@@ -56,9 +56,13 @@ src/
 ## Documentation
 
 - `docs/formats/` - Binary format specifications
-- `NEXT-STEPS.md` - Development roadmap
+- `ROADMAP.md` - Development roadmap
 - `CLAUDE.md` - AI assistant context
+
+## Acknowledgments
+
+This project was written almost entirely by [Claude Opus 4.5](https://www.anthropic.com/claude) via [Claude Code](https://claude.ai/code), with human guidance and direction.
 
 ## License
 
-MIT OR Apache-2.0
+[Unlicense](LICENSE) - Public Domain
