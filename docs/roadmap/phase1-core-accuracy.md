@@ -1,8 +1,8 @@
 # Phase 1: Core Accuracy
 
-**Goal**: Make the emulator faithful to real AIE2 hardware behavior.
+**Goal**: Make the emulator cycle-accurate to real AIE2 hardware behavior.
 
-**Status**: 🟢 Mostly Complete
+**Status**: 🟡 Functional (Timing TODO)
 
 ---
 
@@ -91,28 +91,80 @@ Based on analysis of [llvm-aie](https://github.com/Xilinx/llvm-aie) TableGen fil
 | Load/store operations | ✅ Done | `MemoryUnit` in `execute/memory.rs` |
 | Memory width variants | ✅ Done | Byte/HalfWord/Word/DoubleWord/QuadWord/Vector256 |
 | Post-modify addressing | ✅ Done | None/Immediate/Register |
-| Bank conflict detection | 🔲 TODO | |
-| Timing model | 🔲 TODO | |
+| Bank conflict detection | 🔲 TODO | 8 banks in 64KB, same-bank = stall |
+| Access latency model | 🔲 TODO | Local: 1 cycle, conflict: +1 cycle |
+| Alignment penalty | 🔲 TODO | Unaligned access may stall |
+| Memory bank mapping | 🔲 TODO | Address bits -> bank selection |
 
 ### 1.5 DMA Engine
 
 | Task | Status | Notes |
 |------|--------|-------|
 | DMA start/wait operations | 🟡 Partial | Decoded, instant completion |
-| Multi-dimensional addressing | 🔲 TODO | |
-| BD chaining | 🔲 TODO | |
+| Multi-dimensional addressing | 🔲 TODO | 2D/3D/4D stride patterns |
+| BD chaining | 🔲 TODO | Linked buffer descriptors |
 | Transfer simulation | 🔲 TODO | Currently instant |
+| Transfer latency model | 🔲 TODO | setup + (size / bandwidth) |
+| BD processing overhead | 🔲 TODO | Cycles to parse each BD |
+| Channel arbitration | 🔲 TODO | Multiple DMAs compete for bus |
+| Stall-on-wait timing | 🔲 TODO | Core stalls until DMA complete |
+| S2MM/MM2S timing | 🔲 TODO | Stream-to-memory vs memory-to-stream |
 
 ### 1.6 Synchronization
 
 | Task | Status | Notes |
 |------|--------|-------|
 | Lock acquire/release | ✅ Done | `ControlUnit` in `execute/control.rs` |
-| Lock contention tracking | 🔲 TODO | |
-| Deadlock detection | 🔲 TODO | |
-| Stream switch routing | 🔲 TODO | |
+| Lock contention tracking | 🔲 TODO | Stall cycles when lock busy |
+| Lock acquire latency | 🔲 TODO | Cycles to acquire uncontested lock |
+| Deadlock detection | 🔲 TODO | Circular wait detection |
+| Barrier synchronization | 🔲 TODO | Multi-core barrier timing |
 
-### 1.7 TableGen Parser
+### 1.7 Stream Switch
+
+| Task | Status | Notes |
+|------|--------|-------|
+| Circuit-switched routing | 🔲 TODO | Direct tile-to-tile paths |
+| Packet-switched routing | 🔲 TODO | Header-based routing |
+| Packet header overhead | 🔲 TODO | Cycles per packet header |
+| Backpressure propagation | 🔲 TODO | Stalls when destination full |
+| Route configuration | 🔲 TODO | CDO-based switch setup |
+| Routing latency | 🔲 TODO | Hops between tiles |
+
+### 1.8 Pipeline Model
+
+| Task | Status | Notes |
+|------|--------|-------|
+| Instruction latencies | 🔲 TODO | Per-operation cycle counts |
+| Pipeline stages | 🔲 TODO | Fetch/decode/execute/writeback |
+| RAW hazard detection | 🔲 TODO | Read-after-write stalls |
+| WAW hazard detection | 🔲 TODO | Write-after-write ordering |
+| WAR hazard detection | 🔲 TODO | Write-after-read ordering |
+| Stall cycle modeling | 🔲 TODO | When pipeline must wait |
+| VLIW slot parallelism | 🔲 TODO | Concurrent slot execution |
+| Branch penalty | 🔲 TODO | Cycles lost on taken branch |
+
+**Approximate instruction latencies** (need hardware validation):
+- Scalar ALU (add, sub, and, or): 1 cycle
+- Scalar multiply: 2-3 cycles
+- Vector ALU: 2-4 cycles
+- Vector MAC: 4-8 cycles
+- Load (local memory): 1 cycle + bank conflicts
+- Store (local memory): 1 cycle
+- Branch (taken): 2-4 cycles penalty
+
+### 1.9 Multi-Core Coordination
+
+| Task | Status | Notes |
+|------|--------|-------|
+| Per-tile clock model | 🔲 TODO | All tiles same clock or async? |
+| Inter-tile communication latency | 🔲 TODO | Cycles for tile-to-tile data |
+| Shared resource arbitration | 🔲 TODO | Mem tiles, shim tiles |
+| Global cycle counter | 🔲 TODO | Synchronized across tiles |
+| Event timestamps | 🔲 TODO | For profiling/tracing |
+| Stall cycle accounting | 🔲 TODO | Track why core stalled |
+
+### 1.10 TableGen Parser
 
 | Task | Status | Notes |
 |------|--------|-------|
@@ -258,33 +310,52 @@ src/tablegen/           # ✅ DONE
 
 ## Next Steps
 
-Current status: **100% recognition rate** on test ELF binaries.
+Current status: **100% instruction recognition** on test ELF binaries. **Timing not yet implemented.**
 
-### Completed
+### Completed (Functional Emulation)
 
 1. **VLIW bundle slot extraction** - All 16-112 bit formats
    - 16-bit NOP, 32-bit single-slot, 48-bit dual-slot, 64-bit multi-slot
-   - 80-bit (21 format variants)
-   - 96-bit (20+ format variants)
-   - 112-bit (8 format variants)
+   - 80-bit (21 format variants), 96-bit (20+ variants), 112-bit (8 variants)
 
 2. **TableGen-based decoder** - 70/135 instructions resolved
-   - Pattern matching with specificity ordering
-   - Operand field extraction
 
-### Remaining Work
+3. **Execution units** - Scalar, vector, memory, control operations
+
+### Remaining Work (Cycle-Accuracy)
+
+#### Priority 1: Pipeline Model
+- Instruction latencies per operation type
+- Hazard detection (RAW, WAW, WAR)
+- Stall cycle modeling
+- Branch penalties
+
+#### Priority 2: Memory Timing
+- Bank conflict detection and penalties
+- Access latency model (local memory: 1 cycle base)
+- Alignment penalties
+
+#### Priority 3: DMA Timing
+- Transfer latency = setup + (size / bandwidth)
+- BD processing overhead
+- Channel arbitration
+- Stall-on-wait behavior
+
+#### Priority 4: Multi-Core Timing
+- Lock contention delays
+- Stream switch routing latency
+- Inter-tile communication latency
+- Global cycle synchronization
+
+#### Priority 5: Infrastructure
+- Per-core cycle counter
+- Stall reason tracking
+- Event timestamps for profiling
+
+### Minor Remaining Work (Decoding)
 
 1. **128-bit format extraction** (rare, ~0% of test binaries)
-   - I128_LDB_LDA_ST_LNG_VEC
-   - I128_LDB_LDA_ST_ALU_MV_VEC
-
-2. **Improve operand extraction** for specific instruction variants
-   - Some Load operations show as `Load:??? (0x00000)`
-   - Vector instruction operands need refinement
-
-3. **Code generation** (optional optimization)
-   - Generate static Rust decode tables from resolved encodings
-   - Auto-generate executor stubs from semantic patterns
+2. **Improve operand extraction** for some Load/Vector instructions
 
 ---
 
