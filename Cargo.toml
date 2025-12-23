@@ -1,0 +1,37 @@
+[package]
+name = "xdna-emu"
+version = "0.1.0"
+edition = "2021"
+description = "Open-source emulator and visual debugger for AMD XDNA NPUs"
+license = "MIT OR Apache-2.0"
+rust-version = "1.70"
+
+[dependencies]
+# Binary parsing
+zerocopy = { version = "0.8", features = ["derive"] }  # Zero-copy struct parsing
+nom = "8"                                               # Parser combinators for complex formats
+
+# Error handling
+thiserror = "2"                                         # Derive Error trait
+anyhow = "1"                                            # Flexible error handling
+
+# Utilities
+memmap2 = "0.9"                                         # Memory-mapped file I/O
+uuid = "1"                                              # UUID handling
+
+# ELF parsing for core binaries
+goblin = "0.10"
+
+# GUI framework
+eframe = "0.31"                                         # egui framework for native apps
+egui_extras = { version = "0.31", features = ["image"] } # Extra widgets
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+[dev-dependencies]
+hex = "0.4"                                             # Hex dump utilities for debugging
+
+[profile.release]
+lto = true
