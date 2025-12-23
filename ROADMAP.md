@@ -34,7 +34,7 @@ The architecture is designed to be generic from day one - device-specific detail
 | [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | 🟢 Mostly Complete | 272 tests, 100% real binary recognition |
 | [2. Toolchain Integration](docs/roadmap/phase2-toolchain-integration.md) | 🔴 Not started | |
 | [3. Developer Experience](docs/roadmap/phase3-developer-experience.md) | 🟡 GUI exists | Needs debugging features |
-| [4. Validation & Testing](docs/roadmap/phase4-validation-testing.md) | 🟡 265 tests | Real binary test added |
+| [4. Validation & Testing](docs/roadmap/phase4-validation-testing.md) | 🟡 277 tests | Real binary test added |
 | [5. Production Readiness](docs/roadmap/phase5-production-readiness.md) | 🔴 Not started | |
 | [6. Community & Ecosystem](docs/roadmap/phase6-community-ecosystem.md) | 🔴 Not started | |
 
@@ -53,9 +53,11 @@ Make the emulator faithful to real AIE2 hardware behavior.
 - Memory system (load/store with post-modify addressing)
 - Synchronization (lock acquire/release)
 - TableGen parser extracting 70/135 instruction encodings from llvm-aie
-- **VLIW slot extraction** for 32/48/64-bit bundle formats (100% recognition on test ELF)
+- **VLIW slot extraction** for all 16-112 bit bundle formats (100% recognition on test ELF)
+  - 80-bit (21 format variants), 96-bit (20+ variants), 112-bit (8 variants)
+  - Multi-slot extraction (2-4 slots per bundle)
 
-**Next:** Implement 80-128 bit format extraction, improve operand handling
+**Next:** Implement 128-bit format extraction (rare), improve operand handling
 
 ### Phase 2: Toolchain Integration 🔴
 

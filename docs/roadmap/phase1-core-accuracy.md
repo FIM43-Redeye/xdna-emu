@@ -40,12 +40,14 @@ Based on analysis of [llvm-aie](https://github.com/Xilinx/llvm-aie) TableGen fil
 | Slot operation types (`SlotOp`, `Operation`) | ✅ Done | 30+ operation types |
 | Pattern-based decoder | ✅ Done | `src/interpreter/decode/patterns.rs` |
 | TableGen-based decoder | ✅ Done | `src/interpreter/decode/tablegen_decoder.rs` |
-| Full VLIW bundle parsing | 🟡 Partial | 4-byte works, 16-byte needs refinement |
+| VLIW slot extraction | ✅ Done | 16-112 bit formats fully supported |
+| Full VLIW bundle parsing | ✅ Done | All formats 16-112 bit, 128-bit rare |
 
 **Files created**:
 - `src/interpreter/bundle/mod.rs` - VliwBundle struct, disassembler
 - `src/interpreter/bundle/slot.rs` - SlotIndex, SlotOp, Operation, Operand
 - `src/interpreter/bundle/encoding.rs` - BundleFormat, format detection
+- `src/interpreter/bundle/slot_layout.rs` - VLIW slot extraction (16-112 bit)
 - `src/interpreter/decode/mod.rs` - Aie2Slot, extraction helpers
 - `src/interpreter/decode/patterns.rs` - PatternDecoder
 - `src/interpreter/decode/tablegen_decoder.rs` - TableGenDecoder
@@ -223,7 +225,7 @@ src/tablegen/           # ✅ DONE
 
 ## Test Coverage
 
-**Total: 267 tests passing** (262 unit + 5 doc tests)
+**Total: 277 tests passing** (272 unit + 5 doc tests)
 
 | Module | Tests | Notes |
 |--------|-------|-------|
@@ -256,21 +258,31 @@ src/tablegen/           # ✅ DONE
 
 ## Next Steps
 
-To improve binary recognition beyond 20%:
+Current status: **100% recognition rate** on test ELF binaries.
 
-1. **Parse more format classes** from `AIE2GenInstrFormats.td`
-   - Handle complex inheritance chains
-   - Support multiclass expansions
+### Completed
 
-2. **Handle VLIW bundle encoding**
-   - Investigate the `0x10BB` bundle marker pattern
-   - Parse multi-slot bundles correctly
+1. **VLIW bundle slot extraction** - All 16-112 bit formats
+   - 16-bit NOP, 32-bit single-slot, 48-bit dual-slot, 64-bit multi-slot
+   - 80-bit (21 format variants)
+   - 96-bit (20+ format variants)
+   - 112-bit (8 format variants)
 
-3. **Add vec slot resolution**
-   - Vector instructions use different encoding scheme
-   - May need additional TableGen parsing
+2. **TableGen-based decoder** - 70/135 instructions resolved
+   - Pattern matching with specificity ordering
+   - Operand field extraction
 
-4. **Code generation** (optional)
+### Remaining Work
+
+1. **128-bit format extraction** (rare, ~0% of test binaries)
+   - I128_LDB_LDA_ST_LNG_VEC
+   - I128_LDB_LDA_ST_ALU_MV_VEC
+
+2. **Improve operand extraction** for specific instruction variants
+   - Some Load operations show as `Load:??? (0x00000)`
+   - Vector instruction operands need refinement
+
+3. **Code generation** (optional optimization)
    - Generate static Rust decode tables from resolved encodings
    - Auto-generate executor stubs from semantic patterns
 
