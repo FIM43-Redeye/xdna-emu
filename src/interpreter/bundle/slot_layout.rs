@@ -374,6 +374,635 @@ pub fn extract_64bit(bytes: &[u8]) -> ExtractedBundle {
     bundle
 }
 
+/// Extract slot data from an 80-bit (10-byte) bundle.
+///
+/// # Format Variants (from AIE2CompositeFormats.td)
+///
+/// 80-bit bundles have marker 0xB (0b1011) in low 4 bits and 76 bits of data.
+/// Common patterns include:
+///
+/// - I80_LDA_ST_VEC: `{lda, st, 0b001001, vec, 0b00}`
+/// - I80_LDA_MV_VEC: `{lda, mv, 0b00010, vec, 0b00}`
+/// - I80_ALU_MV_VEC: `{0b00000, {alumv, 0b1}, vec, 0b01}` where alumv = {alu, mv}
+/// - I80_LNG_VEC: `{0b00000, {lng, 0b0}, vec, 0b01}`
+/// - I80_LDA_ST_ALU: `{lda, st, 0b00000000000, alu, 0b111}`
+/// - I80_LDA_ALU_MV: `{lda, 0b00000, {alumv, 0b1}, 0b0001011}`
+/// - I80_LDA_LNG: `{lda, 0b00000, {lng, 0b0}, 0b0001011}`
+pub fn extract_80bit(bytes: &[u8]) -> ExtractedBundle {
+    let mut bundle = ExtractedBundle::new();
+
+    if bytes.len() < 10 {
+        return bundle;
+    }
+
+    // Read 80 bits (10 bytes) as u128 (little-endian)
+    let mut word_bytes = [0u8; 16];
+    word_bytes[..10].copy_from_slice(&bytes[..10]);
+    let word = u128::from_le_bytes(word_bytes);
+
+    // Verify format marker (low 4 bits should be 0b1011 = 0xB)
+    if (word & 0xF) != 0xB {
+        return bundle;
+    }
+
+    // Extract instr80 (76 bits after the marker)
+    let instr80 = (word >> 4) & ((1u128 << 76) - 1);
+
+    // Extract discriminator bits for pattern matching
+    // bits [1:0] of instr80 determine several patterns
+    let bits_1_0 = (instr80 & 0x3) as u8;
+    // bits [7:0] for more specific patterns
+    let bits_7_0 = (instr80 & 0xFF) as u8;
+    // bits at higher positions
+    let bits_75_71 = ((instr80 >> 71) & 0x1F) as u8; // High 5 bits
+
+    // Pattern: *_VEC with discriminator 0b00 at bits [1:0]
+    if bits_1_0 == 0b00 {
+        // VEC is at bits [27:2]
+        let vec_bits = ((instr80 >> 2) & ((1u128 << VEC_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Vec, vec_bits, VEC_WIDTH);
+
+        // Check bits [33:28] for sub-patterns
+        let bits_33_28 = ((instr80 >> 28) & 0x3F) as u8;
+
+        if bits_33_28 == 0b001001 {
+            // I80_LDA_ST_VEC: st at [54:34], lda at [75:55]
+            let st_bits = ((instr80 >> 34) & ((1u128 << ST_WIDTH) - 1)) as u64;
+            let lda_bits = ((instr80 >> 55) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+            bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+        } else {
+            // Check bits [32:28] for other patterns
+            let bits_32_28 = ((instr80 >> 28) & 0x1F) as u8;
+
+            if bits_32_28 == 0b00010 {
+                // I80_LDA_MV_VEC: mv at [54:33], lda at [75:55]
+                let mv_bits = ((instr80 >> 33) & ((1u128 << MV_WIDTH) - 1)) as u64;
+                let lda_bits = ((instr80 >> 55) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+                bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+                bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+            } else if bits_32_28 == 0b00100 {
+                // I80_ST_MV_VEC: mv at [54:33], st at [75:55]
+                let mv_bits = ((instr80 >> 33) & ((1u128 << MV_WIDTH) - 1)) as u64;
+                let st_bits = ((instr80 >> 55) & ((1u128 << ST_WIDTH) - 1)) as u64;
+                bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+                bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+            } else if bits_32_28 == 0b00110 {
+                // I80_LDB_MV_VEC: ldb at [48:33], 0b00000 at [75:71], mv at [32:11] (need recalc)
+                // Actually: {0b00000, ldb, mv, 0b00110, vec, 0b00}
+                // mv at [54:33], ldb at [70:55]
+                let mv_bits = ((instr80 >> 33) & ((1u128 << MV_WIDTH) - 1)) as u64;
+                let ldb_bits = ((instr80 >> 55) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+                bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+                bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+            } else if bits_75_71 == 0b00000 {
+                // Patterns starting with 0b00000 at high bits
+                // I80_ST_LDB_VEC: {st, ldb, 0b00000, 0b000001, vec, 0b00}
+                if bits_33_28 == 0b000001 {
+                    let ldb_bits = ((instr80 >> 39) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+                    let st_bits = ((instr80 >> 55) & ((1u128 << ST_WIDTH) - 1)) as u64;
+                    bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+                    bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+                }
+            } else if ((instr80 >> 28) & 0x7FF) == 0b00000011101 {
+                // I80_LDA_LDB_VEC: {lda, ldb, 0b00000011101, vec, 0b00}
+                let ldb_bits = ((instr80 >> 39) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+                let lda_bits = ((instr80 >> 55) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+                bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+                bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+            }
+        }
+        return bundle;
+    }
+
+    // Pattern: *_VEC with discriminator 0b01 at bits [1:0] (ALU_MV_VEC or LNG_VEC)
+    if bits_1_0 == 0b01 {
+        // VEC is at bits [27:2]
+        let vec_bits = ((instr80 >> 2) & ((1u128 << VEC_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Vec, vec_bits, VEC_WIDTH);
+
+        // alu_mv at bits [70:28], discriminator 0b00000 at bits [75:71]
+        // alu_mv LSB (bit 28) determines ALU+MV (1) vs LNG (0)
+        let alu_mv_lsb = ((instr80 >> 28) & 1) as u8;
+
+        if alu_mv_lsb == 1 {
+            // I80_ALU_MV_VEC: alumv at [69:28], alumv = {alu, mv}
+            // mv at bits [49:28] (after removing LSB)
+            // alu at bits [69:50]
+            let mv_bits = ((instr80 >> 29) & ((1u128 << MV_WIDTH) - 1)) as u64;
+            let alu_bits = ((instr80 >> 51) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+            bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+        } else {
+            // I80_LNG_VEC: lng at [69:28]
+            let lng_bits = ((instr80 >> 29) & ((1u128 << LNG_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Lng, lng_bits, LNG_WIDTH);
+        }
+        return bundle;
+    }
+
+    // Pattern: *_VEC with discriminator 0b10 at bits [1:0]
+    if bits_1_0 == 0b10 {
+        // VEC is at bits [27:2]
+        let vec_bits = ((instr80 >> 2) & ((1u128 << VEC_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Vec, vec_bits, VEC_WIDTH);
+
+        // Check bits [29:28] for sub-patterns
+        let bits_29_28 = ((instr80 >> 28) & 0x3) as u8;
+
+        if bits_29_28 == 0b01 {
+            // I80_ST_ALU_VEC: {st, 0b00000, alu, 0b01, vec, 0b10}
+            let alu_bits = ((instr80 >> 30) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+            let st_bits = ((instr80 >> 55) & ((1u128 << ST_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+            bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+        } else if bits_29_28 == 0b10 {
+            // I80_LDB_ALU_VEC: {0b00000, ldb, 0b00000, alu, 0b10, vec, 0b10}
+            let alu_bits = ((instr80 >> 30) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+            let ldb_bits = ((instr80 >> 55) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+            bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+        } else if bits_29_28 == 0b00 {
+            // I80_LDA_ALU_VEC: {lda, 0b00000, alu, 0b00, vec, 0b10}
+            let alu_bits = ((instr80 >> 30) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+            let lda_bits = ((instr80 >> 55) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+            bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+        }
+        return bundle;
+    }
+
+    // Pattern: Non-VEC patterns with discriminator 0b111 at bits [2:0]
+    if (instr80 & 0x7) == 0b111 {
+        // I80_LDA_ST_ALU: {lda, st, 0b00000000000, alu, 0b111}
+        let alu_bits = ((instr80 >> 3) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+        let st_bits = ((instr80 >> 34) & ((1u128 << ST_WIDTH) - 1)) as u64;
+        let lda_bits = ((instr80 >> 55) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+        bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+        bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+        return bundle;
+    }
+
+    // Pattern: *_ALU_MV or *_LNG patterns
+    if bits_7_0 == 0b0001011 {
+        // I80_LDA_ALU_MV or I80_LDA_LNG
+        // alu_mv at [63:21], discriminator at bits [20:14] = 0b0001011
+        let alu_mv_lsb = ((instr80 >> 21) & 1) as u8;
+        let lda_bits = ((instr80 >> 55) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+
+        if alu_mv_lsb == 1 {
+            // I80_LDA_ALU_MV: alumv = {alu, mv}
+            let mv_bits = ((instr80 >> 22) & ((1u128 << MV_WIDTH) - 1)) as u64;
+            let alu_bits = ((instr80 >> 44) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+            bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+        } else {
+            // I80_LDA_LNG
+            let lng_bits = ((instr80 >> 22) & ((1u128 << LNG_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Lng, lng_bits, LNG_WIDTH);
+        }
+        return bundle;
+    }
+
+    if bits_7_0 == 0b0000011 {
+        // I80_LDB_ALU_MV or I80_LDB_LNG
+        // {0b00000, ldb, 0b00000, alu_mv, 0b0000011}
+        let alu_mv_lsb = ((instr80 >> 14) & 1) as u8;
+        let ldb_bits = ((instr80 >> 55) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+
+        if alu_mv_lsb == 1 {
+            // I80_LDB_ALU_MV
+            let mv_bits = ((instr80 >> 15) & ((1u128 << MV_WIDTH) - 1)) as u64;
+            let alu_bits = ((instr80 >> 37) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+            bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+        } else {
+            // I80_LDB_LNG
+            let lng_bits = ((instr80 >> 15) & ((1u128 << LNG_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Lng, lng_bits, LNG_WIDTH);
+        }
+        return bundle;
+    }
+
+    if bits_7_0 == 0b0010011 {
+        // I80_ST_ALU_MV or I80_ST_LNG
+        // {st, 0b00000, alu_mv, 0b0010011}
+        let alu_mv_lsb = ((instr80 >> 14) & 1) as u8;
+        let st_bits = ((instr80 >> 55) & ((1u128 << ST_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+
+        if alu_mv_lsb == 1 {
+            // I80_ST_ALU_MV
+            let mv_bits = ((instr80 >> 15) & ((1u128 << MV_WIDTH) - 1)) as u64;
+            let alu_bits = ((instr80 >> 37) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+            bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+        } else {
+            // I80_ST_LNG
+            let lng_bits = ((instr80 >> 15) & ((1u128 << LNG_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Lng, lng_bits, LNG_WIDTH);
+        }
+        return bundle;
+    }
+
+    // More non-VEC patterns with specific discriminators
+    if bits_7_0 == 0b01101011 {
+        // I80_ST_LDB_MV: {st, ldb, 0b000000000, mv, 0b01101011}
+        let mv_bits = ((instr80 >> 8) & ((1u128 << MV_WIDTH) - 1)) as u64;
+        let ldb_bits = ((instr80 >> 39) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+        let st_bits = ((instr80 >> 55) & ((1u128 << ST_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+        bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+        bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+        return bundle;
+    }
+
+    if bits_7_0 == 0b00101011 {
+        // I80_LDA_ST_MV: {lda, st, 0b0000, mv, 0b00101011}
+        let mv_bits = ((instr80 >> 8) & ((1u128 << MV_WIDTH) - 1)) as u64;
+        let st_bits = ((instr80 >> 34) & ((1u128 << ST_WIDTH) - 1)) as u64;
+        let lda_bits = ((instr80 >> 55) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+        bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+        bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+        return bundle;
+    }
+
+    if bits_7_0 == 0b11101011 {
+        // I80_LDA_LDB_MV: {lda, ldb, 0b000000000, mv, 0b11101011}
+        let mv_bits = ((instr80 >> 8) & ((1u128 << MV_WIDTH) - 1)) as u64;
+        let ldb_bits = ((instr80 >> 39) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+        let lda_bits = ((instr80 >> 55) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+        bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+        bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+        return bundle;
+    }
+
+    bundle
+}
+
+/// Extract slot data from a 96-bit (12-byte) bundle.
+///
+/// 96-bit bundles have marker 0x7 (0b0111) in low 4 bits and 92 bits of data.
+pub fn extract_96bit(bytes: &[u8]) -> ExtractedBundle {
+    let mut bundle = ExtractedBundle::new();
+
+    if bytes.len() < 12 {
+        return bundle;
+    }
+
+    // Read 96 bits (12 bytes) as u128 (little-endian)
+    let mut word_bytes = [0u8; 16];
+    word_bytes[..12].copy_from_slice(&bytes[..12]);
+    let word = u128::from_le_bytes(word_bytes);
+
+    // Verify format marker (low 4 bits should be 0b0111 = 0x7)
+    if (word & 0xF) != 0x7 {
+        return bundle;
+    }
+
+    // Extract instr96 (92 bits after the marker)
+    let instr96 = (word >> 4) & ((1u128 << 92) - 1);
+
+    // Extract discriminator bits
+    let bits_1_0 = (instr96 & 0x3) as u8;
+    let bits_8_0 = (instr96 & 0x1FF) as u16;
+
+    // Pattern: *_VEC with discriminator 0b01 at bits [1:0]
+    if bits_1_0 == 0b01 {
+        // VEC at bits [27:2]
+        let vec_bits = ((instr96 >> 2) & ((1u128 << VEC_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Vec, vec_bits, VEC_WIDTH);
+
+        // Check alu_mv discriminator at bit 28
+        let alu_mv_lsb = ((instr96 >> 28) & 1) as u8;
+
+        if alu_mv_lsb == 1 {
+            // I96_ST_ALU_MV_VEC: {st, alumv, 0b1, vec, 0b01}
+            let mv_bits = ((instr96 >> 29) & ((1u128 << MV_WIDTH) - 1)) as u64;
+            let alu_bits = ((instr96 >> 51) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+            let st_bits = ((instr96 >> 71) & ((1u128 << ST_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+            bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+            bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+        } else {
+            // I96_ST_LNG_VEC: {st, lng, 0b0, vec, 0b01}
+            let lng_bits = ((instr96 >> 29) & ((1u128 << LNG_WIDTH) - 1)) as u64;
+            let st_bits = ((instr96 >> 71) & ((1u128 << ST_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Lng, lng_bits, LNG_WIDTH);
+            bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+        }
+        return bundle;
+    }
+
+    // Pattern: *_VEC with discriminator 0b10 at bits [1:0]
+    if bits_1_0 == 0b10 {
+        // VEC at bits [27:2]
+        let vec_bits = ((instr96 >> 2) & ((1u128 << VEC_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Vec, vec_bits, VEC_WIDTH);
+
+        // Check bits [32:28] for sub-patterns
+        let bits_32_28 = ((instr96 >> 28) & 0x1F) as u8;
+
+        if bits_32_28 == 0b00110 {
+            // I96_ST_LDB_MV_VEC: {st, ldb, mv, 0b00110, vec, 0b10}
+            let mv_bits = ((instr96 >> 33) & ((1u128 << MV_WIDTH) - 1)) as u64;
+            let ldb_bits = ((instr96 >> 55) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+            let st_bits = ((instr96 >> 71) & ((1u128 << ST_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+            bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+            bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+        } else if bits_32_28 == 0b01010 {
+            // I96_LDB_ALU_MV_VEC or I96_LDB_LNG_VEC
+            let alu_mv_lsb = ((instr96 >> 33) & 1) as u8;
+            let ldb_bits = ((instr96 >> 76) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+
+            if alu_mv_lsb == 1 {
+                let mv_bits = ((instr96 >> 34) & ((1u128 << MV_WIDTH) - 1)) as u64;
+                let alu_bits = ((instr96 >> 56) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+                bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+                bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+            } else {
+                let lng_bits = ((instr96 >> 34) & ((1u128 << LNG_WIDTH) - 1)) as u64;
+                bundle.add_slot(SlotType::Lng, lng_bits, LNG_WIDTH);
+            }
+        } else if bits_32_28 == 0b00010 {
+            // I96_LDA_LDB_MV_VEC: {lda, ldb, mv, 0b00010, vec, 0b10}
+            let mv_bits = ((instr96 >> 33) & ((1u128 << MV_WIDTH) - 1)) as u64;
+            let ldb_bits = ((instr96 >> 55) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+            let lda_bits = ((instr96 >> 71) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+            bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+            bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+        } else if bits_32_28 == 0b01110 {
+            // I96_LDA_LDB_ST_VEC: {lda, ldb, st, 0b001110, vec, 0b10}
+            let st_bits = ((instr96 >> 34) & ((1u128 << ST_WIDTH) - 1)) as u64;
+            let ldb_bits = ((instr96 >> 55) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+            let lda_bits = ((instr96 >> 71) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+            bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+            bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+        } else {
+            // Check for I96_LDA_ST_ALU_VEC: {lda, st, alu, 0b00, vec, 0b10}
+            let bits_29_28 = ((instr96 >> 28) & 0x3) as u8;
+            if bits_29_28 == 0b00 {
+                let alu_bits = ((instr96 >> 30) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+                let st_bits = ((instr96 >> 50) & ((1u128 << ST_WIDTH) - 1)) as u64;
+                let lda_bits = ((instr96 >> 71) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+                bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+                bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+                bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+            } else if bits_29_28 == 0b11 {
+                // I96_LDA_LDB_ALU_VEC: {lda, ldb, 0b00000, alu, 0b11, vec, 0b10}
+                let alu_bits = ((instr96 >> 30) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+                let ldb_bits = ((instr96 >> 55) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+                let lda_bits = ((instr96 >> 71) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+                bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+                bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+                bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+            }
+        }
+        return bundle;
+    }
+
+    // Pattern: *_VEC with discriminator 0b00 at bits [1:0]
+    if bits_1_0 == 0b00 {
+        // I96_LDA_ALU_MV_VEC or I96_LDA_LNG_VEC
+        let vec_bits = ((instr96 >> 2) & ((1u128 << VEC_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Vec, vec_bits, VEC_WIDTH);
+
+        let alu_mv_lsb = ((instr96 >> 28) & 1) as u8;
+        let lda_bits = ((instr96 >> 71) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+
+        if alu_mv_lsb == 1 {
+            let mv_bits = ((instr96 >> 29) & ((1u128 << MV_WIDTH) - 1)) as u64;
+            let alu_bits = ((instr96 >> 51) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+            bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+        } else {
+            let lng_bits = ((instr96 >> 29) & ((1u128 << LNG_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Lng, lng_bits, LNG_WIDTH);
+        }
+        return bundle;
+    }
+
+    // Non-VEC patterns
+    if bits_8_0 == 0b000010011 {
+        // I96_LDA_LDB_ALU_ST: {lda, ldb, 0b00000, alu, st, 0b000010011}
+        let st_bits = ((instr96 >> 9) & ((1u128 << ST_WIDTH) - 1)) as u64;
+        let alu_bits = ((instr96 >> 30) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+        let ldb_bits = ((instr96 >> 55) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+        let lda_bits = ((instr96 >> 71) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+        bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+        bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+        bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+        return bundle;
+    }
+
+    if (instr96 & 0xFF) == 0b00001111 {
+        // I96_LDA_LDB_ST_MV: {lda, ldb, st, 0b0000, mv, 0b00001111}
+        let mv_bits = ((instr96 >> 8) & ((1u128 << MV_WIDTH) - 1)) as u64;
+        let st_bits = ((instr96 >> 34) & ((1u128 << ST_WIDTH) - 1)) as u64;
+        let ldb_bits = ((instr96 >> 55) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+        let lda_bits = ((instr96 >> 71) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+        bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+        bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+        bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+        return bundle;
+    }
+
+    if (instr96 & 0x7F) == 0b0000111 {
+        // I96_LDA_ST_ALU_MV or I96_LDA_ST_LNG
+        let alu_mv_lsb = ((instr96 >> 7) & 1) as u8;
+        let st_bits = ((instr96 >> 50) & ((1u128 << ST_WIDTH) - 1)) as u64;
+        let lda_bits = ((instr96 >> 71) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+        bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+
+        if alu_mv_lsb == 1 {
+            let mv_bits = ((instr96 >> 8) & ((1u128 << MV_WIDTH) - 1)) as u64;
+            let alu_bits = ((instr96 >> 30) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+            bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+        } else {
+            let lng_bits = ((instr96 >> 8) & ((1u128 << LNG_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Lng, lng_bits, LNG_WIDTH);
+        }
+        return bundle;
+    }
+
+    if (instr96 & 0x7F) == 0b0001011 {
+        // I96_LDA_LDB_ALU_MV or I96_LDA_LDB_LNG
+        let alu_mv_lsb = ((instr96 >> 7) & 1) as u8;
+        let ldb_bits = ((instr96 >> 55) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+        let lda_bits = ((instr96 >> 71) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+        bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+
+        if alu_mv_lsb == 1 {
+            let mv_bits = ((instr96 >> 8) & ((1u128 << MV_WIDTH) - 1)) as u64;
+            let alu_bits = ((instr96 >> 30) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+            bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+        } else {
+            let lng_bits = ((instr96 >> 8) & ((1u128 << LNG_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Lng, lng_bits, LNG_WIDTH);
+        }
+        return bundle;
+    }
+
+    bundle
+}
+
+/// Extract slot data from a 112-bit (14-byte) bundle.
+///
+/// 112-bit bundles have marker 0xF (0b1111) in low 4 bits and 108 bits of data.
+pub fn extract_112bit(bytes: &[u8]) -> ExtractedBundle {
+    let mut bundle = ExtractedBundle::new();
+
+    if bytes.len() < 14 {
+        return bundle;
+    }
+
+    // Read 112 bits (14 bytes) as u128 (little-endian)
+    let mut word_bytes = [0u8; 16];
+    word_bytes[..14].copy_from_slice(&bytes[..14]);
+    let word = u128::from_le_bytes(word_bytes);
+
+    // Verify format marker (low 4 bits should be 0b1111 = 0xF)
+    if (word & 0xF) != 0xF {
+        return bundle;
+    }
+
+    // Extract instr112 (108 bits after the marker)
+    let instr112 = (word >> 4) & ((1u128 << 108) - 1);
+
+    // Extract discriminator bits
+    let bits_1_0 = (instr112 & 0x3) as u8;
+
+    // Pattern: *_VEC with discriminator 0b01 at bits [1:0]
+    if bits_1_0 == 0b01 {
+        // VEC at bits [27:2]
+        let vec_bits = ((instr112 >> 2) & ((1u128 << VEC_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Vec, vec_bits, VEC_WIDTH);
+
+        // I112_ST_LDB_ALU_MV_VEC or I112_ST_LDB_LNG_VEC
+        let alu_mv_lsb = ((instr112 >> 28) & 1) as u8;
+
+        if alu_mv_lsb == 1 {
+            let mv_bits = ((instr112 >> 29) & ((1u128 << MV_WIDTH) - 1)) as u64;
+            let alu_bits = ((instr112 >> 51) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+            let ldb_bits = ((instr112 >> 71) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+            let st_bits = ((instr112 >> 87) & ((1u128 << ST_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+            bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+            bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+            bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+        } else {
+            let lng_bits = ((instr112 >> 29) & ((1u128 << LNG_WIDTH) - 1)) as u64;
+            let ldb_bits = ((instr112 >> 71) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+            let st_bits = ((instr112 >> 87) & ((1u128 << ST_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Lng, lng_bits, LNG_WIDTH);
+            bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+            bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+        }
+        return bundle;
+    }
+
+    // Pattern: *_VEC with discriminator 0b10 at bits [1:0]
+    if bits_1_0 == 0b10 {
+        // VEC at bits [27:2]
+        let vec_bits = ((instr112 >> 2) & ((1u128 << VEC_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Vec, vec_bits, VEC_WIDTH);
+
+        // Check bit 28 for further discrimination
+        let bit_28 = ((instr112 >> 28) & 1) as u8;
+
+        if bit_28 == 0 {
+            // I112_LDA_LDB_ALU_ST_VEC: {lda, ldb, alu, 0b00, st, vec, 0b10}
+            let st_bits = ((instr112 >> 29) & ((1u128 << ST_WIDTH) - 1)) as u64;
+            let alu_bits = ((instr112 >> 52) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+            let ldb_bits = ((instr112 >> 72) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+            let lda_bits = ((instr112 >> 88) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+            bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+            bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+            bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+        } else {
+            // I112_LDA_ST_MV_VEC: {lda, st, 0b0000000000000001, mv, vec, 0b10}
+            let mv_bits = ((instr112 >> 29) & ((1u128 << MV_WIDTH) - 1)) as u64;
+            let st_bits = ((instr112 >> 67) & ((1u128 << ST_WIDTH) - 1)) as u64;
+            let lda_bits = ((instr112 >> 88) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+            bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+            bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+        }
+        return bundle;
+    }
+
+    // Pattern: *_VEC with discriminator 0b00 at bits [1:0]
+    if bits_1_0 == 0b00 {
+        // VEC at bits [27:2]
+        let vec_bits = ((instr112 >> 2) & ((1u128 << VEC_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Vec, vec_bits, VEC_WIDTH);
+
+        // I112_LDA_LDB_ALU_MV_VEC or I112_LDA_LDB_LNG_VEC
+        let alu_mv_lsb = ((instr112 >> 28) & 1) as u8;
+
+        if alu_mv_lsb == 1 {
+            let mv_bits = ((instr112 >> 29) & ((1u128 << MV_WIDTH) - 1)) as u64;
+            let alu_bits = ((instr112 >> 51) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+            let ldb_bits = ((instr112 >> 71) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+            let lda_bits = ((instr112 >> 87) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+            bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+            bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+            bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+        } else {
+            let lng_bits = ((instr112 >> 29) & ((1u128 << LNG_WIDTH) - 1)) as u64;
+            let ldb_bits = ((instr112 >> 71) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+            let lda_bits = ((instr112 >> 87) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Lng, lng_bits, LNG_WIDTH);
+            bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+            bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+        }
+        return bundle;
+    }
+
+    // Non-VEC patterns with discriminator 0b0000111 at bits [6:0]
+    if (instr112 & 0x7F) == 0b0000111 {
+        // I112_LDA_LDB_ALU_MV_ST or I112_LDA_LDB_LNG_ST
+        let alu_mv_lsb = ((instr112 >> 7) & 1) as u8;
+        let st_bits = ((instr112 >> 8) & ((1u128 << ST_WIDTH) - 1)) as u64;
+        let ldb_bits = ((instr112 >> 71) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+        let lda_bits = ((instr112 >> 87) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+        bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+        bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+
+        if alu_mv_lsb == 1 {
+            let mv_bits = ((instr112 >> 29) & ((1u128 << MV_WIDTH) - 1)) as u64;
+            let alu_bits = ((instr112 >> 51) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+            bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+        } else {
+            let lng_bits = ((instr112 >> 29) & ((1u128 << LNG_WIDTH) - 1)) as u64;
+            bundle.add_slot(SlotType::Lng, lng_bits, LNG_WIDTH);
+        }
+        return bundle;
+    }
+
+    bundle
+}
+
 /// Extract slot data from any bundle based on its format.
 pub fn extract_slots(bytes: &[u8]) -> ExtractedBundle {
     if bytes.len() < 2 {
@@ -398,12 +1027,12 @@ pub fn extract_slots(bytes: &[u8]) -> ExtractedBundle {
         }
         BundleFormat::Medium48 => extract_48bit(bytes),
         BundleFormat::Medium64 => extract_64bit(bytes),
-        // TODO: Implement 80-128 bit extraction
-        BundleFormat::Long80
-        | BundleFormat::Long96
-        | BundleFormat::Long112
-        | BundleFormat::Full128 => {
-            // For now, return empty - these need more complex handling
+        BundleFormat::Long80 => extract_80bit(bytes),
+        BundleFormat::Long96 => extract_96bit(bytes),
+        BundleFormat::Long112 => extract_112bit(bytes),
+        // TODO: Implement 128-bit extraction
+        BundleFormat::Full128 => {
+            // For now, return empty - 128-bit is rare
             ExtractedBundle::new()
         }
     }
