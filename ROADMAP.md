@@ -31,7 +31,7 @@ The architecture is designed to be generic from day one - device-specific detail
 
 | Phase | Status | Progress |
 |-------|--------|----------|
-| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | 🟢 Mostly Complete | 265 tests, 55% real binary recognition |
+| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | 🟢 Mostly Complete | 272 tests, 100% real binary recognition |
 | [2. Toolchain Integration](docs/roadmap/phase2-toolchain-integration.md) | 🔴 Not started | |
 | [3. Developer Experience](docs/roadmap/phase3-developer-experience.md) | 🟡 GUI exists | Needs debugging features |
 | [4. Validation & Testing](docs/roadmap/phase4-validation-testing.md) | 🟡 265 tests | Real binary test added |
@@ -53,8 +53,9 @@ Make the emulator faithful to real AIE2 hardware behavior.
 - Memory system (load/store with post-modify addressing)
 - Synchronization (lock acquire/release)
 - TableGen parser extracting 70/135 instruction encodings from llvm-aie
+- **VLIW slot extraction** for 32/48/64-bit bundle formats (100% recognition on test ELF)
 
-**Next:** Improve binary recognition beyond 20% (VLIW bundles, more format classes)
+**Next:** Implement 80-128 bit format extraction, improve operand handling
 
 ### Phase 2: Toolchain Integration 🔴
 

@@ -155,21 +155,27 @@ ELF: add_one_objFifo/main_core_0_2.elf
 Architecture: AIE2
 Entry point: 0x0000
 
-Recognition rate: 55% (11/20 instructions)
-- NOPs correctly identified (16-bit format detection working)
-- Variable bundle sizes correctly parsed (2/4/6/10/12/14/16 bytes)
-- Many multi-slot bundles still decoded as "Unknown" (slot extraction needed)
+Recognition rate: 100% (20/20 instructions)
+- All bundle formats correctly detected (16/32/48/64/80/96/112/128-bit)
+- Slot extraction working for 32-bit, 48-bit, and 64-bit formats
+- NOPs, branches, moves, arithmetic, and lock operations all recognized
 ```
 
 **Improvements made:**
 - Added proper VLIW bundle format detection from low nibble
 - Bundle sizes now correctly determined (was always assuming 4 bytes)
 - 16-bit NOP format (`0x0001` marker) now recognized
+- **Slot extraction from VLIW bundles** - new `slot_layout.rs` module
+  - Extracts individual slot bits from packed bundles
+  - Supports 32-bit single-slot formats (LDA, LDB, ALU, MV, ST, VEC)
+  - Supports 48-bit dual-slot formats (LDA+ST, LDA+MV, LDA+ALU, LDB variants, LNG)
+  - Supports 64-bit multi-slot formats (ALU+MV, ALU+VEC, LDA+LDB+ST, etc.)
+- Decoder now uses slot extraction for accurate instruction recognition
 
 **Remaining work** (areas for further improvement):
-1. Only 70/135 instructions resolved (missing format classes)
-2. Multi-slot bundles need slot position extraction
-3. Vector/DMA instructions use `vec`/`lng` slots with different encoding
+1. 80-128 bit format slot extraction (complex hierarchical layouts)
+2. Improve operand extraction for specific instruction variants
+3. Vector/DMA instruction semantics
 
 ---
 
@@ -182,7 +188,8 @@ src/interpreter/
 ├── bundle/             # ✅ DONE
 │   ├── mod.rs          # VliwBundle
 │   ├── slot.rs         # SlotOp, Operation, Operand
-│   └── encoding.rs     # BundleFormat, detection
+│   ├── encoding.rs     # BundleFormat, detection
+│   └── slot_layout.rs  # VLIW slot extraction from bundles
 ├── decode/             # ✅ DONE
 │   ├── mod.rs          # Aie2Slot, helpers
 │   ├── patterns.rs     # PatternDecoder

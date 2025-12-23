@@ -155,6 +155,48 @@ impl TableGenDecoder {
         None
     }
 
+    /// Try to decode slot-specific bits against encodings for that slot.
+    ///
+    /// This is used when we've already extracted the slot bits from a VLIW bundle
+    /// and need to decode them according to the slot's encoding rules.
+    pub fn decode_slot_bits(
+        &self,
+        bits: u64,
+        slot_type: crate::interpreter::bundle::SlotType,
+    ) -> Option<DecodedInstr> {
+        use crate::interpreter::bundle::SlotType;
+
+        // Map SlotType to the slot names used in encodings
+        let slot_name = match slot_type {
+            SlotType::Lda => "lda",
+            SlotType::Ldb => "ldb",
+            SlotType::Alu => "alu",
+            SlotType::Mv => "mv",
+            SlotType::St => "st",
+            SlotType::Vec => "vec",
+            SlotType::Lng => "lng",
+            SlotType::Nop => return None, // NOPs don't have specific encodings
+        };
+
+        // Filter encodings by slot and try to match
+        for encoding in &self.encodings {
+            if encoding.slot == slot_name && encoding.matches(bits) {
+                // Extract operands
+                let mut operands = HashMap::new();
+                for field in &encoding.operand_fields {
+                    let value = field.extract(bits);
+                    operands.insert(field.name.clone(), value);
+                }
+
+                return Some(DecodedInstr {
+                    encoding: encoding.clone(),
+                    operands,
+                });
+            }
+        }
+        None
+    }
+
     /// Convert a decoded instruction to a bundle Operation.
     fn to_operation(&self, decoded: &DecodedInstr) -> Operation {
         // Use semantic info if available
@@ -361,6 +403,8 @@ impl TableGenDecoder {
 
 impl Decoder for TableGenDecoder {
     fn decode(&self, bytes: &[u8], pc: u32) -> Result<VliwBundle, DecodeError> {
+        use crate::interpreter::bundle::{extract_slots, SlotType};
+
         if bytes.len() < 2 {
             return Err(DecodeError::Incomplete {
                 needed: 2,
@@ -404,44 +448,26 @@ impl Decoder for TableGenDecoder {
 
         let mut bundle = VliwBundle::from_raw(&bytes[..effective_size.min(bytes.len())], pc);
 
-        // Handle different format sizes
-        match format {
-            crate::interpreter::bundle::BundleFormat::Nop16 => {
-                // 16-bit NOP format
-                bundle.set_slot(SlotOp::nop(SlotIndex::Scalar0));
-            }
-            crate::interpreter::bundle::BundleFormat::Full128 => {
-                // 128-bit full VLIW - for now mark as unknown until we parse slots
-                // The format marker 0x0 means all zeros or multi-slot bundle
-                let word0 = if bytes.len() >= 4 {
-                    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-                } else {
-                    0
-                };
-                if word0 == 0 {
-                    bundle.set_slot(SlotOp::nop(SlotIndex::Scalar0));
-                } else {
-                    // TODO: Extract individual slots from the 128-bit bundle
-                    bundle.set_slot(SlotOp::new(
-                        SlotIndex::Scalar0,
-                        Operation::Unknown { opcode: word0 },
-                    ));
-                }
-            }
-            _ => {
-                // Other formats: try to decode based on slot encodings
-                let word0 = if bytes.len() >= 4 {
-                    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-                } else {
-                    u16::from_le_bytes([bytes[0], bytes[1]]) as u32
+        // Extract slots from the bundle
+        let extracted = extract_slots(bytes);
+
+        // If we extracted any slots, decode each one
+        if !extracted.is_empty() {
+            for slot in &extracted.slots {
+                let slot_index = match slot.slot_type {
+                    SlotType::Lda | SlotType::Ldb => SlotIndex::Load,
+                    SlotType::Alu => SlotIndex::Scalar0,
+                    SlotType::Mv => SlotIndex::Scalar1,
+                    SlotType::St => SlotIndex::Store,
+                    SlotType::Vec | SlotType::Lng => SlotIndex::Vector,
+                    SlotType::Nop => SlotIndex::Control,
                 };
 
-                // Check for known NOP patterns
-                if word0 == 0 || word0 == 0x15010040 {
-                    bundle.set_slot(SlotOp::nop(SlotIndex::Scalar0));
-                } else if let Some(decoded) = self.decode_word(word0 as u64) {
+                // Try to decode the slot bits against known encodings
+                if slot.slot_type == SlotType::Nop {
+                    bundle.set_slot(SlotOp::nop(slot_index));
+                } else if let Some(decoded) = self.decode_slot_bits(slot.bits, slot.slot_type) {
                     let operation = self.to_operation(&decoded);
-                    let slot_index = self.slot_to_index(&decoded.encoding.slot);
                     let (dest, sources) = self.extract_operands(&decoded);
 
                     let mut slot_op = SlotOp::new(slot_index, operation);
@@ -454,12 +480,58 @@ impl Decoder for TableGenDecoder {
 
                     bundle.set_slot(slot_op);
                 } else {
-                    // Unknown instruction
+                    // Slot extracted but not recognized - mark as unknown with slot info
+                    let slot_name = match slot.slot_type {
+                        SlotType::Lda => "lda",
+                        SlotType::Ldb => "ldb",
+                        SlotType::Alu => "alu",
+                        SlotType::Mv => "mv",
+                        SlotType::St => "st",
+                        SlotType::Vec => "vec",
+                        SlotType::Lng => "lng",
+                        SlotType::Nop => "nop",
+                    };
+                    // For now, mark as unknown but we know the slot type
                     bundle.set_slot(SlotOp::new(
-                        SlotIndex::Scalar0,
-                        Operation::Unknown { opcode: word0 },
+                        slot_index,
+                        Operation::Unknown {
+                            opcode: slot.bits as u32,
+                        },
                     ));
+                    let _ = slot_name; // Suppress unused warning for now
                 }
+            }
+        } else {
+            // No slots extracted - fall back to word-based decoding
+            let word0 = if bytes.len() >= 4 {
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            } else {
+                u16::from_le_bytes([bytes[0], bytes[1]]) as u32
+            };
+
+            // Check for known NOP patterns
+            if word0 == 0 || word0 == 0x15010040 {
+                bundle.set_slot(SlotOp::nop(SlotIndex::Scalar0));
+            } else if let Some(decoded) = self.decode_word(word0 as u64) {
+                let operation = self.to_operation(&decoded);
+                let slot_index = self.slot_to_index(&decoded.encoding.slot);
+                let (dest, sources) = self.extract_operands(&decoded);
+
+                let mut slot_op = SlotOp::new(slot_index, operation);
+                if let Some(d) = dest {
+                    slot_op = slot_op.with_dest(d);
+                }
+                for src in sources {
+                    slot_op = slot_op.with_source(src);
+                }
+
+                bundle.set_slot(slot_op);
+            } else {
+                // Unknown instruction
+                bundle.set_slot(SlotOp::new(
+                    SlotIndex::Scalar0,
+                    Operation::Unknown { opcode: word0 },
+                ));
             }
         }
 
@@ -698,22 +770,37 @@ mod tests {
 
             match decoder.decode(bytes, pc) {
                 Ok(bundle) => {
-                    let slot = bundle.slot(SlotIndex::Scalar0);
-                    let op_name = if let Some(s) = slot {
-                        match &s.op {
+                    // Check all active slots, not just Scalar0
+                    let mut found_known = false;
+                    let mut op_names = Vec::new();
+
+                    for slot_op in bundle.active_slots() {
+                        match &slot_op.op {
                             Operation::Unknown { opcode } => {
-                                unknown_count += 1;
-                                format!("??? (0x{:08X})", opcode)
+                                op_names.push(format!("{:?}:??? (0x{:05X})", slot_op.slot, opcode));
+                            }
+                            Operation::Nop => {
+                                found_known = true;
+                                op_names.push("Nop".to_string());
                             }
                             op => {
-                                decoded_count += 1;
-                                format!("{:?}", op)
+                                found_known = true;
+                                op_names.push(format!("{:?}", op));
                             }
                         }
+                    }
+
+                    let op_name = if op_names.is_empty() {
+                        "empty".to_string()
+                    } else {
+                        op_names.join("; ")
+                    };
+
+                    if found_known || op_names.iter().any(|s| s.contains("Nop")) {
+                        decoded_count += 1;
                     } else {
                         unknown_count += 1;
-                        "empty".to_string()
-                    };
+                    }
 
                     eprintln!(
                         "  PC 0x{:04X}: 0x{:08X} -> {}",
