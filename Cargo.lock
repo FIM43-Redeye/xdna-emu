@@ -4197,6 +4197,7 @@ dependencies = [
  "log",
  "memmap2",
  "nom",
+ "smallvec",
  "thiserror 2.0.17",
  "uuid",
  "zerocopy",

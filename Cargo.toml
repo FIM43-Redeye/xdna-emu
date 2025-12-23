@@ -18,6 +18,7 @@ anyhow = "1"                                            # Flexible error handlin
 # Utilities
 memmap2 = "0.9"                                         # Memory-mapped file I/O
 uuid = "1"                                              # UUID handling
+smallvec = "1.13"                                       # Stack-allocated vectors for operands
 
 # ELF parsing for core binaries
 goblin = "0.10"

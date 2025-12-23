@@ -25,7 +25,7 @@ use anyhow::Result;
 
 use super::array::TileArray;
 use super::registers::{RegisterModule, TileAddress};
-use super::tile::{NUM_DMA_BDS, NUM_DMA_CHANNELS, NUM_LOCKS};
+use super::tile::{Tile, NUM_DMA_BDS, NUM_DMA_CHANNELS, NUM_LOCKS};
 use super::AieArch;
 use crate::parser::cdo::{Cdo, CdoCommand};
 
@@ -471,6 +471,38 @@ impl DeviceState {
                     .unwrap_or(false)
             })
             .count()
+    }
+
+    /// Get number of columns.
+    #[inline]
+    pub fn cols(&self) -> usize {
+        self.array.cols() as usize
+    }
+
+    /// Get number of rows.
+    #[inline]
+    pub fn rows(&self) -> usize {
+        self.array.rows() as usize
+    }
+
+    /// Get a tile by coordinates, or None if out of bounds.
+    #[inline]
+    pub fn tile(&self, col: usize, row: usize) -> Option<&Tile> {
+        if col < self.cols() && row < self.rows() {
+            Some(self.array.tile(col as u8, row as u8))
+        } else {
+            None
+        }
+    }
+
+    /// Get a mutable tile by coordinates, or None if out of bounds.
+    #[inline]
+    pub fn tile_mut(&mut self, col: usize, row: usize) -> Option<&mut Tile> {
+        if col < self.cols() && row < self.rows() {
+            Some(self.array.tile_mut(col as u8, row as u8))
+        } else {
+            None
+        }
     }
 }
 

@@ -1,4 +1,4 @@
-/e# Roadmap
+# Roadmap
 
 A comprehensive plan to make xdna-emu a production-ready, open-source emulator that integrates seamlessly into AMD XDNA NPU development workflows.
 
@@ -18,50 +18,51 @@ The emulator should be a drop-in component that "just works" whether you're usin
 
 ---
 
+## Current Status
+
+| Phase | Status | Progress |
+|-------|--------|----------|
+| 1. Core Accuracy | 🟢 Mostly Complete | [Details](docs/roadmap/phase1-core-accuracy.md) |
+| 2. Toolchain Integration | 🔴 Not started | |
+| 3. Developer Experience | 🟡 GUI exists | Needs debugging features |
+| 4. Validation & Testing | 🟡 224 tests | No integration tests yet |
+| 5. Production Readiness | 🔴 Not started | |
+| 6. Community & Ecosystem | 🔴 Not started | |
+
+**Test count**: 224 passing (86 legacy + 138 new interpreter)
+
+---
+
 ## Phase 1: Core Accuracy
+
+> **[Detailed progress →](docs/roadmap/phase1-core-accuracy.md)**
 
 Make the emulator faithful to real hardware behavior.
 
-### 1.1 Instruction Decoder
-- [ ] Parse llvm-aie TableGen files programmatically
-- [ ] Generate decoder from `AIE2InstrInfo.td`, `AIE2InstrFormats.td`
-- [ ] Handle all instruction formats (scalar, vector, memory, control)
-- [ ] VLIW bundle decoding (128-bit instruction words)
-- [ ] Proper slot assignment (which operations can run in parallel)
+### Summary
 
-### 1.2 Scalar Unit
-- [ ] Full GPR file (32 registers)
-- [ ] All ALU operations (add, sub, mul, div, shifts, logic)
-- [ ] Multiply-accumulate
-- [ ] Condition codes and predication
-- [ ] Address generation unit
+| Component | Status |
+|-----------|--------|
+| 1.1 Instruction Decoder | ✅ Pattern-based complete |
+| 1.2 Scalar Unit | ✅ Register files + execution |
+| 1.3 Vector Unit | ✅ Register files + execution |
+| 1.4 Memory System | ✅ Load/store + post-modify |
+| 1.5 DMA Engine | 🟡 Decoded, instant completion |
+| 1.6 Synchronization | ✅ Lock acquire/release |
 
-### 1.3 Vector Unit
-- [ ] 256-bit vector registers
-- [ ] Vector ALU (vadd, vmul, vmac, etc.)
-- [ ] Shuffle/permute operations
-- [ ] Accumulator registers
-- [ ] Fixed-point and floating-point modes
+### New Modules
 
-### 1.4 Memory System
-- [ ] Accurate memory timing
-- [ ] Bank conflicts detection
-- [ ] Memory access patterns analysis
-- [ ] Stack operations
+- **state** - Register files (Scalar, Vector, Accumulator, Pointer, Modifier)
+- **execute** - Execution units (ScalarAlu, VectorAlu, MemoryUnit, ControlUnit)
+- **core** - CoreInterpreter for per-core execution
+- **engine** - InterpreterEngine for multi-core coordination
 
-### 1.5 DMA Engine
-- [ ] Multi-dimensional addressing (up to 3D)
-- [ ] Stride and wrap configuration
-- [ ] BD chaining with proper timing
-- [ ] S2MM and MM2S channels
-- [ ] Zero-copy between tiles
+### Key Technical Findings
 
-### 1.6 Synchronization
-- [ ] Lock acquire/release with blocking
-- [ ] Lock contention tracking
-- [ ] Deadlock detection
-- [ ] Stream switch packet routing
-- [ ] Control packet handling
+From llvm-aie TableGen analysis:
+- AIE2 has **8 slots** (not 7): `lda`, `ldb`, `alu`, `mv`, `st`, `vec`, `lng`, `nop`
+- Slot bit widths: 16-42 bits
+- Bundle sizes: 2/4/6/16 bytes
 
 ---
 
@@ -206,19 +207,6 @@ Build an open-source community.
 
 ---
 
-## Current Status
-
-| Phase | Status |
-|-------|--------|
-| 1. Core Accuracy | 🟡 Basic (simplified decoder, instant DMA) |
-| 2. Toolchain Integration | 🔴 Not started |
-| 3. Developer Experience | 🟡 GUI exists, needs debugging features |
-| 4. Validation & Testing | 🟡 86 unit tests, no integration tests |
-| 5. Production Readiness | 🔴 Not started |
-| 6. Community & Ecosystem | 🔴 Not started |
-
----
-
 ## Resources
 
 - **llvm-aie**: https://github.com/Xilinx/llvm-aie (instruction definitions)
@@ -226,3 +214,18 @@ Build an open-source community.
 - **mlir-aie**: https://github.com/Xilinx/mlir-aie (test cases, examples)
 - **XRT**: https://github.com/Xilinx/XRT (runtime API)
 - **AMD Docs**: AM020 (AIE2 Architecture), AM025 (Register Reference)
+
+---
+
+## Progress Documents
+
+Detailed progress for each phase:
+
+| Phase | Document |
+|-------|----------|
+| Phase 1: Core Accuracy | [phase1-core-accuracy.md](docs/roadmap/phase1-core-accuracy.md) |
+| Phase 2: Toolchain Integration | *Not started* |
+| Phase 3: Developer Experience | *Not started* |
+| Phase 4: Validation & Testing | *Not started* |
+| Phase 5: Production Readiness | *Not started* |
+| Phase 6: Community & Ecosystem | *Not started* |
