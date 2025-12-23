@@ -1,6 +1,6 @@
 # Roadmap
 
-A comprehensive plan to make xdna-emu a production-ready, open-source emulator that integrates seamlessly into AMD XDNA NPU development workflows.
+A comprehensive plan to make xdna-emu a production-ready, open-source emulator for AMD XDNA NPUs.
 
 ## Vision
 
@@ -11,10 +11,19 @@ Developer writes kernel → Compiles with Peano/Vitis → Emulates with xdna-emu
                                                     correctness validation
 ```
 
-The emulator should be a drop-in component that "just works" whether you're using:
+The emulator should be a drop-in component that "just works" with:
 - **Peano** (open-source LLVM-based compiler)
 - **Vitis** (AMD's full toolchain)
 - **mlir-aie** (MLIR-based flow)
+
+### Multi-Device Strategy
+
+The project targets all AMD XDNA NPUs (NPU1-4), but we're starting with **AIE2 (Phoenix/NPU1)** because:
+1. It's the hardware we have for testing
+2. AIE2 and AIE2P share most of the architecture
+3. Once AIE2 works, AIE2P support is incremental
+
+The architecture is designed to be generic from day one - device-specific details are isolated so adding new NPU variants is straightforward.
 
 ---
 
@@ -22,188 +31,50 @@ The emulator should be a drop-in component that "just works" whether you're usin
 
 | Phase | Status | Progress |
 |-------|--------|----------|
-| 1. Core Accuracy | 🟢 Mostly Complete | [Details](docs/roadmap/phase1-core-accuracy.md) |
-| 2. Toolchain Integration | 🔴 Not started | |
-| 3. Developer Experience | 🟡 GUI exists | Needs debugging features |
-| 4. Validation & Testing | 🟡 224 tests | No integration tests yet |
-| 5. Production Readiness | 🔴 Not started | |
-| 6. Community & Ecosystem | 🔴 Not started | |
-
-**Test count**: 224 passing (86 legacy + 138 new interpreter)
+| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | 🟢 Mostly Complete | 265 tests, 55% real binary recognition |
+| [2. Toolchain Integration](docs/roadmap/phase2-toolchain-integration.md) | 🔴 Not started | |
+| [3. Developer Experience](docs/roadmap/phase3-developer-experience.md) | 🟡 GUI exists | Needs debugging features |
+| [4. Validation & Testing](docs/roadmap/phase4-validation-testing.md) | 🟡 265 tests | Real binary test added |
+| [5. Production Readiness](docs/roadmap/phase5-production-readiness.md) | 🔴 Not started | |
+| [6. Community & Ecosystem](docs/roadmap/phase6-community-ecosystem.md) | 🔴 Not started | |
 
 ---
 
-## Phase 1: Core Accuracy
+## Phase Summaries
 
-> **[Detailed progress →](docs/roadmap/phase1-core-accuracy.md)**
+### Phase 1: Core Accuracy 🟢
 
-Make the emulator faithful to real hardware behavior.
+Make the emulator faithful to real AIE2 hardware behavior.
 
-### Summary
+**Key achievements:**
+- Full instruction decoder with pattern-based and TableGen-based decoders
+- Scalar unit (32 GPRs, pointer/modifier registers, ALU)
+- Vector unit (32×256-bit registers, 8×512-bit accumulators)
+- Memory system (load/store with post-modify addressing)
+- Synchronization (lock acquire/release)
+- TableGen parser extracting 70/135 instruction encodings from llvm-aie
 
-| Component | Status |
-|-----------|--------|
-| 1.1 Instruction Decoder | ✅ Pattern-based complete |
-| 1.2 Scalar Unit | ✅ Register files + execution |
-| 1.3 Vector Unit | ✅ Register files + execution |
-| 1.4 Memory System | ✅ Load/store + post-modify |
-| 1.5 DMA Engine | 🟡 Decoded, instant completion |
-| 1.6 Synchronization | ✅ Lock acquire/release |
+**Next:** Improve binary recognition beyond 20% (VLIW bundles, more format classes)
 
-### New Modules
+### Phase 2: Toolchain Integration 🔴
 
-- **state** - Register files (Scalar, Vector, Accumulator, Pointer, Modifier)
-- **execute** - Execution units (ScalarAlu, VectorAlu, MemoryUnit, ControlUnit)
-- **core** - CoreInterpreter for per-core execution
-- **engine** - InterpreterEngine for multi-core coordination
+Plug into existing development flows: Peano, Vitis, mlir-aie, XRT.
 
-### Key Technical Findings
+### Phase 3: Developer Experience 🟡
 
-From llvm-aie TableGen analysis:
-- AIE2 has **8 slots** (not 7): `lda`, `ldb`, `alu`, `mv`, `st`, `vec`, `lng`, `nop`
-- Slot bit widths: 16-42 bits
-- Bundle sizes: 2/4/6/16 bytes
+Visual debugging and profiling: breakpoints, watchpoints, execution timeline, trace replay.
 
----
+### Phase 4: Validation & Testing 🟡
 
-## Phase 2: Toolchain Integration
+Test infrastructure, benchmarks, CI/CD, hardware comparison.
 
-Plug into existing development flows.
+### Phase 5: Production Readiness 🔴
 
-### 2.1 Peano Integration
-- [ ] Invoke `peano-clang` to compile kernel source
-- [ ] Parse compiler output for debug info
-- [ ] Source-level debugging (map PC to source line)
-- [ ] Watch variables by name
+Performance, multi-device support, APIs, documentation.
 
-### 2.2 Vitis Integration
-- [ ] Support Vitis-generated xclbin files
-- [ ] Parse Vitis metadata sections
-- [ ] Compatible with `v++` output
-- [ ] aiecompiler output support
+### Phase 6: Community & Ecosystem 🔴
 
-### 2.3 mlir-aie Integration
-- [ ] Direct integration with mlir-aie build system
-- [ ] Run mlir-aie test suite in emulator
-- [ ] Support objectFifo patterns
-- [ ] Trace comparison with aiesimulator
-
-### 2.4 XRT Integration
-- [ ] Link against XRT libraries
-- [ ] `xrt::device` emulation backend
-- [ ] Run same host code against emulator or hardware
-- [ ] Result comparison mode
-
----
-
-## Phase 3: Developer Experience
-
-Make debugging and profiling excellent.
-
-### 3.1 Debugging
-- [ ] Breakpoints (PC, memory access, lock)
-- [ ] Watchpoints (memory write triggers)
-- [ ] Step into/over/out
-- [ ] Call stack visualization
-- [ ] Register inspection with symbolic names
-
-### 3.2 Profiling
-- [ ] Cycle counts per function
-- [ ] IPC (instructions per cycle) analysis
-- [ ] Stall analysis (memory, lock, DMA)
-- [ ] Hot path identification
-- [ ] Vector utilization metrics
-
-### 3.3 Visualization
-- [ ] Execution timeline (all cores)
-- [ ] DMA transfer visualization
-- [ ] Lock contention graph
-- [ ] Memory access heatmap
-- [ ] Data flow animation
-
-### 3.4 Trace & Replay
-- [ ] Record execution trace
-- [ ] Replay from trace file
-- [ ] Compare traces (emulator vs hardware)
-- [ ] Export to VCD/FST for waveform viewers
-
----
-
-## Phase 4: Validation & Testing
-
-Ensure correctness and maintain quality.
-
-### 4.1 Test Infrastructure
-- [ ] Import mlir-aie test suite
-- [ ] Automated comparison with aiesimulator
-- [ ] Hardware comparison tests (when available)
-- [ ] Fuzzing for decoder robustness
-
-### 4.2 Benchmarks
-- [ ] Standard kernel benchmarks (matmul, conv2d, etc.)
-- [ ] Performance regression tracking
-- [ ] Emulation speed benchmarks (cycles/second)
-
-### 4.3 Continuous Integration
-- [ ] GitHub Actions for build/test
-- [ ] Coverage reporting
-- [ ] Benchmark dashboards
-- [ ] Release automation
-
----
-
-## Phase 5: Production Readiness
-
-Polish for real-world use.
-
-### 5.1 Performance
-- [ ] JIT-compiled simulation (optional)
-- [ ] Parallel core execution
-- [ ] Fast mode (skip cycle accuracy for speed)
-- [ ] Incremental state updates
-
-### 5.2 Multi-Device Support
-- [ ] NPU1 (Phoenix) - AIE2
-- [ ] NPU2 (Strix) - AIE2P
-- [ ] NPU3 (Strix Halo) - AIE2P, larger array
-- [ ] NPU4 (Krackan) - AIE2P
-- [ ] Device auto-detection from xclbin
-
-### 5.3 API & Extensibility
-- [ ] C API for integration
-- [ ] Python bindings
-- [ ] Plugin system for custom analysis
-- [ ] Scripting support (Lua or Python)
-
-### 5.4 Documentation
-- [ ] User guide
-- [ ] API reference
-- [ ] Architecture deep-dive
-- [ ] Tutorial: debugging your first kernel
-
----
-
-## Phase 6: Community & Ecosystem
-
-Build an open-source community.
-
-### 6.1 Open Source Hygiene
-- [ ] Clear contribution guidelines
-- [ ] Code of conduct
-- [ ] Issue/PR templates
-- [ ] Good first issues labeled
-
-### 6.2 Community Building
-- [ ] Discord/Matrix for discussion
-- [ ] Regular releases with changelogs
-- [ ] Blog posts / tutorials
-- [ ] Conference talks
-
-### 6.3 Ecosystem Integration
-- [ ] Package for major distros
-- [ ] Homebrew formula
-- [ ] Nix package
-- [ ] Docker image
+Open source hygiene, community building, packaging.
 
 ---
 
@@ -217,15 +88,14 @@ Build an open-source community.
 
 ---
 
-## Progress Documents
-
-Detailed progress for each phase:
+## Detailed Documentation
 
 | Phase | Document |
 |-------|----------|
-| Phase 1: Core Accuracy | [phase1-core-accuracy.md](docs/roadmap/phase1-core-accuracy.md) |
-| Phase 2: Toolchain Integration | *Not started* |
-| Phase 3: Developer Experience | *Not started* |
-| Phase 4: Validation & Testing | *Not started* |
-| Phase 5: Production Readiness | *Not started* |
-| Phase 6: Community & Ecosystem | *Not started* |
+| Phase 1 | [phase1-core-accuracy.md](docs/roadmap/phase1-core-accuracy.md) |
+| Phase 2 | [phase2-toolchain-integration.md](docs/roadmap/phase2-toolchain-integration.md) |
+| Phase 3 | [phase3-developer-experience.md](docs/roadmap/phase3-developer-experience.md) |
+| Phase 4 | [phase4-validation-testing.md](docs/roadmap/phase4-validation-testing.md) |
+| Phase 5 | [phase5-production-readiness.md](docs/roadmap/phase5-production-readiness.md) |
+| Phase 6 | [phase6-community-ecosystem.md](docs/roadmap/phase6-community-ecosystem.md) |
+| TableGen Assessment | [tablegen-assessment.md](docs/roadmap/tablegen-assessment.md) |

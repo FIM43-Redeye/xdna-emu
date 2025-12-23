@@ -37,8 +37,10 @@
 //! ```
 
 mod patterns;
+mod tablegen_decoder;
 
 pub use patterns::PatternDecoder;
+pub use tablegen_decoder::{DecodedInstr, TableGenDecoder};
 
 use crate::interpreter::bundle::{
     BranchCondition, BundleFormat, ElementType, MemWidth, Operand, Operation, PostModify,

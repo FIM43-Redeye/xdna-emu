@@ -99,13 +99,7 @@ impl VliwBundle {
         let len = bytes.len().min(16);
         raw[..len].copy_from_slice(&bytes[..len]);
 
-        let word0 = if len >= 4 {
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-        } else {
-            0
-        };
-
-        let format = detect_format(word0, len);
+        let format = detect_format(bytes);
 
         Self {
             raw,

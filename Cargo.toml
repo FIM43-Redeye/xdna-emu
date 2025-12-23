@@ -17,6 +17,7 @@ anyhow = "1"                                            # Flexible error handlin
 
 # Utilities
 memmap2 = "0.9"                                         # Memory-mapped file I/O
+regex = "1"                                             # Regex for TableGen parsing
 uuid = "1"                                              # UUID handling
 smallvec = "1.13"                                       # Stack-allocated vectors for operands
 

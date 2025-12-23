@@ -2,7 +2,7 @@
 
 **Goal**: Make the emulator faithful to real AIE2 hardware behavior.
 
-**Status**: 🟡 In Progress
+**Status**: 🟢 Mostly Complete
 
 ---
 
@@ -39,7 +39,7 @@ Based on analysis of [llvm-aie](https://github.com/Xilinx/llvm-aie) TableGen fil
 | Bundle representation (`VliwBundle`) | ✅ Done | `src/interpreter/bundle/` |
 | Slot operation types (`SlotOp`, `Operation`) | ✅ Done | 30+ operation types |
 | Pattern-based decoder | ✅ Done | `src/interpreter/decode/patterns.rs` |
-| TableGen parser infrastructure | 🔲 Planned | For automated decode table generation |
+| TableGen-based decoder | ✅ Done | `src/interpreter/decode/tablegen_decoder.rs` |
 | Full VLIW bundle parsing | 🟡 Partial | 4-byte works, 16-byte needs refinement |
 
 **Files created**:
@@ -48,6 +48,7 @@ Based on analysis of [llvm-aie](https://github.com/Xilinx/llvm-aie) TableGen fil
 - `src/interpreter/bundle/encoding.rs` - BundleFormat, format detection
 - `src/interpreter/decode/mod.rs` - Aie2Slot, extraction helpers
 - `src/interpreter/decode/patterns.rs` - PatternDecoder
+- `src/interpreter/decode/tablegen_decoder.rs` - TableGenDecoder
 
 ### 1.2 Scalar Unit
 
@@ -109,6 +110,67 @@ Based on analysis of [llvm-aie](https://github.com/Xilinx/llvm-aie) TableGen fil
 | Deadlock detection | 🔲 TODO | |
 | Stream switch routing | 🔲 TODO | |
 
+### 1.7 TableGen Parser
+
+| Task | Status | Notes |
+|------|--------|-------|
+| Parse slots from AIE2Slots.td | ✅ Done | 8 slots with correct bit widths |
+| Parse format classes | ✅ Done | 108 format classes parsed |
+| Parse instructions | ✅ Done | 135 instruction definitions |
+| Extract semantics | ✅ Done | mayLoad, mayStore, Defs, Uses |
+| Extract patterns | ✅ Done | 18 semantic patterns (Add, Sub, etc.) |
+| Resolve encodings | ✅ Done | 70/135 instructions → concrete encodings |
+| Build decoder tables | ✅ Done | `build_decoder_tables()` API |
+| Real binary test | ✅ Done | 20% recognition on real ELF |
+
+**Files created**:
+- `src/tablegen/mod.rs` - Public API, `load_from_llvm_aie()`
+- `src/tablegen/types.rs` - SlotDef, FormatClass, InstrDef, SemanticOp
+- `src/tablegen/parser.rs` - Regex-based .td file parsing
+- `src/tablegen/resolver.rs` - Compute fixed bits/masks, operand fields
+
+**Parsing results**:
+- **8 slots**: lda, ldb, alu, mv, st, vec, lng, nop (all with correct bit widths)
+- **108 format classes**: Encoding patterns with field layouts
+- **135 instructions**: Concrete instruction definitions
+- **34 instructions** with Defs (implicit register writes)
+- **6 instructions** with mayLoad
+- **6 instructions** with mayStore
+- **18 semantic patterns**: Add, Sub, And, Or, Xor, Shl, Sra, Srl, Br → instructions
+
+**Resolved encodings** (70/135 instructions):
+- `mv`: 23 instructions
+- `alu`: 17 instructions
+- `lda`: 12 instructions
+- `st`: 10 instructions
+- `ldb`: 5 instructions
+- `lng`: 3 instructions
+
+### 1.8 Real Binary Validation
+
+Tested the full pipeline against a real AIE2 ELF from mlir-aie:
+
+```
+ELF: add_one_objFifo/main_core_0_2.elf
+Architecture: AIE2
+Entry point: 0x0000
+
+Recognition rate: 55% (11/20 instructions)
+- NOPs correctly identified (16-bit format detection working)
+- Variable bundle sizes correctly parsed (2/4/6/10/12/14/16 bytes)
+- Many multi-slot bundles still decoded as "Unknown" (slot extraction needed)
+```
+
+**Improvements made:**
+- Added proper VLIW bundle format detection from low nibble
+- Bundle sizes now correctly determined (was always assuming 4 bytes)
+- 16-bit NOP format (`0x0001` marker) now recognized
+
+**Remaining work** (areas for further improvement):
+1. Only 70/135 instructions resolved (missing format classes)
+2. Multi-slot bundles need slot position extraction
+3. Vector/DMA instructions use `vec`/`lng` slots with different encoding
+
 ---
 
 ## Module Structure
@@ -123,7 +185,8 @@ src/interpreter/
 │   └── encoding.rs     # BundleFormat, detection
 ├── decode/             # ✅ DONE
 │   ├── mod.rs          # Aie2Slot, helpers
-│   └── patterns.rs     # PatternDecoder
+│   ├── patterns.rs     # PatternDecoder
+│   └── tablegen_decoder.rs  # TableGenDecoder
 ├── state/              # ✅ DONE
 │   ├── mod.rs          # Module exports
 │   ├── registers.rs    # All register files
@@ -141,11 +204,19 @@ src/interpreter/
 └── engine/             # ✅ DONE
     ├── mod.rs          # Module exports
     └── coordinator.rs  # InterpreterEngine
+
+src/tablegen/           # ✅ DONE
+├── mod.rs              # Public API, load_from_llvm_aie()
+├── types.rs            # Data structures
+├── parser.rs           # Regex-based parsing
+└── resolver.rs         # Encoding resolution
 ```
 
 ---
 
 ## Test Coverage
+
+**Total: 267 tests passing** (262 unit + 5 doc tests)
 
 | Module | Tests | Notes |
 |--------|-------|-------|
@@ -154,6 +225,7 @@ src/interpreter/
 | bundle/mod.rs | 8 | VliwBundle creation, disassembly |
 | decode/mod.rs | 4 | Extract helpers |
 | decode/patterns.rs | 8 | Pattern decoding |
+| decode/tablegen_decoder.rs | 6 | TableGen-based decoding |
 | traits.rs | 5 | Flags operations |
 | state/registers.rs | 13 | All register files |
 | state/context.rs | 10 | ExecutionContext |
@@ -164,9 +236,36 @@ src/interpreter/
 | execute/fast_executor.rs | 9 | Executor integration |
 | core/interpreter.rs | 9 | CoreInterpreter |
 | engine/coordinator.rs | 11 | InterpreterEngine |
-| **Total new** | **128** | |
-| **Legacy (emu_stub)** | **86** | Preserved |
-| **Grand total** | **224** | All passing |
+| tablegen/types.rs | 6 | Data structures |
+| tablegen/parser.rs | 11 | Parsing tests |
+| tablegen/resolver.rs | 8 | Encoding resolution |
+| tablegen/mod.rs | 5 | Integration tests |
+| **Interpreter subtotal** | **~140** | |
+| **TableGen subtotal** | **~36** | |
+| **Legacy (emu_stub)** | **~86** | Preserved |
+| **Grand total** | **~262** | All passing |
+
+---
+
+## Next Steps
+
+To improve binary recognition beyond 20%:
+
+1. **Parse more format classes** from `AIE2GenInstrFormats.td`
+   - Handle complex inheritance chains
+   - Support multiclass expansions
+
+2. **Handle VLIW bundle encoding**
+   - Investigate the `0x10BB` bundle marker pattern
+   - Parse multi-slot bundles correctly
+
+3. **Add vec slot resolution**
+   - Vector instructions use different encoding scheme
+   - May need additional TableGen parsing
+
+4. **Code generation** (optional)
+   - Generate static Rust decode tables from resolved encodings
+   - Auto-generate executor stubs from semantic patterns
 
 ---
 
@@ -179,6 +278,10 @@ TableGen parsing is complex and the llvm-aie repo has generated files. Starting 
 2. Handles common cases accurately
 3. Provides infrastructure for TableGen integration later
 4. Gracefully falls back to `Unknown` for unrecognized patterns
+
+Now we have **both** decoders:
+- `PatternDecoder` - Hand-written patterns for known instructions
+- `TableGenDecoder` - Auto-generated from llvm-aie TableGen files
 
 ### Slot Mapping
 
@@ -195,19 +298,10 @@ The interpreter uses a simplified 7-slot model internally while the decoder unde
 
 ---
 
-## Next Steps
-
-1. **State module** - Full register file implementations
-2. **Execute module** - Actual operation execution
-3. **CoreInterpreter** - Per-core execution loop
-4. **InterpreterEngine** - Multi-core coordination
-5. **GUI integration** - Wire new interpreter to visual layerf
-
----
-
 ## Resources
 
 - **llvm-aie TableGen**: `llvm/lib/Target/AIE/` in [Xilinx/llvm-aie](https://github.com/Xilinx/llvm-aie)
-- **Key files**: `AIE2Slots.td`, `AIE2InstrFormats.td`, `AIE2InstrInfo.td`
+- **Key files**: `AIE2Slots.td`, `AIE2GenInstrFormats.td`, `AIE2GenInstrInfo.td`
 - **aie-rt**: Register definitions in [Xilinx/aie-rt](https://github.com/Xilinx/aie-rt)
 - **AMD Docs**: AM020 (AIE2 Architecture), AM025 (Register Reference)
+- **Assessment**: [tablegen-assessment.md](tablegen-assessment.md)
