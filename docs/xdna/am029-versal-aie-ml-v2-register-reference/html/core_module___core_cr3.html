@@ -1,0 +1,46 @@
+<!doctype html>
+<html>
+<head>
+<title>Core_CR3 (CORE_MODULE) Register</title>
+<meta name="robots" content="noindex, nofollow" />
+<link rel="stylesheet" type="text/css" href="./_register_reference.css">
+<script src="xilfunctions.js" type="text/javascript"></script>
+</head>
+<body>
+<p class=header><a href=# onclick=gotoTopic("_overview.html")>Versal Adaptive SoC AI Engine-ML v2 Register Reference</a> &gt; <a href=# onclick=gotoTopic("_module_summary.html")>Module Summary</a> &gt; <a href=# onclick=gotoTopic("mod___core_module.html")>CORE_MODULE Module</a> &gt; Core_CR3 (CORE_MODULE) Register</p><h1>Core_CR3 (CORE_MODULE) Register</h1>
+<h2>Core_CR3 (CORE_MODULE) Register Description</h2>
+<table class=noborder>
+<tr valign=top><th width=20% class=sumparam>Register Name</th><td width=80% class=noborder>Core_CR3</td></tr>
+<tr valign=top><th class=sumparam>Offset Address</th><td class="hex noborder" id="registerOffset">0x0000032DA0</td></tr>
+<tr valign=top><th class=sumparam>Absolute Address</th><td class=noborder>
+<p>The base address for this register can be found by using the following formula:</p>
+<p>&nbsp;&nbsp;&nbsp;&nbsp;Register Base Address = 0x200_0000_0000 + (&lt;colnum> * 32 + &lt;rownum>) * 0x10_0000</p>
+<p><b>Note</b>: &lt;colnum> and &lt;rownum> are the column and row indices of the module in the matrix of AI Engine tiles.</p>
+</td></tr>
+<tr valign=top><th class=sumparam>Width</th><td class=noborder>32</td></tr>
+<tr valign=top><th class=sumparam>Type</th><td class="tooltip2rr noborder">rw<span class="tooltiptext2rr">Normal read/write</span></td></tr>
+<tr valign=top><th class=sumparam>Reset Value</th><td class="hex noborder">0x04FF2165</td></tr>
+<tr valign=top><th class=sumparam>Description</th><td class=noborder>Control register CR3</td></tr>
+</table>
+<p></p>
+<h2>Core_CR3 (CORE_MODULE) Register Bit-Field Summary</h2>
+<table>
+<tr valign=top><th width=20%>Field Name</th><th width=10%>Bits</th><th width=10%>Type</th><th width=10%>Reset Value</th><th width=50%>Description</th></tr>
+<tr valign=top><td>Float_to_Bfp_Invalid_Mask</td><td class="center">26</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x1</td><td>Conversion results in invalid output</td></tr>
+<tr valign=top><td>Nlf_Reserved2_Mask</td><td class="center">23</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x1</td><td>Reserved</td></tr>
+<tr valign=top><td>Nlf_Reserved1_Mask</td><td class="center">22</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x1</td><td>Reserved</td></tr>
+<tr valign=top><td>Nlf_Inexact_Mask</td><td class="center">21</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x1</td><td>Mask for non-linear functions inexact flag generation</td></tr>
+<tr valign=top><td>Nlf_Huge_Mask</td><td class="center">20</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x1</td><td>Mask for non-linear functions huge flag generation</td></tr>
+<tr valign=top><td>Nlf_Tiny_Mask</td><td class="center">19</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x1</td><td>Mask for non-linear functions tiny flag generation</td></tr>
+<tr valign=top><td>Nlf_Invalid_Mask</td><td class="center">18</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x1</td><td>Mask for non-linear functions invalid flag generation</td></tr>
+<tr valign=top><td>Nlf_Infinity_Mask</td><td class="center">17</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x1</td><td>Mask for non-linear functions infinity flag generation</td></tr>
+<tr valign=top><td>Nlf_Zero_Mask</td><td class="center">16</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x1</td><td>Mask for non-linear functions zero flag generation</td></tr>
+<tr valign=top><td>Fix_to_Float_Inexact_Mask</td><td class="center">13</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x1</td><td>Mask for fix to float inexact flag generation</td></tr>
+<tr valign=top><td>Fix_to_Float_Zero_Mask</td><td class="center"> 8</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x1</td><td>Mask for fix to float zero flag generation</td></tr>
+<tr valign=top><td>Float_to_Fix_Huge_Mask</td><td class="center"> 6</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x1</td><td>Mask for float to fix huge flag generation</td></tr>
+<tr valign=top><td>Float_to_Fix_Inexact_Mask</td><td class="center"> 5</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x1</td><td>Mask for float to fix inexact flag generation</td></tr>
+<tr valign=top><td>Float_to_Fix_Invalid_Mask</td><td class="center"> 2</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x1</td><td>Mask for float to fix invalid flag generation</td></tr>
+<tr valign=top><td>Float_to_Fix_Zero_Mask</td><td class="center"> 0</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x1</td><td>Mask for float to fix zero flag generation</td></tr>
+</table><p id=foot class=footer></p>
+</body>
+</html>

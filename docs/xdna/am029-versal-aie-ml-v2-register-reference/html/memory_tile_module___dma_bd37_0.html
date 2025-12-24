@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head>
+<title>DMA_BD37_0 (MEMORY_TILE_MODULE) Register</title>
+<meta name="robots" content="noindex, nofollow" />
+<link rel="stylesheet" type="text/css" href="./_register_reference.css">
+<script src="xilfunctions.js" type="text/javascript"></script>
+</head>
+<body>
+<p class=header><a href=# onclick=gotoTopic("_overview.html")>Versal Adaptive SoC AI Engine-ML v2 Register Reference</a> &gt; <a href=# onclick=gotoTopic("_module_summary.html")>Module Summary</a> &gt; <a href=# onclick=gotoTopic("mod___memory_tile_module.html")>MEMORY_TILE_MODULE Module</a> &gt; DMA_BD37_0 (MEMORY_TILE_MODULE) Register</p><h1>DMA_BD37_0 (MEMORY_TILE_MODULE) Register</h1>
+<h2>DMA_BD37_0 (MEMORY_TILE_MODULE) Register Description</h2>
+<table class=noborder>
+<tr valign=top><th width=20% class=sumparam>Register Name</th><td width=80% class=noborder>DMA_BD37_0</td></tr>
+<tr valign=top><th class=sumparam>Offset Address</th><td class="hex noborder" id="registerOffset">0x00000A04A0</td></tr>
+<tr valign=top><th class=sumparam>Absolute Address</th><td class=noborder>
+<p>The base address for this register can be found by using the following formula:</p>
+<p>&nbsp;&nbsp;&nbsp;&nbsp;Register Base Address = 0x200_0000_0000 + (&lt;colnum> * 32 + &lt;rownum>) * 0x10_0000</p>
+<p><b>Note</b>: &lt;colnum> and &lt;rownum> are the column and row indices of the module in the matrix of AI Engine tiles.</p>
+</td></tr>
+<tr valign=top><th class=sumparam>Width</th><td class=noborder>32</td></tr>
+<tr valign=top><th class=sumparam>Type</th><td class="tooltip2rr noborder">rw<span class="tooltiptext2rr">Normal read/write</span></td></tr>
+<tr valign=top><th class=sumparam>Reset Value</th><td class="hex noborder">0x00000000</td></tr>
+<tr valign=top><th class=sumparam>Description</th><td class=noborder>DMA BD37 0</td></tr>
+</table>
+<p></p>
+<h2>DMA_BD37_0 (MEMORY_TILE_MODULE) Register Bit-Field Summary</h2>
+<table>
+<tr valign=top><th width=20%>Field Name</th><th width=10%>Bits</th><th width=10%>Type</th><th width=10%>Reset Value</th><th width=50%>Description</th></tr>
+<tr valign=top><td>Enable_Packet</td><td class="center">31</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0</td><td>Enable adding packet header at start of transfer (MM2S only)</td></tr>
+<tr valign=top><td>Packet_Type</td><td class="center">30:28</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0</td><td>Value of inserted Packet Type field in packet header (MM2S only)</td></tr>
+<tr valign=top><td>Packet_ID</td><td class="center">27:23</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0</td><td>Value of inserted Packet ID field in packet header (MM2S only)</td></tr>
+<tr valign=top><td>Out_Of_Order_BD_ID</td><td class="center">22:17</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0</td><td>Insert Out of Order ID field in packet header (MM2S only)</td></tr>
+<tr valign=top><td>Buffer_Length</td><td class="center">16:0</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0</td><td>Buffer Length (number of 32-bit words) (Actual); Range [0:128k-1]</td></tr>
+</table><p id=foot class=footer></p>
+</body>
+</html>

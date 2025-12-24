@@ -1,0 +1,47 @@
+<!doctype html>
+<html>
+<head>
+<title>Module Summary</title>
+<meta name="robots" content="noindex, nofollow" />
+<link rel="stylesheet" type="text/css" href="./_register_reference.css">
+<script src="xilfunctions.js" type="text/javascript"></script>
+</head>
+<body>
+<p class=header><a href=# onclick=gotoTopic("_overview.html")>Versal Adaptive SoC AIE-ML Register Reference</a> &gt; Module Summary<h1>Module Summary</h1><p>The AI Engine-ML consists of a matrix of Tiles, Memory Tiles, and Interface Tiles, each containing one or more Modules:</p>
+<h3>Tile</h3>
+<ul>
+    <li>Core Module</li>
+    <li>Memory Module</li>
+</ul>
+<p>The register base addresses for compute modules can be found by using the following formula:<br>
+&nbsp;&nbsp;&nbsp;Register Base Address = 0x200_0000_0000 + (&lt;colnum> * 32 + &lt;rownum + <i>m</i> + 1>) * 0x10_0000<br>
+&nbsp;&nbsp;&nbsp;<b>Note 1</b>: The first row of compute tiles is rownum 0.<br>
+&nbsp;&nbsp;&nbsp;<b>Note 2</b>: <i>m</i> is the number of memory tile rows, which is 1 or 2 depending on the device.</p>
+<p>For the calculated addresses for each device, see <a href="https://support.xilinx.com/s/article/000036946?language=en_US" target="_blank" rel="noopener noreferrer">Answer Record 000036946</a>.</p>
+<h3>Memory Tile</h3>
+<ul>
+    <li>Memory Tile Module</li>
+</ul>
+<p>The register base addresses for memory tile modules can be found by using the following formula:<br>
+&nbsp;&nbsp;&nbsp;Register Base Address = 0x200_0000_0000 + (&lt;colnum> * 32 + &lt;rownum + 1>) * 0x10_0000<br>
+&nbsp;&nbsp;&nbsp;<b>Note</b>: The first row of memory tiles is rownum 0.<br>
+<p>For the calculated addresses for each device, see <a href="https://support.xilinx.com/s/article/000036946?language=en_US" target="_blank" rel="noopener noreferrer">Answer Record 000036946</a>.</p>
+<h3>Interface Tile</h3>
+<ul>
+    <li>PL_Module</li>
+    <li>NOC_Module (not in every Interface Tile)</li>
+</ul>
+<p>The register base addresses for interface modules can be found by using the following formula:<br>
+&nbsp;&nbsp;&nbsp;Register Base Address = 0x200_0000_0000 + (&lt;colnum> * 32) * 0x10_0000<br>
+&nbsp;&nbsp;&nbsp;<b>Note</b>: Not all columns have a NOC module.</p>
+<p>For the calculated addresses for each device, see <a href="https://support.xilinx.com/s/article/000036946?language=en_US" target="_blank" rel="noopener noreferrer">Answer Record 000036946</a>.</p>
+
+<table><tr valign=top><th width=30%>Module Type</th><th width=50%>Description</th></tr><tr valign=top><td width="30%"><a href=# onclick=gotoTopic("mod___core_module.html")>CORE_MODULE</a></td><td width=50%>Core Module Control and Status Registers</td></tr>
+<tr valign=top><td width="30%"><a href=# onclick=gotoTopic("mod___memory_module.html")>MEMORY_MODULE</a></td><td width=50%>Memory Module Control and Status Registers</td></tr>
+<tr valign=top><td width="30%"><a href=# onclick=gotoTopic("mod___memory_tile_module.html")>MEMORY_TILE_MODULE</a></td><td width=50%>Memory Tile Control and Status Registers</td></tr>
+<tr valign=top><td width="30%"><a href=# onclick=gotoTopic("mod___noc_module.html")>NOC_MODULE</a></td><td width=50%>NoC Interface Control and Status Registers</td></tr>
+<tr valign=top><td width="30%"><a href=# onclick=gotoTopic("mod___pl_module.html")>PL_MODULE</a></td><td width=50%>PL Interface Control and Status Registers</td></tr>
+</table>
+<p id=foot class=footer></p>
+</body>
+</html>

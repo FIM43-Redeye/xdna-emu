@@ -1,14 +1,26 @@
 # Phase 1: Core Accuracy
 
-**Goal**: Make the emulator cycle-accurate to real AIE2 hardware behavior.
+**Goal**: Make the emulator cycle-accurate to real AIE2 hardware behavior, including as many edge cases as possible.
 
-**Status**: 🟡 Functional (Timing TODO)
+**Status**: 🟢 Functional Emulation Complete | 🟡 Timing TODO
+
+---
+
+## Documentation Sources
+
+Architecture constants verified against AMD official documentation:
+- **AM020**: Versal AI Engine ML (AIE-ML) Architecture Manual
+- **AM025**: AIE-ML Register Reference
+- **AM027**: AIE-ML v2 (AIE2P) Architecture Manual
+- **AM029**: AIE-ML v2 Register Reference
+
+All constants now defined in `src/device/aie2_spec.rs` with AM020 section references.
 
 ---
 
 ## Architecture Overview
 
-Based on analysis of [llvm-aie](https://github.com/Xilinx/llvm-aie) TableGen files, AIE2 has:
+Based on AMD AM020 and [llvm-aie](https://github.com/Xilinx/llvm-aie) TableGen files, AIE2 has:
 
 ### VLIW Structure
 - **8 functional slots**: `lda`, `ldb`, `alu`, `mv`, `st`, `vec`, `lng`, `nop`
@@ -40,14 +52,14 @@ Based on analysis of [llvm-aie](https://github.com/Xilinx/llvm-aie) TableGen fil
 | Slot operation types (`SlotOp`, `Operation`) | ✅ Done | 30+ operation types |
 | Pattern-based decoder | ✅ Done | `src/interpreter/decode/patterns.rs` |
 | TableGen-based decoder | ✅ Done | `src/interpreter/decode/tablegen_decoder.rs` |
-| VLIW slot extraction | ✅ Done | 16-112 bit formats fully supported |
-| Full VLIW bundle parsing | ✅ Done | All formats 16-112 bit, 128-bit rare |
+| VLIW slot extraction | ✅ Done | All formats 16-128 bit fully supported |
+| Full VLIW bundle parsing | ✅ Done | All formats 16-128 bit complete |
 
 **Files created**:
 - `src/interpreter/bundle/mod.rs` - VliwBundle struct, disassembler
 - `src/interpreter/bundle/slot.rs` - SlotIndex, SlotOp, Operation, Operand
 - `src/interpreter/bundle/encoding.rs` - BundleFormat, format detection
-- `src/interpreter/bundle/slot_layout.rs` - VLIW slot extraction (16-112 bit)
+- `src/interpreter/bundle/slot_layout.rs` - VLIW slot extraction (16-128 bit)
 - `src/interpreter/decode/mod.rs` - Aie2Slot, extraction helpers
 - `src/interpreter/decode/patterns.rs` - PatternDecoder
 - `src/interpreter/decode/tablegen_decoder.rs` - TableGenDecoder
@@ -73,11 +85,22 @@ Based on analysis of [llvm-aie](https://github.com/Xilinx/llvm-aie) TableGen fil
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Vector registers (32 × 256-bit) | ✅ Done | `VectorRegisterFile` in `state/registers.rs` |
-| Accumulator registers (8 × 512-bit) | ✅ Done | `AccumulatorRegisterFile` |
+| Vector registers | ✅ Done | `VectorRegisterFile` in `state/registers.rs` |
+| Accumulator registers | ✅ Done | `AccumulatorRegisterFile` |
 | Vector ALU operations | ✅ Done | `VectorAlu` in `execute/vector.rs` |
 | Shuffle/permute | ✅ Done | ShufflePattern enum + execution |
 | Element types | ✅ Done | i8/u8/i16/u16/i32/u32/bf16/f32 |
+| BFloat16 arithmetic | ✅ Done | Proper bf16↔f32 conversion |
+| Float32 arithmetic | ✅ Done | IEEE 754 float operations |
+
+**AM020 Register Architecture** (see `aie2_spec.rs`):
+- W registers: 24 × 256-bit (wl0-wl11, wh0-wh11)
+- X registers: 12 × 512-bit (pairs of W)
+- Y registers: 6 × 1024-bit (pairs of X)
+- Accumulator am: 8 × 256-bit
+- Accumulator bm: 4 × 512-bit (pairs of am)
+- Accumulator cm: 2 × 1024-bit (pairs of bm)
+- Mask Q registers: 4 × 128-bit (for sparsity)
 
 **Implemented operations**:
 - `VectorAdd`, `VectorSub`, `VectorMul`, `VectorMac`
@@ -91,10 +114,18 @@ Based on analysis of [llvm-aie](https://github.com/Xilinx/llvm-aie) TableGen fil
 | Load/store operations | ✅ Done | `MemoryUnit` in `execute/memory.rs` |
 | Memory width variants | ✅ Done | Byte/HalfWord/Word/DoubleWord/QuadWord/Vector256 |
 | Post-modify addressing | ✅ Done | None/Immediate/Register |
-| Bank conflict detection | 🔲 TODO | 8 banks in 64KB, same-bank = stall |
-| Access latency model | 🔲 TODO | Local: 1 cycle, conflict: +1 cycle |
+| Bank conflict detection | 🔲 TODO | 8 banks × 8KB = 64KB |
+| Access latency model | 🔲 TODO | 5 cycles (AM020 Ch4) |
 | Alignment penalty | 🔲 TODO | Unaligned access may stall |
-| Memory bank mapping | 🔲 TODO | Address bits -> bank selection |
+| Memory bank mapping | 🔲 TODO | Address bits → bank selection |
+
+**AM020 Memory Architecture**:
+- Program memory: 16 KB (1024 × 128-bit instructions)
+- Data memory per tile: 64 KB (8 banks × 8 KB)
+- Memory tile: 512 KB (16 banks × 32 KB)
+- Addressable per core: 256 KB (4 neighboring tiles)
+- Bank width: 128 bits
+- Two 256-bit load ports + one 256-bit store port
 
 ### 1.5 DMA Engine
 
@@ -115,10 +146,17 @@ Based on analysis of [llvm-aie](https://github.com/Xilinx/llvm-aie) TableGen fil
 | Task | Status | Notes |
 |------|--------|-------|
 | Lock acquire/release | ✅ Done | `ControlUnit` in `execute/control.rs` |
+| Lock value clamping | ✅ Done | 6-bit (0-63) per AM020 |
 | Lock contention tracking | 🔲 TODO | Stall cycles when lock busy |
 | Lock acquire latency | 🔲 TODO | Cycles to acquire uncontested lock |
 | Deadlock detection | 🔲 TODO | Circular wait detection |
 | Barrier synchronization | 🔲 TODO | Multi-core barrier timing |
+
+**AM020 Lock Architecture**:
+- Compute tiles: 16 semaphore locks
+- Memory tiles: 64 semaphore locks
+- Lock state: 6-bit unsigned (0-63)
+- No acquired bit (unlike AIE1)
 
 ### 1.7 Stream Switch
 
@@ -144,14 +182,19 @@ Based on analysis of [llvm-aie](https://github.com/Xilinx/llvm-aie) TableGen fil
 | VLIW slot parallelism | 🔲 TODO | Concurrent slot execution |
 | Branch penalty | 🔲 TODO | Cycles lost on taken branch |
 
-**Approximate instruction latencies** (need hardware validation):
-- Scalar ALU (add, sub, and, or): 1 cycle
-- Scalar multiply: 2-3 cycles
-- Vector ALU: 2-4 cycles
-- Vector MAC: 4-8 cycles
-- Load (local memory): 1 cycle + bank conflicts
-- Store (local memory): 1 cycle
-- Branch (taken): 2-4 cycles penalty
+**Instruction latencies from AM020 Ch4** (now in `aie2_spec.rs`):
+- Scalar add/sub/compare/shift: 1 cycle
+- Scalar multiply (32x32): 2 cycles
+- Scalar logic (AND/OR/XOR): 1 cycle
+- Data memory access: 5 cycles
+- AGU (address generation): 1 cycle
+- Maximum pipeline depth: 8 stages
+
+**Stream switch latencies from AM020 Ch2**:
+- Local slave → local master: 3 cycles (6-deep FIFO)
+- Local slave → external master: 4 cycles (8-deep FIFO)
+- External slave → local master: 3 cycles (6-deep FIFO)
+- External → external: 4 cycles (8-deep FIFO)
 
 ### 1.9 Multi-Core Coordination
 
@@ -221,15 +264,13 @@ Recognition rate: 100% (20/20 instructions)
 - 16-bit NOP format (`0x0001` marker) now recognized
 - **Slot extraction from VLIW bundles** - new `slot_layout.rs` module
   - Extracts individual slot bits from packed bundles
-  - Supports 32-bit single-slot formats (LDA, LDB, ALU, MV, ST, VEC)
-  - Supports 48-bit dual-slot formats (LDA+ST, LDA+MV, LDA+ALU, LDB variants, LNG)
-  - Supports 64-bit multi-slot formats (ALU+MV, ALU+VEC, LDA+LDB+ST, etc.)
+  - Supports all formats from 16-bit to 128-bit
+  - 128-bit format detection fixed to recognize bit 0 = 0 (any even nibble)
 - Decoder now uses slot extraction for accurate instruction recognition
 
 **Remaining work** (areas for further improvement):
-1. 80-128 bit format slot extraction (complex hierarchical layouts)
-2. Improve operand extraction for specific instruction variants
-3. Vector/DMA instruction semantics
+1. Improve operand extraction for specific instruction variants
+2. Vector/DMA instruction semantics
 
 ---
 
@@ -277,7 +318,7 @@ src/tablegen/           # ✅ DONE
 
 ## Test Coverage
 
-**Total: 277 tests passing** (272 unit + 5 doc tests)
+**Total: 296 tests passing** (291 unit + 5 doc tests)
 
 | Module | Tests | Notes |
 |--------|-------|-------|
@@ -314,9 +355,10 @@ Current status: **100% instruction recognition** on test ELF binaries. **Timing 
 
 ### Completed (Functional Emulation)
 
-1. **VLIW bundle slot extraction** - All 16-112 bit formats
+1. **VLIW bundle slot extraction** - All 16-128 bit formats
    - 16-bit NOP, 32-bit single-slot, 48-bit dual-slot, 64-bit multi-slot
    - 80-bit (21 format variants), 96-bit (20+ variants), 112-bit (8 variants)
+   - 128-bit (2 variants: LDB+LDA+ST+ALU+MV+VEC and LDB+LDA+ST+LNG+VEC)
 
 2. **TableGen-based decoder** - 70/135 instructions resolved
 
@@ -354,8 +396,7 @@ Current status: **100% instruction recognition** on test ELF binaries. **Timing 
 
 ### Minor Remaining Work (Decoding)
 
-1. **128-bit format extraction** (rare, ~0% of test binaries)
-2. **Improve operand extraction** for some Load/Vector instructions
+1. **Improve operand extraction** for some Load/Vector instructions
 
 ---
 
@@ -390,8 +431,13 @@ The interpreter uses a simplified 7-slot model internally while the decoder unde
 
 ## Resources
 
+- **AMD Documentation** (in `docs/xdna/`):
+  - AM020: AIE-ML Architecture Manual (primary reference)
+  - AM025: AIE-ML Register Reference
+  - AM027: AIE-ML v2 Architecture (for AIE2P)
+  - AM029: AIE-ML v2 Register Reference
 - **llvm-aie TableGen**: `llvm/lib/Target/AIE/` in [Xilinx/llvm-aie](https://github.com/Xilinx/llvm-aie)
 - **Key files**: `AIE2Slots.td`, `AIE2GenInstrFormats.td`, `AIE2GenInstrInfo.td`
 - **aie-rt**: Register definitions in [Xilinx/aie-rt](https://github.com/Xilinx/aie-rt)
-- **AMD Docs**: AM020 (AIE2 Architecture), AM025 (Register Reference)
+- **Architecture constants**: `src/device/aie2_spec.rs` (with AM020 references)
 - **Assessment**: [tablegen-assessment.md](tablegen-assessment.md)

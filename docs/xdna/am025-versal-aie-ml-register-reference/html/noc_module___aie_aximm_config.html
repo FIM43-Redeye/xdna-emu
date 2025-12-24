@@ -1,0 +1,33 @@
+<!doctype html>
+<html>
+<head>
+<title>AIE_AXIMM_Config (NOC_MODULE) Register</title>
+<meta name="robots" content="noindex, nofollow" />
+<link rel="stylesheet" type="text/css" href="./_register_reference.css">
+<script src="xilfunctions.js" type="text/javascript"></script>
+</head>
+<body>
+<p class=header><a href=# onclick=gotoTopic("_overview.html")>Versal Adaptive SoC AIE-ML Register Reference</a> &gt; <a href=# onclick=gotoTopic("_module_summary.html")>Module Summary</a> &gt; <a href=# onclick=gotoTopic("mod___noc_module.html")>NOC_MODULE Module</a> &gt; AIE_AXIMM_Config (NOC_MODULE) Register</p><h1>AIE_AXIMM_Config (NOC_MODULE) Register</h1>
+<h2>AIE_AXIMM_Config (NOC_MODULE) Register Description</h2>
+<table class=noborder>
+<tr valign=top><th width=20% class=sumparam>Register Name</th><td width=80% class=noborder>AIE_AXIMM_Config</td></tr>
+<tr valign=top><th class=sumparam>Offset Address</th><td class="hex noborder" id="registerOffset">0x000001E020</td></tr>
+<tr valign=top><th class=sumparam>Absolute Address</th><td class=noborder>
+<p>The notation for the AI Engine register addresses is aie_[pl]/[core]/[memory]/[noc]_module_column_row.</p>
+</td></tr>
+<tr valign=top><th class=sumparam>Width</th><td class=noborder>32</td></tr>
+<tr valign=top><th class=sumparam>Type</th><td class="tooltip2rr noborder">rw<span class="tooltiptext2rr">Normal read/write</span></td></tr>
+<tr valign=top><th class=sumparam>Reset Value</th><td class="hex noborder">0x00000000</td></tr>
+<tr valign=top><th class=sumparam>Description</th><td class=noborder>Configuration selection between AXIS and AXIMM on NoC Interface (privileged)</td></tr>
+</table>
+<p></p>
+<h2>AIE_AXIMM_Config (NOC_MODULE) Register Bit-Field Summary</h2>
+<table>
+<tr valign=top><th width=20%>Field Name</th><th width=10%>Bits</th><th width=10%>Type</th><th width=10%>Reset Value</th><th width=50%>Description</th></tr>
+<tr valign=top><td>DECERR_Block</td><td class="center"> 3</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x0</td><td>1: Block returning of DECERR when accessing non-existant tiles;</td></tr>
+<tr valign=top><td>SLVERR_Block</td><td class="center"> 2</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x0</td><td>1: Block returning of SLVERR when accessing unmapped registers;</td></tr>
+<tr valign=top><td>Slave_Sel</td><td class="center"> 1</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x0</td><td>0: Select AXIMM; 1: Select Streaming</td></tr>
+<tr valign=top><td>Master_Sel</td><td class="center"> 0</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x0</td><td>0: Select AXIMM; 1: Select Streaming</td></tr>
+</table><p id=foot class=footer></p>
+</body>
+</html>

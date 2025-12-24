@@ -1,0 +1,119 @@
+﻿<!doctype html>
+<html>
+<head>
+<title>Overview</title>
+<!--farOnly--><link rel="stylesheet" TYPE="text/css" href="./_register_reference.css">
+<meta name="robots" content="noindex, nofollow" />
+<!--farOnly--><script src="xilfunctions.js" type="text/javascript"></script>
+</head>
+<body>
+<!--farOnly-->
+<h1>Overview</h1>
+
+<details><p><summary class="collapseHead">Organization</summary>
+<p>The register summary lists each instance of a register module; it is alphabetically organized by instance name and includes its address space.</p>
+The body of the register manual describes each register module; the instances are summarized at the beginning of the register module description.</p></details>
+
+<details><p><summary class="collapseHead">Name Representation</summary>
+<p>The technical reference manuals use the following format for identifying registers:</p>
+<ul>
+<li>module_name.register_name</li>
+</ul>
+<p>To add register bit field:</p>
+<ul>
+<li>module_name.register_name [bitfield_name]</li>
+</ul>
+<p>There are other representations in engineering, and in software code and documentation.</p></details>
+
+<details><p><summary class="collapseHead">Register Access</summary>
+<p>The APB and NPI register interfaces require word read/write transactions (32-bit).
+The APB register interfaces support single read and write transactions.
+The NPI register interfaces supports burst read and write transactions.</p>
+<p>In many cases, register writes should be done with a read-modify-write transaction to maintain the settings of reserved register bits.
+When a register bitfield is a full 32 bits wide, then a read is not necessary.</p>
+<p>The register interfaces can detect accesses to un-implemented registers;
+in this case, the register interface might assert an error and/or interrupt signal.</p></details>
+
+<details><p><summary class="collapseHead">Read/Write Access Types</summary>
+
+<table>
+<tr valign=top><th width=20%>Access Types</th><th width=80%>Description</th></tr>
+<tr valign=top><td width=20%>clronrd</td><td width=80%>Readable, clears value on read</td></tr>
+<tr valign=top><td width=20%>clronwr</td><td width=80%>Readable, clears value on write</td></tr>
+<tr valign=top><td width=20%>nsnsro</td><td width=80%>During non-secure access, if thread is non-secure, it is read only</td></tr>
+<tr valign=top><td width=20%>nsnsrw</td><td width=80%>During non-secure access, if thread is non-secure, it is read write</td></tr>
+<tr valign=top><td width=20%>nsnswo</td><td width=80%>During non-secure access, if thread is non-secure, it is write only</td></tr>
+<tr valign=top><td width=20%>nssraz</td><td width=80%>During non-secure access, if thread is secure, it is read as zero</td></tr>
+<tr valign=top><td width=20%>raz</td><td width=80%>Read as zero</td></tr>
+<tr valign=top><td width=20%>ro</td><td width=80%>Read-only</td></tr>
+<tr valign=top><td width=20%>rs</td><td width=80%>w: no effect, r: sets all bits</td></tr>
+<tr valign=top><td width=20%>rud</td><td width=80%>Read undefined</td></tr>
+<tr valign=top><td width=20%>rw</td><td width=80%>Normal read/write</td></tr>
+<tr valign=top><td width=20%>rwso</td><td width=80%>Read/write, set only</td></tr>
+<tr valign=top><td width=20%>sro</td><td width=80%>During secure access, it is read only</td></tr>
+<tr valign=top><td width=20%>srw</td><td width=80%>During secure access, it is read write</td></tr>
+<tr valign=top><td width=20%>swo</td><td width=80%>During secure access, it is  write only</td></tr>
+<tr valign=top><td width=20%>w0c</td><td width=80%>w: 1/0 no effect on/clears matching bit, r: no effect</td></tr>
+<tr valign=top><td width=20%>w0crs</td><td width=80%>w: 1/0 no effect on/clears matching bit, r: sets all bits</td></tr>
+<tr valign=top><td width=20%>w0s</td><td width=80%>w: 1/0 no effect on/sets matching bit, r: no effect</td></tr>
+<tr valign=top><td width=20%>w0src</td><td width=80%>w: 1/0 no effect on/sets matching bit, r: clears all bits</td></tr>
+<tr valign=top><td width=20%>w0t</td><td width=80%>w: 1/0 no effect on/toggles matching bit, r: no effect</td></tr>
+<tr valign=top><td width=20%>w1</td><td width=80%>w: first one after ~hard~ reset is as-is, other w have no effects, r: no effect</td></tr>
+<tr valign=top><td width=20%>w1crs</td><td width=80%>w: 1/0 clears/no effect on matching bit, r: sets all bits</td></tr>
+<tr valign=top><td width=20%>w1src</td><td width=80%>w: 1/0 sets/no effect on matching bit, r: clears all bits</td></tr>
+<tr valign=top><td width=20%>w1t</td><td width=80%>w: 1/0 toggles/no effect on matching bit, r: no effect</td></tr>
+<tr valign=top><td width=20%>waz</td><td width=80%>Write as zero</td></tr>
+<tr valign=top><td width=20%>wcrs</td><td width=80%>w: clears all bits, r: sets all bits</td></tr>
+<tr valign=top><td width=20%>wo</td><td width=80%>Write-only</td></tr>
+<tr valign=top><td width=20%>wo1</td><td width=80%>w: first one after ~hard~ reset is as-is, other w have no effects, r: error</td></tr>
+<tr valign=top><td width=20%>woc</td><td width=80%>w: clears all bits, r: error</td></tr>
+<tr valign=top><td width=20%>wos</td><td width=80%>w: sets all bits, r: error</td></tr>
+<tr valign=top><td width=20%>wrc</td><td width=80%>w: as-is, r: clears all bits</td></tr>
+<tr valign=top><td width=20%>wrs</td><td width=80%>w: as-is, r: sets all bits</td></tr>
+<tr valign=top><td width=20%>ws</td><td width=80%>w: sets all bits, r: no effect</td></tr>
+<tr valign=top><td width=20%>wsrc</td><td width=80%>w: sets all bits, r: clears all bits</td></tr>
+<tr valign=top><td width=20%>wtc</td><td width=80%>Readable, write a 1 to clear</td></tr>
+<tr valign=top><td width=20%>z</td><td width=80%>Access (read or write) as zero</td></tr>
+</table>
+
+</details>
+
+<details><p><summary class="collapseHead">Introduction to Versal Adaptive SoC</summary>
+<p>Versal® Adaptive SoCs combine Scalar Engines, Adaptable Engines, and Intelligent Engines with leading-edge memory and interfacing technologies to deliver powerful heterogeneous acceleration for any application. Most importantly, Versal Adaptive SoC hardware and software are targeted for programming and optimization by data scientists and software and hardware developers. Versal Adaptive SoCs are enabled by a host of tools, software, libraries, IP, middleware, and frameworks to enable all industry-standard design flows.</p>
+<p>Built on the TSMC 7 nm FinFET process technology, the Versal portfolio is the first platform to combine software programmability and domain-specific hardware acceleration with the adaptability necessary to meet today's rapid pace of innovation. The portfolio includes six series of devices uniquely architected to deliver scalability and AI inference capabilities for a host of applications across different markets—from cloud—to networking—to wireless communications—to edge computing and endpoints.</p>
+<p>The Versal architecture combines different engine types with a wealth of connectivity and communication capability and a network on chip (NoC) to enable seamless memory-mapped access to the full height and width of the device. Intelligent Engines are SIMD VLIW AI Engines for adaptive inference and advanced signal processing compute, and DSP Engines for fixed point, floating point, and complex MAC operations. Adaptable Engines are a combination of programmable logic blocks and memory, architected for high-compute density. Scalar Engines, including Arm® Cortex®-A72 and Cortex-R5F processors, allow for intensive compute tasks.</p>
+<p>The Versal AI Edge series focuses on AI performance per watt for real-time systems in automated drive, predictive factory and healthcare systems, multi-mission payloads in aerospace & defense, and a breadth of other applications. More than just AI, the Versal AI Edge series accelerates the whole application from sensor to AI to real-time control, all with the highest levels of safety and security to meet critical standards such as ISO26262 and IEC 61508.</p>
+<p>The Versal AI Core series delivers breakthrough AI inference acceleration with AI Engines that deliver over 100x greater compute performance than current server-class of CPUs. This series is designed for a breadth of applications, including cloud for dynamic workloads and network for massive bandwidth, all while delivering advanced safety and security features. AI and data scientists, as well as software and hardware developers, can all take advantage of the high-compute density to accelerate the performance of any application.</p>
+<p>The Versal Prime series is the foundation and the mid-range of the Versal platform, serving the broadest range of uses across multiple markets. These applications include 100G to 200G networking equipment, network and storage acceleration in the Data Center, communications test equipment, broadcast, and aerospace & defense. The series integrates mainstream 58G transceivers and optimized I/O and DDR connectivity, achieving low-latency acceleration and performance across diverse workloads.</p>
+<p>The Versal Premium series provides breakthrough heterogeneous integration, very high-performance compute, connectivity, and security in an adaptable platform with a minimized power and area footprint. The series is designed to exceed the demands of high-bandwidth, compute-intensive applications in wired communications, data center, test & measurement, and other applications. Versal Premium series Adaptive SoCs include 112G PAM4 transceivers and integrated blocks for 600G Ethernet, 600G Interlaken, PCI Express® Gen5, and high-speed cryptography.</p>
+<p>The Versal HBM series enables the convergence of fast memory, adaptable compute, and secure connectivity in a single platform. The series is architected to keep up with the higher memory needs of the most compute intensive, memory bound applications, providing adaptable acceleration for data center, wired networking, test & measurement, and aerospace & defense applications. Versal HBM Adaptive SoCs integrate the most advanced HBM2e DRAM, providing high memory bandwidth and capacity within a single device.</p>
+<p>The Versal architecture documentation suite is available at: <a href="https://www.xilinx.com/versal">https://www.xilinx.com/versal</a>.</p></details>
+
+<details><p><summary class="collapseHead">Navigating Content by Design Process</summary>
+<p>Xilinx&reg; documentation is organized around a set of standard design processes to help you find
+relevant content for your current development task. This document covers the following design processes:</p>
+<ul>
+  <li><span style="font-weight: bold;">System and Solution Planning:</span> Identifying the components, performance, I/O, and data transfer requirements at a system level. Includes application mapping for the solution to PS, PL, and AI Engine.</li>
+  <li><span style="font-weight: bold;">Embedded Software Development:</span> Creating the software platform from the hardware platform and
+developing the application code using the embedded CPU. Also covers XRT and Graph APIs.</li>
+  <li><span style="font-weight: bold;">Board System Design:</span> Designing a PCB through schematics and board layout. Also involves power, thermal, and signal integrity considerations.</li>
+  </li>
+</ul></details>
+
+<details id="inclusive"><p><summary class="collapseHead">Inclusive Terminology</summary>
+Xilinx is creating an environment where employees, customers, and partners feel welcome and included. To that end, we’re removing
+non-inclusive language from our products and related collateral. We’ve launched an internal initiative to remove language that could exclude
+people or reinforce historical biases, including terms embedded in our software and IPs. You may still find examples of non-inclusive language
+in our older products as we work to make these changes and align with evolving industry standards. 
+Follow this <a href="https://www.xilinx.com/content/dam/xilinx/publications/about/Inclusive-terminology.pdf">link</a> for more information.</p></details>
+
+<!--farOnly--><h3>See Also</h3>
+<!--farOnly--><ul>
+<!--farOnly--><li><a href=# onclick=gotoTopic("_module_summary.html")>Module Summary</a></li>
+<!--farOnly--><li><a href=# onclick=gotoTopic("_legal_notices.html")>Legal Notices</a></li>
+<!--farOnly--><li><a href=# onclick=gotoTopic("_revision_history.html")>Revision History</a></li>
+<!--farOnly--></ul>
+<!--farOnly--><p id="foot" class="footer"></p>
+<!--farOnly-->
+</body>
+</html>

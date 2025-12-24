@@ -1,0 +1,151 @@
+﻿body {font-family: Verdana, arial, sans-serif;}
+
+h1 {
+    font-weight: normal;
+    color: black;
+    border-bottom-width: 2px;
+    border-bottom-color: rgb(178, 8, 56);
+    border-bottom-style: solid;
+    padding-bottom: 10px;
+    margin-bottom: 30px;
+}
+h2 {
+    font-weight: normal;
+    color: black;
+    border-bottom-width: 1px;
+    border-bottom-color: rgb(178, 8, 56);
+    border-bottom-style: solid;
+    padding-bottom: 5px;
+    margin-bottom: 20px;
+}
+h3 {
+    font-weight: normal;
+    color: black;
+    border-bottom-width: 1px;
+    border-bottom-color: rgb(178, 8, 56);
+    border-bottom-style: solid;
+    padding-bottom: 5px;
+    margin-bottom: 20px;
+}
+
+table {width: 100%;
+    border-collapse: collapse;
+    border: 5px solid lightgray;}
+tr {vertical-align: text-top;}
+th {border: 1px solid lightgray;
+    color: white;
+    background-color: dimgray;
+    padding: 8px;
+}
+th.sumparam {text-align: left;
+    color: black;
+    background-color: white;
+    border: 0px;
+    padding: 4px;
+}
+td {border: 1px solid gray;
+    vertical-align: top;
+}
+.noborder {border: 0px;
+    padding: 4px;
+    text-align: left;
+}
+.diff-change {background-color: #ffffcc;}
+.diff-chgadd {background-color: #ccff99;}
+.diff-add {background-color: #ccffff;}
+.diff-rmv {background-color: #ffe5e5;}
+
+p.confidential {font-size: 16px;
+    font-weight: bold;
+    color: rgb(255, 121, 0);}
+p.header {font-size: 12px;
+    color: slategray;}
+p.footer {font-size: 12px;
+    color: slategray;}
+p.disclaimer {font-size: 12px;
+    color: slategray;}
+
+.grayback {background-color: aliceblue;}
+
+.center {text-align: center;}
+
+.hex {text-align: center;
+    font-family: Courier,"Courier New",monospace;
+}
+
+/* Tooltip container */
+.tooltip3rr {
+    position: relative;
+    color: blue;
+    text-align: center;
+}
+
+/* Tooltip container */
+.tooltip2rr {
+    position: relative;
+    color: blue;
+    text-align: left;
+}
+
+/* Tooltip text */
+.tooltip3rr .tooltiptext2rr, .tooltip2rr .tooltiptext2rr {
+    visibility: hidden;
+    width: 300px;
+    background-color: LightGoldenRodYellow;
+    color: black;
+    text-align: center;
+    padding: 5px 0;
+    border-radius: 6px;
+    border: 1px solid black;
+
+    /* Position the tooltip text */
+    position: absolute;
+    z-index: 1;
+    bottom: 125%;
+
+    /* Fade in tooltip */
+    opacity: 0;
+    transition: opacity 0.5s;
+}
+
+.tooltip3rr .tooltiptext2rr {
+    left: 50%;
+    margin-left: -60px;
+}
+
+.tooltip2rr .tooltiptext2rr {
+    left: 0;
+    margin-left: -60px;
+}
+
+/* Tooltip arrow */
+.tooltip3rr .tooltiptext2rr::after, .tooltip2rr .tooltiptext2rr::after {
+    content: "";
+    position: absolute;
+    top: 100%;
+    margin-left: -7px;
+    border-width: 7px;
+    border-style: solid;
+    border-color: #555 transparent transparent transparent;
+}
+
+.tooltip3rr .tooltiptext2rr::after {
+    left: 60px;
+}
+
+.tooltip2rr .tooltiptext2rr::after {
+    left: 70px;
+}
+
+/* Show the tooltip text when you mouse over the tooltip container */
+.tooltip3rr:hover .tooltiptext2rr, .tooltip2rr:hover .tooltiptext2rr {
+    visibility: visible;
+    opacity: 1;
+}
+
+.collapseHead {
+    font-weight: normal;
+    font-size: 14pt;
+    color: black;
+    margin-bottom: 20px;
+}

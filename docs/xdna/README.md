@@ -1,0 +1,1 @@
+AI AGENTS: Do NOT read the PDFs in this root folder! Use the split-by-chapter text files in the folders instead.

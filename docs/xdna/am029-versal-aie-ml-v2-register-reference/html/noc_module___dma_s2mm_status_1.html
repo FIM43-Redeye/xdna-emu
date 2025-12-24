@@ -1,0 +1,46 @@
+<!doctype html>
+<html>
+<head>
+<title>DMA_S2MM_Status_1 (NOC_MODULE) Register</title>
+<meta name="robots" content="noindex, nofollow" />
+<link rel="stylesheet" type="text/css" href="./_register_reference.css">
+<script src="xilfunctions.js" type="text/javascript"></script>
+</head>
+<body>
+<p class=header><a href=# onclick=gotoTopic("_overview.html")>Versal Adaptive SoC AI Engine-ML v2 Register Reference</a> &gt; <a href=# onclick=gotoTopic("_module_summary.html")>Module Summary</a> &gt; <a href=# onclick=gotoTopic("mod___noc_module.html")>NOC_MODULE Module</a> &gt; DMA_S2MM_Status_1 (NOC_MODULE) Register</p><h1>DMA_S2MM_Status_1 (NOC_MODULE) Register</h1>
+<h2>DMA_S2MM_Status_1 (NOC_MODULE) Register Description</h2>
+<table class=noborder>
+<tr valign=top><th width=20% class=sumparam>Register Name</th><td width=80% class=noborder>DMA_S2MM_Status_1</td></tr>
+<tr valign=top><th class=sumparam>Offset Address</th><td class="hex noborder" id="registerOffset">0x0000009324</td></tr>
+<tr valign=top><th class=sumparam>Absolute Address</th><td class=noborder>
+<p>The base address for this register can be found by using the following formula:</p>
+<p>&nbsp;&nbsp;&nbsp;&nbsp;Register Base Address = 0x200_0000_0000 + (&lt;colnum> * 32 + &lt;rownum>) * 0x10_0000</p>
+<p><b>Note</b>: &lt;colnum> and &lt;rownum> are the column and row indices of the module in the matrix of AI Engine tiles.</p>
+</td></tr>
+<tr valign=top><th class=sumparam>Width</th><td class=noborder>32</td></tr>
+<tr valign=top><th class=sumparam>Type</th><td class="tooltip2rr noborder">mixed<span class="tooltiptext2rr">Mixed types. See bit-field details.</span></td></tr>
+<tr valign=top><th class=sumparam>Reset Value</th><td class="hex noborder">0x00000000</td></tr>
+<tr valign=top><th class=sumparam>Description</th><td class=noborder>DMA S2MM Status Register Ch1</td></tr>
+</table>
+<p></p>
+<h2>DMA_S2MM_Status_1 (NOC_MODULE) Register Bit-Field Summary</h2>
+<table>
+<tr valign=top><th width=20%>Field Name</th><th width=10%>Bits</th><th width=10%>Type</th><th width=10%>Reset Value</th><th width=50%>Description</th></tr>
+<tr valign=top><td>Cur_BD</td><td class="center">27:24</td><td class="tooltip3rr">ro<span class="tooltiptext2rr">Read-only</span></td><td class="hex center">0x0</td><td>Current BD channel is operating on</td></tr>
+<tr valign=top><td>Task_Queue_Size</td><td class="center">22:20</td><td class="tooltip3rr">ro<span class="tooltiptext2rr">Read-only</span></td><td class="hex center">0x0</td><td>Current number of tasks in queue. Range [0:4]</td></tr>
+<tr valign=top><td>Channel_Running</td><td class="center">19</td><td class="tooltip3rr">ro<span class="tooltiptext2rr">Read-only</span></td><td class="hex center">0x0</td><td>0=channel data path idle AND queue empty; 1=channel operating on a transfer OR queue not empty</td></tr>
+<tr valign=top><td>Task_Queue_Overflow</td><td class="center">18</td><td class="tooltip3rr">wtc<span class="tooltiptext2rr">Readable, write a 1 to clear</span></td><td class="hex center">0x0</td><td>Attempt to write to full task queue, channel 0. Sticky bit, write to clear</td></tr>
+<tr valign=top><td>AXI_MM_Slave_Error</td><td class="center">17</td><td class="tooltip3rr">wtc<span class="tooltiptext2rr">Readable, write a 1 to clear</span></td><td class="hex center">0x0</td><td>AXI-MM slave error in channel. Sticky bit, write to clear</td></tr>
+<tr valign=top><td>AXI_MM_Decode_Error</td><td class="center">16</td><td class="tooltip3rr">wtc<span class="tooltiptext2rr">Readable, write a 1 to clear</span></td><td class="hex center">0x0</td><td>AXI-MM decode error in channel. Sticky bit, write to clear</td></tr>
+<tr valign=top><td>Error_FoT_BDs_per_Task</td><td class="center">13</td><td class="tooltip3rr">ro<span class="tooltiptext2rr">Read-only</span></td><td class="hex center">0x0</td><td>Error: Channel in FoT_counts_with_task_tokens mode and too many BD calls in one task. The count FIFO is full</td></tr>
+<tr valign=top><td>Error_FoT_Length_Exceeded</td><td class="center">12</td><td class="tooltip3rr">ro<span class="tooltiptext2rr">Read-only</span></td><td class="hex center">0x0</td><td>Error: Channel in FoT mode, Buffer_Length words received but no TLAST received</td></tr>
+<tr valign=top><td>Error_BD_Invalid</td><td class="center">11</td><td class="tooltip3rr">ro<span class="tooltiptext2rr">Read-only</span></td><td class="hex center">0x0</td><td>Error: BD loaded by channel has valid bit not set.</td></tr>
+<tr valign=top><td>Error_BD_Unavailable</td><td class="center">10</td><td class="tooltip3rr">ro<span class="tooltiptext2rr">Read-only</span></td><td class="hex center">0x0</td><td>Error: Channel attempted to load an invalid BD ID (out-of-order mode)</td></tr>
+<tr valign=top><td>Stalled_TCT_or_Count_FIFO_Full</td><td class="center"> 5</td><td class="tooltip3rr">ro<span class="tooltiptext2rr">Read-only</span></td><td class="hex center">0x0</td><td>Channel stalled due to task complete token backpressure or Finish on TLAST count backpressure</td></tr>
+<tr valign=top><td>Stalled_Stream_Starvation</td><td class="center"> 4</td><td class="tooltip3rr">ro<span class="tooltiptext2rr">Read-only</span></td><td class="hex center">0x0</td><td>Channel stalled on stream access</td></tr>
+<tr valign=top><td>Stalled_Lock_Rel</td><td class="center"> 3</td><td class="tooltip3rr">ro<span class="tooltiptext2rr">Read-only</span></td><td class="hex center">0x0</td><td>Channel stalled while requesting lock release</td></tr>
+<tr valign=top><td>Stalled_Lock_Acq</td><td class="center"> 2</td><td class="tooltip3rr">ro<span class="tooltiptext2rr">Read-only</span></td><td class="hex center">0x0</td><td>Channel stalled while requesting lock acquire</td></tr>
+<tr valign=top><td>Status</td><td class="center"> 1:0</td><td class="tooltip3rr">ro<span class="tooltiptext2rr">Read-only</span></td><td class="hex center">0x0</td><td>Channel control state machine status. Encoding is: 00=IDLE, 01=STARTING, 10=RUNNING</td></tr>
+</table><p id=foot class=footer></p>
+</body>
+</html>

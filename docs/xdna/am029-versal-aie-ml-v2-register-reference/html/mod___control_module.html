@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+<head>
+<title>CONTROL_MODULE Module</title>
+<meta name="robots" content="noindex, nofollow" />
+<link rel="stylesheet" type="text/css" href="./_register_reference.css">
+<script src="xilfunctions.js" type="text/javascript"></script>
+</head>
+<body>
+<p class=header><a href=# onclick=gotoTopic("_overview.html")>Versal Adaptive SoC AI Engine-ML v2 Register Reference</a> &gt; <a href=# onclick=gotoTopic("_module_summary.html")>Module Summary</a> > CONTROL_MODULE Module</p><h1>CONTROL_MODULE Module</h1>
+<h2>CONTROL_MODULE Module Description</h2>
+<table class=noborder>
+<tr valign=top><th width=20% class=sumparam>Module Type</th><td width=80% class=noborder>CONTROL_MODULE Module</td></tr>
+<tr valign=top><th class=sumparam>Base Addresses</th><td class=noborder>
+<p>The register base addresses for interface modules can be found by using the following formula:<br>
+&nbsp;&nbsp;&nbsp;Register Base Address = 0x200_0000_0000 + (&lt;colnum> * 32) * 0x10_0000</p>
+
+<tr valign=top><th class=sumparam>Description</th><td class=noborder>Control-Module Control and Status Registers</td></tr>
+</table>
+<h2>CONTROL_MODULE Module Register Summary</h2>
+<table>
+<tr valign=top><th width=20%>Register Name</th><th width=10%>Offset Address</th><th width=10%>Width</th><th width=10%>Type</th><th width=10%>Reset Value</th><th width=40%>Description</th></tr>
+<tr valign=top><td><a href=# onclick=gotoTopic("control_module___core_program_memory.html")>Core_Program_Memory</a></td><td class="hex center">0x0000080000</td><td class="center">32</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x00000000</td><td>uC-Core Program Memory (uC-PM) (32 kbyte)</td></tr>
+<tr valign=top><td><a href=# onclick=gotoTopic("control_module___core_private_data_memory.html")>Core_Private_Data_Memory</a></td><td class="hex center">0x0000088000</td><td class="center">32</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x00000000</td><td>uC-Core private Data Memory (uC-private-DM) (16 kbyte)</td></tr>
+<tr valign=top><td><a href=# onclick=gotoTopic("control_module___core_status.html")>Core_Status</a></td><td class="hex center">0x00000C0000</td><td class="center">32</td><td class="tooltip3rr">ro<span class="tooltiptext2rr">Read-only</span></td><td class="hex center">0x00000001</td><td>uC-Core status bits</td></tr>
+<tr valign=top><td><a href=# onclick=gotoTopic("control_module___core_control.html")>Core_Control</a></td><td class="hex center">0x00000C0004</td><td class="center">32</td><td class="tooltip3rr">wo<span class="tooltiptext2rr">Write-only</span></td><td class="hex center">0x00000000</td><td>uC-Core control bits</td></tr>
+<tr valign=top><td><a href=# onclick=gotoTopic("control_module___core_interrupt_status.html")>Core_Interrupt_Status</a></td><td class="hex center">0x00000C0008</td><td class="center">32</td><td class="tooltip3rr">wtc<span class="tooltiptext2rr">Readable, write a 1 to clear</span></td><td class="hex center">0x00000000</td><td>uC-Core external interrupts sticky bits</td></tr>
+<tr valign=top><td><a href=# onclick=gotoTopic("control_module___module_aximm_offset.html")>Module_AXIMM_Offset</a></td><td class="hex center">0x00000C0020</td><td class="center">32</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x00000000</td><td>AXI-MM address offset</td></tr>
+<tr valign=top><td><a href=# onclick=gotoTopic("control_module___module_axi_mm_outstanding_transactions.html")>Module_AXI_MM_Outstanding_Transactions</a></td><td class="hex center">0x00000C0024</td><td class="center">32</td><td class="tooltip3rr">ro<span class="tooltiptext2rr">Read-only</span></td><td class="hex center">0x00000000</td><td>AXI-MM outstanding transactions monitors</td></tr>
+<tr valign=top><td><a href=# onclick=gotoTopic("control_module___memory_zeroization.html")>Memory_Zeroization</a></td><td class="hex center">0x00000C0030</td><td class="center">32</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x00000000</td><td>Control of memory zeroization (privileged)</td></tr>
+<tr valign=top><td><a href=# onclick=gotoTopic("control_module___memory_privileged.html")>Memory_Privileged</a></td><td class="hex center">0x00000C0034</td><td class="center">32</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x00000000</td><td>Control of uC-PM, uC-Private-DM and uC-Core debug port privileged status (privileged)</td></tr>
+<tr valign=top><td><a href=# onclick=gotoTopic("control_module___dma_dm2mm_status.html")>DMA_DM2MM_Status</a></td><td class="hex center">0x00000C0100</td><td class="center">32</td><td class="tooltip3rr">ro<span class="tooltiptext2rr">Read-only</span></td><td class="hex center">0x00000000</td><td>MM2DM DMA Status</td></tr>
+<tr valign=top><td><a href=# onclick=gotoTopic("control_module___dma_dm2mm_control.html")>DMA_DM2MM_Control</a></td><td class="hex center">0x00000C0104</td><td class="center">32</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x00000000</td><td>MM2DM DMA Control</td></tr>
+<tr valign=top><td><a href=# onclick=gotoTopic("control_module___dma_dm2mm_axi_control.html")>DMA_DM2MM_AXI_Control</a></td><td class="hex center">0x00000C0108</td><td class="center">32</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x00000000</td><td>MM2DM DMA External AXI Control</td></tr>
+<tr valign=top><td><a href=# onclick=gotoTopic("control_module___dma_mm2dm_status.html")>DMA_MM2DM_Status</a></td><td class="hex center">0x00000C0110</td><td class="center">32</td><td class="tooltip3rr">ro<span class="tooltiptext2rr">Read-only</span></td><td class="hex center">0x00000000</td><td>DM2MM DMA Status</td></tr>
+<tr valign=top><td><a href=# onclick=gotoTopic("control_module___dma_mm2dm_control.html")>DMA_MM2DM_Control</a></td><td class="hex center">0x00000C0114</td><td class="center">32</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x00000000</td><td>DM2MM DMA Control</td></tr>
+<tr valign=top><td><a href=# onclick=gotoTopic("control_module___dma_mm2dm_axi_control.html")>DMA_MM2DM_AXI_Control</a></td><td class="hex center">0x00000C0118</td><td class="center">32</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x00000000</td><td>DM2MM DMA External AXI Control</td></tr>
+<tr valign=top><td><a href=# onclick=gotoTopic("control_module___dma_pause.html")>DMA_Pause</a></td><td class="hex center">0x00000C0120</td><td class="center">32</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x00000000</td><td>DMA Pause (privileged)</td></tr>
+<tr valign=top><td><a href=# onclick=gotoTopic("control_module___module_data_memory.html")>Module_Data_Memory</a></td><td class="hex center">0x00000D0000</td><td class="center">128</td><td class="tooltip3rr">rw<span class="tooltiptext2rr">Normal read/write</span></td><td class="hex center">0x00000000</td><td>Data memory shared between uC-Core and uC-DMAs (uC-DM) (32 kbyte)</td></tr>
+</table>
+<p id=foot class=footer></p>
+</body>
+</html>
