@@ -47,6 +47,7 @@
 //! assert_eq!(addr.row, 2);
 //! ```
 
+pub mod aie2_spec;
 pub mod registers;
 pub mod tile;
 pub mod array;

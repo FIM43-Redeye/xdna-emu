@@ -307,7 +307,8 @@ impl CoreExecutor {
                 if lid < 64 {
                     // Check if we can acquire (value > 0)
                     if tile.locks[lid].value > 0 {
-                        tile.locks[lid].value = tile.locks[lid].value.saturating_sub(*value as u32);
+                        let sub_val = (*value as u8).min(tile.locks[lid].value);
+                        tile.locks[lid].value = tile.locks[lid].value.saturating_sub(sub_val);
                         ExecuteResult::Continue
                     } else {
                         // Need to wait
@@ -323,7 +324,10 @@ impl CoreExecutor {
             InstructionKind::LockRelease { lock_id, value } => {
                 let lid = *lock_id as usize;
                 if lid < 64 {
-                    tile.locks[lid].value = tile.locks[lid].value.saturating_add(*value as u32);
+                    // Lock value is 6-bit (0-63), saturate at max
+                    let add_val = *value as u8;
+                    let new_val = tile.locks[lid].value.saturating_add(add_val);
+                    tile.locks[lid].value = new_val.min(crate::device::tile::Lock::MAX_VALUE);
                     ExecuteResult::Continue
                 } else {
                     ExecuteResult::Error {

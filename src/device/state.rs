@@ -140,7 +140,8 @@ impl DeviceState {
             RegisterModule::Locks => {
                 let lock_idx = ((tile_addr.offset - 0x1F000) / 4) as usize;
                 if lock_idx < NUM_LOCKS {
-                    tile.locks[lock_idx].value = value;
+                    // CDO writes 32-bit, but lock value is 6-bit (0-63)
+                    tile.locks[lock_idx].set(value as u8);
                 }
             }
 
@@ -184,8 +185,10 @@ impl DeviceState {
             RegisterModule::Locks => {
                 let lock_idx = ((tile_addr.offset - 0x1F000) / 4) as usize;
                 if lock_idx < NUM_LOCKS {
-                    let current = tile.locks[lock_idx].value;
-                    tile.locks[lock_idx].value = (current & !mask) | (value & mask);
+                    // CDO mask_write uses 32-bit, but lock value is 6-bit
+                    let current = tile.locks[lock_idx].value as u32;
+                    let new_value = (current & !mask) | (value & mask);
+                    tile.locks[lock_idx].set(new_value as u8);
                 }
             }
 

@@ -2,11 +2,16 @@
 //!
 //! Each tile contains:
 //! - Data memory (64KB for compute tiles, 512KB for mem tiles)
-//! - Program memory (64KB, compute tiles only)
-//! - 64 locks for synchronization
+//! - Program memory (16KB, compute tiles only)
+//! - Locks for synchronization (16 for compute tiles, 64 for mem tiles)
 //! - DMA engine with buffer descriptors and channels
 //! - Core state (PC, registers, status)
 //! - Stream switch configuration
+//!
+//! # Architecture Constants
+//!
+//! All constants are derived from AMD AM020 (AIE-ML Architecture Manual).
+//! See `aie2_spec` module for the authoritative values.
 //!
 //! # Performance
 //!
@@ -15,40 +20,63 @@
 //! - Direct field access (no hash maps)
 //! - Cache-friendly layout (related data together)
 
+use super::aie2_spec;
+
 /// Size of data memory in compute tiles (64KB)
-pub const COMPUTE_TILE_MEMORY_SIZE: usize = 64 * 1024;
+/// See AM020 Ch4: "An individual data memory block is 64 KB"
+pub const COMPUTE_TILE_MEMORY_SIZE: usize = aie2_spec::COMPUTE_TILE_DATA_MEMORY_SIZE;
 
 /// Size of data memory in memory tiles (512KB)
-pub const MEM_TILE_MEMORY_SIZE: usize = 512 * 1024;
+/// See AM020 Ch5: "Each AIE-ML memory tile has 512 KB of memory"
+pub const MEM_TILE_MEMORY_SIZE: usize = aie2_spec::MEM_TILE_DATA_MEMORY_SIZE;
 
-/// Size of program memory (64KB = 16K instructions)
-pub const PROGRAM_MEMORY_SIZE: usize = 64 * 1024;
+/// Size of program memory (16KB = 1024 x 128-bit instructions)
+/// See AM020 Ch4: "The program memory size on the AIE-ML is 16 KB"
+pub const PROGRAM_MEMORY_SIZE: usize = aie2_spec::PROGRAM_MEMORY_SIZE;
 
-/// Number of locks per tile
-pub const NUM_LOCKS: usize = 64;
+/// Number of locks per compute tile (16)
+/// See AM020 Ch2: "The AIE-ML features 16 semaphore locks"
+pub const NUM_LOCKS_COMPUTE: usize = aie2_spec::COMPUTE_TILE_NUM_LOCKS;
 
-/// Number of DMA buffer descriptors per tile
-pub const NUM_DMA_BDS: usize = 16;
+/// Number of locks per memory tile (64)
+/// See AM020 Ch5: "there are 64 semaphore locks"
+pub const NUM_LOCKS_MEM_TILE: usize = aie2_spec::MEM_TILE_NUM_LOCKS;
 
-/// Number of DMA channels (2 S2MM + 2 MM2S)
-pub const NUM_DMA_CHANNELS: usize = 4;
+/// Maximum number of locks (for array sizing - uses mem tile count)
+pub const NUM_LOCKS: usize = NUM_LOCKS_MEM_TILE;
+
+/// Number of DMA buffer descriptors per tile (16)
+/// See AM020 Ch2: "the DMA controller has access to the 16 buffer descriptors"
+pub const NUM_DMA_BDS: usize = aie2_spec::NUM_DMA_BUFFER_DESCRIPTORS;
+
+/// Number of DMA channels for compute tiles (2 S2MM + 2 MM2S = 4)
+pub const NUM_DMA_CHANNELS: usize = aie2_spec::COMPUTE_TILE_S2MM_CHANNELS
+    + aie2_spec::COMPUTE_TILE_MM2S_CHANNELS;
 
 /// Lock state.
 ///
 /// AIE2 uses semaphore locks with acquire/release semantics.
-/// Value is typically 0 (available) or 1+ (acquired N times).
+/// Lock value is 6-bit unsigned (0-63). See AM020 Ch2:
+/// "The semaphore lock has a larger state and no acquired bit;
+/// each lock state is 6-bit unsigned."
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
 pub struct Lock {
-    /// Current lock value (semaphore count)
-    pub value: u32,
+    /// Current lock value (semaphore count, 0-63)
+    /// Stored as u8 for efficiency but only lower 6 bits are valid.
+    pub value: u8,
 }
 
 impl Lock {
-    /// Create a new lock with initial value
+    /// Maximum lock value (6-bit: 0-63)
+    pub const MAX_VALUE: u8 = aie2_spec::LOCK_MAX_VALUE;
+
+    /// Create a new lock with initial value (clamped to 0-63)
     #[inline]
-    pub fn new(value: u32) -> Self {
-        Self { value }
+    pub fn new(value: u8) -> Self {
+        Self {
+            value: value.min(Self::MAX_VALUE),
+        }
     }
 
     /// Acquire the lock (decrement if > 0)
@@ -62,10 +90,18 @@ impl Lock {
         }
     }
 
-    /// Release the lock (increment)
+    /// Release the lock (increment, saturating at MAX_VALUE)
     #[inline]
     pub fn release(&mut self) {
-        self.value += 1;
+        if self.value < Self::MAX_VALUE {
+            self.value += 1;
+        }
+    }
+
+    /// Set the lock value directly (clamped to 0-63)
+    #[inline]
+    pub fn set(&mut self, value: u8) {
+        self.value = value.min(Self::MAX_VALUE);
     }
 }
 
@@ -463,6 +499,25 @@ mod tests {
     }
 
     #[test]
+    fn test_lock_max_value() {
+        // Test clamping at creation
+        let lock = Lock::new(100);
+        assert_eq!(lock.value, Lock::MAX_VALUE); // Clamped to 63
+
+        // Test saturation on release
+        let mut lock = Lock::new(63);
+        lock.release();
+        assert_eq!(lock.value, 63); // Saturated at max
+
+        // Test set
+        let mut lock = Lock::new(0);
+        lock.set(50);
+        assert_eq!(lock.value, 50);
+        lock.set(200);
+        assert_eq!(lock.value, 63); // Clamped
+    }
+
+    #[test]
     fn test_dma_bd_valid() {
         let mut bd = DmaBufferDescriptor::default();
         assert!(!bd.is_valid());
@@ -491,9 +546,22 @@ mod tests {
     #[test]
     fn test_struct_sizes() {
         // Ensure structs are reasonably sized
-        assert_eq!(std::mem::size_of::<Lock>(), 4);
+        assert_eq!(std::mem::size_of::<Lock>(), 1); // u8 now
         assert_eq!(std::mem::size_of::<DmaBufferDescriptor>(), 24);
         assert_eq!(std::mem::size_of::<DmaChannel>(), 12);
         assert_eq!(std::mem::size_of::<CoreState>(), 24);
+    }
+
+    #[test]
+    fn test_program_memory_size() {
+        // Verify program memory is 16KB per AM020
+        assert_eq!(PROGRAM_MEMORY_SIZE, 16 * 1024);
+    }
+
+    #[test]
+    fn test_lock_counts() {
+        // Verify lock counts per AM020
+        assert_eq!(NUM_LOCKS_COMPUTE, 16);
+        assert_eq!(NUM_LOCKS_MEM_TILE, 64);
     }
 }
