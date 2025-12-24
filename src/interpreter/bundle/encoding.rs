@@ -50,9 +50,21 @@ impl BundleFormat {
     pub const MARKER_FULL128: u8 = 0b0000; // 0x0
 
     /// Detect format from the low 4 bits of the first halfword.
+    ///
+    /// The 128-bit format only has a 1-bit marker (bit 0 = 0), so any even
+    /// nibble (0x0, 0x2, 0x4, 0x6, 0x8, 0xA, 0xC, 0xE) indicates 128-bit.
+    /// All other formats have bit 0 = 1.
     #[inline]
     pub fn from_marker(marker: u8) -> Self {
-        match marker & 0xF {
+        let nibble = marker & 0xF;
+
+        // 128-bit format has only 1-bit marker (bit 0 = 0)
+        // All other formats have bit 0 = 1
+        if nibble & 1 == 0 {
+            return BundleFormat::Full128;
+        }
+
+        match nibble {
             Self::MARKER_NOP16 => BundleFormat::Nop16,
             Self::MARKER_SHORT32 => BundleFormat::Short32,
             Self::MARKER_MEDIUM48 => BundleFormat::Medium48,
@@ -60,9 +72,7 @@ impl BundleFormat {
             Self::MARKER_LONG80 => BundleFormat::Long80,
             Self::MARKER_LONG96 => BundleFormat::Long96,
             Self::MARKER_LONG112 => BundleFormat::Long112,
-            Self::MARKER_FULL128 => BundleFormat::Full128,
-            // Other values: could be mid-bundle data or invalid
-            // Default to 32-bit as safest assumption
+            // All odd values that don't match known markers default to 32-bit
             _ => BundleFormat::Short32,
         }
     }

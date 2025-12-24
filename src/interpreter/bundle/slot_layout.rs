@@ -1003,6 +1003,87 @@ pub fn extract_112bit(bytes: &[u8]) -> ExtractedBundle {
     bundle
 }
 
+/// Extract slot data from a 128-bit (16-byte) bundle.
+///
+/// 128-bit bundles have marker 0 at bit 0 (LSB = 0) and 127 bits of data.
+///
+/// # Format Variants (from AIE2CompositeFormats.td)
+///
+/// Both variants have the same overall structure:
+/// `{ldb, lda, st, alu_mv, vec}` where alu_mv is 43 bits.
+///
+/// The alu_mv LSB (bit 27 of Inst) distinguishes the two variants:
+///
+/// - I128_LDB_LDA_ST_LNG_VEC: `alu_mv = {lng, 0b0}` - bit 27 = 0
+/// - I128_LDB_LDA_ST_ALU_MV_VEC: `alu_mv = {alumv, 0b1}` where `alumv = {alu, mv}` - bit 27 = 1
+///
+/// Bit positions in Inst:
+/// - Inst[0] = 0 (marker)
+/// - vec[25:0] at Inst[26:1]
+/// - alu_mv LSB at Inst[27]
+/// - For ALU+MV: mv[21:0] at Inst[49:28], alu[19:0] at Inst[69:50]
+/// - For LNG: lng[41:0] at Inst[69:28]
+/// - st[20:0] at Inst[90:70]
+/// - lda[20:0] at Inst[111:91]
+/// - ldb[15:0] at Inst[127:112]
+pub fn extract_128bit(bytes: &[u8]) -> ExtractedBundle {
+    let mut bundle = ExtractedBundle::new();
+
+    if bytes.len() < 16 {
+        return bundle;
+    }
+
+    // Read 128 bits (16 bytes) as u128 (little-endian)
+    let word = u128::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11],
+        bytes[12], bytes[13], bytes[14], bytes[15],
+    ]);
+
+    // Verify format marker (bit 0 should be 0)
+    if (word & 0x1) != 0 {
+        return bundle;
+    }
+
+    // Extract vec slot: bits [26:1] (26 bits)
+    let vec_bits = ((word >> 1) & ((1u128 << VEC_WIDTH) - 1)) as u64;
+    bundle.add_slot(SlotType::Vec, vec_bits, VEC_WIDTH);
+
+    // Check alu_mv LSB at bit 27 to determine variant
+    let alu_mv_lsb = ((word >> 27) & 1) as u8;
+
+    if alu_mv_lsb == 1 {
+        // I128_LDB_LDA_ST_ALU_MV_VEC: alumv = {alu, mv}
+        // mv[21:0] at bits [49:28]
+        let mv_bits = ((word >> 28) & ((1u128 << MV_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
+
+        // alu[19:0] at bits [69:50]
+        let alu_bits = ((word >> 50) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+    } else {
+        // I128_LDB_LDA_ST_LNG_VEC: alu_mv = {lng, 0b0}
+        // lng[41:0] at bits [69:28]
+        let lng_bits = ((word >> 28) & ((1u128 << LNG_WIDTH) - 1)) as u64;
+        bundle.add_slot(SlotType::Lng, lng_bits, LNG_WIDTH);
+    }
+
+    // st[20:0] at bits [90:70]
+    let st_bits = ((word >> 70) & ((1u128 << ST_WIDTH) - 1)) as u64;
+    bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
+
+    // lda[20:0] at bits [111:91]
+    let lda_bits = ((word >> 91) & ((1u128 << LDA_WIDTH) - 1)) as u64;
+    bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
+
+    // ldb[15:0] at bits [127:112]
+    let ldb_bits = ((word >> 112) & ((1u128 << LDB_WIDTH) - 1)) as u64;
+    bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
+
+    bundle
+}
+
 /// Extract slot data from any bundle based on its format.
 pub fn extract_slots(bytes: &[u8]) -> ExtractedBundle {
     if bytes.len() < 2 {
@@ -1030,11 +1111,7 @@ pub fn extract_slots(bytes: &[u8]) -> ExtractedBundle {
         BundleFormat::Long80 => extract_80bit(bytes),
         BundleFormat::Long96 => extract_96bit(bytes),
         BundleFormat::Long112 => extract_112bit(bytes),
-        // TODO: Implement 128-bit extraction
-        BundleFormat::Full128 => {
-            // For now, return empty - 128-bit is rare
-            ExtractedBundle::new()
-        }
+        BundleFormat::Full128 => extract_128bit(bytes),
     }
 }
 
@@ -1138,5 +1215,152 @@ mod tests {
         let bundle = extract_slots(&bytes);
         assert_eq!(bundle.slots.len(), 1);
         assert_eq!(bundle.slots[0].slot_type, SlotType::Alu);
+    }
+
+    #[test]
+    fn test_extract_128bit_alu_mv_vec() {
+        // I128_LDB_LDA_ST_ALU_MV_VEC: {ldb, lda, st, {alu, mv}, 0b1, vec}
+        // Bit positions:
+        // - Inst[0] = 0 (marker)
+        // - vec[25:0] at Inst[26:1]
+        // - alu_mv LSB = 1 at Inst[27]
+        // - mv[21:0] at Inst[49:28]
+        // - alu[19:0] at Inst[69:50]
+        // - st[20:0] at Inst[90:70]
+        // - lda[20:0] at Inst[111:91]
+        // - ldb[15:0] at Inst[127:112]
+
+        let vec_value: u128 = 0x2ABCDEF;   // 26 bits
+        let mv_value: u128 = 0x3ABCDE;     // 22 bits
+        let alu_value: u128 = 0x89ABC;     // 20 bits
+        let st_value: u128 = 0x1BCDEF;     // 21 bits
+        let lda_value: u128 = 0x1CDEF0;    // 21 bits
+        let ldb_value: u128 = 0xABCD;      // 16 bits
+
+        // Construct the 128-bit word
+        let word: u128 = 0                           // bit 0 = 0 (marker)
+            | (vec_value << 1)                       // bits [26:1]
+            | (1u128 << 27)                          // bit 27 = 1 (ALU+MV variant)
+            | (mv_value << 28)                       // bits [49:28]
+            | (alu_value << 50)                      // bits [69:50]
+            | (st_value << 70)                       // bits [90:70]
+            | (lda_value << 91)                      // bits [111:91]
+            | (ldb_value << 112);                    // bits [127:112]
+
+        let bytes = word.to_le_bytes();
+        let bundle = extract_128bit(&bytes);
+
+        // Should have 6 slots: vec, mv, alu, st, lda, ldb
+        assert_eq!(bundle.slots.len(), 6, "Expected 6 slots, got: {:?}", bundle.slots);
+
+        let vec_slot = bundle.slots.iter().find(|s| s.slot_type == SlotType::Vec);
+        let mv_slot = bundle.slots.iter().find(|s| s.slot_type == SlotType::Mv);
+        let alu_slot = bundle.slots.iter().find(|s| s.slot_type == SlotType::Alu);
+        let st_slot = bundle.slots.iter().find(|s| s.slot_type == SlotType::St);
+        let lda_slot = bundle.slots.iter().find(|s| s.slot_type == SlotType::Lda);
+        let ldb_slot = bundle.slots.iter().find(|s| s.slot_type == SlotType::Ldb);
+
+        assert!(vec_slot.is_some(), "Expected Vec slot");
+        assert!(mv_slot.is_some(), "Expected Mv slot");
+        assert!(alu_slot.is_some(), "Expected Alu slot");
+        assert!(st_slot.is_some(), "Expected St slot");
+        assert!(lda_slot.is_some(), "Expected Lda slot");
+        assert!(ldb_slot.is_some(), "Expected Ldb slot");
+
+        assert_eq!(vec_slot.unwrap().bits, vec_value as u64);
+        assert_eq!(mv_slot.unwrap().bits, mv_value as u64);
+        assert_eq!(alu_slot.unwrap().bits, alu_value as u64);
+        assert_eq!(st_slot.unwrap().bits, st_value as u64);
+        assert_eq!(lda_slot.unwrap().bits, lda_value as u64);
+        assert_eq!(ldb_slot.unwrap().bits, ldb_value as u64);
+    }
+
+    #[test]
+    fn test_extract_128bit_lng_vec() {
+        // I128_LDB_LDA_ST_LNG_VEC: {ldb, lda, st, {lng, 0b0}, vec}
+        // Bit positions:
+        // - Inst[0] = 0 (marker)
+        // - vec[25:0] at Inst[26:1]
+        // - alu_mv LSB = 0 at Inst[27]
+        // - lng[41:0] at Inst[69:28]
+        // - st[20:0] at Inst[90:70]
+        // - lda[20:0] at Inst[111:91]
+        // - ldb[15:0] at Inst[127:112]
+
+        let vec_value: u128 = 0x1234567;       // 26 bits
+        let lng_value: u128 = 0x2ABCDEF0123;   // 42 bits
+        let st_value: u128 = 0x1ABCDE;         // 21 bits
+        let lda_value: u128 = 0x1BCDEF;        // 21 bits
+        let ldb_value: u128 = 0xCDEF;          // 16 bits
+
+        // Construct the 128-bit word
+        let word: u128 = 0                           // bit 0 = 0 (marker)
+            | (vec_value << 1)                       // bits [26:1]
+            | (0u128 << 27)                          // bit 27 = 0 (LNG variant)
+            | (lng_value << 28)                      // bits [69:28]
+            | (st_value << 70)                       // bits [90:70]
+            | (lda_value << 91)                      // bits [111:91]
+            | (ldb_value << 112);                    // bits [127:112]
+
+        let bytes = word.to_le_bytes();
+        let bundle = extract_128bit(&bytes);
+
+        // Should have 5 slots: vec, lng, st, lda, ldb
+        assert_eq!(bundle.slots.len(), 5, "Expected 5 slots, got: {:?}", bundle.slots);
+
+        let vec_slot = bundle.slots.iter().find(|s| s.slot_type == SlotType::Vec);
+        let lng_slot = bundle.slots.iter().find(|s| s.slot_type == SlotType::Lng);
+        let st_slot = bundle.slots.iter().find(|s| s.slot_type == SlotType::St);
+        let lda_slot = bundle.slots.iter().find(|s| s.slot_type == SlotType::Lda);
+        let ldb_slot = bundle.slots.iter().find(|s| s.slot_type == SlotType::Ldb);
+
+        assert!(vec_slot.is_some(), "Expected Vec slot");
+        assert!(lng_slot.is_some(), "Expected Lng slot");
+        assert!(st_slot.is_some(), "Expected St slot");
+        assert!(lda_slot.is_some(), "Expected Lda slot");
+        assert!(ldb_slot.is_some(), "Expected Ldb slot");
+
+        assert_eq!(vec_slot.unwrap().bits, vec_value as u64);
+        assert_eq!(lng_slot.unwrap().bits, lng_value as u64);
+        assert_eq!(st_slot.unwrap().bits, st_value as u64);
+        assert_eq!(lda_slot.unwrap().bits, lda_value as u64);
+        assert_eq!(ldb_slot.unwrap().bits, ldb_value as u64);
+    }
+
+    #[test]
+    fn test_extract_slots_128bit() {
+        // Test that extract_slots properly routes to extract_128bit
+        // Use a 128-bit bundle with ALU+MV variant
+
+        let vec_value: u128 = 0x1111111;
+        let mv_value: u128 = 0x222222;
+        let alu_value: u128 = 0x33333;
+        let st_value: u128 = 0x144444;
+        let lda_value: u128 = 0x155555;
+        let ldb_value: u128 = 0x6666;
+
+        let word: u128 = 0
+            | (vec_value << 1)
+            | (1u128 << 27)
+            | (mv_value << 28)
+            | (alu_value << 50)
+            | (st_value << 70)
+            | (lda_value << 91)
+            | (ldb_value << 112);
+
+        let bytes = word.to_le_bytes();
+        let bundle = extract_slots(&bytes);
+
+        // Should have 6 slots
+        assert_eq!(bundle.slots.len(), 6);
+
+        // Verify we got the expected slot types
+        let slot_types: Vec<SlotType> = bundle.slots.iter().map(|s| s.slot_type).collect();
+        assert!(slot_types.contains(&SlotType::Vec));
+        assert!(slot_types.contains(&SlotType::Mv));
+        assert!(slot_types.contains(&SlotType::Alu));
+        assert!(slot_types.contains(&SlotType::St));
+        assert!(slot_types.contains(&SlotType::Lda));
+        assert!(slot_types.contains(&SlotType::Ldb));
     }
 }

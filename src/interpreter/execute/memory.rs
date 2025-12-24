@@ -50,11 +50,17 @@ impl MemoryUnit {
         // Get address from source operand
         let addr = Self::get_address(op, ctx);
 
-        // Read from memory
-        let value = Self::read_memory(tile, addr, width);
-
-        // Write to destination register
-        Self::write_dest(op, ctx, value, width);
+        // Handle full vector loads specially
+        if width == MemWidth::Vector256 {
+            let vec_data = Self::read_vector_from_memory(tile, addr);
+            if let Some(Operand::VectorReg(r)) = &op.dest {
+                ctx.vector.write(*r, vec_data);
+            }
+        } else {
+            // Scalar/partial loads
+            let value = Self::read_memory(tile, addr, width);
+            Self::write_dest(op, ctx, value, width);
+        }
 
         // Apply post-modify to address register
         Self::apply_post_modify(op, ctx, post_modify);
@@ -71,11 +77,27 @@ impl MemoryUnit {
         // Get address from first source operand
         let addr = Self::get_address(op, ctx);
 
-        // Get value from second source (or dest for store) operand
-        let value = Self::get_store_value(op, ctx, width);
+        // Handle full vector stores specially
+        if width == MemWidth::Vector256 {
+            // Get vector register from source or dest
+            let vec_reg = op
+                .sources
+                .get(1)
+                .or(op.dest.as_ref())
+                .and_then(|operand| match operand {
+                    Operand::VectorReg(r) => Some(*r),
+                    _ => None,
+                });
 
-        // Write to memory
-        Self::write_memory(tile, addr, value, width);
+            if let Some(r) = vec_reg {
+                let vec_data = ctx.vector.read(r);
+                Self::write_vector_to_memory(tile, addr, vec_data);
+            }
+        } else {
+            // Scalar/partial stores
+            let value = Self::get_store_value(op, ctx, width);
+            Self::write_memory(tile, addr, value, width);
+        }
 
         // Apply post-modify to address register
         Self::apply_post_modify(op, ctx, post_modify);
@@ -512,5 +534,109 @@ mod tests {
 
         let read_back = MemoryUnit::read_vector_from_memory(&tile, 0x300);
         assert_eq!(read_back, data);
+    }
+
+    #[test]
+    fn test_vector256_load() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        // Write test vector data to memory (256 bits = 8 x 32-bit words)
+        let test_data = [
+            0x11111111u32,
+            0x22222222,
+            0x33333333,
+            0x44444444,
+            0x55555555,
+            0x66666666,
+            0x77777777,
+            0x88888888,
+        ];
+        MemoryUnit::write_vector_to_memory(&mut tile, 0x400, test_data);
+
+        // Set pointer
+        ctx.pointer.write(0, 0x400);
+
+        // Load vector: v0 = [p0]
+        let op = SlotOp::new(
+            SlotIndex::Load,
+            Operation::Load {
+                width: MemWidth::Vector256,
+                post_modify: PostModify::None,
+            },
+        )
+        .with_dest(Operand::VectorReg(0))
+        .with_source(Operand::PointerReg(0));
+
+        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+
+        // Verify all 8 lanes were loaded correctly
+        let loaded = ctx.vector.read(0);
+        assert_eq!(loaded, test_data);
+    }
+
+    #[test]
+    fn test_vector256_store() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        // Set up vector register with test data
+        let test_data = [
+            0xAAAA_BBBBu32,
+            0xCCCC_DDDD,
+            0xEEEE_FFFF,
+            0x1111_2222,
+            0x3333_4444,
+            0x5555_6666,
+            0x7777_8888,
+            0x9999_0000,
+        ];
+        ctx.vector.write(1, test_data);
+
+        // Set pointer
+        ctx.pointer.write(0, 0x500);
+
+        // Store vector: [p0] = v1
+        let op = SlotOp::new(
+            SlotIndex::Store,
+            Operation::Store {
+                width: MemWidth::Vector256,
+                post_modify: PostModify::None,
+            },
+        )
+        .with_dest(Operand::VectorReg(1))
+        .with_source(Operand::PointerReg(0));
+
+        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+
+        // Verify all 8 lanes were stored correctly
+        let stored = MemoryUnit::read_vector_from_memory(&tile, 0x500);
+        assert_eq!(stored, test_data);
+    }
+
+    #[test]
+    fn test_vector256_load_with_post_modify() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        let test_data = [1, 2, 3, 4, 5, 6, 7, 8];
+        MemoryUnit::write_vector_to_memory(&mut tile, 0x600, test_data);
+        ctx.pointer.write(0, 0x600);
+
+        // Load with post-modify: v0 = [p0], p0 += 32
+        let op = SlotOp::new(
+            SlotIndex::Load,
+            Operation::Load {
+                width: MemWidth::Vector256,
+                post_modify: PostModify::Immediate(32), // 256 bits = 32 bytes
+            },
+        )
+        .with_dest(Operand::VectorReg(0))
+        .with_source(Operand::PointerReg(0));
+
+        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+
+        assert_eq!(ctx.vector.read(0), test_data);
+        assert_eq!(ctx.pointer.read(0), 0x620); // 0x600 + 32
     }
 }

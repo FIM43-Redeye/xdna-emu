@@ -134,19 +134,39 @@ impl VectorAlu {
         }
     }
 
+    /// Convert BFloat16 (upper 16 bits of f32) to f32.
+    #[inline]
+    fn bf16_to_f32(bits: u16) -> f32 {
+        f32::from_bits((bits as u32) << 16)
+    }
+
+    /// Convert f32 to BFloat16 (truncate lower 16 bits).
+    #[inline]
+    fn f32_to_bf16(val: f32) -> u16 {
+        (val.to_bits() >> 16) as u16
+    }
+
     /// Vector addition by element type.
     fn vector_add(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
-                // 8 × 32-bit lanes
+            ElementType::Int32 | ElementType::UInt32 => {
+                // 8 × 32-bit integer lanes
                 for i in 0..8 {
                     result[i] = a[i].wrapping_add(b[i]);
                 }
             }
-            ElementType::Int16 | ElementType::UInt16 | ElementType::BFloat16 => {
-                // 16 × 16-bit lanes (2 per u32)
+            ElementType::Float32 => {
+                // 8 × 32-bit IEEE 754 float lanes
+                for i in 0..8 {
+                    let fa = f32::from_bits(a[i]);
+                    let fb = f32::from_bits(b[i]);
+                    result[i] = (fa + fb).to_bits();
+                }
+            }
+            ElementType::Int16 | ElementType::UInt16 => {
+                // 16 × 16-bit integer lanes (2 per u32)
                 for i in 0..8 {
                     let a_lo = (a[i] & 0xFFFF) as u16;
                     let a_hi = ((a[i] >> 16) & 0xFFFF) as u16;
@@ -154,6 +174,18 @@ impl VectorAlu {
                     let b_hi = ((b[i] >> 16) & 0xFFFF) as u16;
                     let r_lo = a_lo.wrapping_add(b_lo);
                     let r_hi = a_hi.wrapping_add(b_hi);
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::BFloat16 => {
+                // 16 × BFloat16 lanes (2 per u32)
+                for i in 0..8 {
+                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
+                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
+                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
+                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
+                    let r_lo = Self::f32_to_bf16(a_lo + b_lo);
+                    let r_hi = Self::f32_to_bf16(a_hi + b_hi);
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -180,12 +212,19 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+            ElementType::Int32 | ElementType::UInt32 => {
                 for i in 0..8 {
                     result[i] = a[i].wrapping_sub(b[i]);
                 }
             }
-            ElementType::Int16 | ElementType::UInt16 | ElementType::BFloat16 => {
+            ElementType::Float32 => {
+                for i in 0..8 {
+                    let fa = f32::from_bits(a[i]);
+                    let fb = f32::from_bits(b[i]);
+                    result[i] = (fa - fb).to_bits();
+                }
+            }
+            ElementType::Int16 | ElementType::UInt16 => {
                 for i in 0..8 {
                     let a_lo = (a[i] & 0xFFFF) as u16;
                     let a_hi = ((a[i] >> 16) & 0xFFFF) as u16;
@@ -193,6 +232,17 @@ impl VectorAlu {
                     let b_hi = ((b[i] >> 16) & 0xFFFF) as u16;
                     let r_lo = a_lo.wrapping_sub(b_lo);
                     let r_hi = a_hi.wrapping_sub(b_hi);
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
+                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
+                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
+                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
+                    let r_lo = Self::f32_to_bf16(a_lo - b_lo);
+                    let r_hi = Self::f32_to_bf16(a_hi - b_hi);
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -223,6 +273,13 @@ impl VectorAlu {
                     result[i] = a[i].wrapping_mul(b[i]);
                 }
             }
+            ElementType::Float32 => {
+                for i in 0..8 {
+                    let fa = f32::from_bits(a[i]);
+                    let fb = f32::from_bits(b[i]);
+                    result[i] = (fa * fb).to_bits();
+                }
+            }
             ElementType::Int16 | ElementType::UInt16 => {
                 for i in 0..8 {
                     let a_lo = (a[i] & 0xFFFF) as u16;
@@ -231,6 +288,17 @@ impl VectorAlu {
                     let b_hi = ((b[i] >> 16) & 0xFFFF) as u16;
                     let r_lo = a_lo.wrapping_mul(b_lo);
                     let r_hi = a_hi.wrapping_mul(b_hi);
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
+                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
+                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
+                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
+                    let r_lo = Self::f32_to_bf16(a_lo * b_lo);
+                    let r_hi = Self::f32_to_bf16(a_hi * b_hi);
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -244,12 +312,6 @@ impl VectorAlu {
                         r |= (r_byte as u32) << (j * 8);
                     }
                     result[i] = r;
-                }
-            }
-            ElementType::Float32 | ElementType::BFloat16 => {
-                // Floating point - simplified integer approximation
-                for i in 0..8 {
-                    result[i] = a[i].wrapping_mul(b[i]);
                 }
             }
         }
@@ -277,6 +339,17 @@ impl VectorAlu {
                 }
                 ctx.accumulator.write(acc_reg, new_acc);
             }
+            ElementType::Float32 => {
+                // 8 × f32 MAC: accumulator holds f64 for precision
+                let mut new_acc = current;
+                for i in 0..8 {
+                    let fa = f32::from_bits(a[i]) as f64;
+                    let fb = f32::from_bits(b[i]) as f64;
+                    let current_f = f64::from_bits(current[i]);
+                    new_acc[i] = (current_f + fa * fb).to_bits();
+                }
+                ctx.accumulator.write(acc_reg, new_acc);
+            }
             ElementType::Int16 | ElementType::UInt16 => {
                 // 16 × 16-bit → 16 products, accumulated
                 let mut new_acc = current;
@@ -294,12 +367,30 @@ impl VectorAlu {
                 }
                 ctx.accumulator.write(acc_reg, new_acc);
             }
-            _ => {
-                // Default: 32-bit multiply-add
-                let mut new_acc = [0u64; 8];
+            ElementType::BFloat16 => {
+                // 16 × bf16 MAC: convert to f32, accumulate to f64
+                let mut new_acc = current;
                 for i in 0..8 {
-                    let prod = (a[i] as u64) * (b[i] as u64);
-                    new_acc[i] = current[i].wrapping_add(prod);
+                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16) as f64;
+                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16) as f64;
+                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16) as f64;
+                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16) as f64;
+                    let current_f = f64::from_bits(current[i]);
+                    new_acc[i] = (current_f + a_lo * b_lo + a_hi * b_hi).to_bits();
+                }
+                ctx.accumulator.write(acc_reg, new_acc);
+            }
+            ElementType::Int8 | ElementType::UInt8 => {
+                // 32 × 8-bit → 32 products, accumulated
+                let mut new_acc = current;
+                for i in 0..8 {
+                    let mut sum = 0u64;
+                    for j in 0..4 {
+                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as u64;
+                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as u64;
+                        sum += a_byte * b_byte;
+                    }
+                    new_acc[i] = current[i].wrapping_add(sum);
                 }
                 ctx.accumulator.write(acc_reg, new_acc);
             }
@@ -321,9 +412,68 @@ impl VectorAlu {
                     result[i] = std::cmp::min(a[i], b[i]);
                 }
             }
-            _ => {
+            ElementType::Float32 => {
                 for i in 0..8 {
-                    result[i] = std::cmp::min(a[i], b[i]);
+                    let fa = f32::from_bits(a[i]);
+                    let fb = f32::from_bits(b[i]);
+                    result[i] = fa.min(fb).to_bits();
+                }
+            }
+            ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
+                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
+                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
+                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
+                    let r_lo = Self::f32_to_bf16(a_lo.min(b_lo));
+                    let r_hi = Self::f32_to_bf16(a_hi.min(b_hi));
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::Int16 => {
+                for i in 0..8 {
+                    let a_lo = (a[i] & 0xFFFF) as i16;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as i16;
+                    let b_lo = (b[i] & 0xFFFF) as i16;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as i16;
+                    let r_lo = std::cmp::min(a_lo, b_lo) as u16;
+                    let r_hi = std::cmp::min(a_hi, b_hi) as u16;
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::UInt16 => {
+                for i in 0..8 {
+                    let a_lo = (a[i] & 0xFFFF) as u16;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as u16;
+                    let b_lo = (b[i] & 0xFFFF) as u16;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as u16;
+                    let r_lo = std::cmp::min(a_lo, b_lo);
+                    let r_hi = std::cmp::min(a_hi, b_hi);
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::Int8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as i8;
+                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as i8;
+                        let r_byte = std::cmp::min(a_byte, b_byte) as u8;
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+            ElementType::UInt8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as u8;
+                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as u8;
+                        let r_byte = std::cmp::min(a_byte, b_byte);
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
                 }
             }
         }
@@ -346,9 +496,68 @@ impl VectorAlu {
                     result[i] = std::cmp::max(a[i], b[i]);
                 }
             }
-            _ => {
+            ElementType::Float32 => {
                 for i in 0..8 {
-                    result[i] = std::cmp::max(a[i], b[i]);
+                    let fa = f32::from_bits(a[i]);
+                    let fb = f32::from_bits(b[i]);
+                    result[i] = fa.max(fb).to_bits();
+                }
+            }
+            ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
+                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
+                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
+                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
+                    let r_lo = Self::f32_to_bf16(a_lo.max(b_lo));
+                    let r_hi = Self::f32_to_bf16(a_hi.max(b_hi));
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::Int16 => {
+                for i in 0..8 {
+                    let a_lo = (a[i] & 0xFFFF) as i16;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as i16;
+                    let b_lo = (b[i] & 0xFFFF) as i16;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as i16;
+                    let r_lo = std::cmp::max(a_lo, b_lo) as u16;
+                    let r_hi = std::cmp::max(a_hi, b_hi) as u16;
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::UInt16 => {
+                for i in 0..8 {
+                    let a_lo = (a[i] & 0xFFFF) as u16;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as u16;
+                    let b_lo = (b[i] & 0xFFFF) as u16;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as u16;
+                    let r_lo = std::cmp::max(a_lo, b_lo);
+                    let r_hi = std::cmp::max(a_hi, b_hi);
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::Int8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as i8;
+                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as i8;
+                        let r_byte = std::cmp::max(a_byte, b_byte) as u8;
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+            ElementType::UInt8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as u8;
+                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as u8;
+                        let r_byte = std::cmp::max(a_byte, b_byte);
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
                 }
             }
         }
@@ -691,5 +900,197 @@ mod tests {
         assert_eq!(result[1], 0); // 2 != 0
         assert_eq!(result[2], 0xFFFF_FFFF); // 3 == 3
         assert_eq!(result[3], 0); // 4 != 0
+    }
+
+    #[test]
+    fn test_vector_add_f32() {
+        let mut ctx = make_ctx();
+
+        // Create float vectors: [1.0, 2.0, 3.0, ...] and [0.5, 0.5, ...]
+        let a: [u32; 8] = [
+            1.0f32.to_bits(),
+            2.0f32.to_bits(),
+            3.0f32.to_bits(),
+            4.0f32.to_bits(),
+            5.0f32.to_bits(),
+            6.0f32.to_bits(),
+            7.0f32.to_bits(),
+            8.0f32.to_bits(),
+        ];
+        let b: [u32; 8] = [0.5f32.to_bits(); 8];
+
+        ctx.vector.write(0, a);
+        ctx.vector.write(1, b);
+
+        let op = SlotOp::new(
+            SlotIndex::Vector,
+            Operation::VectorAdd {
+                element_type: ElementType::Float32,
+            },
+        )
+        .with_dest(Operand::VectorReg(2))
+        .with_source(Operand::VectorReg(0))
+        .with_source(Operand::VectorReg(1));
+
+        VectorAlu::execute(&op, &mut ctx);
+        let result = ctx.vector.read(2);
+
+        // Check results: 1.5, 2.5, 3.5, ...
+        assert_eq!(f32::from_bits(result[0]), 1.5);
+        assert_eq!(f32::from_bits(result[1]), 2.5);
+        assert_eq!(f32::from_bits(result[2]), 3.5);
+        assert_eq!(f32::from_bits(result[7]), 8.5);
+    }
+
+    #[test]
+    fn test_vector_mul_f32() {
+        let mut ctx = make_ctx();
+
+        // [2.0, 3.0, 4.0, ...] * [0.5, 0.5, ...]
+        let a: [u32; 8] = [
+            2.0f32.to_bits(),
+            3.0f32.to_bits(),
+            4.0f32.to_bits(),
+            5.0f32.to_bits(),
+            6.0f32.to_bits(),
+            7.0f32.to_bits(),
+            8.0f32.to_bits(),
+            9.0f32.to_bits(),
+        ];
+        let b: [u32; 8] = [0.5f32.to_bits(); 8];
+
+        ctx.vector.write(0, a);
+        ctx.vector.write(1, b);
+
+        let op = SlotOp::new(
+            SlotIndex::Vector,
+            Operation::VectorMul {
+                element_type: ElementType::Float32,
+            },
+        )
+        .with_dest(Operand::VectorReg(2))
+        .with_source(Operand::VectorReg(0))
+        .with_source(Operand::VectorReg(1));
+
+        VectorAlu::execute(&op, &mut ctx);
+        let result = ctx.vector.read(2);
+
+        // Check results: 1.0, 1.5, 2.0, ...
+        assert_eq!(f32::from_bits(result[0]), 1.0);
+        assert_eq!(f32::from_bits(result[1]), 1.5);
+        assert_eq!(f32::from_bits(result[2]), 2.0);
+    }
+
+    #[test]
+    fn test_vector_min_max_f32() {
+        let mut ctx = make_ctx();
+
+        // Test with positive and negative floats
+        let a: [u32; 8] = [
+            1.0f32.to_bits(),
+            (-2.0f32).to_bits(),
+            3.0f32.to_bits(),
+            (-4.0f32).to_bits(),
+            5.0f32.to_bits(),
+            6.0f32.to_bits(),
+            7.0f32.to_bits(),
+            8.0f32.to_bits(),
+        ];
+        let b: [u32; 8] = [
+            0.5f32.to_bits(),
+            (-1.0f32).to_bits(),
+            2.0f32.to_bits(),
+            (-5.0f32).to_bits(),
+            4.0f32.to_bits(),
+            7.0f32.to_bits(),
+            6.0f32.to_bits(),
+            9.0f32.to_bits(),
+        ];
+
+        ctx.vector.write(0, a);
+        ctx.vector.write(1, b);
+
+        // Min
+        let op = SlotOp::new(
+            SlotIndex::Vector,
+            Operation::VectorMin {
+                element_type: ElementType::Float32,
+            },
+        )
+        .with_dest(Operand::VectorReg(2))
+        .with_source(Operand::VectorReg(0))
+        .with_source(Operand::VectorReg(1));
+
+        VectorAlu::execute(&op, &mut ctx);
+        let result = ctx.vector.read(2);
+        assert_eq!(f32::from_bits(result[0]), 0.5);  // min(1.0, 0.5)
+        assert_eq!(f32::from_bits(result[1]), -2.0); // min(-2.0, -1.0)
+        assert_eq!(f32::from_bits(result[3]), -5.0); // min(-4.0, -5.0)
+
+        // Max
+        let op = SlotOp::new(
+            SlotIndex::Vector,
+            Operation::VectorMax {
+                element_type: ElementType::Float32,
+            },
+        )
+        .with_dest(Operand::VectorReg(2))
+        .with_source(Operand::VectorReg(0))
+        .with_source(Operand::VectorReg(1));
+
+        VectorAlu::execute(&op, &mut ctx);
+        let result = ctx.vector.read(2);
+        assert_eq!(f32::from_bits(result[0]), 1.0);  // max(1.0, 0.5)
+        assert_eq!(f32::from_bits(result[1]), -1.0); // max(-2.0, -1.0)
+        assert_eq!(f32::from_bits(result[3]), -4.0); // max(-4.0, -5.0)
+    }
+
+    #[test]
+    fn test_vector_add_bf16() {
+        let mut ctx = make_ctx();
+
+        // BFloat16 is upper 16 bits of f32
+        // Pack two bf16 values per u32: low half and high half
+        fn pack_bf16(lo: f32, hi: f32) -> u32 {
+            let lo_bits = (lo.to_bits() >> 16) as u16;
+            let hi_bits = (hi.to_bits() >> 16) as u16;
+            (lo_bits as u32) | ((hi_bits as u32) << 16)
+        }
+
+        // Create vectors with bf16 pairs
+        let a: [u32; 8] = [
+            pack_bf16(1.0, 2.0),
+            pack_bf16(3.0, 4.0),
+            0, 0, 0, 0, 0, 0,
+        ];
+        let b: [u32; 8] = [
+            pack_bf16(0.5, 0.5),
+            pack_bf16(0.5, 0.5),
+            0, 0, 0, 0, 0, 0,
+        ];
+
+        ctx.vector.write(0, a);
+        ctx.vector.write(1, b);
+
+        let op = SlotOp::new(
+            SlotIndex::Vector,
+            Operation::VectorAdd {
+                element_type: ElementType::BFloat16,
+            },
+        )
+        .with_dest(Operand::VectorReg(2))
+        .with_source(Operand::VectorReg(0))
+        .with_source(Operand::VectorReg(1));
+
+        VectorAlu::execute(&op, &mut ctx);
+        let result = ctx.vector.read(2);
+
+        // Extract and check bf16 values
+        let lo0 = VectorAlu::bf16_to_f32((result[0] & 0xFFFF) as u16);
+        let hi0 = VectorAlu::bf16_to_f32(((result[0] >> 16) & 0xFFFF) as u16);
+
+        // BFloat16 has limited precision, so check approximate equality
+        assert!((lo0 - 1.5).abs() < 0.1, "Expected ~1.5, got {}", lo0);
+        assert!((hi0 - 2.5).abs() < 0.1, "Expected ~2.5, got {}", hi0);
     }
 }
