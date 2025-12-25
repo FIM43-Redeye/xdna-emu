@@ -14,7 +14,7 @@ This section is the single reference for what needs to be done and in what order
 
 ```
 Component Completion:
-├── Binary Loading (XCLBIN/ELF/CDO)     ████████░░  80%
+├── Binary Loading (XCLBIN/ELF/CDO)      ████████░░  80%
 ├── Instruction Decoding                 ██████░░░░  60%  (formats done, ISA partial)
 ├── Instruction Execution                ████░░░░░░  40%  (basic ops, missing specialized)
 ├── Memory System                        ███████░░░  75%  (single-tile complete)

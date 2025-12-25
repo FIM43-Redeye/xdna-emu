@@ -49,6 +49,7 @@ pub mod execute;
 pub mod core;
 pub mod engine;
 pub mod timing;
+pub mod test_runner;
 
 // Re-export key types for convenience
 pub use traits::{Decoder, Executor, StateAccess, ExecuteResult, DecodeError};
@@ -80,3 +81,6 @@ pub use engine::{InterpreterEngine, EngineStatus};
 
 // Timing types
 pub use timing::{LatencyTable, OperationTiming, MemoryModel, HazardDetector};
+
+// Test harness
+pub use test_runner::{TestRunner, TestResult};

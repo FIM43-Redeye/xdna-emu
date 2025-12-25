@@ -15,4 +15,4 @@ pub mod elf;
 pub use xclbin::Xclbin;
 pub use aie_partition::AiePartition;
 pub use cdo::Cdo;
-pub use elf::AieElf;
+pub use elf::{AieElf, MemoryRegion};
