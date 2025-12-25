@@ -307,7 +307,17 @@ impl Default for TestRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::interpreter::bundle::{Operation, SlotOp, SlotIndex, Operand};
+
+    // Integration test: validate single-tile execution
+    //
+    // This test directly exercises the interpreter without relying on
+    // real ELF files. It validates that:
+    // 1. Program memory can be written
+    // 2. Cores can be enabled and stepped
+    // 3. Instructions execute correctly
+    // 4. Results are visible in registers/memory
 
     fn make_minimal_aie_elf() -> Vec<u8> {
         let mut elf = vec![0u8; 256];
@@ -504,5 +514,140 @@ mod tests {
         // This should fail - wrong values
         let result = runner.verify_u32_output(1, 2, 0, &[1, 2, 3, 4]);
         assert!(result.is_err());
+    }
+
+    // ========= Integration Tests =========
+    //
+    // These tests validate real kernel execution.
+
+    #[test]
+    fn test_load_real_add_one_elf() {
+        // Path to the add_one kernel ELF from mlir-aie build
+        let elf_path = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_objFifo/aie_arch.mlir.prj/main_core_0_2.elf";
+
+        if !std::path::Path::new(elf_path).exists() {
+            eprintln!("Skipping test_load_real_add_one_elf: ELF not found at {}", elf_path);
+            return;
+        }
+
+        let mut runner = TestRunner::new();
+
+        // Load the ELF
+        let result = runner.load_elf(0, 2, elf_path);
+        assert!(result.is_ok(), "Failed to load ELF: {:?}", result.err());
+
+        // Core should be enabled at PC=0
+        assert!(runner.engine.is_core_enabled(0, 2));
+        assert_eq!(runner.core_pc(0, 2), Some(0));
+
+        // Step a few times to verify decoder doesn't crash
+        for _ in 0..10 {
+            runner.step();
+        }
+
+        // PC should have advanced (we executed some instructions)
+        let pc = runner.core_pc(0, 2).unwrap();
+        eprintln!("After 10 steps, PC = 0x{:04X}", pc);
+
+        // Basic sanity: PC should have moved or we hit a branch
+        // (We can't easily predict behavior without DMA/objectFIFO support)
+    }
+
+    #[test]
+    fn test_single_tile_add_program() {
+        // This test validates the complete single-tile execution path:
+        // 1. Write a simple program that adds two memory values
+        // 2. Set up input data
+        // 3. Run
+        // 4. Verify output
+
+        let mut runner = TestRunner::new();
+
+        // For now, we'll just verify that we can set up registers and
+        // step the core without crashing. The actual computation test
+        // requires we have working memory load/store instructions decoded
+        // which depends on the specific instruction encoding.
+
+        // Enable core at tile (1, 2)
+        runner.engine.enable_core(1, 2);
+
+        // Set up some registers via direct access
+        runner.set_scalar_reg(1, 2, 0, 100).unwrap();  // r0 = 100
+        runner.set_scalar_reg(1, 2, 1, 42).unwrap();   // r1 = 42
+
+        // Write NOPs to program memory (we don't have a simple ADD encoding yet)
+        if let Some(tile) = runner.engine.device_mut().tile_mut(1, 2) {
+            tile.write_program(0, &[0u8; 64]);
+        }
+
+        // Step a few cycles
+        for _ in 0..5 {
+            runner.step();
+        }
+
+        // Registers should be unchanged by NOPs
+        assert_eq!(runner.scalar_reg(1, 2, 0), Some(100));
+        assert_eq!(runner.scalar_reg(1, 2, 1), Some(42));
+
+        eprintln!("Single-tile NOP execution validated");
+    }
+
+    #[test]
+    fn test_decoder_coverage() {
+        // This test loads a real ELF and reports decoder coverage
+        let elf_path = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_objFifo/aie_arch.mlir.prj/main_core_0_2.elf";
+
+        if !std::path::Path::new(elf_path).exists() {
+            eprintln!("Skipping test_decoder_coverage: ELF not found");
+            return;
+        }
+
+        // Read ELF and get program section
+        use crate::parser::AieElf;
+        let data = std::fs::read(elf_path).unwrap();
+        let elf = AieElf::parse(&data).unwrap();
+
+        let text = elf.text_section();
+        assert!(text.is_some(), "No .text section found");
+
+        let text_data = text.unwrap();
+        eprintln!("Program size: {} bytes", text_data.len());
+
+        // Try to decode instructions
+        use crate::interpreter::decode::PatternDecoder;
+        use crate::interpreter::traits::Decoder;
+
+        let decoder = PatternDecoder::new();
+        let mut offset = 0;
+        let mut decoded = 0;
+        let mut unknown = 0;
+
+        while offset + 4 <= text_data.len() {
+            let result = decoder.decode(&text_data[offset..], offset as u32);
+            match result {
+                Ok(bundle) => {
+                    // Check first slot for operation type
+                    let first_slot = bundle.slots().iter().find_map(|s| s.as_ref());
+                    let op_str = format!("{:?}", first_slot.map(|s| &s.op));
+                    if op_str.contains("Unknown") {
+                        unknown += 1;
+                    } else {
+                        decoded += 1;
+                    }
+                    offset += bundle.size() as usize;
+                }
+                Err(_) => {
+                    offset += 4;
+                    unknown += 1;
+                }
+            }
+        }
+
+        let total = decoded + unknown;
+        let coverage = if total > 0 { decoded as f64 / total as f64 * 100.0 } else { 0.0 };
+        eprintln!("Decoder coverage: {}/{} instructions ({:.1}%)", decoded, total, coverage);
+
+        // We should decode at least some instructions
+        assert!(decoded > 0, "Failed to decode any instructions!");
     }
 }

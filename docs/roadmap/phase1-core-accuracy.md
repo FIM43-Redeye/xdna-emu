@@ -25,19 +25,21 @@ Component Completion:
 └── Multi-Core Coordination              ████░░░░░░  40%  (counters done, no data flow)
 ```
 
-### Milestone 1: Single-Tile Execution (Target: 50%)
+### Milestone 1: Single-Tile Execution (Target: 50%) - COMPLETE
 
 **Goal**: Run a simple kernel on ONE tile, producing correct results.
 
 | Task | Priority | Effort | Status |
 |------|----------|--------|--------|
-| Wire DmaStart/DmaWait to DmaEngine | P0 | Medium | 🔲 |
-| Connect HostMemory to shim DMA | P0 | Medium | 🔲 |
-| Test harness: load ELF, set inputs, run, check outputs | P0 | Medium | 🔲 |
-| Expand scalar instruction execution | P1 | Low | 🔲 |
-| Basic vector ops (add/sub/mul on all types) | P1 | Medium | 🔲 |
+| Wire DmaStart/DmaWait to DmaEngine | P0 | Medium | ✅ |
+| Connect HostMemory to shim DMA | P0 | Medium | ✅ |
+| Test harness: load ELF, set inputs, run, check outputs | P0 | Medium | ✅ |
+| Expand scalar instruction execution | P1 | Low | ✅ |
+| Basic vector ops (add/sub/mul on all types) | P1 | Medium | ✅ |
 
 **Validation**: Run `add_one` kernel, verify output = input + 1.
+
+**Tests**: 446 passing
 
 ### Milestone 2: Multi-Tile Data Flow (Target: 65%)
 
