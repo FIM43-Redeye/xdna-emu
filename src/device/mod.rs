@@ -55,6 +55,7 @@ pub mod state;
 pub mod host_memory;
 pub mod dma;
 pub mod stream_switch;
+pub mod stream_router;
 
 pub use registers::{RegisterInfo, RegisterModule, TileAddress};
 pub use tile::{Tile, TileType, Lock, LockResult, DmaBufferDescriptor, DmaChannel, CoreState};
@@ -66,8 +67,10 @@ pub use dma::{
     DmaResult, DmaError, AddressGenerator, DimensionConfig,
     Transfer, TransferState, TransferDirection, TransferEndpoint,
     DmaTimingConfig, ChannelTimingState, TransferPhase, ChannelArbiter,
+    StreamData,
 };
 pub use stream_switch::{StreamSwitch, StreamPort, StreamPacket, PortDirection, PortType};
+pub use stream_router::{StreamRouter, StreamWord, StreamFifo, PortId, Route, RouterStats};
 
 /// AIE architecture variant
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

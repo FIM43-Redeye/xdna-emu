@@ -34,7 +34,7 @@
 //! 3. Advance address generator
 
 use super::addressing::AddressGenerator;
-use super::{BdConfig, DmaError, DmaResult};
+use super::{BdConfig, DmaError};
 
 /// Transfer state in the state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,7 +228,7 @@ impl Transfer {
     pub fn new_host_to_tile(
         tile_col: u8,
         tile_row: u8,
-        host_addr: u64,
+        _host_addr: u64,
         tile_addr: u64,
         length: u32,
     ) -> Self {
@@ -260,7 +260,7 @@ impl Transfer {
         tile_col: u8,
         tile_row: u8,
         tile_addr: u64,
-        host_addr: u64,
+        _host_addr: u64,
         length: u32,
     ) -> Self {
         // Address gen uses tile address since that's where we read

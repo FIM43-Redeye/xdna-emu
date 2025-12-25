@@ -183,8 +183,10 @@ pub enum BranchCondition {
 
 /// Shuffle pattern for vector permute operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum ShufflePattern {
     /// No shuffle (identity).
+    #[default]
     Identity,
     /// Reverse elements.
     Reverse,
@@ -198,11 +200,6 @@ pub enum ShufflePattern {
     Custom(u32),
 }
 
-impl Default for ShufflePattern {
-    fn default() -> Self {
-        ShufflePattern::Identity
-    }
-}
 
 /// Unified operation enum covering all AIE2 instruction types.
 ///

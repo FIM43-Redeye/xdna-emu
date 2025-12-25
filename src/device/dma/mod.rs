@@ -67,7 +67,7 @@ pub mod timing;
 
 pub use addressing::{AddressGenerator, DimensionConfig, AddressIterator};
 pub use transfer::{Transfer, TransferState, TransferDirection, TransferEndpoint};
-pub use engine::{DmaEngine, ChannelState, ChannelId};
+pub use engine::{DmaEngine, ChannelState, ChannelId, StreamData};
 pub use timing::{DmaTimingConfig, ChannelTimingState, TransferPhase, ChannelArbiter};
 
 use super::aie2_spec;

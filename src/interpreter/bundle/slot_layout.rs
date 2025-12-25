@@ -298,7 +298,6 @@ pub fn extract_64bit(bytes: &[u8]) -> ExtractedBundle {
 
     // Extract bits for pattern matching
     let bits_6_4 = ((word >> 4) & 0x7) as u8;
-    let bits_2_0_after_marker = ((word >> 4) & 0x7) as u8; // bits 6:4
 
     // I64_ALU_MV: bits 6:4 = 100 (0b100)
     // I64_NOP_LNG: bits 6:4 = 100, but with lng slot

@@ -2,7 +2,7 @@
 
 use eframe::egui;
 
-use crate::emu::EngineStatus;
+use crate::interpreter::EngineStatus;
 
 use super::app::EmulatorApp;
 
@@ -10,20 +10,20 @@ use super::app::EmulatorApp;
 pub fn show_controls(ui: &mut egui::Ui, app: &mut EmulatorApp) {
     ui.horizontal(|ui| {
         // Run/Pause button
-        let (run_text, run_enabled) = match app.engine.status {
+        let (run_text, run_enabled) = match app.engine.status() {
             EngineStatus::Running => ("Pause", true),
-            EngineStatus::Paused | EngineStatus::Idle => ("Run", true),
-            EngineStatus::Breakpoint { .. } => ("Resume", true),
-            EngineStatus::AllHalted => ("Run", false),
+            EngineStatus::Paused | EngineStatus::Ready => ("Run", true),
+            EngineStatus::Halted => ("Run", false),
+            EngineStatus::Error => ("Run", false),
         };
 
         if ui.add_enabled(run_enabled, egui::Button::new(run_text)).clicked() {
-            match app.engine.status {
+            match app.engine.status() {
                 EngineStatus::Running => {
                     app.auto_run = false;
                     app.engine.pause();
                 }
-                EngineStatus::Paused | EngineStatus::Idle | EngineStatus::Breakpoint { .. } => {
+                EngineStatus::Paused | EngineStatus::Ready => {
                     app.auto_run = true;
                     app.engine.resume();
                 }
@@ -32,7 +32,7 @@ pub fn show_controls(ui: &mut egui::Ui, app: &mut EmulatorApp) {
         }
 
         // Step button
-        let step_enabled = !matches!(app.engine.status, EngineStatus::Running);
+        let step_enabled = !matches!(app.engine.status(), EngineStatus::Running);
         if ui.add_enabled(step_enabled, egui::Button::new("Step")).clicked() {
             app.engine.step();
         }
@@ -52,12 +52,12 @@ pub fn show_controls(ui: &mut egui::Ui, app: &mut EmulatorApp) {
         ui.separator();
 
         // Status display
-        let status_color = match app.engine.status {
-            EngineStatus::Idle => egui::Color32::GRAY,
+        let status_color = match app.engine.status() {
+            EngineStatus::Ready => egui::Color32::GRAY,
             EngineStatus::Running => egui::Color32::GREEN,
             EngineStatus::Paused => egui::Color32::YELLOW,
-            EngineStatus::Breakpoint { .. } => egui::Color32::from_rgb(200, 50, 200),
-            EngineStatus::AllHalted => egui::Color32::RED,
+            EngineStatus::Halted => egui::Color32::RED,
+            EngineStatus::Error => egui::Color32::from_rgb(200, 50, 50),
         };
 
         ui.colored_label(status_color, app.engine.status_string());

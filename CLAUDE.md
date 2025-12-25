@@ -30,14 +30,14 @@ Compare emulated vs actual results
 ## Current Status
 
 See [ROADMAP.md](ROADMAP.md) for high-level progress, or dive into:
-- [Phase 1: Core Accuracy](docs/roadmap/phase1-core-accuracy.md) - 🟢 Mostly Complete (55% binary recognition)
+- [Phase 1: Core Accuracy](docs/roadmap/phase1-core-accuracy.md) - 🟢 Functional (100% binary recognition, timing pending)
 - [Phase 2: Toolchain Integration](docs/roadmap/phase2-toolchain-integration.md) - 🔴 Not Started
 - [Phase 3: Developer Experience](docs/roadmap/phase3-developer-experience.md) - 🟡 GUI Exists
-- [Phase 4: Validation & Testing](docs/roadmap/phase4-validation-testing.md) - 🟡 265 Tests
+- [Phase 4: Validation & Testing](docs/roadmap/phase4-validation-testing.md) - 🟡 433 Tests
 - [Phase 5: Production Readiness](docs/roadmap/phase5-production-readiness.md) - 🔴 Not Started
 - [Phase 6: Community & Ecosystem](docs/roadmap/phase6-community-ecosystem.md) - 🔴 Not Started
 
-**Current focus**: Phase 1 - extracting slots from multi-slot bundles (currently 55%)
+**Current focus**: Phase 1 - DMA/stream switch integration for multi-tile execution
 
 ## Target Devices
 
@@ -124,22 +124,28 @@ xdna-emu/
 │   │   ├── cdo.rs        # CDO commands
 │   │   └── elf.rs        # AIE ELF files
 │   ├── device/           # Device state model
+│   │   ├── aie2_spec.rs  # Architecture constants (AM020)
 │   │   ├── registers.rs  # Register definitions
 │   │   ├── tile.rs       # Single tile state
 │   │   ├── array.rs      # Tile array
-│   │   └── state.rs      # CDO application
-│   ├── interpreter/      # New modular interpreter
+│   │   ├── state.rs      # CDO application
+│   │   ├── host_memory.rs # Simulated DDR
+│   │   ├── stream_switch.rs # Per-tile stream switch
+│   │   ├── stream_router.rs # Global stream router
+│   │   └── dma/          # DMA execution engine
+│   ├── interpreter/      # Modular AIE2 interpreter
 │   │   ├── bundle/       # VLIW bundle handling
-│   │   ├── decode/       # Instruction decoding (pattern + TableGen)
+│   │   ├── decode/       # TableGen-driven instruction decoder
 │   │   ├── state/        # Register files, execution context
 │   │   ├── execute/      # Execution units (scalar, vector, memory, control)
+│   │   ├── timing/       # Latency, hazards, memory timing
 │   │   ├── core/         # Per-core interpreter
-│   │   └── engine/       # Multi-core coordinator
+│   │   ├── engine/       # Multi-core coordinator
+│   │   └── test_runner.rs # Test harness for kernel execution
 │   ├── tablegen/         # TableGen parser for llvm-aie
 │   │   ├── parser.rs     # Regex-based .td file parsing
 │   │   ├── types.rs      # SlotDef, FormatClass, InstrDef, SemanticOp
 │   │   └── resolver.rs   # Compute encodings from format classes
-│   ├── emu_stub/         # Legacy emulation (being replaced)
 │   ├── visual/           # GUI (egui)
 │   │   ├── app.rs        # Main application
 │   │   ├── tile_grid.rs  # Tile array view
@@ -178,7 +184,7 @@ cargo build --release
 # Run
 cargo run -- path/to/binary.xclbin
 
-# Test (267 tests)
+# Test (433 tests)
 cargo test
 
 # Benchmark

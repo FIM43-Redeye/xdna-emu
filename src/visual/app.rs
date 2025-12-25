@@ -3,8 +3,7 @@
 use eframe::egui;
 use std::path::PathBuf;
 
-use crate::device::DeviceState;
-use crate::emu::{Engine, EngineStatus};
+use crate::interpreter::{InterpreterEngine, EngineStatus};
 use crate::parser::{Xclbin, AiePartition, Cdo};
 use crate::parser::xclbin::SectionKind;
 use crate::parser::cdo::find_cdo_offset;
@@ -23,7 +22,7 @@ pub struct SelectedTile {
 /// Main application state.
 pub struct EmulatorApp {
     /// The emulation engine.
-    pub engine: Engine,
+    pub engine: InterpreterEngine,
     /// Currently selected tile for detail view.
     pub selected_tile: Option<SelectedTile>,
     /// Path to loaded xclbin file.
@@ -55,7 +54,7 @@ pub struct EmulatorApp {
 impl Default for EmulatorApp {
     fn default() -> Self {
         Self {
-            engine: Engine::new_npu1(),
+            engine: InterpreterEngine::new_npu1(),
             selected_tile: Some(SelectedTile { col: 0, row: 2 }),
             loaded_file: None,
             status_message: "Ready. Drag & drop an .xclbin file or use File > Open".to_string(),
@@ -75,7 +74,7 @@ impl Default for EmulatorApp {
 
 impl EmulatorApp {
     /// Create a new app with an engine.
-    pub fn with_engine(engine: Engine) -> Self {
+    pub fn with_engine(engine: InterpreterEngine) -> Self {
         Self {
             engine,
             ..Default::default()
@@ -107,15 +106,15 @@ impl EmulatorApp {
         let cdo = Cdo::parse(&pdi.pdi_image[cdo_offset..])?;
 
         // Apply to device
-        self.engine = Engine::new_npu1();
-        self.engine.state.apply_cdo(&cdo)?;
+        self.engine = InterpreterEngine::new_npu1();
+        self.engine.device_mut().apply_cdo(&cdo)?;
 
         self.loaded_file = Some(path.to_path_buf());
         self.status_message = format!(
             "Loaded: {} ({} commands, {} bytes program)",
             path.file_name().unwrap_or_default().to_string_lossy(),
-            self.engine.state.stats.commands,
-            self.engine.state.stats.program_bytes
+            self.engine.device().stats.commands,
+            self.engine.device().stats.program_bytes
         );
         self.error_message = None;
 
@@ -151,7 +150,7 @@ impl eframe::App for EmulatorApp {
         self.handle_file_drop(ctx);
 
         // Auto-run mode
-        if self.auto_run && self.engine.status == EngineStatus::Running {
+        if self.auto_run && self.engine.status() == EngineStatus::Running {
             self.engine.run(self.steps_per_frame);
             ctx.request_repaint();
         }
@@ -208,7 +207,7 @@ impl eframe::App for EmulatorApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!(
                         "Cycles: {} | Instructions: {}",
-                        self.engine.total_cycles,
+                        self.engine.total_cycles(),
                         self.engine.total_instructions()
                     ));
                 });

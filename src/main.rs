@@ -2,7 +2,6 @@
 
 use std::env;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use xdna_emu::parser::{Xclbin, AiePartition, Cdo, AieElf};
 use xdna_emu::parser::xclbin::SectionKind;
 use xdna_emu::parser::cdo::{find_cdo_offset, CdoCommand};

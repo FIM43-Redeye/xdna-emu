@@ -215,7 +215,7 @@ impl Xclbin {
         let data_slice = &mmap[..];
 
         // Validate magic
-        if &data_slice[0..8] != XCLBIN_MAGIC {
+        if data_slice[0..8] != XCLBIN_MAGIC {
             bail!(
                 "Invalid magic: expected {:?}, got {:?}",
                 XCLBIN_MAGIC,

@@ -386,6 +386,223 @@ pub fn build_decoder_tables(data: &TableGenData) -> HashMap<String, Vec<InstrEnc
     Resolver::new(data).resolve_by_slot()
 }
 
+/// O(1) instruction lookup index for a single slot.
+///
+/// Uses a HashMap keyed on the common opcode bits to achieve constant-time
+/// lookup for most instructions, with a small linear scan for disambiguation.
+#[derive(Debug, Clone)]
+pub struct SlotIndex {
+    /// The slot name (e.g., "alu", "lda")
+    pub slot_name: String,
+
+    /// Intersection of all fixed_masks - the "common opcode bits".
+    /// All instructions in this slot have these bits as part of their opcode.
+    pub common_mask: u64,
+
+    /// Primary lookup table: (word & common_mask) -> candidate encodings.
+    /// Usually 1 entry per key, occasionally 2-3 for disambiguation.
+    by_opcode: HashMap<u64, Vec<InstrEncoding>>,
+
+    /// Fallback encodings for instructions with unusual masks.
+    /// These have fixed_mask bits outside the common_mask (rare).
+    fallback: Vec<InstrEncoding>,
+}
+
+impl SlotIndex {
+    /// Build a slot index from a list of encodings.
+    ///
+    /// Computes the common opcode mask and organizes encodings for O(1) lookup.
+    pub fn build(slot_name: impl Into<String>, mut encodings: Vec<InstrEncoding>) -> Self {
+        let slot_name = slot_name.into();
+
+        if encodings.is_empty() {
+            return Self {
+                slot_name,
+                common_mask: 0,
+                by_opcode: HashMap::new(),
+                fallback: Vec::new(),
+            };
+        }
+
+        // Sort by specificity (most specific first) for disambiguation
+        encodings.sort_by(|a, b| b.specificity().cmp(&a.specificity()));
+
+        // Compute common mask: intersection of all fixed_masks
+        let common_mask = encodings
+            .iter()
+            .map(|e| e.fixed_mask)
+            .fold(!0u64, |acc, mask| acc & mask);
+
+        // Partition encodings into by_opcode vs fallback
+        let mut by_opcode: HashMap<u64, Vec<InstrEncoding>> = HashMap::new();
+        let mut fallback = Vec::new();
+
+        for encoding in encodings {
+            // Check if this encoding's mask is exactly the common mask
+            // or a superset (has additional fixed bits beyond common)
+            if (encoding.fixed_mask & common_mask) == common_mask {
+                // Normal case: index by the common opcode bits
+                let opcode = encoding.fixed_bits & common_mask;
+                by_opcode.entry(opcode).or_default().push(encoding);
+            } else {
+                // Unusual: this encoding has a smaller mask than common
+                // (shouldn't happen with proper TableGen, but be safe)
+                fallback.push(encoding);
+            }
+        }
+
+        // Sort each bucket by specificity
+        for bucket in by_opcode.values_mut() {
+            bucket.sort_by(|a, b| b.specificity().cmp(&a.specificity()));
+        }
+        fallback.sort_by(|a, b| b.specificity().cmp(&a.specificity()));
+
+        Self {
+            slot_name,
+            common_mask,
+            by_opcode,
+            fallback,
+        }
+    }
+
+    /// Decode a word using O(1) lookup.
+    ///
+    /// Returns the matching encoding and extracted operand values.
+    #[inline]
+    pub fn decode(&self, word: u64) -> Option<(&InstrEncoding, HashMap<String, u64>)> {
+        // Primary lookup: use common opcode bits
+        let opcode = word & self.common_mask;
+
+        if let Some(candidates) = self.by_opcode.get(&opcode) {
+            // Usually 1 candidate, occasionally 2-3
+            for encoding in candidates {
+                if encoding.matches(word) {
+                    let operands = self.extract_operands(encoding, word);
+                    return Some((encoding, operands));
+                }
+            }
+        }
+
+        // Fallback: linear scan of unusual encodings
+        for encoding in &self.fallback {
+            if encoding.matches(word) {
+                let operands = self.extract_operands(encoding, word);
+                return Some((encoding, operands));
+            }
+        }
+
+        None
+    }
+
+    /// Extract operand values from a matched instruction.
+    #[inline]
+    fn extract_operands(&self, encoding: &InstrEncoding, word: u64) -> HashMap<String, u64> {
+        let mut operands = HashMap::new();
+        for field in &encoding.operand_fields {
+            let value = field.extract(word);
+            operands.insert(field.name.clone(), value);
+        }
+        operands
+    }
+
+    /// Get the number of indexed encodings.
+    pub fn encoding_count(&self) -> usize {
+        self.by_opcode.values().map(|v| v.len()).sum::<usize>() + self.fallback.len()
+    }
+
+    /// Get statistics about the index.
+    pub fn stats(&self) -> SlotIndexStats {
+        let bucket_sizes: Vec<usize> = self.by_opcode.values().map(|v| v.len()).collect();
+        let max_bucket = bucket_sizes.iter().copied().max().unwrap_or(0);
+        let avg_bucket = if bucket_sizes.is_empty() {
+            0.0
+        } else {
+            bucket_sizes.iter().sum::<usize>() as f64 / bucket_sizes.len() as f64
+        };
+
+        SlotIndexStats {
+            slot_name: self.slot_name.clone(),
+            common_mask: self.common_mask,
+            bucket_count: self.by_opcode.len(),
+            fallback_count: self.fallback.len(),
+            max_bucket_size: max_bucket,
+            avg_bucket_size: avg_bucket,
+        }
+    }
+}
+
+/// Statistics about a SlotIndex.
+#[derive(Debug, Clone)]
+pub struct SlotIndexStats {
+    pub slot_name: String,
+    pub common_mask: u64,
+    pub bucket_count: usize,
+    pub fallback_count: usize,
+    pub max_bucket_size: usize,
+    pub avg_bucket_size: f64,
+}
+
+/// Complete decoder index for all slots.
+///
+/// Provides O(1) instruction decoding by slot type.
+#[derive(Debug, Clone, Default)]
+pub struct DecoderIndex {
+    /// Per-slot indices
+    slots: HashMap<String, SlotIndex>,
+}
+
+impl DecoderIndex {
+    /// Build a decoder index from TableGen data.
+    pub fn build(data: &TableGenData) -> Self {
+        let by_slot = Resolver::new(data).resolve_by_slot();
+        Self::from_slot_encodings(by_slot)
+    }
+
+    /// Build from pre-resolved slot encodings.
+    pub fn from_slot_encodings(by_slot: HashMap<String, Vec<InstrEncoding>>) -> Self {
+        let slots = by_slot
+            .into_iter()
+            .map(|(name, encodings)| {
+                let index = SlotIndex::build(&name, encodings);
+                (name, index)
+            })
+            .collect();
+
+        Self { slots }
+    }
+
+    /// Decode slot bits for a specific slot type.
+    #[inline]
+    pub fn decode_slot(&self, slot_name: &str, bits: u64) -> Option<(&InstrEncoding, HashMap<String, u64>)> {
+        self.slots.get(slot_name).and_then(|idx| idx.decode(bits))
+    }
+
+    /// Get the index for a specific slot.
+    pub fn slot_index(&self, slot_name: &str) -> Option<&SlotIndex> {
+        self.slots.get(slot_name)
+    }
+
+    /// Get all slot names.
+    pub fn slot_names(&self) -> impl Iterator<Item = &str> {
+        self.slots.keys().map(|s| s.as_str())
+    }
+
+    /// Get statistics for all slots.
+    pub fn stats(&self) -> Vec<SlotIndexStats> {
+        self.slots.values().map(|idx| idx.stats()).collect()
+    }
+
+    /// Check if the index is empty.
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Get total encoding count across all slots.
+    pub fn total_encodings(&self) -> usize {
+        self.slots.values().map(|idx| idx.encoding_count()).sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,5 +830,129 @@ mod tests {
         let result = resolver.resolve_instruction(data.instructions.get("ADD").unwrap());
 
         assert!(matches!(result, Err(ResolveError::TemplateArgsMismatch { .. })));
+    }
+
+    // === O(1) SlotIndex Tests ===
+
+    #[test]
+    fn test_slot_index_build() {
+        let data = make_test_data();
+        let by_slot = build_decoder_tables(&data);
+
+        let alu_index = SlotIndex::build("alu", by_slot["alu"].clone());
+
+        // Common mask should be 0x1F (bits 4:0 are the opcode)
+        assert_eq!(alu_index.common_mask, 0b1_1111);
+
+        // Should have 2 encodings
+        assert_eq!(alu_index.encoding_count(), 2);
+
+        // No fallback needed
+        let stats = alu_index.stats();
+        assert_eq!(stats.fallback_count, 0);
+    }
+
+    #[test]
+    fn test_slot_index_o1_decode() {
+        let data = make_test_data();
+        let by_slot = build_decoder_tables(&data);
+        let alu_index = SlotIndex::build("alu", by_slot["alu"].clone());
+
+        // ADD: r5 = r3 + r2 -> mRx0=3, mRx=5, mRy=2, op=0, lit=1
+        let add_word = 0b00011_00101_00010_0000_1u64;
+        let (encoding, operands) = alu_index.decode(add_word).expect("Should decode ADD");
+        assert_eq!(encoding.name, "ADD");
+        assert_eq!(operands.get("mRx0"), Some(&3));
+        assert_eq!(operands.get("mRx"), Some(&5));
+        assert_eq!(operands.get("mRy"), Some(&2));
+
+        // SUB: r5 = r3 - r2 -> mRx0=3, mRx=5, mRy=2, op=1, lit=1
+        let sub_word = 0b00011_00101_00010_0001_1u64;
+        let (encoding, operands) = alu_index.decode(sub_word).expect("Should decode SUB");
+        assert_eq!(encoding.name, "SUB");
+        assert_eq!(operands.get("mRx0"), Some(&3));
+    }
+
+    #[test]
+    fn test_slot_index_unknown() {
+        let data = make_test_data();
+        let by_slot = build_decoder_tables(&data);
+        let alu_index = SlotIndex::build("alu", by_slot["alu"].clone());
+
+        // Invalid instruction (wrong opcode bits)
+        let bad_word = 0b00011_00101_00010_1111_0u64; // Wrong trailing bit
+        assert!(alu_index.decode(bad_word).is_none());
+    }
+
+    #[test]
+    fn test_decoder_index_build() {
+        let data = make_test_data();
+        let index = DecoderIndex::build(&data);
+
+        assert!(!index.is_empty());
+        assert!(index.slot_index("alu").is_some());
+        assert_eq!(index.total_encodings(), 2);
+    }
+
+    #[test]
+    fn test_decoder_index_decode_slot() {
+        let data = make_test_data();
+        let index = DecoderIndex::build(&data);
+
+        let add_word = 0b00011_00101_00010_0000_1u64;
+        let (encoding, _) = index.decode_slot("alu", add_word).expect("Should decode");
+        assert_eq!(encoding.name, "ADD");
+    }
+
+    #[test]
+    fn test_slot_index_stats() {
+        let data = make_test_data();
+        let by_slot = build_decoder_tables(&data);
+        let alu_index = SlotIndex::build("alu", by_slot["alu"].clone());
+
+        let stats = alu_index.stats();
+        assert_eq!(stats.slot_name, "alu");
+        assert_eq!(stats.common_mask, 0b1_1111);
+        assert_eq!(stats.bucket_count, 2); // ADD and SUB have different opcodes
+        assert_eq!(stats.fallback_count, 0);
+        assert_eq!(stats.max_bucket_size, 1); // Each opcode maps to 1 instruction
+    }
+
+    #[test]
+    fn test_decoder_index_with_real_llvm_aie() {
+        use std::path::Path;
+        use crate::tablegen::load_from_llvm_aie;
+
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found");
+            return;
+        }
+
+        let data = load_from_llvm_aie(llvm_aie_path).expect("Failed to load llvm-aie");
+        let index = DecoderIndex::build(&data);
+
+        eprintln!("DecoderIndex built with {} total encodings", index.total_encodings());
+
+        // Print stats for each slot
+        for stat in index.stats() {
+            eprintln!(
+                "  {}: common_mask=0x{:X}, buckets={}, fallback={}, max_bucket={}, avg_bucket={:.2}",
+                stat.slot_name,
+                stat.common_mask,
+                stat.bucket_count,
+                stat.fallback_count,
+                stat.max_bucket_size,
+                stat.avg_bucket_size
+            );
+        }
+
+        // Verify the index is usable
+        assert!(!index.is_empty());
+        assert!(index.total_encodings() > 0);
+
+        // Verify we have expected slots
+        assert!(index.slot_index("alu").is_some(), "Should have alu slot");
+        assert!(index.slot_index("lda").is_some(), "Should have lda slot");
     }
 }

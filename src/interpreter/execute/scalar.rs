@@ -73,7 +73,7 @@ impl ScalarAlu {
 
             Operation::ScalarShl => {
                 let (a, b) = Self::get_two_sources(op, ctx);
-                let shift = (b & 0x1F) as u32;
+                let shift = (b & 0x1F);
                 let result = a << shift;
                 Self::write_dest(op, ctx, result);
                 ctx.set_flags(Flags::from_result(result));
@@ -82,7 +82,7 @@ impl ScalarAlu {
 
             Operation::ScalarShr => {
                 let (a, b) = Self::get_two_sources(op, ctx);
-                let shift = (b & 0x1F) as u32;
+                let shift = (b & 0x1F);
                 let result = a >> shift;
                 Self::write_dest(op, ctx, result);
                 ctx.set_flags(Flags::from_result(result));
@@ -91,7 +91,7 @@ impl ScalarAlu {
 
             Operation::ScalarSra => {
                 let (a, b) = Self::get_two_sources(op, ctx);
-                let shift = (b & 0x1F) as u32;
+                let shift = (b & 0x1F);
                 let result = ((a as i32) >> shift) as u32;
                 Self::write_dest(op, ctx, result);
                 ctx.set_flags(Flags::from_result(result));

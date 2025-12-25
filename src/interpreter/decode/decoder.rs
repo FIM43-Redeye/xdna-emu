@@ -1,8 +1,7 @@
 //! TableGen-driven instruction decoder.
 //!
 //! This decoder uses encoding tables generated from llvm-aie's TableGen files
-//! to accurately decode AIE2 instructions. Unlike the heuristic-based
-//! `PatternDecoder`, this decoder matches against actual instruction encodings.
+//! to accurately decode AIE2 instructions with O(1) lookup performance.
 //!
 //! # How It Works
 //!
@@ -15,21 +14,22 @@
 //!
 //! ```ignore
 //! use xdna_emu::tablegen::{load_from_llvm_aie, build_decoder_tables};
-//! use xdna_emu::interpreter::decode::TableGenDecoder;
+//! use xdna_emu::interpreter::decode::InstructionDecoder;
 //!
 //! let data = load_from_llvm_aie("../llvm-aie")?;
 //! let tables = build_decoder_tables(&data);
-//! let decoder = TableGenDecoder::from_tables(tables);
+//! let decoder = InstructionDecoder::from_tables(tables);
 //! ```
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::interpreter::bundle::{
     BranchCondition, ElementType, MemWidth, Operand, Operation, PostModify, SlotIndex, SlotOp,
     VliwBundle,
 };
 use crate::interpreter::traits::{DecodeError, Decoder};
-use crate::tablegen::{InstrEncoding, SemanticOp};
+use crate::tablegen::{build_decoder_tables, load_from_llvm_aie, DecoderIndex, InstrEncoding, SemanticOp};
 
 /// A decoded instruction from TableGen data.
 #[derive(Debug, Clone)]
@@ -76,38 +76,90 @@ impl DecodedInstr {
 ///
 /// Uses resolved encoding tables from llvm-aie's TableGen files to decode
 /// instructions accurately.
-pub struct TableGenDecoder {
-    /// All encodings, sorted by specificity (most specific first).
+///
+/// # Performance
+///
+/// This decoder uses O(1) lookup via `DecoderIndex`:
+/// 1. Extract slot bits from bundle
+/// 2. Compute `opcode = bits & common_mask` for the slot
+/// 3. HashMap lookup to find candidate encodings
+/// 4. Small linear scan (usually 1-3 candidates) for disambiguation
+pub struct InstructionDecoder {
+    /// O(1) decoder index (per-slot HashMap lookup).
+    index: DecoderIndex,
+
+    /// Legacy flat encoding list (for fallback/compatibility).
+    /// Will be removed once all code uses DecoderIndex.
     encodings: Vec<InstrEncoding>,
+
     /// Statistics: successful decodes.
     decode_count: u64,
     /// Statistics: unknown patterns.
     unknown_count: u64,
 }
 
-impl Default for TableGenDecoder {
+impl Default for InstructionDecoder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl TableGenDecoder {
+/// Default path to llvm-aie repository (relative to project root).
+pub const DEFAULT_LLVM_AIE_PATH: &str = "../llvm-aie";
+
+impl InstructionDecoder {
     /// Create an empty decoder (no encodings loaded).
     pub fn new() -> Self {
         Self {
+            index: DecoderIndex::default(),
             encodings: Vec::new(),
             decode_count: 0,
             unknown_count: 0,
         }
     }
 
+    /// Load a decoder from llvm-aie at the default path (../llvm-aie).
+    ///
+    /// Returns an empty decoder if llvm-aie is not found.
+    pub fn load_default() -> Self {
+        Self::try_load(DEFAULT_LLVM_AIE_PATH).unwrap_or_else(|_| Self::new())
+    }
+
+    /// Load a decoder from llvm-aie at the specified path.
+    ///
+    /// Returns an error if the path doesn't exist or parsing fails.
+    pub fn try_load(llvm_aie_path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
+        let path = llvm_aie_path.as_ref();
+        if !path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("llvm-aie not found at: {}", path.display()),
+            ));
+        }
+
+        let data = load_from_llvm_aie(path)?;
+        let tables = build_decoder_tables(&data);
+        Ok(Self::from_tables(tables))
+    }
+
+    /// Check if llvm-aie is available at the default path.
+    pub fn is_llvm_aie_available() -> bool {
+        Path::new(DEFAULT_LLVM_AIE_PATH).exists()
+    }
+
     /// Create a decoder from encoding tables grouped by slot.
+    ///
+    /// This is the preferred constructor - it builds an O(1) index.
     pub fn from_tables(tables: HashMap<String, Vec<InstrEncoding>>) -> Self {
-        // Flatten all encodings and sort by specificity (descending)
+        // Build O(1) index from the tables
+        let index = DecoderIndex::from_slot_encodings(tables.clone());
+
+        // Keep flat list for legacy decode_word() compatibility
         let mut encodings: Vec<InstrEncoding> = tables.into_values().flatten().collect();
         encodings.sort_by(|a, b| b.specificity().cmp(&a.specificity()));
 
         Self {
+            index,
             encodings,
             decode_count: 0,
             unknown_count: 0,
@@ -116,9 +168,27 @@ impl TableGenDecoder {
 
     /// Create a decoder from a flat list of encodings.
     pub fn from_encodings(mut encodings: Vec<InstrEncoding>) -> Self {
+        // Group by slot for the O(1) index
+        let mut by_slot: HashMap<String, Vec<InstrEncoding>> = HashMap::new();
+        for enc in &encodings {
+            by_slot.entry(enc.slot.clone()).or_default().push(enc.clone());
+        }
+        let index = DecoderIndex::from_slot_encodings(by_slot);
+
         encodings.sort_by(|a, b| b.specificity().cmp(&a.specificity()));
         Self {
+            index,
             encodings,
+            decode_count: 0,
+            unknown_count: 0,
+        }
+    }
+
+    /// Create a decoder from a pre-built DecoderIndex.
+    pub fn from_index(index: DecoderIndex) -> Self {
+        Self {
+            index,
+            encodings: Vec::new(), // No legacy list needed
             decode_count: 0,
             unknown_count: 0,
         }
@@ -135,7 +205,15 @@ impl TableGenDecoder {
         self.unknown_count = 0;
     }
 
+    /// Get the underlying decoder index.
+    pub fn decoder_index(&self) -> &DecoderIndex {
+        &self.index
+    }
+
     /// Try to decode an instruction word against all known encodings.
+    ///
+    /// Note: This is a legacy O(n) method. Prefer using decode_slot_bits()
+    /// with the slot type for O(1) performance.
     pub fn decode_word(&self, word: u64) -> Option<DecodedInstr> {
         for encoding in &self.encodings {
             if encoding.matches(word) {
@@ -157,8 +235,8 @@ impl TableGenDecoder {
 
     /// Try to decode slot-specific bits against encodings for that slot.
     ///
-    /// This is used when we've already extracted the slot bits from a VLIW bundle
-    /// and need to decode them according to the slot's encoding rules.
+    /// This is the preferred O(1) decode method. It uses the DecoderIndex
+    /// for constant-time lookup based on the slot's common opcode bits.
     pub fn decode_slot_bits(
         &self,
         bits: u64,
@@ -178,22 +256,14 @@ impl TableGenDecoder {
             SlotType::Nop => return None, // NOPs don't have specific encodings
         };
 
-        // Filter encodings by slot and try to match
-        for encoding in &self.encodings {
-            if encoding.slot == slot_name && encoding.matches(bits) {
-                // Extract operands
-                let mut operands = HashMap::new();
-                for field in &encoding.operand_fields {
-                    let value = field.extract(bits);
-                    operands.insert(field.name.clone(), value);
-                }
-
-                return Some(DecodedInstr {
-                    encoding: encoding.clone(),
-                    operands,
-                });
-            }
+        // O(1) lookup via DecoderIndex
+        if let Some((encoding, operands)) = self.index.decode_slot(slot_name, bits) {
+            return Some(DecodedInstr {
+                encoding: encoding.clone(),
+                operands,
+            });
         }
+
         None
     }
 
@@ -401,7 +471,7 @@ impl TableGenDecoder {
     }
 }
 
-impl Decoder for TableGenDecoder {
+impl Decoder for InstructionDecoder {
     fn decode(&self, bytes: &[u8], pc: u32) -> Result<VliwBundle, DecodeError> {
         use crate::interpreter::bundle::{extract_slots, SlotType};
 
@@ -600,7 +670,7 @@ mod tests {
 
     #[test]
     fn test_decoder_matches_add() {
-        let decoder = TableGenDecoder::from_encodings(vec![make_add_encoding()]);
+        let decoder = InstructionDecoder::from_encodings(vec![make_add_encoding()]);
 
         // Construct ADD r5, r3, r2: mRx0=3, mRx=5, mRy=2, fixed=0b0_0001
         // Encoding: 00011_00101_00010_0000_1 = bits 19:0
@@ -615,7 +685,7 @@ mod tests {
 
     #[test]
     fn test_decoder_trait() {
-        let decoder = TableGenDecoder::from_encodings(vec![make_add_encoding()]);
+        let decoder = InstructionDecoder::from_encodings(vec![make_add_encoding()]);
 
         // ADD r5, r3, r2 as bytes (little-endian)
         // Slot encoding: 00011_00101_00010_0000_1 = 20 bits
@@ -638,7 +708,7 @@ mod tests {
 
     #[test]
     fn test_decoder_nop() {
-        let decoder = TableGenDecoder::new();
+        let decoder = InstructionDecoder::new();
 
         let bytes = [0x00u8, 0x00, 0x00, 0x00];
         let bundle = decoder.decode(&bytes, 0).expect("Should decode");
@@ -647,7 +717,7 @@ mod tests {
 
     #[test]
     fn test_decoder_unknown() {
-        let decoder = TableGenDecoder::new();
+        let decoder = InstructionDecoder::new();
 
         // Random non-NOP word with 32-bit format marker (0x9)
         // This ensures we don't need more bytes than provided
@@ -677,7 +747,7 @@ mod tests {
         let more_specific = make_add_encoding(); // 5 fixed bits
 
         // Order shouldn't matter - decoder sorts by specificity
-        let decoder = TableGenDecoder::from_encodings(vec![less_specific.clone(), more_specific]);
+        let decoder = InstructionDecoder::from_encodings(vec![less_specific.clone(), more_specific]);
 
         let word = 0b00011_00101_00010_0000_1u64;
         let decoded = decoder.decode_word(word).expect("Should decode");
@@ -704,7 +774,7 @@ mod tests {
         }
 
         // Create decoder from real data
-        let decoder = TableGenDecoder::from_tables(tables);
+        let decoder = InstructionDecoder::from_tables(tables);
 
         // Test NOP decoding
         let nop_bytes = [0x00u8, 0x00, 0x00, 0x00];
@@ -742,7 +812,7 @@ mod tests {
         // Load TableGen data and create decoder
         let data = load_from_llvm_aie(llvm_aie_path).expect("Failed to load llvm-aie");
         let tables = build_decoder_tables(&data);
-        let decoder = TableGenDecoder::from_tables(tables);
+        let decoder = InstructionDecoder::from_tables(tables);
 
         // Read ELF using proper parser
         let elf_data = std::fs::read(elf_path).expect("Failed to read ELF");

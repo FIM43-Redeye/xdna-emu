@@ -1,8 +1,8 @@
 //! Instruction decoder for AIE2.
 //!
 //! This module provides instruction decoding from raw bytes to [`VliwBundle`]
-//! structures. The decoder is designed to be accurate for common instruction
-//! patterns while providing infrastructure for TableGen-based refinement.
+//! structures. The decoder uses TableGen definitions from llvm-aie for
+//! accurate, O(1) instruction lookup.
 //!
 //! # AIE2 Instruction Format
 //!
@@ -28,25 +28,21 @@
 //! # Example
 //!
 //! ```ignore
-//! use xdna_emu::interpreter::decode::PatternDecoder;
+//! use xdna_emu::interpreter::decode::InstructionDecoder;
 //! use xdna_emu::interpreter::traits::Decoder;
 //!
-//! let decoder = PatternDecoder::new();
+//! let decoder = InstructionDecoder::load_default();
 //! let bytes = &program_memory[pc..];
 //! let bundle = decoder.decode(bytes, pc)?;
 //! ```
 
-mod patterns;
-mod tablegen_decoder;
+mod decoder;
 
-pub use patterns::PatternDecoder;
-pub use tablegen_decoder::{DecodedInstr, TableGenDecoder};
+pub use decoder::{DecodedInstr, InstructionDecoder, DEFAULT_LLVM_AIE_PATH};
 
 use crate::interpreter::bundle::{
-    BranchCondition, BundleFormat, ElementType, MemWidth, Operand, Operation, PostModify,
-    SlotIndex, SlotOp, VliwBundle,
+    Operand, Operation, SlotIndex, SlotOp,
 };
-use crate::interpreter::traits::DecodeError;
 
 /// AIE2 slot types based on TableGen definitions.
 ///

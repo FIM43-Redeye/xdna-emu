@@ -56,7 +56,8 @@ pub use parser::{
     parse_tablegen_files_with_patterns, ParseError,
 };
 pub use resolver::{
-    build_decoder_tables, InstrEncoding, OperandField, ResolveError, Resolver,
+    build_decoder_tables, DecoderIndex, InstrEncoding, OperandField, ResolveError, Resolver,
+    SlotIndex, SlotIndexStats,
 };
 pub use types::{
     EncodingPart, FormatClass, InstrAttributes, InstrDef, OperandDef, SemanticOp, SemanticPattern,

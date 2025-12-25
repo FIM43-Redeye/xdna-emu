@@ -27,9 +27,9 @@
 
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{Operation, SlotOp, VliwBundle};
-use crate::interpreter::state::{ExecutionContext, TimingContext};
+use crate::interpreter::state::ExecutionContext;
 use crate::interpreter::timing::{
-    hazards::SlotOpExt, LatencyTable, MemoryAccess, MemoryModel, HazardDetector,
+    LatencyTable, MemoryAccess, MemoryModel, HazardDetector,
 };
 use crate::interpreter::traits::{ExecuteResult, Executor};
 

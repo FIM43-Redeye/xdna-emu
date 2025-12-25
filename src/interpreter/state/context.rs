@@ -304,7 +304,7 @@ impl ExecutionContext {
     }
 
     /// Push a value onto the stack (decrement SP, write value).
-    pub fn push(&mut self, value: u32) {
+    pub fn push(&mut self, _value: u32) {
         let new_sp = self.sp().wrapping_sub(4);
         self.set_sp(new_sp);
         // Note: actual memory write must be done by caller

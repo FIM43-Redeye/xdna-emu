@@ -39,7 +39,7 @@ Component Completion:
 
 **Validation**: Run `add_one` kernel, verify output = input + 1.
 
-**Tests**: 446 passing
+**Tests**: 433 passing
 
 ### Milestone 2: Multi-Tile Data Flow (Target: 65%)
 
@@ -186,19 +186,17 @@ Based on AMD AM020 and [llvm-aie](https://github.com/Xilinx/llvm-aie) TableGen f
 |------|--------|-------|
 | Bundle representation (`VliwBundle`) | ✅ Done | `src/interpreter/bundle/` |
 | Slot operation types (`SlotOp`, `Operation`) | ✅ Done | 30+ operation types |
-| Pattern-based decoder | ✅ Done | `src/interpreter/decode/patterns.rs` |
-| TableGen-based decoder | ✅ Done | `src/interpreter/decode/tablegen_decoder.rs` |
+| TableGen-based decoder | ✅ Done | `src/interpreter/decode/decoder.rs` |
 | VLIW slot extraction | ✅ Done | All formats 16-128 bit fully supported |
 | Full VLIW bundle parsing | ✅ Done | All formats 16-128 bit complete |
 
-**Files created**:
+**Files**:
 - `src/interpreter/bundle/mod.rs` - VliwBundle struct, disassembler
 - `src/interpreter/bundle/slot.rs` - SlotIndex, SlotOp, Operation, Operand
 - `src/interpreter/bundle/encoding.rs` - BundleFormat, format detection
 - `src/interpreter/bundle/slot_layout.rs` - VLIW slot extraction (16-128 bit)
 - `src/interpreter/decode/mod.rs` - Aie2Slot, extraction helpers
-- `src/interpreter/decode/patterns.rs` - PatternDecoder
-- `src/interpreter/decode/tablegen_decoder.rs` - TableGenDecoder
+- `src/interpreter/decode/decoder.rs` - InstructionDecoder (O(1) lookup)
 
 ### 1.2 Scalar Unit
 
@@ -581,6 +579,7 @@ for addr in gen.iter() {
 src/interpreter/
 ├── mod.rs              # Public API, re-exports
 ├── traits.rs           # Decoder, Executor, StateAccess traits
+├── test_runner.rs      # ✅ TestRunner for kernel execution
 ├── bundle/             # ✅ DONE
 │   ├── mod.rs          # VliwBundle
 │   ├── slot.rs         # SlotOp, Operation, Operand
@@ -588,8 +587,7 @@ src/interpreter/
 │   └── slot_layout.rs  # VLIW slot extraction from bundles
 ├── decode/             # ✅ DONE
 │   ├── mod.rs          # Aie2Slot, helpers
-│   ├── patterns.rs     # PatternDecoder
-│   └── tablegen_decoder.rs  # TableGenDecoder
+│   └── decoder.rs      # InstructionDecoder (O(1) lookup)
 ├── state/              # ✅ DONE
 │   ├── mod.rs          # Module exports
 │   ├── registers.rs    # All register files
@@ -623,41 +621,37 @@ src/tablegen/           # ✅ DONE
 └── resolver.rs         # Encoding resolution
 
 src/device/             # ✅ DONE
-├── mod.rs              # ✅ Device models
-├── aie2_spec.rs        # ✅ Architecture constants (AM020)
-├── tile.rs             # ✅ Tile state (memory, locks, DMA BDs)
-├── array.rs            # ✅ TileArray
-├── state.rs            # ✅ CDO application
-├── registers.rs        # ✅ Address decoding
-├── host_memory.rs      # ✅ Simulated DDR (sparse 64-bit address space)
-├── stream_switch.rs    # ✅ Stream switch stub (ports, FIFOs, routing)
+├── mod.rs              # Device models
+├── aie2_spec.rs        # Architecture constants (AM020)
+├── tile.rs             # Tile state (memory, locks, DMA BDs)
+├── array.rs            # TileArray
+├── state.rs            # CDO application
+├── registers.rs        # Address decoding
+├── host_memory.rs      # Simulated DDR (sparse 64-bit address space)
+├── stream_switch.rs    # Per-tile stream switch (ports, FIFOs, routing)
+├── stream_router.rs    # ✅ Global stream router (tile-to-tile data flow)
 └── dma/                # ✅ DMA execution engine
     ├── mod.rs          # BdConfig, ChannelType, DmaResult, DmaError
     ├── engine.rs       # DmaEngine (per-tile DMA controller)
     ├── transfer.rs     # Transfer state machine with locks
     ├── addressing.rs   # AddressGenerator (1D-4D patterns)
     └── timing.rs       # DmaTimingConfig, ChannelArbiter
-
-src/emulator/           # 🔲 TODO: High-level test harness
-├── mod.rs              # Emulator facade
-├── harness.rs          # Test harness API
-└── runner.rs           # Run-to-completion logic
 ```
 
 ---
 
 ## Test Coverage
 
-**Total: 431 tests passing** (425 unit + 6 doc tests)
+**Total: 433 tests passing** (427 unit + 6 doc tests)
 
 | Module | Tests | Notes |
 |--------|-------|-------|
+| **Interpreter** | | |
 | bundle/slot.rs | 8 | SlotIndex, ElementType, Operation |
 | bundle/encoding.rs | 6 | BundleFormat, SlotMask |
 | bundle/mod.rs | 8 | VliwBundle creation, disassembly |
 | decode/mod.rs | 4 | Extract helpers |
-| decode/patterns.rs | 8 | Pattern decoding |
-| decode/tablegen_decoder.rs | 6 | TableGen-based decoding |
+| decode/decoder.rs | 6 | InstructionDecoder |
 | traits.rs | 5 | Flags operations |
 | state/registers.rs | 13 | All register files |
 | state/context.rs | 10 | ExecutionContext |
@@ -673,23 +667,23 @@ src/emulator/           # 🔲 TODO: High-level test harness
 | timing/deadlock.rs | 11 | DeadlockDetector, cycle detection |
 | core/interpreter.rs | 9 | CoreInterpreter |
 | engine/coordinator.rs | 11 | InterpreterEngine |
+| test_runner.rs | 8 | TestRunner, kernel execution |
+| **TableGen** | | |
 | tablegen/types.rs | 6 | Data structures |
 | tablegen/parser.rs | 11 | Parsing tests |
 | tablegen/resolver.rs | 8 | Encoding resolution |
 | tablegen/mod.rs | 5 | Integration tests |
-| **Interpreter subtotal** | **~190** | Including timing/sync/deadlock modules |
-| **TableGen subtotal** | **~36** | |
-| **Legacy (emu_stub)** | **~86** | Preserved |
-| host_memory.rs | 12 | HostMemory, MemoryRegion |
+| **Device** | | |
+| device/aie2_spec.rs | 6 | Architecture constants |
+| device/host_memory.rs | 12 | HostMemory, MemoryRegion |
+| device/stream_switch.rs | 6 | StreamSwitch, StreamPort |
+| device/stream_router.rs | 8 | StreamRouter, tile-to-tile routing |
 | dma/mod.rs | 4 | BdConfig, ChannelType |
 | dma/addressing.rs | 15 | AddressGenerator (1D-4D) |
 | dma/transfer.rs | 13 | Transfer state machine |
 | dma/engine.rs | 15 | DmaEngine, timing integration |
 | dma/timing.rs | 5 | DmaTimingConfig, ChannelArbiter |
-| stream_switch.rs | 6 | StreamSwitch, StreamPort |
-| **DMA subtotal** | **~59** | Addressing, transfer, engine, timing |
-| **Timing/Stream subtotal** | **~29** | DMA timing + stream switch + sync + deadlock |
-| **Grand total** | **~431** | All passing |
+| **Grand total** | **433** | All passing |
 
 ---
 
@@ -719,10 +713,11 @@ Current status: **100% instruction recognition** on test ELF binaries. **DMA eng
 #### Priority 1: Integration (Critical for Testing)
 **Connect DMA engine to interpreter and stream switch.**
 - ~~Stream switch stub~~ - ✅ `StreamSwitch` with ports, FIFOs, routing API
+- ~~Stream router~~ - ✅ `StreamRouter` for global tile-to-tile data flow
+- ~~Test harness~~ - ✅ `TestRunner` with `run_to_completion()` in `test_runner.rs`
 - Integrate `DmaEngine` with `TileArray` for tile-to-tile transfers
 - Connect `DmaStart`/`DmaWait` in `control.rs` to actual DMA engine
 - Wire DMA channels to stream switch ports
-- Test harness `run_to_completion()` API
 
 #### Priority 2: Pipeline Model (Partial - Timing Infrastructure Done)
 - ~~Instruction latencies per operation type~~ - ✅ `LatencyTable`
@@ -763,17 +758,15 @@ Current status: **100% instruction recognition** on test ELF binaries. **DMA eng
 
 ## Technical Decisions
 
-### Why Pattern-Based Decoder First?
+### TableGen-Based Decoder
 
-TableGen parsing is complex and the llvm-aie repo has generated files. Starting with pattern-based decoding:
-1. Gets us running quickly
-2. Handles common cases accurately
-3. Provides infrastructure for TableGen integration later
-4. Gracefully falls back to `Unknown` for unrecognized patterns
+The decoder uses encoding tables generated from llvm-aie's TableGen files for O(1) lookup:
+1. Parse `.td` files to extract instruction encodings
+2. Build per-slot lookup tables keyed by opcode bits
+3. Match instructions with minimal linear scan (1-3 candidates)
+4. Extract operands using field definitions from TableGen
 
-Now we have **both** decoders:
-- `PatternDecoder` - Hand-written patterns for known instructions
-- `TableGenDecoder` - Auto-generated from llvm-aie TableGen files
+The `InstructionDecoder` in `decode/decoder.rs` provides the unified decoding interface.
 
 ### Slot Mapping
 
@@ -801,4 +794,3 @@ The interpreter uses a simplified 7-slot model internally while the decoder unde
 - **Key files**: `AIE2Slots.td`, `AIE2GenInstrFormats.td`, `AIE2GenInstrInfo.td`
 - **aie-rt**: Register definitions in [Xilinx/aie-rt](https://github.com/Xilinx/aie-rt)
 - **Architecture constants**: `src/device/aie2_spec.rs` (with AM020 references)
-- **Assessment**: [tablegen-assessment.md](tablegen-assessment.md)

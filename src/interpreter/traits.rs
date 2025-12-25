@@ -159,8 +159,7 @@ pub enum DecodeError {
 /// Implementations decode raw bytes into structured `VliwBundle` representations.
 /// Different implementations can provide different trade-offs:
 ///
-/// - `FastDecoder`: Quick pattern matching, may miss edge cases
-/// - `TableGenDecoder`: Full accuracy from parsed TableGen definitions
+/// - `InstructionDecoder`: Full accuracy from parsed TableGen definitions
 ///
 /// # Example
 ///

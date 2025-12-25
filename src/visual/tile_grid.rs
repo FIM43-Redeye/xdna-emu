@@ -6,7 +6,7 @@
 use eframe::egui::{self, Color32, Rect, Sense, Stroke, StrokeKind, Vec2};
 
 use crate::device::tile::TileType;
-use crate::emu::CoreStatus;
+use crate::interpreter::CoreStatus;
 
 use super::app::{EmulatorApp, SelectedTile};
 
@@ -17,7 +17,7 @@ const TILE_SPACING: f32 = 4.0;
 
 /// Get the color for a tile based on its type and status.
 fn tile_color(app: &EmulatorApp, col: u8, row: u8) -> Color32 {
-    let tile = match app.engine.state.array.get(col, row) {
+    let tile = match app.engine.device().array.get(col, row) {
         Some(t) => t,
         None => return Color32::DARK_GRAY,
     };
@@ -27,15 +27,14 @@ fn tile_color(app: &EmulatorApp, col: u8, row: u8) -> Color32 {
         TileType::MemTile => Color32::from_rgb(70, 100, 70), // Dark green
         TileType::Compute => {
             // Check core status
-            if let Some(exec) = app.engine.get_executor(col, row) {
-                match exec.status {
+            if let Some(status) = app.engine.core_status(col as usize, row as usize) {
+                match status {
                     CoreStatus::Running => Color32::from_rgb(50, 200, 50),      // Bright green
                     CoreStatus::WaitingLock { .. } => Color32::from_rgb(200, 200, 50), // Yellow
                     CoreStatus::WaitingDma { .. } => Color32::from_rgb(200, 150, 50),  // Orange
                     CoreStatus::Halted => Color32::from_rgb(150, 50, 50),       // Dark red
-                    CoreStatus::Breakpoint => Color32::from_rgb(200, 50, 200),  // Purple
-                    CoreStatus::DecodeError => Color32::from_rgb(255, 0, 0),    // Bright red
-                    CoreStatus::Idle => {
+                    CoreStatus::Error => Color32::from_rgb(255, 0, 0),          // Bright red
+                    CoreStatus::Ready => {
                         if tile.core.enabled {
                             Color32::from_rgb(80, 120, 80) // Ready (light green)
                         } else {
@@ -54,8 +53,8 @@ fn tile_color(app: &EmulatorApp, col: u8, row: u8) -> Color32 {
 
 /// Show the tile grid.
 pub fn show_tile_grid(ui: &mut egui::Ui, app: &mut EmulatorApp) {
-    let cols = app.engine.state.array.cols();
-    let rows = app.engine.state.array.rows();
+    let cols = app.engine.device().array.cols();
+    let rows = app.engine.device().array.rows();
 
     // Grid dimensions
     let grid_width = cols as f32 * (TILE_SIZE + TILE_SPACING);
@@ -101,7 +100,7 @@ pub fn show_tile_grid(ui: &mut egui::Ui, app: &mut EmulatorApp) {
             }
 
             // Draw tile label
-            let label = match app.engine.state.array.get(col, row) {
+            let label = match app.engine.device().array.get(col, row) {
                 Some(tile) => {
                     let type_char = match tile.tile_type {
                         TileType::Shim => "S",
@@ -138,7 +137,7 @@ pub fn show_tile_grid(ui: &mut egui::Ui, app: &mut EmulatorApp) {
     ui.separator();
     ui.heading("Summary");
 
-    let (shim, mem, compute) = app.engine.state.array.count_by_type();
+    let (shim, mem, compute) = app.engine.device().array.count_by_type();
     ui.label(format!("Tiles: {} shim, {} mem, {} compute", shim, mem, compute));
     ui.label(format!("Enabled cores: {}", app.engine.enabled_cores()));
     ui.label(format!("Active cores: {}", app.engine.active_cores()));
@@ -148,7 +147,7 @@ pub fn show_tile_grid(ui: &mut egui::Ui, app: &mut EmulatorApp) {
         ui.separator();
         ui.label(format!("Selected: ({}, {})", sel.col, sel.row));
 
-        if let Some(tile) = app.engine.state.array.get(sel.col, sel.row) {
+        if let Some(tile) = app.engine.device().array.get(sel.col, sel.row) {
             let type_name = match tile.tile_type {
                 TileType::Shim => "Shim Tile",
                 TileType::MemTile => "Memory Tile (512KB)",
@@ -158,8 +157,8 @@ pub fn show_tile_grid(ui: &mut egui::Ui, app: &mut EmulatorApp) {
 
             if tile.is_compute() {
                 ui.label(format!("PC: 0x{:04X}", tile.core.pc));
-                if let Some(exec) = app.engine.get_executor(sel.col, sel.row) {
-                    ui.label(format!("Status: {}", exec.status_string()));
+                if let Some(status) = app.engine.core_status(sel.col as usize, sel.row as usize) {
+                    ui.label(format!("Status: {:?}", status));
                 }
             }
         }

@@ -61,7 +61,7 @@ pub use bundle::{
 };
 
 // Decoder types
-pub use decode::PatternDecoder;
+pub use decode::InstructionDecoder;
 
 // State types
 pub use state::{ExecutionContext, SpRegister, TimingContext};

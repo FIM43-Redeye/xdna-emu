@@ -614,10 +614,10 @@ mod tests {
         eprintln!("Program size: {} bytes", text_data.len());
 
         // Try to decode instructions
-        use crate::interpreter::decode::PatternDecoder;
+        use crate::interpreter::decode::InstructionDecoder;
         use crate::interpreter::traits::Decoder;
 
-        let decoder = PatternDecoder::new();
+        let decoder = InstructionDecoder::load_default();
         let mut offset = 0;
         let mut decoded = 0;
         let mut unknown = 0;
@@ -649,5 +649,74 @@ mod tests {
 
         // We should decode at least some instructions
         assert!(decoded > 0, "Failed to decode any instructions!");
+    }
+
+    #[test]
+    fn test_multi_tile_dma_stream_flow() {
+        // This test validates the complete data path:
+        // 1. Source tile data memory -> MM2S DMA -> stream_out
+        // 2. StreamRouter routes from source tile to destination tile
+        // 3. DMA stream_in -> S2MM DMA -> destination tile data memory
+
+        let mut runner = TestRunner::new();
+
+        // Source tile (0, 2) -> Destination tile (0, 3)
+        let src_col = 0u8;
+        let src_row = 2u8;
+        let dst_col = 0u8;
+        let dst_row = 3u8;
+
+        // DMA channel 2 = MM2S_0 on source, channel 0 = S2MM_0 on destination
+        let mm2s_channel = 2u8;
+        let s2mm_channel = 0u8;
+
+        // Write test pattern to source tile memory at offset 0x1000
+        let test_data: Vec<u8> = (0..64u8).collect(); // 64 bytes = 16 words
+        runner.write_tile_memory(src_col, src_row, 0x1000, &test_data).unwrap();
+
+        // Configure MM2S BD on source tile: read from 0x1000, 64 bytes
+        let mm2s_bd = BdConfig::simple_1d(0x1000, 64);
+        runner.configure_dma_bd(src_col, src_row, 0, mm2s_bd).unwrap();
+
+        // Configure S2MM BD on destination tile: write to 0x2000, 64 bytes
+        let s2mm_bd = BdConfig::simple_1d(0x2000, 64);
+        runner.configure_dma_bd(dst_col, dst_row, 0, s2mm_bd).unwrap();
+
+        // Configure stream routing: source tile port 2 (MM2S_0) -> dest tile port 0 (S2MM_0)
+        runner.engine.device_mut().array.stream_router.add_route(
+            src_col, src_row, mm2s_channel,
+            dst_col, dst_row, s2mm_channel,
+        );
+
+        // Start both DMA channels
+        // MM2S_0 is channel index 2, S2MM_0 is channel index 0
+        runner.engine.device_mut().array.dma_engine_mut(src_col, src_row)
+            .unwrap()
+            .start_channel(mm2s_channel, 0) // BD 0
+            .unwrap();
+
+        runner.engine.device_mut().array.dma_engine_mut(dst_col, dst_row)
+            .unwrap()
+            .start_channel(s2mm_channel, 0) // BD 0
+            .unwrap();
+
+        // Step the system multiple times to allow data to flow
+        // Each step should: DMA transfer -> stream routing -> DMA transfer
+        for _ in 0..100 {
+            runner.step();
+        }
+
+        // Read destination tile memory and verify
+        let result = runner.read_tile_memory(dst_col, dst_row, 0x2000, 64).unwrap();
+
+        // Check if at least some data arrived
+        let nonzero_count = result.iter().filter(|&&b| b != 0).count();
+        eprintln!("Transferred {} non-zero bytes out of 64", nonzero_count);
+        eprintln!("First 16 bytes: {:?}", &result[..16]);
+        eprintln!("Expected first 16 bytes: {:?}", &test_data[..16]);
+
+        // For now, just verify the mechanism works - full validation requires
+        // proper S2MM stream data handling
+        assert!(nonzero_count > 0, "Expected at least some data to transfer");
     }
 }

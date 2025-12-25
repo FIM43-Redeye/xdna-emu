@@ -163,7 +163,7 @@ pub fn parse_slots(content: &str) -> Vec<SlotDef> {
             let start = i + pos;
 
             // Check if this is a slot definition
-            if let Some(slot_match) = PATTERNS.slot_def.captures(&content[start..]) {
+            if let Some(_slot_match) = PATTERNS.slot_def.captures(&content[start..]) {
                 // Find the closing brace for this block
                 let block_start = start;
                 let mut brace_count = 0;
@@ -516,7 +516,7 @@ fn parse_template_args(args_str: &str) -> (Vec<u64>, String, String, Vec<Operand
         .map(|(_, s)| s)
         .collect();
 
-    if quoted_strings.len() >= 1 {
+    if !quoted_strings.is_empty() {
         mnemonic = quoted_strings[0].to_string();
     }
     if quoted_strings.len() >= 2 {

@@ -20,7 +20,7 @@ pub fn show_tile_detail(ui: &mut egui::Ui, app: &mut EmulatorApp) {
     };
 
     // Get tile type first (before borrowing for scroll area)
-    let tile_info = app.engine.state.array.get(sel.col, sel.row).map(|t| {
+    let tile_info = app.engine.device().array.get(sel.col, sel.row).map(|t| {
         (t.tile_type, t.is_compute())
     });
 
@@ -84,7 +84,7 @@ fn show_core_state(ui: &mut egui::Ui, app: &EmulatorApp, col: u8, row: u8) {
     egui::CollapsingHeader::new("Core State")
         .default_open(true)
         .show(ui, |ui| {
-            if let Some(tile) = app.engine.state.array.get(col, row) {
+            if let Some(tile) = app.engine.device().array.get(col, row) {
                 egui::Grid::new("core_state_grid")
                     .num_columns(2)
                     .spacing([20.0, 4.0])
@@ -114,19 +114,13 @@ fn show_core_state(ui: &mut egui::Ui, app: &EmulatorApp, col: u8, row: u8) {
                         ui.end_row();
                     });
 
-                // Executor state
-                if let Some(exec) = app.engine.get_executor(col, row) {
+                // Interpreter state
+                if let Some(ctx) = app.engine.core_context(col as usize, row as usize) {
                     ui.separator();
-                    ui.label(format!("Executor: {}", exec.status_string()));
-                    ui.label(format!("Cycles: {}", exec.cycles));
-                    ui.label(format!("Instructions: {}", exec.instructions));
-
-                    // Last instruction
-                    if let Some(inst) = &exec.last_instruction {
-                        ui.separator();
-                        ui.label("Last instruction:");
-                        ui.monospace(inst.disassemble());
-                    }
+                    ui.label(format!("PC: 0x{:04X}", ctx.pc()));
+                }
+                if let Some(status) = app.engine.core_status(col as usize, row as usize) {
+                    ui.label(format!("Status: {:?}", status));
                 }
             }
         });
@@ -137,14 +131,14 @@ fn show_registers_panel(ui: &mut egui::Ui, app: &EmulatorApp, col: u8, row: u8) 
     egui::CollapsingHeader::new("Registers")
         .default_open(false)
         .show(ui, |ui| {
-            if let Some(exec) = app.engine.get_executor(col, row) {
+            if let Some(ctx) = app.engine.core_context(col as usize, row as usize) {
                 egui::Grid::new("regs_grid")
                     .num_columns(4)
                     .spacing([10.0, 2.0])
                     .show(ui, |ui| {
                         for i in 0..16 {
                             ui.monospace(format!("r{:02}:", i));
-                            ui.monospace(format!("0x{:08X}", exec.scalar.gpr[i]));
+                            ui.monospace(format!("0x{:08X}", ctx.scalar.read(i as u8)));
 
                             if i % 2 == 1 {
                                 ui.end_row();
@@ -152,7 +146,7 @@ fn show_registers_panel(ui: &mut egui::Ui, app: &EmulatorApp, col: u8, row: u8) 
                         }
                     });
             } else {
-                ui.label("No executor for this tile");
+                ui.label("No context for this tile");
             }
         });
 }
@@ -162,7 +156,7 @@ fn show_locks_panel(ui: &mut egui::Ui, app: &EmulatorApp, col: u8, row: u8) {
     egui::CollapsingHeader::new("Locks")
         .default_open(false)
         .show(ui, |ui| {
-            if let Some(tile) = app.engine.state.array.get(col, row) {
+            if let Some(tile) = app.engine.device().array.get(col, row) {
                 // Count non-zero locks
                 let active_locks: Vec<_> = tile
                     .locks
@@ -209,7 +203,7 @@ fn show_dma_panel(ui: &mut egui::Ui, app: &EmulatorApp, col: u8, row: u8) {
     egui::CollapsingHeader::new("DMA")
         .default_open(false)
         .show(ui, |ui| {
-            if let Some(tile) = app.engine.state.array.get(col, row) {
+            if let Some(tile) = app.engine.device().array.get(col, row) {
                 // Channels
                 ui.label("Channels:");
                 egui::Grid::new("dma_channels_grid")
@@ -307,7 +301,7 @@ fn show_memory_section(ui: &mut egui::Ui, app: &mut EmulatorApp, col: u8, row: u
 
             ui.separator();
 
-            if let Some(tile) = app.engine.state.array.get(col, row) {
+            if let Some(tile) = app.engine.device().array.get(col, row) {
                 if app.show_program_memory {
                     if let Some(pm) = tile.program_memory() {
                         memory_view::show_memory_view(ui, pm, app.memory_offset, "program_mem");

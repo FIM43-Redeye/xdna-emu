@@ -354,10 +354,10 @@ impl VectorAlu {
                 // 16 × 16-bit → 16 products, accumulated
                 let mut new_acc = current;
                 for i in 0..8 {
-                    let a_lo = (a[i] & 0xFFFF) as u32;
-                    let a_hi = ((a[i] >> 16) & 0xFFFF) as u32;
-                    let b_lo = (b[i] & 0xFFFF) as u32;
-                    let b_hi = ((b[i] >> 16) & 0xFFFF) as u32;
+                    let a_lo = (a[i] & 0xFFFF);
+                    let a_hi = ((a[i] >> 16) & 0xFFFF);
+                    let b_lo = (b[i] & 0xFFFF);
+                    let b_hi = ((b[i] >> 16) & 0xFFFF);
                     let prod_lo = a_lo * b_lo;
                     let prod_hi = a_hi * b_hi;
                     // Accumulate both products into single 64-bit lane
@@ -622,13 +622,13 @@ impl VectorAlu {
 
         // Pack lower halves: take low 16 bits of each input lane
         for i in 0..4 {
-            let a_lo = (a[i * 2] & 0xFFFF) as u32;
-            let a_hi = (a[i * 2 + 1] & 0xFFFF) as u32;
+            let a_lo = (a[i * 2] & 0xFFFF);
+            let a_hi = (a[i * 2 + 1] & 0xFFFF);
             result[i] = a_lo | (a_hi << 16);
         }
         for i in 0..4 {
-            let b_lo = (b[i * 2] & 0xFFFF) as u32;
-            let b_hi = (b[i * 2 + 1] & 0xFFFF) as u32;
+            let b_lo = (b[i * 2] & 0xFFFF);
+            let b_hi = (b[i * 2 + 1] & 0xFFFF);
             result[i + 4] = b_lo | (b_hi << 16);
         }
 

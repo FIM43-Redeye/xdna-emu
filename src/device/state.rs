@@ -238,11 +238,10 @@ impl DeviceState {
 
             _ => {
                 // Could be register array writes - handle as data
-                if offset < 0x10000 {
-                    if tile.write_data(offset, data) {
+                if offset < 0x10000
+                    && tile.write_data(offset, data) {
                         self.stats.data_bytes += data.len();
                     }
-                }
             }
         }
 
@@ -397,12 +396,12 @@ impl DeviceState {
 
         // Master ports: 0x3F000 + (port * 4)
         // Slave ports: 0x3F100 + (port * 4)
-        if offset >= 0x3F000 && offset < 0x3F020 {
+        if (0x3F000..0x3F020).contains(&offset) {
             let port = ((offset - 0x3F000) / 4) as usize;
             if port < 8 {
                 tile.stream_switch.master[port].config = value;
             }
-        } else if offset >= 0x3F100 && offset < 0x3F120 {
+        } else if (0x3F100..0x3F120).contains(&offset) {
             let port = ((offset - 0x3F100) / 4) as usize;
             if port < 8 {
                 tile.stream_switch.slave[port].config = value;

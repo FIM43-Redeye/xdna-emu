@@ -4,15 +4,17 @@
 
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::VliwBundle;
-use crate::interpreter::decode::PatternDecoder;
+use crate::interpreter::decode::InstructionDecoder;
 use crate::interpreter::execute::FastExecutor;
 use crate::interpreter::state::ExecutionContext;
 use crate::interpreter::traits::{DecodeError, Decoder, ExecuteResult, Executor};
 
 /// Core execution status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum CoreStatus {
     /// Core is ready to execute.
+    #[default]
     Ready,
     /// Core is running.
     Running,
@@ -26,11 +28,6 @@ pub enum CoreStatus {
     Error,
 }
 
-impl Default for CoreStatus {
-    fn default() -> Self {
-        CoreStatus::Ready
-    }
-}
 
 /// Result of a single step execution.
 #[derive(Debug, Clone)]
@@ -53,7 +50,16 @@ pub enum StepResult {
 ///
 /// Manages the execution of a single AIE2 compute core by coordinating
 /// the decoder and executor.
-pub struct CoreInterpreter<D = PatternDecoder, E = FastExecutor>
+///
+/// # Default Configuration
+///
+/// The default configuration uses:
+/// - `InstructionDecoder`: O(1) instruction decoder from llvm-aie TableGen files
+/// - `FastExecutor`: Non-cycle-accurate fast executor
+///
+/// If llvm-aie is not available, the decoder will be empty and return
+/// unknown operations for all instructions.
+pub struct CoreInterpreter<D = InstructionDecoder, E = FastExecutor>
 where
     D: Decoder,
     E: Executor,
@@ -68,10 +74,13 @@ where
     last_bundle: Option<VliwBundle>,
 }
 
-impl CoreInterpreter<PatternDecoder, FastExecutor> {
+impl CoreInterpreter<InstructionDecoder, FastExecutor> {
     /// Create a new interpreter with default decoder and executor.
+    ///
+    /// Uses InstructionDecoder loaded from llvm-aie at ../llvm-aie.
+    /// Falls back to an empty decoder if llvm-aie is not found.
     pub fn default_new() -> Self {
-        Self::new(PatternDecoder::new(), FastExecutor::new())
+        Self::new(InstructionDecoder::load_default(), FastExecutor::new())
     }
 }
 

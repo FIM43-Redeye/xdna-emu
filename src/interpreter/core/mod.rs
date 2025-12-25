@@ -16,9 +16,9 @@
 //! # Example
 //!
 //! ```ignore
-//! use xdna_emu::interpreter::{CoreInterpreter, PatternDecoder, FastExecutor};
+//! use xdna_emu::interpreter::{CoreInterpreter, InstructionDecoder, FastExecutor};
 //!
-//! let decoder = PatternDecoder::new();
+//! let decoder = InstructionDecoder::load_default();
 //! let executor = FastExecutor::new();
 //! let mut interpreter = CoreInterpreter::new(decoder, executor);
 //!
@@ -34,14 +34,13 @@ pub use interpreter::{CoreInterpreter, CoreStatus, StepResult};
 mod tests {
     use super::*;
     use crate::device::tile::Tile;
-    use crate::interpreter::bundle::{Operation, Operand, SlotIndex, SlotOp};
-    use crate::interpreter::decode::PatternDecoder;
+    use crate::interpreter::decode::InstructionDecoder;
     use crate::interpreter::execute::FastExecutor;
     use crate::interpreter::state::ExecutionContext;
 
     #[test]
     fn test_core_interpreter_basic() {
-        let decoder = PatternDecoder::new();
+        let decoder = InstructionDecoder::load_default();
         let executor = FastExecutor::new();
         let mut interpreter = CoreInterpreter::new(decoder, executor);
 

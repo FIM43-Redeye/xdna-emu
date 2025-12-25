@@ -334,7 +334,7 @@ impl HostMemory {
 
     /// Write a slice of u32 values (convenience method for test data).
     pub fn write_slice<T: Copy>(&mut self, addr: u64, data: &[T]) {
-        let byte_len = data.len() * std::mem::size_of::<T>();
+        let byte_len = std::mem::size_of_val(data);
         let bytes = unsafe {
             std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len)
         };

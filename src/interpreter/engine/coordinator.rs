@@ -8,14 +8,16 @@ use crate::device::host_memory::HostMemory;
 use crate::device::tile::TileType;
 use crate::device::DeviceState;
 use crate::interpreter::core::{CoreInterpreter, CoreStatus, StepResult};
-use crate::interpreter::decode::PatternDecoder;
+use crate::interpreter::decode::InstructionDecoder;
 use crate::interpreter::execute::FastExecutor;
 use crate::interpreter::state::ExecutionContext;
 
 /// Engine execution status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum EngineStatus {
     /// Engine is ready to run.
+    #[default]
     Ready,
     /// Engine is running (at least one core active).
     Running,
@@ -27,11 +29,6 @@ pub enum EngineStatus {
     Error,
 }
 
-impl Default for EngineStatus {
-    fn default() -> Self {
-        EngineStatus::Ready
-    }
-}
 
 /// Per-core state managed by the engine.
 struct CoreState {
@@ -46,7 +43,7 @@ struct CoreState {
 impl CoreState {
     fn new() -> Self {
         Self {
-            interpreter: CoreInterpreter::new(PatternDecoder::new(), FastExecutor::new()),
+            interpreter: CoreInterpreter::new(InstructionDecoder::load_default(), FastExecutor::new()),
             context: ExecutionContext::new(),
             enabled: false,
         }
@@ -74,6 +71,8 @@ pub struct InterpreterEngine {
     status: EngineStatus,
     /// Total cycles executed.
     total_cycles: u64,
+    /// Total instructions executed across all cores.
+    total_instructions: u64,
     /// Auto-run mode.
     auto_run: bool,
 }
@@ -98,6 +97,7 @@ impl InterpreterEngine {
             compute_row_start,
             status: EngineStatus::Ready,
             total_cycles: 0,
+            total_instructions: 0,
             auto_run: false,
         }
     }
@@ -120,6 +120,11 @@ impl InterpreterEngine {
     /// Get total cycles executed.
     pub fn total_cycles(&self) -> u64 {
         self.total_cycles
+    }
+
+    /// Get total instructions executed across all cores.
+    pub fn total_instructions(&self) -> u64 {
+        self.total_instructions
     }
 
     /// Get reference to device state.
@@ -227,6 +232,7 @@ impl InterpreterEngine {
                     match result {
                         StepResult::Continue => {
                             any_running = true;
+                            self.total_instructions += 1;
                         }
                         StepResult::WaitLock { .. } | StepResult::WaitDma { .. } => {
                             // Stalled, but still active
@@ -244,9 +250,11 @@ impl InterpreterEngine {
             }
         }
 
-        // Phase 3: Step all DMA engines
-        let dma_active = self.device.array.step_all_dma(&mut self.host_memory);
-        if dma_active {
+        // Phase 3: Step all DMA engines and stream routing
+        // This includes: DMA transfers, DMA-to-stream routing, and stream propagation
+        let (dma_active, streams_moved, _words_routed) =
+            self.device.array.step_data_movement(&mut self.host_memory);
+        if dma_active || streams_moved {
             any_running = true;
         }
 
@@ -358,6 +366,7 @@ impl InterpreterEngine {
 
         self.status = EngineStatus::Ready;
         self.total_cycles = 0;
+        self.total_instructions = 0;
     }
 
     /// Get the number of enabled cores.

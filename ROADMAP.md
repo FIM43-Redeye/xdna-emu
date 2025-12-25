@@ -31,10 +31,10 @@ The architecture is designed to be generic from day one - device-specific detail
 
 | Phase | Status | Progress |
 |-------|--------|----------|
-| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | 🟢 Mostly Complete | 272 tests, 100% real binary recognition |
+| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | 🟢 Functional | 433 tests, 100% binary recognition, timing pending |
 | [2. Toolchain Integration](docs/roadmap/phase2-toolchain-integration.md) | 🔴 Not started | |
 | [3. Developer Experience](docs/roadmap/phase3-developer-experience.md) | 🟡 GUI exists | Needs debugging features |
-| [4. Validation & Testing](docs/roadmap/phase4-validation-testing.md) | 🟡 277 tests | Real binary test added |
+| [4. Validation & Testing](docs/roadmap/phase4-validation-testing.md) | 🟡 433 tests | TestRunner harness added |
 | [5. Production Readiness](docs/roadmap/phase5-production-readiness.md) | 🔴 Not started | |
 | [6. Community & Ecosystem](docs/roadmap/phase6-community-ecosystem.md) | 🔴 Not started | |
 
@@ -47,17 +47,17 @@ The architecture is designed to be generic from day one - device-specific detail
 Make the emulator faithful to real AIE2 hardware behavior.
 
 **Key achievements:**
-- Full instruction decoder with pattern-based and TableGen-based decoders
+- TableGen-driven instruction decoder with O(1) lookup
 - Scalar unit (32 GPRs, pointer/modifier registers, ALU)
-- Vector unit (32×256-bit registers, 8×512-bit accumulators)
-- Memory system (load/store with post-modify addressing)
-- Synchronization (lock acquire/release)
-- TableGen parser extracting 70/135 instruction encodings from llvm-aie
-- **VLIW slot extraction** for all 16-112 bit bundle formats (100% recognition on test ELF)
-  - 80-bit (21 format variants), 96-bit (20+ variants), 112-bit (8 variants)
-  - Multi-slot extraction (2-4 slots per bundle)
+- Vector unit (24x256-bit W registers, 8x256-bit accumulators)
+- Memory system (load/store with post-modify addressing, bank conflict detection)
+- DMA engine with multi-dimensional addressing (1D-4D patterns)
+- Synchronization (lock acquire/release with timing)
+- Stream switch and router infrastructure
+- TestRunner harness for kernel execution
+- **VLIW slot extraction** for all 16-128 bit bundle formats (100% recognition)
 
-**Next:** Implement 128-bit format extraction (rare), improve operand handling
+**Next:** DMA/stream switch integration for multi-tile data flow
 
 ### Phase 2: Toolchain Integration 🔴
 
@@ -101,4 +101,3 @@ Open source hygiene, community building, packaging.
 | Phase 4 | [phase4-validation-testing.md](docs/roadmap/phase4-validation-testing.md) |
 | Phase 5 | [phase5-production-readiness.md](docs/roadmap/phase5-production-readiness.md) |
 | Phase 6 | [phase6-community-ecosystem.md](docs/roadmap/phase6-community-ecosystem.md) |
-| TableGen Assessment | [tablegen-assessment.md](docs/roadmap/tablegen-assessment.md) |
