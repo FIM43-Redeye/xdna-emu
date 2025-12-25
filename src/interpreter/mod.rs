@@ -48,6 +48,7 @@ pub mod state;
 pub mod execute;
 pub mod core;
 pub mod engine;
+pub mod timing;
 
 // Re-export key types for convenience
 pub use traits::{Decoder, Executor, StateAccess, ExecuteResult, DecodeError};
@@ -62,17 +63,20 @@ pub use bundle::{
 pub use decode::PatternDecoder;
 
 // State types
-pub use state::{ExecutionContext, SpRegister};
+pub use state::{ExecutionContext, SpRegister, TimingContext};
 pub use state::{
     ScalarRegisterFile, VectorRegisterFile, AccumulatorRegisterFile,
     PointerRegisterFile, ModifierRegisterFile,
 };
 
 // Execute types
-pub use execute::{FastExecutor, ScalarAlu, VectorAlu, MemoryUnit, ControlUnit};
+pub use execute::{FastExecutor, CycleAccurateExecutor, CycleAccurateStats, ScalarAlu, VectorAlu, MemoryUnit, ControlUnit};
 
 // Core types
 pub use core::{CoreInterpreter, CoreStatus, StepResult};
 
 // Engine types
 pub use engine::{InterpreterEngine, EngineStatus};
+
+// Timing types
+pub use timing::{LatencyTable, OperationTiming, MemoryModel, HazardDetector};

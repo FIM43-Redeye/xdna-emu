@@ -53,18 +53,45 @@ pub const NUM_DMA_BDS: usize = aie2_spec::NUM_DMA_BUFFER_DESCRIPTORS;
 pub const NUM_DMA_CHANNELS: usize = aie2_spec::COMPUTE_TILE_S2MM_CHANNELS
     + aie2_spec::COMPUTE_TILE_MM2S_CHANNELS;
 
+/// Result of a lock operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockResult {
+    /// Operation succeeded
+    Success,
+    /// Operation failed - would underflow (value would go negative)
+    WouldUnderflow,
+    /// Operation failed - would overflow (value would exceed 63)
+    WouldOverflow,
+}
+
 /// Lock state.
 ///
 /// AIE2 uses semaphore locks with acquire/release semantics.
 /// Lock value is 6-bit unsigned (0-63). See AM020 Ch2:
 /// "The semaphore lock has a larger state and no acquired bit;
 /// each lock state is 6-bit unsigned."
+///
+/// # Semaphore Model (AM025)
+///
+/// Lock operations use a change_value parameter:
+/// - Acquire: Waits until (value + change_value >= 0), then applies change
+/// - Release: Applies change_value, saturating at MAX_VALUE (63)
+///
+/// The Lock_Request register format (AM025):
+/// - Lock_Id [13:10]: Which lock (0-15 for compute, 0-63 for mem tile)
+/// - Acq_Rel [9]: 1 = acquire (blocking), 0 = release (non-blocking)
+/// - Change_Value [8:2]: Signed 7-bit delta (-64 to +63)
+/// - Request_Result [0]: 0 = failed, 1 = succeeded
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
 pub struct Lock {
     /// Current lock value (semaphore count, 0-63)
     /// Stored as u8 for efficiency but only lower 6 bits are valid.
     pub value: u8,
+    /// Overflow flag - set when release would exceed MAX_VALUE
+    pub overflow: bool,
+    /// Underflow flag - set when acquire would go negative
+    pub underflow: bool,
 }
 
 impl Lock {
@@ -76,10 +103,14 @@ impl Lock {
     pub fn new(value: u8) -> Self {
         Self {
             value: value.min(Self::MAX_VALUE),
+            overflow: false,
+            underflow: false,
         }
     }
 
-    /// Acquire the lock (decrement if > 0)
+    /// Acquire the lock (decrement if > 0).
+    ///
+    /// This is the simple form equivalent to `acquire_with_value(1, -1)`.
     #[inline]
     pub fn acquire(&mut self) -> bool {
         if self.value > 0 {
@@ -90,7 +121,9 @@ impl Lock {
         }
     }
 
-    /// Release the lock (increment, saturating at MAX_VALUE)
+    /// Release the lock (increment, saturating at MAX_VALUE).
+    ///
+    /// This is the simple form equivalent to `release_with_value(1)`.
     #[inline]
     pub fn release(&mut self) {
         if self.value < Self::MAX_VALUE {
@@ -98,10 +131,103 @@ impl Lock {
         }
     }
 
+    /// Acquire with value check.
+    ///
+    /// Checks if `value >= expected_value`, and if so, applies `delta` to the
+    /// lock value. Returns `LockResult::Success` if the operation succeeded,
+    /// or the appropriate error if it would underflow.
+    ///
+    /// # Arguments
+    /// * `expected_value` - Minimum value required for acquire to succeed
+    /// * `delta` - Change to apply (typically negative for acquire)
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Wait for lock value >= 1, then decrement by 1
+    /// lock.acquire_with_value(1, -1);
+    ///
+    /// // Wait for lock value >= 2, then decrement by 2
+    /// lock.acquire_with_value(2, -2);
+    /// ```
+    #[inline]
+    pub fn acquire_with_value(&mut self, expected_value: u8, delta: i8) -> LockResult {
+        if self.value < expected_value {
+            // Not enough value - operation would stall
+            return LockResult::WouldUnderflow;
+        }
+
+        // Apply delta (convert to i16 for safe arithmetic)
+        let new_value = (self.value as i16) + (delta as i16);
+
+        if new_value < 0 {
+            self.underflow = true;
+            return LockResult::WouldUnderflow;
+        }
+
+        if new_value > Self::MAX_VALUE as i16 {
+            // This shouldn't happen for acquire (negative delta), but handle it
+            self.overflow = true;
+            self.value = Self::MAX_VALUE;
+            return LockResult::WouldOverflow;
+        }
+
+        self.value = new_value as u8;
+        LockResult::Success
+    }
+
+    /// Release with specific delta.
+    ///
+    /// Adds `delta` to the lock value, saturating at MAX_VALUE.
+    /// Sets overflow flag if saturation occurs.
+    ///
+    /// # Arguments
+    /// * `delta` - Amount to add (typically positive for release)
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Release: increment by 1
+    /// lock.release_with_value(1);
+    ///
+    /// // Release: increment by 2
+    /// lock.release_with_value(2);
+    /// ```
+    #[inline]
+    pub fn release_with_value(&mut self, delta: i8) -> LockResult {
+        let new_value = (self.value as i16) + (delta as i16);
+
+        if new_value < 0 {
+            self.underflow = true;
+            self.value = 0;
+            return LockResult::WouldUnderflow;
+        }
+
+        if new_value > Self::MAX_VALUE as i16 {
+            self.overflow = true;
+            self.value = Self::MAX_VALUE;
+            return LockResult::WouldOverflow;
+        }
+
+        self.value = new_value as u8;
+        LockResult::Success
+    }
+
     /// Set the lock value directly (clamped to 0-63)
     #[inline]
     pub fn set(&mut self, value: u8) {
         self.value = value.min(Self::MAX_VALUE);
+    }
+
+    /// Clear the overflow and underflow flags.
+    #[inline]
+    pub fn clear_flags(&mut self) {
+        self.overflow = false;
+        self.underflow = false;
+    }
+
+    /// Check if the lock has any error flags set.
+    #[inline]
+    pub fn has_error(&self) -> bool {
+        self.overflow || self.underflow
     }
 }
 
@@ -546,7 +672,7 @@ mod tests {
     #[test]
     fn test_struct_sizes() {
         // Ensure structs are reasonably sized
-        assert_eq!(std::mem::size_of::<Lock>(), 1); // u8 now
+        assert_eq!(std::mem::size_of::<Lock>(), 3); // u8 + 2 bools
         assert_eq!(std::mem::size_of::<DmaBufferDescriptor>(), 24);
         assert_eq!(std::mem::size_of::<DmaChannel>(), 12);
         assert_eq!(std::mem::size_of::<CoreState>(), 24);
@@ -563,5 +689,79 @@ mod tests {
         // Verify lock counts per AM020
         assert_eq!(NUM_LOCKS_COMPUTE, 16);
         assert_eq!(NUM_LOCKS_MEM_TILE, 64);
+    }
+
+    #[test]
+    fn test_lock_acquire_with_value() {
+        let mut lock = Lock::new(5);
+
+        // Acquire with value >= 3, decrement by 2
+        assert_eq!(lock.acquire_with_value(3, -2), LockResult::Success);
+        assert_eq!(lock.value, 3);
+
+        // Acquire with value >= 2, decrement by 1
+        assert_eq!(lock.acquire_with_value(2, -1), LockResult::Success);
+        assert_eq!(lock.value, 2);
+
+        // Try to acquire with value >= 5 - should fail (only have 2)
+        assert_eq!(lock.acquire_with_value(5, -3), LockResult::WouldUnderflow);
+        assert_eq!(lock.value, 2); // Value unchanged
+
+        // Acquire all remaining
+        assert_eq!(lock.acquire_with_value(2, -2), LockResult::Success);
+        assert_eq!(lock.value, 0);
+
+        // Can't acquire when value is 0
+        assert_eq!(lock.acquire_with_value(1, -1), LockResult::WouldUnderflow);
+        assert_eq!(lock.value, 0);
+    }
+
+    #[test]
+    fn test_lock_release_with_value() {
+        let mut lock = Lock::new(0);
+
+        // Release by 3
+        assert_eq!(lock.release_with_value(3), LockResult::Success);
+        assert_eq!(lock.value, 3);
+
+        // Release by 10
+        assert_eq!(lock.release_with_value(10), LockResult::Success);
+        assert_eq!(lock.value, 13);
+
+        // Release to max (60 + 13 = 73, saturates to 63)
+        assert_eq!(lock.release_with_value(60), LockResult::WouldOverflow);
+        assert_eq!(lock.value, 63);
+        assert!(lock.overflow);
+    }
+
+    #[test]
+    fn test_lock_release_negative_delta() {
+        // Release with negative delta (unusual but supported)
+        let mut lock = Lock::new(10);
+
+        // "Release" with -3 is like an acquire
+        assert_eq!(lock.release_with_value(-3), LockResult::Success);
+        assert_eq!(lock.value, 7);
+
+        // Try to underflow
+        assert_eq!(lock.release_with_value(-10), LockResult::WouldUnderflow);
+        assert_eq!(lock.value, 0);
+        assert!(lock.underflow);
+    }
+
+    #[test]
+    fn test_lock_flags_clear() {
+        let mut lock = Lock::new(63);
+
+        // Cause overflow
+        lock.release_with_value(10);
+        assert!(lock.overflow);
+        assert!(!lock.underflow);
+        assert!(lock.has_error());
+
+        // Clear flags
+        lock.clear_flags();
+        assert!(!lock.overflow);
+        assert!(!lock.has_error());
     }
 }

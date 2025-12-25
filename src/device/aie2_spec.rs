@@ -66,6 +66,28 @@ pub const LOCK_STATE_BITS: usize = 6;
 pub const LOCK_MAX_VALUE: u8 = (1 << LOCK_STATE_BITS) - 1;
 
 // ============================================================================
+// Lock Timing (AM020 Ch2, AM025 Lock_Request register)
+// ============================================================================
+
+/// Lock acquire latency (uncontested): 1 cycle
+/// The lock module can handle a new request every clock cycle (AM020 Ch2).
+/// Similar to memory bank arbitration which is round-robin.
+pub const LOCK_ACQUIRE_LATENCY: u8 = 1;
+
+/// Lock release latency: 1 cycle
+/// Release operations are non-blocking and complete in 1 cycle.
+pub const LOCK_RELEASE_LATENCY: u8 = 1;
+
+/// Lock contention retry interval: 1 cycle
+/// When a lock acquire fails, the core stalls and retries each cycle.
+/// "Examples include: ... lock modules" in stall sources (AM020 Ch2).
+pub const LOCK_RETRY_INTERVAL: u8 = 1;
+
+/// Lock value change bits in Lock_Request register: 7 bits
+/// "Change_Value [8:2]" (AM025) - allows delta from -64 to +63
+pub const LOCK_CHANGE_VALUE_BITS: usize = 7;
+
+// ============================================================================
 // Register Architecture (AM020 Ch4, Table 8-11)
 // ============================================================================
 
@@ -216,6 +238,35 @@ pub const MEM_TILE_MM2S_CHANNELS: usize = 6;
 pub const DMA_DATA_WIDTH_BITS: usize = 32;
 
 // ============================================================================
+// DMA Timing (AM020 Ch2, derived from architecture)
+// ============================================================================
+
+/// DMA BD setup latency: cycles to parse and configure a buffer descriptor
+/// Estimated based on BD register reads and internal state machine setup
+pub const DMA_BD_SETUP_CYCLES: u8 = 4;
+
+/// DMA channel start latency: cycles from start trigger to first data
+/// Includes arbitration and initial memory request
+pub const DMA_CHANNEL_START_CYCLES: u8 = 2;
+
+/// DMA words per cycle (throughput): 1 word (32-bit) per cycle per channel
+/// At 1 GHz, this gives 4 GB/s per channel
+pub const DMA_WORDS_PER_CYCLE: u8 = 1;
+
+/// DMA memory access latency: uses same as data memory (5 cycles)
+/// "Load and store units manage the 5-cycle latency" (AM020 Ch4)
+pub const DMA_MEMORY_LATENCY_CYCLES: u8 = 5;
+
+/// DMA lock acquire latency: cycles to check and acquire a lock
+pub const DMA_LOCK_ACQUIRE_CYCLES: u8 = 1;
+
+/// DMA lock release latency: cycles to release a lock
+pub const DMA_LOCK_RELEASE_CYCLES: u8 = 1;
+
+/// DMA BD chain latency: cycles between finishing one BD and starting next
+pub const DMA_BD_CHAIN_CYCLES: u8 = 2;
+
+// ============================================================================
 // Stream Switch Configuration (AM020 Ch2)
 // ============================================================================
 
@@ -285,6 +336,35 @@ pub const BF16_MACS_PER_CYCLE: usize = 128;
 /// Int8 multipliers: 256
 /// "The number of int8 multipliers is 256"
 pub const INT8_MULTIPLIERS: usize = 256;
+
+// ============================================================================
+// Memory Access and Alignment (AM020 Ch4)
+// ============================================================================
+
+/// Vector load/store alignment requirement: 32 bytes (256 bits)
+/// "Two 256-bit load and one 256-bit store units with aligned addresses" (AM020 Ch4)
+pub const VECTOR_ALIGNMENT_BYTES: usize = 32;
+
+/// Word alignment: 4 bytes
+pub const WORD_ALIGNMENT_BYTES: usize = 4;
+
+/// Halfword alignment: 2 bytes
+pub const HALFWORD_ALIGNMENT_BYTES: usize = 2;
+
+/// Memory bank conflict penalty: 1 cycle stall
+/// "When there are multiple requests in the same cycle to the same memory bank,
+/// only one request per cycle is allowed...stalled for one cycle" (AM020 Ch2)
+pub const BANK_CONFLICT_PENALTY_CYCLES: u8 = 1;
+
+/// Bank interleaving: physical banks are paired into logical banks
+/// "From a programmer's perspective, every two banks are interleaved to form one bank" (AM020 Ch2)
+pub const BANKS_PER_LOGICAL_BANK: usize = 2;
+
+/// Number of logical banks (programmer's view): 4
+pub const LOGICAL_BANKS: usize = COMPUTE_TILE_MEMORY_BANKS / BANKS_PER_LOGICAL_BANK;
+
+/// Logical bank size: 16 KB
+pub const LOGICAL_BANK_SIZE: usize = COMPUTE_TILE_BANK_SIZE * BANKS_PER_LOGICAL_BANK;
 
 // ============================================================================
 // Address Space (AM020 Ch2, Ch4)

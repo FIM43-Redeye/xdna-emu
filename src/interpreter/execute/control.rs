@@ -7,8 +7,23 @@
 //! - **Lock**: Acquire/release synchronization primitives
 //! - **DMA**: Start/wait for DMA transfers
 //! - **Halt**: Stop core execution
+//!
+//! # Lock Operations (AIE2 Semaphore Model)
+//!
+//! AIE2 uses semaphore locks with 6-bit unsigned values (0-63).
+//! Lock operations can specify expected values and deltas:
+//!
+//! - **Acquire**: Waits until `value >= expected`, then applies delta
+//!   - Operands: lock_id, [expected_value], [delta]
+//!   - Default: expected=1, delta=-1 (simple binary semaphore)
+//!
+//! - **Release**: Applies delta (non-blocking)
+//!   - Operands: lock_id, [delta]
+//!   - Default: delta=+1 (simple binary semaphore)
+//!
+//! See AM020 Ch2 and AM025 Lock_Request register for details.
 
-use crate::device::tile::Tile;
+use crate::device::tile::{Tile, LockResult};
 use crate::interpreter::bundle::{BranchCondition, Operation, Operand, SlotOp};
 use crate::interpreter::state::ExecutionContext;
 use crate::interpreter::traits::{ExecuteResult, Flags};
@@ -48,23 +63,32 @@ impl ControlUnit {
             }
 
             Operation::LockAcquire => {
-                let lock_id = Self::get_lock_id(op);
-                if tile.locks[lock_id as usize].acquire() {
-                    Some(ExecuteResult::Continue)
-                } else {
-                    Some(ExecuteResult::WaitLock { lock_id })
+                let (lock_id, expected, delta) = Self::get_lock_acquire_params(op);
+                let lock = &mut tile.locks[lock_id as usize];
+
+                match lock.acquire_with_value(expected, delta) {
+                    LockResult::Success => Some(ExecuteResult::Continue),
+                    LockResult::WouldUnderflow => Some(ExecuteResult::WaitLock { lock_id }),
+                    LockResult::WouldOverflow => {
+                        // This shouldn't happen for acquire, but handle it
+                        Some(ExecuteResult::Continue)
+                    }
                 }
             }
 
             Operation::LockRelease => {
-                let lock_id = Self::get_lock_id(op);
-                tile.locks[lock_id as usize].release();
+                let (lock_id, delta) = Self::get_lock_release_params(op);
+                let lock = &mut tile.locks[lock_id as usize];
+
+                // Release is non-blocking; overflow just saturates
+                lock.release_with_value(delta);
                 Some(ExecuteResult::Continue)
             }
 
             Operation::DmaStart => {
                 let channel = Self::get_dma_channel(op);
-                Self::start_dma(tile, channel);
+                let bd_index = Self::get_dma_bd(op);
+                Self::start_dma(tile, channel, bd_index);
                 Some(ExecuteResult::Continue)
             }
 
@@ -113,13 +137,52 @@ impl ControlUnit {
         }
     }
 
-    /// Get lock ID from operand.
-    fn get_lock_id(op: &SlotOp) -> u8 {
-        op.sources.first().map_or(0, |src| match src {
+    /// Get lock acquire parameters from operands.
+    ///
+    /// Returns (lock_id, expected_value, delta).
+    /// Default: expected=1, delta=-1 (simple binary semaphore).
+    fn get_lock_acquire_params(op: &SlotOp) -> (u8, u8, i8) {
+        // Lock ID from first operand
+        let lock_id = op.sources.first().map_or(0, |src| match src {
             Operand::Lock(id) => *id,
             Operand::Immediate(v) => *v as u8,
             _ => 0,
-        })
+        });
+
+        // Expected value from second operand (default: 1)
+        let expected = op.sources.get(1).map_or(1, |src| match src {
+            Operand::Immediate(v) => *v as u8,
+            _ => 1,
+        });
+
+        // Delta from third operand (default: -1)
+        let delta = op.sources.get(2).map_or(-1, |src| match src {
+            Operand::Immediate(v) => *v as i8,
+            _ => -1,
+        });
+
+        (lock_id, expected, delta)
+    }
+
+    /// Get lock release parameters from operands.
+    ///
+    /// Returns (lock_id, delta).
+    /// Default: delta=+1 (simple binary semaphore).
+    fn get_lock_release_params(op: &SlotOp) -> (u8, i8) {
+        // Lock ID from first operand
+        let lock_id = op.sources.first().map_or(0, |src| match src {
+            Operand::Lock(id) => *id,
+            Operand::Immediate(v) => *v as u8,
+            _ => 0,
+        });
+
+        // Delta from second operand (default: +1)
+        let delta = op.sources.get(1).map_or(1, |src| match src {
+            Operand::Immediate(v) => *v as i8,
+            _ => 1,
+        });
+
+        (lock_id, delta)
     }
 
     /// Get DMA channel from operand.
@@ -131,16 +194,34 @@ impl ControlUnit {
         })
     }
 
-    /// Start a DMA transfer (simplified - instant completion for now).
-    fn start_dma(tile: &mut Tile, channel: u8) {
+    /// Start a DMA transfer.
+    ///
+    /// This sets up the start request in tile.dma_channels[]. The interpreter
+    /// is responsible for syncing this to the actual DmaEngine and stepping it.
+    ///
+    /// The start_queue field holds the BD index (from immediate operand).
+    /// When the interpreter sees running=true and start_queue is set, it calls
+    /// DmaEngine.start_channel(channel, start_queue).
+    fn start_dma(tile: &mut Tile, channel: u8, bd_index: u8) {
         let ch = &mut tile.dma_channels[channel as usize & 0x03];
         ch.running = true;
-        // In a real implementation, this would schedule the transfer
-        // For now, mark as complete immediately
-        ch.running = false;
+        ch.start_queue = bd_index as u32;
+    }
+
+    /// Get the BD index for a DMA start operation.
+    fn get_dma_bd(op: &SlotOp) -> u8 {
+        // BD index is typically in second operand or immediate
+        op.sources.get(1).map_or(0, |src| match src {
+            Operand::Immediate(v) => *v as u8,
+            _ => 0,
+        })
     }
 
     /// Check if DMA transfer is complete.
+    ///
+    /// Returns true if channel is not marked as running.
+    /// The interpreter is responsible for clearing running=false when
+    /// the DmaEngine reports the channel as complete.
     fn is_dma_complete(tile: &Tile, channel: u8) -> bool {
         !tile.dma_channels[channel as usize & 0x03].running
     }
@@ -286,6 +367,79 @@ mod tests {
     }
 
     #[test]
+    fn test_lock_acquire_with_value() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        // Initialize lock with value 5
+        tile.locks[2].value = 5;
+
+        // Acquire with expected=3, delta=-2 (should succeed)
+        let op = SlotOp::new(SlotIndex::Control, Operation::LockAcquire)
+            .with_source(Operand::Lock(2))
+            .with_source(Operand::Immediate(3)) // expected value
+            .with_source(Operand::Immediate(-2)); // delta
+
+        let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
+        assert!(matches!(result, Some(ExecuteResult::Continue)));
+        assert_eq!(tile.locks[2].value, 3); // 5 - 2 = 3
+    }
+
+    #[test]
+    fn test_lock_acquire_with_value_blocked() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        // Initialize lock with value 2
+        tile.locks[7].value = 2;
+
+        // Acquire with expected=5 (should fail - only have 2)
+        let op = SlotOp::new(SlotIndex::Control, Operation::LockAcquire)
+            .with_source(Operand::Lock(7))
+            .with_source(Operand::Immediate(5)) // expected value
+            .with_source(Operand::Immediate(-3)); // delta
+
+        let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
+        assert!(matches!(result, Some(ExecuteResult::WaitLock { lock_id: 7 })));
+        assert_eq!(tile.locks[7].value, 2); // Unchanged
+    }
+
+    #[test]
+    fn test_lock_release_with_delta() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        tile.locks[4].value = 5;
+
+        // Release with delta=3
+        let op = SlotOp::new(SlotIndex::Control, Operation::LockRelease)
+            .with_source(Operand::Lock(4))
+            .with_source(Operand::Immediate(3)); // delta
+
+        let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
+        assert!(matches!(result, Some(ExecuteResult::Continue)));
+        assert_eq!(tile.locks[4].value, 8); // 5 + 3 = 8
+    }
+
+    #[test]
+    fn test_lock_release_saturates() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        tile.locks[6].value = 60;
+
+        // Release with delta=10 (should saturate at 63)
+        let op = SlotOp::new(SlotIndex::Control, Operation::LockRelease)
+            .with_source(Operand::Lock(6))
+            .with_source(Operand::Immediate(10)); // delta
+
+        let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
+        assert!(matches!(result, Some(ExecuteResult::Continue)));
+        assert_eq!(tile.locks[6].value, 63); // Saturated at MAX
+        assert!(tile.locks[6].overflow); // Overflow flag set
+    }
+
+    #[test]
     fn test_halt() {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
@@ -341,19 +495,51 @@ mod tests {
     }
 
     #[test]
-    fn test_dma_operations() {
+    fn test_dma_start() {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
-        // Start DMA
+        // Start DMA on channel 0 with BD 5
         let op = SlotOp::new(SlotIndex::Control, Operation::DmaStart)
-            .with_source(Operand::DmaChannel(0));
+            .with_source(Operand::DmaChannel(0))
+            .with_source(Operand::Immediate(5)); // BD index
+
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
 
-        // Wait DMA (should complete immediately in current implementation)
+        // Verify channel state was set up for interpreter to sync
+        assert!(tile.dma_channels[0].running);
+        assert_eq!(tile.dma_channels[0].start_queue, 5);
+    }
+
+    #[test]
+    fn test_dma_wait_blocks() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        // Set channel as running (simulates DMA in progress)
+        tile.dma_channels[1].running = true;
+
+        // DmaWait should return WaitDma since channel is busy
         let op = SlotOp::new(SlotIndex::Control, Operation::DmaWait)
-            .with_source(Operand::DmaChannel(0));
+            .with_source(Operand::DmaChannel(1));
+
+        let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
+        assert!(matches!(result, Some(ExecuteResult::WaitDma { channel: 1 })));
+    }
+
+    #[test]
+    fn test_dma_wait_completes() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        // Channel not running (transfer complete)
+        tile.dma_channels[2].running = false;
+
+        // DmaWait should succeed
+        let op = SlotOp::new(SlotIndex::Control, Operation::DmaWait)
+            .with_source(Operand::DmaChannel(2));
+
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
     }

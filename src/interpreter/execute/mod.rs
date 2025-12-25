@@ -31,12 +31,14 @@ mod vector;
 mod memory;
 mod control;
 mod fast_executor;
+mod cycle_accurate;
 
 pub use scalar::ScalarAlu;
 pub use vector::VectorAlu;
 pub use memory::MemoryUnit;
 pub use control::ControlUnit;
 pub use fast_executor::FastExecutor;
+pub use cycle_accurate::{CycleAccurateExecutor, CycleAccurateStats};
 
 #[cfg(test)]
 mod tests {

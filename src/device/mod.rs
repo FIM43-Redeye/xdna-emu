@@ -52,11 +52,22 @@ pub mod registers;
 pub mod tile;
 pub mod array;
 pub mod state;
+pub mod host_memory;
+pub mod dma;
+pub mod stream_switch;
 
 pub use registers::{RegisterInfo, RegisterModule, TileAddress};
-pub use tile::{Tile, TileType, Lock, DmaBufferDescriptor, DmaChannel, CoreState};
+pub use tile::{Tile, TileType, Lock, LockResult, DmaBufferDescriptor, DmaChannel, CoreState};
 pub use array::TileArray;
 pub use state::{DeviceState, CdoStats};
+pub use host_memory::{HostMemory, HostMemoryError, MemoryRegion, DataDirection};
+pub use dma::{
+    DmaEngine, BdConfig, ChannelState, ChannelId, ChannelType,
+    DmaResult, DmaError, AddressGenerator, DimensionConfig,
+    Transfer, TransferState, TransferDirection, TransferEndpoint,
+    DmaTimingConfig, ChannelTimingState, TransferPhase, ChannelArbiter,
+};
+pub use stream_switch::{StreamSwitch, StreamPort, StreamPacket, PortDirection, PortType};
 
 /// AIE architecture variant
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

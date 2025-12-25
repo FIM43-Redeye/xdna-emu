@@ -4,12 +4,94 @@
 //! instructions: registers, program counter, flags, and execution statistics.
 //!
 //! This replaces the placeholder `ExecutionContext` in `traits.rs`.
+//!
+//! # Timing Support
+//!
+//! For cycle-accurate execution, use `TimingContext` which bundles:
+//! - `HazardDetector`: Tracks RAW/WAW/WAR register hazards
+//! - `MemoryModel`: Tracks memory bank conflicts
+//! - `LatencyTable`: Operation latency lookup
+//!
+//! ```ignore
+//! let mut ctx = ExecutionContext::new();
+//! ctx.enable_timing(); // Enable cycle-accurate tracking
+//! ```
 
 use super::registers::{
     AccumulatorRegisterFile, ModifierRegisterFile, PointerRegisterFile, ScalarRegisterFile,
     VectorRegisterFile,
 };
+use crate::interpreter::timing::{HazardDetector, LatencyTable, MemoryModel};
 use crate::interpreter::traits::{Flags, StateAccess};
+
+/// Timing context for cycle-accurate execution.
+///
+/// Bundles all timing-related state into one structure that can be
+/// optionally attached to an `ExecutionContext` for accurate cycle counting.
+#[derive(Clone)]
+pub struct TimingContext {
+    /// Register hazard detector (RAW, WAW, WAR).
+    pub hazards: HazardDetector,
+
+    /// Memory bank conflict detector.
+    pub memory: MemoryModel,
+
+    /// Operation latency lookup table.
+    pub latencies: LatencyTable,
+
+    /// Total hazard stall cycles.
+    pub hazard_stalls: u64,
+
+    /// Total memory conflict stall cycles.
+    pub memory_stalls: u64,
+}
+
+impl TimingContext {
+    /// Create a new timing context with AIE2 defaults.
+    pub fn new() -> Self {
+        Self {
+            hazards: HazardDetector::new(),
+            memory: MemoryModel::new(),
+            latencies: LatencyTable::aie2(),
+            hazard_stalls: 0,
+            memory_stalls: 0,
+        }
+    }
+
+    /// Advance all timing models to the given cycle.
+    pub fn advance_to(&mut self, cycle: u64) {
+        self.hazards.advance_to(cycle);
+        self.memory.advance_to(cycle);
+    }
+
+    /// Reset timing state but keep latency table.
+    pub fn reset(&mut self) {
+        self.hazards.reset();
+        self.memory.reset();
+        self.hazard_stalls = 0;
+        self.memory_stalls = 0;
+    }
+
+    /// Get combined timing statistics.
+    pub fn total_stall_cycles(&self) -> u64 {
+        self.hazard_stalls + self.memory_stalls
+    }
+}
+
+impl Default for TimingContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for TimingContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TimingContext")
+            .field("hazard_stalls", &self.hazard_stalls)
+            .field("memory_stalls", &self.memory_stalls)
+            .finish()
+    }
+}
 
 /// Complete execution context for an AIE2 core.
 ///
@@ -66,6 +148,11 @@ pub struct ExecutionContext {
     /// Link register (alias to a scalar reg).
     /// By convention, often r0 or r14.
     lr_reg: u8,
+
+    // === Timing (optional) ===
+    /// Timing context for cycle-accurate execution.
+    /// When None, uses fast mode (1 cycle per instruction).
+    pub timing: Option<TimingContext>,
 }
 
 /// Which register to use as stack pointer.
@@ -91,6 +178,7 @@ impl Default for ExecutionContext {
 
 impl ExecutionContext {
     /// Create a new execution context with all state zeroed.
+    /// Uses fast mode (no timing) by default.
     pub fn new() -> Self {
         Self {
             pc: 0,
@@ -106,7 +194,15 @@ impl ExecutionContext {
             halted: false,
             sp_reg: SpRegister::default(),
             lr_reg: 0, // r0 as link register
+            timing: None,
         }
+    }
+
+    /// Create a new context with cycle-accurate timing enabled.
+    pub fn new_with_timing() -> Self {
+        let mut ctx = Self::new();
+        ctx.enable_timing();
+        ctx
     }
 
     /// Create a new context with initial stack pointer.
@@ -114,6 +210,37 @@ impl ExecutionContext {
         let mut ctx = Self::new();
         ctx.set_sp(stack_addr);
         ctx
+    }
+
+    /// Enable cycle-accurate timing.
+    /// This adds overhead but provides accurate cycle counts.
+    pub fn enable_timing(&mut self) {
+        if self.timing.is_none() {
+            self.timing = Some(TimingContext::new());
+        }
+    }
+
+    /// Disable cycle-accurate timing (switch to fast mode).
+    pub fn disable_timing(&mut self) {
+        self.timing = None;
+    }
+
+    /// Check if cycle-accurate timing is enabled.
+    #[inline]
+    pub fn has_timing(&self) -> bool {
+        self.timing.is_some()
+    }
+
+    /// Get the timing context if enabled.
+    #[inline]
+    pub fn timing_context(&self) -> Option<&TimingContext> {
+        self.timing.as_ref()
+    }
+
+    /// Get mutable timing context if enabled.
+    #[inline]
+    pub fn timing_context_mut(&mut self) -> Option<&mut TimingContext> {
+        self.timing.as_mut()
     }
 
     /// Get the program counter.
@@ -420,5 +547,50 @@ mod tests {
         assert_eq!(ctx.scalar.read(5), 0);
         assert_eq!(ctx.cycles, 0);
         assert!(!ctx.halted);
+    }
+
+    #[test]
+    fn test_timing_context() {
+        // Default: no timing
+        let ctx = ExecutionContext::new();
+        assert!(!ctx.has_timing());
+        assert!(ctx.timing.is_none());
+
+        // Create with timing
+        let ctx_timed = ExecutionContext::new_with_timing();
+        assert!(ctx_timed.has_timing());
+        assert!(ctx_timed.timing.is_some());
+    }
+
+    #[test]
+    fn test_enable_disable_timing() {
+        let mut ctx = ExecutionContext::new();
+
+        // Enable timing
+        ctx.enable_timing();
+        assert!(ctx.has_timing());
+
+        // Access timing context
+        if let Some(timing) = ctx.timing_context_mut() {
+            timing.hazard_stalls = 5;
+        }
+        assert_eq!(ctx.timing_context().unwrap().hazard_stalls, 5);
+
+        // Disable timing
+        ctx.disable_timing();
+        assert!(!ctx.has_timing());
+        assert!(ctx.timing_context().is_none());
+    }
+
+    #[test]
+    fn test_timing_context_reset() {
+        let mut timing = TimingContext::new();
+        timing.hazard_stalls = 10;
+        timing.memory_stalls = 5;
+
+        timing.reset();
+        assert_eq!(timing.hazard_stalls, 0);
+        assert_eq!(timing.memory_stalls, 0);
+        assert_eq!(timing.total_stall_cycles(), 0);
     }
 }

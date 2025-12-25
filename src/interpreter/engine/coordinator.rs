@@ -1,7 +1,10 @@
 //! Multi-core coordinator implementation.
 //!
 //! The engine manages multiple core interpreters and coordinates their execution.
+//! It also coordinates DMA engines and host memory for data transfers.
 
+use crate::device::dma::ChannelState;
+use crate::device::host_memory::HostMemory;
 use crate::device::tile::TileType;
 use crate::device::DeviceState;
 use crate::interpreter::core::{CoreInterpreter, CoreStatus, StepResult};
@@ -53,9 +56,12 @@ impl CoreState {
 /// Multi-core interpreter engine.
 ///
 /// Coordinates execution across all compute cores in the device.
+/// Also manages DMA engines and host memory for data transfers.
 pub struct InterpreterEngine {
-    /// Device state (tiles, memory, locks).
+    /// Device state (tiles, memory, locks, DMA engines).
     device: DeviceState,
+    /// Host memory for DMA transfers to/from external DDR.
+    host_memory: HostMemory,
     /// Per-core execution state (indexed by column * max_rows + row).
     cores: Vec<CoreState>,
     /// Number of columns.
@@ -85,6 +91,7 @@ impl InterpreterEngine {
 
         Self {
             device,
+            host_memory: HostMemory::new(),
             cores,
             cols,
             rows,
@@ -123,6 +130,16 @@ impl InterpreterEngine {
     /// Get mutable reference to device state.
     pub fn device_mut(&mut self) -> &mut DeviceState {
         &mut self.device
+    }
+
+    /// Get reference to host memory.
+    pub fn host_memory(&self) -> &HostMemory {
+        &self.host_memory
+    }
+
+    /// Get mutable reference to host memory.
+    pub fn host_memory_mut(&mut self) -> &mut HostMemory {
+        &mut self.host_memory
     }
 
     /// Enable a core at (col, row).
@@ -168,7 +185,13 @@ impl InterpreterEngine {
         }
     }
 
-    /// Execute one cycle on all enabled cores.
+    /// Execute one cycle on all enabled cores and DMA engines.
+    ///
+    /// The execution order is:
+    /// 1. Sync DMA start requests from tiles to DMA engines
+    /// 2. Step all compute cores
+    /// 3. Step all DMA engines
+    /// 4. Update tile DMA channel state from engine state
     pub fn step(&mut self) {
         if matches!(self.status, EngineStatus::Halted | EngineStatus::Error) {
             return;
@@ -178,7 +201,10 @@ impl InterpreterEngine {
         let mut any_running = false;
         let mut all_halted = true;
 
-        // Step each enabled core
+        // Phase 1: Sync DMA start requests from tiles to DMA engines
+        self.sync_dma_start_requests();
+
+        // Phase 2: Step each enabled core
         for col in 0..self.cols {
             for row in self.compute_row_start..self.rows {
                 let idx = col * self.rows + row;
@@ -218,10 +244,75 @@ impl InterpreterEngine {
             }
         }
 
+        // Phase 3: Step all DMA engines
+        let dma_active = self.device.array.step_all_dma(&mut self.host_memory);
+        if dma_active {
+            any_running = true;
+        }
+
+        // Phase 4: Update tile DMA channel state from engine state
+        self.sync_dma_completion();
+
         self.total_cycles += 1;
 
-        if all_halted || !any_running {
+        // Engine only halts when BOTH all cores are halted AND no activity (DMA, etc.)
+        if all_halted && !any_running {
             self.status = EngineStatus::Halted;
+        }
+    }
+
+    /// Sync DMA start requests from tile.dma_channels to DmaEngine.
+    ///
+    /// When a core executes DmaStart, it sets tile.dma_channels[ch].running = true
+    /// and tile.dma_channels[ch].start_queue = bd_index. This method reads those
+    /// values and calls DmaEngine.start_channel().
+    fn sync_dma_start_requests(&mut self) {
+        for col in 0..self.cols as u8 {
+            for row in 0..self.rows as u8 {
+                // Get tile and DMA engine together
+                if let Some((tile, engine)) = self.device.array.tile_and_dma(col, row) {
+                    for ch in 0..tile.dma_channels.len() {
+                        let channel = &mut tile.dma_channels[ch];
+
+                        // Check for pending start request:
+                        // - running is true (set by DmaStart instruction)
+                        // - engine channel is not already active
+                        if channel.running && !engine.channel_active(ch as u8) {
+                            let bd_index = channel.start_queue as u8;
+
+                            // Start the channel on the engine
+                            if engine.start_channel(ch as u8, bd_index).is_ok() {
+                                // Clear start_queue to indicate we processed it
+                                channel.start_queue = 0xFF;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sync DMA completion state from DmaEngine to tile.dma_channels.
+    ///
+    /// When DmaEngine reports a channel as complete (not active), we clear
+    /// tile.dma_channels[ch].running so that DmaWait instructions can proceed.
+    fn sync_dma_completion(&mut self) {
+        for col in 0..self.cols as u8 {
+            for row in 0..self.rows as u8 {
+                if let Some((tile, engine)) = self.device.array.tile_and_dma(col, row) {
+                    for ch in 0..tile.dma_channels.len() {
+                        let channel = &mut tile.dma_channels[ch];
+
+                        // If engine reports channel complete, clear running flag
+                        if channel.running {
+                            let state = engine.channel_state(ch as u8);
+                            if matches!(state, ChannelState::Complete | ChannelState::Idle) {
+                                channel.running = false;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -487,5 +578,82 @@ mod tests {
     fn test_status_string() {
         let engine = InterpreterEngine::new_npu1();
         assert_eq!(engine.status_string(), "Ready");
+    }
+
+    #[test]
+    fn test_dma_integration() {
+        use crate::device::dma::BdConfig;
+
+        let mut engine = InterpreterEngine::new_npu1();
+
+        // Configure a BD on tile (1, 2)
+        // Use 64-byte transfer: at 4 bytes/cycle, takes 16 cycles to complete
+        // This ensures the transfer is still in progress after the first step
+        if let Some(dma) = engine.device_mut().array.dma_engine_mut(1, 2) {
+            dma.configure_bd(0, BdConfig::simple_1d(0x100, 64)).unwrap();
+        }
+
+        // Simulate DmaStart by setting tile channel state
+        if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
+            tile.dma_channels[0].running = true;
+            tile.dma_channels[0].start_queue = 0; // BD index 0
+        }
+
+        // Initial state: DMA should not be active on engine yet
+        {
+            let dma = engine.device().array.dma_engine(1, 2).unwrap();
+            assert!(!dma.channel_active(0));
+        }
+
+        // Step once - should sync start request and begin transfer
+        engine.step();
+
+        // DMA engine should now be active (transfer in progress)
+        {
+            let dma = engine.device().array.dma_engine(1, 2).unwrap();
+            assert!(dma.channel_active(0), "DMA should be active after first step");
+        }
+
+        // Step more - 64 bytes at 4 bytes/cycle = 16 cycles
+        // (Currently no setup overhead since timing isn't integrated yet)
+        for i in 0..50 {
+            engine.step();
+
+            let dma = engine.device().array.dma_engine(1, 2).unwrap();
+            let state = dma.channel_state(0);
+
+            // Break when complete
+            if matches!(state, ChannelState::Complete | ChannelState::Idle) {
+                break;
+            }
+
+            // Safety check - shouldn't take more than ~20 cycles
+            if i > 30 {
+                let stats = dma.channel_stats(0).unwrap();
+                panic!(
+                    "DMA taking too long. State: {:?}, bytes transferred: {}, active: {}",
+                    state, stats.bytes_transferred, dma.channel_active(0)
+                );
+            }
+        }
+
+        // Tile channel should show complete
+        {
+            let tile = engine.device().array.tile(1, 2);
+            assert!(!tile.dma_channels[0].running, "Tile channel should show complete");
+        }
+    }
+
+    #[test]
+    fn test_host_memory_access() {
+        let mut engine = InterpreterEngine::new_npu1();
+
+        // Write some data to host memory
+        engine.host_memory_mut().write_bytes(0x1000, &[1, 2, 3, 4]);
+
+        // Read it back
+        let mut buf = [0u8; 4];
+        engine.host_memory().read_bytes(0x1000, &mut buf);
+        assert_eq!(buf, [1, 2, 3, 4]);
     }
 }

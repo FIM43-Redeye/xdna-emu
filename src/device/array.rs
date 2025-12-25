@@ -15,7 +15,15 @@
 //!
 //! Tiles are stored in a flat Vec for cache efficiency. Access is O(1)
 //! via `col * rows + row` indexing.
+//!
+//! # DMA Integration
+//!
+//! Each tile has an associated `DmaEngine` stored in a parallel array.
+//! DMA engines are accessed via `dma_engine(col, row)` and stepped via
+//! `step_dma(col, row, host_memory)`.
 
+use super::dma::{DmaEngine, DmaResult};
+use super::host_memory::HostMemory;
 use super::tile::{Tile, TileType};
 use super::AieArch;
 
@@ -41,6 +49,10 @@ pub struct TileArray {
     /// Tiles stored in flat array: tiles[col * rows + row]
     /// Using Vec because tile count varies by device
     tiles: Vec<Tile>,
+
+    /// DMA engines stored in parallel with tiles.
+    /// Each tile has exactly one DMA engine.
+    dma_engines: Vec<DmaEngine>,
 }
 
 impl TileArray {
@@ -48,10 +60,12 @@ impl TileArray {
     pub fn new(arch: AieArch) -> Self {
         let cols = arch.columns();
         let rows = arch.rows();
+        let capacity = (cols as usize) * (rows as usize);
 
-        let mut tiles = Vec::with_capacity((cols as usize) * (rows as usize));
+        let mut tiles = Vec::with_capacity(capacity);
+        let mut dma_engines = Vec::with_capacity(capacity);
 
-        // Create tiles in column-major order
+        // Create tiles and DMA engines in column-major order
         for col in 0..cols {
             for row in 0..rows {
                 let tile_type = if row == 0 {
@@ -62,10 +76,17 @@ impl TileArray {
                     TileType::Compute
                 };
                 tiles.push(Tile::new(tile_type, col, row));
+
+                // Create appropriate DMA engine for tile type
+                let engine = match tile_type {
+                    TileType::MemTile => DmaEngine::new_mem_tile(col, row),
+                    _ => DmaEngine::new_compute_tile(col, row),
+                };
+                dma_engines.push(engine);
             }
         }
 
-        Self { arch, cols, rows, tiles }
+        Self { arch, cols, rows, tiles, dma_engines }
     }
 
     /// Create an NPU1 (Phoenix/HawkPoint) array.
@@ -176,6 +197,78 @@ impl TileArray {
         self.tiles.iter().filter(|t| t.is_mem_tile())
     }
 
+    // === DMA Engine Access ===
+
+    /// Get the DMA engine for a tile.
+    ///
+    /// Returns None if coordinates are out of bounds.
+    #[inline]
+    pub fn dma_engine(&self, col: u8, row: u8) -> Option<&DmaEngine> {
+        if col < self.cols && row < self.rows {
+            Some(&self.dma_engines[self.tile_index(col, row)])
+        } else {
+            None
+        }
+    }
+
+    /// Get the mutable DMA engine for a tile.
+    ///
+    /// Returns None if coordinates are out of bounds.
+    #[inline]
+    pub fn dma_engine_mut(&mut self, col: u8, row: u8) -> Option<&mut DmaEngine> {
+        if col < self.cols && row < self.rows {
+            let idx = self.tile_index(col, row);
+            Some(&mut self.dma_engines[idx])
+        } else {
+            None
+        }
+    }
+
+    /// Get tile and DMA engine together (for operations that need both).
+    ///
+    /// Returns separate references to allow independent mutation.
+    pub fn tile_and_dma(&mut self, col: u8, row: u8) -> Option<(&mut Tile, &mut DmaEngine)> {
+        if col < self.cols && row < self.rows {
+            let idx = self.tile_index(col, row);
+            // Safety: We're returning references to different arrays
+            Some((&mut self.tiles[idx], &mut self.dma_engines[idx]))
+        } else {
+            None
+        }
+    }
+
+    /// Step the DMA engine for a specific tile.
+    ///
+    /// This advances the DMA transfer state by one cycle.
+    pub fn step_dma(&mut self, col: u8, row: u8, host_memory: &mut HostMemory) -> Option<DmaResult> {
+        if col < self.cols && row < self.rows {
+            let idx = self.tile_index(col, row);
+            let (tile, engine) = (&mut self.tiles[idx], &mut self.dma_engines[idx]);
+            Some(engine.step(tile, host_memory))
+        } else {
+            None
+        }
+    }
+
+    /// Step all DMA engines.
+    ///
+    /// Returns true if any DMA engine is still active.
+    pub fn step_all_dma(&mut self, host_memory: &mut HostMemory) -> bool {
+        let mut any_active = false;
+        for i in 0..self.tiles.len() {
+            let result = self.dma_engines[i].step(&mut self.tiles[i], host_memory);
+            if matches!(result, DmaResult::InProgress | DmaResult::WaitingForLock(_)) {
+                any_active = true;
+            }
+        }
+        any_active
+    }
+
+    /// Check if any DMA engine has active transfers.
+    pub fn any_dma_active(&self) -> bool {
+        self.dma_engines.iter().any(|e| e.any_channel_active())
+    }
+
     /// Count tiles by type.
     pub fn count_by_type(&self) -> (usize, usize, usize) {
         let mut shim = 0;
@@ -207,6 +300,11 @@ impl TileArray {
             tile.stream_switch = Default::default();
             // Note: We don't zero memory here for performance
             // Call zero_memory() explicitly if needed
+        }
+
+        // Reset all DMA engines
+        for engine in &mut self.dma_engines {
+            engine.reset();
         }
     }
 
@@ -320,5 +418,69 @@ mod tests {
         // Verify reset
         assert_eq!(array.tile(1, 2).core.pc, 0);
         assert_eq!(array.tile(1, 2).locks[0].value, 0);
+    }
+
+    // === DMA Engine Integration Tests ===
+
+    #[test]
+    fn test_dma_engine_creation() {
+        let array = TileArray::npu1();
+
+        // Each tile should have a DMA engine
+        assert_eq!(array.dma_engines.len(), 30);
+
+        // Compute tile (row 2+) should have 4 channels
+        let engine = array.dma_engine(1, 2).unwrap();
+        assert_eq!(engine.num_channels(), 4);
+
+        // Memory tile (row 1) should have 12 channels
+        let engine = array.dma_engine(1, 1).unwrap();
+        assert_eq!(engine.num_channels(), 12);
+    }
+
+    #[test]
+    fn test_dma_engine_access() {
+        let mut array = TileArray::npu1();
+
+        // Get mutable engine and configure it
+        let engine = array.dma_engine_mut(2, 3).unwrap();
+        assert_eq!(engine.col, 2);
+        assert_eq!(engine.row, 3);
+    }
+
+    #[test]
+    fn test_tile_and_dma() {
+        let mut array = TileArray::npu1();
+
+        // Get both tile and DMA engine
+        let (tile, engine) = array.tile_and_dma(3, 4).unwrap();
+        assert_eq!(tile.col, 3);
+        assert_eq!(tile.row, 4);
+        assert_eq!(engine.col, 3);
+        assert_eq!(engine.row, 4);
+    }
+
+    #[test]
+    fn test_no_active_dma_initially() {
+        let array = TileArray::npu1();
+        assert!(!array.any_dma_active());
+    }
+
+    #[test]
+    fn test_dma_reset() {
+        use crate::device::dma::BdConfig;
+
+        let mut array = TileArray::npu1();
+
+        // Configure and start a DMA transfer
+        let engine = array.dma_engine_mut(1, 2).unwrap();
+        engine.configure_bd(0, BdConfig::simple_1d(0x100, 32)).unwrap();
+        engine.start_channel(0, 0).unwrap();
+        assert!(engine.channel_active(0));
+
+        // Reset should clear it
+        array.reset();
+        let engine = array.dma_engine(1, 2).unwrap();
+        assert!(!engine.any_channel_active());
     }
 }

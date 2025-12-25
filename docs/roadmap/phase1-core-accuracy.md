@@ -2,7 +2,141 @@
 
 **Goal**: Make the emulator cycle-accurate to real AIE2 hardware behavior, including as many edge cases as possible.
 
-**Status**: 🟢 Functional Emulation Complete | 🟡 Timing TODO
+**Status**: 🟢 Functional Emulation Complete | 🟡 Timing Infrastructure Done, Integration Pending
+
+---
+
+## Execution Path to Binary Compatibility
+
+This section is the single reference for what needs to be done and in what order.
+
+### Current State: ~35-40% Binary Compatible
+
+```
+Component Completion:
+├── Binary Loading (XCLBIN/ELF/CDO)     ████████░░  80%
+├── Instruction Decoding                 ██████░░░░  60%  (formats done, ISA partial)
+├── Instruction Execution                ████░░░░░░  40%  (basic ops, missing specialized)
+├── Memory System                        ███████░░░  75%  (single-tile complete)
+├── DMA Engine                           ███████░░░  70%  (complete, needs integration)
+├── Synchronization                      ████████░░  80%  (locks done, barriers TODO)
+├── Stream Switch                        ███░░░░░░░  30%  (structure exists, no routing)
+├── Pipeline/Timing                      █████░░░░░  50%  (infrastructure done)
+└── Multi-Core Coordination              ████░░░░░░  40%  (counters done, no data flow)
+```
+
+### Milestone 1: Single-Tile Execution (Target: 50%)
+
+**Goal**: Run a simple kernel on ONE tile, producing correct results.
+
+| Task | Priority | Effort | Status |
+|------|----------|--------|--------|
+| Wire DmaStart/DmaWait to DmaEngine | P0 | Medium | 🔲 |
+| Connect HostMemory to shim DMA | P0 | Medium | 🔲 |
+| Test harness: load ELF, set inputs, run, check outputs | P0 | Medium | 🔲 |
+| Expand scalar instruction execution | P1 | Low | 🔲 |
+| Basic vector ops (add/sub/mul on all types) | P1 | Medium | 🔲 |
+
+**Validation**: Run `add_one` kernel, verify output = input + 1.
+
+### Milestone 2: Multi-Tile Data Flow (Target: 65%)
+
+**Goal**: Data flows correctly between tiles via DMA and stream switch.
+
+| Task | Priority | Effort | Status |
+|------|----------|--------|--------|
+| Stream switch circuit routing (tile-to-tile) | P0 | High | 🔲 |
+| DmaEngine ↔ TileArray integration | P0 | High | 🔲 |
+| Cross-tile memory access (neighbor tiles) | P1 | Medium | 🔲 |
+| Packet-switched routing (headers, arbitration) | P2 | High | 🔲 |
+| Stream switch timing (hop latency) | P2 | Medium | 🔲 |
+
+**Validation**: Run 2-tile pipeline (tile A produces, tile B consumes).
+
+### Milestone 3: Timing Accuracy (Target: 80%)
+
+**Goal**: Cycle counts match hardware within ~10%.
+
+| Task | Priority | Effort | Status |
+|------|----------|--------|--------|
+| Full pipeline model (fetch/decode/execute/writeback) | P0 | High | 🔲 |
+| Integrate hazard stalls into execution | P0 | Medium | 🟡 |
+| Branch penalty modeling | P1 | Medium | 🔲 |
+| VLIW slot parallelism (concurrent execution) | P1 | High | 🔲 |
+| Memory bank conflict stalls | P1 | Low | ✅ |
+| Lock contention timing integration | P2 | Low | ✅ |
+
+**Validation**: Compare cycle counts against aiesimulator for reference kernels.
+
+### Milestone 4: Full ISA Coverage (Target: 90%)
+
+**Goal**: Execute any mlir-aie compiled binary correctly.
+
+| Task | Priority | Effort | Status |
+|------|----------|--------|--------|
+| Matrix multiply instructions (MAC variants) | P0 | High | 🔲 |
+| Convolution operations | P0 | High | 🔲 |
+| SIMD shuffle/permute variants | P1 | Medium | 🔲 |
+| Accumulator operations (full precision) | P1 | Medium | 🟡 |
+| All addressing modes | P2 | Medium | 🟡 |
+| Remaining TableGen instructions (65 more) | P2 | High | 🔲 |
+
+**Validation**: Run mlir-aie test suite, all kernels produce correct results.
+
+### Milestone 5: Production Ready (Target: 95%+)
+
+**Goal**: Drop-in replacement for aiesimulator.
+
+| Task | Priority | Effort | Status |
+|------|----------|--------|--------|
+| Edge cases and corner cases | P1 | Ongoing | 🔲 |
+| Performance optimization | P2 | Medium | 🔲 |
+| Error messages matching hardware | P2 | Low | 🔲 |
+| Comprehensive test coverage | P1 | Ongoing | 🟡 |
+
+---
+
+### Quick Reference: What Blocks What
+
+```
+Single-tile works
+       │
+       ▼
+┌──────────────────┐
+│ DMA ↔ Interpreter│ ◄── Must wire DmaStart/DmaWait to engine
+│   Integration    │
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│  Stream Switch   │ ◄── Data must actually flow between tiles
+│    Routing       │
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│   Multi-Tile     │ ◄── Real programs use tile-to-tile pipelines
+│   Execution      │
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│  Full ISA +      │ ◄── Matrix ops, convolutions, specialized SIMD
+│  Timing Model    │
+└──────────────────┘
+```
+
+### Effort Estimates
+
+| Milestone | Est. Work | Cumulative |
+|-----------|-----------|------------|
+| M1: Single-tile | 2-3 sessions | 2-3 sessions |
+| M2: Multi-tile data flow | 3-5 sessions | 5-8 sessions |
+| M3: Timing accuracy | 3-4 sessions | 8-12 sessions |
+| M4: Full ISA | 5-10 sessions | 13-22 sessions |
+| M5: Production | Ongoing | Ongoing |
+
+*Session = one evening of focused work (~2-4 hours)*
 
 ---
 
@@ -114,10 +248,10 @@ Based on AMD AM020 and [llvm-aie](https://github.com/Xilinx/llvm-aie) TableGen f
 | Load/store operations | ✅ Done | `MemoryUnit` in `execute/memory.rs` |
 | Memory width variants | ✅ Done | Byte/HalfWord/Word/DoubleWord/QuadWord/Vector256 |
 | Post-modify addressing | ✅ Done | None/Immediate/Register |
-| Bank conflict detection | 🔲 TODO | 8 banks × 8KB = 64KB |
-| Access latency model | 🔲 TODO | 5 cycles (AM020 Ch4) |
-| Alignment penalty | 🔲 TODO | Unaligned access may stall |
-| Memory bank mapping | 🔲 TODO | Address bits → bank selection |
+| Bank conflict detection | ✅ Done | `MemoryModel` in `timing/memory.rs` |
+| Access latency model | ✅ Done | 5 cycles base (AM020 Ch4), +1 on conflict |
+| Alignment penalty | ✅ Done | `AlignmentError`, `check_alignment()` |
+| Memory bank mapping | ✅ Done | bits[6:4] = physical bank, documented in `timing/memory.rs` |
 
 **AM020 Memory Architecture**:
 - Program memory: 16 KB (1024 × 128-bit instructions)
@@ -131,15 +265,36 @@ Based on AMD AM020 and [llvm-aie](https://github.com/Xilinx/llvm-aie) TableGen f
 
 | Task | Status | Notes |
 |------|--------|-------|
-| DMA start/wait operations | 🟡 Partial | Decoded, instant completion |
-| Multi-dimensional addressing | 🔲 TODO | 2D/3D/4D stride patterns |
-| BD chaining | 🔲 TODO | Linked buffer descriptors |
-| Transfer simulation | 🔲 TODO | Currently instant |
-| Transfer latency model | 🔲 TODO | setup + (size / bandwidth) |
-| BD processing overhead | 🔲 TODO | Cycles to parse each BD |
-| Channel arbitration | 🔲 TODO | Multiple DMAs compete for bus |
-| Stall-on-wait timing | 🔲 TODO | Core stalls until DMA complete |
-| S2MM/MM2S timing | 🔲 TODO | Stream-to-memory vs memory-to-stream |
+| DMA start/wait operations | ✅ Done | `DmaEngine` in `device/dma/engine.rs` |
+| Multi-dimensional addressing | ✅ Done | `AddressGenerator` supports 1D-4D patterns |
+| BD chaining | ✅ Done | `next_bd` field with automatic chaining |
+| Transfer simulation | ✅ Done | Per-cycle data movement (32-bit chunks) |
+| Host memory interface | ✅ Done | `HostMemory` in `device/host_memory.rs` |
+| Transfer state machine | ✅ Done | `Transfer` with lock acquire/release |
+| Channel management | ✅ Done | Start/stop/pause/resume channels |
+| Transfer latency model | ✅ Done | `DmaTimingConfig` with per-phase timing |
+| BD processing overhead | ✅ Done | `DMA_BD_SETUP_CYCLES` (4 cycles) |
+| Channel arbitration | ✅ Done | `ChannelArbiter` with round-robin |
+| Stream switch integration | ✅ Done | `StreamSwitch` stub with ports/FIFOs |
+
+**DMA Implementation** (in `src/device/dma/`):
+- `mod.rs` - `BdConfig`, `ChannelType`, `DmaResult`, `DmaError`
+- `addressing.rs` - `AddressGenerator` for multi-dimensional addressing
+- `transfer.rs` - `Transfer` state machine with lock synchronization
+- `engine.rs` - `DmaEngine` per-tile DMA controller
+- `timing.rs` - `DmaTimingConfig`, `ChannelTimingState`, `ChannelArbiter`
+
+**Host Memory** (in `src/device/host_memory.rs`):
+- `HostMemory` - Sparse 64-bit address space simulation
+- `MemoryRegion` - Named regions for debugging (input/output buffers)
+- Page-based allocation (4KB pages on demand)
+- Statistics tracking (bytes read/written, DMA ops)
+
+**Stream Switch** (in `src/device/stream_switch.rs`):
+- `StreamSwitch` - Per-tile stream switch with ports and FIFOs
+- `StreamPort` - Master/slave ports with backpressure
+- `StreamPacket` - Data packet for network routing
+- Support for compute tiles, memory tiles, and shim tiles
 
 ### 1.6 Synchronization
 
@@ -147,9 +302,12 @@ Based on AMD AM020 and [llvm-aie](https://github.com/Xilinx/llvm-aie) TableGen f
 |------|--------|-------|
 | Lock acquire/release | ✅ Done | `ControlUnit` in `execute/control.rs` |
 | Lock value clamping | ✅ Done | 6-bit (0-63) per AM020 |
-| Lock contention tracking | 🔲 TODO | Stall cycles when lock busy |
-| Lock acquire latency | 🔲 TODO | Cycles to acquire uncontested lock |
-| Deadlock detection | 🔲 TODO | Circular wait detection |
+| Semaphore lock model | ✅ Done | `acquire_with_value()`, `release_with_value()` |
+| Lock overflow/underflow flags | ✅ Done | Per-lock error tracking |
+| Lock timing constants | ✅ Done | `LOCK_ACQUIRE_LATENCY` etc in `aie2_spec.rs` |
+| Lock contention tracking | ✅ Done | `LockTimingState` in `timing/sync.rs` |
+| Lock acquire latency | ✅ Done | 1 cycle uncontested (AM020 Ch2) |
+| Deadlock detection | ✅ Done | `DeadlockDetector` in `timing/deadlock.rs` |
 | Barrier synchronization | 🔲 TODO | Multi-core barrier timing |
 
 **AM020 Lock Architecture**:
@@ -157,28 +315,60 @@ Based on AMD AM020 and [llvm-aie](https://github.com/Xilinx/llvm-aie) TableGen f
 - Memory tiles: 64 semaphore locks
 - Lock state: 6-bit unsigned (0-63)
 - No acquired bit (unlike AIE1)
+- Lock_Request register (AM025): Lock_Id [13:10], Acq_Rel [9], Change_Value [8:2]
+
+**Lock Timing** (from `aie2_spec.rs`):
+- Acquire latency: 1 cycle (uncontested)
+- Release latency: 1 cycle
+- Retry interval: 1 cycle (when contended)
+
+**Lock Contention Tracking** (in `timing/sync.rs`):
+- `LockTimingState` - Per-tile lock timing with statistics
+- `LockStats` - Per-lock acquire/release counts, contention cycles
+- `SyncTimingConfig` - Timing configuration (cycle-accurate or instant)
+- `AggregateStats` - Aggregate contention metrics across all locks
+
+**Deadlock Detection** (in `timing/deadlock.rs`):
+- `DeadlockDetector` - Wait-for graph cycle detection
+- `TileId`, `LockId` - Tile and lock identifiers
+- `DeadlockCycle` - Represents detected circular wait
+- DFS-based cycle detection for multi-tile deadlocks
+- Configurable detection (can disable for fast simulation)
 
 ### 1.7 Stream Switch
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Circuit-switched routing | 🔲 TODO | Direct tile-to-tile paths |
+| Stream switch stub | ✅ Done | `StreamSwitch` in `device/stream_switch.rs` |
+| Master/slave ports | ✅ Done | `StreamPort` with direction and type |
+| Port FIFOs | ✅ Done | Per-port FIFO buffering |
+| Backpressure (FIFO full) | ✅ Done | `is_full()`, `can_accept()` checks |
+| Route configuration API | ✅ Done | `set_route()`, `clear_route()` |
+| DMA port mapping | ✅ Done | Compute (4), MemTile (12), Shim (4) |
+| Circuit-switched routing | 🔲 TODO | Actual tile-to-tile data movement |
 | Packet-switched routing | 🔲 TODO | Header-based routing |
 | Packet header overhead | 🔲 TODO | Cycles per packet header |
-| Backpressure propagation | 🔲 TODO | Stalls when destination full |
-| Route configuration | 🔲 TODO | CDO-based switch setup |
 | Routing latency | 🔲 TODO | Hops between tiles |
+
+**Stream Switch Implementation** (in `src/device/stream_switch.rs`):
+- `StreamSwitch` - Per-tile switch with configurable ports
+- `StreamPort` - Master/slave with FIFO buffering (6-8 deep)
+- `StreamPacket` - Data packet with source/dest routing info
+- Tile-type-specific port configurations:
+  - Compute: 2 S2MM + 2 MM2S + 4 directional + core
+  - MemTile: 6 S2MM + 6 MM2S + north/south
+  - Shim: 2 S2MM + 2 MM2S + north
 
 ### 1.8 Pipeline Model
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Instruction latencies | 🔲 TODO | Per-operation cycle counts |
+| Instruction latencies | ✅ Done | `LatencyTable` in `timing/latency.rs` |
 | Pipeline stages | 🔲 TODO | Fetch/decode/execute/writeback |
-| RAW hazard detection | 🔲 TODO | Read-after-write stalls |
-| WAW hazard detection | 🔲 TODO | Write-after-write ordering |
-| WAR hazard detection | 🔲 TODO | Write-after-read ordering |
-| Stall cycle modeling | 🔲 TODO | When pipeline must wait |
+| RAW hazard detection | ✅ Done | `HazardDetector` in `timing/hazards.rs` |
+| WAW hazard detection | ✅ Done | `HazardDetector` in `timing/hazards.rs` |
+| WAR hazard detection | ✅ Done | `HazardDetector` in `timing/hazards.rs` |
+| Stall cycle modeling | 🟡 Partial | Infrastructure in place, integration pending |
 | VLIW slot parallelism | 🔲 TODO | Concurrent slot execution |
 | Branch penalty | 🔲 TODO | Cycles lost on taken branch |
 
@@ -200,12 +390,12 @@ Based on AMD AM020 and [llvm-aie](https://github.com/Xilinx/llvm-aie) TableGen f
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Per-tile clock model | 🔲 TODO | All tiles same clock or async? |
+| Per-tile clock model | ✅ Done | Single clock domain (AM020 Ch2), CDC at NoC/PL |
 | Inter-tile communication latency | 🔲 TODO | Cycles for tile-to-tile data |
 | Shared resource arbitration | 🔲 TODO | Mem tiles, shim tiles |
-| Global cycle counter | 🔲 TODO | Synchronized across tiles |
+| Global cycle counter | ✅ Done | `TimingContext` in `state/context.rs` |
 | Event timestamps | 🔲 TODO | For profiling/tracing |
-| Stall cycle accounting | 🔲 TODO | Track why core stalled |
+| Stall cycle accounting | 🟡 Partial | `StallReason` enum in hazards, integration pending |
 
 ### 1.10 TableGen Parser
 
@@ -272,6 +462,115 @@ Recognition rate: 100% (20/20 instructions)
 1. Improve operand extraction for specific instruction variants
 2. Vector/DMA instruction semantics
 
+### 1.11 External Interfaces & Host Memory
+
+This section covers the critical path for **testing real programs**: getting data into
+the NPU, moving it between tiles, and reading results back.
+
+#### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Host System                             │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │              DDR Memory (via NoC)                    │    │
+│  │   - Input buffers (test data)                        │    │
+│  │   - Output buffers (results)                         │    │
+│  │   - Intermediate buffers (ping-pong)                 │    │
+│  └─────────────────────────────────────────────────────┘    │
+└─────────────────────────┬───────────────────────────────────┘
+                          │ PCIe/NoC (async, CDC boundary)
+                          ▼
+┌─────────┬─────────┬─────────┬─────────┬─────────┐
+│ Shim(0) │ Shim(1) │ Shim(2) │ Shim(3) │ Shim(4) │  Row 0: DDR interface
+│  DMA    │  DMA    │  DMA    │  DMA    │  DMA    │  - S2MM: DDR → tile
+│         │         │         │         │         │  - MM2S: tile → DDR
+├─────────┼─────────┼─────────┼─────────┼─────────┤
+│MemTile  │MemTile  │MemTile  │MemTile  │MemTile  │  Row 1: 512KB each
+│ 512KB   │ 512KB   │ 512KB   │ 512KB   │ 512KB   │  Shared between columns
+├─────────┼─────────┼─────────┼─────────┼─────────┤
+│Compute  │Compute  │Compute  │Compute  │Compute  │  Rows 2-5: 64KB + core
+│  64KB   │  64KB   │  64KB   │  64KB   │  64KB   │  Local data memory
+└─────────┴─────────┴─────────┴─────────┴─────────┘
+```
+
+#### Data Flow for a Typical Kernel
+
+1. **Host → Shim**: XRT writes input data to DDR, triggers shim DMA
+2. **Shim → MemTile/Compute**: Shim DMA (S2MM) transfers to tile memory
+3. **Compute processing**: Core reads input, computes, writes output
+4. **Tile → Shim**: Tile DMA (MM2S) transfers to shim
+5. **Shim → Host**: Shim DMA writes to DDR, XRT reads results
+
+#### Implementation Status
+
+| Task | Status | Notes |
+|------|--------|-------|
+| **Host Memory Model** | | |
+| `HostMemory` struct | ✅ Done | `device/host_memory.rs` - sparse 64-bit address space |
+| Address mapping | ✅ Done | 4KB page-based allocation on demand |
+| Memory regions | ✅ Done | `MemoryRegion` for named input/output buffers |
+| **Shim Tile Interface** | | |
+| Shim DMA channels | 🟡 Partial | Channels exist, need stream switch integration |
+| S2MM (stream-to-memory) | ✅ Done | `DmaEngine` supports S2MM transfers |
+| MM2S (memory-to-stream) | ✅ Done | `DmaEngine` supports MM2S transfers |
+| Shim BD execution | ✅ Done | `BdConfig` with full BD field support |
+| **DMA Execution** | | |
+| BD interpretation | ✅ Done | `BdConfig` struct with all BD fields |
+| 1D transfers | ✅ Done | `AddressGenerator::new_1d()` |
+| 2D transfers | ✅ Done | `AddressGenerator::new_2d()` |
+| 3D/4D transfers | ✅ Done | `AddressGenerator::new_3d()` + 4D support |
+| BD chaining | ✅ Done | `next_bd` field with automatic continuation |
+| Tile-to-tile DMA | 🟡 Partial | Needs TileArray integration |
+| **Test Harness API** | | |
+| `write_slice(addr, data)` | ✅ Done | `HostMemory::write_slice()` |
+| `read_slice(addr, len)` | ✅ Done | `HostMemory::read_slice()` |
+| `execute_1d_transfer()` | ✅ Done | `DmaEngine::execute_1d_transfer()` |
+| `run_to_completion()` | 🔲 TODO | Needs interpreter integration |
+| `compare_results()` | 🔲 TODO | Golden comparison helper |
+
+#### Key Data Structures (Implemented)
+
+See `src/device/host_memory.rs` and `src/device/dma/`:
+
+```rust
+// Host memory with sparse 4KB page allocation
+let mut host_mem = HostMemory::new();
+host_mem.allocate_region("input", 0x1000_0000, 4096)?;
+host_mem.write_slice(0x1000_0000, &[1u32, 2, 3, 4]);
+
+// DMA engine per tile
+let mut dma = DmaEngine::new_compute_tile(1, 2);
+dma.configure_bd(0, BdConfig::simple_1d(0x100, 256))?;
+dma.start_channel(0, 0)?;
+
+// Step until complete
+while dma.any_channel_active() {
+    dma.step(&mut tile, &mut host_mem);
+}
+
+// Multi-dimensional addressing
+let gen = AddressGenerator::new_2d(0x1000, 64, 4, 8, 256);
+for addr in gen.iter() {
+    // Process each address
+}
+```
+
+#### AM020 References
+
+- **Ch2 (DMA)**: Buffer descriptor format, channel operation
+- **Ch2 (Shim)**: "The interface tile... includes DMA engines for data movement"
+- **Ch5 (MemTile)**: "Each memory tile has six DMA channels"
+- **Shim DMA**: 2 S2MM + 2 MM2S channels per shim tile
+
+#### Remaining Work
+
+1. ~~**Stream switch stub**~~ - ✅ `StreamSwitch` with ports and FIFOs
+2. ~~**DMA timing model**~~ - ✅ `DmaTimingConfig` with per-phase latency
+3. **TileArray integration** - Enable tile-to-tile transfers
+4. **Interpreter integration** - Connect DmaStart/DmaWait to engine
+5. **Full stream routing** - Actual data movement between tiles
+
 ---
 
 ## Module Structure
@@ -299,7 +598,15 @@ src/interpreter/
 │   ├── vector.rs       # VectorAlu
 │   ├── memory.rs       # MemoryUnit
 │   ├── control.rs      # ControlUnit (branch, lock, DMA)
-│   └── fast_executor.rs # FastExecutor
+│   ├── fast_executor.rs # FastExecutor
+│   └── cycle_accurate.rs # CycleAccurateExecutor
+├── timing/             # ✅ DONE
+│   ├── mod.rs          # Module exports
+│   ├── latency.rs      # LatencyTable, per-operation cycle counts
+│   ├── memory.rs       # MemoryModel, bank conflicts, alignment
+│   ├── hazards.rs      # HazardDetector (RAW/WAW/WAR)
+│   ├── sync.rs         # LockTimingState, lock contention tracking
+│   └── deadlock.rs     # DeadlockDetector, cycle detection
 ├── core/               # ✅ DONE
 │   ├── mod.rs          # Module exports
 │   └── interpreter.rs  # CoreInterpreter
@@ -312,13 +619,34 @@ src/tablegen/           # ✅ DONE
 ├── types.rs            # Data structures
 ├── parser.rs           # Regex-based parsing
 └── resolver.rs         # Encoding resolution
+
+src/device/             # ✅ DONE
+├── mod.rs              # ✅ Device models
+├── aie2_spec.rs        # ✅ Architecture constants (AM020)
+├── tile.rs             # ✅ Tile state (memory, locks, DMA BDs)
+├── array.rs            # ✅ TileArray
+├── state.rs            # ✅ CDO application
+├── registers.rs        # ✅ Address decoding
+├── host_memory.rs      # ✅ Simulated DDR (sparse 64-bit address space)
+├── stream_switch.rs    # ✅ Stream switch stub (ports, FIFOs, routing)
+└── dma/                # ✅ DMA execution engine
+    ├── mod.rs          # BdConfig, ChannelType, DmaResult, DmaError
+    ├── engine.rs       # DmaEngine (per-tile DMA controller)
+    ├── transfer.rs     # Transfer state machine with locks
+    ├── addressing.rs   # AddressGenerator (1D-4D patterns)
+    └── timing.rs       # DmaTimingConfig, ChannelArbiter
+
+src/emulator/           # 🔲 TODO: High-level test harness
+├── mod.rs              # Emulator facade
+├── harness.rs          # Test harness API
+└── runner.rs           # Run-to-completion logic
 ```
 
 ---
 
 ## Test Coverage
 
-**Total: 296 tests passing** (291 unit + 5 doc tests)
+**Total: 431 tests passing** (425 unit + 6 doc tests)
 
 | Module | Tests | Notes |
 |--------|-------|-------|
@@ -334,24 +662,38 @@ src/tablegen/           # ✅ DONE
 | execute/scalar.rs | 10 | Scalar ALU operations |
 | execute/vector.rs | 10 | Vector ALU operations |
 | execute/memory.rs | 7 | Load/store operations |
-| execute/control.rs | 10 | Branch, lock, DMA |
+| execute/control.rs | 17 | Branch, lock (with value), DMA |
 | execute/fast_executor.rs | 9 | Executor integration |
+| timing/latency.rs | 7 | Latency table, operation timing |
+| timing/memory.rs | 11 | Bank conflicts, alignment, bank mapping |
+| timing/hazards.rs | 7 | RAW/WAW/WAR hazard detection |
+| timing/sync.rs | 7 | Lock contention tracking, timing |
+| timing/deadlock.rs | 11 | DeadlockDetector, cycle detection |
 | core/interpreter.rs | 9 | CoreInterpreter |
 | engine/coordinator.rs | 11 | InterpreterEngine |
 | tablegen/types.rs | 6 | Data structures |
 | tablegen/parser.rs | 11 | Parsing tests |
 | tablegen/resolver.rs | 8 | Encoding resolution |
 | tablegen/mod.rs | 5 | Integration tests |
-| **Interpreter subtotal** | **~140** | |
+| **Interpreter subtotal** | **~190** | Including timing/sync/deadlock modules |
 | **TableGen subtotal** | **~36** | |
 | **Legacy (emu_stub)** | **~86** | Preserved |
-| **Grand total** | **~262** | All passing |
+| host_memory.rs | 12 | HostMemory, MemoryRegion |
+| dma/mod.rs | 4 | BdConfig, ChannelType |
+| dma/addressing.rs | 15 | AddressGenerator (1D-4D) |
+| dma/transfer.rs | 13 | Transfer state machine |
+| dma/engine.rs | 15 | DmaEngine, timing integration |
+| dma/timing.rs | 5 | DmaTimingConfig, ChannelArbiter |
+| stream_switch.rs | 6 | StreamSwitch, StreamPort |
+| **DMA subtotal** | **~59** | Addressing, transfer, engine, timing |
+| **Timing/Stream subtotal** | **~29** | DMA timing + stream switch + sync + deadlock |
+| **Grand total** | **~431** | All passing |
 
 ---
 
 ## Next Steps
 
-Current status: **100% instruction recognition** on test ELF binaries. **Timing not yet implemented.**
+Current status: **100% instruction recognition** on test ELF binaries. **DMA engine implemented.**
 
 ### Completed (Functional Emulation)
 
@@ -364,35 +706,52 @@ Current status: **100% instruction recognition** on test ELF binaries. **Timing 
 
 3. **Execution units** - Scalar, vector, memory, control operations
 
-### Remaining Work (Cycle-Accuracy)
+4. **DMA engine** - Full implementation with multi-dimensional addressing
+   - `HostMemory` for simulated DDR (sparse 64-bit address space)
+   - `DmaEngine` per-tile with BD chaining and lock synchronization
+   - `AddressGenerator` supporting 1D/2D/3D/4D stride patterns
+   - `Transfer` state machine with lock acquire/release
 
-#### Priority 1: Pipeline Model
-- Instruction latencies per operation type
-- Hazard detection (RAW, WAW, WAR)
-- Stall cycle modeling
-- Branch penalties
+### Remaining Work
 
-#### Priority 2: Memory Timing
-- Bank conflict detection and penalties
-- Access latency model (local memory: 1 cycle base)
-- Alignment penalties
+#### Priority 1: Integration (Critical for Testing)
+**Connect DMA engine to interpreter and stream switch.**
+- ~~Stream switch stub~~ - ✅ `StreamSwitch` with ports, FIFOs, routing API
+- Integrate `DmaEngine` with `TileArray` for tile-to-tile transfers
+- Connect `DmaStart`/`DmaWait` in `control.rs` to actual DMA engine
+- Wire DMA channels to stream switch ports
+- Test harness `run_to_completion()` API
 
-#### Priority 3: DMA Timing
-- Transfer latency = setup + (size / bandwidth)
-- BD processing overhead
-- Channel arbitration
-- Stall-on-wait behavior
+#### Priority 2: Pipeline Model (Partial - Timing Infrastructure Done)
+- ~~Instruction latencies per operation type~~ - ✅ `LatencyTable`
+- ~~Hazard detection (RAW, WAW, WAR)~~ - ✅ `HazardDetector`
+- Stall cycle modeling - Infrastructure ready, integration pending
+- Branch penalties - TODO
 
-#### Priority 4: Multi-Core Timing
-- Lock contention delays
-- Stream switch routing latency
-- Inter-tile communication latency
-- Global cycle synchronization
+#### Priority 3: Memory Timing (Complete)
+- ~~Bank conflict detection and penalties~~ - ✅ `MemoryModel`
+- ~~Access latency model~~ - ✅ 5 cycles base, +1 on conflict
+- ~~Alignment penalties~~ - ✅ `AlignmentError`, `check_alignment()`
+- ~~Bank mapping~~ - ✅ bits[6:4] = physical bank
 
-#### Priority 5: Infrastructure
-- Per-core cycle counter
-- Stall reason tracking
-- Event timestamps for profiling
+#### Priority 4: DMA Timing (Complete)
+- ~~Transfer latency = setup + (size / bandwidth)~~ - ✅ `DmaTimingConfig`
+- ~~BD processing overhead~~ - ✅ `DMA_BD_SETUP_CYCLES` (4 cycles)
+- ~~Channel arbitration~~ - ✅ `ChannelArbiter` with round-robin
+- ~~DMA timing integration~~ - ✅ `DmaEngine.with_cycle_accurate_timing()`
+- ~~Phase-based execution~~ - ✅ BdSetup/MemoryLatency/DataTransfer/Complete phases
+
+#### Priority 5: Multi-Core Timing (Partial)
+- ~~Clock domain verification~~ - ✅ Single clock for tile array (AM020 Ch2)
+- ~~Global cycle counter~~ - ✅ `TimingContext`
+- ~~Lock contention delays~~ - ✅ `LockTimingState` in `timing/sync.rs`
+- Stream switch routing latency - TODO
+- Inter-tile communication latency - TODO
+
+#### Priority 6: Infrastructure (Partial)
+- ~~Per-core cycle counter~~ - ✅ `TimingContext.current_cycle`
+- ~~Stall reason tracking~~ - ✅ `StallReason` enum in hazards.rs
+- Event timestamps for profiling - TODO
 
 ### Minor Remaining Work (Decoding)
 

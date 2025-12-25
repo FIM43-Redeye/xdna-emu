@@ -58,6 +58,7 @@ We're starting with **Phoenix (NPU1/AIE2)** because it's the hardware we have. T
 - **AM020**: AIE-ML (AIE2) Architecture Manual
 - **AM025**: AIE-ML Register Reference
 - Links: https://docs.amd.com/
+- Path: xdna-emu/docs/xdna/ (use the files in the folders, not the PDFs)
 
 ### Binary Formats
 - **XCLBIN**: Container (ELF cores + PDI/CDO configuration)
