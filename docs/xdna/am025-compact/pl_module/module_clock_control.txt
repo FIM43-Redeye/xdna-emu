@@ -1,0 +1,15 @@
+# PL_MODULE / MODULE_CLOCK_CONTROL
+# 2 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Module_Clock_Control_0 @ 0x00000FFF00 [32 rw reset=0x0000003B] "Control clock gating of modules (privileged)"
+  5       DMA_Adaptive_Clock_Gate      rw  "Enable adaptive clock gate in DMA when it is idle"
+  4       Stream_Switch_Adaptive_Clock_Gate rw  "Enable adaptive clock gate in stream switch when it has been idle for X cycles"
+  3       CTE_Clock_Enable             rw  "Enable the clock to Event, Trace"
+  1       PL_Interface_Clock_Enable    rw  "Enable the clock to PL interface"
+  0       Stream_Switch_Clock_Enable   rw  "Enable the clock to stream switch, ctrl-pkt handler"
+
+Module_Clock_Control_1 @ 0x00000FFF04 [32 rw reset=0x00000001] "Control clock gating of modules (privileged)"
+  0       NoC_Module_Clock_Enable      rw  "Enable the clock to NoC Module"

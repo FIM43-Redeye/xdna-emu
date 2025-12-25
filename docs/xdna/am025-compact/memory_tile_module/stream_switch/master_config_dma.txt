@@ -1,0 +1,41 @@
+# MEMORY_TILE_MODULE / STREAM_SWITCH/MASTER_CONFIG_DMA
+# 6 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Stream_Switch_Master_Config_DMA0 @ 0x00000B0000 [32 rw] "Stream Switch Master Configuration DMA 0"
+  31      Master_Enable                rw  "1=enable the master port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for master port"
+  7       Drop_Header                  rw  "1=drop header on packet if in packet switching mode, ignored in circuit switching mode"
+  6:0     Configuration                rw  "circuit: [4:0]=slave port; packet: [2:0]=arbitor, [6:3]=msel_enable"
+
+Stream_Switch_Master_Config_DMA1 @ 0x00000B0004 [32 rw] "Stream Switch Master Configuration DMA 1"
+  31      Master_Enable                rw  "1=enable the master port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for master port"
+  7       Drop_Header                  rw  "1=drop header on packet if in packet switching mode, ignored in circuit switching mode"
+  6:0     Configuration                rw  "circuit: [4:0]=slave port; packet: [2:0]=arbitor, [6:3]=msel_enable"
+
+Stream_Switch_Master_Config_DMA2 @ 0x00000B0008 [32 rw] "Stream Switch Master Configuration DMA 2"
+  31      Master_Enable                rw  "1=enable the master port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for master port"
+  7       Drop_Header                  rw  "1=drop header on packet if in packet switching mode, ignored in circuit switching mode"
+  6:0     Configuration                rw  "circuit: [4:0]=slave port; packet: [2:0]=arbitor, [6:3]=msel_enable"
+
+Stream_Switch_Master_Config_DMA3 @ 0x00000B000C [32 rw] "Stream Switch Master Configuration DMA 3"
+  31      Master_Enable                rw  "1=enable the master port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for master port"
+  7       Drop_Header                  rw  "1=drop header on packet if in packet switching mode, ignored in circuit switching mode"
+  6:0     Configuration                rw  "circuit: [4:0]=slave port; packet: [2:0]=arbitor, [6:3]=msel_enable"
+
+Stream_Switch_Master_Config_DMA4 @ 0x00000B0010 [32 rw] "Stream Switch Master Configuration DMA 4"
+  31      Master_Enable                rw  "1=enable the master port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for master port"
+  7       Drop_Header                  rw  "1=drop header on packet if in packet switching mode, ignored in circuit switching mode"
+  6:0     Configuration                rw  "circuit: [4:0]=slave port; packet: [2:0]=arbitor, [6:3]=msel_enable"
+
+Stream_Switch_Master_Config_DMA5 @ 0x00000B0014 [32 rw] "Stream Switch Master Configuration DMA 5"
+  31      Master_Enable                rw  "1=enable the master port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for master port"
+  7       Drop_Header                  rw  "1=drop header on packet if in packet switching mode, ignored in circuit switching mode"
+  6:0     Configuration                rw  "circuit: [4:0]=slave port; packet: [2:0]=arbitor, [6:3]=msel_enable"

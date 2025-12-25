@@ -1,0 +1,53 @@
+# CORE_MODULE / EVENT/BROADCAST
+# 16 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Event_Broadcast0 @ 0x0000034010 [32 rw] "Control of which Internal Event to Broadcast0"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast1 @ 0x0000034014 [32 rw] "Control of which Internal Event to Broadcast1"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast2 @ 0x0000034018 [32 rw] "Control of which Internal Event to Broadcast2"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast3 @ 0x000003401C [32 rw] "Control of which Internal Event to Broadcast3"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast4 @ 0x0000034020 [32 rw] "Control of which Internal Event to Broadcast4"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast5 @ 0x0000034024 [32 rw] "Control of which Internal Event to Broadcast5"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast6 @ 0x0000034028 [32 rw] "Control of which Internal Event to Broadcast6"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast7 @ 0x000003402C [32 rw] "Control of which Internal Event to Broadcast7"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast8 @ 0x0000034030 [32 rw] "Control of which Internal Event to Broadcast8"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast9 @ 0x0000034034 [32 rw] "Control of which Internal Event to Broadcast9"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast10 @ 0x0000034038 [32 rw] "Control of which Internal Event to Broadcast10"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast11 @ 0x000003403C [32 rw] "Control of which Internal Event to Broadcast11"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast12 @ 0x0000034040 [32 rw] "Control of which Internal Event to Broadcast12"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast13 @ 0x0000034044 [32 rw] "Control of which Internal Event to Broadcast13"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast14 @ 0x0000034048 [32 rw] "Control of which Internal Event to Broadcast14"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast15 @ 0x000003404C [32 rw] "Control of which Internal Event to Broadcast15"
+  6:0     Event                        rw  "Internal Event No to Broadcast"

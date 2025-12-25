@@ -1,0 +1,13 @@
+# MEMORY_TILE_MODULE / EDGE_DETECTION_EVENT_CONTROL
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Edge_Detection_event_control @ 0x0000094408 [32 rw] "Configuration for edge detection events"
+  26      Edge_Detection_1_Trigger_Falling rw  "Event 1 triggered on falling edge"
+  25      Edge_Detection_1_Trigger_Rising rw  "Event 1 triggered on rising edge"
+  23:16   Edge_Detection_Event_1       rw  "Select input event for edge detection 1"
+  10      Edge_Detection_0_Trigger_Falling rw  "Event triggered on falling edge"
+  9       Edge_Detection_0_Trigger_Rising rw  "Event triggered on rising edge"
+  7:0     Edge_Detection_Event_0       rw  "Select input event for edge detection 0"

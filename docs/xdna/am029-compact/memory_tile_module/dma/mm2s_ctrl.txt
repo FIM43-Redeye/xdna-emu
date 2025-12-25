@@ -1,0 +1,35 @@
+# MEMORY_TILE_MODULE / DMA/MM2S_CTRL
+# 6 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+DMA_MM2S_0_Ctrl @ 0x00000A0630 [32 rw reset=1] "DMA Control Register MM2S Ch0"
+  15:8    Controller_ID                rw  "Task-complete-token controller ID field"
+  4       Compression_Enable           rw  "Enable compression. 0=no compression; 1=compression may be enabled by BD"
+  1       Reset                        rw  "Reset MM2S0"
+
+DMA_MM2S_1_Ctrl @ 0x00000A0638 [32 rw reset=1] "DMA Control Register MM2S Ch1"
+  15:8    Controller_ID                rw  "Task-complete-token controller ID field"
+  4       Compression_Enable           rw  "Enable compression. 0=no compression; 1=compression may be enabled by BD"
+  1       Reset                        rw  "Reset MM2S0"
+
+DMA_MM2S_2_Ctrl @ 0x00000A0640 [32 rw reset=1] "DMA Control Register MM2S Ch2"
+  15:8    Controller_ID                rw  "Task-complete-token controller ID field"
+  4       Compression_Enable           rw  "Enable compression. 0=no compression; 1=compression may be enabled by BD"
+  1       Reset                        rw  "Reset MM2S0"
+
+DMA_MM2S_3_Ctrl @ 0x00000A0648 [32 rw reset=1] "DMA Control Register MM2S Ch3"
+  15:8    Controller_ID                rw  "Task-complete-token controller ID field"
+  4       Compression_Enable           rw  "Enable compression. 0=no compression; 1=compression may be enabled by BD"
+  1       Reset                        rw  "Reset MM2S0"
+
+DMA_MM2S_4_Ctrl @ 0x00000A0650 [32 rw reset=1] "DMA Control Register MM2S Ch4"
+  15:8    Controller_ID                rw  "Task-complete-token controller ID field"
+  4       Compression_Enable           rw  "Enable compression. 0=no compression; 1=compression may be enabled by BD"
+  1       Reset                        rw  "Reset MM2S0"
+
+DMA_MM2S_5_Ctrl @ 0x00000A0658 [32 rw reset=1] "DMA Control Register MM2S Ch5"
+  15:8    Controller_ID                rw  "Task-complete-token controller ID field"
+  4       Compression_Enable           rw  "Enable compression. 0=no compression; 1=compression may be enabled by BD"
+  1       Reset                        rw  "Reset MM2S0"

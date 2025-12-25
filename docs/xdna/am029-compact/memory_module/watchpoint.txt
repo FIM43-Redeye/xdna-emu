@@ -1,0 +1,29 @@
+# MEMORY_MODULE / WATCHPOINT
+# 2 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+WatchPoint0 @ 0x0000014100 [32 rw] "Define Watchpoint0"
+  31      Read_Access                  rw  "Read Access"
+  30      Write_Access                 rw  "Write Access"
+  29      AXI_Access                   rw  "AXI Access"
+  28      DMA_Access                   rw  "DMA Access"
+  27      East_Access                  rw  "Access from East AI Engine"
+  26      North_Access                 rw  "Access from North AI Engine"
+  25      West_Access                  rw  "Access from West AI Engine"
+  24      South_Access                 rw  "Access from South AI Engine"
+  23:16   WriteStrobeMask              rw  "Write Strobe mask; set 1 in bit positions to select if a write to a subset of 8x 32-bit lanes in the 256-bit memory access will assert the event. 0xFF=write to any lane will assert event; 0x00=no event on writes."
+  10:0    Address                      rw  "Internal Address (256-bit aligned; bits [15:5] of byte address)"
+
+WatchPoint1 @ 0x0000014104 [32 rw] "Define Watchpoint1"
+  31      Read_Access                  rw  "Read Access"
+  30      Write_Access                 rw  "Write Access"
+  29      AXI_Access                   rw  "AXI Access"
+  28      DMA_Access                   rw  "DMA Access"
+  27      East_Access                  rw  "Access from East AI Engine"
+  26      North_Access                 rw  "Access from North AI Engine"
+  25      West_Access                  rw  "Access from West AI Engine"
+  24      South_Access                 rw  "Access from South AI Engine"
+  23:16   WriteStrobeMask              rw  "Write Strobe mask; set 1 in bit positions to select if a write to a subset of 8x 32-bit lanes in the 256-bit memory access will assert the event. 0xFF=write to any lane will assert event; 0x00=no event on writes."
+  10:0    Address                      rw  "Internal Address (256-bit aligned; bits [15:5] of byte address)"

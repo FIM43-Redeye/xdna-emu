@@ -1,0 +1,41 @@
+# MEMORY_TILE_MODULE / STREAM_SWITCH/MASTER_CONFIG_NORTH
+# 6 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Stream_Switch_Master_Config_North0 @ 0x00000B002C [32 rw] "Stream Switch Master Configuration North 0"
+  31      Master_Enable                rw  "1=enable the master port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for master port"
+  7       Drop_Header                  rw  "1=drop header on packet if in packet switching mode, ignored in circuit switching mode"
+  6:0     Configuration                rw  "circuit: [4:0]=slave port; packet: [2:0]=arbiter, [6:3]=msel_enable"
+
+Stream_Switch_Master_Config_North1 @ 0x00000B0030 [32 rw] "Stream Switch Master Configuration North 1"
+  31      Master_Enable                rw  "1=enable the master port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for master port"
+  7       Drop_Header                  rw  "1=drop header on packet if in packet switching mode, ignored in circuit switching mode"
+  6:0     Configuration                rw  "circuit: [4:0]=slave port; packet: [2:0]=arbiter, [6:3]=msel_enable"
+
+Stream_Switch_Master_Config_North2 @ 0x00000B0034 [32 rw] "Stream Switch Master Configuration North 2"
+  31      Master_Enable                rw  "1=enable the master port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for master port"
+  7       Drop_Header                  rw  "1=drop header on packet if in packet switching mode, ignored in circuit switching mode"
+  6:0     Configuration                rw  "circuit: [4:0]=slave port; packet: [2:0]=arbiter, [6:3]=msel_enable"
+
+Stream_Switch_Master_Config_North3 @ 0x00000B0038 [32 rw] "Stream Switch Master Configuration North 3"
+  31      Master_Enable                rw  "1=enable the master port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for master port"
+  7       Drop_Header                  rw  "1=drop header on packet if in packet switching mode, ignored in circuit switching mode"
+  6:0     Configuration                rw  "circuit: [4:0]=slave port; packet: [2:0]=arbiter, [6:3]=msel_enable"
+
+Stream_Switch_Master_Config_North4 @ 0x00000B003C [32 rw] "Stream Switch Master Configuration North 4"
+  31      Master_Enable                rw  "1=enable the master port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for master port"
+  7       Drop_Header                  rw  "1=drop header on packet if in packet switching mode, ignored in circuit switching mode"
+  6:0     Configuration                rw  "circuit: [4:0]=slave port; packet: [2:0]=arbiter, [6:3]=msel_enable"
+
+Stream_Switch_Master_Config_North5 @ 0x00000B0040 [32 rw] "Stream Switch Master Configuration North 5"
+  31      Master_Enable                rw  "1=enable the master port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for master port"
+  7       Drop_Header                  rw  "1=drop header on packet if in packet switching mode, ignored in circuit switching mode"
+  6:0     Configuration                rw  "circuit: [4:0]=slave port; packet: [2:0]=arbiter, [6:3]=msel_enable"

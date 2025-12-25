@@ -1,0 +1,11 @@
+# NOC_MODULE / MUX_CONFIG
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Mux_Config @ 0x0000002104 [32 rw] "Configuration of multiplexer of tile input streams"
+  15:14   South7                       rw  "Connect PL (00) or NoC Module DMA(01) to input stream south 7"
+  13:12   South5                       rw  "Defeatured this generation"
+  11:10   South3                       rw  "Connect PL (00) or NoC Module DMA(01) to input stream south 3"
+  9:8     South1                       rw  "Defeatured this generation"

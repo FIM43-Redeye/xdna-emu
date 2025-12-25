@@ -1,0 +1,8 @@
+# PL_MODULE / COLUMN_CLOCK_CONTROL
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Column_Clock_Control @ 0x00000FFF20 [32 rw] "Control of global clock gating (privileged) (TMR protection)"
+  0       Clock_Buffer_Enable          rw  "Column clock gate: Control the global clock buffer, affects all tiles above (Tile & MEM). This Shim tile unaffected. 1=Clock enabled; 0=Clock gated"

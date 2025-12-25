@@ -1,0 +1,23 @@
+# MEMORY_TILE_MODULE / EVENT/STATUS
+# 6 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Event_Status0 @ 0x0000094200 [32 wtc reset=0x00000002] "Internal event status register0"
+  31:0    Event_31_0_Status            wtc  "Sticky bit for each event 31-0"
+
+Event_Status1 @ 0x0000094204 [32 wtc] "Internal event status register1"
+  31:0    Event_63_32_Status           wtc  "Sticky bit for each event 63-32"
+
+Event_Status2 @ 0x0000094208 [32 wtc] "Internal event status register2"
+  31:0    Event_95_64_Status           wtc  "Sticky bit for each event 95-64"
+
+Event_Status3 @ 0x000009420C [32 wtc] "Internal event status register3"
+  31:0    Event_127_96_Status          wtc  "Sticky bit for each event 127-96"
+
+Event_Status4 @ 0x0000094210 [32 wtc] "Internal event status register4"
+  31:0    Event_159_128_Status         wtc  "Sticky bit for each event 159-128"
+
+Event_Status5 @ 0x0000094214 [32 wtc] "Internal event status register5"
+  31:0    Event_191_160_Status         wtc  "Sticky bit for each event 160"

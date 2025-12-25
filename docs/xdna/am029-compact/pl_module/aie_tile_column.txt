@@ -1,0 +1,8 @@
+# PL_MODULE / AIE_TILE_COLUMN
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+AIE_Tile_Column_Reset @ 0x000007FF28 [32 rw reset=0] "Reset for all ME tiles in the column above (privileged) (TMR protection)"
+  0       Reset                        rw  "1=Reset all AIE tiles in the column above"

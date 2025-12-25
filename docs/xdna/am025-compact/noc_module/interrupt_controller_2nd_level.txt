@@ -1,0 +1,20 @@
+# NOC_MODULE / INTERRUPT_CONTROLLER_2ND_LEVEL
+# 5 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Interrupt_controller_2nd_level_mask @ 0x0000015000 [32 ro] "Interrupt controller 2nd level mask (IMR)"
+  15:0    IRQ_Mask_A                   ro  "Current value of the mask (IMR)"
+
+Interrupt_controller_2nd_level_enable @ 0x0000015004 [32 wo] "Interrupt controller 2nd level enable interrupt (IER)"
+  15:0    Enable_A                     wo  "Enable individual interrupts by setting bits in the mask value (IMR)"
+
+Interrupt_controller_2nd_level_disable @ 0x0000015008 [32 wo] "Interrupt controller 2nd level disable interrupt (IDR)"
+  15:0    Disable_A                    wo  "Disable individual interrupts by clearing bits in the mask value (IMR_A)"
+
+Interrupt_controller_2nd_level_status @ 0x000001500C [32 wtc] "Interrupt controller 2nd level status register (ISR)"
+  15:0    Status_A                     wtc  "Sticky bit for each interrupt"
+
+Interrupt_controller_2nd_level_interrupt @ 0x0000015010 [32 rw] "Interrupt controller 2nd level interrupt (privileged)"
+  1:0     NoC_Interrupt                rw  "NoC Interrupt (1 of 4) to drive when one of active events occures"

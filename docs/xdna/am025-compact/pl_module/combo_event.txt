@@ -1,0 +1,16 @@
+# PL_MODULE / COMBO_EVENT
+# 2 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Combo_event_inputs @ 0x0000034400 [32 rw] "Combo events input events"
+  30:24   eventD                       rw  "Input event D"
+  22:16   eventC                       rw  "Input event C"
+  14:8    eventB                       rw  "Input event B"
+  6:0     eventA                       rw  "Input event A"
+
+Combo_event_control @ 0x0000034404 [32 rw] "Combo events input events"
+  17:16   combo2                       rw  "Control bits for combo 2"
+  9:8     combo1                       rw  "Control bits for combo 1"
+  1:0     combo0                       rw  "Control bits for combo 0"

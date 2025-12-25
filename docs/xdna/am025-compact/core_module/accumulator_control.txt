@@ -1,0 +1,9 @@
+# CORE_MODULE / ACCUMULATOR_CONTROL
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Accumulator_Control @ 0x0000036060 [32 rw] "Control Accumulator Cascade"
+  1       Output                       rw  "Output cascade direction. 0=to South; 1=to East"
+  0       Input                        rw  "Input cascade direction. 0=from North; 1=from West"

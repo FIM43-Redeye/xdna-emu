@@ -1,0 +1,47 @@
+# MEMORY_TILE_MODULE / DMA/S2MM_CTRL
+# 6 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+DMA_S2MM_0_Ctrl @ 0x00000A0600 [32 rw reset=1] "DMA Control Register S2MM Ch0"
+  17:16   FoT_Mode                     rw  "Finish on TLAST mode. 00 = FoT_disabled; 01 = FoT_no_counts; 10 = FoT_counts_with_task_tokens; 11 = FoT_counts_from_mm_register"
+  15:8    Controller_ID                rw  "Task-complete-token controller ID field"
+  4       Decompression_Enable         rw  "Enable decompression. 0=no decompression; 1=decompression may be enabled by BD"
+  3       Enable_Out_of_Order          rw  "Enable out-of-order mode. 0=in-order mode"
+  1       Reset                        rw  "Reset S2MM0"
+
+DMA_S2MM_1_Ctrl @ 0x00000A0608 [32 rw reset=1] "DMA Control Register S2MM Ch1"
+  17:16   FoT_Mode                     rw  "Finish on TLAST mode. 00 = FoT_disabled; 01 = FoT_no_counts; 10 = FoT_counts_with_task_tokens; 11 = FoT_counts_from_mm_register"
+  15:8    Controller_ID                rw  "Task-complete-token controller ID field"
+  4       Decompression_Enable         rw  "Enable decompression. 0=no decompression; 1=decompression may be enabled by BD"
+  3       Enable_Out_of_Order          rw  "Enable out-of-order mode. 0=in-order mode"
+  1       Reset                        rw  "Reset S2MM0"
+
+DMA_S2MM_2_Ctrl @ 0x00000A0610 [32 rw reset=1] "DMA Control Register S2MM Ch2"
+  17:16   FoT_Mode                     rw  "Finish on TLAST mode. 00 = FoT_disabled; 01 = FoT_no_counts; 10 = FoT_counts_with_task_tokens; 11 = FoT_counts_from_mm_register"
+  15:8    Controller_ID                rw  "Task-complete-token controller ID field"
+  4       Decompression_Enable         rw  "Enable decompression. 0=no decompression; 1=decompression may be enabled by BD"
+  3       Enable_Out_of_Order          rw  "Enable out-of-order mode. 0=in-order mode"
+  1       Reset                        rw  "Reset S2MM0"
+
+DMA_S2MM_3_Ctrl @ 0x00000A0618 [32 rw reset=1] "DMA Control Register S2MM Ch3"
+  17:16   FoT_Mode                     rw  "Finish on TLAST mode. 00 = FoT_disabled; 01 = FoT_no_counts; 10 = FoT_counts_with_task_tokens; 11 = FoT_counts_from_mm_register"
+  15:8    Controller_ID                rw  "Task-complete-token controller ID field"
+  4       Decompression_Enable         rw  "Enable decompression. 0=no decompression; 1=decompression may be enabled by BD"
+  3       Enable_Out_of_Order          rw  "Enable out-of-order mode. 0=in-order mode"
+  1       Reset                        rw  "Reset S2MM0"
+
+DMA_S2MM_4_Ctrl @ 0x00000A0620 [32 rw reset=1] "DMA Control Register S2MM Ch4"
+  17:16   FoT_Mode                     rw  "Finish on TLAST mode. 00 = FoT_disabled; 01 = FoT_no_counts; 10 = FoT_counts_with_task_tokens; 11 = FoT_counts_from_mm_register"
+  15:8    Controller_ID                rw  "Task-complete-token controller ID field"
+  4       Decompression_Enable         rw  "Enable decompression. 0=no decompression; 1=decompression may be enabled by BD"
+  3       Enable_Out_of_Order          rw  "Enable out-of-order mode. 0=in-order mode"
+  1       Reset                        rw  "Reset S2MM0"
+
+DMA_S2MM_5_Ctrl @ 0x00000A0628 [32 rw reset=1] "DMA Control Register S2MM Ch5"
+  17:16   FoT_Mode                     rw  "Finish on TLAST mode. 00 = FoT_disabled; 01 = FoT_no_counts; 10 = FoT_counts_with_task_tokens; 11 = FoT_counts_from_mm_register"
+  15:8    Controller_ID                rw  "Task-complete-token controller ID field"
+  4       Decompression_Enable         rw  "Enable decompression. 0=no decompression; 1=decompression may be enabled by BD"
+  3       Enable_Out_of_Order          rw  "Enable out-of-order mode. 0=in-order mode"
+  1       Reset                        rw  "Reset S2MM0"

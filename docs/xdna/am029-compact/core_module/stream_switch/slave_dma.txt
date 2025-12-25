@@ -1,0 +1,61 @@
+# CORE_MODULE / STREAM_SWITCH/SLAVE_DMA
+# 8 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Stream_Switch_Slave_DMA_0_Slot0 @ 0x000003F210 [32 rw] "Stream Switch Slave Configuration DMA 0"
+  28:24   id                           rw  "Slot0 ID"
+  20:16   mask                         rw  "Slot0 mask (1=bit is used in the comparison)"
+  8       enable                       rw  "Slot0 enable"
+  5:4     msel                         rw  "Slot0 msel"
+  2:0     arbit                        rw  "Slot0 arbiter to use"
+
+Stream_Switch_Slave_DMA_0_Slot1 @ 0x000003F214 [32 rw] "Stream Switch Slave Configuration DMA 0"
+  28:24   id                           rw  "Slot1 ID"
+  20:16   mask                         rw  "Slot1 mask (1=bit is used in the comparison)"
+  8       enable                       rw  "Slot1 enable"
+  5:4     msel                         rw  "Slot1 msel"
+  2:0     arbit                        rw  "Slot1 arbiter to use"
+
+Stream_Switch_Slave_DMA_0_Slot2 @ 0x000003F218 [32 rw] "Stream Switch Slave Configuration DMA 0"
+  28:24   id                           rw  "Slot2 ID"
+  20:16   mask                         rw  "Slot2 mask (1=bit is used in the comparison)"
+  8       enable                       rw  "Slot2 enable"
+  5:4     msel                         rw  "Slot2 msel"
+  2:0     arbit                        rw  "Slot2 arbiter to use"
+
+Stream_Switch_Slave_DMA_0_Slot3 @ 0x000003F21C [32 rw] "Stream Switch Slave Configuration DMA 0"
+  28:24   id                           rw  "Slot3 ID"
+  20:16   mask                         rw  "Slot3 mask (1=bit is used in the comparison)"
+  8       enable                       rw  "Slot3 enable"
+  5:4     msel                         rw  "Slot3 msel"
+  2:0     arbit                        rw  "Slot3 arbiter to use"
+
+Stream_Switch_Slave_DMA_1_Slot0 @ 0x000003F220 [32 rw] "Stream Switch Slave Configuration DMA 1"
+  28:24   id                           rw  "Slot0 ID"
+  20:16   mask                         rw  "Slot0 mask (1=bit is used in the comparison)"
+  8       enable                       rw  "Slot0 enable"
+  5:4     msel                         rw  "Slot0 msel"
+  2:0     arbit                        rw  "Slot0 arbiter to use"
+
+Stream_Switch_Slave_DMA_1_Slot1 @ 0x000003F224 [32 rw] "Stream Switch Slave Configuration DMA 1"
+  28:24   id                           rw  "Slot1 ID"
+  20:16   mask                         rw  "Slot1 mask (1=bit is used in the comparison)"
+  8       enable                       rw  "Slot1 enable"
+  5:4     msel                         rw  "Slot1 msel"
+  2:0     arbit                        rw  "Slot1 arbiter to use"
+
+Stream_Switch_Slave_DMA_1_Slot2 @ 0x000003F228 [32 rw] "Stream Switch Slave Configuration DMA 1"
+  28:24   id                           rw  "Slot2 ID"
+  20:16   mask                         rw  "Slot2 mask (1=bit is used in the comparison)"
+  8       enable                       rw  "Slot2 enable"
+  5:4     msel                         rw  "Slot2 msel"
+  2:0     arbit                        rw  "Slot2 arbiter to use"
+
+Stream_Switch_Slave_DMA_1_Slot3 @ 0x000003F22C [32 rw] "Stream Switch Slave Configuration DMA 1"
+  28:24   id                           rw  "Slot3 ID"
+  20:16   mask                         rw  "Slot3 mask (1=bit is used in the comparison)"
+  8       enable                       rw  "Slot3 enable"
+  5:4     msel                         rw  "Slot3 msel"
+  2:0     arbit                        rw  "Slot3 arbiter to use"

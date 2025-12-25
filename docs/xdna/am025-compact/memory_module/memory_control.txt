@@ -1,0 +1,8 @@
+# MEMORY_MODULE / MEMORY_CONTROL
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Memory_Control @ 0x0000016010 [32 rw] "Control for memory (privileged)"
+  0       Memory_Zeroisation           rw  "1= Triggers the zeroisation of the memory, is returned to 0 when completed"

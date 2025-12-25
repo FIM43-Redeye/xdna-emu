@@ -1,0 +1,27 @@
+# PL_MODULE / PERFORMANCE
+# 6 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Performance_Ctrl0 @ 0x0000031000 [32 rw] "Performance Counters 1-0 Start and Stop Event"
+  30:24   Cnt1_Stop_Event              rw  "Event No to Stop Counter1"
+  22:16   Cnt1_Start_Event             rw  "Event No to Start Counter1"
+  14:8    Cnt0_Stop_Event              rw  "Event No to Stop Counter0"
+  6:0     Cnt0_Start_Event             rw  "Event No to Start Counter0"
+
+Performance_Ctrl1 @ 0x0000031008 [32 rw reset=6:0] "Performance Counters Reset Events"
+  14:8    Cnt1_Reset_Event             rw  "Event No to Reset Counter1"
+  6:0     Cnt0_Reset_Event             rw  "Event No to Reset Counter0"
+
+Performance_Counter0 @ 0x0000031020 [32 rw] "Performance Counter0"
+  31:0    Counter0_Value               rw  "Counter Value"
+
+Performance_Counter1 @ 0x0000031024 [32 rw] "Performance Counter1"
+  31:0    Counter0_Value               rw  "Counter Value"
+
+Performance_Counter0_Event_Value @ 0x0000031080 [32 rw] "Performance Counter0 Event Value."
+  31:0    Counter_Event_Value          rw  "When the Performance Counter0 reach this value, an event will be generated"
+
+Performance_Counter1_Event_Value @ 0x0000031084 [32 rw] "Performance Counter1 Event Value. When the Performance Counter1 reach this value, an event will be generated"
+  31:0    Counter_Event_Value          rw  "When the Performance Counter0 reach this value, an event will be generated"

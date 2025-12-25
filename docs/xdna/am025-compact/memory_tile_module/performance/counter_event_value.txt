@@ -1,0 +1,17 @@
+# MEMORY_TILE_MODULE / PERFORMANCE/COUNTER_EVENT_VALUE
+# 4 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Performance_Counter0_Event_Value @ 0x0000091080 [32 rw] "Performance Counter0 Event Value."
+  31:0    Counter0_Event_Value         rw  "When Performance Counter0 reaches this value, an event will be generated"
+
+Performance_Counter1_Event_Value @ 0x0000091084 [32 rw] "Performance Counter1 Event Value."
+  31:0    Counter1_Event_Value         rw  "When Performance Counter1 reaches this value, an event will be generated"
+
+Performance_Counter2_Event_Value @ 0x0000091088 [32 rw] "Performance Counter2 Event Value."
+  31:0    Counter2_Event_Value         rw  "When Performance Counter2 reaches this value, an event will be generated"
+
+Performance_Counter3_Event_Value @ 0x000009108C [32 rw] "Performance Counter3 Event Value."
+  31:0    Counter3_Event_Value         rw  "When Performance Counter3 reaches this value, an event will be generated"

@@ -1,0 +1,11 @@
+# NOC_MODULE / DEMUX_CONFIG
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Demux_Config @ 0x000001F004 [32 rw] "Configuration of demultiplexer of tile output streams"
+  11:10   South5                       rw  "Connect output stream south 5 to PL (00) or NoC(10)"
+  9:8     South4                       rw  "Connect output stream south 4 to PL (00) or NoC(10)"
+  7:6     South3                       rw  "Connect output stream south 3 to PL (00), DMA(01) or NoC(10)"
+  5:4     South2                       rw  "Connect output stream south 2 to PL (00), DMA(01) or NoC(10)"

@@ -1,0 +1,8 @@
+# CORE_MODULE / RESET_EVENT
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Reset_Event @ 0x000003200C [32 rw reset=6:0] "Set reset event trigger"
+  6:0     Reset_Event                  rw  "Event No to reset AI Engine"

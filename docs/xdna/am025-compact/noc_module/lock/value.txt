@@ -1,0 +1,53 @@
+# NOC_MODULE / LOCK/VALUE
+# 16 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Lock0_value @ 0x0000014000 [32 rw] "Value of lock 0"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock1_value @ 0x0000014010 [32 rw] "Value of lock 1"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock2_value @ 0x0000014020 [32 rw] "Value of lock 2"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock3_value @ 0x0000014030 [32 rw] "Value of lock 3"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock4_value @ 0x0000014040 [32 rw] "Value of lock 4"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock5_value @ 0x0000014050 [32 rw] "Value of lock 5"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock6_value @ 0x0000014060 [32 rw] "Value of lock 6"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock7_value @ 0x0000014070 [32 rw] "Value of lock 7"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock8_value @ 0x0000014080 [32 rw] "Value of lock 8"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock9_value @ 0x0000014090 [32 rw] "Value of lock 9"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock10_value @ 0x00000140A0 [32 rw] "Value of lock 10"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock11_value @ 0x00000140B0 [32 rw] "Value of lock 11"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock12_value @ 0x00000140C0 [32 rw] "Value of lock 12"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock13_value @ 0x00000140D0 [32 rw] "Value of lock 13"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock14_value @ 0x00000140E0 [32 rw] "Value of lock 14"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock15_value @ 0x00000140F0 [32 rw] "Value of lock 15"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"

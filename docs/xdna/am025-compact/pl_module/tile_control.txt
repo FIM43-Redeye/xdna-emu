@@ -1,0 +1,11 @@
+# PL_MODULE / TILE_CONTROL
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Tile_Control @ 0x0000036030 [32 rw reset=0x0000000F] "Tile control register"
+  3       Isolate_From_East            rw  "Block events from East"
+  2       Isolate_From_North           rw  "Block events from North"
+  1       Isolate_From_West            rw  "Block events from West"
+  0       Isolate_From_South           rw  "Block events from South"

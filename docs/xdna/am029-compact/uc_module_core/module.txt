@@ -1,0 +1,11 @@
+# UC_MODULE_CORE / MODULE
+# 2 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Module_Data_Memory @ 0x0000020000 [32 rw] "Data memory shared between uC-Core and uC-DMAs (uC-DM) (32 kbyte)"
+  31:0    _                            rw  "Data Word"
+
+Module_Local_Column_Index @ 0x000003C200 [32 ro] "Column index of this uC-Core"
+  6:0     Column_Index                 ro  "Column index of this uC-Core. Used to compute the AXI-MM offset to configure registers in this tile."

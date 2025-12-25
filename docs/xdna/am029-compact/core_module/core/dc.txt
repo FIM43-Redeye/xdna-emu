@@ -1,0 +1,29 @@
+# CORE_MODULE / CORE/DC
+# 8 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Core_DC0 @ 0x0000032B80 [32 rw] "Count register DC0"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DC1 @ 0x0000032B90 [32 rw] "Count register DC1"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DC2 @ 0x0000032BA0 [32 rw] "Count register DC2"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DC3 @ 0x0000032BB0 [32 rw] "Count register DC3"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DC4 @ 0x0000032BC0 [32 rw] "Count register DC4"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DC5 @ 0x0000032BD0 [32 rw] "Count register DC5"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DC6 @ 0x0000032BE0 [32 rw] "Count register DC6"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DC7 @ 0x0000032BF0 [32 rw] "Count register DC7"
+  19:0    Register_Value               rw  "Register Value"

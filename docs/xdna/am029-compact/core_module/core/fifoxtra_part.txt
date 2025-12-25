@@ -1,0 +1,17 @@
+# CORE_MODULE / CORE/FIFOXTRA_PART
+# 4 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Core_FIFOXTRA_Part1 @ 0x0000032580 [128 rw] "FIFOXTRA Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of FIFOXTRA register"
+
+Core_FIFOXTRA_Part2 @ 0x0000032590 [128 rw] "FIFOXTRA Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of FIFOXTRA register"
+
+Core_FIFOXTRA_Part3 @ 0x00000325A0 [128 rw] "FIFOXTRA Part 3"
+  127:0   Register_Value               rw  "Bits 383 down to 256 of FIFOXTRA register"
+
+Core_FIFOXTRA_Part4 @ 0x00000325B0 [128 rw] "FIFOXTRA Part 4"
+  127:0   Register_Value               rw  "Bits 511 down to 384 of FIFOXTRA register"

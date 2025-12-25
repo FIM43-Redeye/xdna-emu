@@ -1,0 +1,11 @@
+# NOC_MODULE / DEMUX_CONFIG
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Demux_Config @ 0x0000002108 [32 rw] "Configuration of demultiplexer of tile output streams"
+  11:10   South5                       rw  "Defeatured this generation"
+  7:6     South3                       rw  "Connect output stream south 3 to PL (00) or NoC Module DMA (01)"
+  5:4     South2                       rw  "Defeatured this generation"
+  3:2     South1                       rw  "Connect output stream south 1 to PL (00) or NoC Module DMA (01)"

@@ -1,0 +1,11 @@
+# PL_MODULE / PERFORMANCE/MISC
+# 2 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Performance_Counter0_Event_Value @ 0x0000031080 [32 rw] "Performance Counter0 Event Value."
+  31:0    Counter_Event_Value          rw  "When the Performance Counter0 reach this value, an event will be generated"
+
+Performance_Counter1_Event_Value @ 0x0000031084 [32 rw] "Performance Counter1 Event Value. When the Performance Counter1 reach this value, an event will be generated"
+  31:0    Counter_Event_Value          rw  "When the Performance Counter0 reach this value, an event will be generated"

@@ -1,0 +1,8 @@
+# CORE_MODULE / PROGRAM_MEMORY
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Program_Memory @ 0x0000020000 [128 rw] "Program Memory (16 kbyte)"
+  127:0   _                            rw  "Instruction Word"

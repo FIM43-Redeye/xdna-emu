@@ -1,0 +1,17 @@
+# CORE_MODULE / CORE/S
+# 4 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Core_S0 @ 0x0000032C80 [32 rw] "Shift register S0"
+  5:0     Register_Value               rw  "Register Value"
+
+Core_S1 @ 0x0000032C90 [32 rw] "Shift register S1"
+  5:0     Register_Value               rw  "Register Value"
+
+Core_S2 @ 0x0000032CA0 [32 rw] "Shift register S2"
+  5:0     Register_Value               rw  "Register Value"
+
+Core_S3 @ 0x0000032CB0 [32 rw] "Shift register S3"
+  5:0     Register_Value               rw  "Register Value"

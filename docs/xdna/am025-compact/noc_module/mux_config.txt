@@ -1,0 +1,11 @@
+# NOC_MODULE / MUX_CONFIG
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Mux_Config @ 0x000001F000 [32 rw] "Configuration of multiplexer of tile input streams"
+  15:14   South7                       rw  "Connect PL (00), DMA(01) or NoC(10) to input stream south 7"
+  13:12   South6                       rw  "Connect PL (00) or NoC(10) to input stream south 6"
+  11:10   South3                       rw  "Connect PL (00), DMA(01) or NoC(10) to input stream south 3"
+  9:8     South2                       rw  "Connect PL (00) or NoC(10) to input stream south 2"

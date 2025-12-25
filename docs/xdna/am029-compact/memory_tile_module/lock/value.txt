@@ -1,0 +1,197 @@
+# MEMORY_TILE_MODULE / LOCK/VALUE
+# 64 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Lock0_value @ 0x00000C0000 [32 rw] "Value of lock 0"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock1_value @ 0x00000C0010 [32 rw] "Value of lock 1"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock2_value @ 0x00000C0020 [32 rw] "Value of lock 2"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock3_value @ 0x00000C0030 [32 rw] "Value of lock 3"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock4_value @ 0x00000C0040 [32 rw] "Value of lock 4"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock5_value @ 0x00000C0050 [32 rw] "Value of lock 5"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock6_value @ 0x00000C0060 [32 rw] "Value of lock 6"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock7_value @ 0x00000C0070 [32 rw] "Value of lock 7"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock8_value @ 0x00000C0080 [32 rw] "Value of lock 8"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock9_value @ 0x00000C0090 [32 rw] "Value of lock 9"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock10_value @ 0x00000C00A0 [32 rw] "Value of lock 10"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock11_value @ 0x00000C00B0 [32 rw] "Value of lock 11"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock12_value @ 0x00000C00C0 [32 rw] "Value of lock 12"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock13_value @ 0x00000C00D0 [32 rw] "Value of lock 13"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock14_value @ 0x00000C00E0 [32 rw] "Value of lock 14"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock15_value @ 0x00000C00F0 [32 rw] "Value of lock 15"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock16_value @ 0x00000C0100 [32 rw] "Value of lock 16"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock17_value @ 0x00000C0110 [32 rw] "Value of lock 17"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock18_value @ 0x00000C0120 [32 rw] "Value of lock 18"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock19_value @ 0x00000C0130 [32 rw] "Value of lock 19"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock20_value @ 0x00000C0140 [32 rw] "Value of lock 20"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock21_value @ 0x00000C0150 [32 rw] "Value of lock 21"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock22_value @ 0x00000C0160 [32 rw] "Value of lock 22"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock23_value @ 0x00000C0170 [32 rw] "Value of lock 23"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock24_value @ 0x00000C0180 [32 rw] "Value of lock 24"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock25_value @ 0x00000C0190 [32 rw] "Value of lock 25"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock26_value @ 0x00000C01A0 [32 rw] "Value of lock 26"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock27_value @ 0x00000C01B0 [32 rw] "Value of lock 27"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock28_value @ 0x00000C01C0 [32 rw] "Value of lock 28"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock29_value @ 0x00000C01D0 [32 rw] "Value of lock 29"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock30_value @ 0x00000C01E0 [32 rw] "Value of lock 30"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock31_value @ 0x00000C01F0 [32 rw] "Value of lock 31"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock32_value @ 0x00000C0200 [32 rw] "Value of lock 32"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock33_value @ 0x00000C0210 [32 rw] "Value of lock 33"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock34_value @ 0x00000C0220 [32 rw] "Value of lock 34"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock35_value @ 0x00000C0230 [32 rw] "Value of lock 35"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock36_value @ 0x00000C0240 [32 rw] "Value of lock 36"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock37_value @ 0x00000C0250 [32 rw] "Value of lock 37"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock38_value @ 0x00000C0260 [32 rw] "Value of lock 38"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock39_value @ 0x00000C0270 [32 rw] "Value of lock 39"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock40_value @ 0x00000C0280 [32 rw] "Value of lock 40"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock41_value @ 0x00000C0290 [32 rw] "Value of lock 41"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock42_value @ 0x00000C02A0 [32 rw] "Value of lock 42"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock43_value @ 0x00000C02B0 [32 rw] "Value of lock 43"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock44_value @ 0x00000C02C0 [32 rw] "Value of lock 44"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock45_value @ 0x00000C02D0 [32 rw] "Value of lock 45"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock46_value @ 0x00000C02E0 [32 rw] "Value of lock 46"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock47_value @ 0x00000C02F0 [32 rw] "Value of lock 47"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock48_value @ 0x00000C0300 [32 rw] "Value of lock 48"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock49_value @ 0x00000C0310 [32 rw] "Value of lock 49"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock50_value @ 0x00000C0320 [32 rw] "Value of lock 50"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock51_value @ 0x00000C0330 [32 rw] "Value of lock 51"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock52_value @ 0x00000C0340 [32 rw] "Value of lock 52"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock53_value @ 0x00000C0350 [32 rw] "Value of lock 53"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock54_value @ 0x00000C0360 [32 rw] "Value of lock 54"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock55_value @ 0x00000C0370 [32 rw] "Value of lock 55"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock56_value @ 0x00000C0380 [32 rw] "Value of lock 56"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock57_value @ 0x00000C0390 [32 rw] "Value of lock 57"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock58_value @ 0x00000C03A0 [32 rw] "Value of lock 58"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock59_value @ 0x00000C03B0 [32 rw] "Value of lock 59"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock60_value @ 0x00000C03C0 [32 rw] "Value of lock 60"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock61_value @ 0x00000C03D0 [32 rw] "Value of lock 61"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock62_value @ 0x00000C03E0 [32 rw] "Value of lock 62"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"
+
+Lock63_value @ 0x00000C03F0 [32 rw] "Value of lock 63"
+  5:0     Lock_value                   rw  "Read current lock value, or write to set lock value"

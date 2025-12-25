@@ -1,0 +1,101 @@
+# CORE_MODULE / CORE/R
+# 32 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Core_R0 @ 0x0000032800 [32 rw] "R0 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R1 @ 0x0000032810 [32 rw] "R1 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R2 @ 0x0000032820 [32 rw] "R2 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R3 @ 0x0000032830 [32 rw] "R3 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R4 @ 0x0000032840 [32 rw] "R4 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R5 @ 0x0000032850 [32 rw] "R5 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R6 @ 0x0000032860 [32 rw] "R6 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R7 @ 0x0000032870 [32 rw] "R7 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R8 @ 0x0000032880 [32 rw] "R8 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R9 @ 0x0000032890 [32 rw] "R9 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R10 @ 0x00000328A0 [32 rw] "R10 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R11 @ 0x00000328B0 [32 rw] "R11 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R12 @ 0x00000328C0 [32 rw] "R12 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R13 @ 0x00000328D0 [32 rw] "R13 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R14 @ 0x00000328E0 [32 rw] "R14 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R15 @ 0x00000328F0 [32 rw] "R15 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R16 @ 0x0000032900 [32 rw] "R16 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R17 @ 0x0000032910 [32 rw] "R17 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R18 @ 0x0000032920 [32 rw] "R18 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R19 @ 0x0000032930 [32 rw] "R19 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R20 @ 0x0000032940 [32 rw] "R20 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R21 @ 0x0000032950 [32 rw] "R21 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R22 @ 0x0000032960 [32 rw] "R22 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R23 @ 0x0000032970 [32 rw] "R23 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R24 @ 0x0000032980 [32 rw] "R24 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R25 @ 0x0000032990 [32 rw] "R25 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R26 @ 0x00000329A0 [32 rw] "R26 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R27 @ 0x00000329B0 [32 rw] "R27 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R28 @ 0x00000329C0 [32 rw] "R28 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R29 @ 0x00000329D0 [32 rw] "R29 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R30 @ 0x00000329E0 [32 rw] "R30 register"
+  31:0    Register_Value               rw  "Register Value"
+
+Core_R31 @ 0x00000329F0 [32 rw] "R31 register"
+  31:0    Register_Value               rw  "Register Value"

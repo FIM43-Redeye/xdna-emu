@@ -1,0 +1,30 @@
+# CORE_MODULE / TRACE
+# 5 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Trace_Control0 @ 0x00000340D0 [32 rw] "Control of Trace"
+  30:24   Trace_Stop_Event             rw  "Event No to Stop Trace"
+  22:16   Trace_Start_Event            rw  "Event No to Start Trace"
+  1:0     Mode                         rw  "Trace mode. 00=event-time, 01=event-PC"
+
+Trace_Control1 @ 0x00000340D4 [32 14:12] "Control of Trace: packet destination"
+  14:12   Packet_Type                  rw  "Packet type"
+  4:0     ID                           rw  "ID value for the packet"
+
+Trace_Status @ 0x00000340D8 [32 ro] "Status of trace engine"
+  9:8     State                        ro  "State. 00=idle, 01=running, 11=overrun"
+  2:0     Mode                         ro  "Current Trace mode. 000=event-time, 001=event-PC"
+
+Trace_Event0 @ 0x00000340E0 [32 rw] "Control of which Internal Event to Trace"
+  30:24   Trace_Event3                 rw  "Internal Event No to add to Trace"
+  22:16   Trace_Event2                 rw  "Internal Event No to add to Trace"
+  14:8    Trace_Event1                 rw  "Internal Event No to add to Trace"
+  6:0     Trace_Event0                 rw  "Internal Event No to add to Trace"
+
+Trace_Event1 @ 0x00000340E4 [32 rw] "Control of which Internal Event to Trace"
+  30:24   Trace_Event7                 rw  "Internal Event No to add to Trace"
+  22:16   Trace_Event6                 rw  "Internal Event No to add to Trace"
+  14:8    Trace_Event5                 rw  "Internal Event No to add to Trace"
+  6:0     Trace_Event4                 rw  "Internal Event No to add to Trace"

@@ -1,0 +1,13 @@
+# CONTROL_MODULE / MEMORY
+# 2 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Memory_Zeroization @ 0x00000C0030 [32 rw] "Control of memory zeroization (privileged)"
+  2       DM_Zeroization               rw  "1= Triggers the zeroization of the uC-DM. Returns to 0 when complete"
+  1       Private_DM_Zeroization       rw  "1= Triggers the zeroization of the private uC-DM. Returns to 0 when complete"
+  0       PM_Zeroization               rw  "1= Triggers the zeroization of the uC-PM. Returns to 0 when complete"
+
+Memory_Privileged @ 0x00000C0034 [32 rw] "Control of uC-PM, uC-Private-DM and uC-Core debug port privileged status (privileged)"
+  0       Memory_Privileged            rw  "1= Make uC-PM, uC-Private-DM, and uC-Core MDM privileged"

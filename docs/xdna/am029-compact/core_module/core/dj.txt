@@ -1,0 +1,29 @@
+# CORE_MODULE / CORE/DJ
+# 8 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Core_DJ0 @ 0x0000032B00 [32 rw] "Step register DJ0"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DJ1 @ 0x0000032B10 [32 rw] "Step register DJ1"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DJ2 @ 0x0000032B20 [32 rw] "Step register DJ2"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DJ3 @ 0x0000032B30 [32 rw] "Step register DJ3"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DJ4 @ 0x0000032B40 [32 rw] "Step register DJ4"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DJ5 @ 0x0000032B50 [32 rw] "Step register DJ5"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DJ6 @ 0x0000032B60 [32 rw] "Step register DJ6"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DJ7 @ 0x0000032B70 [32 rw] "Step register DJ7"
+  19:0    Register_Value               rw  "Register Value"

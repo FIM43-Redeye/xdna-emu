@@ -1,0 +1,11 @@
+# PL_MODULE / CONTROL_PACKET_HANDLER
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Control_Packet_Handler_Status @ 0x000003FF30 [32 wtc] "Status of control packet handling"
+  3       Tlast_Error                  wtc  "Sticky bit"
+  2       SLVERR_On_Access             wtc  "Sticky bit"
+  1       Second_Header_Parity_Error   wtc  "Sticky bit"
+  0       First_Header_Parity_Error    wtc  "Sticky bit"

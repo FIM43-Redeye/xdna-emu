@@ -1,0 +1,11 @@
+# CORE_MODULE / ENABLE_EVENTS
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Enable_Events @ 0x0000032008 [32 mixed] "Set reset event trigger"
+  15      Disable_Event_occurred       wtc  "Latched status. 1=AI Engine was disabled by event"
+  14:8    Disable_Event                rw  "Event No to disable AI Engine"
+  7       Enable_Event_occurred        wtc  "Latched status. 1=AI Engine was enabled by event"
+  6:0     Enable_Event                 rw  "Event No to enable AI Engine"

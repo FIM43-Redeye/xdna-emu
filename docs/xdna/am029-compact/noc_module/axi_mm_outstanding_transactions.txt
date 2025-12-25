@@ -1,0 +1,8 @@
+# NOC_MODULE / AXI_MM_OUTSTANDING_TRANSACTIONS
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+AXI_MM_Outstanding_Transactions @ 0x0000002120 [32 ro] "AXI-MM outstanding transactions monitor"
+  0       NoC_Module_To_NMU            ro  "1=at least one outstanding read and/or write transaction from NoC Module to NMU"

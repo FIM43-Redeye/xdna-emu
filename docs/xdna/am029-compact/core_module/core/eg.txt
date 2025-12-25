@@ -1,0 +1,53 @@
+# CORE_MODULE / CORE/EG
+# 12 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Core_EG0 @ 0x0000032600 [128 rw] "Combined exponent register EG0"
+  127:64  G0                           rw  "Register Value G0"
+  63:0    E0                           rw  "Register Value E0"
+
+Core_EG1 @ 0x0000032610 [128 rw] "Combined exponent register EG1"
+  127:64  G1                           rw  "Register Value G1"
+  63:0    E1                           rw  "Register Value E1"
+
+Core_EG2 @ 0x0000032620 [128 rw] "Combined exponent register EG2"
+  127:64  G2                           rw  "Register Value G2"
+  63:0    E2                           rw  "Register Value E2"
+
+Core_EG3 @ 0x0000032630 [128 rw] "Combined exponent register EG3"
+  127:64  G3                           rw  "Register Value G3"
+  63:0    E3                           rw  "Register Value E3"
+
+Core_EG4 @ 0x0000032640 [128 rw] "Combined exponent register EG4"
+  127:64  G4                           rw  "Register Value G4"
+  63:0    E4                           rw  "Register Value E4"
+
+Core_EG5 @ 0x0000032650 [128 rw] "Combined exponent register EG5"
+  127:64  G5                           rw  "Register Value G5"
+  63:0    E5                           rw  "Register Value E5"
+
+Core_EG6 @ 0x0000032660 [128 rw] "Combined exponent register EG6"
+  127:64  G6                           rw  "Register Value G6"
+  63:0    E6                           rw  "Register Value E6"
+
+Core_EG7 @ 0x0000032670 [128 rw] "Combined exponent register EG7"
+  127:64  G7                           rw  "Register Value G7"
+  63:0    E7                           rw  "Register Value E7"
+
+Core_EG8 @ 0x0000032680 [128 rw] "Combined exponent register EG8"
+  127:64  G8                           rw  "Register Value G8"
+  63:0    E8                           rw  "Register Value E8"
+
+Core_EG9 @ 0x0000032690 [128 rw] "Combined exponent register EG9"
+  127:64  G9                           rw  "Register Value G9"
+  63:0    E9                           rw  "Register Value E9"
+
+Core_EG10 @ 0x00000326A0 [128 rw] "Combined exponent register EG10"
+  127:64  G10                          rw  "Register Value G10"
+  63:0    E10                          rw  "Register Value E10"
+
+Core_EG11 @ 0x00000326B0 [128 rw] "Combined exponent register EG11"
+  127:64  G11                          rw  "Register Value G11"
+  63:0    E11                          rw  "Register Value E11"

@@ -1,0 +1,21 @@
+# CORE_MODULE / PC_EVENT
+# 4 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+PC_Event0 @ 0x0000032020 [32 rw] "PC_Event0"
+  31      Valid                        rw  "If this PC event is active"
+  13:0    PC_Address                   rw  "PC event on this Instruction Address"
+
+PC_Event1 @ 0x0000032024 [32 rw] "PC_Event1"
+  31      Valid                        rw  "If this PC event is active"
+  13:0    PC_Address                   rw  "PC event on this Instruction Address"
+
+PC_Event2 @ 0x0000032028 [32 rw] "PC_Event2"
+  31      Valid                        rw  "If this PC event is active"
+  13:0    PC_Address                   rw  "PC event on this Instruction Address"
+
+PC_Event3 @ 0x000003202C [32 rw] "PC_Event3"
+  31      Valid                        rw  "If this PC event is active"
+  13:0    PC_Address                   rw  "PC event on this Instruction Address"

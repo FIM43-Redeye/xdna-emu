@@ -1,0 +1,8 @@
+# NOC_MODULE / SMID
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+SMID @ 0x0000003000 [32 rw] "SMID bits (privileged)"
+  9:0     SMID                         rw  "SMID bits (drive bits [9:0] of AxUSER)"

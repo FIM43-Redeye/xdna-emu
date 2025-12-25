@@ -1,0 +1,21 @@
+# CORE_MODULE / DEBUG/CONTROL
+# 3 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Debug_Control0 @ 0x0000038010 [32 rw] "Debug control of manual debug stall and single step count"
+  5:2     Single_Step_Count            rw  "Number of instruction to single-step"
+  0       Debug_Halt_Bit               rw  "Manual Debug stall and unstall"
+
+Debug_Control1 @ 0x0000038014 [32 rw] "Debug Halt Event Control"
+  30:24   Debug_Halt_Core_Event1       rw  "Event No to Halt the AI Engine"
+  22:16   Debug_Halt_Core_Event0       rw  "Event No to Halt the AI Engine"
+  14:8    Debug_SingleStep_Core_Event  rw  "Event No to Single-Step the AI Engine"
+  6:0     Debug_Resume_Core_Event      rw  "Event No to resume AI Engine execution after debug halt"
+
+Debug_Control2 @ 0x0000038018 [32 rw] "Debug Halt Control"
+  3       Stream_Stall_Halt            rw  "Debug Halt AI Engine when a stream stall occurs"
+  2       Lock_Stall_Halt              rw  "Debug Halt AI Engine when a lock stall occurs"
+  1       Memory_Stall_Halt            rw  "Debug Halt AI Engine when a memory stall occurs (from DM or TM (processor-bus))"
+  0       PC_Event_Halt                rw  "Debug halt AI Engine when 1 of 4 PC Events addresses are hit"

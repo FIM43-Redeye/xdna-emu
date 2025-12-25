@@ -1,0 +1,35 @@
+# MEMORY_TILE_MODULE / DMA/MM2S_START_QUEUE
+# 6 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+DMA_MM2S_0_Start_Queue @ 0x00000A0634 [32 wo] "DMA Control Register MM2S Ch0 start BD"
+  31      Enable_Token_Issue           wo  "Issue a token when this task is complete"
+  23:16   Repeat_Count                 wo  "Repeat this task this many times (actual-1); Range [1:256]"
+  5:0     Start_BD_ID                  wo  "First BD for this task (in-order-mode only); BD ID [0-23] only"
+
+DMA_MM2S_1_Start_Queue @ 0x00000A063C [32 wo] "DMA Control Register MM2S Ch1 start BD"
+  31      Enable_Token_Issue           wo  "Issue a token when this task is complete"
+  23:16   Repeat_Count                 wo  "Repeat this task this many times (actual-1); Range [1:256]"
+  5:0     Start_BD_ID                  wo  "First BD for this task (in-order-mode only); BD ID [24-47] only"
+
+DMA_MM2S_2_Start_Queue @ 0x00000A0644 [32 wo] "DMA Control Register MM2S Ch2 start BD"
+  31      Enable_Token_Issue           wo  "Issue a token when this task is complete"
+  23:16   Repeat_Count                 wo  "Repeat this task this many times (actual-1); Range [1:256]"
+  5:0     Start_BD_ID                  wo  "First BD for this task (in-order-mode only); BD ID [0-23] only"
+
+DMA_MM2S_3_Start_Queue @ 0x00000A064C [32 wo] "DMA Control Register MM2S Ch3 start BD"
+  31      Enable_Token_Issue           wo  "Issue a token when this task is complete"
+  23:16   Repeat_Count                 wo  "Repeat this task this many times (actual-1); Range [1:256]"
+  5:0     Start_BD_ID                  wo  "First BD for this task (in-order-mode only); BD ID [24-47] only"
+
+DMA_MM2S_4_Start_Queue @ 0x00000A0654 [32 wo] "DMA Control Register MM2S Ch4 start BD"
+  31      Enable_Token_Issue           wo  "Issue a token when this task is complete"
+  23:16   Repeat_Count                 wo  "Repeat this task this many times (actual-1); Range [1:256]"
+  5:0     Start_BD_ID                  wo  "First BD for this task (in-order-mode only); BD ID [0-23] only"
+
+DMA_MM2S_5_Start_Queue @ 0x00000A065C [32 wo] "DMA Control Register MM2S Ch5 start BD"
+  31      Enable_Token_Issue           wo  "Issue a token when this task is complete"
+  23:16   Repeat_Count                 wo  "Repeat this task this many times (actual-1); Range [1:256]"
+  5:0     Start_BD_ID                  wo  "First BD for this task (in-order-mode only); BD ID [24-47] only"

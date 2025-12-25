@@ -1,0 +1,41 @@
+# CORE_MODULE / CORE/F
+# 12 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Core_F0 @ 0x0000032700 [128 rw] "Mantissa msb register F0"
+  127:0   Register_Value               rw  "Register Value"
+
+Core_F1 @ 0x0000032710 [128 rw] "Mantissa msb register F1"
+  127:0   Register_Value               rw  "Register Value"
+
+Core_F2 @ 0x0000032720 [128 rw] "Mantissa msb register F2"
+  127:0   Register_Value               rw  "Register Value"
+
+Core_F3 @ 0x0000032730 [128 rw] "Mantissa msb register F3"
+  127:0   Register_Value               rw  "Register Value"
+
+Core_F4 @ 0x0000032740 [128 rw] "Mantissa msb register F4"
+  127:0   Register_Value               rw  "Register Value"
+
+Core_F5 @ 0x0000032750 [128 rw] "Mantissa msb register F5"
+  127:0   Register_Value               rw  "Register Value"
+
+Core_F6 @ 0x0000032760 [128 rw] "Mantissa msb register F6"
+  127:0   Register_Value               rw  "Register Value"
+
+Core_F7 @ 0x0000032770 [128 rw] "Mantissa msb register F7"
+  127:0   Register_Value               rw  "Register Value"
+
+Core_F8 @ 0x0000032780 [128 rw] "Mantissa msb register F8"
+  127:0   Register_Value               rw  "Register Value"
+
+Core_F9 @ 0x0000032790 [128 rw] "Mantissa msb register F9"
+  127:0   Register_Value               rw  "Register Value"
+
+Core_F10 @ 0x00000327A0 [128 rw] "Mantissa msb register F10"
+  127:0   Register_Value               rw  "Register Value"
+
+Core_F11 @ 0x00000327B0 [128 rw] "Mantissa msb register F11"
+  127:0   Register_Value               rw  "Register Value"

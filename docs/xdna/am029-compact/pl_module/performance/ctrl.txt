@@ -1,0 +1,35 @@
+# PL_MODULE / PERFORMANCE/CTRL
+# 6 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Performance_Ctrl0 @ 0x0000031000 [32 rw] "Performance Counters 1-0 Start and Stop Event"
+  31:24   Cnt1_Stop_Event              rw  "Event No to Stop Counter1"
+  23:16   Cnt1_Start_Event             rw  "Event No to Start Counter1"
+  15:8    Cnt0_Stop_Event              rw  "Event No to Stop Counter0"
+  7:0     Cnt0_Start_Event             rw  "Event No to Start Counter0"
+
+Performance_Ctrl1 @ 0x0000031008 [32 rw reset=7:0] "Performance Counters 1-0 Reset Events"
+  15:8    Cnt1_Reset_Event             rw  "Event No to Reset Counter1"
+  7:0     Cnt0_Reset_Event             rw  "Event No to Reset Counter0"
+
+Performance_Ctrl2 @ 0x000003100C [32 rw] "Performance Counters 3-2 Start and Stop Event"
+  31:24   Cnt3_Stop_Event              rw  "Event No to Stop Counter3"
+  23:16   Cnt3_Start_Event             rw  "Event No to Start Counter3"
+  15:8    Cnt2_Stop_Event              rw  "Event No to Stop Counter2"
+  7:0     Cnt2_Start_Event             rw  "Event No to Start Counter2"
+
+Performance_Ctrl3 @ 0x0000031010 [32 rw reset=7:0] "Performance Counters 3-2 Reset Events"
+  15:8    Cnt3_Reset_Event             rw  "Event No to Reset Counter3"
+  7:0     Cnt2_Reset_Event             rw  "Event No to Reset Counter2"
+
+Performance_Ctrl4 @ 0x0000031014 [32 rw] "Performance Counters 5-4 Start and Stop Event"
+  31:24   Cnt5_Stop_Event              rw  "Event No to Stop Counter5"
+  23:16   Cnt5_Start_Event             rw  "Event No to Start Counter5"
+  15:8    Cnt4_Stop_Event              rw  "Event No to Stop Counter4"
+  7:0     Cnt4_Start_Event             rw  "Event No to Start Counter4"
+
+Performance_Ctrl5 @ 0x0000031018 [32 rw reset=7:0] "Performance Counters 5-4 Reset Events"
+  15:8    Cnt5_Reset_Event             rw  "Event No to Reset Counter5"
+  7:0     Cnt4_Reset_Event             rw  "Event No to Reset Counter4"

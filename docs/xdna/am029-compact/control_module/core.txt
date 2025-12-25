@@ -1,0 +1,23 @@
+# CONTROL_MODULE / CORE
+# 5 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Core_Program_Memory @ 0x0000080000 [32 rw] "uC-Core Program Memory (uC-PM) (32 kbyte)"
+  31:0    _                            rw  "Instruction Word"
+
+Core_Private_Data_Memory @ 0x0000088000 [32 rw] "uC-Core private Data Memory (uC-private-DM) (16 kbyte)"
+  31:0    _                            rw  "Data Word"
+
+Core_Status @ 0x00000C0000 [32 ro reset=0x00000001] "uC-Core status bits"
+  1       Interrupt                    ro  "The uC-Core has a pending interrupt"
+  0       Sleep                        ro  "1=uC-Core is in sleep; 0=uC-Core is not in sleep"
+
+Core_Control @ 0x00000C0004 [32 wo] "uC-Core control bits"
+  1       Go_To_Sleep                  wo  "1: Put the uC-Core to sleep; 0: no effect"
+  0       Wakeup                       wo  "1: Wake up the uC-Core; 0: no effect"
+
+Core_Interrupt_Status @ 0x00000C0008 [32 wtc] "uC-Core external interrupts sticky bits"
+  1       Event_Action                 wtc  "Sticky bit for the uC_Core_Interrupt_Event event action interrupt"
+  0       Go_To_Sleep                  wtc  "Sticky bit for the Go_To_Sleep interrupt"

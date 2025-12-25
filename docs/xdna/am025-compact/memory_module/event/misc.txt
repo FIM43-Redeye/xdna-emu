@@ -1,0 +1,8 @@
+# MEMORY_MODULE / EVENT/MISC
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Event_Generate @ 0x0000014008 [32 wo] "Generate an internal event"
+  6:0     Event                        wo  "Which internal Event No to generate"

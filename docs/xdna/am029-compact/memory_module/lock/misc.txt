@@ -1,0 +1,8 @@
+# MEMORY_MODULE / LOCK/MISC
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Lock_Request @ 0x0000040000 [32 ro] "Lock Request. 16kB address space: 0x40000 - 0x43FFC, Lock_Id [13:10], Acq_Rel (9), Change_Value [8:2]"
+  0       Request_Result               ro  "Request result. 0=request failed; 1=request succeeded"

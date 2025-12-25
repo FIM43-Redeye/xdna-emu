@@ -1,0 +1,1 @@
+The PDFs are horribly difficult for AIs to read and figures are useless to AI.

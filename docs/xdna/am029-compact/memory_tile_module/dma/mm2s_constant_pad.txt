@@ -1,0 +1,23 @@
+# MEMORY_TILE_MODULE / DMA/MM2S_CONSTANT_PAD
+# 6 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+DMA_MM2S_0_Constant_Pad_Value @ 0x00000A06E0 [32 rw] "DMA MM2S 0 Constant Pad Value"
+  31:0    Constant_Pad_Value           rw  "32-bit value to insert onto stream when performing constant padding"
+
+DMA_MM2S_1_Constant_Pad_Value @ 0x00000A06E4 [32 rw] "DMA MM2S 1 Constant Pad Value"
+  31:0    Constant_Pad_Value           rw  "32-bit value to insert onto stream when performing constant padding"
+
+DMA_MM2S_2_Constant_Pad_Value @ 0x00000A06E8 [32 rw] "DMA MM2S 2 Constant Pad Value"
+  31:0    Constant_Pad_Value           rw  "32-bit value to insert onto stream when performing constant padding"
+
+DMA_MM2S_3_Constant_Pad_Value @ 0x00000A06EC [32 rw] "DMA MM2S 3 Constant Pad Value"
+  31:0    Constant_Pad_Value           rw  "32-bit value to insert onto stream when performing constant padding"
+
+DMA_MM2S_4_Constant_Pad_Value @ 0x00000A06F0 [32 rw] "DMA MM2S 4 Constant Pad Value"
+  31:0    Constant_Pad_Value           rw  "32-bit value to insert onto stream when performing constant padding"
+
+DMA_MM2S_5_Constant_Pad_Value @ 0x00000A06F4 [32 rw] "DMA MM2S 5 Constant Pad Value"
+  31:0    Constant_Pad_Value           rw  "32-bit value to insert onto stream when performing constant padding"

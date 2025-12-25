@@ -1,0 +1,17 @@
+# CORE_MODULE / CORE/Q
+# 4 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Core_Q0 @ 0x00000310C0 [128 rw] "Mask register Q0"
+  127:0   Register_Value               rw  "Register Value"
+
+Core_Q1 @ 0x00000310D0 [128 rw] "Mask register Q1"
+  127:0   Register_Value               rw  "Register Value"
+
+Core_Q2 @ 0x00000310E0 [128 rw] "Mask register Q2"
+  127:0   Register_Value               rw  "Register Value"
+
+Core_Q3 @ 0x00000310F0 [128 rw] "Mask register Q3"
+  127:0   Register_Value               rw  "Register Value"

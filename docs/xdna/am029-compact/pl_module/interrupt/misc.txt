@@ -1,0 +1,15 @@
+# PL_MODULE / INTERRUPT/MISC
+# 2 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Interrupt_controller_Hw_Error_mask @ 0x000007FF50 [32 rw] "Interrupt controller hardware errors mask (privileged)"
+  2       AXI_Errors                   rw  "Mask for AXI Errors (1=block raising interrupt_out)"
+  1       Hw_Correctable_Errors        rw  "Mask for Hw Correctable Errors (1=block raising interrupt_out)"
+  0       Hw_Uncorrectable_Errors      rw  "Mask for Hw Uncorrectable Errors (1=block raising interrupt_out)"
+
+Interrupt_controller_Hw_Error_status @ 0x000007FF54 [32 wtc] "Interrupt controller hardware errors status register (not affected by mask) (privileged)"
+  2       AXI_Errors                   wtc  "Sticky bit for AXI Errors. When this=1 and mask-bit=0, then drive interrupt_out level high"
+  1       Hw_Correctable_Errors        wtc  "Sticky bit for Hw Correctable Errors. When this=1 and mask-bit=0, then drive interrupt_out level high"
+  0       Hw_Uncorrectable_Errors      wtc  "Sticky bit for Hw Uncorrectable Errors. When this=1 and mask-bit=0, then drive interrupt_out level high"

@@ -1,0 +1,29 @@
+# MEMORY_TILE_MODULE / STREAM_SWITCH/DETERMINISTIC_MERGE_ARB_SLAVE
+# 4 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Stream_Switch_Deterministic_Merge_arb0_slave0_1 @ 0x00000B0800 [32 rw] "Stream Switch Deterministic Merge Arbiter:0 Slave:0,1"
+  29:24   Packet_Count_1               rw  "Number of packets from position 1"
+  20:16   Slave_ID_1                   rw  "Slave ID for position 1"
+  13:8    Packet_Count_0               rw  "Number of packets from position 0"
+  4:0     Slave_ID_0                   rw  "Slave ID for position 0"
+
+Stream_Switch_Deterministic_Merge_arb0_slave2_3 @ 0x00000B0804 [32 rw] "Stream Switch Deterministic Merge Arbiter:0 Slave:2,3"
+  29:24   Packet_Count_3               rw  "Number of packets from position 3"
+  20:16   Slave_ID_3                   rw  "Slave ID for position 3"
+  13:8    Packet_Count_2               rw  "Number of packets from position 2"
+  4:0     Slave_ID_2                   rw  "Slave ID for position 2"
+
+Stream_Switch_Deterministic_Merge_arb1_slave0_1 @ 0x00000B0810 [32 rw] "Stream Switch Deterministic Merge Arbiter:1 Slave:0,1"
+  29:24   Packet_Count_1               rw  "Number of packets from position 1"
+  20:16   Slave_ID_1                   rw  "Slave ID for position 1"
+  13:8    Packet_Count_0               rw  "Number of packets from position 0"
+  4:0     Slave_ID_0                   rw  "Slave ID for position 0"
+
+Stream_Switch_Deterministic_Merge_arb1_slave2_3 @ 0x00000B0814 [32 rw] "Stream Switch Deterministic Merge Arbiter:1 Slave:2,3"
+  29:24   Packet_Count_3               rw  "Number of packets from position 3"
+  20:16   Slave_ID_3                   rw  "Slave ID for position 3"
+  13:8    Packet_Count_2               rw  "Number of packets from position 2"
+  4:0     Slave_ID_2                   rw  "Slave ID for position 2"

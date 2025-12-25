@@ -1,0 +1,59 @@
+# CORE_MODULE / CORE/AMLH_PART
+# 18 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Core_AMLH0_Part1 @ 0x0000030020 [128 rw] "Accumulator AMLH0 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of accumulator register"
+
+Core_AMLH0_Part2 @ 0x0000030030 [128 rw] "Accumulator AMLH0 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of accumulator register"
+
+Core_AMLH1_Part1 @ 0x00000300A0 [128 rw] "Accumulator AMLH1 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of accumulator register"
+
+Core_AMLH1_Part2 @ 0x00000300B0 [128 rw] "Accumulator AMLH1 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of accumulator register"
+
+Core_AMLH2_Part1 @ 0x0000030120 [128 rw] "Accumulator AMLH2 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of accumulator register"
+
+Core_AMLH2_Part2 @ 0x0000030130 [128 rw] "Accumulator AMLH2 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of accumulator register"
+
+Core_AMLH3_Part1 @ 0x00000301A0 [128 rw] "Accumulator AMLH3 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of accumulator register"
+
+Core_AMLH3_Part2 @ 0x00000301B0 [128 rw] "Accumulator AMLH3 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of accumulator register"
+
+Core_AMLH4_Part1 @ 0x0000030220 [128 rw] "Accumulator AMLH4 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of accumulator register"
+
+Core_AMLH4_Part2 @ 0x0000030230 [128 rw] "Accumulator AMLH4 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of accumulator register"
+
+Core_AMLH5_Part1 @ 0x00000302A0 [128 rw] "Accumulator AMLH5 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of accumulator register"
+
+Core_AMLH5_Part2 @ 0x00000302B0 [128 rw] "Accumulator AMLH5 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of accumulator register"
+
+Core_AMLH6_Part1 @ 0x0000030320 [128 rw] "Accumulator AMLH6 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of accumulator register"
+
+Core_AMLH6_Part2 @ 0x0000030330 [128 rw] "Accumulator AMLH6 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of accumulator register"
+
+Core_AMLH7_Part1 @ 0x00000303A0 [128 rw] "Accumulator AMLH7 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of accumulator register"
+
+Core_AMLH7_Part2 @ 0x00000303B0 [128 rw] "Accumulator AMLH7 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of accumulator register"
+
+Core_AMLH8_Part1 @ 0x0000030420 [128 rw] "Accumulator AMLH8 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of accumulator register"
+
+Core_AMLH8_Part2 @ 0x0000030430 [128 rw] "Accumulator AMLH8 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of accumulator register"

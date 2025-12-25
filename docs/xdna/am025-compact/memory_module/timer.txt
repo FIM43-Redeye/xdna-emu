@@ -1,0 +1,21 @@
+# MEMORY_MODULE / TIMER
+# 5 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Timer_Control @ 0x0000014000 [32 mixed reset=14:8] "Control of Internal Timer"
+  31      Reset                        wo  "Reset Timer by writing 1"
+  14:8    Reset_Event                  rw  "Event No that will reset Internal Timer"
+
+Timer_Trig_Event_Low_Value @ 0x00000140F0 [32 rw reset=0xFFFFFFFF] "Internal Timer Event Value."
+  31:0    TimerTrigLow                 rw  "When the Internal Timer reach this value, an event will be generated"
+
+Timer_Trig_Event_High_Value @ 0x00000140F4 [32 rw reset=0xFFFFFFFF] "Internal Timer Event Value."
+  31:0    TimerTrigHigh                rw  "When the Internal Timer reach this value, an event will be generated"
+
+Timer_Low @ 0x00000140F8 [32 ro] "Internal Timer Low part Value."
+  31:0    TimerLow                     ro  "Lower 32-bit from the timer"
+
+Timer_High @ 0x00000140FC [32 ro] "Internal Timer High part Value."
+  31:0    TimerHigh                    ro  "Upper 32-bit from the timer"

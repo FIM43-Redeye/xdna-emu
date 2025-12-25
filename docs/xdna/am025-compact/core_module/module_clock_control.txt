@@ -1,0 +1,12 @@
+# CORE_MODULE / MODULE_CLOCK_CONTROL
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Module_Clock_Control @ 0x0000060000 [32 rw reset=0x00000037] "Control clock gating of modules (privileged)"
+  5       DMA_Adaptive_Clock_Gate      rw  "Enable adaptive clock gate in DMA when it is idle"
+  4       Stream_Switch_Adaptive_Clock_Gate rw  "Enable adaptive clock gate in stream switch when it has been idle for X cycles"
+  2       Core_Module_Clock_Enable     rw  "Enable the clock to Core Module"
+  1       Memory_Module_Clock_Enable   rw  "Enable the clock to Memory Module"
+  0       Stream_Switch_Clock_Enable   rw  "Enable the clock to Stream Switch"

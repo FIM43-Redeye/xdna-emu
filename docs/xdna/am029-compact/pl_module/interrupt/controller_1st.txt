@@ -1,0 +1,65 @@
+# PL_MODULE / INTERRUPT/CONTROLLER_1ST
+# 18 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Interrupt_controller_1st_level_mask_A @ 0x0000035000 [32 ro] "Interrupt controller 1st level mask (IMR_A)"
+  19:0    IRQ_Mask_A                   ro  "Current value of the mask (IMR_A)"
+
+Interrupt_controller_1st_level_enable_A @ 0x0000035004 [32 wo] "Interrupt controller 1st level enable interrupt (IER_A)"
+  19:0    Enable_A                     wo  "Enable individual interrupts by setting bits in the mask value (IMR_A)"
+
+Interrupt_controller_1st_level_disable_A @ 0x0000035008 [32 wo] "Interrupt controller 1st level disable interrupt (IDR_A)"
+  19:0    Disable_A                    wo  "Disable individual interrupts by clearing bits in the mask value (IMR_A)"
+
+Interrupt_controller_1st_level_status_A @ 0x000003500C [32 wtc] "Interrupt controller 1st level status register (ISR_A)"
+  19:0    Status_A                     wtc  "Sticky bit for each interrupt source"
+
+Interrupt_controller_1st_level_irq_no_A @ 0x0000035010 [32 rw] "Interrupt controller 1st level broadcast number"
+  3:0     Irq_no_A                     rw  "Which broadcast event signal the interrupt shall be driven to"
+
+Interrupt_controller_1st_level_irq_event_A @ 0x0000035014 [32 rw] "Interrupt controller 1st level broadcast number"
+  31:24   IRQ_Event3                   rw  "Internal Event No that can cause IRQ19"
+  23:16   IRQ_Event2                   rw  "Internal Event No that can cause IRQ18"
+  15:8    IRQ_Event1                   rw  "Internal Event No that can cause IRQ17"
+  7:0     IRQ_Event0                   rw  "Internal Event No that can cause IRQ16"
+
+Interrupt_controller_1st_level_block_north_in_A_set @ 0x0000035018 [32 wo] "Set interrupt controller 1st level block north in A"
+  15:0    Set                          wo  "Set block"
+
+Interrupt_controller_1st_level_block_north_in_A_clear @ 0x000003501C [32 wo] "Clear interrupt controller 1st level block north in A"
+  15:0    Clear                        wo  "Clear block"
+
+Interrupt_controller_1st_level_block_north_in_A_value @ 0x0000035020 [32 ro] "Interrupt controller 1st level block value for north in A"
+  15:0    Value                        ro  "Current value of block"
+
+Interrupt_controller_1st_level_mask_B @ 0x0000035030 [32 ro] "Interrupt controller 1st level mask (IMR_B)"
+  19:0    IRQ_Mask_B                   ro  "Current value of the mask (IMR_B)"
+
+Interrupt_controller_1st_level_enable_B @ 0x0000035034 [32 wo] "Interrupt controller 1st level enable interrupt (IER_B)"
+  19:0    Enable_B                     wo  "Enable individual interrupts by setting bits in the mask value (IMR_B)"
+
+Interrupt_controller_1st_level_disable_B @ 0x0000035038 [32 wo] "Interrupt controller 1st level disable interrupt (IDR_B)"
+  19:0    Disable_B                    wo  "Disable individual interrupts by clearing bits in the mask value (IMR_B)"
+
+Interrupt_controller_1st_level_status_B @ 0x000003503C [32 wtc] "Interrupt controller 1st level status register (ISR_B)"
+  19:0    Status_B                     wtc  "Sticky bit for each interrupt source"
+
+Interrupt_controller_1st_level_irq_no_B @ 0x0000035040 [32 rw] "Interrupt controller 1st level broadcast number"
+  3:0     Irq_no_B                     rw  "Which broadcast event signal the interrupt shall be driven to"
+
+Interrupt_controller_1st_level_irq_event_B @ 0x0000035044 [32 rw] "Interrupt controller 1st level broadcast number"
+  31:24   IRQ_Event3                   rw  "Internal Event No that can cause IRQ19"
+  23:16   IRQ_Event2                   rw  "Internal Event No that can cause IRQ18"
+  15:8    IRQ_Event1                   rw  "Internal Event No that can cause IRQ17"
+  7:0     IRQ_Event0                   rw  "Internal Event No that can cause IRQ16"
+
+Interrupt_controller_1st_level_block_north_in_B_set @ 0x0000035048 [32 wo] "Set interrupt controller 1st level block north in B"
+  15:0    Set                          wo  "Set block"
+
+Interrupt_controller_1st_level_block_north_in_B_clear @ 0x000003504C [32 wo] "Clear interrupt controller 1st level block north in B"
+  15:0    Clear                        wo  "Disable block"
+
+Interrupt_controller_1st_level_block_north_in_B_value @ 0x0000035050 [32 ro] "Interrupt controller 1st level block value for north in B"
+  15:0    Value                        ro  "Current value of block"

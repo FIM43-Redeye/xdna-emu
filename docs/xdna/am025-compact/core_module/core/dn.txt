@@ -1,0 +1,29 @@
+# CORE_MODULE / CORE/DN
+# 8 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Core_DN0 @ 0x0000030E80 [32 rw] "Size register DN0"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DN1 @ 0x0000030E90 [32 rw] "Size register DN1"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DN2 @ 0x0000030EA0 [32 rw] "Size register DN2"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DN3 @ 0x0000030EB0 [32 rw] "Size register DN3"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DN4 @ 0x0000030EC0 [32 rw] "Size register DN4"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DN5 @ 0x0000030ED0 [32 rw] "Size register DN5"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DN6 @ 0x0000030EE0 [32 rw] "Size register DN6"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_DN7 @ 0x0000030EF0 [32 rw] "Size register DN7"
+  19:0    Register_Value               rw  "Register Value"

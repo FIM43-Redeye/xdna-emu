@@ -1,0 +1,47 @@
+# CONTROL_MODULE / DMA
+# 7 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+DMA_DM2MM_Status @ 0x00000C0100 [32 ro] "MM2DM DMA Status"
+  20:16   Response_Queue_Size          ro  "Number of completed tasks that have not yet been handled by the uC-Core. Range: [0, 16]"
+  12:8    Task_Queue_Size              ro  "Number of outstanding tasks, including the one that is currently active. A task is popped once all the AXI-MM requests have been sent. Range: [0, 16]"
+  6       Task_Queue_Overflow          ro  "Attempt to write to full task queue: at least one task enqueue has been dropped. Channel reset required to clear this bit."
+  5       Error_ECC_DED                ro  "ECC DED on data loaded from uC-DM (DM2MM: BD or data, MM2DM: BD only). Channel requires a reset to proceed."
+  4       AXI_MM_DECERR                ro  "Channel received a decode error response on AXI-MM interface. Channel requires a reset to proceed."
+  3       AXI_MM_SLVERR                ro  "Channel received a slave error response on AXI-MM interface. Channel requires a reset to proceed."
+  2       Error_Local_address_out_of_range ro  "Load/store to uC-DM while processing a BD failed due to address out of range. Channel requires a reset to proceed."
+  1       Error_BD_Invalid             ro  "Issue loading BD (BD address enqueued is out of uC-DM range). Channel requires a reset to proceed."
+  0       Running                      ro  "Indicates if the channel is active. 0 = no tasks in task queue and no outstanding transactions; 1 = there are tasks in the queue and/or outstanding transactions"
+
+DMA_DM2MM_Control @ 0x00000C0104 [32 rw reset=0] "MM2DM DMA Control"
+  0       Reset                        rw  "Reset DMA channel and request and response queues. Ignored until all outstanding responses are returned, then reset applied."
+
+DMA_DM2MM_AXI_Control @ 0x00000C0108 [32 rw] "MM2DM DMA External AXI Control"
+  9:8     Burst_Length                 rw  "Defines the burst length for external AXI-MM requests. Encoding is:(00): BLEN=4 (64B)(01): BLEN=8 (128B)(10): BLEN=16 (256B)(11): BLEN=32 (512B)"
+  7:4     AxCACHE                      rw  "AxCACHE bits for external AXI-MM requests."
+  3:0     AxQOS                        rw  "AxQOS bits for external AXI-MM requests."
+
+DMA_MM2DM_Status @ 0x00000C0110 [32 ro] "DM2MM DMA Status"
+  20:16   Response_Queue_Size          ro  "Number of completed tasks that have not yet been handled by the uC-Core. Range: [0, 16]"
+  12:8    Task_Queue_Size              ro  "Number of outstanding tasks, including the one that is currently active. A task is popped once all the AXI-MM requests have been sent. Range: [0, 16]"
+  6       Task_Queue_Overflow          ro  "Attempt to write to full task queue: at least one task enqueue has been dropped. Channel reset required to clear this bit."
+  5       Error_ECC_DED                ro  "ECC DED on data loaded from uC-DM (DM2MM: BD or data, MM2DM: BD only). Channel requires a reset to proceed."
+  4       AXI_MM_DECERR                ro  "Channel received a decode error response on AXI-MM interface. Channel requires a reset to proceed."
+  3       AXI_MM_SLVERR                ro  "Channel received a slave error response on AXI-MM interface. Channel requires a reset to proceed."
+  2       Error_Local_address_out_of_range ro  "Load/store to uC-DM while processing a BD failed due to address out of range. Channel requires a reset to proceed."
+  1       Error_BD_Invalid             ro  "Issue loading BD (BD address enqueued is out of uC-DM range). Channel requires a reset to proceed."
+  0       Running                      ro  "Indicates if the channel is active. 0 = no tasks in task queue and no outstanding transactions; 1 = there are tasks in the queue and/or outstanding transactions"
+
+DMA_MM2DM_Control @ 0x00000C0114 [32 rw reset=0] "DM2MM DMA Control"
+  0       Reset                        rw  "Reset DMA channel and request and response queues. Ignored until all outstanding responses are returned, then reset applied."
+
+DMA_MM2DM_AXI_Control @ 0x00000C0118 [32 rw] "DM2MM DMA External AXI Control"
+  9:8     Burst_Length                 rw  "Defines the burst length for external AXI-MM requests. Encoding is:(00): BLEN=4 (64B)(01): BLEN=8 (128B)(10): BLEN=16 (256B)(11): BLEN=32 (512B)"
+  7:4     AxCACHE                      rw  "AxCACHE bits for external AXI-MM requests."
+  3:0     AxQOS                        rw  "AxQOS bits for external AXI-MM requests."
+
+DMA_Pause @ 0x00000C0120 [32 rw] "DMA Pause (privileged)"
+  1       MM2DM                        rw  "When set, pauses the issuing of new AXI-MM commands on MM2DM"
+  0       DM2MM                        rw  "When set, pauses the issuing of new AXI-MM commands on DM2MM"

@@ -1,0 +1,16 @@
+# MEMORY_TILE_MODULE / COMBO_EVENT
+# 2 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Combo_event_inputs @ 0x0000094400 [32 rw] "Combo events input events"
+  31:24   eventD                       rw  "Input event D"
+  23:16   eventC                       rw  "Input event C"
+  15:8    eventB                       rw  "Input event B"
+  7:0     eventA                       rw  "Input event A"
+
+Combo_event_control @ 0x0000094404 [32 rw] "Combo events input events"
+  17:16   combo2                       rw  "Control bits for combo 2 (0: Combo0 and Combo1, 1: C0 and not C1, 2: C0 or C1, 3: C0 or not C1)"
+  9:8     combo1                       rw  "Control bits for combo 1 (0: C and D, 1: C and not D, 2: C or D, 3: C or not D)"
+  1:0     combo0                       rw  "Control bits for combo 0 (0: A and B, 1: A and not B, 2: A or B, 3: A or not B)"

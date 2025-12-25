@@ -1,0 +1,8 @@
+# MEMORY_TILE_MODULE / DATAMEMORY
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+DataMemory @ 0x0000000000 [256 rw] "DataMemory of 8 banks, 256-bit wide, 512KiB"
+  255:0   Data                         rw  "DataMemory of 8 banks, 256-bit wide, 512KiB"

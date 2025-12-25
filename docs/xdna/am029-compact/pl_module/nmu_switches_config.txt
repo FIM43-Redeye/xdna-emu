@@ -1,0 +1,9 @@
+# PL_MODULE / NMU_SWITCHES_CONFIG
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+NMU_Switches_Config @ 0x000007FF48 [32 rw] "Configuration of switches between uC/NoC modules and NMUs (privileged)"
+  1       NMU_1                        rw  "0=Local NMU 1 connected to local NoC Module 1; 1=Local NMU 1 connected to uC-Module and NoC Module 0 from west neighbour (Set this field to 1 in column 1)"
+  0       NMU_0                        rw  "0=Local uC-Module and NoC Module 0 connected to local NMU 0; 1=Connection from local uC-Module and NoC Module 0 forwarded to east neighbour (Set this field to 1 in column 0)"

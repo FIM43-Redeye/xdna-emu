@@ -1,0 +1,17 @@
+# NOC_MODULE / NOC_INTERFACE_AIE_TO
+# 4 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+NoC_Interface_AIE_to_NoC_South2 @ 0x000001E008 [32 rw] "Configure NoC stream parameters for output South2"
+  9:0     Tdest                        rw  "Tdest"
+
+NoC_Interface_AIE_to_NoC_South3 @ 0x000001E00C [32 rw] "Configure NoC stream parameters for output South3"
+  9:0     Tdest                        rw  "Tdest"
+
+NoC_Interface_AIE_to_NoC_South4 @ 0x000001E010 [32 rw] "Configure NoC stream parameters for output South4"
+  9:0     Tdest                        rw  "Tdest"
+
+NoC_Interface_AIE_to_NoC_South5 @ 0x000001E014 [32 rw] "Configure NoC stream parameters for output South5"
+  9:0     Tdest                        rw  "Tdest"

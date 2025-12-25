@@ -1,0 +1,15 @@
+# CONTROL_MODULE / MODULE
+# 3 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Module_AXI_MM_Outstanding_Transactions @ 0x00000C0024 [32 ro] "AXI-MM outstanding transactions monitors"
+  1       uC_Module_To_Array           ro  "1=at least one outstanding read and/or write transaction from uC-Module to the array"
+  0       uC_DMA_To_NMU                ro  "1=at least one outstanding read and/or write transaction from uC-DMA to NMU"
+
+Module_Data_Memory @ 0x00000D0000 [128 rw] "Data memory shared between uC-Core and uC-DMAs (uC-DM) (32 kbyte)"
+  127:0   _                            rw  "Data Word"
+
+Module_AXIMM_Offset @ 31:0 [32 rw] "AXI-MM address offset"
+  31:0    AXIMM_Offset                 rw  "Offset added to the address of all AXI-MM transactions from the uC-Core and uC-DMA to the array. Used to implement application relocatability. The only valid use-case is to set this register to multiples of 0x200_0000."

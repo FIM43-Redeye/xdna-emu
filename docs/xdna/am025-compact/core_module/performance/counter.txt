@@ -1,0 +1,17 @@
+# CORE_MODULE / PERFORMANCE/COUNTER
+# 4 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Performance_Counter0 @ 0x0000031520 [32 rw] "Performance Counter0"
+  31:0    Counter0_Value               rw  "Counter Value"
+
+Performance_Counter1 @ 0x0000031524 [32 rw] "Performance Counter1"
+  31:0    Counter0_Value               rw  "Counter Value"
+
+Performance_Counter2 @ 0x0000031528 [32 rw] "Performance Counter2"
+  31:0    Counter0_Value               rw  "Counter Value"
+
+Performance_Counter3 @ 0x000003152C [32 rw] "Performance Counter3"
+  31:0    Counter0_Value               rw  "Counter Value"

@@ -1,0 +1,29 @@
+# MEMORY_TILE_MODULE / STREAM_SWITCH/SLAVE_CONFIG_DMA
+# 6 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Stream_Switch_Slave_Config_DMA_0 @ 0x00000B0100 [32 rw] "Stream Switch Slave Configuration DMA 0"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_DMA_1 @ 0x00000B0104 [32 rw] "Stream Switch Slave Configuration DMA 1"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_DMA_2 @ 0x00000B0108 [32 rw] "Stream Switch Slave Configuration DMA 2"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_DMA_3 @ 0x00000B010C [32 rw] "Stream Switch Slave Configuration DMA 3"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_DMA_4 @ 0x00000B0110 [32 rw] "Stream Switch Slave Configuration DMA 4"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_DMA_5 @ 0x00000B0114 [32 rw] "Stream Switch Slave Configuration DMA 5"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"

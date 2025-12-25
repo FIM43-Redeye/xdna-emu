@@ -1,0 +1,11 @@
+# NOC_MODULE / AIE_AXIMM_CONFIG
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+AIE_AXIMM_Config @ 0x000001E020 [32 rw] "Configuration selection between AXIS and AXIMM on NoC Interface (privileged)"
+  3       DECERR_Block                 rw  "1: Block returning of DECERR when accessing non-existant tiles;"
+  2       SLVERR_Block                 rw  "1: Block returning of SLVERR when accessing unmapped registers;"
+  1       Slave_Sel                    rw  "0: Select AXIMM; 1: Select Streaming"
+  0       Master_Sel                   rw  "0: Select AXIMM; 1: Select Streaming"

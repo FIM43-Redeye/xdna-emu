@@ -1,0 +1,9 @@
+# PL_MODULE / MODULE_RESET_CONTROL
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Module_Reset_Control_1 @ 0x000007FF14 [32 rw reset=0] "Reset of modules (privileged)"
+  1       NoC_Module_1_Reset           rw  "Defeatured this generation, this field has no effect"
+  0       NoC_Module_0_Reset           rw  "Reset the NoC Module"

@@ -1,0 +1,23 @@
+# MEMORY_TILE_MODULE / DMA/S2MM_CURRENT_WRITE
+# 6 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+DMA_S2MM_Current_Write_Count_0 @ 0x00000A06B0 [32 ro] "DMA S2MM Current Write Count Ch0"
+  16:0    Current_Write_Count          ro  "Current count of 32-bit words processed by this channel in current transfer"
+
+DMA_S2MM_Current_Write_Count_1 @ 0x00000A06B4 [32 ro] "DMA S2MM Current Write Count Ch1"
+  16:0    Current_Write_Count          ro  "Current count of 32-bit words processed by this channel in current transfer"
+
+DMA_S2MM_Current_Write_Count_2 @ 0x00000A06B8 [32 ro] "DMA S2MM Current Write Count Ch2"
+  16:0    Current_Write_Count          ro  "Current count of 32-bit words processed by this channel in current transfer"
+
+DMA_S2MM_Current_Write_Count_3 @ 0x00000A06BC [32 ro] "DMA S2MM Current Write Count Ch3"
+  16:0    Current_Write_Count          ro  "Current count of 32-bit words processed by this channel in current transfer"
+
+DMA_S2MM_Current_Write_Count_4 @ 0x00000A06C0 [32 ro] "DMA S2MM Current Write Count Ch4"
+  16:0    Current_Write_Count          ro  "Current count of 32-bit words processed by this channel in current transfer"
+
+DMA_S2MM_Current_Write_Count_5 @ 0x00000A06C4 [32 ro] "DMA S2MM Current Write Count Ch5"
+  16:0    Current_Write_Count          ro  "Current count of 32-bit words processed by this channel in current transfer"

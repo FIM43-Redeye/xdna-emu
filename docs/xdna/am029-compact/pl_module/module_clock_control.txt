@@ -1,0 +1,20 @@
+# PL_MODULE / MODULE_CLOCK_CONTROL
+# 2 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Module_Clock_Control_0 @ 0x000007FF00 [32 rw reset=0x0000007F] "Control clock gating of modules (privileged)"
+  7       uController_SRAMs_Sleep      rw  "Enable sleep mode in uC-PM, uC-private-DM, uC-DM"
+  6       NoC_Module_1_DMA_Adaptive_Clock_Gate rw  "Defeatured this generation, this field has no effect."
+  5       NoC_Module_0_DMA_Adaptive_Clock_Gate rw  "Enable adaptive clock gate in NoC Module DMA when it is idle"
+  4       Ctrl_Pkt_Tlast_Error_Enable  rw  "Configure error on missing TLAST at the end of write control packets (read packets unaffected). 1 = Error on missing TLAST; 0 = No error on missing TLAST. Was Stream_Switch_Adaptive_Clock_Gate"
+  3       CTE_Clock_Enable             rw  "Enable the clock to Event, Trace"
+  2       uController_Clock_Enable     rw  "Enable the clock to uC-Module"
+  1       PL_Interface_Clock_Enable    rw  "Enable the clock to PL interface"
+  0       Stream_Switch_Clock_Enable   rw  "Defeatured this generation, this field has no effect."
+
+Module_Clock_Control_1 @ 0x000007FF04 [32 rw reset=0x00000003] "Control clock gating of modules (privileged)"
+  2       Shim_DMA_SRAMs_Sleep         rw  "Enable sleep mode in all Shim DMA response queue SRAMs in this tile"
+  1       NoC_Module_1_Clock_Enable    rw  "Defeatured this generation, this field has no effect."
+  0       NoC_Module_0_Clock_Enable    rw  "Enable the clock to NoC Module"

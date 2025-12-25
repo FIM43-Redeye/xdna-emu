@@ -1,0 +1,29 @@
+# CORE_MODULE / CORE/P
+# 8 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Core_P0 @ 0x0000031000 [32 rw] "Pointer register P0"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_P1 @ 0x0000031010 [32 rw] "Pointer register P1"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_P2 @ 0x0000031020 [32 rw] "Pointer register P2"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_P3 @ 0x0000031030 [32 rw] "Pointer register P3"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_P4 @ 0x0000031040 [32 rw] "Pointer register P4"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_P5 @ 0x0000031050 [32 rw] "Pointer register P5"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_P6 @ 0x0000031060 [32 rw] "Pointer register P6"
+  19:0    Register_Value               rw  "Register Value"
+
+Core_P7 @ 0x0000031070 [32 rw] "Pointer register P7"
+  19:0    Register_Value               rw  "Register Value"

@@ -1,0 +1,17 @@
+# CORE_MODULE / CORE/STFIFOL_PART
+# 4 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Core_STFIFOL_Part1 @ 0x0000032500 [128 rw] "STFIFOL Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of ST FIFO L register"
+
+Core_STFIFOL_Part2 @ 0x0000032510 [128 rw] "STFIFOL Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of ST FIFO L register"
+
+Core_STFIFOL_Part3 @ 0x0000032520 [128 rw] "STFIFOL Part 3"
+  127:0   Register_Value               rw  "Bits 383 down to 256 of ST FIFO L register"
+
+Core_STFIFOL_Part4 @ 0x0000032530 [128 rw] "STFIFOL Part 4"
+  127:0   Register_Value               rw  "Bits 511 down to 384 of ST FIFO L register"

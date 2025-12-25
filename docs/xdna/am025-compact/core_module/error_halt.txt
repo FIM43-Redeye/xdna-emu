@@ -1,0 +1,11 @@
+# CORE_MODULE / ERROR_HALT
+# 2 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Error_Halt_Control @ 0x0000032030 [32 wtc] "Error Halt Control"
+  0       Error_Halt                   wtc  "Registrer for AI Engine error halt, 1=AI Engine halted."
+
+Error_Halt_Event @ 0x0000032034 [32 rw] "Error Halt Event"
+  6:0     Error_Halt_Core_Event        rw  "Event No to place AI Engine in error halt"

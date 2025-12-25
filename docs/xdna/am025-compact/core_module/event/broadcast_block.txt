@@ -1,0 +1,41 @@
+# CORE_MODULE / EVENT/BROADCAST_BLOCK
+# 12 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Event_Broadcast_Block_South_Set @ 0x0000034050 [32 wo] "Set block of broadcast signals to South"
+  15:0    Set                          wo  "Set block. 1= sets matching bit; 0=no effect"
+
+Event_Broadcast_Block_South_Clr @ 0x0000034054 [32 wo] "Clear block of broadcast signals to South"
+  15:0    Clear                        wo  "Clear block. 1=clears matching bit; 0=no effect"
+
+Event_Broadcast_Block_South_Value @ 0x0000034058 [32 ro] "Current value of block for broadcast signals to South"
+  15:0    Value                        ro  "Current value of block"
+
+Event_Broadcast_Block_West_Set @ 0x0000034060 [32 wo] "Set block of broadcast signals to West"
+  15:0    Set                          wo  "Set block. 1= sets matching bit; 0=no effect"
+
+Event_Broadcast_Block_West_Clr @ 0x0000034064 [32 wo] "Clear block of broadcast signals to West"
+  15:0    Clear                        wo  "Clear block. 1=clears matching bit; 0=no effect"
+
+Event_Broadcast_Block_West_Value @ 0x0000034068 [32 ro] "Current value of block for broadcast signals to West"
+  15:0    Value                        ro  "Current value of block"
+
+Event_Broadcast_Block_North_Set @ 0x0000034070 [32 wo] "Set block of broadcast signals to North"
+  15:0    Set                          wo  "Set block. 1= sets matching bit; 0=no effect"
+
+Event_Broadcast_Block_North_Clr @ 0x0000034074 [32 wo] "Clear block of broadcast signals to North"
+  15:0    Clear                        wo  "Clear block. 1=clears matching bit; 0=no effect"
+
+Event_Broadcast_Block_North_Value @ 0x0000034078 [32 ro] "Current value of block for broadcast signals to North"
+  15:0    Value                        ro  "Current value of block"
+
+Event_Broadcast_Block_East_Set @ 0x0000034080 [32 wo] "Set block of broadcast signals to East"
+  15:0    Set                          wo  "Set block. 1= sets matching bit; 0=no effect"
+
+Event_Broadcast_Block_East_Clr @ 0x0000034084 [32 wo] "Clear block of broadcast signals to East"
+  15:0    Clear                        wo  "Clear block. 1=clears matching bit; 0=no effect"
+
+Event_Broadcast_Block_East_Value @ 0x0000034088 [32 ro] "Current value of block for broadcast signals to East"
+  15:0    Value                        ro  "Current value of block"

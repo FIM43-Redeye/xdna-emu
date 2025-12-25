@@ -1,0 +1,89 @@
+# PL_MODULE / EVENT/BROADCAST_A
+# 28 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Event_Broadcast0_A @ 0x0000034010 [32 rw] "Control of which Internal Event to Broadcast0 for switch A"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast1_A @ 0x0000034014 [32 rw] "Control of which Internal Event to Broadcast1 for switch A"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast2_A @ 0x0000034018 [32 rw] "Control of which Internal Event to Broadcast2 for switch A"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast3_A @ 0x000003401C [32 rw] "Control of which Internal Event to Broadcast3 for switch A"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast4_A @ 0x0000034020 [32 rw] "Control of which Internal Event to Broadcast4 for switch A"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast5_A @ 0x0000034024 [32 rw] "Control of which Internal Event to Broadcast5 for switch A"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast6_A @ 0x0000034028 [32 rw] "Control of which Internal Event to Broadcast6 for switch A"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast7_A @ 0x000003402C [32 rw] "Control of which Internal Event to Broadcast7 for switch A"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast8_A @ 0x0000034030 [32 rw] "Control of which Internal Event to Broadcast8 for switch A"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast9_A @ 0x0000034034 [32 rw] "Control of which Internal Event to Broadcast9 for switch A"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast10_A @ 0x0000034038 [32 rw] "Control of which Internal Event to Broadcast10 for switch A"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast11_A @ 0x000003403C [32 rw] "Control of which Internal Event to Broadcast11 for switch A"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast12_A @ 0x0000034040 [32 rw] "Control of which Internal Event to Broadcast12 for switch A"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast13_A @ 0x0000034044 [32 rw] "Control of which Internal Event to Broadcast13 for switch A"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast14_A @ 0x0000034048 [32 rw] "Control of which Internal Event to Broadcast14 for switch A"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast15_A @ 0x000003404C [32 rw] "Control of which Internal Event to Broadcast15 for switch A"
+  6:0     Event                        rw  "Internal Event No to Broadcast"
+
+Event_Broadcast_A_Block_South_Set @ 0x0000034050 [32 wo] "Set block of broadcast switch A signals to South"
+  15:0    Set                          wo  "Set block. 1= sets matching bit; 0=no effect"
+
+Event_Broadcast_A_Block_South_Clr @ 0x0000034054 [32 wo] "Clear block of broadcast switch A signals to South"
+  15:0    Clear                        wo  "Clear block. 1=clears matching bit; 0=no effect"
+
+Event_Broadcast_A_Block_South_Value @ 0x0000034058 [32 ro] "Current value of block for broadcast switch A signals to South"
+  15:0    Value                        ro  "Current value of block"
+
+Event_Broadcast_A_Block_West_Set @ 0x0000034060 [32 wo] "Set block of broadcast switch A signals to West"
+  15:0    Set                          wo  "Set block. 1= sets matching bit; 0=no effect"
+
+Event_Broadcast_A_Block_West_Clr @ 0x0000034064 [32 wo] "Clear block of broadcast switch A signals to West"
+  15:0    Clear                        wo  "Clear block. 1=clears matching bit; 0=no effect"
+
+Event_Broadcast_A_Block_West_Value @ 0x0000034068 [32 ro] "Current value of block for broadcast switch A signals to West"
+  15:0    Value                        ro  "Current value of block"
+
+Event_Broadcast_A_Block_North_Set @ 0x0000034070 [32 wo] "Set block of broadcast switch A signals to North"
+  15:0    Set                          wo  "Set block. 1= sets matching bit; 0=no effect"
+
+Event_Broadcast_A_Block_North_Clr @ 0x0000034074 [32 wo] "Clear block of broadcast switch A signals to North"
+  15:0    Clear                        wo  "Clear block. 1=clears matching bit; 0=no effect"
+
+Event_Broadcast_A_Block_North_Value @ 0x0000034078 [32 ro] "Current value of block for broadcast switch A signals to North"
+  15:0    Value                        ro  "Current value of block"
+
+Event_Broadcast_A_Block_East_Set @ 0x0000034080 [32 wo] "Set block of broadcast switch A signals to East"
+  15:0    Set                          wo  "Set block. 1= sets matching bit; 0=no effect"
+
+Event_Broadcast_A_Block_East_Clr @ 0x0000034084 [32 wo] "Clear block of broadcast switch A signals to East"
+  15:0    Clear                        wo  "Clear block. 1=clears matching bit; 0=no effect"
+
+Event_Broadcast_A_Block_East_Value @ 0x0000034088 [32 ro] "Current value of block for broadcast switch A signals to East"
+  15:0    Value                        ro  "Current value of block"

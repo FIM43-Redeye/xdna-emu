@@ -1,0 +1,149 @@
+# CORE_MODULE / CORE/X_PART
+# 48 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Core_X0_Part1 @ 0x0000031800 [128 rw] "Vector register X0 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of vector register"
+
+Core_X0_Part2 @ 0x0000031810 [128 rw] "Vector register X0 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of vector register"
+
+Core_X0_Part3 @ 0x0000031820 [128 rw] "Vector register X0 Part 3"
+  127:0   Register_Value               rw  "Bits 383 down to 256 of vector register"
+
+Core_X0_Part4 @ 0x0000031830 [128 rw] "Vector register X0 Part 4"
+  127:0   Register_Value               rw  "Bits 511 down to 384 of vector register"
+
+Core_X1_Part1 @ 0x0000031840 [128 rw] "Vector register X1 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of vector register"
+
+Core_X1_Part2 @ 0x0000031850 [128 rw] "Vector register X1 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of vector register"
+
+Core_X1_Part3 @ 0x0000031860 [128 rw] "Vector register X1 Part 3"
+  127:0   Register_Value               rw  "Bits 383 down to 256 of vector register"
+
+Core_X1_Part4 @ 0x0000031870 [128 rw] "Vector register X1 Part 4"
+  127:0   Register_Value               rw  "Bits 511 down to 384 of vector register"
+
+Core_X2_Part1 @ 0x0000031880 [128 rw] "Vector register X2 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of vector register"
+
+Core_X2_Part2 @ 0x0000031890 [128 rw] "Vector register X2 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of vector register"
+
+Core_X2_Part3 @ 0x00000318A0 [128 rw] "Vector register X2 Part 3"
+  127:0   Register_Value               rw  "Bits 383 down to 256 of vector register"
+
+Core_X2_Part4 @ 0x00000318B0 [128 rw] "Vector register X2 Part 4"
+  127:0   Register_Value               rw  "Bits 511 down to 384 of vector register"
+
+Core_X3_Part1 @ 0x00000318C0 [128 rw] "Vector register X3 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of vector register"
+
+Core_X3_Part2 @ 0x00000318D0 [128 rw] "Vector register X3 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of vector register"
+
+Core_X3_Part3 @ 0x00000318E0 [128 rw] "Vector register X3 Part 3"
+  127:0   Register_Value               rw  "Bits 383 down to 256 of vector register"
+
+Core_X3_Part4 @ 0x00000318F0 [128 rw] "Vector register X3 Part 4"
+  127:0   Register_Value               rw  "Bits 511 down to 384 of vector register"
+
+Core_X4_Part1 @ 0x0000031900 [128 rw] "Vector register X4 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of vector register"
+
+Core_X4_Part2 @ 0x0000031910 [128 rw] "Vector register X4 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of vector register"
+
+Core_X4_Part3 @ 0x0000031920 [128 rw] "Vector register X4 Part 3"
+  127:0   Register_Value               rw  "Bits 383 down to 256 of vector register"
+
+Core_X4_Part4 @ 0x0000031930 [128 rw] "Vector register X4 Part 4"
+  127:0   Register_Value               rw  "Bits 511 down to 384 of vector register"
+
+Core_X5_Part1 @ 0x0000031940 [128 rw] "Vector register X5 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of vector register"
+
+Core_X5_Part2 @ 0x0000031950 [128 rw] "Vector register X5 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of vector register"
+
+Core_X5_Part3 @ 0x0000031960 [128 rw] "Vector register X5 Part 3"
+  127:0   Register_Value               rw  "Bits 383 down to 256 of vector register"
+
+Core_X5_Part4 @ 0x0000031970 [128 rw] "Vector register X5 Part 4"
+  127:0   Register_Value               rw  "Bits 511 down to 384 of vector register"
+
+Core_X6_Part1 @ 0x0000031980 [128 rw] "Vector register X6 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of vector register"
+
+Core_X6_Part2 @ 0x0000031990 [128 rw] "Vector register X6 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of vector register"
+
+Core_X6_Part3 @ 0x00000319A0 [128 rw] "Vector register X6 Part 3"
+  127:0   Register_Value               rw  "Bits 383 down to 256 of vector register"
+
+Core_X6_Part4 @ 0x00000319B0 [128 rw] "Vector register X6 Part 4"
+  127:0   Register_Value               rw  "Bits 511 down to 384 of vector register"
+
+Core_X7_Part1 @ 0x00000319C0 [128 rw] "Vector register X7 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of vector register"
+
+Core_X7_Part2 @ 0x00000319D0 [128 rw] "Vector register X7 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of vector register"
+
+Core_X7_Part3 @ 0x00000319E0 [128 rw] "Vector register X7 Part 3"
+  127:0   Register_Value               rw  "Bits 383 down to 256 of vector register"
+
+Core_X7_Part4 @ 0x00000319F0 [128 rw] "Vector register X7 Part 4"
+  127:0   Register_Value               rw  "Bits 511 down to 384 of vector register"
+
+Core_X8_Part1 @ 0x0000031A00 [128 rw] "Vector register X8 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of vector register"
+
+Core_X8_Part2 @ 0x0000031A10 [128 rw] "Vector register X8 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of vector register"
+
+Core_X8_Part3 @ 0x0000031A20 [128 rw] "Vector register X8 Part 3"
+  127:0   Register_Value               rw  "Bits 383 down to 256 of vector register"
+
+Core_X8_Part4 @ 0x0000031A30 [128 rw] "Vector register X8 Part 4"
+  127:0   Register_Value               rw  "Bits 511 down to 384 of vector register"
+
+Core_X9_Part1 @ 0x0000031A40 [128 rw] "Vector register X9 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of vector register"
+
+Core_X9_Part2 @ 0x0000031A50 [128 rw] "Vector register X9 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of vector register"
+
+Core_X9_Part3 @ 0x0000031A60 [128 rw] "Vector register X9 Part 3"
+  127:0   Register_Value               rw  "Bits 383 down to 256 of vector register"
+
+Core_X9_Part4 @ 0x0000031A70 [128 rw] "Vector register X9 Part 4"
+  127:0   Register_Value               rw  "Bits 511 down to 384 of vector register"
+
+Core_X10_Part1 @ 0x0000031A80 [128 rw] "Vector register X10 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of vector register"
+
+Core_X10_Part2 @ 0x0000031A90 [128 rw] "Vector register X10 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of vector register"
+
+Core_X10_Part3 @ 0x0000031AA0 [128 rw] "Vector register X10 Part 3"
+  127:0   Register_Value               rw  "Bits 383 down to 256 of vector register"
+
+Core_X10_Part4 @ 0x0000031AB0 [128 rw] "Vector register X10 Part 4"
+  127:0   Register_Value               rw  "Bits 511 down to 384 of vector register"
+
+Core_X11_Part1 @ 0x0000031AC0 [128 rw] "Vector register X11 Part 1"
+  127:0   Register_Value               rw  "Bits 127 down to 0 of vector register"
+
+Core_X11_Part2 @ 0x0000031AD0 [128 rw] "Vector register X11 Part 2"
+  127:0   Register_Value               rw  "Bits 255 down to 128 of vector register"
+
+Core_X11_Part3 @ 0x0000031AE0 [128 rw] "Vector register X11 Part 3"
+  127:0   Register_Value               rw  "Bits 383 down to 256 of vector register"
+
+Core_X11_Part4 @ 0x0000031AF0 [128 rw] "Vector register X11 Part 4"
+  127:0   Register_Value               rw  "Bits 511 down to 384 of vector register"

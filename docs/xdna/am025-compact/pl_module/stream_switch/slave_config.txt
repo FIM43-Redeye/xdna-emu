@@ -1,0 +1,97 @@
+# PL_MODULE / STREAM_SWITCH/SLAVE_CONFIG
+# 23 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Stream_Switch_Slave_Config_Tile_Ctrl @ 0x000003F100 [32 rw] "Stream Switch Slave Configuration Tile Ctrl"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_FIFO_0 @ 0x000003F104 [32 rw] "Stream Switch Slave Configuration FIFO 0"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_South_0 @ 0x000003F108 [32 rw] "Stream Switch Slave Configuration South 0"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_South_1 @ 0x000003F10C [32 rw] "Stream Switch Slave Configuration South 1"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_South_2 @ 0x000003F110 [32 rw] "Stream Switch Slave Configuration South 2"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_South_3 @ 0x000003F114 [32 rw] "Stream Switch Slave Configuration South 3"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_South_4 @ 0x000003F118 [32 rw] "Stream Switch Slave Configuration South 4"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_South_5 @ 0x000003F11C [32 rw] "Stream Switch Slave Configuration South 5"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_South_6 @ 0x000003F120 [32 rw] "Stream Switch Slave Configuration South 6"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_South_7 @ 0x000003F124 [32 rw] "Stream Switch Slave Configuration South 7"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_West_0 @ 0x000003F128 [32 rw] "Stream Switch Slave Configuration West 0"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_West_1 @ 0x000003F12C [32 rw] "Stream Switch Slave Configuration West 1"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_West_2 @ 0x000003F130 [32 rw] "Stream Switch Slave Configuration West 2"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_West_3 @ 0x000003F134 [32 rw] "Stream Switch Slave Configuration West 3"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_North_0 @ 0x000003F138 [32 rw] "Stream Switch Slave Configuration North 0"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_North_1 @ 0x000003F13C [32 rw] "Stream Switch Slave Configuration North 1"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_North_2 @ 0x000003F140 [32 rw] "Stream Switch Slave Configuration North 2"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_North_3 @ 0x000003F144 [32 rw] "Stream Switch Slave Configuration North 3"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_East_0 @ 0x000003F148 [32 rw] "Stream Switch Slave Configuration East 0"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_East_1 @ 0x000003F14C [32 rw] "Stream Switch Slave Configuration East 1"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_East_2 @ 0x000003F150 [32 rw] "Stream Switch Slave Configuration East 2"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_East_3 @ 0x000003F154 [32 rw] "Stream Switch Slave Configuration East 3"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_Trace @ 0x000003F158 [32 rw] "Stream Switch Slave Configuration Trace"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"

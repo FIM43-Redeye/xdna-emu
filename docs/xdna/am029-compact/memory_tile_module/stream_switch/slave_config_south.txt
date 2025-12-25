@@ -1,0 +1,29 @@
+# MEMORY_TILE_MODULE / STREAM_SWITCH/SLAVE_CONFIG_SOUTH
+# 6 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Stream_Switch_Slave_Config_South_0 @ 0x00000B011C [32 rw] "Stream Switch Slave Configuration South 0"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_South_1 @ 0x00000B0120 [32 rw] "Stream Switch Slave Configuration South 1"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_South_2 @ 0x00000B0124 [32 rw] "Stream Switch Slave Configuration South 2"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_South_3 @ 0x00000B0128 [32 rw] "Stream Switch Slave Configuration South 3"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_South_4 @ 0x00000B012C [32 rw] "Stream Switch Slave Configuration South 4"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"
+
+Stream_Switch_Slave_Config_South_5 @ 0x00000B0130 [32 rw] "Stream Switch Slave Configuration South 5"
+  31      Slave_Enable                 rw  "1=enable the slave port"
+  30      Packet_Enable                rw  "0=circuit; 1=packet switching mode for slave port"

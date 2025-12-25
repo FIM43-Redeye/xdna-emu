@@ -1,0 +1,14 @@
+# CORE_MODULE / DEBUG/MISC
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Debug_Status @ 0x000003201C [32 ro] "Debug Status"
+  6       Debug_Event1_Halted          ro  "AI Engine halted due to debug halt Event1"
+  5       Debug_Event0_Halted          ro  "AI Engine halted due to debug halt Event0"
+  4       Stream_stall_Halted          ro  "AI Engine halted due to debug stream stall halt"
+  3       Lock_Stall_Halted            ro  "AI Engine halted due to debug lock stall halt"
+  2       Memory_Stall_Halted          ro  "AI Engine halted due to debug memory stall halt"
+  1       PC_Event_halted              ro  "AI Engine halted due to PC event halt"
+  0       Debug_halted                 ro  "AI Engine halted due to any debug"

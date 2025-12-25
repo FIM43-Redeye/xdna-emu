@@ -1,0 +1,8 @@
+# PL_MODULE / UC_CORE_INTERRUPT
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+uC_Core_Interrupt_Event @ 0x0000034600 [32 rw] "uC-Core Interrupt Event Action"
+  7:0     Event                        rw  "Event No that generates an interrupt to the uC-Core"

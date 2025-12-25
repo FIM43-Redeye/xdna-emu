@@ -1,0 +1,17 @@
+# CORE_MODULE / PERFORMANCE/COUNTER_EVENT
+# 4 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Performance_Counter0_Event_Value @ 0x0000037580 [32 rw] "Performance Counter0 Event Value."
+  31:0    Counter_Event_Value          rw  "When the Performance Counter0 reach this value, an event will be generated"
+
+Performance_Counter1_Event_Value @ 0x0000037584 [32 rw] "Performance Counter1 Event Value. When the Performance Counter1 reach this value, an event will be generated"
+  31:0    Counter_Event_Value          rw  "When the Performance Counter0 reach this value, an event will be generated"
+
+Performance_Counter2_Event_Value @ 0x0000037588 [32 rw] "Performance Counter2 Event Value. When the Performance Counter2 reach this value, an event will be generated"
+  31:0    Counter_Event_Value          rw  "When the Performance Counter0 reach this value, an event will be generated"
+
+Performance_Counter3_Event_Value @ 0x000003758C [32 rw] "Performance Counter3 Event Value. When the Performance Counter3 reach this value, an event will be generated"
+  31:0    Counter_Event_Value          rw  "When the Performance Counter0 reach this value, an event will be generated"

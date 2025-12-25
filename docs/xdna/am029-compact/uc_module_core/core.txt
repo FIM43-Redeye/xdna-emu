@@ -1,0 +1,156 @@
+# UC_MODULE_CORE / CORE
+# 33 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Core_Program_Memory @ 0x0000000000 [32 rw] "uC-Core Program Memory (uC-PM) (32 kbyte)"
+  31:0    _                            rw  "Instruction Word"
+
+Core_Private_Data_Memory @ 0x0000008000 [32 rw] "uC-Core private Data Memory (uC-private-DM) (16 kbyte)"
+  31:0    _                            rw  "Data Word"
+
+Core_IO_Module_1_IRQ_Mode @ 0x000003800C [32 wo] "Interrupt Mode"
+  31:0    IRQ_Mode                     wo  "All bit positions written with 1 use fast interrupt mode"
+
+Core_IO_Module_1_GPO1 @ 0x0000038010 [32 wo] "General Purpose Output 1"
+  0       Interrupt_Out                wo  "1 = Raise an interrupt to the 2nd level interrupt handler. 0 = Clear the interrupt"
+
+Core_IO_Module_1_IRQ_Status @ 0x0000038030 [32 ro] "Interrupt Status Register"
+  24      AXI_Error_IRQ                ro  "An AXI error occurred in this column"
+  23      HW_Correctable_Error_IRQ     ro  "A HW correctable error occurred in this column"
+  22      HW_Uncorrectable_Error_IRQ   ro  "A HW uncorrectable error occurred in this column"
+  21      Event_Action_IRQ             ro  "The uC_Core_Interrupt event action has triggered"
+  20      Interrupt_Controller_2nd_Level_IRQ ro  "The 2nd level interrupt handler of this Shim tile is active"
+  19      Go_To_Sleep_IRQ              ro  "The uC-Core has been requested to enter sleep mode (must be implemented in the ISR)."
+  18      AXIS_Slave_Valid_IRQ         ro  "The uC-Core AXI-S slave port has a valid transaction pending"
+  17      MM2DM_Response_IRQ           ro  "The uC-DMA MM2DM response queue is non-empty"
+  16      DM2MM_Response_IRQ           ro  "The uC-DMA DM2MM response queue is non-empty"
+  6       PIT4_IRQ                     ro  "PIT4 Lapsed"
+  5       PIT3_IRQ                     ro  "PIT3 Lapsed"
+  4       PIT2_IRQ                     ro  "PIT2 Lapsed"
+  3       PIT1_IRQ                     ro  "PIT1 Lapsed"
+
+Core_IO_Module_1_IRQ_Pending @ 0x0000038034 [32 ro] "Interrupt Pending Register"
+  24      AXI_Error_IRQ                ro  "An AXI error occurred in this column and the interrupt is enabled"
+  23      HW_Correctable_Error_IRQ     ro  "A HW correctable error occurred in this column and the interrupt is enabled"
+  22      HW_Uncorrectable_Error_IRQ   ro  "A HW uncorrectable error occurred in this column and the interrupt is enabled"
+  21      Event_Action_IRQ             ro  "The uC_Core_Interrupt event action has triggered and the interrupt is enabled"
+  20      Interrupt_Controller_2nd_Level_IRQ ro  "The 2nd level interrupt handler of this Shim tile is active and the interrupt is enabled"
+  19      Go_To_Sleep_IRQ              ro  "The uC-Core has been requested to enter sleep mode (must be implemented in the ISR) and the interrupt is enabled"
+  18      AXIS_Slave_Valid_IRQ         ro  "The uC-Core AXI-S slave port has a valid transaction pending and the interrupt is enabled"
+  17      MM2DM_Response_IRQ           ro  "The uC-DMA MM2DM response queue is non-empty and the interrupt is enabled"
+  16      DM2MM_Response_IRQ           ro  "The uC-DMA DM2MM response queue is non-empty and the interrupt is enabled"
+  6       PIT4_IRQ                     ro  "PIT4 Lapsed and the interrupt is enabled"
+  5       PIT3_IRQ                     ro  "PIT3 Lapsed and the interrupt is enabled"
+  4       PIT2_IRQ                     ro  "PIT2 Lapsed and the interrupt is enabled"
+  3       PIT1_IRQ                     ro  "PIT1 Lapsed and the interrupt is enabled"
+
+Core_IO_Module_1_IRQ_Enable @ 0x0000038038 [32 wo] "Interrupt Enable Register"
+  24      AXI_Error_IRQ                wo  "Enable the AXI_Error interrupt"
+  23      HW_Correctable_Error_IRQ     wo  "Enable the HW_Correctable_Error interrupt"
+  22      HW_Uncorrectable_Error_IRQ   wo  "Enable the HW_Uncorrectable_Error interrupt"
+  21      Event_Action_IRQ_Enable      wo  "Enable the Event_Action interrupt"
+  20      Interrupt_Controller_2nd_Level_IRQ_Enable wo  "Enable the Interrupt_Controller_2nd_Level interrupt"
+  19      Go_To_Sleep_IRQ_Enable       wo  "Enable the Go_To_Sleep interrupt"
+  18      AXIS_Slave_Valid_IRQ_Enable  wo  "Enable the AXIS_Slave_Valid interrupt"
+  17      MM2DM_Response_IRQ_Enable    wo  "Enable the MM2DM_Response interrupt"
+  16      DM2MM_Response_IRQ_Enable    wo  "Enable the DM2MM_Response interrupt"
+  6       PIT4_IRQ_Enable              wo  "Enable the PIT4 interrupt"
+  5       PIT3_IRQ_Enable              wo  "Enable the PIT3 interrupt"
+  4       PIT2_IRQ_Enable              wo  "Enable the PIT2 interrupt"
+  3       PIT1_IRQ_Enable              wo  "Enable the PIT1 interrupt"
+
+Core_IO_Module_1_IRQ_Ack @ 0x000003803C [32 wo] "Interrupt Acknowledge Register"
+  24      AXI_Error_IRQ_Ack            wo  "Write 1 to clear the AXI_Error interrupt in both IRQ_Status and IRQ_Pending"
+  23      HW_Correctable_Error_IRQ_Ack wo  "Write 1 to clear the HW_Correctable_Error interrupt in both IRQ_Status and IRQ_Pending"
+  22      HW_Uncorrectable_Error_IRQ_Ack wo  "Write 1 to clear the HW_Uncorrectable_Error interrupt in both IRQ_Status and IRQ_Pending"
+  21      Event_Action_IRQ_Ack         wo  "Write 1 to clear the Event_Action interrupt in both IRQ_Status and IRQ_Pending"
+  20      Interrupt_Controller_2nd_Level_IRQ_Ack wo  "Write 1 to clear the Interrupt_Controller_2nd_Level interrupt in both IRQ_Status and IRQ_Pending"
+  19      Go_To_Sleep_IRQ_Ack          wo  "Write 1 to clear the Go_To_Sleep interrupt in both IRQ_Status and IRQ_Pending"
+  18      AXIS_Slave_Valid_IRQ_Ack     wo  "Write 1 to clear the AXIS_Slave_Valid interrupt in both IRQ_Status and IRQ_Pending"
+  17      MM2DM_Response_IRQ_Ack       wo  "Write 1 to clear the MM2DM_Response interrupt in both IRQ_Status and IRQ_Pending"
+  16      DM2MM_Response_IRQ_Ack       wo  "Write 1 to clear the DM2MM_Response interrupt in both IRQ_Status and IRQ_Pending"
+  6       PIT4_IRQ_Ack                 wo  "Write 1 to clear the PIT4 interrupt in both IRQ_Status and IRQ_Pending"
+  5       PIT3_IRQ_Ack                 wo  "Write 1 to clear the PIT3 interrupt in both IRQ_Status and IRQ_Pending"
+  4       PIT2_IRQ_Ack                 wo  "Write 1 to clear the PIT2 interrupt in both IRQ_Status and IRQ_Pending"
+  3       PIT1_IRQ_Ack                 wo  "Write 1 to clear the PIT1 interrupt in both IRQ_Status and IRQ_Pending"
+
+Core_IO_Module_1_PIT1_Preload @ 0x0000038040 [32 wo] "PIT 1 Preload Register"
+  31:0    PIT_Period                   wo  "Register holds the timer period"
+
+Core_IO_Module_1_PIT1_Counter @ 0x0000038044 [32 ro] "PIT 1 Counter Value"
+  31:0    PIT_Count_Value              ro  "PIT Counter Value at time of read"
+
+Core_IO_Module_1_PIT1_Control @ 0x0000038048 [32 wo] "PIT 1 Control Register"
+  1       PIT_Wrap_Ctrl                wo  "0 = Counter counts past zero and then stops, 1 = Counter value is automatically reloaded with the PITx_PRELOAD value when the counter lapses"
+  0       PIT_En                       wo  "0 = Counting Disabled, 1 = Counter Enabled"
+
+Core_IO_Module_1_PIT2_Preload @ 0x0000038050 [32 wo] "PIT 2 Preload Register"
+  31:0    PIT_Period                   wo  "Register holds the timer period"
+
+Core_IO_Module_1_PIT2_Counter @ 0x0000038054 [32 ro] "PIT 2 Counter Value"
+  31:0    PIT_Count_Value              ro  "PIT Counter Value at time of read"
+
+Core_IO_Module_1_PIT2_Control @ 0x0000038058 [32 wo] "PIT 2 Control Register"
+  1       PIT_Wrap_Ctrl                wo  "0 = Counter counts past zero and then stops, 1 = Counter value is automatically reloaded with the PITx_PRELOAD value when the counter lapses"
+  0       PIT_En                       wo  "0 = Counting Disabled, 1 = Counter Enabled"
+
+Core_IO_Module_1_PIT3_Preload @ 0x0000038060 [32 wo] "PIT 3 Preload Register"
+  31:0    PIT_Period                   wo  "Register holds the timer period"
+
+Core_IO_Module_1_PIT3_Counter @ 0x0000038064 [32 ro] "PIT 3 Counter Value"
+  31:0    PIT_Count_Value              ro  "PIT Counter Value at time of read"
+
+Core_IO_Module_1_PIT3_Control @ 0x0000038068 [32 wo] "PIT 3 Control Register"
+  1       PIT_Wrap_Ctrl                wo  "0 = Counter counts past zero and then stops, 1 = Counter value is automatically reloaded with the PITx_PRELOAD value when the counter lapses"
+  0       PIT_En                       wo  "0 = Counting Disabled, 1 = Counter Enabled"
+
+Core_IO_Module_1_PIT4_Preload @ 0x0000038070 [32 wo] "PIT 4 Preload Register"
+  31:0    PIT_Period                   wo  "Register holds the timer period"
+
+Core_IO_Module_1_PIT4_Counter @ 0x0000038074 [32 ro] "PIT 4 Counter Value"
+  31:0    PIT_Count_Value              ro  "PIT Counter Value at time of read"
+
+Core_IO_Module_1_PIT4_Control @ 0x0000038078 [32 wo] "PIT 4 Control Register"
+  1       PIT_Wrap_Ctrl                wo  "0 = Counter counts past zero and then stops, 1 = Counter value is automatically reloaded with the PITx_PRELOAD value when the counter lapses"
+  0       PIT_En                       wo  "0 = Counting Disabled, 1 = Counter Enabled"
+
+Core_IO_Module_1_IRQ_Vector_3 @ 0x000003808C [32 wo] "PIT1_IRQ interrupt address vector"
+  31:0    IRQ_Vector                   wo  "Interrupt address vector"
+
+Core_IO_Module_1_IRQ_Vector_4 @ 0x0000038090 [32 wo] "PIT2_IRQ interrupt address vector"
+  31:0    IRQ_Vector                   wo  "Interrupt address vector"
+
+Core_IO_Module_1_IRQ_Vector_5 @ 0x0000038094 [32 wo] "PIT3_IRQ interrupt address vector"
+  31:0    IRQ_Vector                   wo  "Interrupt address vector"
+
+Core_IO_Module_1_IRQ_Vector_6 @ 0x0000038098 [32 wo] "PIT4_IRQ interrupt address vector"
+  31:0    IRQ_Vector                   wo  "Interrupt address vector"
+
+Core_IO_Module_1_IRQ_Vector_16 @ 0x00000380C0 [32 wo] "DM2MM_Response_IRQ interrupt address vector"
+  31:0    IRQ_Vector                   wo  "Interrupt address vector"
+
+Core_IO_Module_1_IRQ_Vector_17 @ 0x00000380C4 [32 wo] "MM2DM_Response_IRQ interrupt address vector"
+  31:0    IRQ_Vector                   wo  "Interrupt address vector"
+
+Core_IO_Module_1_IRQ_Vector_18 @ 0x00000380C8 [32 wo] "AXIS_Slave_Valid_IRQ interrupt address vector"
+  31:0    IRQ_Vector                   wo  "Interrupt address vector"
+
+Core_IO_Module_1_IRQ_Vector_19 @ 0x00000380CC [32 wo] "Go_To_Sleep_IRQ interrupt address vector"
+  31:0    IRQ_Vector                   wo  "Interrupt address vector"
+
+Core_IO_Module_1_IRQ_Vector_20 @ 0x00000380D0 [32 wo] "Interrupt_Controller_2nd_Level_IRQ interrupt address vector"
+  31:0    IRQ_Vector                   wo  "Interrupt address vector"
+
+Core_IO_Module_1_IRQ_Vector_21 @ 0x00000380D4 [32 wo] "Event_Action_IRQ interrupt address vector"
+  31:0    IRQ_Vector                   wo  "Interrupt address vector"
+
+Core_IO_Module_1_IRQ_Vector_22 @ 0x00000380D8 [32 wo] "HW_Uncorrectable_Error_IRQ interrupt address vector"
+  31:0    IRQ_Vector                   wo  "Interrupt address vector"
+
+Core_IO_Module_1_IRQ_Vector_23 @ 0x00000380DC [32 wo] "HW_Correctable_Error_IRQ interrupt address vector"
+  31:0    IRQ_Vector                   wo  "Interrupt address vector"
+
+Core_IO_Module_1_IRQ_Vector_24 @ 0x00000380E0 [32 wo] "AXI_Error_IRQ interrupt address vector"
+  31:0    IRQ_Vector                   wo  "Interrupt address vector"

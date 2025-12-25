@@ -1,0 +1,15 @@
+# MEMORY_MODULE / PERFORMANCE/MISC
+# 2 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+Performance_Control0 @ 0x0000011000 [32 rw] "Performance Counters Start and Stop Event"
+  30:24   Cnt1_Stop_Event              rw  "Event No to Stop Counter1"
+  22:16   Cnt1_Start_Event             rw  "Event No to Start Counter1"
+  14:8    Cnt0_Stop_Event              rw  "Event No to Stop Counter0"
+  6:0     Cnt0_Start_Event             rw  "Event No to Start Counter0"
+
+Performance_Control1 @ 0x0000011008 [32 rw reset=6:0] "Performance Counters Reset Event"
+  14:8    Cnt1_Reset_Event             rw  "Event No to Reset Counter1"
+  6:0     Cnt0_Reset_Event             rw  "Event No to Reset Counter0"

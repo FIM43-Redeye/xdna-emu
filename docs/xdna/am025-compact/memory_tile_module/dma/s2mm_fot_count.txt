@@ -1,0 +1,41 @@
+# MEMORY_TILE_MODULE / DMA/S2MM_FOT_COUNT
+# 6 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+DMA_S2MM_FoT_Count_FIFO_Pop_0 @ 0x00000A06C8 [32 ro] "DMA S2MM FoT Count FIFO Pop Ch0"
+  31      Valid                        ro  "0: channel not in FoT_counts_from_mm_register mode OR FIFO is empty; 1: this read has valid data. If 0, then all other bits in this register are x."
+  30      Last_in_Task                 ro  "Set if this is the last transfer in this task"
+  29:24   BD_ID                        ro  "The BD used in this transfer"
+  17:0    Write_Count                  ro  "Number of words (32-bit) written to memory this transfer"
+
+DMA_S2MM_FoT_Count_FIFO_Pop_1 @ 0x00000A06CC [32 ro] "DMA S2MM FoT Count FIFO Pop Ch1"
+  31      Valid                        ro  "0: channel not in FoT_counts_from_mm_register mode OR FIFO is empty; 1: this read has valid data. If 0, then all other bits in this register are x."
+  30      Last_in_Task                 ro  "Set if this is the last transfer in this task"
+  29:24   BD_ID                        ro  "The BD used in this transfer"
+  17:0    Write_Count                  ro  "Number of words (32-bit) written to memory this transfer"
+
+DMA_S2MM_FoT_Count_FIFO_Pop_2 @ 0x00000A06D0 [32 ro] "DMA S2MM FoT Count FIFO Pop Ch2"
+  31      Valid                        ro  "0: channel not in FoT_counts_from_mm_register mode OR FIFO is empty; 1: this read has valid data. If 0, then all other bits in this register are x."
+  30      Last_in_Task                 ro  "Set if this is the last transfer in this task"
+  29:24   BD_ID                        ro  "The BD used in this transfer"
+  17:0    Write_Count                  ro  "Number of words (32-bit) written to memory this transfer"
+
+DMA_S2MM_FoT_Count_FIFO_Pop_3 @ 0x00000A06D4 [32 ro] "DMA S2MM FoT Count FIFO Pop Ch3"
+  31      Valid                        ro  "0: channel not in FoT_counts_from_mm_register mode OR FIFO is empty; 1: this read has valid data. If 0, then all other bits in this register are x."
+  30      Last_in_Task                 ro  "Set if this is the last transfer in this task"
+  29:24   BD_ID                        ro  "The BD used in this transfer"
+  17:0    Write_Count                  ro  "Number of words (32-bit) written to memory this transfer"
+
+DMA_S2MM_FoT_Count_FIFO_Pop_4 @ 0x00000A06D8 [32 ro] "DMA S2MM FoT Count FIFO Pop Ch4"
+  31      Valid                        ro  "0: channel not in FoT_counts_from_mm_register mode OR FIFO is empty; 1: this read has valid data. If 0, then all other bits in this register are x."
+  30      Last_in_Task                 ro  "Set if this is the last transfer in this task"
+  29:24   BD_ID                        ro  "The BD used in this transfer"
+  17:0    Write_Count                  ro  "Number of words (32-bit) written to memory this transfer"
+
+DMA_S2MM_FoT_Count_FIFO_Pop_5 @ 0x00000A06DC [32 ro] "DMA S2MM FoT Count FIFO Pop Ch5"
+  31      Valid                        ro  "0: channel not in FoT_counts_from_mm_register mode OR FIFO is empty; 1: this read has valid data. If 0, then all other bits in this register are x."
+  30      Last_in_Task                 ro  "Set if this is the last transfer in this task"
+  29:24   BD_ID                        ro  "The BD used in this transfer"
+  17:0    Write_Count                  ro  "Number of words (32-bit) written to memory this transfer"

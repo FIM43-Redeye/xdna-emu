@@ -1,0 +1,9 @@
+# NOC_MODULE / AIE_AXIMM_CONFIG
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+AIE_AXIMM_Config @ 0x0000002100 [32 rw] "AXI-MM NSU Bridge configuration (privileged)"
+  3       DECERR_Block                 rw  "1: Block returning of DECERR when accessing non-existent tiles;"
+  2       SLVERR_Block                 rw  "1: Block returning of SLVERR when accessing unmapped registers;"

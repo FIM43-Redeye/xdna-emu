@@ -1,0 +1,11 @@
+# MEMORY_TILE_MODULE / DMA/MISC
+# 1 register(s)
+#
+# Format: NAME @ OFFSET [WIDTH TYPE reset=VALUE] "DESCRIPTION"
+#   BITS    FIELD_NAME                   TYPE  "DESCRIPTION"
+
+DMA_Event_Channel_Selection @ 0x00000A06A0 [32 rw] "Selection of which DMA channels will generate events"
+  26:24   MM2S_Sel1_Channel            rw  "Configure which MM2S channel will generate events for MM2S Sel1"
+  18:16   MM2S_Sel0_Channel            rw  "Configure which MM2S channel will generate events for MM2S Sel0"
+  10:8    S2MM_Sel1_Channel            rw  "Configure which S2MM channel will generate events for S2MM Sel1"
+  2:0     S2MM_Sel0_Channel            rw  "Configure which S2MM channel will generate events for S2MM Sel0"
