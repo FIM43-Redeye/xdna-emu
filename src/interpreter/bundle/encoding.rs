@@ -54,6 +54,10 @@ impl BundleFormat {
     /// The 128-bit format only has a 1-bit marker (bit 0 = 0), so any even
     /// nibble (0x0, 0x2, 0x4, 0x6, 0x8, 0xA, 0xC, 0xE) indicates 128-bit.
     /// All other formats have bit 0 = 1.
+    ///
+    /// IMPORTANT: The 48-bit format uses only 3 bits for its marker (0b101),
+    /// while other formats use 4 bits. This means we must check the 3-bit
+    /// marker first before checking 4-bit markers.
     #[inline]
     pub fn from_marker(marker: u8) -> Self {
         let nibble = marker & 0xF;
@@ -64,10 +68,15 @@ impl BundleFormat {
             return BundleFormat::Full128;
         }
 
+        // 48-bit format has a 3-bit marker (0b101), so check it first
+        // This allows 0x5, 0xD (0b0101, 0b1101) to both match 48-bit
+        if (marker & 0x7) == Self::MARKER_MEDIUM48 {
+            return BundleFormat::Medium48;
+        }
+
         match nibble {
             Self::MARKER_NOP16 => BundleFormat::Nop16,
             Self::MARKER_SHORT32 => BundleFormat::Short32,
-            Self::MARKER_MEDIUM48 => BundleFormat::Medium48,
             Self::MARKER_MEDIUM64 => BundleFormat::Medium64,
             Self::MARKER_LONG80 => BundleFormat::Long80,
             Self::MARKER_LONG96 => BundleFormat::Long96,

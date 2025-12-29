@@ -719,4 +719,280 @@ mod tests {
         // proper S2MM stream data handling
         assert!(nonzero_count > 0, "Expected at least some data to transfer");
     }
+
+    /// Diagnostic test that traces add_one kernel execution step by step.
+    ///
+    /// This test helps identify:
+    /// - Unknown instructions that need implementation
+    /// - Lock acquire/release patterns
+    /// - Memory access addresses
+    /// - Execution flow and PC progression
+    #[test]
+    fn test_add_one_diagnostic_trace() {
+        use crate::interpreter::CoreStatus;
+        use crate::interpreter::engine::EngineStatus;
+
+        let elf_path = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_objFifo/aie_arch.mlir.prj/main_core_0_2.elf";
+
+        if !std::path::Path::new(elf_path).exists() {
+            eprintln!("Skipping test_add_one_diagnostic_trace: ELF not found at {}", elf_path);
+            return;
+        }
+
+        let mut runner = TestRunner::new();
+
+        // Load the ELF
+        let result = runner.load_elf(0, 2, elf_path);
+        assert!(result.is_ok(), "Failed to load ELF: {:?}", result.err());
+
+        eprintln!("\n=== add_one Kernel Diagnostic Trace ===\n");
+        eprintln!("ELF loaded to tile (0, 2)");
+        eprintln!("Initial PC: 0x{:04X}\n", runner.core_pc(0, 2).unwrap_or(0));
+
+        // Set up locks per MLIR specification for add_one_objFifo:
+        // Lock 0: init=2 (objFifo_in1_cons_prod_lock) - producer has 2 slots available
+        // Lock 1: init=0 (objFifo_in1_cons_cons_lock) - consumer waiting for data
+        // Lock 2: init=2 (objFifo_out1_prod_lock) - producer has 2 slots available
+        // Lock 3: init=0 (objFifo_out1_cons_lock) - consumer waiting for data
+        //
+        // For our test, we need enough lock tokens to allow the kernel to complete.
+        // The kernel acquires lock 0 multiple times for its buffer access pattern.
+        // Set to 8 to allow extended execution for debugging.
+        if let Some(tile) = runner.engine.device_mut().tile_mut(0, 2) {
+            tile.locks[0].value = 8;  // Allow many input buffer accesses
+            tile.locks[1].value = 8;  // Allow many input buffer releases
+            tile.locks[2].value = 8;  // Allow many output buffer accesses
+            tile.locks[3].value = 8;  // Allow many output buffer releases
+            eprintln!("Locks initialized: [8, 8, 8, 8]");
+        }
+
+        // Write test input to the input buffer location (0x8000 per MLIR)
+        // The add_one kernel adds 41 to each i32 element
+        let input_values: Vec<u32> = (0..8).collect(); // [0, 1, 2, 3, 4, 5, 6, 7]
+        let input_bytes: Vec<u8> = input_values
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        runner.write_tile_memory(0, 2, 0x8000, &input_bytes).unwrap();
+        eprintln!("Input written to 0x8000: {:?}", input_values);
+
+        // Initialize pointer registers with buffer base addresses
+        // Based on trace analysis: loads use p2, stores may use different pointers
+        // Try: p2 = input (0x8000), p0 = output (0x400)
+        // (This simulates what the CDO/runtime would set up)
+        runner.engine.set_core_pointer(0, 2, 0, 0x400);   // p0 = output base
+        runner.engine.set_core_pointer(0, 2, 1, 0x400);   // p1 = output base
+        runner.engine.set_core_pointer(0, 2, 2, 0x8000);  // p2 = input base (loads use this)
+        runner.engine.set_core_pointer(0, 2, 3, 0x8000);  // p3 = input base
+        runner.engine.set_core_pointer(0, 2, 4, 0x400);   // p4 = output base
+        runner.engine.set_core_pointer(0, 2, 5, 0x400);   // p5 = output base
+        runner.engine.set_core_pointer(0, 2, 6, 0x400);   // p6 = output base
+        runner.engine.set_core_pointer(0, 2, 7, 0x400);   // p7 = output base
+        eprintln!("Pointer registers initialized: p2=p3=0x8000 (input), others=0x400 (output)");
+
+        // Step through execution with tracing
+        let max_steps = 100;
+        let mut step = 0;
+        let mut last_pc = runner.core_pc(0, 2).unwrap_or(0);
+        let mut halted = false;
+        let mut error_encountered = false;
+
+        // First, let's decode and examine the first few instructions
+        eprintln!("\n--- First few instructions ---");
+        {
+            use crate::interpreter::decode::InstructionDecoder;
+            use crate::interpreter::traits::Decoder;
+            use crate::interpreter::bundle::slot_layout::{extract_slots, SlotType};
+
+            let decoder = InstructionDecoder::load_default();
+
+            // Show LDB slot statistics
+            eprintln!("\n--- LDB slot encodings ---");
+            if let Some(ldb_index) = decoder.decoder_index().slot_index("ldb") {
+                let stats = ldb_index.stats();
+                eprintln!("  LDB slot: {} encodings, {} opcode buckets, mask=0x{:016X}",
+                    ldb_index.encoding_count(), stats.bucket_count, stats.common_mask);
+
+                // Try to decode the problematic bits 0x41D4
+                let test_bits = 0x41D4u64;
+                eprintln!("  Attempting decode of LDB bits 0x{:04X}:", test_bits);
+                if let Some((enc, _)) = decoder.decoder_index().decode_slot("ldb", test_bits) {
+                    eprintln!("    MATCH: {} (slot={}, fixed_mask=0x{:X})", enc.mnemonic, enc.slot, enc.fixed_mask);
+                } else {
+                    eprintln!("    NO MATCH - instruction not in decoder");
+                }
+            } else {
+                eprintln!("  WARNING: No LDB slot in decoder index!");
+            }
+            if let Some(tile) = runner.engine.device().tile(0, 2) {
+                if let Some(program) = tile.program_memory() {
+                    let mut offset = 0;
+                    // Decode first 50 instructions to understand the program
+                    for _i in 0..50 {
+                        if offset + 4 > program.len() {
+                            break;
+                        }
+                        match decoder.decode(&program[offset..], offset as u32) {
+                            Ok(bundle) => {
+                                // Show all active slots, not just first
+                                let active: Vec<_> = bundle.active_slots().collect();
+                                let slot_info: Vec<String> = active.iter().map(|s| {
+                                    format!("{:?}", s.op)
+                                }).collect();
+
+                                // Extra detail for problematic PC range (around 0x009E)
+                                if offset >= 0x0090 && offset <= 0x00B0 {
+                                    eprintln!("  PC=0x{:04X}: size={} slots={:?}", offset, bundle.size(), slot_info);
+                                    eprintln!("    Raw bytes: {:02X?}", &program[offset..offset + bundle.size() as usize]);
+
+                                    // Show extracted slots detail
+                                    let extracted = extract_slots(&program[offset..]);
+                                    for (i, slot) in extracted.slots.iter().enumerate() {
+                                        eprintln!("    Slot {}: type={:?} bits=0x{:016X} (as u32: 0x{:08X})",
+                                            i, slot.slot_type, slot.bits, slot.bits as u32);
+                                    }
+                                } else {
+                                    eprintln!("  PC=0x{:04X}: size={} slots={:?}", offset, bundle.size(), slot_info);
+                                }
+
+                                offset += bundle.size() as usize;
+                            }
+                            Err(e) => {
+                                eprintln!("  PC=0x{:04X}: DECODE ERROR: {:?}", offset, e);
+                                offset += 4;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!("\n--- Execution Trace ---");
+
+        // Helper closure to print raw bytes at a given PC
+        let print_raw_bytes = |runner: &TestRunner, pc: u32| {
+            if let Some(tile) = runner.engine.device().tile(0, 2) {
+                if let Some(program) = tile.program_memory() {
+                    let offset = pc as usize;
+                    if offset + 16 <= program.len() {
+                        eprintln!("  Raw bytes at PC=0x{:04X}: {:02X?}", pc, &program[offset..offset+16]);
+                    }
+                }
+            }
+        };
+
+        while step < max_steps && !halted && !error_encountered {
+            let pc_before = runner.core_pc(0, 2).unwrap_or(0);
+
+            // Step one cycle
+            runner.step();
+
+            let pc_after = runner.core_pc(0, 2).unwrap_or(0);
+
+            // Check engine and core status
+            let engine_status = runner.engine.status();
+            let core_status = runner.engine.core_status(0, 2);
+
+            match engine_status {
+                EngineStatus::Error => {
+                    eprintln!("Step {:3}: PC=0x{:04X} -> ENGINE ERROR", step, pc_before);
+                    print_raw_bytes(&runner, pc_before);
+                    error_encountered = true;
+                }
+                EngineStatus::Halted => {
+                    eprintln!("Step {:3}: PC=0x{:04X} -> ENGINE HALTED", step, pc_before);
+                    halted = true;
+                }
+                _ => {
+                    // Check core-specific status
+                    match core_status {
+                        Some(CoreStatus::Halted) => {
+                            eprintln!("Step {:3}: PC=0x{:04X} -> HALT", step, pc_before);
+                            halted = true;
+                        }
+                        Some(CoreStatus::Error) => {
+                            eprintln!("Step {:3}: PC=0x{:04X} -> CORE ERROR", step, pc_before);
+                            error_encountered = true;
+                        }
+                        Some(CoreStatus::WaitingLock { lock_id }) => {
+                            eprintln!("Step {:3}: PC=0x{:04X} -> WAIT_LOCK({})", step, pc_before, lock_id);
+                        }
+                        Some(CoreStatus::WaitingDma { channel }) => {
+                            eprintln!("Step {:3}: PC=0x{:04X} -> WAIT_DMA({})", step, pc_before, channel);
+                        }
+                        Some(CoreStatus::Running) | Some(CoreStatus::Ready) | None => {
+                            // Only log every 10th step or on interesting PC change
+                            if step % 10 == 0 || (pc_after != pc_before + 4 && pc_after != pc_before + 2) {
+                                eprintln!("Step {:3}: PC=0x{:04X} -> 0x{:04X}", step, pc_before, pc_after);
+                            }
+                        }
+                    }
+                }
+            }
+
+            last_pc = pc_after;
+            step += 1;
+        }
+
+        eprintln!("\n--- Trace Summary ---");
+        eprintln!("Total steps: {}", step);
+        eprintln!("Final PC: 0x{:04X}", last_pc);
+        eprintln!("Halted: {}", halted);
+        eprintln!("Engine status: {:?}", runner.engine.status());
+        eprintln!("Core status: {:?}", runner.engine.core_status(0, 2));
+
+        // Dump first 64 bytes of data memory to see what was written
+        eprintln!("\n--- Memory Dump (first 64 bytes at 0x0000) ---");
+        if let Ok(data) = runner.read_tile_memory(0, 2, 0x0, 64) {
+            for (i, chunk) in data.chunks(16).enumerate() {
+                let hex: String = chunk.iter().map(|b| format!("{:02X} ", b)).collect();
+                eprintln!("  0x{:04X}: {}", i * 16, hex.trim());
+            }
+        }
+
+        // Also dump at 0x400 (output buffer) with more bytes
+        eprintln!("\n--- Memory Dump at 0x400 (output buffer) ---");
+        if let Ok(data) = runner.read_tile_memory(0, 2, 0x400, 64) {
+            for (i, chunk) in data.chunks(16).enumerate() {
+                let hex: String = chunk.iter().map(|b| format!("{:02X} ", b)).collect();
+                eprintln!("  0x{:04X}: {}", 0x400 + i * 16, hex.trim());
+            }
+        }
+
+        // And at 0x8000 (input buffer)
+        eprintln!("\n--- Memory Dump at 0x8000 (input buffer) ---");
+        if let Ok(data) = runner.read_tile_memory(0, 2, 0x8000, 64) {
+            for (i, chunk) in data.chunks(16).enumerate() {
+                let hex: String = chunk.iter().map(|b| format!("{:02X} ", b)).collect();
+                eprintln!("  0x{:04X}: {}", 0x8000 + i * 16, hex.trim());
+            }
+        }
+
+        if error_encountered {
+            eprintln!("\nNOTE: Error indicates an unknown instruction that needs implementation.");
+            eprintln!("Check the PC address to find which instruction caused the error.");
+        }
+
+        // Read output buffer to see if any computation happened
+        let output = runner.read_tile_memory(0, 2, 0x400, 32).unwrap();
+        let output_u32: Vec<u32> = output
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        eprintln!("\nOutput buffer at 0x400: {:?}", output_u32);
+
+        // Show lock states
+        if let Some(tile) = runner.engine.device().tile(0, 2) {
+            eprintln!("Lock states: [{}, {}, {}, {}]",
+                tile.locks[0].value,
+                tile.locks[1].value,
+                tile.locks[2].value,
+                tile.locks[3].value);
+        }
+
+        // If we got an error, this is informative - we know what instruction to implement
+        // If we halted, that's progress!
+        // The test passes either way - it's diagnostic
+        eprintln!("\n=== End Diagnostic Trace ===\n");
+    }
 }

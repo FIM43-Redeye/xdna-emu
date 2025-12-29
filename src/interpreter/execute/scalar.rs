@@ -26,6 +26,8 @@ impl ScalarAlu {
             Operation::ScalarAdd => {
                 let (a, b) = Self::get_two_sources(op, ctx);
                 let result = a.wrapping_add(b);
+                #[cfg(test)]
+                eprintln!("[ADD] {} + {} = {} -> {:?} (sources={:?})", a, b, result, op.dest, op.sources);
                 Self::write_dest(op, ctx, result);
                 ctx.set_flags(Flags::from_add(a, b, result));
                 true

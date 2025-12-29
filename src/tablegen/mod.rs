@@ -86,7 +86,17 @@ pub fn load_from_llvm_aie(llvm_aie_path: impl AsRef<Path>) -> Result<TableGenDat
 
     let slots_content = std::fs::read_to_string(base.join("AIE2Slots.td"))?;
     let formats_content = std::fs::read_to_string(base.join("AIE2GenInstrFormats.td"))?;
-    let instrs_content = std::fs::read_to_string(base.join("AIE2GenInstrInfo.td"))?;
+
+    // Load instruction definitions from all files
+    // - AIE2GenInstrInfo.td: Generated instruction definitions
+    // - AIE2InstrInfo.td: Main instruction definitions (NOPV, etc.)
+    // - AIE2GenFixupInstrInfo.td: Fixup/vector instructions (VMOV, VADD, etc.)
+    let gen_instrs = std::fs::read_to_string(base.join("AIE2GenInstrInfo.td"))?;
+    let main_instrs = std::fs::read_to_string(base.join("AIE2InstrInfo.td"))
+        .unwrap_or_default();
+    let fixup_instrs = std::fs::read_to_string(base.join("AIE2GenFixupInstrInfo.td"))
+        .unwrap_or_default();
+    let instrs_content = format!("{}\n{}\n{}", gen_instrs, main_instrs, fixup_instrs);
 
     // Try to load patterns file (may not exist in all versions)
     let patterns_content = std::fs::read_to_string(base.join("AIE2InstrPatterns.td")).ok();
@@ -154,13 +164,18 @@ mod tests {
         }
 
         // Check some known instructions
-        let add_count = data
+        let add_instrs: Vec<_> = data
             .instructions
             .keys()
             .filter(|k| k.starts_with("ADD"))
-            .count();
-        eprintln!("Found {} ADD* instructions", add_count);
-        assert!(add_count > 0, "Should have ADD instructions");
+            .collect();
+        eprintln!("Found {} ADD* instructions: {:?}", add_instrs.len(), add_instrs);
+        assert!(!add_instrs.is_empty(), "Should have ADD instructions");
+
+        // Check ADD_NC specifically
+        if let Some(add_nc) = data.instructions.get("ADD_NC") {
+            eprintln!("ADD_NC: format={}, mnemonic={}", add_nc.format, add_nc.mnemonic);
+        }
     }
 
     #[test]
@@ -303,6 +318,68 @@ mod tests {
         eprintln!("Instructions by slot:");
         for (slot, instrs) in &by_slot {
             eprintln!("  {}: {} instructions", slot, instrs.len());
+        }
+
+        // Check ADD_NC specifically
+        if let Some(add_nc) = encodings.iter().find(|e| e.name == "ADD_NC") {
+            eprintln!(
+                "ADD_NC: slot={}, mask=0x{:X}, bits=0x{:X}, mnemonic={}, fields={:?}",
+                add_nc.slot,
+                add_nc.fixed_mask,
+                add_nc.fixed_bits,
+                add_nc.mnemonic,
+                add_nc.operand_fields.iter().map(|f| (&f.name, f.bit_position, f.width)).collect::<Vec<_>>()
+            );
+        } else {
+            eprintln!("ADD_NC not found in resolved encodings!");
+        }
+
+        // Check the format class for ADD_NC
+        if let Some(format) = data.formats.get("AIE2_mv_add_inst_mv") {
+            eprintln!(
+                "AIE2_mv_add_inst_mv format: slot_field={:?}, encoding={:?}",
+                format.slot_field,
+                format.encoding
+            );
+        } else {
+            eprintln!("AIE2_mv_add_inst_mv format not found!");
+        }
+
+        // Check vec format classes
+        let vec_formats: Vec<_> = data.formats.keys().filter(|k| k.contains("_vec")).collect();
+        eprintln!("Vec format classes: {} total", vec_formats.len());
+        for name in vec_formats.iter().take(5) {
+            if let Some(format) = data.formats.get(*name) {
+                eprintln!("  {}: slot_field={:?}, encoding.len={}", name, format.slot_field, format.encoding.len());
+            }
+        }
+
+        // Check NOPV encoding
+        if let Some(nopv) = encodings.iter().find(|e| e.name == "NOPV") {
+            eprintln!(
+                "NOPV: slot={}, mask=0x{:X}, bits=0x{:X}",
+                nopv.slot, nopv.fixed_mask, nopv.fixed_bits
+            );
+        } else {
+            eprintln!("NOPV not found in resolved encodings!");
+        }
+
+        // Check SBC specifically - debug why it's not being resolved
+        if let Some(sbc) = data.instructions.get("SBC") {
+            eprintln!("SBC instruction: format={}, template_args={:?}", sbc.format, sbc.template_args);
+            if let Some(fmt) = data.formats.get(&sbc.format) {
+                eprintln!("  Format found: template_params={:?}", fmt.template_params);
+            } else {
+                eprintln!("  Format NOT FOUND: {}", sbc.format);
+                // List similar format names
+                let similar: Vec<_> = data.formats.keys()
+                    .filter(|k| k.contains("alu"))
+                    .take(10)
+                    .collect();
+                eprintln!("  Similar formats: {:?}", similar);
+            }
+        } else {
+            eprintln!("SBC instruction NOT FOUND in parsed instructions!");
         }
 
         // We should have resolved at least some instructions

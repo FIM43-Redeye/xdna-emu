@@ -76,9 +76,14 @@ impl FastExecutor {
             return Some(result);
         }
 
-        // Unknown operation - treat as NOP
-        if matches!(op.op, Operation::Unknown { .. }) {
-            return None;
+        // Unknown operation - fail loudly to prevent silent incorrect behavior
+        if let Operation::Unknown { opcode } = &op.op {
+            return Some(ExecuteResult::Error {
+                message: format!(
+                    "Unknown instruction opcode 0x{:08X} at slot {:?}",
+                    opcode, op.slot
+                ),
+            });
         }
 
         None
@@ -104,6 +109,8 @@ impl Executor for FastExecutor {
 
         // Execute all slot operations
         for op in bundle.active_slots() {
+            #[cfg(test)]
+            eprintln!("[EXEC] Slot {:?}: op={:?}", op.slot, op.op);
             if let Some(result) = self.execute_slot(op, ctx, tile) {
                 // Control flow result - remember it
                 match &result {

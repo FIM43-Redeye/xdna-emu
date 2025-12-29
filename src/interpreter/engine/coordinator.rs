@@ -329,6 +329,27 @@ impl InterpreterEngine {
         }
     }
 
+    /// Set a pointer register for a core.
+    ///
+    /// AIE2 cores have 8 pointer registers (p0-p7) used for address generation.
+    /// This method allows pre-initializing buffer base addresses before kernel
+    /// execution, as kernels expect the runtime/CDO to configure these pointers.
+    pub fn set_core_pointer(&mut self, col: usize, row: usize, reg: u8, value: u32) {
+        if let Some(core) = self.get_core_mut(col, row) {
+            core.context.pointer.write(reg, value);
+        }
+    }
+
+    /// Set a modifier register for a core.
+    ///
+    /// AIE2 cores have 8 modifier registers (m0-m7) used for addressing modes.
+    /// These are typically set to stride values for loop-based memory access.
+    pub fn set_core_modifier(&mut self, col: usize, row: usize, reg: u8, value: u32) {
+        if let Some(core) = self.get_core_mut(col, row) {
+            core.context.modifier.write(reg, value);
+        }
+    }
+
     /// Execute one cycle on all enabled cores and DMA engines.
     ///
     /// The execution order is:

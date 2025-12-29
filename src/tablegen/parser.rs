@@ -75,8 +75,12 @@ static PATTERNS: LazyLock<Patterns> = LazyLock::new(|| Patterns {
     slot_def: Regex::new(r#"def\s+(\w+)\s*:\s*InstSlot<"(\w+)",\s*(\d+)>"#).unwrap(),
     field_to_find: Regex::new(r#"let\s+FieldToFind\s*=\s*"(\w+)"\s*;"#).unwrap(),
     artificial: Regex::new(r"let\s+Artificial\s*=\s*true\s*;").unwrap(),
+    // Note: Class definitions can span multiple lines
+    // Pattern: class Name<params> : ParentName<args> { body }
+    // The colon and parent class may be on a new line
+    // Template params may contain nested <> like `bits<4> op`, so we use a more permissive pattern
     class_def: Regex::new(
-        r"class\s+(AIE2_\w+)\s*<([^>]*)>\s*(?::\s*(AIE2_\w+)\s*<[^>]*>)?\s*\{",
+        r"class\s+(AIE2_\w+)\s*<((?:[^<>]|<[^>]*>)*)>\s*(?::\s*(AIE2_\w+)\s*<[^>]*>)?\s*\{",
     )
     .unwrap(),
     template_param: Regex::new(r"bits<(\d+)>\s+(\w+)").unwrap(),
@@ -322,10 +326,37 @@ fn parse_field_decls(body: &str) -> HashMap<String, u8> {
 ///
 /// Input: "let alu = {mRx0, mRx, c7s, 0b11, 0b0};"
 /// Output: ("alu", [FieldRef("mRx0"), FieldRef("mRx"), FieldRef("c7s"), Literal(0b11, 2), Literal(0, 1)])
+///
+/// Handles nested braces like: "let mv = {dst,s0,imm{5-2},0b11,imm{1-0},0b11};"
 fn parse_encoding(body: &str) -> Option<(String, Vec<EncodingPart>)> {
-    let caps = PATTERNS.encoding_stmt.captures(body)?;
-    let slot_field = caps.get(1)?.as_str().to_string();
-    let parts_str = caps.get(2)?.as_str();
+    // Find "let <slot> = {" pattern
+    let let_pos = body.find("let ")?;
+    let eq_pos = body[let_pos..].find('=')? + let_pos;
+    let open_brace = body[eq_pos..].find('{')? + eq_pos;
+
+    // Extract slot field name
+    let slot_field = body[let_pos + 4..eq_pos].trim().to_string();
+
+    // Find matching closing brace (handle nested braces)
+    let mut brace_count = 0;
+    let mut close_brace = None;
+    for (i, c) in body[open_brace..].char_indices() {
+        match c {
+            '{' => brace_count += 1,
+            '}' => {
+                brace_count -= 1;
+                if brace_count == 0 {
+                    close_brace = Some(open_brace + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close_brace = close_brace?;
+
+    // Extract content between braces
+    let parts_str = &body[open_brace + 1..close_brace];
 
     let parts: Result<Vec<_>, _> = parts_str
         .split(',')
@@ -710,6 +741,29 @@ class AIE2_add_r_ri_inst_alu <dag outs, dag ins,
 }
 "#;
 
+    // Test multiline format class with bits<N> template parameter (like SBC, ADD)
+    const TEST_FORMAT_ALU_RR: &str = r#"
+class AIE2_alu_r_rr_inst_alu < bits<4> op, dag outs, dag ins, string opcodestr = "", string argstr = "">:
+    AIE2_inst_alu_instr32 <outs, ins, opcodestr, argstr> {
+  bits<5> mRx;
+  bits<4> eBinArith;
+  bits<5> mRx0;
+  bits<5> mRy;
+
+  let alu = {mRx0,mRx,mRy,op,0b1};
+}
+"#;
+
+    const TEST_FORMAT_MV_ADD: &str = r#"
+class AIE2_mv_add_inst_mv < dag outs, dag ins, string opcodestr = "", string argstr = "">:
+    AIE2_inst_mv_instr32 <outs, ins, opcodestr, argstr> {
+  bits<6> imm;
+  bits<7> dst;
+  bits<5> s0;
+  let mv = {dst,s0,imm{5-2},0b11,imm{1-0},0b11};
+}
+"#;
+
     const TEST_INSTR: &str = r#"
 def ADD : AIE2_alu_r_rr_inst_alu<0b0000, (outs eR:$mRx), (ins eR:$mRx0, eR:$mRy), "add", "$mRx, $mRx0, $mRy">;
 "#;
@@ -801,6 +855,65 @@ def ADD : AIE2_alu_r_rr_inst_alu<0b0000, (outs eR:$mRx), (ins eR:$mRx0, eR:$mRy)
 
         // 5 + 5 + 7 + 2 + 1 = 20 bits
         assert_eq!(class.encoding_width(), Some(20));
+    }
+
+    #[test]
+    fn test_parse_format_class_mv_add() {
+        let classes = parse_format_classes(TEST_FORMAT_MV_ADD);
+        eprintln!("Parsed {} classes from MV_ADD format", classes.len());
+        for class in &classes {
+            eprintln!(
+                "  Class: name={}, slot_field={:?}, encoding={:?}",
+                class.name, class.slot_field, class.encoding
+            );
+        }
+        assert_eq!(classes.len(), 1);
+
+        let class = &classes[0];
+        assert_eq!(class.name, "AIE2_mv_add_inst_mv");
+        assert_eq!(class.parent, Some("AIE2_inst_mv_instr32".to_string()));
+        assert_eq!(class.slot_field, Some("mv".to_string()));
+
+        // Check fields
+        assert_eq!(class.fields.get("imm"), Some(&6));
+        assert_eq!(class.fields.get("dst"), Some(&7));
+        assert_eq!(class.fields.get("s0"), Some(&5));
+
+        // Check encoding: {dst,s0,imm{5-2},0b11,imm{1-0},0b11}
+        assert_eq!(class.encoding.len(), 6);
+    }
+
+    #[test]
+    fn test_parse_format_class_alu_rr() {
+        // This tests multiline format class with bits<N> template parameter
+        let classes = parse_format_classes(TEST_FORMAT_ALU_RR);
+        eprintln!("Parsed {} classes from ALU_RR format", classes.len());
+        for class in &classes {
+            eprintln!(
+                "  Class: name={}, parent={:?}, slot_field={:?}, template_params={:?}",
+                class.name, class.parent, class.slot_field, class.template_params
+            );
+        }
+        assert_eq!(classes.len(), 1, "Should parse the alu_r_rr format class");
+
+        let class = &classes[0];
+        assert_eq!(class.name, "AIE2_alu_r_rr_inst_alu");
+        assert_eq!(class.parent, Some("AIE2_inst_alu_instr32".to_string()));
+        assert_eq!(class.slot_field, Some("alu".to_string()));
+
+        // Check template params
+        assert_eq!(class.template_params.len(), 1);
+        assert_eq!(class.template_params[0].name, "op");
+        assert_eq!(class.template_params[0].bits, 4);
+
+        // Check fields
+        assert_eq!(class.fields.get("mRx"), Some(&5));
+        assert_eq!(class.fields.get("mRy"), Some(&5));
+        assert_eq!(class.fields.get("mRx0"), Some(&5));
+        assert_eq!(class.fields.get("op"), Some(&4)); // template param should be in fields too
+
+        // Check encoding: {mRx0,mRx,mRy,op,0b1}
+        assert_eq!(class.encoding.len(), 5);
     }
 
     #[test]

@@ -160,8 +160,14 @@ impl CycleAccurateExecutor {
             return Some(result);
         }
 
-        if matches!(op.op, Operation::Unknown { .. }) {
-            return None;
+        // Unknown operation - fail loudly to prevent silent incorrect behavior
+        if let Operation::Unknown { opcode } = &op.op {
+            return Some(ExecuteResult::Error {
+                message: format!(
+                    "Unknown instruction opcode 0x{:08X} at slot {:?}",
+                    opcode, op.slot
+                ),
+            });
         }
 
         None

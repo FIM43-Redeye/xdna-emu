@@ -277,6 +277,7 @@ impl LatencyTable {
             Operation::ScalarSra => OperationKey::ScalarSra,
             Operation::ScalarMov | Operation::ScalarMovi { .. } => OperationKey::ScalarMov,
             Operation::ScalarCmp => OperationKey::ScalarCmp,
+            Operation::PointerAdd | Operation::PointerMov => OperationKey::Load, // Pointer ops have similar timing to loads
             Operation::Load { .. } => OperationKey::Load,
             Operation::Store { .. } => OperationKey::Store,
             Operation::Branch { .. } => OperationKey::Branch,

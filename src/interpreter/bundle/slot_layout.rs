@@ -218,9 +218,11 @@ pub fn extract_48bit(bytes: &[u8]) -> ExtractedBundle {
         return bundle;
     }
 
-    // Check LDB variants by high5
+    // Check LDB variants by high5 AND additional discriminator bits
+    // Each LDB variant has a specific pattern in both the high 5 bits AND lower bits
+    let bits_4_3 = ((word >> 3) & 0x3) as u8;
     match high5 {
-        0b00001 => {
+        0b00001 if bits_5_3 == 0b000 => {
             // I48_LDB_ST: {0b00001, ldb[15:0], st[20:0], 0b000, 0b101}
             let st_bits = (word >> 6) & ((1u64 << ST_WIDTH) - 1);
             let ldb_bits = (word >> 27) & ((1u64 << LDB_WIDTH) - 1);
@@ -228,7 +230,7 @@ pub fn extract_48bit(bytes: &[u8]) -> ExtractedBundle {
             bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
             return bundle;
         }
-        0b00000 => {
+        0b00000 if bits_4_3 == 0b00 => {
             // I48_LDB_MV: {0b00000, ldb[15:0], mv[21:0], 0b00, 0b101}
             let mv_bits = (word >> 5) & ((1u64 << MV_WIDTH) - 1);
             let ldb_bits = (word >> 27) & ((1u64 << LDB_WIDTH) - 1);
@@ -236,7 +238,7 @@ pub fn extract_48bit(bytes: &[u8]) -> ExtractedBundle {
             bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
             return bundle;
         }
-        0b00010 => {
+        0b00010 if bits_6_3 == 0b0000 => {
             // I48_LDB_ALU: {0b00010, ldb[15:0], alu[19:0], 0b0000, 0b101}
             let alu_bits = (word >> 7) & ((1u64 << ALU_WIDTH) - 1);
             let ldb_bits = (word >> 27) & ((1u64 << LDB_WIDTH) - 1);
@@ -544,64 +546,80 @@ pub fn extract_80bit(bytes: &[u8]) -> ExtractedBundle {
     }
 
     // Pattern: *_ALU_MV or *_LNG patterns
-    if bits_7_0 == 0b0001011 {
+    // From AIE2CompositeFormats.td:
+    // inst_lda_alu_mv = {lda[21], 0b00000[5], alu_mv[43], 0b0001011[7]}
+    // For LNG: alu_mv = {lng[42], 0b0[1]}
+    // For ALU_MV: alu_mv = {alumv[42], 0b1[1]}, alumv = {alu[20], mv[22]}
+    // Note: bits[6:0] is the fixed pattern, bit 7 is the alu_mv discriminator
+    let bits_6_0 = (instr80 & 0x7F) as u8;
+    if bits_6_0 == 0b0001011 {
         // I80_LDA_ALU_MV or I80_LDA_LNG
-        // alu_mv at [63:21], discriminator at bits [20:14] = 0b0001011
-        let alu_mv_lsb = ((instr80 >> 21) & 1) as u8;
+        // Bit 7 distinguishes: 0 = LNG, 1 = ALU_MV
+        let alu_mv_lsb = ((instr80 >> 7) & 1) as u8;
         let lda_bits = ((instr80 >> 55) & ((1u128 << LDA_WIDTH) - 1)) as u64;
         bundle.add_slot(SlotType::Lda, lda_bits, LDA_WIDTH);
 
         if alu_mv_lsb == 1 {
-            // I80_LDA_ALU_MV: alumv = {alu, mv}
-            let mv_bits = ((instr80 >> 22) & ((1u128 << MV_WIDTH) - 1)) as u64;
-            let alu_bits = ((instr80 >> 44) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+            // I80_LDA_ALU_MV: bits 8-29 = mv (22 bits), bits 30-49 = alu (20 bits)
+            let mv_bits = ((instr80 >> 8) & ((1u128 << MV_WIDTH) - 1)) as u64;
+            let alu_bits = ((instr80 >> 30) & ((1u128 << ALU_WIDTH) - 1)) as u64;
             bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
             bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
         } else {
-            // I80_LDA_LNG
-            let lng_bits = ((instr80 >> 22) & ((1u128 << LNG_WIDTH) - 1)) as u64;
+            // I80_LDA_LNG: bits 8-49 = lng (42 bits)
+            let lng_bits = ((instr80 >> 8) & ((1u128 << LNG_WIDTH) - 1)) as u64;
             bundle.add_slot(SlotType::Lng, lng_bits, LNG_WIDTH);
         }
         return bundle;
     }
 
-    if bits_7_0 == 0b0000011 {
+    // From AIE2CompositeFormats.td:
+    // inst_ldb_alu_mv = {0b00000[5], ldb[16], 0b00000[5], alu_mv[43], 0b0000011[7]}
+    // For LNG: alu_mv = {lng[42], 0b0[1]}
+    // For ALU_MV: alu_mv = {alumv[42], 0b1[1]}, alumv = {alu[20], mv[22]}
+    // Note: bits[6:0] is the fixed pattern, bit 7 is the alu_mv discriminator
+    if bits_6_0 == 0b0000011 {
         // I80_LDB_ALU_MV or I80_LDB_LNG
-        // {0b00000, ldb, 0b00000, alu_mv, 0b0000011}
-        let alu_mv_lsb = ((instr80 >> 14) & 1) as u8;
+        // Bit 7 distinguishes: 0 = LNG, 1 = ALU_MV
+        let alu_mv_lsb = ((instr80 >> 7) & 1) as u8;
         let ldb_bits = ((instr80 >> 55) & ((1u128 << LDB_WIDTH) - 1)) as u64;
         bundle.add_slot(SlotType::Ldb, ldb_bits, LDB_WIDTH);
 
         if alu_mv_lsb == 1 {
-            // I80_LDB_ALU_MV
-            let mv_bits = ((instr80 >> 15) & ((1u128 << MV_WIDTH) - 1)) as u64;
-            let alu_bits = ((instr80 >> 37) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+            // I80_LDB_ALU_MV: bits 8-29 = mv (22 bits), bits 30-49 = alu (20 bits)
+            let mv_bits = ((instr80 >> 8) & ((1u128 << MV_WIDTH) - 1)) as u64;
+            let alu_bits = ((instr80 >> 30) & ((1u128 << ALU_WIDTH) - 1)) as u64;
             bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
             bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
         } else {
-            // I80_LDB_LNG
-            let lng_bits = ((instr80 >> 15) & ((1u128 << LNG_WIDTH) - 1)) as u64;
+            // I80_LDB_LNG: bits 8-49 = lng (42 bits)
+            let lng_bits = ((instr80 >> 8) & ((1u128 << LNG_WIDTH) - 1)) as u64;
             bundle.add_slot(SlotType::Lng, lng_bits, LNG_WIDTH);
         }
         return bundle;
     }
 
-    if bits_7_0 == 0b0010011 {
+    // From AIE2CompositeFormats.td:
+    // inst_st_alu_mv = {st[21], 0b00000[5], alu_mv[43], 0b0010011[7]}
+    // For LNG: alu_mv = {lng[42], 0b0[1]}
+    // For ALU_MV: alu_mv = {alumv[42], 0b1[1]}, alumv = {alu[20], mv[22]}
+    // Note: bits[6:0] is the fixed pattern, bit 7 is the alu_mv discriminator
+    if bits_6_0 == 0b0010011 {
         // I80_ST_ALU_MV or I80_ST_LNG
-        // {st, 0b00000, alu_mv, 0b0010011}
-        let alu_mv_lsb = ((instr80 >> 14) & 1) as u8;
+        // Bit 7 distinguishes: 0 = LNG, 1 = ALU_MV
+        let alu_mv_lsb = ((instr80 >> 7) & 1) as u8;
         let st_bits = ((instr80 >> 55) & ((1u128 << ST_WIDTH) - 1)) as u64;
         bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
 
         if alu_mv_lsb == 1 {
-            // I80_ST_ALU_MV
-            let mv_bits = ((instr80 >> 15) & ((1u128 << MV_WIDTH) - 1)) as u64;
-            let alu_bits = ((instr80 >> 37) & ((1u128 << ALU_WIDTH) - 1)) as u64;
+            // I80_ST_ALU_MV: bits 8-29 = mv (22 bits), bits 30-49 = alu (20 bits)
+            let mv_bits = ((instr80 >> 8) & ((1u128 << MV_WIDTH) - 1)) as u64;
+            let alu_bits = ((instr80 >> 30) & ((1u128 << ALU_WIDTH) - 1)) as u64;
             bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
             bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
         } else {
-            // I80_ST_LNG
-            let lng_bits = ((instr80 >> 15) & ((1u128 << LNG_WIDTH) - 1)) as u64;
+            // I80_ST_LNG: bits 8-49 = lng (42 bits)
+            let lng_bits = ((instr80 >> 8) & ((1u128 << LNG_WIDTH) - 1)) as u64;
             bundle.add_slot(SlotType::Lng, lng_bits, LNG_WIDTH);
         }
         return bundle;
@@ -977,10 +995,15 @@ pub fn extract_112bit(bytes: &[u8]) -> ExtractedBundle {
     }
 
     // Non-VEC patterns with discriminator 0b0000111 at bits [6:0]
+    // From AIE2CompositeFormats.td:
+    // inst_lda_ldb_st_alu_mv = {lda[21], ldb[16], alu_mv[43], st[21], 0b0000111[7]}
+    // For LNG: alu_mv = {lng[42], 0b0[1]} - bit 28 = 0
+    // For ALU_MV: alu_mv = {alumv[42], 0b1[1]} - bit 28 = 1
     if (instr112 & 0x7F) == 0b0000111 {
         // I112_LDA_LDB_ALU_MV_ST or I112_LDA_LDB_LNG_ST
-        let alu_mv_lsb = ((instr112 >> 7) & 1) as u8;
-        let st_bits = ((instr112 >> 8) & ((1u128 << ST_WIDTH) - 1)) as u64;
+        // Bit layout: [6:0]=marker, [27:7]=st, [70:28]=alu_mv, [86:71]=ldb, [107:87]=lda
+        let st_bits = ((instr112 >> 7) & ((1u128 << ST_WIDTH) - 1)) as u64;
+        let alu_mv_lsb = ((instr112 >> 28) & 1) as u8;
         let ldb_bits = ((instr112 >> 71) & ((1u128 << LDB_WIDTH) - 1)) as u64;
         let lda_bits = ((instr112 >> 87) & ((1u128 << LDA_WIDTH) - 1)) as u64;
         bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);

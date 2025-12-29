@@ -24,6 +24,11 @@ impl MemoryUnit {
     ///
     /// Returns `true` if the operation was handled, `false` if not a memory op.
     pub fn execute(op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) -> bool {
+        #[cfg(test)]
+        if matches!(&op.op, Operation::PointerMov) {
+            eprintln!("[MEM EXEC] Got PointerMov: dest={:?} sources={:?}", op.dest, op.sources);
+        }
+
         match &op.op {
             Operation::Load { width, post_modify } => {
                 Self::execute_load(op, ctx, tile, *width, post_modify);
@@ -35,8 +40,75 @@ impl MemoryUnit {
                 true
             }
 
+            Operation::PointerAdd => {
+                Self::execute_pointer_add(op, ctx);
+                true
+            }
+
+            Operation::PointerMov => {
+                Self::execute_pointer_mov(op, ctx);
+                true
+            }
+
             _ => false, // Not a memory operation
         }
+    }
+
+    /// Execute pointer add: ptr = ptr + offset.
+    /// padda, paddb, padds instructions modify pointer registers for address generation.
+    fn execute_pointer_add(op: &SlotOp, ctx: &mut ExecutionContext) {
+        // Get destination pointer register
+        let ptr_reg = match &op.dest {
+            Some(Operand::PointerReg(r)) => *r,
+            _ => return, // No valid destination
+        };
+
+        // Get current pointer value
+        let ptr_value = ctx.pointer.read(ptr_reg);
+
+        // Get offset from source operand
+        let offset = match op.sources.first() {
+            Some(Operand::Immediate(imm)) => *imm as i32,
+            Some(Operand::ScalarReg(r)) => ctx.scalar.read(*r) as i32,
+            Some(Operand::ModifierReg(r)) => ctx.modifier.read(*r) as i32,
+            _ => 0,
+        };
+
+        // Add offset to pointer (wrapping)
+        let new_value = (ptr_value as i32).wrapping_add(offset) as u32;
+
+        #[cfg(test)]
+        eprintln!("[PADD] p{}=0x{:04X} + {} = 0x{:04X} sources={:?} dest={:?}",
+            ptr_reg, ptr_value, offset, new_value, op.sources, op.dest);
+
+        ctx.pointer.write(ptr_reg, new_value);
+    }
+
+    /// Execute pointer move: ptr = value.
+    /// mova, movb instructions set pointer registers.
+    fn execute_pointer_mov(op: &SlotOp, ctx: &mut ExecutionContext) {
+        // Get destination pointer register
+        let ptr_reg = match &op.dest {
+            Some(Operand::PointerReg(r)) => *r,
+            _ => {
+                #[cfg(test)]
+                eprintln!("[PMOV] No dest pointer! dest={:?}", op.dest);
+                return; // No valid destination
+            }
+        };
+
+        // Get value from source operand
+        let value = match op.sources.first() {
+            Some(Operand::Immediate(imm)) => *imm as u32,
+            Some(Operand::ScalarReg(r)) => ctx.scalar.read(*r),
+            Some(Operand::PointerReg(r)) => ctx.pointer.read(*r),
+            _ => 0,
+        };
+
+        #[cfg(test)]
+        eprintln!("[PMOV] p{}=0x{:04X} sources={:?}", ptr_reg, value, op.sources);
+
+        ctx.pointer.write(ptr_reg, value);
     }
 
     /// Execute a load operation.
@@ -50,6 +122,10 @@ impl MemoryUnit {
         // Get address from source operand
         let addr = Self::get_address(op, ctx);
 
+        // Debug: log load operations
+        #[cfg(test)]
+        eprintln!("[LOAD] addr=0x{:04X} sources={:?} dest={:?}", addr, op.sources, op.dest);
+
         // Handle full vector loads specially
         if width == MemWidth::Vector256 {
             let vec_data = Self::read_vector_from_memory(tile, addr);
@@ -59,6 +135,8 @@ impl MemoryUnit {
         } else {
             // Scalar/partial loads
             let value = Self::read_memory(tile, addr, width);
+            #[cfg(test)]
+            eprintln!("[LOAD] loaded value=0x{:08X} ({}) to {:?}", value, value, op.dest);
             Self::write_dest(op, ctx, value, width);
         }
 
@@ -76,6 +154,10 @@ impl MemoryUnit {
     ) {
         // Get address from first source operand
         let addr = Self::get_address(op, ctx);
+
+        // Debug: log store operations
+        #[cfg(test)]
+        eprintln!("[STORE] addr=0x{:04X} sources={:?} dest={:?}", addr, op.sources, op.dest);
 
         // Handle full vector stores specially
         if width == MemWidth::Vector256 {
@@ -96,6 +178,8 @@ impl MemoryUnit {
         } else {
             // Scalar/partial stores
             let value = Self::get_store_value(op, ctx, width);
+            #[cfg(test)]
+            eprintln!("[STORE] value=0x{:08X} width={:?}", value, width);
             Self::write_memory(tile, addr, value, width);
         }
 

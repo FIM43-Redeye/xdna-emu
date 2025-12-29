@@ -295,8 +295,20 @@ impl InstructionDecoder {
             Operation::ScalarShr
         } else if mnemonic.starts_with("asr") {
             Operation::ScalarSra
+        } else if mnemonic.starts_with("mova") || mnemonic.starts_with("movb") {
+            // mova, movb - pointer move operations (check before generic mov)
+            Operation::PointerMov
         } else if mnemonic.starts_with("mov") {
             Operation::ScalarMov
+        } else if mnemonic.starts_with("padd") {
+            // padda, paddb, padds - pointer add operations
+            Operation::PointerAdd
+        } else if mnemonic == "add" || mnemonic.starts_with("add.") {
+            // Scalar addition (add, add.nc, add.s, add.u, etc.)
+            Operation::ScalarAdd
+        } else if mnemonic == "sub" || mnemonic.starts_with("sub.") || mnemonic == "sbc" {
+            // Scalar subtraction (sub, sub.nc, sbc = subtract with borrow)
+            Operation::ScalarSub
         } else if mnemonic.starts_with("lda") || mnemonic.starts_with("ldb") || mnemonic.starts_with("ld") {
             Operation::Load {
                 width: MemWidth::Word,
@@ -323,7 +335,8 @@ impl InstructionDecoder {
             Operation::VectorMac {
                 element_type: self.infer_element_type(&mnemonic),
             }
-        } else if mnemonic == "nop" {
+        } else if mnemonic.starts_with("nop") {
+            // Handle all slot-specific NOPs: nop, nopa, nopb, nopm, nops, nopv, nopx, nopxm
             Operation::Nop
         } else if mnemonic.starts_with("acq") {
             Operation::LockAcquire
@@ -429,8 +442,74 @@ impl InstructionDecoder {
         // - mRx0, mRy, s0, s1, src -> source registers
         // - imm, offset -> immediates
 
+        #[cfg(test)]
+        if decoded.encoding.slot == "st" || decoded.encoding.slot == "lda" || decoded.encoding.slot == "ldb" {
+            let field_info: Vec<String> = decoded.encoding.operand_fields.iter()
+                .map(|f| format!("{}=0x{:X}", f.name, decoded.operand(&f.name).unwrap_or(0)))
+                .collect();
+            eprintln!("[DECODE {}] mnemonic={} fields={:?}", decoded.encoding.slot.to_uppercase(), decoded.encoding.mnemonic, field_info);
+        }
+
         for field in &decoded.encoding.operand_fields {
             let value = decoded.operand(&field.name).unwrap_or(0);
+
+            // Special handling for address generator fields (ag_all, ag_idx, agb_sa, etc.)
+            // These encode pointer register, modifier, and addressing mode
+            if field.name.starts_with("ag") {
+                // Extract pointer register from low 3 bits
+                let ptr_reg = (value & 0x7) as u8;
+                // Extract modifier register from bits 3-7 (may vary by encoding)
+                let mod_reg = ((value >> 3) & 0x1F) as u8;
+
+                // For paddb/padda, this is the destination pointer (modified in place)
+                let mnemonic = decoded.encoding.mnemonic.to_lowercase();
+                if mnemonic.starts_with("padd") {
+                    // For pointer add, the pointer is both source and destination
+                    dest = Some(Operand::PointerReg(ptr_reg));
+                    sources.push(Operand::ModifierReg(mod_reg));
+                } else {
+                    // For load/store, pointer is the address source
+                    sources.push(Operand::PointerReg(ptr_reg));
+                    sources.push(Operand::ModifierReg(mod_reg));
+                }
+                continue;
+            }
+
+            // Special handling for scalar store value (mSclSt)
+            if field.name == "mSclSt" || field.name.contains("SclSt") {
+                // This is the scalar register to store
+                sources.push(Operand::ScalarReg(value as u8));
+                continue;
+            }
+
+            // Special handling for scalar load destination (mSclLd, mLdaScl, mLdbScl)
+            if field.name == "mSclLd" || field.name.contains("SclLd")
+                || field.name == "mLdaScl" || field.name == "mLdbScl" {
+                // This is the scalar register to load into
+                dest = Some(Operand::ScalarReg(value as u8));
+                continue;
+            }
+
+            // Special handling for mova/movb coarse granularity field (mLdaCg)
+            // This contains pointer register and mode info for pointer moves
+            if field.name == "mLdaCg" || field.name == "mLdbCg" {
+                // Extract pointer register from low bits
+                let ptr_reg = (value & 0x7) as u8;
+                dest = Some(Operand::PointerReg(ptr_reg));
+                continue;
+            }
+
+            // Special handling for c11s (11-bit signed constant for mova/movb)
+            if field.name == "c11s" {
+                // Sign-extend 11-bit value
+                let sign_extended = if value & 0x400 != 0 {
+                    value | 0xFFFFF800 // Sign extend
+                } else {
+                    value
+                } as i32;
+                sources.push(Operand::Immediate(sign_extended));
+                continue;
+            }
 
             // Determine if this is a destination or source
             let is_dest = field.name.contains("mRx")
@@ -442,6 +521,10 @@ impl InstructionDecoder {
                 || field.name == "src";
             let is_imm = field.name.contains("imm")
                 || field.name.contains("offset")
+                || field.name.contains("target")
+                || field.name.contains("addr")
+                || field.name.contains("tgt")
+                || field.name.contains("disp")  // displacement
                 || field.name.starts_with("i");
 
             let operand = if is_imm {
@@ -452,7 +535,10 @@ impl InstructionDecoder {
                 Operand::VectorReg(value as u8)
             } else if field.name.starts_with("acc") {
                 Operand::AccumReg(value as u8)
-            } else if field.name.starts_with("m") && !field.name.contains("mR") {
+            } else if field.name.starts_with("mP") {
+                // Pointer register with mPx naming
+                Operand::PointerReg(value as u8)
+            } else if field.name.starts_with("m") && !field.name.contains("mR") && !field.name.contains("mS") {
                 Operand::ModifierReg(value as u8)
             } else {
                 Operand::ScalarReg(value as u8)
@@ -534,11 +620,18 @@ impl Decoder for InstructionDecoder {
                 };
 
                 // Try to decode the slot bits against known encodings
-                if slot.slot_type == SlotType::Nop {
+                // Zero bits means no operation in this slot - treat as NOP
+                if slot.slot_type == SlotType::Nop || slot.bits == 0 {
                     bundle.set_slot(SlotOp::nop(slot_index));
                 } else if let Some(decoded) = self.decode_slot_bits(slot.bits, slot.slot_type) {
                     let operation = self.to_operation(&decoded);
                     let (dest, sources) = self.extract_operands(&decoded);
+
+                    #[cfg(test)]
+                    if slot.slot_type == SlotType::Alu || slot.slot_type == SlotType::Mv {
+                        eprintln!("[DECODE {:?}] mnemonic={} op={:?} bits=0x{:X}",
+                            slot.slot_type, decoded.encoding.mnemonic, operation, slot.bits);
+                    }
 
                     let mut slot_op = SlotOp::new(slot_index, operation);
                     if let Some(d) = dest {
@@ -551,6 +644,10 @@ impl Decoder for InstructionDecoder {
                     bundle.set_slot(slot_op);
                 } else {
                     // Slot extracted but not recognized - mark as unknown with slot info
+                    #[cfg(test)]
+                    if slot.slot_type == SlotType::Alu || slot.slot_type == SlotType::Mv {
+                        eprintln!("[DECODE {:?} FAIL] bits=0x{:X} - no matching encoding", slot.slot_type, slot.bits);
+                    }
                     let slot_name = match slot.slot_type {
                         SlotType::Lda => "lda",
                         SlotType::Ldb => "ldb",

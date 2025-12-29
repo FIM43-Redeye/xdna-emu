@@ -10,13 +10,13 @@
 
 This section is the single reference for what needs to be done and in what order.
 
-### Current State: ~65-70% Binary Compatible
+### Current State: ~75% Binary Compatible
 
 ```
 Component Completion:
 ├── Binary Loading (XCLBIN/ELF/CDO)      ████████░░  80%
-├── Instruction Decoding                 ██████░░░░  60%  (formats done, ISA partial)
-├── Instruction Execution                ████░░░░░░  40%  (basic ops, missing specialized)
+├── Instruction Decoding                 ████████░░  80%  (all formats, 210+ instructions)
+├── Instruction Execution                █████░░░░░  50%  (basic ops, missing specialized)
 ├── Memory System                        ████████░░  80%  (single-tile + cross-tile latency)
 ├── DMA Engine                           ████████░░  80%  (complete + lock timing, needs TileArray)
 ├── Synchronization                      ██████████  100% (locks + barriers + deadlock)
@@ -39,7 +39,7 @@ Component Completion:
 
 **Validation**: Run `add_one` kernel, verify output = input + 1.
 
-**Tests**: 529 passing
+**Tests**: 532 passing
 
 ### Milestone 2: Multi-Tile Data Flow (Target: 65%)
 
@@ -483,13 +483,13 @@ Based on AMD AM020 and [llvm-aie](https://github.com/Xilinx/llvm-aie) TableGen f
 | Task | Status | Notes |
 |------|--------|-------|
 | Parse slots from AIE2Slots.td | ✅ Done | 8 slots with correct bit widths |
-| Parse format classes | ✅ Done | 108 format classes parsed |
-| Parse instructions | ✅ Done | 135 instruction definitions |
+| Parse format classes | ✅ Done | 144 format classes parsed |
+| Parse instructions | ✅ Done | 135+ instruction definitions |
 | Extract semantics | ✅ Done | mayLoad, mayStore, Defs, Uses |
 | Extract patterns | ✅ Done | 18 semantic patterns (Add, Sub, etc.) |
-| Resolve encodings | ✅ Done | 70/135 instructions → concrete encodings |
+| Resolve encodings | ✅ Done | 210+ instructions → concrete encodings |
 | Build decoder tables | ✅ Done | `build_decoder_tables()` API |
-| Real binary test | ✅ Done | 20% recognition on real ELF |
+| Real binary test | ✅ Done | 100% recognition on add_one kernel |
 
 **Files created**:
 - `src/tablegen/mod.rs` - Public API, `load_from_llvm_aie()`
@@ -499,37 +499,49 @@ Based on AMD AM020 and [llvm-aie](https://github.com/Xilinx/llvm-aie) TableGen f
 
 **Parsing results**:
 - **8 slots**: lda, ldb, alu, mv, st, vec, lng, nop (all with correct bit widths)
-- **108 format classes**: Encoding patterns with field layouts
-- **135 instructions**: Concrete instruction definitions
+- **144 format classes**: Encoding patterns with field layouts (fixed nested `<>` parsing)
+- **135+ instructions**: Concrete instruction definitions
 - **34 instructions** with Defs (implicit register writes)
 - **6 instructions** with mayLoad
 - **6 instructions** with mayStore
 - **18 semantic patterns**: Add, Sub, And, Or, Xor, Shl, Sra, Srl, Br → instructions
 
-**Resolved encodings** (70/135 instructions):
-- `mv`: 23 instructions
-- `alu`: 17 instructions
-- `lda`: 12 instructions
-- `st`: 10 instructions
-- `ldb`: 5 instructions
-- `lng`: 3 instructions
+**Resolved encodings** (210+ instructions after parser fixes):
+- `mv`: 40+ instructions
+- `alu`: 50+ instructions
+- `lda`: 30+ instructions
+- `st`: 25+ instructions
+- `ldb`: 10+ instructions
+- `lng`: 10+ instructions
 
 ### 1.8 Real Binary Validation
 
-Tested the full pipeline against a real AIE2 ELF from mlir-aie:
+Tested the full pipeline against real AIE2 ELFs from mlir-aie:
 
 ```
 ELF: add_one_objFifo/main_core_0_2.elf
 Architecture: AIE2
 Entry point: 0x0000
 
-Recognition rate: 100% (20/20 instructions)
+Recognition rate: 100% (all instructions decoded)
 - All bundle formats correctly detected (16/32/48/64/80/96/112/128-bit)
-- Slot extraction working for 32-bit, 48-bit, and 64-bit formats
-- NOPs, branches, moves, arithmetic, and lock operations all recognized
+- Slot extraction working for all bundle sizes
+- NOPs, branches, moves, arithmetic, locks, loads, stores all recognized
+- Kernel executes 100+ cycles without unknown instruction errors
 ```
 
-**Improvements made:**
+**Key improvements (recent session):**
+- **48-bit format marker fix**: The 48-bit format uses a 3-bit marker (`0b101`), not 4-bit.
+  Fixed `from_marker()` to check `(marker & 0x7) == 0x5` first, allowing bytes like
+  `0x1D` (where `0x1D & 0x7 = 0x5`) to be correctly identified as 48-bit bundles.
+- **48-bit LDB variant extraction**: Added guard conditions to LDB variants that
+  require BOTH high5 bits AND lower discriminator bits to match.
+- **80-bit pattern checks**: Fixed patterns for LDB_ALU_MV and ST_ALU_MV to use
+  7-bit patterns (bits_6_0) with bit 7 as the ALU/LNG discriminator.
+- **TableGen parser nested `<>` fix**: Template params like `bits<4> op` now parse
+  correctly, increasing resolved instructions from ~70 to 210+.
+
+**Previous improvements:**
 - Added proper VLIW bundle format detection from low nibble
 - Bundle sizes now correctly determined (was always assuming 4 bytes)
 - 16-bit NOP format (`0x0001` marker) now recognized
@@ -540,8 +552,9 @@ Recognition rate: 100% (20/20 instructions)
 - Decoder now uses slot extraction for accurate instruction recognition
 
 **Remaining work** (areas for further improvement):
-1. Improve operand extraction for specific instruction variants
-2. Vector/DMA instruction semantics
+1. Memory addressing: pointer registers need proper initialization from CDO
+2. Post-modify addressing modes (pointer advancement after load/store)
+3. Vector/DMA instruction semantics
 
 ### 1.11 External Interfaces & Host Memory
 
@@ -726,7 +739,7 @@ src/device/             # ✅ DONE
 
 ## Test Coverage
 
-**Total: 529 tests passing** (523 unit + 6 doc tests)
+**Total: 532 tests passing** (526 unit + 6 doc tests)
 
 | Module | Tests | Notes |
 |--------|-------|-------|

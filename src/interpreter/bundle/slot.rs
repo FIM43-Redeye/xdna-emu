@@ -282,6 +282,14 @@ pub enum Operation {
         element_type: ElementType,
     },
 
+    // ========== Pointer Operations ==========
+    /// Pointer add: ptr = ptr + offset (for address generation).
+    /// Used by padda, paddb, padds instructions.
+    PointerAdd,
+    /// Pointer move: ptr = value.
+    /// Used by mova, movb instructions.
+    PointerMov,
+
     // ========== Memory Operations ==========
     /// Load from memory.
     Load {
@@ -394,7 +402,7 @@ impl Operation {
 
             Operation::VectorMac { .. } => SlotIndex::Accumulator,
 
-            Operation::Load { .. } => SlotIndex::Load,
+            Operation::PointerAdd | Operation::PointerMov | Operation::Load { .. } => SlotIndex::Load,
             Operation::Store { .. } => SlotIndex::Store,
 
             Operation::Branch { .. }

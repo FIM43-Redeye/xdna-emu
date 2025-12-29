@@ -288,6 +288,9 @@ fn disassemble_op(slot_op: &SlotOp) -> String {
         Operation::VectorMin { .. } => "vmin",
         Operation::VectorMax { .. } => "vmax",
 
+        Operation::PointerAdd => "padd",
+        Operation::PointerMov => "pmov",
+
         Operation::Load { width, .. } => return format!("ld.{}", width_suffix(*width)),
         Operation::Store { width, .. } => return format!("st.{}", width_suffix(*width)),
 
