@@ -21,8 +21,137 @@ use super::registers::{
     AccumulatorRegisterFile, ModifierRegisterFile, PointerRegisterFile, ScalarRegisterFile,
     VectorRegisterFile,
 };
-use crate::interpreter::timing::{HazardDetector, LatencyTable, MemoryModel};
+use crate::interpreter::timing::{HazardDetector, HazardType, LatencyTable, MemoryModel};
 use crate::interpreter::traits::{Flags, StateAccess};
+
+// ============================================================================
+// Event Tracing
+// ============================================================================
+
+/// Types of events that can be recorded for profiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventType {
+    /// Instruction execution started.
+    InstructionStart { pc: u32 },
+    /// Instruction execution completed.
+    InstructionComplete { pc: u32, latency: u8 },
+    /// Pipeline stall due to register hazard.
+    RegisterHazard { hazard_type: HazardType, register: u8, cycles: u8 },
+    /// Pipeline stall due to memory bank conflict.
+    MemoryConflict { bank: u8, cycles: u8 },
+    /// Pipeline stall due to branch penalty.
+    BranchPenalty { cycles: u8 },
+    /// Branch taken.
+    BranchTaken { from_pc: u32, to_pc: u32 },
+    /// DMA transfer started.
+    DmaStart { channel: u8 },
+    /// DMA transfer completed.
+    DmaComplete { channel: u8 },
+    /// Lock acquire started.
+    LockAcquireStart { lock_id: u8 },
+    /// Lock acquired successfully.
+    LockAcquired { lock_id: u8 },
+    /// Lock contention (waiting).
+    LockContention { lock_id: u8 },
+    /// Lock released.
+    LockReleased { lock_id: u8 },
+    /// Core halted.
+    Halt,
+}
+
+/// A timestamped event for profiling.
+#[derive(Debug, Clone, Copy)]
+pub struct TimestampedEvent {
+    /// Cycle when the event occurred.
+    pub cycle: u64,
+    /// The event type and details.
+    pub event: EventType,
+}
+
+/// Event log for recording execution events.
+#[derive(Clone)]
+pub struct EventLog {
+    /// Recorded events.
+    events: Vec<TimestampedEvent>,
+    /// Maximum events to keep (circular buffer behavior).
+    max_events: usize,
+    /// Whether tracing is enabled.
+    enabled: bool,
+}
+
+impl EventLog {
+    /// Create a new event log with default capacity.
+    pub fn new() -> Self {
+        Self::with_capacity(10000)
+    }
+
+    /// Create a new event log with specified capacity.
+    pub fn with_capacity(max_events: usize) -> Self {
+        Self {
+            events: Vec::with_capacity(max_events.min(1000)),
+            max_events,
+            enabled: false,
+        }
+    }
+
+    /// Enable event recording.
+    pub fn enable(&mut self) {
+        self.enabled = true;
+    }
+
+    /// Disable event recording.
+    pub fn disable(&mut self) {
+        self.enabled = false;
+    }
+
+    /// Check if recording is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Record an event at the given cycle.
+    #[inline]
+    pub fn record(&mut self, cycle: u64, event: EventType) {
+        if !self.enabled {
+            return;
+        }
+        if self.events.len() >= self.max_events {
+            // Drop oldest events (circular buffer)
+            self.events.remove(0);
+        }
+        self.events.push(TimestampedEvent { cycle, event });
+    }
+
+    /// Get all recorded events.
+    pub fn events(&self) -> &[TimestampedEvent] {
+        &self.events
+    }
+
+    /// Clear all events.
+    pub fn clear(&mut self) {
+        self.events.clear();
+    }
+
+    /// Get the number of recorded events.
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Check if the log is empty.
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
+
+impl Default for EventLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
+// Timing Context
+// ============================================================================
 
 /// Timing context for cycle-accurate execution.
 ///
@@ -44,6 +173,9 @@ pub struct TimingContext {
 
     /// Total memory conflict stall cycles.
     pub memory_stalls: u64,
+
+    /// Event log for profiling/tracing.
+    pub events: EventLog,
 }
 
 impl TimingContext {
@@ -55,6 +187,7 @@ impl TimingContext {
             latencies: LatencyTable::aie2(),
             hazard_stalls: 0,
             memory_stalls: 0,
+            events: EventLog::new(),
         }
     }
 
@@ -70,6 +203,23 @@ impl TimingContext {
         self.memory.reset();
         self.hazard_stalls = 0;
         self.memory_stalls = 0;
+        self.events.clear();
+    }
+
+    /// Enable event tracing.
+    pub fn enable_tracing(&mut self) {
+        self.events.enable();
+    }
+
+    /// Disable event tracing.
+    pub fn disable_tracing(&mut self) {
+        self.events.disable();
+    }
+
+    /// Record an event at the given cycle.
+    #[inline]
+    pub fn record_event(&mut self, cycle: u64, event: EventType) {
+        self.events.record(cycle, event);
     }
 
     /// Get combined timing statistics.
@@ -199,9 +349,21 @@ impl ExecutionContext {
     }
 
     /// Create a new context with cycle-accurate timing enabled.
+    ///
+    /// This enables:
+    /// - Hazard detection (RAW, WAW, WAR)
+    /// - Memory bank conflict modeling
+    /// - Event tracing for profiling
+    ///
+    /// Use `disable_tracing()` on the timing context if you need
+    /// cycle-accurate execution without the overhead of event recording.
     pub fn new_with_timing() -> Self {
         let mut ctx = Self::new();
         ctx.enable_timing();
+        // Enable event tracing by default for profiling
+        if let Some(timing) = ctx.timing_context_mut() {
+            timing.enable_tracing();
+        }
         ctx
     }
 
@@ -592,5 +754,117 @@ mod tests {
         assert_eq!(timing.hazard_stalls, 0);
         assert_eq!(timing.memory_stalls, 0);
         assert_eq!(timing.total_stall_cycles(), 0);
+    }
+
+    // --- Event Log tests ---
+
+    #[test]
+    fn test_event_log_disabled_by_default() {
+        let log = EventLog::new();
+        assert!(!log.is_enabled());
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn test_event_log_record_when_disabled() {
+        let mut log = EventLog::new();
+
+        // Recording when disabled should not add events
+        log.record(10, EventType::InstructionStart { pc: 0x100 });
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn test_event_log_record_when_enabled() {
+        let mut log = EventLog::new();
+        log.enable();
+
+        log.record(10, EventType::InstructionStart { pc: 0x100 });
+        log.record(11, EventType::InstructionComplete { pc: 0x100, latency: 1 });
+
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.events()[0].cycle, 10);
+        assert_eq!(log.events()[1].cycle, 11);
+    }
+
+    #[test]
+    fn test_event_log_clear() {
+        let mut log = EventLog::new();
+        log.enable();
+
+        log.record(1, EventType::Halt);
+        log.record(2, EventType::Halt);
+        assert_eq!(log.len(), 2);
+
+        log.clear();
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn test_event_log_circular_buffer() {
+        let mut log = EventLog::with_capacity(3);
+        log.enable();
+
+        log.record(1, EventType::InstructionStart { pc: 0x100 });
+        log.record(2, EventType::InstructionStart { pc: 0x104 });
+        log.record(3, EventType::InstructionStart { pc: 0x108 });
+
+        // At capacity, next record should drop oldest
+        log.record(4, EventType::InstructionStart { pc: 0x10C });
+
+        assert_eq!(log.len(), 3);
+        // First event (cycle 1) should be dropped
+        assert_eq!(log.events()[0].cycle, 2);
+        assert_eq!(log.events()[2].cycle, 4);
+    }
+
+    #[test]
+    fn test_timing_context_event_tracing() {
+        let mut timing = TimingContext::new();
+
+        // Events disabled by default
+        timing.record_event(10, EventType::BranchTaken { from_pc: 0x100, to_pc: 0x200 });
+        assert!(timing.events.is_empty());
+
+        // Enable tracing
+        timing.enable_tracing();
+        timing.record_event(20, EventType::BranchTaken { from_pc: 0x200, to_pc: 0x300 });
+        assert_eq!(timing.events.len(), 1);
+
+        // Disable tracing
+        timing.disable_tracing();
+        timing.record_event(30, EventType::Halt);
+        assert_eq!(timing.events.len(), 1); // No new event recorded
+    }
+
+    #[test]
+    fn test_event_type_variants() {
+        use crate::interpreter::timing::HazardType;
+
+        // Test that all event variants can be created
+        let events = vec![
+            EventType::InstructionStart { pc: 0x100 },
+            EventType::InstructionComplete { pc: 0x100, latency: 2 },
+            EventType::RegisterHazard { hazard_type: HazardType::Raw, register: 5, cycles: 2 },
+            EventType::MemoryConflict { bank: 3, cycles: 1 },
+            EventType::BranchPenalty { cycles: 3 },
+            EventType::BranchTaken { from_pc: 0x100, to_pc: 0x200 },
+            EventType::DmaStart { channel: 0 },
+            EventType::DmaComplete { channel: 0 },
+            EventType::LockAcquireStart { lock_id: 5 },
+            EventType::LockAcquired { lock_id: 5 },
+            EventType::LockContention { lock_id: 5 },
+            EventType::LockReleased { lock_id: 5 },
+            EventType::Halt,
+        ];
+
+        let mut log = EventLog::new();
+        log.enable();
+
+        for (i, event) in events.into_iter().enumerate() {
+            log.record(i as u64, event);
+        }
+
+        assert_eq!(log.len(), 13);
     }
 }

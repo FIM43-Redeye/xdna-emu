@@ -2,6 +2,17 @@
 //!
 //! The engine manages multiple core interpreters and coordinates their execution.
 //! It also coordinates DMA engines and host memory for data transfers.
+//!
+//! # Execution Modes
+//!
+//! The engine supports two execution modes:
+//!
+//! - **Fast mode** (`InterpreterEngine::new()`): Uses `FastExecutor` for quick
+//!   functional simulation. All instructions execute in 1 cycle.
+//!
+//! - **Cycle-accurate mode** (`InterpreterEngine::new_cycle_accurate()`): Uses
+//!   `CycleAccurateExecutor` with full timing model - hazard detection, memory
+//!   bank conflicts, branch penalties, and event tracing.
 
 use crate::device::dma::ChannelState;
 use crate::device::host_memory::HostMemory;
@@ -9,7 +20,7 @@ use crate::device::tile::TileType;
 use crate::device::DeviceState;
 use crate::interpreter::core::{CoreInterpreter, CoreStatus, StepResult};
 use crate::interpreter::decode::InstructionDecoder;
-use crate::interpreter::execute::FastExecutor;
+use crate::interpreter::execute::{CycleAccurateExecutor, FastExecutor};
 use crate::interpreter::state::ExecutionContext;
 
 /// Engine execution status.
@@ -29,11 +40,83 @@ pub enum EngineStatus {
     Error,
 }
 
+/// Type alias for fast interpreter (no timing).
+type FastInterpreter = CoreInterpreter<InstructionDecoder, FastExecutor>;
+
+/// Type alias for cycle-accurate interpreter (full timing).
+type CycleAccurateInterpreter = CoreInterpreter<InstructionDecoder, CycleAccurateExecutor>;
+
+/// Interpreter variant - either fast or cycle-accurate.
+///
+/// This enum allows the engine to switch between execution modes at creation time.
+/// Fast mode is used for quick functional testing, while cycle-accurate mode
+/// provides detailed timing information for performance analysis.
+enum InterpreterKind {
+    /// Fast execution mode (1 cycle per instruction, no hazard tracking).
+    Fast(FastInterpreter),
+    /// Cycle-accurate execution mode (models pipeline, hazards, memory timing).
+    CycleAccurate(CycleAccurateInterpreter),
+}
+
+impl InterpreterKind {
+    /// Create a new fast interpreter.
+    fn new_fast() -> Self {
+        Self::Fast(CoreInterpreter::new(
+            InstructionDecoder::load_default(),
+            FastExecutor::new(),
+        ))
+    }
+
+    /// Create a new cycle-accurate interpreter.
+    fn new_cycle_accurate() -> Self {
+        Self::CycleAccurate(CoreInterpreter::new(
+            InstructionDecoder::load_default(),
+            CycleAccurateExecutor::new(),
+        ))
+    }
+
+    /// Execute a single step.
+    fn step(&mut self, ctx: &mut ExecutionContext, tile: &mut crate::device::tile::Tile) -> StepResult {
+        match self {
+            Self::Fast(interp) => interp.step(ctx, tile),
+            Self::CycleAccurate(interp) => interp.step(ctx, tile),
+        }
+    }
+
+    /// Get interpreter status.
+    fn status(&self) -> CoreStatus {
+        match self {
+            Self::Fast(interp) => interp.status(),
+            Self::CycleAccurate(interp) => interp.status(),
+        }
+    }
+
+    /// Check if halted.
+    fn is_halted(&self) -> bool {
+        match self {
+            Self::Fast(interp) => interp.is_halted(),
+            Self::CycleAccurate(interp) => interp.is_halted(),
+        }
+    }
+
+    /// Reset the interpreter.
+    fn reset(&mut self) {
+        match self {
+            Self::Fast(interp) => interp.reset(),
+            Self::CycleAccurate(interp) => interp.reset(),
+        }
+    }
+
+    /// Check if this is cycle-accurate mode.
+    fn is_cycle_accurate(&self) -> bool {
+        matches!(self, Self::CycleAccurate(_))
+    }
+}
 
 /// Per-core state managed by the engine.
 struct CoreState {
-    /// Core interpreter.
-    interpreter: CoreInterpreter,
+    /// Core interpreter (fast or cycle-accurate).
+    interpreter: InterpreterKind,
     /// Execution context (registers, PC, flags).
     context: ExecutionContext,
     /// Is this core enabled?
@@ -41,10 +124,20 @@ struct CoreState {
 }
 
 impl CoreState {
+    /// Create a new core state with fast executor.
     fn new() -> Self {
         Self {
-            interpreter: CoreInterpreter::new(InstructionDecoder::load_default(), FastExecutor::new()),
+            interpreter: InterpreterKind::new_fast(),
             context: ExecutionContext::new(),
+            enabled: false,
+        }
+    }
+
+    /// Create a new core state with cycle-accurate executor.
+    fn new_cycle_accurate() -> Self {
+        Self {
+            interpreter: InterpreterKind::new_cycle_accurate(),
+            context: ExecutionContext::new_with_timing(),
             enabled: false,
         }
     }
@@ -54,6 +147,11 @@ impl CoreState {
 ///
 /// Coordinates execution across all compute cores in the device.
 /// Also manages DMA engines and host memory for data transfers.
+///
+/// # Execution Modes
+///
+/// Create with `new()` for fast functional simulation, or `new_cycle_accurate()`
+/// for detailed timing with hazard detection, memory conflicts, and event tracing.
 pub struct InterpreterEngine {
     /// Device state (tiles, memory, locks, DMA engines).
     device: DeviceState,
@@ -75,18 +173,43 @@ pub struct InterpreterEngine {
     total_instructions: u64,
     /// Auto-run mode.
     auto_run: bool,
+    /// Whether cycle-accurate timing is enabled.
+    cycle_accurate: bool,
 }
 
 impl InterpreterEngine {
-    /// Create a new engine from device state.
+    /// Create a new engine from device state (fast mode).
+    ///
+    /// Uses `FastExecutor` - all instructions execute in 1 cycle with no
+    /// pipeline modeling. Ideal for quick functional testing.
     pub fn new(device: DeviceState) -> Self {
+        Self::with_mode(device, false)
+    }
+
+    /// Create a new engine with cycle-accurate timing.
+    ///
+    /// Uses `CycleAccurateExecutor` with full timing model:
+    /// - Register hazard detection (RAW, WAW, WAR)
+    /// - Memory bank conflict modeling
+    /// - Branch penalty tracking
+    /// - Event tracing for profiling
+    pub fn new_cycle_accurate(device: DeviceState) -> Self {
+        Self::with_mode(device, true)
+    }
+
+    /// Internal constructor with timing mode flag.
+    fn with_mode(device: DeviceState, cycle_accurate: bool) -> Self {
         let cols = device.cols();
         let rows = device.rows();
         let compute_row_start = 2; // Rows 0=shim, 1=memtile, 2+=compute
 
         // Create core states for all possible positions
         let num_cores = cols * rows;
-        let cores = (0..num_cores).map(|_| CoreState::new()).collect();
+        let cores = if cycle_accurate {
+            (0..num_cores).map(|_| CoreState::new_cycle_accurate()).collect()
+        } else {
+            (0..num_cores).map(|_| CoreState::new()).collect()
+        };
 
         Self {
             device,
@@ -99,17 +222,33 @@ impl InterpreterEngine {
             total_cycles: 0,
             total_instructions: 0,
             auto_run: false,
+            cycle_accurate,
         }
     }
 
-    /// Create engine for NPU1 (Phoenix).
+    /// Create engine for NPU1 (Phoenix) in fast mode.
     pub fn new_npu1() -> Self {
         Self::new(DeviceState::new_npu1())
     }
 
-    /// Create engine for NPU2 (Strix).
+    /// Create engine for NPU2 (Strix) in fast mode.
     pub fn new_npu2() -> Self {
         Self::new(DeviceState::new_npu2())
+    }
+
+    /// Create engine for NPU1 (Phoenix) with cycle-accurate timing.
+    pub fn new_cycle_accurate_npu1() -> Self {
+        Self::new_cycle_accurate(DeviceState::new_npu1())
+    }
+
+    /// Create engine for NPU2 (Strix) with cycle-accurate timing.
+    pub fn new_cycle_accurate_npu2() -> Self {
+        Self::new_cycle_accurate(DeviceState::new_npu2())
+    }
+
+    /// Check if this engine is running in cycle-accurate mode.
+    pub fn is_cycle_accurate(&self) -> bool {
+        self.cycle_accurate
     }
 
     /// Get the engine status.
@@ -664,5 +803,64 @@ mod tests {
         let mut buf = [0u8; 4];
         engine.host_memory().read_bytes(0x1000, &mut buf);
         assert_eq!(buf, [1, 2, 3, 4]);
+    }
+
+    // --- Cycle-accurate mode tests ---
+
+    #[test]
+    fn test_cycle_accurate_engine_creation() {
+        let engine = InterpreterEngine::new_cycle_accurate_npu1();
+
+        assert!(engine.is_cycle_accurate());
+        assert_eq!(engine.status(), EngineStatus::Ready);
+        assert_eq!(engine.total_cycles(), 0);
+    }
+
+    #[test]
+    fn test_fast_vs_cycle_accurate_mode() {
+        // Verify fast mode creates fast executor
+        let fast_engine = InterpreterEngine::new_npu1();
+        assert!(!fast_engine.is_cycle_accurate());
+
+        // Verify cycle-accurate mode creates cycle-accurate executor
+        let accurate_engine = InterpreterEngine::new_cycle_accurate_npu1();
+        assert!(accurate_engine.is_cycle_accurate());
+    }
+
+    #[test]
+    fn test_cycle_accurate_timing_context_enabled() {
+        let engine = InterpreterEngine::new_cycle_accurate_npu1();
+
+        // Core contexts should have timing enabled
+        let ctx = engine.core_context(0, 2).unwrap();
+        assert!(ctx.has_timing(), "Cycle-accurate cores should have timing context");
+    }
+
+    #[test]
+    fn test_cycle_accurate_step() {
+        let mut engine = InterpreterEngine::new_cycle_accurate_npu1();
+
+        // Enable a core and write NOP to program memory
+        engine.enable_core(0, 2);
+
+        if let Some(tile) = engine.device_mut().tile_mut(0, 2) {
+            tile.write_program(0, &[0x00, 0x00, 0x00, 0x00]);
+        }
+
+        engine.step();
+
+        assert_eq!(engine.status(), EngineStatus::Running);
+        assert_eq!(engine.total_cycles(), 1);
+
+        // Check that PC advanced
+        let ctx = engine.core_context(0, 2).unwrap();
+        assert_eq!(ctx.pc(), 4);
+        assert_eq!(ctx.cycles, 1);
+    }
+
+    #[test]
+    fn test_cycle_accurate_npu2() {
+        let engine = InterpreterEngine::new_cycle_accurate_npu2();
+        assert!(engine.is_cycle_accurate());
     }
 }

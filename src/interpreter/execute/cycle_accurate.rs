@@ -25,11 +25,13 @@
 //! The AIE2 has 8 memory banks. Accessing the same bank from multiple ports
 //! in the same cycle causes a stall.
 
+use crate::device::aie2_spec::BRANCH_PENALTY_CYCLES;
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{Operation, SlotOp, VliwBundle};
-use crate::interpreter::state::ExecutionContext;
+use crate::interpreter::state::{EventType, ExecutionContext};
 use crate::interpreter::timing::{
-    LatencyTable, MemoryAccess, MemoryModel, HazardDetector,
+    check_bundle_conflicts, HazardDetector, HazardStats, LatencyTable, MemoryAccess, MemoryModel,
+    StallReason,
 };
 use crate::interpreter::traits::{ExecuteResult, Executor};
 
@@ -68,6 +70,12 @@ pub struct CycleAccurateExecutor {
 
     /// Total stall cycles from memory conflicts.
     pub total_memory_stalls: u64,
+
+    /// Total stall cycles from branch penalties.
+    pub total_branch_stalls: u64,
+
+    /// Detailed stall breakdown by reason.
+    detailed_stats: HazardStats,
 }
 
 impl CycleAccurateExecutor {
@@ -80,6 +88,8 @@ impl CycleAccurateExecutor {
             memory: MemoryModel::new(),
             total_hazard_stalls: 0,
             total_memory_stalls: 0,
+            total_branch_stalls: 0,
+            detailed_stats: HazardStats::default(),
         }
     }
 
@@ -187,16 +197,28 @@ impl CycleAccurateExecutor {
         self.memory.reset();
         self.total_hazard_stalls = 0;
         self.total_memory_stalls = 0;
+        self.total_branch_stalls = 0;
+        self.detailed_stats = HazardStats::default();
     }
 
     /// Get statistics.
     pub fn stats(&self) -> CycleAccurateStats {
+        // Merge detailed stats with hazard detector stats
+        let mut combined_stats = self.detailed_stats.clone();
+        combined_stats.merge(&self.hazards.stats());
+
         CycleAccurateStats {
             hazard_stalls: self.total_hazard_stalls,
             memory_stalls: self.total_memory_stalls,
-            hazard_stats: self.hazards.stats(),
+            branch_stalls: self.total_branch_stalls,
+            hazard_stats: combined_stats,
             memory_stats: self.memory.stats(),
         }
+    }
+
+    /// Get detailed stall breakdown.
+    pub fn detailed_stats(&self) -> &HazardStats {
+        &self.detailed_stats
     }
 }
 
@@ -215,26 +237,103 @@ impl Executor for CycleAccurateExecutor {
     ) -> ExecuteResult {
         self.pending_call_return_addr = None;
 
+        let pc = ctx.pc();
+        let start_cycle = ctx.cycles;
+
+        // Record instruction start event
+        if let Some(timing) = ctx.timing_context_mut() {
+            timing.record_event(start_cycle, EventType::InstructionStart { pc });
+        }
+
         // Advance timing models to current cycle
         self.hazards.advance_to(ctx.cycles);
         self.memory.advance_to(ctx.cycles);
 
-        // Phase 1: Calculate stalls for all operations
+        // Phase 1: Calculate stalls for all operations and collect StallReasons
         let mut total_stall = 0u8;
+        let mut stall_reasons: Vec<StallReason> = Vec::new();
+
         for op in bundle.active_slots() {
             // Check register hazards
-            let hazard_stall = self.check_hazards(op);
-            total_stall = total_stall.max(hazard_stall);
+            let hazards = self.hazards.check_operation(op);
+            for hazard in &hazards {
+                let stall = hazard.stall_cycles;
+                if stall > 0 {
+                    total_stall = total_stall.max(stall);
+                    stall_reasons.push(hazard.to_stall_reason());
+                }
+            }
 
             // Check memory conflicts
             let memory_stall = self.check_memory_conflict(op);
-            total_stall = total_stall.max(memory_stall);
+            if memory_stall > 0 {
+                total_stall = total_stall.max(memory_stall);
+                // Get bank from address (simplified - uses address bits)
+                let bank = (self.get_memory_address(op) / 8192) as u8 & 0x7;
+                stall_reasons.push(StallReason::MemoryConflict {
+                    bank,
+                    cycles: memory_stall,
+                });
+            }
         }
 
-        // Record stalls
+        // Check structural hazards (slot conflicts)
+        let structural_conflicts = check_bundle_conflicts(bundle);
+        for conflict in &structural_conflicts {
+            total_stall = total_stall.max(conflict.penalty_cycles);
+            stall_reasons.push(StallReason::StructuralHazard {
+                resource: conflict.resource.name(),
+                cycles: conflict.penalty_cycles,
+            });
+        }
+
+        // Record stalls and their reasons
         if total_stall > 0 {
             self.total_hazard_stalls += total_stall as u64;
             ctx.record_stall(total_stall as u64);
+
+            // Record detailed breakdown
+            for reason in &stall_reasons {
+                self.detailed_stats.record(reason);
+            }
+
+            // Emit stall events for profiling
+            if let Some(timing) = ctx.timing_context_mut() {
+                for reason in &stall_reasons {
+                    match reason {
+                        StallReason::RegisterHazard { hazard_type, register, cycles } => {
+                            timing.record_event(
+                                start_cycle,
+                                EventType::RegisterHazard {
+                                    hazard_type: *hazard_type,
+                                    register: *register,
+                                    cycles: *cycles,
+                                },
+                            );
+                        }
+                        StallReason::MemoryConflict { bank, cycles } => {
+                            timing.record_event(
+                                start_cycle,
+                                EventType::MemoryConflict {
+                                    bank: *bank,
+                                    cycles: *cycles,
+                                },
+                            );
+                        }
+                        StallReason::BranchPenalty { cycles } => {
+                            timing.record_event(
+                                start_cycle,
+                                EventType::BranchPenalty { cycles: *cycles },
+                            );
+                        }
+                        StallReason::StructuralHazard { .. }
+                        | StallReason::LockContention { .. }
+                        | StallReason::DmaWait { .. } => {
+                            // These don't have direct event mappings yet
+                        }
+                    }
+                }
+            }
         }
 
         // Phase 2: Execute all slot operations
@@ -274,13 +373,41 @@ impl Executor for CycleAccurateExecutor {
             max_latency = max_latency.max(op_latency);
         }
 
+        // Apply branch penalty if a branch was taken
+        // (Pipeline flush due to mispredicted/unconditional branch)
+        if let ExecuteResult::Branch { target } = final_result {
+            let penalty = BRANCH_PENALTY_CYCLES;
+            self.total_branch_stalls += penalty as u64;
+            ctx.record_stall(penalty as u64);
+
+            // Record in detailed stats
+            self.detailed_stats.record(&StallReason::BranchPenalty { cycles: penalty });
+
+            // Emit branch events (capture cycle before borrowing timing)
+            let branch_cycle = ctx.cycles;
+            if let Some(timing) = ctx.timing_context_mut() {
+                timing.record_event(branch_cycle, EventType::BranchPenalty { cycles: penalty });
+                timing.record_event(
+                    branch_cycle,
+                    EventType::BranchTaken { from_pc: pc, to_pc: target },
+                );
+            }
+        }
+
         // Update statistics with actual cycles
         ctx.record_instruction(max_latency as u64);
 
-        // Sync timing context if enabled
+        // Sync timing context and record instruction complete
+        let end_cycle = ctx.cycles;
         if let Some(timing) = ctx.timing_context_mut() {
             timing.hazard_stalls = self.total_hazard_stalls;
             timing.memory_stalls = self.total_memory_stalls;
+
+            // Record instruction completion
+            timing.record_event(
+                end_cycle,
+                EventType::InstructionComplete { pc, latency: max_latency },
+            );
         }
 
         final_result
@@ -298,6 +425,8 @@ pub struct CycleAccurateStats {
     pub hazard_stalls: u64,
     /// Total cycles stalled due to memory conflicts.
     pub memory_stalls: u64,
+    /// Total cycles stalled due to branch penalties.
+    pub branch_stalls: u64,
     /// Detailed hazard statistics.
     pub hazard_stats: crate::interpreter::timing::hazards::HazardStats,
     /// Detailed memory statistics.
@@ -412,11 +541,13 @@ mod tests {
         let mut executor = CycleAccurateExecutor::new();
         executor.total_hazard_stalls = 10;
         executor.total_memory_stalls = 5;
+        executor.total_branch_stalls = 3;
 
         executor.reset();
 
         assert_eq!(executor.total_hazard_stalls, 0);
         assert_eq!(executor.total_memory_stalls, 0);
+        assert_eq!(executor.total_branch_stalls, 0);
     }
 
     #[test]
@@ -426,5 +557,171 @@ mod tests {
 
         assert_eq!(stats.hazard_stalls, 0);
         assert_eq!(stats.memory_stalls, 0);
+        assert_eq!(stats.branch_stalls, 0);
+    }
+
+    #[test]
+    fn test_branch_penalty() {
+        use crate::interpreter::bundle::BranchCondition;
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+
+        // Create a bundle with an unconditional branch instruction
+        let bundle = make_bundle(vec![
+            SlotOp::new(SlotIndex::Control, Operation::Branch {
+                condition: BranchCondition::Always,
+            })
+            .with_source(Operand::Immediate(0x100)), // branch target
+        ]);
+
+        let result = executor.execute(&bundle, &mut ctx, &mut tile);
+
+        // Should return Branch result
+        assert!(matches!(result, ExecuteResult::Branch { target: 0x100 }));
+
+        // Should have recorded branch penalty (3 cycles)
+        assert_eq!(executor.total_branch_stalls, 3);
+
+        // Context should have penalty in stall count
+        // (1 cycle for instruction + 3 for branch penalty = 4 total cycles,
+        // but stalls are 3)
+        assert!(ctx.stall_cycles >= 3);
+
+        // Detailed stats should track branch stalls
+        let detailed = executor.detailed_stats();
+        assert_eq!(detailed.branch_stall_cycles, 3);
+        assert_eq!(detailed.total_stall_cycles, 3);
+    }
+
+    #[test]
+    fn test_detailed_stats_integration() {
+        use crate::interpreter::bundle::BranchCondition;
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+
+        // Execute a branch to generate branch penalty stalls
+        let bundle = make_bundle(vec![
+            SlotOp::new(SlotIndex::Control, Operation::Branch {
+                condition: BranchCondition::Always,
+            })
+            .with_source(Operand::Immediate(0x200)),
+        ]);
+
+        executor.execute(&bundle, &mut ctx, &mut tile);
+
+        // Get full stats
+        let stats = executor.stats();
+
+        // Branch stalls should be tracked
+        assert_eq!(stats.branch_stalls, 3);
+
+        // Hazard stats should include branch stalls in breakdown
+        assert_eq!(stats.hazard_stats.branch_stall_cycles, 3);
+        assert_eq!(stats.hazard_stats.total_stall_cycles, 3);
+
+        // Register and memory stalls should be zero (no hazards in this bundle)
+        assert_eq!(stats.hazard_stats.register_stall_cycles, 0);
+        assert_eq!(stats.hazard_stats.memory_stall_cycles, 0);
+    }
+
+    // --- Event Recording Tests ---
+
+    #[test]
+    fn test_event_recording_instruction_cycle() {
+        use crate::interpreter::state::EventType;
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new_with_timing();
+        let mut tile = Tile::compute(0, 2);
+
+        // Execute a simple scalar add
+        ctx.scalar.write(0, 10);
+        ctx.scalar.write(1, 20);
+
+        let bundle = make_bundle(vec![
+            SlotOp::new(SlotIndex::Scalar0, Operation::ScalarAdd)
+                .with_dest(Operand::ScalarReg(2))
+                .with_source(Operand::ScalarReg(0))
+                .with_source(Operand::ScalarReg(1)),
+        ]);
+
+        executor.execute(&bundle, &mut ctx, &mut tile);
+
+        // Check events were recorded
+        let timing = ctx.timing_context().unwrap();
+        let events = timing.events.events();
+
+        // Should have at least InstructionStart and InstructionComplete
+        assert!(events.len() >= 2, "Expected at least 2 events, got {}", events.len());
+
+        // First event should be InstructionStart
+        assert!(
+            matches!(events[0].event, EventType::InstructionStart { pc: 0 }),
+            "First event should be InstructionStart at PC 0"
+        );
+
+        // Last event should be InstructionComplete
+        let last = &events[events.len() - 1].event;
+        assert!(
+            matches!(last, EventType::InstructionComplete { pc: 0, .. }),
+            "Last event should be InstructionComplete"
+        );
+    }
+
+    #[test]
+    fn test_event_recording_branch() {
+        use crate::interpreter::bundle::BranchCondition;
+        use crate::interpreter::state::EventType;
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new_with_timing();
+        let mut tile = Tile::compute(0, 2);
+
+        // Execute a branch instruction
+        let bundle = make_bundle(vec![
+            SlotOp::new(SlotIndex::Control, Operation::Branch {
+                condition: BranchCondition::Always,
+            })
+            .with_source(Operand::Immediate(0x200)),
+        ]);
+
+        executor.execute(&bundle, &mut ctx, &mut tile);
+
+        // Check for branch events
+        let timing = ctx.timing_context().unwrap();
+        let events = timing.events.events();
+
+        // Should have BranchPenalty and BranchTaken events
+        let has_branch_penalty = events.iter().any(|e| matches!(e.event, EventType::BranchPenalty { .. }));
+        let has_branch_taken = events.iter().any(|e| {
+            matches!(e.event, EventType::BranchTaken { from_pc: 0, to_pc: 0x200 })
+        });
+
+        assert!(has_branch_penalty, "Should have BranchPenalty event");
+        assert!(has_branch_taken, "Should have BranchTaken event");
+    }
+
+    #[test]
+    fn test_event_recording_disabled_by_default_fast_mode() {
+        // Fast mode (no timing) should not have events
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new(); // No timing!
+        let mut tile = Tile::compute(0, 2);
+
+        let bundle = make_bundle(vec![
+            SlotOp::new(SlotIndex::Scalar0, Operation::ScalarAdd)
+                .with_dest(Operand::ScalarReg(2))
+                .with_source(Operand::ScalarReg(0))
+                .with_source(Operand::ScalarReg(1)),
+        ]);
+
+        executor.execute(&bundle, &mut ctx, &mut tile);
+
+        // Should have no timing context
+        assert!(ctx.timing_context().is_none());
     }
 }

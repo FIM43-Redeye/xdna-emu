@@ -36,7 +36,10 @@ pub use registers::{
     PointerRegisterFile,
     ModifierRegisterFile,
 };
-pub use context::{ExecutionContext, SpRegister, TimingContext};
+pub use context::{
+    ExecutionContext, SpRegister, TimingContext,
+    EventLog, EventType, TimestampedEvent,
+};
 
 #[cfg(test)]
 mod tests {
