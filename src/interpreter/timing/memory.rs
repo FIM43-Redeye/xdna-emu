@@ -44,6 +44,87 @@ use crate::device::aie2_spec;
 /// Number of memory banks per compute tile.
 pub const NUM_BANKS: usize = aie2_spec::COMPUTE_TILE_MEMORY_BANKS;
 
+// ============================================================================
+// Cross-Tile Memory Access Latency (AM020 Ch4)
+// ============================================================================
+//
+// Each compute tile can access 256KB of data memory across 4 tiles:
+// - Quadrant 0 (0x00000-0x0FFFF): Local tile memory (64KB)
+// - Quadrant 1 (0x10000-0x1FFFF): South neighbor tile (64KB)
+// - Quadrant 2 (0x20000-0x2FFFF): West neighbor tile (64KB)
+// - Quadrant 3 (0x30000-0x3FFFF): South-West neighbor tile (64KB)
+//
+// Cross-tile memory access incurs routing latency through the stream switch.
+// Per AM020 Ch2, local-to-external routing is 4 cycles per hop.
+//
+
+/// Size of each memory quadrant (64KB).
+pub const QUADRANT_SIZE: u32 = 0x10000;
+
+/// Latency for accessing neighbor tile memory (1 hop).
+/// Per AM020 Ch2: local-to-external routing is 4 cycles.
+pub const CROSS_TILE_LATENCY: u8 = aie2_spec::ROUTE_LATENCY_LOCAL_TO_EXTERNAL;
+
+/// Memory quadrant (which tile's memory is being accessed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryQuadrant {
+    /// Local tile memory (0x00000-0x0FFFF) - no routing latency.
+    Local,
+    /// South neighbor tile (0x10000-0x1FFFF) - 1 hop.
+    South,
+    /// West neighbor tile (0x20000-0x2FFFF) - 1 hop.
+    West,
+    /// South-West neighbor tile (0x30000-0x3FFFF) - 2 hops (diagonal).
+    SouthWest,
+}
+
+impl MemoryQuadrant {
+    /// Determine which quadrant an address falls into.
+    ///
+    /// Address bits [17:16] determine the quadrant:
+    /// - 0b00: Local
+    /// - 0b01: South
+    /// - 0b10: West
+    /// - 0b11: South-West
+    #[inline]
+    pub fn from_address(address: u32) -> Self {
+        match (address >> 16) & 0x3 {
+            0 => Self::Local,
+            1 => Self::South,
+            2 => Self::West,
+            3 => Self::SouthWest,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Get the number of hops to reach this quadrant.
+    #[inline]
+    pub fn hop_count(&self) -> u8 {
+        match self {
+            Self::Local => 0,
+            Self::South | Self::West => 1,
+            Self::SouthWest => 2, // Diagonal = 2 hops (south + west)
+        }
+    }
+
+    /// Get the routing latency for accessing this quadrant.
+    ///
+    /// Based on AM020 Ch2 stream switch latencies:
+    /// - Local: 0 cycles (no routing)
+    /// - 1 hop: 4 cycles (local-to-external)
+    /// - 2 hops: 8 cycles (4 per hop)
+    #[inline]
+    pub fn routing_latency(&self) -> u8 {
+        self.hop_count() * CROSS_TILE_LATENCY
+    }
+
+    /// Check if this is a cross-tile access.
+    #[inline]
+    pub fn is_cross_tile(&self) -> bool {
+        !matches!(self, Self::Local)
+    }
+}
+
 /// Size of each bank in bytes.
 pub const BANK_SIZE: usize = aie2_spec::COMPUTE_TILE_BANK_SIZE;
 
@@ -186,6 +267,29 @@ impl MemoryAccess {
             .map(|i| (start_bank + i) % NUM_BANKS as u8)
             .collect()
     }
+
+    /// Get the memory quadrant for this access.
+    ///
+    /// Determines which of the 4 tiles (local or neighbor) this address
+    /// falls into based on address bits [17:16].
+    #[inline]
+    pub fn quadrant(&self) -> MemoryQuadrant {
+        MemoryQuadrant::from_address(self.address)
+    }
+
+    /// Get the cross-tile routing latency for this access.
+    ///
+    /// Returns 0 for local tile access, or 4-8 cycles for neighbor tiles.
+    #[inline]
+    pub fn cross_tile_latency(&self) -> u8 {
+        self.quadrant().routing_latency()
+    }
+
+    /// Check if this is a cross-tile memory access.
+    #[inline]
+    pub fn is_cross_tile(&self) -> bool {
+        self.quadrant().is_cross_tile()
+    }
 }
 
 /// Result of bank conflict detection.
@@ -213,7 +317,7 @@ impl BankConflict {
 
 /// Memory timing model.
 ///
-/// Tracks per-cycle bank usage to detect conflicts.
+/// Tracks per-cycle bank usage to detect conflicts and cross-tile latency.
 #[derive(Debug, Clone)]
 pub struct MemoryModel {
     /// Last cycle each bank was accessed.
@@ -227,6 +331,12 @@ pub struct MemoryModel {
 
     /// Statistics: total memory accesses.
     total_accesses: u64,
+
+    /// Statistics: total cross-tile accesses.
+    total_cross_tile: u64,
+
+    /// Statistics: total cross-tile latency cycles.
+    total_cross_tile_cycles: u64,
 }
 
 /// Sentinel value indicating "bank never accessed".
@@ -241,6 +351,8 @@ impl MemoryModel {
             current_cycle: 0,
             total_conflicts: 0,
             total_accesses: 0,
+            total_cross_tile: 0,
+            total_cross_tile_cycles: 0,
         }
     }
 
@@ -292,6 +404,12 @@ impl MemoryModel {
             self.total_conflicts += 1;
         }
 
+        // Track cross-tile access statistics
+        if access.is_cross_tile() {
+            self.total_cross_tile += 1;
+            self.total_cross_tile_cycles += access.cross_tile_latency() as u64;
+        }
+
         conflict
     }
 
@@ -328,10 +446,23 @@ impl MemoryModel {
         }
     }
 
-    /// Get total latency for a memory access (base + conflict penalty).
+    /// Get total latency for a memory access (base + conflict penalty + cross-tile).
+    ///
+    /// Total latency includes:
+    /// - Base memory access latency (5 cycles)
+    /// - Bank conflict penalty (if any)
+    /// - Cross-tile routing latency (0, 4, or 8 cycles based on quadrant)
     pub fn access_latency(&self, access: &MemoryAccess) -> u8 {
         let conflict = self.check_conflict(access);
-        BASE_LATENCY.saturating_add(conflict.stall_cycles)
+        let cross_tile = access.cross_tile_latency();
+        BASE_LATENCY
+            .saturating_add(conflict.stall_cycles)
+            .saturating_add(cross_tile)
+    }
+
+    /// Get just the cross-tile routing latency for an access.
+    pub fn cross_tile_latency(&self, access: &MemoryAccess) -> u8 {
+        access.cross_tile_latency()
     }
 
     /// Reset the model.
@@ -340,6 +471,8 @@ impl MemoryModel {
         self.current_cycle = 0;
         self.total_conflicts = 0;
         self.total_accesses = 0;
+        self.total_cross_tile = 0;
+        self.total_cross_tile_cycles = 0;
     }
 
     /// Get statistics.
@@ -349,6 +482,13 @@ impl MemoryModel {
             total_conflicts: self.total_conflicts,
             conflict_rate: if self.total_accesses > 0 {
                 self.total_conflicts as f64 / self.total_accesses as f64
+            } else {
+                0.0
+            },
+            total_cross_tile: self.total_cross_tile,
+            total_cross_tile_cycles: self.total_cross_tile_cycles,
+            cross_tile_rate: if self.total_accesses > 0 {
+                self.total_cross_tile as f64 / self.total_accesses as f64
             } else {
                 0.0
             },
@@ -365,9 +505,18 @@ impl Default for MemoryModel {
 /// Memory access statistics.
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryStats {
+    /// Total memory accesses.
     pub total_accesses: u64,
+    /// Total bank conflicts.
     pub total_conflicts: u64,
+    /// Bank conflict rate (0.0 - 1.0).
     pub conflict_rate: f64,
+    /// Total cross-tile memory accesses.
+    pub total_cross_tile: u64,
+    /// Total cycles spent on cross-tile routing latency.
+    pub total_cross_tile_cycles: u64,
+    /// Cross-tile access rate (0.0 - 1.0).
+    pub cross_tile_rate: f64,
 }
 
 #[cfg(test)]
@@ -566,5 +715,148 @@ mod tests {
         assert!(msg.contains("0x00000123"));
         assert!(msg.contains("width 4"));
         assert!(msg.contains("4-byte alignment"));
+    }
+
+    // ========== Cross-Tile Memory Access Tests ==========
+
+    #[test]
+    fn test_memory_quadrant_from_address() {
+        // Quadrant 0: Local (0x00000-0x0FFFF)
+        assert_eq!(MemoryQuadrant::from_address(0x00000), MemoryQuadrant::Local);
+        assert_eq!(MemoryQuadrant::from_address(0x08000), MemoryQuadrant::Local);
+        assert_eq!(MemoryQuadrant::from_address(0x0FFFF), MemoryQuadrant::Local);
+
+        // Quadrant 1: South (0x10000-0x1FFFF)
+        assert_eq!(MemoryQuadrant::from_address(0x10000), MemoryQuadrant::South);
+        assert_eq!(MemoryQuadrant::from_address(0x1FFFF), MemoryQuadrant::South);
+
+        // Quadrant 2: West (0x20000-0x2FFFF)
+        assert_eq!(MemoryQuadrant::from_address(0x20000), MemoryQuadrant::West);
+        assert_eq!(MemoryQuadrant::from_address(0x2FFFF), MemoryQuadrant::West);
+
+        // Quadrant 3: South-West (0x30000-0x3FFFF)
+        assert_eq!(MemoryQuadrant::from_address(0x30000), MemoryQuadrant::SouthWest);
+        assert_eq!(MemoryQuadrant::from_address(0x3FFFF), MemoryQuadrant::SouthWest);
+    }
+
+    #[test]
+    fn test_quadrant_hop_count() {
+        assert_eq!(MemoryQuadrant::Local.hop_count(), 0);
+        assert_eq!(MemoryQuadrant::South.hop_count(), 1);
+        assert_eq!(MemoryQuadrant::West.hop_count(), 1);
+        assert_eq!(MemoryQuadrant::SouthWest.hop_count(), 2);
+    }
+
+    #[test]
+    fn test_quadrant_routing_latency() {
+        // Local: 0 cycles
+        assert_eq!(MemoryQuadrant::Local.routing_latency(), 0);
+
+        // 1 hop: 4 cycles (LOCAL_TO_EXTERNAL)
+        assert_eq!(MemoryQuadrant::South.routing_latency(), CROSS_TILE_LATENCY);
+        assert_eq!(MemoryQuadrant::West.routing_latency(), CROSS_TILE_LATENCY);
+
+        // 2 hops: 8 cycles (2 * LOCAL_TO_EXTERNAL)
+        assert_eq!(MemoryQuadrant::SouthWest.routing_latency(), 2 * CROSS_TILE_LATENCY);
+    }
+
+    #[test]
+    fn test_memory_access_quadrant() {
+        // Local access
+        let access = MemoryAccess::load(0x1000, 4);
+        assert_eq!(access.quadrant(), MemoryQuadrant::Local);
+        assert!(!access.is_cross_tile());
+        assert_eq!(access.cross_tile_latency(), 0);
+
+        // South neighbor access
+        let access = MemoryAccess::load(0x11000, 4);
+        assert_eq!(access.quadrant(), MemoryQuadrant::South);
+        assert!(access.is_cross_tile());
+        assert_eq!(access.cross_tile_latency(), CROSS_TILE_LATENCY);
+
+        // West neighbor access
+        let access = MemoryAccess::load(0x21000, 4);
+        assert_eq!(access.quadrant(), MemoryQuadrant::West);
+        assert!(access.is_cross_tile());
+        assert_eq!(access.cross_tile_latency(), CROSS_TILE_LATENCY);
+
+        // South-West (diagonal) access
+        let access = MemoryAccess::load(0x31000, 4);
+        assert_eq!(access.quadrant(), MemoryQuadrant::SouthWest);
+        assert!(access.is_cross_tile());
+        assert_eq!(access.cross_tile_latency(), 2 * CROSS_TILE_LATENCY);
+    }
+
+    #[test]
+    fn test_access_latency_local() {
+        let model = MemoryModel::new();
+
+        // Local access: base latency only (5 cycles)
+        let access = MemoryAccess::load(0x1000, 4);
+        let latency = model.access_latency(&access);
+        assert_eq!(latency, BASE_LATENCY);
+    }
+
+    #[test]
+    fn test_access_latency_cross_tile_south() {
+        let model = MemoryModel::new();
+
+        // South neighbor: base + 4 cycles routing (5 + 4 = 9)
+        let access = MemoryAccess::load(0x11000, 4);
+        let latency = model.access_latency(&access);
+        assert_eq!(latency, BASE_LATENCY + CROSS_TILE_LATENCY);
+    }
+
+    #[test]
+    fn test_access_latency_cross_tile_diagonal() {
+        let model = MemoryModel::new();
+
+        // South-West: base + 8 cycles routing (5 + 8 = 13)
+        let access = MemoryAccess::load(0x31000, 4);
+        let latency = model.access_latency(&access);
+        assert_eq!(latency, BASE_LATENCY + 2 * CROSS_TILE_LATENCY);
+    }
+
+    #[test]
+    fn test_cross_tile_stats() {
+        let mut model = MemoryModel::new();
+        model.advance_to(1);
+
+        // Local access (no cross-tile)
+        model.record_access(&MemoryAccess::load(0x1000, 4));
+
+        // South neighbor access (1 hop)
+        model.record_access(&MemoryAccess::load(0x11000, 4));
+
+        // West neighbor access (1 hop)
+        model.record_access(&MemoryAccess::load(0x21000, 4));
+
+        // Diagonal access (2 hops)
+        model.record_access(&MemoryAccess::load(0x31000, 4));
+
+        let stats = model.stats();
+        assert_eq!(stats.total_accesses, 4);
+        assert_eq!(stats.total_cross_tile, 3);
+        // 1 hop + 1 hop + 2 hops = 4 hops total = 16 cycles
+        assert_eq!(stats.total_cross_tile_cycles, 4 * CROSS_TILE_LATENCY as u64);
+        assert!((stats.cross_tile_rate - 0.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_access_latency_combined() {
+        let mut model = MemoryModel::new();
+        model.advance_to(1);
+
+        // First access to bank 0 in local memory
+        let access1 = MemoryAccess::load(0x00, 4);
+        model.record_access(&access1);
+
+        // Second access to bank 0 (conflict) + cross-tile (south)
+        // Should have: base (5) + conflict (1) + cross-tile (4) = 10
+        let access2 = MemoryAccess::load(0x10080, 4);
+        let latency = model.access_latency(&access2);
+
+        // Cross-tile to south + bank 0 conflict
+        assert_eq!(latency, BASE_LATENCY + CONFLICT_PENALTY + CROSS_TILE_LATENCY);
     }
 }

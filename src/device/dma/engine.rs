@@ -43,6 +43,7 @@ use super::transfer::{Transfer, TransferDirection, TransferEndpoint, TransferSta
 use super::timing::{DmaTimingConfig, ChannelTimingState, TransferPhase};
 use crate::device::host_memory::HostMemory;
 use crate::device::tile::Tile;
+use crate::interpreter::timing::sync::LockTimingState;
 
 /// Stream data word for DMA-to-stream interface.
 #[derive(Debug, Clone, Copy)]
@@ -131,6 +132,10 @@ pub struct DmaEngine {
     /// Stream input buffer (S2MM channels consume data from here).
     /// Data from the stream router is queued here for writing to tile memory.
     stream_in: VecDeque<StreamData>,
+
+    /// Lock timing state for contention tracking (optional).
+    /// When enabled, tracks detailed lock acquire/release timing per lock.
+    lock_timing: Option<LockTimingState>,
 }
 
 impl DmaEngine {
@@ -171,6 +176,8 @@ impl DmaEngine {
             // Stream buffers with reasonable capacity
             stream_out: VecDeque::with_capacity(16),
             stream_in: VecDeque::with_capacity(16),
+            // Lock timing disabled by default
+            lock_timing: None,
         }
     }
 
@@ -187,6 +194,31 @@ impl DmaEngine {
     pub fn with_cycle_accurate_timing(mut self) -> Self {
         self.timing_config = DmaTimingConfig::from_aie2_spec();
         self
+    }
+
+    /// Enable lock timing and contention tracking.
+    ///
+    /// When enabled, tracks detailed statistics per lock:
+    /// - Acquire/release counts
+    /// - Contention cycles (time spent waiting for lock)
+    /// - Maximum contention observed
+    ///
+    /// # Arguments
+    ///
+    /// * `num_locks` - Number of locks to track (typically 16 for compute, 64 for mem tile)
+    pub fn with_lock_timing(mut self, num_locks: usize) -> Self {
+        self.lock_timing = Some(LockTimingState::new(num_locks));
+        self
+    }
+
+    /// Get the lock timing state (if enabled).
+    pub fn lock_timing(&self) -> Option<&LockTimingState> {
+        self.lock_timing.as_ref()
+    }
+
+    /// Get mutable lock timing state (if enabled).
+    pub fn lock_timing_mut(&mut self) -> Option<&mut LockTimingState> {
+        self.lock_timing.as_mut()
     }
 
     /// Get the timing configuration.
@@ -749,6 +781,8 @@ impl DmaEngine {
     }
 
     /// Try to acquire a lock.
+    ///
+    /// If lock timing is enabled, tracks acquire attempts and contention.
     fn try_acquire_lock(&mut self, ch_idx: usize, lock_id: u8, tile: &mut Tile) -> bool {
         if (lock_id as usize) >= tile.locks.len() {
             return false;
@@ -761,7 +795,14 @@ impl DmaEngine {
 
         // Check if lock value matches expected acquire value
         let lock = &mut tile.locks[lock_id as usize];
-        if lock.acquire() {
+        let success = lock.acquire();
+
+        // Track timing if enabled
+        if let Some(ref mut timing) = self.lock_timing {
+            timing.track_acquire(lock_id as usize, success);
+        }
+
+        if success {
             transfer.lock_acquired();
             true
         } else {
@@ -1160,5 +1201,72 @@ mod tests {
         // Both should complete successfully
         assert_eq!(instant.channel_state(0), ChannelState::Complete);
         assert_eq!(timed.channel_state(0), ChannelState::Complete);
+    }
+
+    #[test]
+    fn test_lock_timing_integration() {
+        // Create engine with lock timing enabled
+        let mut engine = DmaEngine::new_compute_tile(1, 2)
+            .with_cycle_accurate_timing()
+            .with_lock_timing(16);
+        let mut tile = make_tile();
+        let mut host_mem = make_host_memory();
+
+        // Configure BD that requires a lock
+        let mut bd = BdConfig::simple_1d(0x100, 32);
+        bd.acquire_lock = Some(5);
+        bd.acquire_value = 1;
+        engine.configure_bd(0, bd).unwrap();
+
+        // Lock starts at 0, so acquire will fail initially
+        tile.locks[5].value = 0;
+
+        // Start transfer - should go to WaitingForLock
+        engine.start_channel(0, 0).unwrap();
+
+        // Step a few times - lock still not available
+        for _ in 0..3 {
+            engine.step(&mut tile, &mut host_mem);
+        }
+
+        // Verify waiting state
+        assert!(
+            matches!(engine.channel_state(0), ChannelState::WaitingForLock(5)),
+            "Expected WaitingForLock(5), got {:?}",
+            engine.channel_state(0)
+        );
+
+        // Check lock timing tracked contention
+        let lock_timing = engine.lock_timing().unwrap();
+        let contention = lock_timing.current_stall(5);
+        assert!(contention >= 3, "Should have tracked at least 3 stall cycles, got {}", contention);
+    }
+
+    #[test]
+    fn test_lock_timing_success() {
+        // Test that successful lock acquire is tracked
+        let mut engine = DmaEngine::new_compute_tile(1, 2)
+            .with_lock_timing(16);
+        let mut tile = make_tile();
+        let mut host_mem = make_host_memory();
+
+        // Configure simple BD (no lock requirement)
+        engine.configure_bd(0, BdConfig::simple_1d(0x100, 16)).unwrap();
+
+        // But test lock timing directly - set lock value so acquire succeeds
+        tile.locks[3].value = 1;
+
+        // Start channel
+        engine.start_channel(0, 0).unwrap();
+
+        // Manually trigger lock acquire tracking (simulating what happens internally)
+        if let Some(timing) = engine.lock_timing_mut() {
+            timing.track_acquire(3, true); // Success
+        }
+
+        // Check stats
+        let lock_timing = engine.lock_timing().unwrap();
+        let stats = lock_timing.stats(3).unwrap();
+        assert_eq!(stats.acquires, 1, "Should have recorded 1 acquire");
     }
 }
