@@ -117,6 +117,7 @@ impl LockStats {
 /// Lock timing state for a tile.
 ///
 /// Tracks timing and statistics for all locks in a tile.
+#[derive(Debug)]
 pub struct LockTimingState {
     /// Configuration for timing calculations
     config: SyncTimingConfig,
