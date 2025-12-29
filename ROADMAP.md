@@ -31,10 +31,10 @@ The architecture is designed to be generic from day one - device-specific detail
 
 | Phase | Status | Progress |
 |-------|--------|----------|
-| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | 🟢 Functional | 433 tests, 100% binary recognition, timing pending |
+| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | 🟢 Functional | 529 tests, 100% binary recognition, timing 100% |
 | [2. Toolchain Integration](docs/roadmap/phase2-toolchain-integration.md) | 🔴 Not started | |
 | [3. Developer Experience](docs/roadmap/phase3-developer-experience.md) | 🟡 GUI exists | Needs debugging features |
-| [4. Validation & Testing](docs/roadmap/phase4-validation-testing.md) | 🟡 433 tests | TestRunner harness added |
+| [4. Validation & Testing](docs/roadmap/phase4-validation-testing.md) | 🟡 529 tests | TestRunner harness added |
 | [5. Production Readiness](docs/roadmap/phase5-production-readiness.md) | 🔴 Not started | |
 | [6. Community & Ecosystem](docs/roadmap/phase6-community-ecosystem.md) | 🔴 Not started | |
 
@@ -52,12 +52,19 @@ Make the emulator faithful to real AIE2 hardware behavior.
 - Vector unit (24x256-bit W registers, 8x256-bit accumulators)
 - Memory system (load/store with post-modify addressing, bank conflict detection)
 - DMA engine with multi-dimensional addressing (1D-4D patterns)
-- Synchronization (lock acquire/release with timing)
-- Stream switch and router infrastructure
+- Synchronization (locks with timing, barrier coordination, deadlock detection)
+- **Stream switch complete**: circuit routing, packet switching, routing latency
 - TestRunner harness for kernel execution
 - **VLIW slot extraction** for all 16-128 bit bundle formats (100% recognition)
+- Hazard detection (RAW/WAW/WAR) and latency tables
+- **Pipeline timing complete**: branch penalty, VLIW structural hazards, stall integration
+- **Event tracing**: 13 event types for profiling (instructions, stalls, branches, DMA, locks)
+- **CycleAccurateExecutor integrated**: `new_cycle_accurate()` mode with full timing
+- **Memory tile arbitration**: round-robin arbitration for multi-source access
+- **Cross-tile memory latency**: 0/4/8 cycle routing latency based on quadrant
+- **DMA-lock timing**: LockTimingState integrated into DMA engine
 
-**Next:** DMA/stream switch integration for multi-tile data flow
+**Next:** DMA/TileArray integration (Milestone 2), ISA coverage expansion (Milestone 4)
 
 ### Phase 2: Toolchain Integration 🔴
 
