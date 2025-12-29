@@ -177,6 +177,12 @@ pub const LATENCY_AGU: u8 = 1;
 /// "Different pipeline on each functional unit (eight stages maximum)."
 pub const MAX_PIPELINE_STAGES: u8 = 8;
 
+/// Branch penalty: cycles lost when a branch is taken
+/// When a branch is taken, the fetch pipeline must be flushed.
+/// Based on AM020 Ch4, the fetch unit has ~3 stages that are discarded.
+/// This is a conservative estimate for taken branches.
+pub const BRANCH_PENALTY_CYCLES: u8 = 3;
+
 // ============================================================================
 // Stream Switch Latencies (AM020 Ch2)
 // ============================================================================
@@ -289,6 +295,81 @@ pub const STREAM_SWITCH_FIFO_WIDTH_BITS: usize = 34; // 32 data + 1 parity + 1 T
 /// Packet header stream ID width: 5 bits
 /// "A packet-switched stream is identified by a 5-bit ID"
 pub const PACKET_STREAM_ID_BITS: usize = 5;
+
+// ============================================================================
+// Packet Header Format (AM020 Ch2, Table 2)
+// ============================================================================
+//
+// 32-bit packet header layout:
+// | 31    | 30-28 | 27-21      | 20-16     | 15  | 14-12       | 11-5    | 4-0       |
+// | Parity| Rsvd  | Src Column | Src Row   | Rsvd| Packet Type | Rsvd    | Stream ID |
+// | 1 bit | 3 bits| 7 bits     | 5 bits    | 1bit| 3 bits      | 7 bits  | 5 bits    |
+//
+
+/// Packet header total width: 32 bits
+pub const PACKET_HEADER_WIDTH_BITS: usize = 32;
+
+/// Stream ID field: bits 4-0
+pub const PACKET_STREAM_ID_SHIFT: usize = 0;
+pub const PACKET_STREAM_ID_MASK: u32 = 0x1F; // 5 bits
+
+/// Packet type field: bits 14-12
+pub const PACKET_TYPE_SHIFT: usize = 12;
+pub const PACKET_TYPE_MASK: u32 = 0x7; // 3 bits
+
+/// Source row field: bits 20-16
+pub const PACKET_SRC_ROW_SHIFT: usize = 16;
+pub const PACKET_SRC_ROW_MASK: u32 = 0x1F; // 5 bits
+
+/// Source column field: bits 27-21
+pub const PACKET_SRC_COL_SHIFT: usize = 21;
+pub const PACKET_SRC_COL_MASK: u32 = 0x7F; // 7 bits
+
+/// Parity bit: bit 31
+pub const PACKET_PARITY_SHIFT: usize = 31;
+pub const PACKET_PARITY_MASK: u32 = 0x1;
+
+/// Packet switch arbitration overhead: cycles per packet header
+/// This is the additional latency for packet routing vs circuit routing.
+/// Estimated based on header parsing and route lookup.
+pub const PACKET_ARBITRATION_OVERHEAD_CYCLES: u8 = 1;
+
+/// Maximum number of packet routes per tile
+/// Each stream ID can map to multiple destinations.
+pub const MAX_PACKET_ROUTES_PER_TILE: usize = 32;
+
+// ============================================================================
+// Stream Routing Latency (AM020 Ch2)
+// ============================================================================
+//
+// Stream switch routing latency depends on the path type:
+// - Local = within the same tile (core port, DMA port)
+// - External = to neighboring tile (north/south/east/west)
+//
+// The latency is due to FIFO buffering at each switch:
+// - 6-deep FIFO: used for local-to-local and external-to-local
+// - 8-deep FIFO: used for local-to-external and external-to-external
+//
+
+/// Routing latency: local slave to local master (3 cycles)
+/// "local slave → local master: 3 cycles (6-deep FIFO)" (AM020 Ch2)
+pub const ROUTE_LATENCY_LOCAL_TO_LOCAL: u8 = 3;
+
+/// Routing latency: local slave to external master (4 cycles)
+/// "local slave → external master: 4 cycles (8-deep FIFO)" (AM020 Ch2)
+pub const ROUTE_LATENCY_LOCAL_TO_EXTERNAL: u8 = 4;
+
+/// Routing latency: external slave to local master (3 cycles)
+/// "external slave → local master: 3 cycles (6-deep FIFO)" (AM020 Ch2)
+pub const ROUTE_LATENCY_EXTERNAL_TO_LOCAL: u8 = 3;
+
+/// Routing latency: external slave to external master (4 cycles)
+/// "external → external: 4 cycles (8-deep FIFO)" (AM020 Ch2)
+pub const ROUTE_LATENCY_EXTERNAL_TO_EXTERNAL: u8 = 4;
+
+/// Minimum routing latency per hop between tiles
+/// This is the base latency for crossing a tile boundary.
+pub const ROUTE_LATENCY_PER_HOP: u8 = ROUTE_LATENCY_EXTERNAL_TO_EXTERNAL;
 
 // ============================================================================
 // Cascade Interface (AM020 Ch2, Ch4)

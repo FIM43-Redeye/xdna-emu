@@ -168,6 +168,28 @@ impl StreamPort {
     }
 }
 
+/// A local route within a stream switch (slave to master).
+#[derive(Debug, Clone, Copy)]
+pub struct LocalRoute {
+    /// Source slave port index
+    pub slave_idx: u8,
+    /// Destination master port index
+    pub master_idx: u8,
+    /// Is route enabled
+    pub enabled: bool,
+}
+
+impl LocalRoute {
+    /// Create a new local route.
+    pub fn new(slave_idx: u8, master_idx: u8) -> Self {
+        Self {
+            slave_idx,
+            master_idx,
+            enabled: true,
+        }
+    }
+}
+
 /// Stream switch for a single tile.
 #[derive(Debug, Clone)]
 pub struct StreamSwitch {
@@ -179,6 +201,8 @@ pub struct StreamSwitch {
     pub masters: Vec<StreamPort>,
     /// Slave ports
     pub slaves: Vec<StreamPort>,
+    /// Local routes (slave → master within this tile)
+    pub local_routes: Vec<LocalRoute>,
     /// Latency in cycles for local-to-local routing
     pub local_latency: u8,
     /// Latency in cycles for external routing
@@ -219,6 +243,7 @@ impl StreamSwitch {
             row,
             masters,
             slaves,
+            local_routes: Vec::new(),
             local_latency: aie2_spec::STREAM_LOCAL_TO_LOCAL_LATENCY,
             external_latency: aie2_spec::STREAM_LOCAL_TO_EXTERNAL_LATENCY,
         }
@@ -248,6 +273,7 @@ impl StreamSwitch {
             row,
             masters,
             slaves,
+            local_routes: Vec::new(),
             local_latency: aie2_spec::STREAM_LOCAL_TO_LOCAL_LATENCY,
             external_latency: aie2_spec::STREAM_LOCAL_TO_EXTERNAL_LATENCY,
         }
@@ -275,6 +301,7 @@ impl StreamSwitch {
             row: 0,
             masters,
             slaves,
+            local_routes: Vec::new(),
             local_latency: aie2_spec::STREAM_LOCAL_TO_LOCAL_LATENCY,
             external_latency: aie2_spec::STREAM_EXTERNAL_TO_EXTERNAL_LATENCY,
         }
@@ -342,13 +369,96 @@ impl StreamSwitch {
     }
 
     /// Configure a route from slave to master within this switch.
+    ///
+    /// This sets up a local route that will forward data from the specified
+    /// slave port to the specified master port when `step()` is called.
     pub fn configure_local_route(&mut self, slave_idx: usize, master_idx: usize) {
+        // Enable the ports
         if let Some(master) = self.masters.get_mut(master_idx) {
             master.enabled = true;
         }
         if let Some(slave) = self.slaves.get_mut(slave_idx) {
             slave.enabled = true;
         }
+
+        // Add the local route (avoid duplicates)
+        let route = LocalRoute::new(slave_idx as u8, master_idx as u8);
+        if !self.local_routes.iter().any(|r| {
+            r.slave_idx == route.slave_idx && r.master_idx == route.master_idx
+        }) {
+            self.local_routes.push(route);
+        }
+    }
+
+    /// Remove a local route.
+    pub fn remove_local_route(&mut self, slave_idx: usize, master_idx: usize) {
+        self.local_routes.retain(|r| {
+            !(r.slave_idx == slave_idx as u8 && r.master_idx == master_idx as u8)
+        });
+    }
+
+    /// Clear all local routes.
+    pub fn clear_local_routes(&mut self) {
+        self.local_routes.clear();
+    }
+
+    /// Step the stream switch: forward data along configured local routes.
+    ///
+    /// For each configured route, if the source slave port has data and the
+    /// destination master port has space, move one word from slave to master.
+    ///
+    /// Returns the number of words forwarded.
+    pub fn step(&mut self) -> usize {
+        let mut words_forwarded = 0;
+
+        // Process each local route
+        for route in &self.local_routes {
+            if !route.enabled {
+                continue;
+            }
+
+            let slave_idx = route.slave_idx as usize;
+            let master_idx = route.master_idx as usize;
+
+            // Check bounds
+            if slave_idx >= self.slaves.len() || master_idx >= self.masters.len() {
+                continue;
+            }
+
+            // Check if we can forward (slave has data, master has space)
+            let slave_has_data = self.slaves[slave_idx].has_data();
+            let master_can_accept = self.masters[master_idx].can_accept();
+
+            if slave_has_data && master_can_accept {
+                // Forward one word
+                if let Some(data) = self.slaves[slave_idx].pop() {
+                    if self.masters[master_idx].push(data) {
+                        words_forwarded += 1;
+                    }
+                }
+            }
+        }
+
+        words_forwarded
+    }
+
+    /// Check if any local route has data pending.
+    pub fn has_pending_local(&self) -> bool {
+        for route in &self.local_routes {
+            if !route.enabled {
+                continue;
+            }
+            let slave_idx = route.slave_idx as usize;
+            if slave_idx < self.slaves.len() && self.slaves[slave_idx].has_data() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get the number of configured local routes.
+    pub fn local_route_count(&self) -> usize {
+        self.local_routes.len()
     }
 }
 
@@ -400,6 +510,305 @@ impl StreamPacket {
     pub fn with_last(mut self) -> Self {
         self.is_last = true;
         self
+    }
+}
+
+// ============================================================================
+// Packet-Switched Routing (AM020 Ch2)
+// ============================================================================
+
+/// Packet type for packet-switched streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum PacketType {
+    /// Normal data packet
+    #[default]
+    Data = 0,
+    /// Control packet
+    Control = 1,
+    /// Configuration packet
+    Config = 2,
+    /// Trace packet
+    Trace = 3,
+    /// Reserved types (4-7)
+    Reserved = 4,
+}
+
+impl PacketType {
+    /// Convert from u8.
+    pub fn from_u8(val: u8) -> Self {
+        match val & 0x7 {
+            0 => Self::Data,
+            1 => Self::Control,
+            2 => Self::Config,
+            3 => Self::Trace,
+            _ => Self::Reserved,
+        }
+    }
+}
+
+/// Packet header for packet-switched streams.
+///
+/// The 32-bit header contains routing and control information:
+/// - Stream ID (5 bits): Identifies destination
+/// - Packet Type (3 bits): Data, control, config, or trace
+/// - Source Row (5 bits): Originating tile row
+/// - Source Column (7 bits): Originating tile column
+/// - Parity (1 bit): Odd parity for error detection
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PacketHeader {
+    /// Stream ID (destination identifier)
+    pub stream_id: u8,
+    /// Packet type
+    pub packet_type: PacketType,
+    /// Source tile row
+    pub src_row: u8,
+    /// Source tile column
+    pub src_col: u8,
+}
+
+impl PacketHeader {
+    /// Create a new packet header.
+    pub fn new(stream_id: u8, src_col: u8, src_row: u8) -> Self {
+        Self {
+            stream_id: stream_id & 0x1F, // 5 bits
+            packet_type: PacketType::Data,
+            src_row: src_row & 0x1F, // 5 bits
+            src_col: src_col & 0x7F, // 7 bits
+        }
+    }
+
+    /// Create with specific packet type.
+    pub fn with_type(mut self, ptype: PacketType) -> Self {
+        self.packet_type = ptype;
+        self
+    }
+
+    /// Encode to 32-bit header word.
+    ///
+    /// Layout (AM020 Ch2, Table 2):
+    /// | 31    | 30-28 | 27-21      | 20-16     | 15  | 14-12       | 11-5    | 4-0       |
+    /// | Parity| Rsvd  | Src Column | Src Row   | Rsvd| Packet Type | Rsvd    | Stream ID |
+    pub fn encode(&self) -> u32 {
+        let mut word: u32 = 0;
+
+        // Stream ID: bits 4-0
+        word |= (self.stream_id as u32) & aie2_spec::PACKET_STREAM_ID_MASK;
+
+        // Packet Type: bits 14-12
+        word |= ((self.packet_type as u32) & aie2_spec::PACKET_TYPE_MASK)
+            << aie2_spec::PACKET_TYPE_SHIFT;
+
+        // Source Row: bits 20-16
+        word |= ((self.src_row as u32) & aie2_spec::PACKET_SRC_ROW_MASK)
+            << aie2_spec::PACKET_SRC_ROW_SHIFT;
+
+        // Source Column: bits 27-21
+        word |= ((self.src_col as u32) & aie2_spec::PACKET_SRC_COL_MASK)
+            << aie2_spec::PACKET_SRC_COL_SHIFT;
+
+        // Calculate odd parity over bits 30-0
+        let parity = (word.count_ones() & 1) ^ 1; // Odd parity
+        word |= parity << aie2_spec::PACKET_PARITY_SHIFT;
+
+        word
+    }
+
+    /// Decode from 32-bit header word.
+    ///
+    /// Returns (header, parity_ok) tuple.
+    pub fn decode(word: u32) -> (Self, bool) {
+        // Extract fields
+        let stream_id = (word & aie2_spec::PACKET_STREAM_ID_MASK) as u8;
+
+        let packet_type = PacketType::from_u8(
+            ((word >> aie2_spec::PACKET_TYPE_SHIFT) & aie2_spec::PACKET_TYPE_MASK) as u8,
+        );
+
+        let src_row =
+            ((word >> aie2_spec::PACKET_SRC_ROW_SHIFT) & aie2_spec::PACKET_SRC_ROW_MASK) as u8;
+
+        let src_col =
+            ((word >> aie2_spec::PACKET_SRC_COL_SHIFT) & aie2_spec::PACKET_SRC_COL_MASK) as u8;
+
+        // Check parity (odd parity means total 1-bits should be odd)
+        let parity_ok = word.count_ones() & 1 == 1;
+
+        let header = Self {
+            stream_id,
+            packet_type,
+            src_row,
+            src_col,
+        };
+
+        (header, parity_ok)
+    }
+
+    /// Check if this is a data packet.
+    pub fn is_data(&self) -> bool {
+        self.packet_type == PacketType::Data
+    }
+}
+
+/// A packet route entry in the stream switch.
+///
+/// Maps a stream ID to one or more destination master ports.
+/// Packet-switched routing allows multicast (one stream to many destinations).
+#[derive(Debug, Clone)]
+pub struct PacketRoute {
+    /// Stream ID that triggers this route
+    pub stream_id: u8,
+    /// Destination master port indices
+    pub dest_ports: Vec<u8>,
+    /// Is route enabled
+    pub enabled: bool,
+}
+
+impl PacketRoute {
+    /// Create a new packet route.
+    pub fn new(stream_id: u8, dest_port: u8) -> Self {
+        Self {
+            stream_id,
+            dest_ports: vec![dest_port],
+            enabled: true,
+        }
+    }
+
+    /// Create a multicast route to multiple ports.
+    pub fn multicast(stream_id: u8, dest_ports: Vec<u8>) -> Self {
+        Self {
+            stream_id,
+            dest_ports,
+            enabled: true,
+        }
+    }
+
+    /// Add a destination port (for multicast).
+    pub fn add_dest(&mut self, port: u8) {
+        if !self.dest_ports.contains(&port) {
+            self.dest_ports.push(port);
+        }
+    }
+}
+
+/// Packet switch state for a tile.
+///
+/// This handles packet-switched routing where the destination is
+/// determined by the stream ID in the packet header.
+#[derive(Debug, Clone, Default)]
+pub struct PacketSwitch {
+    /// Packet routes indexed by stream ID
+    routes: Vec<PacketRoute>,
+    /// Current packet being received (header + data count)
+    current_packet: Option<(PacketHeader, usize)>,
+    /// Arbitration overhead counter
+    arb_delay: u8,
+}
+
+impl PacketSwitch {
+    /// Create a new packet switch.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a packet route.
+    pub fn add_route(&mut self, stream_id: u8, dest_port: u8) {
+        // Check if route for this stream ID exists
+        if let Some(route) = self.routes.iter_mut().find(|r| r.stream_id == stream_id) {
+            route.add_dest(dest_port);
+        } else {
+            self.routes.push(PacketRoute::new(stream_id, dest_port));
+        }
+    }
+
+    /// Add a multicast route.
+    pub fn add_multicast_route(&mut self, stream_id: u8, dest_ports: Vec<u8>) {
+        self.routes.push(PacketRoute::multicast(stream_id, dest_ports));
+    }
+
+    /// Remove all routes for a stream ID.
+    pub fn remove_route(&mut self, stream_id: u8) {
+        self.routes.retain(|r| r.stream_id != stream_id);
+    }
+
+    /// Clear all routes.
+    pub fn clear_routes(&mut self) {
+        self.routes.clear();
+    }
+
+    /// Look up destinations for a stream ID.
+    pub fn lookup(&self, stream_id: u8) -> Option<&[u8]> {
+        self.routes
+            .iter()
+            .find(|r| r.stream_id == stream_id && r.enabled)
+            .map(|r| r.dest_ports.as_slice())
+    }
+
+    /// Get the number of configured routes.
+    pub fn route_count(&self) -> usize {
+        self.routes.len()
+    }
+
+    /// Process a packet header word.
+    ///
+    /// Returns the decoded header and list of destination ports.
+    pub fn process_header(&mut self, word: u32) -> Option<(PacketHeader, Vec<u8>)> {
+        let (header, parity_ok) = PacketHeader::decode(word);
+
+        if !parity_ok {
+            // Parity error - drop packet
+            return None;
+        }
+
+        // Look up destinations
+        if let Some(dests) = self.lookup(header.stream_id) {
+            let dest_vec = dests.to_vec();
+            self.current_packet = Some((header, 0));
+            self.arb_delay = aie2_spec::PACKET_ARBITRATION_OVERHEAD_CYCLES;
+            Some((header, dest_vec))
+        } else {
+            // No route for this stream ID
+            None
+        }
+    }
+
+    /// Check if arbitration delay is pending.
+    pub fn has_arb_delay(&self) -> bool {
+        self.arb_delay > 0
+    }
+
+    /// Tick the arbitration delay counter.
+    ///
+    /// Returns true if arbitration is complete.
+    pub fn tick_arb_delay(&mut self) -> bool {
+        if self.arb_delay > 0 {
+            self.arb_delay -= 1;
+        }
+        self.arb_delay == 0
+    }
+
+    /// Record that a data word was processed.
+    pub fn count_data_word(&mut self) {
+        if let Some((_, ref mut count)) = self.current_packet {
+            *count += 1;
+        }
+    }
+
+    /// Complete the current packet (called when TLAST is seen).
+    ///
+    /// Returns the header and word count of the completed packet.
+    pub fn complete_packet(&mut self) -> Option<(PacketHeader, usize)> {
+        self.current_packet.take()
+    }
+
+    /// Check if currently processing a packet.
+    pub fn in_packet(&self) -> bool {
+        self.current_packet.is_some()
+    }
+
+    /// Get current packet info if any.
+    pub fn current_packet(&self) -> Option<&(PacketHeader, usize)> {
+        self.current_packet.as_ref()
     }
 }
 
@@ -498,5 +907,359 @@ mod tests {
 
         let pkt_last = pkt.with_last();
         assert!(pkt_last.is_last);
+    }
+
+    #[test]
+    fn test_local_route() {
+        let route = LocalRoute::new(0, 1);
+        assert_eq!(route.slave_idx, 0);
+        assert_eq!(route.master_idx, 1);
+        assert!(route.enabled);
+    }
+
+    #[test]
+    fn test_configure_local_route() {
+        let mut ss = StreamSwitch::new_compute_tile(0, 2);
+
+        assert_eq!(ss.local_route_count(), 0);
+
+        // Configure route from slave 0 to master 0
+        ss.configure_local_route(0, 0);
+        assert_eq!(ss.local_route_count(), 1);
+
+        // Duplicate route should not be added
+        ss.configure_local_route(0, 0);
+        assert_eq!(ss.local_route_count(), 1);
+
+        // Different route should be added
+        ss.configure_local_route(1, 1);
+        assert_eq!(ss.local_route_count(), 2);
+    }
+
+    #[test]
+    fn test_switch_step_basic() {
+        let mut ss = StreamSwitch::new_compute_tile(0, 2);
+
+        // Configure route from slave 0 to master 0
+        ss.configure_local_route(0, 0);
+
+        // Put data in slave port
+        ss.slaves[0].push(0xDEADBEEF);
+        assert!(ss.slaves[0].has_data());
+        assert!(!ss.masters[0].has_data());
+
+        // Step should forward the data
+        let forwarded = ss.step();
+        assert_eq!(forwarded, 1);
+
+        // Data should now be in master port
+        assert!(!ss.slaves[0].has_data());
+        assert!(ss.masters[0].has_data());
+        assert_eq!(ss.masters[0].peek(), Some(0xDEADBEEF));
+    }
+
+    #[test]
+    fn test_switch_step_multiple_routes() {
+        let mut ss = StreamSwitch::new_compute_tile(0, 2);
+
+        // Configure two routes
+        ss.configure_local_route(0, 0);
+        ss.configure_local_route(1, 1);
+
+        // Put data in both slave ports
+        ss.slaves[0].push(0x11111111);
+        ss.slaves[1].push(0x22222222);
+
+        // Step should forward both
+        let forwarded = ss.step();
+        assert_eq!(forwarded, 2);
+
+        assert_eq!(ss.masters[0].pop(), Some(0x11111111));
+        assert_eq!(ss.masters[1].pop(), Some(0x22222222));
+    }
+
+    #[test]
+    fn test_switch_step_backpressure() {
+        let mut ss = StreamSwitch::new_compute_tile(0, 2);
+        ss.configure_local_route(0, 0);
+
+        // Fill the master port's FIFO
+        while ss.masters[0].can_accept() {
+            ss.masters[0].push(0x99999999);
+        }
+
+        // Put data in slave
+        ss.slaves[0].push(0xDEADBEEF);
+
+        // Step should not forward (backpressure)
+        let forwarded = ss.step();
+        assert_eq!(forwarded, 0);
+
+        // Data still in slave
+        assert!(ss.slaves[0].has_data());
+    }
+
+    #[test]
+    fn test_switch_step_no_data() {
+        let mut ss = StreamSwitch::new_compute_tile(0, 2);
+        ss.configure_local_route(0, 0);
+
+        // No data in slave - step does nothing
+        let forwarded = ss.step();
+        assert_eq!(forwarded, 0);
+    }
+
+    #[test]
+    fn test_has_pending_local() {
+        let mut ss = StreamSwitch::new_compute_tile(0, 2);
+        ss.configure_local_route(0, 0);
+
+        assert!(!ss.has_pending_local());
+
+        ss.slaves[0].push(0x12345678);
+        assert!(ss.has_pending_local());
+
+        ss.step();
+        assert!(!ss.has_pending_local());
+    }
+
+    #[test]
+    fn test_remove_local_route() {
+        let mut ss = StreamSwitch::new_compute_tile(0, 2);
+
+        ss.configure_local_route(0, 0);
+        ss.configure_local_route(1, 1);
+        assert_eq!(ss.local_route_count(), 2);
+
+        ss.remove_local_route(0, 0);
+        assert_eq!(ss.local_route_count(), 1);
+
+        ss.clear_local_routes();
+        assert_eq!(ss.local_route_count(), 0);
+    }
+
+    // ========================================================================
+    // Packet Header Tests
+    // ========================================================================
+
+    #[test]
+    fn test_packet_header_new() {
+        let header = PacketHeader::new(5, 2, 3);
+        assert_eq!(header.stream_id, 5);
+        assert_eq!(header.src_col, 2);
+        assert_eq!(header.src_row, 3);
+        assert_eq!(header.packet_type, PacketType::Data);
+    }
+
+    #[test]
+    fn test_packet_header_with_type() {
+        let header = PacketHeader::new(10, 1, 2).with_type(PacketType::Control);
+        assert_eq!(header.stream_id, 10);
+        assert_eq!(header.packet_type, PacketType::Control);
+    }
+
+    #[test]
+    fn test_packet_header_encode_decode() {
+        let original = PacketHeader::new(7, 3, 4);
+        let encoded = original.encode();
+        let (decoded, parity_ok) = PacketHeader::decode(encoded);
+
+        assert!(parity_ok, "Parity check should pass");
+        assert_eq!(decoded.stream_id, original.stream_id);
+        assert_eq!(decoded.src_col, original.src_col);
+        assert_eq!(decoded.src_row, original.src_row);
+        assert_eq!(decoded.packet_type, original.packet_type);
+    }
+
+    #[test]
+    fn test_packet_header_encode_decode_all_types() {
+        for ptype in [
+            PacketType::Data,
+            PacketType::Control,
+            PacketType::Config,
+            PacketType::Trace,
+        ] {
+            let original = PacketHeader::new(15, 5, 6).with_type(ptype);
+            let encoded = original.encode();
+            let (decoded, parity_ok) = PacketHeader::decode(encoded);
+
+            assert!(parity_ok);
+            assert_eq!(decoded.packet_type, ptype);
+        }
+    }
+
+    #[test]
+    fn test_packet_header_field_masks() {
+        // Test with maximum values for each field
+        let header = PacketHeader {
+            stream_id: 0x1F,   // 5 bits max
+            packet_type: PacketType::Reserved,
+            src_row: 0x1F,     // 5 bits max
+            src_col: 0x7F,     // 7 bits max
+        };
+
+        let encoded = header.encode();
+        let (decoded, _) = PacketHeader::decode(encoded);
+
+        assert_eq!(decoded.stream_id, 0x1F);
+        assert_eq!(decoded.src_row, 0x1F);
+        assert_eq!(decoded.src_col, 0x7F);
+    }
+
+    #[test]
+    fn test_packet_header_parity_error() {
+        let header = PacketHeader::new(5, 2, 3);
+        let mut encoded = header.encode();
+
+        // Flip a bit to corrupt parity
+        encoded ^= 0x100;
+
+        let (_, parity_ok) = PacketHeader::decode(encoded);
+        assert!(!parity_ok, "Parity should fail after bit flip");
+    }
+
+    // ========================================================================
+    // Packet Switch Tests
+    // ========================================================================
+
+    #[test]
+    fn test_packet_switch_new() {
+        let ps = PacketSwitch::new();
+        assert_eq!(ps.route_count(), 0);
+        assert!(!ps.in_packet());
+    }
+
+    #[test]
+    fn test_packet_switch_add_route() {
+        let mut ps = PacketSwitch::new();
+
+        ps.add_route(5, 0);
+        assert_eq!(ps.route_count(), 1);
+
+        // Adding same stream ID adds to existing route
+        ps.add_route(5, 1);
+        assert_eq!(ps.route_count(), 1);
+
+        // Lookup should return both ports
+        let dests = ps.lookup(5).unwrap();
+        assert_eq!(dests.len(), 2);
+        assert!(dests.contains(&0));
+        assert!(dests.contains(&1));
+    }
+
+    #[test]
+    fn test_packet_switch_multicast_route() {
+        let mut ps = PacketSwitch::new();
+
+        ps.add_multicast_route(10, vec![0, 1, 2]);
+        assert_eq!(ps.route_count(), 1);
+
+        let dests = ps.lookup(10).unwrap();
+        assert_eq!(dests, &[0, 1, 2]);
+    }
+
+    #[test]
+    fn test_packet_switch_lookup_not_found() {
+        let ps = PacketSwitch::new();
+        assert!(ps.lookup(5).is_none());
+    }
+
+    #[test]
+    fn test_packet_switch_remove_route() {
+        let mut ps = PacketSwitch::new();
+
+        ps.add_route(5, 0);
+        ps.add_route(10, 1);
+        assert_eq!(ps.route_count(), 2);
+
+        ps.remove_route(5);
+        assert_eq!(ps.route_count(), 1);
+        assert!(ps.lookup(5).is_none());
+        assert!(ps.lookup(10).is_some());
+    }
+
+    #[test]
+    fn test_packet_switch_process_header() {
+        let mut ps = PacketSwitch::new();
+        ps.add_route(5, 2);
+
+        let header = PacketHeader::new(5, 1, 3);
+        let encoded = header.encode();
+
+        let result = ps.process_header(encoded);
+        assert!(result.is_some());
+
+        let (decoded, dests) = result.unwrap();
+        assert_eq!(decoded.stream_id, 5);
+        assert_eq!(dests, vec![2]);
+
+        // Should be in packet now
+        assert!(ps.in_packet());
+        assert!(ps.has_arb_delay());
+    }
+
+    #[test]
+    fn test_packet_switch_process_header_no_route() {
+        let mut ps = PacketSwitch::new();
+        // No routes configured
+
+        let header = PacketHeader::new(5, 1, 3);
+        let encoded = header.encode();
+
+        let result = ps.process_header(encoded);
+        assert!(result.is_none(), "Should return None for unknown stream ID");
+    }
+
+    #[test]
+    fn test_packet_switch_arb_delay() {
+        let mut ps = PacketSwitch::new();
+        ps.add_route(5, 0);
+
+        let header = PacketHeader::new(5, 1, 2);
+        ps.process_header(header.encode());
+
+        // With 1-cycle overhead, first tick should complete
+        assert!(ps.has_arb_delay());
+
+        // Tick until complete (may be immediate if overhead is 1)
+        while ps.has_arb_delay() {
+            ps.tick_arb_delay();
+        }
+        assert!(!ps.has_arb_delay());
+    }
+
+    #[test]
+    fn test_packet_switch_complete_packet() {
+        let mut ps = PacketSwitch::new();
+        ps.add_route(5, 0);
+
+        let header = PacketHeader::new(5, 1, 2);
+        ps.process_header(header.encode());
+
+        // Count some data words
+        ps.count_data_word();
+        ps.count_data_word();
+        ps.count_data_word();
+
+        // Complete packet
+        let result = ps.complete_packet();
+        assert!(result.is_some());
+
+        let (completed_header, word_count) = result.unwrap();
+        assert_eq!(completed_header.stream_id, 5);
+        assert_eq!(word_count, 3);
+
+        // No longer in packet
+        assert!(!ps.in_packet());
+    }
+
+    #[test]
+    fn test_packet_type_from_u8() {
+        assert_eq!(PacketType::from_u8(0), PacketType::Data);
+        assert_eq!(PacketType::from_u8(1), PacketType::Control);
+        assert_eq!(PacketType::from_u8(2), PacketType::Config);
+        assert_eq!(PacketType::from_u8(3), PacketType::Trace);
+        assert_eq!(PacketType::from_u8(4), PacketType::Reserved);
+        assert_eq!(PacketType::from_u8(7), PacketType::Reserved);
     }
 }

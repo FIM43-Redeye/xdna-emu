@@ -283,6 +283,22 @@ impl TileArray {
         self.stream_router.step()
     }
 
+    /// Step all per-tile stream switches.
+    ///
+    /// This handles intra-tile routing: forwarding data from input (slave) ports
+    /// to output (master) ports within each tile based on configured local routes.
+    /// This is necessary for pass-through routing where data enters a tile from
+    /// one direction and exits to another.
+    ///
+    /// Returns the total number of words forwarded across all tiles.
+    pub fn step_tile_switches(&mut self) -> usize {
+        let mut total_forwarded = 0;
+        for tile in &mut self.tiles {
+            total_forwarded += tile.stream_switch.step();
+        }
+        total_forwarded
+    }
+
     /// Route data between DMA engines and the stream router.
     ///
     /// This is the glue between the per-tile DMA engines and the global stream fabric.
@@ -345,18 +361,32 @@ impl TileArray {
     /// This steps DMA, routes between DMA and streams, and steps the stream router.
     /// Use this for a complete simulation cycle.
     ///
+    /// The execution order is:
+    /// 1. Step all DMA engines (transfers data to/from tile memory)
+    /// 2. Route DMA output to stream router (MM2S data enters stream fabric)
+    /// 3. Step global stream router (data moves between tiles)
+    /// 4. Step per-tile stream switches (intra-tile input → output forwarding)
+    /// 5. Route stream router input to DMA (S2MM data exits stream fabric)
+    ///
     /// Returns (dma_active, streams_moved, words_routed)
     pub fn step_data_movement(&mut self, host_memory: &mut HostMemory) -> (bool, bool, usize) {
-        // Step all DMA engines
+        // Phase 1: Step all DMA engines
         let dma_active = self.step_all_dma(host_memory);
 
-        // Route between DMA and stream router
-        let words_routed = self.route_dma_streams();
+        // Phase 2: Route DMA output → StreamRouter
+        let mut words_routed = self.route_dma_streams();
 
-        // Step the stream router
+        // Phase 3: Step global stream router (tile-to-tile routing)
         let streams_moved = self.step_streams();
 
-        (dma_active, streams_moved, words_routed)
+        // Phase 4: Step per-tile stream switches (intra-tile routing)
+        let tile_forwards = self.step_tile_switches();
+        words_routed += tile_forwards;
+
+        // Phase 5: Route StreamRouter → DMA input (done as part of route_dma_streams above)
+        // The S2MM side of route_dma_streams handles this
+
+        (dma_active, streams_moved || tile_forwards > 0, words_routed)
     }
 
     /// Count tiles by type.

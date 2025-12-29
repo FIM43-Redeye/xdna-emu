@@ -351,7 +351,14 @@ pub struct StreamPort {
     pub config: u32,
 }
 
-/// Stream switch state.
+/// Stream switch state (register-level stub).
+///
+/// This is a lightweight representation for CDO configuration.
+/// For functional simulation, see `stream_switch::StreamSwitch` which
+/// has full FIFO modeling and local route forwarding.
+///
+/// TODO: Unify with `stream_switch::StreamSwitch` to have one type
+/// that handles both register configuration and functional simulation.
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
 pub struct StreamSwitch {
@@ -361,6 +368,20 @@ pub struct StreamSwitch {
     pub slave: [StreamPort; 8],
     /// Control packet handler config
     pub ctrl_pkt: u32,
+}
+
+impl StreamSwitch {
+    /// Step the stream switch (placeholder).
+    ///
+    /// This stub returns 0 - no actual data forwarding is done here.
+    /// Real stream routing is handled by `stream_switch::StreamSwitch`
+    /// instances in the TileArray's stream fabric.
+    ///
+    /// TODO: Migrate to unified StreamSwitch type for proper intra-tile routing.
+    pub fn step(&mut self) -> usize {
+        // Placeholder - real routing is in stream_switch::StreamSwitch
+        0
+    }
 }
 
 /// Tile type determines available resources.
