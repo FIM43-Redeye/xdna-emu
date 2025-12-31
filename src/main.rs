@@ -2,17 +2,25 @@
 
 use std::env;
 use std::collections::HashMap;
+use std::path::Path;
 use xdna_emu::parser::{Xclbin, AiePartition, Cdo, AieElf};
 use xdna_emu::parser::xclbin::SectionKind;
 use xdna_emu::parser::cdo::{find_cdo_offset, CdoCommand};
 use xdna_emu::device::{TileAddress, RegisterInfo, RegisterModule, DeviceState};
 use xdna_emu::visual::EmulatorApp;
+use xdna_emu::testing::XclbinSuite;
 
 fn main() -> anyhow::Result<()> {
     // Initialize logging
     env_logger::init();
 
     let args: Vec<String> = env::args().collect();
+
+    // Check for test-suite command
+    if args.len() >= 2 && args[1] == "test-suite" {
+        let path = args.get(2).map(|s| s.as_str()).unwrap_or(".");
+        return run_test_suite(path);
+    }
 
     // Check for GUI mode
     let gui_mode = args.iter().any(|a| a == "--gui" || a == "-g");
@@ -273,6 +281,38 @@ fn print_command(idx: usize, cmd: &CdoCommand) {
             }
         }
     }
+}
+
+/// Run the XCLBIN test suite.
+fn run_test_suite(path: &str) -> anyhow::Result<()> {
+    println!("=== XCLBIN Test Suite ===");
+    println!("Discovering tests in: {}", path);
+    println!();
+
+    let mut suite = XclbinSuite::discover(Path::new(path))?;
+    println!("Found {} tests", suite.test_count());
+    println!();
+
+    if suite.test_count() == 0 {
+        println!("No xclbin files found in {}", path);
+        println!("Expected structure: <dir>/<test_name>/aie.xclbin");
+        return Ok(());
+    }
+
+    // Run all tests
+    println!("Running tests...");
+    println!();
+    let result = suite.run_all();
+
+    // Print summary
+    println!("{}", suite.summary_report(&result));
+
+    // Exit with error code if any tests failed
+    if result.passed < result.total {
+        std::process::exit(1);
+    }
+
+    Ok(())
 }
 
 /// Run the GUI application.

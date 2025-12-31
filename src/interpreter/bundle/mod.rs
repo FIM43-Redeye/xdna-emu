@@ -269,6 +269,19 @@ fn disassemble_op(slot_op: &SlotOp) -> String {
         Operation::ScalarMovi { value } => return format!("movi #{}", value),
         Operation::ScalarCmp => "cmp",
 
+        // Comparison operations
+        Operation::ScalarLt => "lt",
+        Operation::ScalarLtu => "ltu",
+        Operation::ScalarLe => "le",
+        Operation::ScalarLeu => "leu",
+        Operation::ScalarGt => "gt",
+        Operation::ScalarGtu => "gtu",
+        Operation::ScalarGe => "ge",
+        Operation::ScalarGeu => "geu",
+        Operation::ScalarEq => "eq",
+        Operation::ScalarNe => "ne",
+        Operation::ScalarSel => "sel",
+
         Operation::VectorAdd { element_type } => {
             return format!("vadd.{}", element_suffix(*element_type))
         }

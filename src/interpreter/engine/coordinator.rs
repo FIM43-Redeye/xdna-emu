@@ -18,6 +18,8 @@ use crate::device::dma::ChannelState;
 use crate::device::host_memory::HostMemory;
 use crate::device::tile::TileType;
 use crate::device::DeviceState;
+use crate::parser::{AieElf, MemoryRegion};
+use crate::interpreter::bundle::VliwBundle;
 use crate::interpreter::core::{CoreInterpreter, CoreStatus, StepResult};
 use crate::interpreter::decode::InstructionDecoder;
 use crate::interpreter::execute::{CycleAccurateExecutor, FastExecutor};
@@ -110,6 +112,14 @@ impl InterpreterKind {
     /// Check if this is cycle-accurate mode.
     fn is_cycle_accurate(&self) -> bool {
         matches!(self, Self::CycleAccurate(_))
+    }
+
+    /// Get the last decoded bundle (for debugging).
+    fn last_bundle(&self) -> Option<&VliwBundle> {
+        match self {
+            Self::Fast(interp) => interp.last_bundle(),
+            Self::CycleAccurate(interp) => interp.last_bundle(),
+        }
     }
 }
 
@@ -350,6 +360,56 @@ impl InterpreterEngine {
         }
     }
 
+    /// Get the last decoded bundle for a core (for debugging).
+    ///
+    /// Returns the last VLIW bundle that was decoded for the core at (col, row).
+    /// Useful for diagnosing decode/execution errors.
+    pub fn core_last_bundle(&self, col: usize, row: usize) -> Option<&VliwBundle> {
+        self.get_core(col, row).and_then(|c| c.interpreter.last_bundle())
+    }
+
+    /// Load an ELF file into a core's memory.
+    ///
+    /// Parses the ELF, loads program and data segments into the tile's memory,
+    /// sets the entry point as the PC, and enables the core.
+    ///
+    /// Returns the entry point address on success.
+    pub fn load_elf_bytes(&mut self, col: usize, row: usize, data: &[u8]) -> Result<u32, String> {
+        let elf = AieElf::parse(data).map_err(|e| format!("ELF parse error: {}", e))?;
+        let entry = elf.entry_point();
+
+        // Load segments into tile memory
+        {
+            let tile = self.device.tile_mut(col, row)
+                .ok_or_else(|| format!("Invalid tile coordinates ({}, {})", col, row))?;
+
+            for seg in elf.load_segments() {
+                let vaddr = seg.vaddr as usize;
+
+                match seg.region {
+                    MemoryRegion::Program => {
+                        tile.write_program(vaddr, seg.data);
+                    }
+                    MemoryRegion::Data => {
+                        // Data memory starts at 0x00070000 in AIE address space
+                        let dm_offset = vaddr.saturating_sub(0x00070000);
+                        let dm = tile.data_memory_mut();
+                        if dm_offset + seg.data.len() <= dm.len() {
+                            dm[dm_offset..dm_offset + seg.data.len()].copy_from_slice(seg.data);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Set entry point and enable core
+        self.set_core_pc(col, row, entry);
+        self.enable_core(col, row);
+
+        Ok(entry)
+    }
+
     /// Execute one cycle on all enabled cores and DMA engines.
     ///
     /// The execution order is:
@@ -527,6 +587,33 @@ impl InterpreterEngine {
         self.status = EngineStatus::Ready;
         self.total_cycles = 0;
         self.total_instructions = 0;
+    }
+
+    /// Sync core enabled state and PC from device tiles.
+    ///
+    /// After applying CDO, the tile.core.enabled and tile.core.pc fields
+    /// are set by register writes. This method syncs those values to the
+    /// engine's internal core state, enabling execution.
+    ///
+    /// Call this after `device_mut().apply_cdo()` to start execution.
+    pub fn sync_cores_from_device(&mut self) {
+        for col in 0..self.cols {
+            for row in self.compute_row_start..self.rows {
+                if let Some(tile) = self.device.array.get(col as u8, row as u8) {
+                    if tile.tile_type == TileType::Compute {
+                        let idx = col * self.rows + row;
+                        if let Some(core) = self.cores.get_mut(idx) {
+                            // Sync enabled state from tile
+                            core.enabled = tile.core.enabled;
+                            // Sync PC from tile (if set by CDO)
+                            if tile.core.pc != 0 || tile.core.enabled {
+                                core.context.set_pc(tile.core.pc);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Get the number of enabled cores.

@@ -236,6 +236,31 @@ pub enum Operation {
     /// Scalar compare (sets flags): flags = cmp(src1, src2)
     ScalarCmp,
 
+    // ========== Comparison Operations (produce 0/1) ==========
+    /// Signed less than: dst = (src1 < src2) ? 1 : 0
+    ScalarLt,
+    /// Unsigned less than: dst = (src1 < src2) ? 1 : 0 (unsigned)
+    ScalarLtu,
+    /// Signed less than or equal: dst = (src1 <= src2) ? 1 : 0
+    ScalarLe,
+    /// Unsigned less than or equal: dst = (src1 <= src2) ? 1 : 0 (unsigned)
+    ScalarLeu,
+    /// Signed greater than: dst = (src1 > src2) ? 1 : 0
+    ScalarGt,
+    /// Unsigned greater than: dst = (src1 > src2) ? 1 : 0 (unsigned)
+    ScalarGtu,
+    /// Signed greater than or equal: dst = (src1 >= src2) ? 1 : 0
+    ScalarGe,
+    /// Unsigned greater than or equal: dst = (src1 >= src2) ? 1 : 0 (unsigned)
+    ScalarGeu,
+    /// Equal: dst = (src1 == src2) ? 1 : 0
+    ScalarEq,
+    /// Not equal: dst = (src1 != src2) ? 1 : 0
+    ScalarNe,
+
+    /// Conditional select: dst = cond ? src1 : src2
+    ScalarSel,
+
     // ========== Vector Operations ==========
     /// Vector addition: vdst = vsrc1 + vsrc2
     VectorAdd {
@@ -386,7 +411,18 @@ impl Operation {
             | Operation::ScalarSra
             | Operation::ScalarMov
             | Operation::ScalarMovi { .. }
-            | Operation::ScalarCmp => SlotIndex::Scalar0,
+            | Operation::ScalarCmp
+            | Operation::ScalarLt
+            | Operation::ScalarLtu
+            | Operation::ScalarLe
+            | Operation::ScalarLeu
+            | Operation::ScalarGt
+            | Operation::ScalarGtu
+            | Operation::ScalarGe
+            | Operation::ScalarGeu
+            | Operation::ScalarEq
+            | Operation::ScalarNe
+            | Operation::ScalarSel => SlotIndex::Scalar0,
 
             Operation::ScalarMul => SlotIndex::Scalar1,
 

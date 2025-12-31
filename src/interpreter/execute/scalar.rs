@@ -118,6 +118,88 @@ impl ScalarAlu {
                 true
             }
 
+            // Comparison operations: produce 0 or 1 in destination
+            Operation::ScalarLt => {
+                let (a, b) = Self::get_two_sources(op, ctx);
+                let result = if (a as i32) < (b as i32) { 1 } else { 0 };
+                Self::write_dest(op, ctx, result);
+                true
+            }
+
+            Operation::ScalarLtu => {
+                let (a, b) = Self::get_two_sources(op, ctx);
+                let result = if a < b { 1 } else { 0 };
+                Self::write_dest(op, ctx, result);
+                true
+            }
+
+            Operation::ScalarLe => {
+                let (a, b) = Self::get_two_sources(op, ctx);
+                let result = if (a as i32) <= (b as i32) { 1 } else { 0 };
+                Self::write_dest(op, ctx, result);
+                true
+            }
+
+            Operation::ScalarLeu => {
+                let (a, b) = Self::get_two_sources(op, ctx);
+                let result = if a <= b { 1 } else { 0 };
+                Self::write_dest(op, ctx, result);
+                true
+            }
+
+            Operation::ScalarGt => {
+                let (a, b) = Self::get_two_sources(op, ctx);
+                let result = if (a as i32) > (b as i32) { 1 } else { 0 };
+                Self::write_dest(op, ctx, result);
+                true
+            }
+
+            Operation::ScalarGtu => {
+                let (a, b) = Self::get_two_sources(op, ctx);
+                let result = if a > b { 1 } else { 0 };
+                Self::write_dest(op, ctx, result);
+                true
+            }
+
+            Operation::ScalarGe => {
+                let (a, b) = Self::get_two_sources(op, ctx);
+                let result = if (a as i32) >= (b as i32) { 1 } else { 0 };
+                Self::write_dest(op, ctx, result);
+                true
+            }
+
+            Operation::ScalarGeu => {
+                let (a, b) = Self::get_two_sources(op, ctx);
+                let result = if a >= b { 1 } else { 0 };
+                Self::write_dest(op, ctx, result);
+                true
+            }
+
+            Operation::ScalarEq => {
+                let (a, b) = Self::get_two_sources(op, ctx);
+                let result = if a == b { 1 } else { 0 };
+                Self::write_dest(op, ctx, result);
+                true
+            }
+
+            Operation::ScalarNe => {
+                let (a, b) = Self::get_two_sources(op, ctx);
+                let result = if a != b { 1 } else { 0 };
+                Self::write_dest(op, ctx, result);
+                true
+            }
+
+            Operation::ScalarSel => {
+                // sel: dst = cond ? src1 : src2
+                // Typically three sources: cond, true_val, false_val
+                let cond = Self::get_source(op, ctx, 0);
+                let true_val = Self::get_source(op, ctx, 1);
+                let false_val = Self::get_source(op, ctx, 2);
+                let result = if cond != 0 { true_val } else { false_val };
+                Self::write_dest(op, ctx, result);
+                true
+            }
+
             _ => false, // Not a scalar operation
         }
     }

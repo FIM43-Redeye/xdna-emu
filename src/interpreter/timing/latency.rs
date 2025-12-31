@@ -277,6 +277,18 @@ impl LatencyTable {
             Operation::ScalarSra => OperationKey::ScalarSra,
             Operation::ScalarMov | Operation::ScalarMovi { .. } => OperationKey::ScalarMov,
             Operation::ScalarCmp => OperationKey::ScalarCmp,
+            // Comparison operations have same timing as compare
+            Operation::ScalarLt
+            | Operation::ScalarLtu
+            | Operation::ScalarLe
+            | Operation::ScalarLeu
+            | Operation::ScalarGt
+            | Operation::ScalarGtu
+            | Operation::ScalarGe
+            | Operation::ScalarGeu
+            | Operation::ScalarEq
+            | Operation::ScalarNe
+            | Operation::ScalarSel => OperationKey::ScalarCmp,
             Operation::PointerAdd | Operation::PointerMov => OperationKey::Load, // Pointer ops have similar timing to loads
             Operation::Load { .. } => OperationKey::Load,
             Operation::Store { .. } => OperationKey::Store,

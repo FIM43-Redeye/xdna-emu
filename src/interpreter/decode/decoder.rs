@@ -289,11 +289,14 @@ impl InstructionDecoder {
             Operation::ScalarOr
         } else if mnemonic.starts_with("xor") {
             Operation::ScalarXor
-        } else if mnemonic.starts_with("shl") || mnemonic.starts_with("lsl") {
+        } else if mnemonic.starts_with("shl") || mnemonic.starts_with("lsl") || mnemonic.starts_with("lshl") {
+            // shl, lsl, lshl - logical shift left
             Operation::ScalarShl
-        } else if mnemonic.starts_with("shr") || mnemonic.starts_with("lsr") {
+        } else if mnemonic.starts_with("shr") || mnemonic.starts_with("lsr") || mnemonic.starts_with("lshr") {
+            // shr, lsr, lshr - logical shift right
             Operation::ScalarShr
-        } else if mnemonic.starts_with("asr") {
+        } else if mnemonic.starts_with("asr") || mnemonic.starts_with("ashr") {
+            // asr, ashr - arithmetic shift right
             Operation::ScalarSra
         } else if mnemonic.starts_with("mova") || mnemonic.starts_with("movb") {
             // mova, movb - pointer move operations (check before generic mov)
@@ -346,12 +349,46 @@ impl InstructionDecoder {
             Operation::Branch {
                 condition: BranchCondition::Always,
             }
-        } else if mnemonic == "ret" {
+        } else if mnemonic.starts_with("ret") {
+            // ret, ret lr, ret.* - all return operations
             Operation::Return
-        } else if mnemonic == "call" {
+        } else if mnemonic.starts_with("call") {
             Operation::Call
         } else if mnemonic == "halt" {
             Operation::Halt
+        // Comparison operations (produce 0/1 result)
+        } else if mnemonic.starts_with("lt") && !mnemonic.starts_with("ltip") {
+            // lt, lts (signed less than), ltu (unsigned less than)
+            if mnemonic.contains("u") {
+                Operation::ScalarLtu
+            } else {
+                Operation::ScalarLt
+            }
+        } else if mnemonic.starts_with("le") && !mnemonic.starts_with("letp") {
+            if mnemonic.contains("u") {
+                Operation::ScalarLeu
+            } else {
+                Operation::ScalarLe
+            }
+        } else if mnemonic.starts_with("gt") && !mnemonic.starts_with("gtip") {
+            if mnemonic.contains("u") {
+                Operation::ScalarGtu
+            } else {
+                Operation::ScalarGt
+            }
+        } else if mnemonic.starts_with("ge") && !mnemonic.starts_with("getp") {
+            if mnemonic.contains("u") {
+                Operation::ScalarGeu
+            } else {
+                Operation::ScalarGe
+            }
+        } else if mnemonic == "eq" || mnemonic.starts_with("eq.") {
+            Operation::ScalarEq
+        } else if mnemonic == "ne" || mnemonic.starts_with("ne.") {
+            Operation::ScalarNe
+        } else if mnemonic.starts_with("sel") {
+            // sel, sel.eqz, sel.nez, etc.
+            Operation::ScalarSel
         } else {
             Operation::Unknown {
                 opcode: decoded.operands.get("word0").copied().unwrap_or(0) as u32,
@@ -386,6 +423,20 @@ impl InstructionDecoder {
                 condition: BranchCondition::NotEqual, // Placeholder
             },
             SemanticOp::Nop | SemanticOp::Copy => Operation::Nop,
+
+            // Comparison operations (produce 0/1 result)
+            SemanticOp::SetLt => Operation::ScalarLt,
+            SemanticOp::SetLe => Operation::ScalarLe,
+            SemanticOp::SetGt => Operation::ScalarGt,
+            SemanticOp::SetGe => Operation::ScalarGe,
+            SemanticOp::SetUlt => Operation::ScalarLtu,
+            SemanticOp::SetUle => Operation::ScalarLeu,
+            SemanticOp::SetUgt => Operation::ScalarGtu,
+            SemanticOp::SetUge => Operation::ScalarGeu,
+            SemanticOp::SetEq => Operation::ScalarEq,
+            SemanticOp::SetNe => Operation::ScalarNe,
+            SemanticOp::Select => Operation::ScalarSel,
+
             _ => Operation::Unknown { opcode: 0 },
         }
     }

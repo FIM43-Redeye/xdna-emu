@@ -530,7 +530,24 @@ Recognition rate: 100% (all instructions decoded)
 - Kernel executes 100+ cycles without unknown instruction errors
 ```
 
-**Key improvements (recent session):**
+**Test Suite Results (24 mlir-aie xclbin tests):**
+```
+Total: 24, Passed: 4, Failed: 0, Unknown Opcodes: 0, Timeout: 20
+- 4 tests PASS (reconfiguration tests with no ELF execution)
+- 20 tests TIMEOUT (waiting on DMA/locks - expected without input data)
+- 0 unknown opcodes (all instructions now decode correctly)
+```
+
+**Key improvements (most recent session - 2024-12-31):**
+- **Shift mnemonic matching**: AIE2 uses `lshl`/`lshr` for logical shifts, but decoder
+  only matched `shl`/`lsl`. Added `starts_with("lshl")` and `starts_with("lshr")`.
+- **Return instruction matching**: Decoder checked `mnemonic == "ret"` but TableGen
+  mnemonic is `"ret lr"`. Changed to `starts_with("ret")` for flexible matching.
+- **I64_NOP_LNG extraction fix**: For 64-bit I64_NOP_LNG format, the `lng` field was
+  extracted from bit 11, but the format has a discriminator at bit 11, so `lng` starts
+  at bit 12. Fixed extraction to shift by 12 instead of 11.
+
+**Key improvements (previous sessions):**
 - **48-bit format marker fix**: The 48-bit format uses a 3-bit marker (`0b101`), not 4-bit.
   Fixed `from_marker()` to check `(marker & 0x7) == 0x5` first, allowing bytes like
   `0x1D` (where `0x1D & 0x7 = 0x5`) to be correctly identified as 48-bit bundles.

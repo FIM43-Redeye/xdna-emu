@@ -209,10 +209,15 @@ pub fn extract_48bit(bytes: &[u8]) -> ExtractedBundle {
         return bundle;
     }
 
-    // I48_ST_ALU: bits 7:3 = 0b0111
-    if bits_7_3 == 0b00111 {
-        let alu_bits = (word >> 8) & ((1u64 << ALU_WIDTH) - 1);
-        let st_bits = (word >> 28) & ((1u64 << ST_WIDTH) - 1);
+    // I48_ST_ALU: bits 6:3 = 0b0111 (4-bit discriminator)
+    // Format: {st[20:0], alu[19:0], 0b0111, 0b101}
+    // - bits 2:0 = marker (101)
+    // - bits 6:3 = discriminator (0111)
+    // - bits 26:7 = alu[19:0]
+    // - bits 47:27 = st[20:0]
+    if bits_6_3 == 0b0111 {
+        let alu_bits = (word >> 7) & ((1u64 << ALU_WIDTH) - 1);
+        let st_bits = (word >> 27) & ((1u64 << ST_WIDTH) - 1);
         bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
         bundle.add_slot(SlotType::St, st_bits, ST_WIDTH);
         return bundle;
@@ -302,21 +307,23 @@ pub fn extract_64bit(bytes: &[u8]) -> ExtractedBundle {
     let bits_6_4 = ((word >> 4) & 0x7) as u8;
 
     // I64_ALU_MV: bits 6:4 = 100 (0b100)
-    // I64_NOP_LNG: bits 6:4 = 100, but with lng slot
+    // I64_ALU_MV / I64_NOP_LNG: bits 6:4 = 100
+    // Bit 11 is the discriminator: 1 = ALU_MV, 0 = NOP_LNG
+    // The alumv/lng field is at bits 53:12 (42 bits)
     if bits_6_4 == 0b100 {
-        // Check if it's ALU+MV or NOP+LNG by checking the alumv/lng discriminator
-        // alu_mv = {alumv, 0b1} for ALU_MV, alu_mv = {lng, 0b0} for NOP_LNG
-        let alu_mv_lsb = (word >> 10) & 1; // bit 10 determines alumv vs lng
+        let discriminator = (word >> 11) & 1;
 
-        if alu_mv_lsb == 1 {
+        if discriminator == 1 {
             // I64_ALU_MV: {0b0000000000, alumv[41:0], 0b1, 0b0000100, 0b0011}
-            let mv_bits = (word >> 11) & ((1u64 << MV_WIDTH) - 1);
-            let alu_bits = (word >> 33) & ((1u64 << ALU_WIDTH) - 1);
+            // alumv = {alu[19:0], mv[21:0]} at bits 53:12
+            let mv_bits = (word >> 12) & ((1u64 << MV_WIDTH) - 1);
+            let alu_bits = (word >> 34) & ((1u64 << ALU_WIDTH) - 1);
             bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
             bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
         } else {
             // I64_NOP_LNG: {nop, 0b000000000, lng[41:0], 0b0, 0b0000100, 0b0011}
-            let lng_bits = (word >> 11) & ((1u64 << LNG_WIDTH) - 1);
+            // lng field is at bits 53:12 (42 bits)
+            let lng_bits = (word >> 12) & ((1u64 << LNG_WIDTH) - 1);
             bundle.add_slot(SlotType::Lng, lng_bits, LNG_WIDTH);
         }
         return bundle;

@@ -10,6 +10,7 @@
 //! - [`tablegen`]: TableGen parser for instruction definitions
 //! - [`visual`]: GUI visualization (egui-based)
 //! - [`integration`]: External tool integration
+//! - [`testing`]: Test harness for XCLBIN binary compatibility
 
 pub mod parser;
 pub mod device;
@@ -17,3 +18,4 @@ pub mod interpreter;
 pub mod tablegen;
 pub mod visual;
 pub mod integration;
+pub mod testing;
