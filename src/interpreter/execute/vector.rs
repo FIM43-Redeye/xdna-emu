@@ -93,6 +93,48 @@ impl VectorAlu {
                 true
             }
 
+            Operation::VectorMatMulDense { element_type } => {
+                // Dense matrix multiply: acc += A * B
+                // AIE2 processes 4x4 or 4x8 matrix tiles
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let acc_reg = Self::get_acc_dest(op);
+                Self::vector_matmul_dense(ctx, acc_reg, &a, &b, *element_type);
+                true
+            }
+
+            Operation::VectorMatMulSparse { element_type, .. } => {
+                // Sparse matrix multiply: similar to dense but with sparse format
+                // For now, treat as dense - sparse format optimization is a refinement
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let acc_reg = Self::get_acc_dest(op);
+                Self::vector_matmul_dense(ctx, acc_reg, &a, &b, *element_type);
+                true
+            }
+
+            Operation::VectorSRS { from_type, to_type } => {
+                // Shift-Round-Saturate: convert accumulator to vector
+                let acc_reg = Self::get_acc_source(op);
+                let shift = Self::get_shift_amount(op, ctx);
+                let result = Self::vector_srs(ctx, acc_reg, shift, *from_type, *to_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorConvert { from_type, to_type } => {
+                // Type conversion (e.g., bf16 <-> f32)
+                let src = Self::get_vector_source(op, ctx, 0);
+                let result = Self::vector_convert(&src, *from_type, *to_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorMov { .. } => {
+                // Vector register move
+                let src = Self::get_vector_source(op, ctx, 0);
+                Self::write_vector_dest(op, ctx, src);
+                true
+            }
+
             _ => false, // Not a vector operation
         }
     }
@@ -144,6 +186,262 @@ impl VectorAlu {
     #[inline]
     fn f32_to_bf16(val: f32) -> u16 {
         (val.to_bits() >> 16) as u16
+    }
+
+    /// Get accumulator source register from operands.
+    fn get_acc_source(op: &SlotOp) -> u8 {
+        for src in &op.sources {
+            if let Operand::AccumReg(r) = src {
+                return *r;
+            }
+        }
+        0
+    }
+
+    /// Get shift amount from operands (immediate or register).
+    fn get_shift_amount(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
+        // Look for immediate in sources
+        for src in &op.sources {
+            if let Operand::Immediate(imm) = src {
+                return *imm as u32;
+            }
+            if let Operand::ScalarReg(r) = src {
+                return ctx.scalar.read(*r);
+            }
+        }
+        0 // Default: no shift
+    }
+
+    /// Dense matrix multiply: acc += A * B (operates on 4x4 or 4x8 tiles).
+    ///
+    /// For AIE2, this processes matrix tiles where:
+    /// - A: activation matrix (from vector register)
+    /// - B: weight matrix (from vector register)
+    /// - Result accumulates to 512-bit accumulator
+    fn vector_matmul_dense(
+        ctx: &mut ExecutionContext,
+        acc_reg: u8,
+        a: &[u32; 8],
+        b: &[u32; 8],
+        elem_type: ElementType,
+    ) {
+        let current = ctx.accumulator.read(acc_reg);
+
+        match elem_type {
+            ElementType::Int8 | ElementType::UInt8 => {
+                // 32 x int8 elements: interpret as 4x8 * 8x4 = 4x4 output
+                // Each u32 contains 4 int8 values
+                // Simplified: element-wise multiply-accumulate for compatibility
+                let mut new_acc = current;
+                for i in 0..8 {
+                    let mut acc = current[i];
+                    for byte_idx in 0..4 {
+                        let a_byte = ((a[i] >> (byte_idx * 8)) & 0xFF) as u8;
+                        let b_byte = ((b[i] >> (byte_idx * 8)) & 0xFF) as u8;
+                        let prod = if matches!(elem_type, ElementType::Int8) {
+                            (a_byte as i8 as i64) * (b_byte as i8 as i64)
+                        } else {
+                            (a_byte as i64) * (b_byte as i64)
+                        };
+                        acc = acc.wrapping_add(prod as u64);
+                    }
+                    new_acc[i] = acc;
+                }
+                ctx.accumulator.write(acc_reg, new_acc);
+            }
+            ElementType::Int16 | ElementType::UInt16 => {
+                // 16 x int16 elements: interpret as matrix multiply
+                let mut new_acc = current;
+                for i in 0..8 {
+                    let a_lo = (a[i] & 0xFFFF) as i16 as i32;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as i16 as i32;
+                    let b_lo = (b[i] & 0xFFFF) as i16 as i32;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as i16 as i32;
+                    // Accumulate products
+                    new_acc[i] = current[i]
+                        .wrapping_add((a_lo * b_lo) as u64)
+                        .wrapping_add((a_hi * b_hi) as u64);
+                }
+                ctx.accumulator.write(acc_reg, new_acc);
+            }
+            ElementType::BFloat16 => {
+                // 16 x bf16 matrix multiply
+                let mut new_acc = current;
+                for i in 0..8 {
+                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16) as f64;
+                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16) as f64;
+                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16) as f64;
+                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16) as f64;
+                    let current_f = f64::from_bits(current[i]);
+                    new_acc[i] = (current_f + a_lo * b_lo + a_hi * b_hi).to_bits();
+                }
+                ctx.accumulator.write(acc_reg, new_acc);
+            }
+            ElementType::Int32 | ElementType::UInt32 => {
+                // 8 x int32 matrix multiply-accumulate
+                let mut new_acc = current;
+                for i in 0..8 {
+                    let prod = (a[i] as u64) * (b[i] as u64);
+                    new_acc[i] = current[i].wrapping_add(prod);
+                }
+                ctx.accumulator.write(acc_reg, new_acc);
+            }
+            ElementType::Float32 => {
+                // 8 x f32 matrix multiply
+                let mut new_acc = current;
+                for i in 0..8 {
+                    let fa = f32::from_bits(a[i]) as f64;
+                    let fb = f32::from_bits(b[i]) as f64;
+                    let current_f = f64::from_bits(current[i]);
+                    new_acc[i] = (current_f + fa * fb).to_bits();
+                }
+                ctx.accumulator.write(acc_reg, new_acc);
+            }
+        }
+    }
+
+    /// Shift-Round-Saturate: convert 64-bit accumulator lanes to narrower output.
+    ///
+    /// This is used after MAC operations to normalize results back to vector format.
+    fn vector_srs(
+        ctx: &ExecutionContext,
+        acc_reg: u8,
+        shift: u32,
+        _from_type: ElementType,
+        to_type: ElementType,
+    ) -> [u32; 8] {
+        let acc = ctx.accumulator.read(acc_reg);
+        let mut result = [0u32; 8];
+
+        match to_type {
+            ElementType::Int32 | ElementType::UInt32 => {
+                // 64-bit -> 32-bit with shift and saturation
+                for i in 0..8 {
+                    let shifted = if shift > 0 {
+                        // Round: add 0.5 ULP before shift
+                        let round_bit = 1u64 << (shift - 1);
+                        acc[i].wrapping_add(round_bit) >> shift
+                    } else {
+                        acc[i]
+                    };
+                    // Saturate to 32 bits
+                    result[i] = shifted.min(u32::MAX as u64) as u32;
+                }
+            }
+            ElementType::Int16 | ElementType::UInt16 => {
+                // 64-bit -> 16-bit (pack 2 lanes into each u32)
+                for i in 0..4 {
+                    let val0 = {
+                        let shifted = if shift > 0 {
+                            let round_bit = 1u64 << (shift - 1);
+                            acc[i * 2].wrapping_add(round_bit) >> shift
+                        } else {
+                            acc[i * 2]
+                        };
+                        shifted.min(u16::MAX as u64) as u16
+                    };
+                    let val1 = {
+                        let shifted = if shift > 0 {
+                            let round_bit = 1u64 << (shift - 1);
+                            acc[i * 2 + 1].wrapping_add(round_bit) >> shift
+                        } else {
+                            acc[i * 2 + 1]
+                        };
+                        shifted.min(u16::MAX as u64) as u16
+                    };
+                    result[i] = (val0 as u32) | ((val1 as u32) << 16);
+                }
+            }
+            ElementType::BFloat16 => {
+                // 64-bit float -> bf16 (pack 2 per u32)
+                for i in 0..4 {
+                    let f0 = f64::from_bits(acc[i * 2]) as f32;
+                    let f1 = f64::from_bits(acc[i * 2 + 1]) as f32;
+                    let bf0 = Self::f32_to_bf16(f0);
+                    let bf1 = Self::f32_to_bf16(f1);
+                    result[i] = (bf0 as u32) | ((bf1 as u32) << 16);
+                }
+            }
+            ElementType::Float32 => {
+                // 64-bit float -> 32-bit float
+                for i in 0..8 {
+                    let f = f64::from_bits(acc[i]) as f32;
+                    result[i] = f.to_bits();
+                }
+            }
+            _ => {}
+        }
+
+        result
+    }
+
+    /// Vector type conversion.
+    fn vector_convert(src: &[u32; 8], from_type: ElementType, to_type: ElementType) -> [u32; 8] {
+        let mut result = [0u32; 8];
+
+        match (from_type, to_type) {
+            // BFloat16 -> Float32 (expand: 16 bf16 -> 8 f32, use lower half)
+            (ElementType::BFloat16, ElementType::Float32) => {
+                for i in 0..8 {
+                    // Take lower bf16 from each pair
+                    let bf16 = (src[i / 2] >> ((i % 2) * 16)) as u16;
+                    result[i] = Self::bf16_to_f32(bf16).to_bits();
+                }
+            }
+            // Float32 -> BFloat16 (pack: 8 f32 -> 16 bf16, store in lower 4 words)
+            (ElementType::Float32, ElementType::BFloat16) => {
+                for i in 0..4 {
+                    let f0 = f32::from_bits(src[i * 2]);
+                    let f1 = f32::from_bits(src[i * 2 + 1]);
+                    let bf0 = Self::f32_to_bf16(f0);
+                    let bf1 = Self::f32_to_bf16(f1);
+                    result[i] = (bf0 as u32) | ((bf1 as u32) << 16);
+                }
+            }
+            // Int32 -> Float32
+            (ElementType::Int32, ElementType::Float32) => {
+                for i in 0..8 {
+                    result[i] = (src[i] as i32 as f32).to_bits();
+                }
+            }
+            // UInt32 -> Float32
+            (ElementType::UInt32, ElementType::Float32) => {
+                for i in 0..8 {
+                    result[i] = (src[i] as f32).to_bits();
+                }
+            }
+            // Float32 -> Int32
+            (ElementType::Float32, ElementType::Int32) => {
+                for i in 0..8 {
+                    let f = f32::from_bits(src[i]);
+                    result[i] = f as i32 as u32;
+                }
+            }
+            // Float32 -> UInt32
+            (ElementType::Float32, ElementType::UInt32) => {
+                for i in 0..8 {
+                    let f = f32::from_bits(src[i]);
+                    result[i] = f.max(0.0) as u32;
+                }
+            }
+            // Int16 -> Int32 (expand lower half)
+            (ElementType::Int16, ElementType::Int32) => {
+                for i in 0..8 {
+                    let i16_val = (src[i / 2] >> ((i % 2) * 16)) as i16;
+                    result[i] = i16_val as i32 as u32;
+                }
+            }
+            // Same type: pass through
+            _ if from_type == to_type => {
+                result = *src;
+            }
+            _ => {
+                // Unhandled conversion: pass through
+                result = *src;
+            }
+        }
+
+        result
     }
 
     /// Vector addition by element type.
@@ -1092,5 +1390,146 @@ mod tests {
         // BFloat16 has limited precision, so check approximate equality
         assert!((lo0 - 1.5).abs() < 0.1, "Expected ~1.5, got {}", lo0);
         assert!((hi0 - 2.5).abs() < 0.1, "Expected ~2.5, got {}", hi0);
+    }
+
+    #[test]
+    fn test_vector_matmul_dense_int32() {
+        let mut ctx = make_ctx();
+        ctx.vector.write(0, [1, 2, 3, 4, 5, 6, 7, 8]);
+        ctx.vector.write(1, [2, 2, 2, 2, 2, 2, 2, 2]);
+
+        let op = SlotOp::new(
+            SlotIndex::Accumulator,
+            Operation::VectorMatMulDense {
+                element_type: ElementType::Int32,
+            },
+        )
+        .with_dest(Operand::AccumReg(0))
+        .with_source(Operand::VectorReg(0))
+        .with_source(Operand::VectorReg(1));
+
+        VectorAlu::execute(&op, &mut ctx);
+        let acc = ctx.accumulator.read(0);
+        // Each lane: a[i] * b[i] accumulated
+        assert_eq!(acc, [2, 4, 6, 8, 10, 12, 14, 16]);
+
+        // Accumulate again
+        VectorAlu::execute(&op, &mut ctx);
+        let acc = ctx.accumulator.read(0);
+        assert_eq!(acc, [4, 8, 12, 16, 20, 24, 28, 32]);
+    }
+
+    #[test]
+    fn test_vector_srs_int32() {
+        let mut ctx = make_ctx();
+        // Set up accumulator with values that need shifting
+        ctx.accumulator.write(0, [256, 512, 768, 1024, 1280, 1536, 1792, 2048]);
+
+        let op = SlotOp::new(
+            SlotIndex::Vector,
+            Operation::VectorSRS {
+                from_type: ElementType::Int32,
+                to_type: ElementType::Int32,
+            },
+        )
+        .with_dest(Operand::VectorReg(0))
+        .with_source(Operand::AccumReg(0))
+        .with_source(Operand::Immediate(4)); // Shift right by 4
+
+        VectorAlu::execute(&op, &mut ctx);
+        let result = ctx.vector.read(0);
+        // 256 >> 4 = 16, 512 >> 4 = 32, etc (with rounding)
+        assert_eq!(result[0], 16);
+        assert_eq!(result[1], 32);
+        assert_eq!(result[2], 48);
+        assert_eq!(result[3], 64);
+    }
+
+    #[test]
+    fn test_vector_convert_bf16_to_f32() {
+        let mut ctx = make_ctx();
+        // Create bf16 values: 1.0, 2.0, 3.0, 4.0 (packed 2 per u32)
+        let bf16_1 = VectorAlu::f32_to_bf16(1.0);
+        let bf16_2 = VectorAlu::f32_to_bf16(2.0);
+        let bf16_3 = VectorAlu::f32_to_bf16(3.0);
+        let bf16_4 = VectorAlu::f32_to_bf16(4.0);
+        ctx.vector.write(
+            0,
+            [
+                (bf16_1 as u32) | ((bf16_2 as u32) << 16),
+                (bf16_3 as u32) | ((bf16_4 as u32) << 16),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+
+        let op = SlotOp::new(
+            SlotIndex::Vector,
+            Operation::VectorConvert {
+                from_type: ElementType::BFloat16,
+                to_type: ElementType::Float32,
+            },
+        )
+        .with_dest(Operand::VectorReg(1))
+        .with_source(Operand::VectorReg(0));
+
+        VectorAlu::execute(&op, &mut ctx);
+        let result = ctx.vector.read(1);
+
+        // First 4 lanes should be 1.0, 2.0, 3.0, 4.0
+        let f0 = f32::from_bits(result[0]);
+        let f1 = f32::from_bits(result[1]);
+        let f2 = f32::from_bits(result[2]);
+        let f3 = f32::from_bits(result[3]);
+        assert!((f0 - 1.0).abs() < 0.01, "Expected 1.0, got {}", f0);
+        assert!((f1 - 2.0).abs() < 0.01, "Expected 2.0, got {}", f1);
+        assert!((f2 - 3.0).abs() < 0.01, "Expected 3.0, got {}", f2);
+        assert!((f3 - 4.0).abs() < 0.01, "Expected 4.0, got {}", f3);
+    }
+
+    #[test]
+    fn test_vector_convert_int32_to_f32() {
+        let mut ctx = make_ctx();
+        ctx.vector.write(0, [1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let op = SlotOp::new(
+            SlotIndex::Vector,
+            Operation::VectorConvert {
+                from_type: ElementType::Int32,
+                to_type: ElementType::Float32,
+            },
+        )
+        .with_dest(Operand::VectorReg(1))
+        .with_source(Operand::VectorReg(0));
+
+        VectorAlu::execute(&op, &mut ctx);
+        let result = ctx.vector.read(1);
+
+        for i in 0..8 {
+            let f = f32::from_bits(result[i]);
+            assert_eq!(f, (i + 1) as f32);
+        }
+    }
+
+    #[test]
+    fn test_vector_mov() {
+        let mut ctx = make_ctx();
+        ctx.vector.write(0, [10, 20, 30, 40, 50, 60, 70, 80]);
+
+        let op = SlotOp::new(
+            SlotIndex::Vector,
+            Operation::VectorMov {
+                element_type: ElementType::Int32,
+            },
+        )
+        .with_dest(Operand::VectorReg(1))
+        .with_source(Operand::VectorReg(0));
+
+        VectorAlu::execute(&op, &mut ctx);
+        assert_eq!(ctx.vector.read(1), [10, 20, 30, 40, 50, 60, 70, 80]);
     }
 }

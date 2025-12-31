@@ -13,7 +13,7 @@
 //! - **Program Memory**: 64KB at 0x20000-0x2FFFF (read-only)
 
 use crate::device::tile::Tile;
-use crate::interpreter::bundle::{MemWidth, Operation, Operand, PostModify, SlotOp};
+use crate::interpreter::bundle::{ElementType, MemWidth, Operation, Operand, PostModify, SlotOp};
 use crate::interpreter::state::ExecutionContext;
 
 /// Memory unit for load/store operations.
@@ -47,6 +47,30 @@ impl MemoryUnit {
 
             Operation::PointerMov => {
                 Self::execute_pointer_mov(op, ctx);
+                true
+            }
+
+            Operation::VectorLoadA { post_modify } => {
+                Self::execute_vector_load_a(op, ctx, tile, post_modify);
+                true
+            }
+
+            Operation::VectorLoadB { post_modify } => {
+                Self::execute_vector_load_b(op, ctx, tile, post_modify);
+                true
+            }
+
+            Operation::VectorLoadUnpack {
+                from_type,
+                to_type,
+                post_modify,
+            } => {
+                Self::execute_vector_load_unpack(op, ctx, tile, *from_type, *to_type, post_modify);
+                true
+            }
+
+            Operation::VectorStore { post_modify } => {
+                Self::execute_vector_store(op, ctx, tile, post_modify);
                 true
             }
 
@@ -185,6 +209,241 @@ impl MemoryUnit {
 
         // Apply post-modify to address register
         Self::apply_post_modify(op, ctx, post_modify);
+    }
+
+    /// Execute vector load A (VLDA).
+    ///
+    /// Loads 256 bits (32 bytes) from memory into a vector register using the
+    /// A-channel pointer (typically p0-p3). This is a dedicated wide load
+    /// operation for vector data.
+    fn execute_vector_load_a(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        tile: &Tile,
+        post_modify: &PostModify,
+    ) {
+        let addr = Self::get_address(op, ctx);
+
+        #[cfg(test)]
+        eprintln!(
+            "[VLDA] addr=0x{:04X} sources={:?} dest={:?}",
+            addr, op.sources, op.dest
+        );
+
+        // Read 256 bits (32 bytes) from memory
+        let vec_data = Self::read_vector_from_memory(tile, addr);
+
+        // Write to destination vector register
+        if let Some(Operand::VectorReg(r)) = &op.dest {
+            ctx.vector.write(*r, vec_data);
+        }
+
+        // Apply post-modify (vector width = 32 bytes)
+        Self::apply_post_modify(op, ctx, post_modify);
+    }
+
+    /// Execute vector load B (VLDB).
+    ///
+    /// Loads 256 bits (32 bytes) from memory into a vector register using the
+    /// B-channel pointer (typically p4-p7). Functionally identical to VLDA but
+    /// uses a separate address path for parallel memory access.
+    fn execute_vector_load_b(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        tile: &Tile,
+        post_modify: &PostModify,
+    ) {
+        let addr = Self::get_address(op, ctx);
+
+        #[cfg(test)]
+        eprintln!(
+            "[VLDB] addr=0x{:04X} sources={:?} dest={:?}",
+            addr, op.sources, op.dest
+        );
+
+        // Read 256 bits (32 bytes) from memory
+        let vec_data = Self::read_vector_from_memory(tile, addr);
+
+        // Write to destination vector register
+        if let Some(Operand::VectorReg(r)) = &op.dest {
+            ctx.vector.write(*r, vec_data);
+        }
+
+        // Apply post-modify (vector width = 32 bytes)
+        Self::apply_post_modify(op, ctx, post_modify);
+    }
+
+    /// Execute vector load with unpack (VLDB_UNPACK).
+    ///
+    /// Loads narrow-type data from memory and unpacks (expands) to wider elements.
+    /// For example, loading 8-bit integers and expanding to 16-bit or 32-bit.
+    /// This is useful for computation on narrow data types that require wider
+    /// intermediate precision.
+    fn execute_vector_load_unpack(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        tile: &Tile,
+        from_type: ElementType,
+        to_type: ElementType,
+        post_modify: &PostModify,
+    ) {
+        let addr = Self::get_address(op, ctx);
+
+        #[cfg(test)]
+        eprintln!(
+            "[VLDB_UNPACK] addr=0x{:04X} from={:?} to={:?} sources={:?} dest={:?}",
+            addr, from_type, to_type, op.sources, op.dest
+        );
+
+        // Calculate how many bytes to load based on source element type
+        // and the fact that we produce a full 256-bit vector
+        let to_bits = to_type.bits() as u32;
+        let from_bits = from_type.bits() as u32;
+
+        // Number of destination elements in a 256-bit vector
+        let dest_lanes = 256 / to_bits;
+        // Number of source bytes needed
+        let src_bytes = (dest_lanes * from_bits / 8) as usize;
+
+        let mem = tile.data_memory();
+        let addr_usize = addr as usize;
+
+        // Read the packed source data
+        let mut result = [0u32; 8];
+
+        if addr_usize + src_bytes <= mem.len() {
+            match (from_type, to_type) {
+                // 8-bit to 16-bit: read 16 bytes, produce 16 x 16-bit values (packed into 8 x u32)
+                // Each u32 holds two 16-bit values: [hi_16 | lo_16]
+                (ElementType::Int8, ElementType::Int16) => {
+                    for i in 0..8 {
+                        // Sign-extend each byte to 16 bits, pack two into one u32
+                        let lo_byte = mem[addr_usize + i * 2] as i8 as i16 as u16;
+                        let hi_byte = mem[addr_usize + i * 2 + 1] as i8 as i16 as u16;
+                        result[i] = ((hi_byte as u32) << 16) | (lo_byte as u32);
+                    }
+                }
+                (ElementType::UInt8, ElementType::Int16) | (ElementType::UInt8, ElementType::UInt16) => {
+                    for i in 0..8 {
+                        // Zero-extend each byte to 16 bits, pack two into one u32
+                        let lo_byte = mem[addr_usize + i * 2] as u32;
+                        let hi_byte = mem[addr_usize + i * 2 + 1] as u32;
+                        result[i] = (hi_byte << 16) | lo_byte;
+                    }
+                }
+                // 8-bit to 32-bit: read 8 bytes, produce 8 x 32-bit values
+                (ElementType::Int8, ElementType::Int32) => {
+                    for i in 0..8 {
+                        result[i] = mem[addr_usize + i] as i8 as i32 as u32;
+                    }
+                }
+                (ElementType::UInt8, ElementType::UInt32) => {
+                    for i in 0..8 {
+                        result[i] = mem[addr_usize + i] as u32;
+                    }
+                }
+                // 16-bit to 32-bit: read 16 bytes, produce 8 x 32-bit values
+                (ElementType::Int16, ElementType::Int32) => {
+                    for i in 0..8 {
+                        let offset = addr_usize + i * 2;
+                        let val = i16::from_le_bytes([mem[offset], mem[offset + 1]]);
+                        result[i] = val as i32 as u32;
+                    }
+                }
+                (ElementType::UInt16, ElementType::UInt32) => {
+                    for i in 0..8 {
+                        let offset = addr_usize + i * 2;
+                        let val = u16::from_le_bytes([mem[offset], mem[offset + 1]]);
+                        result[i] = val as u32;
+                    }
+                }
+                // BFloat16 to Float32: read 16 bytes, produce 8 x 32-bit floats
+                (ElementType::BFloat16, ElementType::Float32) => {
+                    for i in 0..8 {
+                        let offset = addr_usize + i * 2;
+                        let bf16_bits = u16::from_le_bytes([mem[offset], mem[offset + 1]]);
+                        // BF16 to F32: shift left by 16 bits (add 16 zero mantissa bits)
+                        result[i] = (bf16_bits as u32) << 16;
+                    }
+                }
+                // Default: just do a straight load with no expansion
+                _ => {
+                    let vec_data = Self::read_vector_from_memory(tile, addr);
+                    result = vec_data;
+                }
+            }
+        }
+
+        // Write to destination vector register
+        if let Some(Operand::VectorReg(r)) = &op.dest {
+            ctx.vector.write(*r, result);
+        }
+
+        // Apply post-modify based on source bytes read
+        // For unpack, we advance by the number of bytes actually read, not 32
+        match post_modify {
+            PostModify::None => {}
+            PostModify::Immediate(imm) => {
+                // Use the immediate value directly if specified
+                if let Some(ptr_reg) = Self::get_pointer_reg(op) {
+                    ctx.pointer.add(ptr_reg, *imm as i32);
+                }
+            }
+            PostModify::Register(m) => {
+                // Use modifier register
+                if let Some(ptr_reg) = Self::get_pointer_reg(op) {
+                    let modifier = ctx.modifier.read_signed(*m);
+                    ctx.pointer.add(ptr_reg, modifier);
+                }
+            }
+        }
+    }
+
+    /// Execute vector store (VST).
+    ///
+    /// Stores 256 bits (32 bytes) from a vector register to memory.
+    fn execute_vector_store(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        tile: &mut Tile,
+        post_modify: &PostModify,
+    ) {
+        let addr = Self::get_address(op, ctx);
+
+        #[cfg(test)]
+        eprintln!(
+            "[VST] addr=0x{:04X} sources={:?} dest={:?}",
+            addr, op.sources, op.dest
+        );
+
+        // Get vector register from source or dest
+        // For VST, the vector data comes from a source operand (second source)
+        // or sometimes the dest field is used for the value
+        let vec_reg = op
+            .sources
+            .get(1)
+            .or(op.dest.as_ref())
+            .and_then(|operand| match operand {
+                Operand::VectorReg(r) => Some(*r),
+                _ => None,
+            });
+
+        if let Some(r) = vec_reg {
+            let vec_data = ctx.vector.read(r);
+            Self::write_vector_to_memory(tile, addr, vec_data);
+        }
+
+        // Apply post-modify (vector width = 32 bytes)
+        Self::apply_post_modify(op, ctx, post_modify);
+    }
+
+    /// Get the pointer register from a slot op's source operands.
+    fn get_pointer_reg(op: &SlotOp) -> Option<u8> {
+        op.sources.first().and_then(|src| match src {
+            Operand::Memory { base, .. } => Some(*base),
+            Operand::PointerReg(r) => Some(*r),
+            _ => None,
+        })
     }
 
     /// Get address from memory operand or pointer register.
@@ -722,5 +981,283 @@ mod tests {
 
         assert_eq!(ctx.vector.read(0), test_data);
         assert_eq!(ctx.pointer.read(0), 0x620); // 0x600 + 32
+    }
+
+    #[test]
+    fn test_vector_load_a() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        // Write test vector data
+        let test_data = [0xAABBCCDD, 0x11223344, 0x55667788, 0x99AABBCC,
+                         0xDDEEFF00, 0x12345678, 0x9ABCDEF0, 0xFEDCBA98];
+        MemoryUnit::write_vector_to_memory(&mut tile, 0x700, test_data);
+        ctx.pointer.write(0, 0x700);
+
+        // VLDA: v2 = [p0]
+        let op = SlotOp::new(
+            SlotIndex::Load,
+            Operation::VectorLoadA {
+                post_modify: PostModify::None,
+            },
+        )
+        .with_dest(Operand::VectorReg(2))
+        .with_source(Operand::PointerReg(0));
+
+        assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile));
+        assert_eq!(ctx.vector.read(2), test_data);
+        assert_eq!(ctx.pointer.read(0), 0x700); // No post-modify
+    }
+
+    #[test]
+    fn test_vector_load_a_with_post_modify() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        let test_data = [1, 2, 3, 4, 5, 6, 7, 8];
+        MemoryUnit::write_vector_to_memory(&mut tile, 0x800, test_data);
+        ctx.pointer.write(1, 0x800);
+
+        // VLDA: v0 = [p1], p1 += 32
+        let op = SlotOp::new(
+            SlotIndex::Load,
+            Operation::VectorLoadA {
+                post_modify: PostModify::Immediate(32),
+            },
+        )
+        .with_dest(Operand::VectorReg(0))
+        .with_source(Operand::PointerReg(1));
+
+        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        assert_eq!(ctx.vector.read(0), test_data);
+        assert_eq!(ctx.pointer.read(1), 0x820); // 0x800 + 32
+    }
+
+    #[test]
+    fn test_vector_load_b() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        let test_data = [0xDEADBEEF, 0xCAFEBABE, 0x12345678, 0x9ABCDEF0,
+                         0x0F0F0F0F, 0xF0F0F0F0, 0xAAAA5555, 0x5555AAAA];
+        MemoryUnit::write_vector_to_memory(&mut tile, 0x900, test_data);
+        ctx.pointer.write(4, 0x900); // B-channel typically uses p4-p7
+
+        // VLDB: v3 = [p4]
+        let op = SlotOp::new(
+            SlotIndex::Load,
+            Operation::VectorLoadB {
+                post_modify: PostModify::None,
+            },
+        )
+        .with_dest(Operand::VectorReg(3))
+        .with_source(Operand::PointerReg(4));
+
+        assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile));
+        assert_eq!(ctx.vector.read(3), test_data);
+    }
+
+    #[test]
+    fn test_vector_load_b_with_modifier_register() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        let test_data = [10, 20, 30, 40, 50, 60, 70, 80];
+        MemoryUnit::write_vector_to_memory(&mut tile, 0xA00, test_data);
+        ctx.pointer.write(5, 0xA00);
+        ctx.modifier.write(2, 64); // m2 = 64
+
+        // VLDB: v1 = [p5], p5 += m2
+        let op = SlotOp::new(
+            SlotIndex::Load,
+            Operation::VectorLoadB {
+                post_modify: PostModify::Register(2),
+            },
+        )
+        .with_dest(Operand::VectorReg(1))
+        .with_source(Operand::PointerReg(5));
+
+        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        assert_eq!(ctx.vector.read(1), test_data);
+        assert_eq!(ctx.pointer.read(5), 0xA40); // 0xA00 + 64
+    }
+
+    #[test]
+    fn test_vector_store() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        let test_data = [0x11111111, 0x22222222, 0x33333333, 0x44444444,
+                         0x55555555, 0x66666666, 0x77777777, 0x88888888];
+        ctx.vector.write(4, test_data);
+        ctx.pointer.write(2, 0xB00);
+
+        // VST: [p2] = v4
+        let op = SlotOp::new(
+            SlotIndex::Store,
+            Operation::VectorStore {
+                post_modify: PostModify::None,
+            },
+        )
+        .with_dest(Operand::VectorReg(4))
+        .with_source(Operand::PointerReg(2));
+
+        assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile));
+
+        let stored = MemoryUnit::read_vector_from_memory(&tile, 0xB00);
+        assert_eq!(stored, test_data);
+    }
+
+    #[test]
+    fn test_vector_store_with_post_modify() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        let test_data = [100, 200, 300, 400, 500, 600, 700, 800];
+        ctx.vector.write(5, test_data);
+        ctx.pointer.write(3, 0xC00);
+
+        // VST: [p3] = v5, p3 += 32
+        let op = SlotOp::new(
+            SlotIndex::Store,
+            Operation::VectorStore {
+                post_modify: PostModify::Immediate(32),
+            },
+        )
+        .with_dest(Operand::VectorReg(5))
+        .with_source(Operand::PointerReg(3));
+
+        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+
+        let stored = MemoryUnit::read_vector_from_memory(&tile, 0xC00);
+        assert_eq!(stored, test_data);
+        assert_eq!(ctx.pointer.read(3), 0xC20); // 0xC00 + 32
+    }
+
+    #[test]
+    fn test_vector_load_unpack_int8_to_int32() {
+        use crate::interpreter::bundle::ElementType;
+
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        // Write 8 bytes of int8 data
+        let mem = tile.data_memory_mut();
+        for i in 0..8 {
+            mem[0xD00 + i] = (i + 1) as u8; // 1, 2, 3, 4, 5, 6, 7, 8
+        }
+        ctx.pointer.write(0, 0xD00);
+
+        // VLDB_UNPACK: expand int8 to int32
+        let op = SlotOp::new(
+            SlotIndex::Load,
+            Operation::VectorLoadUnpack {
+                from_type: ElementType::UInt8,
+                to_type: ElementType::UInt32,
+                post_modify: PostModify::None,
+            },
+        )
+        .with_dest(Operand::VectorReg(6))
+        .with_source(Operand::PointerReg(0));
+
+        assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile));
+
+        let result = ctx.vector.read(6);
+        // Each byte should be zero-extended to 32 bits
+        assert_eq!(result[0], 1);
+        assert_eq!(result[1], 2);
+        assert_eq!(result[2], 3);
+        assert_eq!(result[3], 4);
+        assert_eq!(result[4], 5);
+        assert_eq!(result[5], 6);
+        assert_eq!(result[6], 7);
+        assert_eq!(result[7], 8);
+    }
+
+    #[test]
+    fn test_vector_load_unpack_int8_to_int32_signed() {
+        use crate::interpreter::bundle::ElementType;
+
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        // Write 8 bytes with negative values
+        let mem = tile.data_memory_mut();
+        mem[0xE00] = 0xFF; // -1
+        mem[0xE01] = 0xFE; // -2
+        mem[0xE02] = 0x7F; // 127
+        mem[0xE03] = 0x80; // -128
+        mem[0xE04] = 0x01; // 1
+        mem[0xE05] = 0x00; // 0
+        mem[0xE06] = 0xF0; // -16
+        mem[0xE07] = 0x10; // 16
+        ctx.pointer.write(1, 0xE00);
+
+        // VLDB_UNPACK: expand signed int8 to int32
+        let op = SlotOp::new(
+            SlotIndex::Load,
+            Operation::VectorLoadUnpack {
+                from_type: ElementType::Int8,
+                to_type: ElementType::Int32,
+                post_modify: PostModify::None,
+            },
+        )
+        .with_dest(Operand::VectorReg(7))
+        .with_source(Operand::PointerReg(1));
+
+        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+
+        let result = ctx.vector.read(7);
+        assert_eq!(result[0] as i32, -1);
+        assert_eq!(result[1] as i32, -2);
+        assert_eq!(result[2] as i32, 127);
+        assert_eq!(result[3] as i32, -128);
+        assert_eq!(result[4] as i32, 1);
+        assert_eq!(result[5] as i32, 0);
+        assert_eq!(result[6] as i32, -16);
+        assert_eq!(result[7] as i32, 16);
+    }
+
+    #[test]
+    fn test_vector_load_unpack_int16_to_int32() {
+        use crate::interpreter::bundle::ElementType;
+
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        // Write 16 bytes of int16 data (8 values)
+        let mem = tile.data_memory_mut();
+        let values: [i16; 8] = [100, -100, 32767, -32768, 0, 1, -1, 12345];
+        for i in 0..8 {
+            let bytes = values[i].to_le_bytes();
+            mem[0xF00 + i * 2] = bytes[0];
+            mem[0xF00 + i * 2 + 1] = bytes[1];
+        }
+        ctx.pointer.write(2, 0xF00);
+
+        // VLDB_UNPACK: expand int16 to int32
+        let op = SlotOp::new(
+            SlotIndex::Load,
+            Operation::VectorLoadUnpack {
+                from_type: ElementType::Int16,
+                to_type: ElementType::Int32,
+                post_modify: PostModify::Immediate(16), // Read 16 bytes
+            },
+        )
+        .with_dest(Operand::VectorReg(0))
+        .with_source(Operand::PointerReg(2));
+
+        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+
+        let result = ctx.vector.read(0);
+        assert_eq!(result[0] as i32, 100);
+        assert_eq!(result[1] as i32, -100);
+        assert_eq!(result[2] as i32, 32767);
+        assert_eq!(result[3] as i32, -32768);
+        assert_eq!(result[4] as i32, 0);
+        assert_eq!(result[5] as i32, 1);
+        assert_eq!(result[6] as i32, -1);
+        assert_eq!(result[7] as i32, 12345);
+        assert_eq!(ctx.pointer.read(2), 0xF10); // 0xF00 + 16
     }
 }

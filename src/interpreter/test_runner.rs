@@ -1048,4 +1048,283 @@ mod tests {
         // The test passes either way - it's diagnostic
         eprintln!("\n=== End Diagnostic Trace ===\n");
     }
+
+    /// Test bidirectional ping-pong DMA data flow between two tiles.
+    ///
+    /// This test validates simultaneous bidirectional data transfer:
+    /// 1. Tile A (0,2) sends data to Tile B (0,3) via MM2S channel 2 -> S2MM channel 0
+    /// 2. Tile B (0,3) sends different data back to Tile A (0,2) via MM2S channel 3 -> S2MM channel 1
+    /// 3. Both transfers happen concurrently (both channels active on each tile)
+    /// 4. Verify exact byte-for-byte match on both sides
+    ///
+    /// This pattern is common in real applications where tiles exchange data
+    /// bidirectionally, such as in ping-pong buffer schemes or pipeline stages
+    /// that need to send results back upstream.
+    #[test]
+    fn test_bidirectional_dma_ping_pong() {
+        let mut runner = TestRunner::new();
+
+        // Tile A at (0, 2), Tile B at (0, 3)
+        let tile_a_col = 0u8;
+        let tile_a_row = 2u8;
+        let tile_b_col = 0u8;
+        let tile_b_row = 3u8;
+
+        // Channel assignments:
+        // A -> B direction: A's MM2S channel 2 (port 2) -> B's S2MM channel 0 (port 0)
+        // B -> A direction: B's MM2S channel 3 (port 3) -> A's S2MM channel 1 (port 1)
+        let a_to_b_mm2s = 2u8;  // MM2S_0 on tile A
+        let a_to_b_s2mm = 0u8;  // S2MM_0 on tile B
+        let b_to_a_mm2s = 3u8;  // MM2S_1 on tile B
+        let b_to_a_s2mm = 1u8;  // S2MM_1 on tile A
+
+        // Create distinct test patterns for each direction
+        // A -> B: 256 bytes starting at 0xA0
+        let a_to_b_data: Vec<u8> = (0..256u32).map(|i| ((0xA0 + i) % 256) as u8).collect();
+        // B -> A: 256 bytes starting at 0xB0
+        let b_to_a_data: Vec<u8> = (0..256u32).map(|i| ((0xB0 + i) % 256) as u8).collect();
+
+        // Memory layout:
+        // Tile A: source at 0x1000 (A->B data), destination at 0x2000 (receives B->A data)
+        // Tile B: source at 0x3000 (B->A data), destination at 0x4000 (receives A->B data)
+        let a_src_offset = 0x1000usize;
+        let a_dst_offset = 0x2000usize;
+        let b_src_offset = 0x3000usize;
+        let b_dst_offset = 0x4000usize;
+
+        // Write source data to each tile
+        runner.write_tile_memory(tile_a_col, tile_a_row, a_src_offset, &a_to_b_data).unwrap();
+        runner.write_tile_memory(tile_b_col, tile_b_row, b_src_offset, &b_to_a_data).unwrap();
+
+        // Configure buffer descriptors for A -> B transfer
+        // BD 0 on tile A: MM2S reads from 0x1000
+        let a_mm2s_bd = BdConfig::simple_1d(a_src_offset as u64, 256);
+        runner.configure_dma_bd(tile_a_col, tile_a_row, 0, a_mm2s_bd).unwrap();
+
+        // BD 0 on tile B: S2MM writes to 0x4000
+        let b_s2mm_bd = BdConfig::simple_1d(b_dst_offset as u64, 256);
+        runner.configure_dma_bd(tile_b_col, tile_b_row, 0, b_s2mm_bd).unwrap();
+
+        // Configure buffer descriptors for B -> A transfer
+        // BD 1 on tile B: MM2S reads from 0x3000
+        let b_mm2s_bd = BdConfig::simple_1d(b_src_offset as u64, 256);
+        runner.configure_dma_bd(tile_b_col, tile_b_row, 1, b_mm2s_bd).unwrap();
+
+        // BD 1 on tile A: S2MM writes to 0x2000
+        let a_s2mm_bd = BdConfig::simple_1d(a_dst_offset as u64, 256);
+        runner.configure_dma_bd(tile_a_col, tile_a_row, 1, a_s2mm_bd).unwrap();
+
+        // Configure stream routing for both directions
+        // A -> B: tile A port 2 -> tile B port 0
+        runner.engine.device_mut().array.stream_router.add_route(
+            tile_a_col, tile_a_row, a_to_b_mm2s,
+            tile_b_col, tile_b_row, a_to_b_s2mm,
+        );
+
+        // B -> A: tile B port 3 -> tile A port 1
+        runner.engine.device_mut().array.stream_router.add_route(
+            tile_b_col, tile_b_row, b_to_a_mm2s,
+            tile_a_col, tile_a_row, b_to_a_s2mm,
+        );
+
+        // Start all DMA channels simultaneously
+        // A -> B direction: MM2S on A, S2MM on B
+        runner.engine.device_mut().array.dma_engine_mut(tile_a_col, tile_a_row)
+            .unwrap()
+            .start_channel(a_to_b_mm2s, 0)  // BD 0
+            .unwrap();
+
+        runner.engine.device_mut().array.dma_engine_mut(tile_b_col, tile_b_row)
+            .unwrap()
+            .start_channel(a_to_b_s2mm, 0)  // BD 0
+            .unwrap();
+
+        // B -> A direction: MM2S on B, S2MM on A
+        runner.engine.device_mut().array.dma_engine_mut(tile_b_col, tile_b_row)
+            .unwrap()
+            .start_channel(b_to_a_mm2s, 1)  // BD 1
+            .unwrap();
+
+        runner.engine.device_mut().array.dma_engine_mut(tile_a_col, tile_a_row)
+            .unwrap()
+            .start_channel(b_to_a_s2mm, 1)  // BD 1
+            .unwrap();
+
+        // Step until both transfers complete
+        // Allow enough cycles for 256 bytes in each direction
+        for _ in 0..1000 {
+            runner.step();
+        }
+
+        // Verify A -> B transfer: data should have arrived at tile B's destination
+        let received_at_b = runner.read_tile_memory(tile_b_col, tile_b_row, b_dst_offset, 256).unwrap();
+        assert_eq!(
+            received_at_b, a_to_b_data,
+            "A -> B transfer data mismatch: expected data from tile A at tile B's destination"
+        );
+
+        // Verify B -> A transfer: data should have arrived at tile A's destination
+        let received_at_a = runner.read_tile_memory(tile_a_col, tile_a_row, a_dst_offset, 256).unwrap();
+        assert_eq!(
+            received_at_a, b_to_a_data,
+            "B -> A transfer data mismatch: expected data from tile B at tile A's destination"
+        );
+
+        eprintln!("Bidirectional DMA ping-pong: 256 bytes transferred correctly in both directions");
+        eprintln!("  A -> B: {} bytes (pattern starting 0xA0)", a_to_b_data.len());
+        eprintln!("  B -> A: {} bytes (pattern starting 0xB0)", b_to_a_data.len());
+    }
+
+    /// Test three-tile pipeline DMA data flow: (0,2) -> (0,3) -> (0,4).
+    ///
+    /// This test validates a linear pipeline where data flows through three tiles:
+    /// 1. Tile A (0,2): Source tile - MM2S pushes data downstream via port 0 (North)
+    /// 2. Tile B (0,3): Middle tile - S2MM receives via port 1 (South), MM2S forwards via port 0 (North)
+    /// 3. Tile C (0,4): Sink tile - S2MM receives via port 1 (South), stores final result
+    ///
+    /// This pattern is common in real AIE applications for multi-stage processing
+    /// pipelines where data flows through a chain of compute tiles.
+    #[test]
+    fn test_three_tile_dma_pipeline() {
+        let mut runner = TestRunner::new();
+
+        // Tile coordinates: A (source) -> B (middle) -> C (sink)
+        let tile_a_col = 0u8;
+        let tile_a_row = 2u8;
+        let tile_b_col = 0u8;
+        let tile_b_row = 3u8;
+        let tile_c_col = 0u8;
+        let tile_c_row = 4u8;
+
+        // DMA channel assignments:
+        // MM2S channel 2 for output (MM2S_0)
+        // S2MM channel 0 for input (S2MM_0)
+        let mm2s_channel = 2u8;
+        let s2mm_channel = 0u8;
+
+        // Create test pattern: 128 bytes with recognizable pattern
+        let transfer_size = 128u32;
+        let test_data: Vec<u8> = (0..transfer_size).map(|i| ((0xC0 + i) % 256) as u8).collect();
+
+        // Memory layout:
+        // Tile A: source at 0x1000
+        // Tile B: receive at 0x2000, forward from 0x2000 (same buffer - pass-through)
+        // Tile C: destination at 0x3000
+        let a_src_offset = 0x1000usize;
+        let b_buffer_offset = 0x2000usize;
+        let c_dst_offset = 0x3000usize;
+
+        // Write source data to tile A
+        runner.write_tile_memory(tile_a_col, tile_a_row, a_src_offset, &test_data).unwrap();
+
+        // ============================================
+        // Configure DMA buffer descriptors
+        // ============================================
+
+        // Tile A: MM2S BD 0 - read from 0x1000, send downstream
+        let a_mm2s_bd = BdConfig::simple_1d(a_src_offset as u64, transfer_size);
+        runner.configure_dma_bd(tile_a_col, tile_a_row, 0, a_mm2s_bd).unwrap();
+
+        // Tile B: S2MM BD 0 - receive into 0x2000
+        let b_s2mm_bd = BdConfig::simple_1d(b_buffer_offset as u64, transfer_size);
+        runner.configure_dma_bd(tile_b_col, tile_b_row, 0, b_s2mm_bd).unwrap();
+
+        // Tile B: MM2S BD 1 - forward from 0x2000 downstream
+        let b_mm2s_bd = BdConfig::simple_1d(b_buffer_offset as u64, transfer_size);
+        runner.configure_dma_bd(tile_b_col, tile_b_row, 1, b_mm2s_bd).unwrap();
+
+        // Tile C: S2MM BD 0 - receive into 0x3000
+        let c_s2mm_bd = BdConfig::simple_1d(c_dst_offset as u64, transfer_size);
+        runner.configure_dma_bd(tile_c_col, tile_c_row, 0, c_s2mm_bd).unwrap();
+
+        // ============================================
+        // Configure stream routing
+        // ============================================
+
+        // Route A -> B: tile A MM2S (channel 2) -> tile B S2MM (channel 0)
+        // Using add_route with channel numbers as port identifiers
+        runner.engine.device_mut().array.stream_router.add_route(
+            tile_a_col, tile_a_row, mm2s_channel,  // source: A's MM2S_0
+            tile_b_col, tile_b_row, s2mm_channel,  // dest: B's S2MM_0
+        );
+
+        // Route B -> C: tile B MM2S (channel 2) -> tile C S2MM (channel 0)
+        runner.engine.device_mut().array.stream_router.add_route(
+            tile_b_col, tile_b_row, mm2s_channel,  // source: B's MM2S_0
+            tile_c_col, tile_c_row, s2mm_channel,  // dest: C's S2MM_0
+        );
+
+        // ============================================
+        // Start DMA channels
+        // ============================================
+
+        // Phase 1: Start A -> B transfer
+        // Start tile A's MM2S channel with BD 0
+        runner.engine.device_mut().array.dma_engine_mut(tile_a_col, tile_a_row)
+            .unwrap()
+            .start_channel(mm2s_channel, 0)
+            .unwrap();
+
+        // Start tile B's S2MM channel with BD 0
+        runner.engine.device_mut().array.dma_engine_mut(tile_b_col, tile_b_row)
+            .unwrap()
+            .start_channel(s2mm_channel, 0)
+            .unwrap();
+
+        // Start tile C's S2MM channel with BD 0 (ready to receive from B)
+        runner.engine.device_mut().array.dma_engine_mut(tile_c_col, tile_c_row)
+            .unwrap()
+            .start_channel(s2mm_channel, 0)
+            .unwrap();
+
+        // Step to complete A -> B transfer
+        // Allow enough cycles for the first hop
+        for _ in 0..300 {
+            runner.step();
+        }
+
+        // Verify intermediate result: data should be at tile B's buffer
+        let received_at_b = runner.read_tile_memory(tile_b_col, tile_b_row, b_buffer_offset, transfer_size as usize).unwrap();
+        assert_eq!(
+            received_at_b, test_data,
+            "A -> B transfer data mismatch: expected data from tile A at tile B's buffer"
+        );
+        eprintln!("Phase 1 complete: A -> B transfer verified ({} bytes)", transfer_size);
+
+        // Phase 2: Start B -> C transfer (B now has data to forward)
+        // Start tile B's MM2S channel with BD 1 (reads from same buffer that received data)
+        runner.engine.device_mut().array.dma_engine_mut(tile_b_col, tile_b_row)
+            .unwrap()
+            .start_channel(mm2s_channel, 1)
+            .unwrap();
+
+        // Step to complete B -> C transfer
+        for _ in 0..300 {
+            runner.step();
+        }
+
+        // ============================================
+        // Verify final result
+        // ============================================
+
+        // Data should have arrived at tile C's destination
+        let received_at_c = runner.read_tile_memory(tile_c_col, tile_c_row, c_dst_offset, transfer_size as usize).unwrap();
+        assert_eq!(
+            received_at_c, test_data,
+            "B -> C transfer data mismatch: expected data from tile B at tile C's destination"
+        );
+
+        // Also verify tile B still has the data (it was a pass-through, not consumed)
+        let still_at_b = runner.read_tile_memory(tile_b_col, tile_b_row, b_buffer_offset, transfer_size as usize).unwrap();
+        assert_eq!(
+            still_at_b, test_data,
+            "Tile B buffer should still contain the data after forwarding"
+        );
+
+        eprintln!("Three-tile DMA pipeline test passed:");
+        eprintln!("  Source:      tile ({},{}) @ 0x{:04X}", tile_a_col, tile_a_row, a_src_offset);
+        eprintln!("  Middle:      tile ({},{}) @ 0x{:04X}", tile_b_col, tile_b_row, b_buffer_offset);
+        eprintln!("  Destination: tile ({},{}) @ 0x{:04X}", tile_c_col, tile_c_row, c_dst_offset);
+        eprintln!("  Data size:   {} bytes (pattern starting 0xC0)", transfer_size);
+    }
 }

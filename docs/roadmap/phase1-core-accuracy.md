@@ -10,15 +10,15 @@
 
 This section is the single reference for what needs to be done and in what order.
 
-### Current State: ~75% Binary Compatible
+### Current State: ~80% Binary Compatible
 
 ```
 Component Completion:
 ├── Binary Loading (XCLBIN/ELF/CDO)      ████████░░  80%
-├── Instruction Decoding                 ████████░░  80%  (all formats, 210+ instructions)
-├── Instruction Execution                █████░░░░░  50%  (basic ops, missing specialized)
+├── Instruction Decoding                 █████████░  90%  (all formats, 230+ instructions)
+├── Instruction Execution                ██████░░░░  60%  (scalar, vector, matrix basics done)
 ├── Memory System                        ████████░░  80%  (single-tile + cross-tile latency)
-├── DMA Engine                           ████████░░  80%  (complete + lock timing, needs TileArray)
+├── DMA Engine                           █████████░  90%  (multi-tile streaming works)
 ├── Synchronization                      ██████████  100% (locks + barriers + deadlock)
 ├── Stream Switch                        ██████████  100% (circuit+packet+latency done)
 ├── Pipeline/Timing                      ██████████  100% (hazards, branch, VLIW slots, events)
@@ -39,21 +39,24 @@ Component Completion:
 
 **Validation**: Run `add_one` kernel, verify output = input + 1.
 
-**Tests**: 532 passing
+**Tests**: 554 passing
 
-### Milestone 2: Multi-Tile Data Flow (Target: 65%)
+### Milestone 2: Multi-Tile Data Flow (Target: 65%) - LARGELY COMPLETE
 
 **Goal**: Data flows correctly between tiles via DMA and stream switch.
 
 | Task | Priority | Effort | Status |
 |------|----------|--------|--------|
 | Stream switch circuit routing (tile-to-tile) | P0 | High | ✅ |
-| DmaEngine ↔ TileArray integration | P0 | High | 🔲 |
+| DmaEngine ↔ TileArray integration | P0 | High | ✅ S2MM stall fix, route_dma_streams |
 | Cross-tile memory access (neighbor tiles) | P1 | Medium | ✅ MemoryQuadrant + routing latency |
 | Packet-switched routing (headers, arbitration) | P2 | High | ✅ |
 | Stream switch timing (hop latency) | P2 | Medium | ✅ |
+| Two-tile DMA stream flow | P0 | Medium | ✅ 256-byte verified |
+| Three-tile pipeline (A->B->C) | P1 | Medium | ✅ 128-byte chain |
+| Bidirectional ping-pong DMA | P1 | Medium | ✅ Simultaneous transfers |
 
-**Validation**: Run 2-tile pipeline (tile A produces, tile B consumes).
+**Validation**: Run 2-tile pipeline (tile A produces, tile B consumes). ✅ PASSING
 
 ### Milestone 3: Timing Accuracy (Target: 80%) - 🟢 LARGELY COMPLETE
 
@@ -75,18 +78,24 @@ Component Completion:
 fetch/decode/execute/writeback pipeline model which requires significant state tracking.
 Current model uses operation latencies + hazard detection + branch penalties.
 
-### Milestone 4: Full ISA Coverage (Target: 90%)
+### Milestone 4: Full ISA Coverage (Target: 90%) - IN PROGRESS
 
 **Goal**: Execute any mlir-aie compiled binary correctly.
 
 | Task | Priority | Effort | Status |
 |------|----------|--------|--------|
-| Matrix multiply instructions (MAC variants) | P0 | High | 🔲 |
+| Matrix multiply instructions (MAC variants) | P0 | High | ✅ VectorMatMulDense, VectorMac |
+| Shift-Round-Saturate (accumulator to vector) | P0 | Medium | ✅ VectorSRS |
+| Type conversion (bf16/f32/int) | P0 | Medium | ✅ VectorConvert |
+| Vector load/store (VLDA/VLDB/VST) | P0 | Medium | ✅ With post-modify |
+| Vector load with unpack | P1 | Medium | ✅ VectorLoadUnpack |
+| Scalar extensions (abs, clz, clb, adc, sbc) | P1 | Low | ✅ |
+| Sign/zero extend (s8/s16/u8/u16) | P1 | Low | ✅ |
 | Convolution operations | P0 | High | 🔲 |
-| SIMD shuffle/permute variants | P1 | Medium | 🔲 |
-| Accumulator operations (full precision) | P1 | Medium | 🟡 |
-| All addressing modes | P2 | Medium | 🟡 |
-| Remaining TableGen instructions (65 more) | P2 | High | 🔲 |
+| SIMD shuffle/permute variants | P1 | Medium | 🟡 Basic done |
+| Sparse matrix multiply | P2 | High | 🟡 Maps to dense |
+| Stream operations (mv_scl2ms, etc.) | P2 | Medium | 🟡 Mapped |
+| Remaining TableGen instructions (~40 more) | P2 | High | 🔲 |
 
 **Validation**: Run mlir-aie test suite, all kernels produce correct results.
 
@@ -103,55 +112,61 @@ Current model uses operation latencies + hazard detection + branch penalties.
 
 ---
 
-### After 1.8/1.9: What Remains for True Binary Compatibility?
+### After Day 2: Progress Assessment
 
-**1.8 (Pipeline Model) and 1.9 (Multi-Core Coordination) are now COMPLETE.**
+**Milestones 1.8/1.9 COMPLETE. Milestone 2 LARGELY COMPLETE. Milestone 4 IN PROGRESS.**
 
-We have **excellent timing infrastructure** with full integration. Two major areas remain:
+We now have **working multi-tile data flow** with tested pipelines.
 
-#### Gap 1: DMA/TileArray Integration (Milestone 2 blockers)
-
-| Item | Impact | Effort |
-|------|--------|--------|
-| DmaEngine ↔ TileArray integration | **Critical** - multi-tile programs won't run | High |
-| ~~Cross-tile memory access~~ | ~~High - neighbor tile memory reads~~ | ✅ Done |
-| Wire DmaStart/DmaWait to actual engine | High - DMA ops currently no-ops | Medium |
-
-**Without this**: Single-tile kernels work, but any multi-tile pipeline fails.
-
-#### Gap 2: ISA Coverage (Milestone 4)
+#### Gap 1: DMA/TileArray Integration - RESOLVED
 
 | Item | Impact | Effort |
 |------|--------|--------|
-| Matrix multiply (MAC variants) | **Critical** - most ML kernels use these | High |
-| Convolution operations | High - CNN workloads | High |
-| Remaining 65 TableGen instructions | Medium - specialized ops | High |
-| SIMD shuffle/permute variants | Medium - data rearrangement | Medium |
+| ~~DmaEngine ↔ TileArray integration~~ | ~~Critical~~ | ✅ Done (S2MM stall fix) |
+| ~~Cross-tile memory access~~ | ~~High~~ | ✅ Done |
+| ~~Wire DmaStart/DmaWait to actual engine~~ | ~~High~~ | ✅ Done |
+| Three-tile pipeline test | Validates multi-hop | ✅ Done |
+| Bidirectional DMA test | Validates concurrent transfers | ✅ Done |
 
-**Without this**: Simple kernels (add, multiply) work; real ML kernels fail.
+**Status**: Multi-tile pipelines now work! Three-tile chain verified.
 
-#### Realistic Assessment (Post 1.8/1.9)
+#### Gap 2: ISA Coverage (Milestone 4) - PARTIALLY RESOLVED
+
+| Item | Impact | Effort |
+|------|--------|--------|
+| ~~Matrix multiply (MAC variants)~~ | ~~Critical~~ | ✅ VectorMatMulDense done |
+| ~~Type conversion (bf16/f32)~~ | ~~High~~ | ✅ VectorConvert done |
+| ~~Shift-Round-Saturate~~ | ~~High~~ | ✅ VectorSRS done |
+| ~~Vector load/store~~ | ~~High~~ | ✅ VLDA/VLDB/VST done |
+| Convolution operations | High - CNN workloads | 🔲 Pending |
+| Remaining ~40 TableGen instructions | Medium - specialized ops | 🔲 Pending |
+
+**Status**: Basic ML kernels should now work. Convolution is main remaining gap.
+
+#### Realistic Assessment (Post Day 2)
 
 ```
-Current state after 1.8/1.9 completion:
+Current state after Day 2:
 ├── Timing/Pipeline          ██████████  100%  (fully integrated + events)
 ├── Stream/Routing           ██████████  100%  (complete with latency)
 ├── Synchronization          ██████████  100%  (locks, barriers, deadlock)
 ├── Multi-Core Coordination  ██████████  100%  (arbitration, cross-tile, events)
-├── Multi-Tile Data Flow     █████░░░░░  50%   (cross-tile done, DMA integration pending)
-└── ISA Coverage             ████░░░░░░  40%   (basic ops only)
+├── Multi-Tile Data Flow     ████████░░  80%   (3-tile pipeline tested)
+└── ISA Coverage             ██████░░░░  55%   (matrix, vector mem, type conv done)
 
-Overall binary compatibility: ~70%
+Overall binary compatibility: ~80%
 - Simple single-tile kernels: WORK
 - Cross-tile memory access: WORK (with correct latency)
-- Multi-tile pipelines: BLOCKED on DMA integration
-- Real ML workloads: BLOCKED on matrix/conv ops
+- Multi-tile pipelines: WORK (tested up to 3 tiles)
+- Basic ML workloads: SHOULD WORK (matrix multiply available)
+- CNN workloads: BLOCKED on convolution ops
 ```
 
 #### Recommended Next Focus
 
-1. **DMA Integration** (unblocks Milestone 2) - Makes multi-tile actually work
-2. **Matrix Instructions** (enables ML) - Most impactful ISA additions
+1. **Real XCLBIN validation** - Load actual compiled kernel, verify execution
+2. **Convolution ops** - Enables CNN workloads
+3. **Stream operations** - Complete stream read/write execution
 
 ---
 

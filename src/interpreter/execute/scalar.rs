@@ -200,6 +200,106 @@ impl ScalarAlu {
                 true
             }
 
+            // New scalar operations for Phase 1 ISA expansion
+            Operation::ScalarAbs => {
+                let src = Self::get_source(op, ctx, 0);
+                let result = (src as i32).wrapping_abs() as u32;
+                Self::write_dest(op, ctx, result);
+                ctx.set_flags(Flags::from_result(result));
+                true
+            }
+
+            Operation::ScalarClz => {
+                let src = Self::get_source(op, ctx, 0);
+                let result = src.leading_zeros();
+                Self::write_dest(op, ctx, result);
+                true
+            }
+
+            Operation::ScalarClb => {
+                // Count leading bits: leading sign extension bits
+                // For positive: leading zeros - 1 (sign bit doesn't count)
+                // For negative: leading ones - 1
+                let src = Self::get_source(op, ctx, 0);
+                let result = if (src as i32) >= 0 {
+                    src.leading_zeros().saturating_sub(1)
+                } else {
+                    src.leading_ones().saturating_sub(1)
+                };
+                Self::write_dest(op, ctx, result);
+                true
+            }
+
+            Operation::ScalarAdc => {
+                // Add with carry: dst = src1 + src2 + carry_flag
+                let (a, b) = Self::get_two_sources(op, ctx);
+                let carry_in = if ctx.flags().c { 1u32 } else { 0u32 };
+                let (result1, carry1) = a.overflowing_add(b);
+                let (result, carry2) = result1.overflowing_add(carry_in);
+                Self::write_dest(op, ctx, result);
+                // Set flags: carry if either addition overflowed
+                let mut flags = Flags::from_result(result);
+                flags.c = carry1 || carry2;
+                // Overflow: signed overflow in the addition
+                let a_sign = (a as i32) < 0;
+                let b_sign = (b as i32) < 0;
+                let r_sign = (result as i32) < 0;
+                flags.v = (a_sign == b_sign) && (a_sign != r_sign);
+                ctx.set_flags(flags);
+                true
+            }
+
+            Operation::ScalarSbc => {
+                // Subtract with borrow: dst = src1 - src2 - !carry_flag
+                // ARM-style: C=1 means no borrow, C=0 means borrow
+                let (a, b) = Self::get_two_sources(op, ctx);
+                let borrow_in = if ctx.flags().c { 0u32 } else { 1u32 };
+                let (result1, borrow1) = a.overflowing_sub(b);
+                let (result, borrow2) = result1.overflowing_sub(borrow_in);
+                Self::write_dest(op, ctx, result);
+                // Set flags
+                let mut flags = Flags::from_result(result);
+                flags.c = !(borrow1 || borrow2); // C=1 means no borrow
+                let a_sign = (a as i32) < 0;
+                let b_sign = (b as i32) < 0;
+                let r_sign = (result as i32) < 0;
+                flags.v = (a_sign != b_sign) && (a_sign != r_sign);
+                ctx.set_flags(flags);
+                true
+            }
+
+            Operation::ScalarExtendS8 => {
+                let src = Self::get_source(op, ctx, 0);
+                let result = ((src as i8) as i32) as u32;
+                Self::write_dest(op, ctx, result);
+                ctx.set_flags(Flags::from_result(result));
+                true
+            }
+
+            Operation::ScalarExtendS16 => {
+                let src = Self::get_source(op, ctx, 0);
+                let result = ((src as i16) as i32) as u32;
+                Self::write_dest(op, ctx, result);
+                ctx.set_flags(Flags::from_result(result));
+                true
+            }
+
+            Operation::ScalarExtendU8 => {
+                let src = Self::get_source(op, ctx, 0);
+                let result = src & 0xFF;
+                Self::write_dest(op, ctx, result);
+                ctx.set_flags(Flags::from_result(result));
+                true
+            }
+
+            Operation::ScalarExtendU16 => {
+                let src = Self::get_source(op, ctx, 0);
+                let result = src & 0xFFFF;
+                Self::write_dest(op, ctx, result);
+                ctx.set_flags(Flags::from_result(result));
+                true
+            }
+
             _ => false, // Not a scalar operation
         }
     }

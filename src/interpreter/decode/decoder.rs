@@ -29,7 +29,9 @@ use crate::interpreter::bundle::{
     VliwBundle,
 };
 use crate::interpreter::traits::{DecodeError, Decoder};
-use crate::tablegen::{build_decoder_tables, load_from_llvm_aie, DecoderIndex, InstrEncoding, SemanticOp};
+use crate::tablegen::{
+    build_decoder_tables, load_from_llvm_aie, DecoderIndex, InstrEncoding, SemanticOp,
+};
 
 /// A decoded instruction from TableGen data.
 #[derive(Debug, Clone)]
@@ -54,7 +56,11 @@ impl DecodedInstr {
     /// Get an operand as a signed immediate.
     pub fn signed_imm(&self, name: &str) -> Option<i32> {
         // Find the field to get its width for sign extension
-        let field = self.encoding.operand_fields.iter().find(|f| f.name == name)?;
+        let field = self
+            .encoding
+            .operand_fields
+            .iter()
+            .find(|f| f.name == name)?;
         let value = self.operand(name)?;
 
         if field.signed {
@@ -171,7 +177,10 @@ impl InstructionDecoder {
         // Group by slot for the O(1) index
         let mut by_slot: HashMap<String, Vec<InstrEncoding>> = HashMap::new();
         for enc in &encodings {
-            by_slot.entry(enc.slot.clone()).or_default().push(enc.clone());
+            by_slot
+                .entry(enc.slot.clone())
+                .or_default()
+                .push(enc.clone());
         }
         let index = DecoderIndex::from_slot_encodings(by_slot);
 
@@ -289,10 +298,16 @@ impl InstructionDecoder {
             Operation::ScalarOr
         } else if mnemonic.starts_with("xor") {
             Operation::ScalarXor
-        } else if mnemonic.starts_with("shl") || mnemonic.starts_with("lsl") || mnemonic.starts_with("lshl") {
+        } else if mnemonic.starts_with("shl")
+            || mnemonic.starts_with("lsl")
+            || mnemonic.starts_with("lshl")
+        {
             // shl, lsl, lshl - logical shift left
             Operation::ScalarShl
-        } else if mnemonic.starts_with("shr") || mnemonic.starts_with("lsr") || mnemonic.starts_with("lshr") {
+        } else if mnemonic.starts_with("shr")
+            || mnemonic.starts_with("lsr")
+            || mnemonic.starts_with("lshr")
+        {
             // shr, lsr, lshr - logical shift right
             Operation::ScalarShr
         } else if mnemonic.starts_with("asr") || mnemonic.starts_with("ashr") {
@@ -309,10 +324,16 @@ impl InstructionDecoder {
         } else if mnemonic == "add" || mnemonic.starts_with("add.") {
             // Scalar addition (add, add.nc, add.s, add.u, etc.)
             Operation::ScalarAdd
-        } else if mnemonic == "sub" || mnemonic.starts_with("sub.") || mnemonic == "sbc" {
-            // Scalar subtraction (sub, sub.nc, sbc = subtract with borrow)
+        } else if mnemonic == "sbc" || mnemonic.starts_with("sbc.") {
+            // Subtract with borrow
+            Operation::ScalarSbc
+        } else if mnemonic == "sub" || mnemonic.starts_with("sub.") {
+            // Scalar subtraction (sub, sub.nc, etc.)
             Operation::ScalarSub
-        } else if mnemonic.starts_with("lda") || mnemonic.starts_with("ldb") || mnemonic.starts_with("ld") {
+        } else if mnemonic.starts_with("lda")
+            || mnemonic.starts_with("ldb")
+            || mnemonic.starts_with("ld")
+        {
             Operation::Load {
                 width: MemWidth::Word,
                 post_modify: PostModify::None,
@@ -389,6 +410,87 @@ impl InstructionDecoder {
         } else if mnemonic.starts_with("sel") {
             // sel, sel.eqz, sel.nez, etc.
             Operation::ScalarSel
+        // ========== Additional Scalar Operations ==========
+        } else if mnemonic == "abs" || mnemonic.starts_with("abs.") {
+            Operation::ScalarAbs
+        } else if mnemonic == "clz" || mnemonic.starts_with("clz.") {
+            // Count leading zeros
+            Operation::ScalarClz
+        } else if mnemonic == "clb" || mnemonic.starts_with("clb.") {
+            // Count leading bits (ones or zeros)
+            Operation::ScalarClb
+        } else if mnemonic == "adc" || mnemonic.starts_with("adc.") {
+            // Add with carry
+            Operation::ScalarAdc
+        // ========== Sign/Zero Extension Operations ==========
+        } else if mnemonic == "ext.s8" || mnemonic == "sext.8" || mnemonic == "sext8" {
+            Operation::ScalarExtendS8
+        } else if mnemonic == "ext.s16" || mnemonic == "sext.16" || mnemonic == "sext16" {
+            Operation::ScalarExtendS16
+        } else if mnemonic == "ext.u8" || mnemonic == "zext.8" || mnemonic == "zext8" {
+            Operation::ScalarExtendU8
+        } else if mnemonic == "ext.u16" || mnemonic == "zext.16" || mnemonic == "zext16" {
+            Operation::ScalarExtendU16
+        // ========== Vector Operations ==========
+        } else if mnemonic.contains("vmul_vmac_cm_core_dense") || mnemonic.contains("vmac_cm_dense")
+        {
+            // Matrix multiply dense
+            Operation::VectorMatMulDense {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vsrs") {
+            // Shift-round-saturate
+            Operation::VectorSRS {
+                from_type: self.infer_element_type(&mnemonic),
+                to_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vconv") {
+            // Vector type conversion
+            Operation::VectorConvert {
+                from_type: self.infer_element_type(&mnemonic),
+                to_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vmov") {
+            // Vector move (NOT regular "mov")
+            Operation::VectorMov {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vlda") {
+            // Vector load A channel
+            Operation::VectorLoadA {
+                post_modify: PostModify::None,
+            }
+        } else if mnemonic.starts_with("vldb") {
+            // Vector load B channel
+            Operation::VectorLoadB {
+                post_modify: PostModify::None,
+            }
+        } else if mnemonic.starts_with("vlup") {
+            // Vector load with unpack
+            Operation::VectorLoadUnpack {
+                from_type: self.infer_element_type(&mnemonic),
+                to_type: self.infer_element_type(&mnemonic),
+                post_modify: PostModify::None,
+            }
+        } else if mnemonic.starts_with("vst") {
+            // Vector store (check before generic "st")
+            Operation::VectorStore {
+                post_modify: PostModify::None,
+            }
+        // ========== Stream Operations ==========
+        } else if mnemonic.contains("mv_scl2ms") || mnemonic == "scl2ms" {
+            // Write scalar to master stream
+            Operation::StreamWriteScalar { blocking: true }
+        } else if mnemonic.contains("mv_ph2ms") || mnemonic == "ph2ms" {
+            // Write packet header to master stream
+            Operation::StreamWritePacketHeader { blocking: true }
+        } else if mnemonic.contains("mv_ms2scl")
+            || mnemonic.contains("mv_ss2scl")
+            || mnemonic == "ms2scl"
+            || mnemonic == "ss2scl"
+        {
+            // Read from slave stream to scalar
+            Operation::StreamReadScalar { blocking: true }
         } else {
             Operation::Unknown {
                 opcode: decoded.operands.get("word0").copied().unwrap_or(0) as u32,
@@ -449,13 +551,15 @@ impl InstructionDecoder {
             } else {
                 ElementType::Int8
             }
-        } else if mnemonic.ends_with("16") || mnemonic.contains(".i16") || mnemonic.contains(".u16") {
+        } else if mnemonic.ends_with("16") || mnemonic.contains(".i16") || mnemonic.contains(".u16")
+        {
             if mnemonic.contains(".u") {
                 ElementType::UInt16
             } else {
                 ElementType::Int16
             }
-        } else if mnemonic.ends_with("32") || mnemonic.contains(".i32") || mnemonic.contains(".u32") {
+        } else if mnemonic.ends_with("32") || mnemonic.contains(".i32") || mnemonic.contains(".u32")
+        {
             if mnemonic.contains(".u") {
                 ElementType::UInt32
             } else {
@@ -494,11 +598,22 @@ impl InstructionDecoder {
         // - imm, offset -> immediates
 
         #[cfg(test)]
-        if decoded.encoding.slot == "st" || decoded.encoding.slot == "lda" || decoded.encoding.slot == "ldb" {
-            let field_info: Vec<String> = decoded.encoding.operand_fields.iter()
+        if decoded.encoding.slot == "st"
+            || decoded.encoding.slot == "lda"
+            || decoded.encoding.slot == "ldb"
+        {
+            let field_info: Vec<String> = decoded
+                .encoding
+                .operand_fields
+                .iter()
                 .map(|f| format!("{}=0x{:X}", f.name, decoded.operand(&f.name).unwrap_or(0)))
                 .collect();
-            eprintln!("[DECODE {}] mnemonic={} fields={:?}", decoded.encoding.slot.to_uppercase(), decoded.encoding.mnemonic, field_info);
+            eprintln!(
+                "[DECODE {}] mnemonic={} fields={:?}",
+                decoded.encoding.slot.to_uppercase(),
+                decoded.encoding.mnemonic,
+                field_info
+            );
         }
 
         for field in &decoded.encoding.operand_fields {
@@ -534,8 +649,11 @@ impl InstructionDecoder {
             }
 
             // Special handling for scalar load destination (mSclLd, mLdaScl, mLdbScl)
-            if field.name == "mSclLd" || field.name.contains("SclLd")
-                || field.name == "mLdaScl" || field.name == "mLdbScl" {
+            if field.name == "mSclLd"
+                || field.name.contains("SclLd")
+                || field.name == "mLdaScl"
+                || field.name == "mLdbScl"
+            {
                 // This is the scalar register to load into
                 dest = Some(Operand::ScalarReg(value as u8));
                 continue;
@@ -563,9 +681,8 @@ impl InstructionDecoder {
             }
 
             // Determine if this is a destination or source
-            let is_dest = field.name.contains("mRx")
-                || field.name.starts_with("d")
-                || field.name == "dst";
+            let is_dest =
+                field.name.contains("mRx") || field.name.starts_with("d") || field.name == "dst";
             let is_src = field.name.contains("mRx0")
                 || field.name.contains("mRy")
                 || field.name.starts_with("s")
@@ -589,7 +706,10 @@ impl InstructionDecoder {
             } else if field.name.starts_with("mP") {
                 // Pointer register with mPx naming
                 Operand::PointerReg(value as u8)
-            } else if field.name.starts_with("m") && !field.name.contains("mR") && !field.name.contains("mS") {
+            } else if field.name.starts_with("m")
+                && !field.name.contains("mR")
+                && !field.name.contains("mS")
+            {
                 Operand::ModifierReg(value as u8)
             } else {
                 Operand::ScalarReg(value as u8)
@@ -680,8 +800,10 @@ impl Decoder for InstructionDecoder {
 
                     #[cfg(test)]
                     if slot.slot_type == SlotType::Alu || slot.slot_type == SlotType::Mv {
-                        eprintln!("[DECODE {:?}] mnemonic={} op={:?} bits=0x{:X}",
-                            slot.slot_type, decoded.encoding.mnemonic, operation, slot.bits);
+                        eprintln!(
+                            "[DECODE {:?}] mnemonic={} op={:?} bits=0x{:X}",
+                            slot.slot_type, decoded.encoding.mnemonic, operation, slot.bits
+                        );
                     }
 
                     let mut slot_op = SlotOp::new(slot_index, operation);
@@ -697,7 +819,10 @@ impl Decoder for InstructionDecoder {
                     // Slot extracted but not recognized - mark as unknown with slot info
                     #[cfg(test)]
                     if slot.slot_type == SlotType::Alu || slot.slot_type == SlotType::Mv {
-                        eprintln!("[DECODE {:?} FAIL] bits=0x{:X} - no matching encoding", slot.slot_type, slot.bits);
+                        eprintln!(
+                            "[DECODE {:?} FAIL] bits=0x{:X} - no matching encoding",
+                            slot.slot_type, slot.bits
+                        );
                     }
                     let slot_name = match slot.slot_type {
                         SlotType::Lda => "lda",
@@ -884,7 +1009,7 @@ mod tests {
             mnemonic: "generic".to_string(),
             slot: "alu".to_string(),
             width: 20,
-            fixed_mask: 0b1,     // Only 1 fixed bit
+            fixed_mask: 0b1, // Only 1 fixed bit
             fixed_bits: 0b1,
             operand_fields: vec![],
             semantic: None,
@@ -895,7 +1020,8 @@ mod tests {
         let more_specific = make_add_encoding(); // 5 fixed bits
 
         // Order shouldn't matter - decoder sorts by specificity
-        let decoder = InstructionDecoder::from_encodings(vec![less_specific.clone(), more_specific]);
+        let decoder =
+            InstructionDecoder::from_encodings(vec![less_specific.clone(), more_specific]);
 
         let word = 0b00011_00101_00010_0000_1u64;
         let decoded = decoder.decode_word(word).expect("Should decode");
@@ -938,7 +1064,10 @@ mod tests {
             unknown_count
         );
 
-        assert!(decoder.encodings.len() > 0, "Should have loaded some encodings");
+        assert!(
+            decoder.encodings.len() > 0,
+            "Should have loaded some encodings"
+        );
     }
 
     #[test]
@@ -1020,10 +1149,7 @@ mod tests {
                         unknown_count += 1;
                     }
 
-                    eprintln!(
-                        "  PC 0x{:04X}: 0x{:08X} -> {}",
-                        pc, word, op_name
-                    );
+                    eprintln!("  PC 0x{:04X}: 0x{:08X} -> {}", pc, word, op_name);
 
                     pc += bundle.size() as u32;
                 }
@@ -1038,11 +1164,16 @@ mod tests {
         eprintln!("\n=== Results ===");
         eprintln!("Decoded: {} instructions", decoded_count);
         eprintln!("Unknown: {} instructions", unknown_count);
-        eprintln!("Recognition rate: {:.1}%",
-            100.0 * decoded_count as f64 / (decoded_count + unknown_count) as f64);
+        eprintln!(
+            "Recognition rate: {:.1}%",
+            100.0 * decoded_count as f64 / (decoded_count + unknown_count) as f64
+        );
 
         // We expect some unknowns - this is a real binary!
         // But we should decode SOMETHING
-        assert!(decoded_count + unknown_count > 0, "Should have processed some instructions");
+        assert!(
+            decoded_count + unknown_count > 0,
+            "Should have processed some instructions"
+        );
     }
 }
