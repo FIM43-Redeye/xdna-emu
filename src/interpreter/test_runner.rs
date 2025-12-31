@@ -709,15 +709,68 @@ mod tests {
         // Read destination tile memory and verify
         let result = runner.read_tile_memory(dst_col, dst_row, 0x2000, 64).unwrap();
 
-        // Check if at least some data arrived
-        let nonzero_count = result.iter().filter(|&&b| b != 0).count();
-        eprintln!("Transferred {} non-zero bytes out of 64", nonzero_count);
-        eprintln!("First 16 bytes: {:?}", &result[..16]);
-        eprintln!("Expected first 16 bytes: {:?}", &test_data[..16]);
+        // Verify exact byte-for-byte match
+        assert_eq!(
+            result, test_data,
+            "Data mismatch in two-tile DMA stream transfer"
+        );
+        eprintln!("Two-tile DMA stream transfer: 64 bytes transferred correctly");
+    }
 
-        // For now, just verify the mechanism works - full validation requires
-        // proper S2MM stream data handling
-        assert!(nonzero_count > 0, "Expected at least some data to transfer");
+    /// Test two-tile data flow with larger transfer and exact verification.
+    #[test]
+    fn test_two_tile_dma_stream_256_bytes() {
+        let mut runner = TestRunner::new();
+
+        // Source tile (0, 2) -> Destination tile (0, 3)
+        let src_col = 0u8;
+        let src_row = 2u8;
+        let dst_col = 0u8;
+        let dst_row = 3u8;
+
+        let mm2s_channel = 2u8;
+        let s2mm_channel = 0u8;
+
+        // Write 256 bytes with recognizable pattern
+        let test_data: Vec<u8> = (0..256u32).map(|i| (i % 256) as u8).collect();
+        runner.write_tile_memory(src_col, src_row, 0x1000, &test_data).unwrap();
+
+        // Configure BDs for 256-byte transfer
+        let mm2s_bd = BdConfig::simple_1d(0x1000, 256);
+        runner.configure_dma_bd(src_col, src_row, 0, mm2s_bd).unwrap();
+
+        let s2mm_bd = BdConfig::simple_1d(0x2000, 256);
+        runner.configure_dma_bd(dst_col, dst_row, 0, s2mm_bd).unwrap();
+
+        // Configure stream routing
+        runner.engine.device_mut().array.stream_router.add_route(
+            src_col, src_row, mm2s_channel,
+            dst_col, dst_row, s2mm_channel,
+        );
+
+        // Start both DMA channels
+        runner.engine.device_mut().array.dma_engine_mut(src_col, src_row)
+            .unwrap()
+            .start_channel(mm2s_channel, 0)
+            .unwrap();
+
+        runner.engine.device_mut().array.dma_engine_mut(dst_col, dst_row)
+            .unwrap()
+            .start_channel(s2mm_channel, 0)
+            .unwrap();
+
+        // Step until transfer completes
+        for _ in 0..500 {
+            runner.step();
+        }
+
+        // Verify exact match
+        let result = runner.read_tile_memory(dst_col, dst_row, 0x2000, 256).unwrap();
+        assert_eq!(
+            result, test_data,
+            "256-byte transfer data mismatch"
+        );
+        eprintln!("Two-tile DMA stream transfer: 256 bytes transferred correctly");
     }
 
     /// Diagnostic test that traces add_one kernel execution step by step.

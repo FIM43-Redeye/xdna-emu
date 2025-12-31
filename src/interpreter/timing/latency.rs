@@ -277,6 +277,15 @@ impl LatencyTable {
             Operation::ScalarSra => OperationKey::ScalarSra,
             Operation::ScalarMov | Operation::ScalarMovi { .. } => OperationKey::ScalarMov,
             Operation::ScalarCmp => OperationKey::ScalarCmp,
+            // New scalar operations - use existing timing categories
+            Operation::ScalarAbs
+            | Operation::ScalarClz
+            | Operation::ScalarClb
+            | Operation::ScalarExtendS8
+            | Operation::ScalarExtendS16
+            | Operation::ScalarExtendU8
+            | Operation::ScalarExtendU16 => OperationKey::ScalarAdd, // Single-cycle scalar ops
+            Operation::ScalarAdc | Operation::ScalarSbc => OperationKey::ScalarAdd, // Same as add/sub
             // Comparison operations have same timing as compare
             Operation::ScalarLt
             | Operation::ScalarLtu
@@ -306,6 +315,22 @@ impl LatencyTable {
             Operation::VectorCmp { .. } | Operation::VectorMin { .. } | Operation::VectorMax { .. } => {
                 OperationKey::VectorCmp
             }
+            // Matrix multiply operations - use MAC timing (multi-cycle)
+            Operation::VectorMatMulDense { .. }
+            | Operation::VectorMatMulSparse { .. } => OperationKey::VectorMac,
+            // Type conversion and move operations
+            Operation::VectorSRS { .. }
+            | Operation::VectorConvert { .. }
+            | Operation::VectorMov { .. } => OperationKey::VectorAdd, // Similar to vector ALU
+            // Vector memory operations
+            Operation::VectorLoadA { .. }
+            | Operation::VectorLoadB { .. }
+            | Operation::VectorLoadUnpack { .. } => OperationKey::Load,
+            Operation::VectorStore { .. } => OperationKey::Store,
+            // Stream operations - use DMA timing
+            Operation::StreamWriteScalar { .. }
+            | Operation::StreamWritePacketHeader { .. }
+            | Operation::StreamReadScalar { .. } => OperationKey::DmaStart,
             Operation::DmaStart => OperationKey::DmaStart,
             Operation::DmaWait => OperationKey::DmaWait,
             Operation::Unknown { .. } => OperationKey::Unknown,

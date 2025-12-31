@@ -842,23 +842,23 @@ mod tests {
 
         let mut engine = InterpreterEngine::new_npu1();
 
-        // Configure a BD on tile (1, 2)
+        // Configure a BD on tile (1, 2) using MM2S channel (channel 2)
         // Use 64-byte transfer: at 4 bytes/cycle, takes 16 cycles to complete
         // This ensures the transfer is still in progress after the first step
         if let Some(dma) = engine.device_mut().array.dma_engine_mut(1, 2) {
             dma.configure_bd(0, BdConfig::simple_1d(0x100, 64)).unwrap();
         }
 
-        // Simulate DmaStart by setting tile channel state
+        // Simulate DmaStart by setting tile channel state (channel 2 = MM2S)
         if let Some(tile) = engine.device_mut().tile_mut(1, 2) {
-            tile.dma_channels[0].running = true;
-            tile.dma_channels[0].start_queue = 0; // BD index 0
+            tile.dma_channels[2].running = true;
+            tile.dma_channels[2].start_queue = 0; // BD index 0
         }
 
         // Initial state: DMA should not be active on engine yet
         {
             let dma = engine.device().array.dma_engine(1, 2).unwrap();
-            assert!(!dma.channel_active(0));
+            assert!(!dma.channel_active(2));
         }
 
         // Step once - should sync start request and begin transfer
@@ -867,7 +867,7 @@ mod tests {
         // DMA engine should now be active (transfer in progress)
         {
             let dma = engine.device().array.dma_engine(1, 2).unwrap();
-            assert!(dma.channel_active(0), "DMA should be active after first step");
+            assert!(dma.channel_active(2), "DMA should be active after first step");
         }
 
         // Step more - 64 bytes at 4 bytes/cycle = 16 cycles
@@ -876,7 +876,7 @@ mod tests {
             engine.step();
 
             let dma = engine.device().array.dma_engine(1, 2).unwrap();
-            let state = dma.channel_state(0);
+            let state = dma.channel_state(2);
 
             // Break when complete
             if matches!(state, ChannelState::Complete | ChannelState::Idle) {
@@ -885,10 +885,10 @@ mod tests {
 
             // Safety check - shouldn't take more than ~20 cycles
             if i > 30 {
-                let stats = dma.channel_stats(0).unwrap();
+                let stats = dma.channel_stats(2).unwrap();
                 panic!(
                     "DMA taking too long. State: {:?}, bytes transferred: {}, active: {}",
-                    state, stats.bytes_transferred, dma.channel_active(0)
+                    state, stats.bytes_transferred, dma.channel_active(2)
                 );
             }
         }
@@ -896,7 +896,7 @@ mod tests {
         // Tile channel should show complete
         {
             let tile = engine.device().array.tile(1, 2);
-            assert!(!tile.dma_channels[0].running, "Tile channel should show complete");
+            assert!(!tile.dma_channels[2].running, "Tile channel should show complete");
         }
     }
 

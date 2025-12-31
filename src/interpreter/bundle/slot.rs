@@ -236,6 +236,25 @@ pub enum Operation {
     /// Scalar compare (sets flags): flags = cmp(src1, src2)
     ScalarCmp,
 
+    /// Scalar absolute value: dst = |src|
+    ScalarAbs,
+    /// Count leading zeros: dst = clz(src)
+    ScalarClz,
+    /// Count leading bits (ones or zeros): dst = clb(src)
+    ScalarClb,
+    /// Add with carry: dst = src1 + src2 + C
+    ScalarAdc,
+    /// Subtract with borrow: dst = src1 - src2 - !C
+    ScalarSbc,
+    /// Sign extend from 8 bits: dst = sign_extend(src[7:0])
+    ScalarExtendS8,
+    /// Sign extend from 16 bits: dst = sign_extend(src[15:0])
+    ScalarExtendS16,
+    /// Zero extend from 8 bits: dst = zero_extend(src[7:0])
+    ScalarExtendU8,
+    /// Zero extend from 16 bits: dst = zero_extend(src[15:0])
+    ScalarExtendU16,
+
     // ========== Comparison Operations (produce 0/1) ==========
     /// Signed less than: dst = (src1 < src2) ? 1 : 0
     ScalarLt,
@@ -307,6 +326,42 @@ pub enum Operation {
         element_type: ElementType,
     },
 
+    // ========== Matrix/Accumulator Operations ==========
+    /// Matrix multiply (dense): acc = A * B
+    /// Used by VMUL_vmac_cm_core_dense instructions.
+    VectorMatMulDense {
+        /// Element type for the multiplication.
+        element_type: ElementType,
+    },
+    /// Matrix multiply (sparse): acc = sparse(A) * B
+    /// Used by VMUL_vmac_cm_core_sparse_* instructions.
+    VectorMatMulSparse {
+        /// Element type for the multiplication.
+        element_type: ElementType,
+        /// Wide or narrow sparse format.
+        wide: bool,
+    },
+    /// Shift-round-saturate: vdst = srs(acc, shift)
+    /// Converts accumulator to vector with rounding.
+    VectorSRS {
+        /// Source accumulator element type.
+        from_type: ElementType,
+        /// Destination vector element type.
+        to_type: ElementType,
+    },
+    /// Type conversion (e.g., bf16 <-> f32).
+    VectorConvert {
+        /// Source element type.
+        from_type: ElementType,
+        /// Destination element type.
+        to_type: ElementType,
+    },
+    /// Vector move (register to register within vector file).
+    VectorMov {
+        /// Element type.
+        element_type: ElementType,
+    },
+
     // ========== Pointer Operations ==========
     /// Pointer add: ptr = ptr + offset (for address generation).
     /// Used by padda, paddb, padds instructions.
@@ -327,6 +382,30 @@ pub enum Operation {
     Store {
         /// Width of the access.
         width: MemWidth,
+        /// Post-modify behavior.
+        post_modify: PostModify,
+    },
+    /// Vector load A channel (VLDA).
+    VectorLoadA {
+        /// Post-modify behavior.
+        post_modify: PostModify,
+    },
+    /// Vector load B channel (VLDB).
+    VectorLoadB {
+        /// Post-modify behavior.
+        post_modify: PostModify,
+    },
+    /// Vector load with unpack (VLDB_UNPACK).
+    VectorLoadUnpack {
+        /// Source element type (packed).
+        from_type: ElementType,
+        /// Destination element type (unpacked).
+        to_type: ElementType,
+        /// Post-modify behavior.
+        post_modify: PostModify,
+    },
+    /// Vector store (VST).
+    VectorStore {
         /// Post-modify behavior.
         post_modify: PostModify,
     },
@@ -351,6 +430,23 @@ pub enum Operation {
     DmaStart,
     /// DMA wait for completion.
     DmaWait,
+
+    // ========== Stream Operations ==========
+    /// Write scalar to master stream (MOV_mv_scl2ms).
+    StreamWriteScalar {
+        /// Blocking or non-blocking.
+        blocking: bool,
+    },
+    /// Write packet header to master stream (MOV_mv_ph2ms).
+    StreamWritePacketHeader {
+        /// Blocking or non-blocking.
+        blocking: bool,
+    },
+    /// Read from slave stream to scalar (MOV_mv_ss2scl).
+    StreamReadScalar {
+        /// Blocking or non-blocking.
+        blocking: bool,
+    },
 
     // ========== Misc ==========
     /// No operation.
@@ -401,6 +497,7 @@ impl Operation {
     /// Get the natural slot for this operation.
     pub fn natural_slot(&self) -> SlotIndex {
         match self {
+            // Scalar ALU operations (Scalar0 slot)
             Operation::ScalarAdd
             | Operation::ScalarSub
             | Operation::ScalarAnd
@@ -412,6 +509,15 @@ impl Operation {
             | Operation::ScalarMov
             | Operation::ScalarMovi { .. }
             | Operation::ScalarCmp
+            | Operation::ScalarAbs
+            | Operation::ScalarClz
+            | Operation::ScalarClb
+            | Operation::ScalarAdc
+            | Operation::ScalarSbc
+            | Operation::ScalarExtendS8
+            | Operation::ScalarExtendS16
+            | Operation::ScalarExtendU8
+            | Operation::ScalarExtendU16
             | Operation::ScalarLt
             | Operation::ScalarLtu
             | Operation::ScalarLe
@@ -424,8 +530,10 @@ impl Operation {
             | Operation::ScalarNe
             | Operation::ScalarSel => SlotIndex::Scalar0,
 
+            // Scalar multiply (Scalar1 slot)
             Operation::ScalarMul => SlotIndex::Scalar1,
 
+            // Vector ALU operations (Vector slot)
             Operation::VectorAdd { .. }
             | Operation::VectorSub { .. }
             | Operation::VectorMul { .. }
@@ -434,13 +542,29 @@ impl Operation {
             | Operation::VectorUnpack
             | Operation::VectorCmp { .. }
             | Operation::VectorMin { .. }
-            | Operation::VectorMax { .. } => SlotIndex::Vector,
+            | Operation::VectorMax { .. }
+            | Operation::VectorConvert { .. }
+            | Operation::VectorMov { .. }
+            | Operation::VectorSRS { .. } => SlotIndex::Vector,
 
-            Operation::VectorMac { .. } => SlotIndex::Accumulator,
+            // Matrix/Accumulator operations (Accumulator slot)
+            Operation::VectorMac { .. }
+            | Operation::VectorMatMulDense { .. }
+            | Operation::VectorMatMulSparse { .. } => SlotIndex::Accumulator,
 
-            Operation::PointerAdd | Operation::PointerMov | Operation::Load { .. } => SlotIndex::Load,
-            Operation::Store { .. } => SlotIndex::Store,
+            // Memory load operations (Load slot)
+            Operation::PointerAdd
+            | Operation::PointerMov
+            | Operation::Load { .. }
+            | Operation::VectorLoadA { .. }
+            | Operation::VectorLoadB { .. }
+            | Operation::VectorLoadUnpack { .. } => SlotIndex::Load,
 
+            // Memory store operations (Store slot)
+            Operation::Store { .. }
+            | Operation::VectorStore { .. } => SlotIndex::Store,
+
+            // Control and synchronization operations (Control slot)
             Operation::Branch { .. }
             | Operation::Call
             | Operation::Return
@@ -448,6 +572,9 @@ impl Operation {
             | Operation::LockRelease
             | Operation::DmaStart
             | Operation::DmaWait
+            | Operation::StreamWriteScalar { .. }
+            | Operation::StreamWritePacketHeader { .. }
+            | Operation::StreamReadScalar { .. }
             | Operation::Halt => SlotIndex::Control,
 
             Operation::Nop | Operation::Unknown { .. } => SlotIndex::Scalar0,

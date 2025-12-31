@@ -268,6 +268,15 @@ fn disassemble_op(slot_op: &SlotOp) -> String {
         Operation::ScalarMov => "mov",
         Operation::ScalarMovi { value } => return format!("movi #{}", value),
         Operation::ScalarCmp => "cmp",
+        Operation::ScalarAbs => "abs",
+        Operation::ScalarClz => "clz",
+        Operation::ScalarClb => "clb",
+        Operation::ScalarAdc => "adc",
+        Operation::ScalarSbc => "sbc",
+        Operation::ScalarExtendS8 => "ext.s8",
+        Operation::ScalarExtendS16 => "ext.s16",
+        Operation::ScalarExtendU8 => "ext.u8",
+        Operation::ScalarExtendU16 => "ext.u16",
 
         // Comparison operations
         Operation::ScalarLt => "lt",
@@ -300,12 +309,34 @@ fn disassemble_op(slot_op: &SlotOp) -> String {
         Operation::VectorCmp { .. } => "vcmp",
         Operation::VectorMin { .. } => "vmin",
         Operation::VectorMax { .. } => "vmax",
+        Operation::VectorMatMulDense { element_type } => {
+            return format!("vmul.dense.{}", element_suffix(*element_type))
+        }
+        Operation::VectorMatMulSparse { element_type, wide } => {
+            let w = if *wide { "wide" } else { "narrow" };
+            return format!("vmul.sparse.{}.{}", w, element_suffix(*element_type))
+        }
+        Operation::VectorSRS { from_type, to_type } => {
+            return format!("vsrs.{}.{}", element_suffix(*from_type), element_suffix(*to_type))
+        }
+        Operation::VectorConvert { from_type, to_type } => {
+            return format!("vconv.{}.{}", element_suffix(*from_type), element_suffix(*to_type))
+        }
+        Operation::VectorMov { element_type } => {
+            return format!("vmov.{}", element_suffix(*element_type))
+        }
 
         Operation::PointerAdd => "padd",
         Operation::PointerMov => "pmov",
 
         Operation::Load { width, .. } => return format!("ld.{}", width_suffix(*width)),
         Operation::Store { width, .. } => return format!("st.{}", width_suffix(*width)),
+        Operation::VectorLoadA { .. } => "vlda",
+        Operation::VectorLoadB { .. } => "vldb",
+        Operation::VectorLoadUnpack { from_type, to_type, .. } => {
+            return format!("vldb.unpack.{}.{}", element_suffix(*from_type), element_suffix(*to_type))
+        }
+        Operation::VectorStore { .. } => "vst",
 
         Operation::Branch { condition } => return format!("b{}", condition_suffix(*condition)),
         Operation::Call => "call",
@@ -315,6 +346,15 @@ fn disassemble_op(slot_op: &SlotOp) -> String {
         Operation::LockRelease => "lock.release",
         Operation::DmaStart => "dma.start",
         Operation::DmaWait => "dma.wait",
+        Operation::StreamWriteScalar { blocking } => {
+            if *blocking { "stream.write.scl.blocking" } else { "stream.write.scl" }
+        }
+        Operation::StreamWritePacketHeader { blocking } => {
+            if *blocking { "stream.write.ph.blocking" } else { "stream.write.ph" }
+        }
+        Operation::StreamReadScalar { blocking } => {
+            if *blocking { "stream.read.scl.blocking" } else { "stream.read.scl" }
+        }
 
         Operation::Nop => "nop",
         Operation::Halt => "halt",

@@ -488,6 +488,12 @@ impl DmaEngine {
             return;
         }
 
+        // S2MM stalls when stream_in has no data - wait for routing to provide data
+        if matches!(source, TransferEndpoint::Stream { .. }) && self.stream_in.is_empty() {
+            // Stall: don't advance transfer, wait for data to arrive via route_dma_streams
+            return;
+        }
+
         // Perform the transfer
         let success = self.do_transfer(source, dest, addr, bytes_to_transfer, channel, is_last, tile, host_memory);
 
@@ -660,14 +666,18 @@ impl DmaEngine {
         true
     }
 
-    /// S2MM: Read from stream input and write to tile memory.
+    /// S2MM: Read from stream input, write to tile memory.
     ///
-    /// If stream_in has data, it is consumed and written to memory.
-    /// If stream_in is empty, zeros are written (simulating "always ready" stream).
-    /// This allows tests to work without full stream infrastructure.
+    /// Only transfers data that is available in stream_in.
+    /// Returns false if stream_in is empty (caller should stall).
     fn transfer_s2mm(&mut self, addr: u64, bytes: usize, tile: &mut Tile) -> bool {
         let offset = addr as usize;
         if offset + bytes > tile.data_memory().len() {
+            return false;
+        }
+
+        // Must have at least one word to transfer
+        if self.stream_in.is_empty() {
             return false;
         }
 
@@ -677,12 +687,12 @@ impl DmaEngine {
         let word_count = (bytes + 3) / 4;
 
         for _ in 0..word_count {
-            // Try to get data from stream, or use zeros if not available
+            // Get data from stream - caller ensured at least some data exists
             let word = if let Some(stream_data) = self.stream_in.pop_front() {
                 stream_data.data
             } else {
-                // No stream data - use zeros (allows tests to pass)
-                0
+                // No more stream data - transfer partial, continue next step
+                break;
             };
 
             let word_bytes = word.to_le_bytes();
@@ -1007,15 +1017,16 @@ mod tests {
         let mut tile = make_tile();
         let mut host_mem = make_host_memory();
 
-        // Configure BD for 32 bytes
+        // Configure BD for 32 bytes using MM2S channel (reads from tile memory)
+        // Channel 2 is MM2S on compute tiles
         engine.configure_bd(0, BdConfig::simple_1d(0x100, 32)).unwrap();
 
-        // Start transfer
-        engine.start_channel(0, 0).unwrap();
+        // Start transfer on MM2S channel
+        engine.start_channel(2, 0).unwrap();
 
         // Step until complete
         let mut cycles = 0;
-        while engine.channel_active(0) {
+        while engine.channel_active(2) {
             engine.step(&mut tile, &mut host_mem);
             cycles += 1;
             if cycles > 100 {
@@ -1024,9 +1035,9 @@ mod tests {
         }
 
         // Verify completion
-        assert_eq!(engine.channel_state(0), ChannelState::Complete);
+        assert_eq!(engine.channel_state(2), ChannelState::Complete);
 
-        let stats = engine.channel_stats(0).unwrap();
+        let stats = engine.channel_stats(2).unwrap();
         assert_eq!(stats.transfers_completed, 1);
         assert_eq!(stats.bytes_transferred, 32);
     }
@@ -1061,18 +1072,18 @@ mod tests {
         // Set lock to available state
         tile.locks[5].set(1);
 
-        // Configure BD with lock
+        // Configure BD with lock using MM2S channel
         let bd = BdConfig::simple_1d(0x100, 32)
             .with_acquire(5, 1)
             .with_release(5, 0);
         engine.configure_bd(0, bd).unwrap();
 
-        // Start should trigger lock acquire
-        engine.start_channel(0, 0).unwrap();
+        // Start should trigger lock acquire on MM2S channel
+        engine.start_channel(2, 0).unwrap();
 
         // Step until complete
         let mut cycles = 0;
-        while engine.channel_active(0) {
+        while engine.channel_active(2) {
             engine.step(&mut tile, &mut host_mem);
             cycles += 1;
             if cycles > 100 {
@@ -1090,12 +1101,13 @@ mod tests {
         let mut tile = make_tile();
         let mut host_mem = make_host_memory();
 
+        // Use MM2S channel (channel 2) for testing
         engine.configure_bd(0, BdConfig::simple_1d(0x100, 64)).unwrap();
 
-        let cycles = engine.execute_1d_transfer(0, 0, &mut tile, &mut host_mem).unwrap();
+        let cycles = engine.execute_1d_transfer(2, 0, &mut tile, &mut host_mem).unwrap();
         assert!(cycles > 0);
 
-        let stats = engine.channel_stats(0).unwrap();
+        let stats = engine.channel_stats(2).unwrap();
         assert_eq!(stats.bytes_transferred, 64);
     }
 
@@ -1134,16 +1146,16 @@ mod tests {
         let mut tile = make_tile();
         let mut host_mem = make_host_memory();
 
-        // Configure BD for 16 bytes (4 words)
+        // Configure BD for 16 bytes (4 words) using MM2S channel
         // With AIE2 spec: 4 setup + 1 start + 1 mem latency + 4 data cycles = ~10+ cycles
         engine.configure_bd(0, BdConfig::simple_1d(0x100, 16)).unwrap();
 
-        // Start transfer
-        engine.start_channel(0, 0).unwrap();
+        // Start transfer on MM2S channel
+        engine.start_channel(2, 0).unwrap();
 
         // Step until complete
         let mut cycles = 0;
-        while engine.channel_active(0) {
+        while engine.channel_active(2) {
             engine.step(&mut tile, &mut host_mem);
             cycles += 1;
             if cycles > 100 {
@@ -1155,7 +1167,7 @@ mod tests {
         // (setup + latency + data phases)
         assert!(cycles >= 6, "Cycle-accurate transfer should have overhead, got {} cycles", cycles);
 
-        let stats = engine.channel_stats(0).unwrap();
+        let stats = engine.channel_stats(2).unwrap();
         assert_eq!(stats.bytes_transferred, 16);
     }
 
@@ -1166,15 +1178,15 @@ mod tests {
         let mut host_mem1 = make_host_memory();
         let mut host_mem2 = make_host_memory();
 
-        // Test with 64 bytes
+        // Test with 64 bytes using MM2S channel
         let transfer_size = 64;
 
         // Instant mode
         let mut instant = DmaEngine::new_compute_tile(1, 2);
         instant.configure_bd(0, BdConfig::simple_1d(0x100, transfer_size)).unwrap();
-        instant.start_channel(0, 0).unwrap();
+        instant.start_channel(2, 0).unwrap();
         let mut instant_cycles = 0;
-        while instant.channel_active(0) {
+        while instant.channel_active(2) {
             instant.step(&mut tile1, &mut host_mem1);
             instant_cycles += 1;
             if instant_cycles > 200 { break; }
@@ -1183,9 +1195,9 @@ mod tests {
         // Timed mode
         let mut timed = DmaEngine::new_compute_tile(1, 2).with_cycle_accurate_timing();
         timed.configure_bd(0, BdConfig::simple_1d(0x100, transfer_size)).unwrap();
-        timed.start_channel(0, 0).unwrap();
+        timed.start_channel(2, 0).unwrap();
         let mut timed_cycles = 0;
-        while timed.channel_active(0) {
+        while timed.channel_active(2) {
             timed.step(&mut tile2, &mut host_mem2);
             timed_cycles += 1;
             if timed_cycles > 200 { break; }
@@ -1199,8 +1211,8 @@ mod tests {
         );
 
         // Both should complete successfully
-        assert_eq!(instant.channel_state(0), ChannelState::Complete);
-        assert_eq!(timed.channel_state(0), ChannelState::Complete);
+        assert_eq!(instant.channel_state(2), ChannelState::Complete);
+        assert_eq!(timed.channel_state(2), ChannelState::Complete);
     }
 
     #[test]
