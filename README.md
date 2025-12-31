@@ -2,7 +2,7 @@
 
 Open-source emulator and visual debugger for AMD XDNA NPUs (Ryzen AI).
 
-**Status**: ~85% binary compatible | 564 tests passing
+**Status**: ~90% binary compatible | 564 tests passing
 
 ## Features
 

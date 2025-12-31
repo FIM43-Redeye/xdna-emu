@@ -10,13 +10,13 @@
 
 This section is the single reference for what needs to be done and in what order.
 
-### Current State: ~85% Binary Compatible
+### Current State: ~90% Binary Compatible
 
 ```
 Component Completion:
 ├── Binary Loading (XCLBIN/ELF/CDO)      ████████░░  80%
-├── Instruction Decoding                 █████████░  90%  (all formats, 230+ instructions)
-├── Instruction Execution                ████████░░  75%  (scalar div/sel, vector elem/shift, matrix, conv)
+├── Instruction Decoding                 █████████░  90%  (all formats, 240+ instructions)
+├── Instruction Execution                █████████░  85%  (comparison, bitwise, conditional added)
 ├── Memory System                        ████████░░  80%  (single-tile + cross-tile latency)
 ├── DMA Engine                           █████████░  90%  (multi-tile streaming works)
 ├── Synchronization                      ██████████  100% (locks + barriers + deadlock)
@@ -78,7 +78,7 @@ Component Completion:
 fetch/decode/execute/writeback pipeline model which requires significant state tracking.
 Current model uses operation latencies + hazard detection + branch penalties.
 
-### Milestone 4: Full ISA Coverage (Target: 90%) - IN PROGRESS (~75%)
+### Milestone 4: Full ISA Coverage (Target: 90%) - IN PROGRESS (~85%)
 
 **Goal**: Execute any mlir-aie compiled binary correctly.
 
@@ -98,10 +98,13 @@ Current model uses operation latencies + hazard detection + branch penalties.
 | Vector broadcast/clear | P1 | Low | ✅ VectorBroadcast, VectorClear |
 | Vector shift ops (shl, shr, asr) | P1 | Medium | ✅ With per-lane shifts |
 | Vector align/upshift | P1 | Medium | ✅ VectorAlign, VectorUpshift |
+| Vector comparison (ge, lt, eqz) | P1 | Medium | ✅ VectorGe/Lt/Eqz/MaxLt/MinGe |
+| Vector bitwise (and, or, xor, not) | P1 | Low | ✅ VectorAnd/Or/Xor/Not |
+| Vector conditional arith (sub_lt, sub_ge) | P1 | Medium | ✅ VectorSubLt/SubGe/MaxDiffLt |
 | SIMD shuffle/permute variants | P1 | Medium | 🟡 Basic done |
 | Sparse matrix multiply | P2 | High | 🟡 Maps to dense |
 | Stream operations (mv_scl2ms, etc.) | P2 | Medium | ✅ StreamRead/Write ops |
-| Remaining TableGen instructions (~25 more) | P2 | High | 🔲 |
+| Remaining TableGen instructions (~12 more) | P2 | Medium | 🔲 |
 
 **Validation**: Run mlir-aie test suite, all kernels produce correct results.
 
@@ -136,7 +139,7 @@ We have **working multi-tile data flow** and **comprehensive ISA coverage** for 
 
 **Status**: Multi-tile pipelines work! Three-tile chain verified.
 
-#### Gap 2: ISA Coverage (Milestone 4) - ~75% COMPLETE
+#### Gap 2: ISA Coverage (Milestone 4) - ~85% COMPLETE
 
 | Item | Impact | Effort |
 |------|--------|--------|
@@ -148,8 +151,11 @@ We have **working multi-tile data flow** and **comprehensive ISA coverage** for 
 | ~~Scalar division/select~~ | ~~Medium~~ | ✅ div/divu/mod/seleqz/selnez |
 | ~~Vector element ops~~ | ~~Medium~~ | ✅ extract/insert/select/broadcast/clear |
 | ~~Vector shift ops~~ | ~~Medium~~ | ✅ shl/shr/asr/align/upshift |
+| ~~Vector comparison ops~~ | ~~Medium~~ | ✅ ge/lt/eqz/max_lt/min_ge |
+| ~~Vector bitwise ops~~ | ~~Medium~~ | ✅ and/or/xor/not |
+| ~~Vector conditional ops~~ | ~~Medium~~ | ✅ sub_lt/sub_ge/maxdiff_lt |
 | ~~Stream operations~~ | ~~Medium~~ | ✅ StreamRead/Write |
-| Remaining ~25 TableGen instructions | Low - specialized ops | 🔲 Pending |
+| Remaining ~12 TableGen instructions | Low - specialized ops | 🔲 Pending |
 
 **Status**: ML/CNN workloads fully supported. Most common operations implemented.
 
@@ -162,9 +168,9 @@ Current state:
 ├── Synchronization          ██████████  100%  (locks, barriers, deadlock)
 ├── Multi-Core Coordination  ██████████  100%  (arbitration, cross-tile, events)
 ├── Multi-Tile Data Flow     █████████░  90%   (3-tile pipeline, bidirectional DMA)
-└── ISA Coverage             ████████░░  75%   (scalar div/sel, vector elem/shift, matrix, conv)
+└── ISA Coverage             █████████░  85%   (comparison, bitwise, conditional added)
 
-Overall binary compatibility: ~85%
+Overall binary compatibility: ~90%
 - Simple single-tile kernels: WORK
 - Cross-tile memory access: WORK (with correct latency)
 - Multi-tile pipelines: WORK (tested up to 3 tiles)
@@ -172,6 +178,9 @@ Overall binary compatibility: ~85%
 - CNN workloads: WORK (VMAC/VMSC convolution ops)
 - Vector element manipulation: WORK (extract/insert/select/broadcast)
 - Vector shifts: WORK (shl/shr/asr/align)
+- Vector comparisons: WORK (ge/lt/eqz for masking)
+- Vector bitwise: WORK (and/or/xor/not)
+- Vector conditional arith: WORK (sub_lt/sub_ge/maxdiff)
 ```
 
 #### Recommended Next Focus
