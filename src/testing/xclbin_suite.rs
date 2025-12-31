@@ -346,6 +346,9 @@ impl XclbinSuite {
             };
         }
 
+        // Populate host memory with default input data
+        self.setup_default_input(&mut engine);
+
         // Sync core enabled state from device tiles to engine
         engine.sync_cores_from_device();
 
@@ -505,6 +508,27 @@ impl XclbinSuite {
         }
 
         report
+    }
+
+    /// Setup default input data in host memory.
+    ///
+    /// Populates host memory with sequential integer data that most
+    /// mlir-aie test kernels can process. This allows tests to make
+    /// progress instead of timing out waiting for data.
+    fn setup_default_input(&self, engine: &mut InterpreterEngine) {
+        let host_mem = engine.host_memory_mut();
+
+        // Allocate input region (4KB at address 0)
+        // Many tests expect input at low addresses
+        let _ = host_mem.allocate_region("input", 0x0, 4096);
+
+        // Write sequential i32 values: [1, 2, 3, ..., 1024]
+        // This matches the common test pattern in mlir-aie examples
+        let input: Vec<u32> = (1..=1024).collect();
+        host_mem.write_slice(0x0, &input);
+
+        // Allocate output region (4KB at 4KB offset)
+        let _ = host_mem.allocate_region("output", 0x1000, 4096);
     }
 }
 
