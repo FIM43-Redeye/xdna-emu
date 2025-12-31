@@ -327,6 +327,26 @@ pub enum Operation {
     },
 
     // ========== Matrix/Accumulator Operations ==========
+    //
+    // AIE2 Convolution Support:
+    // -------------------------
+    // AIE2 does NOT have dedicated "conv2d" instructions. Instead, convolutions
+    // are implemented using matrix multiply-accumulate (VMAC) instructions combined
+    // with DMA n-dimensional addressing for data layout.
+    //
+    // The convolution workflow:
+    // 1. DMA loads activation windows using stride patterns
+    // 2. Weights are loaded (optionally with on-the-fly sparse decompression)
+    // 3. VMAC/VMSC perform multiply-accumulate on matrix tiles
+    // 4. VSRS converts accumulator results back to vector format
+    //
+    // Instruction variants:
+    // - VMAC: acc += A * B (dense or sparse formats)
+    // - VMSC: acc -= A * B (subtract variant)
+    // - VNEGMAC: acc += -(A * B) (negated product)
+    // - VNEGMSC: acc -= -(A * B) (negated subtract)
+    // - VMAC.f / VMSC.f: BFloat16 floating-point variants
+
     /// Matrix multiply (dense): acc = A * B
     /// Used by VMUL_vmac_cm_core_dense instructions.
     VectorMatMulDense {
@@ -340,6 +360,56 @@ pub enum Operation {
         element_type: ElementType,
         /// Wide or narrow sparse format.
         wide: bool,
+    },
+    /// Matrix multiply-subtract (dense): acc -= A * B
+    /// Used by VMSC instructions for convolution with subtraction.
+    VectorMatMulSubDense {
+        /// Element type for the multiplication.
+        element_type: ElementType,
+    },
+    /// Matrix multiply-subtract (sparse): acc -= sparse(A) * B
+    /// Used by VMSC_vmac_cm_core_sparse_* instructions.
+    VectorMatMulSubSparse {
+        /// Element type for the multiplication.
+        element_type: ElementType,
+        /// Wide or narrow sparse format.
+        wide: bool,
+    },
+    /// Negated matrix multiply (dense): acc += -(A * B)
+    /// Used by VNEGMAC instructions.
+    VectorNegMatMulDense {
+        /// Element type for the multiplication.
+        element_type: ElementType,
+    },
+    /// Negated matrix multiply-subtract (dense): acc -= -(A * B)
+    /// Used by VNEGMSC instructions.
+    VectorNegMatMulSubDense {
+        /// Element type for the multiplication.
+        element_type: ElementType,
+    },
+    /// BFloat16 matrix multiply-accumulate: acc += A * B (bf16 operands, fp32 accumulator)
+    /// Used by VMAC.f instructions for CNN/ML workloads.
+    VectorMatMulAccFloat {
+        /// Always BFloat16 for inputs, Float32 for accumulator.
+        element_type: ElementType,
+    },
+    /// BFloat16 matrix multiply-subtract: acc -= A * B (bf16 operands, fp32 accumulator)
+    /// Used by VMSC.f instructions.
+    VectorMatMulSubFloat {
+        /// Always BFloat16 for inputs, Float32 for accumulator.
+        element_type: ElementType,
+    },
+    /// Double accumulator matrix multiply-add: acc1 = acc1 + acc2 + A * B
+    /// Used by VADDMAC instructions for fused operations.
+    VectorAddMac {
+        /// Element type for the multiplication.
+        element_type: ElementType,
+    },
+    /// Double accumulator matrix multiply-subtract: acc1 = acc1 - acc2 + A * B
+    /// Used by VSUBMAC instructions for fused operations.
+    VectorSubMac {
+        /// Element type for the multiplication.
+        element_type: ElementType,
     },
     /// Shift-round-saturate: vdst = srs(acc, shift)
     /// Converts accumulator to vector with rounding.
@@ -548,9 +618,18 @@ impl Operation {
             | Operation::VectorSRS { .. } => SlotIndex::Vector,
 
             // Matrix/Accumulator operations (Accumulator slot)
+            // All VMAC/VMSC variants used for convolutions
             Operation::VectorMac { .. }
             | Operation::VectorMatMulDense { .. }
-            | Operation::VectorMatMulSparse { .. } => SlotIndex::Accumulator,
+            | Operation::VectorMatMulSparse { .. }
+            | Operation::VectorMatMulSubDense { .. }
+            | Operation::VectorMatMulSubSparse { .. }
+            | Operation::VectorNegMatMulDense { .. }
+            | Operation::VectorNegMatMulSubDense { .. }
+            | Operation::VectorMatMulAccFloat { .. }
+            | Operation::VectorMatMulSubFloat { .. }
+            | Operation::VectorAddMac { .. }
+            | Operation::VectorSubMac { .. } => SlotIndex::Accumulator,
 
             // Memory load operations (Load slot)
             Operation::PointerAdd

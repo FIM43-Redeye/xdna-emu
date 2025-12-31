@@ -316,8 +316,17 @@ impl LatencyTable {
                 OperationKey::VectorCmp
             }
             // Matrix multiply operations - use MAC timing (multi-cycle)
+            // All convolution-related operations share MAC timing
             Operation::VectorMatMulDense { .. }
-            | Operation::VectorMatMulSparse { .. } => OperationKey::VectorMac,
+            | Operation::VectorMatMulSparse { .. }
+            | Operation::VectorMatMulSubDense { .. }
+            | Operation::VectorMatMulSubSparse { .. }
+            | Operation::VectorNegMatMulDense { .. }
+            | Operation::VectorNegMatMulSubDense { .. }
+            | Operation::VectorMatMulAccFloat { .. }
+            | Operation::VectorMatMulSubFloat { .. }
+            | Operation::VectorAddMac { .. }
+            | Operation::VectorSubMac { .. } => OperationKey::VectorMac,
             // Type conversion and move operations
             Operation::VectorSRS { .. }
             | Operation::VectorConvert { .. }

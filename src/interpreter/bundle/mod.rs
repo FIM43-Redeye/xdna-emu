@@ -316,6 +316,28 @@ fn disassemble_op(slot_op: &SlotOp) -> String {
             let w = if *wide { "wide" } else { "narrow" };
             return format!("vmul.sparse.{}.{}", w, element_suffix(*element_type))
         }
+        // Convolution-related matrix operations
+        Operation::VectorMatMulSubDense { element_type } => {
+            return format!("vmsc.dense.{}", element_suffix(*element_type))
+        }
+        Operation::VectorMatMulSubSparse { element_type, wide } => {
+            let w = if *wide { "wide" } else { "narrow" };
+            return format!("vmsc.sparse.{}.{}", w, element_suffix(*element_type))
+        }
+        Operation::VectorNegMatMulDense { element_type } => {
+            return format!("vnegmac.{}", element_suffix(*element_type))
+        }
+        Operation::VectorNegMatMulSubDense { element_type } => {
+            return format!("vnegmsc.{}", element_suffix(*element_type))
+        }
+        Operation::VectorMatMulAccFloat { .. } => "vmac.f",
+        Operation::VectorMatMulSubFloat { .. } => "vmsc.f",
+        Operation::VectorAddMac { element_type } => {
+            return format!("vaddmac.{}", element_suffix(*element_type))
+        }
+        Operation::VectorSubMac { element_type } => {
+            return format!("vsubmac.{}", element_suffix(*element_type))
+        }
         Operation::VectorSRS { from_type, to_type } => {
             return format!("vsrs.{}.{}", element_suffix(*from_type), element_suffix(*to_type))
         }

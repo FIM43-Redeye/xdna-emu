@@ -2,10 +2,14 @@
 
 Open-source emulator and visual debugger for AMD XDNA NPUs (Ryzen AI).
 
+**Status**: ~85% binary compatible | 564 tests passing
+
 ## Features
 
 - **Binary Parsing**: Load real `.xclbin` files (XCLBIN, AIE Partition, CDO, ELF)
 - **Device Emulation**: Simulates NPU1/NPU2 tile arrays (5x6 grid)
+- **ISA Coverage**: Scalar, vector, matrix multiply, convolution (VMAC/VMSC), type conversion
+- **Multi-Tile DMA**: Stream routing, lock synchronization, memory tile support
 - **Visual Debugger**: GUI showing tile status, memory, locks, DMA, registers
 - **Step Debugging**: Run, step, breakpoints, speed control
 

@@ -355,6 +355,51 @@ impl InstructionDecoder {
             Operation::VectorMul {
                 element_type: self.infer_element_type(&mnemonic),
             }
+        } else if mnemonic.starts_with("vaddmac") {
+            // Double accumulator: acc1 = acc1 + acc2 + A * B
+            Operation::VectorAddMac {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vaddmsc") {
+            // Double accumulator subtract variant
+            Operation::VectorAddMac {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vsubmac") {
+            // Double accumulator: acc1 = acc1 - acc2 + A * B
+            Operation::VectorSubMac {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vsubmsc") {
+            // Double accumulator subtract variant
+            Operation::VectorSubMac {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vnegmsc") {
+            // Negated matrix multiply-subtract: acc -= -(A * B)
+            Operation::VectorNegMatMulSubDense {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vnegmac") {
+            // Negated matrix multiply: acc += -(A * B)
+            Operation::VectorNegMatMulDense {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vmsc.f") || mnemonic.starts_with("vmsc_f") {
+            // BFloat16 matrix multiply-subtract
+            Operation::VectorMatMulSubFloat {
+                element_type: ElementType::BFloat16,
+            }
+        } else if mnemonic.starts_with("vmsc") {
+            // Matrix multiply-subtract (integer): acc -= A * B
+            Operation::VectorMatMulSubDense {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vmac.f") || mnemonic.starts_with("vmac_f") {
+            // BFloat16 matrix multiply-accumulate for CNN workloads
+            Operation::VectorMatMulAccFloat {
+                element_type: ElementType::BFloat16,
+            }
         } else if mnemonic.starts_with("vmac") {
             Operation::VectorMac {
                 element_type: self.infer_element_type(&mnemonic),

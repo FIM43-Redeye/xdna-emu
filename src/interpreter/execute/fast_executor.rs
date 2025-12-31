@@ -19,6 +19,7 @@ use crate::interpreter::traits::{ExecuteResult, Executor};
 use super::control::ControlUnit;
 use super::memory::MemoryUnit;
 use super::scalar::ScalarAlu;
+use super::stream::StreamOps;
 use super::vector::VectorAlu;
 
 /// Fast executor that executes bundles in a single cycle.
@@ -70,6 +71,10 @@ impl FastExecutor {
 
         if MemoryUnit::execute(op, ctx, tile) {
             return None; // Memory op handled
+        }
+
+        if StreamOps::execute(op, ctx, tile) {
+            return None; // Stream op handled
         }
 
         if let Some(result) = ControlUnit::execute(op, ctx, tile) {

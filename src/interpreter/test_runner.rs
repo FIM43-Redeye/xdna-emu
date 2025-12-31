@@ -1327,4 +1327,933 @@ mod tests {
         eprintln!("  Destination: tile ({},{}) @ 0x{:04X}", tile_c_col, tile_c_row, c_dst_offset);
         eprintln!("  Data size:   {} bytes (pattern starting 0xC0)", transfer_size);
     }
+
+    /// Helper function to execute a DMA transfer of a given size and verify correctness.
+    ///
+    /// This function:
+    /// 1. Initializes source memory with a known pattern based on the size
+    /// 2. Configures DMA descriptors for the specified length
+    /// 3. Executes transfer via MM2S -> stream routing -> S2MM
+    /// 4. Verifies destination matches source exactly
+    ///
+    /// Returns Ok(()) if transfer succeeded and data matches, Err with details otherwise.
+    fn run_dma_transfer_test(size: u32, pattern_seed: u8) -> Result<(), String> {
+        let mut runner = TestRunner::new();
+
+        // Source tile (0, 2) -> Destination tile (0, 3)
+        let src_col = 0u8;
+        let src_row = 2u8;
+        let dst_col = 0u8;
+        let dst_row = 3u8;
+
+        // DMA channel assignments
+        let mm2s_channel = 2u8;  // MM2S_0 on source
+        let s2mm_channel = 0u8;  // S2MM_0 on destination
+
+        // Memory offsets
+        let src_offset = 0x1000usize;
+        let dst_offset = 0x2000usize;
+
+        // Generate test pattern: each byte is (pattern_seed + index) mod 256
+        // This creates a recognizable pattern that varies with both position and seed
+        let test_data: Vec<u8> = (0..size)
+            .map(|i| pattern_seed.wrapping_add((i % 256) as u8))
+            .collect();
+
+        // Write source data to source tile memory
+        runner.write_tile_memory(src_col, src_row, src_offset, &test_data)
+            .map_err(|e| format!("Failed to write source memory: {}", e))?;
+
+        // Configure MM2S BD on source tile: read from src_offset
+        let mm2s_bd = BdConfig::simple_1d(src_offset as u64, size);
+        runner.configure_dma_bd(src_col, src_row, 0, mm2s_bd)
+            .map_err(|e| format!("Failed to configure MM2S BD: {}", e))?;
+
+        // Configure S2MM BD on destination tile: write to dst_offset
+        let s2mm_bd = BdConfig::simple_1d(dst_offset as u64, size);
+        runner.configure_dma_bd(dst_col, dst_row, 0, s2mm_bd)
+            .map_err(|e| format!("Failed to configure S2MM BD: {}", e))?;
+
+        // Configure stream routing: source tile MM2S -> dest tile S2MM
+        runner.engine.device_mut().array.stream_router.add_route(
+            src_col, src_row, mm2s_channel,
+            dst_col, dst_row, s2mm_channel,
+        );
+
+        // Start both DMA channels
+        runner.engine.device_mut().array.dma_engine_mut(src_col, src_row)
+            .ok_or_else(|| "Failed to get source DMA engine".to_string())?
+            .start_channel(mm2s_channel, 0)
+            .map_err(|e| format!("Failed to start MM2S channel: {}", e))?;
+
+        runner.engine.device_mut().array.dma_engine_mut(dst_col, dst_row)
+            .ok_or_else(|| "Failed to get destination DMA engine".to_string())?
+            .start_channel(s2mm_channel, 0)
+            .map_err(|e| format!("Failed to start S2MM channel: {}", e))?;
+
+        // Calculate cycles needed: allow for setup overhead plus per-byte transfer time
+        // Use a generous margin to ensure completion
+        let cycles_needed = 100 + (size as u64 * 2);
+        for _ in 0..cycles_needed {
+            runner.step();
+        }
+
+        // Read destination memory and verify
+        let result = runner.read_tile_memory(dst_col, dst_row, dst_offset, size as usize)
+            .map_err(|e| format!("Failed to read destination memory: {}", e))?;
+
+        // Compare byte-by-byte for detailed error reporting
+        if result.len() != test_data.len() {
+            return Err(format!(
+                "Length mismatch: expected {} bytes, got {} bytes",
+                test_data.len(), result.len()
+            ));
+        }
+
+        for (i, (expected, actual)) in test_data.iter().zip(result.iter()).enumerate() {
+            if expected != actual {
+                return Err(format!(
+                    "Data mismatch at byte {}: expected 0x{:02X}, got 0x{:02X}",
+                    i, expected, actual
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Test DMA transfers work correctly for various sizes.
+    ///
+    /// This test validates the DMA subsystem handles different transfer sizes:
+    /// - 4 bytes: minimum transfer size (single 32-bit word)
+    /// - 32 bytes: typical cache line size
+    /// - 256 bytes: standard small transfer
+    /// - 4096 bytes: page size, larger transfer
+    ///
+    /// For each size:
+    /// 1. Initialize source memory with a known pattern
+    /// 2. Configure DMA descriptor with that length
+    /// 3. Execute transfer via MM2S -> S2MM with stream routing
+    /// 4. Verify destination matches source exactly
+    #[test]
+    fn test_dma_transfer_sizes() {
+        // Test cases: (size in bytes, pattern seed, description)
+        let test_cases: Vec<(u32, u8, &str)> = vec![
+            (4, 0x10, "minimum (4 bytes)"),
+            (32, 0x20, "cache line (32 bytes)"),
+            (256, 0x30, "standard (256 bytes)"),
+            (4096, 0x40, "page size (4096 bytes)"),
+        ];
+
+        let mut passed = 0;
+        let mut failed = Vec::new();
+
+        for (size, seed, description) in &test_cases {
+            eprintln!("Testing DMA transfer: {}...", description);
+
+            match run_dma_transfer_test(*size, *seed) {
+                Ok(()) => {
+                    eprintln!("  PASS: {} bytes transferred correctly", size);
+                    passed += 1;
+                }
+                Err(e) => {
+                    eprintln!("  FAIL: {}", e);
+                    failed.push((*description, e));
+                }
+            }
+        }
+
+        eprintln!("\nDMA transfer size test summary: {}/{} passed", passed, test_cases.len());
+
+        // Assert all tests passed
+        assert!(
+            failed.is_empty(),
+            "DMA transfer tests failed:\n{}",
+            failed.iter()
+                .map(|(desc, err)| format!("  - {}: {}", desc, err))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// Test data flow from memory tile (row 1) to compute tile (row 2+).
+    ///
+    /// Memory tiles in AIE2 are specialized tiles at row 1 with:
+    /// - 512KB data memory (vs 64KB for compute tiles)
+    /// - 64 locks (vs 16 for compute tiles)
+    /// - 6 S2MM + 6 MM2S DMA channels (vs 2+2 for compute tiles)
+    /// - No program memory (no compute core)
+    ///
+    /// This test validates the memtile -> compute tile data path:
+    /// 1. Write data to memory tile (0,1) at address 0x1000
+    /// 2. Configure DMA on memtile to send data via MM2S (channel 6)
+    /// 3. Configure DMA on compute tile (0,2) to receive via S2MM (channel 0)
+    /// 4. Set up stream routing from memtile to compute tile
+    /// 5. Execute transfer
+    /// 6. Verify data arrived correctly at compute tile
+    ///
+    /// Key differences from compute-to-compute:
+    /// - Memory tiles use channel 6-11 for MM2S (vs 2-3 for compute)
+    /// - Memory tiles use channel 0-5 for S2MM (vs 0-1 for compute)
+    #[test]
+    fn test_memtile_to_compute_path() {
+        let mut runner = TestRunner::new();
+
+        // Memory tile at row 1, compute tile at row 2
+        let memtile_col = 0u8;
+        let memtile_row = 1u8;
+        let compute_col = 0u8;
+        let compute_row = 2u8;
+
+        // ============================================
+        // Phase 1: Verify tile types and properties
+        // ============================================
+
+        // Verify memtile is correctly identified
+        // Use array.tile() which returns &Tile directly (bounds are known valid)
+        let memtile = runner.engine.device().array.tile(memtile_col, memtile_row);
+        assert!(memtile.is_mem_tile(), "Tile at ({},{}) should be a memory tile", memtile_col, memtile_row);
+        eprintln!("Memory tile ({},{}) confirmed: 512KB memory, 64 locks, 12 DMA channels",
+            memtile_col, memtile_row);
+
+        // Check memory size is 512KB
+        let memtile_memory_size = memtile.data_memory().len();
+        assert_eq!(memtile_memory_size, 512 * 1024,
+            "Memory tile should have 512KB data memory, got {} bytes", memtile_memory_size);
+
+        // Verify compute tile
+        let compute_tile = runner.engine.device().array.tile(compute_col, compute_row);
+        assert!(compute_tile.is_compute(), "Tile at ({},{}) should be a compute tile", compute_col, compute_row);
+
+        // Verify DMA engine channel counts
+        let memtile_dma = runner.engine.device().array.dma_engine(memtile_col, memtile_row).unwrap();
+        assert_eq!(memtile_dma.num_channels(), 12,
+            "Memory tile should have 12 DMA channels (6 S2MM + 6 MM2S), got {}", memtile_dma.num_channels());
+
+        let compute_dma = runner.engine.device().array.dma_engine(compute_col, compute_row).unwrap();
+        assert_eq!(compute_dma.num_channels(), 4,
+            "Compute tile should have 4 DMA channels (2 S2MM + 2 MM2S), got {}", compute_dma.num_channels());
+
+        eprintln!("Tile properties verified: memtile={} channels, compute={} channels",
+            memtile_dma.num_channels(), compute_dma.num_channels());
+
+        // ============================================
+        // Phase 2: Set up test data
+        // ============================================
+
+        // Create test pattern: 256 bytes with recognizable pattern
+        let transfer_size = 256u32;
+        let test_data: Vec<u8> = (0..transfer_size).map(|i| ((0xD0 + i) % 256) as u8).collect();
+
+        // Memory offsets
+        let memtile_src_offset = 0x1000usize;
+        let compute_dst_offset = 0x2000usize;
+
+        // Write test data to memory tile
+        // Note: write_tile_memory uses TestRunner which handles memtile memory access
+        runner.write_tile_memory(memtile_col, memtile_row, memtile_src_offset, &test_data).unwrap();
+        eprintln!("Wrote {} bytes to memtile ({},{}) at offset 0x{:04X}",
+            test_data.len(), memtile_col, memtile_row, memtile_src_offset);
+
+        // ============================================
+        // Phase 3: Configure DMA buffer descriptors
+        // ============================================
+
+        // Memory tile DMA channels:
+        // - Channels 0-5: S2MM (stream to memory)
+        // - Channels 6-11: MM2S (memory to stream)
+        let memtile_mm2s_channel = 6u8;  // First MM2S channel on memtile
+
+        // Compute tile DMA channels:
+        // - Channels 0-1: S2MM (stream to memory)
+        // - Channels 2-3: MM2S (memory to stream)
+        let compute_s2mm_channel = 0u8;  // First S2MM channel on compute tile
+
+        // Configure MM2S BD on memtile: read from 0x1000, send to stream
+        let memtile_mm2s_bd = BdConfig::simple_1d(memtile_src_offset as u64, transfer_size);
+        runner.configure_dma_bd(memtile_col, memtile_row, 0, memtile_mm2s_bd).unwrap();
+        eprintln!("Configured memtile MM2S BD: addr=0x{:04X}, len={}", memtile_src_offset, transfer_size);
+
+        // Configure S2MM BD on compute tile: receive from stream, write to 0x2000
+        let compute_s2mm_bd = BdConfig::simple_1d(compute_dst_offset as u64, transfer_size);
+        runner.configure_dma_bd(compute_col, compute_row, 0, compute_s2mm_bd).unwrap();
+        eprintln!("Configured compute S2MM BD: addr=0x{:04X}, len={}", compute_dst_offset, transfer_size);
+
+        // ============================================
+        // Phase 4: Configure stream routing
+        // ============================================
+
+        // Route memtile MM2S output to compute tile S2MM input
+        // The channel number is used as the port identifier in the stream router
+        runner.engine.device_mut().array.stream_router.add_route(
+            memtile_col, memtile_row, memtile_mm2s_channel,
+            compute_col, compute_row, compute_s2mm_channel,
+        );
+        eprintln!("Stream route configured: ({},{}):{} -> ({},{}):{}",
+            memtile_col, memtile_row, memtile_mm2s_channel,
+            compute_col, compute_row, compute_s2mm_channel);
+
+        // ============================================
+        // Phase 5: Start DMA channels
+        // ============================================
+
+        // Start memtile MM2S channel with BD 0
+        runner.engine.device_mut().array.dma_engine_mut(memtile_col, memtile_row)
+            .unwrap()
+            .start_channel(memtile_mm2s_channel, 0)
+            .unwrap();
+        eprintln!("Started memtile MM2S channel {}", memtile_mm2s_channel);
+
+        // Start compute tile S2MM channel with BD 0
+        runner.engine.device_mut().array.dma_engine_mut(compute_col, compute_row)
+            .unwrap()
+            .start_channel(compute_s2mm_channel, 0)
+            .unwrap();
+        eprintln!("Started compute S2MM channel {}", compute_s2mm_channel);
+
+        // ============================================
+        // Phase 6: Execute transfer
+        // ============================================
+
+        // Step until transfer completes
+        // Allow enough cycles for 256 bytes (64 words) plus overhead
+        let max_cycles = 500;
+        for cycle in 0..max_cycles {
+            runner.step();
+
+            // Check if both channels have completed
+            let memtile_done = !runner.engine.device().array
+                .dma_engine(memtile_col, memtile_row)
+                .map_or(false, |e| e.channel_active(memtile_mm2s_channel));
+            let compute_done = !runner.engine.device().array
+                .dma_engine(compute_col, compute_row)
+                .map_or(false, |e| e.channel_active(compute_s2mm_channel));
+
+            if memtile_done && compute_done {
+                eprintln!("Transfer completed in {} cycles", cycle + 1);
+                break;
+            }
+
+            if cycle == max_cycles - 1 {
+                eprintln!("WARNING: Reached max cycles. Memtile done: {}, Compute done: {}",
+                    memtile_done, compute_done);
+            }
+        }
+
+        // ============================================
+        // Phase 7: Verify data transfer
+        // ============================================
+
+        // Read destination memory from compute tile
+        let received_data = runner.read_tile_memory(compute_col, compute_row, compute_dst_offset, transfer_size as usize).unwrap();
+
+        // Verify exact byte-for-byte match
+        assert_eq!(
+            received_data, test_data,
+            "Data mismatch in memtile -> compute transfer"
+        );
+
+        eprintln!("\nMemory tile to compute tile transfer test PASSED:");
+        eprintln!("  Source:      memtile ({},{}) @ 0x{:04X} (MM2S channel {})",
+            memtile_col, memtile_row, memtile_src_offset, memtile_mm2s_channel);
+        eprintln!("  Destination: compute ({},{}) @ 0x{:04X} (S2MM channel {})",
+            compute_col, compute_row, compute_dst_offset, compute_s2mm_channel);
+        eprintln!("  Data:        {} bytes transferred correctly (pattern starting 0xD0)",
+            transfer_size);
+        eprintln!("\nMemory tile properties validated:");
+        eprintln!("  - 512KB data memory");
+        eprintln!("  - 12 DMA channels (6 S2MM + 6 MM2S)");
+        eprintln!("  - Data flows correctly from memtile MM2S to compute S2MM");
+    }
+
+    /// Test lock-synchronized producer-consumer pattern between two tiles.
+    ///
+    /// This test validates the core lock synchronization mechanism for DMA transfers
+    /// where each tile uses its own local locks for DMA buffer synchronization:
+    ///
+    /// Pattern:
+    /// 1. Tile A (producer) at (0,2): DMA acquires local lock 0, reads data, releases lock
+    /// 2. Tile B (consumer) at (0,3): DMA acquires local lock 0, writes data, releases lock
+    ///
+    /// Lock protocol (per tile):
+    /// - Producer lock 0: initially 1 (buffer ready), DMA acquires (1->0), then releases (0->1)
+    /// - Consumer lock 0: initially 1 (buffer ready), DMA acquires (1->0), then releases (0->1)
+    ///
+    /// The streaming interface handles flow control between tiles, while locks
+    /// coordinate local buffer access (e.g., between DMA and core on same tile).
+    ///
+    /// This pattern is fundamental to AIE programming where:
+    /// - Locks guard local buffer access (DMA vs core)
+    /// - Streams handle inter-tile data flow
+    #[test]
+    fn test_lock_synchronized_producer_consumer() {
+        let mut runner = TestRunner::new();
+
+        // Tile coordinates: producer at (0,2), consumer at (0,3)
+        let producer_col = 0u8;
+        let producer_row = 2u8;
+        let consumer_col = 0u8;
+        let consumer_row = 3u8;
+
+        // Each tile uses its local lock 0 for DMA synchronization
+        let producer_lock_id = 0u8;
+        let consumer_lock_id = 0u8;
+
+        // DMA channels: MM2S channel 2 for producer output, S2MM channel 0 for consumer input
+        let mm2s_channel = 2u8;
+        let s2mm_channel = 0u8;
+
+        // Transfer configuration
+        let transfer_size = 128u32;
+        let producer_src_offset = 0x1000usize;
+        let consumer_dst_offset = 0x2000usize;
+
+        // Create test data pattern
+        let test_data: Vec<u8> = (0..transfer_size).map(|i| ((0x50 + i) % 256) as u8).collect();
+
+        // ============================================
+        // Phase 1: Initialize lock states on both tiles
+        // ============================================
+
+        // Producer tile: lock 0 = 1 (buffer is ready for DMA to read)
+        if let Some(tile) = runner.engine.device_mut().tile_mut(producer_col as usize, producer_row as usize) {
+            tile.locks[producer_lock_id as usize].set(1);
+        }
+        eprintln!("Producer lock {} initialized to 1 (buffer ready)", producer_lock_id);
+
+        // Consumer tile: lock 0 = 1 (buffer is ready for DMA to write)
+        if let Some(tile) = runner.engine.device_mut().tile_mut(consumer_col as usize, consumer_row as usize) {
+            tile.locks[consumer_lock_id as usize].set(1);
+        }
+        eprintln!("Consumer lock {} initialized to 1 (buffer ready)", consumer_lock_id);
+
+        // ============================================
+        // Phase 2: Producer writes data to its memory
+        // ============================================
+
+        // Write test data to producer's memory (simulating core writing to buffer)
+        runner.write_tile_memory(producer_col, producer_row, producer_src_offset, &test_data).unwrap();
+        eprintln!("Producer wrote {} bytes to offset 0x{:04X}", test_data.len(), producer_src_offset);
+
+        // ============================================
+        // Phase 3: Configure DMA with lock acquire/release
+        // ============================================
+
+        // Producer's MM2S BD: acquire lock 0, read from memory, release lock 0
+        // This simulates: DMA waits for buffer to be ready, reads it, signals done
+        let producer_bd = BdConfig::simple_1d(producer_src_offset as u64, transfer_size)
+            .with_acquire(producer_lock_id, 1)   // Acquire: wait for lock >= 1, decrement
+            .with_release(producer_lock_id, 1);  // Release: increment lock after transfer
+        runner.configure_dma_bd(producer_col, producer_row, 0, producer_bd).unwrap();
+
+        // Consumer's S2MM BD: acquire lock 0, write to memory, release lock 0
+        // This simulates: DMA waits for buffer to be available, writes to it, signals done
+        let consumer_bd = BdConfig::simple_1d(consumer_dst_offset as u64, transfer_size)
+            .with_acquire(consumer_lock_id, 1)   // Acquire: wait for lock >= 1, decrement
+            .with_release(consumer_lock_id, 1);  // Release: increment lock after transfer
+        runner.configure_dma_bd(consumer_col, consumer_row, 0, consumer_bd).unwrap();
+
+        // Configure stream routing: producer MM2S -> consumer S2MM
+        runner.engine.device_mut().array.stream_router.add_route(
+            producer_col, producer_row, mm2s_channel,
+            consumer_col, consumer_row, s2mm_channel,
+        );
+        eprintln!("Stream route configured: ({},{}):{} -> ({},{}):{}",
+            producer_col, producer_row, mm2s_channel,
+            consumer_col, consumer_row, s2mm_channel);
+
+        // ============================================
+        // Phase 4: Verify initial lock state
+        // ============================================
+
+        // Check that locks are in expected initial state
+        let producer_lock_initial = runner.engine.device()
+            .tile(producer_col as usize, producer_row as usize)
+            .map(|t| t.locks[producer_lock_id as usize].value)
+            .unwrap_or(255);
+        let consumer_lock_initial = runner.engine.device()
+            .tile(consumer_col as usize, consumer_row as usize)
+            .map(|t| t.locks[consumer_lock_id as usize].value)
+            .unwrap_or(255);
+        assert_eq!(producer_lock_initial, 1, "Producer lock should be 1 initially");
+        assert_eq!(consumer_lock_initial, 1, "Consumer lock should be 1 initially");
+        eprintln!("Initial lock states verified: producer={}, consumer={}",
+            producer_lock_initial, consumer_lock_initial);
+
+        // ============================================
+        // Phase 5: Start both DMA channels
+        // ============================================
+
+        // Start producer's MM2S channel (will acquire lock, read, release)
+        runner.engine.device_mut().array.dma_engine_mut(producer_col, producer_row)
+            .unwrap()
+            .start_channel(mm2s_channel, 0)
+            .unwrap();
+        eprintln!("Producer DMA started (acquire lock {}, read, release)", producer_lock_id);
+
+        // Start consumer's S2MM channel (will acquire lock, write, release)
+        runner.engine.device_mut().array.dma_engine_mut(consumer_col, consumer_row)
+            .unwrap()
+            .start_channel(s2mm_channel, 0)
+            .unwrap();
+        eprintln!("Consumer DMA started (acquire lock {}, write, release)", consumer_lock_id);
+
+        // ============================================
+        // Phase 6: Run until transfer completes
+        // ============================================
+
+        // Step the system until both transfers complete
+        let max_cycles = 500;
+        let mut completed_cycle = max_cycles;
+
+        for cycle in 0..max_cycles {
+            runner.step();
+
+            // Check if both channels are idle (transfers complete)
+            let producer_done = !runner.engine.device().array
+                .dma_engine(producer_col, producer_row)
+                .map_or(false, |e| e.channel_active(mm2s_channel));
+            let consumer_done = !runner.engine.device().array
+                .dma_engine(consumer_col, consumer_row)
+                .map_or(false, |e| e.channel_active(s2mm_channel));
+
+            if producer_done && consumer_done {
+                completed_cycle = cycle + 1;
+                eprintln!("Both transfers completed in {} cycles", completed_cycle);
+                break;
+            }
+
+            if cycle == max_cycles - 1 {
+                eprintln!("WARNING: Reached max cycles. Producer done: {}, Consumer done: {}",
+                    producer_done, consumer_done);
+            }
+        }
+
+        // ============================================
+        // Phase 7: Verify lock states after transfers
+        // ============================================
+
+        // After acquire(-1) and release(+1), locks should be back to 1
+        let producer_lock_final = runner.engine.device()
+            .tile(producer_col as usize, producer_row as usize)
+            .map(|t| t.locks[producer_lock_id as usize].value)
+            .unwrap_or(255);
+        let consumer_lock_final = runner.engine.device()
+            .tile(consumer_col as usize, consumer_row as usize)
+            .map(|t| t.locks[consumer_lock_id as usize].value)
+            .unwrap_or(255);
+        eprintln!("Final lock states: producer={}, consumer={}",
+            producer_lock_final, consumer_lock_final);
+
+        // Verify producer lock was properly acquired and released
+        assert_eq!(producer_lock_final, 1,
+            "Producer lock should be 1 after acquire+release cycle");
+
+        // Verify consumer lock was properly acquired and released
+        assert_eq!(consumer_lock_final, 1,
+            "Consumer lock should be 1 after acquire+release cycle");
+
+        // ============================================
+        // Phase 8: Verify data transfer
+        // ============================================
+
+        // Verify consumer received the correct data
+        let received_data = runner.read_tile_memory(consumer_col, consumer_row, consumer_dst_offset, transfer_size as usize).unwrap();
+        assert_eq!(
+            received_data, test_data,
+            "Consumer should have received the producer's data via stream transfer"
+        );
+
+        eprintln!("Lock-synchronized producer-consumer test passed:");
+        eprintln!("  Producer: tile ({},{}) @ 0x{:04X}, lock {} (1->0->1)",
+            producer_col, producer_row, producer_src_offset, producer_lock_id);
+        eprintln!("  Consumer: tile ({},{}) @ 0x{:04X}, lock {} (1->0->1)",
+            consumer_col, consumer_row, consumer_dst_offset, consumer_lock_id);
+        eprintln!("  Data:     {} bytes transferred correctly in {} cycles",
+            transfer_size, completed_cycle);
+    }
+
+    /// Test that loads and executes a real XCLBIN file.
+    ///
+    /// This test validates our parser and state application work with real binaries.
+    /// It exercises the complete loading pipeline:
+    /// 1. Parse XCLBIN container
+    /// 2. Extract AIE Partition section
+    /// 3. Find and parse CDO commands
+    /// 4. Apply CDO to device state
+    /// 5. Load ELF binaries into tiles
+    /// 6. Execute and report results
+    ///
+    /// The test is exploratory - it documents what works and what doesn't.
+    #[test]
+    fn test_execute_real_xclbin() {
+        use crate::parser::xclbin::{SectionKind, Xclbin};
+        use crate::parser::aie_partition::AiePartition;
+        use crate::parser::cdo::{find_cdo_offset, Cdo};
+        use crate::parser::MemoryRegion;
+        use crate::device::DeviceState;
+        use crate::interpreter::engine::InterpreterEngine;
+
+        eprintln!("\n=== Real XCLBIN Execution Test ===\n");
+
+        // Step 1: Locate XCLBIN files
+        // Try multiple potential locations for add_one kernel
+        let xclbin_candidates = [
+            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_objFifo/aie.xclbin",
+            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/aie.xclbin",
+            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_objFifo_elf/aie.xclbin",
+        ];
+
+        let xclbin_path = xclbin_candidates.iter()
+            .find(|p| std::path::Path::new(p).exists());
+
+        let xclbin_path = match xclbin_path {
+            Some(path) => *path,
+            None => {
+                eprintln!("SKIP: No XCLBIN files found. Checked:");
+                for path in &xclbin_candidates {
+                    eprintln!("  - {}", path);
+                }
+                eprintln!("\nTo enable this test, build mlir-aie tests with:");
+                eprintln!("  cd /home/triple/npu-work/mlir-aie/build");
+                eprintln!("  ninja check-aie");
+                return;
+            }
+        };
+
+        eprintln!("XCLBIN: {}", xclbin_path);
+
+        // Step 2: Parse XCLBIN container
+        let xclbin = match Xclbin::from_file(xclbin_path) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("ERROR: Failed to parse XCLBIN: {}", e);
+                panic!("XCLBIN parsing failed");
+            }
+        };
+
+        eprintln!("  UUID: {}", xclbin.uuid());
+        eprintln!("  Platform: {}", xclbin.platform());
+        eprintln!("  Sections: {}", xclbin.num_sections());
+
+        // List all sections
+        eprintln!("\n--- Sections ---");
+        for (i, section) in xclbin.sections().enumerate() {
+            eprintln!("  [{:2}] {:?} \"{}\" @ 0x{:x}, {} bytes",
+                i, section.kind, section.name(), section.offset, section.size());
+        }
+
+        // Step 3: Extract AIE Partition section
+        let aie_partition_section = xclbin.find_section(SectionKind::AiePartition);
+        let aie_partition_section = match aie_partition_section {
+            Some(s) => s,
+            None => {
+                eprintln!("ERROR: No AIE_PARTITION section found");
+                eprintln!("       This XCLBIN may not be for an NPU target");
+                panic!("Missing AIE_PARTITION");
+            }
+        };
+
+        eprintln!("\n--- AIE Partition ---");
+        eprintln!("  Size: {} bytes", aie_partition_section.size());
+
+        let aie_partition = match AiePartition::parse(aie_partition_section.data()) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("ERROR: Failed to parse AIE partition: {}", e);
+                panic!("AIE partition parsing failed");
+            }
+        };
+
+        eprintln!("  Column width: {}", aie_partition.column_width());
+        if let Some(name) = aie_partition.name() {
+            eprintln!("  Name: {}", name);
+        }
+        let start_cols = aie_partition.start_columns();
+        if !start_cols.is_empty() {
+            eprintln!("  Start columns: {:?}", start_cols);
+        }
+
+        // Get PDI images
+        let pdis: Vec<_> = aie_partition.pdis().collect();
+        eprintln!("  PDI count: {}", pdis.len());
+
+        if pdis.is_empty() {
+            eprintln!("ERROR: No PDI images in AIE partition");
+            panic!("No PDIs found");
+        }
+
+        // Step 4: Find and parse CDO within first PDI
+        let pdi = &pdis[0];
+        eprintln!("\n--- Primary PDI ---");
+        eprintln!("  UUID: {}", pdi.uuid);
+        eprintln!("  CDO type: {:?}", pdi.cdo_type);
+        eprintln!("  Image size: {} bytes", pdi.pdi_image.len());
+
+        let cdo_offset = match find_cdo_offset(pdi.pdi_image) {
+            Some(offset) => {
+                eprintln!("  CDO found at offset: 0x{:x}", offset);
+                offset
+            }
+            None => {
+                eprintln!("ERROR: No CDO magic found in PDI image");
+                eprintln!("       PDI may use a different format or be encrypted");
+                panic!("CDO not found");
+            }
+        };
+
+        let cdo = match Cdo::parse(&pdi.pdi_image[cdo_offset..]) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("ERROR: Failed to parse CDO: {}", e);
+                panic!("CDO parsing failed");
+            }
+        };
+
+        eprintln!("\n--- CDO Summary ---");
+        eprintln!("  Magic: {}", cdo.magic());
+        eprintln!("  Version: {:?}", cdo.version());
+        eprintln!("  Length: {} words ({} bytes)",
+            cdo.command_length_words(),
+            cdo.command_length_words() * 4);
+
+        // Count commands by type
+        let counts = cdo.command_counts();
+        eprintln!("  Command counts:");
+        let mut sorted: Vec<_> = counts.iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(a.1));
+        for (name, count) in sorted.iter().take(10) {
+            eprintln!("    {}: {}", name, count);
+        }
+
+        // Step 5: Apply CDO to device state
+        eprintln!("\n--- Applying CDO to Device State ---");
+        let mut device_state = DeviceState::new_npu1();
+        let cdo_stats_commands;
+        match device_state.apply_cdo(&cdo) {
+            Ok(()) => {
+                eprintln!("  Commands processed: {}", device_state.stats.commands);
+                eprintln!("  Writes: {}", device_state.stats.writes);
+                eprintln!("  Mask writes: {}", device_state.stats.mask_writes);
+                eprintln!("  DMA writes: {}", device_state.stats.dma_writes);
+                eprintln!("  Data bytes: {}", device_state.stats.data_bytes);
+                eprintln!("  Program bytes: {}", device_state.stats.program_bytes);
+                eprintln!("  Unknown: {}", device_state.stats.unknown);
+                cdo_stats_commands = device_state.stats.commands;
+            }
+            Err(e) => {
+                eprintln!("ERROR: Failed to apply CDO: {}", e);
+                panic!("CDO application failed");
+            }
+        }
+
+        // Step 6: Look for ELF files in the project directory
+        eprintln!("\n--- Looking for ELF files ---");
+
+        // The ELF path is typically in the .prj directory alongside the XCLBIN
+        let xclbin_dir = std::path::Path::new(xclbin_path).parent().unwrap();
+
+        let mut elf_files: Vec<std::path::PathBuf> = Vec::new();
+
+        // Search for ELF files using standard library
+        // Check common locations: *.elf in current dir and aie_arch.mlir.prj/*.elf
+        let search_dirs = [
+            xclbin_dir.to_path_buf(),
+            xclbin_dir.join("aie_arch.mlir.prj"),
+        ];
+
+        for dir in &search_dirs {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |ext| ext == "elf") {
+                        if !elf_files.contains(&path) {
+                            elf_files.push(path);
+                        }
+                    }
+                }
+            }
+        }
+
+        if elf_files.is_empty() {
+            eprintln!("  No ELF files found in project directory");
+            eprintln!("  Note: Some XCLBINs include ELFs embedded in CDO,");
+            eprintln!("        while others require separate ELF files.");
+        } else {
+            eprintln!("  Found {} ELF file(s):", elf_files.len());
+            for elf_path in &elf_files {
+                eprintln!("    - {}", elf_path.display());
+            }
+        }
+
+        // Step 7: Create interpreter engine and try execution
+        eprintln!("\n--- Creating Interpreter Engine ---");
+        let mut engine = InterpreterEngine::new(device_state);
+
+        // Check for enabled cores from CDO
+        let enabled_cores = engine.enabled_cores();
+        eprintln!("  Enabled cores from CDO: {}", enabled_cores);
+
+        // Load ELF files if found
+        let mut cores_loaded = 0;
+        for elf_path in &elf_files {
+            // Try to extract tile coordinates from filename (e.g., "main_core_0_2.elf")
+            let filename = elf_path.file_stem().unwrap().to_str().unwrap();
+            let coords = parse_elf_filename(filename);
+
+            if let Some((col, row)) = coords {
+                eprintln!("  Loading ELF to tile ({}, {}): {}", col, row, filename);
+
+                let elf_data = match std::fs::read(elf_path) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        eprintln!("    ERROR: Failed to read ELF: {}", e);
+                        continue;
+                    }
+                };
+
+                // Parse ELF
+                let elf = match crate::parser::AieElf::parse(&elf_data) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        eprintln!("    ERROR: Failed to parse ELF: {}", e);
+                        continue;
+                    }
+                };
+
+                eprintln!("    Entry point: 0x{:x}", elf.entry_point());
+
+                // Load into device
+                let tile = match engine.device_mut().tile_mut(col as usize, row as usize) {
+                    Some(t) => t,
+                    None => {
+                        eprintln!("    ERROR: Invalid tile ({}, {})", col, row);
+                        continue;
+                    }
+                };
+
+                // Load segments
+                for seg in elf.load_segments() {
+                    let vaddr = seg.vaddr as usize;
+                    let data = seg.data;
+
+                    match seg.region {
+                        MemoryRegion::Program => {
+                            tile.write_program(vaddr, data);
+                            eprintln!("    Loaded {} bytes to program memory @ 0x{:x}",
+                                data.len(), vaddr);
+                        }
+                        MemoryRegion::Data => {
+                            let dm_offset = vaddr.saturating_sub(0x00070000);
+                            let dm = tile.data_memory_mut();
+                            if dm_offset + data.len() <= dm.len() {
+                                dm[dm_offset..dm_offset + data.len()].copy_from_slice(data);
+                                eprintln!("    Loaded {} bytes to data memory @ 0x{:x}",
+                                    data.len(), dm_offset);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Set entry point and enable core
+                engine.set_core_pc(col as usize, row as usize, elf.entry_point());
+                engine.enable_core(col as usize, row as usize);
+                cores_loaded += 1;
+            }
+        }
+
+        if cores_loaded > 0 {
+            eprintln!("  Loaded {} cores from ELF files", cores_loaded);
+        }
+
+        // Step 8: Attempt execution
+        eprintln!("\n--- Execution Attempt ---");
+
+        let total_enabled = engine.enabled_cores();
+        if total_enabled == 0 {
+            eprintln!("  No cores enabled - cannot execute");
+            eprintln!("\n  Analysis:");
+            eprintln!("  - CDO applied successfully ({} commands)", cdo_stats_commands);
+            eprintln!("  - No cores were enabled by CDO or ELF loading");
+            eprintln!("  - This may be expected for some XCLBIN types");
+            eprintln!("\n  Possible reasons:");
+            eprintln!("  - XCLBINs using DMA-only execution (no core code)");
+            eprintln!("  - Core enable happens at runtime via XRT");
+            eprintln!("  - Missing ELF files");
+            return;
+        }
+
+        eprintln!("  Enabled cores: {}", total_enabled);
+
+        // Try stepping execution
+        let max_steps = 100;
+        let mut step = 0;
+        let mut halted = false;
+        let mut error_encountered = false;
+
+        while step < max_steps && !halted && !error_encountered {
+            engine.step();
+
+            let status = engine.status();
+            match status {
+                crate::interpreter::engine::EngineStatus::Halted => {
+                    halted = true;
+                    eprintln!("  Step {}: All cores halted", step);
+                }
+                crate::interpreter::engine::EngineStatus::Error => {
+                    error_encountered = true;
+                    eprintln!("  Step {}: Engine error", step);
+                }
+                _ => {}
+            }
+            step += 1;
+        }
+
+        eprintln!("\n--- Execution Result ---");
+        eprintln!("  Steps executed: {}", step);
+        eprintln!("  Total cycles: {}", engine.total_cycles());
+        eprintln!("  Final status: {:?}", engine.status());
+
+        if error_encountered {
+            eprintln!("\n  NOTE: Error indicates an unimplemented instruction or feature.");
+            eprintln!("        Check decoder coverage for the specific instruction.");
+        }
+
+        if halted {
+            eprintln!("\n  SUCCESS: Execution completed normally.");
+        } else if !error_encountered {
+            eprintln!("\n  NOTE: Execution did not complete within {} steps.", max_steps);
+            eprintln!("        The kernel may require DMA/lock synchronization.");
+        }
+
+        eprintln!("\n=== End Real XCLBIN Execution Test ===\n");
+    }
+
+    /// Parse ELF filename to extract tile coordinates.
+    /// Expected format: "main_core_X_Y.elf" where X is column and Y is row.
+    fn parse_elf_filename(filename: &str) -> Option<(u8, u8)> {
+        // Look for pattern like "_core_X_Y" or just "_X_Y"
+        let parts: Vec<&str> = filename.split('_').collect();
+
+        // Try to find "core" followed by two numbers
+        for i in 0..parts.len().saturating_sub(2) {
+            if parts[i] == "core" {
+                if let (Ok(col), Ok(row)) = (parts[i+1].parse::<u8>(), parts[i+2].parse::<u8>()) {
+                    return Some((col, row));
+                }
+            }
+        }
+
+        // Fallback: try last two parts as numbers
+        if parts.len() >= 2 {
+            let last = parts[parts.len() - 1];
+            let second_last = parts[parts.len() - 2];
+            if let (Ok(col), Ok(row)) = (second_last.parse::<u8>(), last.parse::<u8>()) {
+                return Some((col, row));
+            }
+        }
+
+        None
+    }
 }

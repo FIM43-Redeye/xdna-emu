@@ -111,6 +111,76 @@ impl VectorAlu {
                 true
             }
 
+            // ========== Convolution-Related Operations (VMSC/VNEGMAC variants) ==========
+
+            Operation::VectorMatMulSubDense { element_type } => {
+                // Matrix multiply-subtract: acc -= A * B
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let acc_reg = Self::get_acc_dest(op);
+                Self::vector_matmul_sub(ctx, acc_reg, &a, &b, *element_type);
+                true
+            }
+
+            Operation::VectorMatMulSubSparse { element_type, .. } => {
+                // Sparse matrix multiply-subtract (treat as dense for now)
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let acc_reg = Self::get_acc_dest(op);
+                Self::vector_matmul_sub(ctx, acc_reg, &a, &b, *element_type);
+                true
+            }
+
+            Operation::VectorNegMatMulDense { element_type } => {
+                // Negated matrix multiply: acc += -(A * B)
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let acc_reg = Self::get_acc_dest(op);
+                Self::vector_neg_matmul(ctx, acc_reg, &a, &b, *element_type);
+                true
+            }
+
+            Operation::VectorNegMatMulSubDense { element_type } => {
+                // Negated matrix multiply-subtract: acc -= -(A * B) = acc + (A * B)
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let acc_reg = Self::get_acc_dest(op);
+                // Note: acc -= -(A*B) is equivalent to acc += (A*B), same as dense
+                Self::vector_matmul_dense(ctx, acc_reg, &a, &b, *element_type);
+                true
+            }
+
+            Operation::VectorMatMulAccFloat { .. } => {
+                // BFloat16 matrix multiply-accumulate for CNN workloads
+                // Operands are bf16, accumulator is fp32
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let acc_reg = Self::get_acc_dest(op);
+                Self::vector_matmul_bf16(ctx, acc_reg, &a, &b, true);
+                true
+            }
+
+            Operation::VectorMatMulSubFloat { .. } => {
+                // BFloat16 matrix multiply-subtract for CNN workloads
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let acc_reg = Self::get_acc_dest(op);
+                Self::vector_matmul_bf16(ctx, acc_reg, &a, &b, false);
+                true
+            }
+
+            Operation::VectorAddMac { element_type } => {
+                // Double accumulator: acc1 = acc1 + acc2 + A * B
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let acc_reg = Self::get_acc_dest(op);
+                let acc2_reg = Self::get_acc_source(op);
+                Self::vector_double_acc_mac(ctx, acc_reg, acc2_reg, &a, &b, *element_type, true);
+                true
+            }
+
+            Operation::VectorSubMac { element_type } => {
+                // Double accumulator: acc1 = acc1 - acc2 + A * B
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let acc_reg = Self::get_acc_dest(op);
+                let acc2_reg = Self::get_acc_source(op);
+                Self::vector_double_acc_mac(ctx, acc_reg, acc2_reg, &a, &b, *element_type, false);
+                true
+            }
+
             Operation::VectorSRS { from_type, to_type } => {
                 // Shift-Round-Saturate: convert accumulator to vector
                 let acc_reg = Self::get_acc_source(op);
@@ -296,6 +366,208 @@ impl VectorAlu {
                     new_acc[i] = (current_f + fa * fb).to_bits();
                 }
                 ctx.accumulator.write(acc_reg, new_acc);
+            }
+        }
+    }
+
+    /// Matrix multiply-subtract (VMSC): acc -= A * B
+    ///
+    /// Used for convolution operations where subtraction is needed.
+    fn vector_matmul_sub(
+        ctx: &mut ExecutionContext,
+        acc_reg: u8,
+        a: &[u32; 8],
+        b: &[u32; 8],
+        elem_type: ElementType,
+    ) {
+        let current = ctx.accumulator.read(acc_reg);
+
+        match elem_type {
+            ElementType::Int8 | ElementType::UInt8 => {
+                let mut new_acc = current;
+                for i in 0..8 {
+                    let mut acc = current[i];
+                    for byte_idx in 0..4 {
+                        let a_byte = ((a[i] >> (byte_idx * 8)) & 0xFF) as u8;
+                        let b_byte = ((b[i] >> (byte_idx * 8)) & 0xFF) as u8;
+                        let prod = if matches!(elem_type, ElementType::Int8) {
+                            (a_byte as i8 as i64) * (b_byte as i8 as i64)
+                        } else {
+                            (a_byte as i64) * (b_byte as i64)
+                        };
+                        acc = acc.wrapping_sub(prod as u64);
+                    }
+                    new_acc[i] = acc;
+                }
+                ctx.accumulator.write(acc_reg, new_acc);
+            }
+            ElementType::Int16 | ElementType::UInt16 => {
+                let mut new_acc = current;
+                for i in 0..8 {
+                    let a_lo = (a[i] & 0xFFFF) as i16 as i32;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as i16 as i32;
+                    let b_lo = (b[i] & 0xFFFF) as i16 as i32;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as i16 as i32;
+                    new_acc[i] = current[i]
+                        .wrapping_sub((a_lo * b_lo) as u64)
+                        .wrapping_sub((a_hi * b_hi) as u64);
+                }
+                ctx.accumulator.write(acc_reg, new_acc);
+            }
+            ElementType::BFloat16 => {
+                let mut new_acc = current;
+                for i in 0..8 {
+                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16) as f64;
+                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16) as f64;
+                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16) as f64;
+                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16) as f64;
+                    let current_f = f64::from_bits(current[i]);
+                    new_acc[i] = (current_f - a_lo * b_lo - a_hi * b_hi).to_bits();
+                }
+                ctx.accumulator.write(acc_reg, new_acc);
+            }
+            ElementType::Int32 | ElementType::UInt32 => {
+                let mut new_acc = current;
+                for i in 0..8 {
+                    let prod = (a[i] as u64) * (b[i] as u64);
+                    new_acc[i] = current[i].wrapping_sub(prod);
+                }
+                ctx.accumulator.write(acc_reg, new_acc);
+            }
+            ElementType::Float32 => {
+                let mut new_acc = current;
+                for i in 0..8 {
+                    let fa = f32::from_bits(a[i]) as f64;
+                    let fb = f32::from_bits(b[i]) as f64;
+                    let current_f = f64::from_bits(current[i]);
+                    new_acc[i] = (current_f - fa * fb).to_bits();
+                }
+                ctx.accumulator.write(acc_reg, new_acc);
+            }
+        }
+    }
+
+    /// Negated matrix multiply (VNEGMAC): acc += -(A * B)
+    ///
+    /// Adds the negated product to the accumulator.
+    fn vector_neg_matmul(
+        ctx: &mut ExecutionContext,
+        acc_reg: u8,
+        a: &[u32; 8],
+        b: &[u32; 8],
+        elem_type: ElementType,
+    ) {
+        // VNEGMAC: acc += -(A * B) is the same as acc -= A * B
+        Self::vector_matmul_sub(ctx, acc_reg, a, b, elem_type);
+    }
+
+    /// BFloat16 matrix multiply-accumulate for CNN workloads (VMAC.f/VMSC.f)
+    ///
+    /// Operands are BFloat16, accumulator is Float32 for higher precision.
+    /// This is the key instruction for neural network inference.
+    fn vector_matmul_bf16(
+        ctx: &mut ExecutionContext,
+        acc_reg: u8,
+        a: &[u32; 8],
+        b: &[u32; 8],
+        accumulate: bool, // true for VMAC.f, false for VMSC.f
+    ) {
+        let current = ctx.accumulator.read(acc_reg);
+        let mut new_acc = current;
+
+        // Each u32 contains 2 bf16 values (16 bf16 total in 256-bit vector)
+        // Accumulator holds 8 x f32 values (as f64 for precision)
+        for i in 0..8 {
+            let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16) as f64;
+            let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16) as f64;
+            let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16) as f64;
+            let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16) as f64;
+            let current_f = f64::from_bits(current[i]);
+
+            let product_sum = a_lo * b_lo + a_hi * b_hi;
+            if accumulate {
+                new_acc[i] = (current_f + product_sum).to_bits();
+            } else {
+                new_acc[i] = (current_f - product_sum).to_bits();
+            }
+        }
+
+        ctx.accumulator.write(acc_reg, new_acc);
+    }
+
+    /// Double accumulator MAC (VADDMAC/VSUBMAC): acc1 = acc1 +/- acc2 + A * B
+    ///
+    /// These fused operations combine accumulator arithmetic with matrix multiply.
+    fn vector_double_acc_mac(
+        ctx: &mut ExecutionContext,
+        acc1_reg: u8,
+        acc2_reg: u8,
+        a: &[u32; 8],
+        b: &[u32; 8],
+        elem_type: ElementType,
+        add_acc2: bool, // true for VADDMAC, false for VSUBMAC
+    ) {
+        let acc1 = ctx.accumulator.read(acc1_reg);
+        let acc2 = ctx.accumulator.read(acc2_reg);
+
+        match elem_type {
+            ElementType::Int32 | ElementType::UInt32 => {
+                let mut new_acc = [0u64; 8];
+                for i in 0..8 {
+                    let prod = (a[i] as u64) * (b[i] as u64);
+                    let acc2_contrib = if add_acc2 {
+                        acc2[i]
+                    } else {
+                        0u64.wrapping_sub(acc2[i])
+                    };
+                    new_acc[i] = acc1[i].wrapping_add(acc2_contrib).wrapping_add(prod);
+                }
+                ctx.accumulator.write(acc1_reg, new_acc);
+            }
+            ElementType::BFloat16 | ElementType::Float32 => {
+                let mut new_acc = [0u64; 8];
+                for i in 0..8 {
+                    let (a_lo, a_hi, b_lo, b_hi) = if matches!(elem_type, ElementType::BFloat16) {
+                        (
+                            Self::bf16_to_f32((a[i] & 0xFFFF) as u16) as f64,
+                            Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16) as f64,
+                            Self::bf16_to_f32((b[i] & 0xFFFF) as u16) as f64,
+                            Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16) as f64,
+                        )
+                    } else {
+                        (
+                            f32::from_bits(a[i]) as f64,
+                            0.0,
+                            f32::from_bits(b[i]) as f64,
+                            0.0,
+                        )
+                    };
+
+                    let acc1_f = f64::from_bits(acc1[i]);
+                    let acc2_f = f64::from_bits(acc2[i]);
+                    let product = a_lo * b_lo + a_hi * b_hi;
+
+                    let result = if add_acc2 {
+                        acc1_f + acc2_f + product
+                    } else {
+                        acc1_f - acc2_f + product
+                    };
+                    new_acc[i] = result.to_bits();
+                }
+                ctx.accumulator.write(acc1_reg, new_acc);
+            }
+            _ => {
+                // For other types, fall back to simple accumulate
+                let mut new_acc = acc1;
+                for i in 0..8 {
+                    let acc2_contrib = if add_acc2 {
+                        acc2[i]
+                    } else {
+                        0u64.wrapping_sub(acc2[i])
+                    };
+                    new_acc[i] = acc1[i].wrapping_add(acc2_contrib);
+                }
+                ctx.accumulator.write(acc1_reg, new_acc);
             }
         }
     }
