@@ -355,6 +355,45 @@ impl InstructionDecoder {
             Operation::VectorMul {
                 element_type: self.infer_element_type(&mnemonic),
             }
+        // ========== Conditional Vector Operations ==========
+        } else if mnemonic.starts_with("vabs_gtz") || mnemonic.starts_with("vabs.gtz") {
+            // Absolute value if greater than zero (ReLU-like)
+            Operation::VectorAbsGtz {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vneg_gtz") || mnemonic.starts_with("vneg.gtz") {
+            // Negate if greater than zero
+            Operation::VectorNegGtz {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vbneg_ltz")
+            || mnemonic.starts_with("vneg_ltz")
+            || mnemonic.starts_with("vneg.ltz")
+        {
+            // Negate if less than zero (abs)
+            Operation::VectorNegLtz {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vacc") && !mnemonic.starts_with("vaccum") {
+            // Vector accumulate (add to accumulator without multiply)
+            Operation::VectorAccumulate {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vneg") && !mnemonic.contains("mac") && !mnemonic.contains("msc") && !mnemonic.contains("_gtz") && !mnemonic.contains("_ltz") && !mnemonic.contains(".gtz") && !mnemonic.contains(".ltz") {
+            // Vector negate (must check after vnegmac/vnegmsc)
+            if mnemonic.contains("add") || mnemonic.starts_with("vnegadd") {
+                Operation::VectorNegAdd {
+                    element_type: self.infer_element_type(&mnemonic),
+                }
+            } else if mnemonic.contains("mul") || mnemonic.starts_with("vnegmul") {
+                Operation::VectorNegMul {
+                    element_type: self.infer_element_type(&mnemonic),
+                }
+            } else {
+                Operation::VectorNegate {
+                    element_type: self.infer_element_type(&mnemonic),
+                }
+            }
         } else if mnemonic.starts_with("vaddmac") {
             // Double accumulator: acc1 = acc1 + acc2 + A * B
             Operation::VectorAddMac {
@@ -452,9 +491,18 @@ impl InstructionDecoder {
             Operation::ScalarEq
         } else if mnemonic == "ne" || mnemonic.starts_with("ne.") {
             Operation::ScalarNe
+        } else if mnemonic.starts_with("seleqz") || mnemonic.starts_with("sel.eqz") {
+            Operation::ScalarSelEqz
+        } else if mnemonic.starts_with("selnez") || mnemonic.starts_with("sel.nez") {
+            Operation::ScalarSelNez
         } else if mnemonic.starts_with("sel") {
-            // sel, sel.eqz, sel.nez, etc.
             Operation::ScalarSel
+        } else if mnemonic == "divs" || mnemonic.starts_with("divs.") {
+            Operation::ScalarDiv
+        } else if mnemonic == "divu" || mnemonic.starts_with("divu.") {
+            Operation::ScalarDivu
+        } else if mnemonic == "mod" || mnemonic.starts_with("mod.") {
+            Operation::ScalarMod
         // ========== Additional Scalar Operations ==========
         } else if mnemonic == "abs" || mnemonic.starts_with("abs.") {
             Operation::ScalarAbs
@@ -536,6 +584,57 @@ impl InstructionDecoder {
         {
             // Read from slave stream to scalar
             Operation::StreamReadScalar { blocking: true }
+        // ========== Vector Element Operations ==========
+        } else if mnemonic.starts_with("vext") || mnemonic.starts_with("vextract") {
+            // Extract element from vector
+            Operation::VectorExtract {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vins") || mnemonic.starts_with("vinsert") {
+            // Insert element into vector
+            Operation::VectorInsert {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vsel") {
+            // Vector per-lane select
+            Operation::VectorSelect {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vclr") || mnemonic == "vclr" {
+            // Clear vector register
+            Operation::VectorClear
+        } else if mnemonic.starts_with("vbcst") || mnemonic.starts_with("vbroadcast") {
+            // Broadcast scalar to vector
+            Operation::VectorBroadcast {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        // ========== Vector Shift Operations ==========
+        } else if mnemonic.starts_with("vshl") {
+            // Vector left shift
+            Operation::VectorShiftLeft {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vshr") || mnemonic.starts_with("vlsr") {
+            // Vector logical right shift
+            Operation::VectorShiftRight {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vasr") {
+            // Vector arithmetic right shift
+            Operation::VectorArithShiftRight {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("valign") {
+            // Vector align
+            Operation::VectorAlign {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vups") || mnemonic.starts_with("vupshift") {
+            // Vector upshift for precision scaling
+            Operation::VectorUpshift {
+                from_type: self.infer_element_type(&mnemonic),
+                to_type: self.infer_element_type(&mnemonic),
+            }
         } else {
             Operation::Unknown {
                 opcode: decoded.operands.get("word0").copied().unwrap_or(0) as u32,

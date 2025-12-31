@@ -77,6 +77,13 @@ pub const LATENCY_SCALAR_CMP: u8 = 1;
 /// Scalar multiply (32x32): 2 cycles (AM020 Ch4)
 pub const LATENCY_SCALAR_MUL: u8 = 2;
 
+/// Scalar division: 6 cycles (iterative algorithm estimate)
+/// AIE2 uses iterative division, not a hardware divider.
+pub const LATENCY_SCALAR_DIV: u8 = 6;
+
+/// Scalar select: 1 cycle (conditional move)
+pub const LATENCY_SCALAR_SEL: u8 = 1;
+
 /// Scalar move: 1 cycle
 pub const LATENCY_SCALAR_MOV: u8 = 1;
 
@@ -163,6 +170,8 @@ pub enum OperationKey {
     ScalarSra,
     ScalarMov,
     ScalarCmp,
+    ScalarDiv,
+    ScalarSel,
     Load,
     Store,
     Branch,
@@ -204,6 +213,8 @@ impl LatencyTable {
         table.set(OperationKey::ScalarSra, OperationTiming::simple(LATENCY_SCALAR_SHIFT));
         table.set(OperationKey::ScalarMov, OperationTiming::simple(LATENCY_SCALAR_MOV));
         table.set(OperationKey::ScalarCmp, OperationTiming::simple(LATENCY_SCALAR_CMP));
+        table.set(OperationKey::ScalarDiv, OperationTiming::with_throughput(LATENCY_SCALAR_DIV, 6));
+        table.set(OperationKey::ScalarSel, OperationTiming::simple(LATENCY_SCALAR_SEL));
 
         // Memory operations
         table.set(OperationKey::Load, OperationTiming::simple(LATENCY_MEMORY));
@@ -286,6 +297,10 @@ impl LatencyTable {
             | Operation::ScalarExtendU8
             | Operation::ScalarExtendU16 => OperationKey::ScalarAdd, // Single-cycle scalar ops
             Operation::ScalarAdc | Operation::ScalarSbc => OperationKey::ScalarAdd, // Same as add/sub
+            // Division operations - multi-cycle
+            Operation::ScalarDiv | Operation::ScalarDivu | Operation::ScalarMod => OperationKey::ScalarDiv,
+            // Select operations - single cycle
+            Operation::ScalarSelEqz | Operation::ScalarSelNez => OperationKey::ScalarSel,
             // Comparison operations have same timing as compare
             Operation::ScalarLt
             | Operation::ScalarLtu
@@ -331,6 +346,29 @@ impl LatencyTable {
             Operation::VectorSRS { .. }
             | Operation::VectorConvert { .. }
             | Operation::VectorMov { .. } => OperationKey::VectorAdd, // Similar to vector ALU
+            // Vector element operations - single/double cycle
+            Operation::VectorExtract { .. }
+            | Operation::VectorInsert { .. }
+            | Operation::VectorSelect { .. }
+            | Operation::VectorClear
+            | Operation::VectorBroadcast { .. } => OperationKey::VectorAdd,
+            // Vector shift operations
+            Operation::VectorShiftLeft { .. }
+            | Operation::VectorShiftRight { .. }
+            | Operation::VectorArithShiftRight { .. } => OperationKey::VectorAdd,
+            // Align is similar to shuffle (concatenate and shift)
+            Operation::VectorAlign { .. } => OperationKey::VectorShuffle,
+            // Upshift for precision scaling
+            Operation::VectorUpshift { .. } => OperationKey::VectorAdd,
+            // Conditional vector operations - use simple vector ALU timing (2 cycles)
+            Operation::VectorAbsGtz { .. }
+            | Operation::VectorNegGtz { .. }
+            | Operation::VectorNegLtz { .. }
+            | Operation::VectorNegate { .. }
+            | Operation::VectorNegAdd { .. } => OperationKey::VectorAdd,
+            // Accumulator operations use MAC timing
+            Operation::VectorAccumulate { .. }
+            | Operation::VectorNegMul { .. } => OperationKey::VectorMac,
             // Vector memory operations
             Operation::VectorLoadA { .. }
             | Operation::VectorLoadB { .. }

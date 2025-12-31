@@ -290,6 +290,11 @@ fn disassemble_op(slot_op: &SlotOp) -> String {
         Operation::ScalarEq => "eq",
         Operation::ScalarNe => "ne",
         Operation::ScalarSel => "sel",
+        Operation::ScalarSelEqz => "sel.eqz",
+        Operation::ScalarSelNez => "sel.nez",
+        Operation::ScalarDiv => "divs",
+        Operation::ScalarDivu => "divu",
+        Operation::ScalarMod => "mod",
 
         Operation::VectorAdd { element_type } => {
             return format!("vadd.{}", element_suffix(*element_type))
@@ -346,6 +351,61 @@ fn disassemble_op(slot_op: &SlotOp) -> String {
         }
         Operation::VectorMov { element_type } => {
             return format!("vmov.{}", element_suffix(*element_type))
+        }
+
+        // Vector element operations
+        Operation::VectorExtract { element_type } => {
+            return format!("vext.{}", element_suffix(*element_type))
+        }
+        Operation::VectorInsert { element_type } => {
+            return format!("vins.{}", element_suffix(*element_type))
+        }
+        Operation::VectorSelect { element_type } => {
+            return format!("vsel.{}", element_suffix(*element_type))
+        }
+        Operation::VectorClear => "vclr",
+        Operation::VectorBroadcast { element_type } => {
+            return format!("vbcst.{}", element_suffix(*element_type))
+        }
+
+        // Vector shift operations
+        Operation::VectorShiftLeft { element_type } => {
+            return format!("vshl.{}", element_suffix(*element_type))
+        }
+        Operation::VectorShiftRight { element_type } => {
+            return format!("vshr.{}", element_suffix(*element_type))
+        }
+        Operation::VectorArithShiftRight { element_type } => {
+            return format!("vasr.{}", element_suffix(*element_type))
+        }
+        Operation::VectorAlign { element_type } => {
+            return format!("valign.{}", element_suffix(*element_type))
+        }
+        Operation::VectorUpshift { from_type, to_type } => {
+            return format!("vups.{}.{}", element_suffix(*from_type), element_suffix(*to_type))
+        }
+
+        // Conditional vector operations
+        Operation::VectorAbsGtz { element_type } => {
+            return format!("vabs_gtz.{}", element_suffix(*element_type))
+        }
+        Operation::VectorNegGtz { element_type } => {
+            return format!("vneg_gtz.{}", element_suffix(*element_type))
+        }
+        Operation::VectorNegLtz { element_type } => {
+            return format!("vneg_ltz.{}", element_suffix(*element_type))
+        }
+        Operation::VectorAccumulate { element_type } => {
+            return format!("vacc.{}", element_suffix(*element_type))
+        }
+        Operation::VectorNegate { element_type } => {
+            return format!("vneg.{}", element_suffix(*element_type))
+        }
+        Operation::VectorNegAdd { element_type } => {
+            return format!("vnegadd.{}", element_suffix(*element_type))
+        }
+        Operation::VectorNegMul { element_type } => {
+            return format!("vnegmul.{}", element_suffix(*element_type))
         }
 
         Operation::PointerAdd => "padd",

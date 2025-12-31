@@ -205,6 +205,159 @@ impl VectorAlu {
                 true
             }
 
+            // ========== Vector Element Operations ==========
+
+            Operation::VectorExtract { element_type } => {
+                // Extract single element from vector to scalar
+                // dst_scalar = src_vector[index]
+                let src = Self::get_vector_source(op, ctx, 0);
+                let index = Self::get_lane_index(op, ctx);
+                let result = Self::vector_extract(&src, index, *element_type);
+                Self::write_scalar_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorInsert { element_type } => {
+                // Insert scalar into vector lane
+                // dst_vector[index] = src_scalar; other lanes from src_vector
+                let mut dst = Self::get_vector_dest_value(op, ctx);
+                let value = Self::get_scalar_source(op, ctx);
+                let index = Self::get_lane_index(op, ctx);
+                Self::vector_insert(&mut dst, value, index, *element_type);
+                Self::write_vector_dest(op, ctx, dst);
+                true
+            }
+
+            Operation::VectorSelect { element_type } => {
+                // Per-lane conditional select: dst[i] = sel[i] ? a[i] : b[i]
+                // vector_select takes (mask, src_if_true, src_if_false)
+                // Source order: mask, true_val, false_val
+                let sel = Self::get_vector_source(op, ctx, 0);
+                let a = Self::get_vector_source(op, ctx, 1);
+                let b = Self::get_vector_source(op, ctx, 2);
+                let result = Self::vector_select(&sel, &a, &b, *element_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorClear => {
+                // Clear vector register to zero
+                Self::write_vector_dest(op, ctx, [0u32; 8]);
+                true
+            }
+
+            Operation::VectorBroadcast { element_type } => {
+                // Broadcast scalar value to all vector lanes
+                let value = Self::get_scalar_source(op, ctx);
+                let result = Self::vector_broadcast(value, *element_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            // ========== Vector Shift Operations ==========
+
+            Operation::VectorShiftLeft { element_type } => {
+                // Vector logical left shift: dst[i] = a[i] << shift[i]
+                let (a, shift) = Self::get_two_vector_sources(op, ctx);
+                let result = Self::vector_shift_left(&a, &shift, *element_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorShiftRight { element_type } => {
+                // Vector logical right shift: dst[i] = a[i] >> shift[i]
+                let (a, shift) = Self::get_two_vector_sources(op, ctx);
+                let result = Self::vector_shift_right_logical(&a, &shift, *element_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorArithShiftRight { element_type } => {
+                // Vector arithmetic right shift: dst[i] = (signed)a[i] >> shift[i]
+                let (a, shift) = Self::get_two_vector_sources(op, ctx);
+                let result = Self::vector_shift_right_arith(&a, &shift, *element_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorAlign { .. } => {
+                // Vector align: concatenate two vectors and shift
+                // Result = (src1 || src2) >> (shift * element_size)
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let shift = Self::get_lane_index(op, ctx);
+                let result = Self::vector_align(&a, &b, shift);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorUpshift { from_type, to_type } => {
+                // Vector upshift: shift left with saturation for precision scaling
+                let src = Self::get_vector_source(op, ctx, 0);
+                let shift = Self::get_lane_index(op, ctx);
+                let result = Self::vector_upshift(&src, shift, *from_type, *to_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            // ========== Conditional Vector Operations ==========
+
+            Operation::VectorAbsGtz { element_type } => {
+                // Absolute value if greater than zero: dst[i] = (src[i] > 0) ? abs(src[i]) : src[i]
+                let src = Self::get_vector_source(op, ctx, 0);
+                let result = Self::vector_abs_gtz(&src, *element_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorNegGtz { element_type } => {
+                // Negate if greater than zero: dst[i] = (src[i] > 0) ? -src[i] : src[i]
+                let src = Self::get_vector_source(op, ctx, 0);
+                let result = Self::vector_neg_gtz(&src, *element_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorNegLtz { element_type } => {
+                // Negate if less than zero: dst[i] = (src[i] < 0) ? -src[i] : src[i]
+                // This is essentially abs()
+                let src = Self::get_vector_source(op, ctx, 0);
+                let result = Self::vector_neg_ltz(&src, *element_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorAccumulate { element_type } => {
+                // Vector accumulate: acc += src (add to accumulator without multiply)
+                let src = Self::get_vector_source(op, ctx, 0);
+                let acc_reg = Self::get_acc_dest(op);
+                Self::vector_accumulate(ctx, acc_reg, &src, *element_type);
+                true
+            }
+
+            Operation::VectorNegate { element_type } => {
+                // Vector negate: dst = -src
+                let src = Self::get_vector_source(op, ctx, 0);
+                let result = Self::vector_negate(&src, *element_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorNegAdd { element_type } => {
+                // Vector negate and add: dst = -src1 + src2
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let result = Self::vector_neg_add(&a, &b, *element_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorNegMul { element_type } => {
+                // Vector negate multiply: acc += -(src1 * src2)
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let acc_reg = Self::get_acc_dest(op);
+                Self::vector_neg_mul(ctx, acc_reg, &a, &b, *element_type);
+                true
+            }
+
             _ => false, // Not a vector operation
         }
     }
@@ -1257,6 +1410,783 @@ impl VectorAlu {
         }
 
         result
+    }
+
+    // ========== Vector Element Manipulation Helper Functions ==========
+
+    /// Get lane index from operands (immediate or register).
+    fn get_lane_index(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
+        // Look for immediate in sources (typically the last source)
+        for src in op.sources.iter().rev() {
+            if let Operand::Immediate(imm) = src {
+                return *imm as u32;
+            }
+            if let Operand::ScalarReg(r) = src {
+                return ctx.scalar.read(*r);
+            }
+        }
+        0 // Default: lane 0
+    }
+
+    /// Get scalar source value from operands.
+    fn get_scalar_source(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
+        for src in &op.sources {
+            match src {
+                Operand::ScalarReg(r) => return ctx.scalar.read(*r),
+                Operand::Immediate(imm) => return *imm as u32,
+                _ => {}
+            }
+        }
+        0
+    }
+
+    /// Write scalar result to destination.
+    fn write_scalar_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: u32) {
+        if let Some(Operand::ScalarReg(r)) = &op.dest {
+            ctx.scalar.write(*r, value);
+        }
+    }
+
+    /// Get current value of vector destination (for read-modify-write ops like insert).
+    fn get_vector_dest_value(op: &SlotOp, ctx: &ExecutionContext) -> [u32; 8] {
+        if let Some(Operand::VectorReg(r)) = &op.dest {
+            ctx.vector.read(*r)
+        } else {
+            [0; 8]
+        }
+    }
+
+    /// Extract a single element from a vector.
+    ///
+    /// Returns the element at the given lane index, converted to a u32.
+    fn vector_extract(src: &[u32; 8], index: u32, elem_type: ElementType) -> u32 {
+        match elem_type {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+                // 8 lanes of 32-bit elements
+                let lane = (index as usize) & 0x7;
+                src[lane]
+            }
+            ElementType::Int16 | ElementType::UInt16 | ElementType::BFloat16 => {
+                // 16 lanes of 16-bit elements (2 per u32)
+                let word_idx = ((index as usize) >> 1) & 0x7;
+                let sub_idx = (index as usize) & 0x1;
+                let value = (src[word_idx] >> (sub_idx * 16)) & 0xFFFF;
+                // Sign-extend for signed types
+                if matches!(elem_type, ElementType::Int16) {
+                    value as i16 as i32 as u32
+                } else {
+                    value
+                }
+            }
+            ElementType::Int8 | ElementType::UInt8 => {
+                // 32 lanes of 8-bit elements (4 per u32)
+                let word_idx = ((index as usize) >> 2) & 0x7;
+                let sub_idx = (index as usize) & 0x3;
+                let value = (src[word_idx] >> (sub_idx * 8)) & 0xFF;
+                // Sign-extend for signed types
+                if matches!(elem_type, ElementType::Int8) {
+                    value as i8 as i32 as u32
+                } else {
+                    value
+                }
+            }
+        }
+    }
+
+    /// Insert a scalar value into a vector at the given index.
+    fn vector_insert(dst: &mut [u32; 8], value: u32, index: u32, elem_type: ElementType) {
+        match elem_type {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+                // 8 lanes of 32-bit elements
+                let lane = (index as usize) & 0x7;
+                dst[lane] = value;
+            }
+            ElementType::Int16 | ElementType::UInt16 | ElementType::BFloat16 => {
+                // 16 lanes of 16-bit elements (2 per u32)
+                let word_idx = ((index as usize) >> 1) & 0x7;
+                let sub_idx = (index as usize) & 0x1;
+                let shift = sub_idx * 16;
+                let mask = !(0xFFFFu32 << shift);
+                dst[word_idx] = (dst[word_idx] & mask) | ((value & 0xFFFF) << shift);
+            }
+            ElementType::Int8 | ElementType::UInt8 => {
+                // 32 lanes of 8-bit elements (4 per u32)
+                let word_idx = ((index as usize) >> 2) & 0x7;
+                let sub_idx = (index as usize) & 0x3;
+                let shift = sub_idx * 8;
+                let mask = !(0xFFu32 << shift);
+                dst[word_idx] = (dst[word_idx] & mask) | ((value & 0xFF) << shift);
+            }
+        }
+    }
+
+    /// Per-element select: dst[i] = mask[i] != 0 ? src1[i] : src2[i]
+    fn vector_select(
+        mask: &[u32; 8],
+        src1: &[u32; 8],
+        src2: &[u32; 8],
+        elem_type: ElementType,
+    ) -> [u32; 8] {
+        let mut result = [0u32; 8];
+
+        match elem_type {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+                // 8 lanes of 32-bit elements
+                for i in 0..8 {
+                    result[i] = if mask[i] != 0 { src1[i] } else { src2[i] };
+                }
+            }
+            ElementType::Int16 | ElementType::UInt16 | ElementType::BFloat16 => {
+                // 16 lanes of 16-bit elements (2 per u32)
+                for i in 0..8 {
+                    let mask_lo = mask[i] & 0xFFFF;
+                    let mask_hi = (mask[i] >> 16) & 0xFFFF;
+                    let src1_lo = src1[i] & 0xFFFF;
+                    let src1_hi = (src1[i] >> 16) & 0xFFFF;
+                    let src2_lo = src2[i] & 0xFFFF;
+                    let src2_hi = (src2[i] >> 16) & 0xFFFF;
+                    let r_lo = if mask_lo != 0 { src1_lo } else { src2_lo };
+                    let r_hi = if mask_hi != 0 { src1_hi } else { src2_hi };
+                    result[i] = r_lo | (r_hi << 16);
+                }
+            }
+            ElementType::Int8 | ElementType::UInt8 => {
+                // 32 lanes of 8-bit elements (4 per u32)
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let m = (mask[i] >> (j * 8)) & 0xFF;
+                        let s1 = (src1[i] >> (j * 8)) & 0xFF;
+                        let s2 = (src2[i] >> (j * 8)) & 0xFF;
+                        let val = if m != 0 { s1 } else { s2 };
+                        r |= val << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Broadcast a scalar value to all vector lanes.
+    fn vector_broadcast(value: u32, elem_type: ElementType) -> [u32; 8] {
+        match elem_type {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+                // Broadcast 32-bit value to all 8 lanes
+                [value; 8]
+            }
+            ElementType::Int16 | ElementType::UInt16 | ElementType::BFloat16 => {
+                // Broadcast 16-bit value to all 16 lanes (replicate in each u32)
+                let val16 = value & 0xFFFF;
+                let packed = val16 | (val16 << 16);
+                [packed; 8]
+            }
+            ElementType::Int8 | ElementType::UInt8 => {
+                // Broadcast 8-bit value to all 32 lanes (replicate in each u32)
+                let val8 = value & 0xFF;
+                let packed = val8 | (val8 << 8) | (val8 << 16) | (val8 << 24);
+                [packed; 8]
+            }
+        }
+    }
+
+    // ========== Vector Shift Operation Implementations ==========
+
+    /// Vector logical left shift: each lane is shifted left by the corresponding shift amount.
+    fn vector_shift_left(src: &[u32; 8], shift: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
+        let mut result = [0u32; 8];
+        match elem_type {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+                for i in 0..8 {
+                    let sh = (shift[i] & 0x1F) as u32;
+                    result[i] = src[i].wrapping_shl(sh);
+                }
+            }
+            ElementType::Int16 | ElementType::UInt16 | ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let src_lo = src[i] & 0xFFFF;
+                    let src_hi = (src[i] >> 16) & 0xFFFF;
+                    let sh_lo = (shift[i] & 0xF) as u32;
+                    let sh_hi = ((shift[i] >> 16) & 0xF) as u32;
+                    let r_lo = (src_lo << sh_lo) & 0xFFFF;
+                    let r_hi = (src_hi << sh_hi) & 0xFFFF;
+                    result[i] = r_lo | (r_hi << 16);
+                }
+            }
+            ElementType::Int8 | ElementType::UInt8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let s = (src[i] >> (j * 8)) & 0xFF;
+                        let sh = (shift[i] >> (j * 8)) & 0x7;
+                        let v = (s << sh) & 0xFF;
+                        r |= v << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+        }
+        result
+    }
+
+    /// Vector logical right shift: unsigned shift right.
+    fn vector_shift_right_logical(src: &[u32; 8], shift: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
+        let mut result = [0u32; 8];
+        match elem_type {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+                for i in 0..8 {
+                    let sh = (shift[i] & 0x1F) as u32;
+                    result[i] = src[i].wrapping_shr(sh);
+                }
+            }
+            ElementType::Int16 | ElementType::UInt16 | ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let src_lo = src[i] & 0xFFFF;
+                    let src_hi = (src[i] >> 16) & 0xFFFF;
+                    let sh_lo = (shift[i] & 0xF) as u32;
+                    let sh_hi = ((shift[i] >> 16) & 0xF) as u32;
+                    let r_lo = src_lo >> sh_lo;
+                    let r_hi = src_hi >> sh_hi;
+                    result[i] = r_lo | (r_hi << 16);
+                }
+            }
+            ElementType::Int8 | ElementType::UInt8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let s = (src[i] >> (j * 8)) & 0xFF;
+                        let sh = (shift[i] >> (j * 8)) & 0x7;
+                        let v = s >> sh;
+                        r |= v << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+        }
+        result
+    }
+
+    /// Vector arithmetic right shift: signed shift right (preserves sign bit).
+    fn vector_shift_right_arith(src: &[u32; 8], shift: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
+        let mut result = [0u32; 8];
+        match elem_type {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+                for i in 0..8 {
+                    let sh = (shift[i] & 0x1F) as u32;
+                    result[i] = ((src[i] as i32).wrapping_shr(sh)) as u32;
+                }
+            }
+            ElementType::Int16 | ElementType::UInt16 | ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let src_lo = (src[i] & 0xFFFF) as i16;
+                    let src_hi = ((src[i] >> 16) & 0xFFFF) as i16;
+                    let sh_lo = (shift[i] & 0xF) as u32;
+                    let sh_hi = ((shift[i] >> 16) & 0xF) as u32;
+                    let r_lo = ((src_lo >> sh_lo) as u16) as u32;
+                    let r_hi = ((src_hi >> sh_hi) as u16) as u32;
+                    result[i] = r_lo | (r_hi << 16);
+                }
+            }
+            ElementType::Int8 | ElementType::UInt8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let s = ((src[i] >> (j * 8)) & 0xFF) as i8;
+                        let sh = (shift[i] >> (j * 8)) & 0x7;
+                        let v = ((s >> sh) as u8) as u32;
+                        r |= v << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+        }
+        result
+    }
+
+    /// Vector align: concatenates two 256-bit vectors and extracts 256 bits at byte offset.
+    /// Result = (src1 || src2) >> (byte_shift * 8), extracting lower 256 bits.
+    fn vector_align(src1: &[u32; 8], src2: &[u32; 8], byte_shift: u32) -> [u32; 8] {
+        // Treat as 64 bytes (512 bits total), shift right by byte_shift bytes
+        // and take lower 32 bytes (256 bits)
+        let shift = (byte_shift & 0x3F) as usize; // Max 63 bytes
+        let mut result = [0u32; 8];
+
+        // Build concatenated 64-byte array: [src2 || src1] (src2 is high, src1 is low)
+        // Then shift right and take lower 32 bytes
+        for i in 0..8 {
+            let byte_idx = i * 4 + shift;
+            let word_idx = byte_idx / 4;
+            let byte_off = byte_idx % 4;
+
+            // Get value from concatenated vector
+            let get_byte = |idx: usize| -> u8 {
+                let w = idx / 4;
+                let b = idx % 4;
+                if w < 8 {
+                    ((src1[w] >> (b * 8)) & 0xFF) as u8
+                } else if w < 16 {
+                    ((src2[w - 8] >> (b * 8)) & 0xFF) as u8
+                } else {
+                    0
+                }
+            };
+
+            let b0 = get_byte(byte_idx) as u32;
+            let b1 = get_byte(byte_idx + 1) as u32;
+            let b2 = get_byte(byte_idx + 2) as u32;
+            let b3 = get_byte(byte_idx + 3) as u32;
+            result[i] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        }
+        result
+    }
+
+    /// Vector upshift: shift left for precision scaling (e.g., int8 -> int16).
+    /// Used when accumulating into wider types.
+    fn vector_upshift(
+        src: &[u32; 8],
+        shift: u32,
+        _from_type: ElementType,
+        _to_type: ElementType,
+    ) -> [u32; 8] {
+        // Simple implementation: just shift left by shift amount
+        // In practice, this would involve type widening but for now just shift
+        let mut result = [0u32; 8];
+        let sh = shift & 0x1F;
+        for i in 0..8 {
+            result[i] = src[i].wrapping_shl(sh);
+        }
+        result
+    }
+
+    // ========== Conditional Vector Operation Implementations ==========
+
+    /// Absolute value if greater than zero: dst[i] = (src[i] > 0) ? abs(src[i]) : src[i]
+    /// For positive values, abs() is identity, so this is really just a pass-through.
+    /// Used for ReLU-like activations where only positive values are preserved as-is.
+    fn vector_abs_gtz(src: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
+        let mut result = [0u32; 8];
+
+        match elem_type {
+            ElementType::Int32 => {
+                for i in 0..8 {
+                    let val = src[i] as i32;
+                    // If val > 0, abs(val) = val (since val is positive)
+                    // If val <= 0, keep val unchanged
+                    result[i] = if val > 0 { val as u32 } else { src[i] };
+                }
+            }
+            ElementType::UInt32 => {
+                // Unsigned: all values are >= 0, so "greater than zero" means != 0
+                // abs() is identity for unsigned
+                result = *src;
+            }
+            ElementType::Float32 => {
+                for i in 0..8 {
+                    let f = f32::from_bits(src[i]);
+                    result[i] = if f > 0.0 { f.abs().to_bits() } else { src[i] };
+                }
+            }
+            ElementType::Int16 => {
+                for i in 0..8 {
+                    let lo = (src[i] & 0xFFFF) as i16;
+                    let hi = ((src[i] >> 16) & 0xFFFF) as i16;
+                    let r_lo = if lo > 0 { lo as u16 } else { lo as u16 };
+                    let r_hi = if hi > 0 { hi as u16 } else { hi as u16 };
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::UInt16 => {
+                result = *src;
+            }
+            ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let lo = Self::bf16_to_f32((src[i] & 0xFFFF) as u16);
+                    let hi = Self::bf16_to_f32(((src[i] >> 16) & 0xFFFF) as u16);
+                    let r_lo = if lo > 0.0 { Self::f32_to_bf16(lo.abs()) } else { (src[i] & 0xFFFF) as u16 };
+                    let r_hi = if hi > 0.0 { Self::f32_to_bf16(hi.abs()) } else { ((src[i] >> 16) & 0xFFFF) as u16 };
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::Int8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let byte = ((src[i] >> (j * 8)) & 0xFF) as i8;
+                        let r_byte = if byte > 0 { byte as u8 } else { byte as u8 };
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+            ElementType::UInt8 => {
+                result = *src;
+            }
+        }
+
+        result
+    }
+
+    /// Negate if greater than zero: dst[i] = (src[i] > 0) ? -src[i] : src[i]
+    fn vector_neg_gtz(src: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
+        let mut result = [0u32; 8];
+
+        match elem_type {
+            ElementType::Int32 => {
+                for i in 0..8 {
+                    let val = src[i] as i32;
+                    result[i] = if val > 0 { (-val) as u32 } else { src[i] };
+                }
+            }
+            ElementType::UInt32 => {
+                // For unsigned, "negate" wraps around
+                for i in 0..8 {
+                    result[i] = if src[i] > 0 { 0u32.wrapping_sub(src[i]) } else { src[i] };
+                }
+            }
+            ElementType::Float32 => {
+                for i in 0..8 {
+                    let f = f32::from_bits(src[i]);
+                    result[i] = if f > 0.0 { (-f).to_bits() } else { src[i] };
+                }
+            }
+            ElementType::Int16 => {
+                for i in 0..8 {
+                    let lo = (src[i] & 0xFFFF) as i16;
+                    let hi = ((src[i] >> 16) & 0xFFFF) as i16;
+                    let r_lo = if lo > 0 { (-lo) as u16 } else { lo as u16 };
+                    let r_hi = if hi > 0 { (-hi) as u16 } else { hi as u16 };
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::UInt16 => {
+                for i in 0..8 {
+                    let lo = (src[i] & 0xFFFF) as u16;
+                    let hi = ((src[i] >> 16) & 0xFFFF) as u16;
+                    let r_lo = if lo > 0 { 0u16.wrapping_sub(lo) } else { lo };
+                    let r_hi = if hi > 0 { 0u16.wrapping_sub(hi) } else { hi };
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let lo = Self::bf16_to_f32((src[i] & 0xFFFF) as u16);
+                    let hi = Self::bf16_to_f32(((src[i] >> 16) & 0xFFFF) as u16);
+                    let r_lo = if lo > 0.0 { Self::f32_to_bf16(-lo) } else { (src[i] & 0xFFFF) as u16 };
+                    let r_hi = if hi > 0.0 { Self::f32_to_bf16(-hi) } else { ((src[i] >> 16) & 0xFFFF) as u16 };
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::Int8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let byte = ((src[i] >> (j * 8)) & 0xFF) as i8;
+                        let r_byte = if byte > 0 { (-byte) as u8 } else { byte as u8 };
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+            ElementType::UInt8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let byte = ((src[i] >> (j * 8)) & 0xFF) as u8;
+                        let r_byte = if byte > 0 { 0u8.wrapping_sub(byte) } else { byte };
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Negate if less than zero: dst[i] = (src[i] < 0) ? -src[i] : src[i]
+    /// This is essentially abs() for signed types.
+    fn vector_neg_ltz(src: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
+        let mut result = [0u32; 8];
+
+        match elem_type {
+            ElementType::Int32 => {
+                for i in 0..8 {
+                    let val = src[i] as i32;
+                    result[i] = val.abs() as u32;
+                }
+            }
+            ElementType::UInt32 => {
+                // Unsigned values are never < 0, so pass through
+                result = *src;
+            }
+            ElementType::Float32 => {
+                for i in 0..8 {
+                    let f = f32::from_bits(src[i]);
+                    result[i] = f.abs().to_bits();
+                }
+            }
+            ElementType::Int16 => {
+                for i in 0..8 {
+                    let lo = (src[i] & 0xFFFF) as i16;
+                    let hi = ((src[i] >> 16) & 0xFFFF) as i16;
+                    let r_lo = lo.abs() as u16;
+                    let r_hi = hi.abs() as u16;
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::UInt16 => {
+                result = *src;
+            }
+            ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let lo = Self::bf16_to_f32((src[i] & 0xFFFF) as u16);
+                    let hi = Self::bf16_to_f32(((src[i] >> 16) & 0xFFFF) as u16);
+                    let r_lo = Self::f32_to_bf16(lo.abs());
+                    let r_hi = Self::f32_to_bf16(hi.abs());
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::Int8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let byte = ((src[i] >> (j * 8)) & 0xFF) as i8;
+                        let r_byte = byte.abs() as u8;
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+            ElementType::UInt8 => {
+                result = *src;
+            }
+        }
+
+        result
+    }
+
+    /// Vector accumulate: acc += src (add to accumulator without multiply).
+    fn vector_accumulate(
+        ctx: &mut ExecutionContext,
+        acc_reg: u8,
+        src: &[u32; 8],
+        elem_type: ElementType,
+    ) {
+        let current = ctx.accumulator.read(acc_reg);
+        let mut new_acc = current;
+
+        match elem_type {
+            ElementType::Int32 | ElementType::UInt32 => {
+                for i in 0..8 {
+                    new_acc[i] = current[i].wrapping_add(src[i] as u64);
+                }
+            }
+            ElementType::Float32 => {
+                for i in 0..8 {
+                    let f = f32::from_bits(src[i]) as f64;
+                    let current_f = f64::from_bits(current[i]);
+                    new_acc[i] = (current_f + f).to_bits();
+                }
+            }
+            ElementType::Int16 | ElementType::UInt16 => {
+                for i in 0..8 {
+                    let lo = (src[i] & 0xFFFF) as u64;
+                    let hi = ((src[i] >> 16) & 0xFFFF) as u64;
+                    new_acc[i] = current[i].wrapping_add(lo).wrapping_add(hi);
+                }
+            }
+            ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let lo = Self::bf16_to_f32((src[i] & 0xFFFF) as u16) as f64;
+                    let hi = Self::bf16_to_f32(((src[i] >> 16) & 0xFFFF) as u16) as f64;
+                    let current_f = f64::from_bits(current[i]);
+                    new_acc[i] = (current_f + lo + hi).to_bits();
+                }
+            }
+            ElementType::Int8 | ElementType::UInt8 => {
+                for i in 0..8 {
+                    let mut sum = 0u64;
+                    for j in 0..4 {
+                        sum += ((src[i] >> (j * 8)) & 0xFF) as u64;
+                    }
+                    new_acc[i] = current[i].wrapping_add(sum);
+                }
+            }
+        }
+
+        ctx.accumulator.write(acc_reg, new_acc);
+    }
+
+    /// Vector negate: dst = -src (per element negation).
+    fn vector_negate(src: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
+        let mut result = [0u32; 8];
+
+        match elem_type {
+            ElementType::Int32 => {
+                for i in 0..8 {
+                    result[i] = (-(src[i] as i32)) as u32;
+                }
+            }
+            ElementType::UInt32 => {
+                for i in 0..8 {
+                    result[i] = 0u32.wrapping_sub(src[i]);
+                }
+            }
+            ElementType::Float32 => {
+                for i in 0..8 {
+                    let f = f32::from_bits(src[i]);
+                    result[i] = (-f).to_bits();
+                }
+            }
+            ElementType::Int16 => {
+                for i in 0..8 {
+                    let lo = (src[i] & 0xFFFF) as i16;
+                    let hi = ((src[i] >> 16) & 0xFFFF) as i16;
+                    let r_lo = (-lo) as u16;
+                    let r_hi = (-hi) as u16;
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::UInt16 => {
+                for i in 0..8 {
+                    let lo = (src[i] & 0xFFFF) as u16;
+                    let hi = ((src[i] >> 16) & 0xFFFF) as u16;
+                    let r_lo = 0u16.wrapping_sub(lo);
+                    let r_hi = 0u16.wrapping_sub(hi);
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let lo = Self::bf16_to_f32((src[i] & 0xFFFF) as u16);
+                    let hi = Self::bf16_to_f32(((src[i] >> 16) & 0xFFFF) as u16);
+                    let r_lo = Self::f32_to_bf16(-lo);
+                    let r_hi = Self::f32_to_bf16(-hi);
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::Int8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let byte = ((src[i] >> (j * 8)) & 0xFF) as i8;
+                        let r_byte = (-byte) as u8;
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+            ElementType::UInt8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let byte = ((src[i] >> (j * 8)) & 0xFF) as u8;
+                        let r_byte = 0u8.wrapping_sub(byte);
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Vector negate and add: dst = -src1 + src2.
+    fn vector_neg_add(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
+        let mut result = [0u32; 8];
+
+        match elem_type {
+            ElementType::Int32 => {
+                for i in 0..8 {
+                    result[i] = ((-(a[i] as i32)) as i64 + (b[i] as i32) as i64) as u32;
+                }
+            }
+            ElementType::UInt32 => {
+                for i in 0..8 {
+                    result[i] = b[i].wrapping_sub(a[i]);
+                }
+            }
+            ElementType::Float32 => {
+                for i in 0..8 {
+                    let fa = f32::from_bits(a[i]);
+                    let fb = f32::from_bits(b[i]);
+                    result[i] = (-fa + fb).to_bits();
+                }
+            }
+            ElementType::Int16 => {
+                for i in 0..8 {
+                    let a_lo = (a[i] & 0xFFFF) as i16;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as i16;
+                    let b_lo = (b[i] & 0xFFFF) as i16;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as i16;
+                    let r_lo = (-a_lo).wrapping_add(b_lo) as u16;
+                    let r_hi = (-a_hi).wrapping_add(b_hi) as u16;
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::UInt16 => {
+                for i in 0..8 {
+                    let a_lo = (a[i] & 0xFFFF) as u16;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as u16;
+                    let b_lo = (b[i] & 0xFFFF) as u16;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as u16;
+                    let r_lo = b_lo.wrapping_sub(a_lo);
+                    let r_hi = b_hi.wrapping_sub(a_hi);
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
+                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
+                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
+                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
+                    let r_lo = Self::f32_to_bf16(-a_lo + b_lo);
+                    let r_hi = Self::f32_to_bf16(-a_hi + b_hi);
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::Int8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as i8;
+                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as i8;
+                        let r_byte = (-a_byte).wrapping_add(b_byte) as u8;
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+            ElementType::UInt8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as u8;
+                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as u8;
+                        let r_byte = b_byte.wrapping_sub(a_byte);
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Vector negate multiply: acc += -(src1 * src2).
+    fn vector_neg_mul(
+        ctx: &mut ExecutionContext,
+        acc_reg: u8,
+        a: &[u32; 8],
+        b: &[u32; 8],
+        elem_type: ElementType,
+    ) {
+        // This is equivalent to vector_neg_matmul (acc -= A * B is same as acc += -(A * B))
+        Self::vector_matmul_sub(ctx, acc_reg, a, b, elem_type);
     }
 }
 

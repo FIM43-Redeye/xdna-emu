@@ -300,6 +300,67 @@ impl ScalarAlu {
                 true
             }
 
+            // Division operations - 6+ cycle iterative division
+            Operation::ScalarDiv => {
+                let (a, b) = Self::get_two_sources(op, ctx);
+                // Signed division: a / b
+                // Division by zero returns INT_MIN (saturated)
+                let result = if b == 0 {
+                    i32::MIN as u32
+                } else {
+                    ((a as i32).wrapping_div(b as i32)) as u32
+                };
+                Self::write_dest(op, ctx, result);
+                ctx.set_flags(Flags::from_result(result));
+                true
+            }
+
+            Operation::ScalarDivu => {
+                let (a, b) = Self::get_two_sources(op, ctx);
+                // Unsigned division: a / b
+                // Division by zero returns MAX (saturated)
+                let result = if b == 0 { u32::MAX } else { a / b };
+                Self::write_dest(op, ctx, result);
+                ctx.set_flags(Flags::from_result(result));
+                true
+            }
+
+            Operation::ScalarMod => {
+                let (a, b) = Self::get_two_sources(op, ctx);
+                // Signed modulo: a % b
+                // Mod by zero returns the dividend unchanged
+                let result = if b == 0 {
+                    a
+                } else {
+                    ((a as i32).wrapping_rem(b as i32)) as u32
+                };
+                Self::write_dest(op, ctx, result);
+                ctx.set_flags(Flags::from_result(result));
+                true
+            }
+
+            // Conditional select operations - single cycle
+            Operation::ScalarSelEqz => {
+                // Select if equal zero: dest = (test == 0) ? src_true : src_false
+                // Operands: test, src_true, src_false
+                let test = Self::get_source(op, ctx, 0);
+                let src_true = Self::get_source(op, ctx, 1);
+                let src_false = Self::get_source(op, ctx, 2);
+                let result = if test == 0 { src_true } else { src_false };
+                Self::write_dest(op, ctx, result);
+                true
+            }
+
+            Operation::ScalarSelNez => {
+                // Select if not equal zero: dest = (test != 0) ? src_true : src_false
+                let test = Self::get_source(op, ctx, 0);
+                let src_true = Self::get_source(op, ctx, 1);
+                let src_false = Self::get_source(op, ctx, 2);
+                let result = if test != 0 { src_true } else { src_false };
+                Self::write_dest(op, ctx, result);
+                true
+            }
+
             _ => false, // Not a scalar operation
         }
     }

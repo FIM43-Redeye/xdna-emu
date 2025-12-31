@@ -279,6 +279,16 @@ pub enum Operation {
 
     /// Conditional select: dst = cond ? src1 : src2
     ScalarSel,
+    /// Signed integer division: dst = src1 / src2
+    ScalarDiv,
+    /// Unsigned integer division: dst = src1 / src2
+    ScalarDivu,
+    /// Modulo: dst = src1 % src2
+    ScalarMod,
+    /// Select if equal zero: dst = (cond == 0) ? true_val : false_val
+    ScalarSelEqz,
+    /// Select if not equal zero: dst = (cond != 0) ? true_val : false_val
+    ScalarSelNez,
 
     // ========== Vector Operations ==========
     /// Vector addition: vdst = vsrc1 + vsrc2
@@ -322,6 +332,52 @@ pub enum Operation {
     },
     /// Vector maximum.
     VectorMax {
+        /// Element type.
+        element_type: ElementType,
+    },
+
+    // ========== Conditional Vector Operations ==========
+
+    /// Absolute value if greater than zero: dst[i] = (src[i] > 0) ? abs(src[i]) : src[i]
+    /// Used for ReLU-like activations.
+    VectorAbsGtz {
+        /// Element type.
+        element_type: ElementType,
+    },
+
+    /// Negate if greater than zero: dst[i] = (src[i] > 0) ? -src[i] : src[i]
+    VectorNegGtz {
+        /// Element type.
+        element_type: ElementType,
+    },
+
+    /// Negate if less than zero: dst[i] = (src[i] < 0) ? -src[i] : src[i]
+    /// This is essentially abs().
+    VectorNegLtz {
+        /// Element type.
+        element_type: ElementType,
+    },
+
+    /// Vector accumulate: acc += src (no multiply, just add to accumulator).
+    VectorAccumulate {
+        /// Element type.
+        element_type: ElementType,
+    },
+
+    /// Vector negate: dst = -src (per element negation).
+    VectorNegate {
+        /// Element type.
+        element_type: ElementType,
+    },
+
+    /// Vector negate and add: dst = -src1 + src2.
+    VectorNegAdd {
+        /// Element type.
+        element_type: ElementType,
+    },
+
+    /// Vector negate multiply: acc += -(src1 * src2) but with single operand negation.
+    VectorNegMul {
         /// Element type.
         element_type: ElementType,
     },
@@ -430,6 +486,59 @@ pub enum Operation {
     VectorMov {
         /// Element type.
         element_type: ElementType,
+    },
+
+    // ========== Vector Element Operations ==========
+    /// Extract single element from vector to scalar.
+    VectorExtract {
+        /// Element type.
+        element_type: ElementType,
+    },
+    /// Insert scalar into vector lane.
+    VectorInsert {
+        /// Element type.
+        element_type: ElementType,
+    },
+    /// Per-lane conditional select: dst[i] = sel[i] ? a[i] : b[i].
+    VectorSelect {
+        /// Element type.
+        element_type: ElementType,
+    },
+    /// Clear vector register to zero.
+    VectorClear,
+    /// Broadcast scalar value to all vector lanes.
+    VectorBroadcast {
+        /// Element type.
+        element_type: ElementType,
+    },
+
+    // ========== Vector Shift Operations ==========
+    /// Vector logical left shift: dst[i] = a[i] << b[i].
+    VectorShiftLeft {
+        /// Element type.
+        element_type: ElementType,
+    },
+    /// Vector logical right shift: dst[i] = a[i] >> b[i].
+    VectorShiftRight {
+        /// Element type.
+        element_type: ElementType,
+    },
+    /// Vector arithmetic right shift: dst[i] = (signed)a[i] >> b[i].
+    VectorArithShiftRight {
+        /// Element type.
+        element_type: ElementType,
+    },
+    /// Vector align: concatenate and shift two vectors.
+    VectorAlign {
+        /// Element type.
+        element_type: ElementType,
+    },
+    /// Vector upshift: shift left with rounding for precision scaling.
+    VectorUpshift {
+        /// Source element type.
+        from_type: ElementType,
+        /// Destination element type.
+        to_type: ElementType,
     },
 
     // ========== Pointer Operations ==========
@@ -598,7 +707,12 @@ impl Operation {
             | Operation::ScalarGeu
             | Operation::ScalarEq
             | Operation::ScalarNe
-            | Operation::ScalarSel => SlotIndex::Scalar0,
+            | Operation::ScalarSel
+            | Operation::ScalarDiv
+            | Operation::ScalarDivu
+            | Operation::ScalarMod
+            | Operation::ScalarSelEqz
+            | Operation::ScalarSelNez => SlotIndex::Scalar0,
 
             // Scalar multiply (Scalar1 slot)
             Operation::ScalarMul => SlotIndex::Scalar1,
@@ -615,7 +729,29 @@ impl Operation {
             | Operation::VectorMax { .. }
             | Operation::VectorConvert { .. }
             | Operation::VectorMov { .. }
-            | Operation::VectorSRS { .. } => SlotIndex::Vector,
+            | Operation::VectorSRS { .. }
+            // Conditional vector operations
+            | Operation::VectorAbsGtz { .. }
+            | Operation::VectorNegGtz { .. }
+            | Operation::VectorNegLtz { .. }
+            | Operation::VectorNegate { .. }
+            | Operation::VectorNegAdd { .. }
+            | Operation::VectorNegMul { .. }
+            // Vector element operations
+            | Operation::VectorExtract { .. }
+            | Operation::VectorInsert { .. }
+            | Operation::VectorSelect { .. }
+            | Operation::VectorClear
+            | Operation::VectorBroadcast { .. }
+            // Vector shift operations
+            | Operation::VectorShiftLeft { .. }
+            | Operation::VectorShiftRight { .. }
+            | Operation::VectorArithShiftRight { .. }
+            | Operation::VectorAlign { .. }
+            | Operation::VectorUpshift { .. } => SlotIndex::Vector,
+
+            // Accumulator operations (Accumulator slot)
+            Operation::VectorAccumulate { .. } => SlotIndex::Accumulator,
 
             // Matrix/Accumulator operations (Accumulator slot)
             // All VMAC/VMSC variants used for convolutions
