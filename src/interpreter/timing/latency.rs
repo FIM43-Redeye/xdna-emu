@@ -374,6 +374,21 @@ impl LatencyTable {
             | Operation::VectorLoadB { .. }
             | Operation::VectorLoadUnpack { .. } => OperationKey::Load,
             Operation::VectorStore { .. } => OperationKey::Store,
+            // Vector comparison operations - use compare timing (2 cycles)
+            Operation::VectorGe { .. }
+            | Operation::VectorLt { .. }
+            | Operation::VectorEqz { .. }
+            | Operation::VectorMaxLt { .. }
+            | Operation::VectorMinGe { .. } => OperationKey::VectorCmp,
+            // Vector bitwise operations - simple ALU timing (2 cycles)
+            Operation::VectorAnd { .. }
+            | Operation::VectorOr { .. }
+            | Operation::VectorXor { .. }
+            | Operation::VectorNot { .. } => OperationKey::VectorAdd,
+            // Vector conditional arithmetic - simple ALU timing (2 cycles)
+            Operation::VectorSubLt { .. }
+            | Operation::VectorSubGe { .. }
+            | Operation::VectorMaxDiffLt { .. } => OperationKey::VectorAdd,
             // Stream operations - use DMA timing
             Operation::StreamWriteScalar { .. }
             | Operation::StreamWritePacketHeader { .. }

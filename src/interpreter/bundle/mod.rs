@@ -314,6 +314,45 @@ fn disassemble_op(slot_op: &SlotOp) -> String {
         Operation::VectorCmp { .. } => "vcmp",
         Operation::VectorMin { .. } => "vmin",
         Operation::VectorMax { .. } => "vmax",
+        // Vector comparison operations
+        Operation::VectorGe { element_type } => {
+            return format!("vge.{}", element_suffix(*element_type))
+        }
+        Operation::VectorLt { element_type } => {
+            return format!("vlt.{}", element_suffix(*element_type))
+        }
+        Operation::VectorEqz { element_type } => {
+            return format!("veqz.{}", element_suffix(*element_type))
+        }
+        Operation::VectorMaxLt { element_type } => {
+            return format!("vmax_lt.{}", element_suffix(*element_type))
+        }
+        Operation::VectorMinGe { element_type } => {
+            return format!("vmin_ge.{}", element_suffix(*element_type))
+        }
+        // Vector bitwise operations
+        Operation::VectorAnd { element_type } => {
+            return format!("vband.{}", element_suffix(*element_type))
+        }
+        Operation::VectorOr { element_type } => {
+            return format!("vbor.{}", element_suffix(*element_type))
+        }
+        Operation::VectorXor { element_type } => {
+            return format!("vbxor.{}", element_suffix(*element_type))
+        }
+        Operation::VectorNot { element_type } => {
+            return format!("vbnot.{}", element_suffix(*element_type))
+        }
+        // Vector conditional arithmetic
+        Operation::VectorSubLt { element_type } => {
+            return format!("vsub_lt.{}", element_suffix(*element_type))
+        }
+        Operation::VectorSubGe { element_type } => {
+            return format!("vsub_ge.{}", element_suffix(*element_type))
+        }
+        Operation::VectorMaxDiffLt { element_type } => {
+            return format!("vmaxdiff_lt.{}", element_suffix(*element_type))
+        }
         Operation::VectorMatMulDense { element_type } => {
             return format!("vmul.dense.{}", element_suffix(*element_type))
         }

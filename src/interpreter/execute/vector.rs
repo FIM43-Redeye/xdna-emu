@@ -358,6 +358,108 @@ impl VectorAlu {
                 true
             }
 
+            // ========== Vector Comparison Operations ==========
+
+            Operation::VectorGe { element_type } => {
+                // Greater than or equal: dst[i] = (a[i] >= b[i]) ? ~0 : 0
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let result = Self::vector_compare_ge(&a, &b, *element_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorLt { element_type } => {
+                // Less than: dst[i] = (a[i] < b[i]) ? ~0 : 0
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let result = Self::vector_compare_lt(&a, &b, *element_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorEqz { element_type } => {
+                // Equal to zero: dst[i] = (a[i] == 0) ? ~0 : 0
+                let src = Self::get_vector_source(op, ctx, 0);
+                let result = Self::vector_compare_eqz(&src, *element_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorMaxLt { element_type } => {
+                // Maximum with less-than flag: dst = max(a, b), sets flags
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let result = Self::vector_max(&a, &b, *element_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorMinGe { element_type } => {
+                // Minimum with greater-equal flag: dst = min(a, b), sets flags
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let result = Self::vector_min(&a, &b, *element_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            // ========== Vector Bitwise Operations ==========
+
+            Operation::VectorAnd { element_type: _ } => {
+                // Bitwise AND: dst = a & b
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let result = Self::vector_bitwise_and(&a, &b);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorOr { element_type: _ } => {
+                // Bitwise OR: dst = a | b
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let result = Self::vector_bitwise_or(&a, &b);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorXor { element_type: _ } => {
+                // Bitwise XOR: dst = a ^ b
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let result = Self::vector_bitwise_xor(&a, &b);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorNot { element_type: _ } => {
+                // Bitwise NOT: dst = ~a
+                let src = Self::get_vector_source(op, ctx, 0);
+                let result = Self::vector_bitwise_not(&src);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            // ========== Vector Conditional Arithmetic Operations ==========
+
+            Operation::VectorSubLt { element_type } => {
+                // Subtract if less-than: dst[i] = (a[i] < b[i]) ? a[i] - b[i] : a[i]
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let result = Self::vector_sub_lt(&a, &b, *element_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorSubGe { element_type } => {
+                // Subtract if greater-equal: dst[i] = (a[i] >= b[i]) ? a[i] - b[i] : a[i]
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let result = Self::vector_sub_ge(&a, &b, *element_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            Operation::VectorMaxDiffLt { element_type } => {
+                // Maximum difference if less-than: dst[i] = max(a[i] - b[i], 0) if a < b
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let result = Self::vector_maxdiff_lt(&a, &b, *element_type);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
             _ => false, // Not a vector operation
         }
     }
@@ -2187,6 +2289,526 @@ impl VectorAlu {
     ) {
         // This is equivalent to vector_neg_matmul (acc -= A * B is same as acc += -(A * B))
         Self::vector_matmul_sub(ctx, acc_reg, a, b, elem_type);
+    }
+
+    // ========== Vector Comparison Operation Implementations ==========
+
+    /// Vector compare greater-or-equal: dst[i] = (a[i] >= b[i]) ? ~0 : 0
+    fn vector_compare_ge(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
+        let mut result = [0u32; 8];
+
+        match elem_type {
+            ElementType::Int32 => {
+                for i in 0..8 {
+                    result[i] = if (a[i] as i32) >= (b[i] as i32) { !0 } else { 0 };
+                }
+            }
+            ElementType::UInt32 => {
+                for i in 0..8 {
+                    result[i] = if a[i] >= b[i] { !0 } else { 0 };
+                }
+            }
+            ElementType::Float32 => {
+                for i in 0..8 {
+                    let fa = f32::from_bits(a[i]);
+                    let fb = f32::from_bits(b[i]);
+                    result[i] = if fa >= fb { !0 } else { 0 };
+                }
+            }
+            ElementType::Int16 => {
+                for i in 0..8 {
+                    let a_lo = (a[i] & 0xFFFF) as i16;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as i16;
+                    let b_lo = (b[i] & 0xFFFF) as i16;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as i16;
+                    let r_lo: u16 = if a_lo >= b_lo { !0 } else { 0 };
+                    let r_hi: u16 = if a_hi >= b_hi { !0 } else { 0 };
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::UInt16 => {
+                for i in 0..8 {
+                    let a_lo = (a[i] & 0xFFFF) as u16;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as u16;
+                    let b_lo = (b[i] & 0xFFFF) as u16;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as u16;
+                    let r_lo: u16 = if a_lo >= b_lo { !0 } else { 0 };
+                    let r_hi: u16 = if a_hi >= b_hi { !0 } else { 0 };
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
+                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
+                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
+                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
+                    let r_lo: u16 = if a_lo >= b_lo { !0 } else { 0 };
+                    let r_hi: u16 = if a_hi >= b_hi { !0 } else { 0 };
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::Int8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as i8;
+                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as i8;
+                        let r_byte: u8 = if a_byte >= b_byte { !0 } else { 0 };
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+            ElementType::UInt8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as u8;
+                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as u8;
+                        let r_byte: u8 = if a_byte >= b_byte { !0 } else { 0 };
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Vector compare less-than: dst[i] = (a[i] < b[i]) ? ~0 : 0
+    fn vector_compare_lt(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
+        let mut result = [0u32; 8];
+
+        match elem_type {
+            ElementType::Int32 => {
+                for i in 0..8 {
+                    result[i] = if (a[i] as i32) < (b[i] as i32) { !0 } else { 0 };
+                }
+            }
+            ElementType::UInt32 => {
+                for i in 0..8 {
+                    result[i] = if a[i] < b[i] { !0 } else { 0 };
+                }
+            }
+            ElementType::Float32 => {
+                for i in 0..8 {
+                    let fa = f32::from_bits(a[i]);
+                    let fb = f32::from_bits(b[i]);
+                    result[i] = if fa < fb { !0 } else { 0 };
+                }
+            }
+            ElementType::Int16 => {
+                for i in 0..8 {
+                    let a_lo = (a[i] & 0xFFFF) as i16;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as i16;
+                    let b_lo = (b[i] & 0xFFFF) as i16;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as i16;
+                    let r_lo: u16 = if a_lo < b_lo { !0 } else { 0 };
+                    let r_hi: u16 = if a_hi < b_hi { !0 } else { 0 };
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::UInt16 => {
+                for i in 0..8 {
+                    let a_lo = (a[i] & 0xFFFF) as u16;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as u16;
+                    let b_lo = (b[i] & 0xFFFF) as u16;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as u16;
+                    let r_lo: u16 = if a_lo < b_lo { !0 } else { 0 };
+                    let r_hi: u16 = if a_hi < b_hi { !0 } else { 0 };
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
+                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
+                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
+                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
+                    let r_lo: u16 = if a_lo < b_lo { !0 } else { 0 };
+                    let r_hi: u16 = if a_hi < b_hi { !0 } else { 0 };
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::Int8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as i8;
+                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as i8;
+                        let r_byte: u8 = if a_byte < b_byte { !0 } else { 0 };
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+            ElementType::UInt8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as u8;
+                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as u8;
+                        let r_byte: u8 = if a_byte < b_byte { !0 } else { 0 };
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Vector compare equal-to-zero: dst[i] = (a[i] == 0) ? ~0 : 0
+    fn vector_compare_eqz(a: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
+        let mut result = [0u32; 8];
+
+        match elem_type {
+            ElementType::Int32 | ElementType::UInt32 => {
+                for i in 0..8 {
+                    result[i] = if a[i] == 0 { !0 } else { 0 };
+                }
+            }
+            ElementType::Float32 => {
+                for i in 0..8 {
+                    let fa = f32::from_bits(a[i]);
+                    result[i] = if fa == 0.0 { !0 } else { 0 };
+                }
+            }
+            ElementType::Int16 | ElementType::UInt16 => {
+                for i in 0..8 {
+                    let lo = (a[i] & 0xFFFF) as u16;
+                    let hi = ((a[i] >> 16) & 0xFFFF) as u16;
+                    let r_lo: u16 = if lo == 0 { !0 } else { 0 };
+                    let r_hi: u16 = if hi == 0 { !0 } else { 0 };
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
+                    let hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
+                    let r_lo: u16 = if lo == 0.0 { !0 } else { 0 };
+                    let r_hi: u16 = if hi == 0.0 { !0 } else { 0 };
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::Int8 | ElementType::UInt8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let byte = ((a[i] >> (j * 8)) & 0xFF) as u8;
+                        let r_byte: u8 = if byte == 0 { !0 } else { 0 };
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+        }
+
+        result
+    }
+
+    // ========== Vector Bitwise Operation Implementations ==========
+
+    /// Vector bitwise AND: dst = a & b
+    fn vector_bitwise_and(a: &[u32; 8], b: &[u32; 8]) -> [u32; 8] {
+        let mut result = [0u32; 8];
+        for i in 0..8 {
+            result[i] = a[i] & b[i];
+        }
+        result
+    }
+
+    /// Vector bitwise OR: dst = a | b
+    fn vector_bitwise_or(a: &[u32; 8], b: &[u32; 8]) -> [u32; 8] {
+        let mut result = [0u32; 8];
+        for i in 0..8 {
+            result[i] = a[i] | b[i];
+        }
+        result
+    }
+
+    /// Vector bitwise XOR: dst = a ^ b
+    fn vector_bitwise_xor(a: &[u32; 8], b: &[u32; 8]) -> [u32; 8] {
+        let mut result = [0u32; 8];
+        for i in 0..8 {
+            result[i] = a[i] ^ b[i];
+        }
+        result
+    }
+
+    /// Vector bitwise NOT: dst = ~a
+    fn vector_bitwise_not(a: &[u32; 8]) -> [u32; 8] {
+        let mut result = [0u32; 8];
+        for i in 0..8 {
+            result[i] = !a[i];
+        }
+        result
+    }
+
+    // ========== Vector Conditional Arithmetic Implementations ==========
+
+    /// Subtract if less-than: dst[i] = (a[i] < b[i]) ? a[i] - b[i] : a[i]
+    fn vector_sub_lt(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
+        let mut result = [0u32; 8];
+
+        match elem_type {
+            ElementType::Int32 => {
+                for i in 0..8 {
+                    let va = a[i] as i32;
+                    let vb = b[i] as i32;
+                    result[i] = if va < vb { va.wrapping_sub(vb) as u32 } else { a[i] };
+                }
+            }
+            ElementType::UInt32 => {
+                for i in 0..8 {
+                    result[i] = if a[i] < b[i] { a[i].wrapping_sub(b[i]) } else { a[i] };
+                }
+            }
+            ElementType::Float32 => {
+                for i in 0..8 {
+                    let fa = f32::from_bits(a[i]);
+                    let fb = f32::from_bits(b[i]);
+                    result[i] = if fa < fb { (fa - fb).to_bits() } else { a[i] };
+                }
+            }
+            ElementType::Int16 => {
+                for i in 0..8 {
+                    let a_lo = (a[i] & 0xFFFF) as i16;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as i16;
+                    let b_lo = (b[i] & 0xFFFF) as i16;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as i16;
+                    let r_lo = if a_lo < b_lo { a_lo.wrapping_sub(b_lo) as u16 } else { a_lo as u16 };
+                    let r_hi = if a_hi < b_hi { a_hi.wrapping_sub(b_hi) as u16 } else { a_hi as u16 };
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::UInt16 => {
+                for i in 0..8 {
+                    let a_lo = (a[i] & 0xFFFF) as u16;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as u16;
+                    let b_lo = (b[i] & 0xFFFF) as u16;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as u16;
+                    let r_lo = if a_lo < b_lo { a_lo.wrapping_sub(b_lo) } else { a_lo };
+                    let r_hi = if a_hi < b_hi { a_hi.wrapping_sub(b_hi) } else { a_hi };
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
+                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
+                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
+                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
+                    let r_lo = if a_lo < b_lo { Self::f32_to_bf16(a_lo - b_lo) } else { (a[i] & 0xFFFF) as u16 };
+                    let r_hi = if a_hi < b_hi { Self::f32_to_bf16(a_hi - b_hi) } else { ((a[i] >> 16) & 0xFFFF) as u16 };
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::Int8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as i8;
+                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as i8;
+                        let r_byte = if a_byte < b_byte { a_byte.wrapping_sub(b_byte) as u8 } else { a_byte as u8 };
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+            ElementType::UInt8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as u8;
+                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as u8;
+                        let r_byte = if a_byte < b_byte { a_byte.wrapping_sub(b_byte) } else { a_byte };
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Subtract if greater-or-equal: dst[i] = (a[i] >= b[i]) ? a[i] - b[i] : a[i]
+    fn vector_sub_ge(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
+        let mut result = [0u32; 8];
+
+        match elem_type {
+            ElementType::Int32 => {
+                for i in 0..8 {
+                    let va = a[i] as i32;
+                    let vb = b[i] as i32;
+                    result[i] = if va >= vb { va.wrapping_sub(vb) as u32 } else { a[i] };
+                }
+            }
+            ElementType::UInt32 => {
+                for i in 0..8 {
+                    result[i] = if a[i] >= b[i] { a[i].wrapping_sub(b[i]) } else { a[i] };
+                }
+            }
+            ElementType::Float32 => {
+                for i in 0..8 {
+                    let fa = f32::from_bits(a[i]);
+                    let fb = f32::from_bits(b[i]);
+                    result[i] = if fa >= fb { (fa - fb).to_bits() } else { a[i] };
+                }
+            }
+            ElementType::Int16 => {
+                for i in 0..8 {
+                    let a_lo = (a[i] & 0xFFFF) as i16;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as i16;
+                    let b_lo = (b[i] & 0xFFFF) as i16;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as i16;
+                    let r_lo = if a_lo >= b_lo { a_lo.wrapping_sub(b_lo) as u16 } else { a_lo as u16 };
+                    let r_hi = if a_hi >= b_hi { a_hi.wrapping_sub(b_hi) as u16 } else { a_hi as u16 };
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::UInt16 => {
+                for i in 0..8 {
+                    let a_lo = (a[i] & 0xFFFF) as u16;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as u16;
+                    let b_lo = (b[i] & 0xFFFF) as u16;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as u16;
+                    let r_lo = if a_lo >= b_lo { a_lo.wrapping_sub(b_lo) } else { a_lo };
+                    let r_hi = if a_hi >= b_hi { a_hi.wrapping_sub(b_hi) } else { a_hi };
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
+                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
+                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
+                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
+                    let r_lo = if a_lo >= b_lo { Self::f32_to_bf16(a_lo - b_lo) } else { (a[i] & 0xFFFF) as u16 };
+                    let r_hi = if a_hi >= b_hi { Self::f32_to_bf16(a_hi - b_hi) } else { ((a[i] >> 16) & 0xFFFF) as u16 };
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::Int8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as i8;
+                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as i8;
+                        let r_byte = if a_byte >= b_byte { a_byte.wrapping_sub(b_byte) as u8 } else { a_byte as u8 };
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+            ElementType::UInt8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as u8;
+                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as u8;
+                        let r_byte = if a_byte >= b_byte { a_byte.wrapping_sub(b_byte) } else { a_byte };
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Maximum difference if less-than: dst[i] = max(a[i] - b[i], 0) for unsigned,
+    /// or clamped difference for signed types.
+    fn vector_maxdiff_lt(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
+        let mut result = [0u32; 8];
+
+        match elem_type {
+            ElementType::Int32 => {
+                for i in 0..8 {
+                    let va = a[i] as i32;
+                    let vb = b[i] as i32;
+                    let diff = va.saturating_sub(vb);
+                    result[i] = diff.max(0) as u32;
+                }
+            }
+            ElementType::UInt32 => {
+                for i in 0..8 {
+                    result[i] = a[i].saturating_sub(b[i]);
+                }
+            }
+            ElementType::Float32 => {
+                for i in 0..8 {
+                    let fa = f32::from_bits(a[i]);
+                    let fb = f32::from_bits(b[i]);
+                    result[i] = (fa - fb).max(0.0).to_bits();
+                }
+            }
+            ElementType::Int16 => {
+                for i in 0..8 {
+                    let a_lo = (a[i] & 0xFFFF) as i16;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as i16;
+                    let b_lo = (b[i] & 0xFFFF) as i16;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as i16;
+                    let r_lo = a_lo.saturating_sub(b_lo).max(0) as u16;
+                    let r_hi = a_hi.saturating_sub(b_hi).max(0) as u16;
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::UInt16 => {
+                for i in 0..8 {
+                    let a_lo = (a[i] & 0xFFFF) as u16;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as u16;
+                    let b_lo = (b[i] & 0xFFFF) as u16;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as u16;
+                    let r_lo = a_lo.saturating_sub(b_lo);
+                    let r_hi = a_hi.saturating_sub(b_hi);
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
+                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
+                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
+                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
+                    let r_lo = Self::f32_to_bf16((a_lo - b_lo).max(0.0));
+                    let r_hi = Self::f32_to_bf16((a_hi - b_hi).max(0.0));
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::Int8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as i8;
+                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as i8;
+                        let r_byte = a_byte.saturating_sub(b_byte).max(0) as u8;
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+            ElementType::UInt8 => {
+                for i in 0..8 {
+                    let mut r = 0u32;
+                    for j in 0..4 {
+                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as u8;
+                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as u8;
+                        let r_byte = a_byte.saturating_sub(b_byte);
+                        r |= (r_byte as u32) << (j * 8);
+                    }
+                    result[i] = r;
+                }
+            }
+        }
+
+        result
     }
 }
 

@@ -336,6 +336,72 @@ pub enum Operation {
         element_type: ElementType,
     },
 
+    // ========== Vector Comparison Operations ==========
+    /// Vector greater-equal: dst[i] = (a[i] >= b[i]) ? 1 : 0
+    VectorGe {
+        /// Element type.
+        element_type: ElementType,
+    },
+    /// Vector less-than: dst[i] = (a[i] < b[i]) ? 1 : 0
+    VectorLt {
+        /// Element type.
+        element_type: ElementType,
+    },
+    /// Vector equal-to-zero: dst[i] = (a[i] == 0) ? 1 : 0
+    VectorEqz {
+        /// Element type.
+        element_type: ElementType,
+    },
+    /// Vector max with less-than: dst[i] = (a[i] < b[i]) ? max(a[i], c[i]) : a[i]
+    VectorMaxLt {
+        /// Element type.
+        element_type: ElementType,
+    },
+    /// Vector min with greater-equal: dst[i] = (a[i] >= b[i]) ? min(a[i], c[i]) : a[i]
+    VectorMinGe {
+        /// Element type.
+        element_type: ElementType,
+    },
+
+    // ========== Vector Bitwise Operations ==========
+    /// Vector bitwise AND: dst[i] = a[i] & b[i]
+    VectorAnd {
+        /// Element type.
+        element_type: ElementType,
+    },
+    /// Vector bitwise OR: dst[i] = a[i] | b[i]
+    VectorOr {
+        /// Element type.
+        element_type: ElementType,
+    },
+    /// Vector bitwise XOR: dst[i] = a[i] ^ b[i]
+    VectorXor {
+        /// Element type.
+        element_type: ElementType,
+    },
+    /// Vector bitwise NOT: dst[i] = ~a[i]
+    VectorNot {
+        /// Element type.
+        element_type: ElementType,
+    },
+
+    // ========== Vector Conditional Arithmetic ==========
+    /// Vector subtract if less-than: dst[i] = (a[i] < b[i]) ? a[i] - c[i] : a[i]
+    VectorSubLt {
+        /// Element type.
+        element_type: ElementType,
+    },
+    /// Vector subtract if greater-equal: dst[i] = (a[i] >= b[i]) ? a[i] - c[i] : a[i]
+    VectorSubGe {
+        /// Element type.
+        element_type: ElementType,
+    },
+    /// Vector max difference if less-than: dst[i] = (a[i] < b[i]) ? max(a[i]-c[i], 0) : a[i]
+    VectorMaxDiffLt {
+        /// Element type.
+        element_type: ElementType,
+    },
+
     // ========== Conditional Vector Operations ==========
 
     /// Absolute value if greater than zero: dst[i] = (src[i] > 0) ? abs(src[i]) : src[i]
@@ -727,6 +793,21 @@ impl Operation {
             | Operation::VectorCmp { .. }
             | Operation::VectorMin { .. }
             | Operation::VectorMax { .. }
+            // Vector comparison operations
+            | Operation::VectorGe { .. }
+            | Operation::VectorLt { .. }
+            | Operation::VectorEqz { .. }
+            | Operation::VectorMaxLt { .. }
+            | Operation::VectorMinGe { .. }
+            // Vector bitwise operations
+            | Operation::VectorAnd { .. }
+            | Operation::VectorOr { .. }
+            | Operation::VectorXor { .. }
+            | Operation::VectorNot { .. }
+            // Vector conditional arithmetic
+            | Operation::VectorSubLt { .. }
+            | Operation::VectorSubGe { .. }
+            | Operation::VectorMaxDiffLt { .. }
             | Operation::VectorConvert { .. }
             | Operation::VectorMov { .. }
             | Operation::VectorSRS { .. }

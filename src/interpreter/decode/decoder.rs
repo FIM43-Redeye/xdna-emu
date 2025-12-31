@@ -355,6 +355,79 @@ impl InstructionDecoder {
             Operation::VectorMul {
                 element_type: self.infer_element_type(&mnemonic),
             }
+        // ========== Vector Comparison Operations ==========
+        } else if mnemonic.starts_with("vge") || mnemonic.starts_with("vcmpge") {
+            // Vector greater-equal comparison
+            Operation::VectorGe {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vlt") || mnemonic.starts_with("vcmplt") {
+            // Vector less-than comparison
+            Operation::VectorLt {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("veqz") {
+            // Vector equal-to-zero
+            Operation::VectorEqz {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vmax_lt") || mnemonic.starts_with("vmax.lt") {
+            // Max with less-than condition
+            Operation::VectorMaxLt {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vmin_ge") || mnemonic.starts_with("vmin.ge") {
+            // Min with greater-equal condition
+            Operation::VectorMinGe {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vmin") {
+            // Vector minimum
+            Operation::VectorMin {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vmax") {
+            // Vector maximum
+            Operation::VectorMax {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        // ========== Vector Bitwise Operations ==========
+        } else if mnemonic.starts_with("vband") || mnemonic.starts_with("vand") {
+            // Vector bitwise AND
+            Operation::VectorAnd {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vbor") || mnemonic.starts_with("vor") {
+            // Vector bitwise OR
+            Operation::VectorOr {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vbxor") || mnemonic.starts_with("vxor") {
+            // Vector bitwise XOR
+            Operation::VectorXor {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vbnot") || mnemonic.starts_with("vnot") {
+            // Vector bitwise NOT
+            Operation::VectorNot {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        // ========== Vector Conditional Arithmetic ==========
+        } else if mnemonic.starts_with("vsub_lt") || mnemonic.starts_with("vsub.lt") {
+            // Subtract if less-than
+            Operation::VectorSubLt {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vsub_ge") || mnemonic.starts_with("vsub.ge") {
+            // Subtract if greater-equal
+            Operation::VectorSubGe {
+                element_type: self.infer_element_type(&mnemonic),
+            }
+        } else if mnemonic.starts_with("vmaxdiff_lt") || mnemonic.starts_with("vmaxdiff.lt") {
+            // Max difference if less-than
+            Operation::VectorMaxDiffLt {
+                element_type: self.infer_element_type(&mnemonic),
+            }
         // ========== Conditional Vector Operations ==========
         } else if mnemonic.starts_with("vabs_gtz") || mnemonic.starts_with("vabs.gtz") {
             // Absolute value if greater than zero (ReLU-like)
