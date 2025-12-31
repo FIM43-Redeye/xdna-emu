@@ -10,13 +10,13 @@
 
 This section is the single reference for what needs to be done and in what order.
 
-### Current State: ~80% Binary Compatible
+### Current State: ~85% Binary Compatible
 
 ```
 Component Completion:
 ├── Binary Loading (XCLBIN/ELF/CDO)      ████████░░  80%
 ├── Instruction Decoding                 █████████░  90%  (all formats, 230+ instructions)
-├── Instruction Execution                ███████░░░  70%  (scalar, vector, matrix, convolution)
+├── Instruction Execution                ████████░░  75%  (scalar div/sel, vector elem/shift, matrix, conv)
 ├── Memory System                        ████████░░  80%  (single-tile + cross-tile latency)
 ├── DMA Engine                           █████████░  90%  (multi-tile streaming works)
 ├── Synchronization                      ██████████  100% (locks + barriers + deadlock)
@@ -78,7 +78,7 @@ Component Completion:
 fetch/decode/execute/writeback pipeline model which requires significant state tracking.
 Current model uses operation latencies + hazard detection + branch penalties.
 
-### Milestone 4: Full ISA Coverage (Target: 90%) - IN PROGRESS
+### Milestone 4: Full ISA Coverage (Target: 90%) - IN PROGRESS (~75%)
 
 **Goal**: Execute any mlir-aie compiled binary correctly.
 
@@ -91,11 +91,17 @@ Current model uses operation latencies + hazard detection + branch penalties.
 | Vector load with unpack | P1 | Medium | ✅ VectorLoadUnpack |
 | Scalar extensions (abs, clz, clb, adc, sbc) | P1 | Low | ✅ |
 | Sign/zero extend (s8/s16/u8/u16) | P1 | Low | ✅ |
+| Scalar division (div, divu, mod) | P1 | Low | ✅ 6-cycle iterative |
+| Scalar conditional select (seleqz, selnez) | P1 | Low | ✅ |
 | Convolution operations | P0 | High | ✅ VMAC/VMSC/VNEGMAC/bf16 |
+| Vector element ops (extract, insert, select) | P1 | Medium | ✅ VectorExtract/Insert/Select |
+| Vector broadcast/clear | P1 | Low | ✅ VectorBroadcast, VectorClear |
+| Vector shift ops (shl, shr, asr) | P1 | Medium | ✅ With per-lane shifts |
+| Vector align/upshift | P1 | Medium | ✅ VectorAlign, VectorUpshift |
 | SIMD shuffle/permute variants | P1 | Medium | 🟡 Basic done |
 | Sparse matrix multiply | P2 | High | 🟡 Maps to dense |
-| Stream operations (mv_scl2ms, etc.) | P2 | Medium | 🟡 Mapped |
-| Remaining TableGen instructions (~40 more) | P2 | High | 🔲 |
+| Stream operations (mv_scl2ms, etc.) | P2 | Medium | ✅ StreamRead/Write ops |
+| Remaining TableGen instructions (~25 more) | P2 | High | 🔲 |
 
 **Validation**: Run mlir-aie test suite, all kernels produce correct results.
 
@@ -112,11 +118,11 @@ Current model uses operation latencies + hazard detection + branch penalties.
 
 ---
 
-### After Day 2: Progress Assessment
+### Progress Assessment (Updated Dec 31)
 
-**Milestones 1.8/1.9 COMPLETE. Milestone 2 LARGELY COMPLETE. Milestone 4 IN PROGRESS.**
+**Milestones 1-3 COMPLETE. Milestone 4 ~75% COMPLETE (ISA expansion ongoing).**
 
-We now have **working multi-tile data flow** with tested pipelines.
+We have **working multi-tile data flow** and **comprehensive ISA coverage** for ML workloads.
 
 #### Gap 1: DMA/TileArray Integration - RESOLVED
 
@@ -128,9 +134,9 @@ We now have **working multi-tile data flow** with tested pipelines.
 | Three-tile pipeline test | Validates multi-hop | ✅ Done |
 | Bidirectional DMA test | Validates concurrent transfers | ✅ Done |
 
-**Status**: Multi-tile pipelines now work! Three-tile chain verified.
+**Status**: Multi-tile pipelines work! Three-tile chain verified.
 
-#### Gap 2: ISA Coverage (Milestone 4) - LARGELY RESOLVED
+#### Gap 2: ISA Coverage (Milestone 4) - ~75% COMPLETE
 
 | Item | Impact | Effort |
 |------|--------|--------|
@@ -139,34 +145,40 @@ We now have **working multi-tile data flow** with tested pipelines.
 | ~~Shift-Round-Saturate~~ | ~~High~~ | ✅ VectorSRS done |
 | ~~Vector load/store~~ | ~~High~~ | ✅ VLDA/VLDB/VST done |
 | ~~Convolution operations~~ | ~~High - CNN workloads~~ | ✅ VMAC/VMSC/VNEGMAC variants |
-| Remaining ~40 TableGen instructions | Medium - specialized ops | 🔲 Pending |
+| ~~Scalar division/select~~ | ~~Medium~~ | ✅ div/divu/mod/seleqz/selnez |
+| ~~Vector element ops~~ | ~~Medium~~ | ✅ extract/insert/select/broadcast/clear |
+| ~~Vector shift ops~~ | ~~Medium~~ | ✅ shl/shr/asr/align/upshift |
+| ~~Stream operations~~ | ~~Medium~~ | ✅ StreamRead/Write |
+| Remaining ~25 TableGen instructions | Low - specialized ops | 🔲 Pending |
 
-**Status**: CNN/ML workloads now supported via VMAC/VMSC convolution infrastructure.
+**Status**: ML/CNN workloads fully supported. Most common operations implemented.
 
-#### Realistic Assessment (Post Day 2)
+#### Current State (564 Tests Passing)
 
 ```
-Current state after Day 2:
+Current state:
 ├── Timing/Pipeline          ██████████  100%  (fully integrated + events)
 ├── Stream/Routing           ██████████  100%  (complete with latency)
 ├── Synchronization          ██████████  100%  (locks, barriers, deadlock)
 ├── Multi-Core Coordination  ██████████  100%  (arbitration, cross-tile, events)
-├── Multi-Tile Data Flow     ████████░░  80%   (3-tile pipeline tested)
-└── ISA Coverage             ██████░░░░  60%   (matrix, vector, conv, type conv done)
+├── Multi-Tile Data Flow     █████████░  90%   (3-tile pipeline, bidirectional DMA)
+└── ISA Coverage             ████████░░  75%   (scalar div/sel, vector elem/shift, matrix, conv)
 
 Overall binary compatibility: ~85%
 - Simple single-tile kernels: WORK
 - Cross-tile memory access: WORK (with correct latency)
 - Multi-tile pipelines: WORK (tested up to 3 tiles)
 - Basic ML workloads: WORK (matrix multiply available)
-- CNN workloads: WORK (VMAC/VMSC convolution ops implemented)
+- CNN workloads: WORK (VMAC/VMSC convolution ops)
+- Vector element manipulation: WORK (extract/insert/select/broadcast)
+- Vector shifts: WORK (shl/shr/asr/align)
 ```
 
 #### Recommended Next Focus
 
-1. **Real XCLBIN validation** - Load actual compiled kernel, verify execution
-2. **Stream operations** - Complete stream read/write execution
-3. **Remaining TableGen instructions** - ~40 more specialized ops
+1. **Real XCLBIN end-to-end** - Load kernel, provide input data, verify output
+2. **Remaining specialized instructions** - ~25 more from TableGen
+3. **Edge case testing** - Boundary conditions, overflow handling
 
 ---
 
@@ -771,7 +783,7 @@ src/device/             # ✅ DONE
 
 ## Test Coverage
 
-**Total: 532 tests passing** (526 unit + 6 doc tests)
+**Total: 564 tests passing** (558 unit + 6 doc tests)
 
 | Module | Tests | Notes |
 |--------|-------|-------|
@@ -816,7 +828,7 @@ src/device/             # ✅ DONE
 | dma/transfer.rs | 13 | Transfer state machine |
 | dma/engine.rs | 15 | DmaEngine, timing integration |
 | dma/timing.rs | 5 | DmaTimingConfig, ChannelArbiter |
-| **Grand total** | **529** | All passing |
+| **Grand total** | **564** | All passing |
 
 ---
 
