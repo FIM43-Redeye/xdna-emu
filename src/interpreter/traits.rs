@@ -106,6 +106,12 @@ pub enum ExecuteResult {
         channel: u8,
     },
 
+    /// Stall waiting on stream data (blocking read with empty buffer).
+    WaitStream {
+        /// Stream port being waited on.
+        port: u8,
+    },
+
     /// Core has halted (normal termination).
     Halt,
 

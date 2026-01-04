@@ -403,6 +403,8 @@ pub fn extract_80bit(bytes: &[u8]) -> ExtractedBundle {
         return bundle;
     }
 
+    log::trace!("[extract_80bit] called with {} bytes: {:02X?}", bytes.len(), &bytes[..10]);
+
     // Read 80 bits (10 bytes) as u128 (little-endian)
     let mut word_bytes = [0u8; 16];
     word_bytes[..10].copy_from_slice(&bytes[..10]);
@@ -559,6 +561,7 @@ pub fn extract_80bit(bytes: &[u8]) -> ExtractedBundle {
     // For ALU_MV: alu_mv = {alumv[42], 0b1[1]}, alumv = {alu[20], mv[22]}
     // Note: bits[6:0] is the fixed pattern, bit 7 is the alu_mv discriminator
     let bits_6_0 = (instr80 & 0x7F) as u8;
+    log::trace!("[80bit] bits_6_0=0x{:02X} (looking for 0x0B for LDA_LNG)", bits_6_0);
     if bits_6_0 == 0b0001011 {
         // I80_LDA_ALU_MV or I80_LDA_LNG
         // Bit 7 distinguishes: 0 = LNG, 1 = ALU_MV
@@ -572,10 +575,13 @@ pub fn extract_80bit(bytes: &[u8]) -> ExtractedBundle {
             let alu_bits = ((instr80 >> 30) & ((1u128 << ALU_WIDTH) - 1)) as u64;
             bundle.add_slot(SlotType::Mv, mv_bits, MV_WIDTH);
             bundle.add_slot(SlotType::Alu, alu_bits, ALU_WIDTH);
+            log::trace!("[80bit] I80_LDA_ALU_MV: lda=0x{:05X} mv=0x{:06X} alu=0x{:05X}",
+                lda_bits, mv_bits, alu_bits);
         } else {
             // I80_LDA_LNG: bits 8-49 = lng (42 bits)
             let lng_bits = ((instr80 >> 8) & ((1u128 << LNG_WIDTH) - 1)) as u64;
             bundle.add_slot(SlotType::Lng, lng_bits, LNG_WIDTH);
+            log::debug!("[80bit] I80_LDA_LNG: lda=0x{:05X} lng=0x{:010X}", lda_bits, lng_bits);
         }
         return bundle;
     }
@@ -1120,6 +1126,7 @@ pub fn extract_slots(bytes: &[u8]) -> ExtractedBundle {
     }
 
     let format = super::detect_format(bytes);
+    log::trace!("[extract_slots] format={:?} bytes[0..2]=0x{:02X}{:02X}", format, bytes[0], bytes[1]);
 
     match format {
         BundleFormat::Nop16 => {

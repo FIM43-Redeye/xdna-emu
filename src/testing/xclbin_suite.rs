@@ -9,6 +9,7 @@ use crate::parser::{Xclbin, AiePartition, Cdo};
 use crate::parser::xclbin::SectionKind;
 use crate::parser::cdo::find_cdo_offset;
 use crate::interpreter::engine::{InterpreterEngine, EngineStatus};
+use crate::npu::{NpuInstructionStream, NpuExecutor};
 
 use super::opcode_collector::{OpcodeCollector, UnknownOpcode};
 
@@ -157,6 +158,21 @@ impl XclbinTest {
             let row_str = parts[1].trim_end_matches(".elf");
             let row: u8 = row_str.parse().ok()?;
             return Some((col, row));
+        }
+        None
+    }
+
+    /// Find the NPU instructions file (insts.bin) for this test.
+    ///
+    /// The insts.bin file contains host-to-NPU commands that configure
+    /// and trigger shim DMA transfers.
+    pub fn find_insts_bin(&self) -> Option<PathBuf> {
+        // Look in the same directory as the xclbin
+        if let Some(parent) = self.xclbin_path.parent() {
+            let insts_path = parent.join("insts.bin");
+            if insts_path.exists() {
+                return Some(insts_path);
+            }
         }
         None
     }
@@ -348,6 +364,46 @@ impl XclbinSuite {
 
         // Populate host memory with default input data
         self.setup_default_input(&mut engine);
+
+        // Execute NPU instructions if insts.bin exists
+        // These configure and trigger shim DMA to move data to/from cores
+        if let Some(insts_path) = test.find_insts_bin() {
+            let insts_data = match std::fs::read(&insts_path) {
+                Ok(d) => d,
+                Err(e) => {
+                    log::warn!("Failed to read insts.bin: {}", e);
+                    // Continue without NPU instructions - some tests may not need them
+                    Vec::new()
+                }
+            };
+
+            if !insts_data.is_empty() {
+                match NpuInstructionStream::parse(&insts_data) {
+                    Ok(stream) => {
+                        log::debug!("Loaded {} NPU instructions from {:?}",
+                            stream.len(), insts_path);
+
+                        let mut npu_executor = NpuExecutor::new();
+
+                        // Set up host buffers (simplified: use default buffer addresses)
+                        // In real usage, these would come from the test harness
+                        npu_executor.add_host_buffer(0x0000_0000, 256);  // Input buffer
+                        npu_executor.add_host_buffer(0x0001_0000, 256);  // Output buffer
+                        npu_executor.add_host_buffer(0x0002_0000, 256);  // Extra buffer
+
+                        if let Err(e) = npu_executor.execute(&stream, engine.device_mut()) {
+                            log::warn!("NPU instruction execution error: {}", e);
+                        } else {
+                            log::debug!("Executed {} NPU instructions",
+                                npu_executor.executed_count());
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to parse insts.bin: {}", e);
+                    }
+                }
+            }
+        }
 
         // Sync core enabled state from device tiles to engine
         engine.sync_cores_from_device();

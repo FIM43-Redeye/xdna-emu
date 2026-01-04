@@ -72,8 +72,11 @@ pub use timing::{DmaTimingConfig, ChannelTimingState, TransferPhase, ChannelArbi
 
 use super::aie2_spec;
 
-/// Number of buffer descriptors per DMA controller.
+/// Number of buffer descriptors per compute tile DMA controller.
 pub const NUM_BUFFER_DESCRIPTORS: usize = aie2_spec::NUM_DMA_BUFFER_DESCRIPTORS;
+
+/// Number of buffer descriptors per memory tile DMA controller.
+pub const MEMTILE_NUM_BUFFER_DESCRIPTORS: usize = aie2_spec::MEMTILE_NUM_DMA_BUFFER_DESCRIPTORS;
 
 /// Number of S2MM channels for compute tiles.
 pub const COMPUTE_S2MM_CHANNELS: usize = aie2_spec::COMPUTE_TILE_S2MM_CHANNELS;

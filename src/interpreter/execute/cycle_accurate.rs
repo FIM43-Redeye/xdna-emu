@@ -350,7 +350,8 @@ impl Executor for CycleAccurateExecutor {
                     ExecuteResult::Branch { .. }
                     | ExecuteResult::Halt
                     | ExecuteResult::WaitLock { .. }
-                    | ExecuteResult::WaitDma { .. } => {
+                    | ExecuteResult::WaitDma { .. }
+                    | ExecuteResult::WaitStream { .. } => {
                         final_result = result;
                     }
                     ExecuteResult::Continue => {}

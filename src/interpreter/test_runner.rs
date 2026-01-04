@@ -119,8 +119,9 @@ impl TestRunner {
                     tile.write_program(vaddr, data);
                 }
                 crate::parser::MemoryRegion::Data => {
+                    use crate::device::registers_spec::AIE_DATA_MEMORY_BASE;
                     // Load into data memory (offset from data memory base)
-                    let dm_offset = vaddr.saturating_sub(0x00070000);
+                    let dm_offset = vaddr.saturating_sub(AIE_DATA_MEMORY_BASE as usize);
                     let dm = tile.data_memory_mut();
                     if dm_offset + data.len() <= dm.len() {
                         dm[dm_offset..dm_offset + data.len()].copy_from_slice(data);
@@ -140,7 +141,7 @@ impl TestRunner {
 
     /// Write data to tile data memory.
     ///
-    /// Address is relative to data memory base (0x00070000 in AIE address space).
+    /// Address is relative to data memory base (AIE_DATA_MEMORY_BASE in AIE address space).
     pub fn write_tile_memory(&mut self, col: u8, row: u8, offset: usize, data: &[u8]) -> Result<()> {
         let tile = self.engine.device_mut().tile_mut(col as usize, row as usize)
             .ok_or_else(|| anyhow!("Invalid tile coordinates ({}, {})", col, row))?;
@@ -972,6 +973,9 @@ mod tests {
                         }
                         Some(CoreStatus::WaitingDma { channel }) => {
                             eprintln!("Step {:3}: PC=0x{:04X} -> WAIT_DMA({})", step, pc_before, channel);
+                        }
+                        Some(CoreStatus::WaitingStream { port }) => {
+                            eprintln!("Step {:3}: PC=0x{:04X} -> WAIT_STREAM({})", step, pc_before, port);
                         }
                         Some(CoreStatus::Running) | Some(CoreStatus::Ready) | None => {
                             // Only log every 10th step or on interesting PC change
@@ -2144,7 +2148,8 @@ mod tests {
                                 data.len(), vaddr);
                         }
                         MemoryRegion::Data => {
-                            let dm_offset = vaddr.saturating_sub(0x00070000);
+                            use crate::device::registers_spec::AIE_DATA_MEMORY_BASE;
+                            let dm_offset = vaddr.saturating_sub(AIE_DATA_MEMORY_BASE as usize);
                             let dm = tile.data_memory_mut();
                             if dm_offset + data.len() <= dm.len() {
                                 dm[dm_offset..dm_offset + data.len()].copy_from_slice(data);

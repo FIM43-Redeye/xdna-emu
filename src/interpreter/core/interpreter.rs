@@ -22,6 +22,8 @@ pub enum CoreStatus {
     WaitingLock { lock_id: u8 },
     /// Core is waiting on DMA completion.
     WaitingDma { channel: u8 },
+    /// Core is waiting on stream data (blocking read with empty buffer).
+    WaitingStream { port: u8 },
     /// Core has halted (normal termination).
     Halted,
     /// Core encountered an error.
@@ -38,6 +40,8 @@ pub enum StepResult {
     WaitLock { lock_id: u8 },
     /// Stalled waiting on DMA.
     WaitDma { channel: u8 },
+    /// Stalled waiting on stream data.
+    WaitStream { port: u8 },
     /// Core halted.
     Halt,
     /// Decode error.
@@ -201,6 +205,12 @@ where
                 StepResult::WaitDma { channel }
             }
 
+            ExecuteResult::WaitStream { port } => {
+                self.status = CoreStatus::WaitingStream { port };
+                ctx.record_stall(1);
+                StepResult::WaitStream { port }
+            }
+
             ExecuteResult::Halt => {
                 self.status = CoreStatus::Halted;
                 ctx.halted = true;
@@ -220,10 +230,13 @@ where
     fn try_resume_stall(&mut self, ctx: &mut ExecutionContext, tile: &mut Tile) -> Option<StepResult> {
         match self.status {
             CoreStatus::WaitingLock { lock_id } => {
-                // Try to acquire lock again
-                if tile.locks[lock_id as usize].acquire() {
+                // Check if lock is now available (don't acquire yet - instruction will do that)
+                let lock_value = tile.locks[lock_id as usize].value;
+                log::trace!("try_resume_stall: lock {} value = {}", lock_id, lock_value);
+                if lock_value > 0 {
+                    log::info!("Lock {} available (value={}), resuming execution", lock_id, lock_value);
                     self.status = CoreStatus::Ready;
-                    // Re-execute the instruction now that lock is acquired
+                    // Re-execute the instruction - it will acquire the lock
                     None
                 } else {
                     ctx.record_stall(1);
@@ -239,6 +252,18 @@ where
                 } else {
                     ctx.record_stall(1);
                     Some(StepResult::WaitDma { channel })
+                }
+            }
+
+            CoreStatus::WaitingStream { port } => {
+                // Check if stream data is available
+                if tile.has_stream_input(port) {
+                    self.status = CoreStatus::Ready;
+                    // Re-execute the instruction now that data is available
+                    None
+                } else {
+                    ctx.record_stall(1);
+                    Some(StepResult::WaitStream { port })
                 }
             }
 
@@ -259,7 +284,7 @@ where
                 result @ StepResult::DecodeError(_) => return (result, ctx.cycles - start_cycles),
                 result @ StepResult::ExecError(_) => return (result, ctx.cycles - start_cycles),
                 // On stall, count as one cycle and continue
-                StepResult::WaitLock { .. } | StepResult::WaitDma { .. } => continue,
+                StepResult::WaitLock { .. } | StepResult::WaitDma { .. } | StepResult::WaitStream { .. } => continue,
             }
         }
 

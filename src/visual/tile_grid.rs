@@ -32,6 +32,7 @@ fn tile_color(app: &EmulatorApp, col: u8, row: u8) -> Color32 {
                     CoreStatus::Running => Color32::from_rgb(50, 200, 50),      // Bright green
                     CoreStatus::WaitingLock { .. } => Color32::from_rgb(200, 200, 50), // Yellow
                     CoreStatus::WaitingDma { .. } => Color32::from_rgb(200, 150, 50),  // Orange
+                    CoreStatus::WaitingStream { .. } => Color32::from_rgb(150, 200, 200), // Cyan (waiting for stream data)
                     CoreStatus::Halted => Color32::from_rgb(150, 50, 50),       // Dark red
                     CoreStatus::Error => Color32::from_rgb(255, 0, 0),          // Bright red
                     CoreStatus::Ready => {

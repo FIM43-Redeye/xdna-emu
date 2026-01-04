@@ -8,6 +8,7 @@
 //! - [`device`]: Hardware state model (tiles, registers, memory)
 //! - [`interpreter`]: Accurate AIE2 interpreter
 //! - [`tablegen`]: TableGen parser for instruction definitions
+//! - [`npu`]: Host-to-NPU instruction execution
 //! - [`visual`]: GUI visualization (egui-based)
 //! - [`integration`]: External tool integration
 //! - [`testing`]: Test harness for XCLBIN binary compatibility
@@ -16,6 +17,7 @@ pub mod parser;
 pub mod device;
 pub mod interpreter;
 pub mod tablegen;
+pub mod npu;
 pub mod visual;
 pub mod integration;
 pub mod testing;

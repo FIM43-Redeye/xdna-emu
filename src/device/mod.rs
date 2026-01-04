@@ -49,6 +49,7 @@
 
 pub mod aie2_spec;
 pub mod registers;
+pub mod registers_spec;
 pub mod tile;
 pub mod array;
 pub mod state;

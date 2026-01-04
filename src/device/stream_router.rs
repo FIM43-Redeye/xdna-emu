@@ -257,7 +257,8 @@ impl StreamRouter {
     /// Create a new stream router for the given array dimensions.
     /// Uses instant routing by default (no latency modeling).
     pub fn new(cols: usize, rows: usize) -> Self {
-        let ports_per_tile = 8; // 8 master + 8 slave ports typical
+        // MemTile has 16 masters and 18 slaves, so we need at least 18 ports per tile
+        let ports_per_tile = 18;
         let fifo_depth = 4; // Words of buffering
 
         let num_tiles = cols * rows;
@@ -431,6 +432,10 @@ impl StreamRouter {
                 && !self.output_fifos[src_idx].is_empty() &&
                    !self.input_fifos[dest_idx].is_full() {
                     if let Some(word) = self.output_fifos[src_idx].pop() {
+                        log::debug!("StreamRouter: ({},{},{}) -> ({},{},{}) data=0x{:08X}",
+                            route.src.col, route.src.row, route.src.port,
+                            route.dest.col, route.dest.row, route.dest.port,
+                            word.data);
                         self.input_fifos[dest_idx].push(word);
                         any_moved = true;
                     }
@@ -560,6 +565,11 @@ impl StreamRouter {
             in_flight: self.in_flight.len(),
             current_cycle: self.current_cycle,
         }
+    }
+
+    /// Get all configured routes (for debugging).
+    pub fn routes(&self) -> &[Route] {
+        &self.routes
     }
 
     /// Clear all FIFOs, routes, and in-flight data.

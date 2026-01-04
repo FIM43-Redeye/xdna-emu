@@ -39,7 +39,7 @@ Component Completion:
 
 **Validation**: Run `add_one` kernel, verify output = input + 1.
 
-**Tests**: 554 passing
+**Tests**: 570 passing
 
 ### Milestone 2: Multi-Tile Data Flow (Target: 65%) - LARGELY COMPLETE
 
@@ -121,11 +121,32 @@ Current model uses operation latencies + hazard detection + branch penalties.
 
 ---
 
-### Progress Assessment (Updated Dec 31)
+### Progress Assessment (Updated Jan 1, 2026)
 
-**Milestones 1-3 COMPLETE. Milestone 4 ~75% COMPLETE (ISA expansion ongoing).**
+**Milestones 1-3 COMPLETE. Milestone 4 ~85% COMPLETE (ISA expansion ongoing).**
 
 We have **working multi-tile data flow** and **comprehensive ISA coverage** for ML workloads.
+
+#### Recent Session Discoveries (Jan 1, 2026)
+
+**Critical Bug Fixed - BD Chaining Parsing:**
+- Next_BD and Use_Next_BD fields were being read from word 3 (control), but they're
+  actually in **word 5 (d1)** at bits 30:27 and bit 26 respectively (AM029 reference).
+- This was preventing DMA ping-pong double-buffering from working.
+- Fix: Changed `write_dma_bd()` in `state.rs` to extract from word5 instead of word3.
+
+**New Feature - DMA Repeat Count:**
+- Implemented `start_channel_with_repeat()` in `DmaEngine`.
+- Task queue register bits 23:16 contain the repeat count (run BD N+1 times).
+- On transfer completion, if repeat_count > 0, the same BD is re-queued automatically.
+
+**Identified Gap - MemTile Configuration:**
+- The `add_one_using_dma` test uses MemTile (0,1) in the data path:
+  - Shim (0,0) → MemTile (0,1) → Compute (0,2) and back
+- The debug example was creating simplified direct routes that bypass the MemTile.
+- Result: Only 8 of 64 values get through (one buffer's worth).
+- **Root cause**: MemTile DMA channels aren't being configured from CDO yet.
+- **Required**: Parse and apply CDO writes to MemTile DMA BDs and channels.
 
 #### Gap 1: DMA/TileArray Integration - RESOLVED
 
@@ -159,7 +180,7 @@ We have **working multi-tile data flow** and **comprehensive ISA coverage** for 
 
 **Status**: ML/CNN workloads fully supported. Most common operations implemented.
 
-#### Current State (564 Tests Passing)
+#### Current State (570 Tests Passing)
 
 ```
 Current state:
@@ -185,9 +206,13 @@ Overall binary compatibility: ~90%
 
 #### Recommended Next Focus
 
-1. **Real XCLBIN end-to-end** - Load kernel, provide input data, verify output
-2. **Remaining specialized instructions** - ~25 more from TableGen
-3. **Edge case testing** - Boundary conditions, overflow handling
+1. **MemTile CDO Configuration** - Parse and apply CDO writes to MemTile DMA BDs and channels
+   - Currently blocking: `add_one_using_dma` only transfers 8 of 64 values
+   - Root cause: MemTile (0,1) DMA channels not configured from CDO
+   - Solution: Extend `apply_cdo()` to handle MemTile DMA register writes
+2. **Stream route extraction from CDO** - Replace manual route setup with CDO-driven configuration
+3. **Remaining specialized instructions** - ~12 more from TableGen
+4. **Edge case testing** - Boundary conditions, overflow handling
 
 ---
 
@@ -792,7 +817,7 @@ src/device/             # ✅ DONE
 
 ## Test Coverage
 
-**Total: 564 tests passing** (558 unit + 6 doc tests)
+**Total: 576 tests passing** (570 unit + 6 doc tests)
 
 | Module | Tests | Notes |
 |--------|-------|-------|
@@ -837,7 +862,7 @@ src/device/             # ✅ DONE
 | dma/transfer.rs | 13 | Transfer state machine |
 | dma/engine.rs | 15 | DmaEngine, timing integration |
 | dma/timing.rs | 5 | DmaTimingConfig, ChannelArbiter |
-| **Grand total** | **564** | All passing |
+| **Grand total** | **576** | All passing (570 unit + 6 doc) |
 
 ---
 

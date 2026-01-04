@@ -454,7 +454,7 @@ impl InterpreterEngine {
                             any_running = true;
                             self.total_instructions += 1;
                         }
-                        StepResult::WaitLock { .. } | StepResult::WaitDma { .. } => {
+                        StepResult::WaitLock { .. } | StepResult::WaitDma { .. } | StepResult::WaitStream { .. } => {
                             // Stalled, but still active
                             any_running = true;
                         }

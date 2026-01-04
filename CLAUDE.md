@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+There is one absolutely critical rule to always keep to: **REFER TO THE DOCUMENTATION.** The way to do so is described below, using Explore agents, since the body of documentation is very large.
+
 ## Project Vision
 
 **xdna-emu** is an open-source, cycle-accurate emulator and visual debugger for AMD XDNA NPUs (Ryzen AI). It fills the gap left by AMD's proprietary aiesimulator (which is license-gated, CLI-only, and not cycle-accurate).
@@ -53,6 +55,22 @@ We're starting with **Phoenix (NPU1/AIE2)** because it's the hardware we have. T
 **Not in scope**: Versal FPGAs (AIE + PL fabric) - different use case, no local hardware.
 
 ## Architecture Knowledge Sources
+
+**CRITICAL: Consult the architecture documentation when implementing any hardware feature.**
+
+Many debugging hours have been lost to assumptions about register layouts, address mappings, and data formats. The AIE-ML architecture has specific conventions that differ from intuition:
+- Lock registers are 16 bytes apart, not 4
+- Core lock IDs 48-63 map to memory module locks 0-15
+- BD fields span multiple words with specific bit layouts
+- DMA addressing uses word units, not bytes
+
+When implementing anything related to registers, DMA, locks, or memory:
+1. First read the relevant AM020/AM025 section
+2. Check the extracted docs in `docs/xdna/` (text files, not PDFs)
+3. Verify bit layouts and address calculations against the reference
+4. Add comments citing the specific register/section
+
+**Use Explore agents for documentation research.** The architecture docs are extensive (AM020 alone spans 100+ pages). Rather than reading files directly and wasting context, spawn an Explore agent with subagent_type='Explore' to navigate the docs and extract the specific details needed. This is ideal for questions like "how does AIE-ML memory addressing work?" or "what is the BD lock field format?"
 
 ### AMD Documentation
 - **AM020**: AIE-ML (AIE2) Architecture Manual
@@ -171,6 +189,24 @@ xdna-emu/
 - **llvm-aie**: `../llvm-aie` (local clone) - ISA definitions, TableGen files
 - **XRT**: https://github.com/Xilinx/XRT - runtime (installed at /opt/xilinx/xrt)
 - **aie-rt**: https://github.com/Xilinx/aie-rt - low-level register definitions
+
+## Available Development Tools
+
+### XRT Tools (in /opt/xilinx/xrt/bin/)
+- **xclbinutil**: Essential tool for XCLBIN inspection, extraction, and manipulation
+  - `xclbinutil --info --input file.xclbin` - dump sections and metadata
+  - `xclbinutil --dump-section` - extract specific sections
+- **xrt-smi**: Device management and diagnostics
+
+### MLIR-AIE Tools (in mlir-aie/my_install/ or ironenv/)
+- **llvm-objdump**: Disassemble AIE ELF binaries
+  - `llvm-objdump -d file.elf` - disassemble to see instruction mnemonics
+- **aie-translate**: MLIR to various formats
+- **aie-opt**: MLIR optimization passes
+
+### RyzenAI-SW Tools
+- Located in `/home/triple/npu-work/RyzenAI-SW/`
+- Contains NPU driver source and examples
 
 ## Build Commands
 

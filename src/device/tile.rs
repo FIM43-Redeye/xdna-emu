@@ -21,6 +21,7 @@
 //! - Cache-friendly layout (related data together)
 
 use super::aie2_spec;
+use super::stream_switch::StreamSwitch as FunctionalStreamSwitch;
 
 /// Size of data memory in compute tiles (64KB)
 /// See AM020 Ch4: "An individual data memory block is 64 KB"
@@ -343,45 +344,13 @@ impl CoreState {
     }
 }
 
-/// Stream switch port configuration.
+/// Legacy stream switch port configuration (kept for reference).
+/// The actual stream switch functionality is now in FunctionalStreamSwitch.
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
-pub struct StreamPort {
+pub struct LegacyStreamPort {
     /// Port configuration register
     pub config: u32,
-}
-
-/// Stream switch state (register-level stub).
-///
-/// This is a lightweight representation for CDO configuration.
-/// For functional simulation, see `stream_switch::StreamSwitch` which
-/// has full FIFO modeling and local route forwarding.
-///
-/// TODO: Unify with `stream_switch::StreamSwitch` to have one type
-/// that handles both register configuration and functional simulation.
-#[derive(Debug, Clone, Copy, Default)]
-#[repr(C)]
-pub struct StreamSwitch {
-    /// Master ports (typically 6)
-    pub master: [StreamPort; 8],
-    /// Slave ports (typically 8)
-    pub slave: [StreamPort; 8],
-    /// Control packet handler config
-    pub ctrl_pkt: u32,
-}
-
-impl StreamSwitch {
-    /// Step the stream switch (placeholder).
-    ///
-    /// This stub returns 0 - no actual data forwarding is done here.
-    /// Real stream routing is handled by `stream_switch::StreamSwitch`
-    /// instances in the TileArray's stream fabric.
-    ///
-    /// TODO: Migrate to unified StreamSwitch type for proper intra-tile routing.
-    pub fn step(&mut self) -> usize {
-        // Placeholder - real routing is in stream_switch::StreamSwitch
-        0
-    }
 }
 
 /// Tile type determines available resources.
@@ -426,10 +395,19 @@ pub struct Tile {
     /// DMA channels (0-1: S2MM, 2-3: MM2S)
     pub dma_channels: [DmaChannel; NUM_DMA_CHANNELS],
 
+    // === Stream port buffers (for core direct stream access) ===
+
+    /// Stream input buffer for core direct reads (StreamReadScalar)
+    /// Maps port number to queue of incoming data
+    pub stream_input: [std::collections::VecDeque<u32>; 8],
+
+    /// Stream output buffer for core direct writes (StreamWriteScalar)
+    pub stream_output: [std::collections::VecDeque<u32>; 8],
+
     // === Cold data (routing configuration) ===
 
-    /// Stream switch configuration
-    pub stream_switch: StreamSwitch,
+    /// Stream switch configuration (full functional model with FIFOs and local routes)
+    pub stream_switch: FunctionalStreamSwitch,
 
     // === Large data (memory) ===
 
@@ -440,6 +418,11 @@ pub struct Tile {
     /// Program memory (64KB, compute tiles only)
     /// None for shim and mem tiles
     program_memory: Option<Box<[u8; PROGRAM_MEMORY_SIZE]>>,
+
+    /// Register store for shim tiles (NPU configuration registers).
+    /// Shim tiles don't have data memory but need to store DMA/stream config.
+    /// Stored as sparse map since most addresses won't be written.
+    registers: std::collections::HashMap<u32, u32>,
 }
 
 impl Tile {
@@ -464,9 +447,16 @@ impl Tile {
             locks: [Lock::default(); NUM_LOCKS],
             dma_bds: [DmaBufferDescriptor::default(); NUM_DMA_BDS],
             dma_channels: [DmaChannel::default(); NUM_DMA_CHANNELS],
-            stream_switch: StreamSwitch::default(),
+            stream_input: Default::default(),
+            stream_output: Default::default(),
+            stream_switch: match tile_type {
+                TileType::Shim => FunctionalStreamSwitch::new_shim_tile(col),
+                TileType::MemTile => FunctionalStreamSwitch::new_mem_tile(col, row),
+                TileType::Compute => FunctionalStreamSwitch::new_compute_tile(col, row),
+            },
             data_memory: vec![0u8; data_memory_size].into_boxed_slice(),
             program_memory,
+            registers: std::collections::HashMap::new(),
         }
     }
 
@@ -579,6 +569,169 @@ impl Tile {
     #[inline]
     pub fn is_shim(&self) -> bool {
         self.tile_type == TileType::Shim
+    }
+
+    // === Register Access (for NPU instruction execution) ===
+
+    /// Write a 32-bit value to a register offset.
+    ///
+    /// For shim tiles, this stores to a sparse register map.
+    /// For other tiles, this may route to DMA BDs, locks, or other subsystems
+    /// based on the offset.
+    ///
+    /// # Register Offset Ranges (from AM020/AM025)
+    ///
+    /// - 0x14000-0x147FF: Lock registers
+    /// - 0x1D000-0x1D3FF: DMA BD registers
+    /// - 0x1D400-0x1D7FF: DMA channel control
+    /// - 0x3F000-0x3FFFF: Stream switch configuration
+    pub fn write_register(&mut self, offset: u32, value: u32) {
+        // Always store in the register map for later retrieval
+        self.registers.insert(offset, value);
+
+        // For specific ranges, also update internal state
+        // DMA BD range: 0x1D000-0x1D3FF (16 BDs × 32 bytes each)
+        if offset >= 0x1D000 && offset < 0x1D200 {
+            let bd_offset = offset - 0x1D000;
+            let bd_index = (bd_offset / 0x20) as usize;
+            let reg_in_bd = (bd_offset % 0x20) as usize / 4;
+
+            if bd_index < NUM_DMA_BDS {
+                let bd = &mut self.dma_bds[bd_index];
+                match reg_in_bd {
+                    0 => bd.addr_low = value,
+                    1 => bd.addr_high = value,
+                    2 => bd.length = value,
+                    3 => bd.control = value,
+                    4 => bd.d0 = value,
+                    5 => bd.d1 = value,
+                    _ => {}
+                }
+            }
+        }
+
+        // Lock registers: 0x14000-0x14XXX
+        if offset >= 0x14000 && offset < 0x15000 {
+            let lock_offset = offset - 0x14000;
+            let lock_id = (lock_offset / 0x10) as usize;
+            if lock_id < NUM_LOCKS {
+                // Lock value register is at offset 0x0 within each lock block
+                if lock_offset % 0x10 == 0 {
+                    self.locks[lock_id].set((value & 0x3F) as u8);
+                }
+            }
+        }
+
+        // DMA channel control: 0x1D200-0x1D3FF
+        if offset >= 0x1D200 && offset < 0x1D400 {
+            let ch_offset = offset - 0x1D200;
+            let ch_index = (ch_offset / 0x8) as usize;
+            if ch_index < NUM_DMA_CHANNELS {
+                let ch = &mut self.dma_channels[ch_index];
+                if ch_offset % 0x8 == 0 {
+                    ch.control = value;
+                } else {
+                    ch.start_queue = value;
+                }
+            }
+        }
+    }
+
+    /// Read a 32-bit value from a register offset.
+    ///
+    /// Returns 0 for unwritten registers (default state).
+    pub fn read_register(&self, offset: u32) -> u32 {
+        // Check specific subsystem state first
+        // DMA BD range: 0x1D000-0x1D1FF
+        if offset >= 0x1D000 && offset < 0x1D200 {
+            let bd_offset = offset - 0x1D000;
+            let bd_index = (bd_offset / 0x20) as usize;
+            let reg_in_bd = (bd_offset % 0x20) as usize / 4;
+
+            if bd_index < NUM_DMA_BDS {
+                let bd = &self.dma_bds[bd_index];
+                return match reg_in_bd {
+                    0 => bd.addr_low,
+                    1 => bd.addr_high,
+                    2 => bd.length,
+                    3 => bd.control,
+                    4 => bd.d0,
+                    5 => bd.d1,
+                    _ => 0,
+                };
+            }
+        }
+
+        // Fall back to register map
+        self.registers.get(&offset).copied().unwrap_or(0)
+    }
+
+    /// Get a reference to the raw register map.
+    ///
+    /// Useful for debugging and inspection.
+    pub fn registers(&self) -> &std::collections::HashMap<u32, u32> {
+        &self.registers
+    }
+
+    // === Stream Port Access (for core direct stream reads/writes) ===
+
+    /// Push a word to the stream input buffer for a port.
+    ///
+    /// Called by the stream router when data arrives for this tile.
+    pub fn push_stream_input(&mut self, port: u8, value: u32) {
+        if (port as usize) < self.stream_input.len() {
+            self.stream_input[port as usize].push_back(value);
+        }
+    }
+
+    /// Pop a word from the stream input buffer for a port.
+    ///
+    /// Called by StreamReadScalar when the core reads from a stream port.
+    /// Returns None if no data is available (should stall if blocking).
+    pub fn pop_stream_input(&mut self, port: u8) -> Option<u32> {
+        if (port as usize) < self.stream_input.len() {
+            self.stream_input[port as usize].pop_front()
+        } else {
+            None
+        }
+    }
+
+    /// Check if stream input has data for a port.
+    pub fn has_stream_input(&self, port: u8) -> bool {
+        if (port as usize) < self.stream_input.len() {
+            !self.stream_input[port as usize].is_empty()
+        } else {
+            false
+        }
+    }
+
+    /// Get stream input queue length for a port.
+    pub fn stream_input_len(&self, port: u8) -> usize {
+        if (port as usize) < self.stream_input.len() {
+            self.stream_input[port as usize].len()
+        } else {
+            0
+        }
+    }
+
+    /// Push a word to the stream output buffer for a port.
+    ///
+    /// Called by StreamWriteScalar when the core writes to a stream port.
+    pub fn push_stream_output(&mut self, port: u8, value: u32) {
+        if (port as usize) < self.stream_output.len() {
+            self.stream_output[port as usize].push_back(value);
+        }
+    }
+
+    /// Pop a word from the stream output buffer for a port.
+    ///
+    /// Called by the stream router to collect data from this tile.
+    pub fn pop_stream_output(&mut self, port: u8) -> Option<u32> {
+        if (port as usize) < self.stream_output.len() {
+            self.stream_output[port as usize].pop_front()
+        } else {
+            None
+        }
     }
 }
 

@@ -36,7 +36,8 @@ use std::collections::VecDeque;
 
 use super::{
     BdConfig, ChannelType, DmaError, DmaResult,
-    NUM_BUFFER_DESCRIPTORS, COMPUTE_S2MM_CHANNELS, COMPUTE_MM2S_CHANNELS,
+    NUM_BUFFER_DESCRIPTORS, MEMTILE_NUM_BUFFER_DESCRIPTORS,
+    COMPUTE_S2MM_CHANNELS, COMPUTE_MM2S_CHANNELS,
     MEM_TILE_S2MM_CHANNELS, MEM_TILE_MM2S_CHANNELS, DMA_DATA_WIDTH_BYTES,
 };
 use super::transfer::{Transfer, TransferDirection, TransferEndpoint, TransferState};
@@ -119,6 +120,13 @@ pub struct DmaEngine {
     /// Queued BD per channel (for chaining)
     queued_bds: Vec<Option<u8>>,
 
+    /// Repeat count per channel (how many more times to repeat current BD)
+    /// Value N means run the BD N+1 more times after current
+    repeat_counts: Vec<u8>,
+
+    /// Current BD index per channel (for repeat)
+    current_bds: Vec<Option<u8>>,
+
     /// Timing configuration (controls cycle-accuracy vs fast mode)
     timing_config: DmaTimingConfig,
 
@@ -161,15 +169,27 @@ impl DmaEngine {
             transfers.push(None);
         }
 
+        // MemTile has 48 BDs, compute tile has 16
+        let num_bds = if is_mem_tile {
+            MEMTILE_NUM_BUFFER_DESCRIPTORS
+        } else {
+            NUM_BUFFER_DESCRIPTORS
+        };
+
+        log::debug!("DmaEngine::new col={} row={} is_mem_tile={} num_channels={} num_bds={}",
+            col, row, is_mem_tile, num_channels, num_bds);
+
         Self {
             col,
             row,
             is_mem_tile,
-            bd_configs: vec![BdConfig::default(); NUM_BUFFER_DESCRIPTORS],
+            bd_configs: vec![BdConfig::default(); num_bds],
             transfers,
             channel_states: vec![ChannelState::Idle; num_channels],
             channel_stats: vec![ChannelStats::default(); num_channels],
             queued_bds: vec![None; num_channels],
+            repeat_counts: vec![0; num_channels],
+            current_bds: vec![None; num_channels],
             // Default to instant timing for backwards compatibility
             timing_config: DmaTimingConfig::instant(),
             timing_states: vec![ChannelTimingState::default(); num_channels],
@@ -244,7 +264,7 @@ impl DmaEngine {
 
     /// Configure a buffer descriptor.
     pub fn configure_bd(&mut self, bd_index: u8, config: BdConfig) -> Result<(), DmaError> {
-        if bd_index as usize >= NUM_BUFFER_DESCRIPTORS {
+        if bd_index as usize >= self.bd_configs.len() {
             return Err(DmaError::InvalidBd(bd_index));
         }
 
@@ -264,13 +284,27 @@ impl DmaEngine {
 
     /// Start a channel with the specified BD.
     pub fn start_channel(&mut self, channel: ChannelId, bd_index: u8) -> Result<(), DmaError> {
+        self.start_channel_with_repeat(channel, bd_index, 0)
+    }
+
+    /// Start a channel with the specified BD and repeat count.
+    ///
+    /// The repeat_count indicates how many additional times to run the BD after
+    /// the first execution. So repeat_count=0 means run once, repeat_count=3
+    /// means run 4 times total.
+    pub fn start_channel_with_repeat(
+        &mut self,
+        channel: ChannelId,
+        bd_index: u8,
+        repeat_count: u8,
+    ) -> Result<(), DmaError> {
         let ch_idx = channel as usize;
 
         if ch_idx >= self.num_channels() {
             return Err(DmaError::InvalidChannel(channel));
         }
 
-        if bd_index as usize >= NUM_BUFFER_DESCRIPTORS {
+        if bd_index as usize >= self.bd_configs.len() {
             return Err(DmaError::InvalidBd(bd_index));
         }
 
@@ -305,8 +339,20 @@ impl DmaEngine {
             _ => ChannelState::Idle,
         };
 
+        // Log transfer details for debugging
+        log::debug!("DMA tile({},{}) ch{} transfer: total_bytes={} src={:?} dst={:?} state={:?}",
+            self.col, self.row, channel,
+            transfer.total_bytes, transfer.source, transfer.dest, transfer.state);
+
         self.transfers[ch_idx] = Some(transfer);
         self.channel_states[ch_idx] = new_state;
+        self.repeat_counts[ch_idx] = repeat_count;
+        self.current_bds[ch_idx] = Some(bd_index);
+
+        if repeat_count > 0 {
+            log::info!("DMA tile({},{}) ch{} started BD {} with repeat_count={}",
+                self.col, self.row, channel, bd_index, repeat_count);
+        }
 
         Ok(())
     }
@@ -354,6 +400,51 @@ impl DmaEngine {
         }
 
         Ok(())
+    }
+
+    /// Enable a channel by type and relative channel number.
+    ///
+    /// This is used by the NPU executor when a DMA control register is written.
+    /// The channel is marked as active, ready to be started with a BD.
+    ///
+    /// # Arguments
+    /// * `is_mm2s` - true for MM2S (memory-to-stream), false for S2MM
+    /// * `relative_channel` - channel number within the type (0 or 1 for compute tiles)
+    pub fn enable_channel(&mut self, is_mm2s: bool, relative_channel: u8) {
+        // Convert relative channel to absolute channel index
+        // For compute tiles: S2MM = 0-1, MM2S = 2-3
+        // For mem tiles: S2MM = 0-5, MM2S = 6-11
+        let s2mm_count = if self.is_mem_tile {
+            MEM_TILE_S2MM_CHANNELS
+        } else {
+            COMPUTE_S2MM_CHANNELS
+        };
+
+        let ch_idx = if is_mm2s {
+            s2mm_count + relative_channel as usize
+        } else {
+            relative_channel as usize
+        };
+
+        if ch_idx >= self.num_channels() {
+            log::warn!(
+                "DmaEngine::enable_channel: invalid channel {} (is_mm2s={}, rel={})",
+                ch_idx, is_mm2s, relative_channel
+            );
+            return;
+        }
+
+        // Mark channel as ready/active
+        // The actual transfer will start when start_channel is called with a BD
+        log::debug!(
+            "DmaEngine ({}, {}): enabled {} channel {}",
+            self.col, self.row,
+            if is_mm2s { "MM2S" } else { "S2MM" },
+            relative_channel
+        );
+
+        // If the channel was idle, we might need to start it with a queued BD
+        // For now, just mark it as being enabled (the queue mechanism handles this)
     }
 
     /// Check if a channel is active.
@@ -421,9 +512,15 @@ impl DmaEngine {
                 ChannelState::Complete => {
                     // Check for BD chaining
                     if let Some(next_bd) = self.queued_bds[ch_idx].take() {
-                        if let Err(_e) = self.start_channel(ch_idx as u8, next_bd) {
+                        log::debug!("DMA tile({},{}) ch{} starting queued BD {}",
+                            self.col, self.row, ch_idx, next_bd);
+                        if let Err(e) = self.start_channel(ch_idx as u8, next_bd) {
+                            log::warn!("DMA tile({},{}) ch{} failed to start BD {}: {:?}",
+                                self.col, self.row, ch_idx, next_bd, e);
                             self.channel_states[ch_idx] = ChannelState::Error;
                         } else {
+                            log::debug!("DMA tile({},{}) ch{} now active with BD {}",
+                                self.col, self.row, ch_idx, next_bd);
                             any_active = true;
                         }
                     }
@@ -477,10 +574,20 @@ impl DmaEngine {
             let dest = transfer.dest;
             let channel = transfer.channel;
             let remaining_after = transfer.remaining_bytes().saturating_sub(bytes_to_transfer as u64);
+            log::trace!(
+                "DMA ch{} step: src={:?} dst={:?} addr=0x{:X} bytes={}",
+                ch_idx, source, dest, addr, bytes_to_transfer
+            );
             (bytes_to_transfer, addr, source, dest, channel, remaining_after == 0)
         };
 
         let (bytes_to_transfer, addr, source, dest, channel, is_last) = transfer_info;
+
+        // Log progress for debugging (shim tile MM2S channel)
+        if self.col == 0 && self.row == 0 && ch_idx == 2 {
+            let remaining = self.transfers[ch_idx].as_ref().unwrap().remaining_bytes();
+            log::info!("Shim MM2S step: addr=0x{:X} bytes={} remaining={}", addr, bytes_to_transfer, remaining);
+        }
 
         // Handle zero-byte transfer case
         if bytes_to_transfer == 0 {
@@ -490,6 +597,9 @@ impl DmaEngine {
 
         // S2MM stalls when stream_in has no data - wait for routing to provide data
         if matches!(source, TransferEndpoint::Stream { .. }) && self.stream_in.is_empty() {
+            // Debug: log when we stall waiting for stream data
+            log::debug!("DMA({},{}) ch{} S2MM stall: stream_in empty, addr=0x{:X}, remaining={}",
+                self.col, self.row, ch_idx, addr, bytes_to_transfer);
             // Stall: don't advance transfer, wait for data to arrive via route_dma_streams
             return;
         }
@@ -616,6 +726,14 @@ impl DmaEngine {
             (TransferEndpoint::TileMemory { .. }, TransferEndpoint::HostMemory) => {
                 Self::transfer_tile_to_host_static(addr, bytes, tile, host_memory)
             }
+            (TransferEndpoint::HostMemory, TransferEndpoint::Stream { .. }) => {
+                // Shim MM2S: Read from host DDR, queue to stream output
+                self.transfer_host_to_stream(addr, bytes, channel, is_last, host_memory)
+            }
+            (TransferEndpoint::Stream { .. }, TransferEndpoint::HostMemory) => {
+                // Shim S2MM: Read from stream input, write to host DDR
+                self.transfer_stream_to_host(addr, bytes, host_memory)
+            }
             (TransferEndpoint::TileMemory { .. }, TransferEndpoint::TileMemory { .. }) => {
                 // Tile to tile: Would need array access, mark as success for now
                 true
@@ -626,8 +744,15 @@ impl DmaEngine {
 
     /// MM2S: Read from tile memory and queue to stream output.
     fn transfer_mm2s(&mut self, addr: u64, bytes: usize, channel: u8, is_last: bool, tile: &Tile) -> bool {
-        let offset = addr as usize;
-        if offset + bytes > tile.data_memory().len() {
+        let mem_size = tile.data_memory().len();
+
+        // MemTile DMA addresses may have a 0x80000 offset in the address space
+        // Wrap addresses to stay within memory bounds
+        let offset = (addr as usize) % mem_size;
+
+        if offset + bytes > mem_size {
+            log::warn!("DMA({},{}) MM2S addr=0x{:X} bytes={} wraps past memory end (size=0x{:X})",
+                self.col, self.row, addr, bytes, mem_size);
             return false;
         }
 
@@ -671,8 +796,15 @@ impl DmaEngine {
     /// Only transfers data that is available in stream_in.
     /// Returns false if stream_in is empty (caller should stall).
     fn transfer_s2mm(&mut self, addr: u64, bytes: usize, tile: &mut Tile) -> bool {
-        let offset = addr as usize;
-        if offset + bytes > tile.data_memory().len() {
+        let mem_size = tile.data_memory().len();
+
+        // MemTile DMA addresses may have a 0x80000 offset in the address space
+        // Wrap addresses to stay within memory bounds
+        let offset = (addr as usize) % mem_size;
+
+        if offset + bytes > mem_size {
+            log::warn!("DMA({},{}) S2MM addr=0x{:X} bytes={} wraps past memory end (size=0x{:X})",
+                self.col, self.row, addr, bytes, mem_size);
             return false;
         }
 
@@ -705,6 +837,70 @@ impl DmaEngine {
         }
 
         true
+    }
+
+    /// Shim MM2S: Read from host DDR and queue to stream output.
+    fn transfer_host_to_stream(
+        &mut self,
+        addr: u64,
+        bytes: usize,
+        channel: u8,
+        is_last: bool,
+        host_memory: &HostMemory,
+    ) -> bool {
+        // Read data from host memory in 32-bit words
+        let word_count = (bytes + 3) / 4;
+
+        log::debug!("MM2S transfer: addr=0x{:X} bytes={} words={}", addr, bytes, word_count);
+
+        for i in 0..word_count {
+            let word_addr = addr + (i * 4) as u64;
+            let word = host_memory.read_u32(word_addr);
+
+            if i < 4 {
+                log::debug!("  MM2S word[{}]: addr=0x{:X} -> 0x{:08X}", i, word_addr, word);
+            }
+
+            self.stream_out.push_back(StreamData {
+                data: word,
+                channel,
+                tlast: is_last && i == word_count - 1,
+            });
+        }
+
+        true
+    }
+
+    /// Shim S2MM: Read from stream input and write to host DDR.
+    fn transfer_stream_to_host(
+        &mut self,
+        addr: u64,
+        bytes: usize,
+        host_memory: &mut HostMemory,
+    ) -> bool {
+        // Must have at least one word to transfer
+        if self.stream_in.is_empty() {
+            return false;
+        }
+
+        // Write data to host memory in 32-bit words
+        let mut bytes_written = 0;
+        let word_count = (bytes + 3) / 4;
+
+        for i in 0..word_count {
+            let word = if let Some(stream_data) = self.stream_in.pop_front() {
+                stream_data.data
+            } else {
+                // No more stream data
+                break;
+            };
+
+            let word_addr = addr + (i * 4) as u64;
+            host_memory.write_u32(word_addr, word);
+            bytes_written += 4;
+        }
+
+        bytes_written > 0
     }
 
     /// Set a transfer error on a channel.
@@ -768,10 +964,17 @@ impl DmaEngine {
             None => return,
         };
 
+        log::debug!("complete_transfer tile({},{}) ch={} state={:?} release_lock={:?}",
+            self.col, self.row, ch_idx, transfer.state, transfer.release_lock);
+
         // Handle lock release if needed
         if let TransferState::ReleasingLock(lock_id) = transfer.state {
+            log::info!("DMA tile({},{}) releasing lock {} on channel {}",
+                self.col, self.row, lock_id, ch_idx);
             if (lock_id as usize) < tile.locks.len() {
                 tile.locks[lock_id as usize].release();
+                log::info!("Tile({},{}) lock {} now = {}",
+                    self.col, self.row, lock_id, tile.locks[lock_id as usize].value);
             }
             transfer.lock_released();
         }
@@ -780,9 +983,21 @@ impl DmaEngine {
         self.channel_stats[ch_idx].transfers_completed += 1;
         self.channel_stats[ch_idx].cycles_spent += transfer.cycles_elapsed;
 
-        // Check for BD chaining
+        // Check for BD chaining first
         if let Some(next_bd) = transfer.next_bd {
+            log::debug!("DMA tile({},{}) ch{} chaining to BD {} (from BD {})",
+                self.col, self.row, ch_idx, next_bd, transfer.bd_index);
             self.queued_bds[ch_idx] = Some(next_bd);
+        }
+        // If no chaining, check for repeat count
+        else if self.repeat_counts[ch_idx] > 0 {
+            // Decrement repeat count and requeue the same BD
+            self.repeat_counts[ch_idx] -= 1;
+            if let Some(bd_idx) = self.current_bds[ch_idx] {
+                self.queued_bds[ch_idx] = Some(bd_idx);
+                log::debug!("DMA tile({},{}) ch{} repeating BD {} ({} remaining)",
+                    self.col, self.row, ch_idx, bd_idx, self.repeat_counts[ch_idx]);
+            }
         }
 
         // Mark channel as complete
@@ -792,8 +1007,14 @@ impl DmaEngine {
 
     /// Try to acquire a lock.
     ///
+    /// AIE-ML lock acquire semantics:
+    /// - If acquire_value < 0: `acq_ge` - wait until lock >= |value|, then decrement by |value|
+    /// - If acquire_value >= 0: `acq_eq` - wait until lock == value, then set to 0
+    ///
     /// If lock timing is enabled, tracks acquire attempts and contention.
     fn try_acquire_lock(&mut self, ch_idx: usize, lock_id: u8, tile: &mut Tile) -> bool {
+        use crate::device::tile::LockResult;
+
         if (lock_id as usize) >= tile.locks.len() {
             return false;
         }
@@ -803,9 +1024,29 @@ impl DmaEngine {
             None => return false,
         };
 
-        // Check if lock value matches expected acquire value
+        let acquire_value = transfer.acquire_value;
         let lock = &mut tile.locks[lock_id as usize];
-        let success = lock.acquire();
+
+        // AIE-ML lock semantics from AM020:
+        // - acquire_value < 0: acq_ge, expected = |value|, delta = value (decrement)
+        // - acquire_value >= 0: acq_eq, expected = value, delta = -value (decrement to 0)
+        let (expected, delta) = if acquire_value < 0 {
+            // acq_ge: wait until lock >= |value|, then decrement by |value|
+            ((-acquire_value) as u8, acquire_value)
+        } else if acquire_value > 0 {
+            // acq_eq: wait until lock == value, then decrement to 0
+            (acquire_value as u8, -acquire_value)
+        } else {
+            // acquire_value == 0: simple acquire (decrement if > 0)
+            (1, -1)
+        };
+
+        let current_value = lock.value;
+        let result = lock.acquire_with_value(expected, delta);
+        let success = matches!(result, LockResult::Success);
+
+        log::trace!("DMA try_acquire_lock tile({},{}) ch{} lock={} expected={} delta={} current={} result={:?}",
+            self.col, self.row, ch_idx, lock_id, expected, delta, current_value, result);
 
         // Track timing if enabled
         if let Some(ref mut timing) = self.lock_timing {
@@ -903,16 +1144,24 @@ impl DmaEngine {
         self.stream_in.len()
     }
 
-    /// Check if any S2MM channel is waiting for stream data.
+    /// Check if any S2MM channel needs to receive stream data.
     ///
     /// Returns Some(channel) if a channel needs data, None otherwise.
+    /// This returns true for S2MM channels that are:
+    /// - Active and waiting for data
+    /// - WaitingForLock (will need data once lock is acquired)
+    /// This allows the stream routing to buffer data in stream_in before
+    /// the lock is acquired, matching how real hardware works.
     pub fn s2mm_needs_data(&self) -> Option<ChannelId> {
         for ch_idx in 0..self.num_channels() {
-            if self.channel_type(ch_idx as u8) == ChannelType::S2MM
-                && self.channel_states[ch_idx] == ChannelState::Active
-                && self.stream_in.is_empty()
-            {
-                return Some(ch_idx as u8);
+            if self.channel_type(ch_idx as u8) == ChannelType::S2MM {
+                let state = &self.channel_states[ch_idx];
+                // Accept data if channel is active or waiting for lock
+                let is_pending = matches!(state, ChannelState::Active | ChannelState::WaitingForLock(_));
+                // Only accept if stream_in has space
+                if is_pending && self.stream_in.len() < 256 {
+                    return Some(ch_idx as u8);
+                }
             }
         }
         None
@@ -1280,5 +1529,25 @@ mod tests {
         let lock_timing = engine.lock_timing().unwrap();
         let stats = lock_timing.stats(3).unwrap();
         assert_eq!(stats.acquires, 1, "Should have recorded 1 acquire");
+    }
+
+    #[test]
+    fn test_memtile_bd_capacity() {
+        // MemTile should support 48 BDs
+        let mut engine = DmaEngine::new_mem_tile(0, 1);
+
+        // Should be able to configure BD 0
+        assert!(engine.configure_bd(0, BdConfig::simple_1d(0x100, 16)).is_ok());
+
+        // Should be able to configure BD 47 (last valid for MemTile)
+        assert!(engine.configure_bd(47, BdConfig::simple_1d(0x100, 16)).is_ok());
+
+        // BD 48 should fail
+        assert!(engine.configure_bd(48, BdConfig::simple_1d(0x100, 16)).is_err());
+
+        // Compute tile should only support 16 BDs
+        let mut compute = DmaEngine::new_compute_tile(0, 2);
+        assert!(compute.configure_bd(15, BdConfig::simple_1d(0x100, 16)).is_ok());
+        assert!(compute.configure_bd(16, BdConfig::simple_1d(0x100, 16)).is_err());
     }
 }

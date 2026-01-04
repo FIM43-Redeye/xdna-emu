@@ -272,11 +272,12 @@ impl CdoCommand {
     /// Decode tile coordinates from AIE address
     /// Returns (column, row, offset) for standard AIE2 addressing
     pub fn decode_aie_address(&self) -> Option<(u8, u8, u32)> {
+        use crate::device::registers_spec::{TILE_COL_SHIFT, TILE_ROW_SHIFT, TILE_OFFSET_MASK};
         let addr = self.address()?;
         // AIE2: col = bits[29:25], row = bits[24:20], offset = bits[19:0]
-        let col = ((addr >> 25) & 0x1F) as u8;
-        let row = ((addr >> 20) & 0x1F) as u8;
-        let offset = (addr & 0xFFFFF) as u32;
+        let col = ((addr >> TILE_COL_SHIFT) & 0x1F) as u8;
+        let row = ((addr >> TILE_ROW_SHIFT) & 0x1F) as u8;
+        let offset = (addr as u32) & TILE_OFFSET_MASK;
         Some((col, row, offset))
     }
 }
@@ -487,14 +488,27 @@ impl<'a> Iterator for CdoCommandIterator<'a> {
 
             CdoOpcode::DmaWrite if payload_len >= 2 => {
                 let address = payload[0];
-                let byte_len = payload[1] as usize;
-                // Data starts at payload[2]
-                let data: Vec<u8> = payload[2..]
-                    .iter()
-                    .flat_map(|w| w.to_le_bytes())
-                    .take(byte_len)
-                    .collect();
-                CdoCommand::DmaWrite { address, data }
+
+                // Handle embedded format (addr=0 means target is in payload[1])
+                if address == 0 && payload_len >= 2 {
+                    // Embedded format: [0, target_addr, data...]
+                    // No separate byte_len - data length is (payload_len - 2) * 4
+                    let target_addr = payload[1];
+                    let data: Vec<u8> = payload[2..]
+                        .iter()
+                        .flat_map(|w| w.to_le_bytes())
+                        .collect();
+                    CdoCommand::DmaWrite { address: target_addr, data }
+                } else {
+                    // Standard format: [addr, byte_len, data...]
+                    let byte_len = payload[1] as usize;
+                    let data: Vec<u8> = payload[2..]
+                        .iter()
+                        .flat_map(|w| w.to_le_bytes())
+                        .take(byte_len)
+                        .collect();
+                    CdoCommand::DmaWrite { address, data }
+                }
             }
 
             CdoOpcode::MaskPoll if payload_len >= 3 => CdoCommand::MaskPoll {

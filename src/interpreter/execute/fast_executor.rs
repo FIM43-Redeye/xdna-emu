@@ -19,7 +19,7 @@ use crate::interpreter::traits::{ExecuteResult, Executor};
 use super::control::ControlUnit;
 use super::memory::MemoryUnit;
 use super::scalar::ScalarAlu;
-use super::stream::StreamOps;
+use super::stream::{StreamOps, StreamResult};
 use super::vector::VectorAlu;
 
 /// Fast executor that executes bundles in a single cycle.
@@ -73,8 +73,13 @@ impl FastExecutor {
             return None; // Memory op handled
         }
 
-        if StreamOps::execute(op, ctx, tile) {
-            return None; // Stream op handled
+        match StreamOps::execute(op, ctx, tile) {
+            StreamResult::Completed => return None, // Stream op handled
+            StreamResult::Stall { port } => {
+                // Blocking stream read with no data - return WaitStream
+                return Some(ExecuteResult::WaitStream { port });
+            }
+            StreamResult::NotStreamOp => {} // Fall through to next unit
         }
 
         if let Some(result) = ControlUnit::execute(op, ctx, tile) {
@@ -116,13 +121,20 @@ impl Executor for FastExecutor {
         for op in bundle.active_slots() {
             #[cfg(test)]
             eprintln!("[EXEC] Slot {:?}: op={:?}", op.slot, op.op);
+
+            // Debug log for PointerMov execution
+            if matches!(op.op, Operation::PointerMov) {
+                log::debug!("[EXEC PMOV] slot={:?} dest={:?} sources={:?}", op.slot, op.dest, op.sources);
+            }
+
             if let Some(result) = self.execute_slot(op, ctx, tile) {
                 // Control flow result - remember it
                 match &result {
                     ExecuteResult::Branch { .. }
                     | ExecuteResult::Halt
                     | ExecuteResult::WaitLock { .. }
-                    | ExecuteResult::WaitDma { .. } => {
+                    | ExecuteResult::WaitDma { .. }
+                    | ExecuteResult::WaitStream { .. } => {
                         final_result = result;
                     }
                     ExecuteResult::Continue => {}

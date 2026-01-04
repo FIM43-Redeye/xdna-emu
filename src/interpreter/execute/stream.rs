@@ -32,6 +32,7 @@
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{Operation, Operand, SlotOp};
 use crate::interpreter::state::ExecutionContext;
+use crate::interpreter::traits::ExecuteResult;
 
 /// Stream operations execution unit.
 ///
@@ -39,17 +40,31 @@ use crate::interpreter::state::ExecutionContext;
 /// This unit requires access to the Tile's stream switch for buffer operations.
 pub struct StreamOps;
 
+/// Result of stream operation execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamResult {
+    /// Operation completed successfully.
+    Completed,
+    /// Operation needs to stall (blocking read with empty buffer).
+    Stall { port: u8 },
+    /// Not a stream operation.
+    NotStreamOp,
+}
+
 impl StreamOps {
     /// Execute a stream operation.
     ///
-    /// Returns `true` if the operation was handled, `false` if not a stream op.
+    /// Returns:
+    /// - `StreamResult::Completed` if the operation was handled successfully
+    /// - `StreamResult::Stall { port }` if blocking on empty stream
+    /// - `StreamResult::NotStreamOp` if not a stream operation
     ///
     /// # Arguments
     ///
     /// * `op` - The slot operation to execute
     /// * `ctx` - Execution context with register files
     /// * `tile` - The tile containing stream buffers
-    pub fn execute(op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) -> bool {
+    pub fn execute(op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) -> StreamResult {
         match &op.op {
             Operation::StreamWriteScalar { blocking } => {
                 // Get the source value from the scalar register
@@ -67,7 +82,7 @@ impl StreamOps {
                 // For now, the operation succeeds but data is discarded
                 let _ = (value, blocking, tile);
 
-                true
+                StreamResult::Completed
             }
 
             Operation::StreamWritePacketHeader { blocking } => {
@@ -85,29 +100,31 @@ impl StreamOps {
                 // Packet headers contain routing information for packet-switched mode
                 let _ = (header, blocking, tile);
 
-                true
+                StreamResult::Completed
             }
 
             Operation::StreamReadScalar { blocking } => {
-                // Log the operation for debugging/tracing
-                #[cfg(any(test, debug_assertions))]
-                eprintln!(
-                    "[STREAM] ReadScalar: blocking={} (tile {},{}) - STUB",
-                    blocking, tile.col, tile.row
-                );
+                // Get the stream port from the operation (default to port 0)
+                // TODO: Parse port from instruction encoding
+                let port = 0u8;
 
-                // TODO: Pop value from tile's stream input buffer
-                // For now, read returns zero
-                let value: u32 = 0;
-                let _ = (blocking, tile);
-
-                // Write the value to the destination register
-                Self::write_dest(op, ctx, value);
-
-                true
+                // Try to pop value from tile's stream input buffer
+                if let Some(value) = tile.pop_stream_input(port) {
+                    // Data available - write to destination register
+                    Self::write_dest(op, ctx, value);
+                    StreamResult::Completed
+                } else if *blocking {
+                    // No data and blocking - signal stall
+                    // The interpreter will retry this instruction
+                    StreamResult::Stall { port }
+                } else {
+                    // No data but non-blocking - write 0 and continue
+                    Self::write_dest(op, ctx, 0);
+                    StreamResult::Completed
+                }
             }
 
-            _ => false, // Not a stream operation
+            _ => StreamResult::NotStreamOp,
         }
     }
 
@@ -172,8 +189,11 @@ mod tests {
         )
         .with_source(Operand::ScalarReg(0));
 
-        // Should return true (handled) even though it's a stub
-        assert!(StreamOps::execute(&op, &mut ctx, &mut tile));
+        // Should return Completed even though it's a stub
+        assert_eq!(
+            StreamOps::execute(&op, &mut ctx, &mut tile),
+            StreamResult::Completed
+        );
     }
 
     #[test]
@@ -189,15 +209,20 @@ mod tests {
         )
         .with_source(Operand::ScalarReg(1));
 
-        assert!(StreamOps::execute(&op, &mut ctx, &mut tile));
+        assert_eq!(
+            StreamOps::execute(&op, &mut ctx, &mut tile),
+            StreamResult::Completed
+        );
     }
 
     #[test]
-    fn test_stream_read_scalar_handled() {
+    fn test_stream_read_with_data() {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
-        // Pre-set destination to non-zero to verify it gets overwritten
+        // Push data into the stream input buffer
+        tile.push_stream_input(0, 0xCAFEBABE);
+
         ctx.scalar.write(5, 0xFFFFFFFF);
 
         let op = SlotOp::new(
@@ -206,9 +231,53 @@ mod tests {
         )
         .with_dest(Operand::ScalarReg(5));
 
-        assert!(StreamOps::execute(&op, &mut ctx, &mut tile));
+        assert_eq!(
+            StreamOps::execute(&op, &mut ctx, &mut tile),
+            StreamResult::Completed
+        );
 
-        // Stub implementation writes zero to destination
+        // Should have read the actual data
+        assert_eq!(ctx.scalar.read(5), 0xCAFEBABE);
+    }
+
+    #[test]
+    fn test_stream_read_blocking_stall() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        // No data in buffer - should stall
+        let op = SlotOp::new(
+            SlotIndex::Scalar0,
+            Operation::StreamReadScalar { blocking: true },
+        )
+        .with_dest(Operand::ScalarReg(5));
+
+        assert_eq!(
+            StreamOps::execute(&op, &mut ctx, &mut tile),
+            StreamResult::Stall { port: 0 }
+        );
+    }
+
+    #[test]
+    fn test_stream_read_nonblocking_empty() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        ctx.scalar.write(5, 0xFFFFFFFF);
+
+        // Non-blocking read with no data should return 0
+        let op = SlotOp::new(
+            SlotIndex::Scalar0,
+            Operation::StreamReadScalar { blocking: false },
+        )
+        .with_dest(Operand::ScalarReg(5));
+
+        assert_eq!(
+            StreamOps::execute(&op, &mut ctx, &mut tile),
+            StreamResult::Completed
+        );
+
+        // Non-blocking returns 0 when empty
         assert_eq!(ctx.scalar.read(5), 0);
     }
 
@@ -223,7 +292,10 @@ mod tests {
             .with_source(Operand::ScalarReg(0))
             .with_source(Operand::ScalarReg(1));
 
-        assert!(!StreamOps::execute(&op, &mut ctx, &mut tile));
+        assert_eq!(
+            StreamOps::execute(&op, &mut ctx, &mut tile),
+            StreamResult::NotStreamOp
+        );
     }
 
     #[test]
@@ -238,7 +310,10 @@ mod tests {
         )
         .with_source(Operand::Immediate(42));
 
-        assert!(StreamOps::execute(&op, &mut ctx, &mut tile));
+        assert_eq!(
+            StreamOps::execute(&op, &mut ctx, &mut tile),
+            StreamResult::Completed
+        );
     }
 
     #[test]
@@ -246,13 +321,18 @@ mod tests {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
-        // Edge case: no destination specified (value is discarded)
+        // Push data - even without dest, should read and discard
+        tile.push_stream_input(0, 0x12345678);
+
         let op = SlotOp::new(
             SlotIndex::Scalar0,
             Operation::StreamReadScalar { blocking: false },
         );
 
-        // Should still return true (handled)
-        assert!(StreamOps::execute(&op, &mut ctx, &mut tile));
+        // Should return Completed (data consumed but discarded)
+        assert_eq!(
+            StreamOps::execute(&op, &mut ctx, &mut tile),
+            StreamResult::Completed
+        );
     }
 }

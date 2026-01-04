@@ -66,6 +66,36 @@ pub enum PortType {
     Cascade,
     /// Connects to FIFO
     Fifo,
+    /// Connects to trace/debug interface
+    Trace,
+}
+
+impl PortType {
+    /// Convert from the u8 encoding used in aie2_spec port layouts.
+    ///
+    /// The encoding is:
+    /// - 0: Core/Tile_Ctrl
+    /// - 1: FIFO
+    /// - 2: Trace
+    /// - 10+n: North(n)
+    /// - 20+n: South(n)
+    /// - 30+n: East(n)
+    /// - 40+n: West(n)
+    /// - 50+n: DMA(n)
+    pub fn from_spec(encoded: u8) -> Self {
+        use aie2_spec::port_type;
+        match encoded {
+            port_type::CORE => PortType::Core,
+            port_type::FIFO => PortType::Fifo,
+            port_type::TRACE => PortType::Trace,
+            n if n >= port_type::DMA_BASE => PortType::Dma(n - port_type::DMA_BASE),
+            n if n >= port_type::WEST_BASE => PortType::West,
+            n if n >= port_type::EAST_BASE => PortType::East,
+            n if n >= port_type::SOUTH_BASE => PortType::South,
+            n if n >= port_type::NORTH_BASE => PortType::North,
+            _ => PortType::Core, // Fallback
+        }
+    }
 }
 
 /// A single stream port.
@@ -81,6 +111,8 @@ pub struct StreamPort {
     pub fifo: Vec<u32>,
     /// FIFO capacity
     pub fifo_capacity: usize,
+    /// Raw configuration register value (from CDO)
+    pub config: u32,
     /// Connected destination (for routing)
     pub route_to: Option<(u8, u8, u8)>, // (col, row, port_index)
     /// Port is enabled
@@ -101,6 +133,7 @@ impl StreamPort {
             port_type,
             fifo: Vec::with_capacity(fifo_capacity),
             fifo_capacity,
+            config: 0,
             route_to: None,
             enabled: false,
         }
@@ -210,33 +243,26 @@ pub struct StreamSwitch {
 }
 
 impl StreamSwitch {
+    /// Build ports from a spec layout.
+    ///
+    /// This takes a slice of encoded port types from aie2_spec and converts
+    /// them into StreamPort instances with the correct indices and types.
+    fn build_ports_from_spec(layout: &[u8], direction: PortDirection) -> Vec<StreamPort> {
+        layout
+            .iter()
+            .enumerate()
+            .map(|(idx, &encoded)| {
+                StreamPort::new(idx as u8, direction, PortType::from_spec(encoded))
+            })
+            .collect()
+    }
+
     /// Create a new stream switch for a compute tile.
+    ///
+    /// Port layout is defined in aie2_spec::{COMPUTE_MASTER_PORTS, COMPUTE_SLAVE_PORTS}.
     pub fn new_compute_tile(col: u8, row: u8) -> Self {
-        let mut masters = Vec::new();
-        let mut slaves = Vec::new();
-
-        // DMA ports (2 S2MM slaves, 2 MM2S masters)
-        for i in 0..2 {
-            slaves.push(StreamPort::new(i, PortDirection::Slave, PortType::Dma(i)));
-        }
-        for i in 0..2 {
-            masters.push(StreamPort::new(i, PortDirection::Master, PortType::Dma(i + 2)));
-        }
-
-        // Directional ports
-        masters.push(StreamPort::new(2, PortDirection::Master, PortType::North));
-        masters.push(StreamPort::new(3, PortDirection::Master, PortType::South));
-        masters.push(StreamPort::new(4, PortDirection::Master, PortType::East));
-        masters.push(StreamPort::new(5, PortDirection::Master, PortType::West));
-
-        slaves.push(StreamPort::new(2, PortDirection::Slave, PortType::North));
-        slaves.push(StreamPort::new(3, PortDirection::Slave, PortType::South));
-        slaves.push(StreamPort::new(4, PortDirection::Slave, PortType::East));
-        slaves.push(StreamPort::new(5, PortDirection::Slave, PortType::West));
-
-        // Core ports
-        masters.push(StreamPort::new(6, PortDirection::Master, PortType::Core));
-        slaves.push(StreamPort::new(6, PortDirection::Slave, PortType::Core));
+        let masters = Self::build_ports_from_spec(aie2_spec::COMPUTE_MASTER_PORTS, PortDirection::Master);
+        let slaves = Self::build_ports_from_spec(aie2_spec::COMPUTE_SLAVE_PORTS, PortDirection::Slave);
 
         Self {
             col,
@@ -250,23 +276,15 @@ impl StreamSwitch {
     }
 
     /// Create a new stream switch for a memory tile.
+    ///
+    /// Port layout is defined in aie2_spec::{MEMTILE_MASTER_PORTS, MEMTILE_SLAVE_PORTS}.
+    ///
+    /// Note the asymmetry: 6 North masters but only 4 North slaves, and
+    /// 4 South masters but 6 South slaves. This matches MemTile's role as
+    /// a buffer between Shim (which has 6 North outputs) and Compute tiles.
     pub fn new_mem_tile(col: u8, row: u8) -> Self {
-        let mut masters = Vec::new();
-        let mut slaves = Vec::new();
-
-        // DMA ports (6 S2MM slaves, 6 MM2S masters)
-        for i in 0..6 {
-            slaves.push(StreamPort::new(i, PortDirection::Slave, PortType::Dma(i)));
-        }
-        for i in 0..6 {
-            masters.push(StreamPort::new(i, PortDirection::Master, PortType::Dma(i + 6)));
-        }
-
-        // Directional ports
-        masters.push(StreamPort::new(6, PortDirection::Master, PortType::North));
-        masters.push(StreamPort::new(7, PortDirection::Master, PortType::South));
-        slaves.push(StreamPort::new(6, PortDirection::Slave, PortType::North));
-        slaves.push(StreamPort::new(7, PortDirection::Slave, PortType::South));
+        let masters = Self::build_ports_from_spec(aie2_spec::MEMTILE_MASTER_PORTS, PortDirection::Master);
+        let slaves = Self::build_ports_from_spec(aie2_spec::MEMTILE_SLAVE_PORTS, PortDirection::Slave);
 
         Self {
             col,
@@ -280,21 +298,13 @@ impl StreamSwitch {
     }
 
     /// Create a new stream switch for a shim tile.
+    ///
+    /// Port layout is defined in aie2_spec::{SHIM_MASTER_PORTS, SHIM_SLAVE_PORTS}.
+    ///
+    /// The 6 North masters (12-17) connect 1:1 to MemTile South slaves (7-12).
     pub fn new_shim_tile(col: u8) -> Self {
-        let mut masters = Vec::new();
-        let mut slaves = Vec::new();
-
-        // DMA ports for host interface
-        for i in 0..2 {
-            slaves.push(StreamPort::new(i, PortDirection::Slave, PortType::Dma(i)));
-        }
-        for i in 0..2 {
-            masters.push(StreamPort::new(i, PortDirection::Master, PortType::Dma(i + 2)));
-        }
-
-        // North port (to mem tile / compute tiles)
-        masters.push(StreamPort::new(2, PortDirection::Master, PortType::North));
-        slaves.push(StreamPort::new(2, PortDirection::Slave, PortType::North));
+        let masters = Self::build_ports_from_spec(aie2_spec::SHIM_MASTER_PORTS, PortDirection::Master);
+        let slaves = Self::build_ports_from_spec(aie2_spec::SHIM_SLAVE_PORTS, PortDirection::Slave);
 
         Self {
             col,
@@ -434,6 +444,8 @@ impl StreamSwitch {
                 if let Some(data) = self.slaves[slave_idx].pop() {
                     if self.masters[master_idx].push(data) {
                         words_forwarded += 1;
+                        log::debug!("TileSwitch({},{}): slave[{}] -> master[{}] data=0x{:08X}",
+                            self.col, self.row, slave_idx, master_idx, data);
                     }
                 }
             }
@@ -849,25 +861,48 @@ mod tests {
     fn test_stream_switch_compute() {
         let ss = StreamSwitch::new_compute_tile(1, 2);
 
-        // Should have DMA ports
-        assert!(ss.dma_slave(0).is_some());
-        assert!(ss.dma_slave(1).is_some());
-        assert!(ss.dma_master(2).is_some());
-        assert!(ss.dma_master(3).is_some());
+        // Per AM025 AIE_TILE_MODULE: Compute tile has 2 DMA channels (0-1).
+        // S2MM (slaves) and MM2S (masters) are at the same channel indices.
+        assert!(ss.dma_slave(0).is_some(), "Should have DMA S2MM channel 0");
+        assert!(ss.dma_slave(1).is_some(), "Should have DMA S2MM channel 1");
+        assert!(ss.dma_master(0).is_some(), "Should have DMA MM2S channel 0");
+        assert!(ss.dma_master(1).is_some(), "Should have DMA MM2S channel 1");
 
-        // Should have directional ports
-        assert!(ss.masters.len() >= 6);
-        assert!(ss.slaves.len() >= 6);
+        // Verify port counts per AM025 CORE_MODULE/STREAM_SWITCH:
+        // Masters: 0=Core, 1-2=DMA, 3=Tile_Ctrl, 4=FIFO0, 5-10=South(6), 11-14=West(4),
+        //          15-18=North(4), 19-22=East(4) = 23 total
+        // Slaves:  0=Core, 1-2=DMA, 3=Tile_Ctrl, 4=FIFO0, 5-10=South(6), 11-14=West(4),
+        //          15-18=North(4), 19-22=East(4), 23-24=Trace(2) = 25 total
+        assert_eq!(ss.masters.len(), 23);
+        assert_eq!(ss.slaves.len(), 25);
     }
 
     #[test]
     fn test_stream_switch_mem_tile() {
         let ss = StreamSwitch::new_mem_tile(0, 1);
 
-        // Should have 6 DMA slave ports
+        // Per AM025 MEMORY_TILE_MODULE: MemTile has 6 DMA channels (0-5).
         for i in 0..6 {
-            assert!(ss.dma_slave(i).is_some());
+            assert!(ss.dma_slave(i).is_some(), "Should have DMA S2MM channel {}", i);
+            assert!(ss.dma_master(i).is_some(), "Should have DMA MM2S channel {}", i);
         }
+
+        // Verify port counts per AM025:
+        // Masters: 0-5=DMA, 6=Tile_Ctrl, 7-10=South(4), 11-16=North(6) = 17 total
+        // Slaves: 0-5=DMA, 6=Tile_Ctrl, 7-12=South(6), 13-16=North(4), 17=Trace = 18 total
+        assert_eq!(ss.masters.len(), 17);
+        assert_eq!(ss.slaves.len(), 18);
+
+        // Verify asymmetric N/S connectivity (key architectural feature)
+        let south_masters = ss.masters.iter().filter(|p| matches!(p.port_type, PortType::South)).count();
+        let south_slaves = ss.slaves.iter().filter(|p| matches!(p.port_type, PortType::South)).count();
+        let north_masters = ss.masters.iter().filter(|p| matches!(p.port_type, PortType::North)).count();
+        let north_slaves = ss.slaves.iter().filter(|p| matches!(p.port_type, PortType::North)).count();
+
+        assert_eq!(south_masters, 4, "MemTile should have 4 South masters");
+        assert_eq!(south_slaves, 6, "MemTile should have 6 South slaves");
+        assert_eq!(north_masters, 6, "MemTile should have 6 North masters");
+        assert_eq!(north_slaves, 4, "MemTile should have 4 North slaves");
     }
 
     #[test]
@@ -877,8 +912,15 @@ mod tests {
         // Shim should be at row 0
         assert_eq!(ss.row, 0);
 
-        // Should have north port for connecting to array
-        assert!(ss.masters.iter().any(|p| matches!(p.port_type, PortType::North)));
+        // Verify port counts per AM025 PL_MODULE:
+        // Masters: 0=Ctrl, 1=FIFO, 2-7=South(6), 8-11=West(4), 12-17=North(6), 18-21=East(4) = 22 total
+        // Slaves: 0=Ctrl, 1=FIFO, 2-9=South(8), 10-13=West(4), 14-17=North(4), 18-21=East(4), 22=Trace = 23 total
+        assert_eq!(ss.masters.len(), 22, "Shim should have 22 master ports");
+        assert_eq!(ss.slaves.len(), 23, "Shim should have 23 slave ports");
+
+        // Verify 6 North masters for connecting to MemTile
+        let north_masters = ss.masters.iter().filter(|p| matches!(p.port_type, PortType::North)).count();
+        assert_eq!(north_masters, 6, "Shim should have 6 North masters");
     }
 
     #[test]

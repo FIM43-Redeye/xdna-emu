@@ -20,6 +20,7 @@ memmap2 = "0.9"                                         # Memory-mapped file I/O
 regex = "1"                                             # Regex for TableGen parsing
 uuid = "1"                                              # UUID handling
 smallvec = "1.13"                                       # Stack-allocated vectors for operands
+byteorder = "1.5"                                       # Byte order utilities for binary parsing
 
 # ELF parsing for core binaries
 goblin = "0.10"

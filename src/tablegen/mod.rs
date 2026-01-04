@@ -382,6 +382,32 @@ mod tests {
             eprintln!("SBC instruction NOT FOUND in parsed instructions!");
         }
 
+        // Check for MOVXM_lng_cg instruction
+        if let Some(movxm) = data.instructions.get("MOVXM_lng_cg") {
+            eprintln!("MOVXM_lng_cg instruction found: format={}, mnemonic={}",
+                     movxm.format, movxm.mnemonic);
+            if let Some(enc) = encodings.iter().find(|e| e.name == "MOVXM_lng_cg") {
+                eprintln!("  RESOLVED: slot={}, mask=0x{:X}, bits=0x{:X}",
+                         enc.slot, enc.fixed_mask, enc.fixed_bits);
+                eprintln!("  fields: {:?}",
+                         enc.operand_fields.iter().map(|f| (&f.name, f.bit_position, f.width)).collect::<Vec<_>>());
+            } else {
+                eprintln!("  MOVXM_lng_cg NOT in resolved encodings - resolution must have failed");
+                // Try to resolve it directly to see the error
+                if let Err(e) = resolver.resolve_instruction(movxm) {
+                    eprintln!("  Resolution error: {:?}", e);
+                }
+            }
+        } else {
+            eprintln!("MOVXM_lng_cg NOT FOUND in parsed instructions!");
+            // List all instruction names containing 'mov'
+            let mov_instrs: Vec<_> = data.instructions.keys()
+                .filter(|k| k.to_lowercase().contains("mov"))
+                .take(20)
+                .collect();
+            eprintln!("  MOV-related instructions: {:?}", mov_instrs);
+        }
+
         // We should have resolved at least some instructions
         assert!(success_count > 0, "Should resolve some instructions");
     }

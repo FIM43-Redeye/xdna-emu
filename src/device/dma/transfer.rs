@@ -155,13 +155,29 @@ impl Transfer {
             ],
         );
 
-        // Determine endpoints based on direction
-        let (source, dest) = match direction {
-            TransferDirection::S2MM => (
+        // Determine endpoints based on direction and tile type
+        // Per AIE2 architecture: Row 0 = Shim (DDR interface), Row 1+ = processing tiles
+        // Note: This matches AieArch::is_shim_tile() but we lack arch context here
+        let is_shim = tile_row == 0;
+
+        let (source, dest) = match (direction, is_shim) {
+            (TransferDirection::S2MM, true) => (
+                // Shim S2MM: Stream (from tiles) -> Host DDR
+                TransferEndpoint::Stream { port: channel },
+                TransferEndpoint::HostMemory,
+            ),
+            (TransferDirection::MM2S, true) => (
+                // Shim MM2S: Host DDR -> Stream (to tiles)
+                TransferEndpoint::HostMemory,
+                TransferEndpoint::Stream { port: channel },
+            ),
+            (TransferDirection::S2MM, false) => (
+                // Compute S2MM: Stream -> Tile Memory
                 TransferEndpoint::Stream { port: channel },
                 TransferEndpoint::TileMemory { col: tile_col, row: tile_row },
             ),
-            TransferDirection::MM2S => (
+            (TransferDirection::MM2S, false) => (
+                // Compute MM2S: Tile Memory -> Stream
                 TransferEndpoint::TileMemory { col: tile_col, row: tile_row },
                 TransferEndpoint::Stream { port: channel },
             ),

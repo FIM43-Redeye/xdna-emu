@@ -63,12 +63,24 @@ impl ControlUnit {
             }
 
             Operation::LockAcquire => {
-                let (lock_id, expected, delta) = Self::get_lock_acquire_params(op);
+                let (raw_lock_id, expected, delta) = Self::get_lock_acquire_params(op);
+                // AIE-ML lock mapping: lock IDs 48-63 in core instructions
+                // map to memory module locks 0-15
+                let lock_id = Self::map_lock_id(raw_lock_id);
+                let current_value = tile.locks[lock_id as usize].value;
                 let lock = &mut tile.locks[lock_id as usize];
 
                 match lock.acquire_with_value(expected, delta) {
-                    LockResult::Success => Some(ExecuteResult::Continue),
-                    LockResult::WouldUnderflow => Some(ExecuteResult::WaitLock { lock_id }),
+                    LockResult::Success => {
+                        log::debug!("LockAcquire raw={} mapped={} expected={} delta={} current={} -> {} SUCCESS",
+                            raw_lock_id, lock_id, expected, delta, current_value, lock.value);
+                        Some(ExecuteResult::Continue)
+                    }
+                    LockResult::WouldUnderflow => {
+                        log::debug!("LockAcquire raw={} mapped={} expected={} current={} -> WAIT",
+                            raw_lock_id, lock_id, expected, current_value);
+                        Some(ExecuteResult::WaitLock { lock_id })
+                    }
                     LockResult::WouldOverflow => {
                         // This shouldn't happen for acquire, but handle it
                         Some(ExecuteResult::Continue)
@@ -77,11 +89,17 @@ impl ControlUnit {
             }
 
             Operation::LockRelease => {
-                let (lock_id, delta) = Self::get_lock_release_params(op);
+                let (raw_lock_id, delta) = Self::get_lock_release_params(op);
+                // AIE-ML lock mapping: lock IDs 48-63 in core instructions
+                // map to memory module locks 0-15
+                let lock_id = Self::map_lock_id(raw_lock_id);
+                let old_value = tile.locks[lock_id as usize].value;
                 let lock = &mut tile.locks[lock_id as usize];
 
                 // Release is non-blocking; overflow just saturates
                 lock.release_with_value(delta);
+                log::debug!("LockRelease raw={} mapped={} delta={} {} -> {}",
+                    raw_lock_id, lock_id, delta, old_value, lock.value);
                 Some(ExecuteResult::Continue)
             }
 
@@ -192,6 +210,29 @@ impl ControlUnit {
             Operand::Immediate(v) => *v as u8,
             _ => 0,
         })
+    }
+
+    /// Map AIE-ML core lock ID to memory module lock index.
+    ///
+    /// In AIE-ML, core lock instructions use different address spaces:
+    /// - Lock IDs 0-47: Core module locks (rarely used, passed through)
+    /// - Lock IDs 48-63: Memory module locks 0-15 (the common case)
+    ///
+    /// This maps the core instruction lock ID to the actual tile.locks[] index.
+    fn map_lock_id(raw_lock_id: u8) -> u8 {
+        if raw_lock_id >= 48 && raw_lock_id < 64 {
+            // Memory module locks: subtract 48 to get 0-15
+            raw_lock_id - 48
+        } else if raw_lock_id < 16 {
+            // Direct mapping for low lock IDs (0-15)
+            // This handles the case where the instruction uses direct lock IDs
+            raw_lock_id
+        } else {
+            // Core module locks (16-47) are passed through
+            // These are rarely used but we should handle them
+            log::warn!("Unusual lock ID {} (not 0-15 or 48-63)", raw_lock_id);
+            raw_lock_id
+        }
     }
 
     /// Start a DMA transfer.

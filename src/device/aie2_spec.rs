@@ -222,9 +222,13 @@ pub const STREAM_EXTERNAL_TO_EXTERNAL_FIFO_DEPTH: u8 = 8;
 // DMA Configuration (AM020 Ch2)
 // ============================================================================
 
-/// Number of DMA buffer descriptors per tile: 16
+/// Number of DMA buffer descriptors per compute tile: 16
 /// "the DMA controller has access to the 16 buffer descriptors" (AM020 Ch2)
 pub const NUM_DMA_BUFFER_DESCRIPTORS: usize = 16;
+
+/// Number of DMA buffer descriptors per memory tile: 48
+/// MemTile has 24 S2MM BDs + 24 MM2S BDs (AM025 memory_tile_module/dma/bd.txt)
+pub const MEMTILE_NUM_DMA_BUFFER_DESCRIPTORS: usize = 48;
 
 /// Number of S2MM DMA channels per compute tile: 2
 pub const COMPUTE_TILE_S2MM_CHANNELS: usize = 2;
@@ -437,6 +441,260 @@ pub const HALFWORD_ALIGNMENT_BYTES: usize = 2;
 /// only one request per cycle is allowed...stalled for one cycle" (AM020 Ch2)
 pub const BANK_CONFLICT_PENALTY_CYCLES: u8 = 1;
 
+// ============================================================================
+// Stream Switch Port Layouts (AM025)
+// ============================================================================
+//
+// These layouts define the port types at each index for each tile type.
+// The hardware has fixed port assignments documented in AM025 register reference.
+// AIE2P (Strix/Strix Halo) may have different layouts.
+
+/// Stream switch port type identifier.
+///
+/// These map to the PortType enum in stream_switch.rs but are simple u8s
+/// for use in const arrays. The mapping is:
+/// - 0: Core/Tile_Ctrl
+/// - 1: FIFO
+/// - 2: Trace
+/// - 10+n: North(n)
+/// - 20+n: South(n)
+/// - 30+n: East(n)
+/// - 40+n: West(n)
+/// - 50+n: DMA(n)
+pub mod port_type {
+    pub const CORE: u8 = 0;
+    pub const FIFO: u8 = 1;
+    pub const TRACE: u8 = 2;
+    pub const NORTH_BASE: u8 = 10;
+    pub const SOUTH_BASE: u8 = 20;
+    pub const EAST_BASE: u8 = 30;
+    pub const WEST_BASE: u8 = 40;
+    pub const DMA_BASE: u8 = 50;
+
+    pub const fn north(n: u8) -> u8 {
+        NORTH_BASE + n
+    }
+    pub const fn south(n: u8) -> u8 {
+        SOUTH_BASE + n
+    }
+    pub const fn east(n: u8) -> u8 {
+        EAST_BASE + n
+    }
+    pub const fn west(n: u8) -> u8 {
+        WEST_BASE + n
+    }
+    pub const fn dma(n: u8) -> u8 {
+        DMA_BASE + n
+    }
+}
+
+/// Shim tile stream switch master port layout.
+///
+/// Per AM025 PL_MODULE/STREAM_SWITCH/MASTER_CONFIG:
+/// - Port 0: Tile_Ctrl
+/// - Port 1: FIFO0
+/// - Ports 2-7: South 0-5 (to NoC/DDR)
+/// - Ports 8-11: West 0-3
+/// - Ports 12-17: North 0-5 (to MemTile)
+/// - Ports 18-21: East 0-3
+pub const SHIM_MASTER_PORTS: &[u8] = &[
+    port_type::CORE,      // 0: Tile_Ctrl
+    port_type::FIFO,      // 1: FIFO0
+    port_type::south(0),  // 2: South0
+    port_type::south(1),  // 3: South1
+    port_type::south(2),  // 4: South2
+    port_type::south(3),  // 5: South3
+    port_type::south(4),  // 6: South4
+    port_type::south(5),  // 7: South5
+    port_type::west(0),   // 8: West0
+    port_type::west(1),   // 9: West1
+    port_type::west(2),   // 10: West2
+    port_type::west(3),   // 11: West3
+    port_type::north(0),  // 12: North0
+    port_type::north(1),  // 13: North1
+    port_type::north(2),  // 14: North2
+    port_type::north(3),  // 15: North3
+    port_type::north(4),  // 16: North4
+    port_type::north(5),  // 17: North5
+    port_type::east(0),   // 18: East0
+    port_type::east(1),   // 19: East1
+    port_type::east(2),   // 20: East2
+    port_type::east(3),   // 21: East3
+];
+
+/// Shim tile stream switch slave port layout.
+///
+/// Per AM025 PL_MODULE/STREAM_SWITCH/SLAVE_CONFIG:
+/// - Port 0: Tile_Ctrl
+/// - Port 1: FIFO0
+/// - Ports 2-9: South 0-7 (from NoC/DDR - DMA data path)
+/// - Ports 10-13: West 0-3
+/// - Ports 14-17: North 0-3 (from MemTile)
+/// - Ports 18-21: East 0-3
+/// - Port 22: Trace
+pub const SHIM_SLAVE_PORTS: &[u8] = &[
+    port_type::CORE,      // 0: Tile_Ctrl
+    port_type::FIFO,      // 1: FIFO0
+    port_type::south(0),  // 2: South0
+    port_type::south(1),  // 3: South1
+    port_type::south(2),  // 4: South2
+    port_type::south(3),  // 5: South3
+    port_type::south(4),  // 6: South4
+    port_type::south(5),  // 7: South5
+    port_type::south(6),  // 8: South6
+    port_type::south(7),  // 9: South7
+    port_type::west(0),   // 10: West0
+    port_type::west(1),   // 11: West1
+    port_type::west(2),   // 12: West2
+    port_type::west(3),   // 13: West3
+    port_type::north(0),  // 14: North0
+    port_type::north(1),  // 15: North1
+    port_type::north(2),  // 16: North2
+    port_type::north(3),  // 17: North3
+    port_type::east(0),   // 18: East0
+    port_type::east(1),   // 19: East1
+    port_type::east(2),   // 20: East2
+    port_type::east(3),   // 21: East3
+    port_type::TRACE,     // 22: Trace
+];
+
+/// MemTile stream switch master port layout.
+///
+/// Per AM025 MEMORY_TILE_MODULE/STREAM_SWITCH/MASTER_CONFIG:
+/// - Ports 0-5: DMA MM2S channels 0-5
+/// - Port 6: Tile_Ctrl
+/// - Ports 7-10: South 0-3 (to Shim)
+/// - Ports 11-16: North 0-5 (to Compute tiles)
+pub const MEMTILE_MASTER_PORTS: &[u8] = &[
+    port_type::dma(0),    // 0: DMA0
+    port_type::dma(1),    // 1: DMA1
+    port_type::dma(2),    // 2: DMA2
+    port_type::dma(3),    // 3: DMA3
+    port_type::dma(4),    // 4: DMA4
+    port_type::dma(5),    // 5: DMA5
+    port_type::CORE,      // 6: Tile_Ctrl
+    port_type::south(0),  // 7: South0
+    port_type::south(1),  // 8: South1
+    port_type::south(2),  // 9: South2
+    port_type::south(3),  // 10: South3
+    port_type::north(0),  // 11: North0
+    port_type::north(1),  // 12: North1
+    port_type::north(2),  // 13: North2
+    port_type::north(3),  // 14: North3
+    port_type::north(4),  // 15: North4
+    port_type::north(5),  // 16: North5
+];
+
+/// MemTile stream switch slave port layout.
+///
+/// Per AM025 MEMORY_TILE_MODULE/STREAM_SWITCH/SLAVE_CONFIG:
+/// - Ports 0-5: DMA S2MM channels 0-5
+/// - Port 6: Tile_Ctrl
+/// - Ports 7-12: South 0-5 (from Shim)
+/// - Ports 13-16: North 0-3 (from Compute tiles)
+/// - Port 17: Trace
+///
+/// Note the asymmetry: 6 South slaves but only 4 North slaves.
+/// This matches the Shim having 6 North masters that feed the MemTile.
+pub const MEMTILE_SLAVE_PORTS: &[u8] = &[
+    port_type::dma(0),    // 0: DMA0
+    port_type::dma(1),    // 1: DMA1
+    port_type::dma(2),    // 2: DMA2
+    port_type::dma(3),    // 3: DMA3
+    port_type::dma(4),    // 4: DMA4
+    port_type::dma(5),    // 5: DMA5
+    port_type::CORE,      // 6: Tile_Ctrl
+    port_type::south(0),  // 7: South0
+    port_type::south(1),  // 8: South1
+    port_type::south(2),  // 9: South2
+    port_type::south(3),  // 10: South3
+    port_type::south(4),  // 11: South4
+    port_type::south(5),  // 12: South5
+    port_type::north(0),  // 13: North0
+    port_type::north(1),  // 14: North1
+    port_type::north(2),  // 15: North2
+    port_type::north(3),  // 16: North3
+    port_type::TRACE,     // 17: Trace
+];
+
+/// Compute tile stream switch master port layout.
+///
+/// Per AM025 CORE_MODULE/STREAM_SWITCH/MASTER_CONFIG (verified against register addresses):
+/// - Port 0: AIE_Core0 (AIE engine output)
+/// - Ports 1-2: DMA MM2S channels 0-1
+/// - Port 3: Tile_Ctrl
+/// - Port 4: FIFO0
+/// - Ports 5-10: South 0-5
+/// - Ports 11-14: West 0-3
+/// - Ports 15-18: North 0-3
+/// - Ports 19-22: East 0-3
+pub const COMPUTE_MASTER_PORTS: &[u8] = &[
+    port_type::CORE,      // 0: AIE_Core0
+    port_type::dma(0),    // 1: DMA0
+    port_type::dma(1),    // 2: DMA1
+    port_type::CORE,      // 3: Tile_Ctrl
+    port_type::FIFO,      // 4: FIFO0
+    port_type::south(0),  // 5: South0
+    port_type::south(1),  // 6: South1
+    port_type::south(2),  // 7: South2
+    port_type::south(3),  // 8: South3
+    port_type::south(4),  // 9: South4
+    port_type::south(5),  // 10: South5
+    port_type::west(0),   // 11: West0
+    port_type::west(1),   // 12: West1
+    port_type::west(2),   // 13: West2
+    port_type::west(3),   // 14: West3
+    port_type::north(0),  // 15: North0
+    port_type::north(1),  // 16: North1
+    port_type::north(2),  // 17: North2
+    port_type::north(3),  // 18: North3
+    port_type::east(0),   // 19: East0
+    port_type::east(1),   // 20: East1
+    port_type::east(2),   // 21: East2
+    port_type::east(3),   // 22: East3
+];
+
+/// Compute tile stream switch slave port layout.
+///
+/// Per AM025 CORE_MODULE/STREAM_SWITCH/SLAVE_CONFIG (verified against register addresses):
+/// - Port 0: AIE_Core0 (AIE engine input)
+/// - Ports 1-2: DMA S2MM channels 0-1
+/// - Port 3: Tile_Ctrl
+/// - Port 4: FIFO0
+/// - Ports 5-10: South 0-5
+/// - Ports 11-14: West 0-3
+/// - Ports 15-18: North 0-3
+/// - Ports 19-22: East 0-3
+/// - Port 23: AIE_Trace
+/// - Port 24: Mem_Trace
+pub const COMPUTE_SLAVE_PORTS: &[u8] = &[
+    port_type::CORE,      // 0: AIE_Core0
+    port_type::dma(0),    // 1: DMA0
+    port_type::dma(1),    // 2: DMA1
+    port_type::CORE,      // 3: Tile_Ctrl
+    port_type::FIFO,      // 4: FIFO0
+    port_type::south(0),  // 5: South0
+    port_type::south(1),  // 6: South1
+    port_type::south(2),  // 7: South2
+    port_type::south(3),  // 8: South3
+    port_type::south(4),  // 9: South4
+    port_type::south(5),  // 10: South5
+    port_type::west(0),   // 11: West0
+    port_type::west(1),   // 12: West1
+    port_type::west(2),   // 13: West2
+    port_type::west(3),   // 14: West3
+    port_type::north(0),  // 15: North0
+    port_type::north(1),  // 16: North1
+    port_type::north(2),  // 17: North2
+    port_type::north(3),  // 18: North3
+    port_type::east(0),   // 19: East0
+    port_type::east(1),   // 20: East1
+    port_type::east(2),   // 21: East2
+    port_type::east(3),   // 22: East3
+    port_type::TRACE,     // 23: AIE_Trace
+    port_type::TRACE,     // 24: Mem_Trace
+];
+
 /// Bank interleaving: physical banks are paired into logical banks
 /// "From a programmer's perspective, every two banks are interleaved to form one bank" (AM020 Ch2)
 pub const BANKS_PER_LOGICAL_BANK: usize = 2;
@@ -512,3 +770,89 @@ mod tests {
         assert_eq!(ADDRESSABLE_MEMORY_SIZE, 256 * 1024);
     }
 }
+
+// ============================================================================
+// Stream Switch Port Ranges (derived from AM025 port layout arrays above)
+// ============================================================================
+//
+// These constants provide convenient ranges for port mapping operations.
+// Values are derived from the SHIM/MEMTILE/COMPUTE_*_PORTS arrays above.
+
+pub mod stream_switch {
+    //! Stream switch port range constants for tile-to-tile routing.
+    //!
+    //! These define which master/slave port indices correspond to which
+    //! direction (North/South) for each tile type.
+
+    /// Shim tile port ranges (toward/from MemTile = North)
+    pub mod shim {
+        /// North-facing master ports: 12-17 (6 ports: North0-North5)
+        /// These send data up to MemTile
+        pub const NORTH_MASTER_START: u8 = 12;
+        pub const NORTH_MASTER_END: u8 = 17;
+
+        /// North-facing slave ports: 14-17 (4 ports: North0-North3)
+        /// These receive data from MemTile
+        pub const NORTH_SLAVE_START: u8 = 14;
+        pub const NORTH_SLAVE_END: u8 = 17;
+    }
+
+    /// MemTile port ranges (South = toward Shim, North = toward Compute)
+    pub mod mem_tile {
+        /// South-facing master ports: 7-10 (4 ports: South0-South3)
+        /// These send data down to Shim
+        pub const SOUTH_MASTER_START: u8 = 7;
+        pub const SOUTH_MASTER_END: u8 = 10;
+
+        /// North-facing master ports: 11-16 (6 ports: North0-North5)
+        /// These send data up to Compute tiles
+        pub const NORTH_MASTER_START: u8 = 11;
+        pub const NORTH_MASTER_END: u8 = 16;
+
+        /// South-facing slave ports: 7-12 (6 ports: South0-South5)
+        /// These receive data from Shim
+        pub const SOUTH_SLAVE_START: u8 = 7;
+        pub const SOUTH_SLAVE_END: u8 = 12;
+
+        /// North-facing slave ports: 13-16 (4 ports: North0-North3)
+        /// These receive data from Compute tiles
+        pub const NORTH_SLAVE_START: u8 = 13;
+        pub const NORTH_SLAVE_END: u8 = 16;
+    }
+
+    /// Compute tile port ranges (South = toward MemTile/Shim, North = toward upper tiles)
+    pub mod compute {
+        /// South-facing master ports: 5-10 (6 ports: South0-South5)
+        /// These send data down to MemTile
+        pub const SOUTH_MASTER_START: u8 = 5;
+        pub const SOUTH_MASTER_END: u8 = 10;
+
+        /// North-facing master ports: 15-18 (4 ports: North0-North3)
+        /// These send data up to upper compute tiles
+        pub const NORTH_MASTER_START: u8 = 15;
+        pub const NORTH_MASTER_END: u8 = 18;
+
+        /// South-facing slave ports: 5-10 (6 ports: South0-South5)
+        /// These receive data from MemTile
+        pub const SOUTH_SLAVE_START: u8 = 5;
+        pub const SOUTH_SLAVE_END: u8 = 10;
+
+        /// North-facing slave ports: 15-18 (4 ports: North0-North3)
+        /// These receive data from upper compute tiles
+        pub const NORTH_SLAVE_START: u8 = 15;
+        pub const NORTH_SLAVE_END: u8 = 18;
+    }
+
+    /// Stream switch configuration bit constants
+    pub const ENABLE_BIT: u32 = 31;
+    pub const SLAVE_SELECT_MASK: u32 = 0x1F;
+}
+
+// ============================================================================
+// Re-export Register Specifications
+// ============================================================================
+//
+// For unified API access, re-export the registers_spec module.
+// Users can access via `aie2_spec::registers::memory_module::LOCK_BASE` etc.
+
+pub use super::registers_spec as registers;

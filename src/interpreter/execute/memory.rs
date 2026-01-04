@@ -7,14 +7,32 @@
 //! AIE2 uses pointer registers (p0-p7) for addressing with optional
 //! post-modify (add immediate or modifier register after access).
 //!
+//! The AGU (Address Generation Unit) generates 20-bit addresses spanning
+//! 0x0000-0x3FFFF (256KB) across the 4 neighboring memory modules:
+//! - 0x00000-0x0FFFF: South (local tile's own memory)
+//! - 0x10000-0x1FFFF: West neighbor
+//! - 0x20000-0x2FFFF: North neighbor
+//! - 0x30000-0x3FFFF: East neighbor
+//!
+//! Linker-assigned addresses (like 0x70440) use higher bits to indicate
+//! memory regions; these must be masked to the 18-bit AGU range.
+//!
 //! # Memory Layout
 //!
 //! - **Data Memory**: 64KB at 0x00000-0x0FFFF (compute tile)
-//! - **Program Memory**: 64KB at 0x20000-0x2FFFF (read-only)
+//! - **Program Memory**: 16KB (read-only from core)
 
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{ElementType, MemWidth, Operation, Operand, PostModify, SlotOp};
 use crate::interpreter::state::ExecutionContext;
+
+/// Address mask for local tile memory (64KB).
+/// Addresses from the AGU span 0x0000-0x3FFFF (256KB across 4 neighbors),
+/// but local memory access only uses the lower 16 bits.
+///
+/// Note: Multi-tile memory access (addresses 0x10000-0x3FFFF) would need
+/// routing to neighbor tiles - not yet implemented.
+const LOCAL_MEMORY_MASK: u32 = 0xFFFF;
 
 /// Memory unit for load/store operations.
 pub struct MemoryUnit;
@@ -146,9 +164,7 @@ impl MemoryUnit {
         // Get address from source operand
         let addr = Self::get_address(op, ctx);
 
-        // Debug: log load operations
-        #[cfg(test)]
-        eprintln!("[LOAD] addr=0x{:04X} sources={:?} dest={:?}", addr, op.sources, op.dest);
+        log::debug!("[LOAD] addr=0x{:04X} sources={:?} dest={:?}", addr, op.sources, op.dest);
 
         // Handle full vector loads specially
         if width == MemWidth::Vector256 {
@@ -159,8 +175,7 @@ impl MemoryUnit {
         } else {
             // Scalar/partial loads
             let value = Self::read_memory(tile, addr, width);
-            #[cfg(test)]
-            eprintln!("[LOAD] loaded value=0x{:08X} ({}) to {:?}", value, value, op.dest);
+            log::debug!("[LOAD] loaded value=0x{:08X} ({}) to {:?}", value, value, op.dest);
             Self::write_dest(op, ctx, value, width);
         }
 
@@ -179,9 +194,10 @@ impl MemoryUnit {
         // Get address from first source operand
         let addr = Self::get_address(op, ctx);
 
-        // Debug: log store operations
-        #[cfg(test)]
-        eprintln!("[STORE] addr=0x{:04X} sources={:?} dest={:?}", addr, op.sources, op.dest);
+        // Debug: log store operations with full pointer state
+        log::debug!("[STORE] addr=0x{:04X} sources={:?} dest={:?} pointers=[p0=0x{:X},p1=0x{:X},p2=0x{:X},p3=0x{:X}]",
+            addr, op.sources, op.dest,
+            ctx.pointer.read(0), ctx.pointer.read(1), ctx.pointer.read(2), ctx.pointer.read(3));
 
         // Handle full vector stores specially
         if width == MemWidth::Vector256 {
@@ -202,8 +218,7 @@ impl MemoryUnit {
         } else {
             // Scalar/partial stores
             let value = Self::get_store_value(op, ctx, width);
-            #[cfg(test)]
-            eprintln!("[STORE] value=0x{:08X} width={:?}", value, width);
+            log::debug!("[STORE] value=0x{:08X} width={:?}", value, width);
             Self::write_memory(tile, addr, value, width);
         }
 
@@ -483,8 +498,12 @@ impl MemoryUnit {
     }
 
     /// Read from tile memory.
+    ///
+    /// Addresses are masked to LOCAL_MEMORY_MASK to handle linker-assigned
+    /// addresses (e.g., 0x70440 -> 0x0440).
     fn read_memory(tile: &Tile, addr: u32, width: MemWidth) -> u64 {
-        let addr = addr as usize;
+        // Mask address to local memory range (see module docs for AGU addressing)
+        let addr = (addr & LOCAL_MEMORY_MASK) as usize;
         let mem = tile.data_memory();
 
         if addr >= mem.len() {
@@ -551,8 +570,12 @@ impl MemoryUnit {
     }
 
     /// Write to tile memory.
+    ///
+    /// Addresses are masked to LOCAL_MEMORY_MASK to handle linker-assigned
+    /// addresses (e.g., 0x70440 -> 0x0440).
     fn write_memory(tile: &mut Tile, addr: u32, value: u64, width: MemWidth) {
-        let addr = addr as usize;
+        // Mask address to local memory range (see module docs for AGU addressing)
+        let addr = (addr & LOCAL_MEMORY_MASK) as usize;
         let mem = tile.data_memory_mut();
 
         if addr >= mem.len() {
@@ -654,8 +677,11 @@ impl MemoryUnit {
     }
 
     /// Read a vector from memory (256 bits = 32 bytes).
+    ///
+    /// Addresses are masked to LOCAL_MEMORY_MASK.
     pub fn read_vector_from_memory(tile: &Tile, addr: u32) -> [u32; 8] {
-        let addr = addr as usize;
+        // Mask address to local memory range
+        let addr = (addr & LOCAL_MEMORY_MASK) as usize;
         let mem = tile.data_memory();
         let mut result = [0u32; 8];
 
@@ -675,8 +701,11 @@ impl MemoryUnit {
     }
 
     /// Write a vector to memory (256 bits = 32 bytes).
+    ///
+    /// Addresses are masked to LOCAL_MEMORY_MASK.
     pub fn write_vector_to_memory(tile: &mut Tile, addr: u32, value: [u32; 8]) {
-        let addr = addr as usize;
+        // Mask address to local memory range
+        let addr = (addr & LOCAL_MEMORY_MASK) as usize;
         let mem = tile.data_memory_mut();
 
         if addr + 31 < mem.len() {

@@ -31,10 +31,10 @@ The architecture is designed to be generic from day one - device-specific detail
 
 | Phase | Status | Progress |
 |-------|--------|----------|
-| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | 🟢 Functional | 529 tests, 100% binary recognition, timing 100% |
+| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | 🟢 Functional | 570 tests, 100% binary recognition, timing 100% |
 | [2. Toolchain Integration](docs/roadmap/phase2-toolchain-integration.md) | 🔴 Not started | |
 | [3. Developer Experience](docs/roadmap/phase3-developer-experience.md) | 🟡 GUI exists | Needs debugging features |
-| [4. Validation & Testing](docs/roadmap/phase4-validation-testing.md) | 🟡 529 tests | TestRunner harness added |
+| [4. Validation & Testing](docs/roadmap/phase4-validation-testing.md) | 🟡 570 tests | TestRunner harness added |
 | [5. Production Readiness](docs/roadmap/phase5-production-readiness.md) | 🔴 Not started | |
 | [6. Community & Ecosystem](docs/roadmap/phase6-community-ecosystem.md) | 🔴 Not started | |
 
@@ -63,8 +63,10 @@ Make the emulator faithful to real AIE2 hardware behavior.
 - **Memory tile arbitration**: round-robin arbitration for multi-source access
 - **Cross-tile memory latency**: 0/4/8 cycle routing latency based on quadrant
 - **DMA-lock timing**: LockTimingState integrated into DMA engine
+- **BD chaining fix**: Next_BD/Use_Next_BD correctly parsed from word5 (AM029)
+- **DMA repeat count**: Task queue repeat_count support for ping-pong patterns
 
-**Next:** DMA/TileArray integration (Milestone 2), ISA coverage expansion (Milestone 4)
+**Next:** MemTile CDO configuration (blocking real XCLBIN execution)
 
 ### Phase 2: Toolchain Integration 🔴
 

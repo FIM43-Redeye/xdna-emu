@@ -38,7 +38,7 @@ pub use scalar::ScalarAlu;
 pub use vector::VectorAlu;
 pub use memory::MemoryUnit;
 pub use control::ControlUnit;
-pub use stream::StreamOps;
+pub use stream::{StreamOps, StreamResult};
 pub use fast_executor::FastExecutor;
 pub use cycle_accurate::{CycleAccurateExecutor, CycleAccurateStats};
 

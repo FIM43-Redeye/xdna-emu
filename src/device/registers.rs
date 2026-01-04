@@ -67,38 +67,66 @@ impl fmt::Display for TileAddress {
 /// Register module (region within a tile).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RegisterModule {
-    /// Tile data memory (0x00000 - 0x0FFFF for compute, larger for mem tile)
+    /// Tile data memory (0x00000 - 0x0FFFF for compute, 0x00000 - 0x7FFFF for mem tile)
     Memory,
-    /// DMA buffer descriptors (0x1D000 - 0x1D1FF)
+    /// DMA buffer descriptors (compute: 0x1D000, memtile: 0xA0000)
     DmaBufferDescriptor,
-    /// DMA channel control (0x1DE00 - 0x1DFFF)
+    /// DMA channel control (compute: 0x1DE00, memtile: 0xA0600)
     DmaChannel,
-    /// Lock registers (0x1F000 - 0x1F0FF)
+    /// Lock registers (compute: 0x1F000, memtile: 0xC0000)
     Locks,
-    /// Program memory (0x20000 - 0x2FFFF)
+    /// Program memory (0x20000 - 0x2FFFF) - compute tiles only
     ProgramMemory,
-    /// Core module registers (0x30000 - 0x3FFFF)
+    /// Core module registers (0x30000 - 0x3FFFF) - compute tiles only
     CoreModule,
-    /// Stream switch (0x3F000 - 0x3FFFF)
+    /// Stream switch (compute: 0x3F000, memtile: 0xB0000)
     StreamSwitch,
     /// Memory module misc (0x1E000 - 0x1EFFF)
     MemoryModule,
+    /// MemTile DMA buffer descriptors (0xA0000 - 0xA03FF)
+    MemTileDmaBufferDescriptor,
+    /// MemTile DMA channel control (0xA0600 - 0xA06FF)
+    MemTileDmaChannel,
+    /// MemTile locks (0xC0000 - 0xC03FF)
+    MemTileLocks,
+    /// MemTile stream switch (0xB0000 - 0xB01FF)
+    MemTileStreamSwitch,
     /// Unknown region
     Unknown,
 }
 
 impl RegisterModule {
     /// Determine module from offset.
+    ///
+    /// Note: This function determines the module type from offset alone.
+    /// For row-specific handling (e.g., MemTile vs Compute), use `from_offset_with_row`.
+    ///
+    /// Register ranges derived from AM025.
     pub fn from_offset(offset: u32) -> Self {
+        use super::registers_spec::{
+            memory_module as mm, mem_tile_module as mt, core_module,
+            DATA_MEMORY_BASE, COMPUTE_DATA_MEMORY_END,
+            PROGRAM_MEMORY_BASE, PROGRAM_MEMORY_END,
+        };
+
         match offset {
-            0x00000..=0x0FFFF => RegisterModule::Memory,
-            0x1D000..=0x1D1FF => RegisterModule::DmaBufferDescriptor,
-            0x1DE00..=0x1DFFF => RegisterModule::DmaChannel,
-            0x1E000..=0x1EFFF => RegisterModule::MemoryModule,
-            0x1F000..=0x1F0FF => RegisterModule::Locks,
-            0x20000..=0x2FFFF => RegisterModule::ProgramMemory,
-            0x30000..=0x3EFFF => RegisterModule::CoreModule,
-            0x3F000..=0x3FFFF => RegisterModule::StreamSwitch,
+            // Compute tile registers (AM025 MEMORY_MODULE, CORE_MODULE)
+            DATA_MEMORY_BASE..=COMPUTE_DATA_MEMORY_END => RegisterModule::Memory,
+            o if o >= mm::DMA_BD_BASE && o < mm::DMA_BD_END => RegisterModule::DmaBufferDescriptor,
+            o if o >= mm::DMA_CHANNEL_BASE && o < mm::DMA_STATUS_BASE => RegisterModule::DmaChannel,
+            0x1E000..=0x1EFFF => RegisterModule::MemoryModule,  // Memory module misc
+            o if o >= mm::LOCK_BASE && o < mm::LOCK_END => RegisterModule::Locks,
+            PROGRAM_MEMORY_BASE..=PROGRAM_MEMORY_END => RegisterModule::ProgramMemory,
+            core_module::OFFSET_START..=core_module::OFFSET_END => RegisterModule::CoreModule,
+            o if o >= mm::STREAM_SWITCH_MASTER_BASE && o <= 0x3FFFF => RegisterModule::StreamSwitch,
+
+            // MemTile registers (row 1) - AM025 MEMORY_TILE_MODULE
+            // MemTile has 512KB data memory (0x00000-0x7FFFF) - handled by Memory above
+            o if o >= mt::DMA_BD_BASE && o < mt::DMA_BD_BASE + 0x400 => RegisterModule::MemTileDmaBufferDescriptor,
+            o if o >= mt::DMA_CHANNEL_S2MM_BASE && o < mt::DMA_CHANNEL_S2MM_BASE + 0x100 => RegisterModule::MemTileDmaChannel,
+            o if o >= mt::STREAM_SWITCH_MASTER_BASE && o < mt::STREAM_SWITCH_SLAVE_END => RegisterModule::MemTileStreamSwitch,
+            o if o >= mt::LOCK_BASE && o < mt::LOCK_END => RegisterModule::MemTileLocks,
+
             _ => RegisterModule::Unknown,
         }
     }
@@ -115,6 +143,10 @@ impl fmt::Display for RegisterModule {
             RegisterModule::CoreModule => write!(f, "Core"),
             RegisterModule::StreamSwitch => write!(f, "StrmSw"),
             RegisterModule::MemoryModule => write!(f, "MemMod"),
+            RegisterModule::MemTileDmaBufferDescriptor => write!(f, "MT_DMA_BD"),
+            RegisterModule::MemTileDmaChannel => write!(f, "MT_DMA_CH"),
+            RegisterModule::MemTileLocks => write!(f, "MT_Locks"),
+            RegisterModule::MemTileStreamSwitch => write!(f, "MT_StrmSw"),
             RegisterModule::Unknown => write!(f, "Unknown"),
         }
     }
@@ -177,20 +209,22 @@ impl fmt::Display for RegisterInfo {
     }
 }
 
-/// Look up DMA buffer descriptor registers (0x1D000 - 0x1D1FF).
+/// Look up DMA buffer descriptor registers.
 ///
-/// Each BD is 6 words (24 bytes), starting at 0x1D000.
-/// BD0: 0x1D000-0x1D014, BD1: 0x1D020-0x1D034, etc.
+/// Each BD is 6 words (24 bytes) with 32-byte stride.
+/// AM025 memory_module/dma/bd.txt
 fn lookup_dma_bd(offset: u32) -> Option<RegisterInfo> {
-    if !(0x1D000..=0x1D1FF).contains(&offset) {
+    use super::registers_spec::memory_module as mm;
+
+    if offset < mm::DMA_BD_BASE || offset >= mm::DMA_BD_END {
         return None;
     }
 
-    let rel = offset - 0x1D000;
-    let bd_num = rel / 0x20;  // Each BD is 0x20 apart
-    let word = (rel % 0x20) / 4;
+    let rel = offset - mm::DMA_BD_BASE;
+    let bd_num = rel / mm::DMA_BD_STRIDE;
+    let word = (rel % mm::DMA_BD_STRIDE) / 4;
 
-    if word > 5 {
+    if word as usize >= mm::DMA_BD_WORDS {
         return None;  // Gap between BDs
     }
 
@@ -212,16 +246,19 @@ fn lookup_dma_bd(offset: u32) -> Option<RegisterInfo> {
     })
 }
 
-/// Look up lock registers (0x1F000 - 0x1F0FF).
+/// Look up lock registers.
 ///
-/// 64 locks, 4 bytes each.
+/// Compute tiles have 16 locks, 16 bytes apart.
+/// AM025 memory_module/lock/value.txt
 fn lookup_lock(offset: u32) -> Option<RegisterInfo> {
-    if !(0x1F000..=0x1F0FF).contains(&offset) {
+    use super::registers_spec::memory_module as mm;
+
+    if offset < mm::LOCK_BASE || offset >= mm::LOCK_END {
         return None;
     }
 
-    let rel = offset - 0x1F000;
-    let lock_num = rel / 4;
+    let rel = offset - mm::LOCK_BASE;
+    let lock_num = rel / mm::LOCK_STRIDE;
 
     Some(RegisterInfo {
         name: "LOCK_VALUE",
@@ -516,11 +553,17 @@ mod tests {
 
     #[test]
     fn test_lookup_lock() {
+        // Lock 0 at base address
         let info = RegisterInfo::lookup_aie2(0x1F000).unwrap();
         assert!(info.description.contains("Lock 0"));
 
+        // Lock 1 at 0x1F010 (locks are 16 bytes apart per AM025)
         let info = RegisterInfo::lookup_aie2(0x1F010).unwrap();
-        assert!(info.description.contains("Lock 4"));
+        assert!(info.description.contains("Lock 1"), "Expected Lock 1, got: {}", info.description);
+
+        // Lock 15 at 0x1F0F0 (last lock for compute tile)
+        let info = RegisterInfo::lookup_aie2(0x1F0F0).unwrap();
+        assert!(info.description.contains("Lock 15"), "Expected Lock 15, got: {}", info.description);
     }
 
     #[test]
