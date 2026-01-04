@@ -22,11 +22,12 @@
 //! ```
 
 use anyhow::Result;
+use std::sync::Arc;
 
+use super::arch_config::{ArchConfig, Aie2Config, Aie2pConfig};
 use super::array::TileArray;
 use super::registers::{RegisterModule, TileAddress};
-use super::tile::{Tile, NUM_DMA_BDS, NUM_DMA_CHANNELS, NUM_LOCKS};
-use super::AieArch;
+use super::tile::{Tile, TileType, NUM_DMA_BDS, NUM_DMA_CHANNELS, NUM_LOCKS};
 use crate::parser::cdo::{Cdo, CdoCommand};
 
 /// Statistics about CDO application.
@@ -61,8 +62,8 @@ pub struct DeviceState {
 }
 
 impl DeviceState {
-    /// Create a new device state for the given architecture.
-    pub fn new(arch: AieArch) -> Self {
+    /// Create a new device state for the given architecture configuration.
+    pub fn new(arch: Arc<dyn ArchConfig>) -> Self {
         Self {
             array: TileArray::new(arch),
             stats: CdoStats::default(),
@@ -72,13 +73,13 @@ impl DeviceState {
     /// Create an NPU1 device state.
     #[inline]
     pub fn new_npu1() -> Self {
-        Self::new(AieArch::Aie2)
+        Self::new(Arc::new(Aie2Config))
     }
 
     /// Create an NPU2 device state.
     #[inline]
     pub fn new_npu2() -> Self {
-        Self::new(AieArch::Aie2P)
+        Self::new(Arc::new(Aie2pConfig))
     }
 
     /// Apply a CDO to configure the device.
@@ -731,38 +732,55 @@ impl DeviceState {
     /// Port layouts (per AM025 and aie2_spec::stream_switch):
     /// - MemTile South slaves: 7-12 (6 ports, South0-South5)
     /// - Compute South slaves: 5-10 (6 ports, South0-South5)
-    fn map_north_master_to_south_slave(&self, _col: u8, src_row: u8, dest_row: u8, master_port: u8) -> u8 {
+    fn map_north_master_to_south_slave(&self, col: u8, src_row: u8, dest_row: u8, master_port: u8) -> u8 {
         use super::aie2_spec::stream_switch::{shim, mem_tile, compute};
 
-        if dest_row == 1 {
-            // Destination is MemTile: South slaves receive from Shim
-            if src_row == 0 {
-                // From Shim: North masters 12-17 → MemTile South slaves 7-12
-                if master_port >= shim::NORTH_MASTER_START && master_port <= shim::NORTH_MASTER_END {
-                    mem_tile::SOUTH_SLAVE_START + (master_port - shim::NORTH_MASTER_START)
-                } else {
-                    mem_tile::SOUTH_SLAVE_START
+        let arch = self.array.arch();
+        let src_type = arch.tile_type(col, src_row);
+        let dest_type = arch.tile_type(col, dest_row);
+
+        match dest_type {
+            TileType::MemTile => {
+                // Destination is MemTile: South slaves receive from Shim or Compute
+                match src_type {
+                    TileType::Shim => {
+                        // From Shim: North masters 12-17 → MemTile South slaves 7-12
+                        if master_port >= shim::NORTH_MASTER_START && master_port <= shim::NORTH_MASTER_END {
+                            mem_tile::SOUTH_SLAVE_START + (master_port - shim::NORTH_MASTER_START)
+                        } else {
+                            mem_tile::SOUTH_SLAVE_START
+                        }
+                    }
+                    _ => {
+                        // From compute tile above MemTile (shouldn't happen in Phoenix)
+                        mem_tile::SOUTH_SLAVE_START + (master_port % 6)
+                    }
                 }
-            } else {
-                // From compute tile above MemTile (shouldn't happen in Phoenix)
-                mem_tile::SOUTH_SLAVE_START + (master_port % 6)
             }
-        } else {
-            // Destination is Compute tile: South slaves receive from below
-            if src_row == 1 {
-                // From MemTile: North masters 11-16 → Compute South slaves 5-10
-                if master_port >= mem_tile::NORTH_MASTER_START && master_port <= mem_tile::NORTH_MASTER_END {
-                    compute::SOUTH_SLAVE_START + (master_port - mem_tile::NORTH_MASTER_START)
-                } else {
-                    compute::SOUTH_SLAVE_START
+            TileType::Compute => {
+                // Destination is Compute tile: South slaves receive from below
+                match src_type {
+                    TileType::MemTile => {
+                        // From MemTile: North masters 11-16 → Compute South slaves 5-10
+                        if master_port >= mem_tile::NORTH_MASTER_START && master_port <= mem_tile::NORTH_MASTER_END {
+                            compute::SOUTH_SLAVE_START + (master_port - mem_tile::NORTH_MASTER_START)
+                        } else {
+                            compute::SOUTH_SLAVE_START
+                        }
+                    }
+                    _ => {
+                        // From another compute tile: North masters 15-18 → South slaves 5-8
+                        if master_port >= compute::NORTH_MASTER_START && master_port <= compute::NORTH_MASTER_END {
+                            compute::SOUTH_SLAVE_START + (master_port - compute::NORTH_MASTER_START)
+                        } else {
+                            compute::SOUTH_SLAVE_START
+                        }
+                    }
                 }
-            } else {
-                // From another compute tile: North masters 15-18 → South slaves 5-8
-                if master_port >= compute::NORTH_MASTER_START && master_port <= compute::NORTH_MASTER_END {
-                    compute::SOUTH_SLAVE_START + (master_port - compute::NORTH_MASTER_START)
-                } else {
-                    compute::SOUTH_SLAVE_START
-                }
+            }
+            TileType::Shim => {
+                // Shim tiles don't receive from North (they're at the bottom)
+                shim::NORTH_SLAVE_START
             }
         }
     }
@@ -776,36 +794,44 @@ impl DeviceState {
     /// - Shim North slaves: 14-17 (4 ports, North0-North3)
     /// - MemTile North slaves: 13-16 (4 ports, North0-North3)
     /// - Compute North slaves: 15-18 (4 ports, North0-North3)
-    fn map_south_master_to_north_slave(&self, _col: u8, src_row: u8, dest_row: u8, master_port: u8) -> u8 {
+    fn map_south_master_to_north_slave(&self, col: u8, src_row: u8, dest_row: u8, master_port: u8) -> u8 {
         use super::aie2_spec::stream_switch::{shim, mem_tile, compute};
 
-        if dest_row == 0 {
-            // Destination is Shim: North slaves 14-17
-            // MemTile South masters 7-10 → Shim North slaves 14-17
-            if src_row == 1 && master_port >= mem_tile::SOUTH_MASTER_START && master_port <= mem_tile::SOUTH_MASTER_END {
-                shim::NORTH_SLAVE_START + (master_port - mem_tile::SOUTH_MASTER_START)
-            } else {
-                shim::NORTH_SLAVE_START
+        let arch = self.array.arch();
+        let src_type = arch.tile_type(col, src_row);
+        let dest_type = arch.tile_type(col, dest_row);
+
+        match dest_type {
+            TileType::Shim => {
+                // Destination is Shim: North slaves 14-17
+                // MemTile South masters 7-10 → Shim North slaves 14-17
+                if src_type.is_mem_tile() && master_port >= mem_tile::SOUTH_MASTER_START && master_port <= mem_tile::SOUTH_MASTER_END {
+                    shim::NORTH_SLAVE_START + (master_port - mem_tile::SOUTH_MASTER_START)
+                } else {
+                    shim::NORTH_SLAVE_START
+                }
             }
-        } else if dest_row == 1 {
-            // Destination is MemTile: North slaves 13-16
-            // Compute South masters 5-10 → MemTile North slaves 13-16
-            if src_row >= 2 && master_port >= compute::SOUTH_MASTER_START && master_port <= compute::SOUTH_MASTER_END {
-                // Map first 4 South masters to 4 North slaves
-                let offset = (master_port - compute::SOUTH_MASTER_START).min(3);
-                mem_tile::NORTH_SLAVE_START + offset
-            } else {
-                mem_tile::NORTH_SLAVE_START
+            TileType::MemTile => {
+                // Destination is MemTile: North slaves 13-16
+                // Compute South masters 5-10 → MemTile North slaves 13-16
+                if src_type.is_compute() && master_port >= compute::SOUTH_MASTER_START && master_port <= compute::SOUTH_MASTER_END {
+                    // Map first 4 South masters to 4 North slaves
+                    let offset = (master_port - compute::SOUTH_MASTER_START).min(3);
+                    mem_tile::NORTH_SLAVE_START + offset
+                } else {
+                    mem_tile::NORTH_SLAVE_START
+                }
             }
-        } else {
-            // Destination is Compute tile: North slaves 15-18 (NOT 8-9!)
-            // Source compute tile South masters 5-10 → destination North slaves 15-18
-            if master_port >= compute::SOUTH_MASTER_START && master_port <= compute::SOUTH_MASTER_END {
-                // Map first 4 South masters to 4 North slaves
-                let offset = (master_port - compute::SOUTH_MASTER_START).min(3);
-                compute::NORTH_SLAVE_START + offset
-            } else {
-                compute::NORTH_SLAVE_START
+            TileType::Compute => {
+                // Destination is Compute tile: North slaves 15-18 (NOT 8-9!)
+                // Source compute tile South masters 5-10 → destination North slaves 15-18
+                if master_port >= compute::SOUTH_MASTER_START && master_port <= compute::SOUTH_MASTER_END {
+                    // Map first 4 South masters to 4 North slaves
+                    let offset = (master_port - compute::SOUTH_MASTER_START).min(3);
+                    compute::NORTH_SLAVE_START + offset
+                } else {
+                    compute::NORTH_SLAVE_START
+                }
             }
         }
     }

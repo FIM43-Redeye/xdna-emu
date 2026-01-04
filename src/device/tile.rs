@@ -364,6 +364,26 @@ pub enum TileType {
     Compute,
 }
 
+impl TileType {
+    /// Check if this is a shim tile.
+    #[inline]
+    pub fn is_shim(self) -> bool {
+        self == TileType::Shim
+    }
+
+    /// Check if this is a memory tile.
+    #[inline]
+    pub fn is_mem_tile(self) -> bool {
+        self == TileType::MemTile
+    }
+
+    /// Check if this is a compute tile.
+    #[inline]
+    pub fn is_compute(self) -> bool {
+        self == TileType::Compute
+    }
+}
+
 /// Complete state of a single AIE tile.
 ///
 /// This struct is designed for cache-friendly access during emulation.

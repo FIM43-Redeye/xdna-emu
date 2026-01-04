@@ -26,7 +26,7 @@
 use crate::device::tile::{Tile, LockResult};
 use crate::interpreter::bundle::{BranchCondition, Operation, Operand, SlotOp};
 use crate::interpreter::state::ExecutionContext;
-use crate::interpreter::traits::{ExecuteResult, Flags};
+use crate::interpreter::traits::{ExecuteResult, Flags, StateAccess};
 
 /// Control unit for branches, calls, and synchronization.
 pub struct ControlUnit;
@@ -43,7 +43,32 @@ impl ControlUnit {
         match &op.op {
             Operation::Branch { condition } => {
                 let target = Self::get_branch_target(op, ctx);
-                if Self::evaluate_condition(*condition, ctx.flags()) {
+                let should_branch = match condition {
+                    // For jz/jnz, check the source register value directly
+                    BranchCondition::Zero | BranchCondition::NotZero => {
+                        // The mRx field for jnz/jz is in dest (decoder treats it as dest)
+                        // Try dest first, then sources as fallback
+                        let reg_val = if let Some(Operand::ScalarReg(r)) = &op.dest {
+                            ctx.read_scalar(*r) as i32
+                        } else if let Some(src) = op.sources.first() {
+                            match src {
+                                Operand::ScalarReg(r) => ctx.read_scalar(*r) as i32,
+                                Operand::Immediate(imm) => *imm,
+                                _ => 0,
+                            }
+                        } else {
+                            0
+                        };
+                        match condition {
+                            BranchCondition::Zero => reg_val == 0,
+                            BranchCondition::NotZero => reg_val != 0,
+                            _ => unreachable!(),
+                        }
+                    }
+                    // For other conditions, check flags
+                    _ => Self::evaluate_condition(*condition, ctx.flags()),
+                };
+                if should_branch {
                     Some(ExecuteResult::Branch { target })
                 } else {
                     Some(ExecuteResult::Continue)
@@ -93,13 +118,16 @@ impl ControlUnit {
                 // AIE-ML lock mapping: lock IDs 48-63 in core instructions
                 // map to memory module locks 0-15
                 let lock_id = Self::map_lock_id(raw_lock_id);
+                let tile_ptr = tile as *const _ as usize;
+                let lock_ptr = &tile.locks[lock_id as usize] as *const _ as usize;
                 let old_value = tile.locks[lock_id as usize].value;
                 let lock = &mut tile.locks[lock_id as usize];
 
                 // Release is non-blocking; overflow just saturates
                 lock.release_with_value(delta);
-                log::debug!("LockRelease raw={} mapped={} delta={} {} -> {}",
-                    raw_lock_id, lock_id, delta, old_value, lock.value);
+                log::info!("LockRelease tile({},{}) raw={} mapped={} delta={} {} -> {} (tile_ptr=0x{:x} lock_ptr=0x{:x})",
+                    tile.col, tile.row, raw_lock_id, lock_id, delta, old_value, lock.value,
+                    tile_ptr, lock_ptr);
                 Some(ExecuteResult::Continue)
             }
 
@@ -137,6 +165,9 @@ impl ControlUnit {
     }
 
     /// Evaluate a branch condition against flags.
+    ///
+    /// Note: Zero and NotZero are register-based conditions handled in execute(),
+    /// not flag-based. They should not reach this function.
     pub fn evaluate_condition(condition: BranchCondition, flags: Flags) -> bool {
         match condition {
             BranchCondition::Always => true,
@@ -152,6 +183,11 @@ impl ControlUnit {
             BranchCondition::CarryClear => !flags.c,
             BranchCondition::OverflowSet => flags.v,
             BranchCondition::OverflowClear => !flags.v,
+            // These are handled directly in execute() using register values
+            BranchCondition::Zero | BranchCondition::NotZero => {
+                log::warn!("Zero/NotZero condition should be handled in execute(), not here");
+                false
+            }
         }
     }
 

@@ -48,6 +48,7 @@
 //! ```
 
 pub mod aie2_spec;
+pub mod arch_config;
 pub mod registers;
 pub mod registers_spec;
 pub mod tile;
@@ -58,6 +59,7 @@ pub mod dma;
 pub mod stream_switch;
 pub mod stream_router;
 
+pub use arch_config::{ArchConfig, Aie2Config, Aie2pConfig, default_arch};
 pub use registers::{RegisterInfo, RegisterModule, TileAddress};
 pub use tile::{Tile, TileType, Lock, LockResult, DmaBufferDescriptor, DmaChannel, CoreState};
 pub use array::TileArray;

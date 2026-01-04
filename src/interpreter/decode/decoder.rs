@@ -536,16 +536,31 @@ impl InstructionDecoder {
                         mnemonic,
                         decoded.operands.iter().map(|(k, v)| format!("{}=0x{:X}", k, v)).collect::<Vec<_>>());
             Operation::LockRelease
+        } else if mnemonic == "jl" || mnemonic.starts_with("call") {
+            // "jl" (jump and link) is the AIE2 call instruction
+            // It saves the return address to lr before jumping
+            Operation::Call
+        } else if mnemonic == "jnz" || mnemonic == "jnzd" || mnemonic == "bnz" {
+            // Conditional jump: jump if register is not zero
+            Operation::Branch {
+                condition: BranchCondition::NotZero,
+            }
+        } else if mnemonic == "jz" || mnemonic == "bz" {
+            // Conditional jump: jump if register is zero
+            Operation::Branch {
+                condition: BranchCondition::Zero,
+            }
         } else if mnemonic.starts_with("j") || mnemonic.starts_with("b") {
+            // Regular unconditional jumps/branches
             Operation::Branch {
                 condition: BranchCondition::Always,
             }
         } else if mnemonic.starts_with("ret") {
             // ret, ret lr, ret.* - all return operations
             Operation::Return
-        } else if mnemonic.starts_with("call") {
-            Operation::Call
-        } else if mnemonic == "halt" {
+        } else if mnemonic == "halt" || mnemonic == "done" {
+            // "done" is the AIE2 instruction name for halting the core
+            // "halt" is kept for compatibility
             Operation::Halt
         // Comparison operations (produce 0/1 result)
         } else if mnemonic.starts_with("lt") && !mnemonic.starts_with("ltip") {
@@ -1050,13 +1065,22 @@ impl InstructionDecoder {
                 || field.name.contains("mRy")
                 || field.name.starts_with("s")
                 || field.name == "src";
+            // Constant field patterns used by AIE2:
+            // - c5u, c5s: 5-bit unsigned/signed constants
+            // - c6u, c6s: 6-bit constants
+            // - cXXs, cXXu: general constant patterns where XX is bit width
+            let is_const_field = field.name.len() >= 3
+                && field.name.starts_with("c")
+                && field.name.chars().nth(1).map_or(false, |c| c.is_ascii_digit())
+                && field.name.chars().last().map_or(false, |c| c == 'u' || c == 's');
             let is_imm = field.name.contains("imm")
                 || field.name.contains("offset")
                 || field.name.contains("target")
                 || field.name.contains("addr")
                 || field.name.contains("tgt")
                 || field.name.contains("disp")  // displacement
-                || field.name.starts_with("i");
+                || field.name.starts_with("i")
+                || is_const_field;
 
             let operand = if is_imm {
                 Operand::Immediate(value as i32)

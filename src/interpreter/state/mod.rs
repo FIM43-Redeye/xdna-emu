@@ -39,6 +39,7 @@ pub use registers::{
 pub use context::{
     ExecutionContext, SpRegister, TimingContext,
     EventLog, EventType, TimestampedEvent,
+    PendingBranch,
 };
 
 #[cfg(test)]

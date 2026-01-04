@@ -6,6 +6,9 @@ description = "Open-source emulator and visual debugger for AMD XDNA NPUs"
 license = "Unlicense"
 rust-version = "1.70"
 
+[lib]
+# Doc tests are enabled but should be run via scripts/run-tests.sh for nice priority
+
 [dependencies]
 # Binary parsing
 zerocopy = { version = "0.8", features = ["derive"] }  # Zero-copy struct parsing

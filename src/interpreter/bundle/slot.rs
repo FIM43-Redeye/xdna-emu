@@ -179,6 +179,12 @@ pub enum BranchCondition {
     OverflowSet,
     /// Branch if overflow clear.
     OverflowClear,
+    /// Branch if source register is zero (jz instruction).
+    /// Unlike Equal which checks flags, this checks a register value directly.
+    Zero,
+    /// Branch if source register is not zero (jnz instruction).
+    /// Unlike NotEqual which checks flags, this checks a register value directly.
+    NotZero,
 }
 
 /// Shuffle pattern for vector permute operations.

@@ -476,12 +476,15 @@ impl MemoryUnit {
     }
 
     /// Get value to store.
+    ///
+    /// Uses `ctx.scalar_read()` for VLIW-safe reads that respect the
+    /// bundle snapshot when inside a VLIW bundle.
     fn get_store_value(op: &SlotOp, ctx: &ExecutionContext, width: MemWidth) -> u64 {
         // For stores, the value is typically in the second source or in dest
         let operand = op.sources.get(1).or(op.dest.as_ref());
 
         operand.map_or(0, |src| match src {
-            Operand::ScalarReg(r) => ctx.scalar.read(*r) as u64,
+            Operand::ScalarReg(r) => ctx.scalar_read(*r) as u64,
             Operand::VectorReg(r) => {
                 // For vector stores, pack into u64 (first 2 lanes)
                 let vec = ctx.vector.read(*r);

@@ -71,6 +71,7 @@ pub use engine::{DmaEngine, ChannelState, ChannelId, StreamData};
 pub use timing::{DmaTimingConfig, ChannelTimingState, TransferPhase, ChannelArbiter};
 
 use super::aie2_spec;
+use super::tile::TileType;
 
 /// Number of buffer descriptors per compute tile DMA controller.
 pub const NUM_BUFFER_DESCRIPTORS: usize = aie2_spec::NUM_DMA_BUFFER_DESCRIPTORS;
@@ -216,9 +217,10 @@ pub enum ChannelType {
 impl ChannelType {
     /// Get the channel type for a channel index.
     ///
-    /// For compute tiles: channels 0-1 are S2MM, 2-3 are MM2S.
-    pub fn from_channel_index(idx: usize, is_mem_tile: bool) -> Self {
-        let s2mm_count = if is_mem_tile {
+    /// For compute/shim tiles: channels 0-1 are S2MM, 2-3 are MM2S.
+    /// For memory tiles: channels 0-5 are S2MM, 6-11 are MM2S.
+    pub fn from_channel_index(idx: usize, tile_type: TileType) -> Self {
+        let s2mm_count = if tile_type.is_mem_tile() {
             MEM_TILE_S2MM_CHANNELS
         } else {
             COMPUTE_S2MM_CHANNELS
@@ -315,18 +317,18 @@ mod tests {
 
     #[test]
     fn test_channel_type_compute() {
-        assert_eq!(ChannelType::from_channel_index(0, false), ChannelType::S2MM);
-        assert_eq!(ChannelType::from_channel_index(1, false), ChannelType::S2MM);
-        assert_eq!(ChannelType::from_channel_index(2, false), ChannelType::MM2S);
-        assert_eq!(ChannelType::from_channel_index(3, false), ChannelType::MM2S);
+        assert_eq!(ChannelType::from_channel_index(0, TileType::Compute), ChannelType::S2MM);
+        assert_eq!(ChannelType::from_channel_index(1, TileType::Compute), ChannelType::S2MM);
+        assert_eq!(ChannelType::from_channel_index(2, TileType::Compute), ChannelType::MM2S);
+        assert_eq!(ChannelType::from_channel_index(3, TileType::Compute), ChannelType::MM2S);
     }
 
     #[test]
     fn test_channel_type_mem_tile() {
         // Mem tile has 6 S2MM and 6 MM2S
-        assert_eq!(ChannelType::from_channel_index(0, true), ChannelType::S2MM);
-        assert_eq!(ChannelType::from_channel_index(5, true), ChannelType::S2MM);
-        assert_eq!(ChannelType::from_channel_index(6, true), ChannelType::MM2S);
-        assert_eq!(ChannelType::from_channel_index(11, true), ChannelType::MM2S);
+        assert_eq!(ChannelType::from_channel_index(0, TileType::MemTile), ChannelType::S2MM);
+        assert_eq!(ChannelType::from_channel_index(5, TileType::MemTile), ChannelType::S2MM);
+        assert_eq!(ChannelType::from_channel_index(6, TileType::MemTile), ChannelType::MM2S);
+        assert_eq!(ChannelType::from_channel_index(11, TileType::MemTile), ChannelType::MM2S);
     }
 }

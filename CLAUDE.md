@@ -220,8 +220,11 @@ cargo build --release
 # Run
 cargo run -- path/to/binary.xclbin
 
-# Test (433 tests)
-cargo test
+# Test (587 tests)
+./scripts/run-tests.sh          # All tests (doc tests run with nice 19)
+./scripts/run-tests.sh --lib    # Fast: library tests only
+./scripts/run-tests.sh --doc    # Doc tests only (nice'd, limited parallelism)
+cargo test --lib                # Direct: library tests without script
 
 # Benchmark
 cargo bench
@@ -230,6 +233,10 @@ cargo bench
 cargo install flamegraph
 cargo flamegraph --release -- path/to/binary.xclbin
 ```
+
+**Note on doc tests**: Doc tests spawn separate processes that each load TableGen
+files from llvm-aie. The test script runs them with `nice -n 19` and limited
+parallelism to avoid overwhelming the system during other work.
 
 ## How To Begin
 

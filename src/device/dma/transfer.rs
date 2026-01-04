@@ -35,6 +35,7 @@
 
 use super::addressing::AddressGenerator;
 use super::{BdConfig, DmaError};
+use crate::device::tile::TileType;
 
 /// Transfer state in the state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +133,10 @@ pub struct Transfer {
 
 impl Transfer {
     /// Create a new transfer from a BD configuration.
+    ///
+    /// The `tile_type` parameter determines how endpoints are configured:
+    /// - Shim tiles transfer to/from host DDR memory
+    /// - Compute and MemTiles transfer to/from local tile memory
     pub fn new(
         bd_config: &BdConfig,
         bd_index: u8,
@@ -139,6 +144,7 @@ impl Transfer {
         direction: TransferDirection,
         tile_col: u8,
         tile_row: u8,
+        tile_type: TileType,
     ) -> Result<Self, DmaError> {
         if !bd_config.valid {
             return Err(DmaError::BdNotValid(bd_index));
@@ -156,9 +162,7 @@ impl Transfer {
         );
 
         // Determine endpoints based on direction and tile type
-        // Per AIE2 architecture: Row 0 = Shim (DDR interface), Row 1+ = processing tiles
-        // Note: This matches AieArch::is_shim_tile() but we lack arch context here
-        let is_shim = tile_row == 0;
+        let is_shim = tile_type == TileType::Shim;
 
         let (source, dest) = match (direction, is_shim) {
             (TransferDirection::S2MM, true) => (
@@ -412,7 +416,7 @@ mod tests {
     #[test]
     fn test_transfer_creation() {
         let bd = simple_bd();
-        let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2).unwrap();
+        let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
 
         assert_eq!(transfer.bd_index, 0);
         assert_eq!(transfer.channel, 0);
@@ -425,7 +429,7 @@ mod tests {
         let mut bd = simple_bd();
         bd.valid = false;
 
-        let result = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2);
+        let result = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute);
         assert!(matches!(result, Err(DmaError::BdNotValid(0))));
     }
 
@@ -435,7 +439,7 @@ mod tests {
         bd.acquire_lock = Some(5);
         bd.acquire_value = 1;
 
-        let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2).unwrap();
+        let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
         assert!(transfer.is_waiting_for_lock());
         assert!(matches!(transfer.state, TransferState::WaitingForLock(5)));
     }
@@ -446,7 +450,7 @@ mod tests {
         bd.acquire_lock = Some(5);
         bd.release_lock = Some(5);
 
-        let mut transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2).unwrap();
+        let mut transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
 
         // Initially waiting for lock
         assert!(transfer.is_waiting_for_lock());
@@ -467,7 +471,7 @@ mod tests {
     #[test]
     fn test_transfer_progress() {
         let bd = simple_bd();
-        let mut transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2).unwrap();
+        let mut transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
 
         assert_eq!(transfer.progress(), 0.0);
 
@@ -481,7 +485,7 @@ mod tests {
     #[test]
     fn test_transfer_remaining() {
         let bd = simple_bd();
-        let mut transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2).unwrap();
+        let mut transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
 
         assert_eq!(transfer.remaining_bytes(), 256);
 
@@ -492,7 +496,7 @@ mod tests {
     #[test]
     fn test_transfer_direction_s2mm() {
         let bd = simple_bd();
-        let transfer = Transfer::new(&bd, 0, 0, TransferDirection::S2MM, 1, 2).unwrap();
+        let transfer = Transfer::new(&bd, 0, 0, TransferDirection::S2MM, 1, 2, TileType::Compute).unwrap();
 
         assert!(matches!(transfer.source, TransferEndpoint::Stream { .. }));
         assert!(matches!(transfer.dest, TransferEndpoint::TileMemory { .. }));
@@ -501,7 +505,7 @@ mod tests {
     #[test]
     fn test_transfer_direction_mm2s() {
         let bd = simple_bd();
-        let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2).unwrap();
+        let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
 
         assert!(matches!(transfer.source, TransferEndpoint::TileMemory { .. }));
         assert!(matches!(transfer.dest, TransferEndpoint::Stream { .. }));
@@ -528,7 +532,7 @@ mod tests {
     #[test]
     fn test_transfer_error() {
         let bd = simple_bd();
-        let mut transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2).unwrap();
+        let mut transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
 
         transfer.set_error(DmaError::AddressOutOfBounds { address: 0xFFFF, limit: 0x1000 });
 
@@ -539,7 +543,7 @@ mod tests {
     #[test]
     fn test_next_bd_chaining() {
         let bd = BdConfig::simple_1d(0x1000, 256).with_next(3);
-        let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2).unwrap();
+        let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
 
         assert_eq!(transfer.next_bd, Some(3));
     }

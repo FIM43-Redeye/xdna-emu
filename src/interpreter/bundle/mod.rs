@@ -565,6 +565,8 @@ fn condition_suffix(c: BranchCondition) -> &'static str {
         BranchCondition::CarryClear => "cc",
         BranchCondition::OverflowSet => "vs",
         BranchCondition::OverflowClear => "vc",
+        BranchCondition::Zero => "z",
+        BranchCondition::NotZero => "nz",
     }
 }
 

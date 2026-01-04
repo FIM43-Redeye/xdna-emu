@@ -117,6 +117,10 @@ impl Executor for FastExecutor {
 
         let mut final_result = ExecuteResult::Continue;
 
+        // Snapshot scalar registers for VLIW parallel read semantics.
+        // All reads within the bundle will see pre-execution values.
+        ctx.begin_bundle();
+
         // Execute all slot operations
         for op in bundle.active_slots() {
             #[cfg(test)]
@@ -144,6 +148,9 @@ impl Executor for FastExecutor {
                 }
             }
         }
+
+        // End VLIW bundle - clear the snapshot
+        ctx.end_bundle();
 
         // Handle call return address
         if let Some(return_addr) = self.pending_call_return_addr {

@@ -26,8 +26,6 @@ impl ScalarAlu {
             Operation::ScalarAdd => {
                 let (a, b) = Self::get_two_sources(op, ctx);
                 let result = a.wrapping_add(b);
-                #[cfg(test)]
-                eprintln!("[ADD] {} + {} = {} -> {:?} (sources={:?})", a, b, result, op.dest, op.sources);
                 Self::write_dest(op, ctx, result);
                 ctx.set_flags(Flags::from_add(a, b, result));
                 true
@@ -378,9 +376,12 @@ impl ScalarAlu {
     }
 
     /// Read an operand value.
+    ///
+    /// Uses `ctx.scalar_read()` for VLIW-safe reads that respect the
+    /// bundle snapshot when inside a VLIW bundle.
     fn read_operand(operand: &Operand, ctx: &ExecutionContext) -> u32 {
         match operand {
-            Operand::ScalarReg(r) => ctx.scalar.read(*r),
+            Operand::ScalarReg(r) => ctx.scalar_read(*r),
             Operand::PointerReg(r) => ctx.pointer.read(*r),
             Operand::ModifierReg(r) => ctx.modifier.read(*r),
             Operand::Immediate(v) => *v as u32,

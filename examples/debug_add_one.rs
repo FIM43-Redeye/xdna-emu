@@ -57,13 +57,16 @@ fn main() -> anyhow::Result<()> {
         stats.commands, stats.writes, stats.dma_writes);
 
     // Setup host memory with input data
+    // The kernel's hardcoded loop processes 32 i32 values (4 batches of 8)
+    // The MLIR signature says 64xi32 but the generated loop only does 1 iteration
     println!("\nSetting up host memory...");
     let host_mem = engine.host_memory_mut();
-    let _ = host_mem.allocate_region("input", 0x0, 4096);
-    let input: Vec<u32> = (1..=1024).collect();
+    let _ = host_mem.allocate_region("input", 0x0, 128);  // 32 * 4 bytes
+    let input: Vec<u32> = (1..=32).collect();
     host_mem.write_slice(0x0, &input);
-    let _ = host_mem.allocate_region("output", 0x1000, 4096);
-    println!("  Input: 64 i32 values at 0x0 (first 4: [1, 2, 3, 4])");
+    let _ = host_mem.allocate_region("unused", 0x100, 128);  // arg1: unused buffer
+    let _ = host_mem.allocate_region("output", 0x1000, 128);  // 32 * 4 bytes
+    println!("  Input: 32 i32 values at 0x0 (first 4: [1, 2, 3, 4])");
 
     // Load and execute NPU instructions (insts.bin)
     let insts_path = test_dir.join("insts.bin");
@@ -77,9 +80,13 @@ fn main() -> anyhow::Result<()> {
         println!("  Parsed {} instructions", stream.len());
 
         let mut npu_executor = NpuExecutor::new();
-        // Set up host buffer addresses matching the test
-        npu_executor.add_host_buffer(0x0, 4096);      // Input buffer
-        npu_executor.add_host_buffer(0x1000, 4096);   // Output buffer
+        // Set up host buffer addresses matching the kernel's runtime_sequence signature:
+        //   aie.runtime_sequence(%arg0: memref<64xi32>, %arg1: memref<32xi32>, %arg2: memref<64xi32>)
+        // The DdrPatch instructions use arg_idx to reference these buffers:
+        //   arg0 = input buffer, arg1 = unused, arg2 = output buffer
+        npu_executor.add_host_buffer(0x0, 256);       // arg0: Input buffer (64 * 4 bytes)
+        npu_executor.add_host_buffer(0x100, 128);     // arg1: Unused middle buffer (32 * 4 bytes)
+        npu_executor.add_host_buffer(0x1000, 256);    // arg2: Output buffer (64 * 4 bytes)
 
         npu_executor.execute(&stream, engine.device_mut())
             .map_err(|e| anyhow::anyhow!("NPU execution failed: {}", e))?;
@@ -140,7 +147,30 @@ fn main() -> anyhow::Result<()> {
         let local_routes = memtile.stream_switch.local_route_count();
         println!("  Total local routes: {}", local_routes);
         for route in &memtile.stream_switch.local_routes {
-            println!("  slave[{}] -> master[{}]", route.slave_idx, route.master_idx);
+            println!("  slave[{}] -> master[{}] enabled={}", route.slave_idx, route.master_idx, route.enabled);
+        }
+
+        // Also print MemTile lock values
+        println!("\nMemTile (0,1) lock values:");
+        for lock_id in 0..4 {
+            let value = memtile.locks[lock_id].value;
+            println!("  Lock {}: {}", lock_id, value);
+        }
+
+        // Check Compute tile local routes
+        println!("\nCompute (0,2) stream switch local routes:");
+        let compute_tile = engine.device().array.tile(0, 2);
+        println!("  Total local routes: {}", compute_tile.stream_switch.local_route_count());
+        for route in &compute_tile.stream_switch.local_routes {
+            println!("  slave[{}] -> master[{}] enabled={}", route.slave_idx, route.master_idx, route.enabled);
+        }
+
+        // Check Shim tile local routes
+        println!("\nShim (0,0) stream switch local routes:");
+        let shim_tile = engine.device().array.tile(0, 0);
+        println!("  Total local routes: {}", shim_tile.stream_switch.local_route_count());
+        for route in &shim_tile.stream_switch.local_routes {
+            println!("  slave[{}] -> master[{}] enabled={}", route.slave_idx, route.master_idx, route.enabled);
         }
 
         // Global routes should be derived automatically from CDO stream switch configuration.
@@ -195,12 +225,28 @@ fn main() -> anyhow::Result<()> {
     let mut stall_count = 0;
     let mut last_stream_count = 16usize;
 
+    // Track lock acquires by PC to see if instructions are re-executed
+    let mut lock_acquire_pcs: Vec<(u32, u32)> = Vec::new(); // (cycle, pc)
+    let lock_acquire_addrs = [0x60u32, 0x74, 0xe8, 0xf2, 0x166, 0x170, 0x1e4, 0x1ee];
+
     for i in 0..1000 {
         engine.step();
 
         // Get PC of core (0,2)
         if let Some(ctx) = engine.core_context(0, 2) {
             let pc = ctx.pc();
+
+            // Track when we hit lock acquire instructions
+            if lock_acquire_addrs.contains(&pc) && (lock_acquire_pcs.is_empty() || lock_acquire_pcs.last().unwrap().1 != pc) {
+                lock_acquire_pcs.push((i as u32, pc));
+                println!("  Cycle {}: HIT lock instruction at PC=0x{:04X}", i, pc);
+            }
+
+            // Track critical control flow points
+            if (pc >= 0x140 && pc <= 0x2b0) || (pc >= 0 && pc <= 0x10) {
+                println!("  Cycle {}: CRITICAL PC=0x{:04X} lr={:?}", i, pc, ctx.lr());
+            }
+
             if pc == last_pc {
                 stall_count += 1;
                 if stall_count == 10 {
@@ -302,6 +348,63 @@ fn main() -> anyhow::Result<()> {
     println!("\n=== Final State ===");
     println!("Total cycles: {}", engine.total_cycles());
     println!("Status: {:?}", engine.status());
+
+    // Summary of lock acquire PCs hit
+    println!("\n=== Lock Acquire PC Trace ===");
+    println!("Total lock instruction hits: {}", lock_acquire_pcs.len());
+    for (cycle, pc) in &lock_acquire_pcs {
+        let lock_type = match *pc {
+            0x60 | 0xe8 | 0x166 | 0x1e4 => "acq #0x31 (lock 1, input consumer)",
+            0x74 | 0xf2 | 0x170 | 0x1ee => "acq #0x32 (lock 2, output producer)",
+            _ => "unknown",
+        };
+        println!("  Cycle {}: PC=0x{:04X} - {}", cycle, pc, lock_type);
+    }
+
+    // =========================================================================
+    // VERIFICATION: Check if the computation actually produced correct results
+    // =========================================================================
+    println!("\n=== Output Verification ===");
+
+    // Read output from host memory (32 elements - matches kernel's hardcoded loop)
+    let host_mem = engine.host_memory_mut();
+    let output: Vec<u32> = host_mem.read_slice(0x1000, 32);
+
+    // Check first 16 values
+    let show_count = 16.min(input.len());
+    println!("Input  (first {}): {:?}", show_count, &input[..show_count]);
+    println!("Output (first {}): {:?}", show_count, &output[..show_count]);
+
+    // Verify: output should be input + 1
+    let mut correct = 0;
+    let mut incorrect = 0;
+    let mut zero_count = 0;
+
+    for i in 0..input.len() {
+        let expected = input[i].wrapping_add(1);
+        if output[i] == expected {
+            correct += 1;
+        } else if output[i] == 0 {
+            zero_count += 1;
+        } else {
+            incorrect += 1;
+            if incorrect <= 5 {
+                println!("  MISMATCH at [{}]: input={}, expected={}, got={}",
+                    i, input[i], expected, output[i]);
+            }
+        }
+    }
+
+    println!("\nResults: {} correct, {} incorrect, {} zeros (untouched)",
+        correct, incorrect, zero_count);
+
+    if correct == input.len() {
+        println!("SUCCESS: All {} outputs are correct (input + 1)!", correct);
+    } else if zero_count == input.len() {
+        println!("FAILURE: Output buffer is all zeros - DMA didn't write results to host memory");
+    } else {
+        println!("PARTIAL: Some computation happened but results are incomplete");
+    }
 
     Ok(())
 }

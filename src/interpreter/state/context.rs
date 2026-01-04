@@ -243,6 +243,36 @@ impl std::fmt::Debug for TimingContext {
     }
 }
 
+/// Pending branch for delay slot handling.
+///
+/// AIE2 has 5-cycle branch delay slots - after a branch instruction,
+/// the next 5 instructions still execute before the branch takes effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingBranch {
+    /// The target address to branch to.
+    pub target: u32,
+    /// Number of delay slots remaining (starts at 5, decrements each instruction).
+    pub delay_slots: u8,
+}
+
+impl PendingBranch {
+    /// Create a new pending branch with 5 delay slots.
+    pub fn new(target: u32) -> Self {
+        Self {
+            target,
+            delay_slots: 5,
+        }
+    }
+
+    /// Decrement delay slot counter. Returns true if branch should now be taken.
+    pub fn tick(&mut self) -> bool {
+        if self.delay_slots > 0 {
+            self.delay_slots -= 1;
+        }
+        self.delay_slots == 0
+    }
+}
+
 /// Complete execution context for an AIE2 core.
 ///
 /// Contains all register files and execution state needed for instruction
@@ -303,6 +333,18 @@ pub struct ExecutionContext {
     /// Timing context for cycle-accurate execution.
     /// When None, uses fast mode (1 cycle per instruction).
     pub timing: Option<TimingContext>,
+
+    // === VLIW Bundle Support ===
+    /// Snapshot of scalar registers for VLIW parallel read semantics.
+    /// When set, scalar reads use this snapshot instead of live registers.
+    /// This ensures all reads in a bundle see pre-execution values.
+    scalar_snapshot: Option<ScalarRegisterFile>,
+
+    // === Branch Delay Slot Support ===
+    /// Pending branch waiting for delay slots to complete.
+    /// AIE2 has 5-cycle branch delay slots - after a branch is decided,
+    /// the next 5 instructions still execute before the branch takes effect.
+    pending_branch: Option<PendingBranch>,
 }
 
 /// Which register to use as stack pointer.
@@ -345,6 +387,8 @@ impl ExecutionContext {
             sp_reg: SpRegister::default(),
             lr_reg: 0, // r0 as link register
             timing: None,
+            scalar_snapshot: None,
+            pending_branch: None,
         }
     }
 
@@ -492,6 +536,89 @@ impl ExecutionContext {
     pub fn record_stall(&mut self, cycles: u64) {
         self.stall_cycles += cycles;
         self.cycles += cycles;
+    }
+
+    // === VLIW Bundle Support ===
+
+    /// Begin a VLIW bundle execution.
+    ///
+    /// Takes a snapshot of scalar registers so that all reads within the
+    /// bundle see the pre-execution values, implementing VLIW parallel
+    /// semantics where all operations execute "simultaneously".
+    #[inline]
+    pub fn begin_bundle(&mut self) {
+        self.scalar_snapshot = Some(self.scalar.clone());
+    }
+
+    /// End a VLIW bundle execution.
+    ///
+    /// Clears the scalar snapshot. Writes that occurred during bundle
+    /// execution are already committed to the live registers.
+    #[inline]
+    pub fn end_bundle(&mut self) {
+        self.scalar_snapshot = None;
+    }
+
+    /// Read a scalar register with VLIW semantics.
+    ///
+    /// If inside a bundle (snapshot exists), returns the pre-execution value.
+    /// Otherwise, returns the current (live) value.
+    #[inline]
+    pub fn scalar_read(&self, reg: u8) -> u32 {
+        if let Some(snapshot) = &self.scalar_snapshot {
+            snapshot.read(reg)
+        } else {
+            self.scalar.read(reg)
+        }
+    }
+
+    // === Branch Delay Slot Support ===
+
+    /// Set a pending branch with 5 delay slots.
+    ///
+    /// Called when a branch instruction is executed. The branch won't
+    /// actually change the PC until 5 more instructions have executed.
+    #[inline]
+    pub fn set_pending_branch(&mut self, target: u32) {
+        // If there's already a pending branch, the new one replaces it
+        // (this matches hardware behavior for back-to-back branches)
+        self.pending_branch = Some(PendingBranch::new(target));
+        log::debug!("Branch to 0x{:X} pending, 5 delay slots", target);
+    }
+
+    /// Check if there's a pending branch.
+    #[inline]
+    pub fn has_pending_branch(&self) -> bool {
+        self.pending_branch.is_some()
+    }
+
+    /// Get the pending branch target (if any).
+    #[inline]
+    pub fn pending_branch_target(&self) -> Option<u32> {
+        self.pending_branch.map(|b| b.target)
+    }
+
+    /// Tick the delay slot counter after executing an instruction.
+    ///
+    /// Returns `Some(target)` if delay slots are exhausted and branch
+    /// should now be taken, `None` otherwise.
+    #[inline]
+    pub fn tick_delay_slots(&mut self) -> Option<u32> {
+        if let Some(ref mut pending) = self.pending_branch {
+            if pending.tick() {
+                let target = pending.target;
+                self.pending_branch = None;
+                log::debug!("Delay slots exhausted, branching to 0x{:X}", target);
+                return Some(target);
+            }
+        }
+        None
+    }
+
+    /// Clear any pending branch (used on halt or error).
+    #[inline]
+    pub fn clear_pending_branch(&mut self) {
+        self.pending_branch = None;
     }
 
     /// Reset execution statistics.

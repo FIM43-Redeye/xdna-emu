@@ -183,12 +183,23 @@ where
         match result {
             ExecuteResult::Continue => {
                 ctx.advance_pc(bundle_size as u32);
+                // Check if pending branch should now be taken
+                if let Some(branch_target) = ctx.tick_delay_slots() {
+                    ctx.set_pc(branch_target);
+                }
                 self.status = CoreStatus::Ready;
                 StepResult::Continue
             }
 
             ExecuteResult::Branch { target } => {
-                ctx.set_pc(target);
+                // Set pending branch with 5 delay slots
+                // The next 5 instructions will still execute before the branch
+                ctx.set_pending_branch(target);
+                ctx.advance_pc(bundle_size as u32);
+                // Check if this was a back-to-back branch and delay slots exhausted
+                if let Some(branch_target) = ctx.tick_delay_slots() {
+                    ctx.set_pc(branch_target);
+                }
                 self.status = CoreStatus::Ready;
                 StepResult::Continue
             }
@@ -214,11 +225,13 @@ where
             ExecuteResult::Halt => {
                 self.status = CoreStatus::Halted;
                 ctx.halted = true;
+                ctx.clear_pending_branch(); // Clear any pending branch on halt
                 StepResult::Halt
             }
 
             ExecuteResult::Error { message } => {
                 self.status = CoreStatus::Error;
+                ctx.clear_pending_branch(); // Clear any pending branch on error
                 StepResult::ExecError(message)
             }
         }

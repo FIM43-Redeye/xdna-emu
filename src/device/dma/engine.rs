@@ -43,7 +43,7 @@ use super::{
 use super::transfer::{Transfer, TransferDirection, TransferEndpoint, TransferState};
 use super::timing::{DmaTimingConfig, ChannelTimingState, TransferPhase};
 use crate::device::host_memory::HostMemory;
-use crate::device::tile::Tile;
+use crate::device::tile::{Tile, TileType};
 use crate::interpreter::timing::sync::LockTimingState;
 
 /// Stream data word for DMA-to-stream interface.
@@ -102,8 +102,8 @@ pub struct DmaEngine {
     /// Tile row
     pub row: u8,
 
-    /// Whether this is a memory tile (affects channel count)
-    pub is_mem_tile: bool,
+    /// Tile type (affects channel count, BD count, and transfer endpoints)
+    pub tile_type: TileType,
 
     /// Buffer descriptor configurations
     bd_configs: Vec<BdConfig>,
@@ -147,42 +147,31 @@ pub struct DmaEngine {
 }
 
 impl DmaEngine {
-    /// Create a new DMA engine for a compute tile.
-    pub fn new_compute_tile(col: u8, row: u8) -> Self {
-        let num_channels = COMPUTE_S2MM_CHANNELS + COMPUTE_MM2S_CHANNELS;
-        Self::new(col, row, false, num_channels)
-    }
+    /// Create a new DMA engine for a specific tile type.
+    pub fn new(col: u8, row: u8, tile_type: TileType) -> Self {
+        let (num_channels, num_bds) = match tile_type {
+            TileType::MemTile => (
+                MEM_TILE_S2MM_CHANNELS + MEM_TILE_MM2S_CHANNELS,
+                MEMTILE_NUM_BUFFER_DESCRIPTORS,
+            ),
+            TileType::Shim | TileType::Compute => (
+                COMPUTE_S2MM_CHANNELS + COMPUTE_MM2S_CHANNELS,
+                NUM_BUFFER_DESCRIPTORS,
+            ),
+        };
 
-    /// Create a new DMA engine for a memory tile.
-    pub fn new_mem_tile(col: u8, row: u8) -> Self {
-        let num_channels = MEM_TILE_S2MM_CHANNELS + MEM_TILE_MM2S_CHANNELS;
-        Self::new(col, row, true, num_channels)
-    }
-
-    /// Create a new DMA engine with specified number of channels.
-    ///
-    /// Uses instant timing by default for fast simulation.
-    /// Call `with_timing` to enable cycle-accurate timing.
-    fn new(col: u8, row: u8, is_mem_tile: bool, num_channels: usize) -> Self {
         let mut transfers = Vec::with_capacity(num_channels);
         for _ in 0..num_channels {
             transfers.push(None);
         }
 
-        // MemTile has 48 BDs, compute tile has 16
-        let num_bds = if is_mem_tile {
-            MEMTILE_NUM_BUFFER_DESCRIPTORS
-        } else {
-            NUM_BUFFER_DESCRIPTORS
-        };
-
-        log::debug!("DmaEngine::new col={} row={} is_mem_tile={} num_channels={} num_bds={}",
-            col, row, is_mem_tile, num_channels, num_bds);
+        log::debug!("DmaEngine::new col={} row={} tile_type={:?} num_channels={} num_bds={}",
+            col, row, tile_type, num_channels, num_bds);
 
         Self {
             col,
             row,
-            is_mem_tile,
+            tile_type,
             bd_configs: vec![BdConfig::default(); num_bds],
             transfers,
             channel_states: vec![ChannelState::Idle; num_channels],
@@ -199,6 +188,21 @@ impl DmaEngine {
             // Lock timing disabled by default
             lock_timing: None,
         }
+    }
+
+    /// Create a new DMA engine for a compute tile.
+    pub fn new_compute_tile(col: u8, row: u8) -> Self {
+        Self::new(col, row, TileType::Compute)
+    }
+
+    /// Create a new DMA engine for a memory tile.
+    pub fn new_mem_tile(col: u8, row: u8) -> Self {
+        Self::new(col, row, TileType::MemTile)
+    }
+
+    /// Create a new DMA engine for a shim tile.
+    pub fn new_shim_tile(col: u8, row: u8) -> Self {
+        Self::new(col, row, TileType::Shim)
     }
 
     /// Set the timing configuration.
@@ -259,7 +263,7 @@ impl DmaEngine {
 
     /// Get the channel type (S2MM or MM2S).
     pub fn channel_type(&self, channel: ChannelId) -> ChannelType {
-        ChannelType::from_channel_index(channel as usize, self.is_mem_tile)
+        ChannelType::from_channel_index(channel as usize, self.tile_type)
     }
 
     /// Configure a buffer descriptor.
@@ -322,7 +326,7 @@ impl DmaEngine {
         };
 
         // Create transfer
-        let transfer = Transfer::new(bd_config, bd_index, channel, direction, self.col, self.row)?;
+        let transfer = Transfer::new(bd_config, bd_index, channel, direction, self.col, self.row, self.tile_type)?;
 
         // Initialize timing state if timing is enabled
         if self.is_timing_enabled() {
@@ -414,7 +418,7 @@ impl DmaEngine {
         // Convert relative channel to absolute channel index
         // For compute tiles: S2MM = 0-1, MM2S = 2-3
         // For mem tiles: S2MM = 0-5, MM2S = 6-11
-        let s2mm_count = if self.is_mem_tile {
+        let s2mm_count = if self.tile_type.is_mem_tile() {
             MEM_TILE_S2MM_CHANNELS
         } else {
             COMPUTE_S2MM_CHANNELS
@@ -595,11 +599,11 @@ impl DmaEngine {
             return;
         }
 
-        // S2MM stalls when stream_in has no data - wait for routing to provide data
-        if matches!(source, TransferEndpoint::Stream { .. }) && self.stream_in.is_empty() {
+        // S2MM stalls when stream_in has no data for THIS channel - wait for routing
+        if matches!(source, TransferEndpoint::Stream { .. }) && !self.has_stream_in_for_channel(channel) {
             // Debug: log when we stall waiting for stream data
-            log::debug!("DMA({},{}) ch{} S2MM stall: stream_in empty, addr=0x{:X}, remaining={}",
-                self.col, self.row, ch_idx, addr, bytes_to_transfer);
+            log::debug!("DMA({},{}) ch{} S2MM stall: no data for channel, addr=0x{:X}, remaining={} (stream_in_len={})",
+                self.col, self.row, ch_idx, addr, bytes_to_transfer, self.stream_in.len());
             // Stall: don't advance transfer, wait for data to arrive via route_dma_streams
             return;
         }
@@ -718,7 +722,7 @@ impl DmaEngine {
             }
             (TransferEndpoint::Stream { .. }, TransferEndpoint::TileMemory { .. }) => {
                 // S2MM: Read from stream input, write to tile memory
-                self.transfer_s2mm(addr, bytes, tile)
+                self.transfer_s2mm(addr, bytes, channel, tile)
             }
             (TransferEndpoint::HostMemory, TransferEndpoint::TileMemory { .. }) => {
                 Self::transfer_host_to_tile_static(addr, bytes, tile, host_memory)
@@ -732,7 +736,7 @@ impl DmaEngine {
             }
             (TransferEndpoint::Stream { .. }, TransferEndpoint::HostMemory) => {
                 // Shim S2MM: Read from stream input, write to host DDR
-                self.transfer_stream_to_host(addr, bytes, host_memory)
+                self.transfer_stream_to_host(addr, bytes, channel, host_memory)
             }
             (TransferEndpoint::TileMemory { .. }, TransferEndpoint::TileMemory { .. }) => {
                 // Tile to tile: Would need array access, mark as success for now
@@ -793,9 +797,9 @@ impl DmaEngine {
 
     /// S2MM: Read from stream input, write to tile memory.
     ///
-    /// Only transfers data that is available in stream_in.
-    /// Returns false if stream_in is empty (caller should stall).
-    fn transfer_s2mm(&mut self, addr: u64, bytes: usize, tile: &mut Tile) -> bool {
+    /// Only transfers data that is available in stream_in for the specified channel.
+    /// Returns false if no data for this channel is available (caller should stall).
+    fn transfer_s2mm(&mut self, addr: u64, bytes: usize, channel: u8, tile: &mut Tile) -> bool {
         let mem_size = tile.data_memory().len();
 
         // MemTile DMA addresses may have a 0x80000 offset in the address space
@@ -808,8 +812,8 @@ impl DmaEngine {
             return false;
         }
 
-        // Must have at least one word to transfer
-        if self.stream_in.is_empty() {
+        // Must have at least one word for this channel to transfer
+        if !self.has_stream_in_for_channel(channel) {
             return false;
         }
 
@@ -819,11 +823,11 @@ impl DmaEngine {
         let word_count = (bytes + 3) / 4;
 
         for _ in 0..word_count {
-            // Get data from stream - caller ensured at least some data exists
-            let word = if let Some(stream_data) = self.stream_in.pop_front() {
+            // Get data from stream for this specific channel
+            let word = if let Some(stream_data) = self.pop_stream_in_for_channel(channel) {
                 stream_data.data
             } else {
-                // No more stream data - transfer partial, continue next step
+                // No more stream data for this channel - transfer partial, continue next step
                 break;
             };
 
@@ -876,10 +880,11 @@ impl DmaEngine {
         &mut self,
         addr: u64,
         bytes: usize,
+        channel: u8,
         host_memory: &mut HostMemory,
     ) -> bool {
-        // Must have at least one word to transfer
-        if self.stream_in.is_empty() {
+        // Must have at least one word for this channel to transfer
+        if !self.has_stream_in_for_channel(channel) {
             return false;
         }
 
@@ -888,14 +893,15 @@ impl DmaEngine {
         let word_count = (bytes + 3) / 4;
 
         for i in 0..word_count {
-            let word = if let Some(stream_data) = self.stream_in.pop_front() {
+            let word = if let Some(stream_data) = self.pop_stream_in_for_channel(channel) {
                 stream_data.data
             } else {
-                // No more stream data
+                // No more stream data for this channel
                 break;
             };
 
             let word_addr = addr + (i * 4) as u64;
+            log::info!("Shim S2MM write: addr=0x{:X} word=0x{:08X}", word_addr, word);
             host_memory.write_u32(word_addr, word);
             bytes_written += 4;
         }
@@ -1025,6 +1031,11 @@ impl DmaEngine {
         };
 
         let acquire_value = transfer.acquire_value;
+
+        // Capture pointers before mutable borrow for debugging
+        let tile_ptr = tile as *const _ as usize;
+        let lock_ptr = &tile.locks[lock_id as usize] as *const _ as usize;
+
         let lock = &mut tile.locks[lock_id as usize];
 
         // AIE-ML lock semantics from AM020:
@@ -1045,8 +1056,9 @@ impl DmaEngine {
         let result = lock.acquire_with_value(expected, delta);
         let success = matches!(result, LockResult::Success);
 
-        log::trace!("DMA try_acquire_lock tile({},{}) ch{} lock={} expected={} delta={} current={} result={:?}",
-            self.col, self.row, ch_idx, lock_id, expected, delta, current_value, result);
+        log::info!("DMA try_acquire_lock tile({},{}) ch{} lock={} expected={} delta={} current={} result={:?} (tile_ptr=0x{:x} lock_ptr=0x{:x})",
+            self.col, self.row, ch_idx, lock_id, expected, delta, current_value, result,
+            tile_ptr, lock_ptr);
 
         // Track timing if enabled
         if let Some(ref mut timing) = self.lock_timing {
@@ -1144,6 +1156,21 @@ impl DmaEngine {
         self.stream_in.len()
     }
 
+    /// Check if stream input buffer has data for a specific channel.
+    pub fn has_stream_in_for_channel(&self, channel: u8) -> bool {
+        self.stream_in.iter().any(|d| d.channel == channel)
+    }
+
+    /// Pop data from stream input buffer for a specific channel.
+    ///
+    /// Scans the buffer for the first entry matching the channel and removes it.
+    /// Returns None if no data for this channel is available.
+    fn pop_stream_in_for_channel(&mut self, channel: u8) -> Option<StreamData> {
+        // Find index of first matching entry
+        let idx = self.stream_in.iter().position(|d| d.channel == channel)?;
+        self.stream_in.remove(idx)
+    }
+
     /// Check if any S2MM channel needs to receive stream data.
     ///
     /// Returns Some(channel) if a channel needs data, None otherwise.
@@ -1192,7 +1219,7 @@ mod tests {
     fn test_mem_tile_engine() {
         let engine = DmaEngine::new_mem_tile(0, 1);
         assert_eq!(engine.num_channels(), 12);
-        assert!(engine.is_mem_tile);
+        assert!(engine.tile_type.is_mem_tile());
     }
 
     #[test]

@@ -185,6 +185,11 @@ pub struct InterpreterEngine {
     auto_run: bool,
     /// Whether cycle-accurate timing is enabled.
     cycle_accurate: bool,
+    /// Counter for cycles with no progress while all cores halted.
+    /// Used to detect deadlock where DMAs are stalled waiting for resources.
+    no_progress_cycles: u32,
+    /// Last cycle's words routed (to detect progress).
+    last_words_routed: usize,
 }
 
 impl InterpreterEngine {
@@ -233,6 +238,8 @@ impl InterpreterEngine {
             total_instructions: 0,
             auto_run: false,
             cycle_accurate,
+            no_progress_cycles: 0,
+            last_words_routed: 0,
         }
     }
 
@@ -438,8 +445,6 @@ impl InterpreterEngine {
                     continue;
                 }
 
-                all_halted = false;
-
                 // Get tile for this core
                 if let Some(tile) = self.device.tile_mut(col, row) {
                     if tile.tile_type != TileType::Compute {
@@ -451,15 +456,17 @@ impl InterpreterEngine {
 
                     match result {
                         StepResult::Continue => {
+                            all_halted = false;
                             any_running = true;
                             self.total_instructions += 1;
                         }
                         StepResult::WaitLock { .. } | StepResult::WaitDma { .. } | StepResult::WaitStream { .. } => {
-                            // Stalled, but still active
+                            // Stalled, but still active - not halted
+                            all_halted = false;
                             any_running = true;
                         }
                         StepResult::Halt => {
-                            // This core halted
+                            // This core halted - don't set all_halted=false
                         }
                         StepResult::DecodeError(_) | StepResult::ExecError(_) => {
                             self.status = EngineStatus::Error;
@@ -472,7 +479,7 @@ impl InterpreterEngine {
 
         // Phase 3: Step all DMA engines and stream routing
         // This includes: DMA transfers, DMA-to-stream routing, and stream propagation
-        let (dma_active, streams_moved, _words_routed) =
+        let (dma_active, streams_moved, words_routed) =
             self.device.array.step_data_movement(&mut self.host_memory);
         if dma_active || streams_moved {
             any_running = true;
@@ -483,9 +490,68 @@ impl InterpreterEngine {
 
         self.total_cycles += 1;
 
-        // Engine only halts when BOTH all cores are halted AND no activity (DMA, etc.)
-        if all_halted && !any_running {
+        // Determine if we should halt the engine.
+        //
+        // The engine halts when:
+        // 1. All cores have halted (executed `done` instruction), AND
+        // 2. Either:
+        //    a. No DMA activity at all, OR
+        //    b. DMA is active but no progress for multiple cycles (deadlock)
+        //
+        // Deadlock detection: If all cores are halted and DMA makes no progress
+        // (no words routed) for several consecutive cycles, the system is stuck.
+        // This handles cases like:
+        // - DMA waiting for locks that will never be released
+        // - DMA waiting for stream data that will never arrive
+        // - Circular dependencies in the data flow
+        //
+        // Check if any cores were enabled (to distinguish DMA-only tests from real programs)
+        let any_cores_enabled = self.cores.iter().any(|c| c.enabled);
+
+        // Case 1: No cores enabled - halt if no activity at all
+        if !any_cores_enabled && !any_running {
             self.status = EngineStatus::Halted;
+            return;
+        }
+
+        // Case 2: Cores enabled and all halted - check for deadlock
+        if all_halted && any_cores_enabled {
+            let dma_waiting = self.device.array.any_dma_waiting_for_lock();
+
+            // Check if we're making progress
+            let making_progress = words_routed > 0 || words_routed != self.last_words_routed;
+            self.last_words_routed = words_routed;
+
+            if !dma_active {
+                // No DMA activity at all - clean halt
+                self.status = EngineStatus::Halted;
+            } else if !making_progress {
+                // DMA active but no progress this cycle
+                self.no_progress_cycles += 1;
+
+                // After 10 cycles of no progress with all cores halted, give up
+                // This is generous - real deadlocks are detected quickly
+                if self.no_progress_cycles >= 10 {
+                    if dma_waiting {
+                        log::info!(
+                            "Engine halting after {} cycles: all cores done, DMAs stalled on unreleased locks",
+                            self.no_progress_cycles
+                        );
+                    } else {
+                        log::info!(
+                            "Engine halting after {} cycles: all cores done, DMA deadlock detected",
+                            self.no_progress_cycles
+                        );
+                    }
+                    self.status = EngineStatus::Halted;
+                }
+            } else {
+                // Making progress - reset counter
+                self.no_progress_cycles = 0;
+            }
+        } else {
+            // Cores still running - reset counter
+            self.no_progress_cycles = 0;
         }
     }
 
