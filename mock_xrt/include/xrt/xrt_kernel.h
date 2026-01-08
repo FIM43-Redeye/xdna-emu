@@ -24,6 +24,9 @@ class xclbin;
 /// Run implementation (internal)
 class run_impl;
 
+// Forward declaration
+class kernel;
+
 /// xrt::run represents one execution of a kernel
 class run {
 public:
@@ -32,6 +35,9 @@ public:
 
     /// Construct from implementation
     explicit run(std::shared_ptr<run_impl> impl) : m_impl(std::move(impl)) {}
+
+    /// Construct from kernel (creates a run ready to execute)
+    explicit run(const kernel& k);
 
     /// Copy constructor
     run(const run&) = default;
@@ -70,10 +76,27 @@ public:
     /// Abort the running kernel
     void abort();
 
+    /// Set a kernel argument
+    ///
+    /// @param index  Argument index
+    /// @param value  Argument value
+    template<typename T>
+    void set_arg(int index, T&& value) {
+        set_arg_impl(index, static_cast<uint64_t>(value));
+    }
+
+    /// Set buffer argument
+    void set_arg(int index, const bo& buf);
+
+    /// Start kernel execution
+    void start();
+
     /// Check if run is valid
     explicit operator bool() const { return m_impl != nullptr; }
 
 private:
+    void set_arg_impl(int index, uint64_t value);
+
     std::shared_ptr<run_impl> m_impl;
 };
 

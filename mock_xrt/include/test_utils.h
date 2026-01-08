@@ -22,6 +22,11 @@ inline void add_default_options(cxxopts::Options& options) {
         ("k,kernel", "Kernel name", cxxopts::value<std::string>()->default_value("MLIR_AIE"))
         ("i,instr", "Path to instruction binary", cxxopts::value<std::string>())
         ("v,verbosity", "Verbosity level", cxxopts::value<int>()->default_value("0"))
+        ("verify", "Verify results (default: true)", cxxopts::value<bool>()->default_value("true"))
+        ("iters", "Number of iterations", cxxopts::value<int>()->default_value("1"))
+        ("warmup", "Number of warmup iterations", cxxopts::value<int>()->default_value("0"))
+        ("trace_sz", "Trace buffer size", cxxopts::value<int>()->default_value("0"))
+        ("trace_file", "Trace output file", cxxopts::value<std::string>()->default_value(""))
         ("h,help", "Print help");
 }
 
