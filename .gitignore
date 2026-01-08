@@ -1,2 +1,26 @@
+# Rust build output
 /target
+
+# IDE
 .idea/
+*.swp
+*.swo
+*~
+
+# Mock XRT build artifacts
+mock_xrt/build/
+
+# Generated/extracted test files (regenerate from mlir-aie)
+tests/mlir-aie-extracted/
+
+# Temporary/scratch files
+*.patch
+*.zip
+*.tar.gz
+
+# Documentation drafts (not ready for commit)
+CURRENT-REFACTOR.md
+
+# OS files
+.DS_Store
+Thumbs.db

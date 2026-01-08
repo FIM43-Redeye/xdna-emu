@@ -22,6 +22,14 @@ MOCK_XRT_BUILD="${MOCK_XRT_ROOT}/build"
 MOCK_XRT_INCLUDE="${MOCK_XRT_ROOT}/include"
 XDNA_EMU_LIB="${XDNA_EMU_ROOT}/target/release"
 
+# mlir-aie toolchain paths (for --prepare)
+MLIR_AIE_BIN="${MLIR_AIE_BUILD}/bin"
+MLIR_AIE_PYTHON="${MLIR_AIE_ROOT}/install/python:${MLIR_AIE_ROOT}/build/python"
+MLIR_AIE_VENV="${MLIR_AIE_ROOT}/ironenv"
+PEANO_INSTALL_DIR="${MLIR_AIE_VENV}/lib/python3.13/site-packages/llvm-aie"
+AIECC="${MLIR_AIE_BIN}/aiecc.py"
+AIE_OPT="${MLIR_AIE_BIN}/aie-opt"
+
 # We use our own test_utils.h (drop-in replacement for mlir-aie's)
 # No dependency on mlir-aie's test_utils library
 
@@ -50,6 +58,7 @@ usage() {
     echo "  -l, --list       List available tests without running"
     echo "  -v, --verbose    Verbose output (show test output)"
     echo "  -c, --compile    Only compile tests, don't run"
+    echo "  -p, --prepare    Generate missing instruction files using mlir-aie toolchain"
     echo "  -f, --force      Force recompilation even if up-to-date"
     echo "  -k, --keep       Keep compiled test binaries"
     echo "  -j N             Parallel compilation (default: 4)"
@@ -133,6 +142,75 @@ discover_tests() {
     printf '%s\n' "${tests[@]}"
 }
 
+# Prepare a test by generating missing instruction files
+# Uses mlir-aie toolchain (aie-opt, aiecc.py)
+prepare_test() {
+    local test_name="$1"
+    local source_dir="${MLIR_AIE_ROOT}/test/npu-xrt/${test_name}"
+    local build_dir="${MLIR_AIE_BUILD}/test/npu-xrt/${test_name}"
+
+    # Check if instruction files already exist
+    if [[ -f "${build_dir}/insts.bin" ]] || [[ -f "${build_dir}/aie_run_seq.bin" ]]; then
+        echo "EXISTS"
+        return 0
+    fi
+
+    # Check what kind of test this is by parsing run.lit
+    local run_lit="${source_dir}/run.lit"
+    if [[ ! -f "$run_lit" ]]; then
+        echo "NO_LIT"
+        return 1
+    fi
+
+    # Detect ctrl_packet tests (need overlay generation)
+    if grep -q "aie-generate-column-control-overlay" "$run_lit"; then
+        # This is a ctrl_packet test - needs special handling
+        pushd "$build_dir" > /dev/null
+
+        # Step 1: Generate overlay if not exists
+        if [[ ! -f "aie_overlay.mlir" ]]; then
+            "$AIE_OPT" -aie-generate-column-control-overlay="route-shim-to-tile-ctrl=true" \
+                aie_arch.mlir -o aie_overlay.mlir 2>&1 || { popd > /dev/null; return 1; }
+        fi
+
+        # Step 2: Generate ctrlpkt.bin and aie_run_seq.bin
+        PYTHONPATH="${MLIR_AIE_PYTHON}:${PYTHONPATH}" \
+        PEANO_INSTALL_DIR="${PEANO_INSTALL_DIR}" \
+        "${MLIR_AIE_VENV}/bin/python3" "$AIECC" --no-xchesscc --no-xbridge \
+            --device-name=main \
+            --aie-generate-ctrlpkt --ctrlpkt-name=ctrlpkt.bin \
+            --aie-generate-npu-insts --npu-insts-name=aie_run_seq.bin \
+            aie_overlay.mlir 2>&1
+
+        local result=$?
+        popd > /dev/null
+        return $result
+
+    # Detect ELF-based tests that might need bin conversion
+    elif grep -q "aie-generate-elf" "$run_lit" && [[ -f "${build_dir}/insts.elf" ]]; then
+        # ELF exists, test harness can use it directly
+        echo "HAS_ELF"
+        return 0
+
+    # Standard test - try to generate insts.bin
+    elif grep -q "aie-generate-npu-insts\|npu-insts-name" "$run_lit"; then
+        pushd "$build_dir" > /dev/null
+
+        PYTHONPATH="${MLIR_AIE_PYTHON}:${PYTHONPATH}" \
+        PEANO_INSTALL_DIR="${PEANO_INSTALL_DIR}" \
+        "${MLIR_AIE_VENV}/bin/python3" "$AIECC" --no-xchesscc --no-xbridge \
+            --aie-generate-npu-insts --npu-insts-name=insts.bin \
+            aie_arch.mlir 2>&1
+
+        local result=$?
+        popd > /dev/null
+        return $result
+    fi
+
+    echo "UNKNOWN"
+    return 1
+}
+
 # Check if test needs recompilation
 # Returns 0 if recompilation needed, 1 if up-to-date
 needs_recompile() {
@@ -206,14 +284,22 @@ run_test() {
         return 1
     fi
 
-    # Check for instruction file - different tests use different names
-    # Try insts.bin first, then aie_run_seq.bin
+    # Check for instruction file - different tests use different names/formats
+    # Priority: insts.bin > aie_run_seq.bin > insts.elf
     if [[ ! -f "$insts" ]]; then
-        local alt_insts="${build_dir}/aie_run_seq.bin"
-        if [[ -f "$alt_insts" ]]; then
-            insts="$alt_insts"
+        if [[ -f "${build_dir}/aie_run_seq.bin" ]]; then
+            insts="${build_dir}/aie_run_seq.bin"
+        elif [[ -f "${build_dir}/insts.elf" ]]; then
+            insts="${build_dir}/insts.elf"
         else
-            log_skip "No instruction file found (needs insts.bin or aie_run_seq.bin)"
+            # List what instruction files ARE needed for this test
+            local needed=""
+            if grep -q "aie_run_seq.bin\|ctrlpkt" "${MLIR_AIE_ROOT}/test/npu-xrt/${test_name}/run.lit" 2>/dev/null; then
+                needed="(needs: aiecc.py --aie-generate-ctrlpkt --aie-generate-npu-insts)"
+            elif grep -q "insts.elf" "${MLIR_AIE_ROOT}/test/npu-xrt/${test_name}/run.lit" 2>/dev/null; then
+                needed="(has insts.elf but may need conversion)"
+            fi
+            log_skip "No instruction file found $needed"
             return 2  # Return 2 for "skipped"
         fi
     fi
@@ -252,6 +338,7 @@ main() {
     local list_only=0
     local verbose=0
     local compile_only=0
+    local prepare_tests=0
     local force_compile=0
     local keep_binaries=0
     local parallel=4
@@ -274,6 +361,10 @@ main() {
                 ;;
             -c|--compile)
                 compile_only=1
+                shift
+                ;;
+            -p|--prepare)
+                prepare_tests=1
                 shift
                 ;;
             -f|--force)
@@ -326,6 +417,48 @@ main() {
             echo "  $test_name"
         done
         exit 0
+    fi
+
+    # Prepare tests (generate missing instruction files)
+    if [[ $prepare_tests -eq 1 ]]; then
+        log_info "Preparing tests (generating missing instruction files)..."
+        local prepared=0
+        local already_exist=0
+        local prep_failed=0
+
+        for test_name in "${tests[@]}"; do
+            printf "  Preparing %-40s " "$test_name..."
+
+            prep_output=$(prepare_test "$test_name" 2>&1)
+            prep_result=$?
+
+            case "$prep_output" in
+                EXISTS)
+                    echo -e "${BLUE}EXISTS${NC}"
+                    already_exist=$((already_exist + 1))
+                    ;;
+                HAS_ELF)
+                    echo -e "${BLUE}HAS_ELF${NC}"
+                    already_exist=$((already_exist + 1))
+                    ;;
+                NO_LIT|UNKNOWN)
+                    echo -e "${YELLOW}SKIP${NC}"
+                    ;;
+                *)
+                    if [[ $prep_result -eq 0 ]]; then
+                        echo -e "${GREEN}OK${NC}"
+                        prepared=$((prepared + 1))
+                    else
+                        echo -e "${RED}FAILED${NC}"
+                        echo "$prep_output" | tail -5
+                        prep_failed=$((prep_failed + 1))
+                    fi
+                    ;;
+            esac
+        done
+
+        log_info "Prepared: $prepared, Already exist: $already_exist, Failed: $prep_failed"
+        echo ""
     fi
 
     # Compile tests
