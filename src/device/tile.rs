@@ -132,11 +132,14 @@ impl Lock {
         }
     }
 
-    /// Acquire with value check.
+    /// Acquire with greater-or-equal check (acquire_ge mode).
     ///
     /// Checks if `value >= expected_value`, and if so, applies `delta` to the
     /// lock value. Returns `LockResult::Success` if the operation succeeded,
     /// or the appropriate error if it would underflow.
+    ///
+    /// This implements the AIE-ML acquire_ge semantics where a negative
+    /// Lock_Acq_Value in the BD indicates waiting for lock >= |value|.
     ///
     /// # Arguments
     /// * `expected_value` - Minimum value required for acquire to succeed
@@ -167,6 +170,52 @@ impl Lock {
 
         if new_value > Self::MAX_VALUE as i16 {
             // This shouldn't happen for acquire (negative delta), but handle it
+            self.overflow = true;
+            self.value = Self::MAX_VALUE;
+            return LockResult::WouldOverflow;
+        }
+
+        self.value = new_value as u8;
+        LockResult::Success
+    }
+
+    /// Acquire with exact-match check (acquire_eq mode).
+    ///
+    /// Checks if `value == expected_value`, and if so, applies `delta` to the
+    /// lock value. Returns `LockResult::Success` if the operation succeeded.
+    /// Returns `LockResult::WouldUnderflow` if the value doesn't match exactly.
+    ///
+    /// This implements the AIE-ML acquire_eq semantics where a non-negative
+    /// Lock_Acq_Value in the BD indicates waiting for lock == value exactly.
+    ///
+    /// # Arguments
+    /// * `expected_value` - Exact value required for acquire to succeed
+    /// * `delta` - Change to apply (typically sets to 0 for acquire_eq)
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Wait for lock value == 1, then set to 0
+    /// lock.acquire_equal(1, -1);
+    ///
+    /// // Wait for lock value == 2, then set to 0
+    /// lock.acquire_equal(2, -2);
+    /// ```
+    #[inline]
+    pub fn acquire_equal(&mut self, expected_value: u8, delta: i8) -> LockResult {
+        if self.value != expected_value {
+            // Value doesn't match exactly - operation would stall
+            return LockResult::WouldUnderflow;
+        }
+
+        // Apply delta (convert to i16 for safe arithmetic)
+        let new_value = (self.value as i16) + (delta as i16);
+
+        if new_value < 0 {
+            self.underflow = true;
+            return LockResult::WouldUnderflow;
+        }
+
+        if new_value > Self::MAX_VALUE as i16 {
             self.overflow = true;
             self.value = Self::MAX_VALUE;
             return LockResult::WouldOverflow;
@@ -291,8 +340,20 @@ pub struct DmaChannel {
     pub current_bd: u8,
     /// Channel is running
     pub running: bool,
-    /// Padding for alignment
-    _pad: [u8; 2],
+    /// Controller ID for task complete tokens (from control register bits 15:8)
+    pub controller_id: u8,
+    /// Finish-on-TLAST mode (S2MM only, from control register bits 17:16)
+    pub fot_mode: u8,
+    /// Enable token issue for current task (from start_queue bit 31)
+    pub enable_token_issue: bool,
+    /// Compression enable (MM2S only, from control register bit 4)
+    pub compression_enable: bool,
+    /// Decompression enable (S2MM only, from control register bit 4)
+    pub decompression_enable: bool,
+    /// Out-of-order mode enable (S2MM only, from control register bit 3)
+    pub out_of_order_enable: bool,
+    /// Status register (read-only bits updated during execution)
+    pub status: u32,
 }
 
 impl DmaChannel {
@@ -306,6 +367,54 @@ impl DmaChannel {
     #[inline]
     pub fn is_paused(&self) -> bool {
         self.control & 2 != 0
+    }
+
+    /// Check if channel is in reset
+    #[inline]
+    pub fn is_reset(&self) -> bool {
+        (self.control >> 1) & 1 != 0
+    }
+
+    /// Get the controller ID for task complete tokens
+    #[inline]
+    pub fn get_controller_id(&self) -> u8 {
+        self.controller_id
+    }
+
+    /// Get the FoT mode (S2MM only)
+    #[inline]
+    pub fn get_fot_mode(&self) -> u8 {
+        self.fot_mode
+    }
+
+    /// Check if token issue is enabled for current task
+    #[inline]
+    pub fn should_issue_token(&self) -> bool {
+        self.enable_token_issue
+    }
+
+    /// Update status register field: Cur_BD
+    pub fn set_cur_bd(&mut self, bd: u8) {
+        use super::registers_spec::memory_module::channel;
+        self.status = (self.status & !(channel::STATUS_CUR_BD_MASK << channel::STATUS_CUR_BD_SHIFT))
+            | (((bd as u32) & channel::STATUS_CUR_BD_MASK) << channel::STATUS_CUR_BD_SHIFT);
+    }
+
+    /// Update status register: Channel_Running
+    pub fn set_channel_running(&mut self, running: bool) {
+        use super::registers_spec::memory_module::channel;
+        if running {
+            self.status |= 1 << channel::STATUS_CHANNEL_RUNNING_BIT;
+        } else {
+            self.status &= !(1 << channel::STATUS_CHANNEL_RUNNING_BIT);
+        }
+    }
+
+    /// Update status register: State bits (00=IDLE, 01=STARTING, 10=RUNNING)
+    pub fn set_state(&mut self, state: u8) {
+        use super::registers_spec::memory_module::channel;
+        self.status = (self.status & !channel::STATUS_STATE_MASK)
+            | ((state as u32) & channel::STATUS_STATE_MASK);
     }
 }
 
@@ -407,6 +516,15 @@ pub struct Tile {
     /// Lock states
     pub locks: [Lock; NUM_LOCKS],
 
+    /// Lock value snapshot for cycle-accurate arbitration.
+    /// All lock operations within a cycle check against this snapshot,
+    /// ensuring all requestors see the same values regardless of processing order.
+    lock_snapshot: [u8; NUM_LOCKS],
+
+    /// Pending lock deltas to apply at end of cycle.
+    /// Releases add positive deltas, acquires add negative deltas.
+    lock_deltas: [i8; NUM_LOCKS],
+
     // === Warm data (accessed during DMA) ===
 
     /// DMA buffer descriptors
@@ -465,6 +583,8 @@ impl Tile {
             row,
             core: CoreState::default(),
             locks: [Lock::default(); NUM_LOCKS],
+            lock_snapshot: [0; NUM_LOCKS],
+            lock_deltas: [0; NUM_LOCKS],
             dma_bds: [DmaBufferDescriptor::default(); NUM_DMA_BDS],
             dma_channels: [DmaChannel::default(); NUM_DMA_CHANNELS],
             stream_input: Default::default(),
@@ -591,6 +711,121 @@ impl Tile {
         self.tile_type == TileType::Shim
     }
 
+    // === Lock Arbiter Methods ===
+    //
+    // These methods implement snapshot-based lock arbitration for cycle-accurate
+    // emulation. Within a single cycle:
+    // 1. `begin_lock_cycle()` - snapshot current lock values
+    // 2. All lock operations (DMA, core) use `try_acquire_snapshot()` / `release_snapshot()`
+    // 3. `end_lock_cycle()` - apply accumulated deltas to actual lock values
+    //
+    // This ensures all requestors see the same lock state regardless of processing
+    // order within a cycle, matching hardware arbiter behavior.
+
+    /// Begin a lock cycle by snapshotting current lock values.
+    ///
+    /// Call this at the start of each simulation cycle, before any lock operations.
+    /// All subsequent `try_acquire_snapshot()` and `release_snapshot()` calls will
+    /// check/modify based on this snapshot rather than live values.
+    #[inline]
+    pub fn begin_lock_cycle(&mut self) {
+        for i in 0..NUM_LOCKS {
+            self.lock_snapshot[i] = self.locks[i].value;
+            self.lock_deltas[i] = 0;
+        }
+    }
+
+    /// Try to acquire a lock using snapshot-based arbitration.
+    ///
+    /// Checks the lock's snapshot value against the expected threshold.
+    /// If successful, records a negative delta to be applied at cycle end.
+    ///
+    /// # Arguments
+    /// * `lock_id` - Lock index (0-63)
+    /// * `expected` - Minimum value required (for acq_ge mode)
+    /// * `delta` - Change to apply (typically negative for acquire)
+    /// * `equal_mode` - If true, requires exact match (acq_eq mode)
+    ///
+    /// # Returns
+    /// `LockResult::Success` if acquire would succeed, error otherwise.
+    pub fn try_acquire_snapshot(&mut self, lock_id: usize, expected: u8, delta: i8, equal_mode: bool) -> LockResult {
+        if lock_id >= NUM_LOCKS {
+            return LockResult::WouldUnderflow;
+        }
+
+        // Calculate effective value: snapshot + any deltas already recorded this cycle
+        let effective = (self.lock_snapshot[lock_id] as i16 + self.lock_deltas[lock_id] as i16) as u8;
+
+        let success = if equal_mode {
+            effective == expected
+        } else {
+            effective >= expected
+        };
+
+        if success {
+            // Record the delta - will be applied at end of cycle
+            self.lock_deltas[lock_id] = self.lock_deltas[lock_id].saturating_add(delta);
+            LockResult::Success
+        } else {
+            LockResult::WouldUnderflow
+        }
+    }
+
+    /// Release a lock using snapshot-based arbitration.
+    ///
+    /// Records a positive delta to be applied at cycle end.
+    /// Release operations always succeed (no blocking).
+    ///
+    /// # Arguments
+    /// * `lock_id` - Lock index (0-63)
+    /// * `delta` - Change to apply (typically positive for release)
+    #[inline]
+    pub fn release_snapshot(&mut self, lock_id: usize, delta: i8) {
+        if lock_id < NUM_LOCKS {
+            self.lock_deltas[lock_id] = self.lock_deltas[lock_id].saturating_add(delta);
+        }
+    }
+
+    /// End a lock cycle by applying accumulated deltas.
+    ///
+    /// Call this at the end of each simulation cycle, after all lock operations.
+    /// Applies all recorded deltas to the actual lock values, with clamping.
+    #[inline]
+    pub fn end_lock_cycle(&mut self) {
+        for i in 0..NUM_LOCKS {
+            let new_value = (self.locks[i].value as i16) + (self.lock_deltas[i] as i16);
+            if new_value < 0 {
+                self.locks[i].underflow = true;
+                self.locks[i].value = 0;
+            } else if new_value > Lock::MAX_VALUE as i16 {
+                self.locks[i].overflow = true;
+                self.locks[i].value = Lock::MAX_VALUE;
+            } else {
+                self.locks[i].value = new_value as u8;
+            }
+        }
+    }
+
+    /// Get the snapshot value for a lock (for debugging/logging).
+    #[inline]
+    pub fn lock_snapshot_value(&self, lock_id: usize) -> u8 {
+        if lock_id < NUM_LOCKS {
+            self.lock_snapshot[lock_id]
+        } else {
+            0
+        }
+    }
+
+    /// Get the pending delta for a lock (for debugging/logging).
+    #[inline]
+    pub fn lock_pending_delta(&self, lock_id: usize) -> i8 {
+        if lock_id < NUM_LOCKS {
+            self.lock_deltas[lock_id]
+        } else {
+            0
+        }
+    }
+
     // === Register Access (for NPU instruction execution) ===
 
     /// Write a 32-bit value to a register offset.
@@ -611,7 +846,7 @@ impl Tile {
 
         // For specific ranges, also update internal state
         // DMA BD range: 0x1D000-0x1D3FF (16 BDs × 32 bytes each)
-        if offset >= 0x1D000 && offset < 0x1D200 {
+        if (0x1D000..0x1D200).contains(&offset) {
             let bd_offset = offset - 0x1D000;
             let bd_index = (bd_offset / 0x20) as usize;
             let reg_in_bd = (bd_offset % 0x20) as usize / 4;
@@ -631,7 +866,7 @@ impl Tile {
         }
 
         // Lock registers: 0x14000-0x14XXX
-        if offset >= 0x14000 && offset < 0x15000 {
+        if (0x14000..0x15000).contains(&offset) {
             let lock_offset = offset - 0x14000;
             let lock_id = (lock_offset / 0x10) as usize;
             if lock_id < NUM_LOCKS {
@@ -643,7 +878,7 @@ impl Tile {
         }
 
         // DMA channel control: 0x1D200-0x1D3FF
-        if offset >= 0x1D200 && offset < 0x1D400 {
+        if (0x1D200..0x1D400).contains(&offset) {
             let ch_offset = offset - 0x1D200;
             let ch_index = (ch_offset / 0x8) as usize;
             if ch_index < NUM_DMA_CHANNELS {
@@ -655,15 +890,70 @@ impl Tile {
                 }
             }
         }
+
+        // Lock status registers (write-to-clear)
+        // Writing 1 to a bit clears that lock's overflow/underflow status
+        use super::registers_spec::{memory_module as mm, mem_tile_module as mt};
+        if self.is_mem_tile() {
+            if offset == mt::LOCKS_OVERFLOW_0 {
+                self.clear_lock_overflow_bits(0, 32, value);
+            } else if offset == mt::LOCKS_OVERFLOW_1 {
+                self.clear_lock_overflow_bits(32, 64, value);
+            } else if offset == mt::LOCKS_UNDERFLOW_0 {
+                self.clear_lock_underflow_bits(0, 32, value);
+            } else if offset == mt::LOCKS_UNDERFLOW_1 {
+                self.clear_lock_underflow_bits(32, 64, value);
+            }
+        } else if self.is_compute() {
+            if offset == mm::LOCKS_OVERFLOW {
+                self.clear_lock_overflow_bits(0, 16, value);
+            } else if offset == mm::LOCKS_UNDERFLOW {
+                self.clear_lock_underflow_bits(0, 16, value);
+            }
+        }
     }
 
     /// Read a 32-bit value from a register offset.
     ///
     /// Returns 0 for unwritten registers (default state).
-    pub fn read_register(&self, offset: u32) -> u32 {
+    pub fn read_register(&mut self, offset: u32) -> u32 {
+        use super::registers_spec::{memory_module as mm, mem_tile_module as mt};
+
+        // Lock_Request register - address encodes operation parameters
+        // Reading performs the lock operation and returns result
+        if self.is_mem_tile() {
+            if (mt::LOCK_REQUEST_BASE..mt::LOCK_REQUEST_END).contains(&offset) {
+                return self.handle_lock_request(offset, true);
+            }
+            // Lock status registers
+            if offset == mt::LOCKS_OVERFLOW_0 {
+                return self.get_lock_overflow_bits(0, 32);
+            }
+            if offset == mt::LOCKS_OVERFLOW_1 {
+                return self.get_lock_overflow_bits(32, 64);
+            }
+            if offset == mt::LOCKS_UNDERFLOW_0 {
+                return self.get_lock_underflow_bits(0, 32);
+            }
+            if offset == mt::LOCKS_UNDERFLOW_1 {
+                return self.get_lock_underflow_bits(32, 64);
+            }
+        } else if self.is_compute() {
+            if (mm::LOCK_REQUEST_BASE..mm::LOCK_REQUEST_END).contains(&offset) {
+                return self.handle_lock_request(offset, false);
+            }
+            // Lock status registers
+            if offset == mm::LOCKS_OVERFLOW {
+                return self.get_lock_overflow_bits(0, 16);
+            }
+            if offset == mm::LOCKS_UNDERFLOW {
+                return self.get_lock_underflow_bits(0, 16);
+            }
+        }
+
         // Check specific subsystem state first
         // DMA BD range: 0x1D000-0x1D1FF
-        if offset >= 0x1D000 && offset < 0x1D200 {
+        if (0x1D000..0x1D200).contains(&offset) {
             let bd_offset = offset - 0x1D000;
             let bd_index = (bd_offset / 0x20) as usize;
             let reg_in_bd = (bd_offset % 0x20) as usize / 4;
@@ -751,6 +1041,102 @@ impl Tile {
             self.stream_output[port as usize].pop_front()
         } else {
             None
+        }
+    }
+
+    // === Lock_Request Register Handling ===
+
+    /// Handle a Lock_Request register read.
+    ///
+    /// The address encodes the lock operation:
+    /// - Lock_Id: bits [13:10] (compute) or [15:10] (memtile)
+    /// - Acq_Rel: bit [9] (1=acquire, 0=release)
+    /// - Change_Value: bits [8:2] (7-bit signed)
+    ///
+    /// Reading from this address performs the operation and returns:
+    /// - Bit 0: 1 if operation succeeded, 0 if it would stall/fail
+    fn handle_lock_request(&mut self, offset: u32, is_memtile: bool) -> u32 {
+        use super::registers_spec::{memory_module as mm, mem_tile_module as mt};
+
+        let base = if is_memtile { mt::LOCK_REQUEST_BASE } else { mm::LOCK_REQUEST_BASE };
+        let addr = offset - base;
+
+        // Extract fields from address
+        let id_shift = if is_memtile { mt::LOCK_REQUEST_ID_SHIFT } else { mm::LOCK_REQUEST_ID_SHIFT };
+        let id_mask = if is_memtile { mt::LOCK_REQUEST_ID_MASK } else { mm::LOCK_REQUEST_ID_MASK };
+
+        let lock_id = ((addr >> id_shift) & id_mask) as usize;
+        let is_acquire = (addr >> mm::LOCK_REQUEST_ACQ_REL_BIT) & 1 != 0;
+        let change_raw = ((addr >> mm::LOCK_REQUEST_VALUE_SHIFT) & mm::LOCK_REQUEST_VALUE_MASK) as i8;
+
+        // Sign-extend 7-bit value
+        let change_value = if change_raw & 0x40 != 0 {
+            change_raw | !0x7F_i8 // Sign extend
+        } else {
+            change_raw
+        };
+
+        // Bounds check
+        let max_locks = if is_memtile { NUM_LOCKS_MEM_TILE } else { NUM_LOCKS_COMPUTE };
+        if lock_id >= max_locks {
+            return 0; // Invalid lock ID
+        }
+
+        // Perform the operation
+        let result = if is_acquire {
+            // Acquire: check if value >= abs(change), then apply delta
+            // For acquire, change_value is typically negative (consuming tokens)
+            self.locks[lock_id].acquire_with_value((-change_value).max(0) as u8, change_value)
+        } else {
+            // Release: just apply delta (typically positive, releasing tokens)
+            self.locks[lock_id].release_with_value(change_value)
+        };
+
+        // Return success bit
+        if matches!(result, LockResult::Success) { 1 } else { 0 }
+    }
+
+    /// Get lock overflow bits for a range of locks.
+    ///
+    /// Returns a bitmask where bit N is set if lock (start + N) has overflowed.
+    fn get_lock_overflow_bits(&self, start: usize, end: usize) -> u32 {
+        let mut bits = 0u32;
+        for i in start..end.min(self.locks.len()) {
+            if self.locks[i].overflow {
+                bits |= 1 << (i - start);
+            }
+        }
+        bits
+    }
+
+    /// Get lock underflow bits for a range of locks.
+    ///
+    /// Returns a bitmask where bit N is set if lock (start + N) has underflowed.
+    fn get_lock_underflow_bits(&self, start: usize, end: usize) -> u32 {
+        let mut bits = 0u32;
+        for i in start..end.min(self.locks.len()) {
+            if self.locks[i].underflow {
+                bits |= 1 << (i - start);
+            }
+        }
+        bits
+    }
+
+    /// Clear lock overflow bits for a range (write-to-clear behavior).
+    fn clear_lock_overflow_bits(&mut self, start: usize, end: usize, bits: u32) {
+        for i in start..end.min(self.locks.len()) {
+            if bits & (1 << (i - start)) != 0 {
+                self.locks[i].overflow = false;
+            }
+        }
+    }
+
+    /// Clear lock underflow bits for a range (write-to-clear behavior).
+    fn clear_lock_underflow_bits(&mut self, start: usize, end: usize, bits: u32) {
+        for i in start..end.min(self.locks.len()) {
+            if bits & (1 << (i - start)) != 0 {
+                self.locks[i].underflow = false;
+            }
         }
     }
 }
@@ -868,7 +1254,8 @@ mod tests {
         // Ensure structs are reasonably sized
         assert_eq!(std::mem::size_of::<Lock>(), 3); // u8 + 2 bools
         assert_eq!(std::mem::size_of::<DmaBufferDescriptor>(), 24);
-        assert_eq!(std::mem::size_of::<DmaChannel>(), 12);
+        // DmaChannel: control u32 + start_queue u32 + 4x u8 + bool (3 padding) + status u32 = 20 bytes
+        assert_eq!(std::mem::size_of::<DmaChannel>(), 20);
         assert_eq!(std::mem::size_of::<CoreState>(), 24);
     }
 
@@ -957,5 +1344,41 @@ mod tests {
         lock.clear_flags();
         assert!(!lock.overflow);
         assert!(!lock.has_error());
+    }
+
+    #[test]
+    fn test_lock_acquire_equal() {
+        // Test acquire_eq semantics (wait for exact match)
+        let mut lock = Lock::new(2);
+
+        // acquire_equal: wait for value == 1, should fail (value is 2)
+        assert_eq!(lock.acquire_equal(1, -1), LockResult::WouldUnderflow);
+        assert_eq!(lock.value, 2); // Unchanged
+
+        // acquire_equal: wait for value == 2, should succeed
+        assert_eq!(lock.acquire_equal(2, -2), LockResult::Success);
+        assert_eq!(lock.value, 0); // Decremented to 0
+
+        // Reset and test acquire_ge vs acquire_eq difference
+        lock.set(3);
+
+        // acquire_ge (acquire_with_value): wait for value >= 2, succeeds with 3
+        assert_eq!(lock.acquire_with_value(2, -1), LockResult::Success);
+        assert_eq!(lock.value, 2); // 3 - 1 = 2
+
+        // acquire_eq: wait for value == 2, succeeds
+        assert_eq!(lock.acquire_equal(2, -2), LockResult::Success);
+        assert_eq!(lock.value, 0);
+
+        // Reset to test exact-match requirement
+        lock.set(5);
+
+        // acquire_eq for value == 3 should fail (we have 5)
+        assert_eq!(lock.acquire_equal(3, -3), LockResult::WouldUnderflow);
+        assert_eq!(lock.value, 5); // Unchanged
+
+        // acquire_ge for value >= 3 should succeed (we have 5)
+        assert_eq!(lock.acquire_with_value(3, -2), LockResult::Success);
+        assert_eq!(lock.value, 3); // 5 - 2 = 3
     }
 }

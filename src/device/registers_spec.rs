@@ -66,6 +66,34 @@ pub mod memory_module {
     /// Lock address range end (exclusive)
     pub const LOCK_END: u32 = LOCK_BASE + (LOCK_COUNT as u32 * LOCK_STRIDE);
 
+    // Lock_Request register (AM025 memory_module/lock/misc.txt)
+    // 16KB address space where address encodes lock operation parameters
+
+    /// Lock_Request base address
+    pub const LOCK_REQUEST_BASE: u32 = 0x40000;
+
+    /// Lock_Request end address (exclusive)
+    pub const LOCK_REQUEST_END: u32 = 0x44000; // 16KB range
+
+    /// Lock_Request address field: Lock_Id [13:10] (4 bits)
+    pub const LOCK_REQUEST_ID_SHIFT: u32 = 10;
+    pub const LOCK_REQUEST_ID_MASK: u32 = 0xF; // 4 bits for 16 locks
+
+    /// Lock_Request address field: Acq_Rel [9] (1=acquire, 0=release)
+    pub const LOCK_REQUEST_ACQ_REL_BIT: u32 = 9;
+
+    /// Lock_Request address field: Change_Value [8:2] (7 bits signed)
+    pub const LOCK_REQUEST_VALUE_SHIFT: u32 = 2;
+    pub const LOCK_REQUEST_VALUE_MASK: u32 = 0x7F; // 7 bits
+
+    // Lock status registers (AM025 memory_module/lock/value.txt)
+
+    /// Lock overflow status register (write-to-clear)
+    pub const LOCKS_OVERFLOW: u32 = 0x1F120;
+
+    /// Lock underflow status register (write-to-clear)
+    pub const LOCKS_UNDERFLOW: u32 = 0x1F128;
+
     // DMA buffer descriptors (AM025 memory_module/dma/bd.txt)
 
     /// DMA buffer descriptor base address
@@ -98,6 +126,91 @@ pub mod memory_module {
     /// DMA channel status base
     pub const DMA_STATUS_BASE: u32 = 0x1DF00;
 
+    /// Channel register field layouts (AM025 memory_module/dma/s2mm.txt, mm2s.txt)
+    pub mod channel {
+        // S2MM Control Register (DMA_S2MM_x_Ctrl @ 0x1DE00, 0x1DE08)
+        // MM2S Control Register (DMA_MM2S_x_Ctrl @ 0x1DE10, 0x1DE18)
+
+        /// FoT_Mode shift (bits 17:16) - S2MM only
+        /// 00 = disabled, 01 = no_counts, 10 = counts_with_tokens, 11 = counts_from_register
+        pub const CTRL_FOT_MODE_SHIFT: u32 = 16;
+        /// FoT_Mode mask (2 bits)
+        pub const CTRL_FOT_MODE_MASK: u32 = 0x3;
+
+        /// Controller_ID shift (bits 15:8)
+        pub const CTRL_CONTROLLER_ID_SHIFT: u32 = 8;
+        /// Controller_ID mask (8 bits)
+        pub const CTRL_CONTROLLER_ID_MASK: u32 = 0xFF;
+
+        /// Compression/Decompression enable bit (bit 4)
+        pub const CTRL_COMPRESSION_ENABLE_BIT: u32 = 4;
+
+        /// Enable Out-of-Order bit (bit 3) - S2MM only
+        pub const CTRL_ENABLE_OUT_OF_ORDER_BIT: u32 = 3;
+
+        /// Reset bit (bit 1)
+        pub const CTRL_RESET_BIT: u32 = 1;
+
+        // Start_Queue Register (DMA_S2MM_x_Start_Queue, DMA_MM2S_x_Start_Queue)
+
+        /// Enable_Token_Issue bit (bit 31)
+        pub const START_QUEUE_ENABLE_TOKEN_ISSUE_BIT: u32 = 31;
+
+        /// Repeat_Count shift (bits 23:16)
+        pub const START_QUEUE_REPEAT_COUNT_SHIFT: u32 = 16;
+        /// Repeat_Count mask (8 bits, actual - 1)
+        pub const START_QUEUE_REPEAT_COUNT_MASK: u32 = 0xFF;
+
+        /// Start_BD_ID mask (bits 3:0)
+        pub const START_QUEUE_BD_ID_MASK: u32 = 0xF;
+
+        // Status Register fields (DMA_S2MM_Status_x, DMA_MM2S_Status_x)
+
+        /// Cur_BD shift (bits 27:24)
+        pub const STATUS_CUR_BD_SHIFT: u32 = 24;
+        /// Cur_BD mask (4 bits)
+        pub const STATUS_CUR_BD_MASK: u32 = 0xF;
+
+        /// Task_Queue_Size shift (bits 22:20)
+        pub const STATUS_TASK_QUEUE_SIZE_SHIFT: u32 = 20;
+        /// Task_Queue_Size mask (3 bits)
+        pub const STATUS_TASK_QUEUE_SIZE_MASK: u32 = 0x7;
+
+        /// Channel_Running bit (bit 19)
+        pub const STATUS_CHANNEL_RUNNING_BIT: u32 = 19;
+
+        /// Task_Queue_Overflow bit (bit 18)
+        pub const STATUS_TASK_QUEUE_OVERFLOW_BIT: u32 = 18;
+
+        /// Error_BD_Invalid bit (bit 11)
+        pub const STATUS_ERROR_BD_INVALID_BIT: u32 = 11;
+
+        /// Error_BD_Unavailable bit (bit 10) - S2MM out-of-order mode only
+        pub const STATUS_ERROR_BD_UNAVAILABLE_BIT: u32 = 10;
+
+        /// Stalled_TCT bit (bit 5)
+        pub const STATUS_STALLED_TCT_BIT: u32 = 5;
+
+        /// Stalled_Stream bit (bit 4)
+        pub const STATUS_STALLED_STREAM_BIT: u32 = 4;
+
+        /// Stalled_Lock_Rel bit (bit 3)
+        pub const STATUS_STALLED_LOCK_REL_BIT: u32 = 3;
+
+        /// Stalled_Lock_Acq bit (bit 2)
+        pub const STATUS_STALLED_LOCK_ACQ_BIT: u32 = 2;
+
+        /// Status mask (bits 1:0)
+        /// 00=IDLE, 01=STARTING, 10=RUNNING
+        pub const STATUS_STATE_MASK: u32 = 0x3;
+
+        /// FoT Mode values
+        pub const FOT_DISABLED: u8 = 0;
+        pub const FOT_NO_COUNTS: u8 = 1;
+        pub const FOT_COUNTS_WITH_TOKENS: u8 = 2;
+        pub const FOT_COUNTS_FROM_REGISTER: u8 = 3;
+    }
+
     // Stream switch (AM025 memory_module/../stream_switch/)
 
     /// Stream switch master config base
@@ -122,6 +235,64 @@ pub mod memory_module {
         pub const WORD0_BASE_ADDR_MASK: u32 = 0x3FFF;
         /// Buffer length mask (bits 13:0, 14 bits)
         pub const WORD0_BUFFER_LEN_MASK: u32 = 0x3FFF;
+
+        // Word 1: Compression/Packet Control (MM2S only)
+        // AM025: memory_module/dma/bd.txt Word 1
+
+        /// Enable compression bit (bit 31)
+        pub const WORD1_ENABLE_COMPRESSION_BIT: u32 = 31;
+        /// Enable packet header bit (bit 30)
+        pub const WORD1_ENABLE_PACKET_BIT: u32 = 30;
+        /// Out-of-order BD ID shift (bits 29:24)
+        pub const WORD1_OOO_BD_ID_SHIFT: u32 = 24;
+        /// Out-of-order BD ID mask (6 bits)
+        pub const WORD1_OOO_BD_ID_MASK: u32 = 0x3F;
+        /// Packet ID shift (bits 23:19)
+        pub const WORD1_PACKET_ID_SHIFT: u32 = 19;
+        /// Packet ID mask (5 bits)
+        pub const WORD1_PACKET_ID_MASK: u32 = 0x1F;
+        /// Packet type shift (bits 18:16)
+        pub const WORD1_PACKET_TYPE_SHIFT: u32 = 16;
+        /// Packet type mask (3 bits)
+        pub const WORD1_PACKET_TYPE_MASK: u32 = 0x7;
+
+        // Word 2: Dimension Stepsizes
+        // AM025: memory_module/dma/bd.txt Word 2
+
+        /// D1 stepsize shift (bits 25:13)
+        pub const WORD2_D1_STEPSIZE_SHIFT: u32 = 13;
+        /// D1 stepsize mask (13 bits, actual stride - 1)
+        pub const WORD2_D1_STEPSIZE_MASK: u32 = 0x1FFF;
+        /// D0 stepsize mask (bits 12:0, 13 bits, actual stride - 1)
+        pub const WORD2_D0_STEPSIZE_MASK: u32 = 0x1FFF;
+
+        // Word 3: Wrap Counts and D2 Stepsize
+        // AM025: memory_module/dma/bd.txt Word 3
+
+        /// D1 wrap count shift (bits 28:21)
+        pub const WORD3_D1_WRAP_SHIFT: u32 = 21;
+        /// D1 wrap count mask (8 bits, 0 = no wrap)
+        pub const WORD3_D1_WRAP_MASK: u32 = 0xFF;
+        /// D0 wrap count shift (bits 20:13)
+        pub const WORD3_D0_WRAP_SHIFT: u32 = 13;
+        /// D0 wrap count mask (8 bits, 0 = no wrap)
+        pub const WORD3_D0_WRAP_MASK: u32 = 0xFF;
+        /// D2 stepsize mask (bits 12:0, 13 bits, actual stride - 1)
+        pub const WORD3_D2_STEPSIZE_MASK: u32 = 0x1FFF;
+
+        // Word 4: Iteration Control
+        // AM025: memory_module/dma/bd.txt Word 4
+
+        /// Iteration current shift (bits 24:19)
+        pub const WORD4_ITERATION_CURRENT_SHIFT: u32 = 19;
+        /// Iteration current mask (6 bits)
+        pub const WORD4_ITERATION_CURRENT_MASK: u32 = 0x3F;
+        /// Iteration wrap shift (bits 18:13)
+        pub const WORD4_ITERATION_WRAP_SHIFT: u32 = 13;
+        /// Iteration wrap mask (6 bits, actual - 1)
+        pub const WORD4_ITERATION_WRAP_MASK: u32 = 0x3F;
+        /// Iteration stepsize mask (bits 12:0, 13 bits, actual - 1)
+        pub const WORD4_ITERATION_STEPSIZE_MASK: u32 = 0x1FFF;
 
         // Word 5: Lock and chaining fields
 
@@ -224,6 +395,40 @@ pub mod mem_tile_module {
 
     /// Lock address range end
     pub const LOCK_END: u32 = LOCK_BASE + (LOCK_COUNT as u32 * LOCK_STRIDE);
+
+    // Lock_Request register (AM025 memory_tile_module/lock/misc.txt)
+    // 64KB address space where address encodes lock operation parameters
+
+    /// Lock_Request base address
+    pub const LOCK_REQUEST_BASE: u32 = 0xD0000;
+
+    /// Lock_Request end address (exclusive)
+    pub const LOCK_REQUEST_END: u32 = 0xE0000; // 64KB range
+
+    /// Lock_Request address field: Lock_Id [15:10] (6 bits)
+    pub const LOCK_REQUEST_ID_SHIFT: u32 = 10;
+    pub const LOCK_REQUEST_ID_MASK: u32 = 0x3F; // 6 bits for 64 locks
+
+    /// Lock_Request address field: Acq_Rel [9] (1=acquire, 0=release)
+    pub const LOCK_REQUEST_ACQ_REL_BIT: u32 = 9;
+
+    /// Lock_Request address field: Change_Value [8:2] (7 bits signed)
+    pub const LOCK_REQUEST_VALUE_SHIFT: u32 = 2;
+    pub const LOCK_REQUEST_VALUE_MASK: u32 = 0x7F; // 7 bits
+
+    // Lock status registers (AM025 memory_tile_module/lock/value.txt)
+
+    /// Lock overflow status register 0 (locks 0-31, write-to-clear)
+    pub const LOCKS_OVERFLOW_0: u32 = 0xC0420;
+
+    /// Lock overflow status register 1 (locks 32-63, write-to-clear)
+    pub const LOCKS_OVERFLOW_1: u32 = 0xC0424;
+
+    /// Lock underflow status register 0 (locks 0-31, write-to-clear)
+    pub const LOCKS_UNDERFLOW_0: u32 = 0xC0428;
+
+    /// Lock underflow status register 1 (locks 32-63, write-to-clear)
+    pub const LOCKS_UNDERFLOW_1: u32 = 0xC042C;
 
     // DMA buffer descriptors
 

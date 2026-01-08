@@ -257,9 +257,24 @@ impl TileArray {
     ///
     /// Returns true if any DMA engine is still active.
     pub fn step_all_dma(&mut self, host_memory: &mut HostMemory) -> bool {
+        // Debug: trace step_all_dma calls
+        static STEP_ALL_DMA_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let call_count = STEP_ALL_DMA_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if call_count < 5 {
+            log::info!("step_all_dma call #{}, tiles={}", call_count, self.tiles.len());
+        }
+
         let mut any_active = false;
         for i in 0..self.tiles.len() {
+            let tile_col = self.tiles[i].col;
+            let tile_row = self.tiles[i].row;
             let result = self.dma_engines[i].step(&mut self.tiles[i], host_memory);
+
+            if call_count < 5 && tile_col == 0 && tile_row == 0 {
+                log::info!("  tile({},{}) engine_i={} result={:?}",
+                    tile_col, tile_row, i, result);
+            }
+
             if matches!(result, DmaResult::InProgress | DmaResult::WaitingForLock(_)) {
                 any_active = true;
             }
@@ -345,6 +360,91 @@ impl TileArray {
         total_forwarded
     }
 
+    /// Convert S2MM DMA channel index to stream switch slave port index.
+    ///
+    /// Per AM025, the mapping differs by tile type:
+    /// - **Compute tiles** (4 channels): S2MM 0-1 at indices 0-1
+    ///   - S2MM channel 0 → slave port 1 (DMA0)
+    ///   - S2MM channel 1 → slave port 2 (DMA1)
+    /// - **MemTiles** (12 channels): S2MM 0-5 at indices 0-5
+    ///   - S2MM channel 0-5 → slave port 0-5
+    /// - **Shim tiles** (4 channels): S2MM 0-1 at indices 0-1
+    ///   - S2MM receives from North ports (from MemTile above)
+    ///   - S2MM channel 0 → North port 0 (slave port 8)
+    ///   - S2MM channel 1 → North port 1 (slave port 9)
+    fn s2mm_channel_to_slave_port(tile_type: TileType, channel: u8) -> u8 {
+        match tile_type {
+            TileType::Compute => {
+                // S2MM channels are at indices 0-1, map to slave ports 1-2
+                // channel 0 → port 1, channel 1 → port 2
+                channel + 1
+            }
+            TileType::MemTile => {
+                // S2MM channels are at indices 0-5, map to slave ports 0-5
+                // channel 0-5 → port 0-5
+                channel
+            }
+            TileType::Shim => {
+                // Shim S2MM channels are at indices 0-1
+                // They receive from North ports (from MemTile above)
+                // Per AM025: Shim slave ports 8-13 are North0-5
+                // S2MM channel 0 → North0 = slave port 8
+                // S2MM channel 1 → North1 = slave port 9
+                8 + channel
+            }
+        }
+    }
+
+    /// Convert MM2S DMA channel index to stream switch master port index.
+    ///
+    /// Per AM025, the mapping differs by tile type:
+    /// - **Compute tiles** (4 channels): S2MM 0-1 at indices 0-1, MM2S 0-1 at indices 2-3
+    ///   - MM2S channel 2 → master port 1 (DMA0)
+    ///   - MM2S channel 3 → master port 2 (DMA1)
+    /// - **MemTiles** (12 channels): S2MM 0-5 at indices 0-5, MM2S 0-5 at indices 6-11
+    ///   - MM2S channel 6-11 → master port 0-5
+    /// - **Shim tiles** (4 channels): S2MM 0-1 at indices 0-1, MM2S 0-1 at indices 2-3
+    ///   - MM2S uses North ports to reach MemTile
+    ///   - MM2S channel 2 → North port 0 (master port 12)
+    ///   - MM2S channel 3 → North port 1 (master port 13)
+    fn mm2s_channel_to_master_port(tile_type: TileType, channel: u8) -> u8 {
+        match tile_type {
+            TileType::Compute => {
+                // MM2S channels are at indices 2-3, map to master ports 1-2
+                // channel 2 → port 1, channel 3 → port 2
+                if channel >= 2 {
+                    channel - 1
+                } else {
+                    log::warn!("mm2s_channel_to_master_port: unexpected S2MM channel {} for compute MM2S", channel);
+                    channel
+                }
+            }
+            TileType::MemTile => {
+                // MM2S channels are at indices 6-11, map to master ports 0-5
+                // channel 6 → port 0, channel 7 → port 1, etc.
+                if channel >= 6 {
+                    channel - 6
+                } else {
+                    log::warn!("mm2s_channel_to_master_port: unexpected S2MM channel {} for memtile MM2S", channel);
+                    channel
+                }
+            }
+            TileType::Shim => {
+                // Shim MM2S channels are at indices 2-3
+                // They connect to North ports to reach MemTile above
+                // Per AM025: Shim master ports 12-17 are North0-5
+                // MM2S channel 2 → North0 = master port 12
+                // MM2S channel 3 → North1 = master port 13
+                if channel >= 2 {
+                    12 + (channel - 2)
+                } else {
+                    log::warn!("mm2s_channel_to_master_port: unexpected S2MM channel {} for shim MM2S", channel);
+                    channel
+                }
+            }
+        }
+    }
+
     /// Route DMA MM2S output to stream router.
     ///
     /// This is phase 1 of the DMA-stream routing: moving data from DMA output
@@ -366,6 +466,7 @@ impl TileArray {
 
             let col = (i / self.rows as usize) as u8;
             let row = (i % self.rows as usize) as u8;
+            let tile_type = self.tiles[i].tile_type;
 
             // Check stream_out length before popping
             let stream_out_len = self.dma_engines[i].stream_out_len();
@@ -374,20 +475,70 @@ impl TileArray {
             }
 
             while let Some(data) = self.dma_engines[i].pop_stream_out() {
-                // Map DMA channel to stream port
-                let port = data.channel;
+                // Map DMA channel to stream switch master port based on tile type
+                let port = Self::mm2s_channel_to_master_port(tile_type, data.channel);
                 let stream_word = StreamWord {
                     data: data.data,
                     tlast: data.tlast,
                 };
-                log::info!("route_dma_to_stream: routing ({},{}) port {} data=0x{:08X} to router", col, row, port, data.data);
+                log::info!("route_dma_to_stream: routing ({},{}) ch{} -> port {} data=0x{:08X} to router",
+                    col, row, data.channel, port, data.data);
                 if self.stream_router.write_output(col, row, port, stream_word) {
                     words_routed += 1;
                 } else {
-                    log::warn!("route_dma_to_stream: write_output failed for ({},{}) port {}", col, row, port);
+                    log::warn!("route_dma_to_stream: write_output failed for ({},{}) port {} (ch{})",
+                        col, row, port, data.channel);
                     // Backpressure - put data back (can't easily do this, so we accept loss)
                     // In a real system, DMA would stall
                     break;
+                }
+            }
+        }
+
+        words_routed
+    }
+
+    /// Route core stream output to the global stream router.
+    ///
+    /// When a core executes StreamWriteScalar or StreamWritePacketHeader,
+    /// data is pushed to tile.stream_output. This function moves that data
+    /// to the global stream router for delivery to destination tiles.
+    ///
+    /// Returns the number of words routed.
+    pub fn route_core_stream_to_router(&mut self) -> usize {
+        use super::stream_router::StreamWord;
+
+        let mut words_routed = 0;
+
+        for i in 0..self.tiles.len() {
+            let col = self.tiles[i].col;
+            let row = self.tiles[i].row;
+
+            // Check all 8 stream output ports
+            for port in 0..8u8 {
+                // Pop data from core stream output buffer
+                while let Some(data) = self.tiles[i].pop_stream_output(port) {
+                    let stream_word = StreamWord {
+                        data,
+                        tlast: false, // Core writes don't have TLAST metadata currently
+                    };
+
+                    log::debug!(
+                        "Core->Router: tile({},{}) port {} -> 0x{:08X}",
+                        col, row, port, data
+                    );
+
+                    if self.stream_router.write_output(col, row, port, stream_word) {
+                        words_routed += 1;
+                    } else {
+                        log::warn!(
+                            "Core->Router: write_output failed for tile({},{}) port {}",
+                            col, row, port
+                        );
+                        // Backpressure - we've lost this data since we already popped it
+                        // In a real system, the stream would stall. For now, accept the loss.
+                        break;
+                    }
                 }
             }
         }
@@ -425,20 +576,12 @@ impl TileArray {
             }
 
             if let Some(channel) = needs_data {
-                use super::aie2_spec::stream_switch::shim;
+                let tile_type = self.tiles[i].tile_type;
                 log::trace!("DMA ({},{}) S2MM channel {} needs data", col, row, channel);
-                // Try to get data from the stream router
-                // Port mapping depends on tile type:
-                // - Shim: S2MM receives from North ports (per aie2_spec::stream_switch::shim)
-                //   Global routes deliver to the slave port index, so we check North ports.
-                // - Other tiles: S2MM receives on DMA ports (port = channel typically)
-                let ports_to_check: Vec<u8> = if self.arch.is_shim_tile(col, row) {
-                    // Shim: check North slave ports for incoming data
-                    (shim::NORTH_SLAVE_START..=shim::NORTH_SLAVE_END).collect()
-                } else {
-                    // Compute/MemTile: check DMA port
-                    vec![if channel == 0 { 0 } else if channel == 1 { 1 } else { channel }]
-                };
+
+                // Map S2MM channel to slave port based on tile type
+                let port = Self::s2mm_channel_to_slave_port(tile_type, channel);
+                let ports_to_check: Vec<u8> = vec![port];
 
                 let mut found_data = false;
                 for port in ports_to_check {
@@ -491,6 +634,7 @@ impl TileArray {
     /// The execution order is:
     /// 1. Step all DMA engines (transfers data to/from tile memory)
     /// 2. Route DMA MM2S output → StreamRouter (for global tile-to-tile routing)
+    /// 2b. Route Core stream output → StreamRouter (for core-initiated stream writes)
     /// 3. Route DMA MM2S output → TileSwitch DMA slaves (for intra-tile local routing)
     /// 4. Step global stream router (data moves between tiles)
     /// 5. Route StreamRouter → TileSwitch external slaves (data enters tiles)
@@ -501,11 +645,20 @@ impl TileArray {
     ///
     /// Returns (dma_active, streams_moved, words_routed)
     pub fn step_data_movement(&mut self, host_memory: &mut HostMemory) -> (bool, bool, usize) {
-        // Phase 1: Step all DMA engines
+        // Phase 0: Begin lock cycle on all tiles (snapshot current lock values)
+        // This must happen BEFORE any DMA operations so all lock checks use the same snapshot.
+        for tile in &mut self.tiles {
+            tile.begin_lock_cycle();
+        }
+
+        // Phase 1: Step all DMA engines (uses snapshot-based lock operations)
         let dma_active = self.step_all_dma(host_memory);
 
         // Phase 2: Route DMA MM2S output → StreamRouter (for global tile-to-tile routing)
         let mut words_routed = self.route_dma_to_stream();
+
+        // Phase 2b: Route Core stream output → StreamRouter (for core-initiated stream writes)
+        words_routed += self.route_core_stream_to_router();
 
         // Phase 3: Route DMA MM2S output → TileSwitch DMA slaves (for intra-tile local routing)
         // This handles cases like MemTile DMA MM2S → local route → North master
@@ -532,6 +685,14 @@ impl TileArray {
         // Phase 9: Route StreamRouter → DMA S2MM input (for direct global routing)
         // This MUST happen after step_streams so data is available
         words_routed += self.route_stream_to_dma();
+
+        // Phase 10: End lock cycle on all tiles (apply accumulated deltas)
+        // This commits all lock releases and acquisitions from this cycle.
+        // Important: This happens AFTER all DMA operations, so releases become
+        // visible to other requestors in the NEXT cycle, not the same cycle.
+        for tile in &mut self.tiles {
+            tile.end_lock_cycle();
+        }
 
         (dma_active, streams_moved || tile_forwards > 0, words_routed)
     }
@@ -669,8 +830,8 @@ impl TileArray {
                 };
 
                 if slave_port < self.tiles[i].stream_switch.slaves.len() {
-                    // Clone port type to avoid borrow conflict
-                    let port_type = self.tiles[i].stream_switch.slaves[slave_port].port_type.clone();
+                    // Copy port type to avoid borrow conflict
+                    let port_type = self.tiles[i].stream_switch.slaves[slave_port].port_type;
 
                     // MM2S output should go to DMA-type slave ports
                     if matches!(port_type, PortType::Dma(_)) {

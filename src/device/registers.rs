@@ -112,20 +112,20 @@ impl RegisterModule {
         match offset {
             // Compute tile registers (AM025 MEMORY_MODULE, CORE_MODULE)
             DATA_MEMORY_BASE..=COMPUTE_DATA_MEMORY_END => RegisterModule::Memory,
-            o if o >= mm::DMA_BD_BASE && o < mm::DMA_BD_END => RegisterModule::DmaBufferDescriptor,
-            o if o >= mm::DMA_CHANNEL_BASE && o < mm::DMA_STATUS_BASE => RegisterModule::DmaChannel,
+            o if (mm::DMA_BD_BASE..mm::DMA_BD_END).contains(&o) => RegisterModule::DmaBufferDescriptor,
+            o if (mm::DMA_CHANNEL_BASE..mm::DMA_STATUS_BASE).contains(&o) => RegisterModule::DmaChannel,
             0x1E000..=0x1EFFF => RegisterModule::MemoryModule,  // Memory module misc
-            o if o >= mm::LOCK_BASE && o < mm::LOCK_END => RegisterModule::Locks,
+            o if (mm::LOCK_BASE..mm::LOCK_END).contains(&o) => RegisterModule::Locks,
             PROGRAM_MEMORY_BASE..=PROGRAM_MEMORY_END => RegisterModule::ProgramMemory,
             core_module::OFFSET_START..=core_module::OFFSET_END => RegisterModule::CoreModule,
-            o if o >= mm::STREAM_SWITCH_MASTER_BASE && o <= 0x3FFFF => RegisterModule::StreamSwitch,
+            o if (mm::STREAM_SWITCH_MASTER_BASE..=0x3FFFF).contains(&o) => RegisterModule::StreamSwitch,
 
             // MemTile registers (row 1) - AM025 MEMORY_TILE_MODULE
             // MemTile has 512KB data memory (0x00000-0x7FFFF) - handled by Memory above
-            o if o >= mt::DMA_BD_BASE && o < mt::DMA_BD_BASE + 0x400 => RegisterModule::MemTileDmaBufferDescriptor,
-            o if o >= mt::DMA_CHANNEL_S2MM_BASE && o < mt::DMA_CHANNEL_S2MM_BASE + 0x100 => RegisterModule::MemTileDmaChannel,
-            o if o >= mt::STREAM_SWITCH_MASTER_BASE && o < mt::STREAM_SWITCH_SLAVE_END => RegisterModule::MemTileStreamSwitch,
-            o if o >= mt::LOCK_BASE && o < mt::LOCK_END => RegisterModule::MemTileLocks,
+            o if (mt::DMA_BD_BASE..mt::DMA_BD_BASE + 0x400).contains(&o) => RegisterModule::MemTileDmaBufferDescriptor,
+            o if (mt::DMA_CHANNEL_S2MM_BASE..mt::DMA_CHANNEL_S2MM_BASE + 0x100).contains(&o) => RegisterModule::MemTileDmaChannel,
+            o if (mt::STREAM_SWITCH_MASTER_BASE..mt::STREAM_SWITCH_SLAVE_END).contains(&o) => RegisterModule::MemTileStreamSwitch,
+            o if (mt::LOCK_BASE..mt::LOCK_END).contains(&o) => RegisterModule::MemTileLocks,
 
             _ => RegisterModule::Unknown,
         }
@@ -216,7 +216,7 @@ impl fmt::Display for RegisterInfo {
 fn lookup_dma_bd(offset: u32) -> Option<RegisterInfo> {
     use super::registers_spec::memory_module as mm;
 
-    if offset < mm::DMA_BD_BASE || offset >= mm::DMA_BD_END {
+    if !(mm::DMA_BD_BASE..mm::DMA_BD_END).contains(&offset) {
         return None;
     }
 
@@ -253,7 +253,7 @@ fn lookup_dma_bd(offset: u32) -> Option<RegisterInfo> {
 fn lookup_lock(offset: u32) -> Option<RegisterInfo> {
     use super::registers_spec::memory_module as mm;
 
-    if offset < mm::LOCK_BASE || offset >= mm::LOCK_END {
+    if !(mm::LOCK_BASE..mm::LOCK_END).contains(&offset) {
         return None;
     }
 

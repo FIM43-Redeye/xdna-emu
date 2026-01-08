@@ -384,27 +384,58 @@ impl DeviceState {
         }
 
         // Also update the DmaEngine's BD config
-        // First, read the tile BD values (need to do this before mutable borrow)
-        let bd_values = self.array.get(col, row).map(|tile| {
+        // Parse all 6 BD words according to AM025 memory_module/dma/bd.txt
+        let bd_config = self.array.get(col, row).map(|tile| {
             let tile_bd = &tile.dma_bds[bd_idx];
-            // AIE-ML memory module BD format (AM025 memory_module/dma/bd.txt)
-            // Word 0: bits 27:14 = Base_Address (word address), bits 13:0 = Buffer_Length (words)
-            // Word 5: bit 25 = Valid_BD, bits 24:18 = Lock_Rel_Value, bits 16:13 = Lock_Rel_ID,
-            //         bit 12 = Lock_Acq_Enable, bits 11:5 = Lock_Acq_Value, bits 3:0 = Lock_Acq_ID
-            let word0 = tile_bd.addr_low;
-            let word5 = tile_bd.d1;
 
-            // Parse word0 using constants from AM025
+            // Get raw words (stored in legacy struct fields)
+            let word0 = tile_bd.addr_low;
+            let word1 = tile_bd.addr_high;  // Actually compression/packet control
+            let word2 = tile_bd.length;     // Actually stepsizes
+            let word3 = tile_bd.control;    // Actually wrap counts
+            let word4 = tile_bd.d0;         // Actually iteration
+            let word5 = tile_bd.d1;         // Locks and chaining
+
+            // === Parse Word 0: Base_Address and Buffer_Length ===
             let base_addr_words = ((word0 >> mm::bd::WORD0_BASE_ADDR_SHIFT) & mm::bd::WORD0_BASE_ADDR_MASK) as u64;
             let base_addr = base_addr_words * 4; // Convert word address to byte address
-
             let length_words = word0 & mm::bd::WORD0_BUFFER_LEN_MASK;
             let length = length_words * 4; // Convert word count to byte count
 
-            // Parse word5 using constants from AM025
-            let valid = (word5 >> mm::bd::WORD5_VALID_BD_BIT) & 1 != 0;
+            // === Parse Word 1: Compression/Packet Control (MM2S only) ===
+            let enable_compression = (word1 >> mm::bd::WORD1_ENABLE_COMPRESSION_BIT) & 1 != 0;
+            let enable_packet = (word1 >> mm::bd::WORD1_ENABLE_PACKET_BIT) & 1 != 0;
+            let out_of_order_bd_id = ((word1 >> mm::bd::WORD1_OOO_BD_ID_SHIFT) & mm::bd::WORD1_OOO_BD_ID_MASK) as u8;
+            let packet_id = ((word1 >> mm::bd::WORD1_PACKET_ID_SHIFT) & mm::bd::WORD1_PACKET_ID_MASK) as u8;
+            let packet_type = ((word1 >> mm::bd::WORD1_PACKET_TYPE_SHIFT) & mm::bd::WORD1_PACKET_TYPE_MASK) as u8;
 
-            // Lock configuration from word5
+            // === Parse Word 2: Dimension Stepsizes ===
+            // Stepsizes are stored as (actual - 1) in words
+            let d0_stepsize_raw = (word2 & mm::bd::WORD2_D0_STEPSIZE_MASK) as u16;
+            let d1_stepsize_raw = ((word2 >> mm::bd::WORD2_D1_STEPSIZE_SHIFT) & mm::bd::WORD2_D1_STEPSIZE_MASK) as u16;
+            // Convert to actual stride in bytes: (raw + 1) * 4
+            let d0_stride = ((d0_stepsize_raw as i32) + 1) * 4;
+            let d1_stride = ((d1_stepsize_raw as i32) + 1) * 4;
+
+            // === Parse Word 3: Wrap Counts and D2 Stepsize ===
+            // Wrap counts: 0 = no wrap (single iteration for that dimension)
+            let d0_wrap = (word3 >> mm::bd::WORD3_D0_WRAP_SHIFT) & mm::bd::WORD3_D0_WRAP_MASK;
+            let d1_wrap = (word3 >> mm::bd::WORD3_D1_WRAP_SHIFT) & mm::bd::WORD3_D1_WRAP_MASK;
+            let d2_stepsize_raw = (word3 & mm::bd::WORD3_D2_STEPSIZE_MASK) as u16;
+            let d2_stride = ((d2_stepsize_raw as i32) + 1) * 4;
+
+            // === Parse Word 4: Iteration Control ===
+            let iteration_current = ((word4 >> mm::bd::WORD4_ITERATION_CURRENT_SHIFT) & mm::bd::WORD4_ITERATION_CURRENT_MASK) as u8;
+            let iteration_wrap = ((word4 >> mm::bd::WORD4_ITERATION_WRAP_SHIFT) & mm::bd::WORD4_ITERATION_WRAP_MASK) as u8;
+            let iteration_stepsize = (word4 & mm::bd::WORD4_ITERATION_STEPSIZE_MASK) as u16;
+
+            // === Parse Word 5: Locks and Chaining ===
+            let tlast_suppress = (word5 >> mm::bd::WORD5_TLAST_SUPPRESS_BIT) & 1 != 0;
+            let valid = (word5 >> mm::bd::WORD5_VALID_BD_BIT) & 1 != 0;
+            let next_bd_id = ((word5 >> mm::bd::WORD5_NEXT_BD_SHIFT) & mm::bd::WORD5_NEXT_BD_MASK) as u8;
+            let use_next_bd = (word5 >> mm::bd::WORD5_USE_NEXT_BD_BIT) & 1 != 0;
+            let next_bd = if use_next_bd { Some(next_bd_id) } else { None };
+
             let lock_acq_id = (word5 & mm::bd::WORD5_LOCK_ACQ_ID_MASK) as u8;
             let lock_acq_raw = (word5 >> mm::bd::WORD5_LOCK_ACQ_VALUE_SHIFT) & mm::bd::WORD5_LOCK_ACQ_VALUE_MASK;
             let lock_acq_value = sign_extend_7bit(lock_acq_raw);
@@ -413,60 +444,68 @@ impl DeviceState {
             let lock_rel_raw = (word5 >> mm::bd::WORD5_LOCK_REL_VALUE_SHIFT) & mm::bd::WORD5_LOCK_REL_VALUE_MASK;
             let lock_rel_value = sign_extend_7bit(lock_rel_raw);
 
-            // BD chaining: bits 30:27 = Next_BD, bit 26 = Use_Next_BD
-            let next_bd_id = ((word5 >> mm::bd::WORD5_NEXT_BD_SHIFT) & mm::bd::WORD5_NEXT_BD_MASK) as u8;
-            let use_next_bd = (word5 >> mm::bd::WORD5_USE_NEXT_BD_BIT) & 1 != 0;
-            let next_bd = if use_next_bd { Some(next_bd_id) } else { None };
-
-            log::trace!("  BD {} word5=0x{:08X} next_bd_id={} use_next_bd={}",
-                bd_idx, word5, next_bd_id, use_next_bd);
+            log::trace!("  BD {} words=[0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}]",
+                bd_idx, word0, word1, word2, word3, word4, word5);
 
             // For backwards compatibility, also check if any data is non-zero
-            let has_any_data = word0 != 0 || tile_bd.addr_high != 0 ||
-                               tile_bd.length != 0 || tile_bd.control != 0 ||
-                               tile_bd.d0 != 0 || word5 != 0;
+            let has_any_data = word0 != 0 || word1 != 0 || word2 != 0 || word3 != 0 || word4 != 0 || word5 != 0;
             let is_valid = valid || has_any_data;
 
-            (base_addr, length, is_valid, lock_acq_enable, lock_acq_id, lock_acq_value,
-             lock_rel_id, lock_rel_value, next_bd)
+            // Build the BdConfig with all parsed fields
+            use crate::device::dma::{BdConfig, DimensionConfig, IterationConfig};
+
+            // Determine dimension sizes from wrap counts
+            // d0_size = wrap count (0 means no wrap, use length_words for simple 1D)
+            // If d0_wrap is 0, this is a simple contiguous transfer
+            let d0_size = if d0_wrap == 0 { length_words } else { d0_wrap };
+            let d1_size = d1_wrap;
+            // d2_size would come from a higher dimension wrap, but AIE2 only has 3D
+            // For now, assume d2 is implicitly 1 if d2_stride is non-default
+
+            BdConfig {
+                base_addr,
+                length,
+                d0: DimensionConfig { size: d0_size, stride: d0_stride },
+                d1: DimensionConfig { size: d1_size, stride: d1_stride },
+                d2: DimensionConfig { size: 0, stride: d2_stride }, // size comes from outer loop
+                d3: DimensionConfig::default(),
+                iteration: IterationConfig {
+                    current: iteration_current,
+                    wrap: iteration_wrap,
+                    stepsize: iteration_stepsize,
+                },
+                compression_enable: enable_compression,
+                enable_packet,
+                packet_id,
+                packet_type,
+                out_of_order_bd_id,
+                out_of_order: false, // S2MM only, parsed separately
+                tlast_suppress,
+                acquire_lock: if lock_acq_enable { Some(lock_acq_id) } else { None },
+                acquire_value: lock_acq_value,
+                release_lock: if lock_rel_value != 0 { Some(lock_rel_id) } else { None },
+                release_value: lock_rel_value,
+                next_bd,
+                valid: is_valid,
+            }
         });
 
-        // Now configure the DmaEngine if we have values
-        if let Some((base_addr, length, valid, lock_acq_enable, lock_acq_id, lock_acq_value,
-                     lock_rel_id, lock_rel_value, next_bd)) = bd_values {
+        // Now configure the DmaEngine if we have a config
+        if let Some(config) = bd_config {
             log::trace!("  BD {} word {} tile({},{}) -> addr=0x{:X} len={} valid={}",
-                bd_idx, word, col, row, base_addr, length, valid);
+                bd_idx, word, col, row, config.base_addr, config.length, config.valid);
 
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
-                use crate::device::dma::BdConfig;
-                // Use simple_1d to properly set d0.size and d0.stride for sequential access
-                let mut config = BdConfig::simple_1d(base_addr, length);
-                config.valid = valid;
-
-                // Set lock configuration if acquire is enabled
-                if lock_acq_enable {
-                    config.acquire_lock = Some(lock_acq_id);
-                    config.acquire_value = lock_acq_value;
-                }
-
-                // Set lock release if non-zero
-                if lock_rel_value != 0 {
-                    config.release_lock = Some(lock_rel_id);
-                    config.release_value = lock_rel_value;
-                }
-
-                // Set BD chaining if enabled
-                config.next_bd = next_bd;
-
                 if let Err(e) = dma.configure_bd(bd_idx as u8, config.clone()) {
                     log::debug!("Failed to configure BD {} on DmaEngine ({},{}): {:?}",
                         bd_idx, col, row, e);
-                } else if valid {
-                    log::info!("CDO configured BD {} on tile ({},{}) addr=0x{:X} len={} acq={:?} rel={:?} next={:?}",
-                        bd_idx, col, row, base_addr, length,
+                } else if config.valid {
+                    log::info!("CDO configured BD {} on tile ({},{}) addr=0x{:X} len={} d0=[{},{}] d1=[{},{}] acq={:?} rel={:?} next={:?}",
+                        bd_idx, col, row, config.base_addr, config.length,
+                        config.d0.size, config.d0.stride, config.d1.size, config.d1.stride,
                         config.acquire_lock.map(|id| (id, config.acquire_value)),
                         config.release_lock.map(|id| (id, config.release_value)),
-                        next_bd);
+                        config.next_bd);
                 }
             }
         }
@@ -475,26 +514,74 @@ impl DeviceState {
     /// Write to a DMA channel register.
     fn write_dma_channel(&mut self, col: u8, row: u8, offset: u32, value: u32) {
         use super::registers_spec::memory_module as mm;
+        use super::registers_spec::memory_module::channel as ch;
 
         // Channel registers: base at DMA_CHANNEL_BASE, stride DMA_CHANNEL_STRIDE (AM025)
+        // Layout: S2MM_0 (0x1DE00), S2MM_1 (0x1DE08), MM2S_0 (0x1DE10), MM2S_1 (0x1DE18)
         // Each channel has CTRL register and START_QUEUE register (4 bytes each)
         let rel = offset - mm::DMA_CHANNEL_BASE;
         let ch_idx = (rel / mm::DMA_CHANNEL_STRIDE) as usize;
         let is_start_queue = (rel % mm::DMA_CHANNEL_STRIDE) >= 4;
+        let is_s2mm = ch_idx < 2; // First 2 channels are S2MM
 
         if ch_idx >= NUM_DMA_CHANNELS {
             return;
         }
 
+        // Parse enable_token_issue before updating tile state
+        let enable_token_issue = if is_start_queue {
+            (value >> ch::START_QUEUE_ENABLE_TOKEN_ISSUE_BIT) & 1 != 0
+        } else {
+            false
+        };
+
+        // Parse compression/out-of-order bits before tile update
+        let compression_enable = (value >> ch::CTRL_COMPRESSION_ENABLE_BIT) & 1 != 0;
+        let out_of_order_enable = (value >> ch::CTRL_ENABLE_OUT_OF_ORDER_BIT) & 1 != 0;
+
         // Update the tile's DMA channel state
         if let Some(tile) = self.array.get_mut(col, row) {
-            let ch = &mut tile.dma_channels[ch_idx];
+            let dma_ch = &mut tile.dma_channels[ch_idx];
             if is_start_queue {
-                ch.start_queue = value;
-                ch.current_bd = (value & 0xF) as u8;
+                dma_ch.start_queue = value;
+                dma_ch.current_bd = (value & ch::START_QUEUE_BD_ID_MASK) as u8;
+                dma_ch.enable_token_issue = enable_token_issue;
             } else {
-                ch.control = value;
-                ch.running = value & 1 != 0;
+                dma_ch.control = value;
+                dma_ch.running = value & 1 != 0;
+                // Parse controller_id from bits 15:8
+                dma_ch.controller_id = ((value >> ch::CTRL_CONTROLLER_ID_SHIFT)
+                    & ch::CTRL_CONTROLLER_ID_MASK) as u8;
+                // Parse FoT mode from bits 17:16 (S2MM only, but harmless to store for MM2S)
+                if is_s2mm {
+                    dma_ch.fot_mode = ((value >> ch::CTRL_FOT_MODE_SHIFT)
+                        & ch::CTRL_FOT_MODE_MASK) as u8;
+                    // S2MM: decompression enable (bit 4), out-of-order enable (bit 3)
+                    dma_ch.decompression_enable = compression_enable;
+                    dma_ch.out_of_order_enable = out_of_order_enable;
+                } else {
+                    // MM2S: compression enable (bit 4)
+                    dma_ch.compression_enable = compression_enable;
+                }
+            }
+        }
+
+        // Update DMA engine compression/OOO config when control register is written
+        if !is_start_queue {
+            if let Some(dma) = self.array.dma_engine_mut(col, row) {
+                let (decompression_en, ooo_en) = if is_s2mm {
+                    (compression_enable, out_of_order_enable)
+                } else {
+                    (false, false)
+                };
+                let compress_en = if is_s2mm { false } else { compression_enable };
+
+                dma.set_channel_compression_config(
+                    ch_idx as u8,
+                    compress_en,
+                    decompression_en,
+                    ooo_en,
+                );
             }
         }
 
@@ -502,24 +589,40 @@ impl DeviceState {
         // Note: value=0 means BD 0, not "don't start"
         // We start the channel whenever the start queue register is written
         // Task queue register format:
-        // - Bits 3:0: BD_ID (buffer descriptor index)
+        // - Bit 31: Enable_Token_Issue
         // - Bits 23:16: Repeat_Count (run BD this many additional times)
+        // - Bits 3:0: BD_ID (buffer descriptor index)
         if is_start_queue {
-            let bd_idx = (value & 0xF) as u8;
-            let repeat_count = ((value >> 16) & 0xFF) as u8;
+            let bd_idx = (value & ch::START_QUEUE_BD_ID_MASK) as u8;
+            let repeat_count = ((value >> ch::START_QUEUE_REPEAT_COUNT_SHIFT)
+                & ch::START_QUEUE_REPEAT_COUNT_MASK) as u8;
+
+            // Read controller_id and fot_mode from the tile's channel state
+            // (which was set earlier when the control register was written)
+            let (controller_id, fot_mode) = self.array.get(col, row)
+                .map(|t| {
+                    let dma_ch = &t.dma_channels[ch_idx];
+                    (dma_ch.controller_id, dma_ch.fot_mode)
+                })
+                .unwrap_or((0, 0));
+
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
+                // Set task config before starting the channel
+                dma.set_channel_task_config(ch_idx as u8, enable_token_issue, controller_id, fot_mode);
+
                 // Start the channel with the specified BD and repeat count
                 if let Err(e) = dma.start_channel_with_repeat(ch_idx as u8, bd_idx, repeat_count) {
                     log::warn!("Failed to start DMA channel {} on tile ({},{}): {:?}",
                         ch_idx, col, row, e);
+                } else if enable_token_issue {
+                    log::debug!("CDO started DMA channel {} with BD {} repeat={} token_issue=true controller_id={} on tile ({},{})",
+                        ch_idx, bd_idx, repeat_count, controller_id, col, row);
+                } else if repeat_count > 0 {
+                    log::info!("CDO started DMA channel {} with BD {} repeat={} on tile ({},{})",
+                        ch_idx, bd_idx, repeat_count, col, row);
                 } else {
-                    if repeat_count > 0 {
-                        log::info!("CDO started DMA channel {} with BD {} repeat={} on tile ({},{})",
-                            ch_idx, bd_idx, repeat_count, col, row);
-                    } else {
-                        log::info!("CDO started DMA channel {} with BD {} on tile ({},{})",
-                            ch_idx, bd_idx, col, row);
-                    }
+                    log::info!("CDO started DMA channel {} with BD {} on tile ({},{})",
+                        ch_idx, bd_idx, col, row);
                 }
             }
         }
@@ -563,14 +666,12 @@ impl DeviceState {
                 if let Err(e) = dma.start_channel_with_repeat(ch_idx as u8, bd_idx, repeat_count) {
                     log::warn!("Failed to start DMA channel {} on tile ({},{}): {:?}",
                         ch_idx, col, row, e);
+                } else if repeat_count > 0 {
+                    log::info!("CDO started DMA channel {} with BD {} repeat={} on tile ({},{})",
+                        ch_idx, bd_idx, repeat_count, col, row);
                 } else {
-                    if repeat_count > 0 {
-                        log::info!("CDO started DMA channel {} with BD {} repeat={} on tile ({},{})",
-                            ch_idx, bd_idx, repeat_count, col, row);
-                    } else {
-                        log::info!("CDO started DMA channel {} with BD {} on tile ({},{})",
-                            ch_idx, bd_idx, col, row);
-                    }
+                    log::info!("CDO started DMA channel {} with BD {} on tile ({},{})",
+                        ch_idx, bd_idx, col, row);
                 }
             }
         }
@@ -745,7 +846,7 @@ impl DeviceState {
                 match src_type {
                     TileType::Shim => {
                         // From Shim: North masters 12-17 → MemTile South slaves 7-12
-                        if master_port >= shim::NORTH_MASTER_START && master_port <= shim::NORTH_MASTER_END {
+                        if (shim::NORTH_MASTER_START..=shim::NORTH_MASTER_END).contains(&master_port) {
                             mem_tile::SOUTH_SLAVE_START + (master_port - shim::NORTH_MASTER_START)
                         } else {
                             mem_tile::SOUTH_SLAVE_START
@@ -762,7 +863,7 @@ impl DeviceState {
                 match src_type {
                     TileType::MemTile => {
                         // From MemTile: North masters 11-16 → Compute South slaves 5-10
-                        if master_port >= mem_tile::NORTH_MASTER_START && master_port <= mem_tile::NORTH_MASTER_END {
+                        if (mem_tile::NORTH_MASTER_START..=mem_tile::NORTH_MASTER_END).contains(&master_port) {
                             compute::SOUTH_SLAVE_START + (master_port - mem_tile::NORTH_MASTER_START)
                         } else {
                             compute::SOUTH_SLAVE_START
@@ -770,7 +871,7 @@ impl DeviceState {
                     }
                     _ => {
                         // From another compute tile: North masters 15-18 → South slaves 5-8
-                        if master_port >= compute::NORTH_MASTER_START && master_port <= compute::NORTH_MASTER_END {
+                        if (compute::NORTH_MASTER_START..=compute::NORTH_MASTER_END).contains(&master_port) {
                             compute::SOUTH_SLAVE_START + (master_port - compute::NORTH_MASTER_START)
                         } else {
                             compute::SOUTH_SLAVE_START
@@ -805,7 +906,7 @@ impl DeviceState {
             TileType::Shim => {
                 // Destination is Shim: North slaves 14-17
                 // MemTile South masters 7-10 → Shim North slaves 14-17
-                if src_type.is_mem_tile() && master_port >= mem_tile::SOUTH_MASTER_START && master_port <= mem_tile::SOUTH_MASTER_END {
+                if src_type.is_mem_tile() && (mem_tile::SOUTH_MASTER_START..=mem_tile::SOUTH_MASTER_END).contains(&master_port) {
                     shim::NORTH_SLAVE_START + (master_port - mem_tile::SOUTH_MASTER_START)
                 } else {
                     shim::NORTH_SLAVE_START
@@ -814,7 +915,7 @@ impl DeviceState {
             TileType::MemTile => {
                 // Destination is MemTile: North slaves 13-16
                 // Compute South masters 5-10 → MemTile North slaves 13-16
-                if src_type.is_compute() && master_port >= compute::SOUTH_MASTER_START && master_port <= compute::SOUTH_MASTER_END {
+                if src_type.is_compute() && (compute::SOUTH_MASTER_START..=compute::SOUTH_MASTER_END).contains(&master_port) {
                     // Map first 4 South masters to 4 North slaves
                     let offset = (master_port - compute::SOUTH_MASTER_START).min(3);
                     mem_tile::NORTH_SLAVE_START + offset
@@ -825,7 +926,7 @@ impl DeviceState {
             TileType::Compute => {
                 // Destination is Compute tile: North slaves 15-18 (NOT 8-9!)
                 // Source compute tile South masters 5-10 → destination North slaves 15-18
-                if master_port >= compute::SOUTH_MASTER_START && master_port <= compute::SOUTH_MASTER_END {
+                if (compute::SOUTH_MASTER_START..=compute::SOUTH_MASTER_END).contains(&master_port) {
                     // Map first 4 South masters to 4 North slaves
                     let offset = (master_port - compute::SOUTH_MASTER_START).min(3);
                     compute::NORTH_SLAVE_START + offset
@@ -941,7 +1042,7 @@ impl DeviceState {
 
         // Set D0 size and stride from wrap/stepsize
         if d0_wrap > 0 {
-            config.d0.size = d0_wrap as u32;
+            config.d0.size = d0_wrap;
             config.d0.stride = d0_stepsize as i32;
         }
 
@@ -973,7 +1074,7 @@ impl DeviceState {
         if words.len() >= 8 {
             log::info!("MemTile BD raw: tile({},{}) offset=0x{:05X} word7=0x{:08X} words=[0x{:08X}, 0x{:08X}..., 0x{:08X}]",
                 col, row, offset, words.get(7).copied().unwrap_or(0),
-                words.get(0).copied().unwrap_or(0), words.get(1).copied().unwrap_or(0), words.get(7).copied().unwrap_or(0));
+                words.first().copied().unwrap_or(0), words.get(1).copied().unwrap_or(0), words.get(7).copied().unwrap_or(0));
         }
 
         // MemTile BDs: base, 8 words per BD
@@ -985,7 +1086,7 @@ impl DeviceState {
         if bd_idx < NUM_DMA_BDS {
             if let Some(tile) = self.array.get_mut(col, row) {
                 let bd = &mut tile.dma_bds[bd_idx];
-                if words.len() > 0 { bd.addr_low = words[0]; }
+                if !words.is_empty() { bd.addr_low = words[0]; }
                 if words.len() > 1 { bd.addr_high = words[1]; }
                 if words.len() > 2 { bd.length = words[2]; }
                 if words.len() > 3 { bd.control = words[3]; }
@@ -1009,7 +1110,7 @@ impl DeviceState {
 
         // Parse MemTile BD format (8 words)
         // Word 0: Buffer_Length[16:0]
-        let buffer_length = words.get(0).copied().unwrap_or(0) & mt_bd::WORD0_BUFFER_LEN_MASK;
+        let buffer_length = words.first().copied().unwrap_or(0) & mt_bd::WORD0_BUFFER_LEN_MASK;
 
         // Word 1: Base_Address[18:0], Use_Next_BD[19], Next_BD[25:20]
         let word1 = words.get(1).copied().unwrap_or(0);

@@ -705,6 +705,88 @@ pub const LOGICAL_BANKS: usize = COMPUTE_TILE_MEMORY_BANKS / BANKS_PER_LOGICAL_B
 /// Logical bank size: 16 KB
 pub const LOGICAL_BANK_SIZE: usize = COMPUTE_TILE_BANK_SIZE * BANKS_PER_LOGICAL_BANK;
 
+/// Bank interleave granularity: 128 bits = 16 bytes
+/// "Interleaving is done at a 128-bit granularity" (AM020 Ch5)
+pub const BANK_INTERLEAVE_BYTES: usize = MEMORY_BANK_WIDTH_BITS / 8;
+
+/// Compute tile bank interleave wrap: 128 bytes (8 banks × 16 bytes)
+pub const COMPUTE_BANK_WRAP_BYTES: usize = COMPUTE_TILE_MEMORY_BANKS * BANK_INTERLEAVE_BYTES;
+
+/// Memory tile bank interleave wrap: 256 bytes (16 banks × 16 bytes)
+/// "wrap around after the 16 banks, every 256B" (AM020 Ch5)
+pub const MEMTILE_BANK_WRAP_BYTES: usize = MEM_TILE_MEMORY_BANKS * BANK_INTERLEAVE_BYTES;
+
+/// Get the physical bank index for a compute tile address.
+///
+/// Bank interleaving maps sequential 128-bit (16-byte) chunks to different banks:
+/// - Bytes 0-15 → Bank 0
+/// - Bytes 16-31 → Bank 1
+/// - ...
+/// - Bytes 112-127 → Bank 7
+/// - Bytes 128-143 → Bank 0 (wraps)
+///
+/// # Arguments
+/// * `address` - Byte address within tile data memory
+///
+/// # Returns
+/// Physical bank index (0-7)
+#[inline]
+pub const fn compute_tile_bank(address: usize) -> usize {
+    (address / BANK_INTERLEAVE_BYTES) % COMPUTE_TILE_MEMORY_BANKS
+}
+
+/// Get the physical bank index for a memory tile address.
+///
+/// Bank interleaving maps sequential 128-bit (16-byte) chunks to different banks:
+/// - Bytes 0-15 → Bank 0
+/// - Bytes 16-31 → Bank 1
+/// - ...
+/// - Bytes 240-255 → Bank 15
+/// - Bytes 256-271 → Bank 0 (wraps)
+///
+/// # Arguments
+/// * `address` - Byte address within tile data memory
+///
+/// # Returns
+/// Physical bank index (0-15)
+#[inline]
+pub const fn mem_tile_bank(address: usize) -> usize {
+    (address / BANK_INTERLEAVE_BYTES) % MEM_TILE_MEMORY_BANKS
+}
+
+/// Get the logical bank index for a compute tile address.
+///
+/// From programmer's perspective, every two physical banks form one logical bank:
+/// - Logical bank 0 = Physical banks 0, 1
+/// - Logical bank 1 = Physical banks 2, 3
+/// - Logical bank 2 = Physical banks 4, 5
+/// - Logical bank 3 = Physical banks 6, 7
+///
+/// # Arguments
+/// * `address` - Byte address within tile data memory
+///
+/// # Returns
+/// Logical bank index (0-3)
+#[inline]
+pub const fn compute_tile_logical_bank(address: usize) -> usize {
+    compute_tile_bank(address) / BANKS_PER_LOGICAL_BANK
+}
+
+/// Check if two addresses conflict on the same bank (compute tile).
+///
+/// Bank conflicts occur when two memory operations in the same cycle
+/// access the same physical bank, causing a stall.
+#[inline]
+pub const fn compute_tile_bank_conflict(addr1: usize, addr2: usize) -> bool {
+    compute_tile_bank(addr1) == compute_tile_bank(addr2)
+}
+
+/// Check if two addresses conflict on the same bank (memory tile).
+#[inline]
+pub const fn mem_tile_bank_conflict(addr1: usize, addr2: usize) -> bool {
+    mem_tile_bank(addr1) == mem_tile_bank(addr2)
+}
+
 // ============================================================================
 // Address Space (AM020 Ch2, Ch4)
 // ============================================================================
@@ -768,6 +850,54 @@ mod tests {
     fn test_addressable_memory() {
         // 4 x 64KB = 256KB
         assert_eq!(ADDRESSABLE_MEMORY_SIZE, 256 * 1024);
+    }
+
+    #[test]
+    fn test_bank_interleave_constants() {
+        assert_eq!(BANK_INTERLEAVE_BYTES, 16); // 128 bits
+        assert_eq!(COMPUTE_BANK_WRAP_BYTES, 128); // 8 banks × 16 bytes
+        assert_eq!(MEMTILE_BANK_WRAP_BYTES, 256); // 16 banks × 16 bytes
+    }
+
+    #[test]
+    fn test_compute_tile_bank_mapping() {
+        // First 128 bytes map to banks 0-7, then wrap
+        assert_eq!(compute_tile_bank(0), 0);    // 0-15 → bank 0
+        assert_eq!(compute_tile_bank(16), 1);   // 16-31 → bank 1
+        assert_eq!(compute_tile_bank(32), 2);   // 32-47 → bank 2
+        assert_eq!(compute_tile_bank(112), 7);  // 112-127 → bank 7
+        assert_eq!(compute_tile_bank(128), 0);  // 128-143 → bank 0 (wrap)
+        assert_eq!(compute_tile_bank(144), 1);  // 144-159 → bank 1
+    }
+
+    #[test]
+    fn test_mem_tile_bank_mapping() {
+        // First 256 bytes map to banks 0-15, then wrap
+        assert_eq!(mem_tile_bank(0), 0);     // 0-15 → bank 0
+        assert_eq!(mem_tile_bank(16), 1);    // 16-31 → bank 1
+        assert_eq!(mem_tile_bank(240), 15);  // 240-255 → bank 15
+        assert_eq!(mem_tile_bank(256), 0);   // 256-271 → bank 0 (wrap)
+    }
+
+    #[test]
+    fn test_logical_bank_mapping() {
+        // Logical banks pair physical banks: 0+1, 2+3, 4+5, 6+7
+        assert_eq!(compute_tile_logical_bank(0), 0);   // phys 0 → logical 0
+        assert_eq!(compute_tile_logical_bank(16), 0);  // phys 1 → logical 0
+        assert_eq!(compute_tile_logical_bank(32), 1);  // phys 2 → logical 1
+        assert_eq!(compute_tile_logical_bank(48), 1);  // phys 3 → logical 1
+    }
+
+    #[test]
+    fn test_bank_conflict_detection() {
+        // Same 16-byte chunk = conflict
+        assert!(compute_tile_bank_conflict(0, 8));     // Both in bank 0
+        assert!(compute_tile_bank_conflict(16, 24));   // Both in bank 1
+        assert!(compute_tile_bank_conflict(0, 128));   // Both bank 0 (after wrap)
+
+        // Different banks = no conflict
+        assert!(!compute_tile_bank_conflict(0, 16));   // Bank 0 vs 1
+        assert!(!compute_tile_bank_conflict(0, 32));   // Bank 0 vs 2
     }
 }
 
