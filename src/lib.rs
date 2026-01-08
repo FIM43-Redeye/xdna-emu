@@ -12,6 +12,7 @@
 //! - [`visual`]: GUI visualization (egui-based)
 //! - [`integration`]: External tool integration
 //! - [`testing`]: Test harness for XCLBIN binary compatibility
+//! - [`ffi`]: C-compatible Foreign Function Interface
 
 pub mod parser;
 pub mod device;
@@ -21,3 +22,4 @@ pub mod npu;
 pub mod visual;
 pub mod integration;
 pub mod testing;
+pub mod ffi;
