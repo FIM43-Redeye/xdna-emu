@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use crate::interpreter::bundle::{
     BranchCondition, ElementType, MemWidth, Operand, Operation, PostModify, SlotIndex, SlotOp,
@@ -30,7 +31,8 @@ use crate::interpreter::bundle::{
 };
 use crate::interpreter::traits::{DecodeError, Decoder};
 use crate::tablegen::{
-    build_decoder_tables, load_from_llvm_aie, DecoderIndex, InstrEncoding, SemanticOp,
+    build_decoder_tables, load_from_llvm_aie, load_via_tblgen, DecoderIndex, InstrEncoding,
+    SemanticOp,
 };
 
 /// A decoded instruction from TableGen data.
@@ -90,6 +92,7 @@ impl DecodedInstr {
 /// 2. Compute `opcode = bits & common_mask` for the slot
 /// 3. HashMap lookup to find candidate encodings
 /// 4. Small linear scan (usually 1-3 candidates) for disambiguation
+#[derive(Clone)]
 pub struct InstructionDecoder {
     /// O(1) decoder index (per-slot HashMap lookup).
     index: DecoderIndex,
@@ -113,6 +116,23 @@ impl Default for InstructionDecoder {
 /// Default path to llvm-aie repository (relative to project root).
 pub const DEFAULT_LLVM_AIE_PATH: &str = "../llvm-aie";
 
+/// Global cached decoder, loaded once on first use.
+/// This avoids repeatedly parsing TableGen files for each core.
+static CACHED_DECODER: OnceLock<InstructionDecoder> = OnceLock::new();
+
+/// Get the path to llvm-aie, checking environment variable first.
+///
+/// Checks in order:
+/// 1. LLVM_AIE_PATH environment variable
+/// 2. DEFAULT_LLVM_AIE_PATH ("../llvm-aie")
+fn get_llvm_aie_path() -> String {
+    if let Ok(path) = std::env::var("LLVM_AIE_PATH") {
+        log::info!("Using llvm-aie from LLVM_AIE_PATH: {}", path);
+        return path;
+    }
+    DEFAULT_LLVM_AIE_PATH.to_string()
+}
+
 impl InstructionDecoder {
     /// Create an empty decoder (no encodings loaded).
     pub fn new() -> Self {
@@ -124,11 +144,53 @@ impl InstructionDecoder {
         }
     }
 
-    /// Load a decoder from llvm-aie at the default path (../llvm-aie).
+    /// Get a cached decoder, loading it on first call.
     ///
-    /// Returns an empty decoder if llvm-aie is not found.
+    /// This is the preferred way to get a decoder - it loads once and reuses
+    /// the cached instance for all subsequent calls. Each caller gets a clone
+    /// with independent statistics.
+    pub fn load_cached() -> Self {
+        CACHED_DECODER.get_or_init(|| {
+            log::info!("Initializing cached instruction decoder");
+            Self::load_fresh()
+        }).clone()
+    }
+
+    /// Load a fresh decoder (not cached).
+    ///
+    /// Use `load_cached()` instead unless you specifically need a fresh load.
+    fn load_fresh() -> Self {
+        let path = get_llvm_aie_path();
+        // Prefer tblgen for accurate encodings (e.g., distinguishes ACQ variants)
+        Self::try_load_via_tblgen(&path)
+            .or_else(|e| {
+                log::warn!("tblgen loading failed: {}, trying regex parser", e);
+                Self::try_load(&path)
+            })
+            .unwrap_or_else(|e| {
+                log::warn!("Regex parser also failed: {}, using empty decoder", e);
+                Self::new()
+            })
+    }
+
+    /// Load a decoder from llvm-aie.
+    ///
+    /// Checks LLVM_AIE_PATH environment variable first, falls back to ../llvm-aie.
+    /// Uses `llvm-tblgen` for accurate encodings when available, falling back
+    /// to regex parsing if tblgen fails. Returns an empty decoder if llvm-aie
+    /// is not found.
+    ///
+    /// NOTE: Prefer `load_cached()` which avoids repeatedly parsing TableGen.
     pub fn load_default() -> Self {
-        Self::try_load(DEFAULT_LLVM_AIE_PATH).unwrap_or_else(|_| Self::new())
+        Self::load_cached()
+    }
+
+    /// Load a decoder using the legacy regex parser.
+    ///
+    /// This is less accurate than tblgen (misses mixin literal bits) but
+    /// doesn't require llvm-tblgen to be installed.
+    pub fn load_default_regex() -> Self {
+        Self::try_load(&get_llvm_aie_path()).unwrap_or_else(|_| Self::new())
     }
 
     /// Load a decoder from llvm-aie at the specified path.
@@ -148,9 +210,30 @@ impl InstructionDecoder {
         Ok(Self::from_tables(tables))
     }
 
-    /// Check if llvm-aie is available at the default path.
+    /// Load a decoder using llvm-tblgen for fully resolved encodings.
+    ///
+    /// This is the preferred loading method - it uses `llvm-tblgen --print-records`
+    /// to get ground truth encodings with all inheritance and mixin field assignments
+    /// resolved. This correctly distinguishes instruction variants like ACQ_mLockId_imm
+    /// vs ACQ_mLockId_reg based on their literal encoding bits.
+    ///
+    /// Requires `llvm-tblgen` to be in PATH.
+    pub fn try_load_via_tblgen(llvm_aie_path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
+        let path = llvm_aie_path.as_ref();
+        if !path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("llvm-aie not found at: {}", path.display()),
+            ));
+        }
+
+        let tables = load_via_tblgen(path)?;
+        Ok(Self::from_tables(tables))
+    }
+
+    /// Check if llvm-aie is available (checks LLVM_AIE_PATH env var first).
     pub fn is_llvm_aie_available() -> bool {
-        Path::new(DEFAULT_LLVM_AIE_PATH).exists()
+        Path::new(&get_llvm_aie_path()).exists()
     }
 
     /// Create a decoder from encoding tables grouped by slot.
@@ -162,7 +245,7 @@ impl InstructionDecoder {
 
         // Keep flat list for legacy decode_word() compatibility
         let mut encodings: Vec<InstrEncoding> = tables.into_values().flatten().collect();
-        encodings.sort_by(|a, b| b.specificity().cmp(&a.specificity()));
+        encodings.sort_by_key(|e| std::cmp::Reverse(e.specificity()));
 
         Self {
             index,
@@ -184,7 +267,7 @@ impl InstructionDecoder {
         }
         let index = DecoderIndex::from_slot_encodings(by_slot);
 
-        encodings.sort_by(|a, b| b.specificity().cmp(&a.specificity()));
+        encodings.sort_by_key(|e| std::cmp::Reverse(e.specificity()));
         Self {
             index,
             encodings,
@@ -277,473 +360,38 @@ impl InstructionDecoder {
     }
 
     /// Convert a decoded instruction to a bundle Operation.
+    ///
+    /// Uses SemanticOp from TableGen for classification. All instructions should have
+    /// SemanticOp assigned via infer_semantic_from_mnemonic() during TableGen parsing.
+    /// If no semantic is available, logs a warning and returns Unknown.
     fn to_operation(&self, decoded: &DecodedInstr) -> Operation {
-        // Use semantic info if available
+        // Use semantic info - this should be available for all instructions
         if let Some(semantic) = decoded.encoding.semantic {
             return self.semantic_to_operation(semantic, decoded);
         }
 
-        // Fall back to mnemonic-based classification
-        let mnemonic = decoded.encoding.mnemonic.to_lowercase();
-
-        if mnemonic.starts_with("add") {
-            Operation::ScalarAdd
-        } else if mnemonic.starts_with("sub") {
-            Operation::ScalarSub
-        } else if mnemonic.starts_with("mul") {
-            Operation::ScalarMul
-        } else if mnemonic.starts_with("and") {
-            Operation::ScalarAnd
-        } else if mnemonic.starts_with("or") {
-            Operation::ScalarOr
-        } else if mnemonic.starts_with("xor") {
-            Operation::ScalarXor
-        } else if mnemonic.starts_with("shl")
-            || mnemonic.starts_with("lsl")
-            || mnemonic.starts_with("lshl")
-        {
-            // shl, lsl, lshl - logical shift left
-            Operation::ScalarShl
-        } else if mnemonic.starts_with("shr")
-            || mnemonic.starts_with("lsr")
-            || mnemonic.starts_with("lshr")
-        {
-            // shr, lsr, lshr - logical shift right
-            Operation::ScalarShr
-        } else if mnemonic.starts_with("asr") || mnemonic.starts_with("ashr") {
-            // asr, ashr - arithmetic shift right
-            Operation::ScalarSra
-        } else if mnemonic.starts_with("mova") || mnemonic.starts_with("movb") || mnemonic.starts_with("movxm") {
-            // mova, movb, movxm - pointer move operations (check before generic mov)
-            // movxm loads extended immediate into pointer register
-            Operation::PointerMov
-        } else if mnemonic.starts_with("mov") {
-            Operation::ScalarMov
-        } else if mnemonic.starts_with("padd") {
-            // padda, paddb, padds - pointer add operations
-            Operation::PointerAdd
-        } else if mnemonic == "add" || mnemonic.starts_with("add.") {
-            // Scalar addition (add, add.nc, add.s, add.u, etc.)
-            Operation::ScalarAdd
-        } else if mnemonic == "sbc" || mnemonic.starts_with("sbc.") {
-            // Subtract with borrow
-            Operation::ScalarSbc
-        } else if mnemonic == "sub" || mnemonic.starts_with("sub.") {
-            // Scalar subtraction (sub, sub.nc, etc.)
-            Operation::ScalarSub
-        } else if mnemonic.starts_with("lda")
-            || mnemonic.starts_with("ldb")
-            || mnemonic.starts_with("ld")
-        {
-            Operation::Load {
-                width: MemWidth::Word,
-                post_modify: PostModify::None,
-            }
-        } else if mnemonic.starts_with("vst") {
-            // Vector store - MUST check before generic "st"
-            Operation::VectorStore {
-                post_modify: PostModify::None,
-            }
-        } else if mnemonic.starts_with("st") {
-            Operation::Store {
-                width: MemWidth::Word,
-                post_modify: PostModify::None,
-            }
-        } else if mnemonic.starts_with("vadd") {
-            Operation::VectorAdd {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vsub") {
-            Operation::VectorSub {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vmul") {
-            Operation::VectorMul {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        // ========== Vector Comparison Operations ==========
-        } else if mnemonic.starts_with("vge") || mnemonic.starts_with("vcmpge") {
-            // Vector greater-equal comparison
-            Operation::VectorGe {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vlt") || mnemonic.starts_with("vcmplt") {
-            // Vector less-than comparison
-            Operation::VectorLt {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("veqz") {
-            // Vector equal-to-zero
-            Operation::VectorEqz {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vmax_lt") || mnemonic.starts_with("vmax.lt") {
-            // Max with less-than condition
-            Operation::VectorMaxLt {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vmin_ge") || mnemonic.starts_with("vmin.ge") {
-            // Min with greater-equal condition
-            Operation::VectorMinGe {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vmin") {
-            // Vector minimum
-            Operation::VectorMin {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vmax") {
-            // Vector maximum
-            Operation::VectorMax {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        // ========== Vector Bitwise Operations ==========
-        } else if mnemonic.starts_with("vband") || mnemonic.starts_with("vand") {
-            // Vector bitwise AND
-            Operation::VectorAnd {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vbor") || mnemonic.starts_with("vor") {
-            // Vector bitwise OR
-            Operation::VectorOr {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vbxor") || mnemonic.starts_with("vxor") {
-            // Vector bitwise XOR
-            Operation::VectorXor {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vbnot") || mnemonic.starts_with("vnot") {
-            // Vector bitwise NOT
-            Operation::VectorNot {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        // ========== Vector Conditional Arithmetic ==========
-        } else if mnemonic.starts_with("vsub_lt") || mnemonic.starts_with("vsub.lt") {
-            // Subtract if less-than
-            Operation::VectorSubLt {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vsub_ge") || mnemonic.starts_with("vsub.ge") {
-            // Subtract if greater-equal
-            Operation::VectorSubGe {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vmaxdiff_lt") || mnemonic.starts_with("vmaxdiff.lt") {
-            // Max difference if less-than
-            Operation::VectorMaxDiffLt {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        // ========== Conditional Vector Operations ==========
-        } else if mnemonic.starts_with("vabs_gtz") || mnemonic.starts_with("vabs.gtz") {
-            // Absolute value if greater than zero (ReLU-like)
-            Operation::VectorAbsGtz {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vneg_gtz") || mnemonic.starts_with("vneg.gtz") {
-            // Negate if greater than zero
-            Operation::VectorNegGtz {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vbneg_ltz")
-            || mnemonic.starts_with("vneg_ltz")
-            || mnemonic.starts_with("vneg.ltz")
-        {
-            // Negate if less than zero (abs)
-            Operation::VectorNegLtz {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vacc") && !mnemonic.starts_with("vaccum") {
-            // Vector accumulate (add to accumulator without multiply)
-            Operation::VectorAccumulate {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vneg") && !mnemonic.contains("mac") && !mnemonic.contains("msc") && !mnemonic.contains("_gtz") && !mnemonic.contains("_ltz") && !mnemonic.contains(".gtz") && !mnemonic.contains(".ltz") {
-            // Vector negate (must check after vnegmac/vnegmsc)
-            if mnemonic.contains("add") || mnemonic.starts_with("vnegadd") {
-                Operation::VectorNegAdd {
-                    element_type: self.infer_element_type(&mnemonic),
-                }
-            } else if mnemonic.contains("mul") || mnemonic.starts_with("vnegmul") {
-                Operation::VectorNegMul {
-                    element_type: self.infer_element_type(&mnemonic),
-                }
-            } else {
-                Operation::VectorNegate {
-                    element_type: self.infer_element_type(&mnemonic),
-                }
-            }
-        } else if mnemonic.starts_with("vaddmac") {
-            // Double accumulator: acc1 = acc1 + acc2 + A * B
-            Operation::VectorAddMac {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vaddmsc") {
-            // Double accumulator subtract variant
-            Operation::VectorAddMac {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vsubmac") {
-            // Double accumulator: acc1 = acc1 - acc2 + A * B
-            Operation::VectorSubMac {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vsubmsc") {
-            // Double accumulator subtract variant
-            Operation::VectorSubMac {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vnegmsc") {
-            // Negated matrix multiply-subtract: acc -= -(A * B)
-            Operation::VectorNegMatMulSubDense {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vnegmac") {
-            // Negated matrix multiply: acc += -(A * B)
-            Operation::VectorNegMatMulDense {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vmsc.f") || mnemonic.starts_with("vmsc_f") {
-            // BFloat16 matrix multiply-subtract
-            Operation::VectorMatMulSubFloat {
-                element_type: ElementType::BFloat16,
-            }
-        } else if mnemonic.starts_with("vmsc") {
-            // Matrix multiply-subtract (integer): acc -= A * B
-            Operation::VectorMatMulSubDense {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vmac.f") || mnemonic.starts_with("vmac_f") {
-            // BFloat16 matrix multiply-accumulate for CNN workloads
-            Operation::VectorMatMulAccFloat {
-                element_type: ElementType::BFloat16,
-            }
-        } else if mnemonic.starts_with("vmac") {
-            Operation::VectorMac {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("nop") {
-            // Handle all slot-specific NOPs: nop, nopa, nopb, nopm, nops, nopv, nopx, nopxm
-            Operation::Nop
-        } else if mnemonic.starts_with("acq") {
-            // Debug: show all operand fields for lock instructions
-            log::debug!("[LOCK DECODE] acq instruction: mnemonic={}, fields={:?}",
-                        mnemonic,
-                        decoded.operands.iter().map(|(k, v)| format!("{}=0x{:X}", k, v)).collect::<Vec<_>>());
-            Operation::LockAcquire
-        } else if mnemonic.starts_with("rel") {
-            log::debug!("[LOCK DECODE] rel instruction: mnemonic={}, fields={:?}",
-                        mnemonic,
-                        decoded.operands.iter().map(|(k, v)| format!("{}=0x{:X}", k, v)).collect::<Vec<_>>());
-            Operation::LockRelease
-        } else if mnemonic == "jl" || mnemonic.starts_with("call") {
-            // "jl" (jump and link) is the AIE2 call instruction
-            // It saves the return address to lr before jumping
-            Operation::Call
-        } else if mnemonic == "jnz" || mnemonic == "jnzd" || mnemonic == "bnz" {
-            // Conditional jump: jump if register is not zero
-            Operation::Branch {
-                condition: BranchCondition::NotZero,
-            }
-        } else if mnemonic == "jz" || mnemonic == "bz" {
-            // Conditional jump: jump if register is zero
-            Operation::Branch {
-                condition: BranchCondition::Zero,
-            }
-        } else if mnemonic.starts_with("j") || mnemonic.starts_with("b") {
-            // Regular unconditional jumps/branches
-            Operation::Branch {
-                condition: BranchCondition::Always,
-            }
-        } else if mnemonic.starts_with("ret") {
-            // ret, ret lr, ret.* - all return operations
-            Operation::Return
-        } else if mnemonic == "halt" || mnemonic == "done" {
-            // "done" is the AIE2 instruction name for halting the core
-            // "halt" is kept for compatibility
-            Operation::Halt
-        // Comparison operations (produce 0/1 result)
-        } else if mnemonic.starts_with("lt") && !mnemonic.starts_with("ltip") {
-            // lt, lts (signed less than), ltu (unsigned less than)
-            if mnemonic.contains("u") {
-                Operation::ScalarLtu
-            } else {
-                Operation::ScalarLt
-            }
-        } else if mnemonic.starts_with("le") && !mnemonic.starts_with("letp") {
-            if mnemonic.contains("u") {
-                Operation::ScalarLeu
-            } else {
-                Operation::ScalarLe
-            }
-        } else if mnemonic.starts_with("gt") && !mnemonic.starts_with("gtip") {
-            if mnemonic.contains("u") {
-                Operation::ScalarGtu
-            } else {
-                Operation::ScalarGt
-            }
-        } else if mnemonic.starts_with("ge") && !mnemonic.starts_with("getp") {
-            if mnemonic.contains("u") {
-                Operation::ScalarGeu
-            } else {
-                Operation::ScalarGe
-            }
-        } else if mnemonic == "eq" || mnemonic.starts_with("eq.") {
-            Operation::ScalarEq
-        } else if mnemonic == "ne" || mnemonic.starts_with("ne.") {
-            Operation::ScalarNe
-        } else if mnemonic.starts_with("seleqz") || mnemonic.starts_with("sel.eqz") {
-            Operation::ScalarSelEqz
-        } else if mnemonic.starts_with("selnez") || mnemonic.starts_with("sel.nez") {
-            Operation::ScalarSelNez
-        } else if mnemonic.starts_with("sel") {
-            Operation::ScalarSel
-        } else if mnemonic == "divs" || mnemonic.starts_with("divs.") {
-            Operation::ScalarDiv
-        } else if mnemonic == "divu" || mnemonic.starts_with("divu.") {
-            Operation::ScalarDivu
-        } else if mnemonic == "mod" || mnemonic.starts_with("mod.") {
-            Operation::ScalarMod
-        // ========== Additional Scalar Operations ==========
-        } else if mnemonic == "abs" || mnemonic.starts_with("abs.") {
-            Operation::ScalarAbs
-        } else if mnemonic == "clz" || mnemonic.starts_with("clz.") {
-            // Count leading zeros
-            Operation::ScalarClz
-        } else if mnemonic == "clb" || mnemonic.starts_with("clb.") {
-            // Count leading bits (ones or zeros)
-            Operation::ScalarClb
-        } else if mnemonic == "adc" || mnemonic.starts_with("adc.") {
-            // Add with carry
-            Operation::ScalarAdc
-        // ========== Sign/Zero Extension Operations ==========
-        } else if mnemonic == "ext.s8" || mnemonic == "sext.8" || mnemonic == "sext8" {
-            Operation::ScalarExtendS8
-        } else if mnemonic == "ext.s16" || mnemonic == "sext.16" || mnemonic == "sext16" {
-            Operation::ScalarExtendS16
-        } else if mnemonic == "ext.u8" || mnemonic == "zext.8" || mnemonic == "zext8" {
-            Operation::ScalarExtendU8
-        } else if mnemonic == "ext.u16" || mnemonic == "zext.16" || mnemonic == "zext16" {
-            Operation::ScalarExtendU16
-        // ========== Vector Operations ==========
-        } else if mnemonic.contains("vmul_vmac_cm_core_dense") || mnemonic.contains("vmac_cm_dense")
-        {
-            // Matrix multiply dense
-            Operation::VectorMatMulDense {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vsrs") {
-            // Shift-round-saturate
-            Operation::VectorSRS {
-                from_type: self.infer_element_type(&mnemonic),
-                to_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vconv") {
-            // Vector type conversion
-            Operation::VectorConvert {
-                from_type: self.infer_element_type(&mnemonic),
-                to_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vmov") {
-            // Vector move (NOT regular "mov")
-            Operation::VectorMov {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vlda") {
-            // Vector load A channel
-            Operation::VectorLoadA {
-                post_modify: PostModify::None,
-            }
-        } else if mnemonic.starts_with("vldb") {
-            // Vector load B channel
-            Operation::VectorLoadB {
-                post_modify: PostModify::None,
-            }
-        } else if mnemonic.starts_with("vlup") {
-            // Vector load with unpack
-            Operation::VectorLoadUnpack {
-                from_type: self.infer_element_type(&mnemonic),
-                to_type: self.infer_element_type(&mnemonic),
-                post_modify: PostModify::None,
-            }
-        // ========== Stream Operations ==========
-        // Note: vst check moved earlier (before generic "st")
-        } else if mnemonic.contains("mv_scl2ms") || mnemonic == "scl2ms" {
-            // Write scalar to master stream
-            Operation::StreamWriteScalar { blocking: true }
-        } else if mnemonic.contains("mv_ph2ms") || mnemonic == "ph2ms" {
-            // Write packet header to master stream
-            Operation::StreamWritePacketHeader { blocking: true }
-        } else if mnemonic.contains("mv_ms2scl")
-            || mnemonic.contains("mv_ss2scl")
-            || mnemonic == "ms2scl"
-            || mnemonic == "ss2scl"
-        {
-            // Read from slave stream to scalar
-            Operation::StreamReadScalar { blocking: true }
-        // ========== Vector Element Operations ==========
-        } else if mnemonic.starts_with("vext") || mnemonic.starts_with("vextract") {
-            // Extract element from vector
-            Operation::VectorExtract {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vins") || mnemonic.starts_with("vinsert") {
-            // Insert element into vector
-            Operation::VectorInsert {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vsel") {
-            // Vector per-lane select
-            Operation::VectorSelect {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vclr") || mnemonic == "vclr" {
-            // Clear vector register
-            Operation::VectorClear
-        } else if mnemonic.starts_with("vbcst") || mnemonic.starts_with("vbroadcast") {
-            // Broadcast scalar to vector
-            Operation::VectorBroadcast {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        // ========== Vector Shift Operations ==========
-        } else if mnemonic.starts_with("vshl") {
-            // Vector left shift
-            Operation::VectorShiftLeft {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vshr") || mnemonic.starts_with("vlsr") {
-            // Vector logical right shift
-            Operation::VectorShiftRight {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vasr") {
-            // Vector arithmetic right shift
-            Operation::VectorArithShiftRight {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("valign") {
-            // Vector align
-            Operation::VectorAlign {
-                element_type: self.infer_element_type(&mnemonic),
-            }
-        } else if mnemonic.starts_with("vups") || mnemonic.starts_with("vupshift") {
-            // Vector upshift for precision scaling
-            Operation::VectorUpshift {
-                from_type: self.infer_element_type(&mnemonic),
-                to_type: self.infer_element_type(&mnemonic),
-            }
-        } else {
-            Operation::Unknown {
-                opcode: decoded.operands.get("word0").copied().unwrap_or(0) as u32,
-            }
+        // No SemanticOp assigned - this is a gap in our semantic inference
+        log::warn!(
+            "[NO SEMANTIC] Instruction '{}' has no SemanticOp - add to infer_semantic_from_mnemonic()",
+            decoded.encoding.mnemonic
+        );
+        Operation::Unknown {
+            opcode: decoded.operands.get("word0").copied().unwrap_or(0) as u32,
         }
     }
 
     /// Convert a SemanticOp to an Operation.
-    fn semantic_to_operation(&self, semantic: SemanticOp, _decoded: &DecodedInstr) -> Operation {
+    fn semantic_to_operation(&self, semantic: SemanticOp, decoded: &DecodedInstr) -> Operation {
+        let mnemonic = &decoded.encoding.mnemonic;
+        let is_vector = mnemonic.starts_with('v') || mnemonic.starts_with('V');
+        let element_type = self.infer_element_type(mnemonic);
+
         match semantic {
+            SemanticOp::Add if is_vector => Operation::VectorAdd { element_type },
             SemanticOp::Add => Operation::ScalarAdd,
+            SemanticOp::Sub if is_vector => Operation::VectorSub { element_type },
             SemanticOp::Sub => Operation::ScalarSub,
+            SemanticOp::Mul if is_vector => Operation::VectorMul { element_type },
             SemanticOp::Mul => Operation::ScalarMul,
             SemanticOp::And => Operation::ScalarAnd,
             SemanticOp::Or => Operation::ScalarOr,
@@ -765,7 +413,8 @@ impl InstructionDecoder {
             SemanticOp::BrCond => Operation::Branch {
                 condition: BranchCondition::NotEqual, // Placeholder
             },
-            SemanticOp::Nop | SemanticOp::Copy => Operation::Nop,
+            SemanticOp::Nop => Operation::Nop,
+            SemanticOp::Copy => Operation::ScalarMov,
 
             // Comparison operations (produce 0/1 result)
             SemanticOp::SetLt => Operation::ScalarLt,
@@ -780,6 +429,17 @@ impl InstructionDecoder {
             SemanticOp::SetNe => Operation::ScalarNe,
             SemanticOp::Select => Operation::ScalarSel,
 
+            // Lock operations
+            SemanticOp::LockAcquire => Operation::LockAcquire,
+            SemanticOp::LockRelease => Operation::LockRelease,
+
+            // Other scalar ops
+            SemanticOp::Abs => Operation::ScalarAbs,
+
+            // Control flow
+            SemanticOp::Ret => Operation::Return,
+
+            // Not handled yet - fall through
             _ => Operation::Unknown { opcode: 0 },
         }
     }
@@ -828,15 +488,21 @@ impl InstructionDecoder {
         }
     }
 
-    /// Extract operands from decoded instruction.
+    /// Extract operands from decoded instruction using TableGen ordering.
+    ///
+    /// This method builds a field_name → Operand map, then extracts:
+    /// - Destination from `output_order` names
+    /// - Sources from `input_order` names (in canonical order)
+    ///
+    /// Special handling is preserved for complex field encodings (ag_*, mSclSt, etc.)
     fn extract_operands(&self, decoded: &DecodedInstr) -> (Option<Operand>, Vec<Operand>) {
-        let mut dest = None;
-        let mut sources = Vec::new();
+        use std::collections::HashMap;
 
-        // Common patterns:
-        // - mRx, d0, dst -> destination register
-        // - mRx0, mRy, s0, s1, src -> source registers
-        // - imm, offset -> immediates
+        // Build a map of field_name -> decoded Operand
+        let mut field_operands: HashMap<String, Operand> = HashMap::new();
+        // Some fields produce multiple operands or set dest directly (special cases)
+        let mut direct_dest: Option<Operand> = None;
+        let mut extra_sources: Vec<Operand> = Vec::new();
 
         if decoded.encoding.slot == "st"
             || decoded.encoding.slot == "lda"
@@ -849,10 +515,12 @@ impl InstructionDecoder {
                 .map(|f| format!("{}=0x{:X}", f.name, decoded.operand(&f.name).unwrap_or(0)))
                 .collect();
             log::debug!(
-                "[DECODE {}] mnemonic={} fields={:?}",
+                "[DECODE {}] mnemonic={} fields={:?} input_order={:?} output_order={:?}",
                 decoded.encoding.slot.to_uppercase(),
                 decoded.encoding.mnemonic,
-                field_info
+                field_info,
+                decoded.encoding.input_order,
+                decoded.encoding.output_order
             );
         }
 
@@ -861,41 +529,31 @@ impl InstructionDecoder {
             log::debug!("[FIELD] Processing field='{}' value=0x{:X}", field.name, value);
 
             // Special handling for address generator fields (ag_all, ag_idx, agb_sa, etc.)
-            // AIE-ML ag_all is a 13-bit field with mode-dependent encoding:
-            // - Low 4 bits: addressing mode selector
-            // - Upper bits: pointer and offset/modifier encoding
+            // These produce Memory operands or multiple operands - handled specially
             if field.name.starts_with("ag") {
                 let mode = (value & 0xF) as u8;
                 let mnemonic = decoded.encoding.mnemonic.to_lowercase();
 
-                // Decode based on addressing mode
                 let (ptr_reg, offset_or_mod) = match mode {
-                        // 0b1010 = indexed with immediate: *(ptr + imm)
-                    // ag_ptr_imm (9 bits) = [ptr(3), imm(6)]
-                    // NOTE: The imm field is in WORD units, multiply by 4 for byte offset
                     0b1010 => {
                         let ag_ptr_imm = value >> 4;
                         let ptr = ((ag_ptr_imm >> 6) & 0x7) as u8;
                         let imm_words = (ag_ptr_imm & 0x3F) as i32;
-                        let imm_bytes = imm_words * 4; // Convert word offset to byte offset
+                        let imm_bytes = imm_words * 4;
                         log::trace!("[DECODE ag_all] mode=0b1010 ptr=p{} imm={}w -> {}b", ptr, imm_words, imm_bytes);
                         (ptr, Operand::Immediate(imm_bytes))
                     }
-                    // 0b0110 = post-increment with immediate: t = *ptr, ptr += imm
                     0b0110 => {
                         let ag_ptr_imm = value >> 3;
                         let ptr = ((ag_ptr_imm >> 7) & 0x7) as u8;
                         let imm = (ag_ptr_imm & 0x7F) as i32;
                         (ptr, Operand::Immediate(imm))
                     }
-                    // 0b0010 = could be idx, 2D, or 3D mode - check higher bits
                     0b0010 => {
-                        // Extract ptr from high 3 bits of the field
                         let ptr = ((value >> 10) & 0x7) as u8;
                         let mod_reg = ((value >> 3) & 0x7) as u8;
                         (ptr, Operand::ModifierReg(mod_reg))
                     }
-                    // Default: simple ptr+mod encoding
                     _ => {
                         let ptr = (value & 0x7) as u8;
                         let mod_reg = ((value >> 3) & 0x1F) as u8;
@@ -904,214 +562,347 @@ impl InstructionDecoder {
                 };
 
                 if mnemonic.starts_with("padd") {
-                    // For pointer add, the pointer is both source and destination
-                    dest = Some(Operand::PointerReg(ptr_reg));
-                    sources.push(offset_or_mod);
+                    direct_dest = Some(Operand::PointerReg(ptr_reg));
+                    extra_sources.push(offset_or_mod);
+                } else if let Operand::Immediate(imm) = offset_or_mod {
+                    extra_sources.push(Operand::Memory { base: ptr_reg, offset: imm as i16 });
                 } else {
-                    // For load/store, create Memory operand with base and offset
-                    if let Operand::Immediate(imm) = offset_or_mod {
-                        sources.push(Operand::Memory { base: ptr_reg, offset: imm as i16 });
-                    } else {
-                        sources.push(Operand::PointerReg(ptr_reg));
-                        sources.push(offset_or_mod);
-                    }
+                    extra_sources.push(Operand::PointerReg(ptr_reg));
+                    extra_sources.push(offset_or_mod);
                 }
                 continue;
             }
 
-            // Special handling for scalar store value (mSclSt) with coarse granularity
-            // The value is divided by 4 to get the register index
+            // Special handling for scalar store value (mSclSt)
             if field.name == "mSclSt" || field.name.contains("SclSt") {
                 let scl_reg = ((value >> 2) & 0x1F) as u8;
                 log::trace!("[DECODE mSclSt] raw=0x{:X} -> r{}", value, scl_reg);
-                sources.push(Operand::ScalarReg(scl_reg));
+                field_operands.insert(field.name.clone(), Operand::ScalarReg(scl_reg));
                 continue;
             }
 
             // Special handling for scalar load destination (mSclLd, mLdaScl, mLdbScl)
-            // Uses coarse granularity encoding like mSclSt - raw values are multiples of 4
-            // From AIE2Disassembler.cpp mLdaSclDecoderTable:
-            //   r0=0, r1=4, r2=8, ... r7=28, r8=32, ... r31=124
-            //   m0=2, m1=6, ... (modifier regs at idx % 4 == 2)
-            //   lr=5, p0=13, p1=29, p2=45, p3=61, p4=77, p5=93, p6=109, p7=125
             if field.name == "mSclLd"
                 || field.name.contains("SclLd")
                 || field.name == "mLdaScl"
                 || field.name == "mLdbScl"
             {
                 log::debug!("[DECODE mLdaScl] HANDLER ENTERED field={} value=0x{:X} ({})", field.name, value, value);
-                // Check which register type based on the pattern
-                if value % 4 == 0 {
-                    // Scalar register: r0=0, r1=4, r2=8, ...
+                let operand = if value % 4 == 0 {
                     let scl_reg = (value / 4) as u8;
                     log::trace!("[DECODE mLdaScl] raw=0x{:X} -> r{}", value, scl_reg);
-                    dest = Some(Operand::ScalarReg(scl_reg));
+                    Operand::ScalarReg(scl_reg)
                 } else if value % 4 == 2 {
-                    // Modifier register: m0=2, m1=6, m2=10, ...
                     let mod_reg = (value / 4) as u8;
                     log::trace!("[DECODE mLdaScl] raw=0x{:X} -> m{} (modifier)", value, mod_reg);
-                    // Treat modifier as scalar for now
-                    dest = Some(Operand::ScalarReg(mod_reg));
+                    Operand::ScalarReg(mod_reg)
                 } else if value == 5 {
-                    // lr (link register)
                     log::trace!("[DECODE mLdaScl] raw=0x{:X} -> lr", value);
-                    dest = Some(Operand::ScalarReg(0)); // Use r0 as placeholder for lr
+                    Operand::ScalarReg(0)
+                } else if value >= 13 && (value - 13) % 16 == 0 {
+                    let ptr_reg = ((value - 13) / 16) as u8;
+                    log::trace!("[DECODE mLdaScl] raw=0x{:X} -> p{}", value, ptr_reg);
+                    Operand::PointerReg(ptr_reg)
                 } else {
-                    // Pointer registers: p0=13, p1=29, p2=45, p3=61, p4=77, p5=93, p6=109, p7=125
-                    // Pattern: pN at 13 + N*16
-                    if value >= 13 && (value - 13) % 16 == 0 {
-                        let ptr_reg = ((value - 13) / 16) as u8;
-                        log::trace!("[DECODE mLdaScl] raw=0x{:X} -> p{}", value, ptr_reg);
-                        dest = Some(Operand::PointerReg(ptr_reg));
-                    } else {
-                        // Unknown encoding, fall back to scalar
-                        let scl_reg = (value / 4) as u8;
-                        log::trace!("[DECODE mLdaScl] raw=0x{:X} -> unknown, using r{}", value, scl_reg);
-                        dest = Some(Operand::ScalarReg(scl_reg));
-                    }
-                }
+                    let scl_reg = (value / 4) as u8;
+                    log::trace!("[DECODE mLdaScl] raw=0x{:X} -> unknown, using r{}", value, scl_reg);
+                    Operand::ScalarReg(scl_reg)
+                };
+                field_operands.insert(field.name.clone(), operand);
                 continue;
             }
 
             // Special handling for mova/movb coarse granularity field (mLdaCg/mLdbCg)
-            // This is a MIXED register class that encodes pointers, scalars, and other regs
-            // Encoding (coarse granularity = values are multiples of 4):
-            // - 0x00-0x1F: pointer registers p0-p7 (at 0x00, 0x04, ..., 0x1C)
-            // - 0x20-0x9F: scalar registers r0-r31 (at 0x20, 0x24, ..., 0x9C)
-            // - 0xA0+: other register types (modifier, loop counter, etc.)
+            // Encoding: r0-r31 at 0x00-0x7C (×4), then p0-p7 at 0x80-0x9C (×4)
             if field.name == "mLdaCg" || field.name == "mLdbCg" {
-                if value < 0x20 {
-                    // Pointer register range: 0x00-0x1F -> p0-p7
-                    let ptr_reg = ((value >> 2) & 0x7) as u8;
-                    log::trace!("[DECODE mLdaCg] raw=0x{:X} -> p{}", value, ptr_reg);
-                    dest = Some(Operand::PointerReg(ptr_reg));
-                } else if value < 0xA0 {
-                    // Scalar register range: 0x20-0x9F -> r0-r31
-                    let scl_reg = ((value - 0x20) >> 2) as u8;
+                let operand = if value < 0x80 {
+                    // Scalar registers r0-r31 (32 regs × 4 = 0x80)
+                    let scl_reg = (value >> 2) as u8;
                     log::trace!("[DECODE mLdaCg] raw=0x{:X} -> r{}", value, scl_reg);
-                    dest = Some(Operand::ScalarReg(scl_reg));
+                    Operand::ScalarReg(scl_reg)
+                } else if value < 0xA0 {
+                    // Pointer registers p0-p7 at 0x80-0x9C
+                    let ptr_reg = ((value - 0x80) >> 2) as u8;
+                    log::trace!("[DECODE mLdaCg] raw=0x{:X} -> p{}", value, ptr_reg);
+                    Operand::PointerReg(ptr_reg)
                 } else {
-                    // Other register types - treat as scalar for now
-                    let reg = ((value >> 2) & 0x1F) as u8;
-                    log::trace!("[DECODE mLdaCg] raw=0x{:X} -> other reg {}", value, reg);
-                    dest = Some(Operand::ScalarReg(reg));
-                }
+                    // Special registers (DC, DJ, DN, M, LC)
+                    let reg = ((value - 0xA0) >> 2) as u8;
+                    log::trace!("[DECODE mLdaCg] raw=0x{:X} -> special reg {}", value, reg);
+                    Operand::ModifierReg(reg)
+                };
+                field_operands.insert(field.name.clone(), operand);
                 continue;
             }
 
             // Special handling for movxm destination register (mMvSclDstCg)
-            // This is a mixed scalar/pointer destination with coarse granularity encoding
-            // Register encoding: bits 6:2 = register bank offset, bits 1:0 vary
-            // For pointer registers (eP): base encoding around 0x40-0x5F
             if field.name == "mMvSclDstCg" {
                 log::trace!("[DECODE mMvSclDstCg] raw=0x{:X} ({})", value, value);
-                // The encoding appears to use: pointer regs at offset 0x40 (64)
-                // p0=0x40, p1=0x44, p2=0x48, etc. (scaled by 4)
-                if value >= 0x40 && value < 0x60 {
-                    // Pointer register: (value - 0x40) / 4 = register index
+                let operand = if (0x40..0x60).contains(&value) {
                     let ptr_reg = ((value - 0x40) >> 2) as u8;
                     log::trace!("[DECODE mMvSclDstCg] -> p{}", ptr_reg);
-                    dest = Some(Operand::PointerReg(ptr_reg));
+                    Operand::PointerReg(ptr_reg)
                 } else if value < 0x80 {
-                    // Scalar register: value / 4 for scaled encoding
                     let scalar_reg = ((value >> 2) & 0x1F) as u8;
                     log::trace!("[DECODE mMvSclDstCg] -> r{}", scalar_reg);
-                    dest = Some(Operand::ScalarReg(scalar_reg));
+                    Operand::ScalarReg(scalar_reg)
                 } else {
-                    // Other special registers - treat as scalar for now
                     log::trace!("[DECODE mMvSclDstCg] -> special reg 0x{:X}", value);
-                    dest = Some(Operand::ScalarReg((value & 0x1F) as u8));
-                }
+                    Operand::ScalarReg((value & 0x1F) as u8)
+                };
+                field_operands.insert(field.name.clone(), operand);
                 continue;
             }
 
-            // Special handling for c11s (11-bit signed constant for mova/movb)
+            // Special handling for c11s (11-bit signed constant)
             if field.name == "c11s" {
-                // Sign-extend 11-bit value
                 let sign_extended = if value & 0x400 != 0 {
-                    value | 0xFFFFF800 // Sign extend
+                    value | 0xFFFFF800
                 } else {
                     value
                 } as i32;
-                sources.push(Operand::Immediate(sign_extended));
+                field_operands.insert(field.name.clone(), Operand::Immediate(sign_extended));
                 continue;
             }
 
             // Special handling for lock instruction ID field
-            // Lock instructions (acq, rel) use "id" field for immediate lock ID
             if field.name == "id" {
                 let mnemonic = decoded.encoding.mnemonic.to_lowercase();
                 if mnemonic.starts_with("acq") || mnemonic.starts_with("rel") {
-                    // The id field is a 6-bit lock ID
                     log::debug!("[LOCK] mnemonic={} id field: value=0x{:X} ({})",
                                 mnemonic, value, value);
-                    sources.push(Operand::Lock(value as u8));
+                    field_operands.insert(field.name.clone(), Operand::Lock(value as u8));
                     continue;
                 }
             }
 
             // Special handling for mLockId field
-            // The mLockId field value is already the lock ID (extracted correctly by TableGen)
             if field.name == "mLockId" {
                 log::debug!("[LOCK] mLockId field: value=0x{:X} ({})", value, value);
-                sources.push(Operand::Lock(value as u8));
+                field_operands.insert(field.name.clone(), Operand::Lock(value as u8));
                 continue;
             }
 
-            // Determine if this is a destination or source
-            let is_dest =
-                field.name.contains("mRx") || field.name.starts_with("d") || field.name == "dst";
-            let is_src = field.name.contains("mRx0")
-                || field.name.contains("mRy")
-                || field.name.starts_with("s")
-                || field.name == "src";
-            // Constant field patterns used by AIE2:
-            // - c5u, c5s: 5-bit unsigned/signed constants
-            // - c6u, c6s: 6-bit constants
-            // - cXXs, cXXu: general constant patterns where XX is bit width
-            let is_const_field = field.name.len() >= 3
-                && field.name.starts_with("c")
-                && field.name.chars().nth(1).map_or(false, |c| c.is_ascii_digit())
-                && field.name.chars().last().map_or(false, |c| c == 'u' || c == 's');
-            let is_imm = field.name.contains("imm")
-                || field.name.contains("offset")
-                || field.name.contains("target")
-                || field.name.contains("addr")
-                || field.name.contains("tgt")
-                || field.name.contains("disp")  // displacement
-                || field.name.starts_with("i")
-                || is_const_field;
+            // Generic operand decoding based on field name patterns
+            let operand = self.decode_generic_operand(&field.name, value);
+            field_operands.insert(field.name.clone(), operand);
+        }
 
-            let operand = if is_imm {
-                Operand::Immediate(value as i32)
-            } else if field.name.contains("ptr") || field.name.starts_with("p") {
-                Operand::PointerReg(value as u8)
-            } else if field.name.starts_with("v") {
-                Operand::VectorReg(value as u8)
-            } else if field.name.starts_with("acc") {
-                Operand::AccumReg(value as u8)
-            } else if field.name.starts_with("mP") {
-                // Pointer register with mPx naming
-                Operand::PointerReg(value as u8)
-            } else if field.name.starts_with("m")
-                && !field.name.contains("mR")
-                && !field.name.contains("mS")
-            {
-                Operand::ModifierReg(value as u8)
-            } else {
-                Operand::ScalarReg(value as u8)
-            };
+        // Now extract dest and sources using TableGen ordering
+        let (dest, sources) = self.extract_ordered_operands(
+            decoded,
+            &field_operands,
+            direct_dest,
+            extra_sources,
+        );
 
-            // Assign to dest or sources
-            // Note: mRx without 0 is typically destination, mRx0/mRy are sources
-            if is_dest && !is_src && dest.is_none() {
-                dest = Some(operand);
-            } else if !is_dest || is_src {
-                sources.push(operand);
+        // Convert ScalarReg to VectorReg for vector instructions
+        // Vector instructions have mnemonics starting with 'v' (e.g., vadd.8, vsub, vmul)
+        let mnemonic = &decoded.encoding.mnemonic;
+        let is_vector_instr = mnemonic.starts_with('v') || mnemonic.starts_with('V');
+
+        if is_vector_instr {
+            log::debug!(
+                "[DECODE VECTOR CONVERT] mnemonic={} converting ScalarReg->VectorReg dest={:?} sources={:?}",
+                mnemonic, dest, sources
+            );
+            let dest = dest.map(|op| match op {
+                Operand::ScalarReg(r) => Operand::VectorReg(r),
+                other => other,
+            });
+            let sources: Vec<Operand> = sources
+                .into_iter()
+                .map(|op| match op {
+                    Operand::ScalarReg(r) => Operand::VectorReg(r),
+                    other => other,
+                })
+                .collect();
+            log::debug!(
+                "[DECODE VECTOR CONVERT] AFTER: dest={:?} sources={:?}",
+                dest, sources
+            );
+            (dest, sources)
+        } else {
+            (dest, sources)
+        }
+    }
+
+    /// Decode a generic operand based on field name patterns.
+    fn decode_generic_operand(&self, field_name: &str, value: u64) -> Operand {
+        // Constant field patterns: c5u, c5s, c6u, etc.
+        let is_const_field = field_name.len() >= 3
+            && field_name.starts_with("c")
+            && field_name.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
+            && field_name.chars().last().is_some_and(|c| c == 'u' || c == 's');
+
+        let is_imm = field_name.contains("imm")
+            || field_name.contains("offset")
+            || field_name.contains("target")
+            || field_name.contains("addr")
+            || field_name.contains("tgt")
+            || field_name.contains("disp")
+            || field_name.starts_with("i")
+            || is_const_field;
+
+        if is_imm {
+            Operand::Immediate(value as i32)
+        } else if field_name.contains("ptr") || field_name.starts_with("p") {
+            Operand::PointerReg(value as u8)
+        } else if field_name.starts_with("v") {
+            Operand::VectorReg(value as u8)
+        } else if field_name.starts_with("acc") {
+            Operand::AccumReg(value as u8)
+        } else if field_name.starts_with("mP") {
+            Operand::PointerReg(value as u8)
+        // Vector registers: mW* (256-bit), mX* (512-bit), my (1024-bit)
+        } else if field_name.starts_with("mW")
+            || field_name.starts_with("mX")
+            || field_name == "my"
+        {
+            Operand::VectorReg(value as u8)
+        // Accumulator registers: mAM* (256-bit), mBM* (512-bit), mCM* (1024-bit)
+        } else if field_name.starts_with("mAM")
+            || field_name.starts_with("mBM")
+            || field_name.starts_with("mCM")
+        {
+            Operand::AccumReg(value as u8)
+        } else if field_name.starts_with("m")
+            && !field_name.contains("mR")
+            && !field_name.contains("mS")
+        {
+            Operand::ModifierReg(value as u8)
+        } else {
+            Operand::ScalarReg(value as u8)
+        }
+    }
+
+    /// Extract destination and sources using TableGen's output_order/input_order.
+    ///
+    /// This is the key function for Phase 1: it ensures sources are in canonical order.
+    ///
+    /// Note: Operand names come from TableGen input_order which should now match
+    /// the field_operands keys (after resolver traces through field_sources).
+    fn extract_ordered_operands(
+        &self,
+        decoded: &DecodedInstr,
+        field_operands: &std::collections::HashMap<String, Operand>,
+        direct_dest: Option<Operand>,
+        extra_sources: Vec<Operand>,
+    ) -> (Option<Operand>, Vec<Operand>) {
+        let output_order = &decoded.encoding.output_order;
+        let input_order = &decoded.encoding.input_order;
+
+        // Extract destination from output_order, or use direct_dest from special handling
+        let dest = if let Some(d) = direct_dest {
+            Some(d)
+        } else if !output_order.is_empty() {
+            // Look up first output name in field_operands
+            output_order.first().and_then(|name| field_operands.get(name).cloned())
+                .or_else(|| self.find_dest_heuristic(field_operands))
+        } else {
+            // No output_order - use heuristic
+            self.find_dest_heuristic(field_operands)
+        };
+
+        // Extract sources from input_order
+        let mut sources = Vec::new();
+
+        if !input_order.is_empty() {
+            // Use TableGen ordering - this is the correct order
+            for input_name in input_order {
+                if let Some(operand) = field_operands.get(input_name) {
+                    sources.push(operand.clone());
+                } else {
+                    log::trace!(
+                        "[DECODE] input_order name '{}' not found in field_operands (keys: {:?})",
+                        input_name,
+                        field_operands.keys().collect::<Vec<_>>()
+                    );
+                }
+            }
+        } else {
+            // No input_order - use all non-dest operands
+            for (name, operand) in field_operands.iter() {
+                if !self.is_dest_field(name) {
+                    sources.push(operand.clone());
+                }
             }
         }
 
+        // Append extra sources from special handling (ag_*, etc.)
+        sources.extend(extra_sources);
+
+        log::debug!(
+            "[DECODE ORDERED] mnemonic={} dest={:?} sources={:?}",
+            decoded.encoding.mnemonic,
+            dest,
+            sources
+        );
+
         (dest, sources)
+    }
+
+    /// Heuristic to find destination from field_operands map.
+    fn find_dest_heuristic(
+        &self,
+        field_operands: &std::collections::HashMap<String, Operand>,
+    ) -> Option<Operand> {
+        for (name, operand) in field_operands {
+            if self.is_dest_field(name) {
+                return Some(operand.clone());
+            }
+        }
+        None
+    }
+
+    /// Check if a field name represents a destination (used for fallback).
+    fn is_dest_field(&self, name: &str) -> bool {
+        (name.contains("mRx") && !name.contains("mRx0"))
+            || name.starts_with("d")
+            || name == "dst"
+            || name.contains("SclLd")
+            || name.contains("mLdaScl")
+            || name.contains("mLdbScl")
+            || name.contains("mLdaCg")
+            || name.contains("mLdbCg")
+            || name.contains("mMvSclDstCg")
+    }
+
+    /// Build a SlotOp with TableGen-derived information.
+    ///
+    /// Sources are already in canonical order from extract_operands().
+    /// This method:
+    /// 1. Sets the semantic operation from TableGen
+    /// 2. Attaches implicit register uses/defs
+    fn build_slot_op(
+        &self,
+        slot_index: SlotIndex,
+        operation: Operation,
+        decoded: &DecodedInstr,
+        dest: Option<Operand>,
+        sources: Vec<Operand>,
+    ) -> SlotOp {
+        // Build SlotOp with semantic and implicit registers
+        let mut slot_op = if let Some(semantic) = decoded.encoding.semantic {
+            SlotOp::with_semantic(slot_index, operation, semantic)
+        } else {
+            SlotOp::new(slot_index, operation)
+        };
+
+        // Add implicit registers from TableGen
+        if !decoded.encoding.implicit_regs.is_empty() {
+            slot_op = slot_op.with_implicit_regs(decoded.encoding.implicit_regs.clone());
+        }
+
+        // Set destination and sources (already in TableGen canonical order)
+        if let Some(d) = dest {
+            slot_op = slot_op.with_dest(d);
+        }
+        for src in sources {
+            slot_op = slot_op.with_source(src);
+        }
+
+        slot_op
     }
 }
 
@@ -1165,13 +956,15 @@ impl Decoder for InstructionDecoder {
         // Extract slots from the bundle
         let extracted = extract_slots(bytes);
 
-        // Debug: show bundle format for first few decodes
-        static DECODE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let count = DECODE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count < 20 {
-            eprintln!("[DECODE#{}] PC=0x{:04X} format={:?} slots={}", count, pc, format, extracted.slots.len());
-            for s in &extracted.slots {
-                eprintln!("  slot: {:?} bits=0x{:010X}", s.slot_type, s.bits);
+        // Debug: show bundle format for first few decodes (trace level only)
+        if log::log_enabled!(log::Level::Trace) {
+            static DECODE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let count = DECODE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count < 20 {
+                log::trace!("[DECODE#{}] PC=0x{:04X} format={:?} slots={}", count, pc, format, extracted.slots.len());
+                for s in &extracted.slots {
+                    log::trace!("  slot: {:?} bits=0x{:010X}", s.slot_type, s.bits);
+                }
             }
         }
 
@@ -1239,21 +1032,57 @@ impl Decoder for InstructionDecoder {
                         );
                     }
 
-                    let mut slot_op = SlotOp::new(slot_index, operation);
-                    if let Some(d) = dest {
-                        slot_op = slot_op.with_dest(d);
-                    }
-                    for src in sources {
-                        slot_op = slot_op.with_source(src);
-                    }
-
+                    // Build SlotOp with TableGen info (reorders sources, adds semantic/implicit)
+                    let slot_op = self.build_slot_op(slot_index, operation, &decoded, dest, sources);
                     bundle.set_slot(slot_op);
+                } else if slot.slot_type == SlotType::Lng {
+                    // FIXME: This is a workaround for LNG control instructions not being
+                    // properly integrated via TableGen. The JL and J instructions use the
+                    // LNG slot format which puts a 20-bit cpmaddr in the immediate field.
+                    // These should be handled by extending the TableGen parser to recognize
+                    // LNG format control flow instructions. See llvm-aie AIE2InstrFormats.td
+                    // for the proper encoding definitions.
+                    //
+                    // JL (jump and link): lng = {0b00000, cpmaddr[19:0], 0b0, 0b0000, 0b0000, 0b00000, 0b100}
+                    // J (jump): lng = {0b00000, cpmaddr[19:0], 0b0, 0b0000, 0b0000, 0b00000, 0b010}
+                    let opcode = (slot.bits & 0x7) as u8;
+
+                    match opcode {
+                        0b100 => {
+                            // JL - Jump and Link (saves return address to LR, jumps to cpmaddr)
+                            let cpmaddr = ((slot.bits >> 17) & 0xFFFFF) as u32;
+                            log::debug!("[LNG JL] bits=0x{:010X} cpmaddr=0x{:05X}", slot.bits, cpmaddr);
+
+                            bundle.set_slot(
+                                SlotOp::new(SlotIndex::Control, Operation::Call)
+                                    .with_source(Operand::Immediate(cpmaddr as i32))
+                            );
+                        }
+                        0b010 => {
+                            // J - Unconditional Jump
+                            let cpmaddr = ((slot.bits >> 17) & 0xFFFFF) as u32;
+                            log::debug!("[LNG J] bits=0x{:010X} cpmaddr=0x{:05X}", slot.bits, cpmaddr);
+
+                            bundle.set_slot(
+                                SlotOp::new(
+                                    SlotIndex::Control,
+                                    Operation::Branch { condition: BranchCondition::Always }
+                                ).with_source(Operand::Immediate(cpmaddr as i32))
+                            );
+                        }
+                        _ => {
+                            // Other LNG opcodes - mark as unknown
+                            log::debug!("[LNG DECODE FAIL] bits=0x{:010X} opcode=0b{:03b} - not recognized",
+                                slot.bits, opcode);
+                            bundle.set_slot(
+                                SlotOp::new(SlotIndex::Control, Operation::Unknown { opcode: slot.bits as u32 })
+                            );
+                        }
+                    }
                 } else {
                     // Slot extracted but not recognized - mark as unknown with slot info
-                    if slot.slot_type == SlotType::Lng {
-                        log::debug!("[LNG DECODE FAIL] bits=0x{:010X} - no matching encoding",
-                            slot.bits);
-                    }
+                    log::debug!("[{:?} DECODE FAIL] bits=0x{:010X} - no matching encoding",
+                        slot.slot_type, slot.bits);
                     #[cfg(test)]
                     if slot.slot_type == SlotType::Alu || slot.slot_type == SlotType::Mv {
                         eprintln!(
@@ -1297,14 +1126,8 @@ impl Decoder for InstructionDecoder {
                 let slot_index = self.slot_to_index(&decoded.encoding.slot);
                 let (dest, sources) = self.extract_operands(&decoded);
 
-                let mut slot_op = SlotOp::new(slot_index, operation);
-                if let Some(d) = dest {
-                    slot_op = slot_op.with_dest(d);
-                }
-                for src in sources {
-                    slot_op = slot_op.with_source(src);
-                }
-
+                // Build SlotOp with TableGen info
+                let slot_op = self.build_slot_op(slot_index, operation, &decoded, dest, sources);
                 bundle.set_slot(slot_op);
             } else {
                 // Unknown instruction
@@ -1375,6 +1198,9 @@ mod tests {
             semantic: Some(SemanticOp::Add),
             may_load: false,
             may_store: false,
+            input_order: vec!["mRx0".to_string(), "mRy".to_string()],
+            output_order: vec!["mRx".to_string()],
+            implicit_regs: vec![],
         }
     }
 
@@ -1452,6 +1278,9 @@ mod tests {
             semantic: None,
             may_load: false,
             may_store: false,
+            input_order: vec![],
+            output_order: vec![],
+            implicit_regs: vec![],
         };
 
         let more_specific = make_add_encoding(); // 5 fixed bits
@@ -1612,5 +1441,51 @@ mod tests {
             decoded_count + unknown_count > 0,
             "Should have processed some instructions"
         );
+    }
+
+    #[test]
+    fn test_decoder_via_tblgen() {
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found at ../llvm-aie");
+            return;
+        }
+
+        // Load decoder via tblgen
+        let decoder = InstructionDecoder::try_load_via_tblgen(llvm_aie_path)
+            .expect("Failed to load via tblgen");
+
+        eprintln!("Loaded {} encodings via tblgen", decoder.encodings.len());
+
+        // Verify we have more than regex-based loader (tblgen captures more instructions)
+        assert!(
+            decoder.encodings.len() > 100,
+            "Should have loaded many encodings"
+        );
+
+        // Verify ACQ instructions are distinguished
+        let acq_imm = decoder.encodings.iter().find(|e| e.name == "ACQ_mLockId_imm");
+        let acq_reg = decoder.encodings.iter().find(|e| e.name == "ACQ_mLockId_reg");
+
+        if let (Some(imm), Some(reg)) = (acq_imm, acq_reg) {
+            eprintln!(
+                "ACQ_mLockId_imm: mask=0x{:05X}, bits=0x{:05X}",
+                imm.fixed_mask, imm.fixed_bits
+            );
+            eprintln!(
+                "ACQ_mLockId_reg: mask=0x{:05X}, bits=0x{:05X}",
+                reg.fixed_mask, reg.fixed_bits
+            );
+
+            assert_ne!(
+                imm.fixed_bits, reg.fixed_bits,
+                "ACQ instructions should have different fixed bits"
+            );
+        }
+
+        // Test NOP decoding still works
+        let nop_bytes = [0x00u8, 0x00, 0x00, 0x00];
+        let bundle = decoder.decode(&nop_bytes, 0).expect("Should decode NOP");
+        assert!(bundle.is_nop());
     }
 }

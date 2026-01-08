@@ -49,6 +49,7 @@
 
 mod parser;
 mod resolver;
+pub mod tblgen_records;
 mod types;
 
 pub use parser::{
@@ -59,11 +60,13 @@ pub use resolver::{
     build_decoder_tables, DecoderIndex, InstrEncoding, OperandField, ResolveError, Resolver,
     SlotIndex, SlotIndexStats,
 };
+pub use tblgen_records::{parse_tblgen_records, InstrRecord, SlotEncoding};
 pub use types::{
-    EncodingPart, FormatClass, InstrAttributes, InstrDef, OperandDef, SemanticOp, SemanticPattern,
-    SlotDef, TableGenData, TemplateParam,
+    EncodingPart, FormatClass, ImplicitReg, InstrAttributes, InstrDef, OperandDef, SemanticOp,
+    SemanticPattern, SlotDef, TableGenData, TemplateParam,
 };
 
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Load TableGen data from an llvm-aie repository clone.
@@ -107,6 +110,148 @@ pub fn load_from_llvm_aie(llvm_aie_path: impl AsRef<Path>) -> Result<TableGenDat
         &instrs_content,
         patterns_content.as_deref(),
     ))
+}
+
+/// Find the AIE-specific llvm-tblgen binary.
+///
+/// The system llvm-tblgen doesn't have AIE support, so we need the one
+/// built with llvm-aie. This searches known installation locations.
+///
+/// # Search Order
+/// 1. LLVM_AIE_TBLGEN environment variable (explicit override)
+/// 2. Sibling mlir-aie installations (ironenv, my_install)
+/// 3. llvm-aie build directory
+/// 4. Fall back to PATH (likely to fail for AIE files)
+pub fn find_aie_tblgen(llvm_aie_path: impl AsRef<Path>) -> Option<std::path::PathBuf> {
+    // Check environment variable first
+    if let Ok(path) = std::env::var("LLVM_AIE_TBLGEN") {
+        let p = std::path::PathBuf::from(&path);
+        if p.exists() {
+            log::info!("Using llvm-tblgen from LLVM_AIE_TBLGEN: {}", path);
+            return Some(p);
+        }
+    }
+
+    let llvm_aie = llvm_aie_path.as_ref();
+
+    // Known locations relative to llvm-aie or its parent
+    let candidates = [
+        // mlir-aie ironenv (Python venv with llvm-aie package)
+        llvm_aie.parent().and_then(|p| Some(p.join("mlir-aie/ironenv/lib/python3.13/site-packages/llvm-aie/bin/llvm-tblgen"))),
+        llvm_aie.parent().and_then(|p| Some(p.join("mlir-aie/ironenv/lib/python3.12/site-packages/llvm-aie/bin/llvm-tblgen"))),
+        llvm_aie.parent().and_then(|p| Some(p.join("mlir-aie/ironenv/lib/python3.11/site-packages/llvm-aie/bin/llvm-tblgen"))),
+        // mlir-aie install directory
+        llvm_aie.parent().and_then(|p| Some(p.join("mlir-aie/my_install/mlir/bin/llvm-tblgen"))),
+        llvm_aie.parent().and_then(|p| Some(p.join("mlir-aie/install/bin/llvm-tblgen"))),
+        // llvm-aie build directory
+        Some(llvm_aie.join("build/bin/llvm-tblgen")),
+        Some(llvm_aie.join("build/Release/bin/llvm-tblgen")),
+    ];
+
+    for candidate in candidates.into_iter().flatten() {
+        // Canonicalize to resolve relative paths like ../mlir-aie/...
+        // canonicalize() fails if the file doesn't exist, so Ok means it exists
+        if let Ok(canonical) = candidate.canonicalize() {
+            log::info!("Found AIE llvm-tblgen at: {}", canonical.display());
+            return Some(canonical);
+        }
+    }
+
+    // Check if PATH version has AIE support (unlikely but worth trying)
+    if let Ok(output) = std::process::Command::new("llvm-tblgen")
+        .arg("--version")
+        .output()
+    {
+        let version = String::from_utf8_lossy(&output.stdout);
+        // AIE-enabled builds typically mention "aie" somewhere
+        if version.to_lowercase().contains("aie") {
+            log::info!("Using llvm-tblgen from PATH (has AIE support)");
+            return Some(std::path::PathBuf::from("llvm-tblgen"));
+        }
+    }
+
+    log::warn!("No AIE-enabled llvm-tblgen found. Set LLVM_AIE_TBLGEN environment variable.");
+    None
+}
+
+/// Load instruction encodings using llvm-tblgen directly.
+///
+/// This gives us fully resolved encodings with all inheritance and template
+/// substitution applied. Much more reliable than regex parsing.
+///
+/// # Arguments
+///
+/// * `llvm_aie_path` - Path to the llvm-aie repository root
+///
+/// # Returns
+///
+/// Vector of InstrEncoding ready for decoder use, grouped by slot.
+///
+/// # Note
+///
+/// Requires an AIE-enabled llvm-tblgen. The system llvm-tblgen typically
+/// doesn't have AIE support. Set LLVM_AIE_TBLGEN environment variable or
+/// ensure mlir-aie is installed as a sibling directory.
+pub fn load_via_tblgen(llvm_aie_path: impl AsRef<Path>) -> Result<HashMap<String, Vec<InstrEncoding>>, std::io::Error> {
+    use std::process::Command;
+
+    let llvm_aie = llvm_aie_path.as_ref();
+    let base = llvm_aie.join("llvm/lib/Target/AIE");
+
+    // Find AIE-enabled llvm-tblgen
+    let tblgen_path = find_aie_tblgen(llvm_aie)
+        .ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No AIE-enabled llvm-tblgen found. Set LLVM_AIE_TBLGEN or install mlir-aie."
+        ))?;
+
+    log::info!("Running llvm-tblgen from: {}", tblgen_path.display());
+
+    // Run llvm-tblgen to get resolved records
+    let output = Command::new(&tblgen_path)
+        .arg("--print-records")
+        .arg("AIE2.td")
+        .arg("-I.")
+        .arg("-I../../..")
+        .arg("-I../../../include")
+        .current_dir(&base)
+        .output()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other,
+            format!("Failed to run llvm-tblgen at {}: {}", tblgen_path.display(), e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(std::io::Error::new(std::io::ErrorKind::Other,
+            format!("llvm-tblgen failed: {}", stderr)));
+    }
+
+    let content = String::from_utf8_lossy(&output.stdout);
+    let records = tblgen_records::parse_tblgen_records(&content);
+
+    log::info!("Parsed {} instruction records from llvm-tblgen", records.len());
+
+    // Convert to encodings grouped by slot
+    let mut by_slot: HashMap<String, Vec<InstrEncoding>> = HashMap::new();
+
+    for record in records {
+        if let Some(encoding) = record.to_encoding() {
+            by_slot.entry(encoding.slot.clone())
+                .or_default()
+                .push(encoding);
+        }
+    }
+
+    // Log slot counts
+    for (slot, encodings) in &by_slot {
+        log::debug!("Slot '{}': {} encodings", slot, encodings.len());
+    }
+
+    // Sort by specificity (most specific first)
+    for encodings in by_slot.values_mut() {
+        encodings.sort_by(|a, b| b.specificity().cmp(&a.specificity()));
+    }
+
+    Ok(by_slot)
 }
 
 #[cfg(test)]
@@ -410,5 +555,165 @@ mod tests {
 
         // We should have resolved at least some instructions
         assert!(success_count > 0, "Should resolve some instructions");
+    }
+
+    /// Test that ACQ_mLockId_imm and ACQ_mLockId_reg have distinguishing fixed bits.
+    ///
+    /// This verifies our tblgen parser correctly captures the literal bits from
+    /// mixin classes that distinguish immediate vs register variants.
+    ///
+    /// Key insight: mLockId field encoding differs:
+    /// - ACQ_mLockId_imm: bit 0 of mLockId = 0 (immediate)
+    /// - ACQ_mLockId_reg: bit 0 of mLockId = 1 (register)
+    #[test]
+    fn test_acq_instruction_disambiguation() {
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found at ../llvm-aie");
+            return;
+        }
+
+        let encodings_by_slot = load_via_tblgen(llvm_aie_path).expect("Failed to load via tblgen");
+
+        // Find ACQ instructions in the alu slot
+        let alu_encodings = encodings_by_slot.get("alu").expect("No alu slot encodings");
+
+        let acq_imm = alu_encodings.iter()
+            .find(|e| e.name == "ACQ_mLockId_imm");
+        let acq_reg = alu_encodings.iter()
+            .find(|e| e.name == "ACQ_mLockId_reg");
+
+        eprintln!("ACQ instructions in alu slot:");
+        for enc in alu_encodings.iter().filter(|e| e.name.starts_with("ACQ")) {
+            eprintln!(
+                "  {}: mask=0x{:05X}, bits=0x{:05X}, fields={:?}",
+                enc.name, enc.fixed_mask, enc.fixed_bits,
+                enc.operand_fields.iter().map(|f| &f.name).collect::<Vec<_>>()
+            );
+        }
+
+        if let (Some(imm), Some(reg)) = (acq_imm, acq_reg) {
+            // They should have different fixed_bits since mLockId bit 0 differs
+            assert_ne!(
+                imm.fixed_bits, reg.fixed_bits,
+                "ACQ_mLockId_imm and ACQ_mLockId_reg should have different fixed_bits! \
+                 imm=0x{:05X}, reg=0x{:05X}",
+                imm.fixed_bits, reg.fixed_bits
+            );
+
+            // The masks should cover the distinguishing bit
+            assert_ne!(
+                imm.fixed_mask & imm.fixed_bits,
+                reg.fixed_mask & reg.fixed_bits,
+                "Masked bits should differ"
+            );
+
+            eprintln!("SUCCESS: ACQ instructions have distinguishing fixed bits");
+            eprintln!(
+                "  ACQ_mLockId_imm: mask=0x{:05X}, bits=0x{:05X}",
+                imm.fixed_mask, imm.fixed_bits
+            );
+            eprintln!(
+                "  ACQ_mLockId_reg: mask=0x{:05X}, bits=0x{:05X}",
+                reg.fixed_mask, reg.fixed_bits
+            );
+        } else {
+            // Print what we did find
+            let acq_names: Vec<_> = alu_encodings.iter()
+                .filter(|e| e.name.to_lowercase().contains("acq"))
+                .map(|e| &e.name)
+                .collect();
+            panic!(
+                "Expected both ACQ_mLockId_imm and ACQ_mLockId_reg, found: {:?}",
+                acq_names
+            );
+        }
+    }
+
+    /// Test that implicit registers are correctly parsed from TableGen definitions.
+    ///
+    /// Instructions like SELEQZ use `eR27:$s2` which means r27 is read implicitly,
+    /// not encoded as a field in the instruction bits.
+    #[test]
+    fn test_implicit_register_parsing() {
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found at ../llvm-aie");
+            return;
+        }
+
+        let data = load_from_llvm_aie(llvm_aie_path).unwrap();
+
+        // Find SELEQZ - it should have r27 as an implicit register
+        let seleqz_instrs: Vec<_> = data
+            .instructions
+            .iter()
+            .filter(|(name, _)| name.to_uppercase().contains("SELEQZ"))
+            .collect();
+
+        eprintln!("Found {} SELEQZ instructions", seleqz_instrs.len());
+
+        for (name, instr) in &seleqz_instrs {
+            eprintln!(
+                "{}: inputs={:?}, outputs={:?}, implicit={:?}",
+                name,
+                instr.inputs.iter().map(|o| &o.name).collect::<Vec<_>>(),
+                instr.outputs.iter().map(|o| &o.name).collect::<Vec<_>>(),
+                instr.implicit_regs
+            );
+
+            // Verify r27 is in implicit_regs, not in inputs
+            let has_r27_implicit = instr
+                .implicit_regs
+                .iter()
+                .any(|ir| ir.reg_num == 27 && ir.is_use);
+            let has_r27_explicit = instr.inputs.iter().any(|o| o.name.contains("27"));
+
+            if has_r27_implicit {
+                eprintln!("  -> r27 correctly parsed as implicit use");
+            }
+            if has_r27_explicit {
+                eprintln!("  WARNING: r27 still appears in explicit inputs!");
+            }
+        }
+
+        // Also check SELNEZ instructions
+        let selnez_instrs: Vec<_> = data
+            .instructions
+            .iter()
+            .filter(|(name, _)| name.to_uppercase().contains("SELNEZ"))
+            .collect();
+
+        eprintln!("\nFound {} SELNEZ instructions", selnez_instrs.len());
+
+        for (name, instr) in &selnez_instrs {
+            eprintln!(
+                "{}: inputs={:?}, implicit={:?}",
+                name,
+                instr.inputs.iter().map(|o| &o.name).collect::<Vec<_>>(),
+                instr.implicit_regs
+            );
+        }
+
+        // Count total instructions with implicit registers
+        let with_implicit: Vec<_> = data
+            .instructions
+            .iter()
+            .filter(|(_, i)| !i.implicit_regs.is_empty())
+            .collect();
+
+        eprintln!(
+            "\nTotal instructions with implicit registers: {}",
+            with_implicit.len()
+        );
+
+        // Show some examples
+        for (name, instr) in with_implicit.iter().take(10) {
+            eprintln!(
+                "  {}: {:?}",
+                name,
+                instr.implicit_regs
+            );
+        }
     }
 }
