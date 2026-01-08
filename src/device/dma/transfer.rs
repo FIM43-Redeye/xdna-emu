@@ -37,6 +37,64 @@ use super::addressing::AddressGenerator;
 use super::{BdConfig, DmaError};
 use crate::device::tile::TileType;
 
+/// Lock acquisition mode for DMA transfers.
+///
+/// AIE-ML supports different lock acquisition semantics. The BD encodes
+/// these using a signed integer convention where negative values indicate
+/// "greater-than-or-equal" mode.
+///
+/// # BD Encoding Convention
+///
+/// - `acquire_value > 0`: Equal mode - wait until lock == value, then set to 0
+/// - `acquire_value < 0`: GE mode - wait until lock >= |value|, then decrement
+/// - `acquire_value == 0`: Simple mode - decrement if lock > 0
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockAcquireMode {
+    /// Wait until lock value >= threshold, then decrement by 1.
+    /// Corresponds to negative acquire_value in BD.
+    GreaterEqual(u8),
+    /// Wait until lock value == threshold, then set to 0.
+    /// Corresponds to positive acquire_value in BD.
+    Equal(u8),
+    /// Simple acquire: decrement if lock > 0.
+    /// Corresponds to acquire_value == 0 in BD.
+    Simple,
+}
+
+impl LockAcquireMode {
+    /// Convert from the BD's signed integer convention.
+    ///
+    /// - Negative values -> GreaterEqual mode
+    /// - Positive values -> Equal mode
+    /// - Zero -> Simple mode
+    pub fn from_bd_value(value: i8) -> Self {
+        if value < 0 {
+            LockAcquireMode::GreaterEqual((-value) as u8)
+        } else if value > 0 {
+            LockAcquireMode::Equal(value as u8)
+        } else {
+            LockAcquireMode::Simple
+        }
+    }
+
+    /// Convert back to BD's signed integer convention.
+    pub fn to_bd_value(&self) -> i8 {
+        match self {
+            LockAcquireMode::GreaterEqual(v) => -(*v as i8),
+            LockAcquireMode::Equal(v) => *v as i8,
+            LockAcquireMode::Simple => 0,
+        }
+    }
+
+    /// Get the threshold value for this mode.
+    pub fn threshold(&self) -> u8 {
+        match self {
+            LockAcquireMode::GreaterEqual(v) | LockAcquireMode::Equal(v) => *v,
+            LockAcquireMode::Simple => 1,
+        }
+    }
+}
+
 /// Transfer state in the state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferState {
@@ -118,6 +176,34 @@ pub struct Transfer {
     /// Next BD to chain to (if any)
     pub next_bd: Option<u8>,
 
+    /// Suppress TLAST at end of transfer (MM2S only)
+    /// When true, TLAST is not asserted at the end of this transfer.
+    /// Used for multi-BD transfers that should appear as a single stream.
+    pub tlast_suppress: bool,
+
+    /// Enable packet header insertion (MM2S only)
+    /// When true, a 32-bit packet header is inserted before the data.
+    pub enable_packet: bool,
+
+    /// Packet ID for header (5 bits, MM2S only)
+    /// Maps to Stream_ID field in packet header.
+    pub packet_id: u8,
+
+    /// Packet type for header (3 bits, MM2S only)
+    pub packet_type: u8,
+
+    /// Out-of-order BD ID for header (6 bits, MM2S only)
+    pub out_of_order_bd_id: u8,
+
+    /// Source tile column (for packet header)
+    pub tile_col: u8,
+
+    /// Source tile row (for packet header)
+    pub tile_row: u8,
+
+    /// Whether packet header has been sent (tracking for current transfer)
+    pub packet_header_sent: bool,
+
     /// Bytes transferred so far
     pub bytes_transferred: u64,
 
@@ -150,8 +236,8 @@ impl Transfer {
             return Err(DmaError::BdNotValid(bd_index));
         }
 
-        // Create address generator based on BD dimensions
-        let address_gen = AddressGenerator::new(
+        // Create address generator based on BD dimensions and iteration config
+        let address_gen = AddressGenerator::with_iteration(
             bd_config.base_addr,
             [
                 bd_config.d0,
@@ -159,6 +245,7 @@ impl Transfer {
                 bd_config.d2,
                 bd_config.d3,
             ],
+            bd_config.iteration,
         );
 
         // Determine endpoints based on direction and tile type
@@ -206,6 +293,14 @@ impl Transfer {
             release_lock: bd_config.release_lock,
             release_value: bd_config.release_value,
             next_bd: bd_config.next_bd,
+            tlast_suppress: bd_config.tlast_suppress,
+            enable_packet: bd_config.enable_packet,
+            packet_id: bd_config.packet_id,
+            packet_type: bd_config.packet_type,
+            out_of_order_bd_id: bd_config.out_of_order_bd_id,
+            tile_col,
+            tile_row,
+            packet_header_sent: false,
             bytes_transferred: 0,
             total_bytes: bd_config.length as u64,
             cycles_elapsed: 0,
@@ -237,6 +332,14 @@ impl Transfer {
             release_lock: None,
             release_value: 0,
             next_bd: None,
+            tlast_suppress: false,
+            enable_packet: false,
+            packet_id: 0,
+            packet_type: 0,
+            out_of_order_bd_id: 0,
+            tile_col: source_col,
+            tile_row: source_row,
+            packet_header_sent: false,
             bytes_transferred: 0,
             total_bytes: length as u64,
             cycles_elapsed: 0,
@@ -268,6 +371,14 @@ impl Transfer {
             release_lock: None,
             release_value: 0,
             next_bd: None,
+            tlast_suppress: false,
+            enable_packet: false,
+            packet_id: 0,
+            packet_type: 0,
+            out_of_order_bd_id: 0,
+            tile_col,
+            tile_row,
+            packet_header_sent: false,
             bytes_transferred: 0,
             total_bytes: length as u64,
             cycles_elapsed: 0,
@@ -299,6 +410,14 @@ impl Transfer {
             release_lock: None,
             release_value: 0,
             next_bd: None,
+            tlast_suppress: false,
+            enable_packet: false,
+            packet_id: 0,
+            packet_type: 0,
+            out_of_order_bd_id: 0,
+            tile_col,
+            tile_row,
+            packet_header_sent: false,
             bytes_transferred: 0,
             total_bytes: length as u64,
             cycles_elapsed: 0,
@@ -318,10 +437,28 @@ impl Transfer {
         matches!(self.state, TransferState::Active)
     }
 
+    /// Check if transfer needs processing (timing ticks).
+    ///
+    /// Returns true for states that require the timing state machine to advance:
+    /// - `Active`: Data transfer phase
+    /// - `ReleasingLock`: Lock release phase
+    #[inline]
+    pub fn needs_processing(&self) -> bool {
+        matches!(self.state, TransferState::Active | TransferState::ReleasingLock(_))
+    }
+
     /// Check if transfer is waiting for a lock.
     #[inline]
     pub fn is_waiting_for_lock(&self) -> bool {
         matches!(self.state, TransferState::WaitingForLock(_))
+    }
+
+    /// Get the lock acquisition mode, if a lock is configured.
+    ///
+    /// Returns `None` if no acquire lock is configured, otherwise returns
+    /// the [`LockAcquireMode`] based on the BD's `acquire_value` convention.
+    pub fn acquire_mode(&self) -> Option<LockAcquireMode> {
+        self.acquire_lock.map(|_| LockAcquireMode::from_bd_value(self.acquire_value))
     }
 
     /// Check if transfer has an error.
@@ -362,8 +499,12 @@ impl Transfer {
     pub fn data_transferred(&mut self, bytes: u64) {
         self.bytes_transferred += bytes;
 
-        // Advance address generator
-        for _ in 0..(bytes as usize) {
+        // Advance address generator once per 32-bit word transferred
+        // AIE-ML DMA works in word units: the address generator has total_elements
+        // equal to length_words, not length_bytes. Each advance produces the next
+        // word address based on the BD's stride configuration.
+        let words = (bytes / 4) as usize;
+        for _ in 0..words {
             if self.address_gen.next().is_none() {
                 break;
             }
@@ -397,6 +538,98 @@ impl Transfer {
     pub fn tick(&mut self) {
         self.cycles_elapsed += 1;
     }
+
+    /// Generate packet header word for MM2S packet-switched streams.
+    ///
+    /// Packet header format (AM025):
+    /// - Bit 31: Odd parity over bits 30:0
+    /// - Bits 30:28: 3'b000
+    /// - Bits 27:25: Source Column (3 bits)
+    /// - Bits 24:22: Source Row (3 bits)
+    /// - Bit 21: 1'b0
+    /// - Bits 20:18: Packet_Type (from BD, 3 bits)
+    /// - Bits 17:11: 7'b0000000
+    /// - Bits 10:5: Stream_ID/Packet_ID (from BD, 6 bits - note: BD has 5 bits, MSB is 0)
+    /// - Bits 4:0: Reserved 5'b00000
+    ///
+    /// Returns None if packet mode is disabled.
+    pub fn generate_packet_header(&self) -> Option<u32> {
+        if !self.enable_packet {
+            return None;
+        }
+
+        let mut header: u32 = 0;
+
+        // Bits 27:25: Source Column (3 bits)
+        header |= ((self.tile_col as u32) & 0x7) << 25;
+
+        // Bits 24:22: Source Row (3 bits)
+        header |= ((self.tile_row as u32) & 0x7) << 22;
+
+        // Bit 21: 0
+
+        // Bits 20:18: Packet_Type (3 bits)
+        header |= ((self.packet_type as u32) & 0x7) << 18;
+
+        // Bits 17:12: Out_Of_Order_BD_ID (6 bits, for S2MM to select BD in OOO mode)
+        // This is placed in the upper reserved bits for OOO identification
+        header |= ((self.out_of_order_bd_id as u32) & 0x3F) << 12;
+
+        // Bits 10:5: Stream_ID (6 bits, from packet_id which is 5 bits)
+        header |= ((self.packet_id as u32) & 0x3F) << 5;
+
+        // Bits 4:0: Reserved
+
+        // Bit 31: Odd parity over bits 30:0
+        let ones = (header & 0x7FFF_FFFF).count_ones();
+        if ones % 2 == 0 {
+            // Even number of ones - set parity bit to make it odd
+            header |= 1 << 31;
+        }
+
+        Some(header)
+    }
+
+    /// Mark packet header as sent.
+    pub fn mark_packet_header_sent(&mut self) {
+        self.packet_header_sent = true;
+    }
+
+    /// Check if packet header needs to be sent.
+    pub fn needs_packet_header(&self) -> bool {
+        self.enable_packet && !self.packet_header_sent
+    }
+}
+
+/// Parse an out-of-order BD ID from a packet header.
+///
+/// The OOO BD ID is stored in bits 17:12 of the packet header.
+/// Returns the 6-bit BD ID that S2MM should use in out-of-order mode.
+pub fn parse_ooo_bd_id_from_header(header: u32) -> u8 {
+    ((header >> 12) & 0x3F) as u8
+}
+
+/// Parse source tile coordinates from a packet header.
+///
+/// Returns (col, row) extracted from header bits 27:25 and 24:22.
+pub fn parse_source_tile_from_header(header: u32) -> (u8, u8) {
+    let col = ((header >> 25) & 0x7) as u8;
+    let row = ((header >> 22) & 0x7) as u8;
+    (col, row)
+}
+
+/// Parse packet type from a packet header.
+///
+/// Returns the 3-bit packet type from bits 20:18.
+pub fn parse_packet_type_from_header(header: u32) -> u8 {
+    ((header >> 18) & 0x7) as u8
+}
+
+/// Parse stream/packet ID from a packet header.
+///
+/// Returns the 6-bit stream ID from bits 10:5.
+pub fn parse_stream_id_from_header(header: u32) -> u8 {
+    ((header >> 5) & 0x3F) as u8
 }
 
 #[cfg(test)]
@@ -546,5 +779,122 @@ mod tests {
         let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
 
         assert_eq!(transfer.next_bd, Some(3));
+    }
+
+    #[test]
+    fn test_packet_header_disabled_by_default() {
+        let bd = simple_bd();
+        let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
+
+        assert!(!transfer.enable_packet);
+        assert!(!transfer.needs_packet_header());
+        assert!(transfer.generate_packet_header().is_none());
+    }
+
+    #[test]
+    fn test_packet_header_generation() {
+        let mut bd = simple_bd();
+        bd.enable_packet = true;
+        bd.packet_id = 0x1F;     // 5-bit value, max
+        bd.packet_type = 0x5;    // 3-bit value
+
+        // Create transfer at tile (3, 5)
+        let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 3, 5, TileType::Compute).unwrap();
+
+        assert!(transfer.needs_packet_header());
+
+        let header = transfer.generate_packet_header().unwrap();
+
+        // Verify header format per AM025:
+        // Bits 27:25 = Source Column (3) = 0b011
+        // Bits 24:22 = Source Row (5)    = 0b101
+        // Bits 20:18 = Packet_Type (5)   = 0b101
+        // Bits 10:5  = Stream_ID (0x1F)  = 0b011111
+
+        // Check source column (bits 27:25)
+        let col = (header >> 25) & 0x7;
+        assert_eq!(col, 3, "Source column should be 3");
+
+        // Check source row (bits 24:22)
+        let row = (header >> 22) & 0x7;
+        assert_eq!(row, 5, "Source row should be 5");
+
+        // Check packet type (bits 20:18)
+        let pkt_type = (header >> 18) & 0x7;
+        assert_eq!(pkt_type, 5, "Packet type should be 5");
+
+        // Check stream ID (bits 10:5)
+        let stream_id = (header >> 5) & 0x3F;
+        assert_eq!(stream_id, 0x1F, "Stream ID should be 0x1F");
+
+        // Verify odd parity
+        let ones = header.count_ones();
+        assert_eq!(ones % 2, 1, "Parity should be odd, got {} ones", ones);
+    }
+
+    #[test]
+    fn test_packet_header_sent_tracking() {
+        let mut bd = simple_bd();
+        bd.enable_packet = true;
+        bd.packet_id = 0x10;
+
+        let mut transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
+
+        // Initially needs header
+        assert!(transfer.needs_packet_header());
+        assert!(!transfer.packet_header_sent);
+
+        // Mark as sent
+        transfer.mark_packet_header_sent();
+
+        // No longer needs header
+        assert!(!transfer.needs_packet_header());
+        assert!(transfer.packet_header_sent);
+    }
+
+    #[test]
+    fn test_lock_acquire_mode_conversion() {
+        // Positive values -> Equal mode
+        assert_eq!(LockAcquireMode::from_bd_value(1), LockAcquireMode::Equal(1));
+        assert_eq!(LockAcquireMode::from_bd_value(5), LockAcquireMode::Equal(5));
+
+        // Negative values -> GreaterEqual mode
+        assert_eq!(LockAcquireMode::from_bd_value(-1), LockAcquireMode::GreaterEqual(1));
+        assert_eq!(LockAcquireMode::from_bd_value(-5), LockAcquireMode::GreaterEqual(5));
+
+        // Zero -> Simple mode
+        assert_eq!(LockAcquireMode::from_bd_value(0), LockAcquireMode::Simple);
+
+        // Round-trip conversion
+        assert_eq!(LockAcquireMode::Equal(3).to_bd_value(), 3);
+        assert_eq!(LockAcquireMode::GreaterEqual(3).to_bd_value(), -3);
+        assert_eq!(LockAcquireMode::Simple.to_bd_value(), 0);
+
+        // Threshold values
+        assert_eq!(LockAcquireMode::Equal(5).threshold(), 5);
+        assert_eq!(LockAcquireMode::GreaterEqual(7).threshold(), 7);
+        assert_eq!(LockAcquireMode::Simple.threshold(), 1);
+    }
+
+    #[test]
+    fn test_transfer_acquire_mode() {
+        // Transfer without lock
+        let bd = simple_bd();
+        let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
+        assert!(transfer.acquire_mode().is_none());
+
+        // Transfer with lock in Equal mode
+        let mut bd_locked = simple_bd();
+        bd_locked.acquire_lock = Some(5);
+        bd_locked.acquire_value = 1;
+        let transfer_locked = Transfer::new(&bd_locked, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
+        assert_eq!(transfer_locked.acquire_mode(), Some(LockAcquireMode::Equal(1)));
+
+        // Transfer with lock in GE mode
+        let mut bd_ge = simple_bd();
+        bd_ge.acquire_lock = Some(5);
+        bd_ge.acquire_value = -2;
+        let transfer_ge = Transfer::new(&bd_ge, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
+        assert_eq!(transfer_ge.acquire_mode(), Some(LockAcquireMode::GreaterEqual(2)));
     }
 }

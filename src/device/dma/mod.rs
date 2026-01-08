@@ -64,10 +64,11 @@ pub mod addressing;
 pub mod transfer;
 pub mod engine;
 pub mod timing;
+pub mod compression;
 
-pub use addressing::{AddressGenerator, DimensionConfig, AddressIterator};
-pub use transfer::{Transfer, TransferState, TransferDirection, TransferEndpoint};
-pub use engine::{DmaEngine, ChannelState, ChannelId, StreamData};
+pub use addressing::{AddressGenerator, DimensionConfig, AddressIterator, IterationConfig};
+pub use transfer::{Transfer, TransferState, TransferDirection, TransferEndpoint, parse_ooo_bd_id_from_header, parse_source_tile_from_header};
+pub use engine::{DmaEngine, ChannelState, ChannelId, StreamData, TaskCompleteToken, ChannelTaskConfig, TaskQueueEntry, MAX_TASK_QUEUE_DEPTH};
 pub use timing::{DmaTimingConfig, ChannelTimingState, TransferPhase, ChannelArbiter};
 
 use super::aie2_spec;
@@ -101,12 +102,29 @@ pub const DMA_DATA_WIDTH_BYTES: usize = DMA_DATA_WIDTH_BITS / 8;
 ///
 /// This is a user-friendly representation of a BD. The actual hardware
 /// BD format is more compact and uses packed fields.
+///
+/// # Unit Conventions
+///
+/// This struct uses **byte units** throughout for programmer convenience.
+/// The hardware BD format (AM025) uses **word units** (32-bit words) for
+/// addresses and strides. Conversion happens at BD parsing/serialization:
+///
+/// | Field | BdConfig Unit | Hardware Unit | Conversion |
+/// |-------|---------------|---------------|------------|
+/// | `base_addr` | bytes | words | ÷4 to hardware |
+/// | `length` | bytes | words | ÷4 to hardware |
+/// | `d0-d3.stride` | bytes | words | ÷4 to hardware |
+/// | `iteration.stepsize` | words (raw) | words | no conversion |
+///
+/// See `state.rs` for BD parsing which performs word→byte conversion.
 #[derive(Debug, Clone, Default)]
 pub struct BdConfig {
-    /// Base address (32-bit for tile memory, 64-bit for host/DDR)
+    /// Base address in bytes (32-bit for tile memory, 64-bit for host/DDR).
+    /// Hardware stores this as a 32-bit word address.
     pub base_addr: u64,
 
-    /// Transfer length in bytes
+    /// Transfer length in bytes.
+    /// Hardware stores this as word count.
     pub length: u32,
 
     /// Dimension 0 configuration (innermost loop)
@@ -121,11 +139,31 @@ pub struct BdConfig {
     /// Dimension 3 configuration (outermost loop) - AIE2P only
     pub d3: DimensionConfig,
 
-    /// Enable compression
+    /// Iteration configuration (repeat with offset)
+    pub iteration: IterationConfig,
+
+    /// Enable compression (MM2S only)
     pub compression_enable: bool,
 
-    /// Enable out-of-order execution
+    /// Enable packet header insertion (MM2S only)
+    pub enable_packet: bool,
+
+    /// Packet ID for header (5 bits, MM2S only)
+    pub packet_id: u8,
+
+    /// Packet type for header (3 bits, MM2S only)
+    pub packet_type: u8,
+
+    /// Out-of-order BD ID (6 bits, MM2S only)
+    pub out_of_order_bd_id: u8,
+
+    /// Enable out-of-order execution (S2MM only)
     pub out_of_order: bool,
+
+    /// Suppress TLAST at end of transfer (MM2S only)
+    /// When true, TLAST is not asserted at the end of this BD's transfer.
+    /// Used for multi-BD transfers that should appear as a single stream.
+    pub tlast_suppress: bool,
 
     /// Lock to acquire before transfer
     pub acquire_lock: Option<u8>,
@@ -150,30 +188,36 @@ impl BdConfig {
     /// Create a simple 1D contiguous transfer BD.
     ///
     /// Configures d0 for a linear transfer: `length` bytes starting at `base_addr`.
+    /// AIE-ML DMA works in 32-bit word units, so the address generator advances
+    /// once per word (4 bytes) with a stride of 4 bytes.
     pub fn simple_1d(base_addr: u64, length: u32) -> Self {
         Self {
             base_addr,
             length,
-            // For 1D contiguous: d0.size = length bytes, d0.stride = 1 byte
-            d0: DimensionConfig::new(length, 1),
+            // For 1D contiguous: d0.size = words, d0.stride = 4 bytes per word
+            // This matches how real BD configuration works (word-level addressing)
+            d0: DimensionConfig::new(length / 4, 4),
             valid: true,
             ..Default::default()
         }
     }
 
     /// Create a 2D transfer BD.
+    ///
+    /// Width and stride should account for the 4-byte word granularity.
     pub fn transfer_2d(
         base_addr: u64,
-        width: u32,      // Bytes per row
+        width: u32,      // Bytes per row (must be multiple of 4)
         height: u32,     // Number of rows
         stride: i32,     // Bytes between row starts
     ) -> Self {
         Self {
             base_addr,
             length: width * height,
+            // D0: words per row, 4-byte stride for contiguous elements
             d0: DimensionConfig {
-                size: width,
-                stride: 1,
+                size: width / 4,  // Convert bytes to words
+                stride: 4,        // 4 bytes per word
             },
             d1: DimensionConfig {
                 size: height,
@@ -262,6 +306,46 @@ pub enum DmaError {
     AddressOutOfBounds { address: u64, limit: u64 },
     /// Channel already active
     ChannelBusy(u8),
+    /// Memory transfer address wraps past end of memory
+    AddressWrap { offset: u64, bytes: usize, memory_size: usize },
+    /// Stream input buffer full, data was dropped
+    StreamBufferFull { channel: u8 },
+    /// S2MM channel stalled waiting for stream data
+    StreamStall { channel: u8, address: u64 },
+}
+
+/// Result of a single DMA transfer step (internal use).
+///
+/// This provides more detail than [`DmaResult`] for tracking step-level
+/// success/failure and error conditions.
+#[derive(Debug, Clone)]
+pub struct StepResult {
+    /// Whether the step succeeded
+    pub success: bool,
+    /// Number of bytes moved in this step
+    pub bytes_moved: usize,
+    /// Error details if step failed
+    pub error: Option<DmaError>,
+    /// First-of-transfer finish signal (TLAST received in FoT mode)
+    pub fot_finish: bool,
+}
+
+impl StepResult {
+    /// Create a successful step result.
+    pub fn success(bytes: usize) -> Self {
+        Self { success: true, bytes_moved: bytes, error: None, fot_finish: false }
+    }
+
+    /// Mark this result as triggering FoT finish.
+    pub fn with_fot(mut self) -> Self {
+        self.fot_finish = true;
+        self
+    }
+
+    /// Create an error step result.
+    pub fn error(e: DmaError) -> Self {
+        Self { success: false, bytes_moved: 0, error: Some(e), fot_finish: false }
+    }
 }
 
 impl std::fmt::Display for DmaError {
@@ -274,6 +358,16 @@ impl std::fmt::Display for DmaError {
                 write!(f, "Address 0x{:08x} out of bounds (limit: 0x{:08x})", address, limit)
             }
             Self::ChannelBusy(ch) => write!(f, "Channel {} is already active", ch),
+            Self::AddressWrap { offset, bytes, memory_size } => {
+                write!(f, "Address 0x{:08x} + {} bytes wraps past memory end (size: 0x{:x})",
+                    offset, bytes, memory_size)
+            }
+            Self::StreamBufferFull { channel } => {
+                write!(f, "Stream input buffer full, ch{} data dropped", channel)
+            }
+            Self::StreamStall { channel, address } => {
+                write!(f, "S2MM ch{} stalled at 0x{:08x} waiting for stream data", channel, address)
+            }
         }
     }
 }
@@ -298,7 +392,9 @@ mod tests {
         let bd = BdConfig::transfer_2d(0x2000, 64, 8, 128);
         assert_eq!(bd.base_addr, 0x2000);
         assert_eq!(bd.length, 512); // 64 * 8
-        assert_eq!(bd.d0.size, 64);
+        // d0.size is in words (64 bytes / 4 = 16 words per row)
+        assert_eq!(bd.d0.size, 16);
+        assert_eq!(bd.d0.stride, 4); // 4 bytes per word
         assert_eq!(bd.d1.size, 8);
         assert_eq!(bd.d1.stride, 128);
     }

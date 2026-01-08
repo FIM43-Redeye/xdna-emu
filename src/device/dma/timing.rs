@@ -73,19 +73,6 @@ impl DmaTimingConfig {
         }
     }
 
-    /// Create instant timing (no delays) for fast simulation.
-    pub fn instant() -> Self {
-        Self {
-            bd_setup_cycles: 0,
-            channel_start_cycles: 0,
-            words_per_cycle: 255, // Max throughput
-            memory_latency_cycles: 0,
-            lock_acquire_cycles: 0,
-            lock_release_cycles: 0,
-            bd_chain_cycles: 0,
-        }
-    }
-
     /// Calculate total cycles for a transfer of given size.
     pub fn transfer_cycles(&self, bytes: u64, has_acquire_lock: bool, has_release_lock: bool) -> u64 {
         let words = (bytes + 3) / 4; // Round up to words
@@ -400,13 +387,6 @@ mod tests {
     }
 
     #[test]
-    fn test_timing_config_instant() {
-        let config = DmaTimingConfig::instant();
-        assert_eq!(config.bd_setup_cycles, 0);
-        assert_eq!(config.memory_latency_cycles, 0);
-    }
-
-    #[test]
     fn test_transfer_cycles_simple() {
         let config = DmaTimingConfig::default();
 
@@ -520,10 +500,9 @@ mod tests {
         let config = DmaTimingConfig::default();
         let mut state = ChannelTimingState::new_transfer(4, &config);
 
-        // Complete a transfer quickly using instant config
-        let instant = DmaTimingConfig::instant();
+        // Complete a transfer through all phases
         while !state.is_complete() {
-            state.tick(&instant, false, true);
+            state.tick(&config, false, true);
         }
 
         // Start chaining

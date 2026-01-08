@@ -58,13 +58,80 @@ impl DimensionConfig {
     }
 }
 
-/// Multi-dimensional address generator.
+/// Configuration for iteration mode (BD repeat with offset).
 ///
-/// Generates a sequence of addresses based on up to 4 dimensions.
-/// Dimensions are processed from innermost (D0) to outermost (D3).
+/// Iteration mode allows a BD to be repeated multiple times, with an
+/// address offset applied between each repetition. This is separate from
+/// dimensional addressing and is used for patterns like sliding windows.
+///
+/// # AM025 Format (Word 4)
+///
+/// - `current` (bits 24:19): Current iteration step (read-only during transfer)
+/// - `wrap` (bits 18:13): Wrap count (actual repetitions - 1)
+/// - `stepsize` (bits 12:0): Per-iteration offset (actual - 1, in words)
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IterationConfig {
+    /// Current iteration step (0 to wrap)
+    pub current: u8,
+
+    /// Wrap count (number of repetitions - 1, 0 = single iteration)
+    pub wrap: u8,
+
+    /// Per-iteration address offset in words (actual - 1)
+    /// The actual offset = (stepsize + 1) * 4 bytes
+    pub stepsize: u16,
+}
+
+impl IterationConfig {
+    /// Create a new iteration config.
+    ///
+    /// # Arguments
+    /// * `wrap` - Number of repetitions - 1 (0 = single iteration)
+    /// * `stepsize` - Address offset per iteration in words (actual - 1)
+    pub fn new(wrap: u8, stepsize: u16) -> Self {
+        Self { current: 0, wrap, stepsize }
+    }
+
+    /// Check if iteration is enabled (more than one repetition)
+    #[inline]
+    pub fn is_enabled(&self) -> bool {
+        self.wrap > 0
+    }
+
+    /// Get the actual stepsize in bytes.
+    #[inline]
+    pub fn stepsize_bytes(&self) -> i32 {
+        ((self.stepsize as i32) + 1) * 4
+    }
+
+    /// Get total number of iterations.
+    #[inline]
+    pub fn total_iterations(&self) -> u8 {
+        self.wrap.saturating_add(1)
+    }
+}
+
+/// Multi-dimensional address generator with iteration support.
+///
+/// Generates a sequence of addresses based on up to 4 dimensions plus iteration.
+/// Dimensions are processed from innermost (D0) to outermost (D3), with iteration
+/// as an outermost loop that adds an offset and repeats the entire dimensional pattern.
 ///
 /// The address is computed as:
-/// `base + d0_counter * d0_stride + d1_counter * d1_stride + ...`
+/// `base + iteration_counter * iteration_stride + d0_counter * d0_stride + ...`
+///
+/// # Iteration Mode
+///
+/// Iteration is an AIE-ML feature that repeats the dimensional pattern with a
+/// per-iteration address offset. This enables patterns like sliding windows:
+///
+/// ```text
+/// With d0_size=4, d1_size=2, iteration_wrap=2, iteration_stepsize=8:
+///
+/// Iteration 0: [0,4,8,12, 16,20,24,28]
+/// Iteration 1: [32,36,40,44, 48,52,56,60]  (base + 32)
+/// Iteration 2: [64,68,72,76, 80,84,88,92]  (base + 64)
+/// ```
 #[derive(Debug, Clone)]
 pub struct AddressGenerator {
     /// Base address
@@ -76,7 +143,13 @@ pub struct AddressGenerator {
     /// Current position in each dimension
     counters: [u32; 4],
 
-    /// Total elements to generate
+    /// Iteration configuration (outermost loop)
+    iteration: IterationConfig,
+
+    /// Current iteration step
+    iteration_counter: u8,
+
+    /// Total elements to generate (including all iterations)
     total_elements: u64,
 
     /// Elements generated so far
@@ -131,26 +204,48 @@ impl AddressGenerator {
         ])
     }
 
-    /// Create a new address generator with custom dimensions.
+    /// Create a new address generator with custom dimensions (no iteration).
     pub fn new(base: u64, dimensions: [DimensionConfig; 4]) -> Self {
-        let total_elements = dimensions.iter()
+        Self::with_iteration(base, dimensions, IterationConfig::default())
+    }
+
+    /// Create a new address generator with dimensions and iteration.
+    ///
+    /// Iteration acts as an outermost loop: the dimensional pattern is repeated
+    /// `iteration.wrap + 1` times, with `iteration.stepsize_bytes()` added to
+    /// the base address each iteration.
+    pub fn with_iteration(
+        base: u64,
+        dimensions: [DimensionConfig; 4],
+        iteration: IterationConfig,
+    ) -> Self {
+        let elements_per_iteration: u64 = dimensions.iter()
             .map(|d| d.effective_size() as u64)
             .product();
+
+        let iteration_count = iteration.total_iterations() as u64;
+        let total_elements = elements_per_iteration * iteration_count;
 
         Self {
             base,
             dimensions,
             counters: [0; 4],
+            iteration,
+            iteration_counter: 0,
             total_elements,
             elements_generated: 0,
             finished: total_elements == 0,
         }
     }
 
-    /// Compute the current address from counters.
+    /// Compute the current address from counters and iteration.
     fn compute_address(&self) -> u64 {
         let mut addr = self.base as i64;
 
+        // Add iteration offset
+        addr += (self.iteration_counter as i64) * (self.iteration.stepsize_bytes() as i64);
+
+        // Add dimension offsets
         for dim in 0..4 {
             addr += (self.counters[dim] as i64) * (self.dimensions[dim].stride as i64);
         }
@@ -217,18 +312,26 @@ impl AddressGenerator {
 
             // This dimension wrapped, reset counter and continue to next dimension
             self.counters[dim] = 0;
+        }
 
-            // If we wrapped the outermost active dimension, we're done
-            if dim == 3 || self.dimensions[dim + 1].effective_size() == 1 {
+        // All dimensions wrapped - advance iteration counter
+        if self.iteration.is_enabled() {
+            self.iteration_counter += 1;
+            if self.iteration_counter > self.iteration.wrap {
+                // All iterations complete
                 self.finished = true;
-                return;
             }
+            // Dimension counters already reset to 0 above
+        } else {
+            // No iteration mode, we're done
+            self.finished = true;
         }
     }
 
     /// Reset to the beginning.
     pub fn reset(&mut self) {
         self.counters = [0; 4];
+        self.iteration_counter = 0;
         self.elements_generated = 0;
         self.finished = self.total_elements == 0;
     }
@@ -428,5 +531,124 @@ mod tests {
             0x1008, 0x1018,  // Column 2: [0,2], [1,2]
             0x100C, 0x101C,  // Column 3: [0,3], [1,3]
         ]);
+    }
+
+    #[test]
+    fn test_iteration_mode_simple() {
+        // 1D transfer with 3 iterations
+        // d0: 2 elements, stride 4
+        // iteration: wrap=2 (3 iterations), stepsize=1 (offset = 8 bytes per iteration)
+        let gen = AddressGenerator::with_iteration(
+            0x1000,
+            [
+                DimensionConfig::new(2, 4),  // 2 elements, 4-byte stride
+                DimensionConfig::default(),
+                DimensionConfig::default(),
+                DimensionConfig::default(),
+            ],
+            IterationConfig::new(2, 1),  // wrap=2 (3 iterations), stepsize=1 (actual=2 words=8 bytes)
+        );
+        let addrs: Vec<u64> = gen.iter().collect();
+
+        assert_eq!(addrs, vec![
+            // Iteration 0: base + 0
+            0x1000, 0x1004,
+            // Iteration 1: base + 8
+            0x1008, 0x100C,
+            // Iteration 2: base + 16
+            0x1010, 0x1014,
+        ]);
+        assert_eq!(addrs.len(), 6);  // 2 elements * 3 iterations
+    }
+
+    #[test]
+    fn test_iteration_mode_2d() {
+        // 2D transfer with 2 iterations (sliding window pattern)
+        // d0: 2 elements (row), stride 4
+        // d1: 2 rows, stride 16
+        // iteration: wrap=1 (2 iterations), stepsize=3 (offset = 16 bytes per iteration)
+        let gen = AddressGenerator::with_iteration(
+            0x1000,
+            [
+                DimensionConfig::new(2, 4),   // 2 elements per row
+                DimensionConfig::new(2, 16),  // 2 rows
+                DimensionConfig::default(),
+                DimensionConfig::default(),
+            ],
+            IterationConfig::new(1, 3),  // wrap=1 (2 iterations), stepsize=3 (actual=4 words=16 bytes)
+        );
+        let addrs: Vec<u64> = gen.iter().collect();
+
+        assert_eq!(addrs, vec![
+            // Iteration 0: base + 0
+            0x1000, 0x1004,  // Row 0
+            0x1010, 0x1014,  // Row 1
+            // Iteration 1: base + 16
+            0x1010, 0x1014,  // Row 0 (offset by 16)
+            0x1020, 0x1024,  // Row 1 (offset by 16)
+        ]);
+        assert_eq!(addrs.len(), 8);  // 4 elements * 2 iterations
+    }
+
+    #[test]
+    fn test_iteration_disabled() {
+        // wrap=0 means single iteration (no repeat)
+        let gen = AddressGenerator::with_iteration(
+            0x1000,
+            [
+                DimensionConfig::new(4, 4),
+                DimensionConfig::default(),
+                DimensionConfig::default(),
+                DimensionConfig::default(),
+            ],
+            IterationConfig::new(0, 10),  // wrap=0 (1 iteration), stepsize doesn't matter
+        );
+        let addrs: Vec<u64> = gen.iter().collect();
+
+        assert_eq!(addrs, vec![0x1000, 0x1004, 0x1008, 0x100C]);
+        assert_eq!(addrs.len(), 4);  // No iteration repeat
+    }
+
+    #[test]
+    fn test_iteration_total_elements() {
+        // Verify total_elements includes iterations
+        let gen = AddressGenerator::with_iteration(
+            0x1000,
+            [
+                DimensionConfig::new(3, 4),   // 3 elements
+                DimensionConfig::new(2, 12),  // 2 rows
+                DimensionConfig::default(),
+                DimensionConfig::default(),
+            ],
+            IterationConfig::new(3, 0),  // wrap=3 (4 iterations)
+        );
+
+        // 3 * 2 * 4 = 24 elements
+        assert_eq!(gen.total_elements(), 24);
+    }
+
+    #[test]
+    fn test_iteration_reset() {
+        let mut gen = AddressGenerator::with_iteration(
+            0x1000,
+            [
+                DimensionConfig::new(2, 4),
+                DimensionConfig::default(),
+                DimensionConfig::default(),
+                DimensionConfig::default(),
+            ],
+            IterationConfig::new(1, 1),  // 2 iterations
+        );
+
+        // Consume some elements
+        gen.next();
+        gen.next();
+        gen.next();
+        assert_eq!(gen.remaining(), 1);
+
+        // Reset
+        gen.reset();
+        assert_eq!(gen.remaining(), 4);  // 2 elements * 2 iterations
+        assert_eq!(gen.current(), 0x1000);
     }
 }
