@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 
-use super::types::{EncodingPart, FormatClass, InstrDef, SemanticOp, SlotDef, TableGenData};
+use super::types::{EncodingPart, FormatClass, ImplicitReg, InstrDef, MixinClass, SemanticOp, SlotDef, TableGenData};
 
 /// A resolved operand field within an instruction encoding.
 ///
@@ -122,6 +122,24 @@ pub struct InstrEncoding {
 
     /// Whether this instruction may store to memory
     pub may_store: bool,
+
+    /// Input operand order from TableGen InstrDef.inputs.
+    ///
+    /// This is the canonical order for source operands. When building SlotOp,
+    /// sources should be ordered according to this list, not field extraction order.
+    /// Empty if InstrDef was not available.
+    pub input_order: Vec<String>,
+
+    /// Output operand order from TableGen InstrDef.outputs.
+    ///
+    /// For instructions with multiple outputs (rare), this defines their order.
+    pub output_order: Vec<String>,
+
+    /// Implicit register uses/defs from TableGen.
+    ///
+    /// For example, `sel.eqz` reads r27 implicitly (via `eR27:$s2` in TableGen).
+    /// These registers are not encoded in instruction bits - they're fixed.
+    pub implicit_regs: Vec<ImplicitReg>,
 }
 
 impl InstrEncoding {
@@ -189,6 +207,48 @@ impl<'a> Resolver<'a> {
         Self { data }
     }
 
+    /// Merge field_sources from format class and all mixin classes.
+    ///
+    /// Mixin classes provide field mappings like `let mLockId = {id, 0b0}` that
+    /// map encoding fields to DAG operand names. This function collects all
+    /// such mappings from:
+    /// 1. The format class itself
+    /// 2. Each mixin class used by the instruction
+    /// 3. Parent classes of the mixin classes (inheritance chain)
+    fn merge_field_sources(
+        &self,
+        format: &FormatClass,
+        instr: &InstrDef,
+    ) -> HashMap<String, Vec<String>> {
+        let mut merged = format.field_sources.clone();
+
+        // Helper to collect field_sources from a mixin and its parent chain
+        fn collect_mixin_sources(
+            mixins: &HashMap<String, MixinClass>,
+            mixin_name: &str,
+            merged: &mut HashMap<String, Vec<String>>,
+        ) {
+            if let Some(mixin) = mixins.get(mixin_name) {
+                // First collect from parent if present (parent sources are lower priority)
+                if let Some(ref parent_name) = mixin.parent {
+                    collect_mixin_sources(mixins, parent_name, merged);
+                }
+
+                // Then collect from this mixin (overrides parent)
+                for (field, sources) in &mixin.field_sources {
+                    merged.insert(field.clone(), sources.clone());
+                }
+            }
+        }
+
+        // Collect from each mixin class used by this instruction
+        for mixin_name in &instr.mixin_classes {
+            collect_mixin_sources(&self.data.mixins, mixin_name, &mut merged);
+        }
+
+        merged
+    }
+
     /// Resolve a single instruction definition to its encoding.
     pub fn resolve_instruction(&self, instr: &InstrDef) -> Result<InstrEncoding, ResolveError> {
         // Find the format class
@@ -218,13 +278,28 @@ impl<'a> Resolver<'a> {
             field_widths.insert(param.name.clone(), param.bits);
         }
 
-        // Process encoding parts to compute masks and fields
-        let (fixed_mask, fixed_bits, operand_fields) =
-            self.process_encoding(&format.encoding, &field_widths, &template_values)?;
+        // Build merged field_sources from format class and all mixin classes
+        // This is critical for mapping encoding fields (e.g., mLockId) to DAG operands (e.g., id)
+        let merged_field_sources = self.merge_field_sources(format, instr);
 
-        // Look up semantic operation
+        // Process encoding parts to compute masks and fields
+        // Pass merged field_sources to trace derived fields back to source operands
+        let (fixed_mask, fixed_bits, operand_fields) =
+            self.process_encoding(
+                &format.encoding,
+                &field_widths,
+                &template_values,
+                &merged_field_sources,
+            )?;
+
+        // Look up semantic operation from pattern, or infer from mnemonic
         let semantic = self.data.semantic_for_instruction(&instr.name)
-            .map(|p| p.operation);
+            .map(|p| p.operation)
+            .or_else(|| infer_semantic_from_mnemonic(&instr.mnemonic));
+
+        // Extract operand ordering from InstrDef
+        let input_order: Vec<String> = instr.inputs.iter().map(|o| o.name.clone()).collect();
+        let output_order: Vec<String> = instr.outputs.iter().map(|o| o.name.clone()).collect();
 
         Ok(InstrEncoding {
             name: instr.name.clone(),
@@ -237,6 +312,9 @@ impl<'a> Resolver<'a> {
             semantic,
             may_load: instr.attributes.may_load,
             may_store: instr.attributes.may_store,
+            input_order,
+            output_order,
+            implicit_regs: instr.implicit_regs.clone(),
         })
     }
 
@@ -295,11 +373,17 @@ impl<'a> Resolver<'a> {
     /// Process encoding parts to compute fixed mask, fixed bits, and operand fields.
     ///
     /// Encoding parts are in MSB-first order, so we process from highest bit down.
+    ///
+    /// The `field_sources` map traces derived fields back to their source operands.
+    /// For example, if `let mLockId = {id, 0b0}` was parsed, then
+    /// `field_sources["mLockId"] = ["id"]`. When we encounter `mLockId` in the encoding,
+    /// we create an OperandField named `id` (the source) instead of `mLockId` (the derived).
     fn process_encoding(
         &self,
         parts: &[EncodingPart],
         field_widths: &HashMap<String, u8>,
         template_values: &HashMap<String, u64>,
+        field_sources: &HashMap<String, Vec<String>>,
     ) -> Result<(u64, u64, Vec<OperandField>), ResolveError> {
         // First, compute total width
         let mut total_width: u8 = 0;
@@ -355,15 +439,24 @@ impl<'a> Resolver<'a> {
                             field_widths.get(name).copied().unwrap_or(0)
                         };
 
+                        // Trace derived fields to their source operands
+                        // If `let mLockId = {id, 0b0}` was parsed, use "id" instead of "mLockId"
+                        let operand_name = if let Some(sources) = field_sources.get(name.as_str()) {
+                            // Use the first source operand name (there's usually just one)
+                            sources.first().map(|s| s.as_str()).unwrap_or(name.as_str())
+                        } else {
+                            name.as_str()
+                        };
+
                         // Check if we should merge with existing field of same name
                         // (for split fields like immediate{10-6} and immediate{5-0})
-                        if let Some(existing) = operand_fields.iter_mut().find(|f| f.name == *name) {
+                        if let Some(existing) = operand_fields.iter_mut().find(|f| f.name == operand_name) {
                             // For now, just note that this is a split field
                             // Full handling would track all slices
                             // We'll use the first (MSB) slice's position
                             existing.width = existing.width.saturating_add(w);
                         } else {
-                            operand_fields.push(OperandField::new(name, bit_pos, w));
+                            operand_fields.push(OperandField::new(operand_name, bit_pos, w));
                         }
                     }
                 }
@@ -603,6 +696,185 @@ impl DecoderIndex {
     }
 }
 
+/// Infer semantic operation from instruction mnemonic.
+///
+/// This is a fallback for instructions whose patterns aren't captured by
+/// the simple pattern regexes (e.g., complex nested patterns like SelectNotPat).
+///
+/// This is the single source of truth for mnemonic → SemanticOp mapping.
+/// Used by both the resolver and tblgen_records modules.
+pub fn infer_semantic_from_mnemonic(mnemonic: &str) -> Option<SemanticOp> {
+    let lower = mnemonic.to_lowercase();
+
+    // Select operations
+    if lower.starts_with("sel") {
+        return Some(SemanticOp::Select);
+    }
+
+    // Arithmetic operations
+    if lower == "add" || lower.starts_with("add.") {
+        return Some(SemanticOp::Add);
+    }
+    if lower == "sub" || lower.starts_with("sub.") {
+        return Some(SemanticOp::Sub);
+    }
+    if lower == "mul" || lower.starts_with("mul.") {
+        return Some(SemanticOp::Mul);
+    }
+    if lower == "abs" || lower.starts_with("abs.") {
+        return Some(SemanticOp::Abs);
+    }
+    if lower == "neg" || lower.starts_with("neg.") {
+        return Some(SemanticOp::Neg);
+    }
+
+    // Comparison operations
+    if lower == "lt" || lower.starts_with("lt.") {
+        return Some(SemanticOp::SetLt);
+    }
+    if lower == "le" || lower.starts_with("le.") {
+        return Some(SemanticOp::SetLe);
+    }
+    if lower == "gt" || lower.starts_with("gt.") {
+        return Some(SemanticOp::SetGt);
+    }
+    if lower == "ge" || lower.starts_with("ge.") {
+        return Some(SemanticOp::SetGe);
+    }
+    if lower == "eq" || lower.starts_with("eq.") {
+        return Some(SemanticOp::SetEq);
+    }
+    if lower == "ne" || lower.starts_with("ne.") {
+        return Some(SemanticOp::SetNe);
+    }
+
+    // Bitwise operations
+    if lower == "and" || lower.starts_with("and.") {
+        return Some(SemanticOp::And);
+    }
+    if lower == "or" || lower.starts_with("or.") {
+        return Some(SemanticOp::Or);
+    }
+    if lower == "xor" || lower.starts_with("xor.") {
+        return Some(SemanticOp::Xor);
+    }
+    if lower == "not" || lower.starts_with("not.") {
+        return Some(SemanticOp::Not);
+    }
+
+    // Shift operations
+    if lower.starts_with("lshl") || lower == "shl" {
+        return Some(SemanticOp::Shl);
+    }
+    if lower.starts_with("ashr") || lower == "asr" {
+        return Some(SemanticOp::Sra);
+    }
+    if lower.starts_with("lshr") || lower == "lsr" {
+        return Some(SemanticOp::Srl);
+    }
+
+    // Move/copy (mov, mova, movx, movxm, mov.* variants)
+    if lower.starts_with("mov") {
+        return Some(SemanticOp::Copy);
+    }
+
+    // Memory operations
+    if lower.starts_with("lda") || lower.starts_with("ld.") {
+        return Some(SemanticOp::Load);
+    }
+    if lower.starts_with("st.") || lower == "st" {
+        return Some(SemanticOp::Store);
+    }
+
+    // Nop
+    if lower == "nop" || lower.starts_with("nop") {
+        return Some(SemanticOp::Nop);
+    }
+
+    // Unsigned comparisons (ltu, leu, gtu, geu)
+    if lower == "ltu" || lower.starts_with("ltu.") {
+        return Some(SemanticOp::SetUlt);
+    }
+    if lower == "leu" || lower.starts_with("leu.") {
+        return Some(SemanticOp::SetUle);
+    }
+    if lower == "gtu" || lower.starts_with("gtu.") {
+        return Some(SemanticOp::SetUgt);
+    }
+    if lower == "geu" || lower.starts_with("geu.") {
+        return Some(SemanticOp::SetUge);
+    }
+
+    // Pointer add (treat as add)
+    if lower.starts_with("padd") {
+        return Some(SemanticOp::Add);
+    }
+
+    // Branch/call operations
+    if lower == "jl" || lower.starts_with("call") {
+        return Some(SemanticOp::Br);
+    }
+    if lower == "j" || lower == "jnz" || lower == "jz" || lower == "jnzd"
+        || lower.starts_with("b") && !lower.starts_with("bswap")
+    {
+        return Some(SemanticOp::BrCond);
+    }
+
+    // Lock operations
+    if lower.starts_with("acq") {
+        return Some(SemanticOp::LockAcquire);
+    }
+    if lower.starts_with("rel") {
+        return Some(SemanticOp::LockRelease);
+    }
+
+    // Return
+    if lower == "ret" || lower.starts_with("ret.") {
+        return Some(SemanticOp::Ret);
+    }
+
+    // Vector operations (vadd, vsub, vmul, etc.)
+    // Map to same SemanticOp as scalar - execution will handle width
+    if lower.starts_with("vadd") {
+        return Some(SemanticOp::Add);
+    }
+    if lower.starts_with("vsub") {
+        return Some(SemanticOp::Sub);
+    }
+    if lower.starts_with("vmul") || lower.starts_with("vmac") || lower.starts_with("vmsc") {
+        return Some(SemanticOp::Mul);
+    }
+    if lower.starts_with("vand") {
+        return Some(SemanticOp::And);
+    }
+    if lower.starts_with("vor") {
+        return Some(SemanticOp::Or);
+    }
+    if lower.starts_with("vxor") {
+        return Some(SemanticOp::Xor);
+    }
+    if lower.starts_with("vnot") || lower.starts_with("vbnot") {
+        return Some(SemanticOp::Not);
+    }
+    if lower.starts_with("vshl") || lower.starts_with("vlshl") {
+        return Some(SemanticOp::Shl);
+    }
+    if lower.starts_with("vshr") || lower.starts_with("vlshr") {
+        return Some(SemanticOp::Srl);
+    }
+    if lower.starts_with("vashr") {
+        return Some(SemanticOp::Sra);
+    }
+    if lower.starts_with("vsel") {
+        return Some(SemanticOp::Select);
+    }
+    if lower.starts_with("vmov") {
+        return Some(SemanticOp::Copy);
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,12 +914,14 @@ mod tests {
                 EncodingPart::FieldRef { name: "op".to_string(), high: None, low: None },
                 EncodingPart::Literal { value: 0b1, width: 1 },
             ],
+            field_sources: HashMap::new(),
         });
 
         // Add ADD instruction: op = 0b0000
         data.instructions.insert("ADD".to_string(), InstrDef {
             name: "ADD".to_string(),
             format: "AIE2_alu_r_rr_inst_alu".to_string(),
+            mixin_classes: vec![],
             template_args: vec![0b0000],
             mnemonic: "add".to_string(),
             asm_string: "$mRx, $mRx0, $mRy".to_string(),
@@ -668,6 +942,7 @@ mod tests {
                     name: "mRy".to_string(),
                 },
             ],
+            implicit_regs: vec![],
             attributes: InstrAttributes::default(),
         });
 
@@ -675,11 +950,13 @@ mod tests {
         data.instructions.insert("SUB".to_string(), InstrDef {
             name: "SUB".to_string(),
             format: "AIE2_alu_r_rr_inst_alu".to_string(),
+            mixin_classes: vec![],
             template_args: vec![0b0001],
             mnemonic: "sub".to_string(),
             asm_string: "$mRx, $mRx0, $mRy".to_string(),
             outputs: vec![],
             inputs: vec![],
+            implicit_regs: vec![],
             attributes: InstrAttributes::default(),
         });
 
@@ -807,11 +1084,13 @@ mod tests {
         let instr = InstrDef {
             name: "BAD".to_string(),
             format: "NonexistentFormat".to_string(),
+            mixin_classes: vec![],
             template_args: vec![],
             mnemonic: "bad".to_string(),
             asm_string: "".to_string(),
             outputs: vec![],
             inputs: vec![],
+            implicit_regs: vec![],
             attributes: InstrAttributes::default(),
         };
 
@@ -954,5 +1233,169 @@ mod tests {
         // Verify we have expected slots
         assert!(index.slot_index("alu").is_some(), "Should have alu slot");
         assert!(index.slot_index("lda").is_some(), "Should have lda slot");
+    }
+
+    // === Operand Ordering Tests ===
+
+    #[test]
+    fn test_input_order_from_instrdef() {
+        // Verify that InstrEncoding.input_order matches InstrDef.inputs order
+        let data = make_test_data();
+        let resolver = Resolver::new(&data);
+
+        let add = data.instructions.get("ADD").unwrap();
+        let encoding = resolver.resolve_instruction(add).unwrap();
+
+        // ADD's InstrDef.inputs = [mRx0, mRy] (in that order)
+        assert_eq!(encoding.input_order, vec!["mRx0", "mRy"]);
+        // Output is mRx
+        assert_eq!(encoding.output_order, vec!["mRx"]);
+    }
+
+    #[test]
+    fn test_semantic_inference_from_mnemonic() {
+        // Test that mnemonics get semantic ops inferred
+        assert_eq!(infer_semantic_from_mnemonic("sel.eqz"), Some(SemanticOp::Select));
+        assert_eq!(infer_semantic_from_mnemonic("sel.nez"), Some(SemanticOp::Select));
+        assert_eq!(infer_semantic_from_mnemonic("add"), Some(SemanticOp::Add));
+        assert_eq!(infer_semantic_from_mnemonic("add.nc"), Some(SemanticOp::Add));
+        assert_eq!(infer_semantic_from_mnemonic("sub"), Some(SemanticOp::Sub));
+        assert_eq!(infer_semantic_from_mnemonic("mov"), Some(SemanticOp::Copy));
+        assert_eq!(infer_semantic_from_mnemonic("lt"), Some(SemanticOp::SetLt));
+        assert_eq!(infer_semantic_from_mnemonic("ge.s32"), Some(SemanticOp::SetGe));
+        assert_eq!(infer_semantic_from_mnemonic("and"), Some(SemanticOp::And));
+        assert_eq!(infer_semantic_from_mnemonic("or"), Some(SemanticOp::Or));
+        assert_eq!(infer_semantic_from_mnemonic("xor"), Some(SemanticOp::Xor));
+        assert_eq!(infer_semantic_from_mnemonic("lshl"), Some(SemanticOp::Shl));
+        assert_eq!(infer_semantic_from_mnemonic("ashr"), Some(SemanticOp::Sra));
+        assert_eq!(infer_semantic_from_mnemonic("lshr"), Some(SemanticOp::Srl));
+
+        // Unsigned comparisons
+        assert_eq!(infer_semantic_from_mnemonic("ltu"), Some(SemanticOp::SetUlt));
+        assert_eq!(infer_semantic_from_mnemonic("geu"), Some(SemanticOp::SetUge));
+
+        // Pointer ops (map to add)
+        assert_eq!(infer_semantic_from_mnemonic("paddb"), Some(SemanticOp::Add));
+
+        // Branch/call operations
+        assert_eq!(infer_semantic_from_mnemonic("jl"), Some(SemanticOp::Br));
+        assert_eq!(infer_semantic_from_mnemonic("jnz"), Some(SemanticOp::BrCond));
+        assert_eq!(infer_semantic_from_mnemonic("bz"), Some(SemanticOp::BrCond));
+
+        // Lock operations
+        assert_eq!(infer_semantic_from_mnemonic("acq"), Some(SemanticOp::LockAcquire));
+        assert_eq!(infer_semantic_from_mnemonic("rel"), Some(SemanticOp::LockRelease));
+
+        // Unknown mnemonics return None
+        assert_eq!(infer_semantic_from_mnemonic("unknown"), None);
+    }
+
+    #[test]
+    fn test_semantic_attached_to_encoding() {
+        // Verify semantic is attached when resolving instructions
+        let data = make_test_data();
+
+        // ADD has "add" mnemonic, resolver should infer SemanticOp::Add
+        let resolver = Resolver::new(&data);
+        let add = data.instructions.get("ADD").unwrap();
+        let encoding = resolver.resolve_instruction(add).unwrap();
+
+        assert_eq!(encoding.semantic, Some(SemanticOp::Add));
+    }
+
+    #[test]
+    fn test_select_semantic_from_mnemonic() {
+        let mut data = make_test_data();
+
+        // Add a SELEQZ instruction
+        data.instructions.insert("SELEQZ".to_string(), InstrDef {
+            name: "SELEQZ".to_string(),
+            format: "AIE2_alu_r_rr_inst_alu".to_string(),
+            mixin_classes: vec![],
+            template_args: vec![0b0100],
+            mnemonic: "sel.eqz".to_string(),
+            asm_string: "$mRx, $mRx0, $mRy".to_string(),
+            outputs: vec![OperandDef {
+                is_output: true,
+                reg_class: "eR".to_string(),
+                name: "mRx".to_string(),
+            }],
+            inputs: vec![
+                OperandDef {
+                    is_output: false,
+                    reg_class: "eR".to_string(),
+                    name: "mRx0".to_string(),
+                },
+                OperandDef {
+                    is_output: false,
+                    reg_class: "eR".to_string(),
+                    name: "mRy".to_string(),
+                },
+            ],
+            implicit_regs: vec![ImplicitReg {
+                reg_class: "eR27".to_string(),
+                reg_num: 27,
+                is_use: true,
+            }],
+            attributes: InstrAttributes::default(),
+        });
+
+        let resolver = Resolver::new(&data);
+        let seleqz = data.instructions.get("SELEQZ").unwrap();
+        let encoding = resolver.resolve_instruction(seleqz).unwrap();
+
+        // Should have Select semantic from mnemonic inference
+        assert_eq!(encoding.semantic, Some(SemanticOp::Select));
+
+        // Should have implicit register r27
+        assert_eq!(encoding.implicit_regs.len(), 1);
+        assert_eq!(encoding.implicit_regs[0].reg_num, 27);
+        assert!(encoding.implicit_regs[0].is_use);
+    }
+
+    #[test]
+    fn test_operand_ordering_with_real_llvm_aie() {
+        use std::path::Path;
+        use crate::tablegen::load_from_llvm_aie;
+
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found");
+            return;
+        }
+
+        let data = load_from_llvm_aie(llvm_aie_path).expect("Failed to load llvm-aie");
+        let resolver = Resolver::new(&data);
+
+        // Check some key instructions have correct operand ordering
+
+        // SELEQZ should have Select semantic and r27 implicit
+        if let Some(seleqz) = data.instructions.get("SELEQZ") {
+            let encoding = resolver.resolve_instruction(seleqz).unwrap();
+            eprintln!("SELEQZ: semantic={:?}, input_order={:?}, implicit_regs={:?}",
+                encoding.semantic, encoding.input_order, encoding.implicit_regs);
+
+            assert_eq!(encoding.semantic, Some(SemanticOp::Select),
+                "SELEQZ should have Select semantic");
+
+            // Check for r27 in implicit registers
+            let has_r27 = encoding.implicit_regs.iter()
+                .any(|ir| ir.reg_num == 27 && ir.is_use);
+            assert!(has_r27, "SELEQZ should have r27 as implicit use");
+        }
+
+        // Count instructions with semantic info
+        let with_semantic: Vec<_> = data.instructions.values()
+            .filter_map(|instr| resolver.resolve_instruction(instr).ok())
+            .filter(|enc| enc.semantic.is_some())
+            .collect();
+
+        let total = data.instructions.len();
+        eprintln!("Instructions with semantic: {}/{} ({:.1}%)",
+            with_semantic.len(), total,
+            100.0 * with_semantic.len() as f64 / total as f64);
+
+        // Should have at least some semantic coverage
+        assert!(with_semantic.len() > 0, "Should have some instructions with semantic info");
     }
 }

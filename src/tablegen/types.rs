@@ -106,6 +106,14 @@ pub struct TemplateParam {
 ///   let alu = {mRx0, mRx, mRy, op, 0b1};
 /// }
 /// ```
+///
+/// Computed field assignments are also tracked:
+/// ```tablegen
+/// class AIE2_mLockId_imm : AIE2_mLockId {
+///   bits<6> id;
+///   let mLockId = {id, 0b0};  // mLockId is derived from id
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatClass {
     /// Class name (e.g., "AIE2_alu_r_rr_inst_alu")
@@ -120,6 +128,10 @@ pub struct FormatClass {
     pub slot_field: Option<String>,
     /// Encoding parts in MSB-first order
     pub encoding: Vec<EncodingPart>,
+    /// Computed field sources: maps derived field to source operand fields.
+    /// e.g., "mLockId" -> ["id"] when `let mLockId = {id, 0b0}` is parsed.
+    /// This is essential for mapping encoding fields back to DAG operand names.
+    pub field_sources: HashMap<String, Vec<String>>,
 }
 
 impl FormatClass {
@@ -154,6 +166,38 @@ impl FormatClass {
             }
         })
     }
+}
+
+/// A mixin class from AIE2GenInstrFormats.td.
+///
+/// Mixin classes are parameterless classes that provide field mappings
+/// to instruction definitions via multiple inheritance. Unlike format classes,
+/// they don't have template parameters or encoding - just field declarations
+/// and computed field assignments.
+///
+/// Example:
+/// ```tablegen
+/// class AIE2_mLockId_imm : AIE2_mLockId {
+///   bits<6> id;
+///   let mLockId = {id, 0b0};  // mLockId is derived from id
+/// }
+/// ```
+///
+/// Instructions use mixins via multiple inheritance:
+/// ```tablegen
+/// def ACQ : FormatClass<...>, AIE2_mLockId_imm;
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixinClass {
+    /// Class name (e.g., "AIE2_mLockId_imm")
+    pub name: String,
+    /// Parent class name (e.g., "AIE2_mLockId")
+    pub parent: Option<String>,
+    /// Field definitions with their bit widths (e.g., {"id": 6})
+    pub fields: HashMap<String, u8>,
+    /// Computed field sources: maps derived field to source operand fields.
+    /// e.g., "mLockId" -> ["id"] when `let mLockId = {id, 0b0}` is parsed.
+    pub field_sources: HashMap<String, Vec<String>>,
 }
 
 /// An operand definition from an instruction.
@@ -243,6 +287,7 @@ pub enum SemanticOp {
     // Control flow
     Br,      // Unconditional branch
     BrCond,  // Conditional branch
+    Ret,     // Return from subroutine
     Select,  // Conditional select (ternary)
 
     // Sign/zero extension
@@ -253,6 +298,10 @@ pub enum SemanticOp {
     // Special
     Copy,    // Move/copy
     Nop,     // No operation
+
+    // Synchronization (AIE-specific)
+    LockAcquire,  // Acquire lock
+    LockRelease,  // Release lock
 
     // Target-specific intrinsic (needs name lookup)
     Intrinsic(u32),  // Index into intrinsic name table
@@ -359,28 +408,53 @@ pub struct SemanticPattern {
     pub intrinsic_name: Option<String>,
 }
 
+/// An implicit register use/def from an instruction.
+///
+/// Some instructions use fixed registers that aren't variable operands.
+/// For example, `sel.eqz` always tests r27 via the `eR27` register class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImplicitReg {
+    /// Register class that constrains to a single register (e.g., "eR27")
+    pub reg_class: String,
+    /// The fixed register number (e.g., 27 for eR27)
+    pub reg_num: u8,
+    /// Whether this is a use (read) or def (write)
+    pub is_use: bool,
+}
+
 /// A concrete instruction definition from AIE2GenInstrInfo.td.
 ///
 /// Example:
 /// ```tablegen
 /// def ADD : AIE2_alu_r_rr_inst_alu<0b0000, (outs eR:$mRx), (ins eR:$mRx0, eR:$mRy), "add", "$mRx, $mRx0, $mRy">;
 /// ```
+///
+/// For instructions with implicit registers (like sel.eqz which always uses r27):
+/// ```tablegen
+/// def SELEQZ : AIE2_select_r_rr_inst_alu<0b0, (outs eR:$mRx),
+///     (ins eR:$mRx0, eR:$mRy, eR27:$s2), "sel.eqz", "$mRx, $mRx0, $mRy, r27">;
+/// ```
+/// The `eR27` register class constrains `$s2` to only r27, making it implicit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstrDef {
     /// Instruction name (e.g., "ADD")
     pub name: String,
     /// Format class this instantiates (e.g., "AIE2_alu_r_rr_inst_alu")
     pub format: String,
+    /// Mixin classes providing field mappings (e.g., ["AIE2_mLockId_imm"])
+    pub mixin_classes: Vec<String>,
     /// Template arguments (e.g., [0b0000] for the `op` parameter)
     pub template_args: Vec<u64>,
     /// Assembly mnemonic (e.g., "add")
     pub mnemonic: String,
     /// Assembly format string (e.g., "$mRx, $mRx0, $mRy")
     pub asm_string: String,
-    /// Output operands
+    /// Output operands (variable, extractable from encoding)
     pub outputs: Vec<OperandDef>,
-    /// Input operands
+    /// Input operands (variable, extractable from encoding)
     pub inputs: Vec<OperandDef>,
+    /// Implicit register uses/defs (fixed registers like r27 for sel.eqz)
+    pub implicit_regs: Vec<ImplicitReg>,
     /// Instruction attributes (mayLoad, Defs, etc.)
     pub attributes: InstrAttributes,
 }
@@ -390,8 +464,10 @@ pub struct InstrDef {
 pub struct TableGenData {
     /// Slot definitions by name
     pub slots: HashMap<String, SlotDef>,
-    /// Format classes by name
+    /// Format classes by name (parameterized, with encodings)
     pub formats: HashMap<String, FormatClass>,
+    /// Mixin classes by name (parameterless, provide field mappings)
+    pub mixins: HashMap<String, MixinClass>,
     /// Instruction definitions by name
     pub instructions: HashMap<String, InstrDef>,
     /// Semantic patterns (instruction → what it computes)
@@ -536,6 +612,7 @@ mod tests {
                 },
                 EncodingPart::Literal { value: 1, width: 1 },
             ],
+            field_sources: HashMap::new(),
         };
 
         // 5 + 5 + 5 + 4 + 1 = 20 bits
@@ -550,6 +627,7 @@ mod tests {
         let instr = InstrDef {
             name: "ADD".to_string(),
             format: "AIE2_alu_r_rr_inst_alu".to_string(),
+            mixin_classes: vec![],
             template_args: vec![0b0000],
             mnemonic: "add".to_string(),
             asm_string: "$mRx, $mRx0, $mRy".to_string(),
@@ -570,6 +648,7 @@ mod tests {
                     name: "mRy".to_string(),
                 },
             ],
+            implicit_regs: vec![],
             attributes: InstrAttributes {
                 may_load: false,
                 may_store: false,

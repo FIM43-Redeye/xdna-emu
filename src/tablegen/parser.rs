@@ -15,9 +15,32 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use super::types::{
-    EncodingPart, FormatClass, InstrAttributes, InstrDef, OperandDef, SemanticOp,
-    SemanticPattern, SlotDef, TableGenData, TemplateParam,
+    EncodingPart, FormatClass, ImplicitReg, InstrAttributes, InstrDef, MixinClass, OperandDef,
+    SemanticOp, SemanticPattern, SlotDef, TableGenData, TemplateParam,
 };
+
+/// Check if a register class is an implicit (fixed) register.
+///
+/// Implicit register classes are those that constrain to a single register,
+/// like `eR27` (only r27) or `eP0` (only p0). These are identified by having
+/// a register type prefix followed by a number.
+///
+/// Returns `Some((base_class, reg_num))` if implicit, `None` if variable.
+fn parse_implicit_register(reg_class: &str) -> Option<(&str, u8)> {
+    // Common patterns: eR27, eP0, eM3, etc.
+    // The pattern is: lowercase 'e' + uppercase letter + digits
+    if reg_class.len() >= 3 && reg_class.starts_with('e') {
+        let rest = &reg_class[1..];
+        if let Some(idx) = rest.find(|c: char| c.is_ascii_digit()) {
+            let base = &reg_class[..idx + 1]; // e.g., "eR"
+            let num_str = &rest[idx..];
+            if let Ok(num) = num_str.parse::<u8>() {
+                return Some((base, num));
+            }
+        }
+    }
+    None
+}
 
 /// Compiled regex patterns for TableGen parsing.
 struct Patterns {
@@ -29,13 +52,13 @@ struct Patterns {
     artificial: Regex,
     /// Matches class definitions: `class AIE2_foo<bits<4> op, ...> : Parent<...> {`
     class_def: Regex,
+    /// Matches mixin class definitions (parameterless): `class AIE2_mLockId_imm : AIE2_mLockId {`
+    mixin_class_def: Regex,
     /// Matches template params: `bits<4> op`
     template_param: Regex,
     /// Matches field declarations: `bits<5> mRx;` or `bits<5> mRx, mRy;`
     field_decl: Regex,
-    /// Matches encoding statements: `let alu = {mRx0, mRx, op, 0b1};`
-    encoding_stmt: Regex,
-    /// Matches instruction defs: `def ADD : Format<args>;`
+    /// Matches instruction defs: `def ADD : Format<args>, Mixin1, Mixin2;`
     instr_def: Regex,
     /// Matches binary literals: `0b0000`
     binary_literal: Regex,
@@ -83,11 +106,18 @@ static PATTERNS: LazyLock<Patterns> = LazyLock::new(|| Patterns {
         r"class\s+(AIE2_\w+)\s*<((?:[^<>]|<[^>]*>)*)>\s*(?::\s*(AIE2_\w+)\s*<[^>]*>)?\s*\{",
     )
     .unwrap(),
+    // Mixin classes have no template params: `class AIE2_mLockId_imm : AIE2_mLockId {`
+    // Captures: 1=name, 2=optional parent
+    mixin_class_def: Regex::new(
+        r"class\s+(AIE2_\w+)\s*(?::\s*(AIE2_\w+))?\s*\{",
+    )
+    .unwrap(),
     template_param: Regex::new(r"bits<(\d+)>\s+(\w+)").unwrap(),
     field_decl: Regex::new(r"bits<(\d+)>\s+([\w,\s]+);").unwrap(),
-    encoding_stmt: Regex::new(r"let\s+(\w+)\s*=\s*\{([^}]+)\}\s*;").unwrap(),
+    // Instruction defs can have multiple mixin classes separated by commas
+    // Captures: 1=instr name, 2=format class, 3=format args, 4=rest (mixins)
     instr_def: Regex::new(
-        r#"def\s+(\w+)\s*:\s*(AIE2_\w+)\s*<([^>]*)>\s*(?:,\s*(AIE2_\w+))?\s*;"#,
+        r#"def\s+(\w+)\s*:\s*(AIE2_\w+)\s*<([^>]*)>\s*((?:,\s*AIE2_\w+)*)\s*;"#,
     )
     .unwrap(),
     binary_literal: Regex::new(r"0b([01]+)").unwrap(),
@@ -366,6 +396,106 @@ fn parse_encoding(body: &str) -> Option<(String, Vec<EncodingPart>)> {
     Some((slot_field, parts.ok()?))
 }
 
+/// Parse computed field assignments like `let mLockId = {id, 0b0};`
+///
+/// Returns a map from derived field name to source operand field names.
+/// e.g., "mLockId" -> ["id"] when `let mLockId = {id, 0b0}` is parsed.
+///
+/// This is critical for tracing encoding fields back to DAG operand names.
+fn parse_computed_field_sources(
+    body: &str,
+    known_fields: &HashMap<String, u8>,
+) -> HashMap<String, Vec<String>> {
+    use std::collections::HashMap;
+    let mut result: HashMap<String, Vec<String>> = HashMap::new();
+
+    // Look for patterns like: let <field> = {<expr>};
+    // But NOT the slot encoding (let alu/lda/st/mv/vec/lng/ldb = ...)
+    let slot_fields = ["alu", "lda", "ldb", "st", "mv", "vec", "lng"];
+
+    // Find all "let X = {" patterns
+    let mut search_pos = 0;
+    while let Some(let_idx) = body[search_pos..].find("let ") {
+        let let_start = search_pos + let_idx;
+        search_pos = let_start + 4;
+
+        // Find the "=" after "let "
+        let Some(eq_offset) = body[let_start..].find('=') else {
+            continue;
+        };
+        let eq_pos = let_start + eq_offset;
+
+        // Extract field name between "let " and "="
+        let field_name = body[let_start + 4..eq_pos].trim();
+
+        // Skip slot encodings
+        if slot_fields.contains(&field_name) {
+            continue;
+        }
+
+        // Look for opening brace after "="
+        let after_eq = &body[eq_pos + 1..];
+        let trimmed = after_eq.trim_start();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+
+        // Find the opening brace position
+        let brace_start = eq_pos + 1 + (after_eq.len() - trimmed.len());
+
+        // Find matching closing brace
+        let mut depth = 0;
+        let mut brace_end = None;
+        for (i, c) in body[brace_start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        brace_end = Some(brace_start + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let Some(end) = brace_end else { continue };
+        let content = &body[brace_start + 1..end];
+
+        // Extract field references from the content
+        // Look for identifiers that are known fields
+        let mut sources = Vec::new();
+        for part in content.split(',') {
+            let part = part.trim();
+            // Skip literals (0b..., numbers)
+            if part.starts_with("0b") || part.starts_with("dontcare") {
+                continue;
+            }
+            // Extract field name (might have bit slice like field{5-0})
+            let field_ref = if let Some(brace_pos) = part.find('{') {
+                &part[..brace_pos]
+            } else {
+                part
+            };
+            let field_ref = field_ref.trim();
+
+            // Check if this is a known field (operand)
+            if !field_ref.is_empty() && known_fields.contains_key(field_ref) {
+                if !sources.contains(&field_ref.to_string()) {
+                    sources.push(field_ref.to_string());
+                }
+            }
+        }
+
+        if !sources.is_empty() {
+            result.insert(field_name.to_string(), sources);
+        }
+    }
+
+    result
+}
+
 /// Parse a single format class definition.
 fn parse_class_block(block: &str) -> Option<FormatClass> {
     let caps = PATTERNS.class_def.captures(block)?;
@@ -381,6 +511,9 @@ fn parse_class_block(block: &str) -> Option<FormatClass> {
         fields.insert(param.name.clone(), param.bits);
     }
 
+    // Parse computed field assignments (e.g., let mLockId = {id, 0b0})
+    let field_sources = parse_computed_field_sources(block, &fields);
+
     let (slot_field, encoding) = parse_encoding(block).unwrap_or_else(|| ("".to_string(), vec![]));
     let slot_field = if slot_field.is_empty() {
         None
@@ -395,6 +528,7 @@ fn parse_class_block(block: &str) -> Option<FormatClass> {
         fields,
         slot_field,
         encoding,
+        field_sources,
     })
 }
 
@@ -436,6 +570,104 @@ pub fn parse_format_classes(content: &str) -> Vec<FormatClass> {
 
             let block = &content[start..block_end];
             if let Some(class) = parse_class_block(block) {
+                classes.push(class);
+            }
+
+            i = block_end;
+        } else {
+            break;
+        }
+    }
+
+    classes
+}
+
+/// Parse a single mixin class definition.
+///
+/// Mixin classes are parameterless classes that provide field mappings.
+/// Example:
+/// ```tablegen
+/// class AIE2_mLockId_imm : AIE2_mLockId {
+///   bits<6> id;
+///   let mLockId = {id, 0b0};
+/// }
+/// ```
+fn parse_mixin_class_block(block: &str) -> Option<MixinClass> {
+    // Check that this is NOT a format class (no template params before {)
+    // Format classes have: class Name<...> : Parent<...> {
+    // Mixin classes have:  class Name : Parent {  OR  class Name {
+
+    // If there's a '<' before '{', this is a format class, not a mixin
+    let brace_pos = block.find('{')?;
+    if block[..brace_pos].contains('<') {
+        return None;
+    }
+
+    let caps = PATTERNS.mixin_class_def.captures(block)?;
+    let name = caps.get(1)?.as_str().to_string();
+    let parent = caps.get(2).map(|m| m.as_str().to_string());
+
+    // Parse field declarations
+    let fields = parse_field_decls(block);
+
+    // Parse computed field assignments (e.g., let mLockId = {id, 0b0})
+    let field_sources = parse_computed_field_sources(block, &fields);
+
+    Some(MixinClass {
+        name,
+        parent,
+        fields,
+        field_sources,
+    })
+}
+
+/// Parse mixin class definitions from AIE2GenInstrFormats.td content.
+///
+/// Mixin classes are parameterless classes used via multiple inheritance
+/// to provide field mappings (e.g., `let mLockId = {id, 0b0}`).
+pub fn parse_mixin_classes(content: &str) -> Vec<MixinClass> {
+    let mut classes = Vec::new();
+    let bytes = content.as_bytes();
+
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look for "class AIE2_"
+        if let Some(pos) = content[i..].find("class AIE2_") {
+            let start = i + pos;
+
+            // Find the opening brace
+            let brace_pos = match content[start..].find('{') {
+                Some(p) => start + p,
+                None => {
+                    i = start + 11;
+                    continue;
+                }
+            };
+
+            // Skip if this has template params (it's a format class, not a mixin)
+            if content[start..brace_pos].contains('<') {
+                i = brace_pos + 1;
+                continue;
+            }
+
+            // Find matching closing brace
+            let mut brace_count = 0;
+            let mut block_end = brace_pos;
+
+            for (j, &byte) in bytes[brace_pos..].iter().enumerate() {
+                if byte == b'{' {
+                    brace_count += 1;
+                } else if byte == b'}' {
+                    brace_count -= 1;
+                    if brace_count == 0 {
+                        block_end = brace_pos + j + 1;
+                        break;
+                    }
+                }
+            }
+
+            let block = &content[start..block_end];
+            if let Some(class) = parse_mixin_class_block(block) {
                 classes.push(class);
             }
 
@@ -497,27 +729,62 @@ fn parse_attributes(context: &str) -> InstrAttributes {
 }
 
 /// Parse operands from a dag string like "eR:$mRx, eR:$mRy".
-fn parse_operands(dag_content: &str, is_output: bool) -> Vec<OperandDef> {
-    PATTERNS
-        .operand
-        .captures_iter(dag_content)
-        .map(|caps| OperandDef {
-            is_output,
-            reg_class: caps.get(1).unwrap().as_str().to_string(),
-            name: caps.get(2).unwrap().as_str().to_string(),
-        })
-        .collect()
+///
+/// Returns (explicit_operands, implicit_registers).
+/// Implicit registers are those with fixed register classes like `eR27`.
+fn parse_operands_with_implicit(
+    dag_content: &str,
+    is_output: bool,
+) -> (Vec<OperandDef>, Vec<ImplicitReg>) {
+    let mut explicit = Vec::new();
+    let mut implicit = Vec::new();
+
+    for caps in PATTERNS.operand.captures_iter(dag_content) {
+        let reg_class = caps.get(1).unwrap().as_str();
+        let name = caps.get(2).unwrap().as_str();
+
+        if let Some((_base, reg_num)) = parse_implicit_register(reg_class) {
+            // This is an implicit register (e.g., eR27 -> r27)
+            implicit.push(ImplicitReg {
+                reg_class: reg_class.to_string(),
+                reg_num,
+                is_use: !is_output,
+            });
+        } else {
+            // This is a regular variable operand
+            explicit.push(OperandDef {
+                is_output,
+                reg_class: reg_class.to_string(),
+                name: name.to_string(),
+            });
+        }
+    }
+
+    (explicit, implicit)
+}
+
+/// Parsed template arguments including implicit registers.
+struct TemplateArgsResult {
+    template_args: Vec<u64>,
+    mnemonic: String,
+    asm_string: String,
+    outputs: Vec<OperandDef>,
+    inputs: Vec<OperandDef>,
+    implicit_regs: Vec<ImplicitReg>,
 }
 
 /// Parse template arguments (the actual values passed to a format class).
 ///
 /// Input: "0b0000, (outs eR:$mRx), (ins eR:$mRx0, eR:$mRy), \"add\", \"$mRx, $mRx0, $mRy\""
-fn parse_template_args(args_str: &str) -> (Vec<u64>, String, String, Vec<OperandDef>, Vec<OperandDef>) {
+///
+/// Also extracts implicit registers from fixed register classes like eR27.
+fn parse_template_args(args_str: &str) -> TemplateArgsResult {
     let mut template_args = Vec::new();
     let mut mnemonic = String::new();
     let mut asm_string = String::new();
     let mut outputs = Vec::new();
     let mut inputs = Vec::new();
+    let mut implicit_regs = Vec::new();
 
     // Extract binary literal arguments
     for caps in PATTERNS.binary_literal.captures_iter(args_str) {
@@ -527,16 +794,20 @@ fn parse_template_args(args_str: &str) -> (Vec<u64>, String, String, Vec<Operand
         }
     }
 
-    // Extract outs dag
+    // Extract outs dag, separating explicit and implicit operands
     if let Some(caps) = PATTERNS.outs_dag.captures(args_str) {
         let content = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-        outputs = parse_operands(content, true);
+        let (explicit, implicit) = parse_operands_with_implicit(content, true);
+        outputs = explicit;
+        implicit_regs.extend(implicit);
     }
 
-    // Extract ins dag
+    // Extract ins dag, separating explicit and implicit operands
     if let Some(caps) = PATTERNS.ins_dag.captures(args_str) {
         let content = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-        inputs = parse_operands(content, false);
+        let (explicit, implicit) = parse_operands_with_implicit(content, false);
+        inputs = explicit;
+        implicit_regs.extend(implicit);
     }
 
     // Extract mnemonic and asm string from quoted strings
@@ -554,7 +825,14 @@ fn parse_template_args(args_str: &str) -> (Vec<u64>, String, String, Vec<Operand
         asm_string = quoted_strings[1].to_string();
     }
 
-    (template_args, mnemonic, asm_string, outputs, inputs)
+    TemplateArgsResult {
+        template_args,
+        mnemonic,
+        asm_string,
+        outputs,
+        inputs,
+        implicit_regs,
+    }
 }
 
 /// Parse instruction definitions from AIE2GenInstrInfo.td content.
@@ -562,7 +840,7 @@ pub fn parse_instructions(content: &str) -> Vec<InstrDef> {
     let mut instructions = Vec::new();
 
     // The instruction defs can span multiple lines, so we need a more robust approach
-    // Look for patterns like: def NAME : AIE2_format<...>;
+    // Look for patterns like: def NAME : AIE2_format<...>, Mixin1, Mixin2;
 
     // First, normalize the content by joining continued lines
     let normalized = content.replace("\\\n", " ");
@@ -574,8 +852,22 @@ pub fn parse_instructions(content: &str) -> Vec<InstrDef> {
         let name = caps.get(1).unwrap().as_str().to_string();
         let format = caps.get(2).unwrap().as_str().to_string();
         let args_str = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+        let mixin_str = caps.get(4).map(|m| m.as_str()).unwrap_or("");
 
-        let (template_args, mnemonic, asm_string, outputs, inputs) = parse_template_args(args_str);
+        let parsed = parse_template_args(args_str);
+
+        // Parse mixin classes from the rest of the definition (e.g., ", AIE2_mLockId_imm")
+        let mixin_classes: Vec<String> = mixin_str
+            .split(',')
+            .filter_map(|s| {
+                let trimmed = s.trim();
+                if trimmed.starts_with("AIE2_") {
+                    Some(trimmed.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         // Extract context for attributes by looking back ~500 chars
         // This captures the enclosing let blocks
@@ -586,11 +878,13 @@ pub fn parse_instructions(content: &str) -> Vec<InstrDef> {
         instructions.push(InstrDef {
             name,
             format,
-            template_args,
-            mnemonic,
-            asm_string,
-            outputs,
-            inputs,
+            mixin_classes,
+            template_args: parsed.template_args,
+            mnemonic: parsed.mnemonic,
+            asm_string: parsed.asm_string,
+            outputs: parsed.outputs,
+            inputs: parsed.inputs,
+            implicit_regs: parsed.implicit_regs,
             attributes,
         });
     }
@@ -697,6 +991,11 @@ pub fn parse_tablegen_files_with_patterns(
     // Parse format classes
     for format in parse_format_classes(formats_content) {
         data.formats.insert(format.name.clone(), format);
+    }
+
+    // Parse mixin classes (from the same file as format classes)
+    for mixin in parse_mixin_classes(formats_content) {
+        data.mixins.insert(mixin.name.clone(), mixin);
     }
 
     // Parse instructions

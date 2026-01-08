@@ -7,6 +7,9 @@ license = "Unlicense"
 rust-version = "1.70"
 
 [lib]
+# Build both a Rust library and a C-compatible shared library
+# The cdylib (libxdna_emu.so) provides FFI for mock XRT integration
+crate-type = ["lib", "cdylib"]
 # Doc tests are enabled but should be run via scripts/run-tests.sh for nice priority
 
 [dependencies]
@@ -24,6 +27,10 @@ regex = "1"                                             # Regex for TableGen par
 uuid = "1"                                              # UUID handling
 smallvec = "1.13"                                       # Stack-allocated vectors for operands
 byteorder = "1.5"                                       # Byte order utilities for binary parsing
+
+# Serialization (for test manifests)
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 # ELF parsing for core binaries
 goblin = "0.10"

@@ -3,7 +3,7 @@
 //! This module provides test discovery and execution for xclbin files.
 
 use std::path::{Path, PathBuf};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 
 use crate::parser::{Xclbin, AiePartition, Cdo};
 use crate::parser::xclbin::SectionKind;
@@ -250,9 +250,19 @@ impl XclbinSuite {
         self.tests.len()
     }
 
+    /// Get the tests as a slice.
+    pub fn tests(&self) -> &[XclbinTest] {
+        &self.tests
+    }
+
     /// Get the collected opcodes.
     pub fn collector(&self) -> &OpcodeCollector {
         &self.collector
+    }
+
+    /// Record an unknown opcode.
+    pub fn record_unknown(&mut self, opcode: UnknownOpcode, test_name: &str) {
+        self.collector.record(opcode, test_name);
     }
 
     /// Run all tests and return summary.
@@ -385,17 +395,17 @@ impl XclbinSuite {
 
                         let mut npu_executor = NpuExecutor::new();
 
-                        // Set up host buffers (simplified: use default buffer addresses)
-                        // In real usage, these would come from the test harness
-                        npu_executor.add_host_buffer(0x0000_0000, 256);  // Input buffer
-                        npu_executor.add_host_buffer(0x0001_0000, 256);  // Output buffer
-                        npu_executor.add_host_buffer(0x0002_0000, 256);  // Extra buffer
+                        // Set up host buffers to match the memory layout in setup_default_input
+                        // These addresses MUST match where data is actually allocated:
+                        //   0x0000: Input buffer (4KB)
+                        //   0x0100: Middle/unused buffer (256 bytes)
+                        //   0x1000: Output buffer (4KB)
+                        npu_executor.add_host_buffer(0x0000, 4096);  // arg0: Input buffer
+                        npu_executor.add_host_buffer(0x0100, 256);   // arg1: Middle buffer
+                        npu_executor.add_host_buffer(0x1000, 4096);  // arg2: Output buffer
 
                         if let Err(e) = npu_executor.execute(&stream, engine.device_mut()) {
                             log::warn!("NPU instruction execution error: {}", e);
-                        } else {
-                            log::debug!("Executed {} NPU instructions",
-                                npu_executor.executed_count());
                         }
                     }
                     Err(e) => {
@@ -405,11 +415,11 @@ impl XclbinSuite {
             }
         }
 
-        // Sync core enabled state from device tiles to engine
-        engine.sync_cores_from_device();
-
         // Load ELF files if project directory exists
+        // IMPORTANT: Load ELFs BEFORE sync_cores_from_device() so the engine
+        // sees the cores as enabled after loading program code
         let elf_files = test.find_elf_files();
+        log::debug!("Found {} ELF files for test {}", elf_files.len(), test.name);
         for (col, row, path) in &elf_files {
             let data = match std::fs::read(path) {
                 Ok(d) => d,
@@ -427,7 +437,10 @@ impl XclbinSuite {
             }
         }
 
-        // Debug: print enabled cores
+        // Sync core enabled state from device tiles to engine
+        // Called AFTER loading ELFs so the engine sees the loaded cores
+        engine.sync_cores_from_device();
+
         let enabled = engine.enabled_cores();
         if enabled == 0 && elf_files.is_empty() {
             // No cores enabled and no ELFs - likely a reconfiguration test
@@ -439,7 +452,7 @@ impl XclbinSuite {
     }
 
     /// Run an engine until completion.
-    fn run_engine(&self, engine: &mut InterpreterEngine, test: &XclbinTest) -> TestOutcome {
+    fn run_engine(&self, engine: &mut InterpreterEngine, _test: &XclbinTest) -> TestOutcome {
         let mut cycles = 0u64;
 
         while cycles < self.max_cycles {
@@ -489,7 +502,7 @@ impl XclbinSuite {
                         {
                             return Some(TestOutcome::UnknownOpcode {
                                 details: UnknownOpcode {
-                                    slot: op.slot.clone(),
+                                    slot: op.slot,
                                     opcode: *opcode,
                                     pc,
                                     tile: (col as u8, row as u8),
@@ -571,11 +584,15 @@ impl XclbinSuite {
     /// Populates host memory with sequential integer data that most
     /// mlir-aie test kernels can process. This allows tests to make
     /// progress instead of timing out waiting for data.
+    ///
+    /// Memory layout (matching mlir-aie test patterns):
+    /// - 0x0000: Input buffer (4KB - up to 1024 i32s)
+    /// - 0x0100: Middle/unused buffer (256 bytes)
+    /// - 0x1000: Output buffer (4KB - up to 1024 i32s)
     fn setup_default_input(&self, engine: &mut InterpreterEngine) {
         let host_mem = engine.host_memory_mut();
 
         // Allocate input region (4KB at address 0)
-        // Many tests expect input at low addresses
         let _ = host_mem.allocate_region("input", 0x0, 4096);
 
         // Write sequential i32 values: [1, 2, 3, ..., 1024]
@@ -583,7 +600,10 @@ impl XclbinSuite {
         let input: Vec<u32> = (1..=1024).collect();
         host_mem.write_slice(0x0, &input);
 
-        // Allocate output region (4KB at 4KB offset)
+        // Allocate middle buffer (unused by most tests)
+        let _ = host_mem.allocate_region("middle", 0x100, 256);
+
+        // Allocate output region (4KB at 0x1000)
         let _ = host_mem.allocate_region("output", 0x1000, 4096);
     }
 }

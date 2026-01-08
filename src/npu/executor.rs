@@ -2,6 +2,9 @@
 //!
 //! Executes NPU instructions against the device state, performing
 //! register writes, address patches, and DMA triggers.
+//!
+//! The executor tracks Sync (TCT) instructions that specify completion
+//! conditions. A "run" is complete when all Sync conditions are satisfied.
 
 use super::{NpuInstruction, NpuInstructionStream};
 use crate::device::DeviceState;
@@ -15,6 +18,21 @@ pub struct HostBuffer {
     pub size: usize,
 }
 
+/// A pending sync condition.
+///
+/// Represents a DMA channel that must complete before the run is done.
+#[derive(Debug, Clone)]
+pub struct PendingSync {
+    /// Tile column.
+    pub column: u8,
+    /// Tile row.
+    pub row: u8,
+    /// DMA channel.
+    pub channel: u8,
+    /// Direction: 0 = S2MM (receive), 1 = MM2S (send).
+    pub direction: u8,
+}
+
 /// NPU instruction executor.
 ///
 /// Executes the host-to-NPU command stream that triggers DMA transfers
@@ -24,6 +42,8 @@ pub struct NpuExecutor {
     host_buffers: Vec<HostBuffer>,
     /// Number of instructions executed.
     executed_count: usize,
+    /// Pending sync conditions from Sync instructions.
+    pending_syncs: Vec<PendingSync>,
 }
 
 impl NpuExecutor {
@@ -32,7 +52,55 @@ impl NpuExecutor {
         Self {
             host_buffers: Vec::new(),
             executed_count: 0,
+            pending_syncs: Vec::new(),
         }
+    }
+
+    /// Get pending sync conditions.
+    pub fn pending_syncs(&self) -> &[PendingSync] {
+        &self.pending_syncs
+    }
+
+    /// Check if all sync conditions are satisfied.
+    ///
+    /// A sync is satisfied when the specified DMA channel has completed
+    /// (gone back to idle or completed its transfer).
+    pub fn syncs_satisfied(&self, device: &DeviceState) -> bool {
+        use crate::device::dma::ChannelState;
+
+        // Debug: trace sync checks (first 5 times)
+        static SYNC_CHECK_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let check_count = SYNC_CHECK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        if self.pending_syncs.is_empty() {
+            if check_count < 5 {
+                log::info!("syncs_satisfied[{}]: no pending syncs - returning true", check_count);
+            }
+            return true;
+        }
+
+        for sync in &self.pending_syncs {
+            if let Some(dma) = device.array.dma_engine(sync.column, sync.row) {
+                let state = dma.channel_state(sync.channel);
+                if check_count < 5 {
+                    log::info!("syncs_satisfied[{}]: tile({},{}) ch{} state={:?}",
+                        check_count, sync.column, sync.row, sync.channel, state);
+                }
+                // Sync is satisfied when channel is Idle (transfer complete)
+                if !matches!(state, ChannelState::Idle) {
+                    return false;
+                }
+            } else {
+                if check_count < 5 {
+                    log::warn!("syncs_satisfied[{}]: no DMA engine for tile({},{})",
+                        check_count, sync.column, sync.row);
+                }
+            }
+        }
+        if check_count < 5 {
+            log::info!("syncs_satisfied[{}]: all syncs satisfied - returning true", check_count);
+        }
+        true
     }
 
     /// Set host buffers for address patching.
@@ -60,7 +128,7 @@ impl NpuExecutor {
     }
 
     /// Execute a single instruction.
-    fn execute_instruction(&self, instr: &NpuInstruction, device: &mut DeviceState) -> Result<(), String> {
+    fn execute_instruction(&mut self, instr: &NpuInstruction, device: &mut DeviceState) -> Result<(), String> {
         match instr {
             NpuInstruction::Write32 { reg_off, value } => {
                 self.execute_write32(*reg_off, *value, device)
@@ -89,13 +157,18 @@ impl NpuExecutor {
                 self.execute_ddr_patch(*reg_addr, *arg_idx, *arg_plus, device)
             }
 
-            NpuInstruction::Sync { channel, column, direction, .. } => {
+            NpuInstruction::Sync { channel, column, row, direction, .. } => {
                 log::debug!(
-                    "NPU Sync: channel={} column={} direction={}",
-                    channel, column, direction
+                    "NPU Sync: channel={} column={} row={} direction={}",
+                    channel, column, row, direction
                 );
-                // Sync is a wait point - in our immediate execution model,
-                // we assume the operation completes.
+                // Record this sync condition - the run is complete when all syncs are satisfied
+                self.pending_syncs.push(PendingSync {
+                    column: *column,
+                    row: *row,
+                    channel: *channel,
+                    direction: *direction,
+                });
                 Ok(())
             }
 
@@ -292,12 +365,18 @@ impl NpuExecutor {
 
             // If patching word 1 (address low), re-read and sync the full BD
             if word_in_bd == 1 {
-                if let Some(tile) = device.tile(col as usize, row as usize) {
+                // Read BD values first (needs mutable borrow), then sync
+                let bd_values = if let Some(tile) = device.tile_mut(col as usize, row as usize) {
                     let bd_base = 0x1D000 + bd_index * 0x20;
                     let mut values = [0u32; 8];
                     for i in 0..8u32 {
                         values[i as usize] = tile.read_register(bd_base + i * 4);
                     }
+                    Some(values)
+                } else {
+                    None
+                };
+                if let Some(values) = bd_values {
                     self.sync_bd_values_to_dma_engine(col, bd_index as u8, &values, device);
                 }
             }
