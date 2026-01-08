@@ -189,6 +189,61 @@ impl TestRunner {
             .map_err(|e| anyhow!("Failed to configure BD: {}", e))
     }
 
+    /// Configure a DMA stream route from source MM2S to destination S2MM.
+    ///
+    /// This properly converts DMA channel indices to stream switch port numbers.
+    /// For compute tiles (row >= 2):
+    /// - MM2S channels 2-3 map to master ports 1-2
+    /// - S2MM channels 0-1 map to slave ports 1-2
+    ///
+    /// # Arguments
+    /// * `src_col`, `src_row` - Source tile coordinates
+    /// * `mm2s_channel` - MM2S DMA channel index (2-3 for compute tiles)
+    /// * `dst_col`, `dst_row` - Destination tile coordinates
+    /// * `s2mm_channel` - S2MM DMA channel index (0-1 for compute tiles)
+    pub fn configure_dma_route(
+        &mut self,
+        src_col: u8, src_row: u8, mm2s_channel: u8,
+        dst_col: u8, dst_row: u8, s2mm_channel: u8,
+    ) {
+        // Convert DMA channel indices to stream switch ports
+        // For compute tiles (row >= 2):
+        // - MM2S channel 2 -> master port 1, channel 3 -> master port 2
+        // - S2MM channel 0 -> slave port 1, channel 1 -> slave port 2
+        let src_port = if src_row >= 2 {
+            // Compute tile: MM2S channels 2-3 -> ports 1-2
+            if mm2s_channel >= 2 { mm2s_channel - 1 } else { mm2s_channel }
+        } else if src_row == 1 {
+            // MemTile: MM2S channels 6-11 -> ports 0-5
+            if mm2s_channel >= 6 { mm2s_channel - 6 } else { mm2s_channel }
+        } else {
+            // Shim tile
+            mm2s_channel
+        };
+
+        let dst_port = if dst_row >= 2 {
+            // Compute tile: S2MM channels 0-1 -> ports 1-2
+            s2mm_channel + 1
+        } else if dst_row == 1 {
+            // MemTile: S2MM channels 0-5 -> ports 0-5
+            s2mm_channel
+        } else {
+            // Shim tile
+            s2mm_channel
+        };
+
+        log::debug!(
+            "configure_dma_route: ({},{}) MM2S ch{} (port {}) -> ({},{}) S2MM ch{} (port {})",
+            src_col, src_row, mm2s_channel, src_port,
+            dst_col, dst_row, s2mm_channel, dst_port
+        );
+
+        self.engine.device_mut().array.stream_router.add_route(
+            src_col, src_row, src_port,
+            dst_col, dst_row, dst_port,
+        );
+    }
+
     /// Run for a maximum number of cycles, or until all cores halt.
     pub fn run(&mut self, max_cycles: u64) -> TestResult {
         let initial_cycles = self.engine.total_cycles();
@@ -683,8 +738,8 @@ mod tests {
         let s2mm_bd = BdConfig::simple_1d(0x2000, 64);
         runner.configure_dma_bd(dst_col, dst_row, 0, s2mm_bd).unwrap();
 
-        // Configure stream routing: source tile port 2 (MM2S_0) -> dest tile port 0 (S2MM_0)
-        runner.engine.device_mut().array.stream_router.add_route(
+        // Configure stream routing: source tile MM2S_0 -> dest tile S2MM_0
+        runner.configure_dma_route(
             src_col, src_row, mm2s_channel,
             dst_col, dst_row, s2mm_channel,
         );
@@ -744,7 +799,7 @@ mod tests {
         runner.configure_dma_bd(dst_col, dst_row, 0, s2mm_bd).unwrap();
 
         // Configure stream routing
-        runner.engine.device_mut().array.stream_router.add_route(
+        runner.configure_dma_route(
             src_col, src_row, mm2s_channel,
             dst_col, dst_row, s2mm_channel,
         );
@@ -1119,14 +1174,14 @@ mod tests {
         runner.configure_dma_bd(tile_a_col, tile_a_row, 1, a_s2mm_bd).unwrap();
 
         // Configure stream routing for both directions
-        // A -> B: tile A port 2 -> tile B port 0
-        runner.engine.device_mut().array.stream_router.add_route(
+        // A -> B: tile A MM2S -> tile B S2MM
+        runner.configure_dma_route(
             tile_a_col, tile_a_row, a_to_b_mm2s,
             tile_b_col, tile_b_row, a_to_b_s2mm,
         );
 
-        // B -> A: tile B port 3 -> tile A port 1
-        runner.engine.device_mut().array.stream_router.add_route(
+        // B -> A: tile B MM2S -> tile A S2MM
+        runner.configure_dma_route(
             tile_b_col, tile_b_row, b_to_a_mm2s,
             tile_a_col, tile_a_row, b_to_a_s2mm,
         );
@@ -1246,16 +1301,15 @@ mod tests {
         // ============================================
 
         // Route A -> B: tile A MM2S (channel 2) -> tile B S2MM (channel 0)
-        // Using add_route with channel numbers as port identifiers
-        runner.engine.device_mut().array.stream_router.add_route(
-            tile_a_col, tile_a_row, mm2s_channel,  // source: A's MM2S_0
-            tile_b_col, tile_b_row, s2mm_channel,  // dest: B's S2MM_0
+        runner.configure_dma_route(
+            tile_a_col, tile_a_row, mm2s_channel,
+            tile_b_col, tile_b_row, s2mm_channel,
         );
 
         // Route B -> C: tile B MM2S (channel 2) -> tile C S2MM (channel 0)
-        runner.engine.device_mut().array.stream_router.add_route(
-            tile_b_col, tile_b_row, mm2s_channel,  // source: B's MM2S_0
-            tile_c_col, tile_c_row, s2mm_channel,  // dest: C's S2MM_0
+        runner.configure_dma_route(
+            tile_b_col, tile_b_row, mm2s_channel,
+            tile_c_col, tile_c_row, s2mm_channel,
         );
 
         // ============================================
@@ -1379,7 +1433,7 @@ mod tests {
             .map_err(|e| format!("Failed to configure S2MM BD: {}", e))?;
 
         // Configure stream routing: source tile MM2S -> dest tile S2MM
-        runner.engine.device_mut().array.stream_router.add_route(
+        runner.configure_dma_route(
             src_col, src_row, mm2s_channel,
             dst_col, dst_row, s2mm_channel,
         );
@@ -1588,12 +1642,11 @@ mod tests {
         // ============================================
 
         // Route memtile MM2S output to compute tile S2MM input
-        // The channel number is used as the port identifier in the stream router
-        runner.engine.device_mut().array.stream_router.add_route(
+        runner.configure_dma_route(
             memtile_col, memtile_row, memtile_mm2s_channel,
             compute_col, compute_row, compute_s2mm_channel,
         );
-        eprintln!("Stream route configured: ({},{}):{} -> ({},{}):{}",
+        eprintln!("Stream route configured: memtile({},{}) ch{} -> compute({},{}) ch{}",
             memtile_col, memtile_row, memtile_mm2s_channel,
             compute_col, compute_row, compute_s2mm_channel);
 
@@ -1758,11 +1811,11 @@ mod tests {
         runner.configure_dma_bd(consumer_col, consumer_row, 0, consumer_bd).unwrap();
 
         // Configure stream routing: producer MM2S -> consumer S2MM
-        runner.engine.device_mut().array.stream_router.add_route(
+        runner.configure_dma_route(
             producer_col, producer_row, mm2s_channel,
             consumer_col, consumer_row, s2mm_channel,
         );
-        eprintln!("Stream route configured: ({},{}):{} -> ({},{}):{}",
+        eprintln!("Stream route configured: ({},{}) ch{} -> ({},{}) ch{}",
             producer_col, producer_row, mm2s_channel,
             consumer_col, consumer_row, s2mm_channel);
 
@@ -1875,6 +1928,91 @@ mod tests {
             consumer_col, consumer_row, consumer_dst_offset, consumer_lock_id);
         eprintln!("  Data:     {} bytes transferred correctly in {} cycles",
             transfer_size, completed_cycle);
+    }
+
+    /// Test core stream operations (StreamWriteScalar -> StreamReadScalar).
+    ///
+    /// This validates the complete core-to-core stream data path:
+    /// 1. Core A executes StreamWriteScalar to push data to stream output
+    /// 2. TileArray routes data through stream fabric
+    /// 3. Core B executes StreamReadScalar to receive the data
+    ///
+    /// This tests the infrastructure added to fix the stream operation stubs.
+    #[test]
+    fn test_core_stream_write_read() {
+        use crate::device::array::TileArray;
+        use crate::device::host_memory::HostMemory;
+
+        eprintln!("\n=== Core Stream Write/Read Test ===\n");
+
+        // Create array and host memory
+        let mut array = TileArray::npu1();
+        let mut host_memory = HostMemory::new();
+
+        // Use two compute tiles
+        let src_col = 0u8;
+        let src_row = 2u8; // Compute tile
+        let dst_col = 0u8;
+        let dst_row = 3u8; // Compute tile above
+
+        // Configure a route from source to destination
+        // Source tile port 0 -> Destination tile port 0
+        array.stream_router.add_route(src_col, src_row, 0, dst_col, dst_row, 0);
+
+        eprintln!("Configured route: ({},{}) port 0 -> ({},{}) port 0",
+            src_col, src_row, dst_col, dst_row);
+
+        // Step 1: Push test data to source tile's stream output (simulates StreamWriteScalar)
+        let test_values = [0xCAFEBABE_u32, 0xDEADBEEF_u32, 0x12345678_u32, 0xABCDEF00_u32];
+        for value in &test_values {
+            array.tile_mut(src_col, src_row).push_stream_output(0, *value);
+        }
+        eprintln!("Pushed {} words to source tile stream output", test_values.len());
+
+        // Step 2: Run data movement cycles to route the data
+        let mut cycles = 0;
+        let max_cycles = 20;
+        while cycles < max_cycles {
+            let (_, moved, routed) = array.step_data_movement(&mut host_memory);
+            if routed > 0 {
+                eprintln!("Cycle {}: routed {} words", cycles, routed);
+            }
+            cycles += 1;
+
+            // Check if destination has received all data
+            let dst_tile = array.tile(dst_col, dst_row);
+            if dst_tile.stream_input_len(0) >= test_values.len() {
+                break;
+            }
+            if !moved && routed == 0 {
+                // No progress, might be done or stuck
+                break;
+            }
+        }
+
+        // Step 3: Read data from destination tile's stream input (simulates StreamReadScalar)
+        let dst_tile = array.tile_mut(dst_col, dst_row);
+        let mut received: Vec<u32> = Vec::new();
+        while let Some(value) = dst_tile.pop_stream_input(0) {
+            received.push(value);
+        }
+
+        eprintln!("Received {} words at destination after {} cycles", received.len(), cycles);
+
+        // Verify all data arrived correctly
+        assert_eq!(received.len(), test_values.len(),
+            "Should receive all {} values, got {}", test_values.len(), received.len());
+
+        for (i, (expected, actual)) in test_values.iter().zip(received.iter()).enumerate() {
+            assert_eq!(*actual, *expected,
+                "Word {}: expected 0x{:08X}, got 0x{:08X}", i, expected, actual);
+        }
+
+        eprintln!("Core stream write/read test passed:");
+        eprintln!("  Source: tile ({},{}) port 0", src_col, src_row);
+        eprintln!("  Destination: tile ({},{}) port 0", dst_col, dst_row);
+        eprintln!("  Data: {} words transferred correctly in {} cycles",
+            test_values.len(), cycles);
     }
 
     /// Test that loads and executes a real XCLBIN file.

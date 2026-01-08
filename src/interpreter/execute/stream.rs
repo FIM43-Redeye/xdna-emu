@@ -4,6 +4,12 @@
 //! the stream fabric. AIE2 uses streams for tile-to-tile communication via
 //! circuit-switched and packet-switched routing.
 //!
+//! # Architecture Note
+//!
+//! Like [`MemoryUnit`](super::MemoryUnit) and [`ControlUnit`](super::ControlUnit),
+//! stream operations are NOT candidates for semantic dispatch - they interact
+//! with the tile's stream switch hardware rather than just computing values.
+//!
 //! # Operations
 //!
 //! - **StreamWriteScalar**: Write scalar register value to master stream port
@@ -26,13 +32,12 @@
 //! - Blocking reads wait until data is available
 //! - Non-blocking operations return immediately (may drop data or read stale)
 //!
-//! For now, this module implements stubs that log operations. Full stream
-//! buffer integration requires wiring up the StreamSwitch from the Tile.
+//! Stream operations push/pop data to/from the Tile's stream buffers.
+//! The TileArray routes this data through the stream switch fabric.
 
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{Operation, Operand, SlotOp};
 use crate::interpreter::state::ExecutionContext;
-use crate::interpreter::traits::ExecuteResult;
 
 /// Stream operations execution unit.
 ///
@@ -70,17 +75,24 @@ impl StreamOps {
                 // Get the source value from the scalar register
                 let value = Self::get_source_value(op, ctx);
 
-                // Log the operation for debugging/tracing
-                #[cfg(any(test, debug_assertions))]
-                eprintln!(
-                    "[STREAM] WriteScalar: value=0x{:08X} blocking={} (tile {},{}) - STUB",
-                    value, blocking, tile.col, tile.row
+                // Get the port from the second source operand if present, otherwise use port 0
+                // AIE2 stream ops typically encode the port as an immediate operand
+                let port = Self::get_port_from_operands(op);
+
+                log::debug!(
+                    "[STREAM] WriteScalar: value=0x{:08X} port={} blocking={} (tile {},{})",
+                    value, port, blocking, tile.col, tile.row
                 );
 
-                // TODO: Push value to tile's stream output buffer
-                // This requires wiring up StreamSwitch from the Tile
-                // For now, the operation succeeds but data is discarded
-                let _ = (value, blocking, tile);
+                // Push value to tile's stream output buffer
+                // The TileArray will route this data through the stream switch
+                tile.push_stream_output(port, value);
+
+                // Note: For blocking writes, we'd check if the output FIFO is full
+                // and return a stall. For now, the VecDeque is unbounded so writes
+                // always succeed. This matches hardware behavior where backpressure
+                // propagates through the fabric.
+                let _ = blocking; // Unused for now - could add FIFO depth check
 
                 StreamResult::Completed
             }
@@ -89,24 +101,27 @@ impl StreamOps {
                 // Get the header value from the scalar register
                 let header = Self::get_source_value(op, ctx);
 
-                // Log the operation for debugging/tracing
-                #[cfg(any(test, debug_assertions))]
-                eprintln!(
-                    "[STREAM] WritePacketHeader: header=0x{:08X} blocking={} (tile {},{}) - STUB",
-                    header, blocking, tile.col, tile.row
+                // Get the port from operands
+                let port = Self::get_port_from_operands(op);
+
+                log::debug!(
+                    "[STREAM] WritePacketHeader: header=0x{:08X} port={} blocking={} (tile {},{})",
+                    header, port, blocking, tile.col, tile.row
                 );
 
-                // TODO: Push packet header to tile's stream output buffer
+                // Push packet header to tile's stream output buffer
                 // Packet headers contain routing information for packet-switched mode
-                let _ = (header, blocking, tile);
+                // The stream switch will interpret this as a packet header and route accordingly
+                tile.push_stream_output(port, header);
+
+                let _ = blocking; // Unused for now
 
                 StreamResult::Completed
             }
 
             Operation::StreamReadScalar { blocking } => {
-                // Get the stream port from the operation (default to port 0)
-                // TODO: Parse port from instruction encoding
-                let port = 0u8;
+                // Get the stream port from operands (default to port 0)
+                let port = Self::get_port_from_operands(op);
 
                 // Try to pop value from tile's stream input buffer
                 if let Some(value) = tile.pop_stream_input(port) {
@@ -135,6 +150,23 @@ impl StreamOps {
         op.sources
             .first()
             .map_or(0, |src| Self::read_operand(src, ctx))
+    }
+
+    /// Get the stream port from operands.
+    ///
+    /// AIE2 stream operations may encode the port as:
+    /// - An immediate operand (second source)
+    /// - Part of the instruction encoding (in which case decoder should set it)
+    /// - Default to port 0 if not specified
+    fn get_port_from_operands(op: &SlotOp) -> u8 {
+        // Check for a second source that's an immediate (port number)
+        if op.sources.len() >= 2 {
+            if let Operand::Immediate(port) = &op.sources[1] {
+                return (*port as u8) & 0x7; // Ports 0-7
+            }
+        }
+        // Default to port 0 (core port)
+        0
     }
 
     /// Read an operand value from the execution context.
@@ -177,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_write_scalar_handled() {
+    fn test_stream_write_scalar_pushes_data() {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
@@ -189,15 +221,42 @@ mod tests {
         )
         .with_source(Operand::ScalarReg(0));
 
-        // Should return Completed even though it's a stub
         assert_eq!(
             StreamOps::execute(&op, &mut ctx, &mut tile),
             StreamResult::Completed
         );
+
+        // Verify data was actually pushed to stream output
+        assert_eq!(tile.pop_stream_output(0), Some(0xDEADBEEF));
     }
 
     #[test]
-    fn test_stream_write_packet_header_handled() {
+    fn test_stream_write_scalar_with_port() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        ctx.scalar.write(0, 0x12345678);
+
+        // Write to port 3 using immediate operand
+        let op = SlotOp::new(
+            SlotIndex::Scalar0,
+            Operation::StreamWriteScalar { blocking: true },
+        )
+        .with_source(Operand::ScalarReg(0))
+        .with_source(Operand::Immediate(3)); // Port 3
+
+        assert_eq!(
+            StreamOps::execute(&op, &mut ctx, &mut tile),
+            StreamResult::Completed
+        );
+
+        // Verify data went to port 3, not port 0
+        assert_eq!(tile.pop_stream_output(0), None);
+        assert_eq!(tile.pop_stream_output(3), Some(0x12345678));
+    }
+
+    #[test]
+    fn test_stream_write_packet_header_pushes_data() {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
@@ -213,6 +272,9 @@ mod tests {
             StreamOps::execute(&op, &mut ctx, &mut tile),
             StreamResult::Completed
         );
+
+        // Verify packet header was pushed to stream output
+        assert_eq!(tile.pop_stream_output(0), Some(0x12345678));
     }
 
     #[test]

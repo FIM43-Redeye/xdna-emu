@@ -5,7 +5,7 @@
 //!
 //! - **Accurate VLIW handling**: Proper 128-bit bundle decoding with 7 slots
 //! - **TableGen-driven decoding**: Instruction definitions parsed from llvm-aie
-//! - **Swappable execution modes**: Fast mode for speed, cycle-accurate for debugging
+//! - **Cycle-accurate execution**: AM020-based latencies, hazard detection, memory conflicts
 //! - **Easy testing**: Trait abstractions enable mocking and unit testing
 //!
 //! # Architecture
@@ -22,7 +22,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use xdna_emu::interpreter::{InterpreterEngine, FastDecoder, FastExecutor};
+//! use xdna_emu::interpreter::{InterpreterEngine, CycleAccurateExecutor};
 //! use xdna_emu::device::DeviceState;
 //!
 //! let state = DeviceState::new_npu1();
@@ -71,7 +71,7 @@ pub use state::{
 };
 
 // Execute types
-pub use execute::{FastExecutor, CycleAccurateExecutor, CycleAccurateStats, ScalarAlu, VectorAlu, MemoryUnit, ControlUnit};
+pub use execute::{CycleAccurateExecutor, CycleAccurateStats, ScalarAlu, VectorAlu, MemoryUnit, ControlUnit};
 
 // Core types
 pub use core::{CoreInterpreter, CoreStatus, StepResult};

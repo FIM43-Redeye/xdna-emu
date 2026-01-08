@@ -205,15 +205,13 @@ pub trait Decoder: Send + Sync {
 
 /// Trait for executing decoded bundles.
 ///
-/// Implementations can vary in accuracy and performance:
-///
-/// - `FastExecutor`: Executes all slots "instantly", no pipeline modeling
-/// - `CycleAccurateExecutor`: Models pipeline stages and hazards
+/// The `CycleAccurateExecutor` implementation models pipeline stages, register
+/// hazards, and memory bank conflicts to provide cycle-accurate simulation.
 ///
 /// # Example
 ///
 /// ```ignore
-/// let mut executor = FastExecutor::new();
+/// let mut executor = CycleAccurateExecutor::new();
 /// let result = executor.execute(&bundle, &mut ctx, &mut tile);
 /// match result {
 ///     ExecuteResult::Continue => ctx.pc += bundle.size as u32,

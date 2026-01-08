@@ -7,14 +7,14 @@
 //!
 //! # Timing Support
 //!
-//! For cycle-accurate execution, use `TimingContext` which bundles:
+//! All execution is cycle-accurate. The `TimingContext` (always present) includes:
 //! - `HazardDetector`: Tracks RAW/WAW/WAR register hazards
 //! - `MemoryModel`: Tracks memory bank conflicts
 //! - `LatencyTable`: Operation latency lookup
 //!
 //! ```ignore
-//! let mut ctx = ExecutionContext::new();
-//! ctx.enable_timing(); // Enable cycle-accurate tracking
+//! let ctx = ExecutionContext::new();
+//! assert!(ctx.has_timing()); // Always true
 //! ```
 
 use super::registers::{
@@ -329,10 +329,10 @@ pub struct ExecutionContext {
     /// By convention, often r0 or r14.
     lr_reg: u8,
 
-    // === Timing (optional) ===
+    // === Timing ===
     /// Timing context for cycle-accurate execution.
-    /// When None, uses fast mode (1 cycle per instruction).
-    pub timing: Option<TimingContext>,
+    /// Always present - all execution is cycle-accurate.
+    pub timing: TimingContext,
 
     // === VLIW Bundle Support ===
     /// Snapshot of scalar registers for VLIW parallel read semantics.
@@ -370,8 +370,14 @@ impl Default for ExecutionContext {
 
 impl ExecutionContext {
     /// Create a new execution context with all state zeroed.
-    /// Uses fast mode (no timing) by default.
+    ///
+    /// All execution is cycle-accurate with:
+    /// - Hazard detection (RAW, WAW, WAR)
+    /// - Memory bank conflict modeling
+    /// - Event tracing (can be disabled via `timing.disable_tracing()`)
     pub fn new() -> Self {
+        let mut timing = TimingContext::new();
+        timing.enable_tracing(); // Enable event tracing by default for profiling
         Self {
             pc: 0,
             flags: Flags::default(),
@@ -386,7 +392,7 @@ impl ExecutionContext {
             halted: false,
             sp_reg: SpRegister::default(),
             lr_reg: 0, // r0 as link register
-            timing: None,
+            timing,
             scalar_snapshot: None,
             pending_branch: None,
         }
@@ -394,21 +400,10 @@ impl ExecutionContext {
 
     /// Create a new context with cycle-accurate timing enabled.
     ///
-    /// This enables:
-    /// - Hazard detection (RAW, WAW, WAR)
-    /// - Memory bank conflict modeling
-    /// - Event tracing for profiling
-    ///
-    /// Use `disable_tracing()` on the timing context if you need
-    /// cycle-accurate execution without the overhead of event recording.
+    /// This is an alias for `new()` - all execution is now cycle-accurate.
+    #[deprecated(since = "0.2.0", note = "All execution is now cycle-accurate. Use new() instead.")]
     pub fn new_with_timing() -> Self {
-        let mut ctx = Self::new();
-        ctx.enable_timing();
-        // Enable event tracing by default for profiling
-        if let Some(timing) = ctx.timing_context_mut() {
-            timing.enable_tracing();
-        }
-        ctx
+        Self::new()
     }
 
     /// Create a new context with initial stack pointer.
@@ -419,34 +414,39 @@ impl ExecutionContext {
     }
 
     /// Enable cycle-accurate timing.
-    /// This adds overhead but provides accurate cycle counts.
+    ///
+    /// This is now a no-op - all execution is cycle-accurate.
+    #[deprecated(since = "0.2.0", note = "All execution is now cycle-accurate. This method is a no-op.")]
     pub fn enable_timing(&mut self) {
-        if self.timing.is_none() {
-            self.timing = Some(TimingContext::new());
-        }
+        // No-op - timing is always enabled
     }
 
-    /// Disable cycle-accurate timing (switch to fast mode).
+    /// Disable cycle-accurate timing.
+    ///
+    /// This is now a no-op - all execution is cycle-accurate.
+    #[deprecated(since = "0.2.0", note = "All execution is now cycle-accurate. This method is a no-op.")]
     pub fn disable_timing(&mut self) {
-        self.timing = None;
+        // No-op - timing cannot be disabled
     }
 
     /// Check if cycle-accurate timing is enabled.
+    ///
+    /// Always returns `true` - all execution is cycle-accurate.
     #[inline]
     pub fn has_timing(&self) -> bool {
-        self.timing.is_some()
+        true
     }
 
-    /// Get the timing context if enabled.
+    /// Get the timing context.
     #[inline]
-    pub fn timing_context(&self) -> Option<&TimingContext> {
-        self.timing.as_ref()
+    pub fn timing_context(&self) -> &TimingContext {
+        &self.timing
     }
 
-    /// Get mutable timing context if enabled.
+    /// Get mutable timing context.
     #[inline]
-    pub fn timing_context_mut(&mut self) -> Option<&mut TimingContext> {
-        self.timing.as_mut()
+    pub fn timing_context_mut(&mut self) -> &mut TimingContext {
+        &mut self.timing
     }
 
     /// Get the program counter.
@@ -839,36 +839,36 @@ mod tests {
     }
 
     #[test]
-    fn test_timing_context() {
-        // Default: no timing
+    fn test_timing_always_enabled() {
+        // All contexts now have timing enabled
         let ctx = ExecutionContext::new();
-        assert!(!ctx.has_timing());
-        assert!(ctx.timing.is_none());
+        assert!(ctx.has_timing());
 
-        // Create with timing
+        // Legacy constructor also has timing
+        #[allow(deprecated)]
         let ctx_timed = ExecutionContext::new_with_timing();
         assert!(ctx_timed.has_timing());
-        assert!(ctx_timed.timing.is_some());
     }
 
     #[test]
-    fn test_enable_disable_timing() {
+    fn test_timing_context_access() {
         let mut ctx = ExecutionContext::new();
 
-        // Enable timing
+        // Can always access timing context
+        assert!(ctx.has_timing());
+
+        // Access timing context directly (no longer Option)
+        ctx.timing_context_mut().hazard_stalls = 5;
+        assert_eq!(ctx.timing_context().hazard_stalls, 5);
+
+        // Deprecated methods are no-ops
+        #[allow(deprecated)]
         ctx.enable_timing();
         assert!(ctx.has_timing());
 
-        // Access timing context
-        if let Some(timing) = ctx.timing_context_mut() {
-            timing.hazard_stalls = 5;
-        }
-        assert_eq!(ctx.timing_context().unwrap().hazard_stalls, 5);
-
-        // Disable timing
+        #[allow(deprecated)]
         ctx.disable_timing();
-        assert!(!ctx.has_timing());
-        assert!(ctx.timing_context().is_none());
+        assert!(ctx.has_timing()); // Still enabled - disable is now a no-op
     }
 
     #[test]

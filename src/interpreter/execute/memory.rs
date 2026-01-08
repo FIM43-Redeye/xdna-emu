@@ -2,6 +2,33 @@
 //!
 //! Handles load/store operations between registers and tile memory.
 //!
+//! # Architecture Note
+//!
+//! Unlike [`ScalarAlu`](super::ScalarAlu) and [`VectorAlu`](super::VectorAlu),
+//! the memory unit is NOT a legacy fallback - it handles actual memory access
+//! that semantic dispatch cannot replicate (memory ops need tile access).
+//!
+//! ## Execution Flow
+//!
+//! ```text
+//! CycleAccurateExecutor::execute_slot()
+//!         |
+//!         v
+//!   execute_semantic(op, ctx)  <-- Pure register ops only
+//!         |
+//!         v
+//!   ScalarAlu::execute(op, ctx)
+//!         |
+//!         v
+//!   VectorAlu::execute(op, ctx)
+//!         |
+//!         v
+//!   MemoryUnit::execute(op, ctx, tile)  <-- Memory access (this module)
+//! ```
+//!
+//! Memory operations require tile access for actual reads/writes, so they
+//! will always be handled here rather than in semantic dispatch.
+//!
 //! # Addressing
 //!
 //! AIE2 uses pointer registers (p0-p7) for addressing with optional
@@ -191,8 +218,8 @@ impl MemoryUnit {
         width: MemWidth,
         post_modify: &PostModify,
     ) {
-        // Get address from first source operand
-        let addr = Self::get_address(op, ctx);
+        // Get address using store-specific layout: sources[1]=ptr, sources[2]=offset
+        let addr = Self::get_store_address(op, ctx);
 
         // Debug: log store operations with full pointer state
         log::debug!("[STORE] addr=0x{:04X} sources={:?} dest={:?} pointers=[p0=0x{:X},p1=0x{:X},p2=0x{:X},p3=0x{:X}]",
@@ -462,26 +489,89 @@ impl MemoryUnit {
     }
 
     /// Get address from memory operand or pointer register.
+    ///
+    /// For indexed addressing (ptr + offset), the offset is a word index
+    /// that gets scaled by the element size (4 bytes for Word width).
     fn get_address(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
-        op.sources.first().map_or(0, |src| match src {
-            Operand::Memory { base, offset } => {
-                let base_addr = ctx.pointer.read(*base);
-                base_addr.wrapping_add(*offset as i32 as u32)
-            }
+        // First check for Memory operand (encapsulates ptr+offset, already scaled)
+        if let Some(Operand::Memory { base, offset }) = op.sources.first() {
+            let base_addr = ctx.pointer.read(*base);
+            return base_addr.wrapping_add(*offset as i32 as u32);
+        }
+
+        // Handle indexed addressing: sources[0]=ptr, sources[1]=offset
+        // Offset is a word index, scaled by 4 bytes
+        let base_addr = op.sources.first().map_or(0, |src| match src {
             Operand::PointerReg(r) => ctx.pointer.read(*r),
             Operand::ScalarReg(r) => ctx.scalar.read(*r),
             Operand::Immediate(v) => *v as u32,
             _ => 0,
-        })
+        });
+
+        let offset = op.sources.get(1).map_or(0, |src| match src {
+            Operand::Immediate(v) => (*v as i32 * 4) as u32, // Scale by word size
+            Operand::ScalarReg(r) => ctx.scalar.read(*r).wrapping_mul(4),
+            _ => 0,
+        });
+
+        base_addr.wrapping_add(offset)
+    }
+
+    /// Get store address.
+    ///
+    /// Handles two operand layouts:
+    /// 1. Decoded kernel: sources[0]=value, sources[1]=ptr, sources[2]=offset
+    /// 2. Test/legacy: sources[0]=ptr (no offset)
+    ///
+    /// Offset is a word index, scaled by 4 bytes.
+    fn get_store_address(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
+        // First check for Memory operand anywhere (encapsulates ptr+offset)
+        for src in &op.sources {
+            if let Operand::Memory { base, offset } = src {
+                let base_addr = ctx.pointer.read(*base);
+                return base_addr.wrapping_add(*offset as i32 as u32);
+            }
+        }
+
+        // Check if sources[0] is a pointer (test/legacy layout)
+        if let Some(Operand::PointerReg(r)) = op.sources.first() {
+            return ctx.pointer.read(*r);
+        }
+
+        // Otherwise: kernel layout - sources[1] is pointer, sources[2] is offset
+        let ptr_val = op.sources.get(1).map_or(0, |src| match src {
+            Operand::PointerReg(r) => ctx.pointer.read(*r),
+            Operand::ScalarReg(r) => ctx.scalar.read(*r),
+            Operand::Immediate(v) => *v as u32,
+            _ => 0,
+        });
+
+        let offset = op.sources.get(2).map_or(0, |src| match src {
+            Operand::Immediate(v) => (*v as i32 * 4) as u32, // Scale by word size
+            Operand::ScalarReg(r) => ctx.scalar.read(*r).wrapping_mul(4),
+            _ => 0,
+        });
+
+        ptr_val.wrapping_add(offset)
     }
 
     /// Get value to store.
     ///
+    /// Handles two operand layouts:
+    /// 1. Decoded kernel: sources[0]=value, sources[1]=ptr, sources[2]=offset
+    /// 2. Test/legacy: sources[0]=ptr, dest=value
+    ///
     /// Uses `ctx.scalar_read()` for VLIW-safe reads that respect the
     /// bundle snapshot when inside a VLIW bundle.
     fn get_store_value(op: &SlotOp, ctx: &ExecutionContext, width: MemWidth) -> u64 {
-        // For stores, the value is typically in the second source or in dest
-        let operand = op.sources.get(1).or(op.dest.as_ref());
+        // If sources[0] is a pointer/memory operand, value is in dest (test layout)
+        // Otherwise, sources[0] is the value (kernel layout)
+        let operand = op.sources.first().and_then(|first| {
+            match first {
+                Operand::PointerReg(_) | Operand::Memory { .. } => op.dest.as_ref(),
+                _ => Some(first),
+            }
+        }).or(op.dest.as_ref());
 
         operand.map_or(0, |src| match src {
             Operand::ScalarReg(r) => ctx.scalar_read(*r) as u64,

@@ -1,6 +1,32 @@
 //! Control unit execution.
 //!
-//! Handles control flow and synchronization operations:
+//! Handles control flow and synchronization operations.
+//!
+//! # Architecture Note
+//!
+//! Like [`MemoryUnit`](super::MemoryUnit), the control unit is NOT a legacy
+//! fallback - it handles operations that have side effects beyond register
+//! writes (branches change PC, locks affect tile state, etc.).
+//!
+//! ## Execution Flow
+//!
+//! ```text
+//! CycleAccurateExecutor::execute_slot()
+//!         |
+//!         v
+//!   execute_semantic(op, ctx)  <-- Pure register ops only
+//!         |
+//!         v
+//!   ScalarAlu / VectorAlu / MemoryUnit / StreamOps
+//!         |
+//!         v
+//!   ControlUnit::execute(op, ctx, tile)  <-- Control flow (this module)
+//! ```
+//!
+//! Control operations return `ExecuteResult` variants (Branch, Halt, WaitLock,
+//! etc.) that affect the interpreter's execution flow.
+//!
+//! # Operations
 //!
 //! - **Branch**: Conditional and unconditional branches
 //! - **Call/Return**: Subroutine calls with link register
@@ -23,7 +49,7 @@
 //!
 //! See AM020 Ch2 and AM025 Lock_Request register for details.
 
-use crate::device::tile::{Tile, LockResult};
+use crate::device::tile::{Lock, Tile, LockResult};
 use crate::interpreter::bundle::{BranchCondition, Operation, Operand, SlotOp};
 use crate::interpreter::state::ExecutionContext;
 use crate::interpreter::traits::{ExecuteResult, Flags, StateAccess};
@@ -35,10 +61,29 @@ impl ControlUnit {
     /// Execute a control operation.
     ///
     /// Returns `Some(result)` if handled, `None` if not a control op.
+    ///
+    /// # Memory Module Lock Routing
+    ///
+    /// For compute tiles, lock IDs 48-63 access the adjacent memory tile's locks 0-15.
+    /// Pass `mem_tile_locks` to enable proper cross-tile lock routing. When `None`,
+    /// all lock operations use the compute tile's local locks (legacy behavior).
     pub fn execute(
         op: &SlotOp,
         ctx: &mut ExecutionContext,
         tile: &mut Tile,
+    ) -> Option<ExecuteResult> {
+        Self::execute_with_mem_locks(op, ctx, tile, None)
+    }
+
+    /// Execute a control operation with optional memory tile lock routing.
+    ///
+    /// When `mem_tile_locks` is provided, lock IDs 48-63 are routed to the memory
+    /// tile's locks 0-15 instead of the compute tile's local locks.
+    pub fn execute_with_mem_locks(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        tile: &mut Tile,
+        mut mem_tile_locks: Option<&mut [Lock; 64]>,
     ) -> Option<ExecuteResult> {
         match &op.op {
             Operation::Branch { condition } => {
@@ -90,20 +135,28 @@ impl ControlUnit {
             Operation::LockAcquire => {
                 let (raw_lock_id, expected, delta) = Self::get_lock_acquire_params(op);
                 // AIE-ML lock mapping: lock IDs 48-63 in core instructions
-                // map to memory module locks 0-15
+                // access the local memory module's locks 0-15 (NOT the adjacent MemTile!)
+                // The memory module is part of the same compute tile - it's the 64KB data memory.
                 let lock_id = Self::map_lock_id(raw_lock_id);
-                let current_value = tile.locks[lock_id as usize].value;
-                let lock = &mut tile.locks[lock_id as usize];
+                let is_mem_module = raw_lock_id >= 48;
+
+                // Always use local tile locks - memory module locks are LOCAL to the tile
+                // The mem_tile_locks parameter is not used for core lock instructions.
+                let locks: &mut [Lock; 64] = &mut tile.locks;
+                let _ = mem_tile_locks; // silence unused warning
+
+                let current_value = locks[lock_id as usize].value;
+                let lock = &mut locks[lock_id as usize];
 
                 match lock.acquire_with_value(expected, delta) {
                     LockResult::Success => {
-                        log::debug!("LockAcquire raw={} mapped={} expected={} delta={} current={} -> {} SUCCESS",
-                            raw_lock_id, lock_id, expected, delta, current_value, lock.value);
+                        log::debug!("LockAcquire raw={} mapped={} expected={} delta={} current={} -> {} SUCCESS (mem_module={})",
+                            raw_lock_id, lock_id, expected, delta, current_value, lock.value, is_mem_module);
                         Some(ExecuteResult::Continue)
                     }
                     LockResult::WouldUnderflow => {
-                        log::debug!("LockAcquire raw={} mapped={} expected={} current={} -> WAIT",
-                            raw_lock_id, lock_id, expected, current_value);
+                        log::debug!("LockAcquire raw={} mapped={} expected={} current={} -> WAIT (mem_module={})",
+                            raw_lock_id, lock_id, expected, current_value, is_mem_module);
                         Some(ExecuteResult::WaitLock { lock_id })
                     }
                     LockResult::WouldOverflow => {
@@ -116,17 +169,27 @@ impl ControlUnit {
             Operation::LockRelease => {
                 let (raw_lock_id, delta) = Self::get_lock_release_params(op);
                 // AIE-ML lock mapping: lock IDs 48-63 in core instructions
-                // map to memory module locks 0-15
+                // access the local memory module's locks 0-15 (NOT the adjacent MemTile!)
                 let lock_id = Self::map_lock_id(raw_lock_id);
+                let is_mem_module = raw_lock_id >= 48;
+
+                // Capture tile info before borrowing locks
+                let tile_col = tile.col;
+                let tile_row = tile.row;
                 let tile_ptr = tile as *const _ as usize;
-                let lock_ptr = &tile.locks[lock_id as usize] as *const _ as usize;
-                let old_value = tile.locks[lock_id as usize].value;
-                let lock = &mut tile.locks[lock_id as usize];
+
+                // Always use local tile locks - memory module locks are LOCAL to the tile
+                let locks: &mut [Lock; 64] = &mut tile.locks;
+                let _ = mem_tile_locks; // silence unused warning
+
+                let lock_ptr = &locks[lock_id as usize] as *const _ as usize;
+                let old_value = locks[lock_id as usize].value;
+                let lock = &mut locks[lock_id as usize];
 
                 // Release is non-blocking; overflow just saturates
                 lock.release_with_value(delta);
-                log::info!("LockRelease tile({},{}) raw={} mapped={} delta={} {} -> {} (tile_ptr=0x{:x} lock_ptr=0x{:x})",
-                    tile.col, tile.row, raw_lock_id, lock_id, delta, old_value, lock.value,
+                log::info!("LockRelease tile({},{}) raw={} mapped={} delta={} {} -> {} (mem_module={} tile_ptr=0x{:x} lock_ptr=0x{:x})",
+                    tile_col, tile_row, raw_lock_id, lock_id, delta, old_value, lock.value, is_mem_module,
                     tile_ptr, lock_ptr);
                 Some(ExecuteResult::Continue)
             }

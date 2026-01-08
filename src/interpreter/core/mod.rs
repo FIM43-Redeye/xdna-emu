@@ -16,10 +16,10 @@
 //! # Example
 //!
 //! ```ignore
-//! use xdna_emu::interpreter::{CoreInterpreter, InstructionDecoder, FastExecutor};
+//! use xdna_emu::interpreter::{CoreInterpreter, InstructionDecoder, CycleAccurateExecutor};
 //!
 //! let decoder = InstructionDecoder::load_default();
-//! let executor = FastExecutor::new();
+//! let executor = CycleAccurateExecutor::new();
 //! let mut interpreter = CoreInterpreter::new(decoder, executor);
 //!
 //! // Run 100 cycles or until stall/halt
@@ -35,13 +35,13 @@ mod tests {
     use super::*;
     use crate::device::tile::Tile;
     use crate::interpreter::decode::InstructionDecoder;
-    use crate::interpreter::execute::FastExecutor;
+    use crate::interpreter::execute::CycleAccurateExecutor;
     use crate::interpreter::state::ExecutionContext;
 
     #[test]
     fn test_core_interpreter_basic() {
         let decoder = InstructionDecoder::load_default();
-        let executor = FastExecutor::new();
+        let executor = CycleAccurateExecutor::new();
         let mut interpreter = CoreInterpreter::new(decoder, executor);
 
         let mut ctx = ExecutionContext::new();

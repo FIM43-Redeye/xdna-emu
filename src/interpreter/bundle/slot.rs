@@ -17,6 +17,9 @@
 
 use smallvec::SmallVec;
 
+// TableGen-derived semantic information
+use crate::tablegen::{ImplicitReg, SemanticOp};
+
 /// Slot index within a VLIW bundle.
 ///
 /// AIE2 has 7 execution slots that can potentially operate in parallel.
@@ -928,13 +931,33 @@ pub struct Predicate {
 /// A single slot operation within a VLIW bundle.
 ///
 /// Contains the operation, its operands, and optional predicate.
+///
+/// # TableGen Integration
+///
+/// The `semantic` and `implicit_regs` fields are populated from TableGen data
+/// when available. This enables:
+/// - `semantic`: Dispatch to ~40 generic handlers instead of 130+ Operation variants
+/// - `implicit_regs`: Handle instructions like `sel.eqz` that read r27 implicitly
+///
+/// During the migration, both `op` and `semantic` may be set. Executors should
+/// prefer `semantic` when present for instructions that have been migrated.
 #[derive(Debug, Clone)]
 pub struct SlotOp {
     /// Which slot this operation occupies.
     pub slot: SlotIndex,
-    /// The specific operation.
+    /// The specific operation (legacy - being replaced by semantic).
     pub op: Operation,
-    /// Source operands.
+    /// TableGen-derived semantic operation (when available).
+    ///
+    /// This represents *what* the instruction computes (Add, Sub, Select, etc.)
+    /// independent of slot, element type, or encoding details.
+    pub semantic: Option<SemanticOp>,
+    /// Implicit register uses/defs from TableGen.
+    ///
+    /// For example, `sel.eqz` uses r27 implicitly to read the test value.
+    /// This is not encoded in the instruction bits - TableGen tells us it's fixed.
+    pub implicit_regs: SmallVec<[ImplicitReg; 2]>,
+    /// Source operands (ordered per InstrDef.inputs when semantic is set).
     pub sources: SmallVec<[Operand; 4]>,
     /// Destination operand (if any).
     pub dest: Option<Operand>,
@@ -948,10 +971,41 @@ impl SlotOp {
         Self {
             slot,
             op,
+            semantic: None,
+            implicit_regs: SmallVec::new(),
             sources: SmallVec::new(),
             dest: None,
             predicate: None,
         }
+    }
+
+    /// Create a new slot operation with TableGen semantic info.
+    pub fn with_semantic(slot: SlotIndex, op: Operation, semantic: SemanticOp) -> Self {
+        Self {
+            slot,
+            op,
+            semantic: Some(semantic),
+            implicit_regs: SmallVec::new(),
+            sources: SmallVec::new(),
+            dest: None,
+            predicate: None,
+        }
+    }
+
+    /// Add implicit registers from TableGen.
+    pub fn with_implicit_regs(mut self, regs: impl IntoIterator<Item = ImplicitReg>) -> Self {
+        self.implicit_regs.extend(regs);
+        self
+    }
+
+    /// Get an implicit register use by register number.
+    ///
+    /// Returns the register number if found and it's a use (not a def).
+    pub fn get_implicit_use(&self, reg_num: u8) -> Option<u8> {
+        self.implicit_regs
+            .iter()
+            .find(|ir| ir.reg_num == reg_num && ir.is_use)
+            .map(|ir| ir.reg_num)
     }
 
     /// Add a source operand.

@@ -3,16 +3,12 @@
 //! The engine manages multiple core interpreters and coordinates their execution.
 //! It also coordinates DMA engines and host memory for data transfers.
 //!
-//! # Execution Modes
+//! # Execution Mode
 //!
-//! The engine supports two execution modes:
-//!
-//! - **Fast mode** (`InterpreterEngine::new()`): Uses `FastExecutor` for quick
-//!   functional simulation. All instructions execute in 1 cycle.
-//!
-//! - **Cycle-accurate mode** (`InterpreterEngine::new_cycle_accurate()`): Uses
-//!   `CycleAccurateExecutor` with full timing model - hazard detection, memory
-//!   bank conflicts, branch penalties, and event tracing.
+//! All execution is cycle-accurate using `CycleAccurateExecutor` with full
+//! AM020 timing model - hazard detection, memory bank conflicts, branch
+//! penalties, and event tracing. This ensures consistent, accurate behavior
+//! that matches the real hardware.
 
 use crate::device::dma::ChannelState;
 use crate::device::host_memory::HostMemory;
@@ -22,7 +18,7 @@ use crate::parser::{AieElf, MemoryRegion};
 use crate::interpreter::bundle::VliwBundle;
 use crate::interpreter::core::{CoreInterpreter, CoreStatus, StepResult};
 use crate::interpreter::decode::InstructionDecoder;
-use crate::interpreter::execute::{CycleAccurateExecutor, FastExecutor};
+use crate::interpreter::execute::CycleAccurateExecutor;
 use crate::interpreter::state::ExecutionContext;
 
 /// Engine execution status.
@@ -42,91 +38,13 @@ pub enum EngineStatus {
     Error,
 }
 
-/// Type alias for fast interpreter (no timing).
-type FastInterpreter = CoreInterpreter<InstructionDecoder, FastExecutor>;
-
-/// Type alias for cycle-accurate interpreter (full timing).
-type CycleAccurateInterpreter = CoreInterpreter<InstructionDecoder, CycleAccurateExecutor>;
-
-/// Interpreter variant - either fast or cycle-accurate.
-///
-/// This enum allows the engine to switch between execution modes at creation time.
-/// Fast mode is used for quick functional testing, while cycle-accurate mode
-/// provides detailed timing information for performance analysis.
-enum InterpreterKind {
-    /// Fast execution mode (1 cycle per instruction, no hazard tracking).
-    Fast(FastInterpreter),
-    /// Cycle-accurate execution mode (models pipeline, hazards, memory timing).
-    CycleAccurate(CycleAccurateInterpreter),
-}
-
-impl InterpreterKind {
-    /// Create a new fast interpreter.
-    fn new_fast() -> Self {
-        Self::Fast(CoreInterpreter::new(
-            InstructionDecoder::load_default(),
-            FastExecutor::new(),
-        ))
-    }
-
-    /// Create a new cycle-accurate interpreter.
-    fn new_cycle_accurate() -> Self {
-        Self::CycleAccurate(CoreInterpreter::new(
-            InstructionDecoder::load_default(),
-            CycleAccurateExecutor::new(),
-        ))
-    }
-
-    /// Execute a single step.
-    fn step(&mut self, ctx: &mut ExecutionContext, tile: &mut crate::device::tile::Tile) -> StepResult {
-        match self {
-            Self::Fast(interp) => interp.step(ctx, tile),
-            Self::CycleAccurate(interp) => interp.step(ctx, tile),
-        }
-    }
-
-    /// Get interpreter status.
-    fn status(&self) -> CoreStatus {
-        match self {
-            Self::Fast(interp) => interp.status(),
-            Self::CycleAccurate(interp) => interp.status(),
-        }
-    }
-
-    /// Check if halted.
-    fn is_halted(&self) -> bool {
-        match self {
-            Self::Fast(interp) => interp.is_halted(),
-            Self::CycleAccurate(interp) => interp.is_halted(),
-        }
-    }
-
-    /// Reset the interpreter.
-    fn reset(&mut self) {
-        match self {
-            Self::Fast(interp) => interp.reset(),
-            Self::CycleAccurate(interp) => interp.reset(),
-        }
-    }
-
-    /// Check if this is cycle-accurate mode.
-    fn is_cycle_accurate(&self) -> bool {
-        matches!(self, Self::CycleAccurate(_))
-    }
-
-    /// Get the last decoded bundle (for debugging).
-    fn last_bundle(&self) -> Option<&VliwBundle> {
-        match self {
-            Self::Fast(interp) => interp.last_bundle(),
-            Self::CycleAccurate(interp) => interp.last_bundle(),
-        }
-    }
-}
+/// Type alias for the cycle-accurate interpreter.
+type Interpreter = CoreInterpreter<InstructionDecoder, CycleAccurateExecutor>;
 
 /// Per-core state managed by the engine.
 struct CoreState {
-    /// Core interpreter (fast or cycle-accurate).
-    interpreter: InterpreterKind,
+    /// Core interpreter (cycle-accurate).
+    interpreter: Interpreter,
     /// Execution context (registers, PC, flags).
     context: ExecutionContext,
     /// Is this core enabled?
@@ -134,20 +52,14 @@ struct CoreState {
 }
 
 impl CoreState {
-    /// Create a new core state with fast executor.
+    /// Create a new core state with cycle-accurate executor.
     fn new() -> Self {
         Self {
-            interpreter: InterpreterKind::new_fast(),
+            interpreter: CoreInterpreter::new(
+                InstructionDecoder::load_default(),
+                CycleAccurateExecutor::new(),
+            ),
             context: ExecutionContext::new(),
-            enabled: false,
-        }
-    }
-
-    /// Create a new core state with cycle-accurate executor.
-    fn new_cycle_accurate() -> Self {
-        Self {
-            interpreter: InterpreterKind::new_cycle_accurate(),
-            context: ExecutionContext::new_with_timing(),
             enabled: false,
         }
     }
@@ -158,10 +70,9 @@ impl CoreState {
 /// Coordinates execution across all compute cores in the device.
 /// Also manages DMA engines and host memory for data transfers.
 ///
-/// # Execution Modes
-///
-/// Create with `new()` for fast functional simulation, or `new_cycle_accurate()`
-/// for detailed timing with hazard detection, memory conflicts, and event tracing.
+/// All execution is cycle-accurate with AM020-based timing - register hazard
+/// detection (RAW, WAW, WAR), memory bank conflict modeling, branch penalties,
+/// and event tracing for profiling.
 pub struct InterpreterEngine {
     /// Device state (tiles, memory, locks, DMA engines).
     device: DeviceState,
@@ -183,8 +94,6 @@ pub struct InterpreterEngine {
     total_instructions: u64,
     /// Auto-run mode.
     auto_run: bool,
-    /// Whether cycle-accurate timing is enabled.
-    cycle_accurate: bool,
     /// Counter for cycles with no progress while all cores halted.
     /// Used to detect deadlock where DMAs are stalled waiting for resources.
     no_progress_cycles: u32,
@@ -193,38 +102,21 @@ pub struct InterpreterEngine {
 }
 
 impl InterpreterEngine {
-    /// Create a new engine from device state (fast mode).
+    /// Create a new engine from device state.
     ///
-    /// Uses `FastExecutor` - all instructions execute in 1 cycle with no
-    /// pipeline modeling. Ideal for quick functional testing.
-    pub fn new(device: DeviceState) -> Self {
-        Self::with_mode(device, false)
-    }
-
-    /// Create a new engine with cycle-accurate timing.
-    ///
-    /// Uses `CycleAccurateExecutor` with full timing model:
+    /// Uses `CycleAccurateExecutor` with full AM020 timing model:
     /// - Register hazard detection (RAW, WAW, WAR)
     /// - Memory bank conflict modeling
     /// - Branch penalty tracking
     /// - Event tracing for profiling
-    pub fn new_cycle_accurate(device: DeviceState) -> Self {
-        Self::with_mode(device, true)
-    }
-
-    /// Internal constructor with timing mode flag.
-    fn with_mode(device: DeviceState, cycle_accurate: bool) -> Self {
+    pub fn new(device: DeviceState) -> Self {
         let cols = device.cols();
         let rows = device.rows();
         let compute_row_start = 2; // Rows 0=shim, 1=memtile, 2+=compute
 
         // Create core states for all possible positions
         let num_cores = cols * rows;
-        let cores = if cycle_accurate {
-            (0..num_cores).map(|_| CoreState::new_cycle_accurate()).collect()
-        } else {
-            (0..num_cores).map(|_| CoreState::new()).collect()
-        };
+        let cores = (0..num_cores).map(|_| CoreState::new()).collect();
 
         Self {
             device,
@@ -237,35 +129,51 @@ impl InterpreterEngine {
             total_cycles: 0,
             total_instructions: 0,
             auto_run: false,
-            cycle_accurate,
             no_progress_cycles: 0,
             last_words_routed: 0,
         }
     }
 
-    /// Create engine for NPU1 (Phoenix) in fast mode.
+    /// Create a new engine with cycle-accurate timing.
+    ///
+    /// This is an alias for `new()` - all execution is now cycle-accurate.
+    /// Preserved for backward compatibility.
+    #[deprecated(since = "0.2.0", note = "All execution is now cycle-accurate. Use new() instead.")]
+    pub fn new_cycle_accurate(device: DeviceState) -> Self {
+        Self::new(device)
+    }
+
+    /// Create engine for NPU1 (Phoenix).
     pub fn new_npu1() -> Self {
         Self::new(DeviceState::new_npu1())
     }
 
-    /// Create engine for NPU2 (Strix) in fast mode.
+    /// Create engine for NPU2 (Strix).
     pub fn new_npu2() -> Self {
         Self::new(DeviceState::new_npu2())
     }
 
     /// Create engine for NPU1 (Phoenix) with cycle-accurate timing.
+    ///
+    /// This is an alias for `new_npu1()` - all execution is now cycle-accurate.
+    #[deprecated(since = "0.2.0", note = "All execution is now cycle-accurate. Use new_npu1() instead.")]
     pub fn new_cycle_accurate_npu1() -> Self {
-        Self::new_cycle_accurate(DeviceState::new_npu1())
+        Self::new_npu1()
     }
 
     /// Create engine for NPU2 (Strix) with cycle-accurate timing.
+    ///
+    /// This is an alias for `new_npu2()` - all execution is now cycle-accurate.
+    #[deprecated(since = "0.2.0", note = "All execution is now cycle-accurate. Use new_npu2() instead.")]
     pub fn new_cycle_accurate_npu2() -> Self {
-        Self::new_cycle_accurate(DeviceState::new_npu2())
+        Self::new_npu2()
     }
 
     /// Check if this engine is running in cycle-accurate mode.
+    ///
+    /// Always returns `true` - all execution is now cycle-accurate.
     pub fn is_cycle_accurate(&self) -> bool {
-        self.cycle_accurate
+        true
     }
 
     /// Get the engine status.
@@ -421,9 +329,13 @@ impl InterpreterEngine {
     ///
     /// The execution order is:
     /// 1. Sync DMA start requests from tiles to DMA engines
-    /// 2. Step all compute cores
-    /// 3. Step all DMA engines
+    /// 2. Step all DMA engines (so lock releases are visible to cores)
+    /// 3. Step all compute cores (with fresh lock snapshot from MemTile)
     /// 4. Update tile DMA channel state from engine state
+    ///
+    /// Note: DMA steps before cores so that when a core copies MemTile locks
+    /// for memory module access (lock IDs 48-63), it sees the locks that
+    /// DMA just released. This is critical for producer/consumer sync.
     pub fn step(&mut self) {
         if matches!(self.status, EngineStatus::Halted | EngineStatus::Error) {
             return;
@@ -436,13 +348,43 @@ impl InterpreterEngine {
         // Phase 1: Sync DMA start requests from tiles to DMA engines
         self.sync_dma_start_requests();
 
-        // Phase 2: Step each enabled core
+        // Phase 2: Step all DMA engines and stream routing FIRST
+        // This ensures lock releases from DMA are visible when cores
+        // snapshot MemTile locks for memory module access.
+        let (dma_active, streams_moved, words_routed) =
+            self.device.array.step_data_movement(&mut self.host_memory);
+        if dma_active || streams_moved {
+            any_running = true;
+        }
+
+        // Debug: trace coordinator step decisions (first 5 cycles)
+        static COORD_TRACE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let trace_count = COORD_TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if trace_count < 5 {
+            log::info!("COORD_STEP[{}] dma_active={} streams_moved={} words_routed={} any_running={}",
+                trace_count, dma_active, streams_moved, words_routed, any_running);
+        }
+
+        // Phase 3: Step each enabled core (after DMA, so locks are up-to-date)
         for col in 0..self.cols {
             for row in self.compute_row_start..self.rows {
                 let idx = col * self.rows + row;
 
                 if !self.cores[idx].enabled {
                     continue;
+                }
+
+                // For compute tiles, we need memory module lock routing.
+                // Memory module locks (48-63) should access the MemTile (row 1) locks.
+                // Copy MemTile locks before stepping, then copy changes back after.
+                let mem_tile_row = 1; // MemTile is always row 1
+                let mut mem_tile_locks_copy: Option<[crate::device::tile::Lock; 64]> = None;
+
+                // Copy memory tile locks if we're in a compute row
+                if row > mem_tile_row {
+                    if let Some(mem_tile) = self.device.tile(col, mem_tile_row) {
+                        mem_tile_locks_copy = Some(mem_tile.locks);
+                    }
                 }
 
                 // Get tile for this core
@@ -452,7 +394,13 @@ impl InterpreterEngine {
                     }
 
                     let core = &mut self.cores[idx];
-                    let result = core.interpreter.step(&mut core.context, tile);
+
+                    // Step with memory tile locks for proper routing of lock IDs 48-63
+                    let result = if let Some(ref mut mem_locks) = mem_tile_locks_copy {
+                        core.interpreter.step_with_mem_locks(&mut core.context, tile, Some(mem_locks))
+                    } else {
+                        core.interpreter.step(&mut core.context, tile)
+                    };
 
                     match result {
                         StepResult::Continue => {
@@ -467,22 +415,30 @@ impl InterpreterEngine {
                         }
                         StepResult::Halt => {
                             // This core halted - don't set all_halted=false
+                            if trace_count < 5 {
+                                log::info!("COORD_STEP[{}] core({},{}) halted", trace_count, col, row);
+                            }
                         }
-                        StepResult::DecodeError(_) | StepResult::ExecError(_) => {
+                        StepResult::DecodeError(ref e) => {
+                            log::error!("COORD_STEP[{}] core({},{}) DecodeError: {:?}", trace_count, col, row, e);
+                            self.status = EngineStatus::Error;
+                            return;
+                        }
+                        StepResult::ExecError(ref e) => {
+                            log::error!("COORD_STEP[{}] core({},{}) ExecError: {:?}", trace_count, col, row, e);
                             self.status = EngineStatus::Error;
                             return;
                         }
                     }
                 }
-            }
-        }
 
-        // Phase 3: Step all DMA engines and stream routing
-        // This includes: DMA transfers, DMA-to-stream routing, and stream propagation
-        let (dma_active, streams_moved, words_routed) =
-            self.device.array.step_data_movement(&mut self.host_memory);
-        if dma_active || streams_moved {
-            any_running = true;
+                // Copy modified memory tile locks back to the MemTile
+                if let Some(mem_locks) = mem_tile_locks_copy {
+                    if let Some(mem_tile) = self.device.tile_mut(col, mem_tile_row) {
+                        mem_tile.locks = mem_locks;
+                    }
+                }
+            }
         }
 
         // Phase 4: Update tile DMA channel state from engine state
@@ -509,7 +465,12 @@ impl InterpreterEngine {
         let any_cores_enabled = self.cores.iter().any(|c| c.enabled);
 
         // Case 1: No cores enabled - halt if no activity at all
+        if trace_count < 5 {
+            log::info!("COORD_STEP[{}] halt_check: any_cores_enabled={} any_running={} all_halted={}",
+                trace_count, any_cores_enabled, any_running, all_halted);
+        }
         if !any_cores_enabled && !any_running {
+            log::info!("COORD_STEP halting: no cores enabled and no activity");
             self.status = EngineStatus::Halted;
             return;
         }
@@ -982,8 +943,8 @@ mod tests {
     // --- Cycle-accurate mode tests ---
 
     #[test]
-    fn test_cycle_accurate_engine_creation() {
-        let engine = InterpreterEngine::new_cycle_accurate_npu1();
+    fn test_engine_is_always_cycle_accurate() {
+        let engine = InterpreterEngine::new_npu1();
 
         assert!(engine.is_cycle_accurate());
         assert_eq!(engine.status(), EngineStatus::Ready);
@@ -991,28 +952,32 @@ mod tests {
     }
 
     #[test]
-    fn test_fast_vs_cycle_accurate_mode() {
-        // Verify fast mode creates fast executor
-        let fast_engine = InterpreterEngine::new_npu1();
-        assert!(!fast_engine.is_cycle_accurate());
+    fn test_all_execution_is_cycle_accurate() {
+        // All engines are now cycle-accurate
+        let engine1 = InterpreterEngine::new_npu1();
+        assert!(engine1.is_cycle_accurate());
 
-        // Verify cycle-accurate mode creates cycle-accurate executor
-        let accurate_engine = InterpreterEngine::new_cycle_accurate_npu1();
-        assert!(accurate_engine.is_cycle_accurate());
+        let engine2 = InterpreterEngine::new_npu2();
+        assert!(engine2.is_cycle_accurate());
+
+        // Legacy constructors (deprecated) also return cycle-accurate engines
+        #[allow(deprecated)]
+        let engine3 = InterpreterEngine::new_cycle_accurate_npu1();
+        assert!(engine3.is_cycle_accurate());
     }
 
     #[test]
-    fn test_cycle_accurate_timing_context_enabled() {
-        let engine = InterpreterEngine::new_cycle_accurate_npu1();
+    fn test_timing_context_enabled() {
+        let engine = InterpreterEngine::new_npu1();
 
         // Core contexts should have timing enabled
         let ctx = engine.core_context(0, 2).unwrap();
-        assert!(ctx.has_timing(), "Cycle-accurate cores should have timing context");
+        assert!(ctx.has_timing(), "Cores should have timing context");
     }
 
     #[test]
     fn test_cycle_accurate_step() {
-        let mut engine = InterpreterEngine::new_cycle_accurate_npu1();
+        let mut engine = InterpreterEngine::new_npu1();
 
         // Enable a core and write NOP to program memory
         engine.enable_core(0, 2);
@@ -1033,8 +998,8 @@ mod tests {
     }
 
     #[test]
-    fn test_cycle_accurate_npu2() {
-        let engine = InterpreterEngine::new_cycle_accurate_npu2();
+    fn test_npu2_is_cycle_accurate() {
+        let engine = InterpreterEngine::new_npu2();
         assert!(engine.is_cycle_accurate());
     }
 }

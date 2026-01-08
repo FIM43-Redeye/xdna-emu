@@ -1,8 +1,8 @@
 //! Cycle-accurate executor implementation.
 //!
 //! The `CycleAccurateExecutor` models pipeline stages, register hazards, and
-//! memory bank conflicts to provide accurate cycle counts. This is slower
-//! than `FastExecutor` but essential for performance analysis.
+//! memory bank conflicts to provide accurate cycle counts. This executor
+//! provides the accurate timing behavior that matches real hardware.
 //!
 //! # Timing Model
 //!
@@ -100,6 +100,8 @@ impl CycleAccurateExecutor {
     }
 
     /// Check for register hazards and return stall cycles needed.
+    /// Reserved for future cycle-accurate pipeline hazard integration.
+    #[allow(dead_code)]
     fn check_hazards(&self, op: &SlotOp) -> u8 {
         let hazards = self.hazards.check_operation(op);
         self.hazards.max_stall(&hazards)
@@ -131,12 +133,23 @@ impl CycleAccurateExecutor {
         0
     }
 
-    /// Execute a single slot operation (same as FastExecutor but with timing).
+    /// Execute a single slot operation with timing tracking.
     fn execute_slot(
         &mut self,
         op: &SlotOp,
         ctx: &mut ExecutionContext,
         tile: &mut Tile,
+    ) -> Option<ExecuteResult> {
+        self.execute_slot_with_mem_locks(op, ctx, tile, None)
+    }
+
+    /// Execute a single slot operation with optional memory tile lock routing.
+    fn execute_slot_with_mem_locks(
+        &mut self,
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        tile: &mut Tile,
+        mem_tile_locks: Option<&mut [crate::device::tile::Lock; 64]>,
     ) -> Option<ExecuteResult> {
         // Check for call - save return address
         if matches!(op.op, Operation::Call) {
@@ -156,7 +169,7 @@ impl CycleAccurateExecutor {
             return None;
         }
 
-        if let Some(result) = ControlUnit::execute(op, ctx, tile) {
+        if let Some(result) = ControlUnit::execute_with_mem_locks(op, ctx, tile, mem_tile_locks) {
             return Some(result);
         }
 
@@ -210,7 +223,7 @@ impl CycleAccurateExecutor {
     /// Get statistics.
     pub fn stats(&self) -> CycleAccurateStats {
         // Merge detailed stats with hazard detector stats
-        let mut combined_stats = self.detailed_stats.clone();
+        let mut combined_stats = self.detailed_stats;
         combined_stats.merge(&self.hazards.stats());
 
         CycleAccurateStats {
@@ -234,12 +247,28 @@ impl Default for CycleAccurateExecutor {
     }
 }
 
-impl Executor for CycleAccurateExecutor {
-    fn execute(
+impl CycleAccurateExecutor {
+    /// Execute a bundle with optional memory tile lock routing.
+    ///
+    /// For compute tiles, pass the adjacent memory tile's locks to enable
+    /// proper routing of lock IDs 48-63 (memory module locks).
+    pub fn execute_with_mem_tile(
         &mut self,
         bundle: &VliwBundle,
         ctx: &mut ExecutionContext,
         tile: &mut Tile,
+        mem_tile_locks: Option<&mut [crate::device::tile::Lock; 64]>,
+    ) -> ExecuteResult {
+        self.execute_internal(bundle, ctx, tile, mem_tile_locks)
+    }
+
+    /// Internal execution with optional memory tile locks.
+    fn execute_internal(
+        &mut self,
+        bundle: &VliwBundle,
+        ctx: &mut ExecutionContext,
+        tile: &mut Tile,
+        mut mem_tile_locks: Option<&mut [crate::device::tile::Lock; 64]>,
     ) -> ExecuteResult {
         self.pending_call_return_addr = None;
 
@@ -247,9 +276,7 @@ impl Executor for CycleAccurateExecutor {
         let start_cycle = ctx.cycles;
 
         // Record instruction start event
-        if let Some(timing) = ctx.timing_context_mut() {
-            timing.record_event(start_cycle, EventType::InstructionStart { pc });
-        }
+        ctx.timing_context_mut().record_event(start_cycle, EventType::InstructionStart { pc });
 
         // Advance timing models to current cycle
         self.hazards.advance_to(ctx.cycles);
@@ -304,59 +331,86 @@ impl Executor for CycleAccurateExecutor {
             }
 
             // Emit stall events for profiling
-            if let Some(timing) = ctx.timing_context_mut() {
-                for reason in &stall_reasons {
-                    match reason {
-                        StallReason::RegisterHazard { hazard_type, register, cycles } => {
-                            timing.record_event(
-                                start_cycle,
-                                EventType::RegisterHazard {
-                                    hazard_type: *hazard_type,
-                                    register: *register,
-                                    cycles: *cycles,
-                                },
-                            );
-                        }
-                        StallReason::MemoryConflict { bank, cycles } => {
-                            timing.record_event(
-                                start_cycle,
-                                EventType::MemoryConflict {
-                                    bank: *bank,
-                                    cycles: *cycles,
-                                },
-                            );
-                        }
-                        StallReason::BranchPenalty { cycles } => {
-                            timing.record_event(
-                                start_cycle,
-                                EventType::BranchPenalty { cycles: *cycles },
-                            );
-                        }
-                        StallReason::StructuralHazard { .. }
-                        | StallReason::LockContention { .. }
-                        | StallReason::DmaWait { .. } => {
-                            // These don't have direct event mappings yet
-                        }
+            let timing = ctx.timing_context_mut();
+            for reason in &stall_reasons {
+                match reason {
+                    StallReason::RegisterHazard { hazard_type, register, cycles } => {
+                        timing.record_event(
+                            start_cycle,
+                            EventType::RegisterHazard {
+                                hazard_type: *hazard_type,
+                                register: *register,
+                                cycles: *cycles,
+                            },
+                        );
+                    }
+                    StallReason::MemoryConflict { bank, cycles } => {
+                        timing.record_event(
+                            start_cycle,
+                            EventType::MemoryConflict {
+                                bank: *bank,
+                                cycles: *cycles,
+                            },
+                        );
+                    }
+                    StallReason::BranchPenalty { cycles } => {
+                        timing.record_event(
+                            start_cycle,
+                            EventType::BranchPenalty { cycles: *cycles },
+                        );
+                    }
+                    StallReason::StructuralHazard { .. }
+                    | StallReason::LockContention { .. }
+                    | StallReason::DmaWait { .. } => {
+                        // These don't have direct event mappings yet
                     }
                 }
             }
         }
 
         // Phase 2: Execute all slot operations
+        //
+        // VLIW semantics require all reads to happen before any writes within
+        // the same instruction word. We achieve this by executing slots in a
+        // specific order:
+        // 1. Load slots - read from memory
+        // 2. Store slots - read from registers (must happen before scalar writes!)
+        // 3. Scalar/Vector/Control - may write to registers
+        //
+        // This ensures that when a bundle contains both "st r7, [p1]" and
+        // "add r7, r8, #1", the store captures r7's value BEFORE the add modifies it.
+        use crate::interpreter::bundle::SlotIndex;
+
         let mut final_result = ExecuteResult::Continue;
-        for op in bundle.active_slots() {
-            if let Some(result) = self.execute_slot(op, ctx, tile) {
-                match &result {
-                    ExecuteResult::Branch { .. }
-                    | ExecuteResult::Halt
-                    | ExecuteResult::WaitLock { .. }
-                    | ExecuteResult::WaitDma { .. }
-                    | ExecuteResult::WaitStream { .. } => {
-                        final_result = result;
-                    }
-                    ExecuteResult::Continue => {}
-                    ExecuteResult::Error { .. } => {
-                        return result;
+
+        // Execution order: Load(4), Store(5), then Scalar0(0), Scalar1(1), Vector(2), Accumulator(3), Control(6)
+        let execution_order = [
+            SlotIndex::Load,       // Memory reads first
+            SlotIndex::Store,      // Register reads for stores (before scalar writes!)
+            SlotIndex::Scalar0,    // Scalar operations
+            SlotIndex::Scalar1,
+            SlotIndex::Vector,
+            SlotIndex::Accumulator,
+            SlotIndex::Control,
+        ];
+
+        for slot_idx in &execution_order {
+            if let Some(ref op) = bundle.slots()[*slot_idx as usize] {
+                // Reborrow mem_tile_locks for each slot operation
+                let slot_mem_locks = mem_tile_locks.as_mut().map(|locks| &mut **locks);
+                if let Some(result) = self.execute_slot_with_mem_locks(op, ctx, tile, slot_mem_locks) {
+                    match &result {
+                        ExecuteResult::Branch { .. }
+                        | ExecuteResult::Halt
+                        | ExecuteResult::WaitLock { .. }
+                        | ExecuteResult::WaitDma { .. }
+                        | ExecuteResult::WaitStream { .. } => {
+                            final_result = result;
+                        }
+                        ExecuteResult::Continue => {}
+                        ExecuteResult::Error { .. } => {
+                            return result;
+                        }
                     }
                 }
             }
@@ -390,15 +444,14 @@ impl Executor for CycleAccurateExecutor {
             // Record in detailed stats
             self.detailed_stats.record(&StallReason::BranchPenalty { cycles: penalty });
 
-            // Emit branch events (capture cycle before borrowing timing)
+            // Emit branch events
             let branch_cycle = ctx.cycles;
-            if let Some(timing) = ctx.timing_context_mut() {
-                timing.record_event(branch_cycle, EventType::BranchPenalty { cycles: penalty });
-                timing.record_event(
-                    branch_cycle,
-                    EventType::BranchTaken { from_pc: pc, to_pc: target },
-                );
-            }
+            let timing = ctx.timing_context_mut();
+            timing.record_event(branch_cycle, EventType::BranchPenalty { cycles: penalty });
+            timing.record_event(
+                branch_cycle,
+                EventType::BranchTaken { from_pc: pc, to_pc: target },
+            );
         }
 
         // Update statistics with actual cycles
@@ -406,18 +459,29 @@ impl Executor for CycleAccurateExecutor {
 
         // Sync timing context and record instruction complete
         let end_cycle = ctx.cycles;
-        if let Some(timing) = ctx.timing_context_mut() {
-            timing.hazard_stalls = self.total_hazard_stalls;
-            timing.memory_stalls = self.total_memory_stalls;
+        let timing = ctx.timing_context_mut();
+        timing.hazard_stalls = self.total_hazard_stalls;
+        timing.memory_stalls = self.total_memory_stalls;
 
-            // Record instruction completion
-            timing.record_event(
-                end_cycle,
-                EventType::InstructionComplete { pc, latency: max_latency },
-            );
-        }
+        // Record instruction completion
+        timing.record_event(
+            end_cycle,
+            EventType::InstructionComplete { pc, latency: max_latency },
+        );
 
         final_result
+    }
+}
+
+impl Executor for CycleAccurateExecutor {
+    fn execute(
+        &mut self,
+        bundle: &VliwBundle,
+        ctx: &mut ExecutionContext,
+        tile: &mut Tile,
+    ) -> ExecuteResult {
+        // Delegate to internal implementation with no memory tile locks
+        self.execute_internal(bundle, ctx, tile, None)
     }
 
     fn is_cycle_accurate(&self) -> bool {
@@ -659,7 +723,7 @@ mod tests {
         executor.execute(&bundle, &mut ctx, &mut tile);
 
         // Check events were recorded
-        let timing = ctx.timing_context().unwrap();
+        let timing = ctx.timing_context();
         let events = timing.events.events();
 
         // Should have at least InstructionStart and InstructionComplete
@@ -685,7 +749,7 @@ mod tests {
         use crate::interpreter::state::EventType;
 
         let mut executor = CycleAccurateExecutor::new();
-        let mut ctx = ExecutionContext::new_with_timing();
+        let mut ctx = ExecutionContext::new();
         let mut tile = Tile::compute(0, 2);
 
         // Execute a branch instruction
@@ -699,7 +763,7 @@ mod tests {
         executor.execute(&bundle, &mut ctx, &mut tile);
 
         // Check for branch events
-        let timing = ctx.timing_context().unwrap();
+        let timing = ctx.timing_context();
         let events = timing.events.events();
 
         // Should have BranchPenalty and BranchTaken events
@@ -713,10 +777,10 @@ mod tests {
     }
 
     #[test]
-    fn test_event_recording_disabled_by_default_fast_mode() {
-        // Fast mode (no timing) should not have events
+    fn test_all_execution_has_timing() {
+        // All contexts now have timing enabled
         let mut executor = CycleAccurateExecutor::new();
-        let mut ctx = ExecutionContext::new(); // No timing!
+        let mut ctx = ExecutionContext::new();
         let mut tile = Tile::compute(0, 2);
 
         let bundle = make_bundle(vec![
@@ -728,7 +792,9 @@ mod tests {
 
         executor.execute(&bundle, &mut ctx, &mut tile);
 
-        // Should have no timing context
-        assert!(ctx.timing_context().is_none());
+        // Should always have timing context
+        assert!(ctx.has_timing());
+        // Events should be recorded
+        assert!(!ctx.timing_context().events.events().is_empty());
     }
 }

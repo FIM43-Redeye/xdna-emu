@@ -5,7 +5,7 @@
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::VliwBundle;
 use crate::interpreter::decode::InstructionDecoder;
-use crate::interpreter::execute::FastExecutor;
+use crate::interpreter::execute::CycleAccurateExecutor;
 use crate::interpreter::state::ExecutionContext;
 use crate::interpreter::traits::{DecodeError, Decoder, ExecuteResult, Executor};
 
@@ -59,11 +59,11 @@ pub enum StepResult {
 ///
 /// The default configuration uses:
 /// - `InstructionDecoder`: O(1) instruction decoder from llvm-aie TableGen files
-/// - `FastExecutor`: Non-cycle-accurate fast executor
+/// - `CycleAccurateExecutor`: Cycle-accurate executor with AM020 timing
 ///
 /// If llvm-aie is not available, the decoder will be empty and return
 /// unknown operations for all instructions.
-pub struct CoreInterpreter<D = InstructionDecoder, E = FastExecutor>
+pub struct CoreInterpreter<D = InstructionDecoder, E = CycleAccurateExecutor>
 where
     D: Decoder,
     E: Executor,
@@ -78,13 +78,120 @@ where
     last_bundle: Option<VliwBundle>,
 }
 
-impl CoreInterpreter<InstructionDecoder, FastExecutor> {
+impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
     /// Create a new interpreter with default decoder and executor.
     ///
     /// Uses InstructionDecoder loaded from llvm-aie at ../llvm-aie.
     /// Falls back to an empty decoder if llvm-aie is not found.
     pub fn default_new() -> Self {
-        Self::new(InstructionDecoder::load_default(), FastExecutor::new())
+        Self::new(InstructionDecoder::load_default(), CycleAccurateExecutor::new())
+    }
+
+    /// Execute a single instruction cycle with memory tile lock routing.
+    ///
+    /// For compute tiles, pass the adjacent memory tile's locks to enable
+    /// proper routing of lock IDs 48-63 (memory module locks) to the MemTile.
+    pub fn step_with_mem_locks(
+        &mut self,
+        ctx: &mut ExecutionContext,
+        tile: &mut Tile,
+        mem_tile_locks: Option<&mut [crate::device::tile::Lock; 64]>,
+    ) -> StepResult {
+        // Check if halted
+        if self.is_halted() {
+            return StepResult::Halt;
+        }
+
+        // Try to resume from stall
+        if let Some(result) = self.try_resume_stall(ctx, tile) {
+            return result;
+        }
+
+        // Fetch instruction bytes from program memory
+        let pc = ctx.pc();
+        let program_mem = match tile.program_memory() {
+            Some(mem) => mem,
+            None => {
+                self.status = CoreStatus::Error;
+                return StepResult::ExecError("No program memory".to_string());
+            }
+        };
+
+        // Check PC bounds
+        let pc_offset = pc as usize;
+        if pc_offset >= program_mem.len() {
+            self.status = CoreStatus::Halted;
+            return StepResult::Halt;
+        }
+
+        // Get instruction bytes (maximum 16 for full VLIW)
+        let end = (pc_offset + 16).min(program_mem.len());
+        let bytes = &program_mem[pc_offset..end];
+
+        // Decode instruction
+        let bundle = match self.decoder.decode(bytes, pc) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = CoreStatus::Error;
+                return StepResult::DecodeError(e);
+            }
+        };
+
+        let bundle_size = bundle.size();
+
+        // Execute bundle with memory tile locks for proper routing
+        self.status = CoreStatus::Running;
+        let result = self.executor.execute_with_mem_tile(&bundle, ctx, tile, mem_tile_locks);
+
+        // Save bundle for debugging
+        self.last_bundle = Some(bundle);
+
+        // Handle execution result (same as step())
+        match result {
+            crate::interpreter::traits::ExecuteResult::Continue => {
+                ctx.advance_pc(bundle_size as u32);
+                if let Some(branch_target) = ctx.tick_delay_slots() {
+                    ctx.set_pc(branch_target);
+                }
+                self.status = CoreStatus::Ready;
+                StepResult::Continue
+            }
+
+            crate::interpreter::traits::ExecuteResult::Branch { target } => {
+                ctx.set_pending_branch(target);
+                ctx.advance_pc(bundle_size as u32);
+                if let Some(branch_target) = ctx.tick_delay_slots() {
+                    ctx.set_pc(branch_target);
+                }
+                self.status = CoreStatus::Ready;
+                StepResult::Continue
+            }
+
+            crate::interpreter::traits::ExecuteResult::WaitLock { lock_id } => {
+                self.status = CoreStatus::WaitingLock { lock_id };
+                StepResult::WaitLock { lock_id }
+            }
+
+            crate::interpreter::traits::ExecuteResult::WaitDma { channel } => {
+                self.status = CoreStatus::WaitingDma { channel };
+                StepResult::WaitDma { channel }
+            }
+
+            crate::interpreter::traits::ExecuteResult::WaitStream { port } => {
+                self.status = CoreStatus::WaitingStream { port };
+                StepResult::WaitStream { port }
+            }
+
+            crate::interpreter::traits::ExecuteResult::Halt => {
+                self.status = CoreStatus::Halted;
+                StepResult::Halt
+            }
+
+            crate::interpreter::traits::ExecuteResult::Error { message } => {
+                self.status = CoreStatus::Error;
+                StepResult::ExecError(message)
+            }
+        }
     }
 }
 

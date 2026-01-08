@@ -1,11 +1,41 @@
-//! Vector ALU execution unit.
+//! Vector ALU execution unit (LEGACY FALLBACK).
 //!
 //! Handles SIMD operations on 256-bit vectors (8 × 32-bit, 16 × 16-bit, 32 × 8-bit).
 //!
+//! # Architecture Note
+//!
+//! Like [`ScalarAlu`](super::ScalarAlu), this module is a **legacy fallback**.
+//! The preferred execution path is through the TableGen-driven semantic
+//! dispatcher in [`execute_semantic`](super::semantic::execute_semantic).
+//!
+//! ## Execution Flow
+//!
+//! ```text
+//! CycleAccurateExecutor::execute_slot()
+//!         |
+//!         v
+//!   execute_semantic(op, ctx)  <-- TableGen-driven, preferred
+//!         |
+//!         | returns false (no semantic info or vector type not handled)
+//!         v
+//!   ScalarAlu::execute(op, ctx)
+//!         |
+//!         | returns false (not a scalar op)
+//!         v
+//!   VectorAlu::execute(op, ctx)  <-- Legacy fallback (this module)
+//! ```
+//!
+//! ## Future Direction
+//!
+//! Many vector operations are element-wise versions of scalar operations.
+//! The plan is to eventually have vector ops call scalar semantic handlers
+//! per-element, reducing ~3,000 lines to ~200 lines of thin wrappers.
+//!
 //! # Operations
 //!
-//! - **Arithmetic**: vadd, vsub, vmul
+//! - **Arithmetic**: vadd, vsub, vmul (element-wise)
 //! - **MAC**: vmac (multiply-accumulate to 512-bit accumulator)
+//! - **MatMul**: Dense/sparse matrix multiply for ML workloads
 //! - **Compare**: vcmp, vmin, vmax
 //! - **Shuffle**: vshuffle, vpack, vunpack
 
@@ -20,8 +50,11 @@ impl VectorAlu {
     ///
     /// Returns `true` if the operation was handled, `false` if not a vector op.
     pub fn execute(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
+        log::trace!("[VECTOR_ALU] Checking op={:?} dest={:?}", op.op, op.dest);
         match &op.op {
             Operation::VectorAdd { element_type } => {
+                log::debug!("[VECTOR_ALU] Executing VectorAdd element_type={:?} dest={:?} sources={:?}",
+                    element_type, op.dest, op.sources);
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let result = Self::vector_add(&a, &b, *element_type);
                 Self::write_vector_dest(op, ctx, result);
@@ -1179,10 +1212,10 @@ impl VectorAlu {
                 // 16 × 16-bit → 16 products, accumulated
                 let mut new_acc = current;
                 for i in 0..8 {
-                    let a_lo = (a[i] & 0xFFFF);
-                    let a_hi = ((a[i] >> 16) & 0xFFFF);
-                    let b_lo = (b[i] & 0xFFFF);
-                    let b_hi = ((b[i] >> 16) & 0xFFFF);
+                    let a_lo = a[i] & 0xFFFF;
+                    let a_hi = (a[i] >> 16) & 0xFFFF;
+                    let b_lo = b[i] & 0xFFFF;
+                    let b_hi = (b[i] >> 16) & 0xFFFF;
                     let prod_lo = a_lo * b_lo;
                     let prod_hi = a_hi * b_hi;
                     // Accumulate both products into single 64-bit lane
@@ -1447,13 +1480,13 @@ impl VectorAlu {
 
         // Pack lower halves: take low 16 bits of each input lane
         for i in 0..4 {
-            let a_lo = (a[i * 2] & 0xFFFF);
-            let a_hi = (a[i * 2 + 1] & 0xFFFF);
+            let a_lo = a[i * 2] & 0xFFFF;
+            let a_hi = a[i * 2 + 1] & 0xFFFF;
             result[i] = a_lo | (a_hi << 16);
         }
         for i in 0..4 {
-            let b_lo = (b[i * 2] & 0xFFFF);
-            let b_hi = (b[i * 2 + 1] & 0xFFFF);
+            let b_lo = b[i * 2] & 0xFFFF;
+            let b_hi = b[i * 2 + 1] & 0xFFFF;
             result[i + 4] = b_lo | (b_hi << 16);
         }
 
@@ -1701,7 +1734,7 @@ impl VectorAlu {
         match elem_type {
             ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
                 for i in 0..8 {
-                    let sh = (shift[i] & 0x1F) as u32;
+                    let sh = shift[i] & 0x1F;
                     result[i] = src[i].wrapping_shl(sh);
                 }
             }
@@ -1709,8 +1742,8 @@ impl VectorAlu {
                 for i in 0..8 {
                     let src_lo = src[i] & 0xFFFF;
                     let src_hi = (src[i] >> 16) & 0xFFFF;
-                    let sh_lo = (shift[i] & 0xF) as u32;
-                    let sh_hi = ((shift[i] >> 16) & 0xF) as u32;
+                    let sh_lo = shift[i] & 0xF;
+                    let sh_hi = (shift[i] >> 16) & 0xF;
                     let r_lo = (src_lo << sh_lo) & 0xFFFF;
                     let r_hi = (src_hi << sh_hi) & 0xFFFF;
                     result[i] = r_lo | (r_hi << 16);
@@ -1738,7 +1771,7 @@ impl VectorAlu {
         match elem_type {
             ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
                 for i in 0..8 {
-                    let sh = (shift[i] & 0x1F) as u32;
+                    let sh = shift[i] & 0x1F;
                     result[i] = src[i].wrapping_shr(sh);
                 }
             }
@@ -1746,8 +1779,8 @@ impl VectorAlu {
                 for i in 0..8 {
                     let src_lo = src[i] & 0xFFFF;
                     let src_hi = (src[i] >> 16) & 0xFFFF;
-                    let sh_lo = (shift[i] & 0xF) as u32;
-                    let sh_hi = ((shift[i] >> 16) & 0xF) as u32;
+                    let sh_lo = shift[i] & 0xF;
+                    let sh_hi = (shift[i] >> 16) & 0xF;
                     let r_lo = src_lo >> sh_lo;
                     let r_hi = src_hi >> sh_hi;
                     result[i] = r_lo | (r_hi << 16);
@@ -1818,8 +1851,6 @@ impl VectorAlu {
         // Then shift right and take lower 32 bytes
         for i in 0..8 {
             let byte_idx = i * 4 + shift;
-            let word_idx = byte_idx / 4;
-            let byte_off = byte_idx % 4;
 
             // Get value from concatenated vector
             let get_byte = |idx: usize| -> u8 {

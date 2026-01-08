@@ -188,7 +188,6 @@ pub fn extract_48bit(bytes: &[u8]) -> ExtractedBundle {
 
     // Check discriminator patterns
     let bits_10_3 = ((word >> 3) & 0xFF) as u8;
-    let bits_7_3 = ((word >> 3) & 0x1F) as u8;
     let bits_6_3 = ((word >> 3) & 0xF) as u8;
     let bits_5_3 = ((word >> 3) & 0x7) as u8;
     let high5 = ((word >> 43) & 0x1F) as u8; // bits 47:43

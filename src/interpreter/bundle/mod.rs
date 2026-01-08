@@ -492,9 +492,7 @@ fn disassemble_op(slot_op: &SlotOp) -> String {
 
     // Add sources
     for (i, src) in slot_op.sources.iter().enumerate() {
-        if i == 0 && slot_op.dest.is_some() {
-            result.push_str(", ");
-        } else if i > 0 {
+        if slot_op.dest.is_some() || i > 0 {
             result.push_str(", ");
         } else {
             result.push(' ');

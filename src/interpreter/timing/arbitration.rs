@@ -60,8 +60,8 @@ impl ArbiterSource {
 struct PendingRequest {
     /// Source of the request.
     source: ArbiterSource,
-    /// Cycle when request was made.
-    request_cycle: u64,
+    /// Cycle when request was made (reserved for latency tracking).
+    _request_cycle: u64,
 }
 
 /// Memory tile arbiter for a single column.
@@ -116,7 +116,7 @@ impl MemTileArbiter {
         // Add this request
         self.pending.push(PendingRequest {
             source,
-            request_cycle: cycle,
+            _request_cycle: cycle,
         });
 
         // If this is the only request, grant immediately

@@ -1,28 +1,80 @@
 //! Execution units for AIE2 operations.
 //!
 //! This module provides the execution logic for decoded operations.
-//! Each unit handles a specific category of operations:
 //!
-//! | Unit | Operations |
-//! |------|------------|
-//! | Scalar ALU | Integer arithmetic, logic, shifts |
-//! | Vector ALU | SIMD arithmetic, shuffle |
-//! | Memory | Load/store operations |
-//! | Control | Branch, call, return |
-//! | Special | Lock, DMA operations |
+//! # Execution Dispatch Architecture
 //!
-//! # Architecture
+//! Operations are dispatched through a chain of execution units. The
+//! **semantic dispatcher** is the preferred path for pure computations:
 //!
-//! The `FastExecutor` executes all operations in a single cycle (no pipeline).
-//! A future `CycleAccurateExecutor` would model the real pipeline stages.
+//! ```text
+//! CycleAccurateExecutor::execute_slot(op)
+//!         |
+//!         v
+//!   ┌─────────────────────────┐
+//!   │  execute_semantic(op)   │ <-- TableGen-driven, ~40 handlers
+//!   │  (pure register ops)    │     Covers: Add, Sub, Mul, And, Or, ...
+//!   └────────────┬────────────┘
+//!                | false (no semantic or unhandled)
+//!                v
+//!   ┌─────────────────────────┐
+//!   │   ScalarAlu::execute()  │ <-- Legacy fallback, sets CPU flags
+//!   └────────────┬────────────┘
+//!                | false
+//!                v
+//!   ┌─────────────────────────┐
+//!   │   VectorAlu::execute()  │ <-- SIMD operations
+//!   └────────────┬────────────┘
+//!                | false
+//!                v
+//!   ┌─────────────────────────┐
+//!   │   MemoryUnit::execute() │ <-- Load/Store (needs tile access)
+//!   └────────────┬────────────┘
+//!                | false
+//!                v
+//!   ┌─────────────────────────┐
+//!   │   StreamOps::execute()  │ <-- Stream I/O (needs stream switch)
+//!   └────────────┬────────────┘
+//!                | NotStreamOp
+//!                v
+//!   ┌─────────────────────────┐
+//!   │  ControlUnit::execute() │ <-- Branch, Lock, Halt (returns ExecuteResult)
+//!   └─────────────────────────┘
+//! ```
+//!
+//! # Unit Responsibilities
+//!
+//! | Unit | Purpose | Semantic Dispatch? |
+//! |------|---------|-------------------|
+//! | [`semantic`] | TableGen-driven pure ops | **Primary** |
+//! | [`ScalarAlu`] | Legacy scalar + flag-setting | Fallback |
+//! | [`VectorAlu`] | SIMD operations | Fallback |
+//! | [`MemoryUnit`] | Load/Store (tile memory) | No (needs tile) |
+//! | [`StreamOps`] | Stream I/O | No (needs switch) |
+//! | [`ControlUnit`] | Branch/Lock/Halt | No (control flow) |
+//!
+//! # Migration Path
+//!
+//! The goal is to migrate pure computational operations to `execute_semantic()`,
+//! which uses TableGen-derived SemanticOp patterns. This reduces the 133+
+//! Operation variants to ~40 semantic handlers and ensures operand ordering
+//! matches the ISA specification.
+//!
+//! See the plan at `~/.claude/plans/memoized-soaring-teapot.md` for details.
+//!
+//! # Executor
+//!
+//! The [`CycleAccurateExecutor`] models AM020-based instruction latencies,
+//! register hazards (RAW/WAW), and memory bank conflicts. This is the only
+//! execution mode - cycle accuracy is always enabled for reliable behavior.
 //!
 //! # Example
 //!
 //! ```ignore
-//! use xdna_emu::interpreter::execute::FastExecutor;
+//! use xdna_emu::interpreter::execute::CycleAccurateExecutor;
 //! use xdna_emu::interpreter::{VliwBundle, ExecutionContext};
 //!
-//! let mut executor = FastExecutor::new();
+//! let mut executor = CycleAccurateExecutor::new();
 //! let result = executor.execute(&bundle, &mut ctx, &mut tile);
 //! ```
 
@@ -31,16 +83,16 @@ mod vector;
 mod memory;
 mod control;
 mod stream;
-mod fast_executor;
 mod cycle_accurate;
+mod semantic;
 
 pub use scalar::ScalarAlu;
 pub use vector::VectorAlu;
 pub use memory::MemoryUnit;
 pub use control::ControlUnit;
 pub use stream::{StreamOps, StreamResult};
-pub use fast_executor::FastExecutor;
 pub use cycle_accurate::{CycleAccurateExecutor, CycleAccurateStats};
+pub use semantic::execute_semantic;
 
 #[cfg(test)]
 mod tests {
@@ -57,8 +109,8 @@ mod tests {
     }
 
     #[test]
-    fn test_fast_executor_nop() {
-        let mut executor = FastExecutor::new();
+    fn test_executor_nop() {
+        let mut executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
         let mut tile = Tile::compute(0, 2);
 
@@ -69,8 +121,8 @@ mod tests {
     }
 
     #[test]
-    fn test_fast_executor_scalar_add() {
-        let mut executor = FastExecutor::new();
+    fn test_executor_scalar_add() {
+        let mut executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
         let mut tile = Tile::compute(0, 2);
 
