@@ -159,43 +159,39 @@ impl InstructionDecoder {
     /// Load a fresh decoder (not cached).
     ///
     /// Use `load_cached()` instead unless you specifically need a fresh load.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the TableGen parser fails. This is intentional - we want to
+    /// fail fast rather than silently falling back to broken behavior.
     fn load_fresh() -> Self {
         let path = get_llvm_aie_path();
-        // Prefer tblgen for accurate encodings (e.g., distinguishes ACQ variants)
         Self::try_load_via_tblgen(&path)
-            .or_else(|e| {
-                log::warn!("tblgen loading failed: {}, trying regex parser", e);
-                Self::try_load(&path)
-            })
-            .unwrap_or_else(|e| {
-                log::warn!("Regex parser also failed: {}, using empty decoder", e);
-                Self::new()
-            })
+            .expect("TableGen decoder loading failed. Set LLVM_AIE_PATH to llvm-aie directory.")
     }
 
     /// Load a decoder from llvm-aie.
     ///
     /// Checks LLVM_AIE_PATH environment variable first, falls back to ../llvm-aie.
-    /// Uses `llvm-tblgen` for accurate encodings when available, falling back
-    /// to regex parsing if tblgen fails. Returns an empty decoder if llvm-aie
-    /// is not found.
+    /// Uses `llvm-tblgen` for accurate encodings.
     ///
     /// NOTE: Prefer `load_cached()` which avoids repeatedly parsing TableGen.
+    ///
+    /// # Panics
+    ///
+    /// Panics if llvm-aie is not found or TableGen parsing fails.
     pub fn load_default() -> Self {
         Self::load_cached()
     }
 
-    /// Load a decoder using the legacy regex parser.
+    /// Load a decoder from llvm-aie at the specified path using the regex parser.
     ///
-    /// This is less accurate than tblgen (misses mixin literal bits) but
-    /// doesn't require llvm-tblgen to be installed.
-    pub fn load_default_regex() -> Self {
-        Self::try_load(&get_llvm_aie_path()).unwrap_or_else(|_| Self::new())
-    }
-
-    /// Load a decoder from llvm-aie at the specified path.
+    /// **DEPRECATED**: Use `try_load_via_tblgen()` instead. The regex parser
+    /// is less accurate (misses mixin literal bits) and is only kept for
+    /// testing/comparison purposes.
     ///
     /// Returns an error if the path doesn't exist or parsing fails.
+    #[deprecated(note = "Use try_load_via_tblgen() instead for accurate encodings")]
     pub fn try_load(llvm_aie_path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
         let path = llvm_aie_path.as_ref();
         if !path.exists() {
