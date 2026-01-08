@@ -4,6 +4,7 @@
 //!
 //! # Module Organization
 //!
+//! - [`config`]: Configuration management (paths, settings)
 //! - [`parser`]: Binary format parsers (xclbin, CDO, ELF)
 //! - [`device`]: Hardware state model (tiles, registers, memory)
 //! - [`interpreter`]: Accurate AIE2 interpreter
@@ -14,6 +15,7 @@
 //! - [`testing`]: Test harness for XCLBIN binary compatibility
 //! - [`ffi`]: C-compatible Foreign Function Interface
 
+pub mod config;
 pub mod parser;
 pub mod device;
 pub mod interpreter;

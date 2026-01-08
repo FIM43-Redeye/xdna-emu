@@ -38,7 +38,7 @@
 
 mod decoder;
 
-pub use decoder::{DecodedInstr, InstructionDecoder, DEFAULT_LLVM_AIE_PATH};
+pub use decoder::{DecodedInstr, InstructionDecoder};
 
 use crate::interpreter::bundle::{
     Operand, Operation, SlotIndex, SlotOp,

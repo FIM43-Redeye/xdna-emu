@@ -27,6 +27,7 @@ regex = "1"                                             # Regex for TableGen par
 uuid = "1"                                              # UUID handling
 smallvec = "1.13"                                       # Stack-allocated vectors for operands
 byteorder = "1.5"                                       # Byte order utilities for binary parsing
+dirs = "6"                                              # Platform-specific config directories
 
 # Serialization (for test manifests)
 serde = { version = "1", features = ["derive"] }

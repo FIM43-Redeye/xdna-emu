@@ -1,0 +1,12 @@
+# xdna-emu configuration
+# This file configures paths for the emulator
+
+# Path to llvm-aie repository (required for instruction decoding)
+# Contains TableGen files defining the AIE2 ISA
+llvm_aie_path = "/home/triple/npu-work/llvm-aie"
+
+# Path to mlir-aie repository (for test discovery)
+mlir_aie_path = "/home/triple/npu-work/mlir-aie"
+
+# Path to XRT installation
+xrt_path = "/opt/xilinx/xrt"

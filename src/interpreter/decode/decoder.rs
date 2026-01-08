@@ -113,25 +113,9 @@ impl Default for InstructionDecoder {
     }
 }
 
-/// Default path to llvm-aie repository (relative to project root).
-pub const DEFAULT_LLVM_AIE_PATH: &str = "../llvm-aie";
-
 /// Global cached decoder, loaded once on first use.
 /// This avoids repeatedly parsing TableGen files for each core.
 static CACHED_DECODER: OnceLock<InstructionDecoder> = OnceLock::new();
-
-/// Get the path to llvm-aie, checking environment variable first.
-///
-/// Checks in order:
-/// 1. LLVM_AIE_PATH environment variable
-/// 2. DEFAULT_LLVM_AIE_PATH ("../llvm-aie")
-fn get_llvm_aie_path() -> String {
-    if let Ok(path) = std::env::var("LLVM_AIE_PATH") {
-        log::info!("Using llvm-aie from LLVM_AIE_PATH: {}", path);
-        return path;
-    }
-    DEFAULT_LLVM_AIE_PATH.to_string()
-}
 
 impl InstructionDecoder {
     /// Create an empty decoder (no encodings loaded).
@@ -165,14 +149,26 @@ impl InstructionDecoder {
     /// Panics if the TableGen parser fails. This is intentional - we want to
     /// fail fast rather than silently falling back to broken behavior.
     fn load_fresh() -> Self {
-        let path = get_llvm_aie_path();
-        Self::try_load_via_tblgen(&path)
-            .expect("TableGen decoder loading failed. Set LLVM_AIE_PATH to llvm-aie directory.")
+        use crate::config::Config;
+        let path = Config::get().llvm_aie_path();
+        Self::try_load_via_tblgen(&path).unwrap_or_else(|e| {
+            let config_path = Config::user_config_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "~/.config/xdna-emu/config.toml".to_string());
+            panic!(
+                "TableGen decoder loading failed: {}\n\n\
+                 Configure llvm_aie_path in {} or set LLVM_AIE_PATH environment variable.\n\n\
+                 Sample config:\n{}",
+                e,
+                config_path,
+                Config::sample_config()
+            );
+        })
     }
 
     /// Load a decoder from llvm-aie.
     ///
-    /// Checks LLVM_AIE_PATH environment variable first, falls back to ../llvm-aie.
+    /// Uses config file or environment variable to find llvm-aie path.
     /// Uses `llvm-tblgen` for accurate encodings.
     ///
     /// NOTE: Prefer `load_cached()` which avoids repeatedly parsing TableGen.
@@ -227,9 +223,10 @@ impl InstructionDecoder {
         Ok(Self::from_tables(tables))
     }
 
-    /// Check if llvm-aie is available (checks LLVM_AIE_PATH env var first).
+    /// Check if llvm-aie is available (checks config and env var).
     pub fn is_llvm_aie_available() -> bool {
-        Path::new(&get_llvm_aie_path()).exists()
+        use crate::config::Config;
+        Path::new(&Config::get().llvm_aie_path()).exists()
     }
 
     /// Create a decoder from encoding tables grouped by slot.

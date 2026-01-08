@@ -5,7 +5,8 @@
 # This script discovers built tests in mlir-aie, compiles them against
 # our mock XRT library, and runs them to verify emulator correctness.
 
-set -e
+# Note: We intentionally do NOT use set -e here because we want to
+# continue running tests even when some fail, and collect results.
 
 # Configuration - adjust these paths as needed
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -49,6 +50,7 @@ usage() {
     echo "  -l, --list       List available tests without running"
     echo "  -v, --verbose    Verbose output (show test output)"
     echo "  -c, --compile    Only compile tests, don't run"
+    echo "  -f, --force      Force recompilation even if up-to-date"
     echo "  -k, --keep       Keep compiled test binaries"
     echo "  -j N             Parallel compilation (default: 4)"
     echo ""
@@ -131,15 +133,44 @@ discover_tests() {
     printf '%s\n' "${tests[@]}"
 }
 
+# Check if test needs recompilation
+# Returns 0 if recompilation needed, 1 if up-to-date
+needs_recompile() {
+    local test_name="$1"
+    local source_dir="${MLIR_AIE_ROOT}/test/npu-xrt/${test_name}"
+    local output_bin="${TEST_BUILD_DIR}/${test_name}"
+
+    # Need to compile if binary doesn't exist
+    [[ ! -f "$output_bin" ]] && return 0
+
+    # Need to compile if source is newer than binary
+    [[ "${source_dir}/test.cpp" -nt "$output_bin" ]] && return 0
+
+    # Need to compile if any header changed (check mock XRT headers)
+    local newest_header
+    newest_header=$(find "${MOCK_XRT_INCLUDE}" -name "*.h" -newer "$output_bin" 2>/dev/null | head -1)
+    [[ -n "$newest_header" ]] && return 0
+
+    # Up-to-date
+    return 1
+}
+
 # Compile a single test
 compile_test() {
     local test_name="$1"
+    local force="$2"
     local source_dir="${MLIR_AIE_ROOT}/test/npu-xrt/${test_name}"
     local build_dir="${MLIR_AIE_BUILD}/test/npu-xrt/${test_name}"
     local output_bin="${TEST_BUILD_DIR}/${test_name}"
 
     # Ensure output directory exists
     mkdir -p "${TEST_BUILD_DIR}"
+
+    # Skip if up-to-date (unless forced)
+    if [[ "$force" != "1" ]] && ! needs_recompile "$test_name"; then
+        echo "UP-TO-DATE"
+        return 0
+    fi
 
     # Compile command
     # Uses our mock XRT headers and test_utils.h (drop-in replacement)
@@ -221,6 +252,7 @@ main() {
     local list_only=0
     local verbose=0
     local compile_only=0
+    local force_compile=0
     local keep_binaries=0
     local parallel=4
     local pattern="*"
@@ -242,6 +274,10 @@ main() {
                 ;;
             -c|--compile)
                 compile_only=1
+                shift
+                ;;
+            -f|--force)
+                force_compile=1
                 shift
                 ;;
             -k|--keep)
@@ -294,12 +330,21 @@ main() {
 
     # Compile tests
     log_info "Compiling tests..."
+    local compiled=0
+    local up_to_date=0
     for test_name in "${tests[@]}"; do
         TOTAL=$((TOTAL + 1))
         printf "  Compiling %-40s " "$test_name..."
 
-        if compile_output=$(compile_test "$test_name" 2>&1); then
+        compile_output=$(compile_test "$test_name" "$force_compile" 2>&1)
+        compile_result=$?
+
+        if [[ "$compile_output" == "UP-TO-DATE" ]]; then
+            echo -e "${BLUE}UP-TO-DATE${NC}"
+            up_to_date=$((up_to_date + 1))
+        elif [[ $compile_result -eq 0 ]]; then
             echo -e "${GREEN}OK${NC}"
+            compiled=$((compiled + 1))
         else
             echo -e "${RED}FAILED${NC}"
             echo "$compile_output" | head -10
@@ -307,6 +352,9 @@ main() {
             SKIPPED=$((SKIPPED + 1))
         fi
     done
+    if [[ $compiled -gt 0 || $up_to_date -gt 0 ]]; then
+        log_info "Compiled: $compiled, Up-to-date: $up_to_date"
+    fi
     echo ""
 
     if [[ $COMPILE_ERRORS -gt 0 ]]; then
