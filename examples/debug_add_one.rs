@@ -57,16 +57,15 @@ fn main() -> anyhow::Result<()> {
         stats.commands, stats.writes, stats.dma_writes);
 
     // Setup host memory with input data
-    // The kernel's hardcoded loop processes 32 i32 values (4 batches of 8)
-    // The MLIR signature says 64xi32 but the generated loop only does 1 iteration
+    // The kernel processes 64 i32 values (8 batches of 8 with ping-pong buffering)
     println!("\nSetting up host memory...");
     let host_mem = engine.host_memory_mut();
-    let _ = host_mem.allocate_region("input", 0x0, 128);  // 32 * 4 bytes
-    let input: Vec<u32> = (1..=32).collect();
+    let _ = host_mem.allocate_region("input", 0x0, 256);  // 64 * 4 bytes
+    let input: Vec<u32> = (1..=64).collect();
     host_mem.write_slice(0x0, &input);
     let _ = host_mem.allocate_region("unused", 0x100, 128);  // arg1: unused buffer
-    let _ = host_mem.allocate_region("output", 0x1000, 128);  // 32 * 4 bytes
-    println!("  Input: 32 i32 values at 0x0 (first 4: [1, 2, 3, 4])");
+    let _ = host_mem.allocate_region("output", 0x1000, 256);  // 64 * 4 bytes
+    println!("  Input: 64 i32 values at 0x0 (first 4: [1, 2, 3, 4])");
 
     // Load and execute NPU instructions (insts.bin)
     let insts_path = test_dir.join("insts.bin");
@@ -228,6 +227,7 @@ fn main() -> anyhow::Result<()> {
     // Track lock acquires by PC to see if instructions are re-executed
     let mut lock_acquire_pcs: Vec<(u32, u32)> = Vec::new(); // (cycle, pc)
     let lock_acquire_addrs = [0x60u32, 0x74, 0xe8, 0xf2, 0x166, 0x170, 0x1e4, 0x1ee];
+    let mut last_dump_cycle: i32 = -100;
 
     for i in 0..1000 {
         engine.step();
@@ -240,6 +240,36 @@ fn main() -> anyhow::Result<()> {
             if lock_acquire_addrs.contains(&pc) && (lock_acquire_pcs.is_empty() || lock_acquire_pcs.last().unwrap().1 != pc) {
                 lock_acquire_pcs.push((i as u32, pc));
                 println!("  Cycle {}: HIT lock instruction at PC=0x{:04X}", i, pc);
+            }
+
+            // Dump memory at key points: before first store (0x9A), first store (0xA0), last store (0xCA), after stores (0xD4)
+            if (pc == 0x9A || pc == 0xA0 || pc == 0xCA || pc == 0xD4) && (i as i32 - last_dump_cycle > 5) {
+                last_dump_cycle = i as i32;
+                let tile = engine.device().array.tile(0, 2);
+                let mem = tile.data_memory();
+                println!("  Cycle {}: Memory dump at PC=0x{:04X}:", i, pc);
+                // Input buffer A: 0x400-0x41F
+                print!("    Input@0x400: ");
+                for j in 0..8 {
+                    let addr = 0x400 + j * 4;
+                    let val = u32::from_le_bytes([mem[addr], mem[addr+1], mem[addr+2], mem[addr+3]]);
+                    print!("{} ", val);
+                }
+                println!();
+                // Output buffer A: 0x440-0x45F
+                print!("    Output@0x440: ");
+                for j in 0..8 {
+                    let addr = 0x440 + j * 4;
+                    let val = u32::from_le_bytes([mem[addr], mem[addr+1], mem[addr+2], mem[addr+3]]);
+                    print!("{} ", val);
+                }
+                println!();
+                // Scalar registers r7-r14 (used for load/add/store)
+                print!("    r7-r14: ");
+                for r in 7..=14 {
+                    print!("{} ", ctx.scalar_read(r));
+                }
+                println!();
             }
 
             // Track critical control flow points
@@ -366,9 +396,9 @@ fn main() -> anyhow::Result<()> {
     // =========================================================================
     println!("\n=== Output Verification ===");
 
-    // Read output from host memory (32 elements - matches kernel's hardcoded loop)
+    // Read output from host memory (64 elements - matches kernel's loop)
     let host_mem = engine.host_memory_mut();
-    let output: Vec<u32> = host_mem.read_slice(0x1000, 32);
+    let output: Vec<u32> = host_mem.read_slice(0x1000, 64);
 
     // Check first 16 values
     let show_count = 16.min(input.len());

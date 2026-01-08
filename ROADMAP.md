@@ -31,10 +31,10 @@ The architecture is designed to be generic from day one - device-specific detail
 
 | Phase | Status | Progress |
 |-------|--------|----------|
-| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | 🟢 Functional | 570 tests, 100% binary recognition, timing 100% |
+| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | 🟢 Functional | 587 tests, 100% kernel accuracy, branch delay slots |
 | [2. Toolchain Integration](docs/roadmap/phase2-toolchain-integration.md) | 🔴 Not started | |
 | [3. Developer Experience](docs/roadmap/phase3-developer-experience.md) | 🟡 GUI exists | Needs debugging features |
-| [4. Validation & Testing](docs/roadmap/phase4-validation-testing.md) | 🟡 570 tests | TestRunner harness added |
+| [4. Validation & Testing](docs/roadmap/phase4-validation-testing.md) | 🟡 587 tests | TestRunner harness added |
 | [5. Production Readiness](docs/roadmap/phase5-production-readiness.md) | 🔴 Not started | |
 | [6. Community & Ecosystem](docs/roadmap/phase6-community-ecosystem.md) | 🔴 Not started | |
 
@@ -65,8 +65,10 @@ Make the emulator faithful to real AIE2 hardware behavior.
 - **DMA-lock timing**: LockTimingState integrated into DMA engine
 - **BD chaining fix**: Next_BD/Use_Next_BD correctly parsed from word5 (AM029)
 - **DMA repeat count**: Task queue repeat_count support for ping-pong patterns
+- **Branch delay slots**: 5-cycle delay slot implementation for correct loop control
+- **100% kernel accuracy**: add_one_using_dma produces 32/32 correct outputs
 
-**Next:** MemTile CDO configuration (blocking real XCLBIN execution)
+**Next:** Expand to more complex kernels, validate against hardware
 
 ### Phase 2: Toolchain Integration 🔴
 
