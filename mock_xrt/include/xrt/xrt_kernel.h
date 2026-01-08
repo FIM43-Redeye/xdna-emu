@@ -76,17 +76,27 @@ public:
     /// Abort the running kernel
     void abort();
 
-    /// Set a kernel argument
+    /// Wait for completion (alias for wait with no timeout)
+    /// Used by some tests instead of wait()
+    void wait2() const { wait(static_cast<uint32_t>(0)); }
+
+    /// Set a kernel argument (integer types)
     ///
     /// @param index  Argument index
     /// @param value  Argument value
     template<typename T>
-    void set_arg(int index, T&& value) {
+    typename std::enable_if<std::is_integral<typename std::decay<T>::type>::value>::type
+    set_arg(int index, T value) {
         set_arg_impl(index, static_cast<uint64_t>(value));
     }
 
-    /// Set buffer argument
+    /// Set buffer argument (lvalue reference)
     void set_arg(int index, const bo& buf);
+
+    /// Set buffer argument (rvalue reference)
+    void set_arg(int index, bo&& buf) {
+        set_arg(index, static_cast<const bo&>(buf));
+    }
 
     /// Start kernel execution
     void start();
@@ -164,6 +174,9 @@ public:
 
     /// Check if kernel is valid
     explicit operator bool() const { return m_impl != nullptr; }
+
+    /// Make run a friend so it can access m_impl
+    friend class run;
 
 private:
     // Base case for argument packing

@@ -24,6 +24,9 @@ class bo_impl;
 /// xrt::bo represents a buffer object that can be used as kernel argument
 class bo {
 public:
+    /// Handle type for buffer export/import between processes
+    using export_handle = uint64_t;
+
     /// Default constructor - creates invalid bo
     bo() = default;
 

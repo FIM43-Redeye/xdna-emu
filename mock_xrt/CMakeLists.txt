@@ -35,6 +35,7 @@ set(MOCK_XRT_SOURCES
     src/xclbin.cpp
     src/hw_context.cpp
     src/kernel.cpp
+    src/experimental.cpp
     src/emulator_bridge.cpp
 )
 
