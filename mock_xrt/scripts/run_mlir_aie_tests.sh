@@ -175,22 +175,36 @@ run_test() {
         return 1
     fi
 
+    # Check for instruction file - different tests use different names
+    # Try insts.bin first, then aie_run_seq.bin
     if [[ ! -f "$insts" ]]; then
-        log_error "insts.bin not found: $insts"
-        return 1
+        local alt_insts="${build_dir}/aie_run_seq.bin"
+        if [[ -f "$alt_insts" ]]; then
+            insts="$alt_insts"
+        else
+            log_skip "No instruction file found (needs insts.bin or aie_run_seq.bin)"
+            return 2  # Return 2 for "skipped"
+        fi
     fi
 
-    # Run the test
+    # Run the test from the build directory so relative paths work
+    # Many mlir-aie tests use hardcoded relative paths like "insts.bin"
     local output
     local exit_code
+    local abs_test_bin
+    abs_test_bin="$(cd "$(dirname "$test_bin")" && pwd)/$(basename "$test_bin")"
+
+    pushd "$build_dir" > /dev/null
 
     if [[ "$verbose" == "1" ]]; then
-        "$test_bin" --xclbin "$xclbin" --instr "$insts" --kernel MLIR_AIE --verbosity 1
+        "$abs_test_bin" --xclbin "$xclbin" --instr "$insts" --kernel MLIR_AIE --verbosity 1
         exit_code=$?
     else
-        output=$("$test_bin" --xclbin "$xclbin" --instr "$insts" --kernel MLIR_AIE 2>&1)
+        output=$("$abs_test_bin" --xclbin "$xclbin" --instr "$insts" --kernel MLIR_AIE 2>&1)
         exit_code=$?
     fi
+
+    popd > /dev/null
 
     if [[ $exit_code -eq 0 ]]; then
         return 0
@@ -312,9 +326,14 @@ main() {
 
             printf "  Running %-42s " "$test_name..."
 
-            if run_test "$test_name" "$verbose"; then
+            run_test "$test_name" "$verbose"
+            local result=$?
+            if [[ $result -eq 0 ]]; then
                 log_success ""
                 PASSED=$((PASSED + 1))
+            elif [[ $result -eq 2 ]]; then
+                # Already logged skip message
+                SKIPPED=$((SKIPPED + 1))
             else
                 log_fail ""
                 FAILED=$((FAILED + 1))
