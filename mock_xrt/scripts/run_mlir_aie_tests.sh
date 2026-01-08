@@ -124,20 +124,27 @@ discover_tests() {
     local pattern="${1:-*}"
     local tests=()
 
-    # Find all directories with aie.xclbin in the build tree
+    # Find all directories with xclbin files (aie.xclbin or final.xclbin) in the build tree
     while IFS= read -r xclbin; do
         local test_dir="$(dirname "$xclbin")"
-        local test_name="$(basename "$test_dir")"
 
-        # Check if pattern matches
-        if [[ "$test_name" == $pattern ]]; then
+        # Get relative path from npu-xrt directory
+        # This handles nested tests like adjacent_memtile_access/two_memtiles
+        local rel_path="${test_dir#${MLIR_AIE_BUILD}/test/npu-xrt/}"
+        local test_name="$rel_path"
+
+        # For pattern matching, use the leaf directory name
+        local leaf_name="$(basename "$test_dir")"
+
+        # Check if pattern matches (match against leaf name for simplicity)
+        if [[ "$leaf_name" == $pattern ]] || [[ "$test_name" == $pattern ]]; then
             # Check if test.cpp exists in source
-            local source_dir="${MLIR_AIE_ROOT}/test/npu-xrt/${test_name}"
+            local source_dir="${MLIR_AIE_ROOT}/test/npu-xrt/${rel_path}"
             if [[ -f "${source_dir}/test.cpp" ]]; then
-                tests+=("$test_name")
+                tests+=("$rel_path")
             fi
         fi
-    done < <(find "${MLIR_AIE_BUILD}/test/npu-xrt" -name "aie.xclbin" 2>/dev/null | sort)
+    done < <(find "${MLIR_AIE_BUILD}/test/npu-xrt" \( -name "aie.xclbin" -o -name "final.xclbin" \) 2>/dev/null | sort)
 
     printf '%s\n' "${tests[@]}"
 }
@@ -241,8 +248,8 @@ compile_test() {
     local build_dir="${MLIR_AIE_BUILD}/test/npu-xrt/${test_name}"
     local output_bin="${TEST_BUILD_DIR}/${test_name}"
 
-    # Ensure output directory exists
-    mkdir -p "${TEST_BUILD_DIR}"
+    # Ensure output directory exists (handles nested paths like adjacent_memtile_access/two_memtiles)
+    mkdir -p "$(dirname "${output_bin}")"
 
     # Skip if up-to-date (unless forced)
     if [[ "$force" != "1" ]] && ! needs_recompile "$test_name"; then
@@ -271,8 +278,13 @@ run_test() {
     local verbose="$2"
     local build_dir="${MLIR_AIE_BUILD}/test/npu-xrt/${test_name}"
     local test_bin="${TEST_BUILD_DIR}/${test_name}"
-    local xclbin="${build_dir}/aie.xclbin"
     local insts="${build_dir}/insts.bin"
+
+    # Find xclbin file (may be aie.xclbin or final.xclbin)
+    local xclbin="${build_dir}/aie.xclbin"
+    if [[ ! -f "$xclbin" ]]; then
+        xclbin="${build_dir}/final.xclbin"
+    fi
 
     if [[ ! -f "$test_bin" ]]; then
         log_error "Test binary not found: $test_bin"
@@ -280,7 +292,7 @@ run_test() {
     fi
 
     if [[ ! -f "$xclbin" ]]; then
-        log_error "xclbin not found: $xclbin"
+        log_error "xclbin not found in: $build_dir"
         return 1
     fi
 
