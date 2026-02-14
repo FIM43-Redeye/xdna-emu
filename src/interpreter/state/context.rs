@@ -247,20 +247,46 @@ impl std::fmt::Debug for TimingContext {
 ///
 /// AIE2 has 5-cycle branch delay slots - after a branch instruction,
 /// the next 5 instructions still execute before the branch takes effect.
+///
+/// The delay_slots counter starts at 6 because `tick()` is called on the
+/// same cycle as the branch instruction itself (in the interpreter loop).
+/// The first tick brings it to 5, then 5 subsequent instruction cycles
+/// bring it to 0, giving exactly 5 executed delay slot instructions.
+///
+/// For `jl` (call) instructions, `is_call` is set and LR is updated
+/// WHEN the delay slots are exhausted (not immediately). This matches
+/// hardware behavior where delay slot instructions see the pre-call LR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingBranch {
     /// The target address to branch to.
     pub target: u32,
-    /// Number of delay slots remaining (starts at 5, decrements each instruction).
+    /// Number of delay slots remaining.
+    /// Starts at 6: first tick (on branch cycle) -> 5, then 5 DS instructions -> 0.
     pub delay_slots: u8,
+    /// Whether this branch is a call (jl) that should update LR on completion.
+    pub is_call: bool,
 }
 
 impl PendingBranch {
     /// Create a new pending branch with 5 delay slots.
+    ///
+    /// Uses initial count of 6 because tick() is called on the branch cycle.
     pub fn new(target: u32) -> Self {
         Self {
             target,
-            delay_slots: 5,
+            delay_slots: 6,
+            is_call: false,
+        }
+    }
+
+    /// Create a new pending call (jl) with 5 delay slots.
+    ///
+    /// When delay slots are exhausted, the caller should set LR = current PC.
+    pub fn new_call(target: u32) -> Self {
+        Self {
+            target,
+            delay_slots: 6,
+            is_call: true,
         }
     }
 
@@ -391,7 +417,7 @@ impl ExecutionContext {
             stall_cycles: 0,
             halted: false,
             sp_reg: SpRegister::default(),
-            lr_reg: 0, // r0 as link register
+            lr_reg: super::registers::LR_REG_INDEX, // Dedicated special register index
             timing,
             scalar_snapshot: None,
             pending_branch: None,
@@ -583,7 +609,19 @@ impl ExecutionContext {
         // If there's already a pending branch, the new one replaces it
         // (this matches hardware behavior for back-to-back branches)
         self.pending_branch = Some(PendingBranch::new(target));
-        log::debug!("Branch to 0x{:X} pending, 5 delay slots", target);
+        log::debug!("Branch to 0x{:X} pending at PC=0x{:X}, 5 delay slots", target, self.pc);
+    }
+
+    /// Set a pending call (jl) with 5 delay slots.
+    ///
+    /// Like `set_pending_branch`, but also defers the LR update until
+    /// delay slots are exhausted. At that point, LR is set to the current
+    /// PC (the first instruction after all delay slots). This matches
+    /// hardware behavior where delay slot instructions see the pre-call LR.
+    #[inline]
+    pub fn set_pending_call(&mut self, target: u32) {
+        self.pending_branch = Some(PendingBranch::new_call(target));
+        log::debug!("Call to 0x{:X} pending, 5 delay slots (LR deferred)", target);
     }
 
     /// Check if there's a pending branch.
@@ -602,13 +640,31 @@ impl ExecutionContext {
     ///
     /// Returns `Some(target)` if delay slots are exhausted and branch
     /// should now be taken, `None` otherwise.
+    ///
+    /// For call instructions (is_call=true), also updates LR to the
+    /// current PC when delay slots are exhausted. This is the address
+    /// of the first instruction after all delay slots, which is the
+    /// correct return address.
     #[inline]
     pub fn tick_delay_slots(&mut self) -> Option<u32> {
         if let Some(ref mut pending) = self.pending_branch {
             if pending.tick() {
                 let target = pending.target;
+                let is_call = pending.is_call;
                 self.pending_branch = None;
-                log::debug!("Delay slots exhausted, branching to 0x{:X}", target);
+                if is_call {
+                    // LR = current PC = first instruction after all delay slots.
+                    // This is deferred from the jl execution to match hardware
+                    // pipeline behavior (delay slots see the old LR).
+                    let return_addr = self.pc;
+                    self.set_lr(return_addr);
+                    log::debug!(
+                        "Call delay slots exhausted, LR=0x{:X}, branching to 0x{:X}",
+                        return_addr, target
+                    );
+                } else {
+                    log::debug!("Delay slots exhausted, branching to 0x{:X}", target);
+                }
                 return Some(target);
             }
         }
@@ -648,8 +704,12 @@ impl ExecutionContext {
     }
 
     /// Configure which scalar register is used as link register.
+    ///
+    /// Accepts indices 0-47 (including special register slots 32-47).
     pub fn set_lr_register(&mut self, reg: u8) {
-        self.lr_reg = reg & 0x1F;
+        assert!((reg as usize) < super::registers::NUM_SCALAR_REGS,
+                "lr register index {} out of range", reg);
+        self.lr_reg = reg;
     }
 }
 
@@ -766,11 +826,15 @@ mod tests {
 
     #[test]
     fn test_link_register() {
+        use crate::interpreter::state::LR_REG_INDEX;
         let mut ctx = ExecutionContext::new();
 
         ctx.set_lr(0x2000);
         assert_eq!(ctx.lr(), 0x2000);
-        assert_eq!(ctx.scalar.read(0), 0x2000); // lr_reg defaults to r0
+        // lr is stored at dedicated index 32, NOT r0
+        assert_eq!(ctx.scalar.read(LR_REG_INDEX), 0x2000);
+        // r0 should be unaffected
+        assert_eq!(ctx.scalar.read(0), 0);
     }
 
     #[test]

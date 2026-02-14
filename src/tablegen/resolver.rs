@@ -109,29 +109,258 @@ pub fn detect_mem_width(mnemonic: &str) -> InstrMemWidth {
     }
 }
 
+/// How a raw bit-field value should be decoded into an Operand.
+///
+/// Determined from the `OperandDef.reg_class` in the TableGen DAG pattern.
+/// This replaces all hand-written heuristics in the decoder with a single
+/// data-driven dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperandType {
+    /// Simple register: raw value IS the register index.
+    Register(RegisterKind),
+    /// Composite register: multiple register classes share one field,
+    /// discriminated by low bits. Requires an inverse encoder function.
+    CompositeRegister(CompositeEncoder),
+    /// Immediate value with sign and scale.
+    Immediate { signed: bool, scale: i32 },
+    /// Lock ID.
+    LockId,
+    /// Unknown (safe fallback: treated as unsigned immediate).
+    Unknown,
+}
+
+/// Which simple register file a field encodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterKind {
+    /// eR: scalar general-purpose registers (r0-r31)
+    Scalar,
+    /// eP: pointer registers (p0-p7)
+    Pointer,
+    /// eM, eDN, eDJ, eDC: modifier/data registers
+    Modifier,
+    /// eW*, mWm: 256-bit vector registers
+    Vector256,
+    /// mXm, eX*: 512-bit vector registers
+    Vector512,
+    /// eAM, eBM, eCM, mAMm, mBMm: accumulator registers
+    Accumulator,
+}
+
+/// Which Peano composite encoder function was used.
+///
+/// Each variant corresponds to a `get<Name>OpValue` function in
+/// `AIE2MCCodeEmitterRegOperandDef.h`. The decoder inverts these
+/// to recover the original register from the encoded bit pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompositeEncoder {
+    /// mLdaScl, mSclSt, mSclMS: load/store scalar composite
+    LdaScl,
+    /// mMvSclSrc, mMvSclDst, mMvSclDstCg: move scalar composite
+    MvSclSrc,
+    /// mLdaCg, mLdbCg: load destination composite group
+    LdaCg,
+    /// mAluCg: ALU destination composite group
+    AluCg,
+    /// mMvAMWQDst: accumulator/weight-queue destination
+    MvAMWQDst,
+    /// mMvAMWQSrc: accumulator/weight-queue source
+    MvAMWQSrc,
+    /// mMvBMXSrc: buffer/cross source
+    MvBMXSrc,
+    /// mMvBMXDst: buffer/cross destination
+    MvBMXDst,
+    /// eRS4: scalar register subset (r16-r31)
+    ERS4,
+    /// mShflDst: shuffle destination
+    ShflDst,
+    /// mWm_1: vector register with bit rearrangement
+    Wm1,
+    /// mQXHLb: cross high/low byte
+    QXHLb,
+}
+
+/// Classify an operand's decode type from the OperandDef.reg_class.
+///
+/// Maps the `reg_class` string (from the TableGen DAG pattern) to the
+/// appropriate `OperandType`. Falls back to field-name heuristics when
+/// `reg_class` is empty (e.g., for immediates not captured in DAG patterns).
+pub fn classify_operand_type(reg_class: &str, field_name: &str) -> OperandType {
+    // 1. Composite register operands (OP_* prefix from TableGen operand classes)
+    match reg_class {
+        "OP_mLdaScl" | "OP_mSclSt" | "OP_mSclMS" | "OP_mLdbScl"
+            => return OperandType::CompositeRegister(CompositeEncoder::LdaScl),
+        "OP_mMvSclSrc" | "OP_mMvSclDst" | "OP_mMvSclDstCg"
+            => return OperandType::CompositeRegister(CompositeEncoder::MvSclSrc),
+        "OP_mLdaCg" | "OP_mLdbCg"
+            => return OperandType::CompositeRegister(CompositeEncoder::LdaCg),
+        "OP_mAluCg"
+            => return OperandType::CompositeRegister(CompositeEncoder::AluCg),
+        "OP_mMvAMWQDst"
+            => return OperandType::CompositeRegister(CompositeEncoder::MvAMWQDst),
+        "OP_mMvAMWQSrc"
+            => return OperandType::CompositeRegister(CompositeEncoder::MvAMWQSrc),
+        "OP_mMvBMXSrc"
+            => return OperandType::CompositeRegister(CompositeEncoder::MvBMXSrc),
+        "OP_mMvBMXDst"
+            => return OperandType::CompositeRegister(CompositeEncoder::MvBMXDst),
+        "OP_eRS4"
+            => return OperandType::CompositeRegister(CompositeEncoder::ERS4),
+        "OP_mShflDst"
+            => return OperandType::CompositeRegister(CompositeEncoder::ShflDst),
+        "OP_mWm_1"
+            => return OperandType::CompositeRegister(CompositeEncoder::Wm1),
+        "OP_mQXHLb"
+            => return OperandType::CompositeRegister(CompositeEncoder::QXHLb),
+        _ => {}
+    }
+
+    // 2. Simple register classes (exact match or prefix)
+    match reg_class {
+        "eR" => return OperandType::Register(RegisterKind::Scalar),
+        "eP" => return OperandType::Register(RegisterKind::Pointer),
+        "eM" | "eDN" | "eDJ" | "eDC" => return OperandType::Register(RegisterKind::Modifier),
+        _ => {}
+    }
+    if reg_class.starts_with("eW") || reg_class == "mWm" {
+        return OperandType::Register(RegisterKind::Vector256);
+    }
+    if reg_class.starts_with("mXm") || reg_class.starts_with("eX") {
+        return OperandType::Register(RegisterKind::Vector512);
+    }
+    if reg_class.starts_with("eAM") || reg_class.starts_with("mAMm")
+        || reg_class.starts_with("eBM") || reg_class.starts_with("mBMm")
+        || reg_class.starts_with("eCM") || reg_class.starts_with("mBMS")
+    {
+        return OperandType::Register(RegisterKind::Accumulator);
+    }
+    // mQQm (weight queue) -- treat as accumulator for emulator purposes
+    if reg_class.starts_with("mQQ") || reg_class.starts_with("mQX") {
+        return OperandType::Register(RegisterKind::Accumulator);
+    }
+
+    // 3. Immediate operands (parsed from reg_class name)
+    if let Some(imm_type) = parse_immediate_type(reg_class) {
+        return imm_type;
+    }
+
+    // 4. Field-name fallback (when reg_class is empty or unrecognized)
+    if reg_class.is_empty() || reg_class == "?" {
+        return classify_from_field_name(field_name);
+    }
+
+    // Unrecognized reg_class -- warn and fallback
+    OperandType::Unknown
+}
+
+/// Parse immediate type from reg_class name (e.g., "simm7", "imm12x4").
+fn parse_immediate_type(reg_class: &str) -> Option<OperandType> {
+    if reg_class.starts_with("simm") {
+        // Signed immediate, check for scale suffix
+        let rest = &reg_class[4..]; // after "simm"
+        let scale = extract_scale_suffix(rest);
+        return Some(OperandType::Immediate { signed: true, scale });
+    }
+    if reg_class.starts_with("imm") {
+        let rest = &reg_class[3..]; // after "imm"
+        let scale = extract_scale_suffix(rest);
+        return Some(OperandType::Immediate { signed: false, scale });
+    }
+    if reg_class.starts_with("addr") {
+        return Some(OperandType::Immediate { signed: false, scale: 1 });
+    }
+    // Target-specific formats like "t5u" (5-bit unsigned)
+    if reg_class.starts_with('t') && reg_class.len() >= 3 {
+        let last = reg_class.as_bytes()[reg_class.len() - 1];
+        if last == b'u' || last == b's' {
+            let signed = last == b's';
+            return Some(OperandType::Immediate { signed, scale: 1 });
+        }
+    }
+    None
+}
+
+/// Extract scale factor from immediate suffix (e.g., "12x4" -> 4, "7" -> 1).
+fn extract_scale_suffix(s: &str) -> i32 {
+    if let Some(pos) = s.find('x') {
+        s[pos + 1..].parse::<i32>().unwrap_or(1)
+    } else {
+        1
+    }
+}
+
+/// Classify operand type purely from the field name (last resort fallback).
+fn classify_from_field_name(field_name: &str) -> OperandType {
+    if field_name == "id" || field_name == "mLockId" {
+        return OperandType::LockId;
+    }
+    // Constant fields: c5s, c11s (signed), c5u, c6u (unsigned)
+    if field_name.len() >= 3 && field_name.starts_with('c') {
+        let bytes = field_name.as_bytes();
+        if bytes[1].is_ascii_digit() {
+            let last = bytes[field_name.len() - 1];
+            if last == b's' {
+                return OperandType::Immediate { signed: true, scale: 1 };
+            }
+            if last == b'u' {
+                return OperandType::Immediate { signed: false, scale: 1 };
+            }
+        }
+    }
+    OperandType::Unknown
+}
+
+/// A fragment of a split operand field.
+///
+/// AIE2 VLIW encodings sometimes scatter operand bits across non-contiguous
+/// positions in the instruction word. For example, MOV_mv_cg encodes a 10-bit
+/// immediate as `{i{9-1}, ..fixed.., i{0}, ..fixed..}`. Each non-contiguous
+/// piece is a FieldFragment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldFragment {
+    /// Bit position in the instruction word where this fragment starts
+    pub inst_bit: u8,
+    /// Width of this fragment in bits
+    pub width: u8,
+    /// Starting bit position in the logical operand value.
+    /// For `i{9-1}`, target_bit = 1 (maps to bits 1..=9 of the value).
+    /// For `i{0}`, target_bit = 0 (maps to bit 0 of the value).
+    pub target_bit: u8,
+}
+
 /// A resolved operand field within an instruction encoding.
 ///
-/// Specifies where an operand can be extracted from the instruction bits.
+/// Specifies where an operand can be extracted from the instruction bits,
+/// and how the raw extracted value should be interpreted.
+///
+/// For contiguous fields, `fragments` is empty and extraction uses the simple
+/// `(word >> bit_position) & mask` path. For split fields (like MOV_mv_cg's
+/// immediate), `fragments` records each piece and extraction reassembles them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperandField {
     /// Field name from TableGen (e.g., "mRx", "imm")
     pub name: String,
-    /// Bit position of LSB within the slot encoding
+    /// Bit position of LSB within the slot encoding (for contiguous fields)
     pub bit_position: u8,
-    /// Width in bits
+    /// Total logical width in bits (sum of all fragments)
     pub width: u8,
     /// Whether this is a signed immediate (for sign extension)
     pub signed: bool,
+    /// Data-driven operand type (determines how raw bits become an Operand)
+    pub operand_type: OperandType,
+    /// Non-contiguous fragments. Empty for contiguous fields.
+    pub fragments: Vec<FieldFragment>,
 }
 
 impl OperandField {
-    /// Create a new operand field.
+    /// Create a new operand field with Unknown operand type.
     pub fn new(name: impl Into<String>, bit_position: u8, width: u8) -> Self {
         Self {
             name: name.into(),
             bit_position,
             width,
             signed: false,
+            operand_type: OperandType::Unknown,
+            fragments: Vec::new(),
         }
     }
 
@@ -142,10 +371,25 @@ impl OperandField {
     }
 
     /// Extract this field's value from an instruction word.
+    ///
+    /// For contiguous fields (the common case), uses a simple shift+mask.
+    /// For split fields, reassembles the value from scattered fragments.
     #[inline]
     pub fn extract(&self, word: u64) -> u64 {
-        let mask = (1u64 << self.width) - 1;
-        (word >> self.bit_position) & mask
+        if self.fragments.is_empty() {
+            // Contiguous field: simple extraction
+            let mask = (1u64 << self.width) - 1;
+            (word >> self.bit_position) & mask
+        } else {
+            // Split field: reassemble from fragments
+            let mut value = 0u64;
+            for frag in &self.fragments {
+                let frag_mask = (1u64 << frag.width) - 1;
+                let bits = (word >> frag.inst_bit) & frag_mask;
+                value |= bits << frag.target_bit;
+            }
+            value
+        }
     }
 
     /// Extract as signed value (sign-extend if needed).
@@ -153,7 +397,7 @@ impl OperandField {
     pub fn extract_signed(&self, word: u64) -> i64 {
         let unsigned = self.extract(word);
         if self.signed && self.width < 64 {
-            // Sign extend
+            // Sign extend based on total logical width
             let sign_bit = 1u64 << (self.width - 1);
             if unsigned & sign_bit != 0 {
                 let mask = !((1u64 << self.width) - 1);
@@ -227,6 +471,13 @@ pub struct InstrEncoding {
     /// Memory access width detected from mnemonic (e.g., `.s8` -> Byte).
     /// Used by the decoder to set the correct MemWidth on Load/Store operations.
     pub mem_width: InstrMemWidth,
+
+    /// Whether the encoding uniquely identifies this instruction.
+    /// When false (from TableGen's `hasCompleteDecoder = 0`), the encoding
+    /// may be ambiguous and this instruction should be deprioritized during
+    /// disambiguation. Complete-decoder instructions are preferred when
+    /// multiple encodings match the same bit pattern.
+    pub has_complete_decoder: bool,
 }
 
 impl InstrEncoding {
@@ -241,6 +492,25 @@ impl InstrEncoding {
     /// Higher specificity = more fixed bits = should match first.
     pub fn specificity(&self) -> u32 {
         self.fixed_mask.count_ones()
+    }
+
+    /// Sort key for disambiguation: (has_complete_decoder, fixed_ones, specificity).
+    ///
+    /// The sort order (all descending) is:
+    /// 1. Complete-decoder instructions first (unambiguous encodings).
+    /// 2. Among incomplete-decoder instructions, prefer those with more fixed
+    ///    1-bits in their opcode. A fixed 1-bit is a positive assertion ("this
+    ///    bit must be 1"), which is more distinctive than a fixed 0-bit. An
+    ///    encoding with all-zero fixed bits matches a huge swath of encoding
+    ///    space and is likely a false match when competing with an encoding
+    ///    that has specific 1-bits.
+    /// 3. Break ties with total fixed bit count (specificity).
+    pub fn sort_key(&self) -> (bool, u32, u32) {
+        (
+            self.has_complete_decoder,
+            self.fixed_bits.count_ones(),
+            self.specificity(),
+        )
     }
 }
 
@@ -371,13 +641,33 @@ impl<'a> Resolver<'a> {
 
         // Process encoding parts to compute masks and fields
         // Pass merged field_sources to trace derived fields back to source operands
-        let (fixed_mask, fixed_bits, operand_fields) =
+        let (fixed_mask, fixed_bits, mut operand_fields) =
             self.process_encoding(
                 &format.encoding,
                 &field_widths,
                 &template_values,
                 &merged_field_sources,
             )?;
+
+        // Populate operand_type on each field using OperandDef.reg_class
+        let all_operand_defs: Vec<&super::types::OperandDef> = instr.outputs.iter()
+            .chain(instr.inputs.iter())
+            .collect();
+
+        for field in &mut operand_fields {
+            if let Some(opdef) = all_operand_defs.iter()
+                .find(|od| od.name == field.name)
+            {
+                field.operand_type = classify_operand_type(&opdef.reg_class, &field.name);
+            } else {
+                // No matching OperandDef -- use field-name fallback
+                field.operand_type = classify_operand_type("", &field.name);
+            }
+            // Sync signed flag from operand type
+            if let OperandType::Immediate { signed: true, .. } = &field.operand_type {
+                field.signed = true;
+            }
+        }
 
         // Look up semantic operation from pattern, or infer from mnemonic
         let semantic = self.data.semantic_for_instruction(&instr.name)
@@ -404,6 +694,8 @@ impl<'a> Resolver<'a> {
             implicit_regs: instr.implicit_regs.clone(),
             addressing_mode: detect_addressing_mode(&instr.name),
             mem_width: detect_mem_width(&instr.mnemonic),
+            // Regex parser doesn't parse hasCompleteDecoder; assume true (safe default)
+            has_complete_decoder: true,
         })
     }
 
@@ -432,9 +724,9 @@ impl<'a> Resolver<'a> {
                 .push(encoding);
         }
 
-        // Sort each slot's instructions by specificity (most specific first)
+        // Sort each slot by disambiguation key
         for encodings in by_slot.values_mut() {
-            encodings.sort_by(|a, b| b.specificity().cmp(&a.specificity()));
+            encodings.sort_by(|a, b| b.sort_key().cmp(&a.sort_key()));
         }
 
         by_slot
@@ -537,12 +829,44 @@ impl<'a> Resolver<'a> {
                             name.as_str()
                         };
 
+                        // Determine which bits of the logical operand this fragment covers.
+                        // For `i{9-1}`, target_bit = 1 (covers bits 1..=9 of the value).
+                        // For `i` (no slice), target_bit = 0 (covers all bits).
+                        let target_bit = low.unwrap_or(0);
+
                         // Check if we should merge with existing field of same name
-                        // (for split fields like immediate{10-6} and immediate{5-0})
+                        // (for split fields like i{9-1} ... i{0})
                         if let Some(existing) = operand_fields.iter_mut().find(|f| f.name == operand_name) {
-                            // For now, just note that this is a split field
-                            // Full handling would track all slices
-                            // We'll use the first (MSB) slice's position
+                            // Split field: convert to fragment-based extraction.
+                            // On the first merge, we retroactively record the original
+                            // contiguous piece as the first fragment.
+                            if existing.fragments.is_empty() {
+                                // First merge: convert the existing contiguous field
+                                // into a fragment. The existing field was the MSB piece
+                                // (parts are processed MSB-first), so its target_bit
+                                // is the width of remaining pieces.
+                                //
+                                // We need to figure out the target_bit for the first
+                                // fragment. The logical field width is in field_widths.
+                                // First fragment covers the MSB, so target_bit =
+                                // total_logical_width - existing.width.
+                                let logical_width = field_widths.get(name)
+                                    .copied()
+                                    .unwrap_or(existing.width + w);
+                                let first_target = logical_width.saturating_sub(existing.width);
+                                existing.fragments.push(FieldFragment {
+                                    inst_bit: existing.bit_position,
+                                    width: existing.width,
+                                    target_bit: first_target,
+                                });
+                            }
+                            // Add the new fragment
+                            existing.fragments.push(FieldFragment {
+                                inst_bit: bit_pos,
+                                width: w,
+                                target_bit: target_bit,
+                            });
+                            // Update total logical width
                             existing.width = existing.width.saturating_add(w);
                         } else {
                             operand_fields.push(OperandField::new(operand_name, bit_pos, w));
@@ -606,8 +930,9 @@ impl SlotIndex {
             };
         }
 
-        // Sort by specificity (most specific first) for disambiguation
-        encodings.sort_by(|a, b| b.specificity().cmp(&a.specificity()));
+        // Sort by disambiguation key: complete-decoder first, then fixed 1-bits,
+        // then total specificity. See InstrEncoding::sort_key() for rationale.
+        encodings.sort_by(|a, b| b.sort_key().cmp(&a.sort_key()));
 
         // Compute common mask: intersection of all fixed_masks
         let common_mask = encodings
@@ -633,11 +958,11 @@ impl SlotIndex {
             }
         }
 
-        // Sort each bucket by specificity
+        // Sort each bucket by disambiguation key
         for bucket in by_opcode.values_mut() {
-            bucket.sort_by(|a, b| b.specificity().cmp(&a.specificity()));
+            bucket.sort_by(|a, b| b.sort_key().cmp(&a.sort_key()));
         }
-        fallback.sort_by(|a, b| b.specificity().cmp(&a.specificity()));
+        fallback.sort_by(|a, b| b.sort_key().cmp(&a.sort_key()));
 
         Self {
             slot_name,
@@ -915,11 +1240,16 @@ pub fn infer_semantic_from_mnemonic(mnemonic: &str) -> Option<SemanticOp> {
         return Some(SemanticOp::Add);
     }
 
-    // Branch/call operations
+    // Call (jump-and-link) operations
     if lower == "jl" || lower.starts_with("call") {
+        return Some(SemanticOp::Call);
+    }
+    // Unconditional jumps
+    if lower == "j" {
         return Some(SemanticOp::Br);
     }
-    if lower == "j" || lower == "jnz" || lower == "jz" || lower == "jnzd"
+    // Conditional branches: register-based (jnz/jz) and flag-based (b*)
+    if lower == "jnz" || lower == "jz" || lower == "jnzd"
         || lower.starts_with("b") && !lower.starts_with("bswap")
     {
         return Some(SemanticOp::BrCond);
@@ -1386,7 +1716,7 @@ mod tests {
         assert_eq!(infer_semantic_from_mnemonic("paddb"), Some(SemanticOp::Add));
 
         // Branch/call operations
-        assert_eq!(infer_semantic_from_mnemonic("jl"), Some(SemanticOp::Br));
+        assert_eq!(infer_semantic_from_mnemonic("jl"), Some(SemanticOp::Call));
         assert_eq!(infer_semantic_from_mnemonic("jnz"), Some(SemanticOp::BrCond));
         assert_eq!(infer_semantic_from_mnemonic("bz"), Some(SemanticOp::BrCond));
 
@@ -1572,5 +1902,155 @@ mod tests {
 
         // Should have at least some semantic coverage
         assert!(with_semantic.len() > 0, "Should have some instructions with semantic info");
+    }
+
+    // === OperandType / classify_operand_type Tests ===
+
+    #[test]
+    fn test_classify_simple_registers() {
+        assert_eq!(
+            classify_operand_type("eR", "mRx"),
+            OperandType::Register(RegisterKind::Scalar)
+        );
+        assert_eq!(
+            classify_operand_type("eP", "ptr"),
+            OperandType::Register(RegisterKind::Pointer)
+        );
+        assert_eq!(
+            classify_operand_type("eM", "mod"),
+            OperandType::Register(RegisterKind::Modifier)
+        );
+        assert_eq!(
+            classify_operand_type("eDN", "dn"),
+            OperandType::Register(RegisterKind::Modifier)
+        );
+        assert_eq!(
+            classify_operand_type("eDJ", "dj"),
+            OperandType::Register(RegisterKind::Modifier)
+        );
+        assert_eq!(
+            classify_operand_type("eDC", "dc"),
+            OperandType::Register(RegisterKind::Modifier)
+        );
+    }
+
+    #[test]
+    fn test_classify_vector_accumulator_registers() {
+        assert_eq!(
+            classify_operand_type("eWLE", "mW"),
+            OperandType::Register(RegisterKind::Vector256)
+        );
+        assert_eq!(
+            classify_operand_type("mWm", "mWm"),
+            OperandType::Register(RegisterKind::Vector256)
+        );
+        assert_eq!(
+            classify_operand_type("mXm", "mXm"),
+            OperandType::Register(RegisterKind::Vector512)
+        );
+        assert_eq!(
+            classify_operand_type("eAM", "mAM"),
+            OperandType::Register(RegisterKind::Accumulator)
+        );
+        assert_eq!(
+            classify_operand_type("mAMm", "mAMm"),
+            OperandType::Register(RegisterKind::Accumulator)
+        );
+        assert_eq!(
+            classify_operand_type("mBMm", "mBMm"),
+            OperandType::Register(RegisterKind::Accumulator)
+        );
+    }
+
+    #[test]
+    fn test_classify_composite_registers() {
+        assert_eq!(
+            classify_operand_type("OP_mLdaScl", "mLdaScl"),
+            OperandType::CompositeRegister(CompositeEncoder::LdaScl)
+        );
+        assert_eq!(
+            classify_operand_type("OP_mSclSt", "mSclSt"),
+            OperandType::CompositeRegister(CompositeEncoder::LdaScl)
+        );
+        assert_eq!(
+            classify_operand_type("OP_mMvSclSrc", "mMvSclSrc"),
+            OperandType::CompositeRegister(CompositeEncoder::MvSclSrc)
+        );
+        assert_eq!(
+            classify_operand_type("OP_mMvSclDstCg", "mMvSclDstCg"),
+            OperandType::CompositeRegister(CompositeEncoder::MvSclSrc)
+        );
+        assert_eq!(
+            classify_operand_type("OP_mLdaCg", "mLdaCg"),
+            OperandType::CompositeRegister(CompositeEncoder::LdaCg)
+        );
+        assert_eq!(
+            classify_operand_type("OP_mAluCg", "mAluCg"),
+            OperandType::CompositeRegister(CompositeEncoder::AluCg)
+        );
+    }
+
+    #[test]
+    fn test_classify_immediates() {
+        assert_eq!(
+            classify_operand_type("simm7", "imm"),
+            OperandType::Immediate { signed: true, scale: 1 }
+        );
+        assert_eq!(
+            classify_operand_type("imm12x4", "imm"),
+            OperandType::Immediate { signed: false, scale: 4 }
+        );
+        assert_eq!(
+            classify_operand_type("imm6x32", "imm"),
+            OperandType::Immediate { signed: false, scale: 32 }
+        );
+        assert_eq!(
+            classify_operand_type("imm5", "imm"),
+            OperandType::Immediate { signed: false, scale: 1 }
+        );
+        assert_eq!(
+            classify_operand_type("addr20", "cpmaddr"),
+            OperandType::Immediate { signed: false, scale: 1 }
+        );
+    }
+
+    #[test]
+    fn test_classify_field_name_fallback() {
+        // Lock IDs
+        assert_eq!(classify_operand_type("", "id"), OperandType::LockId);
+        assert_eq!(classify_operand_type("", "mLockId"), OperandType::LockId);
+
+        // Constant fields from field name
+        assert_eq!(
+            classify_operand_type("", "c11s"),
+            OperandType::Immediate { signed: true, scale: 1 }
+        );
+        assert_eq!(
+            classify_operand_type("", "c5u"),
+            OperandType::Immediate { signed: false, scale: 1 }
+        );
+
+        // Unknown fallback
+        assert_eq!(classify_operand_type("", "unknown"), OperandType::Unknown);
+    }
+
+    #[test]
+    fn test_operand_type_populated_on_resolve() {
+        // Verify that resolve_instruction populates operand_type on fields
+        let data = make_test_data();
+        let resolver = Resolver::new(&data);
+
+        let add = data.instructions.get("ADD").unwrap();
+        let encoding = resolver.resolve_instruction(add).unwrap();
+
+        // ADD has eR reg_class for all operands
+        for field in &encoding.operand_fields {
+            assert_eq!(
+                field.operand_type,
+                OperandType::Register(RegisterKind::Scalar),
+                "Field '{}' should be classified as Scalar register",
+                field.name
+            );
+        }
     }
 }

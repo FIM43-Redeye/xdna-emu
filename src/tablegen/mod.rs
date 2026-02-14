@@ -57,9 +57,9 @@ pub use parser::{
     parse_tablegen_files_with_patterns, ParseError,
 };
 pub use resolver::{
-    build_decoder_tables, AddressingMode, DecoderIndex, InstrEncoding, InstrMemWidth,
-    OperandField, ResolveError, Resolver, SlotIndex, SlotIndexStats,
-    detect_addressing_mode, detect_mem_width,
+    build_decoder_tables, AddressingMode, CompositeEncoder, DecoderIndex, InstrEncoding,
+    InstrMemWidth, OperandField, OperandType, RegisterKind, ResolveError, Resolver, SlotIndex,
+    SlotIndexStats, classify_operand_type, detect_addressing_mode, detect_mem_width,
 };
 pub use tblgen_records::{parse_tblgen_records, InstrRecord, SlotEncoding};
 pub use types::{

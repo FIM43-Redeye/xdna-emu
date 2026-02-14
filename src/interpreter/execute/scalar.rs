@@ -128,7 +128,9 @@ impl ScalarAlu {
 
             Operation::ScalarOr => {
                 let (a, b) = Self::get_two_sources(op, ctx);
-                Self::write_dest(op, ctx, a | b);
+                let result = a | b;
+                log::trace!("OR: a=0x{:X} b=0x{:X} result=0x{:X} dest={:?}", a, b, result, op.dest);
+                Self::write_dest(op, ctx, result);
                 // AIE2: OR does NOT set any flags
                 true
             }
@@ -174,6 +176,7 @@ impl ScalarAlu {
             // ═══════════════════════════════════════════════════════════════
             Operation::ScalarMov => {
                 let src = Self::get_source(op, ctx, 0);
+                log::trace!("ScalarMov: dest={:?} src=0x{:X} (from {:?})", op.dest, src, op.sources.first());
                 Self::write_dest(op, ctx, src);
                 true
             }
@@ -208,6 +211,7 @@ impl ScalarAlu {
             Operation::ScalarLtu => {
                 let (a, b) = Self::get_two_sources(op, ctx);
                 let result = if a < b { 1 } else { 0 };
+                log::trace!("LTU: a=0x{:X} b=0x{:X} result={} dest={:?}", a, b, result, op.dest);
                 Self::write_dest(op, ctx, result);
                 true
             }
@@ -456,11 +460,12 @@ impl ScalarAlu {
                 // AIE2 sel.eqz ALWAYS tests r27 (hardcoded in instruction definition)
                 // Assembly format: sel.eqz dest, true_val, false_val, r27
                 // Only 2 actual operand fields: mRx0 (true), mRy (false)
-                // TODO: This should be driven by TableGen InstrDef, not hardcoded
                 let src_true = Self::get_source(op, ctx, 0);
                 let src_false = Self::get_source(op, ctx, 1);
                 let test = ctx.scalar_read(27); // r27 is implicit test condition
                 let result = if test == 0 { src_true } else { src_false };
+                log::trace!("SEL.EQZ: true=0x{:X} false=0x{:X} r27={} result=0x{:X} dest={:?}",
+                    src_true, src_false, test, result, op.dest);
                 Self::write_dest(op, ctx, result);
                 true
             }

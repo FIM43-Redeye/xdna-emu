@@ -94,6 +94,17 @@ pub enum ExecuteResult {
         target: u32,
     },
 
+    /// Call (jl) to target address.
+    ///
+    /// Like Branch, but defers the LR update until delay slots are
+    /// exhausted. LR will be set to the PC after all delay slots
+    /// (the first non-delay-slot instruction), matching hardware
+    /// pipeline behavior.
+    Call {
+        /// Target program counter.
+        target: u32,
+    },
+
     /// Stall waiting on lock acquisition.
     WaitLock {
         /// Lock ID being waited on.

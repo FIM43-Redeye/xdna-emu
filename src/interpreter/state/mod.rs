@@ -35,6 +35,10 @@ pub use registers::{
     AccumulatorRegisterFile,
     PointerRegisterFile,
     ModifierRegisterFile,
+    // Register file dimensions and special register indices.
+    NUM_SCALAR_REGS, NUM_SCALAR_GPRS,
+    LR_REG_INDEX, LS_REG_INDEX, LE_REG_INDEX, LC_REG_INDEX,
+    DP_REG_INDEX, CORE_ID_REG_INDEX,
 };
 pub use context::{
     ExecutionContext, SpRegister, TimingContext,

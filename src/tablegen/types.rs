@@ -287,6 +287,7 @@ pub enum SemanticOp {
     // Control flow
     Br,      // Unconditional branch
     BrCond,  // Conditional branch
+    Call,    // Call subroutine (jl: sets LR after delay slots)
     Ret,     // Return from subroutine
     Select,  // Conditional select (ternary)
 

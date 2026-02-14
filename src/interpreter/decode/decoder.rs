@@ -31,8 +31,8 @@ use crate::interpreter::bundle::{
 };
 use crate::interpreter::traits::{DecodeError, Decoder};
 use crate::tablegen::{
-    build_decoder_tables, load_from_llvm_aie, load_via_tblgen, AddressingMode, DecoderIndex,
-    InstrEncoding, InstrMemWidth, SemanticOp,
+    build_decoder_tables, load_from_llvm_aie, load_via_tblgen, AddressingMode, CompositeEncoder,
+    DecoderIndex, InstrEncoding, InstrMemWidth, OperandType, RegisterKind, SemanticOp,
 };
 
 /// A decoded instruction from TableGen data.
@@ -113,30 +113,349 @@ impl Default for InstructionDecoder {
     }
 }
 
-/// Decode a mMvScl* composite register group value into an Operand.
-///
-/// These 7-bit fields encode multiple register types in the mv and lng VLIW slots.
-/// The discriminant is in the low 2 bits:
-///   - 0b00: scalar register, number = (raw >> 2) & 0x1F  (r0-r31)
-///   - 0b11: pointer register, index = (raw >> 4) & 0x7   (p0-p7, sp=p6)
-///   - 0b01, 0b10: modifier/special registers (DC, DJ, DN, etc.)
-fn decode_mv_scl_composite(value: u64) -> Operand {
-    match value & 0x3 {
-        0b00 => {
-            let scalar_reg = ((value >> 2) & 0x1F) as u8;
-            Operand::ScalarReg(scalar_reg)
-        }
-        0b11 => {
-            let ptr_idx = ((value >> 4) & 0x7) as u8;
-            Operand::PointerReg(ptr_idx)
-        }
-        _ => {
-            // Modifier/special registers: use bits[6:2] as index
-            let mod_reg = ((value >> 2) & 0x1F) as u8;
-            Operand::ModifierReg(mod_reg)
-        }
+// ─── Inverse Encoder Functions ───────────────────────────────────────────────
+//
+// Each function below is the inverse of the corresponding Peano encoder in
+// AIE2MCCodeEmitterRegOperandDef.h. They take a raw bit-field value and return
+// the decoded Operand.
+
+/// Dispatch a composite register decode based on the encoder variant.
+fn decode_composite(encoder: CompositeEncoder, raw: u64) -> Operand {
+    match encoder {
+        CompositeEncoder::LdaScl => decode_lda_scl(raw),
+        CompositeEncoder::MvSclSrc => decode_mv_scl_src(raw),
+        CompositeEncoder::LdaCg => decode_lda_cg(raw),
+        CompositeEncoder::AluCg => decode_alu_cg(raw),
+        CompositeEncoder::MvAMWQDst => decode_mv_amwq_dst(raw),
+        CompositeEncoder::MvAMWQSrc => decode_mv_amwq_src(raw),
+        CompositeEncoder::MvBMXSrc => decode_mv_bmx_src(raw),
+        CompositeEncoder::MvBMXDst => decode_mv_bmx_dst(raw),
+        CompositeEncoder::ERS4 => decode_ers4(raw),
+        CompositeEncoder::ShflDst => decode_shfl_dst(raw),
+        CompositeEncoder::Wm1 => decode_wm1(raw),
+        CompositeEncoder::QXHLb => decode_qxhlb(raw),
     }
 }
+
+/// Inverse of `getmLdaSclOpValue`. Covers mLdaScl, mSclSt, mSclMS, mLdbScl.
+///
+/// Encoding:
+///   lr         -> 0b0000101
+///   eP(enc)    -> (enc << 4) | 0b1101
+///   eR(enc)    -> (enc << 2) | 0b00
+///   eM(enc)    -> ((enc | 0b00000) << 2) | 0b10
+///   eDN(enc)   -> ((enc | 0b01000) << 2) | 0b10
+///   eDJ(enc)   -> ((enc | 0b10000) << 2) | 0b10
+///   eDC(enc)   -> ((enc | 0b11000) << 2) | 0b10
+fn decode_lda_scl(raw: u64) -> Operand {
+    // Special case: link register (HW encoding 5 in LdaScl space)
+    if raw == 0b0000101 {
+        return Operand::ScalarReg(crate::interpreter::state::LR_REG_INDEX);
+    }
+    // Pointer: low 4 bits == 0b1101
+    if raw & 0xF == 0b1101 {
+        let ptr_reg = ((raw >> 4) & 0x7) as u8;
+        return Operand::PointerReg(ptr_reg);
+    }
+    // Scalar: low 2 bits == 0b00
+    if raw & 0x3 == 0b00 {
+        let scl_reg = ((raw >> 2) & 0x1F) as u8;
+        return Operand::ScalarReg(scl_reg);
+    }
+    // Modifier/special: low 2 bits == 0b10
+    if raw & 0x3 == 0b10 {
+        let combined = (raw >> 2) & 0x1F;
+        let prefix = combined & 0x18; // bits[4:3]
+        let reg = (combined & 0x07) as u8;
+        return match prefix {
+            0b00000 => Operand::ModifierReg(reg),        // eM
+            0b01000 => Operand::ModifierReg(8 + reg),    // eDN
+            0b10000 => Operand::ModifierReg(16 + reg),   // eDJ
+            0b11000 => Operand::ModifierReg(24 + reg),   // eDC
+            _ => Operand::ModifierReg(reg),
+        };
+    }
+    // Fallback
+    Operand::ScalarReg((raw >> 2) as u8)
+}
+
+/// Inverse of `getmMvSclSrcOpValue`. Covers mMvSclSrc, mMvSclDst, mMvSclDstCg.
+///
+/// Special register HW encodings (returned directly):
+///   LS=7, DP=23, lr=39, CORE_ID=55, LE=71, LC=87, SP=103
+///
+/// Otherwise:
+///   eR(enc)    -> (enc << 2) | 0b00
+///   eP(enc)    -> (enc << 4) | 0b0011
+///   eM(enc)    -> ((enc | 0b0000) << 2) | 0b10
+///   eDN/DJ/DC  -> same as LdaScl modifier encoding
+///   eS(enc)    -> (enc << 5) | 0b01011
+///   mCRm(enc)  -> (enc << 3) | 0b001
+///   mSRm(enc)  -> (enc << 3) | 0b101
+fn decode_mv_scl_src(raw: u64) -> Operand {
+    // Check for special register HW encodings first
+    // These have bits[2:0] == 0b111 (the SPL tag) and bits[6:3] identify the register.
+    if raw & 0x7 == 0b111 {
+        // Special register: HWEncoding = (id << 3) | 0b111
+        // id comes from AIE2SPLReg<Enc> in TableGen.
+        use crate::interpreter::state::*;
+        let id = (raw >> 3) & 0xF;
+        return match id {
+            0  => Operand::ScalarReg(LS_REG_INDEX),       // LS (loop start)
+            2  => Operand::ScalarReg(DP_REG_INDEX),       // DP (decompress pointer)
+            4  => Operand::ScalarReg(LR_REG_INDEX),       // lr (link register)
+            6  => Operand::ScalarReg(CORE_ID_REG_INDEX),  // CORE_ID (read-only)
+            8  => Operand::ScalarReg(LE_REG_INDEX),       // LE (loop end)
+            10 => Operand::ScalarReg(LC_REG_INDEX),       // LC (loop count)
+            12 => Operand::PointerReg(6),                 // SP (stack pointer = p6)
+            _  => Operand::ScalarReg(0),
+        };
+    }
+    // Pointer: low 4 bits == 0b0011
+    if raw & 0xF == 0b0011 {
+        let ptr_reg = ((raw >> 4) & 0x7) as u8;
+        return Operand::PointerReg(ptr_reg);
+    }
+    // Scalar: low 2 bits == 0b00
+    if raw & 0x3 == 0b00 {
+        let scl_reg = ((raw >> 2) & 0x1F) as u8;
+        return Operand::ScalarReg(scl_reg);
+    }
+    // eS: low 5 bits == 0b01011
+    if raw & 0x1F == 0b01011 {
+        let s_reg = ((raw >> 5) & 0x3) as u8;
+        return Operand::ScalarReg(s_reg); // Status register, modeled as scalar
+    }
+    // Modifier/special: low 2 bits == 0b10
+    if raw & 0x3 == 0b10 {
+        let combined = (raw >> 2) & 0x1F;
+        let prefix = combined & 0x18;
+        let reg = (combined & 0x07) as u8;
+        return match prefix {
+            0b00000 => Operand::ModifierReg(reg),
+            0b01000 => Operand::ModifierReg(8 + reg),
+            0b10000 => Operand::ModifierReg(16 + reg),
+            0b11000 => Operand::ModifierReg(24 + reg),
+            _ => Operand::ModifierReg(reg),
+        };
+    }
+    // mCRm: low 3 bits == 0b001
+    if raw & 0x7 == 0b001 {
+        let cr_reg = ((raw >> 3) & 0xF) as u8;
+        return Operand::ScalarReg(cr_reg); // Control register, modeled as scalar
+    }
+    // mSRm: low 3 bits == 0b101
+    if raw & 0x7 == 0b101 {
+        let sr_reg = ((raw >> 3) & 0xF) as u8;
+        return Operand::ScalarReg(sr_reg); // Status register, modeled as scalar
+    }
+    // Fallback
+    Operand::ScalarReg((raw >> 2) as u8)
+}
+
+/// Inverse of `getmLdaCgOpValue`. Covers mLdaCg, mLdbCg.
+///
+/// Encoding:
+///   LC         -> 0b0010101
+///   eP(enc)    -> (enc << 4) | 0b1101
+///   eR(enc)    -> (enc << 2) | 0b00
+///   eM/eDN/eDJ/eDC -> same modifier encoding as LdaScl
+fn decode_lda_cg(raw: u64) -> Operand {
+    // Special case: LC (loop count) -- HW encoding 0b0010101 = 21 in LdaCg space
+    if raw == 0b0010101 {
+        return Operand::ScalarReg(crate::interpreter::state::LC_REG_INDEX);
+    }
+    // Pointer: low 4 bits == 0b1101
+    if raw & 0xF == 0b1101 {
+        let ptr_reg = ((raw >> 4) & 0x7) as u8;
+        return Operand::PointerReg(ptr_reg);
+    }
+    // Scalar: low 2 bits == 0b00
+    if raw & 0x3 == 0b00 {
+        let scl_reg = ((raw >> 2) & 0x1F) as u8;
+        return Operand::ScalarReg(scl_reg);
+    }
+    // Modifier: low 2 bits == 0b10
+    if raw & 0x3 == 0b10 {
+        let combined = (raw >> 2) & 0x1F;
+        let prefix = combined & 0x18;
+        let reg = (combined & 0x07) as u8;
+        return match prefix {
+            0b00000 => Operand::ModifierReg(reg),
+            0b01000 => Operand::ModifierReg(8 + reg),
+            0b10000 => Operand::ModifierReg(16 + reg),
+            0b11000 => Operand::ModifierReg(24 + reg),
+            _ => Operand::ModifierReg(reg),
+        };
+    }
+    Operand::ScalarReg((raw >> 2) as u8)
+}
+
+/// Inverse of `getmAluCgOpValue`.
+///
+/// Encoding:
+///   LC         -> 0b000001
+///   eR(enc)    -> enc << 1
+fn decode_alu_cg(raw: u64) -> Operand {
+    if raw == 0b000001 {
+        return Operand::ScalarReg(crate::interpreter::state::LC_REG_INDEX); // LC
+    }
+    let scl_reg = (raw >> 1) as u8;
+    Operand::ScalarReg(scl_reg)
+}
+
+/// Inverse of `getmMvAMWQDstOpValue`.
+///
+/// Encoding:
+///   mAMm(enc)    -> (enc << 1) | 0b1
+///   eWLE(enc)    -> (0b00 << 5) | ((enc >> 2) << 2) | 0b00
+///   eWLO(enc)    -> (0b01 << 5) | ((enc >> 2) << 2) | 0b00
+///   eWHE(enc)    -> (0b10 << 5) | ((enc >> 2) << 2) | 0b00
+///   eWHO(enc)    -> (0b11 << 5) | ((enc >> 2) << 2) | 0b00
+///   mQQm(enc)    -> (enc << 5) | 0b00010
+fn decode_mv_amwq_dst(raw: u64) -> Operand {
+    // mAMm: low bit == 1
+    if raw & 0x1 == 0b1 {
+        let am_reg = (raw >> 1) as u8;
+        return Operand::AccumReg(am_reg);
+    }
+    // mQQm: low 5 bits == 0b00010
+    if raw & 0x1F == 0b00010 {
+        let qq_reg = (raw >> 5) as u8;
+        return Operand::AccumReg(qq_reg); // Weight queue
+    }
+    // eWxx: low 2 bits == 0b00, bits[6:5] select sub-class
+    if raw & 0x3 == 0b00 {
+        let _subclass = (raw >> 5) & 0x3; // 00=WLE, 01=WLO, 10=WHE, 11=WHO
+        let enc_bits = ((raw >> 2) & 0x7) as u8;
+        // Recover original encoding: enc = (enc_bits << 2) (since we stored enc >> 2)
+        let vec_reg = enc_bits << 2;
+        return Operand::VectorReg(vec_reg);
+    }
+    Operand::VectorReg(raw as u8)
+}
+
+/// Inverse of `getmMvAMWQSrcOpValue`.
+///
+/// Encoding:
+///   mAMm(enc)    -> (enc << 3) | 0b001
+///   eWLE(enc)    -> (0b110000 << 3) | (enc >> 2)
+///   eWLO(enc)    -> (0b110001 << 3) | (enc >> 2)
+///   eWHE(enc)    -> (0b110010 << 3) | (enc >> 2)
+///   eWHO(enc)    -> (0b110011 << 3) | (enc >> 2)
+///   mQQm(enc)    -> (0b111 << 6) | (enc << 4) | 0b0000
+fn decode_mv_amwq_src(raw: u64) -> Operand {
+    // Check for mQQm: bits[6:4] == 0b111, low 4 bits == 0b0000
+    if (raw >> 6) & 0x7 == 0b111 && raw & 0xF == 0b0000 {
+        let qq_reg = ((raw >> 4) & 0x3) as u8;
+        return Operand::AccumReg(qq_reg);
+    }
+    // Check for eWxx: bits[8:3] starts with 0b1100xx
+    let upper6 = (raw >> 3) & 0x3F;
+    if upper6 >= 0b110000 && upper6 <= 0b110011 {
+        let enc_div4 = (raw & 0x7) as u8;
+        let vec_reg = enc_div4 << 2;
+        return Operand::VectorReg(vec_reg);
+    }
+    // mAMm: low 3 bits == 0b001
+    if raw & 0x7 == 0b001 {
+        let am_reg = (raw >> 3) as u8;
+        return Operand::AccumReg(am_reg);
+    }
+    Operand::AccumReg(raw as u8)
+}
+
+/// Inverse of `getmMvBMXSrcOpValue`.
+///
+/// Encoding:
+///   mBMm(enc) -> (enc << 4) | 0b0000
+///   mXm(enc)  -> (0b11000 << 4) | enc
+fn decode_mv_bmx_src(raw: u64) -> Operand {
+    // mXm: high bits == 0b11000
+    if (raw >> 4) & 0x1F == 0b11000 {
+        let x_reg = (raw & 0xF) as u8;
+        return Operand::VectorReg(x_reg); // 512-bit vector
+    }
+    // mBMm: low 4 bits == 0b0000
+    let bm_reg = (raw >> 4) as u8;
+    Operand::AccumReg(bm_reg)
+}
+
+/// Inverse of `getmMvBMXDstOpValue`.
+///
+/// Encoding:
+///   mBMm(enc) -> (enc << 1) | 0b1
+///   mXm(enc)  -> (enc << 2) | 0b00
+fn decode_mv_bmx_dst(raw: u64) -> Operand {
+    // mBMm: low bit == 1
+    if raw & 0x1 == 0b1 {
+        let bm_reg = (raw >> 1) as u8;
+        return Operand::AccumReg(bm_reg);
+    }
+    // mXm: low 2 bits == 0b00
+    let x_reg = (raw >> 2) as u8;
+    Operand::VectorReg(x_reg)
+}
+
+/// Inverse of `geteRS4OpValue`.
+///
+/// Encoding: eRS4(enc) -> enc - 16
+fn decode_ers4(raw: u64) -> Operand {
+    let scl_reg = (raw as u8).wrapping_add(16);
+    Operand::ScalarReg(scl_reg)
+}
+
+/// Inverse of `getmShflDstOpValue`.
+///
+/// Encoding:
+///   mBMSm(enc) -> ((((enc & 1) << 3) | (enc >> 1)) << 1) | 0b1
+///   mXm(enc)   -> (enc << 1) | 0b0
+fn decode_shfl_dst(raw: u64) -> Operand {
+    // mXm: low bit == 0
+    if raw & 0x1 == 0b0 {
+        let x_reg = (raw >> 1) as u8;
+        return Operand::VectorReg(x_reg);
+    }
+    // mBMSm: low bit == 1, need to reverse the bit rearrangement
+    let shifted = raw >> 1;
+    // Forward: ((lsb << 3) | (rest >> 1)) where lsb = enc & 1, rest = enc >> 1
+    // shifted = (lsb << 3) | (rest >> 1)
+    // So: lsb = (shifted >> 3) & 1, upper = shifted & 0x7
+    // enc = (upper << 1) | lsb
+    let lsb = ((shifted >> 3) & 0x1) as u8;
+    let upper = (shifted & 0x7) as u8;
+    let bms_reg = (upper << 1) | lsb;
+    Operand::AccumReg(bms_reg)
+}
+
+/// Inverse of `getmWm_1OpValue`.
+///
+/// Encoding: mWm(enc) -> (((bit0 << 1) | bit1) << 3) | (enc >> 2)
+///   where bit0 = enc & 1, bit1 = (enc >> 1) & 1
+fn decode_wm1(raw: u64) -> Operand {
+    // Forward: result = (rearranged_low2 << 3) | (enc >> 2)
+    // rearranged = (bit0 << 1) | bit1
+    let enc_upper = (raw & 0x7) as u8;  // enc >> 2 (3 bits)
+    let rearranged = ((raw >> 3) & 0x3) as u8;
+    // rearranged = (bit0 << 1) | bit1, so bit0 = (rearranged >> 1) & 1, bit1 = rearranged & 1
+    let bit0 = (rearranged >> 1) & 0x1;
+    let bit1 = rearranged & 0x1;
+    let vec_reg = (enc_upper << 2) | (bit1 << 1) | bit0;
+    Operand::VectorReg(vec_reg)
+}
+
+/// Inverse of `getmQXHLbOpValue`.
+///
+/// Encoding:
+///   mQXHb(enc) -> (enc << 1) | 0b0
+///   mQXLb(enc) -> (enc << 1) | 0b1
+fn decode_qxhlb(raw: u64) -> Operand {
+    // Low bit selects high/low sub-register, upper bits are the register index
+    let reg = (raw >> 1) as u8;
+    Operand::AccumReg(reg)
+}
+
+// ─── End Inverse Encoder Functions ──────────────────────────────────────────
 
 /// Sign-extend a value from `bits` width to i32.
 #[inline]
@@ -146,6 +465,25 @@ fn sign_extend(value: i32, bits: u32) -> i32 {
     }
     let shift = 32 - bits;
     (value << shift) >> shift
+}
+
+/// Sign-extend an already-extracted unsigned raw value based on its logical width.
+///
+/// Unlike `OperandField::extract_signed()`, this works on the value directly
+/// without needing the original instruction word. Essential for split fields
+/// where the value was reassembled from non-contiguous fragments.
+#[inline]
+fn sign_extend_raw(value: u64, width: u8) -> i64 {
+    if width == 0 || width >= 64 {
+        return value as i64;
+    }
+    let sign_bit = 1u64 << (width - 1);
+    if value & sign_bit != 0 {
+        let mask = !((1u64 << width) - 1);
+        (value | mask) as i64
+    } else {
+        value as i64
+    }
 }
 
 /// Global cached decoder, loaded once on first use.
@@ -273,7 +611,7 @@ impl InstructionDecoder {
 
         // Keep flat list for legacy decode_word() compatibility
         let mut encodings: Vec<InstrEncoding> = tables.into_values().flatten().collect();
-        encodings.sort_by_key(|e| std::cmp::Reverse(e.specificity()));
+        encodings.sort_by(|a, b| b.sort_key().cmp(&a.sort_key()));
 
         Self {
             index,
@@ -295,7 +633,7 @@ impl InstructionDecoder {
         }
         let index = DecoderIndex::from_slot_encodings(by_slot);
 
-        encodings.sort_by_key(|e| std::cmp::Reverse(e.specificity()));
+        encodings.sort_by(|a, b| b.sort_key().cmp(&a.sort_key()));
         Self {
             index,
             encodings,
@@ -460,8 +798,26 @@ impl InstructionDecoder {
             SemanticOp::Br => Operation::Branch {
                 condition: BranchCondition::Always,
             },
-            SemanticOp::BrCond => Operation::Branch {
-                condition: BranchCondition::NotEqual, // Placeholder
+            SemanticOp::Call => Operation::Call,
+            SemanticOp::BrCond => {
+                // Distinguish register-based (jnz/jz) from flag-based (b*) branches
+                let mn = decoded.encoding.mnemonic.to_lowercase();
+                let condition = if mn == "jnz" || mn == "jnzd" {
+                    BranchCondition::NotZero
+                } else if mn == "jz" {
+                    BranchCondition::Zero
+                } else if mn.starts_with("beq") || mn == "bz" {
+                    BranchCondition::Equal
+                } else if mn.starts_with("bne") || mn == "bnz" {
+                    BranchCondition::NotEqual
+                } else if mn.starts_with("blt") {
+                    BranchCondition::Less
+                } else if mn.starts_with("bge") {
+                    BranchCondition::GreaterEqual
+                } else {
+                    BranchCondition::NotEqual // Fallback
+                };
+                Operation::Branch { condition }
             },
             SemanticOp::Nop => Operation::Nop,
             SemanticOp::Copy => Operation::ScalarMov,
@@ -549,236 +905,128 @@ impl InstructionDecoder {
         }
     }
 
-    /// Extract operands from decoded instruction using TableGen ordering.
+    /// Extract operands from decoded instruction using data-driven dispatch.
     ///
-    /// This method builds a field_name -> Operand map, then extracts:
-    /// - Destination from `output_order` names
-    /// - Sources from `input_order` names (in canonical order)
-    /// - PostModify from ag_* field extraction (if post-modify addressing)
+    /// Each operand field's `operand_type` (populated from TableGen reg_class)
+    /// determines exactly how raw bits become an Operand. No field-name heuristics.
     ///
-    /// Special handling is preserved for complex field encodings (ag_*, mSclSt, etc.)
+    /// Address generator fields (ag_*) are still handled specially because they
+    /// encode a packed {ptr, imm/mod, mode} tuple -- this is structural, not a
+    /// register encoding issue.
     fn extract_operands(&self, decoded: &DecodedInstr) -> (Option<Operand>, Vec<Operand>, Option<PostModify>) {
-        use std::collections::HashMap;
-
-        // Build a map of field_name -> decoded Operand
         let mut field_operands: HashMap<String, Operand> = HashMap::new();
-        // Some fields produce multiple operands or set dest directly (special cases)
         let mut direct_dest: Option<Operand> = None;
         let mut extra_sources: Vec<Operand> = Vec::new();
-        // PostModify extracted from ag_* fields when addressing mode is post-modify
         let mut extracted_post_modify: Option<PostModify> = None;
 
+        let mnemonic = decoded.encoding.mnemonic.to_lowercase();
+
         for field in &decoded.encoding.operand_fields {
-            let value = decoded.operand(&field.name).unwrap_or(0);
+            let raw = decoded.operand(&field.name).unwrap_or(0);
 
-            // Special handling for address generator fields (ag_all, ag_nospill, agb_sa, etc.)
-            // Uses AddressingMode from the instruction name for reliable extraction.
+            // Address generator fields encode packed {ptr, offset/mod, mode} --
+            // this is structural addressing, not a register encoding issue.
             if field.name.starts_with("ag") {
-                let addr_mode = decoded.encoding.addressing_mode;
-                let is_ag_all = field.width >= 13;
-                let mnemonic = decoded.encoding.mnemonic.to_lowercase();
+                self.decode_ag_field(
+                    field, raw, decoded,
+                    &mnemonic,
+                    &mut direct_dest, &mut extra_sources, &mut extracted_post_modify,
+                );
+                continue;
+            }
 
-                match addr_mode {
-                    AddressingMode::IndexedImmediate => {
-                        // Indexed: address = ptr + imm (scaled)
-                        let (mode_bits, imm_bits) = if is_ag_all { (4, 6) } else { (3, 3) };
-                        let data = value >> mode_bits;
-                        let ptr = ((data >> imm_bits) & 0x7) as u8;
-                        let imm_raw = (data & ((1 << imm_bits) - 1)) as i32;
-                        let imm_bytes = if is_ag_all { imm_raw * 4 } else { imm_raw };
-                        if mnemonic.starts_with("padd") {
-                            direct_dest = Some(Operand::PointerReg(ptr));
-                            extra_sources.push(Operand::Immediate(imm_bytes));
-                        } else {
-                            extra_sources.push(Operand::Memory { base: ptr, offset: imm_bytes as i16 });
-                        }
-                    }
-                    AddressingMode::PostModifyImmediate => {
-                        // Post-modify: address = ptr; ptr += imm (signed, scaled)
-                        let (mode_bits, imm_bits) = if is_ag_all { (3, 7) } else { (2, 4) };
-                        let data = value >> mode_bits;
-                        let ptr = ((data >> imm_bits) & 0x7) as u8;
-                        let imm_raw = sign_extend(
-                            (data & ((1 << imm_bits) - 1)) as i32, imm_bits as u32
-                        );
-                        let imm_bytes = if is_ag_all { imm_raw * 4 } else { imm_raw };
-                        // Post-modify: read from ptr (no pre-offset), then advance
-                        extra_sources.push(Operand::PointerReg(ptr));
-                        extracted_post_modify = Some(PostModify::Immediate(imm_bytes as i16));
-                    }
-                    AddressingMode::IndexedRegister => {
-                        // Indexed with modifier register: address = ptr + mN
-                        let ptr = ((value >> (field.width as u64 - 3)) & 0x7) as u8;
-                        let mod_reg = ((value >> 3) & 0x7) as u8;
-                        if mnemonic.starts_with("padd") {
-                            direct_dest = Some(Operand::PointerReg(ptr));
-                            extra_sources.push(Operand::ModifierReg(mod_reg));
-                        } else {
-                            extra_sources.push(Operand::PointerReg(ptr));
-                            extra_sources.push(Operand::ModifierReg(mod_reg));
-                        }
-                    }
-                    AddressingMode::PostModifyRegister => {
-                        // Post-modify with modifier register: read from ptr, ptr += mN
-                        let ptr = ((value >> (field.width as u64 - 3)) & 0x7) as u8;
-                        let mod_reg = ((value >> 3) & 0x7) as u8;
-                        extra_sources.push(Operand::PointerReg(ptr));
-                        extracted_post_modify = Some(PostModify::Register(mod_reg));
-                    }
-                    AddressingMode::Unknown => {
-                        // Fallback for padd and other instructions that use ag_* fields
-                        // without a clear addressing mode in their instruction name.
-                        // Use the old mode-bit heuristic.
-                        let mode = (value & 0xF) as u8;
-                        let (ptr_reg, offset_or_mod) = match mode {
-                            0b1010 => {
-                                let ag_ptr_imm = value >> 4;
-                                let ptr = ((ag_ptr_imm >> 6) & 0x7) as u8;
-                                let imm_words = (ag_ptr_imm & 0x3F) as i32;
-                                let imm_bytes = imm_words * 4;
-                                (ptr, Operand::Immediate(imm_bytes))
-                            }
-                            0b0110 => {
-                                let ag_ptr_imm = value >> 3;
-                                let ptr = ((ag_ptr_imm >> 7) & 0x7) as u8;
-                                let imm = (ag_ptr_imm & 0x7F) as i32;
-                                (ptr, Operand::Immediate(imm))
-                            }
-                            0b0010 => {
-                                let ptr = ((value >> 10) & 0x7) as u8;
-                                let mod_reg = ((value >> 3) & 0x7) as u8;
-                                (ptr, Operand::ModifierReg(mod_reg))
-                            }
-                            _ => {
-                                let ptr = (value & 0x7) as u8;
-                                let mod_reg = ((value >> 3) & 0x1F) as u8;
-                                (ptr, Operand::ModifierReg(mod_reg))
-                            }
-                        };
-
-                        if mnemonic.starts_with("padd") {
-                            direct_dest = Some(Operand::PointerReg(ptr_reg));
-                            extra_sources.push(offset_or_mod);
-                        } else if let Operand::Immediate(imm) = offset_or_mod {
-                            extra_sources.push(Operand::Memory { base: ptr_reg, offset: imm as i16 });
-                        } else {
-                            extra_sources.push(Operand::PointerReg(ptr_reg));
-                            extra_sources.push(offset_or_mod);
-                        }
+            // Data-driven dispatch on operand_type
+            let operand = match &field.operand_type {
+                OperandType::Register(kind) => {
+                    let reg = raw as u8;
+                    match kind {
+                        RegisterKind::Scalar => Operand::ScalarReg(reg),
+                        RegisterKind::Pointer => Operand::PointerReg(reg),
+                        RegisterKind::Modifier => Operand::ModifierReg(reg),
+                        RegisterKind::Vector256 | RegisterKind::Vector512 =>
+                            Operand::VectorReg(reg),
+                        RegisterKind::Accumulator => Operand::AccumReg(reg),
                     }
                 }
-                continue;
-            }
-
-            // Special handling for scalar store value (mSclSt)
-            if field.name == "mSclSt" || field.name.contains("SclSt") {
-                let scl_reg = ((value >> 2) & 0x1F) as u8;
-                log::trace!("[DECODE mSclSt] raw=0x{:X} -> r{}", value, scl_reg);
-                field_operands.insert(field.name.clone(), Operand::ScalarReg(scl_reg));
-                continue;
-            }
-
-            // Special handling for scalar load destination (mSclLd, mLdaScl, mLdbScl)
-            if field.name == "mSclLd"
-                || field.name.contains("SclLd")
-                || field.name == "mLdaScl"
-                || field.name == "mLdbScl"
-            {
-                let operand = if value % 4 == 0 {
-                    let scl_reg = (value / 4) as u8;
-                    log::trace!("[DECODE mLdaScl] raw=0x{:X} -> r{}", value, scl_reg);
-                    Operand::ScalarReg(scl_reg)
-                } else if value % 4 == 2 {
-                    let mod_reg = (value / 4) as u8;
-                    log::trace!("[DECODE mLdaScl] raw=0x{:X} -> m{} (modifier)", value, mod_reg);
-                    Operand::ScalarReg(mod_reg)
-                } else if value == 5 {
-                    log::trace!("[DECODE mLdaScl] raw=0x{:X} -> lr", value);
-                    Operand::ScalarReg(0)
-                } else if value >= 13 && (value - 13) % 16 == 0 {
-                    let ptr_reg = ((value - 13) / 16) as u8;
-                    log::trace!("[DECODE mLdaScl] raw=0x{:X} -> p{}", value, ptr_reg);
-                    Operand::PointerReg(ptr_reg)
-                } else {
-                    let scl_reg = (value / 4) as u8;
-                    log::trace!("[DECODE mLdaScl] raw=0x{:X} -> unknown, using r{}", value, scl_reg);
-                    Operand::ScalarReg(scl_reg)
-                };
-                field_operands.insert(field.name.clone(), operand);
-                continue;
-            }
-
-            // Special handling for mova/movb coarse granularity field (mLdaCg/mLdbCg)
-            // Encoding: r0-r31 at 0x00-0x7C (×4), then p0-p7 at 0x80-0x9C (×4)
-            if field.name == "mLdaCg" || field.name == "mLdbCg" {
-                let operand = if value < 0x80 {
-                    // Scalar registers r0-r31 (32 regs × 4 = 0x80)
-                    let scl_reg = (value >> 2) as u8;
-                    log::trace!("[DECODE mLdaCg] raw=0x{:X} -> r{}", value, scl_reg);
-                    Operand::ScalarReg(scl_reg)
-                } else if value < 0xA0 {
-                    // Pointer registers p0-p7 at 0x80-0x9C
-                    let ptr_reg = ((value - 0x80) >> 2) as u8;
-                    log::trace!("[DECODE mLdaCg] raw=0x{:X} -> p{}", value, ptr_reg);
-                    Operand::PointerReg(ptr_reg)
-                } else {
-                    // Special registers (DC, DJ, DN, M, LC)
-                    let reg = ((value - 0xA0) >> 2) as u8;
-                    log::trace!("[DECODE mLdaCg] raw=0x{:X} -> special reg {}", value, reg);
-                    Operand::ModifierReg(reg)
-                };
-                field_operands.insert(field.name.clone(), operand);
-                continue;
-            }
-
-            // Special handling for mMvScl* composite register groups.
-            // These encode scalar, pointer, and modifier registers in the mv/lng slots.
-            // Encoding discriminant is bits[1:0]:
-            //   0b00 -> scalar register, number = (raw >> 2) & 0x1F
-            //   0b11 -> pointer register, index = (raw >> 4) & 0x7
-            //   0b01, 0b10 -> modifier/special registers
-            if field.name == "mMvSclDstCg"
-                || field.name == "mMvSclDst"
-                || field.name == "mMvSclSrc"
-            {
-                let operand = decode_mv_scl_composite(value);
-                log::trace!("[DECODE {}] raw=0x{:X} -> {:?}", field.name, value, operand);
-                field_operands.insert(field.name.clone(), operand);
-                continue;
-            }
-
-            // Special handling for c11s (11-bit signed constant)
-            if field.name == "c11s" {
-                let sign_extended = if value & 0x400 != 0 {
-                    value | 0xFFFFF800
-                } else {
-                    value
-                } as i32;
-                field_operands.insert(field.name.clone(), Operand::Immediate(sign_extended));
-                continue;
-            }
-
-            // Special handling for lock instruction ID field
-            if field.name == "id" {
-                let mnemonic = decoded.encoding.mnemonic.to_lowercase();
-                if mnemonic.starts_with("acq") || mnemonic.starts_with("rel") {
-                        field_operands.insert(field.name.clone(), Operand::Lock(value as u8));
-                    continue;
+                OperandType::CompositeRegister(encoder) => {
+                    decode_composite(*encoder, raw)
                 }
-            }
+                OperandType::Immediate { signed, scale } => {
+                    let value = if *signed {
+                        // Sign-extend the already-extracted raw value based on field width.
+                        // (Don't reconstruct positioned bits -- breaks for split fields.)
+                        sign_extend_raw(raw, field.width) as i32
+                    } else {
+                        raw as i32
+                    };
+                    Operand::Immediate(value * scale)
+                }
+                OperandType::LockId => Operand::Lock(raw as u8),
+                OperandType::Unknown => {
+                    // Fallback: treat as unsigned immediate
+                    Operand::Immediate(raw as i32)
+                }
+            };
 
-            // Special handling for mLockId field
-            if field.name == "mLockId" {
-                field_operands.insert(field.name.clone(), Operand::Lock(value as u8));
-                continue;
-            }
-
-            // Generic operand decoding based on field name patterns
-            let operand = self.decode_generic_operand(&field.name, value);
             field_operands.insert(field.name.clone(), operand);
         }
 
-        // Now extract dest and sources using TableGen ordering
+        // Combine separate ptr + imm fields into a Memory operand.
+        // The tblgen-resolved encodings have separate "ptr" (PointerReg) and
+        // "imm" (Immediate, already scaled) fields. Combining them here into
+        // a single Memory { base, offset } operand means the execution side
+        // doesn't need to know about the scale factor or field layout.
+        let addr_mode = decoded.encoding.addressing_mode;
+        if matches!(addr_mode, AddressingMode::IndexedImmediate | AddressingMode::IndexedRegister) {
+            if let (Some(Operand::PointerReg(base)), Some(imm_op)) =
+                (field_operands.get("ptr").cloned(), field_operands.get("imm").cloned())
+            {
+                let offset = match imm_op {
+                    Operand::Immediate(v) => v as i16,
+                    _ => 0,
+                };
+                if mnemonic.starts_with("padd") {
+                    // padd: ptr is destination, imm is source operand
+                    direct_dest = Some(Operand::PointerReg(base));
+                    extra_sources.push(Operand::Immediate(offset as i32));
+                } else {
+                    extra_sources.push(Operand::Memory { base, offset });
+                }
+                // Remove ptr and imm from field_operands so they don't
+                // appear as separate sources in extract_ordered_operands
+                field_operands.remove("ptr");
+                field_operands.remove("imm");
+            }
+        } else if matches!(addr_mode, AddressingMode::PostModifyImmediate) {
+            // Post-modify: ptr is the base address, imm is the modify amount
+            if let (Some(Operand::PointerReg(base)), Some(imm_op)) =
+                (field_operands.get("ptr").cloned(), field_operands.get("imm").cloned())
+            {
+                let modify_amount = match imm_op {
+                    Operand::Immediate(v) => v as i16,
+                    _ => 0,
+                };
+                extra_sources.push(Operand::PointerReg(base));
+                extracted_post_modify = Some(PostModify::Immediate(modify_amount));
+                field_operands.remove("ptr");
+                field_operands.remove("imm");
+            }
+        } else if matches!(addr_mode, AddressingMode::PostModifyRegister) {
+            if let (Some(Operand::PointerReg(base)), Some(mod_op)) =
+                (field_operands.get("ptr").cloned(), field_operands.get("mod").cloned())
+            {
+                let mod_reg = match mod_op {
+                    Operand::ModifierReg(r) => r,
+                    _ => 0,
+                };
+                extra_sources.push(Operand::PointerReg(base));
+                extracted_post_modify = Some(PostModify::Register(mod_reg));
+                field_operands.remove("ptr");
+                field_operands.remove("mod");
+            }
+        }
+
+        // Extract dest and sources using TableGen ordering
         let (dest, sources) = self.extract_ordered_operands(
             decoded,
             &field_operands,
@@ -786,75 +1034,109 @@ impl InstructionDecoder {
             extra_sources,
         );
 
-        // Convert ScalarReg to VectorReg for vector instructions
-        // Vector instructions have mnemonics starting with 'v' (e.g., vadd.8, vsub, vmul)
-        let mnemonic = &decoded.encoding.mnemonic;
-        let is_vector_instr = mnemonic.starts_with('v') || mnemonic.starts_with('V');
-
-        if is_vector_instr {
-            let dest = dest.map(|op| match op {
-                Operand::ScalarReg(r) => Operand::VectorReg(r),
-                other => other,
-            });
-            let sources: Vec<Operand> = sources
-                .into_iter()
-                .map(|op| match op {
-                    Operand::ScalarReg(r) => Operand::VectorReg(r),
-                    other => other,
-                })
-                .collect();
-            (dest, sources, extracted_post_modify)
-        } else {
-            (dest, sources, extracted_post_modify)
-        }
+        (dest, sources, extracted_post_modify)
     }
 
-    /// Decode a generic operand based on field name patterns.
-    fn decode_generic_operand(&self, field_name: &str, value: u64) -> Operand {
-        // Constant field patterns: c5u, c5s, c6u, etc.
-        let is_const_field = field_name.len() >= 3
-            && field_name.starts_with("c")
-            && field_name.chars().nth(1).is_some_and(|c| c.is_ascii_digit())
-            && field_name.chars().last().is_some_and(|c| c == 'u' || c == 's');
+    /// Decode an address generator field (ag_all, ag_nospill, agb_sa, etc.).
+    ///
+    /// AG fields encode a packed tuple of {pointer, offset/modifier, mode_bits}.
+    /// The addressing mode (from the instruction name) determines the layout.
+    /// This is structural packing, not a register composite encoding, so it
+    /// stays as explicit logic rather than being part of the OperandType system.
+    fn decode_ag_field(
+        &self,
+        field: &crate::tablegen::OperandField,
+        value: u64,
+        decoded: &DecodedInstr,
+        mnemonic: &str,
+        direct_dest: &mut Option<Operand>,
+        extra_sources: &mut Vec<Operand>,
+        extracted_post_modify: &mut Option<PostModify>,
+    ) {
+        let addr_mode = decoded.encoding.addressing_mode;
+        let is_ag_all = field.width >= 13;
 
-        let is_imm = field_name.contains("imm")
-            || field_name.contains("offset")
-            || field_name.contains("target")
-            || field_name.contains("addr")
-            || field_name.contains("tgt")
-            || field_name.contains("disp")
-            || field_name.starts_with("i")
-            || is_const_field;
+        match addr_mode {
+            AddressingMode::IndexedImmediate => {
+                let (mode_bits, imm_bits) = if is_ag_all { (4, 6) } else { (3, 3) };
+                let data = value >> mode_bits;
+                let ptr = ((data >> imm_bits) & 0x7) as u8;
+                let imm_raw = (data & ((1 << imm_bits) - 1)) as i32;
+                let imm_bytes = if is_ag_all { imm_raw * 4 } else { imm_raw };
+                if mnemonic.starts_with("padd") {
+                    *direct_dest = Some(Operand::PointerReg(ptr));
+                    extra_sources.push(Operand::Immediate(imm_bytes));
+                } else {
+                    extra_sources.push(Operand::Memory { base: ptr, offset: imm_bytes as i16 });
+                }
+            }
+            AddressingMode::PostModifyImmediate => {
+                let (mode_bits, imm_bits) = if is_ag_all { (3, 7) } else { (2, 4) };
+                let data = value >> mode_bits;
+                let ptr = ((data >> imm_bits) & 0x7) as u8;
+                let imm_raw = sign_extend(
+                    (data & ((1 << imm_bits) - 1)) as i32, imm_bits as u32
+                );
+                let imm_bytes = if is_ag_all { imm_raw * 4 } else { imm_raw };
+                extra_sources.push(Operand::PointerReg(ptr));
+                *extracted_post_modify = Some(PostModify::Immediate(imm_bytes as i16));
+            }
+            AddressingMode::IndexedRegister => {
+                let ptr = ((value >> (field.width as u64 - 3)) & 0x7) as u8;
+                let mod_reg = ((value >> 3) & 0x7) as u8;
+                if mnemonic.starts_with("padd") {
+                    *direct_dest = Some(Operand::PointerReg(ptr));
+                    extra_sources.push(Operand::ModifierReg(mod_reg));
+                } else {
+                    extra_sources.push(Operand::PointerReg(ptr));
+                    extra_sources.push(Operand::ModifierReg(mod_reg));
+                }
+            }
+            AddressingMode::PostModifyRegister => {
+                let ptr = ((value >> (field.width as u64 - 3)) & 0x7) as u8;
+                let mod_reg = ((value >> 3) & 0x7) as u8;
+                extra_sources.push(Operand::PointerReg(ptr));
+                *extracted_post_modify = Some(PostModify::Register(mod_reg));
+            }
+            AddressingMode::Unknown => {
+                // Fallback: use mode-bit heuristic for ag_* fields without
+                // a clear addressing mode (e.g., padd with no _idx/_pstm suffix)
+                let mode = (value & 0xF) as u8;
+                let (ptr_reg, offset_or_mod) = match mode {
+                    0b1010 => {
+                        let ag_ptr_imm = value >> 4;
+                        let ptr = ((ag_ptr_imm >> 6) & 0x7) as u8;
+                        let imm_words = (ag_ptr_imm & 0x3F) as i32;
+                        (ptr, Operand::Immediate(imm_words * 4))
+                    }
+                    0b0110 => {
+                        let ag_ptr_imm = value >> 3;
+                        let ptr = ((ag_ptr_imm >> 7) & 0x7) as u8;
+                        let imm = (ag_ptr_imm & 0x7F) as i32;
+                        (ptr, Operand::Immediate(imm))
+                    }
+                    0b0010 => {
+                        let ptr = ((value >> 10) & 0x7) as u8;
+                        let mod_reg = ((value >> 3) & 0x7) as u8;
+                        (ptr, Operand::ModifierReg(mod_reg))
+                    }
+                    _ => {
+                        let ptr = (value & 0x7) as u8;
+                        let mod_reg = ((value >> 3) & 0x1F) as u8;
+                        (ptr, Operand::ModifierReg(mod_reg))
+                    }
+                };
 
-        if is_imm {
-            Operand::Immediate(value as i32)
-        } else if field_name.contains("ptr") || field_name.starts_with("p") {
-            Operand::PointerReg(value as u8)
-        } else if field_name.starts_with("v") {
-            Operand::VectorReg(value as u8)
-        } else if field_name.starts_with("acc") {
-            Operand::AccumReg(value as u8)
-        } else if field_name.starts_with("mP") {
-            Operand::PointerReg(value as u8)
-        // Vector registers: mW* (256-bit), mX* (512-bit), my (1024-bit)
-        } else if field_name.starts_with("mW")
-            || field_name.starts_with("mX")
-            || field_name == "my"
-        {
-            Operand::VectorReg(value as u8)
-        // Accumulator registers: mAM* (256-bit), mBM* (512-bit), mCM* (1024-bit)
-        } else if field_name.starts_with("mAM")
-            || field_name.starts_with("mBM")
-            || field_name.starts_with("mCM")
-        {
-            Operand::AccumReg(value as u8)
-        } else if field_name.starts_with("m")
-            && !field_name.contains("mR")
-            && !field_name.contains("mS")
-        {
-            Operand::ModifierReg(value as u8)
-        } else {
-            Operand::ScalarReg(value as u8)
+                if mnemonic.starts_with("padd") {
+                    *direct_dest = Some(Operand::PointerReg(ptr_reg));
+                    extra_sources.push(offset_or_mod);
+                } else if let Operand::Immediate(imm) = offset_or_mod {
+                    extra_sources.push(Operand::Memory { base: ptr_reg, offset: imm as i16 });
+                } else {
+                    extra_sources.push(Operand::PointerReg(ptr_reg));
+                    extra_sources.push(offset_or_mod);
+                }
+            }
         }
     }
 
@@ -1032,7 +1314,6 @@ impl Decoder for InstructionDecoder {
         // Extract slots from the bundle
         let extracted = extract_slots(bytes);
 
-        // Debug: show bundle format for first few decodes (trace level only)
         if log::log_enabled!(log::Level::Trace) {
             static DECODE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let count = DECODE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1269,6 +1550,7 @@ mod tests {
             implicit_regs: vec![],
             addressing_mode: AddressingMode::Unknown,
             mem_width: InstrMemWidth::Word,
+            has_complete_decoder: true,
         }
     }
 
@@ -1351,6 +1633,7 @@ mod tests {
             implicit_regs: vec![],
             addressing_mode: crate::tablegen::AddressingMode::Unknown,
             mem_width: crate::tablegen::InstrMemWidth::Word,
+            has_complete_decoder: true,
         };
 
         let more_specific = make_add_encoding(); // 5 fixed bits
@@ -1558,5 +1841,304 @@ mod tests {
         let nop_bytes = [0x00u8, 0x00, 0x00, 0x00];
         let bundle = decoder.decode(&nop_bytes, 0).expect("Should decode NOP");
         assert!(bundle.is_nop());
+    }
+
+    // === Inverse Encoder Function Tests ===
+    //
+    // Each test verifies that encode(reg) -> raw -> decode(raw) == reg.
+    // Encoding formulas come from AIE2MCCodeEmitterRegOperandDef.h.
+
+    #[test]
+    fn test_decode_lda_scl_scalar() {
+        // eR(7): encode = (7 << 2) | 0b00 = 28
+        assert_eq!(decode_lda_scl(28), Operand::ScalarReg(7));
+        // eR(0): encode = (0 << 2) | 0b00 = 0
+        assert_eq!(decode_lda_scl(0), Operand::ScalarReg(0));
+        // eR(31): encode = (31 << 2) | 0b00 = 124
+        assert_eq!(decode_lda_scl(124), Operand::ScalarReg(31));
+    }
+
+    #[test]
+    fn test_decode_lda_scl_pointer() {
+        // eP(0): encode = (0 << 4) | 0b1101 = 13
+        assert_eq!(decode_lda_scl(13), Operand::PointerReg(0));
+        // eP(3): encode = (3 << 4) | 0b1101 = 61
+        assert_eq!(decode_lda_scl(61), Operand::PointerReg(3));
+        // eP(7): encode = (7 << 4) | 0b1101 = 125
+        assert_eq!(decode_lda_scl(125), Operand::PointerReg(7));
+    }
+
+    #[test]
+    fn test_decode_lda_scl_lr() {
+        // lr: encode = 0b0000101 = 5
+        use crate::interpreter::state::LR_REG_INDEX;
+        assert_eq!(decode_lda_scl(5), Operand::ScalarReg(LR_REG_INDEX));
+    }
+
+    #[test]
+    fn test_decode_lda_scl_modifier() {
+        // eM(0): encode = ((0 | 0b00000) << 2) | 0b10 = 2
+        assert_eq!(decode_lda_scl(2), Operand::ModifierReg(0));
+        // eM(3): encode = ((3 | 0b00000) << 2) | 0b10 = 14
+        assert_eq!(decode_lda_scl(14), Operand::ModifierReg(3));
+        // eDN(0): encode = ((0 | 0b01000) << 2) | 0b10 = 34
+        assert_eq!(decode_lda_scl(34), Operand::ModifierReg(8));
+        // eDJ(0): encode = ((0 | 0b10000) << 2) | 0b10 = 66
+        assert_eq!(decode_lda_scl(66), Operand::ModifierReg(16));
+        // eDC(0): encode = ((0 | 0b11000) << 2) | 0b10 = 98
+        assert_eq!(decode_lda_scl(98), Operand::ModifierReg(24));
+    }
+
+    #[test]
+    fn test_decode_mv_scl_src_scalar() {
+        // eR(7): encode = (7 << 2) | 0b00 = 28
+        assert_eq!(decode_mv_scl_src(28), Operand::ScalarReg(7));
+        // eR(0): encode = 0
+        assert_eq!(decode_mv_scl_src(0), Operand::ScalarReg(0));
+    }
+
+    #[test]
+    fn test_decode_mv_scl_src_pointer() {
+        // eP(3): encode = (3 << 4) | 0b0011 = 51
+        assert_eq!(decode_mv_scl_src(51), Operand::PointerReg(3));
+        // eP(0): encode = (0 << 4) | 0b0011 = 3
+        assert_eq!(decode_mv_scl_src(3), Operand::PointerReg(0));
+        // eP(7): encode = (7 << 4) | 0b0011 = 115
+        assert_eq!(decode_mv_scl_src(115), Operand::PointerReg(7));
+    }
+
+    #[test]
+    fn test_decode_mv_scl_src_special() {
+        use crate::interpreter::state::*;
+        // SP: HWEncoding = 103 = 0b1100111 (bits[2:0] = 0b111, bits[6:3] = 12)
+        assert_eq!(decode_mv_scl_src(103), Operand::PointerReg(6)); // SP = p6
+        // LC: HWEncoding = 87 = 0b1010111
+        assert_eq!(decode_mv_scl_src(87), Operand::ScalarReg(LC_REG_INDEX));
+        // lr: HWEncoding = 39 = 0b0100111
+        assert_eq!(decode_mv_scl_src(39), Operand::ScalarReg(LR_REG_INDEX));
+        // LS: HWEncoding = 7 = 0b0000111
+        assert_eq!(decode_mv_scl_src(7), Operand::ScalarReg(LS_REG_INDEX));
+        // LE: HWEncoding = 71 = 0b1000111
+        assert_eq!(decode_mv_scl_src(71), Operand::ScalarReg(LE_REG_INDEX));
+        // DP: HWEncoding = 23 = 0b0010111
+        assert_eq!(decode_mv_scl_src(23), Operand::ScalarReg(DP_REG_INDEX));
+        // CORE_ID: HWEncoding = 55 = 0b0110111
+        assert_eq!(decode_mv_scl_src(55), Operand::ScalarReg(CORE_ID_REG_INDEX));
+    }
+
+    #[test]
+    fn test_decode_lda_cg_scalar() {
+        // eR(7): encode = (7 << 2) | 0b00 = 28
+        assert_eq!(decode_lda_cg(28), Operand::ScalarReg(7));
+    }
+
+    #[test]
+    fn test_decode_lda_cg_pointer() {
+        // eP(3): encode = (3 << 4) | 0b1101 = 61
+        assert_eq!(decode_lda_cg(61), Operand::PointerReg(3));
+    }
+
+    #[test]
+    fn test_decode_lda_cg_lc() {
+        use crate::interpreter::state::LC_REG_INDEX;
+        // LC: encode = 0b0010101 = 21
+        assert_eq!(decode_lda_cg(21), Operand::ScalarReg(LC_REG_INDEX));
+    }
+
+    #[test]
+    fn test_decode_alu_cg() {
+        use crate::interpreter::state::LC_REG_INDEX;
+        // eR(7): encode = 7 << 1 = 14
+        assert_eq!(decode_alu_cg(14), Operand::ScalarReg(7));
+        // LC: encode = 0b000001 = 1
+        assert_eq!(decode_alu_cg(1), Operand::ScalarReg(LC_REG_INDEX));
+    }
+
+    #[test]
+    fn test_decode_mv_bmx_src() {
+        // mBMm(0): encode = (0 << 4) | 0b0000 = 0
+        assert_eq!(decode_mv_bmx_src(0), Operand::AccumReg(0));
+        // mBMm(3): encode = (3 << 4) | 0b0000 = 48
+        assert_eq!(decode_mv_bmx_src(48), Operand::AccumReg(3));
+        // mXm(5): encode = (0b11000 << 4) | 5 = 389
+        assert_eq!(decode_mv_bmx_src(389), Operand::VectorReg(5));
+    }
+
+    #[test]
+    fn test_decode_mv_bmx_dst() {
+        // mBMm(2): encode = (2 << 1) | 0b1 = 5
+        assert_eq!(decode_mv_bmx_dst(5), Operand::AccumReg(2));
+        // mXm(3): encode = (3 << 2) | 0b00 = 12
+        assert_eq!(decode_mv_bmx_dst(12), Operand::VectorReg(3));
+    }
+
+    #[test]
+    fn test_decode_ers4() {
+        // eRS4 register 16: encode = 16 - 16 = 0
+        assert_eq!(decode_ers4(0), Operand::ScalarReg(16));
+        // eRS4 register 31: encode = 31 - 16 = 15
+        assert_eq!(decode_ers4(15), Operand::ScalarReg(31));
+    }
+
+    #[test]
+    fn test_decode_shfl_dst() {
+        // mXm(3): encode = (3 << 1) | 0b0 = 6
+        assert_eq!(decode_shfl_dst(6), Operand::VectorReg(3));
+        // mXm(0): encode = (0 << 1) | 0b0 = 0
+        assert_eq!(decode_shfl_dst(0), Operand::VectorReg(0));
+    }
+
+    #[test]
+    fn test_decode_qxhlb() {
+        // mQXHb(2): encode = (2 << 1) | 0b0 = 4
+        assert_eq!(decode_qxhlb(4), Operand::AccumReg(2));
+        // mQXLb(2): encode = (2 << 1) | 0b1 = 5
+        assert_eq!(decode_qxhlb(5), Operand::AccumReg(2));
+    }
+
+    #[test]
+    fn test_decode_composite_dispatch() {
+        // Verify the dispatch function routes correctly
+        // LdaScl: eR(7) = 28
+        assert_eq!(
+            decode_composite(CompositeEncoder::LdaScl, 28),
+            Operand::ScalarReg(7)
+        );
+        // MvSclSrc: eP(3) = 51
+        assert_eq!(
+            decode_composite(CompositeEncoder::MvSclSrc, 51),
+            Operand::PointerReg(3)
+        );
+        // AluCg: eR(5) = 10
+        assert_eq!(
+            decode_composite(CompositeEncoder::AluCg, 10),
+            Operand::ScalarReg(5)
+        );
+    }
+
+    /// Decode an 80-bit VLIW bundle and return (mnemonic, dest, sources) for each slot.
+    /// Helper for the bundle decode diagnosis tests below.
+    fn decode_80bit_bundle_slots(decoder: &InstructionDecoder, bytes: &[u8], pc: u32)
+        -> Vec<(String, Option<Operand>, Vec<Operand>)>
+    {
+        use crate::interpreter::bundle::{extract_slots, SlotType};
+
+        let extracted = extract_slots(bytes);
+        let mut results = Vec::new();
+
+        for slot in &extracted.slots {
+            if slot.slot_type == SlotType::Nop || slot.bits == 0 {
+                results.push(("nop".to_string(), None, vec![]));
+                continue;
+            }
+            if let Some(decoded) = decoder.decode_slot_bits(slot.bits, slot.slot_type) {
+                let (dest, sources, _pm) = decoder.extract_operands(&decoded);
+                results.push((decoded.encoding.mnemonic.clone(), dest, sources));
+            } else {
+                results.push((format!("UNKNOWN_{:?}", slot.slot_type), None, vec![]));
+            }
+        }
+        results
+    }
+
+    #[test]
+    fn test_decode_add314_bundle_at_pc56() {
+        // Bundle from add_314_using_dma_op at PC=0x56:
+        //   mova r27, #0x0; movx r7, #0x0; mov r6, #0x6
+        // Format: I80_LDA_ALU_MV (80-bit, 3 slots)
+        let add_314_bytes: [u8; 10] = [0xbb, 0x48, 0x0f, 0xc0, 0x08, 0x70, 0x00, 0xc8, 0x06, 0x00];
+
+        // For comparison, add_one_using_dma at PC=0x56:
+        //   mova r27, #0x0; movx r6, #0x0; mov r5, #0x6
+        let add_one_bytes: [u8; 10] = [0xbb, 0x48, 0x0f, 0xa0, 0x08, 0x60, 0x00, 0xc8, 0x06, 0x00];
+
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found");
+            return;
+        }
+        let data = load_from_llvm_aie(llvm_aie_path).expect("Failed to load llvm-aie");
+        let tables = build_decoder_tables(&data);
+        let decoder = InstructionDecoder::from_tables(tables);
+
+        // First, show raw slot extraction
+        use crate::interpreter::bundle::extract_slots;
+        let ext_314 = extract_slots(&add_314_bytes);
+        let ext_one = extract_slots(&add_one_bytes);
+        eprintln!("=== add_314 slot extraction ===");
+        for s in &ext_314.slots {
+            eprintln!("  {:?}: bits=0x{:010X} (width={})", s.slot_type, s.bits, s.width);
+        }
+        eprintln!("=== add_one slot extraction ===");
+        for s in &ext_one.slots {
+            eprintln!("  {:?}: bits=0x{:010X} (width={})", s.slot_type, s.bits, s.width);
+        }
+
+        // Now decode each slot
+        let slots_314 = decode_80bit_bundle_slots(&decoder, &add_314_bytes, 0x56);
+        let slots_one = decode_80bit_bundle_slots(&decoder, &add_one_bytes, 0x56);
+        eprintln!("\n=== add_314 decoded slots ===");
+        for (i, (mnem, dest, srcs)) in slots_314.iter().enumerate() {
+            eprintln!("  slot[{}]: {} dest={:?} sources={:?}", i, mnem, dest, srcs);
+        }
+        eprintln!("\n=== add_one decoded slots ===");
+        for (i, (mnem, dest, srcs)) in slots_one.iter().enumerate() {
+            eprintln!("  slot[{}]: {} dest={:?} sources={:?}", i, mnem, dest, srcs);
+        }
+
+        // Verify add_314 expectations from Peano disassembly:
+        //   mova r27, #0x0  -> LDA slot: dest=ScalarReg(27), source=Immediate(0)
+        //   movx r7, #0x0   -> ALU slot: dest=ScalarReg(7), source=Immediate(0)
+        //   mov r6, #0x6    -> MV slot: dest=ScalarReg(6), source=Immediate(6)
+        // (slot ordering in the extracted list may vary)
+
+        // Now drill into the MV slot specifically to see field details
+        eprintln!("\n=== MV slot deep dive ===");
+        for (label, ext) in [("add_314", &ext_314), ("add_one", &ext_one)] {
+            let mv_slot = ext.slots.iter().find(|s| s.slot_type == crate::interpreter::bundle::SlotType::Mv);
+            if let Some(mv) = mv_slot {
+                eprintln!("{} MV bits: 0x{:06X} ({:022b})", label, mv.bits, mv.bits);
+                if let Some(decoded) = decoder.decode_slot_bits(mv.bits, mv.slot_type) {
+                    eprintln!("  matched: {} ({})", decoded.encoding.mnemonic, decoded.encoding.name);
+                    eprintln!("  operand fields:");
+                    for field in &decoded.encoding.operand_fields {
+                        let raw = decoded.operand(&field.name).unwrap_or(0);
+                        eprintln!("    {}: raw={} (0x{:X}), bit_pos={}, width={}, signed={}, type={:?}",
+                            field.name, raw, raw, field.bit_position, field.width, field.signed,
+                            field.operand_type);
+                    }
+                    eprintln!("  input_order: {:?}", decoded.encoding.input_order);
+                    eprintln!("  output_order: {:?}", decoded.encoding.output_order);
+                }
+            }
+        }
+
+        // Verify the key assertion: add_314 MV slot should decode to mov r6, #6
+        let mv_314 = ext_314.slots.iter().find(|s| s.slot_type == crate::interpreter::bundle::SlotType::Mv).unwrap();
+        let decoded_mv_314 = decoder.decode_slot_bits(mv_314.bits, mv_314.slot_type).unwrap();
+        let (dest, sources, _) = decoder.extract_operands(&decoded_mv_314);
+        assert_eq!(dest, Some(Operand::ScalarReg(6)), "Expected dest=r6");
+        assert_eq!(sources, vec![Operand::Immediate(6)], "Expected source=Immediate(6)");
+    }
+
+    #[test]
+    fn test_lda_scl_vs_mv_scl_pointer_encoding_differs() {
+        // This is THE critical test: the same pointer register (p3) encodes
+        // differently in LdaScl vs MvSclSrc. The old heuristic code got this wrong.
+        //
+        // p3 in LdaScl: (3 << 4) | 0b1101 = 61
+        // p3 in MvSclSrc: (3 << 4) | 0b0011 = 51
+        //
+        // Decoding 61 with MvSclSrc would give the wrong register,
+        // and decoding 51 with LdaScl would also be wrong.
+        assert_eq!(decode_lda_scl(61), Operand::PointerReg(3));
+        assert_eq!(decode_mv_scl_src(51), Operand::PointerReg(3));
+
+        // Cross-check: 51 through LdaScl should NOT give p3
+        // 51 = 0b0110011, low 4 bits = 0b0011, not 0b1101, so it's not a pointer in LdaScl
+        // low 2 bits = 0b11, which doesn't match any LdaScl pattern cleanly
+        let cross = decode_lda_scl(51);
+        assert_ne!(cross, Operand::PointerReg(3),
+            "LdaScl(51) should NOT decode as p3 -- different encoding scheme");
     }
 }

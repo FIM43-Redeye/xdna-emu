@@ -2,21 +2,42 @@
 //!
 //! AIE2 has several register files:
 //!
-//! - **Scalar GPR**: 32 × 32-bit general purpose registers (r0-r31)
-//! - **Pointer**: 8 × 20-bit address registers (p0-p7)
-//! - **Modifier**: 8 × 20-bit post-modify registers (m0-m7)
-//! - **Vector**: 32 × 256-bit SIMD registers (v0-v31)
-//! - **Accumulator**: 8 × 512-bit MAC accumulators (acc0-acc7)
+//! - **Scalar GPR**: 32 x 32-bit general purpose registers (r0-r31)
+//! - **Special**: 16 x 32-bit special-purpose registers (lr, LS, LE, LC, etc.)
+//! - **Pointer**: 8 x 20-bit address registers (p0-p7)
+//! - **Modifier**: 8 x 20-bit post-modify registers (m0-m7)
+//! - **Vector**: 32 x 256-bit SIMD registers (v0-v31)
+//! - **Accumulator**: 8 x 512-bit MAC accumulators (acc0-acc7)
 //!
-//! Some registers have special purposes:
-//! - r0 is typically the link register (but not hardwired)
-//! - r13/r14 may be SP/LR by convention
-//! - p0 is often used as the stack pointer
+//! The scalar register file is extended to 48 entries to include special-
+//! purpose registers at indices 32-47. In AIE2 hardware these are separate
+//! registers (not part of the GPR file), but for simplicity we store them
+//! in the same array with dedicated index constants.
 
 use std::fmt;
 
-/// Number of scalar general purpose registers.
-pub const NUM_SCALAR_REGS: usize = 32;
+/// Number of scalar registers including special-purpose slots.
+/// Indices 0-31 are GPRs (r0-r31); 32-47 are special registers.
+pub const NUM_SCALAR_REGS: usize = 48;
+
+/// Number of general-purpose scalar registers (r0-r31).
+pub const NUM_SCALAR_GPRS: usize = 32;
+
+// Special register indices (32+). These are NOT part of the r0-r31 GPR file
+// in hardware; they are separate special-purpose registers. We map them to
+// high indices in the scalar array for convenience.
+/// Link register (lr) -- return address saved by jl/call.
+pub const LR_REG_INDEX: u8 = 32;
+/// Loop start address register (LS).
+pub const LS_REG_INDEX: u8 = 33;
+/// Loop end address register (LE).
+pub const LE_REG_INDEX: u8 = 34;
+/// Loop count register (LC).
+pub const LC_REG_INDEX: u8 = 35;
+/// Decompress pointer register (DP).
+pub const DP_REG_INDEX: u8 = 36;
+/// Core ID register (CORE_ID) -- read-only in hardware.
+pub const CORE_ID_REG_INDEX: u8 = 37;
 
 /// Number of pointer registers.
 pub const NUM_POINTER_REGS: usize = 8;
@@ -33,9 +54,14 @@ pub const NUM_ACCUMULATOR_REGS: usize = 8;
 /// Mask for 20-bit pointer/modifier values.
 const PTR_MASK: u32 = 0x000F_FFFF;
 
-/// Scalar general purpose register file.
+/// Scalar register file including special-purpose registers.
 ///
-/// 32 × 32-bit registers (r0-r31).
+/// Indices 0-31: general-purpose registers r0-r31.
+/// Indices 32-47: special-purpose registers (lr, LS, LE, LC, DP, CORE_ID).
+///
+/// In AIE2 hardware, the special registers are separate from the GPR file.
+/// We store them in the same array for simplicity, using dedicated index
+/// constants (LR_REG_INDEX, etc.) to access them.
 #[derive(Clone)]
 pub struct ScalarRegisterFile {
     regs: [u32; NUM_SCALAR_REGS],
@@ -55,21 +81,23 @@ impl ScalarRegisterFile {
         }
     }
 
-    /// Read a register (0-31).
+    /// Read a register. Indices 0-31 are GPRs; 32-47 are special registers.
     #[inline]
     pub fn read(&self, reg: u8) -> u32 {
-        self.regs[(reg & 0x1F) as usize]
+        let idx = (reg as usize) % NUM_SCALAR_REGS;
+        self.regs[idx]
     }
 
-    /// Write a register (0-31).
+    /// Write a register. Indices 0-31 are GPRs; 32-47 are special registers.
     #[inline]
     pub fn write(&mut self, reg: u8, value: u32) {
-        self.regs[(reg & 0x1F) as usize] = value;
+        let idx = (reg as usize) % NUM_SCALAR_REGS;
+        self.regs[idx] = value;
     }
 
-    /// Get a slice of all registers (for debugging/display).
-    pub fn as_slice(&self) -> &[u32; NUM_SCALAR_REGS] {
-        &self.regs
+    /// Get a slice of GPR registers only (r0-r31) for debugging/display.
+    pub fn as_slice(&self) -> &[u32] {
+        &self.regs[..NUM_SCALAR_GPRS]
     }
 }
 
@@ -450,13 +478,22 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_register_wrapping() {
+    fn test_scalar_special_registers() {
         let mut regs = ScalarRegisterFile::new();
 
-        // Register index wraps at 32
-        regs.write(32, 0x1234); // Should write to r0
-        assert_eq!(regs.read(0), 0x1234);
-        assert_eq!(regs.read(32), 0x1234);
+        // Index 32 is the LR register slot, NOT r0.
+        regs.write(LR_REG_INDEX, 0x1234);
+        assert_eq!(regs.read(LR_REG_INDEX), 0x1234);
+        assert_eq!(regs.read(0), 0); // r0 unaffected
+
+        // Other special registers are independent.
+        regs.write(LC_REG_INDEX, 100);
+        assert_eq!(regs.read(LC_REG_INDEX), 100);
+        assert_eq!(regs.read(LR_REG_INDEX), 0x1234); // lr unaffected
+
+        // Wrapping still applies at NUM_SCALAR_REGS (48).
+        regs.write(48, 0xABCD); // wraps to index 0 (r0)
+        assert_eq!(regs.read(0), 0xABCD);
     }
 
     #[test]

@@ -99,6 +99,9 @@ pub struct InterpreterEngine {
     no_progress_cycles: u32,
     /// Last cycle's words routed (to detect progress).
     last_words_routed: usize,
+    /// Last cycle's total DMA bytes transferred (to detect DMA-level progress
+    /// even when no stream words are routed -- e.g., during lock operations).
+    last_dma_bytes: u64,
 }
 
 impl InterpreterEngine {
@@ -131,6 +134,7 @@ impl InterpreterEngine {
             auto_run: false,
             no_progress_cycles: 0,
             last_words_routed: 0,
+            last_dma_bytes: 0,
         }
     }
 
@@ -479,9 +483,16 @@ impl InterpreterEngine {
         if all_halted && any_cores_enabled {
             let dma_waiting = self.device.array.any_dma_waiting_for_lock();
 
-            // Check if we're making progress
-            let making_progress = words_routed > 0 || words_routed != self.last_words_routed;
+            // Check if we're making progress.
+            // Progress means EITHER stream words were routed OR DMA transferred
+            // more bytes. During pipeline drainage after core completion, DMA may
+            // spend several cycles on lock acquire/release without routing stream
+            // words -- but bytes_transferred will still increase when data moves.
+            let dma_bytes = self.device.array.total_dma_bytes_transferred();
+            let making_progress = words_routed > 0
+                || dma_bytes > self.last_dma_bytes;
             self.last_words_routed = words_routed;
+            self.last_dma_bytes = dma_bytes;
 
             if !dma_active {
                 // No DMA activity at all - clean halt
@@ -490,9 +501,11 @@ impl InterpreterEngine {
                 // DMA active but no progress this cycle
                 self.no_progress_cycles += 1;
 
-                // After 10 cycles of no progress with all cores halted, give up
-                // This is generous - real deadlocks are detected quickly
-                if self.no_progress_cycles >= 10 {
+                // After 50 cycles of no progress with all cores halted, give up.
+                // Lock acquire/release cycles and multi-hop stream routing can
+                // cause gaps of 10-20 cycles with no visible byte progress, so
+                // we need a generous threshold to avoid false positives.
+                if self.no_progress_cycles >= 50 {
                     if dma_waiting {
                         log::info!(
                             "Engine halting after {} cycles: all cores done, DMAs stalled on unreleased locks",

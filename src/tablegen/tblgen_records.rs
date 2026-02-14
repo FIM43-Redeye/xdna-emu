@@ -41,7 +41,7 @@
 
 use std::collections::HashMap;
 
-use super::resolver::{InstrEncoding, OperandField, detect_addressing_mode, detect_mem_width, infer_semantic_from_mnemonic};
+use super::resolver::{FieldFragment, InstrEncoding, OperandField, OperandType, classify_operand_type, detect_addressing_mode, detect_mem_width, infer_semantic_from_mnemonic};
 use super::types::ImplicitReg;
 
 /// A parsed instruction record from tblgen output.
@@ -73,6 +73,10 @@ pub struct InstrRecord {
     pub may_store: bool,
     /// hasSideEffects flag
     pub has_side_effects: bool,
+    /// hasCompleteDecoder flag from TableGen.
+    /// When false, the encoding may be ambiguous and needs post-decode validation.
+    /// We deprioritize these during disambiguation.
+    pub has_complete_decoder: bool,
 }
 
 /// Parsed slot encoding from bits<N> field.
@@ -130,32 +134,101 @@ impl SlotEncoding {
         (mask, bits)
     }
 
-    /// Extract operand fields from the encoding.
+    /// Extract operand fields from the encoding, handling split fields.
     ///
-    /// Groups consecutive field bit references into OperandField entries
-    /// with their bit positions and widths.
+    /// Each `FieldBit { field, bit }` in the encoding tells us exactly which
+    /// logical bit of the operand maps to which instruction bit. For contiguous
+    /// fields (all bits adjacent with sequential target_bit values), we create
+    /// a simple OperandField. For split fields (like MOV_mv_cg's immediate
+    /// where `i{9:1}` is at positions 14-6 and `i{0}` at position 3), we
+    /// create FieldFragments for correct reassembly.
     pub fn extract_operand_fields(&self) -> Vec<OperandField> {
-        let mut fields: HashMap<String, (u8, u8)> = HashMap::new(); // name -> (low_bit, high_bit)
+        // Collect all (inst_bit, target_bit) pairs for each field name
+        let mut field_bits: HashMap<String, Vec<(u8, u8)>> = HashMap::new();
 
         for (i, part) in self.parts.iter().enumerate() {
-            if let EncodingBit::FieldBit { field, bit: _ } = part {
-                let bit_pos = self.width as usize - 1 - i;
-                let entry = fields.entry(field.clone()).or_insert((bit_pos as u8, bit_pos as u8));
-                // Expand range
-                if (bit_pos as u8) < entry.0 {
-                    entry.0 = bit_pos as u8;
-                }
-                if (bit_pos as u8) > entry.1 {
-                    entry.1 = bit_pos as u8;
-                }
+            if let EncodingBit::FieldBit { field, bit } = part {
+                let inst_bit = (self.width as usize - 1 - i) as u8;
+                field_bits.entry(field.clone())
+                    .or_default()
+                    .push((inst_bit, *bit));
             }
         }
 
-        fields
+        field_bits
             .into_iter()
-            .map(|(name, (low, high))| OperandField::new(name, low, high - low + 1))
+            .map(|(name, mut bit_pairs)| {
+                // Sort by target_bit ascending for easier analysis
+                bit_pairs.sort_by_key(|&(_, target)| target);
+
+                let logical_width = bit_pairs.iter()
+                    .map(|&(_, target)| target)
+                    .max().unwrap_or(0) + 1;
+                let low_inst_bit = bit_pairs.iter()
+                    .map(|&(inst, _)| inst)
+                    .min().unwrap_or(0);
+
+                // Check if bits form a single contiguous range in instruction
+                // space with sequential target bits. A contiguous field has:
+                // - target bits 0, 1, 2, ... (sequential)
+                // - inst bits that differ by exactly 1 per step
+                let is_contiguous = bit_pairs.windows(2).all(|w| {
+                    let (inst_a, tgt_a) = w[0];
+                    let (inst_b, tgt_b) = w[1];
+                    tgt_b == tgt_a + 1 && inst_b == inst_a + 1
+                });
+
+                if is_contiguous {
+                    OperandField::new(name, low_inst_bit, logical_width)
+                } else {
+                    // Split field: build fragments from contiguous runs
+                    let fragments = build_fragments(&bit_pairs);
+                    let mut field = OperandField::new(name, low_inst_bit, logical_width);
+                    field.fragments = fragments;
+                    field
+                }
+            })
             .collect()
     }
+}
+
+/// Build FieldFragment entries from sorted (inst_bit, target_bit) pairs.
+///
+/// Groups consecutive runs of bits (where both inst_bit and target_bit
+/// increment by 1) into single fragments. For example:
+/// - [(3, 0)] and [(6, 1), (7, 2), ..., (14, 9)] become two fragments:
+///   Fragment { inst_bit: 3, width: 1, target_bit: 0 } and
+///   Fragment { inst_bit: 6, width: 9, target_bit: 1 }
+fn build_fragments(bit_pairs: &[(u8, u8)]) -> Vec<FieldFragment> {
+    if bit_pairs.is_empty() {
+        return Vec::new();
+    }
+
+    let mut fragments = Vec::new();
+    let mut run_start = 0;
+
+    for i in 1..=bit_pairs.len() {
+        let is_break = if i < bit_pairs.len() {
+            let (inst_prev, tgt_prev) = bit_pairs[i - 1];
+            let (inst_curr, tgt_curr) = bit_pairs[i];
+            !(tgt_curr == tgt_prev + 1 && inst_curr == inst_prev + 1)
+        } else {
+            true // end of sequence
+        };
+
+        if is_break {
+            let (inst_bit, target_bit) = bit_pairs[run_start];
+            let width = (i - run_start) as u8;
+            fragments.push(FieldFragment {
+                inst_bit,
+                width,
+                target_bit,
+            });
+            run_start = i;
+        }
+    }
+
+    fragments
 }
 
 /// Parse tblgen --print-records output.
@@ -208,6 +281,7 @@ fn parse_single_record(lines: &[&str], i: &mut usize) -> Option<InstrRecord> {
         may_load: false,
         may_store: false,
         has_side_effects: false,
+        has_complete_decoder: true, // Default to true; set false if field says 0
     };
 
     // Parse fields until closing brace
@@ -239,6 +313,8 @@ fn parse_single_record(lines: &[&str], i: &mut usize) -> Option<InstrRecord> {
             record.may_store = line.contains("= 1");
         } else if line.starts_with("bit hasSideEffects = ") {
             record.has_side_effects = line.contains("= 1");
+        } else if line.starts_with("bit hasCompleteDecoder = ") {
+            record.has_complete_decoder = line.contains("= 1");
         } else if let Some(enc) = parse_slot_encoding(line) {
             record.slot_encoding = Some(enc);
         }
@@ -408,7 +484,29 @@ impl InstrRecord {
     pub fn to_encoding(&self) -> Option<InstrEncoding> {
         let enc = self.slot_encoding.as_ref()?;
         let (fixed_mask, fixed_bits) = enc.compute_fixed_bits();
-        let operand_fields = enc.extract_operand_fields();
+        let mut operand_fields = enc.extract_operand_fields();
+
+        // Populate operand_type using reg_class from inputs/outputs.
+        // The encoding extraction creates fields with OperandType::Unknown;
+        // we resolve them here using the same classifier as the resolver path.
+        let all_operands: Vec<(&str, &str)> = self.outputs.iter()
+            .chain(self.inputs.iter())
+            .map(|(cls, name)| (cls.as_str(), name.as_str()))
+            .collect();
+
+        for field in &mut operand_fields {
+            if let Some((reg_class, _)) = all_operands.iter()
+                .find(|(_, name)| *name == field.name)
+            {
+                field.operand_type = classify_operand_type(reg_class, &field.name);
+                if let OperandType::Immediate { signed: true, .. } = &field.operand_type {
+                    field.signed = true;
+                }
+            } else {
+                // No matching operand def -- use field-name fallback
+                field.operand_type = classify_operand_type("", &field.name);
+            }
+        }
 
         // Map slot name to canonical form
         let slot = match enc.slot.as_str() {
@@ -469,6 +567,7 @@ impl InstrRecord {
             implicit_regs,
             addressing_mode: detect_addressing_mode(&self.name),
             mem_width: detect_mem_width(&self.mnemonic),
+            has_complete_decoder: self.has_complete_decoder,
         })
     }
 }

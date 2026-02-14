@@ -167,6 +167,16 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                 StepResult::Continue
             }
 
+            crate::interpreter::traits::ExecuteResult::Call { target } => {
+                ctx.set_pending_call(target);
+                ctx.advance_pc(bundle_size as u32);
+                if let Some(branch_target) = ctx.tick_delay_slots() {
+                    ctx.set_pc(branch_target);
+                }
+                self.status = CoreStatus::Ready;
+                StepResult::Continue
+            }
+
             crate::interpreter::traits::ExecuteResult::WaitLock { lock_id } => {
                 self.status = CoreStatus::WaitingLock { lock_id };
                 StepResult::WaitLock { lock_id }
@@ -304,6 +314,19 @@ where
                 ctx.set_pending_branch(target);
                 ctx.advance_pc(bundle_size as u32);
                 // Check if this was a back-to-back branch and delay slots exhausted
+                if let Some(branch_target) = ctx.tick_delay_slots() {
+                    ctx.set_pc(branch_target);
+                }
+                self.status = CoreStatus::Ready;
+                StepResult::Continue
+            }
+
+            ExecuteResult::Call { target } => {
+                // Call (jl): like branch, but LR update is deferred until
+                // delay slots are exhausted. set_pending_call sets is_call=true
+                // so tick_delay_slots will set LR = current PC at that time.
+                ctx.set_pending_call(target);
+                ctx.advance_pc(bundle_size as u32);
                 if let Some(branch_target) = ctx.tick_delay_slots() {
                     ctx.set_pc(branch_target);
                 }

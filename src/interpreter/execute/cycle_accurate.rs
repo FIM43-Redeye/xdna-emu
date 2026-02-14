@@ -402,6 +402,7 @@ impl CycleAccurateExecutor {
                 if let Some(result) = self.execute_slot_with_mem_locks(op, ctx, tile, slot_mem_locks) {
                     match &result {
                         ExecuteResult::Branch { .. }
+                        | ExecuteResult::Call { .. }
                         | ExecuteResult::Halt
                         | ExecuteResult::WaitLock { .. }
                         | ExecuteResult::WaitDma { .. }
@@ -423,9 +424,14 @@ impl CycleAccurateExecutor {
             self.record_memory_access(op);
         }
 
-        // Handle call return address
-        if let Some(return_addr) = self.pending_call_return_addr {
-            ctx.set_lr(return_addr.wrapping_add(bundle.size() as u32));
+        // Convert Branch to Call when this was a jl instruction.
+        // LR is NOT set here -- it's deferred until delay slots are exhausted
+        // (in ExecutionContext::tick_delay_slots) so that delay slot instructions
+        // see the pre-call LR value, matching hardware pipeline behavior.
+        if self.pending_call_return_addr.is_some() {
+            if let ExecuteResult::Branch { target } = final_result {
+                final_result = ExecuteResult::Call { target };
+            }
         }
 
         // Calculate execution cycles (max latency of all ops in bundle)
@@ -437,7 +443,12 @@ impl CycleAccurateExecutor {
 
         // Apply branch penalty if a branch was taken
         // (Pipeline flush due to mispredicted/unconditional branch)
-        if let ExecuteResult::Branch { target } = final_result {
+        // Apply branch penalty for both Branch and Call results
+        let branch_target = match final_result {
+            ExecuteResult::Branch { target } | ExecuteResult::Call { target } => Some(target),
+            _ => None,
+        };
+        if let Some(target) = branch_target {
             let penalty = BRANCH_PENALTY_CYCLES;
             self.total_branch_stalls += penalty as u64;
             ctx.record_stall(penalty as u64);

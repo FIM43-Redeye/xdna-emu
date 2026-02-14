@@ -94,14 +94,24 @@ impl ControlUnit {
                         // The mRx field for jnz/jz is in dest (decoder treats it as dest)
                         // Try dest first, then sources as fallback
                         let reg_val = if let Some(Operand::ScalarReg(r)) = &op.dest {
-                            ctx.read_scalar(*r) as i32
+                            let v = ctx.read_scalar(*r) as i32;
+                            log::debug!("JNZ/JZ: dest=ScalarReg({}) val={} target=0x{:X}", r, v, target);
+                            v
                         } else if let Some(src) = op.sources.first() {
                             match src {
-                                Operand::ScalarReg(r) => ctx.read_scalar(*r) as i32,
-                                Operand::Immediate(imm) => *imm,
+                                Operand::ScalarReg(r) => {
+                                    let v = ctx.read_scalar(*r) as i32;
+                                    log::debug!("JNZ/JZ: src[0]=ScalarReg({}) val={} target=0x{:X}", r, v, target);
+                                    v
+                                }
+                                Operand::Immediate(imm) => {
+                                    log::debug!("JNZ/JZ: src[0]=Imm({}) target=0x{:X}", imm, target);
+                                    *imm
+                                }
                                 _ => 0,
                             }
                         } else {
+                            log::debug!("JNZ/JZ: no dest/src, defaulting to 0, target=0x{:X}", target);
                             0
                         };
                         match condition {
