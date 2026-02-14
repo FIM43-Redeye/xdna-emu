@@ -265,6 +265,38 @@ pub fn is_nop_encoding(word: u32) -> bool {
     NOP_ENCODINGS.contains(&word)
 }
 
+// ============================================================================
+// TableGen Validation
+// ============================================================================
+
+/// Validate that our hardcoded bundle format sizes match the parsed composite
+/// format definitions from AIE2CompositeFormats.td.
+///
+/// The composite formats define which slot combinations exist at each bundle
+/// size. This check ensures our `BundleFormat::size_bytes()` agrees with the
+/// compiler's format definitions.
+///
+/// # Panics
+///
+/// Panics if a parsed format size doesn't correspond to any known BundleFormat.
+pub fn validate_bundle_formats(formats: &[crate::tablegen::CompositeFormatDef]) {
+    // Collect all parsed format sizes
+    let known_sizes: &[u8] = &[2, 4, 6, 8, 10, 12, 14, 16];
+
+    for fmt in formats {
+        assert!(
+            known_sizes.contains(&fmt.total_bytes),
+            "Parsed composite format '{}' has size {} bytes, which doesn't match \
+             any known BundleFormat size (expected one of {:?})",
+            fmt.name, fmt.total_bytes, known_sizes
+        );
+    }
+
+    // Verify that at least 128-bit (16-byte) formats exist (the full VLIW)
+    let has_full = formats.iter().any(|f| f.total_bytes == 16);
+    assert!(has_full, "No 128-bit (16-byte) composite format found");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,5 +430,23 @@ mod tests {
         assert!(is_nop_encoding(0x0000_0000));
         assert!(is_nop_encoding(0x1501_0040));
         assert!(!is_nop_encoding(0x4000_0000));
+    }
+
+    // ── TableGen Validation ─────────────────────────────────────
+
+    #[test]
+    fn test_validate_bundle_formats_with_live_data() {
+        use std::path::Path;
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found");
+            return;
+        }
+
+        let output = crate::tablegen::load_full_via_tblgen(llvm_aie_path)
+            .expect("Failed to load via tblgen");
+
+        // Should not panic
+        validate_bundle_formats(&output.composite_formats);
     }
 }

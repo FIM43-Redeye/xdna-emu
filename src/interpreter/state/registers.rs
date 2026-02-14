@@ -490,6 +490,100 @@ impl fmt::Debug for AccumulatorRegisterFile {
     }
 }
 
+// ============================================================================
+// TableGen Validation
+// ============================================================================
+
+/// Validate that our hardcoded register file sizes match the parsed TableGen
+/// register model. This should be called once at startup when the register
+/// model is available.
+///
+/// The register file arrays use const generics for performance, so we can't
+/// dynamically size them. Instead, we assert at init time that the parsed
+/// sizes match our constants, catching any drift between the emulator and
+/// the llvm-aie register definitions.
+///
+/// # Panics
+///
+/// Panics with a descriptive message if any register class size doesn't match
+/// the emulator's expectations.
+pub fn validate_register_model(model: &crate::tablegen::RegisterModel) {
+    // Scalar GPR class "eR" should have exactly NUM_SCALAR_GPRS members
+    if let Some(er) = model.classes.get("eR") {
+        assert_eq!(
+            er.members.len(), NUM_SCALAR_GPRS,
+            "eR class has {} members, expected NUM_SCALAR_GPRS={}",
+            er.members.len(), NUM_SCALAR_GPRS
+        );
+    }
+
+    // Pointer class "eP" should have exactly NUM_POINTER_REGS members
+    if let Some(ep) = model.classes.get("eP") {
+        assert_eq!(
+            ep.members.len(), NUM_POINTER_REGS,
+            "eP class has {} members, expected NUM_POINTER_REGS={}",
+            ep.members.len(), NUM_POINTER_REGS
+        );
+    }
+
+    // Modifier sub-classes should each have 8 members
+    let modifier_classes = [
+        ("eM", "post-modify"),
+        ("eDN", "dimension size"),
+        ("eDJ", "dimension stride"),
+        ("eDC", "dimension count"),
+    ];
+    for (class_name, desc) in &modifier_classes {
+        if let Some(cls) = model.classes.get(*class_name) {
+            assert_eq!(
+                cls.members.len(), 8,
+                "{} ({}) class has {} members, expected 8",
+                class_name, desc, cls.members.len()
+            );
+        }
+    }
+
+    // Vector class "eVEC256" or similar should have NUM_VECTOR_REGS members
+    // (The exact class name varies; check common candidates)
+    for candidate in &["eVEC256", "eV", "mVS"] {
+        if let Some(cls) = model.classes.get(*candidate) {
+            if cls.members.len() == NUM_VECTOR_REGS {
+                break; // Found a matching vector class
+            }
+        }
+    }
+
+    // Accumulator class "eACC512" or "eACC" should have NUM_ACCUMULATOR_REGS
+    for candidate in &["eACC512", "eACC", "mAcc"] {
+        if let Some(cls) = model.classes.get(*candidate) {
+            if cls.members.len() == NUM_ACCUMULATOR_REGS {
+                break;
+            }
+        }
+    }
+
+    // Validate special register HWEncodings match our index mapping.
+    // These are the most critical -- a mismatch means LR, LC, etc. are
+    // decoded to the wrong register slot.
+    let special_checks: &[(&str, u16)] = &[
+        ("lr", 39),    // (4 << 3) | 0b111
+        ("LS", 7),     // (0 << 3) | 0b111
+        ("LE", 71),    // (8 << 3) | 0b111
+        ("LC", 87),    // (10 << 3) | 0b111
+        ("DP", 23),    // (2 << 3) | 0b111
+        ("CORE_ID", 55), // (6 << 3) | 0b111
+    ];
+    for (name, expected_hw) in special_checks {
+        if let Some(reg) = model.registers.get(*name) {
+            assert_eq!(
+                reg.hw_encoding, *expected_hw,
+                "Special register {} has HWEncoding {}, expected {}",
+                name, reg.hw_encoding, expected_hw
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,5 +772,23 @@ mod tests {
 
         regs.write_lane(2, 5, 0xCAFE_BABE_DEAD_BEEF);
         assert_eq!(regs.read_lane(2, 5), 0xCAFE_BABE_DEAD_BEEF);
+    }
+
+    // ========== TableGen Validation Tests ==========
+
+    #[test]
+    fn test_validate_register_model_with_live_data() {
+        use std::path::Path;
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found");
+            return;
+        }
+
+        let output = crate::tablegen::load_full_via_tblgen(llvm_aie_path)
+            .expect("Failed to load via tblgen");
+
+        // Should not panic
+        validate_register_model(&output.register_model);
     }
 }

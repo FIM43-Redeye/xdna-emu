@@ -41,6 +41,8 @@ pub use registers::{
     DP_REG_INDEX, CORE_ID_REG_INDEX,
     // Modifier register sub-class base indices.
     MOD_BASE_M, MOD_BASE_DN, MOD_BASE_DJ, MOD_BASE_DC,
+    // TableGen validation.
+    validate_register_model,
 };
 pub use context::{
     ExecutionContext, SpRegister, TimingContext,
