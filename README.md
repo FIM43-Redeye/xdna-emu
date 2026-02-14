@@ -7,7 +7,7 @@ Open-source emulator and visual debugger for AMD XDNA NPUs (Ryzen AI).
 ## Features
 
 - **Binary Parsing**: Load real `.xclbin` files (XCLBIN, AIE Partition, CDO, ELF)
-- **Device Emulation**: Simulates NPU1/NPU2 tile arrays (5x6 grid)
+- **Device Emulation**: Simulates NPU1 (Phoenix) tile arrays, NPU4-6 (Strix) planned
 - **ISA Coverage**: Scalar (div, select), vector (element ops, shifts), matrix multiply, convolution, type conversion
 - **Multi-Tile DMA**: Stream routing, lock synchronization, memory tile support
 - **Visual Debugger**: GUI showing tile status, memory, locks, DMA, registers
@@ -40,12 +40,14 @@ Drag & drop `.xclbin` files onto the window to load them.
 
 ## Target Devices
 
-| Device | Codename | Architecture | Array |
-|--------|----------|--------------|-------|
-| NPU1 | Phoenix/HawkPoint | AIE2 | 5x6 |
-| NPU2 | Strix | AIE2P | 5x6 |
-| NPU3 | Strix Halo | AIE2P | 9x6 |
-| NPU4 | Krackan | AIE2P | 5x6 |
+| Driver ID | Product | Codename | Architecture | Array |
+|-----------|---------|----------|--------------|-------|
+| NPU1 | Ryzen AI | Phoenix | AIE2 | 4x5 |
+| NPU4 | Ryzen AI 300 | Strix Point | AIE2P | 4x5 |
+| NPU5 | Ryzen AI Max | Strix Halo | AIE2P | 8x5 |
+| NPU6 | (TBD) | Krackan | AIE2P | 4x5 |
+
+*Note: NPU2/NPU3 are prototypes, not consumer devices.*
 
 ## Project Structure
 
@@ -69,4 +71,4 @@ This project was written almost entirely by [Claude Opus 4.5](https://www.anthro
 
 ## License
 
-[Unlicense](LICENSE) - Public Domain
+[X11 License](LICENSE) - Any usage with attribution, advertisement barred

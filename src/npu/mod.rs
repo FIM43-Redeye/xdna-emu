@@ -26,7 +26,7 @@ mod parser;
 mod executor;
 
 pub use parser::{NpuInstruction, NpuInstructionStream};
-pub use executor::NpuExecutor;
+pub use executor::{NpuExecutor, HostBuffer};
 
 /// NPU instruction opcodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

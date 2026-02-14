@@ -38,7 +38,7 @@ use super::{
     BdConfig, ChannelType, DmaError, DmaResult,
     NUM_BUFFER_DESCRIPTORS, MEMTILE_NUM_BUFFER_DESCRIPTORS,
     COMPUTE_S2MM_CHANNELS, COMPUTE_MM2S_CHANNELS,
-    MEM_TILE_S2MM_CHANNELS, MEM_TILE_MM2S_CHANNELS, DMA_DATA_WIDTH_BYTES,
+    MEM_TILE_S2MM_CHANNELS, MEM_TILE_MM2S_CHANNELS,
 };
 use super::transfer::{Transfer, TransferDirection, TransferEndpoint, TransferState};
 use super::timing::{DmaTimingConfig, ChannelTimingState, TransferPhase};
@@ -742,11 +742,15 @@ impl DmaEngine {
         // Insert packet header if needed (MM2S only, at start of transfer)
         self.maybe_insert_packet_header(ch_idx);
 
-        // Get lock info from transfer and check if lock has been acquired
-        let (has_lock, lock_available) = {
+        // Get lock info from transfer and check if lock has been acquired.
+        // has_acquire_lock: whether the BD requires lock acquisition before transfer
+        // has_release_lock: whether the BD requires lock release after transfer
+        // These are separate because a BD can have release-only (no acquire).
+        let (has_acquire_lock, has_release_lock, lock_available) = {
             let transfer = self.transfers[ch_idx].as_ref()
                 .expect("BUG: step_channel_timed called without active transfer");
-            let has_lock = transfer.acquire_lock.is_some();
+            let has_acquire_lock = transfer.acquire_lock.is_some();
+            let has_release_lock = transfer.release_lock.is_some();
 
             // Lock is "available" to the timing FSM if:
             // - No lock is required, OR
@@ -754,9 +758,9 @@ impl DmaEngine {
             //
             // Note: We don't check the raw lock value because try_acquire_lock() already
             // modified it when it succeeded. The Transfer.state tracks whether acquisition happened.
-            let lock_available = transfer.acquire_lock.is_none()
+            let lock_available = !has_acquire_lock
                 || transfer.state == TransferState::Active;
-            (has_lock, lock_available)
+            (has_acquire_lock, has_release_lock, lock_available)
         };
 
         // Check if we need to do data transfer this cycle (before tick advances state)
@@ -814,7 +818,9 @@ impl DmaEngine {
 
         // Advance timing state (this handles phase transitions and word counting)
         let old_phase = self.timing_states[ch_idx].phase;
-        let phase = self.timing_states[ch_idx].tick(&self.timing_config, has_lock, lock_available);
+        let phase = self.timing_states[ch_idx].tick(
+            &self.timing_config, has_acquire_lock, has_release_lock, lock_available,
+        );
 
         if self.col == 0 && self.row == 0 {
             log::trace!("SHIM tick ch{}: {:?} -> {:?} (remaining={}, words={}/{})",
@@ -1219,15 +1225,16 @@ impl DmaEngine {
         // Handle lock release if needed
         // Use snapshot-based release for cycle-accurate behavior
         if let TransferState::ReleasingLock(lock_id) = transfer.state {
-            log::info!("DMA tile({},{}) releasing lock {} on channel {} (snapshot-based)",
-                self.col, self.row, lock_id, ch_idx);
+            let release_delta = transfer.release_value;
+            log::info!("DMA tile({},{}) releasing lock {} with delta {} on channel {} (snapshot-based)",
+                self.col, self.row, lock_id, release_delta, ch_idx);
             if (lock_id as usize) < tile.locks.len() {
-                // Record release as pending delta (+1), applied at cycle end
-                tile.release_snapshot(lock_id as usize, 1);
-                log::info!("Tile({},{}) lock {} pending delta +1 (current={}, will be {} at cycle end)",
-                    self.col, self.row, lock_id,
-                    tile.locks[lock_id as usize].value,
-                    tile.locks[lock_id as usize].value + 1);
+                // Record release as pending delta, applied at cycle end
+                tile.release_snapshot(lock_id as usize, release_delta);
+                let current = tile.locks[lock_id as usize].value;
+                let new_val = (current as i16 + release_delta as i16).clamp(0, 63) as u8;
+                log::info!("Tile({},{}) lock {} pending delta {} (current={}, will be {} at cycle end)",
+                    self.col, self.row, lock_id, release_delta, current, new_val);
             }
             transfer.lock_released();
         }
@@ -1881,6 +1888,126 @@ impl DmaEngine {
             .map(|c| c.out_of_order_enable)
             .unwrap_or(false)
     }
+
+    // === Stream Port Mapping Integration ===
+    //
+    // These methods integrate with the stream_io module's port mappings,
+    // providing a unified interface for determining which stream switch
+    // ports DMA channels connect to.
+
+    /// Get the slave port that MM2S channel `ch` sends data TO.
+    ///
+    /// For compute tiles: ch0 → slave port 1, ch1 → slave port 2
+    /// For memtiles: ch0-5 → slave ports 0-5
+    /// For shim tiles: ch0 → slave port 2, ch1 → slave port 3 (South ports)
+    pub fn mm2s_slave_port(&self, ch: u8) -> u8 {
+        match self.tile_type {
+            TileType::Compute => super::stream_io::compute::mm2s_slave_port(ch),
+            TileType::MemTile => super::stream_io::memtile::mm2s_slave_port(ch),
+            TileType::Shim => {
+                // Shim MM2S typically goes to South ports for NoC access
+                // This mapping may need adjustment based on CDO configuration
+                super::stream_io::shim::slave::SOUTH_0 + ch
+            }
+        }
+    }
+
+    /// Get the master port that S2MM channel `ch` receives data FROM.
+    ///
+    /// For compute tiles: ch0 ← master port 1, ch1 ← master port 2
+    /// For memtiles: ch0-5 ← master ports 0-5
+    /// For shim tiles: ch0 ← master port 2, ch1 ← master port 3 (South ports)
+    pub fn s2mm_master_port(&self, ch: u8) -> u8 {
+        match self.tile_type {
+            TileType::Compute => super::stream_io::compute::s2mm_master_port(ch),
+            TileType::MemTile => super::stream_io::memtile::s2mm_master_port(ch),
+            TileType::Shim => {
+                // Shim S2MM typically receives from South ports
+                super::stream_io::shim::master::SOUTH_0 + ch
+            }
+        }
+    }
+
+    /// Get the number of S2MM channels for this tile type.
+    pub fn s2mm_channel_count(&self) -> usize {
+        match self.tile_type {
+            TileType::Compute | TileType::Shim => COMPUTE_S2MM_CHANNELS,
+            TileType::MemTile => MEM_TILE_S2MM_CHANNELS,
+        }
+    }
+
+    /// Get the number of MM2S channels for this tile type.
+    pub fn mm2s_channel_count(&self) -> usize {
+        match self.tile_type {
+            TileType::Compute | TileType::Shim => COMPUTE_MM2S_CHANNELS,
+            TileType::MemTile => MEM_TILE_MM2S_CHANNELS,
+        }
+    }
+
+    /// Convert a StreamWord to StreamData for a given channel.
+    ///
+    /// This bridges the stream_io module's `StreamWord` (used by stream switches)
+    /// with the engine's `StreamData` (which tracks channel ownership).
+    pub fn stream_word_to_data(word: super::stream_io::StreamWord, channel: u8) -> StreamData {
+        StreamData {
+            data: word.data,
+            tlast: word.tlast,
+            channel,
+        }
+    }
+
+    /// Convert a StreamData to StreamWord.
+    ///
+    /// Drops the channel information (stream switches don't track channel).
+    /// Parity is computed from the data.
+    pub fn stream_data_to_word(data: &StreamData) -> super::stream_io::StreamWord {
+        super::stream_io::StreamWord {
+            data: data.data,
+            tlast: data.tlast,
+            parity: super::stream_io::StreamWord::compute_parity(data.data),
+        }
+    }
+
+    /// Pop stream output as StreamWord (for stream switch integration).
+    ///
+    /// Returns the word and the channel it came from.
+    pub fn pop_stream_out_as_word(&mut self) -> Option<(super::stream_io::StreamWord, u8)> {
+        self.stream_out.pop_front().map(|data| {
+            (Self::stream_data_to_word(&data), data.channel)
+        })
+    }
+
+    /// Push stream input from StreamWord (for stream switch integration).
+    ///
+    /// Requires specifying which S2MM channel should receive this data.
+    pub fn push_stream_in_from_word(&mut self, word: super::stream_io::StreamWord, channel: u8) -> bool {
+        self.push_stream_in(Self::stream_word_to_data(word, channel))
+    }
+}
+
+// ============================================================================
+// StreamData <-> StreamWord Conversions
+// ============================================================================
+
+impl From<StreamData> for super::stream_io::StreamWord {
+    fn from(data: StreamData) -> Self {
+        Self {
+            data: data.data,
+            tlast: data.tlast,
+            parity: Self::compute_parity(data.data),
+        }
+    }
+}
+
+impl StreamData {
+    /// Create StreamData from a StreamWord with specified channel.
+    pub fn from_stream_word(word: super::stream_io::StreamWord, channel: u8) -> Self {
+        Self {
+            data: word.data,
+            tlast: word.tlast,
+            channel,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1981,6 +2108,10 @@ mod tests {
         let mut tile = make_tile();
         let mut host_mem = make_host_memory();
 
+        // Write a known pattern to tile data memory at the source address
+        let source_data: Vec<u8> = (0..32u8).collect();
+        tile.data_memory_mut()[0x100..0x100 + 32].copy_from_slice(&source_data);
+
         // Configure BD for 32 bytes using MM2S channel (reads from tile memory)
         // Channel 2 is MM2S on compute tiles
         engine.configure_bd(0, BdConfig::simple_1d(0x100, 32)).unwrap();
@@ -2004,6 +2135,10 @@ mod tests {
         let stats = engine.channel_stats(2).unwrap();
         assert_eq!(stats.transfers_completed, 1);
         assert_eq!(stats.bytes_transferred, 32);
+
+        // Verify the source data is still intact (DMA read shouldn't modify it)
+        assert_eq!(&tile.data_memory()[0x100..0x100 + 32], &source_data[..],
+            "Source data should remain intact after MM2S read");
     }
 
     #[test]
@@ -2033,13 +2168,16 @@ mod tests {
         let mut tile = make_tile();
         let mut host_mem = make_host_memory();
 
-        // Set lock to available state
+        // Set lock to available state (value=1 for acq_eq mode)
         tile.locks[5].set(1);
 
         // Configure BD with lock using MM2S channel
+        // Per AMD spec: acquire_value=1 means acq_eq (wait for lock==1, then decrement)
+        // Per AMD spec: release_value=1 means add +1 to lock after transfer
+        // release_value=0 would mean NO release per AM025
         let bd = BdConfig::simple_1d(0x100, 32)
-            .with_acquire(5, 1)
-            .with_release(5, 0);
+            .with_acquire(5, 1)   // Wait for lock==1, decrement by 1 (1->0)
+            .with_release(5, 1);  // After transfer, add +1 to lock (0->1)
         engine.configure_bd(0, bd).unwrap();
 
         // Start should trigger lock acquire on MM2S channel
@@ -2051,15 +2189,15 @@ mod tests {
         while engine.channel_active(2) {
             tile.begin_lock_cycle();  // Snapshot lock values for this cycle
             engine.step(&mut tile, &mut host_mem);
-            tile.end_lock_cycle(); // Apply accumulated deltas at end of cycle
+            tile.end_lock_cycle();    // Apply accumulated deltas at end of cycle
             cycles += 1;
             if cycles > 500 {
                 panic!("Transfer took too long: {} cycles", cycles);
             }
         }
 
-        // Verify lock was released
-        assert_eq!(tile.locks[5].value, 1); // Released back to 1
+        // Verify lock was released: started at 1, acquired (->0), released +1 (->1)
+        assert_eq!(tile.locks[5].value, 1);
     }
 
     #[test]
@@ -2068,14 +2206,24 @@ mod tests {
         let mut tile = make_tile();
         let mut host_mem = make_host_memory();
 
+        // Write a recognizable pattern to source memory
+        let source_data: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(7).wrapping_add(3)).collect();
+        let dm = tile.data_memory_mut();
+        dm[0x100..0x100 + 64].copy_from_slice(&source_data);
+
         // Use MM2S channel (channel 2) for testing
         engine.configure_bd(0, BdConfig::simple_1d(0x100, 64)).unwrap();
 
         let cycles = engine.execute_1d_transfer(2, 0, &mut tile, &mut host_mem).unwrap();
-        assert!(cycles > 0);
+        assert!(cycles > 0, "Transfer should take at least one cycle");
 
         let stats = engine.channel_stats(2).unwrap();
         assert_eq!(stats.bytes_transferred, 64);
+        assert_eq!(stats.transfers_completed, 1);
+
+        // Source data should still be intact
+        assert_eq!(&tile.data_memory()[0x100..0x100 + 64], &source_data[..],
+            "Source data should remain intact after 1D transfer");
     }
 
     #[test]
@@ -2106,6 +2254,12 @@ mod tests {
         let mut tile = make_tile();
         let mut host_mem = make_host_memory();
 
+        // Write recognizable data to source address
+        let source_data: [u8; 16] = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+                                      0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+        let dm = tile.data_memory_mut();
+        dm[0x100..0x100 + 16].copy_from_slice(&source_data);
+
         // Configure BD for 16 bytes (4 words) using MM2S channel
         // With AIE2 spec: 4 setup + 1 start + 5 mem latency + 4 data cycles = 14+ cycles
         engine.configure_bd(0, BdConfig::simple_1d(0x100, 16)).unwrap();
@@ -2128,6 +2282,11 @@ mod tests {
 
         let stats = engine.channel_stats(2).unwrap();
         assert_eq!(stats.bytes_transferred, 16);
+        assert_eq!(stats.transfers_completed, 1);
+
+        // Source data should be unchanged
+        assert_eq!(&tile.data_memory()[0x100..0x100 + 16], &source_data[..],
+            "Source data integrity after cycle-accurate transfer");
     }
 
     #[test]
@@ -2174,7 +2333,7 @@ mod tests {
         let mut engine = DmaEngine::new_compute_tile(1, 2)
             .with_lock_timing(16);
         let mut tile = make_tile();
-        let mut host_mem = make_host_memory();
+        let _host_mem = make_host_memory();
 
         // Configure simple BD (no lock requirement)
         engine.configure_bd(0, BdConfig::simple_1d(0x100, 16)).unwrap();
@@ -2338,5 +2497,102 @@ mod tests {
         let stats = engine.channel_stats(2).unwrap();
         assert_eq!(stats.bytes_transferred, 48);
         assert_eq!(stats.transfers_completed, 3);
+    }
+
+    // === Stream Port Integration Tests ===
+
+    #[test]
+    fn test_compute_tile_port_mappings() {
+        let engine = DmaEngine::new_compute_tile(1, 2);
+
+        // MM2S channels send to slave ports 1, 2
+        assert_eq!(engine.mm2s_slave_port(0), 1);
+        assert_eq!(engine.mm2s_slave_port(1), 2);
+
+        // S2MM channels receive from master ports 1, 2
+        assert_eq!(engine.s2mm_master_port(0), 1);
+        assert_eq!(engine.s2mm_master_port(1), 2);
+
+        // Channel counts
+        assert_eq!(engine.s2mm_channel_count(), 2);
+        assert_eq!(engine.mm2s_channel_count(), 2);
+    }
+
+    #[test]
+    fn test_memtile_port_mappings() {
+        let engine = DmaEngine::new_mem_tile(0, 1);
+
+        // MemTile: DMA channels map directly to ports 0-5
+        for ch in 0..6 {
+            assert_eq!(engine.mm2s_slave_port(ch), ch);
+            assert_eq!(engine.s2mm_master_port(ch), ch);
+        }
+
+        // Channel counts
+        assert_eq!(engine.s2mm_channel_count(), 6);
+        assert_eq!(engine.mm2s_channel_count(), 6);
+    }
+
+    #[test]
+    fn test_stream_data_to_word_conversion() {
+        use crate::device::dma::stream_io::StreamWord;
+
+        let data = StreamData {
+            data: 0x12345678,
+            tlast: true,
+            channel: 2,
+        };
+
+        // Convert to StreamWord
+        let word: StreamWord = data.into();
+        assert_eq!(word.data, 0x12345678);
+        assert!(word.tlast);
+        // Parity should be computed
+        assert_eq!(word.parity, StreamWord::compute_parity(0x12345678));
+    }
+
+    #[test]
+    fn test_stream_word_to_data_conversion() {
+        use crate::device::dma::stream_io::StreamWord;
+
+        let word = StreamWord {
+            data: 0xDEADBEEF,
+            tlast: false,
+            parity: true,
+        };
+
+        // Convert to StreamData with channel
+        let data = StreamData::from_stream_word(word, 3);
+        assert_eq!(data.data, 0xDEADBEEF);
+        assert!(!data.tlast);
+        assert_eq!(data.channel, 3);
+    }
+
+    #[test]
+    fn test_engine_stream_word_interface() {
+        use crate::device::dma::stream_io::StreamWord;
+
+        let mut engine = DmaEngine::new_compute_tile(1, 2);
+
+        // Push via StreamWord interface
+        let word = StreamWord::with_tlast(0xCAFEBABE);
+        assert!(engine.push_stream_in_from_word(word, 0));
+
+        // Verify it's in the buffer
+        assert!(engine.has_stream_in_for_channel(0));
+        assert_eq!(engine.stream_in_len(), 1);
+
+        // Add stream output data directly
+        engine.stream_out.push_back(StreamData {
+            data: 0x11111111,
+            tlast: false,
+            channel: 2,
+        });
+
+        // Pop as StreamWord
+        let (out_word, channel) = engine.pop_stream_out_as_word().unwrap();
+        assert_eq!(out_word.data, 0x11111111);
+        assert!(!out_word.tlast);
+        assert_eq!(channel, 2);
     }
 }

@@ -433,7 +433,30 @@ impl<'a> Iterator for CdoCommandIterator<'a> {
         self.offset += 4;
 
         let opcode = CdoOpcode::from((cmd_word & 0xFFFF) as u16);
-        let payload_len = (cmd_word >> 16) as usize;
+        let inline_len = ((cmd_word >> 16) & 0xFF) as usize;
+
+        // CDO v2 extended length: when the 8-bit inline length field is 0xFF,
+        // the actual payload length is in the next word (supports payloads > 254 words).
+        // See Xilinx CDO library: CDO_MAX_INLINE_PAYLOAD_LEN = 255 sentinel.
+        let payload_len = if inline_len == 0xFF {
+            if self.offset + 4 > self.data.len() {
+                self.offset = self.data.len();
+                return Some(CdoCommand::Unknown {
+                    opcode: (cmd_word & 0xFFFF) as u16,
+                    payload: Vec::new(),
+                });
+            }
+            let actual_len = u32::from_le_bytes([
+                self.data[self.offset],
+                self.data[self.offset + 1],
+                self.data[self.offset + 2],
+                self.data[self.offset + 3],
+            ]) as usize;
+            self.offset += 4;
+            actual_len
+        } else {
+            inline_len
+        };
 
         // Read payload words
         let payload_bytes = payload_len * 4;
@@ -487,28 +510,25 @@ impl<'a> Iterator for CdoCommandIterator<'a> {
             },
 
             CdoOpcode::DmaWrite if payload_len >= 2 => {
-                let address = payload[0];
-
-                // Handle embedded format (addr=0 means target is in payload[1])
-                if address == 0 && payload_len >= 2 {
-                    // Embedded format: [0, target_addr, data...]
-                    // No separate byte_len - data length is (payload_len - 2) * 4
-                    let target_addr = payload[1];
-                    let data: Vec<u8> = payload[2..]
-                        .iter()
-                        .flat_map(|w| w.to_le_bytes())
-                        .collect();
-                    CdoCommand::DmaWrite { address: target_addr, data }
+                // CDO v2 DmaWrite format: [addr_hi, addr_lo, data...]
+                // addr_hi:addr_lo form a 64-bit destination address.
+                // Data length is (payload_len - 2) * 4 bytes.
+                // For AIE tiles, addr_hi is always 0 and addr_lo is the tile address.
+                let addr_hi = payload[0];
+                let addr_lo = payload[1];
+                let address = if addr_hi == 0 {
+                    addr_lo
                 } else {
-                    // Standard format: [addr, byte_len, data...]
-                    let byte_len = payload[1] as usize;
-                    let data: Vec<u8> = payload[2..]
-                        .iter()
-                        .flat_map(|w| w.to_le_bytes())
-                        .take(byte_len)
-                        .collect();
-                    CdoCommand::DmaWrite { address, data }
-                }
+                    // 64-bit address; use lower 32 bits (AIE addresses are 32-bit)
+                    log::warn!("CDO DmaWrite with 64-bit addr: 0x{:08X}_{:08X}, using low 32 bits",
+                        addr_hi, addr_lo);
+                    addr_lo
+                };
+                let data: Vec<u8> = payload[2..]
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect();
+                CdoCommand::DmaWrite { address, data }
             }
 
             CdoOpcode::MaskPoll if payload_len >= 3 => CdoCommand::MaskPoll {
@@ -679,25 +699,84 @@ mod tests {
 
     #[test]
     fn test_parse_cdo_with_dma_write() {
-        let mut data = vec![0u8; 48];
+        let mut data = vec![0u8; 44];
         // Header
         data[0..4].copy_from_slice(&4u32.to_le_bytes());
         data[4..8].copy_from_slice(&CDO_MAGIC_CDO.to_le_bytes());
         data[8..12].copy_from_slice(&0x0200u32.to_le_bytes());
-        data[12..16].copy_from_slice(&7u32.to_le_bytes()); // 7 words: 1 cmd + 2 header + 4 data
-        let checksum = !(4 + CDO_MAGIC_CDO + 0x0200 + 7);
+        data[12..16].copy_from_slice(&6u32.to_le_bytes()); // 6 words: 1 cmd + 2 addr + 2 data + 1 nop
+        let checksum = !(4 + CDO_MAGIC_CDO + 0x0200 + 6);
         data[16..20].copy_from_slice(&checksum.to_le_bytes());
 
-        // DMA_WRITE command: opcode=0x105, payload_len=6 (addr, len, 4 data words)
-        let cmd_word: u32 = 0x0006_0105;
+        // DMA_WRITE command: opcode=0x105, payload_len=4 (addr_hi, addr_lo, 2 data words)
+        // CDO v2 format: [addr_hi, addr_lo, data...]
+        let cmd_word: u32 = 0x0004_0105;
         data[20..24].copy_from_slice(&cmd_word.to_le_bytes());
-        data[24..28].copy_from_slice(&0x0002_0000u32.to_le_bytes()); // address (tile 0,2)
-        data[28..32].copy_from_slice(&8u32.to_le_bytes());           // byte length
+        data[24..28].copy_from_slice(&0u32.to_le_bytes());           // addr_hi = 0
+        data[28..32].copy_from_slice(&0x0022_0000u32.to_le_bytes()); // addr_lo = tile(0,2) program mem
         data[32..36].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());  // data word 0
         data[36..40].copy_from_slice(&0xCAFEBABEu32.to_le_bytes());  // data word 1
-        // Padding words
-        data[40..44].copy_from_slice(&0u32.to_le_bytes());
-        data[44..48].copy_from_slice(&0u32.to_le_bytes());
+
+        // NOP to fill out the 6 words
+        data[40..44].copy_from_slice(&0x0000_0111u32.to_le_bytes());
+
+        let cdo = Cdo::parse(&data).unwrap();
+        let commands: Vec<_> = cdo.commands().collect();
+        assert_eq!(commands.len(), 2);
+
+        match &commands[0] {
+            CdoCommand::DmaWrite { address, data } => {
+                assert_eq!(*address, 0x0022_0000);
+                assert_eq!(data.len(), 8);
+                assert_eq!(data[0..4], [0xEF, 0xBE, 0xAD, 0xDE]); // little-endian
+                assert_eq!(data[4..8], [0xBE, 0xBA, 0xFE, 0xCA]);
+            }
+            _ => panic!("Expected DmaWrite command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_cdo_extended_length() {
+        // Test CDO extended length: when inline payload_len == 0xFF,
+        // the actual length is in the next word.
+        // Build a DmaWrite with 260 payload words (> 254, triggers extended format).
+        let payload_words = 260usize; // addr_hi + addr_lo + 258 data words
+        let cdo_len = 1 + 1 + payload_words; // cmd_word + extended_len_word + payload
+        let total_bytes = CDO_HEADER_SIZE + cdo_len * 4;
+        let mut data = vec![0u8; total_bytes];
+
+        // Header
+        data[0..4].copy_from_slice(&4u32.to_le_bytes());
+        data[4..8].copy_from_slice(&CDO_MAGIC_CDO.to_le_bytes());
+        data[8..12].copy_from_slice(&0x0200u32.to_le_bytes());
+        data[12..16].copy_from_slice(&(cdo_len as u32).to_le_bytes());
+        let checksum = !(4u32.wrapping_add(CDO_MAGIC_CDO).wrapping_add(0x0200).wrapping_add(cdo_len as u32));
+        data[16..20].copy_from_slice(&checksum.to_le_bytes());
+
+        let mut off = CDO_HEADER_SIZE;
+
+        // DMA_WRITE with extended length: inline_len=0xFF sentinel
+        let cmd_word: u32 = 0x00FF_0105;
+        data[off..off + 4].copy_from_slice(&cmd_word.to_le_bytes());
+        off += 4;
+
+        // Extended length word: actual payload = 260 words
+        data[off..off + 4].copy_from_slice(&(payload_words as u32).to_le_bytes());
+        off += 4;
+
+        // payload[0] = addr_hi = 0
+        data[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
+        off += 4;
+
+        // payload[1] = addr_lo = tile(0,2) program memory
+        data[off..off + 4].copy_from_slice(&0x0022_0000u32.to_le_bytes());
+        off += 4;
+
+        // payload[2..260] = data (258 words of pattern)
+        for i in 0..258u32 {
+            data[off..off + 4].copy_from_slice(&i.to_le_bytes());
+            off += 4;
+        }
 
         let cdo = Cdo::parse(&data).unwrap();
         let commands: Vec<_> = cdo.commands().collect();
@@ -705,10 +784,13 @@ mod tests {
 
         match &commands[0] {
             CdoCommand::DmaWrite { address, data } => {
-                assert_eq!(*address, 0x0002_0000);
-                assert_eq!(data.len(), 8);
-                assert_eq!(data[0..4], [0xEF, 0xBE, 0xAD, 0xDE]); // little-endian
-                assert_eq!(data[4..8], [0xBE, 0xBA, 0xFE, 0xCA]);
+                assert_eq!(*address, 0x0022_0000);
+                // 258 data words * 4 bytes = 1032 bytes
+                assert_eq!(data.len(), 258 * 4);
+                // First data word should be 0
+                assert_eq!(data[0..4], 0u32.to_le_bytes());
+                // Second data word should be 1
+                assert_eq!(data[4..8], 1u32.to_le_bytes());
             }
             _ => panic!("Expected DmaWrite command"),
         }

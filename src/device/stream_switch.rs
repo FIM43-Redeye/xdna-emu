@@ -439,8 +439,8 @@ impl StreamSwitch {
             let slave_has_data = self.slaves[slave_idx].has_data();
             let master_can_accept = self.masters[master_idx].can_accept();
 
-            // Debug: trace specific MemTile routes
-            if self.row == 1 && (slave_idx == 11 || slave_idx == 13) {
+            // Debug: trace all routes for tiles with local routes
+            if slave_has_data || self.row >= 1 {
                 let fifo_len = self.slaves[slave_idx].fifo.len();
                 log::trace!("TileSwitch({},{}): route slave[{}]->master[{}] has_data={} fifo_len={} can_accept={}",
                     self.col, self.row, slave_idx, master_idx, slave_has_data, fifo_len, master_can_accept);

@@ -10,15 +10,18 @@
 //! # Usage
 //!
 //! ```bash
-//! # Run a specific manifest
+//! # Run a specific manifest (uses MLIR_AIE_PATH env var or ../mlir-aie default)
+//! cargo run --release --example manifest_test -- \
+//!     tests/mlir-aie-extracted/manifests/add_one_using_dma.toml
+//!
+//! # Or specify mlir-aie path explicitly
 //! cargo run --release --example manifest_test -- \
 //!     tests/mlir-aie-extracted/manifests/add_one_using_dma.toml \
-//!     --mlir-aie /home/triple/npu-work/mlir-aie
+//!     --mlir-aie ../mlir-aie
 //!
 //! # Run all extracted manifests
 //! cargo run --release --example manifest_test -- \
-//!     tests/mlir-aie-extracted/manifests/*.toml \
-//!     --mlir-aie /home/triple/npu-work/mlir-aie
+//!     tests/mlir-aie-extracted/manifests/*.toml
 //! ```
 
 use std::collections::HashMap;
@@ -49,7 +52,7 @@ fn main() {
         eprintln!();
         eprintln!("Example:");
         eprintln!("  {} tests/mlir-aie-extracted/manifests/add_one_using_dma.toml \\", args[0]);
-        eprintln!("      --mlir-aie /home/triple/npu-work/mlir-aie");
+        eprintln!("      --mlir-aie ../mlir-aie");
         std::process::exit(1);
     }
 

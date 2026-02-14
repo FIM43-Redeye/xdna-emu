@@ -10,6 +10,12 @@
 # Mock XRT build artifacts
 mock_xrt/build/
 
+# NPU runner build artifacts
+tools/npu-runner/build/
+
+# Captured NPU hardware outputs (machine-specific, regenerate with capture_npu_outputs)
+tests/npu-outputs/
+
 # Generated/extracted test files (regenerate from mlir-aie)
 tests/mlir-aie-extracted/
 
@@ -17,6 +23,8 @@ tests/mlir-aie-extracted/
 *.patch
 *.zip
 *.tar.gz
+fake.xclbin
+stdout
 
 # Documentation drafts (not ready for commit)
 CURRENT-REFACTOR.md

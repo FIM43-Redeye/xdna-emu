@@ -515,14 +515,14 @@ mod tests {
     // Integration test with real ELF file
     #[test]
     fn test_parse_real_aie_elf() {
-        let test_elf = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_objFifo/aie_arch.mlir.prj/main_core_0_2.elf";
+        use crate::config::Config;
 
-        if !std::path::Path::new(test_elf).exists() {
-            eprintln!("Skipping real ELF test: file not found");
+        let Some(test_elf) = Config::get().add_one_elf() else {
+            eprintln!("Skipping real ELF test: file not found (set MLIR_AIE_PATH)");
             return;
-        }
+        };
 
-        let data = std::fs::read(test_elf).unwrap();
+        let data = std::fs::read(&test_elf).unwrap();
         let elf = AieElf::parse(&data).unwrap();
 
         // Verify it's AIE2
@@ -562,13 +562,14 @@ mod tests {
 
     #[test]
     fn test_functions_iterator() {
-        let test_elf = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_objFifo/aie_arch.mlir.prj/main_core_0_2.elf";
+        use crate::config::Config;
 
-        if !std::path::Path::new(test_elf).exists() {
+        let Some(test_elf) = Config::get().add_one_elf() else {
+            eprintln!("Skipping test_functions_iterator: file not found (set MLIR_AIE_PATH)");
             return;
-        }
+        };
 
-        let data = std::fs::read(test_elf).unwrap();
+        let data = std::fs::read(&test_elf).unwrap();
         let elf = AieElf::parse(&data).unwrap();
 
         let funcs: Vec<_> = elf.functions().collect();

@@ -31,8 +31,8 @@ use crate::interpreter::bundle::{
 };
 use crate::interpreter::traits::{DecodeError, Decoder};
 use crate::tablegen::{
-    build_decoder_tables, load_from_llvm_aie, load_via_tblgen, DecoderIndex, InstrEncoding,
-    SemanticOp,
+    build_decoder_tables, load_from_llvm_aie, load_via_tblgen, AddressingMode, DecoderIndex,
+    InstrEncoding, InstrMemWidth, SemanticOp,
 };
 
 /// A decoded instruction from TableGen data.
@@ -111,6 +111,41 @@ impl Default for InstructionDecoder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Decode a mMvScl* composite register group value into an Operand.
+///
+/// These 7-bit fields encode multiple register types in the mv and lng VLIW slots.
+/// The discriminant is in the low 2 bits:
+///   - 0b00: scalar register, number = (raw >> 2) & 0x1F  (r0-r31)
+///   - 0b11: pointer register, index = (raw >> 4) & 0x7   (p0-p7, sp=p6)
+///   - 0b01, 0b10: modifier/special registers (DC, DJ, DN, etc.)
+fn decode_mv_scl_composite(value: u64) -> Operand {
+    match value & 0x3 {
+        0b00 => {
+            let scalar_reg = ((value >> 2) & 0x1F) as u8;
+            Operand::ScalarReg(scalar_reg)
+        }
+        0b11 => {
+            let ptr_idx = ((value >> 4) & 0x7) as u8;
+            Operand::PointerReg(ptr_idx)
+        }
+        _ => {
+            // Modifier/special registers: use bits[6:2] as index
+            let mod_reg = ((value >> 2) & 0x1F) as u8;
+            Operand::ModifierReg(mod_reg)
+        }
+    }
+}
+
+/// Sign-extend a value from `bits` width to i32.
+#[inline]
+fn sign_extend(value: i32, bits: u32) -> i32 {
+    if bits == 0 || bits >= 32 {
+        return value;
+    }
+    let shift = 32 - bits;
+    (value << shift) >> shift
 }
 
 /// Global cached decoder, loaded once on first use.
@@ -392,13 +427,35 @@ impl InstructionDecoder {
             SemanticOp::Shl => Operation::ScalarShl,
             SemanticOp::Sra => Operation::ScalarSra,
             SemanticOp::Srl => Operation::ScalarShr,
-            SemanticOp::Load => Operation::Load {
-                width: MemWidth::Word,
-                post_modify: PostModify::None,
+            SemanticOp::Load => {
+                let mn = decoded.encoding.mnemonic.to_lowercase();
+                if mn.starts_with("vlda") {
+                    Operation::VectorLoadA { post_modify: PostModify::None }
+                } else if mn.starts_with("vldb") {
+                    Operation::VectorLoadB { post_modify: PostModify::None }
+                } else {
+                    let width = match decoded.encoding.mem_width {
+                        InstrMemWidth::Byte => MemWidth::Byte,
+                        InstrMemWidth::HalfWord => MemWidth::HalfWord,
+                        InstrMemWidth::Word => MemWidth::Word,
+                        InstrMemWidth::Vector256 => MemWidth::Vector256,
+                    };
+                    Operation::Load { width, post_modify: PostModify::None }
+                }
             },
-            SemanticOp::Store => Operation::Store {
-                width: MemWidth::Word,
-                post_modify: PostModify::None,
+            SemanticOp::Store => {
+                let mn = decoded.encoding.mnemonic.to_lowercase();
+                if mn.starts_with("vst") {
+                    Operation::VectorStore { post_modify: PostModify::None }
+                } else {
+                    let width = match decoded.encoding.mem_width {
+                        InstrMemWidth::Byte => MemWidth::Byte,
+                        InstrMemWidth::HalfWord => MemWidth::HalfWord,
+                        InstrMemWidth::Word => MemWidth::Word,
+                        InstrMemWidth::Vector256 => MemWidth::Vector256,
+                    };
+                    Operation::Store { width, post_modify: PostModify::None }
+                }
             },
             SemanticOp::Br => Operation::Branch {
                 condition: BranchCondition::Always,
@@ -420,7 +477,17 @@ impl InstructionDecoder {
             SemanticOp::SetUge => Operation::ScalarGeu,
             SemanticOp::SetEq => Operation::ScalarEq,
             SemanticOp::SetNe => Operation::ScalarNe,
-            SemanticOp::Select => Operation::ScalarSel,
+            SemanticOp::Select => {
+                // Distinguish sel.eqz/sel.nez (implicit r27 test) from generic sel
+                let mn = decoded.encoding.mnemonic.to_lowercase();
+                if mn.contains("eqz") {
+                    Operation::ScalarSelEqz
+                } else if mn.contains("nez") {
+                    Operation::ScalarSelNez
+                } else {
+                    Operation::ScalarSel
+                }
+            }
 
             // Lock operations
             SemanticOp::LockAcquire => Operation::LockAcquire,
@@ -431,6 +498,7 @@ impl InstructionDecoder {
 
             // Control flow
             SemanticOp::Ret => Operation::Return,
+            SemanticOp::Done => Operation::Halt,
 
             // Not handled yet - fall through
             _ => Operation::Unknown { opcode: 0 },
@@ -483,12 +551,13 @@ impl InstructionDecoder {
 
     /// Extract operands from decoded instruction using TableGen ordering.
     ///
-    /// This method builds a field_name → Operand map, then extracts:
+    /// This method builds a field_name -> Operand map, then extracts:
     /// - Destination from `output_order` names
     /// - Sources from `input_order` names (in canonical order)
+    /// - PostModify from ag_* field extraction (if post-modify addressing)
     ///
     /// Special handling is preserved for complex field encodings (ag_*, mSclSt, etc.)
-    fn extract_operands(&self, decoded: &DecodedInstr) -> (Option<Operand>, Vec<Operand>) {
+    fn extract_operands(&self, decoded: &DecodedInstr) -> (Option<Operand>, Vec<Operand>, Option<PostModify>) {
         use std::collections::HashMap;
 
         // Build a map of field_name -> decoded Operand
@@ -496,72 +565,107 @@ impl InstructionDecoder {
         // Some fields produce multiple operands or set dest directly (special cases)
         let mut direct_dest: Option<Operand> = None;
         let mut extra_sources: Vec<Operand> = Vec::new();
-
-        if decoded.encoding.slot == "st"
-            || decoded.encoding.slot == "lda"
-            || decoded.encoding.slot == "ldb"
-        {
-            let field_info: Vec<String> = decoded
-                .encoding
-                .operand_fields
-                .iter()
-                .map(|f| format!("{}=0x{:X}", f.name, decoded.operand(&f.name).unwrap_or(0)))
-                .collect();
-            log::debug!(
-                "[DECODE {}] mnemonic={} fields={:?} input_order={:?} output_order={:?}",
-                decoded.encoding.slot.to_uppercase(),
-                decoded.encoding.mnemonic,
-                field_info,
-                decoded.encoding.input_order,
-                decoded.encoding.output_order
-            );
-        }
+        // PostModify extracted from ag_* fields when addressing mode is post-modify
+        let mut extracted_post_modify: Option<PostModify> = None;
 
         for field in &decoded.encoding.operand_fields {
             let value = decoded.operand(&field.name).unwrap_or(0);
-            log::debug!("[FIELD] Processing field='{}' value=0x{:X}", field.name, value);
 
-            // Special handling for address generator fields (ag_all, ag_idx, agb_sa, etc.)
-            // These produce Memory operands or multiple operands - handled specially
+            // Special handling for address generator fields (ag_all, ag_nospill, agb_sa, etc.)
+            // Uses AddressingMode from the instruction name for reliable extraction.
             if field.name.starts_with("ag") {
-                let mode = (value & 0xF) as u8;
+                let addr_mode = decoded.encoding.addressing_mode;
+                let is_ag_all = field.width >= 13;
                 let mnemonic = decoded.encoding.mnemonic.to_lowercase();
 
-                let (ptr_reg, offset_or_mod) = match mode {
-                    0b1010 => {
-                        let ag_ptr_imm = value >> 4;
-                        let ptr = ((ag_ptr_imm >> 6) & 0x7) as u8;
-                        let imm_words = (ag_ptr_imm & 0x3F) as i32;
-                        let imm_bytes = imm_words * 4;
-                        log::trace!("[DECODE ag_all] mode=0b1010 ptr=p{} imm={}w -> {}b", ptr, imm_words, imm_bytes);
-                        (ptr, Operand::Immediate(imm_bytes))
+                match addr_mode {
+                    AddressingMode::IndexedImmediate => {
+                        // Indexed: address = ptr + imm (scaled)
+                        let (mode_bits, imm_bits) = if is_ag_all { (4, 6) } else { (3, 3) };
+                        let data = value >> mode_bits;
+                        let ptr = ((data >> imm_bits) & 0x7) as u8;
+                        let imm_raw = (data & ((1 << imm_bits) - 1)) as i32;
+                        let imm_bytes = if is_ag_all { imm_raw * 4 } else { imm_raw };
+                        if mnemonic.starts_with("padd") {
+                            direct_dest = Some(Operand::PointerReg(ptr));
+                            extra_sources.push(Operand::Immediate(imm_bytes));
+                        } else {
+                            extra_sources.push(Operand::Memory { base: ptr, offset: imm_bytes as i16 });
+                        }
                     }
-                    0b0110 => {
-                        let ag_ptr_imm = value >> 3;
-                        let ptr = ((ag_ptr_imm >> 7) & 0x7) as u8;
-                        let imm = (ag_ptr_imm & 0x7F) as i32;
-                        (ptr, Operand::Immediate(imm))
+                    AddressingMode::PostModifyImmediate => {
+                        // Post-modify: address = ptr; ptr += imm (signed, scaled)
+                        let (mode_bits, imm_bits) = if is_ag_all { (3, 7) } else { (2, 4) };
+                        let data = value >> mode_bits;
+                        let ptr = ((data >> imm_bits) & 0x7) as u8;
+                        let imm_raw = sign_extend(
+                            (data & ((1 << imm_bits) - 1)) as i32, imm_bits as u32
+                        );
+                        let imm_bytes = if is_ag_all { imm_raw * 4 } else { imm_raw };
+                        // Post-modify: read from ptr (no pre-offset), then advance
+                        extra_sources.push(Operand::PointerReg(ptr));
+                        extracted_post_modify = Some(PostModify::Immediate(imm_bytes as i16));
                     }
-                    0b0010 => {
-                        let ptr = ((value >> 10) & 0x7) as u8;
+                    AddressingMode::IndexedRegister => {
+                        // Indexed with modifier register: address = ptr + mN
+                        let ptr = ((value >> (field.width as u64 - 3)) & 0x7) as u8;
                         let mod_reg = ((value >> 3) & 0x7) as u8;
-                        (ptr, Operand::ModifierReg(mod_reg))
+                        if mnemonic.starts_with("padd") {
+                            direct_dest = Some(Operand::PointerReg(ptr));
+                            extra_sources.push(Operand::ModifierReg(mod_reg));
+                        } else {
+                            extra_sources.push(Operand::PointerReg(ptr));
+                            extra_sources.push(Operand::ModifierReg(mod_reg));
+                        }
                     }
-                    _ => {
-                        let ptr = (value & 0x7) as u8;
-                        let mod_reg = ((value >> 3) & 0x1F) as u8;
-                        (ptr, Operand::ModifierReg(mod_reg))
+                    AddressingMode::PostModifyRegister => {
+                        // Post-modify with modifier register: read from ptr, ptr += mN
+                        let ptr = ((value >> (field.width as u64 - 3)) & 0x7) as u8;
+                        let mod_reg = ((value >> 3) & 0x7) as u8;
+                        extra_sources.push(Operand::PointerReg(ptr));
+                        extracted_post_modify = Some(PostModify::Register(mod_reg));
                     }
-                };
+                    AddressingMode::Unknown => {
+                        // Fallback for padd and other instructions that use ag_* fields
+                        // without a clear addressing mode in their instruction name.
+                        // Use the old mode-bit heuristic.
+                        let mode = (value & 0xF) as u8;
+                        let (ptr_reg, offset_or_mod) = match mode {
+                            0b1010 => {
+                                let ag_ptr_imm = value >> 4;
+                                let ptr = ((ag_ptr_imm >> 6) & 0x7) as u8;
+                                let imm_words = (ag_ptr_imm & 0x3F) as i32;
+                                let imm_bytes = imm_words * 4;
+                                (ptr, Operand::Immediate(imm_bytes))
+                            }
+                            0b0110 => {
+                                let ag_ptr_imm = value >> 3;
+                                let ptr = ((ag_ptr_imm >> 7) & 0x7) as u8;
+                                let imm = (ag_ptr_imm & 0x7F) as i32;
+                                (ptr, Operand::Immediate(imm))
+                            }
+                            0b0010 => {
+                                let ptr = ((value >> 10) & 0x7) as u8;
+                                let mod_reg = ((value >> 3) & 0x7) as u8;
+                                (ptr, Operand::ModifierReg(mod_reg))
+                            }
+                            _ => {
+                                let ptr = (value & 0x7) as u8;
+                                let mod_reg = ((value >> 3) & 0x1F) as u8;
+                                (ptr, Operand::ModifierReg(mod_reg))
+                            }
+                        };
 
-                if mnemonic.starts_with("padd") {
-                    direct_dest = Some(Operand::PointerReg(ptr_reg));
-                    extra_sources.push(offset_or_mod);
-                } else if let Operand::Immediate(imm) = offset_or_mod {
-                    extra_sources.push(Operand::Memory { base: ptr_reg, offset: imm as i16 });
-                } else {
-                    extra_sources.push(Operand::PointerReg(ptr_reg));
-                    extra_sources.push(offset_or_mod);
+                        if mnemonic.starts_with("padd") {
+                            direct_dest = Some(Operand::PointerReg(ptr_reg));
+                            extra_sources.push(offset_or_mod);
+                        } else if let Operand::Immediate(imm) = offset_or_mod {
+                            extra_sources.push(Operand::Memory { base: ptr_reg, offset: imm as i16 });
+                        } else {
+                            extra_sources.push(Operand::PointerReg(ptr_reg));
+                            extra_sources.push(offset_or_mod);
+                        }
+                    }
                 }
                 continue;
             }
@@ -580,7 +684,6 @@ impl InstructionDecoder {
                 || field.name == "mLdaScl"
                 || field.name == "mLdbScl"
             {
-                log::debug!("[DECODE mLdaScl] HANDLER ENTERED field={} value=0x{:X} ({})", field.name, value, value);
                 let operand = if value % 4 == 0 {
                     let scl_reg = (value / 4) as u8;
                     log::trace!("[DECODE mLdaScl] raw=0x{:X} -> r{}", value, scl_reg);
@@ -628,21 +731,18 @@ impl InstructionDecoder {
                 continue;
             }
 
-            // Special handling for movxm destination register (mMvSclDstCg)
-            if field.name == "mMvSclDstCg" {
-                log::trace!("[DECODE mMvSclDstCg] raw=0x{:X} ({})", value, value);
-                let operand = if (0x40..0x60).contains(&value) {
-                    let ptr_reg = ((value - 0x40) >> 2) as u8;
-                    log::trace!("[DECODE mMvSclDstCg] -> p{}", ptr_reg);
-                    Operand::PointerReg(ptr_reg)
-                } else if value < 0x80 {
-                    let scalar_reg = ((value >> 2) & 0x1F) as u8;
-                    log::trace!("[DECODE mMvSclDstCg] -> r{}", scalar_reg);
-                    Operand::ScalarReg(scalar_reg)
-                } else {
-                    log::trace!("[DECODE mMvSclDstCg] -> special reg 0x{:X}", value);
-                    Operand::ScalarReg((value & 0x1F) as u8)
-                };
+            // Special handling for mMvScl* composite register groups.
+            // These encode scalar, pointer, and modifier registers in the mv/lng slots.
+            // Encoding discriminant is bits[1:0]:
+            //   0b00 -> scalar register, number = (raw >> 2) & 0x1F
+            //   0b11 -> pointer register, index = (raw >> 4) & 0x7
+            //   0b01, 0b10 -> modifier/special registers
+            if field.name == "mMvSclDstCg"
+                || field.name == "mMvSclDst"
+                || field.name == "mMvSclSrc"
+            {
+                let operand = decode_mv_scl_composite(value);
+                log::trace!("[DECODE {}] raw=0x{:X} -> {:?}", field.name, value, operand);
                 field_operands.insert(field.name.clone(), operand);
                 continue;
             }
@@ -662,16 +762,13 @@ impl InstructionDecoder {
             if field.name == "id" {
                 let mnemonic = decoded.encoding.mnemonic.to_lowercase();
                 if mnemonic.starts_with("acq") || mnemonic.starts_with("rel") {
-                    log::debug!("[LOCK] mnemonic={} id field: value=0x{:X} ({})",
-                                mnemonic, value, value);
-                    field_operands.insert(field.name.clone(), Operand::Lock(value as u8));
+                        field_operands.insert(field.name.clone(), Operand::Lock(value as u8));
                     continue;
                 }
             }
 
             // Special handling for mLockId field
             if field.name == "mLockId" {
-                log::debug!("[LOCK] mLockId field: value=0x{:X} ({})", value, value);
                 field_operands.insert(field.name.clone(), Operand::Lock(value as u8));
                 continue;
             }
@@ -695,10 +792,6 @@ impl InstructionDecoder {
         let is_vector_instr = mnemonic.starts_with('v') || mnemonic.starts_with('V');
 
         if is_vector_instr {
-            log::debug!(
-                "[DECODE VECTOR CONVERT] mnemonic={} converting ScalarReg->VectorReg dest={:?} sources={:?}",
-                mnemonic, dest, sources
-            );
             let dest = dest.map(|op| match op {
                 Operand::ScalarReg(r) => Operand::VectorReg(r),
                 other => other,
@@ -710,13 +803,9 @@ impl InstructionDecoder {
                     other => other,
                 })
                 .collect();
-            log::debug!(
-                "[DECODE VECTOR CONVERT] AFTER: dest={:?} sources={:?}",
-                dest, sources
-            );
-            (dest, sources)
+            (dest, sources, extracted_post_modify)
         } else {
-            (dest, sources)
+            (dest, sources, extracted_post_modify)
         }
     }
 
@@ -825,13 +914,6 @@ impl InstructionDecoder {
         // Append extra sources from special handling (ag_*, etc.)
         sources.extend(extra_sources);
 
-        log::debug!(
-            "[DECODE ORDERED] mnemonic={} dest={:?} sources={:?}",
-            decoded.encoding.mnemonic,
-            dest,
-            sources
-        );
-
         (dest, sources)
     }
 
@@ -859,6 +941,7 @@ impl InstructionDecoder {
             || name.contains("mLdaCg")
             || name.contains("mLdbCg")
             || name.contains("mMvSclDstCg")
+            || name == "mMvSclDst"
     }
 
     /// Build a SlotOp with TableGen-derived information.
@@ -978,51 +1061,37 @@ impl Decoder for InstructionDecoder {
                 if slot.slot_type == SlotType::Nop || slot.bits == 0 {
                     bundle.set_slot(SlotOp::nop(slot_index));
                 } else if let Some(decoded) = self.decode_slot_bits(slot.bits, slot.slot_type) {
-                    // Debug: log lng slot decoding
-                    if slot.slot_type == SlotType::Lng {
-                        log::debug!("[LNG DECODE] bits=0x{:010X} mnemonic={} fields={:?}",
-                            slot.bits, decoded.encoding.mnemonic,
-                            decoded.operands.keys().collect::<Vec<_>>());
-                    }
-                    let operation = self.to_operation(&decoded);
-                    let (dest, sources) = if decoded.encoding.mnemonic == "movxm" {
+                    let mut operation = self.to_operation(&decoded);
+                    let (dest, sources, extracted_pm) = if decoded.encoding.mnemonic == "movxm" {
                         // Special handling for movxm: immediate is SPLIT in the lng slot
                         // TableGen layout: lng = {i{31-12}, mMvSclDstCg, i{11-0}, 0b001}
-                        // - bits 2:0 = opcode (0b001)
-                        // - bits 14:3 = i{11:0} (low 12 bits of immediate)
-                        // - bits 21:15 = mMvSclDstCg (7-bit destination)
-                        // - bits 41:22 = i{31:12} (high 20 bits of immediate)
                         let i_low = ((slot.bits >> 3) & 0xFFF) as u32;
                         let dst_raw = ((slot.bits >> 15) & 0x7F) as u8;
                         let i_high = ((slot.bits >> 22) & 0xFFFFF) as u32;
                         let full_imm = (i_high << 12) | i_low;
 
-                        // Destination encoding: bits 5:4 = pointer register index
-                        // Pattern: 0x03=p0, 0x13=p1, 0x23=p2, 0x33=p3
-                        let ptr_idx = (dst_raw >> 4) & 0x3;
+                        // Decode destination from mMvSclDstCg composite register encoding
+                        let dest_operand = if dst_raw & 0x3 == 0x3 {
+                            Operand::PointerReg((dst_raw >> 4) & 0x7)
+                        } else {
+                            Operand::ScalarReg((dst_raw >> 2) & 0x1F)
+                        };
 
-                        log::debug!("[MOVXM] bits=0x{:010X} i_low=0x{:03X} i_high=0x{:05X} full=0x{:08X} dst_raw=0x{:02X} -> p{}",
-                            slot.bits, i_low, i_high, full_imm, dst_raw, ptr_idx);
-
-                        (Some(Operand::PointerReg(ptr_idx)), vec![Operand::Immediate(full_imm as i32)])
+                        (Some(dest_operand), vec![Operand::Immediate(full_imm as i32)], None)
                     } else {
                         self.extract_operands(&decoded)
                     };
 
-                    // Debug: log st slot bits and field positions
-                    if slot.slot_type == SlotType::St {
-                        let field_details: Vec<String> = decoded.encoding.operand_fields.iter()
-                            .map(|f| format!("{}@bit{}:w{}", f.name, f.bit_position, f.width))
-                            .collect();
-                        log::debug!("[ST SLOT] bits=0x{:05X} fields={:?}", slot.bits, field_details);
-                    }
-
-                    #[cfg(test)]
-                    if slot.slot_type == SlotType::Alu || slot.slot_type == SlotType::Mv {
-                        eprintln!(
-                            "[DECODE {:?}] mnemonic={} op={:?} bits=0x{:X}",
-                            slot.slot_type, decoded.encoding.mnemonic, operation, slot.bits
-                        );
+                    // Patch PostModify from ag_* extraction into the Operation
+                    if let Some(pm) = extracted_pm {
+                        match &mut operation {
+                            Operation::Load { post_modify, .. } => *post_modify = pm,
+                            Operation::Store { post_modify, .. } => *post_modify = pm,
+                            Operation::VectorLoadA { post_modify } => *post_modify = pm,
+                            Operation::VectorLoadB { post_modify } => *post_modify = pm,
+                            Operation::VectorStore { post_modify } => *post_modify = pm,
+                            _ => {}
+                        }
                     }
 
                     // Build SlotOp with TableGen info (reorders sources, adds semantic/implicit)
@@ -1044,7 +1113,6 @@ impl Decoder for InstructionDecoder {
                         0b100 => {
                             // JL - Jump and Link (saves return address to LR, jumps to cpmaddr)
                             let cpmaddr = ((slot.bits >> 17) & 0xFFFFF) as u32;
-                            log::debug!("[LNG JL] bits=0x{:010X} cpmaddr=0x{:05X}", slot.bits, cpmaddr);
 
                             bundle.set_slot(
                                 SlotOp::new(SlotIndex::Control, Operation::Call)
@@ -1054,7 +1122,6 @@ impl Decoder for InstructionDecoder {
                         0b010 => {
                             // J - Unconditional Jump
                             let cpmaddr = ((slot.bits >> 17) & 0xFFFFF) as u32;
-                            log::debug!("[LNG J] bits=0x{:010X} cpmaddr=0x{:05X}", slot.bits, cpmaddr);
 
                             bundle.set_slot(
                                 SlotOp::new(
@@ -1065,7 +1132,7 @@ impl Decoder for InstructionDecoder {
                         }
                         _ => {
                             // Other LNG opcodes - mark as unknown
-                            log::debug!("[LNG DECODE FAIL] bits=0x{:010X} opcode=0b{:03b} - not recognized",
+                            log::trace!("[LNG DECODE FAIL] bits=0x{:010X} opcode=0b{:03b} - not recognized",
                                 slot.bits, opcode);
                             bundle.set_slot(
                                 SlotOp::new(SlotIndex::Control, Operation::Unknown { opcode: slot.bits as u32 })
@@ -1074,15 +1141,8 @@ impl Decoder for InstructionDecoder {
                     }
                 } else {
                     // Slot extracted but not recognized - mark as unknown with slot info
-                    log::debug!("[{:?} DECODE FAIL] bits=0x{:010X} - no matching encoding",
+                    log::trace!("[{:?} DECODE FAIL] bits=0x{:010X} - no matching encoding",
                         slot.slot_type, slot.bits);
-                    #[cfg(test)]
-                    if slot.slot_type == SlotType::Alu || slot.slot_type == SlotType::Mv {
-                        eprintln!(
-                            "[DECODE {:?} FAIL] bits=0x{:X} - no matching encoding",
-                            slot.slot_type, slot.bits
-                        );
-                    }
                     let slot_name = match slot.slot_type {
                         SlotType::Lda => "lda",
                         SlotType::Ldb => "ldb",
@@ -1115,9 +1175,21 @@ impl Decoder for InstructionDecoder {
             if word0 == 0 || word0 == 0x15010040 {
                 bundle.set_slot(SlotOp::nop(SlotIndex::Scalar0));
             } else if let Some(decoded) = self.decode_word(word0 as u64) {
-                let operation = self.to_operation(&decoded);
+                let mut operation = self.to_operation(&decoded);
                 let slot_index = self.slot_to_index(&decoded.encoding.slot);
-                let (dest, sources) = self.extract_operands(&decoded);
+                let (dest, sources, extracted_pm) = self.extract_operands(&decoded);
+
+                // Patch PostModify from ag_* extraction into the Operation
+                if let Some(pm) = extracted_pm {
+                    match &mut operation {
+                        Operation::Load { post_modify, .. } => *post_modify = pm,
+                        Operation::Store { post_modify, .. } => *post_modify = pm,
+                        Operation::VectorLoadA { post_modify } => *post_modify = pm,
+                        Operation::VectorLoadB { post_modify } => *post_modify = pm,
+                        Operation::VectorStore { post_modify } => *post_modify = pm,
+                        _ => {}
+                    }
+                }
 
                 // Build SlotOp with TableGen info
                 let slot_op = self.build_slot_op(slot_index, operation, &decoded, dest, sources);
@@ -1176,6 +1248,7 @@ mod tests {
     use std::path::Path;
 
     fn make_add_encoding() -> InstrEncoding {
+        use crate::tablegen::{AddressingMode, InstrMemWidth};
         InstrEncoding {
             name: "ADD".to_string(),
             mnemonic: "add".to_string(),
@@ -1194,6 +1267,8 @@ mod tests {
             input_order: vec!["mRx0".to_string(), "mRy".to_string()],
             output_order: vec!["mRx".to_string()],
             implicit_regs: vec![],
+            addressing_mode: AddressingMode::Unknown,
+            mem_width: InstrMemWidth::Word,
         }
     }
 
@@ -1274,6 +1349,8 @@ mod tests {
             input_order: vec![],
             output_order: vec![],
             implicit_regs: vec![],
+            addressing_mode: crate::tablegen::AddressingMode::Unknown,
+            mem_width: crate::tablegen::InstrMemWidth::Word,
         };
 
         let more_specific = make_add_encoding(); // 5 fixed bits
@@ -1331,27 +1408,28 @@ mod tests {
 
     #[test]
     fn test_decode_real_elf_instructions() {
+        use crate::config::Config;
         use crate::parser::AieElf;
+        use std::path::PathBuf;
 
-        let elf_path = Path::new("/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_objFifo/aie_arch.mlir.prj/main_core_0_2.elf");
-        if !elf_path.exists() {
-            eprintln!("Skipping test: ELF not found");
+        let Some(elf_path) = Config::get().add_one_elf() else {
+            eprintln!("Skipping test: ELF not found (set MLIR_AIE_PATH)");
             return;
-        }
+        };
 
-        let llvm_aie_path = Path::new("../llvm-aie");
+        let llvm_aie_path = PathBuf::from(Config::get().llvm_aie_path());
         if !llvm_aie_path.exists() {
-            eprintln!("Skipping test: llvm-aie not found");
+            eprintln!("Skipping test: llvm-aie not found (set LLVM_AIE_PATH)");
             return;
         }
 
         // Load TableGen data and create decoder
-        let data = load_from_llvm_aie(llvm_aie_path).expect("Failed to load llvm-aie");
+        let data = load_from_llvm_aie(&llvm_aie_path).expect("Failed to load llvm-aie");
         let tables = build_decoder_tables(&data);
         let decoder = InstructionDecoder::from_tables(tables);
 
         // Read ELF using proper parser
-        let elf_data = std::fs::read(elf_path).expect("Failed to read ELF");
+        let elf_data = std::fs::read(&elf_path).expect("Failed to read ELF");
         let elf = AieElf::parse(&elf_data).expect("Failed to parse ELF");
 
         eprintln!("ELF Architecture: {:?}", elf.architecture());

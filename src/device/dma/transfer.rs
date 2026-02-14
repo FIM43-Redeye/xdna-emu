@@ -635,7 +635,7 @@ pub fn parse_stream_id_from_header(header: u32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::addressing::DimensionConfig;
+
 
     fn simple_bd() -> BdConfig {
         BdConfig {

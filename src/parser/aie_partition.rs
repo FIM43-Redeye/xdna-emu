@@ -318,16 +318,15 @@ mod tests {
     // Integration test with real XCLBIN file
     #[test]
     fn test_parse_real_aie_partition() {
+        use crate::config::Config;
         use crate::parser::xclbin::{SectionKind, Xclbin};
 
-        let test_xclbin = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_objFifo/aie.xclbin";
-
-        if !std::path::Path::new(test_xclbin).exists() {
-            eprintln!("Skipping real AIE partition test: file not found");
+        let Some(test_xclbin) = Config::get().add_one_xclbin() else {
+            eprintln!("Skipping real AIE partition test: file not found (set MLIR_AIE_PATH)");
             return;
-        }
+        };
 
-        let xclbin = Xclbin::from_file(test_xclbin).unwrap();
+        let xclbin = Xclbin::from_file(&test_xclbin).unwrap();
         let section = xclbin.find_section(SectionKind::AiePartition)
             .expect("XCLBIN should have AIE_PARTITION section");
 
@@ -349,16 +348,16 @@ mod tests {
 
     #[test]
     fn test_parse_pdi_and_find_cdo() {
+        use crate::config::Config;
         use crate::parser::cdo::find_cdo_offset;
         use crate::parser::xclbin::{SectionKind, Xclbin};
 
-        let test_xclbin = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_objFifo/aie.xclbin";
-
-        if !std::path::Path::new(test_xclbin).exists() {
+        let Some(test_xclbin) = Config::get().add_one_xclbin() else {
+            eprintln!("Skipping test_parse_pdi_and_find_cdo: file not found (set MLIR_AIE_PATH)");
             return;
-        }
+        };
 
-        let xclbin = Xclbin::from_file(test_xclbin).unwrap();
+        let xclbin = Xclbin::from_file(&test_xclbin).unwrap();
         let section = xclbin.find_section(SectionKind::AiePartition).unwrap();
         let partition = AiePartition::parse(section.data()).unwrap();
 

@@ -119,6 +119,26 @@ impl DeviceState {
                 self.mask_write_register(*address, *mask, *value)?;
             }
 
+            // Write64/MaskWrite64 use 64-bit addresses but AIE tiles are 32-bit addressed.
+            // The high 32 bits are always 0 for AIE, so we use the low 32 bits.
+            CdoCommand::Write64 { address, value } => {
+                self.stats.writes += 1;
+                let addr32 = *address as u32;
+                let tile_addr = TileAddress::decode(addr32);
+                log::trace!("CDO Write64: addr=0x{:016X} -> tile({},{}) offset=0x{:05X} value=0x{:08X}",
+                    address, tile_addr.col, tile_addr.row, tile_addr.offset, value);
+                self.write_register(addr32, *value)?;
+            }
+
+            CdoCommand::MaskWrite64 { address, mask, value } => {
+                self.stats.mask_writes += 1;
+                let addr32 = *address as u32;
+                let tile_addr = TileAddress::decode(addr32);
+                log::trace!("CDO MaskWrite64: addr=0x{:016X} -> tile({},{}) offset=0x{:05X}",
+                    address, tile_addr.col, tile_addr.row, tile_addr.offset);
+                self.mask_write_register(addr32, *mask, *value)?;
+            }
+
             CdoCommand::DmaWrite { address, data } => {
                 self.stats.dma_writes += 1;
                 let tile_addr = TileAddress::decode(*address);
@@ -1476,15 +1496,15 @@ mod tests {
 
     #[test]
     fn test_apply_real_cdo() {
-        let test_xclbin = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_objFifo/aie.xclbin";
+        use crate::config::Config;
 
-        if !std::path::Path::new(test_xclbin).exists() {
-            eprintln!("Skipping real CDO test: file not found");
+        let Some(test_xclbin) = Config::get().add_one_xclbin() else {
+            eprintln!("Skipping real CDO test: file not found (set MLIR_AIE_PATH)");
             return;
-        }
+        };
 
         // Load xclbin
-        let xclbin = Xclbin::from_file(test_xclbin).unwrap();
+        let xclbin = Xclbin::from_file(&test_xclbin).unwrap();
         let section = xclbin.find_section(SectionKind::AiePartition).unwrap();
         let partition = AiePartition::parse(section.data()).unwrap();
         let pdi = partition.primary_pdi().unwrap();

@@ -134,6 +134,7 @@ impl CycleAccurateExecutor {
     }
 
     /// Execute a single slot operation with timing tracking.
+    #[allow(dead_code)]
     fn execute_slot(
         &mut self,
         op: &SlotOp,
@@ -706,7 +707,7 @@ mod tests {
         use crate::interpreter::state::EventType;
 
         let mut executor = CycleAccurateExecutor::new();
-        let mut ctx = ExecutionContext::new_with_timing();
+        let mut ctx = ExecutionContext::new();
         let mut tile = Tile::compute(0, 2);
 
         // Execute a simple scalar add

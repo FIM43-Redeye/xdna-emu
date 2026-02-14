@@ -460,10 +460,7 @@ impl ScalarAlu {
                 let src_true = Self::get_source(op, ctx, 0);
                 let src_false = Self::get_source(op, ctx, 1);
                 let test = ctx.scalar_read(27); // r27 is implicit test condition
-                log::debug!("[SEL.EQZ] sources={:?} r27={} src_true={} src_false={}",
-                           op.sources, test, src_true, src_false);
                 let result = if test == 0 { src_true } else { src_false };
-                log::debug!("[SEL.EQZ] result={} (r27==0? {})", result, test == 0);
                 Self::write_dest(op, ctx, result);
                 true
             }

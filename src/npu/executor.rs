@@ -191,12 +191,17 @@ impl NpuExecutor {
         // NPU1 address format: bits[31:25]=col, bits[24:20]=row, bits[19:0]=offset
         let (col, row, offset) = decode_npu_address(reg_off);
 
-        // Write to the device register
         if let Some(tile) = device.tile_mut(col as usize, row as usize) {
-            tile.write_register(offset, value);
-
-            // Check if this is a DMA channel control register (triggers DMA start)
-            self.check_dma_trigger(col, row, offset, value, device);
+            // Route to data memory or register space based on offset
+            if is_data_memory_offset(tile, offset) {
+                log::debug!("NPU Write32 -> data memory: tile({},{}) offset=0x{:05X} value=0x{:08X}",
+                    col, row, offset, value);
+                tile.write_data_u32(offset as usize, value);
+            } else {
+                tile.write_register(offset, value);
+                // Check if this is a DMA channel control register (triggers DMA start)
+                self.check_dma_trigger(col, row, offset, value, device);
+            }
         } else {
             log::warn!(
                 "NPU Write32 to non-existent tile ({}, {}): offset=0x{:05X}",
@@ -218,15 +223,24 @@ impl NpuExecutor {
         let (col, row, base_offset) = decode_npu_address(reg_off);
 
         if let Some(tile) = device.tile_mut(col as usize, row as usize) {
-            for (i, &value) in values.iter().enumerate() {
-                let offset = base_offset + (i as u32) * 4;
-                tile.write_register(offset, value);
-            }
+            // Route to data memory or register space based on offset
+            if is_data_memory_offset(tile, base_offset) {
+                log::debug!("NPU BlockWrite -> data memory: tile({},{}) offset=0x{:05X} count={}",
+                    col, row, base_offset, values.len());
+                // Write all values as a contiguous byte block to data memory
+                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+                tile.write_data(base_offset as usize, &bytes);
+            } else {
+                for (i, &value) in values.iter().enumerate() {
+                    let offset = base_offset + (i as u32) * 4;
+                    tile.write_register(offset, value);
+                }
 
-            // Check for DMA triggers in the written range
-            for (i, &value) in values.iter().enumerate() {
-                let offset = base_offset + (i as u32) * 4;
-                self.check_dma_trigger(col, row, offset, value, device);
+                // Check for DMA triggers in the written range
+                for (i, &value) in values.iter().enumerate() {
+                    let offset = base_offset + (i as u32) * 4;
+                    self.check_dma_trigger(col, row, offset, value, device);
+                }
             }
         }
 
@@ -262,11 +276,11 @@ impl NpuExecutor {
         // Dump raw values for debugging
         log::debug!("BD {} raw values: {:08X?}", bd_index, values);
 
-        // BD format (from AM020 - note: shim DMA has different layout than tile DMA):
-        // Shim DMA BD format (32 bytes):
-        // Word 0: Buffer length (bytes) - bits[13:0] = length
-        // Word 1: Buffer address low
-        // Word 2: Buffer address high + packet info
+        // BD format (from AM020/AM025 - shim DMA BD layout):
+        // Shim DMA BD format (32 bytes, 8 words):
+        // Word 0: Buffer length in 32-bit words - bits[17:0] for shim (18-bit field)
+        // Word 1: Buffer address low (32 bits)
+        // Word 2: Buffer address high[15:0] + packet info
         // Word 3: D0 config (size, stride)
         // Word 4: D1 config
         // Word 5: D2 config
@@ -274,8 +288,10 @@ impl NpuExecutor {
         // Word 7: Control/next BD
 
         let length_word = values[0];
-        // Buffer length is in 32-bit words, not bytes (AM025 Shim DMA BD format)
-        let length_words = length_word & 0x3FFF;  // Bottom 14 bits = word count
+        // Shim DMA BD buffer length is 18 bits (supports up to 1MB transfers).
+        // Compute tile BDs use 14 bits, but shim tiles connect to DDR and need
+        // wider lengths. The value is in 32-bit words, not bytes.
+        let length_words = length_word & 0x3FFFF;  // Bottom 18 bits = word count
         let length = length_words * 4;  // Convert to bytes
 
         let addr_low = values[1];
@@ -285,9 +301,9 @@ impl NpuExecutor {
         let base_addr = ((addr_high as u64) << 32) | (addr_low as u64);
 
         // D0 dimension: word 3
-        // Bits 13:0 = size in 32-bit words
+        // Bits 17:0 = size in 32-bit words (same 18-bit width for shim)
         let d0_word = values.get(3).copied().unwrap_or(0);
-        let d0_size_words = d0_word & 0x3FFF;
+        let d0_size_words = d0_word & 0x3FFFF;
         let d0_size_bytes = d0_size_words * 4;
 
         // Use D0 size if buffer length is 0
@@ -316,12 +332,20 @@ impl NpuExecutor {
         let (col, row, offset) = decode_npu_address(reg_off);
 
         if let Some(tile) = device.tile_mut(col as usize, row as usize) {
-            // Read-modify-write
-            let current = tile.read_register(offset);
-            let new_value = (current & !mask) | (value & mask);
-            tile.write_register(offset, new_value);
-
-            self.check_dma_trigger(col, row, offset, new_value, device);
+            if is_data_memory_offset(tile, offset) {
+                // Read-modify-write in data memory
+                let current = tile.read_data_u32(offset as usize).unwrap_or(0);
+                let new_value = (current & !mask) | (value & mask);
+                log::debug!("NPU MaskWrite -> data memory: tile({},{}) offset=0x{:05X} \
+                    current=0x{:08X} -> 0x{:08X}", col, row, offset, current, new_value);
+                tile.write_data_u32(offset as usize, new_value);
+            } else {
+                // Read-modify-write in register space
+                let current = tile.read_register(offset);
+                let new_value = (current & !mask) | (value & mask);
+                tile.write_register(offset, new_value);
+                self.check_dma_trigger(col, row, offset, new_value, device);
+            }
         }
 
         Ok(())
@@ -451,6 +475,20 @@ impl Default for NpuExecutor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Check if a register offset falls in the tile's data memory range.
+///
+/// The AIE tile address space has data memory at the lowest offsets:
+/// - Compute tiles: 0x00000-0x0FFFF (64KB)
+/// - Memory tiles: 0x00000-0x7FFFF (512KB)
+/// - Shim tiles: no data memory
+///
+/// Writes to these offsets must go through tile.write_data() rather
+/// than tile.write_register() to actually reach data memory.
+fn is_data_memory_offset(tile: &crate::device::tile::Tile, offset: u32) -> bool {
+    let dm_size = tile.data_memory().len() as u32;
+    dm_size > 0 && offset < dm_size
 }
 
 /// Decode an NPU address into (col, row, offset).

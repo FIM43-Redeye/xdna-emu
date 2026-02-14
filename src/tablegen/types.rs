@@ -298,6 +298,7 @@ pub enum SemanticOp {
     // Special
     Copy,    // Move/copy
     Nop,     // No operation
+    Done,    // Core termination (halt)
 
     // Synchronization (AIE-specific)
     LockAcquire,  // Acquire lock

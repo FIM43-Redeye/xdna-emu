@@ -16,6 +16,18 @@ fn main() -> anyhow::Result<()> {
 
     let args: Vec<String> = env::args().collect();
 
+    // Check for help
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
+
+    // Check for version
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("xdna-emu {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // Check for test-suite command
     if args.len() >= 2 && args[1] == "test-suite" {
         let path = args.get(2).map(|s| s.as_str()).unwrap_or(".");
@@ -313,6 +325,31 @@ fn run_test_suite(path: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Print help message.
+fn print_help() {
+    println!("xdna-emu - Open-source emulator for AMD XDNA NPUs");
+    println!();
+    println!("USAGE:");
+    println!("    xdna-emu [OPTIONS] [FILE]");
+    println!("    xdna-emu test-suite <PATH>");
+    println!();
+    println!("OPTIONS:");
+    println!("    -h, --help          Print this help message");
+    println!("    -V, --version       Print version");
+    println!("    -g, --gui           Launch visual debugger (default if no file)");
+    println!("    --dump-state        Parse binary and dump device state");
+    println!();
+    println!("COMMANDS:");
+    println!("    test-suite <PATH>   Run xclbin test suite from directory");
+    println!();
+    println!("EXAMPLES:");
+    println!("    xdna-emu                         # Launch GUI");
+    println!("    xdna-emu --gui kernel.xclbin     # GUI with file loaded");
+    println!("    xdna-emu --dump-state kernel.xclbin");
+    println!("    xdna-emu test-suite ./tests/");
+    println!("    xdna-emu kernel.elf              # Parse ELF file");
 }
 
 /// Run the GUI application.

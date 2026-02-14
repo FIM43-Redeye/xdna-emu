@@ -14,7 +14,7 @@ MOCK_XRT_ROOT="${SCRIPT_DIR}/.."
 XDNA_EMU_ROOT="${MOCK_XRT_ROOT}/.."
 
 # Default paths (can be overridden via environment)
-MLIR_AIE_ROOT="${MLIR_AIE_ROOT:-/home/triple/npu-work/mlir-aie}"
+MLIR_AIE_ROOT="${MLIR_AIE_ROOT:-${XDNA_EMU_ROOT}/../mlir-aie}"
 MLIR_AIE_BUILD="${MLIR_AIE_BUILD:-${MLIR_AIE_ROOT}/build}"
 
 # Build paths
@@ -67,7 +67,7 @@ usage() {
     echo "  Optional glob pattern to filter tests (e.g., 'add_one*')"
     echo ""
     echo "Environment variables:"
-    echo "  MLIR_AIE_ROOT    Path to mlir-aie source (default: /home/triple/npu-work/mlir-aie)"
+    echo "  MLIR_AIE_ROOT    Path to mlir-aie source (default: ../mlir-aie relative to xdna-emu)"
     echo "  MLIR_AIE_BUILD   Path to mlir-aie build (default: \$MLIR_AIE_ROOT/build)"
     echo "  RUST_LOG         Set to 'info' or 'debug' for emulator logging"
 }
@@ -108,9 +108,11 @@ check_prerequisites() {
         missing=1
     fi
 
-    if [[ ! -d "${MLIR_AIE_BUILD}/test/npu-xrt" ]]; then
-        log_error "mlir-aie test build directory not found"
-        echo "  Build mlir-aie tests first"
+    # Check if any xclbin files exist in the build directory
+    local xclbin_count=$(find "${MLIR_AIE_BUILD}" -name "aie.xclbin" 2>/dev/null | wc -l)
+    if [[ $xclbin_count -eq 0 ]]; then
+        log_error "No built tests found (no aie.xclbin files)"
+        echo "  Build mlir-aie tests first: cd mlir-aie && ./build_all_tests.sh"
         missing=1
     fi
 
@@ -124,27 +126,25 @@ discover_tests() {
     local pattern="${1:-*}"
     local tests=()
 
-    # Find all directories with xclbin files (aie.xclbin or final.xclbin) in the build tree
+    # Find all directories with xclbin files in the entire build tree
     while IFS= read -r xclbin; do
         local test_dir="$(dirname "$xclbin")"
 
-        # Get relative path from npu-xrt directory
-        # This handles nested tests like adjacent_memtile_access/two_memtiles
-        local rel_path="${test_dir#${MLIR_AIE_BUILD}/test/npu-xrt/}"
-        local test_name="$rel_path"
+        # Get relative path from build directory
+        local rel_path="${test_dir#${MLIR_AIE_BUILD}/}"
 
         # For pattern matching, use the leaf directory name
         local leaf_name="$(basename "$test_dir")"
 
-        # Check if pattern matches (match against leaf name for simplicity)
-        if [[ "$leaf_name" == $pattern ]] || [[ "$test_name" == $pattern ]]; then
+        # Check if pattern matches (match against leaf name or full path)
+        if [[ "$leaf_name" == $pattern ]] || [[ "$rel_path" == *"$pattern"* ]] || [[ "$pattern" == "*" ]]; then
             # Check if test.cpp exists in source
-            local source_dir="${MLIR_AIE_ROOT}/test/npu-xrt/${rel_path}"
+            local source_dir="${MLIR_AIE_ROOT}/${rel_path}"
             if [[ -f "${source_dir}/test.cpp" ]]; then
                 tests+=("$rel_path")
             fi
         fi
-    done < <(find "${MLIR_AIE_BUILD}/test/npu-xrt" \( -name "aie.xclbin" -o -name "final.xclbin" \) 2>/dev/null | sort)
+    done < <(find "${MLIR_AIE_BUILD}" -name "aie.xclbin" 2>/dev/null | grep -v "\.prj/" | sort)
 
     printf '%s\n' "${tests[@]}"
 }
@@ -153,8 +153,8 @@ discover_tests() {
 # Uses mlir-aie toolchain (aie-opt, aiecc.py)
 prepare_test() {
     local test_name="$1"
-    local source_dir="${MLIR_AIE_ROOT}/test/npu-xrt/${test_name}"
-    local build_dir="${MLIR_AIE_BUILD}/test/npu-xrt/${test_name}"
+    local source_dir="${MLIR_AIE_ROOT}/${test_name}"
+    local build_dir="${MLIR_AIE_BUILD}/${test_name}"
 
     # Check if instruction files already exist
     if [[ -f "${build_dir}/insts.bin" ]] || [[ -f "${build_dir}/aie_run_seq.bin" ]]; then
@@ -222,14 +222,14 @@ prepare_test() {
 # Returns 0 if recompilation needed, 1 if up-to-date
 needs_recompile() {
     local test_name="$1"
-    local source_dir="${MLIR_AIE_ROOT}/test/npu-xrt/${test_name}"
-    local output_bin="${TEST_BUILD_DIR}/${test_name}"
+    local source_dir="${MLIR_AIE_ROOT}/${test_name}"
+    local output_bin="${TEST_BUILD_DIR}/${test_name//\//_}"
 
     # Need to compile if binary doesn't exist
     [[ ! -f "$output_bin" ]] && return 0
 
     # Need to compile if source is newer than binary
-    [[ "${source_dir}/test.cpp" -nt "$output_bin" ]] && return 0
+    [[ -f "${source_dir}/test.cpp" && "${source_dir}/test.cpp" -nt "$output_bin" ]] && return 0
 
     # Need to compile if any header changed (check mock XRT headers)
     local newest_header
@@ -244,9 +244,10 @@ needs_recompile() {
 compile_test() {
     local test_name="$1"
     local force="$2"
-    local source_dir="${MLIR_AIE_ROOT}/test/npu-xrt/${test_name}"
-    local build_dir="${MLIR_AIE_BUILD}/test/npu-xrt/${test_name}"
-    local output_bin="${TEST_BUILD_DIR}/${test_name}"
+    local source_dir="${MLIR_AIE_ROOT}/${test_name}"
+    local build_dir="${MLIR_AIE_BUILD}/${test_name}"
+    # Flatten path for output binary (test/npu-xrt/add_one -> test_npu-xrt_add_one)
+    local output_bin="${TEST_BUILD_DIR}/${test_name//\//_}"
 
     # Ensure output directory exists (handles nested paths like adjacent_memtile_access/two_memtiles)
     mkdir -p "$(dirname "${output_bin}")"
@@ -276,8 +277,8 @@ compile_test() {
 run_test() {
     local test_name="$1"
     local verbose="$2"
-    local build_dir="${MLIR_AIE_BUILD}/test/npu-xrt/${test_name}"
-    local test_bin="${TEST_BUILD_DIR}/${test_name}"
+    local build_dir="${MLIR_AIE_BUILD}/${test_name}"
+    local test_bin="${TEST_BUILD_DIR}/${test_name//\//_}"
     local insts="${build_dir}/insts.bin"
 
     # Find xclbin file (may be aie.xclbin or final.xclbin)
@@ -306,9 +307,9 @@ run_test() {
         else
             # List what instruction files ARE needed for this test
             local needed=""
-            if grep -q "aie_run_seq.bin\|ctrlpkt" "${MLIR_AIE_ROOT}/test/npu-xrt/${test_name}/run.lit" 2>/dev/null; then
+            if grep -q "aie_run_seq.bin\|ctrlpkt" "${MLIR_AIE_ROOT}/${test_name}/run.lit" 2>/dev/null; then
                 needed="(needs: aiecc.py --aie-generate-ctrlpkt --aie-generate-npu-insts)"
-            elif grep -q "insts.elf" "${MLIR_AIE_ROOT}/test/npu-xrt/${test_name}/run.lit" 2>/dev/null; then
+            elif grep -q "insts.elf" "${MLIR_AIE_ROOT}/${test_name}/run.lit" 2>/dev/null; then
                 needed="(has insts.elf but may need conversion)"
             fi
             log_skip "No instruction file found $needed"
@@ -512,8 +513,9 @@ main() {
         echo ""
 
         for test_name in "${tests[@]}"; do
-            # Skip if compilation failed
-            if [[ ! -f "${TEST_BUILD_DIR}/${test_name}" ]]; then
+            # Skip if compilation failed (path is flattened: test/foo/bar -> test_foo_bar)
+            local test_bin="${TEST_BUILD_DIR}/${test_name//\//_}"
+            if [[ ! -f "$test_bin" ]]; then
                 continue
             fi
 
@@ -534,10 +536,11 @@ main() {
         done
     fi
 
-    # Clean up unless keeping binaries
-    if [[ $keep_binaries -eq 0 && $compile_only -eq 0 ]]; then
-        rm -rf "${TEST_BUILD_DIR}"
-    fi
+    # Keep binaries by default now - they take too long to rebuild
+    # Only clean up if explicitly requested (we could add a --clean flag later)
+    # if [[ $keep_binaries -eq 0 && $compile_only -eq 0 ]]; then
+    #     rm -rf "${TEST_BUILD_DIR}"
+    # fi
 
     # Summary
     echo ""

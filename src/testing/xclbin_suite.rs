@@ -9,16 +9,53 @@ use crate::parser::{Xclbin, AiePartition, Cdo};
 use crate::parser::xclbin::SectionKind;
 use crate::parser::cdo::find_cdo_offset;
 use crate::interpreter::engine::{InterpreterEngine, EngineStatus};
-use crate::npu::{NpuInstructionStream, NpuExecutor};
+use crate::npu::{NpuInstructionStream, NpuExecutor, HostBuffer};
 
 use super::opcode_collector::{OpcodeCollector, UnknownOpcode};
+use super::manifest_runner::{TestManifest, ElementType, read_values};
+use std::collections::HashMap;
 
 /// Result of running a single xclbin test.
 #[derive(Debug)]
 pub enum TestOutcome {
-    /// Test completed successfully (all cores halted).
+    /// Test completed successfully with validated output.
     Pass {
         cycles: u64,
+        /// Number of correct output values (if validation was performed)
+        correct: Option<usize>,
+        /// Total output values checked
+        total: Option<usize>,
+    },
+    /// Test failed validation (output mismatch).
+    ValidationFail {
+        cycles: u64,
+        correct: usize,
+        total: usize,
+        first_mismatch: Option<(usize, i64, i64)>, // (index, expected, actual)
+    },
+    /// Known-broken test failed as expected. The manifest has
+    /// `expected_fail = true`, and the test did in fact produce wrong output.
+    /// This is informational, not a test failure.
+    ///
+    /// The `actual` field preserves the underlying failure details so we can
+    /// track progress without removing the expected_fail flag.
+    ExpectedFail {
+        cycles: u64,
+        reason: String,
+        /// Human-readable description of the actual failure (e.g. "ValidationFail: 0/64 correct")
+        actual: String,
+    },
+    /// Known-broken test unexpectedly passed. The manifest has
+    /// `expected_fail = true`, but the test produced correct output.
+    /// This means the emulator improved or the manifest needs updating.
+    UnexpectedPass {
+        cycles: u64,
+        correct: usize,
+        total: usize,
+    },
+    /// Test was skipped (e.g. requires xchesscc, missing binary).
+    Skipped {
+        reason: String,
     },
     /// Test failed with an error.
     Fail {
@@ -41,19 +78,37 @@ pub enum TestOutcome {
 }
 
 impl TestOutcome {
-    /// Check if the test passed.
+    /// Check if the test passed (or expected-fail matched expectations).
     pub fn is_pass(&self) -> bool {
-        matches!(self, TestOutcome::Pass { .. })
+        matches!(self, TestOutcome::Pass { .. } | TestOutcome::ExpectedFail { .. })
+    }
+
+    /// Check if the test failed validation.
+    pub fn is_validation_fail(&self) -> bool {
+        matches!(self, TestOutcome::ValidationFail { .. })
+    }
+
+    /// Check if the test was skipped.
+    pub fn is_skipped(&self) -> bool {
+        matches!(self, TestOutcome::Skipped { .. })
+    }
+
+    /// Check if a known-broken test unexpectedly passed.
+    pub fn is_unexpected_pass(&self) -> bool {
+        matches!(self, TestOutcome::UnexpectedPass { .. })
     }
 
     /// Get the cycle count (if available).
     pub fn cycles(&self) -> Option<u64> {
         match self {
-            TestOutcome::Pass { cycles } => Some(*cycles),
+            TestOutcome::Pass { cycles, .. } => Some(*cycles),
+            TestOutcome::ValidationFail { cycles, .. } => Some(*cycles),
+            TestOutcome::ExpectedFail { cycles, .. } => Some(*cycles),
+            TestOutcome::UnexpectedPass { cycles, .. } => Some(*cycles),
             TestOutcome::Fail { cycles, .. } => Some(*cycles),
             TestOutcome::UnknownOpcode { cycles, .. } => Some(*cycles),
             TestOutcome::Timeout { cycles } => Some(*cycles),
-            TestOutcome::LoadError { .. } => None,
+            TestOutcome::Skipped { .. } | TestOutcome::LoadError { .. } => None,
         }
     }
 }
@@ -69,6 +124,8 @@ pub struct XclbinTest {
     pub project_dir: Option<PathBuf>,
     /// Optional expected output for validation.
     pub expected_output: Option<Vec<u8>>,
+    /// Optional manifest for validation.
+    pub manifest: Option<TestManifest>,
 }
 
 impl XclbinTest {
@@ -112,6 +169,7 @@ impl XclbinTest {
             xclbin_path: path.to_path_buf(),
             project_dir,
             expected_output: None,
+            manifest: None,
         }
     }
 
@@ -119,6 +177,23 @@ impl XclbinTest {
     pub fn with_expected_output(mut self, output: Vec<u8>) -> Self {
         self.expected_output = Some(output);
         self
+    }
+
+    /// Set the manifest for validation.
+    pub fn with_manifest(mut self, manifest: TestManifest) -> Self {
+        self.manifest = Some(manifest);
+        self
+    }
+
+    /// Try to load a manifest from a directory.
+    pub fn load_manifest_from(&mut self, manifest_dir: &Path) {
+        let manifest_path = manifest_dir.join(format!("{}.toml", self.name));
+        if manifest_path.exists() {
+            if let Ok(manifest) = TestManifest::from_file(&manifest_path) {
+                log::debug!("Loaded manifest for {}", self.name);
+                self.manifest = Some(manifest);
+            }
+        }
     }
 
     /// Find ELF files for cores in the project directory.
@@ -176,6 +251,51 @@ impl XclbinTest {
         }
         None
     }
+
+    /// Count the number of compute tiles with embedded code in the xclbin.
+    ///
+    /// Parses the CDO and looks for DMA_WRITE commands to program memory
+    /// (offset 0x20000). Returns the count of unique tiles with embedded code.
+    pub fn count_embedded_cores(&self) -> usize {
+        use crate::parser::cdo::CdoCommand;
+        use crate::device::TileAddress;
+        use std::collections::HashSet;
+
+        let xclbin = match Xclbin::from_file(&self.xclbin_path) {
+            Ok(x) => x,
+            Err(_) => return 0,
+        };
+
+        let partition_section = match xclbin.find_section(SectionKind::AiePartition) {
+            Some(s) => s,
+            None => return 0,
+        };
+
+        let partition = match AiePartition::parse(partition_section.data()) {
+            Ok(p) => p,
+            Err(_) => return 0,
+        };
+
+        let mut embedded_cores: HashSet<(u8, u8)> = HashSet::new();
+
+        for pdi in partition.pdis() {
+            if let Some(cdo_offset) = find_cdo_offset(pdi.pdi_image) {
+                if let Ok(cdo) = Cdo::parse(&pdi.pdi_image[cdo_offset..]) {
+                    for cmd in cdo.commands() {
+                        if let CdoCommand::DmaWrite { address, data } = &cmd {
+                            let tile = TileAddress::decode(*address);
+                            // ProgMem starts at offset 0x20000 for compute tiles
+                            if tile.offset >= 0x20000 && tile.offset < 0x40000 && !data.is_empty() {
+                                embedded_cores.insert((tile.col, tile.row));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        embedded_cores.len()
+    }
 }
 
 /// Test suite for running multiple xclbin tests.
@@ -184,10 +304,12 @@ pub struct XclbinSuite {
     tests: Vec<XclbinTest>,
     /// Collected unknown opcodes across all tests.
     collector: OpcodeCollector,
-    /// Maximum cycles before timeout.
+    /// Absolute cycle safety net. 0 means no limit (rely on TDR only).
     max_cycles: u64,
     /// Results from completed tests.
     results: Vec<(String, TestOutcome)>,
+    /// Directory containing manifest files for validation.
+    manifest_dir: Option<PathBuf>,
 }
 
 impl XclbinSuite {
@@ -198,51 +320,100 @@ impl XclbinSuite {
             collector: OpcodeCollector::new(),
             max_cycles: 1_000_000,
             results: Vec::new(),
+            manifest_dir: None,
         }
     }
 
-    /// Set the maximum cycles before timeout.
+    /// Set the absolute cycle safety net.
+    ///
+    /// This is a hard upper bound that catches anything the TDR misses.
+    /// Set to 0 to disable entirely (rely on TDR no-progress detection only).
     pub fn with_max_cycles(mut self, max: u64) -> Self {
         self.max_cycles = max;
         self
     }
 
+    /// Set the manifest directory for validation.
+    pub fn with_manifest_dir(mut self, dir: PathBuf) -> Self {
+        // Load manifests for existing tests
+        for test in &mut self.tests {
+            test.load_manifest_from(&dir);
+        }
+        self.manifest_dir = Some(dir);
+        self
+    }
+
     /// Add a single test.
-    pub fn add_test(&mut self, test: XclbinTest) {
+    pub fn add_test(&mut self, mut test: XclbinTest) {
+        // Load manifest if directory is set
+        if let Some(ref dir) = self.manifest_dir {
+            test.load_manifest_from(dir);
+        }
         self.tests.push(test);
     }
 
     /// Discover tests from a directory.
     ///
-    /// Looks for xclbin files in subdirectories matching the mlir-aie structure.
+    /// Recursively walks subdirectories looking for xclbin files matching
+    /// the mlir-aie build structure. Handles both flat tests
+    /// (e.g., `add_one_using_dma/aie.xclbin`) and nested tests inside
+    /// parent directories (e.g., `core_dmas/writebd/aie.xclbin`).
+    ///
+    /// Test names are relative paths from the base directory, so nested
+    /// tests get names like `core_dmas/writebd` instead of just `writebd`
+    /// (which would collide with `tile_dmas/writebd`).
     pub fn discover(base_path: impl AsRef<Path>) -> Result<Self> {
         let base = base_path.as_ref();
         let mut suite = Self::new();
 
-        // Look for xclbin files in immediate subdirectories
-        for entry in std::fs::read_dir(base)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir() {
-                // Check for aie.xclbin or final.xclbin
-                for xclbin_name in &["aie.xclbin", "final.xclbin"] {
-                    let xclbin_path = path.join(xclbin_name);
-                    if xclbin_path.exists() {
-                        suite.add_test(XclbinTest::from_path(&xclbin_path));
-                        break;
-                    }
-                }
-            } else if path.extension().map(|e| e == "xclbin").unwrap_or(false) {
-                // Direct xclbin file
-                suite.add_test(XclbinTest::from_path(&path));
-            }
-        }
+        Self::discover_recursive(base, base, &mut suite)?;
 
         // Sort tests by name for consistent ordering
         suite.tests.sort_by(|a, b| a.name.cmp(&b.name));
 
         Ok(suite)
+    }
+
+    /// Recursively discover xclbin files under `dir`, computing test names
+    /// relative to `base`.
+    fn discover_recursive(base: &Path, dir: &Path, suite: &mut Self) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if !path.is_dir() {
+                // Direct xclbin file at the base level
+                if path.extension().map(|e| e == "xclbin").unwrap_or(false) {
+                    suite.add_test(XclbinTest::from_path(&path));
+                }
+                continue;
+            }
+
+            // Check if this directory contains an xclbin (leaf test dir)
+            let mut found = false;
+            for xclbin_name in &["aie.xclbin", "final.xclbin"] {
+                let xclbin_path = path.join(xclbin_name);
+                if xclbin_path.exists() {
+                    let mut test = XclbinTest::from_path(&xclbin_path);
+                    // Override name with relative path from base to avoid
+                    // collisions between nested tests (e.g., core_dmas/writebd
+                    // vs tile_dmas/writebd)
+                    if let Ok(rel) = path.strip_prefix(base) {
+                        test.name = rel.to_string_lossy().to_string();
+                    }
+                    suite.add_test(test);
+                    found = true;
+                    break;
+                }
+            }
+
+            // No xclbin here -- recurse into subdirectories (parent dir)
+            if !found {
+                let _ = Self::discover_recursive(base, &path, suite);
+            }
+        }
+
+        Ok(())
     }
 
     /// Get the number of tests.
@@ -270,6 +441,10 @@ impl XclbinSuite {
         let total = self.tests.len();
         let mut passed = 0;
         let mut failed = 0;
+        let mut validation_failed = 0;
+        let mut expected_fail = 0;
+        let mut unexpected_pass = 0;
+        let mut skipped = 0;
         let mut unknown = 0;
         let mut timeout = 0;
         let mut load_error = 0;
@@ -282,6 +457,10 @@ impl XclbinSuite {
 
             match &outcome {
                 TestOutcome::Pass { .. } => passed += 1,
+                TestOutcome::ValidationFail { .. } => validation_failed += 1,
+                TestOutcome::ExpectedFail { .. } => expected_fail += 1,
+                TestOutcome::UnexpectedPass { .. } => unexpected_pass += 1,
+                TestOutcome::Skipped { .. } => skipped += 1,
                 TestOutcome::Fail { .. } => failed += 1,
                 TestOutcome::UnknownOpcode { details, .. } => {
                     unknown += 1;
@@ -298,6 +477,10 @@ impl XclbinSuite {
             total,
             passed,
             failed,
+            validation_failed,
+            expected_fail,
+            unexpected_pass,
+            skipped,
             unknown,
             timeout,
             load_error,
@@ -306,13 +489,41 @@ impl XclbinSuite {
 
     /// Run a single test.
     pub fn run_single(&self, test: &XclbinTest) -> TestOutcome {
+        let (outcome, _) = self.run_single_inner(test);
+        outcome
+    }
+
+    /// Run a single test and capture raw emulator output.
+    ///
+    /// Returns both the test outcome and the raw output bytes read from
+    /// host memory at offset 0x1000 (the standard output buffer address).
+    /// The output bytes are `None` if the engine could not be created or
+    /// the test was skipped.
+    pub fn run_single_with_output(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>) {
+        self.run_single_inner(test)
+    }
+
+    /// Shared implementation for run_single and run_single_with_output.
+    ///
+    /// Always returns the raw output bytes when the engine ran far enough
+    /// to produce output (even if validation failed).
+    fn run_single_inner(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>) {
+        // Check if manifest says to skip this test
+        if let Some(ref manifest) = test.manifest {
+            if manifest.test.skip {
+                return (TestOutcome::Skipped {
+                    reason: manifest.test.skip_reason.clone(),
+                }, None);
+            }
+        }
+
         // Load xclbin
         let xclbin = match Xclbin::from_file(&test.xclbin_path) {
             Ok(x) => x,
             Err(e) => {
-                return TestOutcome::LoadError {
+                return (TestOutcome::LoadError {
                     message: format!("Failed to load xclbin: {}", e),
-                };
+                }, None);
             }
         };
 
@@ -320,9 +531,9 @@ impl XclbinSuite {
         let section = match xclbin.find_section(SectionKind::AiePartition) {
             Some(s) => s,
             None => {
-                return TestOutcome::LoadError {
+                return (TestOutcome::LoadError {
                     message: "No AIE partition in xclbin".to_string(),
-                };
+                }, None);
             }
         };
 
@@ -330,9 +541,9 @@ impl XclbinSuite {
         let partition = match AiePartition::parse(section.data()) {
             Ok(p) => p,
             Err(e) => {
-                return TestOutcome::LoadError {
+                return (TestOutcome::LoadError {
                     message: format!("Failed to parse AIE partition: {}", e),
-                };
+                }, None);
             }
         };
 
@@ -340,43 +551,62 @@ impl XclbinSuite {
         let pdi = match partition.primary_pdi() {
             Some(p) => p,
             None => {
-                return TestOutcome::LoadError {
+                return (TestOutcome::LoadError {
                     message: "No primary PDI in partition".to_string(),
-                };
+                }, None);
             }
         };
 
         let cdo_offset = match find_cdo_offset(pdi.pdi_image) {
             Some(o) => o,
             None => {
-                return TestOutcome::LoadError {
+                return (TestOutcome::LoadError {
                     message: "No CDO found in PDI".to_string(),
-                };
+                }, None);
             }
         };
 
         let cdo = match Cdo::parse(&pdi.pdi_image[cdo_offset..]) {
             Ok(c) => c,
             Err(e) => {
-                return TestOutcome::LoadError {
+                return (TestOutcome::LoadError {
                     message: format!("Failed to parse CDO: {}", e),
-                };
+                }, None);
             }
         };
 
         // Create engine and apply CDO
         let mut engine = InterpreterEngine::new_npu1();
         if let Err(e) = engine.device_mut().apply_cdo(&cdo) {
-            return TestOutcome::LoadError {
+            return (TestOutcome::LoadError {
                 message: format!("Failed to apply CDO: {}", e),
-            };
+            }, None);
         }
 
-        // Populate host memory with default input data
-        self.setup_default_input(&mut engine);
+        // Populate host memory - use manifest data if available, else defaults.
+        // host_buffers maps DDR patch arg_idx to actual host memory addresses.
+        let (input_values, host_buffers) = if let Some(ref manifest) = test.manifest {
+            self.setup_input_from_manifest(&mut engine, manifest)
+        } else {
+            self.setup_default_input(&mut engine);
+            // Default layout: input(0x0, 4KB), middle(0x1000, 256B), output(0x2000, 4KB)
+            let default_buffers = vec![
+                HostBuffer { address: 0x0000, size: 4096 },
+                HostBuffer { address: 0x1000, size: 256 },
+                HostBuffer { address: 0x2000, size: 4096 },
+            ];
+            (None, default_buffers)
+        };
 
-        // Execute NPU instructions if insts.bin exists
-        // These configure and trigger shim DMA to move data to/from cores
+        // Output address is always the last host buffer
+        let output_addr = host_buffers.last().map(|b| b.address).unwrap_or(0x1000u64);
+
+        // Execute NPU instructions if insts.bin exists.
+        // These configure and trigger shim DMA to move data to/from cores.
+        // The NpuExecutor must survive until run_engine() so its collected
+        // sync conditions can be checked as a completion signal.
+        let mut npu_executor: Option<NpuExecutor> = None;
+
         if let Some(insts_path) = test.find_insts_bin() {
             let insts_data = match std::fs::read(&insts_path) {
                 Ok(d) => d,
@@ -393,20 +623,18 @@ impl XclbinSuite {
                         log::debug!("Loaded {} NPU instructions from {:?}",
                             stream.len(), insts_path);
 
-                        let mut npu_executor = NpuExecutor::new();
+                        let mut executor = NpuExecutor::new();
 
-                        // Set up host buffers to match the memory layout in setup_default_input
-                        // These addresses MUST match where data is actually allocated:
-                        //   0x0000: Input buffer (4KB)
-                        //   0x0100: Middle/unused buffer (256 bytes)
-                        //   0x1000: Output buffer (4KB)
-                        npu_executor.add_host_buffer(0x0000, 4096);  // arg0: Input buffer
-                        npu_executor.add_host_buffer(0x0100, 256);   // arg1: Middle buffer
-                        npu_executor.add_host_buffer(0x1000, 4096);  // arg2: Output buffer
+                        // Set up host buffers from the manifest-derived layout.
+                        // These addresses must match the actual host memory allocation
+                        // so DDR patches write correct addresses into shim DMA BDs.
+                        executor.set_host_buffers(host_buffers.clone());
 
-                        if let Err(e) = npu_executor.execute(&stream, engine.device_mut()) {
+                        if let Err(e) = executor.execute(&stream, engine.device_mut()) {
                             log::warn!("NPU instruction execution error: {}", e);
                         }
+
+                        npu_executor = Some(executor);
                     }
                     Err(e) => {
                         log::warn!("Failed to parse insts.bin: {}", e);
@@ -424,16 +652,16 @@ impl XclbinSuite {
             let data = match std::fs::read(path) {
                 Ok(d) => d,
                 Err(e) => {
-                    return TestOutcome::LoadError {
+                    return (TestOutcome::LoadError {
                         message: format!("Failed to read ELF {:?}: {}", path, e),
-                    };
+                    }, None);
                 }
             };
 
             if let Err(e) = engine.load_elf_bytes(*col as usize, *row as usize, &data) {
-                return TestOutcome::LoadError {
+                return (TestOutcome::LoadError {
                     message: format!("Failed to load ELF into ({},{}): {}", col, row, e),
-                };
+                }, None);
             }
         }
 
@@ -444,27 +672,332 @@ impl XclbinSuite {
         let enabled = engine.enabled_cores();
         if enabled == 0 && elf_files.is_empty() {
             // No cores enabled and no ELFs - likely a reconfiguration test
-            return TestOutcome::Pass { cycles: 1 };
+            return (TestOutcome::Pass { cycles: 1, correct: None, total: None }, None);
         }
 
-        // Run until halt, error, or timeout
-        self.run_engine(&mut engine, test)
+        // Run until halt, sync completion, error, or timeout
+        let outcome = self.run_engine(&mut engine, test, input_values, npu_executor.as_ref(), output_addr);
+
+        // Capture raw output from host memory at the output buffer address
+        let raw_output = self.capture_output(&engine, test, output_addr);
+
+        // Remap outcomes for expected-fail tests, preserving the actual failure details
+        let final_outcome = if let Some(ref manifest) = test.manifest {
+            if manifest.test.expected_fail {
+                match outcome {
+                    // Test failed as expected -- wrap with details for diagnostics
+                    TestOutcome::ValidationFail { cycles, correct, total, ref first_mismatch } => {
+                        let actual = if let Some((idx, expected, got)) = first_mismatch {
+                            format!("ValidationFail: {}/{} correct, first mismatch at [{}]: expected {}, got {}",
+                                correct, total, idx, expected, got)
+                        } else {
+                            format!("ValidationFail: {}/{} correct", correct, total)
+                        };
+                        TestOutcome::ExpectedFail {
+                            cycles,
+                            reason: manifest.test.expected_fail_reason.clone(),
+                            actual,
+                        }
+                    }
+                    TestOutcome::Fail { ref message, cycles } => {
+                        TestOutcome::ExpectedFail {
+                            cycles,
+                            reason: manifest.test.expected_fail_reason.clone(),
+                            actual: format!("Fail: {}", message),
+                        }
+                    }
+                    TestOutcome::UnknownOpcode { ref details, cycles } => {
+                        let mnemonic = details.mnemonic.as_deref().unwrap_or("unknown");
+                        TestOutcome::ExpectedFail {
+                            cycles,
+                            reason: manifest.test.expected_fail_reason.clone(),
+                            actual: format!("UnknownOpcode: {:?} 0x{:04X} '{}' at PC {}",
+                                details.slot, details.opcode, mnemonic, details.pc),
+                        }
+                    }
+                    TestOutcome::Timeout { cycles } => {
+                        TestOutcome::ExpectedFail {
+                            cycles,
+                            reason: manifest.test.expected_fail_reason.clone(),
+                            actual: "Timeout".to_string(),
+                        }
+                    }
+                    // Test passed when we expected failure -- manifest needs updating
+                    TestOutcome::Pass { cycles, correct, total } => {
+                        TestOutcome::UnexpectedPass {
+                            cycles,
+                            correct: correct.unwrap_or(0),
+                            total: total.unwrap_or(0),
+                        }
+                    }
+                    // Other outcomes pass through unchanged
+                    other => other,
+                }
+            } else {
+                outcome
+            }
+        } else {
+            outcome
+        };
+
+        (final_outcome, raw_output)
+    }
+
+    /// Capture raw output bytes from host memory.
+    ///
+    /// Reads from the given output buffer address.
+    /// The size is determined by the manifest output buffer definition,
+    /// or defaults to 4KB if no manifest is available.
+    fn capture_output(&self, engine: &InterpreterEngine, test: &XclbinTest, output_addr: u64) -> Option<Vec<u8>> {
+        let output_size = if let Some(ref manifest) = test.manifest {
+            if let Some(output_buf) = manifest.get_output() {
+                if let Some(elem_type) = ElementType::from_str(&output_buf.element_type) {
+                    output_buf.size * elem_type.byte_size()
+                } else {
+                    4096
+                }
+            } else {
+                4096
+            }
+        } else {
+            4096
+        };
+
+        let mut output_data = vec![0u8; output_size];
+        engine.host_memory().read_bytes(output_addr, &mut output_data);
+        Some(output_data)
+    }
+
+    /// Setup host memory from manifest buffer definitions.
+    ///
+    /// Returns (input_values, host_buffers):
+    /// - input_values: map of buffer name -> values for expected output calculation
+    /// - host_buffers: ordered list of HostBuffer entries matching DDR patch arg_idx
+    ///
+    /// The host_buffers are ordered to match runtime_sequence arguments:
+    /// - Single-input tests: [input_a, unused, output]
+    /// - Two-input tests: [input_a, input_b, output]
+    fn setup_input_from_manifest(
+        &self,
+        engine: &mut InterpreterEngine,
+        manifest: &TestManifest,
+    ) -> (Option<HashMap<String, Vec<i64>>>, Vec<HostBuffer>) {
+        let host_mem = engine.host_memory_mut();
+        let mut inputs = HashMap::new();
+
+        // Determine buffer object (BO) count from manifest group_ids.
+        // The MLIR_AIE kernel has: arg3=bo0(gid=3), arg4=bo1(gid=4), ..., arg7=bo4(gid=7).
+        // DDR patches reference bo_index = group_id - 3.
+        // We need enough host buffers to cover max(bo_index) + 1.
+        let input_a_gid = manifest.get_input("input_a").map(|b| b.group_id).unwrap_or(3);
+        let input_b_gid = manifest.get_input("input_b").map(|b| b.group_id);
+        let output_gid = manifest.get_output().map(|b| b.group_id).unwrap_or(5);
+        let max_gid = [Some(input_a_gid), input_b_gid, Some(output_gid)]
+            .iter()
+            .filter_map(|g| *g)
+            .max()
+            .unwrap_or(5);
+        let num_bos = (max_gid.saturating_sub(3) + 1) as usize;
+
+        // Allocate buffers sequentially in host memory to avoid overlaps.
+        // Address layout: each buffer gets a non-overlapping region.
+        let mut next_addr: u64 = 0x0;
+
+        // Helper: allocate input buffer and track its address
+        let mut buffer_addrs: Vec<(u64, usize)> = vec![(0, 0); num_bos]; // (addr, size) indexed by bo_idx
+
+        // Generate primary input (input_a) if present
+        let input_a_idx = (input_a_gid - 3) as usize;
+        if let Some(input_data) = manifest.generate_input("input_a") {
+            if let Some(input_buf) = manifest.get_input("input_a") {
+                if let Some(elem_type) = ElementType::from_str(&input_buf.element_type) {
+                    let data_size = input_data.len();
+                    let alloc_size = data_size.max(4096);
+                    let _ = host_mem.allocate_region("input", next_addr, alloc_size);
+                    host_mem.write_bytes(next_addr, &input_data);
+                    inputs.insert("input_a".to_string(), read_values(&input_data, elem_type));
+                    buffer_addrs[input_a_idx] = (next_addr, data_size);
+                    next_addr += alloc_size as u64;
+                }
+            }
+        } else {
+            // No input_a: allocate default region for DDR patches
+            let _ = host_mem.allocate_region("input", 0x0, 4096);
+            buffer_addrs[input_a_idx] = (0, 4096);
+            next_addr = 4096;
+        }
+
+        // Generate secondary input (input_b) if present
+        if let Some(input_b_gid_val) = input_b_gid {
+            let input_b_idx = (input_b_gid_val - 3) as usize;
+            if let Some(input_b_data) = manifest.generate_input("input_b") {
+                if let Some(input_b_buf) = manifest.get_input("input_b") {
+                    if let Some(elem_type_b) = ElementType::from_str(&input_b_buf.element_type) {
+                        let data_size = input_b_data.len();
+                        let alloc_size = data_size.max(4096);
+                        let _ = host_mem.allocate_region("input_b", next_addr, alloc_size);
+                        host_mem.write_bytes(next_addr, &input_b_data);
+                        inputs.insert("input_b".to_string(), read_values(&input_b_data, elem_type_b));
+                        buffer_addrs[input_b_idx] = (next_addr, data_size);
+                        next_addr += alloc_size as u64;
+                    }
+                }
+            }
+        }
+
+        // Output: place after all inputs, at least 0x1000 for backward compatibility
+        let output_addr = next_addr.max(0x1000);
+        let output_idx = (output_gid - 3) as usize;
+        let mut output_size: usize = 4096;
+        if let Some(output_buf) = manifest.get_output() {
+            if let Some(output_elem_type) = ElementType::from_str(&output_buf.element_type) {
+                output_size = (output_buf.size * output_elem_type.byte_size()).max(4096);
+            }
+        }
+        let _ = host_mem.allocate_region("output", output_addr, output_size);
+        if output_idx < buffer_addrs.len() {
+            buffer_addrs[output_idx] = (output_addr, output_size);
+        }
+
+        // Fill any gaps (unused BO indices) with dummy regions
+        for i in 0..num_bos {
+            if buffer_addrs[i] == (0, 0) && i != input_a_idx {
+                // Unused buffer slot - allocate a small dummy region
+                let _ = host_mem.allocate_region(&format!("unused_bo{}", i), next_addr, 256);
+                buffer_addrs[i] = (next_addr, 256);
+                next_addr += 256;
+            }
+        }
+
+        // Build host buffer list indexed by BO index (= DDR patch arg_idx)
+        let host_buffers: Vec<HostBuffer> = buffer_addrs
+            .iter()
+            .map(|(addr, size)| HostBuffer { address: *addr, size: *size })
+            .collect();
+
+        (Some(inputs), host_buffers)
+    }
+
+    /// Validate output against manifest expected values.
+    fn validate_output(&self, engine: &InterpreterEngine, test: &XclbinTest, input_values: Option<HashMap<String, Vec<i64>>>, output_addr: u64) -> Option<(usize, usize, Option<(usize, i64, i64)>)> {
+        let manifest = test.manifest.as_ref()?;
+        let output_buf = manifest.get_output()?;
+        let elem_type = ElementType::from_str(&output_buf.element_type)?;
+
+        // Read output from host memory
+        let output_size = output_buf.size * elem_type.byte_size();
+        let mut output_data = vec![0u8; output_size];
+        engine.host_memory().read_bytes(output_addr, &mut output_data);
+        let actual_values = read_values(&output_data, elem_type);
+
+        // Generate expected values from all input buffers
+        let inputs = input_values.unwrap_or_default();
+        let expected_values = manifest.generate_expected(&inputs)?;
+
+        // Compare
+        let total = expected_values.len().min(actual_values.len());
+        let mut correct = 0;
+        let mut first_mismatch = None;
+
+        for i in 0..total {
+            if actual_values[i] == expected_values[i] {
+                correct += 1;
+            } else if first_mismatch.is_none() {
+                first_mismatch = Some((i, expected_values[i], actual_values[i]));
+            }
+        }
+
+        Some((correct, total, first_mismatch))
+    }
+
+    /// Build a completion outcome by validating output against the manifest.
+    ///
+    /// Used by both the Halted and syncs-satisfied exit paths to avoid
+    /// duplicating validation logic.
+    fn make_completion_outcome(
+        &self,
+        engine: &InterpreterEngine,
+        test: &XclbinTest,
+        input_values: Option<HashMap<String, Vec<i64>>>,
+        cycles: u64,
+        output_addr: u64,
+    ) -> TestOutcome {
+        if test.manifest.is_some() {
+            if let Some((correct, total, first_mismatch)) =
+                self.validate_output(engine, test, input_values, output_addr)
+            {
+                if correct == total && total > 0 {
+                    return TestOutcome::Pass {
+                        cycles,
+                        correct: Some(correct),
+                        total: Some(total),
+                    };
+                } else {
+                    return TestOutcome::ValidationFail {
+                        cycles,
+                        correct,
+                        total,
+                        first_mismatch,
+                    };
+                }
+            }
+        }
+        // No manifest or validation could not run -- report success
+        TestOutcome::Pass { cycles, correct: None, total: None }
     }
 
     /// Run an engine until completion.
-    fn run_engine(&self, engine: &mut InterpreterEngine, _test: &XclbinTest) -> TestOutcome {
-        let mut cycles = 0u64;
+    ///
+    /// Exits when any of the following occur:
+    /// 1. All cores halt (EngineStatus::Halted)
+    /// 2. DMA sync conditions are satisfied (NpuExecutor::syncs_satisfied)
+    /// 3. A core hits an error (EngineStatus::Error)
+    /// 4. No-progress detected (TDR -- all DMA stalled for two check intervals)
+    /// 5. Absolute cycle limit reached (safety net timeout)
+    ///
+    /// Condition 2 is the primary completion signal for real AIE2 workloads:
+    /// kernels are infinite loops that process data as DMA feeds them, and the
+    /// host determines completion by watching DMA channel status.
+    ///
+    /// Condition 4 mirrors the real xdna-driver's TDR (Timeout Detection &
+    /// Recovery) in `aie2_tdr.c`: every N cycles we snapshot total DMA bytes
+    /// transferred. If the counter doesn't advance for two consecutive check
+    /// intervals, the workload is stalled and will never complete.
+    fn run_engine(
+        &self,
+        engine: &mut InterpreterEngine,
+        test: &XclbinTest,
+        input_values: Option<HashMap<String, Vec<i64>>>,
+        npu_executor: Option<&NpuExecutor>,
+        output_addr: u64,
+    ) -> TestOutcome {
+        // TDR: No-progress detection modeled after xdna-driver aie2_tdr.c.
+        // Check every TDR_CHECK_INTERVAL cycles; declare stalled after
+        // TDR_STRIKES consecutive checks with no DMA progress.
+        // The real xdna-driver TDR waits ~2 seconds (~2 billion cycles at 1GHz).
+        // We use a shorter interval since emulation is slower, but it must be
+        // long enough to tolerate core processing time between DMA transfers.
+        // A 2048-element buffer at ~13 cycles/iteration takes ~6700 cycles of
+        // core processing with no DMA activity.
+        const TDR_CHECK_INTERVAL: u64 = 50_000;
+        const TDR_STRIKES: u32 = 2;
 
-        while cycles < self.max_cycles {
+        let mut cycles = 0u64;
+        let mut last_progress: u64 = 0;
+        let mut stall_strikes: u32 = 0;
+        let mut next_tdr_check: u64 = TDR_CHECK_INTERVAL;
+        // 0 means no hard limit -- rely on TDR only
+        let cycle_limit = if self.max_cycles == 0 { u64::MAX } else { self.max_cycles };
+
+        while cycles < cycle_limit {
             engine.step();
             cycles = engine.total_cycles();
 
             match engine.status() {
                 EngineStatus::Halted => {
-                    return TestOutcome::Pass { cycles };
+                    return self.make_completion_outcome(engine, test, input_values, cycles, output_addr);
                 }
                 EngineStatus::Error => {
-                    // Try to extract error details from the failed core
                     if let Some(details) = self.extract_error_details(engine) {
                         return details;
                     }
@@ -475,6 +1008,40 @@ impl XclbinSuite {
                 }
                 EngineStatus::Running | EngineStatus::Ready | EngineStatus::Paused => {
                     // Continue running
+                }
+            }
+
+            // Check if DMA syncs are satisfied (NPU instruction sequence complete).
+            // This mirrors the FFI path in ffi/mod.rs and is the primary completion
+            // signal for AIE2 kernels which are infinite loops.
+            if let Some(executor) = npu_executor {
+                if executor.syncs_satisfied(engine.device()) {
+                    log::info!("DMA syncs satisfied after {} cycles for test {}", cycles, test.name);
+                    return self.make_completion_outcome(engine, test, input_values, cycles, output_addr);
+                }
+            }
+
+            // TDR: periodic no-progress check modeled after xdna-driver aie2_tdr.c.
+            // Only DMA byte progress counts -- core instruction execution does not
+            // reset the TDR, matching hardware behavior where TDR catches genuinely
+            // stalled workloads (infinite loops, deadlocked locks, etc.).
+            if cycles >= next_tdr_check {
+                next_tdr_check = cycles + TDR_CHECK_INTERVAL;
+
+                let current_progress = engine.device().array.total_dma_bytes_transferred();
+                if current_progress == last_progress {
+                    stall_strikes += 1;
+                    if stall_strikes >= TDR_STRIKES {
+                        log::info!(
+                            "TDR: no DMA progress for {} checks ({} cycles) in test {}",
+                            stall_strikes, stall_strikes as u64 * TDR_CHECK_INTERVAL, test.name,
+                        );
+                        return TestOutcome::Timeout { cycles };
+                    }
+                } else {
+                    // Progress was made -- reset the strike counter
+                    stall_strikes = 0;
+                    last_progress = current_progress;
                 }
             }
         }
@@ -530,15 +1097,23 @@ impl XclbinSuite {
 
         report.push_str("=== XCLBIN Test Suite Results ===\n\n");
         report.push_str(&format!(
-            "Total: {}, Passed: {}, Failed: {}, Unknown Opcodes: {}, Timeout: {}, Load Error: {}\n\n",
-            result.total, result.passed, result.failed, result.unknown, result.timeout, result.load_error
+            "Total: {}, Passed: {}, Validation Failed: {}, Expected Fail: {}, Unexpected Pass: {}, Skipped: {}, Failed: {}, Unknown Opcodes: {}, Timeout: {}, Load Error: {}\n\n",
+            result.total, result.passed, result.validation_failed,
+            result.expected_fail, result.unexpected_pass, result.skipped,
+            result.failed, result.unknown, result.timeout, result.load_error
         ));
 
         // List failed tests
-        if result.failed > 0 || result.unknown > 0 || result.timeout > 0 {
+        if result.failed > 0 || result.validation_failed > 0 || result.unknown > 0 || result.timeout > 0 {
             report.push_str("--- Failed Tests ---\n");
             for (name, outcome) in &self.results {
                 match outcome {
+                    TestOutcome::ValidationFail { cycles, correct, total, first_mismatch } => {
+                        report.push_str(&format!("{}: VALIDATION FAIL after {} cycles ({}/{} correct)\n", name, cycles, correct, total));
+                        if let Some((idx, expected, actual)) = first_mismatch {
+                            report.push_str(&format!("  First mismatch at [{}]: expected {}, got {}\n", idx, expected, actual));
+                        }
+                    }
                     TestOutcome::Fail { message, cycles } => {
                         report.push_str(&format!("{}: FAIL after {} cycles - {}\n", name, cycles, message));
                     }
@@ -560,12 +1135,58 @@ impl XclbinSuite {
             report.push('\n');
         }
 
+        // List expected-fail tests
+        if result.expected_fail > 0 {
+            report.push_str("--- Expected Failures (known-broken) ---\n");
+            for (name, outcome) in &self.results {
+                if let TestOutcome::ExpectedFail { cycles, reason, actual } = outcome {
+                    report.push_str(&format!("{}: EXPECTED FAIL ({} cycles)\n", name, cycles));
+                    if !reason.is_empty() {
+                        report.push_str(&format!("  reason: {}\n", reason));
+                    }
+                    report.push_str(&format!("  actual: {}\n", actual));
+                }
+            }
+            report.push('\n');
+        }
+
+        // List unexpected passes (known-broken tests that suddenly work)
+        if result.unexpected_pass > 0 {
+            report.push_str("--- Unexpected Passes (update manifests!) ---\n");
+            for (name, outcome) in &self.results {
+                if let TestOutcome::UnexpectedPass { cycles, correct, total } = outcome {
+                    report.push_str(&format!("{}: UNEXPECTED PASS ({} cycles, {}/{} correct) - remove expected_fail from manifest\n",
+                        name, cycles, correct, total));
+                }
+            }
+            report.push('\n');
+        }
+
         // List passed tests
         if result.passed > 0 {
             report.push_str("--- Passed Tests ---\n");
             for (name, outcome) in &self.results {
-                if let TestOutcome::Pass { cycles } = outcome {
-                    report.push_str(&format!("{}: PASS ({} cycles)\n", name, cycles));
+                if let TestOutcome::Pass { cycles, correct, total } = outcome {
+                    if let (Some(c), Some(t)) = (correct, total) {
+                        report.push_str(&format!("{}: PASS ({} cycles, {}/{} validated)\n", name, cycles, c, t));
+                    } else {
+                        report.push_str(&format!("{}: PASS ({} cycles)\n", name, cycles));
+                    }
+                }
+            }
+            report.push('\n');
+        }
+
+        // List skipped tests
+        if result.skipped > 0 {
+            report.push_str("--- Skipped Tests ---\n");
+            for (name, outcome) in &self.results {
+                if let TestOutcome::Skipped { reason } = outcome {
+                    if reason.is_empty() {
+                        report.push_str(&format!("{}: SKIPPED\n", name));
+                    } else {
+                        report.push_str(&format!("{}: SKIPPED - {}\n", name, reason));
+                    }
                 }
             }
             report.push('\n');
@@ -600,11 +1221,11 @@ impl XclbinSuite {
         let input: Vec<u32> = (1..=1024).collect();
         host_mem.write_slice(0x0, &input);
 
-        // Allocate middle buffer (unused by most tests)
-        let _ = host_mem.allocate_region("middle", 0x100, 256);
+        // Allocate middle buffer after input (avoids overlap with input data)
+        let _ = host_mem.allocate_region("middle", 0x1000, 256);
 
-        // Allocate output region (4KB at 0x1000)
-        let _ = host_mem.allocate_region("output", 0x1000, 4096);
+        // Allocate output region (4KB at 0x2000, after input + middle)
+        let _ = host_mem.allocate_region("output", 0x2000, 4096);
     }
 }
 
@@ -623,6 +1244,14 @@ pub struct SuiteResult {
     pub passed: usize,
     /// Number of failed tests.
     pub failed: usize,
+    /// Number of tests that failed output validation.
+    pub validation_failed: usize,
+    /// Number of known-broken tests that failed as expected.
+    pub expected_fail: usize,
+    /// Number of known-broken tests that unexpectedly passed.
+    pub unexpected_pass: usize,
+    /// Number of skipped tests.
+    pub skipped: usize,
     /// Number of tests that hit unknown opcodes.
     pub unknown: usize,
     /// Number of tests that timed out.
@@ -632,12 +1261,13 @@ pub struct SuiteResult {
 }
 
 impl SuiteResult {
-    /// Get pass rate as a percentage.
+    /// Get pass rate as a percentage (excludes skipped tests from the denominator).
     pub fn pass_rate(&self) -> f64 {
-        if self.total == 0 {
+        let effective_total = self.total - self.skipped;
+        if effective_total == 0 {
             0.0
         } else {
-            (self.passed as f64 / self.total as f64) * 100.0
+            (self.passed as f64 / effective_total as f64) * 100.0
         }
     }
 }
@@ -670,10 +1300,32 @@ mod tests {
             total: 10,
             passed: 7,
             failed: 1,
+            validation_failed: 0,
+            expected_fail: 0,
+            unexpected_pass: 0,
+            skipped: 0,
             unknown: 1,
             timeout: 1,
             load_error: 0,
         };
         assert!((result.pass_rate() - 70.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_suite_result_pass_rate_with_skipped() {
+        let result = SuiteResult {
+            total: 10,
+            passed: 7,
+            failed: 1,
+            validation_failed: 0,
+            expected_fail: 0,
+            unexpected_pass: 0,
+            skipped: 2,
+            unknown: 0,
+            timeout: 0,
+            load_error: 0,
+        };
+        // 7 passed out of 8 non-skipped = 87.5%
+        assert!((result.pass_rate() - 87.5).abs() < 0.01);
     }
 }

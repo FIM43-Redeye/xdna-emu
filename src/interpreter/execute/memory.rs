@@ -69,11 +69,6 @@ impl MemoryUnit {
     ///
     /// Returns `true` if the operation was handled, `false` if not a memory op.
     pub fn execute(op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) -> bool {
-        #[cfg(test)]
-        if matches!(&op.op, Operation::PointerMov) {
-            eprintln!("[MEM EXEC] Got PointerMov: dest={:?} sources={:?}", op.dest, op.sources);
-        }
-
         match &op.op {
             Operation::Load { width, post_modify } => {
                 Self::execute_load(op, ctx, tile, *width, post_modify);
@@ -146,10 +141,6 @@ impl MemoryUnit {
         // Add offset to pointer (wrapping)
         let new_value = (ptr_value as i32).wrapping_add(offset) as u32;
 
-        #[cfg(test)]
-        eprintln!("[PADD] p{}=0x{:04X} + {} = 0x{:04X} sources={:?} dest={:?}",
-            ptr_reg, ptr_value, offset, new_value, op.sources, op.dest);
-
         ctx.pointer.write(ptr_reg, new_value);
     }
 
@@ -159,11 +150,7 @@ impl MemoryUnit {
         // Get destination pointer register
         let ptr_reg = match &op.dest {
             Some(Operand::PointerReg(r)) => *r,
-            _ => {
-                #[cfg(test)]
-                eprintln!("[PMOV] No dest pointer! dest={:?}", op.dest);
-                return; // No valid destination
-            }
+            _ => return,
         };
 
         // Get value from source operand
@@ -173,9 +160,6 @@ impl MemoryUnit {
             Some(Operand::PointerReg(r)) => ctx.pointer.read(*r),
             _ => 0,
         };
-
-        #[cfg(test)]
-        eprintln!("[PMOV] p{}=0x{:04X} sources={:?}", ptr_reg, value, op.sources);
 
         ctx.pointer.write(ptr_reg, value);
     }
@@ -191,8 +175,6 @@ impl MemoryUnit {
         // Get address from source operand
         let addr = Self::get_address(op, ctx);
 
-        log::debug!("[LOAD] addr=0x{:04X} sources={:?} dest={:?}", addr, op.sources, op.dest);
-
         // Handle full vector loads specially
         if width == MemWidth::Vector256 {
             let vec_data = Self::read_vector_from_memory(tile, addr);
@@ -202,7 +184,6 @@ impl MemoryUnit {
         } else {
             // Scalar/partial loads
             let value = Self::read_memory(tile, addr, width);
-            log::debug!("[LOAD] loaded value=0x{:08X} ({}) to {:?}", value, value, op.dest);
             Self::write_dest(op, ctx, value, width);
         }
 
@@ -220,11 +201,6 @@ impl MemoryUnit {
     ) {
         // Get address using store-specific layout: sources[1]=ptr, sources[2]=offset
         let addr = Self::get_store_address(op, ctx);
-
-        // Debug: log store operations with full pointer state
-        log::debug!("[STORE] addr=0x{:04X} sources={:?} dest={:?} pointers=[p0=0x{:X},p1=0x{:X},p2=0x{:X},p3=0x{:X}]",
-            addr, op.sources, op.dest,
-            ctx.pointer.read(0), ctx.pointer.read(1), ctx.pointer.read(2), ctx.pointer.read(3));
 
         // Handle full vector stores specially
         if width == MemWidth::Vector256 {
@@ -245,7 +221,6 @@ impl MemoryUnit {
         } else {
             // Scalar/partial stores
             let value = Self::get_store_value(op, ctx, width);
-            log::debug!("[STORE] value=0x{:08X} width={:?}", value, width);
             Self::write_memory(tile, addr, value, width);
         }
 
@@ -265,12 +240,6 @@ impl MemoryUnit {
         post_modify: &PostModify,
     ) {
         let addr = Self::get_address(op, ctx);
-
-        #[cfg(test)]
-        eprintln!(
-            "[VLDA] addr=0x{:04X} sources={:?} dest={:?}",
-            addr, op.sources, op.dest
-        );
 
         // Read 256 bits (32 bytes) from memory
         let vec_data = Self::read_vector_from_memory(tile, addr);
@@ -296,12 +265,6 @@ impl MemoryUnit {
         post_modify: &PostModify,
     ) {
         let addr = Self::get_address(op, ctx);
-
-        #[cfg(test)]
-        eprintln!(
-            "[VLDB] addr=0x{:04X} sources={:?} dest={:?}",
-            addr, op.sources, op.dest
-        );
 
         // Read 256 bits (32 bytes) from memory
         let vec_data = Self::read_vector_from_memory(tile, addr);
@@ -330,12 +293,6 @@ impl MemoryUnit {
         post_modify: &PostModify,
     ) {
         let addr = Self::get_address(op, ctx);
-
-        #[cfg(test)]
-        eprintln!(
-            "[VLDB_UNPACK] addr=0x{:04X} from={:?} to={:?} sources={:?} dest={:?}",
-            addr, from_type, to_type, op.sources, op.dest
-        );
 
         // Calculate how many bytes to load based on source element type
         // and the fact that we produce a full 256-bit vector
@@ -452,12 +409,6 @@ impl MemoryUnit {
     ) {
         let addr = Self::get_address(op, ctx);
 
-        #[cfg(test)]
-        eprintln!(
-            "[VST] addr=0x{:04X} sources={:?} dest={:?}",
-            addr, op.sources, op.dest
-        );
-
         // Get vector register from source or dest
         // For VST, the vector data comes from a source operand (second source)
         // or sometimes the dest field is used for the value
@@ -538,21 +489,15 @@ impl MemoryUnit {
             return ctx.pointer.read(*r);
         }
 
-        // Otherwise: kernel layout - sources[1] is pointer, sources[2] is offset
-        let ptr_val = op.sources.get(1).map_or(0, |src| match src {
+        // Kernel layout: sources[0]=value, sources[1]=pointer, sources[2]=post-modify
+        // The store address is just the pointer value. sources[2] is the
+        // post-modify amount (applied after the store), NOT a pre-offset.
+        op.sources.get(1).map_or(0, |src| match src {
             Operand::PointerReg(r) => ctx.pointer.read(*r),
             Operand::ScalarReg(r) => ctx.scalar.read(*r),
             Operand::Immediate(v) => *v as u32,
             _ => 0,
-        });
-
-        let offset = op.sources.get(2).map_or(0, |src| match src {
-            Operand::Immediate(v) => (*v as i32 * 4) as u32, // Scale by word size
-            Operand::ScalarReg(r) => ctx.scalar.read(*r).wrapping_mul(4),
-            _ => 0,
-        });
-
-        ptr_val.wrapping_add(offset)
+        })
     }
 
     /// Get value to store.
@@ -748,8 +693,11 @@ impl MemoryUnit {
 
     /// Apply post-modify to the base address register.
     fn apply_post_modify(op: &SlotOp, ctx: &mut ExecutionContext, post_modify: &PostModify) {
-        // Find the pointer register used as base
-        let ptr_reg = op.sources.first().and_then(|src| match src {
+        // Find the pointer register used as base address.
+        // For loads: sources[0] is typically the pointer.
+        // For stores: sources[0] is the value, sources[1] is the pointer.
+        // Search all sources for the first PointerReg or Memory operand.
+        let ptr_reg = op.sources.iter().find_map(|src| match src {
             Operand::Memory { base, .. } => Some(*base),
             Operand::PointerReg(r) => Some(*r),
             _ => None,

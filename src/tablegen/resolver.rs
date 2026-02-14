@@ -30,6 +30,85 @@ use std::collections::HashMap;
 
 use super::types::{EncodingPart, FormatClass, ImplicitReg, InstrDef, MixinClass, SemanticOp, SlotDef, TableGenData};
 
+/// Addressing mode extracted from the TableGen instruction name.
+///
+/// The AIE2 instruction naming convention encodes the addressing mode:
+/// - `_idx_imm` -> IndexedImmediate:   *(ptr + imm), no pointer update
+/// - `_idx` (no _imm) -> IndexedRegister: *(ptr + mN), no pointer update
+/// - `_pstm_*_imm` -> PostModifyImmediate: t = *ptr, ptr += imm
+/// - `_pstm_*` (no _imm) -> PostModifyRegister: t = *ptr, ptr += mN
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AddressingMode {
+    #[default]
+    Unknown,
+    /// *(ptr + imm), pointer unchanged
+    IndexedImmediate,
+    /// *(ptr + mN), pointer unchanged
+    IndexedRegister,
+    /// t = *ptr; ptr += imm
+    PostModifyImmediate,
+    /// t = *ptr; ptr += mN
+    PostModifyRegister,
+}
+
+/// Memory access width extracted from the instruction mnemonic.
+///
+/// The mnemonic suffix determines the width:
+/// - `lda.s8` / `lda.u8` -> Byte (8-bit)
+/// - `lda.s16` / `lda.u16` -> HalfWord (16-bit)
+/// - `lda` (no suffix) -> Word (32-bit)
+/// - `vlda` / `vldb` / `vst` -> Vector256 (256-bit)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InstrMemWidth {
+    Byte,
+    HalfWord,
+    #[default]
+    Word,
+    Vector256,
+}
+
+/// Detect addressing mode from the TableGen instruction name.
+///
+/// Uses the deterministic naming convention from llvm-aie's class hierarchy:
+/// format class names propagate into instruction names as suffixes.
+pub fn detect_addressing_mode(instr_name: &str) -> AddressingMode {
+    let lower = instr_name.to_lowercase();
+    if lower.contains("_pstm_") {
+        if lower.ends_with("_imm") || lower.contains("_imm_") {
+            AddressingMode::PostModifyImmediate
+        } else {
+            AddressingMode::PostModifyRegister
+        }
+    } else if lower.contains("_idx") {
+        if lower.ends_with("_imm") || lower.contains("_imm_") {
+            AddressingMode::IndexedImmediate
+        } else {
+            AddressingMode::IndexedRegister
+        }
+    } else {
+        AddressingMode::Unknown
+    }
+}
+
+/// Detect memory access width from the instruction mnemonic.
+///
+/// Uses the assembly mnemonic suffix convention: `.s8`, `.u16`, etc.
+/// Vector operations (`vlda`, `vldb`, `vst`) are always 256-bit.
+pub fn detect_mem_width(mnemonic: &str) -> InstrMemWidth {
+    let lower = mnemonic.to_lowercase();
+    if lower.starts_with("vlda") || lower.starts_with("vldb")
+        || lower.starts_with("vst")
+    {
+        InstrMemWidth::Vector256
+    } else if lower.contains(".s8") || lower.contains(".u8") {
+        InstrMemWidth::Byte
+    } else if lower.contains(".s16") || lower.contains(".u16") {
+        InstrMemWidth::HalfWord
+    } else {
+        InstrMemWidth::Word
+    }
+}
+
 /// A resolved operand field within an instruction encoding.
 ///
 /// Specifies where an operand can be extracted from the instruction bits.
@@ -140,6 +219,14 @@ pub struct InstrEncoding {
     /// For example, `sel.eqz` reads r27 implicitly (via `eR27:$s2` in TableGen).
     /// These registers are not encoded in instruction bits - they're fixed.
     pub implicit_regs: Vec<ImplicitReg>,
+
+    /// Addressing mode detected from instruction name (e.g., `_pstm_nrm_imm`).
+    /// Used by the decoder to correctly extract post-modify vs indexed operands.
+    pub addressing_mode: AddressingMode,
+
+    /// Memory access width detected from mnemonic (e.g., `.s8` -> Byte).
+    /// Used by the decoder to set the correct MemWidth on Load/Store operations.
+    pub mem_width: InstrMemWidth,
 }
 
 impl InstrEncoding {
@@ -315,6 +402,8 @@ impl<'a> Resolver<'a> {
             input_order,
             output_order,
             implicit_regs: instr.implicit_regs.clone(),
+            addressing_mode: detect_addressing_mode(&instr.name),
+            mem_width: detect_mem_width(&instr.mnemonic),
         })
     }
 
@@ -779,16 +868,32 @@ pub fn infer_semantic_from_mnemonic(mnemonic: &str) -> Option<SemanticOp> {
     }
 
     // Memory operations
+    // Vector load/store must come before scalar to avoid vlda matching "lda"
+    if lower.starts_with("vlda") || lower.starts_with("vldb") {
+        return Some(SemanticOp::Load);
+    }
+    if lower.starts_with("vst") {
+        return Some(SemanticOp::Store);
+    }
+    // Scalar load B channel
+    if lower.starts_with("ldb") {
+        return Some(SemanticOp::Load);
+    }
     if lower.starts_with("lda") || lower.starts_with("ld.") {
         return Some(SemanticOp::Load);
     }
-    if lower.starts_with("st.") || lower == "st" {
+    if lower.starts_with("st.") || lower == "st" || lower.starts_with("st ") {
         return Some(SemanticOp::Store);
     }
 
     // Nop
     if lower == "nop" || lower.starts_with("nop") {
         return Some(SemanticOp::Nop);
+    }
+
+    // Done (core termination/halt)
+    if lower == "done" {
+        return Some(SemanticOp::Done);
     }
 
     // Unsigned comparisons (ltu, leu, gtu, geu)
@@ -879,7 +984,6 @@ pub fn infer_semantic_from_mnemonic(mnemonic: &str) -> Option<SemanticOp> {
 mod tests {
     use super::*;
     use crate::tablegen::types::{InstrAttributes, OperandDef, TemplateParam};
-    use std::collections::HashSet;
 
     fn make_test_data() -> TableGenData {
         let mut data = TableGenData::new();
@@ -987,14 +1091,18 @@ mod tests {
         assert_eq!(encoding.operand_fields.len(), 3);
 
         // mRx0 at bits 19:15, mRx at 14:10, mRy at 9:5
+        // Names match AIE TableGen register field names (not Rust convention)
+        #[allow(non_snake_case)]
         let mRx0 = encoding.operand_fields.iter().find(|f| f.name == "mRx0").unwrap();
         assert_eq!(mRx0.bit_position, 15);
         assert_eq!(mRx0.width, 5);
 
+        #[allow(non_snake_case)]
         let mRx = encoding.operand_fields.iter().find(|f| f.name == "mRx").unwrap();
         assert_eq!(mRx.bit_position, 10);
         assert_eq!(mRx.width, 5);
 
+        #[allow(non_snake_case)]
         let mRy = encoding.operand_fields.iter().find(|f| f.name == "mRy").unwrap();
         assert_eq!(mRy.bit_position, 5);
         assert_eq!(mRy.width, 5);
@@ -1286,6 +1394,9 @@ mod tests {
         assert_eq!(infer_semantic_from_mnemonic("acq"), Some(SemanticOp::LockAcquire));
         assert_eq!(infer_semantic_from_mnemonic("rel"), Some(SemanticOp::LockRelease));
 
+        // Done (halt) operation
+        assert_eq!(infer_semantic_from_mnemonic("done"), Some(SemanticOp::Done));
+
         // Unknown mnemonics return None
         assert_eq!(infer_semantic_from_mnemonic("unknown"), None);
     }
@@ -1351,6 +1462,70 @@ mod tests {
         assert_eq!(encoding.implicit_regs.len(), 1);
         assert_eq!(encoding.implicit_regs[0].reg_num, 27);
         assert!(encoding.implicit_regs[0].is_use);
+    }
+
+    #[test]
+    fn test_detect_addressing_mode() {
+        // Post-modify immediate
+        assert_eq!(
+            detect_addressing_mode("LDA_dms_lda_pstm_nrm_imm"),
+            AddressingMode::PostModifyImmediate
+        );
+        assert_eq!(
+            detect_addressing_mode("ST_dms_st_pstm_nrm_imm"),
+            AddressingMode::PostModifyImmediate
+        );
+
+        // Post-modify register
+        assert_eq!(
+            detect_addressing_mode("LDA_dms_lda_pstm_nrm"),
+            AddressingMode::PostModifyRegister
+        );
+
+        // Indexed immediate
+        assert_eq!(
+            detect_addressing_mode("LDA_S8_ag_idx_imm"),
+            AddressingMode::IndexedImmediate
+        );
+        assert_eq!(
+            detect_addressing_mode("LDA_dms_lda_idx_imm"),
+            AddressingMode::IndexedImmediate
+        );
+
+        // Indexed register
+        assert_eq!(
+            detect_addressing_mode("LDA_dms_lda_idx"),
+            AddressingMode::IndexedRegister
+        );
+
+        // Unknown (non-memory instructions)
+        assert_eq!(
+            detect_addressing_mode("ADD_add_r_ri"),
+            AddressingMode::Unknown
+        );
+    }
+
+    #[test]
+    fn test_detect_mem_width() {
+        // Byte (8-bit)
+        assert_eq!(detect_mem_width("lda.s8"), InstrMemWidth::Byte);
+        assert_eq!(detect_mem_width("lda.u8"), InstrMemWidth::Byte);
+        assert_eq!(detect_mem_width("st.s8"), InstrMemWidth::Byte);
+
+        // HalfWord (16-bit)
+        assert_eq!(detect_mem_width("lda.s16"), InstrMemWidth::HalfWord);
+        assert_eq!(detect_mem_width("lda.u16"), InstrMemWidth::HalfWord);
+        assert_eq!(detect_mem_width("st.u16"), InstrMemWidth::HalfWord);
+
+        // Word (32-bit, default)
+        assert_eq!(detect_mem_width("lda"), InstrMemWidth::Word);
+        assert_eq!(detect_mem_width("st"), InstrMemWidth::Word);
+        assert_eq!(detect_mem_width("add"), InstrMemWidth::Word);
+
+        // Vector (256-bit)
+        assert_eq!(detect_mem_width("vlda"), InstrMemWidth::Vector256);
+        assert_eq!(detect_mem_width("vldb"), InstrMemWidth::Vector256);
+        assert_eq!(detect_mem_width("vst"), InstrMemWidth::Vector256);
     }
 
     #[test]

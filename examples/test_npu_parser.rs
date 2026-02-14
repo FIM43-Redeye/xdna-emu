@@ -4,7 +4,12 @@ use std::io::{Cursor, Read};
 use byteorder::{LittleEndian, ReadBytesExt};
 
 fn main() {
-    let data = std::fs::read("/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/insts.bin").unwrap();
+    let config = xdna_emu::config::Config::get();
+    let insts_path = config.mlir_aie_subpath(
+        "build/test/npu-xrt/add_one_using_dma/insts.bin",
+    );
+    let data = std::fs::read(&insts_path)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {} (set MLIR_AIE_PATH)", insts_path.display(), e));
     println!("File size: {} bytes", data.len());
 
     let mut cursor = Cursor::new(&data[..]);

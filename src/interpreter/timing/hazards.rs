@@ -467,7 +467,6 @@ impl SlotOpExt for SlotOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::bundle::SlotIndex;
 
     #[test]
     fn test_no_hazard() {

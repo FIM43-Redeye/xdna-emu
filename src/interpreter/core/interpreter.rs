@@ -421,7 +421,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::bundle::{Operation, Operand, SlotIndex, SlotOp, MemWidth, PostModify, BranchCondition};
 
     fn make_interpreter() -> CoreInterpreter {
         CoreInterpreter::default_new()
@@ -513,7 +512,7 @@ mod tests {
 
     #[test]
     fn test_status_transitions() {
-        let mut interpreter = make_interpreter();
+        let interpreter = make_interpreter();
 
         assert_eq!(interpreter.status(), CoreStatus::Ready);
         assert!(!interpreter.is_halted());

@@ -34,23 +34,26 @@ The project is designed to be generic from the start. We're building on **AIE2 (
 | Task | Status | Notes |
 |------|--------|-------|
 | NPU1 (Phoenix) - AIE2 | 🟡 Primary target | Current development focus |
-| NPU2 (Strix) - AIE2P | 🔲 TODO | Incremental from AIE2 |
-| NPU3 (Strix Halo) - AIE2P, larger array | 🔲 TODO | Same as NPU2, different array size |
-| NPU4 (Krackan) - AIE2P | 🔲 TODO | Same as NPU2 |
+| NPU4 (Strix Point) - AIE2P | 🔲 TODO | Incremental from AIE2 |
+| NPU5 (Strix Halo) - AIE2P, larger array | 🔲 TODO | Same as NPU4, different array size |
+| NPU6 (Krackan) - AIE2P | 🔲 TODO | Same as NPU4 |
 | Device auto-detection from xclbin | 🔲 TODO | |
 
 ### Device Matrix
 
 | Device | Codename | Architecture | Array Size |
 |--------|----------|--------------|------------|
-| NPU1 | Phoenix/HawkPoint | AIE2 (XDNA) | 4 cols × 6 rows |
-| NPU2 | Strix | AIE2P (XDNA2) | 4 cols × 6 rows |
-| NPU3 | Strix Halo | AIE2P (XDNA2) | 8 cols × 6 rows |
-| NPU4 | Krackan | AIE2P (XDNA2) | 4 cols × 6 rows |
+| NPU1 | Phoenix/Hawk Point | AIE2 (XDNA) | 4 cols x 6 rows |
+| NPU4 | Strix Point | AIE2P (XDNA2) | 4 cols x 6 rows |
+| NPU5 | Strix Halo | AIE2P (XDNA2) | 8 cols x 6 rows |
+| NPU6 | Krackan | AIE2P (XDNA2) | 4 cols x 6 rows |
+
+**Note**: Driver IDs NPU2/NPU3 are prototypes marked for deprecation -- not consumer devices.
+Array sizes include the shim tile row (row 0).
 
 ### Strategy
 
-AIE2 and AIE2P share ~90% of the architecture. Key differences are isolated:
+AIE2 and AIE2P share most of the architecture. Key differences are isolated:
 - Additional vector instructions in AIE2P
 - Slightly different DMA capabilities
 - Same register model, same VLIW structure

@@ -44,6 +44,18 @@ egui_extras = { version = "0.31", features = ["image"] } # Extra widgets
 log = "0.4"
 env_logger = "0.11"
 
+[features]
+default = []
+# Enable integration tests that require built mlir-aie test binaries (xclbin files).
+# Build binaries first: ./scripts/build-mlir-aie-tests.sh
+# Run tests: cargo test --features xclbin-tests
+xclbin-tests = []
+# Enable hardware cross-validation tests (emulator vs real NPU).
+# Requires: built test binaries + captured NPU outputs in tests/npu-outputs/
+# Capture first: cargo run --example capture_npu_outputs
+# Run tests: cargo test --features hardware-compare
+hardware-compare = []
+
 [dev-dependencies]
 hex = "0.4"                                             # Hex dump utilities for debugging
 

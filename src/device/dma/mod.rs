@@ -61,12 +61,16 @@
 //! ```
 
 pub mod addressing;
+pub mod bd;
+pub mod stream_io;
 pub mod transfer;
 pub mod engine;
 pub mod timing;
 pub mod compression;
 
 pub use addressing::{AddressGenerator, DimensionConfig, AddressIterator, IterationConfig};
+pub use bd::{BufferDescriptor, bd_base_address, bd_count, bd_register_count, BD_SPACING};
+pub use stream_io::{StreamWord, PacketHeader};
 pub use transfer::{Transfer, TransferState, TransferDirection, TransferEndpoint, parse_ooo_bd_id_from_header, parse_source_tile_from_header};
 pub use engine::{DmaEngine, ChannelState, ChannelId, StreamData, TaskCompleteToken, ChannelTaskConfig, TaskQueueEntry, MAX_TASK_QUEUE_DEPTH};
 pub use timing::{DmaTimingConfig, ChannelTimingState, TransferPhase, ChannelArbiter};

@@ -2,6 +2,29 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Workspace Setup
+
+**Start Claude from the parent `npu-work` directory**, not from xdna-emu directly:
+
+```bash
+cd /home/triple/npu-work
+claude
+```
+
+This ensures:
+- NPU development environment auto-activates (Python 3.13, mlir-aie, Peano compiler)
+- XRT and hardware access are configured
+- Helper functions like `npu-compile` and `npu-run-quiet` are available
+
+The workspace contains:
+- `xdna-emu/` - This emulator project (main focus)
+- `mlir-aie/` - MLIR-based AIE compiler and test suite
+- `llvm-aie/` - Peano compiler (LLVM with AIE backend)
+
+See `/home/triple/npu-work/CLAUDE.md` for environment details.
+
+---
+
 There is one absolutely critical rule to always keep to: **REFER TO THE DOCUMENTATION.** The way to do so is described below, using Explore agents, since the body of documentation is very large.
 
 ## Project Vision
@@ -11,48 +34,70 @@ There is one absolutely critical rule to always keep to: **REFER TO THE DOCUMENT
 ### Goals
 1. **Binary-Compatible Emulation**: Load real `.xclbin` binaries, execute them faithfully
 2. **Visual Debugging**: See tiles, data flow, DMA transfers, locks, routing in real-time
-3. **Hardware Validation**: Run in emulator → run on real NPU → compare results
+3. **Hardware Validation**: Run in emulator -> run on real NPU -> compare results
 4. **Optional Compilation**: Invoke Peano compiler to build kernels, run immediately
 
 ### The Dream Workflow
 ```
 Write kernel.cc
-    ↓
-xdna-emu compiles via Peano → kernel.xclbin
-    ↓
+    |
+xdna-emu compiles via Peano -> kernel.xclbin
+    |
 xdna-emu emulates (visual, step-through, breakpoints)
-    ↓
+    |
 "Run on Hardware" button
-    ↓
+    |
 Same binary executes on real NPU via XRT
-    ↓
+    |
 Compare emulated vs actual results
 ```
 
 ## Current Status
 
-See [ROADMAP.md](ROADMAP.md) for high-level progress, or dive into:
-- [Phase 1: Core Accuracy](docs/roadmap/phase1-core-accuracy.md) - 🟢 Functional (100% binary recognition, timing pending)
-- [Phase 2: Toolchain Integration](docs/roadmap/phase2-toolchain-integration.md) - 🔴 Not Started
-- [Phase 3: Developer Experience](docs/roadmap/phase3-developer-experience.md) - 🟡 GUI Exists
-- [Phase 4: Validation & Testing](docs/roadmap/phase4-validation-testing.md) - 🟡 433 Tests
-- [Phase 5: Production Readiness](docs/roadmap/phase5-production-readiness.md) - 🔴 Not Started
-- [Phase 6: Community & Ecosystem](docs/roadmap/phase6-community-ecosystem.md) - 🔴 Not Started
+See [ROADMAP.md](ROADMAP.md) for detailed status with confidence markers
+(VERIFIED / OBSERVED / CLAIMED).
 
-**Current focus**: Phase 1 - DMA/stream switch integration for multi-tile execution
+| Phase | Status | Summary |
+|-------|--------|---------|
+| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | Functional | Unit tests pass; real-binary coverage is thin |
+| [2. Toolchain Integration](docs/roadmap/phase2-toolchain-integration.md) | Not started | Peano-first; Vitis deferred to post-1.0 |
+| [3. Developer Experience](docs/roadmap/phase3-developer-experience.md) | GUI exists | GUI renders; debugging features not built |
+| [4. Validation & Testing](docs/roadmap/phase4-validation-testing.md) | In progress | Test harness exists; coverage has major gaps |
+| [5. Production Readiness](docs/roadmap/phase5-production-readiness.md) | Not started | |
+| [6. Community & Ecosystem](docs/roadmap/phase6-community-ecosystem.md) | Not started | |
+
+Run `cargo test --lib` to see the current test count. Do not rely on
+numbers written in documentation -- they go stale within a session.
 
 ## Target Devices
 
-| Device | Codename | Architecture | Array Size | Status |
-|--------|----------|--------------|------------|--------|
-| NPU1 | Phoenix/HawkPoint | AIE2 (XDNA) | 4 cols × 6 rows | **Primary target** |
-| NPU2 | Strix | AIE2P (XDNA2) | 4 cols × 6 rows | Planned |
-| NPU3 | Strix Halo | AIE2P (XDNA2) | 8 cols × 6 rows | Planned |
-| NPU4 | Krackan | AIE2P (XDNA2) | 4 cols × 6 rows | Planned |
+These are the official device names from the xdna-driver source:
 
-We're starting with **Phoenix (NPU1/AIE2)** because it's the hardware we have. The architecture is generic - AIE2P support will be incremental once AIE2 is solid.
+| Driver ID | Product Name | Codename | Architecture | Array Size | Status |
+|-----------|--------------|----------|--------------|------------|--------|
+| NPU1 | Ryzen AI | Phoenix/Hawk Point | AIE2 (XDNA) | 5 cols x 6 rows | **Primary target** |
+| NPU4 | Ryzen AI 300 | Strix Point | AIE2P (XDNA2) | 5 cols x 6 rows | Planned |
+| NPU5 | Ryzen AI Max | Strix Halo | AIE2P (XDNA2) | 8+ cols x 6 rows | Planned |
+| NPU6 | (TBD) | Krackan | AIE2P (XDNA2) | 5 cols x 6 rows | Planned |
 
-**Not in scope**: Versal FPGAs (AIE + PL fabric) - different use case, no local hardware.
+Array sizes include the shim tile row (row 0). Driver IDs NPU2/NPU3 are
+prototypes marked for deprecation -- not consumer devices.
+
+We are starting with **Phoenix (NPU1/AIE2)** because it is the hardware we have.
+AIE2P support will be incremental once AIE2 is solid.
+
+### mlir-aie Device Target Naming
+
+mlir-aie uses different device names that can be confusing:
+
+| mlir-aie target | Maps to Driver | Architecture |
+|-----------------|----------------|--------------|
+| `npu1`, `npu1_Xcol` | NPU1 (Phoenix) | AIE2 |
+| `npu2`, `npu2_Xcol` | NPU4 (Strix) | AIE2P |
+| `xcvc1902` | N/A (Versal) | AIE1 |
+| `xcve2802` | N/A (Versal) | AIE2 |
+
+**Not in scope**: Versal FPGAs (AIE1 + PL fabric) - different use case, no local hardware. However, AIE1 support may be added later since the TableGen parser handles multiple architectures.
 
 ## Architecture Knowledge Sources
 
@@ -125,66 +170,28 @@ Using `eframe` (egui framework) for the visual debugger:
 - Immediate mode - simple state management
 - Cross-platform (Linux, Windows, macOS, web)
 
-## Repository Structure
+## Component Documentation
 
-```
-xdna-emu/
-├── README.md             # User documentation
-├── ROADMAP.md            # High-level development plan
-├── CLAUDE.md             # AI assistant context (this file)
-├── Cargo.toml
-├── src/
-│   ├── main.rs           # CLI + GUI entry point
-│   ├── lib.rs
-│   ├── parser/           # Binary format parsers
-│   │   ├── xclbin.rs     # XCLBIN container
-│   │   ├── aie_partition.rs
-│   │   ├── cdo.rs        # CDO commands
-│   │   └── elf.rs        # AIE ELF files
-│   ├── device/           # Device state model
-│   │   ├── aie2_spec.rs  # Architecture constants (AM020)
-│   │   ├── registers.rs  # Register definitions
-│   │   ├── tile.rs       # Single tile state
-│   │   ├── array.rs      # Tile array
-│   │   ├── state.rs      # CDO application
-│   │   ├── host_memory.rs # Simulated DDR
-│   │   ├── stream_switch.rs # Per-tile stream switch
-│   │   ├── stream_router.rs # Global stream router
-│   │   └── dma/          # DMA execution engine
-│   ├── interpreter/      # Modular AIE2 interpreter
-│   │   ├── bundle/       # VLIW bundle handling
-│   │   ├── decode/       # TableGen-driven instruction decoder
-│   │   ├── state/        # Register files, execution context
-│   │   ├── execute/      # Execution units (scalar, vector, memory, control)
-│   │   ├── timing/       # Latency, hazards, memory timing
-│   │   ├── core/         # Per-core interpreter
-│   │   ├── engine/       # Multi-core coordinator
-│   │   └── test_runner.rs # Test harness for kernel execution
-│   ├── tablegen/         # TableGen parser for llvm-aie
-│   │   ├── parser.rs     # Regex-based .td file parsing
-│   │   ├── types.rs      # SlotDef, FormatClass, InstrDef, SemanticOp
-│   │   └── resolver.rs   # Compute encodings from format classes
-│   ├── visual/           # GUI (egui)
-│   │   ├── app.rs        # Main application
-│   │   ├── tile_grid.rs  # Tile array view
-│   │   ├── tile_detail.rs # Detail panels
-│   │   ├── controls.rs   # Run/Step/Reset
-│   │   └── memory_view.rs # Hex viewer
-│   └── integration/      # External tools (planned)
-│       └── mod.rs
-└── docs/
-    └── roadmap/          # Detailed phase documentation
-        ├── phase1-core-accuracy.md
-        ├── phase2-toolchain-integration.md
-        ├── phase3-developer-experience.md
-        ├── phase4-validation-testing.md
-        ├── phase5-production-readiness.md
-        ├── phase6-community-ecosystem.md
-        └── tablegen-assessment.md
-```
+Detailed documentation for each module lives in `.claude/components/`. Read
+the relevant file when working on that area of the codebase.
+
+| Component | File | When to Read |
+|-----------|------|-------------|
+| Device model | [`.claude/components/device.md`](.claude/components/device.md) | Working on tiles, array, DMA, streams, locks, host memory (`src/device/`) |
+| Interpreter | [`.claude/components/interpreter.md`](.claude/components/interpreter.md) | Working on instruction decode, execution, timing, multi-core (`src/interpreter/`) |
+| Parser | [`.claude/components/parser.md`](.claude/components/parser.md) | Working on XCLBIN, ELF, or CDO parsing (`src/parser/`) |
+| TableGen | [`.claude/components/tablegen.md`](.claude/components/tablegen.md) | Working on ISA definitions, decoder tables, llvm-aie integration (`src/tablegen/`) |
+| Testing | [`.claude/components/testing.md`](.claude/components/testing.md) | Working on tests, test runner, FFI, NPU instructions, config (`src/testing/`, `src/npu/`, `src/ffi/`, `tests/`) |
+| Visual | [`.claude/components/visual.md`](.claude/components/visual.md) | Working on the GUI debugger (`src/visual/`) |
+
+Top-level source files not covered by component docs:
+- `src/main.rs` -- CLI and GUI entry point
+- `src/lib.rs` -- crate root, module declarations
+- `src/integration/mod.rs` -- external tool integration (placeholder)
 
 ## Related Resources
 
+- **xdna-driver**: `/home/triple/npu-work/xdna-driver` - Linux kernel driver, authoritative device definitions
 - **mlir-aie**: `/home/triple/npu-work/mlir-aie` - test binaries, device models
 - **llvm-aie**: `../llvm-aie` (local clone) - ISA definitions, TableGen files
 - **XRT**: https://github.com/Xilinx/XRT - runtime (installed at /opt/xilinx/xrt)
@@ -220,7 +227,7 @@ cargo build --release
 # Run
 cargo run -- path/to/binary.xclbin
 
-# Test (587 tests)
+# Test
 ./scripts/run-tests.sh          # All tests (doc tests run with nice 19)
 ./scripts/run-tests.sh --lib    # Fast: library tests only
 ./scripts/run-tests.sh --doc    # Doc tests only (nice'd, limited parallelism)
@@ -240,7 +247,7 @@ parallelism to avoid overwhelming the system during other work.
 
 ## How To Begin
 
-1. Read [ROADMAP.md](ROADMAP.md) for the high-level development plan
-2. Check [Phase 1](docs/roadmap/phase1-core-accuracy.md) for current implementation details
-3. Run `cargo test` to verify everything works
-4. See the "Next Steps" section in Phase 1 for current work items
+1. Read [ROADMAP.md](ROADMAP.md) for the development plan and confidence markers
+2. Check the relevant [phase documentation](docs/roadmap/) for current details
+3. Run `cargo test --lib` to verify everything works
+4. Read the component doc (`.claude/components/`) for the module you are working on

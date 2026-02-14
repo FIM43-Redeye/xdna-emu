@@ -57,8 +57,9 @@ pub use parser::{
     parse_tablegen_files_with_patterns, ParseError,
 };
 pub use resolver::{
-    build_decoder_tables, DecoderIndex, InstrEncoding, OperandField, ResolveError, Resolver,
-    SlotIndex, SlotIndexStats,
+    build_decoder_tables, AddressingMode, DecoderIndex, InstrEncoding, InstrMemWidth,
+    OperandField, ResolveError, Resolver, SlotIndex, SlotIndexStats,
+    detect_addressing_mode, detect_mem_width,
 };
 pub use tblgen_records::{parse_tblgen_records, InstrRecord, SlotEncoding};
 pub use types::{
@@ -134,19 +135,30 @@ pub fn find_aie_tblgen(llvm_aie_path: impl AsRef<Path>) -> Option<std::path::Pat
 
     let llvm_aie = llvm_aie_path.as_ref();
 
+    // Binary name is platform-dependent
+    let exe = if cfg!(target_os = "windows") { "llvm-tblgen.exe" } else { "llvm-tblgen" };
+
     // Known locations relative to llvm-aie or its parent
-    let candidates = [
-        // mlir-aie ironenv (Python venv with llvm-aie package)
-        llvm_aie.parent().and_then(|p| Some(p.join("mlir-aie/ironenv/lib/python3.13/site-packages/llvm-aie/bin/llvm-tblgen"))),
-        llvm_aie.parent().and_then(|p| Some(p.join("mlir-aie/ironenv/lib/python3.12/site-packages/llvm-aie/bin/llvm-tblgen"))),
-        llvm_aie.parent().and_then(|p| Some(p.join("mlir-aie/ironenv/lib/python3.11/site-packages/llvm-aie/bin/llvm-tblgen"))),
+    let mut candidates: Vec<Option<std::path::PathBuf>> = vec![
+        // mlir-aie ironenv (Python venv with llvm-aie package) -- Linux layout
+        llvm_aie.parent().map(|p| p.join(format!("mlir-aie/ironenv/lib/python3.13/site-packages/llvm-aie/bin/{exe}"))),
+        llvm_aie.parent().map(|p| p.join(format!("mlir-aie/ironenv/lib/python3.12/site-packages/llvm-aie/bin/{exe}"))),
+        llvm_aie.parent().map(|p| p.join(format!("mlir-aie/ironenv/lib/python3.11/site-packages/llvm-aie/bin/{exe}"))),
         // mlir-aie install directory
-        llvm_aie.parent().and_then(|p| Some(p.join("mlir-aie/my_install/mlir/bin/llvm-tblgen"))),
-        llvm_aie.parent().and_then(|p| Some(p.join("mlir-aie/install/bin/llvm-tblgen"))),
+        llvm_aie.parent().map(|p| p.join(format!("mlir-aie/my_install/mlir/bin/{exe}"))),
+        llvm_aie.parent().map(|p| p.join(format!("mlir-aie/install/bin/{exe}"))),
         // llvm-aie build directory
-        Some(llvm_aie.join("build/bin/llvm-tblgen")),
-        Some(llvm_aie.join("build/Release/bin/llvm-tblgen")),
+        Some(llvm_aie.join(format!("build/bin/{exe}"))),
+        Some(llvm_aie.join(format!("build/Release/bin/{exe}"))),
     ];
+
+    // Windows-specific: Python venv uses Lib/site-packages/ (not lib/pythonX.Y/...)
+    if cfg!(target_os = "windows") {
+        candidates.extend([
+            llvm_aie.parent().map(|p| p.join(format!("mlir-aie/ironenv/Lib/site-packages/llvm-aie/bin/{exe}"))),
+            llvm_aie.parent().map(|p| p.join(format!("mlir-aie/ironenv/Scripts/{exe}"))),
+        ]);
+    }
 
     for candidate in candidates.into_iter().flatten() {
         // Canonicalize to resolve relative paths like ../mlir-aie/...

@@ -394,14 +394,14 @@ mod tests {
     // Integration test with real XCLBIN file
     #[test]
     fn test_parse_real_xclbin() {
-        let test_xclbin = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_objFifo/aie.xclbin";
+        use crate::config::Config;
 
-        if !std::path::Path::new(test_xclbin).exists() {
-            eprintln!("Skipping real XCLBIN test: file not found");
+        let Some(test_xclbin) = Config::get().add_one_xclbin() else {
+            eprintln!("Skipping real XCLBIN test: file not found (set MLIR_AIE_PATH)");
             return;
-        }
+        };
 
-        let xclbin = Xclbin::from_file(test_xclbin).unwrap();
+        let xclbin = Xclbin::from_file(&test_xclbin).unwrap();
 
         // Should have valid UUID
         let uuid = xclbin.uuid();
@@ -435,13 +435,14 @@ mod tests {
 
     #[test]
     fn test_xclbin_sections_types() {
-        let test_xclbin = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_objFifo/aie.xclbin";
+        use crate::config::Config;
 
-        if !std::path::Path::new(test_xclbin).exists() {
+        let Some(test_xclbin) = Config::get().add_one_xclbin() else {
+            eprintln!("Skipping test_xclbin_sections_types: file not found (set MLIR_AIE_PATH)");
             return;
-        }
+        };
 
-        let xclbin = Xclbin::from_file(test_xclbin).unwrap();
+        let xclbin = Xclbin::from_file(&test_xclbin).unwrap();
 
         // Collect all section kinds we see
         let kinds: Vec<_> = xclbin.sections().map(|s| s.kind).collect();

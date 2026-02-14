@@ -222,7 +222,8 @@ pub enum DmaPortType {
 /// Supports both instant routing (for fast simulation) and cycle-accurate
 /// routing with proper latency modeling.
 pub struct StreamRouter {
-    /// Array dimensions
+    /// Array dimensions (used when routing validates column bounds)
+    #[allow(dead_code)]
     cols: usize,
     rows: usize,
 
@@ -257,8 +258,9 @@ impl StreamRouter {
     /// Create a new stream router for the given array dimensions.
     /// Uses instant routing by default (no latency modeling).
     pub fn new(cols: usize, rows: usize) -> Self {
-        // MemTile has 16 masters and 18 slaves, so we need at least 18 ports per tile
-        let ports_per_tile = 18;
+        // Compute tiles have 25 slave ports (0-24) - the max across all tile types
+        // We need at least 25 ports per tile to avoid fifo index collisions
+        let ports_per_tile = 32; // Round up for alignment
         let fifo_depth = 4; // Words of buffering
 
         let num_tiles = cols * rows;
@@ -313,8 +315,11 @@ impl StreamRouter {
     }
 
     /// Get FIFO index for a port.
+    ///
+    /// Uses column-major ordering to match TileArray indexing:
+    /// tile_idx = col * rows + row
     fn fifo_index(&self, col: u8, row: u8, port: u8) -> usize {
-        let tile_idx = (row as usize) * self.cols + (col as usize);
+        let tile_idx = (col as usize) * self.rows + (row as usize);
         tile_idx * self.ports_per_tile + (port as usize)
     }
 
@@ -428,18 +433,15 @@ impl StreamRouter {
             let dest_idx = self.fifo_index(route.dest.col, route.dest.row, route.dest.port);
 
             // Check if we can move data
-            if src_idx < self.output_fifos.len() && dest_idx < self.input_fifos.len()
-                && !self.output_fifos[src_idx].is_empty() &&
-                   !self.input_fifos[dest_idx].is_full() {
-                    if let Some(word) = self.output_fifos[src_idx].pop() {
-                        log::debug!("StreamRouter: ({},{},{}) -> ({},{},{}) data=0x{:08X}",
-                            route.src.col, route.src.row, route.src.port,
-                            route.dest.col, route.dest.row, route.dest.port,
-                            word.data);
-                        self.input_fifos[dest_idx].push(word);
-                        any_moved = true;
-                    }
+            let src_has_data = src_idx < self.output_fifos.len() && !self.output_fifos[src_idx].is_empty();
+            let dest_has_space = dest_idx < self.input_fifos.len() && !self.input_fifos[dest_idx].is_full();
+
+            if src_has_data && dest_has_space {
+                if let Some(word) = self.output_fifos[src_idx].pop() {
+                    self.input_fifos[dest_idx].push(word);
+                    any_moved = true;
                 }
+            }
         }
 
         any_moved

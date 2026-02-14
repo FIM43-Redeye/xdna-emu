@@ -41,7 +41,7 @@
 
 use std::collections::HashMap;
 
-use super::resolver::{InstrEncoding, OperandField, infer_semantic_from_mnemonic};
+use super::resolver::{InstrEncoding, OperandField, detect_addressing_mode, detect_mem_width, infer_semantic_from_mnemonic};
 use super::types::ImplicitReg;
 
 /// A parsed instruction record from tblgen output.
@@ -467,6 +467,8 @@ impl InstrRecord {
             input_order,
             output_order,
             implicit_regs,
+            addressing_mode: detect_addressing_mode(&self.name),
+            mem_width: detect_mem_width(&self.mnemonic),
         })
     }
 }

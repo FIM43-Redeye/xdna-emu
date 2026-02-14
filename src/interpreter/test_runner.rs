@@ -191,10 +191,10 @@ impl TestRunner {
 
     /// Configure a DMA stream route from source MM2S to destination S2MM.
     ///
-    /// This properly converts DMA channel indices to stream switch port numbers.
-    /// For compute tiles (row >= 2):
-    /// - MM2S channels 2-3 map to master ports 1-2
-    /// - S2MM channels 0-1 map to slave ports 1-2
+    /// Uses NPU-compliant hop-by-hop routing through per-tile StreamSwitch:
+    /// - Source tile: DMA slave port → directional master port
+    /// - Intermediate tiles: directional slave → directional master
+    /// - Destination tile: directional slave → DMA master port
     ///
     /// # Arguments
     /// * `src_col`, `src_row` - Source tile coordinates
@@ -206,42 +206,111 @@ impl TestRunner {
         src_col: u8, src_row: u8, mm2s_channel: u8,
         dst_col: u8, dst_row: u8, s2mm_channel: u8,
     ) {
-        // Convert DMA channel indices to stream switch ports
-        // For compute tiles (row >= 2):
-        // - MM2S channel 2 -> master port 1, channel 3 -> master port 2
-        // - S2MM channel 0 -> slave port 1, channel 1 -> slave port 2
-        let src_port = if src_row >= 2 {
-            // Compute tile: MM2S channels 2-3 -> ports 1-2
-            if mm2s_channel >= 2 { mm2s_channel - 1 } else { mm2s_channel }
+        // Get DMA slave/master port indices
+        // Compute tile: DMA slave ports 1-2 (MM2S), DMA master ports 1-2 (S2MM)
+        // MemTile: DMA slave ports 0-5 (MM2S), DMA master ports 0-5 (S2MM)
+        let dma_slave = if src_row >= 2 {
+            // Compute tile: MM2S ch2 → slave[1], ch3 → slave[2]
+            if mm2s_channel >= 2 { mm2s_channel - 1 } else { mm2s_channel + 1 }
         } else if src_row == 1 {
-            // MemTile: MM2S channels 6-11 -> ports 0-5
+            // MemTile: MM2S ch6-11 → slave[0-5]
             if mm2s_channel >= 6 { mm2s_channel - 6 } else { mm2s_channel }
         } else {
-            // Shim tile
             mm2s_channel
         };
 
-        let dst_port = if dst_row >= 2 {
-            // Compute tile: S2MM channels 0-1 -> ports 1-2
+        let dma_master = if dst_row >= 2 {
+            // Compute tile: S2MM ch0 → master[1], ch1 → master[2]
             s2mm_channel + 1
         } else if dst_row == 1 {
-            // MemTile: S2MM channels 0-5 -> ports 0-5
+            // MemTile: S2MM ch0-5 → master[0-5]
             s2mm_channel
         } else {
-            // Shim tile
             s2mm_channel
         };
 
         log::debug!(
-            "configure_dma_route: ({},{}) MM2S ch{} (port {}) -> ({},{}) S2MM ch{} (port {})",
-            src_col, src_row, mm2s_channel, src_port,
-            dst_col, dst_row, s2mm_channel, dst_port
+            "configure_dma_route: ({},{}) DMA slave[{}] -> ({},{}) DMA master[{}]",
+            src_col, src_row, dma_slave,
+            dst_col, dst_row, dma_master
         );
 
-        self.engine.device_mut().array.stream_router.add_route(
-            src_col, src_row, src_port,
-            dst_col, dst_row, dst_port,
-        );
+        // Only support same-column routing for now
+        assert_eq!(src_col, dst_col, "Cross-column DMA routing not yet supported");
+
+        let array = &mut self.engine.device_mut().array;
+
+        if dst_row > src_row {
+            // Upward routing: use North masters → South slaves
+            // Set up routes on each tile in the path
+            for row in src_row..=dst_row {
+                let tile_idx = (src_col as usize) * (array.rows() as usize) + (row as usize);
+                let tile = &mut array.tiles[tile_idx];
+
+                if row == src_row {
+                    // Source tile: DMA slave → North master
+                    // Compute tile: North masters start at 13 (North0-5 = 13-18)
+                    // MemTile: North masters start at 11 (North0-5 = 11-16)
+                    let north_master: usize = if row >= 2 { 13 } else if row == 1 { 11 } else { 12 };
+                    tile.stream_switch.configure_local_route(dma_slave as usize, north_master);
+                    log::debug!("  Route ({},{}) slave[{}] -> master[{}] (DMA->North)",
+                        src_col, row, dma_slave, north_master);
+                } else if row == dst_row {
+                    // Destination tile: South slave → DMA master
+                    // Compute tile: South slaves start at 5 (South0-5 = 5-10)
+                    // MemTile: South slaves start at 7 (South0-5 = 7-12)
+                    let south_slave: usize = if row >= 2 { 5 } else if row == 1 { 7 } else { 7 };
+                    tile.stream_switch.configure_local_route(south_slave, dma_master as usize);
+                    log::debug!("  Route ({},{}) slave[{}] -> master[{}] (South->DMA)",
+                        src_col, row, south_slave, dma_master);
+                } else {
+                    // Intermediate tile: South slave → North master (passthrough)
+                    let south_slave: usize = if row >= 2 { 5 } else if row == 1 { 7 } else { 7 };
+                    let north_master: usize = if row >= 2 { 13 } else if row == 1 { 11 } else { 12 };
+                    tile.stream_switch.configure_local_route(south_slave, north_master);
+                    log::debug!("  Route ({},{}) slave[{}] -> master[{}] (passthrough)",
+                        src_col, row, south_slave, north_master);
+                }
+            }
+        } else if dst_row < src_row {
+            // Downward routing: use South masters → North slaves
+            for row in (dst_row..=src_row).rev() {
+                let tile_idx = (src_col as usize) * (array.rows() as usize) + (row as usize);
+                let tile = &mut array.tiles[tile_idx];
+
+                if row == src_row {
+                    // Source tile: DMA slave → South master
+                    // Compute tile: South masters start at 5 (South0-3 = 5-8)
+                    // MemTile: South masters start at 7 (South0-3 = 7-10)
+                    let south_master: usize = if row >= 2 { 5 } else if row == 1 { 7 } else { 2 };
+                    tile.stream_switch.configure_local_route(dma_slave as usize, south_master);
+                    log::debug!("  Route ({},{}) slave[{}] -> master[{}] (DMA->South)",
+                        src_col, row, dma_slave, south_master);
+                } else if row == dst_row {
+                    // Destination tile: North slave → DMA master
+                    // Compute tile: North slaves start at 15 (North0-3 = 15-18)
+                    // MemTile: North slaves start at 13 (North0-3 = 13-16)
+                    let north_slave: usize = if row >= 2 { 15 } else if row == 1 { 13 } else { 14 };
+                    tile.stream_switch.configure_local_route(north_slave, dma_master as usize);
+                    log::debug!("  Route ({},{}) slave[{}] -> master[{}] (North->DMA)",
+                        src_col, row, north_slave, dma_master);
+                } else {
+                    // Intermediate tile: North slave → South master (passthrough)
+                    let north_slave: usize = if row >= 2 { 15 } else if row == 1 { 13 } else { 14 };
+                    let south_master: usize = if row >= 2 { 5 } else if row == 1 { 7 } else { 2 };
+                    tile.stream_switch.configure_local_route(north_slave, south_master);
+                    log::debug!("  Route ({},{}) slave[{}] -> master[{}] (passthrough)",
+                        src_col, row, north_slave, south_master);
+                }
+            }
+        } else {
+            // Same tile: DMA slave → DMA master (loopback)
+            let tile_idx = (src_col as usize) * (array.rows() as usize) + (src_row as usize);
+            let tile = &mut array.tiles[tile_idx];
+            tile.stream_switch.configure_local_route(dma_slave as usize, dma_master as usize);
+            log::debug!("  Route ({},{}) slave[{}] -> master[{}] (loopback)",
+                src_col, src_row, dma_slave, dma_master);
+        }
     }
 
     /// Run for a maximum number of cycles, or until all cores halt.
@@ -578,18 +647,17 @@ mod tests {
 
     #[test]
     fn test_load_real_add_one_elf() {
-        // Path to the add_one kernel ELF from mlir-aie build
-        let elf_path = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_objFifo/aie_arch.mlir.prj/main_core_0_2.elf";
+        use crate::config::Config;
 
-        if !std::path::Path::new(elf_path).exists() {
-            eprintln!("Skipping test_load_real_add_one_elf: ELF not found at {}", elf_path);
+        let Some(elf_path) = Config::get().add_one_elf() else {
+            eprintln!("Skipping test_load_real_add_one_elf: ELF not found (set MLIR_AIE_PATH)");
             return;
-        }
+        };
 
         let mut runner = TestRunner::new();
 
         // Load the ELF
-        let result = runner.load_elf(0, 2, elf_path);
+        let result = runner.load_elf(0, 2, elf_path.to_str().unwrap());
         assert!(result.is_ok(), "Failed to load ELF: {:?}", result.err());
 
         // Core should be enabled at PC=0
@@ -605,8 +673,14 @@ mod tests {
         let pc = runner.core_pc(0, 2).unwrap();
         eprintln!("After 10 steps, PC = 0x{:04X}", pc);
 
-        // Basic sanity: PC should have moved or we hit a branch
-        // (We can't easily predict behavior without DMA/objectFIFO support)
+        // Verify the engine is still in a valid state (not errored)
+        assert!(
+            !matches!(runner.engine.status(), crate::interpreter::engine::EngineStatus::Error),
+            "Engine should not be in error state after stepping real ELF"
+        );
+
+        // PC should have advanced from 0 (real instructions were decoded and executed)
+        assert!(pc > 0, "PC should have advanced from entry point after 10 steps");
     }
 
     #[test]
@@ -650,13 +724,13 @@ mod tests {
 
     #[test]
     fn test_decoder_coverage() {
-        // This test loads a real ELF and reports decoder coverage
-        let elf_path = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_objFifo/aie_arch.mlir.prj/main_core_0_2.elf";
+        use crate::config::Config;
 
-        if !std::path::Path::new(elf_path).exists() {
-            eprintln!("Skipping test_decoder_coverage: ELF not found");
+        // This test loads a real ELF and reports decoder coverage
+        let Some(elf_path) = Config::get().add_one_elf() else {
+            eprintln!("Skipping test_decoder_coverage: ELF not found (set MLIR_AIE_PATH)");
             return;
-        }
+        };
 
         // Read ELF and get program section
         use crate::parser::AieElf;
@@ -838,20 +912,19 @@ mod tests {
     /// - Execution flow and PC progression
     #[test]
     fn test_add_one_diagnostic_trace() {
+        use crate::config::Config;
         use crate::interpreter::CoreStatus;
         use crate::interpreter::engine::EngineStatus;
 
-        let elf_path = "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_objFifo/aie_arch.mlir.prj/main_core_0_2.elf";
-
-        if !std::path::Path::new(elf_path).exists() {
-            eprintln!("Skipping test_add_one_diagnostic_trace: ELF not found at {}", elf_path);
+        let Some(elf_path) = Config::get().add_one_elf() else {
+            eprintln!("Skipping test_add_one_diagnostic_trace: ELF not found (set MLIR_AIE_PATH)");
             return;
-        }
+        };
 
         let mut runner = TestRunner::new();
 
         // Load the ELF
-        let result = runner.load_elf(0, 2, elf_path);
+        let result = runner.load_elf(0, 2, elf_path.to_str().unwrap());
         assert!(result.is_ok(), "Failed to load ELF: {:?}", result.err());
 
         eprintln!("\n=== add_one Kernel Diagnostic Trace ===\n");
@@ -911,7 +984,7 @@ mod tests {
         {
             use crate::interpreter::decode::InstructionDecoder;
             use crate::interpreter::traits::Decoder;
-            use crate::interpreter::bundle::slot_layout::{extract_slots, SlotType};
+            use crate::interpreter::bundle::slot_layout::extract_slots;
 
             let decoder = InstructionDecoder::load_default();
 
@@ -1955,9 +2028,14 @@ mod tests {
         let dst_col = 0u8;
         let dst_row = 3u8; // Compute tile above
 
-        // Configure a route from source to destination
-        // Source tile port 0 -> Destination tile port 0
-        array.stream_router.add_route(src_col, src_row, 0, dst_col, dst_row, 0);
+        // Configure local routes for NPU-compliant hop-by-hop routing
+        // Source tile: Core slave (0) → North master (13)
+        // Dest tile: South slave (5) → Core master (0)
+        let src_tile = array.tile_mut(src_col, src_row);
+        src_tile.stream_switch.configure_local_route(0, 13); // Core -> North0
+
+        let dst_tile = array.tile_mut(dst_col, dst_row);
+        dst_tile.stream_switch.configure_local_route(5, 0); // South0 -> Core
 
         eprintln!("Configured route: ({},{}) port 0 -> ({},{}) port 0",
             src_col, src_row, dst_col, dst_row);
@@ -2029,6 +2107,7 @@ mod tests {
     /// The test is exploratory - it documents what works and what doesn't.
     #[test]
     fn test_execute_real_xclbin() {
+        use crate::config::Config;
         use crate::parser::xclbin::{SectionKind, Xclbin};
         use crate::parser::aie_partition::AiePartition;
         use crate::parser::cdo::{find_cdo_offset, Cdo};
@@ -2040,30 +2119,25 @@ mod tests {
 
         // Step 1: Locate XCLBIN files
         // Try multiple potential locations for add_one kernel
-        let xclbin_candidates = [
-            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_objFifo/aie.xclbin",
-            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_using_dma/aie.xclbin",
-            "/home/triple/npu-work/mlir-aie/build/test/npu-xrt/add_one_objFifo_elf/aie.xclbin",
-        ];
+        let xclbin_candidates = Config::get().add_one_xclbin_candidates();
 
         let xclbin_path = xclbin_candidates.iter()
-            .find(|p| std::path::Path::new(p).exists());
+            .find(|p| p.exists());
 
         let xclbin_path = match xclbin_path {
-            Some(path) => *path,
+            Some(path) => path,
             None => {
                 eprintln!("SKIP: No XCLBIN files found. Checked:");
                 for path in &xclbin_candidates {
-                    eprintln!("  - {}", path);
+                    eprintln!("  - {}", path.display());
                 }
-                eprintln!("\nTo enable this test, build mlir-aie tests with:");
-                eprintln!("  cd /home/triple/npu-work/mlir-aie/build");
-                eprintln!("  ninja check-aie");
+                eprintln!("\nTo enable this test, set MLIR_AIE_PATH and build mlir-aie tests with:");
+                eprintln!("  cd $MLIR_AIE_PATH/build && ninja check-aie");
                 return;
             }
         };
 
-        eprintln!("XCLBIN: {}", xclbin_path);
+        eprintln!("XCLBIN: {}", xclbin_path.display());
 
         // Step 2: Parse XCLBIN container
         let xclbin = match Xclbin::from_file(xclbin_path) {

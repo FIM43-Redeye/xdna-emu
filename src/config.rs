@@ -12,10 +12,10 @@
 //! # xdna-emu.toml
 //!
 //! # Path to llvm-aie repository (contains TableGen ISA definitions)
-//! llvm_aie_path = "/home/user/llvm-aie"
+//! llvm_aie_path = "../llvm-aie"
 //!
 //! # Path to mlir-aie repository (optional, for test discovery)
-//! mlir_aie_path = "/home/user/mlir-aie"
+//! mlir_aie_path = "../mlir-aie"
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -96,11 +96,71 @@ impl Config {
             .unwrap_or_else(|| "../mlir-aie".to_string())
     }
 
-    /// Get the XRT path, with fallback to default.
+    /// Get the XRT path, with fallback to platform-appropriate default.
+    ///
+    /// Defaults:
+    /// - Linux: `/opt/xilinx/xrt`
+    /// - Windows: `C:\Xilinx\XRT`
     pub fn xrt_path(&self) -> String {
-        self.xrt_path
-            .clone()
-            .unwrap_or_else(|| "/opt/xilinx/xrt".to_string())
+        self.xrt_path.clone().unwrap_or_else(|| {
+            if cfg!(target_os = "windows") {
+                r"C:\Xilinx\XRT".to_string()
+            } else {
+                "/opt/xilinx/xrt".to_string()
+            }
+        })
+    }
+
+    // -- Test fixture path helpers --
+    //
+    // These resolve commonly-used test binary paths relative to the configured
+    // mlir-aie root, replacing what were previously hardcoded absolute paths.
+
+    /// Resolve a path relative to the mlir-aie root.
+    ///
+    /// Joins `mlir_aie_path()` with the given sub-path. Does not check whether
+    /// the resulting path exists -- callers should handle that (typically by
+    /// skipping the test if the file is absent).
+    pub fn mlir_aie_subpath(&self, subpath: &str) -> PathBuf {
+        PathBuf::from(self.mlir_aie_path()).join(subpath)
+    }
+
+    /// Path to the add_one_objFifo xclbin test fixture.
+    ///
+    /// This is the most commonly used test binary across the test suite.
+    /// Returns `None` if the file does not exist at the resolved path.
+    pub fn add_one_xclbin(&self) -> Option<PathBuf> {
+        let path = self.mlir_aie_subpath(
+            "build/test/npu-xrt/add_one_objFifo/aie.xclbin",
+        );
+        path.exists().then_some(path)
+    }
+
+    /// Path to the add_one_objFifo core ELF test fixture.
+    ///
+    /// Returns `None` if the file does not exist at the resolved path.
+    pub fn add_one_elf(&self) -> Option<PathBuf> {
+        let path = self.mlir_aie_subpath(
+            "build/test/npu-xrt/add_one_objFifo/aie_arch.mlir.prj/main_core_0_2.elf",
+        );
+        path.exists().then_some(path)
+    }
+
+    /// Candidate xclbin paths for the add_one kernel.
+    ///
+    /// Returns multiple potential locations (different build variants).
+    /// Used by tests that try several directories before giving up.
+    pub fn add_one_xclbin_candidates(&self) -> Vec<PathBuf> {
+        vec![
+            self.mlir_aie_subpath("build/test/npu-xrt/add_one_objFifo/aie.xclbin"),
+            self.mlir_aie_subpath("build/test/npu-xrt/add_one_using_dma/aie.xclbin"),
+            self.mlir_aie_subpath("build/test/npu-xrt/add_one_objFifo_elf/aie.xclbin"),
+        ]
+    }
+
+    /// The npu-xrt test directory within mlir-aie.
+    pub fn npu_xrt_test_dir(&self) -> PathBuf {
+        self.mlir_aie_subpath("build/test/npu-xrt")
     }
 
     /// Load user configuration from ~/.config/xdna-emu/config.toml
@@ -189,8 +249,27 @@ impl Config {
     }
 
     /// Generate a sample config file content.
+    ///
+    /// Output is platform-aware: shows Windows-style paths on Windows,
+    /// Unix-style paths on Linux/macOS.
     pub fn sample_config() -> String {
-        r#"# xdna-emu configuration
+        if cfg!(target_os = "windows") {
+            r#"# xdna-emu configuration
+# Place this file at %APPDATA%\xdna-emu\config.toml or .\xdna-emu.toml
+
+# Path to llvm-aie repository (required for instruction decoding)
+# This should be an absolute path to your llvm-aie clone
+llvm_aie_path = "C:\\dev\\llvm-aie"
+
+# Path to mlir-aie repository (optional, for test discovery)
+# mlir_aie_path = "C:\\dev\\mlir-aie"
+
+# Path to XRT installation (optional, defaults to C:\Xilinx\XRT)
+# xrt_path = "C:\\Xilinx\\XRT"
+"#
+            .to_string()
+        } else {
+            r#"# xdna-emu configuration
 # Place this file at ~/.config/xdna-emu/config.toml or ./xdna-emu.toml
 
 # Path to llvm-aie repository (required for instruction decoding)
@@ -203,7 +282,8 @@ llvm_aie_path = "/home/user/llvm-aie"
 # Path to XRT installation (optional, defaults to /opt/xilinx/xrt)
 # xrt_path = "/opt/xilinx/xrt"
 "#
-        .to_string()
+            .to_string()
+        }
     }
 }
 
@@ -216,7 +296,32 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.llvm_aie_path(), "../llvm-aie");
         assert_eq!(config.mlir_aie_path(), "../mlir-aie");
-        assert_eq!(config.xrt_path(), "/opt/xilinx/xrt");
+        // XRT default is platform-dependent
+        if cfg!(target_os = "windows") {
+            assert_eq!(config.xrt_path(), r"C:\Xilinx\XRT");
+        } else {
+            assert_eq!(config.xrt_path(), "/opt/xilinx/xrt");
+        }
+    }
+
+    #[test]
+    fn test_fixture_helpers() {
+        let config = Config {
+            mlir_aie_path: Some("/test/mlir-aie".to_string()),
+            ..Default::default()
+        };
+        // mlir_aie_subpath joins correctly
+        let sub = config.mlir_aie_subpath("build/test/npu-xrt");
+        assert!(sub.ends_with("build/test/npu-xrt"));
+        assert!(sub.starts_with("/test/mlir-aie"));
+
+        // add_one helpers return None when files don't exist
+        assert!(config.add_one_xclbin().is_none());
+        assert!(config.add_one_elf().is_none());
+
+        // candidates returns 3 paths
+        let candidates = config.add_one_xclbin_candidates();
+        assert_eq!(candidates.len(), 3);
     }
 
     #[test]

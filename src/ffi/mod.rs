@@ -14,8 +14,7 @@
 //! - Buffer data is copied during write/read operations; the caller
 //!   retains ownership of their pointers.
 
-use std::ffi::{CStr, c_char, c_void};
-use std::path::Path;
+use std::ffi::{CStr, c_char};
 use std::slice;
 use std::sync::Mutex;
 

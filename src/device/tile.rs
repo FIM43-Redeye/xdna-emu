@@ -729,6 +729,18 @@ impl Tile {
     /// check/modify based on this snapshot rather than live values.
     #[inline]
     pub fn begin_lock_cycle(&mut self) {
+        // Debug: log any non-zero deltas that are being cleared for Tile(0,1)
+        if self.col == 0 && self.row == 1 {
+            let non_zero: Vec<_> = self.lock_deltas.iter().enumerate()
+                .filter(|(_, &d)| d != 0)
+                .map(|(i, &d)| format!("{}:{}", i, d))
+                .collect();
+            if !non_zero.is_empty() {
+                log::debug!("Tile(0,1) begin_lock_cycle: CLEARING non-zero deltas = [{}] self_ptr={:p}",
+                    non_zero.join(", "), self);
+            }
+        }
+        // Snapshot current values and clear deltas from previous cycle
         for i in 0..NUM_LOCKS {
             self.lock_snapshot[i] = self.locks[i].value;
             self.lock_deltas[i] = 0;
@@ -754,13 +766,21 @@ impl Tile {
         }
 
         // Calculate effective value: snapshot + any deltas already recorded this cycle
-        let effective = (self.lock_snapshot[lock_id] as i16 + self.lock_deltas[lock_id] as i16) as u8;
+        let snapshot_val = self.lock_snapshot[lock_id];
+        let delta_val = self.lock_deltas[lock_id];
+        let effective = (snapshot_val as i16 + delta_val as i16) as u8;
 
         let success = if equal_mode {
             effective == expected
         } else {
             effective >= expected
         };
+
+        // Debug: log acquire attempts for lock 1 on Tile(0,1)
+        if self.col == 0 && self.row == 1 && lock_id == 1 {
+            log::debug!("Tile(0,1) try_acquire lock 1: snapshot={} delta={} effective={} expected={} success={}",
+                snapshot_val, delta_val, effective, expected, success);
+        }
 
         if success {
             // Record the delta - will be applied at end of cycle
@@ -782,7 +802,10 @@ impl Tile {
     #[inline]
     pub fn release_snapshot(&mut self, lock_id: usize, delta: i8) {
         if lock_id < NUM_LOCKS {
+            let old = self.lock_deltas[lock_id];
             self.lock_deltas[lock_id] = self.lock_deltas[lock_id].saturating_add(delta);
+            log::debug!("Tile({},{}) release_snapshot lock {} delta {} (old_delta={}, new_delta={}) self_ptr={:p}",
+                self.col, self.row, lock_id, delta, old, self.lock_deltas[lock_id], self);
         }
     }
 
@@ -792,16 +815,37 @@ impl Tile {
     /// Applies all recorded deltas to the actual lock values, with clamping.
     #[inline]
     pub fn end_lock_cycle(&mut self) {
+        // Debug: log all non-zero deltas for Tile(0,1)
+        if self.col == 0 && self.row == 1 {
+            let non_zero: Vec<_> = self.lock_deltas.iter().enumerate()
+                .filter(|(_, &d)| d != 0)
+                .map(|(i, &d)| format!("{}:{}", i, d))
+                .collect();
+            if !non_zero.is_empty() {
+                log::debug!("Tile(0,1) end_lock_cycle: non-zero deltas = [{}] self_ptr={:p}",
+                    non_zero.join(", "), self);
+            }
+        }
         for i in 0..NUM_LOCKS {
-            let new_value = (self.locks[i].value as i16) + (self.lock_deltas[i] as i16);
-            if new_value < 0 {
-                self.locks[i].underflow = true;
-                self.locks[i].value = 0;
-            } else if new_value > Lock::MAX_VALUE as i16 {
-                self.locks[i].overflow = true;
-                self.locks[i].value = Lock::MAX_VALUE;
-            } else {
-                self.locks[i].value = new_value as u8;
+            let delta = self.lock_deltas[i];
+            if delta != 0 {
+                let old_value = self.locks[i].value;
+                let new_value = (old_value as i16) + (delta as i16);
+                if new_value < 0 {
+                    self.locks[i].underflow = true;
+                    self.locks[i].value = 0;
+                    log::debug!("Tile({},{}) lock {} end_cycle: {}+({})=0 (clamped, underflow)",
+                        self.col, self.row, i, old_value, delta);
+                } else if new_value > Lock::MAX_VALUE as i16 {
+                    self.locks[i].overflow = true;
+                    self.locks[i].value = Lock::MAX_VALUE;
+                    log::debug!("Tile({},{}) lock {} end_cycle: {}+({})->MAX (overflow)",
+                        self.col, self.row, i, old_value, delta);
+                } else {
+                    self.locks[i].value = new_value as u8;
+                    log::debug!("Tile({},{}) lock {} end_cycle: {}+({})={}",
+                        self.col, self.row, i, old_value, delta, new_value);
+                }
             }
         }
     }

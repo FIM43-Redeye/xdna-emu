@@ -57,6 +57,21 @@ pub struct TestInfo {
     pub source_dir: String,
     #[serde(default)]
     pub description: String,
+    /// Mark this test as expected to fail (emulator produces wrong output).
+    /// The test still runs but a failure is reported as ExpectedFail rather
+    /// than a surprising ValidationFail.
+    #[serde(default)]
+    pub expected_fail: bool,
+    /// Human-readable reason why this test is expected to fail.
+    #[serde(default)]
+    pub expected_fail_reason: String,
+    /// Mark this test as skipped (e.g. requires xchesscc, missing binary).
+    /// Skipped tests are not run at all.
+    #[serde(default)]
+    pub skip: bool,
+    /// Human-readable reason why this test is skipped.
+    #[serde(default)]
+    pub skip_reason: String,
 }
 
 /// Build configuration for the test.
@@ -214,20 +229,24 @@ impl TestManifest {
     }
 
     /// Apply a simple transform expression.
-    /// Supports: "input_a + N", "input_a - N", "input_a * N", "index + N"
+    ///
+    /// Supports:
+    /// - `"input_a + N"` -- element-wise operation with a constant
+    /// - `"input_a + input_b"` -- element-wise operation between two buffers
+    /// - `"index + N"` -- index-based generation with a constant
+    /// - `"N"` -- constant fill
     fn apply_transform(
         &self,
         transform: &str,
         inputs: &HashMap<String, Vec<i64>>,
         output_size: usize,
     ) -> Option<Vec<i64>> {
-        // Parse simple expressions like "input_a + 41"
         let parts: Vec<&str> = transform.split_whitespace().collect();
 
         if parts.len() == 3 {
             let operand = parts[0];
             let op = parts[1];
-            let constant: i64 = parts[2].parse().ok()?;
+            let rhs = parts[2];
 
             let base_values: Vec<i64> = if operand == "index" {
                 (0..output_size as i64).collect()
@@ -237,18 +256,38 @@ impl TestManifest {
                 return None;
             };
 
-            let result: Vec<i64> = base_values
-                .iter()
-                .map(|&v| match op {
-                    "+" => v + constant,
-                    "-" => v - constant,
-                    "*" => v * constant,
-                    "/" => v / constant,
-                    _ => v,
-                })
-                .collect();
-
-            Some(result)
+            // Try parsing the right-hand side as a constant first.
+            // If that fails, resolve it as a buffer name from the inputs map.
+            if let Ok(constant) = rhs.parse::<i64>() {
+                let result: Vec<i64> = base_values
+                    .iter()
+                    .map(|&v| match op {
+                        "+" => v + constant,
+                        "-" => v - constant,
+                        "*" => v * constant,
+                        "/" => v / constant,
+                        _ => v,
+                    })
+                    .collect();
+                Some(result)
+            } else if let Some(rhs_values) = inputs.get(rhs) {
+                // Two-buffer operation: "input_a + input_b"
+                let len = base_values.len().min(rhs_values.len()).min(output_size);
+                let result: Vec<i64> = base_values[..len]
+                    .iter()
+                    .zip(rhs_values[..len].iter())
+                    .map(|(&a, &b)| match op {
+                        "+" => a + b,
+                        "-" => a - b,
+                        "*" => a * b,
+                        "/" => a / b,
+                        _ => a,
+                    })
+                    .collect();
+                Some(result)
+            } else {
+                None
+            }
         } else if parts.len() == 1 {
             // Just a constant
             let constant: i64 = parts[0].parse().ok()?;
@@ -548,5 +587,173 @@ transform = "input_a + 41"
         assert_eq!(ElementType::I8.byte_size(), 1);
         assert_eq!(ElementType::I32.byte_size(), 4);
         assert_eq!(ElementType::I64.byte_size(), 8);
+    }
+
+    #[test]
+    fn test_two_input_transform() {
+        let toml_content = r#"
+[test]
+name = "vec_add"
+source_dir = "test"
+
+[build]
+mlir_file = "aie.mlir"
+device = "npu1_1col"
+
+[buffers.input_a]
+size = 4
+element_type = "i32"
+group_id = 3
+
+[buffers.input_a.pattern]
+type = "sequential"
+start = 1
+step = 1
+
+[buffers.input_b]
+size = 4
+element_type = "i32"
+group_id = 4
+
+[buffers.input_b.pattern]
+type = "sequential"
+start = 10
+step = 10
+
+[buffers.output]
+size = 4
+element_type = "i32"
+group_id = 5
+
+[expected]
+type = "transform"
+transform = "input_a + input_b"
+"#;
+
+        let manifest: TestManifest = toml::from_str(toml_content).unwrap();
+
+        let mut inputs = HashMap::new();
+        inputs.insert("input_a".to_string(), vec![1, 2, 3, 4]);
+        inputs.insert("input_b".to_string(), vec![10, 20, 30, 40]);
+
+        let expected = manifest.generate_expected(&inputs).unwrap();
+        assert_eq!(expected, vec![11, 22, 33, 44]);
+    }
+
+    #[test]
+    fn test_expected_fail_fields() {
+        let toml_content = r#"
+[test]
+name = "broken_test"
+source_dir = "test"
+expected_fail = true
+expected_fail_reason = "Produces input+41 instead of input+1"
+
+[build]
+mlir_file = "aie.mlir"
+device = "npu1_1col"
+
+[buffers.input_a]
+size = 4
+element_type = "i32"
+group_id = 3
+
+[buffers.input_a.pattern]
+type = "sequential"
+start = 1
+step = 1
+
+[buffers.output]
+size = 4
+element_type = "i32"
+group_id = 5
+
+[expected]
+type = "transform"
+transform = "input_a + 1"
+"#;
+
+        let manifest: TestManifest = toml::from_str(toml_content).unwrap();
+        assert!(manifest.test.expected_fail);
+        assert_eq!(manifest.test.expected_fail_reason, "Produces input+41 instead of input+1");
+        assert!(!manifest.test.skip);
+    }
+
+    #[test]
+    fn test_skip_fields() {
+        let toml_content = r#"
+[test]
+name = "chess_test"
+source_dir = "test"
+skip = true
+skip_reason = "Requires xchesscc"
+
+[build]
+mlir_file = "aie.mlir"
+device = "npu1_1col"
+
+[buffers.input_a]
+size = 4
+element_type = "i32"
+group_id = 3
+
+[buffers.input_a.pattern]
+type = "sequential"
+start = 1
+step = 1
+
+[buffers.output]
+size = 4
+element_type = "i32"
+group_id = 5
+
+[expected]
+type = "transform"
+transform = "input_a + 1"
+"#;
+
+        let manifest: TestManifest = toml::from_str(toml_content).unwrap();
+        assert!(manifest.test.skip);
+        assert_eq!(manifest.test.skip_reason, "Requires xchesscc");
+        assert!(!manifest.test.expected_fail);
+    }
+
+    #[test]
+    fn test_default_optional_fields() {
+        // Verify that expected_fail and skip default to false when omitted
+        let toml_content = r#"
+[test]
+name = "normal_test"
+source_dir = "test"
+
+[build]
+mlir_file = "aie.mlir"
+device = "npu1_1col"
+
+[buffers.input_a]
+size = 4
+element_type = "i32"
+group_id = 3
+
+[buffers.input_a.pattern]
+type = "sequential"
+start = 1
+step = 1
+
+[buffers.output]
+size = 4
+element_type = "i32"
+group_id = 5
+
+[expected]
+type = "transform"
+transform = "input_a + 1"
+"#;
+
+        let manifest: TestManifest = toml::from_str(toml_content).unwrap();
+        assert!(!manifest.test.expected_fail);
+        assert!(!manifest.test.skip);
+        assert!(manifest.test.expected_fail_reason.is_empty());
+        assert!(manifest.test.skip_reason.is_empty());
     }
 }

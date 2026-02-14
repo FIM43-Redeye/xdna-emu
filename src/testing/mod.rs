@@ -19,6 +19,8 @@
 pub mod xclbin_suite;
 pub mod opcode_collector;
 pub mod manifest_runner;
+pub mod npu_runner;
+pub mod hardware_comparison;
 
 pub use xclbin_suite::{XclbinSuite, XclbinTest, TestOutcome};
 pub use opcode_collector::{UnknownOpcode, OpcodeCollector};

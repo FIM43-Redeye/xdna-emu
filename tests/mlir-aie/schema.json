@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xdna-emu/tests/mlir-aie/schema.json",
+  "title": "mlir-aie Test Manifest",
+  "description": "Schema for describing mlir-aie tests imported into xdna-emu",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Manifest schema version"
+    },
+    "generated": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this manifest was generated"
+    },
+    "mlir_aie_commit": {
+      "type": "string",
+      "description": "Git commit hash of mlir-aie source"
+    },
+    "tests": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/test"
+      }
+    }
+  },
+  "required": ["version", "tests"],
+  "$defs": {
+    "test": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique test identifier (e.g., 'npu-xrt/add_one_objFifo')"
+        },
+        "name": {
+          "type": "string",
+          "description": "Human-readable test name"
+        },
+        "source_path": {
+          "type": "string",
+          "description": "Path relative to mlir-aie root"
+        },
+        "architecture": {
+          "type": "string",
+          "enum": ["aie1", "aie2", "aie2p", "multi"],
+          "description": "Target architecture family"
+        },
+        "devices": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "xcvc1902", "xcve2302", "xcve2802",
+              "npu1", "npu1_1col", "npu1_2col", "npu1_3col",
+              "npu2", "npu2_1col", "npu2_2col", "npu2_3col", "npu2_4col",
+              "NPUDEVICE"
+            ]
+          },
+          "description": "Compatible device targets"
+        },
+        "source_type": {
+          "type": "string",
+          "enum": ["mlir", "python", "both"],
+          "description": "How the test MLIR is generated"
+        },
+        "has_host_test": {
+          "type": "boolean",
+          "description": "Whether test.cpp exists for runtime validation"
+        },
+        "has_python_test": {
+          "type": "boolean",
+          "description": "Whether test.py exists for runtime validation"
+        },
+        "requires_kernels": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Kernel object files needed (e.g., 'mm_64x64x64.o')"
+        },
+        "python_args": {
+          "type": "string",
+          "description": "Default arguments for Python generator"
+        },
+        "build_status": {
+          "type": "string",
+          "enum": ["success", "failed", "skipped", "untested"],
+          "description": "Last known build status"
+        },
+        "build_error": {
+          "type": "string",
+          "description": "Error message if build failed"
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "unit_test", "integration", "benchmark",
+            "example", "tutorial", "exercise"
+          ],
+          "description": "Test category"
+        },
+        "features": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "dma", "locks", "streams", "cascade", "packet_switch",
+              "objectfifo", "memtile", "shim_dma", "core_kernel",
+              "multi_core", "multi_column"
+            ]
+          },
+          "description": "AIE features exercised by this test"
+        }
+      },
+      "required": ["id", "source_path", "architecture", "devices", "source_type"]
+    }
+  }
+}

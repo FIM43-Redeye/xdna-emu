@@ -158,8 +158,18 @@ impl ChannelTimingState {
 
     /// Advance timing by one cycle.
     ///
+    /// `has_acquire_lock` controls whether the BdSetup -> LockAcquire transition occurs.
+    /// `has_release_lock` controls whether the DataTransfer -> LockRelease transition occurs.
+    /// These are separate because a BD can have a release lock without an acquire lock.
+    ///
     /// Returns the new phase after this cycle.
-    pub fn tick(&mut self, config: &DmaTimingConfig, has_lock: bool, lock_available: bool) -> TransferPhase {
+    pub fn tick(
+        &mut self,
+        config: &DmaTimingConfig,
+        has_acquire_lock: bool,
+        has_release_lock: bool,
+        lock_available: bool,
+    ) -> TransferPhase {
         self.total_cycles += 1;
 
         // Decrement memory pipeline counter
@@ -177,7 +187,7 @@ impl ChannelTimingState {
                     self.cycles_remaining -= 1;
                 }
                 if self.cycles_remaining == 0 {
-                    if has_lock {
+                    if has_acquire_lock {
                         self.phase = TransferPhase::LockAcquire;
                         self.cycles_remaining = config.lock_acquire_cycles as u64;
                     } else {
@@ -217,7 +227,7 @@ impl ChannelTimingState {
                 self.cycles_remaining -= words_this_cycle;
 
                 if self.cycles_remaining == 0 {
-                    if has_lock {
+                    if has_release_lock {
                         self.phase = TransferPhase::LockRelease;
                         self.cycles_remaining = config.lock_release_cycles as u64;
                     } else {
@@ -415,19 +425,19 @@ mod tests {
 
         // Tick through BD setup (4 cycles)
         for _ in 0..4 {
-            state.tick(&config, false, true);
+            state.tick(&config, false, false, true);
         }
         assert_eq!(state.phase, TransferPhase::MemoryLatency);
 
         // Tick through memory latency (5 cycles)
         for _ in 0..5 {
-            state.tick(&config, false, true);
+            state.tick(&config, false, false, true);
         }
         assert_eq!(state.phase, TransferPhase::DataTransfer);
 
         // Tick through data transfer (4 words)
         for _ in 0..4 {
-            state.tick(&config, false, true);
+            state.tick(&config, false, false, true);
         }
         assert_eq!(state.phase, TransferPhase::Complete);
     }
@@ -439,18 +449,18 @@ mod tests {
 
         // Tick through BD setup
         for _ in 0..4 {
-            state.tick(&config, true, true);
+            state.tick(&config, true, true, true);
         }
         assert_eq!(state.phase, TransferPhase::LockAcquire);
 
         // Lock not available - should stall
-        state.tick(&config, true, false);
+        state.tick(&config, true, true, false);
         assert_eq!(state.phase, TransferPhase::LockAcquire);
-        state.tick(&config, true, false);
+        state.tick(&config, true, true, false);
         assert_eq!(state.phase, TransferPhase::LockAcquire);
 
         // Lock becomes available
-        state.tick(&config, true, true);
+        state.tick(&config, true, true, true);
         assert_eq!(state.phase, TransferPhase::MemoryLatency);
     }
 
@@ -502,7 +512,7 @@ mod tests {
 
         // Complete a transfer through all phases
         while !state.is_complete() {
-            state.tick(&config, false, true);
+            state.tick(&config, false, false, true);
         }
 
         // Start chaining
@@ -511,7 +521,7 @@ mod tests {
 
         // Should take bd_chain_cycles + bd_setup_cycles to get to next transfer
         for _ in 0..config.bd_chain_cycles {
-            state.tick(&config, false, true);
+            state.tick(&config, false, false, true);
         }
         assert_eq!(state.phase, TransferPhase::BdSetup);
     }

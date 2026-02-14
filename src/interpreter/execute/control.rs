@@ -83,7 +83,7 @@ impl ControlUnit {
         op: &SlotOp,
         ctx: &mut ExecutionContext,
         tile: &mut Tile,
-        mut mem_tile_locks: Option<&mut [Lock; 64]>,
+        mem_tile_locks: Option<&mut [Lock; 64]>,
     ) -> Option<ExecuteResult> {
         match &op.op {
             Operation::Branch { condition } => {
@@ -219,9 +219,21 @@ impl ControlUnit {
     }
 
     /// Get branch target address from operand.
+    ///
+    /// For conditional branches (jnz/jz), the sources contain both a condition
+    /// register and an immediate target address. We prefer the Immediate operand
+    /// since that's the branch target; the register is the condition (already
+    /// handled by the caller). For unconditional branches (jl), the first source
+    /// is the Immediate target directly.
     fn get_branch_target(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
+        // Prefer Immediate operand (the branch target address)
+        for src in &op.sources {
+            if let Operand::Immediate(v) = src {
+                return *v as u32;
+            }
+        }
+        // Fallback: register-indirect branch (e.g., jr rX)
         op.sources.first().map_or(0, |src| match src {
-            Operand::Immediate(v) => *v as u32,
             Operand::ScalarReg(r) => ctx.scalar.read(*r),
             _ => 0,
         })
