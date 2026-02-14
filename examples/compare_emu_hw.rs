@@ -105,6 +105,7 @@ fn main() {
             &input_values,
             emu_output.as_deref(),
             hw_output.as_deref(),
+            if has_hw_outputs { Some(hw_output_dir.as_path()) } else { None },
         );
 
         // Print per-test status line

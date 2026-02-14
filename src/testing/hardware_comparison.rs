@@ -14,6 +14,7 @@
 //! byte buffers from either live capture or saved files.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use super::manifest_runner::{TestManifest, ElementType, read_values};
 
@@ -97,12 +98,13 @@ pub fn validate_hw_vs_manifest(
     hw_output: &[u8],
     manifest: &TestManifest,
     input_values: &HashMap<String, Vec<i64>>,
+    reference_dir: Option<&Path>,
 ) -> Option<ComparisonResult> {
     let output_buf = manifest.get_output()?;
     let elem_type = ElementType::from_str(&output_buf.element_type)?;
 
-    // Generate expected values from the manifest transform
-    let expected = manifest.generate_expected(input_values)?;
+    // Generate expected values from the manifest transform or reference file
+    let expected = manifest.generate_expected(input_values, reference_dir)?;
     let actual = read_values(hw_output, elem_type);
 
     Some(compare_value_slices(&expected, &actual))
@@ -143,6 +145,7 @@ impl CrossValidation {
         input_values: &HashMap<String, Vec<i64>>,
         emu_output: Option<&[u8]>,
         hw_output: Option<&[u8]>,
+        reference_dir: Option<&Path>,
     ) -> Self {
         let output_buf = manifest.get_output();
         let elem_type = output_buf
@@ -150,12 +153,12 @@ impl CrossValidation {
 
         // Layer 1: Emu vs Manifest
         let emu_vs_manifest = emu_output.and_then(|emu| {
-            validate_hw_vs_manifest(emu, manifest, input_values)
+            validate_hw_vs_manifest(emu, manifest, input_values, reference_dir)
         });
 
         // Layer 2: HW vs Manifest
         let hw_vs_manifest = hw_output.and_then(|hw| {
-            validate_hw_vs_manifest(hw, manifest, input_values)
+            validate_hw_vs_manifest(hw, manifest, input_values, reference_dir)
         });
 
         // Layer 3: Emu vs HW
@@ -402,7 +405,7 @@ transform = "input_a + 1"
             .flat_map(|v| v.to_le_bytes())
             .collect();
 
-        let result = validate_hw_vs_manifest(&hw_output, &manifest, &inputs).unwrap();
+        let result = validate_hw_vs_manifest(&hw_output, &manifest, &inputs, None).unwrap();
         assert!(result.is_match());
         assert_eq!(result.total, 4);
     }
@@ -453,6 +456,7 @@ transform = "input_a + 1"
             &inputs,
             Some(&correct),
             Some(&correct),
+            None,
         );
 
         assert!(cv.emu_vs_manifest.as_ref().unwrap().is_match());
@@ -510,6 +514,7 @@ transform = "input_a + 1"
             &inputs,
             Some(&emu_wrong),
             Some(&hw_correct),
+            None,
         );
 
         // Emu vs manifest: FAIL (emulator produced wrong values)

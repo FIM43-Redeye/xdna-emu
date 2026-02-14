@@ -310,6 +310,8 @@ pub struct XclbinSuite {
     results: Vec<(String, TestOutcome)>,
     /// Directory containing manifest files for validation.
     manifest_dir: Option<PathBuf>,
+    /// Directory containing hardware reference outputs (for type = "reference" manifests).
+    reference_dir: Option<PathBuf>,
 }
 
 impl XclbinSuite {
@@ -321,6 +323,7 @@ impl XclbinSuite {
             max_cycles: 1_000_000,
             results: Vec::new(),
             manifest_dir: None,
+            reference_dir: None,
         }
     }
 
@@ -330,6 +333,12 @@ impl XclbinSuite {
     /// Set to 0 to disable entirely (rely on TDR no-progress detection only).
     pub fn with_max_cycles(mut self, max: u64) -> Self {
         self.max_cycles = max;
+        self
+    }
+
+    /// Set the directory containing hardware reference outputs.
+    pub fn with_reference_dir(mut self, dir: PathBuf) -> Self {
+        self.reference_dir = Some(dir);
         self
     }
 
@@ -892,7 +901,8 @@ impl XclbinSuite {
 
         // Generate expected values from all input buffers
         let inputs = input_values.unwrap_or_default();
-        let expected_values = manifest.generate_expected(&inputs)?;
+        let reference_dir = self.reference_dir.as_deref();
+        let expected_values = manifest.generate_expected(&inputs, reference_dir)?;
 
         // Compare
         let total = expected_values.len().min(actual_values.len());

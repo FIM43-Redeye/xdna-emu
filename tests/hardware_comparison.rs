@@ -78,12 +78,15 @@ fn cross_validate_test(test_name: &str) -> Option<CrossValidation> {
     let hw_output = load_hw_output(test_name);
     let inputs = generate_inputs(&manifest);
 
+    let hw_output_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/npu-outputs");
     Some(CrossValidation::compare(
         test_name,
         &manifest,
         &inputs,
         emu_output.as_deref(),
         hw_output.as_deref(),
+        Some(hw_output_dir.as_path()),
     ))
 }
 

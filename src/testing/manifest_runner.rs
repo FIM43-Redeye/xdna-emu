@@ -215,7 +215,15 @@ impl TestManifest {
     }
 
     /// Generate expected output data based on the transform.
-    pub fn generate_expected(&self, inputs: &HashMap<String, Vec<i64>>) -> Option<Vec<i64>> {
+    ///
+    /// When `expected.type` is `"reference"`, loads the expected output from
+    /// a captured hardware output file at `{reference_dir}/{test_name}/output.bin`.
+    /// Pass `None` for `reference_dir` if reference files are not available.
+    pub fn generate_expected(
+        &self,
+        inputs: &HashMap<String, Vec<i64>>,
+        reference_dir: Option<&Path>,
+    ) -> Option<Vec<i64>> {
         let output_buf = self.buffers.get("output")?;
 
         match self.expected.expected_type.as_str() {
@@ -224,6 +232,13 @@ impl TestManifest {
                 self.apply_transform(transform, inputs, output_buf.size)
             }
             "values" => self.expected.values.clone(),
+            "reference" => {
+                let dir = reference_dir?;
+                let ref_path = dir.join(&self.test.name).join("output.bin");
+                let data = std::fs::read(&ref_path).ok()?;
+                let elem_type = ElementType::from_str(&output_buf.element_type)?;
+                Some(read_values(&data, elem_type))
+            }
             _ => None,
         }
     }
@@ -573,7 +588,7 @@ transform = "input_a + 41"
         let mut inputs = HashMap::new();
         inputs.insert("input_a".to_string(), vec![1, 2, 3, 4]);
 
-        let expected = manifest.generate_expected(&inputs).unwrap();
+        let expected = manifest.generate_expected(&inputs, None).unwrap();
         assert_eq!(expected, vec![42, 43, 44, 45]);
     }
 
@@ -636,7 +651,7 @@ transform = "input_a + input_b"
         inputs.insert("input_a".to_string(), vec![1, 2, 3, 4]);
         inputs.insert("input_b".to_string(), vec![10, 20, 30, 40]);
 
-        let expected = manifest.generate_expected(&inputs).unwrap();
+        let expected = manifest.generate_expected(&inputs, None).unwrap();
         assert_eq!(expected, vec![11, 22, 33, 44]);
     }
 

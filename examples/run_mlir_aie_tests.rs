@@ -112,7 +112,10 @@ fn print_verbose_comparison(
     }
 
     // Generate expected values
-    let expected = match manifest.generate_expected(&inputs) {
+    let reference_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/npu-outputs");
+    let ref_dir = if reference_dir.exists() { Some(reference_dir.as_path()) } else { None };
+    let expected = match manifest.generate_expected(&inputs, ref_dir) {
         Some(e) => e,
         None => { println!("      (could not generate expected values)"); return; }
     };

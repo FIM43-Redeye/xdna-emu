@@ -294,7 +294,10 @@ fn run_test(
     let mut inputs: HashMap<String, Vec<i64>> = HashMap::new();
     inputs.insert("input_a".to_string(), input_values);
 
-    let expected_values = manifest.generate_expected(&inputs)
+    let reference_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/npu-outputs");
+    let ref_dir = if reference_dir.exists() { Some(reference_dir.as_path()) } else { None };
+    let expected_values = manifest.generate_expected(&inputs, ref_dir)
         .ok_or("Failed to generate expected values")?;
 
     // Compare
