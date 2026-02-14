@@ -70,14 +70,18 @@ impl MemoryUnit {
     ///
     /// Returns `true` if the operation was handled, `false` if not a memory op.
     pub fn execute(op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) -> bool {
+        // PostModify comes from op.post_modify (populated directly from the
+        // AG field during decode) rather than from the Operation variant.
+        let pm = &op.post_modify;
+
         match &op.op {
-            Operation::Load { width, post_modify } => {
-                Self::execute_load(op, ctx, tile, *width, post_modify);
+            Operation::Load { width, .. } => {
+                Self::execute_load(op, ctx, tile, *width, pm);
                 true
             }
 
-            Operation::Store { width, post_modify } => {
-                Self::execute_store(op, ctx, tile, *width, post_modify);
+            Operation::Store { width, .. } => {
+                Self::execute_store(op, ctx, tile, *width, pm);
                 true
             }
 
@@ -91,27 +95,27 @@ impl MemoryUnit {
                 true
             }
 
-            Operation::VectorLoadA { post_modify } => {
-                Self::execute_vector_load_a(op, ctx, tile, post_modify);
+            Operation::VectorLoadA { .. } => {
+                Self::execute_vector_load_a(op, ctx, tile, pm);
                 true
             }
 
-            Operation::VectorLoadB { post_modify } => {
-                Self::execute_vector_load_b(op, ctx, tile, post_modify);
+            Operation::VectorLoadB { .. } => {
+                Self::execute_vector_load_b(op, ctx, tile, pm);
                 true
             }
 
             Operation::VectorLoadUnpack {
                 from_type,
                 to_type,
-                post_modify,
+                ..
             } => {
-                Self::execute_vector_load_unpack(op, ctx, tile, *from_type, *to_type, post_modify);
+                Self::execute_vector_load_unpack(op, ctx, tile, *from_type, *to_type, pm);
                 true
             }
 
-            Operation::VectorStore { post_modify } => {
-                Self::execute_vector_store(op, ctx, tile, post_modify);
+            Operation::VectorStore { .. } => {
+                Self::execute_vector_store(op, ctx, tile, pm);
                 true
             }
 
@@ -850,6 +854,7 @@ mod tests {
                 post_modify: PostModify::Immediate(4),
             },
         )
+        .with_post_modify(PostModify::Immediate(4))
         .with_dest(Operand::ScalarReg(0))
         .with_source(Operand::PointerReg(0));
 
@@ -876,6 +881,7 @@ mod tests {
                 post_modify: PostModify::Register(0),
             },
         )
+        .with_post_modify(PostModify::Register(0))
         .with_dest(Operand::ScalarReg(0))
         .with_source(Operand::PointerReg(0));
 
@@ -1062,6 +1068,7 @@ mod tests {
                 post_modify: PostModify::Immediate(32), // 256 bits = 32 bytes
             },
         )
+        .with_post_modify(PostModify::Immediate(32))
         .with_dest(Operand::VectorReg(0))
         .with_source(Operand::PointerReg(0));
 
@@ -1115,6 +1122,7 @@ mod tests {
                 post_modify: PostModify::Immediate(32),
             },
         )
+        .with_post_modify(PostModify::Immediate(32))
         .with_dest(Operand::VectorReg(0))
         .with_source(Operand::PointerReg(1));
 
@@ -1166,6 +1174,7 @@ mod tests {
                 post_modify: PostModify::Register(2),
             },
         )
+        .with_post_modify(PostModify::Register(2))
         .with_dest(Operand::VectorReg(1))
         .with_source(Operand::PointerReg(5));
 
@@ -1217,6 +1226,7 @@ mod tests {
                 post_modify: PostModify::Immediate(32),
             },
         )
+        .with_post_modify(PostModify::Immediate(32))
         .with_dest(Operand::VectorReg(5))
         .with_source(Operand::PointerReg(3));
 
@@ -1339,6 +1349,7 @@ mod tests {
                 post_modify: PostModify::Immediate(16), // Read 16 bytes
             },
         )
+        .with_post_modify(PostModify::Immediate(16))
         .with_dest(Operand::VectorReg(0))
         .with_source(Operand::PointerReg(2));
 

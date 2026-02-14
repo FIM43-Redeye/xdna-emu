@@ -874,17 +874,34 @@ impl InstructionDecoder {
         decoded: &DecodedInstr,
         dest: Option<Operand>,
         sources: Vec<Operand>,
+        extracted_pm: Option<PostModify>,
     ) -> SlotOp {
+        let enc = &decoded.encoding;
+
         // Build SlotOp with semantic and implicit registers
-        let mut slot_op = if let Some(semantic) = decoded.encoding.semantic {
+        let mut slot_op = if let Some(semantic) = enc.semantic {
             SlotOp::with_semantic(slot_index, operation, semantic)
         } else {
             SlotOp::new(slot_index, operation)
         };
 
+        // ── Populate metadata from InstrEncoding ─────────────────────────
+        slot_op.is_vector = enc.is_vector;
+        slot_op.element_type = enc.element_type;
+        slot_op.mem_width = match enc.mem_width {
+            InstrMemWidth::Byte => MemWidth::Byte,
+            InstrMemWidth::HalfWord => MemWidth::HalfWord,
+            InstrMemWidth::Word => MemWidth::Word,
+            InstrMemWidth::Vector256 => MemWidth::Vector256,
+        };
+        slot_op.branch_condition = enc.branch_condition;
+        slot_op.select_variant = enc.select_variant;
+        // PostModify comes directly from AG field extraction -- no backpatching.
+        slot_op.post_modify = extracted_pm.unwrap_or(PostModify::None);
+
         // Add implicit registers from TableGen
-        if !decoded.encoding.implicit_regs.is_empty() {
-            slot_op = slot_op.with_implicit_regs(decoded.encoding.implicit_regs.clone());
+        if !enc.implicit_regs.is_empty() {
+            slot_op = slot_op.with_implicit_regs(enc.implicit_regs.clone());
         }
 
         // Set destination and sources (already in TableGen canonical order)
@@ -980,20 +997,8 @@ impl Decoder for InstructionDecoder {
                 if slot.slot_type == SlotType::Nop || slot.bits == 0 {
                     bundle.set_slot(SlotOp::nop(slot_index));
                 } else if let Some(decoded) = self.decode_slot_bits(slot.bits, slot.slot_type) {
-                    let mut operation = self.to_operation(&decoded);
+                    let operation = self.to_operation(&decoded);
                     let (dest, sources, extracted_pm) = self.extract_operands(&decoded);
-
-                    // Patch PostModify from ag_* extraction into the Operation
-                    if let Some(pm) = extracted_pm {
-                        match &mut operation {
-                            Operation::Load { post_modify, .. } => *post_modify = pm,
-                            Operation::Store { post_modify, .. } => *post_modify = pm,
-                            Operation::VectorLoadA { post_modify } => *post_modify = pm,
-                            Operation::VectorLoadB { post_modify } => *post_modify = pm,
-                            Operation::VectorStore { post_modify } => *post_modify = pm,
-                            _ => {}
-                        }
-                    }
 
                     // For LNG slot instructions, use the operation's natural slot since
                     // LNG can contain either control (JL, J) or vector/scalar (movxm).
@@ -1003,8 +1008,10 @@ impl Decoder for InstructionDecoder {
                         slot_index
                     };
 
-                    // Build SlotOp with TableGen info (reorders sources, adds semantic/implicit)
-                    let slot_op = self.build_slot_op(effective_slot, operation, &decoded, dest, sources);
+                    // Build SlotOp with metadata from InstrEncoding + extracted PostModify
+                    let slot_op = self.build_slot_op(
+                        effective_slot, operation, &decoded, dest, sources, extracted_pm,
+                    );
                     bundle.set_slot(slot_op);
                 } else {
                     // Slot extracted but not recognized - mark as unknown with slot info
@@ -1042,24 +1049,14 @@ impl Decoder for InstructionDecoder {
             if word0 == 0 || word0 == 0x15010040 {
                 bundle.set_slot(SlotOp::nop(SlotIndex::Scalar0));
             } else if let Some(decoded) = self.decode_word(word0 as u64) {
-                let mut operation = self.to_operation(&decoded);
+                let operation = self.to_operation(&decoded);
                 let slot_index = self.slot_to_index(&decoded.encoding.slot);
                 let (dest, sources, extracted_pm) = self.extract_operands(&decoded);
 
-                // Patch PostModify from ag_* extraction into the Operation
-                if let Some(pm) = extracted_pm {
-                    match &mut operation {
-                        Operation::Load { post_modify, .. } => *post_modify = pm,
-                        Operation::Store { post_modify, .. } => *post_modify = pm,
-                        Operation::VectorLoadA { post_modify } => *post_modify = pm,
-                        Operation::VectorLoadB { post_modify } => *post_modify = pm,
-                        Operation::VectorStore { post_modify } => *post_modify = pm,
-                        _ => {}
-                    }
-                }
-
-                // Build SlotOp with TableGen info
-                let slot_op = self.build_slot_op(slot_index, operation, &decoded, dest, sources);
+                // Build SlotOp with metadata from InstrEncoding + extracted PostModify
+                let slot_op = self.build_slot_op(
+                    slot_index, operation, &decoded, dest, sources, extracted_pm,
+                );
                 bundle.set_slot(slot_op);
             } else {
                 // Unknown instruction

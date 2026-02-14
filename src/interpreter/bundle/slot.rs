@@ -860,22 +860,32 @@ pub struct Predicate {
 
 /// A single slot operation within a VLIW bundle.
 ///
-/// Contains the operation, its operands, and optional predicate.
+/// Contains the decoded instruction, its operands, and metadata from
+/// TableGen. The `semantic` field carries the operation kind (Add, Load, Br,
+/// etc.) and the accompanying metadata fields (is_vector, element_type,
+/// mem_width, post_modify, branch_condition, select_variant) carry the
+/// disambiguation and addressing info.
 ///
-/// # TableGen Integration
+/// # Execution Dispatch
 ///
-/// The `semantic` and `implicit_regs` fields are populated from TableGen data
-/// when available. This enables:
-/// - `semantic`: Dispatch to ~40 generic handlers instead of 130+ Operation variants
-/// - `implicit_regs`: Handle instructions like `sel.eqz` that read r27 implicitly
+/// Executors should match on `semantic` plus metadata guards:
+/// ```ignore
+/// match op.semantic {
+///     Some(SemanticOp::Add) if !op.is_vector => { /* scalar add */ }
+///     Some(SemanticOp::Add) => { /* vector add, use op.element_type */ }
+///     Some(SemanticOp::Load) => { /* use op.mem_width, op.post_modify */ }
+///     _ => { /* fallback to op.op for legacy operations */ }
+/// }
+/// ```
 ///
-/// During the migration, both `op` and `semantic` may be set. Executors should
-/// prefer `semantic` when present for instructions that have been migrated.
+/// The `op` field is **deprecated** and retained only for legacy executor
+/// paths and the latency table (Phase 4 will remove it).
 #[derive(Debug, Clone)]
 pub struct SlotOp {
     /// Which slot this operation occupies.
     pub slot: SlotIndex,
-    /// The specific operation (legacy - being replaced by semantic).
+    /// **Deprecated**: Legacy operation enum. Prefer `semantic` + metadata.
+    /// Retained for latency lookup until Phase 4 replaces it.
     pub op: Operation,
     /// TableGen-derived semantic operation (when available).
     ///
@@ -885,8 +895,31 @@ pub struct SlotOp {
     /// Implicit register uses/defs from TableGen.
     ///
     /// For example, `sel.eqz` uses r27 implicitly to read the test value.
-    /// This is not encoded in the instruction bits - TableGen tells us it's fixed.
+    /// This is not encoded in the instruction bits -- TableGen tells us it's fixed.
     pub implicit_regs: SmallVec<[ImplicitReg; 2]>,
+
+    // ── Instruction Metadata (from InstrEncoding) ──────────────────────
+    //
+    // These fields carry all the disambiguation and addressing info that
+    // was previously baked into the 130-variant Operation enum. They are
+    // populated from InstrEncoding at decode time.
+
+    /// Whether this is a vector (SIMD) operation.
+    pub is_vector: bool,
+    /// Element type for vector operations (None for scalar).
+    pub element_type: Option<ElementType>,
+    /// Memory access width for load/store operations.
+    pub mem_width: MemWidth,
+    /// Post-modify mode for load/store addressing.
+    /// Populated directly from the address generator field, not backpatched.
+    pub post_modify: PostModify,
+    /// Branch condition for conditional branches.
+    pub branch_condition: Option<BranchCondition>,
+    /// Select variant (generic, equal-zero, not-equal-zero).
+    pub select_variant: Option<SelectVariant>,
+
+    // ── Operands ───────────────────────────────────────────────────────
+
     /// Source operands (ordered per InstrDef.inputs when semantic is set).
     pub sources: SmallVec<[Operand; 4]>,
     /// Destination operand (if any).
@@ -903,6 +936,12 @@ impl SlotOp {
             op,
             semantic: None,
             implicit_regs: SmallVec::new(),
+            is_vector: false,
+            element_type: None,
+            mem_width: MemWidth::Word,
+            post_modify: PostModify::None,
+            branch_condition: None,
+            select_variant: None,
             sources: SmallVec::new(),
             dest: None,
             predicate: None,
@@ -916,6 +955,12 @@ impl SlotOp {
             op,
             semantic: Some(semantic),
             implicit_regs: SmallVec::new(),
+            is_vector: false,
+            element_type: None,
+            mem_width: MemWidth::Word,
+            post_modify: PostModify::None,
+            branch_condition: None,
+            select_variant: None,
             sources: SmallVec::new(),
             dest: None,
             predicate: None,
@@ -947,6 +992,18 @@ impl SlotOp {
     /// Set the destination operand.
     pub fn with_dest(mut self, dst: Operand) -> Self {
         self.dest = Some(dst);
+        self
+    }
+
+    /// Set the post-modify mode for load/store addressing.
+    pub fn with_post_modify(mut self, pm: PostModify) -> Self {
+        self.post_modify = pm;
+        self
+    }
+
+    /// Set the memory access width.
+    pub fn with_mem_width(mut self, width: MemWidth) -> Self {
+        self.mem_width = width;
         self
     }
 
