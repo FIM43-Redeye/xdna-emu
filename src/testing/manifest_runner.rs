@@ -48,6 +48,68 @@ pub struct TestManifest {
     pub build: BuildInfo,
     pub buffers: HashMap<String, BufferDef>,
     pub expected: ExpectedDef,
+    /// Multi-kernel execution specification (optional).
+    /// When present, the test involves multiple kernel invocations.
+    #[serde(default)]
+    pub multi_kernel: Option<MultiKernelDef>,
+}
+
+/// Multi-kernel execution specification.
+///
+/// Describes how multiple kernels within a single xclbin should be
+/// invoked, including buffer linkage between runs.
+///
+/// # Example
+///
+/// ```toml
+/// [multi_kernel]
+/// mode = "sequential"    # or "runlist"
+///
+/// [[multi_kernel.runs]]
+/// kernel = "ADDONE"
+/// insts = "insts.bin"
+///
+/// [[multi_kernel.runs]]
+/// kernel = "ADDTWO"
+/// insts = "insts.bin"
+///
+/// [[multi_kernel.links]]
+/// from_run = 0
+/// from_group_id = 5
+/// to_run = 1
+/// to_group_id = 3
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct MultiKernelDef {
+    /// Execution mode: "sequential" or "runlist".
+    pub mode: String,
+    /// Kernel invocations in execution order.
+    pub runs: Vec<KernelRun>,
+    /// Buffer linkages between runs.
+    #[serde(default)]
+    pub links: Vec<BufferLink>,
+}
+
+/// A single kernel invocation in a multi-kernel test.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KernelRun {
+    /// Kernel name as it appears in the xclbin (e.g. "ADDONE").
+    pub kernel: String,
+    /// Instruction binary file name (relative to build dir).
+    pub insts: String,
+}
+
+/// Buffer linkage: output of one run feeds as input to another.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BufferLink {
+    /// Source run index (0-based).
+    pub from_run: usize,
+    /// Source buffer group_id.
+    pub from_group_id: u32,
+    /// Destination run index (0-based).
+    pub to_run: usize,
+    /// Destination buffer group_id.
+    pub to_group_id: u32,
 }
 
 /// Basic test metadata.
@@ -72,6 +134,11 @@ pub struct TestInfo {
     /// Human-readable reason why this test is skipped.
     #[serde(default)]
     pub skip_reason: String,
+    /// Hardware platform required by this test (e.g. "npu2").
+    /// Tests with a platform that doesn't match the current hardware
+    /// (npu1 / Phoenix) are reported as PLATFORM rather than SKIP.
+    #[serde(default)]
+    pub platform: String,
 }
 
 /// Build configuration for the test.
@@ -177,6 +244,11 @@ pub struct MismatchInfo {
 }
 
 impl TestManifest {
+    /// Whether this test requires multi-kernel execution.
+    pub fn is_multi_kernel(&self) -> bool {
+        self.multi_kernel.is_some()
+    }
+
     /// Load a manifest from a TOML file.
     pub fn from_file(path: &Path) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)

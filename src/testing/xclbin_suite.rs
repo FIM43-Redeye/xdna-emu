@@ -57,6 +57,13 @@ pub enum TestOutcome {
     Skipped {
         reason: String,
     },
+    /// Test requires a different hardware platform (e.g. npu2/Strix Point).
+    /// Distinct from Skipped: these tests are gated by hardware generation,
+    /// not by missing features or tooling.
+    Platform {
+        required: String,
+        reason: String,
+    },
     /// Test failed with an error.
     Fail {
         message: String,
@@ -108,7 +115,7 @@ impl TestOutcome {
             TestOutcome::Fail { cycles, .. } => Some(*cycles),
             TestOutcome::UnknownOpcode { cycles, .. } => Some(*cycles),
             TestOutcome::Timeout { cycles } => Some(*cycles),
-            TestOutcome::Skipped { .. } | TestOutcome::LoadError { .. } => None,
+            TestOutcome::Skipped { .. } | TestOutcome::Platform { .. } | TestOutcome::LoadError { .. } => None,
         }
     }
 }
@@ -469,7 +476,7 @@ impl XclbinSuite {
                 TestOutcome::ValidationFail { .. } => validation_failed += 1,
                 TestOutcome::ExpectedFail { .. } => expected_fail += 1,
                 TestOutcome::UnexpectedPass { .. } => unexpected_pass += 1,
-                TestOutcome::Skipped { .. } => skipped += 1,
+                TestOutcome::Skipped { .. } | TestOutcome::Platform { .. } => skipped += 1,
                 TestOutcome::Fail { .. } => failed += 1,
                 TestOutcome::UnknownOpcode { details, .. } => {
                     unknown += 1;
@@ -519,6 +526,13 @@ impl XclbinSuite {
     fn run_single_inner(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>) {
         // Check if manifest says to skip this test
         if let Some(ref manifest) = test.manifest {
+            // Platform gate: test requires different hardware generation
+            if !manifest.test.platform.is_empty() {
+                return (TestOutcome::Platform {
+                    required: manifest.test.platform.clone(),
+                    reason: manifest.test.skip_reason.clone(),
+                }, None);
+            }
             if manifest.test.skip {
                 return (TestOutcome::Skipped {
                     reason: manifest.test.skip_reason.clone(),

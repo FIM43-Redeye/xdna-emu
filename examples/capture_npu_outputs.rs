@@ -71,6 +71,13 @@ fn main() {
     for (name, manifest) in &manifests {
         print!("  {:<40} ", name);
 
+        // Skip tests requiring different hardware platform
+        if !manifest.test.platform.is_empty() {
+            println!("PLATFORM (requires {})", manifest.test.platform);
+            skipped += 1;
+            continue;
+        }
+
         // Skip tests marked as skip
         if manifest.test.skip {
             println!("SKIP ({})", manifest.test.skip_reason);
@@ -87,11 +94,17 @@ fn main() {
             continue;
         }
 
-        // Find insts.bin (try both names)
+        // Find insts.bin (try both names).
+        // For multi-kernel tests, insts_path is unused (instruction paths
+        // come from the manifest's multi_kernel.runs), but we still need
+        // a path for the API.  Use a dummy path and let run_on_npu handle it.
         let insts_path = if test_dir.join("insts.bin").exists() {
             test_dir.join("insts.bin")
         } else if test_dir.join("aie_run_seq.bin").exists() {
             test_dir.join("aie_run_seq.bin")
+        } else if manifest.is_multi_kernel() {
+            // Multi-kernel tests get insts paths from the manifest
+            test_dir.join("insts.bin")  // placeholder, not actually read
         } else {
             println!("SKIP (no insts.bin)");
             skipped += 1;

@@ -219,6 +219,12 @@ fn format_result(r: &TestResult, total: usize) -> String {
         TestOutcome::Skipped { reason } => {
             out.push_str(&format!("SKIP\n      {}", reason));
         }
+        TestOutcome::Platform { required, reason } => {
+            out.push_str(&format!("PLATFORM (requires {})", required));
+            if !reason.is_empty() {
+                out.push_str(&format!("\n      {}", reason));
+            }
+        }
     }
 
     out
@@ -295,6 +301,7 @@ fn main() {
     let mut expected_fail = 0;
     let mut unexpected_pass = 0;
     let mut skipped = 0;
+    let mut platform_count = 0;
     let mut failed = 0;
     let mut unknown_count = 0;
     let mut timeout_count = 0;
@@ -316,6 +323,7 @@ fn main() {
             TestOutcome::ExpectedFail { .. } => expected_fail += 1,
             TestOutcome::UnexpectedPass { .. } => unexpected_pass += 1,
             TestOutcome::Skipped { .. } => skipped += 1,
+            TestOutcome::Platform { .. } => platform_count += 1,
         }
 
         // Verbose mode: print full expected vs actual comparison
@@ -338,8 +346,9 @@ fn main() {
 
     println!("\n{:=<60}", "");
     println!("=== SUMMARY ===");
-    let effective = total - skipped;
+    let effective = total - skipped - platform_count;
     println!("Total:            {}", total);
+    println!("Platform:         {} (requires different hardware)", platform_count);
     println!("Skipped:          {}", skipped);
     println!("Passed:           {} ({:.1}%)", passed, 100.0 * passed as f64 / effective.max(1) as f64);
     println!("Expected Fail:    {}", expected_fail);

@@ -26,11 +26,24 @@ else
     MLIR_AIE_BIN="${MLIR_AIE_BUILD}/bin"
 fi
 MLIR_AIE_VENV="${MLIR_AIE_ROOT}/ironenv"
-PEANO_INSTALL_DIR="${PEANO_INSTALL_DIR:-${MLIR_AIE_VENV}/lib/python3.13/site-packages/llvm-aie}"
+# Peano (llvm-aie) location: prefer top-level llvm-aie/install (has runtime
+# libs like crt0.o), fall back to ironenv package, allow environment override.
+if [[ -z "${PEANO_INSTALL_DIR:-}" ]]; then
+    if [[ -d "${XDNA_EMU_ROOT}/../llvm-aie/install/bin" ]]; then
+        PEANO_INSTALL_DIR="${XDNA_EMU_ROOT}/../llvm-aie/install"
+    else
+        PEANO_INSTALL_DIR="${MLIR_AIE_VENV}/lib/python3.13/site-packages/llvm-aie"
+    fi
+fi
 MLIR_AIE_PYTHON="${MLIR_AIE_ROOT}/install/python:${MLIR_AIE_ROOT}/build/python:${MLIR_AIE_ROOT}/my_install/python"
 
 AIECC="${MLIR_AIE_BIN}/aiecc.py"
 AIE_OPT="${MLIR_AIE_BIN}/aie-opt"
+AIE_TRANSLATE="${MLIR_AIE_BIN}/aie-translate"
+
+# aiecc.py internally calls aie-translate, aie-opt, etc. via subprocess.
+# Ensure they are on PATH regardless of whether the environment was activated.
+export PATH="${MLIR_AIE_BIN}:${PATH}"
 
 # Source test directory
 TEST_SRC="${MLIR_AIE_ROOT}/test/npu-xrt"
@@ -159,7 +172,8 @@ has_artifacts() {
     [[ -f "${build_dir}/aie.xclbin" ]] && \
         { [[ -f "${build_dir}/insts.bin" ]] || \
           [[ -f "${build_dir}/aie_run_seq.bin" ]] || \
-          [[ -f "${build_dir}/insts.elf" ]]; }
+          [[ -f "${build_dir}/insts.elf" ]] || \
+          ls "${build_dir}"/*_insts.bin > /dev/null 2>&1; }
 }
 
 # Get the MLIR device name for NPUDEVICE substitution.
@@ -390,6 +404,107 @@ build_elf() {
     return $result
 }
 
+# Build a multi-kernel test by parsing and replaying aiecc.py commands from
+# run.lit. Multi-kernel tests have 2+ aiecc.py invocations where later
+# passes use --xclbin-input to merge kernels. May also include aie-translate
+# for transaction-based reconfiguration (txn tests).
+#
+# Output: aie.xclbin (renamed from final xclbin), insts.bin, and any extra
+# instruction/config files referenced in the build.
+build_multi_kernel() {
+    local name="$1"
+    local src_dir="$2"
+    local bld_dir="$3"
+    local verbose="$4"
+
+    mkdir -p "$bld_dir"
+
+    local mlir_src="${src_dir}/aie.mlir"
+    if [[ ! -f "$mlir_src" ]]; then
+        echo "NO_MLIR"
+        return 1
+    fi
+
+    sed "s/NPUDEVICE/$(detect_device_name "$src_dir")/g" "$mlir_src" > "${bld_dir}/aie_arch.mlir"
+
+    local run_lit="${src_dir}/run.lit"
+    pushd "$bld_dir" > /dev/null
+
+    local step=0
+    local last_xclbin=""
+
+    # Execute each aiecc.py command from run.lit in sequence
+    while IFS= read -r line; do
+        # Strip comment prefix and leading whitespace
+        line="${line#//}"
+        line="${line#"${line%%[![:space:]]*}"}"
+
+        # Skip RUN: prefix and any npu1/npu2 selectors
+        line="${line#RUN:}"
+        line="${line#"${line%%[![:space:]]*}"}"
+
+        # Handle aiecc.py commands
+        if [[ "$line" =~ aiecc\.py ]]; then
+            # Extract everything after "aiecc.py "
+            local args_str="${line#*aiecc.py }"
+
+            # Substitute %S/ with source dir path
+            args_str="${args_str//%S\//${src_dir}/}"
+
+            # Add --no-xchesscc --no-xbridge if not already present
+            if [[ ! "$args_str" =~ --no-xchesscc ]]; then
+                args_str="--no-xchesscc --no-xbridge ${args_str}"
+            fi
+
+            # Track the last xclbin name produced
+            if [[ "$args_str" =~ --xclbin-name=([^ ]+) ]]; then
+                last_xclbin="${BASH_REMATCH[1]}"
+            fi
+
+            step=$((step + 1))
+            if [[ "$verbose" == "1" ]]; then
+                echo "  [step $step] aiecc.py ${args_str}"
+                PYTHONPATH="${MLIR_AIE_PYTHON}:${PYTHONPATH:-}" \
+                PEANO_INSTALL_DIR="${PEANO_INSTALL_DIR}" \
+                "${MLIR_AIE_VENV}/bin/python3" "$AIECC" ${args_str} 2>&1
+            else
+                PYTHONPATH="${MLIR_AIE_PYTHON}:${PYTHONPATH:-}" \
+                PEANO_INSTALL_DIR="${PEANO_INSTALL_DIR}" \
+                "${MLIR_AIE_VENV}/bin/python3" "$AIECC" ${args_str} >> build.log 2>&1
+            fi
+            if [[ $? -ne 0 ]]; then
+                popd > /dev/null
+                return 1
+            fi
+        fi
+
+        # Handle aie-translate commands (used by txn tests)
+        if [[ "$line" =~ aie-translate ]]; then
+            local translate_args="${line#*aie-translate }"
+
+            step=$((step + 1))
+            if [[ "$verbose" == "1" ]]; then
+                echo "  [step $step] aie-translate ${translate_args}"
+                "$AIE_TRANSLATE" ${translate_args} 2>&1
+            else
+                "$AIE_TRANSLATE" ${translate_args} >> build.log 2>&1
+            fi
+            if [[ $? -ne 0 ]]; then
+                popd > /dev/null
+                return 1
+            fi
+        fi
+    done < <(grep -E "(aiecc\.py|aie-translate)" "$run_lit" | grep -v "run_on_npu2")
+
+    # Rename the final xclbin to aie.xclbin for consistency
+    if [[ -n "$last_xclbin" ]] && [[ "$last_xclbin" != "aie.xclbin" ]] && [[ -f "$last_xclbin" ]]; then
+        mv "$last_xclbin" aie.xclbin
+    fi
+
+    popd > /dev/null
+    return 0
+}
+
 # Categorize a test directory
 categorize_test() {
     local name="$1"
@@ -403,7 +518,12 @@ categorize_test() {
     elif is_no_build_test "$name"; then
         echo "NOBUILD"
     elif [[ -f "${src_dir}/run.lit" ]]; then
-        if grep -q "aie-generate-column-control-overlay\|aie-generate-ctrlpkt" "${src_dir}/run.lit"; then
+        # Multi-kernel: 2+ aiecc.py invocations in run.lit
+        local aiecc_count
+        aiecc_count=$(grep -c "aiecc\.py" "${src_dir}/run.lit" 2>/dev/null || echo "0")
+        if [[ "$aiecc_count" -ge 2 ]]; then
+            echo "MULTI"
+        elif grep -q "aie-generate-column-control-overlay\|aie-generate-ctrlpkt" "${src_dir}/run.lit"; then
             echo "CTRL"
         elif grep -q "aie-generate-elf" "${src_dir}/run.lit"; then
             echo "ELF"
@@ -503,6 +623,7 @@ main() {
                     CTRL) build_fn=build_ctrl_packet ;;
                     ELF) build_fn=build_elf ;;
                     PYMLIR) build_fn=build_pymlir ;;
+                    MULTI) build_fn=build_multi_kernel ;;
                 esac
 
                 if $build_fn "$name" "$test_dir" "$bld_dir" "$verbose"; then
