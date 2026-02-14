@@ -15,7 +15,8 @@
 //! | Vector MAC | 4+ cycles | Multiply-accumulate |
 
 use std::collections::HashMap;
-use crate::interpreter::bundle::Operation;
+use crate::interpreter::bundle::{Operation, SlotOp};
+use crate::tablegen::SemanticOp;
 
 /// Timing information for a single operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -404,6 +405,131 @@ impl LatencyTable {
     pub fn timing_for(&self, op: &Operation) -> OperationTiming {
         self.get(Self::key_from_operation(op))
     }
+
+    /// Convert from SemanticOp + vector flag to OperationKey.
+    ///
+    /// This is the preferred path for latency lookup -- it uses the TableGen-derived
+    /// semantic operation instead of the deprecated Operation enum. The `is_vector`
+    /// flag disambiguates between scalar and vector functional units (e.g.,
+    /// `SemanticOp::Add` + `is_vector=false` -> `ScalarAdd`, `is_vector=true` -> `VectorAdd`).
+    pub fn key_from_semantic(semantic: SemanticOp, is_vector: bool) -> OperationKey {
+        match semantic {
+            // Arithmetic
+            SemanticOp::Add if !is_vector => OperationKey::ScalarAdd,
+            SemanticOp::Add => OperationKey::VectorAdd,
+            SemanticOp::Sub if !is_vector => OperationKey::ScalarSub,
+            SemanticOp::Sub => OperationKey::VectorSub,
+            SemanticOp::Mul if !is_vector => OperationKey::ScalarMul,
+            SemanticOp::Mul => OperationKey::VectorMul,
+            SemanticOp::SDiv | SemanticOp::UDiv | SemanticOp::SRem | SemanticOp::URem
+                if !is_vector => OperationKey::ScalarDiv,
+            SemanticOp::SDiv | SemanticOp::UDiv | SemanticOp::SRem | SemanticOp::URem
+                => OperationKey::VectorMac, // Vector div uses MAC pipeline
+            SemanticOp::Abs | SemanticOp::Neg if !is_vector => OperationKey::ScalarAdd,
+            SemanticOp::Abs | SemanticOp::Neg => OperationKey::VectorAdd,
+
+            // Bitwise
+            SemanticOp::And if !is_vector => OperationKey::ScalarAnd,
+            SemanticOp::And => OperationKey::VectorAdd, // Vector bitwise uses ALU pipeline
+            SemanticOp::Or if !is_vector => OperationKey::ScalarOr,
+            SemanticOp::Or => OperationKey::VectorAdd,
+            SemanticOp::Xor if !is_vector => OperationKey::ScalarXor,
+            SemanticOp::Xor => OperationKey::VectorAdd,
+            SemanticOp::Not if !is_vector => OperationKey::ScalarXor, // NOT = XOR with -1
+            SemanticOp::Not => OperationKey::VectorAdd,
+
+            // Shifts
+            SemanticOp::Shl if !is_vector => OperationKey::ScalarShl,
+            SemanticOp::Shl => OperationKey::VectorAdd,
+            SemanticOp::Sra if !is_vector => OperationKey::ScalarSra,
+            SemanticOp::Sra => OperationKey::VectorAdd,
+            SemanticOp::Srl if !is_vector => OperationKey::ScalarShr,
+            SemanticOp::Srl => OperationKey::VectorAdd,
+            SemanticOp::Rotl | SemanticOp::Rotr if !is_vector => OperationKey::ScalarShl,
+            SemanticOp::Rotl | SemanticOp::Rotr => OperationKey::VectorShuffle,
+
+            // Comparisons
+            SemanticOp::SetEq | SemanticOp::SetNe
+            | SemanticOp::SetLt | SemanticOp::SetLe
+            | SemanticOp::SetGt | SemanticOp::SetGe
+            | SemanticOp::SetUlt | SemanticOp::SetUle
+            | SemanticOp::SetUgt | SemanticOp::SetUge
+                if !is_vector => OperationKey::ScalarCmp,
+            SemanticOp::SetEq | SemanticOp::SetNe
+            | SemanticOp::SetLt | SemanticOp::SetLe
+            | SemanticOp::SetGt | SemanticOp::SetGe
+            | SemanticOp::SetUlt | SemanticOp::SetUle
+            | SemanticOp::SetUgt | SemanticOp::SetUge
+                => OperationKey::VectorCmp,
+
+            // Bit manipulation (scalar only in practice)
+            SemanticOp::Ctlz | SemanticOp::Cttz | SemanticOp::Ctpop | SemanticOp::Bswap
+                => OperationKey::ScalarAdd, // Single-cycle scalar ALU
+
+            // Memory
+            SemanticOp::Load => OperationKey::Load,
+            SemanticOp::Store => OperationKey::Store,
+
+            // Control flow (never vector)
+            SemanticOp::Br | SemanticOp::BrCond => OperationKey::Branch,
+            SemanticOp::Call => OperationKey::Call,
+            SemanticOp::Ret => OperationKey::Return,
+            SemanticOp::Select if !is_vector => OperationKey::ScalarSel,
+            SemanticOp::Select => OperationKey::VectorAdd, // Vector select = ALU
+
+            // Type conversion
+            SemanticOp::SignExtend | SemanticOp::ZeroExtend | SemanticOp::Truncate
+                if !is_vector => OperationKey::ScalarAdd, // Single-cycle scalar
+            SemanticOp::SignExtend | SemanticOp::ZeroExtend | SemanticOp::Truncate
+                => OperationKey::VectorPack, // Vector type conversion = pack pipeline
+
+            // Move / NOP / Halt
+            SemanticOp::Copy if !is_vector => OperationKey::ScalarMov,
+            SemanticOp::Copy => OperationKey::VectorAdd,
+            SemanticOp::Nop => OperationKey::Nop,
+            SemanticOp::Done => OperationKey::Unknown, // Halt has no meaningful latency
+
+            // Synchronization
+            SemanticOp::LockAcquire => OperationKey::LockAcquire,
+            SemanticOp::LockRelease => OperationKey::LockRelease,
+
+            // Intrinsics -- default to vector MAC (conservative for high-latency ops)
+            SemanticOp::Intrinsic(_) if is_vector => OperationKey::VectorMac,
+            SemanticOp::Intrinsic(_) => OperationKey::ScalarMul,
+        }
+    }
+
+    /// Get timing for a SlotOp, preferring the semantic path when available.
+    ///
+    /// Falls back to the deprecated `Operation`-based lookup when no semantic
+    /// is set (e.g., for instructions not yet covered by the TableGen pattern matcher).
+    #[inline]
+    pub fn timing_for_slot_op(&self, op: &SlotOp) -> OperationTiming {
+        if let Some(semantic) = op.semantic {
+            self.get(Self::key_from_semantic(semantic, op.is_vector))
+        } else {
+            self.get(Self::key_from_operation(&op.op))
+        }
+    }
+
+    /// Create an AIE2 latency table validated against parsed ProcessorModel.
+    ///
+    /// Asserts that our hardcoded constants match the values extracted from
+    /// `AIE2Schedule.td`. This catches any drift between the emulator and
+    /// the compiler's scheduling model.
+    pub fn validated_aie2(model: &crate::tablegen::ProcessorModel) -> Self {
+        assert_eq!(
+            model.load_latency, LATENCY_MEMORY,
+            "ProcessorModel.load_latency ({}) != LATENCY_MEMORY ({})",
+            model.load_latency, LATENCY_MEMORY
+        );
+        assert_eq!(
+            model.mispredict_penalty, LATENCY_BRANCH_TAKEN + 1,
+            "ProcessorModel.mispredict_penalty ({}) != LATENCY_BRANCH_TAKEN+1 ({})",
+            model.mispredict_penalty, LATENCY_BRANCH_TAKEN + 1
+        );
+        Self::aie2()
+    }
 }
 
 impl Default for LatencyTable {
@@ -450,5 +576,173 @@ mod tests {
             LatencyTable::key_from_operation(&Operation::Nop),
             OperationKey::Nop
         );
+    }
+
+    // ── Semantic path tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_key_from_semantic_scalar_arithmetic() {
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Add, false), OperationKey::ScalarAdd);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Sub, false), OperationKey::ScalarSub);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Mul, false), OperationKey::ScalarMul);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::SDiv, false), OperationKey::ScalarDiv);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::UDiv, false), OperationKey::ScalarDiv);
+    }
+
+    #[test]
+    fn test_key_from_semantic_vector_arithmetic() {
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Add, true), OperationKey::VectorAdd);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Sub, true), OperationKey::VectorSub);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Mul, true), OperationKey::VectorMul);
+    }
+
+    #[test]
+    fn test_key_from_semantic_bitwise() {
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::And, false), OperationKey::ScalarAnd);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Or, false), OperationKey::ScalarOr);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Xor, false), OperationKey::ScalarXor);
+        // Vector bitwise uses ALU pipeline (same timing as vector add)
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::And, true), OperationKey::VectorAdd);
+    }
+
+    #[test]
+    fn test_key_from_semantic_shifts() {
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Shl, false), OperationKey::ScalarShl);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Sra, false), OperationKey::ScalarSra);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Srl, false), OperationKey::ScalarShr);
+    }
+
+    #[test]
+    fn test_key_from_semantic_comparison() {
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::SetEq, false), OperationKey::ScalarCmp);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::SetLt, false), OperationKey::ScalarCmp);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::SetEq, true), OperationKey::VectorCmp);
+    }
+
+    #[test]
+    fn test_key_from_semantic_memory() {
+        // Memory ops are the same regardless of is_vector
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Load, false), OperationKey::Load);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Load, true), OperationKey::Load);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Store, false), OperationKey::Store);
+    }
+
+    #[test]
+    fn test_key_from_semantic_control_flow() {
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Br, false), OperationKey::Branch);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::BrCond, false), OperationKey::Branch);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Call, false), OperationKey::Call);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Ret, false), OperationKey::Return);
+    }
+
+    #[test]
+    fn test_key_from_semantic_special() {
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Copy, false), OperationKey::ScalarMov);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Copy, true), OperationKey::VectorAdd);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Nop, false), OperationKey::Nop);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Select, false), OperationKey::ScalarSel);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::LockAcquire, false), OperationKey::LockAcquire);
+        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::LockRelease, false), OperationKey::LockRelease);
+    }
+
+    #[test]
+    fn test_timing_for_slot_op_prefers_semantic() {
+        use crate::interpreter::bundle::{SlotIndex, PostModify, MemWidth};
+
+        let table = LatencyTable::aie2();
+
+        // SlotOp with semantic set -> uses semantic path
+        let mut op = SlotOp::new(SlotIndex::Scalar0, Operation::ScalarAdd);
+        op.semantic = Some(SemanticOp::Mul); // Override: semantic says Mul
+        op.is_vector = false;
+
+        // Should get ScalarMul latency (2), not ScalarAdd latency (1)
+        let timing = table.timing_for_slot_op(&op);
+        assert_eq!(timing.latency, LATENCY_SCALAR_MUL);
+    }
+
+    #[test]
+    fn test_timing_for_slot_op_falls_back_to_operation() {
+        use crate::interpreter::bundle::SlotIndex;
+
+        let table = LatencyTable::aie2();
+
+        // SlotOp without semantic -> falls back to Operation
+        let mut op = SlotOp::new(SlotIndex::Scalar1, Operation::ScalarMul);
+        op.semantic = None;
+
+        let timing = table.timing_for_slot_op(&op);
+        assert_eq!(timing.latency, LATENCY_SCALAR_MUL);
+    }
+
+    #[test]
+    fn test_semantic_and_operation_paths_agree() {
+        // For the common operations where both paths are available, verify they
+        // produce the same latency. This catches divergence between the two maps.
+        let table = LatencyTable::aie2();
+
+        let agreement_cases: &[(SemanticOp, bool, Operation)] = &[
+            (SemanticOp::Add, false, Operation::ScalarAdd),
+            (SemanticOp::Sub, false, Operation::ScalarSub),
+            (SemanticOp::Mul, false, Operation::ScalarMul),
+            (SemanticOp::And, false, Operation::ScalarAnd),
+            (SemanticOp::Or, false, Operation::ScalarOr),
+            (SemanticOp::Xor, false, Operation::ScalarXor),
+            (SemanticOp::Shl, false, Operation::ScalarShl),
+            (SemanticOp::Sra, false, Operation::ScalarSra),
+            (SemanticOp::Copy, false, Operation::ScalarMov),
+            (SemanticOp::Nop, false, Operation::Nop),
+            (SemanticOp::Call, false, Operation::Call),
+            (SemanticOp::Ret, false, Operation::Return),
+            (SemanticOp::LockAcquire, false, Operation::LockAcquire),
+            (SemanticOp::LockRelease, false, Operation::LockRelease),
+        ];
+
+        for (semantic, is_vector, operation) in agreement_cases {
+            let semantic_key = LatencyTable::key_from_semantic(*semantic, *is_vector);
+            let operation_key = LatencyTable::key_from_operation(operation);
+            assert_eq!(
+                table.latency(semantic_key),
+                table.latency(operation_key),
+                "Latency mismatch for {:?} (is_vector={}) vs {:?}: semantic={}, operation={}",
+                semantic, is_vector, operation,
+                table.latency(semantic_key),
+                table.latency(operation_key),
+            );
+        }
+    }
+
+    #[test]
+    fn test_validated_aie2_matches_processor_model() {
+        use crate::tablegen::ProcessorModel;
+
+        let model = ProcessorModel {
+            load_latency: 5,
+            high_latency: 37,
+            mispredict_penalty: 4,
+            issue_width: 1000,
+            itinerary_name: "AIE2Itineraries".into(),
+        };
+
+        // Should not panic -- our constants match AIE2's ProcessorModel
+        let table = LatencyTable::validated_aie2(&model);
+        assert_eq!(table.latency(OperationKey::Load), 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "ProcessorModel.load_latency")]
+    fn test_validated_aie2_catches_load_latency_drift() {
+        use crate::tablegen::ProcessorModel;
+
+        let model = ProcessorModel {
+            load_latency: 7, // Wrong! AIE2 is 5
+            high_latency: 37,
+            mispredict_penalty: 4,
+            issue_width: 1000,
+            itinerary_name: "AIE2Itineraries".into(),
+        };
+
+        // Should panic because load_latency doesn't match
+        let _table = LatencyTable::validated_aie2(&model);
     }
 }

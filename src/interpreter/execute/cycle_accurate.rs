@@ -94,9 +94,11 @@ impl CycleAccurateExecutor {
     }
 
     /// Calculate the execution cycles for a slot operation.
+    ///
+    /// Prefers the TableGen-derived SemanticOp path when available,
+    /// falling back to the deprecated Operation enum for unmatched instructions.
     fn operation_cycles(&self, op: &SlotOp) -> u8 {
-        let key = LatencyTable::key_from_operation(&op.op);
-        self.latencies.latency(key)
+        self.latencies.timing_for_slot_op(op).latency
     }
 
     /// Check for register hazards and return stall cycles needed.
