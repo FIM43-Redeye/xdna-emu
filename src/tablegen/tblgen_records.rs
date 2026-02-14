@@ -81,6 +81,11 @@ pub struct InstrRecord {
     /// On AIE2 hardware encodings this is the most reliable structural indicator of
     /// control flow, since isBranch/isCall/isReturn are only set on Pseudo variants.
     pub has_delay_slot: bool,
+    /// isCodeGenOnly flag -- instruction exists only for the compiler's instruction
+    /// selection (codegen), not for the assembler/disassembler. These should be
+    /// excluded from decoder tables since they are aliases (e.g., MOV_OR is
+    /// `or $rd, $rs, $rs` with only one input operand).
+    pub is_code_gen_only: bool,
 }
 
 /// Parsed slot encoding from bits<N> field.
@@ -287,6 +292,7 @@ fn parse_single_record(lines: &[&str], i: &mut usize) -> Option<InstrRecord> {
         has_side_effects: false,
         has_complete_decoder: true, // Default to true; set false if field says 0
         has_delay_slot: false,
+        is_code_gen_only: false,
     };
 
     // Parse fields until closing brace
@@ -322,6 +328,8 @@ fn parse_single_record(lines: &[&str], i: &mut usize) -> Option<InstrRecord> {
             record.has_complete_decoder = line.contains("= 1");
         } else if line.starts_with("bit hasDelaySlot = ") {
             record.has_delay_slot = line.contains("= 1");
+        } else if line.starts_with("bit isCodeGenOnly = ") {
+            record.is_code_gen_only = line.contains("= 1");
         } else if let Some(enc) = parse_slot_encoding(line) {
             record.slot_encoding = Some(enc);
         }
@@ -488,7 +496,15 @@ fn parse_encoding_bits(content: &str) -> Vec<EncodingBit> {
 
 impl InstrRecord {
     /// Convert to InstrEncoding for the decoder.
+    ///
+    /// Returns None for isCodeGenOnly instructions, which exist only for the
+    /// compiler's instruction selection and must not participate in decoding.
+    /// Including them causes ambiguous matches (e.g., MOV_OR vs OR have identical
+    /// fixed bits but different operand counts, leading to lost source operands).
     pub fn to_encoding(&self) -> Option<InstrEncoding> {
+        if self.is_code_gen_only {
+            return None;
+        }
         let enc = self.slot_encoding.as_ref()?;
         let (fixed_mask, fixed_bits) = enc.compute_fixed_bits();
         let mut operand_fields = enc.extract_operand_fields();

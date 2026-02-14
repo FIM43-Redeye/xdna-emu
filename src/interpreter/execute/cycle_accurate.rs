@@ -395,6 +395,13 @@ impl CycleAccurateExecutor {
             SlotIndex::Control,
         ];
 
+        // AIE2 uses slot chaining, NOT pure VLIW read-before-write semantics.
+        // Within a bundle, earlier slots' results ARE forwarded to later slots.
+        // The compiler explicitly relies on this: it puts `lda r13, [p5]` and
+        // `add r13, r15, r13` in the same bundle, expecting the load result to
+        // be available to the ALU. Our execution order (Load→Store→Scalar→Vector)
+        // naturally provides this forwarding.
+
         for slot_idx in &execution_order {
             if let Some(ref op) = bundle.slots()[*slot_idx as usize] {
                 // Reborrow mem_tile_locks for each slot operation

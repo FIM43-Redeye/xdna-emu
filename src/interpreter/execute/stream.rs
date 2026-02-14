@@ -172,9 +172,9 @@ impl StreamOps {
     /// Read an operand value from the execution context.
     fn read_operand(operand: &Operand, ctx: &ExecutionContext) -> u32 {
         match operand {
-            Operand::ScalarReg(r) => ctx.scalar.read(*r),
-            Operand::PointerReg(r) => ctx.pointer.read(*r),
-            Operand::ModifierReg(r) => ctx.modifier.read(*r),
+            Operand::ScalarReg(r) => ctx.scalar_read(*r),
+            Operand::PointerReg(r) => ctx.pointer_read(*r),
+            Operand::ModifierReg(r) => ctx.modifier_read(*r),
             Operand::Immediate(v) => *v as u32,
             _ => 0, // Other operand types not valid for stream operations
         }

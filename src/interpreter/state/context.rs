@@ -361,10 +361,12 @@ pub struct ExecutionContext {
     pub timing: TimingContext,
 
     // === VLIW Bundle Support ===
-    /// Snapshot of scalar registers for VLIW parallel read semantics.
-    /// When set, scalar reads use this snapshot instead of live registers.
+    /// Snapshot of register files for VLIW parallel read semantics.
+    /// When set, reads use the snapshot instead of live registers.
     /// This ensures all reads in a bundle see pre-execution values.
     scalar_snapshot: Option<ScalarRegisterFile>,
+    pointer_snapshot: Option<PointerRegisterFile>,
+    modifier_snapshot: Option<ModifierRegisterFile>,
 
     // === Branch Delay Slot Support ===
     /// Pending branch waiting for delay slots to complete.
@@ -420,6 +422,8 @@ impl ExecutionContext {
             lr_reg: super::registers::LR_REG_INDEX, // Dedicated special register index
             timing,
             scalar_snapshot: None,
+            pointer_snapshot: None,
+            modifier_snapshot: None,
             pending_branch: None,
         }
     }
@@ -568,21 +572,25 @@ impl ExecutionContext {
 
     /// Begin a VLIW bundle execution.
     ///
-    /// Takes a snapshot of scalar registers so that all reads within the
-    /// bundle see the pre-execution values, implementing VLIW parallel
-    /// semantics where all operations execute "simultaneously".
+    /// Takes a snapshot of scalar, pointer, and modifier registers so that
+    /// all reads within the bundle see the pre-execution values, implementing
+    /// VLIW parallel semantics where all operations execute "simultaneously".
     #[inline]
     pub fn begin_bundle(&mut self) {
         self.scalar_snapshot = Some(self.scalar.clone());
+        self.pointer_snapshot = Some(self.pointer.clone());
+        self.modifier_snapshot = Some(self.modifier.clone());
     }
 
     /// End a VLIW bundle execution.
     ///
-    /// Clears the scalar snapshot. Writes that occurred during bundle
+    /// Clears register snapshots. Writes that occurred during bundle
     /// execution are already committed to the live registers.
     #[inline]
     pub fn end_bundle(&mut self) {
         self.scalar_snapshot = None;
+        self.pointer_snapshot = None;
+        self.modifier_snapshot = None;
     }
 
     /// Read a scalar register with VLIW semantics.
@@ -595,6 +603,26 @@ impl ExecutionContext {
             snapshot.read(reg)
         } else {
             self.scalar.read(reg)
+        }
+    }
+
+    /// Read a pointer register with VLIW semantics.
+    #[inline]
+    pub fn pointer_read(&self, reg: u8) -> u32 {
+        if let Some(snapshot) = &self.pointer_snapshot {
+            snapshot.read(reg)
+        } else {
+            self.pointer.read(reg)
+        }
+    }
+
+    /// Read a modifier register with VLIW semantics.
+    #[inline]
+    pub fn modifier_read(&self, reg: u8) -> u32 {
+        if let Some(snapshot) = &self.modifier_snapshot {
+            snapshot.read(reg)
+        } else {
+            self.modifier.read(reg)
         }
     }
 

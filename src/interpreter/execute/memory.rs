@@ -128,13 +128,13 @@ impl MemoryUnit {
         };
 
         // Get current pointer value
-        let ptr_value = ctx.pointer.read(ptr_reg);
+        let ptr_value = ctx.pointer_read(ptr_reg);
 
         // Get offset from source operand
         let offset = match op.sources.first() {
             Some(Operand::Immediate(imm)) => *imm as i32,
-            Some(Operand::ScalarReg(r)) => ctx.scalar.read(*r) as i32,
-            Some(Operand::ModifierReg(r)) => ctx.modifier.read(*r) as i32,
+            Some(Operand::ScalarReg(r)) => ctx.scalar_read(*r) as i32,
+            Some(Operand::ModifierReg(r)) => ctx.modifier_read(*r) as i32,
             _ => 0,
         };
 
@@ -156,8 +156,8 @@ impl MemoryUnit {
         // Get value from source operand
         let value = match op.sources.first() {
             Some(Operand::Immediate(imm)) => *imm as u32,
-            Some(Operand::ScalarReg(r)) => ctx.scalar.read(*r),
-            Some(Operand::PointerReg(r)) => ctx.pointer.read(*r),
+            Some(Operand::ScalarReg(r)) => ctx.scalar_read(*r),
+            Some(Operand::PointerReg(r)) => ctx.pointer_read(*r),
             _ => 0,
         };
 
@@ -389,9 +389,9 @@ impl MemoryUnit {
                 }
             }
             PostModify::Register(m) => {
-                // Use modifier register
+                // Use modifier register (VLIW-safe read)
                 if let Some(ptr_reg) = Self::get_pointer_reg(op) {
-                    let modifier = ctx.modifier.read_signed(*m);
+                    let modifier = ctx.modifier_read(*m) as i32;
                     ctx.pointer.add(ptr_reg, modifier);
                 }
             }
@@ -441,27 +441,30 @@ impl MemoryUnit {
 
     /// Get address from memory operand or pointer register.
     ///
-    /// For indexed addressing (ptr + offset), the offset is a word index
-    /// that gets scaled by the element size (4 bytes for Word width).
+    /// Three operand layouts are handled:
+    /// 1. `Memory { base, offset }` -- pre-scaled byte offset from AG decode
+    /// 2. `[PointerReg, ModifierReg]` -- indexed register (byte offset in modifier)
+    /// 3. `[PointerReg, Immediate/ScalarReg]` -- word-scaled offset
     fn get_address(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
         // First check for Memory operand (encapsulates ptr+offset, already scaled)
         if let Some(Operand::Memory { base, offset }) = op.sources.first() {
-            let base_addr = ctx.pointer.read(*base);
+            let base_addr = ctx.pointer_read(*base);
             return base_addr.wrapping_add(*offset as i32 as u32);
         }
 
         // Handle indexed addressing: sources[0]=ptr, sources[1]=offset
-        // Offset is a word index, scaled by 4 bytes
         let base_addr = op.sources.first().map_or(0, |src| match src {
-            Operand::PointerReg(r) => ctx.pointer.read(*r),
-            Operand::ScalarReg(r) => ctx.scalar.read(*r),
+            Operand::PointerReg(r) => ctx.pointer_read(*r),
+            Operand::ScalarReg(r) => ctx.scalar_read(*r),
             Operand::Immediate(v) => *v as u32,
             _ => 0,
         });
 
         let offset = op.sources.get(1).map_or(0, |src| match src {
             Operand::Immediate(v) => (*v as i32 * 4) as u32, // Scale by word size
-            Operand::ScalarReg(r) => ctx.scalar.read(*r).wrapping_mul(4),
+            Operand::ScalarReg(r) => ctx.scalar_read(*r).wrapping_mul(4),
+            // Modifier registers contain byte offsets (set via mov dj0/m0, rN)
+            Operand::ModifierReg(r) => ctx.modifier_read(*r),
             _ => 0,
         });
 
@@ -479,22 +482,22 @@ impl MemoryUnit {
         // First check for Memory operand anywhere (encapsulates ptr+offset)
         for src in &op.sources {
             if let Operand::Memory { base, offset } = src {
-                let base_addr = ctx.pointer.read(*base);
+                let base_addr = ctx.pointer_read(*base);
                 return base_addr.wrapping_add(*offset as i32 as u32);
             }
         }
 
         // Check if sources[0] is a pointer (test/legacy layout)
         if let Some(Operand::PointerReg(r)) = op.sources.first() {
-            return ctx.pointer.read(*r);
+            return ctx.pointer_read(*r);
         }
 
         // Kernel layout: sources[0]=value, sources[1]=pointer, sources[2]=post-modify
         // The store address is just the pointer value. sources[2] is the
         // post-modify amount (applied after the store), NOT a pre-offset.
         op.sources.get(1).map_or(0, |src| match src {
-            Operand::PointerReg(r) => ctx.pointer.read(*r),
-            Operand::ScalarReg(r) => ctx.scalar.read(*r),
+            Operand::PointerReg(r) => ctx.pointer_read(*r),
+            Operand::ScalarReg(r) => ctx.scalar_read(*r),
             Operand::Immediate(v) => *v as u32,
             _ => 0,
         })
@@ -710,7 +713,7 @@ impl MemoryUnit {
                     ctx.pointer.add(reg, *imm as i32);
                 }
                 PostModify::Register(m) => {
-                    let modifier = ctx.modifier.read_signed(*m);
+                    let modifier = ctx.modifier_read(*m) as i32;
                     ctx.pointer.add(reg, modifier);
                 }
             }

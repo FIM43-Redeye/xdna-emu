@@ -186,9 +186,9 @@ fn read_source(op: &SlotOp, ctx: &ExecutionContext, index: usize) -> u32 {
 /// Uses VLIW-safe reads where available (scalar_read for scalar regs).
 fn read_operand(operand: &Operand, ctx: &ExecutionContext) -> u32 {
     match operand {
-        Operand::ScalarReg(r) => ctx.scalar_read(*r), // VLIW-safe read
-        Operand::PointerReg(r) => ctx.pointer.read(*r),
-        Operand::ModifierReg(r) => ctx.modifier.read(*r),
+        Operand::ScalarReg(r) => ctx.scalar_read(*r),
+        Operand::PointerReg(r) => ctx.pointer_read(*r),
+        Operand::ModifierReg(r) => ctx.modifier_read(*r),
         Operand::Immediate(v) => *v as u32,
         Operand::VectorReg(_) | Operand::AccumReg(_) => {
             // Vector/accum need special handling - return 0 for scalar context
