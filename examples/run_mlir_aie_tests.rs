@@ -252,9 +252,15 @@ fn main() {
 
     println!("Discovering tests in {}...", npu_xrt_path.display());
 
+    let reference_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/npu-outputs");
+
     let mut suite = match XclbinSuite::discover(&npu_xrt_path) {
         Ok(s) => {
-            let s = s.with_max_cycles(1_000_000); // 1M cycle timeout
+            let mut s = s.with_max_cycles(1_000_000); // 1M cycle timeout
+            if reference_dir.exists() {
+                s = s.with_reference_dir(reference_dir.clone());
+            }
             if manifest_path.exists() {
                 println!("Loading manifests from {}...", manifest_path.display());
                 s.with_manifest_dir(manifest_path)
