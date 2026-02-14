@@ -60,11 +60,13 @@ pub use resolver::{
     build_decoder_tables, AddressingMode, CompositeEncoder, DecoderIndex, InstrEncoding,
     InstrMemWidth, OperandField, OperandType, RegisterKind, ResolveError, Resolver, SlotIndex,
     SlotIndexStats, classify_operand_type, detect_addressing_mode, detect_mem_width,
+    infer_branch_condition, infer_element_type, infer_select_variant,
 };
 pub use tblgen_records::{parse_tblgen_records, InstrRecord, SlotEncoding};
 pub use types::{
-    EncodingPart, FormatClass, ImplicitReg, InstrAttributes, InstrDef, OperandDef, SemanticOp,
-    SemanticPattern, SlotDef, TableGenData, TemplateParam,
+    BranchCondition, ElementType, EncodingPart, FormatClass, ImplicitReg, InstrAttributes,
+    InstrDef, OperandDef, SelectVariant, SemanticOp, SemanticPattern, SlotDef, TableGenData,
+    TemplateParam,
 };
 
 use std::collections::HashMap;

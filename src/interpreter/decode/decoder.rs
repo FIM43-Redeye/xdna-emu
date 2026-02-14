@@ -26,8 +26,8 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::interpreter::bundle::{
-    BranchCondition, ElementType, MemWidth, Operand, Operation, PostModify, SlotIndex, SlotOp,
-    VliwBundle,
+    BranchCondition, ElementType, MemWidth, Operand, Operation, PostModify, SelectVariant,
+    SlotIndex, SlotOp, VliwBundle,
 };
 use crate::interpreter::traits::{DecodeError, Decoder};
 use crate::tablegen::{
@@ -746,18 +746,21 @@ impl InstructionDecoder {
         }
     }
 
-    /// Convert a SemanticOp to an Operation.
+    /// Convert a SemanticOp to an Operation using pre-resolved metadata.
+    ///
+    /// All element type, branch condition, and select variant disambiguation is
+    /// resolved at TableGen load time on InstrEncoding. No mnemonic string parsing
+    /// happens here -- just field lookups.
     fn semantic_to_operation(&self, semantic: SemanticOp, decoded: &DecodedInstr) -> Operation {
-        let mnemonic = &decoded.encoding.mnemonic;
-        let is_vector = mnemonic.starts_with('v') || mnemonic.starts_with('V');
-        let element_type = self.infer_element_type(mnemonic);
+        let enc = &decoded.encoding;
+        let element_type = enc.element_type.unwrap_or(ElementType::Int32);
 
         match semantic {
-            SemanticOp::Add if is_vector => Operation::VectorAdd { element_type },
+            SemanticOp::Add if enc.is_vector => Operation::VectorAdd { element_type },
             SemanticOp::Add => Operation::ScalarAdd,
-            SemanticOp::Sub if is_vector => Operation::VectorSub { element_type },
+            SemanticOp::Sub if enc.is_vector => Operation::VectorSub { element_type },
             SemanticOp::Sub => Operation::ScalarSub,
-            SemanticOp::Mul if is_vector => Operation::VectorMul { element_type },
+            SemanticOp::Mul if enc.is_vector => Operation::VectorMul { element_type },
             SemanticOp::Mul => Operation::ScalarMul,
             SemanticOp::And => Operation::ScalarAnd,
             SemanticOp::Or => Operation::ScalarOr,
@@ -766,13 +769,16 @@ impl InstructionDecoder {
             SemanticOp::Sra => Operation::ScalarSra,
             SemanticOp::Srl => Operation::ScalarShr,
             SemanticOp::Load => {
-                let mn = decoded.encoding.mnemonic.to_lowercase();
+                // vlda/vldb/vst distinction: mem_width == Vector256 means vector,
+                // and the mnemonic prefix distinguishes A vs B channel. This is a
+                // cheap 4-char check that's cleaner than adding SemanticOp variants.
+                let mn = &enc.mnemonic;
                 if mn.starts_with("vlda") {
                     Operation::VectorLoadA { post_modify: PostModify::None }
                 } else if mn.starts_with("vldb") {
                     Operation::VectorLoadB { post_modify: PostModify::None }
                 } else {
-                    let width = match decoded.encoding.mem_width {
+                    let width = match enc.mem_width {
                         InstrMemWidth::Byte => MemWidth::Byte,
                         InstrMemWidth::HalfWord => MemWidth::HalfWord,
                         InstrMemWidth::Word => MemWidth::Word,
@@ -782,11 +788,11 @@ impl InstructionDecoder {
                 }
             },
             SemanticOp::Store => {
-                let mn = decoded.encoding.mnemonic.to_lowercase();
+                let mn = &enc.mnemonic;
                 if mn.starts_with("vst") {
                     Operation::VectorStore { post_modify: PostModify::None }
                 } else {
-                    let width = match decoded.encoding.mem_width {
+                    let width = match enc.mem_width {
                         InstrMemWidth::Byte => MemWidth::Byte,
                         InstrMemWidth::HalfWord => MemWidth::HalfWord,
                         InstrMemWidth::Word => MemWidth::Word,
@@ -799,25 +805,8 @@ impl InstructionDecoder {
                 condition: BranchCondition::Always,
             },
             SemanticOp::Call => Operation::Call,
-            SemanticOp::BrCond => {
-                // Distinguish register-based (jnz/jz) from flag-based (b*) branches
-                let mn = decoded.encoding.mnemonic.to_lowercase();
-                let condition = if mn == "jnz" || mn == "jnzd" {
-                    BranchCondition::NotZero
-                } else if mn == "jz" {
-                    BranchCondition::Zero
-                } else if mn.starts_with("beq") || mn == "bz" {
-                    BranchCondition::Equal
-                } else if mn.starts_with("bne") || mn == "bnz" {
-                    BranchCondition::NotEqual
-                } else if mn.starts_with("blt") {
-                    BranchCondition::Less
-                } else if mn.starts_with("bge") {
-                    BranchCondition::GreaterEqual
-                } else {
-                    BranchCondition::NotEqual // Fallback
-                };
-                Operation::Branch { condition }
+            SemanticOp::BrCond => Operation::Branch {
+                condition: enc.branch_condition.unwrap_or(BranchCondition::NotEqual),
             },
             SemanticOp::Nop => Operation::Nop,
             SemanticOp::Copy => Operation::ScalarMov,
@@ -833,17 +822,11 @@ impl InstructionDecoder {
             SemanticOp::SetUge => Operation::ScalarGeu,
             SemanticOp::SetEq => Operation::ScalarEq,
             SemanticOp::SetNe => Operation::ScalarNe,
-            SemanticOp::Select => {
-                // Distinguish sel.eqz/sel.nez (implicit r27 test) from generic sel
-                let mn = decoded.encoding.mnemonic.to_lowercase();
-                if mn.contains("eqz") {
-                    Operation::ScalarSelEqz
-                } else if mn.contains("nez") {
-                    Operation::ScalarSelNez
-                } else {
-                    Operation::ScalarSel
-                }
-            }
+            SemanticOp::Select => match enc.select_variant {
+                Some(SelectVariant::EqualZero) => Operation::ScalarSelEqz,
+                Some(SelectVariant::NotEqualZero) => Operation::ScalarSelNez,
+                _ => Operation::ScalarSel,
+            },
 
             // Lock operations
             SemanticOp::LockAcquire => Operation::LockAcquire,
@@ -858,37 +841,6 @@ impl InstructionDecoder {
 
             // Not handled yet - fall through
             _ => Operation::Unknown { opcode: 0 },
-        }
-    }
-
-    /// Infer element type from mnemonic suffix.
-    fn infer_element_type(&self, mnemonic: &str) -> ElementType {
-        if mnemonic.ends_with("8") || mnemonic.contains(".i8") || mnemonic.contains(".u8") {
-            if mnemonic.contains(".u") {
-                ElementType::UInt8
-            } else {
-                ElementType::Int8
-            }
-        } else if mnemonic.ends_with("16") || mnemonic.contains(".i16") || mnemonic.contains(".u16")
-        {
-            if mnemonic.contains(".u") {
-                ElementType::UInt16
-            } else {
-                ElementType::Int16
-            }
-        } else if mnemonic.ends_with("32") || mnemonic.contains(".i32") || mnemonic.contains(".u32")
-        {
-            if mnemonic.contains(".u") {
-                ElementType::UInt32
-            } else {
-                ElementType::Int32
-            }
-        } else if mnemonic.contains("bf16") {
-            ElementType::BFloat16
-        } else if mnemonic.contains("f32") || mnemonic.contains("float") {
-            ElementType::Float32
-        } else {
-            ElementType::Int32 // Default
         }
     }
 
@@ -1333,7 +1285,10 @@ impl Decoder for InstructionDecoder {
                     SlotType::Alu => SlotIndex::Scalar0,
                     SlotType::Mv => SlotIndex::Scalar1,
                     SlotType::St => SlotIndex::Store,
-                    SlotType::Vec | SlotType::Lng => SlotIndex::Vector,
+                    SlotType::Vec => SlotIndex::Vector,
+                    // LNG slot can contain either control flow (JL, J) or vector (movxm).
+                    // Determine the correct slot after decoding via operation.natural_slot().
+                    SlotType::Lng => SlotIndex::Vector,
                     SlotType::Nop => SlotIndex::Control,
                 };
 
@@ -1375,51 +1330,17 @@ impl Decoder for InstructionDecoder {
                         }
                     }
 
+                    // For LNG slot instructions, use the operation's natural slot since
+                    // LNG can contain either control (JL, J) or vector/scalar (movxm).
+                    let effective_slot = if slot.slot_type == SlotType::Lng {
+                        operation.natural_slot()
+                    } else {
+                        slot_index
+                    };
+
                     // Build SlotOp with TableGen info (reorders sources, adds semantic/implicit)
-                    let slot_op = self.build_slot_op(slot_index, operation, &decoded, dest, sources);
+                    let slot_op = self.build_slot_op(effective_slot, operation, &decoded, dest, sources);
                     bundle.set_slot(slot_op);
-                } else if slot.slot_type == SlotType::Lng {
-                    // FIXME: This is a workaround for LNG control instructions not being
-                    // properly integrated via TableGen. The JL and J instructions use the
-                    // LNG slot format which puts a 20-bit cpmaddr in the immediate field.
-                    // These should be handled by extending the TableGen parser to recognize
-                    // LNG format control flow instructions. See llvm-aie AIE2InstrFormats.td
-                    // for the proper encoding definitions.
-                    //
-                    // JL (jump and link): lng = {0b00000, cpmaddr[19:0], 0b0, 0b0000, 0b0000, 0b00000, 0b100}
-                    // J (jump): lng = {0b00000, cpmaddr[19:0], 0b0, 0b0000, 0b0000, 0b00000, 0b010}
-                    let opcode = (slot.bits & 0x7) as u8;
-
-                    match opcode {
-                        0b100 => {
-                            // JL - Jump and Link (saves return address to LR, jumps to cpmaddr)
-                            let cpmaddr = ((slot.bits >> 17) & 0xFFFFF) as u32;
-
-                            bundle.set_slot(
-                                SlotOp::new(SlotIndex::Control, Operation::Call)
-                                    .with_source(Operand::Immediate(cpmaddr as i32))
-                            );
-                        }
-                        0b010 => {
-                            // J - Unconditional Jump
-                            let cpmaddr = ((slot.bits >> 17) & 0xFFFFF) as u32;
-
-                            bundle.set_slot(
-                                SlotOp::new(
-                                    SlotIndex::Control,
-                                    Operation::Branch { condition: BranchCondition::Always }
-                                ).with_source(Operand::Immediate(cpmaddr as i32))
-                            );
-                        }
-                        _ => {
-                            // Other LNG opcodes - mark as unknown
-                            log::trace!("[LNG DECODE FAIL] bits=0x{:010X} opcode=0b{:03b} - not recognized",
-                                slot.bits, opcode);
-                            bundle.set_slot(
-                                SlotOp::new(SlotIndex::Control, Operation::Unknown { opcode: slot.bits as u32 })
-                            );
-                        }
-                    }
                 } else {
                     // Slot extracted but not recognized - mark as unknown with slot info
                     log::trace!("[{:?} DECODE FAIL] bits=0x{:010X} - no matching encoding",
@@ -1551,6 +1472,10 @@ mod tests {
             addressing_mode: AddressingMode::Unknown,
             mem_width: InstrMemWidth::Word,
             has_complete_decoder: true,
+            element_type: None,
+            branch_condition: None,
+            is_vector: false,
+            select_variant: None,
         }
     }
 
@@ -1634,6 +1559,10 @@ mod tests {
             addressing_mode: crate::tablegen::AddressingMode::Unknown,
             mem_width: crate::tablegen::InstrMemWidth::Word,
             has_complete_decoder: true,
+            element_type: None,
+            branch_condition: None,
+            is_vector: false,
+            select_variant: None,
         };
 
         let more_specific = make_add_encoding(); // 5 fixed bits

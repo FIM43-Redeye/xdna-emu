@@ -17,8 +17,13 @@
 
 use smallvec::SmallVec;
 
-// TableGen-derived semantic information
+// TableGen-derived semantic information and shared types
 use crate::tablegen::{ImplicitReg, SemanticOp};
+
+// Re-export types defined in tablegen::types so existing code using
+// crate::interpreter::bundle::{ElementType, BranchCondition, SelectVariant}
+// continues to compile without changes.
+pub use crate::tablegen::{BranchCondition, ElementType, SelectVariant};
 
 /// Slot index within a VLIW bundle.
 ///
@@ -72,43 +77,6 @@ impl SlotIndex {
     }
 }
 
-/// Element type for vector operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ElementType {
-    /// 8-bit signed integer.
-    Int8,
-    /// 8-bit unsigned integer.
-    UInt8,
-    /// 16-bit signed integer.
-    Int16,
-    /// 16-bit unsigned integer.
-    UInt16,
-    /// 32-bit signed integer.
-    Int32,
-    /// 32-bit unsigned integer.
-    UInt32,
-    /// 16-bit brain floating point.
-    BFloat16,
-    /// 32-bit floating point.
-    Float32,
-}
-
-impl ElementType {
-    /// Get the size of this element type in bits.
-    pub fn bits(self) -> u8 {
-        match self {
-            ElementType::Int8 | ElementType::UInt8 => 8,
-            ElementType::Int16 | ElementType::UInt16 | ElementType::BFloat16 => 16,
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => 32,
-        }
-    }
-
-    /// Get the number of elements that fit in a 256-bit vector.
-    pub fn lanes_256(self) -> u8 {
-        (256u16 / self.bits() as u16) as u8
-    }
-}
-
 /// Memory access width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemWidth {
@@ -150,44 +118,6 @@ pub enum PostModify {
     Immediate(i16),
     /// Add modifier register to base register after access.
     Register(u8),
-}
-
-/// Branch condition codes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BranchCondition {
-    /// Always branch (unconditional).
-    #[default]
-    Always,
-    /// Branch if equal (Z=1).
-    Equal,
-    /// Branch if not equal (Z=0).
-    NotEqual,
-    /// Branch if less than (signed: N!=V).
-    Less,
-    /// Branch if greater or equal (signed: N==V).
-    GreaterEqual,
-    /// Branch if less or equal (signed: Z=1 or N!=V).
-    LessEqual,
-    /// Branch if greater (signed: Z=0 and N==V).
-    Greater,
-    /// Branch if negative (N=1).
-    Negative,
-    /// Branch if positive or zero (N=0).
-    PositiveOrZero,
-    /// Branch if carry set (unsigned overflow).
-    CarrySet,
-    /// Branch if carry clear.
-    CarryClear,
-    /// Branch if overflow set.
-    OverflowSet,
-    /// Branch if overflow clear.
-    OverflowClear,
-    /// Branch if source register is zero (jz instruction).
-    /// Unlike Equal which checks flags, this checks a register value directly.
-    Zero,
-    /// Branch if source register is not zero (jnz instruction).
-    /// Unlike NotEqual which checks flags, this checks a register value directly.
-    NotZero,
 }
 
 /// Shuffle pattern for vector permute operations.

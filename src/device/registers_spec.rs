@@ -3,6 +3,15 @@
 //! All addresses and bit field layouts derived from AMD AM025 (AIE-ML Register Reference).
 //! This module centralizes register addresses to eliminate magic numbers throughout the codebase.
 //!
+//! **Note**: Bit field extraction constants (masks and shifts for BD words, channel
+//! registers, etc.) are now superseded by the data-driven register database in
+//! [`super::regdb`], which loads definitions from AMD's JSON register reference.
+//! The constants here are retained as a fallback for when the JSON file is unavailable.
+//! New code should use `regdb::device_reg_layout()` for field extraction.
+//!
+//! Structural constants (base addresses, strides, counts) are still used directly
+//! for address routing in `state.rs` and `registers.rs`.
+//!
 //! Reference: docs/xdna/am025-compact/
 
 // ============================================================================
@@ -127,6 +136,10 @@ pub mod memory_module {
     pub const DMA_STATUS_BASE: u32 = 0x1DF00;
 
     /// Channel register field layouts (AM025 memory_module/dma/s2mm.txt, mm2s.txt)
+    ///
+    /// Deprecated: use `regdb::device_reg_layout().memory_channel` for field extraction.
+    /// These constants are retained as a fallback.
+    #[allow(deprecated)]
     pub mod channel {
         // S2MM Control Register (DMA_S2MM_x_Ctrl @ 0x1DE00, 0x1DE08)
         // MM2S Control Register (DMA_MM2S_x_Ctrl @ 0x1DE10, 0x1DE18)
@@ -226,6 +239,10 @@ pub mod memory_module {
     pub const STREAM_SWITCH_SLAVE_END: u32 = 0x3F180;
 
     /// BD field layouts (AM025 memory_module/dma/bd.txt)
+    ///
+    /// Deprecated: use `regdb::device_reg_layout().memory_bd` for field extraction.
+    /// These constants are retained as a fallback.
+    #[allow(deprecated)]
     pub mod bd {
         // Word 0: Base_Address[27:14], Buffer_Length[13:0]
 
@@ -477,6 +494,10 @@ pub mod mem_tile_module {
 
     /// BD field layouts for MemTile (AM025 memory_tile_module/dma/bd.txt)
     /// Note: MemTile BDs have different field layouts than compute tile BDs
+    ///
+    /// Deprecated: use `regdb::device_reg_layout().memtile_bd` for field extraction.
+    /// These constants are retained as a fallback.
+    #[allow(deprecated)]
     pub mod bd {
         // Word 0: Buffer_Length[16:0] (17 bits for MemTile)
 

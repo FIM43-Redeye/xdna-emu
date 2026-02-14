@@ -28,7 +28,10 @@
 
 use std::collections::HashMap;
 
-use super::types::{EncodingPart, FormatClass, ImplicitReg, InstrDef, MixinClass, SemanticOp, SlotDef, TableGenData};
+use super::types::{
+    BranchCondition, ElementType, EncodingPart, FormatClass, ImplicitReg, InstrDef, MixinClass,
+    SelectVariant, SemanticOp, SlotDef, TableGenData,
+};
 
 /// Addressing mode extracted from the TableGen instruction name.
 ///
@@ -478,6 +481,23 @@ pub struct InstrEncoding {
     /// disambiguation. Complete-decoder instructions are preferred when
     /// multiple encodings match the same bit pattern.
     pub has_complete_decoder: bool,
+
+    // ── Pre-resolved metadata (populated once at TableGen load time) ──
+
+    /// Element type inferred from the mnemonic (e.g., "vadd_8" -> Int8).
+    /// None for instructions that don't have an element type suffix.
+    pub element_type: Option<ElementType>,
+
+    /// Branch condition inferred from the mnemonic (e.g., "jnz" -> NotZero).
+    /// Only set for BrCond instructions.
+    pub branch_condition: Option<BranchCondition>,
+
+    /// Whether this is a vector instruction (mnemonic starts with 'v').
+    pub is_vector: bool,
+
+    /// Select variant inferred from the mnemonic (e.g., "sel.eqz" -> EqualZero).
+    /// Only set for Select instructions.
+    pub select_variant: Option<SelectVariant>,
 }
 
 impl InstrEncoding {
@@ -678,6 +698,12 @@ impl<'a> Resolver<'a> {
         let input_order: Vec<String> = instr.inputs.iter().map(|o| o.name.clone()).collect();
         let output_order: Vec<String> = instr.outputs.iter().map(|o| o.name.clone()).collect();
 
+        // Pre-resolve metadata from mnemonic (once per encoding, not per decode)
+        let is_vector = instr.mnemonic.starts_with('v') || instr.mnemonic.starts_with('V');
+        let element_type = infer_element_type(&instr.mnemonic);
+        let branch_condition = infer_branch_condition(&instr.mnemonic, semantic);
+        let select_variant = infer_select_variant(&instr.mnemonic, semantic);
+
         Ok(InstrEncoding {
             name: instr.name.clone(),
             mnemonic: instr.mnemonic.clone(),
@@ -696,6 +722,10 @@ impl<'a> Resolver<'a> {
             mem_width: detect_mem_width(&instr.mnemonic),
             // Regex parser doesn't parse hasCompleteDecoder; assume true (safe default)
             has_complete_decoder: true,
+            element_type,
+            branch_condition,
+            is_vector,
+            select_variant,
         })
     }
 
@@ -888,8 +918,99 @@ impl<'a> Resolver<'a> {
 /// Build a decoder table from resolved encodings.
 ///
 /// Returns encodings grouped by slot, sorted by specificity (most specific first).
+/// Includes synthetic encodings for LNG control flow instructions (JL, J) that
+/// are not represented in TableGen.
 pub fn build_decoder_tables(data: &TableGenData) -> HashMap<String, Vec<InstrEncoding>> {
-    Resolver::new(data).resolve_by_slot()
+    let mut by_slot = Resolver::new(data).resolve_by_slot();
+    add_lng_control_flow_encodings(&mut by_slot);
+    by_slot
+}
+
+/// Add synthetic InstrEncoding entries for LNG slot control flow instructions.
+///
+/// JL (jump-and-link) and J (unconditional jump) use the LNG slot but aren't
+/// defined in the standard TableGen instruction definitions. Their bit layout
+/// (from AIE2InstrFormats.td comments):
+///
+/// ```text
+/// JL: lng = {00000, cpmaddr[19:0], 0, 0000, 0000, 00000, 100}
+/// J:  lng = {00000, cpmaddr[19:0], 0, 0000, 0000, 00000, 010}
+/// ```
+///
+/// 42-bit LNG slot layout (MSB to LSB):
+/// - bits[41:37] = 00000 (reserved)
+/// - bits[36:17] = cpmaddr[19:0]
+/// - bits[16:3]  = 0 (reserved fields)
+/// - bits[2:0]   = opcode (100 = JL, 010 = J)
+///
+/// For the opcode, movxm uses 001, so no collision with JL (100) or J (010).
+fn add_lng_control_flow_encodings(by_slot: &mut HashMap<String, Vec<InstrEncoding>>) {
+    let cpmaddr_field = OperandField {
+        name: "cpmaddr".into(),
+        bit_position: 17,
+        width: 20,
+        signed: false,
+        operand_type: OperandType::Immediate { signed: false, scale: 1 },
+        fragments: vec![],
+    };
+
+    // Common fixed bits: bits[41:37] = 0, bits[16:3] = 0
+    // These are the "reserved zero" fields. We mask them for specificity.
+    let reserved_mask: u64 =
+        (0x1Fu64 << 37) |   // bits 41:37
+        (0x3FFFu64 << 3);   // bits 16:3
+    let opcode_mask: u64 = 0x7; // bits 2:0
+
+    // JL: opcode = 0b100
+    let jl_encoding = InstrEncoding {
+        name: "JL_synthetic".into(),
+        mnemonic: "jl".into(),
+        slot: "lng".into(),
+        width: 42,
+        fixed_mask: reserved_mask | opcode_mask,
+        fixed_bits: 0b100, // Only the opcode is non-zero
+        operand_fields: vec![cpmaddr_field.clone()],
+        semantic: Some(SemanticOp::Call),
+        may_load: false,
+        may_store: false,
+        input_order: vec!["cpmaddr".into()],
+        output_order: vec![],
+        implicit_regs: vec![],
+        addressing_mode: AddressingMode::Unknown,
+        mem_width: InstrMemWidth::Word,
+        has_complete_decoder: true,
+        element_type: None,
+        branch_condition: None,
+        is_vector: false,
+        select_variant: None,
+    };
+
+    // J: opcode = 0b010
+    let j_encoding = InstrEncoding {
+        name: "J_synthetic".into(),
+        mnemonic: "j".into(),
+        slot: "lng".into(),
+        width: 42,
+        fixed_mask: reserved_mask | opcode_mask,
+        fixed_bits: 0b010, // Only the opcode is non-zero
+        operand_fields: vec![cpmaddr_field],
+        semantic: Some(SemanticOp::Br),
+        may_load: false,
+        may_store: false,
+        input_order: vec!["cpmaddr".into()],
+        output_order: vec![],
+        implicit_regs: vec![],
+        addressing_mode: AddressingMode::Unknown,
+        mem_width: InstrMemWidth::Word,
+        has_complete_decoder: true,
+        element_type: None,
+        branch_condition: Some(BranchCondition::Always),
+        is_vector: false,
+        select_variant: None,
+    };
+
+    by_slot.entry("lng".into()).or_default().push(jl_encoding);
+    by_slot.entry("lng".into()).or_default().push(j_encoding);
 }
 
 /// O(1) instruction lookup index for a single slot.
@@ -1308,6 +1429,80 @@ pub fn infer_semantic_from_mnemonic(mnemonic: &str) -> Option<SemanticOp> {
     }
 
     None
+}
+
+/// Infer element type from a mnemonic suffix.
+///
+/// Resolved once per encoding during TableGen loading (not per decoded instruction).
+/// Returns None for instructions without an element type suffix.
+pub fn infer_element_type(mnemonic: &str) -> Option<ElementType> {
+    if mnemonic.ends_with("8") || mnemonic.contains(".i8") || mnemonic.contains(".u8") {
+        if mnemonic.contains(".u") {
+            Some(ElementType::UInt8)
+        } else {
+            Some(ElementType::Int8)
+        }
+    } else if mnemonic.ends_with("16") || mnemonic.contains(".i16") || mnemonic.contains(".u16") {
+        if mnemonic.contains(".u") {
+            Some(ElementType::UInt16)
+        } else {
+            Some(ElementType::Int16)
+        }
+    } else if mnemonic.ends_with("32") || mnemonic.contains(".i32") || mnemonic.contains(".u32") {
+        if mnemonic.contains(".u") {
+            Some(ElementType::UInt32)
+        } else {
+            Some(ElementType::Int32)
+        }
+    } else if mnemonic.contains("bf16") {
+        Some(ElementType::BFloat16)
+    } else if mnemonic.contains("f32") || mnemonic.contains("float") {
+        Some(ElementType::Float32)
+    } else {
+        None
+    }
+}
+
+/// Infer branch condition from mnemonic and semantic operation.
+///
+/// Only meaningful for BrCond instructions. Returns None for other semantics.
+pub fn infer_branch_condition(mnemonic: &str, semantic: Option<SemanticOp>) -> Option<BranchCondition> {
+    if semantic != Some(SemanticOp::BrCond) {
+        return None;
+    }
+    let mn = mnemonic.to_lowercase();
+    Some(if mn == "jnz" || mn == "jnzd" {
+        BranchCondition::NotZero
+    } else if mn == "jz" {
+        BranchCondition::Zero
+    } else if mn.starts_with("beq") || mn == "bz" {
+        BranchCondition::Equal
+    } else if mn.starts_with("bne") || mn == "bnz" {
+        BranchCondition::NotEqual
+    } else if mn.starts_with("blt") {
+        BranchCondition::Less
+    } else if mn.starts_with("bge") {
+        BranchCondition::GreaterEqual
+    } else {
+        BranchCondition::NotEqual // Fallback
+    })
+}
+
+/// Infer select variant from mnemonic and semantic operation.
+///
+/// Only meaningful for Select instructions. Returns None for other semantics.
+pub fn infer_select_variant(mnemonic: &str, semantic: Option<SemanticOp>) -> Option<SelectVariant> {
+    if semantic != Some(SemanticOp::Select) {
+        return None;
+    }
+    let mn = mnemonic.to_lowercase();
+    Some(if mn.contains("eqz") {
+        SelectVariant::EqualZero
+    } else if mn.contains("nez") {
+        SelectVariant::NotEqualZero
+    } else {
+        SelectVariant::Generic
+    })
 }
 
 #[cfg(test)]

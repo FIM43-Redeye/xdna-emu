@@ -49,6 +49,7 @@
 
 pub mod aie2_spec;
 pub mod arch_config;
+pub mod regdb;
 pub mod registers;
 pub mod registers_spec;
 pub mod tile;

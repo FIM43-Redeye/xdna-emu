@@ -166,16 +166,17 @@ impl DeviceState {
         };
 
         // Dispatch based on register module
-        // Import register address constants
-        use super::registers_spec::{memory_module as mm, mem_tile_module as mt};
+        let reg_layout = super::regdb::device_reg_layout();
 
         match tile_addr.module() {
             RegisterModule::Locks => {
-                Self::write_lock_value(tile, tile_addr, mm::LOCK_BASE, mm::LOCK_STRIDE, value, false);
+                Self::write_lock_value(tile, tile_addr,
+                    reg_layout.memory_lock_base, reg_layout.memory_lock_stride, value, false);
             }
 
             RegisterModule::MemTileLocks => {
-                Self::write_lock_value(tile, tile_addr, mt::LOCK_BASE, mt::LOCK_STRIDE, value, true);
+                Self::write_lock_value(tile, tile_addr,
+                    reg_layout.memtile_lock_base, reg_layout.memtile_lock_stride, value, true);
             }
 
             RegisterModule::DmaBufferDescriptor => {
@@ -226,16 +227,17 @@ impl DeviceState {
 
         // For most registers, we can just apply the masked value directly
         // since we're initializing from zero state
-        // Import register address constants
-        use super::registers_spec::{memory_module as mm, mem_tile_module as mt};
+        let reg_layout = super::regdb::device_reg_layout();
 
         match tile_addr.module() {
             RegisterModule::Locks => {
-                Self::mask_write_lock_value(tile, tile_addr.offset, mm::LOCK_BASE, mm::LOCK_STRIDE, mask, value);
+                Self::mask_write_lock_value(tile, tile_addr.offset,
+                    reg_layout.memory_lock_base, reg_layout.memory_lock_stride, mask, value);
             }
 
             RegisterModule::MemTileLocks => {
-                Self::mask_write_lock_value(tile, tile_addr.offset, mt::LOCK_BASE, mt::LOCK_STRIDE, mask, value);
+                Self::mask_write_lock_value(tile, tile_addr.offset,
+                    reg_layout.memtile_lock_base, reg_layout.memtile_lock_stride, mask, value);
             }
 
             RegisterModule::DmaChannel => {
@@ -404,65 +406,64 @@ impl DeviceState {
         }
 
         // Also update the DmaEngine's BD config
-        // Parse all 6 BD words according to AM025 memory_module/dma/bd.txt
+        // Parse all 6 BD words using the data-driven register database layout
         let bd_config = self.array.get(col, row).map(|tile| {
             let tile_bd = &tile.dma_bds[bd_idx];
+            let lay = &super::regdb::device_reg_layout().memory_bd;
 
             // Get raw words (stored in legacy struct fields)
             let word0 = tile_bd.addr_low;
-            let word1 = tile_bd.addr_high;  // Actually compression/packet control
-            let word2 = tile_bd.length;     // Actually stepsizes
-            let word3 = tile_bd.control;    // Actually wrap counts
-            let word4 = tile_bd.d0;         // Actually iteration
+            let word1 = tile_bd.addr_high;  // Compression/packet control
+            let word2 = tile_bd.length;     // Stepsizes
+            let word3 = tile_bd.control;    // Wrap counts
+            let word4 = tile_bd.d0;         // Iteration
             let word5 = tile_bd.d1;         // Locks and chaining
 
-            // === Parse Word 0: Base_Address and Buffer_Length ===
-            let base_addr_words = ((word0 >> mm::bd::WORD0_BASE_ADDR_SHIFT) & mm::bd::WORD0_BASE_ADDR_MASK) as u64;
+            // === Word 0: Base_Address and Buffer_Length ===
+            let base_addr_words = lay.base_address.extract(word0) as u64;
             let base_addr = base_addr_words * 4; // Convert word address to byte address
-            let length_words = word0 & mm::bd::WORD0_BUFFER_LEN_MASK;
+            let length_words = lay.buffer_length.extract(word0);
             let length = length_words * 4; // Convert word count to byte count
 
-            // === Parse Word 1: Compression/Packet Control (MM2S only) ===
-            let enable_compression = (word1 >> mm::bd::WORD1_ENABLE_COMPRESSION_BIT) & 1 != 0;
-            let enable_packet = (word1 >> mm::bd::WORD1_ENABLE_PACKET_BIT) & 1 != 0;
-            let out_of_order_bd_id = ((word1 >> mm::bd::WORD1_OOO_BD_ID_SHIFT) & mm::bd::WORD1_OOO_BD_ID_MASK) as u8;
-            let packet_id = ((word1 >> mm::bd::WORD1_PACKET_ID_SHIFT) & mm::bd::WORD1_PACKET_ID_MASK) as u8;
-            let packet_type = ((word1 >> mm::bd::WORD1_PACKET_TYPE_SHIFT) & mm::bd::WORD1_PACKET_TYPE_MASK) as u8;
+            // === Word 1: Compression/Packet Control (MM2S only) ===
+            let enable_compression = lay.enable_compression.extract_bool(word1);
+            let enable_packet = lay.enable_packet.extract_bool(word1);
+            let out_of_order_bd_id = lay.out_of_order_bd_id.extract(word1) as u8;
+            let packet_id = lay.packet_id.extract(word1) as u8;
+            let packet_type = lay.packet_type.extract(word1) as u8;
 
-            // === Parse Word 2: Dimension Stepsizes ===
+            // === Word 2: Dimension Stepsizes ===
             // Stepsizes are stored as (actual - 1) in words
-            let d0_stepsize_raw = (word2 & mm::bd::WORD2_D0_STEPSIZE_MASK) as u16;
-            let d1_stepsize_raw = ((word2 >> mm::bd::WORD2_D1_STEPSIZE_SHIFT) & mm::bd::WORD2_D1_STEPSIZE_MASK) as u16;
+            let d0_stepsize_raw = lay.d0_stepsize.extract(word2) as u16;
+            let d1_stepsize_raw = lay.d1_stepsize.extract(word2) as u16;
             // Convert to actual stride in bytes: (raw + 1) * 4
             let d0_stride = ((d0_stepsize_raw as i32) + 1) * 4;
             let d1_stride = ((d1_stepsize_raw as i32) + 1) * 4;
 
-            // === Parse Word 3: Wrap Counts and D2 Stepsize ===
+            // === Word 3: Wrap Counts and D2 Stepsize ===
             // Wrap counts: 0 = no wrap (single iteration for that dimension)
-            let d0_wrap = (word3 >> mm::bd::WORD3_D0_WRAP_SHIFT) & mm::bd::WORD3_D0_WRAP_MASK;
-            let d1_wrap = (word3 >> mm::bd::WORD3_D1_WRAP_SHIFT) & mm::bd::WORD3_D1_WRAP_MASK;
-            let d2_stepsize_raw = (word3 & mm::bd::WORD3_D2_STEPSIZE_MASK) as u16;
+            let d0_wrap = lay.d0_wrap.extract(word3);
+            let d1_wrap = lay.d1_wrap.extract(word3);
+            let d2_stepsize_raw = lay.d2_stepsize.extract(word3) as u16;
             let d2_stride = ((d2_stepsize_raw as i32) + 1) * 4;
 
-            // === Parse Word 4: Iteration Control ===
-            let iteration_current = ((word4 >> mm::bd::WORD4_ITERATION_CURRENT_SHIFT) & mm::bd::WORD4_ITERATION_CURRENT_MASK) as u8;
-            let iteration_wrap = ((word4 >> mm::bd::WORD4_ITERATION_WRAP_SHIFT) & mm::bd::WORD4_ITERATION_WRAP_MASK) as u8;
-            let iteration_stepsize = (word4 & mm::bd::WORD4_ITERATION_STEPSIZE_MASK) as u16;
+            // === Word 4: Iteration Control ===
+            let iteration_current = lay.iteration_current.extract(word4) as u8;
+            let iteration_wrap = lay.iteration_wrap.extract(word4) as u8;
+            let iteration_stepsize = lay.iteration_stepsize.extract(word4) as u16;
 
-            // === Parse Word 5: Locks and Chaining ===
-            let tlast_suppress = (word5 >> mm::bd::WORD5_TLAST_SUPPRESS_BIT) & 1 != 0;
-            let valid = (word5 >> mm::bd::WORD5_VALID_BD_BIT) & 1 != 0;
-            let next_bd_id = ((word5 >> mm::bd::WORD5_NEXT_BD_SHIFT) & mm::bd::WORD5_NEXT_BD_MASK) as u8;
-            let use_next_bd = (word5 >> mm::bd::WORD5_USE_NEXT_BD_BIT) & 1 != 0;
+            // === Word 5: Locks and Chaining ===
+            let tlast_suppress = lay.tlast_suppress.extract_bool(word5);
+            let valid = lay.valid_bd.extract_bool(word5);
+            let next_bd_id = lay.next_bd.extract(word5) as u8;
+            let use_next_bd = lay.use_next_bd.extract_bool(word5);
             let next_bd = if use_next_bd { Some(next_bd_id) } else { None };
 
-            let lock_acq_id = (word5 & mm::bd::WORD5_LOCK_ACQ_ID_MASK) as u8;
-            let lock_acq_raw = (word5 >> mm::bd::WORD5_LOCK_ACQ_VALUE_SHIFT) & mm::bd::WORD5_LOCK_ACQ_VALUE_MASK;
-            let lock_acq_value = sign_extend_7bit(lock_acq_raw);
-            let lock_acq_enable = (word5 >> mm::bd::WORD5_LOCK_ACQ_ENABLE_BIT) & 1 != 0;
-            let lock_rel_id = ((word5 >> mm::bd::WORD5_LOCK_REL_ID_SHIFT) & mm::bd::WORD5_LOCK_REL_ID_MASK) as u8;
-            let lock_rel_raw = (word5 >> mm::bd::WORD5_LOCK_REL_VALUE_SHIFT) & mm::bd::WORD5_LOCK_REL_VALUE_MASK;
-            let lock_rel_value = sign_extend_7bit(lock_rel_raw);
+            let lock_acq_id = lay.lock_acq_id.extract(word5) as u8;
+            let lock_acq_value = sign_extend_7bit(lay.lock_acq_value.extract(word5));
+            let lock_acq_enable = lay.lock_acq_enable.extract_bool(word5);
+            let lock_rel_id = lay.lock_rel_id.extract(word5) as u8;
+            let lock_rel_value = sign_extend_7bit(lay.lock_rel_value.extract(word5));
 
             log::trace!("  BD {} words=[0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}]",
                 bd_idx, word0, word1, word2, word3, word4, word5);
@@ -479,8 +480,6 @@ impl DeviceState {
             // If d0_wrap is 0, this is a simple contiguous transfer
             let d0_size = if d0_wrap == 0 { length_words } else { d0_wrap };
             let d1_size = d1_wrap;
-            // d2_size would come from a higher dimension wrap, but AIE2 only has 3D
-            // For now, assume d2 is implicitly 1 if d2_stride is non-default
 
             BdConfig {
                 base_addr,
@@ -534,7 +533,8 @@ impl DeviceState {
     /// Write to a DMA channel register.
     fn write_dma_channel(&mut self, col: u8, row: u8, offset: u32, value: u32) {
         use super::registers_spec::memory_module as mm;
-        use super::registers_spec::memory_module::channel as ch;
+
+        let lay = &super::regdb::device_reg_layout().memory_channel;
 
         // Channel registers: base at DMA_CHANNEL_BASE, stride DMA_CHANNEL_STRIDE (AM025)
         // Layout: S2MM_0 (0x1DE00), S2MM_1 (0x1DE08), MM2S_0 (0x1DE10), MM2S_1 (0x1DE18)
@@ -550,32 +550,29 @@ impl DeviceState {
 
         // Parse enable_token_issue before updating tile state
         let enable_token_issue = if is_start_queue {
-            (value >> ch::START_QUEUE_ENABLE_TOKEN_ISSUE_BIT) & 1 != 0
+            lay.enable_token_issue.extract_bool(value)
         } else {
             false
         };
 
         // Parse compression/out-of-order bits before tile update
-        let compression_enable = (value >> ch::CTRL_COMPRESSION_ENABLE_BIT) & 1 != 0;
-        let out_of_order_enable = (value >> ch::CTRL_ENABLE_OUT_OF_ORDER_BIT) & 1 != 0;
+        let compression_enable = lay.decompression_enable.extract_bool(value);
+        let out_of_order_enable = lay.enable_out_of_order.extract_bool(value);
 
         // Update the tile's DMA channel state
         if let Some(tile) = self.array.get_mut(col, row) {
             let dma_ch = &mut tile.dma_channels[ch_idx];
             if is_start_queue {
                 dma_ch.start_queue = value;
-                dma_ch.current_bd = (value & ch::START_QUEUE_BD_ID_MASK) as u8;
+                dma_ch.current_bd = lay.start_bd_id.extract(value) as u8;
                 dma_ch.enable_token_issue = enable_token_issue;
             } else {
                 dma_ch.control = value;
                 dma_ch.running = value & 1 != 0;
-                // Parse controller_id from bits 15:8
-                dma_ch.controller_id = ((value >> ch::CTRL_CONTROLLER_ID_SHIFT)
-                    & ch::CTRL_CONTROLLER_ID_MASK) as u8;
-                // Parse FoT mode from bits 17:16 (S2MM only, but harmless to store for MM2S)
+                dma_ch.controller_id = lay.controller_id.extract(value) as u8;
+                // Parse FoT mode (S2MM only, but harmless to store for MM2S)
                 if is_s2mm {
-                    dma_ch.fot_mode = ((value >> ch::CTRL_FOT_MODE_SHIFT)
-                        & ch::CTRL_FOT_MODE_MASK) as u8;
+                    dma_ch.fot_mode = lay.fot_mode.extract(value) as u8;
                     // S2MM: decompression enable (bit 4), out-of-order enable (bit 3)
                     dma_ch.decompression_enable = compression_enable;
                     dma_ch.out_of_order_enable = out_of_order_enable;
@@ -606,16 +603,9 @@ impl DeviceState {
         }
 
         // Start the DmaEngine channel when START_QUEUE is written
-        // Note: value=0 means BD 0, not "don't start"
-        // We start the channel whenever the start queue register is written
-        // Task queue register format:
-        // - Bit 31: Enable_Token_Issue
-        // - Bits 23:16: Repeat_Count (run BD this many additional times)
-        // - Bits 3:0: BD_ID (buffer descriptor index)
         if is_start_queue {
-            let bd_idx = (value & ch::START_QUEUE_BD_ID_MASK) as u8;
-            let repeat_count = ((value >> ch::START_QUEUE_REPEAT_COUNT_SHIFT)
-                & ch::START_QUEUE_REPEAT_COUNT_MASK) as u8;
+            let bd_idx = lay.start_bd_id.extract(value) as u8;
+            let repeat_count = lay.repeat_count.extract(value) as u8;
 
             // Read controller_id and fot_mode from the tile's channel state
             // (which was set earlier when the control register was written)
@@ -1025,7 +1015,6 @@ impl DeviceState {
     /// Parse a MemTile BD from stored word values.
     fn parse_memtile_bd(&self, col: u8, row: u8, bd_idx: usize) -> Option<crate::device::dma::BdConfig> {
         use crate::device::dma::BdConfig;
-        use super::registers_spec::mem_tile_module::bd as mt_bd;
 
         if bd_idx >= NUM_DMA_BDS {
             return None;
@@ -1033,24 +1022,21 @@ impl DeviceState {
 
         let tile = self.array.get(col, row)?;
         let bd = &tile.dma_bds[bd_idx];
+        let lay = &super::regdb::device_reg_layout().memtile_bd;
 
-        // Word 0: Buffer_Length[16:0]
-        let buffer_length = bd.addr_low & mt_bd::WORD0_BUFFER_LEN_MASK; // 17 bits, in 32-bit words
+        // Word 0: Buffer_Length
+        let buffer_length = lay.buffer_length.extract(bd.addr_low);
 
-        // Word 1: Base_Address[18:0], Use_Next_BD[19], Next_BD[25:20]
-        let base_addr_words = bd.addr_high & mt_bd::WORD1_BASE_ADDR_MASK; // 19 bits, word address
-        let use_next_bd = (bd.addr_high >> mt_bd::WORD1_USE_NEXT_BD_BIT) & 1 != 0;
-        let next_bd_id = ((bd.addr_high >> mt_bd::WORD1_NEXT_BD_SHIFT) & mt_bd::WORD1_NEXT_BD_MASK) as u8;
+        // Word 1: Base_Address, Use_Next_BD, Next_BD
+        let base_addr_words = lay.base_address.extract(bd.addr_high);
+        let use_next_bd = lay.use_next_bd.extract_bool(bd.addr_high);
+        let next_bd_id = lay.next_bd.extract(bd.addr_high) as u8;
 
         // Word 2: D0_Stepsize[16:0], D0_Wrap[26:17]
-        let d0_stepsize = bd.length & mt_bd::WORD0_BUFFER_LEN_MASK; // Same 17-bit mask
+        let d0_stepsize = bd.length & 0x1FFFF; // 17-bit stepsize
         let d0_wrap = (bd.length >> 17) & 0x3FF;
 
-        // We don't have word 6,7 in legacy struct, check if bd is valid by looking at d1 field
-        // Word 7: Lock_Acq_ID[7:0], Lock_Acq_Value[14:8], Lock_Acq_Enable[15],
-        //         Lock_Rel_ID[23:16], Lock_Rel_Value[30:24], Valid_BD[31]
-        // Since we only have 6 words, we'll need to read this differently
-        // For now, assume valid if we have any address/length
+        // We don't have words 6-7 in legacy struct, so assume valid from data
         let valid = buffer_length > 0 || base_addr_words > 0;
 
         // Convert word address to byte address
@@ -1068,10 +1054,6 @@ impl DeviceState {
 
         // BD chaining
         config.next_bd = if use_next_bd { Some(next_bd_id) } else { None };
-
-        // We can't fully parse lock config without words 6-7, but let's check d1 field
-        // which might have been repurposed to store lock info during bulk writes
-        // For now, mark as needing extended BD storage
 
         Some(config)
     }
@@ -1122,40 +1104,41 @@ impl DeviceState {
     /// Configure MemTile BD from raw words.
     fn configure_memtile_bd_from_words(&mut self, col: u8, row: u8, bd_idx: usize, words: &[u32]) {
         use crate::device::dma::BdConfig;
-        use super::registers_spec::mem_tile_module::bd as mt_bd;
+        use super::registers_spec::sign_extend_7bit;
 
         if words.is_empty() {
             return;
         }
 
-        // Parse MemTile BD format (8 words)
-        // Word 0: Buffer_Length[16:0]
-        let buffer_length = words.first().copied().unwrap_or(0) & mt_bd::WORD0_BUFFER_LEN_MASK;
+        let lay = &super::regdb::device_reg_layout().memtile_bd;
 
-        // Word 1: Base_Address[18:0], Use_Next_BD[19], Next_BD[25:20]
+        // Parse MemTile BD format (8 words)
+        // Word 0: Buffer_Length
+        let word0 = words.first().copied().unwrap_or(0);
+        let buffer_length = lay.buffer_length.extract(word0);
+
+        // Word 1: Base_Address, Use_Next_BD, Next_BD
         let word1 = words.get(1).copied().unwrap_or(0);
-        let base_addr_words = word1 & mt_bd::WORD1_BASE_ADDR_MASK;
-        let use_next_bd = (word1 >> mt_bd::WORD1_USE_NEXT_BD_BIT) & 1 != 0;
-        let next_bd_id = ((word1 >> mt_bd::WORD1_NEXT_BD_SHIFT) & mt_bd::WORD1_NEXT_BD_MASK) as u8;
+        let base_addr_words = lay.base_address.extract(word1);
+        let use_next_bd = lay.use_next_bd.extract_bool(word1);
+        let next_bd_id = lay.next_bd.extract(word1) as u8;
 
         // Word 2: D0_Stepsize[16:0], D0_Wrap[26:17]
+        // (D0 fields are in word 2, not covered by MemTileBdFieldLayout yet)
         let word2 = words.get(2).copied().unwrap_or(0);
-        let d0_stepsize = word2 & mt_bd::WORD0_BUFFER_LEN_MASK; // Same 17-bit mask
+        let d0_stepsize = word2 & 0x1FFFF; // 17-bit stepsize
         let d0_wrap = (word2 >> 17) & 0x3FF;
 
         // Word 7: Lock config and Valid bit (if present)
         // Note: Lock IDs in MemTile BD encoding use 8 bits, but MemTile only has 64 locks.
         // Lock IDs 64+ appear to map back to 0+ (likely tile-relative), so we mask to 6 bits.
-        use super::registers_spec::sign_extend_7bit;
         let word7 = words.get(7).copied().unwrap_or(0);
-        let lock_acq_id = (word7 & 0x3F) as u8;  // Mask to 6 bits for 64 locks
-        let lock_acq_value_raw = (word7 >> mt_bd::WORD7_LOCK_ACQ_VALUE_SHIFT) & mt_bd::WORD7_LOCK_ACQ_VALUE_MASK;
-        let lock_acq_value = sign_extend_7bit(lock_acq_value_raw);
-        let lock_acq_enable = (word7 >> mt_bd::WORD7_LOCK_ACQ_ENABLE_BIT) & 1 != 0;
-        let lock_rel_id = ((word7 >> mt_bd::WORD7_LOCK_REL_ID_SHIFT) & 0x3F) as u8;  // Mask to 6 bits for 64 locks
-        let lock_rel_value_raw = (word7 >> mt_bd::WORD7_LOCK_REL_VALUE_SHIFT) & mt_bd::WORD7_LOCK_REL_VALUE_MASK;
-        let lock_rel_value = sign_extend_7bit(lock_rel_value_raw);
-        let valid = (word7 >> mt_bd::WORD7_VALID_BD_BIT) & 1 != 0;
+        let lock_acq_id = (lay.lock_acq_id.extract(word7) & 0x3F) as u8; // Mask to 6 bits
+        let lock_acq_value = sign_extend_7bit(lay.lock_acq_value.extract(word7));
+        let lock_acq_enable = lay.lock_acq_enable.extract_bool(word7);
+        let lock_rel_id = (lay.lock_rel_id.extract(word7) & 0x3F) as u8; // Mask to 6 bits
+        let lock_rel_value = sign_extend_7bit(lay.lock_rel_value.extract(word7));
+        let valid = lay.valid_bd.extract_bool(word7);
 
         // Convert to bytes
         let base_addr = (base_addr_words as u64) * 4;

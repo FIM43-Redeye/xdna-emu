@@ -29,8 +29,9 @@ smallvec = "1.13"                                       # Stack-allocated vector
 byteorder = "1.5"                                       # Byte order utilities for binary parsing
 dirs = "6"                                              # Platform-specific config directories
 
-# Serialization (for test manifests)
+# Serialization (for test manifests and register database)
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 
 # ELF parsing for core binaries

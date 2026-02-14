@@ -47,7 +47,7 @@ pub use encoding::{detect_format, is_nop_encoding, BundleFormat, SlotMask, NOP_E
 pub use slot_layout::{extract_slots, ExtractedBundle, ExtractedSlot, SlotType};
 pub use slot::{
     BranchCondition, ElementType, MemWidth, Operand, Operation, PostModify, Predicate,
-    ShufflePattern, SlotIndex, SlotOp,
+    SelectVariant, ShufflePattern, SlotIndex, SlotOp,
 };
 
 /// A decoded VLIW instruction bundle.

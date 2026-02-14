@@ -41,7 +41,7 @@
 
 use std::collections::HashMap;
 
-use super::resolver::{FieldFragment, InstrEncoding, OperandField, OperandType, classify_operand_type, detect_addressing_mode, detect_mem_width, infer_semantic_from_mnemonic};
+use super::resolver::{FieldFragment, InstrEncoding, OperandField, OperandType, classify_operand_type, detect_addressing_mode, detect_mem_width, infer_branch_condition, infer_element_type, infer_select_variant, infer_semantic_from_mnemonic};
 use super::types::ImplicitReg;
 
 /// A parsed instruction record from tblgen output.
@@ -551,6 +551,12 @@ impl InstrRecord {
             }))
             .collect();
 
+        // Pre-resolve metadata from mnemonic
+        let is_vector = self.mnemonic.starts_with('v') || self.mnemonic.starts_with('V');
+        let element_type = infer_element_type(&self.mnemonic);
+        let branch_condition = infer_branch_condition(&self.mnemonic, semantic);
+        let select_variant = infer_select_variant(&self.mnemonic, semantic);
+
         Some(InstrEncoding {
             name: self.name.clone(),
             mnemonic: self.mnemonic.clone(),
@@ -568,6 +574,10 @@ impl InstrRecord {
             addressing_mode: detect_addressing_mode(&self.name),
             mem_width: detect_mem_width(&self.mnemonic),
             has_complete_decoder: self.has_complete_decoder,
+            element_type,
+            branch_condition,
+            is_vector,
+            select_variant,
         })
     }
 }
