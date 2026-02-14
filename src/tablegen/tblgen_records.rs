@@ -612,6 +612,472 @@ impl InstrRecord {
     }
 }
 
+// ============================================================================
+// Phase 1: Extended Parsing for Scheduling, Register, and Format Data
+// ============================================================================
+
+use super::types::{
+    CompositeFormatDef, ItineraryInfo, PipelineStage, ProcessorModel,
+    RegisterClassDef, RegisterDef, RegisterModel,
+};
+
+/// Parse the AIE2SchedModel record from `--print-records` output.
+///
+/// Looks for a record whose parent chain includes "SchedMachineModel" and
+/// extracts the key scheduling parameters (LoadLatency, MispredictPenalty, etc.).
+pub fn parse_processor_model(content: &str) -> Option<ProcessorModel> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        if lines[i].starts_with("def ") && lines[i].contains("SchedMachineModel") {
+            // Found a SchedMachineModel record
+            i += 1;
+            let mut load_latency = 5u8;
+            let mut high_latency = 37u8;
+            let mut mispredict_penalty = 4u8;
+            let mut issue_width = 1000u16;
+            let mut itinerary_name = String::new();
+
+            while i < lines.len() {
+                let line = lines[i].trim();
+                if line == "}" || line.starts_with('}') {
+                    break;
+                }
+
+                if let Some(v) = parse_int_field(line, "LoadLatency") {
+                    load_latency = v as u8;
+                } else if let Some(v) = parse_int_field(line, "HighLatency") {
+                    high_latency = v as u8;
+                } else if let Some(v) = parse_int_field(line, "MispredictPenalty") {
+                    mispredict_penalty = v as u8;
+                } else if let Some(v) = parse_int_field(line, "IssueWidth") {
+                    issue_width = v as u16;
+                } else if line.starts_with("ProcessorItineraries Itineraries = ") {
+                    itinerary_name = line
+                        .strip_prefix("ProcessorItineraries Itineraries = ")
+                        .unwrap_or("")
+                        .trim_end_matches(';')
+                        .to_string();
+                }
+                i += 1;
+            }
+
+            return Some(ProcessorModel {
+                load_latency,
+                high_latency,
+                mispredict_penalty,
+                issue_width,
+                itinerary_name,
+            });
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse all InstrItinData records from `--print-records` output.
+///
+/// InstrItinData records are anonymous (e.g., `def anonymous_8663`) and
+/// reference InstrItinClass and InstrStage records. We resolve these
+/// references to build a complete picture of each itinerary class.
+///
+/// Returns a map from itinerary class name (e.g., "II_ADD") to its info.
+pub fn parse_itinerary_data(content: &str) -> HashMap<String, ItineraryInfo> {
+    let lines: Vec<&str> = content.lines().collect();
+
+    // First pass: collect InstrStage records (anonymous_XXXX -> stage data)
+    let mut stages_map: HashMap<String, PipelineStage> = HashMap::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].starts_with("def ") && lines[i].contains("InstrStage") {
+            if let Some((name, _)) = parse_def_line(lines[i]) {
+                let stage = parse_instr_stage_record(&lines, &mut i);
+                stages_map.insert(name, stage);
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    // Second pass: collect InstrItinData records
+    let mut result: HashMap<String, ItineraryInfo> = HashMap::new();
+    i = 0;
+    while i < lines.len() {
+        if lines[i].starts_with("def ") && lines[i].contains("InstrItinData") {
+            i += 1;
+            let mut class_name = String::new();
+            let mut stage_refs: Vec<String> = Vec::new();
+            let mut operand_cycles: Vec<u8> = Vec::new();
+            let mut bypasses: Vec<String> = Vec::new();
+
+            while i < lines.len() {
+                let line = lines[i].trim();
+                if line == "}" || line.starts_with('}') {
+                    break;
+                }
+
+                if line.starts_with("InstrItinClass TheClass = ") {
+                    class_name = line
+                        .strip_prefix("InstrItinClass TheClass = ")
+                        .unwrap_or("")
+                        .trim_end_matches(';')
+                        .to_string();
+                } else if line.starts_with("list<InstrStage> Stages = ") {
+                    stage_refs = parse_reference_list(line);
+                } else if line.starts_with("list<int> OperandCycles = ") {
+                    operand_cycles = parse_int_list(line);
+                } else if line.starts_with("list<Bypass> Bypasses = ") {
+                    bypasses = parse_reference_list(line);
+                }
+                i += 1;
+            }
+
+            if !class_name.is_empty() {
+                // Resolve stage references
+                let stages: Vec<PipelineStage> = stage_refs
+                    .iter()
+                    .filter_map(|name| stages_map.get(name).cloned())
+                    .collect();
+
+                // Compute total latency from stage cycles
+                let total_latency = stages.iter().map(|s| s.cycles).sum::<u8>();
+
+                result.insert(class_name.clone(), ItineraryInfo {
+                    class_name,
+                    total_latency,
+                    operand_cycles,
+                    stages,
+                    bypasses,
+                });
+            }
+        }
+        i += 1;
+    }
+
+    result
+}
+
+/// Parse a single InstrStage record body.
+fn parse_instr_stage_record(lines: &[&str], i: &mut usize) -> PipelineStage {
+    *i += 1;
+    let mut cycles = 0u8;
+    let mut units: Vec<String> = Vec::new();
+    let mut time_inc = 1i8;
+
+    while *i < lines.len() {
+        let line = lines[*i].trim();
+        if line == "}" || line.starts_with('}') {
+            *i += 1;
+            break;
+        }
+
+        if let Some(v) = parse_int_field(line, "Cycles") {
+            cycles = v as u8;
+        } else if line.starts_with("list<FuncUnit> Units = ") {
+            units = parse_reference_list(line);
+        } else if let Some(v) = parse_signed_int_field(line, "TimeInc") {
+            time_inc = v as i8;
+        }
+        *i += 1;
+    }
+
+    PipelineStage { cycles, units, time_inc }
+}
+
+/// Parse all register definitions (records with HWEncoding field).
+///
+/// Identifies registers by checking for the `bits<16> HWEncoding` field
+/// in any record within the "AIE2" namespace. Extracts the register name,
+/// HWEncoding value, and parent class chain.
+pub fn parse_register_defs(content: &str) -> Vec<RegisterDef> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut regs = Vec::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        // Look for register records (not register classes)
+        if lines[i].starts_with("def ") && lines[i].contains("Register") && !lines[i].contains("RegisterClass") {
+            if let Some((name, parents)) = parse_def_line(lines[i]) {
+                i += 1;
+                let mut namespace = String::new();
+                let mut hw_encoding: Option<u16> = None;
+
+                while i < lines.len() {
+                    let line = lines[i].trim();
+                    if line == "}" || line.starts_with('}') {
+                        break;
+                    }
+
+                    if let Some(ns) = parse_string_field(line, "Namespace") {
+                        namespace = ns;
+                    } else if line.starts_with("bits<16> HWEncoding = ") {
+                        hw_encoding = Some(parse_bits16(line));
+                    }
+                    i += 1;
+                }
+
+                // Only include AIE2 registers with HWEncoding
+                if namespace == "AIE2" && hw_encoding.is_some() {
+                    regs.push(RegisterDef {
+                        name,
+                        hw_encoding: hw_encoding.unwrap(),
+                        parents,
+                    });
+                }
+            }
+        }
+        i += 1;
+    }
+
+    regs
+}
+
+/// Parse `bits<16> HWEncoding = { bit15, bit14, ..., bit0 };`
+///
+/// The format uses MSB-first: `{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1 }`
+/// means bits 5,2,1,0 are set = 0b100111 = 39.
+fn parse_bits16(line: &str) -> u16 {
+    let open = match line.find('{') {
+        Some(p) => p + 1,
+        None => return 0,
+    };
+    let close = match line.rfind('}') {
+        Some(p) => p,
+        None => return 0,
+    };
+
+    let bits_str = &line[open..close];
+    let mut value: u16 = 0;
+
+    for (i, part) in bits_str.split(',').enumerate() {
+        let part = part.trim();
+        if part == "1" {
+            // MSB first: bit index 0 is bit 15, index 15 is bit 0
+            value |= 1 << (15 - i);
+        }
+    }
+
+    value
+}
+
+/// Parse all register class definitions.
+///
+/// Register classes are identified by "RegisterClass" in their parent chain
+/// and have a `MemberList = (add reg1, reg2, ...)` field.
+pub fn parse_register_classes(content: &str) -> Vec<RegisterClassDef> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut classes = Vec::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        if lines[i].starts_with("def ") && lines[i].contains("RegisterClass") {
+            if let Some((name, parents)) = parse_def_line(lines[i]) {
+                i += 1;
+                let mut namespace = String::new();
+                let mut members: Vec<String> = Vec::new();
+                let mut alignment = 0u16;
+
+                while i < lines.len() {
+                    let line = lines[i].trim();
+                    if line == "}" || line.starts_with('}') {
+                        break;
+                    }
+
+                    if let Some(ns) = parse_string_field(line, "Namespace") {
+                        namespace = ns;
+                    } else if line.starts_with("dag MemberList = ") {
+                        members = parse_dag_add_list(line);
+                    } else if let Some(v) = parse_int_field(line, "Alignment") {
+                        alignment = v as u16;
+                    }
+                    i += 1;
+                }
+
+                // Only include AIE2 register classes with members
+                if namespace == "AIE2" && !members.is_empty() {
+                    classes.push(RegisterClassDef {
+                        name,
+                        members,
+                        alignment,
+                        parents,
+                    });
+                }
+            }
+        }
+        i += 1;
+    }
+
+    classes
+}
+
+/// Parse `dag MemberList = (add reg1, reg2, ..., regN);` to extract member names.
+fn parse_dag_add_list(line: &str) -> Vec<String> {
+    let start = match line.find("(add ") {
+        Some(p) => p + 5,
+        None => return Vec::new(),
+    };
+    let end = match line.rfind(')') {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+
+    line[start..end]
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Build a complete RegisterModel from the parsed data.
+pub fn parse_register_model(content: &str) -> RegisterModel {
+    let reg_defs = parse_register_defs(content);
+    let class_defs = parse_register_classes(content);
+
+    let registers: HashMap<String, RegisterDef> = reg_defs
+        .into_iter()
+        .map(|r| (r.name.clone(), r))
+        .collect();
+
+    let classes: HashMap<String, RegisterClassDef> = class_defs
+        .into_iter()
+        .map(|c| (c.name.clone(), c))
+        .collect();
+
+    RegisterModel { registers, classes }
+}
+
+/// Parse composite format definitions (records with `isComposite = 1`).
+///
+/// These define the VLIW bundle layouts: which slots are present and their
+/// bit widths. Extracted from the `InOperandList` (slot fields) and `Size`.
+pub fn parse_composite_formats(content: &str) -> Vec<CompositeFormatDef> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut formats = Vec::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        if lines[i].starts_with("def ") && lines[i].contains("AIE2CompositeInst") {
+            if let Some((name, _)) = parse_def_line(lines[i]) {
+                i += 1;
+                let mut total_bytes = 0u8;
+                let mut is_composite = false;
+                let mut slots: Vec<(String, u16)> = Vec::new();
+
+                while i < lines.len() {
+                    let line = lines[i].trim();
+                    if line == "}" || line.starts_with('}') {
+                        break;
+                    }
+
+                    if let Some(v) = parse_int_field(line, "Size") {
+                        total_bytes = v as u8;
+                    } else if line == "bit isComposite = 1;" || line == "bit isComposite = 1" {
+                        is_composite = true;
+                    } else if line.starts_with("dag InOperandList = ") {
+                        // Parse slot operands: (ins ldb_slot:$ldb, lda_slot:$lda, ...)
+                        let operands = parse_dag_operands(line);
+                        for (slot_type, slot_name) in &operands {
+                            // Extract bit width from corresponding bits<N> field
+                            // The slot_name should match a field defined in the record
+                            let _ = slot_type; // We'll use the bits<N> field instead
+                            slots.push((slot_name.clone(), 0)); // Width filled below
+                        }
+                    } else if line.starts_with("bits<") && !line.contains("Inst =")
+                        && !line.contains("TSFlags") && !line.contains("HWEncoding")
+                        && !line.contains("dontcare")
+                    {
+                        // Parse slot field widths: bits<16> ldb = { ... };
+                        if let Some(gt_pos) = line.find('>') {
+                            let width: u16 = line[5..gt_pos].parse().unwrap_or(0);
+                            let after = line[gt_pos + 1..].trim();
+                            if let Some(eq_pos) = after.find(" = ") {
+                                let field_name = after[..eq_pos].trim();
+                                // Update slot width if this field was in InOperandList
+                                for slot in &mut slots {
+                                    if slot.0 == field_name {
+                                        slot.1 = width;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+
+                if is_composite && total_bytes > 0 {
+                    // Remove slots with zero width (intermediate fields like alu_mv)
+                    slots.retain(|s| s.1 > 0);
+
+                    formats.push(CompositeFormatDef {
+                        name,
+                        total_bytes,
+                        total_bits: total_bytes as u16 * 8,
+                        slots,
+                    });
+                }
+            }
+        }
+        i += 1;
+    }
+
+    formats
+}
+
+// ============================================================================
+// Field parsing helpers
+// ============================================================================
+
+/// Parse `int FieldName = VALUE;` to extract an integer value.
+fn parse_int_field(line: &str, field_name: &str) -> Option<i64> {
+    let prefix = format!("int {} = ", field_name);
+    if !line.starts_with(&prefix) {
+        return None;
+    }
+    let value_str = line[prefix.len()..].trim_end_matches(';').trim();
+    value_str.parse().ok()
+}
+
+/// Parse `int FieldName = VALUE;` that may be negative.
+fn parse_signed_int_field(line: &str, field_name: &str) -> Option<i64> {
+    parse_int_field(line, field_name)
+}
+
+/// Parse a reference list: `list<Type> Field = [ref1, ref2, ...];`
+fn parse_reference_list(line: &str) -> Vec<String> {
+    let start = match line.find('[') {
+        Some(p) => p + 1,
+        None => return Vec::new(),
+    };
+    let end = match line.find(']') {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+
+    line[start..end]
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Parse an integer list: `list<int> Field = [1, 2, 3];`
+fn parse_int_list(line: &str) -> Vec<u8> {
+    let start = match line.find('[') {
+        Some(p) => p + 1,
+        None => return Vec::new(),
+    };
+    let end = match line.find(']') {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+
+    line[start..end]
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

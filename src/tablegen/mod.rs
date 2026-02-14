@@ -64,9 +64,10 @@ pub use resolver::{
 };
 pub use tblgen_records::{parse_tblgen_records, InstrRecord, SlotEncoding};
 pub use types::{
-    BranchCondition, ElementType, EncodingPart, FormatClass, ImplicitReg, InstrAttributes,
-    InstrDef, OperandDef, SelectVariant, SemanticOp, SemanticPattern, SlotDef, TableGenData,
-    TemplateParam,
+    BranchCondition, CompositeFormatDef, ElementType, EncodingPart, FormatClass, ImplicitReg,
+    InstrAttributes, InstrDef, ItineraryInfo, OperandDef, PipelineStage, ProcessorModel,
+    RegisterClassDef, RegisterDef, RegisterModel, SelectVariant, SemanticOp, SemanticPattern,
+    SlotDef, TableGenData, TblgenOutput, TemplateParam,
 };
 
 use std::collections::HashMap;
@@ -206,7 +207,27 @@ pub fn find_aie_tblgen(llvm_aie_path: impl AsRef<Path>) -> Option<std::path::Pat
 /// Requires an AIE-enabled llvm-tblgen. The system llvm-tblgen typically
 /// doesn't have AIE support. Set LLVM_AIE_TBLGEN environment variable or
 /// ensure mlir-aie is installed as a sibling directory.
+/// Load instruction encodings using llvm-tblgen directly (legacy API).
+///
+/// Returns only instruction encodings grouped by slot. For the full model
+/// including scheduling, register, and format data, use [`load_full_via_tblgen`].
 pub fn load_via_tblgen(llvm_aie_path: impl AsRef<Path>) -> Result<HashMap<String, Vec<InstrEncoding>>, std::io::Error> {
+    let output = load_full_via_tblgen(llvm_aie_path)?;
+    Ok(output.encodings_by_slot)
+}
+
+/// Load the complete TableGen model using llvm-tblgen.
+///
+/// This runs `llvm-tblgen --print-records AIE2.td` and extracts:
+/// - Instruction encodings (grouped by slot)
+/// - Processor scheduling model (LoadLatency, MispredictPenalty, etc.)
+/// - Per-instruction itinerary data (latencies, pipeline stages)
+/// - Register model (definitions with HWEncodings, class memberships)
+/// - Composite VLIW bundle format definitions
+///
+/// This gives us fully resolved data with all inheritance and template
+/// substitution applied -- the ground truth for the AIE2 ISA.
+pub fn load_full_via_tblgen(llvm_aie_path: impl AsRef<Path>) -> Result<types::TblgenOutput, std::io::Error> {
     use std::process::Command;
 
     let llvm_aie = llvm_aie_path.as_ref();
@@ -240,13 +261,13 @@ pub fn load_via_tblgen(llvm_aie_path: impl AsRef<Path>) -> Result<HashMap<String
     }
 
     let content = String::from_utf8_lossy(&output.stdout);
-    let records = tblgen_records::parse_tblgen_records(&content);
 
+    // Parse instruction records (existing)
+    let records = tblgen_records::parse_tblgen_records(&content);
     log::info!("Parsed {} instruction records from llvm-tblgen", records.len());
 
     // Convert to encodings grouped by slot
     let mut by_slot: HashMap<String, Vec<InstrEncoding>> = HashMap::new();
-
     for record in records {
         if let Some(encoding) = record.to_encoding() {
             by_slot.entry(encoding.slot.clone())
@@ -255,17 +276,38 @@ pub fn load_via_tblgen(llvm_aie_path: impl AsRef<Path>) -> Result<HashMap<String
         }
     }
 
-    // Log slot counts
-    for (slot, encodings) in &by_slot {
-        log::debug!("Slot '{}': {} encodings", slot, encodings.len());
-    }
-
     // Sort by specificity (most specific first)
     for encodings in by_slot.values_mut() {
         encodings.sort_by(|a, b| b.specificity().cmp(&a.specificity()));
     }
 
-    Ok(by_slot)
+    // Log slot counts
+    for (slot, encodings) in &by_slot {
+        log::debug!("Slot '{}': {} encodings", slot, encodings.len());
+    }
+
+    // Parse extended data (Phase 1)
+    let processor_model = tblgen_records::parse_processor_model(&content);
+    let itineraries = tblgen_records::parse_itinerary_data(&content);
+    let register_model = tblgen_records::parse_register_model(&content);
+    let composite_formats = tblgen_records::parse_composite_formats(&content);
+
+    log::info!(
+        "Extended data: model={}, {} itineraries, {} registers, {} classes, {} formats",
+        processor_model.is_some(),
+        itineraries.len(),
+        register_model.registers.len(),
+        register_model.classes.len(),
+        composite_formats.len(),
+    );
+
+    Ok(types::TblgenOutput {
+        encodings_by_slot: by_slot,
+        processor_model,
+        itineraries,
+        register_model,
+        composite_formats,
+    })
 }
 
 #[cfg(test)]
@@ -768,6 +810,166 @@ mod tests {
                 name,
                 instr.implicit_regs
             );
+        }
+    }
+
+    // =========================================================================
+    // Phase 1 Tests: Extended TableGen Data Extraction
+    // =========================================================================
+
+    /// Verify that the processor scheduling model is parsed correctly.
+    #[test]
+    fn test_processor_model() {
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found");
+            return;
+        }
+
+        let output = load_full_via_tblgen(llvm_aie_path)
+            .expect("Failed to load via tblgen");
+
+        let model = output.processor_model
+            .expect("Should have parsed AIE2SchedModel");
+
+        // These values come directly from AIE2Schedule.td
+        assert_eq!(model.load_latency, 5, "AIE2 LoadLatency should be 5");
+        assert_eq!(model.mispredict_penalty, 4, "AIE2 MispredictPenalty should be 4");
+        assert_eq!(model.high_latency, 37, "AIE2 HighLatency should be 37");
+        assert_eq!(model.issue_width, 1000, "AIE2 IssueWidth should be 1000 (unlimited)");
+        assert_eq!(model.itinerary_name, "AIE2Itineraries");
+
+        eprintln!("ProcessorModel: {:?}", model);
+    }
+
+    /// Verify that itinerary data is parsed with correct latencies.
+    #[test]
+    fn test_itinerary_data() {
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found");
+            return;
+        }
+
+        let output = load_full_via_tblgen(llvm_aie_path)
+            .expect("Failed to load via tblgen");
+
+        let itin = &output.itineraries;
+        assert!(!itin.is_empty(), "Should have parsed itinerary classes");
+        eprintln!("Parsed {} itinerary classes", itin.len());
+
+        // Verify some known itinerary classes exist
+        assert!(itin.contains_key("II_ABS"), "Should have II_ABS");
+        assert!(itin.contains_key("II_ACQ"), "Should have II_ACQ");
+
+        // II_ABS should have 1-cycle latency (single stage on R_WX_PORT)
+        if let Some(abs) = itin.get("II_ABS") {
+            assert_eq!(abs.total_latency, 1, "II_ABS should have 1-cycle latency");
+            assert_eq!(abs.stages.len(), 1, "II_ABS should have 1 stage");
+            eprintln!("II_ABS: latency={}, stages={:?}, cycles={:?}",
+                abs.total_latency, abs.stages, abs.operand_cycles);
+        }
+
+        // Print a few itinerary classes for inspection
+        for (name, info) in itin.iter().take(10) {
+            eprintln!("  {}: latency={}, stages={}, operand_cycles={:?}",
+                name, info.total_latency, info.stages.len(), info.operand_cycles);
+        }
+    }
+
+    /// Verify register definitions are parsed with correct HWEncodings.
+    #[test]
+    fn test_register_model() {
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found");
+            return;
+        }
+
+        let output = load_full_via_tblgen(llvm_aie_path)
+            .expect("Failed to load via tblgen");
+        let model = &output.register_model;
+
+        eprintln!("Register model: {} registers, {} classes",
+            model.registers.len(), model.classes.len());
+
+        // Verify basic register counts
+        assert!(model.registers.len() > 50, "Should have many registers");
+        assert!(model.classes.len() > 5, "Should have several register classes");
+
+        // Verify known HWEncodings (from MEMORY.md)
+        // r0: HWEncoding = 0
+        if let Some(r0) = model.registers.get("r0") {
+            assert_eq!(r0.hw_encoding, 0, "r0 HWEncoding should be 0");
+        }
+
+        // lr: HWEncoding = (4 << 3) | 0b111 = 39
+        if let Some(lr) = model.registers.get("lr") {
+            assert_eq!(lr.hw_encoding, 39, "lr HWEncoding should be 39 = (4<<3)|0b111");
+            eprintln!("lr: hw_encoding={}, parents={:?}", lr.hw_encoding, lr.parents);
+        }
+
+        // LS: HWEncoding = (0 << 3) | 0b111 = 7
+        if let Some(ls) = model.registers.get("LS") {
+            assert_eq!(ls.hw_encoding, 7, "LS HWEncoding should be 7");
+        }
+
+        // p3: HWEncoding = 3
+        if let Some(p3) = model.registers.get("p3") {
+            assert_eq!(p3.hw_encoding, 3, "p3 HWEncoding should be 3");
+        }
+
+        // Verify register classes
+        if let Some(er) = model.classes.get("eR") {
+            assert_eq!(er.members.len(), 32, "eR should have 32 members (r0-r31)");
+            assert!(er.members.contains(&"r0".to_string()));
+            assert!(er.members.contains(&"r31".to_string()));
+            eprintln!("eR: {} members, alignment={}", er.members.len(), er.alignment);
+        }
+
+        if let Some(ep) = model.classes.get("eP") {
+            assert_eq!(ep.members.len(), 8, "eP should have 8 members (p0-p7)");
+            eprintln!("eP: {} members, alignment={}", ep.members.len(), ep.alignment);
+        }
+
+        // Print register class summary
+        for (name, cls) in &model.classes {
+            eprintln!("  class {}: {} members, alignment={}",
+                name, cls.members.len(), cls.alignment);
+        }
+    }
+
+    /// Verify composite format definitions are parsed.
+    #[test]
+    fn test_composite_formats() {
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found");
+            return;
+        }
+
+        let output = load_full_via_tblgen(llvm_aie_path)
+            .expect("Failed to load via tblgen");
+
+        let formats = &output.composite_formats;
+        assert!(!formats.is_empty(), "Should have parsed composite formats");
+        eprintln!("Parsed {} composite formats", formats.len());
+
+        // Should have formats for various sizes
+        let sizes: Vec<u8> = formats.iter().map(|f| f.total_bytes).collect();
+        eprintln!("Format sizes (bytes): {:?}", sizes);
+
+        // The 128-bit (16-byte) format should exist with all 6 slots
+        if let Some(full) = formats.iter().find(|f| f.total_bytes == 16) {
+            eprintln!("128-bit format: {}, slots={:?}", full.name, full.slots);
+            // Should have ldb(16), lda(21), st(21), alu(20), mv(22), vec(26)
+            assert!(full.slots.len() >= 4,
+                "128-bit format should have at least 4 slots, got {}", full.slots.len());
+        }
+
+        for fmt in formats {
+            eprintln!("  {} ({}B = {}b): {:?}",
+                fmt.name, fmt.total_bytes, fmt.total_bits, fmt.slots);
         }
     }
 }

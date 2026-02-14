@@ -556,6 +556,152 @@ pub struct InstrDef {
     pub attributes: InstrAttributes,
 }
 
+// ============================================================================
+// Scheduling Model (from AIE2Schedule.td)
+// ============================================================================
+
+/// Processor-level scheduling parameters from AIE2SchedModel.
+///
+/// These are the top-level latency parameters that the compiler's scheduler
+/// uses. Values are extracted from the `SchedMachineModel` record in
+/// `AIE2Schedule.td`.
+///
+/// # Example (AIE2)
+/// ```text
+/// LoadLatency = 5       -- Memory load pipeline depth
+/// HighLatency = 37      -- Matrix multiply / high-latency ops
+/// MispredictPenalty = 4  -- Branch misprediction cost
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessorModel {
+    /// Cycles for a memory load result to be available (default 5 for AIE2).
+    pub load_latency: u8,
+    /// Cycles for the longest "high latency" operations (e.g., matmul).
+    pub high_latency: u8,
+    /// Branch misprediction penalty in cycles.
+    pub mispredict_penalty: u8,
+    /// Instruction issue width (1000 = "unlimited" in LLVM conventions).
+    pub issue_width: u16,
+    /// Name of the itinerary model (e.g., "AIE2Itineraries").
+    pub itinerary_name: String,
+}
+
+/// Per-instruction scheduling info from InstrItinData records.
+///
+/// Each instruction class (e.g., II_ADD, II_LDA, II_VMUL) has an itinerary
+/// that describes its pipeline occupancy, operand latencies, and functional
+/// unit requirements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItineraryInfo {
+    /// Itinerary class name (e.g., "II_ADD", "II_LDA", "II_VMUL").
+    pub class_name: String,
+    /// Total pipeline latency: sum of stage cycles (result latency).
+    pub total_latency: u8,
+    /// Per-operand result latencies (index 0 = first result, etc.).
+    pub operand_cycles: Vec<u8>,
+    /// Pipeline stages with functional unit assignments.
+    pub stages: Vec<PipelineStage>,
+    /// Bypass classes (forwarding paths), parallel to operand_cycles.
+    pub bypasses: Vec<String>,
+}
+
+/// A single pipeline stage from an InstrStage record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipelineStage {
+    /// Number of cycles this stage occupies.
+    pub cycles: u8,
+    /// Functional units that can execute this stage.
+    pub units: Vec<String>,
+    /// Time increment to next stage (-1 = blocking until done).
+    pub time_inc: i8,
+}
+
+// ============================================================================
+// Register Model (from AIE2GenRegisterInfo.td)
+// ============================================================================
+
+/// A single register definition with its hardware encoding.
+///
+/// Extracted from register records in `--print-records` output. Each register
+/// has a unique HWEncoding used by the assembler/disassembler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterDef {
+    /// Register name as used in assembly (e.g., "r0", "p3", "lr", "m5").
+    pub name: String,
+    /// Hardware encoding value (from `bits<16> HWEncoding`).
+    pub hw_encoding: u16,
+    /// Parent classes from the def line (e.g., ["AIE2GPReg", "DwarfRegNum"]).
+    pub parents: Vec<String>,
+}
+
+/// A register class with its member list.
+///
+/// Register classes group registers that are interchangeable for a given
+/// operand type. They are used to classify composite register encodings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterClassDef {
+    /// Class name (e.g., "eR", "eP", "eM", "eSPL").
+    pub name: String,
+    /// Ordered list of member register names (e.g., ["r0", "r1", ..., "r31"]).
+    pub members: Vec<String>,
+    /// Register alignment in bits (e.g., 32, 256).
+    pub alignment: u16,
+    /// Parent classes from the def line.
+    pub parents: Vec<String>,
+}
+
+/// Complete register model extracted from TableGen.
+#[derive(Debug, Clone, Default)]
+pub struct RegisterModel {
+    /// All individual register definitions, indexed by name.
+    pub registers: HashMap<String, RegisterDef>,
+    /// All register classes, indexed by class name.
+    pub classes: HashMap<String, RegisterClassDef>,
+}
+
+// ============================================================================
+// Composite Bundle Formats (from AIE2CompositeFormats.td)
+// ============================================================================
+
+/// A composite instruction format (VLIW bundle layout).
+///
+/// Extracted from records with `isComposite = 1` in the `--print-records`
+/// output. Each format defines the total bundle size and which VLIW slots
+/// are present at what bit positions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeFormatDef {
+    /// Record name (e.g., "I128_LDB_LDA_ST_ALU_MV_VEC").
+    pub name: String,
+    /// Total size in bytes (e.g., 16 for 128-bit).
+    pub total_bytes: u8,
+    /// Total size in bits.
+    pub total_bits: u16,
+    /// Slot fields present: (slot_name, bit_width).
+    /// Example: [("ldb", 16), ("lda", 21), ("st", 21), ("alu", 20), ("mv", 22), ("vec", 26)]
+    pub slots: Vec<(String, u16)>,
+}
+
+// ============================================================================
+// Combined tblgen output
+// ============================================================================
+
+/// Complete output from parsing `llvm-tblgen --print-records`.
+///
+/// This bundles instruction encodings with scheduling, register, and format
+/// metadata -- everything needed to build a fully data-driven emulator.
+pub struct TblgenOutput {
+    /// Instruction encodings grouped by slot name.
+    pub encodings_by_slot: HashMap<String, Vec<super::resolver::InstrEncoding>>,
+    /// Processor scheduling model (LoadLatency, MispredictPenalty, etc.).
+    pub processor_model: Option<ProcessorModel>,
+    /// Per-itinerary-class scheduling info, keyed by class name (e.g., "II_ADD").
+    pub itineraries: HashMap<String, ItineraryInfo>,
+    /// Register definitions and classes.
+    pub register_model: RegisterModel,
+    /// Composite VLIW bundle formats.
+    pub composite_formats: Vec<CompositeFormatDef>,
+}
+
 /// Collection of all parsed TableGen definitions.
 #[derive(Debug, Default)]
 pub struct TableGenData {
