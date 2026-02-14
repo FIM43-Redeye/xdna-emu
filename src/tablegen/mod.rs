@@ -523,50 +523,6 @@ mod tests {
             eprintln!("NOPV not found in resolved encodings!");
         }
 
-        // Check SBC specifically - debug why it's not being resolved
-        if let Some(sbc) = data.instructions.get("SBC") {
-            eprintln!("SBC instruction: format={}, template_args={:?}", sbc.format, sbc.template_args);
-            if let Some(fmt) = data.formats.get(&sbc.format) {
-                eprintln!("  Format found: template_params={:?}", fmt.template_params);
-            } else {
-                eprintln!("  Format NOT FOUND: {}", sbc.format);
-                // List similar format names
-                let similar: Vec<_> = data.formats.keys()
-                    .filter(|k| k.contains("alu"))
-                    .take(10)
-                    .collect();
-                eprintln!("  Similar formats: {:?}", similar);
-            }
-        } else {
-            eprintln!("SBC instruction NOT FOUND in parsed instructions!");
-        }
-
-        // Check for MOVXM_lng_cg instruction
-        if let Some(movxm) = data.instructions.get("MOVXM_lng_cg") {
-            eprintln!("MOVXM_lng_cg instruction found: format={}, mnemonic={}",
-                     movxm.format, movxm.mnemonic);
-            if let Some(enc) = encodings.iter().find(|e| e.name == "MOVXM_lng_cg") {
-                eprintln!("  RESOLVED: slot={}, mask=0x{:X}, bits=0x{:X}",
-                         enc.slot, enc.fixed_mask, enc.fixed_bits);
-                eprintln!("  fields: {:?}",
-                         enc.operand_fields.iter().map(|f| (&f.name, f.bit_position, f.width)).collect::<Vec<_>>());
-            } else {
-                eprintln!("  MOVXM_lng_cg NOT in resolved encodings - resolution must have failed");
-                // Try to resolve it directly to see the error
-                if let Err(e) = resolver.resolve_instruction(movxm) {
-                    eprintln!("  Resolution error: {:?}", e);
-                }
-            }
-        } else {
-            eprintln!("MOVXM_lng_cg NOT FOUND in parsed instructions!");
-            // List all instruction names containing 'mov'
-            let mov_instrs: Vec<_> = data.instructions.keys()
-                .filter(|k| k.to_lowercase().contains("mov"))
-                .take(20)
-                .collect();
-            eprintln!("  MOV-related instructions: {:?}", mov_instrs);
-        }
-
         // We should have resolved at least some instructions
         assert!(success_count > 0, "Should resolve some instructions");
     }
@@ -642,6 +598,90 @@ mod tests {
                 acq_names
             );
         }
+    }
+
+    /// Verify that structural semantic inference works for real instructions
+    /// loaded from llvm-aie via tblgen.
+    ///
+    /// The tblgen path extracts hasDelaySlot, Defs/Uses, mayLoad/mayStore, and
+    /// parent class chain. These structural signals should produce correct
+    /// SemanticOps for control flow and memory instructions WITHOUT relying
+    /// on mnemonic string parsing.
+    #[test]
+    fn test_structural_semantic_inference() {
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found at ../llvm-aie");
+            return;
+        }
+
+        let encodings_by_slot = load_via_tblgen(llvm_aie_path).expect("Failed to load via tblgen");
+        let all: Vec<_> = encodings_by_slot.values().flatten().collect();
+
+        // JL: Call semantic from Defs=[lr] + hasDelaySlot
+        if let Some(jl) = all.iter().find(|e| e.name == "JL") {
+            assert_eq!(jl.semantic, Some(SemanticOp::Call),
+                "JL should be Call (Defs=[lr] + hasDelaySlot)");
+        }
+
+        // RET: Return semantic from Uses=[lr] + hasDelaySlot
+        if let Some(ret) = all.iter().find(|e| e.name == "RET") {
+            assert_eq!(ret.semantic, Some(SemanticOp::Ret),
+                "RET should be Ret (Uses=[lr] + hasDelaySlot)");
+        }
+
+        // DONE: Done semantic from parent class chain
+        if let Some(done) = all.iter().find(|e| e.name == "DONE") {
+            assert_eq!(done.semantic, Some(SemanticOp::Done),
+                "DONE should be Done (parent chain contains _done_)");
+        }
+
+        // Load instructions: mayLoad=true
+        let load_names = ["VLDA_128", "LDA_DM_S8_ag_idx_imm"];
+        for name in &load_names {
+            if let Some(enc) = all.iter().find(|e| e.name == *name) {
+                assert_eq!(enc.semantic, Some(SemanticOp::Load),
+                    "{} should be Load (mayLoad=true)", name);
+                assert!(enc.may_load, "{} should have may_load flag", name);
+            }
+        }
+
+        // Store instructions: mayStore=true
+        if let Some(st) = all.iter().find(|e| e.name.starts_with("ST_S") || e.name.starts_with("VST")) {
+            assert_eq!(st.semantic, Some(SemanticOp::Store),
+                "{} should be Store (mayStore=true)", st.name);
+            assert!(st.may_store, "{} should have may_store flag", st.name);
+        }
+
+        // Arithmetic: still needs mnemonic fallback (no structural signal)
+        if let Some(add) = all.iter().find(|e| e.name == "ADD") {
+            assert_eq!(add.semantic, Some(SemanticOp::Add),
+                "ADD should be Add (from mnemonic fallback)");
+            assert!(!add.may_load && !add.may_store,
+                "ADD should not have memory flags");
+        }
+
+        // Count how many instructions use structural vs mnemonic inference
+        let mut structural_count = 0;
+        let mut total_with_semantic = 0;
+        for enc in &all {
+            if enc.semantic.is_some() {
+                total_with_semantic += 1;
+                // Check if structure alone would have produced this semantic
+                match enc.semantic {
+                    Some(SemanticOp::Load) if enc.may_load => structural_count += 1,
+                    Some(SemanticOp::Store) if enc.may_store => structural_count += 1,
+                    Some(SemanticOp::Call) | Some(SemanticOp::Ret) | Some(SemanticOp::Done) =>
+                        structural_count += 1,
+                    _ => {}
+                }
+            }
+        }
+        eprintln!(
+            "Structural inference: {}/{} instructions ({:.0}% of semantically-typed instructions)",
+            structural_count, total_with_semantic,
+            structural_count as f64 / total_with_semantic.max(1) as f64 * 100.0,
+        );
     }
 
     /// Test that implicit registers are correctly parsed from TableGen definitions.

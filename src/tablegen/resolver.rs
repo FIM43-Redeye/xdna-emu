@@ -498,6 +498,11 @@ pub struct InstrEncoding {
     /// Select variant inferred from the mnemonic (e.g., "sel.eqz" -> EqualZero).
     /// Only set for Select instructions.
     pub select_variant: Option<SelectVariant>,
+
+    /// Whether this is a pointer arithmetic instruction (mnemonic starts with "padd").
+    /// When true, address generator fields produce a destination pointer + source
+    /// operand instead of a Memory operand.
+    pub is_ptr_arithmetic: bool,
 }
 
 impl InstrEncoding {
@@ -689,9 +694,17 @@ impl<'a> Resolver<'a> {
             }
         }
 
-        // Look up semantic operation from pattern, or infer from mnemonic
+        // Three-tier semantic inference: pattern -> structural -> mnemonic.
+        let defs_vec: Vec<String> = instr.attributes.defs.iter().cloned().collect();
+        let uses_vec: Vec<String> = instr.attributes.uses.iter().cloned().collect();
         let semantic = self.data.semantic_for_instruction(&instr.name)
             .map(|p| p.operation)
+            .or_else(|| infer_semantic_from_structure(
+                &defs_vec, &uses_vec,
+                instr.attributes.may_load, instr.attributes.may_store,
+                false, // regex parser doesn't extract hasDelaySlot
+                &[],   // regex parser doesn't have parent class chain
+            ))
             .or_else(|| infer_semantic_from_mnemonic(&instr.mnemonic));
 
         // Extract operand ordering from InstrDef
@@ -700,6 +713,7 @@ impl<'a> Resolver<'a> {
 
         // Pre-resolve metadata from mnemonic (once per encoding, not per decode)
         let is_vector = instr.mnemonic.starts_with('v') || instr.mnemonic.starts_with('V');
+        let is_ptr_arithmetic = instr.mnemonic.starts_with("padd");
         let element_type = infer_element_type(&instr.mnemonic);
         let branch_condition = infer_branch_condition(&instr.mnemonic, semantic);
         let select_variant = infer_select_variant(&instr.mnemonic, semantic);
@@ -726,6 +740,7 @@ impl<'a> Resolver<'a> {
             branch_condition,
             is_vector,
             select_variant,
+            is_ptr_arithmetic,
         })
     }
 
@@ -983,6 +998,7 @@ fn add_lng_control_flow_encodings(by_slot: &mut HashMap<String, Vec<InstrEncodin
         branch_condition: None,
         is_vector: false,
         select_variant: None,
+        is_ptr_arithmetic: false,
     };
 
     // J: opcode = 0b010
@@ -1007,6 +1023,7 @@ fn add_lng_control_flow_encodings(by_slot: &mut HashMap<String, Vec<InstrEncodin
         branch_condition: Some(BranchCondition::Always),
         is_vector: false,
         select_variant: None,
+        is_ptr_arithmetic: false,
     };
 
     by_slot.entry("lng".into()).or_default().push(jl_encoding);
@@ -1231,12 +1248,78 @@ impl DecoderIndex {
     }
 }
 
+/// Infer semantic operation from structured TableGen data.
+///
+/// Uses register defs/uses, memory flags, delay slot, and parent class names
+/// to classify instructions without parsing the mnemonic string. This is the
+/// preferred inference path -- it relies on compiler-verified attributes from
+/// llvm-aie rather than hand-maintained string matching tables.
+///
+/// Returns None for instructions that can't be classified structurally
+/// (arithmetic, comparison, bitwise -- these need the mnemonic fallback).
+pub fn infer_semantic_from_structure(
+    defs: &[String],
+    uses: &[String],
+    may_load: bool,
+    may_store: bool,
+    has_delay_slot: bool,
+    parents: &[String],
+) -> Option<SemanticOp> {
+    // Control flow: use Defs/Uses of lr and hasDelaySlot.
+    // On AIE2 hardware encodings, isBranch/isCall/isReturn are only set on
+    // Pseudo instructions, but these structural signals are reliable:
+    //   JL/JL_IND: Defs=[lr], hasDelaySlot=1    -> Call
+    //   RET:       Uses=[lr], hasDelaySlot=1     -> Ret
+    //   J_jump_*:  hasDelaySlot=1, no lr         -> Br
+    //   JNZD:      hasDelaySlot=1, no lr         -> BrCond (needs mnemonic for condition)
+    let defs_lr = defs.iter().any(|r| r == "lr");
+    let uses_lr = uses.iter().any(|r| r == "lr");
+
+    if has_delay_slot {
+        if defs_lr {
+            return Some(SemanticOp::Call);
+        }
+        if uses_lr {
+            return Some(SemanticOp::Ret);
+        }
+        // Other delay-slot instructions are branches; the mnemonic fallback
+        // will disambiguate unconditional vs conditional + condition code.
+        // We don't return here because we can't tell j vs jnz vs jz structurally.
+    }
+
+    // Memory operations: mayLoad/mayStore are authoritative flags from TableGen.
+    // The slot (lda/ldb/st) and mnemonic (vlda/vst) refine the operation type,
+    // but Load vs Store classification comes from these flags.
+    if may_load && !may_store {
+        return Some(SemanticOp::Load);
+    }
+    if may_store && !may_load {
+        return Some(SemanticOp::Store);
+    }
+
+    // Parent class chain: format class names encode operation type.
+    // These are compiler-internal names that follow a strict naming convention.
+    for parent in parents {
+        // Lock operations: AIE2_mLockId in parent chain
+        if parent.contains("mLockId") || parent.contains("LockId") {
+            // Can't distinguish acquire vs release from class alone;
+            // leave for mnemonic fallback.
+        }
+        // Done (halt): AIE2_done_inst_alu
+        if parent.contains("_done_") {
+            return Some(SemanticOp::Done);
+        }
+    }
+
+    None
+}
+
 /// Infer semantic operation from instruction mnemonic.
 ///
-/// This is a fallback for instructions whose patterns aren't captured by
-/// the simple pattern regexes (e.g., complex nested patterns like SelectNotPat).
+/// This is the final fallback for instructions not classified by patterns
+/// or structural attributes. It handles arithmetic, comparison, bitwise,
+/// and other operations where no structured TableGen flag exists.
 ///
-/// This is the single source of truth for mnemonic → SemanticOp mapping.
 /// Used by both the resolver and tblgen_records modules.
 pub fn infer_semantic_from_mnemonic(mnemonic: &str) -> Option<SemanticOp> {
     let lower = mnemonic.to_lowercase();
@@ -1924,6 +2007,67 @@ mod tests {
 
         // Unknown mnemonics return None
         assert_eq!(infer_semantic_from_mnemonic("unknown"), None);
+    }
+
+    #[test]
+    fn test_semantic_inference_from_structure() {
+        // Call: Defs=[lr] + hasDelaySlot (JL, JL_IND)
+        assert_eq!(
+            infer_semantic_from_structure(
+                &["lr".into()], &[], false, false, true, &[],
+            ),
+            Some(SemanticOp::Call),
+        );
+
+        // Return: Uses=[lr] + hasDelaySlot (RET)
+        assert_eq!(
+            infer_semantic_from_structure(
+                &[], &["lr".into()], false, false, true, &[],
+            ),
+            Some(SemanticOp::Ret),
+        );
+
+        // Load: mayLoad=true (VLDA, LDA, etc.)
+        assert_eq!(
+            infer_semantic_from_structure(
+                &[], &[], true, false, false, &[],
+            ),
+            Some(SemanticOp::Load),
+        );
+
+        // Store: mayStore=true (VST, ST, etc.)
+        assert_eq!(
+            infer_semantic_from_structure(
+                &[], &[], false, true, false, &[],
+            ),
+            Some(SemanticOp::Store),
+        );
+
+        // Done: parent class chain contains "_done_"
+        assert_eq!(
+            infer_semantic_from_structure(
+                &[], &[], false, false, false,
+                &["AIE2_done_inst_alu".into()],
+            ),
+            Some(SemanticOp::Done),
+        );
+
+        // hasDelaySlot alone (without lr) returns None -- needs mnemonic
+        // to distinguish j vs jnz vs jz
+        assert_eq!(
+            infer_semantic_from_structure(
+                &["srCarry".into()], &[], false, false, true, &[],
+            ),
+            None,
+        );
+
+        // Pure arithmetic: no structural signals -> None
+        assert_eq!(
+            infer_semantic_from_structure(
+                &["srCarry".into()], &[], false, false, false, &[],
+            ),
+            None,
+        );
     }
 
     #[test]

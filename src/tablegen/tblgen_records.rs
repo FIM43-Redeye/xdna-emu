@@ -41,7 +41,7 @@
 
 use std::collections::HashMap;
 
-use super::resolver::{FieldFragment, InstrEncoding, OperandField, OperandType, classify_operand_type, detect_addressing_mode, detect_mem_width, infer_branch_condition, infer_element_type, infer_select_variant, infer_semantic_from_mnemonic};
+use super::resolver::{FieldFragment, InstrEncoding, OperandField, OperandType, classify_operand_type, detect_addressing_mode, detect_mem_width, infer_branch_condition, infer_element_type, infer_select_variant, infer_semantic_from_mnemonic, infer_semantic_from_structure};
 use super::types::ImplicitReg;
 
 /// A parsed instruction record from tblgen output.
@@ -77,6 +77,10 @@ pub struct InstrRecord {
     /// When false, the encoding may be ambiguous and needs post-decode validation.
     /// We deprioritize these during disambiguation.
     pub has_complete_decoder: bool,
+    /// hasDelaySlot flag -- identifies control flow instructions (branches, calls, returns).
+    /// On AIE2 hardware encodings this is the most reliable structural indicator of
+    /// control flow, since isBranch/isCall/isReturn are only set on Pseudo variants.
+    pub has_delay_slot: bool,
 }
 
 /// Parsed slot encoding from bits<N> field.
@@ -282,6 +286,7 @@ fn parse_single_record(lines: &[&str], i: &mut usize) -> Option<InstrRecord> {
         may_store: false,
         has_side_effects: false,
         has_complete_decoder: true, // Default to true; set false if field says 0
+        has_delay_slot: false,
     };
 
     // Parse fields until closing brace
@@ -315,6 +320,8 @@ fn parse_single_record(lines: &[&str], i: &mut usize) -> Option<InstrRecord> {
             record.has_side_effects = line.contains("= 1");
         } else if line.starts_with("bit hasCompleteDecoder = ") {
             record.has_complete_decoder = line.contains("= 1");
+        } else if line.starts_with("bit hasDelaySlot = ") {
+            record.has_delay_slot = line.contains("= 1");
         } else if let Some(enc) = parse_slot_encoding(line) {
             record.slot_encoding = Some(enc);
         }
@@ -520,8 +527,13 @@ impl InstrRecord {
             _ => return None,
         };
 
-        // Try to infer semantic from mnemonic
-        let semantic = infer_semantic_from_mnemonic(&self.mnemonic);
+        // Three-tier semantic inference: structure first, mnemonic fallback.
+        // (Pattern-based semantics are only available on the regex-parser path.)
+        let semantic = infer_semantic_from_structure(
+                &self.defs, &self.uses, self.may_load, self.may_store,
+                self.has_delay_slot, &self.parents,
+            )
+            .or_else(|| infer_semantic_from_mnemonic(&self.mnemonic));
 
         // Build input/output ordering
         let input_order: Vec<String> = self.inputs.iter().map(|(_, n)| n.clone()).collect();
@@ -553,6 +565,7 @@ impl InstrRecord {
 
         // Pre-resolve metadata from mnemonic
         let is_vector = self.mnemonic.starts_with('v') || self.mnemonic.starts_with('V');
+        let is_ptr_arithmetic = self.mnemonic.starts_with("padd");
         let element_type = infer_element_type(&self.mnemonic);
         let branch_condition = infer_branch_condition(&self.mnemonic, semantic);
         let select_variant = infer_select_variant(&self.mnemonic, semantic);
@@ -578,6 +591,7 @@ impl InstrRecord {
             branch_condition,
             is_vector,
             select_variant,
+            is_ptr_arithmetic,
         })
     }
 }

@@ -748,9 +748,9 @@ impl InstructionDecoder {
 
     /// Convert a SemanticOp to an Operation using pre-resolved metadata.
     ///
-    /// All element type, branch condition, and select variant disambiguation is
-    /// resolved at TableGen load time on InstrEncoding. No mnemonic string parsing
-    /// happens here -- just field lookups.
+    /// All element type, branch condition, select variant, and load/store channel
+    /// disambiguation is resolved at TableGen load time on InstrEncoding. No mnemonic
+    /// string parsing happens here -- just field lookups and slot matching.
     fn semantic_to_operation(&self, semantic: SemanticOp, decoded: &DecodedInstr) -> Operation {
         let enc = &decoded.encoding;
         let element_type = enc.element_type.unwrap_or(ElementType::Int32);
@@ -769,36 +769,35 @@ impl InstructionDecoder {
             SemanticOp::Sra => Operation::ScalarSra,
             SemanticOp::Srl => Operation::ScalarShr,
             SemanticOp::Load => {
-                // vlda/vldb/vst distinction: mem_width == Vector256 means vector,
-                // and the mnemonic prefix distinguishes A vs B channel. This is a
-                // cheap 4-char check that's cleaner than adding SemanticOp variants.
-                let mn = &enc.mnemonic;
-                if mn.starts_with("vlda") {
-                    Operation::VectorLoadA { post_modify: PostModify::None }
-                } else if mn.starts_with("vldb") {
-                    Operation::VectorLoadB { post_modify: PostModify::None }
-                } else {
-                    let width = match enc.mem_width {
-                        InstrMemWidth::Byte => MemWidth::Byte,
-                        InstrMemWidth::HalfWord => MemWidth::HalfWord,
-                        InstrMemWidth::Word => MemWidth::Word,
-                        InstrMemWidth::Vector256 => MemWidth::Vector256,
-                    };
-                    Operation::Load { width, post_modify: PostModify::None }
+                // Channel discrimination: enc.slot is the authoritative
+                // functional-unit identifier from TableGen ("lda", "ldb", "st").
+                // The is_vector guard prevents scalar lda/ldb from matching.
+                match enc.slot.as_str() {
+                    "lda" if enc.is_vector => Operation::VectorLoadA { post_modify: PostModify::None },
+                    "ldb" if enc.is_vector => Operation::VectorLoadB { post_modify: PostModify::None },
+                    _ => {
+                        let width = match enc.mem_width {
+                            InstrMemWidth::Byte => MemWidth::Byte,
+                            InstrMemWidth::HalfWord => MemWidth::HalfWord,
+                            InstrMemWidth::Word => MemWidth::Word,
+                            InstrMemWidth::Vector256 => MemWidth::Vector256,
+                        };
+                        Operation::Load { width, post_modify: PostModify::None }
+                    }
                 }
             },
             SemanticOp::Store => {
-                let mn = &enc.mnemonic;
-                if mn.starts_with("vst") {
-                    Operation::VectorStore { post_modify: PostModify::None }
-                } else {
-                    let width = match enc.mem_width {
-                        InstrMemWidth::Byte => MemWidth::Byte,
-                        InstrMemWidth::HalfWord => MemWidth::HalfWord,
-                        InstrMemWidth::Word => MemWidth::Word,
-                        InstrMemWidth::Vector256 => MemWidth::Vector256,
-                    };
-                    Operation::Store { width, post_modify: PostModify::None }
+                match enc.slot.as_str() {
+                    "st" if enc.is_vector => Operation::VectorStore { post_modify: PostModify::None },
+                    _ => {
+                        let width = match enc.mem_width {
+                            InstrMemWidth::Byte => MemWidth::Byte,
+                            InstrMemWidth::HalfWord => MemWidth::HalfWord,
+                            InstrMemWidth::Word => MemWidth::Word,
+                            InstrMemWidth::Vector256 => MemWidth::Vector256,
+                        };
+                        Operation::Store { width, post_modify: PostModify::None }
+                    }
                 }
             },
             SemanticOp::Br => Operation::Branch {
@@ -871,8 +870,6 @@ impl InstructionDecoder {
         let mut extra_sources: Vec<Operand> = Vec::new();
         let mut extracted_post_modify: Option<PostModify> = None;
 
-        let mnemonic = decoded.encoding.mnemonic.to_lowercase();
-
         for field in &decoded.encoding.operand_fields {
             let raw = decoded.operand(&field.name).unwrap_or(0);
 
@@ -881,7 +878,6 @@ impl InstructionDecoder {
             if field.name.starts_with("ag") {
                 self.decode_ag_field(
                     field, raw, decoded,
-                    &mnemonic,
                     &mut direct_dest, &mut extra_sources, &mut extracted_post_modify,
                 );
                 continue;
@@ -937,7 +933,7 @@ impl InstructionDecoder {
                     Operand::Immediate(v) => v as i16,
                     _ => 0,
                 };
-                if mnemonic.starts_with("padd") {
+                if decoded.encoding.is_ptr_arithmetic {
                     // padd: ptr is destination, imm is source operand
                     direct_dest = Some(Operand::PointerReg(base));
                     extra_sources.push(Operand::Immediate(offset as i32));
@@ -1000,7 +996,6 @@ impl InstructionDecoder {
         field: &crate::tablegen::OperandField,
         value: u64,
         decoded: &DecodedInstr,
-        mnemonic: &str,
         direct_dest: &mut Option<Operand>,
         extra_sources: &mut Vec<Operand>,
         extracted_post_modify: &mut Option<PostModify>,
@@ -1015,7 +1010,7 @@ impl InstructionDecoder {
                 let ptr = ((data >> imm_bits) & 0x7) as u8;
                 let imm_raw = (data & ((1 << imm_bits) - 1)) as i32;
                 let imm_bytes = if is_ag_all { imm_raw * 4 } else { imm_raw };
-                if mnemonic.starts_with("padd") {
+                if decoded.encoding.is_ptr_arithmetic {
                     *direct_dest = Some(Operand::PointerReg(ptr));
                     extra_sources.push(Operand::Immediate(imm_bytes));
                 } else {
@@ -1036,7 +1031,7 @@ impl InstructionDecoder {
             AddressingMode::IndexedRegister => {
                 let ptr = ((value >> (field.width as u64 - 3)) & 0x7) as u8;
                 let mod_reg = ((value >> 3) & 0x7) as u8;
-                if mnemonic.starts_with("padd") {
+                if decoded.encoding.is_ptr_arithmetic {
                     *direct_dest = Some(Operand::PointerReg(ptr));
                     extra_sources.push(Operand::ModifierReg(mod_reg));
                 } else {
@@ -1079,7 +1074,7 @@ impl InstructionDecoder {
                     }
                 };
 
-                if mnemonic.starts_with("padd") {
+                if decoded.encoding.is_ptr_arithmetic {
                     *direct_dest = Some(Operand::PointerReg(ptr_reg));
                     extra_sources.push(offset_or_mod);
                 } else if let Operand::Immediate(imm) = offset_or_mod {
@@ -1114,9 +1109,20 @@ impl InstructionDecoder {
         } else if !output_order.is_empty() {
             // Look up first output name in field_operands
             output_order.first().and_then(|name| field_operands.get(name).cloned())
-                .or_else(|| self.find_dest_heuristic(field_operands))
+                .or_else(|| {
+                    log::trace!(
+                        "[DECODE] output_order name '{}' not in field_operands for '{}', falling back to dest heuristic",
+                        output_order.first().map(|s| s.as_str()).unwrap_or("?"),
+                        decoded.encoding.name,
+                    );
+                    self.find_dest_heuristic(field_operands)
+                })
         } else {
             // No output_order - use heuristic
+            log::trace!(
+                "[DECODE] empty output_order for '{}', falling back to dest heuristic",
+                decoded.encoding.name,
+            );
             self.find_dest_heuristic(field_operands)
         };
 
@@ -1137,7 +1143,11 @@ impl InstructionDecoder {
                 }
             }
         } else {
-            // No input_order - use all non-dest operands
+            // No input_order - use all non-dest operands (heuristic fallback)
+            log::trace!(
+                "[DECODE] empty input_order for '{}', using is_dest_field heuristic for source filtering",
+                decoded.encoding.name,
+            );
             for (name, operand) in field_operands.iter() {
                 if !self.is_dest_field(name) {
                     sources.push(operand.clone());
@@ -1164,7 +1174,12 @@ impl InstructionDecoder {
         None
     }
 
-    /// Check if a field name represents a destination (used for fallback).
+    /// Legacy safety net: check if a field name represents a destination.
+    ///
+    /// This heuristic is only used when output_order/input_order are empty or
+    /// when the first output_order name doesn't match any field_operand key.
+    /// New instructions should always have output_order/input_order populated
+    /// by the resolver -- do not extend this pattern list.
     fn is_dest_field(&self, name: &str) -> bool {
         (name.contains("mRx") && !name.contains("mRx0"))
             || name.starts_with("d")
@@ -1298,25 +1313,7 @@ impl Decoder for InstructionDecoder {
                     bundle.set_slot(SlotOp::nop(slot_index));
                 } else if let Some(decoded) = self.decode_slot_bits(slot.bits, slot.slot_type) {
                     let mut operation = self.to_operation(&decoded);
-                    let (dest, sources, extracted_pm) = if decoded.encoding.mnemonic == "movxm" {
-                        // Special handling for movxm: immediate is SPLIT in the lng slot
-                        // TableGen layout: lng = {i{31-12}, mMvSclDstCg, i{11-0}, 0b001}
-                        let i_low = ((slot.bits >> 3) & 0xFFF) as u32;
-                        let dst_raw = ((slot.bits >> 15) & 0x7F) as u8;
-                        let i_high = ((slot.bits >> 22) & 0xFFFFF) as u32;
-                        let full_imm = (i_high << 12) | i_low;
-
-                        // Decode destination from mMvSclDstCg composite register encoding
-                        let dest_operand = if dst_raw & 0x3 == 0x3 {
-                            Operand::PointerReg((dst_raw >> 4) & 0x7)
-                        } else {
-                            Operand::ScalarReg((dst_raw >> 2) & 0x1F)
-                        };
-
-                        (Some(dest_operand), vec![Operand::Immediate(full_imm as i32)], None)
-                    } else {
-                        self.extract_operands(&decoded)
-                    };
+                    let (dest, sources, extracted_pm) = self.extract_operands(&decoded);
 
                     // Patch PostModify from ag_* extraction into the Operation
                     if let Some(pm) = extracted_pm {
@@ -1476,6 +1473,7 @@ mod tests {
             branch_condition: None,
             is_vector: false,
             select_variant: None,
+            is_ptr_arithmetic: false,
         }
     }
 
@@ -1563,6 +1561,7 @@ mod tests {
             branch_condition: None,
             is_vector: false,
             select_variant: None,
+            is_ptr_arithmetic: false,
         };
 
         let more_specific = make_add_encoding(); // 5 fixed bits
@@ -2050,6 +2049,81 @@ mod tests {
         assert_eq!(sources, vec![Operand::Immediate(6)], "Expected source=Immediate(6)");
     }
 
+    /// Verify the generic decode path handles movxm (LNG slot, split immediate).
+    ///
+    /// LNG slot layout: {i{31-12}, mMvSclDstCg, i{11-0}, 0b001}
+    ///   bits [41:22] = i{31-12}  (20 bits)
+    ///   bits [21:15] = mMvSclDstCg (7 bits)
+    ///   bits [14:3]  = i{11-0}   (12 bits)
+    ///   bits [2:0]   = 0b001     (opcode)
+    ///
+    /// This replaced a manual special case that used a 2-bit discriminant
+    /// (dst_raw & 0x3) and would misidentify lr as PointerReg(2).
+    #[test]
+    fn test_decode_movxm_generic_path() {
+        use crate::interpreter::bundle::SlotType;
+        use crate::interpreter::state::LR_REG_INDEX;
+
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found");
+            return;
+        }
+        let data = load_from_llvm_aie(llvm_aie_path).expect("Failed to load llvm-aie");
+        let tables = build_decoder_tables(&data);
+        let decoder = InstructionDecoder::from_tables(tables);
+
+        // Helper: build a 42-bit LNG slot word for movxm
+        let build_movxm = |imm: u32, dst_enc: u8| -> u64 {
+            let i_high = ((imm >> 12) & 0xFFFFF) as u64;
+            let i_low = (imm & 0xFFF) as u64;
+            let dst = dst_enc as u64;
+            (i_high << 22) | (dst << 15) | (i_low << 3) | 0b001
+        };
+
+        // Case 1: movxm r3, #0x7ff
+        // r3 in MvSclSrc: encode = (3 << 2) | 0b00 = 12
+        let bits = build_movxm(0x7ff, 12);
+        let decoded = decoder.decode_slot_bits(bits, SlotType::Lng)
+            .expect("Should decode movxm r3, #0x7ff");
+        assert_eq!(decoded.encoding.mnemonic, "movxm");
+        let (dest, sources, _) = decoder.extract_operands(&decoded);
+        assert_eq!(dest, Some(Operand::ScalarReg(3)));
+        assert_eq!(sources, vec![Operand::Immediate(0x7ff)]);
+
+        // Case 2: movxm p2, #0x100
+        // p2 in MvSclSrc: encode = (2 << 4) | 0b0011 = 35
+        let bits = build_movxm(0x100, 35);
+        let decoded = decoder.decode_slot_bits(bits, SlotType::Lng)
+            .expect("Should decode movxm p2, #0x100");
+        let (dest, sources, _) = decoder.extract_operands(&decoded);
+        assert_eq!(dest, Some(Operand::PointerReg(2)));
+        assert_eq!(sources, vec![Operand::Immediate(0x100)]);
+
+        // Case 3: movxm sp, #0x70000
+        // SP in MvSclSrc: HWEncoding = 103 = (12 << 3) | 0b111
+        let bits = build_movxm(0x70000, 103);
+        let decoded = decoder.decode_slot_bits(bits, SlotType::Lng)
+            .expect("Should decode movxm sp, #0x70000");
+        let (dest, sources, _) = decoder.extract_operands(&decoded);
+        assert_eq!(dest, Some(Operand::PointerReg(6)), "SP should map to p6");
+        assert_eq!(sources, vec![Operand::Immediate(0x70000)]);
+
+        // Case 4: movxm lr, #0x1234
+        // lr in MvSclSrc: HWEncoding = 39 = (4 << 3) | 0b111
+        // The OLD special case got this wrong: 39 & 0x3 == 3, so it decoded
+        // as PointerReg((39 >> 4) & 0x7) = PointerReg(2). The generic
+        // decode_mv_scl_src checks bits[2:0] == 0b111 first, correctly
+        // routing to ScalarReg(LR_REG_INDEX).
+        let bits = build_movxm(0x1234, 39);
+        let decoded = decoder.decode_slot_bits(bits, SlotType::Lng)
+            .expect("Should decode movxm lr, #0x1234");
+        let (dest, sources, _) = decoder.extract_operands(&decoded);
+        assert_eq!(dest, Some(Operand::ScalarReg(LR_REG_INDEX)),
+            "lr must decode as ScalarReg(LR), not PointerReg(2)");
+        assert_eq!(sources, vec![Operand::Immediate(0x1234)]);
+    }
+
     #[test]
     fn test_lda_scl_vs_mv_scl_pointer_encoding_differs() {
         // This is THE critical test: the same pointer register (p3) encodes
@@ -2069,5 +2143,160 @@ mod tests {
         let cross = decode_lda_scl(51);
         assert_ne!(cross, Operand::PointerReg(3),
             "LdaScl(51) should NOT decode as p3 -- different encoding scheme");
+    }
+
+    /// Verify that vector load channel is determined by slot, not mnemonic.
+    ///
+    /// The decoder must produce VectorLoadA for slot="lda"+is_vector,
+    /// VectorLoadB for slot="ldb"+is_vector, and plain Load for non-vector
+    /// instructions in the same slots.
+    #[test]
+    fn test_vector_load_channel_by_slot() {
+        use crate::tablegen::{AddressingMode, InstrMemWidth};
+        let decoder = InstructionDecoder::new();
+
+        // Helper to build a minimal Load encoding for the given slot+is_vector
+        let make_load_enc = |slot: &str, is_vector: bool| -> InstrEncoding {
+            InstrEncoding {
+                name: format!("TEST_LOAD_{}", slot),
+                mnemonic: if is_vector { format!("v{}", slot) } else { slot.to_string() },
+                slot: slot.to_string(),
+                width: 20,
+                fixed_mask: 0,
+                fixed_bits: 0,
+                operand_fields: vec![],
+                semantic: Some(SemanticOp::Load),
+                may_load: true,
+                may_store: false,
+                input_order: vec![],
+                output_order: vec![],
+                implicit_regs: vec![],
+                addressing_mode: AddressingMode::Unknown,
+                mem_width: if is_vector { InstrMemWidth::Vector256 } else { InstrMemWidth::Word },
+                has_complete_decoder: true,
+                element_type: None,
+                branch_condition: None,
+                is_vector,
+                select_variant: None,
+                is_ptr_arithmetic: false,
+            }
+        };
+
+        // Vector load A (slot=lda, is_vector=true) -> VectorLoadA
+        let decoded_vlda = DecodedInstr {
+            encoding: make_load_enc("lda", true),
+            operands: HashMap::new(),
+        };
+        let op = decoder.to_operation(&decoded_vlda);
+        assert!(matches!(op, Operation::VectorLoadA { .. }),
+            "slot=lda + is_vector should produce VectorLoadA, got {:?}", op);
+
+        // Vector load B (slot=ldb, is_vector=true) -> VectorLoadB
+        let decoded_vldb = DecodedInstr {
+            encoding: make_load_enc("ldb", true),
+            operands: HashMap::new(),
+        };
+        let op = decoder.to_operation(&decoded_vldb);
+        assert!(matches!(op, Operation::VectorLoadB { .. }),
+            "slot=ldb + is_vector should produce VectorLoadB, got {:?}", op);
+
+        // Scalar load in lda slot (is_vector=false) -> plain Load
+        let decoded_scl = DecodedInstr {
+            encoding: make_load_enc("lda", false),
+            operands: HashMap::new(),
+        };
+        let op = decoder.to_operation(&decoded_scl);
+        assert!(matches!(op, Operation::Load { .. }),
+            "slot=lda + !is_vector should produce plain Load, got {:?}", op);
+
+        // Vector store (slot=st, is_vector=true) -> VectorStore
+        let mut store_enc = make_load_enc("st", true);
+        store_enc.semantic = Some(SemanticOp::Store);
+        store_enc.may_load = false;
+        store_enc.may_store = true;
+        let decoded_vst = DecodedInstr {
+            encoding: store_enc,
+            operands: HashMap::new(),
+        };
+        let op = decoder.to_operation(&decoded_vst);
+        assert!(matches!(op, Operation::VectorStore { .. }),
+            "slot=st + is_vector should produce VectorStore, got {:?}", op);
+    }
+
+    /// Verify that PADD instructions produce PointerReg destination via
+    /// the is_ptr_arithmetic field (not mnemonic checking).
+    #[test]
+    fn test_padd_dest_is_pointer() {
+        use crate::tablegen::{AddressingMode, InstrMemWidth, OperandType, RegisterKind};
+
+        let decoder = InstructionDecoder::new();
+
+        // Build a PADD-like encoding with IndexedImmediate addressing
+        // and is_ptr_arithmetic=true. The ptr+imm combination should
+        // produce a PointerReg destination + Immediate source.
+        let mut ptr_field = OperandField::new("ptr", 10, 3);
+        ptr_field.operand_type = OperandType::Register(RegisterKind::Pointer);
+        let mut imm_field = OperandField::new("imm", 7, 3);
+        imm_field.operand_type = OperandType::Immediate { signed: false, scale: 1 };
+
+        let padd_enc = InstrEncoding {
+            name: "PADD_test".to_string(),
+            mnemonic: "padd".to_string(),
+            slot: "alu".to_string(),
+            width: 20,
+            fixed_mask: 0,
+            fixed_bits: 0,
+            operand_fields: vec![ptr_field, imm_field],
+            semantic: Some(SemanticOp::Add),
+            may_load: false,
+            may_store: false,
+            input_order: vec![],
+            output_order: vec![],
+            implicit_regs: vec![],
+            addressing_mode: AddressingMode::IndexedImmediate,
+            mem_width: InstrMemWidth::Word,
+            has_complete_decoder: true,
+            element_type: None,
+            branch_condition: None,
+            is_vector: false,
+            select_variant: None,
+            is_ptr_arithmetic: true,
+        };
+
+        // Encode: ptr=3 at bits 12:10, imm=5 at bits 9:7
+        let mut operands = HashMap::new();
+        operands.insert("ptr".to_string(), 3u64);
+        operands.insert("imm".to_string(), 5u64);
+
+        let decoded = DecodedInstr {
+            encoding: padd_enc,
+            operands,
+        };
+
+        let (dest, sources, _post_modify) = decoder.extract_operands(&decoded);
+
+        // PADD: ptr becomes destination, imm becomes source
+        assert_eq!(dest, Some(Operand::PointerReg(3)),
+            "PADD should produce PointerReg destination");
+        assert!(sources.iter().any(|s| matches!(s, Operand::Immediate(5))),
+            "PADD should have immediate source, got {:?}", sources);
+
+        // Verify that a non-padd encoding with same fields produces Memory operand
+        let mut load_enc = decoded.encoding.clone();
+        load_enc.is_ptr_arithmetic = false;
+        load_enc.name = "LDA_test".to_string();
+        load_enc.mnemonic = "lda".to_string();
+        let load_decoded = DecodedInstr {
+            encoding: load_enc,
+            operands: decoded.operands.clone(),
+        };
+
+        let (dest, sources, _) = decoder.extract_operands(&load_decoded);
+
+        // Non-padd: ptr+imm combine into Memory operand as source
+        assert!(dest.is_none() || !matches!(dest, Some(Operand::PointerReg(3))),
+            "Non-PADD should not produce PointerReg destination");
+        assert!(sources.iter().any(|s| matches!(s, Operand::Memory { base: 3, offset: 5 })),
+            "Non-PADD should produce Memory source, got {:?}", sources);
     }
 }
