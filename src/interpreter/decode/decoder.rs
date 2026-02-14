@@ -31,8 +31,9 @@ use crate::interpreter::bundle::{
 };
 use crate::interpreter::state::{MOD_BASE_DJ, MOD_BASE_M};
 use crate::interpreter::traits::{DecodeError, Decoder};
+use super::composite::CompositeLuts;
 use crate::tablegen::{
-    build_decoder_tables, load_from_llvm_aie, load_via_tblgen, AddressingMode, CompositeEncoder,
+    build_decoder_tables, load_from_llvm_aie, load_via_tblgen, AddressingMode,
     DecoderIndex, InstrEncoding, InstrMemWidth, OperandType, RegisterKind, SemanticOp,
 };
 
@@ -102,6 +103,10 @@ pub struct InstructionDecoder {
     /// Will be removed once all code uses DecoderIndex.
     encodings: Vec<InstrEncoding>,
 
+    /// Pre-built composite register decode LUTs.
+    /// Each composite encoder variant has a dedicated LUT for O(1) decode.
+    composite_luts: CompositeLuts,
+
     /// Statistics: successful decodes.
     decode_count: u64,
     /// Statistics: unknown patterns.
@@ -113,350 +118,6 @@ impl Default for InstructionDecoder {
         Self::new()
     }
 }
-
-// ─── Inverse Encoder Functions ───────────────────────────────────────────────
-//
-// Each function below is the inverse of the corresponding Peano encoder in
-// AIE2MCCodeEmitterRegOperandDef.h. They take a raw bit-field value and return
-// the decoded Operand.
-
-/// Dispatch a composite register decode based on the encoder variant.
-fn decode_composite(encoder: CompositeEncoder, raw: u64) -> Operand {
-    match encoder {
-        CompositeEncoder::LdaScl => decode_lda_scl(raw),
-        CompositeEncoder::MvSclSrc => decode_mv_scl_src(raw),
-        CompositeEncoder::LdaCg => decode_lda_cg(raw),
-        CompositeEncoder::AluCg => decode_alu_cg(raw),
-        CompositeEncoder::MvAMWQDst => decode_mv_amwq_dst(raw),
-        CompositeEncoder::MvAMWQSrc => decode_mv_amwq_src(raw),
-        CompositeEncoder::MvBMXSrc => decode_mv_bmx_src(raw),
-        CompositeEncoder::MvBMXDst => decode_mv_bmx_dst(raw),
-        CompositeEncoder::ERS4 => decode_ers4(raw),
-        CompositeEncoder::ShflDst => decode_shfl_dst(raw),
-        CompositeEncoder::Wm1 => decode_wm1(raw),
-        CompositeEncoder::QXHLb => decode_qxhlb(raw),
-    }
-}
-
-/// Inverse of `getmLdaSclOpValue`. Covers mLdaScl, mSclSt, mSclMS, mLdbScl.
-///
-/// Encoding:
-///   lr         -> 0b0000101
-///   eP(enc)    -> (enc << 4) | 0b1101
-///   eR(enc)    -> (enc << 2) | 0b00
-///   eM(enc)    -> ((enc | 0b00000) << 2) | 0b10
-///   eDN(enc)   -> ((enc | 0b01000) << 2) | 0b10
-///   eDJ(enc)   -> ((enc | 0b10000) << 2) | 0b10
-///   eDC(enc)   -> ((enc | 0b11000) << 2) | 0b10
-fn decode_lda_scl(raw: u64) -> Operand {
-    // Special case: link register (HW encoding 5 in LdaScl space)
-    if raw == 0b0000101 {
-        return Operand::ScalarReg(crate::interpreter::state::LR_REG_INDEX);
-    }
-    // Pointer: low 4 bits == 0b1101
-    if raw & 0xF == 0b1101 {
-        let ptr_reg = ((raw >> 4) & 0x7) as u8;
-        return Operand::PointerReg(ptr_reg);
-    }
-    // Scalar: low 2 bits == 0b00
-    if raw & 0x3 == 0b00 {
-        let scl_reg = ((raw >> 2) & 0x1F) as u8;
-        return Operand::ScalarReg(scl_reg);
-    }
-    // Modifier/special: low 2 bits == 0b10
-    if raw & 0x3 == 0b10 {
-        let combined = (raw >> 2) & 0x1F;
-        let prefix = combined & 0x18; // bits[4:3]
-        let reg = (combined & 0x07) as u8;
-        return match prefix {
-            0b00000 => Operand::ModifierReg(reg),        // eM
-            0b01000 => Operand::ModifierReg(8 + reg),    // eDN
-            0b10000 => Operand::ModifierReg(16 + reg),   // eDJ
-            0b11000 => Operand::ModifierReg(24 + reg),   // eDC
-            _ => Operand::ModifierReg(reg),
-        };
-    }
-    // Fallback
-    Operand::ScalarReg((raw >> 2) as u8)
-}
-
-/// Inverse of `getmMvSclSrcOpValue`. Covers mMvSclSrc, mMvSclDst, mMvSclDstCg.
-///
-/// Special register HW encodings (returned directly):
-///   LS=7, DP=23, lr=39, CORE_ID=55, LE=71, LC=87, SP=103
-///
-/// Otherwise:
-///   eR(enc)    -> (enc << 2) | 0b00
-///   eP(enc)    -> (enc << 4) | 0b0011
-///   eM(enc)    -> ((enc | 0b0000) << 2) | 0b10
-///   eDN/DJ/DC  -> same as LdaScl modifier encoding
-///   eS(enc)    -> (enc << 5) | 0b01011
-///   mCRm(enc)  -> (enc << 3) | 0b001
-///   mSRm(enc)  -> (enc << 3) | 0b101
-fn decode_mv_scl_src(raw: u64) -> Operand {
-    // Check for special register HW encodings first
-    // These have bits[2:0] == 0b111 (the SPL tag) and bits[6:3] identify the register.
-    if raw & 0x7 == 0b111 {
-        // Special register: HWEncoding = (id << 3) | 0b111
-        // id comes from AIE2SPLReg<Enc> in TableGen.
-        use crate::interpreter::state::*;
-        let id = (raw >> 3) & 0xF;
-        return match id {
-            0  => Operand::ScalarReg(LS_REG_INDEX),       // LS (loop start)
-            2  => Operand::ScalarReg(DP_REG_INDEX),       // DP (decompress pointer)
-            4  => Operand::ScalarReg(LR_REG_INDEX),       // lr (link register)
-            6  => Operand::ScalarReg(CORE_ID_REG_INDEX),  // CORE_ID (read-only)
-            8  => Operand::ScalarReg(LE_REG_INDEX),       // LE (loop end)
-            10 => Operand::ScalarReg(LC_REG_INDEX),       // LC (loop count)
-            12 => Operand::PointerReg(6),                 // SP (stack pointer = p6)
-            _  => Operand::ScalarReg(0),
-        };
-    }
-    // Pointer: low 4 bits == 0b0011
-    if raw & 0xF == 0b0011 {
-        let ptr_reg = ((raw >> 4) & 0x7) as u8;
-        return Operand::PointerReg(ptr_reg);
-    }
-    // Scalar: low 2 bits == 0b00
-    if raw & 0x3 == 0b00 {
-        let scl_reg = ((raw >> 2) & 0x1F) as u8;
-        return Operand::ScalarReg(scl_reg);
-    }
-    // eS: low 5 bits == 0b01011
-    if raw & 0x1F == 0b01011 {
-        let s_reg = ((raw >> 5) & 0x3) as u8;
-        return Operand::ScalarReg(s_reg); // Status register, modeled as scalar
-    }
-    // Modifier/special: low 2 bits == 0b10
-    if raw & 0x3 == 0b10 {
-        let combined = (raw >> 2) & 0x1F;
-        let prefix = combined & 0x18;
-        let reg = (combined & 0x07) as u8;
-        return match prefix {
-            0b00000 => Operand::ModifierReg(reg),
-            0b01000 => Operand::ModifierReg(8 + reg),
-            0b10000 => Operand::ModifierReg(16 + reg),
-            0b11000 => Operand::ModifierReg(24 + reg),
-            _ => Operand::ModifierReg(reg),
-        };
-    }
-    // mCRm: low 3 bits == 0b001
-    if raw & 0x7 == 0b001 {
-        let cr_reg = ((raw >> 3) & 0xF) as u8;
-        return Operand::ScalarReg(cr_reg); // Control register, modeled as scalar
-    }
-    // mSRm: low 3 bits == 0b101
-    if raw & 0x7 == 0b101 {
-        let sr_reg = ((raw >> 3) & 0xF) as u8;
-        return Operand::ScalarReg(sr_reg); // Status register, modeled as scalar
-    }
-    // Fallback
-    Operand::ScalarReg((raw >> 2) as u8)
-}
-
-/// Inverse of `getmLdaCgOpValue`. Covers mLdaCg, mLdbCg.
-///
-/// Encoding:
-///   LC         -> 0b0010101
-///   eP(enc)    -> (enc << 4) | 0b1101
-///   eR(enc)    -> (enc << 2) | 0b00
-///   eM/eDN/eDJ/eDC -> same modifier encoding as LdaScl
-fn decode_lda_cg(raw: u64) -> Operand {
-    // Special case: LC (loop count) -- HW encoding 0b0010101 = 21 in LdaCg space
-    if raw == 0b0010101 {
-        return Operand::ScalarReg(crate::interpreter::state::LC_REG_INDEX);
-    }
-    // Pointer: low 4 bits == 0b1101
-    if raw & 0xF == 0b1101 {
-        let ptr_reg = ((raw >> 4) & 0x7) as u8;
-        return Operand::PointerReg(ptr_reg);
-    }
-    // Scalar: low 2 bits == 0b00
-    if raw & 0x3 == 0b00 {
-        let scl_reg = ((raw >> 2) & 0x1F) as u8;
-        return Operand::ScalarReg(scl_reg);
-    }
-    // Modifier: low 2 bits == 0b10
-    if raw & 0x3 == 0b10 {
-        let combined = (raw >> 2) & 0x1F;
-        let prefix = combined & 0x18;
-        let reg = (combined & 0x07) as u8;
-        return match prefix {
-            0b00000 => Operand::ModifierReg(reg),
-            0b01000 => Operand::ModifierReg(8 + reg),
-            0b10000 => Operand::ModifierReg(16 + reg),
-            0b11000 => Operand::ModifierReg(24 + reg),
-            _ => Operand::ModifierReg(reg),
-        };
-    }
-    Operand::ScalarReg((raw >> 2) as u8)
-}
-
-/// Inverse of `getmAluCgOpValue`.
-///
-/// Encoding:
-///   LC         -> 0b000001
-///   eR(enc)    -> enc << 1
-fn decode_alu_cg(raw: u64) -> Operand {
-    if raw == 0b000001 {
-        return Operand::ScalarReg(crate::interpreter::state::LC_REG_INDEX); // LC
-    }
-    let scl_reg = (raw >> 1) as u8;
-    Operand::ScalarReg(scl_reg)
-}
-
-/// Inverse of `getmMvAMWQDstOpValue`.
-///
-/// Encoding:
-///   mAMm(enc)    -> (enc << 1) | 0b1
-///   eWLE(enc)    -> (0b00 << 5) | ((enc >> 2) << 2) | 0b00
-///   eWLO(enc)    -> (0b01 << 5) | ((enc >> 2) << 2) | 0b00
-///   eWHE(enc)    -> (0b10 << 5) | ((enc >> 2) << 2) | 0b00
-///   eWHO(enc)    -> (0b11 << 5) | ((enc >> 2) << 2) | 0b00
-///   mQQm(enc)    -> (enc << 5) | 0b00010
-fn decode_mv_amwq_dst(raw: u64) -> Operand {
-    // mAMm: low bit == 1
-    if raw & 0x1 == 0b1 {
-        let am_reg = (raw >> 1) as u8;
-        return Operand::AccumReg(am_reg);
-    }
-    // mQQm: low 5 bits == 0b00010
-    if raw & 0x1F == 0b00010 {
-        let qq_reg = (raw >> 5) as u8;
-        return Operand::AccumReg(qq_reg); // Weight queue
-    }
-    // eWxx: low 2 bits == 0b00, bits[6:5] select sub-class
-    if raw & 0x3 == 0b00 {
-        let _subclass = (raw >> 5) & 0x3; // 00=WLE, 01=WLO, 10=WHE, 11=WHO
-        let enc_bits = ((raw >> 2) & 0x7) as u8;
-        // Recover original encoding: enc = (enc_bits << 2) (since we stored enc >> 2)
-        let vec_reg = enc_bits << 2;
-        return Operand::VectorReg(vec_reg);
-    }
-    Operand::VectorReg(raw as u8)
-}
-
-/// Inverse of `getmMvAMWQSrcOpValue`.
-///
-/// Encoding:
-///   mAMm(enc)    -> (enc << 3) | 0b001
-///   eWLE(enc)    -> (0b110000 << 3) | (enc >> 2)
-///   eWLO(enc)    -> (0b110001 << 3) | (enc >> 2)
-///   eWHE(enc)    -> (0b110010 << 3) | (enc >> 2)
-///   eWHO(enc)    -> (0b110011 << 3) | (enc >> 2)
-///   mQQm(enc)    -> (0b111 << 6) | (enc << 4) | 0b0000
-fn decode_mv_amwq_src(raw: u64) -> Operand {
-    // Check for mQQm: bits[6:4] == 0b111, low 4 bits == 0b0000
-    if (raw >> 6) & 0x7 == 0b111 && raw & 0xF == 0b0000 {
-        let qq_reg = ((raw >> 4) & 0x3) as u8;
-        return Operand::AccumReg(qq_reg);
-    }
-    // Check for eWxx: bits[8:3] starts with 0b1100xx
-    let upper6 = (raw >> 3) & 0x3F;
-    if upper6 >= 0b110000 && upper6 <= 0b110011 {
-        let enc_div4 = (raw & 0x7) as u8;
-        let vec_reg = enc_div4 << 2;
-        return Operand::VectorReg(vec_reg);
-    }
-    // mAMm: low 3 bits == 0b001
-    if raw & 0x7 == 0b001 {
-        let am_reg = (raw >> 3) as u8;
-        return Operand::AccumReg(am_reg);
-    }
-    Operand::AccumReg(raw as u8)
-}
-
-/// Inverse of `getmMvBMXSrcOpValue`.
-///
-/// Encoding:
-///   mBMm(enc) -> (enc << 4) | 0b0000
-///   mXm(enc)  -> (0b11000 << 4) | enc
-fn decode_mv_bmx_src(raw: u64) -> Operand {
-    // mXm: high bits == 0b11000
-    if (raw >> 4) & 0x1F == 0b11000 {
-        let x_reg = (raw & 0xF) as u8;
-        return Operand::VectorReg(x_reg); // 512-bit vector
-    }
-    // mBMm: low 4 bits == 0b0000
-    let bm_reg = (raw >> 4) as u8;
-    Operand::AccumReg(bm_reg)
-}
-
-/// Inverse of `getmMvBMXDstOpValue`.
-///
-/// Encoding:
-///   mBMm(enc) -> (enc << 1) | 0b1
-///   mXm(enc)  -> (enc << 2) | 0b00
-fn decode_mv_bmx_dst(raw: u64) -> Operand {
-    // mBMm: low bit == 1
-    if raw & 0x1 == 0b1 {
-        let bm_reg = (raw >> 1) as u8;
-        return Operand::AccumReg(bm_reg);
-    }
-    // mXm: low 2 bits == 0b00
-    let x_reg = (raw >> 2) as u8;
-    Operand::VectorReg(x_reg)
-}
-
-/// Inverse of `geteRS4OpValue`.
-///
-/// Encoding: eRS4(enc) -> enc - 16
-fn decode_ers4(raw: u64) -> Operand {
-    let scl_reg = (raw as u8).wrapping_add(16);
-    Operand::ScalarReg(scl_reg)
-}
-
-/// Inverse of `getmShflDstOpValue`.
-///
-/// Encoding:
-///   mBMSm(enc) -> ((((enc & 1) << 3) | (enc >> 1)) << 1) | 0b1
-///   mXm(enc)   -> (enc << 1) | 0b0
-fn decode_shfl_dst(raw: u64) -> Operand {
-    // mXm: low bit == 0
-    if raw & 0x1 == 0b0 {
-        let x_reg = (raw >> 1) as u8;
-        return Operand::VectorReg(x_reg);
-    }
-    // mBMSm: low bit == 1, need to reverse the bit rearrangement
-    let shifted = raw >> 1;
-    // Forward: ((lsb << 3) | (rest >> 1)) where lsb = enc & 1, rest = enc >> 1
-    // shifted = (lsb << 3) | (rest >> 1)
-    // So: lsb = (shifted >> 3) & 1, upper = shifted & 0x7
-    // enc = (upper << 1) | lsb
-    let lsb = ((shifted >> 3) & 0x1) as u8;
-    let upper = (shifted & 0x7) as u8;
-    let bms_reg = (upper << 1) | lsb;
-    Operand::AccumReg(bms_reg)
-}
-
-/// Inverse of `getmWm_1OpValue`.
-///
-/// Encoding: mWm(enc) -> (((bit0 << 1) | bit1) << 3) | (enc >> 2)
-///   where bit0 = enc & 1, bit1 = (enc >> 1) & 1
-fn decode_wm1(raw: u64) -> Operand {
-    // Forward: result = (rearranged_low2 << 3) | (enc >> 2)
-    // rearranged = (bit0 << 1) | bit1
-    let enc_upper = (raw & 0x7) as u8;  // enc >> 2 (3 bits)
-    let rearranged = ((raw >> 3) & 0x3) as u8;
-    // rearranged = (bit0 << 1) | bit1, so bit0 = (rearranged >> 1) & 1, bit1 = rearranged & 1
-    let bit0 = (rearranged >> 1) & 0x1;
-    let bit1 = rearranged & 0x1;
-    let vec_reg = (enc_upper << 2) | (bit1 << 1) | bit0;
-    Operand::VectorReg(vec_reg)
-}
-
-/// Inverse of `getmQXHLbOpValue`.
-///
-/// Encoding:
-///   mQXHb(enc) -> (enc << 1) | 0b0
-///   mQXLb(enc) -> (enc << 1) | 0b1
-fn decode_qxhlb(raw: u64) -> Operand {
-    // Low bit selects high/low sub-register, upper bits are the register index
-    let reg = (raw >> 1) as u8;
-    Operand::AccumReg(reg)
-}
-
-// ─── End Inverse Encoder Functions ──────────────────────────────────────────
 
 /// Sign-extend a value from `bits` width to i32.
 #[inline]
@@ -497,6 +158,7 @@ impl InstructionDecoder {
         Self {
             index: DecoderIndex::default(),
             encodings: Vec::new(),
+            composite_luts: CompositeLuts::build(),
             decode_count: 0,
             unknown_count: 0,
         }
@@ -617,6 +279,7 @@ impl InstructionDecoder {
         Self {
             index,
             encodings,
+            composite_luts: CompositeLuts::build(),
             decode_count: 0,
             unknown_count: 0,
         }
@@ -638,6 +301,7 @@ impl InstructionDecoder {
         Self {
             index,
             encodings,
+            composite_luts: CompositeLuts::build(),
             decode_count: 0,
             unknown_count: 0,
         }
@@ -648,6 +312,7 @@ impl InstructionDecoder {
         Self {
             index,
             encodings: Vec::new(), // No legacy list needed
+            composite_luts: CompositeLuts::build(),
             decode_count: 0,
             unknown_count: 0,
         }
@@ -898,7 +563,7 @@ impl InstructionDecoder {
                     }
                 }
                 OperandType::CompositeRegister(encoder) => {
-                    decode_composite(*encoder, raw)
+                    self.composite_luts.decode(*encoder, raw)
                 }
                 OperandType::Immediate { signed, scale } => {
                     let value = if *signed {
@@ -1446,7 +1111,7 @@ impl Decoder for InstructionDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tablegen::{build_decoder_tables, load_from_llvm_aie, OperandField};
+    use crate::tablegen::{build_decoder_tables, load_from_llvm_aie, CompositeEncoder, OperandField};
     use std::path::Path;
 
     fn make_add_encoding() -> InstrEncoding {
@@ -1774,175 +1439,29 @@ mod tests {
         assert!(bundle.is_nop());
     }
 
-    // === Inverse Encoder Function Tests ===
+    // === Composite Register LUT Integration Tests ===
     //
-    // Each test verifies that encode(reg) -> raw -> decode(raw) == reg.
-    // Encoding formulas come from AIE2MCCodeEmitterRegOperandDef.h.
+    // Per-function decode tests live in composite.rs. These tests verify
+    // the LUT dispatch works correctly through the CompositeLuts interface.
 
     #[test]
-    fn test_decode_lda_scl_scalar() {
-        // eR(7): encode = (7 << 2) | 0b00 = 28
-        assert_eq!(decode_lda_scl(28), Operand::ScalarReg(7));
-        // eR(0): encode = (0 << 2) | 0b00 = 0
-        assert_eq!(decode_lda_scl(0), Operand::ScalarReg(0));
-        // eR(31): encode = (31 << 2) | 0b00 = 124
-        assert_eq!(decode_lda_scl(124), Operand::ScalarReg(31));
-    }
+    fn test_composite_lut_dispatch() {
+        use crate::interpreter::decode::composite::CompositeLuts;
+        let luts = CompositeLuts::build();
 
-    #[test]
-    fn test_decode_lda_scl_pointer() {
-        // eP(0): encode = (0 << 4) | 0b1101 = 13
-        assert_eq!(decode_lda_scl(13), Operand::PointerReg(0));
-        // eP(3): encode = (3 << 4) | 0b1101 = 61
-        assert_eq!(decode_lda_scl(61), Operand::PointerReg(3));
-        // eP(7): encode = (7 << 4) | 0b1101 = 125
-        assert_eq!(decode_lda_scl(125), Operand::PointerReg(7));
-    }
-
-    #[test]
-    fn test_decode_lda_scl_lr() {
-        // lr: encode = 0b0000101 = 5
-        use crate::interpreter::state::LR_REG_INDEX;
-        assert_eq!(decode_lda_scl(5), Operand::ScalarReg(LR_REG_INDEX));
-    }
-
-    #[test]
-    fn test_decode_lda_scl_modifier() {
-        // eM(0): encode = ((0 | 0b00000) << 2) | 0b10 = 2
-        assert_eq!(decode_lda_scl(2), Operand::ModifierReg(0));
-        // eM(3): encode = ((3 | 0b00000) << 2) | 0b10 = 14
-        assert_eq!(decode_lda_scl(14), Operand::ModifierReg(3));
-        // eDN(0): encode = ((0 | 0b01000) << 2) | 0b10 = 34
-        assert_eq!(decode_lda_scl(34), Operand::ModifierReg(8));
-        // eDJ(0): encode = ((0 | 0b10000) << 2) | 0b10 = 66
-        assert_eq!(decode_lda_scl(66), Operand::ModifierReg(16));
-        // eDC(0): encode = ((0 | 0b11000) << 2) | 0b10 = 98
-        assert_eq!(decode_lda_scl(98), Operand::ModifierReg(24));
-    }
-
-    #[test]
-    fn test_decode_mv_scl_src_scalar() {
-        // eR(7): encode = (7 << 2) | 0b00 = 28
-        assert_eq!(decode_mv_scl_src(28), Operand::ScalarReg(7));
-        // eR(0): encode = 0
-        assert_eq!(decode_mv_scl_src(0), Operand::ScalarReg(0));
-    }
-
-    #[test]
-    fn test_decode_mv_scl_src_pointer() {
-        // eP(3): encode = (3 << 4) | 0b0011 = 51
-        assert_eq!(decode_mv_scl_src(51), Operand::PointerReg(3));
-        // eP(0): encode = (0 << 4) | 0b0011 = 3
-        assert_eq!(decode_mv_scl_src(3), Operand::PointerReg(0));
-        // eP(7): encode = (7 << 4) | 0b0011 = 115
-        assert_eq!(decode_mv_scl_src(115), Operand::PointerReg(7));
-    }
-
-    #[test]
-    fn test_decode_mv_scl_src_special() {
-        use crate::interpreter::state::*;
-        // SP: HWEncoding = 103 = 0b1100111 (bits[2:0] = 0b111, bits[6:3] = 12)
-        assert_eq!(decode_mv_scl_src(103), Operand::PointerReg(6)); // SP = p6
-        // LC: HWEncoding = 87 = 0b1010111
-        assert_eq!(decode_mv_scl_src(87), Operand::ScalarReg(LC_REG_INDEX));
-        // lr: HWEncoding = 39 = 0b0100111
-        assert_eq!(decode_mv_scl_src(39), Operand::ScalarReg(LR_REG_INDEX));
-        // LS: HWEncoding = 7 = 0b0000111
-        assert_eq!(decode_mv_scl_src(7), Operand::ScalarReg(LS_REG_INDEX));
-        // LE: HWEncoding = 71 = 0b1000111
-        assert_eq!(decode_mv_scl_src(71), Operand::ScalarReg(LE_REG_INDEX));
-        // DP: HWEncoding = 23 = 0b0010111
-        assert_eq!(decode_mv_scl_src(23), Operand::ScalarReg(DP_REG_INDEX));
-        // CORE_ID: HWEncoding = 55 = 0b0110111
-        assert_eq!(decode_mv_scl_src(55), Operand::ScalarReg(CORE_ID_REG_INDEX));
-    }
-
-    #[test]
-    fn test_decode_lda_cg_scalar() {
-        // eR(7): encode = (7 << 2) | 0b00 = 28
-        assert_eq!(decode_lda_cg(28), Operand::ScalarReg(7));
-    }
-
-    #[test]
-    fn test_decode_lda_cg_pointer() {
-        // eP(3): encode = (3 << 4) | 0b1101 = 61
-        assert_eq!(decode_lda_cg(61), Operand::PointerReg(3));
-    }
-
-    #[test]
-    fn test_decode_lda_cg_lc() {
-        use crate::interpreter::state::LC_REG_INDEX;
-        // LC: encode = 0b0010101 = 21
-        assert_eq!(decode_lda_cg(21), Operand::ScalarReg(LC_REG_INDEX));
-    }
-
-    #[test]
-    fn test_decode_alu_cg() {
-        use crate::interpreter::state::LC_REG_INDEX;
-        // eR(7): encode = 7 << 1 = 14
-        assert_eq!(decode_alu_cg(14), Operand::ScalarReg(7));
-        // LC: encode = 0b000001 = 1
-        assert_eq!(decode_alu_cg(1), Operand::ScalarReg(LC_REG_INDEX));
-    }
-
-    #[test]
-    fn test_decode_mv_bmx_src() {
-        // mBMm(0): encode = (0 << 4) | 0b0000 = 0
-        assert_eq!(decode_mv_bmx_src(0), Operand::AccumReg(0));
-        // mBMm(3): encode = (3 << 4) | 0b0000 = 48
-        assert_eq!(decode_mv_bmx_src(48), Operand::AccumReg(3));
-        // mXm(5): encode = (0b11000 << 4) | 5 = 389
-        assert_eq!(decode_mv_bmx_src(389), Operand::VectorReg(5));
-    }
-
-    #[test]
-    fn test_decode_mv_bmx_dst() {
-        // mBMm(2): encode = (2 << 1) | 0b1 = 5
-        assert_eq!(decode_mv_bmx_dst(5), Operand::AccumReg(2));
-        // mXm(3): encode = (3 << 2) | 0b00 = 12
-        assert_eq!(decode_mv_bmx_dst(12), Operand::VectorReg(3));
-    }
-
-    #[test]
-    fn test_decode_ers4() {
-        // eRS4 register 16: encode = 16 - 16 = 0
-        assert_eq!(decode_ers4(0), Operand::ScalarReg(16));
-        // eRS4 register 31: encode = 31 - 16 = 15
-        assert_eq!(decode_ers4(15), Operand::ScalarReg(31));
-    }
-
-    #[test]
-    fn test_decode_shfl_dst() {
-        // mXm(3): encode = (3 << 1) | 0b0 = 6
-        assert_eq!(decode_shfl_dst(6), Operand::VectorReg(3));
-        // mXm(0): encode = (0 << 1) | 0b0 = 0
-        assert_eq!(decode_shfl_dst(0), Operand::VectorReg(0));
-    }
-
-    #[test]
-    fn test_decode_qxhlb() {
-        // mQXHb(2): encode = (2 << 1) | 0b0 = 4
-        assert_eq!(decode_qxhlb(4), Operand::AccumReg(2));
-        // mQXLb(2): encode = (2 << 1) | 0b1 = 5
-        assert_eq!(decode_qxhlb(5), Operand::AccumReg(2));
-    }
-
-    #[test]
-    fn test_decode_composite_dispatch() {
-        // Verify the dispatch function routes correctly
-        // LdaScl: eR(7) = 28
+        // LdaScl: eR(7) = (7 << 2) | 0b00 = 28
         assert_eq!(
-            decode_composite(CompositeEncoder::LdaScl, 28),
+            luts.decode(CompositeEncoder::LdaScl, 28),
             Operand::ScalarReg(7)
         );
-        // MvSclSrc: eP(3) = 51
+        // MvSclSrc: eP(3) = (3 << 4) | 0b0011 = 51
         assert_eq!(
-            decode_composite(CompositeEncoder::MvSclSrc, 51),
+            luts.decode(CompositeEncoder::MvSclSrc, 51),
             Operand::PointerReg(3)
         );
-        // AluCg: eR(5) = 10
+        // AluCg: eR(5) = 5 << 1 = 10
         assert_eq!(
-            decode_composite(CompositeEncoder::AluCg, 10),
+            luts.decode(CompositeEncoder::AluCg, 10),
             Operand::ScalarReg(5)
         );
     }
@@ -2115,9 +1634,9 @@ mod tests {
         // Case 4: movxm lr, #0x1234
         // lr in MvSclSrc: HWEncoding = 39 = (4 << 3) | 0b111
         // The OLD special case got this wrong: 39 & 0x3 == 3, so it decoded
-        // as PointerReg((39 >> 4) & 0x7) = PointerReg(2). The generic
-        // decode_mv_scl_src checks bits[2:0] == 0b111 first, correctly
-        // routing to ScalarReg(LR_REG_INDEX).
+        // as PointerReg((39 >> 4) & 0x7) = PointerReg(2). The MvSclSrc LUT
+        // checks bits[2:0] == 0b111 first, correctly routing to
+        // ScalarReg(LR_REG_INDEX).
         let bits = build_movxm(0x1234, 39);
         let decoded = decoder.decode_slot_bits(bits, SlotType::Lng)
             .expect("Should decode movxm lr, #0x1234");
@@ -2129,6 +1648,9 @@ mod tests {
 
     #[test]
     fn test_lda_scl_vs_mv_scl_pointer_encoding_differs() {
+        use crate::interpreter::decode::composite::CompositeLuts;
+        let luts = CompositeLuts::build();
+
         // This is THE critical test: the same pointer register (p3) encodes
         // differently in LdaScl vs MvSclSrc. The old heuristic code got this wrong.
         //
@@ -2137,13 +1659,13 @@ mod tests {
         //
         // Decoding 61 with MvSclSrc would give the wrong register,
         // and decoding 51 with LdaScl would also be wrong.
-        assert_eq!(decode_lda_scl(61), Operand::PointerReg(3));
-        assert_eq!(decode_mv_scl_src(51), Operand::PointerReg(3));
+        assert_eq!(luts.decode(CompositeEncoder::LdaScl, 61), Operand::PointerReg(3));
+        assert_eq!(luts.decode(CompositeEncoder::MvSclSrc, 51), Operand::PointerReg(3));
 
         // Cross-check: 51 through LdaScl should NOT give p3
         // 51 = 0b0110011, low 4 bits = 0b0011, not 0b1101, so it's not a pointer in LdaScl
         // low 2 bits = 0b11, which doesn't match any LdaScl pattern cleanly
-        let cross = decode_lda_scl(51);
+        let cross = luts.decode(CompositeEncoder::LdaScl, 51);
         assert_ne!(cross, Operand::PointerReg(3),
             "LdaScl(51) should NOT decode as p3 -- different encoding scheme");
     }

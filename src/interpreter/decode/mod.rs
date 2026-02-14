@@ -37,6 +37,7 @@
 //! ```
 
 mod decoder;
+pub(crate) mod composite;
 
 pub use decoder::{DecodedInstr, InstructionDecoder};
 
