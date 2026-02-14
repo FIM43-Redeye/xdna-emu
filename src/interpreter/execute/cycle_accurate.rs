@@ -395,12 +395,20 @@ impl CycleAccurateExecutor {
             SlotIndex::Control,
         ];
 
-        // AIE2 uses slot chaining, NOT pure VLIW read-before-write semantics.
-        // Within a bundle, earlier slots' results ARE forwarded to later slots.
-        // The compiler explicitly relies on this: it puts `lda r13, [p5]` and
-        // `add r13, r15, r13` in the same bundle, expecting the load result to
-        // be available to the ALU. Our execution order (Load→Store→Scalar→Vector)
-        // naturally provides this forwarding.
+        // Commit deferred load results whose latency has elapsed.
+        // This must happen BEFORE the VLIW snapshot so that load results
+        // become visible at the correct cycle and are captured by begin_bundle().
+        ctx.commit_pending_writes();
+
+        // AIE2 uses pure VLIW semantics: all reads within a bundle see the
+        // pre-execution values. This is confirmed by the llvm-aie scheduling
+        // model (AIE2Schedule.td) and hazard recognizer which handle data
+        // dependencies only across bundles, not within them.
+        //
+        // The begin_bundle snapshot ensures that when `lda r13, [p5]` and
+        // `or r3, r13, r0` are in the same bundle, the OR reads r13's value
+        // from BEFORE the load writes it.
+        ctx.begin_bundle();
 
         for slot_idx in &execution_order {
             if let Some(ref op) = bundle.slots()[*slot_idx as usize] {
@@ -424,6 +432,8 @@ impl CycleAccurateExecutor {
                 }
             }
         }
+
+        ctx.end_bundle();
 
         // Phase 3: Record writes and memory accesses for future hazard detection
         for op in bundle.active_slots() {
@@ -622,6 +632,9 @@ mod tests {
 
         executor.execute(&bundle, &mut ctx, &mut tile);
 
+        // Load results are deferred -- commit them now that the latency has elapsed.
+        // In normal execution, this happens at the start of the next bundle.
+        ctx.flush_pending_writes();
         assert_eq!(ctx.scalar.read(0), 42);
         assert_eq!(ctx.cycles, 5); // 5 cycles for memory load
     }

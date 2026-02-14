@@ -6,7 +6,7 @@
 //! |---------------|-------|-------|---------|
 //! | Scalar GPR | 32 | 32-bit | General purpose integers |
 //! | Pointer | 8 | 20-bit | Memory addressing |
-//! | Modifier | 8 | 20-bit | Post-modify addressing |
+//! | Modifier | 32 | 20-bit | Post-modify + AGU (m/dn/dj/dc) |
 //! | Vector | 32 | 256-bit | SIMD operations |
 //! | Accumulator | 8 | 512-bit | MAC operations |
 //!
@@ -39,11 +39,13 @@ pub use registers::{
     NUM_SCALAR_REGS, NUM_SCALAR_GPRS,
     LR_REG_INDEX, LS_REG_INDEX, LE_REG_INDEX, LC_REG_INDEX,
     DP_REG_INDEX, CORE_ID_REG_INDEX,
+    // Modifier register sub-class base indices.
+    MOD_BASE_M, MOD_BASE_DN, MOD_BASE_DJ, MOD_BASE_DC,
 };
 pub use context::{
     ExecutionContext, SpRegister, TimingContext,
     EventLog, EventType, TimestampedEvent,
-    PendingBranch,
+    PendingBranch, PendingWrite,
 };
 
 #[cfg(test)]

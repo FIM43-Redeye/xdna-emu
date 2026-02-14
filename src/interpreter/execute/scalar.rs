@@ -94,6 +94,8 @@ impl ScalarAlu {
             Operation::ScalarAdd => {
                 let (a, b) = Self::get_two_sources(op, ctx);
                 let result = a.wrapping_add(b);
+                log::trace!("[ADD] a={} b={} result={} dest={:?} srcs={:?}",
+                    a, b, result, op.dest, op.sources);
                 Self::write_dest(op, ctx, result);
                 ctx.set_flags(Flags::from_add(a, b, result));
                 true

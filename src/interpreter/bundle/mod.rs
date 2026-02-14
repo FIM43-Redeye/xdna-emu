@@ -509,7 +509,13 @@ fn operand_str(op: &Operand) -> String {
         Operand::VectorReg(r) => format!("v{}", r),
         Operand::AccumReg(r) => format!("acc{}", r),
         Operand::PointerReg(r) => format!("p{}", r),
-        Operand::ModifierReg(r) => format!("m{}", r),
+        Operand::ModifierReg(r) => match r {
+            0..=7 => format!("m{}", r),
+            8..=15 => format!("dn{}", r - 8),
+            16..=23 => format!("dj{}", r - 16),
+            24..=31 => format!("dc{}", r - 24),
+            _ => format!("mod{}", r),
+        },
         Operand::Immediate(v) => format!("#{}", v),
         Operand::Memory { base, offset } => {
             if *offset == 0 {

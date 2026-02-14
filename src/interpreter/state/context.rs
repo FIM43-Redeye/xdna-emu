@@ -21,8 +21,31 @@ use super::registers::{
     AccumulatorRegisterFile, ModifierRegisterFile, PointerRegisterFile, ScalarRegisterFile,
     VectorRegisterFile,
 };
+use crate::interpreter::bundle::Operand;
 use crate::interpreter::timing::{HazardDetector, HazardType, LatencyTable, MemoryModel};
 use crate::interpreter::traits::{Flags, StateAccess};
+
+// ============================================================================
+// Load Latency: Pending Write Queue
+// ============================================================================
+
+/// A deferred register write from a memory load operation.
+///
+/// AIE2 memory loads have a 5-cycle pipeline latency (AM020 Ch4). The compiler
+/// pipelines multiple loads to the same register, relying on this latency to
+/// keep earlier values alive until they are consumed. Without deferred writes,
+/// later loads instantly overwrite earlier values, breaking the pipeline.
+#[derive(Debug, Clone)]
+pub struct PendingWrite {
+    /// Destination register to write when ready.
+    pub dest: Operand,
+    /// Value to write (scalar: lower 32 bits; vector: use vec_value).
+    pub scalar_value: u32,
+    /// Vector value for vector loads (None for scalar loads).
+    pub vec_value: Option<[u32; 8]>,
+    /// Cycle at which this write becomes visible.
+    pub ready_cycle: u64,
+}
 
 // ============================================================================
 // Event Tracing
@@ -373,6 +396,12 @@ pub struct ExecutionContext {
     /// AIE2 has 5-cycle branch delay slots - after a branch is decided,
     /// the next 5 instructions still execute before the branch takes effect.
     pending_branch: Option<PendingBranch>,
+
+    // === Load Latency Pipeline ===
+    /// Deferred register writes from memory load operations.
+    /// Loads have a 5-cycle pipeline latency (AM020 Ch4). The write to the
+    /// destination register is deferred until `ready_cycle` is reached.
+    pending_writes: Vec<PendingWrite>,
 }
 
 /// Which register to use as stack pointer.
@@ -425,6 +454,7 @@ impl ExecutionContext {
             pointer_snapshot: None,
             modifier_snapshot: None,
             pending_branch: None,
+            pending_writes: Vec::new(),
         }
     }
 
@@ -591,6 +621,79 @@ impl ExecutionContext {
         self.scalar_snapshot = None;
         self.pointer_snapshot = None;
         self.modifier_snapshot = None;
+    }
+
+    // === Load Latency Methods ===
+
+    /// Queue a scalar load result for deferred register write.
+    ///
+    /// The write will become visible after `latency` cycles, modeling
+    /// the AIE2 memory load pipeline.
+    pub fn queue_scalar_load(&mut self, dest: Operand, value: u32, latency: u64) {
+        self.pending_writes.push(PendingWrite {
+            dest,
+            scalar_value: value,
+            vec_value: None,
+            ready_cycle: self.cycles + latency,
+        });
+    }
+
+    /// Queue a vector load result for deferred register write.
+    pub fn queue_vector_load(&mut self, dest: Operand, value: [u32; 8], latency: u64) {
+        self.pending_writes.push(PendingWrite {
+            dest,
+            scalar_value: 0,
+            vec_value: Some(value),
+            ready_cycle: self.cycles + latency,
+        });
+    }
+
+    /// Flush all pending writes immediately, ignoring cycle timing.
+    ///
+    /// Used in unit tests where memory operations are tested in isolation
+    /// without the cycle-accurate executor. Production code should use
+    /// `commit_pending_writes()` instead.
+    #[cfg(test)]
+    pub fn flush_pending_writes(&mut self) {
+        let writes: Vec<_> = self.pending_writes.drain(..).collect();
+        for pw in &writes {
+            self.apply_pending_write(pw);
+        }
+    }
+
+    /// Commit all pending writes whose ready_cycle has been reached.
+    ///
+    /// Call this at the start of each cycle, BEFORE begin_bundle(), so that
+    /// load results become visible at the correct time and are captured by
+    /// the VLIW snapshot.
+    pub fn commit_pending_writes(&mut self) {
+        let current = self.cycles;
+        // Partition: keep writes not yet ready, commit the rest
+        let mut i = 0;
+        while i < self.pending_writes.len() {
+            if self.pending_writes[i].ready_cycle <= current {
+                let pw = self.pending_writes.swap_remove(i);
+                self.apply_pending_write(&pw);
+                // Don't increment i -- swap_remove moved last element here
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Apply a single pending write to the register file.
+    fn apply_pending_write(&mut self, pw: &PendingWrite) {
+        match &pw.dest {
+            Operand::ScalarReg(r) => self.scalar.write(*r, pw.scalar_value),
+            Operand::PointerReg(r) => self.pointer.write(*r, pw.scalar_value),
+            Operand::ModifierReg(r) => self.modifier.write(*r, pw.scalar_value),
+            Operand::VectorReg(r) => {
+                if let Some(vec) = &pw.vec_value {
+                    self.vector.write(*r, *vec);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Read a scalar register with VLIW semantics.

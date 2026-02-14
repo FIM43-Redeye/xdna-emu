@@ -52,6 +52,7 @@
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{ElementType, MemWidth, Operation, Operand, PostModify, SlotOp};
 use crate::interpreter::state::ExecutionContext;
+use crate::interpreter::timing::LATENCY_MEMORY;
 
 /// Address mask for local tile memory (64KB).
 /// Addresses from the AGU span 0x0000-0x3FFFF (256KB across 4 neighbors),
@@ -175,14 +176,17 @@ impl MemoryUnit {
         // Get address from source operand
         let addr = Self::get_address(op, ctx);
 
+        log::trace!("[LOAD] addr=0x{:X} width={:?} dest={:?} srcs={:?}",
+            addr, width, op.dest, op.sources);
+
         // Handle full vector loads specially
         if width == MemWidth::Vector256 {
             let vec_data = Self::read_vector_from_memory(tile, addr);
-            if let Some(Operand::VectorReg(r)) = &op.dest {
-                ctx.vector.write(*r, vec_data);
+            if let Some(dest) = &op.dest {
+                ctx.queue_vector_load(dest.clone(), vec_data, LATENCY_MEMORY as u64);
             }
         } else {
-            // Scalar/partial loads
+            // Scalar/partial loads go through write_dest (which queues)
             let value = Self::read_memory(tile, addr, width);
             Self::write_dest(op, ctx, value, width);
         }
@@ -244,12 +248,12 @@ impl MemoryUnit {
         // Read 256 bits (32 bytes) from memory
         let vec_data = Self::read_vector_from_memory(tile, addr);
 
-        // Write to destination vector register
-        if let Some(Operand::VectorReg(r)) = &op.dest {
-            ctx.vector.write(*r, vec_data);
+        // Queue deferred write to destination vector register
+        if let Some(dest) = &op.dest {
+            ctx.queue_vector_load(dest.clone(), vec_data, LATENCY_MEMORY as u64);
         }
 
-        // Apply post-modify (vector width = 32 bytes)
+        // Apply post-modify immediately (pointer update is not deferred)
         Self::apply_post_modify(op, ctx, post_modify);
     }
 
@@ -269,12 +273,12 @@ impl MemoryUnit {
         // Read 256 bits (32 bytes) from memory
         let vec_data = Self::read_vector_from_memory(tile, addr);
 
-        // Write to destination vector register
-        if let Some(Operand::VectorReg(r)) = &op.dest {
-            ctx.vector.write(*r, vec_data);
+        // Queue deferred write to destination vector register
+        if let Some(dest) = &op.dest {
+            ctx.queue_vector_load(dest.clone(), vec_data, LATENCY_MEMORY as u64);
         }
 
-        // Apply post-modify (vector width = 32 bytes)
+        // Apply post-modify immediately (pointer update is not deferred)
         Self::apply_post_modify(op, ctx, post_modify);
     }
 
@@ -373,9 +377,9 @@ impl MemoryUnit {
             }
         }
 
-        // Write to destination vector register
-        if let Some(Operand::VectorReg(r)) = &op.dest {
-            ctx.vector.write(*r, result);
+        // Queue deferred write to destination vector register
+        if let Some(dest) = &op.dest {
+            ctx.queue_vector_load(dest.clone(), result, LATENCY_MEMORY as u64);
         }
 
         // Apply post-modify based on source bytes read
@@ -667,26 +671,30 @@ impl MemoryUnit {
         }
     }
 
-    /// Write loaded value to destination register.
+    /// Queue a loaded scalar value for deferred write to the destination register.
+    ///
+    /// Load results are deferred by LATENCY_MEMORY cycles to model the AIE2
+    /// memory pipeline. The compiler relies on this latency to pipeline
+    /// multiple loads to the same register.
     fn write_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: u64, width: MemWidth) {
         if let Some(dest) = &op.dest {
+            let latency = LATENCY_MEMORY as u64;
             match dest {
-                Operand::ScalarReg(r) => {
-                    ctx.scalar.write(*r, value as u32);
+                Operand::ScalarReg(_)
+                | Operand::PointerReg(_)
+                | Operand::ModifierReg(_) => {
+                    ctx.queue_scalar_load(dest.clone(), value as u32, latency);
                 }
-                Operand::VectorReg(r) => {
+                Operand::VectorReg(_) => {
                     if width == MemWidth::Vector256 {
-                        // Would need to read full 256 bits from memory
-                        // For now, put value in first two lanes
                         let mut vec = [0u32; 8];
                         vec[0] = value as u32;
                         vec[1] = (value >> 32) as u32;
-                        ctx.vector.write(*r, vec);
+                        ctx.queue_vector_load(dest.clone(), vec, latency);
                     } else {
-                        // Scalar value into lane 0
                         let mut vec = [0u32; 8];
                         vec[0] = value as u32;
-                        ctx.vector.write(*r, vec);
+                        ctx.queue_vector_load(dest.clone(), vec, latency);
                     }
                 }
                 _ => {}
@@ -798,6 +806,7 @@ mod tests {
         .with_source(Operand::PointerReg(0));
 
         assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile));
+        ctx.flush_pending_writes();
         assert_eq!(ctx.scalar.read(0), 0xDEAD_BEEF);
     }
 
@@ -821,6 +830,7 @@ mod tests {
         .with_source(Operand::Memory { base: 0, offset: 8 });
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        ctx.flush_pending_writes();
         assert_eq!(ctx.scalar.read(0), 0xCAFE_BABE);
     }
 
@@ -844,6 +854,7 @@ mod tests {
         .with_source(Operand::PointerReg(0));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        ctx.flush_pending_writes();
         assert_eq!(ctx.scalar.read(0), 0x1234_5678);
         assert_eq!(ctx.pointer.read(0), 0x104); // Post-modified
     }
@@ -869,6 +880,7 @@ mod tests {
         .with_source(Operand::PointerReg(0));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        ctx.flush_pending_writes();
         assert_eq!(ctx.scalar.read(0), 0xABCD);
         assert_eq!(ctx.pointer.read(0), 0x110);
     }
@@ -915,6 +927,7 @@ mod tests {
         .with_source(Operand::PointerReg(0));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        ctx.flush_pending_writes();
         assert_eq!(ctx.scalar.read(0), 0xAB);
     }
 
@@ -938,6 +951,7 @@ mod tests {
         .with_source(Operand::PointerReg(0));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        ctx.flush_pending_writes();
         assert_eq!(ctx.scalar.read(0), 0xABCD);
     }
 
@@ -985,6 +999,7 @@ mod tests {
         .with_source(Operand::PointerReg(0));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        ctx.flush_pending_writes();
 
         // Verify all 8 lanes were loaded correctly
         let loaded = ctx.vector.read(0);
@@ -1051,6 +1066,7 @@ mod tests {
         .with_source(Operand::PointerReg(0));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        ctx.flush_pending_writes();
 
         assert_eq!(ctx.vector.read(0), test_data);
         assert_eq!(ctx.pointer.read(0), 0x620); // 0x600 + 32
@@ -1078,6 +1094,7 @@ mod tests {
         .with_source(Operand::PointerReg(0));
 
         assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile));
+        ctx.flush_pending_writes();
         assert_eq!(ctx.vector.read(2), test_data);
         assert_eq!(ctx.pointer.read(0), 0x700); // No post-modify
     }
@@ -1102,6 +1119,7 @@ mod tests {
         .with_source(Operand::PointerReg(1));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        ctx.flush_pending_writes();
         assert_eq!(ctx.vector.read(0), test_data);
         assert_eq!(ctx.pointer.read(1), 0x820); // 0x800 + 32
     }
@@ -1127,6 +1145,7 @@ mod tests {
         .with_source(Operand::PointerReg(4));
 
         assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile));
+        ctx.flush_pending_writes();
         assert_eq!(ctx.vector.read(3), test_data);
     }
 
@@ -1151,6 +1170,7 @@ mod tests {
         .with_source(Operand::PointerReg(5));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        ctx.flush_pending_writes();
         assert_eq!(ctx.vector.read(1), test_data);
         assert_eq!(ctx.pointer.read(5), 0xA40); // 0xA00 + 64
     }
@@ -1234,6 +1254,7 @@ mod tests {
         .with_source(Operand::PointerReg(0));
 
         assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile));
+        ctx.flush_pending_writes();
 
         let result = ctx.vector.read(6);
         // Each byte should be zero-extended to 32 bits
@@ -1279,6 +1300,7 @@ mod tests {
         .with_source(Operand::PointerReg(1));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        ctx.flush_pending_writes();
 
         let result = ctx.vector.read(7);
         assert_eq!(result[0] as i32, -1);
@@ -1321,6 +1343,7 @@ mod tests {
         .with_source(Operand::PointerReg(2));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        ctx.flush_pending_writes();
 
         let result = ctx.vector.read(0);
         assert_eq!(result[0] as i32, 100);

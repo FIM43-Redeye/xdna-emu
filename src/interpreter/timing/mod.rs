@@ -41,7 +41,7 @@ pub mod barrier;
 pub mod slots;
 pub mod arbitration;
 
-pub use latency::{LatencyTable, OperationTiming};
+pub use latency::{LatencyTable, OperationTiming, LATENCY_MEMORY};
 pub use memory::{MemoryModel, MemoryAccess, BankConflict, AlignmentError, MemoryQuadrant, CROSS_TILE_LATENCY};
 pub use hazards::{HazardDetector, HazardType, HazardStats, Hazard, StallReason};
 pub use sync::{LockTimingState, LockStats, SyncTimingConfig, AggregateStats};

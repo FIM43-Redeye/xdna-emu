@@ -29,6 +29,7 @@ use crate::interpreter::bundle::{
     BranchCondition, ElementType, MemWidth, Operand, Operation, PostModify, SelectVariant,
     SlotIndex, SlotOp, VliwBundle,
 };
+use crate::interpreter::state::{MOD_BASE_DJ, MOD_BASE_M};
 use crate::interpreter::traits::{DecodeError, Decoder};
 use crate::tablegen::{
     build_decoder_tables, load_from_llvm_aie, load_via_tblgen, AddressingMode, CompositeEncoder,
@@ -1029,8 +1030,9 @@ impl InstructionDecoder {
                 *extracted_post_modify = Some(PostModify::Immediate(imm_bytes as i16));
             }
             AddressingMode::IndexedRegister => {
+                // Indexed addressing uses dj (stride) registers: addr = ptr + dj_n
                 let ptr = ((value >> (field.width as u64 - 3)) & 0x7) as u8;
-                let mod_reg = ((value >> 3) & 0x7) as u8;
+                let mod_reg = ((value >> 3) & 0x7) as u8 + MOD_BASE_DJ;
                 if decoded.encoding.is_ptr_arithmetic {
                     *direct_dest = Some(Operand::PointerReg(ptr));
                     extra_sources.push(Operand::ModifierReg(mod_reg));
@@ -1040,8 +1042,9 @@ impl InstructionDecoder {
                 }
             }
             AddressingMode::PostModifyRegister => {
+                // Post-modify uses m (modifier) registers: addr = ptr, then ptr += m_n
                 let ptr = ((value >> (field.width as u64 - 3)) & 0x7) as u8;
-                let mod_reg = ((value >> 3) & 0x7) as u8;
+                let mod_reg = ((value >> 3) & 0x7) as u8 + MOD_BASE_M;
                 extra_sources.push(Operand::PointerReg(ptr));
                 *extracted_post_modify = Some(PostModify::Register(mod_reg));
             }

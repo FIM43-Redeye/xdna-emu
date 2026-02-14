@@ -43,7 +43,20 @@ pub const CORE_ID_REG_INDEX: u8 = 37;
 pub const NUM_POINTER_REGS: usize = 8;
 
 /// Number of modifier registers.
-pub const NUM_MODIFIER_REGS: usize = 8;
+///
+/// AIE2 has 8 composite 80-bit "d" registers (d0-d7), each containing
+/// four 20-bit sub-registers:
+///   - m0-m7 (sub_mod):        indices 0-7   -- post-modify values
+///   - dn0-dn7 (sub_dim_size): indices 8-15  -- dimension size
+///   - dj0-dj7 (sub_dim_stride): indices 16-23 -- dimension stride/jump
+///   - dc0-dc7 (sub_dim_count): indices 24-31 -- dimension count
+pub const NUM_MODIFIER_REGS: usize = 32;
+
+/// Base index for modifier sub-classes within the modifier register file.
+pub const MOD_BASE_M: u8 = 0;
+pub const MOD_BASE_DN: u8 = 8;
+pub const MOD_BASE_DJ: u8 = 16;
+pub const MOD_BASE_DC: u8 = 24;
 
 /// Number of vector registers.
 pub const NUM_VECTOR_REGS: usize = 32;
@@ -197,8 +210,12 @@ impl fmt::Debug for PointerRegisterFile {
 
 /// Modifier register file.
 ///
-/// 8 × 20-bit registers (m0-m7) for post-modify addressing.
-/// After a load/store, the modifier is added to the pointer.
+/// 32 × 20-bit registers: 4 sub-classes of 8 registers each.
+/// Each sub-class corresponds to a 20-bit slice of the composite d0-d7 registers:
+///   - m0-m7 (indices 0-7): post-modify values
+///   - dn0-dn7 (indices 8-15): dimension size (AGU)
+///   - dj0-dj7 (indices 16-23): dimension stride/jump (AGU)
+///   - dc0-dc7 (indices 24-31): dimension count (AGU)
 #[derive(Clone)]
 pub struct ModifierRegisterFile {
     regs: [u32; NUM_MODIFIER_REGS],
@@ -218,10 +235,13 @@ impl ModifierRegisterFile {
         }
     }
 
-    /// Read a modifier register (0-7).
+    /// Read a modifier register (0-31).
+    ///
+    /// Indices: m0-m7 = 0-7, dn0-dn7 = 8-15, dj0-dj7 = 16-23, dc0-dc7 = 24-31.
     #[inline]
     pub fn read(&self, reg: u8) -> u32 {
-        self.regs[(reg & 0x07) as usize]
+        let idx = (reg as usize) % NUM_MODIFIER_REGS;
+        self.regs[idx]
     }
 
     /// Read as signed value (sign-extended from 20 bits).
@@ -236,11 +256,14 @@ impl ModifierRegisterFile {
         }
     }
 
-    /// Write a modifier register (0-7).
+    /// Write a modifier register (0-31).
     /// Value is masked to 20 bits.
+    ///
+    /// Indices: m0-m7 = 0-7, dn0-dn7 = 8-15, dj0-dj7 = 16-23, dc0-dc7 = 24-31.
     #[inline]
     pub fn write(&mut self, reg: u8, value: u32) {
-        self.regs[(reg & 0x07) as usize] = value & PTR_MASK;
+        let idx = (reg as usize) % NUM_MODIFIER_REGS;
+        self.regs[idx] = value & PTR_MASK;
     }
 }
 
@@ -261,7 +284,14 @@ impl fmt::Debug for ModifierRegisterFile {
                 if i > 0 {
                     write!(f, ", ")?;
                 }
-                write!(f, "m{}: 0x{:05X}", reg, val)?;
+                let name = match *reg {
+                    0..=7 => format!("m{}", reg),
+                    8..=15 => format!("dn{}", reg - 8),
+                    16..=23 => format!("dj{}", reg - 16),
+                    24..=31 => format!("dc{}", reg - 24),
+                    _ => format!("mod{}", reg),
+                };
+                write!(f, "{}: 0x{:05X}", name, val)?;
             }
             write!(f, " }}")
         }
@@ -559,6 +589,23 @@ mod tests {
         // Negative value (sign bit set in 20-bit)
         regs.write(1, 0x000F_FF00); // -256 in 20-bit signed
         assert_eq!(regs.read_signed(1), -256);
+    }
+
+    #[test]
+    fn test_modifier_subclasses_are_independent() {
+        let mut regs = ModifierRegisterFile::new();
+
+        // m0, dn0, dj0, dc0 are all sub-registers of d0 but at different
+        // bit positions. They should be independent in our flat model.
+        regs.write(MOD_BASE_M + 0, 0x111);       // m0
+        regs.write(MOD_BASE_DN + 0, 0x222);      // dn0
+        regs.write(MOD_BASE_DJ + 0, 0x333);      // dj0
+        regs.write(MOD_BASE_DC + 0, 0x444);      // dc0
+
+        assert_eq!(regs.read(MOD_BASE_M + 0), 0x111);   // m0 unchanged
+        assert_eq!(regs.read(MOD_BASE_DN + 0), 0x222);   // dn0 unchanged
+        assert_eq!(regs.read(MOD_BASE_DJ + 0), 0x333);   // dj0 unchanged
+        assert_eq!(regs.read(MOD_BASE_DC + 0), 0x444);   // dc0 unchanged
     }
 
     // ========== Vector Register Tests ==========
