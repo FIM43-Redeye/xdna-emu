@@ -29,6 +29,28 @@ stdout
 # Documentation drafts (not ready for commit)
 CURRENT-REFACTOR.md
 
+# Build script output
+/build/
+
+# Simulator artifacts
+.AIE_SIM_CMD_LINE_OPTIONS
+AIESimulator.log
+aiesimulator_debug.log
+diag_report.log
+qemu_rp.log
+xcd.log
+xsc_report.log
+
+# Temporary extracted/generated artifacts
+*.pdi
+aie_part.bin
+aie_part.json
+
+# Claude Code session state (user-specific)
+.claude/session-state.md
+.claude/settings.local.json
+.claude/skills/
+
 # OS files
 .DS_Store
 Thumbs.db
