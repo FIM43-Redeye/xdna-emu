@@ -36,7 +36,6 @@ use std::collections::VecDeque;
 
 use super::{
     BdConfig, ChannelType, DmaError, DmaResult,
-    NUM_BUFFER_DESCRIPTORS, MEMTILE_NUM_BUFFER_DESCRIPTORS,
     COMPUTE_S2MM_CHANNELS, COMPUTE_MM2S_CHANNELS,
     MEM_TILE_S2MM_CHANNELS, MEM_TILE_MM2S_CHANNELS,
 };
@@ -44,6 +43,7 @@ use super::transfer::{Transfer, TransferDirection, TransferEndpoint, TransferSta
 use super::timing::{DmaTimingConfig, ChannelTimingState, TransferPhase};
 use crate::device::host_memory::HostMemory;
 use crate::device::tile::{Tile, TileType};
+use crate::interpreter::state::EventType;
 use crate::interpreter::timing::sync::LockTimingState;
 
 /// Stream data word for DMA-to-stream interface.
@@ -95,7 +95,7 @@ pub struct ChannelTaskConfig {
 ///
 /// Per AM025, each channel has an 8-deep task queue. Tasks are enqueued
 /// by writing to the Start_Queue register and processed in FIFO order.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TaskQueueEntry {
     /// Starting BD index for this task
     pub start_bd: u8,
@@ -103,6 +103,10 @@ pub struct TaskQueueEntry {
     pub repeat_count: u8,
     /// Enable token issue when this task completes
     pub enable_token_issue: bool,
+    /// Snapshot of the BD config at enqueue time.
+    /// NPU instructions may overwrite the BD between enqueue and execution,
+    /// so we capture the config when the task enters the queue.
+    pub bd_snapshot: Option<super::BdConfig>,
 }
 
 /// Maximum task queue depth per channel (AM025: 3-bit Task_Queue_Size = 0-7)
@@ -251,22 +255,24 @@ pub struct DmaEngine {
     /// Lock timing state for contention tracking (optional).
     /// When enabled, tracks detailed lock acquire/release timing per lock.
     lock_timing: Option<LockTimingState>,
+
+    /// Current cycle, set by coordinator before each step.
+    /// Used for timestamping trace events.
+    current_cycle: u64,
+
+    /// Trace events generated during this step, drained by coordinator.
+    /// Events are buffered here because DmaEngine doesn't own an EventLog
+    /// directly -- the coordinator collects them after each step.
+    trace_events: Vec<(u64, EventType)>,
 }
 
 impl DmaEngine {
-    /// Create a new DMA engine for a specific tile type.
-    pub fn new(col: u8, row: u8, tile_type: TileType) -> Self {
-        let (num_channels, num_bds) = match tile_type {
-            TileType::MemTile => (
-                MEM_TILE_S2MM_CHANNELS + MEM_TILE_MM2S_CHANNELS,
-                MEMTILE_NUM_BUFFER_DESCRIPTORS,
-            ),
-            TileType::Shim | TileType::Compute => (
-                COMPUTE_S2MM_CHANNELS + COMPUTE_MM2S_CHANNELS,
-                NUM_BUFFER_DESCRIPTORS,
-            ),
-        };
-
+    /// Create a new DMA engine with the given channel and BD counts.
+    ///
+    /// `num_channels` and `num_bds` come from the architecture configuration
+    /// (ArchConfig) rather than compile-time constants. The caller is
+    /// responsible for providing the correct values for the tile type.
+    pub fn new(col: u8, row: u8, tile_type: TileType, num_channels: usize, num_bds: usize) -> Self {
         let mut transfers = Vec::with_capacity(num_channels);
         for _ in 0..num_channels {
             transfers.push(None);
@@ -302,22 +308,31 @@ impl DmaEngine {
             error_bd_unavailable: vec![false; num_channels],
             // Lock timing disabled by default
             lock_timing: None,
+            // Trace event buffer
+            current_cycle: 0,
+            trace_events: Vec::new(),
         }
     }
 
-    /// Create a new DMA engine for a compute tile.
+    /// Create a new DMA engine for a compute tile (NPU1/AIE2 defaults).
+    ///
+    /// Uses hardcoded channel/BD counts matching Phoenix/HawkPoint.
+    /// Production code should use `new()` with ArchConfig-derived values.
     pub fn new_compute_tile(col: u8, row: u8) -> Self {
-        Self::new(col, row, TileType::Compute)
+        Self::new(col, row, TileType::Compute,
+            COMPUTE_S2MM_CHANNELS + COMPUTE_MM2S_CHANNELS, 16)
     }
 
-    /// Create a new DMA engine for a memory tile.
+    /// Create a new DMA engine for a memory tile (NPU1/AIE2 defaults).
     pub fn new_mem_tile(col: u8, row: u8) -> Self {
-        Self::new(col, row, TileType::MemTile)
+        Self::new(col, row, TileType::MemTile,
+            MEM_TILE_S2MM_CHANNELS + MEM_TILE_MM2S_CHANNELS, 48)
     }
 
-    /// Create a new DMA engine for a shim tile.
+    /// Create a new DMA engine for a shim tile (NPU1/AIE2 defaults).
     pub fn new_shim_tile(col: u8, row: u8) -> Self {
-        Self::new(col, row, TileType::Shim)
+        Self::new(col, row, TileType::Shim,
+            COMPUTE_S2MM_CHANNELS + COMPUTE_MM2S_CHANNELS, 16)
     }
 
     /// Configure custom timing parameters.
@@ -354,6 +369,24 @@ impl DmaEngine {
         self.lock_timing.as_mut()
     }
 
+    /// Set the current cycle for trace event timestamps.
+    /// Called by the coordinator before each step.
+    pub fn set_current_cycle(&mut self, cycle: u64) {
+        self.current_cycle = cycle;
+    }
+
+    /// Record a trace event at the current cycle.
+    #[inline]
+    fn trace(&mut self, event: EventType) {
+        self.trace_events.push((self.current_cycle, event));
+    }
+
+    /// Drain all buffered trace events. Called by the coordinator after
+    /// each step to collect events into the global trace log.
+    pub fn drain_trace_events(&mut self) -> Vec<(u64, EventType)> {
+        std::mem::take(&mut self.trace_events)
+    }
+
     /// Get the timing configuration.
     pub fn timing_config(&self) -> &DmaTimingConfig {
         &self.timing_config
@@ -362,6 +395,20 @@ impl DmaEngine {
     /// Get the number of channels.
     pub fn num_channels(&self) -> usize {
         self.transfers.len()
+    }
+
+    /// Get the DMA channel status field layout for this engine's tile type.
+    ///
+    /// Returns the compute tile layout for compute/shim tiles, and the
+    /// memtile layout for memory tiles. The key difference is the `cur_bd`
+    /// field width: 4 bits for compute (16 BDs), 6 bits for memtile (48 BDs).
+    fn status_layout(&self) -> &'static crate::device::regdb::StatusFieldLayout {
+        let layout = crate::device::regdb::device_reg_layout();
+        if self.tile_type.is_mem_tile() {
+            &layout.memtile_status
+        } else {
+            &layout.memory_status
+        }
     }
 
     /// Get the channel type (S2MM or MM2S).
@@ -458,6 +505,9 @@ impl DmaEngine {
             log::info!("DMA tile({},{}) ch{} started BD {} with repeat_count={}",
                 self.col, self.row, channel, bd_index, repeat_count);
         }
+
+        // Emit DMA_START_TASK trace event
+        self.trace(EventType::DmaStartTask { channel });
 
         Ok(())
     }
@@ -665,6 +715,7 @@ impl DmaEngine {
                         any_active = true;
                     } else {
                         self.channel_stats[ch_idx].lock_wait_cycles += 1;
+                        self.trace(EventType::DmaStalledLock { channel: ch_idx as u8 });
                         any_waiting = true;
                     }
                 }
@@ -794,6 +845,7 @@ impl DmaEngine {
                 if result.stall {
                     // S2MM waiting for stream data - don't advance timing, just return
                     // The transfer will try again next cycle when data may be available
+                    self.trace(EventType::DmaStreamStarvation { channel });
                     return;
                 }
 
@@ -1243,10 +1295,18 @@ impl DmaEngine {
         self.channel_stats[ch_idx].transfers_completed += 1;
         self.channel_stats[ch_idx].cycles_spent += transfer.cycles_elapsed;
 
+        // Extract transfer fields before releasing the borrow
+        let next_bd = transfer.next_bd;
+        let bd_index = transfer.bd_index;
+
+        // Emit DMA_FINISHED_BD -- one BD within a task completed.
+        // Push directly to avoid borrow conflict with `transfer`.
+        self.trace_events.push((self.current_cycle, EventType::DmaFinishedBd { channel: ch_idx as u8 }));
+
         // Check for BD chaining first
-        if let Some(next_bd) = transfer.next_bd {
+        if let Some(next_bd) = next_bd {
             log::debug!("DMA tile({},{}) ch{} chaining to BD {} (from BD {})",
-                self.col, self.row, ch_idx, next_bd, transfer.bd_index);
+                self.col, self.row, ch_idx, next_bd, bd_index);
             self.queued_bds[ch_idx] = Some(next_bd);
         }
         // If no chaining, check for repeat count
@@ -1261,6 +1321,8 @@ impl DmaEngine {
         }
         // Task is complete (no chaining, no repeats) - emit token if enabled
         else {
+            // Emit DMA_FINISHED_TASK -- entire task (all BDs and repeats) complete
+            self.trace(EventType::DmaFinishedTask { channel: ch_idx as u8 });
             self.maybe_emit_task_token(ch_idx);
 
             // Check for more tasks in the queue
@@ -1591,11 +1653,15 @@ impl DmaEngine {
             return false;
         }
 
+        // Snapshot the BD config at enqueue time so later overwrites don't affect this task
+        let bd_snapshot = self.bd_configs.get(start_bd as usize).cloned();
+
         // Enqueue the task
         queue.push_back(TaskQueueEntry {
             start_bd,
             repeat_count,
             enable_token_issue,
+            bd_snapshot,
         });
 
         log::debug!(
@@ -1646,6 +1712,16 @@ impl DmaEngine {
             self.col, self.row, channel, task.start_bd, task.repeat_count,
             self.task_queues[ch_idx].len()
         );
+
+        // Restore BD snapshot: NPU instructions may have overwritten the BD
+        // between enqueue time and now. The snapshot preserves the config that
+        // was active when the task was enqueued (matching real hardware behavior).
+        if let Some(snapshot) = task.bd_snapshot {
+            let bd_idx = task.start_bd as usize;
+            if bd_idx < self.bd_configs.len() {
+                self.bd_configs[bd_idx] = snapshot;
+            }
+        }
 
         // Start the channel with the task
         if let Err(e) = self.start_channel_with_repeat(channel, task.start_bd, task.repeat_count) {
@@ -1795,7 +1871,7 @@ impl DmaEngine {
     ///
     /// Additional bits for stall conditions are set based on channel state.
     pub fn get_channel_status(&self, channel: u8) -> u32 {
-        use crate::device::registers_spec::memory_module::channel as ch;
+        let layout = self.status_layout();
 
         let ch_idx = channel as usize;
         if ch_idx >= self.num_channels() {
@@ -1804,23 +1880,23 @@ impl DmaEngine {
 
         let mut status: u32 = 0;
 
-        // Cur_BD (bits 27:24)
+        // Cur_BD: 4 bits [27:24] for compute, 6 bits [29:24] for memtile
         if let Some(bd_idx) = self.current_bds[ch_idx] {
-            status |= ((bd_idx as u32) & ch::STATUS_CUR_BD_MASK) << ch::STATUS_CUR_BD_SHIFT;
+            status = layout.cur_bd.insert(status, bd_idx as u32);
         }
 
         // Task_Queue_Size (bits 22:20)
         let queue_size = self.task_queues[ch_idx].len() as u32;
-        status |= (queue_size & ch::STATUS_TASK_QUEUE_SIZE_MASK) << ch::STATUS_TASK_QUEUE_SIZE_SHIFT;
+        status = layout.task_queue_size.insert(status, queue_size);
 
         // Task_Queue_Overflow (bit 18)
         if self.task_queue_overflow[ch_idx] {
-            status |= 1 << ch::STATUS_TASK_QUEUE_OVERFLOW_BIT;
+            status = layout.task_queue_overflow.set_bit(status);
         }
 
         // Error_BD_Unavailable (bit 10) - S2MM out-of-order mode only
         if self.error_bd_unavailable[ch_idx] {
-            status |= 1 << ch::STATUS_ERROR_BD_UNAVAILABLE_BIT;
+            status = layout.error_bd_unavailable.set_bit(status);
         }
 
         // Channel state (bits 1:0 and bit 19)
@@ -1830,26 +1906,26 @@ impl DmaEngine {
             }
             ChannelState::Active => {
                 // State = 10 (RUNNING), running = 1
-                status |= 0b10; // RUNNING state
-                status |= 1 << ch::STATUS_CHANNEL_RUNNING_BIT;
+                status = layout.status.insert(status, 0b10);
+                status = layout.channel_running.set_bit(status);
             }
             ChannelState::Paused => {
                 // Paused: running but not actively transferring
-                status |= 1 << ch::STATUS_CHANNEL_RUNNING_BIT;
+                status = layout.channel_running.set_bit(status);
             }
             ChannelState::WaitingForLock(_lock_id) => {
                 // State = 10 (RUNNING), stalled on lock acquire
-                status |= 0b10;
-                status |= 1 << ch::STATUS_CHANNEL_RUNNING_BIT;
-                status |= 1 << ch::STATUS_STALLED_LOCK_ACQ_BIT;
+                status = layout.status.insert(status, 0b10);
+                status = layout.channel_running.set_bit(status);
+                status = layout.stalled_lock_acq.set_bit(status);
             }
             ChannelState::Complete => {
                 // Transition state: will go to IDLE on next step
-                status |= 0b01; // STARTING state (transitional)
+                status = layout.status.insert(status, 0b01);
             }
             ChannelState::Error => {
                 // Error: set invalid BD error
-                status |= 1 << ch::STATUS_ERROR_BD_INVALID_BIT;
+                status = layout.error_bd_invalid.set_bit(status);
             }
         }
 
@@ -1858,7 +1934,7 @@ impl DmaEngine {
             if matches!(transfer.direction, TransferDirection::S2MM)
                 && !self.has_stream_in_for_channel(channel)
             {
-                status |= 1 << ch::STATUS_STALLED_STREAM_BIT;
+                status = layout.stalled_stream.set_bit(status);
             }
         }
 
@@ -2418,7 +2494,7 @@ mod tests {
 
     #[test]
     fn test_task_queue_status_register() {
-        use crate::device::registers_spec::memory_module::channel as ch;
+        let layout = &crate::device::regdb::device_reg_layout().memory_status;
 
         let mut engine = DmaEngine::new_compute_tile(1, 2);
         engine.configure_bd(0, BdConfig::simple_1d(0x100, 32)).unwrap();
@@ -2430,12 +2506,11 @@ mod tests {
 
         let status = engine.get_channel_status(2);
 
-        // Task_Queue_Size should be 2 (bits 22:20)
-        let queue_size = (status >> ch::STATUS_TASK_QUEUE_SIZE_SHIFT) & ch::STATUS_TASK_QUEUE_SIZE_MASK;
-        assert_eq!(queue_size, 2);
+        // Task_Queue_Size should be 2
+        assert_eq!(layout.task_queue_size.extract(status), 2);
 
-        // Channel should be running (bit 19)
-        assert!((status >> ch::STATUS_CHANNEL_RUNNING_BIT) & 1 == 1);
+        // Channel should be running
+        assert!(layout.channel_running.extract_bool(status));
     }
 
     #[test]

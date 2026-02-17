@@ -1,0 +1,3138 @@
+{
+  "generator": "aie-device-dump.py",
+  "mlir_aie_python_path": "/home/triple/npu-work/mlir-aie/build/python",
+  "devices": {
+    "npu1": {
+      "device_id": 4,
+      "columns": 4,
+      "rows": 6,
+      "is_npu": true,
+      "local_memory_size": 65536,
+      "mem_tile_size": 524288,
+      "num_mem_tile_rows": 1,
+      "max_lock_value": 63,
+      "address_gen_granularity": 32,
+      "column_shift": 25,
+      "row_shift": 20,
+      "mem_base_addresses": {
+        "south": 262144,
+        "west": 327680,
+        "north": 393216,
+        "east": 458752
+      },
+      "tile_types": {
+        "shim_noc": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            1,
+            0
+          ],
+          "switchbox_ports": {
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 6,
+              "slave": 8
+            },
+            "West": {
+              "master": 4,
+              "slave": 4
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          },
+          "shim_mux_ports": {
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "South": {
+              "master": 8,
+              "slave": 6
+            }
+          }
+        },
+        "mem_tile": {
+          "num_locks": 64,
+          "num_bds": 48,
+          "num_banks": 8,
+          "representative": [
+            1,
+            1
+          ],
+          "switchbox_ports": {
+            "DMA": {
+              "master": 6,
+              "slave": 6
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        },
+        "core": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            1,
+            2
+          ],
+          "switchbox_ports": {
+            "Core": {
+              "master": 1,
+              "slave": 1
+            },
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "West": {
+              "master": 4,
+              "slave": 4
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 2
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        }
+      },
+      "tile_map": [
+        {
+          "col": 0,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 0,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 0,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 1,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 1,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 2,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 2,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 3,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 3,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 5,
+          "type": "core"
+        }
+      ]
+    },
+    "npu1_1col": {
+      "device_id": 5,
+      "columns": 1,
+      "rows": 6,
+      "is_npu": true,
+      "local_memory_size": 65536,
+      "mem_tile_size": 524288,
+      "num_mem_tile_rows": 1,
+      "max_lock_value": 63,
+      "address_gen_granularity": 32,
+      "column_shift": 25,
+      "row_shift": 20,
+      "mem_base_addresses": {
+        "south": 262144,
+        "west": 327680,
+        "north": 393216,
+        "east": 458752
+      },
+      "tile_types": {
+        "shim_noc": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            0,
+            0
+          ],
+          "switchbox_ports": {
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 6,
+              "slave": 8
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          },
+          "shim_mux_ports": {
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "South": {
+              "master": 8,
+              "slave": 6
+            }
+          }
+        },
+        "mem_tile": {
+          "num_locks": 64,
+          "num_bds": 48,
+          "num_banks": 8,
+          "representative": [
+            0,
+            1
+          ],
+          "switchbox_ports": {
+            "DMA": {
+              "master": 6,
+              "slave": 6
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        },
+        "core": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            0,
+            2
+          ],
+          "switchbox_ports": {
+            "Core": {
+              "master": 1,
+              "slave": 1
+            },
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 2
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        }
+      },
+      "tile_map": [
+        {
+          "col": 0,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 0,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 0,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 5,
+          "type": "core"
+        }
+      ]
+    },
+    "npu1_2col": {
+      "device_id": 6,
+      "columns": 2,
+      "rows": 6,
+      "is_npu": true,
+      "local_memory_size": 65536,
+      "mem_tile_size": 524288,
+      "num_mem_tile_rows": 1,
+      "max_lock_value": 63,
+      "address_gen_granularity": 32,
+      "column_shift": 25,
+      "row_shift": 20,
+      "mem_base_addresses": {
+        "south": 262144,
+        "west": 327680,
+        "north": 393216,
+        "east": 458752
+      },
+      "tile_types": {
+        "shim_noc": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            0,
+            0
+          ],
+          "switchbox_ports": {
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 6,
+              "slave": 8
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          },
+          "shim_mux_ports": {
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "South": {
+              "master": 8,
+              "slave": 6
+            }
+          }
+        },
+        "mem_tile": {
+          "num_locks": 64,
+          "num_bds": 48,
+          "num_banks": 8,
+          "representative": [
+            0,
+            1
+          ],
+          "switchbox_ports": {
+            "DMA": {
+              "master": 6,
+              "slave": 6
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        },
+        "core": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            0,
+            2
+          ],
+          "switchbox_ports": {
+            "Core": {
+              "master": 1,
+              "slave": 1
+            },
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 2
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        }
+      },
+      "tile_map": [
+        {
+          "col": 0,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 0,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 0,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 1,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 1,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 5,
+          "type": "core"
+        }
+      ]
+    },
+    "npu1_3col": {
+      "device_id": 7,
+      "columns": 3,
+      "rows": 6,
+      "is_npu": true,
+      "local_memory_size": 65536,
+      "mem_tile_size": 524288,
+      "num_mem_tile_rows": 1,
+      "max_lock_value": 63,
+      "address_gen_granularity": 32,
+      "column_shift": 25,
+      "row_shift": 20,
+      "mem_base_addresses": {
+        "south": 262144,
+        "west": 327680,
+        "north": 393216,
+        "east": 458752
+      },
+      "tile_types": {
+        "shim_noc": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            1,
+            0
+          ],
+          "switchbox_ports": {
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 6,
+              "slave": 8
+            },
+            "West": {
+              "master": 4,
+              "slave": 4
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          },
+          "shim_mux_ports": {
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "South": {
+              "master": 8,
+              "slave": 6
+            }
+          }
+        },
+        "mem_tile": {
+          "num_locks": 64,
+          "num_bds": 48,
+          "num_banks": 8,
+          "representative": [
+            1,
+            1
+          ],
+          "switchbox_ports": {
+            "DMA": {
+              "master": 6,
+              "slave": 6
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        },
+        "core": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            1,
+            2
+          ],
+          "switchbox_ports": {
+            "Core": {
+              "master": 1,
+              "slave": 1
+            },
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "West": {
+              "master": 4,
+              "slave": 4
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 2
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        }
+      },
+      "tile_map": [
+        {
+          "col": 0,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 0,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 0,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 1,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 1,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 2,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 2,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 5,
+          "type": "core"
+        }
+      ]
+    },
+    "npu2": {
+      "device_id": 8,
+      "columns": 8,
+      "rows": 6,
+      "is_npu": true,
+      "local_memory_size": 65536,
+      "mem_tile_size": 524288,
+      "num_mem_tile_rows": 1,
+      "max_lock_value": 63,
+      "address_gen_granularity": 32,
+      "column_shift": 25,
+      "row_shift": 20,
+      "mem_base_addresses": {
+        "south": 262144,
+        "west": 327680,
+        "north": 393216,
+        "east": 458752
+      },
+      "tile_types": {
+        "shim_noc": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            1,
+            0
+          ],
+          "switchbox_ports": {
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 6,
+              "slave": 8
+            },
+            "West": {
+              "master": 4,
+              "slave": 4
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          },
+          "shim_mux_ports": {
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "South": {
+              "master": 8,
+              "slave": 6
+            }
+          }
+        },
+        "mem_tile": {
+          "num_locks": 64,
+          "num_bds": 48,
+          "num_banks": 8,
+          "representative": [
+            1,
+            1
+          ],
+          "switchbox_ports": {
+            "DMA": {
+              "master": 6,
+              "slave": 6
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        },
+        "core": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            1,
+            2
+          ],
+          "switchbox_ports": {
+            "Core": {
+              "master": 1,
+              "slave": 1
+            },
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "West": {
+              "master": 4,
+              "slave": 4
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 2
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        }
+      },
+      "tile_map": [
+        {
+          "col": 0,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 0,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 0,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 1,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 1,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 2,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 2,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 3,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 3,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 4,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 4,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 4,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 4,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 4,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 4,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 5,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 5,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 5,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 5,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 5,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 5,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 6,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 6,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 6,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 6,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 6,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 6,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 7,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 7,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 7,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 7,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 7,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 7,
+          "row": 5,
+          "type": "core"
+        }
+      ]
+    },
+    "npu2_1col": {
+      "device_id": 9,
+      "columns": 1,
+      "rows": 6,
+      "is_npu": true,
+      "local_memory_size": 65536,
+      "mem_tile_size": 524288,
+      "num_mem_tile_rows": 1,
+      "max_lock_value": 63,
+      "address_gen_granularity": 32,
+      "column_shift": 25,
+      "row_shift": 20,
+      "mem_base_addresses": {
+        "south": 262144,
+        "west": 327680,
+        "north": 393216,
+        "east": 458752
+      },
+      "tile_types": {
+        "shim_noc": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            0,
+            0
+          ],
+          "switchbox_ports": {
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 6,
+              "slave": 8
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          },
+          "shim_mux_ports": {
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "South": {
+              "master": 8,
+              "slave": 6
+            }
+          }
+        },
+        "mem_tile": {
+          "num_locks": 64,
+          "num_bds": 48,
+          "num_banks": 8,
+          "representative": [
+            0,
+            1
+          ],
+          "switchbox_ports": {
+            "DMA": {
+              "master": 6,
+              "slave": 6
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        },
+        "core": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            0,
+            2
+          ],
+          "switchbox_ports": {
+            "Core": {
+              "master": 1,
+              "slave": 1
+            },
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 2
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        }
+      },
+      "tile_map": [
+        {
+          "col": 0,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 0,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 0,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 5,
+          "type": "core"
+        }
+      ]
+    },
+    "npu2_2col": {
+      "device_id": 10,
+      "columns": 2,
+      "rows": 6,
+      "is_npu": true,
+      "local_memory_size": 65536,
+      "mem_tile_size": 524288,
+      "num_mem_tile_rows": 1,
+      "max_lock_value": 63,
+      "address_gen_granularity": 32,
+      "column_shift": 25,
+      "row_shift": 20,
+      "mem_base_addresses": {
+        "south": 262144,
+        "west": 327680,
+        "north": 393216,
+        "east": 458752
+      },
+      "tile_types": {
+        "shim_noc": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            0,
+            0
+          ],
+          "switchbox_ports": {
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 6,
+              "slave": 8
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          },
+          "shim_mux_ports": {
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "South": {
+              "master": 8,
+              "slave": 6
+            }
+          }
+        },
+        "mem_tile": {
+          "num_locks": 64,
+          "num_bds": 48,
+          "num_banks": 8,
+          "representative": [
+            0,
+            1
+          ],
+          "switchbox_ports": {
+            "DMA": {
+              "master": 6,
+              "slave": 6
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        },
+        "core": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            0,
+            2
+          ],
+          "switchbox_ports": {
+            "Core": {
+              "master": 1,
+              "slave": 1
+            },
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 2
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        }
+      },
+      "tile_map": [
+        {
+          "col": 0,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 0,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 0,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 1,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 1,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 5,
+          "type": "core"
+        }
+      ]
+    },
+    "npu2_3col": {
+      "device_id": 11,
+      "columns": 3,
+      "rows": 6,
+      "is_npu": true,
+      "local_memory_size": 65536,
+      "mem_tile_size": 524288,
+      "num_mem_tile_rows": 1,
+      "max_lock_value": 63,
+      "address_gen_granularity": 32,
+      "column_shift": 25,
+      "row_shift": 20,
+      "mem_base_addresses": {
+        "south": 262144,
+        "west": 327680,
+        "north": 393216,
+        "east": 458752
+      },
+      "tile_types": {
+        "shim_noc": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            1,
+            0
+          ],
+          "switchbox_ports": {
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 6,
+              "slave": 8
+            },
+            "West": {
+              "master": 4,
+              "slave": 4
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          },
+          "shim_mux_ports": {
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "South": {
+              "master": 8,
+              "slave": 6
+            }
+          }
+        },
+        "mem_tile": {
+          "num_locks": 64,
+          "num_bds": 48,
+          "num_banks": 8,
+          "representative": [
+            1,
+            1
+          ],
+          "switchbox_ports": {
+            "DMA": {
+              "master": 6,
+              "slave": 6
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        },
+        "core": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            1,
+            2
+          ],
+          "switchbox_ports": {
+            "Core": {
+              "master": 1,
+              "slave": 1
+            },
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "West": {
+              "master": 4,
+              "slave": 4
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 2
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        }
+      },
+      "tile_map": [
+        {
+          "col": 0,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 0,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 0,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 1,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 1,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 2,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 2,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 5,
+          "type": "core"
+        }
+      ]
+    },
+    "npu2_4col": {
+      "device_id": 12,
+      "columns": 4,
+      "rows": 6,
+      "is_npu": true,
+      "local_memory_size": 65536,
+      "mem_tile_size": 524288,
+      "num_mem_tile_rows": 1,
+      "max_lock_value": 63,
+      "address_gen_granularity": 32,
+      "column_shift": 25,
+      "row_shift": 20,
+      "mem_base_addresses": {
+        "south": 262144,
+        "west": 327680,
+        "north": 393216,
+        "east": 458752
+      },
+      "tile_types": {
+        "shim_noc": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            1,
+            0
+          ],
+          "switchbox_ports": {
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 6,
+              "slave": 8
+            },
+            "West": {
+              "master": 4,
+              "slave": 4
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          },
+          "shim_mux_ports": {
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "South": {
+              "master": 8,
+              "slave": 6
+            }
+          }
+        },
+        "mem_tile": {
+          "num_locks": 64,
+          "num_bds": 48,
+          "num_banks": 8,
+          "representative": [
+            1,
+            1
+          ],
+          "switchbox_ports": {
+            "DMA": {
+              "master": 6,
+              "slave": 6
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        },
+        "core": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            1,
+            2
+          ],
+          "switchbox_ports": {
+            "Core": {
+              "master": 1,
+              "slave": 1
+            },
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "West": {
+              "master": 4,
+              "slave": 4
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 2
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        }
+      },
+      "tile_map": [
+        {
+          "col": 0,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 0,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 0,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 1,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 1,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 2,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 2,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 3,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 3,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 5,
+          "type": "core"
+        }
+      ]
+    },
+    "npu2_5col": {
+      "device_id": 13,
+      "columns": 5,
+      "rows": 6,
+      "is_npu": true,
+      "local_memory_size": 65536,
+      "mem_tile_size": 524288,
+      "num_mem_tile_rows": 1,
+      "max_lock_value": 63,
+      "address_gen_granularity": 32,
+      "column_shift": 25,
+      "row_shift": 20,
+      "mem_base_addresses": {
+        "south": 262144,
+        "west": 327680,
+        "north": 393216,
+        "east": 458752
+      },
+      "tile_types": {
+        "shim_noc": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            1,
+            0
+          ],
+          "switchbox_ports": {
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 6,
+              "slave": 8
+            },
+            "West": {
+              "master": 4,
+              "slave": 4
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          },
+          "shim_mux_ports": {
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "South": {
+              "master": 8,
+              "slave": 6
+            }
+          }
+        },
+        "mem_tile": {
+          "num_locks": 64,
+          "num_bds": 48,
+          "num_banks": 8,
+          "representative": [
+            1,
+            1
+          ],
+          "switchbox_ports": {
+            "DMA": {
+              "master": 6,
+              "slave": 6
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        },
+        "core": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            1,
+            2
+          ],
+          "switchbox_ports": {
+            "Core": {
+              "master": 1,
+              "slave": 1
+            },
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "West": {
+              "master": 4,
+              "slave": 4
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 2
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        }
+      },
+      "tile_map": [
+        {
+          "col": 0,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 0,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 0,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 1,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 1,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 2,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 2,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 3,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 3,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 4,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 4,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 4,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 4,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 4,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 4,
+          "row": 5,
+          "type": "core"
+        }
+      ]
+    },
+    "npu2_6col": {
+      "device_id": 14,
+      "columns": 6,
+      "rows": 6,
+      "is_npu": true,
+      "local_memory_size": 65536,
+      "mem_tile_size": 524288,
+      "num_mem_tile_rows": 1,
+      "max_lock_value": 63,
+      "address_gen_granularity": 32,
+      "column_shift": 25,
+      "row_shift": 20,
+      "mem_base_addresses": {
+        "south": 262144,
+        "west": 327680,
+        "north": 393216,
+        "east": 458752
+      },
+      "tile_types": {
+        "shim_noc": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            1,
+            0
+          ],
+          "switchbox_ports": {
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 6,
+              "slave": 8
+            },
+            "West": {
+              "master": 4,
+              "slave": 4
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          },
+          "shim_mux_ports": {
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "South": {
+              "master": 8,
+              "slave": 6
+            }
+          }
+        },
+        "mem_tile": {
+          "num_locks": 64,
+          "num_bds": 48,
+          "num_banks": 8,
+          "representative": [
+            1,
+            1
+          ],
+          "switchbox_ports": {
+            "DMA": {
+              "master": 6,
+              "slave": 6
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        },
+        "core": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            1,
+            2
+          ],
+          "switchbox_ports": {
+            "Core": {
+              "master": 1,
+              "slave": 1
+            },
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "West": {
+              "master": 4,
+              "slave": 4
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 2
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        }
+      },
+      "tile_map": [
+        {
+          "col": 0,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 0,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 0,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 1,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 1,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 2,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 2,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 3,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 3,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 4,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 4,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 4,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 4,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 4,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 4,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 5,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 5,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 5,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 5,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 5,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 5,
+          "row": 5,
+          "type": "core"
+        }
+      ]
+    },
+    "npu2_7col": {
+      "device_id": 15,
+      "columns": 7,
+      "rows": 6,
+      "is_npu": true,
+      "local_memory_size": 65536,
+      "mem_tile_size": 524288,
+      "num_mem_tile_rows": 1,
+      "max_lock_value": 63,
+      "address_gen_granularity": 32,
+      "column_shift": 25,
+      "row_shift": 20,
+      "mem_base_addresses": {
+        "south": 262144,
+        "west": 327680,
+        "north": 393216,
+        "east": 458752
+      },
+      "tile_types": {
+        "shim_noc": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            1,
+            0
+          ],
+          "switchbox_ports": {
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 6,
+              "slave": 8
+            },
+            "West": {
+              "master": 4,
+              "slave": 4
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          },
+          "shim_mux_ports": {
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "South": {
+              "master": 8,
+              "slave": 6
+            }
+          }
+        },
+        "mem_tile": {
+          "num_locks": 64,
+          "num_bds": 48,
+          "num_banks": 8,
+          "representative": [
+            1,
+            1
+          ],
+          "switchbox_ports": {
+            "DMA": {
+              "master": 6,
+              "slave": 6
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        },
+        "core": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "num_banks": 4,
+          "representative": [
+            1,
+            2
+          ],
+          "switchbox_ports": {
+            "Core": {
+              "master": 1,
+              "slave": 1
+            },
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "West": {
+              "master": 4,
+              "slave": 4
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 2
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        }
+      },
+      "tile_map": [
+        {
+          "col": 0,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 0,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 0,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 0,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 1,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 1,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 1,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 2,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 2,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 2,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 3,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 3,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 3,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 4,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 4,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 4,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 4,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 4,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 4,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 5,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 5,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 5,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 5,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 5,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 5,
+          "row": 5,
+          "type": "core"
+        },
+        {
+          "col": 6,
+          "row": 0,
+          "type": "shim_noc"
+        },
+        {
+          "col": 6,
+          "row": 1,
+          "type": "mem_tile"
+        },
+        {
+          "col": 6,
+          "row": 2,
+          "type": "core"
+        },
+        {
+          "col": 6,
+          "row": 3,
+          "type": "core"
+        },
+        {
+          "col": 6,
+          "row": 4,
+          "type": "core"
+        },
+        {
+          "col": 6,
+          "row": 5,
+          "type": "core"
+        }
+      ]
+    }
+  }
+}

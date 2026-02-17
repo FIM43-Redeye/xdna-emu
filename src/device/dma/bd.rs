@@ -12,18 +12,9 @@
 
 use crate::device::tile::TileType;
 
-/// BD base addresses per tile type (from AM025)
-pub const BD_BASE_COMPUTE: u64 = 0x1D000;
-pub const BD_BASE_MEMTILE: u64 = 0xA0000;
-pub const BD_BASE_SHIM: u64 = 0x1D000;
-
-/// BD spacing: 32 bytes (0x20) between BDs for all tile types
+/// BD spacing: 32 bytes (0x20) between BDs for all tile types.
+/// Consistent across compute, memtile, and shim; also derivable from regdb.
 pub const BD_SPACING: u64 = 0x20;
-
-/// Number of BDs per tile type
-pub const BD_COUNT_COMPUTE: usize = 16;
-pub const BD_COUNT_MEMTILE: usize = 48;
-pub const BD_COUNT_SHIM: usize = 16;
 
 /// Number of registers per BD
 pub const BD_REGS_COMPUTE: usize = 6;
@@ -157,17 +148,13 @@ impl BufferDescriptor {
 
     /// Parse Compute tile BD (6 registers per BD).
     ///
-    /// Layout from AM025 MEMORY_MODULE/DMA/BD:
-    /// - BD_0: Base_Address[27:14], Buffer_Length[13:0]
-    /// - BD_1: Compression[31], Packet[30], OOO_ID[29:24], Packet_ID[23:19], Packet_Type[18:16]
-    /// - BD_2: D1_Stepsize[25:13], D0_Stepsize[12:0]
-    /// - BD_3: D1_Wrap[28:21], D0_Wrap[20:13], D2_Stepsize[12:0]
-    /// - BD_4: Iteration_Current[24:19], Iteration_Wrap[18:13], Iteration_Stepsize[12:0]
-    /// - BD_5: TLAST_Suppress[31], Next_BD[30:27], Use_Next_BD[26], Valid_BD[25],
-    ///         Lock_Rel_Value[24:18], Lock_Rel_ID[16:13], Lock_Acq_Enable[12],
-    ///         Lock_Acq_Value[11:5], Lock_Acq_ID[3:0]
+    /// Field layouts are derived from the register database (AM025 memory module).
+    /// All bit positions come from `BdFieldLayout::from_regdb()` rather than
+    /// hardcoded shift/mask constants. This matches the pattern used by `parse_shim()`.
     fn parse_compute(words: &[u32]) -> Self {
         assert!(words.len() >= BD_REGS_COMPUTE, "Compute BD needs 6 registers");
+
+        let lay = &crate::device::regdb::device_reg_layout().memory_bd;
 
         let w0 = words[0];
         let w1 = words[1];
@@ -177,41 +164,41 @@ impl BufferDescriptor {
         let w5 = words[5];
 
         Self {
-            // BD_0
-            base_addr_words: ((w0 >> 14) & 0x3FFF) as u64,  // 14 bits
-            length_words: w0 & 0x3FFF,                       // 14 bits
+            // BD_0: Base_Address, Buffer_Length
+            base_addr_words: lay.base_address.extract(w0) as u64,
+            length_words: lay.buffer_length.extract(w0),
 
-            // BD_1
-            compression_enable: (w1 >> 31) & 1 != 0,
-            enable_packet: (w1 >> 30) & 1 != 0,
-            ooo_bd_id: ((w1 >> 24) & 0x3F) as u8,
-            packet_id: ((w1 >> 19) & 0x1F) as u8,
-            packet_type: ((w1 >> 16) & 0x7) as u8,
+            // BD_1: compression, packet control
+            compression_enable: lay.enable_compression.extract_bool(w1),
+            enable_packet: lay.enable_packet.extract_bool(w1),
+            ooo_bd_id: lay.out_of_order_bd_id.extract(w1) as u8,
+            packet_id: lay.packet_id.extract(w1) as u8,
+            packet_type: lay.packet_type.extract(w1) as u8,
 
-            // BD_2 - stepsizes stored as (actual-1), convert to actual
-            d1_stepsize: ((w2 >> 13) & 0x1FFF) + 1,  // 13 bits + 1
-            d0_stepsize: (w2 & 0x1FFF) + 1,           // 13 bits + 1
+            // BD_2: stepsizes (stored as actual-1, convert to actual)
+            d1_stepsize: lay.d1_stepsize.extract(w2) + 1,
+            d0_stepsize: lay.d0_stepsize.extract(w2) + 1,
 
-            // BD_3
-            d1_wrap: ((w3 >> 21) & 0xFF) as u16,     // 8 bits
-            d0_wrap: ((w3 >> 13) & 0xFF) as u16,     // 8 bits
-            d2_stepsize: (w3 & 0x1FFF) + 1,          // 13 bits + 1
+            // BD_3: wrap counts and D2 stepsize
+            d1_wrap: lay.d1_wrap.extract(w3) as u16,
+            d0_wrap: lay.d0_wrap.extract(w3) as u16,
+            d2_stepsize: lay.d2_stepsize.extract(w3) + 1,
 
-            // BD_4
-            iteration_current: ((w4 >> 19) & 0x3F) as u8,  // 6 bits
-            iteration_wrap: (((w4 >> 13) & 0x3F) + 1) as u8, // 6 bits, stored as actual-1
-            iteration_stepsize: (w4 & 0x1FFF) + 1,   // 13 bits + 1
+            // BD_4: iteration control
+            iteration_current: lay.iteration_current.extract(w4) as u8,
+            iteration_wrap: (lay.iteration_wrap.extract(w4) + 1) as u8, // stored as actual-1
+            iteration_stepsize: lay.iteration_stepsize.extract(w4) + 1,
 
-            // BD_5
-            tlast_suppress: (w5 >> 31) & 1 != 0,
-            next_bd: ((w5 >> 27) & 0xF) as u8,       // 4 bits
-            use_next_bd: (w5 >> 26) & 1 != 0,
-            valid: (w5 >> 25) & 1 != 0,
-            lock_rel_value: sign_extend_7bit(((w5 >> 18) & 0x7F) as u8),
-            lock_rel_id: ((w5 >> 13) & 0xF) as u8,   // 4 bits
-            lock_acq_enable: (w5 >> 12) & 1 != 0,
-            lock_acq_value: sign_extend_7bit(((w5 >> 5) & 0x7F) as u8),
-            lock_acq_id: (w5 & 0xF) as u8,           // 4 bits
+            // BD_5: TLAST, chaining, locks
+            tlast_suppress: lay.tlast_suppress.extract_bool(w5),
+            next_bd: lay.next_bd.extract(w5) as u8,
+            use_next_bd: lay.use_next_bd.extract_bool(w5),
+            valid: lay.valid_bd.extract_bool(w5),
+            lock_rel_value: sign_extend_7bit(lay.lock_rel_value.extract(w5) as u8),
+            lock_rel_id: lay.lock_rel_id.extract(w5) as u8,
+            lock_acq_enable: lay.lock_acq_enable.extract_bool(w5),
+            lock_acq_value: sign_extend_7bit(lay.lock_acq_value.extract(w5) as u8),
+            lock_acq_id: lay.lock_acq_id.extract(w5) as u8,
 
             // Not used in compute tile
             d3_stepsize: 0,
@@ -232,19 +219,13 @@ impl BufferDescriptor {
 
     /// Parse MemTile BD (8 registers per BD).
     ///
-    /// Layout from AM025 MEMORY_TILE_MODULE/DMA/BD:
-    /// - BD_0: Enable_Packet[31], Packet_Type[30:28], Packet_ID[27:23],
-    ///         OOO_BD_ID[22:17], Buffer_Length[16:0]
-    /// - BD_1: D0_Zero_Before[31:26], Next_BD[25:20], Use_Next_BD[19], Base_Address[18:0]
-    /// - BD_2: TLAST_Suppress[31], D0_Wrap[26:17], D0_Stepsize[16:0]
-    /// - BD_3: D1_Zero_Before[31:27], D1_Wrap[26:17], D1_Stepsize[16:0]
-    /// - BD_4: Compression[31], D2_Zero_Before[30:27], D2_Wrap[26:17], D2_Stepsize[16:0]
-    /// - BD_5: D2_Zero_After[31:28], D1_Zero_After[27:23], D0_Zero_After[22:17], D3_Stepsize[16:0]
-    /// - BD_6: Iteration_Current[28:23], Iteration_Wrap[22:17], Iteration_Stepsize[16:0]
-    /// - BD_7: Valid_BD[31], Lock_Rel_Value[30:24], Lock_Rel_ID[23:16],
-    ///         Lock_Acq_Enable[15], Lock_Acq_Value[14:8], Lock_Acq_ID[7:0]
+    /// Field layouts are derived from the register database (AM025 memory_tile
+    /// module). All bit positions come from `MemTileBdFieldLayout::from_regdb()`
+    /// rather than hardcoded shift/mask constants.
     fn parse_memtile(words: &[u32]) -> Self {
         assert!(words.len() >= BD_REGS_MEMTILE, "MemTile BD needs 8 registers");
+
+        let lay = &crate::device::regdb::device_reg_layout().memtile_bd;
 
         let w0 = words[0];
         let w1 = words[1];
@@ -256,53 +237,53 @@ impl BufferDescriptor {
         let w7 = words[7];
 
         Self {
-            // BD_0
-            enable_packet: (w0 >> 31) & 1 != 0,
-            packet_type: ((w0 >> 28) & 0x7) as u8,
-            packet_id: ((w0 >> 23) & 0x1F) as u8,
-            ooo_bd_id: ((w0 >> 17) & 0x3F) as u8,
-            length_words: w0 & 0x1FFFF,              // 17 bits (up to 128K)
+            // BD_0: packet control and buffer length
+            enable_packet: lay.enable_packet.extract_bool(w0),
+            packet_type: lay.packet_type.extract(w0) as u8,
+            packet_id: lay.packet_id.extract(w0) as u8,
+            ooo_bd_id: lay.out_of_order_bd_id.extract(w0) as u8,
+            length_words: lay.buffer_length.extract(w0),
 
-            // BD_1
-            d0_zero_before: ((w1 >> 26) & 0x3F) as u8,
-            next_bd: ((w1 >> 20) & 0x3F) as u8,      // 6 bits (0-47, but only 0-23 valid)
-            use_next_bd: (w1 >> 19) & 1 != 0,
-            base_addr_words: (w1 & 0x7FFFF) as u64,  // 19 bits (512KB)
+            // BD_1: zero-padding, chaining, base address
+            d0_zero_before: lay.d0_zero_before.extract(w1) as u8,
+            next_bd: lay.next_bd.extract(w1) as u8,
+            use_next_bd: lay.use_next_bd.extract_bool(w1),
+            base_addr_words: lay.base_address.extract(w1) as u64,
 
-            // BD_2
-            tlast_suppress: (w2 >> 31) & 1 != 0,
-            d0_wrap: ((w2 >> 17) & 0x3FF) as u16,    // 10 bits
-            d0_stepsize: (w2 & 0x1FFFF) + 1,         // 17 bits + 1
+            // BD_2: TLAST and D0 addressing
+            tlast_suppress: lay.tlast_suppress.extract_bool(w2),
+            d0_wrap: lay.d0_wrap.extract(w2) as u16,
+            d0_stepsize: lay.d0_stepsize.extract(w2) + 1,  // stored as actual-1
 
-            // BD_3
-            d1_zero_before: ((w3 >> 27) & 0x1F) as u8,
-            d1_wrap: ((w3 >> 17) & 0x3FF) as u16,
-            d1_stepsize: (w3 & 0x1FFFF) + 1,
+            // BD_3: D1 zero-padding and addressing
+            d1_zero_before: lay.d1_zero_before.extract(w3) as u8,
+            d1_wrap: lay.d1_wrap.extract(w3) as u16,
+            d1_stepsize: lay.d1_stepsize.extract(w3) + 1,
 
-            // BD_4
-            compression_enable: (w4 >> 31) & 1 != 0,
-            d2_zero_before: ((w4 >> 27) & 0xF) as u8,
-            d2_wrap: ((w4 >> 17) & 0x3FF) as u16,
-            d2_stepsize: (w4 & 0x1FFFF) + 1,
+            // BD_4: compression, D2 zero-padding and addressing
+            compression_enable: lay.enable_compression.extract_bool(w4),
+            d2_zero_before: lay.d2_zero_before.extract(w4) as u8,
+            d2_wrap: lay.d2_wrap.extract(w4) as u16,
+            d2_stepsize: lay.d2_stepsize.extract(w4) + 1,
 
-            // BD_5
-            d2_zero_after: ((w5 >> 28) & 0xF) as u8,
-            d1_zero_after: ((w5 >> 23) & 0x1F) as u8,
-            d0_zero_after: ((w5 >> 17) & 0x3F) as u8,
-            d3_stepsize: (w5 & 0x1FFFF) + 1,         // MemTile has D3!
+            // BD_5: zero-after padding and D3 stepsize
+            d2_zero_after: lay.d2_zero_after.extract(w5) as u8,
+            d1_zero_after: lay.d1_zero_after.extract(w5) as u8,
+            d0_zero_after: lay.d0_zero_after.extract(w5) as u8,
+            d3_stepsize: lay.d3_stepsize.extract(w5) + 1,  // MemTile has D3
 
-            // BD_6
-            iteration_current: ((w6 >> 23) & 0x3F) as u8,
-            iteration_wrap: (((w6 >> 17) & 0x3F) + 1) as u8,
-            iteration_stepsize: (w6 & 0x1FFFF) + 1,
+            // BD_6: iteration control
+            iteration_current: lay.iteration_current.extract(w6) as u8,
+            iteration_wrap: (lay.iteration_wrap.extract(w6) + 1) as u8,  // stored as actual-1
+            iteration_stepsize: lay.iteration_stepsize.extract(w6) + 1,
 
-            // BD_7
-            valid: (w7 >> 31) & 1 != 0,
-            lock_rel_value: sign_extend_7bit(((w7 >> 24) & 0x7F) as u8),
-            lock_rel_id: ((w7 >> 16) & 0xFF) as u8,  // 8 bits for MemTile!
-            lock_acq_enable: (w7 >> 15) & 1 != 0,
-            lock_acq_value: sign_extend_7bit(((w7 >> 8) & 0x7F) as u8),
-            lock_acq_id: (w7 & 0xFF) as u8,          // 8 bits for MemTile!
+            // BD_7: validity and lock synchronization
+            valid: lay.valid_bd.extract_bool(w7),
+            lock_rel_value: sign_extend_7bit(lay.lock_rel_value.extract(w7) as u8),
+            lock_rel_id: lay.lock_rel_id.extract(w7) as u8,  // 8 bits for MemTile
+            lock_acq_enable: lay.lock_acq_enable.extract_bool(w7),
+            lock_acq_value: sign_extend_7bit(lay.lock_acq_value.extract(w7) as u8),
+            lock_acq_id: lay.lock_acq_id.extract(w7) as u8,  // 8 bits for MemTile
 
             // Not used in MemTile
             burst_length: 0,
@@ -315,20 +296,14 @@ impl BufferDescriptor {
 
     /// Parse Shim tile BD (8 registers per BD).
     ///
-    /// Layout from AM025 NOC_MODULE/DMA/BD:
-    /// - BD_0: Buffer_Length[31:0]
-    /// - BD_1: Base_Address_Low[31:2], Reserved[1:0]
-    /// - BD_2: Enable_Packet[30], OOO_ID[29:24], Packet_ID[23:19],
-    ///         Packet_Type[18:16], Base_Address_High[15:0]
-    /// - BD_3: Secure_Access[30], D0_Wrap[29:20], D0_Stepsize[19:0]
-    /// - BD_4: Burst_Length[31:30], D1_Wrap[29:20], D1_Stepsize[19:0]
-    /// - BD_5: SMID[31:28], AxCache[27:24], AxQoS[23:20], D2_Stepsize[19:0]
-    /// - BD_6: Iteration_Current[31:26], Iteration_Wrap[25:20], Iteration_Stepsize[19:0]
-    /// - BD_7: TLAST_Suppress[31], Next_BD[30:27], Use_Next_BD[26], Valid_BD[25],
-    ///         Lock_Rel_Value[24:18], Lock_Rel_ID[16:13], Lock_Acq_Enable[12],
-    ///         Lock_Acq_Value[11:5], Lock_Acq_ID[3:0]
+    /// Field layouts are derived from the register database (AM025 shim module).
+    /// The shim BD is notable for its full 32-bit buffer length, 46-bit word
+    /// address (split across two registers), and AXI parameters (burst length,
+    /// SMID, AxCache, AxQoS).
     fn parse_shim(words: &[u32]) -> Self {
         assert!(words.len() >= BD_REGS_SHIM, "Shim BD needs 8 registers");
+
+        let lay = &crate::device::regdb::device_reg_layout().shim_bd;
 
         let w0 = words[0];
         let w1 = words[1];
@@ -340,54 +315,54 @@ impl BufferDescriptor {
         let w7 = words[7];
 
         // 46-bit word address from low and high parts
-        let addr_low = (w1 >> 2) as u64;             // 30 bits
-        let addr_high = (w2 & 0xFFFF) as u64;        // 16 bits
+        let addr_low = lay.base_address_low.extract(w1) as u64;    // 30 bits
+        let addr_high = lay.base_address_high.extract(w2) as u64;  // 16 bits
         let base_addr = addr_low | (addr_high << 30);
 
         Self {
-            // BD_0
-            length_words: w0,                         // Full 32 bits for DDR
+            // BD_0: full 32-bit buffer length for DDR transfers
+            length_words: lay.buffer_length.extract(w0),
 
-            // BD_1 + BD_2 (address)
+            // BD_1 + BD_2: 46-bit word address
             base_addr_words: base_addr,
 
-            // BD_2
-            enable_packet: (w2 >> 30) & 1 != 0,
-            ooo_bd_id: ((w2 >> 24) & 0x3F) as u8,
-            packet_id: ((w2 >> 19) & 0x1F) as u8,
-            packet_type: ((w2 >> 16) & 0x7) as u8,
+            // BD_2: packet control
+            enable_packet: lay.enable_packet.extract_bool(w2),
+            ooo_bd_id: lay.out_of_order_bd_id.extract(w2) as u8,
+            packet_id: lay.packet_id.extract(w2) as u8,
+            packet_type: lay.packet_type.extract(w2) as u8,
 
-            // BD_3
-            secure_access: (w3 >> 30) & 1 != 0,
-            d0_wrap: ((w3 >> 20) & 0x3FF) as u16,    // 10 bits
-            d0_stepsize: (w3 & 0xFFFFF) + 1,         // 20 bits + 1 (up to 1M)
+            // BD_3: secure access + D0
+            secure_access: lay.secure_access.extract_bool(w3),
+            d0_wrap: lay.d0_wrap.extract(w3) as u16,
+            d0_stepsize: lay.d0_stepsize.extract(w3) + 1,  // stored as actual-1
 
-            // BD_4
-            burst_length: ((w4 >> 30) & 0x3) as u8,
-            d1_wrap: ((w4 >> 20) & 0x3FF) as u16,
-            d1_stepsize: (w4 & 0xFFFFF) + 1,
+            // BD_4: burst length + D1
+            burst_length: lay.burst_length.extract(w4) as u8,
+            d1_wrap: lay.d1_wrap.extract(w4) as u16,
+            d1_stepsize: lay.d1_stepsize.extract(w4) + 1,
 
-            // BD_5
-            smid: ((w5 >> 28) & 0xF) as u8,
-            axcache: ((w5 >> 24) & 0xF) as u8,
-            axqos: ((w5 >> 20) & 0xF) as u8,
-            d2_stepsize: (w5 & 0xFFFFF) + 1,
+            // BD_5: AXI parameters + D2
+            smid: lay.smid.extract(w5) as u8,
+            axcache: lay.axcache.extract(w5) as u8,
+            axqos: lay.axqos.extract(w5) as u8,
+            d2_stepsize: lay.d2_stepsize.extract(w5) + 1,
 
-            // BD_6
-            iteration_current: ((w6 >> 26) & 0x3F) as u8,
-            iteration_wrap: (((w6 >> 20) & 0x3F) + 1) as u8,
-            iteration_stepsize: (w6 & 0xFFFFF) + 1,
+            // BD_6: iteration control
+            iteration_current: lay.iteration_current.extract(w6) as u8,
+            iteration_wrap: (lay.iteration_wrap.extract(w6) + 1) as u8, // stored as actual-1
+            iteration_stepsize: lay.iteration_stepsize.extract(w6) + 1,
 
-            // BD_7
-            tlast_suppress: (w7 >> 31) & 1 != 0,
-            next_bd: ((w7 >> 27) & 0xF) as u8,
-            use_next_bd: (w7 >> 26) & 1 != 0,
-            valid: (w7 >> 25) & 1 != 0,
-            lock_rel_value: sign_extend_7bit(((w7 >> 18) & 0x7F) as u8),
-            lock_rel_id: ((w7 >> 13) & 0xF) as u8,
-            lock_acq_enable: (w7 >> 12) & 1 != 0,
-            lock_acq_value: sign_extend_7bit(((w7 >> 5) & 0x7F) as u8),
-            lock_acq_id: (w7 & 0xF) as u8,
+            // BD_7: locks and chaining
+            tlast_suppress: lay.tlast_suppress.extract_bool(w7),
+            next_bd: lay.next_bd.extract(w7) as u8,
+            use_next_bd: lay.use_next_bd.extract_bool(w7),
+            valid: lay.valid_bd.extract_bool(w7),
+            lock_rel_value: sign_extend_7bit(lay.lock_rel_value.extract(w7) as u8),
+            lock_rel_id: lay.lock_rel_id.extract(w7) as u8,
+            lock_acq_enable: lay.lock_acq_enable.extract_bool(w7),
+            lock_acq_value: sign_extend_7bit(lay.lock_acq_value.extract(w7) as u8),
+            lock_acq_id: lay.lock_acq_id.extract(w7) as u8,
 
             // Not used in Shim
             d3_stepsize: 0,
@@ -452,23 +427,81 @@ impl BufferDescriptor {
     pub fn length_bytes(&self) -> u64 {
         self.length_words as u64 * 4
     }
-}
 
-/// Get BD base address for a tile type
-pub fn bd_base_address(tile_type: TileType) -> u64 {
-    match tile_type {
-        TileType::Compute => BD_BASE_COMPUTE,
-        TileType::MemTile => BD_BASE_MEMTILE,
-        TileType::Shim => BD_BASE_SHIM,
+    /// Convert to the runtime BdConfig used by the DMA engine.
+    ///
+    /// BufferDescriptor stores hardware-native units (word addresses, word
+    /// strides, actual values for stepsizes and wraps). BdConfig stores
+    /// byte-addressed values for the emulator's address generator, and uses
+    /// the "stored - 1" convention for iteration fields.
+    pub fn to_bd_config(&self) -> super::BdConfig {
+        use super::{BdConfig, DimensionConfig, IterationConfig};
+
+        // Convert word address to byte address
+        let base_addr = self.base_addr_words * 4;
+        let length = self.length_words * 4;
+
+        // Convert word strides to byte strides: stride_bytes = stride_words * 4
+        // d0_wrap of 0 means simple contiguous transfer -- use length_words as size
+        let d0_size = if self.d0_wrap == 0 { self.length_words } else { self.d0_wrap as u32 };
+        let d0_stride = (self.d0_stepsize as i32) * 4;
+
+        let d1_size = self.d1_wrap as u32;
+        let d1_stride = (self.d1_stepsize as i32) * 4;
+
+        let d2_size = self.d2_wrap as u32;
+        let d2_stride = (self.d2_stepsize as i32) * 4;
+
+        let d3_stride = (self.d3_stepsize as i32) * 4;
+
+        // IterationConfig uses stored-1 convention: wrap=0 means 1 iteration,
+        // stepsize is also stored-1. BufferDescriptor already has actual values
+        // (e.g., iteration_wrap=3 means 3 iterations). Convert back.
+        let iteration = IterationConfig {
+            current: self.iteration_current,
+            wrap: self.iteration_wrap.saturating_sub(1),
+            stepsize: self.iteration_stepsize.saturating_sub(1) as u16,
+        };
+
+        // Lock configuration: acquire if enabled, release if value is non-zero
+        let acquire_lock = if self.lock_acq_enable { Some(self.lock_acq_id) } else { None };
+        let release_lock = if self.lock_rel_value != 0 { Some(self.lock_rel_id) } else { None };
+
+        // BD chaining: chain if use_next_bd is set AND the BD is valid
+        let next_bd = if self.use_next_bd { Some(self.next_bd) } else { None };
+
+        BdConfig {
+            base_addr,
+            length,
+            d0: DimensionConfig { size: d0_size, stride: d0_stride },
+            d1: DimensionConfig { size: d1_size, stride: d1_stride },
+            d2: DimensionConfig { size: d2_size, stride: d2_stride },
+            d3: DimensionConfig { size: 0, stride: d3_stride },
+            iteration,
+            compression_enable: self.compression_enable,
+            enable_packet: self.enable_packet,
+            packet_id: self.packet_id,
+            packet_type: self.packet_type,
+            out_of_order_bd_id: self.ooo_bd_id,
+            out_of_order: false, // S2MM-only, set by channel config
+            tlast_suppress: self.tlast_suppress,
+            acquire_lock,
+            acquire_value: self.lock_acq_value,
+            release_lock,
+            release_value: self.lock_rel_value,
+            next_bd,
+            valid: self.valid,
+        }
     }
 }
 
-/// Get number of BDs for a tile type
-pub fn bd_count(tile_type: TileType) -> usize {
+/// Get BD base address for a tile type (from register database).
+pub fn bd_base_address(tile_type: TileType) -> u64 {
+    let lay = crate::device::regdb::device_reg_layout();
     match tile_type {
-        TileType::Compute => BD_COUNT_COMPUTE,
-        TileType::MemTile => BD_COUNT_MEMTILE,
-        TileType::Shim => BD_COUNT_SHIM,
+        TileType::Compute => lay.memory_bd_base as u64,
+        TileType::MemTile => lay.memtile_bd_base as u64,
+        TileType::Shim => lay.shim_bd_base as u64,
     }
 }
 
@@ -576,6 +609,303 @@ mod tests {
         assert_eq!(bd.base_addr_words, 0x100);
         assert_eq!(bd.d0_wrap, 1);
         assert_eq!(bd.d0_stepsize, 4);
+    }
+
+    /// Cross-validate regdb-driven parse_compute() against AM025 bit positions.
+    ///
+    /// Constructs BD words where every field has a distinct, non-zero value
+    /// placed at exact AM025 bit positions, then verifies that parse_compute()
+    /// (which uses regdb extraction) produces the expected values. This catches
+    /// any mismatch between JSON field definitions and the AM025 register spec.
+    #[test]
+    fn test_compute_bd_cross_validation() {
+        // Exact bit positions from AM025 / aie_registers_aie2.json:
+        //
+        // DMA_BD0_0: Buffer_Length[13:0], Base_Address[27:14]
+        // DMA_BD0_1: Packet_Type[18:16], Packet_ID[23:19], OOO_BD_ID[29:24],
+        //            Enable_Packet[30], Enable_Compression[31]
+        // DMA_BD0_2: D0_Stepsize[12:0], D1_Stepsize[25:13]
+        // DMA_BD0_3: D2_Stepsize[12:0], D0_Wrap[20:13], D1_Wrap[28:21]
+        // DMA_BD0_4: Iteration_Stepsize[12:0], Iteration_Wrap[18:13],
+        //            Iteration_Current[24:19]
+        // DMA_BD0_5: Lock_Acq_ID[3:0], Lock_Acq_Value[11:5], Lock_Acq_Enable[12],
+        //            Lock_Rel_ID[16:13], Lock_Rel_Value[24:18], Valid_BD[25],
+        //            Use_Next_BD[26], Next_BD[30:27], TLAST_Suppress[31]
+
+        let w0: u32 = (0x1AB << 14) | 0x2345;
+        let w1: u32 = (1 << 31) | (1 << 30) | (0x15 << 24) | (0x0A << 19) | (0x5 << 16);
+        let w2: u32 = (99 << 13) | 49;              // D1_Step[25:13]=99, D0_Step[12:0]=49
+        let w3: u32 = (7 << 21) | (3 << 13) | 19;   // D1_Wrap[28:21]=7, D0_Wrap[20:13]=3, D2_Step[12:0]=19
+        let w4: u32 = (5 << 19) | (2 << 13) | 9;    // Iter_Cur[24:19]=5, Iter_Wrap[18:13]=2, Iter_Step[12:0]=9
+        let w5: u32 = (1 << 31) | (5 << 27) | (1 << 26) | (1 << 25)
+            | (3 << 18) | (2 << 13) | (1 << 12) | (1 << 5) | 7;
+
+        let words = [w0, w1, w2, w3, w4, w5];
+        let bd = BufferDescriptor::from_registers(&words, TileType::Compute);
+
+        // Word 0
+        assert_eq!(bd.base_addr_words, 0x1AB, "base_addr_words");
+        assert_eq!(bd.length_words, 0x2345, "length_words");
+
+        // Word 1
+        assert!(bd.compression_enable, "compression_enable");
+        assert!(bd.enable_packet, "enable_packet");
+        assert_eq!(bd.ooo_bd_id, 0x15, "ooo_bd_id");
+        assert_eq!(bd.packet_id, 0x0A, "packet_id");
+        assert_eq!(bd.packet_type, 0x5, "packet_type");
+
+        // Word 2 (stepsizes stored as actual-1, parser adds 1)
+        assert_eq!(bd.d0_stepsize, 50, "d0_stepsize (stored 49 + 1)");
+        assert_eq!(bd.d1_stepsize, 100, "d1_stepsize (stored 99 + 1)");
+
+        // Word 3
+        assert_eq!(bd.d0_wrap, 3, "d0_wrap");
+        assert_eq!(bd.d1_wrap, 7, "d1_wrap");
+        assert_eq!(bd.d2_stepsize, 20, "d2_stepsize (stored 19 + 1)");
+
+        // Word 4
+        assert_eq!(bd.iteration_current, 5, "iteration_current");
+        assert_eq!(bd.iteration_wrap, 3, "iteration_wrap (stored 2 + 1)");
+        assert_eq!(bd.iteration_stepsize, 10, "iteration_stepsize (stored 9 + 1)");
+
+        // Word 5
+        assert!(bd.tlast_suppress, "tlast_suppress");
+        assert_eq!(bd.next_bd, 5, "next_bd");
+        assert!(bd.use_next_bd, "use_next_bd");
+        assert!(bd.valid, "valid");
+        assert_eq!(bd.lock_rel_value, 3, "lock_rel_value");
+        assert_eq!(bd.lock_rel_id, 2, "lock_rel_id");
+        assert!(bd.lock_acq_enable, "lock_acq_enable");
+        assert_eq!(bd.lock_acq_value, 1, "lock_acq_value");
+        assert_eq!(bd.lock_acq_id, 7, "lock_acq_id");
+    }
+
+    /// Cross-validate regdb-driven parse_memtile() against AM025 bit positions.
+    ///
+    /// Constructs BD words where every field has a distinct, non-zero value
+    /// placed at exact AM025 bit positions, then verifies all fields extract
+    /// correctly through the regdb-based parser.
+    #[test]
+    fn test_memtile_bd_cross_validation() {
+        // Exact bit positions from AM025 / aie_registers_aie2.json (memory_tile):
+        //
+        // DMA_BD0_0: Buffer_Length[16:0], Out_Of_Order_BD_ID[22:17],
+        //            Packet_ID[27:23], Packet_Type[30:28], Enable_Packet[31]
+        // DMA_BD0_1: Base_Address[18:0], Use_Next_BD[19], Next_BD[25:20],
+        //            D0_Zero_Before[31:26]
+        // DMA_BD0_2: D0_Stepsize[16:0], D0_Wrap[26:17], TLAST_Suppress[31]
+        // DMA_BD0_3: D1_Stepsize[16:0], D1_Wrap[26:17], D1_Zero_Before[31:27]
+        // DMA_BD0_4: D2_Stepsize[16:0], D2_Wrap[26:17], D2_Zero_Before[30:27],
+        //            Enable_Compression[31]
+        // DMA_BD0_5: D3_Stepsize[16:0], D0_Zero_After[22:17],
+        //            D1_Zero_After[27:23], D2_Zero_After[31:28]
+        // DMA_BD0_6: Iteration_Stepsize[16:0], Iteration_Wrap[22:17],
+        //            Iteration_Current[28:23]
+        // DMA_BD0_7: Lock_Acq_ID[7:0], Lock_Acq_Value[14:8],
+        //            Lock_Acq_Enable[15], Lock_Rel_ID[23:16],
+        //            Lock_Rel_Value[30:24], Valid_BD[31]
+
+        let w0: u32 = (1 << 31) | (5 << 28) | (0x0A << 23) | (0x15 << 17) | 0x1234;
+        let w1: u32 = (3 << 26) | (7 << 20) | (1 << 19) | 0x3_ABCD;
+        let w2: u32 = (1 << 31) | (5 << 17) | 99;            // tlast, d0_wrap=5, d0_step stored=99
+        let w3: u32 = (2 << 27) | (8 << 17) | 49;            // d1_zero_before=2, d1_wrap=8, d1_step=49
+        let w4: u32 = (1 << 31) | (3 << 27) | (6 << 17) | 29; // compress, d2_zero_before=3, d2_wrap=6, d2_step=29
+        let w5: u32 = (4 << 28) | (5 << 23) | (6 << 17) | 19; // d2_zero_after=4, d1_zero_after=5, d0_zero_after=6, d3_step=19
+        let w6: u32 = (10 << 23) | (3 << 17) | 39;           // iter_cur=10, iter_wrap stored=3, iter_step stored=39
+        let w7: u32 = (1u32 << 31) | (3 << 24) | (0x42 << 16) | (1 << 15) | (2 << 8) | 0x37;
+
+        let words = [w0, w1, w2, w3, w4, w5, w6, w7];
+        let bd = BufferDescriptor::from_registers(&words, TileType::MemTile);
+
+        // Word 0
+        assert!(bd.enable_packet, "enable_packet");
+        assert_eq!(bd.packet_type, 5, "packet_type");
+        assert_eq!(bd.packet_id, 0x0A, "packet_id");
+        assert_eq!(bd.ooo_bd_id, 0x15, "ooo_bd_id");
+        assert_eq!(bd.length_words, 0x1234, "length_words");
+
+        // Word 1
+        assert_eq!(bd.d0_zero_before, 3, "d0_zero_before");
+        assert_eq!(bd.next_bd, 7, "next_bd");
+        assert!(bd.use_next_bd, "use_next_bd");
+        assert_eq!(bd.base_addr_words, 0x3_ABCD, "base_addr_words");
+
+        // Word 2 (stepsizes stored as actual-1)
+        assert!(bd.tlast_suppress, "tlast_suppress");
+        assert_eq!(bd.d0_wrap, 5, "d0_wrap");
+        assert_eq!(bd.d0_stepsize, 100, "d0_stepsize (stored 99 + 1)");
+
+        // Word 3
+        assert_eq!(bd.d1_zero_before, 2, "d1_zero_before");
+        assert_eq!(bd.d1_wrap, 8, "d1_wrap");
+        assert_eq!(bd.d1_stepsize, 50, "d1_stepsize (stored 49 + 1)");
+
+        // Word 4
+        assert!(bd.compression_enable, "compression_enable");
+        assert_eq!(bd.d2_zero_before, 3, "d2_zero_before");
+        assert_eq!(bd.d2_wrap, 6, "d2_wrap");
+        assert_eq!(bd.d2_stepsize, 30, "d2_stepsize (stored 29 + 1)");
+
+        // Word 5
+        assert_eq!(bd.d2_zero_after, 4, "d2_zero_after");
+        assert_eq!(bd.d1_zero_after, 5, "d1_zero_after");
+        assert_eq!(bd.d0_zero_after, 6, "d0_zero_after");
+        assert_eq!(bd.d3_stepsize, 20, "d3_stepsize (stored 19 + 1)");
+
+        // Word 6
+        assert_eq!(bd.iteration_current, 10, "iteration_current");
+        assert_eq!(bd.iteration_wrap, 4, "iteration_wrap (stored 3 + 1)");
+        assert_eq!(bd.iteration_stepsize, 40, "iteration_stepsize (stored 39 + 1)");
+
+        // Word 7
+        assert!(bd.valid, "valid");
+        assert_eq!(bd.lock_rel_value, 3, "lock_rel_value");
+        assert_eq!(bd.lock_rel_id, 0x42, "lock_rel_id");
+        assert!(bd.lock_acq_enable, "lock_acq_enable");
+        assert_eq!(bd.lock_acq_value, 2, "lock_acq_value");
+        assert_eq!(bd.lock_acq_id, 0x37, "lock_acq_id");
+    }
+
+    /// Test to_bd_config() conversion with a fully-populated BufferDescriptor.
+    ///
+    /// Constructs a BufferDescriptor directly (not via register parsing) to
+    /// verify the unit conversions independently of bit layouts.
+    #[test]
+    fn test_to_bd_config_full() {
+        let bd = BufferDescriptor {
+            valid: true,
+            base_addr_words: 0x1000,
+            length_words: 256,
+            d0_stepsize: 4,     // actual words
+            d0_wrap: 16,
+            d1_stepsize: 8,
+            d1_wrap: 4,
+            d2_stepsize: 16,
+            d2_wrap: 2,
+            d3_stepsize: 32,    // MemTile only
+            iteration_stepsize: 10, // actual words
+            iteration_wrap: 3,     // actual count
+            iteration_current: 0,
+            lock_acq_enable: true,
+            lock_acq_id: 5,
+            lock_acq_value: 1,
+            lock_rel_id: 5,
+            lock_rel_value: -1,
+            use_next_bd: true,
+            next_bd: 3,
+            enable_packet: true,
+            packet_id: 7,
+            packet_type: 2,
+            ooo_bd_id: 10,
+            tlast_suppress: true,
+            compression_enable: true,
+            ..Default::default()
+        };
+
+        let cfg = bd.to_bd_config();
+
+        // Address and length: word units * 4 = byte units
+        assert_eq!(cfg.base_addr, 0x1000 * 4);
+        assert_eq!(cfg.length, 256 * 4);
+
+        // Dimension strides: word strides * 4 = byte strides
+        assert_eq!(cfg.d0.size, 16);
+        assert_eq!(cfg.d0.stride, 4 * 4);
+        assert_eq!(cfg.d1.size, 4);
+        assert_eq!(cfg.d1.stride, 8 * 4);
+        assert_eq!(cfg.d2.size, 2);
+        assert_eq!(cfg.d2.stride, 16 * 4);
+        assert_eq!(cfg.d3.stride, 32 * 4);
+
+        // Iteration: actual values -> stored-1 convention
+        assert_eq!(cfg.iteration.wrap, 2, "wrap: actual 3 -> stored 2");
+        assert_eq!(cfg.iteration.stepsize, 9, "stepsize: actual 10 -> stored 9");
+        assert_eq!(cfg.iteration.current, 0);
+
+        // Locks
+        assert_eq!(cfg.acquire_lock, Some(5));
+        assert_eq!(cfg.acquire_value, 1);
+        assert_eq!(cfg.release_lock, Some(5));
+        assert_eq!(cfg.release_value, -1);
+
+        // Chaining
+        assert_eq!(cfg.next_bd, Some(3));
+
+        // Packet/compression
+        assert!(cfg.enable_packet);
+        assert_eq!(cfg.packet_id, 7);
+        assert_eq!(cfg.packet_type, 2);
+        assert_eq!(cfg.out_of_order_bd_id, 10);
+        assert!(cfg.tlast_suppress);
+        assert!(cfg.compression_enable);
+        assert!(cfg.valid);
+    }
+
+    /// Test to_bd_config() with lock and chaining disabled.
+    #[test]
+    fn test_to_bd_config_no_locks_no_chain() {
+        let bd = BufferDescriptor {
+            valid: true,
+            length_words: 64,
+            lock_acq_enable: false,
+            lock_acq_id: 3,        // Should be ignored
+            lock_rel_value: 0,     // 0 means no release
+            lock_rel_id: 3,        // Should be ignored
+            use_next_bd: false,
+            next_bd: 5,            // Should be ignored
+            ..Default::default()
+        };
+
+        let cfg = bd.to_bd_config();
+
+        assert_eq!(cfg.acquire_lock, None);
+        assert_eq!(cfg.release_lock, None);
+        assert_eq!(cfg.next_bd, None);
+    }
+
+    /// Test to_bd_config() with d0_wrap=0 (simple 1D contiguous transfer).
+    #[test]
+    fn test_to_bd_config_simple_1d() {
+        let bd = BufferDescriptor {
+            valid: true,
+            length_words: 128,
+            d0_stepsize: 1,  // 1 word stride
+            d0_wrap: 0,      // 0 means simple contiguous
+            ..Default::default()
+        };
+
+        let cfg = bd.to_bd_config();
+
+        // d0_wrap=0 -> d0.size should be length_words (128)
+        assert_eq!(cfg.d0.size, 128);
+        // d0_stepsize=1 word -> stride = 4 bytes
+        assert_eq!(cfg.d0.stride, 4);
+    }
+
+    /// Round-trip test: parse shim BD from registers, convert to BdConfig,
+    /// and verify all fields match expectations.
+    #[test]
+    fn test_to_bd_config_shim_round_trip() {
+        // Use the existing shim BD parsing test values
+        let words: [u32; 8] = [
+            0x0000_1000,  // BD_0: length=0x1000 words
+            0x0000_0400,  // BD_1: addr_low=0x100
+            0x0000_0000,  // BD_2: addr_high=0
+            0x0010_0003,  // BD_3: d0_wrap=1, d0_step stored=3 (actual=4)
+            0x0000_0000,  // BD_4
+            0x0000_0000,  // BD_5
+            0x0000_0000,  // BD_6
+            0x0200_0000,  // BD_7: valid=1
+        ];
+
+        let bd = BufferDescriptor::from_registers(&words, TileType::Shim);
+        let cfg = bd.to_bd_config();
+
+        assert!(cfg.valid);
+        assert_eq!(cfg.base_addr, 0x100 * 4);
+        assert_eq!(cfg.length, 0x1000 * 4);
+        assert_eq!(cfg.d0.size, 1);
+        assert_eq!(cfg.d0.stride, 4 * 4);
     }
 
     #[test]

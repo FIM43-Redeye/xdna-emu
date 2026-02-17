@@ -62,6 +62,8 @@ pub enum PortType {
     Dma(u8), // Channel index
     /// Connects to local core
     Core,
+    /// Connects to tile control packet handler
+    TileCtrl,
     /// Connects to cascade interface
     Cascade,
     /// Connects to FIFO
@@ -109,6 +111,9 @@ pub struct StreamPort {
     pub port_type: PortType,
     /// FIFO buffer (data waiting to be sent/received)
     pub fifo: Vec<u32>,
+    /// TLAST flags parallel to `fifo` -- true if word at same index has TLAST set.
+    /// Kept in lock-step: push/pop/clear update both vectors together.
+    tlast_flags: Vec<bool>,
     /// FIFO capacity
     pub fifo_capacity: usize,
     /// Raw configuration register value (from CDO)
@@ -132,6 +137,7 @@ impl StreamPort {
             direction,
             port_type,
             fifo: Vec::with_capacity(fifo_capacity),
+            tlast_flags: Vec::with_capacity(fifo_capacity),
             fifo_capacity,
             config: 0,
             route_to: None,
@@ -154,10 +160,22 @@ impl StreamPort {
         self.fifo.len() >= self.fifo_capacity
     }
 
-    /// Push data into FIFO (returns false if full).
+    /// Push data into FIFO (returns false if full). TLAST defaults to false.
     pub fn push(&mut self, data: u32) -> bool {
         if self.can_accept() {
             self.fifo.push(data);
+            self.tlast_flags.push(false);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Push data with explicit TLAST flag (returns false if full).
+    pub fn push_with_tlast(&mut self, data: u32, tlast: bool) -> bool {
+        if self.can_accept() {
+            self.fifo.push(data);
+            self.tlast_flags.push(tlast);
             true
         } else {
             false
@@ -169,13 +187,29 @@ impl StreamPort {
         if self.fifo.is_empty() {
             None
         } else {
+            self.tlast_flags.remove(0);
             Some(self.fifo.remove(0))
+        }
+    }
+
+    /// Pop data with its TLAST flag from FIFO.
+    pub fn pop_with_tlast(&mut self) -> Option<(u32, bool)> {
+        if self.fifo.is_empty() {
+            None
+        } else {
+            let tlast = self.tlast_flags.remove(0);
+            Some((self.fifo.remove(0), tlast))
         }
     }
 
     /// Peek at front of FIFO without removing.
     pub fn peek(&self) -> Option<u32> {
         self.fifo.first().copied()
+    }
+
+    /// Peek at front TLAST flag without removing.
+    pub fn peek_tlast(&self) -> Option<bool> {
+        self.tlast_flags.first().copied()
     }
 
     /// Get number of items in FIFO.
@@ -186,6 +220,7 @@ impl StreamPort {
     /// Clear the FIFO.
     pub fn clear(&mut self) {
         self.fifo.clear();
+        self.tlast_flags.clear();
     }
 
     /// Set the route destination.
@@ -199,6 +234,109 @@ impl StreamPort {
         self.route_to = None;
         self.enabled = false;
     }
+}
+
+// ============================================================================
+// Packet Routing Configuration (AM025 stream switch slave slot registers)
+// ============================================================================
+
+/// Per-slave-port packet slot configuration (4 slots per slave port).
+///
+/// Packet matching: `(incoming_pkt_id & mask) == (slot_pkt_id & mask)`
+/// When a match is found, the packet is routed to all master ports on
+/// the same arbiter whose `msel_enable` bit matches this slot's `msel`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PacketSlot {
+    /// Packet ID to match (bits 28:24, 5 bits)
+    pub pkt_id: u8,
+    /// ID mask for matching (bits 20:16, 5 bits)
+    pub mask: u8,
+    /// Slot is enabled (bit 8)
+    pub enable: bool,
+    /// Master select index (bits 5:4, 2 bits)
+    pub msel: u8,
+    /// Arbiter number (bits 2:0, 3 bits)
+    pub arbiter: u8,
+}
+
+impl PacketSlot {
+    /// Parse from a 32-bit register value.
+    ///
+    /// Register layout (from aie-rt xaiemlgbl_params.h):
+    /// - Bits 28:24 = ID (packet ID)
+    /// - Bits 20:16 = MASK
+    /// - Bit 8 = ENABLE
+    /// - Bits 5:4 = MSEL
+    /// - Bits 2:0 = ARBITOR
+    pub fn from_register(value: u32) -> Self {
+        Self {
+            pkt_id: ((value >> 24) & 0x1F) as u8,
+            mask: ((value >> 16) & 0x1F) as u8,
+            enable: (value >> 8) & 1 != 0,
+            msel: ((value >> 4) & 0x3) as u8,
+            arbiter: (value & 0x7) as u8,
+        }
+    }
+
+    /// Check if an incoming packet ID matches this slot.
+    pub fn matches(&self, incoming_pkt_id: u8) -> bool {
+        self.enable && ((incoming_pkt_id & self.mask) == (self.pkt_id & self.mask))
+    }
+}
+
+/// Per-master-port packet configuration.
+///
+/// When `packet_enable` is true, this master operates in packet mode:
+/// it receives data from the arbiter/msel routing system rather than
+/// a directly-selected slave.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MasterPacketConfig {
+    /// Packet switching enabled (bit 30 of master config)
+    pub packet_enable: bool,
+    /// Drop packet header before forwarding (bit 7 of config field)
+    pub drop_header: bool,
+    /// Arbiter this master belongs to (bits 2:0 of config field)
+    pub arbiter: u8,
+    /// Which msel values this master accepts (bits 6:3 of config field, 4-bit bitmap)
+    pub msel_enable: u8,
+}
+
+impl MasterPacketConfig {
+    /// Parse from master config register value.
+    ///
+    /// Master config register layout:
+    /// - Bit 31: MASTER_ENABLE
+    /// - Bit 30: PACKET_ENABLE
+    /// - Bits 6:0: CONFIGURATION (when packet_enable=1):
+    ///   - Bit 7: DROP_HEADER
+    ///   - Bits 6:3: MSEL_ENABLE (4-bit bitmap)
+    ///   - Bits 2:0: ARBITOR
+    pub fn from_register(value: u32) -> Self {
+        let packet_enable = (value >> 30) & 1 != 0;
+        let config = value & 0xFF; // Lower 8 bits
+        Self {
+            packet_enable,
+            drop_header: (config >> 7) & 1 != 0,
+            arbiter: (config & 0x7) as u8,
+            msel_enable: ((config >> 3) & 0xF) as u8,
+        }
+    }
+
+    /// Check if this master accepts packets from the given arbiter and msel.
+    pub fn accepts(&self, arbiter: u8, msel: u8) -> bool {
+        self.packet_enable
+            && self.arbiter == arbiter
+            && (self.msel_enable >> msel) & 1 != 0
+    }
+}
+
+/// Active packet tracking for a slave port currently forwarding packet data.
+#[derive(Debug, Clone)]
+pub struct ActivePacket {
+    /// Master port indices this packet routes to
+    pub target_masters: Vec<u8>,
+    /// Number of data words forwarded so far
+    pub words_forwarded: usize,
 }
 
 /// A local route within a stream switch (slave to master).
@@ -234,12 +372,22 @@ pub struct StreamSwitch {
     pub masters: Vec<StreamPort>,
     /// Slave ports
     pub slaves: Vec<StreamPort>,
-    /// Local routes (slave → master within this tile)
+    /// Local routes (slave → master within this tile, circuit mode)
     pub local_routes: Vec<LocalRoute>,
     /// Latency in cycles for local-to-local routing
     pub local_latency: u8,
     /// Latency in cycles for external routing
     pub external_latency: u8,
+
+    // === Packet routing state ===
+
+    /// Per-slave packet slot config (4 slots per port), indexed by slave port.
+    slave_slots: Vec<[PacketSlot; 4]>,
+    /// Per-master packet config, indexed by master port.
+    master_packet_config: Vec<MasterPacketConfig>,
+    /// Per-slave active packet tracking for mid-packet forwarding.
+    /// `Some(ActivePacket)` while forwarding data words between header and TLAST.
+    active_packets: Vec<Option<ActivePacket>>,
 }
 
 impl StreamSwitch {
@@ -260,10 +408,17 @@ impl StreamSwitch {
     /// Create a new stream switch for a compute tile.
     ///
     /// Port layout is defined in aie2_spec::{COMPUTE_MASTER_PORTS, COMPUTE_SLAVE_PORTS}.
+    /// Port 3 (master and slave) is Tile_Ctrl, not Core.
     pub fn new_compute_tile(col: u8, row: u8) -> Self {
-        let masters = Self::build_ports_from_spec(aie2_spec::COMPUTE_MASTER_PORTS, PortDirection::Master);
-        let slaves = Self::build_ports_from_spec(aie2_spec::COMPUTE_SLAVE_PORTS, PortDirection::Slave);
+        let mut masters = Self::build_ports_from_spec(aie2_spec::COMPUTE_MASTER_PORTS, PortDirection::Master);
+        let mut slaves = Self::build_ports_from_spec(aie2_spec::COMPUTE_SLAVE_PORTS, PortDirection::Slave);
 
+        // Tag port 3 as TileCtrl (AM025: Compute port 3 = Tile_Ctrl)
+        if masters.len() > 3 { masters[3].port_type = PortType::TileCtrl; }
+        if slaves.len() > 3 { slaves[3].port_type = PortType::TileCtrl; }
+
+        let num_slaves = slaves.len();
+        let num_masters = masters.len();
         Self {
             col,
             row,
@@ -272,20 +427,30 @@ impl StreamSwitch {
             local_routes: Vec::new(),
             local_latency: aie2_spec::STREAM_LOCAL_TO_LOCAL_LATENCY,
             external_latency: aie2_spec::STREAM_LOCAL_TO_EXTERNAL_LATENCY,
+            slave_slots: vec![[PacketSlot::default(); 4]; num_slaves],
+            master_packet_config: vec![MasterPacketConfig::default(); num_masters],
+            active_packets: vec![None; num_slaves],
         }
     }
 
     /// Create a new stream switch for a memory tile.
     ///
     /// Port layout is defined in aie2_spec::{MEMTILE_MASTER_PORTS, MEMTILE_SLAVE_PORTS}.
+    /// Port 6 (master and slave) is Tile_Ctrl, not Core.
     ///
     /// Note the asymmetry: 6 North masters but only 4 North slaves, and
     /// 4 South masters but 6 South slaves. This matches MemTile's role as
     /// a buffer between Shim (which has 6 North outputs) and Compute tiles.
     pub fn new_mem_tile(col: u8, row: u8) -> Self {
-        let masters = Self::build_ports_from_spec(aie2_spec::MEMTILE_MASTER_PORTS, PortDirection::Master);
-        let slaves = Self::build_ports_from_spec(aie2_spec::MEMTILE_SLAVE_PORTS, PortDirection::Slave);
+        let mut masters = Self::build_ports_from_spec(aie2_spec::MEMTILE_MASTER_PORTS, PortDirection::Master);
+        let mut slaves = Self::build_ports_from_spec(aie2_spec::MEMTILE_SLAVE_PORTS, PortDirection::Slave);
 
+        // Tag port 6 as TileCtrl (AM025: MemTile port 6 = Tile_Ctrl)
+        if masters.len() > 6 { masters[6].port_type = PortType::TileCtrl; }
+        if slaves.len() > 6 { slaves[6].port_type = PortType::TileCtrl; }
+
+        let num_slaves = slaves.len();
+        let num_masters = masters.len();
         Self {
             col,
             row,
@@ -294,18 +459,28 @@ impl StreamSwitch {
             local_routes: Vec::new(),
             local_latency: aie2_spec::STREAM_LOCAL_TO_LOCAL_LATENCY,
             external_latency: aie2_spec::STREAM_LOCAL_TO_EXTERNAL_LATENCY,
+            slave_slots: vec![[PacketSlot::default(); 4]; num_slaves],
+            master_packet_config: vec![MasterPacketConfig::default(); num_masters],
+            active_packets: vec![None; num_slaves],
         }
     }
 
     /// Create a new stream switch for a shim tile.
     ///
     /// Port layout is defined in aie2_spec::{SHIM_MASTER_PORTS, SHIM_SLAVE_PORTS}.
+    /// Port 0 (master and slave) is Tile_Ctrl, not Core.
     ///
     /// The 6 North masters (12-17) connect 1:1 to MemTile South slaves (7-12).
     pub fn new_shim_tile(col: u8) -> Self {
-        let masters = Self::build_ports_from_spec(aie2_spec::SHIM_MASTER_PORTS, PortDirection::Master);
-        let slaves = Self::build_ports_from_spec(aie2_spec::SHIM_SLAVE_PORTS, PortDirection::Slave);
+        let mut masters = Self::build_ports_from_spec(aie2_spec::SHIM_MASTER_PORTS, PortDirection::Master);
+        let mut slaves = Self::build_ports_from_spec(aie2_spec::SHIM_SLAVE_PORTS, PortDirection::Slave);
 
+        // Tag port 0 as TileCtrl (AM025: Shim port 0 = Tile_Ctrl)
+        if !masters.is_empty() { masters[0].port_type = PortType::TileCtrl; }
+        if !slaves.is_empty() { slaves[0].port_type = PortType::TileCtrl; }
+
+        let num_slaves = slaves.len();
+        let num_masters = masters.len();
         Self {
             col,
             row: 0,
@@ -314,6 +489,9 @@ impl StreamSwitch {
             local_routes: Vec::new(),
             local_latency: aie2_spec::STREAM_LOCAL_TO_LOCAL_LATENCY,
             external_latency: aie2_spec::STREAM_EXTERNAL_TO_EXTERNAL_LATENCY,
+            slave_slots: vec![[PacketSlot::default(); 4]; num_slaves],
+            master_packet_config: vec![MasterPacketConfig::default(); num_masters],
+            active_packets: vec![None; num_slaves],
         }
     }
 
@@ -335,6 +513,11 @@ impl StreamSwitch {
     /// Get a mutable slave port by index.
     pub fn slave_mut(&mut self, index: usize) -> Option<&mut StreamPort> {
         self.slaves.get_mut(index)
+    }
+
+    /// Get the packet config for a master port.
+    pub fn master_packet_cfg(&self, index: usize) -> Option<&MasterPacketConfig> {
+        self.master_packet_config.get(index)
     }
 
     /// Find a DMA master port (for MM2S).
@@ -412,16 +595,21 @@ impl StreamSwitch {
         self.local_routes.clear();
     }
 
-    /// Step the stream switch: forward data along configured local routes.
+    /// Step the stream switch: forward data along circuit and packet routes.
     ///
-    /// For each configured route, if the source slave port has data and the
-    /// destination master port has space, move one word from slave to master.
+    /// Circuit routes: for each configured route, if the source slave port
+    /// has data and the destination master port has space, move one word.
+    /// Packet routes: process packet headers and forward based on slot config.
     ///
     /// Returns the number of words forwarded.
     pub fn step(&mut self) -> usize {
         let mut words_forwarded = 0;
 
-        // Process each local route
+        // Step packet-switched routes first (they consume from slave FIFOs
+        // that circuit routes should not also consume from)
+        words_forwarded += self.step_packet_routes();
+
+        // Process each circuit-switched local route
         for route in &self.local_routes {
             if !route.enabled {
                 continue;
@@ -447,12 +635,13 @@ impl StreamSwitch {
             }
 
             if slave_has_data && master_can_accept {
-                // Forward one word
-                if let Some(data) = self.slaves[slave_idx].pop() {
-                    if self.masters[master_idx].push(data) {
+                // Forward one word with TLAST sideband
+                if let Some((data, tlast)) = self.slaves[slave_idx].pop_with_tlast() {
+                    if self.masters[master_idx].push_with_tlast(data, tlast) {
                         words_forwarded += 1;
-                        log::debug!("TileSwitch({},{}): slave[{}] -> master[{}] data=0x{:08X}",
-                            self.col, self.row, slave_idx, master_idx, data);
+                        log::debug!("TileSwitch({},{}): slave[{}] -> master[{}] data=0x{:08X}{}",
+                            self.col, self.row, slave_idx, master_idx, data,
+                            if tlast { " TLAST" } else { "" });
                     }
                 }
             }
@@ -478,6 +667,200 @@ impl StreamSwitch {
     /// Get the number of configured local routes.
     pub fn local_route_count(&self) -> usize {
         self.local_routes.len()
+    }
+
+    // ========================================================================
+    // Packet routing configuration and forwarding
+    // ========================================================================
+
+    /// Configure a slave port's packet slot from a register write.
+    ///
+    /// Each slave port has 4 slots (0-3). The register value encodes
+    /// ID, mask, enable, msel, and arbiter fields per aie-rt format.
+    pub fn configure_slave_slot(&mut self, slave_port: usize, slot: usize, value: u32) {
+        if slave_port < self.slave_slots.len() && slot < 4 {
+            let parsed = PacketSlot::from_register(value);
+            log::debug!("TileSwitch({},{}): slave[{}] slot[{}] = id={} mask=0x{:02X} en={} msel={} arb={}",
+                self.col, self.row, slave_port, slot,
+                parsed.pkt_id, parsed.mask, parsed.enable, parsed.msel, parsed.arbiter);
+            self.slave_slots[slave_port][slot] = parsed;
+        }
+    }
+
+    /// Configure a master port's packet mode from its config register.
+    ///
+    /// Extracts packet_enable, drop_header, arbiter, and msel_enable.
+    pub fn configure_master_packet(&mut self, master_port: usize, value: u32) {
+        if master_port < self.master_packet_config.len() {
+            let parsed = MasterPacketConfig::from_register(value);
+            log::debug!("TileSwitch({},{}): master[{}] pkt_en={} drop_hdr={} arb={} msel_en=0b{:04b}",
+                self.col, self.row, master_port,
+                parsed.packet_enable, parsed.drop_header, parsed.arbiter, parsed.msel_enable);
+            self.master_packet_config[master_port] = parsed;
+        }
+    }
+
+    /// Resolve which master ports a packet should route to.
+    ///
+    /// Scans the slave's 4 slots for a match on `pkt_id`, then finds all
+    /// masters on the matching arbiter whose msel_enable includes the slot's msel.
+    fn resolve_packet_route(&self, slave_port: usize, pkt_id: u8) -> Option<(Vec<u8>, bool)> {
+        if slave_port >= self.slave_slots.len() {
+            return None;
+        }
+
+        // Find first matching slot
+        for slot in &self.slave_slots[slave_port] {
+            if !slot.matches(pkt_id) {
+                continue;
+            }
+
+            // Find all master ports on this arbiter+msel
+            let mut masters = Vec::new();
+            let mut all_drop_header = true;
+            for (idx, mcfg) in self.master_packet_config.iter().enumerate() {
+                if mcfg.accepts(slot.arbiter, slot.msel) {
+                    masters.push(idx as u8);
+                    if !mcfg.drop_header {
+                        all_drop_header = false;
+                    }
+                }
+            }
+
+            if !masters.is_empty() {
+                log::debug!("TileSwitch({},{}): pkt_id={} matched slave[{}] slot(arb={},msel={}) -> masters {:?} drop_hdr={}",
+                    self.col, self.row, pkt_id, slave_port,
+                    slot.arbiter, slot.msel, masters, all_drop_header);
+                return Some((masters, all_drop_header));
+            }
+        }
+
+        None
+    }
+
+    /// Step packet-switched routing for all slave ports.
+    ///
+    /// For each slave with enabled packet slots:
+    /// - If idle: peek at first word, decode as header, resolve route, begin forwarding
+    /// - If mid-packet: pop word, push to all target masters, end on TLAST
+    ///
+    /// Returns the number of words forwarded.
+    pub fn step_packet_routes(&mut self) -> usize {
+        let mut words_forwarded = 0;
+        let num_slaves = self.slaves.len();
+
+        for slave_idx in 0..num_slaves {
+            // Skip slaves with no enabled packet slots
+            let has_any_slot = self.slave_slots.get(slave_idx)
+                .map_or(false, |slots| slots.iter().any(|s| s.enable));
+            if !has_any_slot {
+                continue;
+            }
+
+            // Skip if slave has no data
+            if !self.slaves[slave_idx].has_data() {
+                continue;
+            }
+
+            if self.active_packets[slave_idx].is_none() {
+                // === Idle: look for a new packet header ===
+                let header_word = match self.slaves[slave_idx].peek() {
+                    Some(w) => w,
+                    None => continue,
+                };
+
+                // Decode the stream header to get pkt_id
+                let (header, _parity_ok) = PacketHeader::decode(header_word);
+                let pkt_id = header.stream_id;
+
+                // Resolve route
+                match self.resolve_packet_route(slave_idx, pkt_id) {
+                    Some((masters, all_drop_header)) => {
+                        // Consume the header word from slave
+                        let (data, tlast) = self.slaves[slave_idx].pop_with_tlast().unwrap();
+
+                        // Forward header to masters that don't drop it
+                        if !all_drop_header {
+                            for &m in &masters {
+                                let m = m as usize;
+                                if m < self.masters.len() && !self.master_packet_config[m].drop_header {
+                                    self.masters[m].push_with_tlast(data, tlast);
+                                }
+                            }
+                        }
+                        words_forwarded += 1;
+
+                        log::debug!("TileSwitch({},{}): pkt header 0x{:08X} (id={}) slave[{}] -> masters {:?}{}{}",
+                            self.col, self.row, data, pkt_id, slave_idx, masters,
+                            if all_drop_header { " (header dropped)" } else { "" },
+                            if tlast { " TLAST" } else { "" });
+
+                        if tlast {
+                            // Single-word packet (header only with TLAST)
+                            // Don't set active_packets -- we're done
+                        } else {
+                            self.active_packets[slave_idx] = Some(ActivePacket {
+                                target_masters: masters,
+                                words_forwarded: 0,
+                            });
+                        }
+                    }
+                    None => {
+                        // No route found -- drop the word
+                        log::warn!("TileSwitch({},{}): no packet route for pkt_id={} on slave[{}], dropping",
+                            self.col, self.row, pkt_id, slave_idx);
+                        self.slaves[slave_idx].pop();
+                    }
+                }
+            } else {
+                // === Mid-packet: forward data word ===
+                let (data, tlast) = match self.slaves[slave_idx].pop_with_tlast() {
+                    Some(dt) => dt,
+                    None => continue,
+                };
+
+                // Push to all target masters
+                let active = self.active_packets[slave_idx].as_ref().unwrap();
+                let targets: Vec<u8> = active.target_masters.clone();
+                for &m in &targets {
+                    let m = m as usize;
+                    if m < self.masters.len() {
+                        self.masters[m].push_with_tlast(data, tlast);
+                    }
+                }
+                words_forwarded += 1;
+
+                if let Some(ref mut active) = self.active_packets[slave_idx] {
+                    active.words_forwarded += 1;
+                }
+
+                if tlast {
+                    log::debug!("TileSwitch({},{}): pkt data 0x{:08X} slave[{}] -> {:?} TLAST (end of pkt)",
+                        self.col, self.row, data, slave_idx, targets);
+                    self.active_packets[slave_idx] = None;
+                } else {
+                    log::trace!("TileSwitch({},{}): pkt data 0x{:08X} slave[{}] -> {:?}",
+                        self.col, self.row, data, slave_idx, targets);
+                }
+            }
+        }
+
+        words_forwarded
+    }
+
+    /// Check if any packet route has data pending.
+    pub fn has_pending_packet(&self) -> bool {
+        for slave_idx in 0..self.slaves.len() {
+            if self.active_packets[slave_idx].is_some() {
+                return true;
+            }
+            let has_any_slot = self.slave_slots.get(slave_idx)
+                .map_or(false, |slots| slots.iter().any(|s| s.enable));
+            if has_any_slot && self.slaves[slave_idx].has_data() {
+                return true;
+            }
+        }
+        false
     }
 }
 

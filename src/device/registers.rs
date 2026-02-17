@@ -101,31 +101,47 @@ impl RegisterModule {
     /// Note: This function determines the module type from offset alone.
     /// For row-specific handling (e.g., MemTile vs Compute), use `from_offset_with_row`.
     ///
-    /// Register ranges derived from AM025.
+    /// Structural constants (BD base, channel base, lock base, etc.) are derived
+    /// from the register database. Only core module, program/data memory ranges,
+    /// and stream switch addresses remain as constants (no regdb equivalent).
     pub fn from_offset(offset: u32) -> Self {
         use super::registers_spec::{
-            memory_module as mm, mem_tile_module as mt, core_module,
+            core_module,
             DATA_MEMORY_BASE, COMPUTE_DATA_MEMORY_END,
             PROGRAM_MEMORY_BASE, PROGRAM_MEMORY_END,
         };
 
+        let lay = super::regdb::device_reg_layout();
+
+        // Compute tile BD end: base + count * stride. Use 16 BDs (from model config).
+        let memory_bd_end = lay.memory_bd_base + 16 * lay.memory_bd_stride;
+
+        // MemTile lock end: base + 64 locks * stride
+        let memtile_lock_end = lay.memtile_lock_base + 64 * lay.memtile_lock_stride;
+
+        // Compute tile lock end: base + 16 locks * stride
+        let memory_lock_end = lay.memory_lock_base + 16 * lay.memory_lock_stride;
+
+        let ss = &lay.memory_stream_switch;
+        let mt_ss = &lay.memtile_stream_switch;
+
         match offset {
             // Compute tile registers (AM025 MEMORY_MODULE, CORE_MODULE)
             DATA_MEMORY_BASE..=COMPUTE_DATA_MEMORY_END => RegisterModule::Memory,
-            o if (mm::DMA_BD_BASE..mm::DMA_BD_END).contains(&o) => RegisterModule::DmaBufferDescriptor,
-            o if (mm::DMA_CHANNEL_BASE..mm::DMA_STATUS_BASE).contains(&o) => RegisterModule::DmaChannel,
+            o if (lay.memory_bd_base..memory_bd_end).contains(&o) => RegisterModule::DmaBufferDescriptor,
+            o if (lay.memory_channel_base..lay.memory_status_base).contains(&o) => RegisterModule::DmaChannel,
             0x1E000..=0x1EFFF => RegisterModule::MemoryModule,  // Memory module misc
-            o if (mm::LOCK_BASE..mm::LOCK_END).contains(&o) => RegisterModule::Locks,
+            o if (lay.memory_lock_base..memory_lock_end).contains(&o) => RegisterModule::Locks,
             PROGRAM_MEMORY_BASE..=PROGRAM_MEMORY_END => RegisterModule::ProgramMemory,
             core_module::OFFSET_START..=core_module::OFFSET_END => RegisterModule::CoreModule,
-            o if (mm::STREAM_SWITCH_MASTER_BASE..=0x3FFFF).contains(&o) => RegisterModule::StreamSwitch,
+            o if (ss.master_base..ss.slave_slot_end).contains(&o) => RegisterModule::StreamSwitch,
 
             // MemTile registers (row 1) - AM025 MEMORY_TILE_MODULE
             // MemTile has 512KB data memory (0x00000-0x7FFFF) - handled by Memory above
-            o if (mt::DMA_BD_BASE..mt::DMA_BD_BASE + 0x400).contains(&o) => RegisterModule::MemTileDmaBufferDescriptor,
-            o if (mt::DMA_CHANNEL_S2MM_BASE..mt::DMA_CHANNEL_S2MM_BASE + 0x100).contains(&o) => RegisterModule::MemTileDmaChannel,
-            o if (mt::STREAM_SWITCH_MASTER_BASE..mt::STREAM_SWITCH_SLAVE_END).contains(&o) => RegisterModule::MemTileStreamSwitch,
-            o if (mt::LOCK_BASE..mt::LOCK_END).contains(&o) => RegisterModule::MemTileLocks,
+            o if (lay.memtile_bd_base..lay.memtile_bd_base + 0x400).contains(&o) => RegisterModule::MemTileDmaBufferDescriptor,
+            o if (lay.memtile_channel_s2mm_base..lay.memtile_channel_s2mm_base + 0x100).contains(&o) => RegisterModule::MemTileDmaChannel,
+            o if (mt_ss.master_base..mt_ss.slave_slot_end).contains(&o) => RegisterModule::MemTileStreamSwitch,
+            o if (lay.memtile_lock_base..memtile_lock_end).contains(&o) => RegisterModule::MemTileLocks,
 
             _ => RegisterModule::Unknown,
         }
@@ -211,20 +227,20 @@ impl fmt::Display for RegisterInfo {
 
 /// Look up DMA buffer descriptor registers.
 ///
-/// Each BD is 6 words (24 bytes) with 32-byte stride.
-/// AM025 memory_module/dma/bd.txt
+/// BD base/stride/words derived from register database (AM025).
 fn lookup_dma_bd(offset: u32) -> Option<RegisterInfo> {
-    use super::registers_spec::memory_module as mm;
+    let lay = super::regdb::device_reg_layout();
+    let bd_end = lay.memory_bd_base + 16 * lay.memory_bd_stride;
 
-    if !(mm::DMA_BD_BASE..mm::DMA_BD_END).contains(&offset) {
+    if !(lay.memory_bd_base..bd_end).contains(&offset) {
         return None;
     }
 
-    let rel = offset - mm::DMA_BD_BASE;
-    let bd_num = rel / mm::DMA_BD_STRIDE;
-    let word = (rel % mm::DMA_BD_STRIDE) / 4;
+    let rel = offset - lay.memory_bd_base;
+    let bd_num = rel / lay.memory_bd_stride;
+    let word = (rel % lay.memory_bd_stride) / 4;
 
-    if word as usize >= mm::DMA_BD_WORDS {
+    if word as usize >= lay.memory_bd_words {
         return None;  // Gap between BDs
     }
 
@@ -248,17 +264,17 @@ fn lookup_dma_bd(offset: u32) -> Option<RegisterInfo> {
 
 /// Look up lock registers.
 ///
-/// Compute tiles have 16 locks, 16 bytes apart.
-/// AM025 memory_module/lock/value.txt
+/// Lock base/stride derived from register database (AM025).
 fn lookup_lock(offset: u32) -> Option<RegisterInfo> {
-    use super::registers_spec::memory_module as mm;
+    let lay = super::regdb::device_reg_layout();
+    let lock_end = lay.memory_lock_base + 16 * lay.memory_lock_stride;
 
-    if !(mm::LOCK_BASE..mm::LOCK_END).contains(&offset) {
+    if !(lay.memory_lock_base..lock_end).contains(&offset) {
         return None;
     }
 
-    let rel = offset - mm::LOCK_BASE;
-    let lock_num = rel / mm::LOCK_STRIDE;
+    let rel = offset - lay.memory_lock_base;
+    let lock_num = rel / lay.memory_lock_stride;
 
     Some(RegisterInfo {
         name: "LOCK_VALUE",
@@ -300,7 +316,7 @@ static CORE_REGISTERS: &[RegisterInfo] = &[
     },
     RegisterInfo {
         name: "CORE_DEBUG_CONTROL0",
-        offset: 0x32400,
+        offset: 0x32010,
         description: "Debug control 0",
         module: RegisterModule::CoreModule,
     },

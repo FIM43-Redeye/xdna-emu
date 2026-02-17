@@ -248,6 +248,12 @@ impl Transfer {
             bd_config.iteration,
         );
 
+        // Total transfer size: BD length (per-iteration) * number of iterations.
+        // Buffer_Length sets the per-iteration data volume; iteration repeats
+        // the entire dimensional pattern with an address offset.
+        let total_bytes = bd_config.length as u64
+            * bd_config.iteration.total_iterations() as u64;
+
         // Determine endpoints based on direction and tile type
         let is_shim = tile_type == TileType::Shim;
 
@@ -302,7 +308,7 @@ impl Transfer {
             tile_row,
             packet_header_sent: false,
             bytes_transferred: 0,
-            total_bytes: bd_config.length as u64,
+            total_bytes,
             cycles_elapsed: 0,
             error: None,
         })
@@ -541,16 +547,9 @@ impl Transfer {
 
     /// Generate packet header word for MM2S packet-switched streams.
     ///
-    /// Packet header format (AM025):
-    /// - Bit 31: Odd parity over bits 30:0
-    /// - Bits 30:28: 3'b000
-    /// - Bits 27:25: Source Column (3 bits)
-    /// - Bits 24:22: Source Row (3 bits)
-    /// - Bit 21: 1'b0
-    /// - Bits 20:18: Packet_Type (from BD, 3 bits)
-    /// - Bits 17:11: 7'b0000000
-    /// - Bits 10:5: Stream_ID/Packet_ID (from BD, 6 bits - note: BD has 5 bits, MSB is 0)
-    /// - Bits 4:0: Reserved 5'b00000
+    /// Uses the AM020 Ch2 Table 2 format via `PacketHeader::encode()`:
+    /// | 31    | 30-28 | 27-21      | 20-16     | 15  | 14-12       | 11-5    | 4-0       |
+    /// | Parity| Rsvd  | Src Column | Src Row   | Rsvd| Packet Type | Rsvd    | Stream ID |
     ///
     /// Returns None if packet mode is disabled.
     pub fn generate_packet_header(&self) -> Option<u32> {
@@ -558,36 +557,10 @@ impl Transfer {
             return None;
         }
 
-        let mut header: u32 = 0;
-
-        // Bits 27:25: Source Column (3 bits)
-        header |= ((self.tile_col as u32) & 0x7) << 25;
-
-        // Bits 24:22: Source Row (3 bits)
-        header |= ((self.tile_row as u32) & 0x7) << 22;
-
-        // Bit 21: 0
-
-        // Bits 20:18: Packet_Type (3 bits)
-        header |= ((self.packet_type as u32) & 0x7) << 18;
-
-        // Bits 17:12: Out_Of_Order_BD_ID (6 bits, for S2MM to select BD in OOO mode)
-        // This is placed in the upper reserved bits for OOO identification
-        header |= ((self.out_of_order_bd_id as u32) & 0x3F) << 12;
-
-        // Bits 10:5: Stream_ID (6 bits, from packet_id which is 5 bits)
-        header |= ((self.packet_id as u32) & 0x3F) << 5;
-
-        // Bits 4:0: Reserved
-
-        // Bit 31: Odd parity over bits 30:0
-        let ones = (header & 0x7FFF_FFFF).count_ones();
-        if ones % 2 == 0 {
-            // Even number of ones - set parity bit to make it odd
-            header |= 1 << 31;
-        }
-
-        Some(header)
+        use crate::device::stream_switch::{PacketHeader, PacketType};
+        let header = PacketHeader::new(self.packet_id, self.tile_col, self.tile_row)
+            .with_type(PacketType::from_u8(self.packet_type));
+        Some(header.encode())
     }
 
     /// Mark packet header as sent.
@@ -601,35 +574,30 @@ impl Transfer {
     }
 }
 
-/// Parse an out-of-order BD ID from a packet header.
+/// Parse source tile coordinates from a packet header (AM020 Table 2).
 ///
-/// The OOO BD ID is stored in bits 17:12 of the packet header.
-/// Returns the 6-bit BD ID that S2MM should use in out-of-order mode.
-pub fn parse_ooo_bd_id_from_header(header: u32) -> u8 {
-    ((header >> 12) & 0x3F) as u8
-}
-
-/// Parse source tile coordinates from a packet header.
-///
-/// Returns (col, row) extracted from header bits 27:25 and 24:22.
+/// Returns (col, row) extracted from header bits 27:21 and 20:16.
 pub fn parse_source_tile_from_header(header: u32) -> (u8, u8) {
-    let col = ((header >> 25) & 0x7) as u8;
-    let row = ((header >> 22) & 0x7) as u8;
+    use crate::device::aie2_spec;
+    let col = ((header >> aie2_spec::PACKET_SRC_COL_SHIFT) & aie2_spec::PACKET_SRC_COL_MASK) as u8;
+    let row = ((header >> aie2_spec::PACKET_SRC_ROW_SHIFT) & aie2_spec::PACKET_SRC_ROW_MASK) as u8;
     (col, row)
 }
 
-/// Parse packet type from a packet header.
+/// Parse packet type from a packet header (AM020 Table 2).
 ///
-/// Returns the 3-bit packet type from bits 20:18.
+/// Returns the 3-bit packet type from bits 14:12.
 pub fn parse_packet_type_from_header(header: u32) -> u8 {
-    ((header >> 18) & 0x7) as u8
+    use crate::device::aie2_spec;
+    ((header >> aie2_spec::PACKET_TYPE_SHIFT) & aie2_spec::PACKET_TYPE_MASK) as u8
 }
 
-/// Parse stream/packet ID from a packet header.
+/// Parse stream/packet ID from a packet header (AM020 Table 2).
 ///
-/// Returns the 6-bit stream ID from bits 10:5.
+/// Returns the 5-bit stream ID from bits 4:0.
 pub fn parse_stream_id_from_header(header: u32) -> u8 {
-    ((header >> 5) & 0x3F) as u8
+    use crate::device::aie2_spec;
+    (header & aie2_spec::PACKET_STREAM_ID_MASK) as u8
 }
 
 #[cfg(test)]
@@ -796,7 +764,7 @@ mod tests {
         let mut bd = simple_bd();
         bd.enable_packet = true;
         bd.packet_id = 0x1F;     // 5-bit value, max
-        bd.packet_type = 0x5;    // 3-bit value
+        bd.packet_type = 0x3;    // 3-bit value (Trace)
 
         // Create transfer at tile (3, 5)
         let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 3, 5, TileType::Compute).unwrap();
@@ -805,31 +773,41 @@ mod tests {
 
         let header = transfer.generate_packet_header().unwrap();
 
-        // Verify header format per AM025:
-        // Bits 27:25 = Source Column (3) = 0b011
-        // Bits 24:22 = Source Row (5)    = 0b101
-        // Bits 20:18 = Packet_Type (5)   = 0b101
-        // Bits 10:5  = Stream_ID (0x1F)  = 0b011111
+        // Verify header format per AM020 Ch2, Table 2:
+        // | 31    | 30-28 | 27-21      | 20-16     | 15  | 14-12       | 11-5    | 4-0       |
+        // | Parity| Rsvd  | Src Column | Src Row   | Rsvd| Packet Type | Rsvd    | Stream ID |
 
-        // Check source column (bits 27:25)
-        let col = (header >> 25) & 0x7;
+        // Check source column (bits 27:21, 7-bit field)
+        let col = (header >> 21) & 0x7F;
         assert_eq!(col, 3, "Source column should be 3");
 
-        // Check source row (bits 24:22)
-        let row = (header >> 22) & 0x7;
+        // Check source row (bits 20:16, 5-bit field)
+        let row = (header >> 16) & 0x1F;
         assert_eq!(row, 5, "Source row should be 5");
 
-        // Check packet type (bits 20:18)
-        let pkt_type = (header >> 18) & 0x7;
-        assert_eq!(pkt_type, 5, "Packet type should be 5");
+        // Check packet type (bits 14:12, 3-bit field)
+        let pkt_type = (header >> 12) & 0x7;
+        assert_eq!(pkt_type, 3, "Packet type should be 3 (Trace)");
 
-        // Check stream ID (bits 10:5)
-        let stream_id = (header >> 5) & 0x3F;
+        // Check stream ID (bits 4:0, 5-bit field)
+        let stream_id = header & 0x1F;
         assert_eq!(stream_id, 0x1F, "Stream ID should be 0x1F");
 
         // Verify odd parity
         let ones = header.count_ones();
         assert_eq!(ones % 2, 1, "Parity should be odd, got {} ones", ones);
+
+        // Verify round-trip via PacketHeader::decode
+        let (decoded, parity_ok) = crate::device::stream_switch::PacketHeader::decode(header);
+        assert!(parity_ok, "Parity check should pass");
+        assert_eq!(decoded.stream_id, 0x1F);
+        assert_eq!(decoded.src_col, 3);
+        assert_eq!(decoded.src_row, 5);
+
+        // Verify parse helper functions
+        assert_eq!(super::parse_stream_id_from_header(header), 0x1F);
+        assert_eq!(super::parse_packet_type_from_header(header), 3);
+        assert_eq!(super::parse_source_tile_from_header(header), (3, 5));
     }
 
     #[test]

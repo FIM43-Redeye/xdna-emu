@@ -24,10 +24,10 @@
 use anyhow::Result;
 use std::sync::Arc;
 
-use super::arch_config::{ArchConfig, Aie2Config, Aie2pConfig};
+use super::arch_config::{ArchConfig, ModelConfig};
 use super::array::TileArray;
 use super::registers::{RegisterModule, TileAddress};
-use super::tile::{Tile, TileType, NUM_DMA_BDS, NUM_DMA_CHANNELS, NUM_LOCKS};
+use super::tile::{Tile, TileType};
 use crate::parser::cdo::{Cdo, CdoCommand};
 
 /// Statistics about CDO application.
@@ -73,13 +73,13 @@ impl DeviceState {
     /// Create an NPU1 device state.
     #[inline]
     pub fn new_npu1() -> Self {
-        Self::new(Arc::new(Aie2Config))
+        Self::new(ModelConfig::npu1())
     }
 
     /// Create an NPU2 device state.
     #[inline]
     pub fn new_npu2() -> Self {
-        Self::new(Arc::new(Aie2pConfig))
+        Self::new(ModelConfig::npu2())
     }
 
     /// Apply a CDO to configure the device.
@@ -114,8 +114,8 @@ impl DeviceState {
             CdoCommand::MaskWrite { address, mask, value } => {
                 self.stats.mask_writes += 1;
                 let tile_addr = TileAddress::decode(*address);
-                log::trace!("CDO MaskWrite: addr=0x{:08X} -> tile({},{}) offset=0x{:05X}",
-                    address, tile_addr.col, tile_addr.row, tile_addr.offset);
+                log::trace!("CDO MaskWrite: addr=0x{:08X} -> tile({},{}) offset=0x{:05X} mask=0x{:08X} value=0x{:08X}",
+                    address, tile_addr.col, tile_addr.row, tile_addr.offset, mask, value);
                 self.mask_write_register(*address, *mask, *value)?;
             }
 
@@ -218,21 +218,37 @@ impl DeviceState {
     /// Masked write to a register.
     fn mask_write_register(&mut self, address: u32, mask: u32, value: u32) -> Result<()> {
         let tile_addr = TileAddress::decode(address);
+        let module = tile_addr.module();
+
+        log::trace!("mask_write_register: addr=0x{:08X} tile({},{}) offset=0x{:05X} module={:?}",
+            address, tile_addr.col, tile_addr.row, tile_addr.offset, module);
 
         // Get the tile
         let tile = match self.array.get_mut(tile_addr.col, tile_addr.row) {
             Some(t) => t,
-            None => return Ok(()),
+            None => {
+                log::trace!("mask_write_register: tile({},{}) not in array", tile_addr.col, tile_addr.row);
+                return Ok(());
+            }
         };
 
         // For most registers, we can just apply the masked value directly
         // since we're initializing from zero state
         let reg_layout = super::regdb::device_reg_layout();
 
-        match tile_addr.module() {
+        match module {
             RegisterModule::Locks => {
-                Self::mask_write_lock_value(tile, tile_addr.offset,
-                    reg_layout.memory_lock_base, reg_layout.memory_lock_stride, mask, value);
+                // Lock offsets (0x1F000+) collide with Shim Mux/Demux Config
+                // (0x1F000/0x1F004). For shim tiles, route through write_register()
+                // so the Shim Mux parser fires. For other tiles, handle as lock write.
+                if tile.is_shim() {
+                    let current = *tile.registers_ref().get(&tile_addr.offset).unwrap_or(&0);
+                    let new_value = (current & !mask) | (value & mask);
+                    tile.write_register(tile_addr.offset, new_value);
+                } else {
+                    Self::mask_write_lock_value(tile, tile_addr.offset,
+                        reg_layout.memory_lock_base, reg_layout.memory_lock_stride, mask, value);
+                }
             }
 
             RegisterModule::MemTileLocks => {
@@ -253,8 +269,19 @@ impl DeviceState {
             }
 
             _ => {
-                // For unhandled registers, just do a regular write
-                self.write_register(address, value)?;
+                // Read-modify-write: preserve bits not covered by mask.
+                // Multiple MaskWrites to the same register (e.g., Shim Mux config at
+                // 0x1F000) must accumulate rather than clobber each other.
+                if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
+                    let current = *tile.registers_ref().get(&tile_addr.offset).unwrap_or(&0);
+                    let new_value = (current & !mask) | (value & mask);
+                    log::debug!("CDO MaskWrite RMW: tile({},{}) offset=0x{:05X} current=0x{:08X} -> 0x{:08X} (mask=0x{:08X} val=0x{:08X})",
+                        tile_addr.col, tile_addr.row, tile_addr.offset, current, new_value, mask, value);
+                    tile.write_register(tile_addr.offset, new_value);
+                } else {
+                    log::warn!("CDO MaskWrite: tile({},{}) not found for offset=0x{:05X}",
+                        tile_addr.col, tile_addr.row, tile_addr.offset);
+                }
             }
         }
 
@@ -331,7 +358,7 @@ impl DeviceState {
         is_memtile: bool,
     ) {
         let lock_idx = ((tile_addr.offset - base) / stride) as usize;
-        if lock_idx < NUM_LOCKS {
+        if lock_idx < tile.locks.len() {
             tile.locks[lock_idx].set(value as u8);
             if value != 0 {
                 let tile_type = if is_memtile { "MemTile" } else { "Compute" };
@@ -351,7 +378,7 @@ impl DeviceState {
         value: u32,
     ) {
         let lock_idx = ((offset - base) / stride) as usize;
-        if lock_idx < NUM_LOCKS {
+        if lock_idx < tile.locks.len() {
             let current = tile.locks[lock_idx].value as u32;
             let new_value = (current & !mask) | (value & mask);
             tile.locks[lock_idx].set(new_value as u8);
@@ -380,18 +407,22 @@ impl DeviceState {
 
     /// Write to a DMA buffer descriptor.
     fn write_dma_bd(&mut self, col: u8, row: u8, offset: u32, value: u32) {
-        use super::registers_spec::{memory_module as mm, sign_extend_7bit};
+        use crate::device::dma::bd::BufferDescriptor;
+        use crate::device::tile::TileType;
 
-        // BD registers: base at DMA_BD_BASE, stride DMA_BD_STRIDE (AM025)
-        let rel = offset - mm::DMA_BD_BASE;
-        let bd_idx = (rel / mm::DMA_BD_STRIDE) as usize;
-        let word = ((rel % mm::DMA_BD_STRIDE) / 4) as usize;
+        let reg_layout = super::regdb::device_reg_layout();
 
-        if bd_idx >= NUM_DMA_BDS || word >= mm::DMA_BD_WORDS {
+        // BD registers: base/stride/words derived from register database
+        let rel = offset - reg_layout.memory_bd_base;
+        let bd_idx = (rel / reg_layout.memory_bd_stride) as usize;
+        let word = ((rel % reg_layout.memory_bd_stride) / 4) as usize;
+
+        let num_bds = self.array.get(col, row).map_or(0, |t| t.dma_bds.len());
+        if bd_idx >= num_bds || word >= reg_layout.memory_bd_words {
             return;
         }
 
-        // Update the legacy tile BD storage
+        // Update the legacy tile BD storage (CDO writes one word at a time)
         if let Some(tile) = self.array.get_mut(col, row) {
             let bd = &mut tile.dma_bds[bd_idx];
             match word {
@@ -405,111 +436,31 @@ impl DeviceState {
             }
         }
 
-        // Also update the DmaEngine's BD config
-        // Parse all 6 BD words using the data-driven register database layout
+        // Parse all 6 BD words using the data-driven register database parser,
+        // then convert to the runtime BdConfig used by the DMA engine.
         let bd_config = self.array.get(col, row).map(|tile| {
             let tile_bd = &tile.dma_bds[bd_idx];
-            let lay = &super::regdb::device_reg_layout().memory_bd;
-
-            // Get raw words (stored in legacy struct fields)
-            let word0 = tile_bd.addr_low;
-            let word1 = tile_bd.addr_high;  // Compression/packet control
-            let word2 = tile_bd.length;     // Stepsizes
-            let word3 = tile_bd.control;    // Wrap counts
-            let word4 = tile_bd.d0;         // Iteration
-            let word5 = tile_bd.d1;         // Locks and chaining
-
-            // === Word 0: Base_Address and Buffer_Length ===
-            let base_addr_words = lay.base_address.extract(word0) as u64;
-            let base_addr = base_addr_words * 4; // Convert word address to byte address
-            let length_words = lay.buffer_length.extract(word0);
-            let length = length_words * 4; // Convert word count to byte count
-
-            // === Word 1: Compression/Packet Control (MM2S only) ===
-            let enable_compression = lay.enable_compression.extract_bool(word1);
-            let enable_packet = lay.enable_packet.extract_bool(word1);
-            let out_of_order_bd_id = lay.out_of_order_bd_id.extract(word1) as u8;
-            let packet_id = lay.packet_id.extract(word1) as u8;
-            let packet_type = lay.packet_type.extract(word1) as u8;
-
-            // === Word 2: Dimension Stepsizes ===
-            // Stepsizes are stored as (actual - 1) in words
-            let d0_stepsize_raw = lay.d0_stepsize.extract(word2) as u16;
-            let d1_stepsize_raw = lay.d1_stepsize.extract(word2) as u16;
-            // Convert to actual stride in bytes: (raw + 1) * 4
-            let d0_stride = ((d0_stepsize_raw as i32) + 1) * 4;
-            let d1_stride = ((d1_stepsize_raw as i32) + 1) * 4;
-
-            // === Word 3: Wrap Counts and D2 Stepsize ===
-            // Wrap counts: 0 = no wrap (single iteration for that dimension)
-            let d0_wrap = lay.d0_wrap.extract(word3);
-            let d1_wrap = lay.d1_wrap.extract(word3);
-            let d2_stepsize_raw = lay.d2_stepsize.extract(word3) as u16;
-            let d2_stride = ((d2_stepsize_raw as i32) + 1) * 4;
-
-            // === Word 4: Iteration Control ===
-            let iteration_current = lay.iteration_current.extract(word4) as u8;
-            let iteration_wrap = lay.iteration_wrap.extract(word4) as u8;
-            let iteration_stepsize = lay.iteration_stepsize.extract(word4) as u16;
-
-            // === Word 5: Locks and Chaining ===
-            let tlast_suppress = lay.tlast_suppress.extract_bool(word5);
-            let valid = lay.valid_bd.extract_bool(word5);
-            let next_bd_id = lay.next_bd.extract(word5) as u8;
-            let use_next_bd = lay.use_next_bd.extract_bool(word5);
-            let next_bd = if use_next_bd { Some(next_bd_id) } else { None };
-
-            let lock_acq_id = lay.lock_acq_id.extract(word5) as u8;
-            let lock_acq_value = sign_extend_7bit(lay.lock_acq_value.extract(word5));
-            let lock_acq_enable = lay.lock_acq_enable.extract_bool(word5);
-            let lock_rel_id = lay.lock_rel_id.extract(word5) as u8;
-            let lock_rel_value = sign_extend_7bit(lay.lock_rel_value.extract(word5));
+            let words = [
+                tile_bd.addr_low, tile_bd.addr_high, tile_bd.length,
+                tile_bd.control, tile_bd.d0, tile_bd.d1,
+            ];
 
             log::trace!("  BD {} words=[0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}]",
-                bd_idx, word0, word1, word2, word3, word4, word5);
+                bd_idx, words[0], words[1], words[2], words[3], words[4], words[5]);
 
-            // For backwards compatibility, also check if any data is non-zero
-            let has_any_data = word0 != 0 || word1 != 0 || word2 != 0 || word3 != 0 || word4 != 0 || word5 != 0;
-            let is_valid = valid || has_any_data;
+            let parsed = BufferDescriptor::from_registers(&words, TileType::Compute);
+            let mut config = parsed.to_bd_config();
 
-            // Build the BdConfig with all parsed fields
-            use crate::device::dma::{BdConfig, DimensionConfig, IterationConfig};
-
-            // Determine dimension sizes from wrap counts
-            // d0_size = wrap count (0 means no wrap, use length_words for simple 1D)
-            // If d0_wrap is 0, this is a simple contiguous transfer
-            let d0_size = if d0_wrap == 0 { length_words } else { d0_wrap };
-            let d1_size = d1_wrap;
-
-            BdConfig {
-                base_addr,
-                length,
-                d0: DimensionConfig { size: d0_size, stride: d0_stride },
-                d1: DimensionConfig { size: d1_size, stride: d1_stride },
-                d2: DimensionConfig { size: 0, stride: d2_stride }, // size comes from outer loop
-                d3: DimensionConfig::default(),
-                iteration: IterationConfig {
-                    current: iteration_current,
-                    wrap: iteration_wrap,
-                    stepsize: iteration_stepsize,
-                },
-                compression_enable: enable_compression,
-                enable_packet,
-                packet_id,
-                packet_type,
-                out_of_order_bd_id,
-                out_of_order: false, // S2MM only, parsed separately
-                tlast_suppress,
-                acquire_lock: if lock_acq_enable { Some(lock_acq_id) } else { None },
-                acquire_value: lock_acq_value,
-                release_lock: if lock_rel_value != 0 { Some(lock_rel_id) } else { None },
-                release_value: lock_rel_value,
-                next_bd,
-                valid: is_valid,
+            // For backwards compatibility, also mark as valid if any data is non-zero.
+            // This handles BDs that are programmed but don't have the valid bit set yet
+            // (CDO writes words one at a time, valid bit is in the last word).
+            if !config.valid && words.iter().any(|&w| w != 0) {
+                config.valid = true;
             }
+
+            config
         });
 
-        // Now configure the DmaEngine if we have a config
         if let Some(config) = bd_config {
             log::trace!("  BD {} word {} tile({},{}) -> addr=0x{:X} len={} valid={}",
                 bd_idx, word, col, row, config.base_addr, config.length, config.valid);
@@ -532,19 +483,19 @@ impl DeviceState {
 
     /// Write to a DMA channel register.
     fn write_dma_channel(&mut self, col: u8, row: u8, offset: u32, value: u32) {
-        use super::registers_spec::memory_module as mm;
+        let reg_layout = super::regdb::device_reg_layout();
+        let lay = &reg_layout.memory_channel;
 
-        let lay = &super::regdb::device_reg_layout().memory_channel;
-
-        // Channel registers: base at DMA_CHANNEL_BASE, stride DMA_CHANNEL_STRIDE (AM025)
-        // Layout: S2MM_0 (0x1DE00), S2MM_1 (0x1DE08), MM2S_0 (0x1DE10), MM2S_1 (0x1DE18)
+        // Channel registers: base/stride derived from register database
+        // Layout: S2MM_0, S2MM_1, MM2S_0, MM2S_1
         // Each channel has CTRL register and START_QUEUE register (4 bytes each)
-        let rel = offset - mm::DMA_CHANNEL_BASE;
-        let ch_idx = (rel / mm::DMA_CHANNEL_STRIDE) as usize;
-        let is_start_queue = (rel % mm::DMA_CHANNEL_STRIDE) >= 4;
+        let rel = offset - reg_layout.memory_channel_base;
+        let ch_idx = (rel / reg_layout.memory_channel_stride) as usize;
+        let is_start_queue = (rel % reg_layout.memory_channel_stride) >= 4;
         let is_s2mm = ch_idx < 2; // First 2 channels are S2MM
 
-        if ch_idx >= NUM_DMA_CHANNELS {
+        let num_channels = self.array.get(col, row).map_or(0, |t| t.dma_channels.len());
+        if ch_idx >= num_channels {
             return;
         }
 
@@ -617,22 +568,22 @@ impl DeviceState {
                 .unwrap_or((0, 0));
 
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
-                // Set task config before starting the channel
+                // Set task config before enqueuing the task
                 dma.set_channel_task_config(ch_idx as u8, enable_token_issue, controller_id, fot_mode);
 
-                // Start the channel with the specified BD and repeat count
-                if let Err(e) = dma.start_channel_with_repeat(ch_idx as u8, bd_idx, repeat_count) {
-                    log::warn!("Failed to start DMA channel {} on tile ({},{}): {:?}",
-                        ch_idx, col, row, e);
+                // Enqueue to the channel's task queue (hardware has 8-deep queue).
+                // Unlike start_channel_with_repeat(), this never rejects a busy
+                // channel -- it queues the task for execution when the current
+                // transfer finishes.
+                if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, enable_token_issue) {
+                    log::warn!("DMA channel {} task queue overflow on tile ({},{})",
+                        ch_idx, col, row);
                 } else if enable_token_issue {
-                    log::debug!("CDO started DMA channel {} with BD {} repeat={} token_issue=true controller_id={} on tile ({},{})",
+                    log::debug!("CDO enqueued DMA channel {} BD {} repeat={} token_issue=true controller_id={} on tile ({},{})",
                         ch_idx, bd_idx, repeat_count, controller_id, col, row);
-                } else if repeat_count > 0 {
-                    log::info!("CDO started DMA channel {} with BD {} repeat={} on tile ({},{})",
-                        ch_idx, bd_idx, repeat_count, col, row);
                 } else {
-                    log::info!("CDO started DMA channel {} with BD {} on tile ({},{})",
-                        ch_idx, bd_idx, col, row);
+                    log::info!("CDO enqueued DMA channel {} BD {} repeat={} on tile ({},{})",
+                        ch_idx, bd_idx, repeat_count, col, row);
                 }
             }
         }
@@ -640,12 +591,13 @@ impl DeviceState {
 
     /// Masked write to a DMA channel register.
     fn mask_write_dma_channel(&mut self, col: u8, row: u8, offset: u32, mask: u32, value: u32) {
-        use super::registers_spec::memory_module as mm;
-        let rel = offset - mm::DMA_CHANNEL_BASE;
-        let ch_idx = (rel / 8) as usize;
-        let is_start_queue = (rel % 8) >= 4;
+        let reg_layout = super::regdb::device_reg_layout();
+        let rel = offset - reg_layout.memory_channel_base;
+        let ch_idx = (rel / reg_layout.memory_channel_stride) as usize;
+        let is_start_queue = (rel % reg_layout.memory_channel_stride) >= 4;
 
-        if ch_idx >= NUM_DMA_CHANNELS {
+        let num_channels = self.array.get(col, row).map_or(0, |t| t.dma_channels.len());
+        if ch_idx >= num_channels {
             return;
         }
 
@@ -664,8 +616,7 @@ impl DeviceState {
             None
         };
 
-        // Also start the DmaEngine channel when START_QUEUE is written
-        // Start the channel whenever START_QUEUE is written (even if BD index is 0)
+        // Enqueue to the DMA channel's task queue when START_QUEUE is written.
         // Task queue register format:
         // - Bits 3:0: BD_ID (buffer descriptor index)
         // - Bits 23:16: Repeat_Count (run BD this many additional times)
@@ -673,15 +624,12 @@ impl DeviceState {
             let bd_idx = (queue_val & 0xF) as u8;
             let repeat_count = ((queue_val >> 16) & 0xFF) as u8;
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
-                if let Err(e) = dma.start_channel_with_repeat(ch_idx as u8, bd_idx, repeat_count) {
-                    log::warn!("Failed to start DMA channel {} on tile ({},{}): {:?}",
-                        ch_idx, col, row, e);
-                } else if repeat_count > 0 {
-                    log::info!("CDO started DMA channel {} with BD {} repeat={} on tile ({},{})",
-                        ch_idx, bd_idx, repeat_count, col, row);
+                if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
+                    log::warn!("DMA channel {} task queue overflow on tile ({},{})",
+                        ch_idx, col, row);
                 } else {
-                    log::info!("CDO started DMA channel {} with BD {} on tile ({},{})",
-                        ch_idx, bd_idx, col, row);
+                    log::info!("CDO enqueued DMA channel {} BD {} repeat={} on tile ({},{})",
+                        ch_idx, bd_idx, repeat_count, col, row);
                 }
             }
         }
@@ -747,12 +695,13 @@ impl DeviceState {
     /// Slave config format: bit 31 = enable
     fn write_stream_switch(&mut self, col: u8, row: u8, offset: u32, value: u32) {
         use super::aie2_spec::stream_switch::{ENABLE_BIT, SLAVE_SELECT_MASK};
-        use super::registers_spec::memory_module as mm;
+        let ss = &super::regdb::device_reg_layout().memory_stream_switch;
 
         // Master ports: base + (port * 4), Slave ports: base + (port * 4)
-        if (mm::STREAM_SWITCH_MASTER_BASE..mm::STREAM_SWITCH_MASTER_END).contains(&offset) {
-            let port = ((offset - mm::STREAM_SWITCH_MASTER_BASE) / 4) as usize;
+        if (ss.master_base..ss.master_end).contains(&offset) {
+            let port = ((offset - ss.master_base) / 4) as usize;
             let enable = (value >> ENABLE_BIT) & 1 != 0;
+            let packet_enable = (value >> 30) & 1 != 0;
             let slave_select = (value & SLAVE_SELECT_MASK) as usize;
 
             // Get port type before mutable borrow
@@ -765,10 +714,17 @@ impl DeviceState {
                     tile.stream_switch.masters[port].config = value;
                     tile.stream_switch.masters[port].enabled = enable;
 
-                    // Configure local route if enabled
-                    if enable && slave_select < tile.stream_switch.slaves.len() {
+                    // Always configure packet mode settings from the register
+                    tile.stream_switch.configure_master_packet(port, value);
+
+                    if packet_enable {
+                        // Packet mode: routing is done by arbiter/msel, not circuit route
+                        log::info!("Tile ({},{}) stream switch: master[{}] packet mode (arb/msel from config)",
+                            col, row, port);
+                    } else if enable && slave_select < tile.stream_switch.slaves.len() {
+                        // Circuit mode: configure local route
                         tile.stream_switch.configure_local_route(slave_select, port);
-                        log::info!("Tile ({},{}) stream switch: master[{}] enabled with slave_select={} (local route: slave[{}] -> master[{}])",
+                        log::info!("Tile ({},{}) stream switch: master[{}] circuit mode slave_select={} (local route: slave[{}] -> master[{}])",
                             col, row, port, slave_select, slave_select, port);
                     } else if enable {
                         log::info!("Tile ({},{}) stream switch: master[{}] enabled with slave_select={} (no local route - slave out of range)",
@@ -777,15 +733,15 @@ impl DeviceState {
                 }
             }
 
-            // Create global route for external ports (North/South)
-            if enable {
+            // Create global route for external ports (North/South) -- circuit mode only
+            if enable && !packet_enable {
                 if let Some(pt) = port_type {
                     self.derive_global_route(col, row, port as u8, pt);
                 }
             }
-        // Slave ports - extend range to cover all ports
-        } else if (mm::STREAM_SWITCH_SLAVE_BASE..mm::STREAM_SWITCH_SLAVE_END).contains(&offset) {
-            let port = ((offset - mm::STREAM_SWITCH_SLAVE_BASE) / 4) as usize;
+        // Slave ports
+        } else if (ss.slave_base..ss.slave_end).contains(&offset) {
+            let port = ((offset - ss.slave_base) / 4) as usize;
             let enable = (value >> ENABLE_BIT) & 1 != 0;
 
             if let Some(tile) = self.array.get_mut(col, row) {
@@ -794,8 +750,19 @@ impl DeviceState {
                     tile.stream_switch.slaves[port].enabled = enable;
                 }
             }
+        // Slave slot registers (packet routing config per slave port)
+        } else if (ss.slave_slot_base..ss.slave_slot_end).contains(&offset) {
+            // Each slave port has 4 slots at 4-byte intervals (0x10 per port)
+            let slot_offset = offset - ss.slave_slot_base;
+            let slave_port = (slot_offset / 0x10) as usize;
+            let slot = ((slot_offset % 0x10) / 4) as usize;
+
+            if let Some(tile) = self.array.get_mut(col, row) {
+                tile.stream_switch.configure_slave_slot(slave_port, slot, value);
+                log::info!("Tile ({},{}) stream switch: slave[{}] slot[{}] = 0x{:08X}",
+                    col, row, slave_port, slot, value);
+            }
         }
-        // Note: ctrl_pkt (0x3F500) not stored - functional switch doesn't need it
     }
 
     /// Derive global route from master port type to adjacent tile.
@@ -964,37 +931,47 @@ impl DeviceState {
     /// - Word 6: Iteration_Stepsize[16:0], Iteration_Wrap[22:17], Iteration_Current[28:23]
     /// - Word 7: Lock_Acq_ID[7:0], Lock_Acq_Value[14:8], Lock_Acq_Enable[15], Lock_Rel_ID[23:16], Lock_Rel_Value[30:24], Valid_BD[31]
     fn write_memtile_dma_bd(&mut self, col: u8, row: u8, offset: u32, value: u32) {
-        use super::registers_spec::mem_tile_module as mt;
-        // MemTile BDs: base, 8 words (0x20 bytes) per BD, up to 48 BDs
-        let rel = offset - mt::DMA_BD_BASE;
-        let bd_idx = (rel / mt::DMA_BD_STRIDE) as usize;
-        let word = ((rel % mt::DMA_BD_STRIDE) / 4) as usize;
+        let reg_layout = super::regdb::device_reg_layout();
 
-        // MemTile has 48 BDs (24 for S2MM + 24 for MM2S), up to index 47
-        if bd_idx >= mt::DMA_BD_COUNT || word > 7 {
+        // MemTile BDs: base/stride derived from register database
+        let rel = offset - reg_layout.memtile_bd_base;
+        let bd_idx = (rel / reg_layout.memtile_bd_stride) as usize;
+        let word = ((rel % reg_layout.memtile_bd_stride) / 4) as usize;
+
+        // Bounds check against tile's actual BD count and 8 words per BD
+        let num_bds = self.array.get(col, row).map_or(0, |t| t.dma_bds.len());
+        if bd_idx >= num_bds || word > 7 {
             return;
         }
 
-        // Store raw BD words in tile for reference (using first 16 legacy slots if available)
-        if bd_idx < NUM_DMA_BDS {
-            if let Some(tile) = self.array.get_mut(col, row) {
-                let bd = &mut tile.dma_bds[bd_idx];
-                match word {
-                    0 => bd.addr_low = value,  // Actually length for MemTile
-                    1 => bd.addr_high = value, // Address + next_bd
-                    2 => bd.length = value,    // D0 config
-                    3 => bd.control = value,   // D1 config
-                    4 => bd.d0 = value,        // D2 config
-                    5 => bd.d1 = value,        // D3 config
-                    // Words 6,7 don't fit in legacy struct
-                    _ => {}
-                }
+        // Store raw BD words in the tile's BD structure (first 6 words only;
+        // legacy struct has 6 fields, but the data-driven parser will read
+        // from tile registers for words 6-7 when available)
+        if let Some(tile) = self.array.get_mut(col, row) {
+            let bd = &mut tile.dma_bds[bd_idx];
+            match word {
+                0 => bd.addr_low = value,
+                1 => bd.addr_high = value,
+                2 => bd.length = value,
+                3 => bd.control = value,
+                4 => bd.d0 = value,
+                5 => bd.d1 = value,
+                _ => {}
             }
         }
 
-        // Now parse and configure the DmaEngine
-        // We need all 8 words to properly parse, so read back from tile
-        let bd_config = self.parse_memtile_bd(col, row, bd_idx);
+        // Parse using the data-driven parser. The legacy struct only stores
+        // words 0-5; for single-word CDO writes we pad words 6-7 with zeros.
+        // The bulk DMA write path (dma_write_memtile_bd_data) has all 8 words.
+        let bd_config = self.array.get(col, row).map(|tile| {
+            let tile_bd = &tile.dma_bds[bd_idx];
+            let words = [
+                tile_bd.addr_low, tile_bd.addr_high, tile_bd.length,
+                tile_bd.control, tile_bd.d0, tile_bd.d1,
+                0, 0, // Words 6-7 not in legacy struct; set by bulk writes
+            ];
+            self.parse_memtile_bd_from_words(&words)
+        });
 
         if let Some(config) = bd_config {
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
@@ -1002,8 +979,9 @@ impl DeviceState {
                     log::debug!("Failed to configure MemTile BD {} on DmaEngine ({},{}): {:?}",
                         bd_idx, col, row, e);
                 } else if config.valid {
-                    log::info!("CDO configured MemTile BD {} on tile ({},{}) addr=0x{:X} len={} acq={:?} rel={:?} next={:?}",
+                    log::info!("CDO configured MemTile BD {} on tile ({},{}) addr=0x{:X} len={} d0=[{},{}] d1=[{},{}] acq={:?} rel={:?} next={:?}",
                         bd_idx, col, row, config.base_addr, config.length,
+                        config.d0.size, config.d0.stride, config.d1.size, config.d1.stride,
                         config.acquire_lock.map(|id| (id, config.acquire_value)),
                         config.release_lock.map(|id| (id, config.release_value)),
                         config.next_bd);
@@ -1012,55 +990,38 @@ impl DeviceState {
         }
     }
 
-    /// Parse a MemTile BD from stored word values.
-    fn parse_memtile_bd(&self, col: u8, row: u8, bd_idx: usize) -> Option<crate::device::dma::BdConfig> {
-        use crate::device::dma::BdConfig;
+    /// Parse MemTile BD words into a BdConfig using the data-driven parser.
+    ///
+    /// MemTile lock IDs are 8 bits in the register encoding but the tile only
+    /// has 64 locks, so we mask to 6 bits.
+    fn parse_memtile_bd_from_words(&self, words: &[u32]) -> crate::device::dma::BdConfig {
+        use crate::device::dma::bd::BufferDescriptor;
+        use crate::device::tile::TileType;
 
-        if bd_idx >= NUM_DMA_BDS {
-            return None;
+        let parsed = BufferDescriptor::from_registers(words, TileType::MemTile);
+        let mut config = parsed.to_bd_config();
+
+        // MemTile lock IDs: mask to 6 bits (64 locks per tile)
+        if let Some(ref mut id) = config.acquire_lock {
+            *id &= 0x3F;
+        }
+        if let Some(ref mut id) = config.release_lock {
+            *id &= 0x3F;
         }
 
-        let tile = self.array.get(col, row)?;
-        let bd = &tile.dma_bds[bd_idx];
-        let lay = &super::regdb::device_reg_layout().memtile_bd;
-
-        // Word 0: Buffer_Length
-        let buffer_length = lay.buffer_length.extract(bd.addr_low);
-
-        // Word 1: Base_Address, Use_Next_BD, Next_BD
-        let base_addr_words = lay.base_address.extract(bd.addr_high);
-        let use_next_bd = lay.use_next_bd.extract_bool(bd.addr_high);
-        let next_bd_id = lay.next_bd.extract(bd.addr_high) as u8;
-
-        // Word 2: D0_Stepsize[16:0], D0_Wrap[26:17]
-        let d0_stepsize = bd.length & 0x1FFFF; // 17-bit stepsize
-        let d0_wrap = (bd.length >> 17) & 0x3FF;
-
-        // We don't have words 6-7 in legacy struct, so assume valid from data
-        let valid = buffer_length > 0 || base_addr_words > 0;
-
-        // Convert word address to byte address
-        let base_addr = (base_addr_words as u64) * 4;
-        let length = buffer_length * 4; // Convert word count to bytes
-
-        let mut config = BdConfig::simple_1d(base_addr, length);
-        config.valid = valid;
-
-        // Set D0 size and stride from wrap/stepsize
-        if d0_wrap > 0 {
-            config.d0.size = d0_wrap;
-            config.d0.stride = d0_stepsize as i32;
+        // For backwards compatibility, mark as valid if any data is present
+        if !config.valid && words.iter().any(|&w| w != 0) {
+            config.valid = true;
         }
 
-        // BD chaining
-        config.next_bd = if use_next_bd { Some(next_bd_id) } else { None };
-
-        Some(config)
+        config
     }
 
     /// Write MemTile BD data from a byte array.
     ///
     /// MemTile DMA_WRITE commands write 32 bytes (8 words) per BD.
+    /// This path has all 8 words available, so the data-driven parser
+    /// can extract all fields including iteration and locks.
     fn dma_write_memtile_bd_data(&mut self, col: u8, row: u8, offset: u32, data: &[u8]) {
         // Parse into 32-bit words
         let words: Vec<u32> = data
@@ -1072,21 +1033,19 @@ impl DeviceState {
             })
             .collect();
 
-        // Log words for debugging BD parsing
         if words.len() >= 8 {
-            log::info!("MemTile BD raw: tile({},{}) offset=0x{:05X} word7=0x{:08X} words=[0x{:08X}, 0x{:08X}..., 0x{:08X}]",
-                col, row, offset, words.get(7).copied().unwrap_or(0),
-                words.first().copied().unwrap_or(0), words.get(1).copied().unwrap_or(0), words.get(7).copied().unwrap_or(0));
+            log::debug!("MemTile BD raw: tile({},{}) offset=0x{:05X} words=[{:08X?}]",
+                col, row, offset, &words[..8]);
         }
 
-        // MemTile BDs: base, 8 words per BD
-        use super::registers_spec::mem_tile_module as mt;
-        let rel = offset - mt::DMA_BD_BASE;
-        let bd_idx = (rel / mt::DMA_BD_STRIDE) as usize;
+        // MemTile BDs: base/stride derived from register database
+        let reg_layout = super::regdb::device_reg_layout();
+        let rel = offset - reg_layout.memtile_bd_base;
+        let bd_idx = (rel / reg_layout.memtile_bd_stride) as usize;
 
-        // Store words in tile BD structure (limited to first 6 for legacy compat)
-        if bd_idx < NUM_DMA_BDS {
-            if let Some(tile) = self.array.get_mut(col, row) {
+        // Store words in tile BD structure (first 6 only -- legacy struct limit)
+        if let Some(tile) = self.array.get_mut(col, row) {
+            if bd_idx < tile.dma_bds.len() {
                 let bd = &mut tile.dma_bds[bd_idx];
                 if !words.is_empty() { bd.addr_low = words[0]; }
                 if words.len() > 1 { bd.addr_high = words[1]; }
@@ -1097,90 +1056,22 @@ impl DeviceState {
             }
         }
 
-        // Parse using full 8 words and configure DmaEngine
-        self.configure_memtile_bd_from_words(col, row, bd_idx, &words);
-    }
+        // Parse using data-driven parser with all 8 words available
+        if words.len() >= 8 {
+            let config = self.parse_memtile_bd_from_words(&words);
 
-    /// Configure MemTile BD from raw words.
-    fn configure_memtile_bd_from_words(&mut self, col: u8, row: u8, bd_idx: usize, words: &[u32]) {
-        use crate::device::dma::BdConfig;
-        use super::registers_spec::sign_extend_7bit;
-
-        if words.is_empty() {
-            return;
-        }
-
-        let lay = &super::regdb::device_reg_layout().memtile_bd;
-
-        // Parse MemTile BD format (8 words)
-        // Word 0: Buffer_Length
-        let word0 = words.first().copied().unwrap_or(0);
-        let buffer_length = lay.buffer_length.extract(word0);
-
-        // Word 1: Base_Address, Use_Next_BD, Next_BD
-        let word1 = words.get(1).copied().unwrap_or(0);
-        let base_addr_words = lay.base_address.extract(word1);
-        let use_next_bd = lay.use_next_bd.extract_bool(word1);
-        let next_bd_id = lay.next_bd.extract(word1) as u8;
-
-        // Word 2: D0_Stepsize[16:0], D0_Wrap[26:17]
-        // (D0 fields are in word 2, not covered by MemTileBdFieldLayout yet)
-        let word2 = words.get(2).copied().unwrap_or(0);
-        let d0_stepsize = word2 & 0x1FFFF; // 17-bit stepsize
-        let d0_wrap = (word2 >> 17) & 0x3FF;
-
-        // Word 7: Lock config and Valid bit (if present)
-        // Note: Lock IDs in MemTile BD encoding use 8 bits, but MemTile only has 64 locks.
-        // Lock IDs 64+ appear to map back to 0+ (likely tile-relative), so we mask to 6 bits.
-        let word7 = words.get(7).copied().unwrap_or(0);
-        let lock_acq_id = (lay.lock_acq_id.extract(word7) & 0x3F) as u8; // Mask to 6 bits
-        let lock_acq_value = sign_extend_7bit(lay.lock_acq_value.extract(word7));
-        let lock_acq_enable = lay.lock_acq_enable.extract_bool(word7);
-        let lock_rel_id = (lay.lock_rel_id.extract(word7) & 0x3F) as u8; // Mask to 6 bits
-        let lock_rel_value = sign_extend_7bit(lay.lock_rel_value.extract(word7));
-        let valid = lay.valid_bd.extract_bool(word7);
-
-        // Convert to bytes
-        let base_addr = (base_addr_words as u64) * 4;
-        let length = buffer_length * 4;
-
-        let mut config = BdConfig::simple_1d(base_addr, length);
-        config.valid = valid || buffer_length > 0;
-
-        // D0 config
-        if d0_wrap > 0 {
-            config.d0.size = d0_wrap;
-            config.d0.stride = d0_stepsize as i32;
-        }
-
-        // BD chaining
-        config.next_bd = if use_next_bd { Some(next_bd_id) } else { None };
-
-        // Lock config
-        if lock_acq_enable && words.len() >= 8 {
-            config.acquire_lock = Some(lock_acq_id);
-            config.acquire_value = lock_acq_value;
-        }
-        if lock_rel_value != 0 && words.len() >= 8 {
-            config.release_lock = Some(lock_rel_id);
-            config.release_value = lock_rel_value;
-        }
-
-        // Configure the DMA engine
-        if let Some(dma) = self.array.dma_engine_mut(col, row) {
-            // Log all MemTile BD configurations at debug level
-            log::debug!("MemTile BD {} tile({},{}) valid={} addr=0x{:X} len={} word7=0x{:08X}",
-                bd_idx, col, row, config.valid, base_addr, length, word7);
-
-            if let Err(e) = dma.configure_bd(bd_idx as u8, config.clone()) {
-                log::warn!("Failed to configure MemTile BD {} on DmaEngine ({},{}): {:?}",
-                    bd_idx, col, row, e);
-            } else if config.valid {
-                log::info!("CDO configured MemTile BD {} on tile ({},{}) addr=0x{:X} len={} d0=({},{}) acq={:?} rel={:?} next={:?}",
-                    bd_idx, col, row, base_addr, length, d0_wrap, d0_stepsize,
-                    config.acquire_lock.map(|id| (id, config.acquire_value)),
-                    config.release_lock.map(|id| (id, config.release_value)),
-                    config.next_bd);
+            if let Some(dma) = self.array.dma_engine_mut(col, row) {
+                if let Err(e) = dma.configure_bd(bd_idx as u8, config.clone()) {
+                    log::warn!("Failed to configure MemTile BD {} on DmaEngine ({},{}): {:?}",
+                        bd_idx, col, row, e);
+                } else if config.valid {
+                    log::info!("CDO configured MemTile BD {} on tile ({},{}) addr=0x{:X} len={} d0=[{},{}] d1=[{},{}] acq={:?} rel={:?} next={:?}",
+                        bd_idx, col, row, config.base_addr, config.length,
+                        config.d0.size, config.d0.stride, config.d1.size, config.d1.stride,
+                        config.acquire_lock.map(|id| (id, config.acquire_value)),
+                        config.release_lock.map(|id| (id, config.release_value)),
+                        config.next_bd);
+                }
             }
         }
     }
@@ -1202,7 +1093,7 @@ impl DeviceState {
 
         // Update tile DMA channel state
         if let Some(tile) = self.array.get_mut(col, row) {
-            if ch_idx < NUM_DMA_CHANNELS {
+            if ch_idx < tile.dma_channels.len() {
                 let ch = &mut tile.dma_channels[ch_idx];
                 if is_start_queue {
                     ch.start_queue = value;
@@ -1214,18 +1105,18 @@ impl DeviceState {
             }
         }
 
-        // Start DmaEngine channel when START_QUEUE is written
+        // Enqueue to DMA channel's task queue when START_QUEUE is written
         if is_start_queue {
             let bd_idx = (value & 0x3F) as u8; // 6-bit BD index
             let repeat_count = ((value >> 16) & 0xFF) as u8;
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
-                if let Err(e) = dma.start_channel_with_repeat(ch_idx as u8, bd_idx, repeat_count) {
-                    log::warn!("Failed to start MemTile DMA channel {} on tile ({},{}): {:?}",
-                        ch_idx, col, row, e);
+                if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
+                    log::warn!("MemTile DMA channel {} task queue overflow on tile ({},{})",
+                        ch_idx, col, row);
                 } else {
                     let dir = if ch_idx < 6 { "S2MM" } else { "MM2S" };
                     let local_ch = if ch_idx < 6 { ch_idx } else { ch_idx - 6 };
-                    log::info!("CDO started MemTile DMA {} ch {} with BD {} repeat={} on tile ({},{})",
+                    log::info!("CDO enqueued MemTile DMA {} ch {} BD {} repeat={} on tile ({},{})",
                         dir, local_ch, bd_idx, repeat_count, col, row);
                 }
             }
@@ -1241,7 +1132,7 @@ impl DeviceState {
         }
 
         let new_start_queue = if let Some(tile) = self.array.get_mut(col, row) {
-            if ch_idx < NUM_DMA_CHANNELS {
+            if ch_idx < tile.dma_channels.len() {
                 let ch = &mut tile.dma_channels[ch_idx];
                 if is_start_queue {
                     ch.start_queue = (ch.start_queue & !mask) | (value & mask);
@@ -1258,18 +1149,18 @@ impl DeviceState {
             None
         };
 
-        // Start channel if START_QUEUE was written
+        // Enqueue to task queue when START_QUEUE was written
         if let Some(queue_val) = new_start_queue {
             let bd_idx = (queue_val & 0x3F) as u8;
             let repeat_count = ((queue_val >> 16) & 0xFF) as u8;
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
-                if let Err(e) = dma.start_channel_with_repeat(ch_idx as u8, bd_idx, repeat_count) {
-                    log::warn!("Failed to start MemTile DMA channel {} on tile ({},{}): {:?}",
-                        ch_idx, col, row, e);
+                if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
+                    log::warn!("MemTile DMA channel {} task queue overflow on tile ({},{})",
+                        ch_idx, col, row);
                 } else {
                     let dir = if ch_idx < 6 { "S2MM" } else { "MM2S" };
                     let local_ch = if ch_idx < 6 { ch_idx } else { ch_idx - 6 };
-                    log::info!("CDO started MemTile DMA {} ch {} with BD {} repeat={} on tile ({},{})",
+                    log::info!("CDO enqueued MemTile DMA {} ch {} BD {} repeat={} on tile ({},{})",
                         dir, local_ch, bd_idx, repeat_count, col, row);
                 }
             }
@@ -1278,21 +1169,23 @@ impl DeviceState {
 
     /// Decode MemTile DMA channel offset into (channel_index, is_start_queue).
     fn decode_memtile_channel_offset(&self, offset: u32) -> (usize, bool) {
-        use super::registers_spec::mem_tile_module as mt;
-        // S2MM channels 0-5: control at base+n*8, queue at base+4+n*8
-        // MM2S channels 0-5: control at base+n*8, queue at base+4+n*8
+        let reg_layout = super::regdb::device_reg_layout();
+        let s2mm_base = reg_layout.memtile_channel_s2mm_base;
+        let mm2s_base = reg_layout.memtile_channel_mm2s_base;
+        let stride = reg_layout.memtile_channel_stride;
 
-        if (mt::DMA_CHANNEL_S2MM_BASE..mt::DMA_CHANNEL_MM2S_BASE).contains(&offset) {
-            // S2MM range (channels 0-5)
-            let rel = offset - mt::DMA_CHANNEL_S2MM_BASE;
-            let ch = (rel / 8) as usize;
-            let is_queue = (rel % 8) >= 4;
+        // S2MM channels 0-5: control at base+n*stride, queue at base+4+n*stride
+        // MM2S channels 0-5: control at base+n*stride, queue at base+4+n*stride
+        if (s2mm_base..mm2s_base).contains(&offset) {
+            let rel = offset - s2mm_base;
+            let ch = (rel / stride) as usize;
+            let is_queue = (rel % stride) >= 4;
             (ch, is_queue)
-        } else if (mt::DMA_CHANNEL_MM2S_BASE..mt::DMA_CHANNEL_MM2S_BASE + 0x30).contains(&offset) {
+        } else if (mm2s_base..mm2s_base + 6 * stride).contains(&offset) {
             // MM2S range - channel indices 6-11
-            let rel = offset - mt::DMA_CHANNEL_MM2S_BASE;
-            let ch = 6 + (rel / 8) as usize;
-            let is_queue = (rel % 8) >= 4;
+            let rel = offset - mm2s_base;
+            let ch = 6 + (rel / stride) as usize;
+            let is_queue = (rel % stride) >= 4;
             (ch, is_queue)
         } else {
             (usize::MAX, false)
@@ -1306,12 +1199,13 @@ impl DeviceState {
     /// Slave config format: bit 31 = enable
     fn write_memtile_stream_switch(&mut self, col: u8, row: u8, offset: u32, value: u32) {
         use super::aie2_spec::stream_switch::{ENABLE_BIT, SLAVE_SELECT_MASK};
-        use super::registers_spec::mem_tile_module as mt;
+        let ss = &super::regdb::device_reg_layout().memtile_stream_switch;
 
         // MemTile master ports: base + (port * 4), slave ports: base + (port * 4)
-        if (mt::STREAM_SWITCH_MASTER_BASE..mt::STREAM_SWITCH_MASTER_END).contains(&offset) {
-            let port = ((offset - mt::STREAM_SWITCH_MASTER_BASE) / 4) as usize;
+        if (ss.master_base..ss.master_end).contains(&offset) {
+            let port = ((offset - ss.master_base) / 4) as usize;
             let enable = (value >> ENABLE_BIT) & 1 != 0;
+            let packet_enable = (value >> 30) & 1 != 0;
             let slave_select = (value & SLAVE_SELECT_MASK) as usize;
 
             // Get port type before mutable borrow
@@ -1330,24 +1224,32 @@ impl DeviceState {
                 tile.stream_switch.masters[port].enabled = enable;
             }
 
-            log::debug!("MemTile ({},{}) stream switch master[{}] = 0x{:08X} (en={}, slave={})",
-                col, row, port, value, enable, slave_select);
+            // Always configure packet mode settings
+            tile.stream_switch.configure_master_packet(port, value);
 
-            // If enabled, create a local route from the selected slave to this master
-            if enable && slave_select < tile.stream_switch.slaves.len() && port < tile.stream_switch.masters.len() {
-                tile.stream_switch.configure_local_route(slave_select, port);
-                log::info!("MemTile ({},{}) local route: slave[{}] -> master[{}]",
-                    col, row, slave_select, port);
+            if packet_enable {
+                log::info!("MemTile ({},{}) stream switch master[{}] packet mode = 0x{:08X}",
+                    col, row, port, value);
+            } else {
+                log::debug!("MemTile ({},{}) stream switch master[{}] = 0x{:08X} (en={}, slave={})",
+                    col, row, port, value, enable, slave_select);
+
+                // Circuit mode: create local route if enabled
+                if enable && slave_select < tile.stream_switch.slaves.len() && port < tile.stream_switch.masters.len() {
+                    tile.stream_switch.configure_local_route(slave_select, port);
+                    log::info!("MemTile ({},{}) local route: slave[{}] -> master[{}]",
+                        col, row, slave_select, port);
+                }
             }
 
-            // Derive global route for external ports (North/South)
-            if enable {
+            // Derive global route for external ports (North/South) -- circuit mode only
+            if enable && !packet_enable {
                 if let Some(pt) = port_type {
                     self.derive_global_route(col, row, port as u8, pt);
                 }
             }
-        } else if (mt::STREAM_SWITCH_SLAVE_BASE..mt::STREAM_SWITCH_SLAVE_END).contains(&offset) {
-            let port = ((offset - mt::STREAM_SWITCH_SLAVE_BASE) / 4) as usize;
+        } else if (ss.slave_base..ss.slave_end).contains(&offset) {
+            let port = ((offset - ss.slave_base) / 4) as usize;
             let enable = (value >> ENABLE_BIT) & 1 != 0;
 
             let tile = match self.array.get_mut(col, row) {
@@ -1363,6 +1265,17 @@ impl DeviceState {
 
             log::debug!("MemTile ({},{}) stream switch slave[{}] = 0x{:08X} (en={})",
                 col, row, port, value, enable);
+        // Slave slot registers (packet routing config per slave port)
+        } else if (ss.slave_slot_base..ss.slave_slot_end).contains(&offset) {
+            let slot_offset = offset - ss.slave_slot_base;
+            let slave_port = (slot_offset / 0x10) as usize;
+            let slot = ((slot_offset % 0x10) / 4) as usize;
+
+            if let Some(tile) = self.array.get_mut(col, row) {
+                tile.stream_switch.configure_slave_slot(slave_port, slot, value);
+                log::info!("MemTile ({},{}) stream switch: slave[{}] slot[{}] = 0x{:08X}",
+                    col, row, slave_port, slot, value);
+            }
         }
     }
 
@@ -1544,5 +1457,52 @@ mod tests {
 
         let tile = state.array.tile(1, 2);
         assert!(tile.core.enabled);
+    }
+
+    #[test]
+    fn test_cdo_writes_tile_init_data() {
+        // Verify that CDO DmaWrite correctly loads in2_mem_buff_0 into
+        // tile(0,2) data memory at offset 0x400.
+        // This is a regression test for the vec_vec_add_tile_init failure.
+        let xclbin_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../mlir-aie/build/test/npu-xrt/vec_vec_add_tile_init/aie.xclbin");
+        if !xclbin_path.exists() {
+            eprintln!("Skipping tile init test: {:?} not found", xclbin_path);
+            return;
+        }
+
+        let xclbin = Xclbin::from_file(&xclbin_path).unwrap();
+        let section = xclbin.find_section(SectionKind::AiePartition).unwrap();
+        let partition = AiePartition::parse(section.data()).unwrap();
+        let pdi = partition.primary_pdi().unwrap();
+        let cdo_offset = find_cdo_offset(pdi.pdi_image).unwrap();
+        let cdo = Cdo::parse(&pdi.pdi_image[cdo_offset..]).unwrap();
+
+        let mut state = DeviceState::new_npu1();
+        state.apply_cdo(&cdo).unwrap();
+
+        // Check tile(0,2) data memory at offset 0x400
+        // Expected: in2_mem_buff_0 = [0, 1, 2, ..., 255] as i32
+        let tile = state.array.tile(0, 2);
+        let dm = tile.data_memory();
+
+        // Read first 16 words from offset 0x400
+        let mut values = Vec::new();
+        for i in 0..16 {
+            let off = 0x400 + i * 4;
+            let word = u32::from_le_bytes([dm[off], dm[off+1], dm[off+2], dm[off+3]]);
+            values.push(word);
+        }
+        eprintln!("tile(0,2) data mem @0x400: first 16 words = {:?}", values);
+
+        // First word should be 0, second should be 1, etc.
+        assert_eq!(values[0], 0, "in2_mem_buff_0[0] should be 0");
+        assert_eq!(values[1], 1, "in2_mem_buff_0[1] should be 1");
+        assert_eq!(values[2], 2, "in2_mem_buff_0[2] should be 2");
+        assert_eq!(values[15], 15, "in2_mem_buff_0[15] should be 15");
+
+        // Also verify data_bytes was counted
+        assert!(state.stats.data_bytes >= 1024,
+            "Expected at least 1024 data bytes written, got {}", state.stats.data_bytes);
     }
 }

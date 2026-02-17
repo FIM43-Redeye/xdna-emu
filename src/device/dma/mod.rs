@@ -69,35 +69,36 @@ pub mod timing;
 pub mod compression;
 
 pub use addressing::{AddressGenerator, DimensionConfig, AddressIterator, IterationConfig};
-pub use bd::{BufferDescriptor, bd_base_address, bd_count, bd_register_count, BD_SPACING};
-pub use stream_io::{StreamWord, PacketHeader};
-pub use transfer::{Transfer, TransferState, TransferDirection, TransferEndpoint, parse_ooo_bd_id_from_header, parse_source_tile_from_header};
+pub use bd::{BufferDescriptor, bd_base_address, bd_register_count, BD_SPACING};
+pub use stream_io::StreamWord;
+pub use transfer::{Transfer, TransferState, TransferDirection, TransferEndpoint, parse_source_tile_from_header};
 pub use engine::{DmaEngine, ChannelState, ChannelId, StreamData, TaskCompleteToken, ChannelTaskConfig, TaskQueueEntry, MAX_TASK_QUEUE_DEPTH};
 pub use timing::{DmaTimingConfig, ChannelTimingState, TransferPhase, ChannelArbiter};
 
-use super::aie2_spec;
 use super::tile::TileType;
 
-/// Number of buffer descriptors per compute tile DMA controller.
-pub const NUM_BUFFER_DESCRIPTORS: usize = aie2_spec::NUM_DMA_BUFFER_DESCRIPTORS;
-
-/// Number of buffer descriptors per memory tile DMA controller.
-pub const MEMTILE_NUM_BUFFER_DESCRIPTORS: usize = aie2_spec::MEMTILE_NUM_DMA_BUFFER_DESCRIPTORS;
+// ============================================================================
+// DMA constants
+//
+// BD counts come from ArchConfig (data-driven from mlir-aie device models).
+// Channel counts are kept as constants pending future data-driving.
+// Values validated against mlir-aie by model::validate_against_spec().
+// ============================================================================
 
 /// Number of S2MM channels for compute tiles.
-pub const COMPUTE_S2MM_CHANNELS: usize = aie2_spec::COMPUTE_TILE_S2MM_CHANNELS;
+pub const COMPUTE_S2MM_CHANNELS: usize = 2;
 
 /// Number of MM2S channels for compute tiles.
-pub const COMPUTE_MM2S_CHANNELS: usize = aie2_spec::COMPUTE_TILE_MM2S_CHANNELS;
+pub const COMPUTE_MM2S_CHANNELS: usize = 2;
 
 /// Number of S2MM channels for memory tiles.
-pub const MEM_TILE_S2MM_CHANNELS: usize = aie2_spec::MEM_TILE_S2MM_CHANNELS;
+pub const MEM_TILE_S2MM_CHANNELS: usize = 6;
 
 /// Number of MM2S channels for memory tiles.
-pub const MEM_TILE_MM2S_CHANNELS: usize = aie2_spec::MEM_TILE_MM2S_CHANNELS;
+pub const MEM_TILE_MM2S_CHANNELS: usize = 6;
 
 /// DMA data width in bits.
-pub const DMA_DATA_WIDTH_BITS: usize = aie2_spec::DMA_DATA_WIDTH_BITS;
+pub const DMA_DATA_WIDTH_BITS: usize = 32;
 
 /// DMA data width in bytes.
 pub const DMA_DATA_WIDTH_BYTES: usize = DMA_DATA_WIDTH_BITS / 8;

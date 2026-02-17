@@ -61,73 +61,6 @@ impl StreamWord {
     }
 }
 
-/// Packet header format per AM020 Table 2.
-///
-/// When Enable_Packet is set in a BD, the DMA inserts a header word
-/// before the data. The stream switch uses this for packet routing.
-///
-/// Header word format (32 bits):
-/// ```text
-/// [31:20] Reserved
-/// [19:13] Source Column (7 bits)
-/// [12:8]  Source Row (5 bits)
-/// [7:5]   Packet Type (3 bits)
-/// [4:0]   Packet ID / Stream ID (5 bits)
-/// ```
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PacketHeader {
-    /// Packet ID / Stream ID (5 bits, 0-31)
-    pub packet_id: u8,
-    /// Packet type (3 bits, 0-7)
-    pub packet_type: u8,
-    /// Source row (5 bits)
-    pub source_row: u8,
-    /// Source column (7 bits)
-    pub source_col: u8,
-}
-
-impl PacketHeader {
-    /// Create a new packet header
-    pub fn new(packet_id: u8, packet_type: u8) -> Self {
-        Self {
-            packet_id: packet_id & 0x1F,
-            packet_type: packet_type & 0x7,
-            source_row: 0,
-            source_col: 0,
-        }
-    }
-
-    /// Create with source tile information
-    pub fn with_source(packet_id: u8, packet_type: u8, col: u8, row: u8) -> Self {
-        Self {
-            packet_id: packet_id & 0x1F,
-            packet_type: packet_type & 0x7,
-            source_row: row & 0x1F,
-            source_col: col & 0x7F,
-        }
-    }
-
-    /// Encode header as 32-bit word
-    pub fn to_word(&self) -> u32 {
-        let mut word = 0u32;
-        word |= (self.packet_id & 0x1F) as u32;                // [4:0]
-        word |= ((self.packet_type & 0x7) as u32) << 5;        // [7:5]
-        word |= ((self.source_row & 0x1F) as u32) << 8;        // [12:8]
-        word |= ((self.source_col & 0x7F) as u32) << 13;       // [19:13]
-        word
-    }
-
-    /// Decode header from 32-bit word
-    pub fn from_word(word: u32) -> Self {
-        Self {
-            packet_id: (word & 0x1F) as u8,
-            packet_type: ((word >> 5) & 0x7) as u8,
-            source_row: ((word >> 8) & 0x1F) as u8,
-            source_col: ((word >> 13) & 0x7F) as u8,
-        }
-    }
-}
-
 // ============================================================================
 // Stream Switch Port Mappings
 // ============================================================================
@@ -391,18 +324,6 @@ mod tests {
 
         let tlast_word = StreamWord::with_tlast(0xDEADBEEF);
         assert!(tlast_word.tlast);
-    }
-
-    #[test]
-    fn test_packet_header_roundtrip() {
-        let header = PacketHeader::with_source(5, 3, 2, 1);
-        let word = header.to_word();
-        let decoded = PacketHeader::from_word(word);
-
-        assert_eq!(decoded.packet_id, 5);
-        assert_eq!(decoded.packet_type, 3);
-        assert_eq!(decoded.source_col, 2);
-        assert_eq!(decoded.source_row, 1);
     }
 
     #[test]

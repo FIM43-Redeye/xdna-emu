@@ -23,36 +23,42 @@
 use super::aie2_spec;
 use super::stream_switch::StreamSwitch as FunctionalStreamSwitch;
 
-/// Size of data memory in compute tiles (64KB)
-/// See AM020 Ch4: "An individual data memory block is 64 KB"
-pub const COMPUTE_TILE_MEMORY_SIZE: usize = aie2_spec::COMPUTE_TILE_DATA_MEMORY_SIZE;
-
-/// Size of data memory in memory tiles (512KB)
-/// See AM020 Ch5: "Each AIE-ML memory tile has 512 KB of memory"
-pub const MEM_TILE_MEMORY_SIZE: usize = aie2_spec::MEM_TILE_DATA_MEMORY_SIZE;
-
-/// Size of program memory (16KB = 1024 x 128-bit instructions)
-/// See AM020 Ch4: "The program memory size on the AIE-ML is 16 KB"
+/// Size of program memory (16 KB = 1024 x 128-bit instructions).
 pub const PROGRAM_MEMORY_SIZE: usize = aie2_spec::PROGRAM_MEMORY_SIZE;
 
-/// Number of locks per compute tile (16)
-/// See AM020 Ch2: "The AIE-ML features 16 semaphore locks"
-pub const NUM_LOCKS_COMPUTE: usize = aie2_spec::COMPUTE_TILE_NUM_LOCKS;
+/// Parameters for constructing a Tile with correct per-tile-type sizing.
+///
+/// Production code derives these from `ArchConfig` (which reads mlir-aie
+/// device models). Test convenience constructors use hardcoded defaults
+/// matching NPU1/AIE2.
+#[derive(Debug, Clone)]
+pub struct TileParams {
+    /// Data memory size in bytes (0 for shim, 64K for compute, 512K for mem tile).
+    pub data_memory_size: usize,
+    /// Number of locks (0 for shim, 16 for compute, 64 for mem tile).
+    pub num_locks: usize,
+    /// Number of DMA buffer descriptors (16 for compute, 48 for mem tile).
+    pub num_bds: usize,
+    /// Total DMA channels (4 for compute, 12 for mem tile).
+    pub num_channels: usize,
+}
 
-/// Number of locks per memory tile (64)
-/// See AM020 Ch5: "there are 64 semaphore locks"
-pub const NUM_LOCKS_MEM_TILE: usize = aie2_spec::MEM_TILE_NUM_LOCKS;
+impl TileParams {
+    /// Default compute tile params (NPU1/AIE2).
+    pub fn compute() -> Self {
+        Self { data_memory_size: 64 * 1024, num_locks: 16, num_bds: 16, num_channels: 4 }
+    }
 
-/// Maximum number of locks (for array sizing - uses mem tile count)
-pub const NUM_LOCKS: usize = NUM_LOCKS_MEM_TILE;
+    /// Default memory tile params (NPU1/AIE2).
+    pub fn mem_tile() -> Self {
+        Self { data_memory_size: 512 * 1024, num_locks: 64, num_bds: 48, num_channels: 12 }
+    }
 
-/// Number of DMA buffer descriptors per tile (16)
-/// See AM020 Ch2: "the DMA controller has access to the 16 buffer descriptors"
-pub const NUM_DMA_BDS: usize = aie2_spec::NUM_DMA_BUFFER_DESCRIPTORS;
-
-/// Number of DMA channels for compute tiles (2 S2MM + 2 MM2S = 4)
-pub const NUM_DMA_CHANNELS: usize = aie2_spec::COMPUTE_TILE_S2MM_CHANNELS
-    + aie2_spec::COMPUTE_TILE_MM2S_CHANNELS;
+    /// Default shim tile params.
+    pub fn shim() -> Self {
+        Self { data_memory_size: 0, num_locks: 0, num_bds: 0, num_channels: 0 }
+    }
+}
 
 /// Result of a lock operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,8 +102,12 @@ pub struct Lock {
 }
 
 impl Lock {
-    /// Maximum lock value (6-bit: 0-63)
-    pub const MAX_VALUE: u8 = aie2_spec::LOCK_MAX_VALUE;
+    /// Maximum lock value (6-bit: 0-63).
+    ///
+    /// This compile-time constant is validated against the mlir-aie device
+    /// model at startup (see `model::validate_against_spec()`). It is kept
+    /// as a const for hot-path efficiency in lock acquire/release.
+    pub const MAX_VALUE: u8 = 63;
 
     /// Create a new lock with initial value (clamped to 0-63)
     #[inline]
@@ -394,27 +404,29 @@ impl DmaChannel {
     }
 
     /// Update status register field: Cur_BD
+    ///
+    /// Uses the compute tile status layout. The DmaEngine.get_channel_status()
+    /// method selects the correct layout per tile type; this is a convenience
+    /// for the DmaChannel struct which stores a copy of the status word.
     pub fn set_cur_bd(&mut self, bd: u8) {
-        use super::registers_spec::memory_module::channel;
-        self.status = (self.status & !(channel::STATUS_CUR_BD_MASK << channel::STATUS_CUR_BD_SHIFT))
-            | (((bd as u32) & channel::STATUS_CUR_BD_MASK) << channel::STATUS_CUR_BD_SHIFT);
+        let layout = &super::regdb::device_reg_layout().memory_status;
+        self.status = layout.cur_bd.insert(self.status, bd as u32);
     }
 
     /// Update status register: Channel_Running
     pub fn set_channel_running(&mut self, running: bool) {
-        use super::registers_spec::memory_module::channel;
+        let layout = &super::regdb::device_reg_layout().memory_status;
         if running {
-            self.status |= 1 << channel::STATUS_CHANNEL_RUNNING_BIT;
+            self.status = layout.channel_running.set_bit(self.status);
         } else {
-            self.status &= !(1 << channel::STATUS_CHANNEL_RUNNING_BIT);
+            self.status &= !(layout.channel_running.mask << layout.channel_running.shift);
         }
     }
 
     /// Update status register: State bits (00=IDLE, 01=STARTING, 10=RUNNING)
     pub fn set_state(&mut self, state: u8) {
-        use super::registers_spec::memory_module::channel;
-        self.status = (self.status & !channel::STATUS_STATE_MASK)
-            | ((state as u32) & channel::STATUS_STATE_MASK);
+        let layout = &super::regdb::device_reg_layout().memory_status;
+        self.status = layout.status.insert(self.status, state as u32);
     }
 }
 
@@ -497,6 +509,42 @@ impl TileType {
 ///
 /// This struct is designed for cache-friendly access during emulation.
 /// Hot data (core state, locks) is at the start; cold data (memory) is at the end.
+/// Control packet state machine for TileControl port.
+///
+/// The TileControl port receives control packets from the stream switch.
+/// Each packet has a header word followed by 1-4 data words (beats).
+///
+/// Control packet header format (AM020 Table 3):
+/// - Bits 19:0 = Address (tile-local register offset)
+/// - Bits 21:20 = Length (00=1 beat, 01=2, 10=3, 11=4)
+/// - Bits 23:22 = Operation (00=write, 01=read+return, 10=write_incr, 11=block_write)
+/// - Bits 30:24 = Stream_ID (for response routing)
+/// - Bit 31 = Parity
+#[derive(Debug, Clone, Default)]
+pub enum ControlPacketState {
+    /// Waiting for stream header (when master port Drop_Header=false).
+    /// The stream switch forwards the routing header to TileCtrl; we must
+    /// consume and discard it before the actual control packet header.
+    WaitingForStreamHeader,
+    /// Waiting for control packet header (stream header already consumed
+    /// or was dropped by the switch).
+    #[default]
+    Idle,
+    /// Collecting data beats after header
+    Collecting {
+        /// Target register address (bits 19:0 of header)
+        address: u32,
+        /// Operation: 0=write, 1=read_return, 2=write_incr, 3=block_write
+        operation: u8,
+        /// Stream ID for response routing (bits 30:24)
+        response_id: u8,
+        /// Total beats expected (1-4)
+        beats_total: u8,
+        /// Accumulated data words
+        data: Vec<u32>,
+    },
+}
+
 #[derive(Debug)]
 pub struct Tile {
     /// Tile type
@@ -513,25 +561,25 @@ pub struct Tile {
     /// Core processor state (compute tiles only)
     pub core: CoreState,
 
-    /// Lock states
-    pub locks: [Lock; NUM_LOCKS],
+    /// Lock states (sized from TileParams: 16 for compute, 64 for mem tile, 0 for shim)
+    pub locks: Vec<Lock>,
 
     /// Lock value snapshot for cycle-accurate arbitration.
     /// All lock operations within a cycle check against this snapshot,
     /// ensuring all requestors see the same values regardless of processing order.
-    lock_snapshot: [u8; NUM_LOCKS],
+    lock_snapshot: Vec<u8>,
 
     /// Pending lock deltas to apply at end of cycle.
     /// Releases add positive deltas, acquires add negative deltas.
-    lock_deltas: [i8; NUM_LOCKS],
+    lock_deltas: Vec<i8>,
 
     // === Warm data (accessed during DMA) ===
 
-    /// DMA buffer descriptors
-    pub dma_bds: [DmaBufferDescriptor; NUM_DMA_BDS],
+    /// DMA buffer descriptors (sized from TileParams: 16 for compute, 48 for mem tile)
+    pub dma_bds: Vec<DmaBufferDescriptor>,
 
-    /// DMA channels (0-1: S2MM, 2-3: MM2S)
-    pub dma_channels: [DmaChannel; NUM_DMA_CHANNELS],
+    /// DMA channels (sized from TileParams: 4 for compute, 12 for mem tile)
+    pub dma_channels: Vec<DmaChannel>,
 
     // === Stream port buffers (for core direct stream access) ===
 
@@ -561,17 +609,34 @@ pub struct Tile {
     /// Shim tiles don't have data memory but need to store DMA/stream config.
     /// Stored as sparse map since most addresses won't be written.
     registers: std::collections::HashMap<u32, u32>,
+
+    /// Control packet state machine for TileCtrl port.
+    pub ctrl_pkt_state: ControlPacketState,
+
+    /// Whether the TileCtrl master port drops stream headers.
+    /// Set from the master port's packet config during CDO processing.
+    /// When false, the handler must consume and discard the stream header
+    /// before parsing the control packet header.
+    pub ctrl_pkt_drop_header: bool,
+
+    /// Shim Mux: which switchbox South slave port each DMA MM2S channel feeds.
+    /// Parsed from Mux_Config register (0x1F000). Index 0 = MM2S ch0, 1 = MM2S ch1.
+    /// Value is the switchbox slave port index (e.g., 5 for South3).
+    pub shim_mux_mm2s_slaves: [Option<usize>; 2],
+
+    /// Shim Mux: which switchbox South master port feeds each DMA S2MM channel.
+    /// Parsed from Demux_Config register (0x1F004). Index 0 = S2MM ch0, 1 = S2MM ch1.
+    /// Value is the switchbox master port index (e.g., 2 for South0).
+    pub shim_mux_s2mm_masters: [Option<usize>; 2],
 }
 
 impl Tile {
-    /// Create a new tile of the specified type.
-    pub fn new(tile_type: TileType, col: u8, row: u8) -> Self {
-        let data_memory_size = match tile_type {
-            TileType::Shim => 0,
-            TileType::MemTile => MEM_TILE_MEMORY_SIZE,
-            TileType::Compute => COMPUTE_TILE_MEMORY_SIZE,
-        };
-
+    /// Create a new tile of the specified type with explicit parameters.
+    ///
+    /// Production code should use the `ArchConfig`-derived params (via
+    /// `TileArray::new()`). Test code can use `Tile::compute()` etc. for
+    /// convenience with NPU1/AIE2 defaults.
+    pub fn new(tile_type: TileType, col: u8, row: u8, params: &TileParams) -> Self {
         let program_memory = match tile_type {
             TileType::Compute => Some(Box::new([0u8; PROGRAM_MEMORY_SIZE])),
             _ => None,
@@ -582,11 +647,11 @@ impl Tile {
             col,
             row,
             core: CoreState::default(),
-            locks: [Lock::default(); NUM_LOCKS],
-            lock_snapshot: [0; NUM_LOCKS],
-            lock_deltas: [0; NUM_LOCKS],
-            dma_bds: [DmaBufferDescriptor::default(); NUM_DMA_BDS],
-            dma_channels: [DmaChannel::default(); NUM_DMA_CHANNELS],
+            locks: vec![Lock::default(); params.num_locks],
+            lock_snapshot: vec![0; params.num_locks],
+            lock_deltas: vec![0; params.num_locks],
+            dma_bds: vec![DmaBufferDescriptor::default(); params.num_bds],
+            dma_channels: vec![DmaChannel::default(); params.num_channels],
             stream_input: Default::default(),
             stream_output: Default::default(),
             stream_switch: match tile_type {
@@ -594,28 +659,35 @@ impl Tile {
                 TileType::MemTile => FunctionalStreamSwitch::new_mem_tile(col, row),
                 TileType::Compute => FunctionalStreamSwitch::new_compute_tile(col, row),
             },
-            data_memory: vec![0u8; data_memory_size].into_boxed_slice(),
+            data_memory: vec![0u8; params.data_memory_size].into_boxed_slice(),
             program_memory,
             registers: std::collections::HashMap::new(),
+            ctrl_pkt_state: ControlPacketState::Idle,
+            ctrl_pkt_drop_header: true,
+            shim_mux_mm2s_slaves: [None; 2],
+            shim_mux_s2mm_masters: [None; 2],
         }
     }
 
-    /// Create a compute tile.
+    /// Create a compute tile with NPU1/AIE2 default parameters.
+    ///
+    /// Convenience constructor for tests. Production code should use
+    /// `Tile::new()` with ArchConfig-derived params.
     #[inline]
     pub fn compute(col: u8, row: u8) -> Self {
-        Self::new(TileType::Compute, col, row)
+        Self::new(TileType::Compute, col, row, &TileParams::compute())
     }
 
-    /// Create a memory tile.
+    /// Create a memory tile with NPU1/AIE2 default parameters.
     #[inline]
     pub fn mem_tile(col: u8, row: u8) -> Self {
-        Self::new(TileType::MemTile, col, row)
+        Self::new(TileType::MemTile, col, row, &TileParams::mem_tile())
     }
 
-    /// Create a shim tile.
+    /// Create a shim tile with NPU1/AIE2 default parameters.
     #[inline]
     pub fn shim(col: u8, row: u8) -> Self {
-        Self::new(TileType::Shim, col, row)
+        Self::new(TileType::Shim, col, row, &TileParams::shim())
     }
 
     /// Get data memory slice.
@@ -741,7 +813,8 @@ impl Tile {
             }
         }
         // Snapshot current values and clear deltas from previous cycle
-        for i in 0..NUM_LOCKS {
+        let num_locks = self.locks.len();
+        for i in 0..num_locks {
             self.lock_snapshot[i] = self.locks[i].value;
             self.lock_deltas[i] = 0;
         }
@@ -761,7 +834,7 @@ impl Tile {
     /// # Returns
     /// `LockResult::Success` if acquire would succeed, error otherwise.
     pub fn try_acquire_snapshot(&mut self, lock_id: usize, expected: u8, delta: i8, equal_mode: bool) -> LockResult {
-        if lock_id >= NUM_LOCKS {
+        if lock_id >= self.locks.len() {
             return LockResult::WouldUnderflow;
         }
 
@@ -801,7 +874,7 @@ impl Tile {
     /// * `delta` - Change to apply (typically positive for release)
     #[inline]
     pub fn release_snapshot(&mut self, lock_id: usize, delta: i8) {
-        if lock_id < NUM_LOCKS {
+        if lock_id < self.locks.len() {
             let old = self.lock_deltas[lock_id];
             self.lock_deltas[lock_id] = self.lock_deltas[lock_id].saturating_add(delta);
             log::debug!("Tile({},{}) release_snapshot lock {} delta {} (old_delta={}, new_delta={}) self_ptr={:p}",
@@ -826,7 +899,8 @@ impl Tile {
                     non_zero.join(", "), self);
             }
         }
-        for i in 0..NUM_LOCKS {
+        let num_locks = self.locks.len();
+        for i in 0..num_locks {
             let delta = self.lock_deltas[i];
             if delta != 0 {
                 let old_value = self.locks[i].value;
@@ -853,7 +927,7 @@ impl Tile {
     /// Get the snapshot value for a lock (for debugging/logging).
     #[inline]
     pub fn lock_snapshot_value(&self, lock_id: usize) -> u8 {
-        if lock_id < NUM_LOCKS {
+        if lock_id < self.locks.len() {
             self.lock_snapshot[lock_id]
         } else {
             0
@@ -863,7 +937,7 @@ impl Tile {
     /// Get the pending delta for a lock (for debugging/logging).
     #[inline]
     pub fn lock_pending_delta(&self, lock_id: usize) -> i8 {
-        if lock_id < NUM_LOCKS {
+        if lock_id < self.locks.len() {
             self.lock_deltas[lock_id]
         } else {
             0
@@ -884,6 +958,14 @@ impl Tile {
     /// - 0x1D000-0x1D3FF: DMA BD registers
     /// - 0x1D400-0x1D7FF: DMA channel control
     /// - 0x3F000-0x3FFFF: Stream switch configuration
+    /// Get an immutable reference to the register map.
+    ///
+    /// Used by mask_write_register in state.rs to read current values without
+    /// triggering side effects (unlike read_register which executes lock operations).
+    pub fn registers_ref(&self) -> &std::collections::HashMap<u32, u32> {
+        &self.registers
+    }
+
     pub fn write_register(&mut self, offset: u32, value: u32) {
         // Always store in the register map for later retrieval
         self.registers.insert(offset, value);
@@ -895,7 +977,7 @@ impl Tile {
             let bd_index = (bd_offset / 0x20) as usize;
             let reg_in_bd = (bd_offset % 0x20) as usize / 4;
 
-            if bd_index < NUM_DMA_BDS {
+            if bd_index < self.dma_bds.len() {
                 let bd = &mut self.dma_bds[bd_index];
                 match reg_in_bd {
                     0 => bd.addr_low = value,
@@ -909,15 +991,27 @@ impl Tile {
             }
         }
 
-        // Lock registers: 0x14000-0x14XXX
-        if (0x14000..0x15000).contains(&offset) {
-            let lock_offset = offset - 0x14000;
-            let lock_id = (lock_offset / 0x10) as usize;
-            if lock_id < NUM_LOCKS {
-                // Lock value register is at offset 0x0 within each lock block
-                if lock_offset % 0x10 == 0 {
-                    self.locks[lock_id].set((value & 0x3F) as u8);
-                }
+        // Lock value registers (from AM025 regdb: Lock0_value @ 0x1F000, stride 0x10)
+        let reg_layout = super::regdb::device_reg_layout();
+        let lock_base = if self.tile_type == TileType::MemTile {
+            reg_layout.memtile_lock_base
+        } else {
+            reg_layout.memory_lock_base
+        };
+        let lock_stride = if self.tile_type == TileType::MemTile {
+            reg_layout.memtile_lock_stride
+        } else {
+            reg_layout.memory_lock_stride
+        };
+        let lock_end = lock_base + (self.locks.len() as u32) * lock_stride;
+        if (lock_base..lock_end).contains(&offset) {
+            let lock_id = ((offset - lock_base) / lock_stride) as usize;
+            let sub_offset = (offset - lock_base) % lock_stride;
+            if lock_id < self.locks.len() && sub_offset == 0 {
+                // Lock_value field is bits 5:0 (6-bit unsigned, 0-63)
+                self.locks[lock_id].set((value & 0x3F) as u8);
+                log::info!("Tile ({},{}) write_register: Lock{} = {} (raw=0x{:08X})",
+                    self.col, self.row, lock_id, value & 0x3F, value);
             }
         }
 
@@ -925,7 +1019,7 @@ impl Tile {
         if (0x1D200..0x1D400).contains(&offset) {
             let ch_offset = offset - 0x1D200;
             let ch_index = (ch_offset / 0x8) as usize;
-            if ch_index < NUM_DMA_CHANNELS {
+            if ch_index < self.dma_channels.len() {
                 let ch = &mut self.dma_channels[ch_index];
                 if ch_offset % 0x8 == 0 {
                     ch.control = value;
@@ -935,23 +1029,36 @@ impl Tile {
             }
         }
 
+        // Shim Mux config registers (shim tiles only)
+        // Mux_Config (0x1F000): selects source for switchbox South slave ports
+        //   Each 2-bit field: 0=South/PL, 1=DMA, 2=NoC
+        // Shim Mux/Demux config registers: select DMA/PL/NoC sources/dests
+        // for switchbox South ports. Offsets and field layout are data-driven.
+        let reg_layout = super::regdb::device_reg_layout();
+        if self.tile_type == TileType::Shim {
+            if offset == reg_layout.shim_mux.mux_offset {
+                self.parse_shim_mux_config(value);
+            } else if offset == reg_layout.shim_mux.demux_offset {
+                self.parse_shim_demux_config(value);
+            }
+        }
+
         // Lock status registers (write-to-clear)
         // Writing 1 to a bit clears that lock's overflow/underflow status
-        use super::registers_spec::{memory_module as mm, mem_tile_module as mt};
         if self.is_mem_tile() {
-            if offset == mt::LOCKS_OVERFLOW_0 {
+            if offset == reg_layout.memtile_locks_overflow_0 {
                 self.clear_lock_overflow_bits(0, 32, value);
-            } else if offset == mt::LOCKS_OVERFLOW_1 {
+            } else if offset == reg_layout.memtile_locks_overflow_1 {
                 self.clear_lock_overflow_bits(32, 64, value);
-            } else if offset == mt::LOCKS_UNDERFLOW_0 {
+            } else if offset == reg_layout.memtile_locks_underflow_0 {
                 self.clear_lock_underflow_bits(0, 32, value);
-            } else if offset == mt::LOCKS_UNDERFLOW_1 {
+            } else if offset == reg_layout.memtile_locks_underflow_1 {
                 self.clear_lock_underflow_bits(32, 64, value);
             }
         } else if self.is_compute() {
-            if offset == mm::LOCKS_OVERFLOW {
+            if offset == reg_layout.memory_locks_overflow {
                 self.clear_lock_overflow_bits(0, 16, value);
-            } else if offset == mm::LOCKS_UNDERFLOW {
+            } else if offset == reg_layout.memory_locks_underflow {
                 self.clear_lock_underflow_bits(0, 16, value);
             }
         }
@@ -962,6 +1069,7 @@ impl Tile {
     /// Returns 0 for unwritten registers (default state).
     pub fn read_register(&mut self, offset: u32) -> u32 {
         use super::registers_spec::{memory_module as mm, mem_tile_module as mt};
+        let reg_layout = super::regdb::device_reg_layout();
 
         // Lock_Request register - address encodes operation parameters
         // Reading performs the lock operation and returns result
@@ -970,16 +1078,16 @@ impl Tile {
                 return self.handle_lock_request(offset, true);
             }
             // Lock status registers
-            if offset == mt::LOCKS_OVERFLOW_0 {
+            if offset == reg_layout.memtile_locks_overflow_0 {
                 return self.get_lock_overflow_bits(0, 32);
             }
-            if offset == mt::LOCKS_OVERFLOW_1 {
+            if offset == reg_layout.memtile_locks_overflow_1 {
                 return self.get_lock_overflow_bits(32, 64);
             }
-            if offset == mt::LOCKS_UNDERFLOW_0 {
+            if offset == reg_layout.memtile_locks_underflow_0 {
                 return self.get_lock_underflow_bits(0, 32);
             }
-            if offset == mt::LOCKS_UNDERFLOW_1 {
+            if offset == reg_layout.memtile_locks_underflow_1 {
                 return self.get_lock_underflow_bits(32, 64);
             }
         } else if self.is_compute() {
@@ -987,10 +1095,10 @@ impl Tile {
                 return self.handle_lock_request(offset, false);
             }
             // Lock status registers
-            if offset == mm::LOCKS_OVERFLOW {
+            if offset == reg_layout.memory_locks_overflow {
                 return self.get_lock_overflow_bits(0, 16);
             }
-            if offset == mm::LOCKS_UNDERFLOW {
+            if offset == reg_layout.memory_locks_underflow {
                 return self.get_lock_underflow_bits(0, 16);
             }
         }
@@ -1002,17 +1110,19 @@ impl Tile {
             let bd_index = (bd_offset / 0x20) as usize;
             let reg_in_bd = (bd_offset % 0x20) as usize / 4;
 
-            if bd_index < NUM_DMA_BDS {
+            if bd_index < self.dma_bds.len() {
                 let bd = &self.dma_bds[bd_index];
-                return match reg_in_bd {
-                    0 => bd.addr_low,
-                    1 => bd.addr_high,
-                    2 => bd.length,
-                    3 => bd.control,
-                    4 => bd.d0,
-                    5 => bd.d1,
-                    _ => 0,
-                };
+                // Legacy struct has 6 fields; words 6-7 (shim/memtile iteration
+                // and lock/valid) fall through to the register HashMap below.
+                match reg_in_bd {
+                    0 => return bd.addr_low,
+                    1 => return bd.addr_high,
+                    2 => return bd.length,
+                    3 => return bd.control,
+                    4 => return bd.d0,
+                    5 => return bd.d1,
+                    _ => {} // Fall through to register map for words 6-7
+                }
             }
         }
 
@@ -1088,6 +1198,178 @@ impl Tile {
         }
     }
 
+    // === Control Packet Handling ===
+
+    /// Parse Shim Mux_Config register to find DMA MM2S South slave mapping.
+    ///
+    /// The Shim Mux selects which source (PL/DMA/NoC) feeds each switchbox South
+    /// slave port. DMA MM2S output enters the switchbox through a South slave.
+    ///
+    /// Field layout and port mappings are derived from the AM025 register database.
+    /// Select values: 0=South/PL, 1=DMA, 2=NoC
+    fn parse_shim_mux_config(&mut self, value: u32) {
+        let mux = &super::regdb::device_reg_layout().shim_mux;
+
+        // Reset mapping (register may be rewritten with different config)
+        self.shim_mux_mm2s_slaves = [None; 2];
+
+        let mut dma_ch = 0usize;
+        for mf in &mux.mux_fields {
+            let select = mf.field.extract(value);
+            if select == 1 && dma_ch < 2 {
+                // DMA source -> this South slave gets MM2S output
+                self.shim_mux_mm2s_slaves[dma_ch] = Some(mf.port_index);
+                log::info!("Shim Mux ({},{}): MM2S ch{} -> slave[{}] ({})",
+                    self.col, self.row, dma_ch, mf.port_index, mf.field.name);
+                dma_ch += 1;
+            }
+        }
+    }
+
+    /// Parse Shim Demux_Config register to find DMA S2MM South master mapping.
+    ///
+    /// The Shim Demux selects which destination (PL/DMA/NoC) receives switchbox
+    /// South master output. DMA S2MM input comes from a South master.
+    ///
+    /// Field layout and port mappings are derived from the AM025 register database.
+    /// Select values: 0=South/PL, 1=DMA, 2=NoC
+    fn parse_shim_demux_config(&mut self, value: u32) {
+        let mux = &super::regdb::device_reg_layout().shim_mux;
+
+        // Reset mapping
+        self.shim_mux_s2mm_masters = [None; 2];
+
+        let mut dma_ch = 0usize;
+        for df in &mux.demux_fields {
+            let select = df.field.extract(value);
+            if select == 1 && dma_ch < 2 {
+                self.shim_mux_s2mm_masters[dma_ch] = Some(df.port_index);
+                log::info!("Shim Mux ({},{}): S2MM ch{} <- master[{}] ({})",
+                    self.col, self.row, dma_ch, df.port_index, df.field.name);
+                dma_ch += 1;
+            }
+        }
+    }
+
+    /// Process a data word arriving at the TileControl port.
+    ///
+    /// The TileControl master port delivers control packets that reprogram
+    /// tile registers at runtime. Each packet consists of:
+    /// 1. A control header word (address, operation, beat count)
+    /// 2. One or more data words (the register values to write)
+    ///
+    /// Control packet header format (AM020 Table 3):
+    /// - Bits 19:0 = Address (tile-local register offset)
+    /// - Bits 21:20 = Length (00=1 beat, 01=2, 10=3, 11=4)
+    /// - Bits 23:22 = Operation (00=write, 01=read, 10=write_incr, 11=block_write)
+    /// - Bits 30:24 = Stream_ID (for response routing)
+    /// - Bit 31 = Parity
+    pub fn process_ctrl_packet_word(&mut self, word: u32, tlast: bool) {
+        match std::mem::take(&mut self.ctrl_pkt_state) {
+            ControlPacketState::WaitingForStreamHeader => {
+                // Stream header forwarded because Drop_Header=false on master.
+                // Consume it and transition to Idle for the actual ctrl header.
+                let pkt_id = word & 0x1F;
+                let pkt_type = (word >> 12) & 0x7;
+                log::debug!("Tile ({},{}) ctrl_pkt: consuming stream header 0x{:08X} (pkt_id={}, pkt_type={})",
+                    self.col, self.row, word, pkt_id, pkt_type);
+                self.ctrl_pkt_state = ControlPacketState::Idle;
+            }
+            ControlPacketState::Idle => {
+                // Parse control packet header (AM020 Table 3)
+                use crate::device::aie2_spec::*;
+                let address = word & CTRL_PKT_ADDRESS_MASK;
+                let beats = ((word >> CTRL_PKT_LENGTH_SHIFT) & CTRL_PKT_LENGTH_MASK) as u8 + 1;
+                let operation = ((word >> CTRL_PKT_OPERATION_SHIFT) & CTRL_PKT_OPERATION_MASK) as u8;
+                let response_id = ((word >> CTRL_PKT_RESPONSE_ID_SHIFT) & CTRL_PKT_RESPONSE_ID_MASK) as u8;
+
+                log::info!("Tile ({},{}) ctrl_pkt: header 0x{:08X} addr=0x{:05X} op={} beats={} resp_id={}",
+                    self.col, self.row, word, address, operation, beats, response_id);
+
+                self.ctrl_pkt_state = ControlPacketState::Collecting {
+                    address,
+                    operation,
+                    response_id,
+                    beats_total: beats,
+                    data: Vec::with_capacity(beats as usize),
+                };
+            }
+            ControlPacketState::Collecting {
+                address,
+                operation,
+                response_id,
+                beats_total,
+                mut data,
+            } => {
+                data.push(word);
+                log::debug!("Tile ({},{}) ctrl_pkt: data[{}] = 0x{:08X} ({}/{}){}",
+                    self.col, self.row, data.len() - 1, word, data.len(), beats_total,
+                    if tlast { " TLAST" } else { "" });
+
+                if data.len() >= beats_total as usize {
+                    // All beats received -- execute the operation
+                    self.execute_ctrl_packet(address, operation, response_id, &data);
+                    // After completion: if TLAST marks end of stream packet AND
+                    // headers aren't dropped, expect a stream header next time.
+                    // Otherwise stay Idle for the next ctrl packet within this
+                    // same stream packet.
+                    self.ctrl_pkt_state = if tlast && !self.ctrl_pkt_drop_header {
+                        ControlPacketState::WaitingForStreamHeader
+                    } else {
+                        ControlPacketState::Idle
+                    };
+                } else {
+                    // Still collecting
+                    self.ctrl_pkt_state = ControlPacketState::Collecting {
+                        address,
+                        operation,
+                        response_id,
+                        beats_total,
+                        data,
+                    };
+                }
+            }
+        }
+    }
+
+    /// Execute a complete control packet operation.
+    ///
+    /// Currently supports:
+    /// - Operation 0 (write): Write data words to consecutive register addresses
+    /// - Operation 1 (read): Not yet implemented (would need response routing)
+    fn execute_ctrl_packet(&mut self, base_address: u32, operation: u8, _response_id: u8, data: &[u32]) {
+        use crate::device::aie2_spec::*;
+        match operation {
+            CTRL_PKT_OP_WRITE | CTRL_PKT_OP_BLOCK_WRITE => {
+                // Write / Block write: write data to consecutive 32-bit registers
+                for (i, &value) in data.iter().enumerate() {
+                    let addr = base_address + (i as u32) * 4;
+                    log::info!("Tile ({},{}) ctrl_pkt WRITE: [0x{:05X}] = 0x{:08X}",
+                        self.col, self.row, addr, value);
+                    self.write_register(addr, value);
+                }
+            }
+            CTRL_PKT_OP_READ => {
+                // Read: would need to send response back via stream
+                log::warn!("Tile ({},{}) ctrl_pkt: read operation not yet supported (addr=0x{:05X})",
+                    self.col, self.row, base_address);
+            }
+            CTRL_PKT_OP_WRITE_INCR => {
+                // Write with increment: write data to address, then address+4, etc.
+                for (i, &value) in data.iter().enumerate() {
+                    let addr = base_address + (i as u32) * 4;
+                    log::info!("Tile ({},{}) ctrl_pkt WRITE_INCR: [0x{:05X}] = 0x{:08X}",
+                        self.col, self.row, addr, value);
+                    self.write_register(addr, value);
+                }
+            }
+            _ => {
+                log::warn!("Tile ({},{}) ctrl_pkt: unknown operation {} (addr=0x{:05X})",
+                    self.col, self.row, operation, base_address);
+            }
+        }
+    }
+
     // === Lock_Request Register Handling ===
 
     /// Handle a Lock_Request register read.
@@ -1120,9 +1402,8 @@ impl Tile {
             change_raw
         };
 
-        // Bounds check
-        let max_locks = if is_memtile { NUM_LOCKS_MEM_TILE } else { NUM_LOCKS_COMPUTE };
-        if lock_id >= max_locks {
+        // Bounds check against actual lock count for this tile
+        if lock_id >= self.locks.len() {
             return 0; // Invalid lock ID
         }
 
@@ -1196,7 +1477,10 @@ mod tests {
         assert_eq!(tile.row, 2);
         assert!(tile.is_compute());
         assert!(tile.program_memory().is_some());
-        assert_eq!(tile.data_memory().len(), COMPUTE_TILE_MEMORY_SIZE);
+        assert_eq!(tile.data_memory().len(), 64 * 1024);
+        assert_eq!(tile.locks.len(), 16);
+        assert_eq!(tile.dma_bds.len(), 16);
+        assert_eq!(tile.dma_channels.len(), 4);
     }
 
     #[test]
@@ -1204,7 +1488,10 @@ mod tests {
         let tile = Tile::mem_tile(0, 1);
         assert!(tile.is_mem_tile());
         assert!(tile.program_memory().is_none());
-        assert_eq!(tile.data_memory().len(), MEM_TILE_MEMORY_SIZE);
+        assert_eq!(tile.data_memory().len(), 512 * 1024);
+        assert_eq!(tile.locks.len(), 64);
+        assert_eq!(tile.dma_bds.len(), 48);
+        assert_eq!(tile.dma_channels.len(), 12);
     }
 
     #[test]
@@ -1213,6 +1500,9 @@ mod tests {
         assert!(tile.is_shim());
         assert!(tile.program_memory().is_none());
         assert_eq!(tile.data_memory().len(), 0);
+        assert_eq!(tile.locks.len(), 0);
+        assert_eq!(tile.dma_bds.len(), 0);
+        assert_eq!(tile.dma_channels.len(), 0);
     }
 
     #[test]
@@ -1311,9 +1601,9 @@ mod tests {
 
     #[test]
     fn test_lock_counts() {
-        // Verify lock counts per AM020
-        assert_eq!(NUM_LOCKS_COMPUTE, 16);
-        assert_eq!(NUM_LOCKS_MEM_TILE, 64);
+        // Verify lock counts per AM020 (via TileParams defaults)
+        assert_eq!(TileParams::compute().num_locks, 16);
+        assert_eq!(TileParams::mem_tile().num_locks, 64);
     }
 
     #[test]
