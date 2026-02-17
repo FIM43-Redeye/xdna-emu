@@ -1,0 +1,338 @@
+//! AMD aiesimulator invocation and output parsing.
+//!
+//! aiesimulator is AMD's cycle-accurate AIE simulator. It runs on a `.prj`
+//! directory produced by aiecc.py (when `--no-aiesim` is NOT passed).
+//!
+//! This module provides:
+//! - `run_simulation()`: invoke aiesimulator with input data and timeout
+//! - `read_output_data()`: read raw binary output from simulation results
+//!
+//! # Prerequisites
+//!
+//! - aietools must be installed with aiesimulator binary
+//! - A valid Xilinx license (aiesimulator requires one)
+//! - A `.prj` directory with `sim/` subdirectory (from a Chess build)
+//!
+//! # Example
+//!
+//! ```ignore
+//! let tools = AieTools::discover(&config)?;
+//! let result = run_simulation(&tools, &prj_dir, &input_data, 100_000)?;
+//! let output = read_output_data(&result)?;
+//! ```
+
+use std::path::{Path, PathBuf};
+
+use super::aietools::AieTools;
+
+/// Result of an aiesimulator run.
+#[derive(Debug)]
+pub struct SimResult {
+    /// Directory containing simulation output files.
+    pub output_dir: PathBuf,
+    /// Exit code from aiesimulator process.
+    pub exit_code: i32,
+    /// Captured stdout.
+    pub stdout: String,
+    /// Captured stderr.
+    pub stderr: String,
+}
+
+/// Run aiesimulator on a .prj directory.
+///
+/// # Arguments
+///
+/// * `tools` - Discovered aietools installation (must have aiesimulator)
+/// * `prj_dir` - Path to the .prj directory (must contain `sim/` subdirectory)
+/// * `input_data` - Named input files: `(filename, raw_bytes)` pairs.
+///   These are written into an input directory that aiesimulator reads from.
+/// * `timeout_cycles` - Maximum simulation cycles before timeout
+///
+/// # Returns
+///
+/// `SimResult` with output directory path, exit code, and captured output.
+/// The caller should use `read_output_data()` to extract results.
+pub fn run_simulation(
+    tools: &AieTools,
+    prj_dir: &Path,
+    input_data: &[(String, Vec<u8>)],
+    timeout_cycles: u64,
+) -> Result<SimResult, String> {
+    // Validate simulator is available
+    if tools.aiesimulator.is_none() {
+        return Err("aiesimulator not available in aietools".to_string());
+    }
+
+    // Validate .prj/sim/ exists
+    let sim_dir = prj_dir.join("sim");
+    if !sim_dir.is_dir() {
+        return Err(format!(
+            "No sim/ directory in {} -- was the build run without --no-aiesim?",
+            prj_dir.display()
+        ));
+    }
+
+    // Create working directories alongside the .prj
+    let work_dir = prj_dir.parent()
+        .unwrap_or(Path::new("."));
+    let input_dir = work_dir.join("aiesim_input");
+    let output_dir = work_dir.join("aiesim_output");
+
+    // Clean and recreate output directory
+    if output_dir.exists() {
+        std::fs::remove_dir_all(&output_dir)
+            .map_err(|e| format!("Failed to clean output dir: {}", e))?;
+    }
+    std::fs::create_dir_all(&output_dir)
+        .map_err(|e| format!("Failed to create output dir: {}", e))?;
+
+    // Write input data files
+    std::fs::create_dir_all(&input_dir)
+        .map_err(|e| format!("Failed to create input dir: {}", e))?;
+    for (name, data) in input_data {
+        let path = input_dir.join(name);
+        std::fs::write(&path, data)
+            .map_err(|e| format!("Failed to write input file {}: {}", name, e))?;
+    }
+
+    // ps.so (the sim host shim) links against libxaienginecdo.so from the
+    // mlir-aie install, but the aiesimulator bash wrapper manages its own
+    // LD_LIBRARY_PATH, clobbering what we set. The reliable fix: symlink
+    // the library into the ps/ directory so the dynamic linker finds it
+    // via the same directory as ps.so.
+    let ps_dir = sim_dir.join("ps");
+    if ps_dir.is_dir() {
+        let config = crate::config::Config::get();
+        let mlir_aie = PathBuf::from(config.mlir_aie_path());
+        let xaiengine_src_raw = mlir_aie.join("install/runtime_lib/x86_64/xaiengine/lib/libxaienginecdo.so");
+        // Canonicalize to absolute path -- mlir_aie_path() may be relative
+        let xaiengine_src = xaiengine_src_raw.canonicalize()
+            .unwrap_or(xaiengine_src_raw);
+        let xaiengine_link = ps_dir.join("libxaienginecdo.so");
+        if xaiengine_src.exists() && !xaiengine_link.exists() {
+            #[cfg(unix)]
+            {
+                if let Err(e) = std::os::unix::fs::symlink(&xaiengine_src, &xaiengine_link) {
+                    log::warn!("Failed to symlink libxaienginecdo.so: {}", e);
+                }
+            }
+        }
+    }
+
+    // aiesimulator is a complex bash wrapper that sources setupEnv.sh,
+    // chess_env_LNa64.sh, and manages its own LD_LIBRARY_PATH/PATH.
+    // We invoke via bash -c to ensure proper shell environment setup.
+    let aiesim_path = tools.aiesimulator.as_ref()
+        .ok_or("aiesimulator not available in aietools")?;
+
+    // Build the shell command string with LD_LIBRARY_PATH prepended
+    // (the wrapper script prepends its own dirs, so ours go in front).
+    let config = crate::config::Config::get();
+    let mlir_aie = PathBuf::from(config.mlir_aie_path());
+    let xaiengine_lib_raw = mlir_aie.join("install/runtime_lib/x86_64/xaiengine/lib");
+    let xaiengine_lib = xaiengine_lib_raw.canonicalize()
+        .unwrap_or(xaiengine_lib_raw);
+    let ld_prefix = if xaiengine_lib.is_dir() {
+        format!("LD_LIBRARY_PATH={}:$LD_LIBRARY_PATH ", xaiengine_lib.display())
+    } else {
+        String::new()
+    };
+
+    let shell_cmd = format!(
+        "{}{} --pkg-dir={} --input-dir={} --output-dir={} --simulation-cycle-timeout={}",
+        ld_prefix,
+        aiesim_path.display(),
+        sim_dir.display(),
+        input_dir.display(),
+        output_dir.display(),
+        timeout_cycles,
+    );
+
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg("-c");
+    cmd.arg(&shell_cmd);
+    cmd.current_dir(work_dir);
+
+    log::info!(
+        "Running aiesimulator: pkg-dir={}, timeout={}",
+        sim_dir.display(), timeout_cycles
+    );
+
+    let output = cmd.output()
+        .map_err(|e| format!("Failed to execute aiesimulator: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    if !output.status.success() {
+        log::warn!(
+            "aiesimulator exited with code {}: {}",
+            exit_code,
+            stderr.lines().take(5).collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    Ok(SimResult {
+        output_dir,
+        exit_code,
+        stdout,
+        stderr,
+    })
+}
+
+/// Read raw binary output data from aiesimulator output directory.
+///
+/// Searches for output files in `{output_dir}/data/` and concatenates
+/// them into a single byte buffer. The exact output format depends on
+/// the test's ps.so wrapper, so this is best-effort.
+///
+/// Returns the concatenated bytes, or an error if no output files are found.
+pub fn read_output_data(sim_result: &SimResult) -> Result<Vec<u8>, String> {
+    // aiesimulator writes output to {output_dir}/data/ or directly
+    // to {output_dir}/. Check both locations.
+    let data_dir = sim_result.output_dir.join("data");
+    let search_dir = if data_dir.is_dir() {
+        &data_dir
+    } else {
+        &sim_result.output_dir
+    };
+
+    let mut output = Vec::new();
+    let mut found_files = Vec::new();
+
+    let entries = std::fs::read_dir(search_dir)
+        .map_err(|e| format!("Failed to read output dir {}: {}", search_dir.display(), e))?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        // Read .bin files (raw binary) and .txt files (text format)
+        let ext = path.extension()
+            .map(|e| e.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        match ext.as_str() {
+            "bin" => {
+                if let Ok(data) = std::fs::read(&path) {
+                    found_files.push(path.clone());
+                    output.extend_from_slice(&data);
+                }
+            }
+            "txt" => {
+                // Try parsing as whitespace-separated integers
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    let parsed = parse_text_output(&text);
+                    if !parsed.is_empty() {
+                        found_files.push(path.clone());
+                        output.extend_from_slice(&parsed);
+                    }
+                }
+            }
+            _ => {
+                // Try reading as raw binary
+                if let Ok(data) = std::fs::read(&path) {
+                    if !data.is_empty() {
+                        found_files.push(path.clone());
+                        output.extend_from_slice(&data);
+                    }
+                }
+            }
+        }
+    }
+
+    if found_files.is_empty() {
+        return Err(format!(
+            "No output files found in {}",
+            search_dir.display()
+        ));
+    }
+
+    log::info!(
+        "Read {} bytes from {} output file(s): {:?}",
+        output.len(),
+        found_files.len(),
+        found_files.iter()
+            .map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+    );
+
+    Ok(output)
+}
+
+/// Parse text output from aiesimulator (whitespace-separated integers).
+///
+/// Each integer is converted to a 4-byte little-endian representation.
+/// Lines starting with `#` are treated as comments.
+fn parse_text_output(text: &str) -> Vec<u8> {
+    let mut result = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        for token in line.split_whitespace() {
+            // Try parsing as integer (decimal or hex)
+            let value = if let Some(hex) = token.strip_prefix("0x").or_else(|| token.strip_prefix("0X")) {
+                i64::from_str_radix(hex, 16).ok()
+            } else {
+                token.parse::<i64>().ok()
+            };
+            if let Some(v) = value {
+                result.extend_from_slice(&(v as i32).to_le_bytes());
+            }
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_text_output_decimal() {
+        let text = "1 2 3 4\n5 6 7 8\n";
+        let bytes = parse_text_output(text);
+        // 8 integers * 4 bytes each = 32 bytes
+        assert_eq!(bytes.len(), 32);
+        // First value should be 1 in little-endian
+        assert_eq!(&bytes[0..4], &1i32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &2i32.to_le_bytes());
+    }
+
+    #[test]
+    fn test_parse_text_output_hex() {
+        let text = "0x01 0x0A 0xFF\n";
+        let bytes = parse_text_output(text);
+        assert_eq!(bytes.len(), 12);
+        assert_eq!(&bytes[0..4], &1i32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &10i32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &255i32.to_le_bytes());
+    }
+
+    #[test]
+    fn test_parse_text_output_comments() {
+        let text = "# This is a comment\n1 2\n# Another comment\n3 4\n";
+        let bytes = parse_text_output(text);
+        assert_eq!(bytes.len(), 16);
+    }
+
+    #[test]
+    fn test_parse_text_output_empty() {
+        assert!(parse_text_output("").is_empty());
+        assert!(parse_text_output("# only comments\n").is_empty());
+        assert!(parse_text_output("   \n\n  ").is_empty());
+    }
+
+    #[test]
+    fn test_parse_text_output_mixed_garbage() {
+        // Non-numeric tokens are silently skipped
+        let text = "1 hello 3\n";
+        let bytes = parse_text_output(text);
+        assert_eq!(bytes.len(), 8); // Only 1 and 3 parsed
+    }
+}

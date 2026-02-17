@@ -107,7 +107,7 @@ fn run_test(name: &str) {
                 name, cycles, correct, total
             );
         }
-        TestOutcome::ExpectedFail { cycles, reason } => {
+        TestOutcome::ExpectedFail { cycles, reason, .. } => {
             eprintln!(
                 "EXPECTED FAIL {}: {} cycles - {}",
                 name, cycles, reason
@@ -147,6 +147,9 @@ fn run_test(name: &str) {
         }
         TestOutcome::LoadError { message } => {
             panic!("LOAD ERROR for {}: {}", name, message);
+        }
+        TestOutcome::Platform { required, reason } => {
+            eprintln!("PLATFORM SKIP {}: requires {} - {}", name, required, reason);
         }
     }
 }

@@ -32,6 +32,19 @@ const RUNNER_SEARCH_PATHS: &[&str] = &[
     "target/npu-runner/npu_runner",
 ];
 
+/// Build a sanitized LD_LIBRARY_PATH for npu-runner.
+///
+/// aietools ships an ancient libstdc++.so.6 that shadows the system one
+/// when its lib directory is on LD_LIBRARY_PATH. npu-runner only needs
+/// XRT, not aietools, so we strip aietools paths to avoid the conflict.
+fn sanitized_ld_library_path() -> String {
+    let current = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    current.split(':')
+        .filter(|p| !p.contains("aietools"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 /// NPU accelerator device nodes to probe.
 const ACCEL_DEVICE_NODES: &[&str] = &[
     "/dev/accel/accel0",
@@ -237,7 +250,10 @@ fn run_single_kernel(
             if a.contains(' ') { format!("\"{}\"", a) } else { a.clone() }
         }).collect::<Vec<_>>().join(" "));
 
-    let output = Command::new(runner).args(&args).output()?;
+    let output = Command::new(runner)
+        .args(&args)
+        .env("LD_LIBRARY_PATH", sanitized_ld_library_path())
+        .output()?;
     handle_runner_result(output, &output_file, &tmp_dir, input_values)
 }
 
@@ -382,6 +398,7 @@ fn run_multi_kernel(
 
     let output = Command::new(runner)
         .args(["--spec", &spec_file.to_string_lossy()])
+        .env("LD_LIBRARY_PATH", sanitized_ld_library_path())
         .output()?;
 
     handle_runner_result(output, &output_file, &tmp_dir, input_values)

@@ -25,3 +25,4 @@ pub mod hardware_comparison;
 pub use xclbin_suite::{XclbinSuite, XclbinTest, TestOutcome};
 pub use opcode_collector::{UnknownOpcode, OpcodeCollector};
 pub use manifest_runner::{TestManifest, ManifestRunner, TestResult, ElementType};
+pub use hardware_comparison::{Diagnosis, HardwareValidation};

@@ -21,6 +21,7 @@ pub mod device;
 pub mod interpreter;
 pub mod tablegen;
 pub mod npu;
+pub mod trace;
 pub mod visual;
 pub mod integration;
 pub mod testing;

@@ -28,30 +28,55 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Extract --trace <file> early (applies to all commands)
+    let mut trace_output: Option<String> = None;
+    {
+        let mut i = 1;
+        while i < args.len() {
+            if args[i] == "--trace" {
+                if i + 1 < args.len() {
+                    trace_output = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("Error: --trace requires an output file path");
+                    std::process::exit(1);
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     // Check for test-suite command
-    if args.len() >= 2 && args[1] == "test-suite" {
-        let path = args.get(2).map(|s| s.as_str()).unwrap_or(".");
-        return run_test_suite(path);
+    if args.len() >= 2 && args.iter().any(|a| a == "test-suite") {
+        let path = args.iter()
+            .skip(1)
+            .find(|a| !a.starts_with('-') && a.as_str() != "test-suite")
+            .map(|s| s.as_str())
+            .unwrap_or(".");
+        return run_test_suite(path, trace_output.as_deref());
     }
 
     // Check for GUI mode
     let gui_mode = args.iter().any(|a| a == "--gui" || a == "-g");
     let file_arg: Option<&str> = args.iter()
         .skip(1)
-        .find(|a| !a.starts_with('-'))
+        .find(|a| !a.starts_with('-') && a.as_str() != "--trace")
         .map(|s| s.as_str());
 
     if gui_mode || args.len() < 2 {
         return run_gui(file_arg);
     }
 
-    // Parse options for CLI mode
+    // Parse remaining options for CLI mode
     let mut dump_state = false;
     let mut path = None;
 
     for arg in &args[1..] {
         if arg == "--dump-state" {
             dump_state = true;
+        } else if arg == "--trace" {
+            // Already handled above, skip next arg
         } else if !arg.starts_with('-') {
             path = Some(arg.as_str());
         }
@@ -296,9 +321,12 @@ fn print_command(idx: usize, cmd: &CdoCommand) {
 }
 
 /// Run the XCLBIN test suite.
-fn run_test_suite(path: &str) -> anyhow::Result<()> {
+fn run_test_suite(path: &str, trace_output: Option<&str>) -> anyhow::Result<()> {
     println!("=== XCLBIN Test Suite ===");
     println!("Discovering tests in: {}", path);
+    if let Some(trace_path) = trace_output {
+        println!("Trace output: {}", trace_path);
+    }
     println!();
 
     let mut suite = XclbinSuite::discover(Path::new(path))?;
@@ -318,6 +346,15 @@ fn run_test_suite(path: &str) -> anyhow::Result<()> {
 
     // Print summary
     println!("{}", suite.summary_report(&result));
+
+    // Export trace if requested
+    if let Some(trace_path) = trace_output {
+        println!("Exporting trace to {}...", trace_path);
+        let events = suite.collect_trace_events();
+        let mut file = std::fs::File::create(trace_path)?;
+        xdna_emu::trace::export_perfetto(&events, &mut file)?;
+        println!("Trace exported: {} events", events.len());
+    }
 
     // Exit with error code if any tests failed
     if result.passed < result.total {
@@ -340,6 +377,7 @@ fn print_help() {
     println!("    -V, --version       Print version");
     println!("    -g, --gui           Launch visual debugger (default if no file)");
     println!("    --dump-state        Parse binary and dump device state");
+    println!("    --trace <FILE>      Export Perfetto trace JSON after execution");
     println!();
     println!("COMMANDS:");
     println!("    test-suite <PATH>   Run xclbin test suite from directory");
@@ -348,7 +386,7 @@ fn print_help() {
     println!("    xdna-emu                         # Launch GUI");
     println!("    xdna-emu --gui kernel.xclbin     # GUI with file loaded");
     println!("    xdna-emu --dump-state kernel.xclbin");
-    println!("    xdna-emu test-suite ./tests/");
+    println!("    xdna-emu --trace trace.json test-suite ./tests/");
     println!("    xdna-emu kernel.elf              # Parse ELF file");
 }
 

@@ -57,6 +57,10 @@ xclbin-tests = []
 # Run tests: cargo test --features hardware-compare
 hardware-compare = []
 
+[build-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 [dev-dependencies]
 hex = "0.4"                                             # Hex dump utilities for debugging
 

@@ -13,6 +13,9 @@ use crate::npu::{NpuInstructionStream, NpuExecutor, HostBuffer};
 
 use super::opcode_collector::{OpcodeCollector, UnknownOpcode};
 use super::manifest_runner::{TestManifest, ElementType, read_values};
+use super::hardware_comparison::{
+    self, CrossValidation, HardwareValidation, Diagnosis,
+};
 use std::collections::HashMap;
 
 /// Result of running a single xclbin test.
@@ -314,11 +317,17 @@ pub struct XclbinSuite {
     /// Absolute cycle safety net. 0 means no limit (rely on TDR only).
     max_cycles: u64,
     /// Results from completed tests.
-    results: Vec<(String, TestOutcome)>,
+    results: Vec<(String, TestOutcome, Option<HardwareValidation>)>,
     /// Directory containing manifest files for validation.
     manifest_dir: Option<PathBuf>,
     /// Directory containing hardware reference outputs (for type = "reference" manifests).
     reference_dir: Option<PathBuf>,
+    /// Directory containing captured hardware outputs for cross-validation.
+    /// Each test's output is at `{npu_output_dir}/{test_name}/output.bin`.
+    npu_output_dir: Option<PathBuf>,
+    /// Accumulated trace events from all test runs.
+    /// Populated when tests run; drained by `collect_trace_events()`.
+    trace_events: Vec<crate::interpreter::engine::TileTracedEvent>,
 }
 
 impl XclbinSuite {
@@ -331,6 +340,8 @@ impl XclbinSuite {
             results: Vec::new(),
             manifest_dir: None,
             reference_dir: None,
+            npu_output_dir: None,
+            trace_events: Vec::new(),
         }
     }
 
@@ -346,6 +357,16 @@ impl XclbinSuite {
     /// Set the directory containing hardware reference outputs.
     pub fn with_reference_dir(mut self, dir: PathBuf) -> Self {
         self.reference_dir = Some(dir);
+        self
+    }
+
+    /// Set the directory containing captured NPU hardware outputs.
+    ///
+    /// Each test's captured output is expected at
+    /// `{dir}/{test_name}/output.bin`. When set, the suite performs
+    /// three-way cross-validation after each test run.
+    pub fn with_npu_output_dir(mut self, dir: PathBuf) -> Self {
+        self.npu_output_dir = Some(dir);
         self
     }
 
@@ -464,12 +485,17 @@ impl XclbinSuite {
         let mut unknown = 0;
         let mut timeout = 0;
         let mut load_error = 0;
+        let mut hw_validated = 0;
+        let mut hw_correct = 0;
+        let mut hw_compiler_bug = 0;
+        let mut hw_emulator_bug = 0;
 
         // Clone tests to avoid borrow issues
         let tests: Vec<_> = self.tests.clone();
 
         for test in tests {
-            let outcome = self.run_single(&test);
+            let (outcome, raw_output, trace) = self.run_single_inner(&test);
+            self.trace_events.extend(trace);
 
             match &outcome {
                 TestOutcome::Pass { .. } => passed += 1,
@@ -486,7 +512,21 @@ impl XclbinSuite {
                 TestOutcome::LoadError { .. } => load_error += 1,
             }
 
-            self.results.push((test.name.clone(), outcome));
+            // Cross-validate against hardware if npu_output_dir is set
+            let hw_validation = self.cross_validate(&test, raw_output.as_deref());
+            if let Some(ref hv) = hw_validation {
+                if hv.diagnosis != Diagnosis::NoReference {
+                    hw_validated += 1;
+                    match hv.diagnosis {
+                        Diagnosis::Correct => hw_correct += 1,
+                        Diagnosis::CompilerBug => hw_compiler_bug += 1,
+                        Diagnosis::EmulatorBug => hw_emulator_bug += 1,
+                        _ => {}
+                    }
+                }
+            }
+
+            self.results.push((test.name.clone(), outcome, hw_validation));
         }
 
         SuiteResult {
@@ -500,12 +540,16 @@ impl XclbinSuite {
             unknown,
             timeout,
             load_error,
+            hw_validated,
+            hw_correct,
+            hw_compiler_bug,
+            hw_emulator_bug,
         }
     }
 
     /// Run a single test.
     pub fn run_single(&self, test: &XclbinTest) -> TestOutcome {
-        let (outcome, _) = self.run_single_inner(test);
+        let (outcome, _, _) = self.run_single_inner(test);
         outcome
     }
 
@@ -516,14 +560,54 @@ impl XclbinSuite {
     /// The output bytes are `None` if the engine could not be created or
     /// the test was skipped.
     pub fn run_single_with_output(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>) {
-        self.run_single_inner(test)
+        let (outcome, output, _) = self.run_single_inner(test);
+        (outcome, output)
+    }
+
+    /// Run a single test with full cross-validation results.
+    ///
+    /// Returns the test outcome, raw output, and optional hardware
+    /// cross-validation diagnosis.
+    pub fn run_single_with_hw_validation(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Option<HardwareValidation>) {
+        let (outcome, raw_output, _) = self.run_single_inner(test);
+        let hw_validation = self.cross_validate(test, raw_output.as_deref());
+        (outcome, raw_output, hw_validation)
+    }
+
+    /// Perform three-way cross-validation against captured hardware output.
+    ///
+    /// Returns `None` if no npu_output_dir is configured or no manifest
+    /// is available. Returns `Some(HardwareValidation)` with a `NoReference`
+    /// diagnosis if the hardware output file does not exist.
+    fn cross_validate(&self, test: &XclbinTest, emu_output: Option<&[u8]>) -> Option<HardwareValidation> {
+        let npu_dir = self.npu_output_dir.as_ref()?;
+        let manifest = test.manifest.as_ref()?;
+
+        // Load hardware reference output
+        let hw_output = hardware_comparison::load_hw_reference(npu_dir, &test.name);
+
+        // Generate input values for expected value calculation
+        let input_values = hardware_comparison::generate_input_values(manifest);
+
+        let reference_dir = self.reference_dir.as_deref();
+
+        let cv = CrossValidation::compare(
+            &test.name,
+            manifest,
+            &input_values,
+            emu_output,
+            hw_output.as_deref(),
+            reference_dir,
+        );
+
+        Some(HardwareValidation::classify(cv))
     }
 
     /// Shared implementation for run_single and run_single_with_output.
     ///
-    /// Always returns the raw output bytes when the engine ran far enough
-    /// to produce output (even if validation failed).
-    fn run_single_inner(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>) {
+    /// Returns (outcome, raw_output, trace_events). The trace_events are
+    /// collected from the engine after execution for Perfetto export.
+    fn run_single_inner(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Vec<crate::interpreter::engine::TileTracedEvent>) {
         // Check if manifest says to skip this test
         if let Some(ref manifest) = test.manifest {
             // Platform gate: test requires different hardware generation
@@ -531,12 +615,12 @@ impl XclbinSuite {
                 return (TestOutcome::Platform {
                     required: manifest.test.platform.clone(),
                     reason: manifest.test.skip_reason.clone(),
-                }, None);
+                }, None, Vec::new());
             }
             if manifest.test.skip {
                 return (TestOutcome::Skipped {
                     reason: manifest.test.skip_reason.clone(),
-                }, None);
+                }, None, Vec::new());
             }
         }
 
@@ -546,7 +630,7 @@ impl XclbinSuite {
             Err(e) => {
                 return (TestOutcome::LoadError {
                     message: format!("Failed to load xclbin: {}", e),
-                }, None);
+                }, None, Vec::new());
             }
         };
 
@@ -556,7 +640,7 @@ impl XclbinSuite {
             None => {
                 return (TestOutcome::LoadError {
                     message: "No AIE partition in xclbin".to_string(),
-                }, None);
+                }, None, Vec::new());
             }
         };
 
@@ -566,7 +650,7 @@ impl XclbinSuite {
             Err(e) => {
                 return (TestOutcome::LoadError {
                     message: format!("Failed to parse AIE partition: {}", e),
-                }, None);
+                }, None, Vec::new());
             }
         };
 
@@ -576,7 +660,7 @@ impl XclbinSuite {
             None => {
                 return (TestOutcome::LoadError {
                     message: "No primary PDI in partition".to_string(),
-                }, None);
+                }, None, Vec::new());
             }
         };
 
@@ -585,7 +669,7 @@ impl XclbinSuite {
             None => {
                 return (TestOutcome::LoadError {
                     message: "No CDO found in PDI".to_string(),
-                }, None);
+                }, None, Vec::new());
             }
         };
 
@@ -594,7 +678,7 @@ impl XclbinSuite {
             Err(e) => {
                 return (TestOutcome::LoadError {
                     message: format!("Failed to parse CDO: {}", e),
-                }, None);
+                }, None, Vec::new());
             }
         };
 
@@ -603,7 +687,7 @@ impl XclbinSuite {
         if let Err(e) = engine.device_mut().apply_cdo(&cdo) {
             return (TestOutcome::LoadError {
                 message: format!("Failed to apply CDO: {}", e),
-            }, None);
+            }, None, Vec::new());
         }
 
         // Populate host memory - use manifest data if available, else defaults.
@@ -677,14 +761,14 @@ impl XclbinSuite {
                 Err(e) => {
                     return (TestOutcome::LoadError {
                         message: format!("Failed to read ELF {:?}: {}", path, e),
-                    }, None);
+                    }, None, Vec::new());
                 }
             };
 
             if let Err(e) = engine.load_elf_bytes(*col as usize, *row as usize, &data) {
                 return (TestOutcome::LoadError {
                     message: format!("Failed to load ELF into ({},{}): {}", col, row, e),
-                }, None);
+                }, None, Vec::new());
             }
         }
 
@@ -695,11 +779,16 @@ impl XclbinSuite {
         let enabled = engine.enabled_cores();
         if enabled == 0 && elf_files.is_empty() {
             // No cores enabled and no ELFs - likely a reconfiguration test
-            return (TestOutcome::Pass { cycles: 1, correct: None, total: None }, None);
+            return (TestOutcome::Pass { cycles: 1, correct: None, total: None }, None, Vec::new());
         }
 
         // Run until halt, sync completion, error, or timeout
-        let outcome = self.run_engine(&mut engine, test, input_values, npu_executor.as_ref(), output_addr);
+        let outcome = self.run_engine(&mut engine, test, input_values, npu_executor.as_mut(), output_addr);
+
+        // Collect trace events from all cores and DMA engines.
+        // Core events live in each core's TimingContext until collected.
+        engine.collect_core_trace_events();
+        let trace_events = engine.trace_log().to_vec();
 
         // Capture raw output from host memory at the output buffer address
         let raw_output = self.capture_output(&engine, test, output_addr);
@@ -763,7 +852,7 @@ impl XclbinSuite {
             outcome
         };
 
-        (final_outcome, raw_output)
+        (final_outcome, raw_output, trace_events)
     }
 
     /// Capture raw output bytes from host memory.
@@ -992,7 +1081,7 @@ impl XclbinSuite {
         engine: &mut InterpreterEngine,
         test: &XclbinTest,
         input_values: Option<HashMap<String, Vec<i64>>>,
-        npu_executor: Option<&NpuExecutor>,
+        mut npu_executor: Option<&mut NpuExecutor>,
         output_addr: u64,
     ) -> TestOutcome {
         // TDR: No-progress detection modeled after xdna-driver aie2_tdr.c.
@@ -1038,7 +1127,7 @@ impl XclbinSuite {
             // Check if DMA syncs are satisfied (NPU instruction sequence complete).
             // This mirrors the FFI path in ffi/mod.rs and is the primary completion
             // signal for AIE2 kernels which are infinite loops.
-            if let Some(executor) = npu_executor {
+            if let Some(executor) = npu_executor.as_mut() {
                 if executor.syncs_satisfied(engine.device()) {
                     log::info!("DMA syncs satisfied after {} cycles for test {}", cycles, test.name);
                     return self.make_completion_outcome(engine, test, input_values, cycles, output_addr);
@@ -1111,7 +1200,7 @@ impl XclbinSuite {
     }
 
     /// Get all test results.
-    pub fn results(&self) -> &[(String, TestOutcome)] {
+    pub fn results(&self) -> &[(String, TestOutcome, Option<HardwareValidation>)] {
         &self.results
     }
 
@@ -1130,7 +1219,7 @@ impl XclbinSuite {
         // List failed tests
         if result.failed > 0 || result.validation_failed > 0 || result.unknown > 0 || result.timeout > 0 {
             report.push_str("--- Failed Tests ---\n");
-            for (name, outcome) in &self.results {
+            for (name, outcome, _) in &self.results {
                 match outcome {
                     TestOutcome::ValidationFail { cycles, correct, total, first_mismatch } => {
                         report.push_str(&format!("{}: VALIDATION FAIL after {} cycles ({}/{} correct)\n", name, cycles, correct, total));
@@ -1162,7 +1251,7 @@ impl XclbinSuite {
         // List expected-fail tests
         if result.expected_fail > 0 {
             report.push_str("--- Expected Failures (known-broken) ---\n");
-            for (name, outcome) in &self.results {
+            for (name, outcome, _) in &self.results {
                 if let TestOutcome::ExpectedFail { cycles, reason, actual } = outcome {
                     report.push_str(&format!("{}: EXPECTED FAIL ({} cycles)\n", name, cycles));
                     if !reason.is_empty() {
@@ -1177,7 +1266,7 @@ impl XclbinSuite {
         // List unexpected passes (known-broken tests that suddenly work)
         if result.unexpected_pass > 0 {
             report.push_str("--- Unexpected Passes (update manifests!) ---\n");
-            for (name, outcome) in &self.results {
+            for (name, outcome, _) in &self.results {
                 if let TestOutcome::UnexpectedPass { cycles, correct, total } = outcome {
                     report.push_str(&format!("{}: UNEXPECTED PASS ({} cycles, {}/{} correct) - remove expected_fail from manifest\n",
                         name, cycles, correct, total));
@@ -1189,7 +1278,7 @@ impl XclbinSuite {
         // List passed tests
         if result.passed > 0 {
             report.push_str("--- Passed Tests ---\n");
-            for (name, outcome) in &self.results {
+            for (name, outcome, _) in &self.results {
                 if let TestOutcome::Pass { cycles, correct, total } = outcome {
                     if let (Some(c), Some(t)) = (correct, total) {
                         report.push_str(&format!("{}: PASS ({} cycles, {}/{} validated)\n", name, cycles, c, t));
@@ -1204,12 +1293,35 @@ impl XclbinSuite {
         // List skipped tests
         if result.skipped > 0 {
             report.push_str("--- Skipped Tests ---\n");
-            for (name, outcome) in &self.results {
+            for (name, outcome, _) in &self.results {
                 if let TestOutcome::Skipped { reason } = outcome {
                     if reason.is_empty() {
                         report.push_str(&format!("{}: SKIPPED\n", name));
                     } else {
                         report.push_str(&format!("{}: SKIPPED - {}\n", name, reason));
+                    }
+                }
+            }
+            report.push('\n');
+        }
+
+        // Hardware cross-validation summary
+        if result.hw_validated > 0 {
+            report.push_str("--- Hardware Cross-Validation ---\n");
+            report.push_str(&format!(
+                "Validated: {}, Correct: {}, Compiler Bug: {}, Emulator Bug: {}\n",
+                result.hw_validated, result.hw_correct,
+                result.hw_compiler_bug, result.hw_emulator_bug
+            ));
+
+            // List tests with non-trivial diagnoses
+            for (name, _, hw) in &self.results {
+                if let Some(hv) = hw {
+                    match hv.diagnosis {
+                        Diagnosis::CompilerBug | Diagnosis::EmulatorBug | Diagnosis::BothBroken => {
+                            report.push_str(&format!("  {}: {}\n", name, hv.diagnosis));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1251,6 +1363,12 @@ impl XclbinSuite {
         // Allocate output region (4KB at 0x2000, after input + middle)
         let _ = host_mem.allocate_region("output", 0x2000, 4096);
     }
+
+    /// Drain accumulated trace events from all test runs.
+    /// Returns the events and clears the internal buffer.
+    pub fn collect_trace_events(&mut self) -> Vec<crate::interpreter::engine::TileTracedEvent> {
+        std::mem::take(&mut self.trace_events)
+    }
 }
 
 impl Default for XclbinSuite {
@@ -1282,6 +1400,14 @@ pub struct SuiteResult {
     pub timeout: usize,
     /// Number of tests that failed to load.
     pub load_error: usize,
+    /// Number of tests with hardware cross-validation data.
+    pub hw_validated: usize,
+    /// Tests where emulator = hardware = manifest.
+    pub hw_correct: usize,
+    /// Tests where emulator = hardware != manifest (compiler/toolchain bug).
+    pub hw_compiler_bug: usize,
+    /// Tests where hardware = manifest != emulator (emulator bug).
+    pub hw_emulator_bug: usize,
 }
 
 impl SuiteResult {
@@ -1331,6 +1457,10 @@ mod tests {
             unknown: 1,
             timeout: 1,
             load_error: 0,
+            hw_validated: 0,
+            hw_correct: 0,
+            hw_compiler_bug: 0,
+            hw_emulator_bug: 0,
         };
         assert!((result.pass_rate() - 70.0).abs() < 0.01);
     }
@@ -1348,6 +1478,10 @@ mod tests {
             unknown: 0,
             timeout: 0,
             load_error: 0,
+            hw_validated: 0,
+            hw_correct: 0,
+            hw_compiler_bug: 0,
+            hw_emulator_bug: 0,
         };
         // 7 passed out of 8 non-skipped = 87.5%
         assert!((result.pass_rate() - 87.5).abs() < 0.01);

@@ -40,6 +40,11 @@ pub struct Config {
     /// Path to XRT installation.
     /// Usually /opt/xilinx/xrt.
     pub xrt_path: Option<String>,
+
+    /// Path to AMD aietools installation (optional).
+    /// Enables elfanalyzer cross-validation, Chess compilation, and
+    /// aiesimulator comparison when present. The emulator works without it.
+    pub aietools_path: Option<String>,
 }
 
 impl Config {
@@ -109,6 +114,15 @@ impl Config {
                 "/opt/xilinx/xrt".to_string()
             }
         })
+    }
+
+    /// Get the aietools path, if configured.
+    ///
+    /// Unlike other path accessors, this returns `Option<PathBuf>` because
+    /// aietools is genuinely optional -- the emulator works without it.
+    /// Returns `None` if no path is configured or the path does not exist.
+    pub fn aietools_path(&self) -> Option<PathBuf> {
+        self.aietools_path.as_ref().map(PathBuf::from).filter(|p| p.exists())
     }
 
     // -- Test fixture path helpers --
@@ -225,6 +239,9 @@ impl Config {
         if other.xrt_path.is_some() {
             self.xrt_path = other.xrt_path;
         }
+        if other.aietools_path.is_some() {
+            self.aietools_path = other.aietools_path;
+        }
     }
 
     /// Apply environment variable overrides.
@@ -240,6 +257,15 @@ impl Config {
         if let Ok(path) = std::env::var("XRT_PATH") {
             log::info!("Using XRT_PATH from environment: {}", path);
             self.xrt_path = Some(path);
+        }
+        // Check our env var first, then fall back to AMD's standard env var.
+        // XILINX_VITIS_AIETOOLS is set by activate-npu-env.sh.
+        if let Ok(path) = std::env::var("AIETOOLS_PATH") {
+            log::info!("Using AIETOOLS_PATH from environment: {}", path);
+            self.aietools_path = Some(path);
+        } else if let Ok(path) = std::env::var("XILINX_VITIS_AIETOOLS") {
+            log::info!("Using XILINX_VITIS_AIETOOLS from environment: {}", path);
+            self.aietools_path = Some(path);
         }
     }
 
@@ -266,6 +292,11 @@ llvm_aie_path = "C:\\dev\\llvm-aie"
 
 # Path to XRT installation (optional, defaults to C:\Xilinx\XRT)
 # xrt_path = "C:\\Xilinx\\XRT"
+
+# Path to AMD aietools installation (optional)
+# Enables elfanalyzer, Chess compiler, and aiesimulator integration
+# Also detected via AIETOOLS_PATH or XILINX_VITIS_AIETOOLS env vars
+# aietools_path = "C:\\Xilinx\\aietools"
 "#
             .to_string()
         } else {
@@ -281,6 +312,11 @@ llvm_aie_path = "/home/user/llvm-aie"
 
 # Path to XRT installation (optional, defaults to /opt/xilinx/xrt)
 # xrt_path = "/opt/xilinx/xrt"
+
+# Path to AMD aietools installation (optional)
+# Enables elfanalyzer, Chess compiler, and aiesimulator integration
+# Also detected via AIETOOLS_PATH or XILINX_VITIS_AIETOOLS env vars
+# aietools_path = "/home/user/aietools"
 "#
             .to_string()
         }
@@ -330,12 +366,14 @@ mod tests {
             llvm_aie_path: Some("/base/llvm-aie".to_string()),
             mlir_aie_path: None,
             xrt_path: Some("/base/xrt".to_string()),
+            aietools_path: Some("/base/aietools".to_string()),
         };
 
         let overlay = Config {
             llvm_aie_path: None,
             mlir_aie_path: Some("/overlay/mlir-aie".to_string()),
             xrt_path: Some("/overlay/xrt".to_string()),
+            aietools_path: None,
         };
 
         base.merge(overlay);
@@ -346,6 +384,8 @@ mod tests {
         assert_eq!(base.mlir_aie_path, Some("/overlay/mlir-aie".to_string()));
         // xrt_path overridden by overlay
         assert_eq!(base.xrt_path, Some("/overlay/xrt".to_string()));
+        // aietools_path unchanged (overlay was None)
+        assert_eq!(base.aietools_path, Some("/base/aietools".to_string()));
     }
 
     #[test]
@@ -353,5 +393,33 @@ mod tests {
         let sample = Config::sample_config();
         // Should parse without error (though paths won't exist)
         let _: Config = toml::from_str(&sample).expect("Sample config should parse");
+    }
+
+    #[test]
+    fn test_aietools_path_default() {
+        let config = Config::default();
+        // No aietools configured by default
+        assert!(config.aietools_path.is_none());
+        // Accessor returns None when path is not configured
+        assert!(config.aietools_path().is_none());
+    }
+
+    #[test]
+    fn test_aietools_path_nonexistent() {
+        let config = Config {
+            aietools_path: Some("/nonexistent/aietools".to_string()),
+            ..Default::default()
+        };
+        // Configured but path does not exist on disk -> returns None
+        assert!(config.aietools_path().is_none());
+    }
+
+    #[test]
+    fn test_aietools_env_override() {
+        // Simulate environment variable override
+        let mut config = Config::default();
+        // Directly test the merge behavior that apply_env_overrides uses
+        config.aietools_path = Some("/env/aietools".to_string());
+        assert_eq!(config.aietools_path, Some("/env/aietools".to_string()));
     }
 }

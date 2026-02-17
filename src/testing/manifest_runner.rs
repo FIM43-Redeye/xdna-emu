@@ -146,6 +146,14 @@ pub struct TestInfo {
 pub struct BuildInfo {
     pub mlir_file: String,
     pub device: String,
+    /// Compiler to use: "peano" (default), "chess", or "both".
+    /// "both" runs the test with each compiler and compares results.
+    #[serde(default = "default_compiler")]
+    pub compiler: String,
+}
+
+fn default_compiler() -> String {
+    "peano".to_string()
 }
 
 /// Buffer definition (input or output).
@@ -169,6 +177,10 @@ pub struct PatternDef {
     pub step: i64,
     #[serde(default)]
     pub value: i64,
+    /// Explicit values for "values" pattern type.
+    /// Supports decimal and hex (0x...) notation via TOML integers.
+    #[serde(default)]
+    pub values: Vec<i64>,
 }
 
 fn default_step() -> i64 {
@@ -279,6 +291,11 @@ impl TestManifest {
             }
             "zeros" => {
                 data.resize(buffer.size * elem_type.byte_size(), 0);
+            }
+            "values" => {
+                for &v in &pattern.values {
+                    append_value(&mut data, v, elem_type);
+                }
             }
             _ => return None,
         }
@@ -842,5 +859,57 @@ transform = "input_a + 1"
         assert!(!manifest.test.skip);
         assert!(manifest.test.expected_fail_reason.is_empty());
         assert!(manifest.test.skip_reason.is_empty());
+    }
+
+    #[test]
+    fn test_compiler_field_default() {
+        // Verify compiler defaults to "peano" when omitted
+        let toml_content = r#"
+[test]
+name = "test"
+source_dir = "test"
+
+[build]
+mlir_file = "aie.mlir"
+device = "npu1_1col"
+
+[buffers.output]
+size = 4
+element_type = "i32"
+group_id = 5
+
+[expected]
+type = "values"
+values = [1, 2, 3, 4]
+"#;
+
+        let manifest: TestManifest = toml::from_str(toml_content).unwrap();
+        assert_eq!(manifest.build.compiler, "peano");
+    }
+
+    #[test]
+    fn test_compiler_field_explicit() {
+        let toml_content = r#"
+[test]
+name = "chess_test"
+source_dir = "test"
+
+[build]
+mlir_file = "aie.mlir"
+device = "npu1_1col"
+compiler = "both"
+
+[buffers.output]
+size = 4
+element_type = "i32"
+group_id = 5
+
+[expected]
+type = "values"
+values = [1, 2, 3, 4]
+"#;
+
+        let manifest: TestManifest = toml::from_str(toml_content).unwrap();
+        assert_eq!(manifest.build.compiler, "both");
     }
 }
