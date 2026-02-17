@@ -139,8 +139,14 @@ pub enum RegisterKind {
     Scalar,
     /// eP: pointer registers (p0-p7)
     Pointer,
-    /// eM, eDN, eDJ, eDC: modifier/data registers
-    Modifier,
+    /// eM: post-modify registers (m0-m7)
+    ModifierM,
+    /// eDN: dimension size registers (dn0-dn7)
+    ModifierDN,
+    /// eDJ: dimension stride/jump registers (dj0-dj7)
+    ModifierDJ,
+    /// eDC: dimension count registers (dc0-dc7)
+    ModifierDC,
     /// eW*, mWm: 256-bit vector registers
     Vector256,
     /// mXm, eX*: 512-bit vector registers
@@ -221,7 +227,10 @@ pub fn classify_operand_type(reg_class: &str, field_name: &str) -> OperandType {
     match reg_class {
         "eR" => return OperandType::Register(RegisterKind::Scalar),
         "eP" => return OperandType::Register(RegisterKind::Pointer),
-        "eM" | "eDN" | "eDJ" | "eDC" => return OperandType::Register(RegisterKind::Modifier),
+        "eM" => return OperandType::Register(RegisterKind::ModifierM),
+        "eDN" => return OperandType::Register(RegisterKind::ModifierDN),
+        "eDJ" => return OperandType::Register(RegisterKind::ModifierDJ),
+        "eDC" => return OperandType::Register(RegisterKind::ModifierDC),
         _ => {}
     }
     if reg_class.starts_with("eW") || reg_class == "mWm" {
@@ -503,6 +512,10 @@ pub struct InstrEncoding {
     /// When true, address generator fields produce a destination pointer + source
     /// operand instead of a Memory operand.
     pub is_ptr_arithmetic: bool,
+
+    /// Itinerary class from TableGen (e.g., "II_ADD", "II_LDA", "II_VMUL").
+    /// Used for cross-validating latency values against the compiler's scheduling model.
+    pub sched_class: Option<String>,
 }
 
 impl InstrEncoding {
@@ -741,6 +754,7 @@ impl<'a> Resolver<'a> {
             is_vector,
             select_variant,
             is_ptr_arithmetic,
+            sched_class: None, // Regex parser doesn't extract itinerary class
         })
     }
 
@@ -999,6 +1013,7 @@ fn add_lng_control_flow_encodings(by_slot: &mut HashMap<String, Vec<InstrEncodin
         is_vector: false,
         select_variant: None,
         is_ptr_arithmetic: false,
+        sched_class: Some("II_JL".into()),
     };
 
     // J: opcode = 0b010
@@ -1024,6 +1039,7 @@ fn add_lng_control_flow_encodings(by_slot: &mut HashMap<String, Vec<InstrEncodin
         is_vector: false,
         select_variant: None,
         is_ptr_arithmetic: false,
+        sched_class: Some("II_J".into()),
     };
 
     by_slot.entry("lng".into()).or_default().push(jl_encoding);
@@ -1509,6 +1525,46 @@ pub fn infer_semantic_from_mnemonic(mnemonic: &str) -> Option<SemanticOp> {
     }
     if lower.starts_with("vmov") {
         return Some(SemanticOp::Copy);
+    }
+
+    // Vector comparison operations
+    if lower.starts_with("vlt") && !lower.starts_with("vltu") {
+        return Some(SemanticOp::SetLt);
+    }
+    if lower.starts_with("vltu") {
+        return Some(SemanticOp::SetUlt);
+    }
+    if lower.starts_with("vle") && !lower.starts_with("vleu") {
+        return Some(SemanticOp::SetLe);
+    }
+    if lower.starts_with("vleu") {
+        return Some(SemanticOp::SetUle);
+    }
+    if lower.starts_with("vgt") && !lower.starts_with("vgtu") {
+        return Some(SemanticOp::SetGt);
+    }
+    if lower.starts_with("vgtu") {
+        return Some(SemanticOp::SetUgt);
+    }
+    if lower.starts_with("vge") && !lower.starts_with("vgeu") {
+        return Some(SemanticOp::SetGe);
+    }
+    if lower.starts_with("vgeu") {
+        return Some(SemanticOp::SetUge);
+    }
+    if lower.starts_with("veq") {
+        return Some(SemanticOp::SetEq);
+    }
+    if lower.starts_with("vne") {
+        return Some(SemanticOp::SetNe);
+    }
+
+    // Vector abs/neg
+    if lower.starts_with("vabs") {
+        return Some(SemanticOp::Abs);
+    }
+    if lower.starts_with("vneg") {
+        return Some(SemanticOp::Neg);
     }
 
     None
@@ -2257,19 +2313,19 @@ mod tests {
         );
         assert_eq!(
             classify_operand_type("eM", "mod"),
-            OperandType::Register(RegisterKind::Modifier)
+            OperandType::Register(RegisterKind::ModifierM)
         );
         assert_eq!(
             classify_operand_type("eDN", "dn"),
-            OperandType::Register(RegisterKind::Modifier)
+            OperandType::Register(RegisterKind::ModifierDN)
         );
         assert_eq!(
             classify_operand_type("eDJ", "dj"),
-            OperandType::Register(RegisterKind::Modifier)
+            OperandType::Register(RegisterKind::ModifierDJ)
         );
         assert_eq!(
             classify_operand_type("eDC", "dc"),
-            OperandType::Register(RegisterKind::Modifier)
+            OperandType::Register(RegisterKind::ModifierDC)
         );
     }
 

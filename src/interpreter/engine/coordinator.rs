@@ -18,8 +18,8 @@ use crate::parser::{AieElf, MemoryRegion};
 use crate::interpreter::bundle::VliwBundle;
 use crate::interpreter::core::{CoreInterpreter, CoreStatus, StepResult};
 use crate::interpreter::decode::InstructionDecoder;
-use crate::interpreter::execute::CycleAccurateExecutor;
-use crate::interpreter::state::ExecutionContext;
+use crate::interpreter::execute::{CycleAccurateExecutor, NeighborMemory};
+use crate::interpreter::state::{EventType, ExecutionContext};
 
 /// Engine execution status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +102,26 @@ pub struct InterpreterEngine {
     /// Last cycle's total DMA bytes transferred (to detect DMA-level progress
     /// even when no stream words are routed -- e.g., during lock operations).
     last_dma_bytes: u64,
+    /// Global trace log collecting events from all tiles.
+    /// DMA events are drained from engines each cycle; instruction events
+    /// come from per-core TimingContexts. Events include (col, row) source
+    /// info embedded in the TileTracedEvent wrapper.
+    trace_log: Vec<TileTracedEvent>,
+}
+
+/// A trace event tagged with its source tile coordinates.
+/// This wraps TimestampedEvent to add spatial information needed for
+/// Perfetto export (each tile maps to a separate Perfetto process).
+#[derive(Debug, Clone, Copy)]
+pub struct TileTracedEvent {
+    /// Source tile column.
+    pub col: u8,
+    /// Source tile row.
+    pub row: u8,
+    /// Cycle when the event occurred.
+    pub cycle: u64,
+    /// The event type.
+    pub event: EventType,
 }
 
 impl InterpreterEngine {
@@ -135,6 +155,7 @@ impl InterpreterEngine {
             no_progress_cycles: 0,
             last_words_routed: 0,
             last_dma_bytes: 0,
+            trace_log: Vec::new(),
         }
     }
 
@@ -193,6 +214,34 @@ impl InterpreterEngine {
     /// Get total instructions executed across all cores.
     pub fn total_instructions(&self) -> u64 {
         self.total_instructions
+    }
+
+    /// Get the global trace log (DMA and core events from all tiles).
+    pub fn trace_log(&self) -> &[TileTracedEvent] {
+        &self.trace_log
+    }
+
+    /// Drain all per-core instruction trace events into the global trace log.
+    /// Call this after execution completes (before export) to collect
+    /// instruction-level events from each core's TimingContext.
+    pub fn collect_core_trace_events(&mut self) {
+        for col in 0..self.cols {
+            for row in self.compute_row_start..self.rows {
+                let idx = col * self.rows + row;
+                if !self.cores[idx].enabled {
+                    continue;
+                }
+                let events = self.cores[idx].context.timing_context().events.events();
+                for evt in events {
+                    self.trace_log.push(TileTracedEvent {
+                        col: col as u8,
+                        row: row as u8,
+                        cycle: evt.cycle,
+                        event: evt.event,
+                    });
+                }
+            }
+        }
     }
 
     /// Get reference to device state.
@@ -355,8 +404,19 @@ impl InterpreterEngine {
         // Phase 2: Step all DMA engines and stream routing FIRST
         // This ensures lock releases from DMA are visible when cores
         // snapshot MemTile locks for memory module access.
+        //
+        // Set cycle timestamp on DMA engines before stepping so trace
+        // events get the correct cycle number.
+        self.device.array.set_dma_cycle(self.total_cycles);
+
         let (dma_active, streams_moved, words_routed) =
             self.device.array.step_data_movement(&mut self.host_memory);
+
+        // Drain DMA trace events into the global trace log
+        for (col, row, cycle, event) in self.device.array.drain_dma_trace_events() {
+            self.trace_log.push(TileTracedEvent { col, row, cycle, event });
+        }
+
         if dma_active || streams_moved {
             any_running = true;
         }
@@ -382,14 +442,30 @@ impl InterpreterEngine {
                 // Memory module locks (48-63) should access the MemTile (row 1) locks.
                 // Copy MemTile locks before stepping, then copy changes back after.
                 let mem_tile_row = 1; // MemTile is always row 1
-                let mut mem_tile_locks_copy: Option<[crate::device::tile::Lock; 64]> = None;
+                let mut mem_tile_locks_copy: Option<Vec<crate::device::tile::Lock>> = None;
 
                 // Copy memory tile locks if we're in a compute row
                 if row > mem_tile_row {
                     if let Some(mem_tile) = self.device.tile(col, mem_tile_row) {
-                        mem_tile_locks_copy = Some(mem_tile.locks);
+                        mem_tile_locks_copy = Some(mem_tile.locks.clone());
                     }
                 }
+
+                // Build cross-tile neighbor memory context.
+                // Snapshots are loaded eagerly before the mutable tile borrow
+                // because the memory functions can't access DeviceState during
+                // execution. Only existing neighbors are cloned (edge tiles
+                // have fewer). This costs up to 192KB per core per cycle.
+                //
+                // Optimization paths if profiling shows this matters:
+                // 1. Pre-allocate per-core snapshot buffers and reuse across cycles
+                // 2. Use shared immutable &[u8] instead of clones (requires proving
+                //    no cross-tile writes within the same cycle)
+                // 3. Track which cores use cross-tile addressing and skip others
+                let mut neighbors = NeighborMemory::new(col, row);
+                neighbors.ensure_snapshot(1, &self.device); // West
+                neighbors.ensure_snapshot(2, &self.device); // North
+                neighbors.ensure_snapshot(3, &self.device); // East
 
                 // Get tile for this core
                 if let Some(tile) = self.device.tile_mut(col, row) {
@@ -399,11 +475,19 @@ impl InterpreterEngine {
 
                     let core = &mut self.cores[idx];
 
-                    // Step with memory tile locks for proper routing of lock IDs 48-63
+                    // Step with memory tile locks and neighbor memory
                     let result = if let Some(ref mut mem_locks) = mem_tile_locks_copy {
-                        core.interpreter.step_with_mem_locks(&mut core.context, tile, Some(mem_locks))
+                        core.interpreter.step_with_mem_locks(
+                            &mut core.context, tile,
+                            Some(mem_locks.as_mut_slice()),
+                            Some(&mut neighbors),
+                        )
                     } else {
-                        core.interpreter.step(&mut core.context, tile)
+                        core.interpreter.step_with_mem_locks(
+                            &mut core.context, tile,
+                            None,
+                            Some(&mut neighbors),
+                        )
                     };
 
                     match result {
@@ -419,9 +503,6 @@ impl InterpreterEngine {
                         }
                         StepResult::Halt => {
                             // This core halted - don't set all_halted=false
-                            if trace_count < 5 {
-                                log::info!("COORD_STEP[{}] core({},{}) halted", trace_count, col, row);
-                            }
                         }
                         StepResult::DecodeError(ref e) => {
                             log::error!("COORD_STEP[{}] core({},{}) DecodeError: {:?}", trace_count, col, row, e);
@@ -436,10 +517,15 @@ impl InterpreterEngine {
                     }
                 }
 
+                // Apply buffered cross-tile writes to neighbor tiles
+                if neighbors.has_pending_writes() {
+                    neighbors.apply_writes(&mut self.device);
+                }
+
                 // Copy modified memory tile locks back to the MemTile
                 if let Some(mem_locks) = mem_tile_locks_copy {
                     if let Some(mem_tile) = self.device.tile_mut(col, mem_tile_row) {
-                        mem_tile.locks = mem_locks;
+                        mem_tile.locks.copy_from_slice(&mem_locks);
                     }
                 }
             }

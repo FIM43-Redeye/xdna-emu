@@ -175,6 +175,7 @@ pub fn find_aie_tblgen(llvm_aie_path: impl AsRef<Path>) -> Option<std::path::Pat
     // Check if PATH version has AIE support (unlikely but worth trying)
     if let Ok(output) = std::process::Command::new("llvm-tblgen")
         .arg("--version")
+        .env_remove("LD_LIBRARY_PATH")
         .output()
     {
         let version = String::from_utf8_lossy(&output.stdout);
@@ -242,7 +243,9 @@ pub fn load_full_via_tblgen(llvm_aie_path: impl AsRef<Path>) -> Result<types::Tb
 
     log::info!("Running llvm-tblgen from: {}", tblgen_path.display());
 
-    // Run llvm-tblgen to get resolved records
+    // Run llvm-tblgen to get resolved records.
+    // Remove LD_LIBRARY_PATH to prevent aietools from injecting an older
+    // libstdc++ that lacks GLIBCXX symbols llvm-tblgen needs.
     let output = Command::new(&tblgen_path)
         .arg("--print-records")
         .arg("AIE2.td")
@@ -250,6 +253,7 @@ pub fn load_full_via_tblgen(llvm_aie_path: impl AsRef<Path>) -> Result<types::Tb
         .arg("-I../../..")
         .arg("-I../../../include")
         .current_dir(&base)
+        .env_remove("LD_LIBRARY_PATH")
         .output()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other,
             format!("Failed to run llvm-tblgen at {}: {}", tblgen_path.display(), e)))?;

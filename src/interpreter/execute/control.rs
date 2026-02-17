@@ -83,7 +83,7 @@ impl ControlUnit {
         op: &SlotOp,
         ctx: &mut ExecutionContext,
         tile: &mut Tile,
-        mem_tile_locks: Option<&mut [Lock; 64]>,
+        mem_tile_locks: Option<&mut [Lock]>,
     ) -> Option<ExecuteResult> {
         match &op.op {
             Operation::Branch { condition } => {
@@ -152,7 +152,7 @@ impl ControlUnit {
 
                 // Always use local tile locks - memory module locks are LOCAL to the tile
                 // The mem_tile_locks parameter is not used for core lock instructions.
-                let locks: &mut [Lock; 64] = &mut tile.locks;
+                let locks: &mut [Lock] = &mut tile.locks;
                 let _ = mem_tile_locks; // silence unused warning
 
                 let current_value = locks[lock_id as usize].value;
@@ -160,6 +160,10 @@ impl ControlUnit {
 
                 match lock.acquire_with_value(expected, delta) {
                     LockResult::Success => {
+                        log::trace!(
+                            "[WATCH-ACQ] pc=0x{:03X} cycle={} lock={} value={}->{} SUCCESS",
+                            ctx.pc(), ctx.cycles, raw_lock_id, current_value, lock.value
+                        );
                         log::debug!("LockAcquire raw={} mapped={} expected={} delta={} current={} -> {} SUCCESS (mem_module={})",
                             raw_lock_id, lock_id, expected, delta, current_value, lock.value, is_mem_module);
                         Some(ExecuteResult::Continue)
@@ -189,7 +193,7 @@ impl ControlUnit {
                 let tile_ptr = tile as *const _ as usize;
 
                 // Always use local tile locks - memory module locks are LOCAL to the tile
-                let locks: &mut [Lock; 64] = &mut tile.locks;
+                let locks: &mut [Lock] = &mut tile.locks;
                 let _ = mem_tile_locks; // silence unused warning
 
                 let lock_ptr = &locks[lock_id as usize] as *const _ as usize;

@@ -29,7 +29,7 @@ use crate::interpreter::bundle::{
     BranchCondition, ElementType, MemWidth, Operand, Operation, PostModify, SelectVariant,
     SlotIndex, SlotOp, VliwBundle,
 };
-use crate::interpreter::state::{MOD_BASE_DJ, MOD_BASE_M};
+use crate::interpreter::state::{MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN, MOD_BASE_M};
 use crate::interpreter::traits::{DecodeError, Decoder};
 use super::composite::CompositeLuts;
 use crate::tablegen::{
@@ -556,7 +556,13 @@ impl InstructionDecoder {
                     match kind {
                         RegisterKind::Scalar => Operand::ScalarReg(reg),
                         RegisterKind::Pointer => Operand::PointerReg(reg),
-                        RegisterKind::Modifier => Operand::ModifierReg(reg),
+                        // Each modifier sub-class maps to a different base index
+                        // in the unified modifier register file (32 entries total):
+                        //   m0-m7 at 0-7, dn0-dn7 at 8-15, dj0-dj7 at 16-23, dc0-dc7 at 24-31
+                        RegisterKind::ModifierM  => Operand::ModifierReg(reg + MOD_BASE_M),
+                        RegisterKind::ModifierDN => Operand::ModifierReg(reg + MOD_BASE_DN),
+                        RegisterKind::ModifierDJ => Operand::ModifierReg(reg + MOD_BASE_DJ),
+                        RegisterKind::ModifierDC => Operand::ModifierReg(reg + MOD_BASE_DC),
                         RegisterKind::Vector256 | RegisterKind::Vector512 =>
                             Operand::VectorReg(reg),
                         RegisterKind::Accumulator => Operand::AccumReg(reg),
@@ -590,8 +596,14 @@ impl InstructionDecoder {
         // "imm" (Immediate, already scaled) fields. Combining them here into
         // a single Memory { base, offset } operand means the execution side
         // doesn't need to know about the scale factor or field layout.
+        //
+        // IMPORTANT: Only handle IndexedImmediate here. IndexedRegister uses
+        // a modifier register (dj) as the offset, which is decoded from the
+        // AG field in decode_ag_field(). If we match IndexedRegister here and
+        // find "ptr"+"imm" fields, we'd create a Memory { base, offset: 0 }
+        // operand that ignores the dj register, producing wrong addresses.
         let addr_mode = decoded.encoding.addressing_mode;
-        if matches!(addr_mode, AddressingMode::IndexedImmediate | AddressingMode::IndexedRegister) {
+        if matches!(addr_mode, AddressingMode::IndexedImmediate) {
             if let (Some(Operand::PointerReg(base)), Some(imm_op)) =
                 (field_operands.get("ptr").cloned(), field_operands.get("imm").cloned())
             {
@@ -1139,6 +1151,7 @@ mod tests {
             is_vector: false,
             select_variant: None,
             is_ptr_arithmetic: false,
+            sched_class: None,
         }
     }
 
@@ -1227,6 +1240,7 @@ mod tests {
             is_vector: false,
             select_variant: None,
             is_ptr_arithmetic: false,
+            sched_class: None,
         };
 
         let more_specific = make_add_encoding(); // 5 fixed bits
@@ -1701,6 +1715,7 @@ mod tests {
                 is_vector,
                 select_variant: None,
                 is_ptr_arithmetic: false,
+                sched_class: None,
             }
         };
 
@@ -1783,6 +1798,7 @@ mod tests {
             is_vector: false,
             select_variant: None,
             is_ptr_arithmetic: true,
+            sched_class: None,
         };
 
         // Encode: ptr=3 at bits 12:10, imm=5 at bits 9:7

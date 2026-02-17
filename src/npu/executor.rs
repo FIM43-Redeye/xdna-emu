@@ -21,16 +21,24 @@ pub struct HostBuffer {
 /// A pending sync condition.
 ///
 /// Represents a DMA channel that must complete before the run is done.
+/// Tracks whether the channel has ever been observed running, to avoid
+/// declaring a sync satisfied before the transfer starts (initial idle
+/// matches the completed-idle state on real hardware, but the host only
+/// polls *after* submitting the task).
 #[derive(Debug, Clone)]
 pub struct PendingSync {
     /// Tile column.
     pub column: u8,
     /// Tile row.
     pub row: u8,
-    /// DMA channel.
+    /// DMA channel (relative within direction: 0 or 1).
     pub channel: u8,
     /// Direction: 0 = S2MM (receive), 1 = MM2S (send).
     pub direction: u8,
+    /// Whether the channel has been observed in a running state.
+    /// A sync is only satisfied after the channel has been running AND
+    /// returned to idle -- never on the initial idle.
+    started: bool,
 }
 
 /// NPU instruction executor.
@@ -63,42 +71,49 @@ impl NpuExecutor {
 
     /// Check if all sync conditions are satisfied.
     ///
-    /// A sync is satisfied when the specified DMA channel has completed
-    /// (gone back to idle or completed its transfer).
-    pub fn syncs_satisfied(&self, device: &DeviceState) -> bool {
-        use crate::device::dma::ChannelState;
-
-        // Debug: trace sync checks (first 5 times)
-        static SYNC_CHECK_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let check_count = SYNC_CHECK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    /// Polls the DMA status register's `Channel_Running` bit (bit 19),
+    /// matching the hardware polling loop in `_XAieMl_DmaWaitForDone()`.
+    /// A sync is only satisfied when the channel has been observed running
+    /// at least once AND has since returned to not-running. This avoids
+    /// the false-positive where initial idle is mistaken for completion.
+    pub fn syncs_satisfied(&mut self, device: &DeviceState) -> bool {
+        let reg_layout = crate::device::regdb::device_reg_layout();
 
         if self.pending_syncs.is_empty() {
-            if check_count < 5 {
-                log::info!("syncs_satisfied[{}]: no pending syncs - returning true", check_count);
-            }
             return true;
         }
 
-        for sync in &self.pending_syncs {
+        for sync in &mut self.pending_syncs {
+            // Map (channel, direction) to absolute channel index, matching
+            // the encoding in check_dma_trigger: S2MM ch0=0, ch1=1;
+            // MM2S ch0=2, ch1=3.
+            let abs_channel = if sync.direction == 1 {
+                2 + sync.channel
+            } else {
+                sync.channel
+            };
+
             if let Some(dma) = device.array.dma_engine(sync.column, sync.row) {
-                let state = dma.channel_state(sync.channel);
-                if check_count < 5 {
-                    log::info!("syncs_satisfied[{}]: tile({},{}) ch{} state={:?}",
-                        check_count, sync.column, sync.row, sync.channel, state);
-                }
-                // Sync is satisfied when channel is Idle (transfer complete)
-                if !matches!(state, ChannelState::Idle) {
+                let status = dma.get_channel_status(abs_channel);
+                let status_layout = if dma.tile_type.is_mem_tile() {
+                    &reg_layout.memtile_status
+                } else {
+                    &reg_layout.memory_status
+                };
+                let channel_running = status_layout.channel_running.extract_bool(status);
+
+                if channel_running {
+                    // Channel is active -- mark as started and keep waiting.
+                    sync.started = true;
                     return false;
                 }
-            } else {
-                if check_count < 5 {
-                    log::warn!("syncs_satisfied[{}]: no DMA engine for tile({},{})",
-                        check_count, sync.column, sync.row);
+
+                // Channel is not running. Only count as "done" if it was
+                // previously observed running.
+                if !sync.started {
+                    return false;
                 }
             }
-        }
-        if check_count < 5 {
-            log::info!("syncs_satisfied[{}]: all syncs satisfied - returning true", check_count);
         }
         true
     }
@@ -168,6 +183,7 @@ impl NpuExecutor {
                     row: *row,
                     channel: *channel,
                     direction: *direction,
+                    started: false,
                 });
                 Ok(())
             }
@@ -268,56 +284,32 @@ impl NpuExecutor {
         self.sync_bd_values_to_dma_engine(col, bd_index as u8, values, device);
     }
 
-    /// Sync BD values to DMA engine (internal helper).
+    /// Sync BD values to DMA engine using the data-driven register database parser.
+    ///
+    /// This uses `BufferDescriptor::from_registers()` to parse ALL BD fields
+    /// (multi-dimensional addressing, BD chaining, locks, packet mode, iteration,
+    /// AXI parameters) from the register words, then converts to the runtime
+    /// BdConfig. This replaces the old manual extraction that only handled
+    /// length, address, and D0.
     fn sync_bd_values_to_dma_engine(&self, col: u8, bd_index: u8, values: &[u32], device: &mut DeviceState) {
-        use crate::device::dma::BdConfig;
+        use crate::device::dma::bd::BufferDescriptor;
+        use crate::device::tile::TileType;
 
-        // Parse BD fields from the values
-        // Dump raw values for debugging
-        log::debug!("BD {} raw values: {:08X?}", bd_index, values);
+        log::debug!("Shim BD {} raw values: {:08X?}", bd_index, values);
 
-        // BD format (from AM020/AM025 - shim DMA BD layout):
-        // Shim DMA BD format (32 bytes, 8 words):
-        // Word 0: Buffer length in 32-bit words - bits[17:0] for shim (18-bit field)
-        // Word 1: Buffer address low (32 bits)
-        // Word 2: Buffer address high[15:0] + packet info
-        // Word 3: D0 config (size, stride)
-        // Word 4: D1 config
-        // Word 5: D2 config
-        // Word 6: Iteration config
-        // Word 7: Control/next BD
-
-        let length_word = values[0];
-        // Shim DMA BD buffer length is 18 bits (supports up to 1MB transfers).
-        // Compute tile BDs use 14 bits, but shim tiles connect to DDR and need
-        // wider lengths. The value is in 32-bit words, not bytes.
-        let length_words = length_word & 0x3FFFF;  // Bottom 18 bits = word count
-        let length = length_words * 4;  // Convert to bytes
-
-        let addr_low = values[1];
-        let addr_high = values[2] & 0xFFFF;  // Bits 15:0 are address high
-
-        // Combine low and high address parts
-        let base_addr = ((addr_high as u64) << 32) | (addr_low as u64);
-
-        // D0 dimension: word 3
-        // Bits 17:0 = size in 32-bit words (same 18-bit width for shim)
-        let d0_word = values.get(3).copied().unwrap_or(0);
-        let d0_size_words = d0_word & 0x3FFFF;
-        let d0_size_bytes = d0_size_words * 4;
-
-        // Use D0 size if buffer length is 0
-        let actual_length = if length > 0 { length } else { d0_size_bytes };
-
-        // Create a simple 1D linear transfer
-        // BdConfig::simple_1d properly sets d0.size=length, d0.stride=1 for sequential access
-        let config = BdConfig::simple_1d(base_addr, actual_length);
+        let bd = BufferDescriptor::from_registers(values, TileType::Shim);
+        let config = bd.to_bd_config();
 
         if let Some(dma) = device.array.dma_engine_mut(col, 0) {
-            if let Err(e) = dma.configure_bd(bd_index as u8, config) {
-                log::warn!("Failed to configure BD {}: {:?}", bd_index, e);
+            if let Err(e) = dma.configure_bd(bd_index, config.clone()) {
+                log::warn!("Failed to configure shim BD {}: {:?}", bd_index, e);
             } else {
-                log::debug!("Configured BD {} with addr=0x{:X} length={}", bd_index, base_addr, length);
+                log::debug!("Configured shim BD {} addr=0x{:X} len={} d0=[{},{}] d1=[{},{}] next={:?} acq={:?} rel={:?}",
+                    bd_index, config.base_addr, config.length,
+                    config.d0.size, config.d0.stride, config.d1.size, config.d1.stride,
+                    config.next_bd,
+                    config.acquire_lock.map(|id| (id, config.acquire_value)),
+                    config.release_lock.map(|id| (id, config.release_value)));
             }
         }
     }
@@ -375,8 +367,21 @@ impl NpuExecutor {
 
         if let Some(tile) = device.tile_mut(col as usize, row as usize) {
             tile.write_register(offset, patched_addr as u32);
-            // Some BDs need the high bits too at offset+4
-            tile.write_register(offset + 4, (patched_addr >> 32) as u32);
+
+            // Write high 32 bits of the patched address to the next word.
+            // For shim DMA BDs, the next word (word 2) shares its 32 bits between
+            // Base_Address_High[15:0] and other fields (Enable_Packet, Packet_ID,
+            // Packet_Type, OoO_BD_ID). A blind write would clobber those fields.
+            // Use read-modify-write to preserve the non-address bits.
+            let high_bits = (patched_addr >> 32) as u32;
+            if row == 0 && offset >= 0x1D000 && offset < 0x1D200 {
+                // Shim BD: Base_Address_High occupies bits 15:0 of word 2
+                let current = tile.read_register(offset + 4);
+                let merged = (current & 0xFFFF_0000) | (high_bits & 0x0000_FFFF);
+                tile.write_register(offset + 4, merged);
+            } else {
+                tile.write_register(offset + 4, high_bits);
+            }
         }
 
         // Re-sync the BD to DMA engine if patching BD address field
@@ -439,28 +444,27 @@ impl NpuExecutor {
             _ => return, // Not a queue register
         };
 
-        // BD index is in bits 0-3 of the value
+        // Start_Queue register format (same as compute/memtile):
+        // - Bits 3:0: BD_ID (buffer descriptor index)
+        // - Bits 23:16: Repeat_Count (run BD this many additional times)
         let bd_index = (value & 0xF) as u8;
+        let repeat_count = ((value >> 16) & 0xFF) as u8;
 
         log::info!(
-            "NPU DMA start: col={} {} ch={} bd={}",
-            col, if is_mm2s { "MM2S" } else { "S2MM" }, channel, bd_index
+            "NPU DMA start: col={} {} ch={} bd={} repeat={}",
+            col, if is_mm2s { "MM2S" } else { "S2MM" }, channel, bd_index, repeat_count
         );
 
-        // Actually start the DMA channel with this BD
+        // Enqueue to the channel's task queue (matches CDO path behavior).
         if let Some(dma) = device.array.dma_engine_mut(col, 0) {
             // Convert to absolute channel index
-            // S2MM channels are 0-1, MM2S channels are 2-3 for compute tiles
-            // For shim tiles, S2MM = 0-5, MM2S = 6-11 but we only use 0-1 of each
+            // For shim tiles, S2MM = 0-1, MM2S = 2-3
             let abs_channel = if is_mm2s { 2 + channel } else { channel };
 
-            match dma.start_channel(abs_channel, bd_index) {
-                Ok(()) => {
-                    log::info!("  DMA channel {} started with BD {}", abs_channel, bd_index);
-                }
-                Err(e) => {
-                    log::warn!("  Failed to start DMA channel: {:?}", e);
-                }
+            if !dma.enqueue_task(abs_channel, bd_index, repeat_count, false) {
+                log::warn!("  DMA channel {} task queue overflow", abs_channel);
+            } else {
+                log::info!("  DMA channel {} enqueued BD {} repeat={}", abs_channel, bd_index, repeat_count);
             }
         }
     }
@@ -542,5 +546,101 @@ mod tests {
     fn test_executor_new() {
         let executor = NpuExecutor::new();
         assert_eq!(executor.executed_count(), 0);
+    }
+
+    /// Verify that sync completion requires the channel to have been running
+    /// before it returns to idle, preventing false-positive on initial idle.
+    #[test]
+    fn test_sync_requires_channel_started() {
+        use crate::device::dma::BdConfig;
+        use crate::device::host_memory::HostMemory;
+        use crate::device::DeviceState;
+        let reg_layout = crate::device::regdb::device_reg_layout();
+
+        let mut device = DeviceState::new_npu1();
+        let mut host_mem = HostMemory::new();
+        let mut executor = NpuExecutor::new();
+
+        // Use a compute tile (row 2) which has proper DMA channels (4 ch, 16 BDs).
+        // Shim tiles (row 0) currently have 0 channels in the ArchConfig.
+        let test_col: u8 = 0;
+        let test_row: u8 = 2;
+
+        // Add a sync on compute tile col 0, row 2, MM2S channel 0.
+        // direction=1 (MM2S) -> absolute channel = 2.
+        executor.pending_syncs.push(PendingSync {
+            column: test_col,
+            row: test_row,
+            channel: 0,
+            direction: 1, // MM2S
+            started: false,
+        });
+
+        // Before any DMA activity, the channel is idle but the sync should
+        // NOT be satisfied (channel was never running).
+        assert!(
+            !executor.syncs_satisfied(&device),
+            "sync must not be satisfied on initial idle"
+        );
+
+        // Verify Channel_Running bit is 0 initially.
+        let abs_ch = 2u8; // MM2S ch0 = abs channel 2
+        let dma = device.array.dma_engine(test_col, test_row).unwrap();
+        let status = dma.get_channel_status(abs_ch);
+        assert!(
+            !reg_layout.memory_status.channel_running.extract_bool(status),
+            "Channel_Running should be 0 initially"
+        );
+
+        // Write source data into tile data memory so the MM2S transfer has
+        // something to read (address 0x100, 64 bytes).
+        let tile = device.tile_mut(test_col as usize, test_row as usize).unwrap();
+        for i in 0..64usize {
+            tile.data_memory_mut()[0x100 + i] = i as u8;
+        }
+
+        // Configure BD 0 for a 64-byte MM2S transfer from local address 0x100.
+        let bd = BdConfig::simple_1d(0x100, 64);
+        let dma = device.array.dma_engine_mut(test_col, test_row).unwrap();
+        dma.configure_bd(0, bd).unwrap();
+        dma.start_channel(abs_ch, 0).unwrap();
+
+        // Channel should now be running.
+        let status = device.array.dma_engine(test_col, test_row).unwrap()
+            .get_channel_status(abs_ch);
+        assert!(
+            reg_layout.memory_status.channel_running.extract_bool(status),
+            "Channel_Running should be 1 after start"
+        );
+
+        // Sync still not satisfied (channel is running).
+        assert!(
+            !executor.syncs_satisfied(&device),
+            "sync must not be satisfied while channel is running"
+        );
+
+        // Step DMA until the channel completes.
+        for _ in 0..10_000 {
+            device.array.step_dma(test_col, test_row, &mut host_mem);
+            let status = device.array.dma_engine(test_col, test_row).unwrap()
+                .get_channel_status(abs_ch);
+            if !reg_layout.memory_status.channel_running.extract_bool(status) {
+                break;
+            }
+        }
+
+        // Channel should be done.
+        let status = device.array.dma_engine(test_col, test_row).unwrap()
+            .get_channel_status(abs_ch);
+        assert!(
+            !reg_layout.memory_status.channel_running.extract_bool(status),
+            "Channel_Running should be 0 after completion"
+        );
+
+        // NOW the sync should be satisfied (was running, now idle).
+        assert!(
+            executor.syncs_satisfied(&device),
+            "sync should be satisfied after channel ran and completed"
+        );
     }
 }

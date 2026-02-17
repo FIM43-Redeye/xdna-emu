@@ -57,10 +57,168 @@ use crate::interpreter::timing::LATENCY_MEMORY;
 /// Address mask for local tile memory (64KB).
 /// Addresses from the AGU span 0x0000-0x3FFFF (256KB across 4 neighbors),
 /// but local memory access only uses the lower 16 bits.
-///
-/// Note: Multi-tile memory access (addresses 0x10000-0x3FFFF) would need
-/// routing to neighbor tiles - not yet implemented.
 const LOCAL_MEMORY_MASK: u32 = 0xFFFF;
+
+/// Maximum valid data memory address for the 18-bit quadrant address space.
+/// Addresses above this come from the linker's system address map (e.g.,
+/// 0x70000 for a compute tile) and should be masked to a 16-bit local offset.
+const DATA_MEMORY_ADDRESS_LIMIT: u32 = 0x3FFFF;
+
+/// Extract the quadrant (0-3) and local offset from a data memory address.
+///
+/// AIE2 cores use an 18-bit address space for data memory:
+///   - bits 17:16 select the quadrant (0=local, 1=West, 2=North, 3=East)
+///   - bits 15:0  are the 64KB offset within the quadrant
+///
+/// However, addresses loaded from the ELF/linker may include the tile's
+/// system base address (e.g., 0x70000 for tile at col 0, row 2). These
+/// addresses exceed the 18-bit window and must be masked to a 16-bit local
+/// offset (quadrant 0).
+#[inline]
+fn decode_data_address(addr: u32) -> (u32, usize) {
+    if addr > DATA_MEMORY_ADDRESS_LIMIT {
+        // Linker/system address -- strip to local 16-bit offset
+        (0, (addr & LOCAL_MEMORY_MASK) as usize)
+    } else {
+        // Valid 18-bit data memory address -- use quadrant routing
+        let quadrant = (addr >> 16) & 0x3;
+        let offset = (addr & LOCAL_MEMORY_MASK) as usize;
+        (quadrant, offset)
+    }
+}
+
+/// Read-only snapshots of neighbor tile data memory for cross-tile access.
+///
+/// Built lazily before each core step. Neighbor memory is only cloned on
+/// the first cross-tile access, so cores that only touch local memory
+/// (quadrant 0) pay zero allocation cost.
+///
+/// Cross-tile writes are buffered and applied after the core step completes,
+/// matching hardware behavior where cross-tile writes have higher latency
+/// and become visible on the next cycle.
+///
+/// # Quadrant Mapping
+///
+/// | Quadrant | Direction | Neighbor offset        |
+/// |----------|-----------|------------------------|
+/// | 0        | South     | Local (own tile memory) |
+/// | 1        | West      | (col-1, row)           |
+/// | 2        | North     | (col, row+1)           |
+/// | 3        | East      | (col+1, row)           |
+pub struct NeighborMemory {
+    /// Source tile coordinates (needed for resolving neighbors).
+    col: usize,
+    row: usize,
+
+    /// Neighbor data memory snapshots indexed by quadrant-1 (0=West, 1=North, 2=East).
+    /// None until first access (lazy clone). Inner None if neighbor doesn't exist.
+    snapshots: [Option<Option<Vec<u8>>>; 3],
+
+    /// Buffered cross-tile writes: (quadrant, offset_within_tile, data).
+    /// Applied after core step completes.
+    pub pending_writes: Vec<(u8, usize, Vec<u8>)>,
+}
+
+impl NeighborMemory {
+    /// Create a new NeighborMemory for the core at (col, row).
+    ///
+    /// Does NOT clone any neighbor memory yet -- snapshots are lazy.
+    pub fn new(col: usize, row: usize) -> Self {
+        Self {
+            col,
+            row,
+            snapshots: [None, None, None],
+            pending_writes: Vec::new(),
+        }
+    }
+
+    /// Resolve a quadrant (1-3) to the neighbor tile coordinates.
+    ///
+    /// Returns None if the neighbor is outside the array bounds.
+    fn neighbor_coords(&self, quadrant: u8) -> Option<(usize, usize)> {
+        match quadrant {
+            1 => {
+                // West: col-1, same row
+                if self.col > 0 { Some((self.col - 1, self.row)) } else { None }
+            }
+            2 => {
+                // North: same col, row+1
+                Some((self.col, self.row + 1))
+            }
+            3 => {
+                // East: col+1, same row
+                Some((self.col + 1, self.row))
+            }
+            _ => None,
+        }
+    }
+
+    /// Lazily snapshot a neighbor tile's data memory.
+    ///
+    /// Called internally on first cross-tile access for a given quadrant.
+    /// The `device` reference is only needed for this initial clone.
+    pub fn ensure_snapshot(&mut self, quadrant: u8, device: &crate::device::DeviceState) {
+        let idx = (quadrant - 1) as usize;
+        if idx >= 3 || self.snapshots[idx].is_some() {
+            return; // Already loaded or invalid quadrant
+        }
+
+        let snapshot = self.neighbor_coords(quadrant)
+            .and_then(|(c, r)| device.tile(c, r))
+            .map(|tile| tile.data_memory().to_vec());
+
+        self.snapshots[idx] = Some(snapshot);
+    }
+
+    /// Get a reference to a neighbor's data memory snapshot.
+    ///
+    /// Returns None if the neighbor doesn't exist or hasn't been snapshotted.
+    pub fn get_memory(&self, quadrant: u8) -> Option<&[u8]> {
+        let idx = (quadrant - 1) as usize;
+        if idx >= 3 {
+            return None;
+        }
+        self.snapshots[idx]
+            .as_ref()
+            .and_then(|opt| opt.as_deref())
+    }
+
+    /// Buffer a cross-tile write for deferred application.
+    pub fn buffer_write(&mut self, quadrant: u8, offset: usize, data: &[u8]) {
+        self.pending_writes.push((quadrant, offset, data.to_vec()));
+    }
+
+    /// Apply all buffered cross-tile writes to the device.
+    ///
+    /// Resolves each quadrant to the target tile and writes the data.
+    /// Called after the core step completes.
+    pub fn apply_writes(self, device: &mut crate::device::DeviceState) {
+        let col = self.col;
+        let row = self.row;
+        for (quadrant, offset, data) in self.pending_writes {
+            // Resolve quadrant to neighbor coordinates inline (self is consumed)
+            let coords = match quadrant {
+                1 => if col > 0 { Some((col - 1, row)) } else { None },
+                2 => Some((col, row + 1)),
+                3 => Some((col + 1, row)),
+                _ => None,
+            };
+            if let Some((c, r)) = coords {
+                if let Some(tile) = device.tile_mut(c, r) {
+                    let mem = tile.data_memory_mut();
+                    if offset + data.len() <= mem.len() {
+                        mem[offset..offset + data.len()].copy_from_slice(&data);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check if there are any pending cross-tile writes.
+    pub fn has_pending_writes(&self) -> bool {
+        !self.pending_writes.is_empty()
+    }
+}
 
 /// Memory unit for load/store operations.
 pub struct MemoryUnit;
@@ -68,20 +226,28 @@ pub struct MemoryUnit;
 impl MemoryUnit {
     /// Execute a memory operation.
     ///
+    /// The `neighbors` parameter enables cross-tile memory access (quadrants 1-3).
+    /// Pass `None` for local-only access (unit tests, simple mode).
+    ///
     /// Returns `true` if the operation was handled, `false` if not a memory op.
-    pub fn execute(op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) -> bool {
+    pub fn execute(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        tile: &mut Tile,
+        neighbors: Option<&mut NeighborMemory>,
+    ) -> bool {
         // PostModify comes from op.post_modify (populated directly from the
         // AG field during decode) rather than from the Operation variant.
         let pm = &op.post_modify;
 
         match &op.op {
             Operation::Load { width, .. } => {
-                Self::execute_load(op, ctx, tile, *width, pm);
+                Self::execute_load(op, ctx, tile, *width, pm, neighbors);
                 true
             }
 
             Operation::Store { width, .. } => {
-                Self::execute_store(op, ctx, tile, *width, pm);
+                Self::execute_store(op, ctx, tile, *width, pm, neighbors);
                 true
             }
 
@@ -96,12 +262,12 @@ impl MemoryUnit {
             }
 
             Operation::VectorLoadA { .. } => {
-                Self::execute_vector_load_a(op, ctx, tile, pm);
+                Self::execute_vector_load_a(op, ctx, tile, pm, neighbors);
                 true
             }
 
             Operation::VectorLoadB { .. } => {
-                Self::execute_vector_load_b(op, ctx, tile, pm);
+                Self::execute_vector_load_b(op, ctx, tile, pm, neighbors);
                 true
             }
 
@@ -115,7 +281,7 @@ impl MemoryUnit {
             }
 
             Operation::VectorStore { .. } => {
-                Self::execute_vector_store(op, ctx, tile, pm);
+                Self::execute_vector_store(op, ctx, tile, pm, neighbors);
                 true
             }
 
@@ -176,6 +342,7 @@ impl MemoryUnit {
         tile: &Tile,
         width: MemWidth,
         post_modify: &PostModify,
+        neighbors: Option<&mut NeighborMemory>,
     ) {
         // Get address from source operand
         let addr = Self::get_address(op, ctx);
@@ -185,13 +352,23 @@ impl MemoryUnit {
 
         // Handle full vector loads specially
         if width == MemWidth::Vector256 {
-            let vec_data = Self::read_vector_from_memory(tile, addr);
+            let vec_data = Self::read_vector_from_memory(tile, addr, neighbors.map(|n| &*n));
             if let Some(dest) = &op.dest {
                 ctx.queue_vector_load(dest.clone(), vec_data, LATENCY_MEMORY as u64);
             }
         } else {
             // Scalar/partial loads go through write_dest (which queues)
-            let value = Self::read_memory(tile, addr, width);
+            let value = Self::read_memory(tile, addr, width, neighbors.map(|n| &*n));
+            if log::log_enabled!(log::Level::Trace) {
+                let masked = addr & 0xFFFF;
+                if masked >= 0x0400 && masked < 0x0420 {
+                    let elem = (masked - 0x0400) / 4;
+                    log::trace!(
+                        "[WATCH-LD] pc=0x{:03X} cycle={} elem={} addr=0x{:05X} value={} dest={:?}",
+                        ctx.pc(), ctx.cycles, elem, masked, value as i32, op.dest
+                    );
+                }
+            }
             Self::write_dest(op, ctx, value, width);
         }
 
@@ -206,6 +383,7 @@ impl MemoryUnit {
         tile: &mut Tile,
         width: MemWidth,
         post_modify: &PostModify,
+        neighbors: Option<&mut NeighborMemory>,
     ) {
         // Get address using store-specific layout: sources[1]=ptr, sources[2]=offset
         let addr = Self::get_store_address(op, ctx);
@@ -224,12 +402,22 @@ impl MemoryUnit {
 
             if let Some(r) = vec_reg {
                 let vec_data = ctx.vector.read(r);
-                Self::write_vector_to_memory(tile, addr, vec_data);
+                Self::write_vector_to_memory(tile, addr, vec_data, neighbors);
             }
         } else {
             // Scalar/partial stores
             let value = Self::get_store_value(op, ctx, width);
-            Self::write_memory(tile, addr, value, width);
+            if log::log_enabled!(log::Level::Trace) {
+                let masked = addr & 0xFFFF;
+                if masked >= 0x0400 && masked < 0x0420 {
+                    let elem = (masked - 0x0400) / 4;
+                    log::trace!(
+                        "[WATCH-ST] pc=0x{:03X} cycle={} elem={} addr=0x{:05X} value={} srcs={:?}",
+                        ctx.pc(), ctx.cycles, elem, masked, value as i32, op.sources
+                    );
+                }
+            }
+            Self::write_memory(tile, addr, value, width, neighbors);
         }
 
         // Apply post-modify to address register
@@ -246,11 +434,12 @@ impl MemoryUnit {
         ctx: &mut ExecutionContext,
         tile: &Tile,
         post_modify: &PostModify,
+        neighbors: Option<&mut NeighborMemory>,
     ) {
         let addr = Self::get_address(op, ctx);
 
         // Read 256 bits (32 bytes) from memory
-        let vec_data = Self::read_vector_from_memory(tile, addr);
+        let vec_data = Self::read_vector_from_memory(tile, addr, neighbors.map(|n| &*n));
 
         // Queue deferred write to destination vector register
         if let Some(dest) = &op.dest {
@@ -271,11 +460,12 @@ impl MemoryUnit {
         ctx: &mut ExecutionContext,
         tile: &Tile,
         post_modify: &PostModify,
+        neighbors: Option<&mut NeighborMemory>,
     ) {
         let addr = Self::get_address(op, ctx);
 
         // Read 256 bits (32 bytes) from memory
-        let vec_data = Self::read_vector_from_memory(tile, addr);
+        let vec_data = Self::read_vector_from_memory(tile, addr, neighbors.map(|n| &*n));
 
         // Queue deferred write to destination vector register
         if let Some(dest) = &op.dest {
@@ -375,7 +565,7 @@ impl MemoryUnit {
                 }
                 // Default: just do a straight load with no expansion
                 _ => {
-                    let vec_data = Self::read_vector_from_memory(tile, addr);
+                    let vec_data = Self::read_vector_from_memory(tile, addr, None);
                     result = vec_data;
                 }
             }
@@ -414,6 +604,7 @@ impl MemoryUnit {
         ctx: &mut ExecutionContext,
         tile: &mut Tile,
         post_modify: &PostModify,
+        neighbors: Option<&mut NeighborMemory>,
     ) {
         let addr = Self::get_address(op, ctx);
 
@@ -431,7 +622,7 @@ impl MemoryUnit {
 
         if let Some(r) = vec_reg {
             let vec_data = ctx.vector.read(r);
-            Self::write_vector_to_memory(tile, addr, vec_data);
+            Self::write_vector_to_memory(tile, addr, vec_data, neighbors);
         }
 
         // Apply post-modify (vector width = 32 bytes)
@@ -457,7 +648,8 @@ impl MemoryUnit {
         // First check for Memory operand (encapsulates ptr+offset, already scaled)
         if let Some(Operand::Memory { base, offset }) = op.sources.first() {
             let base_addr = ctx.pointer_read(*base);
-            return base_addr.wrapping_add(*offset as i32 as u32);
+            let result = base_addr.wrapping_add(*offset as i32 as u32);
+            return result;
         }
 
         // Handle indexed addressing: sources[0]=ptr, sources[1]=offset
@@ -476,7 +668,8 @@ impl MemoryUnit {
             _ => 0,
         });
 
-        base_addr.wrapping_add(offset)
+        let result = base_addr.wrapping_add(offset);
+        result
     }
 
     /// Get store address.
@@ -546,15 +739,36 @@ impl MemoryUnit {
         })
     }
 
-    /// Read from tile memory.
+    /// Read from tile memory with cross-tile quadrant routing.
     ///
-    /// Addresses are masked to LOCAL_MEMORY_MASK to handle linker-assigned
-    /// addresses (e.g., 0x70440 -> 0x0440).
-    fn read_memory(tile: &Tile, addr: u32, width: MemWidth) -> u64 {
-        // Mask address to local memory range (see module docs for AGU addressing)
-        let addr = (addr & LOCAL_MEMORY_MASK) as usize;
-        let mem = tile.data_memory();
+    /// Address bits 17:16 select the memory quadrant:
+    /// - 0: Local tile memory (fast path)
+    /// - 1: West neighbor
+    /// - 2: North neighbor
+    /// - 3: East neighbor
+    ///
+    /// Linker-assigned addresses (e.g., 0x70440) are masked to the 16-bit
+    /// local offset within the selected quadrant.
+    fn read_memory(tile: &Tile, addr: u32, width: MemWidth, neighbors: Option<&NeighborMemory>) -> u64 {
+        let (quadrant, offset) = decode_data_address(addr);
 
+        // Select memory source based on quadrant
+        let mem: &[u8] = if quadrant == 0 || neighbors.is_none() {
+            // Fast path: local tile memory
+            tile.data_memory()
+        } else if let Some(neighbor_mem) = neighbors.and_then(|n| n.get_memory(quadrant as u8)) {
+            neighbor_mem
+        } else {
+            // Neighbor doesn't exist (edge of array) - return zero
+            log::trace!("[LOAD] cross-tile read to non-existent neighbor quadrant {}", quadrant);
+            return 0;
+        };
+
+        Self::read_from_slice(mem, offset, width)
+    }
+
+    /// Read a value from a memory slice at the given offset.
+    fn read_from_slice(mem: &[u8], addr: usize, width: MemWidth) -> u64 {
         if addr >= mem.len() {
             return 0;
         }
@@ -618,15 +832,51 @@ impl MemoryUnit {
         }
     }
 
-    /// Write to tile memory.
+    /// Write to tile memory with cross-tile quadrant routing.
     ///
-    /// Addresses are masked to LOCAL_MEMORY_MASK to handle linker-assigned
-    /// addresses (e.g., 0x70440 -> 0x0440).
-    fn write_memory(tile: &mut Tile, addr: u32, value: u64, width: MemWidth) {
-        // Mask address to local memory range (see module docs for AGU addressing)
-        let addr = (addr & LOCAL_MEMORY_MASK) as usize;
-        let mem = tile.data_memory_mut();
+    /// Address bits 17:16 select the memory quadrant. Cross-tile writes
+    /// (quadrants 1-3) are buffered in the NeighborMemory for deferred
+    /// application after the core step completes.
+    fn write_memory(tile: &mut Tile, addr: u32, value: u64, width: MemWidth, neighbors: Option<&mut NeighborMemory>) {
+        let (quadrant, offset) = decode_data_address(addr);
 
+        if quadrant != 0 {
+            if let Some(nbr) = neighbors {
+                // Cross-tile write: serialize value and buffer it
+                let data = Self::serialize_value(value, width);
+                nbr.buffer_write(quadrant as u8, offset, &data);
+                return;
+            }
+            // No neighbor context -- fall through to local write (legacy behavior)
+        }
+
+        // Local tile write (quadrant 0 or no neighbor context)
+        let mem = tile.data_memory_mut();
+        Self::write_to_slice(mem, offset, value, width);
+    }
+
+    /// Serialize a scalar value to bytes for the given width.
+    fn serialize_value(value: u64, width: MemWidth) -> Vec<u8> {
+        match width {
+            MemWidth::Byte => vec![value as u8],
+            MemWidth::HalfWord => (value as u16).to_le_bytes().to_vec(),
+            MemWidth::Word => (value as u32).to_le_bytes().to_vec(),
+            MemWidth::DoubleWord => value.to_le_bytes().to_vec(),
+            MemWidth::QuadWord => {
+                let mut data = value.to_le_bytes().to_vec();
+                data.extend_from_slice(&[0u8; 8]);
+                data
+            }
+            MemWidth::Vector256 => {
+                let mut data = value.to_le_bytes().to_vec();
+                data.extend_from_slice(&[0u8; 24]);
+                data
+            }
+        }
+    }
+
+    /// Write a value to a memory slice at the given offset.
+    fn write_to_slice(mem: &mut [u8], addr: usize, value: u64, width: MemWidth) {
         if addr >= mem.len() {
             return;
         }
@@ -732,13 +982,24 @@ impl MemoryUnit {
         }
     }
 
-    /// Read a vector from memory (256 bits = 32 bytes).
-    ///
-    /// Addresses are masked to LOCAL_MEMORY_MASK.
-    pub fn read_vector_from_memory(tile: &Tile, addr: u32) -> [u32; 8] {
-        // Mask address to local memory range
-        let addr = (addr & LOCAL_MEMORY_MASK) as usize;
-        let mem = tile.data_memory();
+    /// Read a vector from memory (256 bits = 32 bytes) with cross-tile routing.
+    pub fn read_vector_from_memory(tile: &Tile, addr: u32, neighbors: Option<&NeighborMemory>) -> [u32; 8] {
+        let (quadrant, offset) = decode_data_address(addr);
+
+        // Select memory source
+        let mem: &[u8] = if quadrant == 0 || neighbors.is_none() {
+            tile.data_memory()
+        } else if let Some(neighbor_mem) = neighbors.and_then(|n| n.get_memory(quadrant as u8)) {
+            neighbor_mem
+        } else {
+            return [0u32; 8];
+        };
+
+        Self::read_vector_from_slice(mem, offset)
+    }
+
+    /// Read 8 x u32 from a memory slice at the given byte offset.
+    fn read_vector_from_slice(mem: &[u8], addr: usize) -> [u32; 8] {
         let mut result = [0u32; 8];
 
         if addr + 31 < mem.len() {
@@ -756,14 +1017,29 @@ impl MemoryUnit {
         result
     }
 
-    /// Write a vector to memory (256 bits = 32 bytes).
-    ///
-    /// Addresses are masked to LOCAL_MEMORY_MASK.
-    pub fn write_vector_to_memory(tile: &mut Tile, addr: u32, value: [u32; 8]) {
-        // Mask address to local memory range
-        let addr = (addr & LOCAL_MEMORY_MASK) as usize;
-        let mem = tile.data_memory_mut();
+    /// Write a vector to memory (256 bits = 32 bytes) with cross-tile routing.
+    pub fn write_vector_to_memory(tile: &mut Tile, addr: u32, value: [u32; 8], neighbors: Option<&mut NeighborMemory>) {
+        let (quadrant, offset) = decode_data_address(addr);
 
+        if quadrant != 0 {
+            if let Some(nbr) = neighbors {
+                // Cross-tile vector write: serialize all 8 words and buffer
+                let mut data = Vec::with_capacity(32);
+                for word in &value {
+                    data.extend_from_slice(&word.to_le_bytes());
+                }
+                nbr.buffer_write(quadrant as u8, offset, &data);
+                return;
+            }
+        }
+
+        // Local tile write
+        let mem = tile.data_memory_mut();
+        Self::write_vector_to_slice(mem, offset, value);
+    }
+
+    /// Write 8 x u32 to a memory slice at the given byte offset.
+    fn write_vector_to_slice(mem: &mut [u8], addr: usize, value: [u32; 8]) {
         if addr + 31 < mem.len() {
             for i in 0..8 {
                 let offset = addr + i * 4;
@@ -809,7 +1085,7 @@ mod tests {
         .with_dest(Operand::ScalarReg(0))
         .with_source(Operand::PointerReg(0));
 
-        assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile));
+        assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile, None));
         ctx.flush_pending_writes();
         assert_eq!(ctx.scalar.read(0), 0xDEAD_BEEF);
     }
@@ -833,7 +1109,7 @@ mod tests {
         .with_dest(Operand::ScalarReg(0))
         .with_source(Operand::Memory { base: 0, offset: 8 });
 
-        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
         assert_eq!(ctx.scalar.read(0), 0xCAFE_BABE);
     }
@@ -858,7 +1134,7 @@ mod tests {
         .with_dest(Operand::ScalarReg(0))
         .with_source(Operand::PointerReg(0));
 
-        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
         assert_eq!(ctx.scalar.read(0), 0x1234_5678);
         assert_eq!(ctx.pointer.read(0), 0x104); // Post-modified
@@ -885,7 +1161,7 @@ mod tests {
         .with_dest(Operand::ScalarReg(0))
         .with_source(Operand::PointerReg(0));
 
-        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
         assert_eq!(ctx.scalar.read(0), 0xABCD);
         assert_eq!(ctx.pointer.read(0), 0x110);
@@ -910,7 +1186,7 @@ mod tests {
         .with_dest(Operand::ScalarReg(1))
         .with_source(Operand::PointerReg(0));
 
-        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         assert_eq!(tile.read_data_u32(0x200), Some(0xFEED_FACE));
     }
 
@@ -932,7 +1208,7 @@ mod tests {
         .with_dest(Operand::ScalarReg(0))
         .with_source(Operand::PointerReg(0));
 
-        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
         assert_eq!(ctx.scalar.read(0), 0xAB);
     }
@@ -956,7 +1232,7 @@ mod tests {
         .with_dest(Operand::ScalarReg(0))
         .with_source(Operand::PointerReg(0));
 
-        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
         assert_eq!(ctx.scalar.read(0), 0xABCD);
     }
@@ -966,9 +1242,9 @@ mod tests {
         let mut tile = make_tile();
 
         let data = [1, 2, 3, 4, 5, 6, 7, 8];
-        MemoryUnit::write_vector_to_memory(&mut tile, 0x300, data);
+        MemoryUnit::write_vector_to_memory(&mut tile, 0x300, data, None);
 
-        let read_back = MemoryUnit::read_vector_from_memory(&tile, 0x300);
+        let read_back = MemoryUnit::read_vector_from_memory(&tile, 0x300, None);
         assert_eq!(read_back, data);
     }
 
@@ -988,7 +1264,7 @@ mod tests {
             0x77777777,
             0x88888888,
         ];
-        MemoryUnit::write_vector_to_memory(&mut tile, 0x400, test_data);
+        MemoryUnit::write_vector_to_memory(&mut tile, 0x400, test_data, None);
 
         // Set pointer
         ctx.pointer.write(0, 0x400);
@@ -1004,7 +1280,7 @@ mod tests {
         .with_dest(Operand::VectorReg(0))
         .with_source(Operand::PointerReg(0));
 
-        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
 
         // Verify all 8 lanes were loaded correctly
@@ -1044,10 +1320,10 @@ mod tests {
         .with_dest(Operand::VectorReg(1))
         .with_source(Operand::PointerReg(0));
 
-        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
 
         // Verify all 8 lanes were stored correctly
-        let stored = MemoryUnit::read_vector_from_memory(&tile, 0x500);
+        let stored = MemoryUnit::read_vector_from_memory(&tile, 0x500, None);
         assert_eq!(stored, test_data);
     }
 
@@ -1057,7 +1333,7 @@ mod tests {
         let mut tile = make_tile();
 
         let test_data = [1, 2, 3, 4, 5, 6, 7, 8];
-        MemoryUnit::write_vector_to_memory(&mut tile, 0x600, test_data);
+        MemoryUnit::write_vector_to_memory(&mut tile, 0x600, test_data, None);
         ctx.pointer.write(0, 0x600);
 
         // Load with post-modify: v0 = [p0], p0 += 32
@@ -1072,7 +1348,7 @@ mod tests {
         .with_dest(Operand::VectorReg(0))
         .with_source(Operand::PointerReg(0));
 
-        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
 
         assert_eq!(ctx.vector.read(0), test_data);
@@ -1087,7 +1363,7 @@ mod tests {
         // Write test vector data
         let test_data = [0xAABBCCDD, 0x11223344, 0x55667788, 0x99AABBCC,
                          0xDDEEFF00, 0x12345678, 0x9ABCDEF0, 0xFEDCBA98];
-        MemoryUnit::write_vector_to_memory(&mut tile, 0x700, test_data);
+        MemoryUnit::write_vector_to_memory(&mut tile, 0x700, test_data, None);
         ctx.pointer.write(0, 0x700);
 
         // VLDA: v2 = [p0]
@@ -1100,7 +1376,7 @@ mod tests {
         .with_dest(Operand::VectorReg(2))
         .with_source(Operand::PointerReg(0));
 
-        assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile));
+        assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile, None));
         ctx.flush_pending_writes();
         assert_eq!(ctx.vector.read(2), test_data);
         assert_eq!(ctx.pointer.read(0), 0x700); // No post-modify
@@ -1112,7 +1388,7 @@ mod tests {
         let mut tile = make_tile();
 
         let test_data = [1, 2, 3, 4, 5, 6, 7, 8];
-        MemoryUnit::write_vector_to_memory(&mut tile, 0x800, test_data);
+        MemoryUnit::write_vector_to_memory(&mut tile, 0x800, test_data, None);
         ctx.pointer.write(1, 0x800);
 
         // VLDA: v0 = [p1], p1 += 32
@@ -1126,7 +1402,7 @@ mod tests {
         .with_dest(Operand::VectorReg(0))
         .with_source(Operand::PointerReg(1));
 
-        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
         assert_eq!(ctx.vector.read(0), test_data);
         assert_eq!(ctx.pointer.read(1), 0x820); // 0x800 + 32
@@ -1139,7 +1415,7 @@ mod tests {
 
         let test_data = [0xDEADBEEF, 0xCAFEBABE, 0x12345678, 0x9ABCDEF0,
                          0x0F0F0F0F, 0xF0F0F0F0, 0xAAAA5555, 0x5555AAAA];
-        MemoryUnit::write_vector_to_memory(&mut tile, 0x900, test_data);
+        MemoryUnit::write_vector_to_memory(&mut tile, 0x900, test_data, None);
         ctx.pointer.write(4, 0x900); // B-channel typically uses p4-p7
 
         // VLDB: v3 = [p4]
@@ -1152,7 +1428,7 @@ mod tests {
         .with_dest(Operand::VectorReg(3))
         .with_source(Operand::PointerReg(4));
 
-        assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile));
+        assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile, None));
         ctx.flush_pending_writes();
         assert_eq!(ctx.vector.read(3), test_data);
     }
@@ -1163,7 +1439,7 @@ mod tests {
         let mut tile = make_tile();
 
         let test_data = [10, 20, 30, 40, 50, 60, 70, 80];
-        MemoryUnit::write_vector_to_memory(&mut tile, 0xA00, test_data);
+        MemoryUnit::write_vector_to_memory(&mut tile, 0xA00, test_data, None);
         ctx.pointer.write(5, 0xA00);
         ctx.modifier.write(2, 64); // m2 = 64
 
@@ -1178,7 +1454,7 @@ mod tests {
         .with_dest(Operand::VectorReg(1))
         .with_source(Operand::PointerReg(5));
 
-        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
         assert_eq!(ctx.vector.read(1), test_data);
         assert_eq!(ctx.pointer.read(5), 0xA40); // 0xA00 + 64
@@ -1204,9 +1480,9 @@ mod tests {
         .with_dest(Operand::VectorReg(4))
         .with_source(Operand::PointerReg(2));
 
-        assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile));
+        assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile, None));
 
-        let stored = MemoryUnit::read_vector_from_memory(&tile, 0xB00);
+        let stored = MemoryUnit::read_vector_from_memory(&tile, 0xB00, None);
         assert_eq!(stored, test_data);
     }
 
@@ -1230,9 +1506,9 @@ mod tests {
         .with_dest(Operand::VectorReg(5))
         .with_source(Operand::PointerReg(3));
 
-        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
 
-        let stored = MemoryUnit::read_vector_from_memory(&tile, 0xC00);
+        let stored = MemoryUnit::read_vector_from_memory(&tile, 0xC00, None);
         assert_eq!(stored, test_data);
         assert_eq!(ctx.pointer.read(3), 0xC20); // 0xC00 + 32
     }
@@ -1263,7 +1539,7 @@ mod tests {
         .with_dest(Operand::VectorReg(6))
         .with_source(Operand::PointerReg(0));
 
-        assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile));
+        assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile, None));
         ctx.flush_pending_writes();
 
         let result = ctx.vector.read(6);
@@ -1309,7 +1585,7 @@ mod tests {
         .with_dest(Operand::VectorReg(7))
         .with_source(Operand::PointerReg(1));
 
-        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
 
         let result = ctx.vector.read(7);
@@ -1353,7 +1629,7 @@ mod tests {
         .with_dest(Operand::VectorReg(0))
         .with_source(Operand::PointerReg(2));
 
-        MemoryUnit::execute(&op, &mut ctx, &mut tile);
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
 
         let result = ctx.vector.read(0);
@@ -1366,5 +1642,235 @@ mod tests {
         assert_eq!(result[6] as i32, -1);
         assert_eq!(result[7] as i32, 12345);
         assert_eq!(ctx.pointer.read(2), 0xF10); // 0xF00 + 16
+    }
+
+    // --- Cross-tile memory tests ---
+
+    #[test]
+    fn test_neighbor_memory_build_and_read() {
+        // Create a device with tiles. Tile(1,2) is the executing core.
+        // Neighbor mapping:
+        //   Quadrant 1 (West)  = tile(0, 2)
+        //   Quadrant 2 (North) = tile(1, 3)
+        //   Quadrant 3 (East)  = tile(2, 2)
+        let mut device = crate::device::DeviceState::new_npu1();
+
+        // Write known data into west neighbor's memory
+        if let Some(west) = device.tile_mut(0, 2) {
+            west.data_memory_mut()[0x100..0x104].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        }
+
+        // Write known data into north neighbor's memory
+        if let Some(north) = device.tile_mut(1, 3) {
+            north.data_memory_mut()[0x200..0x204].copy_from_slice(&0xCAFE_BABEu32.to_le_bytes());
+        }
+
+        // Write known data into east neighbor's memory
+        if let Some(east) = device.tile_mut(2, 2) {
+            east.data_memory_mut()[0x300..0x304].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        }
+
+        // Build NeighborMemory for tile(1,2) and load snapshots
+        let mut nbr = NeighborMemory::new(1, 2);
+        nbr.ensure_snapshot(1, &device); // West
+        nbr.ensure_snapshot(2, &device); // North
+        nbr.ensure_snapshot(3, &device); // East
+
+        // Verify reads from each quadrant
+        let west_mem = nbr.get_memory(1).expect("West neighbor should exist");
+        assert_eq!(
+            u32::from_le_bytes([west_mem[0x100], west_mem[0x101], west_mem[0x102], west_mem[0x103]]),
+            0xDEAD_BEEF
+        );
+
+        let north_mem = nbr.get_memory(2).expect("North neighbor should exist");
+        assert_eq!(
+            u32::from_le_bytes([north_mem[0x200], north_mem[0x201], north_mem[0x202], north_mem[0x203]]),
+            0xCAFE_BABE
+        );
+
+        let east_mem = nbr.get_memory(3).expect("East neighbor should exist");
+        assert_eq!(
+            u32::from_le_bytes([east_mem[0x300], east_mem[0x301], east_mem[0x302], east_mem[0x303]]),
+            0x1234_5678
+        );
+    }
+
+    #[test]
+    fn test_neighbor_memory_buffer_write_and_apply() {
+        let mut device = crate::device::DeviceState::new_npu1();
+
+        // Build NeighborMemory for tile(1,2)
+        let mut nbr = NeighborMemory::new(1, 2);
+        nbr.ensure_snapshot(1, &device);
+
+        // Buffer a write to west neighbor at offset 0x400
+        let write_data = 0xAAAA_BBBBu32.to_le_bytes();
+        nbr.buffer_write(1, 0x400, &write_data);
+
+        assert!(nbr.has_pending_writes());
+
+        // Apply writes to the device
+        nbr.apply_writes(&mut device);
+
+        // Verify the write landed in the west neighbor tile
+        let west = device.tile(0, 2).unwrap();
+        let mem = west.data_memory();
+        let value = u32::from_le_bytes([mem[0x400], mem[0x401], mem[0x402], mem[0x403]]);
+        assert_eq!(value, 0xAAAA_BBBB);
+    }
+
+    #[test]
+    fn test_cross_tile_scalar_load() {
+        // Test that a load with address in quadrant 1 (0x1xxxx) reads from
+        // the west neighbor's memory snapshot.
+        let mut device = crate::device::DeviceState::new_npu1();
+
+        // Write test data to west neighbor (tile 0,2)
+        if let Some(west) = device.tile_mut(0, 2) {
+            west.write_data_u32(0x100, 0xFEED_FACE);
+        }
+
+        // Build neighbor snapshot for tile(1,2)
+        let mut nbr = NeighborMemory::new(1, 2);
+        nbr.ensure_snapshot(1, &device);
+
+        // Read from quadrant 1 address: 0x10100 = west neighbor, offset 0x100
+        let tile = Tile::compute(1, 2);
+        let value = MemoryUnit::read_memory(&tile, 0x10100, MemWidth::Word, Some(&nbr));
+        assert_eq!(value, 0xFEED_FACE);
+    }
+
+    #[test]
+    fn test_cross_tile_vector_load() {
+        let mut device = crate::device::DeviceState::new_npu1();
+
+        // Write vector data to north neighbor (tile 1,3)
+        let test_data = [10u32, 20, 30, 40, 50, 60, 70, 80];
+        if let Some(north) = device.tile_mut(1, 3) {
+            let mem = north.data_memory_mut();
+            for (i, &val) in test_data.iter().enumerate() {
+                let offset = 0x200 + i * 4;
+                let bytes = val.to_le_bytes();
+                mem[offset..offset + 4].copy_from_slice(&bytes);
+            }
+        }
+
+        // Build neighbor snapshot
+        let mut nbr = NeighborMemory::new(1, 2);
+        nbr.ensure_snapshot(2, &device); // North
+
+        // Read vector from quadrant 2: 0x20200 = north neighbor, offset 0x200
+        let tile = Tile::compute(1, 2);
+        let result = MemoryUnit::read_vector_from_memory(&tile, 0x20200, Some(&nbr));
+        assert_eq!(result, test_data);
+    }
+
+    #[test]
+    fn test_cross_tile_scalar_store_buffered() {
+        // Cross-tile stores are buffered, not immediately written.
+        let mut device = crate::device::DeviceState::new_npu1();
+
+        let mut nbr = NeighborMemory::new(1, 2);
+        nbr.ensure_snapshot(3, &device); // East
+
+        // Write to quadrant 3 (east) address 0x30400
+        let mut tile = Tile::compute(1, 2);
+        MemoryUnit::write_memory(&mut tile, 0x30400, 0xBAAD_F00D, MemWidth::Word, Some(&mut nbr));
+
+        // Should be buffered, not yet in the east neighbor
+        let east = device.tile(2, 2).unwrap();
+        let mem = east.data_memory();
+        let value = u32::from_le_bytes([mem[0x400], mem[0x401], mem[0x402], mem[0x403]]);
+        assert_eq!(value, 0, "Write should be buffered, not applied yet");
+
+        // Apply writes
+        assert!(nbr.has_pending_writes());
+        nbr.apply_writes(&mut device);
+
+        // Now it should be visible
+        let east = device.tile(2, 2).unwrap();
+        let mem = east.data_memory();
+        let value = u32::from_le_bytes([mem[0x400], mem[0x401], mem[0x402], mem[0x403]]);
+        assert_eq!(value, 0xBAAD_F00D);
+    }
+
+    #[test]
+    fn test_cross_tile_vector_store_buffered() {
+        let mut device = crate::device::DeviceState::new_npu1();
+
+        let mut nbr = NeighborMemory::new(1, 2);
+        nbr.ensure_snapshot(1, &device); // West
+
+        // Write vector to quadrant 1 (west) address 0x10800
+        let test_data = [1u32, 2, 3, 4, 5, 6, 7, 8];
+        let mut tile = Tile::compute(1, 2);
+        MemoryUnit::write_vector_to_memory(&mut tile, 0x10800, test_data, Some(&mut nbr));
+
+        // Apply and verify
+        nbr.apply_writes(&mut device);
+
+        let west = device.tile(0, 2).unwrap();
+        let mem = west.data_memory();
+        for (i, &expected) in test_data.iter().enumerate() {
+            let offset = 0x800 + i * 4;
+            let actual = u32::from_le_bytes([mem[offset], mem[offset+1], mem[offset+2], mem[offset+3]]);
+            assert_eq!(actual, expected, "Vector word {} mismatch", i);
+        }
+    }
+
+    #[test]
+    fn test_quadrant_0_fast_path_unchanged() {
+        // Verify that quadrant 0 (local memory) works exactly as before,
+        // even when NeighborMemory is Some.
+        let mut device = crate::device::DeviceState::new_npu1();
+        let mut nbr = NeighborMemory::new(1, 2);
+        nbr.ensure_snapshot(1, &device);
+
+        let mut tile = make_tile();
+        tile.write_data_u32(0x100, 0x42424242);
+
+        // Read from local memory (quadrant 0) with neighbors present
+        let value = MemoryUnit::read_memory(&tile, 0x100, MemWidth::Word, Some(&nbr));
+        assert_eq!(value, 0x42424242);
+
+        // Write to local memory (quadrant 0) with neighbors present
+        MemoryUnit::write_memory(&mut tile, 0x200, 0x99887766, MemWidth::Word, Some(&mut nbr));
+        assert_eq!(tile.read_data_u32(0x200), Some(0x99887766));
+
+        // No cross-tile writes should have been buffered
+        assert!(!nbr.has_pending_writes());
+    }
+
+    #[test]
+    fn test_edge_tile_no_west_neighbor() {
+        // Tile(0,2) has no west neighbor (col 0).
+        // Cross-tile read should return 0.
+        let device = crate::device::DeviceState::new_npu1();
+        let mut nbr = NeighborMemory::new(0, 2);
+        nbr.ensure_snapshot(1, &device); // West -- doesn't exist
+
+        let tile = Tile::compute(0, 2);
+        let value = MemoryUnit::read_memory(&tile, 0x10100, MemWidth::Word, Some(&nbr));
+        assert_eq!(value, 0, "Read from non-existent west neighbor should return 0");
+    }
+
+    #[test]
+    fn test_linker_high_bits_masked_to_local() {
+        // Linker-assigned addresses like 0x70440 have high bits beyond the
+        // 18-bit AGU range. They should be masked to quadrant 0 local access.
+        // 0x70440 & 0x3FFFF = 0x30440 -> quadrant 3, offset 0x0440
+        // But actually, linker addresses are typically resolved by ELF loading
+        // which subtracts the base (0x70000). The AGU only sees 20-bit addresses.
+        //
+        // For addresses where bits above 17 are set but below 20, they map
+        // correctly to quadrants 0-3. Addresses above 0x3FFFF wrap via the
+        // mask to whatever quadrant the lower bits indicate.
+        let mut tile = make_tile();
+        tile.write_data_u32(0x440, 0xABCDABCD);
+
+        // 0x00440 = quadrant 0, offset 0x440 -> local memory
+        let value = MemoryUnit::read_memory(&tile, 0x00440, MemWidth::Word, None);
+        assert_eq!(value, 0xABCDABCD);
     }
 }

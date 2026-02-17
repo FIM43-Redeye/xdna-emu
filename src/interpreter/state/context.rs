@@ -22,7 +22,7 @@ use super::registers::{
     VectorRegisterFile,
 };
 use crate::interpreter::bundle::Operand;
-use crate::interpreter::timing::{HazardDetector, HazardType, LatencyTable, MemoryModel};
+use crate::interpreter::timing::{HazardDetector, LatencyTable, MemoryModel};
 use crate::interpreter::traits::{Flags, StateAccess};
 
 // ============================================================================
@@ -31,9 +31,10 @@ use crate::interpreter::traits::{Flags, StateAccess};
 
 /// A deferred register write from a memory load operation.
 ///
-/// AIE2 memory loads have a 5-cycle pipeline latency (AM020 Ch4). The compiler
-/// pipelines multiple loads to the same register, relying on this latency to
-/// keep earlier values alive until they are consumed. Without deferred writes,
+/// AIE2 memory loads have a 7-cycle pipeline latency (AIE2Schedule.td
+/// operandcycles[0] = 7 for all load itineraries). The compiler pipelines
+/// multiple loads to the same register, relying on this latency to keep
+/// earlier values alive until they are consumed. Without deferred writes,
 /// later loads instantly overwrite earlier values, breaking the pipeline.
 #[derive(Debug, Clone)]
 pub struct PendingWrite {
@@ -51,35 +52,100 @@ pub struct PendingWrite {
 // Event Tracing
 // ============================================================================
 
-/// Types of events that can be recorded for profiling.
+/// Types of events that can be recorded for profiling and trace export.
+///
+/// Each variant maps to a hardware trace event code from the AIE2 tile trace
+/// units (Core module and Memory module). This alignment allows direct
+/// comparison between emulator traces and hardware traces in Perfetto.
+///
+/// See AM025 Trace Event Codes and AIE2Schedule.td CoreEvent definitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventType {
-    /// Instruction execution started.
-    InstructionStart { pc: u32 },
-    /// Instruction execution completed.
-    InstructionComplete { pc: u32, latency: u8 },
-    /// Pipeline stall due to register hazard.
-    RegisterHazard { hazard_type: HazardType, register: u8, cycles: u8 },
-    /// Pipeline stall due to memory bank conflict.
-    MemoryConflict { bank: u8, cycles: u8 },
-    /// Pipeline stall due to branch penalty.
-    BranchPenalty { cycles: u8 },
-    /// Branch taken.
-    BranchTaken { from_pc: u32, to_pc: u32 },
-    /// DMA transfer started.
-    DmaStart { channel: u8 },
-    /// DMA transfer completed.
-    DmaComplete { channel: u8 },
-    /// Lock acquire started.
-    LockAcquireStart { lock_id: u8 },
-    /// Lock acquired successfully.
-    LockAcquired { lock_id: u8 },
-    /// Lock contention (waiting).
-    LockContention { lock_id: u8 },
+    // -- Instruction events (Core module trace) --
+    // Per-class events matching hardware CoreEvent codes from AIE2Schedule.td.
+
+    /// Vector instruction executed (VMAC, VADD, VCMP, etc.).
+    /// Maps to hardware INSTR_VECTOR.
+    InstrVector { pc: u32 },
+    /// Load instruction executed.
+    /// Maps to hardware INSTR_LOAD.
+    InstrLoad { pc: u32 },
+    /// Store instruction executed.
+    /// Maps to hardware INSTR_STORE.
+    InstrStore { pc: u32 },
+    /// Call instruction executed (jl).
+    /// Maps to hardware INSTR_CALL.
+    InstrCall { pc: u32 },
+    /// Return instruction executed (ret).
+    /// Maps to hardware INSTR_RETURN.
+    InstrReturn { pc: u32 },
+    /// Lock acquire request instruction.
+    /// Maps to hardware INSTR_LOCK_ACQUIRE_REQ.
+    InstrLockAcquireReq { pc: u32 },
+    /// Lock release request instruction.
+    /// Maps to hardware INSTR_LOCK_RELEASE_REQ.
+    InstrLockReleaseReq { pc: u32 },
+    /// Stream get instruction.
+    /// Maps to hardware INSTR_STREAM_GET.
+    InstrStreamGet { pc: u32 },
+    /// Stream put instruction.
+    /// Maps to hardware INSTR_STREAM_PUT.
+    InstrStreamPut { pc: u32 },
+
+    // -- Stall events (Core module trace) --
+
+    /// Memory access stall.
+    /// Maps to hardware MEMORY_STALL.
+    MemoryStall { cycles: u8 },
+    /// Lock acquire stall.
+    /// Maps to hardware LOCK_STALL.
+    LockStall { cycles: u8 },
+    /// Stream interface stall.
+    /// Maps to hardware STREAM_STALL.
+    StreamStall { cycles: u8 },
+
+    // -- DMA events (Memory module trace) --
+    // Channel encodes direction: 0-1 = S2MM (input), 2-3 = MM2S (output)
+    // for compute tiles. Shim/memtile may have more channels.
+
+    /// DMA channel started a task.
+    /// Maps to hardware DMA_x_START_TASK.
+    DmaStartTask { channel: u8 },
+    /// DMA channel finished one buffer descriptor.
+    /// Maps to hardware DMA_x_FINISHED_BD.
+    DmaFinishedBd { channel: u8 },
+    /// DMA channel finished an entire task (all BDs and repeats).
+    /// Maps to hardware DMA_x_FINISHED_TASK.
+    DmaFinishedTask { channel: u8 },
+    /// DMA channel stalled waiting for a lock.
+    /// Maps to hardware DMA_x_STALLED_LOCK.
+    DmaStalledLock { channel: u8 },
+    /// DMA channel stalled waiting for stream data.
+    /// Maps to hardware DMA_x_STREAM_STARVATION.
+    DmaStreamStarvation { channel: u8 },
+
+    // -- Lock events (Memory module trace) --
+
+    /// Lock acquired.
+    /// Maps to hardware LOCK_n_ACQ.
+    LockAcquire { lock_id: u8 },
     /// Lock released.
-    LockReleased { lock_id: u8 },
-    /// Core halted.
-    Halt,
+    /// Maps to hardware LOCK_n_REL.
+    LockRelease { lock_id: u8 },
+
+    // -- Core state events --
+
+    /// Core is actively executing.
+    /// Maps to hardware ACTIVE_CORE.
+    CoreActive,
+    /// Core has halted (done instruction).
+    /// Maps to hardware DISABLED_CORE.
+    CoreDisabled,
+
+    // -- Branch events (emulator-internal, no direct HW trace event) --
+
+    /// Branch taken with source and target PCs.
+    BranchTaken { from_pc: u32, to_pc: u32 },
 }
 
 /// A timestamped event for profiling.
@@ -399,8 +465,8 @@ pub struct ExecutionContext {
 
     // === Load Latency Pipeline ===
     /// Deferred register writes from memory load operations.
-    /// Loads have a 5-cycle pipeline latency (AM020 Ch4). The write to the
-    /// destination register is deferred until `ready_cycle` is reached.
+    /// Loads have a 7-cycle pipeline latency (AIE2Schedule.td). The write to
+    /// the destination register is deferred until `ready_cycle` is reached.
     pending_writes: Vec<PendingWrite>,
 }
 
@@ -668,16 +734,36 @@ impl ExecutionContext {
     /// the VLIW snapshot.
     pub fn commit_pending_writes(&mut self) {
         let current = self.cycles;
-        // Partition: keep writes not yet ready, commit the rest
-        let mut i = 0;
-        while i < self.pending_writes.len() {
-            if self.pending_writes[i].ready_cycle <= current {
-                let pw = self.pending_writes.swap_remove(i);
-                self.apply_pending_write(&pw);
-                // Don't increment i -- swap_remove moved last element here
-            } else {
-                i += 1;
+        // Commit writes whose ready_cycle has been reached.
+        //
+        // Using `<=` matches LLVM's LoadLatency semantics: a load with
+        // latency L issued at cycle C has ready_cycle = C + L, and a
+        // dependent instruction at cycle C + L can read the new value.
+        //
+        // When multiple pending writes target the SAME register, we must
+        // apply them in ready_cycle order so the latest one wins. We sort
+        // the ready writes by ready_cycle before applying.
+        let mut ready_indices: Vec<usize> = Vec::new();
+        for (i, pw) in self.pending_writes.iter().enumerate() {
+            if pw.ready_cycle <= current {
+                ready_indices.push(i);
             }
+        }
+        // Sort by ready_cycle so earlier writes are applied first
+        // (later writes to the same register overwrite them correctly)
+        ready_indices.sort_by_key(|&i| self.pending_writes[i].ready_cycle);
+        // Drain in reverse index order to avoid invalidating indices
+        // We collect the writes first, then remove them
+        let mut ready_writes: Vec<PendingWrite> = Vec::with_capacity(ready_indices.len());
+        // Remove from highest index to lowest to preserve indices
+        ready_indices.sort_unstable_by(|a, b| b.cmp(a));
+        for &idx in &ready_indices {
+            ready_writes.push(self.pending_writes.swap_remove(idx));
+        }
+        // Sort by ready_cycle ascending and apply
+        ready_writes.sort_by_key(|pw| pw.ready_cycle);
+        for pw in &ready_writes {
+            self.apply_pending_write(pw);
         }
     }
 
@@ -1092,7 +1178,7 @@ mod tests {
         let mut log = EventLog::new();
 
         // Recording when disabled should not add events
-        log.record(10, EventType::InstructionStart { pc: 0x100 });
+        log.record(10, EventType::InstrLoad { pc: 0x100 });
         assert!(log.is_empty());
     }
 
@@ -1101,8 +1187,8 @@ mod tests {
         let mut log = EventLog::new();
         log.enable();
 
-        log.record(10, EventType::InstructionStart { pc: 0x100 });
-        log.record(11, EventType::InstructionComplete { pc: 0x100, latency: 1 });
+        log.record(10, EventType::InstrLoad { pc: 0x100 });
+        log.record(11, EventType::InstrVector { pc: 0x100 });
 
         assert_eq!(log.len(), 2);
         assert_eq!(log.events()[0].cycle, 10);
@@ -1114,8 +1200,8 @@ mod tests {
         let mut log = EventLog::new();
         log.enable();
 
-        log.record(1, EventType::Halt);
-        log.record(2, EventType::Halt);
+        log.record(1, EventType::CoreDisabled);
+        log.record(2, EventType::CoreDisabled);
         assert_eq!(log.len(), 2);
 
         log.clear();
@@ -1127,12 +1213,12 @@ mod tests {
         let mut log = EventLog::with_capacity(3);
         log.enable();
 
-        log.record(1, EventType::InstructionStart { pc: 0x100 });
-        log.record(2, EventType::InstructionStart { pc: 0x104 });
-        log.record(3, EventType::InstructionStart { pc: 0x108 });
+        log.record(1, EventType::InstrLoad { pc: 0x100 });
+        log.record(2, EventType::InstrLoad { pc: 0x104 });
+        log.record(3, EventType::InstrLoad { pc: 0x108 });
 
         // At capacity, next record should drop oldest
-        log.record(4, EventType::InstructionStart { pc: 0x10C });
+        log.record(4, EventType::InstrLoad { pc: 0x10C });
 
         assert_eq!(log.len(), 3);
         // First event (cycle 1) should be dropped
@@ -1155,29 +1241,43 @@ mod tests {
 
         // Disable tracing
         timing.disable_tracing();
-        timing.record_event(30, EventType::Halt);
+        timing.record_event(30, EventType::CoreDisabled);
         assert_eq!(timing.events.len(), 1); // No new event recorded
     }
 
     #[test]
     fn test_event_type_variants() {
-        use crate::interpreter::timing::HazardType;
-
-        // Test that all event variants can be created
+        // Test that all event variants can be created and recorded.
+        // Each maps to a hardware trace event code.
         let events = vec![
-            EventType::InstructionStart { pc: 0x100 },
-            EventType::InstructionComplete { pc: 0x100, latency: 2 },
-            EventType::RegisterHazard { hazard_type: HazardType::Raw, register: 5, cycles: 2 },
-            EventType::MemoryConflict { bank: 3, cycles: 1 },
-            EventType::BranchPenalty { cycles: 3 },
+            // Instruction events
+            EventType::InstrVector { pc: 0x100 },
+            EventType::InstrLoad { pc: 0x104 },
+            EventType::InstrStore { pc: 0x108 },
+            EventType::InstrCall { pc: 0x10C },
+            EventType::InstrReturn { pc: 0x110 },
+            EventType::InstrLockAcquireReq { pc: 0x114 },
+            EventType::InstrLockReleaseReq { pc: 0x118 },
+            EventType::InstrStreamGet { pc: 0x11C },
+            EventType::InstrStreamPut { pc: 0x120 },
+            // Stall events
+            EventType::MemoryStall { cycles: 2 },
+            EventType::LockStall { cycles: 3 },
+            EventType::StreamStall { cycles: 1 },
+            // DMA events
+            EventType::DmaStartTask { channel: 0 },
+            EventType::DmaFinishedBd { channel: 1 },
+            EventType::DmaFinishedTask { channel: 2 },
+            EventType::DmaStalledLock { channel: 0 },
+            EventType::DmaStreamStarvation { channel: 1 },
+            // Lock events
+            EventType::LockAcquire { lock_id: 5 },
+            EventType::LockRelease { lock_id: 5 },
+            // Core state
+            EventType::CoreActive,
+            EventType::CoreDisabled,
+            // Branch (emulator-internal)
             EventType::BranchTaken { from_pc: 0x100, to_pc: 0x200 },
-            EventType::DmaStart { channel: 0 },
-            EventType::DmaComplete { channel: 0 },
-            EventType::LockAcquireStart { lock_id: 5 },
-            EventType::LockAcquired { lock_id: 5 },
-            EventType::LockContention { lock_id: 5 },
-            EventType::LockReleased { lock_id: 5 },
-            EventType::Halt,
         ];
 
         let mut log = EventLog::new();
@@ -1187,6 +1287,6 @@ mod tests {
             log.record(i as u64, event);
         }
 
-        assert_eq!(log.len(), 13);
+        assert_eq!(log.len(), 22);
     }
 }

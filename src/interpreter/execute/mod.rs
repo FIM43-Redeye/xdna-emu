@@ -88,7 +88,7 @@ mod semantic;
 
 pub use scalar::ScalarAlu;
 pub use vector::VectorAlu;
-pub use memory::MemoryUnit;
+pub use memory::{MemoryUnit, NeighborMemory};
 pub use control::ControlUnit;
 pub use stream::{StreamOps, StreamResult};
 pub use cycle_accurate::{CycleAccurateExecutor, CycleAccurateStats};

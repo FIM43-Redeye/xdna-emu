@@ -87,15 +87,18 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
         Self::new(InstructionDecoder::load_default(), CycleAccurateExecutor::new())
     }
 
-    /// Execute a single instruction cycle with memory tile lock routing.
+    /// Execute a single instruction cycle with memory tile lock routing
+    /// and optional cross-tile memory access.
     ///
     /// For compute tiles, pass the adjacent memory tile's locks to enable
     /// proper routing of lock IDs 48-63 (memory module locks) to the MemTile.
+    /// Pass `neighbors` to enable cross-tile memory access (quadrants 1-3).
     pub fn step_with_mem_locks(
         &mut self,
         ctx: &mut ExecutionContext,
         tile: &mut Tile,
-        mem_tile_locks: Option<&mut [crate::device::tile::Lock; 64]>,
+        mem_tile_locks: Option<&mut [crate::device::tile::Lock]>,
+        neighbors: Option<&mut crate::interpreter::execute::NeighborMemory>,
     ) -> StepResult {
         // Check if halted
         if self.is_halted() {
@@ -139,9 +142,9 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
 
         let bundle_size = bundle.size();
 
-        // Execute bundle with memory tile locks for proper routing
+        // Execute bundle with memory tile locks and neighbor memory for proper routing
         self.status = CoreStatus::Running;
-        let result = self.executor.execute_with_mem_tile(&bundle, ctx, tile, mem_tile_locks);
+        let result = self.executor.execute_with_mem_tile(&bundle, ctx, tile, mem_tile_locks, neighbors);
 
         // Save bundle for debugging
         self.last_bundle = Some(bundle);

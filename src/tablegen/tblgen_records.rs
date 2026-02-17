@@ -86,6 +86,10 @@ pub struct InstrRecord {
     /// excluded from decoder tables since they are aliases (e.g., MOV_OR is
     /// `or $rd, $rs, $rs` with only one input operand).
     pub is_code_gen_only: bool,
+    /// Itinerary class name from `InstrItinClass Itinerary = II_ADD;`.
+    /// Links this instruction to its pipeline timing data in the scheduling model.
+    /// None only if the field is absent; "NoItinerary" means explicitly unscheduled.
+    pub itinerary_class: Option<String>,
 }
 
 /// Parsed slot encoding from bits<N> field.
@@ -293,6 +297,7 @@ fn parse_single_record(lines: &[&str], i: &mut usize) -> Option<InstrRecord> {
         has_complete_decoder: true, // Default to true; set false if field says 0
         has_delay_slot: false,
         is_code_gen_only: false,
+        itinerary_class: None,
     };
 
     // Parse fields until closing brace
@@ -330,6 +335,15 @@ fn parse_single_record(lines: &[&str], i: &mut usize) -> Option<InstrRecord> {
             record.has_delay_slot = line.contains("= 1");
         } else if line.starts_with("bit isCodeGenOnly = ") {
             record.is_code_gen_only = line.contains("= 1");
+        } else if line.starts_with("InstrItinClass Itinerary = ") {
+            let val = line
+                .strip_prefix("InstrItinClass Itinerary = ")
+                .unwrap_or("")
+                .trim_end_matches(';')
+                .to_string();
+            if val != "NoItinerary" {
+                record.itinerary_class = Some(val);
+            }
         } else if let Some(enc) = parse_slot_encoding(line) {
             record.slot_encoding = Some(enc);
         }
@@ -608,6 +622,7 @@ impl InstrRecord {
             is_vector,
             select_variant,
             is_ptr_arithmetic,
+            sched_class: self.itinerary_class.clone(),
         })
     }
 }
