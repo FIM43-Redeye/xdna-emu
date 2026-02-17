@@ -18,14 +18,16 @@ This ensures:
 
 The workspace contains:
 - `xdna-emu/` - This emulator project (main focus)
-- `mlir-aie/` - MLIR-based AIE compiler and test suite
-- `llvm-aie/` - Peano compiler (LLVM with AIE backend)
+- `mlir-aie/` - MLIR-based AIE compiler, test suite, and device models
+  - `third_party/aie-rt/` - Vendored hardware abstraction layer (critical reference)
+  - `lib/Dialect/AIE/Util/aie_registers_aie2.json` - AM025 register database
+- `llvm-aie/` - Peano compiler (LLVM with AIE backend, TableGen ISA definitions)
 
 See `/home/triple/npu-work/CLAUDE.md` for environment details.
 
 ---
 
-There is one absolutely critical rule to always keep to: **REFER TO THE DOCUMENTATION.** The way to do so is described below, using Explore agents, since the body of documentation is very large.
+There is one absolutely critical rule to always keep to: **DERIVE FROM THE TOOLCHAIN.** The open-source toolchain (aie-rt, llvm-aie, mlir-aie) is the authoritative specification for hardware behavior. Never hardcode what can be extracted. See "Correctness Principle" below for the full source hierarchy and guidance.
 
 ## Project Vision
 
@@ -51,6 +53,43 @@ Same binary executes on real NPU via XRT
     |
 Compare emulated vs actual results
 ```
+
+### Licensing and Relationship to AMD
+
+This project is **MIT-licensed** and exists to help the AMD NPU ecosystem.
+The emulator is orders of magnitude slower than real silicon -- it is a
+development tool, not a hardware substitute. Its purpose is to lower the
+barrier to entry for NPU programming, which benefits AMD by expanding the
+developer community for their hardware.
+
+**Source derivation policy:**
+
+All emulator code is original. Hardware behavior is derived from these sources,
+in order of preference:
+
+1. **Open-source toolchain** (aie-rt, llvm-aie, mlir-aie) -- Apache 2.0 /
+   MIT licensed. Primary and preferred source for all emulator behavior.
+   Derive from these wherever possible.
+
+2. **Hardware observation** -- Running binaries on the real NPU we own and
+   observing results. The hardware itself is ground truth.
+
+3. **aietools** (AMD proprietary, locally installed) -- Used strictly as a
+   **reading reference** to understand hardware behavior that the open-source
+   toolchain does not document (primarily vector compute semantics). Never
+   copy code or data from aietools into this repository. Read, understand
+   the hardware facts, then write original implementations. aiesimulator may
+   be used as a debugging aid to understand where the emulator diverges from
+   expected behavior, but the real NPU is always ground truth.
+
+4. **AM020/AM025 documentation** -- AMD architecture reference manuals for
+   areas not covered elsewhere.
+
+**What this means in practice**: when implementing a feature, comment the
+source of behavioral knowledge as the hardware behavior itself (e.g.,
+"Rounding matches observed NPU output" or "BD field layout per AM025 register
+database"), not as proprietary tool internals. The knowledge is about how
+the silicon works; the implementation is ours.
 
 ## Current Status
 
@@ -99,39 +138,138 @@ mlir-aie uses different device names that can be confusing:
 
 **Not in scope**: Versal FPGAs (AIE1 + PL fabric) - different use case, no local hardware. However, AIE1 support may be added later since the TableGen parser handles multiple architectures.
 
-## Architecture Knowledge Sources
+## Correctness Principle: Derive From the Toolchain
 
-**CRITICAL: Consult the architecture documentation when implementing any hardware feature.**
+**CRITICAL: The open-source toolchain IS the hardware specification. Derive
+emulator behavior from it. Never hardcode what can be extracted.**
 
-Many debugging hours have been lost to assumptions about register layouts, address mappings, and data formats. The AIE-ML architecture has specific conventions that differ from intuition:
-- Lock registers are 16 bytes apart, not 4
-- Core lock IDs 48-63 map to memory module locks 0-15
-- BD fields span multiple words with specific bit layouts
-- DMA addressing uses word units, not bytes
+This project's accuracy depends on treating mlir-aie, llvm-aie, and aie-rt as
+the authoritative sources of truth for hardware behavior. Every hardcoded
+constant, bit position, or behavioral assumption is a potential bug. The
+toolchain evolves with the hardware -- if we derive from it, we evolve too.
 
-When implementing anything related to registers, DMA, locks, or memory:
-1. First read the relevant AM020/AM025 section
-2. Check the extracted docs in `docs/xdna/` (text files, not PDFs)
-3. Verify bit layouts and address calculations against the reference
-4. Add comments citing the specific register/section
+**The rule**: before implementing any hardware feature, check whether the
+toolchain already defines it. Only fall back to AM020/AM025 documentation for
+things the toolchain genuinely does not cover (primarily vector operation
+computational semantics).
 
-**Use Explore agents for documentation research.** The architecture docs are extensive (AM020 alone spans 100+ pages). Rather than reading files directly and wasting context, spawn an Explore agent with subagent_type='Explore' to navigate the docs and extract the specific details needed. This is ideal for questions like "how does AIE-ML memory addressing work?" or "what is the BD lock field format?"
+### Authoritative Sources (in priority order)
 
-### AMD Documentation
-- **AM020**: AIE-ML (AIE2) Architecture Manual
-- **AM025**: AIE-ML Register Reference
-- Links: https://docs.amd.com/
-- Path: xdna-emu/docs/xdna/ (use the files in the folders, not the PDFs)
+#### 1. aie-rt -- Hardware Abstraction Layer
+
+**The same library that programs real silicon.** Vendored inside mlir-aie.
+
+| What it provides | Key files |
+|-----------------|-----------|
+| Register offsets and bit fields (exhaustive) | `global/xaiemlgbl_params.h` |
+| DMA BD programming sequences | `dma/xaie_dma_aieml.h` |
+| Lock acquire/release/set/get operations | `locks/xaie_locks_aieml.h` |
+| Stream switch circuit/packet configuration | `stream_switch/xaie_ss.h` |
+| DMA polling and completion detection | `dma/xaie_dma_aieml.c` |
+| Data structures for all hardware objects | `global/xaiegbl.h` |
+
+**Path**: `../mlir-aie/third_party/aie-rt/driver/src/`
+
+When implementing DMA, lock, or stream switch behavior, the aie-rt function
+that does the same thing on real hardware is the reference implementation.
+Example: `_XAieMl_DmaWaitForDone()` is exactly how the host polls for DMA
+completion -- our `syncs_satisfied()` should match its logic.
+
+#### 2. AM025 Register Database (JSON)
+
+Machine-readable register specification extracted from AMD's register
+reference manual. Already parsed by our `regdb.rs` at startup.
+
+| What it provides | Coverage |
+|-----------------|----------|
+| 1,806 register definitions | Names, offsets, widths, reset values |
+| 6,412 bit field definitions | Exact positions and widths within registers |
+| Per-module organization | Core, memory, DMA, locks, stream switch |
+
+**Path**: `../mlir-aie/lib/Dialect/AIE/Util/aie_registers_aie2.json`
+
+BD field parsing is already fully data-driven from this source (zero hardcoded
+bit positions in `bd.rs`). Extend this pattern to other register interactions.
+
+#### 3. llvm-aie TableGen -- ISA Specification
+
+Complete instruction set definition for the Peano compiler backend.
+
+| What it provides | Coverage |
+|-----------------|----------|
+| Instruction encodings and formats | ~600+ definitions, all VLIW slots |
+| Register file structure | Scalar, vector, accumulator, pointer classes |
+| Semantic operation mappings | ~48 SemanticOp types (Add, Mul, Br, etc.) |
+| Scheduling model / latencies | 278+ itinerary classes with cycle counts |
+| Intrinsic signatures | 317 AIE2-specific intrinsics with types |
+| Split field layouts | Non-contiguous operand bit positions |
+
+**Path**: `../llvm-aie/llvm/lib/Target/AIE/`
+
+Instruction decoding is already fully TableGen-driven. Instruction semantics
+are ~33% data-driven (via SemanticOp), with the rest in legacy fallback
+handlers. The goal is to close that gap.
+
+#### 4. mlir-aie Device Model -- Array Topology
+
+Architecture-level parameters extracted from `AIETargetModel`.
+
+| What it provides | Coverage |
+|-----------------|----------|
+| Array dimensions (cols, rows) | Per-device variant |
+| Tile type classification | Shim, memtile, compute |
+| Memory sizes, lock counts, BD counts | Per tile type |
+| DMA channel counts | Including shim mux ports |
+| Stream switch port counts per bundle | Switchbox and shim mux |
+
+**Path**: `xdna-emu/tools/aie-device-models.json` (pre-extracted)
+**Generator**: `xdna-emu/tools/aie-device-dump.py` (queries mlir-aie Python API)
+
+Architecture configuration is already fully data-driven from this source.
+
+### What Still Requires Non-Open-Source References
+
+The open-source toolchain does not fully specify these areas. Use aietools
+as a reading reference (see Licensing section above) and AM020/AM025
+documentation. Read to understand the hardware, then write original code.
+
+- **Vector operation computational semantics**: Intrinsics give function
+  signatures (argument/return types, configuration word) but not what the
+  operation computes. How does VMAC's configuration word affect rounding,
+  saturation, and accumulator behavior? The aietools Python models at
+  `aietools/data/aie_ml/lib/python_model/model/` describe these semantics
+  (mulmac.py, srs_ups.py, permute.py, constants.py). Read them to understand
+  the hardware behavior, then implement independently.
+- **Stream switch per-port type assignments**: mlir-aie gives port counts per
+  bundle, not which index maps to which bundle type. Currently hardcoded from
+  AM025 in `aie2_spec.rs`.
+- **Micro-timing details**: DMA pipeline depth, NoC latency, memory bank
+  conflict resolution. These affect cycle-accuracy but not functional
+  correctness.
+
+**Documentation path**: `xdna-emu/docs/xdna/` (extracted text files, not PDFs)
+
+**aietools reference paths** (read-only, never copy):
+- Vector semantics: `aietools/data/aie_ml/lib/python_model/model/`
+- Register IDs: `aietools/data/aie_ml/lib/isg/me_regid.txt` (Synopsys copyright)
+- AIE API headers: `aietools/include/aie_api/` (MIT licensed)
+- Event types: `aietools/data/eventanalyze/event_type_table.txt`
+
+### Research Guidance
+
+**Use Explore agents for documentation and toolchain research.** These sources
+are extensive. Rather than reading files directly and burning context, spawn an
+Explore agent to navigate them. Good queries:
+
+- "How does aie-rt implement DMA channel start?" (check aie-rt)
+- "What are the BD field positions for shim tiles?" (check regdb JSON)
+- "What does the VMAC configuration word control?" (check AM020)
+- "How many stream switch ports does a memtile have?" (check device model)
 
 ### Binary Formats
 - **XCLBIN**: Container (ELF cores + PDI/CDO configuration)
 - **ELF**: Per-core executables
 - **CDO**: Configuration Data Objects (DMA descriptors, routing)
-
-### ISA Reference
-- **llvm-aie (Peano)**: `llvm/lib/Target/AIE/` has TableGen instruction definitions
-- Repository: https://github.com/Xilinx/llvm-aie
-- Local clone: `../llvm-aie`
 
 ## What We're Emulating
 
@@ -191,11 +329,12 @@ Top-level source files not covered by component docs:
 
 ## Related Resources
 
-- **xdna-driver**: `/home/triple/npu-work/xdna-driver` - Linux kernel driver, authoritative device definitions
-- **mlir-aie**: `/home/triple/npu-work/mlir-aie` - test binaries, device models
-- **llvm-aie**: `../llvm-aie` (local clone) - ISA definitions, TableGen files
+- **aie-rt**: `../mlir-aie/third_party/aie-rt/driver/src/` - Hardware abstraction layer (vendored in mlir-aie). The reference implementation for DMA, locks, and stream switch programming.
+- **mlir-aie**: `../mlir-aie` - MLIR-based AIE compiler, test binaries, device models, AM025 register database JSON
+- **llvm-aie**: `../llvm-aie` (local clone) - Peano compiler, ISA definitions via TableGen
+- **aietools**: `../aietools` - AMD proprietary tools (Chess compiler, aiesimulator, analysis tools). Read-only reference for hardware semantics not covered by open-source toolchain. See Licensing section.
+- **xdna-driver**: `/home/triple/npu-work/xdna-driver` - Linux kernel driver, device definitions
 - **XRT**: https://github.com/Xilinx/XRT - runtime (installed at /opt/xilinx/xrt)
-- **aie-rt**: https://github.com/Xilinx/aie-rt - low-level register definitions
 
 ## Available Development Tools
 
@@ -210,6 +349,17 @@ Top-level source files not covered by component docs:
   - `llvm-objdump -d file.elf` - disassemble to see instruction mnemonics
 - **aie-translate**: MLIR to various formats
 - **aie-opt**: MLIR optimization passes
+
+### aietools (AMD proprietary, read-only reference)
+- **aiesimulator**: Cycle-accurate AIE simulator (debugging aid, not oracle)
+  - `aiesimulator --pkg-dir=<dir>` - run simulation
+  - Variants: `aie2simmsm` (cycle-accurate), `aie2simmsm_func` (functional)
+- **elfanalyzer**: Static analysis of AIE ELF binaries (code layout, memory map)
+- **hwanalyze**: Hardware trace analysis from real NPU event traces
+- **eventanalyze**: VCD/trace event analysis (95+ event types)
+- **xchesscc**: Chess compiler (via `xchesscc_wrapper` for architecture selection)
+- Note: aietools LD_LIBRARY_PATH must be appended (not prepended) to avoid
+  shadowing system libstdc++ -- see activate-npu-env.sh
 
 ### RyzenAI-SW Tools
 - Located in `/home/triple/npu-work/RyzenAI-SW/`
@@ -251,3 +401,42 @@ parallelism to avoid overwhelming the system during other work.
 2. Check the relevant [phase documentation](docs/roadmap/) for current details
 3. Run `cargo test --lib` to verify everything works
 4. Read the component doc (`.claude/components/`) for the module you are working on
+
+## Session Continuity
+
+Use `/resume-skill` at the start of a session and `/checkpoint` before ending
+one. These skills manage `.claude/session-state.md` to preserve context across
+sessions.
+
+When resuming, always verify context with the user before diving into
+exploration or code changes -- stale session state from days ago is worse
+than no session state at all.
+
+## Debugging Guidelines
+
+**Match real hardware behavior.** When debugging emulator issues, the goal is
+always to reproduce what the silicon does, not to invent workarounds or
+simplified approximations. If aie-rt does something a particular way, we do
+it that way too.
+
+When investigating a failing test:
+1. Start from the failing assertion and work backward through the data path.
+2. Do not jump to hypotheses about unrelated subsystems (e.g., do not
+   investigate stream routing if the data is wrong at source memory level).
+3. If unsure about hardware semantics, ask rather than guess.
+
+**Correctness before performance.** Do not optimize (including multithreading)
+until emulator behavior is indistinguishable from real hardware. Making wrong
+answers faster helps nobody, and threading introduces its own bugs that muddy
+correctness work.
+
+## Validation
+
+Always run `cargo test --lib` after making changes. Do not consider work
+complete until tests pass. If tests were passing before your changes and are
+now failing, that is a regression to fix before moving on.
+
+**Planned: differential fuzzing.** The long-term validation strategy is a
+logic fuzzer that generates valid kernels, runs them on both the emulator and
+real NPU hardware, and compares results. This is future work -- do not start
+building it until hand-written test coverage confirms baseline correctness.

@@ -1,0 +1,46 @@
+# Test runner configuration for run_mlir_aie_tests.
+#
+# This file controls default behavior for the test runner example.
+# CLI flags override these settings (e.g., --chess enables chess even
+# if chess.build is false here). To disable something that a CLI flag
+# would enable, set the config value and do NOT pass the flag.
+#
+# Missing sections or keys use built-in defaults (shown in comments).
+
+[execution]
+# Maximum emulator cycles before TDR-based timeout.
+# Default: 1_000_000. Set to 0 to rely on TDR detection only.
+max_cycles = 1_000_000
+
+[build]
+# Nice level for compilation subprocesses (0-19, higher = lower priority).
+# Keeps heavy compilations from starving interactive work.
+# Default: 19
+nice_level = 19
+
+[chess]
+# Build tests with the Chess compiler during the batch build phase.
+# Controlled by --chess CLI flag; this sets the default when the flag
+# is not specified.
+# Default: false
+build = false
+
+# Run Chess-compiled binaries through the emulator.
+# Currently disabled: all Chess binaries timeout in the emulator due
+# to unimplemented instruction patterns in Chess-compiled code.
+# When false, --chess still builds and runs on hardware (if --hw),
+# but skips the emulator step entirely.
+# Default: false
+run_emulator = false
+
+# Run Chess-compiled binaries on real NPU hardware.
+# Only effective when --hw is also specified on the command line.
+# Default: true
+run_hardware = true
+
+[aiesim]
+# Run aiesimulator on Chess-built .prj directories.
+# Currently blocked: ps.so symbol mismatch prevents aiesimulator from
+# loading the host shim. Enable when the build issue is resolved.
+# Default: false
+enabled = false

@@ -12,9 +12,8 @@
 //! - (Optional) NPU outputs captured: cargo run --example capture_npu_outputs
 
 use std::path::PathBuf;
-use std::collections::HashMap;
 
-use xdna_emu::testing::manifest_runner::{TestManifest, ElementType, read_values};
+use xdna_emu::testing::manifest_runner::TestManifest;
 use xdna_emu::testing::xclbin_suite::{XclbinSuite, XclbinTest};
 use xdna_emu::testing::hardware_comparison::{self, CrossValidation};
 
@@ -84,7 +83,7 @@ fn main() {
         let (outcome, emu_output) = suite.run_single_with_output(&test);
 
         // Generate input values for comparison
-        let input_values = generate_input_values(manifest);
+        let input_values = hardware_comparison::generate_input_values(manifest);
 
         // Load hardware output if available
         let hw_output = if has_hw_outputs {
@@ -135,24 +134,6 @@ fn main() {
     // Print the full report
     println!();
     print!("{}", hardware_comparison::format_report(&cross_results));
-}
-
-/// Generate input values from a manifest for comparison.
-fn generate_input_values(manifest: &TestManifest) -> HashMap<String, Vec<i64>> {
-    let mut inputs = HashMap::new();
-
-    for (buf_name, buf_def) in &manifest.buffers {
-        if buf_name == "output" {
-            continue;
-        }
-        if let Some(elem_type) = ElementType::from_str(&buf_def.element_type) {
-            if let Some(data) = manifest.generate_input(buf_name) {
-                inputs.insert(buf_name.clone(), read_values(&data, elem_type));
-            }
-        }
-    }
-
-    inputs
 }
 
 /// Discover all TOML manifest files in a directory.
