@@ -1,0 +1,38 @@
+[test]
+name = "adjacent_memtile_access/three_memtiles"
+source_dir = "test/npu-xrt/adjacent_memtile_access/three_memtiles"
+description = "Three-memtile data path adding two inputs"
+skip = true
+skip_reason = "Targets npu2_1col (AIE2P/Strix), not supported on our NPU1 hardware"
+
+[build]
+mlir_file = "aie2.py"
+device = "npu2_1col"
+
+[buffers.input_a]
+size = 256
+element_type = "i32"
+group_id = 3
+
+[buffers.input_a.pattern]
+type = "constant"
+value = 1
+
+[buffers.input_b]
+size = 256
+element_type = "i32"
+group_id = 4
+
+[buffers.input_b.pattern]
+type = "sequential"
+start = 0
+step = 1
+
+[buffers.output]
+size = 256
+element_type = "i32"
+group_id = 5
+
+[expected]
+type = "transform"
+transform = "input_a + input_b"

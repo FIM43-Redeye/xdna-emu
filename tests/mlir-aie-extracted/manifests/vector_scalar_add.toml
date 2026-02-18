@@ -1,0 +1,30 @@
+# Auto-generated test manifest
+# Source: programming_examples/basic/vector_scalar_add
+
+[test]
+name = "vector_scalar_add"
+source_dir = "programming_examples/basic/vector_scalar_add"
+description = "Auto-extracted from vector_scalar_add"
+
+[build]
+mlir_file = "aie.mlir"
+device = "npu1_1col"
+
+[buffers.input_a]
+size = 1024
+element_type = "i32"
+group_id = 3
+
+[buffers.input_a.pattern]
+type = "sequential"
+start = 1
+step = 1
+
+[buffers.output]
+size = 1024
+element_type = "i32"
+group_id = 5
+
+[expected]
+type = "transform"
+transform = "input_a + 1"

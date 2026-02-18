@@ -1,0 +1,34 @@
+# Test manifest for vector_scalar_using_dma
+# Source: test/npu-xrt/vector_scalar_using_dma
+# Kernel multiplies each element by scalar 3
+
+[test]
+name = "vector_scalar_using_dma"
+source_dir = "test/npu-xrt/vector_scalar_using_dma"
+description = "Scalar multiplication of vector elements by 3 using DMA"
+
+[build]
+mlir_file = "aie.mlir"
+device = "npu1_1col"
+compiler = "chess"
+
+[buffers.input_a]
+size = 4096
+element_type = "i32"
+group_id = 3
+
+[buffers.input_a.pattern]
+type = "sequential"
+start = 1
+step = 1
+
+# inB (group_id 4) is used internally, not host-initialized
+
+[buffers.output]
+size = 4096
+element_type = "i32"
+group_id = 5
+
+[expected]
+type = "transform"
+transform = "input_a * 3"

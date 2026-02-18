@@ -1,0 +1,32 @@
+# Test manifest for dynamic_object_fifo/ping_pong
+# Source: test/npu-xrt/dynamic_object_fifo/ping_pong
+# Passthrough kernel using ping-pong object FIFOs
+
+[test]
+name = "dynamic_object_fifo/ping_pong"
+source_dir = "test/npu-xrt/dynamic_object_fifo/ping_pong"
+description = "Passthrough via ping-pong object FIFOs"
+
+[build]
+mlir_file = "aie2.py"
+device = "npu1_1col"
+compiler = "chess"
+
+[buffers.input_a]
+size = 1024
+element_type = "i32"
+group_id = 3
+
+[buffers.input_a.pattern]
+type = "sequential"
+start = 0
+step = 1
+
+[buffers.output]
+size = 1024
+element_type = "i32"
+group_id = 4
+
+[expected]
+type = "transform"
+transform = "input_a + 0"

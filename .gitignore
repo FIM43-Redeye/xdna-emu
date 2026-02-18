@@ -17,7 +17,9 @@ tools/npu-runner/build/
 tests/npu-outputs/
 
 # Generated/extracted test files (regenerate from mlir-aie)
-tests/mlir-aie-extracted/
+# Ignore contents but track hand-written manifests
+tests/mlir-aie-extracted/*
+!tests/mlir-aie-extracted/manifests/
 
 # Temporary/scratch files
 *.patch

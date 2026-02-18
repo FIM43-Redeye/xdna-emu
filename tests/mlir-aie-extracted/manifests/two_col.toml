@@ -1,0 +1,44 @@
+# Test manifest for two_col
+# Source: test/npu-xrt/two_col
+# Threshold: output[i] = (input[i] <= 50) ? 0 : 255 across 4 cores
+
+[test]
+name = "two_col"
+source_dir = "test/npu-xrt/two_col"
+description = "Two-column 4-core threshold operation on u8 data"
+
+[build]
+mlir_file = "aie.mlir"
+device = "npu1_2col"
+compiler = "chess"
+
+[buffers.input_a]
+size = 2048
+element_type = "u8"
+group_id = 3
+
+# Random input in test.py -- use sequential for reproducibility
+[buffers.input_a.pattern]
+type = "sequential"
+start = 0
+step = 1
+
+# Debug buffer (unused for validation)
+[buffers.input_b]
+size = 2048
+element_type = "u8"
+group_id = 4
+
+[buffers.input_b.pattern]
+type = "zeros"
+
+[buffers.output]
+size = 2048
+element_type = "u8"
+group_id = 5
+
+# With sequential input 0..2047 and threshold 50:
+# Random input in test.py makes exact values unpredictable;
+# use reference for HW-captured validation
+[expected]
+type = "reference"

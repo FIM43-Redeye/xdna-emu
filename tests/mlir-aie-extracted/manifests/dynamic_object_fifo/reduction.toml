@@ -1,0 +1,50 @@
+# Test manifest for dynamic_object_fifo/reduction
+# Source: test/npu-xrt/dynamic_object_fifo/reduction
+# Pairwise sum: output[i] = input[2i] + input[2i+1] (row-wise)
+
+[test]
+name = "dynamic_object_fifo/reduction"
+source_dir = "test/npu-xrt/dynamic_object_fifo/reduction"
+description = "Pairwise row reduction via addition"
+
+[build]
+mlir_file = "aie2.py"
+device = "npu1_1col"
+compiler = "chess"
+
+[buffers.input_a]
+size = 100
+element_type = "i32"
+group_id = 3
+
+# Input: 10 rows of 10, row i has all elements = i
+[buffers.input_a.pattern]
+type = "values"
+values = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+    9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+]
+
+[buffers.output]
+size = 50
+element_type = "i32"
+group_id = 4
+
+# Pairwise: row0+row1=1, row2+row3=5, row4+row5=9, row6+row7=13, row8+row9=17
+[expected]
+type = "values"
+values = [
+    1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
+    5,  5,  5,  5,  5,  5,  5,  5,  5,  5,
+    9,  9,  9,  9,  9,  9,  9,  9,  9,  9,
+    13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
+    17, 17, 17, 17, 17, 17, 17, 17, 17, 17,
+]

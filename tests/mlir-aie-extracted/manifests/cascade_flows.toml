@@ -1,0 +1,32 @@
+# Auto-generated test manifest
+# Source: test/npu-xrt/cascade_flows
+
+[test]
+name = "cascade_flows"
+source_dir = "test/npu-xrt/cascade_flows"
+description = "Auto-extracted from cascade_flows"
+skip = true
+skip_reason = "Requires xchesscc compiler"
+
+[build]
+mlir_file = "aie.mlir"
+device = "npu1_1col"
+
+[buffers.input_a]
+size = 64
+element_type = "i32"
+group_id = 3
+
+[buffers.input_a.pattern]
+type = "sequential"
+start = 1
+step = 1
+
+[buffers.output]
+size = 64
+element_type = "i32"
+group_id = 5
+
+[expected]
+type = "transform"
+transform = "0"

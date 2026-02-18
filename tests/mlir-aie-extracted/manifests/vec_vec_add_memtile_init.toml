@@ -1,0 +1,41 @@
+# Test manifest for vec_vec_add_memtile_init
+# Source: test/npu-xrt/vec_vec_add_memtile_init
+# Same kernel as static_L1_init but routes through mem tile
+
+[test]
+name = "vec_vec_add_memtile_init"
+source_dir = "test/npu-xrt/vec_vec_add_memtile_init"
+description = "Vector-vector addition routed through mem tile initialization"
+
+[build]
+mlir_file = "aie.mlir"
+device = "npu1_1col"
+
+[buffers.input_a]
+size = 256
+element_type = "i32"
+group_id = 3
+
+[buffers.input_a.pattern]
+type = "sequential"
+start = 1
+step = 1
+
+[buffers.input_b]
+size = 256
+element_type = "i32"
+group_id = 4
+
+[buffers.input_b.pattern]
+type = "sequential"
+start = 0
+step = 1
+
+[buffers.output]
+size = 256
+element_type = "i32"
+group_id = 5
+
+[expected]
+type = "transform"
+transform = "input_a + input_b"

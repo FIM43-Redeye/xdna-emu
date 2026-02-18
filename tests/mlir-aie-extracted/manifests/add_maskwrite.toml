@@ -1,0 +1,29 @@
+[test]
+name = "add_maskwrite"
+source_dir = "test/npu-xrt/add_maskwrite"
+description = "Maskwrite operations with selective bit masking then add 1"
+expected_fail = true
+expected_fail_reason = "Maskwrite to data memory works but core has no DMA input, reads uninitialized memory"
+
+[build]
+mlir_file = "aie.mlir"
+device = "npu1_1col"
+
+# Output only: 8 i32 (no input buffer from host).
+# Core initializes memory to 0x37373737, applies two maskwrite32 ops
+# with different masks, then adds 1 to each result value.
+#
+# Element 0: ((0x37373737 & ~0xF0F0F0F0) | (0x12345678 & 0xF0F0F0F0)) + 1
+#           = (0x07070707 | 0x10305070) + 1 = 0x17375777 + 1 = 0x17375778
+# Element 1: ((0x37373737 & ~0x0F0F0F0F) | (0x9ABCDEF0 & 0x0F0F0F0F)) + 1
+#           = (0x30303030 | 0x0A0C0E00) + 1 = 0x3A3C3E30 + 1 = 0x3A3C3E31
+# Elements 2-7: 0x37373737 + 1 = 0x37373738
+
+[buffers.output]
+size = 8
+element_type = "i32"
+group_id = 3
+
+[expected]
+type = "values"
+values = [389502840, 977026609, 926365496, 926365496, 926365496, 926365496, 926365496, 926365496]

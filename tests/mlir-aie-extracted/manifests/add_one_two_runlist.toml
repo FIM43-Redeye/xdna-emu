@@ -1,0 +1,57 @@
+# Test manifest for add_one_two_runlist
+# Source: test/npu-xrt/add_one_two_runlist
+# Two chained kernels: ADDONE (+1) then ADDTWO (+2), net effect is +3
+#
+# Runlist execution: both runs submitted to xrt::runlist together.
+# ADDTWO's input BO is the same physical object as ADDONE's output BO.
+# Buffer layout: gid=3 (input), gid=4 (output).  Note: different from
+# add_one_two which uses gid=5 for output.
+
+[test]
+name = "add_one_two_runlist"
+source_dir = "test/npu-xrt/add_one_two_runlist"
+description = "Two chained add kernels (+1 then +2) via runlist execution"
+platform = "npu2"
+skip_reason = "Multi-kernel runlist execution; hangs on npu1 (Phoenix)"
+
+[build]
+mlir_file = "aie.mlir"
+device = "npu1_1col"
+
+[buffers.input_a]
+size = 64
+element_type = "i32"
+group_id = 3
+
+[buffers.input_a.pattern]
+type = "sequential"
+start = 1
+step = 1
+
+[buffers.output]
+size = 64
+element_type = "i32"
+group_id = 4
+
+[expected]
+type = "transform"
+transform = "input_a + 3"
+
+# Multi-kernel execution: two kernels run via xrt::runlist with shared buffers.
+# ADDONE output (gid=4) is shared as ADDTWO input (gid=3) -- same BO.
+[multi_kernel]
+mode = "runlist"
+
+[[multi_kernel.runs]]
+kernel = "ADDONE"
+insts = "insts.bin"
+
+[[multi_kernel.runs]]
+kernel = "ADDTWO"
+insts = "insts.bin"
+
+[[multi_kernel.links]]
+from_run = 0
+from_group_id = 4
+to_run = 1
+to_group_id = 3

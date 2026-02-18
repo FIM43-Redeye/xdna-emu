@@ -1,0 +1,43 @@
+# Test manifest for add_one_two_txn
+# Source: test/npu-xrt/add_one_two_txn
+# Transaction-based reconfiguration: two independent compute phases.
+#
+# Phase 1 (ADDONE): adds 1 to input -> output0
+# Config: reconfigures the tile with add_two_cfg.bin
+# Phase 2 (ADDTWO): adds 102 to separate input -> output1
+#
+# This test has two independent outputs and requires transaction binary
+# support (config binary between kernel runs), which is beyond our
+# current multi-kernel infrastructure.
+
+[test]
+name = "add_one_two_txn"
+source_dir = "test/npu-xrt/add_one_two_txn"
+description = "Two independent transactions: kernel1 adds 1 (out0), kernel2 adds 102 (out1)"
+platform = "npu2"
+skip_reason = "Transaction-based tile reconfiguration; not supported on npu1 (Phoenix)"
+
+[build]
+mlir_file = "aie.mlir"
+device = "npu1_1col"
+
+[buffers.input_a]
+size = 64
+element_type = "i32"
+group_id = 3
+
+[buffers.input_a.pattern]
+type = "sequential"
+start = 1
+step = 1
+
+[buffers.output]
+size = 64
+element_type = "i32"
+group_id = 4
+
+[expected]
+type = "reference"
+# Expected output from NPU capture (when available).
+# Phase 1 output: input[i] + 1 = i+2
+# (Only phase 1 output is captured; phase 2 output is independent)

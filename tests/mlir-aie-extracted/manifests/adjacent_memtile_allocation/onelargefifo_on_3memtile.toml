@@ -1,0 +1,31 @@
+# Test manifest for adjacent_memtile_allocation/onelargefifo_on_3memtile
+# Source: test/npu-xrt/adjacent_memtile_allocation/onelargefifo_on_3memtile
+# Large FIFO across 3 memtiles, kernel adds 1 to constant-1 input
+
+[test]
+name = "adjacent_memtile_allocation/onelargefifo_on_3memtile"
+source_dir = "test/npu-xrt/adjacent_memtile_allocation/onelargefifo_on_3memtile"
+description = "Large object FIFO spanning 3 memtiles with add-1 kernel"
+
+[build]
+mlir_file = "ext_to_core_L2_placed.py"
+device = "npu1_1col"
+compiler = "chess"
+
+[buffers.input_a]
+size = 96000
+element_type = "i32"
+group_id = 3
+
+[buffers.input_a.pattern]
+type = "constant"
+value = 1
+
+[buffers.output]
+size = 8
+element_type = "i32"
+group_id = 4
+
+[expected]
+type = "transform"
+transform = "2"

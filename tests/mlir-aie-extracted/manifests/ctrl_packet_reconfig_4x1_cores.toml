@@ -1,0 +1,33 @@
+# Test manifest for ctrl_packet_reconfig_4x1_cores
+# Source: test/npu-xrt/ctrl_packet_reconfig_4x1_cores
+# 4 cores each add (12 + core_id) to their chunk of input
+# Input: modulo pattern (i%128)+1, 4096 elements per core
+
+[test]
+name = "ctrl_packet_reconfig_4x1_cores"
+source_dir = "test/npu-xrt/ctrl_packet_reconfig_4x1_cores"
+description = "4-core control packet reconfig (4x1 layout) with per-core add offsets"
+
+[build]
+mlir_file = "aie.mlir"
+device = "npu1_1col"
+compiler = "chess"
+
+[buffers.input_a]
+size = 16384
+element_type = "i8"
+group_id = 3
+
+[buffers.input_a.pattern]
+type = "sequential"
+start = 1
+step = 1
+
+[buffers.output]
+size = 16384
+element_type = "i8"
+group_id = 4
+
+# Per-core offset makes this hard to express as a single transform
+[expected]
+type = "reference"

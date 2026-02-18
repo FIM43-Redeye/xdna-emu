@@ -1,0 +1,32 @@
+# Test manifest for ctrl_packet_reconfig
+# Source: test/npu-xrt/ctrl_packet_reconfig
+# Kernel adds 12 to each i8 element via control packet reconfiguration
+
+[test]
+name = "ctrl_packet_reconfig"
+source_dir = "test/npu-xrt/ctrl_packet_reconfig"
+description = "Control packet reconfiguration with add-12 kernel"
+
+[build]
+mlir_file = "aie.mlir"
+device = "npu1_1col"
+compiler = "chess"
+
+[buffers.input_a]
+size = 4096
+element_type = "i8"
+group_id = 3
+
+[buffers.input_a.pattern]
+type = "sequential"
+start = 1
+step = 1
+
+[buffers.output]
+size = 4096
+element_type = "i8"
+group_id = 4
+
+[expected]
+type = "transform"
+transform = "input_a + 12"

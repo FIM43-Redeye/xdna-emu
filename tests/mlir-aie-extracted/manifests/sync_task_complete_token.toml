@@ -1,0 +1,33 @@
+[test]
+name = "sync_task_complete_token"
+source_dir = "test/npu-xrt/sync_task_complete_token"
+description = "Sync token completion with reduction over 16-element blocks"
+expected_fail = true
+expected_fail_reason = "Emulator does not yet support reduction kernels"
+
+[build]
+mlir_file = "aie2.py"
+device = "npu1_1col"
+
+# Input: 256 i32 (sequential 0..255)
+# Output: 16 i32 where output[i] = sum(input[i*16 : (i+1)*16])
+
+[buffers.input_a]
+size = 256
+element_type = "i32"
+group_id = 3
+
+[buffers.input_a.pattern]
+type = "sequential"
+start = 0
+step = 1
+
+[buffers.output]
+size = 16
+element_type = "i32"
+group_id = 4
+
+[expected]
+type = "reference"
+# Expected output loaded from tests/npu-outputs/sync_task_complete_token/output.bin
+# Reduction: output[i] = sum(input[i*16 : (i+1)*16])

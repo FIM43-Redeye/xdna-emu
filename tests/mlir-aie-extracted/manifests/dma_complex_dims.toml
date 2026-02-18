@@ -1,0 +1,33 @@
+[test]
+name = "dma_complex_dims"
+source_dir = "test/npu-xrt/dma_complex_dims"
+description = "N-dimensional DMA reshape with multi-level tiling access patterns"
+expected_fail = true
+expected_fail_reason = "Complex n-dimensional DMA tiling transform not expressible as simple arithmetic"
+
+[build]
+mlir_file = "aie2.py"
+device = "npu1_1col"
+
+# m=32, k=64, K=256 -> 8192 i32 per buffer
+# Complex 2D tiling: linear -> (r*s) subtiled within (m*k) blocks
+
+[buffers.input_a]
+size = 8192
+element_type = "i32"
+group_id = 3
+
+[buffers.input_a.pattern]
+type = "sequential"
+start = 0
+step = 1
+
+[buffers.output]
+size = 8192
+element_type = "i32"
+group_id = 5
+
+[expected]
+type = "reference"
+# Expected output loaded from tests/npu-outputs/dma_complex_dims/output.bin
+# Complex n-dimensional DMA tiling permutation

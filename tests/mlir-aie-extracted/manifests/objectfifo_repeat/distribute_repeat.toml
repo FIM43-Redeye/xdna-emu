@@ -1,0 +1,33 @@
+[test]
+name = "objectfifo_repeat/distribute_repeat"
+source_dir = "test/npu-xrt/objectfifo_repeat/distribute_repeat"
+description = "ObjectFifo repeat: input distributed across 2 tiles, each adds a different constant"
+expected_fail = true
+expected_fail_reason = "Split-add-merge across 2 compute tiles, not expressible as simple transform"
+
+[build]
+mlir_file = "aie2.py"
+device = "npu1_1col"
+
+# Input: 36 i32 (sequential 1..36)
+# Split into halves, tile2 adds 1, tile3 adds 2, then merged back
+# Output: 36 i32 with interleaved results
+
+[buffers.input_a]
+size = 36
+element_type = "i32"
+group_id = 3
+
+[buffers.input_a.pattern]
+type = "sequential"
+start = 1
+step = 1
+
+[buffers.output]
+size = 36
+element_type = "i32"
+group_id = 5
+
+[expected]
+type = "transform"
+transform = "input_a + 1"

@@ -1,0 +1,31 @@
+[test]
+name = "memtile_dmas/dma_configure_task_token"
+source_dir = "test/npu-xrt/memtile_dmas/dma_configure_task_token"
+description = "Complex memtile DMA with quarter-rearrangement using token synchronization"
+expected_fail = true
+expected_fail_reason = "Complex multi-BD rearrangement not expressible as simple transform"
+
+[build]
+mlir_file = "aie.mlir"
+device = "npu1_1col"
+
+# Same rearrangement as dma_configure_task_lock but with token-based sync.
+
+[buffers.input_a]
+size = 4096
+element_type = "i32"
+group_id = 3
+
+[buffers.input_a.pattern]
+type = "sequential"
+start = 1
+step = 1
+
+[buffers.output]
+size = 4096
+element_type = "i32"
+group_id = 4
+
+[expected]
+type = "transform"
+transform = "input_a + 0"
