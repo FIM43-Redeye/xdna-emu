@@ -33,6 +33,8 @@
 //! export_perfetto(events, &mut file)?;
 //! ```
 
+pub mod vcd;
+
 use crate::interpreter::engine::TileTracedEvent;
 use crate::interpreter::state::EventType;
 use std::collections::BTreeMap;
@@ -100,8 +102,8 @@ fn event_name(event: &EventType) -> &'static str {
         EventType::DmaStreamStarvation { .. } => "DMA_STREAM_STARVATION",
         EventType::LockAcquire { .. } => "LOCK_ACQ",
         EventType::LockRelease { .. } => "LOCK_REL",
-        EventType::CoreActive => "ACTIVE_CORE",
-        EventType::CoreDisabled => "DISABLED_CORE",
+        EventType::CoreActive => "ACTIVE",
+        EventType::CoreDisabled => "DISABLED",
         EventType::BranchTaken { .. } => "BRANCH_TAKEN",
     }
 }
@@ -190,7 +192,7 @@ pub fn export_perfetto(
         first = false;
         write!(
             output,
-            r#"{{"name":"process_name","ph":"M","pid":{},"args":{{"name":"{}_trace for tile({},{})"}}}}"#,
+            r#"{{"name":"process_name","ph":"M","pid":{},"args":{{"name":"{}_trace for tile{},{}"}}}}"#,
             pid, trace_type_name, key.row, key.col
         )?;
     }
@@ -261,7 +263,7 @@ mod tests {
         assert_eq!(event_name(&EventType::InstrVector { pc: 0 }), "INSTR_VECTOR");
         assert_eq!(event_name(&EventType::InstrLoad { pc: 0 }), "INSTR_LOAD");
         assert_eq!(event_name(&EventType::DmaStartTask { channel: 0 }), "DMA_START_TASK");
-        assert_eq!(event_name(&EventType::CoreDisabled), "DISABLED_CORE");
+        assert_eq!(event_name(&EventType::CoreDisabled), "DISABLED");
         assert_eq!(event_name(&EventType::LockAcquire { lock_id: 0 }), "LOCK_ACQ");
     }
 
@@ -302,12 +304,12 @@ mod tests {
 
         // Should contain metadata
         assert!(json.contains("process_name"));
-        assert!(json.contains("core_trace for tile(2,0)"));
+        assert!(json.contains("core_trace for tile2,0"));
 
         // Should contain event names
         assert!(json.contains("INSTR_LOAD"));
         assert!(json.contains("INSTR_VECTOR"));
-        assert!(json.contains("DISABLED_CORE"));
+        assert!(json.contains("DISABLED"));
 
         // Should contain Begin and End phases
         assert!(json.contains(r#""ph":"B""#));
