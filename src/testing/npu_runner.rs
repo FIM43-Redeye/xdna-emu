@@ -235,14 +235,18 @@ fn run_single_kernel(
             format!("Unknown output element type: {}", output_buf.element_type),
         ))?;
 
-    let output_size = output_buf.size * output_elem_type.byte_size();
+    // Allocate output buffer with optional trace padding. Tests that enable
+    // hardware tracing set trace_size so the NPU can write trace packets
+    // after the output data.
+    let output_data_size = output_buf.size * output_elem_type.byte_size();
+    let output_alloc_size = output_data_size + output_buf.trace_size;
     let output_file = tmp_dir.join("output.bin");
 
     args.extend_from_slice(&[
         "--out".to_string(),
         output_buf.group_id.to_string(),
         output_file.to_string_lossy().to_string(),
-        output_size.to_string(),
+        output_alloc_size.to_string(),
     ]);
 
     log::info!("Running on NPU (single-kernel): {} {}", runner.display(),
@@ -311,7 +315,8 @@ fn run_multi_kernel(
         .ok_or_else(|| NpuRunError::InputGeneration(
             format!("Unknown output element type: {}", output_buf.element_type),
         ))?;
-    let output_size = output_buf.size * output_elem_type.byte_size();
+    let output_data_size = output_buf.size * output_elem_type.byte_size();
+    let output_size = output_data_size + output_buf.trace_size;
     let output_file = tmp_dir.join("output.bin");
 
     // Build the linkage lookup: (to_run, to_gid) -> (from_run, from_gid)

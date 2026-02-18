@@ -44,3 +44,17 @@ run_hardware = true
 # loading the host shim. Enable when the build issue is resolved.
 # Default: false
 enabled = false
+
+[unit_tests]
+# Run mlir-aie chess_compiler_tests_aie2 unit tests.
+# These are self-contained tests with tile memory writes and lock sync
+# (no DDR/shim DMA). Requires aietools (xchesscc + aiesimulator) and
+# mlir-aie's test_lib target. Enable via --unit-tests CLI flag.
+# Default: false
+enabled = false
+# Run discovered unit tests through aiesimulator.
+# Default: true (when unit_tests.enabled is true)
+aiesim = true
+# Maximum simulation cycles for unit test aiesimulator runs.
+# Default: 1_000_000
+aiesim_timeout = 1_000_000

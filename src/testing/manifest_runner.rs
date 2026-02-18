@@ -164,6 +164,11 @@ pub struct BufferDef {
     pub group_id: u32,
     #[serde(default)]
     pub pattern: Option<PatternDef>,
+    /// Extra bytes to allocate beyond `size * element_size` for trace data.
+    /// Tests that enable hardware tracing need this so the NPU can append
+    /// trace packets after the output data without overflowing the buffer.
+    #[serde(default)]
+    pub trace_size: usize,
 }
 
 /// Pattern for generating input data.

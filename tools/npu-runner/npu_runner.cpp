@@ -418,8 +418,13 @@ static int exec_sequential(
         }
 
         run.start();
-        auto timeout_ms = static_cast<unsigned int>(spec.timeout_sec * 1000);
-        auto state = run.wait(std::chrono::milliseconds(timeout_ms));
+        ert_cmd_state state;
+        if (spec.timeout_sec > 0) {
+            auto timeout_ms = static_cast<unsigned int>(spec.timeout_sec * 1000);
+            state = run.wait(std::chrono::milliseconds(timeout_ms));
+        } else {
+            state = run.wait();
+        }
 
         if (state == ERT_CMD_STATE_TIMEOUT) {
             std::cerr << "ERROR: run " << run_idx << " timed out\n";
@@ -578,8 +583,11 @@ static int exec_runlist(
               << " runs, timeout=" << spec.timeout_sec << "s)...\n";
 
     runlist.execute();
-    auto timeout_ms = static_cast<unsigned int>(spec.timeout_sec * 1000);
-    auto cv_state = runlist.wait(std::chrono::milliseconds(timeout_ms));
+    // timeout_sec=0 means wait forever (TDR handles hardware hangs).
+    auto wait_duration = (spec.timeout_sec > 0)
+        ? std::chrono::milliseconds(spec.timeout_sec * 1000)
+        : std::chrono::milliseconds(24 * 3600 * 1000);  // 24h fallback
+    auto cv_state = runlist.wait(wait_duration);
 
     if (cv_state == std::cv_status::timeout) {
         std::cerr << "ERROR: runlist timed out after "
@@ -732,11 +740,20 @@ static int exec_single(
             run.set_arg(lb.desc.group_id, lb.bo);
         }
 
-        std::cerr << "Running kernel (timeout=" << timeout_sec << "s)...\n";
+        if (timeout_sec > 0)
+            std::cerr << "Running kernel (timeout=" << timeout_sec << "s)...\n";
+        else
+            std::cerr << "Running kernel (no timeout, TDR handles hangs)...\n";
         run.start();
 
-        auto timeout_ms = static_cast<unsigned int>(timeout_sec * 1000);
-        auto state = run.wait(std::chrono::milliseconds(timeout_ms));
+        ert_cmd_state state;
+        if (timeout_sec > 0) {
+            auto timeout_ms = static_cast<unsigned int>(timeout_sec * 1000);
+            state = run.wait(std::chrono::milliseconds(timeout_ms));
+        } else {
+            // Wait forever -- hardware TDR handles actual hangs.
+            state = run.wait();
+        }
 
         if (state == ERT_CMD_STATE_TIMEOUT) {
             std::cerr << "ERROR: kernel execution timed out after "

@@ -24,6 +24,7 @@
 use std::path::{Path, PathBuf};
 
 use super::aietools::AieTools;
+use crate::trace::vcd;
 
 /// Result of an aiesimulator run.
 #[derive(Debug)]
@@ -36,6 +37,21 @@ pub struct SimResult {
     pub stdout: String,
     /// Captured stderr.
     pub stderr: String,
+}
+
+/// Result of a unit test simulation (self-contained ps.so test).
+#[derive(Debug)]
+pub struct UnitSimResult {
+    /// Whether stdout contained "PASS!" (the standard success marker).
+    pub passed: bool,
+    /// Captured stdout from the simulation.
+    pub stdout: String,
+    /// Captured stderr from the simulation.
+    pub stderr: String,
+    /// Exit code from aiesimulator.
+    pub exit_code: i32,
+    /// Wall clock time for the simulation in seconds.
+    pub wall_time_secs: f64,
 }
 
 /// Run aiesimulator on a .prj directory.
@@ -95,29 +111,8 @@ pub fn run_simulation(
             .map_err(|e| format!("Failed to write input file {}: {}", name, e))?;
     }
 
-    // ps.so (the sim host shim) links against libxaienginecdo.so from the
-    // mlir-aie install, but the aiesimulator bash wrapper manages its own
-    // LD_LIBRARY_PATH, clobbering what we set. The reliable fix: symlink
-    // the library into the ps/ directory so the dynamic linker finds it
-    // via the same directory as ps.so.
-    let ps_dir = sim_dir.join("ps");
-    if ps_dir.is_dir() {
-        let config = crate::config::Config::get();
-        let mlir_aie = PathBuf::from(config.mlir_aie_path());
-        let xaiengine_src_raw = mlir_aie.join("install/runtime_lib/x86_64/xaiengine/lib/libxaienginecdo.so");
-        // Canonicalize to absolute path -- mlir_aie_path() may be relative
-        let xaiengine_src = xaiengine_src_raw.canonicalize()
-            .unwrap_or(xaiengine_src_raw);
-        let xaiengine_link = ps_dir.join("libxaienginecdo.so");
-        if xaiengine_src.exists() && !xaiengine_link.exists() {
-            #[cfg(unix)]
-            {
-                if let Err(e) = std::os::unix::fs::symlink(&xaiengine_src, &xaiengine_link) {
-                    log::warn!("Failed to symlink libxaienginecdo.so: {}", e);
-                }
-            }
-        }
-    }
+    // Ensure libxaienginecdo.so is available alongside ps.so
+    ensure_xaiengine_symlink(&sim_dir);
 
     // aiesimulator is a complex bash wrapper that sources setupEnv.sh,
     // chess_env_LNa64.sh, and manages its own LD_LIBRARY_PATH/PATH.
@@ -127,19 +122,10 @@ pub fn run_simulation(
 
     // Build the shell command string with LD_LIBRARY_PATH prepended
     // (the wrapper script prepends its own dirs, so ours go in front).
-    let config = crate::config::Config::get();
-    let mlir_aie = PathBuf::from(config.mlir_aie_path());
-    let xaiengine_lib_raw = mlir_aie.join("install/runtime_lib/x86_64/xaiengine/lib");
-    let xaiengine_lib = xaiengine_lib_raw.canonicalize()
-        .unwrap_or(xaiengine_lib_raw);
-    let ld_prefix = if xaiengine_lib.is_dir() {
-        format!("LD_LIBRARY_PATH={}:$LD_LIBRARY_PATH ", xaiengine_lib.display())
-    } else {
-        String::new()
-    };
+    let ld_prefix = xaiengine_ld_prefix();
 
     let shell_cmd = format!(
-        "{}{} --pkg-dir={} --input-dir={} --output-dir={} --simulation-cycle-timeout={}",
+        "{}{} --pkg-dir={} --input-dir={} --output-dir={} --dump-vcd --simulation-cycle-timeout={}",
         ld_prefix,
         aiesim_path.display(),
         sim_dir.display(),
@@ -173,12 +159,209 @@ pub fn run_simulation(
         );
     }
 
+    // Auto-convert VCD traces to Perfetto JSON
+    convert_vcd_traces(work_dir);
+
     Ok(SimResult {
         output_dir,
         exit_code,
         stdout,
         stderr,
     })
+}
+
+/// Run aiesimulator on a unit test .prj directory.
+///
+/// Unit tests (from chess_compiler_tests_aie2) are self-contained: the
+/// compiled `ps.so` handles all buffer writes, lock management, result
+/// checking, and prints "PASS!" to stdout on success. No separate input
+/// or output directories are needed.
+///
+/// This function runs `aiesim.sh` from the .prj directory and checks
+/// stdout for the "PASS!" marker.
+///
+/// # Arguments
+///
+/// * `tools` - Discovered aietools installation
+/// * `prj_dir` - Path to the .prj directory (must contain `aiesim.sh`)
+/// * `timeout_cycles` - Maximum simulation cycles before timeout
+pub fn run_unit_simulation(
+    tools: &AieTools,
+    prj_dir: &Path,
+    timeout_cycles: u64,
+) -> Result<UnitSimResult, String> {
+    if tools.aiesimulator.is_none() {
+        return Err("aiesimulator not available in aietools".to_string());
+    }
+
+    // Unit tests use aiesim.sh which wraps aiesimulator with the right flags
+    let aiesim_sh = prj_dir.join("aiesim.sh");
+    if !aiesim_sh.exists() {
+        return Err(format!(
+            "No aiesim.sh in {} -- was the build run with --aiesim?",
+            prj_dir.display()
+        ));
+    }
+
+    // Ensure libxaienginecdo.so is available in the ps/ directory
+    ensure_xaiengine_symlink(&prj_dir.join("sim"));
+
+    // Build LD_LIBRARY_PATH prefix for the xaiengine library
+    let ld_prefix = xaiengine_ld_prefix();
+
+    // Run aiesim.sh with the timeout. The script internally calls
+    // aiesimulator with --pkg-dir pointing to sim/.
+    let shell_cmd = format!(
+        "{}bash {} --simulation-cycle-timeout={}",
+        ld_prefix,
+        aiesim_sh.display(),
+        timeout_cycles,
+    );
+
+    let work_dir = prj_dir.parent().unwrap_or(Path::new("."));
+
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg("-c");
+    cmd.arg(&shell_cmd);
+    cmd.current_dir(work_dir);
+
+    log::info!(
+        "Running unit sim: prj={}, timeout={}",
+        prj_dir.display(), timeout_cycles
+    );
+
+    let start = std::time::Instant::now();
+    let output = cmd.output()
+        .map_err(|e| format!("Failed to execute aiesim.sh: {}", e))?;
+    let wall_time_secs = start.elapsed().as_secs_f64();
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = output.status.code().unwrap_or(-1);
+    let passed = stdout.contains("PASS!");
+
+    if !output.status.success() && !passed {
+        log::warn!(
+            "Unit sim exited with code {}: {}",
+            exit_code,
+            stderr.lines().take(5).collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    // Auto-convert VCD traces to Perfetto JSON
+    convert_vcd_traces(work_dir);
+
+    Ok(UnitSimResult {
+        passed,
+        stdout,
+        stderr,
+        exit_code,
+        wall_time_secs,
+    })
+}
+
+/// Find VCD files in a directory and convert them to Perfetto JSON.
+///
+/// aiesimulator writes VCD files with `--dump-vcd`. This function finds
+/// all `.vcd` files in `dir`, converts each to a `.perfetto.json` file
+/// alongside it, and logs the results. Non-fatal: conversion errors are
+/// logged but do not fail the simulation.
+fn convert_vcd_traces(dir: &Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "vcd") {
+            let json_path = path.with_extension("perfetto.json");
+            match convert_single_vcd(&path, &json_path) {
+                Ok(result) => {
+                    log::info!(
+                        "VCD -> Perfetto: {} ({} signals, {} transitions, {} tiles) -> {}",
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        result.signal_count,
+                        result.transition_count,
+                        result.tile_count,
+                        json_path.file_name().unwrap_or_default().to_string_lossy(),
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to convert VCD {}: {}",
+                        path.display(), e
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Convert a single VCD file to Perfetto JSON.
+fn convert_single_vcd(
+    vcd_path: &Path,
+    json_path: &Path,
+) -> Result<vcd::VcdConvertResult, String> {
+    let vcd_file = std::fs::File::open(vcd_path)
+        .map_err(|e| format!("open VCD: {}", e))?;
+    let reader = std::io::BufReader::new(vcd_file);
+
+    let json_file = std::fs::File::create(json_path)
+        .map_err(|e| format!("create JSON: {}", e))?;
+    let mut writer = std::io::BufWriter::new(json_file);
+
+    vcd::vcd_to_perfetto(reader, &mut writer, None)
+        .map_err(|e| format!("conversion: {}", e))
+}
+
+/// Symlink libxaienginecdo.so into a sim/ps/ directory if not already present.
+///
+/// ps.so (the simulation host shim) links against libxaienginecdo.so from
+/// the mlir-aie install, but the aiesimulator bash wrapper clobbers
+/// LD_LIBRARY_PATH. The reliable fix: symlink the library into ps/ so
+/// the dynamic linker finds it alongside ps.so.
+fn ensure_xaiengine_symlink(sim_dir: &Path) {
+    let ps_dir = sim_dir.join("ps");
+    if !ps_dir.is_dir() {
+        return;
+    }
+
+    let config = crate::config::Config::get();
+    let mlir_aie = PathBuf::from(config.mlir_aie_path());
+    let xaiengine_src_raw = mlir_aie
+        .join("install/runtime_lib/x86_64/xaiengine/lib/libxaienginecdo.so");
+    let xaiengine_src = xaiengine_src_raw.canonicalize()
+        .unwrap_or(xaiengine_src_raw);
+    let xaiengine_link = ps_dir.join("libxaienginecdo.so");
+
+    if xaiengine_src.exists() && !xaiengine_link.exists() {
+        #[cfg(unix)]
+        {
+            if let Err(e) = std::os::unix::fs::symlink(&xaiengine_src, &xaiengine_link) {
+                log::warn!("Failed to symlink libxaienginecdo.so: {}", e);
+            }
+        }
+    }
+}
+
+/// Build an LD_LIBRARY_PATH prefix string for the xaiengine library.
+///
+/// Returns a string like `LD_LIBRARY_PATH=/path/to/lib:$LD_LIBRARY_PATH `
+/// or an empty string if the library directory does not exist.
+fn xaiengine_ld_prefix() -> String {
+    let config = crate::config::Config::get();
+    let mlir_aie = PathBuf::from(config.mlir_aie_path());
+    let xaiengine_lib_raw = mlir_aie
+        .join("install/runtime_lib/x86_64/xaiengine/lib");
+    let xaiengine_lib = xaiengine_lib_raw.canonicalize()
+        .unwrap_or(xaiengine_lib_raw);
+
+    if xaiengine_lib.is_dir() {
+        format!("LD_LIBRARY_PATH={}:$LD_LIBRARY_PATH ", xaiengine_lib.display())
+    } else {
+        String::new()
+    }
 }
 
 /// Read raw binary output data from aiesimulator output directory.

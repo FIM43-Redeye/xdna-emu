@@ -172,9 +172,18 @@ impl Config {
         ]
     }
 
-    /// The npu-xrt test directory within mlir-aie.
+    /// The npu-xrt test directory within mlir-aie (build tree, for --no-build).
     pub fn npu_xrt_test_dir(&self) -> PathBuf {
         self.mlir_aie_subpath("build/test/npu-xrt")
+    }
+
+    /// The npu-xrt test source directory within mlir-aie.
+    ///
+    /// This is the source tree, containing all test definitions (run.lit,
+    /// aie2.py, aie.mlir). Used by source-driven discovery which finds
+    /// tests by their entry point files rather than pre-built xclbins.
+    pub fn npu_xrt_source_dir(&self) -> PathBuf {
+        self.mlir_aie_subpath("test/npu-xrt")
     }
 
     /// Load user configuration from ~/.config/xdna-emu/config.toml

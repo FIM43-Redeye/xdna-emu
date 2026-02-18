@@ -136,6 +136,9 @@ pub struct XclbinTest {
     pub expected_output: Option<Vec<u8>>,
     /// Optional manifest for validation.
     pub manifest: Option<TestManifest>,
+    /// Explicit path to NPU instructions file (overrides directory-based discovery).
+    /// Set for multi-xclbin tests where each xclbin has a distinct insts file.
+    pub insts_path: Option<PathBuf>,
 }
 
 impl XclbinTest {
@@ -180,6 +183,7 @@ impl XclbinTest {
             project_dir,
             expected_output: None,
             manifest: None,
+            insts_path: None,
         }
     }
 
@@ -247,12 +251,20 @@ impl XclbinTest {
         None
     }
 
-    /// Find the NPU instructions file (insts.bin) for this test.
+    /// Find the NPU instructions file for this test.
     ///
-    /// The insts.bin file contains host-to-NPU commands that configure
-    /// and trigger shim DMA transfers.
+    /// The insts file contains host-to-NPU commands that configure
+    /// and trigger shim DMA transfers. Uses the explicit `insts_path` if set
+    /// (for multi-xclbin tests), otherwise falls back to looking for
+    /// `insts.bin` in the xclbin's parent directory.
     pub fn find_insts_bin(&self) -> Option<PathBuf> {
-        // Look in the same directory as the xclbin
+        // Use explicit path if set (multi-xclbin tests)
+        if let Some(ref path) = self.insts_path {
+            if path.exists() {
+                return Some(path.clone());
+            }
+        }
+        // Fallback: look for insts.bin in the same directory as the xclbin
         if let Some(parent) = self.xclbin_path.parent() {
             let insts_path = parent.join("insts.bin");
             if insts_path.exists() {
@@ -342,6 +354,18 @@ impl XclbinSuite {
             reference_dir: None,
             npu_output_dir: None,
             trace_events: Vec::new(),
+        }
+    }
+
+    /// Create a test suite from a pre-built list of tests.
+    ///
+    /// Unlike `discover()` which walks a directory tree, this constructor
+    /// accepts tests that have already been built (e.g. by `batch_build_peano()`).
+    /// Tests are used as-is, with their manifests already attached.
+    pub fn from_tests(tests: Vec<XclbinTest>) -> Self {
+        Self {
+            tests,
+            ..Self::new()
         }
     }
 

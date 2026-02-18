@@ -21,8 +21,12 @@ pub mod opcode_collector;
 pub mod manifest_runner;
 pub mod npu_runner;
 pub mod hardware_comparison;
+pub mod unit_test;
+pub mod npu_test;
 
 pub use xclbin_suite::{XclbinSuite, XclbinTest, TestOutcome};
 pub use opcode_collector::{UnknownOpcode, OpcodeCollector};
 pub use manifest_runner::{TestManifest, ManifestRunner, TestResult, ElementType};
 pub use hardware_comparison::{Diagnosis, HardwareValidation};
+pub use unit_test::{UnitTest, UnitTestBuildResult};
+pub use npu_test::NpuTestSource;
