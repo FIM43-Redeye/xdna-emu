@@ -28,6 +28,7 @@ uuid = "1"                                              # UUID handling
 smallvec = "1.13"                                       # Stack-allocated vectors for operands
 byteorder = "1.5"                                       # Byte order utilities for binary parsing
 dirs = "6"                                              # Platform-specific config directories
+crossterm = "0.29"                                       # Terminal control for build progress grid
 
 # Serialization (for test manifests and register database)
 serde = { version = "1", features = ["derive"] }

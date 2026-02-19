@@ -26,3 +26,4 @@ pub mod visual;
 pub mod integration;
 pub mod testing;
 pub mod ffi;
+pub mod build_progress;

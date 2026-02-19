@@ -12,10 +12,9 @@
 
 #![cfg(feature = "hardware-compare")]
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
-use xdna_emu::testing::manifest_runner::{TestManifest, ElementType, read_values};
+use xdna_emu::testing::test_cpp_parser::{self, ElementType};
 use xdna_emu::testing::xclbin_suite::{XclbinSuite, XclbinTest};
 use xdna_emu::testing::hardware_comparison::{self, CrossValidation};
 
@@ -24,69 +23,56 @@ fn hw_output_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/npu-outputs")
 }
 
-/// Manifest directory.
-fn manifest_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/mlir-aie-extracted/manifests")
-}
-
-/// Load a manifest by test name.
-fn load_manifest(name: &str) -> Option<TestManifest> {
-    let path = manifest_dir().join(format!("{}.toml", name));
-    TestManifest::from_file(&path).ok()
-}
-
 /// Load captured hardware output for a test.
 fn load_hw_output(name: &str) -> Option<Vec<u8>> {
     let path = hw_output_dir().join(name).join("output.bin");
     std::fs::read(&path).ok()
 }
 
-/// Generate input values from a manifest.
-fn generate_inputs(manifest: &TestManifest) -> HashMap<String, Vec<i64>> {
-    let mut inputs = HashMap::new();
-    for (buf_name, buf_def) in &manifest.buffers {
-        if buf_name == "output" {
-            continue;
-        }
-        if let Some(elem_type) = ElementType::from_str(&buf_def.element_type) {
-            if let Some(data) = manifest.generate_input(buf_name) {
-                inputs.insert(buf_name.clone(), read_values(&data, elem_type));
-            }
-        }
+/// Determine the output element type for a test from its test.cpp.
+fn output_element_type(test_name: &str) -> ElementType {
+    let test_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../mlir-aie/test/npu-xrt")
+        .join(test_name);
+
+    if let Some(spec) = test_cpp_parser::parse_test_cpp(&test_dir) {
+        spec.buffers.iter()
+            .find(|b| b.direction == test_cpp_parser::BufferDir::Output)
+            .map(|b| b.element_type)
+            .unwrap_or(ElementType::I32)
+    } else {
+        ElementType::I32
     }
-    inputs
 }
 
-/// Run a single test through the emulator and cross-validate.
+/// Run a single test through the emulator and cross-validate against
+/// hardware reference output.
 fn cross_validate_test(test_name: &str) -> Option<CrossValidation> {
-    let manifest = load_manifest(test_name)?;
-    if manifest.test.skip {
-        return None;
-    }
-
     let config = xdna_emu::config::Config::get();
     let xclbin_path = config.npu_xrt_test_dir().join(test_name).join("aie.xclbin");
     if !xclbin_path.exists() {
         return None;
     }
 
+    // Parse test.cpp for buffer metadata
+    let test_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../mlir-aie/test/npu-xrt")
+        .join(test_name);
+    let buffer_spec = test_cpp_parser::parse_test_cpp(&test_dir);
+
     let suite = XclbinSuite::new().with_max_cycles(1_000_000);
     let mut test = XclbinTest::from_path(&xclbin_path);
-    test.manifest = Some(manifest.clone());
+    test.buffer_spec = buffer_spec;
 
     let (_outcome, emu_output) = suite.run_single_with_output(&test);
     let hw_output = load_hw_output(test_name);
-    let inputs = generate_inputs(&manifest);
+    let elem_type = output_element_type(test_name);
 
-    let hw_output_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/npu-outputs");
     Some(CrossValidation::compare(
         test_name,
-        &manifest,
-        &inputs,
         emu_output.as_deref(),
         hw_output.as_deref(),
-        Some(hw_output_dir.as_path()),
+        elem_type,
     ))
 }
 
@@ -97,12 +83,8 @@ fn cross_validate_test(test_name: &str) -> Option<CrossValidation> {
 #[test]
 fn cross_validate_add_one_using_dma() {
     if let Some(cv) = cross_validate_test("add_one_using_dma") {
-        if let Some(ref hw) = cv.hw_vs_manifest {
-            assert!(hw.is_match(), "Hardware should match manifest for add_one_using_dma");
-        }
-        if let Some(ref emu_hw) = cv.emu_vs_hw {
-            // This is informational -- emulator may not match hardware yet
-            eprintln!("add_one_using_dma: emu vs hw = {}", emu_hw.summary());
+        if let Some(ref result) = cv.emu_vs_reference {
+            eprintln!("add_one_using_dma: emu vs hw = {}", result.summary());
         }
     }
 }
@@ -110,11 +92,8 @@ fn cross_validate_add_one_using_dma() {
 #[test]
 fn cross_validate_add_314_using_dma_op() {
     if let Some(cv) = cross_validate_test("add_314_using_dma_op") {
-        if let Some(ref hw) = cv.hw_vs_manifest {
-            assert!(hw.is_match(), "Hardware should match manifest for add_314_using_dma_op");
-        }
-        if let Some(ref emu_hw) = cv.emu_vs_hw {
-            eprintln!("add_314_using_dma_op: emu vs hw = {}", emu_hw.summary());
+        if let Some(ref result) = cv.emu_vs_reference {
+            eprintln!("add_314_using_dma_op: emu vs hw = {}", result.summary());
         }
     }
 }
@@ -122,40 +101,31 @@ fn cross_validate_add_314_using_dma_op() {
 #[test]
 fn cross_validate_vec_vec_add_tile_init() {
     if let Some(cv) = cross_validate_test("vec_vec_add_tile_init") {
-        if let Some(ref hw) = cv.hw_vs_manifest {
-            assert!(hw.is_match(), "Hardware should match manifest for vec_vec_add_tile_init");
-        }
-        if let Some(ref emu_hw) = cv.emu_vs_hw {
-            eprintln!("vec_vec_add_tile_init: emu vs hw = {}", emu_hw.summary());
+        if let Some(ref result) = cv.emu_vs_reference {
+            eprintln!("vec_vec_add_tile_init: emu vs hw = {}", result.summary());
         }
     }
 }
 
-/// Batch cross-validation: run all tests with captures and produce a report.
+/// Batch cross-validation: run all discoverable tests and produce a report.
 #[test]
 fn cross_validate_all_with_report() {
-    let manifest_path = manifest_dir();
-    if !manifest_path.exists() {
-        eprintln!("Skipping: no manifest directory");
+    let hw_dir = hw_output_dir();
+    if !hw_dir.exists() {
+        eprintln!("Skipping: no hardware output directory");
         return;
     }
 
-    let entries: Vec<_> = std::fs::read_dir(&manifest_path)
-        .expect("Cannot read manifest dir")
+    let entries: Vec<_> = std::fs::read_dir(&hw_dir)
+        .expect("Cannot read hardware output dir")
         .flatten()
-        .filter(|e| {
-            e.path().extension().map(|ext| ext == "toml").unwrap_or(false)
-        })
+        .filter(|e| e.path().is_dir())
         .collect();
 
     let mut results: Vec<CrossValidation> = Vec::new();
 
     for entry in &entries {
-        let name = entry.path()
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-
+        let name = entry.file_name().to_string_lossy().to_string();
         if let Some(cv) = cross_validate_test(&name) {
             results.push(cv);
         }

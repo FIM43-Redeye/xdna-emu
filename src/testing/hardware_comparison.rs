@@ -1,14 +1,10 @@
-//! Three-way comparison logic for emulator-vs-hardware validation.
+//! Comparison logic for emulator-vs-hardware validation.
 //!
-//! Provides three validation layers:
-//! 1. **Emu vs Manifest**: Does the emulator produce the expected output?
-//!    (Already exists in xclbin_suite -- this module adds the other two.)
-//! 2. **HW vs Manifest**: Does real hardware produce the expected output?
-//! 3. **Emu vs HW**: Do the emulator and hardware agree?
+//! Validates emulator output against hardware reference captures:
+//! - **Emu vs Reference**: Does the emulator match captured hardware output?
 //!
-//! Layer 1 catches emulator bugs against spec. Layer 2 catches manifest
-//! errors. Layer 3 catches emulator/hardware divergence regardless of
-//! the "correct" answer.
+//! Also provides dual-compiler comparison (Peano vs Chess) for fault
+//! isolation across the compiler x execution-environment matrix.
 //!
 //! This module is pure logic -- no hardware dependency. It works on raw
 //! byte buffers from either live capture or saved files.
@@ -16,35 +12,24 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::manifest_runner::{TestManifest, ElementType, read_values};
+use super::test_cpp_parser::{BufferSpec, BufferDir, ElementType, read_values, generate_input_data};
 
-/// Diagnosis from three-way comparison: emulator vs hardware vs manifest.
+/// Diagnosis from emulator-vs-hardware comparison.
 ///
-/// Maps the truth table of three pairwise comparisons to a human-readable
-/// root cause category:
-///
-/// | emu=manifest | hw=manifest | emu=hw | Diagnosis    |
-/// |:-------------|:------------|:-------|:-------------|
-/// | yes          | yes         | yes    | Correct      |
-/// | no           | no          | yes    | CompilerBug  |
-/// | no           | yes         | no     | EmulatorBug  |
-/// | no           | no          | no     | BothBroken   |
+/// Maps the comparison result to a root cause category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Diagnosis {
-    /// All three agree: emulator = hardware = manifest.
+    /// Emulator output matches hardware reference.
     Correct,
-    /// Emulator matches hardware, but both disagree with manifest.
-    /// This typically indicates a compiler or toolchain bug --
-    /// the binary is wrong, but the emulator faithfully reproduces
-    /// the hardware behavior.
+    /// Emulator matches hardware, but both disagree with expected values.
+    /// Indicates a compiler or toolchain bug -- the binary is wrong, but
+    /// the emulator faithfully reproduces the hardware behavior.
     CompilerBug,
-    /// Hardware matches manifest, but emulator diverges.
-    /// This is an emulator bug.
+    /// Emulator output diverges from hardware reference.
     EmulatorBug,
-    /// All three disagree. Both the binary and the emulator are wrong
-    /// in different ways.
+    /// All three sources disagree (emulator, hardware, expected).
     BothBroken,
-    /// No hardware capture available for this test.
+    /// No hardware reference available for this test.
     NoReference,
 }
 
@@ -77,38 +62,12 @@ pub struct HardwareValidation {
 impl HardwareValidation {
     /// Classify a CrossValidation result into a Diagnosis.
     ///
-    /// Requires at least emu_vs_hw to be present; otherwise returns NoReference.
+    /// Requires emu_vs_reference to be present; otherwise returns NoReference.
     pub fn classify(cross: CrossValidation) -> Self {
-        let diagnosis = match (&cross.emu_vs_manifest, &cross.hw_vs_manifest, &cross.emu_vs_hw) {
-            // No hardware data at all
-            (_, _, None) => Diagnosis::NoReference,
-
-            // All three layers available
-            (Some(em), Some(hm), Some(eh)) => {
-                match (em.is_match(), hm.is_match(), eh.is_match()) {
-                    (true, true, true) => Diagnosis::Correct,
-                    (false, false, true) => Diagnosis::CompilerBug,
-                    (false, true, false) => Diagnosis::EmulatorBug,
-                    // emu=manifest=true, hw!=manifest -- unusual but possible
-                    // (hardware has a bug? Or manifest is wrong in a way that
-                    // accidentally matches the emulator). Call it BothBroken
-                    // since we cannot cleanly attribute it.
-                    _ => Diagnosis::BothBroken,
-                }
-            }
-
-            // Have emu_vs_hw but missing one of the manifest comparisons.
-            // We can still check if emu matches hw.
-            (_, _, Some(eh)) => {
-                if eh.is_match() {
-                    // Emu and HW agree, but we cannot check manifest.
-                    // Conservative: report as NoReference since we lack
-                    // the full truth table.
-                    Diagnosis::NoReference
-                } else {
-                    Diagnosis::BothBroken
-                }
-            }
+        let diagnosis = match &cross.emu_vs_reference {
+            None => Diagnosis::NoReference,
+            Some(r) if r.is_match() => Diagnosis::Correct,
+            Some(_) => Diagnosis::EmulatorBug,
         };
 
         HardwareValidation { diagnosis, cross }
@@ -127,24 +86,19 @@ pub fn load_hw_reference(reference_dir: &Path, test_name: &str) -> Option<Vec<u8
     }
 }
 
-/// Generate input values from a manifest's buffer definitions.
+/// Generate input values from a BufferSpec.
 ///
-/// Returns a map of buffer name -> element values, suitable for passing
-/// to `CrossValidation::compare()` or `TestManifest::generate_expected()`.
-///
-/// Shared between `compare_emu_hw.rs` and `xclbin_suite.rs`.
-pub fn generate_input_values(manifest: &TestManifest) -> HashMap<String, Vec<i64>> {
+/// Returns a map of buffer name -> element values, used for display
+/// and debugging purposes.
+pub fn generate_input_values_from_spec(spec: &BufferSpec) -> HashMap<String, Vec<i64>> {
     let mut inputs = HashMap::new();
 
-    for (buf_name, buf_def) in &manifest.buffers {
-        if buf_name == "output" {
+    for buf in &spec.buffers {
+        if buf.direction == BufferDir::Output {
             continue;
         }
-        if let Some(elem_type) = ElementType::from_str(&buf_def.element_type) {
-            if let Some(data) = manifest.generate_input(buf_name) {
-                inputs.insert(buf_name.clone(), read_values(&data, elem_type));
-            }
-        }
+        let data = generate_input_data(buf);
+        inputs.insert(buf.name.clone(), read_values(&data, buf.element_type));
     }
 
     inputs
@@ -187,7 +141,7 @@ impl ComparisonResult {
 
 /// Compare two byte buffers element-by-element using the given type.
 ///
-/// This is the core comparison primitive used by all three validation layers.
+/// This is the core comparison primitive used by all validation layers.
 pub fn compare_buffers(
     left: &[u8],
     right: &[u8],
@@ -219,30 +173,7 @@ pub fn compare_value_slices(left: &[i64], right: &[i64]) -> ComparisonResult {
     }
 }
 
-/// Layer 2: Validate hardware output against manifest expected transform.
-///
-/// Generates expected values from the manifest's transform expression
-/// and compares them against the raw hardware output bytes.
-///
-/// Returns `None` if the manifest lacks enough information to generate
-/// expected values (missing output buffer def, unknown element type, etc.).
-pub fn validate_hw_vs_manifest(
-    hw_output: &[u8],
-    manifest: &TestManifest,
-    input_values: &HashMap<String, Vec<i64>>,
-    reference_dir: Option<&Path>,
-) -> Option<ComparisonResult> {
-    let output_buf = manifest.get_output()?;
-    let elem_type = ElementType::from_str(&output_buf.element_type)?;
-
-    // Generate expected values from the manifest transform or reference file
-    let expected = manifest.generate_expected(input_values, reference_dir)?;
-    let actual = read_values(hw_output, elem_type);
-
-    Some(compare_value_slices(&expected, &actual))
-}
-
-/// Layer 3: Compare emulator output against hardware output.
+/// Compare emulator output against hardware output.
 ///
 /// A direct byte-level comparison (interpreted through the element type)
 /// that catches any divergence between the two execution environments.
@@ -254,56 +185,32 @@ pub fn compare_emu_vs_hw(
     compare_buffers(emu_output, hw_output, element_type)
 }
 
-/// Complete three-way comparison result for a single test.
+/// Comparison result for a single test: emulator vs hardware reference.
 #[derive(Debug)]
 pub struct CrossValidation {
     pub test_name: String,
-    /// Layer 1: Emulator output vs manifest expected values.
-    pub emu_vs_manifest: Option<ComparisonResult>,
-    /// Layer 2: Hardware output vs manifest expected values.
-    pub hw_vs_manifest: Option<ComparisonResult>,
-    /// Layer 3: Emulator output vs hardware output.
-    pub emu_vs_hw: Option<ComparisonResult>,
+    /// Emulator output vs hardware reference output.
+    pub emu_vs_reference: Option<ComparisonResult>,
 }
 
 impl CrossValidation {
-    /// Run all three comparison layers for a test.
+    /// Compare emulator output against hardware reference.
     ///
-    /// Any layer can be `None` if the required data is unavailable
-    /// (e.g. no hardware capture, no manifest, emulator didn't produce output).
+    /// Returns `None` for emu_vs_reference if either output is missing.
     pub fn compare(
         test_name: &str,
-        manifest: &TestManifest,
-        input_values: &HashMap<String, Vec<i64>>,
         emu_output: Option<&[u8]>,
-        hw_output: Option<&[u8]>,
-        reference_dir: Option<&Path>,
+        hw_reference: Option<&[u8]>,
+        element_type: ElementType,
     ) -> Self {
-        let output_buf = manifest.get_output();
-        let elem_type = output_buf
-            .and_then(|b| ElementType::from_str(&b.element_type));
-
-        // Layer 1: Emu vs Manifest
-        let emu_vs_manifest = emu_output.and_then(|emu| {
-            validate_hw_vs_manifest(emu, manifest, input_values, reference_dir)
-        });
-
-        // Layer 2: HW vs Manifest
-        let hw_vs_manifest = hw_output.and_then(|hw| {
-            validate_hw_vs_manifest(hw, manifest, input_values, reference_dir)
-        });
-
-        // Layer 3: Emu vs HW
-        let emu_vs_hw = match (emu_output, hw_output, elem_type) {
-            (Some(emu), Some(hw), Some(et)) => Some(compare_emu_vs_hw(emu, hw, et)),
+        let emu_vs_reference = match (emu_output, hw_reference) {
+            (Some(emu), Some(hw)) => Some(compare_emu_vs_hw(emu, hw, element_type)),
             _ => None,
         };
 
         CrossValidation {
             test_name: test_name.to_string(),
-            emu_vs_manifest,
-            hw_vs_manifest,
-            emu_vs_hw,
+            emu_vs_reference,
         }
     }
 }
@@ -317,23 +224,15 @@ fn format_column(result: &Option<ComparisonResult>) -> String {
     }
 }
 
-/// Format the Emu-vs-HW column (uses MATCH/DIVERGE instead of PASS/FAIL).
-fn format_emu_hw_column(result: &Option<ComparisonResult>) -> String {
-    match result {
-        Some(r) => r.summary(),
-        None => "N/A".to_string(),
-    }
-}
-
-/// Generate a three-column comparison report from cross-validation results.
+/// Generate a comparison report from cross-validation results.
 ///
 /// Output format:
 /// ```text
 /// === Cross-Validation Report ===
 ///
-/// Test                           | Emu vs Manifest | HW vs Manifest | Emu vs HW
-/// -------------------------------|-----------------|----------------|----------
-/// add_one_using_dma              | PASS (64/64)    | PASS (64/64)   | MATCH
+/// Test                           | Emu vs HW Ref
+/// -------------------------------|---------------
+/// add_one_using_dma              | PASS (64/64)
 /// ```
 pub fn format_report(results: &[CrossValidation]) -> String {
     let mut report = String::new();
@@ -342,12 +241,12 @@ pub fn format_report(results: &[CrossValidation]) -> String {
 
     // Header
     report.push_str(&format!(
-        "{:<35} | {:<17} | {:<17} | {}\n",
-        "Test", "Emu vs Manifest", "HW vs Manifest", "Emu vs HW"
+        "{:<35} | {}\n",
+        "Test", "Emu vs HW Ref"
     ));
     report.push_str(&format!(
-        "{:-<35}-+-{:-<17}-+-{:-<17}-+-{:-<17}\n",
-        "", "", "", ""
+        "{:-<35}-+-{:-<17}\n",
+        "", ""
     ));
 
     // Rows
@@ -359,56 +258,27 @@ pub fn format_report(results: &[CrossValidation]) -> String {
         };
 
         report.push_str(&format!(
-            "{:<35} | {:<17} | {:<17} | {}\n",
+            "{:<35} | {}\n",
             name,
-            format_column(&cv.emu_vs_manifest),
-            format_column(&cv.hw_vs_manifest),
-            format_emu_hw_column(&cv.emu_vs_hw),
+            format_column(&cv.emu_vs_reference),
         ));
     }
 
     // Summary statistics
     let total = results.len();
-    let emu_manifest_pass = results.iter()
-        .filter(|cv| cv.emu_vs_manifest.as_ref().map_or(false, |r| r.is_match()))
+    let emu_ref_pass = results.iter()
+        .filter(|cv| cv.emu_vs_reference.as_ref().map_or(false, |r| r.is_match()))
         .count();
-    let hw_manifest_pass = results.iter()
-        .filter(|cv| cv.hw_vs_manifest.as_ref().map_or(false, |r| r.is_match()))
-        .count();
-    let emu_hw_match = results.iter()
-        .filter(|cv| cv.emu_vs_hw.as_ref().map_or(false, |r| r.is_match()))
-        .count();
-
-    let emu_manifest_total = results.iter()
-        .filter(|cv| cv.emu_vs_manifest.is_some())
-        .count();
-    let hw_manifest_total = results.iter()
-        .filter(|cv| cv.hw_vs_manifest.is_some())
-        .count();
-    let emu_hw_total = results.iter()
-        .filter(|cv| cv.emu_vs_hw.is_some())
+    let emu_ref_total = results.iter()
+        .filter(|cv| cv.emu_vs_reference.is_some())
         .count();
 
     report.push_str(&format!("\n=== Summary ===\n"));
-    if emu_manifest_total > 0 {
-        report.push_str(&format!(
-            "Emulator matches manifest: {}/{} ({:.1}%)\n",
-            emu_manifest_pass, emu_manifest_total,
-            100.0 * emu_manifest_pass as f64 / emu_manifest_total as f64
-        ));
-    }
-    if hw_manifest_total > 0 {
-        report.push_str(&format!(
-            "Hardware matches manifest: {}/{} ({:.1}%)\n",
-            hw_manifest_pass, hw_manifest_total,
-            100.0 * hw_manifest_pass as f64 / hw_manifest_total as f64
-        ));
-    }
-    if emu_hw_total > 0 {
+    if emu_ref_total > 0 {
         report.push_str(&format!(
             "Emulator matches hardware: {}/{} ({:.1}%)\n",
-            emu_hw_match, emu_hw_total,
-            100.0 * emu_hw_match as f64 / emu_hw_total as f64
+            emu_ref_pass, emu_ref_total,
+            100.0 * emu_ref_pass as f64 / emu_ref_total as f64
         ));
     }
     report.push_str(&format!("Total tests: {}\n", total));
@@ -442,8 +312,8 @@ pub struct CompilerComparison {
     pub peano_hw: Option<Vec<u8>>,
     /// Hardware output with Chess-compiled binary.
     pub chess_hw: Option<Vec<u8>>,
-    /// Expected output from the manifest.
-    pub manifest_expected: Option<Vec<i64>>,
+    /// Expected output values (from hardware reference capture).
+    pub expected_values: Option<Vec<i64>>,
 }
 
 /// Dual-compiler diagnosis.
@@ -496,7 +366,7 @@ impl CompilerComparison {
             _ => return CompilerDiagnosis::Incomplete,
         };
 
-        let expected = match &self.manifest_expected {
+        let expected = match &self.expected_values {
             Some(e) => e,
             None => return CompilerDiagnosis::Incomplete,
         };
@@ -529,20 +399,15 @@ impl CompilerComparison {
     /// to confirm or revise the diagnosis:
     ///
     /// - **EmulatorBug + hardware correct** -> confirmed EmulatorBug
-    ///   (both compilers wrong on emu, but hardware produces correct output,
-    ///   so the binaries are fine -- emulator is the problem).
     /// - **EmulatorBug + hardware also wrong** -> Inconclusive
-    ///   (maybe the manifest expected values are wrong, not the emulator).
     /// - **PeanoCompilerBug + Peano HW correct** -> EmulatorBug
-    ///   (Peano binary runs correctly on hardware; emulator misexecutes it).
     /// - **ChessCompilerBug + Chess HW correct** -> EmulatorBug
-    ///   (same logic, Chess side).
     ///
     /// Falls back to `classify()` when no hardware data is available.
     pub fn classify_full(&self, element_type: ElementType) -> CompilerDiagnosis {
         let emu_diag = self.classify(element_type);
 
-        let expected = match &self.manifest_expected {
+        let expected = match &self.expected_values {
             Some(e) => e,
             None => return emu_diag,
         };
@@ -559,7 +424,7 @@ impl CompilerComparison {
                 match (peano_hw_correct, chess_hw_correct) {
                     // At least one hardware run confirms correct output
                     (Some(true), _) | (_, Some(true)) => CompilerDiagnosis::EmulatorBug,
-                    // Hardware also wrong -- manifest might be the problem
+                    // Hardware also wrong -- reference might be the problem
                     (Some(false), _) | (_, Some(false)) => CompilerDiagnosis::Inconclusive,
                     // No hardware data -- keep emulator-only diagnosis
                     (None, None) => emu_diag,
@@ -600,6 +465,7 @@ impl CompilerComparison {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::test_cpp_parser::InputPattern;
 
     #[test]
     fn test_compare_matching_buffers() {
@@ -679,85 +545,8 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_hw_vs_manifest() {
-        let toml_content = r#"
-[test]
-name = "test"
-source_dir = "test"
-
-[build]
-mlir_file = "aie.mlir"
-device = "npu1_1col"
-
-[buffers.input_a]
-size = 4
-element_type = "i32"
-group_id = 3
-
-[buffers.input_a.pattern]
-type = "sequential"
-start = 1
-step = 1
-
-[buffers.output]
-size = 4
-element_type = "i32"
-group_id = 5
-
-[expected]
-type = "transform"
-transform = "input_a + 1"
-"#;
-        let manifest: TestManifest = toml::from_str(toml_content).unwrap();
-        let mut inputs = HashMap::new();
-        inputs.insert("input_a".to_string(), vec![1, 2, 3, 4]);
-
-        // Hardware produced correct output: [2, 3, 4, 5]
-        let hw_output: Vec<u8> = [2i32, 3, 4, 5]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-
-        let result = validate_hw_vs_manifest(&hw_output, &manifest, &inputs, None).unwrap();
-        assert!(result.is_match());
-        assert_eq!(result.total, 4);
-    }
-
-    #[test]
-    fn test_cross_validation() {
-        let toml_content = r#"
-[test]
-name = "add_one"
-source_dir = "test"
-
-[build]
-mlir_file = "aie.mlir"
-device = "npu1_1col"
-
-[buffers.input_a]
-size = 4
-element_type = "i32"
-group_id = 3
-
-[buffers.input_a.pattern]
-type = "sequential"
-start = 1
-step = 1
-
-[buffers.output]
-size = 4
-element_type = "i32"
-group_id = 5
-
-[expected]
-type = "transform"
-transform = "input_a + 1"
-"#;
-        let manifest: TestManifest = toml::from_str(toml_content).unwrap();
-        let mut inputs = HashMap::new();
-        inputs.insert("input_a".to_string(), vec![1, 2, 3, 4]);
-
-        // Both produce correct output
+    fn test_cross_validation_match() {
+        // Both emulator and hardware reference produce [2, 3, 4, 5]
         let correct: Vec<u8> = [2i32, 3, 4, 5]
             .iter()
             .flat_map(|v| v.to_le_bytes())
@@ -765,53 +554,17 @@ transform = "input_a + 1"
 
         let cv = CrossValidation::compare(
             "add_one",
-            &manifest,
-            &inputs,
             Some(&correct),
             Some(&correct),
-            None,
+            ElementType::I32,
         );
 
-        assert!(cv.emu_vs_manifest.as_ref().unwrap().is_match());
-        assert!(cv.hw_vs_manifest.as_ref().unwrap().is_match());
-        assert!(cv.emu_vs_hw.as_ref().unwrap().is_match());
+        assert!(cv.emu_vs_reference.as_ref().unwrap().is_match());
     }
 
     #[test]
-    fn test_cross_validation_emu_wrong() {
-        let toml_content = r#"
-[test]
-name = "add_one"
-source_dir = "test"
-
-[build]
-mlir_file = "aie.mlir"
-device = "npu1_1col"
-
-[buffers.input_a]
-size = 4
-element_type = "i32"
-group_id = 3
-
-[buffers.input_a.pattern]
-type = "sequential"
-start = 1
-step = 1
-
-[buffers.output]
-size = 4
-element_type = "i32"
-group_id = 5
-
-[expected]
-type = "transform"
-transform = "input_a + 1"
-"#;
-        let manifest: TestManifest = toml::from_str(toml_content).unwrap();
-        let mut inputs = HashMap::new();
-        inputs.insert("input_a".to_string(), vec![1, 2, 3, 4]);
-
-        // Hardware correct, emulator wrong
+    fn test_cross_validation_diverge() {
+        // Emulator wrong, hardware reference correct
         let hw_correct: Vec<u8> = [2i32, 3, 4, 5]
             .iter()
             .flat_map(|v| v.to_le_bytes())
@@ -823,19 +576,29 @@ transform = "input_a + 1"
 
         let cv = CrossValidation::compare(
             "add_one",
-            &manifest,
-            &inputs,
             Some(&emu_wrong),
             Some(&hw_correct),
-            None,
+            ElementType::I32,
         );
 
-        // Emu vs manifest: FAIL (emulator produced wrong values)
-        assert!(!cv.emu_vs_manifest.as_ref().unwrap().is_match());
-        // HW vs manifest: PASS
-        assert!(cv.hw_vs_manifest.as_ref().unwrap().is_match());
-        // Emu vs HW: DIVERGE
-        assert!(!cv.emu_vs_hw.as_ref().unwrap().is_match());
+        assert!(!cv.emu_vs_reference.as_ref().unwrap().is_match());
+    }
+
+    #[test]
+    fn test_cross_validation_no_reference() {
+        let emu: Vec<u8> = [2i32, 3, 4, 5]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+
+        let cv = CrossValidation::compare(
+            "add_one",
+            Some(&emu),
+            None,
+            ElementType::I32,
+        );
+
+        assert!(cv.emu_vs_reference.is_none());
     }
 
     #[test]
@@ -843,13 +606,7 @@ transform = "input_a + 1"
         let results = vec![
             CrossValidation {
                 test_name: "add_one".to_string(),
-                emu_vs_manifest: Some(ComparisonResult {
-                    total: 64, matching: 64, first_mismatch: None,
-                }),
-                hw_vs_manifest: Some(ComparisonResult {
-                    total: 64, matching: 64, first_mismatch: None,
-                }),
-                emu_vs_hw: Some(ComparisonResult {
+                emu_vs_reference: Some(ComparisonResult {
                     total: 64, matching: 64, first_mismatch: None,
                 }),
             },
@@ -858,7 +615,6 @@ transform = "input_a + 1"
         assert!(report.contains("Cross-Validation Report"));
         assert!(report.contains("add_one"));
         assert!(report.contains("PASS (64/64)"));
-        assert!(report.contains("64/64 (MATCH)"));
     }
 
     /// Helper: build a match result.
@@ -866,74 +622,33 @@ transform = "input_a + 1"
         ComparisonResult { total: n, matching: n, first_mismatch: None }
     }
 
-    /// Helper: build a diverge result.
-    fn make_diverge(matching: usize, total: usize) -> ComparisonResult {
-        ComparisonResult {
-            total,
-            matching,
-            first_mismatch: Some((matching, 0, 1)),
-        }
-    }
-
     #[test]
     fn test_diagnosis_correct() {
         let cv = CrossValidation {
             test_name: "t".to_string(),
-            emu_vs_manifest: Some(make_match(4)),
-            hw_vs_manifest: Some(make_match(4)),
-            emu_vs_hw: Some(make_match(4)),
+            emu_vs_reference: Some(make_match(4)),
         };
         let hv = HardwareValidation::classify(cv);
         assert_eq!(hv.diagnosis, Diagnosis::Correct);
     }
 
     #[test]
-    fn test_diagnosis_compiler_bug() {
-        // emu and hw agree, but both differ from manifest
-        let cv = CrossValidation {
-            test_name: "t".to_string(),
-            emu_vs_manifest: Some(make_diverge(0, 4)),
-            hw_vs_manifest: Some(make_diverge(0, 4)),
-            emu_vs_hw: Some(make_match(4)),
-        };
-        let hv = HardwareValidation::classify(cv);
-        assert_eq!(hv.diagnosis, Diagnosis::CompilerBug);
-    }
-
-    #[test]
     fn test_diagnosis_emulator_bug() {
-        // hw matches manifest, emu diverges
         let cv = CrossValidation {
             test_name: "t".to_string(),
-            emu_vs_manifest: Some(make_diverge(0, 4)),
-            hw_vs_manifest: Some(make_match(4)),
-            emu_vs_hw: Some(make_diverge(0, 4)),
+            emu_vs_reference: Some(ComparisonResult {
+                total: 4, matching: 0, first_mismatch: Some((0, 1, 99)),
+            }),
         };
         let hv = HardwareValidation::classify(cv);
         assert_eq!(hv.diagnosis, Diagnosis::EmulatorBug);
     }
 
     #[test]
-    fn test_diagnosis_both_broken() {
-        // All three disagree
-        let cv = CrossValidation {
-            test_name: "t".to_string(),
-            emu_vs_manifest: Some(make_diverge(0, 4)),
-            hw_vs_manifest: Some(make_diverge(1, 4)),
-            emu_vs_hw: Some(make_diverge(2, 4)),
-        };
-        let hv = HardwareValidation::classify(cv);
-        assert_eq!(hv.diagnosis, Diagnosis::BothBroken);
-    }
-
-    #[test]
     fn test_diagnosis_no_reference() {
-        // No hardware data
         let cv = CrossValidation {
             test_name: "t".to_string(),
-            emu_vs_manifest: Some(make_match(4)),
-            hw_vs_manifest: None,
-            emu_vs_hw: None,
+            emu_vs_reference: None,
         };
         let hv = HardwareValidation::classify(cv);
         assert_eq!(hv.diagnosis, Diagnosis::NoReference);
@@ -971,7 +686,7 @@ transform = "input_a + 1"
             chess_emu: Some(correct),
             peano_hw: None,
             chess_hw: None,
-            manifest_expected: Some(vec![2, 3, 4, 5]),
+            expected_values: Some(vec![2, 3, 4, 5]),
         };
         assert_eq!(cc.classify(ElementType::I32), CompilerDiagnosis::Correct);
     }
@@ -986,7 +701,7 @@ transform = "input_a + 1"
             chess_emu: Some(correct),
             peano_hw: None,
             chess_hw: None,
-            manifest_expected: Some(vec![2, 3, 4, 5]),
+            expected_values: Some(vec![2, 3, 4, 5]),
         };
         assert_eq!(cc.classify(ElementType::I32), CompilerDiagnosis::PeanoCompilerBug);
     }
@@ -1001,7 +716,7 @@ transform = "input_a + 1"
             chess_emu: Some(wrong),
             peano_hw: None,
             chess_hw: None,
-            manifest_expected: Some(vec![2, 3, 4, 5]),
+            expected_values: Some(vec![2, 3, 4, 5]),
         };
         assert_eq!(cc.classify(ElementType::I32), CompilerDiagnosis::ChessCompilerBug);
     }
@@ -1016,7 +731,7 @@ transform = "input_a + 1"
             chess_emu: Some(wrong),
             peano_hw: None,
             chess_hw: None,
-            manifest_expected: Some(vec![2, 3, 4, 5]),
+            expected_values: Some(vec![2, 3, 4, 5]),
         };
         assert_eq!(cc.classify(ElementType::I32), CompilerDiagnosis::EmulatorBug);
     }
@@ -1032,7 +747,7 @@ transform = "input_a + 1"
             chess_emu: Some(wrong_b),
             peano_hw: None,
             chess_hw: None,
-            manifest_expected: Some(vec![2, 3, 4, 5]),
+            expected_values: Some(vec![2, 3, 4, 5]),
         };
         assert_eq!(cc.classify(ElementType::I32), CompilerDiagnosis::Inconclusive);
     }
@@ -1045,7 +760,7 @@ transform = "input_a + 1"
             chess_emu: None, // Missing Chess data
             peano_hw: None,
             chess_hw: None,
-            manifest_expected: Some(vec![2, 3, 4, 5]),
+            expected_values: Some(vec![2, 3, 4, 5]),
         };
         assert_eq!(cc.classify(ElementType::I32), CompilerDiagnosis::Incomplete);
     }
@@ -1064,8 +779,6 @@ transform = "input_a + 1"
 
     #[test]
     fn test_classify_full_emulator_bug_confirmed_by_hw() {
-        // Both compilers produce same wrong output on emulator,
-        // but Peano hardware produces correct output -> confirmed EmulatorBug.
         let wrong = make_i32_bytes(&[99, 99, 99, 99]);
         let correct = make_i32_bytes(&[2, 3, 4, 5]);
         let cc = CompilerComparison {
@@ -1074,15 +787,13 @@ transform = "input_a + 1"
             chess_emu: Some(wrong),
             peano_hw: Some(correct),
             chess_hw: None,
-            manifest_expected: Some(vec![2, 3, 4, 5]),
+            expected_values: Some(vec![2, 3, 4, 5]),
         };
         assert_eq!(cc.classify_full(ElementType::I32), CompilerDiagnosis::EmulatorBug);
     }
 
     #[test]
     fn test_classify_full_emulator_bug_hw_also_wrong() {
-        // Both compilers wrong on emulator, hardware also wrong ->
-        // Inconclusive (manifest might be the problem).
         let wrong = make_i32_bytes(&[99, 99, 99, 99]);
         let also_wrong = make_i32_bytes(&[50, 50, 50, 50]);
         let cc = CompilerComparison {
@@ -1091,15 +802,13 @@ transform = "input_a + 1"
             chess_emu: Some(wrong),
             peano_hw: Some(also_wrong),
             chess_hw: None,
-            manifest_expected: Some(vec![2, 3, 4, 5]),
+            expected_values: Some(vec![2, 3, 4, 5]),
         };
         assert_eq!(cc.classify_full(ElementType::I32), CompilerDiagnosis::Inconclusive);
     }
 
     #[test]
     fn test_classify_full_peano_bug_revised_to_emu_bug() {
-        // Peano-emu wrong, Chess-emu correct, but Peano-hw correct ->
-        // binary is fine, emulator misexecutes it.
         let correct = make_i32_bytes(&[2, 3, 4, 5]);
         let wrong = make_i32_bytes(&[99, 99, 99, 99]);
         let cc = CompilerComparison {
@@ -1108,15 +817,13 @@ transform = "input_a + 1"
             chess_emu: Some(correct.clone()),
             peano_hw: Some(correct),
             chess_hw: None,
-            manifest_expected: Some(vec![2, 3, 4, 5]),
+            expected_values: Some(vec![2, 3, 4, 5]),
         };
         assert_eq!(cc.classify_full(ElementType::I32), CompilerDiagnosis::EmulatorBug);
     }
 
     #[test]
     fn test_classify_full_chess_bug_revised_to_emu_bug() {
-        // Chess-emu wrong, Peano-emu correct, but Chess-hw correct ->
-        // binary is fine, emulator misexecutes it.
         let correct = make_i32_bytes(&[2, 3, 4, 5]);
         let wrong = make_i32_bytes(&[99, 99, 99, 99]);
         let cc = CompilerComparison {
@@ -1125,14 +832,13 @@ transform = "input_a + 1"
             chess_emu: Some(wrong),
             peano_hw: None,
             chess_hw: Some(correct),
-            manifest_expected: Some(vec![2, 3, 4, 5]),
+            expected_values: Some(vec![2, 3, 4, 5]),
         };
         assert_eq!(cc.classify_full(ElementType::I32), CompilerDiagnosis::EmulatorBug);
     }
 
     #[test]
     fn test_classify_full_no_hw_data_falls_back() {
-        // No hardware data -> classify_full() returns same as classify().
         let wrong = make_i32_bytes(&[99, 99, 99, 99]);
         let cc = CompilerComparison {
             test_name: "t".to_string(),
@@ -1140,7 +846,7 @@ transform = "input_a + 1"
             chess_emu: Some(wrong),
             peano_hw: None,
             chess_hw: None,
-            manifest_expected: Some(vec![2, 3, 4, 5]),
+            expected_values: Some(vec![2, 3, 4, 5]),
         };
         assert_eq!(cc.classify_full(ElementType::I32), CompilerDiagnosis::EmulatorBug);
         assert_eq!(cc.classify(ElementType::I32), cc.classify_full(ElementType::I32));
@@ -1148,7 +854,6 @@ transform = "input_a + 1"
 
     #[test]
     fn test_classify_full_correct_stays_correct() {
-        // Both compilers correct on emulator -> Correct, regardless of hw data.
         let correct = make_i32_bytes(&[2, 3, 4, 5]);
         let cc = CompilerComparison {
             test_name: "t".to_string(),
@@ -1156,15 +861,13 @@ transform = "input_a + 1"
             chess_emu: Some(correct.clone()),
             peano_hw: Some(correct),
             chess_hw: None,
-            manifest_expected: Some(vec![2, 3, 4, 5]),
+            expected_values: Some(vec![2, 3, 4, 5]),
         };
         assert_eq!(cc.classify_full(ElementType::I32), CompilerDiagnosis::Correct);
     }
 
     #[test]
     fn test_classify_full_peano_bug_hw_also_wrong() {
-        // Peano-emu wrong, Chess-emu correct, Peano-hw also wrong ->
-        // stays PeanoCompilerBug (hardware confirms the binary is broken).
         let correct = make_i32_bytes(&[2, 3, 4, 5]);
         let wrong = make_i32_bytes(&[99, 99, 99, 99]);
         let cc = CompilerComparison {
@@ -1173,8 +876,37 @@ transform = "input_a + 1"
             chess_emu: Some(correct),
             peano_hw: Some(wrong),
             chess_hw: None,
-            manifest_expected: Some(vec![2, 3, 4, 5]),
+            expected_values: Some(vec![2, 3, 4, 5]),
         };
         assert_eq!(cc.classify_full(ElementType::I32), CompilerDiagnosis::PeanoCompilerBug);
+    }
+
+    #[test]
+    fn test_generate_input_values_from_spec() {
+        let spec = BufferSpec {
+            buffers: vec![
+                super::super::test_cpp_parser::BufferDef {
+                    name: "in".to_string(),
+                    group_id: 3,
+                    size_elements: 4,
+                    element_type: ElementType::I32,
+                    direction: BufferDir::Input,
+                    input_pattern: InputPattern::Sequential { start: 1, step: 1 },
+                },
+                super::super::test_cpp_parser::BufferDef {
+                    name: "out".to_string(),
+                    group_id: 5,
+                    size_elements: 4,
+                    element_type: ElementType::I32,
+                    direction: BufferDir::Output,
+                    input_pattern: InputPattern::Zeros,
+                },
+            ],
+            multi_kernel: false,
+        };
+
+        let inputs = generate_input_values_from_spec(&spec);
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs["in"], vec![1, 2, 3, 4]);
     }
 }

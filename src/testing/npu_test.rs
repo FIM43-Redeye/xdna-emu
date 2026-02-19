@@ -20,9 +20,11 @@
 //! }
 //! ```
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use super::manifest_runner::TestManifest;
+use super::test_cpp_parser::BufferSpec;
+use super::native_hw::TestCppPattern;
 
 /// A single NPU test discovered from the mlir-aie source tree.
 ///
@@ -47,8 +49,16 @@ pub struct NpuTestSource {
     pub requires: Vec<String>,
     /// Test is expected to fail (XFAIL: annotation present).
     pub xfail: bool,
-    /// Attached manifest (loaded separately via `load_manifests()`).
-    pub manifest: Option<TestManifest>,
+    /// Buffer metadata parsed from test.cpp (sizes, types, group IDs, input patterns).
+    pub buffer_spec: Option<BufferSpec>,
+    /// Override: skip this test with the given reason.
+    pub skip_reason: Option<String>,
+    /// Override: test is expected to fail with the given reason.
+    pub expected_fail_reason: Option<String>,
+    /// Path to test.cpp for native hardware execution (if present).
+    pub test_cpp_path: Option<PathBuf>,
+    /// Which argument pattern the test.cpp uses (cxxopts vs #define).
+    pub test_cpp_pattern: Option<TestCppPattern>,
 }
 
 impl NpuTestSource {
@@ -152,6 +162,16 @@ fn discover_recursive(base: &Path, dir: &Path, tests: &mut Vec<NpuTestSource>) {
 
         let build_steps = filter_build_steps(&annotations.run_lines);
 
+        // Parse buffer metadata from test.cpp if present
+        let buffer_spec = super::test_cpp_parser::parse_test_cpp(dir);
+
+        // Detect test.cpp and its argument pattern for native HW execution
+        let (test_cpp_path, test_cpp_pattern) =
+            match super::native_hw::detect_test_cpp(dir) {
+                Some((path, pattern)) => (Some(path), Some(pattern)),
+                None => (None, None),
+            };
+
         tests.push(NpuTestSource {
             name,
             source_dir: dir.to_path_buf(),
@@ -159,7 +179,11 @@ fn discover_recursive(base: &Path, dir: &Path, tests: &mut Vec<NpuTestSource>) {
             build_steps,
             requires: annotations.requires,
             xfail: annotations.xfail,
-            manifest: None,
+            buffer_spec,
+            skip_reason: None,
+            expected_fail_reason: None,
+            test_cpp_path,
+            test_cpp_pattern,
         });
         // Leaf directory -- do not recurse further
         return;
@@ -348,28 +372,53 @@ pub fn filter_build_steps(run_lines: &[String]) -> Vec<String> {
     steps
 }
 
-/// Load test manifests from a directory, attaching them to discovered tests.
+/// Test overrides loaded from `tests/test_overrides.toml`.
 ///
-/// For each test, looks for `{manifest_dir}/{name}.toml`. Nested test names
-/// like `core_dmas/writebd` are looked up as `core_dmas/writebd.toml` (with
-/// the path separator preserved).
-pub fn load_manifests(tests: &mut [NpuTestSource], manifest_dir: &Path) {
-    if !manifest_dir.is_dir() {
-        return;
-    }
+/// Replaces 68 hand-maintained manifest files with a minimal set of
+/// emulator-specific metadata: skip gates and expected-fail markers.
+/// Buffer metadata comes from test.cpp parsing, not overrides.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct TestOverrides {
+    /// Tests to skip entirely, with reason string.
+    pub skip: HashMap<String, String>,
+    /// Tests expected to fail, with reason string.
+    pub expected_fail: HashMap<String, String>,
+}
 
-    for test in tests.iter_mut() {
-        let manifest_path = manifest_dir.join(format!("{}.toml", test.name));
-        if manifest_path.exists() {
-            match TestManifest::from_file(&manifest_path) {
-                Ok(manifest) => {
-                    log::debug!("Loaded manifest for {}", test.name);
-                    test.manifest = Some(manifest);
-                }
-                Err(e) => {
-                    log::warn!("Failed to load manifest for {}: {}", test.name, e);
+impl TestOverrides {
+    /// Load overrides from a TOML file.
+    ///
+    /// Returns default (empty) overrides if the file is missing or unparseable.
+    pub fn load(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                match toml::from_str(&content) {
+                    Ok(overrides) => overrides,
+                    Err(e) => {
+                        log::warn!("Failed to parse {}: {}", path.display(), e);
+                        Self::default()
+                    }
                 }
             }
+            Err(_) => Self::default(),
+        }
+    }
+}
+
+/// Load test overrides and attach skip/expected_fail metadata to tests.
+///
+/// Call after `discover()` to apply emulator-specific gates. The override
+/// file is typically at `tests/test_overrides.toml`.
+pub fn load_overrides(tests: &mut [NpuTestSource], overrides_path: &Path) {
+    let overrides = TestOverrides::load(overrides_path);
+
+    for test in tests.iter_mut() {
+        if let Some(reason) = overrides.skip.get(&test.name) {
+            test.skip_reason = Some(reason.clone());
+        }
+        if let Some(reason) = overrides.expected_fail.get(&test.name) {
+            test.expected_fail_reason = Some(reason.clone());
         }
     }
 }
@@ -558,7 +607,11 @@ mod tests {
             build_steps: Vec::new(),
             requires: vec!["ryzen_ai".to_string(), "chess".to_string()],
             xfail: false,
-            manifest: None,
+            buffer_spec: None,
+            skip_reason: None,
+            expected_fail_reason: None,
+            test_cpp_path: None,
+            test_cpp_pattern: None,
         };
         assert!(test.requires_chess());
         assert!(!test.requires_npu2());
@@ -573,7 +626,11 @@ mod tests {
             build_steps: Vec::new(),
             requires: vec!["ryzen_ai_npu2".to_string(), "peano".to_string()],
             xfail: false,
-            manifest: None,
+            buffer_spec: None,
+            skip_reason: None,
+            expected_fail_reason: None,
+            test_cpp_path: None,
+            test_cpp_pattern: None,
         };
         assert!(test.requires_npu2());
         assert!(!test.requires_chess());
@@ -588,7 +645,11 @@ mod tests {
             build_steps: Vec::new(),
             requires: vec!["ryzen_ai".to_string(), "valid_xchess_license".to_string()],
             xfail: false,
-            manifest: None,
+            buffer_spec: None,
+            skip_reason: None,
+            expected_fail_reason: None,
+            test_cpp_path: None,
+            test_cpp_pattern: None,
         };
         assert!(test.requires_chess());
     }
@@ -602,7 +663,11 @@ mod tests {
             build_steps: Vec::new(),
             requires: vec!["dont_run".to_string()],
             xfail: false,
-            manifest: None,
+            buffer_spec: None,
+            skip_reason: None,
+            expected_fail_reason: None,
+            test_cpp_path: None,
+            test_cpp_pattern: None,
         };
         assert!(test.is_suppressed());
     }
@@ -791,26 +856,6 @@ mod tests {
     }
 
     #[test]
-    fn test_load_manifests_no_match() {
-        let dir = test_dir("manifests_no_match");
-        let manifest_dir = dir.join("manifests");
-        std::fs::create_dir_all(&manifest_dir).unwrap();
-
-        let mut tests = vec![NpuTestSource {
-            name: "nonexistent_test".to_string(),
-            source_dir: dir.join("source"),
-            entry_file: dir.join("source/run.lit"),
-            build_steps: Vec::new(),
-            requires: Vec::new(),
-            xfail: false,
-            manifest: None,
-        }];
-
-        load_manifests(&mut tests, &manifest_dir);
-        assert!(tests[0].manifest.is_none());
-    }
-
-    #[test]
     fn test_run_lit_preferred_over_aie2_py() {
         let dir = test_dir("prefer_run_lit");
         let test_root = dir.join("test/npu-xrt/both_files");
@@ -830,5 +875,122 @@ mod tests {
         assert_eq!(tests.len(), 1);
         assert!(tests[0].entry_file.ends_with("run.lit"));
         assert!(tests[0].build_steps[0].contains("from_run_lit"));
+    }
+
+    #[test]
+    fn test_load_overrides_applies_skip_and_expected_fail() {
+        let dir = test_dir("load_overrides");
+        let overrides_path = dir.join("test_overrides.toml");
+        std::fs::write(&overrides_path, r#"
+[skip]
+skip_me = "Platform not supported"
+
+[expected_fail]
+flaky_test = "Known emulator limitation"
+"#).unwrap();
+
+        let mut tests = vec![
+            NpuTestSource {
+                name: "skip_me".to_string(),
+                source_dir: dir.clone(),
+                entry_file: dir.join("run.lit"),
+                build_steps: Vec::new(),
+                requires: Vec::new(),
+                xfail: false,
+                buffer_spec: None,
+                skip_reason: None,
+                expected_fail_reason: None,
+                test_cpp_path: None,
+                test_cpp_pattern: None,
+            },
+            NpuTestSource {
+                name: "flaky_test".to_string(),
+                source_dir: dir.clone(),
+                entry_file: dir.join("run.lit"),
+                build_steps: Vec::new(),
+                requires: Vec::new(),
+                xfail: false,
+                buffer_spec: None,
+                skip_reason: None,
+                expected_fail_reason: None,
+                test_cpp_path: None,
+                test_cpp_pattern: None,
+            },
+            NpuTestSource {
+                name: "normal_test".to_string(),
+                source_dir: dir.clone(),
+                entry_file: dir.join("run.lit"),
+                build_steps: Vec::new(),
+                requires: Vec::new(),
+                xfail: false,
+                buffer_spec: None,
+                skip_reason: None,
+                expected_fail_reason: None,
+                test_cpp_path: None,
+                test_cpp_pattern: None,
+            },
+        ];
+
+        load_overrides(&mut tests, &overrides_path);
+
+        assert_eq!(tests[0].skip_reason.as_deref(), Some("Platform not supported"));
+        assert!(tests[0].expected_fail_reason.is_none());
+
+        assert!(tests[1].skip_reason.is_none());
+        assert_eq!(tests[1].expected_fail_reason.as_deref(), Some("Known emulator limitation"));
+
+        assert!(tests[2].skip_reason.is_none());
+        assert!(tests[2].expected_fail_reason.is_none());
+    }
+
+    #[test]
+    fn test_load_overrides_missing_file_returns_empty() {
+        let dir = test_dir("overrides_missing");
+        let overrides_path = dir.join("does_not_exist.toml");
+
+        let mut tests = vec![NpuTestSource {
+            name: "test".to_string(),
+            source_dir: dir.clone(),
+            entry_file: dir.join("run.lit"),
+            build_steps: Vec::new(),
+            requires: Vec::new(),
+            xfail: false,
+            buffer_spec: None,
+            skip_reason: None,
+            expected_fail_reason: None,
+            test_cpp_path: None,
+            test_cpp_pattern: None,
+        }];
+
+        load_overrides(&mut tests, &overrides_path);
+        assert!(tests[0].skip_reason.is_none());
+        assert!(tests[0].expected_fail_reason.is_none());
+    }
+
+    #[test]
+    fn test_load_overrides_nested_test_name() {
+        let dir = test_dir("overrides_nested");
+        let overrides_path = dir.join("test_overrides.toml");
+        std::fs::write(&overrides_path, r#"
+[skip]
+"adjacent_memtile_access/two_memtiles" = "Requires NPU2"
+"#).unwrap();
+
+        let mut tests = vec![NpuTestSource {
+            name: "adjacent_memtile_access/two_memtiles".to_string(),
+            source_dir: dir.clone(),
+            entry_file: dir.join("run.lit"),
+            build_steps: Vec::new(),
+            requires: Vec::new(),
+            xfail: false,
+            buffer_spec: None,
+            skip_reason: None,
+            expected_fail_reason: None,
+            test_cpp_path: None,
+            test_cpp_pattern: None,
+        }];
+
+        load_overrides(&mut tests, &overrides_path);
+        assert_eq!(tests[0].skip_reason.as_deref(), Some("Requires NPU2"));
     }
 }

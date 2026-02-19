@@ -3,30 +3,32 @@
 //! This module provides infrastructure for:
 //! - Discovering and running xclbin test files
 //! - Collecting unknown opcodes when execution fails
-//! - Validating output against expected results
-//! - Running tests from TOML manifests (extracted from mlir-aie)
+//! - Validating output against hardware reference captures
+//! - Parsing buffer metadata from test.cpp files
 //!
 //! # Usage
 //!
 //! ```bash
 //! # Run xclbin test suite
 //! cargo run -- test-suite /path/to/mlir-aie/build/test/npu-xrt/
-//!
-//! # Run manifest-based test
-//! cargo run --example manifest_test -- tests/mlir-aie-extracted/manifests/add_one_using_dma.toml
 //! ```
 
 pub mod xclbin_suite;
 pub mod opcode_collector;
-pub mod manifest_runner;
 pub mod npu_runner;
 pub mod hardware_comparison;
 pub mod unit_test;
 pub mod npu_test;
+pub mod test_cpp_parser;
+pub mod runner_config;
+pub mod runner_stats;
+pub mod hw_executor;
+pub mod runner_display;
+pub mod native_hw;
 
-pub use xclbin_suite::{XclbinSuite, XclbinTest, TestOutcome};
+pub use xclbin_suite::{XclbinSuite, XclbinTest, TestOutcome, Compiler};
 pub use opcode_collector::{UnknownOpcode, OpcodeCollector};
-pub use manifest_runner::{TestManifest, ManifestRunner, TestResult, ElementType};
+pub use test_cpp_parser::{BufferSpec, ElementType};
 pub use hardware_comparison::{Diagnosis, HardwareValidation};
 pub use unit_test::{UnitTest, UnitTestBuildResult};
 pub use npu_test::NpuTestSource;

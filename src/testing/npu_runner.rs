@@ -1,13 +1,13 @@
 //! Rust orchestration for running tests on real NPU hardware.
 //!
-//! Drives the C++ `npu-runner` tool, translating manifest-defined tests
-//! into CLI invocations.  All TOML parsing and data generation stays in
-//! Rust; the C++ side is a thin XRT wrapper.
+//! Drives the C++ `npu-runner` tool, translating BufferSpec-defined tests
+//! into CLI invocations.  Buffer metadata is parsed from test.cpp; the
+//! C++ side is a thin XRT wrapper.
 //!
 //! # Architecture
 //!
 //! ```text
-//! Manifest (TOML)
+//! test.cpp (parsed by test_cpp_parser)
 //!   |
 //!   v
 //! npu_runner.rs          -- generates input files, invokes npu-runner
@@ -23,8 +23,10 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
-use super::manifest_runner::{TestManifest, ElementType, read_values};
+use super::test_cpp_parser::{BufferSpec, BufferDef, BufferDir, generate_input_data, read_values};
 
 /// Well-known paths where the npu-runner binary might be found.
 const RUNNER_SEARCH_PATHS: &[&str] = &[
@@ -57,6 +59,122 @@ const ACCEL_DEVICE_NODES: &[&str] = &[
 /// created by the xdna-driver when an AMD NPU is present.
 pub fn npu_available() -> bool {
     ACCEL_DEVICE_NODES.iter().any(|p| Path::new(p).exists())
+}
+
+/// Probe whether the NPU device appears healthy.
+///
+/// Checks that the accel device node exists and is stat-able.
+/// This is a lightweight check -- it does NOT open the device
+/// or allocate any XRT resources. Useful for distinguishing
+/// "device node gone" (driver crash) from "XRT can't open it"
+/// (device wedged but driver alive).
+pub fn probe_device_health() -> bool {
+    use std::fs;
+    ACCEL_DEVICE_NODES.iter().any(|p| fs::metadata(p).is_ok())
+}
+
+// ── Adaptive device readiness polling ──────────────────────────────
+//
+// Instead of fixed-duration sleeps between test runs, we poll the
+// Linux runtime PM sysfs entries that the kernel maintains for every
+// PCI device. These reads are free (no device wake, no side effects):
+//
+//   runtime_usage   - refcount of active users (0 = nobody has the fd open)
+//   runtime_status  - power state lifecycle (active / suspending / suspended)
+//
+// Path: /sys/class/accel/<node>/device/power/
+
+/// Cached sysfs power directory for the NPU device.
+/// Discovered once on first access, reused for all subsequent calls.
+static NPU_POWER_SYSFS: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Maximum time to wait for device suspension after an error (seconds).
+const DEVICE_IDLE_TIMEOUT_SECS: u64 = 10;
+
+/// Poll interval when waiting for device suspension (ms).
+const DEVICE_IDLE_POLL_MS: u64 = 100;
+
+/// Fixed fallback cooldown after success when sysfs is unavailable (ms).
+const FALLBACK_COOLDOWN_MS: u64 = 200;
+
+/// Fixed fallback cooldown after error when sysfs is unavailable (ms).
+const FALLBACK_ERROR_COOLDOWN_MS: u64 = 2000;
+
+/// Discover the sysfs power directory for the NPU device.
+///
+/// Follows `/sys/class/accel/<node>/device/power/` which is a stable
+/// path through the sysfs symlink chain to the PCI device's runtime PM.
+fn npu_power_sysfs() -> Option<&'static Path> {
+    NPU_POWER_SYSFS.get_or_init(|| {
+        for node in ACCEL_DEVICE_NODES {
+            if let Some(dev_name) = Path::new(node).file_name() {
+                let power_dir = PathBuf::from("/sys/class/accel")
+                    .join(dev_name)
+                    .join("device/power");
+                if power_dir.exists() {
+                    return Some(power_dir);
+                }
+            }
+        }
+        None
+    }).as_deref()
+}
+
+/// Wait for the NPU device to become idle after a test run.
+///
+/// Uses Linux runtime PM sysfs to adaptively wait for device readiness
+/// instead of fixed-duration sleeps:
+///
+/// - **After success**: reads `runtime_usage` once. If 0, the device has
+///   no active users and we proceed immediately. Since npu-runner has
+///   already exited, this is typically instant.
+///
+/// - **After error/timeout**: polls `runtime_status` for `"suspended"`,
+///   meaning the device has fully powered down and recovered from TDR.
+///   Polls every 100ms, gives up after 10s.
+///
+/// Falls back to fixed cooldowns if sysfs is unavailable (different
+/// kernel, container, etc.).
+pub fn wait_for_device_idle(after_error: bool) {
+    let Some(power_dir) = npu_power_sysfs() else {
+        // Sysfs not available -- fall back to fixed cooldown.
+        let ms = if after_error { FALLBACK_ERROR_COOLDOWN_MS } else { FALLBACK_COOLDOWN_MS };
+        std::thread::sleep(Duration::from_millis(ms));
+        return;
+    };
+
+    if after_error {
+        // After error/TDR: wait for full device suspension (recovery complete).
+        // The driver resets the device during TDR, then runtime PM eventually
+        // suspends it once all contexts are torn down.
+        let status_path = power_dir.join("runtime_status");
+        let deadline = Instant::now() + Duration::from_secs(DEVICE_IDLE_TIMEOUT_SECS);
+
+        loop {
+            if let Ok(status) = std::fs::read_to_string(&status_path) {
+                if status.trim() == "suspended" {
+                    return;
+                }
+            }
+            if Instant::now() >= deadline {
+                // Timed out -- proceed anyway, cascade detection will catch
+                // persistent problems.
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(DEVICE_IDLE_POLL_MS));
+        }
+    } else {
+        // After success: verify runtime_usage is 0 (no active users).
+        // npu-runner has already exited so this should be immediate.
+        let usage_path = power_dir.join("runtime_usage");
+        if let Ok(usage) = std::fs::read_to_string(&usage_path) {
+            if usage.trim() == "0" {
+                return;
+            }
+        }
+        // Usage not 0 or unreadable -- brief fallback.
+        std::thread::sleep(Duration::from_millis(FALLBACK_COOLDOWN_MS));
+    }
 }
 
 /// Find the npu-runner binary, searching known build locations.
@@ -101,7 +219,7 @@ pub enum NpuRunError {
     NoHardware,
     /// npu-runner binary not found (not built).
     NoBinary,
-    /// Failed to generate input data from manifest.
+    /// Failed to generate input data from buffer spec.
     InputGeneration(String),
     /// npu-runner process failed.
     ExecutionFailed {
@@ -145,17 +263,19 @@ pub struct NpuRunResult {
 
 /// Run a test on real NPU hardware.
 ///
-/// Dispatches to single-kernel or multi-kernel execution based on the
-/// manifest's `multi_kernel` section.  For multi-kernel tests, generates
-/// a run spec file and invokes npu-runner in `--spec` mode.
+/// Uses buffer metadata from the parsed test.cpp (BufferSpec) to set up
+/// input/output buffers and invoke npu-runner.  Multi-kernel tests are
+/// not yet supported via BufferSpec; they return `InputGeneration` error.
 ///
 /// # Arguments
-/// * `manifest` - Test manifest defining inputs, outputs, and transforms
+/// * `spec` - Buffer specification parsed from test.cpp
+/// * `test_name` - Test name (used for temp directory naming)
 /// * `xclbin_path` - Path to the compiled .xclbin file
-/// * `insts_path` - Path to the NPU instruction binary (insts.bin for single-kernel)
+/// * `insts_path` - Path to the NPU instruction binary (insts.bin)
 /// * `timeout_sec` - Kernel execution timeout in seconds
 pub fn run_on_npu(
-    manifest: &TestManifest,
+    spec: &BufferSpec,
+    test_name: &str,
     xclbin_path: &Path,
     insts_path: &Path,
     timeout_sec: u32,
@@ -166,22 +286,25 @@ pub fn run_on_npu(
 
     let runner = runner_binary().ok_or(NpuRunError::NoBinary)?;
 
-    if manifest.is_multi_kernel() {
-        run_multi_kernel(manifest, xclbin_path, &runner, timeout_sec)
-    } else {
-        run_single_kernel(manifest, xclbin_path, insts_path, &runner, timeout_sec)
+    if spec.multi_kernel {
+        return Err(NpuRunError::InputGeneration(
+            "Multi-kernel tests not yet supported via BufferSpec".to_string(),
+        ));
     }
+
+    run_single_kernel(spec, test_name, xclbin_path, insts_path, &runner, timeout_sec)
 }
 
-/// Run a single-kernel test using the legacy CLI mode.
+/// Run a single-kernel test using the CLI mode.
 fn run_single_kernel(
-    manifest: &TestManifest,
+    spec: &BufferSpec,
+    test_name: &str,
     xclbin_path: &Path,
     insts_path: &Path,
     runner: &Path,
     timeout_sec: u32,
 ) -> Result<NpuRunResult, NpuRunError> {
-    let tmp_dir = std::env::temp_dir().join(format!("npu_run_{}", manifest.test.name));
+    let tmp_dir = std::env::temp_dir().join(format!("npu_run_{}", test_name));
     std::fs::create_dir_all(&tmp_dir)?;
 
     let mut args: Vec<String> = vec![
@@ -194,59 +317,42 @@ fn run_single_kernel(
     let mut input_values = HashMap::new();
 
     // Generate and write input buffers
-    for (buf_name, buf_def) in &manifest.buffers {
-        if buf_name == "output" {
+    for buf in &spec.buffers {
+        if buf.direction != BufferDir::Input {
             continue;
         }
 
-        let elem_type = ElementType::from_str(&buf_def.element_type)
-            .ok_or_else(|| NpuRunError::InputGeneration(
-                format!("Unknown element type: {}", buf_def.element_type),
-            ))?;
+        let input_data = generate_input_data(buf);
+        input_values.insert(buf.name.clone(), read_values(&input_data, buf.element_type));
 
-        let input_data = manifest.generate_input(buf_name)
-            .ok_or_else(|| NpuRunError::InputGeneration(
-                format!("Failed to generate input for buffer '{}'", buf_name),
-            ))?;
-
-        input_values.insert(buf_name.clone(), read_values(&input_data, elem_type));
-
-        let input_file = tmp_dir.join(format!("{}.bin", buf_name));
+        let input_file = tmp_dir.join(format!("{}.bin", buf.name));
         let mut f = std::fs::File::create(&input_file)?;
         f.write_all(&input_data)?;
 
-        let size_bytes = buf_def.size * elem_type.byte_size();
+        let size_bytes = buf.size_elements * buf.element_type.byte_size();
 
         args.extend_from_slice(&[
             "--in".to_string(),
-            buf_def.group_id.to_string(),
+            buf.group_id.to_string(),
             input_file.to_string_lossy().to_string(),
             size_bytes.to_string(),
         ]);
     }
 
-    // Set up output buffer
-    let output_buf = manifest.get_output()
+    // Set up output buffer (first output buffer in the spec)
+    let output_buf = find_output_buffer(&spec.buffers)
         .ok_or_else(|| NpuRunError::InputGeneration(
-            "No output buffer defined in manifest".to_string(),
-        ))?;
-    let output_elem_type = ElementType::from_str(&output_buf.element_type)
-        .ok_or_else(|| NpuRunError::InputGeneration(
-            format!("Unknown output element type: {}", output_buf.element_type),
+            "No output buffer defined in buffer spec".to_string(),
         ))?;
 
-    // Allocate output buffer with optional trace padding. Tests that enable
-    // hardware tracing set trace_size so the NPU can write trace packets
-    // after the output data.
-    let output_data_size = output_buf.size * output_elem_type.byte_size();
-    let output_alloc_size = output_data_size + output_buf.trace_size;
+    let output_size_bytes = output_buf.size_elements * output_buf.element_type.byte_size();
     let output_file = tmp_dir.join("output.bin");
 
     args.extend_from_slice(&[
         "--out".to_string(),
         output_buf.group_id.to_string(),
         output_file.to_string_lossy().to_string(),
-        output_alloc_size.to_string(),
+        output_size_bytes.to_string(),
     ]);
 
     log::info!("Running on NPU (single-kernel): {} {}", runner.display(),
@@ -261,152 +367,9 @@ fn run_single_kernel(
     handle_runner_result(output, &output_file, &tmp_dir, input_values)
 }
 
-/// Run a multi-kernel test using a spec file.
-///
-/// Generates a run specification file from the manifest's `multi_kernel`
-/// section, then invokes npu-runner with `--spec`.  The spec file describes
-/// the kernel invocation order, buffer allocations, and linkages.
-fn run_multi_kernel(
-    manifest: &TestManifest,
-    xclbin_path: &Path,
-    runner: &Path,
-    timeout_sec: u32,
-) -> Result<NpuRunResult, NpuRunError> {
-    let mk = manifest.multi_kernel.as_ref().unwrap();
-    let build_dir = xclbin_path.parent().unwrap_or(Path::new("."));
-
-    let tmp_dir = std::env::temp_dir().join(format!("npu_run_{}", manifest.test.name));
-    std::fs::create_dir_all(&tmp_dir)?;
-
-    let mut input_values = HashMap::new();
-
-    // Generate input files
-    let mut input_files: HashMap<String, (PathBuf, usize)> = HashMap::new();
-    for (buf_name, buf_def) in &manifest.buffers {
-        if buf_name == "output" {
-            continue;
-        }
-        let elem_type = ElementType::from_str(&buf_def.element_type)
-            .ok_or_else(|| NpuRunError::InputGeneration(
-                format!("Unknown element type: {}", buf_def.element_type),
-            ))?;
-
-        let input_data = manifest.generate_input(buf_name)
-            .ok_or_else(|| NpuRunError::InputGeneration(
-                format!("Failed to generate input for buffer '{}'", buf_name),
-            ))?;
-
-        input_values.insert(buf_name.clone(), read_values(&input_data, elem_type));
-
-        let input_file = tmp_dir.join(format!("{}.bin", buf_name));
-        let mut f = std::fs::File::create(&input_file)?;
-        f.write_all(&input_data)?;
-
-        let size_bytes = buf_def.size * elem_type.byte_size();
-        input_files.insert(buf_name.clone(), (input_file, size_bytes));
-    }
-
-    // Get output buffer info
-    let output_buf = manifest.get_output()
-        .ok_or_else(|| NpuRunError::InputGeneration(
-            "No output buffer defined in manifest".to_string(),
-        ))?;
-    let output_elem_type = ElementType::from_str(&output_buf.element_type)
-        .ok_or_else(|| NpuRunError::InputGeneration(
-            format!("Unknown output element type: {}", output_buf.element_type),
-        ))?;
-    let output_data_size = output_buf.size * output_elem_type.byte_size();
-    let output_size = output_data_size + output_buf.trace_size;
-    let output_file = tmp_dir.join("output.bin");
-
-    // Build the linkage lookup: (to_run, to_gid) -> (from_run, from_gid)
-    let mut link_map: HashMap<(usize, u32), (usize, u32)> = HashMap::new();
-    for link in &mk.links {
-        link_map.insert(
-            (link.to_run, link.to_group_id),
-            (link.from_run, link.from_group_id),
-        );
-    }
-
-    // Generate run specification file
-    let spec_file = tmp_dir.join("run_spec.txt");
-    let mut spec = String::new();
-    spec.push_str(&format!("# Multi-kernel spec for {}\n", manifest.test.name));
-    spec.push_str(&format!("xclbin {}\n", xclbin_path.to_string_lossy()));
-    spec.push_str(&format!("mode {}\n", mk.mode));
-    spec.push_str(&format!("timeout {}\n\n", timeout_sec));
-
-    let last_run = mk.runs.len() - 1;
-
-    for (run_idx, kr) in mk.runs.iter().enumerate() {
-        let insts_path = build_dir.join(&kr.insts);
-        spec.push_str(&format!("run {} {}\n", kr.kernel,
-            insts_path.to_string_lossy()));
-
-        // For each buffer group_id referenced by input buffers, check
-        // if this run needs it as input, linked, or output.
-        //
-        // Strategy: iterate all manifest buffers and assign them to the
-        // appropriate run based on the linkage map.
-
-        // Input buffers go to the first run (unless overridden by links)
-        for (buf_name, buf_def) in &manifest.buffers {
-            if buf_name == "output" {
-                continue;
-            }
-            // Check if this buffer is linked to this run from a previous run
-            if link_map.contains_key(&(run_idx, buf_def.group_id)) {
-                continue; // Will be handled as a link below
-            }
-            // Input buffers go to run 0 (or whichever run consumes them)
-            if run_idx == 0 {
-                if let Some((file, size)) = input_files.get(buf_name) {
-                    spec.push_str(&format!("in {} {} {}\n",
-                        buf_def.group_id,
-                        file.to_string_lossy(),
-                        size));
-                }
-            }
-        }
-
-        // Links
-        for link in &mk.links {
-            if link.to_run == run_idx {
-                spec.push_str(&format!("link {} {} {}\n",
-                    link.to_group_id, link.from_run, link.from_group_id));
-            }
-        }
-
-        // Output buffer: intermediate (no file) for all runs except the last
-        if run_idx == last_run {
-            spec.push_str(&format!("out {} {} {}\n",
-                output_buf.group_id,
-                output_file.to_string_lossy(),
-                output_size));
-        } else {
-            // Check if any links reference this run's output
-            for link in &mk.links {
-                if link.from_run == run_idx {
-                    spec.push_str(&format!("out {} {}\n",
-                        link.from_group_id, output_size));
-                }
-            }
-        }
-        spec.push('\n');
-    }
-
-    std::fs::write(&spec_file, &spec)?;
-
-    log::info!("Running on NPU (multi-kernel): {} --spec {}",
-        runner.display(), spec_file.display());
-    log::debug!("Spec file contents:\n{}", spec);
-
-    let output = Command::new(runner)
-        .args(["--spec", &spec_file.to_string_lossy()])
-        .env("LD_LIBRARY_PATH", sanitized_ld_library_path())
-        .output()?;
-
-    handle_runner_result(output, &output_file, &tmp_dir, input_values)
+/// Find the first output buffer in a buffer list.
+fn find_output_buffer(buffers: &[BufferDef]) -> Option<&BufferDef> {
+    buffers.iter().find(|b| b.direction == BufferDir::Output)
 }
 
 /// Process the result of a npu-runner invocation.
@@ -440,28 +403,28 @@ fn handle_runner_result(
     }
 }
 
-/// Generate input values from a manifest (without running on hardware).
+/// Generate input values from a BufferSpec (without running on hardware).
 ///
 /// Useful for comparison when you already have hardware output captured
 /// on disk and just need the input values to compute expected output.
-pub fn generate_inputs(manifest: &TestManifest) -> Option<HashMap<String, Vec<i64>>> {
+pub fn generate_inputs(spec: &BufferSpec) -> HashMap<String, Vec<i64>> {
     let mut inputs = HashMap::new();
 
-    for (buf_name, buf_def) in &manifest.buffers {
-        if buf_name == "output" {
+    for buf in &spec.buffers {
+        if buf.direction != BufferDir::Input {
             continue;
         }
-        let elem_type = ElementType::from_str(&buf_def.element_type)?;
-        let data = manifest.generate_input(buf_name)?;
-        inputs.insert(buf_name.clone(), read_values(&data, elem_type));
+        let data = generate_input_data(buf);
+        inputs.insert(buf.name.clone(), read_values(&data, buf.element_type));
     }
 
-    Some(inputs)
+    inputs
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::test_cpp_parser::{InputPattern, ElementType};
 
     #[test]
     fn test_npu_device_detection() {
@@ -477,89 +440,59 @@ mod tests {
         let _binary = runner_binary();
     }
 
+    /// Helper to build a BufferDef for tests.
+    fn make_input(name: &str, group_id: u32, size: usize, pattern: InputPattern) -> BufferDef {
+        BufferDef {
+            name: name.to_string(),
+            group_id,
+            size_elements: size,
+            element_type: ElementType::I32,
+            direction: BufferDir::Input,
+            input_pattern: pattern,
+        }
+    }
+
+    fn make_output(name: &str, group_id: u32, size: usize) -> BufferDef {
+        BufferDef {
+            name: name.to_string(),
+            group_id,
+            size_elements: size,
+            element_type: ElementType::I32,
+            direction: BufferDir::Output,
+            input_pattern: InputPattern::Zeros,
+        }
+    }
+
     #[test]
     fn test_generate_inputs_single() {
-        let toml_content = r#"
-[test]
-name = "test"
-source_dir = "test"
+        let spec = BufferSpec {
+            buffers: vec![
+                make_input("bo_inA", 3, 4, InputPattern::Sequential { start: 1, step: 1 }),
+                make_output("bo_out", 5, 4),
+            ],
+            multi_kernel: false,
+        };
 
-[build]
-mlir_file = "aie.mlir"
-device = "npu1_1col"
-
-[buffers.input_a]
-size = 4
-element_type = "i32"
-group_id = 3
-
-[buffers.input_a.pattern]
-type = "sequential"
-start = 1
-step = 1
-
-[buffers.output]
-size = 4
-element_type = "i32"
-group_id = 5
-
-[expected]
-type = "transform"
-transform = "input_a + 1"
-"#;
-        let manifest: TestManifest = toml::from_str(toml_content).unwrap();
-        let inputs = generate_inputs(&manifest).unwrap();
-
+        let inputs = generate_inputs(&spec);
         assert_eq!(inputs.len(), 1);
-        assert_eq!(inputs["input_a"], vec![1, 2, 3, 4]);
+        assert_eq!(inputs["bo_inA"], vec![1, 2, 3, 4]);
     }
 
     #[test]
     fn test_generate_inputs_two_buffers() {
-        let toml_content = r#"
-[test]
-name = "vec_add"
-source_dir = "test"
+        let spec = BufferSpec {
+            buffers: vec![
+                make_input("bo_inA", 3, 4, InputPattern::Sequential { start: 1, step: 1 }),
+                make_input("bo_inB", 4, 4, InputPattern::Sequential { start: 10, step: 10 }),
+                make_output("bo_out", 5, 4),
+            ],
+            multi_kernel: false,
+        };
 
-[build]
-mlir_file = "aie.mlir"
-device = "npu1_1col"
-
-[buffers.input_a]
-size = 4
-element_type = "i32"
-group_id = 3
-
-[buffers.input_a.pattern]
-type = "sequential"
-start = 1
-step = 1
-
-[buffers.input_b]
-size = 4
-element_type = "i32"
-group_id = 4
-
-[buffers.input_b.pattern]
-type = "sequential"
-start = 10
-step = 10
-
-[buffers.output]
-size = 4
-element_type = "i32"
-group_id = 5
-
-[expected]
-type = "transform"
-transform = "input_a + input_b"
-"#;
-        let manifest: TestManifest = toml::from_str(toml_content).unwrap();
-        let inputs = generate_inputs(&manifest).unwrap();
-
+        let inputs = generate_inputs(&spec);
         assert_eq!(inputs.len(), 2);
-        assert_eq!(inputs["input_a"], vec![1, 2, 3, 4]);
-        assert_eq!(inputs["input_b"], vec![10, 20, 30, 40]);
+        assert_eq!(inputs["bo_inA"], vec![1, 2, 3, 4]);
+        assert_eq!(inputs["bo_inB"], vec![10, 20, 30, 40]);
     }
 
     #[test]
@@ -572,98 +505,37 @@ transform = "input_a + input_b"
     }
 
     #[test]
-    fn test_multi_kernel_manifest_parsing() {
-        let toml_content = r#"
-[test]
-name = "add_one_two"
-source_dir = "test/npu-xrt/add_one_two"
+    fn test_multi_kernel_spec_returns_error() {
+        let spec = BufferSpec {
+            buffers: vec![
+                make_input("bo_inA", 3, 4, InputPattern::Sequential { start: 1, step: 1 }),
+                make_output("bo_out", 5, 4),
+            ],
+            multi_kernel: true,
+        };
 
-[build]
-mlir_file = "aie.mlir"
-device = "npu1_1col"
-
-[buffers.input_a]
-size = 64
-element_type = "i32"
-group_id = 3
-
-[buffers.input_a.pattern]
-type = "sequential"
-start = 1
-step = 1
-
-[buffers.output]
-size = 64
-element_type = "i32"
-group_id = 5
-
-[expected]
-type = "transform"
-transform = "input_a + 3"
-
-[multi_kernel]
-mode = "sequential"
-
-[[multi_kernel.runs]]
-kernel = "ADDONE"
-insts = "insts.bin"
-
-[[multi_kernel.runs]]
-kernel = "ADDTWO"
-insts = "insts.bin"
-
-[[multi_kernel.links]]
-from_run = 0
-from_group_id = 5
-to_run = 1
-to_group_id = 3
-"#;
-        let manifest: TestManifest = toml::from_str(toml_content).unwrap();
-        assert!(manifest.is_multi_kernel());
-
-        let mk = manifest.multi_kernel.as_ref().unwrap();
-        assert_eq!(mk.mode, "sequential");
-        assert_eq!(mk.runs.len(), 2);
-        assert_eq!(mk.runs[0].kernel, "ADDONE");
-        assert_eq!(mk.runs[1].kernel, "ADDTWO");
-        assert_eq!(mk.links.len(), 1);
-        assert_eq!(mk.links[0].from_run, 0);
-        assert_eq!(mk.links[0].from_group_id, 5);
-        assert_eq!(mk.links[0].to_run, 1);
-        assert_eq!(mk.links[0].to_group_id, 3);
+        let result = run_on_npu(&spec, "test", Path::new("a.xclbin"), Path::new("insts.bin"), 30);
+        // Will fail with NoHardware or NoBinary before reaching the multi-kernel check
+        // in CI, but on a machine with hardware it would hit InputGeneration.
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_single_kernel_has_no_multi_kernel() {
-        let toml_content = r#"
-[test]
-name = "test"
-source_dir = "test"
+    fn test_find_output_buffer() {
+        let buffers = vec![
+            make_input("bo_inA", 3, 4, InputPattern::Sequential { start: 1, step: 1 }),
+            make_output("bo_out", 5, 4),
+        ];
+        let out = find_output_buffer(&buffers).unwrap();
+        assert_eq!(out.name, "bo_out");
+        assert_eq!(out.group_id, 5);
+    }
 
-[build]
-mlir_file = "aie.mlir"
-device = "npu1_1col"
-
-[buffers.input_a]
-size = 4
-element_type = "i32"
-group_id = 3
-
-[buffers.input_a.pattern]
-type = "sequential"
-start = 1
-step = 1
-
-[buffers.output]
-size = 4
-element_type = "i32"
-group_id = 5
-
-[expected]
-type = "transform"
-transform = "input_a + 1"
-"#;
-        let manifest: TestManifest = toml::from_str(toml_content).unwrap();
-        assert!(!manifest.is_multi_kernel());
+    #[test]
+    fn test_find_output_buffer_none() {
+        let buffers = vec![
+            make_input("bo_inA", 3, 4, InputPattern::Sequential { start: 1, step: 1 }),
+        ];
+        assert!(find_output_buffer(&buffers).is_none());
     }
 }

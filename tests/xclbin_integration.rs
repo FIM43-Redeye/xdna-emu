@@ -1,4 +1,4 @@
-//! Integration tests for xclbin binary execution with manifest validation.
+//! Integration tests for xclbin binary execution with hardware reference validation.
 //!
 //! These tests require built mlir-aie test binaries. Build them first:
 //!
@@ -13,15 +13,16 @@
 //! ```
 //!
 //! Each test loads a real xclbin binary, runs it through the emulator,
-//! and validates the output against the manifest's expected transform.
-//! Tests marked `expected_fail` in their manifest will pass as long as
+//! and validates the output against hardware reference captures.
+//! Tests marked `expected_fail` in test_overrides.toml will pass as long as
 //! they fail in the expected way. Tests marked `skip` are not run.
 
 #![cfg(feature = "xclbin-tests")]
 
 use std::path::PathBuf;
 
-use xdna_emu::testing::manifest_runner::TestManifest;
+use xdna_emu::testing::test_cpp_parser;
+use xdna_emu::testing::npu_test::NpuTestSource;
 use xdna_emu::testing::xclbin_suite::{XclbinTest, XclbinSuite, TestOutcome};
 
 /// Find the mlir-aie build directory.
@@ -48,14 +49,19 @@ fn mlir_aie_build() -> Option<PathBuf> {
     None
 }
 
-/// Find the manifest directory.
-fn manifest_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/mlir-aie-extracted/manifests")
+/// mlir-aie source test directory (for test.cpp parsing).
+fn mlir_aie_test_src() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../mlir-aie/test/npu-xrt")
 }
 
-/// Load a test by name: find the xclbin, load the manifest, create XclbinTest.
-fn load_test(name: &str) -> Option<(XclbinTest, TestManifest)> {
+/// Load test overrides from test_overrides.toml.
+fn load_overrides() -> xdna_emu::testing::npu_test::TestOverrides {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/test_overrides.toml");
+    xdna_emu::testing::npu_test::TestOverrides::load(&path)
+}
+
+/// Load a test by name: find the xclbin, parse test.cpp, apply overrides.
+fn load_test(name: &str) -> Option<XclbinTest> {
     let build = mlir_aie_build()?;
     let test_dir = build.join("test/npu-xrt").join(name);
 
@@ -68,24 +74,34 @@ fn load_test(name: &str) -> Option<(XclbinTest, TestManifest)> {
         return None;
     };
 
-    // Load manifest
-    let manifest_path = manifest_dir().join(format!("{}.toml", name));
-    let manifest = TestManifest::from_file(&manifest_path).ok()?;
+    // Parse test.cpp for buffer metadata
+    let buffer_spec = test_cpp_parser::parse_test_cpp(&mlir_aie_test_src().join(name));
 
-    let test = XclbinTest::from_path(&xclbin_path).with_manifest(manifest.clone());
+    // Apply overrides
+    let overrides = load_overrides();
 
-    Some((test, manifest))
+    let mut test = XclbinTest::from_path(&xclbin_path);
+    test.buffer_spec = buffer_spec;
+
+    if let Some(reason) = overrides.skip.get(name) {
+        test.skip_reason = Some(reason.clone());
+    }
+    if let Some(reason) = overrides.expected_fail.get(name) {
+        test.expected_fail_reason = Some(reason.clone());
+    }
+
+    Some(test)
 }
 
-/// Run a test and return the outcome, handling skip/expected_fail.
+/// Run a test and report the outcome.
 fn run_test(name: &str) {
-    let Some((test, manifest)) = load_test(name) else {
-        eprintln!("SKIP {}: binary or manifest not found (run ./scripts/build-mlir-aie-tests.sh)", name);
+    let Some(test) = load_test(name) else {
+        eprintln!("SKIP {}: binary not found (run ./scripts/build-mlir-aie-tests.sh)", name);
         return;
     };
 
-    if manifest.test.skip {
-        eprintln!("SKIP {}: {}", name, manifest.test.skip_reason);
+    if let Some(ref reason) = test.skip_reason {
+        eprintln!("SKIP {}: {}", name, reason);
         return;
     }
 
@@ -94,30 +110,21 @@ fn run_test(name: &str) {
 
     match &outcome {
         TestOutcome::Pass { cycles, correct, total } => {
-            if manifest.test.expected_fail {
-                // Expected to fail but passed -- manifest needs updating
-                panic!(
-                    "UNEXPECTED PASS for {}: passed ({} cycles, {:?}/{:?} correct) \
-                     but manifest says expected_fail=true. Update the manifest!",
-                    name, cycles, correct, total
-                );
-            }
             eprintln!(
                 "PASS {}: {} cycles, {:?}/{:?} validated",
                 name, cycles, correct, total
             );
         }
-        TestOutcome::ExpectedFail { cycles, reason, .. } => {
+        TestOutcome::ExpectedFail { cycles, reason, actual } => {
             eprintln!(
-                "EXPECTED FAIL {}: {} cycles - {}",
-                name, cycles, reason
+                "EXPECTED FAIL {}: {} cycles - {} ({})",
+                name, cycles, reason, actual
             );
-            // This is OK -- test failed as documented
         }
         TestOutcome::UnexpectedPass { cycles, correct, total } => {
             panic!(
                 "UNEXPECTED PASS for {}: {} cycles, {}/{} correct. \
-                 Remove expected_fail from manifest!",
+                 Remove expected_fail from test_overrides.toml!",
                 name, cycles, correct, total
             );
         }
@@ -155,7 +162,7 @@ fn run_test(name: &str) {
 }
 
 // ===== Individual test functions =====
-// Each maps to a manifest file and (potentially) a built test binary.
+// Each maps to a test.cpp and (potentially) a built test binary.
 // Tests are ordered alphabetically for easy scanning.
 
 #[test]

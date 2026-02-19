@@ -12,11 +12,23 @@ use crate::interpreter::engine::{InterpreterEngine, EngineStatus};
 use crate::npu::{NpuInstructionStream, NpuExecutor, HostBuffer};
 
 use super::opcode_collector::{OpcodeCollector, UnknownOpcode};
-use super::manifest_runner::{TestManifest, ElementType, read_values};
+use super::test_cpp_parser::{BufferSpec, BufferDir, ElementType, read_values, generate_input_data};
 use super::hardware_comparison::{
     self, CrossValidation, HardwareValidation, Diagnosis,
 };
+use super::native_hw::TestCppPattern;
 use std::collections::HashMap;
+
+/// Which compiler produced an xclbin artifact.
+///
+/// Tracks the provenance of each test so hardware execution statistics
+/// are attributed to the correct compiler. Without this, Chess-only tests
+/// that land in `primary_tests` would be mislabeled as Peano.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compiler {
+    Peano,
+    Chess,
+}
 
 /// Result of running a single xclbin test.
 #[derive(Debug)]
@@ -36,21 +48,21 @@ pub enum TestOutcome {
         total: usize,
         first_mismatch: Option<(usize, i64, i64)>, // (index, expected, actual)
     },
-    /// Known-broken test failed as expected. The manifest has
-    /// `expected_fail = true`, and the test did in fact produce wrong output.
+    /// Known-broken test failed as expected. The test has an
+    /// expected_fail_reason in test_overrides.toml, and did produce wrong output.
     /// This is informational, not a test failure.
     ///
     /// The `actual` field preserves the underlying failure details so we can
-    /// track progress without removing the expected_fail flag.
+    /// track progress without removing the expected_fail entry.
     ExpectedFail {
         cycles: u64,
         reason: String,
         /// Human-readable description of the actual failure (e.g. "ValidationFail: 0/64 correct")
         actual: String,
     },
-    /// Known-broken test unexpectedly passed. The manifest has
-    /// `expected_fail = true`, but the test produced correct output.
-    /// This means the emulator improved or the manifest needs updating.
+    /// Known-broken test unexpectedly passed. The test has an
+    /// expected_fail_reason in test_overrides.toml, but produced correct output.
+    /// This means the emulator improved or the override needs removing.
     UnexpectedPass {
         cycles: u64,
         correct: usize,
@@ -134,11 +146,26 @@ pub struct XclbinTest {
     pub project_dir: Option<PathBuf>,
     /// Optional expected output for validation.
     pub expected_output: Option<Vec<u8>>,
-    /// Optional manifest for validation.
-    pub manifest: Option<TestManifest>,
+    /// Buffer metadata parsed from test.cpp (sizes, types, group IDs, input patterns).
+    pub buffer_spec: Option<BufferSpec>,
+    /// Skip reason from test_overrides.toml.
+    pub skip_reason: Option<String>,
+    /// Expected failure reason from test_overrides.toml.
+    pub expected_fail_reason: Option<String>,
     /// Explicit path to NPU instructions file (overrides directory-based discovery).
     /// Set for multi-xclbin tests where each xclbin has a distinct insts file.
     pub insts_path: Option<PathBuf>,
+    /// Which compiler produced this xclbin (Peano or Chess).
+    /// Set by the build system in `collect_results()`. `None` for legacy
+    /// tests discovered from pre-built directories (treated as Peano).
+    pub compiler: Option<Compiler>,
+    /// Path to compiled native test.exe for hardware execution.
+    /// Set during the build phase when test.cpp is compiled.
+    pub test_exe: Option<PathBuf>,
+    /// Which argument pattern the test.cpp uses (cxxopts vs #define).
+    pub test_cpp_pattern: Option<TestCppPattern>,
+    /// Path to the original test source directory (for test.cpp location).
+    pub source_dir: Option<PathBuf>,
 }
 
 impl XclbinTest {
@@ -182,8 +209,14 @@ impl XclbinTest {
             xclbin_path: path.to_path_buf(),
             project_dir,
             expected_output: None,
-            manifest: None,
+            buffer_spec: None,
+            skip_reason: None,
+            expected_fail_reason: None,
             insts_path: None,
+            compiler: None,
+            test_exe: None,
+            test_cpp_pattern: None,
+            source_dir: None,
         }
     }
 
@@ -193,21 +226,10 @@ impl XclbinTest {
         self
     }
 
-    /// Set the manifest for validation.
-    pub fn with_manifest(mut self, manifest: TestManifest) -> Self {
-        self.manifest = Some(manifest);
+    /// Set the buffer spec for input setup and validation.
+    pub fn with_buffer_spec(mut self, spec: BufferSpec) -> Self {
+        self.buffer_spec = Some(spec);
         self
-    }
-
-    /// Try to load a manifest from a directory.
-    pub fn load_manifest_from(&mut self, manifest_dir: &Path) {
-        let manifest_path = manifest_dir.join(format!("{}.toml", self.name));
-        if manifest_path.exists() {
-            if let Ok(manifest) = TestManifest::from_file(&manifest_path) {
-                log::debug!("Loaded manifest for {}", self.name);
-                self.manifest = Some(manifest);
-            }
-        }
     }
 
     /// Find ELF files for cores in the project directory.
@@ -330,9 +352,8 @@ pub struct XclbinSuite {
     max_cycles: u64,
     /// Results from completed tests.
     results: Vec<(String, TestOutcome, Option<HardwareValidation>)>,
-    /// Directory containing manifest files for validation.
-    manifest_dir: Option<PathBuf>,
-    /// Directory containing hardware reference outputs (for type = "reference" manifests).
+    /// Directory containing hardware reference outputs.
+    /// Each test's captured output is at `{reference_dir}/{test_name}/output.bin`.
     reference_dir: Option<PathBuf>,
     /// Directory containing captured hardware outputs for cross-validation.
     /// Each test's output is at `{npu_output_dir}/{test_name}/output.bin`.
@@ -350,7 +371,6 @@ impl XclbinSuite {
             collector: OpcodeCollector::new(),
             max_cycles: 1_000_000,
             results: Vec::new(),
-            manifest_dir: None,
             reference_dir: None,
             npu_output_dir: None,
             trace_events: Vec::new(),
@@ -361,7 +381,7 @@ impl XclbinSuite {
     ///
     /// Unlike `discover()` which walks a directory tree, this constructor
     /// accepts tests that have already been built (e.g. by `batch_build_peano()`).
-    /// Tests are used as-is, with their manifests already attached.
+    /// Tests are used as-is, with their buffer specs already attached.
     pub fn from_tests(tests: Vec<XclbinTest>) -> Self {
         Self {
             tests,
@@ -394,22 +414,8 @@ impl XclbinSuite {
         self
     }
 
-    /// Set the manifest directory for validation.
-    pub fn with_manifest_dir(mut self, dir: PathBuf) -> Self {
-        // Load manifests for existing tests
-        for test in &mut self.tests {
-            test.load_manifest_from(&dir);
-        }
-        self.manifest_dir = Some(dir);
-        self
-    }
-
     /// Add a single test.
-    pub fn add_test(&mut self, mut test: XclbinTest) {
-        // Load manifest if directory is set
-        if let Some(ref dir) = self.manifest_dir {
-            test.load_manifest_from(dir);
-        }
+    pub fn add_test(&mut self, test: XclbinTest) {
         self.tests.push(test);
     }
 
@@ -598,30 +604,29 @@ impl XclbinSuite {
         (outcome, raw_output, hw_validation)
     }
 
-    /// Perform three-way cross-validation against captured hardware output.
+    /// Cross-validate emulator output against captured hardware reference.
     ///
-    /// Returns `None` if no npu_output_dir is configured or no manifest
+    /// Returns `None` if no npu_output_dir is configured or no buffer_spec
     /// is available. Returns `Some(HardwareValidation)` with a `NoReference`
     /// diagnosis if the hardware output file does not exist.
     fn cross_validate(&self, test: &XclbinTest, emu_output: Option<&[u8]>) -> Option<HardwareValidation> {
         let npu_dir = self.npu_output_dir.as_ref()?;
-        let manifest = test.manifest.as_ref()?;
+        let spec = test.buffer_spec.as_ref()?;
+
+        // Find output buffer element type for comparison
+        let output_type = spec.buffers.iter()
+            .find(|b| b.direction == BufferDir::Output)
+            .map(|b| b.element_type)
+            .unwrap_or(ElementType::I32);
 
         // Load hardware reference output
-        let hw_output = hardware_comparison::load_hw_reference(npu_dir, &test.name);
-
-        // Generate input values for expected value calculation
-        let input_values = hardware_comparison::generate_input_values(manifest);
-
-        let reference_dir = self.reference_dir.as_deref();
+        let hw_reference = hardware_comparison::load_hw_reference(npu_dir, &test.name);
 
         let cv = CrossValidation::compare(
             &test.name,
-            manifest,
-            &input_values,
             emu_output,
-            hw_output.as_deref(),
-            reference_dir,
+            hw_reference.as_deref(),
+            output_type,
         );
 
         Some(HardwareValidation::classify(cv))
@@ -632,20 +637,11 @@ impl XclbinSuite {
     /// Returns (outcome, raw_output, trace_events). The trace_events are
     /// collected from the engine after execution for Perfetto export.
     fn run_single_inner(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Vec<crate::interpreter::engine::TileTracedEvent>) {
-        // Check if manifest says to skip this test
-        if let Some(ref manifest) = test.manifest {
-            // Platform gate: test requires different hardware generation
-            if !manifest.test.platform.is_empty() {
-                return (TestOutcome::Platform {
-                    required: manifest.test.platform.clone(),
-                    reason: manifest.test.skip_reason.clone(),
-                }, None, Vec::new());
-            }
-            if manifest.test.skip {
-                return (TestOutcome::Skipped {
-                    reason: manifest.test.skip_reason.clone(),
-                }, None, Vec::new());
-            }
+        // Check if test overrides say to skip this test
+        if let Some(ref reason) = test.skip_reason {
+            return (TestOutcome::Skipped {
+                reason: reason.clone(),
+            }, None, Vec::new());
         }
 
         // Load xclbin
@@ -714,10 +710,10 @@ impl XclbinSuite {
             }, None, Vec::new());
         }
 
-        // Populate host memory - use manifest data if available, else defaults.
+        // Populate host memory - use buffer spec if available, else defaults.
         // host_buffers maps DDR patch arg_idx to actual host memory addresses.
-        let (input_values, host_buffers) = if let Some(ref manifest) = test.manifest {
-            self.setup_input_from_manifest(&mut engine, manifest)
+        let (input_values, host_buffers) = if let Some(ref spec) = test.buffer_spec {
+            self.setup_input_from_buffer_spec(&mut engine, spec)
         } else {
             self.setup_default_input(&mut engine);
             // Default layout: input(0x0, 4KB), middle(0x1000, 256B), output(0x2000, 4KB)
@@ -756,7 +752,7 @@ impl XclbinSuite {
 
                         let mut executor = NpuExecutor::new();
 
-                        // Set up host buffers from the manifest-derived layout.
+                        // Set up host buffers from the buffer spec layout.
                         // These addresses must match the actual host memory allocation
                         // so DDR patches write correct addresses into shim DMA BDs.
                         executor.set_host_buffers(host_buffers.clone());
@@ -818,59 +814,55 @@ impl XclbinSuite {
         let raw_output = self.capture_output(&engine, test, output_addr);
 
         // Remap outcomes for expected-fail tests, preserving the actual failure details
-        let final_outcome = if let Some(ref manifest) = test.manifest {
-            if manifest.test.expected_fail {
-                match outcome {
-                    // Test failed as expected -- wrap with details for diagnostics
-                    TestOutcome::ValidationFail { cycles, correct, total, ref first_mismatch } => {
-                        let actual = if let Some((idx, expected, got)) = first_mismatch {
-                            format!("ValidationFail: {}/{} correct, first mismatch at [{}]: expected {}, got {}",
-                                correct, total, idx, expected, got)
-                        } else {
-                            format!("ValidationFail: {}/{} correct", correct, total)
-                        };
-                        TestOutcome::ExpectedFail {
-                            cycles,
-                            reason: manifest.test.expected_fail_reason.clone(),
-                            actual,
-                        }
+        let final_outcome = if let Some(ref reason) = test.expected_fail_reason {
+            match outcome {
+                // Test failed as expected -- wrap with details for diagnostics
+                TestOutcome::ValidationFail { cycles, correct, total, ref first_mismatch } => {
+                    let actual = if let Some((idx, expected, got)) = first_mismatch {
+                        format!("ValidationFail: {}/{} correct, first mismatch at [{}]: expected {}, got {}",
+                            correct, total, idx, expected, got)
+                    } else {
+                        format!("ValidationFail: {}/{} correct", correct, total)
+                    };
+                    TestOutcome::ExpectedFail {
+                        cycles,
+                        reason: reason.clone(),
+                        actual,
                     }
-                    TestOutcome::Fail { ref message, cycles } => {
-                        TestOutcome::ExpectedFail {
-                            cycles,
-                            reason: manifest.test.expected_fail_reason.clone(),
-                            actual: format!("Fail: {}", message),
-                        }
-                    }
-                    TestOutcome::UnknownOpcode { ref details, cycles } => {
-                        let mnemonic = details.mnemonic.as_deref().unwrap_or("unknown");
-                        TestOutcome::ExpectedFail {
-                            cycles,
-                            reason: manifest.test.expected_fail_reason.clone(),
-                            actual: format!("UnknownOpcode: {:?} 0x{:04X} '{}' at PC {}",
-                                details.slot, details.opcode, mnemonic, details.pc),
-                        }
-                    }
-                    TestOutcome::Timeout { cycles } => {
-                        TestOutcome::ExpectedFail {
-                            cycles,
-                            reason: manifest.test.expected_fail_reason.clone(),
-                            actual: "Timeout".to_string(),
-                        }
-                    }
-                    // Test passed when we expected failure -- manifest needs updating
-                    TestOutcome::Pass { cycles, correct, total } => {
-                        TestOutcome::UnexpectedPass {
-                            cycles,
-                            correct: correct.unwrap_or(0),
-                            total: total.unwrap_or(0),
-                        }
-                    }
-                    // Other outcomes pass through unchanged
-                    other => other,
                 }
-            } else {
-                outcome
+                TestOutcome::Fail { ref message, cycles } => {
+                    TestOutcome::ExpectedFail {
+                        cycles,
+                        reason: reason.clone(),
+                        actual: format!("Fail: {}", message),
+                    }
+                }
+                TestOutcome::UnknownOpcode { ref details, cycles } => {
+                    let mnemonic = details.mnemonic.as_deref().unwrap_or("unknown");
+                    TestOutcome::ExpectedFail {
+                        cycles,
+                        reason: reason.clone(),
+                        actual: format!("UnknownOpcode: {:?} 0x{:04X} '{}' at PC {}",
+                            details.slot, details.opcode, mnemonic, details.pc),
+                    }
+                }
+                TestOutcome::Timeout { cycles } => {
+                    TestOutcome::ExpectedFail {
+                        cycles,
+                        reason: reason.clone(),
+                        actual: "Timeout".to_string(),
+                    }
+                }
+                // Test passed when we expected failure -- override needs updating
+                TestOutcome::Pass { cycles, correct, total } => {
+                    TestOutcome::UnexpectedPass {
+                        cycles,
+                        correct: correct.unwrap_or(0),
+                        total: total.unwrap_or(0),
+                    }
+                }
+                // Other outcomes pass through unchanged
+                other => other,
             }
         } else {
             outcome
@@ -882,19 +874,15 @@ impl XclbinSuite {
     /// Capture raw output bytes from host memory.
     ///
     /// Reads from the given output buffer address.
-    /// The size is determined by the manifest output buffer definition,
-    /// or defaults to 4KB if no manifest is available.
+    /// The size is determined by the buffer spec output definition,
+    /// or defaults to 4KB if no buffer spec is available.
     fn capture_output(&self, engine: &InterpreterEngine, test: &XclbinTest, output_addr: u64) -> Option<Vec<u8>> {
-        let output_size = if let Some(ref manifest) = test.manifest {
-            if let Some(output_buf) = manifest.get_output() {
-                if let Some(elem_type) = ElementType::from_str(&output_buf.element_type) {
-                    output_buf.size * elem_type.byte_size()
-                } else {
-                    4096
-                }
-            } else {
-                4096
-            }
+        let output_size = if let Some(ref spec) = test.buffer_spec {
+            spec.buffers.iter()
+                .find(|b| b.direction == BufferDir::Output)
+                .map(|b| b.size_elements * b.element_type.byte_size())
+                .unwrap_or(4096)
+                .max(4096)
         } else {
             4096
         };
@@ -904,101 +892,81 @@ impl XclbinSuite {
         Some(output_data)
     }
 
-    /// Setup host memory from manifest buffer definitions.
+    /// Setup host memory from BufferSpec buffer definitions.
     ///
     /// Returns (input_values, host_buffers):
-    /// - input_values: map of buffer name -> values for expected output calculation
+    /// - input_values: map of buffer name -> values (for debugging/display)
     /// - host_buffers: ordered list of HostBuffer entries matching DDR patch arg_idx
     ///
-    /// The host_buffers are ordered to match runtime_sequence arguments:
-    /// - Single-input tests: [input_a, unused, output]
-    /// - Two-input tests: [input_a, input_b, output]
-    fn setup_input_from_manifest(
+    /// Host buffers are ordered by group_id to match runtime_sequence arguments:
+    /// DDR patches reference bo_index = group_id - 3.
+    fn setup_input_from_buffer_spec(
         &self,
         engine: &mut InterpreterEngine,
-        manifest: &TestManifest,
+        spec: &BufferSpec,
     ) -> (Option<HashMap<String, Vec<i64>>>, Vec<HostBuffer>) {
         let host_mem = engine.host_memory_mut();
         let mut inputs = HashMap::new();
 
-        // Determine buffer object (BO) count from manifest group_ids.
+        // Determine buffer object (BO) count from group_ids.
         // The MLIR_AIE kernel has: arg3=bo0(gid=3), arg4=bo1(gid=4), ..., arg7=bo4(gid=7).
         // DDR patches reference bo_index = group_id - 3.
-        // We need enough host buffers to cover max(bo_index) + 1.
-        let input_a_gid = manifest.get_input("input_a").map(|b| b.group_id).unwrap_or(3);
-        let input_b_gid = manifest.get_input("input_b").map(|b| b.group_id);
-        let output_gid = manifest.get_output().map(|b| b.group_id).unwrap_or(5);
-        let max_gid = [Some(input_a_gid), input_b_gid, Some(output_gid)]
-            .iter()
-            .filter_map(|g| *g)
+        let max_gid = spec.buffers.iter()
+            .map(|b| b.group_id)
             .max()
             .unwrap_or(5);
         let num_bos = (max_gid.saturating_sub(3) + 1) as usize;
 
         // Allocate buffers sequentially in host memory to avoid overlaps.
-        // Address layout: each buffer gets a non-overlapping region.
         let mut next_addr: u64 = 0x0;
-
-        // Helper: allocate input buffer and track its address
         let mut buffer_addrs: Vec<(u64, usize)> = vec![(0, 0); num_bos]; // (addr, size) indexed by bo_idx
 
-        // Generate primary input (input_a) if present
-        let input_a_idx = (input_a_gid - 3) as usize;
-        if let Some(input_data) = manifest.generate_input("input_a") {
-            if let Some(input_buf) = manifest.get_input("input_a") {
-                if let Some(elem_type) = ElementType::from_str(&input_buf.element_type) {
-                    let data_size = input_data.len();
-                    let alloc_size = data_size.max(4096);
-                    let _ = host_mem.allocate_region("input", next_addr, alloc_size);
-                    host_mem.write_bytes(next_addr, &input_data);
-                    inputs.insert("input_a".to_string(), read_values(&input_data, elem_type));
-                    buffer_addrs[input_a_idx] = (next_addr, data_size);
-                    next_addr += alloc_size as u64;
-                }
+        // Allocate input buffers first
+        for buf in &spec.buffers {
+            if buf.direction == BufferDir::Output {
+                continue;
             }
-        } else {
-            // No input_a: allocate default region for DDR patches
+            let bo_idx = buf.group_id.saturating_sub(3) as usize;
+            if bo_idx >= num_bos {
+                continue;
+            }
+
+            let input_data = generate_input_data(buf);
+            let data_size = input_data.len();
+            let alloc_size = data_size.max(4096);
+
+            let _ = host_mem.allocate_region(&buf.name, next_addr, alloc_size);
+            host_mem.write_bytes(next_addr, &input_data);
+            inputs.insert(buf.name.clone(), read_values(&input_data, buf.element_type));
+            buffer_addrs[bo_idx] = (next_addr, data_size);
+            next_addr += alloc_size as u64;
+        }
+
+        // If no inputs were placed, allocate a default input region
+        if next_addr == 0 {
             let _ = host_mem.allocate_region("input", 0x0, 4096);
-            buffer_addrs[input_a_idx] = (0, 4096);
+            buffer_addrs[0] = (0, 4096);
             next_addr = 4096;
         }
 
-        // Generate secondary input (input_b) if present
-        if let Some(input_b_gid_val) = input_b_gid {
-            let input_b_idx = (input_b_gid_val - 3) as usize;
-            if let Some(input_b_data) = manifest.generate_input("input_b") {
-                if let Some(input_b_buf) = manifest.get_input("input_b") {
-                    if let Some(elem_type_b) = ElementType::from_str(&input_b_buf.element_type) {
-                        let data_size = input_b_data.len();
-                        let alloc_size = data_size.max(4096);
-                        let _ = host_mem.allocate_region("input_b", next_addr, alloc_size);
-                        host_mem.write_bytes(next_addr, &input_b_data);
-                        inputs.insert("input_b".to_string(), read_values(&input_b_data, elem_type_b));
-                        buffer_addrs[input_b_idx] = (next_addr, data_size);
-                        next_addr += alloc_size as u64;
-                    }
-                }
-            }
-        }
-
-        // Output: place after all inputs, at least 0x1000 for backward compatibility
+        // Allocate output buffer after all inputs
         let output_addr = next_addr.max(0x1000);
-        let output_idx = (output_gid - 3) as usize;
-        let mut output_size: usize = 4096;
-        if let Some(output_buf) = manifest.get_output() {
-            if let Some(output_elem_type) = ElementType::from_str(&output_buf.element_type) {
-                output_size = (output_buf.size * output_elem_type.byte_size()).max(4096);
+        for buf in &spec.buffers {
+            if buf.direction != BufferDir::Output {
+                continue;
             }
-        }
-        let _ = host_mem.allocate_region("output", output_addr, output_size);
-        if output_idx < buffer_addrs.len() {
-            buffer_addrs[output_idx] = (output_addr, output_size);
+            let bo_idx = buf.group_id.saturating_sub(3) as usize;
+            if bo_idx >= num_bos {
+                continue;
+            }
+            let output_size = (buf.size_elements * buf.element_type.byte_size()).max(4096);
+            let _ = host_mem.allocate_region(&buf.name, output_addr, output_size);
+            buffer_addrs[bo_idx] = (output_addr, output_size);
         }
 
         // Fill any gaps (unused BO indices) with dummy regions
         for i in 0..num_bos {
-            if buffer_addrs[i] == (0, 0) && i != input_a_idx {
-                // Unused buffer slot - allocate a small dummy region
+            if buffer_addrs[i] == (0, 0) {
                 let _ = host_mem.allocate_region(&format!("unused_bo{}", i), next_addr, 256);
                 buffer_addrs[i] = (next_addr, 256);
                 next_addr += 256;
@@ -1014,40 +982,34 @@ impl XclbinSuite {
         (Some(inputs), host_buffers)
     }
 
-    /// Validate output against manifest expected values.
-    fn validate_output(&self, engine: &InterpreterEngine, test: &XclbinTest, input_values: Option<HashMap<String, Vec<i64>>>, output_addr: u64) -> Option<(usize, usize, Option<(usize, i64, i64)>)> {
-        let manifest = test.manifest.as_ref()?;
-        let output_buf = manifest.get_output()?;
-        let elem_type = ElementType::from_str(&output_buf.element_type)?;
+    /// Validate output against hardware reference capture.
+    ///
+    /// Loads the reference from `{reference_dir}/{test_name}/output.bin`
+    /// and compares element-by-element against the emulator's output.
+    fn validate_output(&self, engine: &InterpreterEngine, test: &XclbinTest, output_addr: u64) -> Option<(usize, usize, Option<(usize, i64, i64)>)> {
+        let reference_dir = self.reference_dir.as_ref()?;
+        let spec = test.buffer_spec.as_ref()?;
 
-        // Read output from host memory
-        let output_size = output_buf.size * elem_type.byte_size();
+        // Find output buffer metadata
+        let output_buf = spec.buffers.iter()
+            .find(|b| b.direction == BufferDir::Output)?;
+        let elem_type = output_buf.element_type;
+
+        // Load hardware reference
+        let hw_ref = hardware_comparison::load_hw_reference(reference_dir, &test.name)?;
+
+        // Read emulator output from host memory
+        let output_size = output_buf.size_elements * elem_type.byte_size();
         let mut output_data = vec![0u8; output_size];
         engine.host_memory().read_bytes(output_addr, &mut output_data);
-        let actual_values = read_values(&output_data, elem_type);
 
-        // Generate expected values from all input buffers
-        let inputs = input_values.unwrap_or_default();
-        let reference_dir = self.reference_dir.as_deref();
-        let expected_values = manifest.generate_expected(&inputs, reference_dir)?;
+        // Compare using hardware_comparison primitives
+        let result = hardware_comparison::compare_buffers(&output_data, &hw_ref, elem_type);
 
-        // Compare
-        let total = expected_values.len().min(actual_values.len());
-        let mut correct = 0;
-        let mut first_mismatch = None;
-
-        for i in 0..total {
-            if actual_values[i] == expected_values[i] {
-                correct += 1;
-            } else if first_mismatch.is_none() {
-                first_mismatch = Some((i, expected_values[i], actual_values[i]));
-            }
-        }
-
-        Some((correct, total, first_mismatch))
+        Some((result.matching, result.total, result.first_mismatch))
     }
 
-    /// Build a completion outcome by validating output against the manifest.
+    /// Build a completion outcome by validating output against hardware reference.
     ///
     /// Used by both the Halted and syncs-satisfied exit paths to avoid
     /// duplicating validation logic.
@@ -1055,13 +1017,13 @@ impl XclbinSuite {
         &self,
         engine: &InterpreterEngine,
         test: &XclbinTest,
-        input_values: Option<HashMap<String, Vec<i64>>>,
+        _input_values: Option<HashMap<String, Vec<i64>>>,
         cycles: u64,
         output_addr: u64,
     ) -> TestOutcome {
-        if test.manifest.is_some() {
+        if test.buffer_spec.is_some() && self.reference_dir.is_some() {
             if let Some((correct, total, first_mismatch)) =
-                self.validate_output(engine, test, input_values, output_addr)
+                self.validate_output(engine, test, output_addr)
             {
                 if correct == total && total > 0 {
                     return TestOutcome::Pass {
@@ -1079,7 +1041,7 @@ impl XclbinSuite {
                 }
             }
         }
-        // No manifest or validation could not run -- report success
+        // No buffer spec, no reference, or validation could not run
         TestOutcome::Pass { cycles, correct: None, total: None }
     }
 
@@ -1289,10 +1251,10 @@ impl XclbinSuite {
 
         // List unexpected passes (known-broken tests that suddenly work)
         if result.unexpected_pass > 0 {
-            report.push_str("--- Unexpected Passes (update manifests!) ---\n");
+            report.push_str("--- Unexpected Passes (update test_overrides.toml!) ---\n");
             for (name, outcome, _) in &self.results {
                 if let TestOutcome::UnexpectedPass { cycles, correct, total } = outcome {
-                    report.push_str(&format!("{}: UNEXPECTED PASS ({} cycles, {}/{} correct) - remove expected_fail from manifest\n",
+                    report.push_str(&format!("{}: UNEXPECTED PASS ({} cycles, {}/{} correct) - remove from [expected_fail] in test_overrides.toml\n",
                         name, cycles, correct, total));
                 }
             }
@@ -1426,11 +1388,11 @@ pub struct SuiteResult {
     pub load_error: usize,
     /// Number of tests with hardware cross-validation data.
     pub hw_validated: usize,
-    /// Tests where emulator = hardware = manifest.
+    /// Tests where emulator matches hardware reference.
     pub hw_correct: usize,
-    /// Tests where emulator = hardware != manifest (compiler/toolchain bug).
+    /// Tests where emulator matches hardware but both differ from expected.
     pub hw_compiler_bug: usize,
-    /// Tests where hardware = manifest != emulator (emulator bug).
+    /// Tests where emulator diverges from hardware reference.
     pub hw_emulator_bug: usize,
 }
 

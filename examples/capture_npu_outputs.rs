@@ -1,7 +1,7 @@
-//! Capture NPU hardware outputs for all manifest-defined tests.
+//! Capture NPU hardware outputs for all discoverable tests.
 //!
-//! For each test manifest with a corresponding built xclbin + insts.bin:
-//! 1. Generates input data from the manifest pattern
+//! For each test with a test.cpp and corresponding built xclbin + insts.bin:
+//! 1. Parses test.cpp for buffer metadata (sizes, types, patterns)
 //! 2. Invokes the npu-runner C++ tool to run on real hardware
 //! 3. Saves the raw output to tests/npu-outputs/<test_name>/output.bin
 //!
@@ -14,8 +14,9 @@
 //! - Test binaries built: ./scripts/build-mlir-aie-tests.sh
 
 use std::path::PathBuf;
-use xdna_emu::testing::manifest_runner::TestManifest;
+use xdna_emu::testing::test_cpp_parser;
 use xdna_emu::testing::npu_runner;
+use xdna_emu::testing::npu_test::TestOverrides;
 
 fn main() {
     env_logger::Builder::from_env(
@@ -39,48 +40,56 @@ fn main() {
 
     let config = xdna_emu::config::Config::get();
     let npu_xrt_dir = config.npu_xrt_test_dir();
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/mlir-aie-extracted/manifests");
+    let test_src_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../mlir-aie/test/npu-xrt");
     let output_base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/npu-outputs");
+    let overrides_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/test_overrides.toml");
 
-    if !manifest_dir.exists() {
-        eprintln!("ERROR: Manifest directory not found: {}", manifest_dir.display());
+    if !test_src_dir.exists() {
+        eprintln!("ERROR: Test source directory not found: {}", test_src_dir.display());
         std::process::exit(1);
     }
 
-    // Discover manifests
-    let manifests = match discover_manifests(&manifest_dir) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("ERROR: Failed to read manifests: {}", e);
-            std::process::exit(1);
-        }
-    };
+    // Discover tests with test.cpp files
+    let test_dirs = discover_test_dirs(&test_src_dir);
+
+    let overrides = TestOverrides::load(&overrides_path);
 
     println!("=== NPU Output Capture ===");
-    println!("Manifests: {}", manifest_dir.display());
-    println!("Binaries:  {}", npu_xrt_dir.display());
-    println!("Output:    {}", output_base.display());
-    println!("Found {} manifests\n", manifests.len());
+    println!("Test source: {}", test_src_dir.display());
+    println!("Binaries:    {}", npu_xrt_dir.display());
+    println!("Output:      {}", output_base.display());
+    println!("Found {} test directories\n", test_dirs.len());
 
     let mut captured = 0;
     let mut failed = 0;
     let mut skipped = 0;
 
-    for (name, manifest) in &manifests {
+    for name in &test_dirs {
         print!("  {:<40} ", name);
 
-        // Skip tests requiring different hardware platform
-        if !manifest.test.platform.is_empty() {
-            println!("PLATFORM (requires {})", manifest.test.platform);
+        // Check overrides
+        if let Some(reason) = overrides.skip.get(name.as_str()) {
+            println!("SKIP ({})", reason);
             skipped += 1;
             continue;
         }
 
-        // Skip tests marked as skip
-        if manifest.test.skip {
-            println!("SKIP ({})", manifest.test.skip_reason);
+        // Parse test.cpp for buffer metadata
+        let spec = match test_cpp_parser::parse_test_cpp(&test_src_dir.join(name)) {
+            Some(s) => s,
+            None => {
+                println!("SKIP (no parseable test.cpp)");
+                skipped += 1;
+                continue;
+            }
+        };
+
+        // Skip multi-kernel tests (not yet supported)
+        if spec.multi_kernel {
+            println!("SKIP (multi-kernel)");
             skipped += 1;
             continue;
         }
@@ -94,17 +103,11 @@ fn main() {
             continue;
         }
 
-        // Find insts.bin (try both names).
-        // For multi-kernel tests, insts_path is unused (instruction paths
-        // come from the manifest's multi_kernel.runs), but we still need
-        // a path for the API.  Use a dummy path and let run_on_npu handle it.
+        // Find insts.bin
         let insts_path = if test_dir.join("insts.bin").exists() {
             test_dir.join("insts.bin")
         } else if test_dir.join("aie_run_seq.bin").exists() {
             test_dir.join("aie_run_seq.bin")
-        } else if manifest.is_multi_kernel() {
-            // Multi-kernel tests get insts paths from the manifest
-            test_dir.join("insts.bin")  // placeholder, not actually read
         } else {
             println!("SKIP (no insts.bin)");
             skipped += 1;
@@ -112,7 +115,7 @@ fn main() {
         };
 
         // Run on NPU
-        match npu_runner::run_on_npu(manifest, &xclbin_path, &insts_path, 30) {
+        match npu_runner::run_on_npu(&spec, name, &xclbin_path, &insts_path, 30) {
             Ok(result) => {
                 // Save output
                 let out_dir = output_base.join(name);
@@ -141,37 +144,31 @@ fn main() {
     println!("Captured: {}", captured);
     println!("Failed:   {}", failed);
     println!("Skipped:  {}", skipped);
-    println!("Total:    {}", manifests.len());
+    println!("Total:    {}", test_dirs.len());
 
     if failed > 0 {
         std::process::exit(1);
     }
 }
 
-/// Discover all TOML manifest files in a directory.
-fn discover_manifests(dir: &std::path::Path) -> Result<Vec<(String, TestManifest)>, String> {
-    let mut manifests = Vec::new();
+/// Discover test directories that contain test.cpp files.
+fn discover_test_dirs(src_dir: &std::path::Path) -> Vec<String> {
+    let mut names = Vec::new();
 
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| format!("Cannot read directory: {}", e))?;
+    let entries = match std::fs::read_dir(src_dir) {
+        Ok(e) => e,
+        Err(_) => return names,
+    };
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().map(|e| e == "toml").unwrap_or(false) {
-            let name = path
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            match TestManifest::from_file(&path) {
-                Ok(manifest) => manifests.push((name, manifest)),
-                Err(e) => {
-                    eprintln!("  WARNING: Failed to parse {}: {}", path.display(), e);
-                }
+        if path.is_dir() && path.join("test.cpp").exists() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                names.push(name.to_string());
             }
         }
     }
 
-    manifests.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(manifests)
+    names.sort();
+    names
 }

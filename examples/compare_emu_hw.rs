@@ -1,8 +1,7 @@
-//! Three-way cross-validation: emulator vs manifest vs hardware.
+//! Cross-validation: emulator vs hardware reference output.
 //!
-//! Runs all manifest-defined tests through the emulator, loads any
-//! captured hardware outputs, and produces a comparison report showing
-//! all three validation layers.
+//! Discovers all tests with test.cpp files, runs them through the emulator,
+//! loads captured hardware outputs, and produces a comparison report.
 //!
 //! Run:
 //!   cargo run --example compare_emu_hw
@@ -13,9 +12,10 @@
 
 use std::path::PathBuf;
 
-use xdna_emu::testing::manifest_runner::TestManifest;
+use xdna_emu::testing::test_cpp_parser;
 use xdna_emu::testing::xclbin_suite::{XclbinSuite, XclbinTest};
 use xdna_emu::testing::hardware_comparison::{self, CrossValidation};
+use xdna_emu::testing::npu_test::TestOverrides;
 
 fn main() {
     env_logger::Builder::from_env(
@@ -25,47 +25,46 @@ fn main() {
 
     let config = xdna_emu::config::Config::get();
     let npu_xrt_dir = config.npu_xrt_test_dir();
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/mlir-aie-extracted/manifests");
+    let test_src_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../mlir-aie/test/npu-xrt");
     let hw_output_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/npu-outputs");
-
-    if !manifest_dir.exists() {
-        eprintln!("ERROR: Manifest directory not found: {}", manifest_dir.display());
-        std::process::exit(1);
-    }
+    let overrides_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/test_overrides.toml");
 
     println!("=== Cross-Validation: Emulator vs Hardware ===\n");
-    println!("Manifests:    {}", manifest_dir.display());
+    println!("Test source:  {}", test_src_dir.display());
     println!("Binaries:     {}", npu_xrt_dir.display());
     println!("HW captures:  {}", hw_output_dir.display());
 
     let has_hw_outputs = hw_output_dir.exists();
     if !has_hw_outputs {
-        println!("  (no hardware captures found -- Layer 2 and 3 will show N/A)");
+        println!("  (no hardware captures found -- comparison will show N/A)");
         println!("  Run: cargo run --example capture_npu_outputs");
     }
     println!();
 
-    // Discover manifests
-    let manifests = match discover_manifests(&manifest_dir) {
-        Ok(m) => m,
+    // Discover tests from test source directory
+    let test_dirs = match discover_test_dirs(&test_src_dir) {
+        Ok(dirs) => dirs,
         Err(e) => {
             eprintln!("ERROR: {}", e);
             std::process::exit(1);
         }
     };
 
+    let overrides = TestOverrides::load(&overrides_path);
+
     // Set up emulator suite
     let suite = XclbinSuite::new()
-        .with_max_cycles(1_000_000)
-        .with_manifest_dir(manifest_dir.clone());
+        .with_max_cycles(1_000_000);
 
     let mut cross_results: Vec<CrossValidation> = Vec::new();
 
-    for (name, manifest) in &manifests {
-        // Skip tests marked as skip
-        if manifest.test.skip {
+    for name in &test_dirs {
+        // Check overrides
+        if let Some(reason) = overrides.skip.get(name.as_str()) {
+            eprintln!("  {:<35} SKIP ({})", name, reason);
             continue;
         }
 
@@ -73,38 +72,42 @@ fn main() {
         let test_dir = npu_xrt_dir.join(name);
         let xclbin_path = test_dir.join("aie.xclbin");
         if !xclbin_path.exists() {
-            continue; // No binary available
+            continue;
         }
+
+        // Parse test.cpp for buffer metadata
+        let buffer_spec = test_cpp_parser::parse_test_cpp(&test_src_dir.join(name));
 
         // Create test and run through emulator
         let mut test = XclbinTest::from_path(&xclbin_path);
-        test.manifest = Some(manifest.clone());
+        test.buffer_spec = buffer_spec.clone();
+
+        if let Some(reason) = overrides.expected_fail.get(name.as_str()) {
+            test.expected_fail_reason = Some(reason.clone());
+        }
 
         let (outcome, emu_output) = suite.run_single_with_output(&test);
 
-        // Generate input values for comparison
-        let input_values = hardware_comparison::generate_input_values(manifest);
+        // Determine output element type
+        let elem_type = buffer_spec.as_ref()
+            .and_then(|s| s.buffers.iter().find(|b| b.direction == test_cpp_parser::BufferDir::Output))
+            .map(|b| b.element_type)
+            .unwrap_or(test_cpp_parser::ElementType::I32);
 
         // Load hardware output if available
         let hw_output = if has_hw_outputs {
             let hw_path = hw_output_dir.join(name).join("output.bin");
-            if hw_path.exists() {
-                std::fs::read(&hw_path).ok()
-            } else {
-                None
-            }
+            std::fs::read(&hw_path).ok()
         } else {
             None
         };
 
-        // Run three-way comparison
+        // Run comparison
         let cv = CrossValidation::compare(
             name,
-            manifest,
-            &input_values,
             emu_output.as_deref(),
             hw_output.as_deref(),
-            if has_hw_outputs { Some(hw_output_dir.as_path()) } else { None },
+            elem_type,
         );
 
         // Print per-test status line
@@ -136,30 +139,26 @@ fn main() {
     print!("{}", hardware_comparison::format_report(&cross_results));
 }
 
-/// Discover all TOML manifest files in a directory.
-fn discover_manifests(dir: &std::path::Path) -> Result<Vec<(String, TestManifest)>, String> {
-    let mut manifests = Vec::new();
+/// Discover test directories that contain test.cpp files.
+fn discover_test_dirs(src_dir: &std::path::Path) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
 
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| format!("Cannot read manifest directory: {}", e))?;
+    if !src_dir.exists() {
+        return Err(format!("Test source directory not found: {}", src_dir.display()));
+    }
+
+    let entries = std::fs::read_dir(src_dir)
+        .map_err(|e| format!("Cannot read directory: {}", e))?;
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().map(|e| e == "toml").unwrap_or(false) {
-            let name = path
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            match TestManifest::from_file(&path) {
-                Ok(manifest) => manifests.push((name, manifest)),
-                Err(e) => {
-                    eprintln!("  WARNING: Failed to parse {}: {}", path.display(), e);
-                }
+        if path.is_dir() && path.join("test.cpp").exists() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                names.push(name.to_string());
             }
         }
     }
 
-    manifests.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(manifests)
+    names.sort();
+    Ok(names)
 }

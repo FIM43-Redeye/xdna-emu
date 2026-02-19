@@ -1,0 +1,33 @@
+# Test overrides for xdna-emu.
+#
+# This file replaces 68 hand-maintained TOML manifests with a minimal set
+# of emulator-specific metadata that cannot be auto-detected from test.cpp
+# or REQUIRES annotations.
+#
+# Most test metadata (buffer sizes, group IDs, element types, input patterns)
+# is now parsed directly from test.cpp. Expected output comes from hardware
+# reference captures, not formula transforms.
+#
+# Categories:
+#   [skip]           - Tests that cannot run on our hardware or in the emulator
+#   [expected_fail]  - Tests with known emulator issues (tracked for regression)
+
+[skip]
+# Platform: requires NPU2 (Strix Point / AIE2P), we have NPU1 (Phoenix)
+add_256_using_dma_op_no_double_buffering = "Requires NPU2 (Strix Point)"
+"adjacent_memtile_access/two_memtiles" = "Requires NPU2 (Strix Point)"
+"adjacent_memtile_access/three_memtiles" = "Requires NPU2 (Strix Point)"
+
+# Multi-kernel: test_cpp_parser does not yet handle chained kernel execution
+add_one_two = "Multi-kernel sequential: parser support pending"
+add_one_two_runlist = "Multi-kernel runlist: parser support pending"
+add_one_two_txn = "Multi-kernel transaction: parser support pending"
+
+[expected_fail]
+# Emulator limitations
+dma_task_large_linear = "65K elements exceeds TDR stall detection threshold"
+neighbor_tile_memory_access = "Neighbor tile memory access not yet implemented"
+add_maskwrite = "Maskwrite works but core reads uninitialized memory (no DMA input)"
+add_one_ctrl_packet = "Control packet routing not implemented"
+add_one_ctrl_packet_4_cores = "Multi-core control packet routing not implemented"
+add_one_ctrl_packet_col_overlay = "Column control overlay not implemented"
