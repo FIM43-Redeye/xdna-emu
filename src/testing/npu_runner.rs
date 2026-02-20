@@ -26,6 +26,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use super::process_control::{self, ProcessOutcome};
 use super::test_cpp_parser::{BufferSpec, BufferDef, BufferDir, generate_input_data, read_values};
 
 /// Well-known paths where the npu-runner binary might be found.
@@ -222,6 +223,9 @@ pub enum NpuRunError {
     },
     /// Kernel timed out on hardware.
     Timeout,
+    /// Process survived SIGKILL -- device is in D-state (uninterruptible sleep).
+    /// The NPU is wedged and no further hardware tests should run.
+    DeviceWedged { pid: u32 },
     /// I/O error (file read/write).
     Io(std::io::Error),
 }
@@ -236,6 +240,7 @@ impl std::fmt::Display for NpuRunError {
                 write!(f, "npu-runner failed (exit code {:?}): {}", exit_code, stderr)
             }
             NpuRunError::Timeout => write!(f, "Kernel timed out on NPU hardware"),
+            NpuRunError::DeviceWedged { pid } => write!(f, "NPU device wedged: process {} survived SIGKILL (D-state)", pid),
             NpuRunError::Io(e) => write!(f, "I/O error: {}", e),
         }
     }
@@ -354,11 +359,27 @@ fn run_single_kernel(
             if a.contains(' ') { format!("\"{}\"", a) } else { a.clone() }
         }).collect::<Vec<_>>().join(" "));
 
-    let output = Command::new(runner)
-        .args(&args)
-        .env("LD_LIBRARY_PATH", sanitized_ld_library_path())
-        .output()?;
-    handle_runner_result(output, &output_file, &tmp_dir, input_values)
+    let mut cmd = Command::new(runner);
+    cmd.args(&args)
+        .env("LD_LIBRARY_PATH", sanitized_ld_library_path());
+
+    match process_control::spawn_with_timeout(&mut cmd, timeout_sec) {
+        ProcessOutcome::Completed { exit_code, stderr, .. } => {
+            handle_runner_exit(exit_code, &stderr, &output_file, &tmp_dir, input_values)
+        }
+        ProcessOutcome::Timeout { .. } => {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            Err(NpuRunError::Timeout)
+        }
+        ProcessOutcome::Wedged { pid, .. } => {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            Err(NpuRunError::DeviceWedged { pid })
+        }
+        ProcessOutcome::SpawnError(msg) => {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            Err(NpuRunError::Io(std::io::Error::new(std::io::ErrorKind::Other, msg)))
+        }
+    }
 }
 
 /// Find the first output buffer in a buffer list.
@@ -366,15 +387,18 @@ fn find_output_buffer(buffers: &[BufferDef]) -> Option<&BufferDef> {
     buffers.iter().find(|b| b.direction == BufferDir::Output)
 }
 
-/// Process the result of a npu-runner invocation.
-fn handle_runner_result(
-    output: std::process::Output,
+/// Process the exit status of a npu-runner invocation.
+///
+/// Exit codes: 0 = success, 2 = kernel timeout (C++ side), anything else = error.
+fn handle_runner_exit(
+    exit_code: i32,
+    stderr: &str,
     output_file: &Path,
     tmp_dir: &Path,
     input_values: HashMap<String, Vec<i64>>,
 ) -> Result<NpuRunResult, NpuRunError> {
-    match output.status.code() {
-        Some(0) => {
+    match exit_code {
+        0 => {
             let output_data = std::fs::read(output_file)?;
             let _ = std::fs::remove_dir_all(tmp_dir);
             Ok(NpuRunResult {
@@ -382,16 +406,15 @@ fn handle_runner_result(
                 input_values,
             })
         }
-        Some(2) => {
+        2 => {
             let _ = std::fs::remove_dir_all(tmp_dir);
             Err(NpuRunError::Timeout)
         }
         code => {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             let _ = std::fs::remove_dir_all(tmp_dir);
             Err(NpuRunError::ExecutionFailed {
-                exit_code: code,
-                stderr,
+                exit_code: Some(code),
+                stderr: stderr.to_string(),
             })
         }
     }

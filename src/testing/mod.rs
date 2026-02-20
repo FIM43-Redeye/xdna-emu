@@ -25,6 +25,7 @@ pub mod runner_stats;
 pub mod hw_executor;
 pub mod runner_display;
 pub mod native_hw;
+pub mod process_control;
 
 pub use xclbin_suite::{XclbinSuite, XclbinTest, TestOutcome, Compiler};
 pub use opcode_collector::{UnknownOpcode, OpcodeCollector};

@@ -428,13 +428,27 @@ fn main() {
             if let Some(ref hw) = hw {
                 stats.record_hw(compiler, hw);
 
+                // Immediate wedge cutoff: D-state means the device is
+                // unrecoverable without a reboot. Stop all HW immediately.
+                if hw.wedged && hw_disabled_reason.is_none() {
+                    let detail = format!(
+                        "NPU device wedged (D-state) at test {} -- \
+                         process survived SIGKILL, reboot required",
+                        idx + 1,
+                    );
+                    eprintln!("\nCRITICAL: {}", detail);
+                    eprintln!("Disabling hardware execution for remaining tests.\n");
+                    stats.hw_cascade_stopped_at = Some(idx + 1);
+                    hw_disabled_reason = Some(detail);
+                }
+
                 // Cascade detection: track consecutive ERROR results.
                 // PASS or FAIL means the device is working (test passed or
                 // produced wrong output). Only ERROR means the device itself
                 // may be wedged.
                 if hw.passed || hw.label.starts_with("FAIL") {
                     consecutive_hw_errors = 0;
-                } else {
+                } else if hw_disabled_reason.is_none() {
                     consecutive_hw_errors += 1;
                     if consecutive_hw_errors >= MAX_CONSECUTIVE_HW_ERRORS {
                         let detail = if !npu_runner::probe_device_health() {
@@ -515,14 +529,25 @@ fn main() {
                             );
                             stats.record_hw(Compiler::Chess, &hw);
 
-                            // Apply same cascade tracking for Chess HW errors
+                            // Immediate wedge cutoff for Chess HW path.
+                            if hw.wedged && hw_disabled_reason.is_none() {
+                                let detail = format!(
+                                    "NPU device wedged (D-state) at test {} (Chess HW) -- \
+                                     process survived SIGKILL, reboot required",
+                                    idx + 1,
+                                );
+                                eprintln!("\nCRITICAL: {}", detail);
+                                eprintln!("Disabling hardware execution for remaining tests.\n");
+                                stats.hw_cascade_stopped_at = Some(idx + 1);
+                                hw_disabled_reason = Some(detail);
+                            }
+
+                            // Apply same cascade tracking for Chess HW errors.
                             if hw.passed || hw.label.starts_with("FAIL") {
                                 consecutive_hw_errors = 0;
-                            } else {
+                            } else if hw_disabled_reason.is_none() {
                                 consecutive_hw_errors += 1;
-                                if consecutive_hw_errors >= MAX_CONSECUTIVE_HW_ERRORS
-                                    && hw_disabled_reason.is_none()
-                                {
+                                if consecutive_hw_errors >= MAX_CONSECUTIVE_HW_ERRORS {
                                     let detail = if !npu_runner::probe_device_health() {
                                         format!(
                                             "NPU device unreachable after {} consecutive errors (test {}, Chess HW)",

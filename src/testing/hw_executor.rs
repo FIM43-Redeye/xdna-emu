@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use crate::testing::test_cpp_parser::{BufferSpec, BufferDir, read_values};
 use crate::testing::hardware_comparison::load_hw_reference;
-use crate::testing::npu_runner;
+use crate::testing::npu_runner::{self, NpuRunError};
 
 use super::runner_stats::HwRunResult;
 
@@ -16,22 +16,32 @@ use super::runner_stats::HwRunResult;
 /// 30s is generous for any test; prevents infinite hangs from TDR failures.
 pub const DEFAULT_HW_TIMEOUT_SEC: u32 = 30;
 
+/// Error from a hardware execution attempt.
+pub struct HwError {
+    /// Human-readable error message (first line of the underlying error).
+    pub message: String,
+    /// True if the device entered D-state (survived SIGKILL).
+    pub wedged: bool,
+}
+
 /// Run an xclbin on real NPU hardware and validate output against reference.
 ///
 /// Returns `Ok((label, raw_output))` on successful execution (even if
-/// validation fails), or `Err(message)` if the hardware run itself failed.
+/// validation fails), or `Err(HwError)` if the hardware run itself failed.
 pub fn run_on_hw_and_validate(
     spec: &BufferSpec,
     test_name: &str,
     xclbin_path: &Path,
     insts_path: &Path,
     reference_dir: &Path,
-) -> Result<(String, Vec<u8>), String> {
+) -> Result<(String, Vec<u8>), HwError> {
     let result = npu_runner::run_on_npu(spec, test_name, xclbin_path, insts_path, DEFAULT_HW_TIMEOUT_SEC)
         .map_err(|e| {
+            let wedged = matches!(e, NpuRunError::DeviceWedged { .. });
             // Truncate to first line -- stderr from GLIBCXX errors can be 10+ lines
             let msg = e.to_string();
-            msg.lines().next().unwrap_or(&msg).to_string()
+            let message = msg.lines().next().unwrap_or(&msg).to_string();
+            HwError { message, wedged }
         })?;
 
     // Validate output against hardware reference
@@ -79,30 +89,35 @@ pub fn run_hw_and_print(
             } else {
                 println!("      {}: {} ({:.1}s)", prefix, label, elapsed);
             }
-            HwRunResult { label, output, passed, elapsed_secs: elapsed }
+            HwRunResult { label, output, passed, elapsed_secs: elapsed, wedged: false }
         }
         Err(e) => {
             let elapsed = hw_start.elapsed().as_secs_f64();
-            // Extract the meaningful error: look for "ERROR:" lines from
-            // npu-runner stderr, falling back to the NpuRunError message.
-            let meaningful = e.lines()
-                .filter(|l| l.contains("ERROR:") || l.starts_with("Kernel timed out"))
-                .last()
-                .unwrap_or_else(|| e.lines().next().unwrap_or(&e));
-            let label = format!("ERROR ({})", &meaningful[..meaningful.len().min(60)]);
+            let label = if e.wedged {
+                "WEDGED (D-state)".to_string()
+            } else {
+                // Extract the meaningful error: look for "ERROR:" lines from
+                // npu-runner stderr, falling back to the NpuRunError message.
+                let meaningful = e.message.lines()
+                    .filter(|l| l.contains("ERROR:") || l.starts_with("Kernel timed out"))
+                    .last()
+                    .unwrap_or_else(|| e.message.lines().next().unwrap_or(&e.message));
+                format!("ERROR ({})", &meaningful[..meaningful.len().min(60)])
+            };
             if compact {
                 print!("{}: {}", prefix, label);
             } else {
                 println!("      {}: {}", prefix, label);
             }
-            HwRunResult { label, output: Vec::new(), passed: false, elapsed_secs: elapsed }
+            HwRunResult { label, output: Vec::new(), passed: false, elapsed_secs: elapsed, wedged: e.wedged }
         }
     };
 
-    // Wait for the NPU device to become idle before the next test.
-    // Polls sysfs runtime PM instead of fixed-duration sleeps.
-    let is_error = result.label.starts_with("ERROR");
-    npu_runner::wait_for_device_idle(is_error);
+    // Don't wait for device idle if wedged -- device is unrecoverable.
+    if !result.wedged {
+        let is_error = result.label.starts_with("ERROR");
+        npu_runner::wait_for_device_idle(is_error);
+    }
 
     result
 }

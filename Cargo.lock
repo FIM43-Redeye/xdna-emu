@@ -4416,6 +4416,7 @@ dependencies = [
  "env_logger",
  "goblin",
  "hex",
+ "libc",
  "log",
  "memmap2",
  "nom",

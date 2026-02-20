@@ -19,6 +19,9 @@ pub struct HwRunResult {
     pub passed: bool,
     /// Wall-clock time in seconds.
     pub elapsed_secs: f64,
+    /// Process survived SIGKILL -- device is in D-state. Triggers immediate
+    /// cascade cutoff rather than waiting for consecutive error threshold.
+    pub wedged: bool,
 }
 
 /// Accumulated statistics from a test run across all execution modes.

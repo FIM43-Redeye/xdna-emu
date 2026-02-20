@@ -34,6 +34,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use super::npu_runner;
+use super::process_control::{self, ProcessOutcome};
 
 /// Result of running a native test.exe on hardware.
 pub struct NativeTestResult {
@@ -51,6 +52,8 @@ pub struct NativeTestResult {
     pub elapsed_secs: f64,
     /// Process exit code (None if killed by signal).
     pub exit_code: Option<i32>,
+    /// Process survived SIGKILL -- device is in D-state.
+    pub wedged: bool,
 }
 
 /// How the test.cpp handles its paths/arguments.
@@ -237,28 +240,9 @@ pub fn run_native_test(
         }
     }
 
-    // Spawn the process with a timeout
-    let child = match cmd.stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return NativeTestResult {
-                passed: false,
-                total_checks: 0,
-                correct_checks: 0,
-                stdout: String::new(),
-                stderr: format!("Failed to spawn test.exe: {}", e),
-                elapsed_secs: start.elapsed().as_secs_f64(),
-                exit_code: None,
-            };
-        }
-    };
-
-    // Wait with timeout
-    match wait_with_timeout(child, timeout_secs) {
-        WaitResult::Completed { stdout, stderr, exit_code } => {
+    // Spawn with timeout and D-state detection via shared process control.
+    match process_control::spawn_with_timeout(&mut cmd, timeout_secs) {
+        ProcessOutcome::Completed { stdout, stderr, exit_code } => {
             let elapsed_secs = start.elapsed().as_secs_f64();
             let (passed, total_checks, correct_checks) = parse_test_output(&stdout);
 
@@ -270,9 +254,10 @@ pub fn run_native_test(
                 stderr,
                 elapsed_secs,
                 exit_code: Some(exit_code),
+                wedged: false,
             }
         }
-        WaitResult::Timeout { stdout, stderr } => {
+        ProcessOutcome::Timeout { stdout, stderr } => {
             let elapsed_secs = start.elapsed().as_secs_f64();
             NativeTestResult {
                 passed: false,
@@ -282,9 +267,23 @@ pub fn run_native_test(
                 stderr: format!("{}\n(killed after {}s timeout)", stderr, timeout_secs),
                 elapsed_secs,
                 exit_code: None,
+                wedged: false,
             }
         }
-        WaitResult::Error(msg) => {
+        ProcessOutcome::Wedged { pid, stdout, stderr } => {
+            let elapsed_secs = start.elapsed().as_secs_f64();
+            NativeTestResult {
+                passed: false,
+                total_checks: 0,
+                correct_checks: 0,
+                stdout,
+                stderr: format!("{}\n(process {} wedged in D-state after {}s)", stderr, pid, timeout_secs),
+                elapsed_secs,
+                exit_code: None,
+                wedged: true,
+            }
+        }
+        ProcessOutcome::SpawnError(msg) => {
             NativeTestResult {
                 passed: false,
                 total_checks: 0,
@@ -293,6 +292,7 @@ pub fn run_native_test(
                 stderr: msg,
                 elapsed_secs: start.elapsed().as_secs_f64(),
                 exit_code: None,
+                wedged: false,
             }
         }
     }
@@ -303,87 +303,6 @@ pub fn run_native_test(
 /// Strips aietools paths that ship an ancient libstdc++ which would shadow
 /// the system one and cause GLIBCXX errors.
 use super::sanitized_ld_library_path;
-
-// -- Timeout handling --------------------------------------------------------
-
-enum WaitResult {
-    Completed {
-        stdout: String,
-        stderr: String,
-        exit_code: i32,
-    },
-    Timeout {
-        stdout: String,
-        stderr: String,
-    },
-    Error(String),
-}
-
-/// Wait for a child process with a timeout, killing it if it exceeds the limit.
-fn wait_with_timeout(mut child: std::process::Child, timeout_secs: u32) -> WaitResult {
-    use std::time::Duration;
-
-    let timeout = Duration::from_secs(timeout_secs as u64);
-    let start = Instant::now();
-    let poll_interval = Duration::from_millis(100);
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Process finished
-                let stdout = child.stdout.take()
-                    .map(|mut s| {
-                        let mut buf = String::new();
-                        std::io::Read::read_to_string(&mut s, &mut buf).ok();
-                        buf
-                    })
-                    .unwrap_or_default();
-                let stderr = child.stderr.take()
-                    .map(|mut s| {
-                        let mut buf = String::new();
-                        std::io::Read::read_to_string(&mut s, &mut buf).ok();
-                        buf
-                    })
-                    .unwrap_or_default();
-
-                return WaitResult::Completed {
-                    stdout,
-                    stderr,
-                    exit_code: status.code().unwrap_or(-1),
-                };
-            }
-            Ok(None) => {
-                // Still running -- check timeout
-                if start.elapsed() >= timeout {
-                    // Kill the process
-                    let _ = child.kill();
-                    let _ = child.wait(); // Reap zombie
-
-                    let stdout = child.stdout.take()
-                        .map(|mut s| {
-                            let mut buf = String::new();
-                            std::io::Read::read_to_string(&mut s, &mut buf).ok();
-                            buf
-                        })
-                        .unwrap_or_default();
-                    let stderr = child.stderr.take()
-                        .map(|mut s| {
-                            let mut buf = String::new();
-                            std::io::Read::read_to_string(&mut s, &mut buf).ok();
-                            buf
-                        })
-                        .unwrap_or_default();
-
-                    return WaitResult::Timeout { stdout, stderr };
-                }
-                std::thread::sleep(poll_interval);
-            }
-            Err(e) => {
-                return WaitResult::Error(format!("Failed to wait for process: {}", e));
-            }
-        }
-    }
-}
 
 // -- Output parsing ----------------------------------------------------------
 
@@ -434,7 +353,9 @@ pub fn run_native_and_print(
 ) -> super::runner_stats::HwRunResult {
     let result = run_native_test(test_exe, xclbin, insts, pattern, DEFAULT_NATIVE_TIMEOUT_SECS);
 
-    let label = if result.passed {
+    let label = if result.wedged {
+        "WEDGED (D-state)".to_string()
+    } else if result.passed {
         if result.total_checks > 0 {
             format!("PASS ({}/{})", result.correct_checks, result.total_checks)
         } else {
@@ -454,6 +375,7 @@ pub fn run_native_and_print(
     };
 
     let passed = result.passed;
+    let wedged = result.wedged;
     let elapsed = result.elapsed_secs;
 
     if compact {
@@ -462,15 +384,18 @@ pub fn run_native_and_print(
         println!("      {}: {} ({:.1}s)", prefix, label, elapsed);
     }
 
-    // Wait for device idle before next test
-    let is_error = label.starts_with("ERROR") || label.starts_with("TIMEOUT");
-    npu_runner::wait_for_device_idle(is_error);
+    // Don't wait for device idle if wedged -- device is unrecoverable.
+    if !wedged {
+        let is_error = label.starts_with("ERROR") || label.starts_with("TIMEOUT");
+        npu_runner::wait_for_device_idle(is_error);
+    }
 
     super::runner_stats::HwRunResult {
         label,
         output: Vec::new(), // Native tests don't expose raw output bytes
         passed,
         elapsed_secs: elapsed,
+        wedged,
     }
 }
 

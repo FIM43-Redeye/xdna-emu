@@ -29,6 +29,7 @@ smallvec = "1.13"                                       # Stack-allocated vector
 byteorder = "1.5"                                       # Byte order utilities for binary parsing
 dirs = "6"                                              # Platform-specific config directories
 crossterm = "0.29"                                       # Terminal control for build progress grid
+libc = "0.2"                                              # POSIX FFI: setsid, killpg for process control
 
 # Serialization (for test manifests and register database)
 serde = { version = "1", features = ["derive"] }
