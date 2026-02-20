@@ -110,6 +110,7 @@ impl CycleAccurateExecutor {
     }
 
     /// Check for memory bank conflicts.
+    #[allow(dead_code)]
     fn check_memory_conflict(&self, op: &SlotOp) -> u8 {
         match &op.op {
             Operation::Load { width, .. } | Operation::Store { width, .. } => {

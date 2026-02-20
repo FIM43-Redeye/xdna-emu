@@ -70,6 +70,8 @@ pub struct BuildEnv {
     /// aietools root, if available (for XILINX_VITIS_AIETOOLS).
     aietools_root: Option<PathBuf>,
     /// Canonicalized mlir-aie root (for deriving test_lib paths).
+    /// Used at construction but not read back yet (pending Chess integration).
+    #[allow(dead_code)]
     mlir_aie_root: PathBuf,
     /// Include path for test_lib (test_library.h), if available.
     test_lib_include: Option<PathBuf>,
