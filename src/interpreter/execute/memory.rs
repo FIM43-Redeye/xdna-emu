@@ -36,10 +36,10 @@
 //!
 //! The AGU (Address Generation Unit) generates 20-bit addresses spanning
 //! 0x0000-0x3FFFF (256KB) across the 4 neighboring memory modules:
-//! - 0x00000-0x0FFFF: South (local tile's own memory)
-//! - 0x10000-0x1FFFF: West neighbor
-//! - 0x20000-0x2FFFF: North neighbor
-//! - 0x30000-0x3FFFF: East neighbor
+//! - 0x00000-0x0FFFF: Local tile memory (quadrant 0)
+//! - 0x10000-0x1FFFF: West neighbor (col-1, same row)
+//! - 0x20000-0x2FFFF: North neighbor (same col, row+1)
+//! - 0x30000-0x3FFFF: East neighbor (col+1, same row)
 //!
 //! Linker-assigned addresses (like 0x70440) use higher bits to indicate
 //! memory regions; these must be masked to the 18-bit AGU range.
@@ -67,8 +67,12 @@ const DATA_MEMORY_ADDRESS_LIMIT: u32 = 0x3FFFF;
 /// Extract the quadrant (0-3) and local offset from a data memory address.
 ///
 /// AIE2 cores use an 18-bit address space for data memory:
-///   - bits 17:16 select the quadrant (0=local, 1=West, 2=North, 3=East)
+///   - bits 17:16 select the quadrant (0=Local, 1=West, 2=North, 3=East)
 ///   - bits 15:0  are the 64KB offset within the quadrant
+///
+/// Quadrant 0 is treated as local memory. Linker-assigned system addresses
+/// (e.g. 0x70000 for East/local) are masked to 16-bit offsets, also landing
+/// in quadrant 0.
 ///
 /// However, addresses loaded from the ELF/linker may include the tile's
 /// system base address (e.g., 0x70000 for tile at col 0, row 2). These
@@ -101,10 +105,15 @@ fn decode_data_address(addr: u32) -> (u32, usize) {
 ///
 /// | Quadrant | Direction | Neighbor offset        |
 /// |----------|-----------|------------------------|
-/// | 0        | South     | Local (own tile memory) |
+/// | 0        | Local     | Own tile memory         |
 /// | 1        | West      | (col-1, row)           |
 /// | 2        | North     | (col, row+1)           |
 /// | 3        | East      | (col+1, row)           |
+///
+/// Note: the hardware's AGU quadrant numbering per aie-rt/mlir-aie is
+/// 0=South, 1=West, 2=North, 3=East(local). The emulator uses quadrant 0
+/// as local because linker-assigned addresses (0x70000+) are masked to
+/// 16-bit offsets landing in quadrant 0 (see [`decode_data_address`]).
 pub struct NeighborMemory {
     /// Source tile coordinates (needed for resolving neighbors).
     col: usize,

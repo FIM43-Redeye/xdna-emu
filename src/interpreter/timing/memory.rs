@@ -50,9 +50,16 @@ pub const NUM_BANKS: usize = aie2_spec::COMPUTE_TILE_MEMORY_BANKS;
 //
 // Each compute tile can access 256KB of data memory across 4 tiles:
 // - Quadrant 0 (0x00000-0x0FFFF): Local tile memory (64KB)
-// - Quadrant 1 (0x10000-0x1FFFF): South neighbor tile (64KB)
-// - Quadrant 2 (0x20000-0x2FFFF): West neighbor tile (64KB)
-// - Quadrant 3 (0x30000-0x3FFFF): South-West neighbor tile (64KB)
+// - Quadrant 1 (0x10000-0x1FFFF): West neighbor tile (col-1, same row)
+// - Quadrant 2 (0x20000-0x2FFFF): North neighbor tile (same col, row+1)
+// - Quadrant 3 (0x30000-0x3FFFF): East neighbor tile (col+1, same row)
+//
+// Note: the hardware's AGU quadrant mapping per aie-rt and mlir-aie is
+// actually 0=South, 1=West, 2=North, 3=East(local). The emulator uses
+// quadrant 0 as local because linker-assigned addresses (0x70000+) are
+// masked to 16-bit offsets landing in quadrant 0 (see decode_data_address
+// in execute/memory.rs). This simplified mapping works for all current
+// code paths.
 //
 // Cross-tile memory access incurs routing latency through the stream switch.
 // Per AM020 Ch2, local-to-external routing is 4 cycles per hop.
@@ -66,44 +73,49 @@ pub const QUADRANT_SIZE: u32 = 0x10000;
 pub const CROSS_TILE_LATENCY: u8 = aie2_spec::ROUTE_LATENCY_LOCAL_TO_EXTERNAL;
 
 /// Memory quadrant (which tile's memory is being accessed).
+///
+/// Mapping matches execute/memory.rs NeighborMemory and decode_data_address().
+/// See comment block above for the relationship to the hardware's actual
+/// AGU quadrant numbering (South/West/North/East per aie-rt).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryQuadrant {
     /// Local tile memory (0x00000-0x0FFFF) - no routing latency.
     Local,
-    /// South neighbor tile (0x10000-0x1FFFF) - 1 hop.
-    South,
-    /// West neighbor tile (0x20000-0x2FFFF) - 1 hop.
+    /// West neighbor tile (0x10000-0x1FFFF) - 1 hop (col-1, same row).
     West,
-    /// South-West neighbor tile (0x30000-0x3FFFF) - 2 hops (diagonal).
-    SouthWest,
+    /// North neighbor tile (0x20000-0x2FFFF) - 1 hop (same col, row+1).
+    North,
+    /// East neighbor tile (0x30000-0x3FFFF) - 1 hop (col+1, same row).
+    East,
 }
 
 impl MemoryQuadrant {
     /// Determine which quadrant an address falls into.
     ///
     /// Address bits [17:16] determine the quadrant:
-    /// - 0b00: Local
-    /// - 0b01: South
-    /// - 0b10: West
-    /// - 0b11: South-West
+    /// - 0b00: Local (own tile memory)
+    /// - 0b01: West neighbor (col-1, same row)
+    /// - 0b10: North neighbor (same col, row+1)
+    /// - 0b11: East neighbor (col+1, same row)
     #[inline]
     pub fn from_address(address: u32) -> Self {
         match (address >> 16) & 0x3 {
             0 => Self::Local,
-            1 => Self::South,
-            2 => Self::West,
-            3 => Self::SouthWest,
+            1 => Self::West,
+            2 => Self::North,
+            3 => Self::East,
             _ => unreachable!(),
         }
     }
 
     /// Get the number of hops to reach this quadrant.
+    ///
+    /// All cross-tile neighbors (West, North, East) are 1 hop away.
     #[inline]
     pub fn hop_count(&self) -> u8 {
         match self {
             Self::Local => 0,
-            Self::South | Self::West => 1,
-            Self::SouthWest => 2, // Diagonal = 2 hops (south + west)
+            Self::West | Self::North | Self::East => 1,
         }
     }
 
@@ -726,25 +738,25 @@ mod tests {
         assert_eq!(MemoryQuadrant::from_address(0x08000), MemoryQuadrant::Local);
         assert_eq!(MemoryQuadrant::from_address(0x0FFFF), MemoryQuadrant::Local);
 
-        // Quadrant 1: South (0x10000-0x1FFFF)
-        assert_eq!(MemoryQuadrant::from_address(0x10000), MemoryQuadrant::South);
-        assert_eq!(MemoryQuadrant::from_address(0x1FFFF), MemoryQuadrant::South);
+        // Quadrant 1: West (0x10000-0x1FFFF)
+        assert_eq!(MemoryQuadrant::from_address(0x10000), MemoryQuadrant::West);
+        assert_eq!(MemoryQuadrant::from_address(0x1FFFF), MemoryQuadrant::West);
 
-        // Quadrant 2: West (0x20000-0x2FFFF)
-        assert_eq!(MemoryQuadrant::from_address(0x20000), MemoryQuadrant::West);
-        assert_eq!(MemoryQuadrant::from_address(0x2FFFF), MemoryQuadrant::West);
+        // Quadrant 2: North (0x20000-0x2FFFF)
+        assert_eq!(MemoryQuadrant::from_address(0x20000), MemoryQuadrant::North);
+        assert_eq!(MemoryQuadrant::from_address(0x2FFFF), MemoryQuadrant::North);
 
-        // Quadrant 3: South-West (0x30000-0x3FFFF)
-        assert_eq!(MemoryQuadrant::from_address(0x30000), MemoryQuadrant::SouthWest);
-        assert_eq!(MemoryQuadrant::from_address(0x3FFFF), MemoryQuadrant::SouthWest);
+        // Quadrant 3: East (0x30000-0x3FFFF)
+        assert_eq!(MemoryQuadrant::from_address(0x30000), MemoryQuadrant::East);
+        assert_eq!(MemoryQuadrant::from_address(0x3FFFF), MemoryQuadrant::East);
     }
 
     #[test]
     fn test_quadrant_hop_count() {
         assert_eq!(MemoryQuadrant::Local.hop_count(), 0);
-        assert_eq!(MemoryQuadrant::South.hop_count(), 1);
         assert_eq!(MemoryQuadrant::West.hop_count(), 1);
-        assert_eq!(MemoryQuadrant::SouthWest.hop_count(), 2);
+        assert_eq!(MemoryQuadrant::North.hop_count(), 1);
+        assert_eq!(MemoryQuadrant::East.hop_count(), 1);
     }
 
     #[test]
@@ -752,12 +764,10 @@ mod tests {
         // Local: 0 cycles
         assert_eq!(MemoryQuadrant::Local.routing_latency(), 0);
 
-        // 1 hop: 4 cycles (LOCAL_TO_EXTERNAL)
-        assert_eq!(MemoryQuadrant::South.routing_latency(), CROSS_TILE_LATENCY);
+        // 1 hop: 4 cycles (LOCAL_TO_EXTERNAL) for all neighbors
         assert_eq!(MemoryQuadrant::West.routing_latency(), CROSS_TILE_LATENCY);
-
-        // 2 hops: 8 cycles (2 * LOCAL_TO_EXTERNAL)
-        assert_eq!(MemoryQuadrant::SouthWest.routing_latency(), 2 * CROSS_TILE_LATENCY);
+        assert_eq!(MemoryQuadrant::North.routing_latency(), CROSS_TILE_LATENCY);
+        assert_eq!(MemoryQuadrant::East.routing_latency(), CROSS_TILE_LATENCY);
     }
 
     #[test]
@@ -768,23 +778,23 @@ mod tests {
         assert!(!access.is_cross_tile());
         assert_eq!(access.cross_tile_latency(), 0);
 
-        // South neighbor access
-        let access = MemoryAccess::load(0x11000, 4);
-        assert_eq!(access.quadrant(), MemoryQuadrant::South);
-        assert!(access.is_cross_tile());
-        assert_eq!(access.cross_tile_latency(), CROSS_TILE_LATENCY);
-
         // West neighbor access
-        let access = MemoryAccess::load(0x21000, 4);
+        let access = MemoryAccess::load(0x11000, 4);
         assert_eq!(access.quadrant(), MemoryQuadrant::West);
         assert!(access.is_cross_tile());
         assert_eq!(access.cross_tile_latency(), CROSS_TILE_LATENCY);
 
-        // South-West (diagonal) access
-        let access = MemoryAccess::load(0x31000, 4);
-        assert_eq!(access.quadrant(), MemoryQuadrant::SouthWest);
+        // North neighbor access
+        let access = MemoryAccess::load(0x21000, 4);
+        assert_eq!(access.quadrant(), MemoryQuadrant::North);
         assert!(access.is_cross_tile());
-        assert_eq!(access.cross_tile_latency(), 2 * CROSS_TILE_LATENCY);
+        assert_eq!(access.cross_tile_latency(), CROSS_TILE_LATENCY);
+
+        // East neighbor access
+        let access = MemoryAccess::load(0x31000, 4);
+        assert_eq!(access.quadrant(), MemoryQuadrant::East);
+        assert!(access.is_cross_tile());
+        assert_eq!(access.cross_tile_latency(), CROSS_TILE_LATENCY);
     }
 
     #[test]
@@ -798,23 +808,23 @@ mod tests {
     }
 
     #[test]
-    fn test_access_latency_cross_tile_south() {
+    fn test_access_latency_cross_tile_west() {
         let model = MemoryModel::new();
 
-        // South neighbor: base + 4 cycles routing (5 + 4 = 9)
+        // West neighbor: base + 4 cycles routing (5 + 4 = 9)
         let access = MemoryAccess::load(0x11000, 4);
         let latency = model.access_latency(&access);
         assert_eq!(latency, BASE_LATENCY + CROSS_TILE_LATENCY);
     }
 
     #[test]
-    fn test_access_latency_cross_tile_diagonal() {
+    fn test_access_latency_cross_tile_east() {
         let model = MemoryModel::new();
 
-        // South-West: base + 8 cycles routing (5 + 8 = 13)
+        // East neighbor: base + 4 cycles routing (5 + 4 = 9)
         let access = MemoryAccess::load(0x31000, 4);
         let latency = model.access_latency(&access);
-        assert_eq!(latency, BASE_LATENCY + 2 * CROSS_TILE_LATENCY);
+        assert_eq!(latency, BASE_LATENCY + CROSS_TILE_LATENCY);
     }
 
     #[test]
@@ -825,20 +835,20 @@ mod tests {
         // Local access (no cross-tile)
         model.record_access(&MemoryAccess::load(0x1000, 4));
 
-        // South neighbor access (1 hop)
+        // West neighbor access (1 hop)
         model.record_access(&MemoryAccess::load(0x11000, 4));
 
-        // West neighbor access (1 hop)
+        // North neighbor access (1 hop)
         model.record_access(&MemoryAccess::load(0x21000, 4));
 
-        // Diagonal access (2 hops)
+        // East neighbor access (1 hop)
         model.record_access(&MemoryAccess::load(0x31000, 4));
 
         let stats = model.stats();
         assert_eq!(stats.total_accesses, 4);
         assert_eq!(stats.total_cross_tile, 3);
-        // 1 hop + 1 hop + 2 hops = 4 hops total = 16 cycles
-        assert_eq!(stats.total_cross_tile_cycles, 4 * CROSS_TILE_LATENCY as u64);
+        // 1 hop + 1 hop + 1 hop = 3 hops total = 12 cycles
+        assert_eq!(stats.total_cross_tile_cycles, 3 * CROSS_TILE_LATENCY as u64);
         assert!((stats.cross_tile_rate - 0.75).abs() < 0.001);
     }
 
@@ -851,12 +861,12 @@ mod tests {
         let access1 = MemoryAccess::load(0x00, 4);
         model.record_access(&access1);
 
-        // Second access to bank 0 (conflict) + cross-tile (south)
+        // Second access to bank 0 (conflict) + cross-tile (west)
         // Should have: base (5) + conflict (1) + cross-tile (4) = 10
         let access2 = MemoryAccess::load(0x10080, 4);
         let latency = model.access_latency(&access2);
 
-        // Cross-tile to south + bank 0 conflict
+        // Cross-tile to west + bank 0 conflict
         assert_eq!(latency, BASE_LATENCY + CONFLICT_PENALTY + CROSS_TILE_LATENCY);
     }
 }
