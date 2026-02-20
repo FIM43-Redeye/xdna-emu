@@ -1698,7 +1698,9 @@ pub fn infer_branch_condition(mnemonic: &str, semantic: Option<SemanticOp>) -> O
         return None;
     }
     let mn = mnemonic.to_lowercase();
-    Some(if mn == "jnz" || mn == "jnzd" {
+    Some(if mn == "jnzd" {
+        BranchCondition::NotZeroDecrement
+    } else if mn == "jnz" {
         BranchCondition::NotZero
     } else if mn == "jz" {
         BranchCondition::Zero

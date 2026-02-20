@@ -571,6 +571,7 @@ fn condition_suffix(c: BranchCondition) -> &'static str {
         BranchCondition::OverflowClear => "vc",
         BranchCondition::Zero => "z",
         BranchCondition::NotZero => "nz",
+        BranchCondition::NotZeroDecrement => "nzd",
     }
 }
 

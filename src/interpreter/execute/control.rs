@@ -89,29 +89,19 @@ impl ControlUnit {
             Operation::Branch { condition } => {
                 let target = Self::get_branch_target(op, ctx);
                 let should_branch = match condition {
-                    // For jz/jnz, check the source register value directly
+                    // For jz/jnz, the test register is in dest (decoder maps
+                    // the single register operand there). Try dest, then sources.
                     BranchCondition::Zero | BranchCondition::NotZero => {
-                        // The mRx field for jnz/jz is in dest (decoder treats it as dest)
-                        // Try dest first, then sources as fallback
                         let reg_val = if let Some(Operand::ScalarReg(r)) = &op.dest {
                             let v = ctx.read_scalar(*r) as i32;
                             log::debug!("JNZ/JZ: dest=ScalarReg({}) val={} target=0x{:X}", r, v, target);
                             v
-                        } else if let Some(src) = op.sources.first() {
-                            match src {
-                                Operand::ScalarReg(r) => {
-                                    let v = ctx.read_scalar(*r) as i32;
-                                    log::debug!("JNZ/JZ: src[0]=ScalarReg({}) val={} target=0x{:X}", r, v, target);
-                                    v
-                                }
-                                Operand::Immediate(imm) => {
-                                    log::debug!("JNZ/JZ: src[0]=Imm({}) target=0x{:X}", imm, target);
-                                    *imm
-                                }
-                                _ => 0,
-                            }
+                        } else if let Some(Operand::ScalarReg(r)) = op.sources.first() {
+                            let v = ctx.read_scalar(*r) as i32;
+                            log::debug!("JNZ/JZ: src[0]=ScalarReg({}) val={} target=0x{:X}", r, v, target);
+                            v
                         } else {
-                            log::debug!("JNZ/JZ: no dest/src, defaulting to 0, target=0x{:X}", target);
+                            log::debug!("JNZ/JZ: no register operand, defaulting to 0");
                             0
                         };
                         match condition {
@@ -119,6 +109,34 @@ impl ControlUnit {
                             BranchCondition::NotZero => reg_val != 0,
                             _ => unreachable!(),
                         }
+                    }
+                    // JNZD: test sources[0] (mRx0), decrement dest (mRx), branch to
+                    // sources[1] (mPm). Decrement always happens regardless of branch.
+                    // TableGen: (outs eR:$mRx), (ins eR:$mRx0, eP:$mPm)
+                    BranchCondition::NotZeroDecrement => {
+                        // Read the test register (sources[0] = mRx0)
+                        let test_val = if let Some(Operand::ScalarReg(r)) = op.sources.first() {
+                            let v = ctx.read_scalar(*r) as i32;
+                            log::debug!("JNZD: test src[0]=r{} val={} target=0x{:X}", r, v, target);
+                            v
+                        } else if let Some(Operand::ScalarReg(r)) = &op.dest {
+                            // Fallback: some decoder paths may put the register in dest
+                            let v = ctx.read_scalar(*r) as i32;
+                            log::debug!("JNZD: test dest=r{} val={} target=0x{:X}", r, v, target);
+                            v
+                        } else {
+                            log::debug!("JNZD: no test register found, defaulting to 0");
+                            0
+                        };
+                        // Decrement the destination register (dest = mRx), always.
+                        // Read dest separately since it may differ from the test source.
+                        if let Some(Operand::ScalarReg(r)) = &op.dest {
+                            let cur = ctx.read_scalar(*r) as i32;
+                            let decremented = (cur - 1) as u32;
+                            ctx.write_scalar(*r, decremented);
+                            log::debug!("JNZD: r{} decremented {} -> {}", r, cur, decremented);
+                        }
+                        test_val != 0
                     }
                     // For other conditions, check flags
                     _ => Self::evaluate_condition(*condition, ctx.flags()),
@@ -273,8 +291,10 @@ impl ControlUnit {
             BranchCondition::OverflowSet => flags.v,
             BranchCondition::OverflowClear => !flags.v,
             // These are handled directly in execute() using register values
-            BranchCondition::Zero | BranchCondition::NotZero => {
-                log::warn!("Zero/NotZero condition should be handled in execute(), not here");
+            BranchCondition::Zero
+            | BranchCondition::NotZero
+            | BranchCondition::NotZeroDecrement => {
+                log::warn!("Zero/NotZero/NotZeroDecrement condition should be handled in execute(), not here");
                 false
             }
         }

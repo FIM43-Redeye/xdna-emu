@@ -471,6 +471,9 @@ pub enum BranchCondition {
     Zero,
     /// Branch if source register is not zero (jnz instruction).
     NotZero,
+    /// Branch if source register is not zero AND decrement (jnzd instruction).
+    /// Same as NotZero but also decrements the destination register.
+    NotZeroDecrement,
 }
 
 /// Select instruction variant.
