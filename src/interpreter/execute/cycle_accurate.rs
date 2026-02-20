@@ -38,6 +38,7 @@ use crate::interpreter::traits::{ExecuteResult, Executor};
 use super::control::ControlUnit;
 use super::memory::{MemoryUnit, NeighborMemory};
 use super::scalar::ScalarAlu;
+use super::semantic::execute_semantic;
 use super::vector::VectorAlu;
 
 /// Cycle-accurate executor that models pipeline timing.
@@ -161,7 +162,14 @@ impl CycleAccurateExecutor {
             self.pending_call_return_addr = Some(ctx.pc());
         }
 
-        // Execute using the functional units
+        // Execute using the functional units.
+        // Prefer TableGen-driven semantic dispatch for pure register operations.
+        // Falls through to legacy dispatch for unhandled ops (vector, memory,
+        // control flow, and any ops without SemanticOp mappings).
+        if execute_semantic(op, ctx) {
+            return None;
+        }
+
         if ScalarAlu::execute(op, ctx) {
             return None;
         }
