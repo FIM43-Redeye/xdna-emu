@@ -926,14 +926,20 @@ impl TileArray {
     ///
     /// This is the critical inter-tile data movement phase. When a tile's North
     /// master port has data, it flows to the South slave port of the tile above.
-    /// Similarly for South→North (downward) connections.
+    /// Similarly for South→North (downward) and East/West (horizontal) connections.
     ///
-    /// Per AM025, the port mappings are:
+    /// Per AM025, the North/South port mappings are:
     /// - **Shim→MemTile**: Shim North masters 12-17 → MemTile South slaves 7-12
     /// - **MemTile→Compute**: MemTile North masters 11-16 → Compute South slaves 5-10
     /// - **Compute→MemTile**: Compute South masters 5-10 → MemTile North slaves 13-16 (only 4)
     /// - **MemTile→Shim**: MemTile South masters 7-10 → Shim North slaves 14-17
     /// - **Compute→Compute**: Compute South masters 5-10 → (below) Compute South slaves 5-10
+    ///
+    /// East/West port mappings (same-type adjacency only, MemTiles have no E/W):
+    /// - **Compute East→West**: East masters 19-22 → West slaves 11-14
+    /// - **Compute West→East**: West masters 9-12 → East slaves 19-22
+    /// - **Shim East→West**: East masters 18-21 → West slaves 10-13
+    /// - **Shim West→East**: West masters 8-11 → East slaves 18-21
     ///
     /// Returns the number of words transferred between tiles.
     fn propagate_inter_tile(&mut self) -> usize {
@@ -1014,6 +1020,78 @@ impl TileArray {
                                     && self.tiles[below_idx].stream_switch.slaves[slave_idx].can_accept()
                                 {
                                     transfers.push((col, row, master_idx, col, row - 1, slave_idx, data, tlast));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check East masters - data flows to tile to the right (col + 1)
+        for col in 0..self.cols {
+            for row in 0..self.rows {
+                let idx = self.tile_index(col, row);
+                let tile_type = self.tiles[idx].tile_type;
+
+                if col + 1 < self.cols {
+                    let right_idx = self.tile_index(col + 1, row);
+                    let right_type = self.tiles[right_idx].tile_type;
+
+                    // East masters on source -> West slaves on destination
+                    // Port indices from AM025 gen_stream_ports.rs:
+                    // Compute: East masters 19-22, West slaves 11-14
+                    // Shim: East masters 18-21, West slaves 10-13
+                    // MemTile: no East/West ports
+                    let (east_master_start, east_count, west_slave_start) = match (tile_type, right_type) {
+                        (TileType::Compute, TileType::Compute) => (19, 4, 11),
+                        (TileType::Shim, TileType::Shim) => (18, 4, 10),
+                        _ => continue,
+                    };
+
+                    for i in 0..east_count {
+                        let master_idx = east_master_start + i;
+                        let slave_idx = west_slave_start + i;
+
+                        if master_idx < self.tiles[idx].stream_switch.masters.len() {
+                            let port = &self.tiles[idx].stream_switch.masters[master_idx];
+                            if let (Some(&data), Some(tlast)) = (port.fifo.first(), port.peek_tlast()) {
+                                if slave_idx < self.tiles[right_idx].stream_switch.slaves.len()
+                                    && self.tiles[right_idx].stream_switch.slaves[slave_idx].can_accept()
+                                {
+                                    transfers.push((col, row, master_idx, col + 1, row, slave_idx, data, tlast));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // West masters on source -> East slaves on destination (col - 1)
+                if col > 0 {
+                    let left_idx = self.tile_index(col - 1, row);
+                    let left_type = self.tiles[left_idx].tile_type;
+
+                    // West masters on source -> East slaves on destination
+                    // Compute: West masters 9-12, East slaves 19-22
+                    // Shim: West masters 8-11, East slaves 18-21
+                    // MemTile: no East/West ports
+                    let (west_master_start, west_count, east_slave_start) = match (tile_type, left_type) {
+                        (TileType::Compute, TileType::Compute) => (9, 4, 19),
+                        (TileType::Shim, TileType::Shim) => (8, 4, 18),
+                        _ => continue,
+                    };
+
+                    for i in 0..west_count {
+                        let master_idx = west_master_start + i;
+                        let slave_idx = east_slave_start + i;
+
+                        if master_idx < self.tiles[idx].stream_switch.masters.len() {
+                            let port = &self.tiles[idx].stream_switch.masters[master_idx];
+                            if let (Some(&data), Some(tlast)) = (port.fifo.first(), port.peek_tlast()) {
+                                if slave_idx < self.tiles[left_idx].stream_switch.slaves.len()
+                                    && self.tiles[left_idx].stream_switch.slaves[slave_idx].can_accept()
+                                {
+                                    transfers.push((col, row, master_idx, col - 1, row, slave_idx, data, tlast));
                                 }
                             }
                         }
