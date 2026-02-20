@@ -80,6 +80,10 @@
 
 mod scalar;
 mod vector;
+pub mod vector_pack;
+pub mod vector_permute;
+pub mod vector_srs;
+pub mod vector_ups;
 mod memory;
 mod control;
 mod stream;
