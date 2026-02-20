@@ -92,7 +92,10 @@ impl Aie2Slot {
             Aie2Slot::Mv => SlotIndex::Scalar1,
             Aie2Slot::St => SlotIndex::Store,
             Aie2Slot::Vec => SlotIndex::Vector,
-            Aie2Slot::Lng => SlotIndex::Vector, // Long operations are often vector
+            // LNG is polymorphic: j/jl -> Control, movxm -> Scalar0.
+            // decode_bundle() resolves via operation.natural_slot() after decoding.
+            // This fallback is only used by SlotDecode::to_slot_op() (currently dead code).
+            Aie2Slot::Lng => SlotIndex::Control,
             Aie2Slot::Nop => SlotIndex::Control,
         }
     }

@@ -428,11 +428,19 @@ impl InstructionDecoder {
             SemanticOp::Sub => Operation::ScalarSub,
             SemanticOp::Mul if enc.is_vector => Operation::VectorMul { element_type },
             SemanticOp::Mul => Operation::ScalarMul,
+            SemanticOp::And if enc.is_vector => Operation::VectorAnd { element_type },
             SemanticOp::And => Operation::ScalarAnd,
+            SemanticOp::Or if enc.is_vector => Operation::VectorOr { element_type },
             SemanticOp::Or => Operation::ScalarOr,
+            SemanticOp::Xor if enc.is_vector => Operation::VectorXor { element_type },
             SemanticOp::Xor => Operation::ScalarXor,
+            SemanticOp::Not if enc.is_vector => Operation::VectorNot { element_type },
+            SemanticOp::Not => Operation::ScalarXor, // scalar not = xor with -1
+            SemanticOp::Shl if enc.is_vector => Operation::VectorShiftLeft { element_type },
             SemanticOp::Shl => Operation::ScalarShl,
+            SemanticOp::Sra if enc.is_vector => Operation::VectorArithShiftRight { element_type },
             SemanticOp::Sra => Operation::ScalarSra,
+            SemanticOp::Srl if enc.is_vector => Operation::VectorShiftRight { element_type },
             SemanticOp::Srl => Operation::ScalarShr,
             SemanticOp::Load => {
                 // Channel discrimination: enc.slot is the authoritative
@@ -497,14 +505,29 @@ impl InstructionDecoder {
             SemanticOp::LockAcquire => Operation::LockAcquire,
             SemanticOp::LockRelease => Operation::LockRelease,
 
-            // Other scalar ops
+            // Abs/Neg
             SemanticOp::Abs => Operation::ScalarAbs,
+            SemanticOp::Neg if enc.is_vector => Operation::VectorNegate { element_type },
+            SemanticOp::Neg => Operation::ScalarSub, // neg r = 0 - r
+
+            // Bit manipulation
+            SemanticOp::Ctlz => Operation::ScalarClz,
+
+            // Sign/zero extension
+            SemanticOp::SignExtend => Operation::ScalarExtendS16,
+            SemanticOp::ZeroExtend => Operation::ScalarExtendU16,
+
+            // Division
+            SemanticOp::SDiv => Operation::ScalarDiv,
+            SemanticOp::UDiv => Operation::ScalarDivu,
+            SemanticOp::SRem => Operation::ScalarMod,
 
             // Control flow
             SemanticOp::Ret => Operation::Return,
             SemanticOp::Done => Operation::Halt,
 
-            // Not handled yet - fall through
+            // Not handled yet - fall through (URem, Rotl, Rotr, Cttz,
+            // Ctpop, Bswap, Truncate, Intrinsic)
             _ => Operation::Unknown { opcode: 0 },
         }
     }
@@ -517,7 +540,9 @@ impl InstructionDecoder {
             "st" => SlotIndex::Store,
             "mv" => SlotIndex::Scalar1,
             "vec" => SlotIndex::Vector,
-            "lng" => SlotIndex::Control, // Long instructions often control
+            // LNG is polymorphic (j/jl/movxm). Control is the safe default;
+            // the main decode_bundle path overrides via natural_slot() anyway.
+            "lng" => SlotIndex::Control,
             _ => SlotIndex::Scalar0,
         }
     }

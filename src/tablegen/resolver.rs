@@ -1567,6 +1567,94 @@ pub fn infer_semantic_from_mnemonic(mnemonic: &str) -> Option<SemanticOp> {
         return Some(SemanticOp::Neg);
     }
 
+    // Bit manipulation (scalar)
+    if lower == "clz" || lower.starts_with("clz.") {
+        return Some(SemanticOp::Ctlz);
+    }
+    if lower == "clb" || lower.starts_with("clb.") {
+        return Some(SemanticOp::Ctlz); // CLB (count leading bits) ~ CLZ variant
+    }
+
+    // Sign/zero extension (scalar)
+    if lower.starts_with("extend.s") || lower.starts_with("ext.s") || lower.starts_with("sext") {
+        return Some(SemanticOp::SignExtend);
+    }
+    if lower.starts_with("extend.u") || lower.starts_with("ext.u") || lower.starts_with("zext") {
+        return Some(SemanticOp::ZeroExtend);
+    }
+
+    // Division (scalar)
+    if lower == "div" || lower == "divs" || lower.starts_with("div.") {
+        return Some(SemanticOp::SDiv);
+    }
+    if lower == "divu" || lower.starts_with("divu.") {
+        return Some(SemanticOp::UDiv);
+    }
+    if lower == "mod" || lower.starts_with("mod.") {
+        return Some(SemanticOp::SRem);
+    }
+
+    // Carry ops (scalar, map to Add/Sub)
+    if lower == "adc" || lower.starts_with("adc.") {
+        return Some(SemanticOp::Add);
+    }
+    if lower == "sbc" || lower.starts_with("sbc.") {
+        return Some(SemanticOp::Sub);
+    }
+
+    // Shift (alternate naming: ashl = arithmetic shift left)
+    if lower == "ashl" || lower.starts_with("ashl.") {
+        return Some(SemanticOp::Shl);
+    }
+
+    // Zero/nonzero test (scalar comparison, produce 0/1)
+    if lower == "eqz" || lower.starts_with("eqz.") {
+        return Some(SemanticOp::SetEq);
+    }
+    if lower == "nez" || lower.starts_with("nez.") {
+        return Some(SemanticOp::SetNe);
+    }
+
+    // Event (control, treat as nop for execution purposes)
+    if lower == "event" || lower.starts_with("event.") {
+        return Some(SemanticOp::Nop);
+    }
+
+    // "ret lr" is a return (alternate mnemonic form)
+    if lower == "ret lr" {
+        return Some(SemanticOp::Ret);
+    }
+
+    // Vector boolean/bitwise ops (vband, vbor = vector boolean and/or)
+    if lower.starts_with("vband") {
+        return Some(SemanticOp::And);
+    }
+    if lower.starts_with("vbor") {
+        return Some(SemanticOp::Or);
+    }
+    if lower.starts_with("vbneg") {
+        return Some(SemanticOp::Neg);
+    }
+
+    // Vector conditional min/max (vmax_lt, vmin_ge, vmaxdiff_lt)
+    if lower.starts_with("vmax_lt") || lower.starts_with("vmaxdiff_lt") {
+        return Some(SemanticOp::SetLt);
+    }
+    if lower.starts_with("vmin_ge") {
+        return Some(SemanticOp::SetGe);
+    }
+
+    // Vector data movement (vshift, vshuffle, vconv, vunpack)
+    if lower.starts_with("vshift") || lower.starts_with("vshuffle") {
+        return Some(SemanticOp::Copy); // Data rearrangement
+    }
+    if lower.starts_with("vconv") {
+        return Some(SemanticOp::Copy); // Type conversion
+    }
+    if lower.starts_with("vunpack") {
+        return Some(SemanticOp::Load); // Unpack from load channel
+    }
+
     None
 }
 
