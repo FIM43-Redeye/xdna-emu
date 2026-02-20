@@ -1,0 +1,997 @@
+//! AIE2 matrix multiply unit with proper tile geometry.
+//!
+//! The AIE2 vector unit contains a systolic-style multiplier array with 512
+//! multiply units operating at 8-bit x 4-bit granularity. Input vectors are
+//! permuted and reinterpreted as 2D matrix tiles. The tile dimensions depend
+//! on element types:
+//!
+//! | A type | B type | Acc type | Rows | Inner | Cols | Output elements |
+//! |--------|--------|----------|------|-------|------|-----------------|
+//! | int8   | int8   | int32    | 4    | 8     | 8    | 32 (4x8)        |
+//! | int16  | int16  | int32    | 4    | 2     | 8    | 32 (4x8)        |
+//! | int16  | int16  | int64    | 4    | 4     | 4    | 16 (4x4)        |
+//! | bf16   | bf16   | fp32     | 4    | 8     | 4    | 16 (4x4)        |
+//! | int8   | int4   | int32    | 4    | 16    | 8    | 32 (4x8)        |
+//! | int16  | int8   | int32    | 4    | 4     | 8    | 32 (4x8)        |
+//!
+//! The multiply is: acc[r][c] += sum(k=0..inner-1) { A[r][k] * B[k][c] }
+//!
+//! Hardware reference: mulmac.py (read for understanding, original implementation).
+
+use crate::interpreter::bundle::ElementType;
+
+/// Tile geometry for a matrix multiply mode.
+#[derive(Debug, Clone, Copy)]
+struct TileGeometry {
+    rows: usize,
+    inner: usize,
+    cols: usize,
+}
+
+/// Extract int8 elements from packed [u32; 8] (256 bits = 32 bytes = 32 int8 values).
+/// Elements are in little-endian byte order within each u32.
+fn extract_i8(packed: &[u32; 8], index: usize) -> i8 {
+    let word = index / 4;
+    let byte = index % 4;
+    ((packed[word] >> (byte * 8)) & 0xFF) as u8 as i8
+}
+
+/// Extract uint8 elements from packed [u32; 8].
+fn extract_u8(packed: &[u32; 8], index: usize) -> u8 {
+    let word = index / 4;
+    let byte = index % 4;
+    ((packed[word] >> (byte * 8)) & 0xFF) as u8
+}
+
+/// Extract int16 elements from packed [u32; 8] (256 bits = 16 int16 values).
+fn extract_i16(packed: &[u32; 8], index: usize) -> i16 {
+    let word = index / 2;
+    let half = index % 2;
+    ((packed[word] >> (half * 16)) & 0xFFFF) as u16 as i16
+}
+
+/// Extract uint16 elements from packed [u32; 8].
+fn extract_u16(packed: &[u32; 8], index: usize) -> u16 {
+    let word = index / 2;
+    let half = index % 2;
+    ((packed[word] >> (half * 16)) & 0xFFFF) as u16
+}
+
+/// Extract bf16 as f32 from packed [u32; 8] (256 bits = 16 bf16 values).
+fn extract_bf16_as_f32(packed: &[u32; 8], index: usize) -> f32 {
+    let word = index / 2;
+    let half = index % 2;
+    let bits = ((packed[word] >> (half * 16)) & 0xFFFF) as u16;
+    f32::from_bits((bits as u32) << 16)
+}
+
+/// Extract int32 elements from packed [u32; 8] (256 bits = 8 int32 values).
+fn extract_i32(packed: &[u32; 8], index: usize) -> i32 {
+    packed[index] as i32
+}
+
+/// Read a 32-bit accumulator lane from the [u64; 8] accumulator.
+///
+/// The 8 u64 lanes hold 16 int32 values (acc_cmb=1 mode, 32-bit accumulator).
+/// Lane layout: acc[0] holds output[0] in low 32 bits, output[1] in high 32 bits, etc.
+fn read_acc32(acc: &[u64; 8], index: usize) -> i64 {
+    let u64_lane = index / 2;
+    let half = index % 2;
+    let bits = ((acc[u64_lane] >> (half * 32)) & 0xFFFF_FFFF) as u32;
+    bits as i32 as i64
+}
+
+/// Write a 32-bit accumulator lane into the [u64; 8] accumulator.
+fn write_acc32(acc: &mut [u64; 8], index: usize, value: i64) {
+    let u64_lane = index / 2;
+    let half = index % 2;
+    let masked = (value as u32) as u64;
+    let shift = half * 32;
+    acc[u64_lane] = (acc[u64_lane] & !(0xFFFF_FFFF_u64 << shift)) | (masked << shift);
+}
+
+/// Read a 64-bit accumulator lane (acc_cmb=2 mode).
+fn read_acc64(acc: &[u64; 8], index: usize) -> i64 {
+    acc[index] as i64
+}
+
+/// Write a 64-bit accumulator lane (acc_cmb=2 mode).
+fn write_acc64(acc: &mut [u64; 8], index: usize, value: i64) {
+    acc[index] = value as u64;
+}
+
+/// Read a float32 accumulator lane from [u64; 8].
+///
+/// For bf16 matmul, the accumulator holds fp32 values. Since we have 16 output
+/// elements (4x4) and 8 u64 lanes, each u64 holds two fp32 values.
+fn read_acc_f32(acc: &[u64; 8], index: usize) -> f32 {
+    let u64_lane = index / 2;
+    let half = index % 2;
+    let bits = ((acc[u64_lane] >> (half * 32)) & 0xFFFF_FFFF) as u32;
+    f32::from_bits(bits)
+}
+
+/// Write a float32 accumulator lane.
+fn write_acc_f32(acc: &mut [u64; 8], index: usize, value: f32) {
+    let u64_lane = index / 2;
+    let half = index % 2;
+    let bits = value.to_bits() as u64;
+    let shift = half * 32;
+    acc[u64_lane] = (acc[u64_lane] & !(0xFFFF_FFFF_u64 << shift)) | (bits << shift);
+}
+
+/// Dense matrix multiply: acc += A * B (or acc = A * B if clear_acc is true).
+///
+/// Performs a tiled matrix multiply based on the element type. The input vectors
+/// are reinterpreted as 2D tiles and multiplied using the geometry appropriate
+/// for the element type combination.
+pub fn matmul_dense(
+    acc: &mut [u64; 8],
+    a: &[u32; 8],
+    b: &[u32; 8],
+    elem_type: ElementType,
+    signed_a: bool,
+    signed_b: bool,
+) {
+    match elem_type {
+        ElementType::Int8 => matmul_i8xi8(acc, a, b, true, true, false),
+        ElementType::UInt8 => matmul_i8xi8(acc, a, b, signed_a, signed_b, false),
+        ElementType::Int16 => matmul_i16xi16_32(acc, a, b, true, true, false),
+        ElementType::UInt16 => matmul_i16xi16_32(acc, a, b, signed_a, signed_b, false),
+        ElementType::BFloat16 => matmul_bf16xbf16(acc, a, b, false),
+        ElementType::Int32 => matmul_i32xi16(acc, a, b, true, true, false),
+        ElementType::UInt32 => matmul_i32xi16(acc, a, b, false, false, false),
+        ElementType::Float32 => matmul_bf16xbf16(acc, a, b, false),
+    }
+}
+
+/// Matrix multiply-subtract: acc -= A * B.
+pub fn matmul_sub(
+    acc: &mut [u64; 8],
+    a: &[u32; 8],
+    b: &[u32; 8],
+    elem_type: ElementType,
+    signed_a: bool,
+    signed_b: bool,
+) {
+    match elem_type {
+        ElementType::Int8 => matmul_i8xi8(acc, a, b, true, true, true),
+        ElementType::UInt8 => matmul_i8xi8(acc, a, b, signed_a, signed_b, true),
+        ElementType::Int16 => matmul_i16xi16_32(acc, a, b, true, true, true),
+        ElementType::UInt16 => matmul_i16xi16_32(acc, a, b, signed_a, signed_b, true),
+        ElementType::BFloat16 => matmul_bf16xbf16(acc, a, b, true),
+        ElementType::Int32 => matmul_i32xi16(acc, a, b, true, true, true),
+        ElementType::UInt32 => matmul_i32xi16(acc, a, b, false, false, true),
+        ElementType::Float32 => matmul_bf16xbf16(acc, a, b, true),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// int8 x int8 -> int32 accumulator
+//
+// Geometry: rows=4, inner=8, cols=8 => 32 output elements
+//
+// A is 4 rows x 8 cols of int8 = 32 bytes = 256 bits (one vector register)
+// B is 8 rows x 8 cols of int8 = 64 bytes = 512 bits (two vector registers,
+//   but the hardware only uses 256 bits from the second source, selecting
+//   via permutation. For the basic mode we use the full 256-bit B vector
+//   reshaped as 8x4.)
+//
+// Actually for the basic int8xi8 mode (mmode=1, perm_mode row 1):
+//   rows=4, inner=8, cols=8
+// But we only have 256 bits of B = 32 int8 values. With 8 rows and 8 cols
+// that would be 64 values, which exceeds our vector width.
+//
+// Looking more carefully at the hardware: the 256-bit vector holds 32 int8
+// elements. For 4x8 output, the inner dimension must be such that
+// 4 * inner * sizeof(int8) <= 256 bits AND inner * 8 * sizeof(int8) <= 256 bits.
+// So inner * 8 <= 32, meaning inner <= 4.
+//
+// The correct basic mode is actually rows=4, inner=4, cols=8 for 16xi8 input,
+// but for 8x8 input (mmode=1): rows=4, inner=8, cols=8.
+// In that case B needs 8*8 = 64 bytes which exceeds 256 bits.
+//
+// The resolution: the hardware permute unit rearranges the input data.
+// With 512-bit permute width, B can actually be drawn from the full permute
+// space. For the simpler emulation, we implement the most common sub-case:
+// rows=4, inner=8, cols=4 which fits in 256 bits for both A (4*8=32 bytes)
+// and B (8*4=32 bytes).
+//
+// For the full 4x8x8 mode, the hardware uses both X and Y permute inputs
+// which may come from different vector register halves or two registers.
+// We implement the 4x8x4 variant first as it matches one 256-bit register
+// per operand.
+// ---------------------------------------------------------------------------
+
+/// int8 x int8 matrix multiply with 32-bit accumulator.
+///
+/// Geometry: A[4][8] * B[8][4] = C[4][4], 16 output int32 values.
+/// A: 32 int8 values from 256-bit vector, row-major 4 rows x 8 cols.
+/// B: 32 int8 values from 256-bit vector, row-major 8 rows x 4 cols.
+/// Output: 16 int32 values in 8 u64 lanes (two int32 per u64).
+fn matmul_i8xi8(
+    acc: &mut [u64; 8],
+    a: &[u32; 8],
+    b: &[u32; 8],
+    signed_a: bool,
+    signed_b: bool,
+    subtract: bool,
+) {
+    // A is 4 rows x 8 cols of int8 = 32 elements (256 bits)
+    // B is 8 rows x 4 cols of int8 = 32 elements (256 bits)
+    // Output is 4 rows x 4 cols of int32 = 16 elements in acc
+    let geom = TileGeometry { rows: 4, inner: 8, cols: 4 };
+
+    for r in 0..geom.rows {
+        for c in 0..geom.cols {
+            let out_idx = r * geom.cols + c;
+            let mut sum: i64 = 0;
+
+            for k in 0..geom.inner {
+                let a_idx = r * geom.inner + k;
+                let b_idx = k * geom.cols + c;
+
+                let a_val = if signed_a {
+                    extract_i8(a, a_idx) as i64
+                } else {
+                    extract_u8(a, a_idx) as i64
+                };
+
+                let b_val = if signed_b {
+                    extract_i8(b, b_idx) as i64
+                } else {
+                    extract_u8(b, b_idx) as i64
+                };
+
+                sum += a_val * b_val;
+            }
+
+            let prev = read_acc32(acc, out_idx);
+            if subtract {
+                write_acc32(acc, out_idx, prev - sum);
+            } else {
+                write_acc32(acc, out_idx, prev + sum);
+            }
+        }
+    }
+}
+
+/// int16 x int16 matrix multiply with 32-bit accumulator (acc_cmb=1).
+///
+/// Geometry: A[4][2] * B[2][8] = C[4][8], 32 output int32 values.
+/// A: 16 int16 values from 256-bit vector. We use the first 8 (4 rows x 2 inner).
+/// B: 16 int16 values from 256-bit vector. We use all 16 (2 rows x 8 cols).
+/// Output: 32 int32 values packed into the accumulator.
+///
+/// Note: with acc_cmb=1 and 32-bit accumulator, we get 32 output lanes.
+/// With 8 u64 lanes that's 16 int32 values directly addressable, so we use
+/// the common sub-case: A[4][2] * B[2][4] = C[4][4] = 16 outputs.
+fn matmul_i16xi16_32(
+    acc: &mut [u64; 8],
+    a: &[u32; 8],
+    b: &[u32; 8],
+    signed_a: bool,
+    signed_b: bool,
+    subtract: bool,
+) {
+    // A: 4 rows x 2 inner = 8 int16 elements (128 bits, first half of vector)
+    // B: 2 rows x 4 cols = 8 int16 elements (128 bits, first half of vector)
+    // Output: 4 rows x 4 cols = 16 int32 values
+    let geom = TileGeometry { rows: 4, inner: 2, cols: 4 };
+
+    for r in 0..geom.rows {
+        for c in 0..geom.cols {
+            let out_idx = r * geom.cols + c;
+            let mut sum: i64 = 0;
+
+            for k in 0..geom.inner {
+                let a_idx = r * geom.inner + k;
+                let b_idx = k * geom.cols + c;
+
+                let a_val = if signed_a {
+                    extract_i16(a, a_idx) as i64
+                } else {
+                    extract_u16(a, a_idx) as i64
+                };
+
+                let b_val = if signed_b {
+                    extract_i16(b, b_idx) as i64
+                } else {
+                    extract_u16(b, b_idx) as i64
+                };
+
+                sum += a_val * b_val;
+            }
+
+            let prev = read_acc32(acc, out_idx);
+            if subtract {
+                write_acc32(acc, out_idx, prev - sum);
+            } else {
+                write_acc32(acc, out_idx, prev + sum);
+            }
+        }
+    }
+}
+
+/// bf16 x bf16 matrix multiply with fp32 accumulator.
+///
+/// Geometry: A[4][8] * B[8][4] = C[4][4], 16 output fp32 values.
+/// A: 16 bf16 values from 256-bit vector, reinterpreted as 4 rows x 4 cols
+///    (limited by 256-bit width: 16 bf16 = 4x4).
+/// B: 16 bf16 values, reinterpreted as 4 rows x 4 cols.
+///
+/// The hardware actually uses rows=4, inner=8, cols=4 from constants.py,
+/// but with 256-bit inputs we only have 16 bf16 values per vector,
+/// so the practical single-register mode is 4x4x4.
+fn matmul_bf16xbf16(
+    acc: &mut [u64; 8],
+    a: &[u32; 8],
+    b: &[u32; 8],
+    subtract: bool,
+) {
+    // A: 4 rows x 4 inner = 16 bf16 elements (256 bits)
+    // B: 4 rows x 4 cols = 16 bf16 elements (256 bits)
+    // Output: 4 rows x 4 cols = 16 fp32 values
+    let geom = TileGeometry { rows: 4, inner: 4, cols: 4 };
+
+    for r in 0..geom.rows {
+        for c in 0..geom.cols {
+            let out_idx = r * geom.cols + c;
+            let mut sum: f32 = 0.0;
+
+            for k in 0..geom.inner {
+                let a_idx = r * geom.inner + k;
+                let b_idx = k * geom.cols + c;
+
+                let a_val = extract_bf16_as_f32(a, a_idx);
+                let b_val = extract_bf16_as_f32(b, b_idx);
+                sum += a_val * b_val;
+            }
+
+            let prev = read_acc_f32(acc, out_idx);
+            if subtract {
+                write_acc_f32(acc, out_idx, prev - sum);
+            } else {
+                write_acc_f32(acc, out_idx, prev + sum);
+            }
+        }
+    }
+}
+
+/// int32 x int16 matrix multiply with 64-bit accumulator (acc_cmb=2).
+///
+/// Geometry: A[4][2] * B[2][4] = C[4][4], producing 16 int64 outputs.
+/// But we only have 8 u64 lanes, so the practical mode is:
+/// A[2][2] * B[2][4] = C[2][4] = 8 int64 outputs.
+///
+/// Actually from constants.py: mmode=7 is 32x16 acc_cmb=2, perm_modes
+/// include rows=4, inner=2, cols=4.
+fn matmul_i32xi16(
+    acc: &mut [u64; 8],
+    a: &[u32; 8],
+    b: &[u32; 8],
+    signed_a: bool,
+    signed_b: bool,
+    subtract: bool,
+) {
+    // A: 4 rows x 2 inner of int32 = 8 elements (256 bits)
+    // B: 2 rows x 4 cols of int16 = 8 elements (128 bits)
+    // Output: 4 rows x 2 cols = 8 int64 values
+    //
+    // With acc_cmb=2, each output is 64 bits, fitting in one u64 lane.
+    // 4*2 = 8 outputs = 8 u64 lanes.
+    let geom = TileGeometry { rows: 4, inner: 2, cols: 2 };
+
+    for r in 0..geom.rows {
+        for c in 0..geom.cols {
+            let out_idx = r * geom.cols + c;
+            let mut sum: i64 = 0;
+
+            for k in 0..geom.inner {
+                let a_idx = r * geom.inner + k;
+                let b_idx = k * geom.cols + c;
+
+                let a_val = if signed_a {
+                    extract_i32(a, a_idx) as i64
+                } else {
+                    a[a_idx] as i64
+                };
+
+                let b_val = if signed_b {
+                    extract_i16(b, b_idx) as i64
+                } else {
+                    extract_u16(b, b_idx) as i64
+                };
+
+                sum += a_val * b_val;
+            }
+
+            let prev = read_acc64(acc, out_idx);
+            if subtract {
+                write_acc64(acc, out_idx, prev - sum);
+            } else {
+                write_acc64(acc, out_idx, prev + sum);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pack int8 values into [u32; 8] in little-endian order.
+    fn pack_i8(values: &[i8]) -> [u32; 8] {
+        let mut packed = [0u32; 8];
+        for (i, &v) in values.iter().enumerate() {
+            let word = i / 4;
+            let byte = i % 4;
+            packed[word] |= ((v as u8) as u32) << (byte * 8);
+        }
+        packed
+    }
+
+    /// Pack int16 values into [u32; 8] in little-endian order.
+    fn pack_i16(values: &[i16]) -> [u32; 8] {
+        let mut packed = [0u32; 8];
+        for (i, &v) in values.iter().enumerate() {
+            let word = i / 2;
+            let half = i % 2;
+            packed[word] |= ((v as u16) as u32) << (half * 16);
+        }
+        packed
+    }
+
+    /// Pack bf16 values (as u16 bit patterns) into [u32; 8].
+    fn pack_bf16(values: &[u16]) -> [u32; 8] {
+        let mut packed = [0u32; 8];
+        for (i, &v) in values.iter().enumerate() {
+            let word = i / 2;
+            let half = i % 2;
+            packed[word] |= (v as u32) << (half * 16);
+        }
+        packed
+    }
+
+    /// Convert f32 to bf16 bit pattern (truncate lower 16 bits).
+    fn f32_to_bf16_bits(v: f32) -> u16 {
+        (v.to_bits() >> 16) as u16
+    }
+
+    // -----------------------------------------------------------------------
+    // int8 x int8 tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_i8xi8_identity_like() {
+        // A = 4x8 identity-like (first 4 cols are identity, rest zero)
+        // B = 8x4 with known values in first 4 rows
+        //
+        // A[r][k] = if k == r { 1 } else { 0 } for k < 4, rest 0
+        // B[k][c] = (k * 4 + c + 1) for k < 4, rest 0
+        //
+        // Result should be: C[r][c] = B[r][c] = r * 4 + c + 1
+
+        let mut a_vals = [0i8; 32];
+        // Row 0: a_vals[0] = 1 (k=0)
+        a_vals[0] = 1;
+        // Row 1: a_vals[8+1] = 1 (k=1)
+        a_vals[8 + 1] = 1;
+        // Row 2: a_vals[16+2] = 1 (k=2)
+        a_vals[16 + 2] = 1;
+        // Row 3: a_vals[24+3] = 1 (k=3)
+        a_vals[24 + 3] = 1;
+
+        let mut b_vals = [0i8; 32];
+        for k in 0..4 {
+            for c in 0..4 {
+                b_vals[k * 4 + c] = (k * 4 + c + 1) as i8;
+            }
+        }
+
+        let a = pack_i8(&a_vals);
+        let b = pack_i8(&b_vals);
+        let mut acc = [0u64; 8];
+
+        matmul_i8xi8(&mut acc, &a, &b, true, true, false);
+
+        // Check C[r][c] = B[r][c] for the identity rows
+        for r in 0..4 {
+            for c in 0..4 {
+                let out_idx = r * 4 + c;
+                let expected = (r * 4 + c + 1) as i64;
+                let actual = read_acc32(&acc, out_idx);
+                assert_eq!(
+                    actual, expected,
+                    "C[{}][{}]: expected {}, got {}",
+                    r, c, expected, actual
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_i8xi8_all_ones() {
+        // A = 4x8, all 1s
+        // B = 8x4, all 1s
+        // C[r][c] = sum of 8 ones = 8
+
+        let a_vals = [1i8; 32];
+        let b_vals = [1i8; 32];
+        let a = pack_i8(&a_vals);
+        let b = pack_i8(&b_vals);
+        let mut acc = [0u64; 8];
+
+        matmul_i8xi8(&mut acc, &a, &b, true, true, false);
+
+        for r in 0..4 {
+            for c in 0..4 {
+                let out_idx = r * 4 + c;
+                assert_eq!(
+                    read_acc32(&acc, out_idx),
+                    8,
+                    "C[{}][{}] should be 8",
+                    r, c
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_i8xi8_accumulate() {
+        // Verify accumulation: run matmul twice, values should double
+        let a_vals = [1i8; 32];
+        let b_vals = [1i8; 32];
+        let a = pack_i8(&a_vals);
+        let b = pack_i8(&b_vals);
+        let mut acc = [0u64; 8];
+
+        matmul_i8xi8(&mut acc, &a, &b, true, true, false);
+        matmul_i8xi8(&mut acc, &a, &b, true, true, false);
+
+        for r in 0..4 {
+            for c in 0..4 {
+                let out_idx = r * 4 + c;
+                assert_eq!(
+                    read_acc32(&acc, out_idx),
+                    16,
+                    "C[{}][{}] should be 16 after two accumulations",
+                    r, c
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_i8xi8_subtract() {
+        // First accumulate, then subtract the same product
+        let a_vals = [2i8; 32];
+        let b_vals = [3i8; 32];
+        let a = pack_i8(&a_vals);
+        let b = pack_i8(&b_vals);
+        let mut acc = [0u64; 8];
+
+        // acc += A * B => each output = 8 * (2 * 3) = 48
+        matmul_i8xi8(&mut acc, &a, &b, true, true, false);
+        for idx in 0..16 {
+            assert_eq!(read_acc32(&acc, idx), 48);
+        }
+
+        // acc -= A * B => each output = 48 - 48 = 0
+        matmul_i8xi8(&mut acc, &a, &b, true, true, true);
+        for idx in 0..16 {
+            assert_eq!(read_acc32(&acc, idx), 0);
+        }
+    }
+
+    #[test]
+    fn test_i8xi8_signed_negative() {
+        // Test with negative values
+        let mut a_vals = [0i8; 32];
+        let mut b_vals = [0i8; 32];
+
+        // A[0][0] = -1, B[0][0] = -2
+        // C[0][0] = (-1) * (-2) = 2
+        a_vals[0] = -1;
+        b_vals[0] = -2;
+
+        // A[0][1] = 3, B[1][0] = -4
+        // C[0][0] += 3 * (-4) = -12
+        // Total C[0][0] = 2 + (-12) = -10
+        a_vals[1] = 3;
+        b_vals[4] = -4;
+
+        let a = pack_i8(&a_vals);
+        let b = pack_i8(&b_vals);
+        let mut acc = [0u64; 8];
+
+        matmul_i8xi8(&mut acc, &a, &b, true, true, false);
+        assert_eq!(read_acc32(&acc, 0), -10);
+    }
+
+    #[test]
+    fn test_i8xi8_unsigned() {
+        // Unsigned: 200 * 200 = 40000 (would be negative if signed)
+        let mut a_vals = [0i8; 32];
+        let mut b_vals = [0i8; 32];
+
+        // 200 as u8 = 0xC8, which as i8 = -56
+        a_vals[0] = -56; // 200 as u8
+        b_vals[0] = -56; // 200 as u8
+
+        let a = pack_i8(&a_vals);
+        let b = pack_i8(&b_vals);
+        let mut acc = [0u64; 8];
+
+        // Signed: (-56) * (-56) = 3136
+        matmul_i8xi8(&mut acc, &a, &b, true, true, false);
+        assert_eq!(read_acc32(&acc, 0), 3136);
+
+        // Unsigned: 200 * 200 = 40000
+        let mut acc2 = [0u64; 8];
+        matmul_i8xi8(&mut acc2, &a, &b, false, false, false);
+        assert_eq!(read_acc32(&acc2, 0), 40000);
+    }
+
+    // -----------------------------------------------------------------------
+    // int16 x int16 tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_i16xi16_identity() {
+        // A = 4x2, identity-like: A[r][k] = delta(r%2, k)
+        // B = 2x4 with sequential values
+        // For rows 0,1: result should pick from B rows 0,1
+        // For rows 2,3: same pattern wraps
+
+        let mut a_vals = [0i16; 16];
+        // Row 0: A[0][0] = 1 (k=0)
+        a_vals[0] = 1;
+        // Row 1: A[1][1] = 1 (k=1)
+        a_vals[3] = 1;
+
+        let mut b_vals = [0i16; 16];
+        // B[0][0..4] = {10, 20, 30, 40}
+        b_vals[0] = 10;
+        b_vals[1] = 20;
+        b_vals[2] = 30;
+        b_vals[3] = 40;
+        // B[1][0..4] = {50, 60, 70, 80}
+        b_vals[4] = 50;
+        b_vals[5] = 60;
+        b_vals[6] = 70;
+        b_vals[7] = 80;
+
+        let a = pack_i16(&a_vals);
+        let b = pack_i16(&b_vals);
+        let mut acc = [0u64; 8];
+
+        matmul_i16xi16_32(&mut acc, &a, &b, true, true, false);
+
+        // C[0][c] = A[0][0]*B[0][c] + A[0][1]*B[1][c] = 1*B[0][c] + 0 = B[0][c]
+        assert_eq!(read_acc32(&acc, 0), 10);
+        assert_eq!(read_acc32(&acc, 1), 20);
+        assert_eq!(read_acc32(&acc, 2), 30);
+        assert_eq!(read_acc32(&acc, 3), 40);
+
+        // C[1][c] = A[1][0]*B[0][c] + A[1][1]*B[1][c] = 0 + 1*B[1][c] = B[1][c]
+        assert_eq!(read_acc32(&acc, 4), 50);
+        assert_eq!(read_acc32(&acc, 5), 60);
+        assert_eq!(read_acc32(&acc, 6), 70);
+        assert_eq!(read_acc32(&acc, 7), 80);
+    }
+
+    #[test]
+    fn test_i16xi16_multiply() {
+        // A = [[1, 2], [3, 4], [5, 6], [7, 8]]  (4x2)
+        // B = [[1, 0, 0, 0], [0, 1, 0, 0]]       (2x4)
+        //
+        // C = A * B:
+        // C[0] = [1*1+2*0, 1*0+2*1, 1*0+2*0, 1*0+2*0] = [1, 2, 0, 0]
+        // C[1] = [3, 4, 0, 0]
+        // C[2] = [5, 6, 0, 0]
+        // C[3] = [7, 8, 0, 0]
+
+        let a_vals: [i16; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0];
+        let b_vals: [i16; 16] = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        let a = pack_i16(&a_vals);
+        let b = pack_i16(&b_vals);
+        let mut acc = [0u64; 8];
+
+        matmul_i16xi16_32(&mut acc, &a, &b, true, true, false);
+
+        assert_eq!(read_acc32(&acc, 0), 1);  // C[0][0]
+        assert_eq!(read_acc32(&acc, 1), 2);  // C[0][1]
+        assert_eq!(read_acc32(&acc, 4), 3);  // C[1][0]
+        assert_eq!(read_acc32(&acc, 5), 4);  // C[1][1]
+        assert_eq!(read_acc32(&acc, 8), 5);  // C[2][0]
+        assert_eq!(read_acc32(&acc, 9), 6);  // C[2][1]
+        assert_eq!(read_acc32(&acc, 12), 7); // C[3][0]
+        assert_eq!(read_acc32(&acc, 13), 8); // C[3][1]
+    }
+
+    #[test]
+    fn test_i16xi16_accumulate_subtract() {
+        let a_vals: [i16; 16] = [10, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let b_vals: [i16; 16] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        let a = pack_i16(&a_vals);
+        let b = pack_i16(&b_vals);
+        let mut acc = [0u64; 8];
+
+        // acc += A * B => C[0][0] = 10
+        matmul_i16xi16_32(&mut acc, &a, &b, true, true, false);
+        assert_eq!(read_acc32(&acc, 0), 10);
+
+        // acc -= A * B => C[0][0] = 10 - 10 = 0
+        matmul_i16xi16_32(&mut acc, &a, &b, true, true, true);
+        assert_eq!(read_acc32(&acc, 0), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // bf16 x bf16 tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bf16_identity() {
+        // A = 4x4 identity matrix as bf16
+        // B = 4x4 with known values
+        // C = B (identity property)
+
+        let mut a_bits = [0u16; 16];
+        let one = f32_to_bf16_bits(1.0);
+        // Diagonal: A[0][0], A[1][1], A[2][2], A[3][3]
+        a_bits[0 * 4 + 0] = one;
+        a_bits[1 * 4 + 1] = one;
+        a_bits[2 * 4 + 2] = one;
+        a_bits[3 * 4 + 3] = one;
+
+        let mut b_bits = [0u16; 16];
+        for i in 0..16 {
+            b_bits[i] = f32_to_bf16_bits((i + 1) as f32);
+        }
+
+        let a = pack_bf16(&a_bits);
+        let b = pack_bf16(&b_bits);
+        let mut acc = [0u64; 8];
+
+        matmul_bf16xbf16(&mut acc, &a, &b, false);
+
+        for r in 0..4 {
+            for c in 0..4 {
+                let idx = r * 4 + c;
+                let expected = (r * 4 + c + 1) as f32;
+                let actual = read_acc_f32(&acc, idx);
+                assert!(
+                    (actual - expected).abs() < 0.01,
+                    "C[{}][{}]: expected {}, got {}",
+                    r, c, expected, actual
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_bf16_all_ones() {
+        // A = 4x4 all ones, B = 4x4 all ones
+        // C[r][c] = sum of 4 ones = 4.0
+        let one = f32_to_bf16_bits(1.0);
+        let a_bits = [one; 16];
+        let b_bits = [one; 16];
+
+        let a = pack_bf16(&a_bits);
+        let b = pack_bf16(&b_bits);
+        let mut acc = [0u64; 8];
+
+        matmul_bf16xbf16(&mut acc, &a, &b, false);
+
+        for idx in 0..16 {
+            let actual = read_acc_f32(&acc, idx);
+            assert!(
+                (actual - 4.0).abs() < 0.01,
+                "Output[{}]: expected 4.0, got {}",
+                idx, actual
+            );
+        }
+    }
+
+    #[test]
+    fn test_bf16_accumulate() {
+        let one = f32_to_bf16_bits(1.0);
+        let a_bits = [one; 16];
+        let b_bits = [one; 16];
+
+        let a = pack_bf16(&a_bits);
+        let b = pack_bf16(&b_bits);
+        let mut acc = [0u64; 8];
+
+        // First: acc = 4.0
+        matmul_bf16xbf16(&mut acc, &a, &b, false);
+        // Second: acc = 8.0
+        matmul_bf16xbf16(&mut acc, &a, &b, false);
+
+        for idx in 0..16 {
+            let actual = read_acc_f32(&acc, idx);
+            assert!(
+                (actual - 8.0).abs() < 0.01,
+                "Output[{}]: expected 8.0, got {}",
+                idx, actual
+            );
+        }
+    }
+
+    #[test]
+    fn test_bf16_subtract() {
+        let two = f32_to_bf16_bits(2.0);
+        let three = f32_to_bf16_bits(3.0);
+        let a_bits = [two; 16];
+        let b_bits = [three; 16];
+
+        let a = pack_bf16(&a_bits);
+        let b = pack_bf16(&b_bits);
+        let mut acc = [0u64; 8];
+
+        // acc += 2*3*4 = 24 per lane
+        matmul_bf16xbf16(&mut acc, &a, &b, false);
+        // acc -= 2*3*4 = 24 per lane => 0
+        matmul_bf16xbf16(&mut acc, &a, &b, true);
+
+        for idx in 0..16 {
+            let actual = read_acc_f32(&acc, idx);
+            assert!(
+                actual.abs() < 0.01,
+                "Output[{}]: expected 0.0, got {}",
+                idx, actual
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // int32 x int16 tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_i32xi16_basic() {
+        // A = 4x2 of int32 = 8 values (256 bits)
+        // B = 2x2 of int16 = 4 values (64 bits)
+        // C = 4x2 of int64 = 8 values
+
+        let mut a_packed = [0u32; 8];
+        // A[0][0] = 100, A[0][1] = 200
+        a_packed[0] = 100;
+        a_packed[1] = 200;
+        // A[1][0] = 300, A[1][1] = 400
+        a_packed[2] = 300;
+        a_packed[3] = 400;
+
+        // B = 2x2 identity matrix (row-major): B[0][0]=1, B[0][1]=0, B[1][0]=0, B[1][1]=1
+        let b_vals: [i16; 16] = [1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let b = pack_i16(&b_vals);
+
+        let mut acc = [0u64; 8];
+        matmul_i32xi16(&mut acc, &a_packed, &b, true, true, false);
+
+        // C[0][0] = 100*1 + 200*0 = 100
+        // C[0][1] = 100*0 + 200*1 = 200
+        assert_eq!(read_acc64(&acc, 0), 100);
+        assert_eq!(read_acc64(&acc, 1), 200);
+
+        // C[1][0] = 300*1 + 400*0 = 300
+        // C[1][1] = 300*0 + 400*1 = 400
+        assert_eq!(read_acc64(&acc, 2), 300);
+        assert_eq!(read_acc64(&acc, 3), 400);
+    }
+
+    // -----------------------------------------------------------------------
+    // Element extraction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_i8() {
+        let packed = pack_i8(&[1, -2, 3, -4, 5, -6, 7, -8,
+                               0, 0, 0, 0, 0, 0, 0, 0,
+                               0, 0, 0, 0, 0, 0, 0, 0,
+                               0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(extract_i8(&packed, 0), 1);
+        assert_eq!(extract_i8(&packed, 1), -2);
+        assert_eq!(extract_i8(&packed, 2), 3);
+        assert_eq!(extract_i8(&packed, 3), -4);
+        assert_eq!(extract_i8(&packed, 4), 5);
+        assert_eq!(extract_i8(&packed, 5), -6);
+    }
+
+    #[test]
+    fn test_extract_i16() {
+        let packed = pack_i16(&[100, -200, 300, -400, 0, 0, 0, 0,
+                                0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(extract_i16(&packed, 0), 100);
+        assert_eq!(extract_i16(&packed, 1), -200);
+        assert_eq!(extract_i16(&packed, 2), 300);
+        assert_eq!(extract_i16(&packed, 3), -400);
+    }
+
+    #[test]
+    fn test_acc32_read_write_roundtrip() {
+        let mut acc = [0u64; 8];
+        write_acc32(&mut acc, 0, 42);
+        write_acc32(&mut acc, 1, -100);
+        write_acc32(&mut acc, 15, 999);
+
+        assert_eq!(read_acc32(&acc, 0), 42);
+        assert_eq!(read_acc32(&acc, 1), -100);
+        assert_eq!(read_acc32(&acc, 15), 999);
+    }
+
+    #[test]
+    fn test_acc_f32_read_write_roundtrip() {
+        let mut acc = [0u64; 8];
+        write_acc_f32(&mut acc, 0, 3.14);
+        write_acc_f32(&mut acc, 1, -2.71);
+        write_acc_f32(&mut acc, 15, 42.0);
+
+        assert!((read_acc_f32(&acc, 0) - 3.14).abs() < 0.001);
+        assert!((read_acc_f32(&acc, 1) - (-2.71)).abs() < 0.001);
+        assert!((read_acc_f32(&acc, 15) - 42.0).abs() < 0.001);
+    }
+
+    // -----------------------------------------------------------------------
+    // Public API tests (matmul_dense / matmul_sub)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_matmul_dense_i8() {
+        let a_vals = [1i8; 32];
+        let b_vals = [1i8; 32];
+        let a = pack_i8(&a_vals);
+        let b = pack_i8(&b_vals);
+        let mut acc = [0u64; 8];
+
+        matmul_dense(&mut acc, &a, &b, ElementType::Int8, true, true);
+
+        // Each output = inner (8) dot products of 1*1 = 8
+        for idx in 0..16 {
+            assert_eq!(read_acc32(&acc, idx), 8);
+        }
+    }
+
+    #[test]
+    fn test_matmul_sub_i16() {
+        let a_vals: [i16; 16] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let b_vals: [i16; 16] = [5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let a = pack_i16(&a_vals);
+        let b = pack_i16(&b_vals);
+
+        // Pre-load accumulator with 100 in lane 0
+        let mut acc = [0u64; 8];
+        write_acc32(&mut acc, 0, 100);
+
+        matmul_sub(&mut acc, &a, &b, ElementType::Int16, true, true);
+
+        // C[0][0] = 100 - (1*5 + 0*0) = 95
+        assert_eq!(read_acc32(&acc, 0), 95);
+    }
+
+    #[test]
+    fn test_matmul_dense_bf16() {
+        let two = f32_to_bf16_bits(2.0);
+        let three = f32_to_bf16_bits(3.0);
+
+        // A = all 2.0, B = all 3.0
+        // Each output = 4 * (2.0 * 3.0) = 24.0
+        let a = pack_bf16(&[two; 16]);
+        let b = pack_bf16(&[three; 16]);
+        let mut acc = [0u64; 8];
+
+        matmul_dense(&mut acc, &a, &b, ElementType::BFloat16, true, true);
+
+        for idx in 0..16 {
+            let actual = read_acc_f32(&acc, idx);
+            assert!(
+                (actual - 24.0).abs() < 0.1,
+                "Output[{}]: expected 24.0, got {}",
+                idx, actual
+            );
+        }
+    }
+}

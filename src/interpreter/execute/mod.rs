@@ -84,6 +84,7 @@ pub mod vector_pack;
 pub mod vector_permute;
 pub mod vector_srs;
 pub mod vector_ups;
+pub mod vector_matmul;
 mod memory;
 mod control;
 mod stream;
