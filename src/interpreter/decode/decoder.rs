@@ -402,7 +402,13 @@ impl InstructionDecoder {
             return self.semantic_to_operation(semantic, decoded);
         }
 
-        // No SemanticOp assigned - this is a gap in our semantic inference
+        // No SemanticOp assigned - this is a gap in our semantic inference.
+        // "opcodestr" is a parser artifact from unresolved TableGen template parameters
+        // in NOP class definitions; treat as NOP rather than Unknown.
+        if decoded.encoding.mnemonic == "opcodestr" || decoded.encoding.mnemonic.is_empty() {
+            return Operation::Nop;
+        }
+
         log::warn!(
             "[NO SEMANTIC] Instruction '{}' has no SemanticOp - add to infer_semantic_from_mnemonic()",
             decoded.encoding.mnemonic
@@ -526,9 +532,20 @@ impl InstructionDecoder {
             SemanticOp::Ret => Operation::Return,
             SemanticOp::Done => Operation::Halt,
 
-            // Not handled yet - fall through (URem, Rotl, Rotr, Cttz,
-            // Ctpop, Bswap, Truncate, Intrinsic)
-            _ => Operation::Unknown { opcode: 0 },
+            // Truncate: narrow type conversion, treat as NOP for now
+            // (the narrowing happens implicitly in register writes)
+            SemanticOp::Truncate => Operation::Nop,
+
+            // Not handled yet (URem, Rotl, Rotr, Cttz, Ctpop, Bswap, Intrinsic)
+            _ => {
+                log::warn!(
+                    "[UNHANDLED SEMANTIC] '{}' has SemanticOp::{:?} in slot '{}' - not yet implemented",
+                    decoded.encoding.mnemonic, semantic, decoded.encoding.slot
+                );
+                Operation::Unknown {
+                    opcode: decoded.encoding.fixed_bits as u32,
+                }
+            }
         }
     }
 
