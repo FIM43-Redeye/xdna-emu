@@ -52,7 +52,7 @@
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{ElementType, MemWidth, Operation, Operand, PostModify, SlotOp};
 use crate::interpreter::state::ExecutionContext;
-use crate::interpreter::timing::LATENCY_MEMORY;
+use crate::interpreter::timing::{LATENCY_MEMORY, CROSS_TILE_LATENCY};
 
 /// Address mask for local tile memory (64KB).
 /// Addresses from the AGU span 0x0000-0x3FFFF (256KB across 4 neighbors),
@@ -88,6 +88,22 @@ fn decode_data_address(addr: u32) -> (u32, usize) {
         let quadrant = (addr >> 16) & 0x3;
         let offset = (addr & LOCAL_MEMORY_MASK) as usize;
         (quadrant, offset)
+    }
+}
+
+/// Compute the total load latency for a data memory address.
+///
+/// Local memory (quadrant 0) uses the base LATENCY_MEMORY (7 cycles).
+/// Cross-tile accesses (quadrants 1-3) add CROSS_TILE_LATENCY (4 cycles)
+/// per hop to model the routing delay through the stream switch.
+#[inline]
+fn load_latency_for_address(addr: u32) -> u64 {
+    let (quadrant, _) = decode_data_address(addr);
+    let base = LATENCY_MEMORY as u64;
+    if quadrant == 0 {
+        base
+    } else {
+        base + CROSS_TILE_LATENCY as u64
     }
 }
 
@@ -355,18 +371,19 @@ impl MemoryUnit {
     ) {
         // Get address from source operand
         let addr = Self::get_address(op, ctx);
+        let latency = load_latency_for_address(addr);
 
-        log::trace!("[LOAD] addr=0x{:X} width={:?} dest={:?} srcs={:?}",
-            addr, width, op.dest, op.sources);
+        log::trace!("[LOAD] addr=0x{:X} width={:?} dest={:?} srcs={:?} latency={}",
+            addr, width, op.dest, op.sources, latency);
 
         // Handle full vector loads specially
         if width == MemWidth::Vector256 {
             let vec_data = Self::read_vector_from_memory(tile, addr, neighbors.map(|n| &*n));
             if let Some(dest) = &op.dest {
-                ctx.queue_vector_load(dest.clone(), vec_data, LATENCY_MEMORY as u64);
+                ctx.queue_vector_load(dest.clone(), vec_data, latency);
             }
         } else {
-            // Scalar/partial loads go through write_dest (which queues)
+            // Scalar/partial loads go through write_dest_with_latency (which queues)
             let value = Self::read_memory(tile, addr, width, neighbors.map(|n| &*n));
             if log::log_enabled!(log::Level::Trace) {
                 let masked = addr & 0xFFFF;
@@ -378,7 +395,7 @@ impl MemoryUnit {
                     );
                 }
             }
-            Self::write_dest(op, ctx, value, width);
+            Self::write_dest_with_latency(op, ctx, value, width, latency);
         }
 
         // Apply post-modify to address register
@@ -446,13 +463,14 @@ impl MemoryUnit {
         neighbors: Option<&mut NeighborMemory>,
     ) {
         let addr = Self::get_address(op, ctx);
+        let latency = load_latency_for_address(addr);
 
         // Read 256 bits (32 bytes) from memory
         let vec_data = Self::read_vector_from_memory(tile, addr, neighbors.map(|n| &*n));
 
         // Queue deferred write to destination vector register
         if let Some(dest) = &op.dest {
-            ctx.queue_vector_load(dest.clone(), vec_data, LATENCY_MEMORY as u64);
+            ctx.queue_vector_load(dest.clone(), vec_data, latency);
         }
 
         // Apply post-modify immediately (pointer update is not deferred)
@@ -472,13 +490,14 @@ impl MemoryUnit {
         neighbors: Option<&mut NeighborMemory>,
     ) {
         let addr = Self::get_address(op, ctx);
+        let latency = load_latency_for_address(addr);
 
         // Read 256 bits (32 bytes) from memory
         let vec_data = Self::read_vector_from_memory(tile, addr, neighbors.map(|n| &*n));
 
         // Queue deferred write to destination vector register
         if let Some(dest) = &op.dest {
-            ctx.queue_vector_load(dest.clone(), vec_data, LATENCY_MEMORY as u64);
+            ctx.queue_vector_load(dest.clone(), vec_data, latency);
         }
 
         // Apply post-modify immediately (pointer update is not deferred)
@@ -500,6 +519,7 @@ impl MemoryUnit {
         post_modify: &PostModify,
     ) {
         let addr = Self::get_address(op, ctx);
+        let latency = load_latency_for_address(addr);
 
         // Calculate how many bytes to load based on source element type
         // and the fact that we produce a full 256-bit vector
@@ -582,7 +602,7 @@ impl MemoryUnit {
 
         // Queue deferred write to destination vector register
         if let Some(dest) = &op.dest {
-            ctx.queue_vector_load(dest.clone(), result, LATENCY_MEMORY as u64);
+            ctx.queue_vector_load(dest.clone(), result, latency);
         }
 
         // Apply post-modify based on source bytes read
@@ -936,12 +956,12 @@ impl MemoryUnit {
 
     /// Queue a loaded scalar value for deferred write to the destination register.
     ///
-    /// Load results are deferred by LATENCY_MEMORY cycles to model the AIE2
-    /// memory pipeline. The compiler relies on this latency to pipeline
-    /// multiple loads to the same register.
-    fn write_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: u64, width: MemWidth) {
+    /// Load results are deferred by the given latency to model the AIE2
+    /// memory pipeline. Cross-tile accesses (quadrants 1-3) incur additional
+    /// routing latency on top of the base LATENCY_MEMORY. The compiler relies
+    /// on this latency to pipeline multiple loads to the same register.
+    fn write_dest_with_latency(op: &SlotOp, ctx: &mut ExecutionContext, value: u64, width: MemWidth, latency: u64) {
         if let Some(dest) = &op.dest {
-            let latency = LATENCY_MEMORY as u64;
             match dest {
                 Operand::ScalarReg(_)
                 | Operand::PointerReg(_)
@@ -1862,6 +1882,29 @@ mod tests {
         let tile = Tile::compute(0, 2);
         let value = MemoryUnit::read_memory(&tile, 0x10100, MemWidth::Word, Some(&nbr));
         assert_eq!(value, 0, "Read from non-existent west neighbor should return 0");
+    }
+
+    #[test]
+    fn test_load_latency_local_vs_cross_tile() {
+        use crate::interpreter::timing::CROSS_TILE_LATENCY;
+
+        // Local memory (quadrant 0): base latency only
+        assert_eq!(load_latency_for_address(0x0000), LATENCY_MEMORY as u64);
+        assert_eq!(load_latency_for_address(0x0FFFF), LATENCY_MEMORY as u64);
+
+        // West neighbor (quadrant 1): base + cross-tile
+        let expected_cross = LATENCY_MEMORY as u64 + CROSS_TILE_LATENCY as u64;
+        assert_eq!(load_latency_for_address(0x10000), expected_cross);
+        assert_eq!(load_latency_for_address(0x1FFFF), expected_cross);
+
+        // North neighbor (quadrant 2): base + cross-tile
+        assert_eq!(load_latency_for_address(0x20000), expected_cross);
+
+        // East neighbor (quadrant 3): base + cross-tile
+        assert_eq!(load_latency_for_address(0x30000), expected_cross);
+
+        // High linker address (>0x3FFFF) maps to local (quadrant 0)
+        assert_eq!(load_latency_for_address(0x70440), LATENCY_MEMORY as u64);
     }
 
     #[test]
