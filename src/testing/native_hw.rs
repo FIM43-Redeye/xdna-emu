@@ -302,14 +302,7 @@ pub fn run_native_test(
 ///
 /// Strips aietools paths that ship an ancient libstdc++ which would shadow
 /// the system one and cause GLIBCXX errors.
-fn sanitized_ld_library_path() -> String {
-    let current = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-    current
-        .split(':')
-        .filter(|p| !p.contains("aietools"))
-        .collect::<Vec<_>>()
-        .join(":")
-}
+use super::sanitized_ld_library_path;
 
 // -- Timeout handling --------------------------------------------------------
 

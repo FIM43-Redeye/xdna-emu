@@ -32,3 +32,18 @@ pub use test_cpp_parser::{BufferSpec, ElementType};
 pub use hardware_comparison::{Diagnosis, HardwareValidation};
 pub use unit_test::{UnitTest, UnitTestBuildResult};
 pub use npu_test::NpuTestSource;
+
+/// Build an LD_LIBRARY_PATH that strips aietools entries.
+///
+/// aietools ships an outdated libstdc++ that shadows the system copy and
+/// crashes XRT-linked executables. This helper filters those paths out so
+/// child processes (npu-runner, native test.exe) link against the system
+/// runtime.
+pub fn sanitized_ld_library_path() -> String {
+    let current = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    current
+        .split(':')
+        .filter(|p| !p.contains("aietools"))
+        .collect::<Vec<_>>()
+        .join(":")
+}

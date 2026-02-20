@@ -39,13 +39,7 @@ const RUNNER_SEARCH_PATHS: &[&str] = &[
 /// aietools ships an ancient libstdc++.so.6 that shadows the system one
 /// when its lib directory is on LD_LIBRARY_PATH. npu-runner only needs
 /// XRT, not aietools, so we strip aietools paths to avoid the conflict.
-fn sanitized_ld_library_path() -> String {
-    let current = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-    current.split(':')
-        .filter(|p| !p.contains("aietools"))
-        .collect::<Vec<_>>()
-        .join(":")
-}
+use super::sanitized_ld_library_path;
 
 /// NPU accelerator device nodes to probe.
 const ACCEL_DEVICE_NODES: &[&str] = &[
