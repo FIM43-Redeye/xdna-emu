@@ -25,7 +25,6 @@
 use super::arch_config::{ArchConfig, ModelConfig};
 use super::dma::{DmaEngine, DmaResult};
 use super::host_memory::HostMemory;
-use super::stream_router::StreamRouter;
 use super::tile::{Tile, TileParams, TileType};
 use crate::interpreter::state::EventType;
 use std::sync::Arc;
@@ -56,9 +55,6 @@ pub struct TileArray {
     /// DMA engines stored in parallel with tiles.
     /// Each tile has exactly one DMA engine.
     pub(crate) dma_engines: Vec<DmaEngine>,
-
-    /// Stream router for tile-to-tile data flow.
-    pub stream_router: StreamRouter,
 }
 
 impl TileArray {
@@ -91,9 +87,7 @@ impl TileArray {
             }
         }
 
-        let stream_router = StreamRouter::new(cols as usize, rows as usize);
-
-        Self { arch, cols, rows, tiles, dma_engines, stream_router }
+        Self { arch, cols, rows, tiles, dma_engines }
     }
 
     /// Create an NPU1 (Phoenix/HawkPoint) array.
@@ -376,19 +370,6 @@ impl TileArray {
             }
         }
         total
-    }
-
-    /// Step the global stream router (DEPRECATED).
-    ///
-    /// This method is deprecated and no longer used in the main data flow.
-    /// The NPU-compliant implementation uses per-tile StreamSwitch + inter-tile
-    /// propagation instead of a global router. This method is kept for
-    /// backwards compatibility but does nothing useful.
-    ///
-    /// Use `step_data_movement()` instead for proper stream routing.
-    #[deprecated(note = "Use step_data_movement() for NPU-compliant stream routing")]
-    pub fn step_streams(&mut self) -> bool {
-        self.stream_router.step()
     }
 
     /// Step all per-tile stream switches.
@@ -1109,9 +1090,6 @@ impl TileArray {
         for engine in &mut self.dma_engines {
             engine.reset();
         }
-
-        // Reset stream router
-        self.stream_router.reset();
     }
 
     /// Zero all tile memory (slow, use only during initialization).

@@ -59,7 +59,6 @@ pub mod state;
 pub mod host_memory;
 pub mod dma;
 pub mod stream_switch;
-pub mod stream_router;
 
 pub use arch_config::{ArchConfig, ModelConfig, default_arch};
 pub use registers::{RegisterInfo, RegisterModule, TileAddress};
@@ -75,7 +74,6 @@ pub use dma::{
     StreamData,
 };
 pub use stream_switch::{StreamSwitch, StreamPort, StreamPacket, PortDirection, PortType};
-pub use stream_router::{StreamRouter, StreamWord, StreamFifo, PortId, Route, RouterStats};
 
 /// AIE architecture variant
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

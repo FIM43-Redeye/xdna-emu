@@ -785,7 +785,7 @@ mod tests {
     fn test_multi_tile_dma_stream_flow() {
         // This test validates the complete data path:
         // 1. Source tile data memory -> MM2S DMA -> stream_out
-        // 2. StreamRouter routes from source tile to destination tile
+        // 2. Per-tile StreamSwitch + propagate_inter_tile routes to destination
         // 3. DMA stream_in -> S2MM DMA -> destination tile data memory
 
         let mut runner = TestRunner::new();
