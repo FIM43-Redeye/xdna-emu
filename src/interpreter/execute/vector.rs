@@ -42,6 +42,10 @@
 use crate::interpreter::bundle::{ElementType, Operation, Operand, ShufflePattern, SlotOp};
 use crate::interpreter::state::ExecutionContext;
 
+use super::vector_srs::{self, RoundingMode};
+use super::vector_ups;
+use super::vector_pack;
+
 /// Vector ALU execution unit.
 pub struct VectorAlu;
 
@@ -862,7 +866,10 @@ impl VectorAlu {
 
     /// Shift-Round-Saturate: convert 64-bit accumulator lanes to narrower output.
     ///
-    /// This is used after MAC operations to normalize results back to vector format.
+    /// Delegates to the `vector_srs` module which implements the full 10-mode
+    /// SRS pipeline (shift, round, saturate) per AIE2 hardware specification.
+    /// Float types (BFloat16, Float32) are handled inline since they bypass
+    /// the integer rounding pipeline.
     fn vector_srs(
         ctx: &ExecutionContext,
         acc_reg: u8,
@@ -873,46 +880,64 @@ impl VectorAlu {
         let acc = ctx.accumulator.read(acc_reg);
         let mut result = [0u32; 8];
 
+        // Default rounding mode: PosInf (round half toward +inf).
+        // The hardware default is configurable via a status register, but
+        // PosInf is the most common mode used by compiled code.
+        let mode = RoundingMode::PosInf;
+
+        let signed_output = matches!(
+            to_type,
+            ElementType::Int8 | ElementType::Int16 | ElementType::Int32
+        );
+
         match to_type {
             ElementType::Int32 | ElementType::UInt32 => {
-                // 64-bit -> 32-bit with shift and saturation
+                // 8 accumulator lanes -> 8 x 32-bit output values
                 for i in 0..8 {
-                    let shifted = if shift > 0 {
-                        // Round: add 0.5 ULP before shift
-                        let round_bit = 1u64 << (shift - 1);
-                        acc[i].wrapping_add(round_bit) >> shift
-                    } else {
-                        acc[i]
-                    };
-                    // Saturate to 32 bits
-                    result[i] = shifted.min(u32::MAX as u64) as u32;
+                    let val = acc[i] as i64;
+                    let out = vector_srs::srs_lane(
+                        val, shift, signed_output, 32,
+                        true, false, mode,
+                    );
+                    result[i] = out as u32;
                 }
             }
             ElementType::Int16 | ElementType::UInt16 => {
-                // 64-bit -> 16-bit (pack 2 lanes into each u32)
+                // 8 accumulator lanes -> 8 x 16-bit output values (pack 2 per u32)
                 for i in 0..4 {
-                    let val0 = {
-                        let shifted = if shift > 0 {
-                            let round_bit = 1u64 << (shift - 1);
-                            acc[i * 2].wrapping_add(round_bit) >> shift
-                        } else {
-                            acc[i * 2]
-                        };
-                        shifted.min(u16::MAX as u64) as u16
-                    };
-                    let val1 = {
-                        let shifted = if shift > 0 {
-                            let round_bit = 1u64 << (shift - 1);
-                            acc[i * 2 + 1].wrapping_add(round_bit) >> shift
-                        } else {
-                            acc[i * 2 + 1]
-                        };
-                        shifted.min(u16::MAX as u64) as u16
-                    };
-                    result[i] = (val0 as u32) | ((val1 as u32) << 16);
+                    let val0 = acc[i * 2] as i64;
+                    let val1 = acc[i * 2 + 1] as i64;
+                    let out0 = vector_srs::srs_lane(
+                        val0, shift, signed_output, 16,
+                        true, false, mode,
+                    );
+                    let out1 = vector_srs::srs_lane(
+                        val1, shift, signed_output, 16,
+                        true, false, mode,
+                    );
+                    result[i] = (out0 as u16 as u32) | ((out1 as u16 as u32) << 16);
+                }
+            }
+            ElementType::Int8 | ElementType::UInt8 => {
+                // 8 accumulator lanes -> 8 x 8-bit output values (pack 4 per u32)
+                for i in 0..2 {
+                    let mut word = 0u32;
+                    for j in 0..4 {
+                        let lane = i * 4 + j;
+                        if lane < 8 {
+                            let val = acc[lane] as i64;
+                            let out = vector_srs::srs_lane(
+                                val, shift, signed_output, 8,
+                                true, false, mode,
+                            );
+                            word |= (out as u8 as u32) << (j * 8);
+                        }
+                    }
+                    result[i] = word;
                 }
             }
             ElementType::BFloat16 => {
+                // Float path: no integer rounding, just type conversion.
                 // 64-bit float -> bf16 (pack 2 per u32)
                 for i in 0..4 {
                     let f0 = f64::from_bits(acc[i * 2]) as f32;
@@ -929,7 +954,6 @@ impl VectorAlu {
                     result[i] = f.to_bits();
                 }
             }
-            _ => {}
         }
 
         result
@@ -1474,39 +1498,27 @@ impl VectorAlu {
         }
     }
 
-    /// Pack two 32-bit vectors into one 16-bit vector.
-    fn vector_pack(a: &[u32; 8], b: &[u32; 8]) -> [u32; 8] {
-        let mut result = [0u32; 8];
-
-        // Pack lower halves: take low 16 bits of each input lane
-        for i in 0..4 {
-            let a_lo = a[i * 2] & 0xFFFF;
-            let a_hi = a[i * 2 + 1] & 0xFFFF;
-            result[i] = a_lo | (a_hi << 16);
-        }
-        for i in 0..4 {
-            let b_lo = b[i * 2] & 0xFFFF;
-            let b_hi = b[i * 2 + 1] & 0xFFFF;
-            result[i + 4] = b_lo | (b_hi << 16);
-        }
-
-        result
+    /// Pack: narrow 32-bit lanes to 16-bit (truncation mode).
+    ///
+    /// Delegates to the `vector_pack` module. Takes two 256-bit vectors
+    /// of 32-bit elements and produces one 256-bit vector of 16-bit elements.
+    /// Uses truncation mode (no saturation) since the Operation variant
+    /// does not carry saturation information.
+    fn vector_pack(a: &[u32; 8], _b: &[u32; 8]) -> [u32; 8] {
+        // The vector_pack module operates on a single register at a time,
+        // narrowing from bits_i to bits_o. Pack the first source; the second
+        // source would go into the upper half for a full 512-bit result,
+        // but our register model is 256-bit so we pack just the first.
+        vector_pack::pack_vector(a, 32, 16, false, vector_pack::PackMode::Truncate)
     }
 
-    /// Unpack low half (sign-extend 16-bit to 32-bit).
+    /// Unpack: widen 16-bit lanes to 32-bit (signed, sign-extend).
+    ///
+    /// Delegates to the `vector_pack` module. Takes a 256-bit vector of
+    /// 16-bit elements and produces a 256-bit vector of 32-bit elements
+    /// (lower half of the logical result).
     fn vector_unpack_low(src: &[u32; 8]) -> [u32; 8] {
-        let mut result = [0u32; 8];
-
-        for i in 0..4 {
-            // Sign-extend low 16 bits
-            let val = (src[i] & 0xFFFF) as i16 as i32 as u32;
-            result[i * 2] = val;
-            // Sign-extend high 16 bits
-            let val = ((src[i] >> 16) & 0xFFFF) as i16 as i32 as u32;
-            result[i * 2 + 1] = val;
-        }
-
-        result
+        vector_pack::unpack_vector(src, 16, 32, true)
     }
 
     /// Vector equality comparison (returns mask).
@@ -1874,22 +1886,18 @@ impl VectorAlu {
         result
     }
 
-    /// Vector upshift: shift left for precision scaling (e.g., int8 -> int16).
-    /// Used when accumulating into wider types.
+    /// Vector upshift: widen and left-shift for precision scaling.
+    ///
+    /// Delegates to the `vector_ups` module which handles per-lane
+    /// sign extension, left shift, and optional saturation per AIE2
+    /// hardware specification.
     fn vector_upshift(
         src: &[u32; 8],
         shift: u32,
-        _from_type: ElementType,
-        _to_type: ElementType,
+        from_type: ElementType,
+        to_type: ElementType,
     ) -> [u32; 8] {
-        // Simple implementation: just shift left by shift amount
-        // In practice, this would involve type widening but for now just shift
-        let mut result = [0u32; 8];
-        let sh = shift & 0x1F;
-        for i in 0..8 {
-            result[i] = src[i].wrapping_shl(sh);
-        }
-        result
+        vector_ups::ups_vector(src, shift, from_type, to_type)
     }
 
     // ========== Conditional Vector Operation Implementations ==========
