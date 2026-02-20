@@ -1,0 +1,495 @@
+//! UPS (Upshift / type-widening) for AIE2 vector operations.
+//!
+//! UPS promotes narrow integer lanes into wider accumulator lanes with an
+//! optional left shift. This is the standard DSP "upshift" operation used
+//! to load data into accumulators before multiply-accumulate chains.
+//!
+//! # Hardware behavior (derived from AIE2 architecture)
+//!
+//! The operation is parameterised by a *scale* and an *accumulator mode*:
+//!
+//! | Scale | Acc mode | Lanes | Input bits | Output bits |
+//! |-------|----------|-------|------------|-------------|
+//! | Half  | Acc32    | 32    | 8          | 32          |
+//! | Full  | Acc32    | 32    | 16         | 32          |
+//! | Half  | Acc64    | 16    | 16         | 64          |
+//! | Full  | Acc64    | 16    | 32         | 64          |
+//!
+//! Per lane the operation is:
+//! 1. Sign-extend the input value to its declared width.
+//! 2. Left-shift by the shift amount.
+//! 3. Optionally saturate to the output range.
+//! 4. Truncate (mask) to the output width.
+//!
+//! The 256-bit source vector is treated as packed lanes of `from_bits` width.
+//! The result occupies a wider register (256 or 512 bits depending on mode).
+//! Because our register file stores 8 x u32 words, the caller is responsible
+//! for writing the result to the appropriate accumulator register(s).
+
+use crate::tablegen::ElementType;
+
+/// UPS scale modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpsScale {
+    /// Half-scale: narrower input type (8->32 or 16->64).
+    Half,
+    /// Full-scale: wider input type (16->32 or 32->64).
+    Full,
+}
+
+/// UPS accumulator modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpsAccMode {
+    /// 32-bit accumulator output.
+    Acc32,
+    /// 64-bit accumulator output.
+    Acc64,
+}
+
+/// Parameters for a single UPS mode, derived from the mode table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpsMode {
+    /// Number of SIMD lanes.
+    pub lanes: u32,
+    /// Input element width in bits.
+    pub bits_in: u32,
+    /// Output element width in bits.
+    pub bits_out: u32,
+}
+
+/// Look up the UPS mode parameters from scale and accumulator settings.
+///
+/// Returns `(lanes, bits_in, bits_out)` matching the hardware mode table.
+pub fn ups_mode(scale: UpsScale, acc: UpsAccMode) -> UpsMode {
+    match (scale, acc) {
+        (UpsScale::Half, UpsAccMode::Acc32) => UpsMode { lanes: 32, bits_in: 8, bits_out: 32 },
+        (UpsScale::Full, UpsAccMode::Acc32) => UpsMode { lanes: 32, bits_in: 16, bits_out: 32 },
+        (UpsScale::Half, UpsAccMode::Acc64) => UpsMode { lanes: 16, bits_in: 16, bits_out: 64 },
+        (UpsScale::Full, UpsAccMode::Acc64) => UpsMode { lanes: 16, bits_in: 32, bits_out: 64 },
+    }
+}
+
+/// Infer the UPS mode from source and destination element types.
+///
+/// Returns `None` if the type pair does not correspond to a valid UPS mode.
+pub fn ups_mode_from_types(from_type: ElementType, to_type: ElementType) -> Option<UpsMode> {
+    let bits_in = from_type.bits() as u32;
+    let bits_out = to_type.bits() as u32;
+
+    // Match against the four valid UPS mode entries.
+    match (bits_in, bits_out) {
+        (8, 32) => Some(UpsMode { lanes: 32, bits_in: 8, bits_out: 32 }),
+        (16, 32) => Some(UpsMode { lanes: 32, bits_in: 16, bits_out: 32 }),
+        (16, 64) => Some(UpsMode { lanes: 16, bits_in: 16, bits_out: 64 }),
+        (32, 64) => Some(UpsMode { lanes: 16, bits_in: 32, bits_out: 64 }),
+        // Same-width is a degenerate UPS (just shift within same width).
+        (w_in, w_out) if w_in == w_out => {
+            let lanes = 256 / w_in;
+            Some(UpsMode { lanes, bits_in: w_in, bits_out: w_out })
+        }
+        _ => None,
+    }
+}
+
+/// Sign-extend a value from `bits` width to i64.
+///
+/// Treats the lowest `bits` bits of `val` as a two's-complement signed
+/// integer and sign-extends to 64 bits.
+fn sign_extend(val: u64, bits: u32) -> i64 {
+    if bits == 0 || bits >= 64 {
+        return val as i64;
+    }
+    let shift = 64 - bits;
+    ((val as i64) << shift) >> shift
+}
+
+/// Truncate a value to `bits` width (mask to lowest `bits` bits).
+fn truncate(val: i64, bits: u32) -> i64 {
+    if bits >= 64 {
+        return val;
+    }
+    let mask = (1i64 << bits) - 1;
+    let masked = val & mask;
+    // Sign-extend the truncated value.
+    sign_extend(masked as u64, bits)
+}
+
+/// Perform UPS on a single lane.
+///
+/// 1. Sign-extend input to `bits_in` width.
+/// 2. Left-shift by `shift`.
+/// 3. If `saturate` is true, clamp to the signed range of `bits_out`.
+/// 4. Truncate to `bits_out` width.
+pub fn ups_lane(value: i64, shift: u32, bits_in: u32, bits_out: u32, saturate: bool) -> i64 {
+    // Sign-extend input to its declared width, then widen to i64.
+    let extended = truncate(value, bits_in);
+
+    // Left-shift for scaling into the wider accumulator.
+    let shifted = extended.wrapping_shl(shift);
+
+    // Optional saturation to the output range.
+    let saturated = if saturate {
+        let vmax = (1i64 << (bits_out - 1)) - 1;
+        let vmin = -(1i64 << (bits_out - 1));
+        shifted.max(vmin).min(vmax)
+    } else {
+        shifted
+    };
+
+    // Truncate to output width with sign extension.
+    truncate(saturated, bits_out)
+}
+
+/// Extract lane `index` from a packed 256-bit vector represented as `[u32; 8]`.
+///
+/// Lanes are packed little-endian: lane 0 occupies the lowest bits of word 0.
+fn extract_lane(src: &[u32; 8], index: u32, lane_bits: u32) -> i64 {
+    let bit_offset = index * lane_bits;
+    let word_idx = (bit_offset / 32) as usize;
+    let bit_within_word = bit_offset % 32;
+
+    if lane_bits <= 32 - bit_within_word {
+        // Lane fits entirely within one word.
+        let raw = (src[word_idx] >> bit_within_word) as u64;
+        let mask = (1u64 << lane_bits) - 1;
+        sign_extend(raw & mask, lane_bits)
+    } else {
+        // Lane spans two words.
+        let lo_bits = 32 - bit_within_word;
+        let lo = (src[word_idx] >> bit_within_word) as u64;
+        let hi = if word_idx + 1 < 8 {
+            src[word_idx + 1] as u64
+        } else {
+            0
+        };
+        let raw = lo | (hi << lo_bits);
+        let mask = (1u64 << lane_bits) - 1;
+        sign_extend(raw & mask, lane_bits)
+    }
+}
+
+/// Pack a lane value into a 256-bit result vector at `[u32; 8]`.
+///
+/// Writes `lane_bits` bits of `value` at the position for lane `index`.
+fn pack_lane(dst: &mut [u32; 8], index: u32, lane_bits: u32, value: i64) {
+    let bit_offset = index * lane_bits;
+    let word_idx = (bit_offset / 32) as usize;
+    let bit_within_word = bit_offset % 32;
+    let mask = if lane_bits >= 64 { u64::MAX } else { (1u64 << lane_bits) - 1 };
+    let raw = (value as u64) & mask;
+
+    if lane_bits <= 32 - bit_within_word {
+        // Fits in one word.
+        let wmask = (mask as u32) << bit_within_word;
+        dst[word_idx] = (dst[word_idx] & !wmask) | ((raw as u32) << bit_within_word);
+    } else {
+        // Spans two words.
+        let lo_bits = 32 - bit_within_word;
+        let lo_mask = ((1u64 << lo_bits) - 1) as u32;
+        dst[word_idx] = (dst[word_idx] & !(lo_mask << bit_within_word))
+            | ((raw as u32 & lo_mask) << bit_within_word);
+        if word_idx + 1 < 8 {
+            let hi_bits = lane_bits - lo_bits;
+            let hi_mask = if hi_bits >= 32 { u32::MAX } else { (1u32 << hi_bits) - 1 };
+            let hi_val = (raw >> lo_bits) as u32 & hi_mask;
+            dst[word_idx + 1] = (dst[word_idx + 1] & !hi_mask) | hi_val;
+        }
+    }
+}
+
+/// Perform a full UPS operation on a 256-bit source vector.
+///
+/// The source vector contains `mode.lanes` elements of `mode.bits_in` width.
+/// Each lane is sign-extended, left-shifted by `shift`, and written to the
+/// result as `mode.bits_out`-width elements.
+///
+/// When `bits_out > 32`, the result needs more than 256 bits. The caller must
+/// handle writing to multiple accumulator registers. This function fills up
+/// to 8 words (256 bits) of the result; for 64-bit accumulator modes where
+/// the full result is 16x64=1024 bits, the caller should invoke this
+/// function with appropriate slicing or use [`ups_lane`] directly.
+///
+/// For the common 32-bit accumulator modes (8->32 and 16->32), the full
+/// result fits in 256 bits (8 x u32).
+pub fn ups_vector(
+    src: &[u32; 8],
+    shift: u32,
+    from_type: ElementType,
+    to_type: ElementType,
+) -> [u32; 8] {
+    let bits_in = from_type.bits() as u32;
+    let bits_out = to_type.bits() as u32;
+    let lanes = 256 / bits_in;
+
+    // For output wider than 32 bits per lane, we can only fit
+    // 256 / bits_out lanes in the result. Cap accordingly.
+    let out_lanes = if bits_out > 0 { (256 / bits_out).min(lanes) } else { 0 };
+
+    let mut result = [0u32; 8];
+
+    for i in 0..out_lanes {
+        let val = extract_lane(src, i, bits_in);
+        let out = ups_lane(val, shift, bits_in, bits_out, false);
+        pack_lane(&mut result, i, bits_out, out);
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- sign_extend tests --
+
+    #[test]
+    fn test_sign_extend_positive() {
+        // 0x7F in 8 bits = +127
+        assert_eq!(sign_extend(0x7F, 8), 127);
+    }
+
+    #[test]
+    fn test_sign_extend_negative() {
+        // 0xFF in 8 bits = -1
+        assert_eq!(sign_extend(0xFF, 8), -1);
+        // 0x80 in 8 bits = -128
+        assert_eq!(sign_extend(0x80, 8), -128);
+    }
+
+    #[test]
+    fn test_sign_extend_16bit() {
+        assert_eq!(sign_extend(0xFFFF, 16), -1);
+        assert_eq!(sign_extend(0x7FFF, 16), 32767);
+        assert_eq!(sign_extend(0x8000, 16), -32768);
+    }
+
+    // -- truncate tests --
+
+    #[test]
+    fn test_truncate_to_8bit() {
+        assert_eq!(truncate(256, 8), 0);
+        assert_eq!(truncate(255, 8), -1); // 0xFF sign-extended
+        assert_eq!(truncate(127, 8), 127);
+        assert_eq!(truncate(-1, 8), -1);
+    }
+
+    #[test]
+    fn test_truncate_to_32bit() {
+        assert_eq!(truncate(0x7FFFFFFF, 32), 0x7FFFFFFF);
+        assert_eq!(truncate(-1, 32), -1);
+    }
+
+    // -- ups_lane tests --
+
+    #[test]
+    fn test_ups_lane_8_to_32_no_shift() {
+        // Simple widening: 8-bit value 42 -> 32-bit value 42
+        let result = ups_lane(42, 0, 8, 32, false);
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn test_ups_lane_8_to_32_with_shift() {
+        // 8-bit value 1, shift left by 8 -> 256 in 32-bit
+        let result = ups_lane(1, 8, 8, 32, false);
+        assert_eq!(result, 256);
+    }
+
+    #[test]
+    fn test_ups_lane_negative_8_to_32() {
+        // -1 in 8 bits (0xFF), shift 0 -> -1 in 32 bits
+        let result = ups_lane(0xFF, 0, 8, 32, false);
+        assert_eq!(result, -1);
+    }
+
+    #[test]
+    fn test_ups_lane_negative_8_to_32_shifted() {
+        // -1 in 8 bits, shift left by 4 -> -16 in 32 bits
+        let result = ups_lane(0xFF, 4, 8, 32, false);
+        assert_eq!(result, -16);
+    }
+
+    #[test]
+    fn test_ups_lane_16_to_32() {
+        // 16-bit value 1000, shift 8 -> 256000
+        let result = ups_lane(1000, 8, 16, 32, false);
+        assert_eq!(result, 256000);
+    }
+
+    #[test]
+    fn test_ups_lane_16_to_64() {
+        // 16-bit value 0x7FFF = 32767, shift 16 -> 32767 * 65536
+        let result = ups_lane(0x7FFF, 16, 16, 64, false);
+        assert_eq!(result, 32767 * 65536);
+    }
+
+    #[test]
+    fn test_ups_lane_saturation() {
+        // 16-bit max positive 32767, shift 20 -> would overflow 32-bit
+        // With saturation, should clamp to i32::MAX
+        let result = ups_lane(0x7FFF, 20, 16, 32, true);
+        assert_eq!(result, i32::MAX as i64);
+    }
+
+    #[test]
+    fn test_ups_lane_saturation_negative() {
+        // -32768 in 16 bits, shift 20 -> large negative, clamp to i32::MIN
+        let result = ups_lane(0x8000_u64 as i64, 20, 16, 32, true);
+        assert_eq!(result, i32::MIN as i64);
+    }
+
+    #[test]
+    fn test_ups_lane_no_saturation_wraps() {
+        // Without saturation, large shifts wrap within the output width.
+        // 32767 << 20 in 32 bits wraps around.
+        let result = ups_lane(0x7FFF, 20, 16, 32, false);
+        let expected = truncate(32767i64 << 20, 32);
+        assert_eq!(result, expected);
+    }
+
+    // -- extract_lane / pack_lane tests --
+
+    #[test]
+    fn test_extract_pack_roundtrip_8bit() {
+        let mut data = [0u32; 8];
+        // Write values to each 8-bit lane
+        for i in 0..32u32 {
+            pack_lane(&mut data, i, 8, i as i64);
+        }
+        for i in 0..32u32 {
+            let val = extract_lane(&data, i, 8);
+            assert_eq!(val, i as i64, "lane {i} mismatch");
+        }
+    }
+
+    #[test]
+    fn test_extract_pack_roundtrip_16bit() {
+        let mut data = [0u32; 8];
+        for i in 0..16u32 {
+            let val = (i as i64) * 1000 - 8000;
+            pack_lane(&mut data, i, 16, val);
+        }
+        for i in 0..16u32 {
+            let expected = (i as i64) * 1000 - 8000;
+            let val = extract_lane(&data, i, 16);
+            assert_eq!(val, expected, "lane {i} mismatch");
+        }
+    }
+
+    #[test]
+    fn test_extract_negative_8bit() {
+        // Pack -1 (0xFF) into lane 0
+        let mut data = [0u32; 8];
+        pack_lane(&mut data, 0, 8, -1);
+        assert_eq!(extract_lane(&data, 0, 8), -1);
+    }
+
+    // -- ups_vector integration tests --
+
+    #[test]
+    fn test_ups_vector_8_to_32_identity() {
+        // 32 lanes of 8-bit values [0..31], shift 0
+        // Result: 8 words of 32-bit values [0..7] (only 8 fit in 256 bits)
+        let mut src = [0u32; 8];
+        for i in 0..32u32 {
+            pack_lane(&mut src, i, 8, i as i64);
+        }
+
+        let result = ups_vector(&src, 0, ElementType::Int8, ElementType::Int32);
+
+        // With 32-bit output, only 8 lanes fit in 256 bits.
+        for i in 0..8u32 {
+            let val = extract_lane(&result, i, 32);
+            assert_eq!(val, i as i64, "lane {i}");
+        }
+    }
+
+    #[test]
+    fn test_ups_vector_8_to_32_shifted() {
+        // Pack value 5 into every 8-bit lane, shift by 4 -> each 32-bit lane = 80
+        let mut src = [0u32; 8];
+        for i in 0..32u32 {
+            pack_lane(&mut src, i, 8, 5);
+        }
+
+        let result = ups_vector(&src, 4, ElementType::Int8, ElementType::Int32);
+
+        for i in 0..8u32 {
+            let val = extract_lane(&result, i, 32);
+            assert_eq!(val, 80, "lane {i}");
+        }
+    }
+
+    #[test]
+    fn test_ups_vector_16_to_32() {
+        // 16 lanes of 16-bit values, shift by 8
+        let mut src = [0u32; 8];
+        for i in 0..16u32 {
+            pack_lane(&mut src, i, 16, (i as i64) + 1);
+        }
+
+        let result = ups_vector(&src, 8, ElementType::Int16, ElementType::Int32);
+
+        // 32-bit output: 8 lanes fit in 256 bits
+        for i in 0..8u32 {
+            let expected = ((i as i64) + 1) << 8;
+            let val = extract_lane(&result, i, 32);
+            assert_eq!(val, expected, "lane {i}");
+        }
+    }
+
+    #[test]
+    fn test_ups_vector_negative_values() {
+        // Pack -5 into 8-bit lanes, shift by 2 -> -20 in 32-bit
+        let mut src = [0u32; 8];
+        for i in 0..32u32 {
+            pack_lane(&mut src, i, 8, -5);
+        }
+
+        let result = ups_vector(&src, 2, ElementType::Int8, ElementType::Int32);
+
+        for i in 0..8u32 {
+            let val = extract_lane(&result, i, 32);
+            assert_eq!(val, -20, "lane {i}");
+        }
+    }
+
+    // -- UPS mode lookup tests --
+
+    #[test]
+    fn test_ups_mode_table() {
+        let m = ups_mode(UpsScale::Half, UpsAccMode::Acc32);
+        assert_eq!((m.lanes, m.bits_in, m.bits_out), (32, 8, 32));
+
+        let m = ups_mode(UpsScale::Full, UpsAccMode::Acc32);
+        assert_eq!((m.lanes, m.bits_in, m.bits_out), (32, 16, 32));
+
+        let m = ups_mode(UpsScale::Half, UpsAccMode::Acc64);
+        assert_eq!((m.lanes, m.bits_in, m.bits_out), (16, 16, 64));
+
+        let m = ups_mode(UpsScale::Full, UpsAccMode::Acc64);
+        assert_eq!((m.lanes, m.bits_in, m.bits_out), (16, 32, 64));
+    }
+
+    #[test]
+    fn test_ups_mode_from_types_valid() {
+        let m = ups_mode_from_types(ElementType::Int8, ElementType::Int32).unwrap();
+        assert_eq!((m.lanes, m.bits_in, m.bits_out), (32, 8, 32));
+
+        let m = ups_mode_from_types(ElementType::Int16, ElementType::Int32).unwrap();
+        assert_eq!((m.lanes, m.bits_in, m.bits_out), (32, 16, 32));
+    }
+
+    #[test]
+    fn test_ups_mode_from_types_same_width() {
+        // Same width is allowed as degenerate case.
+        let m = ups_mode_from_types(ElementType::Int32, ElementType::Int32).unwrap();
+        assert_eq!((m.lanes, m.bits_in, m.bits_out), (8, 32, 32));
+    }
+
+    #[test]
+    fn test_ups_mode_from_types_invalid() {
+        // 32->16 is not a valid UPS (that would be SRS).
+        assert!(ups_mode_from_types(ElementType::Int32, ElementType::Int16).is_none());
+    }
+}
