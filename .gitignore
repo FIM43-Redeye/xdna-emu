@@ -19,6 +19,9 @@ tests/npu-outputs/
 # Generated/extracted test files (regenerate from mlir-aie)
 tests/mlir-aie-extracted/*
 
+# Validation reports (regenerable)
+reports/
+
 # Temporary/scratch files
 *.patch
 *.zip

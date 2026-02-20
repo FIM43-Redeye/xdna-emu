@@ -1,0 +1,6 @@
+# Build artifacts
+build/
+
+# CUDD source (downloaded by Makefile)
+cudd-3.0.0/
+cudd-release.tar.gz
