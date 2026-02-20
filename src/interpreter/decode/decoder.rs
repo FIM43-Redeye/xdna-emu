@@ -1023,9 +1023,10 @@ impl Decoder for InstructionDecoder {
                     SlotType::Mv => SlotIndex::Scalar1,
                     SlotType::St => SlotIndex::Store,
                     SlotType::Vec => SlotIndex::Vector,
-                    // LNG slot can contain either control flow (JL, J) or vector (movxm).
-                    // Determine the correct slot after decoding via operation.natural_slot().
-                    SlotType::Lng => SlotIndex::Vector,
+                    // LNG is polymorphic: j/jl -> Control, movxm -> Scalar0.
+                    // This default is only used for NOPs; real instructions get
+                    // resolved via operation.natural_slot() below.
+                    SlotType::Lng => SlotIndex::Control,
                     SlotType::Nop => SlotIndex::Control,
                 };
 
