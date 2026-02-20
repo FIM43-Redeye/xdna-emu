@@ -395,9 +395,12 @@ fn execute_setcc(op: &SlotOp, ctx: &mut ExecutionContext, cmp: CmpOp, signed: bo
 // Conditional select
 // ============================================================================
 
-/// Execute conditional select: dest = (test == 0) ? true_val : false_val
+/// Execute conditional select.
 ///
-/// For `sel.eqz`, r27 is implicit (from TableGen eR27 register class).
+/// - `sel.eqz` / `ScalarSelEqz`: dest = (test == 0) ? true_val : false_val
+/// - `sel.nez` / `ScalarSelNez`: dest = (test != 0) ? true_val : false_val
+///
+/// For both variants, r27 is implicit (from TableGen eR27 register class).
 /// For generic select, the test value is the 3rd source operand.
 fn execute_select(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     let src_true = read_source(op, ctx, 0);
@@ -406,15 +409,20 @@ fn execute_select(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     // Get test value: first check for implicit r27, then fall back to source[2]
     let test = get_implicit_use(op, ctx, 27).unwrap_or_else(|| read_source(op, ctx, 2));
 
+    // Determine condition: sel.nez inverts the test
+    let condition = match op.op {
+        Operation::ScalarSelNez => test != 0,
+        _ => test == 0, // sel.eqz and generic select
+    };
+
     log::debug!(
-        "[SEMANTIC SELECT] sources={:?} implicit_regs={:?} test={} true={} false={}",
-        op.sources, op.implicit_regs, test, src_true, src_false
+        "[SEMANTIC SELECT] op={:?} sources={:?} implicit_regs={:?} test={} true={} false={} cond={}",
+        op.op, op.sources, op.implicit_regs, test, src_true, src_false, condition
     );
 
-    // sel.eqz semantics: if test == 0, select true_val
-    let result = if test == 0 { src_true } else { src_false };
+    let result = if condition { src_true } else { src_false };
 
-    log::debug!("[SEMANTIC SELECT] result={} (test==0? {})", result, test == 0);
+    log::debug!("[SEMANTIC SELECT] result={}", result);
 
     write_dest(op, ctx, result);
     true
@@ -506,19 +514,23 @@ fn execute_popcount(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
 }
 
 fn execute_sign_extend(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
-    // Sign extension width is typically encoded in the instruction
-    // For now, assume 8-bit or 16-bit based on mnemonic (handled by caller)
     let a = read_source(op, ctx, 0);
-    // Default to 16-bit sign extension
-    let extended = ((a as i16) as i32) as u32;
+    // Width determined by the Operation variant
+    let extended = match op.op {
+        Operation::ScalarExtendS8 => ((a as i8) as i32) as u32,
+        _ => ((a as i16) as i32) as u32, // ScalarExtendS16 and default
+    };
     write_dest(op, ctx, extended);
     true
 }
 
 fn execute_zero_extend(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     let a = read_source(op, ctx, 0);
-    // Default to 16-bit zero extension
-    let extended = a & 0xFFFF;
+    // Width determined by the Operation variant
+    let extended = match op.op {
+        Operation::ScalarExtendU8 => a & 0xFF,
+        _ => a & 0xFFFF, // ScalarExtendU16 and default
+    };
     write_dest(op, ctx, extended);
     true
 }
@@ -613,6 +625,46 @@ mod tests {
 
         assert!(execute_semantic(&op, &mut ctx));
         assert_eq!(ctx.scalar_read(3), 200); // r27!=0, so false value selected
+    }
+
+    #[test]
+    fn test_execute_sel_nez_with_zero() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(1, 100); // true value
+        ctx.scalar.write(2, 200); // false value
+        ctx.scalar.write(27, 0);  // test value (r27) = 0, so sel.nez selects false
+
+        let mut op = SlotOp::with_semantic(SlotIndex::Scalar0, Operation::ScalarSelNez, SemanticOp::Select);
+        op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(3));
+        op.implicit_regs = smallvec![ImplicitReg {
+            reg_class: "eR27".to_string(),
+            reg_num: 27,
+            is_use: true,
+        }];
+
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 200); // r27==0, nez condition false -> false value
+    }
+
+    #[test]
+    fn test_execute_sel_nez_with_nonzero() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(1, 100); // true value
+        ctx.scalar.write(2, 200); // false value
+        ctx.scalar.write(27, 42); // test value (r27) != 0, so sel.nez selects true
+
+        let mut op = SlotOp::with_semantic(SlotIndex::Scalar0, Operation::ScalarSelNez, SemanticOp::Select);
+        op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(3));
+        op.implicit_regs = smallvec![ImplicitReg {
+            reg_class: "eR27".to_string(),
+            reg_num: 27,
+            is_use: true,
+        }];
+
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 100); // r27!=0, nez condition true -> true value
     }
 
     #[test]
