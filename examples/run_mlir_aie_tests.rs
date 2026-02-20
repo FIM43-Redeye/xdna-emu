@@ -143,6 +143,8 @@ fn main() {
     // DISCOVERY AND BUILD
     // ====================================================================
 
+    // Declared here (not inside the else branch) so it outlives the if/else block.
+    // Only assigned in the source-driven (non --no-build) path.
     let mut source_tests_storage: Vec<NpuTestSource>;
 
     let (mut suite, tests, total_discovered, chess_builds) = if opts.no_build {
@@ -154,7 +156,6 @@ fn main() {
             std::process::exit(1);
         }
 
-        source_tests_storage = Vec::new();
         println!("Discovering pre-built tests in {}...", npu_xrt_path.display());
 
         let suite = match XclbinSuite::discover(&npu_xrt_path) {
@@ -498,9 +499,9 @@ fn main() {
 
         // --- Chess comparison HW (only for Peano-primary tests that also have Chess builds) ---
         // Chess-only primary tests already ran above via primary_hw.
-        // Respect cascade detection: if device is wedged, skip Chess HW too.
-        let chess_hw: Option<HwRunResult> = if hw_disabled_reason.is_some() {
-            // Already counted in cascade_skipped for primary; don't double-count
+        // Respect both --no-hw flag and cascade detection.
+        let chess_hw: Option<HwRunResult> = if !hw_available || hw_disabled_reason.is_some() {
+            // hw_available is false when --no-hw is passed; cascade means device is wedged
             None
         } else if chess_available && !skip_hw && compiler == Compiler::Peano {
             if let Some(chess_artifacts) = chess_builds.get(&test.name) {
