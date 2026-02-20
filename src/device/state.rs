@@ -147,6 +147,23 @@ impl DeviceState {
                 self.dma_write(*address, data)?;
             }
 
+            // Synchronization/timing commands - no-ops in emulation.
+            // MaskPoll waits for a register to match a value on real hardware;
+            // in the emulator, configuration writes take effect immediately.
+            CdoCommand::MaskPoll { .. } | CdoCommand::MaskPoll64 { .. } => {
+                log::trace!("CDO MaskPoll: skipped (emulator writes are synchronous)");
+            }
+
+            // Delay inserts a wait on real hardware; no-op in emulation.
+            CdoCommand::Delay { .. } => {
+                log::trace!("CDO Delay: skipped (emulator has no real-time clock)");
+            }
+
+            // Structural markers - no functional effect.
+            CdoCommand::EndMark | CdoCommand::Marker { .. } => {
+                log::trace!("CDO marker/end: skipped");
+            }
+
             _ => {
                 self.stats.unknown += 1;
             }
@@ -208,7 +225,16 @@ impl DeviceState {
             }
 
             _ => {
-                // Ignore other writes for now
+                // Shim DMA channels live at a different offset (0x1D200) than
+                // compute channels (0x1DE00). RegisterModule::from_offset()
+                // is row-agnostic and cannot distinguish them, so we catch
+                // shim channel writes here.
+                let reg_layout = super::regdb::device_reg_layout();
+                let shim_ch_base = reg_layout.shim_channel_base;
+                let shim_ch_end = shim_ch_base + 4 * reg_layout.shim_channel_stride;
+                if tile_addr.row == 0 && (shim_ch_base..shim_ch_end).contains(&tile_addr.offset) {
+                    self.write_shim_dma_channel(tile_addr.col, tile_addr.row, tile_addr.offset, value);
+                }
             }
         }
 
@@ -269,18 +295,25 @@ impl DeviceState {
             }
 
             _ => {
-                // Read-modify-write: preserve bits not covered by mask.
-                // Multiple MaskWrites to the same register (e.g., Shim Mux config at
-                // 0x1F000) must accumulate rather than clobber each other.
-                if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
-                    let current = *tile.registers_ref().get(&tile_addr.offset).unwrap_or(&0);
-                    let new_value = (current & !mask) | (value & mask);
-                    log::debug!("CDO MaskWrite RMW: tile({},{}) offset=0x{:05X} current=0x{:08X} -> 0x{:08X} (mask=0x{:08X} val=0x{:08X})",
-                        tile_addr.col, tile_addr.row, tile_addr.offset, current, new_value, mask, value);
-                    tile.write_register(tile_addr.offset, new_value);
+                // Shim DMA channels at 0x1D200 (see write_register for details).
+                let shim_ch_base = reg_layout.shim_channel_base;
+                let shim_ch_end = shim_ch_base + 4 * reg_layout.shim_channel_stride;
+                if tile_addr.row == 0 && (shim_ch_base..shim_ch_end).contains(&tile_addr.offset) {
+                    self.mask_write_shim_dma_channel(tile_addr.col, tile_addr.row, tile_addr.offset, mask, value);
                 } else {
-                    log::warn!("CDO MaskWrite: tile({},{}) not found for offset=0x{:05X}",
-                        tile_addr.col, tile_addr.row, tile_addr.offset);
+                    // Read-modify-write: preserve bits not covered by mask.
+                    // Multiple MaskWrites to the same register (e.g., Shim Mux config at
+                    // 0x1F000) must accumulate rather than clobber each other.
+                    if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
+                        let current = *tile.registers_ref().get(&tile_addr.offset).unwrap_or(&0);
+                        let new_value = (current & !mask) | (value & mask);
+                        log::debug!("CDO MaskWrite RMW: tile({},{}) offset=0x{:05X} current=0x{:08X} -> 0x{:08X} (mask=0x{:08X} val=0x{:08X})",
+                            tile_addr.col, tile_addr.row, tile_addr.offset, current, new_value, mask, value);
+                        tile.write_register(tile_addr.offset, new_value);
+                    } else {
+                        log::warn!("CDO MaskWrite: tile({},{}) not found for offset=0x{:05X}",
+                            tile_addr.col, tile_addr.row, tile_addr.offset);
+                    }
                 }
             }
         }
@@ -405,24 +438,38 @@ impl DeviceState {
         }
     }
 
-    /// Write to a DMA buffer descriptor.
+    /// Write to a DMA buffer descriptor (compute or shim tile).
+    ///
+    /// Compute tile BDs have 6 words (14-bit address, 14-bit length).
+    /// Shim tile BDs have 8 words (46-bit DDR address, 32-bit length).
+    /// Both share the same BD base address (0x1D000) and stride (0x20),
+    /// so we determine tile type from the row to select the correct parser.
     fn write_dma_bd(&mut self, col: u8, row: u8, offset: u32, value: u32) {
         use crate::device::dma::bd::BufferDescriptor;
-        use crate::device::tile::TileType;
 
+        let tile_type = self.array.arch().tile_type(col, row);
         let reg_layout = super::regdb::device_reg_layout();
 
-        // BD registers: base/stride/words derived from register database
-        let rel = offset - reg_layout.memory_bd_base;
-        let bd_idx = (rel / reg_layout.memory_bd_stride) as usize;
-        let word = ((rel % reg_layout.memory_bd_stride) / 4) as usize;
+        // Select base/stride/max words based on tile type.
+        // Shim and compute share the same BD base and stride, but shim uses
+        // 8 words per BD while compute uses 6.
+        let (bd_base, bd_stride, max_words) = match tile_type {
+            TileType::Shim => (reg_layout.shim_bd_base, reg_layout.shim_bd_stride, 8usize),
+            _ => (reg_layout.memory_bd_base, reg_layout.memory_bd_stride, reg_layout.memory_bd_words),
+        };
+
+        let rel = offset - bd_base;
+        let bd_idx = (rel / bd_stride) as usize;
+        let word = ((rel % bd_stride) / 4) as usize;
 
         let num_bds = self.array.get(col, row).map_or(0, |t| t.dma_bds.len());
-        if bd_idx >= num_bds || word >= reg_layout.memory_bd_words {
+        if bd_idx >= num_bds || word >= max_words {
             return;
         }
 
-        // Update the legacy tile BD storage (CDO writes one word at a time)
+        // Update the legacy tile BD storage (CDO writes one word at a time).
+        // The legacy struct has 6 fields; for shim BDs, words 6-7 are stored
+        // in the tile's register map and reconstructed at parse time.
         if let Some(tile) = self.array.get_mut(col, row) {
             let bd = &mut tile.dma_bds[bd_idx];
             match word {
@@ -432,33 +479,62 @@ impl DeviceState {
                 3 => bd.control = value,
                 4 => bd.d0 = value,
                 5 => bd.d1 = value,
+                // Words 6-7 (shim): store in the tile register map
+                w if w >= 6 => {
+                    let reg_off = bd_base + (bd_idx as u32) * bd_stride + (w as u32) * 4;
+                    tile.write_register(reg_off, value);
+                }
                 _ => {}
             }
         }
 
-        // Parse all 6 BD words using the data-driven register database parser,
-        // then convert to the runtime BdConfig used by the DMA engine.
+        // Build the word array and parse using the correct tile-type parser.
         let bd_config = self.array.get(col, row).map(|tile| {
             let tile_bd = &tile.dma_bds[bd_idx];
-            let words = [
-                tile_bd.addr_low, tile_bd.addr_high, tile_bd.length,
-                tile_bd.control, tile_bd.d0, tile_bd.d1,
-            ];
 
-            log::trace!("  BD {} words=[0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}]",
-                bd_idx, words[0], words[1], words[2], words[3], words[4], words[5]);
+            match tile_type {
+                TileType::Shim => {
+                    // Shim BDs: 8 words. Words 6-7 from register map.
+                    let w6_off = bd_base + (bd_idx as u32) * bd_stride + 24;
+                    let w7_off = bd_base + (bd_idx as u32) * bd_stride + 28;
+                    let w6 = *tile.registers_ref().get(&w6_off).unwrap_or(&0);
+                    let w7 = *tile.registers_ref().get(&w7_off).unwrap_or(&0);
+                    let words = [
+                        tile_bd.addr_low, tile_bd.addr_high, tile_bd.length,
+                        tile_bd.control, tile_bd.d0, tile_bd.d1, w6, w7,
+                    ];
 
-            let parsed = BufferDescriptor::from_registers(&words, TileType::Compute);
-            let mut config = parsed.to_bd_config();
+                    log::trace!("  Shim BD {} words=[{:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}]",
+                        bd_idx, words[0], words[1], words[2], words[3],
+                        words[4], words[5], words[6], words[7]);
 
-            // For backwards compatibility, also mark as valid if any data is non-zero.
-            // This handles BDs that are programmed but don't have the valid bit set yet
-            // (CDO writes words one at a time, valid bit is in the last word).
-            if !config.valid && words.iter().any(|&w| w != 0) {
-                config.valid = true;
+                    let parsed = BufferDescriptor::from_registers(&words, TileType::Shim);
+                    let mut config = parsed.to_bd_config();
+
+                    if !config.valid && words.iter().any(|&w| w != 0) {
+                        config.valid = true;
+                    }
+                    config
+                }
+                _ => {
+                    // Compute tile BDs: 6 words.
+                    let words = [
+                        tile_bd.addr_low, tile_bd.addr_high, tile_bd.length,
+                        tile_bd.control, tile_bd.d0, tile_bd.d1,
+                    ];
+
+                    log::trace!("  BD {} words=[0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}]",
+                        bd_idx, words[0], words[1], words[2], words[3], words[4], words[5]);
+
+                    let parsed = BufferDescriptor::from_registers(&words, TileType::Compute);
+                    let mut config = parsed.to_bd_config();
+
+                    if !config.valid && words.iter().any(|&w| w != 0) {
+                        config.valid = true;
+                    }
+                    config
+                }
             }
-
-            config
         });
 
         if let Some(config) = bd_config {
@@ -635,6 +711,132 @@ impl DeviceState {
         }
     }
 
+    /// Write to a shim DMA channel register.
+    ///
+    /// Shim tiles have the same 2 S2MM + 2 MM2S channel layout as compute
+    /// tiles, but at a different base address (0x1D200 vs 0x1DE00).
+    /// The register bit layout is the same (same ChannelFieldLayout).
+    fn write_shim_dma_channel(&mut self, col: u8, row: u8, offset: u32, value: u32) {
+        let reg_layout = super::regdb::device_reg_layout();
+        let lay = &reg_layout.memory_channel; // Same bit layout as compute
+
+        let rel = offset - reg_layout.shim_channel_base;
+        let ch_idx = (rel / reg_layout.shim_channel_stride) as usize;
+        let is_start_queue = (rel % reg_layout.shim_channel_stride) >= 4;
+        let is_s2mm = ch_idx < 2;
+
+        let num_channels = self.array.get(col, row).map_or(0, |t| t.dma_channels.len());
+        if ch_idx >= num_channels {
+            return;
+        }
+
+        let enable_token_issue = if is_start_queue {
+            lay.enable_token_issue.extract_bool(value)
+        } else {
+            false
+        };
+
+        let compression_enable = lay.decompression_enable.extract_bool(value);
+        let out_of_order_enable = lay.enable_out_of_order.extract_bool(value);
+
+        if let Some(tile) = self.array.get_mut(col, row) {
+            let dma_ch = &mut tile.dma_channels[ch_idx];
+            if is_start_queue {
+                dma_ch.start_queue = value;
+                dma_ch.current_bd = lay.start_bd_id.extract(value) as u8;
+                dma_ch.enable_token_issue = enable_token_issue;
+            } else {
+                dma_ch.control = value;
+                dma_ch.running = value & 1 != 0;
+                dma_ch.controller_id = lay.controller_id.extract(value) as u8;
+                if is_s2mm {
+                    dma_ch.fot_mode = lay.fot_mode.extract(value) as u8;
+                    dma_ch.decompression_enable = compression_enable;
+                    dma_ch.out_of_order_enable = out_of_order_enable;
+                } else {
+                    dma_ch.compression_enable = compression_enable;
+                }
+            }
+        }
+
+        if !is_start_queue {
+            if let Some(dma) = self.array.dma_engine_mut(col, row) {
+                let (decompression_en, ooo_en) = if is_s2mm {
+                    (compression_enable, out_of_order_enable)
+                } else {
+                    (false, false)
+                };
+                let compress_en = if is_s2mm { false } else { compression_enable };
+                dma.set_channel_compression_config(ch_idx as u8, compress_en, decompression_en, ooo_en);
+            }
+        }
+
+        if is_start_queue {
+            let bd_idx = lay.start_bd_id.extract(value) as u8;
+            let repeat_count = lay.repeat_count.extract(value) as u8;
+
+            let (controller_id, fot_mode) = self.array.get(col, row)
+                .map(|t| {
+                    let dma_ch = &t.dma_channels[ch_idx];
+                    (dma_ch.controller_id, dma_ch.fot_mode)
+                })
+                .unwrap_or((0, 0));
+
+            if let Some(dma) = self.array.dma_engine_mut(col, row) {
+                dma.set_channel_task_config(ch_idx as u8, enable_token_issue, controller_id, fot_mode);
+
+                if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, enable_token_issue) {
+                    log::warn!("Shim DMA channel {} task queue overflow on tile ({},{})",
+                        ch_idx, col, row);
+                } else {
+                    log::info!("CDO enqueued Shim DMA channel {} BD {} repeat={} on tile ({},{})",
+                        ch_idx, bd_idx, repeat_count, col, row);
+                }
+            }
+        }
+    }
+
+    /// Masked write to a shim DMA channel register.
+    fn mask_write_shim_dma_channel(&mut self, col: u8, row: u8, offset: u32, mask: u32, value: u32) {
+        let reg_layout = super::regdb::device_reg_layout();
+        let rel = offset - reg_layout.shim_channel_base;
+        let ch_idx = (rel / reg_layout.shim_channel_stride) as usize;
+        let is_start_queue = (rel % reg_layout.shim_channel_stride) >= 4;
+
+        let num_channels = self.array.get(col, row).map_or(0, |t| t.dma_channels.len());
+        if ch_idx >= num_channels {
+            return;
+        }
+
+        let new_start_queue = if let Some(tile) = self.array.get_mut(col, row) {
+            let ch = &mut tile.dma_channels[ch_idx];
+            if is_start_queue {
+                ch.start_queue = (ch.start_queue & !mask) | (value & mask);
+                Some(ch.start_queue)
+            } else {
+                ch.control = (ch.control & !mask) | (value & mask);
+                ch.running = ch.control & 1 != 0;
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(queue_val) = new_start_queue {
+            let bd_idx = (queue_val & 0xF) as u8;
+            let repeat_count = ((queue_val >> 16) & 0xFF) as u8;
+            if let Some(dma) = self.array.dma_engine_mut(col, row) {
+                if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
+                    log::warn!("Shim DMA channel {} task queue overflow on tile ({},{})",
+                        ch_idx, col, row);
+                } else {
+                    log::info!("CDO enqueued Shim DMA channel {} BD {} repeat={} on tile ({},{})",
+                        ch_idx, bd_idx, repeat_count, col, row);
+                }
+            }
+        }
+    }
+
     /// Write to a core register.
     fn write_core_register(&mut self, col: u8, row: u8, offset: u32, value: u32) {
         use super::registers_spec::core_module as cm;
@@ -704,11 +906,6 @@ impl DeviceState {
             let packet_enable = (value >> 30) & 1 != 0;
             let slave_select = (value & SLAVE_SELECT_MASK) as usize;
 
-            // Get port type before mutable borrow
-            let port_type = self.array.get(col, row)
-                .and_then(|t| t.stream_switch.masters.get(port))
-                .map(|p| p.port_type);
-
             if let Some(tile) = self.array.get_mut(col, row) {
                 if port < tile.stream_switch.masters.len() {
                     tile.stream_switch.masters[port].config = value;
@@ -733,12 +930,6 @@ impl DeviceState {
                 }
             }
 
-            // Create global route for external ports (North/South) -- circuit mode only
-            if enable && !packet_enable {
-                if let Some(pt) = port_type {
-                    self.derive_global_route(col, row, port as u8, pt);
-                }
-            }
         // Slave ports
         } else if (ss.slave_base..ss.slave_end).contains(&offset) {
             let port = ((offset - ss.slave_base) / 4) as usize;
@@ -761,155 +952,6 @@ impl DeviceState {
                 tile.stream_switch.configure_slave_slot(slave_port, slot, value);
                 log::info!("Tile ({},{}) stream switch: slave[{}] slot[{}] = 0x{:08X}",
                     col, row, slave_port, slot, value);
-            }
-        }
-    }
-
-    /// Derive global route from master port type to adjacent tile.
-    ///
-    /// When a master port of type North/South is enabled, create a route
-    /// to the adjacent tile's corresponding slave port.
-    fn derive_global_route(&mut self, col: u8, row: u8, master_port: u8, port_type: crate::device::stream_switch::PortType) {
-        use crate::device::stream_switch::PortType;
-
-        match port_type {
-            PortType::North => {
-                // North master connects to tile above's South slave
-                // Determine the destination slave port based on tile type
-                let dest_row = row + 1;
-                if dest_row < self.array.rows() {
-                    // For compute tiles, South slave ports start at specific indices
-                    // Map master port to appropriate destination slave
-                    let dest_slave = self.map_north_master_to_south_slave(col, row, dest_row, master_port);
-                    log::info!("Derived global route: ({},{}) master[{}] -> ({},{}) slave[{}] (North)",
-                        col, row, master_port, col, dest_row, dest_slave);
-                    self.array.stream_router.add_route(col, row, master_port, col, dest_row, dest_slave);
-                }
-            }
-            PortType::South => {
-                // South master connects to tile below's North slave
-                if row > 0 {
-                    let dest_row = row - 1;
-                    let dest_slave = self.map_south_master_to_north_slave(col, row, dest_row, master_port);
-                    log::info!("Derived global route: ({},{}) master[{}] -> ({},{}) slave[{}] (South)",
-                        col, row, master_port, col, dest_row, dest_slave);
-                    self.array.stream_router.add_route(col, row, master_port, col, dest_row, dest_slave);
-                }
-            }
-            _ => {
-                // DMA, Core, etc. - no global route needed
-            }
-        }
-    }
-
-    /// Map a North master port to the corresponding South slave on the tile above.
-    ///
-    /// When a tile sends data North (upward), the receiving tile receives it on its
-    /// South slave port (since the data is coming from below).
-    ///
-    /// Port layouts (per AM025 and aie2_spec::stream_switch):
-    /// - MemTile South slaves: 7-12 (6 ports, South0-South5)
-    /// - Compute South slaves: 5-10 (6 ports, South0-South5)
-    fn map_north_master_to_south_slave(&self, col: u8, src_row: u8, dest_row: u8, master_port: u8) -> u8 {
-        use super::aie2_spec::stream_switch::{shim, mem_tile, compute};
-
-        let arch = self.array.arch();
-        let src_type = arch.tile_type(col, src_row);
-        let dest_type = arch.tile_type(col, dest_row);
-
-        match dest_type {
-            TileType::MemTile => {
-                // Destination is MemTile: South slaves receive from Shim or Compute
-                match src_type {
-                    TileType::Shim => {
-                        // From Shim: North masters 12-17 → MemTile South slaves 7-12
-                        if (shim::NORTH_MASTER_START..=shim::NORTH_MASTER_END).contains(&master_port) {
-                            mem_tile::SOUTH_SLAVE_START + (master_port - shim::NORTH_MASTER_START)
-                        } else {
-                            mem_tile::SOUTH_SLAVE_START
-                        }
-                    }
-                    _ => {
-                        // From compute tile above MemTile (shouldn't happen in Phoenix)
-                        mem_tile::SOUTH_SLAVE_START + (master_port % 6)
-                    }
-                }
-            }
-            TileType::Compute => {
-                // Destination is Compute tile: South slaves receive from below
-                match src_type {
-                    TileType::MemTile => {
-                        // From MemTile: North masters 11-16 → Compute South slaves 5-10
-                        if (mem_tile::NORTH_MASTER_START..=mem_tile::NORTH_MASTER_END).contains(&master_port) {
-                            compute::SOUTH_SLAVE_START + (master_port - mem_tile::NORTH_MASTER_START)
-                        } else {
-                            compute::SOUTH_SLAVE_START
-                        }
-                    }
-                    _ => {
-                        // From another compute tile: North masters 15-18 → South slaves 5-8
-                        if (compute::NORTH_MASTER_START..=compute::NORTH_MASTER_END).contains(&master_port) {
-                            compute::SOUTH_SLAVE_START + (master_port - compute::NORTH_MASTER_START)
-                        } else {
-                            compute::SOUTH_SLAVE_START
-                        }
-                    }
-                }
-            }
-            TileType::Shim => {
-                // Shim tiles don't receive from North (they're at the bottom)
-                shim::NORTH_SLAVE_START
-            }
-        }
-    }
-
-    /// Map a South master port to the corresponding North slave on the tile below.
-    ///
-    /// When a tile sends data South (downward), the receiving tile receives it on its
-    /// North slave port (since the data is coming from above).
-    ///
-    /// Port layouts (per AM025 and aie2_spec::stream_switch):
-    /// - Shim North slaves: 14-17 (4 ports, North0-North3)
-    /// - MemTile North slaves: 13-16 (4 ports, North0-North3)
-    /// - Compute North slaves: 15-18 (4 ports, North0-North3)
-    fn map_south_master_to_north_slave(&self, col: u8, src_row: u8, dest_row: u8, master_port: u8) -> u8 {
-        use super::aie2_spec::stream_switch::{shim, mem_tile, compute};
-
-        let arch = self.array.arch();
-        let src_type = arch.tile_type(col, src_row);
-        let dest_type = arch.tile_type(col, dest_row);
-
-        match dest_type {
-            TileType::Shim => {
-                // Destination is Shim: North slaves 14-17
-                // MemTile South masters 7-10 → Shim North slaves 14-17
-                if src_type.is_mem_tile() && (mem_tile::SOUTH_MASTER_START..=mem_tile::SOUTH_MASTER_END).contains(&master_port) {
-                    shim::NORTH_SLAVE_START + (master_port - mem_tile::SOUTH_MASTER_START)
-                } else {
-                    shim::NORTH_SLAVE_START
-                }
-            }
-            TileType::MemTile => {
-                // Destination is MemTile: North slaves 13-16
-                // Compute South masters 5-10 → MemTile North slaves 13-16
-                if src_type.is_compute() && (compute::SOUTH_MASTER_START..=compute::SOUTH_MASTER_END).contains(&master_port) {
-                    // Map first 4 South masters to 4 North slaves
-                    let offset = (master_port - compute::SOUTH_MASTER_START).min(3);
-                    mem_tile::NORTH_SLAVE_START + offset
-                } else {
-                    mem_tile::NORTH_SLAVE_START
-                }
-            }
-            TileType::Compute => {
-                // Destination is Compute tile: North slaves 15-18 (NOT 8-9!)
-                // Source compute tile South masters 5-10 → destination North slaves 15-18
-                if (compute::SOUTH_MASTER_START..=compute::SOUTH_MASTER_END).contains(&master_port) {
-                    // Map first 4 South masters to 4 North slaves
-                    let offset = (master_port - compute::SOUTH_MASTER_START).min(3);
-                    compute::NORTH_SLAVE_START + offset
-                } else {
-                    compute::NORTH_SLAVE_START
-                }
             }
         }
     }
@@ -1208,11 +1250,6 @@ impl DeviceState {
             let packet_enable = (value >> 30) & 1 != 0;
             let slave_select = (value & SLAVE_SELECT_MASK) as usize;
 
-            // Get port type before mutable borrow
-            let port_type = self.array.get(col, row)
-                .and_then(|t| t.stream_switch.masters.get(port))
-                .map(|p| p.port_type);
-
             let tile = match self.array.get_mut(col, row) {
                 Some(t) => t,
                 None => return,
@@ -1242,12 +1279,6 @@ impl DeviceState {
                 }
             }
 
-            // Derive global route for external ports (North/South) -- circuit mode only
-            if enable && !packet_enable {
-                if let Some(pt) = port_type {
-                    self.derive_global_route(col, row, port as u8, pt);
-                }
-            }
         } else if (ss.slave_base..ss.slave_end).contains(&offset) {
             let port = ((offset - ss.slave_base) / 4) as usize;
             let enable = (value >> ENABLE_BIT) & 1 != 0;
