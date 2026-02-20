@@ -150,9 +150,9 @@ impl GridLayout {
         Self { cols, rows, total: n }
     }
 
-    /// Total character width needed (each cell is "X " = 2 chars).
+    /// Total character width needed: "[ " + cells ("X " each) + "]".
     pub fn display_width(&self) -> usize {
-        self.cols * 2
+        2 + self.cols * 2 + 1
     }
 
     /// Total rows needed for the grid alone.
@@ -241,21 +241,33 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Total lines output per frame: grid rows + blank line + status line.
+fn frame_height(layout: &GridLayout) -> u16 {
+    layout.rows as u16 + 2
+}
+
 /// Render one frame of the grid to stdout.
 ///
-/// Positions the cursor at `grid_start_row` and redraws all cells.
+/// Uses relative cursor movement (`MoveUp`) to overwrite the previous frame.
+/// This avoids `cursor::position()` / `cursor::MoveTo()` which rely on DSR
+/// queries and absolute row numbers -- both fragile across terminal emulators
+/// (known issue with Ghostty) and invalidated by scrolling.
 fn render_frame(
     progress: &BuildProgress,
-    grid_start_row: u16,
+    is_first_frame: bool,
     flicker_phase: bool,
 ) {
     let mut stdout = io::stdout();
     let layout = &progress.layout;
 
-    // Move to grid start
-    let _ = execute!(stdout, cursor::MoveTo(0, grid_start_row));
+    // Move back up to overwrite the previous frame (skip on first frame).
+    if !is_first_frame {
+        let lines_up = frame_height(layout);
+        let _ = execute!(stdout, cursor::MoveUp(lines_up), cursor::MoveToColumn(0));
+    }
 
     for row in 0..layout.rows {
+        let _ = execute!(stdout, style::ResetColor, style::Print("[ "));
         for col in 0..layout.cols {
             let idx = row * layout.cols + col;
             if idx < layout.total {
@@ -272,10 +284,12 @@ fn render_frame(
                 let _ = execute!(stdout, style::Print("  "));
             }
         }
-        let _ = execute!(stdout, style::Print('\n'));
+        let _ = execute!(stdout, style::ResetColor, style::Print("]\n"));
     }
+    // Blank line between grid and status line
+    let _ = execute!(stdout, style::Print('\n'));
 
-    // Status line below grid
+    // Status line below grid (clear to end of line in case previous was longer)
     let completed = progress.completed.load(Ordering::Relaxed);
     let elapsed = progress.start_time.elapsed().as_secs_f64();
     let _ = execute!(
@@ -515,9 +529,9 @@ pub fn run_parallel_builds(
 fn grid_fits_terminal(layout: &GridLayout) -> bool {
     match terminal::size() {
         Ok((w, h)) => {
-            // Grid needs: width for cells + status line height + legend
+            // Grid needs: width for cells (with brackets) + blank line + status + legend
             layout.display_width() <= w as usize
-                && (layout.display_height() + 4) <= h as usize
+                && (layout.display_height() + 5) <= h as usize
         }
         Err(_) => false,
     }
@@ -536,33 +550,27 @@ fn run_with_grid(
 ) {
     let mut stdout = io::stdout();
 
-    // Setup: hide cursor, print legend, record grid position
+    // Setup: hide cursor, print legend
     let _ = execute!(stdout, cursor::Hide);
     let _guard = TerminalGuard;
 
     print_legend();
 
-    // Get current cursor position for grid rendering
-    // We'll use the row right after the legend
-    let grid_start_row = match cursor::position() {
-        Ok((_, row)) => row,
-        Err(_) => 10, // fallback
-    };
-
-    // Pre-render initial grid (all X dim)
-    render_frame(progress, grid_start_row, false);
+    // Pre-render initial grid (all X dim) -- first frame, no MoveUp
+    render_frame(progress, true, false);
 
     std::thread::scope(|s| {
-        // Render thread -- loops until done flag is set
+        // Render thread -- loops until done flag is set.
+        // All subsequent frames use MoveUp to overwrite the previous.
         s.spawn(|| {
             let mut flicker_phase = false;
             while !progress.done.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(250));
                 flicker_phase = !flicker_phase;
-                render_frame(progress, grid_start_row, flicker_phase);
+                render_frame(progress, false, flicker_phase);
             }
             // Final render with all cells in terminal state
-            render_frame(progress, grid_start_row, false);
+            render_frame(progress, false, false);
         });
 
         // Worker threads -- collect handles so we can join them explicitly
@@ -587,10 +595,8 @@ fn run_with_grid(
         progress.done.store(true, Ordering::Relaxed);
     });
 
-    // Move cursor past the grid + status area
-    let final_row = grid_start_row + progress.layout.display_height() as u16 + 2;
-    let _ = execute!(stdout, cursor::MoveTo(0, final_row));
-    let _ = execute!(stdout, style::ResetColor, cursor::Show);
+    // Move to a fresh line below the status line
+    let _ = execute!(stdout, style::ResetColor, style::Print("\n\n"), cursor::Show);
     let _ = stdout.flush();
 }
 
@@ -1041,7 +1047,7 @@ mod tests {
     #[test]
     fn grid_layout_display_dimensions() {
         let g = GridLayout::new(67);
-        assert_eq!(g.display_width(), 18); // 9 cols * 2 chars each
+        assert_eq!(g.display_width(), 21); // "[ " + 9 cols * 2 chars + "]"
         assert_eq!(g.display_height(), 8); // 8 rows
     }
 }
