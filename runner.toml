@@ -26,9 +26,9 @@ nice_level = 19
 build = false
 
 # Run Chess-compiled binaries through the emulator.
-# As of 2026-02-19: ~27/64 Chess tests pass, ~20 timeout (DMA subsystem
-# gaps), ~6 hit unknown opcodes. Not yet reliable enough to enable by
-# default, but no longer "all timeout."
+# As of 2026-02-19: JNZD fix (f4a9fbf) should resolve ~26 previous
+# timeouts. Expected ~47+ pass, ~6 hit unknown opcodes, rest skipped.
+# Not yet validated with a full Chess run.
 # When false, --chess still builds and runs on hardware (if --hw),
 # but skips the emulator step entirely.
 # Default: false

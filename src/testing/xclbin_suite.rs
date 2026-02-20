@@ -1152,10 +1152,11 @@ impl XclbinSuite {
     fn extract_error_details(&self, engine: &InterpreterEngine) -> Option<TestOutcome> {
         let cycles = engine.total_cycles();
 
-        // Find the core that failed by checking the last decoded bundle
-        // Check each core for error state
-        for col in 0..4usize {
-            for row in 2..6usize {
+        // Find the core that failed by checking all compute tiles.
+        let cols = engine.device().cols();
+        let rows = engine.device().rows();
+        for col in 0..cols {
+            for row in 2..rows {
                 // Get PC from context
                 let pc = engine.core_context(col, row)
                     .map(|ctx| ctx.pc())
