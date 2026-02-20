@@ -191,7 +191,7 @@ fn show_locks_panel(ui: &mut egui::Ui, app: &EmulatorApp, col: u8, row: u8) {
                     if i % 16 == 0 && i > 0 {
                         lock_str.push('\n');
                     }
-                    lock_str.push_str(&format!("{:X}", lock.value.min(15)));
+                    lock_str.push_str(&format!("{:X}", (lock.value.max(0) as u8).min(15)));
                 }
                 ui.monospace(lock_str);
             }

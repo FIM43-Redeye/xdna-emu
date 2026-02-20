@@ -304,7 +304,7 @@ impl ControlUnit {
     ///
     /// Returns (lock_id, expected_value, delta).
     /// Default: expected=1, delta=-1 (simple binary semaphore).
-    fn get_lock_acquire_params(op: &SlotOp) -> (u8, u8, i8) {
+    fn get_lock_acquire_params(op: &SlotOp) -> (u8, i8, i8) {
         // Lock ID from first operand
         let lock_id = op.sources.first().map_or(0, |src| match src {
             Operand::Lock(id) => *id,
@@ -314,7 +314,7 @@ impl ControlUnit {
 
         // Expected value from second operand (default: 1)
         let expected = op.sources.get(1).map_or(1, |src| match src {
-            Operand::Immediate(v) => *v as u8,
+            Operand::Immediate(v) => *v as i8,
             _ => 1,
         });
 

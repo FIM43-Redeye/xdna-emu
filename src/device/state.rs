@@ -30,6 +30,19 @@ use super::registers::{RegisterModule, TileAddress};
 use super::tile::{Tile, TileType};
 use crate::parser::cdo::{Cdo, CdoCommand};
 
+/// Sign-extend a 7-bit lock value from a register u32 to i8.
+///
+/// The Lock_Value register field is bits [6:0], interpreted as a 7-bit
+/// signed integer (-64 to +63).
+fn sign_extend_lock_value(raw: u32) -> i8 {
+    let raw7 = (raw & 0x7F) as u8;
+    if raw7 & 0x40 != 0 {
+        raw7 as i8 | !0x7F_i8 // sign-extend bit 6
+    } else {
+        raw7 as i8
+    }
+}
+
 /// Statistics about CDO application.
 #[derive(Debug, Default)]
 pub struct CdoStats {
@@ -382,6 +395,7 @@ impl DeviceState {
     /// Write a lock value (direct write, no mask).
     ///
     /// Lock registers are 16 bytes (LOCK_STRIDE) apart per AM025.
+    /// Lock_Value field is 7-bit signed (bits 6:0).
     fn write_lock_value(
         tile: &mut Tile,
         tile_addr: TileAddress,
@@ -392,11 +406,13 @@ impl DeviceState {
     ) {
         let lock_idx = ((tile_addr.offset - base) / stride) as usize;
         if lock_idx < tile.locks.len() {
-            tile.locks[lock_idx].set(value as u8);
+            // Lock_Value field is 7-bit signed (bits 6:0)
+            let signed = sign_extend_lock_value(value);
+            tile.locks[lock_idx].set(signed);
             if value != 0 {
                 let tile_type = if is_memtile { "MemTile" } else { "Compute" };
                 log::info!("CDO init {} lock {} on tile ({},{}) = {}",
-                    tile_type, lock_idx, tile_addr.col, tile_addr.row, value);
+                    tile_type, lock_idx, tile_addr.col, tile_addr.row, signed);
             }
         }
     }
@@ -412,9 +428,11 @@ impl DeviceState {
     ) {
         let lock_idx = ((offset - base) / stride) as usize;
         if lock_idx < tile.locks.len() {
-            let current = tile.locks[lock_idx].value as u32;
-            let new_value = (current & !mask) | (value & mask);
-            tile.locks[lock_idx].set(new_value as u8);
+            // Read current value as unsigned 7-bit representation for mask ops
+            let current_u7 = (tile.locks[lock_idx].value as u8 & 0x7F) as u32;
+            let new_raw = (current_u7 & !mask) | (value & mask);
+            let signed = sign_extend_lock_value(new_raw);
+            tile.locks[lock_idx].set(signed);
         }
     }
 

@@ -65,24 +65,23 @@ impl TileParams {
 pub enum LockResult {
     /// Operation succeeded
     Success,
-    /// Operation failed - would underflow (value would go negative)
+    /// Operation failed - would underflow (value would go below -64)
     WouldUnderflow,
-    /// Operation failed - would overflow (value would exceed 63)
+    /// Operation failed - would overflow (value would exceed +63)
     WouldOverflow,
 }
 
 /// Lock state.
 ///
 /// AIE2 uses semaphore locks with acquire/release semantics.
-/// Lock value is 6-bit unsigned (0-63). See AM020 Ch2:
-/// "The semaphore lock has a larger state and no acquired bit;
-/// each lock state is 6-bit unsigned."
+/// Lock value is 7-bit signed (-64 to +63). Per AM025, the
+/// Lock_Value register field is bits [6:0] with sign extension.
 ///
 /// # Semaphore Model (AM025)
 ///
 /// Lock operations use a change_value parameter:
-/// - Acquire: Waits until (value + change_value >= 0), then applies change
-/// - Release: Applies change_value, saturating at MAX_VALUE (63)
+/// - Acquire: Waits until condition met, then applies change
+/// - Release: Applies change_value, clamping to [MIN_VALUE, MAX_VALUE]
 ///
 /// The Lock_Request register format (AM025):
 /// - Lock_Id [13:10]: Which lock (0-15 for compute, 0-63 for mem tile)
@@ -92,28 +91,31 @@ pub enum LockResult {
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
 pub struct Lock {
-    /// Current lock value (semaphore count, 0-63)
-    /// Stored as u8 for efficiency but only lower 6 bits are valid.
-    pub value: u8,
+    /// Current lock value (semaphore count, -64 to +63).
+    /// 7-bit signed per AM025 Lock_Value register field.
+    pub value: i8,
     /// Overflow flag - set when release would exceed MAX_VALUE
     pub overflow: bool,
-    /// Underflow flag - set when acquire would go negative
+    /// Underflow flag - set when acquire would go below MIN_VALUE
     pub underflow: bool,
 }
 
 impl Lock {
-    /// Maximum lock value (6-bit: 0-63).
+    /// Maximum lock value (7-bit signed: +63).
     ///
     /// This compile-time constant is validated against the mlir-aie device
     /// model at startup (see `model::validate_against_spec()`). It is kept
     /// as a const for hot-path efficiency in lock acquire/release.
-    pub const MAX_VALUE: u8 = 63;
+    pub const MAX_VALUE: i8 = 63;
 
-    /// Create a new lock with initial value (clamped to 0-63)
+    /// Minimum lock value (7-bit signed: -64).
+    pub const MIN_VALUE: i8 = -64;
+
+    /// Create a new lock with initial value (clamped to -64..+63)
     #[inline]
-    pub fn new(value: u8) -> Self {
+    pub fn new(value: i8) -> Self {
         Self {
-            value: value.min(Self::MAX_VALUE),
+            value: value.clamp(Self::MIN_VALUE, Self::MAX_VALUE),
             overflow: false,
             underflow: false,
         }
@@ -132,7 +134,7 @@ impl Lock {
         }
     }
 
-    /// Release the lock (increment, saturating at MAX_VALUE).
+    /// Release the lock (increment, clamping at MAX_VALUE).
     ///
     /// This is the simple form equivalent to `release_with_value(1)`.
     #[inline]
@@ -164,7 +166,7 @@ impl Lock {
     /// lock.acquire_with_value(2, -2);
     /// ```
     #[inline]
-    pub fn acquire_with_value(&mut self, expected_value: u8, delta: i8) -> LockResult {
+    pub fn acquire_with_value(&mut self, expected_value: i8, delta: i8) -> LockResult {
         if self.value < expected_value {
             // Not enough value - operation would stall
             return LockResult::WouldUnderflow;
@@ -173,7 +175,7 @@ impl Lock {
         // Apply delta (convert to i16 for safe arithmetic)
         let new_value = (self.value as i16) + (delta as i16);
 
-        if new_value < 0 {
+        if new_value < Self::MIN_VALUE as i16 {
             self.underflow = true;
             return LockResult::WouldUnderflow;
         }
@@ -185,7 +187,7 @@ impl Lock {
             return LockResult::WouldOverflow;
         }
 
-        self.value = new_value as u8;
+        self.value = new_value as i8;
         LockResult::Success
     }
 
@@ -211,7 +213,7 @@ impl Lock {
     /// lock.acquire_equal(2, -2);
     /// ```
     #[inline]
-    pub fn acquire_equal(&mut self, expected_value: u8, delta: i8) -> LockResult {
+    pub fn acquire_equal(&mut self, expected_value: i8, delta: i8) -> LockResult {
         if self.value != expected_value {
             // Value doesn't match exactly - operation would stall
             return LockResult::WouldUnderflow;
@@ -220,7 +222,7 @@ impl Lock {
         // Apply delta (convert to i16 for safe arithmetic)
         let new_value = (self.value as i16) + (delta as i16);
 
-        if new_value < 0 {
+        if new_value < Self::MIN_VALUE as i16 {
             self.underflow = true;
             return LockResult::WouldUnderflow;
         }
@@ -231,7 +233,7 @@ impl Lock {
             return LockResult::WouldOverflow;
         }
 
-        self.value = new_value as u8;
+        self.value = new_value as i8;
         LockResult::Success
     }
 
@@ -255,9 +257,9 @@ impl Lock {
     pub fn release_with_value(&mut self, delta: i8) -> LockResult {
         let new_value = (self.value as i16) + (delta as i16);
 
-        if new_value < 0 {
+        if new_value < Self::MIN_VALUE as i16 {
             self.underflow = true;
-            self.value = 0;
+            self.value = Self::MIN_VALUE;
             return LockResult::WouldUnderflow;
         }
 
@@ -267,14 +269,14 @@ impl Lock {
             return LockResult::WouldOverflow;
         }
 
-        self.value = new_value as u8;
+        self.value = new_value as i8;
         LockResult::Success
     }
 
-    /// Set the lock value directly (clamped to 0-63)
+    /// Set the lock value directly (clamped to -64..+63)
     #[inline]
-    pub fn set(&mut self, value: u8) {
-        self.value = value.min(Self::MAX_VALUE);
+    pub fn set(&mut self, value: i8) {
+        self.value = value.clamp(Self::MIN_VALUE, Self::MAX_VALUE);
     }
 
     /// Clear the overflow and underflow flags.
@@ -567,7 +569,7 @@ pub struct Tile {
     /// Lock value snapshot for cycle-accurate arbitration.
     /// All lock operations within a cycle check against this snapshot,
     /// ensuring all requestors see the same values regardless of processing order.
-    lock_snapshot: Vec<u8>,
+    lock_snapshot: Vec<i8>,
 
     /// Pending lock deltas to apply at end of cycle.
     /// Releases add positive deltas, acquires add negative deltas.
@@ -833,7 +835,7 @@ impl Tile {
     ///
     /// # Returns
     /// `LockResult::Success` if acquire would succeed, error otherwise.
-    pub fn try_acquire_snapshot(&mut self, lock_id: usize, expected: u8, delta: i8, equal_mode: bool) -> LockResult {
+    pub fn try_acquire_snapshot(&mut self, lock_id: usize, expected: i8, delta: i8, equal_mode: bool) -> LockResult {
         if lock_id >= self.locks.len() {
             return LockResult::WouldUnderflow;
         }
@@ -841,7 +843,7 @@ impl Tile {
         // Calculate effective value: snapshot + any deltas already recorded this cycle
         let snapshot_val = self.lock_snapshot[lock_id];
         let delta_val = self.lock_deltas[lock_id];
-        let effective = (snapshot_val as i16 + delta_val as i16) as u8;
+        let effective = (snapshot_val as i16 + delta_val as i16) as i8;
 
         let success = if equal_mode {
             effective == expected
@@ -905,10 +907,10 @@ impl Tile {
             if delta != 0 {
                 let old_value = self.locks[i].value;
                 let new_value = (old_value as i16) + (delta as i16);
-                if new_value < 0 {
+                if new_value < Lock::MIN_VALUE as i16 {
                     self.locks[i].underflow = true;
-                    self.locks[i].value = 0;
-                    log::debug!("Tile({},{}) lock {} end_cycle: {}+({})=0 (clamped, underflow)",
+                    self.locks[i].value = Lock::MIN_VALUE;
+                    log::debug!("Tile({},{}) lock {} end_cycle: {}+({})=MIN (clamped, underflow)",
                         self.col, self.row, i, old_value, delta);
                 } else if new_value > Lock::MAX_VALUE as i16 {
                     self.locks[i].overflow = true;
@@ -916,7 +918,7 @@ impl Tile {
                     log::debug!("Tile({},{}) lock {} end_cycle: {}+({})->MAX (overflow)",
                         self.col, self.row, i, old_value, delta);
                 } else {
-                    self.locks[i].value = new_value as u8;
+                    self.locks[i].value = new_value as i8;
                     log::debug!("Tile({},{}) lock {} end_cycle: {}+({})={}",
                         self.col, self.row, i, old_value, delta, new_value);
                 }
@@ -926,7 +928,7 @@ impl Tile {
 
     /// Get the snapshot value for a lock (for debugging/logging).
     #[inline]
-    pub fn lock_snapshot_value(&self, lock_id: usize) -> u8 {
+    pub fn lock_snapshot_value(&self, lock_id: usize) -> i8 {
         if lock_id < self.locks.len() {
             self.lock_snapshot[lock_id]
         } else {
@@ -1008,10 +1010,16 @@ impl Tile {
             let lock_id = ((offset - lock_base) / lock_stride) as usize;
             let sub_offset = (offset - lock_base) % lock_stride;
             if lock_id < self.locks.len() && sub_offset == 0 {
-                // Lock_value field is bits 5:0 (6-bit unsigned, 0-63)
-                self.locks[lock_id].set((value & 0x3F) as u8);
+                // Lock_value field is bits 6:0 (7-bit signed, -64 to +63)
+                let raw7 = (value & 0x7F) as u8;
+                let signed = if raw7 & 0x40 != 0 {
+                    raw7 as i8 | !0x7F_i8  // sign-extend bit 6
+                } else {
+                    raw7 as i8
+                };
+                self.locks[lock_id].set(signed);
                 log::info!("Tile ({},{}) write_register: Lock{} = {} (raw=0x{:08X})",
-                    self.col, self.row, lock_id, value & 0x3F, value);
+                    self.col, self.row, lock_id, signed, value);
             }
         }
 
@@ -1411,7 +1419,7 @@ impl Tile {
         let result = if is_acquire {
             // Acquire: check if value >= abs(change), then apply delta
             // For acquire, change_value is typically negative (consuming tokens)
-            self.locks[lock_id].acquire_with_value((-change_value).max(0) as u8, change_value)
+            self.locks[lock_id].acquire_with_value((-change_value).max(0), change_value)
         } else {
             // Release: just apply delta (typically positive, releasing tokens)
             self.locks[lock_id].release_with_value(change_value)
@@ -1540,9 +1548,13 @@ mod tests {
 
     #[test]
     fn test_lock_max_value() {
-        // Test clamping at creation
+        // Test clamping at creation (positive overflow)
         let lock = Lock::new(100);
         assert_eq!(lock.value, Lock::MAX_VALUE); // Clamped to 63
+
+        // Test clamping at creation (negative overflow)
+        let lock = Lock::new(-100);
+        assert_eq!(lock.value, Lock::MIN_VALUE); // Clamped to -64
 
         // Test saturation on release
         let mut lock = Lock::new(63);
@@ -1553,8 +1565,12 @@ mod tests {
         let mut lock = Lock::new(0);
         lock.set(50);
         assert_eq!(lock.value, 50);
-        lock.set(200);
+        lock.set(Lock::MAX_VALUE + 1); // would be 64, but i8 can't hold it; test boundary
+        // i8 max is 127, so test with explicit value
+        lock.set(100); // > 63
         assert_eq!(lock.value, 63); // Clamped
+        lock.set(-100); // < -64
+        assert_eq!(lock.value, -64); // Clamped
     }
 
     #[test]
@@ -1658,9 +1674,13 @@ mod tests {
         assert_eq!(lock.release_with_value(-3), LockResult::Success);
         assert_eq!(lock.value, 7);
 
-        // Try to underflow
-        assert_eq!(lock.release_with_value(-10), LockResult::WouldUnderflow);
-        assert_eq!(lock.value, 0);
+        // Large negative delta: goes into negative range (7 - 10 = -3, valid)
+        assert_eq!(lock.release_with_value(-10), LockResult::Success);
+        assert_eq!(lock.value, -3);
+
+        // Push to underflow past MIN_VALUE (-3 - 62 = -65, beyond -64)
+        assert_eq!(lock.release_with_value(-62), LockResult::WouldUnderflow);
+        assert_eq!(lock.value, Lock::MIN_VALUE); // Clamped to -64
         assert!(lock.underflow);
     }
 

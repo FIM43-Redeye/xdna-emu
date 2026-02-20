@@ -39,6 +39,7 @@ use super::{
     COMPUTE_S2MM_CHANNELS, COMPUTE_MM2S_CHANNELS,
     MEM_TILE_S2MM_CHANNELS, MEM_TILE_MM2S_CHANNELS,
 };
+use super::compression;
 use super::transfer::{Transfer, TransferDirection, TransferEndpoint, TransferState};
 use super::timing::{DmaTimingConfig, ChannelTimingState, TransferPhase};
 use crate::device::host_memory::HostMemory;
@@ -1016,8 +1017,15 @@ impl DmaEngine {
             return false;
         }
 
-        // Read data from tile memory in 32-bit words
         let data = tile.data_memory();
+
+        // When compression is enabled, read 32-byte blocks and compress each one.
+        // Compressed output (mask + packed non-zero bytes) is pushed as 32-bit stream words.
+        if self.is_compression_enabled(channel) {
+            return self.transfer_mm2s_compressed(data, offset, bytes, channel, is_last, tlast_suppress);
+        }
+
+        // Uncompressed path: read data from tile memory in 32-bit words
         let word_count = (bytes + 3) / 4;
 
         log::debug!("DMA({},{}) MM2S ch{}: addr=0x{:X} offset=0x{:X} bytes={} words={}",
@@ -1062,6 +1070,75 @@ impl DmaEngine {
         true
     }
 
+    /// MM2S compressed path: read 32-byte blocks, compress, push to stream.
+    ///
+    /// Sparsity compression (AM020 Ch1) operates on 256-bit (32-byte) blocks.
+    /// Each block produces a 32-bit mask followed by packed non-zero bytes,
+    /// padded to a 4-byte boundary. The compressed output is pushed as 32-bit
+    /// stream words.
+    fn transfer_mm2s_compressed(
+        &mut self,
+        data: &[u8],
+        offset: usize,
+        bytes: usize,
+        channel: u8,
+        is_last: bool,
+        tlast_suppress: bool,
+    ) -> bool {
+        const BLOCK_SIZE: usize = 32;
+
+        log::debug!("DMA({},{}) MM2S ch{} COMPRESSED: offset=0x{:X} bytes={}",
+            self.col, self.row, channel, offset, bytes);
+
+        let num_blocks = (bytes + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+        for block_idx in 0..num_blocks {
+            let block_start = offset + block_idx * BLOCK_SIZE;
+            let block_end = (block_start + BLOCK_SIZE).min(offset + bytes).min(data.len());
+            let block_len = block_end - block_start;
+
+            // Pad to 32 bytes if this is a partial final block
+            let mut block = [0u8; BLOCK_SIZE];
+            block[..block_len].copy_from_slice(&data[block_start..block_end]);
+
+            let compressed = match compression::compress(&block) {
+                Some(c) => c,
+                None => {
+                    log::error!("DMA({},{}) MM2S ch{} compression failed at block {}",
+                        self.col, self.row, channel, block_idx);
+                    return false;
+                }
+            };
+
+            log::debug!("DMA({},{}) MM2S ch{} block {}: {} bytes -> {} compressed bytes",
+                self.col, self.row, channel, block_idx, BLOCK_SIZE, compressed.len());
+
+            // Push compressed bytes as 32-bit stream words
+            let compressed_words = compressed.len() / 4;
+            let is_last_block = is_last && block_idx == num_blocks - 1;
+
+            for w in 0..compressed_words {
+                let wi = w * 4;
+                let word = u32::from_le_bytes([
+                    compressed[wi],
+                    compressed[wi + 1],
+                    compressed[wi + 2],
+                    compressed[wi + 3],
+                ]);
+
+                let is_last_word = is_last_block && w == compressed_words - 1;
+                let should_assert_tlast = is_last_word && !tlast_suppress;
+                self.stream_out.push_back(StreamData {
+                    data: word,
+                    tlast: should_assert_tlast,
+                    channel,
+                });
+            }
+        }
+
+        true
+    }
+
     /// S2MM: Read from stream input, write to tile memory.
     ///
     /// Only transfers data that is available in stream_in for the specified channel.
@@ -1085,7 +1162,13 @@ impl DmaEngine {
             return S2mmResult { success: true, stall: true, tlast_received: false, bytes_written: 0 };
         }
 
-        // Write data to tile memory in 32-bit words
+        // When decompression is enabled, consume compressed blocks from stream
+        // and write decompressed 32-byte blocks to memory.
+        if self.is_decompression_enabled(channel) {
+            return self.transfer_s2mm_decompressed(offset, bytes, channel, tile);
+        }
+
+        // Uncompressed path: write data to tile memory in 32-bit words
         let data = tile.data_memory_mut();
         let mut bytes_written = 0;
         let word_count = (bytes + 3) / 4;
@@ -1125,6 +1208,104 @@ impl DmaEngine {
         S2mmResult { success: true, stall: false, tlast_received, bytes_written }
     }
 
+    /// S2MM decompressed path: read compressed blocks from stream, decompress, write to memory.
+    ///
+    /// Sparsity decompression (AM020 Ch1) consumes compressed blocks from the stream.
+    /// Each block starts with a 32-bit mask word, followed by ceil(popcount(mask)/4)
+    /// data words containing packed non-zero bytes. The decompressed 32-byte output
+    /// is written to tile memory.
+    fn transfer_s2mm_decompressed(
+        &mut self,
+        offset: usize,
+        bytes: usize,
+        channel: u8,
+        tile: &mut Tile,
+    ) -> S2mmResult {
+        const BLOCK_SIZE: usize = 32;
+
+        log::debug!("DMA({},{}) S2MM ch{} DECOMPRESSED: offset=0x{:X} bytes={}",
+            self.col, self.row, channel, offset, bytes);
+
+        let mut mem_bytes_written: usize = 0;
+        let mut tlast_received = false;
+
+        // Process compressed blocks until we have written enough decompressed bytes
+        while mem_bytes_written < bytes {
+            // Read the mask word (first word of compressed block)
+            let mask_data = match self.pop_stream_in_for_channel(channel) {
+                Some(sd) => sd,
+                None => break, // No more stream data; partial transfer
+            };
+
+            if mask_data.tlast {
+                // TLAST on the mask word itself -- unusual, but handle gracefully.
+                // Treat as an empty block (mask only, no data bytes).
+                tlast_received = true;
+                break;
+            }
+
+            let mask = mask_data.data;
+            let non_zero_count = mask.count_ones() as usize;
+            let data_bytes_needed = non_zero_count;
+            let data_words_needed = (data_bytes_needed + 3) / 4;
+
+            // Collect the data words for this compressed block
+            let mut compressed_buf = Vec::with_capacity(4 + data_words_needed * 4);
+            compressed_buf.extend_from_slice(&mask.to_le_bytes());
+
+            let mut got_tlast = false;
+            for _ in 0..data_words_needed {
+                match self.pop_stream_in_for_channel(channel) {
+                    Some(sd) => {
+                        compressed_buf.extend_from_slice(&sd.data.to_le_bytes());
+                        if sd.tlast {
+                            got_tlast = true;
+                            break;
+                        }
+                    }
+                    None => break, // Stream starved mid-block
+                }
+            }
+
+            // Decompress (tolerates short input: missing bytes decompress as zero)
+            match compression::decompress(&compressed_buf) {
+                Some(decompressed) => {
+                    let data = tile.data_memory_mut();
+                    let write_len = BLOCK_SIZE.min(bytes - mem_bytes_written);
+                    let dest_start = offset + mem_bytes_written;
+                    let dest_end = (dest_start + write_len).min(data.len());
+                    let actual_write = dest_end - dest_start;
+
+                    data[dest_start..dest_end].copy_from_slice(&decompressed[..actual_write]);
+                    mem_bytes_written += actual_write;
+
+                    log::debug!("DMA({},{}) S2MM ch{} decompressed block: mask=0x{:08X} {} non-zero -> {} bytes to mem",
+                        self.col, self.row, channel, mask, non_zero_count, actual_write);
+                }
+                None => {
+                    log::error!("DMA({},{}) S2MM ch{} decompression failed (mask=0x{:08X}, buf_len={})",
+                        self.col, self.row, channel, mask, compressed_buf.len());
+                    return S2mmResult {
+                        success: false, stall: false, tlast_received: false,
+                        bytes_written: mem_bytes_written,
+                    };
+                }
+            }
+
+            if got_tlast {
+                tlast_received = true;
+                break;
+            }
+        }
+
+        S2mmResult {
+            success: mem_bytes_written > 0,
+            stall: false,
+            tlast_received,
+            bytes_written: mem_bytes_written,
+        }
+    }
+
     /// Shim MM2S: Read from host DDR and queue to stream output.
     ///
     /// # Arguments
@@ -1138,7 +1319,14 @@ impl DmaEngine {
         tlast_suppress: bool,
         host_memory: &HostMemory,
     ) -> bool {
-        // Read data from host memory in 32-bit words
+        // When compression is enabled, read 32-byte blocks and compress
+        if self.is_compression_enabled(channel) {
+            return self.transfer_host_to_stream_compressed(
+                addr, bytes, channel, is_last, tlast_suppress, host_memory,
+            );
+        }
+
+        // Uncompressed path: read data from host memory in 32-bit words
         let word_count = (bytes + 3) / 4;
 
         log::debug!("MM2S transfer: addr=0x{:X} bytes={} words={}", addr, bytes, word_count);
@@ -1165,6 +1353,71 @@ impl DmaEngine {
         true
     }
 
+    /// Shim MM2S compressed path: read 32-byte blocks from host DDR, compress, push to stream.
+    fn transfer_host_to_stream_compressed(
+        &mut self,
+        addr: u64,
+        bytes: usize,
+        channel: u8,
+        is_last: bool,
+        tlast_suppress: bool,
+        host_memory: &HostMemory,
+    ) -> bool {
+        const BLOCK_SIZE: usize = 32;
+
+        log::debug!("Shim MM2S COMPRESSED: addr=0x{:X} bytes={}", addr, bytes);
+
+        let num_blocks = (bytes + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+        for block_idx in 0..num_blocks {
+            let block_start = addr + (block_idx * BLOCK_SIZE) as u64;
+            let block_remaining = bytes - block_idx * BLOCK_SIZE;
+            let block_len = BLOCK_SIZE.min(block_remaining);
+
+            // Read 32-byte block from host memory
+            let mut block = [0u8; BLOCK_SIZE];
+            for i in 0..block_len {
+                let byte_addr = block_start + i as u64;
+                // Read individual bytes using word-aligned reads
+                let word_addr = byte_addr & !3;
+                let byte_offset = (byte_addr & 3) as usize;
+                let word = host_memory.read_u32(word_addr);
+                block[i] = word.to_le_bytes()[byte_offset];
+            }
+
+            let compressed = match compression::compress(&block) {
+                Some(c) => c,
+                None => {
+                    log::error!("Shim MM2S ch{} compression failed at block {}", channel, block_idx);
+                    return false;
+                }
+            };
+
+            let compressed_words = compressed.len() / 4;
+            let is_last_block = is_last && block_idx == num_blocks - 1;
+
+            for w in 0..compressed_words {
+                let wi = w * 4;
+                let word = u32::from_le_bytes([
+                    compressed[wi],
+                    compressed[wi + 1],
+                    compressed[wi + 2],
+                    compressed[wi + 3],
+                ]);
+
+                let is_last_word = is_last_block && w == compressed_words - 1;
+                let should_assert_tlast = is_last_word && !tlast_suppress;
+                self.stream_out.push_back(StreamData {
+                    data: word,
+                    channel,
+                    tlast: should_assert_tlast,
+                });
+            }
+        }
+
+        true
+    }
+
     /// Shim S2MM: Read from stream input and write to host DDR.
     ///
     /// Returns S2mmResult to properly handle stalls when no stream data is available.
@@ -1181,7 +1434,12 @@ impl DmaEngine {
             return S2mmResult { success: true, stall: true, tlast_received: false, bytes_written: 0 };
         }
 
-        // Write data to host memory in 32-bit words
+        // When decompression is enabled, consume compressed blocks from stream
+        if self.is_decompression_enabled(channel) {
+            return self.transfer_stream_to_host_decompressed(addr, bytes, channel, host_memory);
+        }
+
+        // Uncompressed path: write data to host memory in 32-bit words
         let mut bytes_written = 0;
         let word_count = (bytes + 3) / 4;
         let mut tlast_received = false;
@@ -1208,6 +1466,105 @@ impl DmaEngine {
         }
 
         S2mmResult { success: bytes_written > 0, stall: false, tlast_received, bytes_written }
+    }
+
+    /// Shim S2MM decompressed path: read compressed blocks from stream, decompress, write to host DDR.
+    fn transfer_stream_to_host_decompressed(
+        &mut self,
+        addr: u64,
+        bytes: usize,
+        channel: u8,
+        host_memory: &mut HostMemory,
+    ) -> S2mmResult {
+        const BLOCK_SIZE: usize = 32;
+
+        log::debug!("Shim S2MM DECOMPRESSED: addr=0x{:X} bytes={}", addr, bytes);
+
+        let mut mem_bytes_written: usize = 0;
+        let mut tlast_received = false;
+
+        while mem_bytes_written < bytes {
+            // Read the mask word
+            let mask_data = match self.pop_stream_in_for_channel(channel) {
+                Some(sd) => sd,
+                None => break,
+            };
+
+            if mask_data.tlast {
+                tlast_received = true;
+                break;
+            }
+
+            let mask = mask_data.data;
+            let non_zero_count = mask.count_ones() as usize;
+            let data_words_needed = (non_zero_count + 3) / 4;
+
+            let mut compressed_buf = Vec::with_capacity(4 + data_words_needed * 4);
+            compressed_buf.extend_from_slice(&mask.to_le_bytes());
+
+            let mut got_tlast = false;
+            for _ in 0..data_words_needed {
+                match self.pop_stream_in_for_channel(channel) {
+                    Some(sd) => {
+                        compressed_buf.extend_from_slice(&sd.data.to_le_bytes());
+                        if sd.tlast {
+                            got_tlast = true;
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+
+            match compression::decompress(&compressed_buf) {
+                Some(decompressed) => {
+                    let write_len = BLOCK_SIZE.min(bytes - mem_bytes_written);
+                    let dest_addr = addr + mem_bytes_written as u64;
+
+                    // Write decompressed bytes to host memory via word-aligned writes
+                    let full_words = write_len / 4;
+                    for w in 0..full_words {
+                        let wi = w * 4;
+                        let word = u32::from_le_bytes([
+                            decompressed[wi],
+                            decompressed[wi + 1],
+                            decompressed[wi + 2],
+                            decompressed[wi + 3],
+                        ]);
+                        host_memory.write_u32(dest_addr + wi as u64, word);
+                    }
+                    // Handle trailing bytes (partial last word)
+                    let trailing = write_len % 4;
+                    if trailing > 0 {
+                        let wi = full_words * 4;
+                        let mut word_bytes = [0u8; 4];
+                        word_bytes[..trailing].copy_from_slice(&decompressed[wi..wi + trailing]);
+                        host_memory.write_u32(dest_addr + wi as u64, u32::from_le_bytes(word_bytes));
+                    }
+
+                    mem_bytes_written += write_len;
+                }
+                None => {
+                    log::error!("Shim S2MM ch{} decompression failed (mask=0x{:08X})", channel, mask);
+                    return S2mmResult {
+                        success: false, stall: false, tlast_received: false,
+                        bytes_written: mem_bytes_written,
+                    };
+                }
+            }
+
+            if got_tlast {
+                tlast_received = true;
+                break;
+            }
+        }
+
+        S2mmResult {
+            success: mem_bytes_written > 0,
+            stall: false,
+            tlast_received,
+            bytes_written: mem_bytes_written,
+        }
     }
 
     /// Set a transfer error on a channel.
@@ -1276,6 +1633,7 @@ impl DmaEngine {
 
         // Handle lock release if needed
         // Use snapshot-based release for cycle-accurate behavior
+        use crate::device::tile::Lock;
         if let TransferState::ReleasingLock(lock_id) = transfer.state {
             let release_delta = transfer.release_value;
             log::info!("DMA tile({},{}) releasing lock {} with delta {} on channel {} (snapshot-based)",
@@ -1284,7 +1642,7 @@ impl DmaEngine {
                 // Record release as pending delta, applied at cycle end
                 tile.release_snapshot(lock_id as usize, release_delta);
                 let current = tile.locks[lock_id as usize].value;
-                let new_val = (current as i16 + release_delta as i16).clamp(0, 63) as u8;
+                let new_val = (current as i16 + release_delta as i16).clamp(Lock::MIN_VALUE as i16, Lock::MAX_VALUE as i16) as i8;
                 log::info!("Tile({},{}) lock {} pending delta {} (current={}, will be {} at cycle end)",
                     self.col, self.row, lock_id, release_delta, current, new_val);
             }
@@ -1408,13 +1766,13 @@ impl DmaEngine {
         // All lock operations within a cycle check against the snapshot taken at cycle start.
         let (expected, delta, equal_mode) = if acquire_value < 0 {
             // acq_ge: wait until lock >= |value|, then decrement by |value|
-            ((-acquire_value) as u8, acquire_value, false)
+            ((-acquire_value) as i8, acquire_value, false)
         } else if acquire_value > 0 {
             // acq_eq: wait until lock == value, then decrement to 0
-            (acquire_value as u8, -acquire_value, true)
+            (acquire_value as i8, -acquire_value, true)
         } else {
             // acquire_value == 0: simple acquire (decrement if > 0)
-            (1u8, -1i8, false)
+            (1i8, -1i8, false)
         };
 
         let result = tile.try_acquire_snapshot(lock_id as usize, expected, delta, equal_mode);
@@ -2669,5 +3027,170 @@ mod tests {
         assert_eq!(out_word.data, 0x11111111);
         assert!(!out_word.tlast);
         assert_eq!(channel, 2);
+    }
+
+    // === Compression / Decompression Integration Tests ===
+
+    #[test]
+    fn test_mm2s_compression_sparse_data() {
+        let mut engine = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = make_tile();
+
+        // Write sparse data: only bytes 0, 3, 8 are non-zero
+        tile.data_memory_mut()[0] = 5;
+        tile.data_memory_mut()[3] = 3;
+        tile.data_memory_mut()[8] = 7;
+
+        // Enable compression on MM2S channel 2
+        engine.set_channel_compression_config(2, true, false, false);
+
+        let result = engine.transfer_mm2s(0, 32, 2, true, false, &tile);
+        assert!(result);
+
+        // mask + 1 data word (3 bytes + padding) = 2 stream words
+        assert_eq!(engine.stream_out_len(), 2);
+
+        let mask_word = engine.stream_out.pop_front().unwrap();
+        assert_eq!(mask_word.data, (1 << 0) | (1 << 3) | (1 << 8));
+        assert!(!mask_word.tlast);
+
+        let data_word = engine.stream_out.pop_front().unwrap();
+        assert_eq!(data_word.data, u32::from_le_bytes([5, 3, 7, 0]));
+        assert!(data_word.tlast);
+    }
+
+    #[test]
+    fn test_mm2s_compression_all_zeros() {
+        let mut engine = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = make_tile();
+
+        engine.set_channel_compression_config(2, true, false, false);
+
+        let result = engine.transfer_mm2s(0, 32, 2, true, false, &tile);
+        assert!(result);
+
+        // All zeros: just mask word, no data
+        assert_eq!(engine.stream_out_len(), 1);
+        let mask_word = engine.stream_out.pop_front().unwrap();
+        assert_eq!(mask_word.data, 0);
+        assert!(mask_word.tlast);
+    }
+
+    #[test]
+    fn test_s2mm_decompression_round_trip() {
+        let mut engine = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = make_tile();
+
+        tile.data_memory_mut()[0] = 42;
+        tile.data_memory_mut()[15] = 128;
+        tile.data_memory_mut()[31] = 255;
+
+        // MM2S compress from offset 0
+        engine.set_channel_compression_config(2, true, false, false);
+        let result = engine.transfer_mm2s(0, 32, 2, true, false, &tile);
+        assert!(result);
+
+        // Route compressed data from stream_out to stream_in (channel 0)
+        while let Some(sd) = engine.stream_out.pop_front() {
+            engine.push_stream_in(StreamData {
+                data: sd.data,
+                tlast: sd.tlast,
+                channel: 0,
+            });
+        }
+
+        // S2MM decompress to offset 256
+        engine.set_channel_compression_config(0, false, true, false);
+        let result = engine.transfer_s2mm(256, 32, 0, &mut tile);
+        assert!(result.success);
+        assert_eq!(result.bytes_written, 32);
+
+        let data = tile.data_memory();
+        assert_eq!(data[256], 42);
+        assert_eq!(data[256 + 15], 128);
+        assert_eq!(data[256 + 31], 255);
+        for i in 0..32 {
+            if i != 0 && i != 15 && i != 31 {
+                assert_eq!(data[256 + i], 0, "byte {} should be zero", i);
+            }
+        }
+    }
+
+    #[test]
+    fn test_mm2s_no_compression_when_disabled() {
+        let mut engine = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = make_tile();
+
+        tile.data_memory_mut()[0] = 0xAA;
+        tile.data_memory_mut()[1] = 0xBB;
+        tile.data_memory_mut()[2] = 0xCC;
+        tile.data_memory_mut()[3] = 0xDD;
+
+        assert!(!engine.is_compression_enabled(2));
+
+        let result = engine.transfer_mm2s(0, 4, 2, true, false, &tile);
+        assert!(result);
+
+        assert_eq!(engine.stream_out_len(), 1);
+        let word = engine.stream_out.pop_front().unwrap();
+        assert_eq!(word.data, u32::from_le_bytes([0xAA, 0xBB, 0xCC, 0xDD]));
+        assert!(word.tlast);
+    }
+
+    #[test]
+    fn test_s2mm_no_decompression_when_disabled() {
+        let mut engine = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = make_tile();
+
+        engine.push_stream_in(StreamData {
+            data: 0xDEADBEEF,
+            tlast: true,
+            channel: 0,
+        });
+
+        assert!(!engine.is_decompression_enabled(0));
+
+        let result = engine.transfer_s2mm(0, 4, 0, &mut tile);
+        assert!(result.success);
+        assert_eq!(result.bytes_written, 4);
+
+        let data = tile.data_memory();
+        assert_eq!(
+            u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+            0xDEADBEEF,
+        );
+    }
+
+    #[test]
+    fn test_compression_multiple_blocks() {
+        let mut engine = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = make_tile();
+
+        tile.data_memory_mut()[0] = 0x11;
+        tile.data_memory_mut()[32] = 0x22;
+
+        engine.set_channel_compression_config(2, true, false, false);
+
+        let result = engine.transfer_mm2s(0, 64, 2, true, false, &tile);
+        assert!(result);
+
+        // Block 0: mask + data = 2 words; Block 1: mask + data = 2 words
+        assert_eq!(engine.stream_out_len(), 4);
+
+        let w0 = engine.stream_out.pop_front().unwrap();
+        assert_eq!(w0.data, 1u32);
+        assert!(!w0.tlast);
+
+        let w1 = engine.stream_out.pop_front().unwrap();
+        assert_eq!(w1.data, u32::from_le_bytes([0x11, 0, 0, 0]));
+        assert!(!w1.tlast);
+
+        let w2 = engine.stream_out.pop_front().unwrap();
+        assert_eq!(w2.data, 1u32);
+        assert!(!w2.tlast);
+
+        let w3 = engine.stream_out.pop_front().unwrap();
+        assert_eq!(w3.data, u32::from_le_bytes([0x22, 0, 0, 0]));
+        assert!(w3.tlast);
     }
 }
