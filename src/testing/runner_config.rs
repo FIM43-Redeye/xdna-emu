@@ -52,6 +52,9 @@ pub struct ChessConfig {
     pub run_emulator: bool,
     /// Run Chess-compiled binaries on real NPU hardware.
     pub run_hardware: bool,
+    /// Use Chess as the primary compiler for ALL tests (skip Peano entirely).
+    /// Temporary option while the IRON/Peano stack matures.
+    pub chess_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +105,7 @@ impl Default for ChessConfig {
             build: false,
             run_emulator: false,
             run_hardware: true,
+            chess_only: false,
         }
     }
 }
@@ -149,6 +153,9 @@ impl RunnerConfig {
     pub fn print_active_overrides(&self) {
         let d = Self::default();
         let mut overrides = Vec::new();
+        if self.chess.chess_only != d.chess.chess_only {
+            overrides.push(format!("chess.chess_only={}", self.chess.chess_only));
+        }
         if self.chess.run_emulator != d.chess.run_emulator {
             overrides.push(format!("chess.run_emulator={}", self.chess.run_emulator));
         }
@@ -210,6 +217,8 @@ pub struct Options {
     /// Hardware-only mode: skip emulator, run only on real NPU hardware.
     /// Useful for validating known-good tests quickly on real silicon.
     pub hw_only: bool,
+    /// Use Chess as the primary compiler for ALL tests (skip Peano entirely).
+    pub chess_only: bool,
 }
 
 /// Parse CLI arguments and merge with runner config.
@@ -226,6 +235,7 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
     let mut unit_tests = false;
     let mut no_build = false;
     let mut no_chess = false;
+    let mut chess_only = false;
     let mut iter = args.iter();
 
     while let Some(arg) = iter.next() {
@@ -235,6 +245,7 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
             // --chess is accepted for backward compat but is now the default
             "--chess" => {}
             "--no-chess" => no_chess = true,
+            "--chess-only" => chess_only = true,
             // --hw is accepted for backward compat but is now the default
             "--hw" => hw = true,
             "--no-hw" => hw = false,
@@ -259,7 +270,7 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
             _ if !arg.starts_with('-') => filters.push(arg.clone()),
             other => {
                 eprintln!("Unknown option: {}", other);
-                eprintln!("Usage: run_mlir_aie_tests [--verbose|-v] [-j N] [--elfanalyze] [--no-chess] [--no-hw] [--hw-only] [--aiesim] [--unit-tests] [--full] [--no-build] [FILTER...]");
+                eprintln!("Usage: run_mlir_aie_tests [--verbose|-v] [-j N] [--elfanalyze] [--no-chess] [--chess-only] [--no-hw] [--hw-only] [--aiesim] [--unit-tests] [--full] [--no-build] [FILTER...]");
                 std::process::exit(1);
             }
         }
@@ -282,9 +293,12 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
             .unwrap_or(4);
     }
 
+    // Merge chess_only from CLI and config.
+    let chess_only = chess_only || config.chess.chess_only;
+
     // Chess builds are ON by default (auto-detected from aietools).
-    // --no-chess explicitly disables.
-    let chess_build = !no_chess;
+    // --no-chess explicitly disables. --chess-only implies chess_build.
+    let chess_build = if chess_only { true } else { !no_chess };
     let chess_emulator = if chess_build { config.chess.run_emulator } else { false };
     let chess_hardware = if chess_build { config.chess.run_hardware } else { false };
     let aiesim = if aiesim { true } else if chess_build { config.aiesim.enabled } else { false };
@@ -309,6 +323,7 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
         unit_tests_aiesim_timeout: config.unit_tests.aiesim_timeout,
         no_build,
         hw_only,
+        chess_only,
     }
 }
 

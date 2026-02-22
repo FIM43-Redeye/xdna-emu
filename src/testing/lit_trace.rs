@@ -80,6 +80,8 @@ pub struct TraceConfig {
     /// [`crate::config::Config::aietools_path`] which checks, in order:
     /// `AIETOOLS_PATH`, `XILINX_VITIS_AIETOOLS`, config file, sibling dir.
     pub aietools_path: Option<PathBuf>,
+    /// Use Chess compiler instead of Peano for the compile stage.
+    pub use_chess: bool,
 }
 
 impl TraceConfig {
@@ -123,6 +125,7 @@ impl Default for TraceConfig {
             compile_timeout: 600,
             execute_timeout: 120,
             aietools_path: None,
+            use_chess: false,
         }
     }
 }
@@ -135,7 +138,7 @@ impl Default for TraceConfig {
 ///
 /// Falls back to joining with the current directory if the path does not
 /// exist on disk (e.g. build output directories that will be created later).
-fn abs_dir(p: PathBuf) -> PathBuf {
+pub(crate) fn abs_dir(p: PathBuf) -> PathBuf {
     fs::canonicalize(&p).unwrap_or_else(|_| {
         if p.is_absolute() {
             p
@@ -153,7 +156,7 @@ fn abs_dir(p: PathBuf) -> PathBuf {
 /// to the system Python binary, and Python uses the *symlink* path to locate
 /// its `sys.prefix` (and therefore site-packages).  Using `canonicalize`
 /// would resolve through to `/usr/bin/python3.13`, losing the venv.
-fn make_absolute(p: PathBuf) -> PathBuf {
+pub(crate) fn make_absolute(p: PathBuf) -> PathBuf {
     let full = if p.is_absolute() {
         p
     } else {
@@ -184,7 +187,7 @@ fn make_absolute(p: PathBuf) -> PathBuf {
 /// Built once from a [`TraceConfig`] and applied to every subprocess so
 /// that Python scripts, aiecc.py, and the Peano compiler all find their
 /// dependencies regardless of the runner's cwd.
-struct SubprocessEnv {
+pub(crate) struct SubprocessEnv {
     path: String,
     pythonpath: String,
     ld_library_path: String,
@@ -194,7 +197,7 @@ struct SubprocessEnv {
 
 impl SubprocessEnv {
     /// Build the environment from a resolved [`TraceConfig`].
-    fn from_config(config: &TraceConfig) -> Self {
+    pub(crate) fn from_config(config: &TraceConfig) -> Self {
         // -- PATH --
         // Prepend: venv bin, mlir-aie install/bin, XRT bin
         let mut path_dirs: Vec<String> = Vec::new();
@@ -255,7 +258,7 @@ impl SubprocessEnv {
     }
 
     /// Apply this environment to a [`Command`].
-    fn apply(&self, cmd: &mut Command) {
+    pub(crate) fn apply(&self, cmd: &mut Command) {
         cmd.env("PATH", &self.path)
             .env("PYTHONPATH", &self.pythonpath)
             .env("LD_LIBRARY_PATH", &self.ld_library_path);
@@ -267,7 +270,7 @@ impl SubprocessEnv {
 }
 
 /// Push a directory path into the list if it exists on disk.
-fn push_if_dir(dirs: &mut Vec<String>, path: &Path) {
+pub(crate) fn push_if_dir(dirs: &mut Vec<String>, path: &Path) {
     if path.is_dir() {
         dirs.push(path.to_string_lossy().into_owned());
     }
@@ -277,40 +280,65 @@ fn push_if_dir(dirs: &mut Vec<String>, path: &Path) {
 // Staleness checking
 // ---------------------------------------------------------------------------
 
+/// Config fingerprint for staleness checking.
+///
+/// Any change to these values means the build is stale even if source
+/// files haven't changed.  Encoded as a simple `key=value` string so
+/// that switching compilers or trace buffer sizes forces a rebuild.
+pub(crate) fn config_fingerprint(config: &TraceConfig) -> String {
+    format!(
+        "compiler={};trace_size={}",
+        if config.use_chess { "chess" } else { "peano" },
+        config.trace_size,
+    )
+}
+
 /// Check whether a test's traced build is up-to-date.
 ///
 /// Compares SHA256 of the upstream source and the inject tool against
-/// cached hashes in the test build directory.  If both match and the
-/// xclbin exists, returns true (skip inject + compile).
-fn is_up_to_date(test_build_dir: &Path, upstream_dir: &Path, inject_tool: &Path) -> bool {
+/// cached hashes in the test build directory, plus the config fingerprint.
+/// All three must match and the xclbin must exist to return true (skip
+/// inject + compile).
+pub(crate) fn is_up_to_date(
+    test_build_dir: &Path,
+    upstream_dir: &Path,
+    inject_tool: &Path,
+    config_fp: &str,
+) -> bool {
     let xclbin = test_build_dir.join("aie.xclbin");
     if !xclbin.exists() {
         return false;
     }
 
-    let source_hash_file = test_build_dir.join(".source-hash");
-    let inject_hash_file = test_build_dir.join(".inject-hash");
-
     let current_source_hash = hash_directory_sources(upstream_dir);
     let current_inject_hash = hash_file(inject_tool);
 
-    let cached_source = fs::read_to_string(&source_hash_file).unwrap_or_default();
-    let cached_inject = fs::read_to_string(&inject_hash_file).unwrap_or_default();
+    let cached_source = fs::read_to_string(test_build_dir.join(".source-hash")).unwrap_or_default();
+    let cached_inject = fs::read_to_string(test_build_dir.join(".inject-hash")).unwrap_or_default();
+    let cached_config = fs::read_to_string(test_build_dir.join(".config-hash")).unwrap_or_default();
 
-    cached_source.trim() == current_source_hash && cached_inject.trim() == current_inject_hash
+    cached_source.trim() == current_source_hash
+        && cached_inject.trim() == current_inject_hash
+        && cached_config.trim() == config_fp
 }
 
 /// Write staleness hashes after a successful inject + compile.
-fn write_hashes(test_build_dir: &Path, upstream_dir: &Path, inject_tool: &Path) {
+pub(crate) fn write_hashes(
+    test_build_dir: &Path,
+    upstream_dir: &Path,
+    inject_tool: &Path,
+    config_fp: &str,
+) {
     let source_hash = hash_directory_sources(upstream_dir);
     let inject_hash = hash_file(inject_tool);
 
     fs::write(test_build_dir.join(".source-hash"), &source_hash).ok();
     fs::write(test_build_dir.join(".inject-hash"), &inject_hash).ok();
+    fs::write(test_build_dir.join(".config-hash"), config_fp).ok();
 }
 
 /// SHA256 of all source files in a test directory (aie.mlir, aie2.py, test.cpp).
-fn hash_directory_sources(dir: &Path) -> String {
+pub(crate) fn hash_directory_sources(dir: &Path) -> String {
     let mut hasher = Sha256::new();
     let mut found_any = false;
 
@@ -404,7 +432,7 @@ fn run_inject(
 /// Copy or symlink kernel source files (.cc, .cpp, .h) from the upstream
 /// test directory into the build directory so that aiecc.py can find them
 /// during compilation (link_with = "kernel.o" requires the source nearby).
-fn copy_kernel_sources(upstream_dir: &Path, build_dir: &Path) {
+pub(crate) fn copy_kernel_sources(upstream_dir: &Path, build_dir: &Path) {
     let extensions = ["cc", "cpp", "h"];
     if let Ok(entries) = fs::read_dir(upstream_dir) {
         for entry in entries.flatten() {
@@ -439,7 +467,7 @@ fn copy_kernel_sources(upstream_dir: &Path, build_dir: &Path) {
 }
 
 /// Read extra aiecc.py flags written by trace-inject.py (e.g. --dynamic-objFifos).
-fn read_extra_aiecc_flags(test_build_dir: &Path) -> Vec<String> {
+pub(crate) fn read_extra_aiecc_flags(test_build_dir: &Path) -> Vec<String> {
     let flags_file = test_build_dir.join(".aiecc-extra-flags");
     match fs::read_to_string(&flags_file) {
         Ok(content) => content
@@ -456,7 +484,7 @@ fn read_extra_aiecc_flags(test_build_dir: &Path) -> Vec<String> {
 /// Many npu-xrt tests have external kernel code (kernel.cc, scale.cc, etc.)
 /// that must be compiled to .o files before aiecc.py can link them into
 /// the ELF.  The original lit tests use xchesscc_wrapper for this.
-fn compile_kernels(
+pub(crate) fn compile_kernels(
     test_build_dir: &Path,
     config: &TraceConfig,
     env: &SubprocessEnv,
@@ -540,7 +568,7 @@ fn compile_kernels(
 }
 
 /// Run the compile stage: aiecc.py on the traced MLIR.
-fn run_compile(
+pub(crate) fn run_compile(
     test_name: &str,
     test_build_dir: &Path,
     config: &TraceConfig,
@@ -556,6 +584,13 @@ fn run_compile(
         .arg("--no-compile-host")
         .arg("--xclbin-name=aie.xclbin")
         .arg("--npu-insts-name=insts.bin");
+
+    // Compiler selection: explicit about which compiler aiecc.py should use.
+    if config.use_chess {
+        cmd.arg("--xchesscc").arg("--xbridge");
+    } else {
+        cmd.arg("--no-xchesscc").arg("--no-xbridge");
+    }
 
     // Apply extra flags from trace-inject.py (e.g. --dynamic-objFifos)
     for flag in read_extra_aiecc_flags(test_build_dir) {
@@ -649,9 +684,10 @@ pub fn run_trace_pipeline(
     let test_build_dir = config.build_traced_dir.join(test_name);
     let trace_output_dir = config.traces_dir.join(test_name);
     let inject_tool = config.xdna_emu_root.join("tools/trace-inject.py");
+    let config_fp = config_fingerprint(config);
 
     // Staleness check
-    let needs_rebuild = !is_up_to_date(&test_build_dir, upstream_dir, &inject_tool);
+    let needs_rebuild = !is_up_to_date(&test_build_dir, upstream_dir, &inject_tool, &config_fp);
 
     if needs_rebuild {
         // Create build directory
@@ -693,7 +729,7 @@ pub fn run_trace_pipeline(
         }
 
         // Write staleness hashes after successful inject + compile
-        write_hashes(&test_build_dir, upstream_dir, &inject_tool);
+        write_hashes(&test_build_dir, upstream_dir, &inject_tool, &config_fp);
     }
 
     // Stage 3: Execute (always runs -- traces are the point)
@@ -813,6 +849,7 @@ mod tests {
             &tmp,
             Path::new("/nonexistent"),
             Path::new("/nonexistent"),
+            "compiler=peano;trace_size=1048576",
         ));
         fs::remove_dir_all(&tmp).ok();
     }

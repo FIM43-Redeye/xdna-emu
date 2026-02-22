@@ -369,6 +369,8 @@ pub struct ParallelBuildConfig {
     pub verbose: bool,
     /// Generate simulation artifacts (--aiesim).
     pub gen_sim: bool,
+    /// Use Chess as the primary compiler for ALL tests (skip Peano).
+    pub chess_only: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -412,7 +414,7 @@ pub fn run_parallel_builds(
             continue;
         }
 
-        let is_chess_only = test.requires_chess();
+        let is_chess_only = config.chess_only || test.requires_chess();
         if is_chess_only && !chess_available {
             skipped_no_chess += 1;
             continue;
@@ -470,6 +472,9 @@ pub fn run_parallel_builds(
     let total_skipped = skipped_npu2 + skipped_no_chess + skipped_no_steps;
 
     println!("\n=== BUILD PHASE ===");
+    if config.chess_only {
+        println!("Mode: --chess-only (all tests use Chess compiler)");
+    }
     println!(
         "{} tests ({} builds: {} primary, {} comparison), {} skipped \
          (npu2: {}, no chess: {}, no steps: {})",

@@ -252,6 +252,52 @@ pub fn export_perfetto(
     Ok(())
 }
 
+/// Offset all `pid` fields in a Perfetto JSON string and prefix process_name args.
+///
+/// Used by the trace merge pipeline to separate traces from different sources
+/// (NPU hardware, emulator, aiesimulator) into distinct PID ranges within a
+/// single combined Perfetto JSON file.
+///
+/// This operates on raw JSON text via line-by-line regex replacement rather
+/// than full JSON parsing, keeping the dependency footprint minimal and
+/// handling the simple, regular structure of Perfetto trace event arrays.
+///
+/// # Arguments
+///
+/// * `json` - Perfetto JSON string (array of trace event objects)
+/// * `pid_offset` - Value to add to every `"pid":N` field
+/// * `name_prefix` - Prefix for process_name metadata args (e.g. "Emulator: ")
+pub fn offset_perfetto_pids(json: &str, pid_offset: i64, name_prefix: &str) -> String {
+    // Match "pid":N where N is a non-negative integer
+    let pid_re = regex::Regex::new(r#""pid"\s*:\s*(\d+)"#).unwrap();
+    // Match "name":"..." inside process_name metadata args
+    let pname_re = regex::Regex::new(
+        r#"("name"\s*:\s*"process_name".*?"args"\s*:\s*\{[^}]*"name"\s*:\s*")([^"]*)"#
+    ).unwrap();
+
+    let mut result = String::with_capacity(json.len() + json.len() / 10);
+
+    for line in json.lines() {
+        let mut modified = pid_re.replace_all(line, |caps: &regex::Captures| {
+            let old_pid: i64 = caps[1].parse().unwrap_or(0);
+            let new_pid = old_pid + pid_offset;
+            format!(r#""pid":{}"#, new_pid)
+        }).to_string();
+
+        // Prefix process_name if this line is a process_name metadata event
+        if modified.contains("\"process_name\"") && !name_prefix.is_empty() {
+            modified = pname_re.replace(&modified, |caps: &regex::Captures| {
+                format!("{}{}{}", &caps[1], name_prefix, &caps[2])
+            }).to_string();
+        }
+
+        result.push_str(&modified);
+        result.push('\n');
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +393,47 @@ mod tests {
         // Begin at ts=100, End at ts=105 (5 cycle duration)
         assert!(json.contains(r#""ts":100"#));
         assert!(json.contains(r#""ts":105"#));
+    }
+
+    #[test]
+    fn test_offset_perfetto_pids_basic() {
+        let json = r#"[
+{"name":"process_name","ph":"M","pid":0,"args":{"name":"core_trace for tile2,0"}},
+{"name":"INSTR_LOAD","ph":"B","pid":0,"tid":1,"ts":10,"args":{}}
+]"#;
+        let result = offset_perfetto_pids(json, 100, "Emulator: ");
+
+        // PID should be shifted to 100
+        assert!(result.contains(r#""pid":100"#));
+        assert!(!result.contains(r#""pid":0"#));
+
+        // process_name should be prefixed
+        assert!(result.contains("Emulator: core_trace for tile2,0"));
+    }
+
+    #[test]
+    fn test_offset_perfetto_pids_no_prefix() {
+        let json = r#"{"name":"INSTR_LOAD","ph":"B","pid":5,"tid":1,"ts":10,"args":{}}"#;
+        let result = offset_perfetto_pids(json, 0, "");
+        // PID unchanged when offset is 0
+        assert!(result.contains(r#""pid":5"#));
+    }
+
+    #[test]
+    fn test_offset_perfetto_pids_multiple() {
+        let json = r#"[
+{"name":"process_name","ph":"M","pid":0,"args":{"name":"core_trace for tile2,0"}},
+{"name":"process_name","ph":"M","pid":1,"args":{"name":"mem_trace for tile2,0"}},
+{"name":"INSTR_LOAD","ph":"B","pid":0,"tid":1,"ts":10,"args":{}},
+{"name":"DMA_START_TASK","ph":"B","pid":1,"tid":0,"ts":15,"args":{}}
+]"#;
+        let result = offset_perfetto_pids(json, 200, "aiesimulator: ");
+
+        assert!(result.contains(r#""pid":200"#));
+        assert!(result.contains(r#""pid":201"#));
+        assert!(!result.contains(r#""pid":0"#));
+        assert!(!result.contains(r#""pid":1,"#));
+        assert!(result.contains("aiesimulator: core_trace"));
+        assert!(result.contains("aiesimulator: mem_trace"));
     }
 }

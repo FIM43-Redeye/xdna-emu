@@ -594,6 +594,15 @@ impl XclbinSuite {
         (outcome, output)
     }
 
+    /// Run a single test and return trace events for Perfetto export.
+    ///
+    /// Unlike `run_single()` which discards internal details, this exposes
+    /// the emulator's per-tile trace events. Used by the triple trace
+    /// comparison pipeline to generate `emu-trace.json`.
+    pub fn run_single_with_trace(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Vec<crate::interpreter::engine::TileTracedEvent>) {
+        self.run_single_inner(test)
+    }
+
     /// Run a single test with full cross-validation results.
     ///
     /// Returns the test outcome, raw output, and optional hardware

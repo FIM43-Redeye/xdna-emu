@@ -29,6 +29,7 @@ pub mod process_control;
 pub mod lit_wrapper;
 pub mod lit_progress;
 pub mod lit_trace;
+pub mod trace_compare;
 
 pub use xclbin_suite::{XclbinSuite, XclbinTest, TestOutcome, Compiler};
 pub use opcode_collector::{UnknownOpcode, OpcodeCollector};

@@ -11,6 +11,7 @@
 //!   -j N              Run N tests in parallel (default: auto, up to 8)
 //!   --elfanalyze      Run elfanalyzer on each test's ELFs (requires aietools)
 //!   --no-chess        Disable Chess compiler builds (Chess is auto-detected by default)
+//!   --chess-only      Use Chess as the primary compiler for all tests (skip Peano)
 //!   --no-hw           Disable NPU hardware validation (auto-detected by default)
 //!   --aiesim          Run aiesimulator on Chess-built .prj (requires aietools)
 //!   --unit-tests      Run mlir-aie chess_compiler_tests_aie2 unit tests (requires aietools)
@@ -28,6 +29,7 @@
 //!   cargo run --example run_mlir_aie_tests -- -j 8                # run 8 tests at once
 //!   cargo run --example run_mlir_aie_tests -- --elfanalyze add_one  # ELF analysis
 //!   cargo run --example run_mlir_aie_tests -- --no-chess add_one    # Peano only (skip Chess)
+//!   cargo run --example run_mlir_aie_tests -- --chess-only add_one   # Chess only (skip Peano)
 //!   cargo run --example run_mlir_aie_tests -- --no-hw add_one       # skip real NPU
 //!   cargo run --example run_mlir_aie_tests -- --full add_one        # full validation matrix
 //!   cargo run --example run_mlir_aie_tests -- --full                # full validation, all tests
@@ -76,6 +78,11 @@ fn main() {
     let aietools = AieTools::discover(config);
     let chess_available = opts.chess_build && aietools.as_ref()
         .map_or(false, |t| t.xchesscc.is_some());
+
+    if opts.chess_only && !chess_available {
+        eprintln!("Error: --chess-only requires aietools with xchesscc");
+        std::process::exit(1);
+    }
 
     if let Some(ref tools) = aietools {
         println!("aietools: {}", tools.summary());
@@ -211,6 +218,7 @@ fn main() {
                 nice_level: opts.build_nice,
                 verbose: opts.verbose,
                 gen_sim: opts.aiesim,
+                chess_only: opts.chess_only,
             },
         );
 

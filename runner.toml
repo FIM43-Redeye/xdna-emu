@@ -39,6 +39,12 @@ run_emulator = false
 # Default: true
 run_hardware = true
 
+# Use Chess as the primary compiler for ALL tests (skip Peano entirely).
+# Temporary option while the IRON/Peano stack matures.
+# Requires aietools with xchesscc.
+# Default: false
+chess_only = false
+
 [aiesim]
 # Run aiesimulator on Chess-built .prj directories.
 # Currently blocked: ps.so symbol mismatch prevents aiesimulator from
