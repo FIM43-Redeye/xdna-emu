@@ -148,6 +148,22 @@ fn sign_extend_raw(value: u64, width: u8) -> i64 {
     }
 }
 
+/// Returns true if this operand type can be a write destination.
+///
+/// Register kinds (scalar, vector, accum, pointer, modifier) are writable.
+/// Immediates, locks, DMA channels, buffer descriptors, and memory operands
+/// are not valid write targets.
+fn can_be_dest(operand: &Operand) -> bool {
+    matches!(
+        operand,
+        Operand::ScalarReg(_)
+            | Operand::VectorReg(_)
+            | Operand::AccumReg(_)
+            | Operand::PointerReg(_)
+            | Operand::ModifierReg(_)
+    )
+}
+
 /// Global cached decoder, loaded once on first use.
 /// This avoids repeatedly parsing TableGen files for each core.
 static CACHED_DECODER: OnceLock<InstructionDecoder> = OnceLock::new();
@@ -820,7 +836,7 @@ impl InstructionDecoder {
         decoded: &DecodedInstr,
         field_operands: &std::collections::HashMap<String, Operand>,
         direct_dest: Option<Operand>,
-        extra_sources: Vec<Operand>,
+        mut extra_sources: Vec<Operand>,
     ) -> (Option<Operand>, Vec<Operand>) {
         let output_order = &decoded.encoding.output_order;
         let input_order = &decoded.encoding.input_order;
@@ -846,6 +862,21 @@ impl InstructionDecoder {
                 decoded.encoding.name,
             );
             self.find_dest_heuristic(field_operands)
+        };
+
+        // Validate: dest must be a writable operand type.
+        // If an Immediate or other non-writable operand ended up here (from a
+        // heuristic mismatch or bad output_order resolution), move it to sources.
+        let dest = match dest {
+            Some(d) if !can_be_dest(&d) => {
+                log::warn!(
+                    "[DECODE] Non-writable {:?} in dest for '{}', moving to sources",
+                    d, decoded.encoding.name,
+                );
+                extra_sources.insert(0, d);
+                None
+            }
+            other => other,
         };
 
         // Extract sources from input_order

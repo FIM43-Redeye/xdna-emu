@@ -359,6 +359,8 @@ pub struct OperandField {
     pub signed: bool,
     /// Data-driven operand type (determines how raw bits become an Operand)
     pub operand_type: OperandType,
+    /// Whether this operand is an output (destination). From TableGen (outs) vs (ins).
+    pub is_output: bool,
     /// Non-contiguous fragments. Empty for contiguous fields.
     pub fragments: Vec<FieldFragment>,
 }
@@ -372,6 +374,7 @@ impl OperandField {
             width,
             signed: false,
             operand_type: OperandType::Unknown,
+            is_output: false,
             fragments: Vec::new(),
         }
     }
@@ -697,9 +700,11 @@ impl<'a> Resolver<'a> {
                 .find(|od| od.name == field.name)
             {
                 field.operand_type = classify_operand_type(&opdef.reg_class, &field.name);
+                field.is_output = opdef.is_output;
             } else {
                 // No matching OperandDef -- use field-name fallback
                 field.operand_type = classify_operand_type("", &field.name);
+                // is_output stays false (safe default: unknowns are inputs)
             }
             // Sync signed flag from operand type
             if let OperandType::Immediate { signed: true, .. } = &field.operand_type {
@@ -980,6 +985,7 @@ fn add_lng_control_flow_encodings(by_slot: &mut HashMap<String, Vec<InstrEncodin
         width: 20,
         signed: false,
         operand_type: OperandType::Immediate { signed: false, scale: 1 },
+        is_output: false,
         fragments: vec![],
     };
 
@@ -2521,7 +2527,7 @@ mod tests {
 
     #[test]
     fn test_operand_type_populated_on_resolve() {
-        // Verify that resolve_instruction populates operand_type on fields
+        // Verify that resolve_instruction populates operand_type and is_output on fields
         let data = make_test_data();
         let resolver = Resolver::new(&data);
 
@@ -2535,6 +2541,16 @@ mod tests {
                 OperandType::Register(RegisterKind::Scalar),
                 "Field '{}' should be classified as Scalar register",
                 field.name
+            );
+        }
+
+        // Verify is_output: mRx is the output, mRx0 and mRy are inputs
+        for field in &encoding.operand_fields {
+            let expected_output = field.name == "mRx";
+            assert_eq!(
+                field.is_output, expected_output,
+                "Field '{}' is_output should be {}",
+                field.name, expected_output,
             );
         }
     }

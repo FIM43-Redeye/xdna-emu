@@ -206,13 +206,30 @@ fn write_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: u32) {
 }
 
 /// Write a value to an operand.
+///
+/// Three categories:
+/// - Scalar/pointer/modifier: fully implemented, write to register file.
+/// - Vector/accum: valid destinations, but writes are handled by VectorAlu.
+///   Only reaches here if a scalar semantic op has vector operands (misclassification).
+/// - Non-writable (Immediate, Lock, etc.): should never reach here after decoder
+///   validation in `extract_ordered_operands`. Debug-assert to catch regressions.
 fn write_operand(operand: &Operand, ctx: &mut ExecutionContext, value: u32) {
     match operand {
         Operand::ScalarReg(r) => ctx.scalar.write(*r, value),
         Operand::PointerReg(r) => ctx.pointer.write(*r, value),
         Operand::ModifierReg(r) => ctx.modifier.write(*r, value),
+        Operand::VectorReg(_) | Operand::AccumReg(_) => {
+            log::trace!(
+                "[SEMANTIC] Vector/accum register write not yet implemented: {:?}",
+                operand,
+            );
+        }
         _ => {
-            log::warn!("[SEMANTIC] Cannot write to operand: {:?}", operand);
+            debug_assert!(
+                false,
+                "write_operand called with non-writable operand: {:?}",
+                operand,
+            );
         }
     }
 }
