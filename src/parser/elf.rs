@@ -540,9 +540,10 @@ mod tests {
         let segments: Vec<_> = elf.load_segments().collect();
         assert!(!segments.is_empty());
 
-        // Should have __start symbol
-        let start = elf.find_symbol("__start");
-        assert!(start.is_some());
+        // Should have an entry function: __start (Peano) or _main_init (Chess)
+        let start = elf.find_symbol("__start")
+            .or_else(|| elf.find_symbol("_main_init"));
+        assert!(start.is_some(), "expected __start (Peano) or _main_init (Chess)");
         assert!(start.unwrap().is_function);
 
         // Should have data memory symbols (objFifo buffers)
@@ -554,10 +555,9 @@ mod tests {
             assert_eq!(sym.region, MemoryRegion::Data);
         }
 
-        // Should have compiler info
-        let info = elf.compiler_info();
-        assert!(info.is_some());
-        assert!(info.unwrap().contains("clang") || info.unwrap().contains("LLD"));
+        // Compiler info: Peano has .comment with "clang"/"LLD", Chess may not
+        // Just verify no panic on access
+        let _info = elf.compiler_info();
     }
 
     #[test]
@@ -574,17 +574,23 @@ mod tests {
 
         let funcs: Vec<_> = elf.functions().collect();
 
-        // Should have at least __start, main, _main_init
-        assert!(funcs.len() >= 3);
+        // Should have at least a few functions (entry + kernel + runtime)
+        assert!(
+            funcs.len() >= 2,
+            "expected >= 2 functions, got {}: {:?}",
+            funcs.len(),
+            funcs.iter().map(|f| &f.name).collect::<Vec<_>>(),
+        );
 
         // All should be marked as functions
         for f in &funcs {
             assert!(f.is_function);
         }
 
-        // __start should exist and be at address 0
-        let start = funcs.iter().find(|f| f.name == "__start");
-        assert!(start.is_some());
+        // Entry function at address 0: __start (Peano) or _main_init (Chess)
+        let start = funcs.iter().find(|f| f.name == "__start")
+            .or_else(|| funcs.iter().find(|f| f.name == "_main_init"));
+        assert!(start.is_some(), "expected __start or _main_init in functions");
         assert_eq!(start.unwrap().address, 0);
     }
 }

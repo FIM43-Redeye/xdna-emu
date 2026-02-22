@@ -395,6 +395,13 @@ cargo flamegraph --release -- path/to/binary.xclbin
 files from llvm-aie. The test script runs them with `nice -n 19` and limited
 parallelism to avoid overwhelming the system during other work.
 
+**Long-running commands**: Never pipe a long-running command through `tail`,
+`head`, or any filter that buffers -- the output will appear to hang because
+the filter waits for EOF. Instead, redirect output to a file and read it
+afterward, or use `run_in_background` and check the output file with Read.
+The same applies to `dmesg -w` and other streaming commands: redirect to a
+file, never pipe interactively.
+
 ## How To Begin
 
 1. Read [ROADMAP.md](ROADMAP.md) for the development plan and confidence markers

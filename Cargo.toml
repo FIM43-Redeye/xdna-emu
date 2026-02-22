@@ -30,6 +30,7 @@ byteorder = "1.5"                                       # Byte order utilities f
 dirs = "6"                                              # Platform-specific config directories
 crossterm = "0.29"                                       # Terminal control for build progress grid
 libc = "0.2"                                              # POSIX FFI: setsid, killpg for process control
+sha2 = "0.10"                                             # SHA256 for trace staleness checking
 
 # Serialization (for test manifests and register database)
 serde = { version = "1", features = ["derive"] }
@@ -65,6 +66,10 @@ serde_json = "1"
 
 [dev-dependencies]
 hex = "0.4"                                             # Hex dump utilities for debugging
+
+[[bin]]
+name = "lit-runner"
+path = "src/bin/lit_runner.rs"
 
 [profile.release]
 lto = true
