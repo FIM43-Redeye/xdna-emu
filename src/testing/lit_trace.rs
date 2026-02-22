@@ -73,6 +73,13 @@ pub struct TraceConfig {
     pub compile_timeout: u32,
     /// Timeout for execute stage (seconds).
     pub execute_timeout: u32,
+    /// Path to AMD aietools installation (optional).
+    ///
+    /// Used by `compile_kernels()` for the `-I aietools/include` flag when
+    /// compiling kernel .cc files with xchesscc_wrapper.  Resolved from
+    /// [`crate::config::Config::aietools_path`] which checks, in order:
+    /// `AIETOOLS_PATH`, `XILINX_VITIS_AIETOOLS`, config file, sibling dir.
+    pub aietools_path: Option<PathBuf>,
 }
 
 impl TraceConfig {
@@ -115,6 +122,7 @@ impl Default for TraceConfig {
             inject_timeout: 120,
             compile_timeout: 600,
             execute_timeout: 120,
+            aietools_path: None,
         }
     }
 }
@@ -180,6 +188,8 @@ struct SubprocessEnv {
     path: String,
     pythonpath: String,
     ld_library_path: String,
+    /// aietools root for XILINX_VITIS_AIETOOLS (needed by xchesscc_wrapper).
+    aietools_path: Option<PathBuf>,
 }
 
 impl SubprocessEnv {
@@ -240,6 +250,7 @@ impl SubprocessEnv {
             path: path_dirs.join(":"),
             pythonpath: py_dirs.join(":"),
             ld_library_path,
+            aietools_path: config.aietools_path.clone(),
         }
     }
 
@@ -248,6 +259,10 @@ impl SubprocessEnv {
         cmd.env("PATH", &self.path)
             .env("PYTHONPATH", &self.pythonpath)
             .env("LD_LIBRARY_PATH", &self.ld_library_path);
+        if let Some(ref aietools) = self.aietools_path {
+            cmd.env("XILINX_VITIS_AIETOOLS", aietools);
+            cmd.env("XILINX_VITIS", aietools);
+        }
     }
 }
 
@@ -446,9 +461,16 @@ fn compile_kernels(
     config: &TraceConfig,
     env: &SubprocessEnv,
 ) -> Result<(), String> {
-    let aietools = std::env::var("XILINX_VITIS_AIETOOLS")
-        .unwrap_or_else(|_| String::from("/home/triple/npu-work/aietools"));
-    let aietools_include = PathBuf::from(&aietools).join("include");
+    let aietools_include = match &config.aietools_path {
+        Some(p) => p.join("include"),
+        None => {
+            // No aietools available -- kernel .cc files that need
+            // xchesscc_wrapper will fail, but tests with only .o files
+            // (pre-compiled) or no kernel code will still work.
+            log::warn!("aietools not configured; skipping kernel compilation");
+            return Ok(());
+        }
+    };
 
     // Find all .cc and .cpp files in the build directory
     let cc_files: Vec<PathBuf> = fs::read_dir(test_build_dir)

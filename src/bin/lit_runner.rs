@@ -215,6 +215,7 @@ fn run_trace_mode(cli: &CliArgs) {
         inject_timeout: 120,
         compile_timeout: cli.timeout_secs.unwrap_or(600),
         execute_timeout: cli.timeout_secs.unwrap_or(120),
+        aietools_path: config.aietools_path(),
     }
     .resolve();
 

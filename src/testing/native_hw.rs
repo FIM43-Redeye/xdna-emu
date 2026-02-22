@@ -390,9 +390,15 @@ pub fn run_native_and_print(
         npu_runner::wait_for_device_idle(is_error);
     }
 
+    // Native test.cpp binaries do their own validation internally and print
+    // PASS/FAIL to stdout.  They don't expose raw output bytes -- the
+    // comparison logic is baked into the C++ code.  This means the compiler
+    // comparison pipeline (CompilerComparison::classify_full) can't get
+    // peano_hw output from the native path; only the npu-runner path
+    // (which reads raw bytes from a BO) can provide it.
     super::runner_stats::HwRunResult {
         label,
-        output: Vec::new(), // Native tests don't expose raw output bytes
+        output: Vec::new(),
         passed,
         elapsed_secs: elapsed,
         wedged,

@@ -17,6 +17,15 @@ from pathlib import Path
 
 import numpy as np
 
+# Mapping from manifest dtype strings to numpy dtypes.
+DTYPE_MAP = {
+    "int8": np.int8, "uint8": np.uint8,
+    "int16": np.int16, "uint16": np.uint16,
+    "int32": np.int32, "uint32": np.uint32,
+    "int64": np.int64,
+    "float16": np.float16, "float32": np.float32,
+}
+
 
 def load_manifest(manifest_path: Path) -> dict:
     """Load and validate a trace manifest JSON file."""
@@ -44,15 +53,7 @@ def generate_input_data(buf_spec: dict) -> np.ndarray:
 
     Uses a deterministic RNG seeded on buffer name for reproducibility.
     """
-    dtype_map = {
-        "int8": np.int8, "uint8": np.uint8,
-        "int16": np.int16, "uint16": np.uint16,
-        "int32": np.int32, "uint32": np.uint32,
-        "int64": np.int64,
-        "float16": np.float16, "float32": np.float32,
-    }
-
-    np_dtype = dtype_map.get(buf_spec["dtype"], np.int32)
+    np_dtype = DTYPE_MAP.get(buf_spec["dtype"], np.int32)
     count = buf_spec.get("elements", buf_spec["size_bytes"] // np.dtype(np_dtype).itemsize)
 
     pattern = buf_spec.get("pattern", "incrementing")
@@ -115,17 +116,32 @@ def run_on_npu(manifest_dir: Path, manifest: dict, output_dir: Path) -> bool:
     hw_ctx = pyxrt.hw_context(device, xclbin.get_uuid())
     kernel = pyxrt.kernel(hw_ctx, kernel_name)
 
-    # Allocate instruction buffer (group_id 1)
+    # XRT kernel call convention for mlir-aie MLIR_AIE kernels:
+    #   kernel(opcode, instr_bo, instr_len, arg0_bo, arg1_bo, ..., trace_bo)
+    #
+    # Group IDs are fixed by the xclbin's kernel argument layout:
+    #   group_id(0) = opcode (uint32, always 3 for MLIR_AIE)
+    #   group_id(1) = instruction buffer (cacheable BO)
+    #   group_id(2) = instruction length (uint32)
+    #   group_id(3+i) = data buffer i (host_only BO)
+    #   group_id(3+trace_ddr_id) = trace buffer (host_only BO)
+    #
+    # These IDs are determined at xclbin build time by aiecc.py and are
+    # the same for all mlir-aie tests.  The manifest's trace_ddr_id tells
+    # us where the trace buffer sits relative to the data buffers.
+    INSTR_GROUP_ID = 1
+    DATA_GROUP_ID_BASE = 3
+
     instr_bo = pyxrt.bo(
         device,
         len(insts_data) * 4,
         pyxrt.bo.cacheable,
-        kernel.group_id(1),
+        kernel.group_id(INSTR_GROUP_ID),
     )
     instr_bo.write(insts_data.tobytes(), 0)
     instr_bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
 
-    # Allocate data buffers (group_id 3+)
+    # Allocate data buffers
     data_bos = []
     input_arrays = []
     for i, buf_spec in enumerate(buffers):
@@ -134,7 +150,7 @@ def run_on_npu(manifest_dir: Path, manifest: dict, output_dir: Path) -> bool:
             device,
             size,
             pyxrt.bo.host_only,
-            kernel.group_id(3 + i),
+            kernel.group_id(DATA_GROUP_ID_BASE + i),
         )
 
         if buf_spec["direction"] == "input":
@@ -147,12 +163,12 @@ def run_on_npu(manifest_dir: Path, manifest: dict, output_dir: Path) -> bool:
 
         data_bos.append(bo)
 
-    # Allocate trace buffer (group_id 3 + trace_ddr_id)
+    # Allocate trace buffer
     trace_bo = pyxrt.bo(
         device,
         trace_size,
         pyxrt.bo.host_only,
-        kernel.group_id(3 + trace_ddr_id),
+        kernel.group_id(DATA_GROUP_ID_BASE + trace_ddr_id),
     )
     # Zero the trace buffer so we can detect actual data
     trace_bo.write(bytes(trace_size), 0)
@@ -173,9 +189,10 @@ def run_on_npu(manifest_dir: Path, manifest: dict, output_dir: Path) -> bool:
             data_bos[i].sync(
                 pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE
             )
+            out_dtype = DTYPE_MAP.get(buf_spec.get("dtype", "int32"), np.int32)
             out_data = np.frombuffer(
                 data_bos[i].read(buf_spec["size_bytes"], 0),
-                dtype=np.int32,  # Default; ideally use buf_spec dtype
+                dtype=out_dtype,
             )
             out_path = output_dir / f"output_{buf_spec['name']}.bin"
             out_data.tofile(str(out_path))
