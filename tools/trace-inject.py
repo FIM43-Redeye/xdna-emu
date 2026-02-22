@@ -201,22 +201,28 @@ def inject_trace(mlir_text: str, trace_size: int) -> tuple[str, dict]:
             lambda o: isinstance(o.opview, aiedialect.TileOp),
         )
 
-        # Classify tiles
+        # Classify tiles: one shim as trace destination, everything else traced.
+        # Only trace tiles that are actually USED (have SSA references from
+        # other ops).  Tests like matrix_transpose declare 24 tiles but only
+        # use 2 -- tracing all of them overwhelms the router.
         shim_tile = None
-        compute_tiles = []
+        tiles_to_trace = []
         for t in tile_ops:
             top = t.opview
             col = top.col.value
             row = top.row.value
-            if row == 0:
-                shim_tile = top
-            elif row >= 2:
-                compute_tiles.append(top)
+            if row == 0 and shim_tile is None:
+                shim_tile = top  # First shim is the trace destination
+                continue
+            # Skip tiles with no uses (declared but not connected to anything)
+            if len(list(top.result.uses)) == 0:
+                continue
+            tiles_to_trace.append(top)
 
         if shim_tile is None:
             raise RuntimeError("No shim tile (row 0) found")
-        if not compute_tiles:
-            raise RuntimeError("No compute tiles (row >= 2) found -- memtile-only test")
+        if not tiles_to_trace:
+            raise RuntimeError("No used tiles to trace (all non-shim tiles are unused)")
 
         # RuntimeSequenceOp: the host instruction sequence (within this device)
         seq_ops = find_ops(
@@ -235,13 +241,13 @@ def inject_trace(mlir_text: str, trace_size: int) -> tuple[str, dict]:
         # -- Insert trace packet flows at device level ----------------------
 
         with InsertionPoint.at_block_terminator(device_block):
-            configure_packet_tracing_flow(compute_tiles, shim_tile)
+            configure_packet_tracing_flow(tiles_to_trace, shim_tile)
 
         # -- Insert trace config at sequence start --------------------------
 
         with InsertionPoint.at_block_begin(seq_block):
             configure_packet_tracing_aie2(
-                compute_tiles,
+                tiles_to_trace,
                 shim_tile,
                 trace_size,
                 ddr_id=trace_ddr_id,
@@ -295,13 +301,24 @@ def inject_trace(mlir_text: str, trace_size: int) -> tuple[str, dict]:
         count=1,
     )
 
-    # Build manifest partial
+    # Build manifest partial with per-tile type classification
     tiles_traced = []
-    for ct in compute_tiles:
+    for tile in tiles_to_trace:
+        row = tile.row.value
+        if row == 0:
+            tile_type = "shim"
+            events = "default_shim_8"
+        elif row == 1:
+            tile_type = "memtile"
+            events = "default_memtile_8"
+        else:
+            tile_type = "core"
+            events = "default_core_8"
         tiles_traced.append({
-            "col": ct.col.value,
-            "row": ct.row.value,
-            "trace_types": ["core"],
+            "col": tile.col.value,
+            "row": row,
+            "tile_type": tile_type,
+            "events": events,
         })
 
     manifest_partial = {
@@ -484,7 +501,11 @@ def main():
     print(f"Injected trace for {test_name}:")
     print(f"  MLIR:     {output_dir / 'aie_traced.mlir'}")
     print(f"  Manifest: {output_dir / 'manifest.json'}")
-    print(f"  Tiles:    {len(manifest_partial['tiles_traced'])} compute")
+    tile_counts = {}
+    for t in manifest_partial["tiles_traced"]:
+        tile_counts[t["tile_type"]] = tile_counts.get(t["tile_type"], 0) + 1
+    tile_summary = ", ".join(f"{v} {k}" for k, v in sorted(tile_counts.items()))
+    print(f"  Tiles:    {tile_summary}")
     print(f"  DDR ID:   {manifest_partial['trace_ddr_id']}")
     print(f"  Size:     {args.trace_size} bytes")
     if extra_flags:
