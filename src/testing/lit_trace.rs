@@ -386,6 +386,137 @@ fn run_inject(
     }
 }
 
+/// Copy or symlink kernel source files (.cc, .cpp, .h) from the upstream
+/// test directory into the build directory so that aiecc.py can find them
+/// during compilation (link_with = "kernel.o" requires the source nearby).
+fn copy_kernel_sources(upstream_dir: &Path, build_dir: &Path) {
+    let extensions = ["cc", "cpp", "h"];
+    if let Ok(entries) = fs::read_dir(upstream_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let dominated = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| extensions.contains(&e))
+                .unwrap_or(false);
+            if !dominated {
+                continue;
+            }
+            if let Some(name) = path.file_name() {
+                let dest = build_dir.join(name);
+                if !dest.exists() {
+                    // Symlink to avoid copying large files
+                    #[cfg(unix)]
+                    {
+                        std::os::unix::fs::symlink(&path, &dest).ok();
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        fs::copy(&path, &dest).ok();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Read extra aiecc.py flags written by trace-inject.py (e.g. --dynamic-objFifos).
+fn read_extra_aiecc_flags(test_build_dir: &Path) -> Vec<String> {
+    let flags_file = test_build_dir.join(".aiecc-extra-flags");
+    match fs::read_to_string(&flags_file) {
+        Ok(content) => content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Compile kernel .cc/.cpp files to .o using xchesscc_wrapper.
+///
+/// Many npu-xrt tests have external kernel code (kernel.cc, scale.cc, etc.)
+/// that must be compiled to .o files before aiecc.py can link them into
+/// the ELF.  The original lit tests use xchesscc_wrapper for this.
+fn compile_kernels(
+    test_build_dir: &Path,
+    config: &TraceConfig,
+    env: &SubprocessEnv,
+) -> Result<(), String> {
+    let aietools = std::env::var("XILINX_VITIS_AIETOOLS")
+        .unwrap_or_else(|_| String::from("/home/triple/npu-work/aietools"));
+    let aietools_include = PathBuf::from(&aietools).join("include");
+
+    // Find all .cc and .cpp files in the build directory
+    let cc_files: Vec<PathBuf> = fs::read_dir(test_build_dir)
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let dominated = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e == "cc" || e == "cpp")
+                .unwrap_or(false);
+            // Skip test.cpp (host code, not kernel)
+            let is_test = path.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("test"))
+                .unwrap_or(false);
+            if dominated && !is_test { Some(path) } else { None }
+        })
+        .collect();
+
+    if cc_files.is_empty() {
+        return Ok(());
+    }
+
+    for cc_file in &cc_files {
+        let stem = cc_file.file_stem().unwrap_or_default();
+        let obj_file = test_build_dir.join(format!("{}.o", stem.to_string_lossy()));
+        if obj_file.exists() {
+            continue; // Already compiled
+        }
+
+        let mut cmd = Command::new("xchesscc_wrapper");
+        cmd.arg("aie2")
+            .arg("-I")
+            .arg(&aietools_include)
+            .arg("-c")
+            .arg(cc_file)
+            .arg("-o")
+            .arg(&obj_file)
+            .current_dir(test_build_dir);
+        env.apply(&mut cmd);
+
+        match spawn_with_timeout(&mut cmd, config.compile_timeout) {
+            ProcessOutcome::Completed { exit_code, stderr, .. } => {
+                if exit_code != 0 {
+                    return Err(format!(
+                        "xchesscc_wrapper failed for {}: {}",
+                        cc_file.display(),
+                        stderr,
+                    ));
+                }
+            }
+            ProcessOutcome::Timeout { .. } => {
+                return Err(format!("kernel compile timed out: {}", cc_file.display()));
+            }
+            ProcessOutcome::Wedged { .. } => {
+                return Err("device wedged during kernel compile".to_string());
+            }
+            ProcessOutcome::SpawnError(msg) => {
+                return Err(format!("spawn error compiling {}: {}", cc_file.display(), msg));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Run the compile stage: aiecc.py on the traced MLIR.
 fn run_compile(
     test_name: &str,
@@ -402,8 +533,14 @@ fn run_compile(
         .arg("--aie-generate-npu-insts")
         .arg("--no-compile-host")
         .arg("--xclbin-name=aie.xclbin")
-        .arg("--npu-insts-name=insts.bin")
-        .arg(&traced_mlir)
+        .arg("--npu-insts-name=insts.bin");
+
+    // Apply extra flags from trace-inject.py (e.g. --dynamic-objFifos)
+    for flag in read_extra_aiecc_flags(test_build_dir) {
+        cmd.arg(&flag);
+    }
+
+    cmd.arg(&traced_mlir)
         .current_dir(test_build_dir);
     env.apply(&mut cmd);
 
@@ -517,6 +654,15 @@ pub fn run_trace_pipeline(
                     };
                 }
             }
+        }
+
+        // Stage 1b: Copy kernel sources (.cc/.cpp/.h) from upstream so
+        // compile_kernels and aiecc.py can find them.
+        copy_kernel_sources(upstream_dir, &test_build_dir);
+
+        // Stage 1c: Compile external kernel .cc files to .o
+        if let Err(msg) = compile_kernels(&test_build_dir, config, &env) {
+            return TraceOutcome::CompileFailed { stderr: msg };
         }
 
         // Stage 2: Compile

@@ -11,7 +11,7 @@ the Python API does not expose FuncOp argument mutation.
 
 Usage:
     trace-inject.py <test_source_dir> --output <output_dir> \
-        [--trace-size BYTES] [--device npu1_1col]
+        [--trace-size BYTES] [--device auto]
 """
 
 import argparse
@@ -37,21 +37,94 @@ def detect_source_type(test_dir: Path) -> str:
     sys.exit(1)
 
 
+def parse_aie2_args(test_dir: Path) -> list[str]:
+    """Extract aie2.py arguments from RUN directives.
+
+    Reads the aie2.py file and parses the ``# RUN: %python %S/aie2.py <args>``
+    line to determine the correct invocation arguments.  Falls back to ``npu``
+    if no RUN directive is found.
+    """
+    aie2_path = test_dir / "aie2.py"
+    if not aie2_path.exists():
+        return ["npu"]
+
+    text = aie2_path.read_text()
+    for line in text.splitlines():
+        m = re.match(r"#\s*RUN:\s*%python\s+%S/aie2\.py\s+(.*?)(?:\s*>\s*|$)", line)
+        if m:
+            raw = m.group(1).strip()
+            # Strip any trailing redirections or pipes
+            raw = re.sub(r"\s*[>|].*", "", raw)
+            if raw:
+                return raw.split()
+
+    # No RUN directive found -- default to "npu"
+    return ["npu"]
+
+
+def parse_aiecc_extra_flags(test_dir: Path) -> list[str]:
+    """Extract extra aiecc.py flags from RUN directives.
+
+    Looks for flags like ``--dynamic-objFifos`` in the aiecc.py RUN line.
+    Returns a list of extra flags to pass to aiecc.py during compilation.
+    """
+    extra = []
+    # Check aie2.py and test.cpp for RUN lines
+    for fname in ["aie2.py", "test.cpp"]:
+        fpath = test_dir / fname
+        if not fpath.exists():
+            continue
+        text = fpath.read_text()
+        for line in text.splitlines():
+            if "aiecc.py" in line and "--dynamic-objFifos" in line:
+                extra.append("--dynamic-objFifos")
+                return extra
+    return extra
+
+
+def auto_detect_device(mlir_text: str) -> str:
+    """Detect the required device target from tile column indices in MLIR.
+
+    Scans for aie.tile declarations and picks the smallest device variant
+    that fits all columns.
+    """
+    max_col = 0
+    for m in re.finditer(r"aie\.tile\s*\(\s*(\d+)\s*,", mlir_text):
+        col = int(m.group(1))
+        max_col = max(max_col, col)
+
+    if max_col == 0:
+        return "npu1_1col"
+    elif max_col == 1:
+        return "npu1_2col"
+    elif max_col == 2:
+        return "npu1_3col"
+    elif max_col == 3:
+        return "npu1_4col"
+    else:
+        return "npu1"
+
+
 def get_mlir_text(test_dir: Path, source_type: str, device: str) -> str:
     """Get MLIR text from either a static file or a Python generator.
 
     For raw MLIR: reads aie.mlir and substitutes the NPUDEVICE placeholder.
-    For Python: runs ``python aie2.py npu`` and captures stdout.
+    For Python: runs ``python aie2.py <args>`` with arguments parsed from
+    the test's RUN directives.
     """
     if source_type == "mlir":
         text = (test_dir / "aie.mlir").read_text()
-        # Substitute the generic device placeholder used by most tests
+        # Auto-detect device if needed, then substitute placeholder
+        if device == "auto":
+            device = auto_detect_device(text)
         text = text.replace("NPUDEVICE", device)
         return text
 
-    # Python generator -- run it and capture the MLIR it prints
+    # Python generator -- parse args from RUN directives
+    aie2_args = parse_aie2_args(test_dir)
+
     result = subprocess.run(
-        [sys.executable, str(test_dir / "aie2.py"), "npu"],
+        [sys.executable, str(test_dir / "aie2.py")] + aie2_args,
         capture_output=True,
         text=True,
         cwd=str(test_dir),
@@ -59,7 +132,7 @@ def get_mlir_text(test_dir: Path, source_type: str, device: str) -> str:
     )
     if result.returncode != 0:
         print(
-            f"Error running aie2.py:\n{result.stderr}",
+            f"Error running aie2.py {' '.join(aie2_args)}:\n{result.stderr}",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -67,8 +140,12 @@ def get_mlir_text(test_dir: Path, source_type: str, device: str) -> str:
 
 
 def has_existing_trace(mlir_text: str) -> bool:
-    """Check whether the MLIR already contains trace packet_flow ops."""
-    return "aie.packet_flow" in mlir_text and "Trace" in mlir_text
+    """Check whether the MLIR already contains trace packet_flow ops.
+
+    Looks for actual trace source ports (e.g. ``Trace : 0``), not just the
+    word "Trace" which can appear in comments or unrelated context.
+    """
+    return "aie.packet_source" in mlir_text and "Trace :" in mlir_text
 
 
 def inject_trace(mlir_text: str, trace_size: int) -> tuple[str, dict]:
@@ -109,12 +186,18 @@ def inject_trace(mlir_text: str, trace_size: int) -> tuple[str, dict]:
         )
         if not device_ops:
             raise RuntimeError("No aie.device op found in MLIR")
+
+        # For multi-device modules, inject into the first device only.
         device_op = device_ops[0].opview
         device_block = device_op.body_region.blocks[0]
 
-        # TileOps: all tile declarations
+        # Scope all subsequent searches to THIS device (not the whole module)
+        # to avoid cross-region SSA references in multi-device MLIR.
+        search_root = device_op.operation
+
+        # TileOps: tile declarations within this device
         tile_ops = find_ops(
-            module.operation,
+            search_root,
             lambda o: isinstance(o.opview, aiedialect.TileOp),
         )
 
@@ -133,11 +216,11 @@ def inject_trace(mlir_text: str, trace_size: int) -> tuple[str, dict]:
         if shim_tile is None:
             raise RuntimeError("No shim tile (row 0) found")
         if not compute_tiles:
-            raise RuntimeError("No compute tiles (row >= 2) found")
+            raise RuntimeError("No compute tiles (row >= 2) found -- memtile-only test")
 
-        # RuntimeSequenceOp: the host instruction sequence
+        # RuntimeSequenceOp: the host instruction sequence (within this device)
         seq_ops = find_ops(
-            module.operation,
+            search_root,
             lambda o: isinstance(o.opview, aiedialect.RuntimeSequenceOp),
         )
         if not seq_ops:
@@ -166,10 +249,13 @@ def inject_trace(mlir_text: str, trace_size: int) -> tuple[str, dict]:
 
         # -- Insert trace done after the last DMA wait ----------------------
 
-        # Look for the last NpuDmaWaitOp or DMAAwaitTaskOp
+        # Collect all wait/sync op types
         wait_op_types = [aiexdialect.NpuDmaWaitOp]
         if hasattr(aiexdialect, "DMAAwaitTaskOp"):
             wait_op_types.append(aiexdialect.DMAAwaitTaskOp)
+        if hasattr(aiexdialect, "NpuSyncOp"):
+            wait_op_types.append(aiexdialect.NpuSyncOp)
+
         wait_ops = find_ops(
             seq_op.operation,
             lambda o: isinstance(o.opview, tuple(wait_op_types)),
@@ -179,9 +265,15 @@ def inject_trace(mlir_text: str, trace_size: int) -> tuple[str, dict]:
             with InsertionPoint.after(last_wait):
                 gen_trace_done_aie2(shim_tile)
         else:
-            # No waits found -- append at end of sequence block
-            with InsertionPoint.at_block_terminator(seq_block):
-                gen_trace_done_aie2(shim_tile)
+            # No waits found -- insert before the last operation in the block
+            # (which may be an implicit terminator or the last instruction).
+            ops = list(seq_block.operations)
+            if ops:
+                with InsertionPoint(ops[-1]):
+                    gen_trace_done_aie2(shim_tile)
+            else:
+                with InsertionPoint.at_block_begin(seq_block):
+                    gen_trace_done_aie2(shim_tile)
 
         # -- Serialize -------------------------------------------------------
 
@@ -333,8 +425,8 @@ def main():
     )
     parser.add_argument(
         "--device",
-        default="npu1_1col",
-        help="Device target for NPUDEVICE substitution (default: npu1_1col)",
+        default="auto",
+        help="Device target for NPUDEVICE substitution (default: auto-detect)",
     )
     args = parser.parse_args()
 
@@ -376,6 +468,11 @@ def main():
 
     (output_dir / "aie_traced.mlir").write_text(traced_mlir)
 
+    # Also write extra aiecc flags if any were detected
+    extra_flags = parse_aiecc_extra_flags(test_dir)
+    if extra_flags:
+        (output_dir / ".aiecc-extra-flags").write_text("\n".join(extra_flags) + "\n")
+
     test_name = test_dir.name
     manifest = build_manifest(
         test_name, test_dir, output_dir, traced_mlir, manifest_partial,
@@ -390,6 +487,8 @@ def main():
     print(f"  Tiles:    {len(manifest_partial['tiles_traced'])} compute")
     print(f"  DDR ID:   {manifest_partial['trace_ddr_id']}")
     print(f"  Size:     {args.trace_size} bytes")
+    if extra_flags:
+        print(f"  Extra:    {' '.join(extra_flags)}")
 
 
 if __name__ == "__main__":

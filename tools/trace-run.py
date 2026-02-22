@@ -211,7 +211,7 @@ def run_on_npu(manifest_dir: Path, manifest: dict, output_dir: Path) -> bool:
                 json.dump(trace_events, f, indent=2)
             print(f"  JSON:   {trace_json_path} ({len(trace_events)} events)")
 
-        except Exception as e:
+        except (Exception, SystemExit) as e:
             print(f"  Warning: trace parsing failed: {e}", file=sys.stderr)
     else:
         print(f"  Warning: MLIR not found at {mlir_path}, skipping trace parse")
