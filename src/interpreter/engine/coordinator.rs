@@ -49,6 +49,10 @@ struct CoreState {
     context: ExecutionContext,
     /// Is this core enabled?
     enabled: bool,
+    /// Number of trace events already consumed from the EventLog.
+    /// Used to incrementally drain new events each cycle for the
+    /// hardware trace unit without needing a drain() method.
+    trace_events_consumed: usize,
 }
 
 impl CoreState {
@@ -61,6 +65,7 @@ impl CoreState {
             ),
             context: ExecutionContext::new(),
             enabled: false,
+            trace_events_consumed: 0,
         }
     }
 }
@@ -242,6 +247,45 @@ impl InterpreterEngine {
                 }
             }
         }
+
+        // Flush all tile trace units so partial packets get emitted with padding.
+        // This ensures the final trace data is available for stream routing.
+        for col in 0..self.device.array.cols() {
+            for row in 0..self.device.array.rows() {
+                if let Some(tile) = self.device.array.get_mut(col as u8, row as u8) {
+                    tile.core_trace.flush();
+                    tile.mem_trace.flush();
+                }
+            }
+        }
+
+        // Route flushed trace packets through the stream switch to host DDR.
+        // During normal execution, step_data_movement() runs every step() cycle.
+        // But flush() above creates final packets AFTER the execution loop exits,
+        // so we need additional routing passes to deliver them through the
+        // multi-hop stream switch network.
+        //
+        // Each word traverses multiple hops (e.g., Compute -> MemTile -> Shim
+        // -> DMA = 3-4 hops). Each hop takes one routing pass. Two 8-word
+        // packets need ~64 passes in the worst case. Use a generous limit
+        // and stop early when nothing moves.
+        let mut total_flush_words = 0;
+        let mut flush_iters = 0;
+        for _ in 0..100 {
+            let (_, streams_moved, words_routed) =
+                self.device.array.step_data_movement(&mut self.host_memory);
+            total_flush_words += words_routed;
+            flush_iters += 1;
+            if !streams_moved && words_routed == 0 {
+                break;
+            }
+        }
+        if total_flush_words > 0 {
+            log::info!(
+                "Post-flush routing: {} words in {} iterations",
+                total_flush_words, flush_iters
+            );
+        }
     }
 
     /// Get reference to device state.
@@ -412,8 +456,15 @@ impl InterpreterEngine {
         let (dma_active, streams_moved, words_routed) =
             self.device.array.step_data_movement(&mut self.host_memory);
 
-        // Drain DMA trace events into the global trace log
+        // Drain DMA trace events into the global trace log and notify
+        // memory module trace units so they can produce binary trace packets.
         for (col, row, cycle, event) in self.device.array.drain_dma_trace_events() {
+            // Notify the tile's memory module trace unit
+            if let Some(hw_id) = crate::trace::mem_event_to_hw_id(&event) {
+                if let Some(tile) = self.device.array.get_mut(col, row) {
+                    tile.mem_trace.notify_event(hw_id, cycle);
+                }
+            }
             self.trace_log.push(TileTracedEvent { col, row, cycle, event });
         }
 
@@ -514,6 +565,20 @@ impl InterpreterEngine {
                             self.status = EngineStatus::Error;
                             return;
                         }
+                    }
+
+                    // Notify core trace unit with any new events since last cycle.
+                    // We track how many events have been consumed to avoid re-processing
+                    // the full EventLog history every cycle.
+                    let events = core.context.timing_context().events.events();
+                    let new_start = core.trace_events_consumed;
+                    if new_start < events.len() {
+                        for evt in &events[new_start..] {
+                            if let Some(hw_id) = crate::trace::core_event_to_hw_id(&evt.event) {
+                                tile.core_trace.notify_event(hw_id, evt.cycle);
+                            }
+                        }
+                        core.trace_events_consumed = events.len();
                     }
                 }
 

@@ -298,6 +298,117 @@ pub fn offset_perfetto_pids(json: &str, pid_offset: i64, name_prefix: &str) -> S
     result
 }
 
+/// Map an emulator `EventType` to its AIE2 hardware event ID.
+///
+/// These IDs come from mlir-aie `python/utils/trace/events/aie2.py`.
+/// Core module events and memory module events use different ID spaces.
+///
+/// # Core Module Events
+///
+/// These are the event IDs for events originating in the Core module
+/// (instruction events, stalls, core status).
+///
+/// # Memory Module Events
+///
+/// DMA and lock events use per-channel IDs. The `channel` field in DMA
+/// events encodes S2MM (0-1) vs MM2S (2-3) for compute tiles.
+pub fn core_event_to_hw_id(event: &EventType) -> Option<u8> {
+    match event {
+        // Stall events (Core module)
+        EventType::MemoryStall { .. }          => Some(23),
+        EventType::StreamStall { .. }          => Some(24),
+        EventType::LockStall { .. }            => Some(26),
+        // Core status
+        EventType::CoreActive                  => Some(28),
+        EventType::CoreDisabled                => Some(29),
+        // Program flow events
+        EventType::InstrCall { .. }            => Some(35),
+        EventType::InstrReturn { .. }          => Some(36),
+        EventType::InstrVector { .. }          => Some(37),
+        EventType::InstrLoad { .. }            => Some(38),
+        EventType::InstrStore { .. }           => Some(39),
+        EventType::InstrStreamGet { .. }       => Some(40),
+        EventType::InstrStreamPut { .. }       => Some(41),
+        EventType::InstrLockAcquireReq { .. }  => Some(44),
+        EventType::InstrLockReleaseReq { .. }  => Some(45),
+        // Branch is an emulator-internal event, no hardware equivalent
+        EventType::BranchTaken { .. }          => None,
+        // Memory module events don't have core event IDs
+        _ => None,
+    }
+}
+
+/// Map an emulator `EventType` to its AIE2 memory module hardware event ID.
+///
+/// DMA events are per-channel. The channel field encodes:
+/// - 0 = S2MM ch0, 1 = S2MM ch1, 2 = MM2S ch0, 3 = MM2S ch1
+///
+/// Lock events are per-lock (lock IDs 0-7 have dedicated event IDs).
+pub fn mem_event_to_hw_id(event: &EventType) -> Option<u8> {
+    match event {
+        // DMA start task: S2MM_0=19, S2MM_1=20, MM2S_0=21, MM2S_1=22
+        EventType::DmaStartTask { channel } => match channel {
+            0 => Some(19),
+            1 => Some(20),
+            2 => Some(21),
+            3 => Some(22),
+            _ => None,
+        },
+        // DMA finished BD: S2MM_0=23, S2MM_1=24, MM2S_0=25, MM2S_1=26
+        EventType::DmaFinishedBd { channel } => match channel {
+            0 => Some(23),
+            1 => Some(24),
+            2 => Some(25),
+            3 => Some(26),
+            _ => None,
+        },
+        // DMA finished task: S2MM_0=27, S2MM_1=28, MM2S_0=29, MM2S_1=30
+        EventType::DmaFinishedTask { channel } => match channel {
+            0 => Some(27),
+            1 => Some(28),
+            2 => Some(29),
+            3 => Some(30),
+            _ => None,
+        },
+        // DMA stalled lock: S2MM_0=31, S2MM_1=32, MM2S_0=33, MM2S_1=34
+        EventType::DmaStalledLock { channel } => match channel {
+            0 => Some(31),
+            1 => Some(32),
+            2 => Some(33),
+            3 => Some(34),
+            _ => None,
+        },
+        // DMA stream starvation: S2MM_0=35, S2MM_1=36, MM2S_0=37(backpressure), MM2S_1=38
+        EventType::DmaStreamStarvation { channel } => match channel {
+            0 => Some(35),
+            1 => Some(36),
+            2 => Some(37),
+            3 => Some(38),
+            _ => None,
+        },
+        // Lock acquire: LOCK_SEL0_ACQ_GE=45, stride 4 per lock
+        // Lock 0 acq_ge=45, Lock 1 acq_ge=49, ..., Lock 7 acq_ge=73
+        EventType::LockAcquire { lock_id } => {
+            if *lock_id <= 7 {
+                Some(45 + (*lock_id as u8) * 4)
+            } else {
+                None
+            }
+        },
+        // Lock release: LOCK_0_REL=46, stride 4 per lock
+        // Lock 0 rel=46, Lock 1 rel=50, ..., Lock 7 rel=74
+        EventType::LockRelease { lock_id } => {
+            if *lock_id <= 7 {
+                Some(46 + (*lock_id as u8) * 4)
+            } else {
+                None
+            }
+        },
+        // Core events don't have memory module IDs
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +546,80 @@ mod tests {
         assert!(!result.contains(r#""pid":1,"#));
         assert!(result.contains("aiesimulator: core_trace"));
         assert!(result.contains("aiesimulator: mem_trace"));
+    }
+
+    // -- Hardware event ID mapping tests --
+
+    #[test]
+    fn test_core_event_ids() {
+        // Verify key core event IDs match mlir-aie aie2.py
+        assert_eq!(core_event_to_hw_id(&EventType::InstrVector { pc: 0 }), Some(37));
+        assert_eq!(core_event_to_hw_id(&EventType::InstrLoad { pc: 0 }), Some(38));
+        assert_eq!(core_event_to_hw_id(&EventType::InstrStore { pc: 0 }), Some(39));
+        assert_eq!(core_event_to_hw_id(&EventType::InstrCall { pc: 0 }), Some(35));
+        assert_eq!(core_event_to_hw_id(&EventType::InstrReturn { pc: 0 }), Some(36));
+        assert_eq!(core_event_to_hw_id(&EventType::MemoryStall { cycles: 1 }), Some(23));
+        assert_eq!(core_event_to_hw_id(&EventType::LockStall { cycles: 1 }), Some(26));
+        assert_eq!(core_event_to_hw_id(&EventType::StreamStall { cycles: 1 }), Some(24));
+        assert_eq!(core_event_to_hw_id(&EventType::CoreActive), Some(28));
+        assert_eq!(core_event_to_hw_id(&EventType::CoreDisabled), Some(29));
+        assert_eq!(core_event_to_hw_id(&EventType::InstrStreamGet { pc: 0 }), Some(40));
+        assert_eq!(core_event_to_hw_id(&EventType::InstrStreamPut { pc: 0 }), Some(41));
+        assert_eq!(core_event_to_hw_id(&EventType::InstrLockAcquireReq { pc: 0 }), Some(44));
+        assert_eq!(core_event_to_hw_id(&EventType::InstrLockReleaseReq { pc: 0 }), Some(45));
+    }
+
+    #[test]
+    fn test_core_event_branch_has_no_hw_id() {
+        assert_eq!(core_event_to_hw_id(&EventType::BranchTaken { from_pc: 0, to_pc: 0 }), None);
+    }
+
+    #[test]
+    fn test_mem_event_dma_ids() {
+        // DMA start task: S2MM_0=19, S2MM_1=20, MM2S_0=21, MM2S_1=22
+        assert_eq!(mem_event_to_hw_id(&EventType::DmaStartTask { channel: 0 }), Some(19));
+        assert_eq!(mem_event_to_hw_id(&EventType::DmaStartTask { channel: 1 }), Some(20));
+        assert_eq!(mem_event_to_hw_id(&EventType::DmaStartTask { channel: 2 }), Some(21));
+        assert_eq!(mem_event_to_hw_id(&EventType::DmaStartTask { channel: 3 }), Some(22));
+
+        // DMA finished BD: S2MM_0=23, S2MM_1=24, MM2S_0=25, MM2S_1=26
+        assert_eq!(mem_event_to_hw_id(&EventType::DmaFinishedBd { channel: 0 }), Some(23));
+        assert_eq!(mem_event_to_hw_id(&EventType::DmaFinishedBd { channel: 3 }), Some(26));
+
+        // DMA finished task: S2MM_0=27, ..., MM2S_1=30
+        assert_eq!(mem_event_to_hw_id(&EventType::DmaFinishedTask { channel: 0 }), Some(27));
+        assert_eq!(mem_event_to_hw_id(&EventType::DmaFinishedTask { channel: 3 }), Some(30));
+    }
+
+    #[test]
+    fn test_mem_event_lock_ids() {
+        // Lock 0: acq_ge=45, rel=46
+        assert_eq!(mem_event_to_hw_id(&EventType::LockAcquire { lock_id: 0 }), Some(45));
+        assert_eq!(mem_event_to_hw_id(&EventType::LockRelease { lock_id: 0 }), Some(46));
+
+        // Lock 3: acq_ge=45+12=57, rel=46+12=58
+        assert_eq!(mem_event_to_hw_id(&EventType::LockAcquire { lock_id: 3 }), Some(57));
+        assert_eq!(mem_event_to_hw_id(&EventType::LockRelease { lock_id: 3 }), Some(58));
+
+        // Lock 7: acq_ge=45+28=73, rel=46+28=74
+        assert_eq!(mem_event_to_hw_id(&EventType::LockAcquire { lock_id: 7 }), Some(73));
+        assert_eq!(mem_event_to_hw_id(&EventType::LockRelease { lock_id: 7 }), Some(74));
+
+        // Lock 8+: out of range
+        assert_eq!(mem_event_to_hw_id(&EventType::LockAcquire { lock_id: 8 }), None);
+    }
+
+    #[test]
+    fn test_core_events_not_in_mem_space() {
+        // Core events should return None from mem_event_to_hw_id
+        assert_eq!(mem_event_to_hw_id(&EventType::InstrVector { pc: 0 }), None);
+        assert_eq!(mem_event_to_hw_id(&EventType::CoreActive), None);
+    }
+
+    #[test]
+    fn test_mem_events_not_in_core_space() {
+        // Memory events should return None from core_event_to_hw_id
+        assert_eq!(core_event_to_hw_id(&EventType::DmaStartTask { channel: 0 }), None);
+        assert_eq!(core_event_to_hw_id(&EventType::LockAcquire { lock_id: 0 }), None);
     }
 }

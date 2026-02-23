@@ -59,6 +59,7 @@ pub mod state;
 pub mod host_memory;
 pub mod dma;
 pub mod stream_switch;
+pub mod trace_unit;
 
 pub use arch_config::{ArchConfig, ModelConfig, default_arch};
 pub use registers::{RegisterInfo, RegisterModule, TileAddress};

@@ -22,6 +22,7 @@
 
 use super::aie2_spec;
 use super::stream_switch::StreamSwitch as FunctionalStreamSwitch;
+use super::trace_unit::TraceUnit;
 
 /// Size of program memory (16 KB = 1024 x 128-bit instructions).
 pub const PROGRAM_MEMORY_SIZE: usize = aie2_spec::PROGRAM_MEMORY_SIZE;
@@ -630,6 +631,23 @@ pub struct Tile {
     /// Parsed from Demux_Config register (0x1F004). Index 0 = S2MM ch0, 1 = S2MM ch1.
     /// Value is the switchbox master port index (e.g., 2 for South0).
     pub shim_mux_s2mm_masters: [Option<usize>; 2],
+
+    // === Trace Units ===
+
+    /// Core module trace unit (compute tiles only).
+    ///
+    /// Configured by writes to offsets 0x340D0-0x340E4. Monitors core module
+    /// events (instructions, stalls) and emits binary trace packets through
+    /// the stream switch Trace slave port (slave[23] = AIE_TRACE).
+    pub core_trace: TraceUnit,
+
+    /// Memory module trace unit (compute and mem tiles).
+    ///
+    /// Configured by writes to offsets 0x140D0-0x140E4 (compute) or
+    /// 0x940D0-0x940E4 (memtile). Monitors memory module events (DMA, locks)
+    /// and emits through Trace slave port (slave[24] = MEM_TRACE for compute,
+    /// slave[17] = TRACE for memtile).
+    pub mem_trace: TraceUnit,
 }
 
 impl Tile {
@@ -668,6 +686,8 @@ impl Tile {
             ctrl_pkt_drop_header: true,
             shim_mux_mm2s_slaves: [None; 2],
             shim_mux_s2mm_masters: [None; 2],
+            core_trace: TraceUnit::new(col, row),
+            mem_trace: TraceUnit::new(col, row),
         }
     }
 
@@ -1068,6 +1088,35 @@ impl Tile {
                 self.clear_lock_overflow_bits(0, 16, value);
             } else if offset == reg_layout.memory_locks_underflow {
                 self.clear_lock_underflow_bits(0, 16, value);
+            }
+        }
+
+        // Trace register routing.
+        //
+        // Core module trace registers (compute tiles):
+        //   0x340D0 (Control0), 0x340D4 (Control1), 0x340E0 (Event0), 0x340E4 (Event1)
+        //
+        // Memory module trace registers (compute tiles):
+        //   0x140D0 (Control0), 0x140D4 (Control1), 0x140E0 (Event0), 0x140E4 (Event1)
+        //
+        // MemTile trace registers:
+        //   0x940D0 (Control0), 0x940D4 (Control1), 0x940E0 (Event0), 0x940E4 (Event1)
+        if self.is_compute() {
+            // Core module trace: base 0x340D0
+            if offset >= 0x340D0 && offset <= 0x340E4 {
+                let trace_offset = offset - 0x340D0;
+                self.core_trace.write_register(trace_offset, value);
+            }
+            // Memory module trace: base 0x140D0
+            if offset >= 0x140D0 && offset <= 0x140E4 {
+                let trace_offset = offset - 0x140D0;
+                self.mem_trace.write_register(trace_offset, value);
+            }
+        } else if self.is_mem_tile() {
+            // MemTile trace: base 0x940D0
+            if offset >= 0x940D0 && offset <= 0x940E4 {
+                let trace_offset = offset - 0x940D0;
+                self.mem_trace.write_register(trace_offset, value);
             }
         }
     }

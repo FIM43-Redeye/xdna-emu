@@ -524,7 +524,7 @@ impl XclbinSuite {
         let tests: Vec<_> = self.tests.clone();
 
         for test in tests {
-            let (outcome, raw_output, trace) = self.run_single_inner(&test);
+            let (outcome, raw_output, trace, _) = self.run_single_inner(&test);
             self.trace_events.extend(trace);
 
             match &outcome {
@@ -579,7 +579,7 @@ impl XclbinSuite {
 
     /// Run a single test.
     pub fn run_single(&self, test: &XclbinTest) -> TestOutcome {
-        let (outcome, _, _) = self.run_single_inner(test);
+        let (outcome, _, _, _) = self.run_single_inner(test);
         outcome
     }
 
@@ -590,17 +590,22 @@ impl XclbinSuite {
     /// The output bytes are `None` if the engine could not be created or
     /// the test was skipped.
     pub fn run_single_with_output(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>) {
-        let (outcome, output, _) = self.run_single_inner(test);
+        let (outcome, output, _, _) = self.run_single_inner(test);
         (outcome, output)
     }
 
     /// Run a single test and return trace events for Perfetto export.
     ///
     /// Unlike `run_single()` which discards internal details, this exposes
-    /// the emulator's per-tile trace events. Used by the triple trace
-    /// comparison pipeline to generate `emu-trace.json`.
-    pub fn run_single_with_trace(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Vec<crate::interpreter::engine::TileTracedEvent>) {
-        self.run_single_inner(test)
+    /// the emulator's per-tile trace events and optional binary trace buffer.
+    /// Used by the triple trace comparison pipeline to generate `emu-trace.json`.
+    ///
+    /// Returns (outcome, raw_output, trace_events, binary_trace_buffer).
+    /// The binary_trace_buffer contains raw trace packets from the hardware
+    /// trace units, in the same format as real NPU hardware produces.
+    pub fn run_single_with_trace(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Vec<crate::interpreter::engine::TileTracedEvent>, Option<Vec<u8>>) {
+        let (outcome, raw_output, trace_events, trace_buf) = self.run_single_inner(test);
+        (outcome, raw_output, trace_events, trace_buf)
     }
 
     /// Run a single test with full cross-validation results.
@@ -608,7 +613,7 @@ impl XclbinSuite {
     /// Returns the test outcome, raw output, and optional hardware
     /// cross-validation diagnosis.
     pub fn run_single_with_hw_validation(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Option<HardwareValidation>) {
-        let (outcome, raw_output, _) = self.run_single_inner(test);
+        let (outcome, raw_output, _, _) = self.run_single_inner(test);
         let hw_validation = self.cross_validate(test, raw_output.as_deref());
         (outcome, raw_output, hw_validation)
     }
@@ -643,14 +648,16 @@ impl XclbinSuite {
 
     /// Shared implementation for run_single and run_single_with_output.
     ///
-    /// Returns (outcome, raw_output, trace_events). The trace_events are
-    /// collected from the engine after execution for Perfetto export.
-    fn run_single_inner(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Vec<crate::interpreter::engine::TileTracedEvent>) {
+    /// Returns (outcome, raw_output, trace_events, binary_trace_buffer).
+    /// The trace_events are collected from the engine after execution for
+    /// Perfetto export. The binary_trace_buffer contains raw packets from
+    /// hardware trace units that flowed through stream switch to host DDR.
+    fn run_single_inner(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Vec<crate::interpreter::engine::TileTracedEvent>, Option<Vec<u8>>) {
         // Check if test overrides say to skip this test
         if let Some(ref reason) = test.skip_reason {
             return (TestOutcome::Skipped {
                 reason: reason.clone(),
-            }, None, Vec::new());
+            }, None, Vec::new(), None);
         }
 
         // Load xclbin
@@ -659,7 +666,7 @@ impl XclbinSuite {
             Err(e) => {
                 return (TestOutcome::LoadError {
                     message: format!("Failed to load xclbin: {}", e),
-                }, None, Vec::new());
+                }, None, Vec::new(), None);
             }
         };
 
@@ -669,7 +676,7 @@ impl XclbinSuite {
             None => {
                 return (TestOutcome::LoadError {
                     message: "No AIE partition in xclbin".to_string(),
-                }, None, Vec::new());
+                }, None, Vec::new(), None);
             }
         };
 
@@ -679,7 +686,7 @@ impl XclbinSuite {
             Err(e) => {
                 return (TestOutcome::LoadError {
                     message: format!("Failed to parse AIE partition: {}", e),
-                }, None, Vec::new());
+                }, None, Vec::new(), None);
             }
         };
 
@@ -689,7 +696,7 @@ impl XclbinSuite {
             None => {
                 return (TestOutcome::LoadError {
                     message: "No primary PDI in partition".to_string(),
-                }, None, Vec::new());
+                }, None, Vec::new(), None);
             }
         };
 
@@ -698,7 +705,7 @@ impl XclbinSuite {
             None => {
                 return (TestOutcome::LoadError {
                     message: "No CDO found in PDI".to_string(),
-                }, None, Vec::new());
+                }, None, Vec::new(), None);
             }
         };
 
@@ -707,7 +714,7 @@ impl XclbinSuite {
             Err(e) => {
                 return (TestOutcome::LoadError {
                     message: format!("Failed to parse CDO: {}", e),
-                }, None, Vec::new());
+                }, None, Vec::new(), None);
             }
         };
 
@@ -716,7 +723,7 @@ impl XclbinSuite {
         if let Err(e) = engine.device_mut().apply_cdo(&cdo) {
             return (TestOutcome::LoadError {
                 message: format!("Failed to apply CDO: {}", e),
-            }, None, Vec::new());
+            }, None, Vec::new(), None);
         }
 
         // Populate host memory - use buffer spec if available, else defaults.
@@ -790,14 +797,14 @@ impl XclbinSuite {
                 Err(e) => {
                     return (TestOutcome::LoadError {
                         message: format!("Failed to read ELF {:?}: {}", path, e),
-                    }, None, Vec::new());
+                    }, None, Vec::new(), None);
                 }
             };
 
             if let Err(e) = engine.load_elf_bytes(*col as usize, *row as usize, &data) {
                 return (TestOutcome::LoadError {
                     message: format!("Failed to load ELF into ({},{}): {}", col, row, e),
-                }, None, Vec::new());
+                }, None, Vec::new(), None);
             }
         }
 
@@ -808,7 +815,7 @@ impl XclbinSuite {
         let enabled = engine.enabled_cores();
         if enabled == 0 && elf_files.is_empty() {
             // No cores enabled and no ELFs - likely a reconfiguration test
-            return (TestOutcome::Pass { cycles: 1, correct: None, total: None }, None, Vec::new());
+            return (TestOutcome::Pass { cycles: 1, correct: None, total: None }, None, Vec::new(), None);
         }
 
         // Run until halt, sync completion, error, or timeout
@@ -821,6 +828,31 @@ impl XclbinSuite {
 
         // Capture raw output from host memory at the output buffer address
         let raw_output = self.capture_output(&engine, test, output_addr);
+
+        // Capture binary trace buffer from host memory if a trace buffer was allocated.
+        // The NPU executor allocates trace buffers for DDR patches referencing arg_idx
+        // beyond the known host buffers (typically arg_idx=3 for trace data).
+        let binary_trace_buf = npu_executor.as_ref().and_then(|exec| {
+            // Trace buffer is typically the last host buffer (beyond the user-specified ones)
+            let bufs = exec.host_buffers();
+            if bufs.len() > 3 {
+                let tb = &bufs[3];
+                let mut data = vec![0u8; tb.size];
+                engine.host_memory().read_bytes(tb.address, &mut data);
+                // Only return if there's actual data (not all zeros)
+                if data.iter().any(|&b| b != 0) {
+                    log::info!(
+                        "Captured {} bytes of binary trace data from host memory at 0x{:X}",
+                        data.len(), tb.address
+                    );
+                    Some(data)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
 
         // Remap outcomes for expected-fail tests, preserving the actual failure details
         let final_outcome = if let Some(ref reason) = test.expected_fail_reason {
@@ -877,7 +909,7 @@ impl XclbinSuite {
             outcome
         };
 
-        (final_outcome, raw_output, trace_events)
+        (final_outcome, raw_output, trace_events, binary_trace_buf)
     }
 
     /// Capture raw output bytes from host memory.

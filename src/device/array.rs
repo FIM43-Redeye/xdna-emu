@@ -569,6 +569,12 @@ impl TileArray {
         // Data from core stream writes enters via the Core slave port (port 0)
         words_routed += self.route_core_to_tile_switches();
 
+        // Step 2b: Trace unit → StreamSwitch trace slave ports
+        // Binary trace packets enter the network on dedicated trace slave ports:
+        //   Compute: slave[23] (core trace), slave[24] (mem trace)
+        //   MemTile: slave[17] (mem trace)
+        words_routed += self.route_trace_to_tile_switches();
+
         // Step 3: StreamSwitch local routing (first pass)
         // Apply configured routes within each tile: slave → master
         words_routed += self.step_tile_switches();
@@ -721,6 +727,69 @@ impl TileArray {
                                     "Core->TileSwitch: tile({},{}) slave[{}] <- 0x{:08X}",
                                     self.tiles[i].col, self.tiles[i].row, slave_port, data
                                 );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        words_routed
+    }
+
+    /// Route trace unit packets to per-tile stream switch trace slave ports.
+    ///
+    /// Each tile has trace units that produce 8-word (32-byte) binary trace
+    /// packets. These packets enter the stream switch via dedicated trace
+    /// slave ports:
+    ///   - Compute tile: slave[23] = core trace, slave[24] = memory trace
+    ///   - MemTile: slave[17] = memory trace
+    ///   - Shim: slave[22] = trace (not currently used)
+    ///
+    /// Once on the slave port, the existing packet routing infrastructure
+    /// handles forwarding to shim DMA and ultimately to host DDR.
+    fn route_trace_to_tile_switches(&mut self) -> usize {
+        let mut words_routed = 0;
+
+        for i in 0..self.tiles.len() {
+            let tile_type = self.tiles[i].tile_type;
+
+            match tile_type {
+                TileType::Compute => {
+                    // Core trace -> slave[23] (AIE_TRACE)
+                    while let Some(packet) = self.tiles[i].core_trace.pop_packet() {
+                        for word in packet {
+                            if self.tiles[i].stream_switch.slaves[23].push(word) {
+                                words_routed += 1;
+                            }
+                        }
+                    }
+                    // Memory trace -> slave[24] (MEM_TRACE)
+                    while let Some(packet) = self.tiles[i].mem_trace.pop_packet() {
+                        for word in packet {
+                            if self.tiles[i].stream_switch.slaves[24].push(word) {
+                                words_routed += 1;
+                            }
+                        }
+                    }
+                }
+                TileType::MemTile => {
+                    // Memory trace -> slave[17] (TRACE)
+                    while let Some(packet) = self.tiles[i].mem_trace.pop_packet() {
+                        for word in packet {
+                            if self.tiles[i].stream_switch.slaves[17].push(word) {
+                                words_routed += 1;
+                            }
+                        }
+                    }
+                }
+                TileType::Shim => {
+                    // Shim trace -> slave[22] (TRACE) -- rarely used
+                    // but wire it for completeness
+                    while let Some(packet) = self.tiles[i].mem_trace.pop_packet() {
+                        for word in packet {
+                            if self.tiles[i].stream_switch.slaves[22].push(word) {
+                                words_routed += 1;
                             }
                         }
                     }

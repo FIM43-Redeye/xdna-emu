@@ -613,7 +613,7 @@ fn run_emulator_trace(
 
     // Create a minimal suite and run the test
     let suite = XclbinSuite::new().with_max_cycles(max_cycles);
-    let (outcome, _raw_output, trace_events) = suite.run_single_with_trace(&test);
+    let (outcome, _raw_output, trace_events, binary_trace) = suite.run_single_with_trace(&test);
 
     // Check if the test at least started (we want traces even on validation fail)
     match &outcome {
@@ -631,6 +631,19 @@ fn run_emulator_trace(
 
     if trace_events.is_empty() {
         return Err("no trace events collected".to_string());
+    }
+
+    // Write binary trace buffer if available (raw packets from trace units)
+    if let Some(ref trace_data) = binary_trace {
+        let bin_path = output_dir.join("emu-trace_raw.bin");
+        fs::write(&bin_path, trace_data)
+            .map_err(|e| format!("write emu-trace_raw.bin: {}", e))?;
+        // Count non-zero bytes to report meaningful data size
+        let non_zero = trace_data.iter().filter(|&&b| b != 0).count();
+        log::info!(
+            "{}: wrote {} bytes binary trace ({} non-zero) -> {}",
+            test_name, trace_data.len(), non_zero, bin_path.display()
+        );
     }
 
     // Export to Perfetto JSON

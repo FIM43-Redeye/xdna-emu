@@ -133,6 +133,11 @@ impl NpuExecutor {
         self.host_buffers.push(HostBuffer { address, size });
     }
 
+    /// Get all host buffers (for reading back trace data, etc.).
+    pub fn host_buffers(&self) -> &[HostBuffer] {
+        &self.host_buffers
+    }
+
     /// Execute all instructions in a stream against the device.
     pub fn execute(&mut self, stream: &NpuInstructionStream, device: &mut DeviceState) -> Result<(), String> {
         for instr in stream.instructions() {
@@ -345,24 +350,23 @@ impl NpuExecutor {
 
     /// Execute a DDR patch instruction.
     fn execute_ddr_patch(&mut self, reg_addr: u32, arg_idx: u8, arg_plus: u32, device: &mut DeviceState) -> Result<(), String> {
-        // Extend host_buffers with trace-sized dummy entries if the xclbin
+        // Extend host_buffers with trace-sized entries if the xclbin
         // references arg indices beyond what the test harness allocated.
         // This happens with trace-injected xclbins: trace injection adds an
-        // extra DDR buffer for HW packet trace collection that the emulator
-        // doesn't provide.  We allocate a dummy buffer so the DMA BD gets a
-        // valid address and the trace DMA channel can run (writing into a
-        // region nobody reads).
+        // extra DDR buffer for HW packet trace collection. The emulator's
+        // trace units produce real binary trace packets that flow through
+        // the stream switch and shim DMA into this buffer, matching the
+        // format expected by mlir-aie's parse.py.
         while self.host_buffers.len() <= arg_idx as usize {
             let trace_addr = self.host_buffers.last()
                 .map(|b| b.address + b.size as u64)
                 .unwrap_or(0x10_0000);
             // 1 MB trace buffer, matching the default trace_size
             let trace_size = 1_048_576;
-            log::warn!(
+            log::info!(
                 "DDR patch references arg_idx {} beyond {} known buffers -- \
-                 allocating dummy trace buffer at 0x{:X} ({}KB). \
-                 TODO: implement full emulator-side tracing to produce \
-                 real packet trace data here.",
+                 allocating trace buffer at 0x{:X} ({}KB) for binary \
+                 trace packet collection.",
                 arg_idx,
                 self.host_buffers.len(),
                 trace_addr,
