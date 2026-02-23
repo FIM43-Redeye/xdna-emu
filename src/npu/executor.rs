@@ -344,15 +344,37 @@ impl NpuExecutor {
     }
 
     /// Execute a DDR patch instruction.
-    fn execute_ddr_patch(&self, reg_addr: u32, arg_idx: u8, arg_plus: u32, device: &mut DeviceState) -> Result<(), String> {
-        // Get the host buffer address
-        let buffer = self.host_buffers.get(arg_idx as usize).ok_or_else(|| {
-            format!(
-                "DDR patch references arg_idx {} but only {} buffers available",
+    fn execute_ddr_patch(&mut self, reg_addr: u32, arg_idx: u8, arg_plus: u32, device: &mut DeviceState) -> Result<(), String> {
+        // Extend host_buffers with trace-sized dummy entries if the xclbin
+        // references arg indices beyond what the test harness allocated.
+        // This happens with trace-injected xclbins: trace injection adds an
+        // extra DDR buffer for HW packet trace collection that the emulator
+        // doesn't provide.  We allocate a dummy buffer so the DMA BD gets a
+        // valid address and the trace DMA channel can run (writing into a
+        // region nobody reads).
+        while self.host_buffers.len() <= arg_idx as usize {
+            let trace_addr = self.host_buffers.last()
+                .map(|b| b.address + b.size as u64)
+                .unwrap_or(0x10_0000);
+            // 1 MB trace buffer, matching the default trace_size
+            let trace_size = 1_048_576;
+            log::warn!(
+                "DDR patch references arg_idx {} beyond {} known buffers -- \
+                 allocating dummy trace buffer at 0x{:X} ({}KB). \
+                 TODO: implement full emulator-side tracing to produce \
+                 real packet trace data here.",
                 arg_idx,
-                self.host_buffers.len()
-            )
-        })?;
+                self.host_buffers.len(),
+                trace_addr,
+                trace_size / 1024,
+            );
+            self.host_buffers.push(HostBuffer {
+                address: trace_addr,
+                size: trace_size,
+            });
+        }
+
+        let buffer = &self.host_buffers[arg_idx as usize];
 
         let patched_addr = buffer.address + arg_plus as u64;
 
