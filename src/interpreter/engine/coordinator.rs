@@ -477,7 +477,7 @@ impl InterpreterEngine {
                     crate::trace::mem_event_to_hw_id(&event)
                 };
                 if let Some(id) = hw_id {
-                    tile.mem_trace.notify_event(id, cycle);
+                    tile.notify_mem_trace_event(id, cycle);
                 }
             }
             self.trace_log.push(TileTracedEvent { col, row, cycle, event });
@@ -556,9 +556,9 @@ impl InterpreterEngine {
                 // Compute tiles use core_trace for port events (CoreEvent namespace).
                 // MemTiles and shim tiles use mem_trace.
                 if tt == TileType::Compute {
-                    tile.core_trace.notify_event(hw_id, cycle);
+                    tile.notify_core_trace_event(hw_id, cycle);
                 } else {
-                    tile.mem_trace.notify_event(hw_id, cycle);
+                    tile.notify_mem_trace_event(hw_id, cycle);
                 }
             }
         }
@@ -662,7 +662,7 @@ impl InterpreterEngine {
                     if new_start < events.len() {
                         for evt in &events[new_start..] {
                             if let Some(hw_id) = crate::trace::core_event_to_hw_id(&evt.event) {
-                                tile.core_trace.notify_event(hw_id, evt.cycle);
+                                tile.notify_core_trace_event(hw_id, evt.cycle);
                             }
                         }
                         core.trace_events_consumed = events.len();
@@ -722,7 +722,19 @@ impl InterpreterEngine {
                 } else {
                     crate::trace::mem_conflict_dm_bank_hw_id(bank)
                 };
-                tile.mem_trace.notify_event(hw_id, cycle);
+                tile.notify_mem_trace_event(hw_id, cycle);
+            }
+        }
+
+        // Phase 3c: Evaluate edge detectors.
+        //
+        // After all raw events have been generated (DMA, port, core, bank
+        // conflict), check edge detectors for rising/falling transitions
+        // and fire EDGE_DETECTION_EVENT_0/1 as needed.
+        {
+            let cycle = self.total_cycles;
+            for tile in &mut self.device.array.tiles {
+                tile.evaluate_edge_detectors(cycle);
             }
         }
 

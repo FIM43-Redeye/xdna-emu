@@ -588,6 +588,33 @@ pub fn memtile_conflict_dm_bank_hw_id(bank: u8) -> u8 {
     112 + bank
 }
 
+// ============================================================================
+// Edge detection event IDs
+// ============================================================================
+//
+// Edge detection monitors event signal transitions (rising/falling edges).
+// Each module has two independent edge detectors that produce derived events.
+//
+// Source: xaie_events_aieml.h
+
+/// CoreEvent EDGE_DETECTION_EVENT_N hardware event ID.
+/// Core module: IDs 13-14 for detectors 0-1.
+pub fn core_edge_detection_event_hw_id(detector: u8) -> u8 {
+    13 + detector
+}
+
+/// MemEvent EDGE_DETECTION_EVENT_N hardware event ID.
+/// Compute tile memory module: IDs 11-12 for detectors 0-1.
+pub fn mem_edge_detection_event_hw_id(detector: u8) -> u8 {
+    11 + detector
+}
+
+/// MemTileEvent EDGE_DETECTION_EVENT_N hardware event ID.
+/// MemTile memory module: IDs 13-14 for detectors 0-1.
+pub fn memtile_edge_detection_event_hw_id(detector: u8) -> u8 {
+    13 + detector
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -926,5 +953,20 @@ mod tests {
         // MemTile: GROUP_MEMORY_CONFLICT=111, BANK_0=112..BANK_15=127
         assert_eq!(memtile_conflict_dm_bank_hw_id(0), 112);
         assert_eq!(memtile_conflict_dm_bank_hw_id(15), 127);
+    }
+
+    #[test]
+    fn test_edge_detection_event_hw_ids() {
+        // Core module: EDGE_DETECTION_EVENT_0=13, EVENT_1=14
+        assert_eq!(core_edge_detection_event_hw_id(0), 13);
+        assert_eq!(core_edge_detection_event_hw_id(1), 14);
+
+        // Memory module: EDGE_DETECTION_EVENT_0=11, EVENT_1=12
+        assert_eq!(mem_edge_detection_event_hw_id(0), 11);
+        assert_eq!(mem_edge_detection_event_hw_id(1), 12);
+
+        // MemTile: EDGE_DETECTION_EVENT_0=13, EVENT_1=14
+        assert_eq!(memtile_edge_detection_event_hw_id(0), 13);
+        assert_eq!(memtile_edge_detection_event_hw_id(1), 14);
     }
 }

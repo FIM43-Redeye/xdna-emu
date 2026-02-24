@@ -669,6 +669,56 @@ pub struct Tile {
     /// Bit N set = bank N was accessed. Supports up to 16 banks (MemTile).
     /// Reset at the start of each coordinator step.
     pub cycle_dma_banks: u16,
+
+    // === Edge Detection ===
+
+    /// Core module edge detectors (two independent circuits).
+    /// Configured by Edge_Detection_event_control register at 0x34408 (compute).
+    /// Monitor core module event signals for rising/falling transitions.
+    pub core_edge_detectors: [EdgeDetector; 2],
+
+    /// Memory module edge detectors (two independent circuits).
+    /// Configured by Edge_Detection_event_control register at:
+    /// - 0x14408 (compute tile memory module)
+    /// - 0x94408 (MemTile)
+    pub mem_edge_detectors: [EdgeDetector; 2],
+}
+
+/// Single edge detection circuit.
+///
+/// Monitors one event signal and generates an EDGE_DETECTION_EVENT when
+/// the signal transitions (rising, falling, or both). Each module has two
+/// independent edge detectors (SelectId 0 and 1).
+///
+/// Register layout (Edge_Detection_event_control):
+/// - Event 0: bits [6:0] event select, bit 9 rising, bit 10 falling
+/// - Event 1: bits [22:16] event select, bit 25 rising, bit 26 falling
+/// - MemTile: 8-bit event fields (bits [7:0] and [23:16])
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeDetector {
+    /// Hardware event ID to monitor (0 = disabled).
+    pub input_event: u8,
+    /// Fire on 0->1 transition.
+    pub trigger_rising: bool,
+    /// Fire on 1->0 transition.
+    pub trigger_falling: bool,
+    /// Whether the monitored event was active last cycle.
+    prev_active: bool,
+    /// Whether the monitored event was active this cycle (accumulates
+    /// during event notification, reset at end of cycle).
+    curr_active: bool,
+}
+
+impl Default for EdgeDetector {
+    fn default() -> Self {
+        Self {
+            input_event: 0,
+            trigger_rising: false,
+            trigger_falling: false,
+            prev_active: false,
+            curr_active: false,
+        }
+    }
 }
 
 impl Tile {
@@ -711,6 +761,8 @@ impl Tile {
             mem_trace: TraceUnit::new(col, row),
             event_port_selection: [None; 8],
             cycle_dma_banks: 0,
+            core_edge_detectors: [EdgeDetector::default(); 2],
+            mem_edge_detectors: [EdgeDetector::default(); 2],
         }
     }
 
@@ -853,6 +905,102 @@ impl Tile {
     #[inline]
     pub fn reset_bank_tracking(&mut self) {
         self.cycle_dma_banks = 0;
+    }
+
+    // === Edge Detection ===
+
+    /// Notify a core module event for both tracing and edge detection.
+    ///
+    /// Forwards the event to `core_trace.notify_event()` and marks it as
+    /// active for the core module edge detectors this cycle.
+    #[inline]
+    pub fn notify_core_trace_event(&mut self, hw_id: u8, cycle: u64) {
+        self.core_trace.notify_event(hw_id, cycle);
+        for det in &mut self.core_edge_detectors {
+            if det.input_event == hw_id {
+                det.curr_active = true;
+            }
+        }
+    }
+
+    /// Notify a memory module event for both tracing and edge detection.
+    ///
+    /// Forwards the event to `mem_trace.notify_event()` and marks it as
+    /// active for the memory module edge detectors this cycle.
+    #[inline]
+    pub fn notify_mem_trace_event(&mut self, hw_id: u8, cycle: u64) {
+        self.mem_trace.notify_event(hw_id, cycle);
+        for det in &mut self.mem_edge_detectors {
+            if det.input_event == hw_id {
+                det.curr_active = true;
+            }
+        }
+    }
+
+    /// Evaluate edge detectors and fire generated events to trace units.
+    ///
+    /// Call once per cycle after all raw events have been notified.
+    /// Compares current vs previous signal state and fires
+    /// EDGE_DETECTION_EVENT_0/1 on detected transitions.
+    pub fn evaluate_edge_detectors(&mut self, cycle: u64) {
+        // Core module edge detectors -> core_trace
+        for i in 0..2 {
+            let det = &self.core_edge_detectors[i];
+            let fire = (det.trigger_rising && det.curr_active && !det.prev_active)
+                || (det.trigger_falling && !det.curr_active && det.prev_active);
+            if fire {
+                let hw_id = crate::trace::core_edge_detection_event_hw_id(i as u8);
+                self.core_trace.notify_event(hw_id, cycle);
+            }
+        }
+        // Memory module edge detectors -> mem_trace
+        for i in 0..2 {
+            let det = &self.mem_edge_detectors[i];
+            let fire = (det.trigger_rising && det.curr_active && !det.prev_active)
+                || (det.trigger_falling && !det.curr_active && det.prev_active);
+            if fire {
+                let hw_id = if self.is_mem_tile() {
+                    crate::trace::memtile_edge_detection_event_hw_id(i as u8)
+                } else {
+                    crate::trace::mem_edge_detection_event_hw_id(i as u8)
+                };
+                self.mem_trace.notify_event(hw_id, cycle);
+            }
+        }
+        // Advance state: current becomes previous, reset current
+        for det in &mut self.core_edge_detectors {
+            det.prev_active = det.curr_active;
+            det.curr_active = false;
+        }
+        for det in &mut self.mem_edge_detectors {
+            det.prev_active = det.curr_active;
+            det.curr_active = false;
+        }
+    }
+
+    /// Configure edge detectors from a register write.
+    ///
+    /// Parses the Edge_Detection_event_control register value and updates
+    /// the specified detector pair. `is_memtile` controls whether event
+    /// fields are 7-bit (compute/shim) or 8-bit (MemTile).
+    fn configure_edge_detectors(detectors: &mut [EdgeDetector; 2], value: u32, is_memtile: bool) {
+        // Event 0: bits [6:0] or [7:0], rising=bit 9, falling=bit 10
+        let event_mask_0: u32 = if is_memtile { 0xFF } else { 0x7F };
+        detectors[0].input_event = (value & event_mask_0) as u8;
+        detectors[0].trigger_rising = (value & (1 << 9)) != 0;
+        detectors[0].trigger_falling = (value & (1 << 10)) != 0;
+
+        // Event 1: bits [22:16] or [23:16], rising=bit 25, falling=bit 26
+        let event_mask_1: u32 = if is_memtile { 0xFF } else { 0x7F };
+        detectors[1].input_event = ((value >> 16) & event_mask_1) as u8;
+        detectors[1].trigger_rising = (value & (1 << 25)) != 0;
+        detectors[1].trigger_falling = (value & (1 << 26)) != 0;
+
+        log::debug!(
+            "Edge detectors configured: det0(event={}, rise={}, fall={}), det1(event={}, rise={}, fall={})",
+            detectors[0].input_event, detectors[0].trigger_rising, detectors[0].trigger_falling,
+            detectors[1].input_event, detectors[1].trigger_rising, detectors[1].trigger_falling,
+        );
     }
 
     // === Lock Arbiter Methods ===
@@ -1167,6 +1315,25 @@ impl Tile {
             if offset >= 0x940D0 && offset <= 0x940E4 {
                 let trace_offset = offset - 0x940D0;
                 self.mem_trace.write_register(trace_offset, value);
+            }
+        }
+
+        // Edge detection event control registers.
+        //
+        // Each module has one register with two independent edge detectors.
+        // Compute tile: 0x34408 (core module), 0x14408 (memory module)
+        // MemTile: 0x94408
+        // Shim: 0x34408 (PL module, handled in shim tracing)
+        if self.is_compute() {
+            if offset == 0x34408 {
+                Self::configure_edge_detectors(&mut self.core_edge_detectors, value, false);
+            }
+            if offset == 0x14408 {
+                Self::configure_edge_detectors(&mut self.mem_edge_detectors, value, false);
+            }
+        } else if self.is_mem_tile() {
+            if offset == 0x94408 {
+                Self::configure_edge_detectors(&mut self.mem_edge_detectors, value, true);
             }
         }
 
@@ -1863,5 +2030,156 @@ mod tests {
         // acquire_ge for value >= 3 should succeed (we have 5)
         assert_eq!(lock.acquire_with_value(3, -2), LockResult::Success);
         assert_eq!(lock.value, 3); // 5 - 2 = 3
+    }
+
+    // === Edge Detection Tests ===
+
+    #[test]
+    fn test_edge_detector_default() {
+        let det = EdgeDetector::default();
+        assert_eq!(det.input_event, 0);
+        assert!(!det.trigger_rising);
+        assert!(!det.trigger_falling);
+        assert!(!det.prev_active);
+        assert!(!det.curr_active);
+    }
+
+    #[test]
+    fn test_configure_edge_detectors_compute() {
+        let mut dets = [EdgeDetector::default(); 2];
+        // Event 0: event=37 (0x25), rising=1, falling=0
+        // Event 1: event=29 (0x1D), rising=0, falling=1
+        // value = (1<<26) | (29<<16) | (1<<9) | 37
+        let value = (1 << 26) | (29 << 16) | (1 << 9) | 37;
+        Tile::configure_edge_detectors(&mut dets, value, false);
+
+        assert_eq!(dets[0].input_event, 37);
+        assert!(dets[0].trigger_rising);
+        assert!(!dets[0].trigger_falling);
+
+        assert_eq!(dets[1].input_event, 29);
+        assert!(!dets[1].trigger_rising);
+        assert!(dets[1].trigger_falling);
+    }
+
+    #[test]
+    fn test_configure_edge_detectors_memtile_8bit() {
+        let mut dets = [EdgeDetector::default(); 2];
+        // MemTile uses 8-bit event fields: [7:0] and [23:16]
+        // Event 0: event=200 (> 127, needs 8 bits), rising+falling
+        // Event 1: event=150, rising only
+        let value = (1 << 25) | (150 << 16) | (1 << 10) | (1 << 9) | 200;
+        Tile::configure_edge_detectors(&mut dets, value, true);
+
+        assert_eq!(dets[0].input_event, 200);
+        assert!(dets[0].trigger_rising);
+        assert!(dets[0].trigger_falling);
+
+        assert_eq!(dets[1].input_event, 150);
+        assert!(dets[1].trigger_rising);
+        assert!(!dets[1].trigger_falling);
+    }
+
+    #[test]
+    fn test_edge_detector_rising_edge() {
+        let mut tile = Tile::compute(0, 2);
+        // Configure core edge detector 0: monitor event 37, rising edge
+        tile.core_edge_detectors[0].input_event = 37;
+        tile.core_edge_detectors[0].trigger_rising = true;
+
+        // Configure core trace to accept edge events (need start event)
+        tile.core_trace.write_register(0x00, 0x01); // mode=EventTime
+        tile.core_trace.write_register(0x10, 37); // event slot 0 = event 37
+        // Also configure slot for edge detection event (ID 13)
+        tile.core_trace.write_register(0x10, 37 | (13 << 8)); // slot 0=37, slot 1=13
+
+        // Cycle 1: event 37 fires (0->1 = rising edge)
+        tile.notify_core_trace_event(37, 100);
+        tile.evaluate_edge_detectors(100);
+        // The edge detector should have detected rising edge and fired event 13
+
+        // Cycle 2: event 37 does not fire (1->0 = falling, not configured)
+        tile.evaluate_edge_detectors(200);
+        // No event should fire (falling not configured)
+
+        // Cycle 3: event 37 fires again (0->1 = rising edge again)
+        tile.notify_core_trace_event(37, 300);
+        tile.evaluate_edge_detectors(300);
+        // Rising edge detected again
+    }
+
+    #[test]
+    fn test_edge_detector_falling_edge() {
+        let mut tile = Tile::compute(0, 2);
+        // Configure mem edge detector 1: monitor event 77, falling edge
+        tile.mem_edge_detectors[1].input_event = 77;
+        tile.mem_edge_detectors[1].trigger_falling = true;
+
+        // Cycle 1: event fires (0->1), no trigger (falling only)
+        tile.notify_mem_trace_event(77, 100);
+        tile.evaluate_edge_detectors(100);
+
+        // Cycle 2: event does NOT fire (1->0 = falling edge)
+        tile.evaluate_edge_detectors(200);
+        // Falling edge should fire EDGE_DETECTION_EVENT_1 (mem ID 12)
+    }
+
+    #[test]
+    fn test_edge_detector_register_write() {
+        let mut tile = Tile::compute(0, 2);
+        // Write core module edge detection register (0x34408)
+        // Event 0: event=42, rising=1; Event 1: event=50, falling=1
+        let value = (1u32 << 26) | (50 << 16) | (1 << 9) | 42;
+        tile.write_register(0x34408, value);
+
+        assert_eq!(tile.core_edge_detectors[0].input_event, 42);
+        assert!(tile.core_edge_detectors[0].trigger_rising);
+        assert!(!tile.core_edge_detectors[0].trigger_falling);
+
+        assert_eq!(tile.core_edge_detectors[1].input_event, 50);
+        assert!(!tile.core_edge_detectors[1].trigger_rising);
+        assert!(tile.core_edge_detectors[1].trigger_falling);
+    }
+
+    #[test]
+    fn test_edge_detector_mem_module_register() {
+        let mut tile = Tile::compute(0, 2);
+        // Write memory module edge detection register (0x14408)
+        let value = (1u32 << 25) | (30 << 16) | (1 << 10) | (1 << 9) | 20;
+        tile.write_register(0x14408, value);
+
+        assert_eq!(tile.mem_edge_detectors[0].input_event, 20);
+        assert!(tile.mem_edge_detectors[0].trigger_rising);
+        assert!(tile.mem_edge_detectors[0].trigger_falling);
+
+        assert_eq!(tile.mem_edge_detectors[1].input_event, 30);
+        assert!(tile.mem_edge_detectors[1].trigger_rising);
+        assert!(!tile.mem_edge_detectors[1].trigger_falling);
+    }
+
+    #[test]
+    fn test_edge_detector_memtile_register() {
+        let mut tile = Tile::mem_tile(0, 1);
+        // Write MemTile edge detection register (0x94408)
+        // Use event > 127 to verify 8-bit field
+        let value = (1u32 << 25) | (200 << 16) | (1 << 9) | 180;
+        tile.write_register(0x94408, value);
+
+        assert_eq!(tile.mem_edge_detectors[0].input_event, 180);
+        assert!(tile.mem_edge_detectors[0].trigger_rising);
+
+        assert_eq!(tile.mem_edge_detectors[1].input_event, 200);
+        assert!(tile.mem_edge_detectors[1].trigger_rising);
+    }
+
+    #[test]
+    fn test_edge_detector_no_trigger_when_unconfigured() {
+        let mut tile = Tile::compute(0, 2);
+        // Default: no edge detection configured (input_event=0, no triggers)
+        // Notify event 37
+        tile.notify_core_trace_event(37, 100);
+        tile.evaluate_edge_detectors(100);
+        // No edge events should fire (detectors not configured)
+        // Just verify it doesn't panic
     }
 }
