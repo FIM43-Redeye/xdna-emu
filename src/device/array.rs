@@ -381,16 +381,6 @@ impl TileArray {
     ///
     /// Returns the total number of words forwarded across all tiles.
     pub fn step_tile_switches(&mut self) -> usize {
-        // Debug: check MemTile slave[13] state BEFORE stepping
-        for tile in &self.tiles {
-            if tile.row == 1 && tile.col == 0 {
-                let slave13_len = tile.stream_switch.slaves.get(13).map(|s| s.fifo.len()).unwrap_or(0);
-                if slave13_len > 0 {
-                    log::debug!("PRE-step: MemTile({},{}) slave[13] fifo_len={}", tile.col, tile.row, slave13_len);
-                }
-            }
-        }
-
         let mut total_forwarded = 0;
         for tile in &mut self.tiles {
             total_forwarded += tile.stream_switch.step();
@@ -757,41 +747,40 @@ impl TileArray {
             match tile_type {
                 TileType::Compute => {
                     // Core trace -> slave[23] (AIE_TRACE)
-                    while let Some(packet) = self.tiles[i].core_trace.pop_packet() {
-                        for word in packet {
-                            if self.tiles[i].stream_switch.slaves[23].push(word) {
-                                words_routed += 1;
-                            }
-                        }
+                    while self.tiles[i].core_trace.has_pending_words()
+                        && self.tiles[i].stream_switch.slaves[23].can_accept()
+                    {
+                        let (word, tlast) = self.tiles[i].core_trace.pop_word().unwrap();
+                        self.tiles[i].stream_switch.slaves[23].push_with_tlast(word, tlast);
+                        words_routed += 1;
                     }
                     // Memory trace -> slave[24] (MEM_TRACE)
-                    while let Some(packet) = self.tiles[i].mem_trace.pop_packet() {
-                        for word in packet {
-                            if self.tiles[i].stream_switch.slaves[24].push(word) {
-                                words_routed += 1;
-                            }
-                        }
+                    while self.tiles[i].mem_trace.has_pending_words()
+                        && self.tiles[i].stream_switch.slaves[24].can_accept()
+                    {
+                        let (word, tlast) = self.tiles[i].mem_trace.pop_word().unwrap();
+                        self.tiles[i].stream_switch.slaves[24].push_with_tlast(word, tlast);
+                        words_routed += 1;
                     }
                 }
                 TileType::MemTile => {
                     // Memory trace -> slave[17] (TRACE)
-                    while let Some(packet) = self.tiles[i].mem_trace.pop_packet() {
-                        for word in packet {
-                            if self.tiles[i].stream_switch.slaves[17].push(word) {
-                                words_routed += 1;
-                            }
-                        }
+                    while self.tiles[i].mem_trace.has_pending_words()
+                        && self.tiles[i].stream_switch.slaves[17].can_accept()
+                    {
+                        let (word, tlast) = self.tiles[i].mem_trace.pop_word().unwrap();
+                        self.tiles[i].stream_switch.slaves[17].push_with_tlast(word, tlast);
+                        words_routed += 1;
                     }
                 }
                 TileType::Shim => {
                     // Shim trace -> slave[22] (TRACE) -- rarely used
-                    // but wire it for completeness
-                    while let Some(packet) = self.tiles[i].mem_trace.pop_packet() {
-                        for word in packet {
-                            if self.tiles[i].stream_switch.slaves[22].push(word) {
-                                words_routed += 1;
-                            }
-                        }
+                    while self.tiles[i].mem_trace.has_pending_words()
+                        && self.tiles[i].stream_switch.slaves[22].can_accept()
+                    {
+                        let (word, tlast) = self.tiles[i].mem_trace.pop_word().unwrap();
+                        self.tiles[i].stream_switch.slaves[22].push_with_tlast(word, tlast);
+                        words_routed += 1;
                     }
                 }
             }

@@ -337,6 +337,8 @@ pub struct ActivePacket {
     pub target_masters: Vec<u8>,
     /// Number of data words forwarded so far
     pub words_forwarded: usize,
+    /// Which arbiter this packet is using (for lock release on TLAST).
+    pub arbiter: u8,
 }
 
 /// A local route within a stream switch (slave to master).
@@ -388,6 +390,11 @@ pub struct StreamSwitch {
     /// Per-slave active packet tracking for mid-packet forwarding.
     /// `Some(ActivePacket)` while forwarding data words between header and TLAST.
     active_packets: Vec<Option<ActivePacket>>,
+    /// Per-arbiter lock: which slave port currently holds each arbiter.
+    /// `None` = arbiter is free, `Some(slave_idx)` = locked by that slave
+    /// until TLAST. Prevents packet interleaving when multiple slaves route
+    /// through the same arbiter simultaneously. 8 arbiters max (3-bit field).
+    arbiter_locks: [Option<usize>; 8],
 }
 
 impl StreamSwitch {
@@ -430,6 +437,7 @@ impl StreamSwitch {
             slave_slots: vec![[PacketSlot::default(); 4]; num_slaves],
             master_packet_config: vec![MasterPacketConfig::default(); num_masters],
             active_packets: vec![None; num_slaves],
+            arbiter_locks: [None; 8],
         }
     }
 
@@ -462,6 +470,7 @@ impl StreamSwitch {
             slave_slots: vec![[PacketSlot::default(); 4]; num_slaves],
             master_packet_config: vec![MasterPacketConfig::default(); num_masters],
             active_packets: vec![None; num_slaves],
+            arbiter_locks: [None; 8],
         }
     }
 
@@ -492,6 +501,7 @@ impl StreamSwitch {
             slave_slots: vec![[PacketSlot::default(); 4]; num_slaves],
             master_packet_config: vec![MasterPacketConfig::default(); num_masters],
             active_packets: vec![None; num_slaves],
+            arbiter_locks: [None; 8],
         }
     }
 
@@ -704,7 +714,9 @@ impl StreamSwitch {
     ///
     /// Scans the slave's 4 slots for a match on `pkt_id`, then finds all
     /// masters on the matching arbiter whose msel_enable includes the slot's msel.
-    fn resolve_packet_route(&self, slave_port: usize, pkt_id: u8) -> Option<(Vec<u8>, bool)> {
+    ///
+    /// Returns `(target_masters, all_drop_header, arbiter)`.
+    fn resolve_packet_route(&self, slave_port: usize, pkt_id: u8) -> Option<(Vec<u8>, bool, u8)> {
         if slave_port >= self.slave_slots.len() {
             return None;
         }
@@ -731,7 +743,7 @@ impl StreamSwitch {
                 log::debug!("TileSwitch({},{}): pkt_id={} matched slave[{}] slot(arb={},msel={}) -> masters {:?} drop_hdr={}",
                     self.col, self.row, pkt_id, slave_port,
                     slot.arbiter, slot.msel, masters, all_drop_header);
-                return Some((masters, all_drop_header));
+                return Some((masters, all_drop_header, slot.arbiter));
             }
         }
 
@@ -775,7 +787,34 @@ impl StreamSwitch {
 
                 // Resolve route
                 match self.resolve_packet_route(slave_idx, pkt_id) {
-                    Some((masters, all_drop_header)) => {
+                    Some((masters, all_drop_header, arbiter)) => {
+                        // Check arbiter lock: another slave may hold this arbiter
+                        if let Some(locked_by) = self.arbiter_locks[arbiter as usize] {
+                            if locked_by != slave_idx {
+                                // Arbiter busy -- backpressure (hold data in FIFO)
+                                log::trace!("TileSwitch({},{}): slave[{}] waiting for arbiter {} (held by slave[{}])",
+                                    self.col, self.row, slave_idx, arbiter, locked_by);
+                                continue;
+                            }
+                        }
+
+                        // Backpressure: check that all target masters can accept
+                        // BEFORE consuming from slave. If any master is full,
+                        // hold data in the slave FIFO until next cycle.
+                        if !all_drop_header {
+                            let all_can_accept = masters.iter().all(|&m| {
+                                let m = m as usize;
+                                m >= self.masters.len()
+                                    || self.master_packet_config[m].drop_header
+                                    || self.masters[m].can_accept()
+                            });
+                            if !all_can_accept {
+                                log::trace!("TileSwitch({},{}): slave[{}] header backpressure (master full)",
+                                    self.col, self.row, slave_idx);
+                                continue;
+                            }
+                        }
+
                         // Consume the header word from slave
                         let (data, tlast) = self.slaves[slave_idx].pop_with_tlast().unwrap();
 
@@ -790,18 +829,21 @@ impl StreamSwitch {
                         }
                         words_forwarded += 1;
 
-                        log::debug!("TileSwitch({},{}): pkt header 0x{:08X} (id={}) slave[{}] -> masters {:?}{}{}",
-                            self.col, self.row, data, pkt_id, slave_idx, masters,
+                        log::debug!("TileSwitch({},{}): pkt header 0x{:08X} (id={}) slave[{}] -> masters {:?} arb={}{}{}",
+                            self.col, self.row, data, pkt_id, slave_idx, masters, arbiter,
                             if all_drop_header { " (header dropped)" } else { "" },
                             if tlast { " TLAST" } else { "" });
 
                         if tlast {
                             // Single-word packet (header only with TLAST)
-                            // Don't set active_packets -- we're done
+                            // No lock needed -- packet is complete
                         } else {
+                            // Lock the arbiter for this multi-word packet
+                            self.arbiter_locks[arbiter as usize] = Some(slave_idx);
                             self.active_packets[slave_idx] = Some(ActivePacket {
                                 target_masters: masters,
                                 words_forwarded: 0,
+                                arbiter,
                             });
                         }
                     }
@@ -814,12 +856,27 @@ impl StreamSwitch {
                 }
             } else {
                 // === Mid-packet: forward data word ===
+
+                // Backpressure: check that all target masters can accept
+                // BEFORE consuming from slave. If any master is full,
+                // hold data in the slave FIFO until next cycle.
+                let active = self.active_packets[slave_idx].as_ref().unwrap();
+                let all_can_accept = active.target_masters.iter().all(|&m| {
+                    let m = m as usize;
+                    m >= self.masters.len() || self.masters[m].can_accept()
+                });
+                if !all_can_accept {
+                    log::trace!("TileSwitch({},{}): slave[{}] data backpressure (master full)",
+                        self.col, self.row, slave_idx);
+                    continue;
+                }
+
                 let (data, tlast) = match self.slaves[slave_idx].pop_with_tlast() {
                     Some(dt) => dt,
                     None => continue,
                 };
 
-                // Push to all target masters
+                // Push to all target masters (guaranteed to succeed via check above)
                 let active = self.active_packets[slave_idx].as_ref().unwrap();
                 let targets: Vec<u8> = active.target_masters.clone();
                 for &m in &targets {
@@ -835,6 +892,10 @@ impl StreamSwitch {
                 }
 
                 if tlast {
+                    // Release arbiter lock
+                    if let Some(ref active) = self.active_packets[slave_idx] {
+                        self.arbiter_locks[active.arbiter as usize] = None;
+                    }
                     log::debug!("TileSwitch({},{}): pkt data 0x{:08X} slave[{}] -> {:?} TLAST (end of pkt)",
                         self.col, self.row, data, slave_idx, targets);
                     self.active_packets[slave_idx] = None;
@@ -1693,5 +1754,171 @@ mod tests {
         assert_eq!(PacketType::from_u8(3), PacketType::Trace);
         assert_eq!(PacketType::from_u8(4), PacketType::Reserved);
         assert_eq!(PacketType::from_u8(7), PacketType::Reserved);
+    }
+
+    // ========================================================================
+    // Arbiter Locking Tests
+    // ========================================================================
+
+    /// Helper: build a slave slot register value.
+    /// Layout: id[28:24], mask[20:16], enable[8], msel[5:4], arbiter[2:0]
+    fn make_slot_reg(pkt_id: u8, mask: u8, msel: u8, arbiter: u8) -> u32 {
+        ((pkt_id as u32) << 24) | ((mask as u32) << 16) | (1 << 8) | ((msel as u32) << 4) | (arbiter as u32)
+    }
+
+    /// Helper: build a master packet config register value.
+    /// Layout: enable[31], packet_enable[30], drop_header[7], msel_enable[6:3], arbiter[2:0]
+    fn make_master_pkt_reg(arbiter: u8, msel_enable: u8, drop_header: bool) -> u32 {
+        (1 << 31) | (1 << 30)
+            | if drop_header { 1 << 7 } else { 0 }
+            | ((msel_enable as u32) << 3)
+            | (arbiter as u32)
+    }
+
+    #[test]
+    fn test_arbiter_lock_prevents_interleave() {
+        // Two slaves route through the SAME arbiter to the same master.
+        // With locking, one completes its full packet before the other starts.
+        let mut ss = StreamSwitch::new_compute_tile(0, 2);
+
+        // Slave 23 (core trace): pkt_id=1, arbiter=0, msel=0
+        ss.configure_slave_slot(23, 0, make_slot_reg(1, 0x1F, 0, 0));
+        // Slave 24 (mem trace): pkt_id=2, arbiter=0, msel=0
+        ss.configure_slave_slot(24, 0, make_slot_reg(2, 0x1F, 0, 0));
+
+        // Master 7: packet mode, arbiter=0, msel_enable=0b0001 (accepts msel=0)
+        ss.configure_master_packet(7, make_master_pkt_reg(0, 0b0001, false));
+
+        // Build two 4-word packets (header + 3 data + TLAST on last).
+        // Slave FIFO is 4 deep, so these fit. Master FIFO is only 2 deep,
+        // so we drain between steps to simulate downstream consumption.
+        let hdr1 = PacketHeader::new(1, 0, 2).with_type(PacketType::Trace);
+        let hdr2 = PacketHeader::new(2, 0, 2).with_type(PacketType::Trace);
+
+        // Packet 1 on slave 23
+        ss.slaves[23].push_with_tlast(hdr1.encode(), false);
+        ss.slaves[23].push_with_tlast(0xAAAA_0001, false);
+        ss.slaves[23].push_with_tlast(0xAAAA_0002, false);
+        ss.slaves[23].push_with_tlast(0xAAAA_0003, true);
+
+        // Packet 2 on slave 24
+        ss.slaves[24].push_with_tlast(hdr2.encode(), false);
+        ss.slaves[24].push_with_tlast(0xBBBB_0001, false);
+        ss.slaves[24].push_with_tlast(0xBBBB_0002, false);
+        ss.slaves[24].push_with_tlast(0xBBBB_0003, true);
+
+        // Step and drain the master each time (simulates downstream consumer)
+        let mut output: Vec<u32> = Vec::new();
+        for _ in 0..20 {
+            ss.step();
+            while let Some((word, _)) = ss.masters[7].pop_with_tlast() {
+                output.push(word);
+            }
+        }
+
+        // Should have all 8 words (2 x 4-word packets)
+        assert_eq!(output.len(), 8, "expected 8 words, got {}: {:08X?}", output.len(), output);
+
+        // First 4 words must ALL be from the same packet (no interleaving).
+        // Slave 23 has lower index, so it gets priority.
+        let first_pkt_id = output[0] & 0x1F;
+        assert_eq!(first_pkt_id, 1, "slave 23 (lower index) should go first");
+
+        // Words 1-3 of first packet: 0xAAAA_xxxx
+        for i in 1..4 {
+            assert_eq!(output[i] >> 16, 0xAAAA,
+                "word {} should be from packet 1, got 0x{:08X}", i, output[i]);
+        }
+
+        // Second packet: words 4-7
+        let second_pkt_id = output[4] & 0x1F;
+        assert_eq!(second_pkt_id, 2, "packet 2 should follow");
+        for i in 5..8 {
+            assert_eq!(output[i] >> 16, 0xBBBB,
+                "word {} should be from packet 2, got 0x{:08X}", i, output[i]);
+        }
+    }
+
+    #[test]
+    fn test_different_arbiters_no_contention() {
+        // Two slaves use DIFFERENT arbiters -- both proceed simultaneously.
+        let mut ss = StreamSwitch::new_compute_tile(0, 2);
+
+        // Slave 23: pkt_id=1, arbiter=0, msel=0
+        ss.configure_slave_slot(23, 0, make_slot_reg(1, 0x1F, 0, 0));
+        // Slave 24: pkt_id=2, arbiter=1, msel=0
+        ss.configure_slave_slot(24, 0, make_slot_reg(2, 0x1F, 0, 1));
+
+        // Master 7: arbiter=0, master 8: arbiter=1
+        ss.configure_master_packet(7, make_master_pkt_reg(0, 0b0001, false));
+        ss.configure_master_packet(8, make_master_pkt_reg(1, 0b0001, false));
+
+        let hdr1 = PacketHeader::new(1, 0, 2).with_type(PacketType::Trace);
+        let hdr2 = PacketHeader::new(2, 0, 2).with_type(PacketType::Trace);
+
+        // 2-word packets (header + data+TLAST) fit within 2-deep master FIFO
+        ss.slaves[23].push_with_tlast(hdr1.encode(), false);
+        ss.slaves[23].push_with_tlast(0xAAAA_0001, true);
+
+        ss.slaves[24].push_with_tlast(hdr2.encode(), false);
+        ss.slaves[24].push_with_tlast(0xBBBB_0001, true);
+
+        // Step 1: both headers forward in parallel (different arbiters)
+        let words = ss.step();
+        assert_eq!(words, 2, "both slaves should forward in parallel");
+
+        // Step 2: both TLAST data words forward in parallel
+        let words2 = ss.step();
+        assert_eq!(words2, 2, "both data words should forward in parallel");
+
+        // Verify master 7 got packet 1, master 8 got packet 2
+        let mut m7: Vec<u32> = Vec::new();
+        let mut m8: Vec<u32> = Vec::new();
+        while let Some(w) = ss.masters[7].pop() { m7.push(w); }
+        while let Some(w) = ss.masters[8].pop() { m8.push(w); }
+
+        assert_eq!(m7.len(), 2, "master 7 should have 2 words");
+        assert_eq!(m8.len(), 2, "master 8 should have 2 words");
+        assert_eq!(m7[0] & 0x1F, 1, "master 7 = packet 1");
+        assert_eq!(m8[0] & 0x1F, 2, "master 8 = packet 2");
+    }
+
+    #[test]
+    fn test_arbiter_lock_released_on_tlast() {
+        // Verify the arbiter is freed after TLAST so the next packet can proceed.
+        let mut ss = StreamSwitch::new_compute_tile(0, 2);
+
+        // Slave 23: arbiter=0
+        ss.configure_slave_slot(23, 0, make_slot_reg(1, 0x1F, 0, 0));
+        // Slave 24: arbiter=0 (same!)
+        ss.configure_slave_slot(24, 0, make_slot_reg(2, 0x1F, 0, 0));
+        // Master 7: arbiter=0
+        ss.configure_master_packet(7, make_master_pkt_reg(0, 0b0001, false));
+
+        // First packet: 2 words (header + data+TLAST) from slave 23
+        let hdr1 = PacketHeader::new(1, 0, 2).with_type(PacketType::Trace);
+        ss.slaves[23].push_with_tlast(hdr1.encode(), false);
+        ss.slaves[23].push_with_tlast(0xAAAA_0001, true);
+
+        // Step and drain: process first packet completely
+        ss.step(); // header forwarded
+        ss.masters[7].pop(); // drain header (make room)
+        ss.step(); // data+TLAST forwarded, arbiter released
+        ss.masters[7].pop(); // drain data
+
+        // Arbiter should be free now
+        assert!(ss.arbiter_locks[0].is_none(), "arbiter 0 should be free after TLAST");
+
+        // Now slave 24 should be able to send through the same arbiter
+        let hdr2 = PacketHeader::new(2, 0, 2).with_type(PacketType::Trace);
+        ss.slaves[24].push_with_tlast(hdr2.encode(), false);
+        ss.slaves[24].push_with_tlast(0xBBBB_0001, true);
+
+        let words = ss.step(); // header from slave 24
+        assert_eq!(words, 1, "slave 24 should now use arbiter 0");
+
+        // Verify master 7 got packet 2's header
+        let (w, _) = ss.masters[7].pop_with_tlast().unwrap();
+        assert_eq!(w & 0x1F, 2, "should be packet 2 header");
     }
 }

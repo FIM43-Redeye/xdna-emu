@@ -110,8 +110,11 @@ pub struct TraceUnit {
     last_event_cycle: u64,
     /// Accumulated encoded bytes waiting to be packed into packets.
     byte_buffer: Vec<u8>,
-    /// Complete 8-word packets ready for emission to the stream switch.
-    pending_packets: VecDeque<[u32; 8]>,
+    /// Individual words ready for emission to the stream switch.
+    /// Each entry is (word, tlast). Words are pushed in order: header first,
+    /// then 7 data words, with TLAST=true on the last word. This allows the
+    /// routing layer to push one word at a time, respecting FIFO backpressure.
+    pending_words: VecDeque<(u32, bool)>,
 
     // -- Tile identity (for packet headers) --
 
@@ -139,7 +142,7 @@ impl TraceUnit {
             timer: 0,
             last_event_cycle: 0,
             byte_buffer: Vec::with_capacity(64),
-            pending_packets: VecDeque::new(),
+            pending_words: VecDeque::new(),
             col,
             row,
             configured: false,
@@ -286,14 +289,37 @@ impl TraceUnit {
 
     /// Pop one complete trace packet (8 x u32 words).
     ///
-    /// Returns `None` if no packets are ready.
+    /// Returns `None` if no packets are ready. Consumes 8 words from the
+    /// pending queue. Callers that need backpressure support should use
+    /// `pop_word()` instead.
     pub fn pop_packet(&mut self) -> Option<[u32; 8]> {
-        self.pending_packets.pop_front()
+        if self.pending_words.len() < 8 {
+            return None;
+        }
+        let mut packet = [0u32; 8];
+        for p in &mut packet {
+            *p = self.pending_words.pop_front().unwrap().0;
+        }
+        Some(packet)
     }
 
-    /// Check if there are pending packets to emit.
+    /// Pop a single word with its TLAST flag.
+    ///
+    /// Returns `None` if no words are pending. The caller should push the
+    /// word to the stream switch slave port, checking `can_accept()` first
+    /// to respect FIFO backpressure.
+    pub fn pop_word(&mut self) -> Option<(u32, bool)> {
+        self.pending_words.pop_front()
+    }
+
+    /// Check if there are pending words to emit.
+    pub fn has_pending_words(&self) -> bool {
+        !self.pending_words.is_empty()
+    }
+
+    /// Check if there are pending packets to emit (8+ words queued).
     pub fn has_pending_packets(&self) -> bool {
-        !self.pending_packets.is_empty()
+        self.pending_words.len() >= 8
     }
 
     /// Check if the trace unit is configured (mode != Off).
@@ -309,7 +335,7 @@ impl TraceUnit {
 
         log::trace!(
             "TraceUnit ({},{}) flush: {} bytes -> padded packet (packets so far: {})",
-            self.col, self.row, self.byte_buffer.len(), self.pending_packets.len()
+            self.col, self.row, self.byte_buffer.len(), self.pending_words.len() / 8
         );
 
         // Pad to 28 bytes with 0xFE
@@ -371,10 +397,8 @@ impl TraceUnit {
         }
     }
 
-    /// Consume 28 bytes from the buffer and emit one packet.
+    /// Consume 28 bytes from the buffer and emit one packet as individual words.
     fn emit_packet_from_buffer(&mut self) {
-        let mut packet = [0u32; 8];
-
         // Word 0: packet header
         // Format from mlir-aie parse.py:
         //   [4:0]   = packet_id
@@ -392,7 +416,7 @@ impl TraceUnit {
         if ones % 2 == 0 {
             header |= 1 << 31; // Set parity bit to make total odd
         }
-        packet[0] = header;
+        self.pending_words.push_back((header, false));
 
         // Words 1-7: 28 bytes of trace data, packed big-endian into u32s
         for word_idx in 0..7 {
@@ -406,14 +430,13 @@ impl TraceUnit {
                 };
                 word = (word << 8) | (byte as u32);
             }
-            packet[1 + word_idx] = word;
+            let tlast = word_idx == 6; // Last data word (word 7 of 8)
+            self.pending_words.push_back((word, tlast));
         }
 
         // Remove consumed bytes (up to 28)
         let consumed = self.byte_buffer.len().min(28);
         self.byte_buffer.drain(..consumed);
-
-        self.pending_packets.push_back(packet);
     }
 }
 

@@ -272,11 +272,21 @@ impl InterpreterEngine {
         let mut total_flush_words = 0;
         let mut flush_iters = 0;
         for _ in 0..100 {
-            let (_, streams_moved, words_routed) =
+            let (_, _streams_moved, words_routed) =
                 self.device.array.step_data_movement(&mut self.host_memory);
             total_flush_words += words_routed;
             flush_iters += 1;
-            if !streams_moved && words_routed == 0 {
+
+            // Keep routing as long as trace data is anywhere in the pipeline:
+            // pending in trace units, in stream switch slave/master FIFOs, or
+            // awaiting inter-tile propagation.
+            let trace_in_flight = self.device.array.tiles.iter().any(|t| {
+                t.core_trace.has_pending_words()
+                    || t.mem_trace.has_pending_words()
+                    || t.stream_switch.has_pending_packet()
+                    || t.stream_switch.has_pending_data()
+            });
+            if !trace_in_flight && words_routed == 0 {
                 break;
             }
         }
