@@ -60,6 +60,7 @@ fn event_trace_type(event: &EventType) -> TraceType {
         | EventType::InstrLockReleaseReq { .. }
         | EventType::InstrStreamGet { .. }
         | EventType::InstrStreamPut { .. }
+        | EventType::InstrEvent { .. }
         | EventType::MemoryStall { .. }
         | EventType::LockStall { .. }
         | EventType::StreamStall { .. }
@@ -92,6 +93,9 @@ fn event_name(event: &EventType) -> &'static str {
         EventType::InstrLockReleaseReq { .. } => "INSTR_LOCK_RELEASE_REQ",
         EventType::InstrStreamGet { .. } => "INSTR_STREAM_GET",
         EventType::InstrStreamPut { .. } => "INSTR_STREAM_PUT",
+        EventType::InstrEvent { id: 0, .. } => "INSTR_EVENT_0",
+        EventType::InstrEvent { id: 1, .. } => "INSTR_EVENT_1",
+        EventType::InstrEvent { .. } => "INSTR_EVENT",
         EventType::MemoryStall { .. } => "MEMORY_STALL",
         EventType::LockStall { .. } => "LOCK_STALL",
         EventType::StreamStall { .. } => "STREAM_STALL",
@@ -120,6 +124,7 @@ fn event_tid(event: &EventType) -> u32 {
         EventType::InstrCall { .. } | EventType::InstrReturn { .. } => 3,
         EventType::InstrLockAcquireReq { .. } | EventType::InstrLockReleaseReq { .. } => 4,
         EventType::InstrStreamGet { .. } | EventType::InstrStreamPut { .. } => 5,
+        EventType::InstrEvent { .. } => 6,
         EventType::MemoryStall { .. } | EventType::LockStall { .. }
         | EventType::StreamStall { .. } => 6,
         EventType::CoreActive | EventType::CoreDisabled | EventType::BranchTaken { .. } => 7,
@@ -314,6 +319,10 @@ pub fn offset_perfetto_pids(json: &str, pid_offset: i64, name_prefix: &str) -> S
 /// events encodes S2MM (0-1) vs MM2S (2-3) for compute tiles.
 pub fn core_event_to_hw_id(event: &EventType) -> Option<u8> {
     match event {
+        // User-defined events (Core module)
+        EventType::InstrEvent { id: 0, .. }    => Some(33),
+        EventType::InstrEvent { id: 1, .. }    => Some(34),
+        EventType::InstrEvent { .. }           => None, // id 2/3 are AIE2P only
         // Stall events (Core module)
         EventType::MemoryStall { .. }          => Some(23),
         EventType::StreamStall { .. }          => Some(24),
@@ -697,6 +706,16 @@ mod tests {
     }
 
     // -- Hardware event ID mapping tests --
+
+    #[test]
+    fn test_core_event_instr_event_ids() {
+        // INSTR_EVENT_0=33, INSTR_EVENT_1=34
+        assert_eq!(core_event_to_hw_id(&EventType::InstrEvent { pc: 0, id: 0 }), Some(33));
+        assert_eq!(core_event_to_hw_id(&EventType::InstrEvent { pc: 0, id: 1 }), Some(34));
+        // id >= 2 is AIE2P only
+        assert_eq!(core_event_to_hw_id(&EventType::InstrEvent { pc: 0, id: 2 }), None);
+        assert_eq!(core_event_to_hw_id(&EventType::InstrEvent { pc: 0, id: 3 }), None);
+    }
 
     #[test]
     fn test_core_event_ids() {

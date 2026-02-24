@@ -1621,9 +1621,10 @@ pub fn infer_semantic_from_mnemonic(mnemonic: &str) -> Option<SemanticOp> {
         return Some(SemanticOp::SetNe);
     }
 
-    // Event (control, treat as nop for execution purposes)
+    // Event instruction: generates INSTR_EVENT_0/1 trace events.
+    // Operand is a 2-bit immediate selecting which event to fire.
     if lower == "event" || lower.starts_with("event.") {
-        return Some(SemanticOp::Nop);
+        return Some(SemanticOp::Event);
     }
 
     // "ret lr" is a return (alternate mnemonic form)

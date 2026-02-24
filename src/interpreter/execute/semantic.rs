@@ -153,6 +153,21 @@ pub fn execute_semantic(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         // Nop
         SemanticOp::Nop => true, // Nothing to do
 
+        // Event: generate a user-defined trace event (INSTR_EVENT_0/1)
+        SemanticOp::Event => {
+            let event_id = match op.sources.first() {
+                Some(Operand::Immediate(v)) => *v as u8,
+                _ => 0, // Default to event 0 if operand missing
+            };
+            let pc = ctx.pc();
+            let cycle = ctx.cycles;
+            ctx.timing_context_mut().record_event(
+                cycle,
+                crate::interpreter::state::EventType::InstrEvent { pc, id: event_id },
+            );
+            true
+        }
+
         // Unknown/unsupported - fall back to Operation-based dispatch
         _ => {
             log::trace!("[SEMANTIC] Unhandled semantic op: {:?}", semantic);

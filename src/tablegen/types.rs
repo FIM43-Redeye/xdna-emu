@@ -300,6 +300,7 @@ pub enum SemanticOp {
     Copy,    // Move/copy
     Nop,     // No operation
     Done,    // Core termination (halt)
+    Event,   // Generate trace event (operand selects INSTR_EVENT_0/1)
 
     // Synchronization (AIE-specific)
     LockAcquire,  // Acquire lock

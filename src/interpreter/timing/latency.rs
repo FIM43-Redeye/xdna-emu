@@ -502,6 +502,7 @@ impl LatencyTable {
             SemanticOp::Copy if !is_vector => OperationKey::ScalarMov,
             SemanticOp::Copy => OperationKey::VectorAdd,
             SemanticOp::Nop => OperationKey::Nop,
+            SemanticOp::Event => OperationKey::Nop, // EVENT is 1-cycle, no pipeline impact
             SemanticOp::Done => OperationKey::Unknown, // Halt has no meaningful latency
 
             // Synchronization

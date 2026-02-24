@@ -91,6 +91,9 @@ pub enum EventType {
     /// Stream put instruction.
     /// Maps to hardware INSTR_STREAM_PUT.
     InstrStreamPut { pc: u32 },
+    /// User-defined event instruction (`event #0` or `event #1`).
+    /// Maps to hardware INSTR_EVENT_0 (id=0) or INSTR_EVENT_1 (id=1).
+    InstrEvent { pc: u32, id: u8 },
 
     // -- Stall events (Core module trace) --
 
@@ -1260,6 +1263,8 @@ mod tests {
             EventType::InstrLockReleaseReq { pc: 0x118 },
             EventType::InstrStreamGet { pc: 0x11C },
             EventType::InstrStreamPut { pc: 0x120 },
+            EventType::InstrEvent { pc: 0x124, id: 0 },
+            EventType::InstrEvent { pc: 0x128, id: 1 },
             // Stall events
             EventType::MemoryStall { cycles: 2 },
             EventType::LockStall { cycles: 3 },
@@ -1287,6 +1292,6 @@ mod tests {
             log.record(i as u64, event);
         }
 
-        assert_eq!(log.len(), 22);
+        assert_eq!(log.len(), 24);
     }
 }
