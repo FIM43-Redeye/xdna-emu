@@ -338,12 +338,14 @@ pub fn core_event_to_hw_id(event: &EventType) -> Option<u8> {
     }
 }
 
-/// Map an emulator `EventType` to its AIE2 memory module hardware event ID.
+/// Map an emulator `EventType` to its AIE2 compute tile memory module event ID.
 ///
 /// DMA events are per-channel. The channel field encodes:
 /// - 0 = S2MM ch0, 1 = S2MM ch1, 2 = MM2S ch0, 3 = MM2S ch1
 ///
 /// Lock events are per-lock (lock IDs 0-7 have dedicated event IDs).
+///
+/// Event IDs from mlir-aie `python/utils/trace/events/aie2.py` MemEvent.
 pub fn mem_event_to_hw_id(event: &EventType) -> Option<u8> {
     match event {
         // DMA start task: S2MM_0=19, S2MM_1=20, MM2S_0=21, MM2S_1=22
@@ -407,6 +409,102 @@ pub fn mem_event_to_hw_id(event: &EventType) -> Option<u8> {
         // Core events don't have memory module IDs
         _ => None,
     }
+}
+
+/// Map an emulator `EventType` to its AIE2 MemTile hardware event ID.
+///
+/// MemTiles use a different event ID namespace than compute tile memory modules.
+/// DMA events are offset by +2 from compute tile IDs, and use SEL0/SEL1 naming
+/// for the two channel groups.
+///
+/// Event IDs from mlir-aie `python/utils/trace/events/aie2.py` MemTileEvent.
+pub fn memtile_event_to_hw_id(event: &EventType) -> Option<u8> {
+    match event {
+        // DMA start task: S2MM_SEL0=21, S2MM_SEL1=22, MM2S_SEL0=23, MM2S_SEL1=24
+        EventType::DmaStartTask { channel } => match channel {
+            0 => Some(21),
+            1 => Some(22),
+            2 => Some(23),
+            3 => Some(24),
+            _ => None,
+        },
+        // DMA finished BD: S2MM_SEL0=25, S2MM_SEL1=26, MM2S_SEL0=27, MM2S_SEL1=28
+        EventType::DmaFinishedBd { channel } => match channel {
+            0 => Some(25),
+            1 => Some(26),
+            2 => Some(27),
+            3 => Some(28),
+            _ => None,
+        },
+        // DMA finished task: S2MM_SEL0=29, S2MM_SEL1=30, MM2S_SEL0=31, MM2S_SEL1=32
+        EventType::DmaFinishedTask { channel } => match channel {
+            0 => Some(29),
+            1 => Some(30),
+            2 => Some(31),
+            3 => Some(32),
+            _ => None,
+        },
+        // DMA stalled lock: S2MM_SEL0=33, S2MM_SEL1=34, MM2S_SEL0=35, MM2S_SEL1=36
+        EventType::DmaStalledLock { channel } => match channel {
+            0 => Some(33),
+            1 => Some(34),
+            2 => Some(35),
+            3 => Some(36),
+            _ => None,
+        },
+        // DMA stream starvation: S2MM_SEL0=37, S2MM_SEL1=38, MM2S_SEL0=39(bp), MM2S_SEL1=40
+        EventType::DmaStreamStarvation { channel } => match channel {
+            0 => Some(37),
+            1 => Some(38),
+            2 => Some(39),
+            3 => Some(40),
+            _ => None,
+        },
+        // Lock acquire: LOCK_SEL0_ACQ_GE=47, stride 4 per lock
+        EventType::LockAcquire { lock_id } => {
+            if *lock_id <= 7 {
+                Some(47 + (*lock_id as u8) * 4)
+            } else {
+                None
+            }
+        },
+        // Lock release: LOCK_SEL0_REL=48, stride 4 per lock
+        EventType::LockRelease { lock_id } => {
+            if *lock_id <= 7 {
+                Some(48 + (*lock_id as u8) * 4)
+            } else {
+                None
+            }
+        },
+        _ => None,
+    }
+}
+
+/// Hardware event ID for PORT_RUNNING_N.
+///
+/// PORT_RUNNING events indicate a stream switch port is actively transferring
+/// data. Each module type has its own PORT_RUNNING ID base (stride 4):
+///
+/// | Module     | PORT_RUNNING_0 | Stride | Source (aie2.py)          |
+/// |------------|----------------|--------|---------------------------|
+/// | CoreEvent  | 75             | 4      | CoreEvent.PORT_RUNNING_0  |
+/// | MemEvent   | 78             | 4      | MemEvent.PORT_RUNNING_0   |
+/// | MemTile    | 80             | 4      | MemTileEvent.PORT_RUNNING_0|
+///
+/// The physical port (master/slave + index) is configured separately via
+/// Event Port Selection registers (0x3FF00/0x3FF04 or 0xB0F00/0xB0F04).
+pub fn core_port_running_hw_id(event_port: u8) -> u8 {
+    75 + (event_port * 4)
+}
+
+/// Hardware event ID for PORT_RUNNING_N in the memory module (compute tiles).
+pub fn mem_port_running_hw_id(event_port: u8) -> u8 {
+    78 + (event_port * 4)
+}
+
+/// Hardware event ID for PORT_RUNNING_N in MemTile module.
+pub fn memtile_port_running_hw_id(event_port: u8) -> u8 {
+    80 + (event_port * 4)
 }
 
 #[cfg(test)]
@@ -621,5 +719,67 @@ mod tests {
         // Memory events should return None from core_event_to_hw_id
         assert_eq!(core_event_to_hw_id(&EventType::DmaStartTask { channel: 0 }), None);
         assert_eq!(core_event_to_hw_id(&EventType::LockAcquire { lock_id: 0 }), None);
+    }
+
+    // -- MemTile event ID tests --
+
+    #[test]
+    fn test_memtile_dma_ids_offset_from_compute() {
+        // MemTile DMA events are offset +2 from compute tile memory module.
+        // Compute: S2MM_0_START_TASK=19, MemTile: S2MM_SEL0_START_TASK=21
+        assert_eq!(memtile_event_to_hw_id(&EventType::DmaStartTask { channel: 0 }), Some(21));
+        assert_eq!(memtile_event_to_hw_id(&EventType::DmaStartTask { channel: 1 }), Some(22));
+        assert_eq!(memtile_event_to_hw_id(&EventType::DmaStartTask { channel: 2 }), Some(23));
+        assert_eq!(memtile_event_to_hw_id(&EventType::DmaStartTask { channel: 3 }), Some(24));
+    }
+
+    #[test]
+    fn test_memtile_dma_finished_ids() {
+        assert_eq!(memtile_event_to_hw_id(&EventType::DmaFinishedBd { channel: 0 }), Some(25));
+        assert_eq!(memtile_event_to_hw_id(&EventType::DmaFinishedBd { channel: 3 }), Some(28));
+        assert_eq!(memtile_event_to_hw_id(&EventType::DmaFinishedTask { channel: 0 }), Some(29));
+        assert_eq!(memtile_event_to_hw_id(&EventType::DmaFinishedTask { channel: 3 }), Some(32));
+    }
+
+    #[test]
+    fn test_memtile_lock_ids_offset_from_compute() {
+        // Compute: LOCK_SEL0_ACQ_GE=45, MemTile: LOCK_SEL0_ACQ_GE=47
+        assert_eq!(memtile_event_to_hw_id(&EventType::LockAcquire { lock_id: 0 }), Some(47));
+        assert_eq!(memtile_event_to_hw_id(&EventType::LockRelease { lock_id: 0 }), Some(48));
+        // Lock 7: 47 + 28 = 75
+        assert_eq!(memtile_event_to_hw_id(&EventType::LockAcquire { lock_id: 7 }), Some(75));
+        assert_eq!(memtile_event_to_hw_id(&EventType::LockRelease { lock_id: 7 }), Some(76));
+    }
+
+    #[test]
+    fn test_memtile_core_events_return_none() {
+        assert_eq!(memtile_event_to_hw_id(&EventType::InstrVector { pc: 0 }), None);
+        assert_eq!(memtile_event_to_hw_id(&EventType::CoreActive), None);
+    }
+
+    // -- PORT_RUNNING ID tests --
+
+    #[test]
+    fn test_core_port_running_hw_ids() {
+        // CoreEvent: PORT_RUNNING_0=75, stride 4
+        assert_eq!(core_port_running_hw_id(0), 75);
+        assert_eq!(core_port_running_hw_id(1), 79);
+        assert_eq!(core_port_running_hw_id(7), 103);
+    }
+
+    #[test]
+    fn test_mem_port_running_hw_ids() {
+        // MemEvent: PORT_RUNNING_0=78, stride 4
+        assert_eq!(mem_port_running_hw_id(0), 78);
+        assert_eq!(mem_port_running_hw_id(1), 82);
+        assert_eq!(mem_port_running_hw_id(7), 106);
+    }
+
+    #[test]
+    fn test_memtile_port_running_hw_ids() {
+        // MemTileEvent: PORT_RUNNING_0=80, stride 4
+        assert_eq!(memtile_port_running_hw_id(0), 80);
+        assert_eq!(memtile_port_running_hw_id(1), 84);
+        assert_eq!(memtile_port_running_hw_id(7), 108);
     }
 }

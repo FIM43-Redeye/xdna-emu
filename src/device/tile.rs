@@ -648,6 +648,20 @@ pub struct Tile {
     /// and emits through Trace slave port (slave[24] = MEM_TRACE for compute,
     /// slave[17] = TRACE for memtile).
     pub mem_trace: TraceUnit,
+
+    /// Stream switch event port selection (8 logical event ports).
+    ///
+    /// Each entry maps a logical event port (0-7) to a physical stream switch
+    /// port. `None` means the port is not configured. `Some((port_idx, is_master))`
+    /// identifies the physical port to monitor for PORT_RUNNING/IDLE/STALLED events.
+    ///
+    /// Configured by Event Port Selection registers:
+    /// - Compute/Shim: 0x3FF00 (ports 0-3), 0x3FF04 (ports 4-7)
+    /// - MemTile: 0xB0F00 (ports 0-3), 0xB0F04 (ports 4-7)
+    ///
+    /// Register encoding per 8-bit slot: bit 5 = master (1) or slave (0),
+    /// bits 4:0 = port index.
+    pub event_port_selection: [Option<(u8, bool)>; 8],
 }
 
 impl Tile {
@@ -688,6 +702,7 @@ impl Tile {
             shim_mux_s2mm_masters: [None; 2],
             core_trace: TraceUnit::new(col, row),
             mem_trace: TraceUnit::new(col, row),
+            event_port_selection: [None; 8],
         }
     }
 
@@ -1117,6 +1132,36 @@ impl Tile {
             if offset >= 0x940D0 && offset <= 0x940E4 {
                 let trace_offset = offset - 0x940D0;
                 self.mem_trace.write_register(trace_offset, value);
+            }
+        }
+
+        // Event port selection registers.
+        //
+        // These configure which physical stream switch ports map to logical
+        // event ports 0-7 for PORT_RUNNING/IDLE/STALLED trace events.
+        //
+        // Register layout: 4 x 8-bit entries per register.
+        // Per entry: bit 5 = master (1) / slave (0), bits 4:0 = port index.
+        //
+        // Compute/Shim: 0x3FF00 (ports 0-3), 0x3FF04 (ports 4-7)
+        // MemTile:      0xB0F00 (ports 0-3), 0xB0F04 (ports 4-7)
+        let port_sel_base = match self.tile_type {
+            TileType::Compute | TileType::Shim => Some((0x3FF00u32, 0x3FF04u32)),
+            TileType::MemTile => Some((0xB0F00, 0xB0F04)),
+        };
+        if let Some((reg0, reg1)) = port_sel_base {
+            if offset == reg0 || offset == reg1 {
+                let base_slot = if offset == reg0 { 0 } else { 4 };
+                for i in 0..4usize {
+                    let byte = ((value >> (i * 8)) & 0xFF) as u8;
+                    let port_idx = byte & 0x1F;
+                    let is_master = (byte & 0x20) != 0;
+                    self.event_port_selection[base_slot + i] = Some((port_idx, is_master));
+                }
+                log::debug!(
+                    "Tile({},{}) event port sel @0x{:X}: {:?}",
+                    self.col, self.row, offset, &self.event_port_selection[base_slot..base_slot+4]
+                );
             }
         }
     }

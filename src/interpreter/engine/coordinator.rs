@@ -455,7 +455,7 @@ impl InterpreterEngine {
         // Phase 1: Sync DMA start requests from tiles to DMA engines
         self.sync_dma_start_requests();
 
-        // Phase 2: Step all DMA engines and stream routing FIRST
+        // Phase 2: Step all DMA engines and stream routing.
         // This ensures lock releases from DMA are visible when cores
         // snapshot MemTile locks for memory module access.
         //
@@ -468,26 +468,69 @@ impl InterpreterEngine {
 
         // Drain DMA trace events into the global trace log and notify
         // memory module trace units so they can produce binary trace packets.
+        // MemTiles use a different event ID namespace than compute tiles.
         for (col, row, cycle, event) in self.device.array.drain_dma_trace_events() {
-            // Notify the tile's memory module trace unit
-            if let Some(hw_id) = crate::trace::mem_event_to_hw_id(&event) {
-                if let Some(tile) = self.device.array.get_mut(col, row) {
-                    tile.mem_trace.notify_event(hw_id, cycle);
+            if let Some(tile) = self.device.array.get_mut(col, row) {
+                let hw_id = if tile.is_mem_tile() {
+                    crate::trace::memtile_event_to_hw_id(&event)
+                } else {
+                    crate::trace::mem_event_to_hw_id(&event)
+                };
+                if let Some(id) = hw_id {
+                    tile.mem_trace.notify_event(id, cycle);
                 }
             }
             self.trace_log.push(TileTracedEvent { col, row, cycle, event });
         }
 
-        if dma_active || streams_moved {
-            any_running = true;
+        // Phase 2b: Generate PORT_RUNNING events from cycle_active flags.
+        //
+        // PORT_RUNNING is a level event: it fires every cycle a monitored port
+        // is active. step_data_movement() seeds cycle_active from pre-existing
+        // FIFO state and marks ports active as data flows through during routing.
+        // We read those flags here to notify trace units.
+        {
+            let cycle = self.total_cycles;
+            let mut port_events: Vec<(usize, u8, bool)> = Vec::new();
+            for idx in 0..self.device.array.tiles.len() {
+                let tile = &self.device.array.tiles[idx];
+                if !tile.core_trace.is_configured() && !tile.mem_trace.is_configured() {
+                    continue;
+                }
+
+                for event_port in 0..8u8 {
+                    if let Some((port_idx, is_master)) = tile.event_port_selection[event_port as usize] {
+                        let port_active = if is_master {
+                            tile.stream_switch.masters.get(port_idx as usize)
+                                .map_or(false, |p| p.cycle_active)
+                        } else {
+                            tile.stream_switch.slaves.get(port_idx as usize)
+                                .map_or(false, |p| p.cycle_active)
+                        };
+
+                        if port_active {
+                            let hw_id = if tile.is_compute() {
+                                crate::trace::core_port_running_hw_id(event_port)
+                            } else {
+                                crate::trace::memtile_port_running_hw_id(event_port)
+                            };
+                            port_events.push((idx, hw_id, tile.is_compute()));
+                        }
+                    }
+                }
+            }
+            for (idx, hw_id, is_compute) in port_events {
+                let tile = &mut self.device.array.tiles[idx];
+                if is_compute {
+                    tile.core_trace.notify_event(hw_id, cycle);
+                } else {
+                    tile.mem_trace.notify_event(hw_id, cycle);
+                }
+            }
         }
 
-        // Debug: trace coordinator step decisions (first 5 cycles)
-        static COORD_TRACE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let trace_count = COORD_TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if trace_count < 5 {
-            log::info!("COORD_STEP[{}] dma_active={} streams_moved={} words_routed={} any_running={}",
-                trace_count, dma_active, streams_moved, words_routed, any_running);
+        if dma_active || streams_moved {
+            any_running = true;
         }
 
         // Phase 3: Step each enabled core (after DMA, so locks are up-to-date)
@@ -566,12 +609,12 @@ impl InterpreterEngine {
                             // This core halted - don't set all_halted=false
                         }
                         StepResult::DecodeError(ref e) => {
-                            log::error!("COORD_STEP[{}] core({},{}) DecodeError: {:?}", trace_count, col, row, e);
+                            log::error!("Core({},{}) DecodeError at cycle {}: {:?}", col, row, self.total_cycles, e);
                             self.status = EngineStatus::Error;
                             return;
                         }
                         StepResult::ExecError(ref e) => {
-                            log::error!("COORD_STEP[{}] core({},{}) ExecError: {:?}", trace_count, col, row, e);
+                            log::error!("Core({},{}) ExecError at cycle {}: {:?}", col, row, self.total_cycles, e);
                             self.status = EngineStatus::Error;
                             return;
                         }
@@ -630,12 +673,7 @@ impl InterpreterEngine {
         let any_cores_enabled = self.cores.iter().any(|c| c.enabled);
 
         // Case 1: No cores enabled - halt if no activity at all
-        if trace_count < 5 {
-            log::info!("COORD_STEP[{}] halt_check: any_cores_enabled={} any_running={} all_halted={}",
-                trace_count, any_cores_enabled, any_running, all_halted);
-        }
         if !any_cores_enabled && !any_running {
-            log::info!("COORD_STEP halting: no cores enabled and no activity");
             self.status = EngineStatus::Halted;
             return;
         }

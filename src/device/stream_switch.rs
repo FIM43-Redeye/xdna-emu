@@ -118,6 +118,12 @@ pub struct StreamPort {
     pub fifo_capacity: usize,
     /// Raw configuration register value (from CDO)
     pub config: u32,
+    /// Was this port active during the current routing cycle?
+    /// Set true when data is pushed or when the FIFO was non-empty at the
+    /// start of routing. Used by PORT_RUNNING trace events -- data flows
+    /// through the entire stream switch within a single `route_streams()`
+    /// call, so checking `has_data()` between calls always sees empty FIFOs.
+    pub cycle_active: bool,
     /// Connected destination (for routing)
     pub route_to: Option<(u8, u8, u8)>, // (col, row, port_index)
     /// Port is enabled
@@ -142,6 +148,7 @@ impl StreamPort {
             config: 0,
             route_to: None,
             enabled: false,
+            cycle_active: false,
         }
     }
 
@@ -165,6 +172,7 @@ impl StreamPort {
         if self.can_accept() {
             self.fifo.push(data);
             self.tlast_flags.push(false);
+            self.cycle_active = true;
             true
         } else {
             false
@@ -176,6 +184,7 @@ impl StreamPort {
         if self.can_accept() {
             self.fifo.push(data);
             self.tlast_flags.push(tlast);
+            self.cycle_active = true;
             true
         } else {
             false
@@ -553,6 +562,23 @@ impl StreamSwitch {
     /// Check if any port has pending data.
     pub fn has_pending_data(&self) -> bool {
         self.masters.iter().any(|p| p.has_data()) || self.slaves.iter().any(|p| p.has_data())
+    }
+
+    /// Begin a new routing cycle for port activity tracking.
+    ///
+    /// Seeds `cycle_active` from pre-existing FIFO state (ports with data
+    /// from backpressure in previous cycles are already "running") and
+    /// clears it for empty ports. Called at the start of each
+    /// `step_data_movement()` so that `push()` during routing also marks
+    /// ports active. After routing completes, the coordinator reads
+    /// `cycle_active` to generate PORT_RUNNING trace events.
+    pub fn begin_routing_cycle(&mut self) {
+        for port in &mut self.masters {
+            port.cycle_active = port.has_data();
+        }
+        for port in &mut self.slaves {
+            port.cycle_active = port.has_data();
+        }
     }
 
     /// Get total data in all FIFOs.
@@ -1920,5 +1946,62 @@ mod tests {
         // Verify master 7 got packet 2's header
         let (w, _) = ss.masters[7].pop_with_tlast().unwrap();
         assert_eq!(w & 0x1F, 2, "should be packet 2 header");
+    }
+
+    #[test]
+    fn test_cycle_active_tracks_port_activity() {
+        // cycle_active captures whether a port had data at any point during
+        // the routing cycle. This is needed for PORT_RUNNING trace events
+        // because data enters and exits FIFOs within a single route_streams()
+        // call, making between-step has_data() checks always see empty ports.
+        let mut port = StreamPort::new(0, PortDirection::Slave, PortType::Dma(0));
+
+        // Initially not active
+        assert!(!port.cycle_active);
+        assert!(!port.has_data());
+
+        // Push marks active
+        port.push_with_tlast(0xAAAA, false);
+        assert!(port.cycle_active);
+
+        // Pop drains data, but cycle_active persists
+        port.pop();
+        assert!(!port.has_data(), "FIFO should be empty after pop");
+        assert!(port.cycle_active, "cycle_active should persist after pop");
+    }
+
+    #[test]
+    fn test_begin_routing_cycle_seeds_from_fifo() {
+        let mut ss = StreamSwitch::new_compute_tile(0, 2);
+
+        // Put data in slave[1] (simulating backpressure holdover)
+        ss.slaves[1].push_with_tlast(0x1234, false);
+
+        // begin_routing_cycle seeds cycle_active from existing FIFO state
+        ss.begin_routing_cycle();
+
+        assert!(ss.slaves[1].cycle_active,
+            "slave with existing data should be active");
+        assert!(!ss.slaves[0].cycle_active,
+            "empty slave should not be active");
+        assert!(!ss.masters[0].cycle_active,
+            "empty master should not be active");
+    }
+
+    #[test]
+    fn test_begin_routing_cycle_clears_previous() {
+        let mut ss = StreamSwitch::new_compute_tile(0, 2);
+
+        // Push data to mark a port active
+        ss.slaves[0].push_with_tlast(0xAAAA, false);
+        assert!(ss.slaves[0].cycle_active);
+
+        // Drain it
+        ss.slaves[0].pop();
+
+        // begin_routing_cycle clears the stale active flag
+        ss.begin_routing_cycle();
+        assert!(!ss.slaves[0].cycle_active,
+            "empty port should not be active after begin_routing_cycle");
     }
 }

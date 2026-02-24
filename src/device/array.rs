@@ -286,24 +286,9 @@ impl TileArray {
     ///
     /// Returns true if any DMA engine is still active.
     pub fn step_all_dma(&mut self, host_memory: &mut HostMemory) -> bool {
-        // Debug: trace step_all_dma calls
-        static STEP_ALL_DMA_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let call_count = STEP_ALL_DMA_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if call_count < 5 {
-            log::info!("step_all_dma call #{}, tiles={}", call_count, self.tiles.len());
-        }
-
         let mut any_active = false;
         for i in 0..self.tiles.len() {
-            let tile_col = self.tiles[i].col;
-            let tile_row = self.tiles[i].row;
             let result = self.dma_engines[i].step(&mut self.tiles[i], host_memory);
-
-            if call_count < 5 && tile_col == 0 && tile_row == 0 {
-                log::info!("  tile({},{}) engine_i={} result={:?}",
-                    tile_col, tile_row, i, result);
-            }
-
             if matches!(result, DmaResult::InProgress | DmaResult::WaitingForLock(_)) {
                 any_active = true;
             }
@@ -496,15 +481,17 @@ impl TileArray {
     ///
     /// Returns (dma_active, streams_moved, words_routed)
     pub fn step_data_movement(&mut self, host_memory: &mut HostMemory) -> (bool, bool, usize) {
-        // Debug: track cycle count
-        static CYCLE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let cycle = CYCLE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Phase 0: Port activity tracking reset.
+        // Seed cycle_active flags from pre-existing FIFO state before routing.
+        // Ports that receive data during routing will also be marked active.
+        // The coordinator reads these flags after routing to generate
+        // PORT_RUNNING trace events.
+        for tile in &mut self.tiles {
+            tile.stream_switch.begin_routing_cycle();
+        }
 
         // Phase 1: Lock Snapshot
         // Freeze lock values so all operations in this cycle see consistent state.
-        if cycle < 20 {
-            log::debug!("CYCLE[{}] Phase 1: begin_lock_cycle for all tiles", cycle);
-        }
         for tile in &mut self.tiles {
             tile.begin_lock_cycle();
         }
@@ -512,23 +499,14 @@ impl TileArray {
         // Phase 2: DMA Step
         // All DMA engines transfer data to/from tile memory.
         // MM2S channels produce stream words, S2MM channels consume them.
-        if cycle < 20 {
-            log::debug!("CYCLE[{}] Phase 2: step_all_dma", cycle);
-        }
         let dma_active = self.step_all_dma(host_memory);
 
         // Phase 3: Stream Routing
         // Route all stream data through the stream switch network.
-        if cycle < 20 {
-            log::debug!("CYCLE[{}] Phase 3: route_streams", cycle);
-        }
         let words_routed = self.route_streams();
 
         // Phase 4: Lock Commit
         // Apply accumulated lock deltas. Changes become visible next cycle.
-        if cycle < 20 {
-            log::debug!("CYCLE[{}] Phase 4: end_lock_cycle for all tiles", cycle);
-        }
         for tile in &mut self.tiles {
             tile.end_lock_cycle();
         }
