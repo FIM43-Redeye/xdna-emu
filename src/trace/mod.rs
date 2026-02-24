@@ -566,6 +566,28 @@ pub fn shim_port_tlast_hw_id(event_port: u8) -> u8 {
     80 + (event_port * 4)
 }
 
+// ============================================================================
+// Memory bank conflict event IDs
+// ============================================================================
+//
+// CONFLICT_DM_BANK events fire when two agents (core + DMA, or two DMA
+// channels) access the same memory bank in the same cycle. The hardware
+// generates one event per conflicting bank per cycle.
+//
+// Source: xaie_events_aieml.h
+
+/// MemEvent CONFLICT_DM_BANK_N hardware event ID.
+/// Compute tile memory module: IDs 77-84 for banks 0-7.
+pub fn mem_conflict_dm_bank_hw_id(bank: u8) -> u8 {
+    77 + bank
+}
+
+/// MemTileEvent CONFLICT_DM_BANK_N hardware event ID.
+/// MemTile memory module: IDs 112-127 for banks 0-15.
+pub fn memtile_conflict_dm_bank_hw_id(bank: u8) -> u8 {
+    112 + bank
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,5 +915,16 @@ mod tests {
         assert_eq!(memtile_port_running_hw_id(7), 108);
         assert_eq!(memtile_port_stalled_hw_id(7), 109);
         assert_eq!(memtile_port_tlast_hw_id(7), 110);
+    }
+
+    #[test]
+    fn test_conflict_dm_bank_hw_ids() {
+        // Compute tile MemEvent: GROUP_MEMORY_CONFLICT=76, BANK_0=77..BANK_7=84
+        assert_eq!(mem_conflict_dm_bank_hw_id(0), 77);
+        assert_eq!(mem_conflict_dm_bank_hw_id(7), 84);
+
+        // MemTile: GROUP_MEMORY_CONFLICT=111, BANK_0=112..BANK_15=127
+        assert_eq!(memtile_conflict_dm_bank_hw_id(0), 112);
+        assert_eq!(memtile_conflict_dm_bank_hw_id(15), 127);
     }
 }

@@ -373,6 +373,12 @@ impl MemoryUnit {
         let addr = Self::get_address(op, ctx);
         let latency = load_latency_for_address(addr);
 
+        // Track bank access for conflict detection (local memory only)
+        let (quadrant, local_offset) = decode_data_address(addr);
+        if quadrant == 0 {
+            ctx.record_core_bank_access(local_offset as u32, width.bytes() as usize, tile.num_banks());
+        }
+
         log::trace!("[LOAD] addr=0x{:X} width={:?} dest={:?} srcs={:?} latency={}",
             addr, width, op.dest, op.sources, latency);
 
@@ -413,6 +419,12 @@ impl MemoryUnit {
     ) {
         // Get address using store-specific layout: sources[1]=ptr, sources[2]=offset
         let addr = Self::get_store_address(op, ctx);
+
+        // Track bank access for conflict detection (local memory only)
+        let (quadrant, local_offset) = decode_data_address(addr);
+        if quadrant == 0 {
+            ctx.record_core_bank_access(local_offset as u32, width.bytes() as usize, tile.num_banks());
+        }
 
         // Handle full vector stores specially
         if width == MemWidth::Vector256 {
@@ -465,6 +477,12 @@ impl MemoryUnit {
         let addr = Self::get_address(op, ctx);
         let latency = load_latency_for_address(addr);
 
+        // Track bank access for conflict detection (local memory only)
+        let (quadrant, local_offset) = decode_data_address(addr);
+        if quadrant == 0 {
+            ctx.record_core_bank_access(local_offset as u32, 32, tile.num_banks());
+        }
+
         // Read 256 bits (32 bytes) from memory
         let vec_data = Self::read_vector_from_memory(tile, addr, neighbors.map(|n| &*n));
 
@@ -491,6 +509,12 @@ impl MemoryUnit {
     ) {
         let addr = Self::get_address(op, ctx);
         let latency = load_latency_for_address(addr);
+
+        // Track bank access for conflict detection (local memory only)
+        let (quadrant, local_offset) = decode_data_address(addr);
+        if quadrant == 0 {
+            ctx.record_core_bank_access(local_offset as u32, 32, tile.num_banks());
+        }
 
         // Read 256 bits (32 bytes) from memory
         let vec_data = Self::read_vector_from_memory(tile, addr, neighbors.map(|n| &*n));
@@ -636,6 +660,12 @@ impl MemoryUnit {
         neighbors: Option<&mut NeighborMemory>,
     ) {
         let addr = Self::get_address(op, ctx);
+
+        // Track bank access for conflict detection (local memory only)
+        let (quadrant, local_offset) = decode_data_address(addr);
+        if quadrant == 0 {
+            ctx.record_core_bank_access(local_offset as u32, 32, tile.num_banks());
+        }
 
         // Get vector register from source or dest
         // For VST, the vector data comes from a source operand (second source)

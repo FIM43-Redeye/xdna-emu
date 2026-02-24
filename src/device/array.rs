@@ -128,7 +128,7 @@ impl TileArray {
 
     /// Get tile index from coordinates.
     #[inline]
-    fn tile_index(&self, col: u8, row: u8) -> usize {
+    pub fn tile_index(&self, col: u8, row: u8) -> usize {
         (col as usize) * (self.rows as usize) + (row as usize)
     }
 
@@ -288,10 +288,19 @@ impl TileArray {
     pub fn step_all_dma(&mut self, host_memory: &mut HostMemory) -> bool {
         let mut any_active = false;
         for i in 0..self.tiles.len() {
+            // Reset bank tracking for this cycle
+            self.tiles[i].reset_bank_tracking();
+            self.dma_engines[i].cycle_dma_banks = 0;
+
             let result = self.dma_engines[i].step(&mut self.tiles[i], host_memory);
             if matches!(result, DmaResult::InProgress | DmaResult::WaitingForLock(_)) {
                 any_active = true;
             }
+
+            // Merge DMA engine bank accesses into the tile.
+            // Static transfer methods record directly on tile.cycle_dma_banks;
+            // MM2S/S2MM record on engine.cycle_dma_banks. Merge both.
+            self.tiles[i].cycle_dma_banks |= self.dma_engines[i].cycle_dma_banks;
         }
         any_active
     }

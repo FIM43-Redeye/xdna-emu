@@ -683,6 +683,49 @@ impl InterpreterEngine {
             }
         }
 
+        // Phase 3b: Detect memory bank conflicts (core vs DMA).
+        //
+        // CONFLICT_DM_BANK events fire when the core and DMA access the same
+        // memory bank in the same cycle. The hardware resolves conflicts by
+        // stalling one agent; we detect them for trace event generation.
+        {
+            let cycle = self.total_cycles;
+            let mut bank_events: Vec<(usize, u8)> = Vec::new();
+            for col in 0..self.cols {
+                for row in self.compute_row_start..self.rows {
+                    let idx = col * self.rows + row;
+                    if !self.cores[idx].enabled {
+                        continue;
+                    }
+                    let core_banks = self.cores[idx].context.cycle_core_banks;
+                    let tile_idx = self.device.array.tile_index(col as u8, row as u8);
+                    let dma_banks = self.device.array.tiles[tile_idx].cycle_dma_banks;
+
+                    let conflicts = core_banks & dma_banks;
+                    if conflicts != 0 {
+                        let num_banks = self.device.array.tiles[tile_idx].num_banks();
+                        for bank in 0..num_banks as u8 {
+                            if conflicts & (1 << bank) != 0 {
+                                bank_events.push((tile_idx, bank));
+                            }
+                        }
+                    }
+
+                    // Reset core bank tracking for next cycle
+                    self.cores[idx].context.reset_bank_tracking();
+                }
+            }
+            for (tile_idx, bank) in bank_events {
+                let tile = &mut self.device.array.tiles[tile_idx];
+                let hw_id = if tile.is_mem_tile() {
+                    crate::trace::memtile_conflict_dm_bank_hw_id(bank)
+                } else {
+                    crate::trace::mem_conflict_dm_bank_hw_id(bank)
+                };
+                tile.mem_trace.notify_event(hw_id, cycle);
+            }
+        }
+
         // Phase 4: Update tile DMA channel state from engine state
         self.sync_dma_completion();
 

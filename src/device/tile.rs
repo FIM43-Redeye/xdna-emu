@@ -662,6 +662,13 @@ pub struct Tile {
     /// Register encoding per 8-bit slot: bit 5 = master (1) or slave (0),
     /// bits 4:0 = port index.
     pub event_port_selection: [Option<(u8, bool)>; 8],
+
+    // === Memory Bank Conflict Detection ===
+
+    /// Bitmask of memory banks accessed by DMA during this cycle.
+    /// Bit N set = bank N was accessed. Supports up to 16 banks (MemTile).
+    /// Reset at the start of each coordinator step.
+    pub cycle_dma_banks: u16,
 }
 
 impl Tile {
@@ -703,6 +710,7 @@ impl Tile {
             core_trace: TraceUnit::new(col, row),
             mem_trace: TraceUnit::new(col, row),
             event_port_selection: [None; 8],
+            cycle_dma_banks: 0,
         }
     }
 
@@ -818,6 +826,33 @@ impl Tile {
     #[inline]
     pub fn is_shim(&self) -> bool {
         self.tile_type == TileType::Shim
+    }
+
+    // === Memory Bank Conflict Detection ===
+
+    /// Number of memory banks for this tile type.
+    pub fn num_banks(&self) -> usize {
+        match self.tile_type {
+            TileType::Compute => crate::device::aie2_spec::COMPUTE_TILE_MEMORY_BANKS,
+            TileType::MemTile => crate::device::aie2_spec::MEMTILE_MEMORY_BANKS,
+            TileType::Shim => 0,
+        }
+    }
+
+    /// Record that DMA accessed the given memory address range this cycle.
+    /// Call from DMA transfer methods during Phase 2.
+    #[inline]
+    pub fn record_dma_bank_access(&mut self, addr: u32, bytes: usize) {
+        let nb = self.num_banks();
+        if nb > 0 {
+            self.cycle_dma_banks |= crate::device::aie2_spec::banks_for_access(addr, bytes, nb);
+        }
+    }
+
+    /// Reset bank tracking for a new cycle. Call at the start of each step.
+    #[inline]
+    pub fn reset_bank_tracking(&mut self) {
+        self.cycle_dma_banks = 0;
     }
 
     // === Lock Arbiter Methods ===

@@ -265,6 +265,15 @@ pub struct DmaEngine {
     /// Events are buffered here because DmaEngine doesn't own an EventLog
     /// directly -- the coordinator collects them after each step.
     trace_events: Vec<(u64, EventType)>,
+
+    /// Number of memory banks for this tile type (8 for compute, 16 for MemTile).
+    /// Used to compute bank indices for conflict detection.
+    num_banks: usize,
+
+    /// Bitmask of memory banks accessed by DMA during this cycle.
+    /// Transferred to the tile at the end of each DMA step for comparison
+    /// with core bank accesses.
+    pub cycle_dma_banks: u16,
 }
 
 impl DmaEngine {
@@ -312,6 +321,13 @@ impl DmaEngine {
             // Trace event buffer
             current_cycle: 0,
             trace_events: Vec::new(),
+            // Bank conflict tracking
+            num_banks: match tile_type {
+                TileType::Compute => crate::device::aie2_spec::COMPUTE_TILE_MEMORY_BANKS,
+                TileType::MemTile => crate::device::aie2_spec::MEMTILE_MEMORY_BANKS,
+                TileType::Shim => 0,
+            },
+            cycle_dma_banks: 0,
         }
     }
 
@@ -954,6 +970,8 @@ impl DmaEngine {
                 }
             }
             (TransferEndpoint::TileMemory { .. }, TransferEndpoint::HostMemory) => {
+                // Record bank access for conflict detection (tile read by DMA)
+                tile.record_dma_bank_access(addr as u32, bytes);
                 if Self::transfer_tile_to_host_static(addr, bytes, tile, host_memory) {
                     TransferResult::success()
                 } else {
@@ -1010,6 +1028,11 @@ impl DmaEngine {
         // MemTile DMA addresses may have a 0x80000 offset in the address space
         // Wrap addresses to stay within memory bounds
         let offset = (addr as usize) % mem_size;
+
+        // Record bank access for conflict detection
+        self.cycle_dma_banks |= crate::device::aie2_spec::banks_for_access(
+            offset as u32, bytes, self.num_banks,
+        );
 
         if offset + bytes > mem_size {
             log::warn!("DMA({},{}) MM2S addr=0x{:X} bytes={} wraps past memory end (size=0x{:X})",
@@ -1149,6 +1172,11 @@ impl DmaEngine {
         // MemTile DMA addresses may have a 0x80000 offset in the address space
         // Wrap addresses to stay within memory bounds
         let offset = (addr as usize) % mem_size;
+
+        // Record bank access for conflict detection
+        self.cycle_dma_banks |= crate::device::aie2_spec::banks_for_access(
+            offset as u32, bytes, self.num_banks,
+        );
 
         if offset + bytes > mem_size {
             log::warn!("DMA({},{}) S2MM addr=0x{:X} bytes={} wraps past memory end (size=0x{:X})",
@@ -1586,6 +1614,9 @@ impl DmaEngine {
         if offset + bytes > tile.data_memory().len() {
             return false;
         }
+
+        // Record bank access for conflict detection
+        tile.record_dma_bank_access(offset as u32, bytes);
 
         // Read from host memory
         let mut buf = vec![0u8; bytes];

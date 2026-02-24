@@ -471,6 +471,12 @@ pub struct ExecutionContext {
     /// Loads have a 7-cycle pipeline latency (AIE2Schedule.td). The write to
     /// the destination register is deferred until `ready_cycle` is reached.
     pending_writes: Vec<PendingWrite>,
+
+    // === Memory Bank Conflict Detection ===
+    /// Bitmask of memory banks accessed by the core during this cycle.
+    /// Bit N set = bank N was accessed via load/store. Compared against
+    /// Tile::cycle_dma_banks after each step to detect conflicts.
+    pub cycle_core_banks: u16,
 }
 
 /// Which register to use as stack pointer.
@@ -524,6 +530,7 @@ impl ExecutionContext {
             modifier_snapshot: None,
             pending_branch: None,
             pending_writes: Vec::new(),
+            cycle_core_banks: 0,
         }
     }
 
@@ -728,6 +735,24 @@ impl ExecutionContext {
         for pw in &writes {
             self.apply_pending_write(pw);
         }
+    }
+
+    /// Record that the core accessed a memory address range this cycle.
+    ///
+    /// Computes the bank(s) touched and sets the corresponding bits in
+    /// `cycle_core_banks`. Called from MemoryUnit during loads and stores.
+    #[inline]
+    pub fn record_core_bank_access(&mut self, addr: u32, bytes: usize, num_banks: usize) {
+        if num_banks > 0 {
+            self.cycle_core_banks |=
+                crate::device::aie2_spec::banks_for_access(addr, bytes, num_banks);
+        }
+    }
+
+    /// Reset core bank tracking for a new cycle.
+    #[inline]
+    pub fn reset_bank_tracking(&mut self) {
+        self.cycle_core_banks = 0;
     }
 
     /// Commit all pending writes whose ready_cycle has been reached.

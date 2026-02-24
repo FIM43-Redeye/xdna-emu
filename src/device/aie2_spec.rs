@@ -37,9 +37,55 @@ pub const COMPUTE_TILE_MEMORY_BANKS: usize = 8;
 /// Size of each memory bank in compute tile: 8 KB (64 KB / 8 banks)
 pub const COMPUTE_TILE_BANK_SIZE: usize = 8 * 1024;
 
-/// Memory bank width: 128 bits
+/// Memory bank width: 128 bits (16 bytes)
 /// "Each bank is 128 bits wide" (AM020 Ch5)
 pub const MEMORY_BANK_WIDTH_BITS: usize = 128;
+
+/// Memory bank width in bytes (128 bits = 16 bytes).
+pub const MEMORY_BANK_WIDTH_BYTES: usize = MEMORY_BANK_WIDTH_BITS / 8;
+
+/// Number of memory banks per MemTile: 16
+/// 512KB / 32KB per bank = 16 banks (event IDs 0-15 in MemTileEvent)
+pub const MEMTILE_MEMORY_BANKS: usize = 16;
+
+/// Size of each memory bank in MemTile: 32 KB (512 KB / 16 banks)
+pub const MEMTILE_BANK_SIZE: usize = 32 * 1024;
+
+/// Compute the bank index for a local memory address.
+///
+/// AIE2 uses interleaved banking at 128-bit (16-byte) boundaries.
+/// Consecutive 16-byte lines map to different banks, enabling parallel
+/// access to sequential addresses from separate load/store units.
+///
+/// `addr` is the byte offset within tile data memory.
+/// `num_banks` is 8 for compute tiles, 16 for MemTiles.
+#[inline]
+pub fn addr_to_bank(addr: u32, num_banks: usize) -> u8 {
+    ((addr as usize >> 4) % num_banks) as u8
+}
+
+/// Compute a bitmask of all banks touched by a memory access.
+///
+/// A 32-byte (256-bit) vector access spans two 128-bit bank rows and may
+/// touch two different banks. This function returns a u16 bitmask with one
+/// bit set per bank touched.
+#[inline]
+pub fn banks_for_access(addr: u32, bytes: usize, num_banks: usize) -> u16 {
+    if bytes == 0 {
+        return 0;
+    }
+    let mut mask = 0u16;
+    // Align down to bank row boundary
+    let start = (addr & !0xF) as usize;
+    let end = (addr as usize) + bytes;
+    let mut a = start;
+    while a < end {
+        let bank = (a >> 4) % num_banks;
+        mask |= 1 << bank;
+        a += 16;
+    }
+    mask
+}
 
 // ============================================================================
 // Lock Architecture (AM020 Ch2, Appendix A)
@@ -292,5 +338,64 @@ mod tests {
     #[test]
     fn test_memory_bank_size() {
         assert_eq!(COMPUTE_TILE_BANK_SIZE, 8 * 1024);
+    }
+
+    #[test]
+    fn test_memtile_bank_size() {
+        assert_eq!(MEMTILE_BANK_SIZE, 32 * 1024);
+        assert_eq!(MEMTILE_MEMORY_BANKS * MEMTILE_BANK_SIZE, 512 * 1024);
+    }
+
+    #[test]
+    fn test_addr_to_bank_interleaved() {
+        // Consecutive 16-byte rows map to consecutive banks
+        assert_eq!(addr_to_bank(0x00, 8), 0);
+        assert_eq!(addr_to_bank(0x10, 8), 1);
+        assert_eq!(addr_to_bank(0x20, 8), 2);
+        assert_eq!(addr_to_bank(0x70, 8), 7);
+        // Wraps around after 8 banks
+        assert_eq!(addr_to_bank(0x80, 8), 0);
+        assert_eq!(addr_to_bank(0x90, 8), 1);
+    }
+
+    #[test]
+    fn test_addr_to_bank_within_row() {
+        // All bytes within a 16-byte bank row map to the same bank
+        for offset in 0..16 {
+            assert_eq!(addr_to_bank(0x30 + offset, 8), 3);
+        }
+    }
+
+    #[test]
+    fn test_addr_to_bank_memtile_16_banks() {
+        assert_eq!(addr_to_bank(0x00, 16), 0);
+        assert_eq!(addr_to_bank(0xF0, 16), 15);
+        assert_eq!(addr_to_bank(0x100, 16), 0); // wraps at 16
+    }
+
+    #[test]
+    fn test_banks_for_access_scalar() {
+        // 4-byte scalar load within one bank row -> one bank
+        let mask = banks_for_access(0x00, 4, 8);
+        assert_eq!(mask, 0b0000_0001); // bank 0
+
+        let mask = banks_for_access(0x14, 4, 8);
+        assert_eq!(mask, 0b0000_0010); // bank 1
+    }
+
+    #[test]
+    fn test_banks_for_access_vector() {
+        // 32-byte vector access at 0x00: spans banks 0 and 1
+        let mask = banks_for_access(0x00, 32, 8);
+        assert_eq!(mask, 0b0000_0011); // banks 0,1
+
+        // 32-byte vector access at 0x70: spans banks 7 and 0 (wraps)
+        let mask = banks_for_access(0x70, 32, 8);
+        assert_eq!(mask, 0b1000_0001); // banks 7,0
+    }
+
+    #[test]
+    fn test_banks_for_access_zero_bytes() {
+        assert_eq!(banks_for_access(0x00, 0, 8), 0);
     }
 }
