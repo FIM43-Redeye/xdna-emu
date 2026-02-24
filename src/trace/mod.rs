@@ -489,6 +489,81 @@ pub fn memtile_event_to_hw_id(event: &EventType) -> Option<u8> {
     }
 }
 
+/// Map an emulator `EventType` to its AIE2 shim tile (PL module) hardware event ID.
+///
+/// Shim tiles have their own event namespace distinct from both compute tile
+/// memory modules and MemTiles. DMA events are in a different ID range.
+///
+/// Event IDs from xaie_events_aieml.h (XAIEML_EVENTS_PL_*).
+pub fn shim_event_to_hw_id(event: &EventType) -> Option<u8> {
+    match event {
+        // DMA start task: S2MM_0=14, S2MM_1=15, MM2S_0=16, MM2S_1=17
+        EventType::DmaStartTask { channel } => match channel {
+            0 => Some(14),
+            1 => Some(15),
+            2 => Some(16),
+            3 => Some(17),
+            _ => None,
+        },
+        // DMA finished BD: S2MM_0=18, S2MM_1=19, MM2S_0=20, MM2S_1=21
+        EventType::DmaFinishedBd { channel } => match channel {
+            0 => Some(18),
+            1 => Some(19),
+            2 => Some(20),
+            3 => Some(21),
+            _ => None,
+        },
+        // DMA finished task: S2MM_0=22, S2MM_1=23, MM2S_0=24, MM2S_1=25
+        EventType::DmaFinishedTask { channel } => match channel {
+            0 => Some(22),
+            1 => Some(23),
+            2 => Some(24),
+            3 => Some(25),
+            _ => None,
+        },
+        // DMA stalled lock: S2MM_0=26, S2MM_1=27, MM2S_0=28, MM2S_1=29
+        EventType::DmaStalledLock { channel } => match channel {
+            0 => Some(26),
+            1 => Some(27),
+            2 => Some(28),
+            3 => Some(29),
+            _ => None,
+        },
+        // DMA stream starvation: S2MM_0=30, S2MM_1=31
+        // DMA stream backpressure: MM2S_0=32, MM2S_1=33
+        EventType::DmaStreamStarvation { channel } => match channel {
+            0 => Some(30),
+            1 => Some(31),
+            2 => Some(32),
+            3 => Some(33),
+            _ => None,
+        },
+        // Lock acquire: LOCK_0_ACQ_GE=40, stride 4 per lock (6 locks max)
+        EventType::LockAcquire { lock_id } => {
+            if *lock_id <= 5 {
+                Some(40 + (*lock_id as u8) * 4)
+            } else {
+                None
+            }
+        },
+        // Lock release: LOCK_0_REL=41, stride 4 per lock
+        EventType::LockRelease { lock_id } => {
+            if *lock_id <= 5 {
+                Some(41 + (*lock_id as u8) * 4)
+            } else {
+                None
+            }
+        },
+        _ => None,
+    }
+}
+
+/// ShimTileEvent EDGE_DETECTION_EVENT_N hardware event ID.
+/// Shim PL module: IDs 11-12 for detectors 0-1.
+pub fn shim_edge_detection_event_hw_id(detector: u8) -> u8 {
+    11 + detector
+}
+
 /// Hardware event IDs for stream switch port monitoring events.
 ///
 /// Each event port (0-7) has four event types at stride 4:
@@ -968,5 +1043,43 @@ mod tests {
         // MemTile: EDGE_DETECTION_EVENT_0=13, EVENT_1=14
         assert_eq!(memtile_edge_detection_event_hw_id(0), 13);
         assert_eq!(memtile_edge_detection_event_hw_id(1), 14);
+
+        // Shim PL module: EDGE_DETECTION_EVENT_0=11, EVENT_1=12
+        assert_eq!(shim_edge_detection_event_hw_id(0), 11);
+        assert_eq!(shim_edge_detection_event_hw_id(1), 12);
+    }
+
+    #[test]
+    fn test_shim_event_to_hw_id() {
+        use crate::trace::EventType;
+
+        // DMA start task: S2MM_0=14, S2MM_1=15, MM2S_0=16, MM2S_1=17
+        assert_eq!(shim_event_to_hw_id(&EventType::DmaStartTask { channel: 0 }), Some(14));
+        assert_eq!(shim_event_to_hw_id(&EventType::DmaStartTask { channel: 1 }), Some(15));
+        assert_eq!(shim_event_to_hw_id(&EventType::DmaStartTask { channel: 2 }), Some(16));
+        assert_eq!(shim_event_to_hw_id(&EventType::DmaStartTask { channel: 3 }), Some(17));
+
+        // DMA finished BD: S2MM_0=18, S2MM_1=19, MM2S_0=20, MM2S_1=21
+        assert_eq!(shim_event_to_hw_id(&EventType::DmaFinishedBd { channel: 0 }), Some(18));
+        assert_eq!(shim_event_to_hw_id(&EventType::DmaFinishedBd { channel: 3 }), Some(21));
+
+        // DMA finished task: S2MM_0=22, S2MM_1=23, MM2S_0=24, MM2S_1=25
+        assert_eq!(shim_event_to_hw_id(&EventType::DmaFinishedTask { channel: 0 }), Some(22));
+        assert_eq!(shim_event_to_hw_id(&EventType::DmaFinishedTask { channel: 3 }), Some(25));
+
+        // DMA stalled lock: S2MM_0=26, S2MM_1=27, MM2S_0=28, MM2S_1=29
+        assert_eq!(shim_event_to_hw_id(&EventType::DmaStalledLock { channel: 0 }), Some(26));
+        assert_eq!(shim_event_to_hw_id(&EventType::DmaStalledLock { channel: 3 }), Some(29));
+
+        // DMA stream starvation/backpressure: S2MM_0=30, S2MM_1=31, MM2S_0=32, MM2S_1=33
+        assert_eq!(shim_event_to_hw_id(&EventType::DmaStreamStarvation { channel: 0 }), Some(30));
+        assert_eq!(shim_event_to_hw_id(&EventType::DmaStreamStarvation { channel: 3 }), Some(33));
+
+        // Lock events: 6 locks, stride 4, ACQ_GE base=40, REL base=41
+        assert_eq!(shim_event_to_hw_id(&EventType::LockAcquire { lock_id: 0 }), Some(40));
+        assert_eq!(shim_event_to_hw_id(&EventType::LockAcquire { lock_id: 5 }), Some(60));
+        assert_eq!(shim_event_to_hw_id(&EventType::LockAcquire { lock_id: 6 }), None); // Only 6 locks
+        assert_eq!(shim_event_to_hw_id(&EventType::LockRelease { lock_id: 0 }), Some(41));
+        assert_eq!(shim_event_to_hw_id(&EventType::LockRelease { lock_id: 5 }), Some(61));
     }
 }

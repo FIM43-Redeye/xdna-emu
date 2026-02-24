@@ -943,13 +943,18 @@ impl Tile {
     /// Compares current vs previous signal state and fires
     /// EDGE_DETECTION_EVENT_0/1 on detected transitions.
     pub fn evaluate_edge_detectors(&mut self, cycle: u64) {
-        // Core module edge detectors -> core_trace
+        // Core module / PL module edge detectors -> core_trace
         for i in 0..2 {
             let det = &self.core_edge_detectors[i];
             let fire = (det.trigger_rising && det.curr_active && !det.prev_active)
                 || (det.trigger_falling && !det.curr_active && det.prev_active);
             if fire {
-                let hw_id = crate::trace::core_edge_detection_event_hw_id(i as u8);
+                // Shim PL module: IDs 11-12; Core module: IDs 13-14
+                let hw_id = if self.is_shim() {
+                    crate::trace::shim_edge_detection_event_hw_id(i as u8)
+                } else {
+                    crate::trace::core_edge_detection_event_hw_id(i as u8)
+                };
                 self.core_trace.notify_event(hw_id, cycle);
             }
         }
@@ -1299,6 +1304,10 @@ impl Tile {
         //
         // MemTile trace registers:
         //   0x940D0 (Control0), 0x940D4 (Control1), 0x940E0 (Event0), 0x940E4 (Event1)
+        //
+        // Shim (PL module) trace registers:
+        //   0x340D0 (Control0), 0x340D4 (Control1), 0x340E0 (Event0), 0x340E4 (Event1)
+        //   Same offset as core module. Uses core_trace since shim has one trace unit.
         if self.is_compute() {
             // Core module trace: base 0x340D0
             if offset >= 0x340D0 && offset <= 0x340E4 {
@@ -1316,6 +1325,12 @@ impl Tile {
                 let trace_offset = offset - 0x940D0;
                 self.mem_trace.write_register(trace_offset, value);
             }
+        } else if self.is_shim() {
+            // Shim PL module trace: base 0x340D0, stored in core_trace
+            if offset >= 0x340D0 && offset <= 0x340E4 {
+                let trace_offset = offset - 0x340D0;
+                self.core_trace.write_register(trace_offset, value);
+            }
         }
 
         // Edge detection event control registers.
@@ -1323,7 +1338,7 @@ impl Tile {
         // Each module has one register with two independent edge detectors.
         // Compute tile: 0x34408 (core module), 0x14408 (memory module)
         // MemTile: 0x94408
-        // Shim: 0x34408 (PL module, handled in shim tracing)
+        // Shim: 0x34408 (PL module, uses core_edge_detectors)
         if self.is_compute() {
             if offset == 0x34408 {
                 Self::configure_edge_detectors(&mut self.core_edge_detectors, value, false);
@@ -1334,6 +1349,10 @@ impl Tile {
         } else if self.is_mem_tile() {
             if offset == 0x94408 {
                 Self::configure_edge_detectors(&mut self.mem_edge_detectors, value, true);
+            }
+        } else if self.is_shim() {
+            if offset == 0x34408 {
+                Self::configure_edge_detectors(&mut self.core_edge_detectors, value, false);
             }
         }
 
@@ -2181,5 +2200,45 @@ mod tests {
         tile.evaluate_edge_detectors(100);
         // No edge events should fire (detectors not configured)
         // Just verify it doesn't panic
+    }
+
+    // === Shim Tile Tracing Tests ===
+
+    #[test]
+    fn test_shim_trace_register_write() {
+        let mut tile = Tile::shim(0, 0);
+        // Write Trace_Control0 at 0x340D0 (same offset as core module)
+        // start_event=1 (TRUE), stop_event=0 (NONE), mode=0 (event-time)
+        let ctrl0 = (0 << 24) | (1 << 16) | 0;
+        tile.write_register(0x340D0, ctrl0);
+        // Trace unit should now be configured
+        assert!(tile.core_trace.is_configured());
+    }
+
+    #[test]
+    fn test_shim_edge_detection_register() {
+        let mut tile = Tile::shim(0, 0);
+        // Write edge detection register at 0x34408 for PL module
+        let value = (1u32 << 25) | (14 << 16) | (1 << 9) | 22;
+        tile.write_register(0x34408, value);
+
+        // Shim uses core_edge_detectors for its PL module
+        assert_eq!(tile.core_edge_detectors[0].input_event, 22);
+        assert!(tile.core_edge_detectors[0].trigger_rising);
+
+        assert_eq!(tile.core_edge_detectors[1].input_event, 14);
+        assert!(tile.core_edge_detectors[1].trigger_rising);
+    }
+
+    #[test]
+    fn test_shim_dma_event_notification() {
+        let mut tile = Tile::shim(0, 0);
+        // Configure trace unit with start=TRUE(1)
+        tile.write_register(0x340D0, (1 << 16) | 0); // start=1, mode=0
+
+        // Shim DMA events go through core_trace (PL module)
+        // DMA_S2MM_0_START_TASK = PL event 14
+        tile.notify_core_trace_event(14, 100);
+        // Should not panic, trace unit accepts it
     }
 }

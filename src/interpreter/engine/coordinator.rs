@@ -467,17 +467,25 @@ impl InterpreterEngine {
             self.device.array.step_data_movement(&mut self.host_memory);
 
         // Drain DMA trace events into the global trace log and notify
-        // memory module trace units so they can produce binary trace packets.
-        // MemTiles use a different event ID namespace than compute tiles.
+        // trace units so they can produce binary trace packets.
+        // Each tile type uses a different event ID namespace and trace unit:
+        // - Compute tiles: mem_event_to_hw_id -> mem_trace
+        // - MemTiles: memtile_event_to_hw_id -> mem_trace
+        // - Shim tiles: shim_event_to_hw_id -> core_trace (PL module)
         for (col, row, cycle, event) in self.device.array.drain_dma_trace_events() {
             if let Some(tile) = self.device.array.get_mut(col, row) {
-                let hw_id = if tile.is_mem_tile() {
-                    crate::trace::memtile_event_to_hw_id(&event)
+                if tile.is_shim() {
+                    if let Some(id) = crate::trace::shim_event_to_hw_id(&event) {
+                        tile.notify_core_trace_event(id, cycle);
+                    }
+                } else if tile.is_mem_tile() {
+                    if let Some(id) = crate::trace::memtile_event_to_hw_id(&event) {
+                        tile.notify_mem_trace_event(id, cycle);
+                    }
                 } else {
-                    crate::trace::mem_event_to_hw_id(&event)
-                };
-                if let Some(id) = hw_id {
-                    tile.notify_mem_trace_event(id, cycle);
+                    if let Some(id) = crate::trace::mem_event_to_hw_id(&event) {
+                        tile.notify_mem_trace_event(id, cycle);
+                    }
                 }
             }
             self.trace_log.push(TileTracedEvent { col, row, cycle, event });
@@ -553,12 +561,13 @@ impl InterpreterEngine {
             }
             for (idx, hw_id, tt) in port_events {
                 let tile = &mut self.device.array.tiles[idx];
-                // Compute tiles use core_trace for port events (CoreEvent namespace).
-                // MemTiles and shim tiles use mem_trace.
-                if tt == TileType::Compute {
-                    tile.notify_core_trace_event(hw_id, cycle);
-                } else {
+                // Compute tiles: core_trace (CoreEvent namespace)
+                // Shim tiles: core_trace (PL module, single trace unit)
+                // MemTiles: mem_trace (MemTileEvent namespace)
+                if tt == TileType::MemTile {
                     tile.notify_mem_trace_event(hw_id, cycle);
+                } else {
+                    tile.notify_core_trace_event(hw_id, cycle);
                 }
             }
         }
