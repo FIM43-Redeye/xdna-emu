@@ -124,6 +124,14 @@ pub struct StreamPort {
     /// through the entire stream switch within a single `route_streams()`
     /// call, so checking `has_data()` between calls always sees empty FIFOs.
     pub cycle_active: bool,
+    /// Was this port stalled during the current routing cycle?
+    /// Set true when a slave has data but cannot forward it due to arbiter
+    /// contention or master backpressure. Used by PORT_STALLED trace events.
+    pub cycle_stalled: bool,
+    /// Was a TLAST seen on this port during the current routing cycle?
+    /// Set true when a word with TLAST=true is pushed or popped.
+    /// Used by PORT_TLAST trace events.
+    pub cycle_tlast: bool,
     /// Connected destination (for routing)
     pub route_to: Option<(u8, u8, u8)>, // (col, row, port_index)
     /// Port is enabled
@@ -149,6 +157,8 @@ impl StreamPort {
             route_to: None,
             enabled: false,
             cycle_active: false,
+            cycle_stalled: false,
+            cycle_tlast: false,
         }
     }
 
@@ -185,6 +195,9 @@ impl StreamPort {
             self.fifo.push(data);
             self.tlast_flags.push(tlast);
             self.cycle_active = true;
+            if tlast {
+                self.cycle_tlast = true;
+            }
             true
         } else {
             false
@@ -207,6 +220,9 @@ impl StreamPort {
             None
         } else {
             let tlast = self.tlast_flags.remove(0);
+            if tlast {
+                self.cycle_tlast = true;
+            }
             Some((self.fifo.remove(0), tlast))
         }
     }
@@ -575,9 +591,13 @@ impl StreamSwitch {
     pub fn begin_routing_cycle(&mut self) {
         for port in &mut self.masters {
             port.cycle_active = port.has_data();
+            port.cycle_stalled = false;
+            port.cycle_tlast = false;
         }
         for port in &mut self.slaves {
             port.cycle_active = port.has_data();
+            port.cycle_stalled = false;
+            port.cycle_tlast = false;
         }
     }
 
@@ -818,6 +838,7 @@ impl StreamSwitch {
                         if let Some(locked_by) = self.arbiter_locks[arbiter as usize] {
                             if locked_by != slave_idx {
                                 // Arbiter busy -- backpressure (hold data in FIFO)
+                                self.slaves[slave_idx].cycle_stalled = true;
                                 log::trace!("TileSwitch({},{}): slave[{}] waiting for arbiter {} (held by slave[{}])",
                                     self.col, self.row, slave_idx, arbiter, locked_by);
                                 continue;
@@ -835,6 +856,7 @@ impl StreamSwitch {
                                     || self.masters[m].can_accept()
                             });
                             if !all_can_accept {
+                                self.slaves[slave_idx].cycle_stalled = true;
                                 log::trace!("TileSwitch({},{}): slave[{}] header backpressure (master full)",
                                     self.col, self.row, slave_idx);
                                 continue;
@@ -892,6 +914,7 @@ impl StreamSwitch {
                     m >= self.masters.len() || self.masters[m].can_accept()
                 });
                 if !all_can_accept {
+                    self.slaves[slave_idx].cycle_stalled = true;
                     log::trace!("TileSwitch({},{}): slave[{}] data backpressure (master full)",
                         self.col, self.row, slave_idx);
                     continue;
@@ -2003,5 +2026,51 @@ mod tests {
         ss.begin_routing_cycle();
         assert!(!ss.slaves[0].cycle_active,
             "empty port should not be active after begin_routing_cycle");
+    }
+
+    #[test]
+    fn test_cycle_tlast_tracks_tlast_on_push() {
+        let mut port = StreamPort::new(0, PortDirection::Master, PortType::Dma(0));
+
+        // Push without TLAST: cycle_tlast stays false
+        port.push_with_tlast(0x1111, false);
+        assert!(!port.cycle_tlast);
+
+        // Push with TLAST: cycle_tlast becomes true
+        port.push_with_tlast(0x2222, true);
+        assert!(port.cycle_tlast);
+    }
+
+    #[test]
+    fn test_cycle_tlast_tracks_tlast_on_pop() {
+        let mut port = StreamPort::new(0, PortDirection::Slave, PortType::Dma(0));
+
+        // Push a word with TLAST (cycle_tlast set on push)
+        port.push_with_tlast(0xAAAA, true);
+        assert!(port.cycle_tlast);
+
+        // Reset to test pop path
+        port.cycle_tlast = false;
+        let (_, tlast) = port.pop_with_tlast().unwrap();
+        assert!(tlast);
+        assert!(port.cycle_tlast, "pop_with_tlast should set cycle_tlast");
+    }
+
+    #[test]
+    fn test_begin_routing_cycle_clears_stalled_and_tlast() {
+        let mut ss = StreamSwitch::new_compute_tile(0, 2);
+
+        // Manually set flags to verify they get cleared
+        ss.slaves[0].cycle_stalled = true;
+        ss.slaves[0].cycle_tlast = true;
+        ss.masters[0].cycle_stalled = true;
+        ss.masters[0].cycle_tlast = true;
+
+        ss.begin_routing_cycle();
+
+        assert!(!ss.slaves[0].cycle_stalled);
+        assert!(!ss.slaves[0].cycle_tlast);
+        assert!(!ss.masters[0].cycle_stalled);
+        assert!(!ss.masters[0].cycle_tlast);
     }
 }

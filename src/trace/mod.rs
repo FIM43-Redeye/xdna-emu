@@ -480,30 +480,80 @@ pub fn memtile_event_to_hw_id(event: &EventType) -> Option<u8> {
     }
 }
 
-/// Hardware event ID for PORT_RUNNING_N.
+/// Hardware event IDs for stream switch port monitoring events.
 ///
-/// PORT_RUNNING events indicate a stream switch port is actively transferring
-/// data. Each module type has its own PORT_RUNNING ID base (stride 4):
+/// Each event port (0-7) has four event types at stride 4:
+/// PORT_IDLE, PORT_RUNNING, PORT_STALLED, PORT_TLAST.
 ///
-/// | Module     | PORT_RUNNING_0 | Stride | Source (aie2.py)          |
-/// |------------|----------------|--------|---------------------------|
-/// | CoreEvent  | 75             | 4      | CoreEvent.PORT_RUNNING_0  |
-/// | MemEvent   | 78             | 4      | MemEvent.PORT_RUNNING_0   |
-/// | MemTile    | 80             | 4      | MemTileEvent.PORT_RUNNING_0|
+/// | Module     | PORT_IDLE_0 | PORT_RUNNING_0 | PORT_STALLED_0 | PORT_TLAST_0 |
+/// |------------|-------------|----------------|----------------|--------------|
+/// | CoreEvent  | 74          | 75             | 76             | 77           |
+/// | MemEvent   | (none)      | (none)         | (none)         | (none)       |
+/// | MemTile    | 79          | 80             | 81             | 82           |
 ///
 /// The physical port (master/slave + index) is configured separately via
 /// Event Port Selection registers (0x3FF00/0x3FF04 or 0xB0F00/0xB0F04).
+///
+/// Source: mlir-aie `python/utils/trace/events/aie2.py`
+
+pub fn core_port_idle_hw_id(event_port: u8) -> u8 {
+    74 + (event_port * 4)
+}
+
 pub fn core_port_running_hw_id(event_port: u8) -> u8 {
     75 + (event_port * 4)
 }
 
+pub fn core_port_stalled_hw_id(event_port: u8) -> u8 {
+    76 + (event_port * 4)
+}
+
+pub fn core_port_tlast_hw_id(event_port: u8) -> u8 {
+    77 + (event_port * 4)
+}
+
 /// Hardware event ID for PORT_RUNNING_N in the memory module (compute tiles).
-pub fn mem_port_running_hw_id(event_port: u8) -> u8 {
+///
+/// WARNING: MemEvent does NOT have PORT events. IDs 78+ in MemEvent are
+/// CONFLICT_DM_BANK events. This function exists for symmetry but should
+/// not be used -- compute tile port events use CoreEvent IDs, not MemEvent.
+/// Kept for reference; use `core_port_*_hw_id()` for compute tile ports.
+#[allow(dead_code)]
+fn mem_port_running_hw_id(event_port: u8) -> u8 {
     78 + (event_port * 4)
 }
 
-/// Hardware event ID for PORT_RUNNING_N in MemTile module.
+pub fn memtile_port_idle_hw_id(event_port: u8) -> u8 {
+    79 + (event_port * 4)
+}
+
 pub fn memtile_port_running_hw_id(event_port: u8) -> u8 {
+    80 + (event_port * 4)
+}
+
+pub fn memtile_port_stalled_hw_id(event_port: u8) -> u8 {
+    81 + (event_port * 4)
+}
+
+pub fn memtile_port_tlast_hw_id(event_port: u8) -> u8 {
+    82 + (event_port * 4)
+}
+
+/// Shim tile port event IDs (ShimTileEvent).
+/// Base: PORT_IDLE_0=77, stride 4.
+pub fn shim_port_idle_hw_id(event_port: u8) -> u8 {
+    77 + (event_port * 4)
+}
+
+pub fn shim_port_running_hw_id(event_port: u8) -> u8 {
+    78 + (event_port * 4)
+}
+
+pub fn shim_port_stalled_hw_id(event_port: u8) -> u8 {
+    79 + (event_port * 4)
+}
+
+pub fn shim_port_tlast_hw_id(event_port: u8) -> u8 {
     80 + (event_port * 4)
 }
 
@@ -757,29 +807,72 @@ mod tests {
         assert_eq!(memtile_event_to_hw_id(&EventType::CoreActive), None);
     }
 
-    // -- PORT_RUNNING ID tests --
+    // -- Port event ID tests --
+    //
+    // Each event port has 4 IDs at stride 4: IDLE, RUNNING, STALLED, TLAST.
 
     #[test]
-    fn test_core_port_running_hw_ids() {
-        // CoreEvent: PORT_RUNNING_0=75, stride 4
+    fn test_core_port_event_ids_stride() {
+        // CoreEvent: PORT_IDLE_0=74, PORT_RUNNING_0=75, PORT_STALLED_0=76, PORT_TLAST_0=77
+        assert_eq!(core_port_idle_hw_id(0), 74);
         assert_eq!(core_port_running_hw_id(0), 75);
+        assert_eq!(core_port_stalled_hw_id(0), 76);
+        assert_eq!(core_port_tlast_hw_id(0), 77);
+
+        // Port 1: +4
+        assert_eq!(core_port_idle_hw_id(1), 78);
         assert_eq!(core_port_running_hw_id(1), 79);
+        assert_eq!(core_port_stalled_hw_id(1), 80);
+        assert_eq!(core_port_tlast_hw_id(1), 81);
+
+        // Port 7: +28
+        assert_eq!(core_port_idle_hw_id(7), 102);
         assert_eq!(core_port_running_hw_id(7), 103);
+        assert_eq!(core_port_stalled_hw_id(7), 104);
+        assert_eq!(core_port_tlast_hw_id(7), 105);
     }
 
     #[test]
-    fn test_mem_port_running_hw_ids() {
-        // MemEvent: PORT_RUNNING_0=78, stride 4
-        assert_eq!(mem_port_running_hw_id(0), 78);
-        assert_eq!(mem_port_running_hw_id(1), 82);
-        assert_eq!(mem_port_running_hw_id(7), 106);
+    fn test_mem_port_running_hw_ids_are_wrong_namespace() {
+        // MemEvent does NOT have PORT events. IDs 78+ are CONFLICT_DM_BANK.
+        // This function exists for symmetry but should not be used.
+        // Compute tile port events use CoreEvent IDs via core_port_*_hw_id().
+        assert_eq!(mem_port_running_hw_id(0), 78); // Would be CONFLICT_DM_BANK_1
     }
 
     #[test]
-    fn test_memtile_port_running_hw_ids() {
-        // MemTileEvent: PORT_RUNNING_0=80, stride 4
+    fn test_shim_port_event_ids_stride() {
+        // ShimTileEvent: PORT_IDLE_0=77, PORT_RUNNING_0=78, PORT_STALLED_0=79, PORT_TLAST_0=80
+        assert_eq!(shim_port_idle_hw_id(0), 77);
+        assert_eq!(shim_port_running_hw_id(0), 78);
+        assert_eq!(shim_port_stalled_hw_id(0), 79);
+        assert_eq!(shim_port_tlast_hw_id(0), 80);
+
+        // Port 7: +28
+        assert_eq!(shim_port_idle_hw_id(7), 105);
+        assert_eq!(shim_port_running_hw_id(7), 106);
+        assert_eq!(shim_port_stalled_hw_id(7), 107);
+        assert_eq!(shim_port_tlast_hw_id(7), 108);
+    }
+
+    #[test]
+    fn test_memtile_port_event_ids_stride() {
+        // MemTileEvent: PORT_IDLE_0=79, PORT_RUNNING_0=80, PORT_STALLED_0=81, PORT_TLAST_0=82
+        assert_eq!(memtile_port_idle_hw_id(0), 79);
         assert_eq!(memtile_port_running_hw_id(0), 80);
+        assert_eq!(memtile_port_stalled_hw_id(0), 81);
+        assert_eq!(memtile_port_tlast_hw_id(0), 82);
+
+        // Port 1: +4
+        assert_eq!(memtile_port_idle_hw_id(1), 83);
         assert_eq!(memtile_port_running_hw_id(1), 84);
+        assert_eq!(memtile_port_stalled_hw_id(1), 85);
+        assert_eq!(memtile_port_tlast_hw_id(1), 86);
+
+        // Port 7: +28
+        assert_eq!(memtile_port_idle_hw_id(7), 107);
         assert_eq!(memtile_port_running_hw_id(7), 108);
+        assert_eq!(memtile_port_stalled_hw_id(7), 109);
+        assert_eq!(memtile_port_tlast_hw_id(7), 110);
     }
 }

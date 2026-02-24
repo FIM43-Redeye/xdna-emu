@@ -483,45 +483,79 @@ impl InterpreterEngine {
             self.trace_log.push(TileTracedEvent { col, row, cycle, event });
         }
 
-        // Phase 2b: Generate PORT_RUNNING events from cycle_active flags.
+        // Phase 2b: Generate stream switch port events from cycle flags.
         //
-        // PORT_RUNNING is a level event: it fires every cycle a monitored port
-        // is active. step_data_movement() seeds cycle_active from pre-existing
-        // FIFO state and marks ports active as data flows through during routing.
-        // We read those flags here to notify trace units.
+        // Four event types per monitored port, all level events:
+        // - PORT_IDLE: port had no data this cycle
+        // - PORT_RUNNING: port was active (had data flowing)
+        // - PORT_STALLED: port had data but couldn't forward (backpressure)
+        // - PORT_TLAST: a TLAST was seen on this port
+        //
+        // step_data_movement() seeds these flags from FIFO state at routing
+        // start and updates them as data flows. We read them here to notify
+        // trace units.
         {
             let cycle = self.total_cycles;
-            let mut port_events: Vec<(usize, u8, bool)> = Vec::new();
+            // Collect (tile_idx, hw_event_id, trace_target) tuples.
+            // trace_target: which trace unit to notify (core_trace vs mem_trace).
+            let mut port_events: Vec<(usize, u8, TileType)> = Vec::new();
             for idx in 0..self.device.array.tiles.len() {
                 let tile = &self.device.array.tiles[idx];
                 if !tile.core_trace.is_configured() && !tile.mem_trace.is_configured() {
                     continue;
                 }
+                let tt = tile.tile_type;
 
                 for event_port in 0..8u8 {
                     if let Some((port_idx, is_master)) = tile.event_port_selection[event_port as usize] {
-                        let port_active = if is_master {
+                        let port = if is_master {
                             tile.stream_switch.masters.get(port_idx as usize)
-                                .map_or(false, |p| p.cycle_active)
                         } else {
                             tile.stream_switch.slaves.get(port_idx as usize)
-                                .map_or(false, |p| p.cycle_active)
                         };
+                        let Some(port) = port else { continue };
 
-                        if port_active {
-                            let hw_id = if tile.is_compute() {
-                                crate::trace::core_port_running_hw_id(event_port)
-                            } else {
-                                crate::trace::memtile_port_running_hw_id(event_port)
+                        // PORT_RUNNING or PORT_IDLE (mutually exclusive)
+                        let hw_id = if port.cycle_active {
+                            match tt {
+                                TileType::Compute => crate::trace::core_port_running_hw_id(event_port),
+                                TileType::MemTile => crate::trace::memtile_port_running_hw_id(event_port),
+                                TileType::Shim => crate::trace::shim_port_running_hw_id(event_port),
+                            }
+                        } else {
+                            match tt {
+                                TileType::Compute => crate::trace::core_port_idle_hw_id(event_port),
+                                TileType::MemTile => crate::trace::memtile_port_idle_hw_id(event_port),
+                                TileType::Shim => crate::trace::shim_port_idle_hw_id(event_port),
+                            }
+                        };
+                        port_events.push((idx, hw_id, tt));
+
+                        if port.cycle_stalled {
+                            let hw_id = match tt {
+                                TileType::Compute => crate::trace::core_port_stalled_hw_id(event_port),
+                                TileType::MemTile => crate::trace::memtile_port_stalled_hw_id(event_port),
+                                TileType::Shim => crate::trace::shim_port_stalled_hw_id(event_port),
                             };
-                            port_events.push((idx, hw_id, tile.is_compute()));
+                            port_events.push((idx, hw_id, tt));
+                        }
+
+                        if port.cycle_tlast {
+                            let hw_id = match tt {
+                                TileType::Compute => crate::trace::core_port_tlast_hw_id(event_port),
+                                TileType::MemTile => crate::trace::memtile_port_tlast_hw_id(event_port),
+                                TileType::Shim => crate::trace::shim_port_tlast_hw_id(event_port),
+                            };
+                            port_events.push((idx, hw_id, tt));
                         }
                     }
                 }
             }
-            for (idx, hw_id, is_compute) in port_events {
+            for (idx, hw_id, tt) in port_events {
                 let tile = &mut self.device.array.tiles[idx];
-                if is_compute {
+                // Compute tiles use core_trace for port events (CoreEvent namespace).
+                // MemTiles and shim tiles use mem_trace.
+                if tt == TileType::Compute {
                     tile.core_trace.notify_event(hw_id, cycle);
                 } else {
                     tile.mem_trace.notify_event(hw_id, cycle);
