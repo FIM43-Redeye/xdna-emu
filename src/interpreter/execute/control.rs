@@ -165,13 +165,13 @@ impl ControlUnit {
                 // AIE-ML lock mapping: lock IDs 48-63 in core instructions
                 // access the local memory module's locks 0-15 (NOT the adjacent MemTile!)
                 // The memory module is part of the same compute tile - it's the 64KB data memory.
-                let lock_id = Self::map_lock_id(raw_lock_id);
-                let is_mem_module = raw_lock_id >= 48;
-
                 // Always use local tile locks - memory module locks are LOCAL to the tile
                 // The mem_tile_locks parameter is not used for core lock instructions.
                 let locks: &mut [Lock] = &mut tile.locks;
                 let _ = mem_tile_locks; // silence unused warning
+
+                let lock_id = Self::map_lock_id(raw_lock_id, locks.len());
+                let is_mem_module = raw_lock_id >= 48;
 
                 let current_value = locks[lock_id as usize].value;
                 let lock = &mut locks[lock_id as usize];
@@ -200,10 +200,6 @@ impl ControlUnit {
 
             Operation::LockRelease => {
                 let (raw_lock_id, delta) = Self::get_lock_release_params(op, ctx);
-                // AIE-ML lock mapping: lock IDs 48-63 in core instructions
-                // access the local memory module's locks 0-15 (NOT the adjacent MemTile!)
-                let lock_id = Self::map_lock_id(raw_lock_id);
-                let is_mem_module = raw_lock_id >= 48;
 
                 // Capture tile info before borrowing locks
                 let tile_col = tile.col;
@@ -213,6 +209,9 @@ impl ControlUnit {
                 // Always use local tile locks - memory module locks are LOCAL to the tile
                 let locks: &mut [Lock] = &mut tile.locks;
                 let _ = mem_tile_locks; // silence unused warning
+
+                let lock_id = Self::map_lock_id(raw_lock_id, locks.len());
+                let is_mem_module = raw_lock_id >= 48;
 
                 let lock_ptr = &locks[lock_id as usize] as *const _ as usize;
                 let old_value = locks[lock_id as usize].value;
@@ -366,27 +365,25 @@ impl ControlUnit {
         })
     }
 
-    /// Map AIE-ML core lock ID to memory module lock index.
+    /// Map AIE-ML core lock ID to tile lock index.
     ///
-    /// In AIE-ML, core lock instructions use different address spaces:
-    /// - Lock IDs 0-47: Core module locks (rarely used, passed through)
-    /// - Lock IDs 48-63: Memory module locks 0-15 (the common case)
+    /// In AIE-ML, core lock instructions use a 6-bit lock ID field:
+    /// - Lock IDs 0-15: Core module locks 0-15 (direct mapping)
+    /// - Lock IDs 48-63: Memory module locks 0-15 (subtract 48)
+    /// - Lock IDs 16-47: Hardware uses low 4 bits (lock & 0xF)
     ///
-    /// This maps the core instruction lock ID to the actual tile.locks[] index.
-    fn map_lock_id(raw_lock_id: u8) -> u8 {
-        if raw_lock_id >= 48 && raw_lock_id < 64 {
-            // Memory module locks: subtract 48 to get 0-15
+    /// The hardware addresses locks using the low bits of the ID within
+    /// the selected module. For IDs outside the standard ranges, we
+    /// mask to the valid range to match hardware behavior.
+    fn map_lock_id(raw_lock_id: u8, num_locks: usize) -> u8 {
+        let mapped = if raw_lock_id >= 48 {
+            // Memory module locks: subtract 48
             raw_lock_id - 48
-        } else if raw_lock_id < 16 {
-            // Direct mapping for low lock IDs (0-15)
-            // This handles the case where the instruction uses direct lock IDs
-            raw_lock_id
         } else {
-            // Core module locks (16-47) are passed through
-            // These are rarely used but we should handle them
-            log::warn!("Unusual lock ID {} (not 0-15 or 48-63)", raw_lock_id);
             raw_lock_id
-        }
+        };
+        // Clamp to valid range for this tile's lock count
+        if num_locks == 0 { 0 } else { mapped % num_locks as u8 }
     }
 
     /// Start a DMA transfer.

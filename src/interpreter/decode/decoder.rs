@@ -504,6 +504,7 @@ impl InstructionDecoder {
                 condition: enc.branch_condition.unwrap_or(BranchCondition::NotEqual),
             },
             SemanticOp::Nop => Operation::Nop,
+            SemanticOp::Copy if enc.is_vector => Operation::VectorMov { element_type },
             SemanticOp::Copy => Operation::ScalarMov,
 
             // Comparison operations (produce 0/1 result)
@@ -551,6 +552,10 @@ impl InstructionDecoder {
             // Truncate: narrow type conversion, treat as NOP for now
             // (the narrowing happens implicitly in register writes)
             SemanticOp::Truncate => Operation::Nop,
+
+            // Event: fires a trace event (INSTR_EVENT_0/1). No computational
+            // effect; the trace subsystem auto-starts events separately.
+            SemanticOp::Event => Operation::Nop,
 
             // Not handled yet (URem, Rotl, Rotr, Cttz, Ctpop, Bswap, Intrinsic)
             _ => {
@@ -867,9 +872,13 @@ impl InstructionDecoder {
         // Validate: dest must be a writable operand type.
         // If an Immediate or other non-writable operand ended up here (from a
         // heuristic mismatch or bad output_order resolution), move it to sources.
+        // This is expected for some Chess-compiled instructions (VMOV_mv_scd,
+        // VMOV_mv_cm, VGE_D32) where the TableGen output_order puts a config
+        // immediate in the dest position. The fallback is correct: treat it as
+        // a source operand instead.
         let dest = match dest {
             Some(d) if !can_be_dest(&d) => {
-                log::warn!(
+                log::trace!(
                     "[DECODE] Non-writable {:?} in dest for '{}', moving to sources",
                     d, decoded.encoding.name,
                 );

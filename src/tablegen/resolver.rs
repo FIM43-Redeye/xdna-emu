@@ -1651,15 +1651,32 @@ pub fn infer_semantic_from_mnemonic(mnemonic: &str) -> Option<SemanticOp> {
         return Some(SemanticOp::SetGe);
     }
 
-    // Vector data movement (vshift, vshuffle, vconv, vunpack)
+    // Vector data movement (vshift, vshuffle, vconv, vunpack, vextbcst, vpush)
     if lower.starts_with("vshift") || lower.starts_with("vshuffle") {
         return Some(SemanticOp::Copy); // Data rearrangement
     }
-    if lower.starts_with("vconv") {
-        return Some(SemanticOp::Copy); // Type conversion
+    if lower.starts_with("vconv") || lower.starts_with("vfloor") || lower.starts_with("vceil")
+        || lower.starts_with("vtrunc") || lower.starts_with("vround")
+    {
+        return Some(SemanticOp::Copy); // Type conversion (including rounding variants)
     }
     if lower.starts_with("vunpack") {
         return Some(SemanticOp::Load); // Unpack from load channel
+    }
+    if lower.starts_with("vextbcst") || lower.starts_with("vbcst") {
+        return Some(SemanticOp::Copy); // Extract-broadcast / broadcast
+    }
+    if lower.starts_with("vpush") {
+        return Some(SemanticOp::Copy); // Push vector to accumulator
+    }
+    if lower.starts_with("vsrs") {
+        return Some(SemanticOp::Copy); // Shift-round-saturate (acc -> vec)
+    }
+    if lower.starts_with("vups") {
+        return Some(SemanticOp::Copy); // Upshift (vec -> acc)
+    }
+    if lower == "vclr" || lower.starts_with("vclr.") {
+        return Some(SemanticOp::Copy); // Clear vector to zero
     }
 
     None
