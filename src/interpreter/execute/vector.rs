@@ -880,10 +880,14 @@ impl VectorAlu {
         let acc = ctx.accumulator.read(acc_reg);
         let mut result = [0u32; 8];
 
-        // Default rounding mode: PosInf (round half toward +inf).
-        // The hardware default is configurable via a status register, but
-        // PosInf is the most common mode used by compiled code.
-        let mode = RoundingMode::PosInf;
+        // Read rounding and saturation from the SRS control register state.
+        // In hardware, these are fields within the Core_CR MMIO register,
+        // set by set_rnd() / set_satmode() instructions.
+        let cfg = &ctx.srs_config;
+        let mode = RoundingMode::from_raw(cfg.rounding_mode)
+            .unwrap_or(RoundingMode::PosInf);
+        let saturate = cfg.saturate();
+        let sym_sat = cfg.symmetric_saturate();
 
         let signed_output = matches!(
             to_type,
@@ -897,7 +901,7 @@ impl VectorAlu {
                     let val = acc[i] as i64;
                     let out = vector_srs::srs_lane(
                         val, shift, signed_output, 32,
-                        true, false, mode,
+                        saturate, sym_sat, mode,
                     );
                     result[i] = out as u32;
                 }
@@ -909,11 +913,11 @@ impl VectorAlu {
                     let val1 = acc[i * 2 + 1] as i64;
                     let out0 = vector_srs::srs_lane(
                         val0, shift, signed_output, 16,
-                        true, false, mode,
+                        saturate, sym_sat, mode,
                     );
                     let out1 = vector_srs::srs_lane(
                         val1, shift, signed_output, 16,
-                        true, false, mode,
+                        saturate, sym_sat, mode,
                     );
                     result[i] = (out0 as u16 as u32) | ((out1 as u16 as u32) << 16);
                 }
@@ -928,7 +932,7 @@ impl VectorAlu {
                             let val = acc[lane] as i64;
                             let out = vector_srs::srs_lane(
                                 val, shift, signed_output, 8,
-                                true, false, mode,
+                                saturate, sym_sat, mode,
                             );
                             word |= (out as u8 as u32) << (j * 8);
                         }
@@ -3394,5 +3398,73 @@ mod tests {
 
         VectorAlu::execute(&op, &mut ctx);
         assert_eq!(ctx.vector.read(1), [10, 20, 30, 40, 50, 60, 70, 80]);
+    }
+
+    #[test]
+    fn test_vector_srs_reads_config() {
+        // Verify SRS reads rounding mode from srs_config, not hardcoded.
+        let mut ctx = make_ctx();
+        // Accumulator lane 0 = 264 (264 >> 4 = 16.5)
+        ctx.accumulator.write(0, [264, 0, 0, 0, 0, 0, 0, 0]);
+
+        let op = SlotOp::new(
+            SlotIndex::Vector,
+            Operation::VectorSRS {
+                from_type: ElementType::Int32,
+                to_type: ElementType::Int32,
+            },
+        )
+        .with_dest(Operand::VectorReg(0))
+        .with_source(Operand::AccumReg(0))
+        .with_source(Operand::Immediate(4));
+
+        // Default config: PosInf (mode 9), saturation on, signed.
+        // 16.5 with PosInf -> 17 (round toward +inf at halfway)
+        VectorAlu::execute(&op, &mut ctx);
+        assert_eq!(ctx.vector.read(0)[0], 17);
+
+        // Switch to Floor rounding (mode 0): 16.5 -> 16
+        ctx.srs_config.rounding_mode = 0; // Floor
+        ctx.accumulator.write(0, [264, 0, 0, 0, 0, 0, 0, 0]);
+        VectorAlu::execute(&op, &mut ctx);
+        assert_eq!(ctx.vector.read(0)[0], 16);
+
+        // Switch to NegInf (mode 8): 16.5 at half -> 16 (toward -inf)
+        ctx.srs_config.rounding_mode = 8; // NegInf
+        ctx.accumulator.write(0, [264, 0, 0, 0, 0, 0, 0, 0]);
+        VectorAlu::execute(&op, &mut ctx);
+        assert_eq!(ctx.vector.read(0)[0], 16);
+    }
+
+    #[test]
+    fn test_vector_srs_saturation_from_config() {
+        let mut ctx = make_ctx();
+        // Value that overflows i16: 32768 (> 32767)
+        let overflow_val = 32768i64 as u64;
+        ctx.accumulator.write(0, [overflow_val, 0, 0, 0, 0, 0, 0, 0]);
+
+        let op = SlotOp::new(
+            SlotIndex::Vector,
+            Operation::VectorSRS {
+                from_type: ElementType::Int32,
+                to_type: ElementType::Int16,
+            },
+        )
+        .with_dest(Operand::VectorReg(0))
+        .with_source(Operand::AccumReg(0))
+        .with_source(Operand::Immediate(0)); // shift=0
+
+        // Default: saturation enabled -> clamp to 32767
+        VectorAlu::execute(&op, &mut ctx);
+        let lo16 = ctx.vector.read(0)[0] as i16;
+        assert_eq!(lo16, 32767);
+
+        // Disable saturation: value wraps
+        ctx.srs_config.saturation_mode = 0; // No saturation
+        ctx.accumulator.write(0, [overflow_val, 0, 0, 0, 0, 0, 0, 0]);
+        VectorAlu::execute(&op, &mut ctx);
+        let lo16_nowrap = ctx.vector.read(0)[0] as i16;
+        // Without saturation, 32768 truncated to 16 bits wraps to -32768
+        assert_eq!(lo16_nowrap, -32768);
     }
 }

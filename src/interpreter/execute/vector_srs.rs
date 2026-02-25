@@ -589,6 +589,146 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Golden reference saturation tests (from ISA Spec 1.12 SRS model)
+    //
+    // These test vectors are ported from the AMD SRS reference model that
+    // validates boundary behavior at i16 saturation limits. Each test uses
+    // shift=8 with Floor rounding (mode 0) and 16-bit signed output.
+    //
+    // Test categories:
+    // A. Exact boundary values (should pass through without saturation)
+    // B. One-beyond-boundary (should saturate)
+    // C. Boundary + half-point (rounding interacts with saturation)
+    //
+    // Repeated for both normal and symmetric saturation.
+    // -----------------------------------------------------------------------
+
+    /// Helper for golden reference tests: signed 16-bit output, shift=8.
+    fn srs_golden(value: i64, sat: bool, sym_sat: bool) -> i64 {
+        srs_lane(value, 8, true, 16, sat, sym_sat, RoundingMode::Floor)
+    }
+
+    // -- Category A: Exact boundary values, normal saturation --
+
+    #[test]
+    fn golden_normal_max_exact() {
+        // 32767 * 256 >> 8 = 32767 (i16::MAX): no saturation
+        assert_eq!(srs_golden(32767 * 256, true, false), 32767);
+    }
+
+    #[test]
+    fn golden_normal_min_exact() {
+        // -32768 * 256 >> 8 = -32768 (i16::MIN): no saturation
+        assert_eq!(srs_golden(-32768 * 256, true, false), -32768);
+    }
+
+    #[test]
+    fn golden_normal_sym_min_exact() {
+        // -32767 * 256 >> 8 = -32767: no saturation
+        assert_eq!(srs_golden(-32767 * 256, true, false), -32767);
+    }
+
+    // -- Category B: One beyond boundary, normal saturation --
+
+    #[test]
+    fn golden_normal_max_plus_one() {
+        // 32768 * 256 >> 8 = 32768: saturates to 32767
+        assert_eq!(srs_golden(32768 * 256, true, false), 32767);
+    }
+
+    #[test]
+    fn golden_normal_min_minus_one() {
+        // -32769 * 256 >> 8 = -32769: saturates to -32768
+        assert_eq!(srs_golden(-32769 * 256, true, false), -32768);
+    }
+
+    #[test]
+    fn golden_normal_sym_min_minus_one() {
+        // -32768 * 256 >> 8 = -32768: equals normal min, no saturation
+        assert_eq!(srs_golden(-32768 * 256, true, false), -32768);
+    }
+
+    // -- Category C: Boundary + half-point, normal saturation --
+
+    #[test]
+    fn golden_normal_max_plus_half() {
+        // (32767 * 256) + 128 = 32767.5 * 256. Floor -> 32767, within range.
+        assert_eq!(srs_golden(32767 * 256 + 128, true, false), 32767);
+    }
+
+    #[test]
+    fn golden_normal_min_minus_half() {
+        // (-32768 * 256) - 128 = -32768.5 * 256. Floor -> -32769, saturates to -32768.
+        assert_eq!(srs_golden(-32768 * 256 - 128, true, false), -32768);
+    }
+
+    #[test]
+    fn golden_normal_sym_min_minus_half() {
+        // (-32767 * 256) - 128 = -32767.5 * 256. Floor -> -32768, within normal range.
+        assert_eq!(srs_golden(-32767 * 256 - 128, true, false), -32768);
+    }
+
+    // -- Category A: Exact boundary values, symmetric saturation --
+
+    #[test]
+    fn golden_sym_max_exact() {
+        // 32767 * 256 >> 8 = 32767: no saturation
+        assert_eq!(srs_golden(32767 * 256, true, true), 32767);
+    }
+
+    #[test]
+    fn golden_sym_min_exact() {
+        // -32768 * 256 >> 8 = -32768: symmetric min is -32767, saturates.
+        assert_eq!(srs_golden(-32768 * 256, true, true), -32767);
+    }
+
+    #[test]
+    fn golden_sym_sym_min_exact() {
+        // -32767 * 256 >> 8 = -32767: equals symmetric min, no saturation.
+        assert_eq!(srs_golden(-32767 * 256, true, true), -32767);
+    }
+
+    // -- Category B: One beyond boundary, symmetric saturation --
+
+    #[test]
+    fn golden_sym_max_plus_one() {
+        // 32768 * 256 >> 8 = 32768: saturates to 32767
+        assert_eq!(srs_golden(32768 * 256, true, true), 32767);
+    }
+
+    #[test]
+    fn golden_sym_min_minus_one() {
+        // -32769 * 256 >> 8 = -32769: saturates to -32767 (symmetric min)
+        assert_eq!(srs_golden(-32769 * 256, true, true), -32767);
+    }
+
+    #[test]
+    fn golden_sym_sym_min_minus_one() {
+        // -32768 * 256 >> 8 = -32768: saturates to -32767 (symmetric min)
+        assert_eq!(srs_golden(-32768 * 256, true, true), -32767);
+    }
+
+    // -- Category C: Boundary + half-point, symmetric saturation --
+
+    #[test]
+    fn golden_sym_max_plus_half() {
+        // (32767 * 256) + 128: Floor -> 32767, within range.
+        assert_eq!(srs_golden(32767 * 256 + 128, true, true), 32767);
+    }
+
+    #[test]
+    fn golden_sym_min_minus_half() {
+        // (-32768 * 256) - 128: Floor -> -32769, saturates to -32767 (symmetric).
+        assert_eq!(srs_golden(-32768 * 256 - 128, true, true), -32767);
+    }
+
+    #[test]
+    fn golden_sym_sym_min_minus_half() {
+        // (-32767 * 256) - 128: Floor -> -32768, saturates to -32767 (symmetric).
+        assert_eq!(srs_golden(-32767 * 256 - 128, true, true), -32767);
+    }
+
+    // -----------------------------------------------------------------------
     // Zero shift
     // -----------------------------------------------------------------------
 

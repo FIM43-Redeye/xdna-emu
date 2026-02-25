@@ -48,6 +48,7 @@ pub use context::{
     ExecutionContext, SpRegister, TimingContext,
     EventLog, EventType, TimestampedEvent,
     PendingBranch, PendingWrite,
+    SrsConfig,
 };
 
 #[cfg(test)]

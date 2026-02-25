@@ -407,6 +407,75 @@ impl PendingBranch {
     }
 }
 
+/// Vector control register state for SRS/UPS operations.
+///
+/// Models the Core_CR MMIO register fields that control shift-round-saturate
+/// behavior. In hardware, these are set by instructions like `set_satmode()`
+/// and `set_rnd()` which compile to control register writes.
+///
+/// Hardware register layout (from aie-rt `xaiemlgbl_params.h`):
+///   [1:0]  SATURATION_MODE  -- 0=none, 1=saturate, 2=symmetric (reserved), 3=symmetric saturate
+///   [5:2]  ROUND_MODE       -- 0-3, 8-13 valid (see `RoundingMode`)
+///   [17]   SRS_SIGN         -- 0=unsigned, 1=signed
+///
+/// Hardware reset defaults: all zero (no saturation, Floor rounding, unsigned).
+/// But compiled code invariably sets these before SRS instructions -- typical
+/// settings are PosInf rounding, saturation enabled, signed output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SrsConfig {
+    /// Rounding mode (crRnd) -- hardware field [5:2] of Core_CR.
+    pub rounding_mode: u8,
+
+    /// Saturation mode (crSat) -- hardware field [1:0] of Core_CR.
+    /// 0 = no saturation (truncate), 1 = saturate, 3 = symmetric saturate.
+    pub saturation_mode: u8,
+
+    /// SRS sign mode (crSRSSign) -- hardware bit [17] of Core_CR.
+    /// 0 = unsigned output, 1 = signed output.
+    pub srs_sign: bool,
+}
+
+impl Default for SrsConfig {
+    /// Default matches what mlir-aie compiled code typically configures:
+    /// - Rounding: PosInf (mode 9) -- most common in aie API usage
+    /// - Saturation: enabled (mode 1) -- prevents silent overflow
+    /// - Sign: signed (true) -- most common output type
+    ///
+    /// Hardware reset is all-zero (Floor, no saturation, unsigned), but
+    /// kernel preamble code always reconfigures these before SRS. Until
+    /// control register write instructions are decoded, these defaults
+    /// match expected behavior for the test suite.
+    fn default() -> Self {
+        Self {
+            rounding_mode: 9,  // PosInf
+            saturation_mode: 1, // Saturate (not symmetric)
+            srs_sign: true,     // Signed output
+        }
+    }
+}
+
+impl SrsConfig {
+    /// Create with hardware reset defaults (all zero).
+    #[cfg(test)]
+    pub fn hardware_reset() -> Self {
+        Self {
+            rounding_mode: 0,   // Floor
+            saturation_mode: 0, // No saturation
+            srs_sign: false,    // Unsigned
+        }
+    }
+
+    /// Whether saturation is enabled (mode bits [0] set).
+    pub fn saturate(&self) -> bool {
+        self.saturation_mode & 0x1 != 0
+    }
+
+    /// Whether symmetric saturation is enabled (mode bits [1] set).
+    pub fn symmetric_saturate(&self) -> bool {
+        self.saturation_mode & 0x2 != 0
+    }
+}
+
 /// Complete execution context for an AIE2 core.
 ///
 /// Contains all register files and execution state needed for instruction
@@ -493,6 +562,20 @@ pub struct ExecutionContext {
     /// Bit N set = bank N was accessed via load/store. Compared against
     /// Tile::cycle_dma_banks after each step to detect conflicts.
     pub cycle_core_banks: u16,
+
+    // === Vector Control Registers ===
+    /// SRS/UPS control register state.
+    ///
+    /// In hardware, these are fields within the Core_CR MMIO register:
+    ///   [1:0]  SATURATION_MODE  (crSat)
+    ///   [5:2]  ROUND_MODE       (crRnd)
+    ///   [17]   SRS_SIGN         (crSRSSign)
+    ///
+    /// Set by instructions like `set_satmode()` / `set_rnd()` (aie API) which
+    /// compile to control register writes. Currently defaulted to the values
+    /// most mlir-aie compiled code expects; will be wired to instruction-level
+    /// writes when control register decoding is implemented.
+    pub srs_config: SrsConfig,
 }
 
 /// Which register to use as stack pointer.
@@ -547,6 +630,7 @@ impl ExecutionContext {
             pending_branch: None,
             pending_writes: Vec::new(),
             cycle_core_banks: 0,
+            srs_config: SrsConfig::default(),
         }
     }
 
