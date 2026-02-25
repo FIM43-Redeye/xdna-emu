@@ -68,8 +68,8 @@ serde_json = "1"
 hex = "0.4"                                             # Hex dump utilities for debugging
 
 [[bin]]
-name = "lit-runner"
-path = "src/bin/lit_runner.rs"
+name = "npu-test"
+path = "src/bin/npu_test.rs"
 
 [profile.release]
 lto = true

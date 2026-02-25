@@ -110,17 +110,17 @@ else
     warn "Some integration tests failed (check if binaries are built)"
 fi
 
-# Step 4: Full binary suite (if example exists)
+# Step 4: Full binary suite
 section "Step 4: Full Binary Suite"
 
-if cargo build --example run_mlir_aie_tests 2>/dev/null; then
-    if cargo run --release --example run_mlir_aie_tests 2>&1; then
+if cargo build --bin npu-test 2>/dev/null; then
+    if cargo run --release --bin npu-test 2>&1; then
         pass "Binary suite completed"
     else
         warn "Binary suite had failures (check output above)"
     fi
 else
-    info "run_mlir_aie_tests example not available, skipping"
+    info "npu-test binary not available, skipping"
 fi
 
 # Step 5: Hardware cross-validation (conditional on NPU availability)

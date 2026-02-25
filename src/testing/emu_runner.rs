@@ -1,62 +1,35 @@
-//! Run all xclbin tests from mlir-aie npu-xrt directory.
+//! Emulator + hardware validation runner.
 //!
-//! This is a quick test runner to see how many mlir-aie tests pass.
-//! Validates output against hardware reference captures when available.
+//! This is the primary test runner mode: discover tests from the mlir-aie
+//! source tree (or pre-built cmake output), build them with Peano (and
+//! optionally Chess), run through the emulator, validate against hardware
+//! reference captures, and optionally execute on real NPU hardware.
 //!
-//! Usage:
-//!   cargo run --example run_mlir_aie_tests [OPTIONS] [FILTER...]
-//!
-//! Options:
-//!   --verbose, -v     Show full expected/actual output arrays for failures
-//!   -j N              Run N tests in parallel (default: auto, up to 8)
-//!   --elfanalyze      Run elfanalyzer on each test's ELFs (requires aietools)
-//!   --no-chess        Disable Chess compiler builds (Chess is auto-detected by default)
-//!   --chess-only      Use Chess as the primary compiler for all tests (skip Peano)
-//!   --no-hw           Disable NPU hardware validation (auto-detected by default)
-//!   --aiesim          Run aiesimulator on Chess-built .prj (requires aietools)
-//!   --unit-tests      Run mlir-aie chess_compiler_tests_aie2 unit tests (requires aietools)
-//!   --full            Enable all validation: elfanalyze, aiesim, unit-tests, hw
-//!   --no-build        Skip build phase, discover from build output directories
-//!
-//! Positional arguments are substring filters on test name. Multiple filters
-//! are OR-ed (a test runs if it matches ANY filter).
-//!
-//! Examples:
-//!   cargo run --example run_mlir_aie_tests                        # run all tests
-//!   cargo run --example run_mlir_aie_tests -- add_blockwrite      # run one test
-//!   cargo run --example run_mlir_aie_tests -- -v vec_vec          # verbose for matching
-//!   cargo run --example run_mlir_aie_tests -- -v                  # verbose for all
-//!   cargo run --example run_mlir_aie_tests -- -j 8                # run 8 tests at once
-//!   cargo run --example run_mlir_aie_tests -- --elfanalyze add_one  # ELF analysis
-//!   cargo run --example run_mlir_aie_tests -- --no-chess add_one    # Peano only (skip Chess)
-//!   cargo run --example run_mlir_aie_tests -- --chess-only add_one   # Chess only (skip Peano)
-//!   cargo run --example run_mlir_aie_tests -- --no-hw add_one       # skip real NPU
-//!   cargo run --example run_mlir_aie_tests -- --full add_one        # full validation matrix
-//!   cargo run --example run_mlir_aie_tests -- --full                # full validation, all tests
+//! Entry point: [`run()`].
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use xdna_emu::testing::xclbin_suite::{Compiler, XclbinSuite, XclbinTest, TestOutcome};
-use xdna_emu::testing::test_cpp_parser::{BufferDir, read_values};
-use xdna_emu::testing::hardware_comparison::{
+use crate::testing::xclbin_suite::{Compiler, XclbinSuite, XclbinTest, TestOutcome};
+use crate::testing::test_cpp_parser::{BufferDir, read_values};
+use crate::testing::hardware_comparison::{
     CompilerComparison, CompilerDiagnosis, load_hw_reference,
 };
-use xdna_emu::testing::npu_runner;
-use xdna_emu::testing::npu_test::{self, NpuTestSource};
-use xdna_emu::testing::runner_config::{self, Options, RunnerConfig};
-use xdna_emu::testing::runner_stats::{RunStats, HwRunResult};
-use xdna_emu::testing::hw_executor;
-use xdna_emu::testing::native_hw;
-use xdna_emu::testing::runner_display::{self, TestResult};
-use xdna_emu::integration::aietools::AieTools;
-use xdna_emu::integration::chess_build::BuildEnv;
-use xdna_emu::build_progress::{self, ParallelBuildConfig};
-use xdna_emu::testing::unit_test;
+use crate::testing::npu_runner;
+use crate::testing::npu_test::{self, NpuTestSource};
+use crate::testing::runner_config::{self, Options};
+use crate::testing::runner_stats::{RunStats, HwRunResult};
+use crate::testing::hw_executor;
+use crate::testing::native_hw;
+use crate::testing::runner_display::{self, TestResult};
+use crate::testing::unit_test;
+use crate::integration::aietools::AieTools;
+use crate::integration::chess_build::BuildEnv;
+use crate::build_progress::{self, ParallelBuildConfig};
 
 /// Type alias for Chess build artifacts (from build_progress module).
 type ChessBuildArtifacts = build_progress::ChessArtifacts;
@@ -166,7 +139,7 @@ struct TestContext<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Per-test processing (extracted from the main loop)
+// Per-test processing
 // ---------------------------------------------------------------------------
 
 /// Process a single test: display emulator results, run hardware, do
@@ -317,7 +290,7 @@ fn run_hw_for_test(
     test: &XclbinTest,
     compiler: Compiler,
     compact: bool,
-    spec: Option<&xdna_emu::testing::test_cpp_parser::BufferSpec>,
+    spec: Option<&crate::testing::test_cpp_parser::BufferSpec>,
     insts_path: &Option<PathBuf>,
     ctx: &TestContext,
     stats: &mut RunStats,
@@ -356,7 +329,7 @@ fn run_hw_for_test(
 fn run_chess_hw_for_test(
     test: &XclbinTest,
     compact: bool,
-    spec: Option<&xdna_emu::testing::test_cpp_parser::BufferSpec>,
+    spec: Option<&crate::testing::test_cpp_parser::BufferSpec>,
     ctx: &TestContext,
     stats: &mut RunStats,
     cascade: &mut HwCascadeState,
@@ -401,7 +374,7 @@ fn format_chess_emu_label(outcome: &TestOutcome) -> String {
 
 /// Run compiler comparison (Peano vs Chess) and return the diagnosis.
 fn run_compiler_comparison(
-    spec: &xdna_emu::testing::test_cpp_parser::BufferSpec,
+    spec: &crate::testing::test_cpp_parser::BufferSpec,
     test: &XclbinTest,
     compiler: Compiler,
     emu: &Option<TestResult>,
@@ -443,7 +416,7 @@ fn run_compiler_comparison(
 }
 
 // ---------------------------------------------------------------------------
-// Unit test execution (extracted from main)
+// Unit test execution
 // ---------------------------------------------------------------------------
 
 /// Results from the unit test phase, for summary display.
@@ -555,7 +528,7 @@ fn run_unit_tests(
     // Simulation phase (run through aiesimulator)
     if opts.unit_tests_aiesim && !build_results.is_empty() {
         if let Some(ref tools) = aietools {
-            use xdna_emu::integration::aiesimulator;
+            use crate::integration::aiesimulator;
 
             println!("\n--- Unit Test Simulation Phase ({} tests) ---",
                 build_results.len());
@@ -610,18 +583,102 @@ fn run_unit_tests(
     s
 }
 
-fn main() {
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("error"),
-    )
-    .init();
+// ---------------------------------------------------------------------------
+// Emulator execution helpers
+// ---------------------------------------------------------------------------
 
+/// Run tests sequentially (original behavior, -j 1).
+fn run_sequential(suite: &XclbinSuite, tests: &[XclbinTest]) -> Vec<TestResult> {
+    let total = tests.len();
+    let mut results = Vec::with_capacity(total);
+
+    for (i, test) in tests.iter().enumerate() {
+        eprint!("\r[{:2}/{}] {}...", i + 1, total, &test.name[..test.name.len().min(40)]);
+        io::stderr().flush().unwrap();
+
+        let elf_count = test.find_elf_files().len();
+        let embedded_count = test.count_embedded_cores();
+        let has_npu = test.find_insts_bin().is_some();
+        let (outcome, raw_output, hw_validation) = suite.run_single_with_hw_validation(test);
+
+        results.push(TestResult {
+            idx: i,
+            name: test.name.clone(),
+            elf_count,
+            embedded_count,
+            has_npu,
+            outcome,
+            raw_output,
+            hw_validation,
+        });
+    }
+    eprint!("\r{:60}\r", ""); // Clear progress line
+    io::stderr().flush().unwrap();
+
+    results
+}
+
+/// Run tests in parallel across N worker threads.
+///
+/// Uses an atomic work counter so fast tests don't block behind slow ones.
+/// Results are collected in arbitrary order, then sorted by index for display.
+fn run_parallel(suite: &XclbinSuite, tests: &[XclbinTest], jobs: usize) -> Vec<TestResult> {
+    let total = tests.len();
+    let next_idx = AtomicUsize::new(0);
+    let completed = AtomicUsize::new(0);
+    let results = Mutex::new(Vec::with_capacity(total));
+
+    eprintln!("Running {} tests with {} threads...", total, jobs);
+
+    std::thread::scope(|s| {
+        for _ in 0..jobs {
+            s.spawn(|| {
+                loop {
+                    let i = next_idx.fetch_add(1, Ordering::SeqCst);
+                    if i >= total { break; }
+
+                    let test = &tests[i];
+                    let elf_count = test.find_elf_files().len();
+                    let embedded_count = test.count_embedded_cores();
+                    let has_npu = test.find_insts_bin().is_some();
+                    let (outcome, raw_output, hw_validation) = suite.run_single_with_hw_validation(test);
+
+                    let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
+                    eprint!("\r  [{}/{}] completed", done, total);
+
+                    results.lock().unwrap().push(TestResult {
+                        idx: i,
+                        name: test.name.clone(),
+                        elf_count,
+                        embedded_count,
+                        has_npu,
+                        outcome,
+                        raw_output,
+                        hw_validation,
+                    });
+                }
+            });
+        }
+    });
+    eprintln!(); // Newline after progress counter
+
+    let mut results = results.into_inner().unwrap();
+    results.sort_by_key(|r| r.idx);
+    results
+}
+
+// ---------------------------------------------------------------------------
+// Main entry point
+// ---------------------------------------------------------------------------
+
+/// Run the emulator + hardware validation pipeline.
+///
+/// This is the default mode for `npu-test`. It discovers tests from the
+/// mlir-aie source tree (or pre-built cmake output), builds them, runs
+/// through the emulator, and optionally validates against real NPU hardware.
+pub fn run(opts: &Options) {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let runner_config = RunnerConfig::load(manifest_dir);
-    runner_config.print_active_overrides();
-    let opts = runner_config::parse_args(&runner_config);
-
-    let config = xdna_emu::config::Config::get();
+    let config = crate::config::Config::get();
     let mlir_aie_path = PathBuf::from(config.mlir_aie_path());
 
     // Discover aietools (always attempt -- needed for auto Chess detection)
@@ -672,14 +729,11 @@ fn main() {
     };
 
     // Hardware validation: auto-detected by default, graceful fallback.
-    // Native test.exe execution (preferred) only needs NPU + XRT.
-    // npu-runner (fallback) also needs the npu_runner binary built.
     let hw_available = if opts.hw {
         if !npu_runner::npu_available() {
             println!("hw: NPU not available, hardware validation disabled");
             false
         } else {
-            // NPU is available. Native test.exe path works regardless of npu-runner.
             let has_runner = npu_runner::runner_binary().is_some();
             if has_runner {
                 println!("hw: NPU available (native test.exe + npu-runner fallback)");
@@ -701,7 +755,6 @@ fn main() {
     // ====================================================================
 
     // Declared here (not inside the else branch) so it outlives the if/else block.
-    // Only assigned in the source-driven (non --no-build) path.
     let mut source_tests_storage: Vec<NpuTestSource>;
 
     let (mut suite, tests, total_discovered, chess_builds) = if opts.no_build {
@@ -773,14 +826,12 @@ fn main() {
         );
 
         // Compile native test.exe for hardware execution.
-        // This is fast (~0.5s each) and sequential is fine.
         let mut primary_tests = build_result.primary_tests;
         if hw_available {
             let test_exe_dir = PathBuf::from(manifest_dir).join("build/test_exe");
             let mut compiled = 0usize;
             let mut failed = 0usize;
             for test in primary_tests.iter_mut() {
-                // Only compile if the source test has a test.cpp
                 if test.test_cpp_pattern.is_none() {
                     continue;
                 }
@@ -891,7 +942,7 @@ fn main() {
     let mut cascade = HwCascadeState::new();
 
     let ctx = TestContext {
-        opts: &opts,
+        opts,
         hw_available,
         chess_available,
         aietools: &aietools,
@@ -909,7 +960,7 @@ fn main() {
 
     // === UNIT TESTS ===
     let unit_stats = if opts.unit_tests {
-        Some(run_unit_tests(&opts, &aietools, &build_env, &mlir_aie_path, manifest_dir))
+        Some(run_unit_tests(opts, &aietools, &build_env, &mlir_aie_path, manifest_dir))
     } else {
         None
     };
@@ -946,84 +997,4 @@ fn main() {
                      op.slot, op.opcode, mnemonic, entry.count, entry.tests.len());
         }
     }
-}
-
-/// Run tests sequentially (original behavior, -j 1).
-fn run_sequential(suite: &XclbinSuite, tests: &[XclbinTest]) -> Vec<TestResult> {
-    let total = tests.len();
-    let mut results = Vec::with_capacity(total);
-
-    for (i, test) in tests.iter().enumerate() {
-        eprint!("\r[{:2}/{}] {}...", i + 1, total, &test.name[..test.name.len().min(40)]);
-        io::stderr().flush().unwrap();
-
-        let elf_count = test.find_elf_files().len();
-        let embedded_count = test.count_embedded_cores();
-        let has_npu = test.find_insts_bin().is_some();
-        let (outcome, raw_output, hw_validation) = suite.run_single_with_hw_validation(test);
-
-        results.push(TestResult {
-            idx: i,
-            name: test.name.clone(),
-            elf_count,
-            embedded_count,
-            has_npu,
-            outcome,
-            raw_output,
-            hw_validation,
-        });
-    }
-    eprint!("\r{:60}\r", ""); // Clear progress line
-    io::stderr().flush().unwrap();
-
-    results
-}
-
-/// Run tests in parallel across N worker threads.
-///
-/// Uses an atomic work counter so fast tests don't block behind slow ones.
-/// Results are collected in arbitrary order, then sorted by index for display.
-fn run_parallel(suite: &XclbinSuite, tests: &[XclbinTest], jobs: usize) -> Vec<TestResult> {
-    let total = tests.len();
-    let next_idx = AtomicUsize::new(0);
-    let completed = AtomicUsize::new(0);
-    let results = Mutex::new(Vec::with_capacity(total));
-
-    eprintln!("Running {} tests with {} threads...", total, jobs);
-
-    std::thread::scope(|s| {
-        for _ in 0..jobs {
-            s.spawn(|| {
-                loop {
-                    let i = next_idx.fetch_add(1, Ordering::SeqCst);
-                    if i >= total { break; }
-
-                    let test = &tests[i];
-                    let elf_count = test.find_elf_files().len();
-                    let embedded_count = test.count_embedded_cores();
-                    let has_npu = test.find_insts_bin().is_some();
-                    let (outcome, raw_output, hw_validation) = suite.run_single_with_hw_validation(test);
-
-                    let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
-                    eprint!("\r  [{}/{}] completed", done, total);
-
-                    results.lock().unwrap().push(TestResult {
-                        idx: i,
-                        name: test.name.clone(),
-                        elf_count,
-                        embedded_count,
-                        has_npu,
-                        outcome,
-                        raw_output,
-                        hw_validation,
-                    });
-                }
-            });
-        }
-    });
-    eprintln!(); // Newline after progress counter
-
-    let mut results = results.into_inner().unwrap();
-    results.sort_by_key(|r| r.idx);
-    results
 }

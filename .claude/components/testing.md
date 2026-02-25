@@ -71,10 +71,19 @@ cargo test --lib
 ./scripts/run-tests.sh --doc
 
 # Run full mlir-aie test suite (emulator + optional hardware comparison)
-cargo run --example run_mlir_aie_tests
+cargo run --bin npu-test
 
 # Single test
-cargo run --example run_mlir_aie_tests -- add_one_using_dma
+cargo run --bin npu-test -- add_one_using_dma
+
+# Lit wrapper mode (standard LLVM lit execution)
+cargo run --bin npu-test -- --lit
+
+# Trace collection mode
+cargo run --bin npu-test -- --trace
+
+# Triple trace comparison (HW + emulator + optional aiesimulator)
+cargo run --bin npu-test -- --trace-all
 
 # Capture NPU hardware reference outputs (requires NPU hardware)
 cargo run --example capture_npu_outputs

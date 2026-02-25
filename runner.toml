@@ -1,6 +1,6 @@
-# Test runner configuration for run_mlir_aie_tests.
+# Test runner configuration for npu-test.
 #
-# This file controls default behavior for the test runner example.
+# This file controls default behavior for the npu-test binary.
 # CLI flags override these settings (e.g., --chess enables chess even
 # if chess.build is false here). To disable something that a CLI flag
 # would enable, set the config value and do NOT pass the flag.

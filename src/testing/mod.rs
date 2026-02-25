@@ -30,6 +30,7 @@ pub mod lit_wrapper;
 pub mod lit_progress;
 pub mod lit_trace;
 pub mod trace_compare;
+pub mod emu_runner;
 
 pub use xclbin_suite::{XclbinSuite, XclbinTest, TestOutcome, Compiler};
 pub use opcode_collector::{UnknownOpcode, OpcodeCollector};

@@ -12,6 +12,23 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
+// Run mode
+// ---------------------------------------------------------------------------
+
+/// Which test runner mode to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunMode {
+    /// Emulator + hardware validation (default).
+    EmuHw,
+    /// Wrap LLVM's `lit` for standard test execution.
+    Lit,
+    /// Trace collection: inject tracing, compile, execute on NPU.
+    Trace,
+    /// Triple trace comparison: HW + emulator (+ optional aiesimulator).
+    TraceAll,
+}
+
+// ---------------------------------------------------------------------------
 // Runner configuration (loaded from runner.toml)
 // ---------------------------------------------------------------------------
 
@@ -186,9 +203,16 @@ impl RunnerConfig {
 
 /// Parsed CLI options, merged with runner config.
 pub struct Options {
+    // --- Common (all modes) ---
+    /// Which runner mode was selected.
+    pub mode: RunMode,
     pub verbose: bool,
     pub jobs: usize,
     pub filters: Vec<String>,
+    /// Use Chess as the primary compiler for ALL tests (skip Peano entirely).
+    pub chess_only: bool,
+
+    // --- Emu+HW mode ---
     /// Run elfanalyzer on each test's ELF files (requires aietools).
     pub elfanalyze: bool,
     /// Build with Chess compiler (batch build phase).
@@ -212,71 +236,171 @@ pub struct Options {
     /// Maximum simulation cycles for unit test aiesimulator runs.
     pub unit_tests_aiesim_timeout: u64,
     /// Skip build phase entirely -- discover from build output directories.
-    /// Useful for quick re-runs of already-built tests.
     pub no_build: bool,
     /// Hardware-only mode: skip emulator, run only on real NPU hardware.
-    /// Useful for validating known-good tests quickly on real silicon.
     pub hw_only: bool,
-    /// Use Chess as the primary compiler for ALL tests (skip Peano entirely).
-    pub chess_only: bool,
+
+    // --- Lit mode ---
+    /// Per-test timeout in seconds (forwarded to lit / trace pipeline).
+    pub timeout_secs: Option<u32>,
+    /// Explicit mlir-aie build directory (auto-detected if None).
+    pub build_dir: Option<PathBuf>,
+    /// Stop after this many failures.
+    pub max_failures: Option<usize>,
+    /// Extra arguments passed through to lit verbatim.
+    pub lit_args: Vec<String>,
+    /// Outer watchdog timeout for entire lit process (seconds).
+    pub watchdog_secs: u32,
+
+    // --- Trace modes ---
+    /// Trace buffer size in bytes (default: 1MB).
+    pub trace_size: usize,
+    /// Also collect aiesimulator VCD traces (with --trace-all).
+    pub aiesim_trace: bool,
 }
 
 /// Parse CLI arguments and merge with runner config.
+///
+/// Handles all modes: default (emu+hw), --lit, --trace, --trace-all.
+/// Mode-specific flags are accepted in any mode but only take effect in
+/// their respective mode.
 pub fn parse_args(config: &RunnerConfig) -> Options {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Common
     let mut verbose = false;
     let mut jobs: usize = 0; // 0 = auto-detect
     let mut filters = Vec::new();
+    let mut chess_only = false;
+
+    // Mode selection
+    let mut lit_mode = false;
+    let mut trace_mode = false;
+    let mut trace_all_mode = false;
+
+    // Emu+HW mode
     let mut elfanalyze = false;
-    let mut hw = true; // auto-detected, disabled by --no-hw
+    let mut hw = true;
     let mut hw_only = false;
     let mut aiesim = false;
     let mut full = false;
     let mut unit_tests = false;
     let mut no_build = false;
     let mut no_chess = false;
-    let mut chess_only = false;
+
+    // Lit mode
+    let mut timeout_secs: Option<u32> = None;
+    let mut build_dir: Option<PathBuf> = None;
+    let mut max_failures: Option<usize> = None;
+    let mut lit_args: Vec<String> = Vec::new();
+    let mut watchdog_secs: u32 = 3600;
+
+    // Trace modes
+    let mut trace_size: usize = 1_048_576; // 1MB default
+    let mut aiesim_trace = false;
+
     let mut iter = args.iter();
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            // --- Mode selection ---
+            "--lit" => lit_mode = true,
+            "--trace" => trace_mode = true,
+            "--trace-all" => { trace_all_mode = true; chess_only = true; }
+
+            // --- Common ---
             "--verbose" | "-v" => verbose = true,
-            "--elfanalyze" => elfanalyze = true,
-            // --chess is accepted for backward compat but is now the default
-            "--chess" => {}
-            "--no-chess" => no_chess = true,
             "--chess-only" => chess_only = true,
-            // --hw is accepted for backward compat but is now the default
-            "--hw" => hw = true,
+            "-j" => {
+                let n = next_value(&mut iter, "-j");
+                jobs = n.parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid -j value: {}", n);
+                    std::process::exit(1);
+                });
+                if jobs == 0 { jobs = 1; }
+            }
+
+            // --- Emu+HW mode ---
+            "--elfanalyze" => elfanalyze = true,
+            "--chess" => {} // backward compat, now the default
+            "--no-chess" => no_chess = true,
+            "--hw" => hw = true, // backward compat
             "--no-hw" => hw = false,
-            "--hw-only" => { hw_only = true; hw = true; },
+            "--hw-only" => { hw_only = true; hw = true; }
             "--aiesim" => aiesim = true,
             "--full" => full = true,
             "--unit-tests" => unit_tests = true,
             "--no-build" => no_build = true,
-            "-j" => {
-                if let Some(n) = iter.next() {
-                    jobs = n.parse().unwrap_or_else(|_| {
-                        eprintln!("Invalid -j value: {}", n);
-                        std::process::exit(1);
-                    });
-                    // -j 0 is nonsensical; treat as 1
-                    if jobs == 0 { jobs = 1; }
-                } else {
-                    eprintln!("-j requires a number");
+
+            // --- Lit mode ---
+            "--timeout" => {
+                let v = next_value(&mut iter, "--timeout");
+                timeout_secs = Some(v.parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid --timeout value: {}", v);
                     std::process::exit(1);
-                }
+                }));
             }
+            "--build-dir" => {
+                let v = next_value(&mut iter, "--build-dir");
+                build_dir = Some(PathBuf::from(v));
+            }
+            "--max-failures" => {
+                let v = next_value(&mut iter, "--max-failures");
+                max_failures = Some(v.parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid --max-failures value: {}", v);
+                    std::process::exit(1);
+                }));
+            }
+            "--lit-args" => {
+                let v = next_value(&mut iter, "--lit-args");
+                lit_args.extend(v.split_whitespace().map(String::from));
+            }
+            "--watchdog" => {
+                let v = next_value(&mut iter, "--watchdog");
+                watchdog_secs = v.parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid --watchdog value: {}", v);
+                    std::process::exit(1);
+                });
+            }
+
+            // --- Trace modes ---
+            "--trace-size" => {
+                let v = next_value(&mut iter, "--trace-size");
+                trace_size = v.parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid --trace-size value: {}", v);
+                    std::process::exit(1);
+                });
+            }
+            "--aiesim-trace" => aiesim_trace = true,
+
+            // --- Help ---
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+
+            // --- Positional / unknown ---
             _ if !arg.starts_with('-') => filters.push(arg.clone()),
             other => {
                 eprintln!("Unknown option: {}", other);
-                eprintln!("Usage: run_mlir_aie_tests [--verbose|-v] [-j N] [--elfanalyze] [--no-chess] [--chess-only] [--no-hw] [--hw-only] [--aiesim] [--unit-tests] [--full] [--no-build] [FILTER...]");
+                print_usage();
                 std::process::exit(1);
             }
         }
     }
 
-    // --full enables everything
+    // Determine mode (mutually exclusive)
+    let mode = if trace_all_mode {
+        RunMode::TraceAll
+    } else if trace_mode {
+        RunMode::Trace
+    } else if lit_mode {
+        RunMode::Lit
+    } else {
+        RunMode::EmuHw
+    };
+
+    // --full enables everything (emu+hw mode)
     if full {
         elfanalyze = true;
         no_chess = false;
@@ -285,31 +409,38 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
         unit_tests = true;
     }
 
-    // Auto-detect parallelism: use available CPU count, capped at 8 to avoid
-    // overwhelming the system during builds. User can override with explicit -j N.
+    // Auto-detect parallelism: use available CPU count, capped at 8.
     if jobs == 0 {
-        jobs = std::thread::available_parallelism()
-            .map(|n| n.get().min(8))
-            .unwrap_or(4);
+        jobs = match mode {
+            // Lit mode defaults to 1 (lit handles parallelism internally)
+            RunMode::Lit | RunMode::Trace | RunMode::TraceAll => 1,
+            RunMode::EmuHw => {
+                std::thread::available_parallelism()
+                    .map(|n| n.get().min(8))
+                    .unwrap_or(4)
+            }
+        };
     }
 
     // Merge chess_only from CLI and config.
     let chess_only = chess_only || config.chess.chess_only;
 
     // Chess builds are ON by default (auto-detected from aietools).
-    // --no-chess explicitly disables. --chess-only implies chess_build.
     let chess_build = if chess_only { true } else { !no_chess };
     let chess_emulator = if chess_build { config.chess.run_emulator } else { false };
     let chess_hardware = if chess_build { config.chess.run_hardware } else { false };
     let aiesim = if aiesim { true } else if chess_build { config.aiesim.enabled } else { false };
 
-    // Unit tests: CLI --unit-tests overrides config.unit_tests.enabled
+    // Unit tests: CLI overrides config
     let unit_tests = unit_tests || config.unit_tests.enabled;
 
     Options {
+        mode,
         verbose,
         jobs,
         filters,
+        chess_only,
+
         elfanalyze,
         chess_build,
         chess_emulator,
@@ -323,8 +454,66 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
         unit_tests_aiesim_timeout: config.unit_tests.aiesim_timeout,
         no_build,
         hw_only,
-        chess_only,
+
+        timeout_secs,
+        build_dir,
+        max_failures,
+        lit_args,
+        watchdog_secs,
+
+        trace_size,
+        aiesim_trace,
     }
+}
+
+/// Consume the next argument as a value for the given flag, or exit.
+fn next_value<'a>(iter: &mut impl Iterator<Item = &'a String>, flag: &str) -> &'a String {
+    iter.next().unwrap_or_else(|| {
+        eprintln!("{} requires a value", flag);
+        std::process::exit(1);
+    })
+}
+
+/// Print unified usage for all modes.
+fn print_usage() {
+    eprintln!("npu-test: Unified test runner for mlir-aie npu-xrt tests");
+    eprintln!();
+    eprintln!("Usage: npu-test [MODE] [OPTIONS] [FILTER...]");
+    eprintln!();
+    eprintln!("Modes (default: emulator + hardware):");
+    eprintln!("  (none)              Emulator + hardware validation");
+    eprintln!("  --lit               Run tests via LLVM's lit framework");
+    eprintln!("  --trace             Trace collection on real NPU hardware");
+    eprintln!("  --trace-all         Triple trace: HW + emulator (+ aiesimulator)");
+    eprintln!();
+    eprintln!("Common options:");
+    eprintln!("  -v, --verbose       Show detailed output");
+    eprintln!("  -j N                Parallelism (default: auto for emu, 1 for lit/trace)");
+    eprintln!("  --chess-only        Use Chess compiler (skip Peano)");
+    eprintln!("  -h, --help          Show this help");
+    eprintln!();
+    eprintln!("Emulator mode options:");
+    eprintln!("  --elfanalyze        Run elfanalyzer on each test's ELFs");
+    eprintln!("  --no-chess          Disable Chess compiler builds");
+    eprintln!("  --no-hw             Skip NPU hardware validation");
+    eprintln!("  --hw-only           Skip emulator, hardware only");
+    eprintln!("  --aiesim            Run aiesimulator on Chess builds");
+    eprintln!("  --unit-tests        Run mlir-aie unit tests");
+    eprintln!("  --full              Enable all validation modes");
+    eprintln!("  --no-build          Skip build phase, use pre-built tests");
+    eprintln!();
+    eprintln!("Lit mode options:");
+    eprintln!("  --timeout SECS      Per-test timeout (forwarded to lit)");
+    eprintln!("  --build-dir PATH    mlir-aie build directory (auto-detected)");
+    eprintln!("  --max-failures N    Stop after N failures");
+    eprintln!("  --lit-args \"...\"    Extra arguments passed to lit verbatim");
+    eprintln!("  --watchdog SECS     Outer watchdog for entire lit process (default: 3600)");
+    eprintln!();
+    eprintln!("Trace mode options:");
+    eprintln!("  --trace-size BYTES  Trace buffer size (default: 1048576 = 1MB)");
+    eprintln!("  --aiesim-trace      Also collect aiesimulator VCD traces (--trace-all)");
+    eprintln!();
+    eprintln!("Filters are substring matches on test names, OR-ed together.");
 }
 
 /// Check if a test name matches any of the given filters.
