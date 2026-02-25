@@ -78,6 +78,8 @@ impl TileArray {
                     num_locks: arch.lock_count(tile_type),
                     num_bds: arch.dma_bd_count(tile_type),
                     num_channels: arch.dma_total_channels(tile_type),
+                    dma_s2mm_channels: arch.dma_s2mm_channels(tile_type),
+                    dma_mm2s_channels: arch.dma_mm2s_channels(tile_type),
                 };
                 tiles.push(Tile::new(tile_type, col, row, &params));
 
@@ -961,16 +963,24 @@ impl TileArray {
                     let above_idx = self.tile_index(col, row + 1);
                     let above_type = self.tiles[above_idx].tile_type;
 
-                    // Determine port mappings based on tile types
-                    // Per AM025/dma-reference.md:
-                    // - Compute: North masters 13-18 (North0-5), South slaves 5-10 (South0-5)
-                    // - MemTile: North masters 11-16 (North0-5), South slaves 7-12 (South0-5)
-                    // - Shim: North masters 12-17 (North0-5), South slaves 7-12 (South0-5)
+                    // Determine port mappings based on tile types (AM025-derived constants)
                     let (north_master_start, north_master_count, south_slave_start) = match (tile_type, above_type) {
-                        (TileType::Shim, TileType::MemTile) => (12, 6, 7),    // Shim→MemTile
-                        (TileType::MemTile, TileType::Compute) => (11, 6, 5), // MemTile→Compute
-                        (TileType::Compute, TileType::Compute) => (13, 6, 5), // Compute→Compute (North0-5)
-                        _ => continue, // Skip unsupported transitions
+                        (TileType::Shim, TileType::MemTile) => (
+                            shim::NORTH_MASTER_START as usize,
+                            (shim::NORTH_MASTER_END - shim::NORTH_MASTER_START + 1) as usize,
+                            mem_tile::SOUTH_SLAVE_START as usize,
+                        ),
+                        (TileType::MemTile, TileType::Compute) => (
+                            mem_tile::NORTH_MASTER_START as usize,
+                            (mem_tile::NORTH_MASTER_END - mem_tile::NORTH_MASTER_START + 1) as usize,
+                            compute::SOUTH_SLAVE_START as usize,
+                        ),
+                        (TileType::Compute, TileType::Compute) => (
+                            compute::NORTH_MASTER_START as usize,
+                            (compute::NORTH_MASTER_END - compute::NORTH_MASTER_START + 1) as usize,
+                            compute::SOUTH_SLAVE_START as usize,
+                        ),
+                        _ => continue,
                     };
 
                     // Transfer from each North master to corresponding South slave
@@ -997,15 +1007,24 @@ impl TileArray {
                     let below_idx = self.tile_index(col, row - 1);
                     let below_type = self.tiles[below_idx].tile_type;
 
-                    // Determine port mappings based on tile types
-                    // Per AM025/dma-reference.md:
-                    // - Compute: South masters 5-8 (South0-3), North slaves 15-18 (North0-3)
-                    // - MemTile: South masters 7-10 (South0-3), North slaves 13-16 (North0-3)
+                    // Determine port mappings based on tile types (AM025-derived constants)
                     let (south_master_start, south_master_count, north_slave_start) = match (tile_type, below_type) {
-                        (TileType::MemTile, TileType::Shim) => (7, 4, 14),     // MemTile→Shim
-                        (TileType::Compute, TileType::MemTile) => (5, 4, 13),  // Compute→MemTile
-                        (TileType::Compute, TileType::Compute) => (5, 4, 15),  // Compute→Compute (South0-3)
-                        _ => continue, // Skip unsupported transitions
+                        (TileType::MemTile, TileType::Shim) => (
+                            mem_tile::SOUTH_MASTER_START as usize,
+                            (mem_tile::SOUTH_MASTER_END - mem_tile::SOUTH_MASTER_START + 1) as usize,
+                            shim::NORTH_SLAVE_START as usize,
+                        ),
+                        (TileType::Compute, TileType::MemTile) => (
+                            compute::SOUTH_MASTER_START as usize,
+                            (compute::SOUTH_MASTER_END - compute::SOUTH_MASTER_START + 1) as usize,
+                            mem_tile::NORTH_SLAVE_START as usize,
+                        ),
+                        (TileType::Compute, TileType::Compute) => (
+                            compute::SOUTH_MASTER_START as usize,
+                            (compute::SOUTH_MASTER_END - compute::SOUTH_MASTER_START + 1) as usize,
+                            compute::NORTH_SLAVE_START as usize,
+                        ),
+                        _ => continue,
                     };
 
                     // Transfer from each South master to corresponding North slave
@@ -1039,14 +1058,18 @@ impl TileArray {
                     let right_idx = self.tile_index(col + 1, row);
                     let right_type = self.tiles[right_idx].tile_type;
 
-                    // East masters on source -> West slaves on destination
-                    // Port indices from AM025 gen_stream_ports.rs:
-                    // Compute: East masters 19-22, West slaves 11-14
-                    // Shim: East masters 18-21, West slaves 10-13
-                    // MemTile: no East/West ports
+                    // East masters on source -> West slaves on destination (AM025-derived)
                     let (east_master_start, east_count, west_slave_start) = match (tile_type, right_type) {
-                        (TileType::Compute, TileType::Compute) => (19, 4, 11),
-                        (TileType::Shim, TileType::Shim) => (18, 4, 10),
+                        (TileType::Compute, TileType::Compute) => (
+                            compute::EAST_MASTER_START as usize,
+                            (compute::EAST_MASTER_END - compute::EAST_MASTER_START + 1) as usize,
+                            compute::WEST_SLAVE_START as usize,
+                        ),
+                        (TileType::Shim, TileType::Shim) => (
+                            shim::EAST_MASTER_START as usize,
+                            (shim::EAST_MASTER_END - shim::EAST_MASTER_START + 1) as usize,
+                            shim::WEST_SLAVE_START as usize,
+                        ),
                         _ => continue,
                     };
 
@@ -1072,13 +1095,18 @@ impl TileArray {
                     let left_idx = self.tile_index(col - 1, row);
                     let left_type = self.tiles[left_idx].tile_type;
 
-                    // West masters on source -> East slaves on destination
-                    // Compute: West masters 9-12, East slaves 19-22
-                    // Shim: West masters 8-11, East slaves 18-21
-                    // MemTile: no East/West ports
+                    // West masters on source -> East slaves on destination (AM025-derived)
                     let (west_master_start, west_count, east_slave_start) = match (tile_type, left_type) {
-                        (TileType::Compute, TileType::Compute) => (9, 4, 19),
-                        (TileType::Shim, TileType::Shim) => (8, 4, 18),
+                        (TileType::Compute, TileType::Compute) => (
+                            compute::WEST_MASTER_START as usize,
+                            (compute::WEST_MASTER_END - compute::WEST_MASTER_START + 1) as usize,
+                            compute::EAST_SLAVE_START as usize,
+                        ),
+                        (TileType::Shim, TileType::Shim) => (
+                            shim::WEST_MASTER_START as usize,
+                            (shim::WEST_MASTER_END - shim::WEST_MASTER_START + 1) as usize,
+                            shim::EAST_SLAVE_START as usize,
+                        ),
                         _ => continue,
                     };
 

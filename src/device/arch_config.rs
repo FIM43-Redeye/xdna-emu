@@ -530,6 +530,8 @@ mod tests {
 
     #[test]
     fn test_npu1_port_ranges() {
+        use crate::device::aie2_spec::stream_switch::{compute, mem_tile, shim};
+
         let arch = npu1_arch();
 
         // Shim north masters: 12-17 (6 ports)
@@ -544,6 +546,43 @@ mod tests {
         // MemTile north masters: 11-16 (6 ports)
         let (start, end) = arch.north_master_range(TileType::MemTile);
         assert_eq!((start, end), (11, 16));
+
+        // Validate E/W generated constants match AM025 port arrays
+        // Compute tile
+        assert_eq!(compute::EAST_MASTER_START, 19);
+        assert_eq!(compute::EAST_MASTER_END, 22);
+        assert_eq!(compute::EAST_SLAVE_START, 19);
+        assert_eq!(compute::EAST_SLAVE_END, 22);
+        assert_eq!(compute::WEST_MASTER_START, 9);
+        assert_eq!(compute::WEST_MASTER_END, 12);
+        assert_eq!(compute::WEST_SLAVE_START, 11);
+        assert_eq!(compute::WEST_SLAVE_END, 14);
+
+        // Shim tile
+        assert_eq!(shim::EAST_MASTER_START, 18);
+        assert_eq!(shim::EAST_MASTER_END, 21);
+        assert_eq!(shim::EAST_SLAVE_START, 18);
+        assert_eq!(shim::EAST_SLAVE_END, 21);
+        assert_eq!(shim::WEST_MASTER_START, 8);
+        assert_eq!(shim::WEST_MASTER_END, 11);
+        assert_eq!(shim::WEST_SLAVE_START, 10);
+        assert_eq!(shim::WEST_SLAVE_END, 13);
+        assert_eq!(shim::SOUTH_MASTER_START, 2);
+        assert_eq!(shim::SOUTH_MASTER_END, 7);
+        assert_eq!(shim::SOUTH_SLAVE_START, 2);
+        assert_eq!(shim::SOUTH_SLAVE_END, 9);
+
+        // Verify port counts are consistent (END - START + 1)
+        assert_eq!(compute::EAST_MASTER_END - compute::EAST_MASTER_START + 1, 4);
+        assert_eq!(compute::WEST_MASTER_END - compute::WEST_MASTER_START + 1, 4);
+        assert_eq!(shim::EAST_MASTER_END - shim::EAST_MASTER_START + 1, 4);
+        assert_eq!(shim::WEST_MASTER_END - shim::WEST_MASTER_START + 1, 4);
+        assert_eq!(shim::SOUTH_MASTER_END - shim::SOUTH_MASTER_START + 1, 6);
+
+        // Verify MemTile has no E/W ports (constants should not exist)
+        // This is verified structurally: mem_tile module has no EAST_*/WEST_* constants
+        assert_eq!(mem_tile::SOUTH_MASTER_START, 7);
+        assert_eq!(mem_tile::NORTH_MASTER_START, 11);
     }
 
     #[test]

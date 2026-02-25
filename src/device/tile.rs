@@ -42,22 +42,35 @@ pub struct TileParams {
     pub num_bds: usize,
     /// Total DMA channels (4 for compute, 12 for mem tile).
     pub num_channels: usize,
+    /// S2MM (write) DMA channels (2 for compute/shim, 6 for mem tile).
+    pub dma_s2mm_channels: usize,
+    /// MM2S (read) DMA channels (2 for compute/shim, 6 for mem tile).
+    pub dma_mm2s_channels: usize,
 }
 
 impl TileParams {
     /// Default compute tile params (NPU1/AIE2).
     pub fn compute() -> Self {
-        Self { data_memory_size: 64 * 1024, num_locks: 16, num_bds: 16, num_channels: 4 }
+        Self {
+            data_memory_size: 64 * 1024, num_locks: 16, num_bds: 16, num_channels: 4,
+            dma_s2mm_channels: 2, dma_mm2s_channels: 2,
+        }
     }
 
     /// Default memory tile params (NPU1/AIE2).
     pub fn mem_tile() -> Self {
-        Self { data_memory_size: 512 * 1024, num_locks: 64, num_bds: 48, num_channels: 12 }
+        Self {
+            data_memory_size: 512 * 1024, num_locks: 64, num_bds: 48, num_channels: 12,
+            dma_s2mm_channels: 6, dma_mm2s_channels: 6,
+        }
     }
 
     /// Default shim tile params.
     pub fn shim() -> Self {
-        Self { data_memory_size: 0, num_locks: 0, num_bds: 0, num_channels: 0 }
+        Self {
+            data_memory_size: 0, num_locks: 0, num_bds: 0, num_channels: 0,
+            dma_s2mm_channels: 2, dma_mm2s_channels: 2,
+        }
     }
 }
 
@@ -543,8 +556,10 @@ pub enum ControlPacketState {
         response_id: u8,
         /// Total beats expected (1-4)
         beats_total: u8,
-        /// Accumulated data words
-        data: Vec<u32>,
+        /// Number of beats collected so far
+        beats_collected: u8,
+        /// Accumulated data words (max 4 beats per control packet)
+        data: [u32; 4],
     },
 }
 
@@ -755,8 +770,8 @@ impl Tile {
             registers: std::collections::HashMap::new(),
             ctrl_pkt_state: ControlPacketState::Idle,
             ctrl_pkt_drop_header: true,
-            shim_mux_mm2s_slaves: vec![None; super::dma::COMPUTE_MM2S_CHANNELS],
-            shim_mux_s2mm_masters: vec![None; super::dma::COMPUTE_S2MM_CHANNELS],
+            shim_mux_mm2s_slaves: vec![None; params.dma_mm2s_channels],
+            shim_mux_s2mm_masters: vec![None; params.dma_s2mm_channels],
             core_trace: TraceUnit::new(col, row),
             mem_trace: TraceUnit::new(col, row),
             event_port_selection: [None; 8],
@@ -1614,7 +1629,8 @@ impl Tile {
                     operation,
                     response_id,
                     beats_total: beats,
-                    data: Vec::with_capacity(beats as usize),
+                    beats_collected: 0,
+                    data: [0; 4],
                 };
             }
             ControlPacketState::Collecting {
@@ -1622,16 +1638,18 @@ impl Tile {
                 operation,
                 response_id,
                 beats_total,
+                mut beats_collected,
                 mut data,
             } => {
-                data.push(word);
+                data[beats_collected as usize] = word;
+                beats_collected += 1;
                 log::debug!("Tile ({},{}) ctrl_pkt: data[{}] = 0x{:08X} ({}/{}){}",
-                    self.col, self.row, data.len() - 1, word, data.len(), beats_total,
+                    self.col, self.row, beats_collected - 1, word, beats_collected, beats_total,
                     if tlast { " TLAST" } else { "" });
 
-                if data.len() >= beats_total as usize {
+                if beats_collected >= beats_total {
                     // All beats received -- execute the operation
-                    self.execute_ctrl_packet(address, operation, response_id, &data);
+                    self.execute_ctrl_packet(address, operation, response_id, &data[..beats_collected as usize]);
                     // After completion: if TLAST marks end of stream packet AND
                     // headers aren't dropped, expect a stream header next time.
                     // Otherwise stay Idle for the next ctrl packet within this
@@ -1648,6 +1666,7 @@ impl Tile {
                         operation,
                         response_id,
                         beats_total,
+                        beats_collected,
                         data,
                     };
                 }

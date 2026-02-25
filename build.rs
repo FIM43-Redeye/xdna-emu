@@ -665,6 +665,9 @@ fn gen_stream_ranges(
     writeln!(out, "/// Shim tile port ranges").unwrap();
     writeln!(out, "pub mod shim {{").unwrap();
     write_direction_ranges(&mut out, "NORTH", &port_data.shim_master, &port_data.shim_slave);
+    write_direction_ranges(&mut out, "SOUTH", &port_data.shim_master, &port_data.shim_slave);
+    write_direction_ranges(&mut out, "EAST", &port_data.shim_master, &port_data.shim_slave);
+    write_direction_ranges(&mut out, "WEST", &port_data.shim_master, &port_data.shim_slave);
     write_bundle_ranges(&mut out, "TRACE", PT_TRACE, &port_data.shim_master, &port_data.shim_slave);
     writeln!(out, "}}\n").unwrap();
 
@@ -702,6 +705,8 @@ fn gen_stream_ranges(
         &port_data.compute_master,
         &port_data.compute_slave,
     );
+    write_direction_ranges(&mut out, "EAST", &port_data.compute_master, &port_data.compute_slave);
+    write_direction_ranges(&mut out, "WEST", &port_data.compute_master, &port_data.compute_slave);
     write_bundle_ranges(&mut out, "DMA", PT_DMA_BASE, &port_data.compute_master, &port_data.compute_slave);
     write_bundle_ranges(&mut out, "TRACE", PT_TRACE, &port_data.compute_master, &port_data.compute_slave);
     writeln!(out, "}}").unwrap();

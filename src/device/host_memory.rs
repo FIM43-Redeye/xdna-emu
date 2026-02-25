@@ -147,9 +147,8 @@ pub struct HostMemory {
     /// Named regions for debugging and tracking
     regions: Vec<MemoryRegion>,
 
-    /// Statistics
+    /// Total bytes written (for diagnostics)
     total_bytes_written: u64,
-    total_bytes_read: u64,
 }
 
 impl HostMemory {
@@ -165,7 +164,6 @@ impl HostMemory {
             pages: BTreeMap::new(),
             regions: Vec::new(),
             total_bytes_written: 0,
-            total_bytes_read: 0,
         }
     }
 
@@ -387,11 +385,6 @@ impl HostMemory {
         self.total_bytes_written
     }
 
-    /// Get total bytes read.
-    pub fn total_bytes_read(&self) -> u64 {
-        self.total_bytes_read
-    }
-
     /// Get number of allocated pages.
     pub fn allocated_pages(&self) -> usize {
         self.pages.len()
@@ -407,7 +400,6 @@ impl HostMemory {
         self.pages.clear();
         self.regions.clear();
         self.total_bytes_written = 0;
-        self.total_bytes_read = 0;
     }
 
     /// Hexdump a memory region for debugging.
@@ -466,7 +458,6 @@ impl std::fmt::Debug for HostMemory {
             .field("allocated_bytes", &self.allocated_bytes())
             .field("regions", &self.regions.len())
             .field("total_bytes_written", &self.total_bytes_written)
-            .field("total_bytes_read", &self.total_bytes_read)
             .finish()
     }
 }
