@@ -161,7 +161,7 @@ impl ControlUnit {
             }
 
             Operation::LockAcquire => {
-                let (raw_lock_id, expected, delta) = Self::get_lock_acquire_params(op);
+                let (raw_lock_id, expected, delta) = Self::get_lock_acquire_params(op, ctx);
                 // AIE-ML lock mapping: lock IDs 48-63 in core instructions
                 // access the local memory module's locks 0-15 (NOT the adjacent MemTile!)
                 // The memory module is part of the same compute tile - it's the 64KB data memory.
@@ -199,7 +199,7 @@ impl ControlUnit {
             }
 
             Operation::LockRelease => {
-                let (raw_lock_id, delta) = Self::get_lock_release_params(op);
+                let (raw_lock_id, delta) = Self::get_lock_release_params(op, ctx);
                 // AIE-ML lock mapping: lock IDs 48-63 in core instructions
                 // access the local memory module's locks 0-15 (NOT the adjacent MemTile!)
                 let lock_id = Self::map_lock_id(raw_lock_id);
@@ -304,11 +304,17 @@ impl ControlUnit {
     ///
     /// Returns (lock_id, expected_value, delta).
     /// Default: expected=1, delta=-1 (simple binary semaphore).
-    fn get_lock_acquire_params(op: &SlotOp) -> (u8, i8, i8) {
-        // Lock ID from first operand
+    ///
+    /// AIE2 has two ACQ instruction variants:
+    /// - ACQ_mLockId_imm: lock ID is a 6-bit immediate (Operand::Immediate or Lock)
+    /// - ACQ_mLockId_reg: lock ID is in a scalar register (Operand::ScalarReg)
+    /// Both variants also take a register (mRy) for the lock value parameter.
+    fn get_lock_acquire_params(op: &SlotOp, ctx: &ExecutionContext) -> (u8, i8, i8) {
+        // Lock ID from first operand -- immediate or register
         let lock_id = op.sources.first().map_or(0, |src| match src {
             Operand::Lock(id) => *id,
             Operand::Immediate(v) => *v as u8,
+            Operand::ScalarReg(r) => ctx.scalar_read(*r) as u8,
             _ => 0,
         });
 
@@ -331,11 +337,14 @@ impl ControlUnit {
     ///
     /// Returns (lock_id, delta).
     /// Default: delta=+1 (simple binary semaphore).
-    fn get_lock_release_params(op: &SlotOp) -> (u8, i8) {
-        // Lock ID from first operand
+    ///
+    /// Like ACQ, REL has immediate and register variants for the lock ID.
+    fn get_lock_release_params(op: &SlotOp, ctx: &ExecutionContext) -> (u8, i8) {
+        // Lock ID from first operand -- immediate or register
         let lock_id = op.sources.first().map_or(0, |src| match src {
             Operand::Lock(id) => *id,
             Operand::Immediate(v) => *v as u8,
+            Operand::ScalarReg(r) => ctx.scalar_read(*r) as u8,
             _ => 0,
         });
 
@@ -623,6 +632,42 @@ mod tests {
         assert!(matches!(result, Some(ExecuteResult::Continue)));
         assert_eq!(tile.locks[6].value, 63); // Saturated at MAX
         assert!(tile.locks[6].overflow); // Overflow flag set
+    }
+
+    #[test]
+    fn test_lock_acquire_register_lock_id() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        // Set r0 = 49 (memory module lock 1, maps to tile.locks[1])
+        ctx.scalar.write(0, 49);
+        tile.locks[1].value = 1;
+
+        // ACQ_mLockId_reg uses ScalarReg for lock ID
+        let op = SlotOp::new(SlotIndex::Control, Operation::LockAcquire)
+            .with_source(Operand::ScalarReg(0)); // lock ID from register r0
+
+        let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
+        assert!(matches!(result, Some(ExecuteResult::Continue)));
+        assert_eq!(tile.locks[1].value, 0); // Lock 1 acquired (mapped from 49)
+    }
+
+    #[test]
+    fn test_lock_release_register_lock_id() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        // Set r0 = 48 (memory module lock 0, maps to tile.locks[0])
+        ctx.scalar.write(0, 48);
+        tile.locks[0].value = 0;
+
+        // REL_mLockId_reg uses ScalarReg for lock ID
+        let op = SlotOp::new(SlotIndex::Control, Operation::LockRelease)
+            .with_source(Operand::ScalarReg(0)); // lock ID from register r0
+
+        let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
+        assert!(matches!(result, Some(ExecuteResult::Continue)));
+        assert_eq!(tile.locks[0].value, 1); // Lock 0 released (mapped from 48)
     }
 
     #[test]
