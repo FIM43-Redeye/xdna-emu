@@ -34,7 +34,8 @@
 //!   cargo run --example run_mlir_aie_tests -- --full add_one        # full validation matrix
 //!   cargo run --example run_mlir_aie_tests -- --full                # full validation, all tests
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -47,7 +48,7 @@ use xdna_emu::testing::hardware_comparison::{
 };
 use xdna_emu::testing::npu_runner;
 use xdna_emu::testing::npu_test::{self, NpuTestSource};
-use xdna_emu::testing::runner_config::{self, RunnerConfig};
+use xdna_emu::testing::runner_config::{self, Options, RunnerConfig};
 use xdna_emu::testing::runner_stats::{RunStats, HwRunResult};
 use xdna_emu::testing::hw_executor;
 use xdna_emu::testing::native_hw;
@@ -59,6 +60,555 @@ use xdna_emu::testing::unit_test;
 
 /// Type alias for Chess build artifacts (from build_progress module).
 type ChessBuildArtifacts = build_progress::ChessArtifacts;
+
+// ---------------------------------------------------------------------------
+// Hardware cascade detection
+// ---------------------------------------------------------------------------
+
+/// Maximum consecutive HW errors before disabling hardware execution.
+const MAX_CONSECUTIVE_HW_ERRORS: usize = 3;
+
+/// Tracks consecutive hardware errors for cascade detection.
+///
+/// After `MAX_CONSECUTIVE_HW_ERRORS` consecutive ERROR results (not FAIL --
+/// FAIL means the device works, the test just got wrong output), hardware
+/// execution is disabled for remaining tests.
+struct HwCascadeState {
+    consecutive_errors: usize,
+    disabled_reason: Option<String>,
+    stopped_at: Option<usize>,
+    cascade_skipped: usize,
+}
+
+impl HwCascadeState {
+    fn new() -> Self {
+        Self {
+            consecutive_errors: 0,
+            disabled_reason: None,
+            stopped_at: None,
+            cascade_skipped: 0,
+        }
+    }
+
+    fn is_disabled(&self) -> bool {
+        self.disabled_reason.is_some()
+    }
+
+    /// Record a hardware execution result. Handles both immediate wedge
+    /// detection (D-state) and consecutive error cascade.
+    fn record(&mut self, hw: &HwRunResult, test_idx: usize) {
+        // Immediate wedge cutoff: D-state means the device is unrecoverable.
+        if hw.wedged && self.disabled_reason.is_none() {
+            let detail = format!(
+                "NPU device wedged (D-state) at test {} -- \
+                 process survived SIGKILL, reboot required",
+                test_idx + 1,
+            );
+            eprintln!("\nCRITICAL: {}", detail);
+            eprintln!("Disabling hardware execution for remaining tests.\n");
+            self.stopped_at = Some(test_idx + 1);
+            self.disabled_reason = Some(detail);
+            return;
+        }
+
+        // PASS or FAIL means the device is working. Only ERROR means the
+        // device itself may be wedged.
+        if hw.passed || hw.label.starts_with("FAIL") {
+            self.consecutive_errors = 0;
+        } else if self.disabled_reason.is_none() {
+            self.consecutive_errors += 1;
+            if self.consecutive_errors >= MAX_CONSECUTIVE_HW_ERRORS {
+                let detail = if !npu_runner::probe_device_health() {
+                    format!(
+                        "NPU device unreachable after {} consecutive errors (test {})",
+                        self.consecutive_errors, test_idx + 1,
+                    )
+                } else {
+                    format!(
+                        "NPU device wedged after {} consecutive errors at test {} \
+                         (device node exists but XRT operations fail)",
+                        self.consecutive_errors, test_idx + 1,
+                    )
+                };
+                eprintln!("\nWARNING: {}", detail);
+                eprintln!("Disabling hardware execution for remaining tests.\n");
+                self.stopped_at = Some(test_idx + 1);
+                self.disabled_reason = Some(detail);
+            }
+        }
+    }
+
+    /// Transfer cascade counters to RunStats for summary display.
+    fn apply_to_stats(&self, stats: &mut RunStats) {
+        stats.hw_cascade_stopped_at = self.stopped_at;
+        stats.hw_cascade_skipped = self.cascade_skipped;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-test processing context
+// ---------------------------------------------------------------------------
+
+/// Shared read-only context for per-test processing.
+///
+/// Bundles the ~10 parameters that every test needs access to, avoiding
+/// a function signature with 15 arguments.
+struct TestContext<'a> {
+    opts: &'a Options,
+    hw_available: bool,
+    chess_available: bool,
+    aietools: &'a Option<AieTools>,
+    chess_builds: &'a HashMap<String, ChessBuildArtifacts>,
+    chess_emu_results: &'a HashMap<String, (TestOutcome, Option<Vec<u8>>)>,
+    reference_dir: &'a Path,
+    mlir_aie_path: &'a Path,
+    total: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Per-test processing (extracted from the main loop)
+// ---------------------------------------------------------------------------
+
+/// Process a single test: display emulator results, run hardware, do
+/// comparisons. This is the body of the main test loop.
+fn process_test(
+    ctx: &TestContext,
+    suite: &mut XclbinSuite,
+    stats: &mut RunStats,
+    cascade: &mut HwCascadeState,
+    test: &XclbinTest,
+    idx: usize,
+    emu: &Option<TestResult>,
+) {
+    let compact = emu.is_none(); // hw-only mode: compact single-line output
+
+    // --- Emulator display (skip in hw-only) ---
+    if let Some(ref r) = emu {
+        println!("{}", runner_display::format_result(r, ctx.total));
+        stats.record_emu_outcome(&r.outcome);
+        if let Some(ref hv) = r.hw_validation {
+            stats.record_hw_validation(hv);
+        }
+        if let TestOutcome::UnknownOpcode { ref details, .. } = r.outcome {
+            suite.record_unknown(details.clone(), &r.name);
+        }
+
+        if ctx.opts.verbose {
+            if test.buffer_spec.is_some() {
+                if let Some(ref output) = r.raw_output {
+                    let show = matches!(&r.outcome,
+                        TestOutcome::ValidationFail { .. } |
+                        TestOutcome::ExpectedFail { .. } |
+                        TestOutcome::UnexpectedPass { .. } |
+                        TestOutcome::Pass { correct: Some(_), .. }
+                    );
+                    if show {
+                        runner_display::print_verbose_comparison(output, test, ctx.reference_dir);
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Skip gates ---
+    let skip_hw = emu.as_ref().map_or(false, |r|
+        matches!(&r.outcome, TestOutcome::Platform{..} | TestOutcome::Skipped{..}));
+
+    let spec = test.buffer_spec.as_ref();
+    let insts_path = test.find_insts_bin();
+
+    // In hw-only mode, skip tests that cannot run on hardware at all.
+    if compact {
+        let has_native = test.test_exe.is_some();
+        let has_runner = spec.is_some() && insts_path.is_some();
+        if !has_native && !has_runner {
+            let reason = if insts_path.is_none() { "no insts.bin" }
+                else { "no buffer spec or test.exe" };
+            println!("[{:2}/{}] {:45} SKIP ({})",
+                idx + 1, ctx.total, &test.name[..test.name.len().min(45)], reason);
+            stats.skipped += 1;
+            return;
+        }
+        print!("[{:2}/{}] {:35} ",
+            idx + 1, ctx.total, &test.name[..test.name.len().min(35)]);
+    }
+
+    // --- Primary HW (native test.exe preferred, npu-runner fallback) ---
+    let compiler = test.compiler.unwrap_or(Compiler::Peano);
+    let primary_hw: Option<HwRunResult> = if cascade.is_disabled() {
+        cascade.cascade_skipped += 1;
+        None
+    } else if ctx.hw_available && !skip_hw {
+        run_hw_for_test(test, compiler, compact, spec, &insts_path, ctx, stats, cascade, idx)
+    } else {
+        None
+    };
+
+    // --- elfanalyzer ---
+    if ctx.opts.elfanalyze && !compact {
+        if let Some(ref tools) = ctx.aietools {
+            runner_display::run_elfanalyzer(tools, test, ctx.mlir_aie_path);
+        }
+    }
+
+    // --- Chess emulator (pre-computed in parallel phase 2b) ---
+    let chess_emu_output: Option<Vec<u8>> = if let Some((outcome, raw)) =
+        ctx.chess_emu_results.get(&test.name)
+    {
+        let label = format_chess_emu_label(outcome);
+        if !compact {
+            println!("      chess: {}", label);
+        }
+        raw.clone()
+    } else {
+        None
+    };
+
+    // --- Chess comparison HW (only for Peano-primary tests with Chess builds) ---
+    let chess_hw: Option<HwRunResult> = if !ctx.hw_available || cascade.is_disabled() {
+        None
+    } else if ctx.chess_available && !skip_hw && compiler == Compiler::Peano {
+        run_chess_hw_for_test(test, compact, spec, ctx, stats, cascade, idx)
+    } else {
+        None
+    };
+
+    // --- Differential (when both compilers ran on HW) ---
+    if let (Some(ref p), Some(ref c)) = (&primary_hw, &chess_hw) {
+        if compiler == Compiler::Peano {
+            stats.record_differential(p.passed, c.passed);
+        }
+    }
+
+    // --- Compiler comparison ---
+    if ctx.chess_available {
+        if ctx.chess_builds.contains_key(&test.name) {
+            if let Some(s) = spec {
+                let diag = run_compiler_comparison(
+                    s, test, compiler, emu, &chess_emu_output,
+                    &primary_hw, &chess_hw, ctx.reference_dir, compact,
+                );
+                if let Some(d) = diag {
+                    stats.record_compiler_diagnosis(d);
+                }
+            }
+        }
+    }
+
+    // --- aiesimulator ---
+    if ctx.opts.aiesim && !compact {
+        if let Some(ref tools) = ctx.aietools {
+            if let Some(prj) = ctx.chess_builds.get(&test.name).and_then(|a| a.prj_dir.as_ref()) {
+                let sim_label = runner_display::run_aiesim_comparison(tools, test, prj, ctx.reference_dir);
+                println!("      aiesim: {}", sim_label);
+                stats.record_aiesim(&sim_label);
+            }
+        }
+    }
+
+    // Close compact (hw-only) line
+    if compact {
+        println!();
+    }
+}
+
+/// Run primary hardware test (native test.exe preferred, npu-runner fallback).
+fn run_hw_for_test(
+    test: &XclbinTest,
+    compiler: Compiler,
+    compact: bool,
+    spec: Option<&xdna_emu::testing::test_cpp_parser::BufferSpec>,
+    insts_path: &Option<PathBuf>,
+    ctx: &TestContext,
+    stats: &mut RunStats,
+    cascade: &mut HwCascadeState,
+    idx: usize,
+) -> Option<HwRunResult> {
+    let prefix = match compiler {
+        Compiler::Peano => if compact { "peano" } else { "peano-hw" },
+        Compiler::Chess => if compact { "chess" } else { "chess-hw" },
+    };
+
+    // Try native test.exe first (handles custom host logic correctly)
+    let hw = if let (Some(ref exe), Some(ref pattern), Some(ref insts)) =
+        (&test.test_exe, &test.test_cpp_pattern, insts_path)
+    {
+        Some(native_hw::run_native_and_print(
+            exe, &test.xclbin_path, insts, *pattern, prefix, compact,
+        ))
+    } else if let (Some(s), Some(ref insts)) = (spec, insts_path) {
+        Some(hw_executor::run_hw_and_print(
+            s, &test.name, &test.xclbin_path, insts, prefix, compact, ctx.reference_dir,
+        ))
+    } else {
+        None
+    };
+
+    if let Some(ref hw) = hw {
+        stats.record_hw(compiler, hw);
+        cascade.record(hw, idx);
+    }
+
+    hw
+}
+
+/// Run Chess build on real NPU hardware for comparison with Peano primary.
+fn run_chess_hw_for_test(
+    test: &XclbinTest,
+    compact: bool,
+    spec: Option<&xdna_emu::testing::test_cpp_parser::BufferSpec>,
+    ctx: &TestContext,
+    stats: &mut RunStats,
+    cascade: &mut HwCascadeState,
+    idx: usize,
+) -> Option<HwRunResult> {
+    let chess_artifacts = ctx.chess_builds.get(&test.name)?;
+    let chess_insts = chess_artifacts.insts.as_ref()?;
+    let s = spec?;
+    if !ctx.opts.chess_hardware && !compact {
+        return None;
+    }
+
+    let prefix = if compact { "chess" } else { "chess-hw" };
+    if compact { print!("  "); }
+    let hw = hw_executor::run_hw_and_print(
+        s, &test.name, &chess_artifacts.xclbin, chess_insts, prefix, compact, ctx.reference_dir,
+    );
+    stats.record_hw(Compiler::Chess, &hw);
+    cascade.record(&hw, idx);
+    Some(hw)
+}
+
+/// Format a Chess emulator outcome as a display label.
+fn format_chess_emu_label(outcome: &TestOutcome) -> String {
+    match outcome {
+        TestOutcome::Pass { correct, total, .. } => {
+            if let (Some(c), Some(t)) = (correct, total) {
+                format!("PASS ({}/{})", c, t)
+            } else {
+                "PASS".to_string()
+            }
+        }
+        TestOutcome::ValidationFail { correct, total, .. } =>
+            format!("VALIDATION FAIL ({}/{})", correct, total),
+        TestOutcome::Fail { message, .. } => format!("FAIL: {}", message),
+        TestOutcome::UnknownOpcode { .. } => "UNKNOWN OPCODE".to_string(),
+        TestOutcome::Timeout { .. } => "TIMEOUT".to_string(),
+        TestOutcome::LoadError { message } => format!("LOAD ERROR: {}", message),
+        other => format!("{:?}", other),
+    }
+}
+
+/// Run compiler comparison (Peano vs Chess) and return the diagnosis.
+fn run_compiler_comparison(
+    spec: &xdna_emu::testing::test_cpp_parser::BufferSpec,
+    test: &XclbinTest,
+    compiler: Compiler,
+    emu: &Option<TestResult>,
+    chess_emu_output: &Option<Vec<u8>>,
+    primary_hw: &Option<HwRunResult>,
+    chess_hw: &Option<HwRunResult>,
+    reference_dir: &Path,
+    compact: bool,
+) -> Option<CompilerDiagnosis> {
+    let output_buf = spec.buffers.iter().find(|b| b.direction == BufferDir::Output)?;
+    let elem_type = output_buf.element_type;
+
+    let expected_bytes = load_hw_reference(reference_dir, &test.name)?;
+    let expected = read_values(&expected_bytes, elem_type);
+
+    let peano_hw_output = if compiler == Compiler::Peano {
+        primary_hw.as_ref().map(|h| h.output.clone())
+    } else {
+        None
+    };
+    let comparison = CompilerComparison {
+        test_name: test.name.clone(),
+        peano_emu: emu.as_ref().and_then(|r| r.raw_output.clone()),
+        chess_emu: chess_emu_output.clone(),
+        peano_hw: peano_hw_output,
+        chess_hw: chess_hw.as_ref().map(|h| h.output.clone()),
+        expected_values: Some(expected),
+    };
+
+    let d = if comparison.peano_hw.is_some() || comparison.chess_hw.is_some() {
+        comparison.classify_full(elem_type)
+    } else {
+        comparison.classify(elem_type)
+    };
+    if d != CompilerDiagnosis::Incomplete && !compact {
+        println!("      compiler comparison: {}", d);
+    }
+    Some(d)
+}
+
+// ---------------------------------------------------------------------------
+// Unit test execution (extracted from main)
+// ---------------------------------------------------------------------------
+
+/// Results from the unit test phase, for summary display.
+struct UnitTestStats {
+    discovered: usize,
+    built: usize,
+    build_failed: usize,
+    skipped: usize,
+    sim_pass: usize,
+    sim_fail: usize,
+    sim_error: usize,
+}
+
+/// Run the unit test discovery/build/simulation phase.
+fn run_unit_tests(
+    opts: &Options,
+    aietools: &Option<AieTools>,
+    build_env: &Option<BuildEnv>,
+    mlir_aie_path: &Path,
+    manifest_dir: &str,
+) -> UnitTestStats {
+    let mut s = UnitTestStats {
+        discovered: 0, built: 0, build_failed: 0,
+        skipped: 0, sim_pass: 0, sim_fail: 0, sim_error: 0,
+    };
+
+    println!("\n{:=<60}", "");
+    println!("=== UNIT TESTS (chess_compiler_tests_aie2) ===\n");
+
+    let unit_tests = unit_test::discover(mlir_aie_path);
+    s.discovered = unit_tests.len();
+
+    if unit_tests.is_empty() {
+        println!("No unit tests found.");
+        return s;
+    }
+
+    let filtered: Vec<_> = unit_tests.iter()
+        .filter(|t| runner_config::matches_filter(&t.name, &opts.filters))
+        .collect();
+
+    let filtered_count = filtered.len();
+    if !opts.filters.is_empty() {
+        println!("Filter: {:?} -> {}/{} unit tests selected",
+            opts.filters, filtered_count, s.discovered);
+    } else {
+        println!("Found {} unit tests", s.discovered);
+    }
+
+    let env = match build_env {
+        Some(e) => e,
+        None => return s,
+    };
+
+    // Build phase
+    println!("\n--- Unit Test Build Phase ({} tests) ---", filtered_count);
+    let build_start = Instant::now();
+
+    let mut build_results: Vec<(&unit_test::UnitTest, PathBuf)> = Vec::new();
+
+    for (idx, test) in filtered.iter().enumerate() {
+        if let Some(ref reason) = test.skip_reason {
+            println!("[{:2}/{}] {:40} SKIP ({})",
+                idx + 1, filtered_count,
+                &test.name[..test.name.len().min(40)],
+                reason);
+            s.skipped += 1;
+            continue;
+        }
+
+        let unit_output_dir = PathBuf::from(manifest_dir)
+            .join("build/unit_tests")
+            .join(&test.name);
+
+        let test_start = Instant::now();
+        match env.build_unit_test(
+            test,
+            &unit_output_dir,
+            if opts.build_nice > 0 { Some(opts.build_nice) } else { None },
+        ) {
+            Ok(result) => {
+                let cached = result.build_log == "(cached)";
+                let elapsed = test_start.elapsed();
+                let label = if cached { "cached" } else { "built" };
+                println!("[{:2}/{}] {:40} {} ({:.1}s)",
+                    idx + 1, filtered_count,
+                    &test.name[..test.name.len().min(40)],
+                    label, elapsed.as_secs_f64());
+                s.built += 1;
+                build_results.push((test, result.prj_dir));
+            }
+            Err(e) => {
+                let elapsed = test_start.elapsed();
+                let msg = e.lines().next().unwrap_or(&e);
+                println!("[{:2}/{}] {:40} FAILED ({:.1}s): {}",
+                    idx + 1, filtered_count,
+                    &test.name[..test.name.len().min(40)],
+                    elapsed.as_secs_f64(),
+                    &msg[..msg.len().min(80)]);
+                s.build_failed += 1;
+            }
+        }
+    }
+
+    let build_elapsed = build_start.elapsed();
+    println!("Unit test builds: {}/{} succeeded ({:.1}s)",
+        s.built, filtered_count - s.skipped, build_elapsed.as_secs_f64());
+
+    // Simulation phase (run through aiesimulator)
+    if opts.unit_tests_aiesim && !build_results.is_empty() {
+        if let Some(ref tools) = aietools {
+            use xdna_emu::integration::aiesimulator;
+
+            println!("\n--- Unit Test Simulation Phase ({} tests) ---",
+                build_results.len());
+
+            for (idx, (test, prj_dir)) in build_results.iter().enumerate() {
+                eprint!("\r[{:2}/{}] {}...",
+                    idx + 1, build_results.len(),
+                    &test.name[..test.name.len().min(40)]);
+                io::stderr().flush().unwrap();
+
+                match aiesimulator::run_unit_simulation(
+                    tools,
+                    prj_dir,
+                    opts.unit_tests_aiesim_timeout,
+                ) {
+                    Ok(result) => {
+                        let label = if result.passed {
+                            s.sim_pass += 1;
+                            "PASS"
+                        } else {
+                            s.sim_fail += 1;
+                            "FAIL"
+                        };
+                        eprint!("\r{:60}\r", "");
+                        println!("[{:2}/{}] {:40} {} ({:.1}s)",
+                            idx + 1, build_results.len(),
+                            &test.name[..test.name.len().min(40)],
+                            label, result.wall_time_secs);
+
+                        if opts.verbose && !result.passed {
+                            for line in result.stdout.lines().take(20) {
+                                println!("      {}", line);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        s.sim_error += 1;
+                        eprint!("\r{:60}\r", "");
+                        let msg = e.lines().next().unwrap_or(&e);
+                        println!("[{:2}/{}] {:40} ERROR: {}",
+                            idx + 1, build_results.len(),
+                            &test.name[..test.name.len().min(40)],
+                            &msg[..msg.len().min(60)]);
+                    }
+                }
+            }
+            eprint!("\r{:60}\r", "");
+            io::stderr().flush().unwrap();
+        }
+    }
+
+    s
+}
 
 fn main() {
     env_logger::Builder::from_env(
@@ -188,8 +738,8 @@ fn main() {
             .filter(|t| runner_config::matches_filter(&t.name, &opts.filters))
             .collect();
 
-        let no_build_chess: std::collections::HashMap<String, ChessBuildArtifacts> =
-            std::collections::HashMap::new();
+        let no_build_chess: HashMap<String, ChessBuildArtifacts> =
+            HashMap::new();
         (suite, tests, discovered, no_build_chess)
     } else {
         // Source-driven path: discover from source tree, build, create suite
@@ -272,7 +822,7 @@ fn main() {
 
         let chess_builds_from_build = build_result.chess_artifacts;
 
-        let tests: Vec<_> = suite.tests().to_vec();
+        let tests: Vec<XclbinTest> = suite.tests().to_vec();
         (suite, tests, total_source, chess_builds_from_build)
     };
 
@@ -304,7 +854,7 @@ fn main() {
     };
 
     // Phase 2b: Chess emulator (parallel)
-    let chess_emu_results: std::collections::HashMap<String, (TestOutcome, Option<Vec<u8>>)> =
+    let chess_emu_results: HashMap<String, (TestOutcome, Option<Vec<u8>>)> =
         if chess_available && opts.chess_emulator && !opts.hw_only {
             let chess_tests: Vec<XclbinTest> = chess_builds.iter().filter_map(|(name, artifacts)| {
                 let primary = tests.iter().find(|t| t.name == *name)?;
@@ -330,484 +880,57 @@ fn main() {
                     .map(|r| (r.name.clone(), (r.outcome, r.raw_output)))
                     .collect()
             } else {
-                std::collections::HashMap::new()
+                HashMap::new()
             }
         } else {
-            std::collections::HashMap::new()
+            HashMap::new()
         };
 
     // === DISPLAY + HARDWARE PHASE ===
     let mut stats = RunStats::default();
+    let mut cascade = HwCascadeState::new();
 
-    // Cascade detection: stop hammering hardware after consecutive errors.
-    // A "FAIL (3/8)" means the device works (test just got wrong output).
-    // Only "ERROR (...)" results indicate a potential device problem.
-    const MAX_CONSECUTIVE_HW_ERRORS: usize = 3;
-    let mut consecutive_hw_errors: usize = 0;
-    let mut hw_disabled_reason: Option<String> = None;
+    let ctx = TestContext {
+        opts: &opts,
+        hw_available,
+        chess_available,
+        aietools: &aietools,
+        chess_builds: &chess_builds,
+        chess_emu_results: &chess_emu_results,
+        reference_dir: &reference_dir,
+        mlir_aie_path: &mlir_aie_path,
+        total,
+    };
 
     for (idx, test) in tests.iter().enumerate() {
-        let emu = &emu_results[idx];
-        let compact = emu.is_none(); // hw-only mode: compact single-line output
-
-        // --- Emulator display (skip in hw-only) ---
-        if let Some(ref r) = emu {
-            println!("{}", runner_display::format_result(r, total));
-            stats.record_emu_outcome(&r.outcome);
-            if let Some(ref hv) = r.hw_validation {
-                stats.record_hw_validation(hv);
-            }
-            if let TestOutcome::UnknownOpcode { ref details, .. } = r.outcome {
-                suite.record_unknown(details.clone(), &r.name);
-            }
-
-            // Verbose mode: print full expected vs actual comparison
-            if opts.verbose {
-                if test.buffer_spec.is_some() {
-                    if let Some(ref output) = r.raw_output {
-                        let show = matches!(&r.outcome,
-                            TestOutcome::ValidationFail { .. } |
-                            TestOutcome::ExpectedFail { .. } |
-                            TestOutcome::UnexpectedPass { .. } |
-                            TestOutcome::Pass { correct: Some(_), .. }
-                        );
-                        if show {
-                            runner_display::print_verbose_comparison(output, test, &reference_dir);
-                        }
-                    }
-                }
-            }
-        }
-
-        // --- Skip gates ---
-        let skip_hw = emu.as_ref().map_or(false, |r|
-            matches!(&r.outcome, TestOutcome::Platform{..} | TestOutcome::Skipped{..}));
-
-        let spec = test.buffer_spec.as_ref();
-        let insts_path = test.find_insts_bin();
-
-        // In hw-only mode, skip tests that cannot run on hardware at all.
-        // Native test.exe only needs insts; npu-runner also needs buffer spec.
-        if compact {
-            let has_native = test.test_exe.is_some();
-            let has_runner = spec.is_some() && insts_path.is_some();
-            if !has_native && !has_runner {
-                let reason = if insts_path.is_none() { "no insts.bin" }
-                    else { "no buffer spec or test.exe" };
-                println!("[{:2}/{}] {:45} SKIP ({})",
-                    idx + 1, total, &test.name[..test.name.len().min(45)], reason);
-                stats.skipped += 1;
-                continue;
-            }
-            // Print compact header (results appended on same line)
-            print!("[{:2}/{}] {:35} ",
-                idx + 1, total, &test.name[..test.name.len().min(35)]);
-        }
-
-        // --- Primary HW (native test.exe preferred, npu-runner fallback) ---
-        let compiler = test.compiler.unwrap_or(Compiler::Peano);
-        let hw_cascade_active = hw_disabled_reason.is_some();
-        let primary_hw: Option<HwRunResult> = if hw_cascade_active {
-            // Device was declared wedged -- skip silently (counted below)
-            stats.hw_cascade_skipped += 1;
-            None
-        } else if hw_available && !skip_hw {
-            let prefix = match compiler {
-                Compiler::Peano => if compact { "peano" } else { "peano-hw" },
-                Compiler::Chess => if compact { "chess" } else { "chess-hw" },
-            };
-
-            // Try native test.exe first (handles custom host logic correctly)
-            let hw = if let (Some(ref exe), Some(ref pattern), Some(ref insts)) =
-                (&test.test_exe, &test.test_cpp_pattern, &insts_path)
-            {
-                Some(native_hw::run_native_and_print(
-                    exe, &test.xclbin_path, insts, *pattern, prefix, compact,
-                ))
-            } else if let (Some(s), Some(ref insts)) = (spec, &insts_path) {
-                // Fall back to npu-runner for tests without test.exe
-                Some(hw_executor::run_hw_and_print(
-                    s, &test.name, &test.xclbin_path, insts, prefix, compact, &reference_dir,
-                ))
-            } else {
-                None
-            };
-
-            if let Some(ref hw) = hw {
-                stats.record_hw(compiler, hw);
-
-                // Immediate wedge cutoff: D-state means the device is
-                // unrecoverable without a reboot. Stop all HW immediately.
-                if hw.wedged && hw_disabled_reason.is_none() {
-                    let detail = format!(
-                        "NPU device wedged (D-state) at test {} -- \
-                         process survived SIGKILL, reboot required",
-                        idx + 1,
-                    );
-                    eprintln!("\nCRITICAL: {}", detail);
-                    eprintln!("Disabling hardware execution for remaining tests.\n");
-                    stats.hw_cascade_stopped_at = Some(idx + 1);
-                    hw_disabled_reason = Some(detail);
-                }
-
-                // Cascade detection: track consecutive ERROR results.
-                // PASS or FAIL means the device is working (test passed or
-                // produced wrong output). Only ERROR means the device itself
-                // may be wedged.
-                if hw.passed || hw.label.starts_with("FAIL") {
-                    consecutive_hw_errors = 0;
-                } else if hw_disabled_reason.is_none() {
-                    consecutive_hw_errors += 1;
-                    if consecutive_hw_errors >= MAX_CONSECUTIVE_HW_ERRORS {
-                        let detail = if !npu_runner::probe_device_health() {
-                            format!(
-                                "NPU device unreachable after {} consecutive errors (test {})",
-                                consecutive_hw_errors, idx + 1,
-                            )
-                        } else {
-                            format!(
-                                "NPU device wedged after {} consecutive errors at test {} \
-                                 (device node exists but XRT operations fail)",
-                                consecutive_hw_errors, idx + 1,
-                            )
-                        };
-                        eprintln!("\nWARNING: {}", detail);
-                        eprintln!("Disabling hardware execution for remaining tests.\n");
-                        stats.hw_cascade_stopped_at = Some(idx + 1);
-                        hw_disabled_reason = Some(detail);
-                    }
-                }
-            }
-
-            hw
-        } else {
-            None
-        };
-
-        // --- elfanalyzer ---
-        if opts.elfanalyze && !compact {
-            if let Some(ref tools) = aietools {
-                runner_display::run_elfanalyzer(tools, test, &mlir_aie_path);
-            }
-        }
-
-        // --- Chess emulator (pre-computed in parallel phase 2b) ---
-        let chess_emu_output: Option<Vec<u8>> = if let Some((ref outcome, ref raw)) =
-            chess_emu_results.get(&test.name)
-        {
-            let label = match outcome {
-                TestOutcome::Pass { correct, total, .. } => {
-                    if let (Some(c), Some(t)) = (correct, total) {
-                        format!("PASS ({}/{})", c, t)
-                    } else {
-                        "PASS".to_string()
-                    }
-                }
-                TestOutcome::ValidationFail { correct, total, .. } =>
-                    format!("VALIDATION FAIL ({}/{})", correct, total),
-                TestOutcome::Fail { message, .. } => format!("FAIL: {}", message),
-                TestOutcome::UnknownOpcode { .. } => "UNKNOWN OPCODE".to_string(),
-                TestOutcome::Timeout { .. } => "TIMEOUT".to_string(),
-                TestOutcome::LoadError { message } => format!("LOAD ERROR: {}", message),
-                other => format!("{:?}", other),
-            };
-            if !compact {
-                println!("      chess: {}", label);
-            }
-            raw.clone()
-        } else {
-            None
-        };
-
-        // --- Chess comparison HW (only for Peano-primary tests that also have Chess builds) ---
-        // Chess-only primary tests already ran above via primary_hw.
-        // Respect both --no-hw flag and cascade detection.
-        let chess_hw: Option<HwRunResult> = if !hw_available || hw_disabled_reason.is_some() {
-            // hw_available is false when --no-hw is passed; cascade means device is wedged
-            None
-        } else if chess_available && !skip_hw && compiler == Compiler::Peano {
-            if let Some(chess_artifacts) = chess_builds.get(&test.name) {
-                if let Some(ref chess_insts) = chess_artifacts.insts {
-                    if let Some(s) = spec {
-                        if opts.chess_hardware || compact {
-                            let prefix = if compact { "chess" } else { "chess-hw" };
-                            if compact { print!("  "); }
-                            let hw = hw_executor::run_hw_and_print(
-                                s, &test.name, &chess_artifacts.xclbin, chess_insts, prefix, compact, &reference_dir,
-                            );
-                            stats.record_hw(Compiler::Chess, &hw);
-
-                            // Immediate wedge cutoff for Chess HW path.
-                            if hw.wedged && hw_disabled_reason.is_none() {
-                                let detail = format!(
-                                    "NPU device wedged (D-state) at test {} (Chess HW) -- \
-                                     process survived SIGKILL, reboot required",
-                                    idx + 1,
-                                );
-                                eprintln!("\nCRITICAL: {}", detail);
-                                eprintln!("Disabling hardware execution for remaining tests.\n");
-                                stats.hw_cascade_stopped_at = Some(idx + 1);
-                                hw_disabled_reason = Some(detail);
-                            }
-
-                            // Apply same cascade tracking for Chess HW errors.
-                            if hw.passed || hw.label.starts_with("FAIL") {
-                                consecutive_hw_errors = 0;
-                            } else if hw_disabled_reason.is_none() {
-                                consecutive_hw_errors += 1;
-                                if consecutive_hw_errors >= MAX_CONSECUTIVE_HW_ERRORS {
-                                    let detail = if !npu_runner::probe_device_health() {
-                                        format!(
-                                            "NPU device unreachable after {} consecutive errors (test {}, Chess HW)",
-                                            consecutive_hw_errors, idx + 1,
-                                        )
-                                    } else {
-                                        format!(
-                                            "NPU device wedged after {} consecutive errors at test {} (Chess HW)",
-                                            consecutive_hw_errors, idx + 1,
-                                        )
-                                    };
-                                    eprintln!("\nWARNING: {}", detail);
-                                    eprintln!("Disabling hardware execution for remaining tests.\n");
-                                    stats.hw_cascade_stopped_at = Some(idx + 1);
-                                    hw_disabled_reason = Some(detail);
-                                }
-                            }
-
-                            Some(hw)
-                        } else { None }
-                    } else { None }
-                } else { None }
-            } else { None }
-        } else { None };
-
-        // --- Differential (when both compilers ran on HW) ---
-        if let (Some(ref p), Some(ref c)) = (&primary_hw, &chess_hw) {
-            if compiler == Compiler::Peano {
-                stats.record_differential(p.passed, c.passed);
-            }
-        }
-
-        // --- Compiler comparison ---
-        if chess_available {
-            if chess_builds.contains_key(&test.name) {
-                if let Some(s) = spec {
-                    let diag = (|| -> Option<CompilerDiagnosis> {
-                        let output_buf = s.buffers.iter().find(|b| b.direction == BufferDir::Output)?;
-                        let elem_type = output_buf.element_type;
-
-                        let expected_bytes = load_hw_reference(&reference_dir, &test.name)?;
-                        let expected = read_values(&expected_bytes, elem_type);
-
-                        let peano_hw_output = if compiler == Compiler::Peano {
-                            primary_hw.as_ref().map(|h| h.output.clone())
-                        } else {
-                            None
-                        };
-                        let comparison = CompilerComparison {
-                            test_name: test.name.clone(),
-                            peano_emu: emu.as_ref().and_then(|r| r.raw_output.clone()),
-                            chess_emu: chess_emu_output.clone(),
-                            peano_hw: peano_hw_output,
-                            chess_hw: chess_hw.as_ref().map(|h| h.output.clone()),
-                            expected_values: Some(expected),
-                        };
-
-                        let d = if comparison.peano_hw.is_some() || comparison.chess_hw.is_some() {
-                            comparison.classify_full(elem_type)
-                        } else {
-                            comparison.classify(elem_type)
-                        };
-                        if d != CompilerDiagnosis::Incomplete && !compact {
-                            println!("      compiler comparison: {}", d);
-                        }
-                        Some(d)
-                    })();
-
-                    if let Some(d) = diag {
-                        stats.record_compiler_diagnosis(d);
-                    }
-                }
-            }
-        }
-
-        // --- aiesimulator (needs Chess build's .prj, skip in hw-only) ---
-        if opts.aiesim && !compact {
-            if let Some(ref tools) = aietools {
-                if let Some(prj) = chess_builds.get(&test.name).and_then(|a| a.prj_dir.as_ref()) {
-                    let sim_label = runner_display::run_aiesim_comparison(tools, test, prj, &reference_dir);
-                    println!("      aiesim: {}", sim_label);
-                    stats.record_aiesim(&sim_label);
-                }
-            }
-        }
-
-        // Close compact (hw-only) line
-        if compact {
-            println!();
-        }
+        process_test(&ctx, &mut suite, &mut stats, &mut cascade, test, idx, &emu_results[idx]);
     }
+    cascade.apply_to_stats(&mut stats);
 
     // === UNIT TESTS ===
-    let mut unit_discovered = 0;
-    let mut unit_built = 0;
-    let mut unit_build_failed = 0;
-    let mut unit_skipped = 0;
-    let mut unit_sim_pass = 0;
-    let mut unit_sim_fail = 0;
-    let mut unit_sim_error = 0;
-
-    if opts.unit_tests {
-        println!("\n{:=<60}", "");
-        println!("=== UNIT TESTS (chess_compiler_tests_aie2) ===\n");
-
-        let unit_tests = unit_test::discover(&mlir_aie_path);
-        unit_discovered = unit_tests.len();
-
-        if unit_tests.is_empty() {
-            println!("No unit tests found.");
-        } else {
-            let filtered: Vec<_> = unit_tests.iter()
-                .filter(|t| runner_config::matches_filter(&t.name, &opts.filters))
-                .collect();
-
-            let filtered_count = filtered.len();
-            if !opts.filters.is_empty() {
-                println!("Filter: {:?} -> {}/{} unit tests selected",
-                    opts.filters, filtered_count, unit_discovered);
-            } else {
-                println!("Found {} unit tests", unit_discovered);
-            }
-
-            // Build phase
-            if let Some(ref env) = build_env {
-                println!("\n--- Unit Test Build Phase ({} tests) ---", filtered_count);
-                let build_start = Instant::now();
-
-                let mut build_results: Vec<(&unit_test::UnitTest, PathBuf)> = Vec::new();
-
-                for (idx, test) in filtered.iter().enumerate() {
-                    if let Some(ref reason) = test.skip_reason {
-                        println!("[{:2}/{}] {:40} SKIP ({})",
-                            idx + 1, filtered_count,
-                            &test.name[..test.name.len().min(40)],
-                            reason);
-                        unit_skipped += 1;
-                        continue;
-                    }
-
-                    let unit_output_dir = PathBuf::from(manifest_dir)
-                        .join("build/unit_tests")
-                        .join(&test.name);
-
-                    let test_start = Instant::now();
-                    match env.build_unit_test(
-                        test,
-                        &unit_output_dir,
-                        if opts.build_nice > 0 { Some(opts.build_nice) } else { None },
-                    ) {
-                        Ok(result) => {
-                            let cached = result.build_log == "(cached)";
-                            let elapsed = test_start.elapsed();
-                            let label = if cached { "cached" } else { "built" };
-                            println!("[{:2}/{}] {:40} {} ({:.1}s)",
-                                idx + 1, filtered_count,
-                                &test.name[..test.name.len().min(40)],
-                                label, elapsed.as_secs_f64());
-                            unit_built += 1;
-                            build_results.push((test, result.prj_dir));
-                        }
-                        Err(e) => {
-                            let elapsed = test_start.elapsed();
-                            let msg = e.lines().next().unwrap_or(&e);
-                            println!("[{:2}/{}] {:40} FAILED ({:.1}s): {}",
-                                idx + 1, filtered_count,
-                                &test.name[..test.name.len().min(40)],
-                                elapsed.as_secs_f64(),
-                                &msg[..msg.len().min(80)]);
-                            unit_build_failed += 1;
-                        }
-                    }
-                }
-
-                let build_elapsed = build_start.elapsed();
-                println!("Unit test builds: {}/{} succeeded ({:.1}s)",
-                    unit_built, filtered_count - unit_skipped, build_elapsed.as_secs_f64());
-
-                // Simulation phase (run through aiesimulator)
-                if opts.unit_tests_aiesim && !build_results.is_empty() {
-                    if let Some(ref tools) = aietools {
-                        use xdna_emu::integration::aiesimulator;
-
-                        println!("\n--- Unit Test Simulation Phase ({} tests) ---",
-                            build_results.len());
-
-                        for (idx, (test, prj_dir)) in build_results.iter().enumerate() {
-                            eprint!("\r[{:2}/{}] {}...",
-                                idx + 1, build_results.len(),
-                                &test.name[..test.name.len().min(40)]);
-                            io::stderr().flush().unwrap();
-
-                            match aiesimulator::run_unit_simulation(
-                                tools,
-                                prj_dir,
-                                opts.unit_tests_aiesim_timeout,
-                            ) {
-                                Ok(result) => {
-                                    let label = if result.passed {
-                                        unit_sim_pass += 1;
-                                        "PASS"
-                                    } else {
-                                        unit_sim_fail += 1;
-                                        "FAIL"
-                                    };
-                                    eprint!("\r{:60}\r", "");
-                                    println!("[{:2}/{}] {:40} {} ({:.1}s)",
-                                        idx + 1, build_results.len(),
-                                        &test.name[..test.name.len().min(40)],
-                                        label, result.wall_time_secs);
-
-                                    if opts.verbose && !result.passed {
-                                        for line in result.stdout.lines().take(20) {
-                                            println!("      {}", line);
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    unit_sim_error += 1;
-                                    eprint!("\r{:60}\r", "");
-                                    let msg = e.lines().next().unwrap_or(&e);
-                                    println!("[{:2}/{}] {:40} ERROR: {}",
-                                        idx + 1, build_results.len(),
-                                        &test.name[..test.name.len().min(40)],
-                                        &msg[..msg.len().min(60)]);
-                                }
-                            }
-                        }
-                        eprint!("\r{:60}\r", "");
-                        io::stderr().flush().unwrap();
-                    }
-                }
-            }
-        }
-    }
+    let unit_stats = if opts.unit_tests {
+        Some(run_unit_tests(&opts, &aietools, &build_env, &mlir_aie_path, manifest_dir))
+    } else {
+        None
+    };
 
     // === SUMMARY ===
     stats.print_summary(total, opts.hw_only);
 
-    // Unit test summary (separate counters, not part of RunStats)
-    if unit_discovered > 0 {
-        println!("\n=== UNIT TESTS ===");
-        println!("Discovered:       {}", unit_discovered);
-        println!("Skipped:          {}", unit_skipped);
-        println!("Built:            {}", unit_built);
-        println!("Build Failed:     {}", unit_build_failed);
-        if unit_sim_pass + unit_sim_fail + unit_sim_error > 0 {
-            let unit_sim_total = unit_sim_pass + unit_sim_fail + unit_sim_error;
-            println!("Simulated:        {}", unit_sim_total);
-            println!("Sim Pass:         {}", unit_sim_pass);
-            println!("Sim Fail:         {}", unit_sim_fail);
-            println!("Sim Error:        {}", unit_sim_error);
+    if let Some(ref us) = unit_stats {
+        if us.discovered > 0 {
+            println!("\n=== UNIT TESTS ===");
+            println!("Discovered:       {}", us.discovered);
+            println!("Skipped:          {}", us.skipped);
+            println!("Built:            {}", us.built);
+            println!("Build Failed:     {}", us.build_failed);
+            let sim_total = us.sim_pass + us.sim_fail + us.sim_error;
+            if sim_total > 0 {
+                println!("Simulated:        {}", sim_total);
+                println!("Sim Pass:         {}", us.sim_pass);
+                println!("Sim Fail:         {}", us.sim_fail);
+                println!("Sim Error:        {}", us.sim_error);
+            }
         }
     }
 
