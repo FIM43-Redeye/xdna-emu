@@ -1,5 +1,9 @@
 //! Synchronization timing and contention tracking.
 //!
+//! **Status: scaffolded, not yet wired into the emulator pipeline.**
+//! The types and algorithms are implemented and unit-tested, but no caller
+//! in the coordinator or executor feeds live data into this module yet.
+//!
 //! This module provides cycle-accurate timing for lock operations:
 //!
 //! - **Lock acquire latency**: Cycles for successful acquisition

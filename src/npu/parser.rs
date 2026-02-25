@@ -232,23 +232,23 @@ impl NpuInstructionStream {
                 //   payload[24..28] = words[8] = arg_idx
                 //   payload[32..36] = words[10] = arg_plus
 
-                let reg_addr = if payload.len() >= 20 {
-                    u32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]])
-                } else {
-                    0
-                };
+                // Payload must be at least 36 bytes to contain all fields.
+                // The instruction is 48 bytes total (40 bytes payload after
+                // 8-byte header), but we only need through offset 35.
+                if payload.len() < 36 {
+                    return Err(format!(
+                        "DdrPatch payload too short: {} bytes (need at least 36)",
+                        payload.len()
+                    ));
+                }
 
-                let arg_idx = if payload.len() >= 28 {
-                    payload[24]  // Only the low byte is used
-                } else {
-                    0
-                };
-
-                let arg_plus = if payload.len() >= 36 {
-                    u32::from_le_bytes([payload[32], payload[33], payload[34], payload[35]])
-                } else {
-                    0
-                };
+                let reg_addr = u32::from_le_bytes([
+                    payload[16], payload[17], payload[18], payload[19],
+                ]);
+                let arg_idx = payload[24];
+                let arg_plus = u32::from_le_bytes([
+                    payload[32], payload[33], payload[34], payload[35],
+                ]);
 
                 log::debug!(
                     "DdrPatch parsed: reg_addr=0x{:08X} arg_idx={} arg_plus={}",
@@ -317,8 +317,27 @@ impl NpuInstructionStream {
                     Ok(NpuInstruction::MaskPoll { reg_off: reg_off as u32, value, mask })
                 }
 
+                // ConfigShimDmaBd (5) and ConfigShimDmaDmaBufBd (6) are defined
+                // in aie-rt but never emitted by mlir-aie. Log if encountered.
+                NpuOpcode::ConfigShimDmaBd | NpuOpcode::ConfigShimDmaDmaBufBd => {
+                    log::warn!(
+                        "NPU opcode {:?} encountered but not implemented -- \
+                         mlir-aie does not emit this opcode; payload skipped",
+                        opcode
+                    );
+                    let mut buf = vec![0u8; 8];
+                    cursor.read_exact(&mut buf).ok();
+                    Ok(NpuInstruction::Unknown {
+                        opcode: opcode_byte,
+                        data: buf,
+                    })
+                }
+
                 _ => {
-                    // Unknown standard op - skip 8 bytes (we already read 8 byte header)
+                    log::warn!(
+                        "NPU unknown standard opcode {} ({:#04x}), skipping",
+                        opcode_byte, opcode_byte
+                    );
                     let mut buf = vec![0u8; 8];
                     cursor.read_exact(&mut buf).ok();
                     Ok(NpuInstruction::Unknown {

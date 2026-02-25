@@ -106,6 +106,14 @@ impl DeviceState {
             self.apply_command(&cmd)?;
         }
 
+        if self.stats.unknown > 0 {
+            log::warn!(
+                "CDO application complete: {} commands processed, {} unknown opcodes skipped",
+                self.stats.commands,
+                self.stats.unknown
+            );
+        }
+
         Ok(())
     }
 
@@ -177,8 +185,13 @@ impl DeviceState {
                 log::trace!("CDO marker/end: skipped");
             }
 
-            _ => {
+            CdoCommand::Unknown { opcode, payload } => {
                 self.stats.unknown += 1;
+                log::warn!(
+                    "CDO opcode {:#06x} not implemented, skipping ({} payload words)",
+                    opcode,
+                    payload.len()
+                );
             }
         }
 

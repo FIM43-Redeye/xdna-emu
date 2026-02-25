@@ -165,14 +165,6 @@ impl InterpreterEngine {
     }
 
     /// Create a new engine with cycle-accurate timing.
-    ///
-    /// This is an alias for `new()` - all execution is now cycle-accurate.
-    /// Preserved for backward compatibility.
-    #[deprecated(since = "0.2.0", note = "All execution is now cycle-accurate. Use new() instead.")]
-    pub fn new_cycle_accurate(device: DeviceState) -> Self {
-        Self::new(device)
-    }
-
     /// Create engine for NPU1 (Phoenix).
     pub fn new_npu1() -> Self {
         Self::new(DeviceState::new_npu1())
@@ -183,25 +175,7 @@ impl InterpreterEngine {
         Self::new(DeviceState::new_npu2())
     }
 
-    /// Create engine for NPU1 (Phoenix) with cycle-accurate timing.
-    ///
-    /// This is an alias for `new_npu1()` - all execution is now cycle-accurate.
-    #[deprecated(since = "0.2.0", note = "All execution is now cycle-accurate. Use new_npu1() instead.")]
-    pub fn new_cycle_accurate_npu1() -> Self {
-        Self::new_npu1()
-    }
-
-    /// Create engine for NPU2 (Strix) with cycle-accurate timing.
-    ///
-    /// This is an alias for `new_npu2()` - all execution is now cycle-accurate.
-    #[deprecated(since = "0.2.0", note = "All execution is now cycle-accurate. Use new_npu2() instead.")]
-    pub fn new_cycle_accurate_npu2() -> Self {
-        Self::new_npu2()
-    }
-
-    /// Check if this engine is running in cycle-accurate mode.
-    ///
-    /// Always returns `true` - all execution is now cycle-accurate.
+    /// All execution is cycle-accurate.
     pub fn is_cycle_accurate(&self) -> bool {
         true
     }
@@ -504,9 +478,9 @@ impl InterpreterEngine {
         // trace units.
         {
             let cycle = self.total_cycles;
-            // Collect (tile_idx, hw_event_id, trace_target) tuples.
+            // Collect (tile_idx, hw_event_id, event_type, trace_target) tuples.
             // trace_target: which trace unit to notify (core_trace vs mem_trace).
-            let mut port_events: Vec<(usize, u8, TileType)> = Vec::new();
+            let mut port_events: Vec<(usize, u8, EventType, TileType)> = Vec::new();
             for idx in 0..self.device.array.tiles.len() {
                 let tile = &self.device.array.tiles[idx];
                 if !tile.core_trace.is_configured() && !tile.mem_trace.is_configured() {
@@ -524,20 +498,22 @@ impl InterpreterEngine {
                         let Some(port) = port else { continue };
 
                         // PORT_RUNNING or PORT_IDLE (mutually exclusive)
-                        let hw_id = if port.cycle_active {
-                            match tt {
+                        let (hw_id, evt) = if port.cycle_active {
+                            let hw_id = match tt {
                                 TileType::Compute => crate::trace::core_port_running_hw_id(event_port),
                                 TileType::MemTile => crate::trace::memtile_port_running_hw_id(event_port),
                                 TileType::Shim => crate::trace::shim_port_running_hw_id(event_port),
-                            }
+                            };
+                            (hw_id, EventType::PortRunning { port: event_port })
                         } else {
-                            match tt {
+                            let hw_id = match tt {
                                 TileType::Compute => crate::trace::core_port_idle_hw_id(event_port),
                                 TileType::MemTile => crate::trace::memtile_port_idle_hw_id(event_port),
                                 TileType::Shim => crate::trace::shim_port_idle_hw_id(event_port),
-                            }
+                            };
+                            (hw_id, EventType::PortIdle { port: event_port })
                         };
-                        port_events.push((idx, hw_id, tt));
+                        port_events.push((idx, hw_id, evt, tt));
 
                         if port.cycle_stalled {
                             let hw_id = match tt {
@@ -545,7 +521,7 @@ impl InterpreterEngine {
                                 TileType::MemTile => crate::trace::memtile_port_stalled_hw_id(event_port),
                                 TileType::Shim => crate::trace::shim_port_stalled_hw_id(event_port),
                             };
-                            port_events.push((idx, hw_id, tt));
+                            port_events.push((idx, hw_id, EventType::PortStalled { port: event_port }, tt));
                         }
 
                         if port.cycle_tlast {
@@ -554,13 +530,15 @@ impl InterpreterEngine {
                                 TileType::MemTile => crate::trace::memtile_port_tlast_hw_id(event_port),
                                 TileType::Shim => crate::trace::shim_port_tlast_hw_id(event_port),
                             };
-                            port_events.push((idx, hw_id, tt));
+                            port_events.push((idx, hw_id, EventType::PortTlast { port: event_port }, tt));
                         }
                     }
                 }
             }
-            for (idx, hw_id, tt) in port_events {
+            for (idx, hw_id, evt, tt) in port_events {
                 let tile = &mut self.device.array.tiles[idx];
+                let col = tile.col;
+                let row = tile.row;
                 // Compute tiles: core_trace (CoreEvent namespace)
                 // Shim tiles: core_trace (PL module, single trace unit)
                 // MemTiles: mem_trace (MemTileEvent namespace)
@@ -569,6 +547,7 @@ impl InterpreterEngine {
                 } else {
                     tile.notify_core_trace_event(hw_id, cycle);
                 }
+                self.trace_log.push(TileTracedEvent { col, row, cycle, event: evt });
             }
         }
 
@@ -1263,17 +1242,11 @@ mod tests {
 
     #[test]
     fn test_all_execution_is_cycle_accurate() {
-        // All engines are now cycle-accurate
         let engine1 = InterpreterEngine::new_npu1();
         assert!(engine1.is_cycle_accurate());
 
         let engine2 = InterpreterEngine::new_npu2();
         assert!(engine2.is_cycle_accurate());
-
-        // Legacy constructors (deprecated) also return cycle-accurate engines
-        #[allow(deprecated)]
-        let engine3 = InterpreterEngine::new_cycle_accurate_npu1();
-        assert!(engine3.is_cycle_accurate());
     }
 
     #[test]

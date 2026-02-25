@@ -145,6 +145,22 @@ pub enum EventType {
     /// Maps to hardware DISABLED_CORE.
     CoreDisabled,
 
+    // -- Stream port events (Core/MemTile/Shim module trace) --
+    // Level events sampled every cycle per monitored port.
+
+    /// Port had no data this cycle.
+    /// Maps to hardware PORT_IDLE_0 through PORT_IDLE_7.
+    PortIdle { port: u8 },
+    /// Port was active (data flowing).
+    /// Maps to hardware PORT_RUNNING_0 through PORT_RUNNING_7.
+    PortRunning { port: u8 },
+    /// Port had data but couldn't forward (backpressure).
+    /// Maps to hardware PORT_STALLED_0 through PORT_STALLED_7.
+    PortStalled { port: u8 },
+    /// TLAST seen on this port.
+    /// Maps to hardware PORT_TLAST_0 through PORT_TLAST_7.
+    PortTlast { port: u8 },
+
     // -- Branch events (emulator-internal, no direct HW trace event) --
 
     /// Branch taken with source and target PCs.

@@ -317,9 +317,9 @@ impl<'a> Cdo<'a> {
         let computed_checksum =
             !(header.num_words + header.ident_word + header.version + header.cdo_length);
         if header.checksum != computed_checksum {
-            // Warn but don't fail - some tools may not set checksum correctly
-            eprintln!(
-                "Warning: CDO checksum mismatch: expected 0x{:08X}, got 0x{:08X}",
+            // Warn but don't fail -- some tools may not set checksum correctly.
+            log::warn!(
+                "CDO checksum mismatch: expected 0x{:08X}, got 0x{:08X}",
                 computed_checksum, header.checksum
             );
         }
@@ -519,9 +519,14 @@ impl<'a> Iterator for CdoCommandIterator<'a> {
                 let address = if addr_hi == 0 {
                     addr_lo
                 } else {
-                    // 64-bit address; use lower 32 bits (AIE addresses are 32-bit)
-                    log::warn!("CDO DmaWrite with 64-bit addr: 0x{:08X}_{:08X}, using low 32 bits",
-                        addr_hi, addr_lo);
+                    // AIE tile addresses are 32-bit. A non-zero addr_hi means
+                    // this targets DDR above 4GB, which the emulator's host
+                    // memory model does not support. Warn and use low 32 bits.
+                    log::warn!(
+                        "CDO DmaWrite has 64-bit addr 0x{:08X}_{:08X} (>4GB); \
+                         emulator only supports 32-bit tile addresses, using low 32 bits",
+                        addr_hi, addr_lo
+                    );
                     addr_lo
                 };
                 let data: Vec<u8> = payload[2..]

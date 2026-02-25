@@ -665,6 +665,7 @@ fn gen_stream_ranges(
     writeln!(out, "/// Shim tile port ranges").unwrap();
     writeln!(out, "pub mod shim {{").unwrap();
     write_direction_ranges(&mut out, "NORTH", &port_data.shim_master, &port_data.shim_slave);
+    write_bundle_ranges(&mut out, "TRACE", PT_TRACE, &port_data.shim_master, &port_data.shim_slave);
     writeln!(out, "}}\n").unwrap();
 
     // MemTile port ranges
@@ -682,6 +683,8 @@ fn gen_stream_ranges(
         &port_data.memtile_master,
         &port_data.memtile_slave,
     );
+    write_bundle_ranges(&mut out, "DMA", PT_DMA_BASE, &port_data.memtile_master, &port_data.memtile_slave);
+    write_bundle_ranges(&mut out, "TRACE", PT_TRACE, &port_data.memtile_master, &port_data.memtile_slave);
     writeln!(out, "}}\n").unwrap();
 
     // Compute tile port ranges
@@ -699,6 +702,8 @@ fn gen_stream_ranges(
         &port_data.compute_master,
         &port_data.compute_slave,
     );
+    write_bundle_ranges(&mut out, "DMA", PT_DMA_BASE, &port_data.compute_master, &port_data.compute_slave);
+    write_bundle_ranges(&mut out, "TRACE", PT_TRACE, &port_data.compute_master, &port_data.compute_slave);
     writeln!(out, "}}").unwrap();
 
     fs::write(out_dir.join("gen_stream_ranges.rs"), out).unwrap();
@@ -769,6 +774,74 @@ fn write_direction_ranges(
         )
         .unwrap();
     }
+}
+
+/// Find port index range for a bundle type and write START/END constants.
+///
+/// For ranged types (DMA, directional), matches `base <= value < base + 10`.
+/// For single-value types (TRACE, CORE, FIFO), matches `value == base` exactly.
+fn write_bundle_ranges(
+    out: &mut String,
+    bundle: &str,
+    base: u8,
+    master_ports: &[PortEntry],
+    slave_ports: &[PortEntry],
+) {
+    // TRACE/CORE/FIFO are single-value types; directional and DMA are ranged
+    let is_ranged = base >= 10;
+
+    if let Some((start, end)) = find_port_range_flex(master_ports, base, is_ranged) {
+        writeln!(
+            out,
+            "    /// {} master ports: {}-{} ({} ports)",
+            bundle.to_lowercase(),
+            start,
+            end,
+            end - start + 1
+        )
+        .unwrap();
+        writeln!(out, "    pub const {}_MASTER_START: u8 = {};", bundle, start).unwrap();
+        writeln!(out, "    pub const {}_MASTER_END: u8 = {};", bundle, end).unwrap();
+    }
+
+    if let Some((start, end)) = find_port_range_flex(slave_ports, base, is_ranged) {
+        writeln!(
+            out,
+            "    /// {} slave ports: {}-{} ({} ports)",
+            bundle.to_lowercase(),
+            start,
+            end,
+            end - start + 1
+        )
+        .unwrap();
+        writeln!(out, "    pub const {}_SLAVE_START: u8 = {};", bundle, start).unwrap();
+        writeln!(out, "    pub const {}_SLAVE_END: u8 = {};", bundle, end).unwrap();
+    }
+}
+
+/// Find the first and last indices matching a port type.
+///
+/// When `ranged` is true, matches `base <= value < base + 10` (for directional/DMA).
+/// When `ranged` is false, matches `value == base` exactly (for TRACE/CORE/FIFO).
+fn find_port_range_flex(ports: &[PortEntry], base: u8, ranged: bool) -> Option<(u8, u8)> {
+    let mut first = None;
+    let mut last = None;
+
+    for (i, entry) in ports.iter().enumerate() {
+        let matches = if ranged {
+            entry.port_type_value >= base && entry.port_type_value < base + 10
+        } else {
+            entry.port_type_value == base
+        };
+        if matches {
+            if first.is_none() {
+                first = Some(i as u8);
+            }
+            last = Some(i as u8);
+        }
+    }
+
+    first.map(|f| (f, last.unwrap()))
 }
 
 /// Find the first and last indices where port_type_value has the given base

@@ -66,7 +66,11 @@ fn event_trace_type(event: &EventType) -> TraceType {
         | EventType::StreamStall { .. }
         | EventType::CoreActive
         | EventType::CoreDisabled
-        | EventType::BranchTaken { .. } => TraceType::Core,
+        | EventType::BranchTaken { .. }
+        | EventType::PortIdle { .. }
+        | EventType::PortRunning { .. }
+        | EventType::PortStalled { .. }
+        | EventType::PortTlast { .. } => TraceType::Core,
 
         // DMA and lock events are Memory module traces
         EventType::DmaStartTask { .. }
@@ -109,6 +113,10 @@ fn event_name(event: &EventType) -> &'static str {
         EventType::CoreActive => "ACTIVE",
         EventType::CoreDisabled => "DISABLED",
         EventType::BranchTaken { .. } => "BRANCH_TAKEN",
+        EventType::PortIdle { .. } => "PORT_IDLE",
+        EventType::PortRunning { .. } => "PORT_RUNNING",
+        EventType::PortStalled { .. } => "PORT_STALLED",
+        EventType::PortTlast { .. } => "PORT_TLAST",
     }
 }
 
@@ -128,6 +136,9 @@ fn event_tid(event: &EventType) -> u32 {
         EventType::MemoryStall { .. } | EventType::LockStall { .. }
         | EventType::StreamStall { .. } => 6,
         EventType::CoreActive | EventType::CoreDisabled | EventType::BranchTaken { .. } => 7,
+        // Port events share tid 8 (stream switch monitoring)
+        EventType::PortIdle { .. } | EventType::PortRunning { .. }
+        | EventType::PortStalled { .. } | EventType::PortTlast { .. } => 8,
 
         // Memory module: spread across tids 0-4
         EventType::DmaStartTask { .. } => 0,
@@ -600,13 +611,6 @@ pub fn core_port_tlast_hw_id(event_port: u8) -> u8 {
 ///
 /// WARNING: MemEvent does NOT have PORT events. IDs 78+ in MemEvent are
 /// CONFLICT_DM_BANK events. This function exists for symmetry but should
-/// not be used -- compute tile port events use CoreEvent IDs, not MemEvent.
-/// Kept for reference; use `core_port_*_hw_id()` for compute tile ports.
-#[allow(dead_code)]
-fn mem_port_running_hw_id(event_port: u8) -> u8 {
-    78 + (event_port * 4)
-}
-
 pub fn memtile_port_idle_hw_id(event_port: u8) -> u8 {
     79 + (event_port * 4)
 }
@@ -973,14 +977,6 @@ mod tests {
         assert_eq!(core_port_running_hw_id(7), 103);
         assert_eq!(core_port_stalled_hw_id(7), 104);
         assert_eq!(core_port_tlast_hw_id(7), 105);
-    }
-
-    #[test]
-    fn test_mem_port_running_hw_ids_are_wrong_namespace() {
-        // MemEvent does NOT have PORT events. IDs 78+ are CONFLICT_DM_BANK.
-        // This function exists for symmetry but should not be used.
-        // Compute tile port events use CoreEvent IDs via core_port_*_hw_id().
-        assert_eq!(mem_port_running_hw_id(0), 78); // Would be CONFLICT_DM_BANK_1
     }
 
     #[test]

@@ -1,5 +1,9 @@
 //! Parallel build orchestrator with ncurses-style grid display.
 //!
+//! **Status: complete but not yet integrated into any caller.**
+//! Intended consumer: `lit_runner` or `run_mlir_aie_tests`. Will be wired in
+//! when the test runner refactoring (Tier 6.1) is done.
+//!
 //! Replaces the sequential `batch_build_primary()` and `batch_build_chess_comparison()`
 //! with a parallel build system that shows progress as a compact, color-coded grid
 //! using crossterm for terminal control.

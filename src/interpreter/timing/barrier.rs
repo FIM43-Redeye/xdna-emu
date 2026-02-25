@@ -1,5 +1,9 @@
 //! Barrier synchronization timing and tracking.
 //!
+//! **Status: scaffolded, not yet wired into the emulator pipeline.**
+//! The types and algorithms are implemented and unit-tested, but no caller
+//! in the coordinator or executor feeds live data into this module yet.
+//!
 //! This module provides cycle-accurate timing for barrier synchronization:
 //!
 //! - **Barrier state**: Track which cores have arrived at a barrier

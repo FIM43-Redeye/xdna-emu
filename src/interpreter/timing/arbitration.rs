@@ -1,5 +1,9 @@
 //! Memory tile arbitration for multi-core access.
 //!
+//! **Status: scaffolded, not yet wired into the emulator pipeline.**
+//! The types and algorithms are implemented and unit-tested, but no caller
+//! in the coordinator or executor feeds live data into this module yet.
+//!
 //! This module models contention when multiple compute tiles and DMA channels
 //! access the same memory tile simultaneously.
 //!

@@ -186,7 +186,7 @@ impl ControlUnit {
                             raw_lock_id, lock_id, expected, delta, current_value, lock.value, is_mem_module);
                         Some(ExecuteResult::Continue)
                     }
-                    LockResult::WouldUnderflow => {
+                    LockResult::PreconditionNotMet => {
                         log::debug!("LockAcquire raw={} mapped={} expected={} current={} -> WAIT (mem_module={})",
                             raw_lock_id, lock_id, expected, current_value, is_mem_module);
                         Some(ExecuteResult::WaitLock { lock_id })

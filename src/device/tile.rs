@@ -67,7 +67,7 @@ pub enum LockResult {
     /// Operation succeeded
     Success,
     /// Operation failed - would underflow (value would go below -64)
-    WouldUnderflow,
+    PreconditionNotMet,
     /// Operation failed - would overflow (value would exceed +63)
     WouldOverflow,
 }
@@ -170,7 +170,7 @@ impl Lock {
     pub fn acquire_with_value(&mut self, expected_value: i8, delta: i8) -> LockResult {
         if self.value < expected_value {
             // Not enough value - operation would stall
-            return LockResult::WouldUnderflow;
+            return LockResult::PreconditionNotMet;
         }
 
         // Apply delta (convert to i16 for safe arithmetic)
@@ -178,7 +178,7 @@ impl Lock {
 
         if new_value < Self::MIN_VALUE as i16 {
             self.underflow = true;
-            return LockResult::WouldUnderflow;
+            return LockResult::PreconditionNotMet;
         }
 
         if new_value > Self::MAX_VALUE as i16 {
@@ -196,7 +196,7 @@ impl Lock {
     ///
     /// Checks if `value == expected_value`, and if so, applies `delta` to the
     /// lock value. Returns `LockResult::Success` if the operation succeeded.
-    /// Returns `LockResult::WouldUnderflow` if the value doesn't match exactly.
+    /// Returns `LockResult::PreconditionNotMet` if the value doesn't match exactly.
     ///
     /// This implements the AIE-ML acquire_eq semantics where a non-negative
     /// Lock_Acq_Value in the BD indicates waiting for lock == value exactly.
@@ -217,7 +217,7 @@ impl Lock {
     pub fn acquire_equal(&mut self, expected_value: i8, delta: i8) -> LockResult {
         if self.value != expected_value {
             // Value doesn't match exactly - operation would stall
-            return LockResult::WouldUnderflow;
+            return LockResult::PreconditionNotMet;
         }
 
         // Apply delta (convert to i16 for safe arithmetic)
@@ -225,7 +225,7 @@ impl Lock {
 
         if new_value < Self::MIN_VALUE as i16 {
             self.underflow = true;
-            return LockResult::WouldUnderflow;
+            return LockResult::PreconditionNotMet;
         }
 
         if new_value > Self::MAX_VALUE as i16 {
@@ -261,7 +261,7 @@ impl Lock {
         if new_value < Self::MIN_VALUE as i16 {
             self.underflow = true;
             self.value = Self::MIN_VALUE;
-            return LockResult::WouldUnderflow;
+            return LockResult::PreconditionNotMet;
         }
 
         if new_value > Self::MAX_VALUE as i16 {
@@ -623,14 +623,14 @@ pub struct Tile {
     pub ctrl_pkt_drop_header: bool,
 
     /// Shim Mux: which switchbox South slave port each DMA MM2S channel feeds.
-    /// Parsed from Mux_Config register (0x1F000). Index 0 = MM2S ch0, 1 = MM2S ch1.
+    /// Parsed from Mux_Config register (0x1F000). Index 0 = MM2S ch0, etc.
     /// Value is the switchbox slave port index (e.g., 5 for South3).
-    pub shim_mux_mm2s_slaves: [Option<usize>; 2],
+    pub shim_mux_mm2s_slaves: Vec<Option<usize>>,
 
     /// Shim Mux: which switchbox South master port feeds each DMA S2MM channel.
-    /// Parsed from Demux_Config register (0x1F004). Index 0 = S2MM ch0, 1 = S2MM ch1.
+    /// Parsed from Demux_Config register (0x1F004). Index 0 = S2MM ch0, etc.
     /// Value is the switchbox master port index (e.g., 2 for South0).
-    pub shim_mux_s2mm_masters: [Option<usize>; 2],
+    pub shim_mux_s2mm_masters: Vec<Option<usize>>,
 
     // === Trace Units ===
 
@@ -755,8 +755,8 @@ impl Tile {
             registers: std::collections::HashMap::new(),
             ctrl_pkt_state: ControlPacketState::Idle,
             ctrl_pkt_drop_header: true,
-            shim_mux_mm2s_slaves: [None; 2],
-            shim_mux_s2mm_masters: [None; 2],
+            shim_mux_mm2s_slaves: vec![None; super::dma::COMPUTE_MM2S_CHANNELS],
+            shim_mux_s2mm_masters: vec![None; super::dma::COMPUTE_S2MM_CHANNELS],
             core_trace: TraceUnit::new(col, row),
             mem_trace: TraceUnit::new(col, row),
             event_port_selection: [None; 8],
@@ -1060,7 +1060,7 @@ impl Tile {
     /// `LockResult::Success` if acquire would succeed, error otherwise.
     pub fn try_acquire_snapshot(&mut self, lock_id: usize, expected: i8, delta: i8, equal_mode: bool) -> LockResult {
         if lock_id >= self.locks.len() {
-            return LockResult::WouldUnderflow;
+            return LockResult::PreconditionNotMet;
         }
 
         // Calculate effective value: snapshot + any deltas already recorded this cycle
@@ -1085,7 +1085,7 @@ impl Tile {
             self.lock_deltas[lock_id] = self.lock_deltas[lock_id].saturating_add(delta);
             LockResult::Success
         } else {
-            LockResult::WouldUnderflow
+            LockResult::PreconditionNotMet
         }
     }
 
@@ -1534,12 +1534,12 @@ impl Tile {
         let mux = &super::regdb::device_reg_layout().shim_mux;
 
         // Reset mapping (register may be rewritten with different config)
-        self.shim_mux_mm2s_slaves = [None; 2];
+        self.shim_mux_mm2s_slaves.fill(None);
 
         let mut dma_ch = 0usize;
         for mf in &mux.mux_fields {
             let select = mf.field.extract(value);
-            if select == 1 && dma_ch < 2 {
+            if select == 1 && dma_ch < self.shim_mux_mm2s_slaves.len() {
                 // DMA source -> this South slave gets MM2S output
                 self.shim_mux_mm2s_slaves[dma_ch] = Some(mf.port_index);
                 log::info!("Shim Mux ({},{}): MM2S ch{} -> slave[{}] ({})",
@@ -1560,12 +1560,12 @@ impl Tile {
         let mux = &super::regdb::device_reg_layout().shim_mux;
 
         // Reset mapping
-        self.shim_mux_s2mm_masters = [None; 2];
+        self.shim_mux_s2mm_masters.fill(None);
 
         let mut dma_ch = 0usize;
         for df in &mux.demux_fields {
             let select = df.field.extract(value);
-            if select == 1 && dma_ch < 2 {
+            if select == 1 && dma_ch < self.shim_mux_s2mm_masters.len() {
                 self.shim_mux_s2mm_masters[dma_ch] = Some(df.port_index);
                 log::info!("Shim Mux ({},{}): S2MM ch{} <- master[{}] ({})",
                     self.col, self.row, dma_ch, df.port_index, df.field.name);
@@ -1950,7 +1950,7 @@ mod tests {
         assert_eq!(lock.value, 2);
 
         // Try to acquire with value >= 5 - should fail (only have 2)
-        assert_eq!(lock.acquire_with_value(5, -3), LockResult::WouldUnderflow);
+        assert_eq!(lock.acquire_with_value(5, -3), LockResult::PreconditionNotMet);
         assert_eq!(lock.value, 2); // Value unchanged
 
         // Acquire all remaining
@@ -1958,7 +1958,7 @@ mod tests {
         assert_eq!(lock.value, 0);
 
         // Can't acquire when value is 0
-        assert_eq!(lock.acquire_with_value(1, -1), LockResult::WouldUnderflow);
+        assert_eq!(lock.acquire_with_value(1, -1), LockResult::PreconditionNotMet);
         assert_eq!(lock.value, 0);
     }
 
@@ -1994,7 +1994,7 @@ mod tests {
         assert_eq!(lock.value, -3);
 
         // Push to underflow past MIN_VALUE (-3 - 62 = -65, beyond -64)
-        assert_eq!(lock.release_with_value(-62), LockResult::WouldUnderflow);
+        assert_eq!(lock.release_with_value(-62), LockResult::PreconditionNotMet);
         assert_eq!(lock.value, Lock::MIN_VALUE); // Clamped to -64
         assert!(lock.underflow);
     }
@@ -2021,7 +2021,7 @@ mod tests {
         let mut lock = Lock::new(2);
 
         // acquire_equal: wait for value == 1, should fail (value is 2)
-        assert_eq!(lock.acquire_equal(1, -1), LockResult::WouldUnderflow);
+        assert_eq!(lock.acquire_equal(1, -1), LockResult::PreconditionNotMet);
         assert_eq!(lock.value, 2); // Unchanged
 
         // acquire_equal: wait for value == 2, should succeed
@@ -2043,7 +2043,7 @@ mod tests {
         lock.set(5);
 
         // acquire_eq for value == 3 should fail (we have 5)
-        assert_eq!(lock.acquire_equal(3, -3), LockResult::WouldUnderflow);
+        assert_eq!(lock.acquire_equal(3, -3), LockResult::PreconditionNotMet);
         assert_eq!(lock.value, 5); // Unchanged
 
         // acquire_ge for value >= 3 should succeed (we have 5)

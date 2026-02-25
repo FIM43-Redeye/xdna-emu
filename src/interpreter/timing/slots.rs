@@ -1,5 +1,9 @@
 //! VLIW slot parallelism and structural hazard detection.
 //!
+//! **Status: scaffolded, not yet wired into the emulator pipeline.**
+//! The types and algorithms are implemented and unit-tested, but no caller
+//! in the coordinator or executor feeds live data into this module yet.
+//!
 //! AIE2 VLIW bundles can contain up to 7 slots that execute in parallel.
 //! However, not all slot combinations are truly parallel - some share
 //! resources and must be serialized.

@@ -1,5 +1,9 @@
 //! Deadlock detection for AIE2 lock synchronization.
 //!
+//! **Status: scaffolded, not yet wired into the emulator pipeline.**
+//! The types and algorithms are implemented and unit-tested, but no caller
+//! in the coordinator or executor feeds live data into this module yet.
+//!
 //! This module detects potential deadlocks in lock acquisition patterns:
 //!
 //! - **Wait-for graph**: Tracks which tiles are waiting for which locks

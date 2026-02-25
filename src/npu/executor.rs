@@ -265,9 +265,8 @@ impl NpuExecutor {
             }
         }
 
-        // If writing to shim DMA BD region (0x1D000-0x1D1FF), sync to DMA engine
-        // BD addresses: 0x1D000, 0x1D020, 0x1D040, etc. (32 bytes each)
-        if row == 0 && base_offset >= 0x1D000 && base_offset < 0x1D200 {
+        // If writing to shim DMA BD region, sync to DMA engine
+        if row == 0 && shim_bd_index_for_offset(base_offset).is_some() {
             self.sync_bd_to_dma_engine(col, base_offset, values, device);
         }
 
@@ -276,9 +275,9 @@ impl NpuExecutor {
 
     /// Sync BD configuration from tile registers to DMA engine.
     fn sync_bd_to_dma_engine(&self, col: u8, base_offset: u32, values: &[u32], device: &mut DeviceState) {
-        // Each BD is 32 bytes (8 words) starting at 0x1D000
-        let bd_base = base_offset - 0x1D000;
-        let bd_index = bd_base / 0x20;
+        let layout = crate::device::regdb::device_reg_layout();
+        let bd_base = base_offset - layout.shim_bd_base;
+        let bd_index = bd_base / layout.shim_bd_stride;
 
         // Only sync if we have a complete BD (8 words)
         if values.len() < 8 {
@@ -400,7 +399,8 @@ impl NpuExecutor {
             // Packet_Type, OoO_BD_ID). A blind write would clobber those fields.
             // Use read-modify-write to preserve the non-address bits.
             let high_bits = (patched_addr >> 32) as u32;
-            if row == 0 && offset >= 0x1D000 && offset < 0x1D200 {
+            let is_shim_bd = row == 0 && shim_bd_index_for_offset(offset).is_some();
+            if is_shim_bd {
                 // Shim BD: Base_Address_High occupies bits 15:0 of word 2
                 let current = tile.read_register(offset + 4);
                 let merged = (current & 0xFFFF_0000) | (high_bits & 0x0000_FFFF);
@@ -411,28 +411,27 @@ impl NpuExecutor {
         }
 
         // Re-sync the BD to DMA engine if patching BD address field
-        // BD addresses start at 0x1D000, each BD is 0x20 bytes
-        // Word 1 (address low) is at BD offset +4
-        if row == 0 && offset >= 0x1D000 && offset < 0x1D200 {
-            let bd_offset = offset - 0x1D000;
-            let bd_index = bd_offset / 0x20;
-            let word_in_bd = (bd_offset % 0x20) / 4;
+        let layout = crate::device::regdb::device_reg_layout();
+        if row == 0 {
+            if let Some(bd_index) = shim_bd_index_for_offset(offset) {
+                let bd_rel = offset - layout.shim_bd_base;
+                let word_in_bd = (bd_rel % layout.shim_bd_stride) / 4;
 
-            // If patching word 1 (address low), re-read and sync the full BD
-            if word_in_bd == 1 {
-                // Read BD values first (needs mutable borrow), then sync
-                let bd_values = if let Some(tile) = device.tile_mut(col as usize, row as usize) {
-                    let bd_base = 0x1D000 + bd_index * 0x20;
-                    let mut values = [0u32; 8];
-                    for i in 0..8u32 {
-                        values[i as usize] = tile.read_register(bd_base + i * 4);
+                // If patching word 1 (address low), re-read and sync the full BD
+                if word_in_bd == 1 {
+                    let bd_values = if let Some(tile) = device.tile_mut(col as usize, row as usize) {
+                        let bd_base = layout.shim_bd_base + bd_index * layout.shim_bd_stride;
+                        let mut values = [0u32; 8];
+                        for i in 0..8u32 {
+                            values[i as usize] = tile.read_register(bd_base + i * 4);
+                        }
+                        Some(values)
+                    } else {
+                        None
+                    };
+                    if let Some(values) = bd_values {
+                        self.sync_bd_values_to_dma_engine(col, bd_index as u8, &values, device);
                     }
-                    Some(values)
-                } else {
-                    None
-                };
-                if let Some(values) = bd_values {
-                    self.sync_bd_values_to_dma_engine(col, bd_index as u8, &values, device);
                 }
             }
         }
@@ -454,20 +453,27 @@ impl NpuExecutor {
             return;
         }
 
-        // Queue registers for starting DMA
-        // S2MM ch0 queue: 0x1D204, S2MM ch1 queue: 0x1D20C
-        // MM2S ch0 queue: 0x1D214, MM2S ch1 queue: 0x1D21C
-        const SHIM_DMA_S2MM_QUEUE_CH0: u32 = 0x1D204;
-        const SHIM_DMA_S2MM_QUEUE_CH1: u32 = 0x1D20C;
-        const SHIM_DMA_MM2S_QUEUE_CH0: u32 = 0x1D214;
-        const SHIM_DMA_MM2S_QUEUE_CH1: u32 = 0x1D21C;
+        // Queue register offsets derived from regdb: each channel occupies
+        // shim_channel_stride bytes, with Ctrl at +0 and Task_Queue at +4.
+        // S2MM channels come first, then MM2S channels.
+        let reg_layout = crate::device::regdb::device_reg_layout();
+        let base = reg_layout.shim_channel_base;
+        let stride = reg_layout.shim_channel_stride;
 
-        let (channel, is_mm2s) = match offset {
-            SHIM_DMA_S2MM_QUEUE_CH0 => (0u8, false),
-            SHIM_DMA_S2MM_QUEUE_CH1 => (1u8, false),
-            SHIM_DMA_MM2S_QUEUE_CH0 => (0u8, true),
-            SHIM_DMA_MM2S_QUEUE_CH1 => (1u8, true),
-            _ => return, // Not a queue register
+        if offset < base || (offset - base) % stride != 4 {
+            return; // Not a task queue register (queue regs are at +4 within each channel)
+        }
+        let ch_abs = ((offset - base) / stride) as u8;
+        let s2mm_count = crate::device::dma::COMPUTE_S2MM_CHANNELS as u8;
+        let total_channels = s2mm_count * 2; // S2MM + MM2S
+
+        if ch_abs >= total_channels {
+            return; // Beyond known channels
+        }
+        let (channel, is_mm2s) = if ch_abs >= s2mm_count {
+            (ch_abs - s2mm_count, true)
+        } else {
+            (ch_abs, false)
         };
 
         // Start_Queue register format (same as compute/memtile):
@@ -519,6 +525,23 @@ impl Default for NpuExecutor {
 fn is_data_memory_offset(tile: &crate::device::tile::Tile, offset: u32) -> bool {
     let dm_size = tile.data_memory().len() as u32;
     dm_size > 0 && offset < dm_size
+}
+
+/// Check if an offset falls in the shim DMA BD register region.
+///
+/// Returns the BD index if the offset is within the BD region, None otherwise.
+/// BD region bounds are derived from the AM025 register database.
+fn shim_bd_index_for_offset(offset: u32) -> Option<u32> {
+    let layout = crate::device::regdb::device_reg_layout();
+    let bd_base = layout.shim_bd_base;
+    let bd_stride = layout.shim_bd_stride;
+    let bd_end = layout.shim_channel_base; // Channel regs start right after BDs
+
+    if offset >= bd_base && offset < bd_end {
+        Some((offset - bd_base) / bd_stride)
+    } else {
+        None
+    }
 }
 
 /// Decode an NPU address into (col, row, offset).

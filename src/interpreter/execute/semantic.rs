@@ -141,6 +141,9 @@ pub fn execute_semantic(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         SemanticOp::Ctlz => execute_clz(op, ctx),
         SemanticOp::Cttz => execute_ctz(op, ctx),
         SemanticOp::Ctpop => execute_popcount(op, ctx),
+        SemanticOp::Rotl => execute_rotl(op, ctx),
+        SemanticOp::Rotr => execute_rotr(op, ctx),
+        SemanticOp::Bswap => execute_bswap(op, ctx),
 
         // Move/copy
         SemanticOp::Copy => execute_mov(op, ctx),
@@ -168,9 +171,16 @@ pub fn execute_semantic(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
             true
         }
 
-        // Unknown/unsupported - fall back to Operation-based dispatch
+        // Intentionally delegated to Operation-based dispatch:
+        // - Call/Ret/Done: Control flow with AIE-specific side effects
+        //   (delay slots, LR management, core halt). Handled by dedicated
+        //   jl/ret/done handlers in execute_operation().
+        // - LockAcquire/LockRelease: Interact with the device lock model,
+        //   not pure register-to-register computation.
+        // - Intrinsic(_): Target-specific intrinsics (vector ops, etc.)
+        //   requiring per-intrinsic dispatch.
         _ => {
-            log::trace!("[SEMANTIC] Unhandled semantic op: {:?}", semantic);
+            log::trace!("[SEMANTIC] Delegated to operation dispatch: {:?}", semantic);
             false
         }
     }
@@ -542,6 +552,26 @@ fn execute_ctz(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
 fn execute_popcount(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     let a = read_source(op, ctx, 0);
     write_dest(op, ctx, a.count_ones());
+    true
+}
+
+fn execute_rotl(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
+    let a = read_source(op, ctx, 0);
+    let b = read_source(op, ctx, 1) & 31; // rotate amount mod 32
+    write_dest(op, ctx, a.rotate_left(b));
+    true
+}
+
+fn execute_rotr(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
+    let a = read_source(op, ctx, 0);
+    let b = read_source(op, ctx, 1) & 31;
+    write_dest(op, ctx, a.rotate_right(b));
+    true
+}
+
+fn execute_bswap(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
+    let a = read_source(op, ctx, 0);
+    write_dest(op, ctx, a.swap_bytes());
     true
 }
 

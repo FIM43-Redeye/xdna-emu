@@ -22,8 +22,9 @@
 //! DMA engines are accessed via `dma_engine(col, row)` and stepped via
 //! `step_dma(col, row, host_memory)`.
 
+use super::aie2_spec::stream_switch::{compute, mem_tile, shim};
 use super::arch_config::{ArchConfig, ModelConfig};
-use super::dma::{DmaEngine, DmaResult};
+use super::dma::{self, DmaEngine, DmaResult};
 use super::host_memory::HostMemory;
 use super::tile::{Tile, TileParams, TileType};
 use crate::interpreter::state::EventType;
@@ -384,87 +385,35 @@ impl TileArray {
 
     /// Convert S2MM DMA channel index to stream switch slave port index.
     ///
-    /// Per AM025, the mapping differs by tile type:
-    /// - **Compute tiles** (4 channels): S2MM 0-1 at indices 0-1
-    ///   - S2MM channel 0 → slave port 1 (DMA0)
-    ///   - S2MM channel 1 → slave port 2 (DMA1)
-    /// - **MemTiles** (12 channels): S2MM 0-5 at indices 0-5
-    ///   - S2MM channel 0-5 → slave port 0-5
-    /// - **Shim tiles** (4 channels): S2MM 0-1 at indices 0-1
-    ///   - S2MM receives from North ports (from MemTile above)
-    ///   - S2MM channel 0 → North port 0 (slave port 8)
-    ///   - S2MM channel 1 → North port 1 (slave port 9)
+    /// Port indices derived from AM025 gen_stream_ranges.rs constants.
     #[allow(dead_code)] // Documented port mapping, may be used in future
     fn s2mm_channel_to_slave_port(tile_type: TileType, channel: u8) -> u8 {
         match tile_type {
-            TileType::Compute => {
-                // S2MM channels are at indices 0-1, map to slave ports 1-2
-                // channel 0 → port 1, channel 1 → port 2
-                channel + 1
-            }
-            TileType::MemTile => {
-                // S2MM channels are at indices 0-5, map to slave ports 0-5
-                // channel 0-5 → port 0-5
-                channel
-            }
-            TileType::Shim => {
-                // Shim S2MM channels are at indices 0-1
-                // They receive from North ports (from MemTile above)
-                // Per AM025: Shim slave ports 8-13 are North0-5
-                // S2MM channel 0 → North0 = slave port 8
-                // S2MM channel 1 → North1 = slave port 9
-                8 + channel
-            }
+            TileType::Compute => compute::DMA_SLAVE_START + channel,
+            TileType::MemTile => mem_tile::DMA_SLAVE_START + channel,
+            TileType::Shim => shim::NORTH_SLAVE_START + channel,
         }
     }
 
     /// Convert MM2S DMA channel index to stream switch master port index.
     ///
-    /// Per AM025, the mapping differs by tile type:
-    /// - **Compute tiles** (4 channels): S2MM 0-1 at indices 0-1, MM2S 0-1 at indices 2-3
-    ///   - MM2S channel 2 → master port 1 (DMA0)
-    ///   - MM2S channel 3 → master port 2 (DMA1)
-    /// - **MemTiles** (12 channels): S2MM 0-5 at indices 0-5, MM2S 0-5 at indices 6-11
-    ///   - MM2S channel 6-11 → master port 0-5
-    /// - **Shim tiles** (4 channels): S2MM 0-1 at indices 0-1, MM2S 0-1 at indices 2-3
-    ///   - MM2S uses North ports to reach MemTile
-    ///   - MM2S channel 2 → North port 0 (master port 12)
-    ///   - MM2S channel 3 → North port 1 (master port 13)
+    /// The `channel` argument is the absolute DMA channel index (S2MM channels
+    /// come first, MM2S channels follow). Port indices derived from AM025
+    /// gen_stream_ranges.rs and DMA channel constants.
     #[allow(dead_code)] // Documented port mapping, may be used in future
     fn mm2s_channel_to_master_port(tile_type: TileType, channel: u8) -> u8 {
         match tile_type {
             TileType::Compute => {
-                // MM2S channels are at indices 2-3, map to master ports 1-2
-                // channel 2 → port 1, channel 3 → port 2
-                if channel >= 2 {
-                    channel - 1
-                } else {
-                    log::warn!("mm2s_channel_to_master_port: unexpected S2MM channel {} for compute MM2S", channel);
-                    channel
-                }
+                let ch_offset = channel.saturating_sub(dma::COMPUTE_S2MM_CHANNELS as u8);
+                compute::DMA_MASTER_START + ch_offset
             }
             TileType::MemTile => {
-                // MM2S channels are at indices 6-11, map to master ports 0-5
-                // channel 6 → port 0, channel 7 → port 1, etc.
-                if channel >= 6 {
-                    channel - 6
-                } else {
-                    log::warn!("mm2s_channel_to_master_port: unexpected S2MM channel {} for memtile MM2S", channel);
-                    channel
-                }
+                let ch_offset = channel.saturating_sub(dma::MEM_TILE_S2MM_CHANNELS as u8);
+                mem_tile::DMA_MASTER_START + ch_offset
             }
             TileType::Shim => {
-                // Shim MM2S channels are at indices 2-3
-                // They connect to North ports to reach MemTile above
-                // Per AM025: Shim master ports 12-17 are North0-5
-                // MM2S channel 2 → North0 = master port 12
-                // MM2S channel 3 → North1 = master port 13
-                if channel >= 2 {
-                    12 + (channel - 2)
-                } else {
-                    log::warn!("mm2s_channel_to_master_port: unexpected S2MM channel {} for shim MM2S", channel);
-                    channel
-                }
+                let ch_offset = channel.saturating_sub(dma::COMPUTE_S2MM_CHANNELS as u8);
+                shim::NORTH_MASTER_START + ch_offset
             }
         }
     }
@@ -547,9 +496,8 @@ impl TileArray {
         words_routed += self.route_core_to_tile_switches();
 
         // Step 2b: Trace unit → StreamSwitch trace slave ports
-        // Binary trace packets enter the network on dedicated trace slave ports:
-        //   Compute: slave[23] (core trace), slave[24] (mem trace)
-        //   MemTile: slave[17] (mem trace)
+        // Binary trace packets enter on dedicated trace slave ports
+        // (indices from AM025 gen_stream_ranges.rs)
         words_routed += self.route_trace_to_tile_switches();
 
         // Step 3: StreamSwitch local routing (first pass)
@@ -718,10 +666,10 @@ impl TileArray {
     ///
     /// Each tile has trace units that produce 8-word (32-byte) binary trace
     /// packets. These packets enter the stream switch via dedicated trace
-    /// slave ports:
-    ///   - Compute tile: slave[23] = core trace, slave[24] = memory trace
-    ///   - MemTile: slave[17] = memory trace
-    ///   - Shim: slave[22] = trace (not currently used)
+    /// slave ports (indices from AM025 via gen_stream_ranges.rs):
+    ///   - Compute tile: TRACE_SLAVE_START (core trace), TRACE_SLAVE_END (memory trace)
+    ///   - MemTile: TRACE_SLAVE_START (memory trace)
+    ///   - Shim: TRACE_SLAVE_START (trace, rarely used)
     ///
     /// Once on the slave port, the existing packet routing infrastructure
     /// handles forwarding to shim DMA and ultimately to host DDR.
@@ -733,40 +681,45 @@ impl TileArray {
 
             match tile_type {
                 TileType::Compute => {
-                    // Core trace -> slave[23] (AIE_TRACE)
+                    let aie_trace = compute::TRACE_SLAVE_START as usize;
+                    let mem_trace = compute::TRACE_SLAVE_END as usize;
+
+                    // Core trace -> AIE_TRACE slave port
                     while self.tiles[i].core_trace.has_pending_words()
-                        && self.tiles[i].stream_switch.slaves[23].can_accept()
+                        && self.tiles[i].stream_switch.slaves[aie_trace].can_accept()
                     {
                         let (word, tlast) = self.tiles[i].core_trace.pop_word().unwrap();
-                        self.tiles[i].stream_switch.slaves[23].push_with_tlast(word, tlast);
+                        self.tiles[i].stream_switch.slaves[aie_trace].push_with_tlast(word, tlast);
                         words_routed += 1;
                     }
-                    // Memory trace -> slave[24] (MEM_TRACE)
+                    // Memory trace -> MEM_TRACE slave port
                     while self.tiles[i].mem_trace.has_pending_words()
-                        && self.tiles[i].stream_switch.slaves[24].can_accept()
+                        && self.tiles[i].stream_switch.slaves[mem_trace].can_accept()
                     {
                         let (word, tlast) = self.tiles[i].mem_trace.pop_word().unwrap();
-                        self.tiles[i].stream_switch.slaves[24].push_with_tlast(word, tlast);
+                        self.tiles[i].stream_switch.slaves[mem_trace].push_with_tlast(word, tlast);
                         words_routed += 1;
                     }
                 }
                 TileType::MemTile => {
-                    // Memory trace -> slave[17] (TRACE)
+                    let trace_port = mem_tile::TRACE_SLAVE_START as usize;
+
                     while self.tiles[i].mem_trace.has_pending_words()
-                        && self.tiles[i].stream_switch.slaves[17].can_accept()
+                        && self.tiles[i].stream_switch.slaves[trace_port].can_accept()
                     {
                         let (word, tlast) = self.tiles[i].mem_trace.pop_word().unwrap();
-                        self.tiles[i].stream_switch.slaves[17].push_with_tlast(word, tlast);
+                        self.tiles[i].stream_switch.slaves[trace_port].push_with_tlast(word, tlast);
                         words_routed += 1;
                     }
                 }
                 TileType::Shim => {
-                    // Shim trace -> slave[22] (TRACE) -- rarely used
+                    let trace_port = shim::TRACE_SLAVE_START as usize;
+
                     while self.tiles[i].mem_trace.has_pending_words()
-                        && self.tiles[i].stream_switch.slaves[22].can_accept()
+                        && self.tiles[i].stream_switch.slaves[trace_port].can_accept()
                     {
                         let (word, tlast) = self.tiles[i].mem_trace.pop_word().unwrap();
-                        self.tiles[i].stream_switch.slaves[22].push_with_tlast(word, tlast);
+                        self.tiles[i].stream_switch.slaves[trace_port].push_with_tlast(word, tlast);
                         words_routed += 1;
                     }
                 }
@@ -782,9 +735,7 @@ impl TileArray {
     /// the arbiter can route to external master ports. Local routes like
     /// `slave[1] -> master[5]` configure master[5] to receive from DMA0 MM2S output.
     ///
-    /// Per AM025:
-    /// - Compute tile: Slave[1-2] are DMA0-1 (MM2S output presented as slave source)
-    /// - MemTile: Slave[0-5] are DMA0-5 (MM2S output presented as slave source)
+    /// DMA slave port ranges come from gen_stream_ranges.rs (AM025-derived).
     fn route_dma_to_tile_switches(&mut self) -> usize {
         use super::stream_switch::PortType;
         let mut words_routed = 0;
@@ -812,8 +763,12 @@ impl TileArray {
                     //
                     // DMA channel indices: S2MM = 0-1, MM2S = 2-3 (absolute)
                     // MM2S ch0 = abs channel 2, ch1 = abs channel 3
-                    let mm2s_ch = if data.channel >= 2 { (data.channel - 2) as usize } else { data.channel as usize };
-                    let target_slave_idx = self.tiles[i].shim_mux_mm2s_slaves[mm2s_ch.min(1)];
+                    let s2mm_count = dma::COMPUTE_S2MM_CHANNELS;
+                    let mm2s_ch = data.channel.saturating_sub(s2mm_count as u8) as usize;
+                    let target_slave_idx = self.tiles[i].shim_mux_mm2s_slaves
+                        .get(mm2s_ch)
+                        .copied()
+                        .flatten();
 
                     if let Some(slave_idx) = target_slave_idx {
                         if self.tiles[i].stream_switch.slaves[slave_idx].push_with_tlast(data.data, data.tlast) {
@@ -850,15 +805,16 @@ impl TileArray {
 
                 let slave_port = match tile_type {
                     TileType::MemTile => {
-                        // MemTile MM2S channels 6-11 map to DMA slave ports 0-5
-                        // Per AM025 MEM_TILE: Slave ports 0-5 are DMA0-5
-                        (if data.channel >= 6 { data.channel - 6 } else { data.channel }) as usize
+                        // MemTile MM2S channels start after S2MM channels
+                        let s2mm_count = dma::MEM_TILE_S2MM_CHANNELS as u8;
+                        let ch_offset = data.channel.saturating_sub(s2mm_count);
+                        (mem_tile::DMA_SLAVE_START + ch_offset) as usize
                     }
                     TileType::Compute => {
-                        // Compute tile MM2S channels 2-3 map to DMA slave ports 1-2
-                        // Per AM025 CORE_MODULE: Slave ports 1-2 are DMA0-1
-                        // ch2 (MM2S_0) -> slave[1], ch3 (MM2S_1) -> slave[2]
-                        (if data.channel >= 2 { data.channel - 1 } else { data.channel + 1 }) as usize
+                        // Compute MM2S channels start after S2MM channels
+                        let s2mm_count = dma::COMPUTE_S2MM_CHANNELS as u8;
+                        let ch_offset = data.channel.saturating_sub(s2mm_count);
+                        (compute::DMA_SLAVE_START + ch_offset) as usize
                     }
                     TileType::Shim => unreachable!(), // Handled above
                 };
