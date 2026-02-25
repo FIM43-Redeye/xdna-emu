@@ -1488,6 +1488,27 @@ mod tests {
     }
 
     #[test]
+    fn test_done_instruction_decodes_to_halt() {
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found at ../llvm-aie");
+            return;
+        }
+        let decoder = InstructionDecoder::try_load_via_tblgen(llvm_aie_path)
+            .expect("Failed to load via tblgen");
+
+        // done instruction: bytes from llvm-objdump, encodes to ALU slot
+        let done_bytes: [u8; 4] = [0x19, 0x08, 0x00, 0x10];
+        let bundle = decoder.decode(&done_bytes, 0xbc).expect("Should decode 'done'");
+
+        let has_halt = bundle.active_slots().any(|s|
+            matches!(s.op, Operation::Halt)
+        );
+        assert!(has_halt, "done instruction must decode to Operation::Halt, got: {:?}",
+            bundle.active_slots().map(|s| format!("{:?}", s.op)).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn test_decoder_via_tblgen() {
         let llvm_aie_path = Path::new("../llvm-aie");
         if !llvm_aie_path.exists() {

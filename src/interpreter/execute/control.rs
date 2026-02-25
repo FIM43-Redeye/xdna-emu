@@ -255,7 +255,15 @@ impl ControlUnit {
     /// register and an immediate target address. We prefer the Immediate operand
     /// since that's the branch target; the register is the condition (already
     /// handled by the caller). For unconditional branches (jl), the first source
-    /// is the Immediate target directly.
+    /// is the Immediate target directly. For register-indirect branches (jl pN,
+    /// ret lr, jnzd), a PointerReg operand provides the target.
+    /// Get branch target address from operand.
+    ///
+    /// For conditional branches (jnz/jz), the sources contain both a condition
+    /// register and an immediate target address. We prefer the Immediate operand
+    /// since that's the branch target; the register is the condition (already
+    /// handled by the caller). For register-indirect branches (jl pN, ret lr,
+    /// jnzd), a PointerReg operand provides the target.
     fn get_branch_target(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
         // Prefer Immediate operand (the branch target address)
         for src in &op.sources {
@@ -263,11 +271,19 @@ impl ControlUnit {
                 return *v as u32;
             }
         }
-        // Fallback: register-indirect branch (e.g., jr rX)
-        op.sources.first().map_or(0, |src| match src {
-            Operand::ScalarReg(r) => ctx.scalar.read(*r),
-            _ => 0,
-        })
+        // Check for pointer register (register-indirect branch: jl pN, jnzd ..pN)
+        for src in &op.sources {
+            if let Operand::PointerReg(r) = src {
+                return ctx.pointer.read(*r);
+            }
+        }
+        // Last resort: scalar register (e.g., jr rX)
+        for src in &op.sources {
+            if let Operand::ScalarReg(r) = src {
+                return ctx.scalar.read(*r);
+            }
+        }
+        0
     }
 
     /// Evaluate a branch condition against flags.

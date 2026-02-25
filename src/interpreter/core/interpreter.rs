@@ -135,6 +135,12 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
         let bundle = match self.decoder.decode(bytes, pc) {
             Ok(b) => b,
             Err(e) => {
+                log::debug!(
+                    "DecodeError at PC=0x{:x}, {} bytes avail, prog_len=0x{:x}, \
+                     pending_branch={:?}: {:?}",
+                    pc, bytes.len(), program_mem.len(),
+                    ctx.pending_branch_target(), e
+                );
                 self.status = CoreStatus::Error;
                 return StepResult::DecodeError(e);
             }
