@@ -77,9 +77,11 @@ impl HwCascadeState {
     /// Record a hardware execution result. After each error, verify the
     /// device recovered before allowing subsequent tests to run.
     fn record(&mut self, hw: &HwRunResult, test_idx: usize) {
+        use super::runner_stats::HwOutcome;
+
         // D-state: process survived SIGKILL. Device is unrecoverable
         // without reboot or bus-level reset. Stop immediately.
-        if hw.wedged && self.disabled_reason.is_none() {
+        if hw.outcome == HwOutcome::Wedged && self.disabled_reason.is_none() {
             let detail = format!(
                 "NPU device wedged (D-state) at test {} -- \
                  process survived SIGKILL, reboot required",
@@ -92,10 +94,9 @@ impl HwCascadeState {
             return;
         }
 
-        // PASS, FAIL, or DONE means the device executed the test. No
-        // recovery check needed. DONE indicates the kernel ran but we
-        // couldn't validate output (missing buffer_spec or reference data).
-        if hw.passed || hw.label.starts_with("FAIL") || hw.label.starts_with("DONE") {
+        // PASS or FAIL means the device executed the test. No recovery
+        // check needed.
+        if hw.outcome == HwOutcome::Pass || hw.outcome == HwOutcome::Fail {
             return;
         }
 
@@ -231,7 +232,7 @@ fn process_test(
         matches!(&r.outcome, TestOutcome::Platform{..} | TestOutcome::Skipped{..}));
 
     let spec = test.buffer_spec.as_ref();
-    let insts_path = test.find_insts_bin();
+    let insts_path = test.find_insts_file();
 
     // In hw-only mode, skip tests that cannot run on hardware at all.
     if compact {
@@ -306,7 +307,10 @@ fn process_test(
 
     // --- Differential (when both compilers ran on HW) ---
     if let (Some(ref p), Some(ref c)) = (&primary_hw, &chess_hw) {
-        stats.record_differential(p.passed, c.passed);
+        stats.record_differential(
+            p.outcome == super::runner_stats::HwOutcome::Pass,
+            c.outcome == super::runner_stats::HwOutcome::Pass,
+        );
     }
 
     // --- Compiler comparison ---
@@ -627,7 +631,7 @@ fn run_sequential(suite: &XclbinSuite, tests: &[XclbinTest]) -> Vec<TestResult> 
 
         let elf_count = test.find_elf_files().len();
         let embedded_count = test.count_embedded_cores();
-        let has_npu = test.find_insts_bin().is_some();
+        let has_npu = test.find_insts_file().is_some();
         let (outcome, raw_output, hw_validation) = suite.run_single_with_hw_validation(test);
 
         results.push(TestResult {
@@ -669,7 +673,7 @@ fn run_parallel(suite: &XclbinSuite, tests: &[XclbinTest], jobs: usize) -> Vec<T
                     let test = &tests[i];
                     let elf_count = test.find_elf_files().len();
                     let embedded_count = test.count_embedded_cores();
-                    let has_npu = test.find_insts_bin().is_some();
+                    let has_npu = test.find_insts_file().is_some();
                     let (outcome, raw_output, hw_validation) = suite.run_single_with_hw_validation(test);
 
                     let done = completed.fetch_add(1, Ordering::SeqCst) + 1;

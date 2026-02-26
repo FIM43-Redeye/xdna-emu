@@ -9,10 +9,9 @@
 //! This module is pure logic -- no hardware dependency. It works on raw
 //! byte buffers from either live capture or saved files.
 
-use std::collections::HashMap;
 use std::path::Path;
 
-use super::test_cpp_parser::{BufferSpec, BufferDir, ElementType, read_values, generate_input_data};
+use super::test_cpp_parser::{ElementType, read_values};
 
 /// Diagnosis from emulator-vs-hardware comparison.
 ///
@@ -84,24 +83,6 @@ pub fn load_hw_reference(reference_dir: &Path, test_name: &str) -> Option<Vec<u8
     } else {
         None
     }
-}
-
-/// Generate input values from a BufferSpec.
-///
-/// Returns a map of buffer name -> element values, used for display
-/// and debugging purposes.
-pub fn generate_input_values_from_spec(spec: &BufferSpec) -> HashMap<String, Vec<i64>> {
-    let mut inputs = HashMap::new();
-
-    for buf in &spec.buffers {
-        if buf.direction == BufferDir::Output {
-            continue;
-        }
-        let data = generate_input_data(buf);
-        inputs.insert(buf.name.clone(), read_values(&data, buf.element_type));
-    }
-
-    inputs
 }
 
 /// Result of comparing two output buffers element-by-element.
@@ -465,7 +446,6 @@ impl CompilerComparison {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::test_cpp_parser::InputPattern;
 
     #[test]
     fn test_compare_matching_buffers() {
@@ -879,34 +859,5 @@ mod tests {
             expected_values: Some(vec![2, 3, 4, 5]),
         };
         assert_eq!(cc.classify_full(ElementType::I32), CompilerDiagnosis::PeanoCompilerBug);
-    }
-
-    #[test]
-    fn test_generate_input_values_from_spec() {
-        let spec = BufferSpec {
-            buffers: vec![
-                super::super::test_cpp_parser::BufferDef {
-                    name: "in".to_string(),
-                    group_id: 3,
-                    size_elements: 4,
-                    element_type: ElementType::I32,
-                    direction: BufferDir::Input,
-                    input_pattern: InputPattern::Sequential { start: 1, step: 1 },
-                },
-                super::super::test_cpp_parser::BufferDef {
-                    name: "out".to_string(),
-                    group_id: 5,
-                    size_elements: 4,
-                    element_type: ElementType::I32,
-                    direction: BufferDir::Output,
-                    input_pattern: InputPattern::Zeros,
-                },
-            ],
-            multi_kernel: false,
-        };
-
-        let inputs = generate_input_values_from_spec(&spec);
-        assert_eq!(inputs.len(), 1);
-        assert_eq!(inputs["in"], vec![1, 2, 3, 4]);
     }
 }

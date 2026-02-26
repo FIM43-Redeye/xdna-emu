@@ -412,9 +412,7 @@ pub fn parse_test_output(stdout: &str) -> (bool, usize, usize) {
     (passed, total, correct)
 }
 
-/// Default timeout for native test.exe execution (seconds).
-/// 30s is generous for any test; matches npu_runner default.
-pub const DEFAULT_NATIVE_TIMEOUT_SECS: u32 = 30;
+use super::runner_config::DEFAULT_HW_TIMEOUT_SECS;
 
 /// Run a native test on hardware and produce an HwRunResult for display.
 ///
@@ -431,35 +429,34 @@ pub fn run_native_and_print(
     prefix: &str,
     compact: bool,
 ) -> super::runner_stats::HwRunResult {
-    let result = run_native_test(test_exe, xclbin, insts, pattern, DEFAULT_NATIVE_TIMEOUT_SECS);
+    use super::runner_stats::{HwOutcome, HwRunResult};
 
-    let label = if result.wedged {
-        "WEDGED (D-state)".to_string()
+    let result = run_native_test(test_exe, xclbin, insts, pattern, DEFAULT_HW_TIMEOUT_SECS);
+
+    let (outcome, label) = if result.wedged {
+        (HwOutcome::Wedged, "WEDGED (D-state)".to_string())
     } else if result.passed {
-        if result.total_checks > 0 {
+        let label = if result.total_checks > 0 {
             format!("PASS ({}/{})", result.correct_checks, result.total_checks)
         } else {
             "PASS".to_string()
-        }
+        };
+        (HwOutcome::Pass, label)
     } else if result.exit_code.is_none() {
-        "TIMEOUT".to_string()
-    } else if is_signal_death(result.exit_code) {
-        // Process killed by signal (segfault, abort, bus error, etc.)
-        let sig = signal_name(result.exit_code.unwrap());
-        format!("SIGNAL ({})", sig)
+        (HwOutcome::Error, "TIMEOUT".to_string())
+    } else if let Some(code) = result.exit_code.filter(|&c| is_signal_death(Some(c))) {
+        (HwOutcome::Error, format!("SIGNAL ({})", signal_name(code)))
     } else if result.total_checks > 0 {
-        format!("FAIL ({}/{})", result.correct_checks, result.total_checks)
+        (HwOutcome::Fail, format!("FAIL ({}/{})", result.correct_checks, result.total_checks))
     } else {
         // No element checks and no PASS -- extract meaningful error
         let meaningful = result.stderr.lines()
             .filter(|l| !l.is_empty() && !l.contains("WARNING"))
             .last()
             .unwrap_or("unknown error");
-        format!("ERROR ({})", &meaningful[..meaningful.len().min(50)])
+        (HwOutcome::Error, format!("ERROR ({})", &meaningful[..meaningful.len().min(50)]))
     };
 
-    let passed = result.passed;
-    let wedged = result.wedged;
     let elapsed = result.elapsed_secs;
 
     if compact {
@@ -469,9 +466,8 @@ pub fn run_native_and_print(
     }
 
     // Don't wait for device idle if wedged -- device is unrecoverable.
-    if !wedged {
-        let is_error = label.starts_with("ERROR") || label.starts_with("TIMEOUT");
-        npu_runner::wait_for_device_idle(is_error);
+    if outcome != HwOutcome::Wedged {
+        npu_runner::wait_for_device_idle(outcome == HwOutcome::Error);
     }
 
     // Native test.cpp binaries do their own validation internally and print
@@ -480,12 +476,11 @@ pub fn run_native_and_print(
     // comparison pipeline (CompilerComparison::classify_full) can't get
     // peano_hw output from the native path; only the npu-runner path
     // (which reads raw bytes from a BO) can provide it.
-    super::runner_stats::HwRunResult {
+    HwRunResult {
+        outcome,
         label,
         output: Vec::new(),
-        passed,
         elapsed_secs: elapsed,
-        wedged,
     }
 }
 

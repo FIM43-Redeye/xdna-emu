@@ -11,6 +11,15 @@
 use std::path::PathBuf;
 use serde::Deserialize;
 
+/// Default emulator cycle limit (1M cycles). Used as the default for both
+/// `execution.max_cycles` and `unit_tests.aiesim_timeout` in runner config.
+pub const DEFAULT_MAX_CYCLES: u64 = 1_000_000;
+
+/// Default timeout for NPU hardware execution (seconds).
+/// 30s is generous for any test; prevents infinite hangs from TDR failures.
+/// Used by both `hw_executor` (npu-runner path) and `native_hw` (test.exe path).
+pub const DEFAULT_HW_TIMEOUT_SECS: u32 = 30;
+
 // ---------------------------------------------------------------------------
 // Run mode
 // ---------------------------------------------------------------------------
@@ -106,7 +115,7 @@ impl Default for RunnerConfig {
 
 impl Default for ExecutionConfig {
     fn default() -> Self {
-        Self { max_cycles: 1_000_000 }
+        Self { max_cycles: DEFAULT_MAX_CYCLES }
     }
 }
 
@@ -138,7 +147,7 @@ impl Default for UnitTestsConfig {
         Self {
             enabled: false,
             aiesim: true,
-            aiesim_timeout: 1_000_000,
+            aiesim_timeout: DEFAULT_MAX_CYCLES,
         }
     }
 }

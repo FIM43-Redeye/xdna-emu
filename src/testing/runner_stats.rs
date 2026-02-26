@@ -9,19 +9,32 @@ use crate::testing::hardware_comparison::{
     Diagnosis, HardwareValidation, CompilerDiagnosis,
 };
 
+/// Structured outcome of a hardware test execution.
+///
+/// Separates semantics (what happened) from display (how to show it).
+/// All branching on test outcome should use this enum, not string parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HwOutcome {
+    /// Test executed and produced correct results.
+    Pass,
+    /// Test executed but produced wrong results.
+    Fail,
+    /// Test execution failed (timeout, crash, unknown error).
+    Error,
+    /// Device entered D-state (survived SIGKILL). Unrecoverable.
+    Wedged,
+}
+
 /// Result from running a single test on real NPU hardware.
 pub struct HwRunResult {
+    /// Structured outcome for branching (pass/fail/error/wedged).
+    pub outcome: HwOutcome,
     /// Display label (e.g. "PASS (64/64)", "FAIL (3/8)", "ERROR (...)").
     pub label: String,
     /// Raw output bytes from the NPU (empty on execution error).
     pub output: Vec<u8>,
-    /// Whether the test passed (label starts with "PASS").
-    pub passed: bool,
     /// Wall-clock time in seconds.
     pub elapsed_secs: f64,
-    /// Process survived SIGKILL -- device is in D-state. Triggers immediate
-    /// cascade cutoff rather than waiting for consecutive error threshold.
-    pub wedged: bool,
 }
 
 /// Accumulated statistics from a test run across all execution modes.
@@ -109,27 +122,21 @@ impl RunStats {
 
     /// Record a hardware execution result, attributed to the correct compiler.
     pub fn record_hw(&mut self, compiler: Compiler, hw: &HwRunResult) {
-        match compiler {
-            Compiler::Peano => {
-                self.peano_hw_attempted += 1;
-                if hw.passed {
-                    self.peano_hw_pass += 1;
-                } else if hw.label.starts_with("FAIL") {
-                    self.peano_hw_fail += 1;
-                } else {
-                    self.peano_hw_error += 1;
-                }
-            }
-            Compiler::Chess => {
-                self.chess_hw_attempted += 1;
-                if hw.passed {
-                    self.chess_hw_pass += 1;
-                } else if hw.label.starts_with("FAIL") {
-                    self.chess_hw_fail += 1;
-                } else {
-                    self.chess_hw_error += 1;
-                }
-            }
+        let (attempted, pass, fail, error) = match compiler {
+            Compiler::Peano => (
+                &mut self.peano_hw_attempted, &mut self.peano_hw_pass,
+                &mut self.peano_hw_fail, &mut self.peano_hw_error,
+            ),
+            Compiler::Chess => (
+                &mut self.chess_hw_attempted, &mut self.chess_hw_pass,
+                &mut self.chess_hw_fail, &mut self.chess_hw_error,
+            ),
+        };
+        *attempted += 1;
+        match hw.outcome {
+            HwOutcome::Pass => *pass += 1,
+            HwOutcome::Fail => *fail += 1,
+            HwOutcome::Error | HwOutcome::Wedged => *error += 1,
         }
     }
 

@@ -300,20 +300,20 @@ impl XclbinTest {
     /// The insts file contains host-to-NPU commands that configure
     /// and trigger shim DMA transfers. Uses the explicit `insts_path` if set
     /// (for multi-xclbin tests), otherwise falls back to looking for
-    /// `insts.bin` in the xclbin's parent directory.
-    pub fn find_insts_bin(&self) -> Option<PathBuf> {
+    /// `insts.bin` or `insts.elf` in the xclbin's parent directory.
+    pub fn find_insts_file(&self) -> Option<PathBuf> {
         // Use explicit path if set (multi-xclbin tests)
         if let Some(ref path) = self.insts_path {
             if path.exists() {
                 return Some(path.clone());
             }
         }
-        // Fallback: look for insts.bin in the same directory as the xclbin
+        // Fallback: look in the same directory as the xclbin
         if let Some(parent) = self.xclbin_path.parent() {
-            let insts_path = parent.join("insts.bin");
-            if insts_path.exists() {
-                return Some(insts_path);
-            }
+            let bin = parent.join("insts.bin");
+            if bin.exists() { return Some(bin); }
+            let elf = parent.join("insts.elf");
+            if elf.exists() { return Some(elf); }
         }
         None
     }
@@ -391,7 +391,7 @@ impl XclbinSuite {
         Self {
             tests: Vec::new(),
             collector: OpcodeCollector::new(),
-            max_cycles: 1_000_000,
+            max_cycles: super::runner_config::DEFAULT_MAX_CYCLES,
             results: Vec::new(),
             reference_dir: None,
             npu_output_dir: None,
@@ -777,7 +777,7 @@ impl XclbinSuite {
         // sync conditions can be checked as a completion signal.
         let mut npu_executor: Option<NpuExecutor> = None;
 
-        if let Some(insts_path) = test.find_insts_bin() {
+        if let Some(insts_path) = test.find_insts_file() {
             let insts_data = match std::fs::read(&insts_path) {
                 Ok(d) => d,
                 Err(e) => {

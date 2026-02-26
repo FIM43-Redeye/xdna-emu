@@ -248,7 +248,7 @@ pub fn run_aiesim_comparison(
 
     // Run simulation with generous timeout (aiesimulator is slow)
     let sim_result = match aiesimulator::run_simulation(
-        tools, prj_dir, &input_data, 1_000_000,
+        tools, prj_dir, &input_data, super::runner_config::DEFAULT_MAX_CYCLES,
     ) {
         Ok(r) => r,
         Err(e) => return format!("ERROR: {}", e),

@@ -685,7 +685,7 @@ fn run_aiesim_trace(
         tools,
         prj_dir,
         &[],         // No input data (test.cpp handles IO via ps.so)
-        1_000_000,   // 1M cycle timeout
+        super::runner_config::DEFAULT_MAX_CYCLES,
     )?;
 
     if sim_result.exit_code != 0 {
