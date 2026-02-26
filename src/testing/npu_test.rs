@@ -59,6 +59,10 @@ pub struct NpuTestSource {
     pub test_cpp_path: Option<PathBuf>,
     /// Which argument pattern the test.cpp uses (cxxopts vs #define).
     pub test_cpp_pattern: Option<TestCppPattern>,
+    /// Artifact names parsed from RUN lines (xclbin, insts, test binary).
+    /// Used by discovery and the build system to know exactly what files
+    /// a test produces, instead of guessing with hardcoded fallback lists.
+    pub artifact_names: ArtifactNames,
 }
 
 impl NpuTestSource {
@@ -161,6 +165,7 @@ fn discover_recursive(base: &Path, dir: &Path, tests: &mut Vec<NpuTestSource>) {
         };
 
         let build_steps = filter_build_steps(&annotations.run_lines);
+        let artifact_names = parse_artifact_names(&annotations.run_lines);
 
         // Parse buffer metadata from test.cpp if present
         let buffer_spec = super::test_cpp_parser::parse_test_cpp(dir);
@@ -184,6 +189,7 @@ fn discover_recursive(base: &Path, dir: &Path, tests: &mut Vec<NpuTestSource>) {
             expected_fail_reason: None,
             test_cpp_path,
             test_cpp_pattern,
+            artifact_names,
         });
         // Leaf directory -- do not recurse further
         return;
@@ -370,6 +376,76 @@ pub fn filter_build_steps(run_lines: &[String]) -> Vec<String> {
     }
 
     steps
+}
+
+/// Artifact names extracted from a test's RUN lines.
+///
+/// Parsed from `--xclbin-name=`, `--npu-insts-name=`, `--elf-name=`, and
+/// `-o <binary>` patterns in the raw RUN lines. These tell the build system
+/// and discovery exactly what files a test produces and consumes, rather than
+/// guessing with hardcoded fallback lists.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArtifactNames {
+    /// XCLBIN filenames produced by aiecc.py (e.g., "aie.xclbin", "final.xclbin").
+    pub xclbin_names: Vec<String>,
+    /// Instruction filenames produced by aiecc.py (e.g., "insts.bin", "insts.elf").
+    pub insts_names: Vec<String>,
+    /// Host test binary name from clang/g++ `-o` flag (e.g., "test.exe", "test").
+    /// None if the test uses a Python script instead of compiled binary.
+    pub test_exe_name: Option<String>,
+}
+
+/// Parse artifact names from raw RUN lines.
+///
+/// Extracts filenames from aiecc.py flags (`--xclbin-name=`, `--npu-insts-name=`,
+/// `--elf-name=`) and host compiler `-o` flags. This is the single source of
+/// truth for what files a test produces, replacing hardcoded name guessing in
+/// discovery code.
+pub fn parse_artifact_names(run_lines: &[String]) -> ArtifactNames {
+    let mut names = ArtifactNames::default();
+
+    for line in run_lines {
+        let trimmed = line.trim();
+
+        // Parse aiecc.py lines for xclbin and insts names
+        if trimmed.contains("aiecc.py") {
+            for part in trimmed.split_whitespace() {
+                if let Some(name) = part.strip_prefix("--xclbin-name=") {
+                    if !names.xclbin_names.contains(&name.to_string()) {
+                        names.xclbin_names.push(name.to_string());
+                    }
+                }
+                if let Some(name) = part.strip_prefix("--npu-insts-name=") {
+                    if !names.insts_names.contains(&name.to_string()) {
+                        names.insts_names.push(name.to_string());
+                    }
+                }
+                if let Some(name) = part.strip_prefix("--elf-name=") {
+                    if !names.insts_names.contains(&name.to_string()) {
+                        names.insts_names.push(name.to_string());
+                    }
+                }
+            }
+        }
+
+        // Parse host compiler lines for binary name: clang/g++/gcc -o <name>
+        let is_host_compile = trimmed.starts_with("clang ")
+            || trimmed.starts_with("clang++ ")
+            || trimmed.starts_with("g++ ")
+            || starts_with_gcc_variant(trimmed)
+            || trimmed.starts_with("gcc ");
+        if is_host_compile {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            for i in 0..parts.len().saturating_sub(1) {
+                if parts[i] == "-o" {
+                    names.test_exe_name = Some(parts[i + 1].to_string());
+                    break;
+                }
+            }
+        }
+    }
+
+    names
 }
 
 /// Test overrides loaded from `tests/test_overrides.toml`.
@@ -599,6 +675,35 @@ mod tests {
     }
 
     #[test]
+    fn test_filter_build_steps_elf_instructions() {
+        // add_one_objFifo_elf uses --aie-generate-elf instead of
+        // --aie-generate-npu-insts. The build step must preserve these
+        // flags so the build produces insts.elf, not insts.bin.
+        let run_lines = vec![
+            "cp %S/aie.mlir aie_arch.mlir".to_string(),
+            "%run_on_npu1% sed 's/NPUDEVICE/npu1_1col/g' -i aie_arch.mlir".to_string(),
+            "%run_on_npu2% sed 's/NPUDEVICE/npu2_1col/g' -i aie_arch.mlir".to_string(),
+            "%python aiecc.py --aie-generate-xclbin --xclbin-name=aie.xclbin --aie-generate-elf --elf-name=insts.elf --no-compile-host ./aie_arch.mlir".to_string(),
+            "clang %S/test.cpp -o test.exe -std=c++17 -Wall %xrt_flags -lrt -lstdc++ %test_utils_flags".to_string(),
+            "%run_on_npu1% ./test.exe -x aie.xclbin -k MLIR_AIE -i insts.elf".to_string(),
+            "%run_on_npu2% ./test.exe -x aie.xclbin -k MLIR_AIE -i insts.elf".to_string(),
+            "%run_on_npu1% %python %S/test.py -x aie.xclbin -k MLIR_AIE -i insts.elf".to_string(),
+            "%run_on_npu2% %python %S/test.py -x aie.xclbin -k MLIR_AIE -i insts.elf".to_string(),
+        ];
+
+        let steps = filter_build_steps(&run_lines);
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0], "cp %S/aie.mlir aie_arch.mlir");
+        assert!(steps[1].contains("sed") && steps[1].contains("npu1_1col"));
+        // aiecc.py line must preserve --aie-generate-elf and --elf-name
+        let aiecc = &steps[2];
+        assert!(aiecc.contains("aiecc.py"));
+        assert!(aiecc.contains("--aie-generate-elf"));
+        assert!(aiecc.contains("--elf-name=insts.elf"));
+        assert!(!aiecc.contains("--aie-generate-npu-insts"));
+    }
+
+    #[test]
     fn test_requires_chess() {
         let test = NpuTestSource {
             name: "test".to_string(),
@@ -612,6 +717,7 @@ mod tests {
             expected_fail_reason: None,
             test_cpp_path: None,
             test_cpp_pattern: None,
+            artifact_names: ArtifactNames::default(),
         };
         assert!(test.requires_chess());
         assert!(!test.requires_npu2());
@@ -631,6 +737,7 @@ mod tests {
             expected_fail_reason: None,
             test_cpp_path: None,
             test_cpp_pattern: None,
+            artifact_names: ArtifactNames::default(),
         };
         assert!(test.requires_npu2());
         assert!(!test.requires_chess());
@@ -650,6 +757,7 @@ mod tests {
             expected_fail_reason: None,
             test_cpp_path: None,
             test_cpp_pattern: None,
+            artifact_names: ArtifactNames::default(),
         };
         assert!(test.requires_chess());
     }
@@ -668,6 +776,7 @@ mod tests {
             expected_fail_reason: None,
             test_cpp_path: None,
             test_cpp_pattern: None,
+            artifact_names: ArtifactNames::default(),
         };
         assert!(test.is_suppressed());
     }
@@ -878,6 +987,58 @@ mod tests {
     }
 
     #[test]
+    fn test_discover_populates_artifact_names() {
+        let dir = test_dir("discover_artifacts");
+        let test_root = dir.join("test/npu-xrt/add_one_using_dma");
+        std::fs::create_dir_all(&test_root).unwrap();
+
+        std::fs::write(
+            test_root.join("run.lit"),
+            "// REQUIRES: ryzen_ai\n\
+             //\n\
+             // RUN: cp %S/aie.mlir aie_arch.mlir\n\
+             // RUN: %run_on_npu1% sed 's/NPUDEVICE/npu1_1col/g' -i aie_arch.mlir\n\
+             // RUN: %python aiecc.py --no-aiesim --aie-generate-xclbin --xclbin-name=aie.xclbin --npu-insts-name=insts.bin ./aie_arch.mlir\n\
+             // RUN: clang %S/test.cpp -o test.exe -std=c++17 -Wall %xrt_flags\n\
+             // RUN: %run_on_npu1% ./test.exe -x aie.xclbin -k MLIR_AIE -i insts.bin\n",
+        ).unwrap();
+        std::fs::write(test_root.join("aie.mlir"), "module {}").unwrap();
+        std::fs::write(test_root.join("test.cpp"), "int main() {}").unwrap();
+
+        let tests = discover(&dir);
+        assert_eq!(tests.len(), 1);
+        // Artifact names should be populated from RUN lines
+        assert_eq!(tests[0].artifact_names.xclbin_names, vec!["aie.xclbin"]);
+        assert_eq!(tests[0].artifact_names.insts_names, vec!["insts.bin"]);
+        assert_eq!(tests[0].artifact_names.test_exe_name, Some("test.exe".to_string()));
+    }
+
+    #[test]
+    fn test_discover_populates_elf_artifacts() {
+        let dir = test_dir("discover_elf_artifacts");
+        let test_root = dir.join("test/npu-xrt/add_one_objFifo_elf");
+        std::fs::create_dir_all(&test_root).unwrap();
+
+        std::fs::write(
+            test_root.join("run.lit"),
+            "// REQUIRES: ryzen_ai\n\
+             //\n\
+             // RUN: cp %S/aie.mlir aie_arch.mlir\n\
+             // RUN: %python aiecc.py --aie-generate-xclbin --xclbin-name=aie.xclbin --aie-generate-elf --elf-name=insts.elf --no-compile-host ./aie_arch.mlir\n\
+             // RUN: clang %S/test.cpp -o test.exe -std=c++17\n\
+             // RUN: %run_on_npu1% ./test.exe -x aie.xclbin -k MLIR_AIE -i insts.elf\n",
+        ).unwrap();
+        std::fs::write(test_root.join("aie.mlir"), "module {}").unwrap();
+        std::fs::write(test_root.join("test.cpp"), "int main() {}").unwrap();
+
+        let tests = discover(&dir);
+        assert_eq!(tests.len(), 1);
+        assert_eq!(tests[0].artifact_names.xclbin_names, vec!["aie.xclbin"]);
+        assert_eq!(tests[0].artifact_names.insts_names, vec!["insts.elf"]);
+        assert_eq!(tests[0].artifact_names.test_exe_name, Some("test.exe".to_string()));
+    }
+
+    #[test]
     fn test_load_overrides_applies_skip_and_expected_fail() {
         let dir = test_dir("load_overrides");
         let overrides_path = dir.join("test_overrides.toml");
@@ -902,6 +1063,7 @@ flaky_test = "Known emulator limitation"
                 expected_fail_reason: None,
                 test_cpp_path: None,
                 test_cpp_pattern: None,
+                artifact_names: ArtifactNames::default(),
             },
             NpuTestSource {
                 name: "flaky_test".to_string(),
@@ -915,6 +1077,7 @@ flaky_test = "Known emulator limitation"
                 expected_fail_reason: None,
                 test_cpp_path: None,
                 test_cpp_pattern: None,
+                artifact_names: ArtifactNames::default(),
             },
             NpuTestSource {
                 name: "normal_test".to_string(),
@@ -928,6 +1091,7 @@ flaky_test = "Known emulator limitation"
                 expected_fail_reason: None,
                 test_cpp_path: None,
                 test_cpp_pattern: None,
+                artifact_names: ArtifactNames::default(),
             },
         ];
 
@@ -960,6 +1124,7 @@ flaky_test = "Known emulator limitation"
             expected_fail_reason: None,
             test_cpp_path: None,
             test_cpp_pattern: None,
+            artifact_names: ArtifactNames::default(),
         }];
 
         load_overrides(&mut tests, &overrides_path);
@@ -988,9 +1153,145 @@ flaky_test = "Known emulator limitation"
             expected_fail_reason: None,
             test_cpp_path: None,
             test_cpp_pattern: None,
+            artifact_names: ArtifactNames::default(),
         }];
 
         load_overrides(&mut tests, &overrides_path);
         assert_eq!(tests[0].skip_reason.as_deref(), Some("Requires NPU2"));
+    }
+
+    // ---------------------------------------------------------------
+    // parse_artifact_names tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_artifact_names_typical_run_lit() {
+        // Standard pattern: aie.xclbin, insts.bin, test.exe
+        let run_lines = vec![
+            "cp %S/aie.mlir aie_arch.mlir".to_string(),
+            "%run_on_npu1% sed 's/NPUDEVICE/npu1_1col/g' -i aie_arch.mlir".to_string(),
+            "%python aiecc.py --no-aiesim --aie-generate-xclbin --xclbin-name=aie.xclbin --npu-insts-name=insts.bin ./aie_arch.mlir".to_string(),
+            "clang %S/test.cpp -o test.exe -std=c++17 -Wall %xrt_flags".to_string(),
+            "%run_on_npu1% ./test.exe -x aie.xclbin -k MLIR_AIE -i insts.bin".to_string(),
+        ];
+
+        let artifacts = parse_artifact_names(&run_lines);
+        assert_eq!(artifacts.xclbin_names, vec!["aie.xclbin"]);
+        assert_eq!(artifacts.insts_names, vec!["insts.bin"]);
+        assert_eq!(artifacts.test_exe_name, Some("test.exe".to_string()));
+    }
+
+    #[test]
+    fn test_artifact_names_elf_instructions() {
+        // add_one_objFifo_elf: uses --aie-generate-elf, insts.elf
+        let run_lines = vec![
+            "cp %S/aie.mlir aie_arch.mlir".to_string(),
+            "%python aiecc.py --aie-generate-xclbin --xclbin-name=aie.xclbin --aie-generate-elf --elf-name=insts.elf --no-compile-host ./aie_arch.mlir".to_string(),
+            "clang %S/test.cpp -o test.exe -std=c++17 -Wall %xrt_flags -lrt -lstdc++ %test_utils_flags".to_string(),
+            "%run_on_npu1% ./test.exe -x aie.xclbin -k MLIR_AIE -i insts.elf".to_string(),
+        ];
+
+        let artifacts = parse_artifact_names(&run_lines);
+        assert_eq!(artifacts.xclbin_names, vec!["aie.xclbin"]);
+        assert_eq!(artifacts.insts_names, vec!["insts.elf"]);
+        assert_eq!(artifacts.test_exe_name, Some("test.exe".to_string()));
+    }
+
+    #[test]
+    fn test_artifact_names_final_xclbin() {
+        // aie2.py tests typically use final.xclbin
+        let run_lines = vec![
+            "%python %S/aie2.py > ./aie2.mlir".to_string(),
+            "%python aiecc.py --no-aiesim --xclbin-name=final.xclbin --npu-insts-name=insts.bin ./aie2.mlir".to_string(),
+            "clang %S/test.cpp -o test.exe -std=c++17".to_string(),
+            "%run_on_npu1% ./test.exe -x final.xclbin -k MLIR_AIE -i insts.bin".to_string(),
+        ];
+
+        let artifacts = parse_artifact_names(&run_lines);
+        assert_eq!(artifacts.xclbin_names, vec!["final.xclbin"]);
+        assert_eq!(artifacts.insts_names, vec!["insts.bin"]);
+    }
+
+    #[test]
+    fn test_artifact_names_multi_kernel() {
+        // matrix_multiplication_using_cascade: 3 xclbins, 3 insts files
+        let run_lines = vec![
+            "xchesscc_wrapper aie2 -I %aietools/include -c %S/mm.cc -o ./mm.o".to_string(),
+            "%python aiecc.py --xclbin-name=aie2_buffer.xclbin --npu-insts-name=insts2_buffer.txt %S/aie_plainx1.mlir".to_string(),
+            "%python aiecc.py --xclbin-name=aie2_cascade.xclbin --npu-insts-name=insts2_cascade.txt %S/aie_cascadex4.mlir".to_string(),
+            "%python aiecc.py --xclbin-name=aie2_plain.xclbin --npu-insts-name=insts2_plain.txt %S/aie_plainx4.mlir".to_string(),
+            "g++-13 %S/test.cpp -o test.exe -std=c++23 -Wall %xrt_flags".to_string(),
+            "%run_on_npu1% ./test.exe -x aie2_buffer.xclbin -k MLIR_AIE -i insts2_buffer.txt".to_string(),
+        ];
+
+        let artifacts = parse_artifact_names(&run_lines);
+        assert_eq!(artifacts.xclbin_names.len(), 3);
+        assert!(artifacts.xclbin_names.contains(&"aie2_buffer.xclbin".to_string()));
+        assert!(artifacts.xclbin_names.contains(&"aie2_cascade.xclbin".to_string()));
+        assert!(artifacts.xclbin_names.contains(&"aie2_plain.xclbin".to_string()));
+        assert_eq!(artifacts.insts_names.len(), 3);
+        assert!(artifacts.insts_names.contains(&"insts2_buffer.txt".to_string()));
+        assert_eq!(artifacts.test_exe_name, Some("test.exe".to_string()));
+    }
+
+    #[test]
+    fn test_artifact_names_test_binary_no_extension() {
+        // dma_task_large_linear: binary named "test" not "test.exe"
+        let run_lines = vec![
+            "%python aiecc.py --xclbin-name=final.xclbin --npu-insts-name=insts.bin %S/aie.mlir".to_string(),
+            "clang %S/test.cpp -o test -std=c++17 -Wall %xrt_flags".to_string(),
+            "%run_on_npu1% ./test -x final.xclbin -k MLIR_AIE -i insts.bin".to_string(),
+        ];
+
+        let artifacts = parse_artifact_names(&run_lines);
+        assert_eq!(artifacts.test_exe_name, Some("test".to_string()));
+        assert_eq!(artifacts.xclbin_names, vec!["final.xclbin"]);
+    }
+
+    #[test]
+    fn test_artifact_names_python_test() {
+        // Some tests use test.py instead of compiled binary
+        let run_lines = vec![
+            "%python aiecc.py --xclbin-name=aie.xclbin --npu-insts-name=insts.bin %S/aie.mlir".to_string(),
+            "%run_on_npu1% %python %S/test.py -x aie.xclbin -i insts.bin".to_string(),
+        ];
+
+        let artifacts = parse_artifact_names(&run_lines);
+        // Python tests don't produce a compiled binary
+        assert_eq!(artifacts.test_exe_name, None);
+        assert_eq!(artifacts.xclbin_names, vec!["aie.xclbin"]);
+    }
+
+    #[test]
+    fn test_artifact_names_no_explicit_names() {
+        // Minimal aiecc.py invocation without --xclbin-name or --npu-insts-name
+        let run_lines = vec![
+            "%python aiecc.py --no-aiesim %S/aie.mlir".to_string(),
+            "clang %S/test.cpp -o test.exe".to_string(),
+            "%run_on_npu1% ./test.exe".to_string(),
+        ];
+
+        let artifacts = parse_artifact_names(&run_lines);
+        // No explicit names found
+        assert!(artifacts.xclbin_names.is_empty());
+        assert!(artifacts.insts_names.is_empty());
+        assert_eq!(artifacts.test_exe_name, Some("test.exe".to_string()));
+    }
+
+    #[test]
+    fn test_artifact_names_multi_instr_flags() {
+        // multi_kernel tests use --instr0 and --instr1 in execution
+        let run_lines = vec![
+            "%python aiecc.py --xclbin-name=add_one.xclbin --npu-insts-name=add_one_insts.bin %S/aie_add_one.mlir".to_string(),
+            "%python aiecc.py --xclbin-name=add_two.xclbin --npu-insts-name=add_two_insts.bin %S/aie_add_two.mlir".to_string(),
+            "clang %S/test.cpp -o test.exe".to_string(),
+            "%run_on_npu1% ./test.exe --instr0 add_one_insts.bin --instr1 add_two_insts.bin".to_string(),
+        ];
+
+        let artifacts = parse_artifact_names(&run_lines);
+        assert_eq!(artifacts.xclbin_names.len(), 2);
+        assert!(artifacts.xclbin_names.contains(&"add_one.xclbin".to_string()));
+        assert!(artifacts.xclbin_names.contains(&"add_two.xclbin".to_string()));
+        assert_eq!(artifacts.insts_names.len(), 2);
     }
 }

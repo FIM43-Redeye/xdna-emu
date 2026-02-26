@@ -204,6 +204,28 @@ impl XclbinTest {
             None
         });
 
+        // Check for companion files in the same directory as the xclbin.
+        // These are present in pre-built mlir-aie build trees and allow
+        // --no-build discovery to find everything needed for HW execution.
+        // Some lit tests produce "test.exe", others just "test" (Linux ELF).
+        let test_exe = parent.and_then(|p| {
+            let exe = p.join("test.exe");
+            if exe.exists() { return Some(exe); }
+            let test = p.join("test");
+            if test.exists() && test.is_file() { return Some(test); }
+            None
+        });
+        // Instruction file: most tests use insts.bin (raw NPU instructions),
+        // but add_one_objFifo_elf uses insts.elf (ELF-wrapped instructions
+        // loaded via xrt::elf experimental API).
+        let insts_path = parent.and_then(|p| {
+            let bin = p.join("insts.bin");
+            if bin.exists() { return Some(bin); }
+            let elf = p.join("insts.elf");
+            if elf.exists() { return Some(elf); }
+            None
+        });
+
         Self {
             name,
             xclbin_path: path.to_path_buf(),
@@ -212,9 +234,9 @@ impl XclbinTest {
             buffer_spec: None,
             skip_reason: None,
             expected_fail_reason: None,
-            insts_path: None,
+            insts_path,
             compiler: None,
-            test_exe: None,
+            test_exe,
             test_cpp_pattern: None,
             source_dir: None,
         }
@@ -491,6 +513,11 @@ impl XclbinSuite {
     /// Get the tests as a slice.
     pub fn tests(&self) -> &[XclbinTest] {
         &self.tests
+    }
+
+    /// Get the tests as a mutable slice (for enriching after discovery).
+    pub fn tests_mut(&mut self) -> &mut [XclbinTest] {
+        &mut self.tests
     }
 
     /// Get the collected opcodes.

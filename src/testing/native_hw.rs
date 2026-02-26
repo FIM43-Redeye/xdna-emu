@@ -36,6 +36,37 @@ use std::time::Instant;
 use super::npu_runner;
 use super::process_control::{self, ProcessOutcome};
 
+/// Check if an exit code indicates death by signal (negative on Unix).
+fn is_signal_death(exit_code: Option<i32>) -> bool {
+    // On Unix, processes killed by signal have exit code = 128 + signum
+    // from wait(), but Rust's ExitStatus::code() returns None for signal
+    // death and the raw signal is in .signal(). Our process_control uses
+    // wait4 and returns raw exit codes, where signal death shows as
+    // negative or > 128.
+    match exit_code {
+        Some(c) if c < 0 => true,       // negative = -(signal)
+        Some(c) if c > 128 => true,     // 128 + signal (shell convention)
+        _ => false,
+    }
+}
+
+/// Get a human-readable signal name from an exit code.
+fn signal_name(exit_code: i32) -> &'static str {
+    let signum = if exit_code < 0 { -exit_code } else { exit_code - 128 };
+    match signum {
+        4 => "SIGILL",
+        6 => "SIGABRT",
+        7 => "SIGBUS",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        11 => "SIGSEGV",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        _ => "SIG?",
+    }
+}
+
 /// Result of running a native test.exe on hardware.
 pub struct NativeTestResult {
     /// Whether "PASS!" was found in stdout.
@@ -106,6 +137,24 @@ fn classify_pattern(content: &str) -> TestCppPattern {
     TestCppPattern::Cxxopts
 }
 
+/// Build preprocessor `-D` flags for `#define`-pattern test.cpp files.
+///
+/// Uses the provided artifact names (falling back to standard defaults).
+/// These defines override the test.cpp's own `#ifndef XCLBIN` / `#define XCLBIN`
+/// defaults so the binary finds the correct files at runtime.
+fn preprocessor_defines(
+    xclbin_name: Option<&str>,
+    insts_name: Option<&str>,
+) -> Vec<String> {
+    let xclbin = xclbin_name.unwrap_or("aie.xclbin");
+    let insts = insts_name.unwrap_or("insts.bin");
+    vec![
+        format!("-DXCLBIN=\"{}\"", xclbin),
+        format!("-DINSTS_TXT=\"{}\"", insts),
+        "-DKERNEL_NAME=\"MLIR_AIE\"".to_string(),
+    ]
+}
+
 /// Compile a test.cpp into a test executable.
 ///
 /// Uses the system g++ with XRT and test_utils headers/libraries.
@@ -121,6 +170,21 @@ pub fn compile_test_exe(
     test_cpp: &Path,
     output_dir: &Path,
     mlir_aie_path: &Path,
+) -> Result<PathBuf, String> {
+    compile_test_exe_with_artifacts(test_cpp, output_dir, mlir_aie_path, None, None)
+}
+
+/// Compile a test.cpp with explicit artifact names for preprocessor defines.
+///
+/// When `xclbin_name` or `insts_name` are provided, they override the
+/// default `-DXCLBIN="aie.xclbin"` / `-DINSTS_TXT="insts.bin"` defines.
+/// This ensures `#define`-pattern tests find the correct files at runtime.
+pub fn compile_test_exe_with_artifacts(
+    test_cpp: &Path,
+    output_dir: &Path,
+    mlir_aie_path: &Path,
+    xclbin_name: Option<&str>,
+    insts_name: Option<&str>,
 ) -> Result<PathBuf, String> {
     let test_exe = output_dir.join("test.exe");
 
@@ -171,12 +235,13 @@ pub fn compile_test_exe(
         .arg(format!("-I{}", xrt_include.display()))
         .arg(format!("-L{}", xrt_lib.display()))
         .arg("-lxrt_coreutil")
-        .arg("-luuid")
-        // Preprocessor defines for #define-pattern tests.
-        // Harmless for cxxopts tests (macros are guarded by #ifndef).
-        .arg("-DXCLBIN=\"aie.xclbin\"")
-        .arg("-DINSTS_TXT=\"insts.bin\"")
-        .arg("-DKERNEL_NAME=\"MLIR_AIE\"");
+        .arg("-luuid");
+
+    // Preprocessor defines for #define-pattern tests.
+    // Harmless for cxxopts tests (macros are guarded by #ifndef).
+    for define in preprocessor_defines(xclbin_name, insts_name) {
+        cmd.arg(define);
+    }
 
     // Also add the test_lib static library path in case test_utils.cpp
     // references symbols from test_library.cpp.
@@ -219,24 +284,36 @@ pub fn run_native_test(
 ) -> NativeTestResult {
     let start = Instant::now();
 
-    let mut cmd = Command::new(test_exe);
+    // Canonicalize paths: test_exe and xclbin may be relative to the
+    // original CWD. We need absolute paths because current_dir changes
+    // the working directory for the child process.
+    let abs_exe = std::fs::canonicalize(test_exe).unwrap_or_else(|_| test_exe.to_path_buf());
+    let abs_xclbin = std::fs::canonicalize(xclbin).unwrap_or_else(|_| xclbin.to_path_buf());
+    let abs_insts = std::fs::canonicalize(insts).unwrap_or_else(|_| insts.to_path_buf());
+
+    let mut cmd = Command::new(&abs_exe);
 
     // Sanitize LD_LIBRARY_PATH: strip aietools paths that shadow system libstdc++
     cmd.env("LD_LIBRARY_PATH", sanitized_ld_library_path());
 
+    // Always run from the xclbin's directory. Some tests use hardcoded
+    // relative paths (e.g., load_instr_binary("insts.bin")), so they must
+    // run from the build directory. Cxxopts tests with absolute path args
+    // are unaffected by the working directory.
+    if let Some(parent) = abs_xclbin.parent() {
+        cmd.current_dir(parent);
+    }
+
     match pattern {
         TestCppPattern::Cxxopts => {
             // Pass paths via CLI args (test_utils::add_default_options format)
-            cmd.arg("-x").arg(xclbin)
-                .arg("-i").arg(insts)
+            cmd.arg("-x").arg(&abs_xclbin)
+                .arg("-i").arg(&abs_insts)
                 .arg("-k").arg("MLIR_AIE");
         }
         TestCppPattern::Define => {
             // #define pattern: paths are baked in at compile time.
-            // Run from the xclbin directory so relative paths resolve.
-            if let Some(parent) = xclbin.parent() {
-                cmd.current_dir(parent);
-            }
+            // No CLI args needed -- paths resolved via current_dir above.
         }
     }
 
@@ -363,6 +440,10 @@ pub fn run_native_and_print(
         }
     } else if result.exit_code.is_none() {
         "TIMEOUT".to_string()
+    } else if is_signal_death(result.exit_code) {
+        // Process killed by signal (segfault, abort, bus error, etc.)
+        let sig = signal_name(result.exit_code.unwrap());
+        format!("SIGNAL ({})", sig)
     } else if result.total_checks > 0 {
         format!("FAIL ({}/{})", result.correct_checks, result.total_checks)
     } else {
@@ -509,6 +590,35 @@ FAIL!
         assert!(!passed);
         assert_eq!(total, 2);
         assert_eq!(correct, 0);
+    }
+
+    #[test]
+    fn test_preprocessor_defines_default() {
+        let defines = preprocessor_defines(None, None);
+        assert!(defines.contains(&"-DXCLBIN=\"aie.xclbin\"".to_string()));
+        assert!(defines.contains(&"-DINSTS_TXT=\"insts.bin\"".to_string()));
+        assert!(defines.contains(&"-DKERNEL_NAME=\"MLIR_AIE\"".to_string()));
+    }
+
+    #[test]
+    fn test_preprocessor_defines_custom_xclbin() {
+        let defines = preprocessor_defines(Some("final.xclbin"), None);
+        assert!(defines.contains(&"-DXCLBIN=\"final.xclbin\"".to_string()));
+        assert!(defines.contains(&"-DINSTS_TXT=\"insts.bin\"".to_string()));
+    }
+
+    #[test]
+    fn test_preprocessor_defines_custom_insts() {
+        let defines = preprocessor_defines(None, Some("insts.elf"));
+        assert!(defines.contains(&"-DXCLBIN=\"aie.xclbin\"".to_string()));
+        assert!(defines.contains(&"-DINSTS_TXT=\"insts.elf\"".to_string()));
+    }
+
+    #[test]
+    fn test_preprocessor_defines_both_custom() {
+        let defines = preprocessor_defines(Some("aie2_plain.xclbin"), Some("insts2_plain.txt"));
+        assert!(defines.contains(&"-DXCLBIN=\"aie2_plain.xclbin\"".to_string()));
+        assert!(defines.contains(&"-DINSTS_TXT=\"insts2_plain.txt\"".to_string()));
     }
 
     #[test]

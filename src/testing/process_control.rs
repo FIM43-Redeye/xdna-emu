@@ -21,8 +21,28 @@
 
 use std::io::Read;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+
+/// Extract exit code from ExitStatus, preserving signal information.
+///
+/// Normal exit: returns the exit code (0-255).
+/// Signal death: returns -(signal number), e.g. -11 for SIGSEGV, -6 for SIGABRT.
+/// This lets callers distinguish between a normal error exit and a crash.
+fn exit_code_from_status(status: &ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    // On Unix, signal() gives the signal that killed the process.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return -sig;
+        }
+    }
+    -1 // shouldn't happen, but safe fallback
+}
 
 /// Outcome of a managed child process execution.
 pub enum ProcessOutcome {
@@ -100,6 +120,10 @@ pub fn spawn_with_timeout(cmd: &mut Command, timeout_secs: u32) -> ProcessOutcom
 
 /// Wait for an already-spawned child process with a timeout.
 ///
+/// Stdout and stderr are drained in background threads to prevent pipe
+/// buffer deadlocks (the OS pipe buffer is ~64KB; a chatty child will
+/// block on write() if nobody is reading).
+///
 /// Polls `try_wait()` every 100ms. On timeout:
 /// 1. Sends `SIGKILL` via `killpg()` (kills entire process group).
 /// 2. Waits 500ms for the process to die.
@@ -111,21 +135,50 @@ pub fn wait_with_timeout(mut child: Child, timeout_secs: u32) -> ProcessOutcome 
     let timeout = Duration::from_secs(timeout_secs as u64);
     let start = Instant::now();
 
+    // Take pipe handles immediately and drain in background threads.
+    // This prevents deadlock when a child produces >64KB of output.
+    let stdout_thread = child.stdout.take().map(|pipe| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let mut reader = std::io::BufReader::new(pipe);
+            let _ = reader.read_to_string(&mut buf);
+            buf
+        })
+    });
+    let stderr_thread = child.stderr.take().map(|pipe| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let mut reader = std::io::BufReader::new(pipe);
+            let _ = reader.read_to_string(&mut buf);
+            buf
+        })
+    });
+
+    let join_threads = || {
+        let stdout = stdout_thread
+            .and_then(|t| t.join().ok())
+            .unwrap_or_default();
+        let stderr = stderr_thread
+            .and_then(|t| t.join().ok())
+            .unwrap_or_default();
+        (stdout, stderr)
+    };
+
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 // Process finished normally.
-                let (stdout, stderr) = drain_pipes(&mut child);
+                let (stdout, stderr) = join_threads();
                 return ProcessOutcome::Completed {
                     stdout,
                     stderr,
-                    exit_code: status.code().unwrap_or(-1),
+                    exit_code: exit_code_from_status(&status),
                 };
             }
             Ok(None) => {
                 // Still running -- check timeout.
                 if start.elapsed() >= timeout {
-                    return kill_and_assess(&mut child);
+                    return kill_and_assess(&mut child, join_threads);
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
@@ -139,7 +192,12 @@ pub fn wait_with_timeout(mut child: Child, timeout_secs: u32) -> ProcessOutcome 
 }
 
 /// Kill the child's process group and determine if it survived (D-state).
-fn kill_and_assess(child: &mut Child) -> ProcessOutcome {
+///
+/// `join_threads` collects output from the background drain threads.
+fn kill_and_assess<F>(child: &mut Child, join_threads: F) -> ProcessOutcome
+where
+    F: FnOnce() -> (String, String),
+{
     let pid = child.id();
 
     // Kill the entire process group (child is session leader from setsid).
@@ -154,17 +212,18 @@ fn kill_and_assess(child: &mut Child) -> ProcessOutcome {
     // Give the kernel time to deliver the signal and reap.
     std::thread::sleep(REAP_GRACE);
 
+    // Killing the child closes its pipe ends, unblocking the drain threads.
+    let (stdout, stderr) = join_threads();
+
     // Check if the process actually died.
     match child.try_wait() {
         Ok(Some(_)) => {
             // Dead. Normal timeout.
-            let (stdout, stderr) = drain_pipes(child);
             ProcessOutcome::Timeout { stdout, stderr }
         }
         Ok(None) => {
             // Still alive after SIGKILL + 500ms. This is D-state.
             let state = check_proc_state(pid);
-            let (stdout, stderr) = drain_pipes(child);
             log::error!(
                 "Process {} survived SIGKILL (state: {}). Device is wedged.",
                 pid, state
@@ -173,7 +232,6 @@ fn kill_and_assess(child: &mut Child) -> ProcessOutcome {
         }
         Err(_) => {
             // Error querying -- treat as normal timeout (conservative).
-            let (stdout, stderr) = drain_pipes(child);
             ProcessOutcome::Timeout { stdout, stderr }
         }
     }
@@ -198,29 +256,6 @@ fn check_proc_state(pid: u32) -> String {
     }
 }
 
-/// Drain stdout and stderr pipes from a child process.
-///
-/// Must be called after the child has exited or been killed, otherwise
-/// reading may block if the child is still producing output.
-fn drain_pipes(child: &mut Child) -> (String, String) {
-    let stdout = child.stdout.take()
-        .map(|mut s| {
-            let mut buf = String::new();
-            let _ = s.read_to_string(&mut buf);
-            buf
-        })
-        .unwrap_or_default();
-
-    let stderr = child.stderr.take()
-        .map(|mut s| {
-            let mut buf = String::new();
-            let _ = s.read_to_string(&mut buf);
-            buf
-        })
-        .unwrap_or_default();
-
-    (stdout, stderr)
-}
 
 #[cfg(test)]
 mod tests {

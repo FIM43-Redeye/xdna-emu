@@ -35,19 +35,26 @@ use crate::build_progress::{self, ParallelBuildConfig};
 type ChessBuildArtifacts = build_progress::ChessArtifacts;
 
 // ---------------------------------------------------------------------------
-// Hardware cascade detection
+// Hardware recovery and wedge detection
 // ---------------------------------------------------------------------------
 
-/// Maximum consecutive HW errors before disabling hardware execution.
-const MAX_CONSECUTIVE_HW_ERRORS: usize = 3;
-
-/// Tracks consecutive hardware errors for cascade detection.
+/// Tracks device health across hardware test runs.
 ///
-/// After `MAX_CONSECUTIVE_HW_ERRORS` consecutive ERROR results (not FAIL --
-/// FAIL means the device works, the test just got wrong output), hardware
-/// execution is disabled for remaining tests.
+/// After each HW error (timeout, crash), the test runner already waits for
+/// device recovery via `wait_for_device_idle(true)` in hw_executor/native_hw.
+/// This state tracker then verifies the device actually recovered before
+/// continuing. Only two conditions stop hardware execution:
+///
+/// - **D-state**: process survived SIGKILL, device is truly unrecoverable
+///   without a reboot or bus-level reset.
+/// - **Recovery failure**: device didn't return to healthy state after the
+///   idle wait -- sysfs shows it's still active/wedged, or the device node
+///   disappeared entirely.
+///
+/// Individual test timeouts (e.g. control packet tests that always hang) are
+/// tolerated as long as the device recovers via TDR afterward.
 struct HwCascadeState {
-    consecutive_errors: usize,
+    hw_errors: usize,
     disabled_reason: Option<String>,
     stopped_at: Option<usize>,
     cascade_skipped: usize,
@@ -56,7 +63,7 @@ struct HwCascadeState {
 impl HwCascadeState {
     fn new() -> Self {
         Self {
-            consecutive_errors: 0,
+            hw_errors: 0,
             disabled_reason: None,
             stopped_at: None,
             cascade_skipped: 0,
@@ -67,10 +74,11 @@ impl HwCascadeState {
         self.disabled_reason.is_some()
     }
 
-    /// Record a hardware execution result. Handles both immediate wedge
-    /// detection (D-state) and consecutive error cascade.
+    /// Record a hardware execution result. After each error, verify the
+    /// device recovered before allowing subsequent tests to run.
     fn record(&mut self, hw: &HwRunResult, test_idx: usize) {
-        // Immediate wedge cutoff: D-state means the device is unrecoverable.
+        // D-state: process survived SIGKILL. Device is unrecoverable
+        // without reboot or bus-level reset. Stop immediately.
         if hw.wedged && self.disabled_reason.is_none() {
             let detail = format!(
                 "NPU device wedged (D-state) at test {} -- \
@@ -84,31 +92,67 @@ impl HwCascadeState {
             return;
         }
 
-        // PASS or FAIL means the device is working. Only ERROR means the
-        // device itself may be wedged.
-        if hw.passed || hw.label.starts_with("FAIL") {
-            self.consecutive_errors = 0;
-        } else if self.disabled_reason.is_none() {
-            self.consecutive_errors += 1;
-            if self.consecutive_errors >= MAX_CONSECUTIVE_HW_ERRORS {
-                let detail = if !npu_runner::probe_device_health() {
-                    format!(
-                        "NPU device unreachable after {} consecutive errors (test {})",
-                        self.consecutive_errors, test_idx + 1,
-                    )
-                } else {
-                    format!(
-                        "NPU device wedged after {} consecutive errors at test {} \
-                         (device node exists but XRT operations fail)",
-                        self.consecutive_errors, test_idx + 1,
-                    )
-                };
-                eprintln!("\nWARNING: {}", detail);
+        // PASS, FAIL, or DONE means the device executed the test. No
+        // recovery check needed. DONE indicates the kernel ran but we
+        // couldn't validate output (missing buffer_spec or reference data).
+        if hw.passed || hw.label.starts_with("FAIL") || hw.label.starts_with("DONE") {
+            return;
+        }
+
+        // ERROR (timeout, crash, etc.) -- the device may need TDR recovery.
+        // wait_for_device_idle(true) already ran in hw_executor/native_hw,
+        // so the device has had up to 10s to recover. Verify it did.
+        self.hw_errors += 1;
+
+        if self.disabled_reason.is_some() {
+            return;
+        }
+
+        if !npu_runner::probe_device_health() {
+            // Device node gone -- driver crashed or device disappeared.
+            let detail = format!(
+                "NPU device node disappeared after error at test {} -- \
+                 driver crash or device removal",
+                test_idx + 1,
+            );
+            eprintln!("\nCRITICAL: {}", detail);
+            eprintln!("Disabling hardware execution for remaining tests.\n");
+            self.stopped_at = Some(test_idx + 1);
+            self.disabled_reason = Some(detail);
+            return;
+        }
+
+        // Device node exists. Check if runtime PM recovered (suspended
+        // means device is idle and ready for next test).
+        if !npu_runner::device_is_idle() {
+            // Device still active after the idle wait timeout. TDR
+            // recovery may have failed -- one more short wait.
+            eprintln!(
+                "\n  WARNING: Device still active after error at test {}. \
+                 Waiting for TDR recovery...",
+                test_idx + 1,
+            );
+            npu_runner::wait_for_device_idle(true);
+
+            if !npu_runner::device_is_idle() && !npu_runner::probe_device_health() {
+                let detail = format!(
+                    "NPU device failed to recover after test {} -- \
+                     TDR recovery did not complete",
+                    test_idx + 1,
+                );
+                eprintln!("CRITICAL: {}", detail);
                 eprintln!("Disabling hardware execution for remaining tests.\n");
                 self.stopped_at = Some(test_idx + 1);
                 self.disabled_reason = Some(detail);
+                return;
             }
         }
+
+        // Device recovered. Log and continue.
+        eprintln!(
+            "  (test {} error, device recovered via TDR -- continuing)",
+            test_idx + 1,
+        );
     }
 
     /// Transfer cascade counters to RunStats for summary display.
@@ -129,7 +173,6 @@ impl HwCascadeState {
 struct TestContext<'a> {
     opts: &'a Options,
     hw_available: bool,
-    chess_available: bool,
     aietools: &'a Option<AieTools>,
     chess_builds: &'a HashMap<String, ChessBuildArtifacts>,
     chess_emu_results: &'a HashMap<String, (TestOutcome, Option<Vec<u8>>)>,
@@ -206,12 +249,36 @@ fn process_test(
             idx + 1, ctx.total, &test.name[..test.name.len().min(35)]);
     }
 
-    // --- Primary HW (native test.exe preferred, npu-runner fallback) ---
+    // --- Chess HW first (ground truth, when Chess xclbin is available) ---
+    //
+    // In hw-only (compact) mode, Chess runs first as the primary/ground-truth
+    // compiler. The host test.exe is compiler-agnostic -- we just point it at
+    // the Chess-compiled xclbin and insts.bin.
+    let chess_hw: Option<HwRunResult> = if !ctx.hw_available || cascade.is_disabled() || skip_hw {
+        None
+    } else if let Some(chess_artifacts) = ctx.chess_builds.get(&test.name) {
+        if let Some(ref chess_insts) = chess_artifacts.insts {
+            // Build a temporary test with Chess xclbin/insts but same test.exe
+            let chess_insts_path = Some(chess_insts.clone());
+            let mut chess_test = test.clone();
+            chess_test.xclbin_path = chess_artifacts.xclbin.clone();
+            chess_test.insts_path = Some(chess_insts.clone());
+            run_hw_for_test(&chess_test, Compiler::Chess, compact, spec,
+                &chess_insts_path, ctx, stats, cascade, idx)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // --- Peano HW (secondary, always runs if available) ---
     let compiler = test.compiler.unwrap_or(Compiler::Peano);
     let primary_hw: Option<HwRunResult> = if cascade.is_disabled() {
-        cascade.cascade_skipped += 1;
+        if chess_hw.is_none() { cascade.cascade_skipped += 1; }
         None
     } else if ctx.hw_available && !skip_hw {
+        if compact && chess_hw.is_some() { print!("  "); }
         run_hw_for_test(test, compiler, compact, spec, &insts_path, ctx, stats, cascade, idx)
     } else {
         None
@@ -237,24 +304,13 @@ fn process_test(
         None
     };
 
-    // --- Chess comparison HW (only for Peano-primary tests with Chess builds) ---
-    let chess_hw: Option<HwRunResult> = if !ctx.hw_available || cascade.is_disabled() {
-        None
-    } else if ctx.chess_available && !skip_hw && compiler == Compiler::Peano {
-        run_chess_hw_for_test(test, compact, spec, ctx, stats, cascade, idx)
-    } else {
-        None
-    };
-
     // --- Differential (when both compilers ran on HW) ---
     if let (Some(ref p), Some(ref c)) = (&primary_hw, &chess_hw) {
-        if compiler == Compiler::Peano {
-            stats.record_differential(p.passed, c.passed);
-        }
+        stats.record_differential(p.passed, c.passed);
     }
 
     // --- Compiler comparison ---
-    if ctx.chess_available {
+    if !ctx.chess_builds.is_empty() {
         if ctx.chess_builds.contains_key(&test.name) {
             if let Some(s) = spec {
                 let diag = run_compiler_comparison(
@@ -323,33 +379,6 @@ fn run_hw_for_test(
     }
 
     hw
-}
-
-/// Run Chess build on real NPU hardware for comparison with Peano primary.
-fn run_chess_hw_for_test(
-    test: &XclbinTest,
-    compact: bool,
-    spec: Option<&crate::testing::test_cpp_parser::BufferSpec>,
-    ctx: &TestContext,
-    stats: &mut RunStats,
-    cascade: &mut HwCascadeState,
-    idx: usize,
-) -> Option<HwRunResult> {
-    let chess_artifacts = ctx.chess_builds.get(&test.name)?;
-    let chess_insts = chess_artifacts.insts.as_ref()?;
-    let s = spec?;
-    if !ctx.opts.chess_hardware && !compact {
-        return None;
-    }
-
-    let prefix = if compact { "chess" } else { "chess-hw" };
-    if compact { print!("  "); }
-    let hw = hw_executor::run_hw_and_print(
-        s, &test.name, &chess_artifacts.xclbin, chess_insts, prefix, compact, ctx.reference_dir,
-    );
-    stats.record_hw(Compiler::Chess, &hw);
-    cascade.record(&hw, idx);
-    Some(hw)
 }
 
 /// Format a Chess emulator outcome as a display label.
@@ -768,7 +797,7 @@ pub fn run(opts: &Options) {
 
         println!("Discovering pre-built tests in {}...", npu_xrt_path.display());
 
-        let suite = match XclbinSuite::discover(&npu_xrt_path) {
+        let mut suite = match XclbinSuite::discover(&npu_xrt_path) {
             Ok(s) => {
                 let mut s = s.with_max_cycles(opts.max_cycles);
                 if reference_dir.exists() {
@@ -785,14 +814,50 @@ pub fn run(opts: &Options) {
             }
         };
 
+        // Enrich discovered tests from the source tree. Build tree mirrors
+        // source tree: build/test/npu-xrt/<name>/ -> test/npu-xrt/<name>/.
+        //
+        // From the source test.cpp we extract:
+        // - buffer_spec: sizes, types, group IDs for emulator/npu-runner
+        // - test_cpp_pattern: Cxxopts vs Define, so native test.exe gets
+        //   the right arguments (--xclbin vs -DXCLBIN)
+        let source_dir = config.npu_xrt_source_dir();
+        {
+            let tests_mut = suite.tests_mut();
+            for test in tests_mut.iter_mut() {
+                let test_source = source_dir.join(&test.name);
+                if test_source.exists() {
+                    test.source_dir = Some(test_source.clone());
+                    if test.buffer_spec.is_none() {
+                        test.buffer_spec =
+                            super::test_cpp_parser::parse_test_cpp(&test_source);
+                    }
+                    if test.test_cpp_pattern.is_none() {
+                        if let Some((_, pattern)) =
+                            native_hw::detect_test_cpp(&test_source)
+                        {
+                            test.test_cpp_pattern = Some(pattern);
+                        }
+                    }
+                }
+            }
+        }
+
         let all_tests: Vec<_> = suite.tests().to_vec();
         let discovered = all_tests.len();
         let tests: Vec<_> = all_tests.into_iter()
             .filter(|t| runner_config::matches_filter(&t.name, &opts.filters))
             .collect();
 
-        let no_build_chess: HashMap<String, ChessBuildArtifacts> =
-            HashMap::new();
+        // Discover pre-built Chess artifacts from build/chess/.
+        // These are xclbin+insts pairs produced by a previous --chess-only run.
+        // The host test.exe is compiler-agnostic, so we pair Chess xclbins
+        // with the test.exe from the Peano lit tree.
+        let chess_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/chess");
+        let no_build_chess = discover_chess_artifacts(&chess_dir);
+        if !no_build_chess.is_empty() {
+            println!("{} Chess builds available in {}", no_build_chess.len(), chess_dir.display());
+        }
         (suite, tests, discovered, no_build_chess)
     } else {
         // Source-driven path: discover from source tree, build, create suite
@@ -844,8 +909,16 @@ pub fn run(opts: &Options) {
                     continue;
                 }
 
+                // Use artifact names from source test for correct preprocessor defines.
+                let src = source_tests_storage.iter().find(|s| s.name == test.name);
+                let xclbin_name = src.and_then(|s| s.artifact_names.xclbin_names.first().map(|n| n.as_str()));
+                let insts_name = src.and_then(|s| s.artifact_names.insts_names.first().map(|n| n.as_str()));
+
                 let output_dir = test_exe_dir.join(&test.name);
-                match native_hw::compile_test_exe(&test_cpp, &output_dir, &mlir_aie_path) {
+                match native_hw::compile_test_exe_with_artifacts(
+                    &test_cpp, &output_dir, &mlir_aie_path,
+                    xclbin_name, insts_name,
+                ) {
                     Ok(exe_path) => {
                         test.test_exe = Some(exe_path);
                         compiled += 1;
@@ -944,7 +1017,6 @@ pub fn run(opts: &Options) {
     let ctx = TestContext {
         opts,
         hw_available,
-        chess_available,
         aietools: &aietools,
         chess_builds: &chess_builds,
         chess_emu_results: &chess_emu_results,
@@ -997,4 +1069,91 @@ pub fn run(opts: &Options) {
                      op.slot, op.opcode, mnemonic, entry.count, entry.tests.len());
         }
     }
+}
+
+/// Discover pre-built Chess artifacts from a build directory.
+///
+/// Scans `chess_dir` for subdirectories containing xclbin+insts.bin pairs.
+/// Handles both flat layout (`chess/<name>/aie.xclbin`) and nested layout
+/// (`chess/<parent>/<subtest>/aie.xclbin`).
+fn discover_chess_artifacts(chess_dir: &Path) -> HashMap<String, ChessBuildArtifacts> {
+    let mut results = HashMap::new();
+    if !chess_dir.exists() {
+        return results;
+    }
+
+    // Walk the directory tree looking for xclbin files.
+    fn walk(dir: &Path, prefix: &str, results: &mut HashMap<String, ChessBuildArtifacts>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let full_name = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}/{}", prefix, name)
+                };
+
+                // Check for xclbin in this directory
+                let xclbin = find_xclbin(&path);
+                if let Some(xclbin) = xclbin {
+                    let insts = find_insts(&path);
+                    let prj = find_prj_dir(&path);
+                    results.insert(full_name.clone(), ChessBuildArtifacts {
+                        xclbin,
+                        insts,
+                        prj_dir: prj,
+                    });
+                } else {
+                    // Recurse into subdirectory (for nested test layout)
+                    walk(&path, &full_name, results);
+                }
+            }
+        }
+    }
+
+    fn find_insts(dir: &Path) -> Option<PathBuf> {
+        let bin = dir.join("insts.bin");
+        if bin.exists() { return Some(bin); }
+        let elf = dir.join("insts.elf");
+        if elf.exists() { return Some(elf); }
+        None
+    }
+
+    fn find_xclbin(dir: &Path) -> Option<PathBuf> {
+        // Prefer aie.xclbin, fall back to final.xclbin or any .xclbin
+        let aie = dir.join("aie.xclbin");
+        if aie.exists() { return Some(aie); }
+        let fin = dir.join("final.xclbin");
+        if fin.exists() { return Some(fin); }
+        // Last resort: any xclbin
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().is_some_and(|e| e == "xclbin") {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    }
+
+    fn find_prj_dir(dir: &Path) -> Option<PathBuf> {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() && p.extension().is_some_and(|e| e == "prj") {
+                    return Some(p);
+                }
+            }
+        }
+        None
+    }
+
+    walk(chess_dir, "", &mut results);
+    results
 }

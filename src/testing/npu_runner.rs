@@ -68,6 +68,35 @@ pub fn probe_device_health() -> bool {
     ACCEL_DEVICE_NODES.iter().any(|p| fs::metadata(p).is_ok())
 }
 
+/// Check whether the NPU device is idle (suspended or zero active users).
+///
+/// Returns true if runtime PM shows the device is suspended or has no
+/// active users, meaning TDR recovery completed and the device is ready
+/// for the next test. Returns true (optimistic) if sysfs is unavailable.
+pub fn device_is_idle() -> bool {
+    let Some(power_dir) = npu_power_sysfs() else {
+        return true; // no sysfs, assume OK
+    };
+
+    // Check runtime_status first (most reliable after TDR)
+    let status_path = power_dir.join("runtime_status");
+    if let Ok(status) = std::fs::read_to_string(&status_path) {
+        if status.trim() == "suspended" {
+            return true;
+        }
+    }
+
+    // Fall back to runtime_usage (0 = no active fd holders)
+    let usage_path = power_dir.join("runtime_usage");
+    if let Ok(usage) = std::fs::read_to_string(&usage_path) {
+        if usage.trim() == "0" {
+            return true;
+        }
+    }
+
+    false
+}
+
 // ── Adaptive device readiness polling ──────────────────────────────
 //
 // Instead of fixed-duration sleeps between test runs, we poll the
