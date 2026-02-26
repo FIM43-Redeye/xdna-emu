@@ -212,6 +212,112 @@ impl NpuExecutor {
         &self.host_buffers
     }
 
+    /// Load a parsed instruction stream for interleaved execution.
+    ///
+    /// Copies the instructions into the executor and transitions to
+    /// the Executing state. Call `try_advance()` each engine cycle
+    /// to process instructions one at a time.
+    ///
+    /// This is the interleaved counterpart to `execute()`. Use this
+    /// when NPU instruction execution should be interleaved with
+    /// engine stepping (the test runner and future FFI path).
+    pub fn load(&mut self, stream: &NpuInstructionStream) {
+        self.load_instructions(stream.instructions().to_vec());
+    }
+
+    /// Load instructions directly (for testing or internal use).
+    pub fn load_instructions(&mut self, instructions: Vec<NpuInstruction>) {
+        self.instructions = instructions;
+        if self.instructions.is_empty() {
+            self.state = ExecutorState::Done;
+        } else {
+            self.state = ExecutorState::Executing { next_index: 0 };
+        }
+    }
+
+    /// Try to advance execution by one step.
+    ///
+    /// Called once per engine cycle. Returns the result of the step:
+    /// - `Progressed`: executed one instruction, call again next cycle
+    /// - `Blocked`: waiting for DMA queue to drain, engine should keep stepping
+    /// - `Done`: all instructions processed
+    /// - `Idle`: no instructions loaded
+    ///
+    /// When blocked on a full queue, the executor holds the pending enqueue
+    /// parameters and retries on the next call. The caller's engine.step()
+    /// naturally drains the queue by stepping the full system (DMA + cores +
+    /// stream routing), so the queue will eventually have space.
+    pub fn try_advance(
+        &mut self,
+        device: &mut DeviceState,
+        host_memory: &mut HostMemory,
+    ) -> AdvanceResult {
+        match self.state.clone() {
+            ExecutorState::Idle => AdvanceResult::Idle,
+            ExecutorState::Done => AdvanceResult::Done,
+
+            ExecutorState::Executing { next_index } => {
+                if next_index >= self.instructions.len() {
+                    self.state = ExecutorState::Done;
+                    return AdvanceResult::Done;
+                }
+
+                let instr = self.instructions[next_index].clone();
+                if let Err(e) = self.execute_instruction(&instr, device, host_memory) {
+                    log::error!("NPU instruction {} execution error: {}", next_index, e);
+                    self.warnings.push(format!("Instruction {} error: {}", next_index, e));
+                }
+                self.executed_count += 1;
+
+                // check_dma_trigger may have transitioned us to BlockedOnQueue.
+                // If so, fix up the next_index and return Blocked.
+                if let ExecutorState::BlockedOnQueue { next_index: ref mut ni, .. } = self.state {
+                    *ni = next_index + 1;
+                    return AdvanceResult::Blocked;
+                }
+
+                // Normal progression
+                let new_index = next_index + 1;
+                if new_index >= self.instructions.len() {
+                    self.state = ExecutorState::Done;
+                    AdvanceResult::Done
+                } else {
+                    self.state = ExecutorState::Executing { next_index: new_index };
+                    AdvanceResult::Progressed
+                }
+            }
+
+            ExecutorState::BlockedOnQueue {
+                next_index, col, row, channel, bd_id, repeat, enable_token, ..
+            } => {
+                use crate::device::dma::MAX_TASK_QUEUE_DEPTH;
+
+                // Check if the queue has drained enough for our enqueue
+                let has_space = device.array.dma_engine(col, row)
+                    .map_or(true, |dma| dma.task_queue_size(channel) < MAX_TASK_QUEUE_DEPTH);
+
+                if has_space {
+                    // Enqueue the pending task
+                    if let Some(dma) = device.array.dma_engine_mut(col, row) {
+                        if dma.enqueue_task(channel, bd_id, repeat, enable_token) {
+                            log::info!("  DMA ch{} enqueued BD {} (queue drained)", channel, bd_id);
+                        }
+                    }
+                    // Advance to next instruction
+                    if next_index >= self.instructions.len() {
+                        self.state = ExecutorState::Done;
+                        AdvanceResult::Done
+                    } else {
+                        self.state = ExecutorState::Executing { next_index };
+                        AdvanceResult::Progressed
+                    }
+                } else {
+                    AdvanceResult::Blocked
+                }
+            }
+        }
+    }
+
     /// Execute all instructions in a stream against the device.
     pub fn execute(&mut self, stream: &NpuInstructionStream, device: &mut DeviceState, host_memory: &mut HostMemory) -> Result<(), String> {
         for instr in stream.instructions() {
@@ -813,6 +919,43 @@ mod tests {
     fn test_executor_initial_state_is_idle() {
         let executor = NpuExecutor::new();
         assert!(matches!(executor.state(), ExecutorState::Idle));
+    }
+
+    #[test]
+    fn test_try_advance_idle_returns_idle() {
+        let mut executor = NpuExecutor::new();
+        let mut device = DeviceState::new_npu1();
+        let mut host_mem = HostMemory::new();
+        assert_eq!(executor.try_advance(&mut device, &mut host_mem), AdvanceResult::Idle);
+    }
+
+    #[test]
+    fn test_try_advance_empty_stream_returns_done() {
+        let mut executor = NpuExecutor::new();
+        let mut device = DeviceState::new_npu1();
+        let mut host_mem = HostMemory::new();
+
+        executor.load_instructions(Vec::new());
+        assert_eq!(executor.try_advance(&mut device, &mut host_mem), AdvanceResult::Done);
+        // Subsequent calls also return Done
+        assert_eq!(executor.try_advance(&mut device, &mut host_mem), AdvanceResult::Done);
+    }
+
+    #[test]
+    fn test_try_advance_processes_write32() {
+        let mut executor = NpuExecutor::new();
+        let mut device = DeviceState::new_npu1();
+        let mut host_mem = HostMemory::new();
+
+        // Write to a compute tile register (col 0, row 2, offset 0)
+        let addr = (0u32 << 25) | (2u32 << 20) | 0x0;
+        executor.load_instructions(vec![
+            NpuInstruction::Write32 { reg_off: addr, value: 0x42 },
+        ]);
+
+        assert_eq!(executor.try_advance(&mut device, &mut host_mem), AdvanceResult::Done);
+        // After executing the only instruction, state should be Done
+        assert!(matches!(executor.state(), ExecutorState::Done));
     }
 
     /// Verify that sync completion requires the channel to have been running
