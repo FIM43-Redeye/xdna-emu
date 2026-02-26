@@ -870,12 +870,12 @@ impl XclbinSuite {
                         // so DDR patches write correct addresses into shim DMA BDs.
                         executor.set_host_buffers(host_buffers.clone());
 
-                        let (device, host_mem) = engine.device_and_host_memory();
-                        if let Err(e) = executor.execute(&stream, device, host_mem) {
-                            let msg = format!("NPU instruction execution error: {}", e);
-                            log::warn!("[{}] {}", test.name, msg);
-                            test_warnings.push(msg);
-                        }
+                        // Load instructions for interleaved execution.
+                        // Instructions will be executed one-per-cycle in run_engine()
+                        // alongside full system stepping, so DMA queue backpressure
+                        // works correctly (the full array runs while waiting for
+                        // queues to drain).
+                        executor.load(&stream);
 
                         npu_executor = Some(executor);
                     }
@@ -1242,6 +1242,15 @@ impl XclbinSuite {
         let cycle_limit = if self.max_cycles == 0 { u64::MAX } else { self.max_cycles };
 
         while cycles < cycle_limit {
+            // Advance NPU instruction execution before engine step.
+            // try_advance executes one instruction per cycle; when a DMA
+            // queue is full it returns Blocked and the engine stepping
+            // below drains the queue naturally via full system simulation.
+            if let Some(executor) = npu_executor.as_mut() {
+                let (device, host_mem) = engine.device_and_host_memory();
+                executor.try_advance(device, host_mem);
+            }
+
             engine.step();
             cycles = engine.total_cycles();
 
