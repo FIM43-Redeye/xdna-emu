@@ -416,7 +416,8 @@ pub unsafe extern "C" fn xdna_emu_execute_npu_instructions(
     log::info!("Executing {} NPU instructions", stream.instructions().len());
 
     // Execute instructions
-    if let Err(e) = handle.npu_executor.execute(&stream, handle.engine.device_mut()) {
+    let (device, host_mem) = handle.engine.device_and_host_memory();
+    if let Err(e) = handle.npu_executor.execute(&stream, device, host_mem) {
         log::error!("NPU instruction execution failed: {}", e);
         return XdnaEmuResult::ExecutionError;
     }

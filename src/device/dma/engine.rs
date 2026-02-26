@@ -2279,9 +2279,11 @@ impl DmaEngine {
         // Check for overflow
         if queue.len() >= MAX_TASK_QUEUE_DEPTH {
             self.task_queue_overflow[ch_idx] = true;
-            log::warn!(
-                "DMA tile({},{}) ch{} task queue overflow (queue full, BD {} rejected)",
-                self.col, self.row, channel, start_bd
+            // Logged at trace level since the caller (executor) handles backpressure
+            // and logs a single warning if the drain fails.
+            log::trace!(
+                "DMA tile({},{}) ch{} task queue full (BD {} rejected, queue_len={})",
+                self.col, self.row, channel, start_bd, queue.len()
             );
             return false;
         }

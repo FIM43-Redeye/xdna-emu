@@ -8,6 +8,7 @@
 
 use super::{NpuInstruction, NpuInstructionStream};
 use crate::device::DeviceState;
+use crate::device::host_memory::HostMemory;
 use crate::device::tile::TileType;
 
 /// Host buffer information for address patching.
@@ -140,27 +141,27 @@ impl NpuExecutor {
     }
 
     /// Execute all instructions in a stream against the device.
-    pub fn execute(&mut self, stream: &NpuInstructionStream, device: &mut DeviceState) -> Result<(), String> {
+    pub fn execute(&mut self, stream: &NpuInstructionStream, device: &mut DeviceState, host_memory: &mut HostMemory) -> Result<(), String> {
         for instr in stream.instructions() {
-            self.execute_instruction(instr, device)?;
+            self.execute_instruction(instr, device, host_memory)?;
             self.executed_count += 1;
         }
         Ok(())
     }
 
     /// Execute a single instruction.
-    fn execute_instruction(&mut self, instr: &NpuInstruction, device: &mut DeviceState) -> Result<(), String> {
+    fn execute_instruction(&mut self, instr: &NpuInstruction, device: &mut DeviceState, host_memory: &mut HostMemory) -> Result<(), String> {
         match instr {
             NpuInstruction::Write32 { reg_off, value } => {
-                self.execute_write32(*reg_off, *value, device)
+                self.execute_write32(*reg_off, *value, device, host_memory)
             }
 
             NpuInstruction::BlockWrite { reg_off, values } => {
-                self.execute_blockwrite(*reg_off, values, device)
+                self.execute_blockwrite(*reg_off, values, device, host_memory)
             }
 
             NpuInstruction::MaskWrite { reg_off, value, mask } => {
-                self.execute_maskwrite(*reg_off, *value, *mask, device)
+                self.execute_maskwrite(*reg_off, *value, *mask, device, host_memory)
             }
 
             NpuInstruction::MaskPoll { reg_off, value, mask } => {
@@ -206,7 +207,7 @@ impl NpuExecutor {
     }
 
     /// Execute a Write32 instruction.
-    fn execute_write32(&self, reg_off: u32, value: u32, device: &mut DeviceState) -> Result<(), String> {
+    fn execute_write32(&self, reg_off: u32, value: u32, device: &mut DeviceState, host_memory: &mut HostMemory) -> Result<(), String> {
         log::debug!("NPU Write32: reg=0x{:08X} value=0x{:08X}", reg_off, value);
 
         // Decode tile address from register offset
@@ -222,7 +223,7 @@ impl NpuExecutor {
             } else {
                 tile.write_register(offset, value);
                 // Check if this is a DMA channel control register (triggers DMA start)
-                self.check_dma_trigger(col, row, offset, value, device);
+                self.check_dma_trigger(col, row, offset, value, device, host_memory);
             }
         } else {
             log::warn!(
@@ -235,7 +236,7 @@ impl NpuExecutor {
     }
 
     /// Execute a BlockWrite instruction.
-    fn execute_blockwrite(&self, reg_off: u32, values: &[u32], device: &mut DeviceState) -> Result<(), String> {
+    fn execute_blockwrite(&self, reg_off: u32, values: &[u32], device: &mut DeviceState, host_memory: &mut HostMemory) -> Result<(), String> {
         log::debug!(
             "NPU BlockWrite: reg=0x{:08X} count={}",
             reg_off,
@@ -261,7 +262,7 @@ impl NpuExecutor {
                 // Check for DMA triggers in the written range
                 for (i, &value) in values.iter().enumerate() {
                     let offset = base_offset + (i as u32) * 4;
-                    self.check_dma_trigger(col, row, offset, value, device);
+                    self.check_dma_trigger(col, row, offset, value, device, host_memory);
                 }
             }
         }
@@ -326,7 +327,7 @@ impl NpuExecutor {
     }
 
     /// Execute a MaskWrite instruction.
-    fn execute_maskwrite(&self, reg_off: u32, value: u32, mask: u32, device: &mut DeviceState) -> Result<(), String> {
+    fn execute_maskwrite(&self, reg_off: u32, value: u32, mask: u32, device: &mut DeviceState, host_memory: &mut HostMemory) -> Result<(), String> {
         log::debug!(
             "NPU MaskWrite: reg=0x{:08X} value=0x{:08X} mask=0x{:08X}",
             reg_off, value, mask
@@ -347,7 +348,7 @@ impl NpuExecutor {
                 let current = tile.read_register(offset);
                 let new_value = (current & !mask) | (value & mask);
                 tile.write_register(offset, new_value);
-                self.check_dma_trigger(col, row, offset, new_value, device);
+                self.check_dma_trigger(col, row, offset, new_value, device, host_memory);
             }
         }
 
@@ -439,7 +440,7 @@ impl NpuExecutor {
     }
 
     /// Check if a register write triggers DMA operation.
-    fn check_dma_trigger(&self, col: u8, row: u8, offset: u32, value: u32, device: &mut DeviceState) {
+    fn check_dma_trigger(&self, col: u8, row: u8, offset: u32, value: u32, device: &mut DeviceState, host_memory: &mut HostMemory) {
         // DMA Task_Queue registers trigger DMA channel start when written.
         // Each channel has Ctrl at +0 and Task_Queue at +4 within its stride.
         // Register layouts differ by tile type but all share the same format:
@@ -510,11 +511,55 @@ impl NpuExecutor {
             if is_mm2s { "MM2S" } else { "S2MM" }, abs_channel, bd_index, repeat_count
         );
 
+        // Try to enqueue. If queue is full, apply backpressure by stepping DMA
+        // until space opens, matching real hardware behavior where the host
+        // firmware blocks on Start_Queue writes when the queue is full (aie-rt
+        // _XAieMl_DmaWaitForBdTaskQueue polls Task_Queue_Size before writing).
+        use crate::device::dma::MAX_TASK_QUEUE_DEPTH;
+
+        // Check if the queue has space before enqueuing
+        let needs_drain = device.array.dma_engine(col, row)
+            .map_or(false, |dma| dma.task_queue_size(abs_channel) >= MAX_TASK_QUEUE_DEPTH);
+
+        if needs_drain {
+            // Step DMA to drain the queue. Shim DMA needs stream data flowing
+            // (from compute tiles), so step_all_dma alone may not be sufficient.
+            // Use a bounded loop to avoid infinite spinning.
+            const MAX_DRAIN_CYCLES: u32 = 100_000;
+            let mut drained = false;
+            for drain_cycle in 0..MAX_DRAIN_CYCLES {
+                device.array.step_all_dma(host_memory);
+
+                if let Some(dma) = device.array.dma_engine(col, row) {
+                    if dma.task_queue_size(abs_channel) < MAX_TASK_QUEUE_DEPTH {
+                        log::debug!(
+                            "  DMA tile({},{}) ch{} queue drained after {} cycles",
+                            col, row, abs_channel, drain_cycle + 1
+                        );
+                        drained = true;
+                        break;
+                    }
+                }
+            }
+
+            if !drained {
+                // Queue never drained -- likely needs full system stepping
+                // (cores + stream routing) which we can't do during NPU instruction
+                // execution. Log once and drop the task.
+                log::warn!(
+                    "DMA tile({},{}) ch{} task queue full, BD {} dropped \
+                     (queue could not drain during instruction execution)",
+                    col, row, abs_channel, bd_index
+                );
+                return;
+            }
+        }
+
         if let Some(dma) = device.array.dma_engine_mut(col, row) {
-            if !dma.enqueue_task(abs_channel, bd_index, repeat_count, false) {
-                log::warn!("  DMA channel {} task queue overflow", abs_channel);
-            } else {
+            if dma.enqueue_task(abs_channel, bd_index, repeat_count, false) {
                 log::info!("  DMA channel {} enqueued BD {} repeat={}", abs_channel, bd_index, repeat_count);
+            } else {
+                log::warn!("  DMA channel {} enqueue failed unexpectedly for BD {}", abs_channel, bd_index);
             }
         }
     }

@@ -292,6 +292,14 @@ impl InterpreterEngine {
         &mut self.host_memory
     }
 
+    /// Get mutable references to both device state and host memory.
+    ///
+    /// Needed when NPU instruction execution must interleave DMA stepping
+    /// (backpressure on full task queues requires stepping DMA with host memory).
+    pub fn device_and_host_memory(&mut self) -> (&mut DeviceState, &mut HostMemory) {
+        (&mut self.device, &mut self.host_memory)
+    }
+
     /// Enable a core at (col, row).
     pub fn enable_core(&mut self, col: usize, row: usize) {
         if let Some(core) = self.get_core_mut(col, row) {

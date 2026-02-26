@@ -866,7 +866,8 @@ impl XclbinSuite {
                         // so DDR patches write correct addresses into shim DMA BDs.
                         executor.set_host_buffers(host_buffers.clone());
 
-                        if let Err(e) = executor.execute(&stream, engine.device_mut()) {
+                        let (device, host_mem) = engine.device_and_host_memory();
+                        if let Err(e) = executor.execute(&stream, device, host_mem) {
                             log::warn!("NPU instruction execution error: {}", e);
                         }
 
