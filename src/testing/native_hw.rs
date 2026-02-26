@@ -142,6 +142,10 @@ fn classify_pattern(content: &str) -> TestCppPattern {
 /// Uses the provided artifact names (falling back to standard defaults).
 /// These defines override the test.cpp's own `#ifndef XCLBIN` / `#define XCLBIN`
 /// defaults so the binary finds the correct files at runtime.
+///
+/// XCLBIN is wrapped in `std::string()` to avoid ambiguity between the
+/// `xrt::xclbin(const std::string&)` and `xrt::xclbin(const std::string_view&)`
+/// constructors -- a bare `const char*` literal is equally convertible to both.
 fn preprocessor_defines(
     xclbin_name: Option<&str>,
     insts_name: Option<&str>,
@@ -149,7 +153,7 @@ fn preprocessor_defines(
     let xclbin = xclbin_name.unwrap_or("aie.xclbin");
     let insts = insts_name.unwrap_or("insts.bin");
     vec![
-        format!("-DXCLBIN=\"{}\"", xclbin),
+        format!("-DXCLBIN=std::string(\"{}\")", xclbin),
         format!("-DINSTS_TXT=\"{}\"", insts),
         "-DKERNEL_NAME=\"MLIR_AIE\"".to_string(),
     ]
@@ -230,7 +234,9 @@ pub fn compile_test_exe_with_artifacts(
     cmd.arg(test_cpp)
         .arg(&test_utils_cpp)
         .arg("-o").arg(&test_exe)
-        .arg("-std=c++17")
+        .arg("-std=c++23")
+        .arg("-include").arg("stdfloat")
+        .arg("-DTEST_UTILS_USE_XRT")
         .arg(format!("-I{}", test_lib_include.display()))
         .arg(format!("-I{}", xrt_include.display()))
         .arg(format!("-L{}", xrt_lib.display()))
@@ -593,7 +599,7 @@ FAIL!
     #[test]
     fn test_preprocessor_defines_default() {
         let defines = preprocessor_defines(None, None);
-        assert!(defines.contains(&"-DXCLBIN=\"aie.xclbin\"".to_string()));
+        assert!(defines.contains(&"-DXCLBIN=std::string(\"aie.xclbin\")".to_string()));
         assert!(defines.contains(&"-DINSTS_TXT=\"insts.bin\"".to_string()));
         assert!(defines.contains(&"-DKERNEL_NAME=\"MLIR_AIE\"".to_string()));
     }
@@ -601,21 +607,21 @@ FAIL!
     #[test]
     fn test_preprocessor_defines_custom_xclbin() {
         let defines = preprocessor_defines(Some("final.xclbin"), None);
-        assert!(defines.contains(&"-DXCLBIN=\"final.xclbin\"".to_string()));
+        assert!(defines.contains(&"-DXCLBIN=std::string(\"final.xclbin\")".to_string()));
         assert!(defines.contains(&"-DINSTS_TXT=\"insts.bin\"".to_string()));
     }
 
     #[test]
     fn test_preprocessor_defines_custom_insts() {
         let defines = preprocessor_defines(None, Some("insts.elf"));
-        assert!(defines.contains(&"-DXCLBIN=\"aie.xclbin\"".to_string()));
+        assert!(defines.contains(&"-DXCLBIN=std::string(\"aie.xclbin\")".to_string()));
         assert!(defines.contains(&"-DINSTS_TXT=\"insts.elf\"".to_string()));
     }
 
     #[test]
     fn test_preprocessor_defines_both_custom() {
         let defines = preprocessor_defines(Some("aie2_plain.xclbin"), Some("insts2_plain.txt"));
-        assert!(defines.contains(&"-DXCLBIN=\"aie2_plain.xclbin\"".to_string()));
+        assert!(defines.contains(&"-DXCLBIN=std::string(\"aie2_plain.xclbin\")".to_string()));
         assert!(defines.contains(&"-DINSTS_TXT=\"insts2_plain.txt\"".to_string()));
     }
 
