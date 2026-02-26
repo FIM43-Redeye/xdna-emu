@@ -319,12 +319,58 @@ impl NpuExecutor {
     }
 
     /// Execute all instructions in a stream against the device.
+    ///
+    /// This is the batch execution path, preserved for backward compatibility
+    /// with FFI callers and unit tests that don't have an engine loop. It
+    /// calls `try_advance()` internally, falling back to DMA-only stepping
+    /// when blocked on a full queue.
+    ///
+    /// For interleaved execution (where full system stepping handles queue
+    /// draining), use `load()` + `try_advance()` from the engine loop instead.
     pub fn execute(&mut self, stream: &NpuInstructionStream, device: &mut DeviceState, host_memory: &mut HostMemory) -> Result<(), String> {
-        for instr in stream.instructions() {
-            self.execute_instruction(instr, device, host_memory)?;
-            self.executed_count += 1;
+        self.load(stream);
+
+        const MAX_BLOCKED_CYCLES: u32 = 100_000;
+
+        loop {
+            match self.try_advance(device, host_memory) {
+                AdvanceResult::Progressed => continue,
+                AdvanceResult::Done | AdvanceResult::Idle => return Ok(()),
+                AdvanceResult::Blocked => {
+                    // Fall back to DMA-only stepping since we don't have
+                    // a full engine loop here.
+                    let mut drained = false;
+                    for _ in 0..MAX_BLOCKED_CYCLES {
+                        device.array.step_all_dma(host_memory);
+                        match self.try_advance(device, host_memory) {
+                            AdvanceResult::Blocked => continue,
+                            AdvanceResult::Progressed => { drained = true; break; }
+                            AdvanceResult::Done | AdvanceResult::Idle => return Ok(()),
+                        }
+                    }
+                    if !drained {
+                        // Force-transition out of BlockedOnQueue to avoid
+                        // infinite loop. Same as old behavior: warn and skip.
+                        if let ExecutorState::BlockedOnQueue {
+                            col, row, channel, bd_id, next_index, ..
+                        } = self.state.clone() {
+                            let msg = format!(
+                                "DMA tile({},{}) ch{} task queue full, BD {} dropped \
+                                 (batch mode: queue could not drain)",
+                                col, row, channel, bd_id
+                            );
+                            log::warn!("{}", msg);
+                            self.warnings.push(msg);
+                            if next_index >= self.instructions.len() {
+                                self.state = ExecutorState::Done;
+                            } else {
+                                self.state = ExecutorState::Executing { next_index };
+                            }
+                        }
+                    }
+                }
+            }
         }
-        Ok(())
     }
 
     /// Execute a single instruction.
