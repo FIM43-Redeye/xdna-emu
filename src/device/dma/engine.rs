@@ -28,7 +28,7 @@
 //!
 //! // Step the engine each cycle
 //! while engine.any_channel_active() {
-//!     engine.step(&mut tile_memory, &mut host_memory)?;
+//!     engine.step(&mut tile_memory, &mut NeighborLocks::empty(), &mut host_memory)?;
 //! }
 //! ```
 
@@ -46,6 +46,47 @@ use crate::device::host_memory::HostMemory;
 use crate::device::tile::{Tile, TileType};
 use crate::interpreter::state::EventType;
 use crate::interpreter::timing::sync::LockTimingState;
+
+/// Identifies which tile's locks a DMA lock operation targets.
+///
+/// MemTile DMA BDs use an 8-bit lock ID field addressing 192 entries
+/// across three tiles (per mlir-aie getLockLocalBaseIndex):
+///   - IDs   0- 63: West column MemTile (col-1) locks
+///   - IDs  64-127: Own MemTile locks (local_id = lock_id - 64)
+///   - IDs 128-191: East column MemTile (col+1) locks
+///
+/// Compute/shim tiles use a 4-bit field (0-15), always Own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockTarget {
+    /// Lock on own tile (local lock index).
+    Own(u8),
+    /// Lock on west neighbor MemTile, col-1 (local lock index on that tile).
+    West(u8),
+    /// Lock on east neighbor MemTile, col+1 (local lock index on that tile).
+    East(u8),
+}
+
+/// Provides mutable access to neighbor tiles for cross-tile lock operations.
+///
+/// Models the NPU interconnect that routes MemTile DMA lock accesses to
+/// neighbor columns. Constructed by the array level using disjoint borrows.
+/// Non-MemTile tiles pass `NeighborLocks::empty()`.
+pub struct NeighborLocks<'a> {
+    /// West neighbor MemTile (col-1), if it exists.
+    pub west: Option<&'a mut Tile>,
+    /// East neighbor MemTile (col+1), if it exists.
+    pub east: Option<&'a mut Tile>,
+}
+
+impl NeighborLocks<'_> {
+    /// Create an empty neighbor context (no cross-tile access).
+    ///
+    /// Used for compute/shim tiles where cross-tile lock access
+    /// is not applicable.
+    pub fn empty() -> NeighborLocks<'static> {
+        NeighborLocks { west: None, east: None }
+    }
+}
 
 /// Stream data word for DMA-to-stream interface.
 #[derive(Debug, Clone, Copy)]
@@ -455,37 +496,32 @@ impl DmaEngine {
     ///
     /// For MemTile, maps the 8-bit cross-tile lock address space to local
     /// lock indices. For compute/shim, passes through directly.
-    fn resolve_lock_id(&self, lock_id: u8) -> Option<u8> {
+    fn resolve_lock_id(&self, lock_id: u8) -> Option<LockTarget> {
         Self::resolve_lock_id_static(self.tile_type, self.col, self.row, self.num_locks, lock_id)
     }
 
     /// Static version of resolve_lock_id for use when &self is partially borrowed.
-    fn resolve_lock_id_static(tile_type: TileType, col: u8, row: u8, num_locks: u8, lock_id: u8) -> Option<u8> {
+    ///
+    /// MemTile: 8-bit lock ID field addressing 192 entries across three tiles
+    /// (per mlir-aie getLockLocalBaseIndex, aie-rt NumLocks=192):
+    ///   - IDs   0 .. num_locks-1:         West neighbor (col-1) locks
+    ///   - IDs   num_locks .. 2*num_locks-1: Own tile locks
+    ///   - IDs 2*num_locks .. 3*num_locks-1: East neighbor (col+1) locks
+    ///
+    /// Compute/shim: 4-bit field, always Own tile.
+    pub fn resolve_lock_id_static(tile_type: TileType, col: u8, row: u8, num_locks: u8, lock_id: u8) -> Option<LockTarget> {
         if !tile_type.is_mem_tile() {
             // Compute/shim: 4-bit field, always local
-            return Some(lock_id);
+            return Some(LockTarget::Own(lock_id));
         }
 
         // MemTile: 8-bit field, cross-tile address space (3 * num_locks entries)
         if lock_id < num_locks {
-            // West column (col-1) locks
-            log::warn!(
-                "DMA tile({},{}) lock_id={} maps to west neighbor (col-1) -- \
-                 cross-tile lock access not yet implemented",
-                col, row, lock_id
-            );
-            None
+            Some(LockTarget::West(lock_id))
         } else if lock_id < num_locks * 2 {
-            // Own tile locks
-            Some(lock_id - num_locks)
+            Some(LockTarget::Own(lock_id - num_locks))
         } else if lock_id < num_locks * 3 {
-            // East column (col+1) locks
-            log::warn!(
-                "DMA tile({},{}) lock_id={} maps to east neighbor (col+1) -- \
-                 cross-tile lock access not yet implemented",
-                col, row, lock_id
-            );
-            None
+            Some(LockTarget::East(lock_id - num_locks * 2))
         } else {
             log::warn!(
                 "DMA tile({},{}) lock_id={} out of {}-entry address space",
@@ -764,7 +800,7 @@ impl DmaEngine {
     ///
     /// This processes all active channels, moving data between memory and streams.
     /// Returns the overall result of the step.
-    pub fn step(&mut self, tile: &mut Tile, host_memory: &mut HostMemory) -> DmaResult {
+    pub fn step(&mut self, tile: &mut Tile, neighbors: &mut NeighborLocks<'_>, host_memory: &mut HostMemory) -> DmaResult {
         let mut any_active = false;
         let mut any_waiting = false;
 
@@ -784,12 +820,12 @@ impl DmaEngine {
         for ch_idx in 0..self.num_channels() {
             match self.channel_states[ch_idx] {
                 ChannelState::Active => {
-                    self.step_channel(ch_idx, tile, host_memory);
+                    self.step_channel(ch_idx, tile, neighbors, host_memory);
                     any_active = true;
                 }
                 ChannelState::WaitingForLock(lock_id) => {
                     // Try to acquire lock
-                    if self.try_acquire_lock(ch_idx, lock_id, tile) {
+                    if self.try_acquire_lock(ch_idx, lock_id, tile, neighbors) {
                         self.channel_states[ch_idx] = ChannelState::Active;
                         any_active = true;
                     } else {
@@ -837,7 +873,7 @@ impl DmaEngine {
     /// Step a single channel with cycle-accurate timing.
     ///
     /// Uses the phase-based timing state machine for realistic DMA behavior.
-    fn step_channel(&mut self, ch_idx: usize, tile: &mut Tile, host_memory: &mut HostMemory) {
+    fn step_channel(&mut self, ch_idx: usize, tile: &mut Tile, neighbors: &mut NeighborLocks<'_>, host_memory: &mut HostMemory) {
         // Check if we have a transfer that needs processing
         let transfer = match &self.transfers[ch_idx] {
             Some(t) => t,
@@ -860,7 +896,7 @@ impl DmaEngine {
         }
 
         // Always use cycle-accurate timing
-        self.step_channel_timed(ch_idx, tile, host_memory);
+        self.step_channel_timed(ch_idx, tile, neighbors, host_memory);
     }
 
     /// Step channel with cycle-accurate timing.
@@ -868,7 +904,7 @@ impl DmaEngine {
     /// Uses the phase-based timing state machine for realistic delays.
     /// The timing state machine handles phase transitions and word counting.
     /// This method performs the actual data movement when in DataTransfer phase.
-    fn step_channel_timed(&mut self, ch_idx: usize, tile: &mut Tile, host_memory: &mut HostMemory) {
+    fn step_channel_timed(&mut self, ch_idx: usize, tile: &mut Tile, neighbors: &mut NeighborLocks<'_>, host_memory: &mut HostMemory) {
         // Insert packet header if needed (MM2S only, at start of transfer)
         self.maybe_insert_packet_header(ch_idx);
 
@@ -963,7 +999,7 @@ impl DmaEngine {
                                 self.channel_stats[ch_idx].bytes_transferred += 4;
 
                                 if result.fot_finish {
-                                    self.complete_transfer(ch_idx, tile);
+                                    self.complete_transfer(ch_idx, tile, neighbors);
                                     return;
                                 }
                             } else {
@@ -1010,7 +1046,7 @@ impl DmaEngine {
 
                         // Handle FoT completion (early finish on TLAST)
                         if result.fot_finish {
-                            self.complete_transfer(ch_idx, tile);
+                            self.complete_transfer(ch_idx, tile, neighbors);
                             return;
                         }
                     } else {
@@ -1037,7 +1073,7 @@ impl DmaEngine {
 
         // Handle completion
         if phase == TransferPhase::Complete {
-            self.complete_transfer(ch_idx, tile);
+            self.complete_transfer(ch_idx, tile, neighbors);
         }
 
         // Update transfer tick count
@@ -1789,7 +1825,7 @@ impl DmaEngine {
     }
 
     /// Complete a transfer.
-    fn complete_transfer(&mut self, ch_idx: usize, tile: &mut Tile) {
+    fn complete_transfer(&mut self, ch_idx: usize, tile: &mut Tile, neighbors: &mut NeighborLocks<'_>) {
         let transfer = match &mut self.transfers[ch_idx] {
             Some(t) => t,
             None => return,
@@ -1804,20 +1840,57 @@ impl DmaEngine {
         if let TransferState::ReleasingLock(lock_id) = transfer.state {
             let release_delta = transfer.release_value;
             // Resolve cross-tile lock addressing (MemTile 192-entry space)
-            if let Some(local_id) = Self::resolve_lock_id_static(self.tile_type, self.col, self.row, self.num_locks, lock_id) {
-                log::info!("DMA tile({},{}) releasing bd_lock={} local_lock={} with delta {} on channel {} (snapshot-based)",
-                    self.col, self.row, lock_id, local_id, release_delta, ch_idx);
-                if (local_id as usize) < tile.locks.len() {
+            if let Some(lock_target) = Self::resolve_lock_id_static(self.tile_type, self.col, self.row, self.num_locks, lock_id) {
+                // Route to the correct tile based on lock target
+                let (target_tile, local_id) = match lock_target {
+                    LockTarget::Own(id) => (tile as &mut Tile, id),
+                    LockTarget::West(id) => match neighbors.west.as_deref_mut() {
+                        Some(west) => (west, id),
+                        None => {
+                            log::warn!("DMA tile({},{}) release lock_id={} targets west neighbor but none exists",
+                                self.col, self.row, lock_id);
+                            transfer.lock_released();
+                            // Fall through to statistics update below
+                            return self.finish_complete_transfer(ch_idx);
+                        }
+                    },
+                    LockTarget::East(id) => match neighbors.east.as_deref_mut() {
+                        Some(east) => (east, id),
+                        None => {
+                            log::warn!("DMA tile({},{}) release lock_id={} targets east neighbor but none exists",
+                                self.col, self.row, lock_id);
+                            transfer.lock_released();
+                            return self.finish_complete_transfer(ch_idx);
+                        }
+                    },
+                };
+
+                log::info!("DMA tile({},{}) releasing bd_lock={} target={:?} local_lock={} with delta {} on channel {} (snapshot-based)",
+                    self.col, self.row, lock_id, lock_target, local_id, release_delta, ch_idx);
+                if (local_id as usize) < target_tile.locks.len() {
                     // Record release as pending delta, applied at cycle end
-                    tile.release_snapshot(local_id as usize, release_delta);
-                    let current = tile.locks[local_id as usize].value;
+                    target_tile.release_snapshot(local_id as usize, release_delta);
+                    let current = target_tile.locks[local_id as usize].value;
                     let new_val = (current as i16 + release_delta as i16).clamp(Lock::MIN_VALUE as i16, Lock::MAX_VALUE as i16) as i8;
-                    log::info!("Tile({},{}) lock {} pending delta {} (current={}, will be {} at cycle end)",
-                        self.col, self.row, local_id, release_delta, current, new_val);
+                    log::info!("Tile lock {} pending delta {} (current={}, will be {} at cycle end)",
+                        local_id, release_delta, current, new_val);
                 }
             }
             transfer.lock_released();
         }
+
+        self.finish_complete_transfer(ch_idx);
+    }
+
+    /// Finish transfer completion: update stats, handle BD chaining/repeat, mark idle.
+    ///
+    /// Extracted from complete_transfer so early-return paths (e.g., missing
+    /// neighbor for cross-tile lock release) can also finalize the transfer.
+    fn finish_complete_transfer(&mut self, ch_idx: usize) {
+        let transfer = match &self.transfers[ch_idx] {
+            Some(t) => t,
+            None => return,
+        };
 
         // Update statistics
         self.channel_stats[ch_idx].transfers_completed += 1;
@@ -1906,20 +1979,45 @@ impl DmaEngine {
     /// - If acquire_value >= 0: `acq_eq` - wait until lock == value, then set to 0
     ///
     /// If lock timing is enabled, tracks acquire attempts and contention.
-    fn try_acquire_lock(&mut self, ch_idx: usize, lock_id: u8, tile: &mut Tile) -> bool {
+    fn try_acquire_lock(&mut self, ch_idx: usize, lock_id: u8, tile: &mut Tile, neighbors: &mut NeighborLocks<'_>) -> bool {
         use crate::device::tile::LockResult;
 
         // Resolve cross-tile lock addressing (MemTile 192-entry space)
-        let local_id = match self.resolve_lock_id(lock_id) {
-            Some(id) => id,
-            None => return false, // Cross-tile lock, not yet supported
+        let lock_target = match self.resolve_lock_id(lock_id) {
+            Some(target) => target,
+            None => return false,
         };
 
-        if (local_id as usize) >= tile.locks.len() {
+        // Route to the correct tile based on lock target
+        let (target_tile, local_id): (&mut Tile, u8) = match lock_target {
+            LockTarget::Own(id) => (tile, id),
+            LockTarget::West(id) => match neighbors.west.as_deref_mut() {
+                Some(west) => (west, id),
+                None => {
+                    log::warn!(
+                        "DMA tile({},{}) ch{} lock_id={} targets west neighbor but none exists",
+                        self.col, self.row, ch_idx, lock_id
+                    );
+                    return false;
+                }
+            },
+            LockTarget::East(id) => match neighbors.east.as_deref_mut() {
+                Some(east) => (east, id),
+                None => {
+                    log::warn!(
+                        "DMA tile({},{}) ch{} lock_id={} targets east neighbor but none exists",
+                        self.col, self.row, ch_idx, lock_id
+                    );
+                    return false;
+                }
+            },
+        };
+
+        if (local_id as usize) >= target_tile.locks.len() {
             log::warn!(
-                "DMA try_acquire_lock tile({},{}) ch{} lock_id={} resolved to local_id={} \
-                 but tile only has {} locks",
-                self.col, self.row, ch_idx, lock_id, local_id, tile.locks.len()
+                "DMA try_acquire_lock tile({},{}) ch{} lock_id={} resolved to {:?} local_id={} \
+                 but target tile only has {} locks",
+                self.col, self.row, ch_idx, lock_id, lock_target, local_id, target_tile.locks.len()
             );
             return false;
         }
@@ -1931,12 +2029,8 @@ impl DmaEngine {
 
         let acquire_value = transfer.acquire_value;
 
-        // Capture pointers before mutable borrow for debugging
-        let tile_ptr = tile as *const _ as usize;
-        let lock_ptr = &tile.locks[local_id as usize] as *const _ as usize;
-
         // Get snapshot value for logging (before any modifications)
-        let snapshot_value = tile.lock_snapshot_value(local_id as usize);
+        let snapshot_value = target_tile.lock_snapshot_value(local_id as usize);
 
         // AIE-ML lock semantics from AM020:
         // - acquire_value < 0: acq_ge, wait until lock >= |value|, then decrement by |value|
@@ -1956,12 +2050,11 @@ impl DmaEngine {
             (1i8, -1i8, false)
         };
 
-        let result = tile.try_acquire_snapshot(local_id as usize, expected, delta, equal_mode);
+        let result = target_tile.try_acquire_snapshot(local_id as usize, expected, delta, equal_mode);
         let success = matches!(result, LockResult::Success);
 
-        log::info!("DMA try_acquire_lock tile({},{}) ch{} bd_lock={} local_lock={} expected={} delta={} snapshot={} result={:?} (tile_ptr=0x{:x} lock_ptr=0x{:x})",
-            self.col, self.row, ch_idx, lock_id, local_id, expected, delta, snapshot_value, result,
-            tile_ptr, lock_ptr);
+        log::info!("DMA try_acquire_lock tile({},{}) ch{} bd_lock={} target={:?} local_lock={} expected={} delta={} snapshot={} result={:?}",
+            self.col, self.row, ch_idx, lock_id, lock_target, local_id, expected, delta, snapshot_value, result);
 
         // Track timing if enabled
         if let Some(ref mut timing) = self.lock_timing {
@@ -1985,13 +2078,14 @@ impl DmaEngine {
         channel: ChannelId,
         bd_index: u8,
         tile: &mut Tile,
+        neighbors: &mut NeighborLocks<'_>,
         host_memory: &mut HostMemory,
     ) -> Result<u64, DmaError> {
         self.start_channel(channel, bd_index)?;
 
         let mut cycles = 0u64;
         while self.channel_active(channel) {
-            self.step(tile, host_memory);
+            self.step(tile, neighbors, host_memory);
             cycles += 1;
 
             // Safety limit
@@ -2737,7 +2831,7 @@ mod tests {
         // Step until complete
         let mut cycles = 0;
         while engine.channel_active(2) {
-            engine.step(&mut tile, &mut host_mem);
+            engine.step(&mut tile, &mut NeighborLocks::empty(), &mut host_mem);
             cycles += 1;
             if cycles > 100 {
                 panic!("Transfer took too long");
@@ -2803,7 +2897,7 @@ mod tests {
         let mut cycles = 0;
         while engine.channel_active(2) {
             tile.begin_lock_cycle();  // Snapshot lock values for this cycle
-            engine.step(&mut tile, &mut host_mem);
+            engine.step(&mut tile, &mut NeighborLocks::empty(), &mut host_mem);
             tile.end_lock_cycle();    // Apply accumulated deltas at end of cycle
             cycles += 1;
             if cycles > 500 {
@@ -2829,7 +2923,7 @@ mod tests {
         // Use MM2S channel (channel 2) for testing
         engine.configure_bd(0, BdConfig::simple_1d(0x100, 64)).unwrap();
 
-        let cycles = engine.execute_1d_transfer(2, 0, &mut tile, &mut host_mem).unwrap();
+        let cycles = engine.execute_1d_transfer(2, 0, &mut tile, &mut NeighborLocks::empty(), &mut host_mem).unwrap();
         assert!(cycles > 0, "Transfer should take at least one cycle");
 
         let stats = engine.channel_stats(2).unwrap();
@@ -2885,7 +2979,7 @@ mod tests {
         // Step until complete
         let mut cycles = 0;
         while engine.channel_active(2) {
-            engine.step(&mut tile, &mut host_mem);
+            engine.step(&mut tile, &mut NeighborLocks::empty(), &mut host_mem);
             cycles += 1;
             if cycles > 100 {
                 panic!("Transfer took too long");
@@ -2926,7 +3020,7 @@ mod tests {
 
         // Step a few times - lock still not available
         for _ in 0..3 {
-            engine.step(&mut tile, &mut host_mem);
+            engine.step(&mut tile, &mut NeighborLocks::empty(), &mut host_mem);
         }
 
         // Verify waiting state
@@ -3068,7 +3162,7 @@ mod tests {
         // Run until all work is complete (including queued tasks)
         let mut cycles = 0;
         while engine.channel_has_pending_work(2) {
-            engine.step(&mut tile, &mut host_mem);
+            engine.step(&mut tile, &mut NeighborLocks::empty(), &mut host_mem);
             cycles += 1;
             if cycles > 100 {
                 panic!("Tasks took too long");
@@ -3100,7 +3194,7 @@ mod tests {
         // Run until all work is complete (including repeats)
         let mut cycles = 0;
         while engine.channel_has_pending_work(2) {
-            engine.step(&mut tile, &mut host_mem);
+            engine.step(&mut tile, &mut NeighborLocks::empty(), &mut host_mem);
             cycles += 1;
             if cycles > 200 {
                 panic!("Repeated task took too long");
@@ -3373,5 +3467,201 @@ mod tests {
         let w3 = engine.stream_out.pop_front().unwrap();
         assert_eq!(w3.data, u32::from_le_bytes([0x22, 0, 0, 0]));
         assert!(w3.tlast);
+    }
+
+    #[test]
+    fn test_resolve_lock_id_memtile() {
+        // MemTile: 64 locks, 192-entry address space
+        let tile_type = TileType::MemTile;
+        let num_locks = 64;
+
+        // West neighbor: IDs 0-63
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 1, 1, num_locks, 0),
+            Some(LockTarget::West(0))
+        );
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 1, 1, num_locks, 63),
+            Some(LockTarget::West(63))
+        );
+
+        // Own tile: IDs 64-127
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 1, 1, num_locks, 64),
+            Some(LockTarget::Own(0))
+        );
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 1, 1, num_locks, 127),
+            Some(LockTarget::Own(63))
+        );
+
+        // East neighbor: IDs 128-191
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 1, 1, num_locks, 128),
+            Some(LockTarget::East(0))
+        );
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 1, 1, num_locks, 191),
+            Some(LockTarget::East(63))
+        );
+
+        // Out of range
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 1, 1, num_locks, 192),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_lock_id_compute() {
+        // Compute tiles: 4-bit field, always Own
+        let tile_type = TileType::Compute;
+        let num_locks = 16;
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 1, 2, num_locks, 5),
+            Some(LockTarget::Own(5))
+        );
+    }
+
+    #[test]
+    fn test_cross_tile_lock_acquire_west() {
+        // Create MemTile DMA engine at col 1, row 1
+        let mut engine = DmaEngine::new_mem_tile(1, 1);
+
+        // Create own tile and west neighbor tile
+        let mut own_tile = Tile::mem_tile(1, 1);
+        let mut west_tile = Tile::mem_tile(0, 1);
+
+        // Set west tile's lock 5 to value 1 (will be acquired via acq_eq)
+        west_tile.locks[5].set(1);
+
+        // Configure BD with acquire on west neighbor lock 5.
+        // West locks are IDs 0-63, so lock_id=5 means west lock 5.
+        let bd = BdConfig::simple_1d(0x100, 32)
+            .with_acquire(5, 1);  // acq_eq: wait for value == 1
+        engine.configure_bd(0, bd).unwrap();
+
+        // Write data to own tile memory (MM2S reads from here)
+        own_tile.data_memory_mut()[0x100..0x100 + 32].copy_from_slice(&[0xAA; 32]);
+
+        // Start MM2S channel (channel 6 for MemTile)
+        engine.start_channel(6, 0).unwrap();
+        assert!(matches!(engine.channel_state(6), ChannelState::WaitingForLock(5)));
+
+        // Snapshot locks for this cycle
+        own_tile.begin_lock_cycle();
+        west_tile.begin_lock_cycle();
+
+        // Step with neighbor access -- lock should be acquired from west
+        let mut neighbors = NeighborLocks {
+            west: Some(&mut west_tile),
+            east: None,
+        };
+        let mut host_mem = make_host_memory();
+        engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
+
+        // Channel should now be active (lock acquired from west neighbor)
+        assert_eq!(engine.channel_state(6), ChannelState::Active,
+            "Channel should be active after acquiring west neighbor lock");
+    }
+
+    #[test]
+    fn test_cross_tile_lock_acquire_east() {
+        // Create MemTile DMA engine at col 1, row 1
+        let mut engine = DmaEngine::new_mem_tile(1, 1);
+
+        let mut own_tile = Tile::mem_tile(1, 1);
+        let mut east_tile = Tile::mem_tile(2, 1);
+
+        // Set east tile's lock 10 to value 1
+        east_tile.locks[10].set(1);
+
+        // East locks are IDs 128-191, so lock_id=138 means east lock 10.
+        let bd = BdConfig::simple_1d(0x100, 32)
+            .with_acquire(138, 1);  // acq_eq on east lock 10
+        engine.configure_bd(0, bd).unwrap();
+        own_tile.data_memory_mut()[0x100..0x100 + 32].copy_from_slice(&[0xBB; 32]);
+
+        engine.start_channel(6, 0).unwrap();
+        assert!(matches!(engine.channel_state(6), ChannelState::WaitingForLock(138)));
+
+        own_tile.begin_lock_cycle();
+        east_tile.begin_lock_cycle();
+
+        let mut neighbors = NeighborLocks {
+            west: None,
+            east: Some(&mut east_tile),
+        };
+        let mut host_mem = make_host_memory();
+        engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
+
+        assert_eq!(engine.channel_state(6), ChannelState::Active,
+            "Channel should be active after acquiring east neighbor lock");
+    }
+
+    #[test]
+    fn test_cross_tile_lock_acquire_fails_without_neighbor() {
+        // MemTile at col 0 has no west neighbor
+        let mut engine = DmaEngine::new_mem_tile(0, 1);
+        let mut own_tile = Tile::mem_tile(0, 1);
+        own_tile.begin_lock_cycle();
+
+        let bd = BdConfig::simple_1d(0x100, 32)
+            .with_acquire(5, 1);  // West lock -- but no west neighbor at col 0
+        engine.configure_bd(0, bd).unwrap();
+        own_tile.data_memory_mut()[0x100..0x100 + 32].copy_from_slice(&[0xCC; 32]);
+
+        engine.start_channel(6, 0).unwrap();
+
+        let mut neighbors = NeighborLocks::empty();
+        let mut host_mem = make_host_memory();
+        engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
+
+        // Should remain waiting -- no neighbor to satisfy lock
+        assert!(matches!(engine.channel_state(6), ChannelState::WaitingForLock(5)),
+            "Should stay waiting when neighbor tile is absent");
+    }
+
+    #[test]
+    fn test_cross_tile_lock_release_west() {
+        // Verify that after a transfer, the release lock targets the west neighbor
+        let mut engine = DmaEngine::new_mem_tile(1, 1);
+        let mut own_tile = Tile::mem_tile(1, 1);
+        let mut west_tile = Tile::mem_tile(0, 1);
+
+        // BD: acquire own lock 0 (ID 64), release west lock 3 (ID 3)
+        let bd = BdConfig::simple_1d(0x100, 32)
+            .with_acquire(64, 1)   // own lock 0, acq_eq value=1
+            .with_release(3, 1);   // west lock 3, release delta +1
+        engine.configure_bd(0, bd).unwrap();
+        own_tile.data_memory_mut()[0x100..0x100 + 32].copy_from_slice(&[0xDD; 32]);
+
+        // Set own lock 0 to 1 so acquire succeeds
+        own_tile.locks[0].set(1);
+
+        engine.start_channel(6, 0).unwrap();
+
+        // Run to completion
+        let mut cycles = 0;
+        while engine.channel_active(6) {
+            own_tile.begin_lock_cycle();
+            west_tile.begin_lock_cycle();
+            let mut neighbors = NeighborLocks {
+                west: Some(&mut west_tile),
+                east: None,
+            };
+            let mut host_mem = make_host_memory();
+            engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
+            own_tile.end_lock_cycle();
+            west_tile.end_lock_cycle();
+            cycles += 1;
+            if cycles > 500 {
+                panic!("Transfer took too long: {} cycles, state={:?}", cycles, engine.channel_state(6));
+            }
+        }
+
+        // West tile lock 3 should have been incremented by +1 (release delta)
+        assert_eq!(west_tile.locks[3].value, 1,
+            "West neighbor lock 3 should be 1 after release with delta +1");
     }
 }

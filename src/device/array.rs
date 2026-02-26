@@ -36,6 +36,58 @@ pub const MAX_COLS: usize = 9;
 /// Maximum supported rows
 pub const MAX_ROWS: usize = 6;
 
+/// Get mutable references to up to 3 tiles at disjoint indices for cross-tile lock access.
+///
+/// Returns (west_neighbor, own_tile, east_neighbor) where neighbors are None
+/// if they don't exist or aren't MemTiles. Uses `split_at_mut` for safe
+/// disjoint mutable borrows -- no unsafe code needed.
+///
+/// Indices: west = own_idx - rows, east = own_idx + rows (separated by one
+/// column's worth of rows, always distinct).
+fn get_three_mut(
+    tiles: &mut [Tile],
+    own_idx: usize,
+    col: usize,
+    rows: usize,
+    cols: usize,
+) -> (Option<&mut Tile>, &mut Tile, Option<&mut Tile>) {
+    let west_idx = if col > 0 {
+        let idx = own_idx - rows;
+        // Only provide neighbor if it's also a MemTile
+        if tiles[idx].is_mem_tile() { Some(idx) } else { None }
+    } else {
+        None
+    };
+    let east_idx = if col + 1 < cols {
+        let idx = own_idx + rows;
+        if tiles[idx].is_mem_tile() { Some(idx) } else { None }
+    } else {
+        None
+    };
+
+    match (west_idx, east_idx) {
+        (None, None) => {
+            (None, &mut tiles[own_idx], None)
+        }
+        (Some(w), None) => {
+            // w < own_idx guaranteed (west is lower column)
+            let (left, right) = tiles.split_at_mut(own_idx);
+            (Some(&mut left[w]), &mut right[0], None)
+        }
+        (None, Some(e)) => {
+            // own_idx < e guaranteed (east is higher column)
+            let (left, right) = tiles.split_at_mut(e);
+            (None, &mut left[own_idx], Some(&mut right[0]))
+        }
+        (Some(w), Some(e)) => {
+            // w < own_idx < e guaranteed
+            let (left, rest) = tiles.split_at_mut(own_idx);
+            let (mid, right) = rest.split_at_mut(e - own_idx);
+            (Some(&mut left[w]), &mut mid[0], Some(&mut right[0]))
+        }
+    }
+}
+
 /// AIE tile array.
 ///
 /// Stores tiles in row-major order for cache-friendly column iteration.
@@ -276,27 +328,59 @@ impl TileArray {
     /// Step the DMA engine for a specific tile.
     ///
     /// This advances the DMA transfer state by one cycle.
+    /// For MemTiles, constructs neighbor lock access from adjacent columns.
     pub fn step_dma(&mut self, col: u8, row: u8, host_memory: &mut HostMemory) -> Option<DmaResult> {
-        if col < self.cols && row < self.rows {
-            let idx = self.tile_index(col, row);
-            let (tile, engine) = (&mut self.tiles[idx], &mut self.dma_engines[idx]);
-            Some(engine.step(tile, host_memory))
-        } else {
-            None
+        if col >= self.cols || row >= self.rows {
+            return None;
         }
+        let idx = self.tile_index(col, row);
+        let is_mem_tile = self.tiles[idx].is_mem_tile();
+
+        let result = if is_mem_tile {
+            let rows = self.rows as usize;
+            let cols = self.cols as usize;
+            let (west_ref, own_ref, east_ref) = get_three_mut(
+                &mut self.tiles, idx, col as usize, rows, cols,
+            );
+            let mut neighbors = dma::NeighborLocks { west: west_ref, east: east_ref };
+            self.dma_engines[idx].step(own_ref, &mut neighbors, host_memory)
+        } else {
+            self.dma_engines[idx].step(&mut self.tiles[idx], &mut dma::NeighborLocks::empty(), host_memory)
+        };
+        Some(result)
     }
 
     /// Step all DMA engines.
     ///
     /// Returns true if any DMA engine is still active.
+    /// MemTile engines receive neighbor lock access for cross-tile lock operations.
     pub fn step_all_dma(&mut self, host_memory: &mut HostMemory) -> bool {
         let mut any_active = false;
-        for i in 0..self.tiles.len() {
-            // Reset bank tracking for this cycle
-            self.tiles[i].reset_bank_tracking();
-            self.dma_engines[i].cycle_dma_banks = 0;
+        let rows = self.rows as usize;
+        let cols = self.cols as usize;
 
-            let result = self.dma_engines[i].step(&mut self.tiles[i], host_memory);
+        // Destructure for disjoint field borrows (tiles vs engines)
+        let tiles = &mut self.tiles;
+        let engines = &mut self.dma_engines;
+
+        for i in 0..tiles.len() {
+            // Reset bank tracking for this cycle
+            tiles[i].reset_bank_tracking();
+            engines[i].cycle_dma_banks = 0;
+
+            let is_mem_tile = engines[i].tile_type.is_mem_tile();
+
+            let result = if is_mem_tile {
+                let col = i / rows;
+                let (west_ref, own_ref, east_ref) = get_three_mut(
+                    tiles, i, col, rows, cols,
+                );
+                let mut neighbors = dma::NeighborLocks { west: west_ref, east: east_ref };
+                engines[i].step(own_ref, &mut neighbors, host_memory)
+            } else {
+                engines[i].step(&mut tiles[i], &mut dma::NeighborLocks::empty(), host_memory)
+            };
+
             if matches!(result, DmaResult::InProgress | DmaResult::WaitingForLock(_)) {
                 any_active = true;
             }
@@ -304,7 +388,7 @@ impl TileArray {
             // Merge DMA engine bank accesses into the tile.
             // Static transfer methods record directly on tile.cycle_dma_banks;
             // MM2S/S2MM record on engine.cycle_dma_banks. Merge both.
-            self.tiles[i].cycle_dma_banks |= self.dma_engines[i].cycle_dma_banks;
+            tiles[i].cycle_dma_banks |= engines[i].cycle_dma_banks;
         }
         any_active
     }
