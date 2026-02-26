@@ -154,11 +154,11 @@ pub fn parse_test_cpp(test_dir: &Path) -> Option<BufferSpec> {
 
 /// Parse test.cpp content (for testability without filesystem).
 pub fn parse_test_cpp_content(content: &str) -> Option<BufferSpec> {
-    // Step 1: Collect all constants (#define and constexpr int).
-    let constants = extract_constants(content);
-
-    // Step 2: Collect DATATYPE macros.
+    // Step 1: Collect type aliases first (needed for sizeof resolution in constants).
     let type_macros = extract_type_macros(content);
+
+    // Step 2: Collect all constants (#define, constexpr, cxxopts defaults).
+    let constants = extract_constants(content, &type_macros);
 
     // Step 3: Detect multi-kernel pattern (bo0_*, bo1_* prefixes).
     let multi_kernel = content.contains("bo0_in") || content.contains("kernel0");
@@ -182,9 +182,22 @@ pub fn parse_test_cpp_content(content: &str) -> Option<BufferSpec> {
     })
 }
 
-/// Extract integer constants from `constexpr int NAME = EXPR;` and
-/// `#define NAME EXPR` declarations.
-fn extract_constants(content: &str) -> HashMap<String, usize> {
+/// Extract integer constants from `constexpr int NAME = EXPR;`,
+/// `#define NAME EXPR`, and cxxopts default values.
+///
+/// The cxxopts pattern handles tests like `objectfifo_repeat/init_values_repeat`
+/// where buffer sizes are computed from runtime arguments with known defaults:
+///
+/// ```cpp
+/// options.add_options()("length,l", "...", cxxopts::value<int>()->default_value("4096"));
+/// int N = vm["length"].as<int>();
+/// ```
+///
+/// We extract the default value and map it to the variable name.
+fn extract_constants(
+    content: &str,
+    type_macros: &HashMap<String, ElementType>,
+) -> HashMap<String, usize> {
     let mut constants = HashMap::new();
 
     // constexpr int NAME = EXPR;
@@ -193,7 +206,7 @@ fn extract_constants(content: &str) -> HashMap<String, usize> {
     ).unwrap();
     for cap in re_constexpr.captures_iter(content) {
         let name = cap[1].to_string();
-        if let Some(val) = eval_const_expr(&cap[2], &constants) {
+        if let Some(val) = eval_const_expr(&cap[2], &constants, type_macros) {
             constants.insert(name, val);
         }
     }
@@ -214,17 +227,66 @@ fn extract_constants(content: &str) -> HashMap<String, usize> {
         }
         // Strip trailing C/C++ comments
         let value = value.split("//").next().unwrap_or(value).trim();
-        if let Some(val) = eval_const_expr(value, &constants) {
+        if let Some(val) = eval_const_expr(value, &constants, type_macros) {
             constants.insert(name, val);
+        }
+    }
+
+    // cxxopts default values: extract option defaults and map to variables.
+    //
+    // Step 1: Collect option_name -> default_value from cxxopts declarations.
+    //   Pattern: ("option_name,short", "desc", cxxopts::value<int>()->default_value("VALUE"))
+    let cxxopts_defaults = extract_cxxopts_defaults(content);
+
+    // Step 2: Map variable assignments from vm["option_name"].as<type>().
+    //   Pattern: int VAR = vm["option_name"].as<int>();
+    let re_vm_assign = Regex::new(
+        r#"int\s+(\w+)\s*=\s*vm\["(\w+)"\]\.as<int>\(\)"#
+    ).unwrap();
+    for cap in re_vm_assign.captures_iter(content) {
+        let var_name = cap[1].to_string();
+        let option_name = &cap[2];
+        if let Some(default_val) = cxxopts_defaults.get(option_name) {
+            constants.entry(var_name).or_insert(*default_val);
         }
     }
 
     constants
 }
 
+/// Extract cxxopts default values from option declarations.
+///
+/// Matches patterns like:
+///   ("length,l", "description", cxxopts::value<int>()->default_value("4096"))
+///   ("repeat,r", "description", cxxopts::value<int>()->default_value("4"))
+///
+/// Returns a map from option name (e.g. "length") to default value.
+fn extract_cxxopts_defaults(content: &str) -> HashMap<String, usize> {
+    let mut defaults = HashMap::new();
+
+    // Allow whitespace between ( and " for multiline chained options:
+    //   options.add_options()("length,l", ..., default_value("4096"))(
+    //       "repeat,r", ..., default_value("4"));
+    let re = Regex::new(
+        r#"\(\s*"(\w+)(?:,\w)?"[^)]*cxxopts::value<int>\(\)->default_value\("(\d+)"\)"#
+    ).unwrap();
+    for cap in re.captures_iter(content) {
+        let option_name = cap[1].to_string();
+        if let Ok(val) = cap[2].parse::<usize>() {
+            defaults.insert(option_name, val);
+        }
+    }
+
+    defaults
+}
+
 /// Evaluate a simple constant expression (supports +, *, -, /, parentheses,
 /// sizeof(), and named constant references).
-fn eval_const_expr(expr: &str, constants: &HashMap<String, usize>) -> Option<usize> {
+fn eval_const_expr(
+    expr: &str,
+    constants: &HashMap<String, usize>,
+    type_macros: &HashMap<String, ElementType>,
+) -> Option<usize> {
     let expr = expr.trim();
 
     // Direct integer literal
@@ -237,7 +299,7 @@ fn eval_const_expr(expr: &str, constants: &HashMap<String, usize>) -> Option<usi
         return Some(*v);
     }
 
-    // sizeof(type) -- resolve common types
+    // sizeof(type) -- resolve standard C++ types and type aliases
     if let Some(inner) = expr.strip_prefix("sizeof(").and_then(|s| s.strip_suffix(')')) {
         let inner = inner.trim();
         // Strip pointer suffix if present (e.g. "buf_in[0]")
@@ -246,7 +308,14 @@ fn eval_const_expr(expr: &str, constants: &HashMap<String, usize>) -> Option<usi
         } else {
             inner
         };
-        return ElementType::from_cpp_type(type_name).map(|t| t.byte_size());
+        // Try direct C++ type first, then type aliases (using/define)
+        if let Some(t) = ElementType::from_cpp_type(type_name) {
+            return Some(t.byte_size());
+        }
+        if let Some(t) = type_macros.get(type_name) {
+            return Some(t.byte_size());
+        }
+        return None;
     }
 
     // Binary expressions: A * B, A + B, etc.
@@ -259,16 +328,56 @@ fn eval_const_expr(expr: &str, constants: &HashMap<String, usize>) -> Option<usi
 
     // Try splitting on * (multiplication, most common in size expressions)
     if let Some(pos) = find_top_level_op(expr, '*') {
-        let left = eval_const_expr(&expr[..pos], constants)?;
-        let right = eval_const_expr(&expr[pos+1..], constants)?;
+        let left = eval_const_expr(&expr[..pos], constants, type_macros)?;
+        let right = eval_const_expr(&expr[pos+1..], constants, type_macros)?;
         return Some(left * right);
     }
 
     // Try splitting on + (addition)
     if let Some(pos) = find_top_level_op(expr, '+') {
-        let left = eval_const_expr(&expr[..pos], constants)?;
-        let right = eval_const_expr(&expr[pos+1..], constants)?;
+        let left = eval_const_expr(&expr[..pos], constants, type_macros)?;
+        let right = eval_const_expr(&expr[pos+1..], constants, type_macros)?;
         return Some(left + right);
+    }
+
+    None
+}
+
+/// Lenient expression evaluation: like `eval_const_expr` but treats unknown
+/// addends as 0 in addition expressions.
+///
+/// This handles `C_SIZE + trace_size` where `trace_size` is an unresolvable
+/// runtime variable that defaults to 0. For multiplication, both sides must
+/// be known (unknown factor = undefined result, not safe to assume 0).
+fn eval_const_expr_lenient(
+    expr: &str,
+    constants: &HashMap<String, usize>,
+    type_macros: &HashMap<String, ElementType>,
+) -> Option<usize> {
+    // Try exact evaluation first
+    if let Some(val) = eval_const_expr(expr, constants, type_macros) {
+        return Some(val);
+    }
+
+    let expr = expr.trim();
+
+    // Strip outer parens
+    let expr = if expr.starts_with('(') && expr.ends_with(')') {
+        &expr[1..expr.len()-1]
+    } else {
+        expr
+    };
+
+    // For addition: if one side resolves and the other doesn't, use the known side
+    if let Some(pos) = find_top_level_op(expr, '+') {
+        let left = eval_const_expr(&expr[..pos], constants, type_macros);
+        let right = eval_const_expr(&expr[pos+1..], constants, type_macros);
+        match (left, right) {
+            (Some(l), Some(r)) => return Some(l + r),
+            (Some(l), None) => return Some(l),
+            (None, Some(r)) => return Some(r),
+            (None, None) => {}
+        }
     }
 
     None
@@ -289,14 +398,30 @@ fn find_top_level_op(expr: &str, op: char) -> Option<usize> {
     None
 }
 
-/// Extract DATATYPE macros: `#define IN_DATATYPE int8_t`.
+/// Extract type aliases from `#define` macros and `using` declarations.
+///
+/// Handles two patterns:
+///   `#define IN_DATATYPE int8_t`          -- preprocessor macro
+///   `using A_DATATYPE = std::int32_t;`    -- C++ type alias (matmul tests)
 fn extract_type_macros(content: &str) -> HashMap<String, ElementType> {
     let mut macros = HashMap::new();
 
-    let re = Regex::new(
+    // #define DATATYPE type
+    let re_define = Regex::new(
         r"#define\s+(\w*DATATYPE\w*)\s+(\w+)"
     ).unwrap();
-    for cap in re.captures_iter(content) {
+    for cap in re_define.captures_iter(content) {
+        let name = cap[1].to_string();
+        if let Some(elem_type) = ElementType::from_cpp_type(&cap[2]) {
+            macros.insert(name, elem_type);
+        }
+    }
+
+    // using NAME = std::type; (with or without std:: prefix)
+    let re_using = Regex::new(
+        r"using\s+(\w+)\s*=\s*(?:std::)?(\w+)\s*;"
+    ).unwrap();
+    for cap in re_using.captures_iter(content) {
         let name = cap[1].to_string();
         if let Some(elem_type) = ElementType::from_cpp_type(&cap[2]) {
             macros.insert(name, elem_type);
@@ -366,7 +491,7 @@ fn parse_size_expr(
         let sizeof_part = &expr[pos..];
 
         // Resolve count
-        let count = eval_const_expr(count_part, constants).unwrap_or(64);
+        let count = eval_const_expr(count_part, constants, type_macros).unwrap_or(64);
 
         // Resolve type from sizeof argument
         let elem_type = parse_sizeof_type(sizeof_part, type_macros)
@@ -375,17 +500,18 @@ fn parse_size_expr(
         return (count, elem_type);
     }
 
-    // Pattern 2: bare SIZE constant (byte count, e.g. matrix_transpose)
-    // This is SIZE = ROWS * COLS * sizeof(int32_t), already in bytes.
-    // Detect by checking if the constant name's definition contains sizeof.
-    if let Some(val) = constants.get(expr.trim()) {
-        // If the original #define contained sizeof, this is a byte count.
-        // We need to detect this. For now, use a heuristic: if SIZE is
-        // not a clean multiple of 4 but is a multiple of 1, try i8.
-        // Otherwise default to i32.
-        let elem_type = default_type;
-        let size_elements = val / elem_type.byte_size();
-        return (size_elements, elem_type);
+    // Pattern 2: general expression evaluation (handles constants, arithmetic)
+    //
+    // For expressions like `C_SIZE + trace_size` where one term is unknown,
+    // eval_const_expr_lenient treats unknown addends as 0. This is correct
+    // for the common `DATA_SIZE + trace_size` pattern where trace_size
+    // defaults to 0 in production and the data size is the dominant term.
+    if let Some(val) = eval_const_expr_lenient(expr.trim(), constants, type_macros) {
+        if val > 0 {
+            let elem_type = default_type;
+            let size_elements = val / elem_type.byte_size();
+            return (size_elements, elem_type);
+        }
     }
 
     // Pattern 3: numeric literal
@@ -744,7 +870,8 @@ mod tests {
 constexpr int IN_SIZE = 64;
 constexpr int OUT_SIZE = 64;
 "#;
-        let constants = extract_constants(content);
+        let types = HashMap::new();
+        let constants = extract_constants(content, &types);
         assert_eq!(constants["IN_SIZE"], 64);
         assert_eq!(constants["OUT_SIZE"], 64);
     }
@@ -755,7 +882,8 @@ constexpr int OUT_SIZE = 64;
 #define MATRIX_ROWS 7
 #define MATRIX_COLS 19
 "#;
-        let constants = extract_constants(content);
+        let types = HashMap::new();
+        let constants = extract_constants(content, &types);
         assert_eq!(constants["MATRIX_ROWS"], 7);
         assert_eq!(constants["MATRIX_COLS"], 19);
     }
@@ -775,14 +903,24 @@ constexpr int OUT_SIZE = 64;
     fn test_eval_const_expr_multiplication() {
         let mut constants = HashMap::new();
         constants.insert("IN_SIZE".to_string(), 64);
-        assert_eq!(eval_const_expr("IN_SIZE * 4", &constants), Some(256));
+        let types = HashMap::new();
+        assert_eq!(eval_const_expr("IN_SIZE * 4", &constants, &types), Some(256));
     }
 
     #[test]
     fn test_eval_const_expr_sizeof() {
         let constants = HashMap::new();
-        assert_eq!(eval_const_expr("sizeof(int32_t)", &constants), Some(4));
-        assert_eq!(eval_const_expr("sizeof(int8_t)", &constants), Some(1));
+        let types = HashMap::new();
+        assert_eq!(eval_const_expr("sizeof(int32_t)", &constants, &types), Some(4));
+        assert_eq!(eval_const_expr("sizeof(int8_t)", &constants, &types), Some(1));
+    }
+
+    #[test]
+    fn test_eval_const_expr_sizeof_type_alias() {
+        let constants = HashMap::new();
+        let mut types = HashMap::new();
+        types.insert("A_DATATYPE".to_string(), ElementType::I32);
+        assert_eq!(eval_const_expr("sizeof(A_DATATYPE)", &constants, &types), Some(4));
     }
 
     // ---------------------------------------------------------------
@@ -1130,5 +1268,128 @@ auto bo1_out = xrt::bo(device, OUT_SIZE * sizeof(int32_t),
         assert_eq!(bo_in.direction, BufferDir::Input);
         // 7 * 19 = 133 elements (SIZE is in bytes, parser divides by element size)
         assert_eq!(bo_in.size_elements, 133);
+    }
+
+    #[test]
+    fn test_parse_real_init_values_repeat() {
+        let test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../mlir-aie/test/npu-xrt/objectfifo_repeat/init_values_repeat");
+        if !test_dir.exists() {
+            return;
+        }
+
+        let spec = parse_test_cpp(&test_dir).unwrap();
+        assert_eq!(spec.buffers.len(), 3);
+
+        // bo_inA: N=4096 elements (from cxxopts default)
+        let in_a = spec.buffers.iter().find(|b| b.name == "bo_inA").unwrap();
+        assert_eq!(in_a.group_id, 3);
+        assert_eq!(in_a.size_elements, 4096);
+        assert_eq!(in_a.element_type, ElementType::I32);
+        assert_eq!(in_a.direction, BufferDir::Input);
+
+        // bo_out: N * repeat_count = 4096 * 4 = 16384 elements
+        let out = spec.buffers.iter().find(|b| b.name == "bo_out").unwrap();
+        assert_eq!(out.group_id, 5);
+        assert_eq!(out.size_elements, 16384);
+        assert_eq!(out.element_type, ElementType::I32);
+        assert_eq!(out.direction, BufferDir::Output);
+    }
+
+    #[test]
+    fn test_cxxopts_default_extraction() {
+        let content = r#"
+options.add_options()("length,l", "the length", cxxopts::value<int>()->default_value("4096"))(
+    "repeat,r", "the repeat count", cxxopts::value<int>()->default_value("4"));
+
+int N = vm["length"].as<int>();
+int repeat_count = vm["repeat"].as<int>();
+
+auto bo_inA = xrt::bo(device, N * sizeof(int32_t), XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(3));
+auto bo_out = xrt::bo(device, N * repeat_count * sizeof(int32_t), XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(5));
+
+int32_t *bufInA = bo_inA.map<int32_t *>();
+std::vector<uint32_t> srcVecA;
+for (int i = 0; i < N; i++)
+  srcVecA.push_back(i + 1);
+memcpy(bufInA, srcVecA.data(), (srcVecA.size() * sizeof(uint32_t)));
+
+bo_inA.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+"#;
+
+        let spec = parse_test_cpp_content(content).unwrap();
+        assert_eq!(spec.buffers.len(), 2);
+
+        let in_a = spec.buffers.iter().find(|b| b.name == "bo_inA").unwrap();
+        assert_eq!(in_a.size_elements, 4096);
+        assert_eq!(in_a.element_type, ElementType::I32);
+        assert_eq!(in_a.direction, BufferDir::Input);
+
+        let out = spec.buffers.iter().find(|b| b.name == "bo_out").unwrap();
+        assert_eq!(out.size_elements, 4096 * 4);
+        assert_eq!(out.element_type, ElementType::I32);
+        assert_eq!(out.direction, BufferDir::Output);
+    }
+
+    #[test]
+    fn test_using_type_alias_in_sizeof() {
+        let content = r#"
+using A_DATATYPE = std::int32_t;
+using B_DATATYPE = std::int32_t;
+using C_DATATYPE = std::int32_t;
+
+constexpr int M = 16;
+constexpr int K = 16;
+constexpr int N = 16;
+
+constexpr int A_VOLUME = M * K;
+constexpr int C_VOLUME = M * N;
+
+constexpr int A_SIZE = (A_VOLUME * sizeof(A_DATATYPE));
+constexpr int C_SIZE = (C_VOLUME * sizeof(C_DATATYPE));
+
+auto bo_a = xrt::bo(device, A_SIZE, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(3));
+auto bo_c = xrt::bo(device, C_SIZE, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(5));
+
+bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+"#;
+
+        let spec = parse_test_cpp_content(content).unwrap();
+        assert_eq!(spec.buffers.len(), 2);
+
+        // A_SIZE = 16 * 16 * 4 = 1024 bytes, / 4 = 256 elements
+        let bo_a = spec.buffers.iter().find(|b| b.name == "bo_a").unwrap();
+        assert_eq!(bo_a.size_elements, 256);
+        assert_eq!(bo_a.element_type, ElementType::I32);
+        assert_eq!(bo_a.direction, BufferDir::Input);
+
+        // C_SIZE = 16 * 16 * 4 = 1024 bytes, / 4 = 256 elements
+        let bo_c = spec.buffers.iter().find(|b| b.name == "bo_c").unwrap();
+        assert_eq!(bo_c.size_elements, 256);
+        assert_eq!(bo_c.element_type, ElementType::I32);
+        assert_eq!(bo_c.direction, BufferDir::Output);
+    }
+
+    #[test]
+    fn test_parse_real_matmul_cascade() {
+        let test_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../mlir-aie/test/npu-xrt/matrix_multiplication_using_cascade");
+        if !test_dir.exists() {
+            return;
+        }
+
+        let spec = parse_test_cpp(&test_dir).unwrap();
+        assert_eq!(spec.buffers.len(), 3);
+
+        // A: 256 elements (16x16), B: 256, C: 256
+        let bo_a = spec.buffers.iter().find(|b| b.group_id == 3).unwrap();
+        assert_eq!(bo_a.size_elements, 256);
+        assert_eq!(bo_a.direction, BufferDir::Input);
+
+        let bo_c = spec.buffers.iter().find(|b| b.group_id == 5).unwrap();
+        assert_eq!(bo_c.size_elements, 256);
+        assert_eq!(bo_c.direction, BufferDir::Output);
     }
 }

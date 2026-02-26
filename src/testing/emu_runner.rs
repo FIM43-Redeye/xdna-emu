@@ -285,6 +285,14 @@ fn process_test(
         None
     };
 
+    // --- Auto-capture reference output ---
+    // Prefer Peano output (primary test path). Fall back to Chess if Peano
+    // didn't run (e.g. cascade disabled for Peano but Chess already ran).
+    let capture_hw = primary_hw.as_ref().or(chess_hw.as_ref());
+    if let Some(hw) = capture_hw {
+        auto_capture_reference(test, hw, ctx.reference_dir, compact);
+    }
+
     // --- elfanalyzer ---
     if ctx.opts.elfanalyze && !compact {
         if let Some(ref tools) = ctx.aietools {
@@ -383,6 +391,92 @@ fn run_hw_for_test(
     }
 
     hw
+}
+
+/// Auto-capture hardware reference output for future emulator validation.
+///
+/// When a test passes on hardware but has no saved reference output, this
+/// captures the raw binary output and saves it so subsequent emulator runs
+/// can validate against it. Two paths:
+///
+/// 1. If the HW run already produced raw bytes (npu_runner path), save directly.
+/// 2. If the HW run used native test.exe (no raw bytes), do a supplementary
+///    npu_runner execution to capture the output buffer contents.
+///
+/// Only captures when the test passed -- we don't want wrong output as reference.
+fn auto_capture_reference(
+    test: &XclbinTest,
+    hw: &HwRunResult,
+    reference_dir: &Path,
+    compact: bool,
+) {
+    use super::runner_stats::HwOutcome;
+
+    // Only capture for tests that passed on hardware
+    if hw.outcome != HwOutcome::Pass {
+        return;
+    }
+
+    // Need buffer spec to know output element type for validation
+    let spec = match test.buffer_spec.as_ref() {
+        Some(s) => s,
+        None => return,
+    };
+
+    // Need insts for npu_runner fallback
+    let insts_path = match test.find_insts_file() {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Skip if reference already exists
+    let ref_path = reference_dir.join(&test.name).join("output.bin");
+    if ref_path.exists() {
+        return;
+    }
+
+    // Get raw output bytes: either from the HW result or via supplementary capture
+    let output = if !hw.output.is_empty() {
+        hw.output.clone()
+    } else {
+        // Native test.exe path -- no raw bytes. Do a npu_runner capture.
+        match npu_runner::run_on_npu(
+            spec, &test.name, &test.xclbin_path, &insts_path,
+            super::runner_config::DEFAULT_HW_TIMEOUT_SECS,
+        ) {
+            Ok(result) => result.output,
+            Err(e) => {
+                log::debug!("auto-capture npu_runner failed for {}: {}", test.name, e);
+                return;
+            }
+        }
+    };
+
+    if output.is_empty() {
+        return;
+    }
+
+    // Save the reference
+    if let Some(parent) = ref_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log::warn!("auto-capture: failed to create dir for {}: {}", test.name, e);
+            return;
+        }
+    }
+    match std::fs::write(&ref_path, &output) {
+        Ok(_) => {
+            let label = format!("captured {} bytes", output.len());
+            if compact {
+                // hw-only mode: append to current line
+                print!("  [{}]", label);
+            } else {
+                println!("      ref: {} -> {}", label, ref_path.display());
+            }
+        }
+        Err(e) => {
+            log::warn!("auto-capture: failed to write {}: {}", ref_path.display(), e);
+        }
+    }
 }
 
 /// Format a Chess emulator outcome as a display label.
@@ -830,18 +924,32 @@ pub fn run(opts: &Options) {
             let tests_mut = suite.tests_mut();
             for test in tests_mut.iter_mut() {
                 let test_source = source_dir.join(&test.name);
-                if test_source.exists() {
-                    test.source_dir = Some(test_source.clone());
-                    if test.buffer_spec.is_none() {
-                        test.buffer_spec =
-                            super::test_cpp_parser::parse_test_cpp(&test_source);
+
+                // For multi-variant tests (e.g. matrix_multiplication_using_cascade/aie2_buffer),
+                // the exact source path won't exist because variants don't have their own
+                // directories. The test.cpp lives in the parent source directory.
+                let effective_source = if test_source.exists() {
+                    test_source
+                } else if let Some(parent) = test_source.parent() {
+                    if parent.join("test.cpp").exists() {
+                        parent.to_path_buf()
+                    } else {
+                        continue;
                     }
-                    if test.test_cpp_pattern.is_none() {
-                        if let Some((_, pattern)) =
-                            native_hw::detect_test_cpp(&test_source)
-                        {
-                            test.test_cpp_pattern = Some(pattern);
-                        }
+                } else {
+                    continue;
+                };
+
+                test.source_dir = Some(effective_source.clone());
+                if test.buffer_spec.is_none() {
+                    test.buffer_spec =
+                        super::test_cpp_parser::parse_test_cpp(&effective_source);
+                }
+                if test.test_cpp_pattern.is_none() {
+                    if let Some((_, pattern)) =
+                        native_hw::detect_test_cpp(&effective_source)
+                    {
+                        test.test_cpp_pattern = Some(pattern);
                     }
                 }
             }
