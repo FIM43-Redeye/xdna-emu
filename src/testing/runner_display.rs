@@ -55,7 +55,7 @@ pub fn format_result(r: &TestResult, total: usize) -> String {
             if let (Some(c), Some(t)) = (correct, total) {
                 out.push_str(&format!("PASS ({} cycles, {}/{} validated)", cycles, c, t));
             } else {
-                out.push_str(&format!("PASS ({} cycles)", cycles));
+                out.push_str(&format!("PASS ({} cycles, no validation)", cycles));
             }
         }
         TestOutcome::ValidationFail { cycles, correct, total, first_mismatch } => {

@@ -45,6 +45,8 @@ pub struct HwRunResult {
 pub struct RunStats {
     // Emulator outcomes
     pub passed: usize,
+    /// Subset of `passed` where output was validated against reference data.
+    pub passed_validated: usize,
     pub validation_failed: usize,
     pub expected_fail: usize,
     pub unexpected_pass: usize,
@@ -94,7 +96,12 @@ pub struct RunStats {
 impl RunStats {
     pub fn record_emu_outcome(&mut self, outcome: &TestOutcome) {
         match outcome {
-            TestOutcome::Pass { .. } => self.passed += 1,
+            TestOutcome::Pass { correct, .. } => {
+                self.passed += 1;
+                if correct.is_some() {
+                    self.passed_validated += 1;
+                }
+            }
             TestOutcome::ValidationFail { .. } => self.validation_failed += 1,
             TestOutcome::Fail { .. } => self.failed += 1,
             TestOutcome::UnknownOpcode { .. } => self.unknown += 1,
@@ -191,8 +198,14 @@ impl RunStats {
             println!("Total:            {}", total);
             println!("Platform:         {} (requires different hardware)", self.platform);
             println!("Skipped:          {}", self.skipped);
-            println!("Passed:           {} ({:.1}%)", self.passed,
-                100.0 * self.passed as f64 / effective.max(1) as f64);
+            let unvalidated = self.passed - self.passed_validated;
+            println!("Passed:           {} ({:.1}%){}", self.passed,
+                100.0 * self.passed as f64 / effective.max(1) as f64,
+                if unvalidated > 0 {
+                    format!("  ({} validated, {} no validation)", self.passed_validated, unvalidated)
+                } else {
+                    String::new()
+                });
             println!("Expected Fail:    {}", self.expected_fail);
             println!("Unexpected Pass:  {}", self.unexpected_pass);
             println!("Validation Fail:  {}", self.validation_failed);

@@ -500,11 +500,12 @@ impl XclbinSuite {
     /// relative to `base`.
     ///
     /// Handles three directory layouts:
-    /// 1. **Standard**: directory contains `aie.xclbin` or `final.xclbin` -> one test
-    /// 2. **Multi-variant**: directory contains multiple non-standard `.xclbin`
-    ///    files (e.g., `aie2_buffer.xclbin`, `aie2_cascade.xclbin`) -> one test
-    ///    per xclbin, with variant name appended
-    /// 3. **Parent**: directory contains subdirectories -> recurse
+    /// 1. **Single xclbin**: directory contains exactly one `.xclbin` -> one test,
+    ///    named after the directory (not the xclbin filename). Works regardless
+    ///    of the xclbin's name (`aie.xclbin`, `final.xclbin`, `aie2p.xclbin`, etc.).
+    /// 2. **Multi-variant**: directory contains 2+ `.xclbin` files -> one test
+    ///    per xclbin, with the xclbin stem appended to the directory name.
+    /// 3. **Parent**: directory contains no xclbins -> recurse into subdirectories.
     fn discover_recursive(base: &Path, dir: &Path, suite: &mut Self) -> Result<()> {
         let mut subdirs = Vec::new();
         let mut loose_xclbins = Vec::new();
@@ -520,54 +521,51 @@ impl XclbinSuite {
             }
         }
 
-        // Case 1: standard single-xclbin directory (aie.xclbin or final.xclbin)
-        for standard_name in &["aie.xclbin", "final.xclbin"] {
-            if let Some(xclbin_path) = loose_xclbins.iter().find(|p| {
-                p.file_name().map(|n| n == *standard_name).unwrap_or(false)
-            }) {
+        match loose_xclbins.len() {
+            0 => {
+                // No xclbins -- recurse into subdirectories
+                for subdir in subdirs {
+                    let _ = Self::discover_recursive(base, &subdir, suite);
+                }
+            }
+            1 => {
+                // Single xclbin: standard test, name = directory relative to base
+                let xclbin_path = &loose_xclbins[0];
                 let mut test = XclbinTest::from_path(xclbin_path);
                 if let Ok(rel) = dir.strip_prefix(base) {
                     test.name = rel.to_string_lossy().to_string();
                 }
                 suite.add_test(test);
-                return Ok(());
             }
-        }
-
-        // Case 2: multi-variant directory (non-standard xclbin names)
-        if !loose_xclbins.is_empty() {
-            let dir_name = dir.strip_prefix(base)
-                .map(|r| r.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            for xclbin_path in &loose_xclbins {
-                let stem = xclbin_path.file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
+            _ => {
+                // Multiple xclbins: one test per variant
+                let dir_name = dir.strip_prefix(base)
+                    .map(|r| r.to_string_lossy().to_string())
                     .unwrap_or_default();
 
-                let mut test = XclbinTest::from_path(xclbin_path);
+                for xclbin_path in &loose_xclbins {
+                    let stem = xclbin_path.file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
 
-                // Name: <dir_relative_to_base>/<xclbin_stem>
-                test.name = if dir_name.is_empty() {
-                    stem.clone()
-                } else {
-                    format!("{}/{}", dir_name, stem)
-                };
+                    let mut test = XclbinTest::from_path(xclbin_path);
 
-                // Find matching insts file by convention:
-                // aie2_buffer.xclbin -> insts2_buffer.txt (aie->insts prefix swap)
-                if test.insts_path.is_none() {
-                    test.insts_path = find_matching_insts(dir, &stem);
+                    // Name: <dir_relative_to_base>/<xclbin_stem>
+                    test.name = if dir_name.is_empty() {
+                        stem.clone()
+                    } else {
+                        format!("{}/{}", dir_name, stem)
+                    };
+
+                    // Find matching insts file by convention:
+                    // aie2_buffer.xclbin -> insts2_buffer.txt (aie->insts prefix swap)
+                    if test.insts_path.is_none() {
+                        test.insts_path = find_matching_insts(dir, &stem);
+                    }
+
+                    suite.add_test(test);
                 }
-
-                suite.add_test(test);
             }
-            return Ok(());
-        }
-
-        // Case 3: no xclbins -- recurse into subdirectories
-        for subdir in subdirs {
-            let _ = Self::discover_recursive(base, &subdir, suite);
         }
 
         Ok(())
