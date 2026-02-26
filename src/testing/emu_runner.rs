@@ -813,6 +813,51 @@ pub fn run(opts: &Options) {
     let config = crate::config::Config::get();
     let mlir_aie_path = PathBuf::from(config.mlir_aie_path());
 
+    // --list: discover and print tests from source tree, then exit.
+    if opts.list_only {
+        let mut source_tests = npu_test::discover(&mlir_aie_path);
+        let overrides_path = PathBuf::from(manifest_dir).join("tests/test_overrides.toml");
+        npu_test::load_overrides(&mut source_tests, &overrides_path);
+
+        // Apply filters
+        let tests: Vec<&npu_test::NpuTestSource> = source_tests.iter()
+            .filter(|t| runner_config::matches_filter(&t.name, &opts.filters))
+            .collect();
+
+        let peano_count = tests.iter().filter(|t| !t.requires_chess()).count();
+        let chess_only_count = tests.iter().filter(|t| t.requires_chess()).count();
+        let npu2_count = tests.iter().filter(|t| t.requires_npu2()).count();
+        let xfail_count = tests.iter().filter(|t| t.xfail).count();
+        let skip_count = tests.iter().filter(|t| t.skip_reason.is_some()).count();
+        let efail_count = tests.iter().filter(|t| t.expected_fail_reason.is_some()).count();
+
+        println!("{} tests discovered ({} Peano, {} Chess-only, {} NPU2, {} XFAIL, {} expected-fail, {} skipped)\n",
+            tests.len(), peano_count, chess_only_count, npu2_count, xfail_count, efail_count, skip_count);
+
+        for t in &tests {
+            let mut tags = Vec::new();
+            if t.requires_chess() { tags.push("chess-only".to_string()); }
+            if t.requires_npu2() { tags.push("npu2".to_string()); }
+            if t.xfail { tags.push("XFAIL".to_string()); }
+            if let Some(ref reason) = t.expected_fail_reason {
+                tags.push(format!("expected-fail: {}", reason));
+            }
+            if let Some(ref reason) = t.skip_reason {
+                tags.push(format!("skip: {}", reason));
+            }
+            if t.build_steps.is_empty() { tags.push("no-build-steps".to_string()); }
+            if !t.requires.is_empty() {
+                tags.push(format!("requires: {}", t.requires.join(", ")));
+            }
+            if tags.is_empty() {
+                println!("  {}", t.name);
+            } else {
+                println!("  {} [{}]", t.name, tags.join("; "));
+            }
+        }
+        return;
+    }
+
     // Discover aietools (always attempt -- needed for auto Chess detection)
     let aietools = AieTools::discover(config);
     let chess_available = opts.chess_build && aietools.as_ref()

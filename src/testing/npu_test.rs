@@ -482,14 +482,31 @@ impl TestOverrides {
     }
 }
 
-/// Load test overrides and attach skip/expected_fail metadata to tests.
+/// Load test overrides and propagate source annotations to runner metadata.
 ///
-/// Call after `discover()` to apply emulator-specific gates. The override
-/// file is typically at `tests/test_overrides.toml`.
+/// Call after `discover()`. This does two things:
+///
+/// 1. Applies emulator-specific gates from `test_overrides.toml` (skip,
+///    expected_fail entries for emulator-specific issues).
+/// 2. Propagates source-level annotations that the runner should act on:
+///    - `XFAIL: *` -> `expected_fail_reason` (unless overridden by TOML)
+///    - `REQUIRES: ryzen_ai_npu2` -> `skip_reason` (wrong hardware)
+///
+/// TOML overrides take precedence over source annotations, so
+/// emulator-specific reasons are preserved when both are present.
 pub fn load_overrides(tests: &mut [NpuTestSource], overrides_path: &Path) {
     let overrides = TestOverrides::load(overrides_path);
 
     for test in tests.iter_mut() {
+        // Source annotations (lower priority, applied first)
+        if test.xfail && test.expected_fail_reason.is_none() {
+            test.expected_fail_reason = Some("XFAIL upstream".to_string());
+        }
+        if test.requires_npu2() && test.skip_reason.is_none() {
+            test.skip_reason = Some("Requires NPU2 (Strix Point)".to_string());
+        }
+
+        // TOML overrides (higher priority, overwrite source annotations)
         if let Some(reason) = overrides.skip.get(&test.name) {
             test.skip_reason = Some(reason.clone());
         }

@@ -266,6 +266,9 @@ pub struct Options {
     pub trace_size: usize,
     /// Also collect aiesimulator VCD traces (with --trace-all).
     pub aiesim_trace: bool,
+
+    /// List-only mode: discover and print tests, then exit.
+    pub list_only: bool,
 }
 
 /// Parse CLI arguments and merge with runner config.
@@ -307,6 +310,7 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
     // Trace modes
     let mut trace_size: usize = 1_048_576; // 1MB default
     let mut aiesim_trace = false;
+    let mut list_only = false;
 
     let mut iter = args.iter();
 
@@ -381,6 +385,9 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
                 });
             }
             "--aiesim-trace" => aiesim_trace = true,
+
+            // --- Discovery ---
+            "--list" => list_only = true,
 
             // --- Help ---
             "--help" | "-h" => {
@@ -472,6 +479,7 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
 
         trace_size,
         aiesim_trace,
+        list_only,
     }
 }
 
@@ -510,6 +518,7 @@ fn print_usage() {
     eprintln!("  --unit-tests        Run mlir-aie unit tests");
     eprintln!("  --full              Enable all validation modes");
     eprintln!("  --no-build          Skip build phase, use pre-built tests");
+    eprintln!("  --list              Discover tests and print list, then exit");
     eprintln!();
     eprintln!("Lit mode options:");
     eprintln!("  --timeout SECS      Per-test timeout (forwarded to lit)");
