@@ -906,12 +906,13 @@ impl XclbinSuite {
         engine.sync_cores_from_device();
 
         let enabled = engine.enabled_cores();
-        if enabled == 0 && elf_files.is_empty() {
-            // No cores enabled and no ELFs -- DMA-only or reconfiguration test.
-            // The emulator can't meaningfully execute these (no instruction loop
-            // to step through). Skip rather than claiming a false pass.
+        if enabled == 0 && elf_files.is_empty() && npu_executor.is_none() {
+            // No cores, no ELFs, and no NPU instructions -- truly nothing to
+            // execute. DMA-only tests (which have insts.bin) still run: the
+            // NPU instructions configure and enqueue DMA transfers, and the
+            // engine steps DMA engines + stream switches until completion.
             return (TestOutcome::Skipped {
-                reason: "DMA-only test (no core code to emulate)".to_string(),
+                reason: "No core code and no NPU instructions to execute".to_string(),
             }, None, Vec::new(), None);
         }
 

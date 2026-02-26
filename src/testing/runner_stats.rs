@@ -197,7 +197,7 @@ impl RunStats {
             let effective = total - self.skipped - self.platform;
             println!("Total:            {}", total);
             println!("Platform:         {} (requires different hardware)", self.platform);
-            println!("Skipped:          {} (DMA-only or missing artifacts)", self.skipped);
+            println!("Skipped:          {} (missing artifacts or no instructions)", self.skipped);
             let unvalidated = self.passed - self.passed_validated;
             println!("Passed:           {} ({:.1}%){}", self.passed,
                 100.0 * self.passed as f64 / effective.max(1) as f64,

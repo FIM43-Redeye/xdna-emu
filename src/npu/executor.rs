@@ -8,6 +8,7 @@
 
 use super::{NpuInstruction, NpuInstructionStream};
 use crate::device::DeviceState;
+use crate::device::tile::TileType;
 
 /// Host buffer information for address patching.
 #[derive(Debug, Clone)]
@@ -265,51 +266,57 @@ impl NpuExecutor {
             }
         }
 
-        // If writing to shim DMA BD region, sync to DMA engine
-        if row == 0 && shim_bd_index_for_offset(base_offset).is_some() {
-            self.sync_bd_to_dma_engine(col, base_offset, values, device);
+        // If writing to a DMA BD region, sync BD data to the DMA engine.
+        // Read the FULL BD back from tile registers rather than using the
+        // blockwrite values directly -- the compiler may write fewer than 8
+        // words when trailing words are zero, and partial writes compose
+        // correctly when read back from register space.
+        if let Some((bd_index, tile_type)) = bd_index_for_blockwrite(row, base_offset) {
+            Self::sync_bd_from_registers(col, row, bd_index, tile_type, device);
         }
 
         Ok(())
     }
 
-    /// Sync BD configuration from tile registers to DMA engine.
-    fn sync_bd_to_dma_engine(&self, col: u8, base_offset: u32, values: &[u32], device: &mut DeviceState) {
-        let layout = crate::device::regdb::device_reg_layout();
-        let bd_base = base_offset - layout.shim_bd_base;
-        let bd_index = bd_base / layout.shim_bd_stride;
-
-        // Only sync if we have a complete BD (8 words)
-        if values.len() < 8 {
-            log::debug!("Partial BD write at 0x{:05X}, {} words", base_offset, values.len());
-            return;
-        }
-
-        self.sync_bd_values_to_dma_engine(col, bd_index as u8, values, device);
-    }
-
-    /// Sync BD values to DMA engine using the data-driven register database parser.
+    /// Read a full BD from tile registers and sync it to the DMA engine.
     ///
-    /// This uses `BufferDescriptor::from_registers()` to parse ALL BD fields
+    /// Uses `BufferDescriptor::from_registers()` to parse ALL BD fields
     /// (multi-dimensional addressing, BD chaining, locks, packet mode, iteration,
     /// AXI parameters) from the register words, then converts to the runtime
-    /// BdConfig. This replaces the old manual extraction that only handled
-    /// length, address, and D0.
-    fn sync_bd_values_to_dma_engine(&self, col: u8, bd_index: u8, values: &[u32], device: &mut DeviceState) {
+    /// BdConfig. Reads from tile register space so partial writes compose
+    /// correctly.
+    fn sync_bd_from_registers(
+        col: u8, row: u8, bd_index: u8, tile_type: TileType, device: &mut DeviceState,
+    ) {
         use crate::device::dma::bd::BufferDescriptor;
-        use crate::device::tile::TileType;
 
-        log::debug!("Shim BD {} raw values: {:08X?}", bd_index, values);
+        let layout = crate::device::regdb::device_reg_layout();
+        let (bd_base, bd_stride) = match tile_type {
+            TileType::Shim => (layout.shim_bd_base, layout.shim_bd_stride),
+            TileType::MemTile => (layout.memtile_bd_base, layout.memtile_bd_stride),
+            TileType::Compute => (layout.memory_bd_base, layout.memory_bd_stride),
+        };
+        let bd_words = (bd_stride / 4) as usize;
 
-        let bd = BufferDescriptor::from_registers(values, TileType::Shim);
+        // Read full BD from tile register space
+        let values = if let Some(tile) = device.tile_mut(col as usize, row as usize) {
+            let start = bd_base + bd_index as u32 * bd_stride;
+            (0..bd_words).map(|i| tile.read_register(start + i as u32 * 4)).collect::<Vec<_>>()
+        } else {
+            return;
+        };
+
+        log::debug!("{:?} BD {} (col={},row={}) raw: {:08X?}", tile_type, bd_index, col, row, values);
+
+        let bd = BufferDescriptor::from_registers(&values, tile_type);
         let config = bd.to_bd_config();
 
-        if let Some(dma) = device.array.dma_engine_mut(col, 0) {
+        if let Some(dma) = device.array.dma_engine_mut(col, row) {
             if let Err(e) = dma.configure_bd(bd_index, config.clone()) {
-                log::warn!("Failed to configure shim BD {}: {:?}", bd_index, e);
+                log::warn!("Failed to configure {:?} BD {}: {:?}", tile_type, bd_index, e);
             } else {
-                log::debug!("Configured shim BD {} addr=0x{:X} len={} d0=[{},{}] d1=[{},{}] next={:?} acq={:?} rel={:?}",
-                    bd_index, config.base_addr, config.length,
+                log::debug!("Configured {:?} BD {} addr=0x{:X} len={} d0=[{},{}] d1=[{},{}] next={:?} acq={:?} rel={:?}",
+                    tile_type, bd_index, config.base_addr, config.length,
                     config.d0.size, config.d0.stride, config.d1.size, config.d1.stride,
                     config.next_bd,
                     config.acquire_lock.map(|id| (id, config.acquire_value)),
@@ -399,7 +406,7 @@ impl NpuExecutor {
             // Packet_Type, OoO_BD_ID). A blind write would clobber those fields.
             // Use read-modify-write to preserve the non-address bits.
             let high_bits = (patched_addr >> 32) as u32;
-            let is_shim_bd = row == 0 && shim_bd_index_for_offset(offset).is_some();
+            let is_shim_bd = row == 0 && bd_index_for_blockwrite(row, offset).is_some();
             if is_shim_bd {
                 // Shim BD: Base_Address_High occupies bits 15:0 of word 2
                 let current = tile.read_register(offset + 4);
@@ -410,29 +417,21 @@ impl NpuExecutor {
             }
         }
 
-        // Re-sync the BD to DMA engine if patching BD address field
-        let layout = crate::device::regdb::device_reg_layout();
-        if row == 0 {
-            if let Some(bd_index) = shim_bd_index_for_offset(offset) {
-                let bd_rel = offset - layout.shim_bd_base;
-                let word_in_bd = (bd_rel % layout.shim_bd_stride) / 4;
+        // Re-sync the BD to DMA engine if patching BD address field.
+        // DDR patches always target word 1 (address low) within a BD, so
+        // we only re-sync when the patched offset falls on that word.
+        if let Some((bd_index, tile_type)) = bd_index_for_blockwrite(row, offset) {
+            let layout = crate::device::regdb::device_reg_layout();
+            let (bd_base_addr, bd_stride) = match tile_type {
+                TileType::Shim => (layout.shim_bd_base, layout.shim_bd_stride),
+                TileType::MemTile => (layout.memtile_bd_base, layout.memtile_bd_stride),
+                TileType::Compute => (layout.memory_bd_base, layout.memory_bd_stride),
+            };
+            let bd_rel = offset - bd_base_addr;
+            let word_in_bd = (bd_rel % bd_stride) / 4;
 
-                // If patching word 1 (address low), re-read and sync the full BD
-                if word_in_bd == 1 {
-                    let bd_values = if let Some(tile) = device.tile_mut(col as usize, row as usize) {
-                        let bd_base = layout.shim_bd_base + bd_index * layout.shim_bd_stride;
-                        let mut values = [0u32; 8];
-                        for i in 0..8u32 {
-                            values[i as usize] = tile.read_register(bd_base + i * 4);
-                        }
-                        Some(values)
-                    } else {
-                        None
-                    };
-                    if let Some(values) = bd_values {
-                        self.sync_bd_values_to_dma_engine(col, bd_index as u8, &values, device);
-                    }
-                }
+            if word_in_bd == 1 {
+                Self::sync_bd_from_registers(col, row, bd_index, tile_type, device);
             }
         }
 
@@ -441,64 +440,105 @@ impl NpuExecutor {
 
     /// Check if a register write triggers DMA operation.
     fn check_dma_trigger(&self, col: u8, row: u8, offset: u32, value: u32, device: &mut DeviceState) {
-        // Shim tile DMA control registers are at specific offsets
-        // S2MM Channel 0 queue: 0x1D204 (writing BD index starts transfer)
-        // MM2S Channel 0 queue: 0x1D214 (writing BD index starts transfer)
-        //
-        // For shim DMA, writing to the queue register starts the DMA with that BD.
-        // The value written contains the BD index to use.
-
-        // Shim tile is at row 0
-        if row != 0 {
-            return;
-        }
-
-        // Queue register offsets derived from regdb: each channel occupies
-        // shim_channel_stride bytes, with Ctrl at +0 and Task_Queue at +4.
-        // S2MM channels come first, then MM2S channels.
-        let reg_layout = crate::device::regdb::device_reg_layout();
-        let base = reg_layout.shim_channel_base;
-        let stride = reg_layout.shim_channel_stride;
-
-        if offset < base || (offset - base) % stride != 4 {
-            return; // Not a task queue register (queue regs are at +4 within each channel)
-        }
-        let ch_abs = ((offset - base) / stride) as u8;
-        let s2mm_count = crate::device::dma::COMPUTE_S2MM_CHANNELS as u8;
-        let total_channels = s2mm_count * 2; // S2MM + MM2S
-
-        if ch_abs >= total_channels {
-            return; // Beyond known channels
-        }
-        let (channel, is_mm2s) = if ch_abs >= s2mm_count {
-            (ch_abs - s2mm_count, true)
-        } else {
-            (ch_abs, false)
+        // DMA Task_Queue registers trigger DMA channel start when written.
+        // Each channel has Ctrl at +0 and Task_Queue at +4 within its stride.
+        // Register layouts differ by tile type but all share the same format:
+        //   Bits 3:0  = BD_ID (buffer descriptor index)
+        //   Bits 23:16 = Repeat_Count (additional BD executions)
+        use crate::device::dma::{
+            COMPUTE_S2MM_CHANNELS, COMPUTE_MM2S_CHANNELS,
+            MEM_TILE_S2MM_CHANNELS, MEM_TILE_MM2S_CHANNELS,
         };
 
-        // Start_Queue register format (same as compute/memtile):
-        // - Bits 3:0: BD_ID (buffer descriptor index)
-        // - Bits 23:16: Repeat_Count (run BD this many additional times)
+        let reg_layout = crate::device::regdb::device_reg_layout();
+        let tile_type = device.tile(col as usize, row as usize)
+            .map(|t| t.tile_type);
+        let tile_type = match tile_type {
+            Some(tt) => tt,
+            None => return,
+        };
+
+        // Determine channel base(s), stride, and S2MM/MM2S channel counts
+        // for the tile type. Compute and shim have a single contiguous block
+        // (S2MM channels first, then MM2S). MemTile has separate S2MM and
+        // MM2S base addresses because it has 6 channels of each type.
+        let (abs_channel, is_mm2s) = match tile_type {
+            TileType::Shim => {
+                let base = reg_layout.shim_channel_base;
+                let stride = reg_layout.shim_channel_stride;
+                let s2mm = COMPUTE_S2MM_CHANNELS as u8;
+                match Self::channel_from_queue_write(offset, base, stride, s2mm, s2mm + COMPUTE_MM2S_CHANNELS as u8) {
+                    Some(r) => r,
+                    None => return,
+                }
+            }
+            TileType::Compute => {
+                let base = reg_layout.memory_channel_base;
+                let stride = reg_layout.memory_channel_stride;
+                let s2mm = COMPUTE_S2MM_CHANNELS as u8;
+                match Self::channel_from_queue_write(offset, base, stride, s2mm, s2mm + COMPUTE_MM2S_CHANNELS as u8) {
+                    Some(r) => r,
+                    None => return,
+                }
+            }
+            TileType::MemTile => {
+                // MemTile has separate S2MM and MM2S register blocks
+                let stride = reg_layout.memtile_channel_stride;
+                let s2mm_base = reg_layout.memtile_channel_s2mm_base;
+                let mm2s_base = reg_layout.memtile_channel_mm2s_base;
+                let s2mm_count = MEM_TILE_S2MM_CHANNELS as u8;
+                let mm2s_count = MEM_TILE_MM2S_CHANNELS as u8;
+
+                // Try S2MM block first
+                if let Some((ch, _)) = Self::channel_from_queue_write(offset, s2mm_base, stride, s2mm_count, s2mm_count) {
+                    (ch, false)
+                } else if let Some((ch_raw, _)) = Self::channel_from_queue_write(offset, mm2s_base, stride, mm2s_count, mm2s_count) {
+                    // MM2S channels are numbered after S2MM in the DMA engine
+                    (s2mm_count + ch_raw, true)
+                } else {
+                    return;
+                }
+            }
+        };
+
         let bd_index = (value & 0xF) as u8;
         let repeat_count = ((value >> 16) & 0xFF) as u8;
 
         log::info!(
-            "NPU DMA start: col={} {} ch={} bd={} repeat={}",
-            col, if is_mm2s { "MM2S" } else { "S2MM" }, channel, bd_index, repeat_count
+            "NPU DMA start: col={} row={} {:?} {} ch={} bd={} repeat={}",
+            col, row, tile_type,
+            if is_mm2s { "MM2S" } else { "S2MM" }, abs_channel, bd_index, repeat_count
         );
 
-        // Enqueue to the channel's task queue (matches CDO path behavior).
-        if let Some(dma) = device.array.dma_engine_mut(col, 0) {
-            // Convert to absolute channel index
-            // For shim tiles, S2MM = 0-1, MM2S = 2-3
-            let abs_channel = if is_mm2s { 2 + channel } else { channel };
-
+        if let Some(dma) = device.array.dma_engine_mut(col, row) {
             if !dma.enqueue_task(abs_channel, bd_index, repeat_count, false) {
                 log::warn!("  DMA channel {} task queue overflow", abs_channel);
             } else {
                 log::info!("  DMA channel {} enqueued BD {} repeat={}", abs_channel, bd_index, repeat_count);
             }
         }
+    }
+
+    /// Check if a register offset is a DMA Task_Queue write within a channel block.
+    ///
+    /// Returns `(absolute_channel_index, is_mm2s)` if the offset matches a queue
+    /// register. Queue registers are at base + ch*stride + 4 within each block.
+    fn channel_from_queue_write(
+        offset: u32, base: u32, stride: u32, s2mm_count: u8, total: u8,
+    ) -> Option<(u8, bool)> {
+        if offset < base || stride == 0 {
+            return None;
+        }
+        let rel = offset - base;
+        if rel % stride != 4 {
+            return None; // Not a Task_Queue register (Ctrl is at +0, Queue at +4)
+        }
+        let ch = (rel / stride) as u8;
+        if ch >= total {
+            return None;
+        }
+        let is_mm2s = ch >= s2mm_count;
+        Some((ch, is_mm2s))
     }
 
     /// Get the count of executed instructions.
@@ -531,16 +571,51 @@ fn is_data_memory_offset(tile: &crate::device::tile::Tile, offset: u32) -> bool 
 ///
 /// Returns the BD index if the offset is within the BD region, None otherwise.
 /// BD region bounds are derived from the AM025 register database.
-fn shim_bd_index_for_offset(offset: u32) -> Option<u32> {
+/// Check if a BlockWrite targets a DMA BD region in any tile type.
+///
+/// Returns `(bd_index, tile_type)` if the offset falls within a BD register
+/// range. Row determines tile type: 0=shim, 1=memtile, >=2=compute.
+fn bd_index_for_blockwrite(row: u8, offset: u32) -> Option<(u8, TileType)> {
     let layout = crate::device::regdb::device_reg_layout();
-    let bd_base = layout.shim_bd_base;
-    let bd_stride = layout.shim_bd_stride;
-    let bd_end = layout.shim_channel_base; // Channel regs start right after BDs
 
-    if offset >= bd_base && offset < bd_end {
-        Some((offset - bd_base) / bd_stride)
-    } else {
-        None
+    match row {
+        0 => {
+            // Shim BD region
+            if offset >= layout.shim_bd_base && offset < layout.shim_channel_base {
+                let idx = (offset - layout.shim_bd_base) / layout.shim_bd_stride;
+                Some((idx as u8, TileType::Shim))
+            } else {
+                None
+            }
+        }
+        1 => {
+            // MemTile BD region
+            if offset >= layout.memtile_bd_base {
+                let rel = offset - layout.memtile_bd_base;
+                if rel < layout.memtile_bd_stride * 48 {
+                    let idx = rel / layout.memtile_bd_stride;
+                    Some((idx as u8, TileType::MemTile))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => {
+            // Compute tile BD region (memory module)
+            if offset >= layout.memory_bd_base {
+                let rel = offset - layout.memory_bd_base;
+                if rel < layout.memory_bd_stride * 16 {
+                    let idx = rel / layout.memory_bd_stride;
+                    Some((idx as u8, TileType::Compute))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
     }
 }
 
