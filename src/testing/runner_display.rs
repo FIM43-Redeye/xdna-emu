@@ -32,8 +32,8 @@ pub fn format_result(r: &TestResult, total: usize) -> String {
     let mut out = String::new();
 
     // Header: index, name, code sources
-    out.push_str(&format!("[{:2}/{}] {:40} ... ", r.idx + 1, total,
-        &r.name[..r.name.len().min(40)]));
+    out.push_str(&format!("[{:2}/{}] {:55} ... ", r.idx + 1, total,
+        &r.name[..r.name.len().min(55)]));
 
     if r.elf_count == 0 && r.embedded_count == 0 {
         out.push_str("(no code) ");

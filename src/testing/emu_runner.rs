@@ -512,9 +512,9 @@ fn run_unit_tests(
 
     for (idx, test) in filtered.iter().enumerate() {
         if let Some(ref reason) = test.skip_reason {
-            println!("[{:2}/{}] {:40} SKIP ({})",
+            println!("[{:2}/{}] {:55} SKIP ({})",
                 idx + 1, filtered_count,
-                &test.name[..test.name.len().min(40)],
+                &test.name[..test.name.len().min(55)],
                 reason);
             s.skipped += 1;
             continue;
@@ -534,9 +534,9 @@ fn run_unit_tests(
                 let cached = result.build_log == "(cached)";
                 let elapsed = test_start.elapsed();
                 let label = if cached { "cached" } else { "built" };
-                println!("[{:2}/{}] {:40} {} ({:.1}s)",
+                println!("[{:2}/{}] {:55} {} ({:.1}s)",
                     idx + 1, filtered_count,
-                    &test.name[..test.name.len().min(40)],
+                    &test.name[..test.name.len().min(55)],
                     label, elapsed.as_secs_f64());
                 s.built += 1;
                 build_results.push((test, result.prj_dir));
@@ -544,9 +544,9 @@ fn run_unit_tests(
             Err(e) => {
                 let elapsed = test_start.elapsed();
                 let msg = e.lines().next().unwrap_or(&e);
-                println!("[{:2}/{}] {:40} FAILED ({:.1}s): {}",
+                println!("[{:2}/{}] {:55} FAILED ({:.1}s): {}",
                     idx + 1, filtered_count,
-                    &test.name[..test.name.len().min(40)],
+                    &test.name[..test.name.len().min(55)],
                     elapsed.as_secs_f64(),
                     &msg[..msg.len().min(80)]);
                 s.build_failed += 1;
@@ -569,7 +569,7 @@ fn run_unit_tests(
             for (idx, (test, prj_dir)) in build_results.iter().enumerate() {
                 eprint!("\r[{:2}/{}] {}...",
                     idx + 1, build_results.len(),
-                    &test.name[..test.name.len().min(40)]);
+                    &test.name[..test.name.len().min(55)]);
                 io::stderr().flush().unwrap();
 
                 match aiesimulator::run_unit_simulation(
@@ -586,9 +586,9 @@ fn run_unit_tests(
                             "FAIL"
                         };
                         eprint!("\r{:60}\r", "");
-                        println!("[{:2}/{}] {:40} {} ({:.1}s)",
+                        println!("[{:2}/{}] {:55} {} ({:.1}s)",
                             idx + 1, build_results.len(),
-                            &test.name[..test.name.len().min(40)],
+                            &test.name[..test.name.len().min(55)],
                             label, result.wall_time_secs);
 
                         if opts.verbose && !result.passed {
@@ -601,9 +601,9 @@ fn run_unit_tests(
                         s.sim_error += 1;
                         eprint!("\r{:60}\r", "");
                         let msg = e.lines().next().unwrap_or(&e);
-                        println!("[{:2}/{}] {:40} ERROR: {}",
+                        println!("[{:2}/{}] {:55} ERROR: {}",
                             idx + 1, build_results.len(),
-                            &test.name[..test.name.len().min(40)],
+                            &test.name[..test.name.len().min(55)],
                             &msg[..msg.len().min(60)]);
                     }
                 }
@@ -626,7 +626,7 @@ fn run_sequential(suite: &XclbinSuite, tests: &[XclbinTest]) -> Vec<TestResult> 
     let mut results = Vec::with_capacity(total);
 
     for (i, test) in tests.iter().enumerate() {
-        eprint!("\r[{:2}/{}] {}...", i + 1, total, &test.name[..test.name.len().min(40)]);
+        eprint!("\r[{:2}/{}] {}...", i + 1, total, &test.name[..test.name.len().min(55)]);
         io::stderr().flush().unwrap();
 
         let elf_count = test.find_elf_files().len();
