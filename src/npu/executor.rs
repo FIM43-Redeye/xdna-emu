@@ -11,6 +11,59 @@ use crate::device::DeviceState;
 use crate::device::host_memory::HostMemory;
 use crate::device::tile::TileType;
 
+/// Result of a single `try_advance()` step.
+///
+/// The caller (run_engine or FFI loop) uses this to know whether
+/// execution is still in progress. The caller does not need to
+/// inspect internal state -- just check the variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdvanceResult {
+    /// Executed one instruction successfully. Call again next cycle.
+    Progressed,
+    /// Blocked waiting for a DMA queue to drain. Engine should keep
+    /// stepping; the executor will retry on the next try_advance() call.
+    Blocked,
+    /// All instructions have been executed. Executor is finished.
+    Done,
+    /// No instructions loaded or executor not started.
+    Idle,
+}
+
+/// Internal state of the NPU instruction executor.
+///
+/// Drives the state machine in `try_advance()`. Not exposed to callers
+/// except through `AdvanceResult`.
+#[derive(Debug, Clone)]
+pub(crate) enum ExecutorState {
+    /// No instruction stream loaded.
+    Idle,
+    /// Processing instructions. `next_index` is the index of the next
+    /// instruction to execute in the loaded stream.
+    Executing { next_index: usize },
+    /// Blocked on a full DMA task queue. Holds the pending enqueue
+    /// parameters so we can retry without re-executing the instruction.
+    BlockedOnQueue {
+        /// Index of the instruction that triggered the block (for logging).
+        instr_index: usize,
+        /// Index of the NEXT instruction after the blocked one completes.
+        next_index: usize,
+        /// Tile column with the full queue.
+        col: u8,
+        /// Tile row with the full queue.
+        row: u8,
+        /// Absolute channel index.
+        channel: u8,
+        /// BD index to enqueue.
+        bd_id: u8,
+        /// Repeat count for the task.
+        repeat: u8,
+        /// Enable_Token_Issue bit (Start_Queue bit 31). Stubbed for future use.
+        enable_token: bool,
+    },
+    /// All instructions executed.
+    Done,
+}
+
 /// Host buffer information for address patching.
 #[derive(Debug, Clone)]
 pub struct HostBuffer {
@@ -56,6 +109,10 @@ pub struct NpuExecutor {
     pending_syncs: Vec<PendingSync>,
     /// Warnings collected during execution (surfaced in test output).
     warnings: Vec<String>,
+    /// Internal state machine state.
+    state: ExecutorState,
+    /// Loaded instructions for interleaved execution via try_advance().
+    instructions: Vec<NpuInstruction>,
 }
 
 impl NpuExecutor {
@@ -66,12 +123,19 @@ impl NpuExecutor {
             executed_count: 0,
             pending_syncs: Vec::new(),
             warnings: Vec::new(),
+            state: ExecutorState::Idle,
+            instructions: Vec::new(),
         }
     }
 
     /// Get warnings collected during execution.
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+
+    /// Get the current executor state (for testing/debugging).
+    pub(crate) fn state(&self) -> &ExecutorState {
+        &self.state
     }
 
     /// Get pending sync conditions.
@@ -725,6 +789,30 @@ mod tests {
     fn test_executor_new() {
         let executor = NpuExecutor::new();
         assert_eq!(executor.executed_count(), 0);
+    }
+
+    #[test]
+    fn test_advance_result_variants() {
+        let results = [
+            AdvanceResult::Progressed,
+            AdvanceResult::Blocked,
+            AdvanceResult::Done,
+            AdvanceResult::Idle,
+        ];
+        for r in &results {
+            match r {
+                AdvanceResult::Progressed => {}
+                AdvanceResult::Blocked => {}
+                AdvanceResult::Done => {}
+                AdvanceResult::Idle => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_executor_initial_state_is_idle() {
+        let executor = NpuExecutor::new();
+        assert!(matches!(executor.state(), ExecutorState::Idle));
     }
 
     /// Verify that sync completion requires the channel to have been running
