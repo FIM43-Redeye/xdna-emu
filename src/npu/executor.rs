@@ -138,6 +138,18 @@ impl NpuExecutor {
         &self.state
     }
 
+    /// Whether the executor has finished processing all instructions.
+    ///
+    /// Returns true when all NPU instructions have been executed (state is
+    /// Done) or when no instructions were loaded (Idle). This is needed to
+    /// gate `syncs_satisfied()` checks -- sync conditions are only populated
+    /// as Sync instructions are executed, so checking before all instructions
+    /// are processed would see an empty pending_syncs and falsely report
+    /// completion.
+    pub fn is_done(&self) -> bool {
+        matches!(self.state, ExecutorState::Done | ExecutorState::Idle)
+    }
+
     /// Get pending sync conditions.
     pub fn pending_syncs(&self) -> &[PendingSync] {
         &self.pending_syncs

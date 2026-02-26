@@ -1273,10 +1273,11 @@ impl XclbinSuite {
             }
 
             // Check if DMA syncs are satisfied (NPU instruction sequence complete).
-            // This mirrors the FFI path in ffi/mod.rs and is the primary completion
-            // signal for AIE2 kernels which are infinite loops.
+            // Only check after all NPU instructions have been executed -- Sync
+            // instructions are interleaved one-per-cycle, so pending_syncs is
+            // not fully populated until the executor reaches Done state.
             if let Some(executor) = npu_executor.as_mut() {
-                if executor.syncs_satisfied(engine.device()) {
+                if executor.is_done() && executor.syncs_satisfied(engine.device()) {
                     log::info!("DMA syncs satisfied after {} cycles for test {}", cycles, test.name);
                     return self.make_completion_outcome(engine, test, input_values, cycles, output_addr);
                 }

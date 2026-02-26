@@ -530,15 +530,19 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
             break;
         }
 
-        // Check if DMA syncs are satisfied (execution complete)
-        if handle.npu_executor.syncs_satisfied(handle.engine.device()) {
+        // Check if DMA syncs are satisfied (execution complete).
+        // Only check after all NPU instructions have been processed.
+        if handle.npu_executor.is_done()
+            && handle.npu_executor.syncs_satisfied(handle.engine.device())
+        {
             log::info!("All DMA syncs satisfied after {} cycles", cycles);
             break;
         }
     }
 
     let halted = handle.engine.status() == EngineStatus::Halted
-        || handle.npu_executor.syncs_satisfied(handle.engine.device());
+        || (handle.npu_executor.is_done()
+            && handle.npu_executor.syncs_satisfied(handle.engine.device()));
 
     XdnaEmuExecStatus {
         result: XdnaEmuResult::Success,
