@@ -25,6 +25,8 @@ pub struct TestResult {
     pub raw_output: Option<Vec<u8>>,
     /// Hardware cross-validation result (if npu-outputs are available).
     pub hw_validation: Option<HardwareValidation>,
+    /// Warnings collected during emulator execution (e.g., DMA queue full).
+    pub warnings: Vec<String>,
 }
 
 /// Format a test result line for display.
@@ -114,6 +116,14 @@ pub fn format_result(r: &TestResult, total: usize) -> String {
             Diagnosis::BothBroken => {
                 out.push_str("\n      hw: BOTH BROKEN (emulator and hardware both wrong)");
             }
+        }
+    }
+
+    // Append per-test warnings (DMA queue full, parse errors, etc.)
+    if !r.warnings.is_empty() {
+        out.push_str(&format!("\n      warnings ({}):", r.warnings.len()));
+        for w in &r.warnings {
+            out.push_str(&format!("\n        - {}", w));
         }
     }
 

@@ -91,6 +91,11 @@ pub struct RunStats {
     pub hw_cascade_stopped_at: Option<usize>,
     /// Number of tests that were not attempted on hardware due to cascade.
     pub hw_cascade_skipped: usize,
+    // Per-test warnings (DMA queue full, parse errors, etc.)
+    /// Total warnings across all tests.
+    pub total_warnings: usize,
+    /// Number of tests that had at least one warning.
+    pub tests_with_warnings: usize,
 }
 
 impl RunStats {
@@ -172,6 +177,13 @@ impl RunStats {
         }
     }
 
+    pub fn record_warnings(&mut self, count: usize) {
+        if count > 0 {
+            self.total_warnings += count;
+            self.tests_with_warnings += 1;
+        }
+    }
+
     pub fn record_differential(&mut self, peano_pass: bool, chess_pass: bool) {
         match (peano_pass, chess_pass) {
             (true, true) => self.both_pass += 1,
@@ -213,6 +225,11 @@ impl RunStats {
             println!("Unknown:          {}", self.unknown);
             println!("Timeout:          {}", self.timeout);
             println!("Load Error:       {}", self.load_error);
+        }
+
+        // Per-test warnings
+        if self.total_warnings > 0 {
+            println!("Warnings:         {} ({} tests)", self.total_warnings, self.tests_with_warnings);
         }
 
         // Hardware cross-validation (from captured npu-outputs dir)

@@ -54,6 +54,8 @@ pub struct NpuExecutor {
     executed_count: usize,
     /// Pending sync conditions from Sync instructions.
     pending_syncs: Vec<PendingSync>,
+    /// Warnings collected during execution (surfaced in test output).
+    warnings: Vec<String>,
 }
 
 impl NpuExecutor {
@@ -63,7 +65,13 @@ impl NpuExecutor {
             host_buffers: Vec::new(),
             executed_count: 0,
             pending_syncs: Vec::new(),
+            warnings: Vec::new(),
         }
+    }
+
+    /// Get warnings collected during execution.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// Get pending sync conditions.
@@ -207,7 +215,7 @@ impl NpuExecutor {
     }
 
     /// Execute a Write32 instruction.
-    fn execute_write32(&self, reg_off: u32, value: u32, device: &mut DeviceState, host_memory: &mut HostMemory) -> Result<(), String> {
+    fn execute_write32(&mut self, reg_off: u32, value: u32, device: &mut DeviceState, host_memory: &mut HostMemory) -> Result<(), String> {
         log::debug!("NPU Write32: reg=0x{:08X} value=0x{:08X}", reg_off, value);
 
         // Decode tile address from register offset
@@ -236,7 +244,7 @@ impl NpuExecutor {
     }
 
     /// Execute a BlockWrite instruction.
-    fn execute_blockwrite(&self, reg_off: u32, values: &[u32], device: &mut DeviceState, host_memory: &mut HostMemory) -> Result<(), String> {
+    fn execute_blockwrite(&mut self, reg_off: u32, values: &[u32], device: &mut DeviceState, host_memory: &mut HostMemory) -> Result<(), String> {
         log::debug!(
             "NPU BlockWrite: reg=0x{:08X} count={}",
             reg_off,
@@ -327,7 +335,7 @@ impl NpuExecutor {
     }
 
     /// Execute a MaskWrite instruction.
-    fn execute_maskwrite(&self, reg_off: u32, value: u32, mask: u32, device: &mut DeviceState, host_memory: &mut HostMemory) -> Result<(), String> {
+    fn execute_maskwrite(&mut self, reg_off: u32, value: u32, mask: u32, device: &mut DeviceState, host_memory: &mut HostMemory) -> Result<(), String> {
         log::debug!(
             "NPU MaskWrite: reg=0x{:08X} value=0x{:08X} mask=0x{:08X}",
             reg_off, value, mask
@@ -440,7 +448,7 @@ impl NpuExecutor {
     }
 
     /// Check if a register write triggers DMA operation.
-    fn check_dma_trigger(&self, col: u8, row: u8, offset: u32, value: u32, device: &mut DeviceState, host_memory: &mut HostMemory) {
+    fn check_dma_trigger(&mut self, col: u8, row: u8, offset: u32, value: u32, device: &mut DeviceState, host_memory: &mut HostMemory) {
         // DMA Task_Queue registers trigger DMA channel start when written.
         // Each channel has Ctrl at +0 and Task_Queue at +4 within its stride.
         // Register layouts differ by tile type but all share the same format:
@@ -546,11 +554,13 @@ impl NpuExecutor {
                 // Queue never drained -- likely needs full system stepping
                 // (cores + stream routing) which we can't do during NPU instruction
                 // execution. Log once and drop the task.
-                log::warn!(
+                let msg = format!(
                     "DMA tile({},{}) ch{} task queue full, BD {} dropped \
                      (queue could not drain during instruction execution)",
                     col, row, abs_channel, bd_index
                 );
+                log::warn!("{}", msg);
+                self.warnings.push(msg);
                 return;
             }
         }

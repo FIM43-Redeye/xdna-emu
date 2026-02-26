@@ -203,6 +203,7 @@ fn process_test(
     if let Some(ref r) = emu {
         println!("{}", runner_display::format_result(r, ctx.total));
         stats.record_emu_outcome(&r.outcome);
+        stats.record_warnings(r.warnings.len());
         if let Some(ref hv) = r.hw_validation {
             stats.record_hw_validation(hv);
         }
@@ -728,7 +729,7 @@ fn run_sequential(suite: &XclbinSuite, tests: &[XclbinTest]) -> Vec<TestResult> 
         let elf_count = test.find_elf_files().len();
         let embedded_count = test.count_embedded_cores();
         let has_npu = test.find_insts_file().is_some();
-        let (outcome, raw_output, hw_validation) = suite.run_single_with_hw_validation(test);
+        let (outcome, raw_output, hw_validation, warnings) = suite.run_single_with_hw_validation(test);
 
         results.push(TestResult {
             idx: i,
@@ -739,6 +740,7 @@ fn run_sequential(suite: &XclbinSuite, tests: &[XclbinTest]) -> Vec<TestResult> 
             outcome,
             raw_output,
             hw_validation,
+            warnings,
         });
     }
     eprint!("\r{:60}\r", ""); // Clear progress line
@@ -770,7 +772,7 @@ fn run_parallel(suite: &XclbinSuite, tests: &[XclbinTest], jobs: usize) -> Vec<T
                     let elf_count = test.find_elf_files().len();
                     let embedded_count = test.count_embedded_cores();
                     let has_npu = test.find_insts_file().is_some();
-                    let (outcome, raw_output, hw_validation) = suite.run_single_with_hw_validation(test);
+                    let (outcome, raw_output, hw_validation, warnings) = suite.run_single_with_hw_validation(test);
 
                     let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
                     eprint!("\r  [{}/{}] completed", done, total);
@@ -784,6 +786,7 @@ fn run_parallel(suite: &XclbinSuite, tests: &[XclbinTest], jobs: usize) -> Vec<T
                         outcome,
                         raw_output,
                         hw_validation,
+                        warnings,
                     });
                 }
             });

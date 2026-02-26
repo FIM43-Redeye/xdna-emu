@@ -617,7 +617,7 @@ impl XclbinSuite {
         let tests: Vec<_> = self.tests.clone();
 
         for test in tests {
-            let (outcome, raw_output, trace, _) = self.run_single_inner(&test);
+            let (outcome, raw_output, trace, _, _) = self.run_single_inner(&test);
             self.trace_events.extend(trace);
 
             match &outcome {
@@ -672,7 +672,7 @@ impl XclbinSuite {
 
     /// Run a single test.
     pub fn run_single(&self, test: &XclbinTest) -> TestOutcome {
-        let (outcome, _, _, _) = self.run_single_inner(test);
+        let (outcome, _, _, _, _) = self.run_single_inner(test);
         outcome
     }
 
@@ -683,7 +683,7 @@ impl XclbinSuite {
     /// The output bytes are `None` if the engine could not be created or
     /// the test was skipped.
     pub fn run_single_with_output(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>) {
-        let (outcome, output, _, _) = self.run_single_inner(test);
+        let (outcome, output, _, _, _) = self.run_single_inner(test);
         (outcome, output)
     }
 
@@ -697,7 +697,7 @@ impl XclbinSuite {
     /// The binary_trace_buffer contains raw trace packets from the hardware
     /// trace units, in the same format as real NPU hardware produces.
     pub fn run_single_with_trace(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Vec<crate::interpreter::engine::TileTracedEvent>, Option<Vec<u8>>) {
-        let (outcome, raw_output, trace_events, trace_buf) = self.run_single_inner(test);
+        let (outcome, raw_output, trace_events, trace_buf, _) = self.run_single_inner(test);
         (outcome, raw_output, trace_events, trace_buf)
     }
 
@@ -705,10 +705,10 @@ impl XclbinSuite {
     ///
     /// Returns the test outcome, raw output, and optional hardware
     /// cross-validation diagnosis.
-    pub fn run_single_with_hw_validation(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Option<HardwareValidation>) {
-        let (outcome, raw_output, _, _) = self.run_single_inner(test);
+    pub fn run_single_with_hw_validation(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Option<HardwareValidation>, Vec<String>) {
+        let (outcome, raw_output, _, _, warnings) = self.run_single_inner(test);
         let hw_validation = self.cross_validate(test, raw_output.as_deref());
-        (outcome, raw_output, hw_validation)
+        (outcome, raw_output, hw_validation, warnings)
     }
 
     /// Cross-validate emulator output against captured hardware reference.
@@ -741,16 +741,17 @@ impl XclbinSuite {
 
     /// Shared implementation for run_single and run_single_with_output.
     ///
-    /// Returns (outcome, raw_output, trace_events, binary_trace_buffer).
+    /// Returns (outcome, raw_output, trace_events, binary_trace_buffer, warnings).
     /// The trace_events are collected from the engine after execution for
     /// Perfetto export. The binary_trace_buffer contains raw packets from
     /// hardware trace units that flowed through stream switch to host DDR.
-    fn run_single_inner(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Vec<crate::interpreter::engine::TileTracedEvent>, Option<Vec<u8>>) {
+    /// Warnings are collected from the NPU executor during instruction execution.
+    fn run_single_inner(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Vec<crate::interpreter::engine::TileTracedEvent>, Option<Vec<u8>>, Vec<String>) {
         // Check if test overrides say to skip this test
         if let Some(ref reason) = test.skip_reason {
             return (TestOutcome::Skipped {
                 reason: reason.clone(),
-            }, None, Vec::new(), None);
+            }, None, Vec::new(), None, Vec::new());
         }
 
         // Load xclbin
@@ -759,7 +760,7 @@ impl XclbinSuite {
             Err(e) => {
                 return (TestOutcome::LoadError {
                     message: format!("Failed to load xclbin: {}", e),
-                }, None, Vec::new(), None);
+                }, None, Vec::new(), None, Vec::new());
             }
         };
 
@@ -769,7 +770,7 @@ impl XclbinSuite {
             None => {
                 return (TestOutcome::LoadError {
                     message: "No AIE partition in xclbin".to_string(),
-                }, None, Vec::new(), None);
+                }, None, Vec::new(), None, Vec::new());
             }
         };
 
@@ -779,7 +780,7 @@ impl XclbinSuite {
             Err(e) => {
                 return (TestOutcome::LoadError {
                     message: format!("Failed to parse AIE partition: {}", e),
-                }, None, Vec::new(), None);
+                }, None, Vec::new(), None, Vec::new());
             }
         };
 
@@ -789,7 +790,7 @@ impl XclbinSuite {
             None => {
                 return (TestOutcome::LoadError {
                     message: "No primary PDI in partition".to_string(),
-                }, None, Vec::new(), None);
+                }, None, Vec::new(), None, Vec::new());
             }
         };
 
@@ -798,7 +799,7 @@ impl XclbinSuite {
             None => {
                 return (TestOutcome::LoadError {
                     message: "No CDO found in PDI".to_string(),
-                }, None, Vec::new(), None);
+                }, None, Vec::new(), None, Vec::new());
             }
         };
 
@@ -807,7 +808,7 @@ impl XclbinSuite {
             Err(e) => {
                 return (TestOutcome::LoadError {
                     message: format!("Failed to parse CDO: {}", e),
-                }, None, Vec::new(), None);
+                }, None, Vec::new(), None, Vec::new());
             }
         };
 
@@ -816,7 +817,7 @@ impl XclbinSuite {
         if let Err(e) = engine.device_mut().apply_cdo(&cdo) {
             return (TestOutcome::LoadError {
                 message: format!("Failed to apply CDO: {}", e),
-            }, None, Vec::new(), None);
+            }, None, Vec::new(), None, Vec::new());
         }
 
         // Populate host memory - use buffer spec if available, else defaults.
@@ -842,12 +843,15 @@ impl XclbinSuite {
         // The NpuExecutor must survive until run_engine() so its collected
         // sync conditions can be checked as a completion signal.
         let mut npu_executor: Option<NpuExecutor> = None;
+        let mut test_warnings: Vec<String> = Vec::new();
 
         if let Some(insts_path) = test.find_insts_file() {
             let insts_data = match std::fs::read(&insts_path) {
                 Ok(d) => d,
                 Err(e) => {
-                    log::warn!("Failed to read insts.bin: {}", e);
+                    let msg = format!("Failed to read insts.bin: {}", e);
+                    log::warn!("[{}] {}", test.name, msg);
+                    test_warnings.push(msg);
                     // Continue without NPU instructions - some tests may not need them
                     Vec::new()
                 }
@@ -868,13 +872,17 @@ impl XclbinSuite {
 
                         let (device, host_mem) = engine.device_and_host_memory();
                         if let Err(e) = executor.execute(&stream, device, host_mem) {
-                            log::warn!("NPU instruction execution error: {}", e);
+                            let msg = format!("NPU instruction execution error: {}", e);
+                            log::warn!("[{}] {}", test.name, msg);
+                            test_warnings.push(msg);
                         }
 
                         npu_executor = Some(executor);
                     }
                     Err(e) => {
-                        log::warn!("Failed to parse insts.bin: {}", e);
+                        let msg = format!("Failed to parse insts.bin: {}", e);
+                        log::warn!("[{}] {}", test.name, msg);
+                        test_warnings.push(msg);
                     }
                 }
             }
@@ -891,14 +899,14 @@ impl XclbinSuite {
                 Err(e) => {
                     return (TestOutcome::LoadError {
                         message: format!("Failed to read ELF {:?}: {}", path, e),
-                    }, None, Vec::new(), None);
+                    }, None, Vec::new(), None, Vec::new());
                 }
             };
 
             if let Err(e) = engine.load_elf_bytes(*col as usize, *row as usize, &data) {
                 return (TestOutcome::LoadError {
                     message: format!("Failed to load ELF into ({},{}): {}", col, row, e),
-                }, None, Vec::new(), None);
+                }, None, Vec::new(), None, Vec::new());
             }
         }
 
@@ -914,7 +922,7 @@ impl XclbinSuite {
             // engine steps DMA engines + stream switches until completion.
             return (TestOutcome::Skipped {
                 reason: "No core code and no NPU instructions to execute".to_string(),
-            }, None, Vec::new(), None);
+            }, None, Vec::new(), None, Vec::new());
         }
 
         // Run until halt, sync completion, error, or timeout
@@ -1008,7 +1016,12 @@ impl XclbinSuite {
             outcome
         };
 
-        (final_outcome, raw_output, trace_events, binary_trace_buf)
+        // Merge test-level warnings with NPU executor warnings
+        if let Some(ref exec) = npu_executor {
+            test_warnings.extend(exec.warnings().iter().cloned());
+        }
+
+        (final_outcome, raw_output, trace_events, binary_trace_buf, test_warnings)
     }
 
     /// Capture raw output bytes from host memory.
