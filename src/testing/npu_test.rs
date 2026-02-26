@@ -203,10 +203,17 @@ fn discover_recursive(base: &Path, dir: &Path, tests: &mut Vec<NpuTestSource>) {
 
 /// Find the test entry point file in a directory.
 ///
-/// Priority: `run.lit` > `aie2.py` > other `.py` with RUN lines > `aie.mlir`.
-/// Returns the entry file path and its parsed annotations.
+/// Matches lit's discovery rules for npu-xrt: `.lit` and `.py` files are
+/// test entry points (per `lit.local.cfg: config.suffixes = [".lit", ".py"]`).
+/// Only `util.py` is excluded (lit's `config.excludes`).
+///
+/// Priority when multiple candidates exist:
+///   `run.lit` > `aie2.py` > other `.py` with RUN lines > `aie.mlir`
+///
+/// The `aie.mlir` fallback is not a lit suffix in npu-xrt but is kept for
+/// robustness with other test trees that may use `.mlir` as their suffix.
 fn find_entry_point(dir: &Path) -> Option<(PathBuf, Annotations)> {
-    // 1. run.lit (highest priority -- always the driver when present)
+    // 1. run.lit (highest priority -- explicit test driver)
     let run_lit = dir.join("run.lit");
     if run_lit.exists() {
         let ann = parse_annotations(&run_lit);
@@ -215,7 +222,7 @@ fn find_entry_point(dir: &Path) -> Option<(PathBuf, Annotations)> {
         }
     }
 
-    // 2. aie2.py (standard Python MLIR generator)
+    // 2. aie2.py (standard MLIR generator, preferred over other .py)
     let aie2_py = dir.join("aie2.py");
     if aie2_py.exists() {
         let ann = parse_annotations(&aie2_py);
@@ -224,27 +231,34 @@ fn find_entry_point(dir: &Path) -> Option<(PathBuf, Annotations)> {
         }
     }
 
-    // 3. Other .py files with RUN lines (e.g. ext_to_core_L2_placed.py)
+    // 3. Any other .py file with RUN lines (sorted for determinism).
+    //    Matches lit's suffix rule: all .py files are potential tests.
+    //    Only skip aie2.py (already checked above) and util.py (lit excludes it).
     if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().map_or(false, |e| e == "py") {
-                let name = path.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
-                // Skip known non-entry-point Python files
-                if name == "test.py" || name == "aie2.py" {
-                    continue;
+        let mut py_files: Vec<_> = entries.flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                if path.extension().map_or(false, |e| e == "py") {
+                    let name = path.file_name()?.to_str()?.to_string();
+                    if name != "aie2.py" && name != "util.py" {
+                        return Some(path);
+                    }
                 }
-                let ann = parse_annotations(&path);
-                if !ann.run_lines.is_empty() {
-                    return Some((path, ann));
-                }
+                None
+            })
+            .collect();
+        py_files.sort();
+
+        for path in py_files {
+            let ann = parse_annotations(&path);
+            if !ann.run_lines.is_empty() {
+                return Some((path, ann));
             }
         }
     }
 
-    // 4. aie.mlir (fallback, rarely used as entry point in npu-xrt)
+    // 4. aie.mlir (fallback -- not a lit suffix in npu-xrt, but kept for
+    //    robustness with other test trees)
     let aie_mlir = dir.join("aie.mlir");
     if aie_mlir.exists() {
         let ann = parse_annotations(&aie_mlir);

@@ -1245,6 +1245,10 @@ fn discover_chess_artifacts(chess_dir: &Path) -> HashMap<String, ChessBuildArtif
     }
 
     // Walk the directory tree looking for xclbin files.
+    //
+    // Mirrors XclbinSuite::discover_recursive: directories with a single
+    // xclbin produce one entry named after the directory; directories with
+    // multiple xclbins produce one entry per variant (dir_name/stem).
     fn walk(dir: &Path, prefix: &str, results: &mut HashMap<String, ChessBuildArtifacts>) {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
@@ -1260,22 +1264,55 @@ fn discover_chess_artifacts(chess_dir: &Path) -> HashMap<String, ChessBuildArtif
                     format!("{}/{}", prefix, name)
                 };
 
-                // Check for xclbin in this directory
-                let xclbin = find_xclbin(&path);
-                if let Some(xclbin) = xclbin {
-                    let insts = find_insts(&path);
-                    let prj = find_prj_dir(&path);
-                    results.insert(full_name.clone(), ChessBuildArtifacts {
-                        xclbin,
-                        insts,
-                        prj_dir: prj,
-                    });
-                } else {
-                    // Recurse into subdirectory (for nested test layout)
-                    walk(&path, &full_name, results);
+                let xclbins = collect_xclbins(&path);
+                match xclbins.len() {
+                    0 => {
+                        // No xclbins -- recurse into subdirectory
+                        walk(&path, &full_name, results);
+                    }
+                    1 => {
+                        // Single xclbin: one entry named after directory
+                        let insts = find_insts(&path);
+                        let prj = find_prj_dir(&path);
+                        results.insert(full_name, ChessBuildArtifacts {
+                            xclbin: xclbins.into_iter().next().unwrap(),
+                            insts,
+                            prj_dir: prj,
+                        });
+                    }
+                    _ => {
+                        // Multiple xclbins: one entry per variant
+                        for xclbin in &xclbins {
+                            let stem = xclbin.file_stem()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let variant_name = format!("{}/{}", full_name, stem);
+                            let insts = find_matching_insts_chess(&path, &stem);
+                            let prj = find_prj_dir(&path);
+                            results.insert(variant_name, ChessBuildArtifacts {
+                                xclbin: xclbin.clone(),
+                                insts,
+                                prj_dir: prj,
+                            });
+                        }
+                    }
                 }
             }
         }
+    }
+
+    fn collect_xclbins(dir: &Path) -> Vec<PathBuf> {
+        let mut xclbins = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().is_some_and(|e| e == "xclbin") {
+                    xclbins.push(p);
+                }
+            }
+        }
+        xclbins.sort();
+        xclbins
     }
 
     fn find_insts(dir: &Path) -> Option<PathBuf> {
@@ -1286,21 +1323,29 @@ fn discover_chess_artifacts(chess_dir: &Path) -> HashMap<String, ChessBuildArtif
         None
     }
 
-    fn find_xclbin(dir: &Path) -> Option<PathBuf> {
-        // Prefer aie.xclbin, fall back to final.xclbin or any .xclbin
-        let aie = dir.join("aie.xclbin");
-        if aie.exists() { return Some(aie); }
-        let fin = dir.join("final.xclbin");
-        if fin.exists() { return Some(fin); }
-        // Last resort: any xclbin
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().is_some_and(|e| e == "xclbin") {
-                    return Some(p);
+    /// Find the matching insts file for a multi-variant xclbin.
+    /// Convention: aie2_buffer.xclbin -> insts2_buffer.txt (aie->insts swap)
+    fn find_matching_insts_chess(dir: &Path, xclbin_stem: &str) -> Option<PathBuf> {
+        // Convention: swap "aie" prefix to "insts", keep the rest
+        if let Some(suffix) = xclbin_stem.strip_prefix("aie") {
+            let insts_stem = format!("insts{}", suffix);
+            for ext in &["txt", "bin"] {
+                let candidate = dir.join(format!("{}.{}", insts_stem, ext));
+                if candidate.exists() {
+                    return Some(candidate);
                 }
             }
         }
+        // Fallback: try <stem>.txt and <stem>.bin
+        for ext in &["txt", "bin"] {
+            let candidate = dir.join(format!("{}.{}", xclbin_stem, ext));
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+        // Last fallback: shared insts.bin
+        let bin = dir.join("insts.bin");
+        if bin.exists() { return Some(bin); }
         None
     }
 
