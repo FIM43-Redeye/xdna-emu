@@ -33,9 +33,279 @@
 //! 2. Write to tile memory at current address
 //! 3. Advance address generator
 
-use super::addressing::AddressGenerator;
+use super::addressing::{AddressGenerator, ZeroPadConfig};
 use super::{BdConfig, DmaError};
 use crate::device::tile::TileType;
+
+/// What a padded transfer should output on the next cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PadAction {
+    /// Read a data word from memory at the given address.
+    Data(u64),
+    /// Emit a zero word (padding, no memory read).
+    Zero,
+}
+
+/// Phase within the zero-padding state machine.
+///
+/// The output pattern for a padded transfer follows nested dimension loops:
+///
+/// ```text
+/// for each D2 iteration:
+///   [d2_before zeros]
+///   for each D1 iteration:
+///     [d1_before zeros]
+///     [d0_before zeros] [d0_size data words] [d0_after zeros]
+///     [d1_after zeros]
+///   [d2_after zeros]
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PadPhase {
+    D2Before,
+    D1Before,
+    D0Before,
+    D0Data,
+    D0After,
+    D1After,
+    D2After,
+    Done,
+}
+
+/// Tracks zero-padding state for a MemTile MM2S transfer.
+///
+/// Wraps around the address generator: on each `next()` call, returns either
+/// `PadAction::Data(addr)` (read from memory) or `PadAction::Zero` (emit zero).
+/// The address generator only advances for data words.
+#[derive(Debug, Clone)]
+pub struct ZeroPadState {
+    config: ZeroPadConfig,
+    phase: PadPhase,
+    /// Remaining words in the current phase
+    phase_remaining: u32,
+    /// D0 data size (from dimension config)
+    d0_size: u32,
+    /// D1 iteration count
+    d1_size: u32,
+    /// D2 iteration count
+    d2_size: u32,
+    /// Current D1 counter (0..d1_size)
+    d1_counter: u32,
+    /// Current D2 counter (0..d2_size)
+    d2_counter: u32,
+    /// Total output words (data + padding) for the whole transfer
+    total_output_words: u64,
+    /// Output words emitted so far
+    words_emitted: u64,
+}
+
+impl ZeroPadState {
+    /// Create a new padding state from BD dimensions and padding config.
+    pub fn new(
+        config: ZeroPadConfig,
+        d0_size: u32,
+        d1_size: u32,
+        d2_size: u32,
+    ) -> Self {
+        let d0_eff = if d0_size == 0 { 1 } else { d0_size };
+        let d1_eff = if d1_size == 0 { 1 } else { d1_size };
+        let d2_eff = if d2_size == 0 { 1 } else { d2_size };
+
+        let data_words = d0_eff as u64 * d1_eff as u64 * d2_eff as u64;
+        let pad_words = config.total_pad_words(d1_eff, d2_eff);
+        let total = data_words + pad_words;
+
+        // Start at D2Before if there are D2-level before zeros, otherwise
+        // cascade down through the phase hierarchy
+        let (phase, phase_remaining) = Self::enter_d2_iteration(&config, d0_eff);
+
+        Self {
+            config,
+            phase,
+            phase_remaining,
+            d0_size: d0_eff,
+            d1_size: d1_eff,
+            d2_size: d2_eff,
+            d1_counter: 0,
+            d2_counter: 0,
+            total_output_words: total,
+            words_emitted: 0,
+        }
+    }
+
+    /// Total output words (data + padding).
+    pub fn total_output_words(&self) -> u64 {
+        self.total_output_words
+    }
+
+    /// Whether all output words have been emitted.
+    pub fn is_finished(&self) -> bool {
+        self.phase == PadPhase::Done || self.words_emitted >= self.total_output_words
+    }
+
+    /// Remaining output words.
+    pub fn remaining(&self) -> u64 {
+        self.total_output_words.saturating_sub(self.words_emitted)
+    }
+
+    /// Get the next output action without advancing state.
+    pub fn current_action(&self, addr_gen: &AddressGenerator) -> PadAction {
+        match self.phase {
+            PadPhase::D0Data => PadAction::Data(addr_gen.current()),
+            PadPhase::Done => PadAction::Zero, // shouldn't be called, but safe
+            _ => PadAction::Zero,
+        }
+    }
+
+    /// Advance the state machine by one output word.
+    ///
+    /// Returns true if the address generator should also be advanced
+    /// (i.e., the word was data, not padding).
+    pub fn advance(&mut self) -> bool {
+        if self.phase == PadPhase::Done {
+            return false;
+        }
+
+        self.words_emitted += 1;
+        let is_data = self.phase == PadPhase::D0Data;
+
+        self.phase_remaining = self.phase_remaining.saturating_sub(1);
+        if self.phase_remaining == 0 {
+            self.transition();
+        }
+
+        is_data
+    }
+
+    /// Transition to the next phase when the current phase is exhausted.
+    fn transition(&mut self) {
+        match self.phase {
+            PadPhase::D2Before => {
+                let (phase, remaining) = Self::enter_d1_iteration(&self.config, self.d0_size);
+                self.phase = phase;
+                self.phase_remaining = remaining;
+            }
+            PadPhase::D1Before => {
+                self.phase = if self.config.d0_before > 0 {
+                    PadPhase::D0Before
+                } else {
+                    PadPhase::D0Data
+                };
+                self.phase_remaining = if self.config.d0_before > 0 {
+                    self.config.d0_before as u32
+                } else {
+                    self.d0_size
+                };
+            }
+            PadPhase::D0Before => {
+                self.phase = PadPhase::D0Data;
+                self.phase_remaining = self.d0_size;
+            }
+            PadPhase::D0Data => {
+                if self.config.d0_after > 0 {
+                    self.phase = PadPhase::D0After;
+                    self.phase_remaining = self.config.d0_after as u32;
+                } else {
+                    // D0 done, emit d1_after for this D1 iteration
+                    self.emit_d1_after();
+                }
+            }
+            PadPhase::D0After => {
+                // D0 done, emit d1_after for this D1 iteration
+                self.emit_d1_after();
+            }
+            PadPhase::D1After => {
+                // D1 after emitted for this iteration, advance D1 counter
+                self.d1_counter += 1;
+                if self.d1_counter < self.d1_size {
+                    // More D1 iterations remain
+                    let (phase, remaining) = Self::enter_d1_iteration(
+                        &self.config, self.d0_size,
+                    );
+                    self.phase = phase;
+                    self.phase_remaining = remaining;
+                } else {
+                    // All D1 iterations done
+                    self.finish_d2_iteration();
+                }
+            }
+            PadPhase::D2After => {
+                self.d2_counter += 1;
+                if self.d2_counter < self.d2_size {
+                    let (phase, remaining) = Self::enter_d2_iteration(
+                        &self.config, self.d0_size,
+                    );
+                    self.phase = phase;
+                    self.phase_remaining = remaining;
+                } else {
+                    self.phase = PadPhase::Done;
+                    self.phase_remaining = 0;
+                }
+            }
+            PadPhase::Done => {}
+        }
+    }
+
+    /// Emit D1 after-padding for the current D1 iteration, or skip to
+    /// the next phase if d1_after is zero.
+    fn emit_d1_after(&mut self) {
+        if self.config.d1_after > 0 {
+            self.phase = PadPhase::D1After;
+            self.phase_remaining = self.config.d1_after as u32;
+        } else {
+            // No d1_after, advance D1 counter directly
+            self.d1_counter += 1;
+            if self.d1_counter < self.d1_size {
+                let (phase, remaining) = Self::enter_d1_iteration(
+                    &self.config, self.d0_size,
+                );
+                self.phase = phase;
+                self.phase_remaining = remaining;
+            } else {
+                self.finish_d2_iteration();
+            }
+        }
+    }
+
+    /// Called when all D1 iterations within a D2 iteration are done.
+    fn finish_d2_iteration(&mut self) {
+        if self.config.d2_after > 0 {
+            self.phase = PadPhase::D2After;
+            self.phase_remaining = self.config.d2_after as u32;
+        } else {
+            self.d2_counter += 1;
+            if self.d2_counter < self.d2_size {
+                let (phase, remaining) = Self::enter_d2_iteration(
+                    &self.config, self.d0_size,
+                );
+                self.phase = phase;
+                self.phase_remaining = remaining;
+            } else {
+                self.phase = PadPhase::Done;
+                self.phase_remaining = 0;
+            }
+        }
+    }
+
+    /// Determine initial phase when entering a new D2 iteration.
+    fn enter_d2_iteration(config: &ZeroPadConfig, d0_size: u32) -> (PadPhase, u32) {
+        if config.d2_before > 0 {
+            (PadPhase::D2Before, config.d2_before as u32)
+        } else {
+            Self::enter_d1_iteration(config, d0_size)
+        }
+    }
+
+    /// Determine initial phase when entering a new D1 iteration.
+    fn enter_d1_iteration(config: &ZeroPadConfig, d0_size: u32) -> (PadPhase, u32) {
+        if config.d1_before > 0 {
+            (PadPhase::D1Before, config.d1_before as u32)
+        } else if config.d0_before > 0 {
+            (PadPhase::D0Before, config.d0_before as u32)
+        } else {
+            (PadPhase::D0Data, d0_size)
+        }
+    }
+}
 
 /// Lock acquisition mode for DMA transfers.
 ///
@@ -213,6 +483,10 @@ pub struct Transfer {
     /// Cycle count for this transfer (for timing)
     pub cycles_elapsed: u64,
 
+    /// Zero-padding state machine (MemTile MM2S only).
+    /// When Some, the transfer inserts zero words at dimension boundaries.
+    pub zero_pad_state: Option<ZeroPadState>,
+
     /// Last error (if any)
     pub error: Option<DmaError>,
 }
@@ -251,8 +525,31 @@ impl Transfer {
         // Total transfer size: BD length (per-iteration) * number of iterations.
         // Buffer_Length sets the per-iteration data volume; iteration repeats
         // the entire dimensional pattern with an address offset.
-        let total_bytes = bd_config.length as u64
+        let data_bytes = bd_config.length as u64
             * bd_config.iteration.total_iterations() as u64;
+
+        // Zero-padding adds extra output words for MemTile MM2S only.
+        // The padding state machine tracks where to insert zeros.
+        let pad = &bd_config.zero_padding;
+        let zero_pad_state = if pad.is_enabled()
+            && direction == TransferDirection::MM2S
+            && tile_type == TileType::MemTile
+        {
+            Some(ZeroPadState::new(
+                *pad,
+                bd_config.d0.effective_size(),
+                bd_config.d1.effective_size(),
+                bd_config.d2.effective_size(),
+            ))
+        } else {
+            None
+        };
+
+        // Total output includes padding words (each is 4 bytes)
+        let pad_bytes = zero_pad_state.as_ref()
+            .map(|s| (s.total_output_words() - address_gen.total_elements()) * 4)
+            .unwrap_or(0);
+        let total_bytes = data_bytes + pad_bytes;
 
         // Determine endpoints based on direction and tile type
         let is_shim = tile_type == TileType::Shim;
@@ -310,6 +607,7 @@ impl Transfer {
             bytes_transferred: 0,
             total_bytes,
             cycles_elapsed: 0,
+            zero_pad_state,
             error: None,
         })
     }
@@ -349,6 +647,7 @@ impl Transfer {
             bytes_transferred: 0,
             total_bytes: length as u64,
             cycles_elapsed: 0,
+            zero_pad_state: None,
             error: None,
         }
     }
@@ -388,6 +687,7 @@ impl Transfer {
             bytes_transferred: 0,
             total_bytes: length as u64,
             cycles_elapsed: 0,
+            zero_pad_state: None,
             error: None,
         }
     }
@@ -427,6 +727,7 @@ impl Transfer {
             bytes_transferred: 0,
             total_bytes: length as u64,
             cycles_elapsed: 0,
+            zero_pad_state: None,
             error: None,
         }
     }
@@ -479,6 +780,25 @@ impl Transfer {
         self.address_gen.current()
     }
 
+    /// Get the next output action for this transfer.
+    ///
+    /// When zero-padding is active, returns `PadAction::Zero` for padding
+    /// positions and `PadAction::Data(addr)` for real data positions.
+    /// Without padding, always returns `PadAction::Data(addr)`.
+    pub fn next_output_action(&self) -> PadAction {
+        if let Some(ref pad) = self.zero_pad_state {
+            pad.current_action(&self.address_gen)
+        } else {
+            PadAction::Data(self.address_gen.current())
+        }
+    }
+
+    /// Whether zero-padding is active for this transfer.
+    #[inline]
+    pub fn has_zero_padding(&self) -> bool {
+        self.zero_pad_state.is_some()
+    }
+
     /// Get progress as a fraction (0.0 to 1.0).
     pub fn progress(&self) -> f32 {
         if self.total_bytes == 0 {
@@ -501,18 +821,35 @@ impl Transfer {
         }
     }
 
-    /// Notify that data was transferred.
+    /// Notify that output was produced (data or padding).
+    ///
+    /// When zero-padding is active, the padding state machine determines
+    /// whether each output word advances the address generator (data) or
+    /// not (padding zeros). The caller should use `next_output_action()`
+    /// to determine what each word should be before calling this.
     pub fn data_transferred(&mut self, bytes: u64) {
         self.bytes_transferred += bytes;
 
-        // Advance address generator once per 32-bit word transferred
-        // AIE-ML DMA works in word units: the address generator has total_elements
-        // equal to length_words, not length_bytes. Each advance produces the next
-        // word address based on the BD's stride configuration.
         let words = (bytes / 4) as usize;
-        for _ in 0..words {
-            if self.address_gen.next().is_none() {
-                break;
+
+        if let Some(ref mut pad_state) = self.zero_pad_state {
+            // With zero-padding: advance state machine per word.
+            // The state machine tells us whether to advance the address
+            // generator (data word) or skip it (padding zero).
+            for _ in 0..words {
+                let advance_addr = pad_state.advance();
+                if advance_addr {
+                    self.address_gen.next();
+                }
+            }
+        } else {
+            // Without padding: advance address generator for every word.
+            // AIE-ML DMA works in word units: the address generator has
+            // total_elements equal to length_words, not length_bytes.
+            for _ in 0..words {
+                if self.address_gen.next().is_none() {
+                    break;
+                }
             }
         }
 
@@ -874,5 +1211,186 @@ mod tests {
         bd_ge.acquire_value = -2;
         let transfer_ge = Transfer::new(&bd_ge, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
         assert_eq!(transfer_ge.acquire_mode(), Some(LockAcquireMode::GreaterEqual(2)));
+    }
+
+    // --- ZeroPadState tests ---
+
+    #[test]
+    fn test_pad_state_no_padding() {
+        // No padding configured: all output should be data
+        let config = ZeroPadConfig::default();
+        let mut state = ZeroPadState::new(config, 4, 1, 1);
+
+        // With no padding, total output = data words only
+        assert_eq!(state.total_output_words(), 4);
+
+        let gen = AddressGenerator::new_1d(0x1000, 4, 4);
+        for _ in 0..4 {
+            assert!(matches!(state.current_action(&gen), PadAction::Data(_)));
+            state.advance();
+        }
+        assert!(state.is_finished());
+    }
+
+    #[test]
+    fn test_pad_state_d0_only() {
+        // D0 before=2, after=1, d0_size=3, d1=1, d2=1
+        // Expected output: [0,0, D,D,D, 0] = 6 words total
+        let config = ZeroPadConfig {
+            d0_before: 2,
+            d0_after: 1,
+            ..Default::default()
+        };
+        let mut state = ZeroPadState::new(config, 3, 1, 1);
+        let gen = AddressGenerator::new_1d(0x1000, 3, 4);
+
+        assert_eq!(state.total_output_words(), 6);
+
+        // Collect output sequence
+        let mut actions = Vec::new();
+        while !state.is_finished() {
+            actions.push(state.current_action(&gen));
+            state.advance();
+        }
+
+        assert_eq!(actions.len(), 6);
+        assert_eq!(actions[0], PadAction::Zero);  // d0_before
+        assert_eq!(actions[1], PadAction::Zero);  // d0_before
+        assert!(matches!(actions[2], PadAction::Data(_)));  // data
+        assert!(matches!(actions[3], PadAction::Data(_)));  // data
+        assert!(matches!(actions[4], PadAction::Data(_)));  // data
+        assert_eq!(actions[5], PadAction::Zero);  // d0_after
+    }
+
+    #[test]
+    fn test_pad_state_d0_with_d1_iterations() {
+        // D0 before=1, after=1, d0_size=2, d1_size=3, d2=1
+        // Per D1 iteration: [0, D,D, 0] = 4 words
+        // Total: 4 * 3 = 12 words
+        let config = ZeroPadConfig {
+            d0_before: 1,
+            d0_after: 1,
+            ..Default::default()
+        };
+        let mut state = ZeroPadState::new(config, 2, 3, 1);
+        let gen = AddressGenerator::new_2d(0x1000, 2, 4, 3, 8);
+
+        assert_eq!(state.total_output_words(), 12);
+
+        let mut actions = Vec::new();
+        while !state.is_finished() {
+            actions.push(state.current_action(&gen));
+            state.advance();
+        }
+
+        // Verify structure: 3 repetitions of [Zero, Data, Data, Zero]
+        for iter in 0..3 {
+            let base = iter * 4;
+            assert_eq!(actions[base], PadAction::Zero, "d0_before at D1 iter {}", iter);
+            assert!(matches!(actions[base + 1], PadAction::Data(_)), "data at D1 iter {}", iter);
+            assert!(matches!(actions[base + 2], PadAction::Data(_)), "data at D1 iter {}", iter);
+            assert_eq!(actions[base + 3], PadAction::Zero, "d0_after at D1 iter {}", iter);
+        }
+    }
+
+    #[test]
+    fn test_pad_state_all_dimensions() {
+        // D0 before=1, d0_size=2, D1 before=1, after=1, d1=2, D2 before=1, after=1, d2=1
+        // Pattern:
+        //   [d2_before=1]
+        //     [d1_before=1]
+        //       [d0_before=1] [D,D]
+        //     [d1_after=1]
+        //     [d1_before=1]
+        //       [d0_before=1] [D,D]
+        //     [d1_after=1]
+        //   [d2_after=1]
+        // = 1 + (1+1+2+1) * 2 + 1 = 12 words total
+        let config = ZeroPadConfig {
+            d0_before: 1,
+            d0_after: 0,
+            d1_before: 1,
+            d1_after: 1,
+            d2_before: 1,
+            d2_after: 1,
+        };
+        let mut state = ZeroPadState::new(config, 2, 2, 1);
+        let gen = AddressGenerator::new_2d(0x1000, 2, 4, 2, 8);
+
+        assert_eq!(state.total_output_words(), 12);
+
+        let mut sequence = Vec::new();
+        while !state.is_finished() {
+            let is_data = matches!(state.current_action(&gen), PadAction::Data(_));
+            sequence.push(if is_data { 'D' } else { '0' });
+            state.advance();
+        }
+
+        let pattern: String = sequence.into_iter().collect();
+        // d2_before(1) | d1_before(1) d0_before(1) DD d1_after(1)
+        //              | d1_before(1) d0_before(1) DD d1_after(1) | d2_after(1)
+        assert_eq!(pattern, "000DD000DD00");
+    }
+
+    #[test]
+    fn test_pad_state_advance_returns_is_data() {
+        // Verify advance() returns true for data words, false for padding
+        let config = ZeroPadConfig {
+            d0_before: 1,
+            d0_after: 1,
+            ..Default::default()
+        };
+        let mut state = ZeroPadState::new(config, 2, 1, 1);
+
+        // Expected: [Zero, Data, Data, Zero]
+        assert!(!state.advance()); // d0_before zero
+        assert!(state.advance());  // data
+        assert!(state.advance());  // data
+        assert!(!state.advance()); // d0_after zero
+        assert!(state.is_finished());
+    }
+
+    #[test]
+    fn test_transfer_with_padding_total_bytes() {
+        // Verify total_bytes includes padding words
+        use crate::device::dma::DimensionConfig;
+
+        let bd = BdConfig {
+            base_addr: 0x80000,
+            length: 40,  // 10 data words * 4 bytes (d0=5 * d1=2)
+            d0: DimensionConfig::new(5, 4),
+            d1: DimensionConfig::new(2, 20),
+            valid: true,
+            zero_padding: ZeroPadConfig {
+                d0_before: 1,
+                d0_after: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // On a MemTile MM2S transfer, padding should increase total_bytes
+        let transfer = Transfer::new(
+            &bd, 0, 0, TransferDirection::MM2S, 1, 1, TileType::MemTile,
+        ).unwrap();
+
+        // Data: 10 words = 40 bytes
+        // Padding: (1+1) * 2 d1_iters = 4 words = 16 bytes
+        // Total: 56 bytes
+        assert_eq!(transfer.total_bytes, 56);
+        assert!(transfer.has_zero_padding());
+
+        // Same BD on compute tile (not MemTile) -- no padding applied
+        let transfer_compute = Transfer::new(
+            &bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute,
+        ).unwrap();
+        assert_eq!(transfer_compute.total_bytes, 40);
+        assert!(!transfer_compute.has_zero_padding());
+
+        // Same BD on MemTile S2MM -- no padding (S2MM ignores padding)
+        let transfer_s2mm = Transfer::new(
+            &bd, 0, 0, TransferDirection::S2MM, 1, 1, TileType::MemTile,
+        ).unwrap();
+        assert!(!transfer_s2mm.has_zero_padding());
     }
 }

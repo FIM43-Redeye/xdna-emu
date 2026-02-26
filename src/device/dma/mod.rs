@@ -68,7 +68,7 @@ pub mod engine;
 pub mod timing;
 pub mod compression;
 
-pub use addressing::{AddressGenerator, DimensionConfig, AddressIterator, IterationConfig};
+pub use addressing::{AddressGenerator, DimensionConfig, AddressIterator, IterationConfig, ZeroPadConfig};
 pub use bd::{BufferDescriptor, bd_base_address, bd_register_count, BD_SPACING};
 pub use stream_io::StreamWord;
 pub use transfer::{Transfer, TransferState, TransferDirection, TransferEndpoint, parse_source_tile_from_header};
@@ -149,6 +149,10 @@ pub struct BdConfig {
 
     /// Enable compression (MM2S only)
     pub compression_enable: bool,
+
+    /// Zero-padding configuration (MemTile MM2S only).
+    /// Inserts zero-valued words into the output stream at dimension boundaries.
+    pub zero_padding: addressing::ZeroPadConfig,
 
     /// Enable packet header insertion (MM2S only)
     pub enable_packet: bool,

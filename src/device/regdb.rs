@@ -885,6 +885,10 @@ pub struct StreamSwitchLayout {
     pub slave_slot_base: u32,
     /// Stream switch slave slot config end (exclusive)
     pub slave_slot_end: u32,
+    /// Bytes between consecutive slave ports' slot registers (derived from AM025)
+    pub slave_slot_port_stride: u32,
+    /// Number of slots per slave port (derived from register count)
+    pub slave_slot_count: usize,
 }
 
 impl StreamSwitchLayout {
@@ -934,6 +938,35 @@ impl StreamSwitchLayout {
         let slave_slot_base = slave_slot_offsets[0];
         let slave_slot_end = slave_slot_offsets[slave_slot_offsets.len() - 1] + 4;
 
+        // Derive slave slot port stride and slot count from the register offsets.
+        // Slot registers follow: Port0_Slot0, Port0_Slot1, ..., Port1_Slot0, ...
+        // Within a port, slots are 4 bytes apart. Between ports, the stride is larger.
+        // Find the first gap > 4 to determine where port 0 ends and port 1 begins.
+        let num_slave_ports = slave_config_offsets.len();
+        let (slave_slot_port_stride, slave_slot_count) = if num_slave_ports > 1
+            && slave_slot_offsets.len() > 1
+        {
+            // Total slot registers / number of slave ports = slots per port
+            let slots_per_port = slave_slot_offsets.len() / num_slave_ports;
+            // Port stride = offset of port 1's first slot - offset of port 0's first slot
+            let port_stride = if slots_per_port > 0 && slave_slot_offsets.len() > slots_per_port {
+                slave_slot_offsets[slots_per_port] - slave_slot_offsets[0]
+            } else {
+                // Fallback: derive from gaps
+                let mut stride = 0u32;
+                for pair in slave_slot_offsets.windows(2) {
+                    if pair[1] - pair[0] > 4 {
+                        stride = pair[1] - pair[0] + 4 * (slots_per_port as u32 - 1);
+                        break;
+                    }
+                }
+                stride
+            };
+            (port_stride, slots_per_port)
+        } else {
+            (0x10, 4) // Shouldn't happen, but safe defaults
+        };
+
         Ok(Self {
             master_base,
             master_end,
@@ -941,6 +974,8 @@ impl StreamSwitchLayout {
             slave_end,
             slave_slot_base,
             slave_slot_end,
+            slave_slot_port_stride,
+            slave_slot_count,
         })
     }
 }
@@ -1016,6 +1051,8 @@ pub struct DeviceRegLayout {
     pub memtile_bd_base: u32,
     /// DMA BD stride in bytes (memory tile)
     pub memtile_bd_stride: u32,
+    /// Words per BD (number of DMA_BD0_N registers found)
+    pub memtile_bd_words: usize,
 
     // -- MemTile channel layout (derived from DMA_S2MM_0_Ctrl etc.) --
     /// S2MM channel control base address (memory tile)
@@ -1044,6 +1081,8 @@ pub struct DeviceRegLayout {
     pub shim_bd_base: u32,
     /// DMA BD stride in bytes (shim)
     pub shim_bd_stride: u32,
+    /// Words per BD (number of DMA_BD0_N registers found)
+    pub shim_bd_words: usize,
 
     // -- Shim channel layout (derived from DMA_S2MM_0_Ctrl etc.) --
     /// DMA channel control base address (shim)
@@ -1108,6 +1147,11 @@ impl DeviceRegLayout {
         let memtile_bd_base = reg_offset("memory_tile", "DMA_BD0_0")?;
         let memtile_bd_stride = reg_offset("memory_tile", "DMA_BD1_0")? - memtile_bd_base;
 
+        let mt = db.module("memory_tile").unwrap();
+        let memtile_bd_words = (0..16)
+            .take_while(|i| mt.register(&format!("DMA_BD0_{}", i)).is_some())
+            .count();
+
         // -- MemTile channels --
         let memtile_channel_s2mm_base = reg_offset("memory_tile", "DMA_S2MM_0_Ctrl")?;
         let memtile_channel_mm2s_base = reg_offset("memory_tile", "DMA_MM2S_0_Ctrl")?;
@@ -1129,6 +1173,11 @@ impl DeviceRegLayout {
         // -- Shim BDs --
         let shim_bd_base = reg_offset("shim", "DMA_BD0_0")?;
         let shim_bd_stride = reg_offset("shim", "DMA_BD1_0")? - shim_bd_base;
+
+        let sh = db.module("shim").unwrap();
+        let shim_bd_words = (0..16)
+            .take_while(|i| sh.register(&format!("DMA_BD0_{}", i)).is_some())
+            .count();
 
         // -- Shim channels --
         let shim_channel_base = reg_offset("shim", "DMA_S2MM_0_Ctrl")?;
@@ -1159,6 +1208,7 @@ impl DeviceRegLayout {
             memtile_locks_underflow_1,
             memtile_bd_base,
             memtile_bd_stride,
+            memtile_bd_words,
             memtile_channel_s2mm_base,
             memtile_channel_mm2s_base,
             memtile_channel_stride,
@@ -1168,6 +1218,7 @@ impl DeviceRegLayout {
             shim_bd,
             shim_bd_base,
             shim_bd_stride,
+            shim_bd_words,
             shim_channel_base,
             shim_channel_stride,
             db,
@@ -1408,6 +1459,7 @@ mod tests {
         // Verify memtile BD layout (AM025)
         assert_eq!(layout.memtile_bd_base, 0xA0000, "MemTile BD base");
         assert_eq!(layout.memtile_bd_stride, 0x20, "MemTile BD stride");
+        assert_eq!(layout.memtile_bd_words, 8, "MemTile BD words");
 
         // Verify memtile channel layout (AM025)
         assert_eq!(layout.memtile_channel_s2mm_base, 0xA0600, "MemTile S2MM base");
@@ -1417,10 +1469,21 @@ mod tests {
         // Verify shim BD layout (AM025)
         assert_eq!(layout.shim_bd_base, 0x1D000, "Shim BD base");
         assert_eq!(layout.shim_bd_stride, 0x20, "Shim BD stride");
+        assert_eq!(layout.shim_bd_words, 8, "Shim BD words");
 
         // Verify shim channel layout (AM025)
         assert_eq!(layout.shim_channel_base, 0x1D200, "Shim channel base");
         assert_eq!(layout.shim_channel_stride, 0x08, "Shim channel stride");
+
+        // Verify stream switch slave slot layout (AM025)
+        assert_eq!(layout.memory_stream_switch.slave_slot_port_stride, 0x10,
+            "Compute slave slot port stride");
+        assert_eq!(layout.memory_stream_switch.slave_slot_count, 4,
+            "Compute slave slots per port");
+        assert_eq!(layout.memtile_stream_switch.slave_slot_port_stride, 0x10,
+            "MemTile slave slot port stride");
+        assert_eq!(layout.memtile_stream_switch.slave_slot_count, 4,
+            "MemTile slave slots per port");
 
         // Verify shim BD field layout was populated
         assert_eq!(layout.shim_bd.buffer_length.width, 32, "Shim buffer_length is 32-bit");

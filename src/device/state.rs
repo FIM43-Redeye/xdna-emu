@@ -485,7 +485,7 @@ impl DeviceState {
         // Shim and compute share the same BD base and stride, but shim uses
         // 8 words per BD while compute uses 6.
         let (bd_base, bd_stride, max_words) = match tile_type {
-            TileType::Shim => (reg_layout.shim_bd_base, reg_layout.shim_bd_stride, 8usize),
+            TileType::Shim => (reg_layout.shim_bd_base, reg_layout.shim_bd_stride, reg_layout.shim_bd_words),
             _ => (reg_layout.memory_bd_base, reg_layout.memory_bd_stride, reg_layout.memory_bd_words),
         };
 
@@ -699,6 +699,7 @@ impl DeviceState {
     /// Masked write to a DMA channel register.
     fn mask_write_dma_channel(&mut self, col: u8, row: u8, offset: u32, mask: u32, value: u32) {
         let reg_layout = super::regdb::device_reg_layout();
+        let lay = &reg_layout.memory_channel;
         let rel = offset - reg_layout.memory_channel_base;
         let ch_idx = (rel / reg_layout.memory_channel_stride) as usize;
         let is_start_queue = (rel % reg_layout.memory_channel_stride) >= 4;
@@ -724,12 +725,10 @@ impl DeviceState {
         };
 
         // Enqueue to the DMA channel's task queue when START_QUEUE is written.
-        // Task queue register format:
-        // - Bits 3:0: BD_ID (buffer descriptor index)
-        // - Bits 23:16: Repeat_Count (run BD this many additional times)
+        // Field positions derived from AM025 via ChannelFieldLayout.
         if let Some(queue_val) = new_start_queue {
-            let bd_idx = (queue_val & 0xF) as u8;
-            let repeat_count = ((queue_val >> 16) & 0xFF) as u8;
+            let bd_idx = lay.start_bd_id.extract(queue_val) as u8;
+            let repeat_count = lay.repeat_count.extract(queue_val) as u8;
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
                     log::warn!("DMA channel {} task queue overflow on tile ({},{})",
@@ -830,6 +829,7 @@ impl DeviceState {
     /// Masked write to a shim DMA channel register.
     fn mask_write_shim_dma_channel(&mut self, col: u8, row: u8, offset: u32, mask: u32, value: u32) {
         let reg_layout = super::regdb::device_reg_layout();
+        let lay = &reg_layout.memory_channel; // Same bit layout as compute
         let rel = offset - reg_layout.shim_channel_base;
         let ch_idx = (rel / reg_layout.shim_channel_stride) as usize;
         let is_start_queue = (rel % reg_layout.shim_channel_stride) >= 4;
@@ -854,8 +854,8 @@ impl DeviceState {
         };
 
         if let Some(queue_val) = new_start_queue {
-            let bd_idx = (queue_val & 0xF) as u8;
-            let repeat_count = ((queue_val >> 16) & 0xFF) as u8;
+            let bd_idx = lay.start_bd_id.extract(queue_val) as u8;
+            let repeat_count = lay.repeat_count.extract(queue_val) as u8;
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
                     log::warn!("Shim DMA channel {} task queue overflow on tile ({},{})",
@@ -974,10 +974,9 @@ impl DeviceState {
             }
         // Slave slot registers (packet routing config per slave port)
         } else if (ss.slave_slot_base..ss.slave_slot_end).contains(&offset) {
-            // Each slave port has 4 slots at 4-byte intervals (0x10 per port)
             let slot_offset = offset - ss.slave_slot_base;
-            let slave_port = (slot_offset / 0x10) as usize;
-            let slot = ((slot_offset % 0x10) / 4) as usize;
+            let slave_port = (slot_offset / ss.slave_slot_port_stride) as usize;
+            let slot = ((slot_offset % ss.slave_slot_port_stride) / 4) as usize;
 
             if let Some(tile) = self.array.get_mut(col, row) {
                 tile.stream_switch.configure_slave_slot(slave_port, slot, value);
@@ -1011,9 +1010,9 @@ impl DeviceState {
         let bd_idx = (rel / reg_layout.memtile_bd_stride) as usize;
         let word = ((rel % reg_layout.memtile_bd_stride) / 4) as usize;
 
-        // Bounds check against tile's actual BD count and 8 words per BD
+        // Bounds check against tile's actual BD count and words per BD
         let num_bds = self.array.get(col, row).map_or(0, |t| t.dma_bds.len());
-        if bd_idx >= num_bds || word > 7 {
+        if bd_idx >= num_bds || word >= reg_layout.memtile_bd_words {
             return;
         }
 
@@ -1065,22 +1064,16 @@ impl DeviceState {
 
     /// Parse MemTile BD words into a BdConfig using the data-driven parser.
     ///
-    /// MemTile lock IDs are 8 bits in the register encoding but the tile only
-    /// has 64 locks, so we mask to 6 bits.
+    /// MemTile lock IDs are 8 bits in the register encoding, addressing a
+    /// 192-entry cross-tile lock space (West 0-63, Own 64-127, East 128-191).
+    /// The DMA engine's resolve_lock_id() maps these to local lock indices
+    /// at runtime -- do NOT mask here.
     fn parse_memtile_bd_from_words(&self, words: &[u32]) -> crate::device::dma::BdConfig {
         use crate::device::dma::bd::BufferDescriptor;
         use crate::device::tile::TileType;
 
         let parsed = BufferDescriptor::from_registers(words, TileType::MemTile);
         let mut config = parsed.to_bd_config();
-
-        // MemTile lock IDs: mask to 6 bits (64 locks per tile)
-        if let Some(ref mut id) = config.acquire_lock {
-            *id &= 0x3F;
-        }
-        if let Some(ref mut id) = config.release_lock {
-            *id &= 0x3F;
-        }
 
         // For backwards compatibility, mark as valid if any data is present
         if !config.valid && words.iter().any(|&w| w != 0) {
@@ -1157,6 +1150,9 @@ impl DeviceState {
     /// - MM2S 0-5 control: 0xA0630, 0xA0638, 0xA0640, 0xA0648, 0xA0650, 0xA0658
     /// - MM2S 0-5 queue:   0xA0634, 0xA063C, 0xA0644, 0xA064C, 0xA0654, 0xA065C
     fn write_memtile_dma_channel(&mut self, col: u8, row: u8, offset: u32, value: u32) {
+        let reg_layout = super::regdb::device_reg_layout();
+        let lay = &reg_layout.memtile_channel;
+
         // Determine channel index and whether this is a start queue write
         let (ch_idx, is_start_queue) = self.decode_memtile_channel_offset(offset);
 
@@ -1170,7 +1166,7 @@ impl DeviceState {
                 let ch = &mut tile.dma_channels[ch_idx];
                 if is_start_queue {
                     ch.start_queue = value;
-                    ch.current_bd = (value & 0x3F) as u8; // 6-bit BD index for MemTile
+                    ch.current_bd = lay.start_bd_id.extract(value) as u8;
                 } else {
                     ch.control = value;
                     ch.running = value & 1 != 0;
@@ -1180,8 +1176,8 @@ impl DeviceState {
 
         // Enqueue to DMA channel's task queue when START_QUEUE is written
         if is_start_queue {
-            let bd_idx = (value & 0x3F) as u8; // 6-bit BD index
-            let repeat_count = ((value >> 16) & 0xFF) as u8;
+            let bd_idx = lay.start_bd_id.extract(value) as u8;
+            let repeat_count = lay.repeat_count.extract(value) as u8;
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
                     log::warn!("MemTile DMA channel {} task queue overflow on tile ({},{})",
@@ -1198,6 +1194,8 @@ impl DeviceState {
 
     /// Masked write to MemTile DMA channel register.
     fn mask_write_memtile_dma_channel(&mut self, col: u8, row: u8, offset: u32, mask: u32, value: u32) {
+        let reg_layout = super::regdb::device_reg_layout();
+        let lay = &reg_layout.memtile_channel;
         let (ch_idx, is_start_queue) = self.decode_memtile_channel_offset(offset);
 
         if ch_idx >= 12 {
@@ -1224,8 +1222,8 @@ impl DeviceState {
 
         // Enqueue to task queue when START_QUEUE was written
         if let Some(queue_val) = new_start_queue {
-            let bd_idx = (queue_val & 0x3F) as u8;
-            let repeat_count = ((queue_val >> 16) & 0xFF) as u8;
+            let bd_idx = lay.start_bd_id.extract(queue_val) as u8;
+            let repeat_count = lay.repeat_count.extract(queue_val) as u8;
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
                     log::warn!("MemTile DMA channel {} task queue overflow on tile ({},{})",
@@ -1330,8 +1328,8 @@ impl DeviceState {
         // Slave slot registers (packet routing config per slave port)
         } else if (ss.slave_slot_base..ss.slave_slot_end).contains(&offset) {
             let slot_offset = offset - ss.slave_slot_base;
-            let slave_port = (slot_offset / 0x10) as usize;
-            let slot = ((slot_offset % 0x10) / 4) as usize;
+            let slave_port = (slot_offset / ss.slave_slot_port_stride) as usize;
+            let slot = ((slot_offset % ss.slave_slot_port_stride) / 4) as usize;
 
             if let Some(tile) = self.array.get_mut(col, row) {
                 tile.stream_switch.configure_slave_slot(slave_port, slot, value);

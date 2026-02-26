@@ -111,6 +111,79 @@ impl IterationConfig {
     }
 }
 
+/// Zero-padding configuration for MemTile MM2S DMA transfers.
+///
+/// Inserts zero-valued words into the MM2S output stream at dimension
+/// boundaries. Each dimension can have zeros before and/or after its
+/// data iterations. Used for algorithmic padding (e.g., convolution edges)
+/// and granularity padding (e.g., aligning channel counts).
+///
+/// Field widths per dimension (from AM025 register database):
+/// - D0: 6 bits (max 63 zeros)
+/// - D1: 5 bits (max 31 zeros)
+/// - D2: 4 bits (max 15 zeros)
+///
+/// Only meaningful for MemTile MM2S channels.
+///
+/// # Output Pattern
+///
+/// ```text
+/// for each D2 iteration:
+///   [d2_before zeros]
+///   for each D1 iteration:
+///     [d1_before zeros]
+///     [d0_before zeros] [d0_size data words] [d0_after zeros]
+///     [d1_after zeros]
+///   [d2_after zeros]
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ZeroPadConfig {
+    /// Zeros inserted before each D0 data run
+    pub d0_before: u8,
+    /// Zeros inserted after each D0 data run
+    pub d0_after: u8,
+    /// Zeros inserted before each D1 iteration (before all D0 runs)
+    pub d1_before: u8,
+    /// Zeros inserted after each D1 iteration (after all D0 runs)
+    pub d1_after: u8,
+    /// Zeros inserted before each D2 iteration (before all D1 iterations)
+    pub d2_before: u8,
+    /// Zeros inserted after each D2 iteration (after all D1 iterations)
+    pub d2_after: u8,
+}
+
+impl ZeroPadConfig {
+    /// Check if any padding is configured.
+    pub fn is_enabled(&self) -> bool {
+        self.d0_before > 0 || self.d0_after > 0
+            || self.d1_before > 0 || self.d1_after > 0
+            || self.d2_before > 0 || self.d2_after > 0
+    }
+
+    /// Total padding words per complete dimensional pattern (one iteration).
+    ///
+    /// The padding words are added on top of the data words at each
+    /// dimension boundary. This computes the total additional words
+    /// from padding alone (not including data words).
+    ///
+    /// Dimension sizes should be effective sizes (0 treated as 1 by caller).
+    ///
+    /// Per the nested loop structure:
+    /// - D0 before/after: emitted once per D1 iteration
+    /// - D1 before/after: emitted once per D1 iteration
+    /// - D2 before/after: emitted once per D2 iteration
+    pub fn total_pad_words(&self, d1_size: u32, d2_size: u32) -> u64 {
+        let d0_pad = self.d0_before as u64 + self.d0_after as u64;
+        let d1_pad = self.d1_before as u64 + self.d1_after as u64;
+        let d2_pad = self.d2_before as u64 + self.d2_after as u64;
+
+        // Both D0 and D1 padding occur once per D1 iteration
+        // D2 padding occurs once per D2 iteration
+        (d0_pad + d1_pad) * d1_size as u64 * d2_size as u64
+            + d2_pad * d2_size as u64
+    }
+}
+
 /// Multi-dimensional address generator with iteration support.
 ///
 /// Generates a sequence of addresses based on up to 4 dimensions plus iteration.
@@ -650,5 +723,47 @@ mod tests {
         gen.reset();
         assert_eq!(gen.remaining(), 4);  // 2 elements * 2 iterations
         assert_eq!(gen.current(), 0x1000);
+    }
+
+    #[test]
+    fn test_zero_pad_disabled_by_default() {
+        let pad = ZeroPadConfig::default();
+        assert!(!pad.is_enabled());
+        assert_eq!(pad.total_pad_words(1, 1), 0);
+    }
+
+    #[test]
+    fn test_zero_pad_d0_only() {
+        let pad = ZeroPadConfig {
+            d0_before: 2,
+            d0_after: 3,
+            ..Default::default()
+        };
+        assert!(pad.is_enabled());
+        // D0 padding = (2+3) = 5 per D1 iter, with d1=1 d2=1: 5 total
+        assert_eq!(pad.total_pad_words(1, 1), 5);
+        // With d1=4, d2=1: 5 * 4 = 20
+        assert_eq!(pad.total_pad_words(4, 1), 20);
+        // With d1=4, d2=2: 5 * 4 * 2 = 40
+        assert_eq!(pad.total_pad_words(4, 2), 40);
+    }
+
+    #[test]
+    fn test_zero_pad_all_dimensions() {
+        // Matches aie-rt test: d0 before=2 after=3, d1 before=2 after=3, d2 before=3 after=3
+        let pad = ZeroPadConfig {
+            d0_before: 2,
+            d0_after: 3,
+            d1_before: 2,
+            d1_after: 3,
+            d2_before: 3,
+            d2_after: 3,
+        };
+        // d1=10, d2=1
+        // D0+D1 pad per D1 iter: (2+3) + (2+3) = 10
+        // Total D0+D1: 10 * 10 * 1 = 100
+        // D2 pad: (3+3) * 1 = 6
+        // Total: 100 + 6 = 106
+        assert_eq!(pad.total_pad_words(10, 1), 106);
     }
 }

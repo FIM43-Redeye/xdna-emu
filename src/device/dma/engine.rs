@@ -40,7 +40,7 @@ use super::{
     MEM_TILE_S2MM_CHANNELS, MEM_TILE_MM2S_CHANNELS,
 };
 use super::compression;
-use super::transfer::{Transfer, TransferDirection, TransferEndpoint, TransferState};
+use super::transfer::{Transfer, TransferDirection, TransferEndpoint, TransferState, PadAction};
 use super::timing::{DmaTimingConfig, ChannelTimingState, TransferPhase};
 use crate::device::host_memory::HostMemory;
 use crate::device::tile::{Tile, TileType};
@@ -266,6 +266,10 @@ pub struct DmaEngine {
     /// directly -- the coordinator collects them after each step.
     trace_events: Vec<(u64, EventType)>,
 
+    /// Number of locks per tile (16 for compute, 64 for MemTile, 0 for shim).
+    /// Used by resolve_lock_id() for cross-tile lock addressing.
+    num_locks: u8,
+
     /// Number of memory banks for this tile type (8 for compute, 16 for MemTile).
     /// Used to compute bank indices for conflict detection.
     num_banks: usize,
@@ -282,14 +286,14 @@ impl DmaEngine {
     /// `num_channels` and `num_bds` come from the architecture configuration
     /// (ArchConfig) rather than compile-time constants. The caller is
     /// responsible for providing the correct values for the tile type.
-    pub fn new(col: u8, row: u8, tile_type: TileType, num_channels: usize, num_bds: usize) -> Self {
+    pub fn new(col: u8, row: u8, tile_type: TileType, num_channels: usize, num_bds: usize, num_locks: u8) -> Self {
         let mut transfers = Vec::with_capacity(num_channels);
         for _ in 0..num_channels {
             transfers.push(None);
         }
 
-        log::debug!("DmaEngine::new col={} row={} tile_type={:?} num_channels={} num_bds={}",
-            col, row, tile_type, num_channels, num_bds);
+        log::debug!("DmaEngine::new col={} row={} tile_type={:?} num_channels={} num_bds={} num_locks={}",
+            col, row, tile_type, num_channels, num_bds, num_locks);
 
         Self {
             col,
@@ -321,6 +325,8 @@ impl DmaEngine {
             // Trace event buffer
             current_cycle: 0,
             trace_events: Vec::new(),
+            // Lock count for cross-tile addressing
+            num_locks,
             // Bank conflict tracking
             num_banks: match tile_type {
                 TileType::Compute => crate::device::aie2_spec::COMPUTE_TILE_MEMORY_BANKS,
@@ -337,19 +343,19 @@ impl DmaEngine {
     /// Production code should use `new()` with ArchConfig-derived values.
     pub fn new_compute_tile(col: u8, row: u8) -> Self {
         Self::new(col, row, TileType::Compute,
-            COMPUTE_S2MM_CHANNELS + COMPUTE_MM2S_CHANNELS, 16)
+            COMPUTE_S2MM_CHANNELS + COMPUTE_MM2S_CHANNELS, 16, 16)
     }
 
     /// Create a new DMA engine for a memory tile (NPU1/AIE2 defaults).
     pub fn new_mem_tile(col: u8, row: u8) -> Self {
         Self::new(col, row, TileType::MemTile,
-            MEM_TILE_S2MM_CHANNELS + MEM_TILE_MM2S_CHANNELS, 48)
+            MEM_TILE_S2MM_CHANNELS + MEM_TILE_MM2S_CHANNELS, 48, 64)
     }
 
     /// Create a new DMA engine for a shim tile (NPU1/AIE2 defaults).
     pub fn new_shim_tile(col: u8, row: u8) -> Self {
         Self::new(col, row, TileType::Shim,
-            COMPUTE_S2MM_CHANNELS + COMPUTE_MM2S_CHANNELS, 16)
+            COMPUTE_S2MM_CHANNELS + COMPUTE_MM2S_CHANNELS, 16, 0)
     }
 
     /// Configure custom timing parameters.
@@ -445,14 +451,22 @@ impl DmaEngine {
     ///
     /// Returns `Some(local_lock_index)` for own-tile locks, `None` for
     /// cross-tile locks (which require neighbor tile access).
-    fn resolve_lock_id(tile_type: TileType, col: u8, row: u8, lock_id: u8) -> Option<u8> {
+    /// Resolve a BD lock ID to a local lock index.
+    ///
+    /// For MemTile, maps the 8-bit cross-tile lock address space to local
+    /// lock indices. For compute/shim, passes through directly.
+    fn resolve_lock_id(&self, lock_id: u8) -> Option<u8> {
+        Self::resolve_lock_id_static(self.tile_type, self.col, self.row, self.num_locks, lock_id)
+    }
+
+    /// Static version of resolve_lock_id for use when &self is partially borrowed.
+    fn resolve_lock_id_static(tile_type: TileType, col: u8, row: u8, num_locks: u8, lock_id: u8) -> Option<u8> {
         if !tile_type.is_mem_tile() {
             // Compute/shim: 4-bit field, always local
             return Some(lock_id);
         }
 
-        // MemTile: 8-bit field, 192-entry cross-tile address space
-        let num_locks: u8 = 64; // MemTile has 64 locks
+        // MemTile: 8-bit field, cross-tile address space (3 * num_locks entries)
         if lock_id < num_locks {
             // West column (col-1) locks
             log::warn!(
@@ -474,8 +488,8 @@ impl DmaEngine {
             None
         } else {
             log::warn!(
-                "DMA tile({},{}) lock_id={} out of 192-entry address space",
-                col, row, lock_id
+                "DMA tile({},{}) lock_id={} out of {}-entry address space",
+                col, row, lock_id, num_locks as u16 * 3
             );
             None
         }
@@ -888,47 +902,121 @@ impl DmaEngine {
             let words_per_cycle = self.timing_config.words_per_cycle as usize;
             let bytes_per_cycle = words_per_cycle * 4;
 
-            let (bytes_to_transfer, addr, source, dest, channel, is_last, tlast_suppress) = {
-                let transfer = self.transfers[ch_idx].as_ref()
-                    .expect("BUG: transfer missing in timed extraction block");
-                let bytes_to_transfer = bytes_per_cycle.min(transfer.remaining_bytes() as usize);
-                let remaining_after = transfer.remaining_bytes().saturating_sub(bytes_to_transfer as u64);
-                (
-                    bytes_to_transfer,
-                    transfer.current_address(),
-                    transfer.source,
-                    transfer.dest,
-                    transfer.channel,
-                    remaining_after == 0,
-                    transfer.tlast_suppress,
-                )
-            };
+            // Check if zero-padding is active (MemTile MM2S only).
+            // When padding, we process one word at a time because each word
+            // can independently be data (from memory) or zero (padding).
+            let has_padding = self.transfers[ch_idx].as_ref()
+                .map(|t| t.has_zero_padding())
+                .unwrap_or(false);
 
-            if bytes_to_transfer > 0 {
-                let result = self.do_transfer(source, dest, addr, bytes_to_transfer, channel, is_last, tlast_suppress, tile, host_memory);
+            if has_padding {
+                // Padding-aware path: one word at a time
+                let (action, remaining, channel, is_last_word, tlast_suppress) = {
+                    let transfer = self.transfers[ch_idx].as_ref()
+                        .expect("BUG: transfer missing in padded extraction block");
+                    let remaining = transfer.remaining_bytes();
+                    let is_last_word = remaining <= 4;
+                    (
+                        transfer.next_output_action(),
+                        remaining,
+                        transfer.channel,
+                        is_last_word,
+                        transfer.tlast_suppress,
+                    )
+                };
 
-                if result.stall {
-                    // S2MM waiting for stream data - don't advance timing, just return
-                    // The transfer will try again next cycle when data may be available
-                    self.trace(EventType::DmaStreamStarvation { channel });
-                    return;
+                if remaining > 0 {
+                    match action {
+                        PadAction::Zero => {
+                            // Emit a zero word directly to stream (no memory read)
+                            let should_assert_tlast = is_last_word && !tlast_suppress;
+                            self.stream_out.push_back(StreamData {
+                                data: 0,
+                                tlast: should_assert_tlast,
+                                channel,
+                            });
+                            let transfer = self.transfers[ch_idx].as_mut()
+                                .expect("BUG: transfer missing after pad zero emit");
+                            transfer.data_transferred(4);
+                            self.channel_stats[ch_idx].bytes_transferred += 4;
+                        }
+                        PadAction::Data(addr) => {
+                            // Normal memory read for this word
+                            let transfer = self.transfers[ch_idx].as_ref()
+                                .expect("BUG: transfer missing in pad data block");
+                            let source = transfer.source;
+                            let dest = transfer.dest;
+                            let result = self.do_transfer(
+                                source, dest, addr, 4, channel,
+                                is_last_word, tlast_suppress, tile, host_memory,
+                            );
+
+                            if result.stall {
+                                self.trace(EventType::DmaStreamStarvation { channel });
+                                return;
+                            }
+
+                            if result.success {
+                                let transfer = self.transfers[ch_idx].as_mut()
+                                    .expect("BUG: transfer missing after pad data transfer");
+                                transfer.data_transferred(4);
+                                self.channel_stats[ch_idx].bytes_transferred += 4;
+
+                                if result.fot_finish {
+                                    self.complete_transfer(ch_idx, tile);
+                                    return;
+                                }
+                            } else {
+                                self.set_transfer_error(ch_idx, addr, tile.data_memory().len() as u64);
+                                return;
+                            }
+                        }
+                    }
                 }
+            } else {
+                // Standard path (no padding): transfer bytes_per_cycle at once
+                let (bytes_to_transfer, addr, source, dest, channel, is_last, tlast_suppress) = {
+                    let transfer = self.transfers[ch_idx].as_ref()
+                        .expect("BUG: transfer missing in timed extraction block");
+                    let bytes_to_transfer = bytes_per_cycle.min(transfer.remaining_bytes() as usize);
+                    let remaining_after = transfer.remaining_bytes().saturating_sub(bytes_to_transfer as u64);
+                    (
+                        bytes_to_transfer,
+                        transfer.current_address(),
+                        transfer.source,
+                        transfer.dest,
+                        transfer.channel,
+                        remaining_after == 0,
+                        transfer.tlast_suppress,
+                    )
+                };
 
-                if result.success {
-                    // Update transfer state (address generator, bytes transferred)
-                    let transfer = self.transfers[ch_idx].as_mut()
-                        .expect("BUG: transfer missing after timed do_transfer");
-                    transfer.data_transferred(bytes_to_transfer as u64);
-                    self.channel_stats[ch_idx].bytes_transferred += bytes_to_transfer as u64;
+                if bytes_to_transfer > 0 {
+                    let result = self.do_transfer(source, dest, addr, bytes_to_transfer, channel, is_last, tlast_suppress, tile, host_memory);
 
-                    // Handle FoT completion (early finish on TLAST)
-                    if result.fot_finish {
-                        self.complete_transfer(ch_idx, tile);
+                    if result.stall {
+                        // S2MM waiting for stream data - don't advance timing, just return
+                        // The transfer will try again next cycle when data may be available
+                        self.trace(EventType::DmaStreamStarvation { channel });
                         return;
                     }
-                } else {
-                    self.set_transfer_error(ch_idx, addr, tile.data_memory().len() as u64);
-                    return;
+
+                    if result.success {
+                        // Update transfer state (address generator, bytes transferred)
+                        let transfer = self.transfers[ch_idx].as_mut()
+                            .expect("BUG: transfer missing after timed do_transfer");
+                        transfer.data_transferred(bytes_to_transfer as u64);
+                        self.channel_stats[ch_idx].bytes_transferred += bytes_to_transfer as u64;
+
+                        // Handle FoT completion (early finish on TLAST)
+                        if result.fot_finish {
+                            self.complete_transfer(ch_idx, tile);
+                            return;
+                        }
+                    } else {
+                        self.set_transfer_error(ch_idx, addr, tile.data_memory().len() as u64);
+                        return;
+                    }
                 }
             }
         }
@@ -1716,7 +1804,7 @@ impl DmaEngine {
         if let TransferState::ReleasingLock(lock_id) = transfer.state {
             let release_delta = transfer.release_value;
             // Resolve cross-tile lock addressing (MemTile 192-entry space)
-            if let Some(local_id) = Self::resolve_lock_id(self.tile_type, self.col, self.row, lock_id) {
+            if let Some(local_id) = Self::resolve_lock_id_static(self.tile_type, self.col, self.row, self.num_locks, lock_id) {
                 log::info!("DMA tile({},{}) releasing bd_lock={} local_lock={} with delta {} on channel {} (snapshot-based)",
                     self.col, self.row, lock_id, local_id, release_delta, ch_idx);
                 if (local_id as usize) < tile.locks.len() {
@@ -1822,7 +1910,7 @@ impl DmaEngine {
         use crate::device::tile::LockResult;
 
         // Resolve cross-tile lock addressing (MemTile 192-entry space)
-        let local_id = match Self::resolve_lock_id(self.tile_type, self.col, self.row, lock_id) {
+        let local_id = match self.resolve_lock_id(lock_id) {
             Some(id) => id,
             None => return false, // Cross-tile lock, not yet supported
         };

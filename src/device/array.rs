@@ -83,9 +83,10 @@ impl TileArray {
                 };
                 tiles.push(Tile::new(tile_type, col, row, &params));
 
-                // Create DMA engine with ArchConfig-derived channel/BD counts
+                // Create DMA engine with ArchConfig-derived channel/BD/lock counts
                 dma_engines.push(DmaEngine::new(
                     col, row, tile_type, params.num_channels, params.num_bds,
+                    params.num_locks as u8,
                 ));
             }
         }
