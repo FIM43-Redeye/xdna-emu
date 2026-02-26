@@ -907,8 +907,12 @@ impl XclbinSuite {
 
         let enabled = engine.enabled_cores();
         if enabled == 0 && elf_files.is_empty() {
-            // No cores enabled and no ELFs - likely a reconfiguration test
-            return (TestOutcome::Pass { cycles: 1, correct: None, total: None }, None, Vec::new(), None);
+            // No cores enabled and no ELFs -- DMA-only or reconfiguration test.
+            // The emulator can't meaningfully execute these (no instruction loop
+            // to step through). Skip rather than claiming a false pass.
+            return (TestOutcome::Skipped {
+                reason: "DMA-only test (no core code to emulate)".to_string(),
+            }, None, Vec::new(), None);
         }
 
         // Run until halt, sync completion, error, or timeout

@@ -228,8 +228,10 @@ fn process_test(
     }
 
     // --- Skip gates ---
+    // Only skip HW for Platform tests (wrong hardware generation). Skipped tests
+    // (e.g. DMA-only, no core code) may still be valid on real hardware.
     let skip_hw = emu.as_ref().map_or(false, |r|
-        matches!(&r.outcome, TestOutcome::Platform{..} | TestOutcome::Skipped{..}));
+        matches!(&r.outcome, TestOutcome::Platform{..}));
 
     let spec = test.buffer_spec.as_ref();
     let insts_path = test.find_insts_file();
