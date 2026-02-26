@@ -415,12 +415,8 @@ pub unsafe extern "C" fn xdna_emu_execute_npu_instructions(
 
     log::info!("Executing {} NPU instructions", stream.instructions().len());
 
-    // Execute instructions
-    let (device, host_mem) = handle.engine.device_and_host_memory();
-    if let Err(e) = handle.npu_executor.execute(&stream, device, host_mem) {
-        log::error!("NPU instruction execution failed: {}", e);
-        return XdnaEmuResult::ExecutionError;
-    }
+    // Load instructions for interleaved execution in xdna_emu_run().
+    handle.npu_executor.load(&stream);
 
     XdnaEmuResult::Success
 }
@@ -520,6 +516,12 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
     log::info!("Running emulator (max {} cycles)", max);
 
     while cycles < max {
+        // Advance NPU instruction execution (interleaved with engine step)
+        {
+            let (device, host_mem) = handle.engine.device_and_host_memory();
+            handle.npu_executor.try_advance(device, host_mem);
+        }
+
         handle.engine.step();
         cycles += 1;
 
