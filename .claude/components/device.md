@@ -65,6 +65,7 @@ Row 0 = shim (DDR interface), row 1 = mem tile (512KB), rows 2-5 = compute (64KB
 
 ## Architecture References
 
+- aie-rt: `../aie-rt/driver/src/` (official Xilinx, branch xlnx_rel_v2025.2)
 - AM020: AIE-ML Architecture Manual (DMA, locks, memory layout)
 - AM025: Register Reference (offsets, field definitions)
 - Extracted docs: `docs/xdna/` (text format, use Explore agents to navigate)

@@ -18,8 +18,12 @@ This ensures:
 
 The workspace contains:
 - `xdna-emu/` - This emulator project (main focus)
+- `aie-rt/` - Official Xilinx aie-rt (hardware abstraction layer, tests, FAL)
+  - `driver/src/` - Register definitions, DMA/lock/stream switch implementations
+  - `driver/tests/` - Unit tests for DMA, locks, events (valuable reference)
+  - `fal/` - Full Abstraction Layer (profiling, tracing, resource management)
 - `mlir-aie/` - MLIR-based AIE compiler, test suite, and device models
-  - `third_party/aie-rt/` - Vendored hardware abstraction layer (critical reference)
+  - `third_party/aie-rt/` - Patched aie-rt fork (mlir-aie build dependency only)
   - `lib/Dialect/AIE/Util/aie_registers_aie2.json` - AM025 register database
 - `llvm-aie/` - Peano compiler (LLVM with AIE backend, TableGen ISA definitions)
 
@@ -157,7 +161,10 @@ computational semantics).
 
 #### 1. aie-rt -- Hardware Abstraction Layer
 
-**The same library that programs real silicon.** Vendored inside mlir-aie.
+**The same library that programs real silicon.** Official Xilinx repository
+cloned at `../aie-rt/` (branch `xlnx_rel_v2025.2`). mlir-aie also vendors
+a patched fork at `third_party/aie-rt/` for its build -- use the official
+Xilinx clone as the emulator's reference source.
 
 | What it provides | Key files |
 |-----------------|-----------|
@@ -167,8 +174,12 @@ computational semantics).
 | Stream switch circuit/packet configuration | `stream_switch/xaie_ss.h` |
 | DMA polling and completion detection | `dma/xaie_dma_aieml.c` |
 | Data structures for all hardware objects | `global/xaiegbl.h` |
+| AIE2P/AIE2PS register definitions | `global/xaie2psgbl_params.h` |
+| Unit tests (DMA, locks, events, etc.) | `../tests/utest/test_*.cpp` |
+| DMA loopback example | `../examples/xaie_tile_dma_loopback.c` |
+| Auto-routing module | `routing/xaie_routing.c` |
 
-**Path**: `../mlir-aie/third_party/aie-rt/driver/src/`
+**Path**: `../aie-rt/driver/src/`
 
 When implementing DMA, lock, or stream switch behavior, the aie-rt function
 that does the same thing on real hardware is the reference implementation.
@@ -329,7 +340,7 @@ Top-level source files not covered by component docs:
 
 ## Related Resources
 
-- **aie-rt**: `../mlir-aie/third_party/aie-rt/driver/src/` - Hardware abstraction layer (vendored in mlir-aie). The reference implementation for DMA, locks, and stream switch programming.
+- **aie-rt**: `../aie-rt/driver/src/` - Official Xilinx hardware abstraction layer (branch `xlnx_rel_v2025.2`). The reference implementation for DMA, locks, and stream switch programming. Includes unit tests, examples, FAL, and AIE2P definitions. (mlir-aie vendors a patched fork at `third_party/aie-rt/` for its build -- that is NOT the emulator's reference.)
 - **mlir-aie**: `../mlir-aie` - MLIR-based AIE compiler, test binaries, device models, AM025 register database JSON
 - **llvm-aie**: `../llvm-aie` (local clone) - Peano compiler, ISA definitions via TableGen
 - **aietools**: `../aietools` - AMD proprietary tools (Chess compiler, aiesimulator, analysis tools). Read-only reference for hardware semantics not covered by open-source toolchain. See Licensing section.

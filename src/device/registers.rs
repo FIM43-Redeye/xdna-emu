@@ -1,7 +1,7 @@
 //! AIE register definitions and address decoder.
 //!
 //! Register definitions are derived from:
-//! - mlir-aie/third_party/aie-rt/driver/src/global/xaiemlgbl_params.h
+//! - aie-rt/driver/src/global/xaiemlgbl_params.h (Xilinx official, xlnx_rel_v2025.2)
 //! - AMD AM020 (AIE-ML Architecture Manual)
 //! - AMD AM025 (AIE-ML Register Reference)
 //!

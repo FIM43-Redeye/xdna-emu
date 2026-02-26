@@ -433,6 +433,54 @@ impl DmaEngine {
         ChannelType::from_channel_index(channel as usize, self.tile_type)
     }
 
+    /// Resolve a BD lock ID to a local lock index on the own tile.
+    ///
+    /// MemTile DMA BDs use an 8-bit lock ID field that addresses 192 locks
+    /// across three tiles (per mlir-aie getLockLocalBaseIndex):
+    ///   - IDs   0- 63: West column MemTile (col-1) locks
+    ///   - IDs  64-127: Own MemTile locks (local_id = lock_id - 64)
+    ///   - IDs 128-191: East column MemTile (col+1) locks
+    ///
+    /// Compute and shim tile DMA BDs use a 4-bit field (0-15), always local.
+    ///
+    /// Returns `Some(local_lock_index)` for own-tile locks, `None` for
+    /// cross-tile locks (which require neighbor tile access).
+    fn resolve_lock_id(tile_type: TileType, col: u8, row: u8, lock_id: u8) -> Option<u8> {
+        if !tile_type.is_mem_tile() {
+            // Compute/shim: 4-bit field, always local
+            return Some(lock_id);
+        }
+
+        // MemTile: 8-bit field, 192-entry cross-tile address space
+        let num_locks: u8 = 64; // MemTile has 64 locks
+        if lock_id < num_locks {
+            // West column (col-1) locks
+            log::warn!(
+                "DMA tile({},{}) lock_id={} maps to west neighbor (col-1) -- \
+                 cross-tile lock access not yet implemented",
+                col, row, lock_id
+            );
+            None
+        } else if lock_id < num_locks * 2 {
+            // Own tile locks
+            Some(lock_id - num_locks)
+        } else if lock_id < num_locks * 3 {
+            // East column (col+1) locks
+            log::warn!(
+                "DMA tile({},{}) lock_id={} maps to east neighbor (col+1) -- \
+                 cross-tile lock access not yet implemented",
+                col, row, lock_id
+            );
+            None
+        } else {
+            log::warn!(
+                "DMA tile({},{}) lock_id={} out of 192-entry address space",
+                col, row, lock_id
+            );
+            None
+        }
+    }
+
     /// Configure a buffer descriptor.
     pub fn configure_bd(&mut self, bd_index: u8, config: BdConfig) -> Result<(), DmaError> {
         if bd_index as usize >= self.bd_configs.len() {
@@ -1667,15 +1715,18 @@ impl DmaEngine {
         use crate::device::tile::Lock;
         if let TransferState::ReleasingLock(lock_id) = transfer.state {
             let release_delta = transfer.release_value;
-            log::info!("DMA tile({},{}) releasing lock {} with delta {} on channel {} (snapshot-based)",
-                self.col, self.row, lock_id, release_delta, ch_idx);
-            if (lock_id as usize) < tile.locks.len() {
-                // Record release as pending delta, applied at cycle end
-                tile.release_snapshot(lock_id as usize, release_delta);
-                let current = tile.locks[lock_id as usize].value;
-                let new_val = (current as i16 + release_delta as i16).clamp(Lock::MIN_VALUE as i16, Lock::MAX_VALUE as i16) as i8;
-                log::info!("Tile({},{}) lock {} pending delta {} (current={}, will be {} at cycle end)",
-                    self.col, self.row, lock_id, release_delta, current, new_val);
+            // Resolve cross-tile lock addressing (MemTile 192-entry space)
+            if let Some(local_id) = Self::resolve_lock_id(self.tile_type, self.col, self.row, lock_id) {
+                log::info!("DMA tile({},{}) releasing bd_lock={} local_lock={} with delta {} on channel {} (snapshot-based)",
+                    self.col, self.row, lock_id, local_id, release_delta, ch_idx);
+                if (local_id as usize) < tile.locks.len() {
+                    // Record release as pending delta, applied at cycle end
+                    tile.release_snapshot(local_id as usize, release_delta);
+                    let current = tile.locks[local_id as usize].value;
+                    let new_val = (current as i16 + release_delta as i16).clamp(Lock::MIN_VALUE as i16, Lock::MAX_VALUE as i16) as i8;
+                    log::info!("Tile({},{}) lock {} pending delta {} (current={}, will be {} at cycle end)",
+                        self.col, self.row, local_id, release_delta, current, new_val);
+                }
             }
             transfer.lock_released();
         }
@@ -1770,7 +1821,18 @@ impl DmaEngine {
     fn try_acquire_lock(&mut self, ch_idx: usize, lock_id: u8, tile: &mut Tile) -> bool {
         use crate::device::tile::LockResult;
 
-        if (lock_id as usize) >= tile.locks.len() {
+        // Resolve cross-tile lock addressing (MemTile 192-entry space)
+        let local_id = match Self::resolve_lock_id(self.tile_type, self.col, self.row, lock_id) {
+            Some(id) => id,
+            None => return false, // Cross-tile lock, not yet supported
+        };
+
+        if (local_id as usize) >= tile.locks.len() {
+            log::warn!(
+                "DMA try_acquire_lock tile({},{}) ch{} lock_id={} resolved to local_id={} \
+                 but tile only has {} locks",
+                self.col, self.row, ch_idx, lock_id, local_id, tile.locks.len()
+            );
             return false;
         }
 
@@ -1783,10 +1845,10 @@ impl DmaEngine {
 
         // Capture pointers before mutable borrow for debugging
         let tile_ptr = tile as *const _ as usize;
-        let lock_ptr = &tile.locks[lock_id as usize] as *const _ as usize;
+        let lock_ptr = &tile.locks[local_id as usize] as *const _ as usize;
 
         // Get snapshot value for logging (before any modifications)
-        let snapshot_value = tile.lock_snapshot_value(lock_id as usize);
+        let snapshot_value = tile.lock_snapshot_value(local_id as usize);
 
         // AIE-ML lock semantics from AM020:
         // - acquire_value < 0: acq_ge, wait until lock >= |value|, then decrement by |value|
@@ -1806,16 +1868,16 @@ impl DmaEngine {
             (1i8, -1i8, false)
         };
 
-        let result = tile.try_acquire_snapshot(lock_id as usize, expected, delta, equal_mode);
+        let result = tile.try_acquire_snapshot(local_id as usize, expected, delta, equal_mode);
         let success = matches!(result, LockResult::Success);
 
-        log::info!("DMA try_acquire_lock tile({},{}) ch{} lock={} expected={} delta={} snapshot={} result={:?} (tile_ptr=0x{:x} lock_ptr=0x{:x})",
-            self.col, self.row, ch_idx, lock_id, expected, delta, snapshot_value, result,
+        log::info!("DMA try_acquire_lock tile({},{}) ch{} bd_lock={} local_lock={} expected={} delta={} snapshot={} result={:?} (tile_ptr=0x{:x} lock_ptr=0x{:x})",
+            self.col, self.row, ch_idx, lock_id, local_id, expected, delta, snapshot_value, result,
             tile_ptr, lock_ptr);
 
         // Track timing if enabled
         if let Some(ref mut timing) = self.lock_timing {
-            timing.track_acquire(lock_id as usize, success);
+            timing.track_acquire(local_id as usize, success);
         }
 
         if success {

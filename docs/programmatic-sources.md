@@ -35,7 +35,7 @@ Our local toolchain contains three major programmatic knowledge sources:
 |--------|----------|--------|-----------------|
 | **llvm-aie** (Peano) | `../llvm-aie/` | TableGen (.td), C++ | ISA, register encoding, scheduling, ABI |
 | **mlir-aie** | `../mlir-aie/` | C++, JSON, Python | Device model, routing, register database |
-| **aie-rt** | `../mlir-aie/third_party/aie-rt/` | C headers/source | Register offsets, DMA/lock implementations |
+| **aie-rt** | `../aie-rt/` (official Xilinx) | C headers/source | Register offsets, DMA/lock implementations, tests, AIE2P |
 
 Implementation priority (revised 2026-02-14):
 
@@ -307,15 +307,23 @@ pragmatic -- we already have most values correct, we just need confidence.
 ### Location
 
 ```
-mlir-aie/third_party/aie-rt/driver/src/
+aie-rt/driver/src/               -- Official Xilinx (branch xlnx_rel_v2025.2)
   global/xaiemlgbl_params.h      -- All register offset #defines (~10K lines)
   global/xaiemlgbl_reginit.c     -- Structured register property tables
+  global/xaie2psgbl_params.h     -- AIE2P register definitions (future target)
+  global/xaie2psgbl_reginit.c    -- AIE2P property tables (future target)
   global/xaiegbl_defs.h          -- Device type constants, tile types
   global/xaiegbl_regdef.h        -- Type definitions for register properties
   dma/xaie_dma_aieml.c           -- DMA BD read/write (56K lines)
   locks/xaie_locks_aieml.c       -- Lock acquire/release implementation
   device/xaie_device_aieml.c     -- Device initialization
   core/xaie_core_aieml.c         -- Core enable/disable/status
+  routing/xaie_routing.c         -- Auto-routing (not in mlir-aie's fork)
+aie-rt/driver/tests/utest/       -- Unit tests (valuable reference)
+  test_dma_aieml.cpp             -- DMA BD programming tests
+  test_locks_aieml.cpp           -- Lock acquire/release tests
+aie-rt/driver/examples/
+  xaie_tile_dma_loopback.c       -- DMA loopback example
 ```
 
 ### Key Constants
