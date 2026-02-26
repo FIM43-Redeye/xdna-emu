@@ -398,9 +398,12 @@ pub fn parse_test_output(stdout: &str) -> (bool, usize, usize) {
 
     for line in stdout.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("Correct") {
+        // Standard pattern: "Correct(...)" / "Error(...)"
+        // two_col pattern: "... is correct  : ..."
+        // distribute_repeat pattern: "error at index[N]: expected X got Y"
+        if trimmed.starts_with("Correct") || trimmed.contains("is correct") {
             correct += 1;
-        } else if trimmed.starts_with("Error") {
+        } else if trimmed.starts_with("Error") || trimmed.starts_with("error at index") {
             errors += 1;
         }
     }

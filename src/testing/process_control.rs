@@ -137,20 +137,25 @@ pub fn wait_with_timeout(mut child: Child, timeout_secs: u32) -> ProcessOutcome 
 
     // Take pipe handles immediately and drain in background threads.
     // This prevents deadlock when a child produces >64KB of output.
+    //
+    // Uses read_to_end + from_utf8_lossy instead of read_to_string because
+    // some tests (e.g. two_col) print raw uint8_t values that produce
+    // invalid UTF-8 sequences. read_to_string would fail and return an
+    // empty string, causing the runner to miss PASS/FAIL in the output.
     let stdout_thread = child.stdout.take().map(|pipe| {
         std::thread::spawn(move || {
-            let mut buf = String::new();
+            let mut bytes = Vec::new();
             let mut reader = std::io::BufReader::new(pipe);
-            let _ = reader.read_to_string(&mut buf);
-            buf
+            let _ = reader.read_to_end(&mut bytes);
+            String::from_utf8_lossy(&bytes).into_owned()
         })
     });
     let stderr_thread = child.stderr.take().map(|pipe| {
         std::thread::spawn(move || {
-            let mut buf = String::new();
+            let mut bytes = Vec::new();
             let mut reader = std::io::BufReader::new(pipe);
-            let _ = reader.read_to_string(&mut buf);
-            buf
+            let _ = reader.read_to_end(&mut bytes);
+            String::from_utf8_lossy(&bytes).into_owned()
         })
     });
 
