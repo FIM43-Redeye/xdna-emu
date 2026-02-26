@@ -77,6 +77,31 @@ pub struct BuildEnv {
     test_lib_include: Option<PathBuf>,
     /// Library path for test_lib (libtest_lib.a), if available.
     test_lib_lib: Option<PathBuf>,
+    /// Modification time of the toolchain (max mtime of key binaries like
+    /// aie-opt). Used by cache checks to invalidate when mlir-aie is rebuilt
+    /// even if test sources are unchanged.
+    toolchain_mtime: Option<std::time::SystemTime>,
+}
+
+/// Check whether a cached xclbin is still valid given source and toolchain timestamps.
+///
+/// The xclbin is valid only if it is newer than BOTH the source file AND
+/// the toolchain. This catches the case where mlir-aie is rebuilt (changing
+/// buffer allocation, CDO generation, etc.) but the test source is unchanged.
+fn is_cache_valid(
+    xclbin_mtime: std::time::SystemTime,
+    source_mtime: std::time::SystemTime,
+    toolchain_mtime: Option<std::time::SystemTime>,
+) -> bool {
+    if xclbin_mtime <= source_mtime {
+        return false;
+    }
+    if let Some(tc) = toolchain_mtime {
+        if xclbin_mtime <= tc {
+            return false;
+        }
+    }
+    true
 }
 
 impl BuildEnv {
@@ -174,6 +199,14 @@ impl BuildEnv {
             if p.is_dir() { Some(p) } else { None }
         };
 
+        // Toolchain mtime: use aie-opt as sentinel for mlir-aie rebuilds.
+        // aie-opt is always rebuilt when mlir-aie changes; aiecc.py in the
+        // install dir can have a stale timestamp from the initial copy.
+        let toolchain_mtime = mlir_aie_bin.join("aie-opt")
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok();
+
         Ok(BuildEnv {
             python,
             aiecc,
@@ -184,6 +217,7 @@ impl BuildEnv {
             mlir_aie_root: mlir_aie,
             test_lib_include,
             test_lib_lib,
+            toolchain_mtime,
         })
     }
 
@@ -649,7 +683,7 @@ impl BuildEnv {
         let xclbin_modified = xclbin_path.metadata().ok()?.modified().ok()?;
         let entry_modified = test.entry_file.metadata().ok()?.modified().ok()?;
 
-        if xclbin_modified > entry_modified {
+        if is_cache_valid(xclbin_modified, entry_modified, self.toolchain_mtime) {
             log::info!("Using cached NPU test build in {}", output_dir.display());
             Some(BuildResult {
                 xclbin: xclbin_path.to_path_buf(),
@@ -705,7 +739,7 @@ impl BuildEnv {
         let source_modified = mlir_source.metadata().ok()?.modified().ok()?;
         let xclbin_modified = xclbin_path.metadata().ok()?.modified().ok()?;
 
-        if xclbin_modified > source_modified {
+        if is_cache_valid(xclbin_modified, source_modified, self.toolchain_mtime) {
             log::info!("Using cached build in {}", output_dir.display());
             Some(BuildResult {
                 xclbin: xclbin_path.to_path_buf(),
@@ -742,8 +776,8 @@ impl BuildEnv {
 
         for source in sources {
             let src_modified = source.metadata().ok()?.modified().ok()?;
-            if src_modified > ps_modified {
-                return None; // Source is newer, rebuild needed
+            if !is_cache_valid(ps_modified, src_modified, self.toolchain_mtime) {
+                return None; // Source or toolchain is newer, rebuild needed
             }
         }
 
@@ -1428,5 +1462,56 @@ mod tests {
         assert!(results[2].1.as_ref().unwrap().ends_with("insts2_plain.txt"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_toolchain_mtime_detects_stale_cache() {
+        // Simulate: xclbin is newer than source, but toolchain was rebuilt
+        // after the xclbin was produced. Cache should be invalidated.
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join("xdna_test_toolchain_cache");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let xclbin_path = dir.join("aie.xclbin");
+        let source_path = dir.join("aie.mlir");
+
+        // Create source first, then xclbin (xclbin is "newer" than source)
+        std::fs::write(&source_path, b"source").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::write(&xclbin_path, b"xclbin").unwrap();
+
+        let xclbin_mtime = xclbin_path.metadata().unwrap().modified().unwrap();
+        let source_mtime = source_path.metadata().unwrap().modified().unwrap();
+
+        // Without toolchain check: cache is valid (xclbin > source)
+        assert!(xclbin_mtime > source_mtime);
+
+        // With toolchain rebuilt AFTER the xclbin: cache should be invalid
+        let future_toolchain = xclbin_mtime + Duration::from_secs(100);
+        assert!(is_cache_valid(xclbin_mtime, source_mtime, Some(future_toolchain)) == false);
+
+        // With toolchain older than xclbin: cache is still valid
+        let old_toolchain = source_mtime - Duration::from_secs(100);
+        assert!(is_cache_valid(xclbin_mtime, source_mtime, Some(old_toolchain)) == true);
+
+        // With no toolchain mtime (legacy behavior): cache is valid
+        assert!(is_cache_valid(xclbin_mtime, source_mtime, None) == true);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_toolchain_mtime_source_newer_always_invalidates() {
+        // Even with old toolchain, if source is newer than xclbin, cache is invalid.
+        use std::time::{Duration, SystemTime};
+
+        let now = SystemTime::now();
+        let xclbin_mtime = now - Duration::from_secs(200);
+        let source_mtime = now - Duration::from_secs(100);  // source newer than xclbin
+        let toolchain_mtime = now - Duration::from_secs(300);  // toolchain older than both
+
+        assert!(is_cache_valid(xclbin_mtime, source_mtime, Some(toolchain_mtime)) == false);
     }
 }
