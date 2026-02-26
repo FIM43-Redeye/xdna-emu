@@ -689,50 +689,32 @@ impl NpuExecutor {
             if is_mm2s { "MM2S" } else { "S2MM" }, abs_channel, bd_index, repeat_count
         );
 
-        // Try to enqueue. If queue is full, apply backpressure by stepping DMA
-        // until space opens, matching real hardware behavior where the host
-        // firmware blocks on Start_Queue writes when the queue is full (aie-rt
+        // Try to enqueue. If queue is full, transition to BlockedOnQueue
+        // and let the caller handle draining (engine stepping in interleaved
+        // mode, or bounded DMA-only stepping in batch execute() mode).
+        // This matches real hardware where the host firmware blocks on
+        // Start_Queue writes when the queue is full (aie-rt
         // _XAieMl_DmaWaitForBdTaskQueue polls Task_Queue_Size before writing).
         use crate::device::dma::MAX_TASK_QUEUE_DEPTH;
 
-        // Check if the queue has space before enqueuing
-        let needs_drain = device.array.dma_engine(col, row)
+        let queue_full = device.array.dma_engine(col, row)
             .map_or(false, |dma| dma.task_queue_size(abs_channel) >= MAX_TASK_QUEUE_DEPTH);
 
-        if needs_drain {
-            // Step DMA to drain the queue. Shim DMA needs stream data flowing
-            // (from compute tiles), so step_all_dma alone may not be sufficient.
-            // Use a bounded loop to avoid infinite spinning.
-            const MAX_DRAIN_CYCLES: u32 = 100_000;
-            let mut drained = false;
-            for drain_cycle in 0..MAX_DRAIN_CYCLES {
-                device.array.step_all_dma(host_memory);
-
-                if let Some(dma) = device.array.dma_engine(col, row) {
-                    if dma.task_queue_size(abs_channel) < MAX_TASK_QUEUE_DEPTH {
-                        log::debug!(
-                            "  DMA tile({},{}) ch{} queue drained after {} cycles",
-                            col, row, abs_channel, drain_cycle + 1
-                        );
-                        drained = true;
-                        break;
-                    }
-                }
-            }
-
-            if !drained {
-                // Queue never drained -- likely needs full system stepping
-                // (cores + stream routing) which we can't do during NPU instruction
-                // execution. Log once and drop the task.
-                let msg = format!(
-                    "DMA tile({},{}) ch{} task queue full, BD {} dropped \
-                     (queue could not drain during instruction execution)",
-                    col, row, abs_channel, bd_index
-                );
-                log::warn!("{}", msg);
-                self.warnings.push(msg);
-                return;
-            }
+        if queue_full {
+            log::debug!(
+                "DMA tile({},{}) ch{} queue full, deferring BD {} enqueue",
+                col, row, abs_channel, bd_index
+            );
+            self.state = ExecutorState::BlockedOnQueue {
+                instr_index: self.executed_count,
+                next_index: self.executed_count + 1,
+                col, row,
+                channel: abs_channel,
+                bd_id: bd_index,
+                repeat: repeat_count,
+                enable_token: (value >> 31) & 1 != 0,
+            };
+            return;
         }
 
         if let Some(dma) = device.array.dma_engine_mut(col, row) {
