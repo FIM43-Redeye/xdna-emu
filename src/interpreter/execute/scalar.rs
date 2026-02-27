@@ -371,7 +371,28 @@ impl ScalarAlu {
                 Operand::ScalarReg(r) => ctx.scalar.write(*r, value),
                 Operand::PointerReg(r) => ctx.pointer.write(*r, value),
                 Operand::ModifierReg(r) => ctx.modifier.write(*r, value),
-                _ => {} // Ignore invalid destinations
+                Operand::ControlReg(id) => {
+                    // Control register write: update SRS/UPS config.
+                    // Hardware register IDs from AIE2GenRegisterInfo.td.
+                    match id {
+                        9 => { // crSat
+                            ctx.srs_config.saturation_mode = (value & 0x3) as u8;
+                            log::trace!("crSat = {} (raw 0x{:X})", value & 0x3, value);
+                        }
+                        6 => { // crRnd
+                            ctx.srs_config.rounding_mode = (value & 0xF) as u8;
+                            log::trace!("crRnd = {} (raw 0x{:X})", value & 0xF, value);
+                        }
+                        8 => { // crSRSSign
+                            ctx.srs_config.srs_sign = (value & 1) != 0;
+                            log::trace!("crSRSSign = {} (raw 0x{:X})", value & 1, value);
+                        }
+                        _ => {
+                            log::trace!("control register write: id={}, value=0x{:X}", id, value);
+                        }
+                    }
+                }
+                _ => {} // Other operand types not valid as scalar destinations
             }
         }
     }
@@ -586,5 +607,56 @@ mod tests {
 
         ScalarAlu::execute(&op, &mut ctx);
         assert_eq!(ctx.scalar.read(1), 0x1100);
+    }
+
+    #[test]
+    fn test_control_reg_write_crsat() {
+        let mut ctx = make_ctx();
+        // Write value 3 (symmetric saturate) to crSat (id=9)
+        let op = SlotOp::new(SlotIndex::Scalar0, Operation::ScalarMov)
+            .with_source(Operand::Immediate(3))
+            .with_dest(Operand::ControlReg(9));
+        ScalarAlu::execute(&op, &mut ctx);
+        assert_eq!(ctx.srs_config.saturation_mode, 3);
+    }
+
+    #[test]
+    fn test_control_reg_write_crrnd() {
+        let mut ctx = make_ctx();
+        // Write rounding mode 9 (PosInf) to crRnd (id=6)
+        let op = SlotOp::new(SlotIndex::Scalar0, Operation::ScalarMov)
+            .with_source(Operand::Immediate(9))
+            .with_dest(Operand::ControlReg(6));
+        ScalarAlu::execute(&op, &mut ctx);
+        assert_eq!(ctx.srs_config.rounding_mode, 9);
+    }
+
+    #[test]
+    fn test_control_reg_write_srssign() {
+        let mut ctx = make_ctx();
+        // Write 1 (signed) to crSRSSign (id=8)
+        let op = SlotOp::new(SlotIndex::Scalar0, Operation::ScalarMov)
+            .with_source(Operand::Immediate(1))
+            .with_dest(Operand::ControlReg(8));
+        ScalarAlu::execute(&op, &mut ctx);
+        assert!(ctx.srs_config.srs_sign);
+    }
+
+    #[test]
+    fn test_control_reg_write_masks_value() {
+        let mut ctx = make_ctx();
+        // crSat only uses lower 2 bits, crRnd only lower 4 bits.
+        // Writing 0xFF should mask to the valid field width.
+        let op = SlotOp::new(SlotIndex::Scalar0, Operation::ScalarMov)
+            .with_source(Operand::Immediate(0xFF))
+            .with_dest(Operand::ControlReg(9)); // crSat
+        ScalarAlu::execute(&op, &mut ctx);
+        assert_eq!(ctx.srs_config.saturation_mode, 3); // 0xFF & 0x3
+
+        let op = SlotOp::new(SlotIndex::Scalar0, Operation::ScalarMov)
+            .with_source(Operand::Immediate(0xFF))
+            .with_dest(Operand::ControlReg(6)); // crRnd
+        ScalarAlu::execute(&op, &mut ctx);
+        assert_eq!(ctx.srs_config.rounding_mode, 15); // 0xFF & 0xF
     }
 }

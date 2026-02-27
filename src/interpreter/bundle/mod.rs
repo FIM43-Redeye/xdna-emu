@@ -529,6 +529,7 @@ fn operand_str(op: &Operand) -> String {
         Operand::Lock(id) => format!("lock{}", id),
         Operand::DmaChannel(ch) => format!("ch{}", ch),
         Operand::BufferDescriptor(bd) => format!("bd{}", bd),
+        Operand::ControlReg(id) => format!("cr{}", id),
     }
 }
 

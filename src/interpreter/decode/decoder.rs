@@ -645,6 +645,7 @@ impl InstructionDecoder {
                         RegisterKind::Vector256 | RegisterKind::Vector512 =>
                             Operand::VectorReg(reg),
                         RegisterKind::Accumulator => Operand::AccumReg(reg),
+                        RegisterKind::Control => Operand::ControlReg(reg),
                     }
                 }
                 OperandType::CompositeRegister(encoder) => {

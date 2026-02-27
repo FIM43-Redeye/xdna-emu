@@ -876,6 +876,9 @@ pub enum Operand {
     DmaChannel(u8),
     /// Buffer descriptor.
     BufferDescriptor(u8),
+    /// Control register (crRnd=6, crSat=9, crSRSSign=8, crVaddSign=0, etc.).
+    /// The u8 is the 4-bit hardware register ID from the ISA encoding.
+    ControlReg(u8),
 }
 
 /// Predicate for conditional execution.

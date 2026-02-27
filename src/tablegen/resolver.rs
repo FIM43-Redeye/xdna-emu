@@ -153,6 +153,8 @@ pub enum RegisterKind {
     Vector512,
     /// eAM, eBM, eCM, mAMm, mBMm: accumulator registers
     Accumulator,
+    /// mCRm: control registers (crRnd, crSat, crSRSSign, crVaddSign, etc.)
+    Control,
 }
 
 /// Which Peano composite encoder function was used.
@@ -231,6 +233,7 @@ pub fn classify_operand_type(reg_class: &str, field_name: &str) -> OperandType {
         "eDN" => return OperandType::Register(RegisterKind::ModifierDN),
         "eDJ" => return OperandType::Register(RegisterKind::ModifierDJ),
         "eDC" => return OperandType::Register(RegisterKind::ModifierDC),
+        "mCRm" => return OperandType::Register(RegisterKind::Control),
         _ => {}
     }
     if reg_class.starts_with("eW") || reg_class == "mWm" {
@@ -1600,12 +1603,12 @@ pub fn infer_semantic_from_mnemonic(mnemonic: &str) -> Option<SemanticOp> {
         return Some(SemanticOp::SRem);
     }
 
-    // Carry ops (scalar, map to Add/Sub)
+    // Carry ops (scalar, add/subtract with carry flag input)
     if lower == "adc" || lower.starts_with("adc.") {
-        return Some(SemanticOp::Add);
+        return Some(SemanticOp::Adc);
     }
     if lower == "sbc" || lower.starts_with("sbc.") {
-        return Some(SemanticOp::Sub);
+        return Some(SemanticOp::Sbc);
     }
 
     // Shift (alternate naming: ashl = arithmetic shift left)

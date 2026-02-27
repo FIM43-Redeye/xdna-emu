@@ -436,35 +436,20 @@ pub struct SrsConfig {
 }
 
 impl Default for SrsConfig {
-    /// Default matches what mlir-aie compiled code typically configures:
-    /// - Rounding: PosInf (mode 9) -- most common in aie API usage
-    /// - Saturation: enabled (mode 1) -- prevents silent overflow
-    /// - Sign: signed (true) -- most common output type
+    /// Hardware reset defaults: all zero.
     ///
-    /// Hardware reset is all-zero (Floor, no saturation, unsigned), but
-    /// kernel preamble code always reconfigures these before SRS. Until
-    /// control register write instructions are decoded, these defaults
-    /// match expected behavior for the test suite.
+    /// Kernel preamble code configures crRnd/crSat/crSRSSign via control
+    /// register write instructions before any SRS/UPS operations.
     fn default() -> Self {
-        Self {
-            rounding_mode: 9,  // PosInf
-            saturation_mode: 1, // Saturate (not symmetric)
-            srs_sign: true,     // Signed output
-        }
-    }
-}
-
-impl SrsConfig {
-    /// Create with hardware reset defaults (all zero).
-    #[cfg(test)]
-    pub fn hardware_reset() -> Self {
         Self {
             rounding_mode: 0,   // Floor
             saturation_mode: 0, // No saturation
             srs_sign: false,    // Unsigned
         }
     }
+}
 
+impl SrsConfig {
     /// Whether saturation is enabled (mode bits [0] set).
     pub fn saturate(&self) -> bool {
         self.saturation_mode & 0x1 != 0

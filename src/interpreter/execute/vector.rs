@@ -3418,8 +3418,11 @@ mod tests {
         .with_source(Operand::AccumReg(0))
         .with_source(Operand::Immediate(4));
 
-        // Default config: PosInf (mode 9), saturation on, signed.
+        // PosInf (mode 9), saturation on, signed.
         // 16.5 with PosInf -> 17 (round toward +inf at halfway)
+        ctx.srs_config.rounding_mode = 9; // PosInf
+        ctx.srs_config.saturation_mode = 1; // Saturate
+        ctx.srs_config.srs_sign = true; // Signed
         VectorAlu::execute(&op, &mut ctx);
         assert_eq!(ctx.vector.read(0)[0], 17);
 
@@ -3454,7 +3457,9 @@ mod tests {
         .with_source(Operand::AccumReg(0))
         .with_source(Operand::Immediate(0)); // shift=0
 
-        // Default: saturation enabled -> clamp to 32767
+        // Saturation enabled, signed -> clamp to 32767
+        ctx.srs_config.saturation_mode = 1; // Saturate
+        ctx.srs_config.srs_sign = true; // Signed
         VectorAlu::execute(&op, &mut ctx);
         let lo16 = ctx.vector.read(0)[0] as i16;
         assert_eq!(lo16, 32767);
