@@ -92,6 +92,25 @@ impl LoadedTrace {
             active_tiles,
         }
     }
+
+    /// Binary search for the contiguous slice of events at a given cycle.
+    /// Returns an empty slice if no events at that cycle.
+    pub fn events_at_cycle(&self, cycle: u64) -> &[TraceEvent] {
+        let start = self.events.partition_point(|e| e.cycle < cycle);
+        let end = self.events.partition_point(|e| e.cycle <= cycle);
+        &self.events[start..end]
+    }
+
+    /// Slice of events in [start_cycle, end_cycle] inclusive.
+    pub fn events_in_range(
+        &self,
+        start_cycle: u64,
+        end_cycle: u64,
+    ) -> &[TraceEvent] {
+        let start = self.events.partition_point(|e| e.cycle < start_cycle);
+        let end = self.events.partition_point(|e| e.cycle <= end_cycle);
+        &self.events[start..end]
+    }
 }
 
 /// Multi-source trace store with global cycle cursor.
@@ -178,6 +197,47 @@ impl TraceStore {
             }
         }
         best
+    }
+
+    /// All events at the current cursor cycle, per loaded trace.
+    /// Returns (trace_ref, event_slice) pairs. Slice may be empty for
+    /// traces with no events at this cycle.
+    pub fn events_at_cursor(&self) -> Vec<(&LoadedTrace, &[TraceEvent])> {
+        self.traces
+            .iter()
+            .map(|t| (t, t.events_at_cycle(self.cursor)))
+            .collect()
+    }
+
+    /// Events at the cursor for a specific tile, per loaded trace.
+    pub fn tile_events_at_cursor(
+        &self,
+        col: u8,
+        row: u8,
+    ) -> Vec<(&LoadedTrace, Vec<&TraceEvent>)> {
+        self.traces
+            .iter()
+            .map(|t| {
+                let tile_events: Vec<&TraceEvent> = t
+                    .events_at_cycle(self.cursor)
+                    .iter()
+                    .filter(|e| e.col == col && e.row == row)
+                    .collect();
+                (t, tile_events)
+            })
+            .collect()
+    }
+
+    /// Events in a cycle range [start, end] inclusive, per loaded trace.
+    pub fn events_in_range(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Vec<(&LoadedTrace, &[TraceEvent])> {
+        self.traces
+            .iter()
+            .map(|t| (t, t.events_in_range(start, end)))
+            .collect()
     }
 
     /// All tiles with events in any loaded trace.
@@ -347,5 +407,102 @@ mod tests {
 
         store.seek(20);
         assert_eq!(store.next_event_cycle(), Some(30));
+    }
+
+    #[test]
+    fn test_events_at_cursor() {
+        let mut store = TraceStore::new();
+        store.add_trace(LoadedTrace::from_events(
+            "t1".into(),
+            TraceSource::Emulator,
+            vec![
+                make_event(10, 0, 2, "A"),
+                make_event(10, 1, 2, "B"),
+                make_event(20, 0, 2, "C"),
+            ],
+        ));
+
+        store.seek(10);
+        let results = store.events_at_cursor();
+        assert_eq!(results.len(), 1); // one trace
+        assert_eq!(results[0].1.len(), 2); // two events at cycle 10
+    }
+
+    #[test]
+    fn test_events_at_cursor_multi_trace() {
+        let mut store = TraceStore::new();
+        store.add_trace(LoadedTrace::from_events(
+            "emu".into(),
+            TraceSource::Emulator,
+            vec![make_event(10, 0, 2, "A")],
+        ));
+        store.add_trace(LoadedTrace::from_events(
+            "hw".into(),
+            TraceSource::Hardware,
+            vec![make_event(10, 0, 2, "X"), make_event(10, 1, 2, "Y")],
+        ));
+
+        store.seek(10);
+        let results = store.events_at_cursor();
+        assert_eq!(results.len(), 2); // two traces
+        assert_eq!(results[0].1.len(), 1); // emu: 1 event
+        assert_eq!(results[1].1.len(), 2); // hw: 2 events
+    }
+
+    #[test]
+    fn test_tile_events_at_cursor() {
+        let mut store = TraceStore::new();
+        store.add_trace(LoadedTrace::from_events(
+            "t1".into(),
+            TraceSource::Emulator,
+            vec![
+                make_event(10, 0, 2, "A"),
+                make_event(10, 1, 2, "B"),
+                make_event(10, 0, 2, "C"),
+            ],
+        ));
+
+        store.seek(10);
+        let results = store.tile_events_at_cursor(0, 2);
+        assert_eq!(results.len(), 1); // one trace
+        assert_eq!(results[0].1.len(), 2); // events A and C for tile (0,2)
+    }
+
+    #[test]
+    fn test_events_in_range() {
+        let mut store = TraceStore::new();
+        store.add_trace(LoadedTrace::from_events(
+            "t1".into(),
+            TraceSource::Emulator,
+            vec![
+                make_event(5, 0, 2, "A"),
+                make_event(10, 0, 2, "B"),
+                make_event(15, 0, 2, "C"),
+                make_event(20, 0, 2, "D"),
+                make_event(25, 0, 2, "E"),
+            ],
+        ));
+
+        let results = store.events_in_range(10, 20);
+        assert_eq!(results.len(), 1);
+        // Should include events at cycles 10, 15, 20
+        assert_eq!(results[0].1.len(), 3);
+        assert_eq!(results[0].1[0].name, "B");
+        assert_eq!(results[0].1[2].name, "D");
+    }
+
+    #[test]
+    fn test_events_at_cursor_empty_cycle() {
+        let mut store = TraceStore::new();
+        store.add_trace(LoadedTrace::from_events(
+            "t1".into(),
+            TraceSource::Emulator,
+            vec![make_event(10, 0, 2, "A"), make_event(20, 0, 2, "B")],
+        ));
+
+        store.seek(15); // no events at cycle 15
+        let results = store.events_at_cursor();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1.len(), 0); // empty slice
     }
 }
