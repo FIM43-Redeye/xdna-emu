@@ -993,27 +993,43 @@ pub fn run(opts: &Options) {
     let config = crate::config::Config::get();
     let mlir_aie_path = PathBuf::from(config.mlir_aie_path());
 
-    // Platform detection via mlir-aie bridge.
-    // Stored for use in pre-flight test filtering (skip tests requiring
-    // features this platform doesn't have).
-    let platform = crate::integration::bridge::BridgePath::discover()
-        .and_then(|bridge| {
-            match crate::integration::bridge::PlatformInfo::from_bridge(&bridge) {
-                Ok(p) => {
-                    println!(
-                        "platform: {} ({}) -- features: {}",
-                        p.npu_model.as_deref().unwrap_or("unknown"),
-                        p.arch.as_deref().unwrap_or("unknown"),
-                        p.features.join(", "),
-                    );
-                    Some(p)
-                }
-                Err(e) => {
-                    eprintln!("Warning: platform detection failed: {}", e);
-                    None
+    // mlir-aie bridge: platform detection + trace event validation.
+    // Bridge path is stored for trace event validation; platform info
+    // is stored for pre-flight test filtering.
+    let bridge = crate::integration::bridge::BridgePath::discover();
+    let platform = bridge.as_ref().and_then(|b| {
+        match crate::integration::bridge::PlatformInfo::from_bridge(b) {
+            Ok(p) => {
+                println!(
+                    "platform: {} ({}) -- features: {}",
+                    p.npu_model.as_deref().unwrap_or("unknown"),
+                    p.arch.as_deref().unwrap_or("unknown"),
+                    p.features.join(", "),
+                );
+                Some(p)
+            }
+            Err(e) => {
+                eprintln!("Warning: platform detection failed: {}", e);
+                None
+            }
+        }
+    });
+
+    // Validate compiled-in trace event codes against current mlir-aie.
+    if let Some(ref b) = bridge {
+        match crate::trace::validate_trace_events(b) {
+            Ok(warnings) => {
+                for w in &warnings {
+                    eprintln!("Warning: trace event mismatch: {}", w);
                 }
             }
-        });
+            Err(e) => {
+                // Trace validation failure is non-fatal (mlir-aie might
+                // not be importable even though the bridge script exists).
+                log::debug!("trace event validation skipped: {}", e);
+            }
+        }
+    }
 
     // --list: discover and print tests from source tree, then exit.
     if opts.list_only {

@@ -50,6 +50,62 @@ use crate::interpreter::state::EventType;
 use std::collections::BTreeMap;
 use std::io::Write;
 
+/// Validate compiled-in trace event tables against current mlir-aie.
+///
+/// Spot-checks key event codes from the build-time generated tables against
+/// live bridge output. Reports any mismatches, which indicate mlir-aie was
+/// updated after the last build. Returns Ok(()) if all checks pass, or an
+/// error if the bridge invocation fails (bridge unavailable is not an error).
+pub fn validate_trace_events(
+    bridge: &crate::integration::bridge::BridgePath,
+) -> Result<Vec<String>, String> {
+    let json = crate::integration::bridge::invoke_bridge(bridge, "trace-events", &[])?;
+
+    let mut warnings = Vec::new();
+
+    // Spot-check core events.
+    let core = &json["enums"]["CoreEvent"];
+    let core_checks: &[(&str, u8)] = &[
+        ("INSTR_VECTOR", event_codes::core_events::INSTR_VECTOR),
+        ("MEMORY_STALL", event_codes::core_events::MEMORY_STALL),
+        ("LOCK_STALL", event_codes::core_events::LOCK_STALL),
+        ("ACTIVE", event_codes::core_events::ACTIVE),
+        ("DISABLED", event_codes::core_events::DISABLED),
+        ("INSTR_LOAD", event_codes::core_events::INSTR_LOAD),
+    ];
+
+    for (name, expected) in core_checks {
+        if let Some(actual) = core[*name].as_u64() {
+            if actual as u8 != *expected {
+                warnings.push(format!(
+                    "CoreEvent::{} compiled={} mlir-aie={}",
+                    name, expected, actual,
+                ));
+            }
+        }
+    }
+
+    // Spot-check mem events.
+    let mem = &json["enums"]["MemEvent"];
+    let mem_checks: &[(&str, u8)] = &[
+        ("DMA_S2MM_0_START_TASK", event_codes::mem_events::DMA_S2MM_0_START_TASK),
+        ("DMA_MM2S_0_START_TASK", event_codes::mem_events::DMA_MM2S_0_START_TASK),
+    ];
+
+    for (name, expected) in mem_checks {
+        if let Some(actual) = mem[*name].as_u64() {
+            if actual as u8 != *expected {
+                warnings.push(format!(
+                    "MemEvent::{} compiled={} mlir-aie={}",
+                    name, expected, actual,
+                ));
+            }
+        }
+    }
+
+    Ok(warnings)
+}
+
 /// Event category for PID grouping (matches mlir-aie PacketType).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TraceType {
@@ -1079,6 +1135,21 @@ mod tests {
         // Shim PL module: EDGE_DETECTION_EVENT_0=11, EVENT_1=12
         assert_eq!(shim_edge_detection_event_hw_id(0), 11);
         assert_eq!(shim_edge_detection_event_hw_id(1), 12);
+    }
+
+    #[test]
+    fn test_validate_trace_events_passes() {
+        // Validate compiled-in tables against live mlir-aie (if available).
+        let bridge = crate::integration::bridge::BridgePath::discover();
+        if bridge.is_none() { return; }
+        let warnings = validate_trace_events(&bridge.unwrap());
+        assert!(warnings.is_ok(), "validation failed: {:?}", warnings.err());
+        let warnings = warnings.unwrap();
+        assert!(
+            warnings.is_empty(),
+            "trace event mismatches: {:?}",
+            warnings,
+        );
     }
 
     #[test]
