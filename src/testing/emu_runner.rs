@@ -927,6 +927,23 @@ pub fn run(opts: &Options) {
     let config = crate::config::Config::get();
     let mlir_aie_path = PathBuf::from(config.mlir_aie_path());
 
+    // Platform detection via mlir-aie bridge (informational).
+    if let Some(bridge) = crate::integration::bridge::BridgePath::discover() {
+        match crate::integration::bridge::PlatformInfo::from_bridge(&bridge) {
+            Ok(platform) => {
+                println!(
+                    "platform: {} ({}) -- features: {}",
+                    platform.npu_model.as_deref().unwrap_or("unknown"),
+                    platform.arch.as_deref().unwrap_or("unknown"),
+                    platform.features.join(", "),
+                );
+            }
+            Err(e) => {
+                eprintln!("Warning: platform detection failed: {}", e);
+            }
+        }
+    }
+
     // --list: discover and print tests from source tree, then exit.
     if opts.list_only {
         let mut source_tests = npu_test::discover(&mlir_aie_path);
