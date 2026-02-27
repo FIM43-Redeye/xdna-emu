@@ -1016,17 +1016,20 @@ pub fn run(opts: &Options) {
     });
 
     // Validate compiled-in trace event codes against current mlir-aie.
-    if let Some(ref b) = bridge {
-        match crate::trace::validate_trace_events(b) {
-            Ok(warnings) => {
-                for w in &warnings {
-                    eprintln!("Warning: trace event mismatch: {}", w);
+    // Only runs in verbose mode to avoid an extra 0.2s subprocess call on
+    // every startup. The unit test (test_validate_trace_events_passes)
+    // catches drift during development.
+    if opts.verbose {
+        if let Some(ref b) = bridge {
+            match crate::trace::validate_trace_events(b) {
+                Ok(warnings) => {
+                    for w in &warnings {
+                        eprintln!("Warning: trace event mismatch: {}", w);
+                    }
                 }
-            }
-            Err(e) => {
-                // Trace validation failure is non-fatal (mlir-aie might
-                // not be importable even though the bridge script exists).
-                log::debug!("trace event validation skipped: {}", e);
+                Err(e) => {
+                    log::debug!("trace event validation skipped: {}", e);
+                }
             }
         }
     }

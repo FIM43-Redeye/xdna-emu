@@ -459,6 +459,13 @@ def cmd_platform_detect(args):
     if tools.get("aiesimulator", {}).get("found"):
         features.append("aiesimulator")
 
+    # Check for XRT Python bindings (pyxrt).
+    try:
+        import pyxrt  # noqa: F401
+        features.append("xrt_python_bindings")
+    except ImportError:
+        pass
+
     result = {
         "hardware": hardware,
         "tools": tools,
