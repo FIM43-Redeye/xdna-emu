@@ -258,8 +258,15 @@ pub struct DmaEngine {
     /// Value N means run the BD N+1 more times after current
     repeat_counts: Vec<u8>,
 
-    /// Current BD index per channel (for repeat)
+    /// Current BD index per channel (for status register readback)
     current_bds: Vec<Option<u8>>,
+
+    /// Start BD of the current task's chain per channel (for repeat restart).
+    /// When a BD chain with repeat completes its last BD, the repeat should
+    /// restart from the chain's FIRST BD, not the last one. `current_bds`
+    /// gets overwritten as each chained BD starts, so this separate field
+    /// preserves the chain origin.
+    chain_start_bds: Vec<Option<u8>>,
 
     /// Timing configuration (controls cycle-accuracy vs fast mode)
     timing_config: DmaTimingConfig,
@@ -347,6 +354,7 @@ impl DmaEngine {
             queued_bds: vec![None; num_channels],
             repeat_counts: vec![0; num_channels],
             current_bds: vec![None; num_channels],
+            chain_start_bds: vec![None; num_channels],
             // Cycle-accurate timing is the default and only mode
             timing_config: DmaTimingConfig::from_aie2_spec(),
             timing_states: vec![ChannelTimingState::default(); num_channels],
@@ -553,7 +561,9 @@ impl DmaEngine {
 
     /// Start a channel with the specified BD.
     pub fn start_channel(&mut self, channel: ChannelId, bd_index: u8) -> Result<(), DmaError> {
-        self.start_channel_with_repeat(channel, bd_index, 0)
+        self.start_channel_with_repeat(channel, bd_index, 0)?;
+        self.chain_start_bds[channel as usize] = Some(bd_index);
+        Ok(())
     }
 
     /// Start a channel with the specified BD and repeat count.
@@ -638,6 +648,7 @@ impl DmaEngine {
         self.transfers[ch_idx] = None;
         self.channel_states[ch_idx] = ChannelState::Idle;
         self.queued_bds[ch_idx] = None;
+        self.chain_start_bds[ch_idx] = None;
 
         Ok(())
     }
@@ -1910,14 +1921,15 @@ impl DmaEngine {
                 self.col, self.row, ch_idx, next_bd, bd_index);
             self.queued_bds[ch_idx] = Some(next_bd);
         }
-        // If no chaining, check for repeat count
+        // If no chaining, check for repeat count.
+        // Restart from chain_start_bds (the FIRST BD of the task), not
+        // current_bds (which was overwritten to the last chained BD).
         else if self.repeat_counts[ch_idx] > 0 {
-            // Decrement repeat count and requeue the same BD
             self.repeat_counts[ch_idx] -= 1;
-            if let Some(bd_idx) = self.current_bds[ch_idx] {
-                self.queued_bds[ch_idx] = Some(bd_idx);
-                log::debug!("DMA tile({},{}) ch{} repeating BD {} ({} remaining)",
-                    self.col, self.row, ch_idx, bd_idx, self.repeat_counts[ch_idx]);
+            if let Some(start_bd) = self.chain_start_bds[ch_idx] {
+                self.queued_bds[ch_idx] = Some(start_bd);
+                log::debug!("DMA tile({},{}) ch{} repeating chain from BD {} ({} remaining)",
+                    self.col, self.row, ch_idx, start_bd, self.repeat_counts[ch_idx]);
             }
         }
         // Task is complete (no chaining, no repeats) - emit token if enabled
@@ -2108,6 +2120,7 @@ impl DmaEngine {
             self.error_bd_unavailable[i] = false;
             self.repeat_counts[i] = 0;
             self.current_bds[i] = None;
+            self.chain_start_bds[i] = None;
         }
 
         // Clear stream buffers
@@ -2359,12 +2372,16 @@ impl DmaEngine {
         }
 
         // Start the channel with the task
-        if let Err(e) = self.start_channel_with_repeat(channel, task.start_bd, task.repeat_count) {
+        let start_bd = task.start_bd;
+        if let Err(e) = self.start_channel_with_repeat(channel, start_bd, task.repeat_count) {
             log::error!(
                 "DMA tile({},{}) ch{} failed to start queued task BD {}: {}",
-                self.col, self.row, channel, task.start_bd, e
+                self.col, self.row, channel, start_bd, e
             );
             self.channel_states[ch_idx] = ChannelState::Error;
+        } else {
+            // Record the chain start BD for repeat restart
+            self.chain_start_bds[ch_idx] = Some(start_bd);
         }
     }
 
@@ -3207,6 +3224,43 @@ mod tests {
         let stats = engine.channel_stats(2).unwrap();
         assert_eq!(stats.bytes_transferred, 48);
         assert_eq!(stats.transfers_completed, 3);
+    }
+
+    /// Regression test: BD chain + repeat must restart from the FIRST BD,
+    /// not the last one. Previously, `current_bds` was overwritten to the
+    /// last chained BD, so repeat only re-executed the tail of the chain.
+    #[test]
+    fn test_bd_chain_with_repeat_restarts_from_start() {
+        let mut engine = DmaEngine::new_compute_tile(1, 2);
+        let mut tile = make_tile();
+        let mut host_mem = make_host_memory();
+
+        // BD0 (16 bytes at 0x100) chains to BD1 (16 bytes at 0x200)
+        engine.configure_bd(0, BdConfig::simple_1d(0x100, 16).with_next(1)).unwrap();
+        engine.configure_bd(1, BdConfig::simple_1d(0x200, 16)).unwrap();
+
+        // Enqueue task: start at BD0, repeat_count=1 (run chain twice total)
+        // Expected: BD0->BD1, BD0->BD1 = 4 transfers, 64 bytes
+        engine.enqueue_task(2, 0, 1, false);
+
+        let mut cycles = 0;
+        while engine.channel_has_pending_work(2) {
+            engine.step(&mut tile, &mut NeighborLocks::empty(), &mut host_mem);
+            cycles += 1;
+            if cycles > 500 {
+                panic!("BD chain with repeat took too long (>500 cycles)");
+            }
+        }
+
+        let stats = engine.channel_stats(2).unwrap();
+        // 2 iterations x 2 BDs per chain = 4 transfers
+        assert_eq!(stats.transfers_completed, 4,
+            "Expected 4 transfers (2 chain iterations x 2 BDs), got {}",
+            stats.transfers_completed);
+        // 4 transfers x 16 bytes = 64 bytes total
+        assert_eq!(stats.bytes_transferred, 64,
+            "Expected 64 bytes (4 x 16), got {}",
+            stats.bytes_transferred);
     }
 
     // === Stream Port Integration Tests ===
