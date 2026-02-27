@@ -96,38 +96,53 @@ fn event_trace_type(event: &EventType) -> TraceType {
 /// Map an EventType to its hardware event name string.
 /// These names match the AIE2 enum names in mlir-aie's trace event
 /// definitions (`aie/utils/trace/events/aie2.py`).
-fn event_name(event: &EventType) -> &'static str {
+/// Map event to its canonical mlir-aie name.
+///
+/// Channel-qualified DMA events: `DMA_S2MM_0_START_TASK`, `DMA_MM2S_1_FINISHED_BD`
+/// Port-qualified events: `PORT_IDLE_0`, `PORT_RUNNING_3`
+/// Lock-qualified events: `LOCK_ACQ_0`, `LOCK_REL_5`
+fn event_name(event: &EventType) -> String {
     match event {
-        EventType::InstrVector { .. } => "INSTR_VECTOR",
-        EventType::InstrLoad { .. } => "INSTR_LOAD",
-        EventType::InstrStore { .. } => "INSTR_STORE",
-        EventType::InstrCall { .. } => "INSTR_CALL",
-        EventType::InstrReturn { .. } => "INSTR_RETURN",
-        EventType::InstrLockAcquireReq { .. } => "INSTR_LOCK_ACQUIRE_REQ",
-        EventType::InstrLockReleaseReq { .. } => "INSTR_LOCK_RELEASE_REQ",
-        EventType::InstrStreamGet { .. } => "INSTR_STREAM_GET",
-        EventType::InstrStreamPut { .. } => "INSTR_STREAM_PUT",
-        EventType::InstrEvent { id: 0, .. } => "INSTR_EVENT_0",
-        EventType::InstrEvent { id: 1, .. } => "INSTR_EVENT_1",
-        EventType::InstrEvent { .. } => "INSTR_EVENT",
-        EventType::MemoryStall { .. } => "MEMORY_STALL",
-        EventType::LockStall { .. } => "LOCK_STALL",
-        EventType::StreamStall { .. } => "STREAM_STALL",
-        EventType::DmaStartTask { .. } => "DMA_START_TASK",
-        EventType::DmaFinishedBd { .. } => "DMA_FINISHED_BD",
-        EventType::DmaFinishedTask { .. } => "DMA_FINISHED_TASK",
-        EventType::DmaStalledLock { .. } => "DMA_STALLED_LOCK",
-        EventType::DmaStreamStarvation { .. } => "DMA_STREAM_STARVATION",
-        EventType::LockAcquire { .. } => "LOCK_ACQ",
-        EventType::LockRelease { .. } => "LOCK_REL",
-        EventType::CoreActive => "ACTIVE",
-        EventType::CoreDisabled => "DISABLED",
-        EventType::BranchTaken { .. } => "BRANCH_TAKEN",
-        EventType::PortIdle { .. } => "PORT_IDLE",
-        EventType::PortRunning { .. } => "PORT_RUNNING",
-        EventType::PortStalled { .. } => "PORT_STALLED",
-        EventType::PortTlast { .. } => "PORT_TLAST",
+        EventType::InstrVector { .. } => "INSTR_VECTOR".into(),
+        EventType::InstrLoad { .. } => "INSTR_LOAD".into(),
+        EventType::InstrStore { .. } => "INSTR_STORE".into(),
+        EventType::InstrCall { .. } => "INSTR_CALL".into(),
+        EventType::InstrReturn { .. } => "INSTR_RETURN".into(),
+        EventType::InstrLockAcquireReq { .. } => "INSTR_LOCK_ACQUIRE_REQ".into(),
+        EventType::InstrLockReleaseReq { .. } => "INSTR_LOCK_RELEASE_REQ".into(),
+        EventType::InstrStreamGet { .. } => "INSTR_STREAM_GET".into(),
+        EventType::InstrStreamPut { .. } => "INSTR_STREAM_PUT".into(),
+        EventType::InstrEvent { id, .. } => format!("INSTR_EVENT_{}", id),
+        EventType::MemoryStall { .. } => "MEMORY_STALL".into(),
+        EventType::LockStall { .. } => "LOCK_STALL".into(),
+        EventType::StreamStall { .. } => "STREAM_STALL".into(),
+        // DMA events: channels 0-1 = S2MM (input), 2-3 = MM2S (output).
+        EventType::DmaStartTask { channel } => dma_event_name("START_TASK", *channel),
+        EventType::DmaFinishedBd { channel } => dma_event_name("FINISHED_BD", *channel),
+        EventType::DmaFinishedTask { channel } => dma_event_name("FINISHED_TASK", *channel),
+        EventType::DmaStalledLock { channel } => dma_event_name("STALLED_LOCK", *channel),
+        EventType::DmaStreamStarvation { channel } => dma_event_name("STREAM_STARVATION", *channel),
+        EventType::LockAcquire { lock_id } => format!("LOCK_ACQ_{}", lock_id),
+        EventType::LockRelease { lock_id } => format!("LOCK_REL_{}", lock_id),
+        EventType::CoreActive => "ACTIVE_CORE".into(),
+        EventType::CoreDisabled => "DISABLED_CORE".into(),
+        EventType::BranchTaken { .. } => "BRANCH_TAKEN".into(),
+        EventType::PortIdle { port } => format!("PORT_IDLE_{}", port),
+        EventType::PortRunning { port } => format!("PORT_RUNNING_{}", port),
+        EventType::PortStalled { port } => format!("PORT_STALLED_{}", port),
+        EventType::PortTlast { port } => format!("PORT_TLAST_{}", port),
     }
+}
+
+/// Format a DMA event name with channel direction and index.
+/// Channels 0-1 = S2MM (input), 2-3 = MM2S (output).
+fn dma_event_name(suffix: &str, channel: u8) -> String {
+    let (dir, idx) = if channel < 2 {
+        ("S2MM", channel)
+    } else {
+        ("MM2S", channel - 2)
+    };
+    format!("DMA_{}_{}_{}",  dir, idx, suffix)
 }
 
 /// Assign a stable thread ID (0-7) for a given event type within a tile.
@@ -193,7 +208,7 @@ pub fn export_perfetto(
     }
 
     // Discover which tids are used per PID (for thread_name metadata)
-    let mut tid_names: BTreeMap<(u32, u32), &'static str> = BTreeMap::new();
+    let mut tid_names: BTreeMap<(u32, u32), String> = BTreeMap::new();
     for evt in events {
         let key = TileTraceKey {
             trace_type: event_trace_type(&evt.event),
@@ -224,7 +239,7 @@ pub fn export_perfetto(
     }
 
     // Write metadata events: thread_name for each tid
-    for (&(pid, tid), &name) in &tid_names {
+    for (&(pid, tid), name) in &tid_names {
         if !first { output.write_all(b",\n")?; }
         first = false;
         write!(
@@ -711,12 +726,23 @@ mod tests {
 
     #[test]
     fn test_event_name_mapping() {
-        // Verify key event names match mlir-aie conventions
+        // Verify key event names match mlir-aie canonical conventions.
         assert_eq!(event_name(&EventType::InstrVector { pc: 0 }), "INSTR_VECTOR");
         assert_eq!(event_name(&EventType::InstrLoad { pc: 0 }), "INSTR_LOAD");
-        assert_eq!(event_name(&EventType::DmaStartTask { channel: 0 }), "DMA_START_TASK");
-        assert_eq!(event_name(&EventType::CoreDisabled), "DISABLED");
-        assert_eq!(event_name(&EventType::LockAcquire { lock_id: 0 }), "LOCK_ACQ");
+        // DMA events are channel-qualified: S2MM for ch 0-1, MM2S for ch 2-3.
+        assert_eq!(event_name(&EventType::DmaStartTask { channel: 0 }), "DMA_S2MM_0_START_TASK");
+        assert_eq!(event_name(&EventType::DmaStartTask { channel: 1 }), "DMA_S2MM_1_START_TASK");
+        assert_eq!(event_name(&EventType::DmaStartTask { channel: 2 }), "DMA_MM2S_0_START_TASK");
+        assert_eq!(event_name(&EventType::DmaFinishedBd { channel: 3 }), "DMA_MM2S_1_FINISHED_BD");
+        // Core state events use canonical names.
+        assert_eq!(event_name(&EventType::CoreDisabled), "DISABLED_CORE");
+        assert_eq!(event_name(&EventType::CoreActive), "ACTIVE_CORE");
+        // Lock events are lock-ID-qualified.
+        assert_eq!(event_name(&EventType::LockAcquire { lock_id: 0 }), "LOCK_ACQ_0");
+        assert_eq!(event_name(&EventType::LockRelease { lock_id: 5 }), "LOCK_REL_5");
+        // Port events are port-qualified.
+        assert_eq!(event_name(&EventType::PortIdle { port: 0 }), "PORT_IDLE_0");
+        assert_eq!(event_name(&EventType::PortRunning { port: 3 }), "PORT_RUNNING_3");
     }
 
     #[test]
