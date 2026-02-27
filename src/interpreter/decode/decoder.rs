@@ -1088,9 +1088,16 @@ impl Decoder for InstructionDecoder {
                 };
 
                 // Try to decode the slot bits against known encodings
-                // Zero bits means no operation in this slot - treat as NOP
+                // Zero bits means no operation in this slot - treat as NOP.
+                //
+                // Guard: LDA and LDB both map to SlotIndex::Load. If one
+                // has a real instruction and the other is NOP, the NOP must
+                // not overwrite the real instruction. Only set NOP when
+                // the slot is currently empty.
                 if slot.slot_type == SlotType::Nop || slot.bits == 0 {
-                    bundle.set_slot(SlotOp::nop(slot_index));
+                    if bundle.slot(slot_index).is_none() {
+                        bundle.set_slot(SlotOp::nop(slot_index));
+                    }
                 } else if let Some(decoded) = self.decode_slot_bits(slot.bits, slot.slot_type) {
                     let operation = self.to_operation(&decoded);
                     let (dest, sources, extracted_pm) = self.extract_operands(&decoded);
@@ -1107,11 +1114,22 @@ impl Decoder for InstructionDecoder {
                     let slot_op = self.build_slot_op(
                         effective_slot, operation, &decoded, dest, sources, extracted_pm,
                     );
+
+                    // Warn if this overwrites a non-NOP instruction in the same slot
+                    // (e.g., LDA and LDB both active -- would need separate slots).
+                    if let Some(existing) = bundle.slot(effective_slot) {
+                        if !existing.op.is_nop() {
+                            log::warn!(
+                                "[SLOT COLLISION] PC=0x{:04X} {:?} slot {:?} already has {:?}, overwriting with {:?}",
+                                pc, slot.slot_type, effective_slot, existing.op, slot_op.op
+                            );
+                        }
+                    }
                     bundle.set_slot(slot_op);
                 } else {
                     // Slot extracted but not recognized - mark as unknown with slot info
-                    log::trace!("[{:?} DECODE FAIL] bits=0x{:010X} - no matching encoding",
-                        slot.slot_type, slot.bits);
+                    log::warn!("[{:?} DECODE FAIL] PC=0x{:04X} bits=0x{:010X} - no matching encoding",
+                        slot.slot_type, pc, slot.bits);
                     let slot_name = match slot.slot_type {
                         SlotType::Lda => "lda",
                         SlotType::Ldb => "ldb",
@@ -1940,5 +1958,67 @@ mod tests {
             "Non-PADD should not produce PointerReg destination");
         assert!(sources.iter().any(|s| matches!(s, Operand::Memory { base: 3, offset: 5 })),
             "Non-PADD should produce Memory source, got {:?}", sources);
+    }
+
+    /// Regression test: LDA instruction must not be overwritten by LDB NOP.
+    ///
+    /// In 128-bit bundles, LDA and LDB both map to SlotIndex::Load. Before
+    /// the fix, a NOP LDB (bits=0) would unconditionally set a NOP in the
+    /// Load slot, overwriting whatever LDA had placed there. This caused
+    /// `mova` instructions to silently disappear.
+    ///
+    /// Real bundle from add_314_using_dma_op at PC=0x2A0:
+    ///   nopb; mova r0, #0x30; nops; movx r1, #0x1; mov r20, p7; nopv
+    #[test]
+    fn test_lda_not_overwritten_by_ldb_nop() {
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found at ../llvm-aie");
+            return;
+        }
+        let decoder = InstructionDecoder::try_load_via_tblgen(llvm_aie_path)
+            .expect("Failed to load via tblgen");
+
+        // Raw 128-bit bundle from add_314_using_dma_op at PC=0x2A0:
+        // nopb; mova r0, #0x30; nops; movx r1, #0x1; mov r20, p7; nopv
+        let bytes: [u8; 16] = [
+            0xc0, 0x03, 0x00, 0x28, 0x3b, 0x87, 0x2a, 0x10,
+            0x00, 0x00, 0x00, 0x08, 0x00, 0x06, 0x00, 0x00,
+        ];
+
+        let bundle = decoder.decode(&bytes, 0x2A0).expect("Should decode 128-bit bundle");
+        assert_eq!(bundle.size(), 16);
+
+        // The Load slot must contain the mova instruction, not a NOP.
+        // Before the fix, LDB (NOP, bits=0) overwrote LDA's mova.
+        let load_slot = bundle.slot(SlotIndex::Load)
+            .expect("Load slot should be present");
+        assert!(
+            !load_slot.op.is_nop(),
+            "Load slot should have mova r0, #0x30 (not NOP from LDB overwrite)"
+        );
+        assert_eq!(load_slot.dest, Some(Operand::ScalarReg(0)),
+            "mova destination should be r0");
+        assert_eq!(load_slot.sources.len(), 1, "mova should have one source");
+        assert_eq!(load_slot.sources[0], Operand::Immediate(0x30),
+            "mova source should be immediate 0x30");
+
+        // Scalar0 (ALU) should have movx r1, #0x1
+        let scalar0 = bundle.slot(SlotIndex::Scalar0)
+            .expect("Scalar0 slot should be present");
+        assert_eq!(scalar0.dest, Some(Operand::ScalarReg(1)),
+            "movx destination should be r1");
+        assert_eq!(scalar0.sources.len(), 1, "movx should have one source");
+        assert_eq!(scalar0.sources[0], Operand::Immediate(1),
+            "movx source should be immediate 1");
+
+        // Scalar1 (MV) should have mov r20, p7
+        let scalar1 = bundle.slot(SlotIndex::Scalar1)
+            .expect("Scalar1 slot should be present");
+        assert_eq!(scalar1.dest, Some(Operand::ScalarReg(20)),
+            "mov destination should be r20");
+        assert_eq!(scalar1.sources.len(), 1, "mov should have one source");
+        assert_eq!(scalar1.sources[0], Operand::PointerReg(7),
+            "mov source should be p7");
     }
 }
