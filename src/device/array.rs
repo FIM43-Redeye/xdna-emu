@@ -550,6 +550,11 @@ impl TileArray {
         // Route all stream data through the stream switch network.
         let words_routed = self.route_streams();
 
+        // Phase 3.5: Cascade Propagation
+        // Dedicated point-to-point 384-bit links between compute tiles.
+        // Entirely separate from the stream switch fabric.
+        self.route_cascade();
+
         // Phase 4: Lock Commit
         // Apply accumulated lock deltas. Changes become visible next cycle.
         for tile in &mut self.tiles {
@@ -557,6 +562,85 @@ impl TileArray {
         }
 
         (dma_active, words_routed > 0, words_routed)
+    }
+
+    /// Route cascade data between adjacent compute tiles.
+    ///
+    /// Cascade is a dedicated 384-bit point-to-point link entirely separate
+    /// from the stream switch fabric. Each compute tile can send cascade data
+    /// to one neighbor (South or East) and receive from one neighbor (North or
+    /// West), as configured by the accumulator control register at 0x36060.
+    ///
+    /// Uses a two-phase collect-then-apply approach to avoid borrow issues.
+    fn route_cascade(&mut self) {
+        let rows = self.rows;
+        let cols = self.cols;
+
+        // Phase 1: Collect pending transfers.
+        // Each entry: (src_idx, dst_col, dst_row)
+        let mut transfers: Vec<(usize, u8, u8)> = Vec::new();
+
+        for col in 0..cols {
+            for row in 0..rows {
+                let idx = (col as usize) * (rows as usize) + (row as usize);
+                let tile = &self.tiles[idx];
+
+                if !tile.is_compute() || !tile.has_cascade_output() {
+                    continue;
+                }
+
+                // Determine destination based on output direction
+                let (dst_col, dst_row) = match tile.cascade_output_dir {
+                    0 => {
+                        // South: (col, row - 1)
+                        if row == 0 { continue; }
+                        (col, row - 1)
+                    }
+                    1 => {
+                        // East: (col + 1, row)
+                        if col + 1 >= cols { continue; }
+                        (col + 1, row)
+                    }
+                    _ => continue,
+                };
+
+                // Verify destination exists and is a compute tile
+                let dst_idx = (dst_col as usize) * (rows as usize) + (dst_row as usize);
+                if dst_idx >= self.tiles.len() || !self.tiles[dst_idx].is_compute() {
+                    continue;
+                }
+
+                // Verify destination's input direction matches
+                let dst_input_dir = self.tiles[dst_idx].cascade_input_dir;
+                let expected_dir = match tile.cascade_output_dir {
+                    0 => 0, // South output -> North input (dir=0)
+                    1 => 1, // East output -> West input (dir=1)
+                    _ => continue,
+                };
+                if dst_input_dir != expected_dir {
+                    continue;
+                }
+
+                // Check backpressure: destination must have room
+                if self.tiles[dst_idx].cascade_input.is_empty() {
+                    transfers.push((idx, dst_col, dst_row));
+                }
+            }
+        }
+
+        // Phase 2: Apply transfers
+        for (src_idx, dst_col, dst_row) in transfers {
+            let dst_idx = (dst_col as usize) * (rows as usize) + (dst_row as usize);
+
+            if let Some(data) = self.tiles[src_idx].pop_cascade_output() {
+                log::debug!(
+                    "[CASCADE] Route ({},{}) -> ({},{})",
+                    self.tiles[src_idx].col, self.tiles[src_idx].row,
+                    dst_col, dst_row
+                );
+                self.tiles[dst_idx].push_cascade_input(data);
+            }
+        }
     }
 
     /// Route all stream data through the NPU stream network.
@@ -1458,5 +1542,94 @@ mod tests {
         array.reset();
         let engine = array.dma_engine(1, 2).unwrap();
         assert!(!engine.any_channel_active());
+    }
+
+    // === Cascade Routing Tests ===
+
+    #[test]
+    fn test_cascade_route_south() {
+        // NPU1: 5 cols x 6 rows. Compute tiles at rows 2-5.
+        let mut array = TileArray::npu1();
+
+        // Configure tile (1,3): output direction = South (0)
+        // Configure tile (1,2): input direction = North (0)
+        array.tile_mut(1, 3).write_register(0x36060, 0b00); // in=North, out=South
+        array.tile_mut(1, 2).write_register(0x36060, 0b00); // in=North, out=South
+
+        // Push cascade data to tile (1,3) output
+        let data: [u64; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        array.tile_mut(1, 3).push_cascade_output(data);
+
+        // Route cascade
+        array.route_cascade();
+
+        // Data should arrive at tile (1,2) input
+        assert!(array.tile(1, 2).has_cascade_input());
+        assert!(!array.tile(1, 3).has_cascade_output());
+
+        let received = array.tile_mut(1, 2).pop_cascade_input().unwrap();
+        assert_eq!(received, data);
+    }
+
+    #[test]
+    fn test_cascade_route_east() {
+        let mut array = TileArray::npu1();
+
+        // Configure tile (1,3): output direction = East (1)
+        array.tile_mut(1, 3).write_register(0x36060, 0b10); // in=North, out=East
+        // Configure tile (2,3): input direction = West (1)
+        array.tile_mut(2, 3).write_register(0x36060, 0b01); // in=West, out=South
+
+        let data: [u64; 6] = [1, 2, 3, 4, 5, 6];
+        array.tile_mut(1, 3).push_cascade_output(data);
+
+        array.route_cascade();
+
+        assert!(array.tile(2, 3).has_cascade_input());
+        assert!(!array.tile(1, 3).has_cascade_output());
+
+        let received = array.tile_mut(2, 3).pop_cascade_input().unwrap();
+        assert_eq!(received, data);
+    }
+
+    #[test]
+    fn test_cascade_backpressure() {
+        let mut array = TileArray::npu1();
+
+        // Configure South cascade path: (1,3) -> (1,2)
+        array.tile_mut(1, 3).write_register(0x36060, 0b00);
+        array.tile_mut(1, 2).write_register(0x36060, 0b00);
+
+        // Fill destination's input FIFO
+        array.tile_mut(1, 2).push_cascade_input([0; 6]);
+
+        // Push data to source
+        let data: [u64; 6] = [42; 6];
+        array.tile_mut(1, 3).push_cascade_output(data);
+
+        // Route should NOT transfer (backpressure)
+        array.route_cascade();
+
+        // Source still has data, destination still has old data
+        assert!(array.tile(1, 3).has_cascade_output());
+        assert!(array.tile(1, 2).has_cascade_input());
+    }
+
+    #[test]
+    fn test_cascade_direction_mismatch_no_route() {
+        let mut array = TileArray::npu1();
+
+        // Source outputs South, but destination expects West (mismatch)
+        array.tile_mut(1, 3).write_register(0x36060, 0b00); // out=South
+        array.tile_mut(1, 2).write_register(0x36060, 0b01); // in=West (wrong!)
+
+        let data: [u64; 6] = [99; 6];
+        array.tile_mut(1, 3).push_cascade_output(data);
+
+        array.route_cascade();
+
+        // No transfer because directions don't match
+        assert!(array.tile(1, 3).has_cascade_output());
+        assert!(!array.tile(1, 2).has_cascade_input());
     }
 }

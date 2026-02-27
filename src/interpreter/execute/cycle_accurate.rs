@@ -35,6 +35,7 @@ use crate::interpreter::timing::{
 };
 use crate::interpreter::traits::{ExecuteResult, Executor};
 
+use super::cascade::{CascadeOps, CascadeResult};
 use super::control::ControlUnit;
 use super::memory::{MemoryUnit, NeighborMemory};
 use super::scalar::ScalarAlu;
@@ -180,6 +181,15 @@ impl CycleAccurateExecutor {
 
         if MemoryUnit::execute(op, ctx, tile, neighbors) {
             return None;
+        }
+
+        // Cascade operations: dedicated 384-bit point-to-point link, separate
+        // from the stream switch fabric. Stall returns WaitStream with sentinel
+        // port 255 so the coordinator retries next cycle.
+        match CascadeOps::execute(op, ctx, tile) {
+            CascadeResult::Completed => return None,
+            CascadeResult::Stall => return Some(ExecuteResult::WaitStream { port: 255 }),
+            CascadeResult::NotCascadeOp => {}
         }
 
         if let Some(result) = ControlUnit::execute_with_mem_locks(op, ctx, tile, mem_tile_locks) {

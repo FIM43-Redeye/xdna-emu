@@ -88,6 +88,7 @@ pub mod vector_matmul;
 mod memory;
 mod control;
 mod stream;
+mod cascade;
 mod cycle_accurate;
 mod semantic;
 
@@ -96,6 +97,7 @@ pub use vector::VectorAlu;
 pub use memory::{MemoryUnit, NeighborMemory};
 pub use control::ControlUnit;
 pub use stream::{StreamOps, StreamResult};
+pub use cascade::{CascadeOps, CascadeResult};
 pub use cycle_accurate::{CycleAccurateExecutor, CycleAccurateStats};
 pub use semantic::execute_semantic;
 

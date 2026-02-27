@@ -413,6 +413,21 @@ impl InstructionDecoder {
     /// SemanticOp assigned via infer_semantic_from_mnemonic() during TableGen parsing.
     /// If no semantic is available, logs a warning and returns Unknown.
     fn to_operation(&self, decoded: &DecodedInstr) -> Operation {
+        // Cascade instructions: detected by name before SemanticOp lookup.
+        // These have hasSideEffects=true and no SemanticOp in TableGen.
+        // Names from llvm-aie AIE2GenFixupInstrInfo.td:
+        //   VMOV_mv_scd  -- full 384-bit cascade read
+        //   VMOV_HI      -- cascade read high half
+        //   VMOV_LO      -- cascade read low half
+        //   VMOV_mv_mcd  -- full 384-bit cascade write
+        let name = &decoded.encoding.name;
+        if name == "VMOV_mv_scd" || name == "VMOV_HI" || name == "VMOV_LO" {
+            return Operation::CascadeRead;
+        }
+        if name == "VMOV_mv_mcd" {
+            return Operation::CascadeWrite;
+        }
+
         // Use semantic info - this should be available for all instructions
         if let Some(semantic) = decoded.encoding.semantic {
             return self.semantic_to_operation(semantic, decoded);

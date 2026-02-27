@@ -405,6 +405,8 @@ impl LatencyTable {
             Operation::VectorSubLt { .. }
             | Operation::VectorSubGe { .. }
             | Operation::VectorMaxDiffLt { .. } => OperationKey::VectorAdd,
+            // Cascade operations - use vector move timing
+            Operation::CascadeRead | Operation::CascadeWrite => OperationKey::VectorAdd,
             // Stream operations - use DMA timing
             Operation::StreamWriteScalar { .. }
             | Operation::StreamWritePacketHeader { .. }

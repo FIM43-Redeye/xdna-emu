@@ -678,6 +678,25 @@ pub struct Tile {
     /// bits 4:0 = port index.
     pub event_port_selection: [Option<(u8, bool)>; 8],
 
+    // === Cascade Stream (compute tiles only) ===
+
+    /// Cascade input FIFO (SCD). 384-bit width, depth 1.
+    /// Dedicated point-to-point link between adjacent compute tiles,
+    /// entirely separate from the stream switch fabric.
+    /// Source: aie-rt/driver/src/core/xaie_core.c:993-1046
+    pub cascade_input: std::collections::VecDeque<[u64; 6]>,
+
+    /// Cascade output FIFO (MCD). 384-bit width, depth 1.
+    pub cascade_output: std::collections::VecDeque<[u64; 6]>,
+
+    /// Cascade input direction: 0=North, 1=West.
+    /// From accumulator control register at offset 0x36060 bit 0.
+    pub cascade_input_dir: u8,
+
+    /// Cascade output direction: 0=South, 1=East.
+    /// From accumulator control register at offset 0x36060 bit 1.
+    pub cascade_output_dir: u8,
+
     // === Memory Bank Conflict Detection ===
 
     /// Bitmask of memory banks accessed by DMA during this cycle.
@@ -772,6 +791,10 @@ impl Tile {
             ctrl_pkt_drop_header: true,
             shim_mux_mm2s_slaves: vec![None; params.dma_mm2s_channels],
             shim_mux_s2mm_masters: vec![None; params.dma_s2mm_channels],
+            cascade_input: std::collections::VecDeque::new(),
+            cascade_output: std::collections::VecDeque::new(),
+            cascade_input_dir: 0,
+            cascade_output_dir: 0,
             core_trace: TraceUnit::new(col, row),
             mem_trace: TraceUnit::new(col, row),
             event_port_selection: [None; 8],
@@ -1275,6 +1298,21 @@ impl Tile {
             }
         }
 
+        // Accumulator cascade control register (compute tiles only).
+        // Offset 0x36060 per aie-rt xaie_core.c:993-1046.
+        //   Bit 0: cascade input direction (0=North, 1=West)
+        //   Bit 1: cascade output direction (0=South, 1=East)
+        if offset == 0x36060 && self.is_compute() {
+            self.cascade_input_dir = (value & 0x1) as u8;
+            self.cascade_output_dir = ((value >> 1) & 0x1) as u8;
+            log::info!(
+                "Tile ({},{}) cascade config: input_dir={} output_dir={}",
+                self.col, self.row,
+                if self.cascade_input_dir == 0 { "North" } else { "West" },
+                if self.cascade_output_dir == 0 { "South" } else { "East" },
+            );
+        }
+
         // Shim Mux config registers (shim tiles only)
         // Mux_Config (0x1F000): selects source for switchbox South slave ports
         //   Each 2-bit field: 0=South/PL, 1=DMA, 2=NoC
@@ -1534,6 +1572,39 @@ impl Tile {
         } else {
             None
         }
+    }
+
+    // === Cascade Stream Helpers ===
+
+    /// Push a 384-bit value into the cascade input FIFO (SCD).
+    pub fn push_cascade_input(&mut self, data: [u64; 6]) {
+        self.cascade_input.push_back(data);
+    }
+
+    /// Pop a 384-bit value from the cascade input FIFO (SCD).
+    /// Returns None if the FIFO is empty (core should stall).
+    pub fn pop_cascade_input(&mut self) -> Option<[u64; 6]> {
+        self.cascade_input.pop_front()
+    }
+
+    /// Push a 384-bit value into the cascade output FIFO (MCD).
+    pub fn push_cascade_output(&mut self, data: [u64; 6]) {
+        self.cascade_output.push_back(data);
+    }
+
+    /// Pop a 384-bit value from the cascade output FIFO (MCD).
+    pub fn pop_cascade_output(&mut self) -> Option<[u64; 6]> {
+        self.cascade_output.pop_front()
+    }
+
+    /// Check if cascade input has data available.
+    pub fn has_cascade_input(&self) -> bool {
+        !self.cascade_input.is_empty()
+    }
+
+    /// Check if cascade output has data (for routing to neighbor).
+    pub fn has_cascade_output(&self) -> bool {
+        !self.cascade_output.is_empty()
     }
 
     // === Control Packet Handling ===
@@ -2259,5 +2330,79 @@ mod tests {
         // DMA_S2MM_0_START_TASK = PL event 14
         tile.notify_core_trace_event(14, 100);
         // Should not panic, trace unit accepts it
+    }
+
+    // === Cascade Stream Tests ===
+
+    #[test]
+    fn test_cascade_init_state() {
+        let tile = Tile::compute(1, 2);
+        assert!(tile.cascade_input.is_empty());
+        assert!(tile.cascade_output.is_empty());
+        assert_eq!(tile.cascade_input_dir, 0);
+        assert_eq!(tile.cascade_output_dir, 0);
+    }
+
+    #[test]
+    fn test_cascade_register_write() {
+        let mut tile = Tile::compute(1, 2);
+
+        // Input=North(0), Output=South(0)
+        tile.write_register(0x36060, 0b00);
+        assert_eq!(tile.cascade_input_dir, 0);
+        assert_eq!(tile.cascade_output_dir, 0);
+
+        // Input=West(1), Output=East(1)
+        tile.write_register(0x36060, 0b11);
+        assert_eq!(tile.cascade_input_dir, 1);
+        assert_eq!(tile.cascade_output_dir, 1);
+
+        // Input=West(1), Output=South(0)
+        tile.write_register(0x36060, 0b01);
+        assert_eq!(tile.cascade_input_dir, 1);
+        assert_eq!(tile.cascade_output_dir, 0);
+
+        // Input=North(0), Output=East(1)
+        tile.write_register(0x36060, 0b10);
+        assert_eq!(tile.cascade_input_dir, 0);
+        assert_eq!(tile.cascade_output_dir, 1);
+    }
+
+    #[test]
+    fn test_cascade_register_ignored_for_non_compute() {
+        let mut tile = Tile::mem_tile(1, 1);
+        tile.write_register(0x36060, 0b11);
+        // MemTile should not have cascade direction changed
+        assert_eq!(tile.cascade_input_dir, 0);
+        assert_eq!(tile.cascade_output_dir, 0);
+    }
+
+    #[test]
+    fn test_cascade_fifo_push_pop() {
+        let mut tile = Tile::compute(1, 2);
+        let data: [u64; 6] = [1, 2, 3, 4, 5, 6];
+
+        assert!(!tile.has_cascade_input());
+        tile.push_cascade_input(data);
+        assert!(tile.has_cascade_input());
+
+        let result = tile.pop_cascade_input().unwrap();
+        assert_eq!(result, data);
+        assert!(!tile.has_cascade_input());
+        assert!(tile.pop_cascade_input().is_none());
+    }
+
+    #[test]
+    fn test_cascade_output_fifo() {
+        let mut tile = Tile::compute(1, 2);
+        let data: [u64; 6] = [10, 20, 30, 40, 50, 60];
+
+        assert!(!tile.has_cascade_output());
+        tile.push_cascade_output(data);
+        assert!(tile.has_cascade_output());
+
+        let result = tile.pop_cascade_output().unwrap();
+        assert_eq!(result, data);
+        assert!(!tile.has_cascade_output());
     }
 }

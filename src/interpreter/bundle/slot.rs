@@ -629,6 +629,16 @@ pub enum Operation {
     /// DMA wait for completion.
     DmaWait,
 
+    // ========== Cascade Operations ==========
+    /// Read from cascade input (SCD) to vector/accumulator register.
+    /// Implements get_scd_v32int32() / get_scd() intrinsics.
+    /// vmov dst, SCD -- reads 384-bit cascade link.
+    CascadeRead,
+    /// Write vector/accumulator register to cascade output (MCD).
+    /// Implements put_mcd() intrinsic.
+    /// vmov MCD, src -- writes 384-bit cascade link.
+    CascadeWrite,
+
     // ========== Stream Operations ==========
     /// Write scalar to master stream (MOV_mv_scl2ms).
     StreamWriteScalar {
@@ -806,7 +816,10 @@ impl Operation {
             | Operation::PointerMov
             | Operation::Load { .. }
             | Operation::VectorLoadA { .. }
-            | Operation::VectorLoadUnpack { .. } => SlotIndex::LoadA,
+            | Operation::VectorLoadUnpack { .. }
+            // Cascade operations appear in the LDA slot in VLIW bundles
+            | Operation::CascadeRead
+            | Operation::CascadeWrite => SlotIndex::LoadA,
 
             // Memory load operations (LoadB slot -- secondary load port)
             Operation::VectorLoadB { .. } => SlotIndex::LoadB,

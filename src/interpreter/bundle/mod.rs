@@ -467,6 +467,8 @@ fn disassemble_op(slot_op: &SlotOp) -> String {
         Operation::LockRelease => "lock.release",
         Operation::DmaStart => "dma.start",
         Operation::DmaWait => "dma.wait",
+        Operation::CascadeRead => "vmov.scd",
+        Operation::CascadeWrite => "vmov.mcd",
         Operation::StreamWriteScalar { blocking } => {
             if *blocking { "stream.write.scl.blocking" } else { "stream.write.scl" }
         }
