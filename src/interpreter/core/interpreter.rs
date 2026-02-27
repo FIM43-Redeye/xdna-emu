@@ -161,6 +161,8 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                 ctx.advance_pc(bundle_size as u32);
                 if let Some(branch_target) = ctx.tick_delay_slots() {
                     ctx.set_pc(branch_target);
+                } else {
+                    ctx.check_hardware_loop(pc);
                 }
                 self.status = CoreStatus::Ready;
                 StepResult::Continue
@@ -171,6 +173,8 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                 ctx.advance_pc(bundle_size as u32);
                 if let Some(branch_target) = ctx.tick_delay_slots() {
                     ctx.set_pc(branch_target);
+                } else {
+                    ctx.check_hardware_loop(pc);
                 }
                 self.status = CoreStatus::Ready;
                 StepResult::Continue
@@ -181,6 +185,8 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                 ctx.advance_pc(bundle_size as u32);
                 if let Some(branch_target) = ctx.tick_delay_slots() {
                     ctx.set_pc(branch_target);
+                } else {
+                    ctx.check_hardware_loop(pc);
                 }
                 self.status = CoreStatus::Ready;
                 StepResult::Continue
@@ -312,6 +318,8 @@ where
                 // Check if pending branch should now be taken
                 if let Some(branch_target) = ctx.tick_delay_slots() {
                     ctx.set_pc(branch_target);
+                } else {
+                    ctx.check_hardware_loop(pc);
                 }
                 self.status = CoreStatus::Ready;
                 StepResult::Continue
@@ -325,6 +333,8 @@ where
                 // Check if this was a back-to-back branch and delay slots exhausted
                 if let Some(branch_target) = ctx.tick_delay_slots() {
                     ctx.set_pc(branch_target);
+                } else {
+                    ctx.check_hardware_loop(pc);
                 }
                 self.status = CoreStatus::Ready;
                 StepResult::Continue
@@ -338,6 +348,8 @@ where
                 ctx.advance_pc(bundle_size as u32);
                 if let Some(branch_target) = ctx.tick_delay_slots() {
                     ctx.set_pc(branch_target);
+                } else {
+                    ctx.check_hardware_loop(pc);
                 }
                 self.status = CoreStatus::Ready;
                 StepResult::Continue
@@ -408,14 +420,29 @@ where
             }
 
             CoreStatus::WaitingStream { port } => {
-                // Check if stream data is available
-                if tile.has_stream_input(port) {
-                    self.status = CoreStatus::Ready;
-                    // Re-execute the instruction now that data is available
-                    None
+                if port == 255 {
+                    // Cascade stall (sentinel port 255): check cascade state.
+                    // Cascade reads stall on empty input, writes stall on full output.
+                    // Re-executing the instruction will resolve the correct condition.
+                    let can_resume = tile.has_cascade_input()
+                        || tile.cascade_output.is_empty();
+                    if can_resume {
+                        self.status = CoreStatus::Ready;
+                        None
+                    } else {
+                        ctx.record_stall(1);
+                        Some(StepResult::WaitStream { port })
+                    }
                 } else {
-                    ctx.record_stall(1);
-                    Some(StepResult::WaitStream { port })
+                    // Regular stream stall: check if stream data is available
+                    if tile.has_stream_input(port) {
+                        self.status = CoreStatus::Ready;
+                        // Re-execute the instruction now that data is available
+                        None
+                    } else {
+                        ctx.record_stall(1);
+                        Some(StepResult::WaitStream { port })
+                    }
                 }
             }
 

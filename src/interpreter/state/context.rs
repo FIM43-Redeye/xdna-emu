@@ -703,6 +703,37 @@ impl ExecutionContext {
         self.pc = self.pc.wrapping_add(offset);
     }
 
+    /// Check the hardware zero-overhead loop (ZLS/ZLE/LC).
+    ///
+    /// AIE2 cores have a hardware loop mechanism: the LE register holds the
+    /// address of the last instruction in the loop body. After that instruction
+    /// executes, if LC > 0, the hardware decrements LC and redirects PC to LS
+    /// instead of advancing normally.
+    ///
+    /// `fetch_pc` is the address of the instruction that just executed (before
+    /// advance_pc). The check compares this against LE, because LE marks the
+    /// last instruction to execute before looping, not the first instruction
+    /// after the loop.
+    ///
+    /// If a branch resolved this cycle, the branch target takes priority
+    /// and this check is skipped by the caller.
+    #[inline]
+    pub fn check_hardware_loop(&mut self, fetch_pc: u32) {
+        let le = self.scalar.read(super::registers::LE_REG_INDEX);
+        if fetch_pc == le {
+            let lc = self.scalar.read(super::registers::LC_REG_INDEX);
+            if lc > 0 {
+                let ls = self.scalar.read(super::registers::LS_REG_INDEX);
+                self.scalar.write(super::registers::LC_REG_INDEX, lc - 1);
+                self.pc = ls;
+                log::debug!(
+                    "ZLS loop: executed instr at LE=0x{:X}, LC {} -> {}, jumping to LS=0x{:X}",
+                    le, lc, lc - 1, ls
+                );
+            }
+        }
+    }
+
     /// Get the condition flags.
     #[inline]
     pub fn flags(&self) -> Flags {
@@ -1418,5 +1449,56 @@ mod tests {
         }
 
         assert_eq!(log.len(), 24);
+    }
+
+    #[test]
+    fn test_hardware_loop_basic() {
+        use crate::interpreter::state::{LS_REG_INDEX, LE_REG_INDEX, LC_REG_INDEX};
+        let mut ctx = ExecutionContext::new();
+
+        // Set up loop: LS=0x100, LE=0x200, LC=3
+        ctx.scalar.write(LS_REG_INDEX, 0x100);
+        ctx.scalar.write(LE_REG_INDEX, 0x200);
+        ctx.scalar.write(LC_REG_INDEX, 3);
+        ctx.set_pc(0x204); // PC after advance_pc from LE
+
+        // Check with fetch_pc = LE address -> should loop back
+        ctx.check_hardware_loop(0x200);
+        assert_eq!(ctx.pc(), 0x100); // Redirected to LS
+        assert_eq!(ctx.scalar.read(LC_REG_INDEX), 2); // LC decremented
+
+        // Again
+        ctx.set_pc(0x204);
+        ctx.check_hardware_loop(0x200);
+        assert_eq!(ctx.pc(), 0x100);
+        assert_eq!(ctx.scalar.read(LC_REG_INDEX), 1);
+
+        // Third iteration
+        ctx.set_pc(0x204);
+        ctx.check_hardware_loop(0x200);
+        assert_eq!(ctx.pc(), 0x100);
+        assert_eq!(ctx.scalar.read(LC_REG_INDEX), 0);
+
+        // LC=0: should NOT loop back, PC stays advanced
+        ctx.set_pc(0x204);
+        ctx.check_hardware_loop(0x200);
+        assert_eq!(ctx.pc(), 0x204); // Falls through
+        assert_eq!(ctx.scalar.read(LC_REG_INDEX), 0);
+    }
+
+    #[test]
+    fn test_hardware_loop_no_match() {
+        use crate::interpreter::state::{LS_REG_INDEX, LE_REG_INDEX, LC_REG_INDEX};
+        let mut ctx = ExecutionContext::new();
+
+        ctx.scalar.write(LS_REG_INDEX, 0x100);
+        ctx.scalar.write(LE_REG_INDEX, 0x200);
+        ctx.scalar.write(LC_REG_INDEX, 5);
+        ctx.set_pc(0x180);
+
+        // fetch_pc != LE -> no loop
+        ctx.check_hardware_loop(0x17C);
+        assert_eq!(ctx.pc(), 0x180); // Unchanged
+        assert_eq!(ctx.scalar.read(LC_REG_INDEX), 5); // Unchanged
     }
 }
