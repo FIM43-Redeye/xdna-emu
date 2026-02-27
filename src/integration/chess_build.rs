@@ -709,9 +709,16 @@ impl BuildEnv {
             std::fs::create_dir_all(output_dir)
                 .map_err(|e| format!("Failed to create {}: {}", output_dir.display(), e))?;
 
+            // Canonicalize source_dir so symlink targets are absolute.
+            // source_dir may be relative (e.g. "../mlir-aie/programming_examples/...")
+            // and relative symlink targets break when the link lives in a
+            // different directory tree (build/chess_examples/).
+            let abs_source = source_dir.canonicalize()
+                .map_err(|e| format!("Cannot resolve {}: {}", source_dir.display(), e))?;
+
             // Symlink key files from source_dir into output_dir
-            for entry in std::fs::read_dir(source_dir)
-                .map_err(|e| format!("Failed to read {}: {}", source_dir.display(), e))?
+            for entry in std::fs::read_dir(&abs_source)
+                .map_err(|e| format!("Failed to read {}: {}", abs_source.display(), e))?
                 .flatten()
             {
                 let path = entry.path();
@@ -728,7 +735,8 @@ impl BuildEnv {
 
                 let dest = output_dir.join(&name);
                 if !dest.exists() {
-                    // Symlink; srcdir in Makefile follows realpath, so this works
+                    // Symlink with absolute target; srcdir in Makefile follows
+                    // realpath so makefile-common includes resolve correctly.
                     #[cfg(unix)]
                     {
                         let _ = std::os::unix::fs::symlink(&path, &dest);
