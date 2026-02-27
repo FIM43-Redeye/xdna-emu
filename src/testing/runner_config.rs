@@ -54,6 +54,22 @@ pub struct RunnerConfig {
     pub aiesim: AiesimConfig,
     pub unit_tests: UnitTestsConfig,
     pub examples: ExamplesConfig,
+    pub defaults: DefaultsConfig,
+}
+
+/// Default selections from config file (runtime, compiler, suite axes).
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct DefaultsConfig {
+    /// Comma-separated runtime spec (execution targets).
+    /// Valid tokens: emu, hw, aiesim, all. Negation: -emu, -hw, etc.
+    pub runtime: String,
+    /// Comma-separated compiler spec.
+    /// Valid tokens: peano, chess, all. Negation: -peano, -chess.
+    pub compiler: String,
+    /// Comma-separated suite spec (test sources).
+    /// Valid tokens: npu-xrt, examples, unit-tests, all. Negation: -npu-xrt, etc.
+    pub suite: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,6 +131,16 @@ impl Default for ExamplesConfig {
     }
 }
 
+impl Default for DefaultsConfig {
+    fn default() -> Self {
+        Self {
+            runtime: "emu".to_string(),
+            compiler: "peano".to_string(),
+            suite: "npu-xrt".to_string(),
+        }
+    }
+}
+
 impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
@@ -124,6 +150,7 @@ impl Default for RunnerConfig {
             aiesim: AiesimConfig::default(),
             unit_tests: UnitTestsConfig::default(),
             examples: ExamplesConfig::default(),
+            defaults: DefaultsConfig::default(),
         }
     }
 }
@@ -164,6 +191,211 @@ impl Default for UnitTestsConfig {
             aiesim: true,
             aiesim_timeout: DEFAULT_MAX_CYCLES,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generic flag set parser
+// ---------------------------------------------------------------------------
+
+/// Parse a comma-separated flag spec against a list of valid tokens.
+///
+/// Supports `all` (enables everything) and negation via `-` prefix.
+/// Negations are applied after all positive tokens, so `all,-foo` enables
+/// everything except `foo`.
+///
+/// Returns a `HashSet<String>` of enabled tokens, or an error on empty
+/// input, unknown tokens, or negation-only specs.
+///
+/// `axis_name` is used in error messages (e.g. "runtime", "compiler").
+/// `migration_hints` maps old tokens to helpful error messages.
+fn parse_flag_set(
+    spec: &str,
+    valid_tokens: &[&str],
+    axis_name: &str,
+    migration_hints: &[(&str, &str)],
+) -> Result<std::collections::HashSet<String>, String> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err(format!("{} spec is empty", axis_name));
+    }
+
+    let mut enabled = std::collections::HashSet::new();
+    let mut negations = Vec::new();
+    let mut has_positive = false;
+
+    for token in spec.split(',') {
+        let token = token.trim();
+        if token.is_empty() { continue; }
+
+        let (negate, name) = if let Some(rest) = token.strip_prefix('-') {
+            (true, rest)
+        } else {
+            (false, token)
+        };
+
+        // Check for migrated tokens first (helpful error on old usage).
+        if let Some((_, hint)) = migration_hints.iter().find(|(old, _)| *old == name) {
+            return Err(format!(
+                "unknown {}: '{}' ({})", axis_name, name, hint
+            ));
+        }
+
+        if name == "all" {
+            if negate {
+                negations.extend(valid_tokens.iter().map(|s| s.to_string()));
+            } else {
+                for t in valid_tokens {
+                    enabled.insert(t.to_string());
+                }
+                has_positive = true;
+            }
+        } else if valid_tokens.contains(&name) {
+            if negate {
+                negations.push(name.to_string());
+            } else {
+                enabled.insert(name.to_string());
+                has_positive = true;
+            }
+        } else {
+            return Err(format!("unknown {}: '{}'", axis_name, name));
+        }
+    }
+
+    if !has_positive {
+        return Err(format!(
+            "{} spec has only negations, no positive tokens", axis_name
+        ));
+    }
+
+    for neg in negations {
+        enabled.remove(&neg);
+    }
+
+    Ok(enabled)
+}
+
+// ---------------------------------------------------------------------------
+// Three-axis flag sets
+// ---------------------------------------------------------------------------
+
+/// Execution targets: where test binaries run.
+///
+/// Parsed from `--runtime=` or `[defaults] runtime` in runner.toml.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSet {
+    pub emu: bool,
+    pub hw: bool,
+    pub aiesim: bool,
+}
+
+/// Tokens that migrated out of --runtime= into other axes.
+const RUNTIME_MIGRATION_HINTS: &[(&str, &str)] = &[
+    ("chess", "use --compiler=chess instead"),
+    ("unit-tests", "use --suite=unit-tests instead"),
+    ("examples", "use --suite=examples instead"),
+];
+
+impl RuntimeSet {
+    /// Valid tokens for the runtime axis.
+    const TOKENS: &[&str] = &["emu", "hw", "aiesim"];
+
+    /// Parse a comma-separated runtime specification.
+    ///
+    /// Valid tokens: `emu`, `hw`, `aiesim`, `all`.
+    /// Negation: prefix with `-` (e.g. `-aiesim`).
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let set = parse_flag_set(
+            spec, Self::TOKENS, "runtime", RUNTIME_MIGRATION_HINTS,
+        )?;
+        Ok(Self {
+            emu: set.contains("emu"),
+            hw: set.contains("hw"),
+            aiesim: set.contains("aiesim"),
+        })
+    }
+
+    /// Reconstruct a display string from enabled flags.
+    pub fn to_spec(&self) -> String {
+        let mut parts = Vec::new();
+        if self.emu { parts.push("emu"); }
+        if self.hw { parts.push("hw"); }
+        if self.aiesim { parts.push("aiesim"); }
+        if parts.is_empty() { "emu".to_string() } else { parts.join(",") }
+    }
+}
+
+/// Compiler selection: what builds the test binaries.
+///
+/// Parsed from `--compiler=` or `[defaults] compiler` in runner.toml.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompilerSet {
+    pub peano: bool,
+    pub chess: bool,
+}
+
+impl CompilerSet {
+    /// Valid tokens for the compiler axis.
+    const TOKENS: &[&str] = &["peano", "chess"];
+
+    /// Parse a comma-separated compiler specification.
+    ///
+    /// Valid tokens: `peano`, `chess`, `all`.
+    /// Negation: prefix with `-` (e.g. `-chess`).
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let set = parse_flag_set(spec, Self::TOKENS, "compiler", &[])?;
+        Ok(Self {
+            peano: set.contains("peano"),
+            chess: set.contains("chess"),
+        })
+    }
+
+    /// Reconstruct a display string from enabled flags.
+    pub fn to_spec(&self) -> String {
+        let mut parts = Vec::new();
+        if self.peano { parts.push("peano"); }
+        if self.chess { parts.push("chess"); }
+        if parts.is_empty() { "peano".to_string() } else { parts.join(",") }
+    }
+}
+
+/// Test suite selection: which test sources to include.
+///
+/// Parsed from `--suite=` or `[defaults] suite` in runner.toml.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuiteSet {
+    /// The base npu-xrt test suite (always available).
+    pub npu_xrt: bool,
+    /// Include programming_examples/ tests.
+    pub examples: bool,
+    /// Include chess_compiler_tests_aie2 unit tests.
+    pub unit_tests: bool,
+}
+
+impl SuiteSet {
+    /// Valid tokens for the suite axis.
+    const TOKENS: &[&str] = &["npu-xrt", "examples", "unit-tests"];
+
+    /// Parse a comma-separated suite specification.
+    ///
+    /// Valid tokens: `npu-xrt`, `examples`, `unit-tests`, `all`.
+    /// Negation: prefix with `-` (e.g. `-examples`).
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let set = parse_flag_set(spec, Self::TOKENS, "suite", &[])?;
+        Ok(Self {
+            npu_xrt: set.contains("npu-xrt"),
+            examples: set.contains("examples"),
+            unit_tests: set.contains("unit-tests"),
+        })
+    }
+
+    /// Reconstruct a display string from enabled flags.
+    pub fn to_spec(&self) -> String {
+        let mut parts = Vec::new();
+        if self.npu_xrt { parts.push("npu-xrt"); }
+        if self.examples { parts.push("examples"); }
+        if self.unit_tests { parts.push("unit-tests"); }
+        if parts.is_empty() { "npu-xrt".to_string() } else { parts.join(",") }
     }
 }
 
@@ -291,6 +523,12 @@ pub struct Options {
 
     /// List-only mode: discover and print tests, then exit.
     pub list_only: bool,
+
+    // --- JSON output ---
+    /// Path for machine-readable JSON results (default: build/results.json).
+    pub output_path: PathBuf,
+    /// When true, print JSON to stdout instead of human-readable output.
+    pub format_json: bool,
 }
 
 /// Parse CLI arguments and merge with runner config.
@@ -314,14 +552,10 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
 
     // Emu+HW mode
     let mut elfanalyze = false;
-    let mut hw = true;
-    let mut hw_only = false;
-    let mut aiesim = false;
-    let mut full = false;
-    let mut unit_tests = false;
+    let mut runtime_spec: Option<String> = None;
+    let mut compiler_spec: Option<String> = None;
+    let mut suite_spec: Option<String> = None;
     let mut no_build = false;
-    let mut no_chess = false;
-    let mut examples = false;
     let mut rebuild = false;
 
     // Lit mode
@@ -336,9 +570,45 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
     let mut aiesim_trace = false;
     let mut list_only = false;
 
+    // JSON output
+    let mut output_path: Option<PathBuf> = None;
+    let mut format_json = false;
+
     let mut iter = args.iter();
 
     while let Some(arg) = iter.next() {
+        // Handle --runtime=value (= form)
+        if let Some(spec) = arg.strip_prefix("--runtime=") {
+            runtime_spec = Some(spec.to_string());
+            continue;
+        }
+        // Handle --compiler=value (= form)
+        if let Some(spec) = arg.strip_prefix("--compiler=") {
+            compiler_spec = Some(spec.to_string());
+            continue;
+        }
+        // Handle --suite=value (= form)
+        if let Some(spec) = arg.strip_prefix("--suite=") {
+            suite_spec = Some(spec.to_string());
+            continue;
+        }
+        // Handle --output=value (= form)
+        if let Some(path) = arg.strip_prefix("--output=") {
+            output_path = Some(PathBuf::from(path));
+            continue;
+        }
+        // Handle --format=value (= form)
+        if let Some(fmt) = arg.strip_prefix("--format=") {
+            match fmt {
+                "json" => format_json = true,
+                other => {
+                    eprintln!("Unknown format: '{}' (valid: json)", other);
+                    std::process::exit(1);
+                }
+            }
+            continue;
+        }
+
         match arg.as_str() {
             // --- Mode selection ---
             "--lit" => lit_mode = true,
@@ -347,7 +617,7 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
 
             // --- Common ---
             "--verbose" | "-v" => verbose = true,
-            "--chess-only" => chess_only = true,
+            "--chess-only" => { chess_only = true; compiler_spec = Some("chess".to_string()); }
             "-j" => {
                 let n = next_value(&mut iter, "-j");
                 jobs = n.parse().unwrap_or_else(|_| {
@@ -359,17 +629,38 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
 
             // --- Emu+HW mode ---
             "--elfanalyze" => elfanalyze = true,
-            "--chess" => {} // backward compat, now the default
-            "--no-chess" => no_chess = true,
-            "--hw" => hw = true, // backward compat
-            "--no-hw" => hw = false,
-            "--hw-only" => { hw_only = true; hw = true; }
-            "--aiesim" => aiesim = true,
-            "--full" => full = true,
-            "--unit-tests" => unit_tests = true,
-            "--examples" => examples = true,
             "--no-build" => no_build = true,
             "--rebuild" => rebuild = true,
+
+            // --- Selection (space-separated forms) ---
+            "--runtime" => {
+                let v = next_value(&mut iter, "--runtime");
+                runtime_spec = Some(v.clone());
+            }
+            "--compiler" => {
+                let v = next_value(&mut iter, "--compiler");
+                compiler_spec = Some(v.clone());
+            }
+            "--suite" => {
+                let v = next_value(&mut iter, "--suite");
+                suite_spec = Some(v.clone());
+            }
+
+            // --- JSON output (space-separated form) ---
+            "--output" => {
+                let v = next_value(&mut iter, "--output");
+                output_path = Some(PathBuf::from(v.as_str()));
+            }
+            "--format" => {
+                let v = next_value(&mut iter, "--format");
+                match v.as_str() {
+                    "json" => format_json = true,
+                    other => {
+                        eprintln!("Unknown format: '{}' (valid: json)", other);
+                        std::process::exit(1);
+                    }
+                }
+            }
 
             // --- Lit mode ---
             "--timeout" => {
@@ -442,14 +733,29 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
         RunMode::EmuHw
     };
 
-    // --full enables everything (emu+hw mode)
-    if full {
-        elfanalyze = true;
-        no_chess = false;
-        hw = true;
-        aiesim = true;
-        unit_tests = true;
-        examples = true;
+    // Parse all three axes from CLI or config defaults.
+    let rt_spec = runtime_spec.unwrap_or_else(|| config.defaults.runtime.clone());
+    let runtime = RuntimeSet::parse(&rt_spec).unwrap_or_else(|e| {
+        eprintln!("Invalid runtime spec '{}': {}", rt_spec, e);
+        std::process::exit(1);
+    });
+
+    let comp_spec = compiler_spec.unwrap_or_else(|| config.defaults.compiler.clone());
+    let mut compiler = CompilerSet::parse(&comp_spec).unwrap_or_else(|e| {
+        eprintln!("Invalid compiler spec '{}': {}", comp_spec, e);
+        std::process::exit(1);
+    });
+
+    let suite_spec = suite_spec.unwrap_or_else(|| config.defaults.suite.clone());
+    let suite = SuiteSet::parse(&suite_spec).unwrap_or_else(|e| {
+        eprintln!("Invalid suite spec '{}': {}", suite_spec, e);
+        std::process::exit(1);
+    });
+
+    // Auto-inference: aiesim requires Chess builds.
+    if runtime.aiesim && !compiler.chess {
+        eprintln!("note: aiesim requires Chess builds, enabling --compiler=chess");
+        compiler.chess = true;
     }
 
     // Auto-detect parallelism: use all available CPUs.
@@ -465,20 +771,17 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
         };
     }
 
-    // Merge chess_only from CLI and config.
-    let chess_only = chess_only || config.chess.chess_only;
-
-    // Chess builds are ON by default (auto-detected from aietools).
-    let chess_build = if chess_only { true } else { !no_chess };
-    let chess_emulator = if chess_build { config.chess.run_emulator } else { false };
-    let chess_hardware = if chess_build { config.chess.run_hardware } else { false };
-    let aiesim = if aiesim { true } else if chess_build { config.aiesim.enabled } else { false };
-
-    // Unit tests: CLI overrides config
-    let unit_tests = unit_tests || config.unit_tests.enabled;
-
-    // Examples: CLI overrides config
-    let examples = examples || config.examples.enabled;
+    // Derive Options fields from the three axes.
+    let chess_build = compiler.chess;
+    let chess_only = chess_only || config.chess.chess_only || (chess_build && !compiler.peano);
+    let hw = runtime.hw;
+    let hw_only = runtime.hw && !runtime.emu;
+    let chess_emulator = if chess_build { config.chess.run_emulator && runtime.emu } else { false };
+    let chess_hardware = if chess_build { config.chess.run_hardware && runtime.hw } else { false };
+    let aiesim = runtime.aiesim;
+    let unit_tests = suite.unit_tests;
+    let examples = suite.examples;
+    let elfanalyze = elfanalyze || (runtime.emu && runtime.hw && runtime.aiesim);
 
     Options {
         mode,
@@ -512,6 +815,9 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
         trace_size,
         aiesim_trace,
         list_only,
+
+        output_path: output_path.unwrap_or_else(|| PathBuf::from("build/results.json")),
+        format_json,
     }
 }
 
@@ -538,21 +844,27 @@ fn print_usage() {
     eprintln!("Common options:");
     eprintln!("  -v, --verbose       Show detailed output");
     eprintln!("  -j N                Parallelism (default: auto for emu, 1 for lit/trace)");
-    eprintln!("  --chess-only        Use Chess compiler (skip Peano)");
+    eprintln!("  --chess-only        Shorthand for --compiler=chess");
     eprintln!("  -h, --help          Show this help");
+    eprintln!();
+    eprintln!("Selection:");
+    eprintln!("  --runtime=TARGETS   Execution targets (default: from runner.toml)");
+    eprintln!("                      Valid: emu, hw, aiesim, all");
+    eprintln!("  --compiler=COMPILERS  Compiler selection (default: from runner.toml)");
+    eprintln!("                      Valid: peano, chess, all");
+    eprintln!("  --suite=SUITES      Test suites to include (default: from runner.toml)");
+    eprintln!("                      Valid: npu-xrt, examples, unit-tests, all");
+    eprintln!("                      Negation: -token on any axis. Example: all,-aiesim");
     eprintln!();
     eprintln!("Emulator mode options:");
     eprintln!("  --elfanalyze        Run elfanalyzer on each test's ELFs");
-    eprintln!("  --no-chess          Disable Chess compiler builds");
-    eprintln!("  --no-hw             Skip NPU hardware validation");
-    eprintln!("  --hw-only           Skip emulator, hardware only");
-    eprintln!("  --aiesim            Run aiesimulator on Chess builds");
-    eprintln!("  --unit-tests        Run mlir-aie unit tests");
-    eprintln!("  --examples          Include programming_examples/ tests");
-    eprintln!("  --full              Enable all validation modes");
     eprintln!("  --no-build          Skip build phase, use pre-built tests");
     eprintln!("  --rebuild           Force rebuild even if cached artifacts are fresh");
     eprintln!("  --list              Discover tests and print list, then exit");
+    eprintln!();
+    eprintln!("Output options:");
+    eprintln!("  --output=PATH       JSON results file (default: build/results.json)");
+    eprintln!("  --format=json       Write JSON to stdout instead of human-readable");
     eprintln!();
     eprintln!("Lit mode options:");
     eprintln!("  --timeout SECS      Per-test timeout (forwarded to lit)");
@@ -574,4 +886,203 @@ pub fn matches_filter(name: &str, filters: &[String]) -> bool {
         return true;
     }
     filters.iter().any(|f| name.contains(f.as_str()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- RuntimeSet tests ---
+
+    #[test]
+    fn runtime_set_emu_only() {
+        let r = RuntimeSet::parse("emu").unwrap();
+        assert!(r.emu);
+        assert!(!r.hw);
+        assert!(!r.aiesim);
+    }
+
+    #[test]
+    fn runtime_set_all() {
+        let r = RuntimeSet::parse("all").unwrap();
+        assert!(r.emu);
+        assert!(r.hw);
+        assert!(r.aiesim);
+    }
+
+    #[test]
+    fn runtime_set_all_minus_aiesim() {
+        let r = RuntimeSet::parse("all,-aiesim").unwrap();
+        assert!(r.emu);
+        assert!(r.hw);
+        assert!(!r.aiesim);
+    }
+
+    #[test]
+    fn runtime_set_multi() {
+        let r = RuntimeSet::parse("emu,hw").unwrap();
+        assert!(r.emu);
+        assert!(r.hw);
+        assert!(!r.aiesim);
+    }
+
+    #[test]
+    fn runtime_set_empty_is_error() {
+        assert!(RuntimeSet::parse("").is_err());
+    }
+
+    #[test]
+    fn runtime_set_unknown_is_error() {
+        assert!(RuntimeSet::parse("bogus").is_err());
+        assert!(RuntimeSet::parse("emu,nope").is_err());
+    }
+
+    #[test]
+    fn runtime_set_negation_only_is_error() {
+        assert!(RuntimeSet::parse("-emu").is_err());
+        assert!(RuntimeSet::parse("-hw,-aiesim").is_err());
+    }
+
+    #[test]
+    fn runtime_set_whitespace_tolerance() {
+        let r = RuntimeSet::parse(" emu , hw ").unwrap();
+        assert!(r.emu);
+        assert!(r.hw);
+    }
+
+    #[test]
+    fn runtime_set_migrated_token_chess() {
+        let err = RuntimeSet::parse("chess").unwrap_err();
+        assert!(err.contains("--compiler=chess"), "got: {}", err);
+    }
+
+    #[test]
+    fn runtime_set_migrated_token_unit_tests() {
+        let err = RuntimeSet::parse("emu,unit-tests").unwrap_err();
+        assert!(err.contains("--suite=unit-tests"), "got: {}", err);
+    }
+
+    #[test]
+    fn runtime_set_migrated_token_examples() {
+        let err = RuntimeSet::parse("emu,examples").unwrap_err();
+        assert!(err.contains("--suite=examples"), "got: {}", err);
+    }
+
+    #[test]
+    fn runtime_set_to_spec() {
+        let r = RuntimeSet { emu: true, hw: true, aiesim: false };
+        assert_eq!(r.to_spec(), "emu,hw");
+    }
+
+    // --- CompilerSet tests ---
+
+    #[test]
+    fn compiler_set_peano_only() {
+        let c = CompilerSet::parse("peano").unwrap();
+        assert!(c.peano);
+        assert!(!c.chess);
+    }
+
+    #[test]
+    fn compiler_set_chess_only() {
+        let c = CompilerSet::parse("chess").unwrap();
+        assert!(!c.peano);
+        assert!(c.chess);
+    }
+
+    #[test]
+    fn compiler_set_all() {
+        let c = CompilerSet::parse("all").unwrap();
+        assert!(c.peano);
+        assert!(c.chess);
+    }
+
+    #[test]
+    fn compiler_set_all_minus_peano() {
+        let c = CompilerSet::parse("all,-peano").unwrap();
+        assert!(!c.peano);
+        assert!(c.chess);
+    }
+
+    #[test]
+    fn compiler_set_empty_is_error() {
+        assert!(CompilerSet::parse("").is_err());
+    }
+
+    #[test]
+    fn compiler_set_unknown_is_error() {
+        assert!(CompilerSet::parse("gcc").is_err());
+    }
+
+    #[test]
+    fn compiler_set_to_spec() {
+        let c = CompilerSet { peano: true, chess: true };
+        assert_eq!(c.to_spec(), "peano,chess");
+    }
+
+    // --- SuiteSet tests ---
+
+    #[test]
+    fn suite_set_npu_xrt_only() {
+        let s = SuiteSet::parse("npu-xrt").unwrap();
+        assert!(s.npu_xrt);
+        assert!(!s.examples);
+        assert!(!s.unit_tests);
+    }
+
+    #[test]
+    fn suite_set_all() {
+        let s = SuiteSet::parse("all").unwrap();
+        assert!(s.npu_xrt);
+        assert!(s.examples);
+        assert!(s.unit_tests);
+    }
+
+    #[test]
+    fn suite_set_all_minus_examples() {
+        let s = SuiteSet::parse("all,-examples").unwrap();
+        assert!(s.npu_xrt);
+        assert!(!s.examples);
+        assert!(s.unit_tests);
+    }
+
+    #[test]
+    fn suite_set_multi() {
+        let s = SuiteSet::parse("npu-xrt,examples").unwrap();
+        assert!(s.npu_xrt);
+        assert!(s.examples);
+        assert!(!s.unit_tests);
+    }
+
+    #[test]
+    fn suite_set_empty_is_error() {
+        assert!(SuiteSet::parse("").is_err());
+    }
+
+    #[test]
+    fn suite_set_unknown_is_error() {
+        assert!(SuiteSet::parse("integration").is_err());
+    }
+
+    #[test]
+    fn suite_set_to_spec() {
+        let s = SuiteSet { npu_xrt: true, examples: true, unit_tests: false };
+        assert_eq!(s.to_spec(), "npu-xrt,examples");
+    }
+
+    // --- DefaultsConfig tests ---
+
+    #[test]
+    fn defaults_config_default_parses() {
+        let cfg = DefaultsConfig::default();
+        let r = RuntimeSet::parse(&cfg.runtime).unwrap();
+        assert!(r.emu);
+        assert!(!r.hw);
+        let c = CompilerSet::parse(&cfg.compiler).unwrap();
+        assert!(c.peano);
+        assert!(!c.chess);
+        let s = SuiteSet::parse(&cfg.suite).unwrap();
+        assert!(s.npu_xrt);
+        assert!(!s.examples);
+    }
 }

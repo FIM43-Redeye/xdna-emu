@@ -7,6 +7,16 @@
 #
 # Missing sections or keys use built-in defaults (shown in comments).
 
+[defaults]
+# Default selections when CLI flags are not specified.
+# Each axis supports comma-separated tokens, "all", and negation (-token).
+# Runtime: where binaries run. Valid: emu, hw, aiesim, all
+runtime = "emu"
+# Compiler: what builds the code. Valid: peano, chess, all
+compiler = "peano"
+# Suite: which test sources. Valid: npu-xrt, examples, unit-tests, all
+suite = "npu-xrt"
+
 [execution]
 # Maximum emulator cycles before TDR-based timeout.
 # Default: 1_000_000. Set to 0 to rely on TDR detection only.

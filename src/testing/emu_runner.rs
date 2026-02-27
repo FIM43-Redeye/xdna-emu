@@ -23,7 +23,7 @@ use crate::testing::artifacts;
 use crate::testing::npu_runner;
 use crate::testing::npu_test::{self, NpuTestSource};
 use crate::testing::runner_config::{self, Options};
-use crate::testing::runner_stats::{RunStats, HwRunResult};
+use crate::testing::runner_stats::{RunStats, HwRunResult, TestReport, TestEntry};
 use crate::testing::hw_executor;
 use crate::testing::native_hw;
 use crate::testing::runner_display::{self, TestResult};
@@ -187,6 +187,15 @@ struct TestContext<'a> {
 // Per-test processing
 // ---------------------------------------------------------------------------
 
+/// Hardware execution results from processing a single test.
+///
+/// Returned by `process_test` so the caller can build JSON report entries
+/// without re-running hardware.
+pub struct ProcessResult {
+    pub peano_hw: Option<HwRunResult>,
+    pub chess_hw: Option<HwRunResult>,
+}
+
 /// Process a single test: display emulator results, run hardware, do
 /// comparisons. This is the body of the main test loop.
 fn process_test(
@@ -197,7 +206,7 @@ fn process_test(
     test: &XclbinTest,
     idx: usize,
     emu: &Option<TestResult>,
-) {
+) -> ProcessResult {
     let compact = emu.is_none(); // hw-only mode: compact single-line output
 
     // --- Emulator display (skip in hw-only) ---
@@ -248,7 +257,7 @@ fn process_test(
             println!("[{:2}/{}] {:45} SKIP ({})",
                 idx + 1, ctx.total, &test.name[..test.name.len().min(45)], reason);
             stats.skipped += 1;
-            return;
+            return ProcessResult { peano_hw: None, chess_hw: None };
         }
         print!("[{:2}/{}] {:35} ",
             idx + 1, ctx.total, &test.name[..test.name.len().min(35)]);
@@ -358,6 +367,8 @@ fn process_test(
     if compact {
         println!();
     }
+
+    ProcessResult { peano_hw: primary_hw, chess_hw }
 }
 
 /// Run primary hardware test (native test.exe preferred, npu-runner fallback).
@@ -394,8 +405,22 @@ fn run_hw_for_test(
 
     if let Some(ref hw) = hw {
         stats.record_hw(compiler, hw);
-        stats.record_hw_xfail(compiler, hw, test.expected_fail_reason.is_some());
+        let is_xfail = test.expected_fail_reason.is_some();
+        stats.record_hw_xfail(compiler, hw, is_xfail);
         cascade.record(hw, idx);
+
+        // Per-test XFAIL annotation (visible inline next to hw result)
+        if is_xfail {
+            let tag = match hw.outcome {
+                super::runner_stats::HwOutcome::Pass => " [UNEXPECTED PASS]",
+                _ => " [XFAIL]",
+            };
+            if compact {
+                print!("{}", tag);
+            } else {
+                println!("             {}", tag.trim());
+            }
+        }
     }
 
     hw
@@ -780,7 +805,11 @@ fn run_parallel(suite: &XclbinSuite, tests: &[XclbinTest], jobs: usize) -> Vec<T
                     let (outcome, raw_output, hw_validation, warnings) = suite.run_single_with_hw_validation(test);
 
                     let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
-                    eprint!("\r  [{}/{}] completed", done, total);
+                    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+                        eprint!("\r  [{}/{}] completed", done, total);
+                    } else {
+                        eprintln!("  [{}/{}] completed: {}", done, total, test.name);
+                    }
 
                     results.lock().unwrap().push(TestResult {
                         idx: i,
@@ -1476,8 +1505,19 @@ pub fn run(opts: &Options) {
         total,
     };
 
+    let mut report_entries = Vec::with_capacity(total);
     for (idx, test) in tests.iter().enumerate() {
-        process_test(&ctx, &mut suite, &mut stats, &mut cascade, test, idx, &emu_results[idx]);
+        let result = process_test(&ctx, &mut suite, &mut stats, &mut cascade, test, idx, &emu_results[idx]);
+        let is_xfail = test.expected_fail_reason.is_some();
+        report_entries.push(TestEntry {
+            name: test.name.clone(),
+            emulator: emu_results[idx].as_ref().map(|r| r.outcome.to_report()),
+            peano_hw: result.peano_hw.as_ref().map(|h| h.to_report(is_xfail)),
+            chess_hw: result.chess_hw.as_ref().map(|h| h.to_report(is_xfail)),
+            chess_emulator: chess_emu_results.get(&test.name).map(|(o, _)| o.to_report()),
+            xfail_reason: test.expected_fail_reason.clone(),
+            warning_count: emu_results[idx].as_ref().map_or(0, |r| r.warnings.len()),
+        });
     }
     cascade.apply_to_stats(&mut stats);
 
@@ -1518,6 +1558,93 @@ pub fn run(opts: &Options) {
             let mnemonic = op.mnemonic.as_deref().unwrap_or("unknown");
             println!("  {:?} opcode 0x{:04X} '{}' (hits: {}, tests: {})",
                      op.slot, op.opcode, mnemonic, entry.count, entry.tests.len());
+        }
+    }
+
+    // === JSON REPORT ===
+    write_json_report(opts, &stats, total, report_entries);
+}
+
+/// Build and write the machine-readable JSON test report.
+fn write_json_report(
+    opts: &Options,
+    stats: &RunStats,
+    total: usize,
+    entries: Vec<TestEntry>,
+) {
+    use std::time::SystemTime;
+
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let git_commit = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Reconstruct the three-axis specs from Options for the report.
+    let runtime = {
+        let mut parts = Vec::new();
+        if !opts.hw_only { parts.push("emu"); }
+        if opts.hw { parts.push("hw"); }
+        if opts.aiesim { parts.push("aiesim"); }
+        if parts.is_empty() { "emu".to_string() } else { parts.join(",") }
+    };
+    let compiler = {
+        let mut parts = Vec::new();
+        if !opts.chess_only { parts.push("peano"); }
+        if opts.chess_build { parts.push("chess"); }
+        if parts.is_empty() { "peano".to_string() } else { parts.join(",") }
+    };
+    let suite = {
+        let mut parts = Vec::new();
+        // npu-xrt is always included as the base suite.
+        parts.push("npu-xrt");
+        if opts.examples { parts.push("examples"); }
+        if opts.unit_tests { parts.push("unit-tests"); }
+        parts.join(",")
+    };
+
+    let report = TestReport {
+        timestamp,
+        git_commit,
+        runtime,
+        compiler,
+        suite,
+        tests: entries,
+        summary: stats.to_summary(total),
+    };
+
+    // Always write to the output file.
+    if let Some(parent) = opts.output_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    match serde_json::to_string_pretty(&report) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&opts.output_path, &json) {
+                eprintln!("Warning: failed to write {}: {}", opts.output_path.display(), e);
+            } else {
+                eprintln!("Results written to {}", opts.output_path.display());
+            }
+            // If --format=json, also print to stdout.
+            if opts.format_json {
+                println!("{}", json);
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: failed to serialize report: {}", e);
         }
     }
 }

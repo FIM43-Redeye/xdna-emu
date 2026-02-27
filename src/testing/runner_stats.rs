@@ -4,6 +4,8 @@
 //! scattered `let mut` counter variables that previously lived in main().
 //! Each `record_*` method enforces correct increment logic.
 
+use serde::Serialize;
+
 use crate::testing::xclbin_suite::{Compiler, TestOutcome};
 use crate::testing::hardware_comparison::{
     Diagnosis, HardwareValidation, CompilerDiagnosis,
@@ -422,6 +424,232 @@ impl RunStats {
                 };
                 println!("Both fail:        {} (test issue?){}", self.both_fail, annotation);
             }
+        }
+    }
+
+    /// Build a serializable summary from aggregate counters.
+    pub fn to_summary(&self, total: usize) -> ReportSummary {
+        ReportSummary {
+            total,
+            passed: self.passed,
+            expected_fail: self.expected_fail,
+            unexpected_pass: self.unexpected_pass,
+            validation_fail: self.validation_failed,
+            failed: self.failed,
+            unknown: self.unknown,
+            timeout: self.timeout,
+            load_error: self.load_error,
+            skipped: self.skipped,
+            platform: self.platform,
+            peano_hw_pass: self.peano_hw_pass,
+            peano_hw_attempted: self.peano_hw_attempted,
+            chess_hw_pass: self.chess_hw_pass,
+            chess_hw_attempted: self.chess_hw_attempted,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Machine-readable JSON report types
+// ---------------------------------------------------------------------------
+
+/// Top-level test report, written to `build/results.json`.
+#[derive(Debug, Serialize)]
+pub struct TestReport {
+    /// Unix epoch seconds when the run started.
+    pub timestamp: u64,
+    /// Short git commit hash (or "unknown").
+    pub git_commit: String,
+    /// Execution targets (e.g. "emu", "emu,hw").
+    pub runtime: String,
+    /// Compiler selection (e.g. "peano", "peano,chess").
+    pub compiler: String,
+    /// Test suite selection (e.g. "npu-xrt", "npu-xrt,examples").
+    pub suite: String,
+    /// Per-test entries.
+    pub tests: Vec<TestEntry>,
+    /// Aggregate summary.
+    pub summary: ReportSummary,
+}
+
+/// Per-test result entry.
+#[derive(Debug, Serialize)]
+pub struct TestEntry {
+    pub name: String,
+    /// Peano emulator result (None if emulator was not run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emulator: Option<EmulatorResult>,
+    /// Peano hardware result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peano_hw: Option<HwReportResult>,
+    /// Chess hardware result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chess_hw: Option<HwReportResult>,
+    /// Chess emulator result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chess_emulator: Option<EmulatorResult>,
+    /// Expected failure reason from test_overrides.toml (None if not XFAIL).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xfail_reason: Option<String>,
+    /// Number of warnings emitted during emulation.
+    pub warning_count: usize,
+}
+
+/// Emulator execution result for a single test.
+#[derive(Debug, Serialize)]
+pub struct EmulatorResult {
+    /// Outcome category: "pass", "fail", "timeout", "unknown_opcode",
+    /// "load_error", "validation_fail", "expected_fail", "unexpected_pass",
+    /// "skipped", "platform".
+    pub outcome: String,
+    /// Cycle count (if the test ran).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cycles: Option<u64>,
+    /// Correct output values (if validation was performed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correct: Option<usize>,
+    /// Total output values checked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<usize>,
+    /// Reason string (for fail, skip, platform, expected_fail).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Hardware execution result for a single test.
+#[derive(Debug, Serialize)]
+pub struct HwReportResult {
+    /// Outcome: "pass", "fail", "error", "wedged".
+    pub outcome: String,
+    /// Display label (e.g. "PASS (64/64)").
+    pub label: String,
+    /// Wall-clock execution time in seconds.
+    pub elapsed_secs: f64,
+    /// XFAIL status: "expected_fail", "unexpected_pass", or absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xfail_status: Option<String>,
+}
+
+/// Aggregate summary counters.
+#[derive(Debug, Serialize)]
+pub struct ReportSummary {
+    pub total: usize,
+    pub passed: usize,
+    pub expected_fail: usize,
+    pub unexpected_pass: usize,
+    pub validation_fail: usize,
+    pub failed: usize,
+    pub unknown: usize,
+    pub timeout: usize,
+    pub load_error: usize,
+    pub skipped: usize,
+    pub platform: usize,
+    pub peano_hw_pass: usize,
+    pub peano_hw_attempted: usize,
+    pub chess_hw_pass: usize,
+    pub chess_hw_attempted: usize,
+}
+
+impl HwRunResult {
+    /// Convert to a serializable report entry.
+    pub fn to_report(&self, is_xfail: bool) -> HwReportResult {
+        let outcome_str = match self.outcome {
+            HwOutcome::Pass => "pass",
+            HwOutcome::Fail => "fail",
+            HwOutcome::Error => "error",
+            HwOutcome::Wedged => "wedged",
+        };
+        let xfail_status = if is_xfail {
+            Some(match self.outcome {
+                HwOutcome::Pass => "unexpected_pass".to_string(),
+                _ => "expected_fail".to_string(),
+            })
+        } else {
+            None
+        };
+        HwReportResult {
+            outcome: outcome_str.to_string(),
+            label: self.label.clone(),
+            elapsed_secs: self.elapsed_secs,
+            xfail_status,
+        }
+    }
+}
+
+impl TestOutcome {
+    /// Convert to a serializable emulator result.
+    pub fn to_report(&self) -> EmulatorResult {
+        match self {
+            TestOutcome::Pass { cycles, correct, total } => EmulatorResult {
+                outcome: "pass".to_string(),
+                cycles: Some(*cycles),
+                correct: *correct,
+                total: *total,
+                reason: None,
+            },
+            TestOutcome::ValidationFail { cycles, correct, total, .. } => EmulatorResult {
+                outcome: "validation_fail".to_string(),
+                cycles: Some(*cycles),
+                correct: Some(*correct),
+                total: Some(*total),
+                reason: None,
+            },
+            TestOutcome::ExpectedFail { cycles, reason, actual } => EmulatorResult {
+                outcome: "expected_fail".to_string(),
+                cycles: Some(*cycles),
+                correct: None,
+                total: None,
+                reason: Some(format!("{}: {}", reason, actual)),
+            },
+            TestOutcome::UnexpectedPass { cycles, correct, total } => EmulatorResult {
+                outcome: "unexpected_pass".to_string(),
+                cycles: Some(*cycles),
+                correct: Some(*correct),
+                total: Some(*total),
+                reason: None,
+            },
+            TestOutcome::Fail { message, cycles } => EmulatorResult {
+                outcome: "fail".to_string(),
+                cycles: Some(*cycles),
+                correct: None,
+                total: None,
+                reason: Some(message.clone()),
+            },
+            TestOutcome::UnknownOpcode { cycles, .. } => EmulatorResult {
+                outcome: "unknown_opcode".to_string(),
+                cycles: Some(*cycles),
+                correct: None,
+                total: None,
+                reason: None,
+            },
+            TestOutcome::Timeout { cycles } => EmulatorResult {
+                outcome: "timeout".to_string(),
+                cycles: Some(*cycles),
+                correct: None,
+                total: None,
+                reason: None,
+            },
+            TestOutcome::LoadError { message } => EmulatorResult {
+                outcome: "load_error".to_string(),
+                cycles: None,
+                correct: None,
+                total: None,
+                reason: Some(message.clone()),
+            },
+            TestOutcome::Skipped { reason } => EmulatorResult {
+                outcome: "skipped".to_string(),
+                cycles: None,
+                correct: None,
+                total: None,
+                reason: Some(reason.clone()),
+            },
+            TestOutcome::Platform { required, reason } => EmulatorResult {
+                outcome: "platform".to_string(),
+                cycles: None,
+                correct: None,
+                total: None,
+                reason: Some(format!("{}: {}", required, reason)),
+            },
         }
     }
 }
