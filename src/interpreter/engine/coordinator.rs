@@ -185,6 +185,20 @@ impl InterpreterEngine {
         self.status
     }
 
+    /// Reset status from Halted to Running.
+    ///
+    /// The engine halts when no cores are enabled and no DMA is active,
+    /// which is correct for its local view. But the NPU instruction
+    /// executor may still be configuring and triggering DMA from the
+    /// host command stream. The run loop calls this when it knows
+    /// external work is still in progress, so `step()` continues
+    /// advancing DMA engines and stream switches.
+    pub fn force_running(&mut self) {
+        if self.status == EngineStatus::Halted {
+            self.status = EngineStatus::Running;
+        }
+    }
+
     /// Get total cycles executed.
     pub fn total_cycles(&self) -> u64 {
         self.total_cycles
@@ -741,33 +755,33 @@ impl InterpreterEngine {
 
         // Determine if we should halt the engine.
         //
-        // The engine halts when:
-        // 1. All cores have halted (executed `done` instruction), AND
+        // The engine halts when all work is done:
+        // 1. All cores have halted (or no cores were enabled), AND
         // 2. Either:
         //    a. No DMA activity at all, OR
         //    b. DMA is active but no progress for multiple cycles (deadlock)
         //
-        // Deadlock detection: If all cores are halted and DMA makes no progress
-        // (no words routed) for several consecutive cycles, the system is stuck.
-        // This handles cases like:
-        // - DMA waiting for locks that will never be released
-        // - DMA waiting for stream data that will never arrive
-        // - Circular dependencies in the data flow
-        //
-        // Check if any cores were enabled (to distinguish DMA-only tests from real programs)
+        // For DMA-only tests (no cores enabled), NPU instructions from the
+        // host command stream trigger DMA transfers. The engine must keep
+        // stepping so DMA engines and stream switches advance. The run loop
+        // calls force_running() while NPU instructions are still pending;
+        // once DMA is triggered, the deadlock detection here handles
+        // completion and stall detection normally.
         let any_cores_enabled = self.cores.iter().any(|c| c.enabled);
 
-        // Case 1: No cores enabled - halt if no activity at all
-        if !any_cores_enabled && !any_running {
-            self.status = EngineStatus::Halted;
-            return;
-        }
+        // All compute work is done when cores have halted (or none exist).
+        let cores_done = if any_cores_enabled { all_halted } else { !any_running };
 
-        // Case 2: Cores enabled and all halted - check for deadlock
-        if all_halted && any_cores_enabled {
+        if cores_done {
+            // No DMA activity at all -- clean halt.
+            if !dma_active {
+                self.status = EngineStatus::Halted;
+                return;
+            }
+
+            // DMA still active -- check for progress or deadlock.
             let dma_waiting = self.device.array.any_dma_waiting_for_lock();
 
-            // Check if we're making progress.
             // Progress means EITHER stream words were routed OR DMA transferred
             // more bytes. During pipeline drainage after core completion, DMA may
             // spend several cycles on lock acquire/release without routing stream
@@ -778,14 +792,11 @@ impl InterpreterEngine {
             self.last_words_routed = words_routed;
             self.last_dma_bytes = dma_bytes;
 
-            if !dma_active {
-                // No DMA activity at all - clean halt
-                self.status = EngineStatus::Halted;
-            } else if !making_progress {
+            if !making_progress {
                 // DMA active but no progress this cycle
                 self.no_progress_cycles += 1;
 
-                // After 50 cycles of no progress with all cores halted, give up.
+                // After 50 cycles of no progress with all work halted, give up.
                 // Lock acquire/release cycles and multi-hop stream routing can
                 // cause gaps of 10-20 cycles with no visible byte progress, so
                 // we need a generous threshold to avoid false positives.
