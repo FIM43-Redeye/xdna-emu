@@ -76,3 +76,59 @@ pub fn show_controls(ui: &mut egui::Ui, app: &mut EmulatorApp) {
         ui.label(format!("Enabled: {}", app.engine.enabled_cores()));
     });
 }
+
+/// Show trace cursor controls when traces are loaded.
+pub fn show_trace_controls(ui: &mut egui::Ui, app: &mut EmulatorApp) {
+    let store = match &mut app.trace_store {
+        Some(s) if !s.traces.is_empty() => s,
+        _ => return,
+    };
+
+    ui.horizontal(|ui| {
+        ui.label("Trace:");
+
+        // Previous event button.
+        if ui.button("|<").on_hover_text("Previous event").clicked() {
+            if let Some(cycle) = store.prev_event_cycle() {
+                store.seek(cycle);
+            }
+        }
+
+        // Cycle display/input.
+        let mut cycle_str = store.cursor.to_string();
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut cycle_str)
+                .desired_width(80.0),
+        );
+        if response.lost_focus() {
+            if let Ok(cycle) = cycle_str.parse::<u64>() {
+                store.seek(cycle);
+            }
+        }
+
+        // Next event button.
+        if ui.button(">|").on_hover_text("Next event").clicked() {
+            if let Some(cycle) = store.next_event_cycle() {
+                store.seek(cycle);
+            }
+        }
+
+        ui.separator();
+
+        // Cycle range and trace count.
+        ui.label(format!(
+            "Range: {} - {} | {} traces",
+            store.cycle_range.0,
+            store.cycle_range.1,
+            store.traces.len(),
+        ));
+
+        // Events at cursor count.
+        let event_count: usize = store
+            .events_at_cursor()
+            .iter()
+            .map(|(_, events)| events.len())
+            .sum();
+        ui.label(format!("| {} events at cursor", event_count));
+    });
+}

@@ -49,6 +49,8 @@ pub struct EmulatorApp {
     pub error_message: Option<String>,
     /// Dropped file path (for drag & drop).
     dropped_file: Option<PathBuf>,
+    /// Loaded trace data for replay/comparison (None = live mode only).
+    pub trace_store: Option<crate::trace::store::TraceStore>,
 }
 
 impl Default for EmulatorApp {
@@ -68,6 +70,7 @@ impl Default for EmulatorApp {
             show_registers: true,
             error_message: None,
             dropped_file: None,
+            trace_store: None,
         }
     }
 }
@@ -121,9 +124,31 @@ impl EmulatorApp {
         Ok(())
     }
 
-    /// Handle file drop.
+    /// Load a Perfetto JSON trace file.
+    pub fn load_trace(&mut self, path: &std::path::Path) -> Result<usize, String> {
+        use crate::trace::store::{TraceStore, TraceSource};
+
+        let store = self.trace_store.get_or_insert_with(TraceStore::new);
+        let label = path.file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        // Auto-detect source from filename.
+        let source = if label.contains("emu") {
+            TraceSource::Emulator
+        } else if label.contains("aiesim") || label.contains("vcd") {
+            TraceSource::Aiesimulator
+        } else {
+            TraceSource::Hardware
+        };
+
+        store.load(path, label, source)?;
+        let count = store.traces.last().map(|t| t.events.len()).unwrap_or(0);
+        Ok(count)
+    }
+
+    /// Handle file drop (.xclbin or .json).
     fn handle_file_drop(&mut self, ctx: &egui::Context) {
-        // Check for dropped files
         ctx.input(|i| {
             if !i.raw.dropped_files.is_empty() {
                 if let Some(file) = i.raw.dropped_files.first() {
@@ -134,9 +159,26 @@ impl EmulatorApp {
             }
         });
 
-        // Process dropped file
         if let Some(path) = self.dropped_file.take() {
-            if let Err(e) = self.load_xclbin(&path) {
+            let ext = path.extension()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase();
+
+            if ext == "json" {
+                match self.load_trace(&path) {
+                    Ok(count) => {
+                        self.status_message = format!(
+                            "Loaded trace: {} ({} events)",
+                            path.file_name().unwrap_or_default().to_string_lossy(),
+                            count,
+                        );
+                    }
+                    Err(e) => {
+                        self.error_message = Some(format!("Failed to load trace: {}", e));
+                    }
+                }
+            } else if let Err(e) = self.load_xclbin(&path) {
                 self.error_message = Some(format!("Failed to load: {}", e));
                 self.status_message = "Load failed".to_string();
             }
@@ -160,10 +202,26 @@ impl eframe::App for EmulatorApp {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open...").clicked() {
-                        // Use native file dialog if available
                         if let Some(path) = rfd_open_xclbin() {
                             if let Err(e) = self.load_xclbin(&path) {
                                 self.error_message = Some(format!("Failed to load: {}", e));
+                            }
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Load Trace...").clicked() {
+                        if let Some(path) = rfd_open_trace() {
+                            match self.load_trace(&path) {
+                                Ok(count) => {
+                                    self.status_message = format!(
+                                        "Loaded trace: {} ({} events)",
+                                        path.file_name().unwrap_or_default().to_string_lossy(),
+                                        count,
+                                    );
+                                }
+                                Err(e) => {
+                                    self.error_message = Some(format!("Failed to load trace: {}", e));
+                                }
                             }
                         }
                         ui.close_menu();
@@ -199,6 +257,13 @@ impl eframe::App for EmulatorApp {
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
             controls::show_controls(ui, self);
         });
+
+        // Trace cursor controls (only visible when traces are loaded)
+        if self.trace_store.is_some() {
+            egui::TopBottomPanel::top("trace_controls").show(ctx, |ui| {
+                controls::show_trace_controls(ui, self);
+            });
+        }
 
         // Status bar at bottom
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
@@ -247,7 +312,13 @@ impl eframe::App for EmulatorApp {
 /// Open file dialog for xclbin files.
 /// Returns None if dialog was cancelled or rfd is not available.
 fn rfd_open_xclbin() -> Option<PathBuf> {
-    // Try to use rfd if available, otherwise return None
-    // For now we rely on drag & drop since rfd adds complexity
+    // Placeholder -- relies on drag & drop until rfd is added.
+    None
+}
+
+/// Open file dialog for trace JSON files.
+/// Returns None if dialog was cancelled or rfd is not available.
+fn rfd_open_trace() -> Option<PathBuf> {
+    // Placeholder -- relies on drag & drop until rfd is added.
     None
 }

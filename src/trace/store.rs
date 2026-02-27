@@ -263,35 +263,44 @@ pub struct TraceStore {
     pub cycle_range: (u64, u64),
 }
 
-impl TraceStore {
-    /// Create an empty store.
-    pub fn new() -> Self {
+impl Default for TraceStore {
+    fn default() -> Self {
         Self {
             traces: Vec::new(),
             cursor: 0,
             cycle_range: (0, 0),
         }
     }
+}
+
+impl TraceStore {
+    /// Create an empty store.
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Recompute merged cycle_range from all loaded traces.
+    /// Only considers traces that have events (non-empty).
     fn update_cycle_range(&mut self) {
-        if self.traces.is_empty() {
-            self.cycle_range = (0, 0);
-            return;
+        let mut min_cycle = None;
+        let mut max_cycle = None;
+        for trace in &self.traces {
+            if trace.events.is_empty() {
+                continue;
+            }
+            min_cycle =
+                Some(min_cycle.map_or(trace.cycle_range.0, |m: u64| {
+                    m.min(trace.cycle_range.0)
+                }));
+            max_cycle =
+                Some(max_cycle.map_or(trace.cycle_range.1, |m: u64| {
+                    m.max(trace.cycle_range.1)
+                }));
         }
-        let min = self
-            .traces
-            .iter()
-            .map(|t| t.cycle_range.0)
-            .min()
-            .unwrap();
-        let max = self
-            .traces
-            .iter()
-            .map(|t| t.cycle_range.1)
-            .max()
-            .unwrap();
-        self.cycle_range = (min, max);
+        self.cycle_range = match (min_cycle, max_cycle) {
+            (Some(lo), Some(hi)) => (lo, hi),
+            _ => (0, 0),
+        };
     }
 
     /// Add a loaded trace to the store.
@@ -780,5 +789,33 @@ mod tests {
     #[test]
     fn test_parse_process_name_unknown() {
         assert_eq!(parse_process_name("something else"), None);
+    }
+
+    #[test]
+    fn test_empty_trace_does_not_corrupt_range() {
+        let mut store = TraceStore::new();
+        // Add a real trace first.
+        store.add_trace(LoadedTrace::from_events(
+            "real".into(),
+            TraceSource::Emulator,
+            vec![make_event(100, 0, 2, "A"), make_event(200, 0, 2, "B")],
+        ));
+        assert_eq!(store.cycle_range, (100, 200));
+
+        // Add an empty trace -- should NOT drag min to 0.
+        store.add_trace(LoadedTrace::from_events(
+            "empty".into(),
+            TraceSource::Hardware,
+            vec![],
+        ));
+        assert_eq!(store.cycle_range, (100, 200));
+    }
+
+    #[test]
+    fn test_default_trait() {
+        let store = TraceStore::default();
+        assert_eq!(store.cursor, 0);
+        assert_eq!(store.cycle_range, (0, 0));
+        assert!(store.traces.is_empty());
     }
 }
