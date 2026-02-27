@@ -9,5 +9,6 @@
 
 pub mod aietools;
 pub mod aiesimulator;
-pub mod elfanalyzer;
+pub mod bridge;
 pub mod chess_build;
+pub mod elfanalyzer;
