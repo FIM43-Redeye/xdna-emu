@@ -27,7 +27,10 @@ pub use crate::tablegen::{BranchCondition, ElementType, SelectVariant};
 
 /// Slot index within a VLIW bundle.
 ///
-/// AIE2 has 7 execution slots that can potentially operate in parallel.
+/// AIE2 has 8 execution slots that can potentially operate in parallel.
+/// The LDA and LDB slots in 128-bit bundles are independent load ports
+/// with separate bit fields (21-bit LDA, 16-bit LDB) that can both
+/// issue in the same cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum SlotIndex {
@@ -39,28 +42,33 @@ pub enum SlotIndex {
     Vector = 2,
     /// Accumulator slot - MAC operations with 512-bit accumulators.
     Accumulator = 3,
-    /// Load slot - memory read operations.
-    Load = 4,
+    /// Load A slot - primary memory read port (LDA in VLIW encoding).
+    LoadA = 4,
     /// Store slot - memory write operations.
     Store = 5,
     /// Control slot - branches, calls, returns, lock operations.
     Control = 6,
+    /// Load B slot - secondary memory read port (LDB in VLIW encoding).
+    /// Only present in 128-bit bundles; shares the load execution unit
+    /// with LoadA but has independent operands.
+    LoadB = 7,
 }
 
 impl SlotIndex {
     /// Total number of slots in a VLIW bundle.
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 8;
 
     /// Get all slot indices.
-    pub fn all() -> [SlotIndex; 7] {
+    pub fn all() -> [SlotIndex; 8] {
         [
             SlotIndex::Scalar0,
             SlotIndex::Scalar1,
             SlotIndex::Vector,
             SlotIndex::Accumulator,
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             SlotIndex::Store,
             SlotIndex::Control,
+            SlotIndex::LoadB,
         ]
     }
 
@@ -73,7 +81,13 @@ impl SlotIndex {
     /// Check if this is a memory slot.
     #[inline]
     pub fn is_memory(self) -> bool {
-        matches!(self, SlotIndex::Load | SlotIndex::Store)
+        matches!(self, SlotIndex::LoadA | SlotIndex::LoadB | SlotIndex::Store)
+    }
+
+    /// Check if this is a load slot (either port).
+    #[inline]
+    pub fn is_load(self) -> bool {
+        matches!(self, SlotIndex::LoadA | SlotIndex::LoadB)
     }
 }
 
@@ -787,13 +801,15 @@ impl Operation {
             | Operation::VectorAddMac { .. }
             | Operation::VectorSubMac { .. } => SlotIndex::Accumulator,
 
-            // Memory load operations (Load slot)
+            // Memory load operations (LoadA slot -- primary load port)
             Operation::PointerAdd
             | Operation::PointerMov
             | Operation::Load { .. }
             | Operation::VectorLoadA { .. }
-            | Operation::VectorLoadB { .. }
-            | Operation::VectorLoadUnpack { .. } => SlotIndex::Load,
+            | Operation::VectorLoadUnpack { .. } => SlotIndex::LoadA,
+
+            // Memory load operations (LoadB slot -- secondary load port)
+            Operation::VectorLoadB { .. } => SlotIndex::LoadB,
 
             // Memory store operations (Store slot)
             Operation::Store { .. }
@@ -1026,9 +1042,10 @@ mod tests {
     #[test]
     fn test_slot_index_all() {
         let all = SlotIndex::all();
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
         assert_eq!(all[0], SlotIndex::Scalar0);
         assert_eq!(all[6], SlotIndex::Control);
+        assert_eq!(all[7], SlotIndex::LoadB);
     }
 
     #[test]
@@ -1078,7 +1095,7 @@ mod tests {
                 post_modify: PostModify::None
             }
             .natural_slot(),
-            SlotIndex::Load
+            SlotIndex::LoadA
         );
         assert_eq!(
             Operation::Branch {

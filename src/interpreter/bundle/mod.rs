@@ -61,7 +61,7 @@ pub struct VliwBundle {
     raw: [u8; 16],
 
     /// Decoded slot operations (None if slot is empty/NOP).
-    slots: [Option<SlotOp>; 7],
+    slots: [Option<SlotOp>; 8],
 
     /// Size of this bundle in bytes (4, 8, or 16).
     size: u8,
@@ -150,13 +150,13 @@ impl VliwBundle {
 
     /// Get a reference to all slots.
     #[inline]
-    pub fn slots(&self) -> &[Option<SlotOp>; 7] {
+    pub fn slots(&self) -> &[Option<SlotOp>; 8] {
         &self.slots
     }
 
     /// Get a mutable reference to all slots.
     #[inline]
-    pub fn slots_mut(&mut self) -> &mut [Option<SlotOp>; 7] {
+    pub fn slots_mut(&mut self) -> &mut [Option<SlotOp>; 8] {
         &mut self.slots
     }
 

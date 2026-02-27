@@ -44,8 +44,10 @@ impl UnknownOpcode {
             SlotIndex::Scalar1
         } else if message.contains("Vector") {
             SlotIndex::Vector
+        } else if message.contains("LoadB") {
+            SlotIndex::LoadB
         } else if message.contains("Load") {
-            SlotIndex::Load
+            SlotIndex::LoadA
         } else if message.contains("Store") {
             SlotIndex::Store
         } else if message.contains("Control") {

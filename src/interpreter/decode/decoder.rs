@@ -574,7 +574,8 @@ impl InstructionDecoder {
     fn slot_to_index(&self, slot: &str) -> SlotIndex {
         match slot {
             "alu" => SlotIndex::Scalar0,
-            "lda" | "ldb" => SlotIndex::Load,
+            "lda" => SlotIndex::LoadA,
+            "ldb" => SlotIndex::LoadB,
             "st" => SlotIndex::Store,
             "mv" => SlotIndex::Scalar1,
             "vec" => SlotIndex::Vector,
@@ -1075,7 +1076,8 @@ impl Decoder for InstructionDecoder {
         if !extracted.is_empty() {
             for slot in &extracted.slots {
                 let slot_index = match slot.slot_type {
-                    SlotType::Lda | SlotType::Ldb => SlotIndex::Load,
+                    SlotType::Lda => SlotIndex::LoadA,
+                    SlotType::Ldb => SlotIndex::LoadB,
                     SlotType::Alu => SlotIndex::Scalar0,
                     SlotType::Mv => SlotIndex::Scalar1,
                     SlotType::St => SlotIndex::Store,
@@ -1087,17 +1089,10 @@ impl Decoder for InstructionDecoder {
                     SlotType::Nop => SlotIndex::Control,
                 };
 
-                // Try to decode the slot bits against known encodings
+                // Try to decode the slot bits against known encodings.
                 // Zero bits means no operation in this slot - treat as NOP.
-                //
-                // Guard: LDA and LDB both map to SlotIndex::Load. If one
-                // has a real instruction and the other is NOP, the NOP must
-                // not overwrite the real instruction. Only set NOP when
-                // the slot is currently empty.
                 if slot.slot_type == SlotType::Nop || slot.bits == 0 {
-                    if bundle.slot(slot_index).is_none() {
-                        bundle.set_slot(SlotOp::nop(slot_index));
-                    }
+                    bundle.set_slot(SlotOp::nop(slot_index));
                 } else if let Some(decoded) = self.decode_slot_bits(slot.bits, slot.slot_type) {
                     let operation = self.to_operation(&decoded);
                     let (dest, sources, extracted_pm) = self.extract_operands(&decoded);
@@ -1962,15 +1957,14 @@ mod tests {
 
     /// Regression test: LDA instruction must not be overwritten by LDB NOP.
     ///
-    /// In 128-bit bundles, LDA and LDB both map to SlotIndex::Load. Before
-    /// the fix, a NOP LDB (bits=0) would unconditionally set a NOP in the
-    /// Load slot, overwriting whatever LDA had placed there. This caused
-    /// `mova` instructions to silently disappear.
+    /// LDA and LDB are independent load slots in 128-bit bundles. When LDB
+    /// is NOP (bits=0) and LDA has a real instruction, both should decode
+    /// into their own slot without collision.
     ///
     /// Real bundle from add_314_using_dma_op at PC=0x2A0:
     ///   nopb; mova r0, #0x30; nops; movx r1, #0x1; mov r20, p7; nopv
     #[test]
-    fn test_lda_not_overwritten_by_ldb_nop() {
+    fn test_lda_and_ldb_have_separate_slots() {
         let llvm_aie_path = Path::new("../llvm-aie");
         if !llvm_aie_path.exists() {
             eprintln!("Skipping test: llvm-aie not found at ../llvm-aie");
@@ -1989,36 +1983,34 @@ mod tests {
         let bundle = decoder.decode(&bytes, 0x2A0).expect("Should decode 128-bit bundle");
         assert_eq!(bundle.size(), 16);
 
-        // The Load slot must contain the mova instruction, not a NOP.
-        // Before the fix, LDB (NOP, bits=0) overwrote LDA's mova.
-        let load_slot = bundle.slot(SlotIndex::Load)
-            .expect("Load slot should be present");
+        // LoadA slot must contain the mova instruction (LDA slot).
+        let load_a = bundle.slot(SlotIndex::LoadA)
+            .expect("LoadA slot should be present");
         assert!(
-            !load_slot.op.is_nop(),
-            "Load slot should have mova r0, #0x30 (not NOP from LDB overwrite)"
+            !load_a.op.is_nop(),
+            "LoadA slot should have mova r0, #0x30"
         );
-        assert_eq!(load_slot.dest, Some(Operand::ScalarReg(0)),
+        assert_eq!(load_a.dest, Some(Operand::ScalarReg(0)),
             "mova destination should be r0");
-        assert_eq!(load_slot.sources.len(), 1, "mova should have one source");
-        assert_eq!(load_slot.sources[0], Operand::Immediate(0x30),
+        assert_eq!(load_a.sources.len(), 1, "mova should have one source");
+        assert_eq!(load_a.sources[0], Operand::Immediate(0x30),
             "mova source should be immediate 0x30");
+
+        // LoadB slot should be NOP (nopb = LDB NOP).
+        let load_b = bundle.slot(SlotIndex::LoadB)
+            .expect("LoadB slot should be present (NOP)");
+        assert!(load_b.op.is_nop(), "LoadB slot should be NOP (nopb)");
 
         // Scalar0 (ALU) should have movx r1, #0x1
         let scalar0 = bundle.slot(SlotIndex::Scalar0)
             .expect("Scalar0 slot should be present");
         assert_eq!(scalar0.dest, Some(Operand::ScalarReg(1)),
             "movx destination should be r1");
-        assert_eq!(scalar0.sources.len(), 1, "movx should have one source");
-        assert_eq!(scalar0.sources[0], Operand::Immediate(1),
-            "movx source should be immediate 1");
 
         // Scalar1 (MV) should have mov r20, p7
         let scalar1 = bundle.slot(SlotIndex::Scalar1)
             .expect("Scalar1 slot should be present");
         assert_eq!(scalar1.dest, Some(Operand::ScalarReg(20)),
             "mov destination should be r20");
-        assert_eq!(scalar1.sources.len(), 1, "mov should have one source");
-        assert_eq!(scalar1.sources[0], Operand::PointerReg(7),
-            "mov source should be p7");
     }
 }

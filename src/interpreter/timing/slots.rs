@@ -125,7 +125,7 @@ pub fn get_requirements(op: &SlotOp) -> ResourceRequirements {
             reqs.require(ExecutionResource::VectorUnit);
             reqs.require(ExecutionResource::AccumulatorWrite);
         }
-        SlotIndex::Load => {
+        SlotIndex::LoadA | SlotIndex::LoadB => {
             reqs.require(ExecutionResource::LoadPortA);
         }
         SlotIndex::Store => {
@@ -221,7 +221,7 @@ mod tests {
         // Scalar0 and Load use different resources
         let scalar = make_slot(SlotIndex::Scalar0, Operation::ScalarAdd);
         let load = make_slot(
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             Operation::Load {
                 width: MemWidth::Word,
                 post_modify: PostModify::None,
@@ -255,7 +255,7 @@ mod tests {
     fn test_conflict_dual_post_modify() {
         // Both loads with post-modify share AGU
         let load_a = SlotOp::new(
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             Operation::Load {
                 width: MemWidth::Word,
                 post_modify: PostModify::Immediate(4),
@@ -280,7 +280,7 @@ mod tests {
         let mut bundle = VliwBundle::empty();
         bundle.set_slot(make_slot(SlotIndex::Scalar0, Operation::ScalarAdd));
         bundle.set_slot(make_slot(
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             Operation::Load {
                 width: MemWidth::Word,
                 post_modify: PostModify::None,
@@ -308,7 +308,7 @@ mod tests {
     #[test]
     fn test_resource_requirements() {
         let load = SlotOp::new(
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             Operation::Load {
                 width: MemWidth::Word,
                 post_modify: PostModify::Immediate(4),

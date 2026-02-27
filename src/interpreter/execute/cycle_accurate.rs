@@ -360,9 +360,11 @@ impl CycleAccurateExecutor {
 
         let mut final_result = ExecuteResult::Continue;
 
-        // Execution order: Load(4), Store(5), then Scalar0(0), Scalar1(1), Vector(2), Accumulator(3), Control(6)
+        // Execution order: LoadA/LoadB first, then Store, then compute slots.
+        // Both load ports issue in the same cycle (they share a load unit).
         let execution_order = [
-            SlotIndex::Load,       // Memory reads first
+            SlotIndex::LoadA,      // Primary load port (LDA)
+            SlotIndex::LoadB,      // Secondary load port (LDB)
             SlotIndex::Store,      // Register reads for stores (before scalar writes!)
             SlotIndex::Scalar0,    // Scalar operations
             SlotIndex::Scalar1,
@@ -412,7 +414,7 @@ impl CycleAccurateExecutor {
                 // Each active slot generates its own event, just like hardware where
                 // different event types fire for each functional unit.
                 let event = match slot_idx {
-                    SlotIndex::Load => Some(EventType::InstrLoad { pc }),
+                    SlotIndex::LoadA | SlotIndex::LoadB => Some(EventType::InstrLoad { pc }),
                     SlotIndex::Store => Some(EventType::InstrStore { pc }),
                     SlotIndex::Vector | SlotIndex::Accumulator =>
                         Some(EventType::InstrVector { pc }),
@@ -619,7 +621,7 @@ mod tests {
 
         // Memory load has 5 cycle latency
         let bundle = make_bundle(vec![SlotOp::new(
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             Operation::Load {
                 width: MemWidth::Word,
                 post_modify: PostModify::None,

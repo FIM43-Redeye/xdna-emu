@@ -1135,7 +1135,7 @@ mod tests {
 
         // r0 = [p0]
         let op = SlotOp::new(
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             Operation::Load {
                 width: MemWidth::Word,
                 post_modify: PostModify::None,
@@ -1159,7 +1159,7 @@ mod tests {
 
         // r0 = [p0 + 8]
         let op = SlotOp::new(
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             Operation::Load {
                 width: MemWidth::Word,
                 post_modify: PostModify::None,
@@ -1183,7 +1183,7 @@ mod tests {
 
         // r0 = [p0], p0 += 4
         let op = SlotOp::new(
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             Operation::Load {
                 width: MemWidth::Word,
                 post_modify: PostModify::Immediate(4),
@@ -1210,7 +1210,7 @@ mod tests {
 
         // r0 = [p0], p0 += m0
         let op = SlotOp::new(
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             Operation::Load {
                 width: MemWidth::Word,
                 post_modify: PostModify::Register(0),
@@ -1258,7 +1258,7 @@ mod tests {
         ctx.pointer.write(0, 0x50);
 
         let op = SlotOp::new(
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             Operation::Load {
                 width: MemWidth::Byte,
                 post_modify: PostModify::None,
@@ -1282,7 +1282,7 @@ mod tests {
         ctx.pointer.write(0, 0x60);
 
         let op = SlotOp::new(
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             Operation::Load {
                 width: MemWidth::HalfWord,
                 post_modify: PostModify::None,
@@ -1330,7 +1330,7 @@ mod tests {
 
         // Load vector: v0 = [p0]
         let op = SlotOp::new(
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             Operation::Load {
                 width: MemWidth::Vector256,
                 post_modify: PostModify::None,
@@ -1397,7 +1397,7 @@ mod tests {
 
         // Load with post-modify: v0 = [p0], p0 += 32
         let op = SlotOp::new(
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             Operation::Load {
                 width: MemWidth::Vector256,
                 post_modify: PostModify::Immediate(32), // 256 bits = 32 bytes
@@ -1427,7 +1427,7 @@ mod tests {
 
         // VLDA: v2 = [p0]
         let op = SlotOp::new(
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             Operation::VectorLoadA {
                 post_modify: PostModify::None,
             },
@@ -1452,7 +1452,7 @@ mod tests {
 
         // VLDA: v0 = [p1], p1 += 32
         let op = SlotOp::new(
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             Operation::VectorLoadA {
                 post_modify: PostModify::Immediate(32),
             },
@@ -1479,7 +1479,7 @@ mod tests {
 
         // VLDB: v3 = [p4]
         let op = SlotOp::new(
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             Operation::VectorLoadB {
                 post_modify: PostModify::None,
             },
@@ -1504,7 +1504,7 @@ mod tests {
 
         // VLDB: v1 = [p5], p5 += m2
         let op = SlotOp::new(
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             Operation::VectorLoadB {
                 post_modify: PostModify::Register(2),
             },
@@ -1588,7 +1588,7 @@ mod tests {
 
         // VLDB_UNPACK: expand int8 to int32
         let op = SlotOp::new(
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             Operation::VectorLoadUnpack {
                 from_type: ElementType::UInt8,
                 to_type: ElementType::UInt32,
@@ -1634,7 +1634,7 @@ mod tests {
 
         // VLDB_UNPACK: expand signed int8 to int32
         let op = SlotOp::new(
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             Operation::VectorLoadUnpack {
                 from_type: ElementType::Int8,
                 to_type: ElementType::Int32,
@@ -1677,7 +1677,7 @@ mod tests {
 
         // VLDB_UNPACK: expand int16 to int32
         let op = SlotOp::new(
-            SlotIndex::Load,
+            SlotIndex::LoadA,
             Operation::VectorLoadUnpack {
                 from_type: ElementType::Int16,
                 to_type: ElementType::Int32,

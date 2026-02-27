@@ -86,8 +86,8 @@ impl Aie2Slot {
     /// Map to the interpreter's SlotIndex.
     pub fn to_slot_index(self) -> SlotIndex {
         match self {
-            Aie2Slot::Lda => SlotIndex::Load,
-            Aie2Slot::Ldb => SlotIndex::Load,
+            Aie2Slot::Lda => SlotIndex::LoadA,
+            Aie2Slot::Ldb => SlotIndex::LoadB,
             Aie2Slot::Alu => SlotIndex::Scalar0,
             Aie2Slot::Mv => SlotIndex::Scalar1,
             Aie2Slot::St => SlotIndex::Store,
