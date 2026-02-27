@@ -1,7 +1,7 @@
 //! Data-driven device model parsed from mlir-aie's AIETargetModel.
 //!
 //! This module provides Rust types that mirror the JSON output of
-//! `tools/aie-device-dump.py`, which queries mlir-aie's Python bindings
+//! `tools/mlir-aie-bridge.py`, which queries mlir-aie's Python bindings
 //! to extract device configuration parameters for all NPU variants.
 //!
 //! The device model captures everything the compiler knows about the
@@ -422,7 +422,7 @@ mod tests {
         if !path.exists() {
             panic!(
                 "Device model JSON not found at {}. \
-                 Run: python3 tools/aie-device-dump.py > tools/aie-device-models.json",
+                 Run: python3 tools/mlir-aie-bridge.py device-model > tools/aie-device-models.json",
                 path.display()
             );
         }
@@ -443,7 +443,10 @@ mod tests {
             models.devices.contains_key("npu2"),
             "missing npu2 device"
         );
-        assert_eq!(models.generator, "aie-device-dump.py");
+        assert!(
+            models.generator.contains("mlir-aie-bridge") || models.generator.contains("aie-device-dump"),
+            "unexpected generator: {}", models.generator
+        );
     }
 
     #[test]
