@@ -53,6 +53,7 @@ pub struct RunnerConfig {
     pub chess: ChessConfig,
     pub aiesim: AiesimConfig,
     pub unit_tests: UnitTestsConfig,
+    pub examples: ExamplesConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +102,19 @@ pub struct UnitTestsConfig {
     pub aiesim_timeout: u64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct ExamplesConfig {
+    /// Include programming_examples/ tests in test discovery.
+    pub enabled: bool,
+}
+
+impl Default for ExamplesConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
 impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
@@ -109,6 +123,7 @@ impl Default for RunnerConfig {
             chess: ChessConfig::default(),
             aiesim: AiesimConfig::default(),
             unit_tests: UnitTestsConfig::default(),
+            examples: ExamplesConfig::default(),
         }
     }
 }
@@ -129,7 +144,7 @@ impl Default for ChessConfig {
     fn default() -> Self {
         Self {
             build: false,
-            run_emulator: false,
+            run_emulator: true,
             run_hardware: true,
             chess_only: false,
         }
@@ -194,6 +209,9 @@ impl RunnerConfig {
         if self.unit_tests.enabled != d.unit_tests.enabled {
             overrides.push(format!("unit_tests.enabled={}", self.unit_tests.enabled));
         }
+        if self.examples.enabled != d.examples.enabled {
+            overrides.push(format!("examples.enabled={}", self.examples.enabled));
+        }
         if self.build.nice_level != d.build.nice_level {
             overrides.push(format!("build.nice_level={}", self.build.nice_level));
         }
@@ -248,6 +266,10 @@ pub struct Options {
     pub no_build: bool,
     /// Hardware-only mode: skip emulator, run only on real NPU hardware.
     pub hw_only: bool,
+    /// Include programming_examples/ as an additional test source.
+    pub examples: bool,
+    /// Force rebuild even if cached artifacts are fresh.
+    pub rebuild: bool,
 
     // --- Lit mode ---
     /// Per-test timeout in seconds (forwarded to lit / trace pipeline).
@@ -299,6 +321,8 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
     let mut unit_tests = false;
     let mut no_build = false;
     let mut no_chess = false;
+    let mut examples = false;
+    let mut rebuild = false;
 
     // Lit mode
     let mut timeout_secs: Option<u32> = None;
@@ -343,7 +367,9 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
             "--aiesim" => aiesim = true,
             "--full" => full = true,
             "--unit-tests" => unit_tests = true,
+            "--examples" => examples = true,
             "--no-build" => no_build = true,
+            "--rebuild" => rebuild = true,
 
             // --- Lit mode ---
             "--timeout" => {
@@ -423,16 +449,17 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
         hw = true;
         aiesim = true;
         unit_tests = true;
+        examples = true;
     }
 
-    // Auto-detect parallelism: use available CPU count, capped at 8.
+    // Auto-detect parallelism: use all available CPUs.
     if jobs == 0 {
         jobs = match mode {
             // Lit mode defaults to 1 (lit handles parallelism internally)
             RunMode::Lit | RunMode::Trace | RunMode::TraceAll => 1,
             RunMode::EmuHw => {
                 std::thread::available_parallelism()
-                    .map(|n| n.get().min(8))
+                    .map(|n| n.get())
                     .unwrap_or(4)
             }
         };
@@ -449,6 +476,9 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
 
     // Unit tests: CLI overrides config
     let unit_tests = unit_tests || config.unit_tests.enabled;
+
+    // Examples: CLI overrides config
+    let examples = examples || config.examples.enabled;
 
     Options {
         mode,
@@ -470,6 +500,8 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
         unit_tests_aiesim_timeout: config.unit_tests.aiesim_timeout,
         no_build,
         hw_only,
+        examples,
+        rebuild,
 
         timeout_secs,
         build_dir,
@@ -516,8 +548,10 @@ fn print_usage() {
     eprintln!("  --hw-only           Skip emulator, hardware only");
     eprintln!("  --aiesim            Run aiesimulator on Chess builds");
     eprintln!("  --unit-tests        Run mlir-aie unit tests");
+    eprintln!("  --examples          Include programming_examples/ tests");
     eprintln!("  --full              Enable all validation modes");
     eprintln!("  --no-build          Skip build phase, use pre-built tests");
+    eprintln!("  --rebuild           Force rebuild even if cached artifacts are fresh");
     eprintln!("  --list              Discover tests and print list, then exit");
     eprintln!();
     eprintln!("Lit mode options:");

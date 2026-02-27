@@ -160,7 +160,7 @@ fn discover_and_filter(
         process::exit(1);
     }
 
-    let all_tests = lit_trace::discover_tests(&test_source_dir);
+    let all_tests = lit_trace::discover_tests(&trace_config.mlir_aie_source);
     println!("Discovered {} tests in {}", all_tests.len(), test_source_dir.display());
 
     let tests: Vec<_> = if filters.is_empty() {

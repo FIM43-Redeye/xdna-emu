@@ -19,6 +19,7 @@ use crate::testing::test_cpp_parser::{BufferDir, read_values};
 use crate::testing::hardware_comparison::{
     CompilerComparison, CompilerDiagnosis, load_hw_reference,
 };
+use crate::testing::artifacts;
 use crate::testing::npu_runner;
 use crate::testing::npu_test::{self, NpuTestSource};
 use crate::testing::runner_config::{self, Options};
@@ -311,6 +312,7 @@ fn process_test(
         if !compact {
             println!("      chess: {}", label);
         }
+        stats.record_chess_emu(outcome);
         raw.clone()
     } else {
         None
@@ -318,10 +320,12 @@ fn process_test(
 
     // --- Differential (when both compilers ran on HW) ---
     if let (Some(ref p), Some(ref c)) = (&primary_hw, &chess_hw) {
-        stats.record_differential(
-            p.outcome == super::runner_stats::HwOutcome::Pass,
-            c.outcome == super::runner_stats::HwOutcome::Pass,
-        );
+        let peano_pass = p.outcome == super::runner_stats::HwOutcome::Pass;
+        let chess_pass = c.outcome == super::runner_stats::HwOutcome::Pass;
+        stats.record_differential(peano_pass, chess_pass);
+        if !peano_pass && !chess_pass && test.expected_fail_reason.is_some() {
+            stats.both_fail_xfail += 1;
+        }
     }
 
     // --- Compiler comparison ---
@@ -390,6 +394,7 @@ fn run_hw_for_test(
 
     if let Some(ref hw) = hw {
         stats.record_hw(compiler, hw);
+        stats.record_hw_xfail(compiler, hw, test.expected_fail_reason.is_some());
         cascade.record(hw, idx);
     }
 
@@ -800,6 +805,86 @@ fn run_parallel(suite: &XclbinSuite, tests: &[XclbinTest], jobs: usize) -> Vec<T
 }
 
 // ---------------------------------------------------------------------------
+// Programming examples integration
+// ---------------------------------------------------------------------------
+
+/// Discover programming_examples and add them to an existing suite.
+///
+/// Returns the number of examples added. Each example is enriched with
+/// buffer metadata from its test.cpp (same parser as npu-xrt tests).
+/// When `compile_test_exe` is true and hardware is available, also
+/// compiles native test.exe for each example (needed for `--hw-only`).
+fn add_examples_to_suite(
+    suite: &mut XclbinSuite,
+    examples_root: &Path,
+    mlir_aie_path: &Path,
+    compile_test_exe: bool,
+) -> usize {
+    let example_arts = artifacts::discover_examples(examples_root);
+    let test_exe_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/test_exe");
+    let mut added = 0;
+    let mut exe_compiled = 0usize;
+    let mut exe_failed = 0usize;
+
+    for art in example_arts {
+        let mut test = XclbinTest::from_path(&art.xclbin);
+        test.name = art.name;
+        test.insts_path = art.insts;
+
+        // The source dir is two levels up from build/: e.g.
+        // basic/passthrough_dmas/build/final.xclbin -> basic/passthrough_dmas/
+        if let Some(build_dir) = art.xclbin.parent() {
+            if let Some(source_dir) = build_dir.parent() {
+                test.source_dir = Some(source_dir.to_path_buf());
+
+                // Enrich with test.cpp buffer metadata
+                if test.buffer_spec.is_none() {
+                    test.buffer_spec =
+                        super::test_cpp_parser::parse_test_cpp(source_dir);
+                }
+                if test.test_cpp_pattern.is_none() {
+                    if let Some((_, pattern)) =
+                        native_hw::detect_test_cpp(source_dir)
+                    {
+                        test.test_cpp_pattern = Some(pattern);
+                    }
+                }
+
+                // Compile native test.exe for hardware execution.
+                // Examples use fixed artifact names (final.xclbin, insts.bin).
+                if compile_test_exe && test.test_cpp_pattern.is_some() {
+                    let test_cpp = source_dir.join("test.cpp");
+                    if test_cpp.exists() {
+                        let output_dir = test_exe_dir.join(&test.name);
+                        match native_hw::compile_test_exe_with_artifacts(
+                            &test_cpp, &output_dir, mlir_aie_path,
+                            Some("final.xclbin"), Some("insts.bin"),
+                        ) {
+                            Ok(exe_path) => {
+                                test.test_exe = Some(exe_path);
+                                exe_compiled += 1;
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to compile test.exe for {}: {}", test.name, e);
+                                exe_failed += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        suite.add_test(test);
+        added += 1;
+    }
+
+    if exe_compiled > 0 || exe_failed > 0 {
+        println!("  examples test.exe: {} compiled, {} failed", exe_compiled, exe_failed);
+    }
+    added
+}
+
+// ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 
@@ -853,6 +938,46 @@ pub fn run(opts: &Options) {
                 println!("  {}", t.name);
             } else {
                 println!("  {} [{}]", t.name, tags.join("; "));
+            }
+        }
+
+        // Also list programming_examples if --examples is enabled.
+        if opts.examples {
+            let examples_dir = mlir_aie_path.join("programming_examples");
+
+            // Show buildable examples (have Makefile + *.py)
+            let buildable = artifacts::discover_buildable_examples(&examples_dir);
+            let filtered_buildable: Vec<_> = buildable.iter()
+                .filter(|e| runner_config::matches_filter(&e.name, &opts.filters))
+                .collect();
+            if !filtered_buildable.is_empty() {
+                println!("\n{} buildable programming examples:\n",
+                    filtered_buildable.len());
+                for ex in &filtered_buildable {
+                    let has_build = if ex.source_dir.join("build/final.xclbin").exists() {
+                        " [built]"
+                    } else {
+                        ""
+                    };
+                    println!("  {}{}", ex.name, has_build);
+                }
+            }
+
+            // Show pre-built examples that aren't in the buildable set
+            let buildable_names: std::collections::HashSet<_> =
+                filtered_buildable.iter().map(|e| e.name.as_str()).collect();
+            let example_arts = artifacts::discover_examples(&examples_dir);
+            let extra_prebuilt: Vec<_> = example_arts.iter()
+                .filter(|a| runner_config::matches_filter(&a.name, &opts.filters))
+                .filter(|a| !buildable_names.contains(a.name.as_str()))
+                .collect();
+            if !extra_prebuilt.is_empty() {
+                println!("\n{} additional pre-built examples:\n",
+                    extra_prebuilt.len());
+                for art in &extra_prebuilt {
+                    let has_insts = if art.insts.is_some() { "" } else { " [no-insts]" };
+                    println!("  {}{}", art.name, has_insts);
+                }
             }
         }
         return;
@@ -1002,6 +1127,43 @@ pub fn run(opts: &Options) {
                         test.test_cpp_pattern = Some(pattern);
                     }
                 }
+
+                // Parse XFAIL/REQUIRES from entry point file
+                if let Some((_path, ann)) = npu_test::find_entry_point(&effective_source) {
+                    if ann.xfail && test.expected_fail_reason.is_none() {
+                        test.expected_fail_reason = Some("XFAIL upstream".to_string());
+                    }
+                    if ann.requires.iter().any(|r| r == "ryzen_ai_npu2") && test.skip_reason.is_none() {
+                        test.skip_reason = Some("Requires NPU2 (Strix Point)".to_string());
+                    }
+                }
+            }
+        }
+
+        // Apply TOML overrides (higher priority than source annotations).
+        // Mirrors what load_overrides() does for NpuTestSource in the
+        // source-driven path, but applies directly to XclbinTest.
+        {
+            let overrides = npu_test::TestOverrides::load(&overrides_path);
+            let tests_mut = suite.tests_mut();
+            for test in tests_mut.iter_mut() {
+                if let Some(reason) = overrides.skip.get(&test.name) {
+                    test.skip_reason = Some(reason.clone());
+                }
+                if let Some(reason) = overrides.expected_fail.get(&test.name) {
+                    test.expected_fail_reason = Some(reason.clone());
+                }
+            }
+        }
+
+        // Add programming_examples if --examples is enabled.
+        if opts.examples {
+            let examples_dir = mlir_aie_path.join("programming_examples");
+            let n = add_examples_to_suite(
+                &mut suite, &examples_dir, &mlir_aie_path, hw_available,
+            );
+            if n > 0 {
+                println!("{} programming examples added", n);
             }
         }
 
@@ -1049,6 +1211,7 @@ pub fn run(opts: &Options) {
                 verbose: opts.verbose,
                 gen_sim: opts.aiesim,
                 chess_only: opts.chess_only,
+                force_rebuild: opts.rebuild,
             },
         );
 
@@ -1106,7 +1269,133 @@ pub fn run(opts: &Options) {
             suite = suite.with_npu_output_dir(npu_output_dir.clone());
         }
 
-        let chess_builds_from_build = build_result.chess_artifacts;
+        // Build programming_examples if --examples is enabled.
+        // Uses the same parallel build system as npu-xrt tests.
+        let mut example_chess_builds = HashMap::new();
+        if opts.examples {
+            let examples_dir = mlir_aie_path.join("programming_examples");
+            let buildable = artifacts::discover_buildable_examples(&examples_dir);
+
+            // Filter examples by CLI filters
+            let filtered_examples: Vec<&artifacts::ExampleSource> = buildable.iter()
+                .filter(|e| runner_config::matches_filter(&e.name, &opts.filters))
+                .collect();
+
+            if !filtered_examples.is_empty() {
+                println!("\nBuilding {} programming examples...", filtered_examples.len());
+                let example_result = build_progress::run_parallel_builds(
+                    env,
+                    &filtered_examples,
+                    chess_available,
+                    &ParallelBuildConfig {
+                        thread_count: opts.jobs,
+                        nice_level: opts.build_nice,
+                        verbose: opts.verbose,
+                        gen_sim: false, // examples don't use aiesimulator
+                        chess_only: opts.chess_only,
+                        force_rebuild: opts.rebuild,
+                    },
+                );
+
+                // Compile test.exe for hardware execution
+                let mut built_tests = example_result.primary_tests;
+                if hw_available {
+                    let test_exe_dir = PathBuf::from(manifest_dir)
+                        .join("build/test_exe");
+                    let mut exe_compiled = 0usize;
+                    let mut exe_failed = 0usize;
+                    for test in built_tests.iter_mut() {
+                        if test.test_cpp_pattern.is_none() {
+                            continue;
+                        }
+                        let source_dir = match test.source_dir.as_ref() {
+                            Some(d) => d,
+                            None => continue,
+                        };
+                        let test_cpp = source_dir.join("test.cpp");
+                        if !test_cpp.exists() {
+                            continue;
+                        }
+                        let output_dir = test_exe_dir.join(&test.name);
+                        match native_hw::compile_test_exe_with_artifacts(
+                            &test_cpp, &output_dir, &mlir_aie_path,
+                            Some("final.xclbin"), Some("insts.bin"),
+                        ) {
+                            Ok(exe_path) => {
+                                test.test_exe = Some(exe_path);
+                                exe_compiled += 1;
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "Failed to compile test.exe for {}: {}",
+                                    test.name, e
+                                );
+                                exe_failed += 1;
+                            }
+                        }
+                    }
+                    if exe_compiled > 0 || exe_failed > 0 {
+                        println!(
+                            "  examples test.exe: {} compiled, {} failed",
+                            exe_compiled, exe_failed
+                        );
+                    }
+                }
+
+                // Add built examples to the suite
+                let built_count = built_tests.len();
+                for test in built_tests {
+                    suite.add_test(test);
+                }
+                if built_count > 0 {
+                    println!("{} programming examples built", built_count);
+                }
+
+                example_chess_builds = example_result.chess_artifacts;
+            }
+
+            // Fallback: discover pre-built artifacts for examples not
+            // covered by the build system (e.g. missing Makefile or *.py).
+            let existing_names: std::collections::HashSet<String> =
+                suite.tests().iter().map(|t| t.name.clone()).collect();
+            let pre_built = artifacts::discover_examples(&examples_dir);
+            let mut fallback_count = 0;
+            for art in pre_built {
+                if existing_names.contains(&art.name) {
+                    continue;
+                }
+                if !runner_config::matches_filter(&art.name, &opts.filters) {
+                    continue;
+                }
+                let mut test = XclbinTest::from_path(&art.xclbin);
+                test.name = art.name;
+                test.insts_path = art.insts;
+                if let Some(build_dir) = art.xclbin.parent() {
+                    if let Some(source_dir) = build_dir.parent() {
+                        test.source_dir = Some(source_dir.to_path_buf());
+                        if test.buffer_spec.is_none() {
+                            test.buffer_spec =
+                                super::test_cpp_parser::parse_test_cpp(source_dir);
+                        }
+                        if test.test_cpp_pattern.is_none() {
+                            if let Some((_, pattern)) =
+                                native_hw::detect_test_cpp(source_dir)
+                            {
+                                test.test_cpp_pattern = Some(pattern);
+                            }
+                        }
+                    }
+                }
+                suite.add_test(test);
+                fallback_count += 1;
+            }
+            if fallback_count > 0 {
+                println!("{} pre-built examples added as fallback", fallback_count);
+            }
+        }
+
+        let mut chess_builds_from_build = build_result.chess_artifacts;
+        chess_builds_from_build.extend(example_chess_builds);
 
         let tests: Vec<XclbinTest> = suite.tests().to_vec();
         (suite, tests, total_source, chess_builds_from_build)
@@ -1239,128 +1528,14 @@ pub fn run(opts: &Options) {
 /// Handles both flat layout (`chess/<name>/aie.xclbin`) and nested layout
 /// (`chess/<parent>/<subtest>/aie.xclbin`).
 fn discover_chess_artifacts(chess_dir: &Path) -> HashMap<String, ChessBuildArtifacts> {
-    let mut results = HashMap::new();
-    if !chess_dir.exists() {
-        return results;
-    }
+    use crate::testing::artifacts;
 
-    // Walk the directory tree looking for xclbin files.
-    //
-    // Mirrors XclbinSuite::discover_recursive: directories with a single
-    // xclbin produce one entry named after the directory; directories with
-    // multiple xclbins produce one entry per variant (dir_name/stem).
-    fn walk(dir: &Path, prefix: &str, results: &mut HashMap<String, ChessBuildArtifacts>) {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let full_name = if prefix.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{}/{}", prefix, name)
-                };
-
-                let xclbins = collect_xclbins(&path);
-                match xclbins.len() {
-                    0 => {
-                        // No xclbins -- recurse into subdirectory
-                        walk(&path, &full_name, results);
-                    }
-                    1 => {
-                        // Single xclbin: one entry named after directory
-                        let insts = find_insts(&path);
-                        let prj = find_prj_dir(&path);
-                        results.insert(full_name, ChessBuildArtifacts {
-                            xclbin: xclbins.into_iter().next().unwrap(),
-                            insts,
-                            prj_dir: prj,
-                        });
-                    }
-                    _ => {
-                        // Multiple xclbins: one entry per variant
-                        for xclbin in &xclbins {
-                            let stem = xclbin.file_stem()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or_default();
-                            let variant_name = format!("{}/{}", full_name, stem);
-                            let insts = find_matching_insts_chess(&path, &stem);
-                            let prj = find_prj_dir(&path);
-                            results.insert(variant_name, ChessBuildArtifacts {
-                                xclbin: xclbin.clone(),
-                                insts,
-                                prj_dir: prj,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn collect_xclbins(dir: &Path) -> Vec<PathBuf> {
-        let mut xclbins = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().is_some_and(|e| e == "xclbin") {
-                    xclbins.push(p);
-                }
-            }
-        }
-        xclbins.sort();
-        xclbins
-    }
-
-    fn find_insts(dir: &Path) -> Option<PathBuf> {
-        let bin = dir.join("insts.bin");
-        if bin.exists() { return Some(bin); }
-        let elf = dir.join("insts.elf");
-        if elf.exists() { return Some(elf); }
-        None
-    }
-
-    /// Find the matching insts file for a multi-variant xclbin.
-    /// Convention: aie2_buffer.xclbin -> insts2_buffer.txt (aie->insts swap)
-    fn find_matching_insts_chess(dir: &Path, xclbin_stem: &str) -> Option<PathBuf> {
-        // Convention: swap "aie" prefix to "insts", keep the rest
-        if let Some(suffix) = xclbin_stem.strip_prefix("aie") {
-            let insts_stem = format!("insts{}", suffix);
-            for ext in &["txt", "bin"] {
-                let candidate = dir.join(format!("{}.{}", insts_stem, ext));
-                if candidate.exists() {
-                    return Some(candidate);
-                }
-            }
-        }
-        // Fallback: try <stem>.txt and <stem>.bin
-        for ext in &["txt", "bin"] {
-            let candidate = dir.join(format!("{}.{}", xclbin_stem, ext));
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-        // Last fallback: shared insts.bin
-        let bin = dir.join("insts.bin");
-        if bin.exists() { return Some(bin); }
-        None
-    }
-
-    fn find_prj_dir(dir: &Path) -> Option<PathBuf> {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() && p.extension().is_some_and(|e| e == "prj") {
-                    return Some(p);
-                }
-            }
-        }
-        None
-    }
-
-    walk(chess_dir, "", &mut results);
-    results
+    artifacts::discover_build_artifacts(chess_dir)
+        .into_iter()
+        .map(|art| (art.name, ChessBuildArtifacts {
+            xclbin: art.xclbin,
+            insts: art.insts,
+            prj_dir: art.prj_dir,
+        }))
+        .collect()
 }

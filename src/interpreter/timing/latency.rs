@@ -432,10 +432,10 @@ impl LatencyTable {
     pub fn key_from_semantic(semantic: SemanticOp, is_vector: bool) -> OperationKey {
         match semantic {
             // Arithmetic
-            SemanticOp::Add if !is_vector => OperationKey::ScalarAdd,
-            SemanticOp::Add => OperationKey::VectorAdd,
-            SemanticOp::Sub if !is_vector => OperationKey::ScalarSub,
-            SemanticOp::Sub => OperationKey::VectorSub,
+            SemanticOp::Add | SemanticOp::Adc if !is_vector => OperationKey::ScalarAdd,
+            SemanticOp::Add | SemanticOp::Adc => OperationKey::VectorAdd,
+            SemanticOp::Sub | SemanticOp::Sbc if !is_vector => OperationKey::ScalarSub,
+            SemanticOp::Sub | SemanticOp::Sbc => OperationKey::VectorSub,
             SemanticOp::Mul if !is_vector => OperationKey::ScalarMul,
             SemanticOp::Mul => OperationKey::VectorMul,
             SemanticOp::SDiv | SemanticOp::UDiv | SemanticOp::SRem | SemanticOp::URem

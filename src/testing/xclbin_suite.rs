@@ -309,13 +309,7 @@ impl XclbinTest {
             }
         }
         // Fallback: look in the same directory as the xclbin
-        if let Some(parent) = self.xclbin_path.parent() {
-            let bin = parent.join("insts.bin");
-            if bin.exists() { return Some(bin); }
-            let elf = parent.join("insts.elf");
-            if elf.exists() { return Some(elf); }
-        }
-        None
+        self.xclbin_path.parent().and_then(super::artifacts::find_insts)
     }
 
     /// Count the number of compute tiles with embedded code in the xclbin.
@@ -362,39 +356,6 @@ impl XclbinTest {
 
         embedded_cores.len()
     }
-}
-
-/// Find a matching NPU instructions file for a non-standard xclbin stem.
-///
-/// mlir-aie multi-variant tests use a naming convention where the `aie`
-/// prefix in the xclbin name maps to an `insts` prefix in the instructions
-/// file. For example:
-///
-///   `aie2_buffer.xclbin` -> `insts2_buffer.txt`
-///   `aie2_cascade.xclbin` -> `insts2_cascade.txt`
-///
-/// Falls back to checking for `.bin` extension if `.txt` is not found.
-fn find_matching_insts(dir: &Path, xclbin_stem: &str) -> Option<PathBuf> {
-    // Convention: swap "aie" prefix to "insts", keep the rest
-    if let Some(suffix) = xclbin_stem.strip_prefix("aie") {
-        let insts_stem = format!("insts{}", suffix);
-        for ext in &["txt", "bin"] {
-            let candidate = dir.join(format!("{}.{}", insts_stem, ext));
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    // Fallback: try <stem>.txt and <stem>.bin directly
-    for ext in &["txt", "bin"] {
-        let candidate = dir.join(format!("{}.{}", xclbin_stem, ext));
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-
-    None
 }
 
 /// Test suite for running multiple xclbin tests.
@@ -485,90 +446,20 @@ impl XclbinSuite {
     /// tests get names like `core_dmas/writebd` instead of just `writebd`
     /// (which would collide with `tile_dmas/writebd`).
     pub fn discover(base_path: impl AsRef<Path>) -> Result<Self> {
-        let base = base_path.as_ref();
+        let artifacts = super::artifacts::discover_build_artifacts(base_path.as_ref());
         let mut suite = Self::new();
 
-        Self::discover_recursive(base, base, &mut suite)?;
+        for art in artifacts {
+            let mut test = XclbinTest::from_path(&art.xclbin);
+            test.name = art.name;
+            test.insts_path = art.insts;
+            suite.add_test(test);
+        }
 
         // Sort tests by name for consistent ordering
         suite.tests.sort_by(|a, b| a.name.cmp(&b.name));
 
         Ok(suite)
-    }
-
-    /// Recursively discover xclbin files under `dir`, computing test names
-    /// relative to `base`.
-    ///
-    /// Handles three directory layouts:
-    /// 1. **Single xclbin**: directory contains exactly one `.xclbin` -> one test,
-    ///    named after the directory (not the xclbin filename). Works regardless
-    ///    of the xclbin's name (`aie.xclbin`, `final.xclbin`, `aie2p.xclbin`, etc.).
-    /// 2. **Multi-variant**: directory contains 2+ `.xclbin` files -> one test
-    ///    per xclbin, with the xclbin stem appended to the directory name.
-    /// 3. **Parent**: directory contains no xclbins -> recurse into subdirectories.
-    fn discover_recursive(base: &Path, dir: &Path, suite: &mut Self) -> Result<()> {
-        let mut subdirs = Vec::new();
-        let mut loose_xclbins = Vec::new();
-
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir() {
-                subdirs.push(path);
-            } else if path.extension().map(|e| e == "xclbin").unwrap_or(false) {
-                loose_xclbins.push(path);
-            }
-        }
-
-        match loose_xclbins.len() {
-            0 => {
-                // No xclbins -- recurse into subdirectories
-                for subdir in subdirs {
-                    let _ = Self::discover_recursive(base, &subdir, suite);
-                }
-            }
-            1 => {
-                // Single xclbin: standard test, name = directory relative to base
-                let xclbin_path = &loose_xclbins[0];
-                let mut test = XclbinTest::from_path(xclbin_path);
-                if let Ok(rel) = dir.strip_prefix(base) {
-                    test.name = rel.to_string_lossy().to_string();
-                }
-                suite.add_test(test);
-            }
-            _ => {
-                // Multiple xclbins: one test per variant
-                let dir_name = dir.strip_prefix(base)
-                    .map(|r| r.to_string_lossy().to_string())
-                    .unwrap_or_default();
-
-                for xclbin_path in &loose_xclbins {
-                    let stem = xclbin_path.file_stem()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_default();
-
-                    let mut test = XclbinTest::from_path(xclbin_path);
-
-                    // Name: <dir_relative_to_base>/<xclbin_stem>
-                    test.name = if dir_name.is_empty() {
-                        stem.clone()
-                    } else {
-                        format!("{}/{}", dir_name, stem)
-                    };
-
-                    // Find matching insts file by convention:
-                    // aie2_buffer.xclbin -> insts2_buffer.txt (aie->insts prefix swap)
-                    if test.insts_path.is_none() {
-                        test.insts_path = find_matching_insts(dir, &stem);
-                    }
-
-                    suite.add_test(test);
-                }
-            }
-        }
-
-        Ok(())
     }
 
     /// Get the number of tests.
@@ -849,7 +740,8 @@ impl XclbinSuite {
             let insts_data = match std::fs::read(&insts_path) {
                 Ok(d) => d,
                 Err(e) => {
-                    let msg = format!("Failed to read insts.bin: {}", e);
+                    let msg = format!("Failed to read {}: {}",
+                        insts_path.file_name().unwrap_or_default().to_string_lossy(), e);
                     log::warn!("[{}] {}", test.name, msg);
                     test_warnings.push(msg);
                     // Continue without NPU instructions - some tests may not need them
@@ -880,7 +772,8 @@ impl XclbinSuite {
                         npu_executor = Some(executor);
                     }
                     Err(e) => {
-                        let msg = format!("Failed to parse insts.bin: {}", e);
+                        let msg = format!("Failed to parse {}: {}",
+                            insts_path.file_name().unwrap_or_default().to_string_lossy(), e);
                         log::warn!("[{}] {}", test.name, msg);
                         test_warnings.push(msg);
                     }
@@ -1204,17 +1097,18 @@ impl XclbinSuite {
     /// 1. All cores halt (EngineStatus::Halted)
     /// 2. DMA sync conditions are satisfied (NpuExecutor::syncs_satisfied)
     /// 3. A core hits an error (EngineStatus::Error)
-    /// 4. No-progress detected (TDR -- all DMA stalled for two check intervals)
+    /// 4. Quiescence detected (all subsystems terminal for 100 consecutive cycles)
     /// 5. Absolute cycle limit reached (safety net timeout)
     ///
     /// Condition 2 is the primary completion signal for real AIE2 workloads:
     /// kernels are infinite loops that process data as DMA feeds them, and the
     /// host determines completion by watching DMA channel status.
     ///
-    /// Condition 4 mirrors the real xdna-driver's TDR (Timeout Detection &
-    /// Recovery) in `aie2_tdr.c`: every N cycles we snapshot total DMA bytes
-    /// transferred. If the counter doesn't advance for two consecutive check
-    /// intervals, the workload is stalled and will never complete.
+    /// Condition 4 detects deadlock by checking whether the entire system has
+    /// settled: NPU executor done, all cores waiting/halted, all DMA terminal,
+    /// and no data in flight. Sustained for 100 cycles = deadlock. This replaces
+    /// the old TDR (DMA-bytes-only progress check) which failed to catch stalls
+    /// where DMA bytes were moving but no completion was possible.
     fn run_engine(
         &self,
         engine: &mut InterpreterEngine,
@@ -1223,22 +1117,13 @@ impl XclbinSuite {
         mut npu_executor: Option<&mut NpuExecutor>,
         output_addr: u64,
     ) -> TestOutcome {
-        // TDR: No-progress detection modeled after xdna-driver aie2_tdr.c.
-        // Check every TDR_CHECK_INTERVAL cycles; declare stalled after
-        // TDR_STRIKES consecutive checks with no DMA progress.
-        // The real xdna-driver TDR waits ~2 seconds (~2 billion cycles at 1GHz).
-        // We use a shorter interval since emulation is slower, but it must be
-        // long enough to tolerate core processing time between DMA transfers.
-        // A 2048-element buffer at ~13 cycles/iteration takes ~6700 cycles of
-        // core processing with no DMA activity.
-        const TDR_CHECK_INTERVAL: u64 = 50_000;
-        const TDR_STRIKES: u32 = 2;
+        use super::quiescence::{QuiescenceDetector, QuiescenceStatus};
+
+        const QUIESCENCE_CYCLES: u64 = 100;
 
         let mut cycles = 0u64;
-        let mut last_progress: u64 = 0;
-        let mut stall_strikes: u32 = 0;
-        let mut next_tdr_check: u64 = TDR_CHECK_INTERVAL;
-        // 0 means no hard limit -- rely on TDR only
+        let mut quiescence = QuiescenceDetector::new(QUIESCENCE_CYCLES);
+        // 0 means no hard limit -- rely on quiescence only
         let cycle_limit = if self.max_cycles == 0 { u64::MAX } else { self.max_cycles };
 
         while cycles < cycle_limit {
@@ -1256,7 +1141,21 @@ impl XclbinSuite {
 
             match engine.status() {
                 EngineStatus::Halted => {
-                    return self.make_completion_outcome(engine, test, input_values, cycles, output_addr);
+                    // For DMA-only tests (no cores loaded), the engine halts
+                    // immediately because no cores are enabled. But the NPU
+                    // executor may still be issuing instructions that configure
+                    // and trigger DMA. Keep running until the executor finishes
+                    // and DMA syncs are satisfied.
+                    let executor_pending = if let Some(executor) = npu_executor.as_mut() {
+                        !executor.is_done() || !executor.syncs_satisfied(engine.device())
+                    } else {
+                        false
+                    };
+                    if executor_pending {
+                        engine.force_running();
+                    } else {
+                        return self.make_completion_outcome(engine, test, input_values, cycles, output_addr);
+                    }
                 }
                 EngineStatus::Error => {
                     if let Some(details) = self.extract_error_details(engine) {
@@ -1283,28 +1182,18 @@ impl XclbinSuite {
                 }
             }
 
-            // TDR: periodic no-progress check modeled after xdna-driver aie2_tdr.c.
-            // Only DMA byte progress counts -- core instruction execution does not
-            // reset the TDR, matching hardware behavior where TDR catches genuinely
-            // stalled workloads (infinite loops, deadlocked locks, etc.).
-            if cycles >= next_tdr_check {
-                next_tdr_check = cycles + TDR_CHECK_INTERVAL;
-
-                let current_progress = engine.device().array.total_dma_bytes_transferred();
-                if current_progress == last_progress {
-                    stall_strikes += 1;
-                    if stall_strikes >= TDR_STRIKES {
-                        log::info!(
-                            "TDR: no DMA progress for {} checks ({} cycles) in test {}",
-                            stall_strikes, stall_strikes as u64 * TDR_CHECK_INTERVAL, test.name,
-                        );
-                        return TestOutcome::Timeout { cycles };
-                    }
-                } else {
-                    // Progress was made -- reset the strike counter
-                    stall_strikes = 0;
-                    last_progress = current_progress;
+            // Quiescence detection: check if the entire system has settled with
+            // no possible forward progress. All cores terminal, all DMA terminal,
+            // no data in flight, executor done -- sustained for QUIESCENCE_CYCLES.
+            match quiescence.check(engine, npu_executor.as_deref()) {
+                QuiescenceStatus::Quiescent(diagnosis) => {
+                    log::info!(
+                        "Quiescence detected after {} cycles in test {}: {}",
+                        cycles, test.name, diagnosis,
+                    );
+                    return TestOutcome::Timeout { cycles };
                 }
+                QuiescenceStatus::Running => {}
             }
         }
 

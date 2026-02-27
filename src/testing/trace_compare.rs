@@ -231,7 +231,7 @@ pub fn run_trace_compare(
                 Some(tools) => {
                     // Find the .prj directory in the aiesim build
                     let aiesim_build = config.normal_build_dir.join(name);
-                    let prj_dir = find_prj_dir(&aiesim_build);
+                    let prj_dir = super::artifacts::find_prj_dir(&aiesim_build);
                     match prj_dir {
                         Some(prj) => {
                             match run_aiesim_trace(
@@ -829,22 +829,6 @@ fn strip_json_array_brackets(json: &str) -> &str {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Find a .prj directory in a build output directory.
-fn find_prj_dir(build_dir: &Path) -> Option<PathBuf> {
-    let entries = fs::read_dir(build_dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(name) = path.file_name() {
-                if name.to_string_lossy().ends_with(".prj") {
-                    return Some(path);
-                }
-            }
-        }
-    }
-    None
-}
 
 /// Take the first N lines from a string for error message previews.
 fn first_lines(s: &str, n: usize) -> String {

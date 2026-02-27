@@ -13,6 +13,7 @@
 //! cargo run -- test-suite /path/to/mlir-aie/build/test/npu-xrt/
 //! ```
 
+pub mod artifacts;
 pub mod xclbin_suite;
 pub mod opcode_collector;
 pub mod npu_runner;
@@ -31,6 +32,7 @@ pub mod lit_progress;
 pub mod lit_trace;
 pub mod trace_compare;
 pub mod emu_runner;
+pub mod quiescence;
 
 pub use xclbin_suite::{XclbinSuite, XclbinTest, TestOutcome, Compiler};
 pub use opcode_collector::{UnknownOpcode, OpcodeCollector};

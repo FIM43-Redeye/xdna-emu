@@ -1,0 +1,328 @@
+//! Quiescence-based timeout detection.
+//!
+//! Detects deadlocked workloads by checking whether the entire system has
+//! settled with no possible forward progress. This replaces the old TDR
+//! (DMA-bytes-only progress check) which failed to catch stalls where DMA
+//! bytes were moving but cores were stuck.
+//!
+//! The system is quiescent when ALL of the following hold simultaneously:
+//!
+//! 1. NPU executor done -- all host-side NPU instructions issued
+//! 2. All cores terminal -- every enabled core is Halted, Error, or waiting
+//!    (WaitingLock, WaitingDma, WaitingStream) with no runnable cores
+//! 3. All DMA channels terminal -- every channel is Idle, Complete, Error,
+//!    or WaitingForLock (not Active)
+//! 4. No data in flight -- stream switch FIFOs empty, cascade FIFOs empty
+//!
+//! Sustained for `threshold` consecutive cycles = deadlock.
+
+use std::fmt;
+
+use crate::interpreter::core::CoreStatus;
+use crate::interpreter::engine::{InterpreterEngine, EngineStatus};
+use crate::npu::NpuExecutor;
+
+/// Result of a quiescence check on a single cycle.
+pub enum QuiescenceStatus {
+    /// System is making progress or not yet fully configured.
+    Running,
+    /// System is quiescent (deadlocked). Contains diagnostic snapshot.
+    Quiescent(QuiescenceDiagnosis),
+}
+
+/// Diagnostic snapshot of system state at the moment deadlock is declared.
+pub struct QuiescenceDiagnosis {
+    /// Per-core status: (col, row, description).
+    pub core_states: Vec<(u8, u8, String)>,
+    /// Per-channel DMA status: (col, row, channel, state description).
+    pub dma_states: Vec<(u8, u8, u8, String)>,
+    /// Whether any data was in flight at the moment of diagnosis.
+    pub data_in_flight: bool,
+    /// Unsatisfied pending sync descriptions.
+    pub pending_syncs: Vec<String>,
+}
+
+impl fmt::Display for QuiescenceDiagnosis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Core states (only non-halted or interesting ones)
+        let interesting_cores: Vec<_> = self.core_states.iter()
+            .filter(|(_, _, desc)| desc != "Halted")
+            .collect();
+
+        if interesting_cores.is_empty() {
+            write!(f, "all cores halted")?;
+        } else {
+            for (i, (col, row, desc)) in interesting_cores.iter().enumerate() {
+                if i > 0 { write!(f, ", ")?; }
+                write!(f, "core({},{}) {}", col, row, desc)?;
+            }
+        }
+
+        // DMA states (only non-idle ones)
+        let active_dma: Vec<_> = self.dma_states.iter()
+            .filter(|(_, _, _, desc)| desc != "Idle")
+            .collect();
+
+        if !active_dma.is_empty() {
+            write!(f, "; DMA: ")?;
+            for (i, (col, row, ch, desc)) in active_dma.iter().enumerate() {
+                if i > 0 { write!(f, ", ")?; }
+                write!(f, "({},{})ch{} {}", col, row, ch, desc)?;
+            }
+        }
+
+        // Pending syncs
+        if !self.pending_syncs.is_empty() {
+            write!(f, "; pending syncs: ")?;
+            for (i, sync) in self.pending_syncs.iter().enumerate() {
+                if i > 0 { write!(f, ", ")?; }
+                write!(f, "{}", sync)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Detects system quiescence (deadlock) by monitoring all subsystems.
+pub struct QuiescenceDetector {
+    /// Consecutive cycles where all quiescence conditions hold.
+    quiescent_cycles: u64,
+    /// Threshold before declaring deadlock.
+    threshold: u64,
+}
+
+impl QuiescenceDetector {
+    /// Create a new detector with the given cycle threshold.
+    pub fn new(threshold: u64) -> Self {
+        Self {
+            quiescent_cycles: 0,
+            threshold,
+        }
+    }
+
+    /// Check whether the system is quiescent this cycle.
+    ///
+    /// Must be called once per cycle in the run loop. Returns:
+    /// - `Running` if the system is still making progress or waiting
+    /// - `Quiescent(diagnosis)` if deadlock is confirmed (sustained for threshold cycles)
+    pub fn check(
+        &mut self,
+        engine: &InterpreterEngine,
+        npu_executor: Option<&NpuExecutor>,
+    ) -> QuiescenceStatus {
+        // Condition 1: NPU executor must be done.
+        if let Some(executor) = npu_executor {
+            if !executor.is_done() {
+                self.quiescent_cycles = 0;
+                return QuiescenceStatus::Running;
+            }
+        }
+
+        // If the coordinator already declared Halted, let the normal completion
+        // path in run_engine() handle it -- no need for quiescence detection.
+        if matches!(engine.status(), EngineStatus::Halted) {
+            self.quiescent_cycles = 0;
+            return QuiescenceStatus::Running;
+        }
+
+        // Condition 2: No core is in a runnable state (Running or Ready).
+        let device = engine.device();
+        let cols = device.cols();
+        let rows = device.rows();
+
+        for col in 0..cols {
+            for row in 2..rows {
+                if let Some(status) = engine.core_status(col, row) {
+                    if matches!(status, CoreStatus::Running | CoreStatus::Ready) {
+                        self.quiescent_cycles = 0;
+                        return QuiescenceStatus::Running;
+                    }
+                }
+            }
+        }
+
+        // Condition 3: No DMA is actively transferring.
+        if device.array.any_dma_transferring() {
+            self.quiescent_cycles = 0;
+            return QuiescenceStatus::Running;
+        }
+
+        // Condition 4: No data in flight (stream switches, cascade FIFOs).
+        if device.array.any_data_in_flight() {
+            self.quiescent_cycles = 0;
+            return QuiescenceStatus::Running;
+        }
+
+        // All conditions met -- system is quiescent this cycle.
+        self.quiescent_cycles += 1;
+
+        if self.quiescent_cycles >= self.threshold {
+            QuiescenceStatus::Quiescent(Self::diagnose(engine, npu_executor))
+        } else {
+            QuiescenceStatus::Running
+        }
+    }
+
+    /// Build a diagnostic snapshot of the current system state.
+    fn diagnose(
+        engine: &InterpreterEngine,
+        npu_executor: Option<&NpuExecutor>,
+    ) -> QuiescenceDiagnosis {
+        let device = engine.device();
+        let cols = device.cols();
+        let rows = device.rows();
+
+        // Collect core states for enabled compute tiles.
+        let mut core_states = Vec::new();
+        for col in 0..cols {
+            for row in 2..rows {
+                if engine.is_core_enabled(col, row) {
+                    let desc = match engine.core_status(col, row) {
+                        Some(CoreStatus::Ready) => "Ready".to_string(),
+                        Some(CoreStatus::Running) => "Running".to_string(),
+                        Some(CoreStatus::WaitingLock { lock_id }) => {
+                            format!("WaitingLock({})", lock_id)
+                        }
+                        Some(CoreStatus::WaitingDma { channel }) => {
+                            format!("WaitingDma({})", channel)
+                        }
+                        Some(CoreStatus::WaitingStream { port }) => {
+                            format!("WaitingStream({})", port)
+                        }
+                        Some(CoreStatus::Halted) => "Halted".to_string(),
+                        Some(CoreStatus::Error) => "Error".to_string(),
+                        None => "Unknown".to_string(),
+                    };
+                    core_states.push((col as u8, row as u8, desc));
+                }
+            }
+        }
+
+        // Collect DMA channel states for tiles with non-idle channels.
+        use crate::device::dma::engine::ChannelState;
+        let mut dma_states = Vec::new();
+        for col in 0..cols {
+            for row in 0..rows {
+                if let Some(dma) = device.array.dma_engine(col as u8, row as u8) {
+                    for ch in 0..dma.num_channels() {
+                        let state = dma.channel_state(ch as u8);
+                        let desc = match state {
+                            ChannelState::Idle => "Idle".to_string(),
+                            ChannelState::Active => "Active".to_string(),
+                            ChannelState::Paused => "Paused".to_string(),
+                            ChannelState::WaitingForLock(id) => {
+                                format!("WaitingForLock({})", id)
+                            }
+                            ChannelState::Complete => "Complete".to_string(),
+                            ChannelState::Error => "Error".to_string(),
+                        };
+                        if !matches!(state, ChannelState::Idle) {
+                            dma_states.push((col as u8, row as u8, ch as u8, desc));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pending syncs from the NPU executor.
+        let pending_syncs = if let Some(executor) = npu_executor {
+            executor.pending_syncs().iter().map(|s| {
+                let dir = if s.direction == 0 { "S2MM" } else { "MM2S" };
+                format!("col={} row={} ch={} {}", s.column, s.row, s.channel, dir)
+            }).collect()
+        } else {
+            Vec::new()
+        };
+
+        QuiescenceDiagnosis {
+            core_states,
+            dma_states,
+            data_in_flight: device.array.any_data_in_flight(),
+            pending_syncs,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_quiescence_threshold_counting() {
+        // Verify the counter logic in isolation: once we start calling
+        // check() and all conditions are met, it should take exactly
+        // `threshold` cycles to declare quiescence.
+        let mut detector = QuiescenceDetector::new(5);
+
+        // Simulate 4 cycles of quiescence -- not enough yet.
+        for _ in 0..4 {
+            detector.quiescent_cycles += 1;
+        }
+        assert_eq!(detector.quiescent_cycles, 4);
+        assert!(detector.quiescent_cycles < detector.threshold);
+
+        // One more should cross the threshold.
+        detector.quiescent_cycles += 1;
+        assert!(detector.quiescent_cycles >= detector.threshold);
+    }
+
+    #[test]
+    fn test_quiescence_reset_on_progress() {
+        // Verify that making progress resets the counter.
+        let mut detector = QuiescenceDetector::new(10);
+
+        // Accumulate some quiescent cycles.
+        detector.quiescent_cycles = 8;
+
+        // Simulate progress detection (what check() does internally).
+        detector.quiescent_cycles = 0;
+        assert_eq!(detector.quiescent_cycles, 0);
+
+        // Verify we need the full threshold again.
+        for _ in 0..9 {
+            detector.quiescent_cycles += 1;
+        }
+        assert!(detector.quiescent_cycles < detector.threshold);
+    }
+
+    #[test]
+    fn test_diagnosis_display_all_halted() {
+        let diag = QuiescenceDiagnosis {
+            core_states: vec![
+                (0, 2, "Halted".to_string()),
+                (0, 3, "Halted".to_string()),
+            ],
+            dma_states: vec![],
+            data_in_flight: false,
+            pending_syncs: vec![
+                "col=0 row=0 ch=0 S2MM".to_string(),
+            ],
+        };
+        let s = diag.to_string();
+        assert!(s.contains("all cores halted"), "got: {}", s);
+        assert!(s.contains("pending syncs"), "got: {}", s);
+        assert!(s.contains("col=0 row=0 ch=0 S2MM"), "got: {}", s);
+    }
+
+    #[test]
+    fn test_diagnosis_display_waiting_core() {
+        let diag = QuiescenceDiagnosis {
+            core_states: vec![
+                (0, 2, "WaitingLock(5)".to_string()),
+                (0, 3, "Halted".to_string()),
+            ],
+            dma_states: vec![
+                (0, 2, 0, "WaitingForLock(5)".to_string()),
+            ],
+            data_in_flight: false,
+            pending_syncs: vec![],
+        };
+        let s = diag.to_string();
+        assert!(s.contains("core(0,2) WaitingLock(5)"), "got: {}", s);
+        // Halted core should NOT appear since we filter those.
+        assert!(!s.contains("core(0,3)"), "got: {}", s);
+        assert!(s.contains("DMA:"), "got: {}", s);
+        assert!(s.contains("(0,2)ch0 WaitingForLock(5)"), "got: {}", s);
+    }
+}

@@ -97,6 +97,8 @@ pub fn execute_semantic(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         // Arithmetic operations
         SemanticOp::Add => execute_add(op, ctx),
         SemanticOp::Sub => execute_sub(op, ctx),
+        SemanticOp::Adc => execute_adc(op, ctx),
+        SemanticOp::Sbc => execute_sbc(op, ctx),
         SemanticOp::Mul => execute_mul(op, ctx),
         SemanticOp::SDiv => execute_div(op, ctx, true),  // signed
         SemanticOp::UDiv => execute_div(op, ctx, false), // unsigned
@@ -294,6 +296,43 @@ fn execute_sub(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     write_dest(op, ctx, result);
     // AIE2: SUB sets the Carry flag (C). Z/N/V computed by branch logic.
     ctx.set_flags(Flags::from_sub(a, b, result));
+    true
+}
+
+/// Add with carry: result = a + b + carry_in. Sets C, V, Z, N flags.
+fn execute_adc(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
+    let a = read_source(op, ctx, 0);
+    let b = read_source(op, ctx, 1);
+    let carry_in = if ctx.flags().c { 1u32 } else { 0u32 };
+    let (r1, c1) = a.overflowing_add(b);
+    let (result, c2) = r1.overflowing_add(carry_in);
+    write_dest(op, ctx, result);
+    let mut flags = Flags::from_result(result);
+    flags.c = c1 || c2;
+    let a_sign = (a as i32) < 0;
+    let b_sign = (b as i32) < 0;
+    let r_sign = (result as i32) < 0;
+    flags.v = (a_sign == b_sign) && (a_sign != r_sign);
+    ctx.set_flags(flags);
+    true
+}
+
+/// Subtract with borrow: result = a - b - borrow_in. Sets C, V, Z, N flags.
+/// ARM convention: C=1 means no borrow, C=0 means borrow occurred.
+fn execute_sbc(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
+    let a = read_source(op, ctx, 0);
+    let b = read_source(op, ctx, 1);
+    let borrow_in = if ctx.flags().c { 0u32 } else { 1u32 };
+    let (r1, b1) = a.overflowing_sub(b);
+    let (result, b2) = r1.overflowing_sub(borrow_in);
+    write_dest(op, ctx, result);
+    let mut flags = Flags::from_result(result);
+    flags.c = !(b1 || b2); // C=0 means borrow
+    let a_sign = (a as i32) < 0;
+    let b_sign = (b as i32) < 0;
+    let r_sign = (result as i32) < 0;
+    flags.v = (a_sign != b_sign) && (a_sign != r_sign);
+    ctx.set_flags(flags);
     true
 }
 

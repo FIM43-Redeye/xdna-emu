@@ -56,6 +56,18 @@ pub struct RunStats {
     pub unknown: usize,
     pub timeout: usize,
     pub load_error: usize,
+    // Chess emulator outcomes (mirrors Peano emulator counters above)
+    pub chess_emu_passed: usize,
+    pub chess_emu_passed_validated: usize,
+    pub chess_emu_validation_fail: usize,
+    pub chess_emu_expected_fail: usize,
+    pub chess_emu_unexpected_pass: usize,
+    pub chess_emu_skipped: usize,
+    pub chess_emu_platform: usize,
+    pub chess_emu_failed: usize,
+    pub chess_emu_unknown: usize,
+    pub chess_emu_timeout: usize,
+    pub chess_emu_load_error: usize,
     // HW cross-validation (from captured npu-outputs dir)
     pub hw_validated: usize,
     pub hw_correct: usize,
@@ -81,11 +93,18 @@ pub struct RunStats {
     pub sim_correct: usize,
     pub sim_wrong: usize,
     pub sim_error: usize,
+    // HW XFAIL tracking (additive overlay on record_hw counts)
+    pub peano_hw_expected_fail: usize,
+    pub peano_hw_unexpected_pass: usize,
+    pub chess_hw_expected_fail: usize,
+    pub chess_hw_unexpected_pass: usize,
     // Differential (hw-only: Peano vs Chess on HW)
     pub both_pass: usize,
     pub peano_only: usize,
     pub chess_only: usize,
     pub both_fail: usize,
+    /// Subset of `both_fail` where the test has XFAIL annotation.
+    pub both_fail_xfail: usize,
     // Cascade detection
     /// Test index (1-based) where HW execution was disabled due to cascade.
     pub hw_cascade_stopped_at: Option<usize>,
@@ -119,6 +138,28 @@ impl RunStats {
         }
     }
 
+    /// Record a Chess emulator outcome. Mirrors `record_emu_outcome()` but
+    /// tracks into Chess-specific counters.
+    pub fn record_chess_emu(&mut self, outcome: &TestOutcome) {
+        match outcome {
+            TestOutcome::Pass { correct, .. } => {
+                self.chess_emu_passed += 1;
+                if correct.is_some() {
+                    self.chess_emu_passed_validated += 1;
+                }
+            }
+            TestOutcome::ValidationFail { .. } => self.chess_emu_validation_fail += 1,
+            TestOutcome::Fail { .. } => self.chess_emu_failed += 1,
+            TestOutcome::UnknownOpcode { .. } => self.chess_emu_unknown += 1,
+            TestOutcome::Timeout { .. } => self.chess_emu_timeout += 1,
+            TestOutcome::LoadError { .. } => self.chess_emu_load_error += 1,
+            TestOutcome::ExpectedFail { .. } => self.chess_emu_expected_fail += 1,
+            TestOutcome::UnexpectedPass { .. } => self.chess_emu_unexpected_pass += 1,
+            TestOutcome::Skipped { .. } => self.chess_emu_skipped += 1,
+            TestOutcome::Platform { .. } => self.chess_emu_platform += 1,
+        }
+    }
+
     pub fn record_hw_validation(&mut self, hv: &HardwareValidation) {
         if hv.diagnosis == Diagnosis::NoReference {
             return;
@@ -149,6 +190,23 @@ impl RunStats {
             HwOutcome::Pass => *pass += 1,
             HwOutcome::Fail => *fail += 1,
             HwOutcome::Error | HwOutcome::Wedged => *error += 1,
+        }
+    }
+
+    /// Record XFAIL-adjusted hardware result. Call after `record_hw()`.
+    ///
+    /// When `is_xfail` is true: a failing HW result becomes "expected fail"
+    /// and a passing HW result becomes "unexpected pass". These counters are
+    /// additive overlays -- `record_hw()` still tracks raw pass/fail counts.
+    pub fn record_hw_xfail(&mut self, compiler: Compiler, hw: &HwRunResult, is_xfail: bool) {
+        if !is_xfail { return; }
+        let (efail, upass) = match compiler {
+            Compiler::Peano => (&mut self.peano_hw_expected_fail, &mut self.peano_hw_unexpected_pass),
+            Compiler::Chess => (&mut self.chess_hw_expected_fail, &mut self.chess_hw_unexpected_pass),
+        };
+        match hw.outcome {
+            HwOutcome::Pass => *upass += 1,
+            _ => *efail += 1,
         }
     }
 
@@ -193,6 +251,55 @@ impl RunStats {
         }
     }
 
+    /// Format a single HW summary line with XFAIL annotations.
+    fn print_hw_line(
+        &self, label: &str,
+        pass: usize, attempted: usize,
+        fail: usize, error: usize,
+        expected_fail: usize, unexpected_pass: usize,
+    ) {
+        let real_fail = fail.saturating_sub(expected_fail);
+        let mut detail = format!("{}/{} pass", pass, attempted);
+        if real_fail > 0 {
+            detail.push_str(&format!(", {} fail", real_fail));
+        }
+        if error > 0 {
+            detail.push_str(&format!(", {} error", error));
+        }
+        if expected_fail > 0 {
+            detail.push_str(&format!("  ({} expected fail)", expected_fail));
+        }
+        if unexpected_pass > 0 {
+            detail.push_str(&format!("  ({} unexpected pass)", unexpected_pass));
+        }
+        println!("{:18}{}", label, detail);
+    }
+
+    /// Format emulator outcome lines for one compiler.
+    fn print_emu_section(
+        &self, effective: usize,
+        passed: usize, passed_validated: usize,
+        expected_fail: usize, unexpected_pass: usize,
+        validation_fail: usize, failed: usize,
+        unknown: usize, timeout: usize, load_error: usize,
+    ) {
+        let unvalidated = passed.saturating_sub(passed_validated);
+        println!("Passed:           {} ({:.1}%){}", passed,
+            100.0 * passed as f64 / effective.max(1) as f64,
+            if unvalidated > 0 {
+                format!("  ({} validated, {} no validation)", passed_validated, unvalidated)
+            } else {
+                String::new()
+            });
+        println!("Expected Fail:    {}", expected_fail);
+        println!("Unexpected Pass:  {}", unexpected_pass);
+        println!("Validation Fail:  {}", validation_fail);
+        println!("Failed:           {}", failed);
+        println!("Unknown:          {}", unknown);
+        println!("Timeout:          {}", timeout);
+        println!("Load Error:       {}", load_error);
+    }
+
     /// Print run summary, conditionally showing only non-zero sections.
     ///
     /// In hw-only mode the emulator section is suppressed and the header
@@ -210,21 +317,32 @@ impl RunStats {
             println!("Total:            {}", total);
             println!("Platform:         {} (requires different hardware)", self.platform);
             println!("Skipped:          {} (missing artifacts or no instructions)", self.skipped);
-            let unvalidated = self.passed - self.passed_validated;
-            println!("Passed:           {} ({:.1}%){}", self.passed,
-                100.0 * self.passed as f64 / effective.max(1) as f64,
-                if unvalidated > 0 {
-                    format!("  ({} validated, {} no validation)", self.passed_validated, unvalidated)
-                } else {
-                    String::new()
-                });
-            println!("Expected Fail:    {}", self.expected_fail);
-            println!("Unexpected Pass:  {}", self.unexpected_pass);
-            println!("Validation Fail:  {}", self.validation_failed);
-            println!("Failed:           {}", self.failed);
-            println!("Unknown:          {}", self.unknown);
-            println!("Timeout:          {}", self.timeout);
-            println!("Load Error:       {}", self.load_error);
+
+            let chess_emu_attempted = self.chess_emu_passed + self.chess_emu_validation_fail
+                + self.chess_emu_expected_fail + self.chess_emu_unexpected_pass
+                + self.chess_emu_failed + self.chess_emu_unknown
+                + self.chess_emu_timeout + self.chess_emu_load_error;
+            let has_chess_emu = chess_emu_attempted > 0;
+
+            if has_chess_emu {
+                // Per-compiler breakdown when Chess emulator is active
+                println!("\n--- Peano Emulator ---");
+            }
+            self.print_emu_section(effective,
+                self.passed, self.passed_validated,
+                self.expected_fail, self.unexpected_pass,
+                self.validation_failed, self.failed,
+                self.unknown, self.timeout, self.load_error);
+
+            if has_chess_emu {
+                println!("\n--- Chess Emulator ---");
+                self.print_emu_section(effective,
+                    self.chess_emu_passed, self.chess_emu_passed_validated,
+                    self.chess_emu_expected_fail, self.chess_emu_unexpected_pass,
+                    self.chess_emu_validation_fail, self.chess_emu_failed,
+                    self.chess_emu_unknown, self.chess_emu_timeout,
+                    self.chess_emu_load_error);
+            }
         }
 
         // Per-test warnings
@@ -255,24 +373,16 @@ impl RunStats {
         if self.peano_hw_attempted > 0 || self.chess_hw_attempted > 0 {
             println!("\n=== LIVE HARDWARE EXECUTION ===");
             if self.peano_hw_attempted > 0 {
-                let mut detail = format!("{}/{} pass", self.peano_hw_pass, self.peano_hw_attempted);
-                if self.peano_hw_fail > 0 {
-                    detail.push_str(&format!(", {} fail", self.peano_hw_fail));
-                }
-                if self.peano_hw_error > 0 {
-                    detail.push_str(&format!(", {} error", self.peano_hw_error));
-                }
-                println!("Peano HW:         {}", detail);
+                self.print_hw_line("Peano HW:",
+                    self.peano_hw_pass, self.peano_hw_attempted,
+                    self.peano_hw_fail, self.peano_hw_error,
+                    self.peano_hw_expected_fail, self.peano_hw_unexpected_pass);
             }
             if self.chess_hw_attempted > 0 {
-                let mut detail = format!("{}/{} pass", self.chess_hw_pass, self.chess_hw_attempted);
-                if self.chess_hw_fail > 0 {
-                    detail.push_str(&format!(", {} fail", self.chess_hw_fail));
-                }
-                if self.chess_hw_error > 0 {
-                    detail.push_str(&format!(", {} error", self.chess_hw_error));
-                }
-                println!("Chess HW:         {}", detail);
+                self.print_hw_line("Chess HW:",
+                    self.chess_hw_pass, self.chess_hw_attempted,
+                    self.chess_hw_fail, self.chess_hw_error,
+                    self.chess_hw_expected_fail, self.chess_hw_unexpected_pass);
             }
         }
 
@@ -305,7 +415,12 @@ impl RunStats {
                 println!("Chess only:       {} (Peano bug?)", self.chess_only);
             }
             if self.both_fail > 0 {
-                println!("Both fail:        {} (test issue?)", self.both_fail);
+                let annotation = if self.both_fail_xfail > 0 {
+                    format!(" ({} XFAIL)", self.both_fail_xfail)
+                } else {
+                    String::new()
+                };
+                println!("Both fail:        {} (test issue?){}", self.both_fail, annotation);
             }
         }
     }

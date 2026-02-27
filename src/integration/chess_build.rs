@@ -21,6 +21,7 @@ use std::process::Command;
 
 use super::aietools::AieTools;
 use crate::config::Config;
+use crate::testing::artifacts;
 
 /// Result of a build (either Peano or Chess).
 #[derive(Debug)]
@@ -49,6 +50,8 @@ pub struct BuildOpts {
     /// command is wrapped with `nice -n <level>` to reduce scheduling
     /// priority and avoid starving the system during heavy compilation.
     pub nice: Option<i32>,
+    /// Force rebuild even if cached artifacts are fresh.
+    pub force_rebuild: bool,
 }
 
 /// Cached build environment for aiecc.py invocations.
@@ -241,8 +244,10 @@ impl BuildEnv {
 
         // Check cache: skip build if xclbin exists and is newer than source
         let xclbin_path = output_dir.join("aie.xclbin");
-        if let Some(result) = self.check_cache(mlir_source, output_dir, &xclbin_path) {
-            return Ok(result);
+        if !opts.force_rebuild {
+            if let Some(result) = self.check_cache(mlir_source, output_dir, &xclbin_path) {
+                return Ok(result);
+            }
         }
 
         // Create output directory
@@ -326,15 +331,15 @@ impl BuildEnv {
                     "{} build exited with {} but xclbin was produced (partial success)",
                     compiler_label, output.status.code().unwrap_or(-1)
                 );
-            } else if let Some(found) = find_xclbin_in(output_dir) {
+            } else if let Some(found) = artifacts::collect_xclbins(output_dir).into_iter().next() {
                 log::warn!(
                     "{} build exited with {} but found {} (partial success)",
                     compiler_label, output.status.code().unwrap_or(-1), found.display()
                 );
                 return Ok(BuildResult {
                     xclbin: found,
-                    insts: find_insts_in(output_dir),
-                    prj_dir: find_prj_dir(output_dir),
+                    insts: artifacts::find_insts(output_dir),
+                    prj_dir: artifacts::find_prj_dir(output_dir),
                     build_log,
                 });
             } else {
@@ -350,11 +355,11 @@ impl BuildEnv {
         // Find produced artifacts
         if !xclbin_path.exists() {
             // Try finding any xclbin in the output dir
-            if let Some(found) = find_xclbin_in(output_dir) {
+            if let Some(found) = artifacts::collect_xclbins(output_dir).into_iter().next() {
                 return Ok(BuildResult {
                     xclbin: found,
-                    insts: find_insts_in(output_dir),
-                    prj_dir: find_prj_dir(output_dir),
+                    insts: artifacts::find_insts(output_dir),
+                    prj_dir: artifacts::find_prj_dir(output_dir),
                     build_log,
                 });
             }
@@ -366,8 +371,8 @@ impl BuildEnv {
 
         Ok(BuildResult {
             xclbin: xclbin_path,
-            insts: find_insts_in(output_dir),
-            prj_dir: find_prj_dir(output_dir),
+            insts: artifacts::find_insts(output_dir),
+            prj_dir: artifacts::find_prj_dir(output_dir),
             build_log,
         })
     }
@@ -494,7 +499,7 @@ impl BuildEnv {
             if !output.status.success() {
                 // Partial success: if .prj already exists, the failed step
                 // may be ps.so compilation (known issue). Log and continue.
-                if find_prj_dir(output_dir).is_some() {
+                if artifacts::find_prj_dir(output_dir).is_some() {
                     log::warn!(
                         "Build step {}/{} exited with {} but .prj exists (partial success)",
                         step_idx + 1, step_count,
@@ -516,7 +521,7 @@ impl BuildEnv {
         }
 
         // Find the .prj directory produced by aiecc.py
-        let prj_dir = find_prj_dir(output_dir).ok_or_else(|| format!(
+        let prj_dir = artifacts::find_prj_dir(output_dir).ok_or_else(|| format!(
             "Build completed but no .prj directory found in {}",
             output_dir.display()
         ))?;
@@ -549,10 +554,12 @@ impl BuildEnv {
         opts: &BuildOpts,
     ) -> Result<BuildResult, String> {
         // Check cache: skip build if xclbin exists and is newer than entry file
-        for name in &["aie.xclbin", "final.xclbin"] {
-            let path = output_dir.join(name);
-            if let Some(result) = self.check_npu_test_cache(test, output_dir, &path) {
-                return Ok(result);
+        if !opts.force_rebuild {
+            for name in &["aie.xclbin", "final.xclbin"] {
+                let path = output_dir.join(name);
+                if let Some(result) = self.check_npu_test_cache(test, output_dir, &path) {
+                    return Ok(result);
+                }
             }
         }
 
@@ -634,7 +641,7 @@ impl BuildEnv {
             if !output.status.success() {
                 // Partial success: if xclbin already exists, the failed step
                 // may be non-critical (e.g. ps.so compilation).
-                if find_xclbin_in(output_dir).is_some() {
+                if !artifacts::collect_xclbins(output_dir).is_empty() {
                     log::warn!(
                         "Build step {}/{} exited with {} but xclbin exists (partial success)",
                         step_idx + 1, step_count,
@@ -653,17 +660,162 @@ impl BuildEnv {
         }
 
         // Find produced artifacts
-        let xclbin = find_xclbin_in(output_dir).ok_or_else(|| format!(
+        let xclbin = artifacts::collect_xclbins(output_dir).into_iter().next().ok_or_else(|| format!(
             "{} build completed but no xclbin found in {}",
             compiler_label, output_dir.display()
         ))?;
 
         Ok(BuildResult {
             xclbin,
-            insts: find_insts_in(output_dir),
-            prj_dir: find_prj_dir(output_dir),
+            insts: artifacts::find_insts(output_dir),
+            prj_dir: artifacts::find_prj_dir(output_dir),
             build_log,
         })
+    }
+
+    /// Build a programming_example via its Makefile.
+    ///
+    /// For Peano: builds in `source_dir` (in-place, Makefile convention).
+    /// For Chess: creates a symlinked workspace in `output_dir` so the
+    /// in-place Peano build is not clobbered.
+    ///
+    /// Uses `CHESS=true|false` to select the compiler, which `makefile-common`
+    /// translates into `--xchesscc` or `--no-xchesscc` for aiecc.py.
+    pub fn build_example(
+        &self,
+        source_dir: &Path,
+        python_source: &Path,
+        output_dir: &Path,
+        opts: &BuildOpts,
+    ) -> Result<BuildResult, String> {
+        let build_dir = output_dir.join("build");
+        let xclbin_path = build_dir.join("final.xclbin");
+
+        // Check cache
+        if !opts.force_rebuild {
+            if let Some(result) = self.check_example_cache(python_source, output_dir, &xclbin_path) {
+                return Ok(result);
+            }
+        }
+
+        let compiler_label = if opts.use_chess { "Chess" } else { "Peano" };
+        log::info!(
+            "Building example with {} in {}",
+            compiler_label, output_dir.display()
+        );
+
+        // For Chess: create symlinked workspace
+        if opts.use_chess && output_dir != source_dir {
+            std::fs::create_dir_all(output_dir)
+                .map_err(|e| format!("Failed to create {}: {}", output_dir.display(), e))?;
+
+            // Symlink key files from source_dir into output_dir
+            for entry in std::fs::read_dir(source_dir)
+                .map_err(|e| format!("Failed to read {}: {}", source_dir.display(), e))?
+                .flatten()
+            {
+                let path = entry.path();
+                let name = match path.file_name() {
+                    Some(n) => n.to_os_string(),
+                    None => continue,
+                };
+                let name_str = name.to_string_lossy();
+
+                // Skip build dirs and hidden files
+                if name_str == "build" || name_str == "_build" || name_str.starts_with('.') {
+                    continue;
+                }
+
+                let dest = output_dir.join(&name);
+                if !dest.exists() {
+                    // Symlink; srcdir in Makefile follows realpath, so this works
+                    #[cfg(unix)]
+                    {
+                        let _ = std::os::unix::fs::symlink(&path, &dest);
+                    }
+                }
+            }
+        }
+
+        // Run make
+        let chess_flag = if opts.use_chess { "true" } else { "false" };
+        let mut cmd = if let Some(n) = opts.nice {
+            let mut c = Command::new("nice");
+            c.args(["-n", &n.to_string(), "make"]);
+            c
+        } else {
+            Command::new("make")
+        };
+
+        cmd.args(["-C", &output_dir.to_string_lossy()]);
+        cmd.args(["build/final.xclbin"]);
+        cmd.arg(format!("CHESS={}", chess_flag));
+        self.apply_env(&mut cmd);
+
+        let output = cmd.output()
+            .map_err(|e| format!("Failed to execute make: {}", e))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let build_log = format!("--- stdout ---\n{}\n--- stderr ---\n{}", stdout, stderr);
+
+        if !output.status.success() {
+            if xclbin_path.exists() {
+                log::warn!(
+                    "{} example build exited with {} but xclbin was produced",
+                    compiler_label, output.status.code().unwrap_or(-1)
+                );
+            } else {
+                return Err(format!(
+                    "{} example build failed (exit {}):\n{}",
+                    compiler_label,
+                    output.status.code().unwrap_or(-1),
+                    build_log
+                ));
+            }
+        }
+
+        if !xclbin_path.exists() {
+            return Err(format!(
+                "{} example build completed but no xclbin found at {}",
+                compiler_label, xclbin_path.display()
+            ));
+        }
+
+        Ok(BuildResult {
+            xclbin: xclbin_path,
+            insts: artifacts::find_insts(&build_dir),
+            prj_dir: artifacts::find_prj_dir(&build_dir),
+            build_log,
+        })
+    }
+
+    /// Check if a cached example build result exists and is still valid.
+    fn check_example_cache(
+        &self,
+        python_source: &Path,
+        _output_dir: &Path,
+        xclbin_path: &Path,
+    ) -> Option<BuildResult> {
+        if !xclbin_path.exists() {
+            return None;
+        }
+
+        let xclbin_modified = xclbin_path.metadata().ok()?.modified().ok()?;
+        let source_modified = python_source.metadata().ok()?.modified().ok()?;
+
+        if is_cache_valid(xclbin_modified, source_modified, self.toolchain_mtime) {
+            let build_dir = xclbin_path.parent()?;
+            log::info!("Using cached example build at {}", xclbin_path.display());
+            Some(BuildResult {
+                xclbin: xclbin_path.to_path_buf(),
+                insts: artifacts::find_insts(build_dir),
+                prj_dir: artifacts::find_prj_dir(build_dir),
+                build_log: "(cached)".to_string(),
+            })
+        } else {
+            None
+        }
     }
 
     /// Check if a cached NPU test build result exists and is still valid.
@@ -687,8 +839,8 @@ impl BuildEnv {
             log::info!("Using cached NPU test build in {}", output_dir.display());
             Some(BuildResult {
                 xclbin: xclbin_path.to_path_buf(),
-                insts: find_insts_in(output_dir),
-                prj_dir: find_prj_dir(output_dir),
+                insts: artifacts::find_insts(output_dir),
+                prj_dir: artifacts::find_prj_dir(output_dir),
                 build_log: "(cached)".to_string(),
             })
         } else {
@@ -743,8 +895,8 @@ impl BuildEnv {
             log::info!("Using cached build in {}", output_dir.display());
             Some(BuildResult {
                 xclbin: xclbin_path.to_path_buf(),
-                insts: find_insts_in(output_dir),
-                prj_dir: find_prj_dir(output_dir),
+                insts: artifacts::find_insts(output_dir),
+                prj_dir: artifacts::find_prj_dir(output_dir),
                 build_log: "(cached)".to_string(),
             })
         } else {
@@ -761,7 +913,7 @@ impl BuildEnv {
         test: &crate::testing::unit_test::UnitTest,
         output_dir: &Path,
     ) -> Option<crate::testing::unit_test::UnitTestBuildResult> {
-        let prj_dir = find_prj_dir(output_dir)?;
+        let prj_dir = artifacts::find_prj_dir(output_dir)?;
         let ps_so = prj_dir.join("sim/ps/ps.so");
         if !ps_so.exists() {
             return None;
@@ -1021,25 +1173,8 @@ pub fn build_with_chess(
         gen_sim,
         device: device.to_string(),
         nice: None,
+        force_rebuild: false,
     })
-}
-
-/// Find the first .xclbin file in a directory.
-fn find_xclbin_in(dir: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().map_or(false, |ext| ext == "xclbin") {
-            return Some(path);
-        }
-    }
-    None
-}
-
-/// Find the first insts.bin file in a directory.
-fn find_insts_in(dir: &Path) -> Option<PathBuf> {
-    let path = dir.join("insts.bin");
-    path.exists().then_some(path)
 }
 
 /// Find ALL xclbin files in a directory, each paired with its insts file.
@@ -1068,17 +1203,7 @@ pub fn find_all_xclbin_results(
         }
     }
 
-    // Find all xclbin files in the output directory
-    let mut xclbins: Vec<PathBuf> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(output_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "xclbin") {
-                xclbins.push(path);
-            }
-        }
-    }
-    xclbins.sort();
+    let xclbins = artifacts::collect_xclbins(output_dir);
 
     let mut results = Vec::new();
     for xclbin in &xclbins {
@@ -1106,7 +1231,7 @@ pub fn find_all_xclbin_results(
             }
         } else {
             // No parsed mapping -- fall back to standard insts.bin
-            find_insts_in(output_dir)
+            artifacts::find_insts(output_dir)
         };
 
         results.push((xclbin.clone(), insts, variant));
@@ -1127,18 +1252,6 @@ fn extract_flag_value(cmd: &str, flag: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// Find a .prj directory (created by aiecc.py for aiesimulator).
-fn find_prj_dir(dir: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() && path.extension().map_or(false, |ext| ext == "prj") {
-            return Some(path);
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1154,19 +1267,13 @@ mod tests {
         }
     }
 
+    // Basic artifact helper tests moved to testing::artifacts module.
+    // These remain as integration-level checks that the imports work.
     #[test]
-    fn test_find_xclbin_in_empty_dir() {
-        assert!(find_xclbin_in(Path::new("/nonexistent")).is_none());
-    }
-
-    #[test]
-    fn test_find_prj_dir_nonexistent() {
-        assert!(find_prj_dir(Path::new("/nonexistent")).is_none());
-    }
-
-    #[test]
-    fn test_find_insts_nonexistent() {
-        assert!(find_insts_in(Path::new("/nonexistent")).is_none());
+    fn test_artifact_helpers_accessible() {
+        assert!(artifacts::collect_xclbins(Path::new("/nonexistent")).is_empty());
+        assert!(artifacts::find_prj_dir(Path::new("/nonexistent")).is_none());
+        assert!(artifacts::find_insts(Path::new("/nonexistent")).is_none());
     }
 
     #[test]
@@ -1176,10 +1283,12 @@ mod tests {
             gen_sim: false,
             device: "npu1_1col".to_string(),
             nice: None,
+            force_rebuild: false,
         };
         assert!(!opts.use_chess);
         assert!(!opts.gen_sim);
         assert_eq!(opts.device, "npu1_1col");
+        assert!(!opts.force_rebuild);
         assert!(opts.nice.is_none());
     }
 

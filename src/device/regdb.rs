@@ -1006,6 +1006,14 @@ pub struct DeviceRegLayout {
     /// MemTile DMA channel status field layout
     pub memtile_status: StatusFieldLayout,
 
+    // -- Lock value field (derived from Lock0_value.Lock_value) --
+    /// Width of the Lock_value field in bits (6 for AIE2).
+    pub lock_value_width: u8,
+    /// Mask for the Lock_value field: `(1 << width) - 1`.
+    pub lock_value_mask: u32,
+    /// Sign bit position within the Lock_value field: `width - 1`.
+    pub lock_value_sign_bit: u8,
+
     // -- Compute tile lock layout (derived from Lock0_value, Lock1_value) --
     /// Lock register base offset (memory module)
     pub memory_lock_base: u32,
@@ -1097,6 +1105,22 @@ impl DeviceRegLayout {
     /// Derives structural constants (base addresses, strides) from register
     /// offsets. For example, the BD base is DMA_BD0_0's offset, and the BD
     /// stride is DMA_BD1_0 - DMA_BD0_0. This eliminates hand-coded constants.
+    /// Extract and sign-extend a lock value from a raw register word.
+    ///
+    /// Uses the Lock_value field width from the register database (6 bits for
+    /// AIE2) to mask and sign-extend correctly. This is the single source of
+    /// truth for lock value extraction -- use this instead of hardcoded masks.
+    #[inline]
+    pub fn sign_extend_lock_value(&self, raw: u32) -> i8 {
+        let masked = (raw & self.lock_value_mask) as u8;
+        if masked & (1 << self.lock_value_sign_bit) != 0 {
+            // Sign-extend: set all bits above the field width
+            masked as i8 | !(self.lock_value_mask as i8)
+        } else {
+            masked as i8
+        }
+    }
+
     pub fn from_regdb(db: RegisterDb) -> Result<Self, String> {
         let memory_bd = BdFieldLayout::from_regdb(&db, "memory")?;
         let memory_channel = ChannelFieldLayout::from_regdb(&db, "memory")?;
@@ -1113,6 +1137,15 @@ impl DeviceRegLayout {
                 .ok_or_else(|| format!("{}.{} not found", module, reg))
                 .map(|r| r.offset)
         };
+
+        // -- Lock_value field width (shared across all tile types) --
+        let lock_value_field = db.module("memory")
+            .and_then(|m| m.register("Lock0_value"))
+            .and_then(|r| r.field("Lock_value"))
+            .ok_or_else(|| "memory.Lock0_value.Lock_value field not found".to_string())?;
+        let lock_value_width = lock_value_field.width;
+        let lock_value_mask = lock_value_field.mask;
+        let lock_value_sign_bit = lock_value_width - 1;
 
         // -- Compute tile locks --
         let memory_lock_base = reg_offset("memory", "Lock0_value")?;
@@ -1190,6 +1223,9 @@ impl DeviceRegLayout {
             memtile_bd,
             memtile_channel,
             memtile_status,
+            lock_value_width,
+            lock_value_mask,
+            lock_value_sign_bit,
             memory_lock_base,
             memory_lock_stride,
             memory_locks_overflow,
@@ -1445,6 +1481,18 @@ mod tests {
         assert_eq!(layout.memory_lock_stride, 0x10);
         assert_eq!(layout.memtile_lock_base, 0xC0000);
         assert_eq!(layout.memtile_lock_stride, 0x10);
+
+        // Verify Lock_value field (data-driven from regdb)
+        assert_eq!(layout.lock_value_width, 6, "Lock_value field width");
+        assert_eq!(layout.lock_value_mask, 0x3F, "Lock_value field mask");
+        assert_eq!(layout.lock_value_sign_bit, 5, "Lock_value sign bit");
+
+        // Verify sign_extend_lock_value with known values
+        assert_eq!(layout.sign_extend_lock_value(0), 0);
+        assert_eq!(layout.sign_extend_lock_value(31), 31);    // max positive
+        assert_eq!(layout.sign_extend_lock_value(0x20), -32); // min negative
+        assert_eq!(layout.sign_extend_lock_value(0x3F), -1);  // all bits set
+        assert_eq!(layout.sign_extend_lock_value(0xFF), -1);  // extra bits masked
 
         // Verify compute tile BD layout (AM025)
         assert_eq!(layout.memory_bd_base, 0x1D000, "Compute BD base");

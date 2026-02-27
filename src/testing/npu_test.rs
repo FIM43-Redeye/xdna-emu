@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 
 use super::test_cpp_parser::BufferSpec;
 use super::native_hw::TestCppPattern;
+use crate::build_progress::{Buildable, BuiltArtifact};
+use crate::integration::chess_build::{BuildEnv, BuildOpts, BuildResult, find_all_xclbin_results};
 
 /// A single NPU test discovered from the mlir-aie source tree.
 ///
@@ -79,6 +81,86 @@ impl NpuTestSource {
     /// Whether this test is suppressed (dont_run annotation).
     pub fn is_suppressed(&self) -> bool {
         self.requires.iter().any(|r| r == "dont_run")
+    }
+}
+
+impl Buildable for NpuTestSource {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn requires_chess(&self) -> bool {
+        NpuTestSource::requires_chess(self)
+    }
+
+    fn skip_reason(&self) -> Option<&str> {
+        if self.requires_npu2() {
+            Some("Requires NPU2")
+        } else {
+            self.skip_reason.as_deref()
+        }
+    }
+
+    fn can_build(&self) -> bool {
+        !self.build_steps.is_empty()
+    }
+
+    fn build(
+        &self,
+        build_env: &BuildEnv,
+        output_dir: &Path,
+        opts: &BuildOpts,
+    ) -> Result<BuildResult, String> {
+        build_env.build_npu_test(self, output_dir, opts)
+    }
+
+    fn output_dir(&self, use_chess: bool) -> PathBuf {
+        let compiler_dir = if use_chess { "chess" } else { "peano" };
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("build")
+            .join(compiler_dir)
+            .join(&self.name)
+    }
+
+    fn collect_artifacts(
+        &self,
+        output_dir: &Path,
+        result: &BuildResult,
+    ) -> Vec<BuiltArtifact> {
+        let all = find_all_xclbin_results(output_dir, &self.build_steps);
+        let mut artifacts = Vec::new();
+
+        if all.len() <= 1 {
+            if let Some((ref xclbin, ref insts, _)) = all.first() {
+                artifacts.push(BuiltArtifact {
+                    test_name: self.name.clone(),
+                    xclbin: xclbin.clone(),
+                    insts: insts.clone(),
+                    prj_dir: result.prj_dir.clone(),
+                    build_log: result.build_log.clone(),
+                });
+            }
+        } else {
+            for (xclbin, insts, variant) in &all {
+                artifacts.push(BuiltArtifact {
+                    test_name: format!("{}/{}", self.name, variant),
+                    xclbin: xclbin.clone(),
+                    insts: insts.clone(),
+                    prj_dir: result.prj_dir.clone(),
+                    build_log: result.build_log.clone(),
+                });
+            }
+        }
+
+        artifacts
+    }
+
+    fn enrich_test(&self, test: &mut crate::testing::xclbin_suite::XclbinTest) {
+        test.buffer_spec = self.buffer_spec.clone();
+        test.skip_reason = self.skip_reason.clone();
+        test.expected_fail_reason = self.expected_fail_reason.clone();
+        test.test_cpp_pattern = self.test_cpp_pattern;
+        test.source_dir = Some(self.source_dir.clone());
     }
 }
 
@@ -212,7 +294,7 @@ fn discover_recursive(base: &Path, dir: &Path, tests: &mut Vec<NpuTestSource>) {
 ///
 /// The `aie.mlir` fallback is not a lit suffix in npu-xrt but is kept for
 /// robustness with other test trees that may use `.mlir` as their suffix.
-fn find_entry_point(dir: &Path) -> Option<(PathBuf, Annotations)> {
+pub fn find_entry_point(dir: &Path) -> Option<(PathBuf, Annotations)> {
     // 1. run.lit (highest priority -- explicit test driver)
     let run_lit = dir.join("run.lit");
     if run_lit.exists() {

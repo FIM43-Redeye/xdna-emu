@@ -30,17 +30,12 @@ use super::registers::{RegisterModule, TileAddress};
 use super::tile::{Tile, TileType};
 use crate::parser::cdo::{Cdo, CdoCommand};
 
-/// Sign-extend a 7-bit lock value from a register u32 to i8.
+/// Sign-extend a lock value from a register u32 to i8.
 ///
-/// The Lock_Value register field is bits [6:0], interpreted as a 7-bit
-/// signed integer (-64 to +63).
-fn sign_extend_lock_value(raw: u32) -> i8 {
-    let raw7 = (raw & 0x7F) as u8;
-    if raw7 & 0x40 != 0 {
-        raw7 as i8 | !0x7F_i8 // sign-extend bit 6
-    } else {
-        raw7 as i8
-    }
+/// Delegates to DeviceRegLayout::sign_extend_lock_value() which derives the
+/// field width from the AM025 register database (6 bits for AIE2).
+fn sign_extend_lock_value(reg_layout: &super::regdb::DeviceRegLayout, raw: u32) -> i8 {
+    reg_layout.sign_extend_lock_value(raw)
 }
 
 /// Statistics about CDO application.
@@ -213,12 +208,12 @@ impl DeviceState {
 
         match tile_addr.module() {
             RegisterModule::Locks => {
-                Self::write_lock_value(tile, tile_addr,
+                Self::write_lock_value(reg_layout, tile, tile_addr,
                     reg_layout.memory_lock_base, reg_layout.memory_lock_stride, value, false);
             }
 
             RegisterModule::MemTileLocks => {
-                Self::write_lock_value(tile, tile_addr,
+                Self::write_lock_value(reg_layout, tile, tile_addr,
                     reg_layout.memtile_lock_base, reg_layout.memtile_lock_stride, value, true);
             }
 
@@ -298,13 +293,13 @@ impl DeviceState {
                     let new_value = (current & !mask) | (value & mask);
                     tile.write_register(tile_addr.offset, new_value);
                 } else {
-                    Self::mask_write_lock_value(tile, tile_addr.offset,
+                    Self::mask_write_lock_value(reg_layout, tile, tile_addr.offset,
                         reg_layout.memory_lock_base, reg_layout.memory_lock_stride, mask, value);
                 }
             }
 
             RegisterModule::MemTileLocks => {
-                Self::mask_write_lock_value(tile, tile_addr.offset,
+                Self::mask_write_lock_value(reg_layout, tile, tile_addr.offset,
                     reg_layout.memtile_lock_base, reg_layout.memtile_lock_stride, mask, value);
             }
 
@@ -408,8 +403,9 @@ impl DeviceState {
     /// Write a lock value (direct write, no mask).
     ///
     /// Lock registers are 16 bytes (LOCK_STRIDE) apart per AM025.
-    /// Lock_Value field is 7-bit signed (bits 6:0).
+    /// Lock_Value field width is derived from the register database.
     fn write_lock_value(
+        reg_layout: &super::regdb::DeviceRegLayout,
         tile: &mut Tile,
         tile_addr: TileAddress,
         base: u32,
@@ -419,8 +415,7 @@ impl DeviceState {
     ) {
         let lock_idx = ((tile_addr.offset - base) / stride) as usize;
         if lock_idx < tile.locks.len() {
-            // Lock_Value field is 7-bit signed (bits 6:0)
-            let signed = sign_extend_lock_value(value);
+            let signed = sign_extend_lock_value(reg_layout, value);
             tile.locks[lock_idx].set(signed);
             if value != 0 {
                 let tile_type = if is_memtile { "MemTile" } else { "Compute" };
@@ -432,6 +427,7 @@ impl DeviceState {
 
     /// Masked write to a lock value.
     fn mask_write_lock_value(
+        reg_layout: &super::regdb::DeviceRegLayout,
         tile: &mut Tile,
         offset: u32,
         base: u32,
@@ -441,10 +437,10 @@ impl DeviceState {
     ) {
         let lock_idx = ((offset - base) / stride) as usize;
         if lock_idx < tile.locks.len() {
-            // Read current value as unsigned 7-bit representation for mask ops
-            let current_u7 = (tile.locks[lock_idx].value as u8 & 0x7F) as u32;
-            let new_raw = (current_u7 & !mask) | (value & mask);
-            let signed = sign_extend_lock_value(new_raw);
+            // Read current value in unsigned representation for mask ops
+            let current_raw = (tile.locks[lock_idx].value as u8 & reg_layout.lock_value_mask as u8) as u32;
+            let new_raw = (current_raw & !mask) | (value & mask);
+            let signed = sign_extend_lock_value(reg_layout, new_raw);
             tile.locks[lock_idx].set(signed);
         }
     }
@@ -1489,10 +1485,23 @@ mod tests {
         // Write to lock 5 in tile(1,2)
         // AIE-ML lock registers are 16 bytes apart (0x10 spacing per lock)
         let addr = TileAddress::encode(1, 2, 0x1F050); // Lock 5 = 0x1F000 + 5*0x10
-        state.write_register(addr, 42).unwrap();
 
-        let tile = state.array.tile(1, 2);
-        assert_eq!(tile.locks[5].value, 42);
+        // Lock_value field is 6-bit signed (bits [5:0], per AM025 regdb).
+        // Value 5 fits in unsigned 6-bit range -> positive.
+        state.write_register(addr, 5).unwrap();
+        assert_eq!(state.array.tile(1, 2).locks[5].value, 5);
+
+        // Value 0x3F = 63 = all 6 bits set -> sign-extends to -1.
+        state.write_register(addr, 0x3F).unwrap();
+        assert_eq!(state.array.tile(1, 2).locks[5].value, -1);
+
+        // Value 0x20 = bit 5 set -> sign-extends to -32.
+        state.write_register(addr, 0x20).unwrap();
+        assert_eq!(state.array.tile(1, 2).locks[5].value, -32);
+
+        // Value 31 = max positive in 6-bit signed.
+        state.write_register(addr, 31).unwrap();
+        assert_eq!(state.array.tile(1, 2).locks[5].value, 31);
     }
 
     #[test]

@@ -81,6 +81,7 @@ pub enum NpuInstruction {
 }
 
 /// A stream of NPU instructions parsed from binary data.
+#[derive(Debug)]
 pub struct NpuInstructionStream {
     instructions: Vec<NpuInstruction>,
 }
@@ -88,10 +89,18 @@ pub struct NpuInstructionStream {
 impl NpuInstructionStream {
     /// Parse NPU instructions from binary data.
     ///
-    /// The format has a file header followed by instruction opcodes.
+    /// Accepts two formats:
+    /// - Raw binary: 16-byte header (magic 0x06030100) followed by opcodes
+    /// - ELF wrapper: standard ELF with `.ctrltext` section containing raw bytes
+    ///   (produced by `aiebu_asm` via `aiecc.py --aie-generate-elf`)
     pub fn parse(data: &[u8]) -> Result<Self, String> {
         if data.len() < 16 {
             return Err("NPU instruction data too short".to_string());
+        }
+
+        // Detect ELF magic (\x7FELF) and extract .ctrltext section.
+        if data.len() >= 4 && &data[..4] == b"\x7fELF" {
+            return Self::parse_elf(data);
         }
 
         let mut cursor = Cursor::new(data);
@@ -145,6 +154,94 @@ impl NpuInstructionStream {
         }
 
         Ok(Self { instructions })
+    }
+
+    /// Extract raw NPU instructions from an ELF wrapper.
+    ///
+    /// XRT's `xrt::elf` API uses ELF files produced by `aiebu_asm`. The raw
+    /// NPU instruction bytes live in the `.ctrltext` section (PROGBITS,
+    /// ALLOC|EXECUTE). We extract that section and parse it as raw binary.
+    ///
+    /// These ELFs are non-standard (repurposed e_machine, unusual PHDR layout)
+    /// so we parse only the ELF header and section headers rather than using
+    /// goblin's full parser which rejects them.
+    fn parse_elf(data: &[u8]) -> Result<Self, String> {
+        use goblin::elf32::header::{Header as Elf32Header, SIZEOF_EHDR};
+        use goblin::elf32::section_header::SectionHeader;
+
+        if data.len() < SIZEOF_EHDR {
+            return Err("Instruction ELF too small for ELF32 header".to_string());
+        }
+
+        let header = Elf32Header::from_bytes(
+            data[..SIZEOF_EHDR]
+                .try_into()
+                .map_err(|_| "Instruction ELF header size mismatch")?,
+        );
+
+        let shoff = header.e_shoff as usize;
+        let shnum = header.e_shnum as usize;
+        let shentsize = header.e_shentsize as usize;
+        let shstrndx = header.e_shstrndx as usize;
+
+        if shentsize == 0 || shnum == 0 {
+            return Err("Instruction ELF has no section headers".to_string());
+        }
+
+        let shdr_end = shoff + shnum * shentsize;
+        if shdr_end > data.len() {
+            return Err(format!(
+                "Section headers extend past end of ELF (need {}, have {})",
+                shdr_end, data.len()
+            ));
+        }
+
+        let shdrs = SectionHeader::from_bytes(&data[shoff..shdr_end], shnum);
+
+        // Locate the section name string table.
+        if shstrndx >= shnum {
+            return Err("Invalid e_shstrndx".to_string());
+        }
+        let strtab_sh = &shdrs[shstrndx];
+        let strtab_off = strtab_sh.sh_offset as usize;
+        let strtab_size = strtab_sh.sh_size as usize;
+        if strtab_off + strtab_size > data.len() {
+            return Err("Section string table extends past end of ELF".to_string());
+        }
+        let strtab = &data[strtab_off..strtab_off + strtab_size];
+
+        // Find .ctrltext by name.
+        for sh in &shdrs {
+            let name_off = sh.sh_name as usize;
+            if name_off >= strtab.len() {
+                continue;
+            }
+            let name_end = strtab[name_off..]
+                .iter()
+                .position(|&b| b == 0)
+                .map_or(strtab.len(), |p| name_off + p);
+            let name = std::str::from_utf8(&strtab[name_off..name_end]).unwrap_or("");
+
+            if name == ".ctrltext" {
+                let offset = sh.sh_offset as usize;
+                let size = sh.sh_size as usize;
+                if offset + size > data.len() {
+                    return Err(format!(
+                        ".ctrltext section extends past end of ELF \
+                         (offset={}, size={}, file={})",
+                        offset, size, data.len()
+                    ));
+                }
+                let ctrltext = &data[offset..offset + size];
+                log::info!(
+                    "Extracted {} bytes from .ctrltext section in instruction ELF",
+                    size
+                );
+                return Self::parse(ctrltext);
+            }
+        }
+
+        Err("Instruction ELF has no .ctrltext section".to_string())
     }
 
     /// Parse a single instruction from the cursor.
@@ -373,6 +470,157 @@ mod tests {
     fn test_parse_empty() {
         let result = NpuInstructionStream::parse(&[]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_elf_magic_triggers_elf_path() {
+        // A truncated ELF that starts with \x7FELF but isn't valid.
+        let data = b"\x7fELF\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        let result = NpuInstructionStream::parse(data);
+        assert!(result.is_err());
+        // Should complain about ELF parsing, not about "Unknown NPU instruction magic"
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("ELF") || err.contains("elf"),
+            "Expected ELF-related error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_elf_no_ctrltext() {
+        // Build a minimal valid ELF32 LE with no .ctrltext section.
+        let elf = build_minimal_elf32(None);
+        let result = NpuInstructionStream::parse(&elf);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("no .ctrltext"),
+            "Expected missing .ctrltext error"
+        );
+    }
+
+    #[test]
+    fn test_parse_elf_with_ctrltext() {
+        // Build a minimal raw NPU instruction stream (header only, 0 ops).
+        let raw_npu: Vec<u8> = vec![
+            0x00, 0x01, 0x03, 0x06, // magic LE = 0x06030100
+            0x00, 0x00, 0x00, 0x00, // flags
+            0x00, 0x00, 0x00, 0x00, // num_ops = 0
+            0x10, 0x00, 0x00, 0x00, // total_size = 16
+        ];
+        let elf = build_minimal_elf32(Some(&raw_npu));
+        let result = NpuInstructionStream::parse(&elf);
+        assert!(result.is_ok(), "ELF parse failed: {:?}", result.err());
+        assert_eq!(result.unwrap().len(), 0);
+    }
+
+    /// Build a minimal ELF32 little-endian file, optionally with a
+    /// `.ctrltext` section containing `ctrltext_data`.
+    fn build_minimal_elf32(ctrltext_data: Option<&[u8]>) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // String table: \0 + ".shstrtab\0" + optional ".ctrltext\0"
+        let mut strtab = vec![0u8]; // index 0 = empty
+        let shstrtab_name_idx = strtab.len();
+        strtab.extend_from_slice(b".shstrtab\0");
+        let ctrltext_name_idx = if ctrltext_data.is_some() {
+            let idx = strtab.len();
+            strtab.extend_from_slice(b".ctrltext\0");
+            idx
+        } else {
+            0
+        };
+
+        // Section count: null + .shstrtab + optional .ctrltext
+        let num_sections: u16 = if ctrltext_data.is_some() { 3 } else { 2 };
+        let shentsize: u16 = 40; // sizeof(Elf32_Shdr)
+
+        // Layout: ELF header (52) | ctrltext data | strtab | section headers
+        let ehdr_size: usize = 52;
+        let ctrltext_len = ctrltext_data.map_or(0, |d| d.len());
+        let ctrltext_offset = ehdr_size;
+        let strtab_offset = ctrltext_offset + ctrltext_len;
+        let shdr_offset = strtab_offset + strtab.len();
+
+        // ELF header (52 bytes)
+        buf.extend_from_slice(b"\x7fELF");       // e_ident[0..4]: magic
+        buf.push(1);                               // EI_CLASS: ELFCLASS32
+        buf.push(1);                               // EI_DATA: ELFDATA2LSB
+        buf.push(1);                               // EI_VERSION: EV_CURRENT
+        buf.extend_from_slice(&[0; 9]);             // EI_PAD
+        buf.extend_from_slice(&2u16.to_le_bytes()); // e_type: ET_EXEC
+        buf.extend_from_slice(&0u16.to_le_bytes()); // e_machine
+        buf.extend_from_slice(&1u32.to_le_bytes()); // e_version
+        buf.extend_from_slice(&0u32.to_le_bytes()); // e_entry
+        buf.extend_from_slice(&0u32.to_le_bytes()); // e_phoff
+        buf.extend_from_slice(&(shdr_offset as u32).to_le_bytes()); // e_shoff
+        buf.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+        buf.extend_from_slice(&(ehdr_size as u16).to_le_bytes()); // e_ehsize
+        buf.extend_from_slice(&0u16.to_le_bytes()); // e_phentsize
+        buf.extend_from_slice(&0u16.to_le_bytes()); // e_phnum
+        buf.extend_from_slice(&shentsize.to_le_bytes()); // e_shentsize
+        buf.extend_from_slice(&num_sections.to_le_bytes()); // e_shnum
+        buf.extend_from_slice(&1u16.to_le_bytes()); // e_shstrndx = 1
+
+        assert_eq!(buf.len(), ehdr_size);
+
+        // .ctrltext data (if present)
+        if let Some(data) = ctrltext_data {
+            buf.extend_from_slice(data);
+        }
+
+        // String table content
+        buf.extend_from_slice(&strtab);
+
+        // Section headers
+        assert_eq!(buf.len(), shdr_offset);
+
+        // SHdr 0: null section (40 zero bytes)
+        buf.extend_from_slice(&[0u8; 40]);
+
+        // SHdr 1: .shstrtab
+        buf.extend_from_slice(&(shstrtab_name_idx as u32).to_le_bytes()); // sh_name
+        buf.extend_from_slice(&3u32.to_le_bytes()); // sh_type = SHT_STRTAB
+        buf.extend_from_slice(&0u32.to_le_bytes()); // sh_flags
+        buf.extend_from_slice(&0u32.to_le_bytes()); // sh_addr
+        buf.extend_from_slice(&(strtab_offset as u32).to_le_bytes()); // sh_offset
+        buf.extend_from_slice(&(strtab.len() as u32).to_le_bytes()); // sh_size
+        buf.extend_from_slice(&0u32.to_le_bytes()); // sh_link
+        buf.extend_from_slice(&0u32.to_le_bytes()); // sh_info
+        buf.extend_from_slice(&1u32.to_le_bytes()); // sh_addralign
+        buf.extend_from_slice(&0u32.to_le_bytes()); // sh_entsize
+
+        // SHdr 2: .ctrltext (if present)
+        if ctrltext_data.is_some() {
+            buf.extend_from_slice(&(ctrltext_name_idx as u32).to_le_bytes()); // sh_name
+            buf.extend_from_slice(&1u32.to_le_bytes()); // sh_type = SHT_PROGBITS
+            buf.extend_from_slice(&6u32.to_le_bytes()); // sh_flags = ALLOC|EXEC
+            buf.extend_from_slice(&0u32.to_le_bytes()); // sh_addr
+            buf.extend_from_slice(&(ctrltext_offset as u32).to_le_bytes()); // sh_offset
+            buf.extend_from_slice(&(ctrltext_len as u32).to_le_bytes()); // sh_size
+            buf.extend_from_slice(&0u32.to_le_bytes()); // sh_link
+            buf.extend_from_slice(&0u32.to_le_bytes()); // sh_info
+            buf.extend_from_slice(&1u32.to_le_bytes()); // sh_addralign
+            buf.extend_from_slice(&0u32.to_le_bytes()); // sh_entsize
+        }
+
+        buf
+    }
+
+    #[test]
+    fn test_parse_real_insts_elf() {
+        // If a build artifact exists, verify we can parse the real thing.
+        let elf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("build/peano/add_one_objFifo_elf/insts.elf");
+        if !elf_path.exists() {
+            eprintln!("Skipping: {} not found", elf_path.display());
+            return;
+        }
+        let data = std::fs::read(&elf_path).unwrap();
+        let result = NpuInstructionStream::parse(&data);
+        assert!(result.is_ok(), "Failed to parse real insts.elf: {:?}", result.err());
+        let stream = result.unwrap();
+        assert!(stream.len() > 0, "Expected non-empty instruction stream from real ELF");
     }
 
     #[test]

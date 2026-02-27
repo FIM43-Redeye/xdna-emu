@@ -25,10 +25,7 @@ use std::time::Instant;
 
 use crossterm::{cursor, execute, style, terminal};
 
-use crate::integration::chess_build::{
-    BuildEnv, BuildOpts, BuildResult, find_all_xclbin_results,
-};
-use crate::testing::npu_test::NpuTestSource;
+use crate::integration::chess_build::{BuildEnv, BuildOpts, BuildResult};
 use crate::testing::xclbin_suite::{Compiler, XclbinTest};
 
 // ---------------------------------------------------------------------------
@@ -126,6 +123,53 @@ impl CellState {
             },
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Buildable trait
+// ---------------------------------------------------------------------------
+
+/// Trait for anything the parallel build system can build.
+///
+/// Implementations provide the build-specific logic (npu-xrt RUN lines
+/// vs programming_example Makefiles vs future sources), while the
+/// orchestrator handles parallelism, progress display, and result collection.
+pub trait Buildable: Send + Sync {
+    /// Human-readable test name (used in display and result keys).
+    fn name(&self) -> &str;
+
+    /// Whether this test requires Chess (and cannot use Peano).
+    fn requires_chess(&self) -> bool;
+
+    /// Whether this test should be skipped entirely (e.g. requires NPU2).
+    fn skip_reason(&self) -> Option<&str>;
+
+    /// Whether this test has anything to build (false = no build steps).
+    fn can_build(&self) -> bool;
+
+    /// Execute the build for a given compiler.
+    ///
+    /// `output_dir` is determined by the orchestrator (compiler-specific).
+    /// `build_env` provides environment, cache checks, and tool paths.
+    fn build(
+        &self,
+        build_env: &BuildEnv,
+        output_dir: &Path,
+        opts: &BuildOpts,
+    ) -> Result<BuildResult, String>;
+
+    /// Determine the output directory for this test and compiler.
+    fn output_dir(&self, use_chess: bool) -> PathBuf;
+
+    /// Collect result artifacts from a successful build.
+    fn collect_artifacts(
+        &self,
+        output_dir: &Path,
+        result: &BuildResult,
+    ) -> Vec<BuiltArtifact>;
+
+    /// Enrich an XclbinTest with source-level metadata (buffer_spec, etc.).
+    fn enrich_test(&self, test: &mut XclbinTest);
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +418,8 @@ pub struct ParallelBuildConfig {
     pub gen_sim: bool,
     /// Use Chess as the primary compiler for ALL tests (skip Peano).
     pub chess_only: bool,
+    /// Force rebuild even if cached artifacts are fresh.
+    pub force_rebuild: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -390,16 +436,16 @@ pub struct ParallelBuildConfig {
 /// - `config.verbose` is true
 /// - stdout is not a terminal (piped)
 /// - terminal is too small for the grid
-pub fn run_parallel_builds(
+pub fn run_parallel_builds<T: Buildable>(
     build_env: &BuildEnv,
-    tests: &[&NpuTestSource],
+    tests: &[&T],
     chess_available: bool,
     config: &ParallelBuildConfig,
 ) -> ParallelBuildResult {
     let start_time = Instant::now();
 
     // Categorize tests and count skips
-    let mut skipped_npu2 = 0usize;
+    let mut skipped_reason = 0usize;
     let mut skipped_no_chess = 0usize;
     let mut skipped_no_steps = 0usize;
 
@@ -408,11 +454,11 @@ pub fn run_parallel_builds(
     let mut work_queue: Vec<BuildTask> = Vec::new();
 
     for (test_idx, test) in tests.iter().enumerate() {
-        if test.requires_npu2() {
-            skipped_npu2 += 1;
+        if test.skip_reason().is_some() {
+            skipped_reason += 1;
             continue;
         }
-        if test.build_steps.is_empty() {
+        if !test.can_build() {
             skipped_no_steps += 1;
             continue;
         }
@@ -433,7 +479,7 @@ pub fn run_parallel_builds(
         };
 
         cells.push(CellState {
-            name: test.name.clone(),
+            name: test.name().to_string(),
             tracks,
             peano: TrackResult::NotStarted,
             chess: TrackResult::NotStarted,
@@ -472,21 +518,24 @@ pub fn run_parallel_builds(
 
     let total_buildable = cells.len();
     let total_builds = work_queue.len();
-    let total_skipped = skipped_npu2 + skipped_no_chess + skipped_no_steps;
+    let total_skipped = skipped_reason + skipped_no_chess + skipped_no_steps;
 
     println!("\n=== BUILD PHASE ===");
     if config.chess_only {
         println!("Mode: --chess-only (all tests use Chess compiler)");
     }
+    if config.force_rebuild {
+        println!("Mode: --rebuild (forcing all rebuilds)");
+    }
     println!(
         "{} tests ({} builds: {} primary, {} comparison), {} skipped \
-         (npu2: {}, no chess: {}, no steps: {})",
+         (skip-reason: {}, no chess: {}, no steps: {})",
         total_buildable,
         total_builds,
         total_buildable,
         total_builds - total_buildable,
         total_skipped,
-        skipped_npu2,
+        skipped_reason,
         skipped_no_chess,
         skipped_no_steps,
     );
@@ -515,16 +564,17 @@ pub fn run_parallel_builds(
     let work_counter = AtomicUsize::new(0);
     let results: Mutex<Vec<BuildTaskResult>> = Mutex::new(Vec::with_capacity(total_builds));
     let nice = if config.nice_level > 0 { Some(config.nice_level) } else { None };
+    let force_rebuild = config.force_rebuild;
 
     if use_grid {
         run_with_grid(
             build_env, tests, &progress, &work_queue, &work_counter,
-            &results, thread_count, nice,
+            &results, thread_count, nice, force_rebuild,
         );
     } else {
         run_verbose(
             build_env, tests, &progress, &work_queue, &work_counter,
-            &results, thread_count, nice, config.verbose,
+            &results, thread_count, nice, config.verbose, force_rebuild,
         );
     }
 
@@ -546,15 +596,16 @@ fn grid_fits_terminal(layout: &GridLayout) -> bool {
 }
 
 /// Run builds with the grid display.
-fn run_with_grid(
+fn run_with_grid<T: Buildable>(
     build_env: &BuildEnv,
-    tests: &[&NpuTestSource],
+    tests: &[&T],
     progress: &BuildProgress,
     work_queue: &[BuildTask],
     work_counter: &AtomicUsize,
     results: &Mutex<Vec<BuildTaskResult>>,
     thread_count: usize,
     nice: Option<i32>,
+    force_rebuild: bool,
 ) {
     let mut stdout = io::stdout();
 
@@ -587,7 +638,7 @@ fn run_with_grid(
                 s.spawn(|| {
                     run_worker(
                         build_env, tests, progress, work_queue,
-                        work_counter, results, nice,
+                        work_counter, results, nice, force_rebuild,
                     );
                 })
             })
@@ -609,9 +660,9 @@ fn run_with_grid(
 }
 
 /// Run builds with verbose line-by-line output (non-TTY or -v).
-fn run_verbose(
+fn run_verbose<T: Buildable>(
     build_env: &BuildEnv,
-    tests: &[&NpuTestSource],
+    tests: &[&T],
     progress: &BuildProgress,
     work_queue: &[BuildTask],
     work_counter: &AtomicUsize,
@@ -619,12 +670,14 @@ fn run_verbose(
     thread_count: usize,
     nice: Option<i32>,
     is_verbose: bool,
+    force_rebuild: bool,
 ) {
     if is_verbose || thread_count <= 1 {
         // Sequential verbose: build one at a time with immediate output
         for task in work_queue {
             let task_start = Instant::now();
             let test = &tests[task.test_idx];
+            let name = test.name();
             let track_name = match task.track {
                 Track::Peano => "Peano",
                 Track::Chess => "Chess",
@@ -632,15 +685,16 @@ fn run_verbose(
 
             progress.update_cell(task.cell_idx, task.track, TrackResult::Building);
 
-            let output_dir = build_output_dir(test, task.use_chess);
-            match build_env.build_npu_test(
-                test,
+            let output_dir = test.output_dir(task.use_chess);
+            match test.build(
+                build_env,
                 &output_dir,
                 &BuildOpts {
                     use_chess: task.use_chess,
                     gen_sim: task.gen_sim,
                     device: String::new(),
                     nice,
+                    force_rebuild,
                 },
             ) {
                 Ok(result) => {
@@ -652,7 +706,7 @@ fn run_verbose(
                         "[{:2}/{}] {:40} {} {} ({:.1}s)",
                         completed,
                         progress.total_builds,
-                        &test.name[..test.name.len().min(40)],
+                        &name[..name.len().min(40)],
                         track_name,
                         label,
                         elapsed.as_secs_f64(),
@@ -660,7 +714,7 @@ fn run_verbose(
 
                     progress.update_cell(task.cell_idx, task.track, TrackResult::Passed);
 
-                    let artifacts = collect_build_artifacts(test, &output_dir, &result);
+                    let artifacts = test.collect_artifacts(&output_dir, &result);
                     results.lock().unwrap().push(BuildTaskResult::Success {
                         track: task.track,
                         artifacts,
@@ -674,7 +728,7 @@ fn run_verbose(
                         "[{:2}/{}] {:40} {} FAILED ({:.1}s): {}",
                         completed,
                         progress.total_builds,
-                        &test.name[..test.name.len().min(40)],
+                        &name[..name.len().min(40)],
                         track_name,
                         elapsed.as_secs_f64(),
                         &msg[..msg.len().min(60)],
@@ -696,7 +750,7 @@ fn run_verbose(
         std::thread::scope(|s| {
             for _ in 0..thread_count {
                 s.spawn(|| {
-                    run_worker(build_env, tests, progress, work_queue, work_counter, results, nice);
+                    run_worker(build_env, tests, progress, work_queue, work_counter, results, nice, force_rebuild);
                 });
             }
         });
@@ -705,14 +759,15 @@ fn run_verbose(
 }
 
 /// Worker thread body: pull tasks from atomic counter, execute builds.
-fn run_worker(
+fn run_worker<T: Buildable>(
     build_env: &BuildEnv,
-    tests: &[&NpuTestSource],
+    tests: &[&T],
     progress: &BuildProgress,
     work_queue: &[BuildTask],
     work_counter: &AtomicUsize,
     results: &Mutex<Vec<BuildTaskResult>>,
     nice: Option<i32>,
+    force_rebuild: bool,
 ) {
     loop {
         let task_idx = work_counter.fetch_add(1, Ordering::SeqCst);
@@ -725,22 +780,23 @@ fn run_worker(
 
         progress.update_cell(task.cell_idx, task.track, TrackResult::Building);
 
-        let output_dir = build_output_dir(test, task.use_chess);
-        match build_env.build_npu_test(
-            test,
+        let output_dir = test.output_dir(task.use_chess);
+        match test.build(
+            build_env,
             &output_dir,
             &BuildOpts {
                 use_chess: task.use_chess,
                 gen_sim: task.gen_sim,
                 device: String::new(),
                 nice,
+                force_rebuild,
             },
         ) {
             Ok(result) => {
                 progress.update_cell(task.cell_idx, task.track, TrackResult::Passed);
                 progress.completed.fetch_add(1, Ordering::Relaxed);
 
-                let artifacts = collect_build_artifacts(test, &output_dir, &result);
+                let artifacts = test.collect_artifacts(&output_dir, &result);
                 results.lock().unwrap().push(BuildTaskResult::Success {
                     track: task.track,
                     artifacts,
@@ -756,57 +812,10 @@ fn run_worker(
     }
 }
 
-/// Determine the output directory for a build.
-fn build_output_dir(test: &NpuTestSource, use_chess: bool) -> PathBuf {
-    let compiler_dir = if use_chess { "chess" } else { "peano" };
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("build")
-        .join(compiler_dir)
-        .join(&test.name)
-}
-
-/// Collect build artifacts from a successful build result.
-///
-/// Handles both single-xclbin and multi-variant cases.
-fn collect_build_artifacts(
-    test: &NpuTestSource,
-    output_dir: &Path,
-    result: &BuildResult,
-) -> Vec<BuiltArtifact> {
-    let all = find_all_xclbin_results(output_dir, &test.build_steps);
-    let mut artifacts = Vec::new();
-
-    if all.len() <= 1 {
-        // Single xclbin (common case)
-        if let Some((ref xclbin, ref insts, _)) = all.first() {
-            artifacts.push(BuiltArtifact {
-                test_name: test.name.clone(),
-                xclbin: xclbin.clone(),
-                insts: insts.clone(),
-                prj_dir: result.prj_dir.clone(),
-                build_log: result.build_log.clone(),
-            });
-        }
-    } else {
-        // Multiple xclbins (multi-variant tests)
-        for (xclbin, insts, variant) in &all {
-            artifacts.push(BuiltArtifact {
-                test_name: format!("{}/{}", test.name, variant),
-                xclbin: xclbin.clone(),
-                insts: insts.clone(),
-                prj_dir: result.prj_dir.clone(),
-                build_log: result.build_log.clone(),
-            });
-        }
-    }
-
-    artifacts
-}
-
 /// Collect parallel build results into the structures the test runner expects.
-fn collect_results(
+fn collect_results<T: Buildable>(
     task_results: &[BuildTaskResult],
-    tests: &[&NpuTestSource],
+    tests: &[&T],
     total_builds: usize,
     start_time: Instant,
 ) -> ParallelBuildResult {
@@ -826,16 +835,12 @@ fn collect_results(
                             t.name = artifact.test_name.clone();
                             t.insts_path = artifact.insts.clone();
                             t.compiler = Some(Compiler::Peano);
-                            // Find the original test to get the buffer spec and overrides
+                            // Find the original test to enrich with metadata
                             if let Some(src) = tests.iter().find(|s| {
-                                artifact.test_name == s.name
-                                    || artifact.test_name.starts_with(&format!("{}/", s.name))
+                                artifact.test_name == s.name()
+                                    || artifact.test_name.starts_with(&format!("{}/", s.name()))
                             }) {
-                                t.buffer_spec = src.buffer_spec.clone();
-                                t.skip_reason = src.skip_reason.clone();
-                                t.expected_fail_reason = src.expected_fail_reason.clone();
-                                t.test_cpp_pattern = src.test_cpp_pattern;
-                                t.source_dir = Some(src.source_dir.clone());
+                                src.enrich_test(&mut t);
                             }
                             primary_tests.push(t);
                         }
@@ -847,8 +852,8 @@ fn collect_results(
                             // into primary_tests. For chess comparison builds
                             // (Both track), they go into chess_artifacts.
                             let is_primary = tests.iter().any(|s| {
-                                (artifact.test_name == s.name
-                                    || artifact.test_name.starts_with(&format!("{}/", s.name)))
+                                (artifact.test_name == s.name()
+                                    || artifact.test_name.starts_with(&format!("{}/", s.name())))
                                     && s.requires_chess()
                             });
 
@@ -858,24 +863,20 @@ fn collect_results(
                                 t.insts_path = artifact.insts.clone();
                                 t.compiler = Some(Compiler::Chess);
                                 if let Some(src) = tests.iter().find(|s| {
-                                    artifact.test_name == s.name
-                                        || artifact.test_name.starts_with(&format!("{}/", s.name))
+                                    artifact.test_name == s.name()
+                                        || artifact.test_name.starts_with(&format!("{}/", s.name()))
                                 }) {
-                                    t.buffer_spec = src.buffer_spec.clone();
-                                    t.skip_reason = src.skip_reason.clone();
-                                    t.expected_fail_reason = src.expected_fail_reason.clone();
-                                    t.test_cpp_pattern = src.test_cpp_pattern;
-                                    t.source_dir = Some(src.source_dir.clone());
+                                    src.enrich_test(&mut t);
                                 }
                                 primary_tests.push(t);
                             } else {
                                 // Chess comparison artifact -- extract the base
                                 // test name (strip variant suffix if present)
                                 let base_name = if let Some(src) = tests.iter().find(|s| {
-                                    artifact.test_name == s.name
-                                        || artifact.test_name.starts_with(&format!("{}/", s.name))
+                                    artifact.test_name == s.name()
+                                        || artifact.test_name.starts_with(&format!("{}/", s.name()))
                                 }) {
-                                    src.name.clone()
+                                    src.name().to_string()
                                 } else {
                                     artifact.test_name.clone()
                                 };

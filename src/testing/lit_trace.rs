@@ -742,61 +742,19 @@ pub fn run_trace_pipeline(
     }
 }
 
-/// Discover test names from the mlir-aie npu-xrt source tree.
+/// Discover test names from the mlir-aie source tree.
 ///
-/// A test directory must contain either `aie.mlir` or `aie2.py`.
-/// Returns (test_name, source_dir) pairs sorted alphabetically.
-pub fn discover_tests(test_source_root: &Path) -> Vec<(String, PathBuf)> {
-    let mut tests = Vec::new();
-
-    let entries = match fs::read_dir(test_source_root) {
-        Ok(entries) => entries,
-        Err(e) => {
-            log::error!("Failed to read test source dir {}: {}", test_source_root.display(), e);
-            return tests;
-        }
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-
-        let has_mlir = path.join("aie.mlir").exists();
-        let has_python = path.join("aie2.py").exists();
-
-        if has_mlir || has_python {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                tests.push((name.to_string(), path.clone()));
-            }
-        }
-
-        // Check for subdirectories (nested test structure)
-        if let Ok(sub_entries) = fs::read_dir(&path) {
-            for sub_entry in sub_entries.flatten() {
-                let sub_path = sub_entry.path();
-                if !sub_path.is_dir() {
-                    continue;
-                }
-                let sub_has_mlir = sub_path.join("aie.mlir").exists();
-                let sub_has_python = sub_path.join("aie2.py").exists();
-                if sub_has_mlir || sub_has_python {
-                    // Use parent/child as the test name
-                    if let (Some(parent), Some(child)) = (
-                        path.file_name().and_then(|n| n.to_str()),
-                        sub_path.file_name().and_then(|n| n.to_str()),
-                    ) {
-                        let name = format!("{}/{}", parent, child);
-                        tests.push((name, sub_path));
-                    }
-                }
-            }
-        }
-    }
-
-    tests.sort_by(|a, b| a.0.cmp(&b.0));
-    tests
+/// Delegates to [`super::npu_test::discover`] for consistent test discovery
+/// across all runner modes. Returns `(test_name, source_dir)` pairs sorted
+/// alphabetically.
+///
+/// `mlir_aie_path` is the mlir-aie root (e.g. `../mlir-aie`), not the
+/// `test/npu-xrt/` subdirectory.
+pub fn discover_tests(mlir_aie_path: &Path) -> Vec<(String, PathBuf)> {
+    super::npu_test::discover(mlir_aie_path)
+        .into_iter()
+        .map(|t| (t.name, t.source_dir))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

@@ -243,6 +243,8 @@ pub enum SemanticOp {
     // Arithmetic
     Add,
     Sub,
+    Adc,  // Add with carry (reads carry flag before computation)
+    Sbc,  // Subtract with borrow (reads carry flag before computation)
     Mul,
     SDiv,
     UDiv,

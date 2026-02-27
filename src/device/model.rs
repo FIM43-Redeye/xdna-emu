@@ -354,6 +354,14 @@ pub fn validate_against_spec(model: &DeviceModel) -> Result<(), DeviceModelError
         mismatches.push("missing mem_tile tile type".to_string());
     }
 
+    // --- Tile type: shim_noc ---
+    if let Some(shim) = model.shim_noc_config() {
+        check!("shim_noc.num_locks", shim.num_locks, 16_u32);
+        check!("shim_noc.num_bds", shim.num_bds, 16_u32);
+    } else {
+        mismatches.push("missing shim_noc tile type".to_string());
+    }
+
     // --- Memory base addresses ---
     // These map to the AGU address regions for neighboring tile memories.
     // The values 0x40000, 0x50000, 0x60000, 0x70000 are each 64 KB apart,

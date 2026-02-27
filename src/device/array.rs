@@ -437,6 +437,28 @@ impl TileArray {
         })
     }
 
+    /// True when all DMA channels across all tiles are in terminal states
+    /// (Idle, Complete, Error, or WaitingForLock -- not Active).
+    pub fn all_dma_terminal(&self) -> bool {
+        !self.any_dma_transferring()
+    }
+
+    /// Check if any stream switch or cascade FIFO has pending data.
+    ///
+    /// Returns true if at least one stream switch has buffered words or
+    /// at least one cascade FIFO (input or output) is non-empty.
+    pub fn any_data_in_flight(&self) -> bool {
+        for tile in &self.tiles {
+            if tile.stream_switch.has_pending_data() {
+                return true;
+            }
+            if !tile.cascade_input.is_empty() || !tile.cascade_output.is_empty() {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Sum of bytes_transferred across all DMA channels in the array.
     ///
     /// This serves as a progress counter for no-progress detection (TDR),

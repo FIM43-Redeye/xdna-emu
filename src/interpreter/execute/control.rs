@@ -83,7 +83,7 @@ impl ControlUnit {
         op: &SlotOp,
         ctx: &mut ExecutionContext,
         tile: &mut Tile,
-        mem_tile_locks: Option<&mut [Lock]>,
+        mut mem_tile_locks: Option<&mut [Lock]>,
     ) -> Option<ExecuteResult> {
         match &op.op {
             Operation::Branch { condition } => {
@@ -162,16 +162,26 @@ impl ControlUnit {
 
             Operation::LockAcquire => {
                 let (raw_lock_id, expected, delta) = Self::get_lock_acquire_params(op, ctx);
-                // AIE-ML lock mapping: lock IDs 48-63 in core instructions
-                // access the local memory module's locks 0-15 (NOT the adjacent MemTile!)
-                // The memory module is part of the same compute tile - it's the 64KB data memory.
-                // Always use local tile locks - memory module locks are LOCAL to the tile
-                // The mem_tile_locks parameter is not used for core lock instructions.
-                let locks: &mut [Lock] = &mut tile.locks;
-                let _ = mem_tile_locks; // silence unused warning
-
-                let lock_id = Self::map_lock_id(raw_lock_id, locks.len());
+                // AIE-ML lock mapping (per mlir-aie getLockLocalBaseIndex):
+                // - IDs 0-15: local tile locks (South neighbor direction)
+                // - IDs 48-63: adjacent MemTile locks 0-15
+                //
+                // IDs 48-63 route to the MemTile at (col, row=1) which
+                // provides shared memory between cores in the same column.
                 let is_mem_module = raw_lock_id >= 48;
+                let (locks, lock_id) = if is_mem_module {
+                    if let Some(ref mut mt_locks) = mem_tile_locks {
+                        let id = (raw_lock_id - 48) % mt_locks.len() as u8;
+                        (&mut **mt_locks, id)
+                    } else {
+                        // Fallback: no MemTile locks provided, use local
+                        let id = Self::map_lock_id(raw_lock_id, tile.locks.len());
+                        (&mut *tile.locks, id)
+                    }
+                } else {
+                    let id = Self::map_lock_id(raw_lock_id, tile.locks.len());
+                    (&mut *tile.locks, id)
+                };
 
                 let current_value = locks[lock_id as usize].value;
                 let lock = &mut locks[lock_id as usize];
@@ -200,28 +210,31 @@ impl ControlUnit {
 
             Operation::LockRelease => {
                 let (raw_lock_id, delta) = Self::get_lock_release_params(op, ctx);
-
-                // Capture tile info before borrowing locks
                 let tile_col = tile.col;
                 let tile_row = tile.row;
-                let tile_ptr = tile as *const _ as usize;
 
-                // Always use local tile locks - memory module locks are LOCAL to the tile
-                let locks: &mut [Lock] = &mut tile.locks;
-                let _ = mem_tile_locks; // silence unused warning
-
-                let lock_id = Self::map_lock_id(raw_lock_id, locks.len());
+                // Same routing as LockAcquire: IDs 48-63 -> MemTile locks 0-15.
                 let is_mem_module = raw_lock_id >= 48;
+                let (locks, lock_id) = if is_mem_module {
+                    if let Some(ref mut mt_locks) = mem_tile_locks {
+                        let id = (raw_lock_id - 48) % mt_locks.len() as u8;
+                        (&mut **mt_locks, id)
+                    } else {
+                        let id = Self::map_lock_id(raw_lock_id, tile.locks.len());
+                        (&mut *tile.locks, id)
+                    }
+                } else {
+                    let id = Self::map_lock_id(raw_lock_id, tile.locks.len());
+                    (&mut *tile.locks, id)
+                };
 
-                let lock_ptr = &locks[lock_id as usize] as *const _ as usize;
                 let old_value = locks[lock_id as usize].value;
                 let lock = &mut locks[lock_id as usize];
 
                 // Release is non-blocking; overflow just saturates
                 lock.release_with_value(delta);
-                log::info!("LockRelease tile({},{}) raw={} mapped={} delta={} {} -> {} (mem_module={} tile_ptr=0x{:x} lock_ptr=0x{:x})",
-                    tile_col, tile_row, raw_lock_id, lock_id, delta, old_value, lock.value, is_mem_module,
-                    tile_ptr, lock_ptr);
+                log::info!("LockRelease tile({},{}) raw={} mapped={} delta={} {} -> {} (mem_module={})",
+                    tile_col, tile_row, raw_lock_id, lock_id, delta, old_value, lock.value, is_mem_module);
                 Some(ExecuteResult::Continue)
             }
 
