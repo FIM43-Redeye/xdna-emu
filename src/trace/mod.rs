@@ -33,6 +33,7 @@
 //! export_perfetto(events, &mut file)?;
 //! ```
 
+pub mod store;
 pub mod vcd;
 
 use crate::interpreter::engine::TileTracedEvent;
@@ -42,7 +43,7 @@ use std::io::Write;
 
 /// Event category for PID grouping (matches mlir-aie PacketType).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum TraceType {
+pub enum TraceType {
     Core = 0,
     Mem = 1,
 }
