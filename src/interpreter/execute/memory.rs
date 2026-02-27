@@ -1955,4 +1955,29 @@ mod tests {
         let value = MemoryUnit::read_memory(&tile, 0x00440, MemWidth::Word, None);
         assert_eq!(value, 0xABCDABCD);
     }
+
+    // === read_register_pure tests (direct, not through load/store) ===
+    //
+    // Note: core load/store instructions use the 18-bit quadrant-routed data
+    // address space (bits 17:16 = quadrant, 15:0 = offset). Register access
+    // happens through dedicated paths (CDO, lock instructions, control register
+    // writes), NOT through load/store MMIO. read_register_pure exists for those
+    // dedicated paths.
+
+    #[test]
+    fn test_read_register_pure_dma_bd() {
+        let mut tile = make_tile();
+        tile.dma_bds[0].addr_low = 0xBEEF_CAFE;
+        // Direct read_register_pure at DMA BD offset
+        assert_eq!(tile.read_register_pure(0x1D000), 0xBEEF_CAFE);
+    }
+
+    #[test]
+    fn test_read_register_pure_lock_value() {
+        let mut tile = make_tile();
+        tile.locks[3].set(7);
+        let reg_layout = crate::device::regdb::device_reg_layout();
+        let lock3_offset = reg_layout.memory_lock_base + 3 * reg_layout.memory_lock_stride;
+        assert_eq!(tile.read_register_pure(lock3_offset), 7);
+    }
 }

@@ -30,13 +30,13 @@ pub const PROGRAM_MEMORY_SIZE: usize = aie2_spec::PROGRAM_MEMORY_SIZE;
 /// Parameters for constructing a Tile with correct per-tile-type sizing.
 ///
 /// Production code derives these from `ArchConfig` (which reads mlir-aie
-/// device models). Test convenience constructors use hardcoded defaults
-/// matching NPU1/AIE2.
+/// device models). Convenience constructors also load from the device model
+/// so there is a single source of truth.
 #[derive(Debug, Clone)]
 pub struct TileParams {
     /// Data memory size in bytes (0 for shim, 64K for compute, 512K for mem tile).
     pub data_memory_size: usize,
-    /// Number of locks (0 for shim, 16 for compute, 64 for mem tile).
+    /// Number of locks (16 for shim/compute, 64 for mem tile).
     pub num_locks: usize,
     /// Number of DMA buffer descriptors (16 for compute, 48 for mem tile).
     pub num_bds: usize,
@@ -49,27 +49,78 @@ pub struct TileParams {
 }
 
 impl TileParams {
-    /// Default compute tile params (NPU1/AIE2).
+    /// NPU1/AIE2 compute tile params, loaded from device model JSON.
     pub fn compute() -> Self {
-        Self {
-            data_memory_size: 64 * 1024, num_locks: 16, num_bds: 16, num_channels: 4,
-            dma_s2mm_channels: 2, dma_mm2s_channels: 2,
-        }
+        Self::from_npu1_model(TileType::Compute)
     }
 
-    /// Default memory tile params (NPU1/AIE2).
+    /// NPU1/AIE2 memory tile params, loaded from device model JSON.
     pub fn mem_tile() -> Self {
-        Self {
-            data_memory_size: 512 * 1024, num_locks: 64, num_bds: 48, num_channels: 12,
-            dma_s2mm_channels: 6, dma_mm2s_channels: 6,
-        }
+        Self::from_npu1_model(TileType::MemTile)
     }
 
-    /// Default shim tile params.
+    /// NPU1/AIE2 shim tile params, loaded from device model JSON.
     pub fn shim() -> Self {
-        Self {
-            data_memory_size: 0, num_locks: 0, num_bds: 0, num_channels: 0,
-            dma_s2mm_channels: 2, dma_mm2s_channels: 2,
+        Self::from_npu1_model(TileType::Shim)
+    }
+
+    /// Build TileParams from the NPU1 device model for the given tile type.
+    ///
+    /// All values are extracted from `tools/aie-device-models.json` via the
+    /// same `DEVICE_MODELS` LazyLock used by the production `ModelConfig` path.
+    fn from_npu1_model(tile_type: TileType) -> Self {
+        use super::arch_config::DEVICE_MODELS;
+
+        let model = DEVICE_MODELS.npu1()
+            .expect("npu1 device not found in device model JSON");
+
+        match tile_type {
+            TileType::Compute => {
+                let c = model.core_config()
+                    .expect("core tile type missing from device model JSON");
+                let (s2mm, mm2s) = c.switchbox_ports.get("DMA")
+                    .map(|dma| (dma.slave as usize, dma.master as usize))
+                    .unwrap_or((2, 2));
+                Self {
+                    data_memory_size: model.local_memory_size as usize,
+                    num_locks: c.num_locks as usize,
+                    num_bds: c.num_bds as usize,
+                    num_channels: s2mm + mm2s,
+                    dma_s2mm_channels: s2mm,
+                    dma_mm2s_channels: mm2s,
+                }
+            }
+            TileType::MemTile => {
+                let c = model.mem_tile_config()
+                    .expect("mem_tile tile type missing from device model JSON");
+                let (s2mm, mm2s) = c.switchbox_ports.get("DMA")
+                    .map(|dma| (dma.slave as usize, dma.master as usize))
+                    .unwrap_or((6, 6));
+                Self {
+                    data_memory_size: model.mem_tile_size as usize,
+                    num_locks: c.num_locks as usize,
+                    num_bds: c.num_bds as usize,
+                    num_channels: s2mm + mm2s,
+                    dma_s2mm_channels: s2mm,
+                    dma_mm2s_channels: mm2s,
+                }
+            }
+            TileType::Shim => {
+                let c = model.shim_noc_config()
+                    .expect("shim_noc tile type missing from device model JSON");
+                let (s2mm, mm2s) = c.shim_mux_ports.get("DMA")
+                    .or_else(|| c.switchbox_ports.get("DMA"))
+                    .map(|dma| (dma.slave as usize, dma.master as usize))
+                    .unwrap_or((2, 2));
+                Self {
+                    data_memory_size: 0,
+                    num_locks: c.num_locks as usize,
+                    num_bds: c.num_bds as usize,
+                    num_channels: s2mm + mm2s,
+                    dma_s2mm_channels: s2mm,
+                    dma_mm2s_channels: mm2s,
+                }
+            }
         }
     }
 }
@@ -88,8 +139,10 @@ pub enum LockResult {
 /// Lock state.
 ///
 /// AIE2 uses semaphore locks with acquire/release semantics.
-/// Lock value is 7-bit signed (-64 to +63). Per AM025, the
-/// Lock_Value register field is bits [6:0] with sign extension.
+/// Lock value range is -64 to +63 (per aie-rt LockValLowerBound/UpperBound).
+/// The Lock_Value register field is bits [5:0] (6-bit, mask 0x3F per
+/// xaiemlgbl_params.h). Values outside the 6-bit range (-64 to -33) are
+/// valid in the logical model but alias when read back from the register.
 ///
 /// # Semaphore Model (AM025)
 ///
@@ -106,7 +159,8 @@ pub enum LockResult {
 #[repr(C)]
 pub struct Lock {
     /// Current lock value (semaphore count, -64 to +63).
-    /// 7-bit signed per AM025 Lock_Value register field.
+    /// Register field is 6-bit [5:0] (mask 0x3F), but aie-rt defines the
+    /// logical range as LockValLowerBound=-64 to LockValUpperBound=63.
     pub value: i8,
     /// Overflow flag - set when release would exceed MAX_VALUE
     pub overflow: bool,
@@ -115,14 +169,14 @@ pub struct Lock {
 }
 
 impl Lock {
-    /// Maximum lock value (7-bit signed: +63).
+    /// Maximum lock value (+63, per aie-rt LockValUpperBound).
     ///
     /// This compile-time constant is validated against the mlir-aie device
     /// model at startup (see `model::validate_against_spec()`). It is kept
     /// as a const for hot-path efficiency in lock acquire/release.
     pub const MAX_VALUE: i8 = 63;
 
-    /// Minimum lock value (7-bit signed: -64).
+    /// Minimum lock value (-64, per aie-rt LockValLowerBound).
     pub const MIN_VALUE: i8 = -64;
 
     /// Create a new lock with initial value (clamped to -64..+63)
@@ -1271,13 +1325,8 @@ impl Tile {
             let lock_id = ((offset - lock_base) / lock_stride) as usize;
             let sub_offset = (offset - lock_base) % lock_stride;
             if lock_id < self.locks.len() && sub_offset == 0 {
-                // Lock_value field is bits 6:0 (7-bit signed, -64 to +63)
-                let raw7 = (value & 0x7F) as u8;
-                let signed = if raw7 & 0x40 != 0 {
-                    raw7 as i8 | !0x7F_i8  // sign-extend bit 6
-                } else {
-                    raw7 as i8
-                };
+                // Lock_value field width derived from AM025 register database.
+                let signed = reg_layout.sign_extend_lock_value(value);
                 self.locks[lock_id].set(signed);
                 log::info!("Tile ({},{}) write_register: Lock{} = {} (raw=0x{:08X})",
                     self.col, self.row, lock_id, signed, value);
@@ -1499,6 +1548,69 @@ impl Tile {
                     5 => return bd.d1,
                     _ => {} // Fall through to register map for words 6-7
                 }
+            }
+        }
+
+        // Fall back to register map
+        self.registers.get(&offset).copied().unwrap_or(0)
+    }
+
+    /// Read a register value without side effects.
+    ///
+    /// Unlike `read_register()`, this does NOT execute lock operations.
+    /// Used for MMIO loads from the memory unit where mutable tile access
+    /// is not available during instruction execution.
+    pub fn read_register_pure(&self, offset: u32) -> u32 {
+        let reg_layout = super::regdb::device_reg_layout();
+
+        // DMA BD range: 0x1D000-0x1D1FF
+        if (0x1D000..0x1D200).contains(&offset) {
+            let bd_offset = offset - 0x1D000;
+            let bd_index = (bd_offset / 0x20) as usize;
+            let reg_in_bd = (bd_offset % 0x20) as usize / 4;
+            if bd_index < self.dma_bds.len() {
+                let bd = &self.dma_bds[bd_index];
+                return match reg_in_bd {
+                    0 => bd.addr_low,
+                    1 => bd.addr_high,
+                    2 => bd.length,
+                    3 => bd.control,
+                    4 => bd.d0,
+                    5 => bd.d1,
+                    _ => self.registers.get(&offset).copied().unwrap_or(0),
+                };
+            }
+        }
+
+        // DMA channel control: 0x1D200-0x1D3FF
+        if (0x1D200..0x1D400).contains(&offset) {
+            let ch_offset = offset - 0x1D200;
+            let ch_index = (ch_offset / 0x8) as usize;
+            if ch_index < self.dma_channels.len() {
+                return if ch_offset % 0x8 == 0 {
+                    self.dma_channels[ch_index].control
+                } else {
+                    self.dma_channels[ch_index].start_queue
+                };
+            }
+        }
+
+        // Lock value registers (read-only, no acquire side effect)
+        let lock_base = if self.is_mem_tile() {
+            reg_layout.memtile_lock_base
+        } else {
+            reg_layout.memory_lock_base
+        };
+        let lock_stride = if self.is_mem_tile() {
+            reg_layout.memtile_lock_stride
+        } else {
+            reg_layout.memory_lock_stride
+        };
+        let lock_end = lock_base + (self.locks.len() as u32) * lock_stride;
+        if (lock_base..lock_end).contains(&offset) {
+            let lock_id = ((offset - lock_base) / lock_stride) as usize;
+            if lock_id < self.locks.len() {
+                return self.locks[lock_id].value as u32 & reg_layout.lock_value_mask;
             }
         }
 
@@ -1820,13 +1932,28 @@ impl Tile {
             return 0; // Invalid lock ID
         }
 
-        // Perform the operation
+        // Perform the operation.
+        //
+        // AIE-ML lock semantics (matching DMA engine in dma/engine.rs):
+        // - change_value < 0: acq_ge -- wait until lock >= |value|, then decrement
+        // - change_value > 0: acq_eq -- wait until lock == value, then set to 0
+        // - change_value == 0: simple acquire (decrement if > 0)
         let result = if is_acquire {
-            // Acquire: check if value >= abs(change), then apply delta
-            // For acquire, change_value is typically negative (consuming tokens)
-            self.locks[lock_id].acquire_with_value((-change_value).max(0), change_value)
+            if change_value < 0 {
+                // acq_ge: wait until lock >= |value|, then decrement by |value|
+                let expected = (-change_value) as i8;
+                self.locks[lock_id].acquire_with_value(expected, change_value)
+            } else if change_value > 0 {
+                // acq_eq: wait until lock == value, then decrement to 0
+                let expected = change_value as i8;
+                let delta = -expected;
+                self.locks[lock_id].acquire_equal(expected, delta)
+            } else {
+                // Simple acquire: decrement by 1 if > 0
+                self.locks[lock_id].acquire_with_value(1, -1)
+            }
         } else {
-            // Release: just apply delta (typically positive, releasing tokens)
+            // Release: apply delta (typically positive)
             self.locks[lock_id].release_with_value(change_value)
         };
 
@@ -1913,9 +2040,9 @@ mod tests {
         assert!(tile.is_shim());
         assert!(tile.program_memory().is_none());
         assert_eq!(tile.data_memory().len(), 0);
-        assert_eq!(tile.locks.len(), 0);
-        assert_eq!(tile.dma_bds.len(), 0);
-        assert_eq!(tile.dma_channels.len(), 0);
+        assert_eq!(tile.locks.len(), 16);
+        assert_eq!(tile.dma_bds.len(), 16);
+        assert_eq!(tile.dma_channels.len(), 4);
     }
 
     #[test]
