@@ -455,6 +455,7 @@ def cmd_platform_detect(args):
         features.append("peano")
     if tools.get("chess", {}).get("found"):
         features.append("chess")
+        features.append("valid_xchess_license")
     if tools.get("aiesimulator", {}).get("found"):
         features.append("aiesimulator")
 

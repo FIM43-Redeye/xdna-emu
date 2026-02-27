@@ -36,6 +36,72 @@ use crate::build_progress::{self, ParallelBuildConfig};
 type ChessBuildArtifacts = build_progress::ChessArtifacts;
 
 // ---------------------------------------------------------------------------
+// Platform-aware pre-flight filtering
+// ---------------------------------------------------------------------------
+
+/// Apply platform-aware skip reasons to source tests.
+///
+/// For each test, check whether its `REQUIRES:` features are satisfied by
+/// the detected platform. Tests requiring features the platform doesn't
+/// have get a skip_reason explaining why (e.g. "requires ryzen_ai_npu2
+/// (have npu1)"). This replaces the hardcoded `requires_npu2()` check
+/// with a general feature-set comparison.
+///
+/// Only sets skip_reason if one isn't already set (TOML overrides take
+/// priority).
+fn apply_platform_skips(
+    tests: &mut [NpuTestSource],
+    platform: &crate::integration::bridge::PlatformInfo,
+) {
+    // Features the platform can't satisfy. We check each test's
+    // REQUIRES against the platform's detected feature set.
+    // Common platform features: ryzen_ai, ryzen_ai_npu1, peano, chess,
+    // aiesimulator, valid_xchess_license, etc.
+    for test in tests.iter_mut() {
+        if test.skip_reason.is_some() {
+            continue;
+        }
+        for req in &test.requires {
+            if !platform.features.contains(req) {
+                let model = platform.npu_model.as_deref().unwrap_or("unknown");
+                test.skip_reason = Some(format!(
+                    "requires {} (platform: {})",
+                    req, model,
+                ));
+                break;
+            }
+        }
+    }
+}
+
+/// Print a pre-flight summary of how many tests will be skipped and why.
+fn print_preflight_summary(tests: &[NpuTestSource]) {
+    let skipped: Vec<_> = tests.iter()
+        .filter(|t| t.skip_reason.is_some())
+        .collect();
+    if skipped.is_empty() {
+        return;
+    }
+
+    // Group by skip reason prefix for a compact summary.
+    let mut reasons: HashMap<String, usize> = HashMap::new();
+    for t in &skipped {
+        let reason = t.skip_reason.as_deref().unwrap_or("unknown");
+        // Use first clause (before parenthetical) as the group key.
+        let key = reason.split(" (").next().unwrap_or(reason).to_string();
+        *reasons.entry(key).or_insert(0) += 1;
+    }
+
+    let mut sorted: Vec<_> = reasons.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+    println!("pre-flight: {} tests will be skipped", skipped.len());
+    for (reason, count) in &sorted {
+        println!("  {} -- {}", count, reason);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Hardware recovery and wedge detection
 // ---------------------------------------------------------------------------
 
@@ -927,28 +993,36 @@ pub fn run(opts: &Options) {
     let config = crate::config::Config::get();
     let mlir_aie_path = PathBuf::from(config.mlir_aie_path());
 
-    // Platform detection via mlir-aie bridge (informational).
-    if let Some(bridge) = crate::integration::bridge::BridgePath::discover() {
-        match crate::integration::bridge::PlatformInfo::from_bridge(&bridge) {
-            Ok(platform) => {
-                println!(
-                    "platform: {} ({}) -- features: {}",
-                    platform.npu_model.as_deref().unwrap_or("unknown"),
-                    platform.arch.as_deref().unwrap_or("unknown"),
-                    platform.features.join(", "),
-                );
+    // Platform detection via mlir-aie bridge.
+    // Stored for use in pre-flight test filtering (skip tests requiring
+    // features this platform doesn't have).
+    let platform = crate::integration::bridge::BridgePath::discover()
+        .and_then(|bridge| {
+            match crate::integration::bridge::PlatformInfo::from_bridge(&bridge) {
+                Ok(p) => {
+                    println!(
+                        "platform: {} ({}) -- features: {}",
+                        p.npu_model.as_deref().unwrap_or("unknown"),
+                        p.arch.as_deref().unwrap_or("unknown"),
+                        p.features.join(", "),
+                    );
+                    Some(p)
+                }
+                Err(e) => {
+                    eprintln!("Warning: platform detection failed: {}", e);
+                    None
+                }
             }
-            Err(e) => {
-                eprintln!("Warning: platform detection failed: {}", e);
-            }
-        }
-    }
+        });
 
     // --list: discover and print tests from source tree, then exit.
     if opts.list_only {
         let mut source_tests = npu_test::discover(&mlir_aie_path);
         let overrides_path = PathBuf::from(manifest_dir).join("tests/test_overrides.toml");
         npu_test::load_overrides(&mut source_tests, &overrides_path);
+        if let Some(ref p) = platform {
+            apply_platform_skips(&mut source_tests, p);
+        }
 
         // Apply filters
         let tests: Vec<&npu_test::NpuTestSource> = source_tests.iter()
@@ -1179,8 +1253,23 @@ pub fn run(opts: &Options) {
                     if ann.xfail && test.expected_fail_reason.is_none() {
                         test.expected_fail_reason = Some("XFAIL upstream".to_string());
                     }
-                    if ann.requires.iter().any(|r| r == "ryzen_ai_npu2") && test.skip_reason.is_none() {
-                        test.skip_reason = Some("Requires NPU2 (Strix Point)".to_string());
+                    // Platform-aware skip: check each required feature
+                    // against the detected platform.
+                    if test.skip_reason.is_none() {
+                        if let Some(ref p) = platform {
+                            for req in &ann.requires {
+                                if !p.features.contains(req) {
+                                    let model = p.npu_model.as_deref().unwrap_or("unknown");
+                                    test.skip_reason = Some(format!(
+                                        "requires {} (platform: {})", req, model,
+                                    ));
+                                    break;
+                                }
+                            }
+                        } else if ann.requires.iter().any(|r| r == "ryzen_ai_npu2") {
+                            // Fallback when platform detection unavailable.
+                            test.skip_reason = Some("Requires NPU2 (Strix Point)".to_string());
+                        }
                     }
                 }
             }
@@ -1236,6 +1325,13 @@ pub fn run(opts: &Options) {
 
         // Load test overrides (skip/expected_fail gates)
         npu_test::load_overrides(&mut source_tests_storage, &overrides_path);
+
+        // Platform-aware skips: tests requiring features not available on
+        // this platform get skip_reason set before we attempt to build them.
+        if let Some(ref p) = platform {
+            apply_platform_skips(&mut source_tests_storage, p);
+            print_preflight_summary(&source_tests_storage);
+        }
 
         let total_source = source_tests_storage.len();
         println!("Found {} tests in source tree", total_source);
@@ -1682,4 +1778,108 @@ fn discover_chess_artifacts(chess_dir: &Path) -> HashMap<String, ChessBuildArtif
             prj_dir: art.prj_dir,
         }))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::integration::bridge::PlatformInfo;
+
+    fn make_test(name: &str, requires: Vec<&str>) -> NpuTestSource {
+        NpuTestSource {
+            name: name.to_string(),
+            source_dir: PathBuf::from("/tmp/fake"),
+            entry_file: PathBuf::from("/tmp/fake/aie2.py"),
+            build_steps: vec![],
+            requires: requires.into_iter().map(|s| s.to_string()).collect(),
+            xfail: false,
+            buffer_spec: None,
+            skip_reason: None,
+            expected_fail_reason: None,
+            test_cpp_path: None,
+            test_cpp_pattern: None,
+            artifact_names: Default::default(),
+        }
+    }
+
+    fn npu1_platform() -> PlatformInfo {
+        PlatformInfo {
+            npu_model: Some("npu1".to_string()),
+            arch: Some("AIE2".to_string()),
+            npu_generation: Some("Phoenix".to_string()),
+            features: vec![
+                "ryzen_ai".to_string(),
+                "ryzen_ai_npu1".to_string(),
+                "peano".to_string(),
+                "chess".to_string(),
+                "valid_xchess_license".to_string(),
+                "aiesimulator".to_string(),
+            ],
+            has_peano: true,
+            has_chess: true,
+            has_aiesimulator: true,
+        }
+    }
+
+    #[test]
+    fn test_platform_skips_npu2_on_npu1() {
+        let platform = npu1_platform();
+        let mut tests = vec![
+            make_test("npu1_test", vec!["ryzen_ai"]),
+            make_test("npu2_test", vec!["ryzen_ai_npu2"]),
+        ];
+
+        apply_platform_skips(&mut tests, &platform);
+
+        assert!(tests[0].skip_reason.is_none(), "npu1 test should not be skipped");
+        assert!(tests[1].skip_reason.is_some(), "npu2 test should be skipped");
+        assert!(tests[1].skip_reason.as_ref().unwrap().contains("ryzen_ai_npu2"));
+        assert!(tests[1].skip_reason.as_ref().unwrap().contains("npu1"));
+    }
+
+    #[test]
+    fn test_platform_skips_preserves_existing() {
+        let platform = npu1_platform();
+        let mut tests = vec![
+            make_test("override_test", vec!["ryzen_ai_npu2"]),
+        ];
+        tests[0].skip_reason = Some("manual override".to_string());
+
+        apply_platform_skips(&mut tests, &platform);
+
+        // Existing skip_reason should be preserved (TOML override priority).
+        assert_eq!(tests[0].skip_reason.as_deref(), Some("manual override"));
+    }
+
+    #[test]
+    fn test_platform_skips_chess_requirement() {
+        let platform = npu1_platform();
+        let mut tests = vec![
+            make_test("chess_test", vec!["valid_xchess_license"]),
+        ];
+
+        apply_platform_skips(&mut tests, &platform);
+
+        // Chess is available on our platform, so no skip.
+        assert!(tests[0].skip_reason.is_none());
+    }
+
+    #[test]
+    fn test_platform_skips_missing_feature() {
+        let mut platform = npu1_platform();
+        // Simulate a platform without Chess.
+        platform.features.retain(|f| f != "chess" && f != "valid_xchess_license");
+        platform.has_chess = false;
+
+        let mut tests = vec![
+            make_test("chess_test", vec!["valid_xchess_license"]),
+            make_test("peano_test", vec!["ryzen_ai", "peano"]),
+        ];
+
+        apply_platform_skips(&mut tests, &platform);
+
+        assert!(tests[0].skip_reason.is_some(), "chess test should be skipped");
+        assert!(tests[0].skip_reason.as_ref().unwrap().contains("valid_xchess_license"));
+        assert!(tests[1].skip_reason.is_none(), "peano test should not be skipped");
+    }
 }
