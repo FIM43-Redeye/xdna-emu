@@ -36,6 +36,15 @@
 pub mod store;
 pub mod vcd;
 
+/// Generated trace event codes from mlir-aie's canonical enums.
+///
+/// Provides per-tile-type event code constants and name lookup functions.
+/// Generated at build time by `build.rs` from `tools/mlir-aie-bridge.py trace-events`.
+/// Falls back to stubs if mlir-aie is not available.
+pub mod event_codes {
+    include!(concat!(env!("OUT_DIR"), "/trace_event_codes.rs"));
+}
+
 use crate::interpreter::engine::TileTracedEvent;
 use crate::interpreter::state::EventType;
 use std::collections::BTreeMap;
