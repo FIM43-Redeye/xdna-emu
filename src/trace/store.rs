@@ -135,6 +135,51 @@ impl TraceStore {
         self.cycle_range = (min, max);
     }
 
+    /// Add a loaded trace to the store.
+    pub fn add_trace(&mut self, trace: LoadedTrace) {
+        self.traces.push(trace);
+        self.update_cycle_range();
+    }
+
+    /// Move cursor to a specific cycle, clamped to the merged range.
+    pub fn seek(&mut self, cycle: u64) {
+        if self.traces.is_empty() {
+            self.cursor = 0;
+            return;
+        }
+        self.cursor = cycle.clamp(self.cycle_range.0, self.cycle_range.1);
+    }
+
+    /// Find the next cycle (after cursor) that has any event in any trace.
+    /// Returns None if cursor is at or past the last event.
+    pub fn next_event_cycle(&self) -> Option<u64> {
+        let mut best: Option<u64> = None;
+        for trace in &self.traces {
+            // Binary search for first event with cycle > cursor.
+            let idx = trace.events.partition_point(|e| e.cycle <= self.cursor);
+            if idx < trace.events.len() {
+                let candidate = trace.events[idx].cycle;
+                best = Some(best.map_or(candidate, |b: u64| b.min(candidate)));
+            }
+        }
+        best
+    }
+
+    /// Find the previous cycle (before cursor) that has any event in any trace.
+    /// Returns None if cursor is at or before the first event.
+    pub fn prev_event_cycle(&self) -> Option<u64> {
+        let mut best: Option<u64> = None;
+        for trace in &self.traces {
+            // Binary search for last event with cycle < cursor.
+            let idx = trace.events.partition_point(|e| e.cycle < self.cursor);
+            if idx > 0 {
+                let candidate = trace.events[idx - 1].cycle;
+                best = Some(best.map_or(candidate, |b: u64| b.max(candidate)));
+            }
+        }
+        best
+    }
+
     /// All tiles with events in any loaded trace.
     pub fn all_active_tiles(&self) -> HashSet<(u8, u8)> {
         let mut tiles = HashSet::new();
@@ -156,6 +201,20 @@ mod tests {
         assert_eq!(store.cycle_range, (0, 0));
         assert!(store.traces.is_empty());
         assert!(store.all_active_tiles().is_empty());
+    }
+
+    /// Helper to build a TraceEvent with minimal boilerplate.
+    fn make_event(cycle: u64, col: u8, row: u8, name: &str) -> TraceEvent {
+        TraceEvent {
+            cycle,
+            col,
+            row,
+            name: name.to_string(),
+            phase: Phase::Begin,
+            tid: 0,
+            trace_type: TraceType::Core,
+            args: serde_json::Value::Null,
+        }
     }
 
     #[test]
@@ -194,5 +253,99 @@ mod tests {
         assert!(trace.active_tiles.contains(&(0, 2)));
         assert!(trace.active_tiles.contains(&(1, 2)));
         assert_eq!(trace.active_tiles.len(), 2);
+    }
+
+    #[test]
+    fn test_seek_clamps_to_range() {
+        let mut store = TraceStore::new();
+        let events = vec![
+            make_event(10, 0, 2, "A"),
+            make_event(20, 0, 2, "B"),
+            make_event(30, 0, 2, "C"),
+        ];
+        store.add_trace(LoadedTrace::from_events(
+            "t1".into(),
+            TraceSource::Emulator,
+            events,
+        ));
+
+        store.seek(15);
+        assert_eq!(store.cursor, 15);
+
+        store.seek(100);
+        assert_eq!(store.cursor, 30); // clamp to max
+
+        store.seek(0);
+        assert_eq!(store.cursor, 10); // clamp to min
+    }
+
+    #[test]
+    fn test_next_event_cycle() {
+        let mut store = TraceStore::new();
+        let events = vec![
+            make_event(10, 0, 2, "A"),
+            make_event(20, 0, 2, "B"),
+            make_event(30, 0, 2, "C"),
+        ];
+        store.add_trace(LoadedTrace::from_events(
+            "t1".into(),
+            TraceSource::Emulator,
+            events,
+        ));
+
+        store.seek(10);
+        assert_eq!(store.next_event_cycle(), Some(20));
+
+        store.seek(20);
+        assert_eq!(store.next_event_cycle(), Some(30));
+
+        store.seek(30);
+        assert_eq!(store.next_event_cycle(), None); // at end
+    }
+
+    #[test]
+    fn test_prev_event_cycle() {
+        let mut store = TraceStore::new();
+        let events = vec![
+            make_event(10, 0, 2, "A"),
+            make_event(20, 0, 2, "B"),
+            make_event(30, 0, 2, "C"),
+        ];
+        store.add_trace(LoadedTrace::from_events(
+            "t1".into(),
+            TraceSource::Emulator,
+            events,
+        ));
+
+        store.seek(30);
+        assert_eq!(store.prev_event_cycle(), Some(20));
+
+        store.seek(20);
+        assert_eq!(store.prev_event_cycle(), Some(10));
+
+        store.seek(10);
+        assert_eq!(store.prev_event_cycle(), None); // at start
+    }
+
+    #[test]
+    fn test_next_event_merges_traces() {
+        let mut store = TraceStore::new();
+        store.add_trace(LoadedTrace::from_events(
+            "emu".into(),
+            TraceSource::Emulator,
+            vec![make_event(10, 0, 2, "A"), make_event(30, 0, 2, "C")],
+        ));
+        store.add_trace(LoadedTrace::from_events(
+            "hw".into(),
+            TraceSource::Hardware,
+            vec![make_event(20, 0, 2, "B")],
+        ));
+
+        store.seek(10);
+        // Next event is at cycle 20 (from hw trace), not 30
+        assert_eq!(store.next_event_cycle(), Some(20));
+
+        store.seek(20);
+        assert_eq!(store.next_event_cycle(), Some(30));
     }
 }
