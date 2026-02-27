@@ -3,7 +3,8 @@
 //! Loads Perfetto JSON traces from hardware, emulator, and aiesimulator
 //! into a unified store with a global cycle cursor.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::Path;
 
 /// Re-use the existing TraceType from the export module.
@@ -111,6 +112,145 @@ impl LoadedTrace {
         let end = self.events.partition_point(|e| e.cycle <= end_cycle);
         &self.events[start..end]
     }
+
+    /// Parse a Perfetto JSON trace from a reader.
+    ///
+    /// Extracts PID-to-tile mapping from process_name metadata, then
+    /// converts B/E events into TraceEvents with tile coordinates.
+    pub fn from_perfetto_json(
+        reader: impl Read,
+        label: String,
+        source: TraceSource,
+    ) -> Result<Self, String> {
+        let raw: serde_json::Value = serde_json::from_reader(reader)
+            .map_err(|e| format!("JSON parse error: {}", e))?;
+
+        let array = raw
+            .as_array()
+            .ok_or_else(|| "Expected JSON array".to_string())?;
+
+        // Phase 1: Build PID -> (col, row, trace_type) map from metadata.
+        let mut pid_map: HashMap<u64, (u8, u8, TraceType)> = HashMap::new();
+        for entry in array {
+            if entry.get("ph").and_then(|v| v.as_str()) != Some("M") {
+                continue;
+            }
+            if entry.get("name").and_then(|v| v.as_str())
+                != Some("process_name")
+            {
+                continue;
+            }
+            let pid =
+                entry.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+            let pname = entry
+                .get("args")
+                .and_then(|a| a.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            if let Some(parsed) = parse_process_name(pname) {
+                pid_map.insert(pid, parsed);
+            }
+        }
+
+        // Phase 2: Convert B/E events into TraceEvents.
+        let mut events = Vec::new();
+        for entry in array {
+            let ph = match entry.get("ph").and_then(|v| v.as_str()) {
+                Some("B") => Phase::Begin,
+                Some("E") => Phase::End,
+                _ => continue, // skip metadata and other phases
+            };
+
+            let pid =
+                entry.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+            let (col, row, trace_type) = match pid_map.get(&pid) {
+                Some(v) => *v,
+                None => continue, // skip events with unknown PID
+            };
+
+            let name = entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("UNKNOWN")
+                .to_string();
+
+            let cycle =
+                entry.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
+            let tid = entry.get("tid").and_then(|v| v.as_u64()).unwrap_or(0)
+                as u32;
+            let args = entry
+                .get("args")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+
+            events.push(TraceEvent {
+                cycle,
+                col,
+                row,
+                name,
+                phase: ph,
+                tid,
+                trace_type,
+                args,
+            });
+        }
+
+        Ok(Self::from_events(label, source, events))
+    }
+}
+
+/// Parse a process_name string into (col, row, TraceType).
+///
+/// Handles two formats:
+/// - Our format: "core_trace for tile2,0" (row=2, col=0)
+/// - mlir-aie:   "core_trace for column 0, row 2" (col=0, row=2)
+///
+/// Also handles prefixed names like "Emulator: core_trace for tile2,0".
+fn parse_process_name(name: &str) -> Option<(u8, u8, TraceType)> {
+    // Determine trace type from prefix.
+    let trace_type = if name.contains("core_trace") {
+        TraceType::Core
+    } else if name.contains("mem_trace") {
+        TraceType::Mem
+    } else {
+        return None;
+    };
+
+    // Try "tileROW,COL" format first (our format and hw traces).
+    if let Some(pos) = name.find("tile") {
+        let rest = &name[pos + 4..];
+        let coords: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == ',')
+            .collect();
+        let parts: Vec<&str> = coords.split(',').collect();
+        if parts.len() == 2 {
+            let row: u8 = parts[0].parse().ok()?;
+            let col: u8 = parts[1].parse().ok()?;
+            return Some((col, row, trace_type));
+        }
+    }
+
+    // Try "column COL, row ROW" format (mlir-aie).
+    if let Some(col_pos) = name.find("column ") {
+        let after_col = &name[col_pos + 7..];
+        let col_str: String = after_col
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Some(row_pos) = name.find("row ") {
+            let after_row = &name[row_pos + 4..];
+            let row_str: String = after_row
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            let col: u8 = col_str.parse().ok()?;
+            let row: u8 = row_str.parse().ok()?;
+            return Some((col, row, trace_type));
+        }
+    }
+
+    None
 }
 
 /// Multi-source trace store with global cycle cursor.
@@ -238,6 +378,22 @@ impl TraceStore {
             .iter()
             .map(|t| (t, t.events_in_range(start, end)))
             .collect()
+    }
+
+    /// Load a Perfetto JSON trace file into the store.
+    pub fn load(
+        &mut self,
+        path: &Path,
+        label: String,
+        source: TraceSource,
+    ) -> Result<(), String> {
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("Cannot open {}: {}", path.display(), e))?;
+        let reader = std::io::BufReader::new(file);
+        let trace =
+            LoadedTrace::from_perfetto_json(reader, label, source)?;
+        self.add_trace(trace);
+        Ok(())
     }
 
     /// All tiles with events in any loaded trace.
@@ -504,5 +660,125 @@ mod tests {
         let results = store.events_at_cursor();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1.len(), 0); // empty slice
+    }
+
+    // -- Task 4: Perfetto JSON loader tests --
+
+    #[test]
+    fn test_load_perfetto_json_basic() {
+        let json = r#"[
+{"name":"process_name","ph":"M","pid":0,"args":{"name":"core_trace for tile2,0"}},
+{"name":"thread_name","ph":"M","pid":0,"tid":0,"args":{"name":"INSTR_VECTOR"}},
+{"name":"INSTR_VECTOR","ph":"B","pid":0,"tid":0,"ts":10,"args":{}},
+{"name":"INSTR_VECTOR","ph":"E","pid":0,"tid":0,"ts":11,"args":{}}
+]"#;
+
+        let trace = LoadedTrace::from_perfetto_json(
+            json.as_bytes(),
+            "test".to_string(),
+            TraceSource::Emulator,
+        )
+        .unwrap();
+
+        assert_eq!(trace.events.len(), 2);
+        assert_eq!(trace.events[0].cycle, 10);
+        assert_eq!(trace.events[0].col, 0);
+        assert_eq!(trace.events[0].row, 2);
+        assert_eq!(trace.events[0].name, "INSTR_VECTOR");
+        assert_eq!(trace.events[0].phase, Phase::Begin);
+        assert_eq!(trace.events[0].trace_type, TraceType::Core);
+        assert_eq!(trace.events[1].phase, Phase::End);
+        assert!(trace.active_tiles.contains(&(0, 2)));
+    }
+
+    #[test]
+    fn test_load_perfetto_json_multi_tile() {
+        let json = r#"[
+{"name":"process_name","ph":"M","pid":0,"args":{"name":"core_trace for tile2,0"}},
+{"name":"process_name","ph":"M","pid":1,"args":{"name":"mem_trace for tile2,0"}},
+{"name":"process_name","ph":"M","pid":2,"args":{"name":"core_trace for tile2,1"}},
+{"name":"INSTR_VECTOR","ph":"B","pid":0,"tid":0,"ts":10,"args":{}},
+{"name":"DMA_START_TASK","ph":"B","pid":1,"tid":0,"ts":15,"args":{}},
+{"name":"INSTR_LOAD","ph":"B","pid":2,"tid":1,"ts":10,"args":{}}
+]"#;
+
+        let trace = LoadedTrace::from_perfetto_json(
+            json.as_bytes(),
+            "test".to_string(),
+            TraceSource::Hardware,
+        )
+        .unwrap();
+
+        assert_eq!(trace.events.len(), 3);
+        // Sorted by cycle, then col
+        assert_eq!(trace.events[0].cycle, 10);
+        assert_eq!(trace.events[2].cycle, 15);
+        assert!(trace.active_tiles.contains(&(0, 2)));
+        assert!(trace.active_tiles.contains(&(1, 2)));
+        // Check trace types resolved from PID metadata
+        let mem_event = trace
+            .events
+            .iter()
+            .find(|e| e.name == "DMA_START_TASK")
+            .unwrap();
+        assert_eq!(mem_event.trace_type, TraceType::Mem);
+    }
+
+    #[test]
+    fn test_load_perfetto_json_skips_metadata() {
+        let json = r#"[
+{"name":"process_name","ph":"M","pid":0,"args":{"name":"core_trace for tile2,0"}},
+{"name":"thread_name","ph":"M","pid":0,"tid":0,"args":{"name":"INSTR_VECTOR"}},
+{"name":"INSTR_VECTOR","ph":"B","pid":0,"tid":0,"ts":5,"args":{}}
+]"#;
+
+        let trace = LoadedTrace::from_perfetto_json(
+            json.as_bytes(),
+            "test".into(),
+            TraceSource::Emulator,
+        )
+        .unwrap();
+
+        // Only the B event, not the M metadata events
+        assert_eq!(trace.events.len(), 1);
+    }
+
+    #[test]
+    fn test_load_from_file() {
+        // Use a real trace file from the build directory if available.
+        let path =
+            std::path::Path::new("build/traces/add_one_using_dma/emu-trace.json");
+        if !path.exists() {
+            // Skip test if no trace files built.
+            return;
+        }
+        let mut store = TraceStore::new();
+        store
+            .load(path, "emu".into(), TraceSource::Emulator)
+            .unwrap();
+        assert_eq!(store.traces.len(), 1);
+        assert!(!store.traces[0].events.is_empty());
+        assert!(store.cycle_range.1 > 0);
+    }
+
+    #[test]
+    fn test_parse_process_name_tile_format() {
+        let result = parse_process_name("core_trace for tile2,0");
+        assert_eq!(result, Some((0, 2, TraceType::Core)));
+
+        let result = parse_process_name("mem_trace for tile1,3");
+        assert_eq!(result, Some((3, 1, TraceType::Mem)));
+    }
+
+    #[test]
+    fn test_parse_process_name_column_row_format() {
+        let result =
+            parse_process_name("core_trace for column 0, row 2");
+        assert_eq!(result, Some((0, 2, TraceType::Core)));
+    }
+
+    #[test]
+    fn test_parse_process_name_unknown() {
+        assert_eq!(parse_process_name("something else"), None);
     }
 }
