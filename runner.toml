@@ -55,8 +55,9 @@ chess_only = false
 
 [aiesim]
 # Run aiesimulator on Chess-built .prj directories.
-# Currently blocked: ps.so symbol mismatch prevents aiesimulator from
-# loading the host shim. Enable when the build issue is resolved.
+# Requires: aietools with aiesimulator, valid AIEMLsim license,
+# network access for FlexLM verification. Cannot run inside sandbox.
+# Activate via --runtime=aiesim (which auto-enables --compiler=chess).
 # Default: false
 enabled = false
 

@@ -26,6 +26,52 @@ use std::path::{Path, PathBuf};
 use super::aietools::AieTools;
 use crate::trace::vcd;
 
+/// Check whether the process can reach aiesimulator's prerequisites.
+///
+/// aiesimulator requires both:
+/// 1. Read access to `~/.Xilinx/Xilinx.lic` (Xilinx feature license)
+/// 2. Network access for FlexLM license verification
+///
+/// Sandboxed environments (e.g. Claude Code) block both, causing
+/// misleading "license not found" errors. This function detects that
+/// condition and returns a clear error message instead.
+pub fn check_environment() -> Result<(), String> {
+    // Check license file readability.
+    let home = std::env::var("HOME").unwrap_or_default();
+    let license_path = PathBuf::from(&home).join(".Xilinx/Xilinx.lic");
+    if !license_path.exists() {
+        return Err(format!(
+            "Xilinx license file not found at {}. \
+             aiesimulator requires a valid AIEMLsim license.",
+            license_path.display()
+        ));
+    }
+    // Try to actually read it (sandbox may block read even if stat succeeds).
+    match std::fs::read_to_string(&license_path) {
+        Ok(content) => {
+            if !content.contains("AIEMLsim") {
+                return Err(format!(
+                    "License file {} does not contain AIEMLsim feature. \
+                     aiesimulator requires this license.",
+                    license_path.display()
+                ));
+            }
+        }
+        Err(e) => {
+            return Err(format!(
+                "Cannot read license file {}: {}. \
+                 This typically means aiesimulator is being run in a \
+                 sandboxed environment that blocks filesystem access. \
+                 Run outside the sandbox (aiesimulator also needs network \
+                 access for FlexLM license verification).",
+                license_path.display(), e
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Result of an aiesimulator run.
 #[derive(Debug)]
 pub struct SimResult {
@@ -78,6 +124,9 @@ pub fn run_simulation(
     if tools.aiesimulator.is_none() {
         return Err("aiesimulator not available in aietools".to_string());
     }
+
+    // Check license and sandbox conditions before wasting time
+    check_environment()?;
 
     // Validate .prj/sim/ exists
     let sim_dir = prj_dir.join("sim");
@@ -193,6 +242,9 @@ pub fn run_unit_simulation(
     if tools.aiesimulator.is_none() {
         return Err("aiesimulator not available in aietools".to_string());
     }
+
+    // Check license and sandbox conditions before wasting time
+    check_environment()?;
 
     // Unit tests use aiesim.sh which wraps aiesimulator with the right flags
     let aiesim_sh = prj_dir.join("aiesim.sh");
