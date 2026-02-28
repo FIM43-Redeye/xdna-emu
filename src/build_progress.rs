@@ -28,6 +28,59 @@ use crossterm::{cursor, execute, style, terminal};
 use crate::integration::chess_build::{BuildEnv, BuildOpts, BuildResult};
 use crate::testing::xclbin_suite::{Compiler, XclbinTest};
 
+/// Extract a short, human-readable diagnostic from a build error string.
+///
+/// Scans through the log looking for recognizable error patterns and returns
+/// the first meaningful one. Falls back to the first line of the error.
+fn extract_build_diagnostic(error: &str) -> String {
+    // Scan all lines for recognizable error patterns, in priority order.
+    for line in error.lines() {
+        let trimmed = line.trim();
+
+        // LLVM fatal error (Peano backend crash / legalization failure)
+        if let Some(msg) = trimmed.strip_prefix("LLVM ERROR: ") {
+            // Truncate to keep the one-liner readable.
+            let short = if msg.len() > 80 { &msg[..80] } else { msg };
+            return format!("LLVM: {}", short);
+        }
+
+        // MLIR diagnostic (aie-opt / aie-translate errors)
+        if trimmed.contains("error:") && trimmed.contains(".mlir") {
+            // e.g. "aie_arch.mlir:42:5: error: op violates constraint"
+            // Extract just the error portion after the file:line:col prefix.
+            if let Some(pos) = trimmed.find("error:") {
+                let msg = trimmed[pos..].trim();
+                let short = if msg.len() > 80 { &msg[..80] } else { msg };
+                return short.to_string();
+            }
+        }
+
+        // Python exception (aiecc.py or build script failure)
+        // Match common Python error classes at start of line.
+        if trimmed.starts_with("ModuleNotFoundError:")
+            || trimmed.starts_with("ImportError:")
+            || trimmed.starts_with("FileNotFoundError:")
+            || trimmed.starts_with("RuntimeError:")
+            || trimmed.starts_with("ValueError:")
+            || trimmed.starts_with("TypeError:")
+            || trimmed.starts_with("KeyError:")
+            || trimmed.starts_with("subprocess.CalledProcessError:")
+        {
+            let short = if trimmed.len() > 80 { &trimmed[..80] } else { trimmed };
+            return format!("Python: {}", short);
+        }
+
+        // make error
+        if trimmed.starts_with("make:") && trimmed.contains("***") {
+            let short = if trimmed.len() > 80 { &trimmed[..80] } else { trimmed };
+            return short.to_string();
+        }
+    }
+
+    // Fallback: first line of the error string (the "step N/M failed" header).
+    error.lines().next().unwrap_or(error).to_string()
+}
+
 /// Save a build log to `build/logs/<name>-<track>.log`, overwriting any
 /// previous log for the same test+track.
 ///
@@ -741,7 +794,7 @@ fn run_verbose<T: Buildable>(
                 Err(e) => {
                     let elapsed = task_start.elapsed();
                     save_build_log(name, track_name, &e);
-                    let msg = e.lines().next().unwrap_or(&e);
+                    let diag = extract_build_diagnostic(&e);
                     let completed = progress.completed.fetch_add(1, Ordering::Relaxed) + 1;
                     println!(
                         "[{:2}/{}] {:40} {} FAILED ({:.1}s): {}",
@@ -750,7 +803,7 @@ fn run_verbose<T: Buildable>(
                         &name[..name.len().min(40)],
                         track_name,
                         elapsed.as_secs_f64(),
-                        msg,
+                        diag,
                     );
                     println!(
                         "         log: build/logs/{}-{}.log",
@@ -801,6 +854,12 @@ fn run_worker<T: Buildable>(
 
         let task = &work_queue[task_idx];
         let test = &tests[task.test_idx];
+        let name = test.name().to_string();
+        let track_name = match task.track {
+            Track::Peano => "Peano",
+            Track::Chess => "Chess",
+        };
+        let task_start = Instant::now();
 
         progress.update_cell(task.cell_idx, task.track, TrackResult::Building);
 
@@ -817,17 +876,21 @@ fn run_worker<T: Buildable>(
             },
         ) {
             Ok(result) => {
-                let name = test.name();
-                let track_name = match task.track {
-                    Track::Peano => "Peano",
-                    Track::Chess => "Chess",
-                };
-                if result.build_log != "(cached)" {
-                    save_build_log(name, track_name, &result.build_log);
+                let cached = result.build_log == "(cached)";
+                let elapsed = task_start.elapsed();
+                let label = if cached { "cached" } else { "built" };
+                if !cached {
+                    save_build_log(&name, track_name, &result.build_log);
                 }
+                let completed = progress.completed.fetch_add(1, Ordering::Relaxed) + 1;
+                eprintln!(
+                    "[{:2}/{}] {:40} {} {} ({:.1}s)",
+                    completed, progress.total_builds,
+                    &name[..name.len().min(40)],
+                    track_name, label, elapsed.as_secs_f64(),
+                );
 
                 progress.update_cell(task.cell_idx, task.track, TrackResult::Passed);
-                progress.completed.fetch_add(1, Ordering::Relaxed);
 
                 let artifacts = test.collect_artifacts(&output_dir, &result);
                 results.lock().unwrap().push(BuildTaskResult::Success {
@@ -836,15 +899,22 @@ fn run_worker<T: Buildable>(
                 });
             }
             Err(e) => {
-                let name = test.name();
-                let track_name = match task.track {
-                    Track::Peano => "peano",
-                    Track::Chess => "chess",
-                };
-                save_build_log(name, track_name, &e);
+                let elapsed = task_start.elapsed();
+                save_build_log(&name, track_name, &e);
+                let diag = extract_build_diagnostic(&e);
+                let completed = progress.completed.fetch_add(1, Ordering::Relaxed) + 1;
+                eprintln!(
+                    "[{:2}/{}] {:40} {} FAILED ({:.1}s): {}",
+                    completed, progress.total_builds,
+                    &name[..name.len().min(40)],
+                    track_name, elapsed.as_secs_f64(), diag,
+                );
+                eprintln!(
+                    "         log: build/logs/{}-{}.log",
+                    name.replace('/', "-"), track_name.to_lowercase(),
+                );
 
                 progress.update_cell(task.cell_idx, task.track, TrackResult::Failed);
-                progress.completed.fetch_add(1, Ordering::Relaxed);
 
                 results.lock().unwrap().push(BuildTaskResult::Failure);
             }
@@ -1098,5 +1168,60 @@ mod tests {
         let g = GridLayout::new(67);
         assert_eq!(g.display_width(), 21); // "[ " + 9 cols * 2 chars + "]"
         assert_eq!(g.display_height(), 8); // 8 rows
+    }
+
+    #[test]
+    fn diagnostic_llvm_error() {
+        let log = "\
+Peano build step 3/3 failed (exit 250):
+--- step 3/3 ---
+aiecc.py ...
+--- stderr ---
+LLVM ERROR: unable to legalize instruction: %89:_(<4 x s8>) = G_ADD %88:_, %13:_
+PLEASE submit a bug report";
+        let diag = extract_build_diagnostic(log);
+        assert!(diag.starts_with("LLVM: "), "got: {}", diag);
+        assert!(diag.contains("unable to legalize"), "got: {}", diag);
+    }
+
+    #[test]
+    fn diagnostic_mlir_error() {
+        let log = "\
+Build step 2/3 failed (exit 1):
+--- stderr ---
+aie_arch.mlir:42:5: error: 'aie.tile' op column index out of range";
+        let diag = extract_build_diagnostic(log);
+        assert!(diag.starts_with("error:"), "got: {}", diag);
+        assert!(diag.contains("column index"), "got: {}", diag);
+    }
+
+    #[test]
+    fn diagnostic_python_error() {
+        let log = "\
+Build step 1/1 failed (exit 1):
+--- stderr ---
+Traceback (most recent call last):
+  File \"aiecc.py\", line 5
+ModuleNotFoundError: No module named 'aie'";
+        let diag = extract_build_diagnostic(log);
+        assert!(diag.starts_with("Python:"), "got: {}", diag);
+        assert!(diag.contains("ModuleNotFoundError"), "got: {}", diag);
+    }
+
+    #[test]
+    fn diagnostic_make_error() {
+        let log = "\
+Peano example build failed (exit 2):
+--- stderr ---
+make: *** [Makefile:12: build/final.xclbin] Error 2";
+        let diag = extract_build_diagnostic(log);
+        assert!(diag.starts_with("make:"), "got: {}", diag);
+    }
+
+    #[test]
+    fn diagnostic_fallback() {
+        let log = "Build step 1/1 failed (exit 42):\nsome unknown output";
+        let diag = extract_build_diagnostic(log);
+        assert_eq!(diag, "Build step 1/1 failed (exit 42):");
     }
 }
