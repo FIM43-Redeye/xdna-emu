@@ -946,14 +946,20 @@ fn add_examples_to_suite(
                 }
 
                 // Compile native test.exe for hardware execution.
-                // Examples use fixed artifact names (final.xclbin, insts.bin).
+                // Derive artifact names from the actual build output.
                 if compile_test_exe && test.test_cpp_pattern.is_some() {
                     let test_cpp = source_dir.join("test.cpp");
                     if test_cpp.exists() {
+                        let xclbin_name = test.xclbin_path.file_name()
+                            .map(|n| n.to_string_lossy().to_string());
+                        let insts_name = test.insts_path.as_ref()
+                            .and_then(|p| p.file_name())
+                            .map(|n| n.to_string_lossy().to_string());
                         let output_dir = test_exe_dir.join(&test.name);
                         match native_hw::compile_test_exe_with_artifacts(
                             &test_cpp, &output_dir, mlir_aie_path,
-                            Some("final.xclbin"), Some("insts.bin"),
+                            xclbin_name.as_deref(),
+                            insts_name.as_deref(),
                         ) {
                             Ok(exe_path) => {
                                 test.test_exe = Some(exe_path);
@@ -1093,7 +1099,9 @@ pub fn run(opts: &Options) {
                 println!("\n{} buildable programming examples:\n",
                     filtered_buildable.len());
                 for ex in &filtered_buildable {
-                    let has_build = if ex.source_dir.join("build/final.xclbin").exists() {
+                    let has_build = if !artifacts::collect_xclbins(
+                        &ex.source_dir.join("build")
+                    ).is_empty() {
                         " [built]"
                     } else {
                         ""
@@ -1477,10 +1485,17 @@ pub fn run(opts: &Options) {
                         if !test_cpp.exists() {
                             continue;
                         }
+                        // Derive artifact names from the actual build output.
+                        let xclbin_name = test.xclbin_path.file_name()
+                            .map(|n| n.to_string_lossy().to_string());
+                        let insts_name = test.insts_path.as_ref()
+                            .and_then(|p| p.file_name())
+                            .map(|n| n.to_string_lossy().to_string());
                         let output_dir = test_exe_dir.join(&test.name);
                         match native_hw::compile_test_exe_with_artifacts(
                             &test_cpp, &output_dir, &mlir_aie_path,
-                            Some("final.xclbin"), Some("insts.bin"),
+                            xclbin_name.as_deref(),
+                            insts_name.as_deref(),
                         ) {
                             Ok(exe_path) => {
                                 test.test_exe = Some(exe_path);

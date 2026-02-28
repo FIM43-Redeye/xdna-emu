@@ -624,7 +624,7 @@ pub fn run_parallel_builds<T: Buildable>(
         config.thread_count
     } else {
         std::thread::available_parallelism()
-            .map(|n| n.get().min(8))
+            .map(|n| n.get())
             .unwrap_or(4)
     };
 
@@ -642,7 +642,7 @@ pub fn run_parallel_builds<T: Buildable>(
     } else {
         run_verbose(
             build_env, tests, &progress, &work_queue, &work_counter,
-            &results, thread_count, nice, config.verbose, force_rebuild,
+            &results, thread_count, nice, force_rebuild,
         );
     }
 
@@ -727,7 +727,7 @@ fn run_with_grid<T: Buildable>(
     let _ = stdout.flush();
 }
 
-/// Run builds with verbose line-by-line output (non-TTY or -v).
+/// Run builds in parallel with per-completion line output (non-TTY or -v).
 fn run_verbose<T: Buildable>(
     build_env: &BuildEnv,
     tests: &[&T],
@@ -737,102 +737,24 @@ fn run_verbose<T: Buildable>(
     results: &Mutex<Vec<BuildTaskResult>>,
     thread_count: usize,
     nice: Option<i32>,
-    is_verbose: bool,
     force_rebuild: bool,
 ) {
-    if is_verbose || thread_count <= 1 {
-        // Sequential verbose: build one at a time with immediate output
-        for task in work_queue {
-            let task_start = Instant::now();
-            let test = &tests[task.test_idx];
-            let name = test.name();
-            let track_name = match task.track {
-                Track::Peano => "Peano",
-                Track::Chess => "Chess",
-            };
-
-            progress.update_cell(task.cell_idx, task.track, TrackResult::Building);
-
-            let output_dir = test.output_dir(task.use_chess);
-            match test.build(
-                build_env,
-                &output_dir,
-                &BuildOpts {
-                    use_chess: task.use_chess,
-                    gen_sim: task.gen_sim,
-                    device: String::new(),
-                    nice,
-                    force_rebuild,
-                },
-            ) {
-                Ok(result) => {
-                    let cached = result.build_log == "(cached)";
-                    let elapsed = task_start.elapsed();
-                    let label = if cached { "cached" } else { "built" };
-                    let completed = progress.completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    println!(
-                        "[{:2}/{}] {:40} {} {} ({:.1}s)",
-                        completed,
-                        progress.total_builds,
-                        &name[..name.len().min(40)],
-                        track_name,
-                        label,
-                        elapsed.as_secs_f64(),
-                    );
-                    if !cached {
-                        save_build_log(name, track_name, &result.build_log);
-                    }
-
-                    progress.update_cell(task.cell_idx, task.track, TrackResult::Passed);
-
-                    let artifacts = test.collect_artifacts(&output_dir, &result);
-                    results.lock().unwrap().push(BuildTaskResult::Success {
-                        track: task.track,
-                        artifacts,
-                    });
-                }
-                Err(e) => {
-                    let elapsed = task_start.elapsed();
-                    save_build_log(name, track_name, &e);
-                    let diag = extract_build_diagnostic(&e);
-                    let completed = progress.completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    println!(
-                        "[{:2}/{}] {:40} {} FAILED ({:.1}s): {}",
-                        completed,
-                        progress.total_builds,
-                        &name[..name.len().min(40)],
-                        track_name,
-                        elapsed.as_secs_f64(),
-                        diag,
-                    );
-                    println!(
-                        "         log: build/logs/{}-{}.log",
-                        name.replace('/', "-"),
-                        track_name.to_lowercase(),
-                    );
-
-                    progress.update_cell(task.cell_idx, task.track, TrackResult::Failed);
-
-                    results.lock().unwrap().push(BuildTaskResult::Failure);
-                }
-            }
+    // Parallel with atomic per-build output: each build prints its
+    // status line when it completes, so output order reflects completion
+    // order rather than submission order.
+    eprintln!(
+        "Building {} tasks with {} threads...",
+        work_queue.len(),
+        thread_count,
+    );
+    std::thread::scope(|s| {
+        for _ in 0..thread_count {
+            s.spawn(|| {
+                run_worker(build_env, tests, progress, work_queue, work_counter, results, nice, force_rebuild);
+            });
         }
-    } else {
-        // Parallel verbose: threads with line-by-line output
-        eprintln!(
-            "Building {} tasks with {} threads...",
-            work_queue.len(),
-            thread_count,
-        );
-        std::thread::scope(|s| {
-            for _ in 0..thread_count {
-                s.spawn(|| {
-                    run_worker(build_env, tests, progress, work_queue, work_counter, results, nice, force_rebuild);
-                });
-            }
-        });
-        eprintln!();
-    }
+    });
+    eprintln!();
 }
 
 /// Worker thread body: pull tasks from atomic counter, execute builds.
