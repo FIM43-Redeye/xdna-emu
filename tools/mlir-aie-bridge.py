@@ -9,12 +9,14 @@ Subcommands:
     platform-detect  Hardware detection, tool availability, feature set
     test-manifest    Scan tests/examples for target device + build feasibility
     trace-events     Export hardware event enums (CoreEvent, MemEvent, etc.)
+    build-manifest   Dry-run make to discover xclbin/insts output pairs
 
 Usage:
     python3 tools/mlir-aie-bridge.py device-model [--device NAME]
     python3 tools/mlir-aie-bridge.py platform-detect
     python3 tools/mlir-aie-bridge.py test-manifest --npu-xrt-dir PATH --examples-dir PATH
     python3 tools/mlir-aie-bridge.py trace-events [--arch aie2]
+    python3 tools/mlir-aie-bridge.py build-manifest --dir PATH [--chess]
 
 If --mlir-aie-path is not specified, tries ../mlir-aie relative to this
 script's location (matching the standard npu-work layout). Looks for the
@@ -741,6 +743,68 @@ def cmd_test_manifest(args):
 
 
 # ===========================================================================
+# Subcommand: build-manifest
+# ===========================================================================
+
+def cmd_build_manifest(args):
+    """build-manifest subcommand: dry-run make to discover xclbin outputs."""
+    import re
+    import subprocess
+
+    example_dir = os.path.abspath(args.dir)
+    if not os.path.isdir(example_dir):
+        json.dump({"dir": example_dir, "designs": []}, sys.stdout)
+        print()
+        return
+
+    chess_flag = "true" if args.chess else "false"
+    try:
+        result = subprocess.run(
+            ["make", "-nBs", "-C", example_dir, f"CHESS={chess_flag}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        output = result.stdout
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(f"Warning: make dry-run failed: {e}", file=sys.stderr)
+        json.dump({"dir": example_dir, "designs": []}, sys.stdout)
+        print()
+        return
+
+    # Join backslash-continuation lines before parsing
+    output = output.replace("\\\n", " ")
+
+    # Parse aiecc.py invocations from make dry-run output
+    designs = []
+    for line in output.splitlines():
+        if "aiecc.py" not in line:
+            continue
+
+        xclbin_name = None
+        insts_name = None
+
+        # Extract --xclbin-name=VALUE
+        m = re.search(r"--xclbin-name[=\s]+(\S+)", line)
+        if m:
+            xclbin_name = m.group(1)
+
+        # Extract --npu-insts-name=VALUE
+        m = re.search(r"--npu-insts-name[=\s]+(\S+)", line)
+        if m:
+            insts_name = m.group(1)
+
+        if xclbin_name:
+            designs.append({
+                "xclbin": xclbin_name,
+                "insts": insts_name,
+            })
+
+    json.dump({"dir": example_dir, "designs": designs}, sys.stdout)
+    print()
+
+
+# ===========================================================================
 # Main: argument parser with subcommands
 # ===========================================================================
 
@@ -796,6 +860,20 @@ def main():
         help="Architecture (default: aie2)",
     )
 
+    # build-manifest
+    p_bm = subparsers.add_parser(
+        "build-manifest",
+        help="Dry-run make to discover xclbin/insts output pairs",
+    )
+    p_bm.add_argument(
+        "--dir", required=True,
+        help="Path to the example source directory",
+    )
+    p_bm.add_argument(
+        "--chess", action="store_true",
+        help="Use Chess compiler (CHESS=true)",
+    )
+
     args = parser.parse_args()
 
     if args.command == "device-model":
@@ -806,6 +884,8 @@ def main():
         cmd_test_manifest(args)
     elif args.command == "trace-events":
         cmd_trace_events(args)
+    elif args.command == "build-manifest":
+        cmd_build_manifest(args)
 
 
 if __name__ == "__main__":

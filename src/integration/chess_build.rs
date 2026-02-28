@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::aietools::AieTools;
+use super::bridge;
 use crate::config::Config;
 use crate::testing::artifacts;
 
@@ -34,6 +35,13 @@ pub struct BuildResult {
     pub prj_dir: Option<PathBuf>,
     /// Build output (stdout + stderr) for diagnostics.
     pub build_log: String,
+    /// Synthetic aiecc.py commands from build manifest (for multi-xclbin).
+    ///
+    /// Populated by `build_example()` via the bridge `build-manifest`
+    /// subcommand. Each entry is a synthetic command string containing
+    /// `--xclbin-name=` and optionally `--npu-insts-name=` flags, in the
+    /// format expected by `find_all_xclbin_results()`.
+    pub build_commands: Vec<String>,
 }
 
 /// Options controlling a single build invocation.
@@ -109,26 +117,12 @@ fn is_cache_valid(
 
 /// Find an xclbin produced by an example build.
 ///
-/// Prefers `final.xclbin` (the most common convention), then falls back to
-/// the first `*.xclbin` found in the directory. Returns `None` if the
-/// directory does not exist or contains no xclbin files.
+/// Returns the first `*.xclbin` found alphabetically in the directory.
+/// With the build manifest in place, this is a fallback -- the primary
+/// xclbin comes from the manifest. Returns `None` if the directory
+/// does not exist or contains no xclbin files.
 fn find_example_xclbin(build_dir: &Path) -> Option<PathBuf> {
-    let final_path = build_dir.join("final.xclbin");
-    if final_path.exists() {
-        return Some(final_path);
-    }
-
-    // Scan for any xclbin
-    let entries = std::fs::read_dir(build_dir).ok()?;
-    let mut xclbins: Vec<PathBuf> = entries
-        .flatten()
-        .filter(|e| {
-            e.path().extension().map_or(false, |ext| ext == "xclbin")
-        })
-        .map(|e| e.path())
-        .collect();
-    xclbins.sort();
-    xclbins.into_iter().next()
+    artifacts::collect_xclbins(build_dir).into_iter().next()
 }
 
 impl BuildEnv {
@@ -365,6 +359,7 @@ impl BuildEnv {
                     insts: artifacts::find_insts(output_dir),
                     prj_dir: artifacts::find_prj_dir(output_dir),
                     build_log,
+                    build_commands: vec![],
                 });
             } else {
                 return Err(format!(
@@ -385,6 +380,7 @@ impl BuildEnv {
                     insts: artifacts::find_insts(output_dir),
                     prj_dir: artifacts::find_prj_dir(output_dir),
                     build_log,
+                    build_commands: vec![],
                 });
             }
             return Err(format!(
@@ -398,6 +394,7 @@ impl BuildEnv {
             insts: artifacts::find_insts(output_dir),
             prj_dir: artifacts::find_prj_dir(output_dir),
             build_log,
+            build_commands: vec![],
         })
     }
 
@@ -694,6 +691,7 @@ impl BuildEnv {
             insts: artifacts::find_insts(output_dir),
             prj_dir: artifacts::find_prj_dir(output_dir),
             build_log,
+            build_commands: vec![],
         })
     }
 
@@ -714,9 +712,17 @@ impl BuildEnv {
     ) -> Result<BuildResult, String> {
         let build_dir = output_dir.join("build");
 
+        // Query the build manifest to discover all xclbin/insts pairs.
+        // Runs `make -nBs` (dry run, no actual build) to parse aiecc.py flags.
+        // Done before the cache check so cached results also get manifest info.
+        let build_commands = bridge::BridgePath::discover()
+            .and_then(|bp| bridge::query_build_manifest(&bp, source_dir, opts.use_chess))
+            .unwrap_or_default();
+
         // Check cache
         if !opts.force_rebuild {
-            if let Some(result) = self.check_example_cache(python_source, &build_dir) {
+            if let Some(mut result) = self.check_example_cache(python_source, &build_dir) {
+                result.build_commands = build_commands;
                 return Ok(result);
             }
         }
@@ -821,6 +827,7 @@ impl BuildEnv {
             insts: artifacts::find_insts(&build_dir),
             prj_dir: artifacts::find_prj_dir(&build_dir),
             build_log,
+            build_commands,
         })
     }
 
@@ -830,22 +837,34 @@ impl BuildEnv {
         python_source: &Path,
         build_dir: &Path,
     ) -> Option<BuildResult> {
-        let xclbin_path = find_example_xclbin(build_dir)?;
+        let xclbins = artifacts::collect_xclbins(build_dir);
+        if xclbins.is_empty() {
+            return None;
+        }
 
-        let xclbin_modified = xclbin_path.metadata().ok()?.modified().ok()?;
         let source_modified = python_source.metadata().ok()?.modified().ok()?;
 
-        if is_cache_valid(xclbin_modified, source_modified, self.toolchain_mtime) {
-            log::info!("Using cached example build at {}", xclbin_path.display());
-            Some(BuildResult {
-                xclbin: xclbin_path,
-                insts: artifacts::find_insts(build_dir),
-                prj_dir: artifacts::find_prj_dir(build_dir),
-                build_log: "(cached)".to_string(),
-            })
-        } else {
-            None
+        // ALL xclbins must be newer than the source and toolchain.
+        // If any single artifact is stale, the entire cache is invalid.
+        for xclbin in &xclbins {
+            let xclbin_modified = xclbin.metadata().ok()?.modified().ok()?;
+            if !is_cache_valid(xclbin_modified, source_modified, self.toolchain_mtime) {
+                return None;
+            }
         }
+
+        log::info!(
+            "Using cached example build ({} xclbin(s)) in {}",
+            xclbins.len(),
+            build_dir.display()
+        );
+        Some(BuildResult {
+            xclbin: xclbins.into_iter().next().unwrap(),
+            insts: artifacts::find_insts(build_dir),
+            prj_dir: artifacts::find_prj_dir(build_dir),
+            build_log: "(cached)".to_string(),
+            build_commands: vec![],
+        })
     }
 
     /// Check if a cached NPU test build result exists and is still valid.
@@ -872,6 +891,7 @@ impl BuildEnv {
                 insts: artifacts::find_insts(output_dir),
                 prj_dir: artifacts::find_prj_dir(output_dir),
                 build_log: "(cached)".to_string(),
+                build_commands: vec![],
             })
         } else {
             None
@@ -928,6 +948,7 @@ impl BuildEnv {
                 insts: artifacts::find_insts(output_dir),
                 prj_dir: artifacts::find_prj_dir(output_dir),
                 build_log: "(cached)".to_string(),
+                build_commands: vec![],
             })
         } else {
             None
@@ -978,12 +999,27 @@ impl BuildEnv {
         cmd.env("PYTHONPATH", &self.pythonpath);
         cmd.env("PEANO_INSTALL_DIR", &self.peano_dir);
 
-        // PATH: prepend mlir-aie bin and peano bin
+        // MLIR_AIE_DIR: makefile-common uses this for kernel include paths
+        // (-I ${MLIR_AIE_DIR}/include). The activate script sets it to the
+        // repo root, but aie_api/ headers only exist under install/include/.
+        // mlir_aie_bin is install/bin or build/bin; parent is the correct root.
+        if let Some(mlir_aie_dir) = self.mlir_aie_bin.parent() {
+            cmd.env("MLIR_AIE_DIR", mlir_aie_dir);
+        }
+
+        // PATH: prepend mlir-aie bin, peano bin, and aietools bin
         let mut path = self.mlir_aie_bin.to_string_lossy().to_string();
         let peano_bin = self.peano_dir.join("bin");
         if peano_bin.exists() {
             path.push(':');
             path.push_str(&peano_bin.to_string_lossy());
+        }
+        if let Some(ref aietools) = self.aietools_root {
+            let aietools_bin = aietools.join("bin");
+            if aietools_bin.exists() {
+                path.push(':');
+                path.push_str(&aietools_bin.to_string_lossy());
+            }
         }
         if let Ok(system_path) = std::env::var("PATH") {
             path.push(':');

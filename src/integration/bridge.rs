@@ -125,6 +125,44 @@ impl PlatformInfo {
     }
 }
 
+/// Query the Makefile dry-run to discover xclbin/insts output pairs.
+///
+/// Runs `make -nBs` via the bridge and parses aiecc.py invocations for
+/// `--xclbin-name` and `--npu-insts-name` flags. Returns synthetic
+/// command strings that `find_all_xclbin_results()` can parse.
+///
+/// Returns `None` if the bridge fails or finds no aiecc.py calls.
+pub fn query_build_manifest(
+    bridge: &BridgePath,
+    example_dir: &Path,
+    use_chess: bool,
+) -> Option<Vec<String>> {
+    let dir_str = example_dir.to_string_lossy().to_string();
+    let mut args = vec!["--dir", &dir_str];
+    if use_chess {
+        args.push("--chess");
+    }
+
+    let json = invoke_bridge(bridge, "build-manifest", &args).ok()?;
+
+    let designs = json["designs"].as_array()?;
+    if designs.is_empty() {
+        return None;
+    }
+
+    let mut commands = Vec::new();
+    for design in designs {
+        let xclbin = design["xclbin"].as_str()?;
+        let mut cmd = format!("aiecc.py --xclbin-name={}", xclbin);
+        if let Some(insts) = design["insts"].as_str() {
+            cmd.push_str(&format!(" --npu-insts-name={}", insts));
+        }
+        commands.push(cmd);
+    }
+
+    Some(commands)
+}
+
 /// Build feasibility information for a single test.
 #[derive(Debug)]
 pub struct BuildFeasibility {
@@ -407,5 +445,47 @@ mod tests {
         assert!(info.supports_device("npu1_2col"));
         assert!(!info.supports_device("npu2"));
         assert!(!info.supports_device("npu2_3col"));
+    }
+
+    #[test]
+    fn test_query_build_manifest() {
+        let bridge = match skip_if_no_bridge() {
+            Some(b) => b,
+            None => return,
+        };
+
+        // Test on passthrough_dmas (single xclbin)
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let examples_dir = crate_dir
+            .parent()
+            .unwrap()
+            .join("mlir-aie/programming_examples/basic/passthrough_dmas");
+        if !examples_dir.exists() {
+            return; // skip if mlir-aie not available
+        }
+
+        let commands = query_build_manifest(&bridge, &examples_dir, false);
+        assert!(commands.is_some(), "build-manifest returned None");
+        let commands = commands.unwrap();
+        assert!(!commands.is_empty());
+        assert!(
+            commands[0].contains("--xclbin-name="),
+            "command should contain --xclbin-name"
+        );
+    }
+
+    #[test]
+    fn test_query_build_manifest_nonexistent() {
+        let bridge = match skip_if_no_bridge() {
+            Some(b) => b,
+            None => return,
+        };
+
+        let result = query_build_manifest(
+            &bridge,
+            Path::new("/nonexistent_example_dir_12345"),
+            false,
+        );
+        assert!(result.is_none());
     }
 }
