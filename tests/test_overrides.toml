@@ -11,6 +11,8 @@
 # Categories:
 #   [skip]           - Tests that cannot run on our hardware or in the emulator
 #   [expected_fail]  - Tests with known emulator issues (tracked for regression)
+#   [peano_build_xfail] - Tests whose Peano builds are expected to fail
+#   [chess_build_xfail] - Tests whose Chess builds are expected to fail
 
 [skip]
 # Platform: requires NPU2 (Strix Point / AIE2P), we have NPU1 (Phoenix)
@@ -31,3 +33,13 @@ add_maskwrite = "Maskwrite works but core reads uninitialized memory (no DMA inp
 add_one_ctrl_packet = "Control packet routing not implemented"
 add_one_ctrl_packet_4_cores = "Multi-core control packet routing not implemented"
 add_one_ctrl_packet_col_overlay = "Column control overlay not implemented"
+
+[peano_build_xfail]
+# bfp16 matmul kernels create <8 x s8> G_BUILD_VECTOR for splat constants
+# passed to intrinsics. Different from the SLP vectorization bug (llvm-aie#480)
+# which was fixed via TTI getArithmeticInstrCost + getRegisterBitWidth.
+"examples-ml-block_datatypes-matrix_multiplication-in_core_shuffle" = "Peano: bfp16 <8 x s8> G_BUILD_VECTOR legalization"
+"examples-ml-block_datatypes-matrix_multiplication-single_core" = "Peano: bfp16 <8 x s8> G_BUILD_VECTOR legalization"
+"examples-ml-block_datatypes-matrix_multiplication-single_core_no_tiling" = "Peano: bfp16 <8 x s8> G_BUILD_VECTOR legalization"
+"examples-ml-block_datatypes-matrix_multiplication-whole_array" = "Peano: bfp16 <8 x s8> G_BUILD_VECTOR legalization"
+"examples-ml-block_datatypes-matrix_multiplication-whole_array_shuffle" = "Peano: bfp16 <8 x s8> G_BUILD_VECTOR legalization"

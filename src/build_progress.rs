@@ -488,6 +488,10 @@ pub struct ParallelBuildConfig {
     pub chess_only: bool,
     /// Force rebuild even if cached artifacts are fresh.
     pub force_rebuild: bool,
+    /// Peano builds expected to fail (upstream compiler bugs).
+    pub peano_build_xfail: std::collections::HashSet<String>,
+    /// Chess builds expected to fail (upstream compiler bugs).
+    pub chess_build_xfail: std::collections::HashSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -638,11 +642,13 @@ pub fn run_parallel_builds<T: Buildable>(
         run_with_grid(
             build_env, tests, &progress, &work_queue, &work_counter,
             &results, thread_count, nice, force_rebuild,
+            &config.peano_build_xfail, &config.chess_build_xfail,
         );
     } else {
         run_verbose(
             build_env, tests, &progress, &work_queue, &work_counter,
             &results, thread_count, nice, force_rebuild,
+            &config.peano_build_xfail, &config.chess_build_xfail,
         );
     }
 
@@ -674,6 +680,8 @@ fn run_with_grid<T: Buildable>(
     thread_count: usize,
     nice: Option<i32>,
     force_rebuild: bool,
+    peano_build_xfail: &std::collections::HashSet<String>,
+    chess_build_xfail: &std::collections::HashSet<String>,
 ) {
     let mut stdout = io::stdout();
 
@@ -707,6 +715,7 @@ fn run_with_grid<T: Buildable>(
                     run_worker(
                         build_env, tests, progress, work_queue,
                         work_counter, results, nice, force_rebuild,
+                        peano_build_xfail, chess_build_xfail,
                     );
                 })
             })
@@ -738,6 +747,8 @@ fn run_verbose<T: Buildable>(
     thread_count: usize,
     nice: Option<i32>,
     force_rebuild: bool,
+    peano_build_xfail: &std::collections::HashSet<String>,
+    chess_build_xfail: &std::collections::HashSet<String>,
 ) {
     // Parallel with atomic per-build output: each build prints its
     // status line when it completes, so output order reflects completion
@@ -750,7 +761,7 @@ fn run_verbose<T: Buildable>(
     std::thread::scope(|s| {
         for _ in 0..thread_count {
             s.spawn(|| {
-                run_worker(build_env, tests, progress, work_queue, work_counter, results, nice, force_rebuild);
+                run_worker(build_env, tests, progress, work_queue, work_counter, results, nice, force_rebuild, peano_build_xfail, chess_build_xfail);
             });
         }
     });
@@ -767,6 +778,8 @@ fn run_worker<T: Buildable>(
     results: &Mutex<Vec<BuildTaskResult>>,
     nice: Option<i32>,
     force_rebuild: bool,
+    peano_build_xfail: &std::collections::HashSet<String>,
+    chess_build_xfail: &std::collections::HashSet<String>,
 ) {
     loop {
         let task_idx = work_counter.fetch_add(1, Ordering::SeqCst);
@@ -825,16 +838,24 @@ fn run_worker<T: Buildable>(
                 save_build_log(&name, track_name, &e);
                 let diag = extract_build_diagnostic(&e);
                 let completed = progress.completed.fetch_add(1, Ordering::Relaxed) + 1;
+                let xfail_set = match task.track {
+                    Track::Peano => peano_build_xfail,
+                    Track::Chess => chess_build_xfail,
+                };
+                let is_xfail = xfail_set.contains(&name);
+                let status = if is_xfail { "XFAIL" } else { "FAILED" };
                 eprintln!(
-                    "[{:2}/{}] {:40} {} FAILED ({:.1}s): {}",
+                    "[{:2}/{}] {:40} {} {} ({:.1}s): {}",
                     completed, progress.total_builds,
                     &name[..name.len().min(40)],
-                    track_name, elapsed.as_secs_f64(), diag,
+                    track_name, status, elapsed.as_secs_f64(), diag,
                 );
-                eprintln!(
-                    "         log: build/logs/{}-{}.log",
-                    name.replace('/', "-"), track_name.to_lowercase(),
-                );
+                if !is_xfail {
+                    eprintln!(
+                        "         log: build/logs/{}-{}.log",
+                        name.replace('/', "-"), track_name.to_lowercase(),
+                    );
+                }
 
                 progress.update_cell(task.cell_idx, task.track, TrackResult::Failed);
 

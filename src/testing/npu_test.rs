@@ -449,7 +449,11 @@ pub fn filter_build_steps(run_lines: &[String]) -> Vec<String> {
         // Drop execution and host-compilation lines.
         // Host compilers (clang, g++, etc.) produce test.exe which we don't
         // need for emulation -- we only need xclbin + insts.
+        // Also drop test execution commands (./test, ./test.exe) since we
+        // run tests separately via the emulator or hardware runner.
         if effective.contains("./test.exe")
+            || effective == "./test"
+            || effective.starts_with("./test ")
             || effective.contains("test.py")
             || effective.starts_with("clang ")
             || effective.starts_with("clang++ ")
@@ -556,6 +560,10 @@ pub struct TestOverrides {
     pub skip: HashMap<String, String>,
     /// Tests expected to fail, with reason string.
     pub expected_fail: HashMap<String, String>,
+    /// Tests whose Peano builds are expected to fail (upstream compiler bugs).
+    pub peano_build_xfail: HashMap<String, String>,
+    /// Tests whose Chess builds are expected to fail (upstream compiler bugs).
+    pub chess_build_xfail: HashMap<String, String>,
 }
 
 impl TestOverrides {
@@ -814,6 +822,37 @@ mod tests {
         assert!(aiecc.contains("--aie-generate-elf"));
         assert!(aiecc.contains("--elf-name=insts.elf"));
         assert!(!aiecc.contains("--aie-generate-npu-insts"));
+    }
+
+    #[test]
+    fn test_filter_build_steps_drops_bare_test_binary() {
+        // sync_task_complete_token and others use `./test` (no .exe extension).
+        // These are execution commands, not build steps.
+        let run_lines = vec![
+            "%python %S/aie2.py > ./aie2.mlir".to_string(),
+            "%python aiecc.py --no-xchesscc --no-xbridge --no-aiesim --aie-generate-npu-insts --aie-generate-xclbin --no-compile-host --xclbin-name=final.xclbin --npu-insts-name=insts.bin ./aie2.mlir".to_string(),
+            "%run_on_npu1% ./test".to_string(),
+        ];
+
+        let steps = filter_build_steps(&run_lines);
+        assert_eq!(steps.len(), 2);
+        assert!(steps[0].contains("aie2.py"));
+        assert!(steps[1].contains("aiecc.py"));
+        // ./test must NOT appear -- it's execution, not build
+        assert!(steps.iter().all(|s| !s.contains("./test")));
+    }
+
+    #[test]
+    fn test_filter_build_steps_drops_test_with_args() {
+        // Some tests pass arguments to ./test
+        let run_lines = vec![
+            "%python aiecc.py --xclbin-name=final.xclbin ./aie2.mlir".to_string(),
+            "%run_on_npu1% ./test -x final.xclbin -k MLIR_AIE".to_string(),
+        ];
+
+        let steps = filter_build_steps(&run_lines);
+        assert_eq!(steps.len(), 1);
+        assert!(steps[0].contains("aiecc.py"));
     }
 
     #[test]
@@ -1218,6 +1257,30 @@ flaky_test = "Known emulator limitation"
 
         assert!(tests[2].skip_reason.is_none());
         assert!(tests[2].expected_fail_reason.is_none());
+    }
+
+    #[test]
+    fn test_overrides_compiler_build_xfail_parses() {
+        let dir = test_dir("overrides_build_xfail");
+        let path = dir.join("test_overrides.toml");
+        std::fs::write(&path, r#"
+[peano_build_xfail]
+ctrl_packet_reconfig = "i8 vector legalization (llvm-aie#480)"
+"examples-ml-matmul" = "bfp16 vector legalization"
+
+[chess_build_xfail]
+some_chess_test = "Chess intrinsic issue"
+"#).unwrap();
+
+        let overrides = TestOverrides::load(&path);
+        assert_eq!(overrides.peano_build_xfail.len(), 2);
+        assert_eq!(
+            overrides.peano_build_xfail.get("ctrl_packet_reconfig").unwrap(),
+            "i8 vector legalization (llvm-aie#480)",
+        );
+        assert!(overrides.peano_build_xfail.contains_key("examples-ml-matmul"));
+        assert_eq!(overrides.chess_build_xfail.len(), 1);
+        assert!(overrides.chess_build_xfail.contains_key("some_chess_test"));
     }
 
     #[test]

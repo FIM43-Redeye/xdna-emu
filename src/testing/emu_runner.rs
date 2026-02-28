@@ -1368,6 +1368,15 @@ pub fn run(opts: &Options) {
             .filter(|t| runner_config::matches_filter(&t.name, &opts.filters))
             .collect();
 
+        // Load build XFAIL sets (upstream compiler bugs, etc.)
+        let (peano_build_xfail, chess_build_xfail) = {
+            let overrides = npu_test::TestOverrides::load(&overrides_path);
+            (
+                overrides.peano_build_xfail.into_keys().collect::<std::collections::HashSet<_>>(),
+                overrides.chess_build_xfail.into_keys().collect::<std::collections::HashSet<_>>(),
+            )
+        };
+
         // Parallel build phase
         let env = build_env.as_ref().unwrap();
         let build_result = build_progress::run_parallel_builds(
@@ -1381,6 +1390,8 @@ pub fn run(opts: &Options) {
                 gen_sim: opts.aiesim,
                 chess_only: opts.chess_only,
                 force_rebuild: opts.rebuild,
+                peano_build_xfail: peano_build_xfail.clone(),
+                chess_build_xfail: chess_build_xfail.clone(),
             },
         );
 
@@ -1463,6 +1474,8 @@ pub fn run(opts: &Options) {
                         gen_sim: false, // examples don't use aiesimulator
                         chess_only: opts.chess_only,
                         force_rebuild: opts.rebuild,
+                        peano_build_xfail: peano_build_xfail.clone(),
+                        chess_build_xfail: chess_build_xfail.clone(),
                     },
                 );
 
