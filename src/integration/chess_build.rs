@@ -612,8 +612,12 @@ impl BuildEnv {
             .to_string();
 
         for (step_idx, step) in test.build_steps.iter().enumerate() {
-            // Apply compiler override (Peano/Chess flags) to aiecc.py lines
-            let overridden = apply_compiler_override(step, opts.use_chess);
+            // Apply compiler override (Peano/Chess flags) to aiecc.py and
+            // xchesscc_wrapper lines
+            let peano_clang = self.peano_dir.join("bin/clang");
+            let overridden = apply_compiler_override(
+                step, opts.use_chess, Some(&peano_clang),
+            );
 
             // Expand lit substitutions (%S -> source_dir, %python, %aietools, etc.)
             let expanded = expand_lit_subs(
@@ -769,6 +773,26 @@ impl BuildEnv {
                     #[cfg(unix)]
                     {
                         let _ = std::os::unix::fs::symlink(&path, &dest);
+                    }
+                }
+            }
+
+            // Some Makefiles include parent-level files via relative paths
+            // (e.g. `include ${SELF_DIR}../makefile-common`). When SELF_DIR
+            // uses $(lastword $(MAKEFILE_LIST)) without realpath, the include
+            // resolves relative to the build tree, not the source tree.
+            // Symlink parent-level makefile-common files so these includes work.
+            if let Some(source_parent) = abs_source.parent() {
+                if let Some(output_parent) = output_dir.parent() {
+                    for name in &["makefile-common", "Makefile.common"] {
+                        let src_file = source_parent.join(name);
+                        let dst_file = output_parent.join(name);
+                        if src_file.exists() && !dst_file.exists() {
+                            #[cfg(unix)]
+                            {
+                                let _ = std::os::unix::fs::symlink(&src_file, &dst_file);
+                            }
+                        }
                     }
                 }
             }
@@ -1167,12 +1191,23 @@ fn expand_lit_subs(
 /// Apply compiler override to a build command.
 ///
 /// For aiecc.py commands, ensures the correct compiler and linker flags are
-/// present regardless of what the original RUN line specified. Non-aiecc.py
-/// commands (cp, sed, xchesscc_wrapper) pass through unchanged.
+/// present regardless of what the original RUN line specified.
+///
+/// For xchesscc_wrapper commands in Peano mode, rewrites to use Peano's clang
+/// so kernel objects don't contain Chess-specific ELF sections (.tctmemtab,
+/// .rtstab, etc.) that ld.lld rejects with --orphan-handling=error.
 ///
 /// This operates on raw RUN line text (before lit expansion), so `aiecc.py`
 /// appears as a literal string that's easy to match.
-pub fn apply_compiler_override(cmd: &str, use_chess: bool) -> String {
+pub fn apply_compiler_override(cmd: &str, use_chess: bool, peano_clang: Option<&Path>) -> String {
+    // Rewrite xchesscc_wrapper kernel compilation to Peano clang in Peano mode.
+    // Pattern: xchesscc_wrapper <arch> [-I <path>]... -c <source>.cc -o <output>.o
+    if !use_chess && cmd.contains("xchesscc_wrapper") {
+        if let Some(clang) = peano_clang {
+            return rewrite_xchesscc_to_peano(cmd, clang);
+        }
+    }
+
     if !cmd.contains("aiecc.py") {
         return cmd.to_string();
     }
@@ -1200,6 +1235,69 @@ pub fn apply_compiler_override(cmd: &str, use_chess: bool) -> String {
     }
 
     result
+}
+
+/// Rewrite a `xchesscc_wrapper` command to use Peano's clang.
+///
+/// Input:  `xchesscc_wrapper aie2 -I /path/include -c source.cc -o output.o`
+/// Output: `<clang> --target=aie2-none-unknown-elf -I /path/include -c source.cc -o output.o`
+///
+/// Extracts the architecture target from the first argument after xchesscc_wrapper,
+/// preserves -I, -c, -o flags and their arguments, and drops Chess-specific flags
+/// like +w, -d, -f, +l that don't apply to clang.
+fn rewrite_xchesscc_to_peano(cmd: &str, clang: &Path) -> String {
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+
+    // Find xchesscc_wrapper position
+    let wrapper_idx = match parts.iter().position(|p| p.contains("xchesscc_wrapper")) {
+        Some(i) => i,
+        None => return cmd.to_string(),
+    };
+
+    // Next token is architecture (aie2, aie2p, etc.)
+    let arch = parts.get(wrapper_idx + 1).copied().unwrap_or("aie2");
+    let target = format!("--target={}-none-unknown-elf", arch);
+
+    let mut result = vec![clang.to_string_lossy().to_string(), target];
+
+    // Walk remaining args, keeping -I, -c, -o and their values,
+    // dropping Chess-specific flags (+w, -d, -f, +l, +a)
+    let mut i = wrapper_idx + 2;
+    while i < parts.len() {
+        let arg = parts[i];
+        match arg {
+            // Flags with a following value to preserve
+            "-I" | "-c" | "-o" => {
+                result.push(arg.to_string());
+                if let Some(&val) = parts.get(i + 1) {
+                    result.push(val.to_string());
+                    i += 1;
+                }
+            }
+            // Chess-specific flags with a following value to skip
+            "+w" | "+l" | "+a" => {
+                i += 1; // skip the value too
+            }
+            // Chess-specific standalone flags to skip
+            "-d" | "-f" => {}
+            // Keep everything else (source files, -DFOO, etc.)
+            _ if arg.starts_with('-') || arg.starts_with('+') => {
+                // Unknown flag -- skip Chess-specific + flags, keep - flags
+                if arg.starts_with('+') {
+                    // +flags are Chess-specific
+                } else {
+                    result.push(arg.to_string());
+                }
+            }
+            _ => {
+                // Bare argument (source file, object file, etc.)
+                result.push(arg.to_string());
+            }
+        }
+        i += 1;
+    }
+
+    result.join(" ")
 }
 
 /// Required environment variables for Chess builds (legacy check).
@@ -1512,6 +1610,7 @@ mod tests {
         let result = apply_compiler_override(
             "%python aiecc.py --xchesscc --xbridge --no-aiesim %s",
             false,
+            None,
         );
         assert!(result.contains("--no-xchesscc"));
         assert!(result.contains("--no-xbridge"));
@@ -1524,6 +1623,7 @@ mod tests {
         let result = apply_compiler_override(
             "%python aiecc.py --no-xchesscc --no-xbridge --no-aiesim %s",
             true,
+            None,
         );
         assert!(result.contains("--xchesscc"));
         assert!(result.contains("--xbridge"));
@@ -1537,6 +1637,7 @@ mod tests {
         let result = apply_compiler_override(
             "%python aiecc.py --no-aiesim %s",
             false,
+            None,
         );
         assert!(result.contains("--no-xchesscc"));
         assert!(result.contains("--no-xbridge"));
@@ -1544,9 +1645,9 @@ mod tests {
 
     #[test]
     fn test_compiler_override_non_aiecc_passthrough() {
-        // Non-aiecc.py commands should pass through unchanged
+        // Non-aiecc.py commands pass through when no peano_clang provided
         let cmd = "xchesscc_wrapper aie2 -c %S/kernel.cc";
-        let result = apply_compiler_override(cmd, false);
+        let result = apply_compiler_override(cmd, false, None);
         assert_eq!(result, cmd);
     }
 
@@ -1555,8 +1656,54 @@ mod tests {
         let result = apply_compiler_override(
             "%python aiecc.py --xchesscc --xbridge %s",
             false,
+            None,
         );
         assert!(!result.contains("  "));
+    }
+
+    #[test]
+    fn test_compiler_override_xchesscc_to_peano() {
+        // xchesscc_wrapper lines should be rewritten to peano clang in Peano mode
+        let clang = Path::new("/peano/bin/clang");
+        let result = apply_compiler_override(
+            "xchesscc_wrapper aie2 -I %aietools/include -c %S/vector_scalar_mul.cc -o vector_scalar_mul.o",
+            false,
+            Some(clang),
+        );
+        assert!(result.starts_with("/peano/bin/clang"));
+        assert!(result.contains("--target=aie2-none-unknown-elf"));
+        assert!(result.contains("-I %aietools/include"));
+        assert!(result.contains("-c %S/vector_scalar_mul.cc"));
+        assert!(result.contains("-o vector_scalar_mul.o"));
+        assert!(!result.contains("xchesscc_wrapper"));
+    }
+
+    #[test]
+    fn test_compiler_override_xchesscc_chess_mode_passthrough() {
+        // xchesscc_wrapper lines should pass through in Chess mode
+        let clang = Path::new("/peano/bin/clang");
+        let cmd = "xchesscc_wrapper aie2 -I %aietools/include -c kernel.cc -o kernel.o";
+        let result = apply_compiler_override(cmd, true, Some(clang));
+        assert_eq!(result, cmd);
+    }
+
+    #[test]
+    fn test_compiler_override_xchesscc_drops_chess_flags() {
+        // Chess-specific flags (+w, -d, -f, +l) should be stripped
+        let clang = Path::new("/peano/bin/clang");
+        let result = apply_compiler_override(
+            "xchesscc_wrapper aie2 +w /work -d -f input.o kernel.o +l core.bcf -o core.elf",
+            false,
+            Some(clang),
+        );
+        assert!(!result.contains("+w"));
+        assert!(!result.contains("/work"));
+        assert!(!result.contains("+l"));
+        assert!(!result.contains("core.bcf"));
+        // -d and -f are standalone Chess flags
+        assert!(result.contains("-o core.elf"));
+        assert!(result.contains("input.o"));
+        assert!(result.contains("kernel.o"));
     }
 
     #[test]
