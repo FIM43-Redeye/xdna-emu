@@ -1113,6 +1113,41 @@ impl BuildEnv {
     }
 
     /// Return the first path that exists from a list of candidates.
+    /// Peano clang compiler path.
+    pub fn peano_clang(&self) -> PathBuf {
+        self.peano_dir.join("bin/clang")
+    }
+
+    /// Python interpreter from ironenv venv.
+    pub fn python(&self) -> &Path {
+        &self.python
+    }
+
+    /// Path to aiecc.py.
+    pub fn aiecc(&self) -> &Path {
+        &self.aiecc
+    }
+
+    /// PYTHONPATH for mlir-aie Python modules.
+    pub fn pythonpath(&self) -> &str {
+        &self.pythonpath
+    }
+
+    /// Peano installation directory.
+    pub fn peano_dir(&self) -> &Path {
+        &self.peano_dir
+    }
+
+    /// mlir-aie bin directory.
+    pub fn mlir_aie_bin(&self) -> &Path {
+        &self.mlir_aie_bin
+    }
+
+    /// aietools root, if available.
+    pub fn aietools_root(&self) -> Option<&Path> {
+        self.aietools_root.as_deref()
+    }
+
     fn find_first_existing(candidates: &[PathBuf]) -> Option<PathBuf> {
         candidates.iter().find(|p| p.exists()).cloned()
     }
