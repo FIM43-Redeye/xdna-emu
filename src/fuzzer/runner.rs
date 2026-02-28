@@ -121,7 +121,9 @@ pub fn run_fuzz(opts: &Options) {
     println!("  aiecc: {}", tools.aiecc.display());
     println!("  template: {}", tools.template_script.display());
 
-    let fuzz_dir = PathBuf::from("build/fuzz");
+    let fuzz_dir = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("build/fuzz");
     std::fs::create_dir_all(&fuzz_dir).ok();
 
     let mut pass = 0usize;
@@ -258,7 +260,7 @@ fn compile_fuzz_case(
     }
 
     // Step 3: Compile MLIR to xclbin via aiecc.py
-    let aie_mlir = case_dir.join("aie.mlir");
+    // Run from case_dir so aiecc.py can find the kernel .o and write outputs there.
     let mut aiecc_cmd = Command::new(&tools.python);
     aiecc_cmd
         .arg(&tools.aiecc)
@@ -271,7 +273,7 @@ fn compile_fuzz_case(
         .arg("--alloc-scheme=basic-sequential")
         .arg("--xclbin-name=aie.xclbin")
         .arg("--npu-insts-name=insts.bin")
-        .arg(&aie_mlir);
+        .arg("aie.mlir");
     aiecc_cmd.current_dir(case_dir);
     tools.apply_env(&mut aiecc_cmd);
 
@@ -279,8 +281,10 @@ fn compile_fuzz_case(
         .map_err(|e| format!("Failed to spawn aiecc.py: {}", e))?;
     if !aiecc_out.status.success() {
         let stderr = String::from_utf8_lossy(&aiecc_out.stderr);
+        let stdout = String::from_utf8_lossy(&aiecc_out.stdout);
+        let combined = if stderr.is_empty() { stdout } else { stderr };
         return Err(format!("aiecc.py failed:\n{}",
-            stderr.lines().take(10).collect::<Vec<_>>().join("\n")));
+            combined.lines().take(10).collect::<Vec<_>>().join("\n")));
     }
 
     // Verify outputs exist

@@ -147,6 +147,8 @@ fn lower_op(out: &mut String, op: &KernelOp, indent: &str) {
 /// Lower an Operand to a C++ expression string.
 fn lower_operand(op: &Operand) -> String {
     match op {
+        // Var(1) is the loop index variable 'i'; all others are temporaries.
+        Operand::Var(Var(1)) => "i".to_string(),
         Operand::Var(v) => format!("t{}", v.0),
         Operand::Literal(n) => format!("{}", n),
         Operand::Load { buf, idx } => {
@@ -417,7 +419,7 @@ mod tests {
             },
         };
         let cpp = lower_to_cpp(&params);
-        assert!(cpp.contains("buf_in[t1]"));
-        assert!(cpp.contains("buf_out[t1]"));
+        assert!(cpp.contains("buf_in[i]"));
+        assert!(cpp.contains("buf_out[i]"));
     }
 }
