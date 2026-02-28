@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use super::test_cpp_parser::BufferSpec;
 use super::native_hw::TestCppPattern;
 use crate::build_progress::{Buildable, BuiltArtifact};
-use crate::integration::chess_build::{BuildEnv, BuildOpts, BuildResult};
+use crate::integration::chess_build::{self, BuildEnv, BuildOpts, BuildResult};
 
 // ---------------------------------------------------------------------------
 // Individual artifact helpers
@@ -40,18 +40,19 @@ pub fn find_insts(dir: &Path) -> Option<PathBuf> {
 
 /// Find the matching insts file for a multi-variant xclbin.
 ///
-/// In multi-xclbin test directories, the `aie` prefix in the xclbin name
-/// maps to an `insts` prefix in the instructions file:
+/// In multi-xclbin test directories, the xclbin name maps to an
+/// instructions file via several conventions:
 ///
-///   `aie2_buffer.xclbin` -> `insts2_buffer.txt`
-///   `aie2_cascade.xclbin` -> `insts2_cascade.txt`
+///   npu-xrt:  `aie2_buffer.xclbin` -> `insts2_buffer.txt` (aie->insts prefix swap)
+///   examples: `add.xclbin` -> `add_insts.bin` (<stem>_insts suffix)
 ///
 /// Search order:
 /// 1. `aie`->`insts` prefix swap, with `.txt` then `.bin` extension
-/// 2. `<stem>.txt`, `<stem>.bin` (literal stem match)
-/// 3. Shared `insts.bin` fallback
+/// 2. `<stem>_insts.bin`, `<stem>_insts.txt` (examples convention)
+/// 3. `<stem>.txt`, `<stem>.bin` (literal stem match)
+/// 4. Shared `insts.bin` fallback
 pub fn find_matching_insts(dir: &Path, xclbin_stem: &str) -> Option<PathBuf> {
-    // Convention: swap "aie" prefix to "insts", keep the rest
+    // Convention 1: swap "aie" prefix to "insts", keep the rest
     if let Some(suffix) = xclbin_stem.strip_prefix("aie") {
         let insts_stem = format!("insts{}", suffix);
         for ext in &["txt", "bin"] {
@@ -59,6 +60,14 @@ pub fn find_matching_insts(dir: &Path, xclbin_stem: &str) -> Option<PathBuf> {
             if candidate.exists() {
                 return Some(candidate);
             }
+        }
+    }
+
+    // Convention 2: <stem>_insts.bin / <stem>_insts.txt (programming_examples)
+    for ext in &["bin", "txt"] {
+        let candidate = dir.join(format!("{}_insts.{}", xclbin_stem, ext));
+        if candidate.exists() {
+            return Some(candidate);
         }
     }
 
@@ -222,9 +231,9 @@ pub fn discover_examples(examples_root: &Path) -> Vec<BuildArtifact> {
 
 /// Recursive walker for programming_examples directories.
 ///
-/// Looks for directories containing a `build/` subdirectory with xclbin
-/// files. When found, creates BuildArtifact entries with the `examples/`
-/// name prefix.
+/// Looks for directories containing xclbin files, searching both the
+/// conventional `build/` subdirectory and the example directory itself.
+/// Creates BuildArtifact entries with the `examples/` name prefix.
 fn walk_examples(dir: &Path, root: &Path, results: &mut Vec<BuildArtifact>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -246,31 +255,58 @@ fn walk_examples(dir: &Path, root: &Path, results: &mut Vec<BuildArtifact>) {
             None => continue,
         };
 
-        // Skip hidden dirs, build dirs, and common non-test directories.
-        if dir_name.starts_with('.') || dir_name.starts_with('_') {
+        // Skip hidden dirs, build output dirs, and common non-test directories.
+        // "build" is checked explicitly below, not treated as an example.
+        if dir_name.starts_with('.')
+            || dir_name.starts_with('_')
+            || dir_name == "build"
+        {
             continue;
         }
 
+        // Search for xclbins in `build/` first, then in the directory itself.
         let build_dir = subdir.join("build");
-        if build_dir.is_dir() {
-            let xclbins = collect_xclbins(&build_dir);
-            if !xclbins.is_empty() {
-                // Compute name relative to root, prefixed with "examples/"
-                let rel = subdir.strip_prefix(root).unwrap_or(&subdir);
-                let name = format!("examples/{}", rel.to_string_lossy());
+        let (artifact_dir, xclbins) = if build_dir.is_dir() {
+            let found = collect_xclbins(&build_dir);
+            if found.is_empty() {
+                // build/ exists but empty -- check the directory itself
+                (subdir.clone(), collect_xclbins(&subdir))
+            } else {
+                (build_dir, found)
+            }
+        } else {
+            (subdir.clone(), collect_xclbins(&subdir))
+        };
 
-                // Use the first xclbin (typically final.xclbin)
-                let insts = find_insts(&build_dir);
+        if !xclbins.is_empty() {
+            let rel = subdir.strip_prefix(root).unwrap_or(&subdir);
+            let base_name = format!("examples/{}", rel.to_string_lossy());
+            let prj = find_prj_dir(&artifact_dir);
 
-                // Only include if we have instructions -- an xclbin without
-                // insts can't be executed by the emulator.
+            if xclbins.len() == 1 {
+                // Single xclbin: one entry named after directory
+                let insts = find_insts(&artifact_dir);
                 if insts.is_some() {
-                    let prj = find_prj_dir(&build_dir);
                     results.push(BuildArtifact {
-                        name,
+                        name: base_name,
                         xclbin: xclbins.into_iter().next().unwrap(),
                         insts,
                         prj_dir: prj,
+                    });
+                }
+            } else {
+                // Multiple xclbins: one entry per variant
+                for xclbin in &xclbins {
+                    let stem = xclbin
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let insts = find_matching_insts(&artifact_dir, &stem);
+                    results.push(BuildArtifact {
+                        name: format!("{}/{}", base_name, stem),
+                        xclbin: xclbin.clone(),
+                        insts,
+                        prj_dir: prj.clone(),
                     });
                 }
             }
@@ -304,6 +340,8 @@ pub struct ExampleSource {
     pub buffer_spec: Option<BufferSpec>,
     /// Which argument pattern the test.cpp uses.
     pub test_cpp_pattern: Option<TestCppPattern>,
+    /// If set, this example should be skipped (e.g. targets AIE2P hardware).
+    pub skip: Option<String>,
 }
 
 impl Buildable for ExampleSource {
@@ -316,7 +354,7 @@ impl Buildable for ExampleSource {
     }
 
     fn skip_reason(&self) -> Option<&str> {
-        None
+        self.skip.as_deref()
     }
 
     fn can_build(&self) -> bool {
@@ -346,9 +384,45 @@ impl Buildable for ExampleSource {
 
     fn collect_artifacts(
         &self,
-        _output_dir: &Path,
+        output_dir: &Path,
         result: &BuildResult,
     ) -> Vec<BuiltArtifact> {
+        // Use build manifest commands to discover all xclbin/insts pairs.
+        // The build_commands are synthetic aiecc.py invocations parsed from
+        // `make -nBs` output by the bridge build-manifest subcommand.
+        if !result.build_commands.is_empty() {
+            let build_dir = output_dir.join("build");
+            let all = chess_build::find_all_xclbin_results(
+                &build_dir,
+                &result.build_commands,
+            );
+
+            if !all.is_empty() {
+                if all.len() == 1 {
+                    let (ref xclbin, ref insts, _) = all[0];
+                    return vec![BuiltArtifact {
+                        test_name: self.name.clone(),
+                        xclbin: xclbin.clone(),
+                        insts: insts.clone(),
+                        prj_dir: result.prj_dir.clone(),
+                        build_log: result.build_log.clone(),
+                    }];
+                }
+
+                // Multi-xclbin: one artifact per variant
+                return all.iter().map(|(xclbin, insts, variant)| {
+                    BuiltArtifact {
+                        test_name: format!("{}/{}", self.name, variant),
+                        xclbin: xclbin.clone(),
+                        insts: insts.clone(),
+                        prj_dir: result.prj_dir.clone(),
+                        build_log: result.build_log.clone(),
+                    }
+                }).collect();
+            }
+        }
+
+        // Fallback: use the single xclbin from BuildResult
         vec![BuiltArtifact {
             test_name: self.name.clone(),
             xclbin: result.xclbin.clone(),
@@ -428,12 +502,16 @@ fn walk_buildable_examples(
                 let test_cpp_pattern = super::native_hw::detect_test_cpp(&subdir)
                     .map(|(_, pattern)| pattern);
 
+                // Detect AIE2P-only examples
+                let skip = detect_aie2p(&makefile);
+
                 results.push(ExampleSource {
                     name,
                     source_dir: subdir.clone(),
                     python_source: py_source,
                     buffer_spec,
                     test_cpp_pattern,
+                    skip,
                 });
 
                 // Don't recurse into directories that are themselves examples
@@ -444,6 +522,35 @@ fn walk_buildable_examples(
         // Recurse into subdirectories
         walk_buildable_examples(&subdir, root, results);
     }
+}
+
+/// Detect if an example requires AIE2P (NPU2) hardware by reading its Makefile.
+///
+/// Returns a skip reason string if the example targets AIE2P, None otherwise.
+/// Detection checks:
+/// - `devicename=npu2` or `devicename ?= npu2` (hardcoded AIE2P device target)
+/// - `aie_kernels/aie2p` in VPATH (AIE2P-specific kernel source code)
+fn detect_aie2p(makefile: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(makefile).ok()?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // Skip lines with $(NPU2) conditional -- those default to npu (AIE2)
+        if trimmed.contains("$(NPU2)") || trimmed.contains("${NPU2}") {
+            continue;
+        }
+        // devicename=npu2 or devicename ?= npu2 (hardcoded)
+        if trimmed.starts_with("devicename")
+            && trimmed.contains("npu2")
+            && !trimmed.starts_with('#')
+        {
+            return Some("requires AIE2P (npu2) hardware".into());
+        }
+        // VPATH includes aie2p kernel source
+        if trimmed.starts_with("VPATH") && trimmed.contains("aie_kernels/aie2p") {
+            return Some("uses AIE2P kernel source (aie_kernels/aie2p)".into());
+        }
+    }
+    None
 }
 
 /// Find the primary Python source file in a directory.
@@ -577,6 +684,25 @@ mod tests {
         fs::write(dir.join("insts2_buffer.bin"), b"data").unwrap();
         let result = find_matching_insts(&dir, "aie2_buffer");
         assert_eq!(result, Some(dir.join("insts2_buffer.bin")));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_find_matching_insts_stem_insts_convention() {
+        let dir = test_dir("matching_stem_insts");
+        // programming_examples convention: add.xclbin -> add_insts.bin
+        fs::write(dir.join("add_insts.bin"), b"data").unwrap();
+        let result = find_matching_insts(&dir, "add");
+        assert_eq!(result, Some(dir.join("add_insts.bin")));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_find_matching_insts_stem_insts_txt() {
+        let dir = test_dir("matching_stem_insts_txt");
+        fs::write(dir.join("mult_insts.txt"), b"data").unwrap();
+        let result = find_matching_insts(&dir, "mult");
+        assert_eq!(result, Some(dir.join("mult_insts.txt")));
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -820,6 +946,27 @@ mod tests {
     }
 
     #[test]
+    fn test_discover_examples_multi_xclbin() {
+        let root = test_dir("examples_multi_xclbin");
+        let build = root.join("basic/packet_switch/build");
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join("add.xclbin"), b"xclbin1").unwrap();
+        fs::write(build.join("mult.xclbin"), b"xclbin2").unwrap();
+        fs::write(build.join("add_insts.bin"), b"insts1").unwrap();
+        fs::write(build.join("mult_insts.bin"), b"insts2").unwrap();
+
+        let mut arts = discover_examples(&root);
+        arts.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(arts.len(), 2);
+        assert_eq!(arts[0].name, "examples/basic/packet_switch/add");
+        assert_eq!(arts[1].name, "examples/basic/packet_switch/mult");
+        // Each variant should have its own insts file via find_matching_insts
+        assert!(arts[0].insts.is_some());
+        assert!(arts[1].insts.is_some());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn test_discover_examples_skips_hidden_dirs() {
         let root = test_dir("examples_hidden");
         // Hidden dir should be skipped
@@ -837,5 +984,65 @@ mod tests {
         let arts = discover_examples(&root);
         assert!(arts.is_empty());
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn test_discover_examples_no_build_subdir() {
+        // xclbin lives directly in the example directory, not in build/
+        let root = test_dir("examples_no_build");
+        let example = root.join("basic/flat_example");
+        fs::create_dir_all(&example).unwrap();
+        fs::write(example.join("design.xclbin"), b"xclbin").unwrap();
+        fs::write(example.join("insts.bin"), b"data").unwrap();
+
+        let arts = discover_examples(&root);
+        assert_eq!(arts.len(), 1);
+        assert_eq!(arts[0].name, "examples/basic/flat_example");
+        assert!(arts[0].xclbin.ends_with("design.xclbin"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // detect_aie2p tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_detect_aie2p_hardcoded_devicename() {
+        let dir = test_dir("aie2p_hardcoded");
+        let makefile = dir.join("Makefile");
+        fs::write(&makefile, "devicename=npu2\ntarget: build\n").unwrap();
+        assert!(detect_aie2p(&makefile).is_some());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_detect_aie2p_conditional_is_not_hardcoded() {
+        let dir = test_dir("aie2p_conditional");
+        let makefile = dir.join("Makefile");
+        fs::write(&makefile,
+            "devicename ?= $(if $(filter 1,$(NPU2)),npu2,npu)\n"
+        ).unwrap();
+        assert!(detect_aie2p(&makefile).is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_detect_aie2p_vpath_kernel() {
+        let dir = test_dir("aie2p_vpath");
+        let makefile = dir.join("Makefile");
+        fs::write(&makefile,
+            "VPATH :=${srcdir}/../../../aie_kernels/aie2p\n"
+        ).unwrap();
+        assert!(detect_aie2p(&makefile).is_some());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_detect_aie2p_npu1_only() {
+        let dir = test_dir("aie2p_npu1");
+        let makefile = dir.join("Makefile");
+        fs::write(&makefile, "devicename ?= npu\ntarget: build\n").unwrap();
+        assert!(detect_aie2p(&makefile).is_none());
+        fs::remove_dir_all(&dir).ok();
     }
 }
