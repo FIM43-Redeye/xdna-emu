@@ -25,6 +25,7 @@ pub mod runner_config;
 pub mod runner_stats;
 pub mod hw_executor;
 pub mod runner_display;
+pub mod host_defines;
 pub mod native_hw;
 pub mod process_control;
 pub mod lit_wrapper;

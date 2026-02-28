@@ -161,15 +161,17 @@ fn preprocessor_defines(
 
 /// Compile a test.cpp into a test executable.
 ///
-/// Uses the system g++ with XRT and test_utils headers/libraries.
-/// Caches the result: skips recompilation if test.exe is newer than test.cpp.
+/// Uses CMake when the example has a CMakeLists.txt (picks up buffer-size
+/// defines automatically), falling back to direct g++ compilation.
+/// Caches the result: skips recompilation if the executable is newer than
+/// test.cpp.
 ///
 /// # Arguments
 /// * `test_cpp` - Path to the test.cpp source file
-/// * `output_dir` - Directory to place the compiled test.exe
+/// * `output_dir` - Directory to place the compiled executable
 /// * `mlir_aie_path` - Root of the mlir-aie tree (for test_utils headers)
 ///
-/// Returns the path to the compiled test.exe on success.
+/// Returns the path to the compiled executable on success.
 pub fn compile_test_exe(
     test_cpp: &Path,
     output_dir: &Path,
@@ -178,7 +180,82 @@ pub fn compile_test_exe(
     compile_test_exe_with_artifacts(test_cpp, output_dir, mlir_aie_path, None, None)
 }
 
+/// Compile test.exe via CMake using the example's own CMakeLists.txt.
+///
+/// Returns None if no CMakeLists.txt exists (caller should use g++ fallback).
+/// Returns Some(Ok(path)) on success, Some(Err(msg)) on cmake failure.
+///
+/// CMake picks up buffer-size defines (IN1_SIZE, OUT_SIZE, etc.) from each
+/// example's cache variables and target_compile_definitions. XCLBIN/INSTS_TXT
+/// are not needed at compile time -- these tests use xrt_test_wrapper.h which
+/// takes paths via CLI args at runtime.
+fn compile_test_exe_cmake(
+    source_dir: &Path,
+    build_dir: &Path,
+) -> Option<Result<PathBuf, String>> {
+    let cmakelists = source_dir.join("CMakeLists.txt");
+    if !cmakelists.exists() {
+        return None;
+    }
+
+    if let Err(e) = std::fs::create_dir_all(build_dir) {
+        return Some(Err(format!("Failed to create build dir: {}", e)));
+    }
+
+    // Configure. Use system default g++ (not g++-13) because XRT's
+    // libxrt_coreutil.so requires CXXABI_1.3.15 from GCC 15's libstdc++.
+    let configure = Command::new("cmake")
+        .arg("-S").arg(source_dir)
+        .arg("-B").arg(build_dir)
+        .arg("-DTARGET_NAME=test")
+        .arg("-DCMAKE_CXX_COMPILER=g++")
+        .output();
+
+    match configure {
+        Err(e) => return Some(Err(format!("cmake configure failed: {}", e))),
+        Ok(out) if !out.status.success() => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Some(Err(format!("cmake configure failed: {}",
+                stderr.lines().take(5).collect::<Vec<_>>().join("\n"))));
+        }
+        _ => {}
+    }
+
+    // Build
+    let build = Command::new("cmake")
+        .arg("--build").arg(build_dir)
+        .output();
+
+    match build {
+        Err(e) => return Some(Err(format!("cmake build failed: {}", e))),
+        Ok(out) if !out.status.success() => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Some(Err(format!("cmake build failed: {}",
+                stderr.lines().take(5).collect::<Vec<_>>().join("\n"))));
+        }
+        _ => {}
+    }
+
+    // Find the executable -- cmake names it "test" per TARGET_NAME
+    let exe = build_dir.join("test");
+    if exe.exists() {
+        Some(Ok(exe))
+    } else {
+        // Some cmake configs may produce test.exe
+        let exe_alt = build_dir.join("test.exe");
+        if exe_alt.exists() {
+            Some(Ok(exe_alt))
+        } else {
+            Some(Err(format!("cmake build succeeded but no executable in {}",
+                build_dir.display())))
+        }
+    }
+}
+
 /// Compile a test.cpp with explicit artifact names for preprocessor defines.
+///
+/// Tries CMake first (when CMakeLists.txt exists) to pick up buffer-size
+/// defines automatically, then falls back to direct g++ compilation.
 ///
 /// When `xclbin_name` or `insts_name` are provided, they override the
 /// default `-DXCLBIN="aie.xclbin"` / `-DINSTS_TXT="insts.bin"` defines.
@@ -191,24 +268,30 @@ pub fn compile_test_exe_with_artifacts(
     insts_name: Option<&str>,
 ) -> Result<PathBuf, String> {
     let test_exe = output_dir.join("test.exe");
+    let test_alt = output_dir.join("test");
 
-    // Cache check: skip if test.exe is newer than test.cpp
-    if test_exe.exists() {
-        if let (Ok(src_meta), Ok(exe_meta)) =
-            (std::fs::metadata(test_cpp), std::fs::metadata(&test_exe))
-        {
-            if let (Ok(src_time), Ok(exe_time)) =
-                (src_meta.modified(), exe_meta.modified())
-            {
-                if exe_time > src_time {
-                    return Ok(test_exe);
-                }
-            }
-        }
+    // Cache check: skip if executable is newer than test.cpp
+    let cached = [&test_exe, &test_alt].iter()
+        .find(|p| p.exists())
+        .and_then(|exe_path| {
+            let src_time = std::fs::metadata(test_cpp).ok()?.modified().ok()?;
+            let exe_time = std::fs::metadata(exe_path).ok()?.modified().ok()?;
+            if exe_time > src_time { Some(exe_path.to_path_buf()) } else { None }
+        });
+    if let Some(cached_path) = cached {
+        return Ok(cached_path);
     }
 
     std::fs::create_dir_all(output_dir)
         .map_err(|e| format!("Failed to create output dir: {}", e))?;
+
+    // Try CMake first (picks up buffer-size defines automatically).
+    let source_dir = test_cpp.parent().unwrap_or(Path::new("."));
+    if let Some(result) = compile_test_exe_cmake(source_dir, output_dir) {
+        return result;
+    }
+
+    // Fallback: direct g++ compilation (for tests without CMakeLists.txt).
 
     // test_utils include/library paths.
     // mlir-aie builds test_utils as a static library and installs headers.
@@ -246,6 +329,11 @@ pub fn compile_test_exe_with_artifacts(
     // Preprocessor defines for #define-pattern tests.
     // Harmless for cxxopts tests (macros are guarded by #ifndef).
     for define in preprocessor_defines(xclbin_name, insts_name) {
+        cmd.arg(define);
+    }
+
+    // Extra defines from Makefile defaults (tests without CMakeLists.txt).
+    for define in super::host_defines::extra_defines(source_dir) {
         cmd.arg(define);
     }
 
