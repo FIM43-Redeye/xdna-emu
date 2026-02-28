@@ -793,8 +793,14 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
     // Auto-detect parallelism: use all available CPUs.
     if jobs == 0 {
         jobs = match mode {
-            // Lit/trace/fuzz modes default to 1 (sequential)
-            RunMode::Lit | RunMode::Trace | RunMode::TraceAll | RunMode::Fuzz => 1,
+            // Lit/trace modes default to 1 (sequential)
+            RunMode::Lit | RunMode::Trace | RunMode::TraceAll => 1,
+            // Fuzz mode parallelizes compilation and emulator runs.
+            RunMode::Fuzz => {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            }
             RunMode::EmuHw => {
                 std::thread::available_parallelism()
                     .map(|n| n.get())
