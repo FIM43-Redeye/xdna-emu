@@ -407,5 +407,6 @@ fn main() {
         RunMode::Lit => run_lit_mode(&opts),
         RunMode::Trace => run_trace_mode(&opts),
         RunMode::TraceAll => run_trace_all_mode(&opts),
+        RunMode::Fuzz => xdna_emu::fuzzer::runner::run_fuzz(&opts),
     }
 }

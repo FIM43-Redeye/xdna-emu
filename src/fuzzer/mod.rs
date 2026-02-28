@@ -7,4 +7,7 @@
 //! See `docs/plans/2026-02-28-logic-fuzzer-design.md` for the full design.
 
 pub mod ast;
+pub mod gen;
+pub mod lower_cpp;
 pub mod params;
+pub mod runner;

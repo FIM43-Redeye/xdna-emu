@@ -35,6 +35,8 @@ pub enum RunMode {
     Trace,
     /// Triple trace comparison: HW + emulator (+ optional aiesimulator).
     TraceAll,
+    /// Differential fuzzing: generate random kernels, compare emulator vs NPU.
+    Fuzz,
 }
 
 // ---------------------------------------------------------------------------
@@ -529,6 +531,12 @@ pub struct Options {
     pub output_path: PathBuf,
     /// When true, print JSON to stdout instead of human-readable output.
     pub format_json: bool,
+
+    // --- Fuzz mode ---
+    /// Number of fuzz iterations to run.
+    pub fuzz_iterations: usize,
+    /// Base seed for fuzz generation (None = use wall clock).
+    pub fuzz_seed: Option<u64>,
 }
 
 /// Parse CLI arguments and merge with runner config.
@@ -549,6 +557,11 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
     let mut lit_mode = false;
     let mut trace_mode = false;
     let mut trace_all_mode = false;
+    let mut fuzz_mode = false;
+
+    // Fuzz mode
+    let mut fuzz_iterations: usize = 100;
+    let mut fuzz_seed: Option<u64> = None;
 
     // Emu+HW mode
     let mut elfanalyze = false;
@@ -614,6 +627,23 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
             "--lit" => lit_mode = true,
             "--trace" => trace_mode = true,
             "--trace-all" => { trace_all_mode = true; chess_only = true; }
+            "--fuzz" => fuzz_mode = true,
+
+            // --- Fuzz mode ---
+            "--iterations" => {
+                let v = next_value(&mut iter, "--iterations");
+                fuzz_iterations = v.parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid --iterations value: {}", v);
+                    std::process::exit(1);
+                });
+            }
+            "--seed" => {
+                let v = next_value(&mut iter, "--seed");
+                fuzz_seed = Some(v.parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid --seed value: {}", v);
+                    std::process::exit(1);
+                }));
+            }
 
             // --- Common ---
             "--verbose" | "-v" => verbose = true,
@@ -723,7 +753,9 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
     }
 
     // Determine mode (mutually exclusive)
-    let mode = if trace_all_mode {
+    let mode = if fuzz_mode {
+        RunMode::Fuzz
+    } else if trace_all_mode {
         RunMode::TraceAll
     } else if trace_mode {
         RunMode::Trace
@@ -761,8 +793,8 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
     // Auto-detect parallelism: use all available CPUs.
     if jobs == 0 {
         jobs = match mode {
-            // Lit mode defaults to 1 (lit handles parallelism internally)
-            RunMode::Lit | RunMode::Trace | RunMode::TraceAll => 1,
+            // Lit/trace/fuzz modes default to 1 (sequential)
+            RunMode::Lit | RunMode::Trace | RunMode::TraceAll | RunMode::Fuzz => 1,
             RunMode::EmuHw => {
                 std::thread::available_parallelism()
                     .map(|n| n.get())
@@ -818,6 +850,9 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
 
         output_path: output_path.unwrap_or_else(|| PathBuf::from("build/results.json")),
         format_json,
+
+        fuzz_iterations,
+        fuzz_seed,
     }
 }
 
@@ -840,6 +875,7 @@ fn print_usage() {
     eprintln!("  --lit               Run tests via LLVM's lit framework");
     eprintln!("  --trace             Trace collection on real NPU hardware");
     eprintln!("  --trace-all         Triple trace: HW + emulator (+ aiesimulator)");
+    eprintln!("  --fuzz              Differential fuzzing (generate + emulate + compare)");
     eprintln!();
     eprintln!("Common options:");
     eprintln!("  -v, --verbose       Show detailed output");
@@ -876,6 +912,10 @@ fn print_usage() {
     eprintln!("Trace mode options:");
     eprintln!("  --trace-size BYTES  Trace buffer size (default: 1048576 = 1MB)");
     eprintln!("  --aiesim-trace      Also collect aiesimulator VCD traces (--trace-all)");
+    eprintln!();
+    eprintln!("Fuzz mode options:");
+    eprintln!("  --iterations N      Number of fuzz cases to generate (default: 100)");
+    eprintln!("  --seed N            Base RNG seed (default: wall clock)");
     eprintln!();
     eprintln!("Filters are substring matches on test names, OR-ed together.");
 }
