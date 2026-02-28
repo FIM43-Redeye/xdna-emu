@@ -289,7 +289,8 @@ fn walk_examples(dir: &Path, root: &Path, results: &mut Vec<BuildArtifact>) {
 ///
 /// Unlike `NpuTestSource` (which uses RUN-line build steps from lit files),
 /// examples use `make` with `makefile-common` conventions: `CHESS=true|false`
-/// controls the compiler, and `build/final.xclbin` is the output.
+/// controls the compiler, and the default target produces the xclbin output
+/// (usually `build/final.xclbin`, but some examples use other names).
 #[derive(Debug, Clone)]
 pub struct ExampleSource {
     /// Test name, prefixed with "examples/".

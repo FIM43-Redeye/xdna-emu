@@ -107,6 +107,30 @@ fn is_cache_valid(
     true
 }
 
+/// Find an xclbin produced by an example build.
+///
+/// Prefers `final.xclbin` (the most common convention), then falls back to
+/// the first `*.xclbin` found in the directory. Returns `None` if the
+/// directory does not exist or contains no xclbin files.
+fn find_example_xclbin(build_dir: &Path) -> Option<PathBuf> {
+    let final_path = build_dir.join("final.xclbin");
+    if final_path.exists() {
+        return Some(final_path);
+    }
+
+    // Scan for any xclbin
+    let entries = std::fs::read_dir(build_dir).ok()?;
+    let mut xclbins: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| {
+            e.path().extension().map_or(false, |ext| ext == "xclbin")
+        })
+        .map(|e| e.path())
+        .collect();
+    xclbins.sort();
+    xclbins.into_iter().next()
+}
+
 impl BuildEnv {
     /// Discover the build environment from config and filesystem.
     ///
@@ -689,11 +713,10 @@ impl BuildEnv {
         opts: &BuildOpts,
     ) -> Result<BuildResult, String> {
         let build_dir = output_dir.join("build");
-        let xclbin_path = build_dir.join("final.xclbin");
 
         // Check cache
         if !opts.force_rebuild {
-            if let Some(result) = self.check_example_cache(python_source, output_dir, &xclbin_path) {
+            if let Some(result) = self.check_example_cache(python_source, &build_dir) {
                 return Ok(result);
             }
         }
@@ -756,7 +779,9 @@ impl BuildEnv {
         };
 
         cmd.args(["-C", &output_dir.to_string_lossy()]);
-        cmd.args(["build/final.xclbin"]);
+        // Use the default target (`all`), not a hardcoded path.
+        // Most examples define `all: build/final.xclbin`, but some use
+        // parameterized names or multiple xclbin targets.
         cmd.arg(format!("CHESS={}", chess_flag));
         self.apply_env(&mut cmd);
 
@@ -768,7 +793,8 @@ impl BuildEnv {
         let build_log = format!("--- stdout ---\n{}\n--- stderr ---\n{}", stdout, stderr);
 
         if !output.status.success() {
-            if xclbin_path.exists() {
+            // Check if an xclbin was produced despite the error
+            if find_example_xclbin(&build_dir).is_some() {
                 log::warn!(
                     "{} example build exited with {} but xclbin was produced",
                     compiler_label, output.status.code().unwrap_or(-1)
@@ -783,12 +809,12 @@ impl BuildEnv {
             }
         }
 
-        if !xclbin_path.exists() {
-            return Err(format!(
-                "{} example build completed but no xclbin found at {}",
-                compiler_label, xclbin_path.display()
-            ));
-        }
+        let xclbin_path = find_example_xclbin(&build_dir).ok_or_else(|| {
+            format!(
+                "{} example build completed but no xclbin found in {}",
+                compiler_label, build_dir.display()
+            )
+        })?;
 
         Ok(BuildResult {
             xclbin: xclbin_path,
@@ -802,21 +828,17 @@ impl BuildEnv {
     fn check_example_cache(
         &self,
         python_source: &Path,
-        _output_dir: &Path,
-        xclbin_path: &Path,
+        build_dir: &Path,
     ) -> Option<BuildResult> {
-        if !xclbin_path.exists() {
-            return None;
-        }
+        let xclbin_path = find_example_xclbin(build_dir)?;
 
         let xclbin_modified = xclbin_path.metadata().ok()?.modified().ok()?;
         let source_modified = python_source.metadata().ok()?.modified().ok()?;
 
         if is_cache_valid(xclbin_modified, source_modified, self.toolchain_mtime) {
-            let build_dir = xclbin_path.parent()?;
             log::info!("Using cached example build at {}", xclbin_path.display());
             Some(BuildResult {
-                xclbin: xclbin_path.to_path_buf(),
+                xclbin: xclbin_path,
                 insts: artifacts::find_insts(build_dir),
                 prj_dir: artifacts::find_prj_dir(build_dir),
                 build_log: "(cached)".to_string(),
