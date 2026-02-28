@@ -103,9 +103,11 @@ def generate_mlir(
     mlir_type, elem_bytes = DTYPE_INFO[dtype_str]
     chunk_elems, n_iters = _chunk_size(total_elements)
 
-    # Memtile-level chunk is 2x the tile chunk for double-buffering throughput.
-    # (The objectfifo.link handles the size mismatch automatically.)
-    memtile_chunk = chunk_elems * 2
+    # Memtile-level chunk must be a multiple of tile chunk for the
+    # objectfifo.link split/join to work.  A 2x ratio (pipelining) requires
+    # n_iters to be even; with n_iters=1 the DMA would stall at half an
+    # element.  Use 1:1 ratio for correctness at any iteration count.
+    memtile_chunk = chunk_elems
 
     # Total transfer in 32-bit words (for runtime_sequence memrefs).
     total_i32 = _i32_words(total_elements, elem_bytes)

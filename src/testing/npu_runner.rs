@@ -215,6 +215,24 @@ pub fn runner_binary() -> Option<PathBuf> {
         }
     }
 
+    // Try relative to the executable's location (works for release binaries
+    // where CARGO_MANIFEST_DIR is not set). The binary is typically at
+    // target/release/npu-test or target/debug/npu-test, so the project root
+    // is two directories up.
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            // exe_dir = target/release/ or target/debug/
+            if let Some(project_root) = exe_dir.parent().and_then(|p| p.parent()) {
+                for rel_path in RUNNER_SEARCH_PATHS {
+                    let path = project_root.join(rel_path);
+                    if path.exists() {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
+
     // Try relative to current working directory
     for rel_path in RUNNER_SEARCH_PATHS {
         let path = PathBuf::from(rel_path);

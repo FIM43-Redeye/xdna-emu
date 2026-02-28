@@ -928,7 +928,6 @@ impl XclbinSuite {
                 .find(|b| b.direction == BufferDir::Output)
                 .map(|b| b.size_elements * b.element_type.byte_size())
                 .unwrap_or(4096)
-                .max(4096)
         } else {
             4096
         };

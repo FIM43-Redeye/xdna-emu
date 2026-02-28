@@ -1,16 +1,15 @@
 //! Fuzz iteration loop: generate, compile, run, compare.
 //!
-//! Orchestrates the full fuzzing pipeline. Each iteration:
-//! 1. Generate random `FuzzParams` from a seed
-//! 2. Lower to C++ kernel source
-//! 3. Compile to xclbin via IRON template + aiecc.py
-//! 4. Run on emulator
-//! 5. (future) Run on real NPU hardware
-//! 6. Compare outputs
+//! Orchestrates the full fuzzing pipeline in two phases:
+//! 1. **Compile phase** (parallel): generate C++ kernels and compile to xclbin
+//!    using multiple threads.
+//! 2. **Execute phase** (sequential): run each compiled case through the
+//!    emulator and optionally on real NPU hardware, then compare outputs.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 use crate::fuzzer::gen;
 use crate::fuzzer::lower_cpp;
@@ -92,7 +91,14 @@ fn dtype_str(dtype: ScalarType) -> &'static str {
     }
 }
 
-/// Run the fuzz loop: generate, compile, run on emulator + NPU, compare.
+/// A compiled fuzz case ready for execution.
+struct CompiledCase {
+    seed: u64,
+    params: FuzzParams,
+    case_dir: PathBuf,
+}
+
+/// Run the fuzz loop: batch-compile, then run on emulator + NPU and compare.
 pub fn run_fuzz(opts: &Options) {
     let iterations = opts.fuzz_iterations;
     let base_seed = opts.fuzz_seed.unwrap_or_else(|| {
@@ -126,89 +132,355 @@ pub fn run_fuzz(opts: &Options) {
         .join("build/fuzz");
     std::fs::create_dir_all(&fuzz_dir).ok();
 
+    let jobs = opts.jobs;
+    let hw = opts.hw;
+
+    // Phase 1: Generate and compile all cases (parallel).
+    let compile_start = Instant::now();
+    let (compiled, compile_errors) = compile_all(
+        &tools, base_seed, iterations, &fuzz_dir, jobs, opts.verbose,
+    );
+    let compile_elapsed = compile_start.elapsed().as_secs_f64();
+    println!(
+        "Compile: {} ok, {} error ({:.1}s, {} threads)",
+        compiled.len(), compile_errors, compile_elapsed, jobs,
+    );
+
+    if compiled.is_empty() {
+        println!("Fuzz complete: 0 pass, 0 fail, {} error", compile_errors);
+        return;
+    }
+
+    // Phase 2: Execute on emulator (and optionally NPU), compare outputs.
+    let exec_start = Instant::now();
+    let (pass, fail, exec_errors) = execute_all(&compiled, opts.max_cycles, hw, opts.verbose);
+    let exec_elapsed = exec_start.elapsed().as_secs_f64();
+
+    let total_errors = compile_errors + exec_errors;
+    println!(
+        "Execute: {} pass, {} fail, {} error ({:.1}s)",
+        pass, fail, exec_errors, exec_elapsed,
+    );
+    println!(
+        "Fuzz complete: {} pass, {} fail, {} error",
+        pass, fail, total_errors,
+    );
+
+    if fail > 0 {
+        std::process::exit(1);
+    }
+}
+
+/// Phase 1: Generate C++ and compile to xclbin in parallel.
+///
+/// Returns the list of successfully compiled cases and the error count.
+fn compile_all(
+    tools: &ToolPaths,
+    base_seed: u64,
+    iterations: usize,
+    fuzz_dir: &Path,
+    jobs: usize,
+    verbose: bool,
+) -> (Vec<CompiledCase>, usize) {
+    // Generate all case metadata up front (cheap, deterministic).
+    let cases: Vec<(u64, FuzzParams, PathBuf)> = (0..iterations)
+        .map(|i| {
+            let seed = base_seed.wrapping_add(i as u64);
+            let params = gen::generate(seed);
+            let case_dir = fuzz_dir.join(format!("seed_{}", seed));
+            (seed, params, case_dir)
+        })
+        .collect();
+
+    // Write all C++ source files (fast, single-threaded).
+    for (seed, params, case_dir) in &cases {
+        std::fs::create_dir_all(case_dir).ok();
+        let cpp = lower_cpp::lower_to_cpp(params);
+        if let Err(e) = std::fs::write(case_dir.join("fuzz_kernel.cc"), &cpp) {
+            eprintln!("seed {} write error: {}", seed, e);
+        }
+    }
+
+    if verbose {
+        println!("Generated {} kernels, compiling with {} threads...", cases.len(), jobs);
+    }
+
+    // Parallel compilation.
+    // ToolPaths is not Clone, so wrap in Arc for sharing across threads.
+    // We use scoped threads so the borrow is safe.
+    let total = cases.len();
+    let compiled = std::sync::Mutex::new(Vec::new());
+    let errors = std::sync::atomic::AtomicUsize::new(0);
+    let done = std::sync::atomic::AtomicUsize::new(0);
+
+    // Work queue: simple shared index.
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+
+    std::thread::scope(|s| {
+        for _ in 0..jobs {
+            let cases = &cases;
+            let tools = &tools;
+            let compiled = &compiled;
+            let errors = &errors;
+            let done = &done;
+            let next_idx = &next_idx;
+
+            s.spawn(move || {
+                loop {
+                    let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if idx >= cases.len() {
+                        break;
+                    }
+
+                    let (seed, params, case_dir) = &cases[idx];
+
+                    match compile_fuzz_case(tools, params, case_dir) {
+                        Ok(_) => {
+                            compiled.lock().unwrap().push(CompiledCase {
+                                seed: *seed,
+                                params: params.clone(),
+                                case_dir: case_dir.clone(),
+                            });
+                        }
+                        Err(e) => {
+                            errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if verbose {
+                                eprintln!("seed {} compile error: {}", seed, e);
+                            }
+                        }
+                    }
+
+                    let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if !verbose {
+                        // Progress on stderr to avoid mixing with output.
+                        eprint!("\rCompiling [{}/{}]", n, total);
+                    }
+                }
+            });
+        }
+    });
+
+    if !verbose {
+        eprintln!(); // newline after progress
+    }
+
+    let error_count = errors.into_inner();
+    let mut result = compiled.into_inner().unwrap();
+    // Sort by seed for deterministic execution order.
+    result.sort_by_key(|c| c.seed);
+    (result, error_count)
+}
+
+/// Phase 2: Execute compiled cases on emulator (and optionally NPU), compare.
+///
+/// Returns (pass, fail, error) counts.
+fn execute_all(
+    cases: &[CompiledCase],
+    max_cycles: u64,
+    hw: bool,
+    verbose: bool,
+) -> (usize, usize, usize) {
+    let total = cases.len();
     let mut pass = 0usize;
-    let fail = 0usize;
+    let mut fail = 0usize;
     let mut error = 0usize;
 
-    for i in 0..iterations {
-        let seed = base_seed.wrapping_add(i as u64);
-        let params = gen::generate(seed);
-        let case_dir = fuzz_dir.join(format!("seed_{}", seed));
-        std::fs::create_dir_all(&case_dir).ok();
+    for (i, case) in cases.iter().enumerate() {
+        let xclbin_path = case.case_dir.join("aie.xclbin");
 
-        // 1. Lower to C++
-        let cpp = lower_cpp::lower_to_cpp(&params);
-        let kernel_path = case_dir.join("fuzz_kernel.cc");
-        if let Err(e) = std::fs::write(&kernel_path, &cpp) {
-            error += 1;
-            if opts.verbose {
-                eprintln!("[{}/{}] seed {} write error: {}", i + 1, iterations, seed, e);
-            }
-            continue;
-        }
-
-        if opts.verbose {
-            println!("[{}/{}] seed {} generated {} ops, {} bytes C++",
-                i + 1, iterations, seed, params.body.ops.len(), cpp.len());
-        }
-
-        // 2. Compile to xclbin
-        match compile_fuzz_case(&tools, &params, &case_dir) {
-            Ok(_) => {}
-            Err(e) => {
-                error += 1;
-                if opts.verbose {
-                    eprintln!("[{}/{}] seed {} compile error: {}", i + 1, iterations, seed, e);
-                }
-                continue;
-            }
-        }
-
-        // 3. Run on emulator
-        let xclbin_path = case_dir.join("aie.xclbin");
-        let emu_output = match run_emulator(&xclbin_path, &params, opts.max_cycles) {
+        // Run on emulator.
+        let emu_output = match run_emulator(&xclbin_path, &case.params, max_cycles) {
             Ok(output) => output,
             Err(e) => {
                 error += 1;
-                if opts.verbose {
-                    eprintln!("[{}/{}] seed {} emulator error: {}", i + 1, iterations, seed, e);
+                if verbose {
+                    eprintln!("[{}/{}] seed {} emulator error: {}", i + 1, total, case.seed, e);
                 }
                 continue;
             }
         };
 
-        if opts.verbose {
-            println!("[{}/{}] seed {} emulator produced {} output bytes",
-                i + 1, iterations, seed, emu_output.len());
+        if verbose {
+            println!("[{}/{}] seed {} emulator: {} bytes", i + 1, total, case.seed, emu_output.len());
         }
 
-        // 4. TODO: Run on real NPU hardware and compare.
-        // For now, consider the emulator run a success if it produced output
-        // without hanging or crashing. Hardware comparison is Phase 1.5.
-        if !emu_output.is_empty() {
-            pass += 1;
+        if !hw {
+            // Emulator-only mode: pass if output is non-empty.
+            if !emu_output.is_empty() {
+                pass += 1;
+            } else {
+                error += 1;
+                if verbose {
+                    eprintln!("[{}/{}] seed {} emulator produced empty output", i + 1, total, case.seed);
+                }
+            }
         } else {
-            error += 1;
-            if opts.verbose {
-                eprintln!("[{}/{}] seed {} emulator produced empty output", i + 1, iterations, seed);
+            // Hardware comparison mode.
+            let insts_path = case.case_dir.join("insts.bin");
+            match run_on_npu_and_compare(case, &xclbin_path, &insts_path, &emu_output, verbose) {
+                CompareResult::Match => {
+                    pass += 1;
+                    if verbose {
+                        println!("[{}/{}] seed {} MATCH", i + 1, total, case.seed);
+                    }
+                }
+                CompareResult::Mismatch { detail } => {
+                    fail += 1;
+                    // Always print mismatches (the whole point of the fuzzer).
+                    eprintln!("[{}/{}] seed {} MISMATCH: {}", i + 1, total, case.seed, detail);
+                }
+                CompareResult::Error(e) => {
+                    error += 1;
+                    if verbose {
+                        eprintln!("[{}/{}] seed {} hw error: {}", i + 1, total, case.seed, e);
+                    }
+                }
             }
         }
 
-        // Progress (overwrite line in non-verbose mode)
-        if !opts.verbose {
-            print!("\r[{}/{}] {} pass, {} fail, {} error",
-                i + 1, iterations, pass, fail, error);
+        // Progress
+        if !verbose {
+            print!("\r[{}/{}] {} pass, {} fail, {} error", i + 1, total, pass, fail, error);
             std::io::stdout().flush().ok();
         }
     }
 
-    if !opts.verbose {
-        println!(); // final newline after progress line
+    if !verbose {
+        println!();
     }
-    println!("Fuzz complete: {} pass, {} fail, {} error", pass, fail, error);
 
-    if fail > 0 {
-        std::process::exit(1);
+    (pass, fail, error)
+}
+
+enum CompareResult {
+    Match,
+    Mismatch { detail: String },
+    Error(String),
+}
+
+/// Run a fuzz case on real NPU hardware and compare output to emulator output.
+fn run_on_npu_and_compare(
+    case: &CompiledCase,
+    xclbin_path: &Path,
+    insts_path: &Path,
+    emu_output: &[u8],
+    verbose: bool,
+) -> CompareResult {
+    use crate::testing::npu_runner;
+    use crate::testing::test_cpp_parser::{
+        BufferDef, BufferDir, BufferSpec, ElementType, InputPattern,
+    };
+
+    if !npu_runner::npu_available() {
+        return CompareResult::Error("NPU hardware not available".into());
+    }
+
+    let elem_type = match case.params.dtype {
+        ScalarType::I32 => ElementType::I32,
+        ScalarType::I16 => ElementType::I16,
+        ScalarType::I8 => ElementType::I8,
+    };
+
+    // Build a BufferSpec matching our fuzz template layout.
+    // XRT kernel args: [0]=opcode, [1]=instr, [2]=ninstr, [3]=bo0, [4]=bo1, [5]=bo2
+    // The runtime_sequence args map to: %in=arg3, %buf=arg4, %out=arg5.
+    // npu_runner uses group_id as the XRT argument index, so data buffers
+    // start at group_id 3 (group_ids 0-2 are reserved for opcode/instr/ninstr).
+    let spec = BufferSpec {
+        buffers: vec![
+            BufferDef {
+                name: "buf_in".to_string(),
+                group_id: 3,
+                size_elements: case.params.buffer_size,
+                element_type: elem_type,
+                direction: BufferDir::Input,
+                input_pattern: InputPattern::Sequential { start: 1, step: 1 },
+            },
+            BufferDef {
+                name: "buf_scratch".to_string(),
+                group_id: 4,
+                size_elements: case.params.buffer_size,
+                element_type: elem_type,
+                direction: BufferDir::Input,
+                input_pattern: InputPattern::Zeros,
+            },
+            BufferDef {
+                name: "buf_out".to_string(),
+                group_id: 5,
+                size_elements: case.params.buffer_size,
+                element_type: elem_type,
+                direction: BufferDir::Output,
+                input_pattern: InputPattern::Zeros,
+            },
+        ],
+        multi_kernel: false,
+    };
+
+    let test_name = format!("fuzz_seed_{}", case.seed);
+    match npu_runner::run_on_npu(&spec, &test_name, xclbin_path, insts_path, 30) {
+        Ok(result) => {
+            // Compare emulator output to NPU output.
+            if emu_output == result.output.as_slice() {
+                CompareResult::Match
+            } else {
+                let detail = format_mismatch(emu_output, &result.output, elem_type);
+                if verbose {
+                    // Save both outputs for debugging.
+                    let _ = std::fs::write(
+                        case.case_dir.join("emu_output.bin"), emu_output,
+                    );
+                    let _ = std::fs::write(
+                        case.case_dir.join("npu_output.bin"), &result.output,
+                    );
+                }
+                CompareResult::Mismatch { detail }
+            }
+        }
+        Err(e) => CompareResult::Error(format!("{:?}", e)),
+    }
+}
+
+/// Format a human-readable mismatch summary.
+fn format_mismatch(
+    emu: &[u8],
+    npu: &[u8],
+    elem_type: crate::testing::test_cpp_parser::ElementType,
+) -> String {
+    let elem_size = elem_type.byte_size();
+    let emu_elems = emu.len() / elem_size;
+    let npu_elems = npu.len() / elem_size;
+
+    if emu.len() != npu.len() {
+        return format!(
+            "size mismatch: emulator={} bytes ({} elems), npu={} bytes ({} elems)",
+            emu.len(), emu_elems, npu.len(), npu_elems,
+        );
+    }
+
+    // Find first differing element.
+    let min_elems = emu_elems.min(npu_elems);
+    for i in 0..min_elems {
+        let offset = i * elem_size;
+        let emu_slice = &emu[offset..offset + elem_size];
+        let npu_slice = &npu[offset..offset + elem_size];
+        if emu_slice != npu_slice {
+            let emu_val = read_elem(emu_slice, elem_size);
+            let npu_val = read_elem(npu_slice, elem_size);
+            return format!(
+                "element [{}]: emulator={}, npu={} ({} total elements)",
+                i, emu_val, npu_val, emu_elems,
+            );
+        }
+    }
+    "outputs differ but no element mismatch found (padding?)".to_string()
+}
+
+fn read_elem(bytes: &[u8], size: usize) -> i64 {
+    match size {
+        1 => bytes[0] as i8 as i64,
+        2 => i16::from_le_bytes([bytes[0], bytes[1]]) as i64,
+        4 => i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64,
+        _ => 0,
     }
 }
 
@@ -218,13 +490,29 @@ fn compile_fuzz_case(
     params: &FuzzParams,
     case_dir: &Path,
 ) -> Result<(), String> {
-    // Step 1: Compile kernel to .o with Peano clang
+    // Skip if already compiled (xclbin exists and is newer than source).
+    let xclbin = case_dir.join("aie.xclbin");
     let kernel_cc = case_dir.join("fuzz_kernel.cc");
+    if xclbin.exists() {
+        if let (Ok(src_meta), Ok(xclbin_meta)) =
+            (std::fs::metadata(&kernel_cc), std::fs::metadata(&xclbin))
+        {
+            if let (Ok(src_time), Ok(xclbin_time)) =
+                (src_meta.modified(), xclbin_meta.modified())
+            {
+                if xclbin_time > src_time {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // Step 1: Compile kernel to .o with Peano clang
     let kernel_obj = case_dir.join("fuzz_kernel.cc.o");
 
     let mut compile_cmd = Command::new(&tools.peano_clang);
     compile_cmd
-        .arg(format!("--target=aie2-none-unknown-elf"))
+        .arg("--target=aie2-none-unknown-elf")
         .arg("-O2")
         .arg("-c")
         .arg(&kernel_cc)
@@ -288,11 +576,10 @@ fn compile_fuzz_case(
     }
 
     // Verify outputs exist
-    let xclbin = case_dir.join("aie.xclbin");
-    let insts = case_dir.join("insts.bin");
     if !xclbin.exists() {
         return Err("aiecc.py succeeded but aie.xclbin not found".into());
     }
+    let insts = case_dir.join("insts.bin");
     if !insts.exists() {
         return Err("aiecc.py succeeded but insts.bin not found".into());
     }
@@ -305,10 +592,52 @@ fn compile_fuzz_case(
 /// Returns the raw output buffer bytes.
 fn run_emulator(
     xclbin_path: &Path,
-    _params: &FuzzParams,
+    params: &FuzzParams,
     max_cycles: u64,
 ) -> Result<Vec<u8>, String> {
-    let test = XclbinTest::from_path(xclbin_path);
+    use crate::testing::test_cpp_parser::{
+        BufferDef, BufferDir, BufferSpec, ElementType, InputPattern,
+    };
+
+    let elem_type = match params.dtype {
+        ScalarType::I32 => ElementType::I32,
+        ScalarType::I16 => ElementType::I16,
+        ScalarType::I8 => ElementType::I8,
+    };
+
+    // Build the same BufferSpec used for NPU execution so the emulator
+    // allocates identically-sized buffers with the same input data.
+    let spec = BufferSpec {
+        buffers: vec![
+            BufferDef {
+                name: "buf_in".to_string(),
+                group_id: 3,
+                size_elements: params.buffer_size,
+                element_type: elem_type,
+                direction: BufferDir::Input,
+                input_pattern: InputPattern::Sequential { start: 1, step: 1 },
+            },
+            BufferDef {
+                name: "buf_scratch".to_string(),
+                group_id: 4,
+                size_elements: params.buffer_size,
+                element_type: elem_type,
+                direction: BufferDir::Input,
+                input_pattern: InputPattern::Zeros,
+            },
+            BufferDef {
+                name: "buf_out".to_string(),
+                group_id: 5,
+                size_elements: params.buffer_size,
+                element_type: elem_type,
+                direction: BufferDir::Output,
+                input_pattern: InputPattern::Zeros,
+            },
+        ],
+        multi_kernel: false,
+    };
+
+    let test = XclbinTest::from_path(xclbin_path).with_buffer_spec(spec);
     let suite = XclbinSuite::new().with_max_cycles(max_cycles);
     let (_outcome, raw_output) = suite.run_single_with_output(&test);
     raw_output.ok_or_else(|| "Emulator produced no output".into())
@@ -363,5 +692,33 @@ mod tests {
         assert_eq!(dtype_str(ScalarType::I32), "i32");
         assert_eq!(dtype_str(ScalarType::I16), "i16");
         assert_eq!(dtype_str(ScalarType::I8), "i8");
+    }
+
+    #[test]
+    fn test_format_mismatch_size_diff() {
+        use crate::testing::test_cpp_parser::ElementType;
+        let emu = vec![0u8; 16];
+        let npu = vec![0u8; 32];
+        let msg = format_mismatch(&emu, &npu, ElementType::I32);
+        assert!(msg.contains("size mismatch"));
+    }
+
+    #[test]
+    fn test_format_mismatch_element_diff() {
+        use crate::testing::test_cpp_parser::ElementType;
+        let emu = vec![1, 0, 0, 0, 2, 0, 0, 0]; // [1, 2] as i32
+        let npu = vec![1, 0, 0, 0, 9, 0, 0, 0]; // [1, 9] as i32
+        let msg = format_mismatch(&emu, &npu, ElementType::I32);
+        assert!(msg.contains("element [1]"));
+        assert!(msg.contains("emulator=2"));
+        assert!(msg.contains("npu=9"));
+    }
+
+    #[test]
+    fn test_format_mismatch_identical() {
+        use crate::testing::test_cpp_parser::ElementType;
+        let data = vec![1, 0, 0, 0];
+        let msg = format_mismatch(&data, &data, ElementType::I32);
+        assert!(msg.contains("no element mismatch"));
     }
 }
