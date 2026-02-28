@@ -14,6 +14,7 @@
 //! - [`integration`]: External tool integration
 //! - [`testing`]: Test harness for XCLBIN binary compatibility
 //! - [`ffi`]: C-compatible Foreign Function Interface
+//! - [`fuzzer`]: Differential logic fuzzer for emulator validation
 
 pub mod config;
 pub mod parser;
@@ -27,3 +28,4 @@ pub mod integration;
 pub mod testing;
 pub mod ffi;
 pub mod build_progress;
+pub mod fuzzer;
