@@ -28,6 +28,21 @@ use crossterm::{cursor, execute, style, terminal};
 use crate::integration::chess_build::{BuildEnv, BuildOpts, BuildResult};
 use crate::testing::xclbin_suite::{Compiler, XclbinTest};
 
+/// Save a build log to `build/logs/<name>-<track>.log`, overwriting any
+/// previous log for the same test+track.
+///
+/// Name is sanitized: slashes become dashes. The logs directory is created
+/// on first call.
+fn save_build_log(name: &str, track: &str, content: &str) {
+    let log_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let sanitized = name.replace('/', "-");
+    let log_path = log_dir.join(format!("{}-{}.log", sanitized, track.to_lowercase()));
+    if let Err(e) = std::fs::write(&log_path, content) {
+        log::warn!("Failed to write build log {}: {}", log_path.display(), e);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
@@ -711,6 +726,9 @@ fn run_verbose<T: Buildable>(
                         label,
                         elapsed.as_secs_f64(),
                     );
+                    if !cached {
+                        save_build_log(name, track_name, &result.build_log);
+                    }
 
                     progress.update_cell(task.cell_idx, task.track, TrackResult::Passed);
 
@@ -722,6 +740,7 @@ fn run_verbose<T: Buildable>(
                 }
                 Err(e) => {
                     let elapsed = task_start.elapsed();
+                    save_build_log(name, track_name, &e);
                     let msg = e.lines().next().unwrap_or(&e);
                     let completed = progress.completed.fetch_add(1, Ordering::Relaxed) + 1;
                     println!(
@@ -731,7 +750,12 @@ fn run_verbose<T: Buildable>(
                         &name[..name.len().min(40)],
                         track_name,
                         elapsed.as_secs_f64(),
-                        &msg[..msg.len().min(60)],
+                        msg,
+                    );
+                    println!(
+                        "         log: build/logs/{}-{}.log",
+                        name.replace('/', "-"),
+                        track_name.to_lowercase(),
                     );
 
                     progress.update_cell(task.cell_idx, task.track, TrackResult::Failed);
@@ -793,6 +817,15 @@ fn run_worker<T: Buildable>(
             },
         ) {
             Ok(result) => {
+                let name = test.name();
+                let track_name = match task.track {
+                    Track::Peano => "Peano",
+                    Track::Chess => "Chess",
+                };
+                if result.build_log != "(cached)" {
+                    save_build_log(name, track_name, &result.build_log);
+                }
+
                 progress.update_cell(task.cell_idx, task.track, TrackResult::Passed);
                 progress.completed.fetch_add(1, Ordering::Relaxed);
 
@@ -802,7 +835,14 @@ fn run_worker<T: Buildable>(
                     artifacts,
                 });
             }
-            Err(_) => {
+            Err(e) => {
+                let name = test.name();
+                let track_name = match task.track {
+                    Track::Peano => "peano",
+                    Track::Chess => "chess",
+                };
+                save_build_log(name, track_name, &e);
+
                 progress.update_cell(task.cell_idx, task.track, TrackResult::Failed);
                 progress.completed.fetch_add(1, Ordering::Relaxed);
 
