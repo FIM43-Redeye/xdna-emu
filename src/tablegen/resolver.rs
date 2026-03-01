@@ -276,9 +276,13 @@ fn parse_immediate_type(reg_class: &str) -> Option<OperandType> {
         return Some(OperandType::Immediate { signed: true, scale });
     }
     if reg_class.starts_with("imm") {
+        // AIE2 convention: imm* classes (immx4, immx32, etc.) are SIGNED by default.
+        // Only immx128_unsigned explicitly sets isUnsigned=true in TableGen.
+        // Detect unsigned variants by checking for "_unsigned" suffix.
+        let is_unsigned = reg_class.contains("unsigned");
         let rest = &reg_class[3..]; // after "imm"
         let scale = extract_scale_suffix(rest);
-        return Some(OperandType::Immediate { signed: false, scale });
+        return Some(OperandType::Immediate { signed: !is_unsigned, scale });
     }
     if reg_class.starts_with("addr") {
         return Some(OperandType::Immediate { signed: false, scale: 1 });
@@ -519,6 +523,11 @@ pub struct InstrEncoding {
     /// operand instead of a Memory operand.
     pub is_ptr_arithmetic: bool,
 
+    /// Whether this instruction implicitly uses SP (e.g., spill/fill instructions).
+    /// When true and no explicit Memory/PointerReg operand is found, the decoder
+    /// converts the Immediate operand to Memory { base: 6 (SP), offset: imm }.
+    pub is_sp_relative: bool,
+
     /// Itinerary class from TableGen (e.g., "II_ADD", "II_LDA", "II_VMUL").
     /// Used for cross-validating latency values against the compiler's scheduling model.
     pub sched_class: Option<String>,
@@ -735,6 +744,9 @@ impl<'a> Resolver<'a> {
         // Pre-resolve metadata from mnemonic (once per encoding, not per decode)
         let is_vector = instr.mnemonic.starts_with('v') || instr.mnemonic.starts_with('V');
         let is_ptr_arithmetic = instr.mnemonic.starts_with("padd");
+        // Spill/fill instructions implicitly use SP as the base address.
+        // Detected from TableGen Uses = [SP] attribute.
+        let is_sp_relative = instr.attributes.uses.iter().any(|u| u == "SP");
         let element_type = infer_element_type(&instr.mnemonic);
         let branch_condition = infer_branch_condition(&instr.mnemonic, semantic);
         let select_variant = infer_select_variant(&instr.mnemonic, semantic);
@@ -762,6 +774,7 @@ impl<'a> Resolver<'a> {
             is_vector,
             select_variant,
             is_ptr_arithmetic,
+            is_sp_relative,
             sched_class: None, // Regex parser doesn't extract itinerary class
         })
     }
@@ -1022,6 +1035,7 @@ fn add_lng_control_flow_encodings(by_slot: &mut HashMap<String, Vec<InstrEncodin
         is_vector: false,
         select_variant: None,
         is_ptr_arithmetic: false,
+        is_sp_relative: false,
         sched_class: Some("II_JL".into()),
     };
 
@@ -1048,6 +1062,7 @@ fn add_lng_control_flow_encodings(by_slot: &mut HashMap<String, Vec<InstrEncodin
         is_vector: false,
         select_variant: None,
         is_ptr_arithmetic: false,
+        is_sp_relative: false,
         sched_class: Some("II_J".into()),
     };
 
@@ -1162,6 +1177,25 @@ impl SlotIndex {
         }
 
         None
+    }
+
+    /// Return all encodings that match the given word (for diagnostics).
+    pub fn all_matches(&self, word: u64) -> Vec<&InstrEncoding> {
+        let mut result = Vec::new();
+        let opcode = word & self.common_mask;
+        if let Some(candidates) = self.by_opcode.get(&opcode) {
+            for enc in candidates {
+                if enc.matches(word) {
+                    result.push(enc);
+                }
+            }
+        }
+        for enc in &self.fallback {
+            if enc.matches(word) {
+                result.push(enc);
+            }
+        }
+        result
     }
 
     /// Extract operand values from a matched instruction.
@@ -1708,9 +1742,11 @@ pub fn infer_element_type(mnemonic: &str) -> Option<ElementType> {
         } else {
             Some(ElementType::Int32)
         }
-    } else if mnemonic.contains("bf16") {
+    } else if mnemonic.contains("bf16") || mnemonic.contains(".bf") {
         Some(ElementType::BFloat16)
-    } else if mnemonic.contains("f32") || mnemonic.contains("float") {
+    } else if mnemonic.contains("f32") || mnemonic.contains("float")
+        || mnemonic.ends_with(".f")
+    {
         Some(ElementType::Float32)
     } else {
         None
@@ -2508,17 +2544,18 @@ mod tests {
             classify_operand_type("simm7", "imm"),
             OperandType::Immediate { signed: true, scale: 1 }
         );
+        // AIE2 convention: imm* classes are signed (immx4, immx32, etc.)
         assert_eq!(
             classify_operand_type("imm12x4", "imm"),
-            OperandType::Immediate { signed: false, scale: 4 }
+            OperandType::Immediate { signed: true, scale: 4 }
         );
         assert_eq!(
             classify_operand_type("imm6x32", "imm"),
-            OperandType::Immediate { signed: false, scale: 32 }
+            OperandType::Immediate { signed: true, scale: 32 }
         );
         assert_eq!(
             classify_operand_type("imm5", "imm"),
-            OperandType::Immediate { signed: false, scale: 1 }
+            OperandType::Immediate { signed: true, scale: 1 }
         );
         assert_eq!(
             classify_operand_type("addr20", "cpmaddr"),

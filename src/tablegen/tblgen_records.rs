@@ -596,6 +596,7 @@ impl InstrRecord {
         // Pre-resolve metadata from mnemonic
         let is_vector = self.mnemonic.starts_with('v') || self.mnemonic.starts_with('V');
         let is_ptr_arithmetic = self.mnemonic.starts_with("padd");
+        let is_sp_relative = self.uses.iter().any(|u| u == "SP");
         let element_type = infer_element_type(&self.mnemonic);
         let branch_condition = infer_branch_condition(&self.mnemonic, semantic);
         let select_variant = infer_select_variant(&self.mnemonic, semantic);
@@ -622,6 +623,7 @@ impl InstrRecord {
             is_vector,
             select_variant,
             is_ptr_arithmetic,
+            is_sp_relative,
             sched_class: self.itinerary_class.clone(),
         })
     }
