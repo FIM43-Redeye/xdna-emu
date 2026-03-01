@@ -28,25 +28,6 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Extract --trace <file> early (applies to all commands)
-    let mut trace_output: Option<String> = None;
-    {
-        let mut i = 1;
-        while i < args.len() {
-            if args[i] == "--trace" {
-                if i + 1 < args.len() {
-                    trace_output = Some(args[i + 1].clone());
-                    i += 2;
-                } else {
-                    eprintln!("Error: --trace requires an output file path");
-                    std::process::exit(1);
-                }
-            } else {
-                i += 1;
-            }
-        }
-    }
-
     // Check for test-suite command
     if args.len() >= 2 && args.iter().any(|a| a == "test-suite") {
         let path = args.iter()
@@ -54,7 +35,7 @@ fn main() -> anyhow::Result<()> {
             .find(|a| !a.starts_with('-') && a.as_str() != "test-suite")
             .map(|s| s.as_str())
             .unwrap_or(".");
-        return run_test_suite(path, trace_output.as_deref());
+        return run_test_suite(path);
     }
 
     // Check for GUI mode
@@ -321,12 +302,9 @@ fn print_command(idx: usize, cmd: &CdoCommand) {
 }
 
 /// Run the XCLBIN test suite.
-fn run_test_suite(path: &str, trace_output: Option<&str>) -> anyhow::Result<()> {
+fn run_test_suite(path: &str) -> anyhow::Result<()> {
     println!("=== XCLBIN Test Suite ===");
     println!("Discovering tests in: {}", path);
-    if let Some(trace_path) = trace_output {
-        println!("Trace output: {}", trace_path);
-    }
     println!();
 
     let mut suite = XclbinSuite::discover(Path::new(path))?;
@@ -346,15 +324,6 @@ fn run_test_suite(path: &str, trace_output: Option<&str>) -> anyhow::Result<()> 
 
     // Print summary
     println!("{}", suite.summary_report(&result));
-
-    // Export trace if requested
-    if let Some(trace_path) = trace_output {
-        println!("Exporting trace to {}...", trace_path);
-        let events = suite.collect_trace_events();
-        let mut file = std::fs::File::create(trace_path)?;
-        xdna_emu::trace::export_perfetto(&events, &mut file)?;
-        println!("Trace exported: {} events", events.len());
-    }
 
     // Exit with error code if any tests failed
     if result.passed < result.total {

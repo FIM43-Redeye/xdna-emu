@@ -40,7 +40,6 @@ use crate::testing::lit_trace::{
 use crate::testing::process_control::{spawn_with_timeout, ProcessOutcome};
 use crate::testing::test_cpp_parser;
 use crate::testing::xclbin_suite::{XclbinSuite, XclbinTest};
-use crate::trace;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -613,7 +612,7 @@ fn run_emulator_trace(
 
     // Create a minimal suite and run the test
     let suite = XclbinSuite::new().with_max_cycles(max_cycles);
-    let (outcome, _raw_output, trace_events, binary_trace) = suite.run_single_with_trace(&test);
+    let (outcome, _raw_output, binary_trace) = suite.run_single_with_trace(&test);
 
     // Check if the test at least started (we want traces even on validation fail)
     match &outcome {
@@ -629,38 +628,74 @@ fn run_emulator_trace(
         }
     }
 
-    if trace_events.is_empty() {
-        return Err("no trace events collected".to_string());
+    let trace_data = binary_trace
+        .ok_or_else(|| "no binary trace data captured".to_string())?;
+
+    if trace_data.iter().all(|&b| b == 0) {
+        return Err("binary trace buffer is all zeros".to_string());
     }
 
-    // Write binary trace buffer if available (raw packets from trace units)
-    if let Some(ref trace_data) = binary_trace {
-        let bin_path = output_dir.join("emu-trace_raw.bin");
-        fs::write(&bin_path, trace_data)
-            .map_err(|e| format!("write emu-trace_raw.bin: {}", e))?;
-        // Count non-zero bytes to report meaningful data size
-        let non_zero = trace_data.iter().filter(|&&b| b != 0).count();
+    // Write binary trace buffer (raw packets from trace units, same format as NPU)
+    let bin_path = output_dir.join("emu-trace_raw.bin");
+    fs::write(&bin_path, &trace_data)
+        .map_err(|e| format!("write emu-trace_raw.bin: {}", e))?;
+    let non_zero = trace_data.iter().filter(|&&b| b != 0).count();
+    log::info!(
+        "{}: wrote {} bytes binary trace ({} non-zero) -> {}",
+        test_name, trace_data.len(), non_zero, bin_path.display()
+    );
+
+    // Convert binary trace to Perfetto JSON using mlir-aie's parse.py.
+    // This is the same toolchain used for real NPU hardware traces.
+    let parse_py = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("mlir-aie/python/utils/trace/parse.py");
+
+    let emu_trace_path = output_dir.join("emu-trace.json");
+
+    if parse_py.exists() {
+        let status = std::process::Command::new("python3")
+            .arg(&parse_py)
+            .arg("--filename")
+            .arg(&bin_path)
+            .arg("--mlir")
+            .arg(output_dir.join("traced.mlir").display().to_string())
+            .arg("--colshift")
+            .arg("1")
+            .arg("-o")
+            .arg(&emu_trace_path)
+            .status();
+
+        match status {
+            Ok(s) if s.success() => {
+                log::info!(
+                    "{}: parsed binary trace -> {}",
+                    test_name, emu_trace_path.display()
+                );
+            }
+            Ok(s) => {
+                log::warn!(
+                    "{}: parse.py exited with code {}, binary trace saved at {}",
+                    test_name, s.code().unwrap_or(-1), bin_path.display()
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "{}: failed to run parse.py: {}, binary trace saved at {}",
+                    test_name, e, bin_path.display()
+                );
+            }
+        }
+    } else {
         log::info!(
-            "{}: wrote {} bytes binary trace ({} non-zero) -> {}",
-            test_name, trace_data.len(), non_zero, bin_path.display()
+            "{}: parse.py not found at {}, binary trace saved at {}",
+            test_name, parse_py.display(), bin_path.display()
         );
     }
 
-    // Export to Perfetto JSON
-    let emu_trace_path = output_dir.join("emu-trace.json");
-    let mut file = fs::File::create(&emu_trace_path)
-        .map_err(|e| format!("create emu-trace.json: {}", e))?;
-    trace::export_perfetto(&trace_events, &mut file)
-        .map_err(|e| format!("write emu-trace.json: {}", e))?;
-
-    log::info!(
-        "{}: emulator produced {} trace events -> {}",
-        test_name,
-        trace_events.len(),
-        emu_trace_path.display()
-    );
-
-    Ok(emu_trace_path)
+    // Return the binary trace path (parse.py output is optional)
+    Ok(bin_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -772,7 +807,7 @@ fn merge_traces(
             if !stripped.trim().is_empty() {
                 if !first_source { all_events.push_str(",\n"); }
                 // HW traces keep PID 0-based, just prefix the names
-                let adjusted = trace::offset_perfetto_pids(&stripped, 0, "NPU: ");
+                let adjusted = offset_perfetto_pids(&stripped, 0, "NPU: ");
                 all_events.push_str(adjusted.trim());
                 first_source = false;
             }
@@ -784,7 +819,7 @@ fn merge_traces(
             let stripped = strip_json_array_brackets(&json);
             if !stripped.trim().is_empty() {
                 if !first_source { all_events.push_str(",\n"); }
-                let adjusted = trace::offset_perfetto_pids(&stripped, 100, "Emulator: ");
+                let adjusted = offset_perfetto_pids(&stripped, 100, "Emulator: ");
                 all_events.push_str(adjusted.trim());
                 first_source = false;
             }
@@ -796,7 +831,7 @@ fn merge_traces(
             let stripped = strip_json_array_brackets(&json);
             if !stripped.trim().is_empty() {
                 if !first_source { all_events.push_str(",\n"); }
-                let adjusted = trace::offset_perfetto_pids(&stripped, 200, "aiesimulator: ");
+                let adjusted = offset_perfetto_pids(&stripped, 200, "aiesimulator: ");
                 all_events.push_str(adjusted.trim());
             }
         }
@@ -809,6 +844,41 @@ fn merge_traces(
         .map_err(|e| format!("write combined trace: {}", e))?;
 
     Ok(combined_path)
+}
+
+/// Offset all `pid` fields in a Perfetto JSON string and prefix process_name args.
+///
+/// Separates traces from different sources (NPU hardware, emulator, aiesimulator)
+/// into distinct PID ranges within a single combined Perfetto JSON file.
+///
+/// Operates on raw JSON text via line-by-line regex replacement rather than full
+/// JSON parsing, handling the simple, regular structure of Perfetto trace arrays.
+fn offset_perfetto_pids(json: &str, pid_offset: i64, name_prefix: &str) -> String {
+    let pid_re = regex::Regex::new(r#""pid"\s*:\s*(\d+)"#).unwrap();
+    let pname_re = regex::Regex::new(
+        r#"("name"\s*:\s*"process_name".*?"args"\s*:\s*\{[^}]*"name"\s*:\s*")([^"]*)"#
+    ).unwrap();
+
+    let mut result = String::with_capacity(json.len() + json.len() / 10);
+
+    for line in json.lines() {
+        let mut modified = pid_re.replace_all(line, |caps: &regex::Captures| {
+            let old_pid: i64 = caps[1].parse().unwrap_or(0);
+            let new_pid = old_pid + pid_offset;
+            format!(r#""pid":{}"#, new_pid)
+        }).to_string();
+
+        if modified.contains("\"process_name\"") && !name_prefix.is_empty() {
+            modified = pname_re.replace(&modified, |caps: &regex::Captures| {
+                format!("{}{}{}", &caps[1], name_prefix, &caps[2])
+            }).to_string();
+        }
+
+        result.push_str(&modified);
+        result.push('\n');
+    }
+
+    result
 }
 
 /// Strip the outer `[` and `]` brackets from a JSON array string.

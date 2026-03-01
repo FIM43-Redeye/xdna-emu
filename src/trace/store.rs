@@ -7,8 +7,13 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 
-/// Re-use the existing TraceType from the export module.
-pub use super::TraceType;
+/// Trace type distinguishing core module traces from memory module traces.
+/// Matches the PID grouping convention used by mlir-aie's trace parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TraceType {
+    Core = 0,
+    Mem = 1,
+}
 
 /// Phase of a trace event (Begin or End of a duration).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

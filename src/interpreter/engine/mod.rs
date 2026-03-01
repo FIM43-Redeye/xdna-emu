@@ -27,7 +27,7 @@
 
 mod coordinator;
 
-pub use coordinator::{InterpreterEngine, EngineStatus, TileTracedEvent};
+pub use coordinator::{InterpreterEngine, EngineStatus};
 
 #[cfg(test)]
 mod tests {

@@ -259,6 +259,19 @@ impl DeviceState {
             }
         }
 
+        // Forward all writes to tile.write_register() for general handling:
+        // register HashMap storage, trace config, edge detection, event port
+        // selection, cascade config, event broadcast, and Event_Generate.
+        // The specialized handlers above extract structured data (BD fields,
+        // channel control, etc.); this ensures the tile-level handlers also
+        // run for every write.
+        if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
+            tile.write_register(tile_addr.offset, value);
+        }
+
+        // Propagate broadcast events to all tiles in the column.
+        self.propagate_broadcasts(tile_addr.col, tile_addr.row);
+
         Ok(())
     }
 
@@ -1428,6 +1441,46 @@ impl DeviceState {
             Some(self.array.tile_mut(col as u8, row as u8))
         } else {
             None
+        }
+    }
+
+    /// Propagate pending broadcast events from a tile to all tiles in its column.
+    ///
+    /// On real hardware, broadcast events travel through a dedicated broadcast
+    /// network spanning the entire column. When a tile generates a broadcast
+    /// (via Event_Generate matching a broadcast channel config), the BROADCAST_N
+    /// event reaches every tile in the same column.
+    ///
+    /// This is the mechanism that synchronizes trace start/stop: the CDO writes
+    /// Event_Generate on the shim tile, which generates BROADCAST_15 (start) or
+    /// BROADCAST_14 (stop), and all tiles' trace units see their start/stop event.
+    pub(crate) fn propagate_broadcasts(&mut self, col: u8, source_row: u8) {
+        // Drain pending broadcasts from the source tile.
+        let broadcasts = if let Some(tile) = self.array.get_mut(col, source_row) {
+            tile.drain_pending_broadcasts()
+        } else {
+            return;
+        };
+
+        if broadcasts.is_empty() {
+            return;
+        }
+
+        // Propagate each broadcast event to every tile in the column.
+        let rows = self.array.rows();
+        for hw_id in &broadcasts {
+            log::info!(
+                "Propagating BROADCAST_{} (hw_id={}) from tile ({},{}) to column {}",
+                hw_id - 107, hw_id, col, source_row, col
+            );
+            for row in 0..rows {
+                if let Some(tile) = self.array.get_mut(col as u8, row as u8) {
+                    // Notify both trace units -- the trace unit checks if the
+                    // event matches its configured start/stop event.
+                    tile.notify_core_trace_event(*hw_id, 0);
+                    tile.notify_mem_trace_event(*hw_id, 0);
+                }
+            }
         }
     }
 }

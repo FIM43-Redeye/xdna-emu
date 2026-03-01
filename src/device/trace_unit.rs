@@ -168,22 +168,12 @@ impl TraceUnit {
                 self.stop_event = ((value >> 24) & 0xFF) as u8;
                 self.configured = true;
 
-                // FIXME(broadcast-events): On real hardware, tracing starts
-                // when the start event (typically BROADCAST_15) is generated
-                // by the CDO via Event_Generate registers. Since we don't yet
-                // model the broadcast event system, we auto-start the trace
-                // unit on configuration. This works because the CDO always
-                // triggers the start event before cores begin, but it means:
-                //   1. Start/stop event IDs are ignored (always auto-start)
-                //   2. Runtime start/stop via event broadcast won't work
-                // Fix: implement Event_Generate register writes that dispatch
-                // broadcast events to all trace units in the affected column.
-                if self.start_event != 0 {
-                    self.state = TraceState::Running;
-                    self.timer = 0;
-                    self.last_event_cycle = 0;
-                    self.encode_start(0);
-                }
+                // Trace unit waits in Idle state until its start_event fires.
+                // The CDO sequence configures broadcast channels, then writes
+                // Event_Generate to fire USER_EVENT -> BROADCAST_N -> trace
+                // start. The tile's write_register() handles Event_Generate
+                // and propagates broadcast events to all tiles in the column,
+                // which triggers notify_event() on each trace unit.
 
                 log::debug!(
                     "TraceUnit ({},{}) Control0: mode={:?} start={} stop={} -> {:?}",
@@ -497,12 +487,16 @@ mod tests {
     fn test_start_stop_state_machine() {
         let mut tu = TraceUnit::new(0, 2);
 
-        // Configure: mode=EventTime, start=28 (ACTIVE), stop=29 (DISABLED)
-        // Auto-starts because start_event != 0 (emulates broadcast trigger).
+        // Configure: mode=EventTime, start=28, stop=29
         tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
         tu.write_register(0x10, 37); // slot 0 = INSTR_VECTOR (37)
 
-        // Auto-started to Running (CDO triggers broadcast before cores start)
+        // Configured but idle -- waits for start event (like real hardware).
+        assert_eq!(tu.state, TraceState::Idle);
+        assert!(tu.is_configured());
+
+        // Start event triggers Running state
+        tu.notify_event(28, 0);
         assert_eq!(tu.state, TraceState::Running);
 
         // Matched event is encoded while running
@@ -664,8 +658,14 @@ mod tests {
     #[test]
     fn test_start_marker_encoding() {
         let mut tu = TraceUnit::new(0, 2);
-        // Auto-start emits Start marker with timer=0 when Control0 is written
+        // Configure trace unit, then fire start event
         tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+
+        // After configuration, unit is idle (no auto-start)
+        assert!(tu.byte_buffer.is_empty());
+
+        // Fire start event to begin tracing
+        tu.notify_event(28, 0);
 
         // Start marker: 0xF0 prefix + 7 bytes timer (big-endian, timer=0)
         assert_eq!(tu.byte_buffer.len(), 8);

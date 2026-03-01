@@ -374,9 +374,6 @@ pub struct XclbinSuite {
     /// Directory containing captured hardware outputs for cross-validation.
     /// Each test's output is at `{npu_output_dir}/{test_name}/output.bin`.
     npu_output_dir: Option<PathBuf>,
-    /// Accumulated trace events from all test runs.
-    /// Populated when tests run; drained by `collect_trace_events()`.
-    trace_events: Vec<crate::interpreter::engine::TileTracedEvent>,
 }
 
 impl XclbinSuite {
@@ -389,7 +386,6 @@ impl XclbinSuite {
             results: Vec::new(),
             reference_dir: None,
             npu_output_dir: None,
-            trace_events: Vec::new(),
         }
     }
 
@@ -508,8 +504,7 @@ impl XclbinSuite {
         let tests: Vec<_> = self.tests.clone();
 
         for test in tests {
-            let (outcome, raw_output, trace, _, _) = self.run_single_inner(&test);
-            self.trace_events.extend(trace);
+            let (outcome, raw_output, _, _) = self.run_single_inner(&test);
 
             match &outcome {
                 TestOutcome::Pass { .. } => passed += 1,
@@ -563,7 +558,7 @@ impl XclbinSuite {
 
     /// Run a single test.
     pub fn run_single(&self, test: &XclbinTest) -> TestOutcome {
-        let (outcome, _, _, _, _) = self.run_single_inner(test);
+        let (outcome, _, _, _) = self.run_single_inner(test);
         outcome
     }
 
@@ -574,22 +569,21 @@ impl XclbinSuite {
     /// The output bytes are `None` if the engine could not be created or
     /// the test was skipped.
     pub fn run_single_with_output(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>) {
-        let (outcome, output, _, _, _) = self.run_single_inner(test);
+        let (outcome, output, _, _) = self.run_single_inner(test);
         (outcome, output)
     }
 
-    /// Run a single test and return trace events for Perfetto export.
+    /// Run a single test and return the binary trace buffer.
     ///
     /// Unlike `run_single()` which discards internal details, this exposes
-    /// the emulator's per-tile trace events and optional binary trace buffer.
-    /// Used by the triple trace comparison pipeline to generate `emu-trace.json`.
+    /// the binary trace buffer from the hardware trace units.
+    /// The binary trace is in the same format as real NPU hardware produces,
+    /// decodable by mlir-aie's `parse.py`.
     ///
-    /// Returns (outcome, raw_output, trace_events, binary_trace_buffer).
-    /// The binary_trace_buffer contains raw trace packets from the hardware
-    /// trace units, in the same format as real NPU hardware produces.
-    pub fn run_single_with_trace(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Vec<crate::interpreter::engine::TileTracedEvent>, Option<Vec<u8>>) {
-        let (outcome, raw_output, trace_events, trace_buf, _) = self.run_single_inner(test);
-        (outcome, raw_output, trace_events, trace_buf)
+    /// Returns (outcome, raw_output, binary_trace_buffer).
+    pub fn run_single_with_trace(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Option<Vec<u8>>) {
+        let (outcome, raw_output, trace_buf, _) = self.run_single_inner(test);
+        (outcome, raw_output, trace_buf)
     }
 
     /// Run a single test with full cross-validation results.
@@ -597,7 +591,7 @@ impl XclbinSuite {
     /// Returns the test outcome, raw output, and optional hardware
     /// cross-validation diagnosis.
     pub fn run_single_with_hw_validation(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Option<HardwareValidation>, Vec<String>) {
-        let (outcome, raw_output, _, _, warnings) = self.run_single_inner(test);
+        let (outcome, raw_output, _, warnings) = self.run_single_inner(test);
         let hw_validation = self.cross_validate(test, raw_output.as_deref());
         (outcome, raw_output, hw_validation, warnings)
     }
@@ -632,17 +626,16 @@ impl XclbinSuite {
 
     /// Shared implementation for run_single and run_single_with_output.
     ///
-    /// Returns (outcome, raw_output, trace_events, binary_trace_buffer, warnings).
-    /// The trace_events are collected from the engine after execution for
-    /// Perfetto export. The binary_trace_buffer contains raw packets from
-    /// hardware trace units that flowed through stream switch to host DDR.
-    /// Warnings are collected from the NPU executor during instruction execution.
-    fn run_single_inner(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Vec<crate::interpreter::engine::TileTracedEvent>, Option<Vec<u8>>, Vec<String>) {
+    /// Returns (outcome, raw_output, binary_trace_buffer, warnings).
+    /// The binary_trace_buffer contains raw packets from hardware trace units
+    /// that flowed through the stream switch to host DDR, in the same format
+    /// as real NPU hardware. Warnings are collected from the NPU executor.
+    fn run_single_inner(&self, test: &XclbinTest) -> (TestOutcome, Option<Vec<u8>>, Option<Vec<u8>>, Vec<String>) {
         // Check if test overrides say to skip this test
         if let Some(ref reason) = test.skip_reason {
             return (TestOutcome::Skipped {
                 reason: reason.clone(),
-            }, None, Vec::new(), None, Vec::new());
+            }, None, None, Vec::new());
         }
 
         // Load xclbin
@@ -651,7 +644,7 @@ impl XclbinSuite {
             Err(e) => {
                 return (TestOutcome::LoadError {
                     message: format!("Failed to load xclbin: {}", e),
-                }, None, Vec::new(), None, Vec::new());
+                }, None, None, Vec::new());
             }
         };
 
@@ -661,7 +654,7 @@ impl XclbinSuite {
             None => {
                 return (TestOutcome::LoadError {
                     message: "No AIE partition in xclbin".to_string(),
-                }, None, Vec::new(), None, Vec::new());
+                }, None, None, Vec::new());
             }
         };
 
@@ -671,7 +664,7 @@ impl XclbinSuite {
             Err(e) => {
                 return (TestOutcome::LoadError {
                     message: format!("Failed to parse AIE partition: {}", e),
-                }, None, Vec::new(), None, Vec::new());
+                }, None, None, Vec::new());
             }
         };
 
@@ -681,7 +674,7 @@ impl XclbinSuite {
             None => {
                 return (TestOutcome::LoadError {
                     message: "No primary PDI in partition".to_string(),
-                }, None, Vec::new(), None, Vec::new());
+                }, None, None, Vec::new());
             }
         };
 
@@ -690,7 +683,7 @@ impl XclbinSuite {
             None => {
                 return (TestOutcome::LoadError {
                     message: "No CDO found in PDI".to_string(),
-                }, None, Vec::new(), None, Vec::new());
+                }, None, None, Vec::new());
             }
         };
 
@@ -699,7 +692,7 @@ impl XclbinSuite {
             Err(e) => {
                 return (TestOutcome::LoadError {
                     message: format!("Failed to parse CDO: {}", e),
-                }, None, Vec::new(), None, Vec::new());
+                }, None, None, Vec::new());
             }
         };
 
@@ -708,7 +701,7 @@ impl XclbinSuite {
         if let Err(e) = engine.device_mut().apply_cdo(&cdo) {
             return (TestOutcome::LoadError {
                 message: format!("Failed to apply CDO: {}", e),
-            }, None, Vec::new(), None, Vec::new());
+            }, None, None, Vec::new());
         }
 
         // Populate host memory - use buffer spec if available, else defaults.
@@ -726,8 +719,21 @@ impl XclbinSuite {
             (None, default_buffers)
         };
 
-        // Output address is always the last host buffer
-        let output_addr = host_buffers.last().map(|b| b.address).unwrap_or(0x1000u64);
+        // Output address: find the first Output buffer's BO index.
+        // With multiple output buffers (e.g. data + trace), we want the
+        // primary data output, not the trace buffer.
+        let output_addr = if let Some(ref spec) = test.buffer_spec {
+            spec.buffers.iter()
+                .find(|b| b.direction == BufferDir::Output)
+                .map(|b| {
+                    let bo_idx = b.group_id.saturating_sub(3) as usize;
+                    host_buffers.get(bo_idx).map(|hb| hb.address).unwrap_or(0x1000u64)
+                })
+                .unwrap_or_else(|| host_buffers.last().map(|b| b.address).unwrap_or(0x1000u64))
+        } else {
+            // Default layout: output is the last buffer
+            host_buffers.last().map(|b| b.address).unwrap_or(0x1000u64)
+        };
 
         // Execute NPU instructions if insts.bin exists.
         // These configure and trigger shim DMA to move data to/from cores.
@@ -792,14 +798,14 @@ impl XclbinSuite {
                 Err(e) => {
                     return (TestOutcome::LoadError {
                         message: format!("Failed to read ELF {:?}: {}", path, e),
-                    }, None, Vec::new(), None, Vec::new());
+                    }, None, None, Vec::new());
                 }
             };
 
             if let Err(e) = engine.load_elf_bytes(*col as usize, *row as usize, &data) {
                 return (TestOutcome::LoadError {
                     message: format!("Failed to load ELF into ({},{}): {}", col, row, e),
-                }, None, Vec::new(), None, Vec::new());
+                }, None, None, Vec::new());
             }
         }
 
@@ -815,16 +821,14 @@ impl XclbinSuite {
             // engine steps DMA engines + stream switches until completion.
             return (TestOutcome::Skipped {
                 reason: "No core code and no NPU instructions to execute".to_string(),
-            }, None, Vec::new(), None, Vec::new());
+            }, None, None, Vec::new());
         }
 
         // Run until halt, sync completion, error, or timeout
         let outcome = self.run_engine(&mut engine, test, input_values, npu_executor.as_mut(), output_addr);
 
-        // Collect trace events from all cores and DMA engines.
-        // Core events live in each core's TimingContext until collected.
-        engine.collect_core_trace_events();
-        let trace_events = engine.trace_log().to_vec();
+        // Flush trace units and route final binary trace packets to host DDR.
+        engine.flush_trace_to_host();
 
         // Capture raw output from host memory at the output buffer address
         let raw_output = self.capture_output(&engine, test, output_addr);
@@ -914,7 +918,7 @@ impl XclbinSuite {
             test_warnings.extend(exec.warnings().iter().cloned());
         }
 
-        (final_outcome, raw_output, trace_events, binary_trace_buf, test_warnings)
+        (final_outcome, raw_output, binary_trace_buf, test_warnings)
     }
 
     /// Capture raw output bytes from host memory.
@@ -994,8 +998,8 @@ impl XclbinSuite {
             next_addr = 4096;
         }
 
-        // Allocate output buffer after all inputs
-        let output_addr = next_addr.max(0x1000);
+        // Allocate output buffers after all inputs, each at a unique address.
+        next_addr = next_addr.max(0x1000);
         for buf in &spec.buffers {
             if buf.direction != BufferDir::Output {
                 continue;
@@ -1005,8 +1009,9 @@ impl XclbinSuite {
                 continue;
             }
             let output_size = (buf.size_elements * buf.element_type.byte_size()).max(4096);
-            let _ = host_mem.allocate_region(&buf.name, output_addr, output_size);
-            buffer_addrs[bo_idx] = (output_addr, output_size);
+            let _ = host_mem.allocate_region(&buf.name, next_addr, output_size);
+            buffer_addrs[bo_idx] = (next_addr, output_size);
+            next_addr += output_size as u64;
         }
 
         // Fill any gaps (unused BO indices) with dummy regions
@@ -1402,11 +1407,6 @@ impl XclbinSuite {
         let _ = host_mem.allocate_region("output", 0x2000, 4096);
     }
 
-    /// Drain accumulated trace events from all test runs.
-    /// Returns the events and clears the internal buffer.
-    pub fn collect_trace_events(&mut self) -> Vec<crate::interpreter::engine::TileTracedEvent> {
-        std::mem::take(&mut self.trace_events)
-    }
 }
 
 impl Default for XclbinSuite {

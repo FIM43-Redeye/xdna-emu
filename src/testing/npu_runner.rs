@@ -301,8 +301,11 @@ impl From<std::io::Error> for NpuRunError {
 
 /// Result of running a test on real NPU hardware.
 pub struct NpuRunResult {
-    /// Raw output bytes from the NPU.
+    /// Raw output bytes from the primary output buffer.
     pub output: Vec<u8>,
+    /// Additional output buffers beyond the primary (e.g. trace data).
+    /// Keyed by buffer name from the BufferSpec.
+    pub extra_outputs: HashMap<String, Vec<u8>>,
     /// Input values that were generated and sent (for comparison).
     pub input_values: HashMap<String, Vec<i64>>,
 }
@@ -385,21 +388,29 @@ fn run_single_kernel(
         ]);
     }
 
-    // Set up output buffer (first output buffer in the spec)
-    let output_buf = find_output_buffer(&spec.buffers)
-        .ok_or_else(|| NpuRunError::InputGeneration(
+    // Set up all output buffers (first is primary, rest are extra).
+    let output_bufs: Vec<&BufferDef> = spec.buffers.iter()
+        .filter(|b| b.direction == BufferDir::Output)
+        .collect();
+    if output_bufs.is_empty() {
+        return Err(NpuRunError::InputGeneration(
             "No output buffer defined in buffer spec".to_string(),
-        ))?;
+        ));
+    }
 
-    let output_size_bytes = output_buf.size_elements * output_buf.element_type.byte_size();
-    let output_file = tmp_dir.join("output.bin");
-
-    args.extend_from_slice(&[
-        "--out".to_string(),
-        output_buf.group_id.to_string(),
-        output_file.to_string_lossy().to_string(),
-        output_size_bytes.to_string(),
-    ]);
+    let mut output_files: Vec<(String, PathBuf)> = Vec::new();
+    for (i, buf) in output_bufs.iter().enumerate() {
+        let size_bytes = buf.size_elements * buf.element_type.byte_size();
+        let filename = if i == 0 { "output.bin".to_string() } else { format!("output_{}.bin", buf.name) };
+        let file_path = tmp_dir.join(&filename);
+        args.extend_from_slice(&[
+            "--out".to_string(),
+            buf.group_id.to_string(),
+            file_path.to_string_lossy().to_string(),
+            size_bytes.to_string(),
+        ]);
+        output_files.push((buf.name.clone(), file_path));
+    }
 
     log::info!("Running on NPU (single-kernel): {} {}", runner.display(),
         args.iter().map(|a| {
@@ -412,7 +423,7 @@ fn run_single_kernel(
 
     match process_control::spawn_with_timeout(&mut cmd, timeout_sec) {
         ProcessOutcome::Completed { exit_code, stderr, .. } => {
-            handle_runner_exit(exit_code, &stderr, &output_file, &tmp_dir, input_values)
+            handle_runner_exit(exit_code, &stderr, &output_files, &tmp_dir, input_values)
         }
         ProcessOutcome::Timeout { .. } => {
             let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -430,6 +441,7 @@ fn run_single_kernel(
 }
 
 /// Find the first output buffer in a buffer list.
+#[cfg(test)]
 fn find_output_buffer(buffers: &[BufferDef]) -> Option<&BufferDef> {
     buffers.iter().find(|b| b.direction == BufferDir::Output)
 }
@@ -437,19 +449,28 @@ fn find_output_buffer(buffers: &[BufferDef]) -> Option<&BufferDef> {
 /// Process the exit status of a npu-runner invocation.
 ///
 /// Exit codes: 0 = success, 2 = kernel timeout (C++ side), anything else = error.
+/// `output_files` is a list of (buffer_name, file_path) pairs. The first is
+/// the primary output buffer; any others are extra (e.g. trace data).
 fn handle_runner_exit(
     exit_code: i32,
     stderr: &str,
-    output_file: &Path,
+    output_files: &[(String, PathBuf)],
     tmp_dir: &Path,
     input_values: HashMap<String, Vec<i64>>,
 ) -> Result<NpuRunResult, NpuRunError> {
     match exit_code {
         0 => {
-            let output_data = std::fs::read(output_file)?;
+            let output_data = std::fs::read(&output_files[0].1)?;
+            let mut extra_outputs = HashMap::new();
+            for (name, path) in &output_files[1..] {
+                if let Ok(data) = std::fs::read(path) {
+                    extra_outputs.insert(name.clone(), data);
+                }
+            }
             let _ = std::fs::remove_dir_all(tmp_dir);
             Ok(NpuRunResult {
                 output: output_data,
+                extra_outputs,
                 input_values,
             })
         }
