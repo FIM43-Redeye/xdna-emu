@@ -102,6 +102,9 @@ pub use cycle_accurate::{CycleAccurateExecutor, CycleAccurateStats};
 pub use semantic::execute_semantic;
 
 #[cfg(test)]
+mod vector_validate;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::device::tile::Tile;

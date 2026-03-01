@@ -435,6 +435,11 @@ impl ElementType {
     pub fn lanes_256(self) -> u8 {
         (256u16 / self.bits() as u16) as u8
     }
+
+    /// Whether this element type is signed (Int8, Int16, Int32).
+    pub fn is_signed(self) -> bool {
+        matches!(self, ElementType::Int8 | ElementType::Int16 | ElementType::Int32)
+    }
 }
 
 /// Branch condition codes.

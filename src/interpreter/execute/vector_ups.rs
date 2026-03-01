@@ -116,21 +116,44 @@ fn truncate(val: i64, bits: u32) -> i64 {
 
 /// Perform UPS on a single lane.
 ///
-/// 1. Sign-extend input to `bits_in` width.
+/// 1. Extend input to `bits_in` width (sign-extend if signed, zero-extend if unsigned).
 /// 2. Left-shift by `shift`.
 /// 3. If `saturate` is true, clamp to the signed range of `bits_out`.
 /// 4. Truncate to `bits_out` width.
 pub fn ups_lane(value: i64, shift: u32, bits_in: u32, bits_out: u32, saturate: bool) -> i64 {
-    // Sign-extend input to its declared width, then widen to i64.
-    let extended = truncate(value, bits_in);
+    ups_lane_signed(value, shift, bits_in, bits_out, saturate, true)
+}
+
+/// UPS per-lane with explicit signedness control.
+///
+/// When `signed_input` is false, the input value is zero-extended (masked)
+/// instead of sign-extended, matching hardware behavior for unsigned UPS.
+pub fn ups_lane_signed(
+    value: i64, shift: u32, bits_in: u32, bits_out: u32,
+    saturate: bool, signed_input: bool,
+) -> i64 {
+    // Extend input to its declared width.
+    let extended = if signed_input {
+        truncate(value, bits_in)
+    } else {
+        // Zero-extend: mask to bits_in width without sign extension.
+        if bits_in >= 64 {
+            value
+        } else {
+            value & ((1i64 << bits_in) - 1)
+        }
+    };
 
     // Left-shift for scaling into the wider accumulator.
     let shifted = extended.wrapping_shl(shift);
 
     // Optional saturation to the output range.
     let saturated = if saturate {
-        let vmax = (1i64 << (bits_out - 1)) - 1;
-        let vmin = -(1i64 << (bits_out - 1));
+        let (vmin, vmax) = if bits_out >= 64 {
+            (i64::MIN, i64::MAX)
+        } else {
+            (-(1i64 << (bits_out - 1)), (1i64 << (bits_out - 1)) - 1)
+        };
         shifted.max(vmin).min(vmax)
     } else {
         shifted
@@ -227,9 +250,11 @@ pub fn ups_vector(
 
     let mut result = [0u32; 8];
 
+    let signed_input = from_type.is_signed();
+
     for i in 0..out_lanes {
         let val = extract_lane(src, i, bits_in);
-        let out = ups_lane(val, shift, bits_in, bits_out, false);
+        let out = ups_lane_signed(val, shift, bits_in, bits_out, false, signed_input);
         pack_lane(&mut result, i, bits_out, out);
     }
 
