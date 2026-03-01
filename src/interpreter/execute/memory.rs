@@ -447,16 +447,6 @@ impl MemoryUnit {
             // Scalar/partial stores
             let value = Self::get_store_value(op, ctx, width);
 
-            if log::log_enabled!(log::Level::Trace) {
-                let masked = addr & 0xFFFF;
-                if masked >= 0x0400 && masked < 0x0420 {
-                    let elem = (masked - 0x0400) / 4;
-                    log::trace!(
-                        "[WATCH-ST] pc=0x{:03X} cycle={} elem={} addr=0x{:05X} value={} srcs={:?}",
-                        ctx.pc(), ctx.cycles, elem, masked, value as i32, op.sources
-                    );
-                }
-            }
             Self::write_memory(tile, addr, value, width, neighbors);
         }
 

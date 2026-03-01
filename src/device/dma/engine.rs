@@ -1403,7 +1403,6 @@ impl DmaEngine {
 
         log::debug!("DMA({},{}) MM2S ch{}: addr=0x{:X} offset=0x{:X} bytes={} words={}",
             self.col, self.row, channel, addr, offset, bytes, word_count);
-
         for i in 0..word_count {
             let word_offset = offset + i * 4;
             let word = if word_offset + 4 <= data.len() {
@@ -1554,7 +1553,6 @@ impl DmaEngine {
 
         log::debug!("DMA({},{}) S2MM ch{}: addr=0x{:X} offset=0x{:X} bytes={} words={}",
             self.col, self.row, channel, addr, offset, bytes, word_count);
-
         for word_idx in 0..word_count {
             // Get data from stream for this specific channel
             if let Some(stream_data) = self.pop_stream_in_for_channel(channel) {
@@ -1708,7 +1706,6 @@ impl DmaEngine {
         let word_count = (bytes + 3) / 4;
 
         log::debug!("MM2S transfer: addr=0x{:X} bytes={} words={}", addr, bytes, word_count);
-
         for i in 0..word_count {
             let word_addr = addr + (i * 4) as u64;
             let word = host_memory.read_u32(word_addr);
