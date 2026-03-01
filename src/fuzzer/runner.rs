@@ -543,7 +543,8 @@ fn execute_emulator_only(
 fn execute_trace_sweep(cases: &[CompiledCase], opts: &Options) {
     use crate::fuzzer::trace_sweep::{
         TRACE_EVENT_GROUPS, NUM_GROUPS, check_determinism, compare_event_sequences,
-        decode_binary_trace, write_sweep_summary,
+        compare_canonical, decode_binary_trace, write_sweep_summary,
+        cleanup_trace_binaries, DeterminismReport, SlotClass,
     };
 
     let reps = opts.trace_sweep_reps;
@@ -602,16 +603,11 @@ fn execute_trace_sweep(cases: &[CompiledCase], opts: &Options) {
                 }
             }
 
-            let result = check_determinism(&det_traces);
-            let det_text = match &result {
-                Ok(()) => format!("PASS ({} reps, {} bytes each)",
-                    det_traces.len(),
-                    det_traces.first().map(|t| t.len()).unwrap_or(0)),
-                Err(e) => format!("FAIL ({})", e),
-            };
+            let report = check_determinism(&det_traces);
+            let det_text = format!("{}", report);
             let _ = std::fs::write(sweep_dir.join("determinism.txt"), &det_text);
 
-            if result.is_ok() {
+            if report.compute_deterministic {
                 total_deterministic += 1;
             } else {
                 total_nondeterministic += 1;
@@ -622,9 +618,20 @@ fn execute_trace_sweep(cases: &[CompiledCase], opts: &Options) {
                 println!("seed {} determinism: {}", case.seed, det_text);
             }
 
-            result
+            // Keep rep 0 trace for group 0 reuse, clean up the rest.
+            for rep in 1..reps {
+                let _ = std::fs::remove_file(sweep_dir.join(format!("npu_det_rep{}.bin", rep)));
+            }
+
+            report
         } else {
-            Ok(()) // No hardware => skip determinism check.
+            // No hardware => skip determinism check; return trivial report.
+            DeterminismReport {
+                num_reps: 0,
+                dimensions: Vec::new(),
+                compute_deterministic: true,
+                slot_classes: [SlotClass::Inactive; 8],
+            }
         };
 
         // Step 2+3: Per-group NPU and emulator traces.
@@ -689,7 +696,19 @@ fn execute_trace_sweep(cases: &[CompiledCase], opts: &Options) {
             let comp = if let (Some(npu_data), Some(emu_data)) = (&npu_trace, &emu_trace) {
                 let npu_events = decode_binary_trace(npu_data);
                 let emu_events = decode_binary_trace(emu_data);
-                let comp = compare_event_sequences(&npu_events, &emu_events, group.name);
+
+                // Group 0 has determinism data -- use canonical comparison
+                // to filter out non-deterministic slots. Other groups use
+                // raw comparison (no determinism data for their slots).
+                let comp = if group_idx == 0 {
+                    let (c, _filtered) = compare_canonical(
+                        &npu_events, &emu_events,
+                        &determinism.slot_classes, group.name,
+                    );
+                    c
+                } else {
+                    compare_event_sequences(&npu_events, &emu_events, group.name)
+                };
 
                 // Write comparison result.
                 let comp_path = sweep_dir.join(format!("group_{}_compare.txt", group_idx));
@@ -724,6 +743,9 @@ fn execute_trace_sweep(cases: &[CompiledCase], opts: &Options) {
 
         // Write sweep summary for this seed.
         let _ = write_sweep_summary(&sweep_dir, &determinism, &comparisons);
+
+        // Clean up 1MB binary trace files; text summaries are all we keep.
+        cleanup_trace_binaries(&sweep_dir);
     }
 
     // Final report.

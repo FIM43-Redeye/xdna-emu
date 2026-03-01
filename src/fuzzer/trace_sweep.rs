@@ -492,7 +492,73 @@ pub struct DecodedEvent {
     pub abs_cycle: u64,
 }
 
+/// Trim a raw trace buffer to just the region containing real data.
+///
+/// NPU trace buffers are typically 1MB, mostly filled with padding (0xFE
+/// bytes) and zeros. This function finds the end of actual trace data using
+/// the same heuristic as mlir-aie's `trim_trace_pkts`: the first uint32
+/// word equal to `0xFEFEFEFE` followed by two `0x00000000` words marks the
+/// boundary. Everything from that point onward (inclusive of the sentinel)
+/// is padding.
+///
+/// Returns the byte length of the valid data prefix (always a multiple of 4).
+/// If no trim point is found, returns the full buffer length.
+pub fn trim_trace_buffer(data: &[u8]) -> usize {
+    // Scan uint32 words looking for 0xFEFEFEFE followed by two 0x00000000.
+    let word_count = data.len() / 4;
+    for i in 0..word_count {
+        let off = i * 4;
+        let word = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+        if word == 0xFEFEFEFE {
+            // Check if next two words are 0x00000000.
+            if i + 2 < word_count {
+                let w1 = u32::from_le_bytes([
+                    data[off + 4], data[off + 5], data[off + 6], data[off + 7],
+                ]);
+                let w2 = u32::from_le_bytes([
+                    data[off + 8], data[off + 9], data[off + 10], data[off + 11],
+                ]);
+                if w1 == 0 && w2 == 0 {
+                    // Include the sentinel word itself (matches mlir-aie behavior).
+                    return (i + 1) * 4;
+                }
+            }
+        }
+    }
+    data.len()
+}
+
+/// Check if a 32-bit word is a valid trace packet header.
+///
+/// Per mlir-aie `parse_pkt_hdr_in_stream`, a valid header must have:
+/// - Odd parity (odd number of 1-bits)
+/// - Bits [11:5] = 0 (reserved)
+/// - Bit 19 = 0 (reserved)
+/// - Bits [30:28] = 0 (reserved)
+///
+/// All-zero words (empty buffers) fail the parity check.
+fn is_valid_trace_header(word: u32) -> bool {
+    // Odd parity: popcount must be odd.
+    if word.count_ones() % 2 == 0 {
+        return false;
+    }
+    // Reserved fields must be zero.
+    if ((word >> 5) & 0x7F) != 0 {
+        return false;
+    }
+    if ((word >> 19) & 0x1) != 0 {
+        return false;
+    }
+    if ((word >> 28) & 0x7) != 0 {
+        return false;
+    }
+    true
+}
+
 /// Decode binary trace data (raw bytes from the trace buffer) into events.
+///
+/// The buffer is first trimmed to remove padding/zeros (see
+/// [`trim_trace_buffer`]), then decoded packet-by-packet.
 ///
 /// The trace buffer contains 32-byte packets. Word 0 is the header; words
 /// 1-7 contain 28 bytes of encoded events (big-endian packed into u32s).
@@ -516,6 +582,9 @@ pub struct DecodedEvent {
 /// (slot in [6:4] for Single1/2), which is a known divergence from hardware.
 /// This decoder implements the hardware format for NPU trace compatibility.
 pub fn decode_binary_trace(data: &[u8]) -> Vec<DecodedEvent> {
+    let trimmed_len = trim_trace_buffer(data);
+    let data = &data[..trimmed_len];
+
     let mut events = Vec::new();
 
     // Each packet is 32 bytes (8 words of 4 bytes each).
@@ -528,12 +597,28 @@ pub fn decode_binary_trace(data: &[u8]) -> Vec<DecodedEvent> {
     let mut last_delta: u64 = 0;
 
     while pkt_offset + packet_size <= data.len() {
-        // Word 0 is header -- skip it.
-        // Words 1-7 are data: extract 28 bytes (big-endian packed in u32s).
+        // Word 0 is the packet header. Validate it before decoding.
+        // A valid trace packet header has odd parity and specific reserved
+        // bits clear (matching mlir-aie's parse_pkt_hdr_in_stream).
+        let header = u32::from_le_bytes([
+            data[pkt_offset],
+            data[pkt_offset + 1],
+            data[pkt_offset + 2],
+            data[pkt_offset + 3],
+        ]);
+        if !is_valid_trace_header(header) {
+            break;
+        }
+
+        // Words 1-7 are data: extract 28 bytes.
+        // Trace buffers are stored as little-endian uint32 words. Each word
+        // packs 4 event bytes MSB-first (byte 3 = most significant position),
+        // matching mlir-aie's convert_to_byte_stream which extracts with
+        // `event >> (byte * 8)` for byte = 3,2,1,0.
         let mut payload = [0u8; 28];
         for word_idx in 0..7 {
             let word_offset = pkt_offset + (word_idx + 1) * 4;
-            let word = u32::from_be_bytes([
+            let word = u32::from_le_bytes([
                 data[word_offset],
                 data[word_offset + 1],
                 data[word_offset + 2],
@@ -753,6 +838,8 @@ pub struct TraceComparison {
     pub sequence_match: bool,
     /// First divergence point: (index, npu_slot, emu_slot).
     pub first_divergence: Option<(usize, u8, u8)>,
+    /// Number of events filtered during canonicalization (0 = raw comparison).
+    pub filtered_count: usize,
 }
 
 /// Compare NPU and emulator event sequences by slot ID only.
@@ -804,23 +891,31 @@ pub fn compare_event_sequences(
         emu_event_count: emu_count,
         sequence_match,
         first_divergence,
+        filtered_count: 0,
     }
 }
 
 /// Format a TraceComparison as a human-readable string.
 impl std::fmt::Display for TraceComparison {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let suffix = if self.filtered_count > 0 {
+            format!(" (filtered {} timing-dep)", self.filtered_count)
+        } else {
+            String::new()
+        };
+        let label = if self.filtered_count > 0 { "canon" } else { "events" };
+
         if self.sequence_match {
             write!(
                 f,
-                "{}: MATCH ({} events)",
-                self.group_name, self.npu_event_count,
+                "{}: MATCH ({} {}){}",
+                self.group_name, self.npu_event_count, label, suffix,
             )
         } else if let Some((idx, npu_s, emu_s)) = self.first_divergence {
             write!(
                 f,
                 "{}: DIVERGE at index {} (npu_slot={}, emu_slot={}) \
-                 [npu={} events, emu={} events]",
+                 [npu={} {}, emu={} {}]{}",
                 self.group_name,
                 idx,
                 if npu_s == u8::MAX {
@@ -834,7 +929,10 @@ impl std::fmt::Display for TraceComparison {
                     emu_s.to_string()
                 },
                 self.npu_event_count,
+                label,
                 self.emu_event_count,
+                label,
+                suffix,
             )
         } else {
             write!(f, "{}: EMPTY (no events)", self.group_name)
@@ -846,64 +944,706 @@ impl std::fmt::Display for TraceComparison {
 // Sweep orchestration helpers
 // -------------------------------------------------------------------------
 
-/// Check event-sequence determinism across multiple binary trace buffers.
+/// A trace command skeleton element, stripped of timing and repeat counts.
 ///
-/// Decodes each trace and compares the slot sequences (ignoring absolute
-/// cycle values, which naturally vary between runs due to the NPU timer
-/// starting from a different point each time). Returns `Ok(())` if all
-/// runs produced the same events in the same order.
-pub fn check_determinism(traces: &[Vec<u8>]) -> Result<(), String> {
-    if traces.len() < 2 {
-        return Ok(());
+/// Used for determinism comparison: two traces are considered deterministic
+/// if they produce the same sequence of event transitions (same slots firing
+/// in the same order), regardless of how many cycles each phase lasts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SkeletonEntry {
+    /// A single event slot fired.
+    Single(u8),
+    /// Multiple event slots fired simultaneously (sorted).
+    Multiple(Vec<u8>),
+}
+
+/// Extract a command skeleton from decoded events.
+///
+/// Groups consecutive events at the same abs_cycle into Multiple entries
+/// and single events into Single entries. Repeat runs (same slots at
+/// consecutive cycles) collapse into one entry. This strips timing
+/// completely, leaving only the ordered sequence of event transitions.
+fn extract_skeleton(events: &[DecodedEvent]) -> Vec<SkeletonEntry> {
+    if events.is_empty() {
+        return Vec::new();
     }
 
-    // Decode all traces into event sequences.
-    let decoded: Vec<Vec<DecodedEvent>> = traces
+    let mut skeleton = Vec::new();
+    let mut i = 0;
+
+    while i < events.len() {
+        // Collect all events at the same abs_cycle.
+        let cycle = events[i].abs_cycle;
+        let mut slots: Vec<u8> = Vec::new();
+        while i < events.len() && events[i].abs_cycle == cycle {
+            slots.push(events[i].slot);
+            i += 1;
+        }
+        slots.sort();
+        slots.dedup();
+
+        let entry = if slots.len() == 1 {
+            SkeletonEntry::Single(slots[0])
+        } else {
+            SkeletonEntry::Multiple(slots)
+        };
+
+        // Collapse consecutive identical entries (repeat compression).
+        if skeleton.last() != Some(&entry) {
+            skeleton.push(entry);
+        }
+    }
+
+    skeleton
+}
+
+// -------------------------------------------------------------------------
+// Dimension-driven determinism analysis
+// -------------------------------------------------------------------------
+//
+// Every analysis angle is a named "dimension" -- a projection of the raw
+// event stream into a comparable value (scalar or sequence). Adding a new
+// angle requires one call to `scalar_dim()` or `sequence_dim()` inside
+// `analyze_dimensions()`. Per-slot dimensions auto-generate for all 8
+// slots, filtered to those that actually fire.
+
+/// Result of comparing one analysis dimension across repetitions.
+#[derive(Debug, Clone)]
+pub struct DimensionVerdict {
+    /// Dimension name (e.g., "deltas", "slot5_fires", "skeleton").
+    pub name: String,
+    /// Whether this dimension is identical across all repetitions.
+    pub deterministic: bool,
+    /// Human-readable summary of the values or variance.
+    /// Scalars: "42" or "3-7". Sequences: "match (8)" or "diverge@5/12".
+    pub summary: String,
+}
+
+// -------------------------------------------------------------------------
+// Slot classification and trace canonicalization
+// -------------------------------------------------------------------------
+
+/// Classification of a trace slot's determinism behavior, derived from
+/// the N-rep determinism check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotClass {
+    /// Same fire count across all reps (and > 0) -- include in canonical trace.
+    Deterministic,
+    /// Fires 0 or 1 times (trace window boundary race) -- include.
+    Boundary,
+    /// Fire count varies significantly across reps -- exclude from canonical trace.
+    TimingDependent,
+    /// Never fires in any rep -- exclude.
+    Inactive,
+}
+
+/// Classify each of the 8 trace slots based on multi-rep fire count analysis.
+///
+/// Takes the decoded events from each determinism-check rep and determines
+/// which slots fire deterministically vs. which depend on runtime timing.
+pub fn classify_slots_from_reps(reps: &[Vec<DecodedEvent>]) -> [SlotClass; 8] {
+    let mut classes = [SlotClass::Inactive; 8];
+    for slot in 0..8u8 {
+        let counts: Vec<usize> = reps
+            .iter()
+            .map(|events| events.iter().filter(|e| e.slot == slot).count())
+            .collect();
+        let min = counts.iter().copied().min().unwrap_or(0);
+        let max = counts.iter().copied().max().unwrap_or(0);
+
+        classes[slot as usize] = if max == 0 {
+            SlotClass::Inactive
+        } else if min == max {
+            SlotClass::Deterministic
+        } else if min == 0 && max <= 1 {
+            SlotClass::Boundary
+        } else {
+            SlotClass::TimingDependent
+        };
+    }
+    classes
+}
+
+/// A trace with non-deterministic slots filtered out.
+///
+/// Suitable for direct emulator-vs-hardware comparison: only events that the
+/// NPU itself is deterministic about are included. The filtered event counts
+/// are preserved for reporting.
+pub struct CanonicalTrace {
+    /// Events after filtering out TimingDependent and Inactive slots,
+    /// aligned to cycle 0.
+    pub events: Vec<DecodedEvent>,
+    /// Per-slot classification (for reporting).
+    pub slot_classes: [SlotClass; 8],
+    /// How many events were filtered per slot (for reporting).
+    pub filtered_counts: [usize; 8],
+}
+
+/// Produce a canonical trace by filtering out non-deterministic slots
+/// and aligning to cycle 0.
+pub fn canonicalize(
+    events: &[DecodedEvent],
+    slot_classes: &[SlotClass; 8],
+) -> CanonicalTrace {
+    let mut filtered_counts = [0usize; 8];
+
+    // Count filtered events per slot.
+    for e in events {
+        match slot_classes[e.slot as usize] {
+            SlotClass::TimingDependent | SlotClass::Inactive => {
+                filtered_counts[e.slot as usize] += 1;
+            }
+            _ => {}
+        }
+    }
+
+    // Keep only Deterministic and Boundary events, align to cycle 0.
+    let kept: Vec<DecodedEvent> = events
+        .iter()
+        .filter(|e| matches!(
+            slot_classes[e.slot as usize],
+            SlotClass::Deterministic | SlotClass::Boundary,
+        ))
+        .cloned()
+        .collect();
+
+    let base = kept.first().map(|e| e.abs_cycle).unwrap_or(0);
+    let aligned = kept
+        .into_iter()
+        .map(|e| DecodedEvent {
+            slot: e.slot,
+            abs_cycle: e.abs_cycle.saturating_sub(base),
+        })
+        .collect();
+
+    CanonicalTrace {
+        events: aligned,
+        slot_classes: *slot_classes,
+        filtered_counts,
+    }
+}
+
+/// Compare NPU and emulator traces after canonicalizing both.
+///
+/// Returns the comparison result plus the total number of filtered events
+/// (from both sides) for reporting context.
+pub fn compare_canonical(
+    npu_events: &[DecodedEvent],
+    emu_events: &[DecodedEvent],
+    slot_classes: &[SlotClass; 8],
+    group_name: &str,
+) -> (TraceComparison, usize) {
+    let npu_canon = canonicalize(npu_events, slot_classes);
+    let emu_canon = canonicalize(emu_events, slot_classes);
+    let total_filtered = npu_canon.filtered_counts.iter().sum::<usize>()
+        + emu_canon.filtered_counts.iter().sum::<usize>();
+    let mut comp = compare_event_sequences(&npu_canon.events, &emu_canon.events, group_name);
+    comp.filtered_count = total_filtered;
+    (comp, total_filtered)
+}
+
+/// Complete determinism analysis across multiple trace buffer repetitions.
+///
+/// Instead of hardcoding specific analysis angles, this report contains a
+/// list of independently-evaluated dimensions. Each dimension compares one
+/// projection of the event data across all reps. The `compute_deterministic`
+/// verdict is derived from the `deltas` dimension.
+#[derive(Debug, Clone)]
+pub struct DeterminismReport {
+    /// Number of repetitions analyzed.
+    pub num_reps: usize,
+    /// All dimension verdicts (filtered to non-trivial dimensions).
+    pub dimensions: Vec<DimensionVerdict>,
+    /// Overall compute determinism verdict (derived from deltas dimension).
+    pub compute_deterministic: bool,
+    /// Per-slot determinism classification (derived from fire count variance).
+    pub slot_classes: [SlotClass; 8],
+}
+
+impl DeterminismReport {
+    /// Look up a dimension verdict by name.
+    pub fn dimension(&self, name: &str) -> Option<&DimensionVerdict> {
+        self.dimensions.iter().find(|d| d.name == name)
+    }
+
+    /// Check if a specific dimension is deterministic.
+    /// Returns true if the dimension was not measured (no data to compare).
+    pub fn is_deterministic(&self, name: &str) -> bool {
+        self.dimension(name).map(|d| d.deterministic).unwrap_or(true)
+    }
+}
+
+impl std::fmt::Display for DeterminismReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.num_reps < 2 {
+            return write!(f, "SKIP (only {} rep)", self.num_reps);
+        }
+
+        let total = self.dimensions.len();
+        let det_count = self.dimensions.iter().filter(|d| d.deterministic).count();
+        let varying: Vec<&DimensionVerdict> = self.dimensions
+            .iter()
+            .filter(|d| !d.deterministic)
+            .collect();
+
+        if self.compute_deterministic {
+            write!(f, "PASS (compute deterministic, {} reps, {}/{} dims)",
+                   self.num_reps, det_count, total)?;
+        } else {
+            // List the failing sequence dimensions for quick diagnosis.
+            let failing_seqs: Vec<&str> = self.dimensions.iter()
+                .filter(|d| !d.deterministic && d.summary.contains("diverge"))
+                .map(|d| d.name.as_str())
+                .collect();
+            if failing_seqs.is_empty() {
+                write!(f, "FAIL ({} reps, {}/{} dims)",
+                       self.num_reps, det_count, total)?;
+            } else {
+                write!(f, "FAIL ({} diverge, {} reps, {}/{} dims)",
+                       failing_seqs.join("+"), self.num_reps, det_count, total)?;
+            }
+        }
+
+        if !varying.is_empty() {
+            write!(f, " [varying: {}]",
+                   varying.iter()
+                       .map(|d| format!("{}={}", d.name, d.summary))
+                       .collect::<Vec<_>>()
+                       .join(", "))?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Align decoded events so the first event is at cycle 0.
+fn align_events(events: &[DecodedEvent]) -> Vec<DecodedEvent> {
+    if events.is_empty() {
+        return Vec::new();
+    }
+    let base = events[0].abs_cycle;
+    events
+        .iter()
+        .map(|e| DecodedEvent {
+            slot: e.slot,
+            abs_cycle: e.abs_cycle.saturating_sub(base),
+        })
+        .collect()
+}
+
+/// Count state-change edges for a single slot in an event stream.
+///
+/// An "edge" is a transition from the slot being absent to present or
+/// vice versa across consecutive time steps. This measures behavioral
+/// structure independent of duration.
+fn count_slot_edges(events: &[DecodedEvent], slot: u8) -> usize {
+    if events.is_empty() {
+        return 0;
+    }
+
+    // Build a set of cycles where this slot fires.
+    let mut active_cycles = std::collections::BTreeSet::new();
+    for e in events {
+        if e.slot == slot {
+            active_cycles.insert(e.abs_cycle);
+        }
+    }
+    if active_cycles.is_empty() {
+        return 0;
+    }
+
+    // Get all unique cycles in the event stream.
+    let mut all_cycles = std::collections::BTreeSet::new();
+    for e in events {
+        all_cycles.insert(e.abs_cycle);
+    }
+
+    // Count transitions between active and inactive.
+    let mut edges = 0;
+    let mut was_active = false;
+    for &cycle in &all_cycles {
+        let is_active = active_cycles.contains(&cycle);
+        if is_active != was_active {
+            edges += 1;
+            was_active = is_active;
+        }
+    }
+
+    edges
+}
+
+/// Extract per-cycle slot sets from a decoded event stream.
+///
+/// Returns a vector of (abs_cycle, sorted slot set) pairs in cycle order,
+/// with consecutive duplicates collapsed (repeat compression). This is the
+/// behavioral transition sequence.
+fn extract_transitions(events: &[DecodedEvent]) -> Vec<Vec<u8>> {
+    if events.is_empty() {
+        return Vec::new();
+    }
+
+    let mut transitions = Vec::new();
+    let mut i = 0;
+
+    while i < events.len() {
+        let cycle = events[i].abs_cycle;
+        let mut slots = Vec::new();
+        while i < events.len() && events[i].abs_cycle == cycle {
+            slots.push(events[i].slot);
+            i += 1;
+        }
+        slots.sort();
+        slots.dedup();
+
+        // Collapse consecutive identical slot sets.
+        if transitions.last() != Some(&slots) {
+            transitions.push(slots);
+        }
+    }
+
+    transitions
+}
+
+/// Extract inter-event deltas from decoded events.
+///
+/// Returns the cycle delta between each pair of consecutive time-step
+/// changes (not individual events, but distinct cycles). This captures
+/// instruction-level timing independent of which slots fire.
+fn extract_deltas(events: &[DecodedEvent]) -> Vec<u64> {
+    let mut unique_cycles: Vec<u64> = Vec::new();
+    for e in events {
+        if unique_cycles.last() != Some(&e.abs_cycle) {
+            unique_cycles.push(e.abs_cycle);
+        }
+    }
+    if unique_cycles.len() < 2 {
+        return Vec::new();
+    }
+    unique_cycles
+        .windows(2)
+        .map(|w| w[1].saturating_sub(w[0]))
+        .collect()
+}
+
+// -------------------------------------------------------------------------
+// Dimension extraction helpers
+// -------------------------------------------------------------------------
+
+/// Convert a sorted slot set to a bitmask (slot N -> bit N).
+fn slot_bitmask(slots: &[u8]) -> u64 {
+    let mut mask = 0u64;
+    for &s in slots {
+        mask |= 1 << s;
+    }
+    mask
+}
+
+/// Extract inter-fire cycle deltas for a single slot.
+///
+/// Returns the cycle gaps between consecutive fires of the given slot,
+/// capturing per-slot timing behavior independent of other slots.
+fn extract_slot_deltas(events: &[DecodedEvent], slot: u8) -> Vec<u64> {
+    let mut cycles: Vec<u64> = Vec::new();
+    for e in events {
+        if e.slot == slot {
+            if cycles.last() != Some(&e.abs_cycle) {
+                cycles.push(e.abs_cycle);
+            }
+        }
+    }
+    if cycles.len() < 2 {
+        return Vec::new();
+    }
+    cycles.windows(2).map(|w| w[1].saturating_sub(w[0])).collect()
+}
+
+/// Find the longest consecutive run of a slot being active.
+///
+/// A "run" is a sequence of consecutive global time steps where the slot
+/// fires without interruption. Measures duty cycle patterns.
+fn max_consecutive_run(events: &[DecodedEvent], slot: u8) -> usize {
+    let mut active: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for e in events {
+        if e.slot == slot {
+            active.insert(e.abs_cycle);
+        }
+    }
+    if active.is_empty() {
+        return 0;
+    }
+
+    let mut all: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for e in events {
+        all.insert(e.abs_cycle);
+    }
+
+    let mut max_run = 0;
+    let mut current_run = 0;
+    for &cycle in &all {
+        if active.contains(&cycle) {
+            current_run += 1;
+            max_run = max_run.max(current_run);
+        } else {
+            current_run = 0;
+        }
+    }
+    max_run
+}
+
+// -------------------------------------------------------------------------
+// Dimension framework
+// -------------------------------------------------------------------------
+
+/// Add a scalar dimension: one u64 value per rep, compared for equality.
+///
+/// Suppresses dimensions where all reps produce zero (non-firing slots).
+fn scalar_dim(dims: &mut Vec<DimensionVerdict>, name: &str, values: &[u64]) {
+    if values.len() < 2 {
+        return;
+    }
+    // Skip if all values are zero (non-firing slot, uninteresting).
+    if values.iter().all(|&v| v == 0) {
+        return;
+    }
+    let deterministic = values.iter().all(|&v| v == values[0]);
+    let summary = if deterministic {
+        format!("{}", values[0])
+    } else {
+        let min = *values.iter().min().unwrap();
+        let max = *values.iter().max().unwrap();
+        format!("{}-{}", min, max)
+    };
+    dims.push(DimensionVerdict {
+        name: name.to_string(),
+        deterministic,
+        summary,
+    });
+}
+
+/// Add a sequence dimension: one Vec<u64> per rep, compared element-by-element.
+///
+/// Uses prefix matching: sequences of different lengths compare their shared
+/// prefix. Suppresses dimensions where all reps produce empty sequences.
+fn sequence_dim(dims: &mut Vec<DimensionVerdict>, name: &str, sequences: &[Vec<u64>]) {
+    if sequences.len() < 2 {
+        return;
+    }
+    if sequences.iter().all(|s| s.is_empty()) {
+        return;
+    }
+
+    let min_len = sequences.iter().map(|s| s.len()).min().unwrap_or(0);
+    let max_len = sequences.iter().map(|s| s.len()).max().unwrap_or(0);
+
+    // Compare shared prefix.
+    let mut match_count = 0;
+    for i in 0..min_len {
+        if sequences.iter().all(|s| s[i] == sequences[0][i]) {
+            match_count += 1;
+        } else {
+            break;
+        }
+    }
+
+    // Prefix match: if all shared elements match, the dimension is
+    // deterministic. The shorter trace may have captured less data
+    // (trace buffer filled), not different behavior.
+    let deterministic = match_count == min_len;
+    let summary = if deterministic && min_len == max_len {
+        format!("match ({})", max_len)
+    } else if deterministic {
+        format!("prefix {}/{}", min_len, max_len)
+    } else {
+        format!("diverge@{}/{}", match_count, max_len)
+    };
+
+    dims.push(DimensionVerdict {
+        name: name.to_string(),
+        deterministic,
+        summary,
+    });
+}
+
+/// Analyze all dimensions from aligned event streams.
+///
+/// Automatically generates global scalar, global sequence, and per-slot
+/// dimensions. Per-slot dimensions are only included for slots that fire
+/// in at least one rep.
+fn analyze_dimensions(
+    reps: &[Vec<DecodedEvent>],
+    start_times: &[u64],
+) -> Vec<DimensionVerdict> {
+    let mut dims = Vec::new();
+    if reps.len() < 2 {
+        return dims;
+    }
+
+    // --- Start time (pre-alignment, host scheduling jitter) ---
+    scalar_dim(&mut dims, "start_time", start_times);
+
+    // --- Global scalar dimensions ---
+    let total_events: Vec<u64> = reps.iter().map(|e| e.len() as u64).collect();
+    scalar_dim(&mut dims, "total_events", &total_events);
+
+    let unique_cycles: Vec<u64> = reps.iter().map(|e| {
+        let mut set = std::collections::BTreeSet::new();
+        for ev in e { set.insert(ev.abs_cycle); }
+        set.len() as u64
+    }).collect();
+    scalar_dim(&mut dims, "unique_cycles", &unique_cycles);
+
+    let durations: Vec<u64> = reps.iter().map(|e| {
+        if e.len() < 2 { 0 }
+        else { e.last().unwrap().abs_cycle - e.first().unwrap().abs_cycle }
+    }).collect();
+    scalar_dim(&mut dims, "duration", &durations);
+
+    // --- Global sequence dimensions ---
+    let all_deltas: Vec<Vec<u64>> = reps.iter()
+        .map(|e| extract_deltas(e))
+        .collect();
+    sequence_dim(&mut dims, "deltas", &all_deltas);
+
+    let all_transitions: Vec<Vec<u64>> = reps.iter()
+        .map(|e| extract_transitions(e).iter().map(|slots| slot_bitmask(slots)).collect())
+        .collect();
+    sequence_dim(&mut dims, "transitions", &all_transitions);
+
+    let all_skeletons: Vec<Vec<u64>> = reps.iter().map(|e| {
+        extract_skeleton(e).iter().map(|entry| match entry {
+            SkeletonEntry::Single(s) => 1u64 << *s,
+            SkeletonEntry::Multiple(ss) => slot_bitmask(ss),
+        }).collect()
+    }).collect();
+    sequence_dim(&mut dims, "skeleton", &all_skeletons);
+
+    // --- Per-slot dimensions (auto-generated for all 8 slots) ---
+    for slot in 0..8u8 {
+        let fires: Vec<u64> = reps.iter()
+            .map(|e| e.iter().filter(|ev| ev.slot == slot).count() as u64)
+            .collect();
+
+        // Skip slots that never fire in any rep.
+        if fires.iter().all(|&f| f == 0) {
+            continue;
+        }
+
+        let slot_name = format!("slot{}", slot);
+
+        scalar_dim(&mut dims, &format!("{}_fires", slot_name), &fires);
+
+        let edges: Vec<u64> = reps.iter()
+            .map(|e| count_slot_edges(e, slot) as u64)
+            .collect();
+        scalar_dim(&mut dims, &format!("{}_edges", slot_name), &edges);
+
+        let first_cycles: Vec<u64> = reps.iter()
+            .map(|e| e.iter().find(|ev| ev.slot == slot).map(|ev| ev.abs_cycle).unwrap_or(0))
+            .collect();
+        scalar_dim(&mut dims, &format!("{}_first_cycle", slot_name), &first_cycles);
+
+        let last_cycles: Vec<u64> = reps.iter()
+            .map(|e| e.iter().rev().find(|ev| ev.slot == slot).map(|ev| ev.abs_cycle).unwrap_or(0))
+            .collect();
+        scalar_dim(&mut dims, &format!("{}_last_cycle", slot_name), &last_cycles);
+
+        let max_runs: Vec<u64> = reps.iter()
+            .map(|e| max_consecutive_run(e, slot) as u64)
+            .collect();
+        scalar_dim(&mut dims, &format!("{}_max_run", slot_name), &max_runs);
+
+        let slot_dts: Vec<Vec<u64>> = reps.iter()
+            .map(|e| extract_slot_deltas(e, slot))
+            .collect();
+        sequence_dim(&mut dims, &format!("{}_deltas", slot_name), &slot_dts);
+    }
+
+    dims
+}
+
+/// Analyze trace determinism across multiple repetitions.
+///
+/// Decodes binary traces, aligns to cycle 0, then evaluates every
+/// analysis dimension automatically. The `compute_deterministic` verdict
+/// is derived from the `deltas` dimension (inter-event cycle timing).
+pub fn check_determinism(traces: &[Vec<u8>]) -> DeterminismReport {
+    let num_reps = traces.len();
+
+    // Decode all traces.
+    let all_events: Vec<Vec<DecodedEvent>> = traces
         .iter()
         .map(|t| decode_binary_trace(t))
         .collect();
 
-    let ref_events = &decoded[0];
-    for (rep, events) in decoded.iter().enumerate().skip(1) {
-        if events.len() != ref_events.len() {
-            return Err(format!(
-                "rep {} has {} events, rep 0 has {} events",
-                rep,
-                events.len(),
-                ref_events.len(),
-            ));
-        }
-        for (idx, (a, b)) in ref_events.iter().zip(events.iter()).enumerate() {
-            if a.slot != b.slot {
-                return Err(format!(
-                    "rep {} event {} slot mismatch: {} vs {}",
-                    rep, idx, a.slot, b.slot,
-                ));
-            }
-        }
+    // Start times (pre-alignment).
+    let start_times: Vec<u64> = all_events
+        .iter()
+        .map(|events| events.first().map(|e| e.abs_cycle).unwrap_or(0))
+        .collect();
+
+    // Align all events to start at cycle 0.
+    let aligned: Vec<Vec<DecodedEvent>> = all_events
+        .iter()
+        .map(|events| align_events(events))
+        .collect();
+
+    // Classify slots from the aligned events.
+    let slot_classes = classify_slots_from_reps(&aligned);
+
+    // Analyze all dimensions.
+    let dimensions = analyze_dimensions(&aligned, &start_times);
+
+    // Compute determinism = deltas match across the shared prefix.
+    // Inter-event deltas capture instruction-level timing: the cycle gap
+    // between successive unique trace ticks. If these are identical across
+    // reps, the core executed the same instruction sequence at the same
+    // relative timing. All other dimensions are informational diagnostics.
+    let compute_deterministic = dimensions
+        .iter()
+        .find(|d| d.name == "deltas")
+        .map(|d| d.deterministic)
+        .unwrap_or(true);
+
+    DeterminismReport {
+        num_reps,
+        dimensions,
+        compute_deterministic,
+        slot_classes,
     }
-    Ok(())
 }
 
 /// Write a sweep summary file.
 pub fn write_sweep_summary(
     sweep_dir: &Path,
-    determinism: &Result<(), String>,
+    determinism: &DeterminismReport,
     comparisons: &[TraceComparison],
 ) -> std::io::Result<()> {
     use std::io::Write;
     let path = sweep_dir.join("sweep_summary.txt");
     let mut f = std::fs::File::create(&path)?;
 
-    match determinism {
-        Ok(()) => writeln!(f, "Determinism: PASS")?,
-        Err(e) => writeln!(f, "Determinism: FAIL ({})", e)?,
-    }
+    writeln!(f, "Determinism: {}", determinism)?;
 
     for comp in comparisons {
         writeln!(f, "{}", comp)?;
     }
     Ok(())
+}
+
+/// Delete large binary trace files after analysis, keeping only text summaries.
+///
+/// Trace buffers are typically 1MB each; a 13-group sweep with 5 determinism
+/// reps produces ~18MB per seed. This removes the .bin files while preserving
+/// .txt comparison results and the sweep summary.
+pub fn cleanup_trace_binaries(sweep_dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(sweep_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("bin") {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -1082,12 +1822,16 @@ mod tests {
 
     /// Build a trace packet from raw event bytes (helper for tests).
     fn make_trace_packet(event_bytes: &[u8]) -> Vec<u8> {
-        // Header (word 0): minimal valid header.
-        let header: u32 = 0x80000001; // parity=1, packet_id=1
+        // Header (word 0): valid header for tile (2,1), core trace, packet_id=1.
+        // Matches the format from real NPU traces: col in [27:21], row in [20:16],
+        // type in [13:12], id in [4:0], reserved bits clear, odd parity.
+        let header: u32 = 0x00220001; // col=1, row=2, type=0, id=1, popcount=3 (odd)
         let mut packet = Vec::with_capacity(32);
-        packet.extend_from_slice(&header.to_be_bytes());
+        packet.extend_from_slice(&header.to_le_bytes());
 
-        // Words 1-7: pack event_bytes big-endian, pad with 0xFE.
+        // Words 1-7: pack event_bytes into LE uint32 words, pad with 0xFE.
+        // Event bytes are packed MSB-first within each word, then the word is
+        // stored little-endian -- matching real NPU trace buffer format.
         let mut padded = [0xFEu8; 28];
         let copy_len = event_bytes.len().min(28);
         padded[..copy_len].copy_from_slice(&event_bytes[..copy_len]);
@@ -1100,7 +1844,7 @@ mod tests {
                 padded[base + 2],
                 padded[base + 3],
             ]);
-            packet.extend_from_slice(&word.to_be_bytes());
+            packet.extend_from_slice(&word.to_le_bytes());
         }
 
         assert_eq!(packet.len(), 32);
@@ -1173,6 +1917,30 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_trims_padding() {
+        // One packet of real data followed by padding sentinel + zeros.
+        let events = vec![
+            0xF0, 0, 0, 0, 0, 0, 0, 100, // Start marker: timer=100
+            0x13, // slot=1, delta=3
+        ];
+        let mut buf = make_trace_packet(&events);
+
+        // Append 0xFEFEFEFE sentinel + two zero words (as little-endian u32s).
+        buf.extend_from_slice(&0xFEFEFEFEu32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+
+        // Append a second packet full of zeros (would decode as fake events).
+        buf.extend_from_slice(&[0u8; 32]);
+
+        // Without trimming we'd decode the zeros as slot-0 events.
+        // With trimming, only the real packet is decoded.
+        let decoded = decode_binary_trace(&buf);
+        assert_eq!(decoded.len(), 1, "Expected 1 real event, got {}", decoded.len());
+        assert_eq!(decoded[0].slot, 1);
+    }
+
+    #[test]
     fn test_compare_matching() {
         let events = vec![
             DecodedEvent { slot: 1, abs_cycle: 100 },
@@ -1230,55 +1998,293 @@ mod tests {
         assert!(comp.first_divergence.is_none());
     }
 
+    // --- Trim tests ---
+
     #[test]
-    fn test_determinism_pass_same_slots_different_timer() {
-        // Two traces with the same event slots but different start marker timers.
-        // This should PASS because determinism compares slot sequences, not raw bytes.
+    fn test_trim_finds_sentinel() {
+        // 16 bytes of data, then 0xFEFEFEFE + two 0x00000000.
+        let mut buf = vec![0xABu8; 16];
+        buf.extend_from_slice(&0xFEFEFEFEu32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 100]); // trailing zeros
+
+        // trim includes the sentinel word itself: 16 + 4 = 20 bytes.
+        assert_eq!(trim_trace_buffer(&buf), 20);
+    }
+
+    #[test]
+    fn test_trim_no_sentinel_returns_full() {
+        let buf = vec![0x42u8; 64];
+        assert_eq!(trim_trace_buffer(&buf), 64);
+    }
+
+    #[test]
+    fn test_trim_empty() {
+        assert_eq!(trim_trace_buffer(&[]), 0);
+    }
+
+    #[test]
+    fn test_trim_fefe_without_zeros_not_trimmed() {
+        // 0xFEFEFEFE followed by non-zero data: not a trim point.
+        let mut buf = vec![0xABu8; 16];
+        buf.extend_from_slice(&0xFEFEFEFEu32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // non-zero
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(trim_trace_buffer(&buf), buf.len());
+    }
+
+    // --- Skeleton + determinism tests ---
+
+    #[test]
+    fn test_skeleton_collapses_repeats() {
+        // Same slot firing at consecutive cycles should collapse to one entry.
+        let events = vec![
+            DecodedEvent { slot: 1, abs_cycle: 100 },
+            DecodedEvent { slot: 1, abs_cycle: 101 },
+            DecodedEvent { slot: 1, abs_cycle: 102 },
+            DecodedEvent { slot: 2, abs_cycle: 103 },
+        ];
+        let skel = extract_skeleton(&events);
+        assert_eq!(skel.len(), 2);
+        assert_eq!(skel[0], SkeletonEntry::Single(1));
+        assert_eq!(skel[1], SkeletonEntry::Single(2));
+    }
+
+    #[test]
+    fn test_skeleton_groups_simultaneous() {
+        // Multiple slots at the same cycle -> Multiple entry.
+        let events = vec![
+            DecodedEvent { slot: 5, abs_cycle: 100 },
+            DecodedEvent { slot: 7, abs_cycle: 100 },
+            DecodedEvent { slot: 7, abs_cycle: 101 },
+        ];
+        let skel = extract_skeleton(&events);
+        assert_eq!(skel.len(), 2);
+        assert_eq!(skel[0], SkeletonEntry::Multiple(vec![5, 7]));
+        assert_eq!(skel[1], SkeletonEntry::Single(7));
+    }
+
+    #[test]
+    fn test_determinism_pass_same_transitions_different_start_time() {
+        // Same event transitions and deltas, different absolute start timer.
+        // This is the real-world case: host scheduling jitter shifts the
+        // start time but the kernel executes identically.
         let trace_a = make_trace_packet(&[
-            0xF0, 0, 0, 0, 0, 0, 0, 100, // start marker: timer=100
+            0xF0, 0, 0, 0, 0, 0, 0, 100, // timer=100
             0x13, // slot=1, delta=3
             0x25, // slot=2, delta=5
         ]);
         let trace_b = make_trace_packet(&[
-            0xF0, 0, 0, 0, 0, 0, 0, 200, // start marker: timer=200 (different!)
+            0xF0, 0, 0, 0, 0, 0, 0, 200, // timer=200 (different start!)
             0x13, // slot=1, delta=3 (same)
             0x25, // slot=2, delta=5 (same)
         ]);
-        assert!(check_determinism(&[trace_a, trace_b]).is_ok());
+        let report = check_determinism(&[trace_a, trace_b]);
+        assert!(report.is_deterministic("transitions"));
+        assert!(report.is_deterministic("deltas"));
+        assert!(report.compute_deterministic);
+        assert!(!report.is_deterministic("start_time"), "start time should vary");
     }
 
     #[test]
-    fn test_determinism_fail_different_slots() {
+    fn test_determinism_fail_different_deltas() {
+        // Same transitions but different inter-event deltas: this is a real
+        // timing difference in instruction execution, not just DMA jitter.
         let trace_a = make_trace_packet(&[
-            0xF0, 0, 0, 0, 0, 0, 0, 0, // start marker
+            0xF0, 0, 0, 0, 0, 0, 0, 0,
             0x13, // slot=1, delta=3
+            0x25, // slot=2, delta=5
         ]);
         let trace_b = make_trace_packet(&[
-            0xF0, 0, 0, 0, 0, 0, 0, 0, // start marker
-            0x23, // slot=2, delta=3 (different slot!)
+            0xF0, 0, 0, 0, 0, 0, 0, 0,
+            0x1A, // slot=1, delta=10 (different!)
+            0x2F, // slot=2, delta=15 (different!)
         ]);
-        let err = check_determinism(&[trace_a, trace_b]).unwrap_err();
-        assert!(err.contains("slot mismatch"));
+        let report = check_determinism(&[trace_a, trace_b]);
+        assert!(report.is_deterministic("transitions"), "transitions should still match");
+        assert!(!report.is_deterministic("deltas"), "deltas should NOT match");
+        assert!(!report.compute_deterministic, "compute determinism requires matching deltas");
     }
 
     #[test]
-    fn test_determinism_fail_different_event_count() {
+    fn test_determinism_pass_prefix_match() {
+        // One trace has fewer events but is a prefix of the other.
+        let trace_long = make_trace_packet(&[
+            0xF0, 0, 0, 0, 0, 0, 0, 0,
+            0x13, // slot=1
+            0x25, // slot=2
+            0x37, // slot=3
+        ]);
+        let trace_short = make_trace_packet(&[
+            0xF0, 0, 0, 0, 0, 0, 0, 0,
+            0x13, // slot=1
+            0x25, // slot=2
+        ]);
+        let report = check_determinism(&[trace_long, trace_short]);
+        assert!(report.compute_deterministic);
+    }
+
+    #[test]
+    fn test_determinism_fail_different_deltas_real() {
+        // Two traces with the same number of events but different timing.
+        // This represents a genuine instruction-level divergence.
         let trace_a = make_trace_packet(&[
             0xF0, 0, 0, 0, 0, 0, 0, 0,
-            0x13, 0x25, // 2 events
+            0x13, // slot=1, delta=3
+            0x25, // slot=2, delta=5 -> delta between events = 5
         ]);
         let trace_b = make_trace_packet(&[
             0xF0, 0, 0, 0, 0, 0, 0, 0,
-            0x13, // 1 event
+            0x13, // slot=1, delta=3
+            0x29, // slot=2, delta=9 -> delta between events = 9 (different!)
         ]);
-        let err = check_determinism(&[trace_a, trace_b]).unwrap_err();
-        assert!(err.contains("events"));
+        let report = check_determinism(&[trace_a, trace_b]);
+        assert!(!report.is_deterministic("deltas"));
+        assert!(!report.compute_deterministic);
+        let display = format!("{}", report);
+        assert!(display.contains("FAIL"));
+    }
+
+    #[test]
+    fn test_determinism_different_slots_no_deltas_is_inconclusive() {
+        // Single-event traces with different slots: transitions diverge
+        // but there are no deltas to compare, so compute_deterministic
+        // is vacuously true (insufficient data to determine).
+        let trace_a = make_trace_packet(&[
+            0xF0, 0, 0, 0, 0, 0, 0, 0,
+            0x13, // slot=1
+        ]);
+        let trace_b = make_trace_packet(&[
+            0xF0, 0, 0, 0, 0, 0, 0, 0,
+            0x23, // slot=2 (different!)
+        ]);
+        let report = check_determinism(&[trace_a, trace_b]);
+        assert!(!report.is_deterministic("transitions"), "transitions should diverge");
+        // With only one event each, there are no inter-event deltas.
+        assert!(report.compute_deterministic, "no deltas to compare = vacuously true");
     }
 
     #[test]
     fn test_determinism_single_trace() {
         let trace = make_trace_packet(&[0xF0, 0, 0, 0, 0, 0, 0, 42, 0x13]);
-        assert!(check_determinism(&[trace]).is_ok());
+        let report = check_determinism(&[trace]);
+        assert!(report.compute_deterministic);
+        assert_eq!(report.num_reps, 1);
+        assert!(report.dimensions.is_empty(), "single rep produces no dimensions");
+    }
+
+    #[test]
+    fn test_determinism_compensates_dma_latency() {
+        // Simulates DMA latency variation: same skeleton but different repeat
+        // counts for the initial stall phase. Both traces show:
+        //   Multiple[5,7] (stall+active) -> Single[7] (active only)
+        // but with different numbers of repeated stall cycles.
+
+        // Trace A: stall phase with delta=0, repeated via repeat0.
+        let trace_a = make_trace_packet(&[
+            0xF0, 0, 0, 0, 0, 0, 0, 0, // START timer=0
+            0xCA, 0x00,                   // Multiple0: slots 5+7, delta=0
+            0xE5,                         // Repeat0 x5
+            0x70,                         // Single0: slot=7, delta=0
+            0xE3,                         // Repeat0 x3
+        ]);
+        // Trace B: same pattern but longer stall (more repeats).
+        let trace_b = make_trace_packet(&[
+            0xF0, 0, 0, 0, 0, 0, 0, 0, // START timer=0
+            0xCA, 0x00,                   // Multiple0: slots 5+7, delta=0
+            0xEF,                         // Repeat0 x15  (much longer stall!)
+            0x70,                         // Single0: slot=7, delta=0
+            0xE3,                         // Repeat0 x3
+        ]);
+        let report = check_determinism(&[trace_a, trace_b]);
+        assert!(report.is_deterministic("transitions"), "transitions should match");
+        assert!(report.compute_deterministic, "compute should be deterministic");
+        // Slot 5 (LOCK_STALL proxy) should have different fire counts.
+        assert!(!report.is_deterministic("slot5_fires"),
+            "slot 5 fire counts should differ due to repeat count variance");
+    }
+
+    #[test]
+    fn test_determinism_report_per_slot_verdicts() {
+        // Two traces where slot 1 fires identically but slot 2 fires different
+        // amounts (via repeat count variation).
+        let trace_a = make_trace_packet(&[
+            0xF0, 0, 0, 0, 0, 0, 0, 0,
+            0x11, // slot=1, delta=1
+            0x21, // slot=2, delta=1
+            0xE3, // Repeat0 x3 (replays slot=2 three more times)
+        ]);
+        let trace_b = make_trace_packet(&[
+            0xF0, 0, 0, 0, 0, 0, 0, 0,
+            0x11, // slot=1, delta=1
+            0x21, // slot=2, delta=1
+            0xE7, // Repeat0 x7 (replays slot=2 seven more times)
+        ]);
+        let report = check_determinism(&[trace_a, trace_b]);
+
+        // Transitions should match: [slot1] -> [slot2] in both.
+        assert!(report.is_deterministic("transitions"));
+        assert!(report.compute_deterministic);
+
+        // Slot 1 fires exactly once in both.
+        assert!(report.is_deterministic("slot1_fires"), "slot 1 should be count-deterministic");
+
+        // Slot 2 fires different counts due to repeat variation.
+        assert!(!report.is_deterministic("slot2_fires"), "slot 2 should NOT be count-deterministic");
+    }
+
+    #[test]
+    fn test_dimension_framework_auto_generates_per_slot() {
+        // Verify that the dimension framework produces per-slot dimensions
+        // for active slots and skips inactive ones.
+        let trace_a = make_trace_packet(&[
+            0xF0, 0, 0, 0, 0, 0, 0, 0,
+            0x13, // slot=1, delta=3
+            0x25, // slot=2, delta=5
+            0x13, // slot=1, delta=3
+        ]);
+        let trace_b = make_trace_packet(&[
+            0xF0, 0, 0, 0, 0, 0, 0, 0,
+            0x13, // slot=1, delta=3
+            0x25, // slot=2, delta=5
+            0x13, // slot=1, delta=3
+        ]);
+        let report = check_determinism(&[trace_a, trace_b]);
+
+        // Slot 1 and 2 should have dimensions.
+        assert!(report.dimension("slot1_fires").is_some(), "slot1 fires should exist");
+        assert!(report.dimension("slot2_fires").is_some(), "slot2 fires should exist");
+        assert!(report.dimension("slot1_edges").is_some(), "slot1 edges should exist");
+        assert!(report.dimension("slot1_max_run").is_some(), "slot1 max_run should exist");
+        assert!(report.dimension("slot1_deltas").is_some(), "slot1 deltas should exist");
+
+        // Slot 0 never fires, should have no dimensions.
+        assert!(report.dimension("slot0_fires").is_none(), "slot0 should be absent");
+
+        // Global dimensions should exist.
+        assert!(report.dimension("deltas").is_some());
+        assert!(report.dimension("transitions").is_some());
+        assert!(report.dimension("skeleton").is_some());
+        assert!(report.dimension("total_events").is_some());
+        assert!(report.dimension("duration").is_some());
+    }
+
+    #[test]
+    fn test_dimension_display_shows_varying() {
+        // Verify the Display impl lists varying dimensions.
+        let trace_a = make_trace_packet(&[
+            0xF0, 0, 0, 0, 0, 0, 0, 100,
+            0x13, // slot=1, delta=3
+        ]);
+        let trace_b = make_trace_packet(&[
+            0xF0, 0, 0, 0, 0, 0, 0, 200,
+            0x13, // slot=1, delta=3
+        ]);
+        let report = check_determinism(&[trace_a, trace_b]);
+        let display = format!("{}", report);
+        assert!(display.contains("PASS"));
+        assert!(display.contains("start_time="), "should show varying start_time");
     }
 
     #[test]
@@ -1289,6 +2295,7 @@ mod tests {
             emu_event_count: 42,
             sequence_match: true,
             first_divergence: None,
+            filtered_count: 0,
         };
         let s = format!("{}", comp);
         assert!(s.contains("MATCH"));
@@ -1303,6 +2310,7 @@ mod tests {
             emu_event_count: 8,
             sequence_match: false,
             first_divergence: Some((5, 3, 4)),
+            filtered_count: 0,
         };
         let s = format!("{}", comp);
         assert!(s.contains("DIVERGE at index 5"));
@@ -1421,5 +2429,147 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].event_id, 124);
         assert_eq!(merged[1].event_id, 125);
+    }
+
+    // --- Slot classification and canonicalization tests ---
+
+    #[test]
+    fn test_classify_slots_deterministic() {
+        // All reps have the same fire counts -> Deterministic.
+        let reps = vec![
+            vec![
+                DecodedEvent { slot: 0, abs_cycle: 10 },
+                DecodedEvent { slot: 0, abs_cycle: 20 },
+                DecodedEvent { slot: 1, abs_cycle: 15 },
+            ],
+            vec![
+                DecodedEvent { slot: 0, abs_cycle: 10 },
+                DecodedEvent { slot: 0, abs_cycle: 20 },
+                DecodedEvent { slot: 1, abs_cycle: 15 },
+            ],
+        ];
+        let classes = classify_slots_from_reps(&reps);
+        assert_eq!(classes[0], SlotClass::Deterministic);
+        assert_eq!(classes[1], SlotClass::Deterministic);
+        assert_eq!(classes[2], SlotClass::Inactive);
+    }
+
+    #[test]
+    fn test_classify_slots_timing_dependent() {
+        // Slot 5 fires different amounts across reps -> TimingDependent.
+        let reps = vec![
+            vec![
+                DecodedEvent { slot: 5, abs_cycle: 10 },
+                DecodedEvent { slot: 5, abs_cycle: 20 },
+            ],
+            vec![
+                DecodedEvent { slot: 5, abs_cycle: 10 },
+                DecodedEvent { slot: 5, abs_cycle: 20 },
+                DecodedEvent { slot: 5, abs_cycle: 30 },
+                DecodedEvent { slot: 5, abs_cycle: 40 },
+                DecodedEvent { slot: 5, abs_cycle: 50 },
+            ],
+        ];
+        let classes = classify_slots_from_reps(&reps);
+        assert_eq!(classes[5], SlotClass::TimingDependent);
+    }
+
+    #[test]
+    fn test_classify_slots_boundary() {
+        // Slot 2 fires 0 or 1 times across reps -> Boundary.
+        let reps = vec![
+            vec![
+                DecodedEvent { slot: 2, abs_cycle: 10 },
+            ],
+            vec![],  // slot 2 doesn't fire
+            vec![
+                DecodedEvent { slot: 2, abs_cycle: 30 },
+            ],
+        ];
+        let classes = classify_slots_from_reps(&reps);
+        assert_eq!(classes[2], SlotClass::Boundary);
+    }
+
+    #[test]
+    fn test_classify_slots_inactive() {
+        // Slot 6 never fires in any rep -> Inactive.
+        let reps = vec![
+            vec![DecodedEvent { slot: 0, abs_cycle: 10 }],
+            vec![DecodedEvent { slot: 0, abs_cycle: 20 }],
+        ];
+        let classes = classify_slots_from_reps(&reps);
+        assert_eq!(classes[6], SlotClass::Inactive);
+    }
+
+    #[test]
+    fn test_canonicalize_filters_timing_dependent() {
+        // 9 events total: 6 from timing-dependent slot 5, 3 from deterministic slot 1.
+        let events = vec![
+            DecodedEvent { slot: 5, abs_cycle: 100 },
+            DecodedEvent { slot: 1, abs_cycle: 105 },
+            DecodedEvent { slot: 5, abs_cycle: 110 },
+            DecodedEvent { slot: 1, abs_cycle: 115 },
+            DecodedEvent { slot: 5, abs_cycle: 120 },
+            DecodedEvent { slot: 5, abs_cycle: 125 },
+            DecodedEvent { slot: 5, abs_cycle: 130 },
+            DecodedEvent { slot: 5, abs_cycle: 135 },
+            DecodedEvent { slot: 1, abs_cycle: 140 },
+        ];
+        let mut classes = [SlotClass::Inactive; 8];
+        classes[1] = SlotClass::Deterministic;
+        classes[5] = SlotClass::TimingDependent;
+
+        let canon = canonicalize(&events, &classes);
+        assert_eq!(canon.events.len(), 3, "Should keep only slot 1 events");
+        assert_eq!(canon.filtered_counts[5], 6, "6 slot-5 events filtered");
+        assert_eq!(canon.filtered_counts[1], 0, "No slot-1 events filtered");
+        // All kept events should be slot 1.
+        for e in &canon.events {
+            assert_eq!(e.slot, 1);
+        }
+    }
+
+    #[test]
+    fn test_canonicalize_aligns_to_zero() {
+        let events = vec![
+            DecodedEvent { slot: 0, abs_cycle: 5000 },
+            DecodedEvent { slot: 0, abs_cycle: 5100 },
+            DecodedEvent { slot: 0, abs_cycle: 5200 },
+        ];
+        let mut classes = [SlotClass::Inactive; 8];
+        classes[0] = SlotClass::Deterministic;
+
+        let canon = canonicalize(&events, &classes);
+        assert_eq!(canon.events[0].abs_cycle, 0, "First event should be at cycle 0");
+        assert_eq!(canon.events[1].abs_cycle, 100);
+        assert_eq!(canon.events[2].abs_cycle, 200);
+    }
+
+    #[test]
+    fn test_compare_canonical_ignores_stalls() {
+        // NPU and emulator produce the same deterministic events (slot 1)
+        // but NPU also has non-deterministic stall events (slot 5).
+        // Canonical comparison should MATCH.
+        let npu_events = vec![
+            DecodedEvent { slot: 5, abs_cycle: 100 }, // stall (filtered)
+            DecodedEvent { slot: 1, abs_cycle: 105 },
+            DecodedEvent { slot: 5, abs_cycle: 110 }, // stall (filtered)
+            DecodedEvent { slot: 1, abs_cycle: 115 },
+            DecodedEvent { slot: 5, abs_cycle: 120 }, // stall (filtered)
+        ];
+        let emu_events = vec![
+            DecodedEvent { slot: 1, abs_cycle: 10 },
+            DecodedEvent { slot: 1, abs_cycle: 20 },
+        ];
+        let mut classes = [SlotClass::Inactive; 8];
+        classes[1] = SlotClass::Deterministic;
+        classes[5] = SlotClass::TimingDependent;
+
+        let (comp, filtered) = compare_canonical(&npu_events, &emu_events, &classes, "test");
+        assert!(comp.sequence_match, "Should match on deterministic slots only");
+        assert_eq!(comp.npu_event_count, 2, "NPU canonical: 2 slot-1 events");
+        assert_eq!(comp.emu_event_count, 2, "EMU canonical: 2 slot-1 events");
+        assert_eq!(filtered, 3, "3 NPU stall events filtered");
+        assert!(comp.filtered_count > 0, "filtered_count should be set");
     }
 }
