@@ -983,8 +983,8 @@ fn compile_fuzz_case(
 /// for each group, and writes `insts_group_N.bin` files. Returns the paths.
 fn generate_group_insts(
     case_dir: &Path,
-    seed: u64,
-    verbose: bool,
+    _seed: u64,
+    _verbose: bool,
 ) -> Result<Vec<PathBuf>, String> {
     use crate::fuzzer::trace_sweep::{TRACE_EVENT_GROUPS, NUM_GROUPS, patch_insts_for_group};
 
@@ -999,17 +999,6 @@ fn generate_group_insts(
         let group_path = case_dir.join(format!("insts_group_{}.bin", idx));
         std::fs::write(&group_path, &patched)
             .map_err(|e| format!("Failed to write {}: {}", group_path.display(), e))?;
-
-        // Sanity check: group 0 should be identical to the original.
-        if idx == 0 && patched != insts_bytes {
-            if verbose {
-                eprintln!(
-                    "seed {} warning: group 0 patched insts differs from original \
-                     (fuzz_template.py event config may have changed)",
-                    seed,
-                );
-            }
-        }
 
         paths.push(group_path);
     }

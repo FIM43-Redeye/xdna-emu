@@ -2,14 +2,16 @@
 //!
 //! The NPU hardware trace unit has 8 event slots configured by two registers
 //! (Trace_Event0 and Trace_Event1). Each slot monitors one hardware event.
-//! Since many interesting events exist (instruction types, stalls, locks,
-//! ports), a single 8-slot configuration can only observe a subset.
+//! With 128 possible core events and only 8 slots per run, a full picture
+//! requires sweeping through multiple event group configurations.
 //!
 //! This module provides:
-//! - Event group definitions (3 groups of 8 events = 24 events total)
+//! - Complete AIE2 core event catalogue (128 events with categories)
+//! - 13 sweep groups covering all 100 sweepable events (sequential order)
 //! - Binary patching of `insts.bin` to swap trace event configurations
 //!   without recompilation
 //! - Decoding of binary trace packets into event sequences
+//! - Multi-group trace merging into unified all-event traces
 //! - Comparison of NPU vs emulator event sequences per group
 
 use std::path::Path;
@@ -52,38 +54,332 @@ impl TraceEventGroup {
     }
 }
 
-/// The default trace event group matching fuzz_template.py.
+// -------------------------------------------------------------------------
+// AIE2 core trace event catalogue
+// -------------------------------------------------------------------------
+// Source: aie-rt xaie_events_aieml.h (lines 35-161),
+// cross-referenced with mlir-aie aie2.py (CoreEvent enum).
+
+/// Categories for core trace events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventCategory {
+    /// Null event (ID 0) -- never fires.
+    None,
+    /// Always-true trigger (ID 1) -- fires every cycle, floods trace.
+    Trigger,
+    /// Group meta-event -- fires when any sub-event in its group fires.
+    /// Useful for single-slot summaries; redundant when sub-events are
+    /// captured individually in a full sweep.
+    Group,
+    /// Timer synchronization and threshold events.
+    Timer,
+    /// Performance counter overflow (requires counter pre-configuration).
+    PerfCounter,
+    /// Combinational logic events (requires combo register config).
+    Combo,
+    /// Edge detection events (requires edge detector config).
+    EdgeDetect,
+    /// Program counter watchpoint events (requires PC watchpoint config).
+    PcWatchpoint,
+    /// Pipeline stall events.
+    Stall,
+    /// Core debug state.
+    Debug,
+    /// Core activity status.
+    Status,
+    /// ECC error/scrubbing events.
+    Ecc,
+    /// Instruction type events (fires on decode of matching instruction).
+    Instruction,
+    /// Arithmetic and floating-point error events.
+    ComputeError,
+    /// Memory, bus, and access error events.
+    AccessError,
+    /// Stream switch port status events (idle/running/stalled/tlast x 8 ports).
+    StreamPort,
+    /// Inter-tile broadcast events (16 channels).
+    Broadcast,
+    /// Application-defined user events (4 channels).
+    UserEvent,
+    /// Reserved/undefined hardware event.
+    Reserved,
+}
+
+/// A core trace event from the AIE2 hardware event catalogue.
+#[derive(Debug, Clone, Copy)]
+pub struct CoreTraceEvent {
+    /// Human-readable event name (matches aie-rt / mlir-aie naming).
+    pub name: &'static str,
+    /// Event category.
+    pub category: EventCategory,
+    /// Whether this event is included in automatic sweep groups.
+    ///
+    /// Events excluded from sweep:
+    /// - NONE (0): never fires
+    /// - TRUE (1): fires every cycle, floods trace buffer
+    /// - GROUP_* meta-events: redundant when sub-events are captured individually
+    /// - Config-dependent (perf counters, combos, edge detectors, PC watchpoints):
+    ///   require hardware pre-configuration to fire
+    /// - RESERVED (54): undefined
+    pub sweepable: bool,
+}
+
+/// Sweepable event helper (included in automatic sweep).
+const fn sw(name: &'static str, c: EventCategory) -> CoreTraceEvent {
+    CoreTraceEvent { name, category: c, sweepable: true }
+}
+/// Non-sweepable event helper (excluded from automatic sweep).
+const fn ns(name: &'static str, c: EventCategory) -> CoreTraceEvent {
+    CoreTraceEvent { name, category: c, sweepable: false }
+}
+
+/// Complete AIE2 core module trace event catalogue (128 events, indexed by ID).
 ///
-/// These exact event IDs produce register values 640680481 (0x26300221) and
-/// 1330084396 (0x4F477A2C), matching the hardcoded values in fuzz_template.py.
-/// The event IDs were derived from the mlir-aie vec_mul_event_trace reference.
-const GROUP_0: TraceEventGroup = TraceEventGroup {
-    name: "default",
-    // Trace_Event0 = 0x26300221, Trace_Event1 = 0x4F477A2C
+/// Source: `aie-rt/driver/src/events/xaie_events_aieml.h` lines 35-161,
+/// cross-referenced with `mlir-aie/.../trace/events/aie2.py`.
+#[rustfmt::skip]
+pub const CORE_EVENTS: [CoreTraceEvent; 128] = {
+    use EventCategory as E;
+    [
+        ns("NONE",                     E::None),          //   0
+        ns("TRUE",                     E::Trigger),       //   1
+        ns("GROUP_0",                  E::Group),         //   2
+        sw("TIMER_SYNC",              E::Timer),         //   3
+        sw("TIMER_VALUE_REACHED",     E::Timer),         //   4
+        ns("PERF_CNT_0",              E::PerfCounter),   //   5
+        ns("PERF_CNT_1",              E::PerfCounter),   //   6
+        ns("PERF_CNT_2",              E::PerfCounter),   //   7
+        ns("PERF_CNT_3",              E::PerfCounter),   //   8
+        ns("COMBO_EVENT_0",           E::Combo),         //   9
+        ns("COMBO_EVENT_1",           E::Combo),         //  10
+        ns("COMBO_EVENT_2",           E::Combo),         //  11
+        ns("COMBO_EVENT_3",           E::Combo),         //  12
+        ns("EDGE_DETECTION_0",        E::EdgeDetect),    //  13
+        ns("EDGE_DETECTION_1",        E::EdgeDetect),    //  14
+        ns("GROUP_PC_EVENT",          E::Group),         //  15
+        ns("PC_0",                     E::PcWatchpoint),  //  16
+        ns("PC_1",                     E::PcWatchpoint),  //  17
+        ns("PC_2",                     E::PcWatchpoint),  //  18
+        ns("PC_3",                     E::PcWatchpoint),  //  19
+        ns("PC_RANGE_0_1",            E::PcWatchpoint),  //  20
+        ns("PC_RANGE_2_3",            E::PcWatchpoint),  //  21
+        ns("GROUP_STALL",             E::Group),         //  22
+        sw("MEMORY_STALL",            E::Stall),         //  23
+        sw("STREAM_STALL",            E::Stall),         //  24
+        sw("CASCADE_STALL",           E::Stall),         //  25
+        sw("LOCK_STALL",              E::Stall),         //  26
+        sw("DEBUG_HALTED",            E::Debug),         //  27
+        sw("ACTIVE",                   E::Status),        //  28
+        sw("DISABLED",                 E::Status),        //  29
+        sw("ECC_ERROR_STALL",         E::Ecc),           //  30
+        sw("ECC_SCRUBBING_STALL",     E::Ecc),           //  31
+        ns("GROUP_PROGRAM_FLOW",      E::Group),         //  32
+        sw("INSTR_EVENT_0",           E::Instruction),   //  33
+        sw("INSTR_EVENT_1",           E::Instruction),   //  34
+        sw("INSTR_CALL",              E::Instruction),   //  35
+        sw("INSTR_RETURN",            E::Instruction),   //  36
+        sw("INSTR_VECTOR",            E::Instruction),   //  37
+        sw("INSTR_LOAD",              E::Instruction),   //  38
+        sw("INSTR_STORE",             E::Instruction),   //  39
+        sw("INSTR_STREAM_GET",        E::Instruction),   //  40
+        sw("INSTR_STREAM_PUT",        E::Instruction),   //  41
+        sw("INSTR_CASCADE_GET",       E::Instruction),   //  42
+        sw("INSTR_CASCADE_PUT",       E::Instruction),   //  43
+        sw("INSTR_LOCK_ACQUIRE_REQ",  E::Instruction),   //  44
+        sw("INSTR_LOCK_RELEASE_REQ",  E::Instruction),   //  45
+        ns("GROUP_ERRORS_0",          E::Group),         //  46
+        ns("GROUP_ERRORS_1",          E::Group),         //  47
+        sw("SRS_OVERFLOW",            E::ComputeError),  //  48
+        sw("UPS_OVERFLOW",            E::ComputeError),  //  49
+        sw("FP_HUGE",                  E::ComputeError),  //  50
+        sw("INT_FP_0",                E::ComputeError),  //  51
+        sw("FP_INVALID",              E::ComputeError),  //  52
+        sw("FP_INF",                   E::ComputeError),  //  53
+        ns("RESERVED_54",             E::Reserved),      //  54
+        sw("PM_REG_ACCESS_FAILURE",   E::AccessError),   //  55
+        sw("STREAM_PKT_PARITY_ERR",   E::AccessError),   //  56
+        sw("CONTROL_PKT_ERROR",       E::AccessError),   //  57
+        sw("AXI_MM_SLAVE_ERROR",      E::AccessError),   //  58
+        sw("INSTR_DECOMPRSN_ERROR",   E::AccessError),   //  59
+        sw("DM_ADDR_OUT_OF_RANGE",    E::AccessError),   //  60
+        sw("PM_ECC_SCRUB_CORRECTED",  E::AccessError),   //  61
+        sw("PM_ECC_SCRUB_2BIT",       E::AccessError),   //  62
+        sw("PM_ECC_ERROR_1BIT",       E::AccessError),   //  63
+        sw("PM_ECC_ERROR_2BIT",       E::AccessError),   //  64
+        sw("PM_ADDR_OUT_OF_RANGE",    E::AccessError),   //  65
+        sw("DM_ACCESS_UNAVAILABLE",   E::AccessError),   //  66
+        sw("LOCK_ACCESS_UNAVAILABLE", E::AccessError),   //  67
+        sw("INSTR_WARNING",           E::AccessError),   //  68
+        sw("INSTR_ERROR",             E::AccessError),   //  69
+        sw("DECOMPRESSION_UNDERFLOW", E::AccessError),   //  70
+        sw("SS_PORT_PARITY_ERROR",    E::AccessError),   //  71
+        sw("PROCESSOR_BUS_ERROR",     E::AccessError),   //  72
+        ns("GROUP_STREAM_SWITCH",     E::Group),         //  73
+        sw("PORT_IDLE_0",             E::StreamPort),    //  74
+        sw("PORT_RUNNING_0",          E::StreamPort),    //  75
+        sw("PORT_STALLED_0",          E::StreamPort),    //  76
+        sw("PORT_TLAST_0",            E::StreamPort),    //  77
+        sw("PORT_IDLE_1",             E::StreamPort),    //  78
+        sw("PORT_RUNNING_1",          E::StreamPort),    //  79
+        sw("PORT_STALLED_1",          E::StreamPort),    //  80
+        sw("PORT_TLAST_1",            E::StreamPort),    //  81
+        sw("PORT_IDLE_2",             E::StreamPort),    //  82
+        sw("PORT_RUNNING_2",          E::StreamPort),    //  83
+        sw("PORT_STALLED_2",          E::StreamPort),    //  84
+        sw("PORT_TLAST_2",            E::StreamPort),    //  85
+        sw("PORT_IDLE_3",             E::StreamPort),    //  86
+        sw("PORT_RUNNING_3",          E::StreamPort),    //  87
+        sw("PORT_STALLED_3",          E::StreamPort),    //  88
+        sw("PORT_TLAST_3",            E::StreamPort),    //  89
+        sw("PORT_IDLE_4",             E::StreamPort),    //  90
+        sw("PORT_RUNNING_4",          E::StreamPort),    //  91
+        sw("PORT_STALLED_4",          E::StreamPort),    //  92
+        sw("PORT_TLAST_4",            E::StreamPort),    //  93
+        sw("PORT_IDLE_5",             E::StreamPort),    //  94
+        sw("PORT_RUNNING_5",          E::StreamPort),    //  95
+        sw("PORT_STALLED_5",          E::StreamPort),    //  96
+        sw("PORT_TLAST_5",            E::StreamPort),    //  97
+        sw("PORT_IDLE_6",             E::StreamPort),    //  98
+        sw("PORT_RUNNING_6",          E::StreamPort),    //  99
+        sw("PORT_STALLED_6",          E::StreamPort),    // 100
+        sw("PORT_TLAST_6",            E::StreamPort),    // 101
+        sw("PORT_IDLE_7",             E::StreamPort),    // 102
+        sw("PORT_RUNNING_7",          E::StreamPort),    // 103
+        sw("PORT_STALLED_7",          E::StreamPort),    // 104
+        sw("PORT_TLAST_7",            E::StreamPort),    // 105
+        ns("GROUP_BROADCAST",         E::Group),         // 106
+        sw("BROADCAST_0",             E::Broadcast),     // 107
+        sw("BROADCAST_1",             E::Broadcast),     // 108
+        sw("BROADCAST_2",             E::Broadcast),     // 109
+        sw("BROADCAST_3",             E::Broadcast),     // 110
+        sw("BROADCAST_4",             E::Broadcast),     // 111
+        sw("BROADCAST_5",             E::Broadcast),     // 112
+        sw("BROADCAST_6",             E::Broadcast),     // 113
+        sw("BROADCAST_7",             E::Broadcast),     // 114
+        sw("BROADCAST_8",             E::Broadcast),     // 115
+        sw("BROADCAST_9",             E::Broadcast),     // 116
+        sw("BROADCAST_10",            E::Broadcast),     // 117
+        sw("BROADCAST_11",            E::Broadcast),     // 118
+        sw("BROADCAST_12",            E::Broadcast),     // 119
+        sw("BROADCAST_13",            E::Broadcast),     // 120
+        sw("BROADCAST_14",            E::Broadcast),     // 121
+        sw("BROADCAST_15",            E::Broadcast),     // 122
+        ns("GROUP_USER_EVENT",        E::Group),         // 123
+        sw("USER_EVENT_0",            E::UserEvent),     // 124
+        sw("USER_EVENT_1",            E::UserEvent),     // 125
+        sw("USER_EVENT_2",            E::UserEvent),     // 126
+        sw("USER_EVENT_3",            E::UserEvent),     // 127
+    ]
+};
+
+/// Look up an event's human-readable name by hardware ID (0-127).
+pub fn event_name(id: u8) -> &'static str {
+    CORE_EVENTS.get(id as usize).map(|e| e.name).unwrap_or("UNKNOWN")
+}
+
+/// Return event IDs included in the automatic sweep (sequential order).
+///
+/// 100 events across 13 groups of 8. Excludes: NONE, TRUE, GROUP_* meta-events,
+/// config-dependent events (perf counters, combos, edge detectors, PC watchpoints),
+/// and RESERVED.
+pub fn sweepable_event_ids() -> Vec<u8> {
+    CORE_EVENTS
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.sweepable)
+        .map(|(id, _)| id as u8)
+        .collect()
+}
+
+// -------------------------------------------------------------------------
+// Sweep groups (13 groups, sequential order through sweepable events)
+// -------------------------------------------------------------------------
+
+/// Group 0: timer + pipeline stalls + debug/status.
+const SWEEP_00: TraceEventGroup = TraceEventGroup {
+    name: "timer_stall_debug",
+    event_ids: [3, 4, 23, 24, 25, 26, 27, 28],
+};
+/// Group 1: status/ECC + instruction events (begin).
+const SWEEP_01: TraceEventGroup = TraceEventGroup {
+    name: "status_instr_a",
+    event_ids: [29, 30, 31, 33, 34, 35, 36, 37],
+};
+/// Group 2: instruction events (load/store/stream/cascade/lock).
+const SWEEP_02: TraceEventGroup = TraceEventGroup {
+    name: "instr_mem_sync",
+    event_ids: [38, 39, 40, 41, 42, 43, 44, 45],
+};
+/// Group 3: compute errors + first access errors.
+const SWEEP_03: TraceEventGroup = TraceEventGroup {
+    name: "error_compute",
+    event_ids: [48, 49, 50, 51, 52, 53, 55, 56],
+};
+/// Group 4: access/system errors (a).
+const SWEEP_04: TraceEventGroup = TraceEventGroup {
+    name: "error_access_a",
+    event_ids: [57, 58, 59, 60, 61, 62, 63, 64],
+};
+/// Group 5: access/system errors (b).
+const SWEEP_05: TraceEventGroup = TraceEventGroup {
+    name: "error_access_b",
+    event_ids: [65, 66, 67, 68, 69, 70, 71, 72],
+};
+/// Group 6: stream port events (ports 0-1).
+const SWEEP_06: TraceEventGroup = TraceEventGroup {
+    name: "port_01",
+    event_ids: [74, 75, 76, 77, 78, 79, 80, 81],
+};
+/// Group 7: stream port events (ports 2-3).
+const SWEEP_07: TraceEventGroup = TraceEventGroup {
+    name: "port_23",
+    event_ids: [82, 83, 84, 85, 86, 87, 88, 89],
+};
+/// Group 8: stream port events (ports 4-5).
+const SWEEP_08: TraceEventGroup = TraceEventGroup {
+    name: "port_45",
+    event_ids: [90, 91, 92, 93, 94, 95, 96, 97],
+};
+/// Group 9: stream port events (ports 6-7).
+const SWEEP_09: TraceEventGroup = TraceEventGroup {
+    name: "port_67",
+    event_ids: [98, 99, 100, 101, 102, 103, 104, 105],
+};
+/// Group 10: broadcast channels 0-7.
+const SWEEP_10: TraceEventGroup = TraceEventGroup {
+    name: "broadcast_0to7",
+    event_ids: [107, 108, 109, 110, 111, 112, 113, 114],
+};
+/// Group 11: broadcast channels 8-15.
+const SWEEP_11: TraceEventGroup = TraceEventGroup {
+    name: "broadcast_8to15",
+    event_ids: [115, 116, 117, 118, 119, 120, 121, 122],
+};
+/// Group 12: user-defined events (padded with NONE).
+const SWEEP_12: TraceEventGroup = TraceEventGroup {
+    name: "user_event",
+    event_ids: [124, 125, 126, 127, 0, 0, 0, 0],
+};
+
+/// All sweep groups in order. Used by the trace sweep orchestration.
+pub const TRACE_EVENT_GROUPS: &[&TraceEventGroup] = &[
+    &SWEEP_00, &SWEEP_01, &SWEEP_02, &SWEEP_03,
+    &SWEEP_04, &SWEEP_05, &SWEEP_06, &SWEEP_07,
+    &SWEEP_08, &SWEEP_09, &SWEEP_10, &SWEEP_11,
+    &SWEEP_12,
+];
+
+/// Number of sweep groups.
+pub const NUM_GROUPS: usize = 13;
+
+/// The fuzz_template.py default trace event configuration.
+///
+/// Register values: Trace_Event0 = 0x26300221, Trace_Event1 = 0x4F477A2C.
+/// Kept for reference, sanity-checking, and non-sweep use cases.
+pub const LEGACY_DEFAULT_GROUP: TraceEventGroup = TraceEventGroup {
+    name: "legacy_default",
     event_ids: [0x21, 0x02, 0x30, 0x26, 0x2C, 0x7A, 0x47, 0x4F],
 };
-
-/// Group 1: memory and flow control events.
-const GROUP_1: TraceEventGroup = TraceEventGroup {
-    name: "memory_flow",
-    // INSTR_STORE(39), INSTR_CALL(35), INSTR_RETURN(36), INSTR_STREAM_GET(40),
-    // INSTR_STREAM_PUT(41), LOCK_RELEASE_REQ(45), MEMORY_STALL(23), STREAM_STALL(24)
-    event_ids: [39, 35, 36, 40, 41, 45, 23, 24],
-};
-
-/// Group 2: status and port events.
-const GROUP_2: TraceEventGroup = TraceEventGroup {
-    name: "status_ports",
-    // CASCADE_STALL(25), ACTIVE(28), DISABLED(29), PORT_IDLE_0(74),
-    // PORT_STALLED_0(76), PORT_TLAST_0(77), PORT_RUNNING_2(83), PORT_RUNNING_3(87)
-    event_ids: [25, 28, 29, 74, 76, 77, 83, 87],
-};
-
-/// All trace event groups, indexed by group number.
-pub const TRACE_EVENT_GROUPS: &[&TraceEventGroup] = &[&GROUP_0, &GROUP_1, &GROUP_2];
-
-/// Number of trace event groups.
-pub const NUM_GROUPS: usize = 3;
 
 // -------------------------------------------------------------------------
 // NPU address computation
@@ -602,6 +898,50 @@ pub fn write_sweep_summary(
 }
 
 // -------------------------------------------------------------------------
+// Multi-group trace merge
+// -------------------------------------------------------------------------
+
+/// An event from a merged multi-group trace, identified by hardware event ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedEvent {
+    /// Hardware event ID (0-127), resolved from the trace slot + group config.
+    pub event_id: u8,
+    /// Absolute cycle from the trace start marker.
+    pub abs_cycle: u64,
+}
+
+/// Merge decoded traces from multiple groups into a unified event stream.
+///
+/// Each input pair maps a group (for slot-to-event-ID translation) to its
+/// decoded events. The output contains all events with their actual hardware
+/// event IDs (not slot numbers), sorted by absolute cycle.
+///
+/// This produces an "all-event trace" when given traces from all sweep groups.
+/// Requires deterministic execution across groups (verified separately).
+pub fn merge_sweep_traces(
+    group_traces: &[(&TraceEventGroup, &[DecodedEvent])],
+) -> Vec<MergedEvent> {
+    let mut merged = Vec::new();
+    for &(group, events) in group_traces {
+        for ev in events {
+            let slot = ev.slot as usize;
+            if slot < 8 {
+                let event_id = group.event_ids[slot];
+                // Skip NONE (0) padding slots in the last group.
+                if event_id != 0 {
+                    merged.push(MergedEvent {
+                        event_id,
+                        abs_cycle: ev.abs_cycle,
+                    });
+                }
+            }
+        }
+    }
+    merged.sort_by_key(|e| e.abs_cycle);
+    merged
+}
+
+// -------------------------------------------------------------------------
 // Tests
 // -------------------------------------------------------------------------
 
@@ -610,21 +950,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_group0_matches_fuzz_template() {
-        // Verify group 0 register values match fuzz_template.py hardcoded values.
+    fn test_legacy_group_matches_fuzz_template() {
+        // Verify legacy default group register values match fuzz_template.py.
         assert_eq!(
-            GROUP_0.event0_value(),
+            LEGACY_DEFAULT_GROUP.event0_value(),
             640680481,
-            "Group 0 event0 should be 0x{:08X} (640680481), got 0x{:08X}",
+            "Legacy event0 should be 0x{:08X} (640680481), got 0x{:08X}",
             640680481u32,
-            GROUP_0.event0_value(),
+            LEGACY_DEFAULT_GROUP.event0_value(),
         );
         assert_eq!(
-            GROUP_0.event1_value(),
+            LEGACY_DEFAULT_GROUP.event1_value(),
             1330084396,
-            "Group 0 event1 should be 0x{:08X} (1330084396), got 0x{:08X}",
+            "Legacy event1 should be 0x{:08X} (1330084396), got 0x{:08X}",
             1330084396u32,
-            GROUP_0.event1_value(),
+            LEGACY_DEFAULT_GROUP.event1_value(),
         );
     }
 
@@ -699,27 +1039,27 @@ mod tests {
         let event0_addr = npu_address(0, 2, TRACE_EVENT0_OFFSET);
         let event1_addr = npu_address(0, 2, TRACE_EVENT1_OFFSET);
 
-        // Build fake insts with group 0 values.
+        // Build fake insts with legacy default values.
         let mut insts = Vec::new();
-        insts.extend_from_slice(&make_write32(event0_addr, GROUP_0.event0_value()));
-        insts.extend_from_slice(&make_write32(event1_addr, GROUP_0.event1_value()));
+        insts.extend_from_slice(&make_write32(event0_addr, LEGACY_DEFAULT_GROUP.event0_value()));
+        insts.extend_from_slice(&make_write32(event1_addr, LEGACY_DEFAULT_GROUP.event1_value()));
 
-        // Patching with group 0 should be a no-op.
-        let patched0 = patch_insts_for_group(&insts, &GROUP_0).unwrap();
-        assert_eq!(insts, patched0, "Group 0 patch should be identity");
+        // Patching with legacy group should be a no-op.
+        let patched0 = patch_insts_for_group(&insts, &LEGACY_DEFAULT_GROUP).unwrap();
+        assert_eq!(insts, patched0, "Legacy group patch should be identity");
 
-        // Patching with group 1 should change both value fields.
-        let patched1 = patch_insts_for_group(&insts, &GROUP_1).unwrap();
-        assert_ne!(insts, patched1, "Group 1 patch should differ");
+        // Patching with sweep group 0 should change both value fields.
+        let patched1 = patch_insts_for_group(&insts, TRACE_EVENT_GROUPS[0]).unwrap();
+        assert_ne!(insts, patched1, "Sweep group 0 patch should differ from legacy");
 
-        // Verify the patched values match group 1.
+        // Verify the patched values match sweep group 0.
         let val0 = u32::from_le_bytes(patched1[16..20].try_into().unwrap());
         let val1 = u32::from_le_bytes(patched1[24 + 16..24 + 20].try_into().unwrap());
-        assert_eq!(val0, GROUP_1.event0_value());
-        assert_eq!(val1, GROUP_1.event1_value());
+        assert_eq!(val0, TRACE_EVENT_GROUPS[0].event0_value());
+        assert_eq!(val1, TRACE_EVENT_GROUPS[0].event1_value());
 
-        // Patch back to group 0.
-        let round_trip = patch_insts_for_group(&patched1, &GROUP_0).unwrap();
+        // Patch back to legacy.
+        let round_trip = patch_insts_for_group(&patched1, &LEGACY_DEFAULT_GROUP).unwrap();
         assert_eq!(insts, round_trip, "Round-trip should restore original");
     }
 
@@ -727,7 +1067,7 @@ mod tests {
     fn test_patch_missing_target() {
         // insts.bin with no matching Write32 should return Err.
         let insts = make_write32(0x12345678, 0);
-        let result = patch_insts_for_group(&insts, &GROUP_0);
+        let result = patch_insts_for_group(&insts, &LEGACY_DEFAULT_GROUP);
         assert!(result.is_err());
     }
 
@@ -931,5 +1271,120 @@ mod tests {
         };
         let s = format!("{}", comp);
         assert!(s.contains("DIVERGE at index 5"));
+    }
+
+    // --- Event catalogue tests ---
+
+    #[test]
+    fn test_sweepable_count() {
+        let ids = sweepable_event_ids();
+        assert_eq!(ids.len(), 100, "Expected 100 sweepable events, got {}", ids.len());
+        // Verify they're in ascending order.
+        for w in ids.windows(2) {
+            assert!(w[0] < w[1], "Sweepable IDs not sorted: {} >= {}", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn test_excluded_events_not_sweepable() {
+        // NONE, TRUE, RESERVED, all GROUP_* meta-events.
+        let excluded = [0, 1, 2, 15, 22, 32, 46, 47, 54, 73, 106, 123];
+        for id in excluded {
+            assert!(
+                !CORE_EVENTS[id].sweepable,
+                "Event {} ({}) should not be sweepable",
+                id, CORE_EVENTS[id].name,
+            );
+        }
+        // Config-dependent events.
+        for id in 5..=8 { assert!(!CORE_EVENTS[id].sweepable, "PERF_CNT_{}", id - 5); }
+        for id in 9..=12 { assert!(!CORE_EVENTS[id].sweepable, "COMBO_{}", id - 9); }
+        for id in 13..=14 { assert!(!CORE_EVENTS[id].sweepable, "EDGE_{}", id - 13); }
+        for id in 16..=21 { assert!(!CORE_EVENTS[id].sweepable, "PC_{}", id - 16); }
+    }
+
+    #[test]
+    fn test_sweep_groups_cover_all_sweepable() {
+        let expected = sweepable_event_ids();
+        let mut actual: Vec<u8> = Vec::new();
+        for group in TRACE_EVENT_GROUPS {
+            for &id in &group.event_ids {
+                if id != 0 { // Skip NONE padding
+                    actual.push(id);
+                }
+            }
+        }
+        assert_eq!(
+            actual, expected,
+            "Sweep groups should cover all sweepable events in order.\n\
+             Missing: {:?}\nExtra: {:?}",
+            expected.iter().filter(|id| !actual.contains(id)).collect::<Vec<_>>(),
+            actual.iter().filter(|id| !expected.contains(id)).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn test_event_name_lookup() {
+        assert_eq!(event_name(0), "NONE");
+        assert_eq!(event_name(28), "ACTIVE");
+        assert_eq!(event_name(37), "INSTR_VECTOR");
+        assert_eq!(event_name(127), "USER_EVENT_3");
+    }
+
+    #[test]
+    fn test_num_groups_consistent() {
+        assert_eq!(TRACE_EVENT_GROUPS.len(), NUM_GROUPS);
+        assert_eq!(NUM_GROUPS, 13);
+    }
+
+    // --- Merge tests ---
+
+    #[test]
+    fn test_merge_sweep_traces() {
+        // Two groups, each with some events at different cycles.
+        let group_a = TraceEventGroup {
+            name: "a",
+            event_ids: [10, 20, 30, 40, 50, 60, 70, 80],
+        };
+        let group_b = TraceEventGroup {
+            name: "b",
+            event_ids: [11, 21, 31, 41, 51, 61, 71, 81],
+        };
+        let events_a = vec![
+            DecodedEvent { slot: 0, abs_cycle: 100 }, // event_id=10
+            DecodedEvent { slot: 2, abs_cycle: 300 }, // event_id=30
+        ];
+        let events_b = vec![
+            DecodedEvent { slot: 1, abs_cycle: 200 }, // event_id=21
+            DecodedEvent { slot: 3, abs_cycle: 400 }, // event_id=41
+        ];
+        let merged = merge_sweep_traces(&[
+            (&group_a, &events_a),
+            (&group_b, &events_b),
+        ]);
+        assert_eq!(merged.len(), 4);
+        // Sorted by abs_cycle.
+        assert_eq!(merged[0], MergedEvent { event_id: 10, abs_cycle: 100 });
+        assert_eq!(merged[1], MergedEvent { event_id: 21, abs_cycle: 200 });
+        assert_eq!(merged[2], MergedEvent { event_id: 30, abs_cycle: 300 });
+        assert_eq!(merged[3], MergedEvent { event_id: 41, abs_cycle: 400 });
+    }
+
+    #[test]
+    fn test_merge_skips_none_padding() {
+        // Group with NONE padding slots (like SWEEP_12).
+        let group = TraceEventGroup {
+            name: "padded",
+            event_ids: [124, 125, 0, 0, 0, 0, 0, 0],
+        };
+        let events = vec![
+            DecodedEvent { slot: 0, abs_cycle: 100 }, // event_id=124
+            DecodedEvent { slot: 1, abs_cycle: 200 }, // event_id=125
+            DecodedEvent { slot: 2, abs_cycle: 300 }, // event_id=0 -> skipped
+        ];
+        let merged = merge_sweep_traces(&[(&group, &events)]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].event_id, 124);
+        assert_eq!(merged[1].event_id, 125);
     }
 }
