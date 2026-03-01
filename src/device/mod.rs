@@ -70,9 +70,8 @@ pub use host_memory::{HostMemory, HostMemoryError, MemoryRegion, DataDirection};
 pub use dma::{
     DmaEngine, BdConfig, ChannelState, ChannelId, ChannelType,
     DmaResult, DmaError, AddressGenerator, DimensionConfig,
-    Transfer, TransferState, TransferDirection, TransferEndpoint,
-    DmaTimingConfig, ChannelTimingState, TransferPhase, ChannelArbiter,
-    StreamData,
+    Transfer, TransferDirection, TransferEndpoint,
+    DmaTimingConfig, StreamData,
 };
 pub use stream_switch::{StreamSwitch, StreamPort, StreamPacket, PortDirection, PortType};
 

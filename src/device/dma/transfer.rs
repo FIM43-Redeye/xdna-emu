@@ -352,23 +352,6 @@ impl LockAcquireMode {
     }
 }
 
-/// Transfer state in the state machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransferState {
-    /// Transfer created but not yet started
-    Created,
-    /// Waiting to acquire lock before transfer
-    WaitingForLock(u8),
-    /// Transfer is actively moving data
-    Active,
-    /// All data transferred, waiting to release lock
-    ReleasingLock(u8),
-    /// Transfer complete
-    Complete,
-    /// Transfer failed with error
-    Error,
-}
-
 /// Direction of a DMA transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferDirection {
