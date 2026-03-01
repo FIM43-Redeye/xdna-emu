@@ -846,29 +846,38 @@ impl std::fmt::Display for TraceComparison {
 // Sweep orchestration helpers
 // -------------------------------------------------------------------------
 
-/// Check bitwise determinism across multiple binary trace buffers.
+/// Check event-sequence determinism across multiple binary trace buffers.
 ///
-/// Returns `true` if all buffers are byte-identical. Returns a description
-/// of the first difference found if they diverge.
+/// Decodes each trace and compares the slot sequences (ignoring absolute
+/// cycle values, which naturally vary between runs due to the NPU timer
+/// starting from a different point each time). Returns `Ok(())` if all
+/// runs produced the same events in the same order.
 pub fn check_determinism(traces: &[Vec<u8>]) -> Result<(), String> {
     if traces.len() < 2 {
         return Ok(());
     }
-    let reference = &traces[0];
-    for (rep, trace) in traces.iter().enumerate().skip(1) {
-        if trace.len() != reference.len() {
+
+    // Decode all traces into event sequences.
+    let decoded: Vec<Vec<DecodedEvent>> = traces
+        .iter()
+        .map(|t| decode_binary_trace(t))
+        .collect();
+
+    let ref_events = &decoded[0];
+    for (rep, events) in decoded.iter().enumerate().skip(1) {
+        if events.len() != ref_events.len() {
             return Err(format!(
-                "rep {} length {} != rep 0 length {}",
+                "rep {} has {} events, rep 0 has {} events",
                 rep,
-                trace.len(),
-                reference.len()
+                events.len(),
+                ref_events.len(),
             ));
         }
-        for (byte_idx, (a, b)) in reference.iter().zip(trace.iter()).enumerate() {
-            if a != b {
+        for (idx, (a, b)) in ref_events.iter().zip(events.iter()).enumerate() {
+            if a.slot != b.slot {
                 return Err(format!(
-                    "rep {} differs at byte {}: 0x{:02X} vs 0x{:02X}",
-                    rep, byte_idx, a, b
+                    "rep {} event {} slot mismatch: {} vs {}",
+                    rep, idx, a.slot, b.slot,
                 ));
             }
         }
@@ -1222,28 +1231,54 @@ mod tests {
     }
 
     #[test]
-    fn test_determinism_pass() {
-        let traces = vec![vec![1, 2, 3], vec![1, 2, 3], vec![1, 2, 3]];
-        assert!(check_determinism(&traces).is_ok());
+    fn test_determinism_pass_same_slots_different_timer() {
+        // Two traces with the same event slots but different start marker timers.
+        // This should PASS because determinism compares slot sequences, not raw bytes.
+        let trace_a = make_trace_packet(&[
+            0xF0, 0, 0, 0, 0, 0, 0, 100, // start marker: timer=100
+            0x13, // slot=1, delta=3
+            0x25, // slot=2, delta=5
+        ]);
+        let trace_b = make_trace_packet(&[
+            0xF0, 0, 0, 0, 0, 0, 0, 200, // start marker: timer=200 (different!)
+            0x13, // slot=1, delta=3 (same)
+            0x25, // slot=2, delta=5 (same)
+        ]);
+        assert!(check_determinism(&[trace_a, trace_b]).is_ok());
     }
 
     #[test]
-    fn test_determinism_fail_content() {
-        let traces = vec![vec![1, 2, 3], vec![1, 2, 4]];
-        let err = check_determinism(&traces).unwrap_err();
-        assert!(err.contains("rep 1 differs at byte 2"));
+    fn test_determinism_fail_different_slots() {
+        let trace_a = make_trace_packet(&[
+            0xF0, 0, 0, 0, 0, 0, 0, 0, // start marker
+            0x13, // slot=1, delta=3
+        ]);
+        let trace_b = make_trace_packet(&[
+            0xF0, 0, 0, 0, 0, 0, 0, 0, // start marker
+            0x23, // slot=2, delta=3 (different slot!)
+        ]);
+        let err = check_determinism(&[trace_a, trace_b]).unwrap_err();
+        assert!(err.contains("slot mismatch"));
     }
 
     #[test]
-    fn test_determinism_fail_length() {
-        let traces = vec![vec![1, 2, 3], vec![1, 2]];
-        let err = check_determinism(&traces).unwrap_err();
-        assert!(err.contains("length"));
+    fn test_determinism_fail_different_event_count() {
+        let trace_a = make_trace_packet(&[
+            0xF0, 0, 0, 0, 0, 0, 0, 0,
+            0x13, 0x25, // 2 events
+        ]);
+        let trace_b = make_trace_packet(&[
+            0xF0, 0, 0, 0, 0, 0, 0, 0,
+            0x13, // 1 event
+        ]);
+        let err = check_determinism(&[trace_a, trace_b]).unwrap_err();
+        assert!(err.contains("events"));
     }
 
     #[test]
     fn test_determinism_single_trace() {
-        assert!(check_determinism(&[vec![1, 2, 3]]).is_ok());
+        let trace = make_trace_packet(&[0xF0, 0, 0, 0, 0, 0, 0, 42, 0x13]);
+        assert!(check_determinism(&[trace]).is_ok());
     }
 
     #[test]
