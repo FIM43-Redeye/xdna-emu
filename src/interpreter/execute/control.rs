@@ -58,15 +58,7 @@ use crate::interpreter::traits::{ExecuteResult, Flags, StateAccess};
 pub struct ControlUnit;
 
 impl ControlUnit {
-    /// Execute a control operation.
-    ///
-    /// Returns `Some(result)` if handled, `None` if not a control op.
-    ///
-    /// # Memory Module Lock Routing
-    ///
-    /// For compute tiles, lock IDs 48-63 access the adjacent memory tile's locks 0-15.
-    /// Pass `mem_tile_locks` to enable proper cross-tile lock routing. When `None`,
-    /// all lock operations use the compute tile's local locks (legacy behavior).
+    /// Execute a control operation (without cross-tile lock routing).
     pub fn execute(
         op: &SlotOp,
         ctx: &mut ExecutionContext,
@@ -75,10 +67,11 @@ impl ControlUnit {
         Self::execute_with_mem_locks(op, ctx, tile, None)
     }
 
-    /// Execute a control operation with optional memory tile lock routing.
+    /// Execute a control operation with optional cross-tile lock routing.
     ///
-    /// When `mem_tile_locks` is provided, lock IDs 48-63 are routed to the memory
-    /// tile's locks 0-15 instead of the compute tile's local locks.
+    /// AIE2 lock quadrant mapping (per getLockLocalBaseIndex):
+    /// - IDs 48-63 (East=Internal): own tile's memory module locks
+    /// - IDs 0-15  (South): `mem_tile_locks` if provided (row-1 neighbor)
     pub fn execute_with_mem_locks(
         op: &SlotOp,
         ctx: &mut ExecutionContext,
@@ -162,26 +155,19 @@ impl ControlUnit {
 
             Operation::LockAcquire => {
                 let (raw_lock_id, expected, delta) = Self::get_lock_acquire_params(op, ctx);
-                // AIE-ML lock mapping (per mlir-aie getLockLocalBaseIndex):
-                // - IDs 0-15: local tile locks (South neighbor direction)
-                // - IDs 48-63: adjacent MemTile locks 0-15
+                // AIE2 lock quadrant mapping (per mlir-aie getLockLocalBaseIndex
+                // and AIE2TargetModel::isMemEast = isInternal):
                 //
-                // IDs 48-63 route to the MemTile at (col, row=1) which
-                // provides shared memory between cores in the same column.
-                let is_mem_module = raw_lock_id >= 48;
-                let (locks, lock_id) = if is_mem_module {
-                    if let Some(ref mut mt_locks) = mem_tile_locks {
-                        let id = (raw_lock_id - 48) % mt_locks.len() as u8;
-                        (&mut **mt_locks, id)
-                    } else {
-                        // Fallback: no MemTile locks provided, use local
-                        let id = Self::map_lock_id(raw_lock_id, tile.locks.len());
-                        (&mut *tile.locks, id)
-                    }
-                } else {
-                    let id = Self::map_lock_id(raw_lock_id, tile.locks.len());
-                    (&mut *tile.locks, id)
-                };
+                // - IDs 0-15  (South): row-1 neighbor (MemTile for compute row 2)
+                // - IDs 16-31 (West):  col-1 neighbor
+                // - IDs 32-47 (North): row+1 neighbor
+                // - IDs 48-63 (East=Internal): OWN tile's memory module
+                //
+                // The DMA BD lock field (4-bit) directly addresses tile-local
+                // locks 0-15, matching the East/Internal quadrant (IDs 48-63).
+                let (locks, lock_id, is_own_tile) = Self::route_lock(
+                    raw_lock_id, tile, &mut mem_tile_locks,
+                );
 
                 let current_value = locks[lock_id as usize].value;
                 let lock = &mut locks[lock_id as usize];
@@ -192,13 +178,13 @@ impl ControlUnit {
                             "[WATCH-ACQ] pc=0x{:03X} cycle={} lock={} value={}->{} SUCCESS",
                             ctx.pc(), ctx.cycles, raw_lock_id, current_value, lock.value
                         );
-                        log::debug!("LockAcquire raw={} mapped={} expected={} delta={} current={} -> {} SUCCESS (mem_module={})",
-                            raw_lock_id, lock_id, expected, delta, current_value, lock.value, is_mem_module);
+                        log::debug!("LockAcquire raw={} mapped={} expected={} delta={} current={} -> {} SUCCESS (own_tile={})",
+                            raw_lock_id, lock_id, expected, delta, current_value, lock.value, is_own_tile);
                         Some(ExecuteResult::Continue)
                     }
                     LockResult::PreconditionNotMet => {
-                        log::debug!("LockAcquire raw={} mapped={} expected={} current={} -> WAIT (mem_module={})",
-                            raw_lock_id, lock_id, expected, current_value, is_mem_module);
+                        log::debug!("LockAcquire raw={} mapped={} expected={} current={} -> WAIT (own_tile={})",
+                            raw_lock_id, lock_id, expected, current_value, is_own_tile);
                         Some(ExecuteResult::WaitLock { lock_id })
                     }
                     LockResult::WouldOverflow => {
@@ -213,28 +199,18 @@ impl ControlUnit {
                 let tile_col = tile.col;
                 let tile_row = tile.row;
 
-                // Same routing as LockAcquire: IDs 48-63 -> MemTile locks 0-15.
-                let is_mem_module = raw_lock_id >= 48;
-                let (locks, lock_id) = if is_mem_module {
-                    if let Some(ref mut mt_locks) = mem_tile_locks {
-                        let id = (raw_lock_id - 48) % mt_locks.len() as u8;
-                        (&mut **mt_locks, id)
-                    } else {
-                        let id = Self::map_lock_id(raw_lock_id, tile.locks.len());
-                        (&mut *tile.locks, id)
-                    }
-                } else {
-                    let id = Self::map_lock_id(raw_lock_id, tile.locks.len());
-                    (&mut *tile.locks, id)
-                };
+                // Same quadrant routing as LockAcquire.
+                let (locks, lock_id, is_own_tile) = Self::route_lock(
+                    raw_lock_id, tile, &mut mem_tile_locks,
+                );
 
                 let old_value = locks[lock_id as usize].value;
                 let lock = &mut locks[lock_id as usize];
 
                 // Release is non-blocking; overflow just saturates
                 lock.release_with_value(delta);
-                log::info!("LockRelease tile({},{}) raw={} mapped={} delta={} {} -> {} (mem_module={})",
-                    tile_col, tile_row, raw_lock_id, lock_id, delta, old_value, lock.value, is_mem_module);
+                log::info!("LockRelease tile({},{}) raw={} mapped={} delta={} {} -> {} (own_tile={})",
+                    tile_col, tile_row, raw_lock_id, lock_id, delta, old_value, lock.value, is_own_tile);
                 Some(ExecuteResult::Continue)
             }
 
@@ -394,25 +370,45 @@ impl ControlUnit {
         })
     }
 
-    /// Map AIE-ML core lock ID to tile lock index.
+    /// Route a core lock ID to the correct lock array and local index.
     ///
-    /// In AIE-ML, core lock instructions use a 6-bit lock ID field:
-    /// - Lock IDs 0-15: Core module locks 0-15 (direct mapping)
-    /// - Lock IDs 48-63: Memory module locks 0-15 (subtract 48)
-    /// - Lock IDs 16-47: Hardware uses low 4 bits (lock & 0xF)
+    /// AIE2 lock quadrant mapping (per mlir-aie getLockLocalBaseIndex
+    /// and AIE2TargetModel::isMemEast which returns isInternal):
     ///
-    /// The hardware addresses locks using the low bits of the ID within
-    /// the selected module. For IDs outside the standard ranges, we
-    /// mask to the valid range to match hardware behavior.
-    fn map_lock_id(raw_lock_id: u8, num_locks: usize) -> u8 {
-        let mapped = if raw_lock_id >= 48 {
-            // Memory module locks: subtract 48
-            raw_lock_id - 48
+    /// - IDs 0-15  (South): row-1 neighbor's locks
+    /// - IDs 16-31 (West):  col-1 neighbor's locks
+    /// - IDs 32-47 (North): row+1 neighbor's locks
+    /// - IDs 48-63 (East=Internal): OWN tile's memory module locks
+    ///
+    /// The DMA BD lock field (4-bit, values 0-15) addresses the same
+    /// physical locks as the East/Internal quadrant (IDs 48-63).
+    ///
+    /// Returns (lock_slice, local_lock_id, is_own_tile).
+    fn route_lock<'a>(
+        raw_lock_id: u8,
+        tile: &'a mut Tile,
+        mem_tile_locks: &'a mut Option<&mut [Lock]>,
+    ) -> (&'a mut [Lock], u8, bool) {
+        if raw_lock_id >= 48 {
+            // East = Internal = own tile's memory module locks.
+            let id = (raw_lock_id - 48) % tile.locks.len() as u8;
+            (&mut tile.locks, id, true)
+        } else if raw_lock_id < 16 {
+            // South = row-1 neighbor (MemTile for compute tiles at row 2).
+            if let Some(ref mut mt_locks) = mem_tile_locks {
+                let id = raw_lock_id % mt_locks.len() as u8;
+                (&mut **mt_locks, id, false)
+            } else {
+                // No South neighbor locks provided; fall back to own tile.
+                let id = raw_lock_id % tile.locks.len() as u8;
+                (&mut tile.locks, id, true)
+            }
         } else {
-            raw_lock_id
-        };
-        // Clamp to valid range for this tile's lock count
-        if num_locks == 0 { 0 } else { mapped % num_locks as u8 }
+            // West (16-31) or North (32-47): not yet supported.
+            // Fall back to own tile locks with modular mapping.
+            let id = (raw_lock_id % 16) % tile.locks.len() as u8;
+            (&mut tile.locks, id, true)
+        }
     }
 
     /// Start a DMA transfer.

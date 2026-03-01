@@ -391,6 +391,7 @@ impl MemoryUnit {
         } else {
             // Scalar/partial loads go through write_dest_with_latency (which queues)
             let value = Self::read_memory(tile, addr, width, neighbors.map(|n| &*n));
+
             if log::log_enabled!(log::Level::Trace) {
                 let masked = addr & 0xFFFF;
                 if masked >= 0x0400 && masked < 0x0420 {
@@ -445,6 +446,7 @@ impl MemoryUnit {
         } else {
             // Scalar/partial stores
             let value = Self::get_store_value(op, ctx, width);
+
             if log::log_enabled!(log::Level::Trace) {
                 let masked = addr & 0xFFFF;
                 if masked >= 0x0400 && masked < 0x0420 {
@@ -733,11 +735,12 @@ impl MemoryUnit {
 
     /// Get store address.
     ///
-    /// Handles two operand layouts:
-    /// 1. Decoded kernel: sources[0]=value, sources[1]=ptr, sources[2]=offset
+    /// Handles three operand layouts:
+    /// 1. Memory operand: `Memory { base, offset }` -- pre-scaled byte offset
     /// 2. Test/legacy: sources[0]=ptr (no offset)
-    ///
-    /// Offset is a word index, scaled by 4 bytes.
+    /// 3. Kernel layout: sources[0]=value, sources[1]=ptr, sources[2]=index
+    ///    The index is a modifier register (dj/m) containing a byte offset
+    ///    for indexed addressing (`st.s16 rN, [pM, djK]`).
     fn get_store_address(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
         // First check for Memory operand anywhere (encapsulates ptr+offset)
         for src in &op.sources {
@@ -752,15 +755,24 @@ impl MemoryUnit {
             return ctx.pointer_read(*r);
         }
 
-        // Kernel layout: sources[0]=value, sources[1]=pointer, sources[2]=post-modify
-        // The store address is just the pointer value. sources[2] is the
-        // post-modify amount (applied after the store), NOT a pre-offset.
-        op.sources.get(1).map_or(0, |src| match src {
+        // Kernel layout: sources[0]=value, sources[1]=pointer, sources[2]=index
+        let base_addr = op.sources.get(1).map_or(0, |src| match src {
             Operand::PointerReg(r) => ctx.pointer_read(*r),
             Operand::ScalarReg(r) => ctx.scalar_read(*r),
             Operand::Immediate(v) => *v as u32,
             _ => 0,
-        })
+        });
+
+        // sources[2] is the index offset: modifier registers contain byte
+        // offsets (from mov dj/m, rN), matching the load path in get_address.
+        let offset = op.sources.get(2).map_or(0, |src| match src {
+            Operand::ModifierReg(r) => ctx.modifier_read(*r),
+            Operand::Immediate(v) => (*v as i32 * 4) as u32,
+            Operand::ScalarReg(r) => ctx.scalar_read(*r).wrapping_mul(4),
+            _ => 0,
+        });
+
+        base_addr.wrapping_add(offset)
     }
 
     /// Get value to store.
