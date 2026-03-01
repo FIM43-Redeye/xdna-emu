@@ -59,7 +59,7 @@
 //! - `jc`/`jnc` - test Carry flag (for ADC/SBC chains)
 //! - Other conditions computed from register values, not stored flags
 
-use crate::interpreter::bundle::{Operand, Operation, SlotOp};
+use crate::interpreter::bundle::{Operand, Operation, SlotIndex, SlotOp};
 use crate::interpreter::state::ExecutionContext;
 use crate::interpreter::traits::Flags;
 use crate::tablegen::SemanticOp;
@@ -245,6 +245,27 @@ fn write_operand(operand: &Operand, ctx: &mut ExecutionContext, value: u32) {
         Operand::ScalarReg(r) => ctx.scalar.write(*r, value),
         Operand::PointerReg(r) => ctx.pointer.write(*r, value),
         Operand::ModifierReg(r) => ctx.modifier.write(*r, value),
+        Operand::ControlReg(id) => {
+            // Control register write: update SRS/UPS config.
+            // Hardware register IDs from AIE2GenRegisterInfo.td.
+            match id {
+                9 => { // crSat
+                    ctx.srs_config.saturation_mode = (value & 0x3) as u8;
+                    log::trace!("crSat = {} (raw 0x{:X})", value & 0x3, value);
+                }
+                6 => { // crRnd
+                    ctx.srs_config.rounding_mode = (value & 0xF) as u8;
+                    log::trace!("crRnd = {} (raw 0x{:X})", value & 0xF, value);
+                }
+                8 => { // crSRSSign
+                    ctx.srs_config.srs_sign = (value & 1) != 0;
+                    log::trace!("crSRSSign = {} (raw 0x{:X})", value & 1, value);
+                }
+                _ => {
+                    log::trace!("control register write: id={}, value=0x{:X}", id, value);
+                }
+            }
+        }
         Operand::VectorReg(_) | Operand::AccumReg(_) => {
             log::trace!(
                 "[SEMANTIC] Vector/accum register write not yet implemented: {:?}",
@@ -276,13 +297,36 @@ fn get_implicit_use(op: &SlotOp, ctx: &ExecutionContext, reg_num: u8) -> Option<
 // ============================================================================
 
 fn execute_add(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
+    // Pointer arithmetic: padda/paddb [pN], $imm or [pN], djK
+    //
+    // These instructions compute pN = pN + offset. In TableGen, the pointer
+    // register appears as a tied output ($res = $ptr constraint) but the
+    // resolver puts it only in output_order, not input_order. So the SlotOp
+    // has dest=PointerReg(N) and sources=[Immediate] -- missing the pointer
+    // as a source.
+    //
+    // SP variants (PADDA_sp_imm, PADDB_sp_imm) are even more implicit:
+    // Defs=[SP], Uses=[SP] with empty (outs), so dest=None.
+    //
+    // Detect both cases in LoadA/LoadB slots with a single source.
+    if matches!(op.slot, SlotIndex::LoadA | SlotIndex::LoadB)
+        && op.sources.len() == 1
+    {
+        let ptr_idx = match op.dest {
+            Some(Operand::PointerReg(p)) => p,
+            None => 6, // SP = p6
+            _ => return false, // Unexpected dest type
+        };
+        let base = ctx.pointer.read(ptr_idx);
+        let offset = read_source(op, ctx, 0);
+        let result = base.wrapping_add(offset);
+        ctx.pointer.write(ptr_idx, result);
+        return true;
+    }
+
     let a = read_source(op, ctx, 0);
     let b = read_source(op, ctx, 1);
     let result = a.wrapping_add(b);
-    log::debug!(
-        "[SEMANTIC ADD] dest={:?} src0={:?}({}) + src1={:?}({}) = {}",
-        op.dest, op.sources.get(0), a, op.sources.get(1), b, result
-    );
     write_dest(op, ctx, result);
     // AIE2: ADD sets the Carry flag (C). Z/N/V computed by branch logic.
     ctx.set_flags(Flags::from_add(a, b, result));
@@ -802,5 +846,480 @@ mod tests {
         let op = SlotOp::new(SlotIndex::Scalar0, Operation::ScalarAdd);
         // No semantic set, should return false
         assert!(!execute_semantic(&op, &mut ctx.clone()));
+    }
+
+    #[test]
+    fn test_control_reg_write_via_semantic_copy() {
+        // Verify that movx crRnd, rN works through the semantic Copy path.
+        // Previously, ControlReg was not handled in write_operand, so
+        // control register writes were silently dropped when semantic
+        // dispatch returned true before ScalarAlu fallback could run.
+        let mut ctx = make_test_context();
+        ctx.scalar.write(5, 9); // rounding mode value
+
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarMov, SemanticOp::Copy,
+        );
+        op.sources = smallvec![Operand::ScalarReg(5)];
+        op.dest = Some(Operand::ControlReg(6)); // crRnd
+
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.srs_config.rounding_mode, 9);
+    }
+
+    #[test]
+    fn test_control_reg_write_crsat_via_semantic() {
+        let mut ctx = make_test_context();
+
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarMov, SemanticOp::Copy,
+        );
+        op.sources = smallvec![Operand::Immediate(3)];
+        op.dest = Some(Operand::ControlReg(9)); // crSat
+
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.srs_config.saturation_mode, 3);
+    }
+
+    #[test]
+    fn test_control_reg_write_srssign_via_semantic() {
+        let mut ctx = make_test_context();
+
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarMov, SemanticOp::Copy,
+        );
+        op.sources = smallvec![Operand::Immediate(1)];
+        op.dest = Some(Operand::ControlReg(8)); // crSRSSign
+
+        assert!(execute_semantic(&op, &mut ctx));
+        assert!(ctx.srs_config.srs_sign);
+    }
+
+    #[test]
+    fn test_control_reg_write_masks_bits() {
+        let mut ctx = make_test_context();
+
+        // crSat only uses lower 2 bits
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarMov, SemanticOp::Copy,
+        );
+        op.sources = smallvec![Operand::Immediate(0xFF)];
+        op.dest = Some(Operand::ControlReg(9)); // crSat
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.srs_config.saturation_mode, 3); // 0xFF & 0x3
+
+        // crRnd only uses lower 4 bits
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarMov, SemanticOp::Copy,
+        );
+        op.sources = smallvec![Operand::Immediate(0xFF)];
+        op.dest = Some(Operand::ControlReg(6)); // crRnd
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.srs_config.rounding_mode, 15); // 0xFF & 0xF
+    }
+
+    #[test]
+    fn test_execute_mul() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(1, 7);
+        ctx.scalar.write(2, 6);
+
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar1, Operation::ScalarMul, SemanticOp::Mul,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(3));
+
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 42);
+    }
+
+    #[test]
+    fn test_execute_and_or_xor_not() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(1, 0xFF00);
+        ctx.scalar.write(2, 0x0FF0);
+
+        // AND
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarAnd, SemanticOp::And,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 0x0F00);
+
+        // OR
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarOr, SemanticOp::Or,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 0xFFF0);
+
+        // XOR
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarXor, SemanticOp::Xor,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 0xF0F0);
+
+        // NOT
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarMov, SemanticOp::Not,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), !0xFF00u32);
+    }
+
+    #[test]
+    fn test_execute_shifts() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(1, 0x8000_0000u32); // negative in signed
+        ctx.scalar.write(2, 4);
+
+        // SRA (arithmetic right shift, preserves sign)
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarSra, SemanticOp::Sra,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 0xF800_0000u32); // sign-extended
+
+        // SRL (logical right shift, zero-fills)
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarShr, SemanticOp::Srl,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 0x0800_0000u32); // zero-filled
+    }
+
+    #[test]
+    fn test_execute_abs_sets_carry() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(1, (-42i32) as u32);
+
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarAbs, SemanticOp::Abs,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1)];
+        op.dest = Some(Operand::ScalarReg(3));
+
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 42);
+        assert!(ctx.flags().c); // Carry set because input was negative
+    }
+
+    #[test]
+    fn test_execute_neg() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(1, 42);
+
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarMov, SemanticOp::Neg,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1)];
+        op.dest = Some(Operand::ScalarReg(3));
+
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), (-42i32) as u32);
+    }
+
+    #[test]
+    fn test_execute_clz_ctz_popcount() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(1, 0x00F0_0000u32); // 8 leading zeros, 20 trailing zeros, 4 ones
+
+        // CLZ
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarClz, SemanticOp::Ctlz,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 8);
+
+        // CTZ
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarMov, SemanticOp::Cttz,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 20);
+
+        // POPCOUNT
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarMov, SemanticOp::Ctpop,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 4);
+    }
+
+    #[test]
+    fn test_execute_rotl_rotr() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(1, 0x0000_00FFu32);
+        ctx.scalar.write(2, 8);
+
+        // ROTL
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarMov, SemanticOp::Rotl,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 0x0000_FF00u32);
+
+        // ROTR (rotate back)
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarMov, SemanticOp::Rotr,
+        );
+        op.sources = smallvec![Operand::ScalarReg(3), Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(4));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(4), 0x0000_00FFu32);
+    }
+
+    #[test]
+    fn test_execute_bswap() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(1, 0x12_34_56_78u32);
+
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarMov, SemanticOp::Bswap,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 0x78_56_34_12u32);
+    }
+
+    #[test]
+    fn test_execute_sign_extend() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(1, 0x0000_0080u32); // 128 in unsigned, -128 as i8
+
+        // Sign extend from 8 bits
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarExtendS8, SemanticOp::SignExtend,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 0xFFFF_FF80u32); // -128 sign-extended
+
+        // Sign extend from 16 bits
+        ctx.scalar.write(1, 0x0000_8000u32); // -32768 as i16
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarExtendS16, SemanticOp::SignExtend,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 0xFFFF_8000u32);
+    }
+
+    #[test]
+    fn test_execute_zero_extend() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(1, 0xFFFF_FFFFu32);
+
+        // Zero extend from 8 bits
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarExtendU8, SemanticOp::ZeroExtend,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 0xFF);
+
+        // Zero extend from 16 bits
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarExtendU16, SemanticOp::ZeroExtend,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 0xFFFF);
+    }
+
+    #[test]
+    fn test_execute_div_signed() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(1, (-100i32) as u32);
+        ctx.scalar.write(2, 7);
+
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarDiv, SemanticOp::SDiv,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3) as i32, -14); // -100 / 7 = -14
+    }
+
+    #[test]
+    fn test_execute_div_by_zero() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(1, 42);
+        ctx.scalar.write(2, 0);
+
+        // Signed div by zero returns i32::MIN
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarDiv, SemanticOp::SDiv,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), i32::MIN as u32);
+
+        // Unsigned div by zero returns u32::MAX
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarDivu, SemanticOp::UDiv,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), u32::MAX);
+    }
+
+    #[test]
+    fn test_execute_rem() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(1, 17);
+        ctx.scalar.write(2, 5);
+
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarMod, SemanticOp::SRem,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 2); // 17 % 5 = 2
+    }
+
+    #[test]
+    fn test_execute_adc_with_carry() {
+        let mut ctx = make_test_context();
+        // Set carry flag before ADC
+        ctx.set_flags(Flags { z: false, n: false, c: true, v: false });
+        ctx.scalar.write(1, 10);
+        ctx.scalar.write(2, 20);
+
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarAdc, SemanticOp::Adc,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(3));
+
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 31); // 10 + 20 + 1 (carry)
+    }
+
+    #[test]
+    fn test_execute_sbc_with_borrow() {
+        let mut ctx = make_test_context();
+        // C=0 means borrow occurred, so borrow_in=1
+        ctx.set_flags(Flags { z: false, n: false, c: false, v: false });
+        ctx.scalar.write(1, 30);
+        ctx.scalar.write(2, 10);
+
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarSbc, SemanticOp::Sbc,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(3));
+
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 19); // 30 - 10 - 1 (borrow)
+    }
+
+    #[test]
+    fn test_execute_unsigned_comparisons() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(1, 0xFFFF_FFFFu32); // -1 signed, but huge unsigned
+        ctx.scalar.write(2, 1);
+
+        // Signed: -1 < 1 is true
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarLt, SemanticOp::SetLt,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 1);
+
+        // Unsigned: 0xFFFFFFFF > 1 is true, so ult is false
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::ScalarLtu, SemanticOp::SetUlt,
+        );
+        op.sources = smallvec![Operand::ScalarReg(1), Operand::ScalarReg(2)];
+        op.dest = Some(Operand::ScalarReg(3));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(3), 0); // 0xFFFFFFFF is NOT < 1 unsigned
+    }
+
+    #[test]
+    fn test_execute_pointer_add_in_load_slot() {
+        // padda instruction: pN = pN + imm, in LoadA/LoadB slot
+        let mut ctx = make_test_context();
+        ctx.pointer.write(2, 0x1000);
+
+        let mut op = SlotOp::with_semantic(
+            SlotIndex::LoadA, Operation::PointerAdd, SemanticOp::Add,
+        );
+        op.sources = smallvec![Operand::Immediate(0x100)];
+        op.dest = Some(Operand::PointerReg(2));
+
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.pointer.read(2), 0x1100);
+    }
+
+    #[test]
+    fn test_execute_nop() {
+        let mut ctx = make_test_context();
+        let op = SlotOp::with_semantic(
+            SlotIndex::Scalar0, Operation::Nop, SemanticOp::Nop,
+        );
+        assert!(execute_semantic(&op, &mut ctx));
+    }
+
+    #[test]
+    fn test_delegated_ops_return_false() {
+        let mut ctx = make_test_context();
+
+        // Call should delegate to ControlUnit
+        let op = SlotOp::with_semantic(
+            SlotIndex::Control, Operation::Call, SemanticOp::Call,
+        );
+        assert!(!execute_semantic(&op, &mut ctx));
+
+        // LockAcquire should delegate
+        let op = SlotOp::with_semantic(
+            SlotIndex::Control, Operation::LockAcquire, SemanticOp::LockAcquire,
+        );
+        assert!(!execute_semantic(&op, &mut ctx));
+
+        // Load should delegate to MemoryUnit
+        let op = SlotOp::with_semantic(
+            SlotIndex::LoadA,
+            Operation::Load {
+                width: crate::interpreter::bundle::MemWidth::Word,
+                post_modify: crate::interpreter::bundle::PostModify::None,
+            },
+            SemanticOp::Load,
+        );
+        assert!(!execute_semantic(&op, &mut ctx));
     }
 }
