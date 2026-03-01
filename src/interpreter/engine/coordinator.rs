@@ -107,26 +107,6 @@ pub struct InterpreterEngine {
     /// Last cycle's total DMA bytes transferred (to detect DMA-level progress
     /// even when no stream words are routed -- e.g., during lock operations).
     last_dma_bytes: u64,
-    /// Global trace log collecting events from all tiles.
-    /// DMA events are drained from engines each cycle; instruction events
-    /// come from per-core TimingContexts. Events include (col, row) source
-    /// info embedded in the TileTracedEvent wrapper.
-    trace_log: Vec<TileTracedEvent>,
-}
-
-/// A trace event tagged with its source tile coordinates.
-/// This wraps TimestampedEvent to add spatial information needed for
-/// Perfetto export (each tile maps to a separate Perfetto process).
-#[derive(Debug, Clone, Copy)]
-pub struct TileTracedEvent {
-    /// Source tile column.
-    pub col: u8,
-    /// Source tile row.
-    pub row: u8,
-    /// Cycle when the event occurred.
-    pub cycle: u64,
-    /// The event type.
-    pub event: EventType,
 }
 
 impl InterpreterEngine {
@@ -160,7 +140,6 @@ impl InterpreterEngine {
             no_progress_cycles: 0,
             last_words_routed: 0,
             last_dma_bytes: 0,
-            trace_log: Vec::new(),
         }
     }
 
@@ -209,33 +188,12 @@ impl InterpreterEngine {
         self.total_instructions
     }
 
-    /// Get the global trace log (DMA and core events from all tiles).
-    pub fn trace_log(&self) -> &[TileTracedEvent] {
-        &self.trace_log
-    }
-
-    /// Drain all per-core instruction trace events into the global trace log.
-    /// Call this after execution completes (before export) to collect
-    /// instruction-level events from each core's TimingContext.
-    pub fn collect_core_trace_events(&mut self) {
-        for col in 0..self.cols {
-            for row in self.compute_row_start..self.rows {
-                let idx = col * self.rows + row;
-                if !self.cores[idx].enabled {
-                    continue;
-                }
-                let events = self.cores[idx].context.timing_context().events.events();
-                for evt in events {
-                    self.trace_log.push(TileTracedEvent {
-                        col: col as u8,
-                        row: row as u8,
-                        cycle: evt.cycle,
-                        event: evt.event,
-                    });
-                }
-            }
-        }
-
+    /// Flush trace units and route final trace packets to host DDR.
+    ///
+    /// Call after execution completes. Flushes all tile trace units so partial
+    /// packets get emitted with padding, then runs additional routing passes
+    /// to deliver them through the stream switch network to host memory.
+    pub fn flush_trace_to_host(&mut self) {
         // Flush all tile trace units so partial packets get emitted with padding.
         // This ensures the final trace data is available for stream routing.
         for col in 0..self.device.array.cols() {
@@ -484,7 +442,6 @@ impl InterpreterEngine {
                     }
                 }
             }
-            self.trace_log.push(TileTracedEvent { col, row, cycle, event });
         }
 
         // Phase 2b: Generate stream switch port events from cycle flags.
@@ -557,10 +514,8 @@ impl InterpreterEngine {
                     }
                 }
             }
-            for (idx, hw_id, evt, tt) in port_events {
+            for (idx, hw_id, _evt, tt) in port_events {
                 let tile = &mut self.device.array.tiles[idx];
-                let col = tile.col;
-                let row = tile.row;
                 // Compute tiles: core_trace (CoreEvent namespace)
                 // Shim tiles: core_trace (PL module, single trace unit)
                 // MemTiles: mem_trace (MemTileEvent namespace)
@@ -569,7 +524,6 @@ impl InterpreterEngine {
                 } else {
                     tile.notify_core_trace_event(hw_id, cycle);
                 }
-                self.trace_log.push(TileTracedEvent { col, row, cycle, event: evt });
             }
         }
 
@@ -869,7 +823,7 @@ impl InterpreterEngine {
                         // If engine reports channel complete, clear running flag
                         if channel.running {
                             let state = engine.channel_state(ch as u8);
-                            if matches!(state, ChannelState::Complete | ChannelState::Idle) {
+                            if matches!(state, ChannelState::Idle) {
                                 channel.running = false;
                             }
                         }
@@ -1214,7 +1168,7 @@ mod tests {
             let state = dma.channel_state(2);
 
             // Break when complete
-            if matches!(state, ChannelState::Complete | ChannelState::Idle) {
+            if matches!(state, ChannelState::Idle) {
                 break;
             }
 

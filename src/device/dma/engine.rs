@@ -208,8 +208,6 @@ pub enum ChannelState {
     Paused,
     /// Channel is waiting for lock
     WaitingForLock(u8),
-    /// Channel completed last transfer
-    Complete,
     /// Channel encountered an error
     Error,
 }

@@ -214,7 +214,6 @@ impl QuiescenceDetector {
                             ChannelState::WaitingForLock(id) => {
                                 format!("WaitingForLock({})", id)
                             }
-                            ChannelState::Complete => "Complete".to_string(),
                             ChannelState::Error => "Error".to_string(),
                         };
                         if !matches!(state, ChannelState::Idle) {
