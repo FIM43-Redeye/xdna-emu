@@ -958,6 +958,9 @@ pub struct SlotOp {
     pub dest: Option<Operand>,
     /// Optional predicate for conditional execution.
     pub predicate: Option<Predicate>,
+    /// Encoding mnemonic from TableGen (e.g., "jl", "mova", "vadd").
+    /// Used by the crossref tool to compare against llvm-objdump output.
+    pub encoding_name: Option<String>,
 }
 
 impl SlotOp {
@@ -977,6 +980,7 @@ impl SlotOp {
             sources: SmallVec::new(),
             dest: None,
             predicate: None,
+            encoding_name: None,
         }
     }
 
@@ -996,6 +1000,7 @@ impl SlotOp {
             sources: SmallVec::new(),
             dest: None,
             predicate: None,
+            encoding_name: None,
         }
     }
 

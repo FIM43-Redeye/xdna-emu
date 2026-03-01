@@ -38,6 +38,7 @@
 
 mod decoder;
 pub(crate) mod composite;
+pub mod crossref;
 
 pub use decoder::{DecodedInstr, InstructionDecoder};
 
