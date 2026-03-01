@@ -26,6 +26,17 @@ pub enum ScalarType {
     I8,
 }
 
+impl ScalarType {
+    /// Size of one element in bytes.
+    pub fn byte_size(self) -> usize {
+        match self {
+            ScalarType::I32 => 4,
+            ScalarType::I16 => 2,
+            ScalarType::I8 => 1,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

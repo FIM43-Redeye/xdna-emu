@@ -766,7 +766,11 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
     };
 
     // Parse all three axes from CLI or config defaults.
-    let rt_spec = runtime_spec.unwrap_or_else(|| config.defaults.runtime.clone());
+    // Fuzz mode defaults to emu+hw (differential comparison is the whole
+    // point) unless the user explicitly specified --runtime=.
+    let rt_spec = runtime_spec.clone().unwrap_or_else(|| {
+        if fuzz_mode { "emu,hw".to_string() } else { config.defaults.runtime.clone() }
+    });
     let runtime = RuntimeSet::parse(&rt_spec).unwrap_or_else(|e| {
         eprintln!("Invalid runtime spec '{}': {}", rt_spec, e);
         std::process::exit(1);

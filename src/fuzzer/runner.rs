@@ -6,7 +6,6 @@
 //! 2. **Execute phase** (sequential): run each compiled case through the
 //!    emulator and optionally on real NPU hardware, then compare outputs.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -82,6 +81,10 @@ impl ToolPaths {
         }
     }
 }
+
+/// Trace buffer size in elements (i32). 1MB = 262144 x i32, matching the
+/// standard trace buffer size used by npu-test and the NPU executor.
+const TRACE_BUFFER_ELEMENTS: usize = 262_144;
 
 fn dtype_str(dtype: ScalarType) -> &'static str {
     match dtype {
@@ -290,27 +293,29 @@ fn execute_all(
     let total = cases.len();
 
     if !hw {
-        return execute_emulator_only(cases, max_cycles, verbose);
+        return execute_emulator_only(cases, max_cycles, verbose, jobs);
     }
 
-    // HW comparison: pipeline emulator and NPU concurrently.
-    //
-    // Emulator result slots -- one per case, initially empty.  Emulator
-    // workers fill them in parallel; the NPU thread reads them sequentially.
-    let emu_slots: Vec<std::sync::Mutex<Option<Result<Vec<u8>, String>>>> =
+    // HW comparison: run emulator (parallel) and NPU (sequential) independently,
+    // then compare results. This decouples them so neither blocks the other.
+    type CaseResult = Result<(Vec<u8>, Option<Vec<u8>>), String>;
+
+    // Emulator results: parallel work-stealing.
+    let emu_results: Vec<std::sync::Mutex<Option<CaseResult>>> =
         (0..total).map(|_| std::sync::Mutex::new(None)).collect();
-
-    let pass = std::sync::atomic::AtomicUsize::new(0);
-    let fail = std::sync::atomic::AtomicUsize::new(0);
-    let error = std::sync::atomic::AtomicUsize::new(0);
-
     let emu_next = std::sync::atomic::AtomicUsize::new(0);
+    let emu_done = std::sync::atomic::AtomicUsize::new(0);
+
+    // NPU results: sequential (single device).
+    let npu_results: Vec<std::sync::Mutex<Option<CaseResult>>> =
+        (0..total).map(|_| std::sync::Mutex::new(None)).collect();
+    let npu_done = std::sync::atomic::AtomicUsize::new(0);
 
     std::thread::scope(|s| {
-        let emu_slots = &emu_slots;
-        let pass = &pass;
-        let fail = &fail;
-        let error = &error;
+        let emu_results = &emu_results;
+        let npu_results = &npu_results;
+        let emu_done = &emu_done;
+        let npu_done = &npu_done;
 
         // Emulator workers: parallel, work-stealing.
         for _ in 0..jobs {
@@ -322,70 +327,27 @@ fn execute_all(
                     let case = &cases[idx];
                     let xclbin_path = case.case_dir.join("aie.xclbin");
                     let result = run_emulator(&xclbin_path, &case.params, max_cycles);
-                    *emu_slots[idx].lock().unwrap() = Some(result);
+                    *emu_results[idx].lock().unwrap() = Some(result);
+                    let n = emu_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if verbose {
+                        eprintln!("  emu {}/{} (seed {})", n, total, case.seed);
+                    }
                 }
             });
         }
 
-        // NPU thread: sequential (single device), compare with emulator.
+        // NPU thread: sequential (single device).
         s.spawn(move || {
             for (i, case) in cases.iter().enumerate() {
                 let xclbin_path = case.case_dir.join("aie.xclbin");
                 let insts_path = case.case_dir.join("insts.bin");
-
-                // Run on NPU (slow).
-                let npu_result = run_on_npu_raw(case, &xclbin_path, &insts_path);
-
-                // Wait for emulator result (usually already done).
-                let emu_result = loop {
-                    if let Some(r) = emu_slots[i].lock().unwrap().take() {
-                        break r;
-                    }
-                    std::thread::yield_now();
-                };
-
-                // Compare.
-                match (emu_result, npu_result) {
-                    (Ok(emu_output), Ok(npu_output)) => {
-                        if emu_output.as_slice() == npu_output.as_slice() {
-                            pass.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if verbose {
-                                println!("[{}/{}] seed {} MATCH", i + 1, total, case.seed);
-                            }
-                        } else {
-                            fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let elem_type = match case.params.dtype {
-                                ScalarType::I32 => crate::testing::test_cpp_parser::ElementType::I32,
-                                ScalarType::I16 => crate::testing::test_cpp_parser::ElementType::I16,
-                                ScalarType::I8 => crate::testing::test_cpp_parser::ElementType::I8,
-                            };
-                            let detail = format_mismatch(&emu_output, &npu_output, elem_type);
-                            eprintln!("[{}/{}] seed {} MISMATCH: {}", i + 1, total, case.seed, detail);
-                            if verbose {
-                                let _ = std::fs::write(case.case_dir.join("emu_output.bin"), &emu_output);
-                                let _ = std::fs::write(case.case_dir.join("npu_output.bin"), &npu_output);
-                            }
-                        }
-                    }
-                    (Err(e), _) => {
-                        error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if verbose {
-                            eprintln!("[{}/{}] seed {} emulator error: {}", i + 1, total, case.seed, e);
-                        }
-                    }
-                    (_, Err(e)) => {
-                        error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if verbose {
-                            eprintln!("[{}/{}] seed {} hw error: {}", i + 1, total, case.seed, e);
-                        }
-                    }
-                }
-
+                let result = run_on_npu_raw(case, &xclbin_path, &insts_path);
+                *npu_results[i].lock().unwrap() = Some(result);
+                let n = npu_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if !verbose {
-                    let p = pass.load(std::sync::atomic::Ordering::Relaxed);
-                    let f = fail.load(std::sync::atomic::Ordering::Relaxed);
-                    let e = error.load(std::sync::atomic::Ordering::Relaxed);
-                    eprint!("\r[{}/{}] {} pass, {} fail, {} error", i + 1, total, p, f, e);
+                    eprint!("\r  emu {}/{}, npu {}/{}",
+                        emu_done.load(std::sync::atomic::Ordering::Relaxed), total,
+                        n, total);
                 }
             }
         });
@@ -395,63 +357,155 @@ fn execute_all(
         eprintln!();
     }
 
-    (
-        pass.into_inner(),
-        fail.into_inner(),
-        error.into_inner(),
-    )
+    // Compare results.
+    let mut pass = 0usize;
+    let mut fail = 0usize;
+    let mut error = 0usize;
+    let mut vacuous = 0usize;
+
+    for (i, case) in cases.iter().enumerate() {
+        let emu_result = emu_results[i].lock().unwrap().take().unwrap();
+        let npu_result = npu_results[i].lock().unwrap().take().unwrap();
+
+        match (emu_result, npu_result) {
+            (Ok((emu_output, emu_trace)), Ok((npu_output, npu_trace))) => {
+                if emu_output.as_slice() == npu_output.as_slice() {
+                    let all_zero = emu_output.iter().all(|&b| b == 0);
+                    if all_zero {
+                        vacuous += 1;
+                        if verbose {
+                            println!("seed {} MATCH (vacuous -- both zero, {} elements)",
+                                case.seed,
+                                emu_output.len() / case.params.dtype.byte_size());
+                        }
+                    } else {
+                        pass += 1;
+                        if verbose {
+                            println!("seed {} MATCH ({} elements)",
+                                case.seed,
+                                emu_output.len() / case.params.dtype.byte_size());
+                        }
+                    }
+                } else {
+                    fail += 1;
+                    let elem_type = match case.params.dtype {
+                        ScalarType::I32 => crate::testing::test_cpp_parser::ElementType::I32,
+                        ScalarType::I16 => crate::testing::test_cpp_parser::ElementType::I16,
+                        ScalarType::I8 => crate::testing::test_cpp_parser::ElementType::I8,
+                    };
+                    let detail = format_mismatch(&emu_output, &npu_output, elem_type);
+                    println!("seed {} MISMATCH: {}", case.seed, detail);
+                    // Save outputs and trace data for post-mortem debugging.
+                    let _ = std::fs::write(case.case_dir.join("emu_output.bin"), &emu_output);
+                    let _ = std::fs::write(case.case_dir.join("npu_output.bin"), &npu_output);
+                    if let Some(ref t) = emu_trace {
+                        let _ = std::fs::write(case.case_dir.join("emu_trace.bin"), t);
+                    }
+                    if let Some(ref t) = npu_trace {
+                        let _ = std::fs::write(case.case_dir.join("npu_trace.bin"), t);
+                    }
+                }
+            }
+            (Err(e), _) => {
+                error += 1;
+                if verbose {
+                    println!("seed {} emulator error: {}", case.seed, e);
+                }
+            }
+            (_, Err(e)) => {
+                error += 1;
+                if verbose {
+                    println!("seed {} hw error: {}", case.seed, e);
+                }
+            }
+        }
+    }
+
+    if vacuous > 0 {
+        println!("  ({} vacuous matches -- both sides all zeros)", vacuous);
+    }
+
+    (pass, fail, error)
 }
 
-/// Emulator-only execution (no hardware comparison).
+/// Emulator-only execution (no hardware comparison), parallel work-stealing.
 fn execute_emulator_only(
     cases: &[CompiledCase],
     max_cycles: u64,
     verbose: bool,
+    jobs: usize,
 ) -> (usize, usize, usize) {
     let total = cases.len();
-    let mut pass = 0usize;
-    let mut error = 0usize;
+    let pass = std::sync::atomic::AtomicUsize::new(0);
+    let error = std::sync::atomic::AtomicUsize::new(0);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done = std::sync::atomic::AtomicUsize::new(0);
 
-    for (i, case) in cases.iter().enumerate() {
-        let xclbin_path = case.case_dir.join("aie.xclbin");
-        match run_emulator(&xclbin_path, &case.params, max_cycles) {
-            Ok(output) if !output.is_empty() => {
-                pass += 1;
-                if verbose {
-                    println!("[{}/{}] seed {} emulator: {} bytes", i + 1, total, case.seed, output.len());
+    std::thread::scope(|s| {
+        for _ in 0..jobs {
+            let next = &next;
+            let done = &done;
+            let pass = &pass;
+            let error = &error;
+            s.spawn(move || {
+                loop {
+                    let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if idx >= total { break; }
+                    let case = &cases[idx];
+                    let xclbin_path = case.case_dir.join("aie.xclbin");
+                    match run_emulator(&xclbin_path, &case.params, max_cycles) {
+                        Ok((output, trace)) if !output.is_empty() => {
+                            pass.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if verbose {
+                                let trace_msg = trace.as_ref()
+                                    .map(|t| format!(", trace {} bytes", t.len()))
+                                    .unwrap_or_default();
+                                let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                println!("[{}/{}] seed {} emulator: {} bytes{}",
+                                    n, total, case.seed, output.len(), trace_msg);
+                                if let Some(ref trace_data) = trace {
+                                    let _ = std::fs::write(case.case_dir.join("emu_trace.bin"), trace_data);
+                                }
+                            } else {
+                                let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                let p = pass.load(std::sync::atomic::Ordering::Relaxed);
+                                let e = error.load(std::sync::atomic::Ordering::Relaxed);
+                                eprint!("\r[{}/{}] {} pass, {} error", n, total, p, e);
+                            }
+                        }
+                        Ok(_) => {
+                            error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            if verbose {
+                                eprintln!("[{}/{}] seed {} emulator produced empty output", n, total, case.seed);
+                            }
+                        }
+                        Err(e) => {
+                            error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            if verbose {
+                                eprintln!("[{}/{}] seed {} emulator error: {}", n, total, case.seed, e);
+                            }
+                        }
+                    }
                 }
-            }
-            Ok(_) => {
-                error += 1;
-                if verbose {
-                    eprintln!("[{}/{}] seed {} emulator produced empty output", i + 1, total, case.seed);
-                }
-            }
-            Err(e) => {
-                error += 1;
-                if verbose {
-                    eprintln!("[{}/{}] seed {} emulator error: {}", i + 1, total, case.seed, e);
-                }
-            }
+            });
         }
-        if !verbose {
-            print!("\r[{}/{}] {} pass, {} error", i + 1, total, pass, error);
-            std::io::stdout().flush().ok();
-        }
-    }
+    });
+
     if !verbose {
-        println!();
+        eprintln!();
     }
     // No fail category in emulator-only mode (only pass/error).
-    (pass, 0, error)
+    (pass.into_inner(), 0, error.into_inner())
 }
 
-/// Run a fuzz case on real NPU hardware and return raw output bytes.
+/// Run a fuzz case on real NPU hardware and return (output, trace) bytes.
 fn run_on_npu_raw(
     case: &CompiledCase,
     xclbin_path: &Path,
     insts_path: &Path,
-) -> Result<Vec<u8>, String> {
+) -> Result<(Vec<u8>, Option<Vec<u8>>), String> {
     use crate::testing::npu_runner;
     use crate::testing::test_cpp_parser::{
         BufferDef, BufferDir, BufferSpec, ElementType, InputPattern,
@@ -493,13 +547,24 @@ fn run_on_npu_raw(
                 direction: BufferDir::Output,
                 input_pattern: InputPattern::Zeros,
             },
+            BufferDef {
+                name: "buf_trace".to_string(),
+                group_id: 6,
+                size_elements: TRACE_BUFFER_ELEMENTS,
+                element_type: ElementType::I32,
+                direction: BufferDir::Output,
+                input_pattern: InputPattern::Zeros,
+            },
         ],
         multi_kernel: false,
     };
 
     let test_name = format!("fuzz_seed_{}", case.seed);
     match npu_runner::run_on_npu(&spec, &test_name, xclbin_path, insts_path, 30) {
-        Ok(result) => Ok(result.output),
+        Ok(result) => {
+            let trace = result.extra_outputs.get("buf_trace").cloned();
+            Ok((result.output, trace))
+        }
         Err(e) => Err(format!("{:?}", e)),
     }
 }
@@ -592,7 +657,7 @@ fn compile_fuzz_case(
             stderr.lines().take(10).collect::<Vec<_>>().join("\n")));
     }
 
-    // Step 2: Generate MLIR template
+    // Step 2: Generate MLIR template (always with trace instrumentation)
     let mut template_cmd = Command::new(&tools.python);
     template_cmd
         .arg(&tools.template_script)
@@ -600,7 +665,8 @@ fn compile_fuzz_case(
         .arg("--size").arg(params.buffer_size.to_string())
         .arg("--dtype").arg(dtype_str(params.dtype))
         .arg("--outdir").arg(case_dir)
-        .arg("--device").arg("npu1_1col");
+        .arg("--device").arg("npu1_1col")
+        .arg("--trace");
     tools.apply_env(&mut template_cmd);
 
     let template_out = template_cmd.output()
@@ -653,12 +719,12 @@ fn compile_fuzz_case(
 
 /// Run a compiled fuzz case through the emulator.
 ///
-/// Returns the raw output buffer bytes.
+/// Returns (output_bytes, binary_trace_bytes).
 fn run_emulator(
     xclbin_path: &Path,
     params: &FuzzParams,
     max_cycles: u64,
-) -> Result<Vec<u8>, String> {
+) -> Result<(Vec<u8>, Option<Vec<u8>>), String> {
     use crate::testing::test_cpp_parser::{
         BufferDef, BufferDir, BufferSpec, ElementType, InputPattern,
     };
@@ -671,6 +737,8 @@ fn run_emulator(
 
     // Build the same BufferSpec used for NPU execution so the emulator
     // allocates identically-sized buffers with the same input data.
+    // The 4th buffer (trace) receives binary trace data from the hardware
+    // trace units via stream switch -> shim DMA.
     let spec = BufferSpec {
         buffers: vec![
             BufferDef {
@@ -697,14 +765,23 @@ fn run_emulator(
                 direction: BufferDir::Output,
                 input_pattern: InputPattern::Zeros,
             },
+            BufferDef {
+                name: "buf_trace".to_string(),
+                group_id: 6,
+                size_elements: TRACE_BUFFER_ELEMENTS,
+                element_type: ElementType::I32,
+                direction: BufferDir::Output,
+                input_pattern: InputPattern::Zeros,
+            },
         ],
         multi_kernel: false,
     };
 
     let test = XclbinTest::from_path(xclbin_path).with_buffer_spec(spec);
     let suite = XclbinSuite::new().with_max_cycles(max_cycles);
-    let (_outcome, raw_output) = suite.run_single_with_output(&test);
-    raw_output.ok_or_else(|| "Emulator produced no output".into())
+    let (_outcome, raw_output, binary_trace) = suite.run_single_with_trace(&test);
+    let output = raw_output.ok_or_else(|| "Emulator produced no output".to_string())?;
+    Ok((output, binary_trace))
 }
 
 #[cfg(test)]
