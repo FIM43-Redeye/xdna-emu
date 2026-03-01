@@ -62,6 +62,7 @@
 
 pub mod addressing;
 pub mod bd;
+pub mod channel;
 pub mod stream_io;
 pub mod transfer;
 pub mod engine;
@@ -73,6 +74,7 @@ pub use bd::{BufferDescriptor, bd_base_address, bd_register_count, BD_SPACING};
 pub use stream_io::StreamWord;
 pub use transfer::{Transfer, TransferState, TransferDirection, TransferEndpoint, parse_source_tile_from_header};
 pub use engine::{DmaEngine, ChannelState, ChannelId, StreamData, TaskCompleteToken, ChannelTaskConfig, TaskQueueEntry, MAX_TASK_QUEUE_DEPTH, LockTarget, NeighborLocks};
+pub use channel::{ChannelFsm, ChannelContext, CompletionInfo};
 pub use timing::{DmaTimingConfig, ChannelTimingState, TransferPhase, ChannelArbiter};
 
 use super::tile::TileType;

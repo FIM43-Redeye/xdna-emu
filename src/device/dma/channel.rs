@@ -1,0 +1,470 @@
+//! Unified per-channel DMA state machine.
+//!
+//! This module defines `ChannelFsm` and `ChannelContext`, which together
+//! replace the triple-state-machine approach (ChannelState + TransferState +
+//! TransferPhase) with a single FSM per channel.
+//!
+//! `ChannelFsm` variants carry all phase-specific state inline. `ChannelContext`
+//! bundles the FSM with per-channel bookkeeping (task queue, repeat count,
+//! stats) that was previously spread across 11 parallel Vec<T> arrays in
+//! DmaEngine.
+
+use std::collections::VecDeque;
+use std::fmt;
+
+use super::engine::{ChannelStats, ChannelTaskConfig, TaskQueueEntry, MAX_TASK_QUEUE_DEPTH};
+use super::transfer::Transfer;
+
+/// Information carried from a completed transfer into the lock release phase.
+/// Extracted from Transfer so the Transfer can be dropped once data movement
+/// is done.
+#[derive(Debug, Clone)]
+pub struct CompletionInfo {
+    pub bd_index: u8,
+    pub next_bd: Option<u8>,
+    pub cycles_elapsed: u64,
+    pub channel: u8,
+}
+
+/// Unified per-channel DMA state machine.
+///
+/// Each variant represents one phase of the DMA channel lifecycle. The
+/// Transfer (when present) is boxed because it's ~200 bytes -- moving
+/// between variants is a pointer swap.
+///
+/// The key design property: `Transferring` has NO countdown timer. It
+/// checks `transfer.remaining_bytes() == 0` to know when data movement is
+/// complete. This eliminates the desync that existed between the old
+/// ChannelTimingState word counter and the Transfer byte counter.
+#[derive(Debug)]
+pub enum ChannelFsm {
+    /// No active transfer.
+    Idle,
+
+    /// Loading BD configuration.
+    /// Latency: DmaTimingConfig::bd_setup_cycles (default 4).
+    BdSetup {
+        cycles_remaining: u16,
+        transfer: Box<Transfer>,
+    },
+
+    /// Waiting to acquire lock before data movement.
+    /// Stalls if lock unavailable. Counts down lock_acquire_cycles once
+    /// available.
+    AcquiringLock {
+        lock_id: u8,
+        cycles_remaining: u16,
+        acquired: bool,
+        transfer: Box<Transfer>,
+    },
+
+    /// Memory pipeline warmup.
+    /// Latency: DmaTimingConfig::memory_latency_cycles (default 5).
+    MemoryLatency {
+        cycles_remaining: u16,
+        transfer: Box<Transfer>,
+    },
+
+    /// Actively moving data word by word.
+    /// Exits when transfer.remaining_bytes() == 0 or FoT TLAST received.
+    /// S2MM stalls transparently (stays in this state, no advancement).
+    Transferring {
+        transfer: Box<Transfer>,
+    },
+
+    /// Releasing lock after all data moved.
+    /// Latency: DmaTimingConfig::lock_release_cycles (default 1).
+    ReleasingLock {
+        lock_id: u8,
+        release_value: i8,
+        cycles_remaining: u16,
+        completion: CompletionInfo,
+    },
+
+    /// Transitioning between chained BDs.
+    /// Latency: DmaTimingConfig::bd_chain_cycles (default 2).
+    BdChaining {
+        cycles_remaining: u16,
+        next_bd: u8,
+    },
+
+    /// Channel paused by host. Resumes to saved state.
+    Paused {
+        saved: Box<ChannelFsm>,
+    },
+
+    /// Unrecoverable error.
+    Error,
+}
+
+impl Default for ChannelFsm {
+    fn default() -> Self {
+        ChannelFsm::Idle
+    }
+}
+
+impl ChannelFsm {
+    /// Short human-readable phase name for logging.
+    pub fn phase_name(&self) -> &'static str {
+        match self {
+            ChannelFsm::Idle => "Idle",
+            ChannelFsm::BdSetup { .. } => "BdSetup",
+            ChannelFsm::AcquiringLock { .. } => "AcquiringLock",
+            ChannelFsm::MemoryLatency { .. } => "MemoryLatency",
+            ChannelFsm::Transferring { .. } => "Transferring",
+            ChannelFsm::ReleasingLock { .. } => "ReleasingLock",
+            ChannelFsm::BdChaining { .. } => "BdChaining",
+            ChannelFsm::Paused { .. } => "Paused",
+            ChannelFsm::Error => "Error",
+        }
+    }
+
+    /// Whether this channel is doing work (not idle, not terminal).
+    pub fn is_active(&self) -> bool {
+        !matches!(self, ChannelFsm::Idle | ChannelFsm::Error | ChannelFsm::Paused { .. })
+    }
+
+    /// Access the in-flight Transfer, if the FSM is in a phase that has one.
+    pub fn transfer(&self) -> Option<&Transfer> {
+        match self {
+            ChannelFsm::BdSetup { transfer, .. }
+            | ChannelFsm::AcquiringLock { transfer, .. }
+            | ChannelFsm::MemoryLatency { transfer, .. }
+            | ChannelFsm::Transferring { transfer } => Some(transfer),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to the in-flight Transfer.
+    pub fn transfer_mut(&mut self) -> Option<&mut Transfer> {
+        match self {
+            ChannelFsm::BdSetup { transfer, .. }
+            | ChannelFsm::AcquiringLock { transfer, .. }
+            | ChannelFsm::MemoryLatency { transfer, .. }
+            | ChannelFsm::Transferring { transfer } => Some(transfer),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ChannelFsm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ChannelFsm::Idle => write!(f, "Idle"),
+            ChannelFsm::BdSetup { cycles_remaining, .. } =>
+                write!(f, "BdSetup(cycles={})", cycles_remaining),
+            ChannelFsm::AcquiringLock { lock_id, acquired, .. } =>
+                write!(f, "AcquiringLock(lock={}, acquired={})", lock_id, acquired),
+            ChannelFsm::MemoryLatency { cycles_remaining, .. } =>
+                write!(f, "MemoryLatency(cycles={})", cycles_remaining),
+            ChannelFsm::Transferring { transfer } =>
+                write!(f, "Transferring({} bytes remaining)", transfer.remaining_bytes()),
+            ChannelFsm::ReleasingLock { lock_id, cycles_remaining, .. } =>
+                write!(f, "ReleasingLock(lock={}, cycles={})", lock_id, cycles_remaining),
+            ChannelFsm::BdChaining { cycles_remaining, next_bd } =>
+                write!(f, "BdChaining(next_bd={}, cycles={})", next_bd, cycles_remaining),
+            ChannelFsm::Paused { saved } =>
+                write!(f, "Paused(was={})", saved.phase_name()),
+            ChannelFsm::Error => write!(f, "Error"),
+        }
+    }
+}
+
+/// All per-channel state in one struct.
+///
+/// Replaces the 11 parallel Vec<T> arrays that DmaEngine previously used
+/// for per-channel state.
+pub struct ChannelContext {
+    /// The unified state machine.
+    pub fsm: ChannelFsm,
+
+    /// Which channel index this is (0-based).
+    pub index: u8,
+
+    /// Currently active BD index.
+    pub current_bd: Option<u8>,
+
+    /// First BD in a chain (for repeat restart).
+    pub chain_start_bd: Option<u8>,
+
+    /// Next BD to load after current transfer completes (set by chaining).
+    pub queued_bd: Option<u8>,
+
+    /// Repeat count for current task.
+    pub repeat_count: u32,
+
+    /// Task queue (8-deep FIFO per AM025).
+    pub task_queue: VecDeque<TaskQueueEntry>,
+
+    /// Per-task configuration (token issue, FoT mode, compression).
+    pub task_config: ChannelTaskConfig,
+
+    /// Task queue overflow flag.
+    pub task_queue_overflow: bool,
+
+    /// BD unavailable error flag (out-of-order mode).
+    pub error_bd_unavailable: bool,
+
+    /// Performance counters.
+    pub stats: ChannelStats,
+}
+
+impl ChannelContext {
+    pub fn new(index: u8) -> Self {
+        Self {
+            fsm: ChannelFsm::Idle,
+            index,
+            current_bd: None,
+            chain_start_bd: None,
+            queued_bd: None,
+            repeat_count: 0,
+            task_queue: VecDeque::with_capacity(MAX_TASK_QUEUE_DEPTH),
+            task_config: ChannelTaskConfig::default(),
+            task_queue_overflow: false,
+            error_bd_unavailable: false,
+            stats: ChannelStats::default(),
+        }
+    }
+
+    /// Derive the public ChannelState from the FSM.
+    ///
+    /// Maps FSM variants to the current ChannelState enum, which includes
+    /// WaitingForLock and Complete variants. AcquiringLock maps to
+    /// WaitingForLock; all other active phases map to Active.
+    pub fn state(&self) -> super::ChannelState {
+        match &self.fsm {
+            ChannelFsm::Idle => super::ChannelState::Idle,
+            ChannelFsm::AcquiringLock { lock_id, .. } =>
+                super::ChannelState::WaitingForLock(*lock_id),
+            ChannelFsm::Paused { .. } => super::ChannelState::Paused,
+            ChannelFsm::Error => super::ChannelState::Error,
+            _ => super::ChannelState::Active,
+        }
+    }
+
+    /// Whether this channel has active work.
+    pub fn is_active(&self) -> bool {
+        self.fsm.is_active()
+    }
+
+    /// Whether this channel has any pending work (active or queued).
+    pub fn has_pending_work(&self) -> bool {
+        self.fsm.is_active() || self.queued_bd.is_some() || !self.task_queue.is_empty()
+    }
+
+    /// Access the in-flight Transfer, if any.
+    pub fn transfer(&self) -> Option<&Transfer> {
+        self.fsm.transfer()
+    }
+
+    /// One-call debug dump.
+    pub fn debug_string(&self, col: u8, row: u8) -> String {
+        format!("DMA({},{}) ch{}: fsm={}, bd={:?}, repeat={}, queue={}",
+            col, row, self.index, self.fsm, self.current_bd,
+            self.repeat_count, self.task_queue.len())
+    }
+
+    /// Reset to initial state.
+    pub fn reset(&mut self) {
+        self.fsm = ChannelFsm::Idle;
+        self.current_bd = None;
+        self.chain_start_bd = None;
+        self.queued_bd = None;
+        self.repeat_count = 0;
+        self.task_queue.clear();
+        self.task_config = ChannelTaskConfig::default();
+        self.task_queue_overflow = false;
+        self.error_bd_unavailable = false;
+        self.stats = ChannelStats::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fsm_default_is_idle() {
+        let fsm = ChannelFsm::default();
+        assert!(matches!(fsm, ChannelFsm::Idle));
+        assert_eq!(fsm.phase_name(), "Idle");
+    }
+
+    #[test]
+    fn test_fsm_phase_names() {
+        assert_eq!(ChannelFsm::Idle.phase_name(), "Idle");
+        assert_eq!(ChannelFsm::Error.phase_name(), "Error");
+        let fsm = ChannelFsm::BdChaining { cycles_remaining: 2, next_bd: 3 };
+        assert_eq!(fsm.phase_name(), "BdChaining");
+    }
+
+    #[test]
+    fn test_fsm_is_active() {
+        assert!(!ChannelFsm::Idle.is_active());
+        assert!(!ChannelFsm::Error.is_active());
+        let paused = ChannelFsm::Paused { saved: Box::new(ChannelFsm::Idle) };
+        assert!(!paused.is_active());
+
+        let chaining = ChannelFsm::BdChaining { cycles_remaining: 1, next_bd: 0 };
+        assert!(chaining.is_active());
+    }
+
+    #[test]
+    fn test_fsm_transfer_accessor_returns_none_for_non_transfer_states() {
+        assert!(ChannelFsm::Idle.transfer().is_none());
+        assert!(ChannelFsm::Error.transfer().is_none());
+        let chaining = ChannelFsm::BdChaining { cycles_remaining: 1, next_bd: 0 };
+        assert!(chaining.transfer().is_none());
+        let releasing = ChannelFsm::ReleasingLock {
+            lock_id: 0,
+            release_value: 1,
+            cycles_remaining: 1,
+            completion: CompletionInfo {
+                bd_index: 0,
+                next_bd: None,
+                cycles_elapsed: 0,
+                channel: 0,
+            },
+        };
+        assert!(releasing.transfer().is_none());
+    }
+
+    #[test]
+    fn test_fsm_display_idle() {
+        assert_eq!(format!("{}", ChannelFsm::Idle), "Idle");
+    }
+
+    #[test]
+    fn test_fsm_display_error() {
+        assert_eq!(format!("{}", ChannelFsm::Error), "Error");
+    }
+
+    #[test]
+    fn test_fsm_display_bd_chaining() {
+        let fsm = ChannelFsm::BdChaining { cycles_remaining: 2, next_bd: 5 };
+        assert_eq!(format!("{}", fsm), "BdChaining(next_bd=5, cycles=2)");
+    }
+
+    #[test]
+    fn test_fsm_display_releasing_lock() {
+        let fsm = ChannelFsm::ReleasingLock {
+            lock_id: 3,
+            release_value: -1,
+            cycles_remaining: 1,
+            completion: CompletionInfo {
+                bd_index: 0,
+                next_bd: None,
+                cycles_elapsed: 100,
+                channel: 0,
+            },
+        };
+        assert_eq!(format!("{}", fsm), "ReleasingLock(lock=3, cycles=1)");
+    }
+
+    #[test]
+    fn test_fsm_display_paused() {
+        let inner = ChannelFsm::BdChaining { cycles_remaining: 1, next_bd: 0 };
+        let fsm = ChannelFsm::Paused { saved: Box::new(inner) };
+        assert_eq!(format!("{}", fsm), "Paused(was=BdChaining)");
+    }
+
+    #[test]
+    fn test_channel_context_new() {
+        let ctx = ChannelContext::new(2);
+        assert_eq!(ctx.index, 2);
+        assert!(matches!(ctx.fsm, ChannelFsm::Idle));
+        assert!(ctx.current_bd.is_none());
+        assert!(ctx.chain_start_bd.is_none());
+        assert!(ctx.queued_bd.is_none());
+        assert_eq!(ctx.repeat_count, 0);
+        assert!(ctx.task_queue.is_empty());
+        assert!(!ctx.task_queue_overflow);
+        assert!(!ctx.error_bd_unavailable);
+    }
+
+    #[test]
+    fn test_channel_context_state_idle() {
+        let ctx = ChannelContext::new(0);
+        assert!(matches!(ctx.state(), super::super::ChannelState::Idle));
+    }
+
+    #[test]
+    fn test_channel_context_state_error() {
+        let mut ctx = ChannelContext::new(0);
+        ctx.fsm = ChannelFsm::Error;
+        assert!(matches!(ctx.state(), super::super::ChannelState::Error));
+    }
+
+    #[test]
+    fn test_channel_context_state_paused() {
+        let mut ctx = ChannelContext::new(0);
+        ctx.fsm = ChannelFsm::Paused { saved: Box::new(ChannelFsm::Idle) };
+        assert!(matches!(ctx.state(), super::super::ChannelState::Paused));
+    }
+
+    #[test]
+    fn test_channel_context_state_active_for_chaining() {
+        let mut ctx = ChannelContext::new(0);
+        ctx.fsm = ChannelFsm::BdChaining { cycles_remaining: 1, next_bd: 0 };
+        assert!(matches!(ctx.state(), super::super::ChannelState::Active));
+    }
+
+    #[test]
+    fn test_channel_context_is_active() {
+        let mut ctx = ChannelContext::new(0);
+        assert!(!ctx.is_active());
+        ctx.fsm = ChannelFsm::BdChaining { cycles_remaining: 1, next_bd: 0 };
+        assert!(ctx.is_active());
+    }
+
+    #[test]
+    fn test_channel_context_has_pending_work() {
+        let mut ctx = ChannelContext::new(0);
+        assert!(!ctx.has_pending_work());
+
+        ctx.queued_bd = Some(3);
+        assert!(ctx.has_pending_work());
+
+        ctx.queued_bd = None;
+        ctx.task_queue.push_back(TaskQueueEntry {
+            start_bd: 0,
+            repeat_count: 0,
+            enable_token_issue: false,
+            bd_snapshot: None,
+        });
+        assert!(ctx.has_pending_work());
+    }
+
+    #[test]
+    fn test_channel_context_reset() {
+        let mut ctx = ChannelContext::new(1);
+        ctx.fsm = ChannelFsm::Error;
+        ctx.current_bd = Some(5);
+        ctx.chain_start_bd = Some(5);
+        ctx.queued_bd = Some(6);
+        ctx.repeat_count = 10;
+        ctx.task_queue_overflow = true;
+        ctx.error_bd_unavailable = true;
+        ctx.stats.bytes_transferred = 1024;
+
+        ctx.reset();
+
+        assert!(matches!(ctx.fsm, ChannelFsm::Idle));
+        assert!(ctx.current_bd.is_none());
+        assert!(ctx.chain_start_bd.is_none());
+        assert!(ctx.queued_bd.is_none());
+        assert_eq!(ctx.repeat_count, 0);
+        assert!(ctx.task_queue.is_empty());
+        assert!(!ctx.task_queue_overflow);
+        assert!(!ctx.error_bd_unavailable);
+        assert_eq!(ctx.stats.bytes_transferred, 0);
+    }
+
+    #[test]
+    fn test_channel_context_debug_string() {
+        let ctx = ChannelContext::new(0);
+        let s = ctx.debug_string(1, 2);
+        assert!(s.contains("DMA(1,2) ch0"));
+        assert!(s.contains("Idle"));
+    }
+}
