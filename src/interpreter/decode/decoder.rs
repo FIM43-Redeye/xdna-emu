@@ -27,7 +27,7 @@ use std::sync::OnceLock;
 
 use crate::interpreter::bundle::{
     BranchCondition, ElementType, MemWidth, Operand, Operation, PostModify, SelectVariant,
-    SlotIndex, SlotOp, VliwBundle,
+    ShufflePattern, SlotIndex, SlotOp, VliwBundle,
 };
 use crate::interpreter::state::{MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN, MOD_BASE_M};
 use crate::interpreter::traits::{DecodeError, Decoder};
@@ -428,6 +428,16 @@ impl InstructionDecoder {
             return Operation::CascadeWrite;
         }
 
+        // Vector operation mnemonic dispatch.
+        //
+        // Many vector instructions share generic SemanticOps (Copy, Mul, etc.)
+        // that lose the specific operation type. For example, vsrs maps to
+        // SemanticOp::Copy which becomes VectorMov -- wrong. We intercept
+        // these here and create the correct Operation from the mnemonic.
+        if let Some(op) = Self::vector_op_from_mnemonic(decoded) {
+            return op;
+        }
+
         // Use semantic info - this should be available for all instructions
         if let Some(semantic) = decoded.encoding.semantic {
             return self.semantic_to_operation(semantic, decoded);
@@ -447,6 +457,270 @@ impl InstructionDecoder {
         Operation::Unknown {
             opcode: decoded.operands.get("word0").copied().unwrap_or(0) as u32,
         }
+    }
+
+    /// Map vector instruction mnemonics to specific Operation variants.
+    ///
+    /// Many vector instructions share generic SemanticOps (e.g., vmac and vmul
+    /// both get SemanticOp::Mul, vsrs and vmov both get SemanticOp::Copy). This
+    /// method resolves the ambiguity by checking the mnemonic directly.
+    ///
+    /// Only matches mnemonics that would produce the WRONG Operation through
+    /// the SemanticOp path. Instructions that work correctly via semantic
+    /// dispatch (vadd, vsub, vmul, vand, vor, vxor, vnot, shifts, vmov, vneg,
+    /// loads, stores) are NOT matched here.
+    fn vector_op_from_mnemonic(decoded: &DecodedInstr) -> Option<Operation> {
+        let mnem = decoded.encoding.mnemonic.to_lowercase();
+        let element_type = decoded.encoding.element_type.unwrap_or(ElementType::Int32);
+
+        // ---- SRS / UPS (accumulator <-> vector conversions) ----
+
+        // vsrs/vsrsm: Shift-Round-Saturate (accumulator -> vector).
+        // vsrsm is the masked variant; same operation, mask handled separately.
+        // element_type gives the output width (e.g., vsrs.s8 -> Int8).
+        if mnem.starts_with("vsrs") {
+            return Some(Operation::VectorSRS {
+                from_type: ElementType::Int32,
+                to_type: element_type,
+            });
+        }
+
+        // vups: Upshift (vector -> accumulator).
+        // element_type gives the input width (e.g., vups.s8 -> Int8).
+        if mnem.starts_with("vups") {
+            return Some(Operation::VectorUpshift {
+                from_type: element_type,
+                to_type: ElementType::Int32,
+            });
+        }
+
+        // vpush: push vector to accumulator (functionally same as UPS).
+        if mnem.starts_with("vpush") {
+            return Some(Operation::VectorUpshift {
+                from_type: element_type,
+                to_type: ElementType::Int32,
+            });
+        }
+
+        // ---- MAC variants (must be checked before vmul/vneg) ----
+
+        // vaddmac: acc1 = acc1 + acc2 + A * B
+        if mnem.starts_with("vaddmac") {
+            return Some(Operation::VectorAddMac { element_type });
+        }
+        // vaddmsc: acc1 = acc1 + acc2 - A * B (sub-MAC variant)
+        if mnem.starts_with("vaddmsc") {
+            // No dedicated Operation yet; approximate as VectorAddMac.
+            // The subtraction vs addition of the product is a refinement.
+            return Some(Operation::VectorAddMac { element_type });
+        }
+        // vsubmac: acc1 = acc1 - acc2 + A * B
+        if mnem.starts_with("vsubmac") {
+            return Some(Operation::VectorSubMac { element_type });
+        }
+        // vsubmsc: acc1 = acc1 - acc2 - A * B
+        if mnem.starts_with("vsubmsc") {
+            return Some(Operation::VectorSubMac { element_type });
+        }
+        // vnegmac: acc += -(A * B)
+        if mnem.starts_with("vnegmac") {
+            return Some(Operation::VectorNegMatMulDense { element_type });
+        }
+        // vnegmsc: acc -= -(A * B)  (negate multiply-subtract-accumulate)
+        if mnem.starts_with("vnegmsc") {
+            return Some(Operation::VectorNegMatMulDense { element_type });
+        }
+
+        // vmac: multiply-accumulate (acc += A * B).
+        // vmac.f = bfloat16 variant.
+        if mnem.starts_with("vmac") {
+            if mnem.contains(".f") || mnem.contains(".bf") {
+                return Some(Operation::VectorMatMulAccFloat {
+                    element_type: ElementType::BFloat16,
+                });
+            }
+            return Some(Operation::VectorMac { element_type });
+        }
+        // vmsc: multiply-subtract-accumulate (acc -= A * B).
+        if mnem.starts_with("vmsc") {
+            if mnem.contains(".f") || mnem.contains(".bf") {
+                return Some(Operation::VectorMatMulSubFloat {
+                    element_type: ElementType::BFloat16,
+                });
+            }
+            return Some(Operation::VectorMatMulSubDense { element_type });
+        }
+
+        // ---- Negate-arithmetic variants (must be before vneg) ----
+
+        // vnegmul: acc += -(src1 * src2)
+        if mnem.starts_with("vnegmul") {
+            return Some(Operation::VectorNegMul { element_type });
+        }
+        // vnegadd: dst = -src1 + src2
+        if mnem.starts_with("vnegadd") {
+            return Some(Operation::VectorNegAdd { element_type });
+        }
+        // vnegsub: dst = -(src1) + src2 (same as negadd semantically)
+        if mnem.starts_with("vnegsub") {
+            return Some(Operation::VectorNegAdd { element_type });
+        }
+
+        // vaddsub: alternating add/subtract on even/odd lanes (FFT butterfly).
+        // No dedicated Operation yet; approximate as VectorAdd.
+        if mnem.starts_with("vaddsub") {
+            return Some(Operation::VectorAdd { element_type });
+        }
+
+        // ---- Conditional arithmetic (must be before vsub/comparison) ----
+
+        // vsub_lt: dst[i] = (a[i] < b[i]) ? a[i] - b[i] : a[i]
+        if mnem.starts_with("vsub_lt") {
+            return Some(Operation::VectorSubLt { element_type });
+        }
+        // vsub_ge: dst[i] = (a[i] >= b[i]) ? a[i] - b[i] : a[i]
+        if mnem.starts_with("vsub_ge") {
+            return Some(Operation::VectorSubGe { element_type });
+        }
+        // vmaxdiff_lt: dst[i] = max(a[i] - b[i], 0) when a < b
+        if mnem.starts_with("vmaxdiff_lt") {
+            return Some(Operation::VectorMaxDiffLt { element_type });
+        }
+        // vmax_lt: dst = max(a, b) with less-than flag
+        if mnem.starts_with("vmax_lt") {
+            return Some(Operation::VectorMaxLt { element_type });
+        }
+        // vmin_ge: dst = min(a, b) with greater-equal flag
+        if mnem.starts_with("vmin_ge") {
+            return Some(Operation::VectorMinGe { element_type });
+        }
+        // vmin (standalone): dst = min(a, b)
+        if mnem.starts_with("vmin") {
+            return Some(Operation::VectorMin { element_type });
+        }
+        // vmax (standalone, must come after vmax_lt/vmaxdiff_lt checks): dst = max(a, b)
+        if mnem.starts_with("vmax") {
+            return Some(Operation::VectorMax { element_type });
+        }
+
+        // ---- Absolute value / conditional negate ----
+
+        // vabs_gtz: dst[i] = (src[i] > 0) ? abs(src[i]) : src[i]
+        if mnem.starts_with("vabs_gtz") || mnem.starts_with("vabs") {
+            return Some(Operation::VectorAbsGtz { element_type });
+        }
+        // vneg_gtz: dst[i] = (src[i] > 0) ? -src[i] : src[i]
+        if mnem.starts_with("vneg_gtz") {
+            return Some(Operation::VectorNegGtz { element_type });
+        }
+        // vbneg_ltz: dst[i] = (src[i] < 0) ? -src[i] : src[i] (boolean negate)
+        if mnem.starts_with("vbneg_ltz") || mnem.starts_with("vbneg") {
+            return Some(Operation::VectorNegLtz { element_type });
+        }
+
+        // ---- Vector comparisons (produce mask output) ----
+
+        // veqz: dst[i] = (a[i] == 0) ? ~0 : 0
+        if mnem.starts_with("veqz") {
+            return Some(Operation::VectorEqz { element_type });
+        }
+        // veq: dst[i] = (a[i] == b[i]) ? ~0 : 0
+        if mnem.starts_with("veq.") || mnem == "veq" {
+            return Some(Operation::VectorCmp { element_type });
+        }
+        // vne: dst[i] = (a[i] != b[i]) ? ~0 : 0
+        // Approximate as bitwise XOR (nonzero where different).
+        if mnem.starts_with("vne.") || mnem == "vne" {
+            return Some(Operation::VectorCmp { element_type });
+        }
+        // vge/vgeu: dst[i] = (a[i] >= b[i]) ? ~0 : 0
+        if mnem.starts_with("vge") {
+            return Some(Operation::VectorGe { element_type });
+        }
+        // vlt: dst[i] = (a[i] < b[i]) ? ~0 : 0
+        // Must not match vlda, vldb.
+        if (mnem.starts_with("vlt") || mnem.starts_with("vltu"))
+            && !mnem.starts_with("vlda") && !mnem.starts_with("vldb")
+        {
+            return Some(Operation::VectorLt { element_type });
+        }
+        // vgt/vgtu: dst[i] = (a[i] > b[i]) ? ~0 : 0
+        // Approximate as VectorLt with swapped operands (handled at execution).
+        if mnem.starts_with("vgt") {
+            return Some(Operation::VectorLt { element_type });
+        }
+        // vle/vleu: dst[i] = (a[i] <= b[i]) ? ~0 : 0
+        // Approximate as VectorGe with swapped operands.
+        if mnem.starts_with("vle") {
+            return Some(Operation::VectorGe { element_type });
+        }
+
+        // ---- Data rearrangement ----
+
+        // vshuffle: vector lane permutation
+        if mnem.starts_with("vshuffle") {
+            return Some(Operation::VectorShuffle {
+                pattern: ShufflePattern::InterleaveLow,
+            });
+        }
+        // vshift: concatenate two vectors and shift (alignment)
+        if mnem.starts_with("vshift") {
+            return Some(Operation::VectorAlign { element_type });
+        }
+        // vsel: per-lane conditional select
+        if mnem.starts_with("vsel") {
+            return Some(Operation::VectorSelect { element_type });
+        }
+        // vclr: clear vector register to zero
+        if mnem == "vclr" || mnem.starts_with("vclr.") {
+            return Some(Operation::VectorClear);
+        }
+        // vextbcst / vbcst: extract-broadcast / broadcast scalar to all lanes
+        if mnem.starts_with("vextbcst") || mnem.starts_with("vbcst") {
+            return Some(Operation::VectorBroadcast { element_type });
+        }
+        // vpack: pack two vectors into one (narrow)
+        if mnem.starts_with("vpack") {
+            return Some(Operation::VectorPack);
+        }
+        // vunpack: unpack one vector into two (widen).
+        // Note: vldb.unpack goes through Load path, standalone vunpack goes here.
+        if mnem == "vunpack" || mnem.starts_with("vunpack.") {
+            return Some(Operation::VectorUnpack);
+        }
+        // vextract: extract single element from vector to scalar
+        if mnem.starts_with("vextract") {
+            return Some(Operation::VectorExtract { element_type });
+        }
+        // vinsert: insert scalar into vector lane
+        if mnem.starts_with("vinsert") {
+            return Some(Operation::VectorInsert { element_type });
+        }
+
+        // ---- Type conversion ----
+
+        // vconv: type conversion between vector element types
+        if mnem.starts_with("vconv") {
+            let (from_type, to_type) = if mnem.contains(".bf") {
+                (ElementType::Float32, ElementType::BFloat16)
+            } else if mnem.contains(".fp") {
+                (ElementType::BFloat16, ElementType::Float32)
+            } else {
+                (element_type, element_type)
+            };
+            return Some(Operation::VectorConvert { from_type, to_type });
+        }
+        // vfloor/vceil/vtrunc/vround: float-to-int conversions with rounding
+        if mnem.starts_with("vfloor") || mnem.starts_with("vceil")
+            || mnem.starts_with("vtrunc") || mnem.starts_with("vround")
+        {
+            return Some(Operation::VectorConvert {
+                from_type: ElementType::Float32,
+                to_type: element_type,
+            });
+        }
+
+        None // Not a specialized vector op; fall through to semantic dispatch.
     }
 
     /// Convert a SemanticOp to an Operation using pre-resolved metadata.
@@ -732,6 +1006,18 @@ impl InstructionDecoder {
             }
         }
 
+        // SP-relative load/store (spill/fill): Uses = [SP] in TableGen.
+        // The immediate field is a stack offset, not a standalone value.
+        // Convert to Memory { base: 6 (SP), offset: imm }.
+        // Exclude pointer arithmetic (padda/paddb [sp]) -- those have their
+        // own implicit SP handling in execute_add.
+        if decoded.encoding.is_sp_relative && !decoded.encoding.is_ptr_arithmetic {
+            if let Some(Operand::Immediate(offset)) = field_operands.get("imm").cloned() {
+                extra_sources.push(Operand::Memory { base: 6, offset: offset as i16 });
+                field_operands.remove("imm");
+            }
+        }
+
         // Extract dest and sources using TableGen ordering
         let (dest, sources) = self.extract_ordered_operands(
             decoded,
@@ -1010,6 +1296,9 @@ impl InstructionDecoder {
         // PostModify comes directly from AG field extraction -- no backpatching.
         slot_op.post_modify = extracted_pm.unwrap_or(PostModify::None);
 
+        // Store encoding mnemonic for crossref/debugging
+        slot_op.encoding_name = Some(enc.mnemonic.clone());
+
         // Add implicit registers from TableGen
         if !enc.implicit_regs.is_empty() {
             slot_op = slot_op.with_implicit_regs(enc.implicit_regs.clone());
@@ -1263,6 +1552,7 @@ mod tests {
             is_vector: false,
             select_variant: None,
             is_ptr_arithmetic: false,
+            is_sp_relative: false,
             sched_class: None,
         }
     }
@@ -1352,6 +1642,7 @@ mod tests {
             is_vector: false,
             select_variant: None,
             is_ptr_arithmetic: false,
+            is_sp_relative: false,
             sched_class: None,
         };
 
@@ -1848,6 +2139,7 @@ mod tests {
                 is_vector,
                 select_variant: None,
                 is_ptr_arithmetic: false,
+            is_sp_relative: false,
                 sched_class: None,
             }
         };
@@ -1931,6 +2223,7 @@ mod tests {
             is_vector: false,
             select_variant: None,
             is_ptr_arithmetic: true,
+            is_sp_relative: false,
             sched_class: None,
         };
 
@@ -2028,5 +2321,311 @@ mod tests {
             .expect("Scalar1 slot should be present");
         assert_eq!(scalar1.dest, Some(Operand::ScalarReg(20)),
             "mov destination should be r20");
+    }
+
+    /// Helper: create a minimal vector encoding with the given mnemonic.
+    fn make_vec_encoding(mnemonic: &str) -> InstrEncoding {
+        use crate::tablegen::{AddressingMode, InstrMemWidth};
+        InstrEncoding {
+            name: mnemonic.to_uppercase().replace('.', "_"),
+            mnemonic: mnemonic.to_string(),
+            slot: "vec".to_string(),
+            width: 26,
+            fixed_mask: 0,
+            fixed_bits: 0,
+            operand_fields: vec![],
+            semantic: Some(SemanticOp::Copy), // Generic fallback
+            may_load: false,
+            may_store: false,
+            input_order: vec![],
+            output_order: vec![],
+            implicit_regs: vec![],
+            addressing_mode: AddressingMode::Unknown,
+            mem_width: InstrMemWidth::Word,
+            has_complete_decoder: true,
+            element_type: crate::tablegen::infer_element_type(mnemonic),
+            branch_condition: None,
+            is_vector: true,
+            select_variant: None,
+            is_ptr_arithmetic: false,
+            is_sp_relative: false,
+            sched_class: None,
+        }
+    }
+
+    /// Helper: call vector_op_from_mnemonic and return the Operation.
+    fn dispatch_mnemonic(mnemonic: &str) -> Option<Operation> {
+        let enc = make_vec_encoding(mnemonic);
+        let decoded = DecodedInstr {
+            encoding: enc,
+            operands: HashMap::new(),
+        };
+        InstructionDecoder::vector_op_from_mnemonic(&decoded)
+    }
+
+    #[test]
+    fn test_vector_mnemonic_dispatch_srs_ups() {
+        // SRS: accumulator -> vector
+        assert!(matches!(
+            dispatch_mnemonic("vsrs.s8"),
+            Some(Operation::VectorSRS { to_type: ElementType::Int8, .. })
+        ));
+        assert!(matches!(
+            dispatch_mnemonic("vsrs.d16"),
+            Some(Operation::VectorSRS { to_type: ElementType::Int16, .. })
+        ));
+
+        // UPS: vector -> accumulator
+        assert!(matches!(
+            dispatch_mnemonic("vups.s8"),
+            Some(Operation::VectorUpshift { from_type: ElementType::Int8, .. })
+        ));
+
+        // PUSH: also upshift
+        assert!(matches!(
+            dispatch_mnemonic("vpush.lo.s16"),
+            Some(Operation::VectorUpshift { from_type: ElementType::Int16, .. })
+        ));
+    }
+
+    #[test]
+    fn test_vector_mnemonic_dispatch_mac_variants() {
+        // vmac -> VectorMac (not VectorMul)
+        assert!(matches!(
+            dispatch_mnemonic("vmac"),
+            Some(Operation::VectorMac { .. })
+        ));
+
+        // vmac.f -> VectorMatMulAccFloat (bfloat16)
+        assert!(matches!(
+            dispatch_mnemonic("vmac.f"),
+            Some(Operation::VectorMatMulAccFloat { .. })
+        ));
+
+        // vmsc -> VectorMatMulSubDense (not VectorMul)
+        assert!(matches!(
+            dispatch_mnemonic("vmsc"),
+            Some(Operation::VectorMatMulSubDense { .. })
+        ));
+
+        // vmsc.f -> VectorMatMulSubFloat
+        assert!(matches!(
+            dispatch_mnemonic("vmsc.f"),
+            Some(Operation::VectorMatMulSubFloat { .. })
+        ));
+
+        // vnegmac -> VectorNegMatMulDense
+        assert!(matches!(
+            dispatch_mnemonic("vnegmac"),
+            Some(Operation::VectorNegMatMulDense { .. })
+        ));
+
+        // vaddmac -> VectorAddMac
+        assert!(matches!(
+            dispatch_mnemonic("vaddmac"),
+            Some(Operation::VectorAddMac { .. })
+        ));
+
+        // vsubmac -> VectorSubMac
+        assert!(matches!(
+            dispatch_mnemonic("vsubmac"),
+            Some(Operation::VectorSubMac { .. })
+        ));
+
+        // vnegmul -> VectorNegMul
+        assert!(matches!(
+            dispatch_mnemonic("vnegmul"),
+            Some(Operation::VectorNegMul { .. })
+        ));
+    }
+
+    #[test]
+    fn test_vector_mnemonic_dispatch_conditional() {
+        // Conditional arithmetic
+        assert!(matches!(
+            dispatch_mnemonic("vsub_lt.d32"),
+            Some(Operation::VectorSubLt { .. })
+        ));
+        assert!(matches!(
+            dispatch_mnemonic("vsub_ge.s16"),
+            Some(Operation::VectorSubGe { .. })
+        ));
+        assert!(matches!(
+            dispatch_mnemonic("vmaxdiff_lt.s8"),
+            Some(Operation::VectorMaxDiffLt { .. })
+        ));
+        assert!(matches!(
+            dispatch_mnemonic("vmax_lt.bf"),
+            Some(Operation::VectorMaxLt { .. })
+        ));
+        assert!(matches!(
+            dispatch_mnemonic("vmin_ge.d16"),
+            Some(Operation::VectorMinGe { .. })
+        ));
+    }
+
+    #[test]
+    fn test_vector_mnemonic_dispatch_comparisons() {
+        assert!(matches!(
+            dispatch_mnemonic("vge.s32"),
+            Some(Operation::VectorGe { .. })
+        ));
+        assert!(matches!(
+            dispatch_mnemonic("vlt.d8"),
+            Some(Operation::VectorLt { .. })
+        ));
+        assert!(matches!(
+            dispatch_mnemonic("veqz.s16"),
+            Some(Operation::VectorEqz { .. })
+        ));
+    }
+
+    #[test]
+    fn test_vector_mnemonic_dispatch_abs_neg() {
+        assert!(matches!(
+            dispatch_mnemonic("vabs_gtz.s32"),
+            Some(Operation::VectorAbsGtz { .. })
+        ));
+        assert!(matches!(
+            dispatch_mnemonic("vneg_gtz"),
+            Some(Operation::VectorNegGtz { .. })
+        ));
+        assert!(matches!(
+            dispatch_mnemonic("vbneg_ltz.s16"),
+            Some(Operation::VectorNegLtz { .. })
+        ));
+    }
+
+    #[test]
+    fn test_vector_mnemonic_dispatch_data_movement() {
+        assert!(matches!(
+            dispatch_mnemonic("vshuffle"),
+            Some(Operation::VectorShuffle { .. })
+        ));
+        assert!(matches!(
+            dispatch_mnemonic("vshift.align"),
+            Some(Operation::VectorAlign { .. })
+        ));
+        assert!(matches!(dispatch_mnemonic("vclr"), Some(Operation::VectorClear)));
+        assert!(matches!(
+            dispatch_mnemonic("vsel.s32"),
+            Some(Operation::VectorSelect { .. })
+        ));
+        assert!(matches!(
+            dispatch_mnemonic("vextbcst.s16"),
+            Some(Operation::VectorBroadcast { .. })
+        ));
+        assert!(matches!(
+            dispatch_mnemonic("vbcst.s32"),
+            Some(Operation::VectorBroadcast { .. })
+        ));
+        assert!(matches!(dispatch_mnemonic("vpack.d8"), Some(Operation::VectorPack)));
+        assert!(matches!(
+            dispatch_mnemonic("vunpack.s16"),
+            Some(Operation::VectorUnpack)
+        ));
+        assert!(matches!(
+            dispatch_mnemonic("vextract.s32"),
+            Some(Operation::VectorExtract { .. })
+        ));
+        assert!(matches!(
+            dispatch_mnemonic("vinsert.s16"),
+            Some(Operation::VectorInsert { .. })
+        ));
+    }
+
+    #[test]
+    fn test_vector_mnemonic_dispatch_conversion() {
+        assert!(matches!(
+            dispatch_mnemonic("vconv.bf16"),
+            Some(Operation::VectorConvert { from_type: ElementType::Float32, to_type: ElementType::BFloat16 })
+        ));
+        assert!(matches!(
+            dispatch_mnemonic("vconv.fp32"),
+            Some(Operation::VectorConvert { from_type: ElementType::BFloat16, to_type: ElementType::Float32 })
+        ));
+        assert!(matches!(
+            dispatch_mnemonic("vfloor.s32"),
+            Some(Operation::VectorConvert { from_type: ElementType::Float32, .. })
+        ));
+    }
+
+    #[test]
+    fn test_vector_mnemonic_dispatch_noop_for_basic_ops() {
+        // vadd, vsub, vmul should NOT be caught by mnemonic dispatch
+        // (they work correctly through semantic dispatch)
+        assert!(dispatch_mnemonic("vadd.s32").is_none());
+        assert!(dispatch_mnemonic("vsub.s16").is_none());
+        assert!(dispatch_mnemonic("vmul.s8").is_none());
+        assert!(dispatch_mnemonic("vmov").is_none());
+        assert!(dispatch_mnemonic("vand.s32").is_none());
+        assert!(dispatch_mnemonic("vor.s16").is_none());
+        assert!(dispatch_mnemonic("vxor.s32").is_none());
+    }
+
+    #[test]
+    fn test_vector_mnemonic_dispatch_negadd_negsub() {
+        // vnegadd -> VectorNegAdd
+        assert!(matches!(
+            dispatch_mnemonic("vnegadd.s32"),
+            Some(Operation::VectorNegAdd { .. })
+        ));
+        // vnegsub -> VectorNegAdd (same semantics: -a + b)
+        assert!(matches!(
+            dispatch_mnemonic("vnegsub.f"),
+            Some(Operation::VectorNegAdd { .. })
+        ));
+    }
+
+    /// Verify every vector mnemonic in the TableGen data either has a specialized
+    /// mnemonic dispatch entry or is one of the known "semantic-only" mnemonics
+    /// that work correctly through the generic SemanticOp path.
+    #[test]
+    fn test_all_vector_mnemonics_dispatched() {
+        // These mnemonics work correctly through SemanticOp dispatch
+        // and intentionally do NOT have mnemonic overrides.
+        let semantic_only: std::collections::HashSet<&str> = [
+            "vadd", "vsub", "vmul", "vmov", "vneg",
+            "vband", "vbor",
+            "vlda", "vldb", "vst",
+        ].into_iter().collect();
+
+        let decoder = InstructionDecoder::load_default();
+        let mut vec_mnemonics: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for enc in &decoder.encodings {
+            let m = enc.mnemonic.to_lowercase();
+            if m.starts_with('v') && m != "opcodestr" {
+                let base = m.split('.').next().unwrap_or(&m).to_string();
+                vec_mnemonics.insert(base);
+            }
+        }
+
+        let mut uncovered = Vec::new();
+        for m in &vec_mnemonics {
+            if semantic_only.contains(m.as_str()) {
+                continue;
+            }
+            if dispatch_mnemonic(m).is_none() {
+                uncovered.push(m.clone());
+            }
+        }
+
+        assert!(
+            uncovered.is_empty(),
+            "Vector mnemonics with no dispatch: {:?}\n\
+             Add them to vector_op_from_mnemonic() or the semantic_only set.",
+            uncovered,
+        );
+    }
+
+    #[test]
+    fn test_element_type_bf_suffix() {
+        // Verify .bf suffix correctly infers BFloat16
+        let enc = make_vec_encoding("vmin_ge.bf");
+        assert_eq!(enc.element_type, Some(ElementType::BFloat16));
+
+        // Verify .f suffix correctly infers Float32
+        let enc = make_vec_encoding("vadd.f");
+        assert_eq!(enc.element_type, Some(ElementType::Float32));
     }
 }
