@@ -1,25 +1,12 @@
-//! DMA transfer state machine.
+//! DMA transfer data carrier.
 //!
-//! A transfer represents an active DMA operation from a single buffer
+//! A `Transfer` represents an active DMA operation from a single buffer
 //! descriptor. It tracks the current position, handles multi-dimensional
-//! addressing, and manages the transfer lifecycle.
+//! addressing, and provides data queries for the channel FSM.
 //!
-//! # Transfer Lifecycle
-//!
-//! ```text
-//! ┌─────────┐   lock    ┌───────────────┐   lock    ┌──────────┐
-//! │ Created ├──acquire──► WaitingForLock├──acquired─► Active   │
-//! └─────────┘           └───────────────┘           └────┬─────┘
-//!                                                        │
-//!                        ┌───────────────┐   all data   │
-//!                        │   Complete    ◄──transferred─┘
-//!                        └───────┬───────┘
-//!                                │ lock release
-//!                                ▼
-//!                        ┌───────────────┐
-//!                        │   Finished    │
-//!                        └───────────────┘
-//! ```
+//! State transitions (lock acquire/release, completion) are managed by the
+//! `ChannelFsm` in `channel.rs` -- Transfer is a pure data carrier that
+//! only advances its internal counters and address generator.
 //!
 //! # Data Flow
 //!
@@ -419,9 +406,6 @@ pub struct Transfer {
     /// Transfer direction
     pub direction: TransferDirection,
 
-    /// Current state
-    pub state: TransferState,
-
     /// Address generator for multi-dimensional addressing
     pub address_gen: AddressGenerator,
 
@@ -577,17 +561,10 @@ impl Transfer {
             ),
         };
 
-        let initial_state = if bd_config.acquire_lock.is_some() {
-            TransferState::WaitingForLock(bd_config.acquire_lock.unwrap())
-        } else {
-            TransferState::Active
-        };
-
         Ok(Self {
             source,
             dest,
             direction,
-            state: initial_state,
             address_gen,
             bd_index,
             channel,
@@ -627,7 +604,6 @@ impl Transfer {
             source: TransferEndpoint::TileMemory { col: source_col, row: source_row },
             dest: TransferEndpoint::TileMemory { col: dest_col, row: dest_row },
             direction: TransferDirection::MM2S, // Arbitrary for mem-to-mem
-            state: TransferState::Active,
             address_gen,
             bd_index: 0,
             channel: 0,
@@ -667,7 +643,6 @@ impl Transfer {
             source: TransferEndpoint::HostMemory,
             dest: TransferEndpoint::TileMemory { col: tile_col, row: tile_row },
             direction: TransferDirection::S2MM,
-            state: TransferState::Active,
             address_gen,
             bd_index: 0,
             channel: 0,
@@ -707,7 +682,6 @@ impl Transfer {
             source: TransferEndpoint::TileMemory { col: tile_col, row: tile_row },
             dest: TransferEndpoint::HostMemory,
             direction: TransferDirection::MM2S,
-            state: TransferState::Active,
             address_gen,
             bd_index: 0,
             channel: 0,
@@ -732,46 +706,12 @@ impl Transfer {
         }
     }
 
-    /// Check if transfer is complete.
-    #[inline]
-    pub fn is_complete(&self) -> bool {
-        matches!(self.state, TransferState::Complete)
-    }
-
-    /// Check if transfer is actively moving data.
-    #[inline]
-    pub fn is_active(&self) -> bool {
-        matches!(self.state, TransferState::Active)
-    }
-
-    /// Check if transfer needs processing (timing ticks).
-    ///
-    /// Returns true for states that require the timing state machine to advance:
-    /// - `Active`: Data transfer phase
-    /// - `ReleasingLock`: Lock release phase
-    #[inline]
-    pub fn needs_processing(&self) -> bool {
-        matches!(self.state, TransferState::Active | TransferState::ReleasingLock(_))
-    }
-
-    /// Check if transfer is waiting for a lock.
-    #[inline]
-    pub fn is_waiting_for_lock(&self) -> bool {
-        matches!(self.state, TransferState::WaitingForLock(_))
-    }
-
     /// Get the lock acquisition mode, if a lock is configured.
     ///
     /// Returns `None` if no acquire lock is configured, otherwise returns
     /// the [`LockAcquireMode`] based on the BD's `acquire_value` convention.
     pub fn acquire_mode(&self) -> Option<LockAcquireMode> {
         self.acquire_lock.map(|_| LockAcquireMode::from_bd_value(self.acquire_value))
-    }
-
-    /// Check if transfer has an error.
-    #[inline]
-    pub fn has_error(&self) -> bool {
-        matches!(self.state, TransferState::Error)
     }
 
     /// Get current address for the transfer.
@@ -814,20 +754,16 @@ impl Transfer {
         self.total_bytes.saturating_sub(self.bytes_transferred)
     }
 
-    /// Notify that lock was acquired.
-    pub fn lock_acquired(&mut self) {
-        if let TransferState::WaitingForLock(_) = self.state {
-            self.state = TransferState::Active;
-        }
-    }
-
-    /// Notify that output was produced (data or padding).
+    /// Advance the transfer by the given number of bytes.
     ///
-    /// When zero-padding is active, the padding state machine determines
-    /// whether each output word advances the address generator (data) or
-    /// not (padding zeros). The caller should use `next_output_action()`
-    /// to determine what each word should be before calling this.
-    pub fn data_transferred(&mut self, bytes: u64) {
+    /// Updates `bytes_transferred`, advances the address generator, and
+    /// steps the zero-padding state machine if active. Does NOT perform
+    /// any state transitions -- that responsibility belongs to the
+    /// channel FSM.
+    ///
+    /// The caller should use `next_output_action()` to determine what
+    /// each word should be before calling this.
+    pub fn advance(&mut self, bytes: u64) {
         self.bytes_transferred += bytes;
 
         let words = (bytes / 4) as usize;
@@ -852,28 +788,11 @@ impl Transfer {
                 }
             }
         }
-
-        // Check if transfer is complete
-        if self.bytes_transferred >= self.total_bytes {
-            if let Some(lock) = self.release_lock {
-                self.state = TransferState::ReleasingLock(lock);
-            } else {
-                self.state = TransferState::Complete;
-            }
-        }
     }
 
-    /// Notify that lock was released.
-    pub fn lock_released(&mut self) {
-        if let TransferState::ReleasingLock(_) = self.state {
-            self.state = TransferState::Complete;
-        }
-    }
-
-    /// Mark transfer as failed.
+    /// Record an error on this transfer.
     pub fn set_error(&mut self, error: DmaError) {
         self.error = Some(error);
-        self.state = TransferState::Error;
     }
 
     /// Increment cycle counter.
@@ -959,7 +878,7 @@ mod tests {
         assert_eq!(transfer.bd_index, 0);
         assert_eq!(transfer.channel, 0);
         assert_eq!(transfer.total_bytes, 256);
-        assert!(transfer.is_active());
+        assert_eq!(transfer.remaining_bytes(), 256);
     }
 
     #[test]
@@ -978,32 +897,27 @@ mod tests {
         bd.acquire_value = 1;
 
         let transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
-        assert!(transfer.is_waiting_for_lock());
-        assert!(matches!(transfer.state, TransferState::WaitingForLock(5)));
+        assert_eq!(transfer.acquire_lock, Some(5));
+        assert_eq!(transfer.acquire_value, 1);
+        assert_eq!(transfer.acquire_mode(), Some(LockAcquireMode::Equal(1)));
     }
 
     #[test]
-    fn test_transfer_lifecycle() {
+    fn test_transfer_advance_to_completion() {
         let mut bd = simple_bd();
         bd.acquire_lock = Some(5);
         bd.release_lock = Some(5);
 
         let mut transfer = Transfer::new(&bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute).unwrap();
 
-        // Initially waiting for lock
-        assert!(transfer.is_waiting_for_lock());
+        // Lock config is stored on the transfer
+        assert_eq!(transfer.acquire_lock, Some(5));
+        assert_eq!(transfer.release_lock, Some(5));
 
-        // Acquire lock
-        transfer.lock_acquired();
-        assert!(transfer.is_active());
-
-        // Transfer data
-        transfer.data_transferred(256);
-        assert!(matches!(transfer.state, TransferState::ReleasingLock(5)));
-
-        // Release lock
-        transfer.lock_released();
-        assert!(transfer.is_complete());
+        // Advance all data
+        transfer.advance(256);
+        assert_eq!(transfer.remaining_bytes(), 0);
+        assert_eq!(transfer.bytes_transferred, 256);
     }
 
     #[test]
@@ -1013,10 +927,10 @@ mod tests {
 
         assert_eq!(transfer.progress(), 0.0);
 
-        transfer.data_transferred(128);
+        transfer.advance(128);
         assert_eq!(transfer.progress(), 0.5);
 
-        transfer.data_transferred(128);
+        transfer.advance(128);
         assert_eq!(transfer.progress(), 1.0);
     }
 
@@ -1027,7 +941,7 @@ mod tests {
 
         assert_eq!(transfer.remaining_bytes(), 256);
 
-        transfer.data_transferred(100);
+        transfer.advance(100);
         assert_eq!(transfer.remaining_bytes(), 156);
     }
 
@@ -1074,8 +988,8 @@ mod tests {
 
         transfer.set_error(DmaError::AddressOutOfBounds { address: 0xFFFF, limit: 0x1000 });
 
-        assert!(transfer.has_error());
-        assert!(matches!(transfer.state, TransferState::Error));
+        assert!(transfer.error.is_some());
+        assert!(matches!(transfer.error, Some(DmaError::AddressOutOfBounds { .. })));
     }
 
     #[test]

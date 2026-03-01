@@ -174,6 +174,7 @@ impl fmt::Display for ChannelFsm {
 ///
 /// Replaces the 11 parallel Vec<T> arrays that DmaEngine previously used
 /// for per-channel state.
+#[derive(Debug)]
 pub struct ChannelContext {
     /// The unified state machine.
     pub fsm: ChannelFsm,
@@ -234,8 +235,13 @@ impl ChannelContext {
     pub fn state(&self) -> super::ChannelState {
         match &self.fsm {
             ChannelFsm::Idle => super::ChannelState::Idle,
-            ChannelFsm::AcquiringLock { lock_id, .. } =>
-                super::ChannelState::WaitingForLock(*lock_id),
+            ChannelFsm::AcquiringLock { lock_id, acquired, .. } => {
+                if *acquired {
+                    super::ChannelState::Active
+                } else {
+                    super::ChannelState::WaitingForLock(*lock_id)
+                }
+            }
             ChannelFsm::Paused { .. } => super::ChannelState::Paused,
             ChannelFsm::Error => super::ChannelState::Error,
             _ => super::ChannelState::Active,

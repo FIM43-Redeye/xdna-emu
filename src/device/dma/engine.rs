@@ -40,8 +40,9 @@ use super::{
     MEM_TILE_S2MM_CHANNELS, MEM_TILE_MM2S_CHANNELS,
 };
 use super::compression;
-use super::transfer::{Transfer, TransferDirection, TransferEndpoint, TransferState, PadAction};
-use super::timing::{DmaTimingConfig, ChannelTimingState, TransferPhase};
+use super::transfer::{Transfer, TransferDirection, TransferEndpoint, PadAction};
+use super::channel::{ChannelFsm, ChannelContext, CompletionInfo};
+use super::timing::DmaTimingConfig;
 use crate::device::host_memory::HostMemory;
 use crate::device::tile::{Tile, TileType};
 use crate::interpreter::state::EventType;
@@ -227,6 +228,18 @@ pub struct ChannelStats {
     pub lock_wait_cycles: u64,
 }
 
+/// Result of one cycle of data transfer within the Transferring FSM state.
+enum TransferCycleResult {
+    /// Data moved successfully (or nothing to do this cycle)
+    Continue,
+    /// S2MM stalled waiting for stream data
+    Stalled,
+    /// FoT TLAST received, finish early
+    FotFinish,
+    /// Transfer error (bad address, etc.)
+    Error,
+}
+
 /// DMA engine for a single tile.
 #[derive(Debug)]
 pub struct DmaEngine {
@@ -242,37 +255,12 @@ pub struct DmaEngine {
     /// Buffer descriptor configurations
     bd_configs: Vec<BdConfig>,
 
-    /// Active transfer per channel (None if idle)
-    transfers: Vec<Option<Transfer>>,
-
-    /// Channel states
-    channel_states: Vec<ChannelState>,
-
-    /// Per-channel statistics
-    channel_stats: Vec<ChannelStats>,
-
-    /// Queued BD per channel (for chaining)
-    queued_bds: Vec<Option<u8>>,
-
-    /// Repeat count per channel (how many more times to repeat current BD)
-    /// Value N means run the BD N+1 more times after current
-    repeat_counts: Vec<u8>,
-
-    /// Current BD index per channel (for status register readback)
-    current_bds: Vec<Option<u8>>,
-
-    /// Start BD of the current task's chain per channel (for repeat restart).
-    /// When a BD chain with repeat completes its last BD, the repeat should
-    /// restart from the chain's FIRST BD, not the last one. `current_bds`
-    /// gets overwritten as each chained BD starts, so this separate field
-    /// preserves the chain origin.
-    chain_start_bds: Vec<Option<u8>>,
+    /// Per-channel state (FSM, task queue, stats, BD tracking).
+    /// Replaces 12 parallel Vec<T> fields with one struct per channel.
+    channels: Vec<ChannelContext>,
 
     /// Timing configuration (controls cycle-accuracy vs fast mode)
     timing_config: DmaTimingConfig,
-
-    /// Per-channel timing state (only used when timing is enabled)
-    timing_states: Vec<ChannelTimingState>,
 
     /// Stream output buffer (MM2S channels produce data here).
     /// Data is read from tile memory and queued for the stream router.
@@ -285,21 +273,6 @@ pub struct DmaEngine {
     /// Task complete token output buffer.
     /// Tokens are emitted when tasks complete with Enable_Token_Issue set.
     task_tokens: VecDeque<TaskCompleteToken>,
-
-    /// Per-channel task configuration (set from Start_Queue and channel control).
-    channel_task_configs: Vec<ChannelTaskConfig>,
-
-    /// Task queues per channel (8-deep FIFO per AM025).
-    /// Tasks are enqueued via Start_Queue and processed in order.
-    task_queues: Vec<VecDeque<TaskQueueEntry>>,
-
-    /// Task queue overflow flags per channel (sticky bit, write-to-clear).
-    /// Set when attempting to enqueue to a full queue.
-    task_queue_overflow: Vec<bool>,
-
-    /// Error: BD unavailable flags per channel (sticky bit, write-to-clear).
-    /// Set in OOO mode when S2MM tries to load an invalid BD ID from packet header.
-    error_bd_unavailable: Vec<bool>,
 
     /// Lock timing state for contention tracking (optional).
     /// When enabled, tracks detailed lock acquire/release timing per lock.
@@ -335,48 +308,27 @@ impl DmaEngine {
     /// (ArchConfig) rather than compile-time constants. The caller is
     /// responsible for providing the correct values for the tile type.
     pub fn new(col: u8, row: u8, tile_type: TileType, num_channels: usize, num_bds: usize, num_locks: u8) -> Self {
-        let mut transfers = Vec::with_capacity(num_channels);
-        for _ in 0..num_channels {
-            transfers.push(None);
-        }
-
         log::debug!("DmaEngine::new col={} row={} tile_type={:?} num_channels={} num_bds={} num_locks={}",
             col, row, tile_type, num_channels, num_bds, num_locks);
+
+        let channels = (0..num_channels)
+            .map(|i| ChannelContext::new(i as u8))
+            .collect();
 
         Self {
             col,
             row,
             tile_type,
             bd_configs: vec![BdConfig::default(); num_bds],
-            transfers,
-            channel_states: vec![ChannelState::Idle; num_channels],
-            channel_stats: vec![ChannelStats::default(); num_channels],
-            queued_bds: vec![None; num_channels],
-            repeat_counts: vec![0; num_channels],
-            current_bds: vec![None; num_channels],
-            chain_start_bds: vec![None; num_channels],
-            // Cycle-accurate timing is the default and only mode
+            channels,
             timing_config: DmaTimingConfig::from_aie2_spec(),
-            timing_states: vec![ChannelTimingState::default(); num_channels],
-            // Stream buffers with reasonable capacity
             stream_out: VecDeque::with_capacity(16),
             stream_in: VecDeque::with_capacity(16),
-            // Task tokens and per-channel task config
             task_tokens: VecDeque::with_capacity(4),
-            channel_task_configs: vec![ChannelTaskConfig::default(); num_channels],
-            // Task queues (8-deep per channel)
-            task_queues: (0..num_channels).map(|_| VecDeque::with_capacity(MAX_TASK_QUEUE_DEPTH)).collect(),
-            task_queue_overflow: vec![false; num_channels],
-            // Error tracking per channel
-            error_bd_unavailable: vec![false; num_channels],
-            // Lock timing disabled by default
             lock_timing: None,
-            // Trace event buffer
             current_cycle: 0,
             trace_events: Vec::new(),
-            // Lock count for cross-tile addressing
             num_locks,
-            // Bank conflict tracking
             num_banks: match tile_type {
                 TileType::Compute => crate::device::aie2_spec::COMPUTE_TILE_MEMORY_BANKS,
                 TileType::MemTile => crate::device::aie2_spec::MEMTILE_MEMORY_BANKS,
@@ -466,7 +418,7 @@ impl DmaEngine {
 
     /// Get the number of channels.
     pub fn num_channels(&self) -> usize {
-        self.transfers.len()
+        self.channels.len()
     }
 
     /// Get the DMA channel status field layout for this engine's tile type.
@@ -562,7 +514,7 @@ impl DmaEngine {
     /// Start a channel with the specified BD.
     pub fn start_channel(&mut self, channel: ChannelId, bd_index: u8) -> Result<(), DmaError> {
         self.start_channel_with_repeat(channel, bd_index, 0)?;
-        self.chain_start_bds[channel as usize] = Some(bd_index);
+        self.channels[channel as usize].chain_start_bd = Some(bd_index);
         Ok(())
     }
 
@@ -588,7 +540,7 @@ impl DmaEngine {
         }
 
         // Check if channel is already busy
-        if matches!(self.channel_states[ch_idx], ChannelState::Active | ChannelState::WaitingForLock(_)) {
+        if self.channels[ch_idx].is_active() {
             return Err(DmaError::ChannelBusy(channel));
         }
 
@@ -603,35 +555,35 @@ impl DmaEngine {
         // Create transfer
         let transfer = Transfer::new(bd_config, bd_index, channel, direction, self.col, self.row, self.tile_type)?;
 
-        // Initialize timing state for cycle-accurate execution
-        self.timing_states[ch_idx] = ChannelTimingState::new_transfer(
-            bd_config.length as u64,
-            &self.timing_config,
-        );
-
-        // Update state based on transfer state
-        let new_state = match transfer.state {
-            TransferState::WaitingForLock(lock) => ChannelState::WaitingForLock(lock),
-            TransferState::Active => ChannelState::Active,
-            _ => ChannelState::Idle,
-        };
-
-        // Log transfer details for debugging
-        log::debug!("DMA tile({},{}) ch{} transfer: total_bytes={} src={:?} dst={:?} state={:?}",
+        log::debug!("DMA tile({},{}) ch{} transfer: total_bytes={} src={:?} dst={:?}",
             self.col, self.row, channel,
-            transfer.total_bytes, transfer.source, transfer.dest, transfer.state);
+            transfer.total_bytes, transfer.source, transfer.dest);
 
-        self.transfers[ch_idx] = Some(transfer);
-        self.channel_states[ch_idx] = new_state;
-        self.repeat_counts[ch_idx] = repeat_count;
-        self.current_bds[ch_idx] = Some(bd_index);
+        // Determine initial FSM state based on whether lock acquisition is needed
+        let ch = &mut self.channels[ch_idx];
+        ch.current_bd = Some(bd_index);
+        ch.repeat_count = repeat_count as u32;
+
+        if transfer.acquire_lock.is_some() {
+            let lock_id = transfer.acquire_lock.unwrap();
+            ch.fsm = ChannelFsm::AcquiringLock {
+                lock_id,
+                cycles_remaining: self.timing_config.lock_acquire_cycles as u16,
+                acquired: false,
+                transfer: Box::new(transfer),
+            };
+        } else {
+            ch.fsm = ChannelFsm::BdSetup {
+                cycles_remaining: self.timing_config.bd_setup_cycles as u16,
+                transfer: Box::new(transfer),
+            };
+        }
 
         if repeat_count > 0 {
             log::info!("DMA tile({},{}) ch{} started BD {} with repeat_count={}",
                 self.col, self.row, channel, bd_index, repeat_count);
         }
 
-        // Emit DMA_START_TASK trace event
         self.trace(EventType::DmaStartTask { channel });
 
         Ok(())
@@ -645,10 +597,10 @@ impl DmaEngine {
             return Err(DmaError::InvalidChannel(channel));
         }
 
-        self.transfers[ch_idx] = None;
-        self.channel_states[ch_idx] = ChannelState::Idle;
-        self.queued_bds[ch_idx] = None;
-        self.chain_start_bds[ch_idx] = None;
+        let ch = &mut self.channels[ch_idx];
+        ch.fsm = ChannelFsm::Idle;
+        ch.queued_bd = None;
+        ch.chain_start_bd = None;
 
         Ok(())
     }
@@ -661,8 +613,10 @@ impl DmaEngine {
             return Err(DmaError::InvalidChannel(channel));
         }
 
-        if self.channel_states[ch_idx] == ChannelState::Active {
-            self.channel_states[ch_idx] = ChannelState::Paused;
+        let ch = &mut self.channels[ch_idx];
+        if ch.fsm.is_active() {
+            let saved = std::mem::take(&mut ch.fsm);
+            ch.fsm = ChannelFsm::Paused { saved: Box::new(saved) };
         }
 
         Ok(())
@@ -676,8 +630,9 @@ impl DmaEngine {
             return Err(DmaError::InvalidChannel(channel));
         }
 
-        if self.channel_states[ch_idx] == ChannelState::Paused {
-            self.channel_states[ch_idx] = ChannelState::Active;
+        let ch = &mut self.channels[ch_idx];
+        if let ChannelFsm::Paused { saved } = std::mem::take(&mut ch.fsm) {
+            ch.fsm = *saved;
         }
 
         Ok(())
@@ -734,58 +689,21 @@ impl DmaEngine {
         if ch_idx >= self.num_channels() {
             return false;
         }
-        matches!(
-            self.channel_states[ch_idx],
-            ChannelState::Active | ChannelState::WaitingForLock(_)
-        )
+        self.channels[ch_idx].is_active()
     }
 
     /// Check if a channel has pending work (active, waiting, or has queued work).
-    ///
-    /// This is useful for test loops that need to run until all work is complete,
-    /// including BD chaining, repeats, and queued tasks.
     pub fn channel_has_pending_work(&self, channel: ChannelId) -> bool {
         let ch_idx = channel as usize;
         if ch_idx >= self.num_channels() {
             return false;
         }
-
-        // Channel is actively working
-        if matches!(
-            self.channel_states[ch_idx],
-            ChannelState::Active | ChannelState::WaitingForLock(_)
-        ) {
-            return true;
-        }
-
-        // Channel has queued BD (from chaining or repeat)
-        if self.queued_bds[ch_idx].is_some() {
-            return true;
-        }
-
-        // Channel has pending repeat count
-        if self.repeat_counts[ch_idx] > 0 {
-            return true;
-        }
-
-        // Channel has queued tasks
-        if !self.task_queues[ch_idx].is_empty() {
-            return true;
-        }
-
-        // Complete state needs one more step to process queued work
-        if self.channel_states[ch_idx] == ChannelState::Complete {
-            return true;
-        }
-
-        false
+        self.channels[ch_idx].has_pending_work()
     }
 
     /// Check if any channel is active.
     pub fn any_channel_active(&self) -> bool {
-        self.channel_states.iter().any(|s| {
-            matches!(s, ChannelState::Active | ChannelState::WaitingForLock(_))
-        })
+        self.channels.iter().any(|ch| ch.is_active())
     }
 
     /// Get channel state.
@@ -794,17 +712,17 @@ impl DmaEngine {
         if ch_idx >= self.num_channels() {
             return ChannelState::Idle;
         }
-        self.channel_states[ch_idx]
+        self.channels[ch_idx].state()
     }
 
     /// Get channel statistics.
     pub fn channel_stats(&self, channel: ChannelId) -> Option<&ChannelStats> {
-        self.channel_stats.get(channel as usize)
+        self.channels.get(channel as usize).map(|ch| &ch.stats)
     }
 
     /// Get active transfer for a channel.
     pub fn get_transfer(&self, channel: ChannelId) -> Option<&Transfer> {
-        self.transfers.get(channel as usize).and_then(|t| t.as_ref())
+        self.channels.get(channel as usize).and_then(|ch| ch.transfer())
     }
 
     /// Step the DMA engine by one cycle.
@@ -815,281 +733,532 @@ impl DmaEngine {
         let mut any_active = false;
         let mut any_waiting = false;
 
-        // Debug: trace shim DMA stepping (only first 10 cycles to avoid spam)
-        static SHIM_TRACE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if self.col == 0 && self.row == 0 {
-            let count = SHIM_TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if count < 20 {
-                for ch_idx in 0..self.num_channels() {
-                    let phase = self.timing_states[ch_idx].phase;
-                    log::info!("SHIM_STEP[{}] ch{} state={:?} phase={:?}",
-                        count, ch_idx, self.channel_states[ch_idx], phase);
-                }
-            }
-        }
+        for ch_idx in 0..self.channels.len() {
+            let phase_before = self.channels[ch_idx].fsm.phase_name();
 
-        for ch_idx in 0..self.num_channels() {
-            match self.channel_states[ch_idx] {
-                ChannelState::Active => {
-                    self.step_channel(ch_idx, tile, neighbors, host_memory);
-                    any_active = true;
-                }
-                ChannelState::WaitingForLock(lock_id) => {
-                    // Try to acquire lock
-                    if self.try_acquire_lock(ch_idx, lock_id, tile, neighbors) {
-                        self.channel_states[ch_idx] = ChannelState::Active;
-                        any_active = true;
-                    } else {
-                        self.channel_stats[ch_idx].lock_wait_cycles += 1;
-                        self.trace(EventType::DmaStalledLock { channel: ch_idx as u8 });
-                        any_waiting = true;
-                    }
-                }
-                ChannelState::Complete => {
-                    // Check for BD chaining or repeat
-                    if let Some(next_bd) = self.queued_bds[ch_idx].take() {
-                        // Preserve existing repeat count (set by complete_transfer for repeats)
-                        let repeat_count = self.repeat_counts[ch_idx];
+            match &self.channels[ch_idx].fsm {
+                ChannelFsm::Idle => {
+                    // Check for queued BD from chaining or task queue
+                    if let Some(next_bd) = self.channels[ch_idx].queued_bd.take() {
+                        let repeat_count = self.channels[ch_idx].repeat_count as u8;
                         log::debug!("DMA tile({},{}) ch{} starting queued BD {} (repeat={})",
                             self.col, self.row, ch_idx, next_bd, repeat_count);
                         if let Err(e) = self.start_channel_with_repeat(ch_idx as u8, next_bd, repeat_count) {
                             log::warn!("DMA tile({},{}) ch{} failed to start BD {}: {:?}",
                                 self.col, self.row, ch_idx, next_bd, e);
-                            self.channel_states[ch_idx] = ChannelState::Error;
+                            self.channels[ch_idx].fsm = ChannelFsm::Error;
                         } else {
-                            log::debug!("DMA tile({},{}) ch{} now active with BD {}",
-                                self.col, self.row, ch_idx, next_bd);
                             any_active = true;
                         }
-                    } else {
-                        // No more work to do, transition to Idle
-                        self.channel_states[ch_idx] = ChannelState::Idle;
-                        log::debug!("DMA tile({},{}) ch{} completed, now idle",
-                            self.col, self.row, ch_idx);
                     }
                 }
-                _ => {}
+                ChannelFsm::Paused { .. } | ChannelFsm::Error => {}
+                _ => {
+                    // Active channel -- run one FSM cycle
+                    self.step_channel_fsm(ch_idx, tile, neighbors, host_memory);
+                    if matches!(self.channels[ch_idx].fsm, ChannelFsm::AcquiringLock { acquired: false, .. }) {
+                        any_waiting = true;
+                    } else {
+                        any_active = true;
+                    }
+                }
+            }
+
+            // Log transitions
+            let phase_after = self.channels[ch_idx].fsm.phase_name();
+            if phase_before != phase_after {
+                log::info!("DMA({},{}) ch{}: {} -> {}",
+                    self.col, self.row, ch_idx, phase_before, phase_after);
             }
         }
 
         if any_active {
             DmaResult::InProgress
         } else if any_waiting {
-            DmaResult::WaitingForLock(0) // Generic wait
+            DmaResult::WaitingForLock(0)
         } else {
             DmaResult::Complete
         }
     }
 
-    /// Step a single channel with cycle-accurate timing.
+    /// Step a single channel through one cycle of its unified FSM.
     ///
-    /// Uses the phase-based timing state machine for realistic DMA behavior.
-    fn step_channel(&mut self, ch_idx: usize, tile: &mut Tile, neighbors: &mut NeighborLocks<'_>, host_memory: &mut HostMemory) {
-        // Check if we have a transfer that needs processing
-        let transfer = match &self.transfers[ch_idx] {
-            Some(t) => t,
-            None => {
-                if self.col == 0 && self.row == 0 {
-                    log::trace!("SHIM step_channel ch{}: no transfer", ch_idx);
+    /// Each match arm does ONE cycle of work and optionally transitions to
+    /// a new state. This replaces the old step_channel() + step_channel_timed() +
+    /// complete_transfer() + finish_complete_transfer() chain.
+    fn step_channel_fsm(&mut self, ch_idx: usize, tile: &mut Tile, neighbors: &mut NeighborLocks<'_>, host_memory: &mut HostMemory) {
+        // Take the FSM out temporarily so we can match on it while
+        // mutating self (for stream buffers, do_transfer, etc.)
+        let fsm = std::mem::take(&mut self.channels[ch_idx].fsm);
+
+        let new_fsm = match fsm {
+            ChannelFsm::BdSetup { cycles_remaining, transfer } => {
+                if cycles_remaining <= 1 {
+                    // BD setup done. Insert packet header if needed.
+                    self.maybe_insert_packet_header_from_transfer(&transfer);
+                    // Check if lock acquisition is needed
+                    if let Some(lock_id) = transfer.acquire_lock {
+                        ChannelFsm::AcquiringLock {
+                            lock_id,
+                            cycles_remaining: self.timing_config.lock_acquire_cycles as u16,
+                            acquired: false,
+                            transfer,
+                        }
+                    } else {
+                        ChannelFsm::MemoryLatency {
+                            cycles_remaining: self.timing_config.memory_latency_cycles as u16,
+                            transfer,
+                        }
+                    }
+                } else {
+                    ChannelFsm::BdSetup {
+                        cycles_remaining: cycles_remaining - 1,
+                        transfer,
+                    }
                 }
-                return;
             }
+
+            ChannelFsm::AcquiringLock { lock_id, cycles_remaining, acquired, transfer } => {
+                if acquired {
+                    // Lock already acquired, counting down latency
+                    if cycles_remaining <= 1 {
+                        ChannelFsm::MemoryLatency {
+                            cycles_remaining: self.timing_config.memory_latency_cycles as u16,
+                            transfer,
+                        }
+                    } else {
+                        ChannelFsm::AcquiringLock {
+                            lock_id,
+                            cycles_remaining: cycles_remaining - 1,
+                            acquired: true,
+                            transfer,
+                        }
+                    }
+                } else {
+                    // Try to acquire lock
+                    if self.try_acquire_lock_fsm(lock_id, &transfer, tile, neighbors) {
+                        ChannelFsm::AcquiringLock {
+                            lock_id,
+                            cycles_remaining,
+                            acquired: true,
+                            transfer,
+                        }
+                    } else {
+                        self.channels[ch_idx].stats.lock_wait_cycles += 1;
+                        self.trace(EventType::DmaStalledLock { channel: ch_idx as u8 });
+                        ChannelFsm::AcquiringLock {
+                            lock_id,
+                            cycles_remaining,
+                            acquired: false,
+                            transfer,
+                        }
+                    }
+                }
+            }
+
+            ChannelFsm::MemoryLatency { cycles_remaining, transfer } => {
+                if cycles_remaining <= 1 {
+                    ChannelFsm::Transferring { transfer }
+                } else {
+                    ChannelFsm::MemoryLatency {
+                        cycles_remaining: cycles_remaining - 1,
+                        transfer,
+                    }
+                }
+            }
+
+            ChannelFsm::Transferring { mut transfer } => {
+                // Move one cycle of data
+                let result = self.do_transfer_cycle(ch_idx, &mut transfer, tile, host_memory);
+
+                match result {
+                    TransferCycleResult::Continue => {
+                        // Tick the transfer's cycle counter
+                        transfer.tick();
+                        // Check if data movement is complete
+                        if transfer.remaining_bytes() == 0 {
+                            self.begin_completion(ch_idx, transfer)
+                        } else {
+                            ChannelFsm::Transferring { transfer }
+                        }
+                    }
+                    TransferCycleResult::Stalled => {
+                        // S2MM stall: stay in Transferring, don't advance
+                        self.trace(EventType::DmaStreamStarvation { channel: ch_idx as u8 });
+                        ChannelFsm::Transferring { transfer }
+                    }
+                    TransferCycleResult::FotFinish => {
+                        // Early finish on TLAST (FoT mode)
+                        self.begin_completion(ch_idx, transfer)
+                    }
+                    TransferCycleResult::Error => {
+                        ChannelFsm::Error
+                    }
+                }
+            }
+
+            ChannelFsm::ReleasingLock { lock_id, release_value, cycles_remaining, completion } => {
+                if cycles_remaining <= 1 {
+                    // Execute the lock release
+                    self.execute_lock_release(lock_id, release_value, tile, neighbors);
+                    // Update stats and handle chaining/repeat
+                    self.after_transfer_done(ch_idx, completion)
+                } else {
+                    ChannelFsm::ReleasingLock {
+                        lock_id,
+                        release_value,
+                        cycles_remaining: cycles_remaining - 1,
+                        completion,
+                    }
+                }
+            }
+
+            ChannelFsm::BdChaining { cycles_remaining, next_bd } => {
+                if cycles_remaining <= 1 {
+                    // Load next BD and start transfer
+                    match self.create_transfer_from_bd(next_bd, ch_idx as u8) {
+                        Ok(transfer) => {
+                            self.channels[ch_idx].current_bd = Some(next_bd);
+                            ChannelFsm::BdSetup {
+                                cycles_remaining: self.timing_config.bd_setup_cycles as u16,
+                                transfer: Box::new(transfer),
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("DMA tile({},{}) ch{} BD chain to {} failed: {:?}",
+                                self.col, self.row, ch_idx, next_bd, e);
+                            ChannelFsm::Error
+                        }
+                    }
+                } else {
+                    ChannelFsm::BdChaining {
+                        cycles_remaining: cycles_remaining - 1,
+                        next_bd,
+                    }
+                }
+            }
+
+            // Idle/Paused/Error handled in step(), not here
+            other => other,
         };
 
-        // Need to process both Active (data transfer) and ReleasingLock (lock release)
-        // states - both require the timing state machine to tick through phases
-        if !transfer.needs_processing() {
-            if self.col == 0 && self.row == 0 {
-                log::trace!("SHIM step_channel ch{}: transfer not needs_processing, state={:?}",
-                    ch_idx, transfer.state);
+        self.channels[ch_idx].fsm = new_fsm;
+    }
+
+    /// Create a Transfer from a BD index without starting a channel.
+    /// Used by BdChaining to load the next BD in a chain.
+    fn create_transfer_from_bd(&self, bd_index: u8, channel: u8) -> Result<Transfer, DmaError> {
+        if bd_index as usize >= self.bd_configs.len() {
+            return Err(DmaError::InvalidBd(bd_index));
+        }
+        let bd_config = &self.bd_configs[bd_index as usize];
+        let direction = match self.channel_type(channel) {
+            ChannelType::S2MM => TransferDirection::S2MM,
+            ChannelType::MM2S => TransferDirection::MM2S,
+        };
+        Transfer::new(bd_config, bd_index, channel, direction, self.col, self.row, self.tile_type)
+    }
+
+    /// Begin the completion sequence after data movement is done.
+    ///
+    /// If the BD has a release lock, transitions to ReleasingLock.
+    /// Otherwise, goes directly to chaining/repeat/idle via after_transfer_done.
+    fn begin_completion(&mut self, ch_idx: usize, transfer: Box<Transfer>) -> ChannelFsm {
+        let completion = CompletionInfo {
+            bd_index: transfer.bd_index,
+            next_bd: transfer.next_bd,
+            cycles_elapsed: transfer.cycles_elapsed,
+            channel: ch_idx as u8,
+        };
+
+        if let Some(lock_id) = transfer.release_lock {
+            let release_value = transfer.release_value;
+            ChannelFsm::ReleasingLock {
+                lock_id,
+                release_value,
+                cycles_remaining: self.timing_config.lock_release_cycles as u16,
+                completion,
             }
+        } else {
+            self.after_transfer_done(ch_idx, completion)
+        }
+    }
+
+    /// Handle post-transfer completion: stats, chaining, repeat, task queue.
+    ///
+    /// Returns the next FSM state (BdChaining, Idle, or starts next task).
+    fn after_transfer_done(&mut self, ch_idx: usize, completion: CompletionInfo) -> ChannelFsm {
+        self.channels[ch_idx].stats.transfers_completed += 1;
+        self.channels[ch_idx].stats.cycles_spent += completion.cycles_elapsed;
+
+        // Emit DMA_FINISHED_BD
+        self.trace_events.push((self.current_cycle, EventType::DmaFinishedBd { channel: ch_idx as u8 }));
+
+        // Check for BD chaining
+        if let Some(next_bd) = completion.next_bd {
+            log::debug!("DMA tile({},{}) ch{} chaining to BD {} (from BD {})",
+                self.col, self.row, ch_idx, next_bd, completion.bd_index);
+            return ChannelFsm::BdChaining {
+                cycles_remaining: self.timing_config.bd_chain_cycles as u16,
+                next_bd,
+            };
+        }
+
+        // Check for repeat count
+        if self.channels[ch_idx].repeat_count > 0 {
+            self.channels[ch_idx].repeat_count -= 1;
+            if let Some(start_bd) = self.channels[ch_idx].chain_start_bd {
+                log::debug!("DMA tile({},{}) ch{} repeating chain from BD {} ({} remaining)",
+                    self.col, self.row, ch_idx, start_bd, self.channels[ch_idx].repeat_count);
+                return ChannelFsm::BdChaining {
+                    cycles_remaining: self.timing_config.bd_chain_cycles as u16,
+                    next_bd: start_bd,
+                };
+            }
+        }
+
+        // Task complete (no chaining, no repeats)
+        self.trace(EventType::DmaFinishedTask { channel: ch_idx as u8 });
+        self.maybe_emit_task_token(ch_idx);
+
+        // Check for more tasks in the queue
+        if !self.channels[ch_idx].task_queue.is_empty() {
+            log::debug!("DMA tile({},{}) ch{} task complete, {} tasks remaining in queue",
+                self.col, self.row, ch_idx, self.channels[ch_idx].task_queue.len());
+            self.start_next_queued_task(ch_idx as u8);
+            // start_next_queued_task sets the FSM, return what it set
+            return std::mem::take(&mut self.channels[ch_idx].fsm);
+        }
+
+        ChannelFsm::Idle
+    }
+
+    /// Perform one cycle of data transfer for a channel in the Transferring state.
+    ///
+    /// Extracts transfer parameters, calls do_transfer, and advances the transfer.
+    /// The Transfer is borrowed from the FSM via the caller (not from self.channels).
+    fn do_transfer_cycle(
+        &mut self,
+        ch_idx: usize,
+        transfer: &mut Transfer,
+        tile: &mut Tile,
+        host_memory: &mut HostMemory,
+    ) -> TransferCycleResult {
+        let words_per_cycle = self.timing_config.words_per_cycle as usize;
+        let bytes_per_cycle = words_per_cycle * 4;
+
+        if transfer.has_zero_padding() {
+            // Padding-aware path: one word at a time
+            let remaining = transfer.remaining_bytes();
+            if remaining == 0 {
+                return TransferCycleResult::Continue;
+            }
+
+            let action = transfer.next_output_action();
+            let is_last_word = remaining <= 4;
+            let channel = transfer.channel;
+            let tlast_suppress = transfer.tlast_suppress;
+
+            match action {
+                PadAction::Zero => {
+                    let should_assert_tlast = is_last_word && !tlast_suppress;
+                    self.stream_out.push_back(StreamData {
+                        data: 0,
+                        tlast: should_assert_tlast,
+                        channel,
+                    });
+                    transfer.advance(4);
+                    self.channels[ch_idx].stats.bytes_transferred += 4;
+                    TransferCycleResult::Continue
+                }
+                PadAction::Data(addr) => {
+                    let source = transfer.source;
+                    let dest = transfer.dest;
+                    let result = self.do_transfer(
+                        source, dest, addr, 4, channel,
+                        is_last_word, tlast_suppress, tile, host_memory,
+                    );
+
+                    if result.stall {
+                        return TransferCycleResult::Stalled;
+                    }
+                    if result.success {
+                        transfer.advance(4);
+                        self.channels[ch_idx].stats.bytes_transferred += 4;
+                        if result.fot_finish {
+                            TransferCycleResult::FotFinish
+                        } else {
+                            TransferCycleResult::Continue
+                        }
+                    } else {
+                        TransferCycleResult::Error
+                    }
+                }
+            }
+        } else {
+            // Standard path: transfer bytes_per_cycle at once
+            let bytes_to_transfer = bytes_per_cycle.min(transfer.remaining_bytes() as usize);
+            if bytes_to_transfer == 0 {
+                return TransferCycleResult::Continue;
+            }
+
+            let remaining_after = transfer.remaining_bytes().saturating_sub(bytes_to_transfer as u64);
+            let addr = transfer.current_address();
+            let source = transfer.source;
+            let dest = transfer.dest;
+            let channel = transfer.channel;
+            let is_last = remaining_after == 0;
+            let tlast_suppress = transfer.tlast_suppress;
+
+            let result = self.do_transfer(
+                source, dest, addr, bytes_to_transfer, channel,
+                is_last, tlast_suppress, tile, host_memory,
+            );
+
+            if result.stall {
+                return TransferCycleResult::Stalled;
+            }
+            if result.success {
+                transfer.advance(bytes_to_transfer as u64);
+                self.channels[ch_idx].stats.bytes_transferred += bytes_to_transfer as u64;
+                if result.fot_finish {
+                    TransferCycleResult::FotFinish
+                } else {
+                    TransferCycleResult::Continue
+                }
+            } else {
+                TransferCycleResult::Error
+            }
+        }
+    }
+
+    /// Try to acquire a lock for an FSM channel (no Transfer state mutation).
+    ///
+    /// Unlike the old try_acquire_lock, this doesn't call transfer.lock_acquired().
+    /// The FSM tracks acquisition state via the `acquired` flag in AcquiringLock.
+    fn try_acquire_lock_fsm(
+        &mut self,
+        lock_id: u8,
+        transfer: &Transfer,
+        tile: &mut Tile,
+        neighbors: &mut NeighborLocks<'_>,
+    ) -> bool {
+        use crate::device::tile::LockResult;
+
+        let lock_target = match self.resolve_lock_id(lock_id) {
+            Some(target) => target,
+            None => return false,
+        };
+
+        let (target_tile, local_id): (&mut Tile, u8) = match lock_target {
+            LockTarget::Own(id) => (tile, id),
+            LockTarget::West(id) => match neighbors.west.as_deref_mut() {
+                Some(west) => (west, id),
+                None => return false,
+            },
+            LockTarget::East(id) => match neighbors.east.as_deref_mut() {
+                Some(east) => (east, id),
+                None => return false,
+            },
+        };
+
+        if (local_id as usize) >= target_tile.locks.len() {
+            return false;
+        }
+
+        let acquire_value = transfer.acquire_value;
+        let snapshot_value = target_tile.lock_snapshot_value(local_id as usize);
+
+        let (expected, delta, equal_mode) = if acquire_value < 0 {
+            ((-acquire_value) as i8, acquire_value, false)
+        } else if acquire_value > 0 {
+            (acquire_value as i8, -acquire_value, true)
+        } else {
+            (1i8, -1i8, false)
+        };
+
+        let result = target_tile.try_acquire_snapshot(local_id as usize, expected, delta, equal_mode);
+        let success = matches!(result, LockResult::Success);
+
+        log::info!("DMA try_acquire_lock tile({},{}) bd_lock={} target={:?} local_lock={} expected={} delta={} snapshot={} result={:?}",
+            self.col, self.row, lock_id, lock_target, local_id, expected, delta, snapshot_value, result);
+
+        if let Some(ref mut timing) = self.lock_timing {
+            timing.track_acquire(local_id as usize, success);
+        }
+
+        success
+    }
+
+    /// Execute a lock release operation.
+    ///
+    /// Called from the ReleasingLock FSM state when the countdown expires.
+    fn execute_lock_release(
+        &mut self,
+        lock_id: u8,
+        release_value: i8,
+        tile: &mut Tile,
+        neighbors: &mut NeighborLocks<'_>,
+    ) {
+        use crate::device::tile::Lock;
+
+        let lock_target = match Self::resolve_lock_id_static(
+            self.tile_type, self.col, self.row, self.num_locks, lock_id,
+        ) {
+            Some(target) => target,
+            None => return,
+        };
+
+        let (target_tile, local_id) = match lock_target {
+            LockTarget::Own(id) => (tile as &mut Tile, id),
+            LockTarget::West(id) => match neighbors.west.as_deref_mut() {
+                Some(west) => (west, id),
+                None => {
+                    log::warn!("DMA tile({},{}) release lock_id={} targets west neighbor but none exists",
+                        self.col, self.row, lock_id);
+                    return;
+                }
+            },
+            LockTarget::East(id) => match neighbors.east.as_deref_mut() {
+                Some(east) => (east, id),
+                None => {
+                    log::warn!("DMA tile({},{}) release lock_id={} targets east neighbor but none exists",
+                        self.col, self.row, lock_id);
+                    return;
+                }
+            },
+        };
+
+        log::info!("DMA tile({},{}) releasing bd_lock={} target={:?} local_lock={} with delta {} (snapshot-based)",
+            self.col, self.row, lock_id, lock_target, local_id, release_value);
+
+        if (local_id as usize) < target_tile.locks.len() {
+            target_tile.release_snapshot(local_id as usize, release_value);
+            let current = target_tile.locks[local_id as usize].value;
+            let new_val = (current as i16 + release_value as i16)
+                .clamp(Lock::MIN_VALUE as i16, Lock::MAX_VALUE as i16) as i8;
+            log::info!("Tile lock {} pending delta {} (current={}, will be {} at cycle end)",
+                local_id, release_value, current, new_val);
+        }
+    }
+
+    /// Insert a packet header from a Transfer reference (used during BdSetup).
+    ///
+    /// Unlike the old maybe_insert_packet_header which accessed self.transfers[],
+    /// this takes a Transfer reference directly from the FSM.
+    fn maybe_insert_packet_header_from_transfer(&mut self, transfer: &Transfer) {
+        if !transfer.needs_packet_header() || transfer.direction != TransferDirection::MM2S {
             return;
         }
 
-        // Always use cycle-accurate timing
-        self.step_channel_timed(ch_idx, tile, neighbors, host_memory);
-    }
-
-    /// Step channel with cycle-accurate timing.
-    ///
-    /// Uses the phase-based timing state machine for realistic delays.
-    /// The timing state machine handles phase transitions and word counting.
-    /// This method performs the actual data movement when in DataTransfer phase.
-    fn step_channel_timed(&mut self, ch_idx: usize, tile: &mut Tile, neighbors: &mut NeighborLocks<'_>, host_memory: &mut HostMemory) {
-        // Insert packet header if needed (MM2S only, at start of transfer)
-        self.maybe_insert_packet_header(ch_idx);
-
-        // Get lock info from transfer and check if lock has been acquired.
-        // has_acquire_lock: whether the BD requires lock acquisition before transfer
-        // has_release_lock: whether the BD requires lock release after transfer
-        // These are separate because a BD can have release-only (no acquire).
-        let (has_acquire_lock, has_release_lock, lock_available) = {
-            let transfer = self.transfers[ch_idx].as_ref()
-                .expect("BUG: step_channel_timed called without active transfer");
-            let has_acquire_lock = transfer.acquire_lock.is_some();
-            let has_release_lock = transfer.release_lock.is_some();
-
-            // Lock is "available" to the timing FSM if:
-            // - No lock is required, OR
-            // - The Transfer state is Active (meaning lock was already acquired via try_acquire_lock)
-            //
-            // Note: We don't check the raw lock value because try_acquire_lock() already
-            // modified it when it succeeded. The Transfer.state tracks whether acquisition happened.
-            let lock_available = !has_acquire_lock
-                || transfer.state == TransferState::Active;
-            (has_acquire_lock, has_release_lock, lock_available)
-        };
-
-        // Check if we need to do data transfer this cycle (before tick advances state)
-        let should_transfer = self.timing_states[ch_idx].phase == TransferPhase::DataTransfer
-            && self.timing_states[ch_idx].memory_pipeline_busy == 0;
-
-        // Perform data transfer if in DataTransfer phase
-        if should_transfer {
-            let words_per_cycle = self.timing_config.words_per_cycle as usize;
-            let bytes_per_cycle = words_per_cycle * 4;
-
-            // Check if zero-padding is active (MemTile MM2S only).
-            // When padding, we process one word at a time because each word
-            // can independently be data (from memory) or zero (padding).
-            let has_padding = self.transfers[ch_idx].as_ref()
-                .map(|t| t.has_zero_padding())
-                .unwrap_or(false);
-
-            if has_padding {
-                // Padding-aware path: one word at a time
-                let (action, remaining, channel, is_last_word, tlast_suppress) = {
-                    let transfer = self.transfers[ch_idx].as_ref()
-                        .expect("BUG: transfer missing in padded extraction block");
-                    let remaining = transfer.remaining_bytes();
-                    let is_last_word = remaining <= 4;
-                    (
-                        transfer.next_output_action(),
-                        remaining,
-                        transfer.channel,
-                        is_last_word,
-                        transfer.tlast_suppress,
-                    )
-                };
-
-                if remaining > 0 {
-                    match action {
-                        PadAction::Zero => {
-                            // Emit a zero word directly to stream (no memory read)
-                            let should_assert_tlast = is_last_word && !tlast_suppress;
-                            self.stream_out.push_back(StreamData {
-                                data: 0,
-                                tlast: should_assert_tlast,
-                                channel,
-                            });
-                            let transfer = self.transfers[ch_idx].as_mut()
-                                .expect("BUG: transfer missing after pad zero emit");
-                            transfer.data_transferred(4);
-                            self.channel_stats[ch_idx].bytes_transferred += 4;
-                        }
-                        PadAction::Data(addr) => {
-                            // Normal memory read for this word
-                            let transfer = self.transfers[ch_idx].as_ref()
-                                .expect("BUG: transfer missing in pad data block");
-                            let source = transfer.source;
-                            let dest = transfer.dest;
-                            let result = self.do_transfer(
-                                source, dest, addr, 4, channel,
-                                is_last_word, tlast_suppress, tile, host_memory,
-                            );
-
-                            if result.stall {
-                                self.trace(EventType::DmaStreamStarvation { channel });
-                                return;
-                            }
-
-                            if result.success {
-                                let transfer = self.transfers[ch_idx].as_mut()
-                                    .expect("BUG: transfer missing after pad data transfer");
-                                transfer.data_transferred(4);
-                                self.channel_stats[ch_idx].bytes_transferred += 4;
-
-                                if result.fot_finish {
-                                    self.complete_transfer(ch_idx, tile, neighbors);
-                                    return;
-                                }
-                            } else {
-                                self.set_transfer_error(ch_idx, addr, tile.data_memory().len() as u64);
-                                return;
-                            }
-                        }
-                    }
-                }
-            } else {
-                // Standard path (no padding): transfer bytes_per_cycle at once
-                let (bytes_to_transfer, addr, source, dest, channel, is_last, tlast_suppress) = {
-                    let transfer = self.transfers[ch_idx].as_ref()
-                        .expect("BUG: transfer missing in timed extraction block");
-                    let bytes_to_transfer = bytes_per_cycle.min(transfer.remaining_bytes() as usize);
-                    let remaining_after = transfer.remaining_bytes().saturating_sub(bytes_to_transfer as u64);
-                    (
-                        bytes_to_transfer,
-                        transfer.current_address(),
-                        transfer.source,
-                        transfer.dest,
-                        transfer.channel,
-                        remaining_after == 0,
-                        transfer.tlast_suppress,
-                    )
-                };
-
-                if bytes_to_transfer > 0 {
-                    let result = self.do_transfer(source, dest, addr, bytes_to_transfer, channel, is_last, tlast_suppress, tile, host_memory);
-
-                    if result.stall {
-                        // S2MM waiting for stream data - don't advance timing, just return
-                        // The transfer will try again next cycle when data may be available
-                        self.trace(EventType::DmaStreamStarvation { channel });
-                        return;
-                    }
-
-                    if result.success {
-                        // Update transfer state (address generator, bytes transferred)
-                        let transfer = self.transfers[ch_idx].as_mut()
-                            .expect("BUG: transfer missing after timed do_transfer");
-                        transfer.data_transferred(bytes_to_transfer as u64);
-                        self.channel_stats[ch_idx].bytes_transferred += bytes_to_transfer as u64;
-
-                        // Handle FoT completion (early finish on TLAST)
-                        if result.fot_finish {
-                            self.complete_transfer(ch_idx, tile, neighbors);
-                            return;
-                        }
-                    } else {
-                        self.set_transfer_error(ch_idx, addr, tile.data_memory().len() as u64);
-                        return;
-                    }
-                }
-            }
-        }
-
-        // Advance timing state (this handles phase transitions and word counting)
-        let old_phase = self.timing_states[ch_idx].phase;
-        let phase = self.timing_states[ch_idx].tick(
-            &self.timing_config, has_acquire_lock, has_release_lock, lock_available,
-        );
-
-        if self.col == 0 && self.row == 0 {
-            log::trace!("SHIM tick ch{}: {:?} -> {:?} (remaining={}, words={}/{})",
-                ch_idx, old_phase, phase,
-                self.timing_states[ch_idx].cycles_remaining,
-                self.timing_states[ch_idx].words_transferred,
-                self.timing_states[ch_idx].total_words);
-        }
-
-        // Handle completion
-        if phase == TransferPhase::Complete {
-            self.complete_transfer(ch_idx, tile, neighbors);
-        }
-
-        // Update transfer tick count
-        if let Some(transfer) = self.transfers[ch_idx].as_mut() {
-            transfer.tick();
+        if let Some(header_word) = transfer.generate_packet_header() {
+            self.stream_out.push_back(StreamData {
+                data: header_word,
+                tlast: false,
+                channel: transfer.channel,
+            });
+            log::debug!("DMA({},{}) ch{} inserted packet header: 0x{:08X}",
+                self.col, self.row, transfer.channel, header_word);
         }
     }
 
@@ -1778,14 +1947,6 @@ impl DmaEngine {
         }
     }
 
-    /// Set a transfer error on a channel.
-    fn set_transfer_error(&mut self, ch_idx: usize, address: u64, limit: u64) {
-        if let Some(transfer) = self.transfers[ch_idx].as_mut() {
-            transfer.set_error(DmaError::AddressOutOfBounds { address, limit });
-        }
-        self.channel_states[ch_idx] = ChannelState::Error;
-    }
-
     /// Transfer data from host memory to tile memory (static version).
     fn transfer_host_to_tile_static(
         tile_addr: u64,
@@ -1835,134 +1996,12 @@ impl DmaEngine {
         true
     }
 
-    /// Complete a transfer.
-    fn complete_transfer(&mut self, ch_idx: usize, tile: &mut Tile, neighbors: &mut NeighborLocks<'_>) {
-        let transfer = match &mut self.transfers[ch_idx] {
-            Some(t) => t,
-            None => return,
-        };
-
-        log::debug!("complete_transfer tile({},{}) ch={} state={:?} release_lock={:?}",
-            self.col, self.row, ch_idx, transfer.state, transfer.release_lock);
-
-        // Handle lock release if needed
-        // Use snapshot-based release for cycle-accurate behavior
-        use crate::device::tile::Lock;
-        if let TransferState::ReleasingLock(lock_id) = transfer.state {
-            let release_delta = transfer.release_value;
-            // Resolve cross-tile lock addressing (MemTile 192-entry space)
-            if let Some(lock_target) = Self::resolve_lock_id_static(self.tile_type, self.col, self.row, self.num_locks, lock_id) {
-                // Route to the correct tile based on lock target
-                let (target_tile, local_id) = match lock_target {
-                    LockTarget::Own(id) => (tile as &mut Tile, id),
-                    LockTarget::West(id) => match neighbors.west.as_deref_mut() {
-                        Some(west) => (west, id),
-                        None => {
-                            log::warn!("DMA tile({},{}) release lock_id={} targets west neighbor but none exists",
-                                self.col, self.row, lock_id);
-                            transfer.lock_released();
-                            // Fall through to statistics update below
-                            return self.finish_complete_transfer(ch_idx);
-                        }
-                    },
-                    LockTarget::East(id) => match neighbors.east.as_deref_mut() {
-                        Some(east) => (east, id),
-                        None => {
-                            log::warn!("DMA tile({},{}) release lock_id={} targets east neighbor but none exists",
-                                self.col, self.row, lock_id);
-                            transfer.lock_released();
-                            return self.finish_complete_transfer(ch_idx);
-                        }
-                    },
-                };
-
-                log::info!("DMA tile({},{}) releasing bd_lock={} target={:?} local_lock={} with delta {} on channel {} (snapshot-based)",
-                    self.col, self.row, lock_id, lock_target, local_id, release_delta, ch_idx);
-                if (local_id as usize) < target_tile.locks.len() {
-                    // Record release as pending delta, applied at cycle end
-                    target_tile.release_snapshot(local_id as usize, release_delta);
-                    let current = target_tile.locks[local_id as usize].value;
-                    let new_val = (current as i16 + release_delta as i16).clamp(Lock::MIN_VALUE as i16, Lock::MAX_VALUE as i16) as i8;
-                    log::info!("Tile lock {} pending delta {} (current={}, will be {} at cycle end)",
-                        local_id, release_delta, current, new_val);
-                }
-            }
-            transfer.lock_released();
-        }
-
-        self.finish_complete_transfer(ch_idx);
-    }
-
-    /// Finish transfer completion: update stats, handle BD chaining/repeat, mark idle.
-    ///
-    /// Extracted from complete_transfer so early-return paths (e.g., missing
-    /// neighbor for cross-tile lock release) can also finalize the transfer.
-    fn finish_complete_transfer(&mut self, ch_idx: usize) {
-        let transfer = match &self.transfers[ch_idx] {
-            Some(t) => t,
-            None => return,
-        };
-
-        // Update statistics
-        self.channel_stats[ch_idx].transfers_completed += 1;
-        self.channel_stats[ch_idx].cycles_spent += transfer.cycles_elapsed;
-
-        // Extract transfer fields before releasing the borrow
-        let next_bd = transfer.next_bd;
-        let bd_index = transfer.bd_index;
-
-        // Emit DMA_FINISHED_BD -- one BD within a task completed.
-        // Push directly to avoid borrow conflict with `transfer`.
-        self.trace_events.push((self.current_cycle, EventType::DmaFinishedBd { channel: ch_idx as u8 }));
-
-        // Check for BD chaining first
-        if let Some(next_bd) = next_bd {
-            log::debug!("DMA tile({},{}) ch{} chaining to BD {} (from BD {})",
-                self.col, self.row, ch_idx, next_bd, bd_index);
-            self.queued_bds[ch_idx] = Some(next_bd);
-        }
-        // If no chaining, check for repeat count.
-        // Restart from chain_start_bds (the FIRST BD of the task), not
-        // current_bds (which was overwritten to the last chained BD).
-        else if self.repeat_counts[ch_idx] > 0 {
-            self.repeat_counts[ch_idx] -= 1;
-            if let Some(start_bd) = self.chain_start_bds[ch_idx] {
-                self.queued_bds[ch_idx] = Some(start_bd);
-                log::debug!("DMA tile({},{}) ch{} repeating chain from BD {} ({} remaining)",
-                    self.col, self.row, ch_idx, start_bd, self.repeat_counts[ch_idx]);
-            }
-        }
-        // Task is complete (no chaining, no repeats) - emit token if enabled
-        else {
-            // Emit DMA_FINISHED_TASK -- entire task (all BDs and repeats) complete
-            self.trace(EventType::DmaFinishedTask { channel: ch_idx as u8 });
-            self.maybe_emit_task_token(ch_idx);
-
-            // Check for more tasks in the queue
-            if !self.task_queues[ch_idx].is_empty() {
-                log::debug!(
-                    "DMA tile({},{}) ch{} task complete, {} tasks remaining in queue",
-                    self.col, self.row, ch_idx, self.task_queues[ch_idx].len()
-                );
-                // Mark as complete (will trigger next task in step())
-                self.channel_states[ch_idx] = ChannelState::Complete;
-                self.transfers[ch_idx] = None;
-                // Start next queued task immediately
-                self.start_next_queued_task(ch_idx as u8);
-                return;
-            }
-        }
-
-        // Mark channel as complete
-        self.channel_states[ch_idx] = ChannelState::Complete;
-        self.transfers[ch_idx] = None;
-    }
+    // NOTE: complete_transfer() and finish_complete_transfer() have been
+    // replaced by begin_completion() and after_transfer_done() in the FSM.
 
     /// Emit a task complete token if Enable_Token_Issue is set for this channel.
-    ///
-    /// Called when a task completes (no more BD chaining, no more repeats).
     fn maybe_emit_task_token(&mut self, ch_idx: usize) {
-        let config = &self.channel_task_configs[ch_idx];
+        let config = &self.channels[ch_idx].task_config;
 
         if config.enable_token_issue {
             let token = TaskCompleteToken {
@@ -1980,106 +2019,11 @@ impl DmaEngine {
             self.task_tokens.push_back(token);
 
             // Clear enable_token_issue after issuing (it's set per-task via Start_Queue)
-            self.channel_task_configs[ch_idx].enable_token_issue = false;
+            self.channels[ch_idx].task_config.enable_token_issue = false;
         }
     }
 
-    /// Try to acquire a lock.
-    ///
-    /// AIE-ML lock acquire semantics:
-    /// - If acquire_value < 0: `acq_ge` - wait until lock >= |value|, then decrement by |value|
-    /// - If acquire_value >= 0: `acq_eq` - wait until lock == value, then set to 0
-    ///
-    /// If lock timing is enabled, tracks acquire attempts and contention.
-    fn try_acquire_lock(&mut self, ch_idx: usize, lock_id: u8, tile: &mut Tile, neighbors: &mut NeighborLocks<'_>) -> bool {
-        use crate::device::tile::LockResult;
-
-        // Resolve cross-tile lock addressing (MemTile 192-entry space)
-        let lock_target = match self.resolve_lock_id(lock_id) {
-            Some(target) => target,
-            None => return false,
-        };
-
-        // Route to the correct tile based on lock target
-        let (target_tile, local_id): (&mut Tile, u8) = match lock_target {
-            LockTarget::Own(id) => (tile, id),
-            LockTarget::West(id) => match neighbors.west.as_deref_mut() {
-                Some(west) => (west, id),
-                None => {
-                    log::warn!(
-                        "DMA tile({},{}) ch{} lock_id={} targets west neighbor but none exists",
-                        self.col, self.row, ch_idx, lock_id
-                    );
-                    return false;
-                }
-            },
-            LockTarget::East(id) => match neighbors.east.as_deref_mut() {
-                Some(east) => (east, id),
-                None => {
-                    log::warn!(
-                        "DMA tile({},{}) ch{} lock_id={} targets east neighbor but none exists",
-                        self.col, self.row, ch_idx, lock_id
-                    );
-                    return false;
-                }
-            },
-        };
-
-        if (local_id as usize) >= target_tile.locks.len() {
-            log::warn!(
-                "DMA try_acquire_lock tile({},{}) ch{} lock_id={} resolved to {:?} local_id={} \
-                 but target tile only has {} locks",
-                self.col, self.row, ch_idx, lock_id, lock_target, local_id, target_tile.locks.len()
-            );
-            return false;
-        }
-
-        let transfer = match &mut self.transfers[ch_idx] {
-            Some(t) => t,
-            None => return false,
-        };
-
-        let acquire_value = transfer.acquire_value;
-
-        // Get snapshot value for logging (before any modifications)
-        let snapshot_value = target_tile.lock_snapshot_value(local_id as usize);
-
-        // AIE-ML lock semantics from AM020:
-        // - acquire_value < 0: acq_ge, wait until lock >= |value|, then decrement by |value|
-        // - acquire_value > 0: acq_eq, wait until lock == value, then decrement to 0
-        // - acquire_value == 0: simple acquire (decrement if > 0)
-        //
-        // Use snapshot-based arbitration for cycle-accurate behavior:
-        // All lock operations within a cycle check against the snapshot taken at cycle start.
-        let (expected, delta, equal_mode) = if acquire_value < 0 {
-            // acq_ge: wait until lock >= |value|, then decrement by |value|
-            ((-acquire_value) as i8, acquire_value, false)
-        } else if acquire_value > 0 {
-            // acq_eq: wait until lock == value, then decrement to 0
-            (acquire_value as i8, -acquire_value, true)
-        } else {
-            // acquire_value == 0: simple acquire (decrement if > 0)
-            (1i8, -1i8, false)
-        };
-
-        let result = target_tile.try_acquire_snapshot(local_id as usize, expected, delta, equal_mode);
-        let success = matches!(result, LockResult::Success);
-
-        log::info!("DMA try_acquire_lock tile({},{}) ch{} bd_lock={} target={:?} local_lock={} expected={} delta={} snapshot={} result={:?}",
-            self.col, self.row, ch_idx, lock_id, lock_target, local_id, expected, delta, snapshot_value, result);
-
-        // Track timing if enabled
-        if let Some(ref mut timing) = self.lock_timing {
-            timing.track_acquire(local_id as usize, success);
-        }
-
-        if success {
-            transfer.lock_acquired();
-            true
-        } else {
-            false
-        }
-    }
+    // NOTE: try_acquire_lock() has been replaced by try_acquire_lock_fsm().
 
     /// Execute a simple 1D transfer immediately (no cycling).
     ///
@@ -2111,78 +2055,19 @@ impl DmaEngine {
 
     /// Reset all channels and clear state.
     pub fn reset(&mut self) {
-        for i in 0..self.num_channels() {
-            self.transfers[i] = None;
-            self.channel_states[i] = ChannelState::Idle;
-            self.queued_bds[i] = None;
-            self.task_queues[i].clear();
-            self.task_queue_overflow[i] = false;
-            self.error_bd_unavailable[i] = false;
-            self.repeat_counts[i] = 0;
-            self.current_bds[i] = None;
-            self.chain_start_bds[i] = None;
+        for ch in &mut self.channels {
+            ch.reset();
         }
-
-        // Clear stream buffers
         self.stream_out.clear();
         self.stream_in.clear();
-
-        // Clear task tokens
         self.task_tokens.clear();
-
         // Don't clear BD configs - those are persistent configuration
     }
 
     // === Packet Header Insertion (MM2S only) ===
 
-    /// Insert packet header if needed for MM2S transfers.
-    ///
-    /// Per AM025, when Enable_Packet=1 in BD Word 1, the MM2S channel inserts
-    /// a 32-bit packet header before the data. This header contains:
-    /// - Source tile location (col, row)
-    /// - Packet type and ID from the BD
-    /// - Odd parity bit
-    ///
-    /// This is called at the start of each step for active MM2S channels.
-    fn maybe_insert_packet_header(&mut self, ch_idx: usize) {
-        // Get transfer info
-        let needs_header = self.transfers[ch_idx]
-            .as_ref()
-            .map(|t| t.needs_packet_header() && t.direction == TransferDirection::MM2S)
-            .unwrap_or(false);
-
-        if !needs_header {
-            return;
-        }
-
-        // Generate and insert the packet header
-        let (header, channel) = {
-            let transfer = self.transfers[ch_idx].as_ref()
-                .expect("BUG: transfer missing in packet header generation");
-            let header = transfer.generate_packet_header();
-            (header, transfer.channel)
-        };
-
-        if let Some(header_word) = header {
-            // Insert packet header into stream output (before any data)
-            // Packet header never has TLAST set
-            self.stream_out.push_back(StreamData {
-                data: header_word,
-                tlast: false,
-                channel,
-            });
-
-            log::debug!(
-                "DMA({},{}) ch{} inserted packet header: 0x{:08X}",
-                self.col, self.row, ch_idx, header_word
-            );
-
-            // Mark header as sent
-            if let Some(transfer) = self.transfers[ch_idx].as_mut() {
-                transfer.mark_packet_header_sent();
-            }
-        }
-    }
+    // NOTE: maybe_insert_packet_header() replaced by maybe_insert_packet_header_from_transfer()
+    // which takes a Transfer reference directly from the FSM.
 
     // === Stream Interface for TileArray ===
 
@@ -2247,18 +2132,10 @@ impl DmaEngine {
     /// Check if any S2MM channel needs to receive stream data.
     ///
     /// Returns Some(channel) if a channel needs data, None otherwise.
-    /// This returns true for S2MM channels that are:
-    /// - Active and waiting for data
-    /// - WaitingForLock (will need data once lock is acquired)
-    /// This allows the stream routing to buffer data in stream_in before
-    /// the lock is acquired, matching how real hardware works.
     pub fn s2mm_needs_data(&self) -> Option<ChannelId> {
-        for ch_idx in 0..self.num_channels() {
+        for ch_idx in 0..self.channels.len() {
             if self.channel_type(ch_idx as u8) == ChannelType::S2MM {
-                let state = &self.channel_states[ch_idx];
-                // Accept data if channel is active or waiting for lock
-                let is_pending = matches!(state, ChannelState::Active | ChannelState::WaitingForLock(_));
-                // Only accept if stream_in has space
+                let is_pending = self.channels[ch_idx].is_active();
                 if is_pending && self.stream_in.len() < 256 {
                     return Some(ch_idx as u8);
                 }
@@ -2283,20 +2160,18 @@ impl DmaEngine {
         enable_token_issue: bool,
     ) -> bool {
         let ch_idx = channel as usize;
-        if ch_idx >= self.num_channels() {
+        if ch_idx >= self.channels.len() {
             return false;
         }
 
-        let queue = &mut self.task_queues[ch_idx];
+        let ch = &mut self.channels[ch_idx];
 
         // Check for overflow
-        if queue.len() >= MAX_TASK_QUEUE_DEPTH {
-            self.task_queue_overflow[ch_idx] = true;
-            // Logged at trace level since the caller (executor) handles backpressure
-            // and logs a single warning if the drain fails.
+        if ch.task_queue.len() >= MAX_TASK_QUEUE_DEPTH {
+            ch.task_queue_overflow = true;
             log::trace!(
                 "DMA tile({},{}) ch{} task queue full (BD {} rejected, queue_len={})",
-                self.col, self.row, channel, start_bd, queue.len()
+                self.col, self.row, channel, start_bd, ch.task_queue.len()
             );
             return false;
         }
@@ -2304,8 +2179,7 @@ impl DmaEngine {
         // Snapshot the BD config at enqueue time so later overwrites don't affect this task
         let bd_snapshot = self.bd_configs.get(start_bd as usize).cloned();
 
-        // Enqueue the task
-        queue.push_back(TaskQueueEntry {
+        ch.task_queue.push_back(TaskQueueEntry {
             start_bd,
             repeat_count,
             enable_token_issue,
@@ -2314,13 +2188,12 @@ impl DmaEngine {
 
         log::debug!(
             "DMA tile({},{}) ch{} enqueued task: BD={} repeat={} token={} (queue_size={})",
-            self.col, self.row, channel, start_bd, repeat_count, enable_token_issue, queue.len()
+            self.col, self.row, channel, start_bd, repeat_count, enable_token_issue,
+            ch.task_queue.len()
         );
 
         // If channel is idle, start processing the queue
-        if self.channel_states[ch_idx] == ChannelState::Idle
-            || self.channel_states[ch_idx] == ChannelState::Complete
-        {
+        if matches!(ch.fsm, ChannelFsm::Idle) {
             self.start_next_queued_task(channel);
         }
 
@@ -2328,42 +2201,35 @@ impl DmaEngine {
     }
 
     /// Start the next task from the channel's queue.
-    ///
-    /// Dequeues the front task and starts the channel with it.
     fn start_next_queued_task(&mut self, channel: u8) {
         let ch_idx = channel as usize;
-        if ch_idx >= self.num_channels() {
+        if ch_idx >= self.channels.len() {
             return;
         }
 
-        // Dequeue next task
-        let task = match self.task_queues[ch_idx].pop_front() {
+        let task = match self.channels[ch_idx].task_queue.pop_front() {
             Some(t) => t,
-            None => return, // No tasks queued
+            None => return,
         };
 
-        // Set token config from the task
-        self.channel_task_configs[ch_idx].enable_token_issue = task.enable_token_issue;
+        self.channels[ch_idx].task_config.enable_token_issue = task.enable_token_issue;
 
-        // Validate BD index before attempting to start
         if task.start_bd as usize >= self.bd_configs.len() {
             log::error!(
                 "DMA tile({},{}) ch{} queued task has invalid BD {} (max={})",
                 self.col, self.row, channel, task.start_bd, self.bd_configs.len()
             );
-            self.channel_states[ch_idx] = ChannelState::Error;
+            self.channels[ch_idx].fsm = ChannelFsm::Error;
             return;
         }
 
         log::debug!(
             "DMA tile({},{}) ch{} starting queued task: BD={} repeat={} (remaining={})",
             self.col, self.row, channel, task.start_bd, task.repeat_count,
-            self.task_queues[ch_idx].len()
+            self.channels[ch_idx].task_queue.len()
         );
 
-        // Restore BD snapshot: NPU instructions may have overwritten the BD
-        // between enqueue time and now. The snapshot preserves the config that
-        // was active when the task was enqueued (matching real hardware behavior).
+        // Restore BD snapshot
         if let Some(snapshot) = task.bd_snapshot {
             let bd_idx = task.start_bd as usize;
             if bd_idx < self.bd_configs.len() {
@@ -2371,57 +2237,53 @@ impl DmaEngine {
             }
         }
 
-        // Start the channel with the task
         let start_bd = task.start_bd;
         if let Err(e) = self.start_channel_with_repeat(channel, start_bd, task.repeat_count) {
             log::error!(
                 "DMA tile({},{}) ch{} failed to start queued task BD {}: {}",
                 self.col, self.row, channel, start_bd, e
             );
-            self.channel_states[ch_idx] = ChannelState::Error;
+            self.channels[ch_idx].fsm = ChannelFsm::Error;
         } else {
-            // Record the chain start BD for repeat restart
-            self.chain_start_bds[ch_idx] = Some(start_bd);
+            self.channels[ch_idx].chain_start_bd = Some(start_bd);
         }
     }
 
     /// Get the current task queue size for a channel.
     pub fn task_queue_size(&self, channel: u8) -> usize {
-        self.task_queues
+        self.channels
             .get(channel as usize)
-            .map(|q| q.len())
+            .map(|ch| ch.task_queue.len())
             .unwrap_or(0)
     }
 
     /// Check if the task queue overflow flag is set for a channel.
     pub fn task_queue_overflow(&self, channel: u8) -> bool {
-        self.task_queue_overflow
+        self.channels
             .get(channel as usize)
-            .copied()
+            .map(|ch| ch.task_queue_overflow)
             .unwrap_or(false)
     }
 
     /// Clear the task queue overflow flag (write-to-clear per AM025).
     pub fn clear_task_queue_overflow(&mut self, channel: u8) {
-        if let Some(flag) = self.task_queue_overflow.get_mut(channel as usize) {
-            *flag = false;
+        if let Some(ch) = self.channels.get_mut(channel as usize) {
+            ch.task_queue_overflow = false;
         }
     }
 
     /// Check if the BD unavailable error flag is set for a channel.
-    ///
-    /// This is set in OOO mode when S2MM tries to load an invalid BD from packet header.
     pub fn error_bd_unavailable(&self, channel: u8) -> bool {
-        self.error_bd_unavailable
+        self.channels
             .get(channel as usize)
-            .copied()
+            .map(|ch| ch.error_bd_unavailable)
             .unwrap_or(false)
     }
 
     /// Set the BD unavailable error flag (S2MM OOO mode).
     pub fn set_error_bd_unavailable(&mut self, channel: u8) {
-        if let Some(flag) = self.error_bd_unavailable.get_mut(channel as usize) {
-            *flag = true;
+        if let Some(ch) = self.channels.get_mut(channel as usize) {
+            ch.error_bd_unavailable = true;
             log::warn!(
                 "DMA tile({},{}) S2MM ch{} Error_BD_Unavailable: invalid BD in OOO packet header",
                 self.col, self.row, channel
@@ -2431,8 +2293,8 @@ impl DmaEngine {
 
     /// Clear the BD unavailable error flag (write-to-clear per AM025).
     pub fn clear_error_bd_unavailable(&mut self, channel: u8) {
-        if let Some(flag) = self.error_bd_unavailable.get_mut(channel as usize) {
-            *flag = false;
+        if let Some(ch) = self.channels.get_mut(channel as usize) {
+            ch.error_bd_unavailable = false;
         }
     }
 
@@ -2449,11 +2311,10 @@ impl DmaEngine {
         controller_id: u8,
         fot_mode: u8,
     ) {
-        if (ch_idx as usize) < self.channel_task_configs.len() {
-            let config = &mut self.channel_task_configs[ch_idx as usize];
-            config.enable_token_issue = enable_token_issue;
-            config.controller_id = controller_id;
-            config.fot_mode = fot_mode;
+        if let Some(ch) = self.channels.get_mut(ch_idx as usize) {
+            ch.task_config.enable_token_issue = enable_token_issue;
+            ch.task_config.controller_id = controller_id;
+            ch.task_config.fot_mode = fot_mode;
 
             log::trace!(
                 "DMA tile({},{}) ch{} set task config: token_issue={} controller_id={} fot_mode={}",
@@ -2463,8 +2324,6 @@ impl DmaEngine {
     }
 
     /// Set channel compression/decompression and out-of-order configuration.
-    ///
-    /// Called when channel control register is written.
     pub fn set_channel_compression_config(
         &mut self,
         ch_idx: u8,
@@ -2472,11 +2331,10 @@ impl DmaEngine {
         decompression_enable: bool,
         out_of_order_enable: bool,
     ) {
-        if (ch_idx as usize) < self.channel_task_configs.len() {
-            let config = &mut self.channel_task_configs[ch_idx as usize];
-            config.compression_enable = compression_enable;
-            config.decompression_enable = decompression_enable;
-            config.out_of_order_enable = out_of_order_enable;
+        if let Some(ch) = self.channels.get_mut(ch_idx as usize) {
+            ch.task_config.compression_enable = compression_enable;
+            ch.task_config.decompression_enable = decompression_enable;
+            ch.task_config.out_of_order_enable = out_of_order_enable;
 
             log::trace!(
                 "DMA tile({},{}) ch{} set compression config: compress={} decompress={} ooo={}",
@@ -2504,9 +2362,9 @@ impl DmaEngine {
 
     /// Get the FoT mode for a channel (S2MM only).
     pub fn get_channel_fot_mode(&self, ch_idx: u8) -> u8 {
-        self.channel_task_configs
+        self.channels
             .get(ch_idx as usize)
-            .map(|c| c.fot_mode)
+            .map(|ch| ch.task_config.fot_mode)
             .unwrap_or(0)
     }
 
@@ -2526,63 +2384,56 @@ impl DmaEngine {
         let layout = self.status_layout();
 
         let ch_idx = channel as usize;
-        if ch_idx >= self.num_channels() {
+        if ch_idx >= self.channels.len() {
             return 0;
         }
 
+        let ch = &self.channels[ch_idx];
         let mut status: u32 = 0;
 
-        // Cur_BD: 4 bits [27:24] for compute, 6 bits [29:24] for memtile
-        if let Some(bd_idx) = self.current_bds[ch_idx] {
+        // Cur_BD
+        if let Some(bd_idx) = ch.current_bd {
             status = layout.cur_bd.insert(status, bd_idx as u32);
         }
 
-        // Task_Queue_Size (bits 22:20)
-        let queue_size = self.task_queues[ch_idx].len() as u32;
+        // Task_Queue_Size
+        let queue_size = ch.task_queue.len() as u32;
         status = layout.task_queue_size.insert(status, queue_size);
 
-        // Task_Queue_Overflow (bit 18)
-        if self.task_queue_overflow[ch_idx] {
+        // Task_Queue_Overflow
+        if ch.task_queue_overflow {
             status = layout.task_queue_overflow.set_bit(status);
         }
 
-        // Error_BD_Unavailable (bit 10) - S2MM out-of-order mode only
-        if self.error_bd_unavailable[ch_idx] {
+        // Error_BD_Unavailable
+        if ch.error_bd_unavailable {
             status = layout.error_bd_unavailable.set_bit(status);
         }
 
-        // Channel state (bits 1:0 and bit 19)
-        match self.channel_states[ch_idx] {
-            ChannelState::Idle => {
-                // State = 00 (IDLE), not running
-            }
-            ChannelState::Active => {
-                // State = 10 (RUNNING), running = 1
-                status = layout.status.insert(status, 0b10);
-                status = layout.channel_running.set_bit(status);
-            }
-            ChannelState::Paused => {
-                // Paused: running but not actively transferring
-                status = layout.channel_running.set_bit(status);
-            }
-            ChannelState::WaitingForLock(_lock_id) => {
-                // State = 10 (RUNNING), stalled on lock acquire
+        // Derive external state from FSM
+        match &ch.fsm {
+            ChannelFsm::Idle => {}
+            ChannelFsm::AcquiringLock { acquired: false, .. } => {
+                // Stalled on lock acquire
                 status = layout.status.insert(status, 0b10);
                 status = layout.channel_running.set_bit(status);
                 status = layout.stalled_lock_acq.set_bit(status);
             }
-            ChannelState::Complete => {
-                // Transition state: will go to IDLE on next step
-                status = layout.status.insert(status, 0b01);
+            ChannelFsm::Paused { .. } => {
+                status = layout.channel_running.set_bit(status);
             }
-            ChannelState::Error => {
-                // Error: set invalid BD error
+            ChannelFsm::Error => {
                 status = layout.error_bd_invalid.set_bit(status);
+            }
+            _ => {
+                // All other active states
+                status = layout.status.insert(status, 0b10);
+                status = layout.channel_running.set_bit(status);
             }
         }
 
-        // Check for stream stall (S2MM waiting for data)
-        if let Some(transfer) = &self.transfers[ch_idx] {
+        // Check for stream stall (S2MM waiting for data in Transferring state)
+        if let Some(transfer) = ch.fsm.transfer() {
             if matches!(transfer.direction, TransferDirection::S2MM)
                 && !self.has_stream_in_for_channel(channel)
             {
@@ -2595,25 +2446,25 @@ impl DmaEngine {
 
     /// Get whether compression is enabled for a channel (MM2S).
     pub fn is_compression_enabled(&self, channel: u8) -> bool {
-        self.channel_task_configs
+        self.channels
             .get(channel as usize)
-            .map(|c| c.compression_enable)
+            .map(|ch| ch.task_config.compression_enable)
             .unwrap_or(false)
     }
 
     /// Get whether decompression is enabled for a channel (S2MM).
     pub fn is_decompression_enabled(&self, channel: u8) -> bool {
-        self.channel_task_configs
+        self.channels
             .get(channel as usize)
-            .map(|c| c.decompression_enable)
+            .map(|ch| ch.task_config.decompression_enable)
             .unwrap_or(false)
     }
 
     /// Get whether out-of-order mode is enabled for a channel (S2MM).
     pub fn is_out_of_order_enabled(&self, channel: u8) -> bool {
-        self.channel_task_configs
+        self.channels
             .get(channel as usize)
-            .map(|c| c.out_of_order_enable)
+            .map(|ch| ch.task_config.out_of_order_enable)
             .unwrap_or(false)
     }
 
@@ -2858,7 +2709,7 @@ mod tests {
         }
 
         // Verify completion
-        assert_eq!(engine.channel_state(2), ChannelState::Complete);
+        assert_eq!(engine.channel_state(2), ChannelState::Idle);
 
         let stats = engine.channel_stats(2).unwrap();
         assert_eq!(stats.transfers_completed, 1);
