@@ -537,6 +537,10 @@ pub struct Options {
     pub fuzz_iterations: usize,
     /// Base seed for fuzz generation (None = use wall clock).
     pub fuzz_seed: Option<u64>,
+    /// Run trace event group sweep (multi-group trace capture + comparison).
+    pub trace_sweep: bool,
+    /// Number of NPU repetitions for trace determinism check (default 5).
+    pub trace_sweep_reps: usize,
 }
 
 /// Parse CLI arguments and merge with runner config.
@@ -562,6 +566,8 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
     // Fuzz mode
     let mut fuzz_iterations: usize = 100;
     let mut fuzz_seed: Option<u64> = None;
+    let mut trace_sweep = false;
+    let mut trace_sweep_reps: usize = 5;
 
     // Emu+HW mode
     let mut elfanalyze = false;
@@ -643,6 +649,14 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
                     eprintln!("Invalid --seed value: {}", v);
                     std::process::exit(1);
                 }));
+            }
+            "--trace-sweep" => trace_sweep = true,
+            "--trace-sweep-reps" => {
+                let v = next_value(&mut iter, "--trace-sweep-reps");
+                trace_sweep_reps = v.parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid --trace-sweep-reps value: {}", v);
+                    std::process::exit(1);
+                });
             }
 
             // --- Common ---
@@ -863,6 +877,8 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
 
         fuzz_iterations,
         fuzz_seed,
+        trace_sweep,
+        trace_sweep_reps,
     }
 }
 
@@ -926,6 +942,8 @@ fn print_usage() {
     eprintln!("Fuzz mode options:");
     eprintln!("  --iterations N      Number of fuzz cases to generate (default: 100)");
     eprintln!("  --seed N            Base RNG seed (default: wall clock)");
+    eprintln!("  --trace-sweep       Sweep trace event groups and compare NPU vs emulator");
+    eprintln!("  --trace-sweep-reps N  NPU repetitions for determinism check (default: 5)");
     eprintln!();
     eprintln!("Filters are substring matches on test names, OR-ed together.");
 }

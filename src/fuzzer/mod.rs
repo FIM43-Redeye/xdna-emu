@@ -11,3 +11,4 @@ pub mod gen;
 pub mod lower_cpp;
 pub mod params;
 pub mod runner;
+pub mod trace_sweep;
