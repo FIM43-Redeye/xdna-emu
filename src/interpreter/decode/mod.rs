@@ -99,66 +99,6 @@ impl Aie2Slot {
     }
 }
 
-/// Common opcode patterns for quick classification.
-///
-/// These are derived from observing real instruction streams and
-/// will be refined with TableGen data.
-pub mod opcodes {
-    /// Zero word - simplest NOP.
-    pub const NOP_ZERO: u32 = 0x0000_0000;
-
-    /// AIE canonical NOP pattern.
-    pub const NOP_AIE: u32 = 0x1501_0040;
-
-    /// High nibble patterns for instruction classification.
-    pub mod high_nibble {
-        /// Branch/call patterns.
-        pub const BRANCH: u32 = 0x0;
-        pub const CALL: u32 = 0x1;
-        /// Load patterns.
-        pub const LOAD: u32 = 0x2;
-        /// Store patterns.
-        pub const STORE: u32 = 0x3;
-        /// Arithmetic patterns.
-        pub const ARITH_0: u32 = 0x4;
-        pub const ARITH_1: u32 = 0x5;
-        pub const ARITH_2: u32 = 0x6;
-        pub const ARITH_3: u32 = 0x7;
-        /// Move patterns.
-        pub const MOVE: u32 = 0x8;
-        /// Lock patterns.
-        pub const LOCK: u32 = 0x9;
-        /// DMA patterns.
-        pub const DMA: u32 = 0xA;
-        /// Vector patterns.
-        pub const VEC_0: u32 = 0xB;
-        pub const VEC_1: u32 = 0xC;
-        pub const VEC_2: u32 = 0xD;
-        pub const VEC_3: u32 = 0xE;
-        pub const VEC_4: u32 = 0xF;
-    }
-}
-
-/// Extract register fields from an instruction word.
-#[inline]
-pub fn extract_reg(word: u32, shift: u8, mask: u32) -> u8 {
-    ((word >> shift) & mask) as u8
-}
-
-/// Extract an immediate value from an instruction word.
-#[inline]
-pub fn extract_imm(word: u32, shift: u8, bits: u8) -> i32 {
-    let mask = (1u32 << bits) - 1;
-    let raw = (word >> shift) & mask;
-
-    // Sign extend if high bit is set
-    if bits < 32 && (raw & (1 << (bits - 1))) != 0 {
-        (raw | !mask) as i32
-    } else {
-        raw as i32
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,31 +110,5 @@ mod tests {
         assert_eq!(Aie2Slot::Alu.bit_width(), 20);
         assert_eq!(Aie2Slot::Vec.bit_width(), 26);
         assert_eq!(Aie2Slot::Lng.bit_width(), 42);
-    }
-
-    #[test]
-    fn test_extract_reg() {
-        let word = 0x12345678;
-        assert_eq!(extract_reg(word, 0, 0xF), 0x8);
-        assert_eq!(extract_reg(word, 4, 0xF), 0x7);
-        assert_eq!(extract_reg(word, 8, 0xF), 0x6);
-    }
-
-    #[test]
-    fn test_extract_imm_positive() {
-        // 0x7FF with 12 bits = 2047 (positive, sign bit not set)
-        let word = 0x000007FF;
-        assert_eq!(extract_imm(word, 0, 12), 2047);
-    }
-
-    #[test]
-    fn test_extract_imm_signed() {
-        // 0xFFF with 12 bits = -1 when sign extended
-        let word = 0x00000FFF;
-        assert_eq!(extract_imm(word, 0, 12), -1);
-
-        // 0x7FF with 12 bits = 2047 (positive)
-        let word = 0x000007FF;
-        assert_eq!(extract_imm(word, 0, 12), 2047);
     }
 }

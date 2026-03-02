@@ -103,52 +103,6 @@ impl CycleAccurateExecutor {
         self.latencies.timing_for_slot_op(op).latency
     }
 
-    /// Check for register hazards and return stall cycles needed.
-    /// Reserved for future cycle-accurate pipeline hazard integration.
-    #[allow(dead_code)]
-    fn check_hazards(&self, op: &SlotOp) -> u8 {
-        let hazards = self.hazards.check_operation(op);
-        self.hazards.max_stall(&hazards)
-    }
-
-    /// Check for memory bank conflicts.
-    #[allow(dead_code)]
-    fn check_memory_conflict(&self, op: &SlotOp) -> u8 {
-        match op.semantic {
-            Some(SemanticOp::Load) | Some(SemanticOp::Store) if !op.is_vector => {
-                let addr = self.get_memory_address(op);
-                let is_store = matches!(op.semantic, Some(SemanticOp::Store));
-                let access = MemoryAccess {
-                    address: addr,
-                    width: op.mem_width.bytes(),
-                    is_write: is_store,
-                    port: if is_store { 2 } else { 0 },
-                };
-                self.memory.check_conflict(&access).stall_cycles
-            }
-            _ => 0,
-        }
-    }
-
-    /// Extract memory address from operation (simplified).
-    fn get_memory_address(&self, _op: &SlotOp) -> u32 {
-        // In a real implementation, we'd read the pointer register value
-        // from the execution context. For now, return 0 as a placeholder.
-        // The actual address would be resolved during execution.
-        0
-    }
-
-    /// Execute a single slot operation with timing tracking.
-    #[allow(dead_code)]
-    fn execute_slot(
-        &mut self,
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        tile: &mut Tile,
-    ) -> Option<ExecuteResult> {
-        self.execute_slot_with_mem_locks(op, ctx, tile, None, None)
-    }
-
     /// Execute a single slot operation with optional memory tile lock routing.
     fn execute_slot_with_mem_locks(
         &mut self,
@@ -223,7 +177,9 @@ impl CycleAccurateExecutor {
     fn record_memory_access(&mut self, op: &SlotOp) {
         match op.semantic {
             Some(SemanticOp::Load) | Some(SemanticOp::Store) if !op.is_vector => {
-                let addr = self.get_memory_address(op);
+                // Placeholder: actual address resolution requires the execution
+                // context, which record_memory_access doesn't currently receive.
+                let addr = 0u32;
                 let is_store = matches!(op.semantic, Some(SemanticOp::Store));
                 let access = MemoryAccess {
                     address: addr,
@@ -318,47 +274,10 @@ impl CycleAccurateExecutor {
         // enough independent instructions between a write and its dependent
         // read to cover the pipeline latency. Adding scoreboard-based stalls
         // on top of compiler-scheduled code produces incorrect timing: extra
-        // stall cycles cause load results to become visible too early relative
-        // to the instruction that needs them, breaking the compiler's
-        // carefully-planned pipeline interleaving.
-        //
-        // The correct long-term fix is to model the AIE2 scoreboard
-        // precisely, tracking which pipeline stages each instruction occupies
-        // and only stalling when the compiler's schedule is truly insufficient.
-        // For now, trusting the compiler produces correct functional results.
-        let total_stall = 0u8;
-        let stall_reasons: Vec<StallReason> = Vec::new();
-
-        // Record stalls and their reasons (currently always 0 -- see note above)
-        if total_stall > 0 {
-            self.total_hazard_stalls += total_stall as u64;
-            ctx.record_stall(total_stall as u64);
-
-            // Record detailed breakdown
-            for reason in &stall_reasons {
-                self.detailed_stats.record(reason);
-            }
-
-            // Emit hardware-aligned stall events
-            let timing = ctx.timing_context_mut();
-            for reason in &stall_reasons {
-                match reason {
-                    StallReason::RegisterHazard { cycles, .. } => {
-                        // Register hazards manifest as memory stalls at hardware level
-                        timing.record_event(start_cycle, EventType::MemoryStall { cycles: *cycles });
-                    }
-                    StallReason::MemoryConflict { cycles, .. } => {
-                        timing.record_event(start_cycle, EventType::MemoryStall { cycles: *cycles });
-                    }
-                    StallReason::LockContention { .. } => {
-                        timing.record_event(start_cycle, EventType::LockStall { cycles: 1 });
-                    }
-                    StallReason::BranchPenalty { .. }
-                    | StallReason::StructuralHazard { .. }
-                    | StallReason::DmaWait { .. } => {}
-                }
-            }
-        }
+        // NOTE: Hazard stalls are disabled. The AIE2 scoreboard model needs
+        // precise per-stage tracking before stalls can be re-enabled. The
+        // compiler's schedule is trusted for now. See timing/hazards.rs for
+        // the detection infrastructure (recording is active for stats).
 
         // Phase 2: Execute all slot operations
         //

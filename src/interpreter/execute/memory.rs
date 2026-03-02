@@ -253,16 +253,6 @@ impl MemoryUnit {
                 true
             }
 
-            Some(SemanticOp::PointerAdd) => {
-                Self::execute_pointer_add(op, ctx);
-                true
-            }
-
-            Some(SemanticOp::PointerMov) => {
-                Self::execute_pointer_mov(op, ctx);
-                true
-            }
-
             Some(SemanticOp::Load) if op.slot == SlotIndex::LoadA => {
                 Self::execute_vector_load_a(op, ctx, tile, pm, neighbors);
                 true
@@ -287,52 +277,6 @@ impl MemoryUnit {
 
             _ => false, // Not a memory operation
         }
-    }
-
-    /// Execute pointer add: ptr = ptr + offset.
-    /// padda, paddb, padds instructions modify pointer registers for address generation.
-    fn execute_pointer_add(op: &SlotOp, ctx: &mut ExecutionContext) {
-        // Get destination pointer register
-        let ptr_reg = match &op.dest {
-            Some(Operand::PointerReg(r)) => *r,
-            _ => return, // No valid destination
-        };
-
-        // Get current pointer value
-        let ptr_value = ctx.pointer_read(ptr_reg);
-
-        // Get offset from source operand
-        let offset = match op.sources.first() {
-            Some(Operand::Immediate(imm)) => *imm as i32,
-            Some(Operand::ScalarReg(r)) => ctx.scalar_read(*r) as i32,
-            Some(Operand::ModifierReg(r)) => ctx.modifier_read(*r) as i32,
-            _ => 0,
-        };
-
-        // Add offset to pointer (wrapping)
-        let new_value = (ptr_value as i32).wrapping_add(offset) as u32;
-
-        ctx.pointer.write(ptr_reg, new_value);
-    }
-
-    /// Execute pointer move: ptr = value.
-    /// mova, movb instructions set pointer registers.
-    fn execute_pointer_mov(op: &SlotOp, ctx: &mut ExecutionContext) {
-        // Get destination pointer register
-        let ptr_reg = match &op.dest {
-            Some(Operand::PointerReg(r)) => *r,
-            _ => return,
-        };
-
-        // Get value from source operand
-        let value = match op.sources.first() {
-            Some(Operand::Immediate(imm)) => *imm as u32,
-            Some(Operand::ScalarReg(r)) => ctx.scalar_read(*r),
-            Some(Operand::PointerReg(r)) => ctx.pointer_read(*r),
-            _ => 0,
-        };
-
-        ctx.pointer.write(ptr_reg, value);
     }
 
     /// Execute a load operation.

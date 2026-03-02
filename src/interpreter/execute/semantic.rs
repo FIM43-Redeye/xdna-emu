@@ -136,6 +136,10 @@ pub fn execute_semantic(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         // Move/copy
         SemanticOp::Copy => execute_mov(op, ctx),
 
+        // Pointer operations (padda, paddb, mova, movb)
+        SemanticOp::PointerAdd => execute_pointer_add(op, ctx),
+        SemanticOp::PointerMov => execute_pointer_mov(op, ctx),
+
         // Sign/zero extension
         SemanticOp::SignExtend => execute_sign_extend(op, ctx),
         SemanticOp::ZeroExtend => execute_zero_extend(op, ctx),
@@ -555,6 +559,37 @@ fn execute_mov(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         op.dest, op.sources.get(0), value
     );
     write_dest(op, ctx, value);
+    true
+}
+
+/// Pointer add: pN = pN + offset (padda, paddb, padds).
+///
+/// The pointer register appears as a tied operand (dest=pN, implicit read of
+/// pN for the base address). Uses deferred pipeline write (latency 1) to
+/// match hardware pointer write timing.
+fn execute_pointer_add(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
+    let ptr_idx = match op.dest {
+        Some(Operand::PointerReg(p)) => p,
+        None => 6, // SP = p6 (PADDA_sp_imm / PADDB_sp_imm: Defs=[SP], Uses=[SP])
+        _ => return false,
+    };
+    let base = ctx.pointer_read(ptr_idx);
+    let offset = read_source(op, ctx, 0);
+    let result = base.wrapping_add(offset);
+    ctx.queue_pointer_write(ptr_idx, result, 1);
+    true
+}
+
+/// Pointer move: pN = value (mova, movb to pointer register).
+///
+/// Uses deferred pipeline write (latency 1) to match hardware timing.
+fn execute_pointer_mov(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
+    let ptr_idx = match op.dest {
+        Some(Operand::PointerReg(p)) => p,
+        _ => return false,
+    };
+    let value = read_source(op, ctx, 0);
+    ctx.queue_pointer_write(ptr_idx, value, 1);
     true
 }
 
@@ -1198,8 +1233,37 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_pointer_add_in_load_slot() {
-        // padda instruction: pN = pN + imm, in LoadA/LoadB slot
+    fn test_execute_pointer_add() {
+        // padda instruction: pN = pN + imm
+        let mut ctx = make_test_context();
+        ctx.pointer.write(2, 0x1000);
+
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::PointerAdd)
+            .with_dest(Operand::PointerReg(2))
+            .with_source(Operand::Immediate(0x100));
+
+        assert!(execute_semantic(&op, &mut ctx));
+        ctx.flush_pending_writes();
+        assert_eq!(ctx.pointer.read(2), 0x1100);
+    }
+
+    #[test]
+    fn test_execute_pointer_mov() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(3, 0x2000);
+
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::PointerMov)
+            .with_dest(Operand::PointerReg(1))
+            .with_source(Operand::ScalarReg(3));
+
+        assert!(execute_semantic(&op, &mut ctx));
+        ctx.flush_pending_writes();
+        assert_eq!(ctx.pointer.read(1), 0x2000);
+    }
+
+    #[test]
+    fn test_execute_pointer_add_fallback_via_add() {
+        // Defensive: Add in LoadA slot with single source still works as pointer add
         let mut ctx = make_test_context();
         ctx.pointer.write(2, 0x1000);
 
@@ -1208,7 +1272,6 @@ mod tests {
         op.dest = Some(Operand::PointerReg(2));
 
         assert!(execute_semantic(&op, &mut ctx));
-        // Pointer write is deferred (pipeline latency 1); flush to make visible.
         ctx.flush_pending_writes();
         assert_eq!(ctx.pointer.read(2), 0x1100);
     }
