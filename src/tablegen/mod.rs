@@ -371,6 +371,84 @@ fn parse_tblgen_output(
         pattern_map.len(),
     );
 
+    // Propagate semantics through pseudo -> concrete expansion maps.
+    //
+    // Pat<> patterns often target pseudo instructions (e.g., PADD_imm9_pseudo)
+    // which expand to concrete encodings (e.g., PADDB_ldb_ptr_inc_nrm_imm) via
+    // the `materializableInto` field. The concrete encodings have no Pat<> and
+    // no structural flags, so they miss semantic assignment above.
+    //
+    // Build a reverse map: for each pseudo that has a known semantic (from
+    // pattern_map), propagate that semantic to all its concrete alternatives.
+    let pseudo_map = tblgen_records::parse_pseudo_expansion_map(records_text);
+    let mut pseudo_propagated = 0usize;
+    // Build concrete_name -> semantic from pseudo expansions
+    let mut expansion_semantics: HashMap<String, types::SemanticOp> = HashMap::new();
+    for (pseudo_name, concretes) in &pseudo_map {
+        if let Some(&op) = pattern_map.get(pseudo_name.as_str()) {
+            for concrete in concretes {
+                expansion_semantics.insert(concrete.clone(), op);
+            }
+        }
+    }
+    // Apply to encodings that still lack a semantic
+    for encodings in by_slot.values_mut() {
+        for enc in encodings.iter_mut() {
+            if enc.semantic.is_none() {
+                if let Some(&op) = expansion_semantics.get(enc.name.as_str()) {
+                    enc.semantic = Some(op);
+                    pseudo_propagated += 1;
+                }
+            }
+        }
+    }
+    log::info!(
+        "Propagated {} semantics via pseudo expansion from {} pseudo records",
+        pseudo_propagated,
+        pseudo_map.len(),
+    );
+
+    // Itinerary-based inference for instruction families without pseudo expansion.
+    //
+    // The 2D/3D PADD variants (PADDA_2D, PADDB_3D, etc.) have no MultiSlot_Pseudo
+    // parent and no Pat<> records -- the compiler emits them via custom C++ lowering
+    // for multi-dimensional addressing. Similarly, PADD_sp_imm_pseudo expands to
+    // PADDB_sp_imm/PADDA_sp_imm but has no ptradd SDNode pattern (it's used for
+    // stack frame adjustment). The scheduling model's Itinerary field (II_PADD,
+    // II_PADD_2D, II_PADD_3D) groups all pointer arithmetic instructions, providing
+    // a structural classification from LLVM that doesn't depend on string matching
+    // the assembly mnemonic.
+    let mut itinerary_inferred = 0usize;
+    for encodings in by_slot.values_mut() {
+        for enc in encodings.iter_mut() {
+            if enc.semantic.is_none() {
+                if let Some(ref sched) = enc.sched_class {
+                    if sched.starts_with("II_PADD") {
+                        enc.semantic = Some(types::SemanticOp::PointerAdd);
+                        itinerary_inferred += 1;
+                    }
+                }
+            }
+        }
+    }
+    if itinerary_inferred > 0 {
+        log::info!(
+            "Inferred {} semantics from itinerary class grouping",
+            itinerary_inferred,
+        );
+    }
+
+    // Derive is_ptr_arithmetic from resolved semantics. This ensures the flag
+    // is set for instructions whose PointerAdd semantic came from pseudo
+    // expansion propagation or itinerary inference (both run after to_encoding()).
+    for encodings in by_slot.values_mut() {
+        for enc in encodings.iter_mut() {
+            if enc.semantic == Some(types::SemanticOp::PointerAdd) {
+                enc.is_ptr_arithmetic = true;
+            }
+        }
+    }
+
     // Log slot counts
     for (slot, encodings) in &by_slot {
         log::debug!("Slot '{}': {} encodings", slot, encodings.len());
@@ -954,6 +1032,17 @@ mod tests {
         if let Some(nopx) = all.iter().find(|e| e.name == "NOPX") {
             assert_eq!(nopx.semantic, Some(SemanticOp::Nop),
                 "NOPX should be Nop (isSlotNOP=1)");
+        }
+
+        // Pointer arithmetic: PointerAdd propagated from pseudo expansion.
+        // Pat<ptradd> -> PADD_imm9_pseudo -> materializableInto -> PADDB_*
+        // The concrete PADDB has no Pat<> and no structural flags; semantic
+        // comes entirely through the materializableInto chain.
+        if let Some(paddb) = all.iter().find(|e| e.name == "PADDB_ldb_ptr_inc_nrm_imm") {
+            assert_eq!(paddb.semantic, Some(SemanticOp::PointerAdd),
+                "PADDB_ldb_ptr_inc_nrm_imm should be PointerAdd (via pseudo expansion)");
+            assert!(paddb.is_ptr_arithmetic,
+                "PADDB should have is_ptr_arithmetic derived from semantic");
         }
 
         // Count semantics by source

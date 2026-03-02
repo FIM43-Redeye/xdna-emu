@@ -627,17 +627,6 @@ impl InstrRecord {
         // without lr; the mnemonic distinguishes conditional from unconditional.
         let semantic = refine_branch_semantic(&self.mnemonic, semantic);
 
-        // Mnemonic-based fallback for pointer arithmetic. PADD instructions
-        // (padda, paddb, padds, padda.2d, etc.) have no Pat<> on the concrete
-        // encoding (patterns target PADD_*_pseudo which expands to these) and
-        // no structural flags (no mayLoad/mayStore/hasDelaySlot). The mnemonic
-        // is the only reliable signal.
-        let semantic = if semantic.is_none() && self.mnemonic.starts_with("padd") {
-            Some(SemanticOp::PointerAdd)
-        } else {
-            semantic
-        };
-
         // Cross-validate: isBranch/isCall/isReturn flags (set on Pseudo variants)
         // should agree with hasDelaySlot-based inference on hardware encodings.
         // These flags are secondary (Pseudos don't have hardware encodings), but
@@ -689,9 +678,12 @@ impl InstrRecord {
             }))
             .collect();
 
-        // Pre-resolve metadata from mnemonic
+        // Pre-resolve metadata from mnemonic and semantic
         let is_vector = self.mnemonic.starts_with('v') || self.mnemonic.starts_with('V');
-        let is_ptr_arithmetic = self.mnemonic.starts_with("padd");
+        // Initial value from structural inference; may be upgraded by pseudo
+        // expansion propagation in parse_tblgen_output() when SemanticOp::PointerAdd
+        // is assigned via the materializableInto chain.
+        let is_ptr_arithmetic = semantic == Some(SemanticOp::PointerAdd);
         let is_sp_relative = self.uses.iter().any(|u| u == "SP");
         let element_type = infer_element_type(&self.mnemonic);
         let branch_condition = infer_branch_condition(&self.mnemonic, semantic);
@@ -1196,6 +1188,62 @@ pub fn parse_pattern_records(content: &str) -> HashMap<String, SemanticOp> {
     result
 }
 
+/// Parse MultiSlot_Pseudo expansion maps from `--print-records` output.
+///
+/// Pseudo instructions have `isPseudo = 1` and a `materializableInto` field
+/// listing the concrete instructions they expand into. For example:
+///
+/// ```text
+/// def PADD_imm9_pseudo {  // ... MultiSlot_Pseudo
+///   bit isPseudo = 1;
+///   list<AIE2Inst> materializableInto = [PADDB_ldb_ptr_inc_nrm_imm,
+///                                        PADDS_st_ptr_inc_idx_imm,
+///                                        PADDA_lda_ptr_inc_idx_imm];
+/// }
+/// ```
+///
+/// Returns a map from pseudo instruction name to the list of concrete
+/// instruction names it can expand into.
+pub fn parse_pseudo_expansion_map(content: &str) -> HashMap<String, Vec<String>> {
+    let mut result: HashMap<String, Vec<String>> = HashMap::new();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        // Look for "def NAME {  // ... MultiSlot_Pseudo"
+        if lines[i].starts_with("def ") && lines[i].contains("MultiSlot_Pseudo") {
+            let name = lines[i].strip_prefix("def ")
+                .and_then(|s| s.find(|c: char| c.is_whitespace() || c == '{')
+                    .map(|pos| s[..pos].to_string()));
+
+            if let Some(name) = name {
+                i += 1;
+                let mut concretes: Vec<String> = Vec::new();
+
+                // Parse fields until closing brace
+                while i < lines.len() {
+                    let line = lines[i].trim();
+                    if line == "}" || line.starts_with('}') {
+                        break;
+                    }
+
+                    if line.starts_with("list<AIE2Inst> materializableInto = ") {
+                        concretes = parse_reference_list(line);
+                    }
+                    i += 1;
+                }
+
+                if !concretes.is_empty() {
+                    result.insert(name, concretes);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    result
+}
+
 /// Extract the first instruction name from ResultInstrs.
 ///
 /// Format: `list<dag> ResultInstrs = [(INSTR_NAME operands...)];`
@@ -1512,6 +1560,88 @@ def NOT_A_PATTERN {	// SomeOtherClass
         assert_eq!(map.get("SELNEZ"), Some(&SemanticOp::Select), "SELNEZ -> Select");
         assert_eq!(map.get("ACQ_mLockId_reg"), Some(&SemanticOp::LockAcquire));
         assert_eq!(map.get("REL_mLockId_reg"), Some(&SemanticOp::LockRelease));
+    }
+
+    #[test]
+    fn test_parse_pseudo_expansion_map() {
+        let content = r#"
+def PADD_imm9_pseudo {	// InstructionEncoding Instruction InstFormat AIEBaseInst AIE2Inst MultiSlot_Pseudo
+  bit isPseudo = 1;
+  bit isCodeGenOnly = 1;
+  bits<1> isMultiSlotPseudo = { 1 };
+  list<AIE2Inst> materializableInto = [PADDB_ldb_ptr_inc_nrm_imm, PADDS_st_ptr_inc_idx_imm, PADDA_lda_ptr_inc_idx_imm];
+}
+def PADD_mod_pseudo {	// InstructionEncoding Instruction InstFormat AIEBaseInst AIE2Inst MultiSlot_Pseudo
+  bit isPseudo = 1;
+  list<AIE2Inst> materializableInto = [PADDB_ldb_ptr_inc_nospill_nrm, PADDS_st_ptr_inc_idx, PADDA_lda_ptr_inc_idx];
+}
+def NOT_A_PSEUDO {	// SomeOtherClass
+  string Name = "irrelevant";
+  list<AIE2Inst> materializableInto = [SHOULD_NOT_APPEAR];
+}
+def EMPTY_PSEUDO {	// InstructionEncoding Instruction InstFormat AIEBaseInst AIE2Inst MultiSlot_Pseudo
+  bit isPseudo = 1;
+  list<AIE2Inst> materializableInto = [];
+}
+"#;
+
+        let map = parse_pseudo_expansion_map(content);
+
+        // PADD_imm9_pseudo -> 3 concrete instructions
+        assert_eq!(
+            map.get("PADD_imm9_pseudo").map(|v| v.len()),
+            Some(3),
+        );
+        assert_eq!(
+            map["PADD_imm9_pseudo"][0],
+            "PADDB_ldb_ptr_inc_nrm_imm",
+        );
+
+        // PADD_mod_pseudo -> 3 concrete instructions
+        assert_eq!(
+            map.get("PADD_mod_pseudo").map(|v| v.len()),
+            Some(3),
+        );
+
+        // NOT_A_PSEUDO should be excluded (no MultiSlot_Pseudo in parents)
+        assert!(!map.contains_key("NOT_A_PSEUDO"));
+
+        // EMPTY_PSEUDO should be excluded (empty materializableInto)
+        assert!(!map.contains_key("EMPTY_PSEUDO"));
+
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_pseudo_expansion_map_with_real_data() {
+        let cache_path = std::path::Path::new(env!("HOME"))
+            .join(".cache/xdna-emu/tblgen/records.txt");
+        if !cache_path.exists() {
+            eprintln!("Skipping test: tblgen cache not found");
+            return;
+        }
+
+        let content = std::fs::read_to_string(&cache_path).unwrap();
+        let map = parse_pseudo_expansion_map(&content);
+
+        eprintln!("Parsed {} pseudo expansion records", map.len());
+
+        // Should have the PADD pseudos
+        assert!(map.contains_key("PADD_imm9_pseudo"),
+            "PADD_imm9_pseudo should be present");
+        assert!(map.contains_key("PADD_mod_pseudo"),
+            "PADD_mod_pseudo should be present");
+
+        // PADD_imm9_pseudo should expand to PADDB, PADDS, PADDA variants
+        let padd_imm9 = &map["PADD_imm9_pseudo"];
+        assert_eq!(padd_imm9.len(), 3);
+        assert!(padd_imm9.iter().any(|n| n.starts_with("PADDB")));
+        assert!(padd_imm9.iter().any(|n| n.starts_with("PADDS")));
+        assert!(padd_imm9.iter().any(|n| n.starts_with("PADDA")));
+
+        // VLD pseudos should also be present
+        assert!(map.contains_key("VLD_idx_pseudo"),
+            "VLD_idx_pseudo should be present");
     }
 
     #[test]
