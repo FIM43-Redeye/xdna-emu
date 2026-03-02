@@ -25,10 +25,11 @@
 //! # Usage
 //!
 //! ```ignore
-//! use xdna_emu::interpreter::timing::{LatencyTable, OperationKey, MemoryModel};
+//! use xdna_emu::interpreter::timing::{LatencyTable, MemoryModel};
+//! use xdna_emu::tablegen::SemanticOp;
 //!
 //! let latencies = LatencyTable::aie2();
-//! let timing = latencies.get(OperationKey::ScalarMul);
+//! let timing = LatencyTable::timing_from_semantic(SemanticOp::Mul, false);
 //! assert_eq!(timing.latency, 2);
 //! ```
 

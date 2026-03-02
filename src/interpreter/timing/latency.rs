@@ -14,7 +14,6 @@
 //! | Vector simple | 1-2 cycles | Basic vector ops |
 //! | Vector MAC | 4+ cycles | Multiply-accumulate |
 
-use std::collections::HashMap;
 use crate::interpreter::bundle::SlotOp;
 use crate::tablegen::SemanticOp;
 
@@ -152,273 +151,163 @@ pub const LATENCY_VECTOR_SHUFFLE: u8 = 2;
 pub const LATENCY_VECTOR_PACK: u8 = 2;
 
 // ============================================================================
+// Timing Constants (pre-computed from the latency constants above)
+// ============================================================================
+
+const TIMING_NOP: OperationTiming = OperationTiming::simple(LATENCY_NOP);
+const TIMING_SCALAR_1: OperationTiming = OperationTiming::simple(LATENCY_SCALAR_ADD);
+const TIMING_SCALAR_MUL: OperationTiming = OperationTiming::simple(LATENCY_SCALAR_MUL);
+const TIMING_SCALAR_DIV: OperationTiming = OperationTiming::with_throughput(LATENCY_SCALAR_DIV, 6);
+const TIMING_LOAD: OperationTiming = OperationTiming::simple(LATENCY_MEMORY);
+const TIMING_STORE: OperationTiming = OperationTiming::simple(LATENCY_STORE);
+const TIMING_BRANCH: OperationTiming = OperationTiming::simple(LATENCY_BRANCH_TAKEN);
+const TIMING_CALL: OperationTiming = OperationTiming::simple(LATENCY_CALL);
+const TIMING_RETURN: OperationTiming = OperationTiming::simple(LATENCY_RETURN);
+const TIMING_LOCK: OperationTiming = OperationTiming::simple(LATENCY_LOCK_ACQUIRE);
+const TIMING_VECTOR_SIMPLE: OperationTiming = OperationTiming::simple(LATENCY_VECTOR_SIMPLE);
+const TIMING_VECTOR_MUL: OperationTiming = OperationTiming::simple(LATENCY_VECTOR_MUL);
+const TIMING_VECTOR_MAC: OperationTiming = OperationTiming::simple(LATENCY_VECTOR_MAC);
+const TIMING_VECTOR_SHUFFLE: OperationTiming = OperationTiming::simple(LATENCY_VECTOR_SHUFFLE);
+const TIMING_VECTOR_PACK: OperationTiming = OperationTiming::simple(LATENCY_VECTOR_PACK);
+const TIMING_DEFAULT: OperationTiming = OperationTiming::simple(1);
+
+// ============================================================================
 // Latency Table
 // ============================================================================
 
 /// Lookup table for operation latencies.
 ///
-/// Pre-computed for fast access during execution.
+/// Timing is derived directly from `SemanticOp` + metadata, with no
+/// intermediate key enum. All timing values are compile-time constants
+/// from AM020 and AIE2Schedule.td.
 #[derive(Debug, Clone)]
-pub struct LatencyTable {
-    /// Default timing for unknown operations.
-    default_timing: OperationTiming,
-
-    /// Cached timings for common operations.
-    /// Using a small array for cache-friendly access.
-    cache: [OperationTiming; 32],
-
-    /// Full map for less common operations.
-    extended: HashMap<OperationKey, OperationTiming>,
-}
-
-/// Key for operation lookup (simplified from Operation enum).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum OperationKey {
-    Nop,
-    ScalarAdd,
-    ScalarSub,
-    ScalarMul,
-    ScalarAnd,
-    ScalarOr,
-    ScalarXor,
-    ScalarShl,
-    ScalarShr,
-    ScalarSra,
-    ScalarMov,
-    ScalarCmp,
-    ScalarDiv,
-    ScalarSel,
-    Load,
-    Store,
-    Branch,
-    Call,
-    Return,
-    LockAcquire,
-    LockRelease,
-    VectorAdd,
-    VectorSub,
-    VectorMul,
-    VectorMac,
-    VectorShuffle,
-    VectorPack,
-    VectorCmp,
-    DmaStart,
-    DmaWait,
-    Unknown,
-}
+pub struct LatencyTable;
 
 impl LatencyTable {
     /// Create the AIE2 latency table from AM020 specifications.
     pub fn aie2() -> Self {
-        let mut table = Self {
-            default_timing: OperationTiming::simple(1),
-            cache: [OperationTiming::simple(1); 32],
-            extended: HashMap::new(),
-        };
-
-        // Populate cache with common operations
-        table.set(OperationKey::Nop, OperationTiming::simple(LATENCY_NOP));
-        table.set(OperationKey::ScalarAdd, OperationTiming::simple(LATENCY_SCALAR_ADD));
-        table.set(OperationKey::ScalarSub, OperationTiming::simple(LATENCY_SCALAR_ADD));
-        table.set(OperationKey::ScalarMul, OperationTiming::simple(LATENCY_SCALAR_MUL));
-        table.set(OperationKey::ScalarAnd, OperationTiming::simple(LATENCY_SCALAR_LOGIC));
-        table.set(OperationKey::ScalarOr, OperationTiming::simple(LATENCY_SCALAR_LOGIC));
-        table.set(OperationKey::ScalarXor, OperationTiming::simple(LATENCY_SCALAR_LOGIC));
-        table.set(OperationKey::ScalarShl, OperationTiming::simple(LATENCY_SCALAR_SHIFT));
-        table.set(OperationKey::ScalarShr, OperationTiming::simple(LATENCY_SCALAR_SHIFT));
-        table.set(OperationKey::ScalarSra, OperationTiming::simple(LATENCY_SCALAR_SHIFT));
-        table.set(OperationKey::ScalarMov, OperationTiming::simple(LATENCY_SCALAR_MOV));
-        table.set(OperationKey::ScalarCmp, OperationTiming::simple(LATENCY_SCALAR_CMP));
-        table.set(OperationKey::ScalarDiv, OperationTiming::with_throughput(LATENCY_SCALAR_DIV, 6));
-        table.set(OperationKey::ScalarSel, OperationTiming::simple(LATENCY_SCALAR_SEL));
-
-        // Memory operations
-        table.set(OperationKey::Load, OperationTiming::simple(LATENCY_MEMORY));
-        table.set(OperationKey::Store, OperationTiming::simple(LATENCY_STORE));
-
-        // Control flow
-        table.set(OperationKey::Branch, OperationTiming::simple(LATENCY_BRANCH_TAKEN));
-        table.set(OperationKey::Call, OperationTiming::simple(LATENCY_CALL));
-        table.set(OperationKey::Return, OperationTiming::simple(LATENCY_RETURN));
-
-        // Locks
-        table.set(OperationKey::LockAcquire, OperationTiming::simple(LATENCY_LOCK_ACQUIRE));
-        table.set(OperationKey::LockRelease, OperationTiming::simple(LATENCY_LOCK_RELEASE));
-
-        // Vector operations
-        table.set(OperationKey::VectorAdd, OperationTiming::simple(LATENCY_VECTOR_SIMPLE));
-        table.set(OperationKey::VectorSub, OperationTiming::simple(LATENCY_VECTOR_SIMPLE));
-        table.set(OperationKey::VectorMul, OperationTiming::simple(LATENCY_VECTOR_MUL));
-        table.set(OperationKey::VectorMac, OperationTiming::simple(LATENCY_VECTOR_MAC));
-        table.set(OperationKey::VectorShuffle, OperationTiming::simple(LATENCY_VECTOR_SHUFFLE));
-        table.set(OperationKey::VectorPack, OperationTiming::simple(LATENCY_VECTOR_PACK));
-        table.set(OperationKey::VectorCmp, OperationTiming::simple(LATENCY_VECTOR_SIMPLE));
-
-        // DMA (instant start, wait depends on transfer)
-        table.set(OperationKey::DmaStart, OperationTiming::simple(1));
-        table.set(OperationKey::DmaWait, OperationTiming::simple(1)); // Actual wait is modeled separately
-
-        table
+        Self
     }
 
-    /// Set timing for an operation.
-    fn set(&mut self, key: OperationKey, timing: OperationTiming) {
-        let idx = key as usize;
-        if idx < self.cache.len() {
-            self.cache[idx] = timing;
-        } else {
-            self.extended.insert(key, timing);
-        }
-    }
-
-    /// Get timing for an operation.
-    #[inline]
-    pub fn get(&self, key: OperationKey) -> OperationTiming {
-        let idx = key as usize;
-        if idx < self.cache.len() {
-            self.cache[idx]
-        } else {
-            self.extended.get(&key).copied().unwrap_or(self.default_timing)
-        }
-    }
-
-    /// Get latency (cycles) for an operation.
-    #[inline]
-    pub fn latency(&self, key: OperationKey) -> u8 {
-        self.get(key).latency
-    }
-    /// Convert from SemanticOp + vector flag to OperationKey.
+    /// Map a SemanticOp + vector flag directly to its timing.
     ///
-    /// This is the preferred path for latency lookup -- it uses the TableGen-derived
-    /// semantic operation instead of the deprecated Operation enum. The `is_vector`
-    /// flag disambiguates between scalar and vector functional units (e.g.,
-    /// `SemanticOp::Add` + `is_vector=false` -> `ScalarAdd`, `is_vector=true` -> `VectorAdd`).
-    pub fn key_from_semantic(semantic: SemanticOp, is_vector: bool) -> OperationKey {
+    /// The `is_vector` flag disambiguates between scalar and vector functional
+    /// units (e.g., `Add` + scalar = 1 cycle, `Add` + vector = 2 cycles).
+    pub fn timing_from_semantic(semantic: SemanticOp, is_vector: bool) -> OperationTiming {
         match semantic {
-            // Arithmetic
-            SemanticOp::Add | SemanticOp::Adc if !is_vector => OperationKey::ScalarAdd,
-            SemanticOp::Add | SemanticOp::Adc => OperationKey::VectorAdd,
-            SemanticOp::Sub | SemanticOp::Sbc if !is_vector => OperationKey::ScalarSub,
-            SemanticOp::Sub | SemanticOp::Sbc => OperationKey::VectorSub,
-            SemanticOp::Mul if !is_vector => OperationKey::ScalarMul,
-            SemanticOp::Mul => OperationKey::VectorMul,
+            // ── Arithmetic ──────────────────────────────────────────────
+            SemanticOp::Add | SemanticOp::Adc | SemanticOp::Abs | SemanticOp::Neg
+                if !is_vector => TIMING_SCALAR_1,
+            SemanticOp::Add | SemanticOp::Adc | SemanticOp::Abs | SemanticOp::Neg
+                => TIMING_VECTOR_SIMPLE,
+            SemanticOp::Sub | SemanticOp::Sbc if !is_vector => TIMING_SCALAR_1,
+            SemanticOp::Sub | SemanticOp::Sbc => TIMING_VECTOR_SIMPLE,
+            SemanticOp::Mul if !is_vector => TIMING_SCALAR_MUL,
+            SemanticOp::Mul => TIMING_VECTOR_MUL,
             SemanticOp::SDiv | SemanticOp::UDiv | SemanticOp::SRem | SemanticOp::URem
-                if !is_vector => OperationKey::ScalarDiv,
+                if !is_vector => TIMING_SCALAR_DIV,
             SemanticOp::SDiv | SemanticOp::UDiv | SemanticOp::SRem | SemanticOp::URem
-                => OperationKey::VectorMac, // Vector div uses MAC pipeline
-            SemanticOp::Abs | SemanticOp::Neg if !is_vector => OperationKey::ScalarAdd,
-            SemanticOp::Abs | SemanticOp::Neg => OperationKey::VectorAdd,
+                => TIMING_VECTOR_MAC, // Vector div uses MAC pipeline
 
-            // Bitwise
-            SemanticOp::And if !is_vector => OperationKey::ScalarAnd,
-            SemanticOp::And => OperationKey::VectorAdd, // Vector bitwise uses ALU pipeline
-            SemanticOp::Or if !is_vector => OperationKey::ScalarOr,
-            SemanticOp::Or => OperationKey::VectorAdd,
-            SemanticOp::Xor if !is_vector => OperationKey::ScalarXor,
-            SemanticOp::Xor => OperationKey::VectorAdd,
-            SemanticOp::Not if !is_vector => OperationKey::ScalarXor, // NOT = XOR with -1
-            SemanticOp::Not => OperationKey::VectorAdd,
+            // ── Bitwise ─────────────────────────────────────────────────
+            SemanticOp::And | SemanticOp::Or | SemanticOp::Xor | SemanticOp::Not
+                if !is_vector => TIMING_SCALAR_1,
+            SemanticOp::And | SemanticOp::Or | SemanticOp::Xor | SemanticOp::Not
+                => TIMING_VECTOR_SIMPLE, // Vector bitwise uses ALU pipeline
 
-            // Shifts
-            SemanticOp::Shl if !is_vector => OperationKey::ScalarShl,
-            SemanticOp::Shl => OperationKey::VectorAdd,
-            SemanticOp::Sra if !is_vector => OperationKey::ScalarSra,
-            SemanticOp::Sra => OperationKey::VectorAdd,
-            SemanticOp::Srl if !is_vector => OperationKey::ScalarShr,
-            SemanticOp::Srl => OperationKey::VectorAdd,
-            SemanticOp::Rotl | SemanticOp::Rotr if !is_vector => OperationKey::ScalarShl,
-            SemanticOp::Rotl | SemanticOp::Rotr => OperationKey::VectorShuffle,
+            // ── Shifts ──────────────────────────────────────────────────
+            SemanticOp::Shl | SemanticOp::Sra | SemanticOp::Srl
+                if !is_vector => TIMING_SCALAR_1,
+            SemanticOp::Shl | SemanticOp::Sra | SemanticOp::Srl
+                => TIMING_VECTOR_SIMPLE,
+            SemanticOp::Rotl | SemanticOp::Rotr if !is_vector => TIMING_SCALAR_1,
+            SemanticOp::Rotl | SemanticOp::Rotr => TIMING_VECTOR_SHUFFLE,
 
-            // Comparisons
+            // ── Comparisons ─────────────────────────────────────────────
             SemanticOp::SetEq | SemanticOp::SetNe
             | SemanticOp::SetLt | SemanticOp::SetLe
             | SemanticOp::SetGt | SemanticOp::SetGe
             | SemanticOp::SetUlt | SemanticOp::SetUle
             | SemanticOp::SetUgt | SemanticOp::SetUge
-                if !is_vector => OperationKey::ScalarCmp,
+                if !is_vector => TIMING_SCALAR_1,
             SemanticOp::SetEq | SemanticOp::SetNe
             | SemanticOp::SetLt | SemanticOp::SetLe
             | SemanticOp::SetGt | SemanticOp::SetGe
             | SemanticOp::SetUlt | SemanticOp::SetUle
             | SemanticOp::SetUgt | SemanticOp::SetUge
-                => OperationKey::VectorCmp,
+                => TIMING_VECTOR_SIMPLE,
 
-            // Bit manipulation (scalar only in practice)
+            // ── Bit manipulation (scalar only in practice) ──────────────
             SemanticOp::Ctlz | SemanticOp::Cttz | SemanticOp::Ctpop | SemanticOp::Bswap
-                => OperationKey::ScalarAdd, // Single-cycle scalar ALU
+                => TIMING_SCALAR_1,
+            SemanticOp::Clb | SemanticOp::Cmp => TIMING_SCALAR_1,
 
-            // Memory
-            SemanticOp::Load => OperationKey::Load,
-            SemanticOp::Store => OperationKey::Store,
+            // ── Memory ──────────────────────────────────────────────────
+            SemanticOp::Load => TIMING_LOAD,
+            SemanticOp::Store => TIMING_STORE,
 
-            // Control flow (never vector)
-            SemanticOp::Br | SemanticOp::BrCond => OperationKey::Branch,
-            SemanticOp::Call => OperationKey::Call,
-            SemanticOp::Ret => OperationKey::Return,
-            SemanticOp::Select if !is_vector => OperationKey::ScalarSel,
-            SemanticOp::Select => OperationKey::VectorAdd, // Vector select = ALU
+            // ── Control flow ────────────────────────────────────────────
+            SemanticOp::Br | SemanticOp::BrCond => TIMING_BRANCH,
+            SemanticOp::Call => TIMING_CALL,
+            SemanticOp::Ret => TIMING_RETURN,
+            SemanticOp::Select if !is_vector => TIMING_SCALAR_1,
+            SemanticOp::Select => TIMING_VECTOR_SIMPLE,
 
-            // Type conversion
+            // ── Type conversion ─────────────────────────────────────────
             SemanticOp::SignExtend | SemanticOp::ZeroExtend | SemanticOp::Truncate
-                if !is_vector => OperationKey::ScalarAdd, // Single-cycle scalar
+                if !is_vector => TIMING_SCALAR_1,
             SemanticOp::SignExtend | SemanticOp::ZeroExtend | SemanticOp::Truncate
-                => OperationKey::VectorPack, // Vector type conversion = pack pipeline
+                => TIMING_VECTOR_PACK,
 
-            // Move / NOP / Halt
-            SemanticOp::Copy if !is_vector => OperationKey::ScalarMov,
-            SemanticOp::Copy => OperationKey::VectorAdd,
-            SemanticOp::Nop => OperationKey::Nop,
-            SemanticOp::Event => OperationKey::Nop, // EVENT is 1-cycle, no pipeline impact
-            SemanticOp::Done => OperationKey::Unknown, // Halt has no meaningful latency
+            // ── Move / NOP / Halt ───────────────────────────────────────
+            SemanticOp::Copy if !is_vector => TIMING_SCALAR_1,
+            SemanticOp::Copy => TIMING_VECTOR_SIMPLE,
+            SemanticOp::Nop => TIMING_NOP,
+            SemanticOp::Event => TIMING_NOP,
+            SemanticOp::Done | SemanticOp::Halt => TIMING_DEFAULT,
 
-            // Synchronization
-            SemanticOp::LockAcquire => OperationKey::LockAcquire,
-            SemanticOp::LockRelease => OperationKey::LockRelease,
+            // ── Synchronization ─────────────────────────────────────────
+            SemanticOp::LockAcquire | SemanticOp::LockRelease => TIMING_LOCK,
 
-            // Bit manipulation (scalar only)
-            SemanticOp::Clb | SemanticOp::Cmp => OperationKey::ScalarAdd,
-
-            // Vector-specific operations
+            // ── Vector-specific operations ──────────────────────────────
             SemanticOp::Mac | SemanticOp::MatMul | SemanticOp::MatMulSub
             | SemanticOp::NegMatMul | SemanticOp::AddMac | SemanticOp::SubMac
             | SemanticOp::NegMul | SemanticOp::Accumulate
-                => OperationKey::VectorMac,
+                => TIMING_VECTOR_MAC,
             SemanticOp::Srs | SemanticOp::Ups | SemanticOp::Convert
-                => OperationKey::VectorPack,
+            | SemanticOp::Pack | SemanticOp::Unpack
+                => TIMING_VECTOR_PACK,
             SemanticOp::Shuffle | SemanticOp::Align
-                => OperationKey::VectorShuffle,
-            SemanticOp::Pack => OperationKey::VectorPack,
-            SemanticOp::Unpack => OperationKey::VectorPack,
+                => TIMING_VECTOR_SHUFFLE,
             SemanticOp::VectorBroadcast | SemanticOp::VectorExtract
             | SemanticOp::VectorInsert | SemanticOp::VectorSelect
             | SemanticOp::VectorClear
-                => OperationKey::VectorAdd,
-            SemanticOp::Min | SemanticOp::Max => OperationKey::VectorCmp,
+                => TIMING_VECTOR_SIMPLE,
+            SemanticOp::Min | SemanticOp::Max => TIMING_VECTOR_SIMPLE,
 
-            // Conditional vector operations
+            // ── Conditional vector operations ───────────────────────────
             SemanticOp::SubLt | SemanticOp::SubGe | SemanticOp::MaxDiffLt
             | SemanticOp::MaxLt | SemanticOp::MinGe
             | SemanticOp::AbsGtz | SemanticOp::NegGtz | SemanticOp::NegLtz
             | SemanticOp::NegAdd
-                => OperationKey::VectorAdd,
+                => TIMING_VECTOR_SIMPLE,
 
-            // Side-effect operations
+            // ── Side-effect operations ──────────────────────────────────
             SemanticOp::CascadeRead | SemanticOp::CascadeWrite
-                => OperationKey::VectorAdd,
+                => TIMING_VECTOR_SIMPLE,
             SemanticOp::StreamRead | SemanticOp::StreamWrite
             | SemanticOp::StreamWritePacketHeader
-                => OperationKey::ScalarMov,
+                => TIMING_SCALAR_1,
             SemanticOp::DmaStart | SemanticOp::DmaWait
-                => OperationKey::Unknown,
-            SemanticOp::Halt => OperationKey::Unknown,
+                => TIMING_DEFAULT, // Actual wait modeled separately
 
-            // Pointer operations
+            // ── Pointer operations ──────────────────────────────────────
             SemanticOp::PointerAdd | SemanticOp::PointerMov
-                => OperationKey::ScalarAdd,
+                => TIMING_SCALAR_1,
 
-            // Intrinsics -- default to vector MAC (conservative for high-latency ops)
-            SemanticOp::Intrinsic(_) if is_vector => OperationKey::VectorMac,
-            SemanticOp::Intrinsic(_) => OperationKey::ScalarMul,
+            // ── Intrinsics ──────────────────────────────────────────────
+            SemanticOp::Intrinsic(_) if is_vector => TIMING_VECTOR_MAC, // Conservative
+            SemanticOp::Intrinsic(_) => TIMING_SCALAR_MUL,
         }
     }
 
@@ -426,9 +315,9 @@ impl LatencyTable {
     #[inline]
     pub fn timing_for_slot_op(&self, op: &SlotOp) -> OperationTiming {
         if let Some(semantic) = op.semantic {
-            self.get(Self::key_from_semantic(semantic, op.is_vector))
+            Self::timing_from_semantic(semantic, op.is_vector)
         } else {
-            self.get(OperationKey::Nop)
+            TIMING_NOP
         }
     }
 
@@ -455,49 +344,45 @@ impl LatencyTable {
     }
 }
 
-/// Map an itinerary class name to the corresponding OperationKey.
+/// Map an itinerary class name to its expected OperationTiming.
 ///
-/// Only maps the "representative" class for each OperationKey bucket.
-/// Classes with no clear mapping (e.g., `II_MOVd3`, combined load+UPS)
-/// return None.
-pub fn itinerary_to_operation_key(class_name: &str) -> Option<OperationKey> {
+/// Used for cross-validation against TableGen scheduling data. Only maps
+/// the "representative" class for each timing bucket. Classes with no clear
+/// mapping (e.g., `II_MOVd3`, combined load+UPS) return None.
+pub fn itinerary_to_timing(class_name: &str) -> Option<OperationTiming> {
     Some(match class_name {
         // Scalar arithmetic (1-cycle ALU)
-        "II_ADD" | "II_ADD_NC" => OperationKey::ScalarAdd,
-        "II_SUB" | "II_SBC" | "II_ADC" => OperationKey::ScalarSub,
-        "II_MUL" => OperationKey::ScalarMul,
-        "II_AND" => OperationKey::ScalarAnd,
-        "II_OR" => OperationKey::ScalarOr,
-        "II_XOR" => OperationKey::ScalarXor,
-        "II_ASHL" => OperationKey::ScalarShl,
-        "II_LSHL" => OperationKey::ScalarShr,
-        "II_MOV" | "II_MOVA" | "II_MOVX" | "II_MOV_SCL" => OperationKey::ScalarMov,
+        "II_ADD" | "II_ADD_NC" | "II_SUB" | "II_SBC" | "II_ADC" => TIMING_SCALAR_1,
+        "II_MUL" => TIMING_SCALAR_MUL,
+        "II_AND" | "II_OR" | "II_XOR" => TIMING_SCALAR_1,
+        "II_ASHL" | "II_LSHL" => TIMING_SCALAR_1,
+        "II_MOV" | "II_MOVA" | "II_MOVX" | "II_MOV_SCL" => TIMING_SCALAR_1,
         "II_EQ" | "II_NE" | "II_GE" | "II_GEU" | "II_LT" | "II_LTU"
-        | "II_EQZ" | "II_NEZ" => OperationKey::ScalarCmp,
-        "II_DIVS" => OperationKey::ScalarDiv,
-        "II_SELEQZ" | "II_SELNEZ" => OperationKey::ScalarSel,
+        | "II_EQZ" | "II_NEZ" => TIMING_SCALAR_1,
+        "II_DIVS" => TIMING_SCALAR_DIV,
+        "II_SELEQZ" | "II_SELNEZ" => TIMING_SCALAR_1,
         // Memory
-        "II_LDA" | "II_LDA_POST_1D" | "II_LDA_POST_2D" | "II_LDA_POST_3D" => OperationKey::Load,
+        "II_LDA" | "II_LDA_POST_1D" | "II_LDA_POST_2D" | "II_LDA_POST_3D" => TIMING_LOAD,
         "II_VLDB" | "II_VLDB_POSTINC" | "II_VLDB_2D" | "II_VLDB_3D"
-        | "II_VLDA_W" | "II_VLDA_AM" => OperationKey::Load,
-        "II_ST" | "II_ST_POST_1D" | "II_ST_POST_2D" | "II_ST_POST_3D" => OperationKey::Store,
-        "II_VST_W" | "II_VST_AM" | "II_VST_POSTINC" => OperationKey::Store,
+        | "II_VLDA_W" | "II_VLDA_AM" => TIMING_LOAD,
+        "II_ST" | "II_ST_POST_1D" | "II_ST_POST_2D" | "II_ST_POST_3D" => TIMING_STORE,
+        "II_VST_W" | "II_VST_AM" | "II_VST_POSTINC" => TIMING_STORE,
         // Control flow
-        "II_J" | "II_JNZ" | "II_JZ" | "II_JNZD" => OperationKey::Branch,
-        "II_JL" | "II_JL_IND" => OperationKey::Call,
-        "II_RET" => OperationKey::Return,
+        "II_J" | "II_JNZ" | "II_JZ" | "II_JNZD" => TIMING_BRANCH,
+        "II_JL" | "II_JL_IND" => TIMING_CALL,
+        "II_RET" => TIMING_RETURN,
         // Locks
-        "II_ACQ" | "II_ACQ_COND" => OperationKey::LockAcquire,
-        "II_REL" | "II_REL_COND" => OperationKey::LockRelease,
+        "II_ACQ" | "II_ACQ_COND" => TIMING_LOCK,
+        "II_REL" | "II_REL_COND" => TIMING_LOCK,
         // Vector compute
-        "II_VADD" | "II_VSUB" => OperationKey::VectorAdd,
-        "II_VMUL" | "II_VNEGMUL" => OperationKey::VectorMul,
+        "II_VADD" | "II_VSUB" => TIMING_VECTOR_SIMPLE,
+        "II_VMUL" | "II_VNEGMUL" => TIMING_VECTOR_MUL,
         "II_VMAC" | "II_VMSC" | "II_VNEGMAC" | "II_VNEGMSC"
-        | "II_VACC" | "II_VADDMAC" => OperationKey::VectorMac,
-        "II_VSHUFFLE" | "II_VBCSTSHFL" => OperationKey::VectorShuffle,
-        "II_VPACK" => OperationKey::VectorPack,
-        "II_VCMP" => OperationKey::VectorCmp,
-        "II_NOP" => OperationKey::Nop,
+        | "II_VACC" | "II_VADDMAC" => TIMING_VECTOR_MAC,
+        "II_VSHUFFLE" | "II_VBCSTSHFL" => TIMING_VECTOR_SHUFFLE,
+        "II_VPACK" => TIMING_VECTOR_PACK,
+        "II_VCMP" => TIMING_VECTOR_SIMPLE,
+        "II_NOP" => TIMING_NOP,
         _ => return None,
     })
 }
@@ -513,19 +398,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_latency_table_creation() {
-        let table = LatencyTable::aie2();
-
-        // Scalar ops
-        assert_eq!(table.latency(OperationKey::ScalarAdd), 1);
-        assert_eq!(table.latency(OperationKey::ScalarMul), 2);
-
-        // Memory
-        assert_eq!(table.latency(OperationKey::Load), 7);
-        assert_eq!(table.latency(OperationKey::Store), 1);
-
-        // Vector
-        assert_eq!(table.latency(OperationKey::VectorMac), 5);
+    fn test_latency_constants() {
+        // Verify key timing values from the constants.
+        assert_eq!(TIMING_SCALAR_1.latency, 1);
+        assert_eq!(TIMING_SCALAR_MUL.latency, 2);
+        assert_eq!(TIMING_LOAD.latency, 7);
+        assert_eq!(TIMING_STORE.latency, 1);
+        assert_eq!(TIMING_VECTOR_MAC.latency, 5);
+        assert_eq!(TIMING_NOP.latency, 0);
     }
 
     #[test]
@@ -536,71 +416,70 @@ mod tests {
         assert_eq!(timing.result_stage, 2);
     }
 
-    // ── Semantic path tests ──────────────────────────────────────────
+    // ── Semantic timing tests ───────────────────────────────────────
 
     #[test]
-    fn test_key_from_semantic_scalar_arithmetic() {
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Add, false), OperationKey::ScalarAdd);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Sub, false), OperationKey::ScalarSub);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Mul, false), OperationKey::ScalarMul);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::SDiv, false), OperationKey::ScalarDiv);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::UDiv, false), OperationKey::ScalarDiv);
+    fn test_timing_scalar_arithmetic() {
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Add, false).latency, 1);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Sub, false).latency, 1);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Mul, false).latency, 2);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::SDiv, false).latency, 6);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::UDiv, false).latency, 6);
     }
 
     #[test]
-    fn test_key_from_semantic_vector_arithmetic() {
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Add, true), OperationKey::VectorAdd);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Sub, true), OperationKey::VectorSub);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Mul, true), OperationKey::VectorMul);
+    fn test_timing_vector_arithmetic() {
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Add, true).latency, 2);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Sub, true).latency, 2);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Mul, true).latency, 5);
     }
 
     #[test]
-    fn test_key_from_semantic_bitwise() {
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::And, false), OperationKey::ScalarAnd);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Or, false), OperationKey::ScalarOr);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Xor, false), OperationKey::ScalarXor);
-        // Vector bitwise uses ALU pipeline (same timing as vector add)
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::And, true), OperationKey::VectorAdd);
+    fn test_timing_bitwise() {
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::And, false).latency, 1);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Or, false).latency, 1);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Xor, false).latency, 1);
+        // Vector bitwise uses ALU pipeline
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::And, true).latency, 2);
     }
 
     #[test]
-    fn test_key_from_semantic_shifts() {
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Shl, false), OperationKey::ScalarShl);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Sra, false), OperationKey::ScalarSra);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Srl, false), OperationKey::ScalarShr);
+    fn test_timing_shifts() {
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Shl, false).latency, 1);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Sra, false).latency, 1);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Srl, false).latency, 1);
     }
 
     #[test]
-    fn test_key_from_semantic_comparison() {
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::SetEq, false), OperationKey::ScalarCmp);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::SetLt, false), OperationKey::ScalarCmp);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::SetEq, true), OperationKey::VectorCmp);
+    fn test_timing_comparison() {
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::SetEq, false).latency, 1);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::SetLt, false).latency, 1);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::SetEq, true).latency, 2);
     }
 
     #[test]
-    fn test_key_from_semantic_memory() {
-        // Memory ops are the same regardless of is_vector
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Load, false), OperationKey::Load);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Load, true), OperationKey::Load);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Store, false), OperationKey::Store);
+    fn test_timing_memory() {
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Load, false).latency, 7);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Load, true).latency, 7);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Store, false).latency, 1);
     }
 
     #[test]
-    fn test_key_from_semantic_control_flow() {
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Br, false), OperationKey::Branch);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::BrCond, false), OperationKey::Branch);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Call, false), OperationKey::Call);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Ret, false), OperationKey::Return);
+    fn test_timing_control_flow() {
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Br, false).latency, 3);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::BrCond, false).latency, 3);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Call, false).latency, 3);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Ret, false).latency, 3);
     }
 
     #[test]
-    fn test_key_from_semantic_special() {
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Copy, false), OperationKey::ScalarMov);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Copy, true), OperationKey::VectorAdd);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Nop, false), OperationKey::Nop);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::Select, false), OperationKey::ScalarSel);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::LockAcquire, false), OperationKey::LockAcquire);
-        assert_eq!(LatencyTable::key_from_semantic(SemanticOp::LockRelease, false), OperationKey::LockRelease);
+    fn test_timing_special() {
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Copy, false).latency, 1);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Copy, true).latency, 2);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Nop, false).latency, 0);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::Select, false).latency, 1);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::LockAcquire, false).latency, 1);
+        assert_eq!(LatencyTable::timing_from_semantic(SemanticOp::LockRelease, false).latency, 1);
     }
 
     #[test]
@@ -630,10 +509,8 @@ mod tests {
     }
 
     #[test]
-    fn test_semantic_key_matches_expected_latencies() {
+    fn test_semantic_timing_matches_expected_latencies() {
         // Verify the semantic path produces correct latencies for common ops.
-        let table = LatencyTable::aie2();
-
         let cases: &[(SemanticOp, bool, u8)] = &[
             (SemanticOp::Add, false, LATENCY_SCALAR_ADD),
             (SemanticOp::Sub, false, LATENCY_SCALAR_ADD),
@@ -652,11 +529,11 @@ mod tests {
         ];
 
         for &(semantic, is_vector, expected) in cases {
-            let key = LatencyTable::key_from_semantic(semantic, is_vector);
+            let timing = LatencyTable::timing_from_semantic(semantic, is_vector);
             assert_eq!(
-                table.latency(key), expected,
+                timing.latency, expected,
                 "Latency mismatch for {:?} (is_vector={}): got {}, expected {}",
-                semantic, is_vector, table.latency(key), expected,
+                semantic, is_vector, timing.latency, expected,
             );
         }
     }
@@ -675,7 +552,12 @@ mod tests {
 
         // Should not panic -- our constants match AIE2's ProcessorModel
         let table = LatencyTable::validated_aie2(&model);
-        assert_eq!(table.latency(OperationKey::Load), 7);
+        assert_eq!(table.timing_for_slot_op(
+            &SlotOp::from_semantic(
+                crate::interpreter::bundle::SlotIndex::LoadA,
+                SemanticOp::Load,
+            )
+        ).latency, 7);
     }
 
     #[test]
@@ -697,8 +579,8 @@ mod tests {
 
     /// Cross-validate latency table against TableGen itinerary data.
     ///
-    /// For each itinerary class that maps to an OperationKey, compares
-    /// our hardcoded latency against `operand_cycles[0]` (the result
+    /// For each itinerary class that maps to a timing, compares our
+    /// hardcoded latency against `operand_cycles[0]` (the result
     /// availability cycle from the compiler's scheduling model).
     ///
     /// Known differences:
@@ -717,13 +599,11 @@ mod tests {
             }
         };
 
-        let table = LatencyTable::aie2();
         let mut checked = 0u32;
         let mut mismatches = Vec::new();
 
-        // Classes where the LatencyTable latency intentionally differs from
-        // operand_cycles[0]. For these we verify the relationship rather than
-        // asserting equality.
+        // Classes where our latency intentionally differs from operand_cycles[0].
+        // For these we verify the relationship rather than asserting equality.
         let known_difference_classes: &[&str] = &[
             // Branch/call/return: TableGen models operand timing, not flush penalty.
             "II_J", "II_JNZ", "II_JZ", "II_JNZD", "II_JL", "II_JL_IND", "II_RET",
@@ -736,12 +616,11 @@ mod tests {
         ];
 
         for (class_name, itin) in &tblgen.itineraries {
-            let key = match itinerary_to_operation_key(class_name) {
-                Some(k) => k,
+            let our_timing = match itinerary_to_timing(class_name) {
+                Some(t) => t,
                 None => continue, // No mapping for this class
             };
 
-            let our_latency = table.latency(key);
             // operand_cycles[0] = result availability cycle (the key metric)
             let tblgen_latency = itin.operand_cycles.first().copied().unwrap_or(itin.total_latency);
 
@@ -752,10 +631,10 @@ mod tests {
                 continue;
             }
 
-            if our_latency != tblgen_latency {
+            if our_timing.latency != tblgen_latency {
                 mismatches.push(format!(
-                    "  {} -> {:?}: ours={}, tblgen operand_cycles[0]={}",
-                    class_name, key, our_latency, tblgen_latency,
+                    "  {}: ours={}, tblgen operand_cycles[0]={}",
+                    class_name, our_timing.latency, tblgen_latency,
                 ));
             }
         }

@@ -106,7 +106,10 @@ full decode -> execute -> timing pipeline.
   new SemanticOp requires editing key_from_semantic() (127 lines).
 - **Fix**: Replace with HashMap<(SemanticOp, bool), OperationTiming> or
   a packed key. Eliminates the intermediate enum entirely.
-- **Status**: `[ ]`
+- **Status**: `[x]` -- Deleted OperationKey enum, cache array, HashMap,
+  set/get/latency methods. `timing_from_semantic()` returns OperationTiming
+  directly. `itinerary_to_timing()` replaces `itinerary_to_operation_key()`
+  for cross-validation. LatencyTable is now a zero-sized type.
 
 ### 10. Duplicate doc comment on get_branch_target()
 - **File**: `src/interpreter/execute/control.rs`
