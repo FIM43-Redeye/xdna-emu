@@ -711,6 +711,10 @@ pub struct TblgenOutput {
     pub register_model: RegisterModel,
     /// Composite VLIW bundle formats.
     pub composite_formats: Vec<CompositeFormatDef>,
+    /// LLVM decoder bytecode tables, keyed by slot name.
+    /// Extracted from `llvm-tblgen -gen-disassembler`.
+    /// These provide authoritative disambiguation for instruction decoding.
+    pub decoder_tables: HashMap<String, super::decoder_bytecode::DecoderTable>,
 }
 
 /// Collection of all parsed TableGen definitions.

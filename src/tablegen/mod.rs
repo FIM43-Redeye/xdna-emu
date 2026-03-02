@@ -47,6 +47,7 @@
 //! └── AIE2InstrPatterns.td   # Semantic patterns
 //! ```
 
+pub mod decoder_bytecode;
 mod parser;
 mod resolver;
 pub mod tblgen_records;
@@ -59,7 +60,7 @@ pub use parser::{
 pub use resolver::{
     build_decoder_tables, AddressingMode, CompositeEncoder, DecoderIndex, InstrEncoding,
     InstrMemWidth, OperandField, OperandType, RegisterKind, ResolveError, Resolver, SlotIndex,
-    SlotIndexStats, classify_operand_type, detect_addressing_mode, detect_mem_width,
+    classify_operand_type, detect_addressing_mode, detect_mem_width,
     infer_branch_condition, infer_element_type, infer_select_variant,
 };
 pub use tblgen_records::{parse_tblgen_records, InstrRecord, SlotEncoding};
@@ -226,11 +227,10 @@ pub fn load_via_tblgen(llvm_aie_path: impl AsRef<Path>) -> Result<HashMap<String
 /// - Register model (definitions with HWEncodings, class memberships)
 /// - Composite VLIW bundle format definitions
 ///
-/// This gives us fully resolved data with all inheritance and template
-/// substitution applied -- the ground truth for the AIE2 ISA.
+/// Results are cached to disk at `~/.cache/xdna-emu/tblgen/` keyed on the
+/// llvm-tblgen binary's canonical path and modification time. Cache misses
+/// (including any I/O error) silently fall back to fresh subprocess invocation.
 pub fn load_full_via_tblgen(llvm_aie_path: impl AsRef<Path>) -> Result<types::TblgenOutput, std::io::Error> {
-    use std::process::Command;
-
     let llvm_aie = llvm_aie_path.as_ref();
     let base = llvm_aie.join("llvm/lib/Target/AIE");
 
@@ -241,33 +241,105 @@ pub fn load_full_via_tblgen(llvm_aie_path: impl AsRef<Path>) -> Result<types::Tb
             "No AIE-enabled llvm-tblgen found. Set LLVM_AIE_TBLGEN or install mlir-aie."
         ))?;
 
-    log::info!("Running llvm-tblgen from: {}", tblgen_path.display());
+    // Try disk cache first
+    let cache_key = compute_tblgen_cache_key(&tblgen_path);
+    if let Some(ref key) = cache_key {
+        if let Some((records_text, disasm_text)) = try_load_cached_tblgen(key) {
+            log::info!("Using cached tblgen output (key: {}...)", &key[..12]);
+            return parse_tblgen_output(&records_text, &disasm_text);
+        }
+    }
 
-    // Run llvm-tblgen to get resolved records.
+    // Cache miss -- run subprocesses
+    log::info!("Running llvm-tblgen from: {}", tblgen_path.display());
+    let (records_text, disasm_text) = run_tblgen_subprocesses(&tblgen_path, &base)?;
+
+    // Write to cache (best-effort, errors are logged and ignored)
+    if let Some(ref key) = cache_key {
+        write_tblgen_cache(key, &records_text, &disasm_text);
+    }
+
+    parse_tblgen_output(&records_text, &disasm_text)
+}
+
+/// Run both llvm-tblgen subprocesses and return raw stdout text.
+///
+/// Spawns `--print-records` and `-gen-disassembler` concurrently. The records
+/// output is required (errors are propagated); the disassembler output is
+/// best-effort (failures produce an empty string, logged as warnings).
+fn run_tblgen_subprocesses(
+    tblgen_path: &Path,
+    base: &Path,
+) -> Result<(String, String), std::io::Error> {
+    use std::process::Command;
+
+    // Both need the same include paths and working directory.
     // Remove LD_LIBRARY_PATH to prevent aietools from injecting an older
     // libstdc++ that lacks GLIBCXX symbols llvm-tblgen needs.
-    let output = Command::new(&tblgen_path)
+    let tblgen_args = ["AIE2.td", "-I.", "-I../../..", "-I../../../include"];
+
+    // Spawn -gen-disassembler first (runs concurrently while we wait for records)
+    let disasm_child = Command::new(tblgen_path)
+        .arg("-gen-disassembler")
+        .args(&tblgen_args)
+        .current_dir(base)
+        .env_remove("LD_LIBRARY_PATH")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+
+    // Run --print-records synchronously
+    let records_output = Command::new(tblgen_path)
         .arg("--print-records")
-        .arg("AIE2.td")
-        .arg("-I.")
-        .arg("-I../../..")
-        .arg("-I../../../include")
-        .current_dir(&base)
+        .args(&tblgen_args)
+        .current_dir(base)
         .env_remove("LD_LIBRARY_PATH")
         .output()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other,
             format!("Failed to run llvm-tblgen at {}: {}", tblgen_path.display(), e)))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if !records_output.status.success() {
+        let stderr = String::from_utf8_lossy(&records_output.stderr);
         return Err(std::io::Error::new(std::io::ErrorKind::Other,
-            format!("llvm-tblgen failed: {}", stderr)));
+            format!("llvm-tblgen --print-records failed: {}", stderr)));
     }
 
-    let content = String::from_utf8_lossy(&output.stdout);
+    let records_text = String::from_utf8_lossy(&records_output.stdout).into_owned();
 
-    // Parse instruction records (existing)
-    let records = tblgen_records::parse_tblgen_records(&content);
+    // Collect the -gen-disassembler output (best-effort)
+    let disasm_text = match disasm_child {
+        Ok(child) => {
+            match child.wait_with_output() {
+                Ok(out) if out.status.success() => {
+                    String::from_utf8_lossy(&out.stdout).into_owned()
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    log::warn!("llvm-tblgen -gen-disassembler failed: {}", stderr);
+                    String::new()
+                }
+                Err(e) => {
+                    log::warn!("Failed to collect -gen-disassembler output: {}", e);
+                    String::new()
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("Failed to spawn -gen-disassembler: {}", e);
+            String::new()
+        }
+    };
+
+    Ok((records_text, disasm_text))
+}
+
+/// Parse raw llvm-tblgen text output into the complete TableGen model.
+fn parse_tblgen_output(
+    records_text: &str,
+    disasm_text: &str,
+) -> Result<types::TblgenOutput, std::io::Error> {
+    // Parse instruction records
+    let records = tblgen_records::parse_tblgen_records(records_text);
     log::info!("Parsed {} instruction records from llvm-tblgen", records.len());
 
     // Convert to encodings grouped by slot
@@ -280,21 +352,16 @@ pub fn load_full_via_tblgen(llvm_aie_path: impl AsRef<Path>) -> Result<types::Tb
         }
     }
 
-    // Sort by specificity (most specific first)
-    for encodings in by_slot.values_mut() {
-        encodings.sort_by(|a, b| b.specificity().cmp(&a.specificity()));
-    }
-
     // Log slot counts
     for (slot, encodings) in &by_slot {
         log::debug!("Slot '{}': {} encodings", slot, encodings.len());
     }
 
-    // Parse extended data (Phase 1)
-    let processor_model = tblgen_records::parse_processor_model(&content);
-    let itineraries = tblgen_records::parse_itinerary_data(&content);
-    let register_model = tblgen_records::parse_register_model(&content);
-    let composite_formats = tblgen_records::parse_composite_formats(&content);
+    // Parse extended data
+    let processor_model = tblgen_records::parse_processor_model(records_text);
+    let itineraries = tblgen_records::parse_itinerary_data(records_text);
+    let register_model = tblgen_records::parse_register_model(records_text);
+    let composite_formats = tblgen_records::parse_composite_formats(records_text);
 
     log::info!(
         "Extended data: model={}, {} itineraries, {} registers, {} classes, {} formats",
@@ -305,13 +372,119 @@ pub fn load_full_via_tblgen(llvm_aie_path: impl AsRef<Path>) -> Result<types::Tb
         composite_formats.len(),
     );
 
+    // Parse decoder bytecode tables (empty string -> empty map)
+    let decoder_tables = if disasm_text.is_empty() {
+        log::warn!("No disassembler output available, falling back to heuristic disambiguation");
+        HashMap::new()
+    } else {
+        let tables = decoder_bytecode::extract_all_tables(disasm_text);
+        log::info!(
+            "Extracted {} LLVM decoder tables ({} total bytes)",
+            tables.len(),
+            tables.values().map(|t| t.byte_count()).sum::<usize>(),
+        );
+        tables
+    };
+
     Ok(types::TblgenOutput {
         encodings_by_slot: by_slot,
         processor_model,
         itineraries,
         register_model,
         composite_formats,
+        decoder_tables,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Disk cache for llvm-tblgen output
+// ---------------------------------------------------------------------------
+
+/// Compute a cache key from the llvm-tblgen binary's canonical path and mtime.
+///
+/// Returns `None` if the path cannot be canonicalized or its metadata read
+/// (e.g. the binary was deleted between finding and keying it).
+fn compute_tblgen_cache_key(tblgen_path: &Path) -> Option<String> {
+    use sha2::{Sha256, Digest};
+
+    let canonical = tblgen_path.canonicalize().ok()?;
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    let mtime = metadata.modified().ok()?;
+    let mtime_secs = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    hasher.update(b":");
+    hasher.update(mtime_secs.to_le_bytes());
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// Return the cache directory, creating it if necessary.
+fn tblgen_cache_dir() -> Option<std::path::PathBuf> {
+    let base = dirs::cache_dir()?;
+    let dir = base.join("xdna-emu").join("tblgen");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Try to load cached tblgen output matching `key`.
+///
+/// Returns `None` on any mismatch or I/O error -- the caller should fall
+/// through to fresh subprocess invocation.
+fn try_load_cached_tblgen(key: &str) -> Option<(String, String)> {
+    let dir = tblgen_cache_dir()?;
+
+    // Validate key file first -- if it doesn't match, nothing else matters
+    let stored_key = std::fs::read_to_string(dir.join("key.sha256")).ok()?;
+    if stored_key.trim() != key {
+        return None;
+    }
+
+    let records = std::fs::read_to_string(dir.join("records.txt")).ok()?;
+    let disasm = std::fs::read_to_string(dir.join("disasm.txt")).ok()?;
+    Some((records, disasm))
+}
+
+/// Write tblgen output to the disk cache.
+///
+/// Uses atomic writes (write to .tmp, then rename) to avoid partial reads.
+/// Data files are written first, key file last -- a partial write looks like
+/// a cache miss (stale or missing key).
+fn write_tblgen_cache(key: &str, records_text: &str, disasm_text: &str) {
+    let dir = match tblgen_cache_dir() {
+        Some(d) => d,
+        None => {
+            log::debug!("Could not create tblgen cache directory");
+            return;
+        }
+    };
+
+    let write_atomic = |name: &str, content: &str| -> std::io::Result<()> {
+        let target = dir.join(name);
+        let tmp = dir.join(format!("{}.tmp", name));
+        std::fs::write(&tmp, content)?;
+        std::fs::rename(&tmp, &target)?;
+        Ok(())
+    };
+
+    // Write data files first, key file last
+    if let Err(e) = write_atomic("records.txt", records_text) {
+        log::debug!("Failed to cache records.txt: {}", e);
+        return;
+    }
+    if let Err(e) = write_atomic("disasm.txt", disasm_text) {
+        log::debug!("Failed to cache disasm.txt: {}", e);
+        return;
+    }
+    if let Err(e) = write_atomic("key.sha256", key) {
+        log::debug!("Failed to cache key.sha256: {}", e);
+        return;
+    }
+
+    log::info!("Cached tblgen output (key: {}...)", &key[..key.len().min(12)]);
 }
 
 #[cfg(test)]

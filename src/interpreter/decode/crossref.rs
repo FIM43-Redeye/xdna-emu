@@ -842,25 +842,12 @@ Disassembly of section .text:
         let decoder = InstructionDecoder::load_default();
         let mv_bits: u64 = 0x00713c;
 
-        // Dump all matching encodings for diagnostics
-        let index = decoder.decoder_index();
-        if let Some(slot_idx) = index.slot_index("mv") {
-            let all_matches = slot_idx.all_matches(mv_bits);
-            for enc in &all_matches {
-                eprintln!(
-                    "  candidate: name='{}' mnemonic='{}' fixed_mask=0x{:06x} fixed_bits=0x{:06x} sort_key={:?}",
-                    enc.name, enc.mnemonic, enc.fixed_mask, enc.fixed_bits, enc.sort_key(),
-                );
-            }
-        }
-
         if let Some(decoded) = decoder.decode_slot_bits(mv_bits, SlotType::Mv) {
             eprintln!(
-                "MV 0x{:06x} -> name='{}' mnemonic='{}' sort_key={:?} fixed_mask=0x{:06x} fixed_bits=0x{:06x}",
+                "MV 0x{:06x} -> name='{}' mnemonic='{}' fixed_mask=0x{:06x} fixed_bits=0x{:06x}",
                 mv_bits,
                 decoded.encoding.name,
                 decoded.encoding.mnemonic,
-                decoded.encoding.sort_key(),
                 decoded.encoding.fixed_mask,
                 decoded.encoding.fixed_bits,
             );

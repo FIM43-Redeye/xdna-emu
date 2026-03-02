@@ -1,24 +1,22 @@
 //! TableGen-driven instruction decoder.
 //!
-//! This decoder uses encoding tables generated from llvm-aie's TableGen files
+//! This decoder uses LLVM bytecode tables generated from llvm-aie's TableGen files
 //! to accurately decode AIE2 instructions with O(1) lookup performance.
 //!
 //! # How It Works
 //!
-//! 1. At construction, we receive resolved `InstrEncoding` tables grouped by slot
-//! 2. For each instruction word, we try to match against all encodings
-//! 3. The encoding with the most specific match (highest fixed bit count) wins
+//! 1. At construction, we receive resolved `InstrEncoding` tables and LLVM decoder
+//!    bytecode tables grouped by slot
+//! 2. For each instruction word, the LLVM bytecode identifies the instruction name
+//! 3. The name is looked up in a per-slot HashMap to retrieve the full encoding
 //! 4. Operand fields are extracted using the encoding's field definitions
 //!
 //! # Example
 //!
 //! ```ignore
-//! use xdna_emu::tablegen::{load_from_llvm_aie, build_decoder_tables};
 //! use xdna_emu::interpreter::decode::InstructionDecoder;
 //!
-//! let data = load_from_llvm_aie("../llvm-aie")?;
-//! let tables = build_decoder_tables(&data);
-//! let decoder = InstructionDecoder::from_tables(tables);
+//! let decoder = InstructionDecoder::try_load_via_tblgen("../llvm-aie")?;
 //! ```
 
 use std::collections::HashMap;
@@ -33,8 +31,8 @@ use crate::interpreter::state::{MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN, MOD_BASE_
 use crate::interpreter::traits::{DecodeError, Decoder};
 use super::composite::CompositeLuts;
 use crate::tablegen::{
-    build_decoder_tables, load_from_llvm_aie, load_via_tblgen, AddressingMode,
-    DecoderIndex, InstrEncoding, InstrMemWidth, OperandType, RegisterKind, SemanticOp,
+    AddressingMode, DecoderIndex, InstrEncoding, InstrMemWidth, OperandType, RegisterKind,
+    SemanticOp, decoder_bytecode,
 };
 
 /// A decoded instruction from TableGen data.
@@ -91,17 +89,12 @@ impl DecodedInstr {
 ///
 /// This decoder uses O(1) lookup via `DecoderIndex`:
 /// 1. Extract slot bits from bundle
-/// 2. Compute `opcode = bits & common_mask` for the slot
-/// 3. HashMap lookup to find candidate encodings
-/// 4. Small linear scan (usually 1-3 candidates) for disambiguation
+/// 2. LLVM bytecode table identifies instruction name
+/// 3. Name lookup retrieves full `InstrEncoding` with semantic metadata
 #[derive(Clone)]
 pub struct InstructionDecoder {
-    /// O(1) decoder index (per-slot HashMap lookup).
+    /// O(1) decoder index (per-slot LLVM bytecode lookup).
     index: DecoderIndex,
-
-    /// Legacy flat encoding list (for fallback/compatibility).
-    /// Will be removed once all code uses DecoderIndex.
-    encodings: Vec<InstrEncoding>,
 
     /// Pre-built composite register decode LUTs.
     /// Each composite encoder variant has a dedicated LUT for O(1) decode.
@@ -173,7 +166,6 @@ impl InstructionDecoder {
     pub fn new() -> Self {
         Self {
             index: DecoderIndex::default(),
-            encodings: Vec::new(),
             composite_luts: CompositeLuts::build(),
             decode_count: 0,
             unknown_count: 0,
@@ -232,28 +224,6 @@ impl InstructionDecoder {
         Self::load_cached()
     }
 
-    /// Load a decoder from llvm-aie at the specified path using the regex parser.
-    ///
-    /// **DEPRECATED**: Use `try_load_via_tblgen()` instead. The regex parser
-    /// is less accurate (misses mixin literal bits) and is only kept for
-    /// testing/comparison purposes.
-    ///
-    /// Returns an error if the path doesn't exist or parsing fails.
-    #[deprecated(note = "Use try_load_via_tblgen() instead for accurate encodings")]
-    pub fn try_load(llvm_aie_path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
-        let path = llvm_aie_path.as_ref();
-        if !path.exists() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("llvm-aie not found at: {}", path.display()),
-            ));
-        }
-
-        let data = load_from_llvm_aie(path)?;
-        let tables = build_decoder_tables(&data);
-        Ok(Self::from_tables(tables))
-    }
-
     /// Load a decoder using llvm-tblgen for fully resolved encodings.
     ///
     /// This is the preferred loading method - it uses `llvm-tblgen --print-records`
@@ -271,8 +241,12 @@ impl InstructionDecoder {
             ));
         }
 
-        let tables = load_via_tblgen(path)?;
-        Ok(Self::from_tables(tables))
+        // Use load_full_via_tblgen to get both encodings and LLVM decoder tables
+        let output = crate::tablegen::load_full_via_tblgen(path)?;
+        Ok(Self::from_tables_with_decoders(
+            output.encodings_by_slot,
+            output.decoder_tables,
+        ))
     }
 
     /// Check if llvm-aie is available (checks config and env var).
@@ -281,42 +255,26 @@ impl InstructionDecoder {
         Path::new(&Config::get().llvm_aie_path()).exists()
     }
 
-    /// Create a decoder from encoding tables grouped by slot.
+    /// Create a decoder from encoding tables grouped by slot (no LLVM bytecode).
     ///
-    /// This is the preferred constructor - it builds an O(1) index.
+    /// Without bytecode tables, all slot decodes return `None` (unknown).
+    /// Use `from_tables_with_decoders()` for the full decode path.
     pub fn from_tables(tables: HashMap<String, Vec<InstrEncoding>>) -> Self {
-        // Build O(1) index from the tables
-        let index = DecoderIndex::from_slot_encodings(tables.clone());
-
-        // Keep flat list for legacy decode_word() compatibility
-        let mut encodings: Vec<InstrEncoding> = tables.into_values().flatten().collect();
-        encodings.sort_by(|a, b| b.sort_key().cmp(&a.sort_key()));
-
-        Self {
-            index,
-            encodings,
-            composite_luts: CompositeLuts::build(),
-            decode_count: 0,
-            unknown_count: 0,
-        }
+        Self::from_tables_with_decoders(tables, HashMap::new())
     }
 
-    /// Create a decoder from a flat list of encodings.
-    pub fn from_encodings(mut encodings: Vec<InstrEncoding>) -> Self {
-        // Group by slot for the O(1) index
-        let mut by_slot: HashMap<String, Vec<InstrEncoding>> = HashMap::new();
-        for enc in &encodings {
-            by_slot
-                .entry(enc.slot.clone())
-                .or_default()
-                .push(enc.clone());
-        }
-        let index = DecoderIndex::from_slot_encodings(by_slot);
+    /// Create a decoder from encoding tables with LLVM decoder bytecode tables.
+    ///
+    /// This is the primary constructor. LLVM bytecode tables are the sole
+    /// disambiguation mechanism, matching LLVM's own disassembler behavior.
+    pub fn from_tables_with_decoders(
+        tables: HashMap<String, Vec<InstrEncoding>>,
+        decoder_tables: HashMap<String, decoder_bytecode::DecoderTable>,
+    ) -> Self {
+        let index = DecoderIndex::from_slot_encodings(tables, decoder_tables);
 
-        encodings.sort_by(|a, b| b.sort_key().cmp(&a.sort_key()));
         Self {
             index,
-            encodings,
             composite_luts: CompositeLuts::build(),
             decode_count: 0,
             unknown_count: 0,
@@ -327,7 +285,6 @@ impl InstructionDecoder {
     pub fn from_index(index: DecoderIndex) -> Self {
         Self {
             index,
-            encodings: Vec::new(), // No legacy list needed
             composite_luts: CompositeLuts::build(),
             decode_count: 0,
             unknown_count: 0,
@@ -348,29 +305,6 @@ impl InstructionDecoder {
     /// Get the underlying decoder index.
     pub fn decoder_index(&self) -> &DecoderIndex {
         &self.index
-    }
-
-    /// Try to decode an instruction word against all known encodings.
-    ///
-    /// Note: This is a legacy O(n) method. Prefer using decode_slot_bits()
-    /// with the slot type for O(1) performance.
-    pub fn decode_word(&self, word: u64) -> Option<DecodedInstr> {
-        for encoding in &self.encodings {
-            if encoding.matches(word) {
-                // Extract operands
-                let mut operands = HashMap::new();
-                for field in &encoding.operand_fields {
-                    let value = field.extract(word);
-                    operands.insert(field.name.clone(), value);
-                }
-
-                return Some(DecodedInstr {
-                    encoding: encoding.clone(),
-                    operands,
-                });
-            }
-        }
-        None
     }
 
     /// Try to decode slot-specific bits against encodings for that slot.
@@ -856,22 +790,6 @@ impl InstructionDecoder {
                     opcode: decoded.encoding.fixed_bits as u32,
                 }
             }
-        }
-    }
-
-    /// Map slot name to SlotIndex.
-    fn slot_to_index(&self, slot: &str) -> SlotIndex {
-        match slot {
-            "alu" => SlotIndex::Scalar0,
-            "lda" => SlotIndex::LoadA,
-            "ldb" => SlotIndex::LoadB,
-            "st" => SlotIndex::Store,
-            "mv" => SlotIndex::Scalar1,
-            "vec" => SlotIndex::Vector,
-            // LNG is polymorphic (j/jl/movxm). Control is the safe default;
-            // the main decode_bundle path overrides via natural_slot() anyway.
-            "lng" => SlotIndex::Control,
-            _ => SlotIndex::Scalar0,
         }
     }
 
@@ -1451,28 +1369,16 @@ impl Decoder for InstructionDecoder {
                 }
             }
         } else {
-            // No slots extracted - fall back to word-based decoding
+            // No slots extracted - treat as unknown
             let word0 = if bytes.len() >= 4 {
                 u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
             } else {
                 u16::from_le_bytes([bytes[0], bytes[1]]) as u32
             };
 
-            // Check for known NOP patterns
             if word0 == 0 || word0 == 0x15010040 {
                 bundle.set_slot(SlotOp::nop(SlotIndex::Scalar0));
-            } else if let Some(decoded) = self.decode_word(word0 as u64) {
-                let operation = self.to_operation(&decoded);
-                let slot_index = self.slot_to_index(&decoded.encoding.slot);
-                let (dest, sources, extracted_pm) = self.extract_operands(&decoded);
-
-                // Build SlotOp with metadata from InstrEncoding + extracted PostModify
-                let slot_op = self.build_slot_op(
-                    slot_index, operation, &decoded, dest, sources, extracted_pm,
-                );
-                bundle.set_slot(slot_op);
             } else {
-                // Unknown instruction
                 bundle.set_slot(SlotOp::new(
                     SlotIndex::Scalar0,
                     Operation::Unknown { opcode: word0 },
@@ -1521,79 +1427,8 @@ impl Decoder for InstructionDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tablegen::{build_decoder_tables, load_from_llvm_aie, CompositeEncoder, OperandField};
+    use crate::tablegen::{CompositeEncoder, OperandField};
     use std::path::Path;
-
-    fn make_add_encoding() -> InstrEncoding {
-        use crate::tablegen::{AddressingMode, InstrMemWidth};
-        InstrEncoding {
-            name: "ADD".to_string(),
-            mnemonic: "add".to_string(),
-            slot: "alu".to_string(),
-            width: 20,
-            fixed_mask: 0b1_1111,
-            fixed_bits: 0b0_0001,
-            operand_fields: vec![
-                OperandField::new("mRx0", 15, 5),
-                OperandField::new("mRx", 10, 5),
-                OperandField::new("mRy", 5, 5),
-            ],
-            semantic: Some(SemanticOp::Add),
-            may_load: false,
-            may_store: false,
-            input_order: vec!["mRx0".to_string(), "mRy".to_string()],
-            output_order: vec!["mRx".to_string()],
-            implicit_regs: vec![],
-            addressing_mode: AddressingMode::Unknown,
-            mem_width: InstrMemWidth::Word,
-            has_complete_decoder: true,
-            element_type: None,
-            branch_condition: None,
-            is_vector: false,
-            select_variant: None,
-            is_ptr_arithmetic: false,
-            is_sp_relative: false,
-            sched_class: None,
-        }
-    }
-
-    #[test]
-    fn test_decoder_matches_add() {
-        let decoder = InstructionDecoder::from_encodings(vec![make_add_encoding()]);
-
-        // Construct ADD r5, r3, r2: mRx0=3, mRx=5, mRy=2, fixed=0b0_0001
-        // Encoding: 00011_00101_00010_0000_1 = bits 19:0
-        let word = 0b00011_00101_00010_0000_1u64;
-
-        let decoded = decoder.decode_word(word).expect("Should decode");
-        assert_eq!(decoded.encoding.name, "ADD");
-        assert_eq!(decoded.reg("mRx0"), Some(3));
-        assert_eq!(decoded.reg("mRx"), Some(5));
-        assert_eq!(decoded.reg("mRy"), Some(2));
-    }
-
-    #[test]
-    fn test_decoder_trait() {
-        let decoder = InstructionDecoder::from_encodings(vec![make_add_encoding()]);
-
-        // ADD r5, r3, r2 as bytes (little-endian)
-        // Slot encoding: 00011_00101_00010_0000_1 = 20 bits
-        // For 32-bit format, we need format marker 0x9 in low nibble
-        // Shift slot content left by 4 bits and add format marker
-        let slot_content = 0b00011_00101_00010_0000_1u32; // 20 bits
-        let word = (slot_content << 4) | 0x9; // Add 32-bit format marker
-        let bytes = word.to_le_bytes();
-
-        let bundle = decoder.decode(&bytes, 0x100).expect("Should decode");
-        assert_eq!(bundle.pc(), 0x100);
-
-        // Note: The slot encoding is now shifted, so decode_word needs to look
-        // at the shifted position. For now, check that we get SOMETHING decoded.
-        // The actual operation may be Unknown since the encoding doesn't match
-        // the shifted position. That's OK - this test is mainly about the Decoder
-        // trait working, not the specific instruction matching.
-        assert_eq!(bundle.size(), 4); // Should be 32-bit format
-    }
 
     #[test]
     fn test_decoder_nop() {
@@ -1618,48 +1453,6 @@ mod tests {
     }
 
     #[test]
-    fn test_specificity_ordering() {
-        // More specific encoding (more fixed bits) should match first
-        let less_specific = InstrEncoding {
-            name: "GENERIC".to_string(),
-            mnemonic: "generic".to_string(),
-            slot: "alu".to_string(),
-            width: 20,
-            fixed_mask: 0b1, // Only 1 fixed bit
-            fixed_bits: 0b1,
-            operand_fields: vec![],
-            semantic: None,
-            may_load: false,
-            may_store: false,
-            input_order: vec![],
-            output_order: vec![],
-            implicit_regs: vec![],
-            addressing_mode: crate::tablegen::AddressingMode::Unknown,
-            mem_width: crate::tablegen::InstrMemWidth::Word,
-            has_complete_decoder: true,
-            element_type: None,
-            branch_condition: None,
-            is_vector: false,
-            select_variant: None,
-            is_ptr_arithmetic: false,
-            is_sp_relative: false,
-            sched_class: None,
-        };
-
-        let more_specific = make_add_encoding(); // 5 fixed bits
-
-        // Order shouldn't matter - decoder sorts by specificity
-        let decoder =
-            InstructionDecoder::from_encodings(vec![less_specific.clone(), more_specific]);
-
-        let word = 0b00011_00101_00010_0000_1u64;
-        let decoded = decoder.decode_word(word).expect("Should decode");
-
-        // Should match ADD (more specific), not GENERIC
-        assert_eq!(decoded.encoding.name, "ADD");
-    }
-
-    #[test]
     fn test_decoder_with_real_llvm_aie() {
         let llvm_aie_path = Path::new("../llvm-aie");
         if !llvm_aie_path.exists() {
@@ -1667,17 +1460,13 @@ mod tests {
             return;
         }
 
-        // Load real TableGen data
-        let data = load_from_llvm_aie(llvm_aie_path).expect("Failed to load llvm-aie");
-        let tables = build_decoder_tables(&data);
+        // Load decoder with bytecode tables (the only real decode path)
+        let decoder = InstructionDecoder::try_load_via_tblgen(llvm_aie_path)
+            .expect("Failed to load via tblgen");
 
-        eprintln!("Loaded {} slots with encodings:", tables.len());
-        for (slot, encodings) in &tables {
-            eprintln!("  {}: {} encodings", slot, encodings.len());
-        }
-
-        // Create decoder from real data
-        let decoder = InstructionDecoder::from_tables(tables);
+        let encoding_count = decoder.decoder_index().all_encodings().count();
+        eprintln!("Loaded {} encodings", encoding_count);
+        assert!(encoding_count > 100, "Should have many encodings");
 
         // Test NOP decoding
         let nop_bytes = [0x00u8, 0x00, 0x00, 0x00];
@@ -1687,15 +1476,9 @@ mod tests {
         // Get stats
         let (decode_count, unknown_count) = decoder.stats();
         eprintln!(
-            "Decoder created with {} encodings, {} decoded, {} unknown",
-            decoder.encodings.len(),
+            "Decoder stats: {} decoded, {} unknown",
             decode_count,
             unknown_count
-        );
-
-        assert!(
-            decoder.encodings.len() > 0,
-            "Should have loaded some encodings"
         );
     }
 
@@ -1716,10 +1499,9 @@ mod tests {
             return;
         }
 
-        // Load TableGen data and create decoder
-        let data = load_from_llvm_aie(&llvm_aie_path).expect("Failed to load llvm-aie");
-        let tables = build_decoder_tables(&data);
-        let decoder = InstructionDecoder::from_tables(tables);
+        // Load decoder with bytecode tables
+        let decoder = InstructionDecoder::try_load_via_tblgen(&llvm_aie_path)
+            .expect("Failed to load via tblgen");
 
         // Read ELF using proper parser
         let elf_data = std::fs::read(&elf_path).expect("Failed to read ELF");
@@ -1840,17 +1622,19 @@ mod tests {
         let decoder = InstructionDecoder::try_load_via_tblgen(llvm_aie_path)
             .expect("Failed to load via tblgen");
 
-        eprintln!("Loaded {} encodings via tblgen", decoder.encodings.len());
+        let index = decoder.decoder_index();
+        let encoding_count = index.all_encodings().count();
+        eprintln!("Loaded {} encodings via tblgen", encoding_count);
 
-        // Verify we have more than regex-based loader (tblgen captures more instructions)
+        // Verify we loaded many encodings
         assert!(
-            decoder.encodings.len() > 100,
+            encoding_count > 100,
             "Should have loaded many encodings"
         );
 
         // Verify ACQ instructions are distinguished
-        let acq_imm = decoder.encodings.iter().find(|e| e.name == "ACQ_mLockId_imm");
-        let acq_reg = decoder.encodings.iter().find(|e| e.name == "ACQ_mLockId_reg");
+        let acq_imm = index.all_encodings().find(|e| e.name == "ACQ_mLockId_imm");
+        let acq_reg = index.all_encodings().find(|e| e.name == "ACQ_mLockId_reg");
 
         if let (Some(imm), Some(reg)) = (acq_imm, acq_reg) {
             eprintln!(
@@ -1942,9 +1726,8 @@ mod tests {
             eprintln!("Skipping test: llvm-aie not found");
             return;
         }
-        let data = load_from_llvm_aie(llvm_aie_path).expect("Failed to load llvm-aie");
-        let tables = build_decoder_tables(&data);
-        let decoder = InstructionDecoder::from_tables(tables);
+        let decoder = InstructionDecoder::try_load_via_tblgen(llvm_aie_path)
+            .expect("Failed to load via tblgen");
 
         // First, show raw slot extraction
         use crate::interpreter::bundle::extract_slots;
@@ -2026,9 +1809,8 @@ mod tests {
             eprintln!("Skipping test: llvm-aie not found");
             return;
         }
-        let data = load_from_llvm_aie(llvm_aie_path).expect("Failed to load llvm-aie");
-        let tables = build_decoder_tables(&data);
-        let decoder = InstructionDecoder::from_tables(tables);
+        let decoder = InstructionDecoder::try_load_via_tblgen(llvm_aie_path)
+            .expect("Failed to load via tblgen");
 
         // Helper: build a 42-bit LNG slot word for movxm
         let build_movxm = |imm: u32, dst_enc: u8| -> u64 {
@@ -2592,7 +2374,7 @@ mod tests {
 
         let decoder = InstructionDecoder::load_default();
         let mut vec_mnemonics: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for enc in &decoder.encodings {
+        for enc in decoder.decoder_index().all_encodings() {
             let m = enc.mnemonic.to_lowercase();
             if m.starts_with('v') && m != "opcodestr" {
                 let base = m.split('.').next().unwrap_or(&m).to_string();
