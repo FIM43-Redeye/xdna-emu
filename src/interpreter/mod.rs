@@ -71,7 +71,7 @@ pub use state::{
 };
 
 // Execute types
-pub use execute::{CycleAccurateExecutor, CycleAccurateStats, ScalarAlu, VectorAlu, MemoryUnit, ControlUnit};
+pub use execute::{CycleAccurateExecutor, CycleAccurateStats, VectorAlu, MemoryUnit, ControlUnit};
 
 // Core types
 pub use core::{CoreInterpreter, CoreStatus, StepResult};

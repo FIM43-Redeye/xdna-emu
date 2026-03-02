@@ -12,15 +12,10 @@
 //!         |
 //!         v
 //!   ┌─────────────────────────┐
-//!   │  execute_semantic(op)   │ <-- TableGen-driven, ~40 handlers
+//!   │  execute_semantic(op)   │ <-- TableGen-driven, ~85 handlers
 //!   │  (pure register ops)    │     Covers: Add, Sub, Mul, And, Or, ...
 //!   └────────────┬────────────┘
-//!                | false (no semantic or unhandled)
-//!                v
-//!   ┌─────────────────────────┐
-//!   │   ScalarAlu::execute()  │ <-- Legacy fallback, sets CPU flags
-//!   └────────────┬────────────┘
-//!                | false
+//!                | false (not a pure register op)
 //!                v
 //!   ┌─────────────────────────┐
 //!   │   VectorAlu::execute()  │ <-- SIMD operations
@@ -31,6 +26,11 @@
 //!   │   MemoryUnit::execute() │ <-- Load/Store (needs tile access)
 //!   └────────────┬────────────┘
 //!                | false
+//!                v
+//!   ┌─────────────────────────┐
+//!   │   CascadeOps::execute() │ <-- 384-bit cascade link
+//!   └────────────┬────────────┘
+//!                | NotCascadeOp
 //!                v
 //!   ┌─────────────────────────┐
 //!   │   StreamOps::execute()  │ <-- Stream I/O (needs stream switch)
@@ -47,9 +47,9 @@
 //! | Unit | Purpose | Semantic Dispatch? |
 //! |------|---------|-------------------|
 //! | [`semantic`] | TableGen-driven pure ops | **Primary** |
-//! | [`ScalarAlu`] | Legacy scalar + flag-setting | Fallback |
 //! | [`VectorAlu`] | SIMD operations | Fallback |
 //! | [`MemoryUnit`] | Load/Store (tile memory) | No (needs tile) |
+//! | [`CascadeOps`] | 384-bit cascade link | No (needs tile) |
 //! | [`StreamOps`] | Stream I/O | No (needs switch) |
 //! | [`ControlUnit`] | Branch/Lock/Halt | No (control flow) |
 //!
@@ -75,7 +75,6 @@
 //! let result = executor.execute(&bundle, &mut ctx, &mut tile);
 //! ```
 
-mod scalar;
 mod vector;
 pub mod vector_pack;
 pub mod vector_permute;
@@ -89,7 +88,6 @@ mod cascade;
 mod cycle_accurate;
 mod semantic;
 
-pub use scalar::ScalarAlu;
 pub use vector::VectorAlu;
 pub use memory::{MemoryUnit, NeighborMemory};
 pub use control::ControlUnit;

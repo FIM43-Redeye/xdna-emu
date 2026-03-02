@@ -40,6 +40,8 @@ use crate::interpreter::bundle::{Operand, SlotOp};
 use crate::tablegen::SemanticOp;
 use crate::interpreter::state::ExecutionContext;
 
+use super::semantic::{read_operand, write_dest};
+
 /// Stream operations execution unit.
 ///
 /// Handles read/write operations between scalar registers and stream ports.
@@ -128,7 +130,7 @@ impl StreamOps {
                 // Try to pop value from tile's stream input buffer
                 if let Some(value) = tile.pop_stream_input(port) {
                     // Data available - write to destination register
-                    Self::write_dest(op, ctx, value);
+                    write_dest(op, ctx, value);
                     StreamResult::Completed
                 } else if blocking {
                     // No data and blocking - signal stall
@@ -136,7 +138,7 @@ impl StreamOps {
                     StreamResult::Stall { port }
                 } else {
                     // No data but non-blocking - write 0 and continue
-                    Self::write_dest(op, ctx, 0);
+                    write_dest(op, ctx, 0);
                     StreamResult::Completed
                 }
             }
@@ -151,7 +153,7 @@ impl StreamOps {
     fn get_source_value(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
         op.sources
             .first()
-            .map_or(0, |src| Self::read_operand(src, ctx))
+            .map_or(0, |src| read_operand(src, ctx))
     }
 
     /// Get the stream port from operands.
@@ -171,30 +173,6 @@ impl StreamOps {
         0
     }
 
-    /// Read an operand value from the execution context.
-    fn read_operand(operand: &Operand, ctx: &ExecutionContext) -> u32 {
-        match operand {
-            Operand::ScalarReg(r) => ctx.scalar_read(*r),
-            Operand::PointerReg(r) => ctx.pointer_read(*r),
-            Operand::ModifierReg(r) => ctx.modifier_read(*r),
-            Operand::Immediate(v) => *v as u32,
-            _ => 0, // Other operand types not valid for stream operations
-        }
-    }
-
-    /// Write result to destination operand.
-    ///
-    /// Stream reads write to a scalar register destination.
-    fn write_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: u32) {
-        if let Some(dest) = &op.dest {
-            match dest {
-                Operand::ScalarReg(r) => ctx.scalar.write(*r, value),
-                Operand::PointerReg(r) => ctx.pointer.write(*r, value),
-                Operand::ModifierReg(r) => ctx.modifier.write(*r, value),
-                _ => {} // Ignore invalid destinations
-            }
-        }
-    }
 }
 
 #[cfg(test)]

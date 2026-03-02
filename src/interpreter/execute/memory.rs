@@ -2,32 +2,8 @@
 //!
 //! Handles load/store operations between registers and tile memory.
 //!
-//! # Architecture Note
-//!
-//! Unlike [`ScalarAlu`](super::ScalarAlu) and [`VectorAlu`](super::VectorAlu),
-//! the memory unit is NOT a legacy fallback - it handles actual memory access
-//! that semantic dispatch cannot replicate (memory ops need tile access).
-//!
-//! ## Execution Flow
-//!
-//! ```text
-//! CycleAccurateExecutor::execute_slot()
-//!         |
-//!         v
-//!   execute_semantic(op, ctx)  <-- Pure register ops only
-//!         |
-//!         v
-//!   ScalarAlu::execute(op, ctx)
-//!         |
-//!         v
-//!   VectorAlu::execute(op, ctx)
-//!         |
-//!         v
-//!   MemoryUnit::execute(op, ctx, tile)  <-- Memory access (this module)
-//! ```
-//!
 //! Memory operations require tile access for actual reads/writes, so they
-//! will always be handled here rather than in semantic dispatch.
+//! are handled here rather than in semantic dispatch.
 //!
 //! # Addressing
 //!

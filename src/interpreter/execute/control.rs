@@ -17,7 +17,7 @@
 //!   execute_semantic(op, ctx)  <-- Pure register ops only
 //!         |
 //!         v
-//!   ScalarAlu / VectorAlu / MemoryUnit / StreamOps
+//!   VectorAlu / MemoryUnit / CascadeOps / StreamOps
 //!         |
 //!         v
 //!   ControlUnit::execute(op, ctx, tile)  <-- Control flow (this module)
@@ -248,13 +248,6 @@ impl ControlUnit {
     /// handled by the caller). For unconditional branches (jl), the first source
     /// is the Immediate target directly. For register-indirect branches (jl pN,
     /// ret lr, jnzd), a PointerReg operand provides the target.
-    /// Get branch target address from operand.
-    ///
-    /// For conditional branches (jnz/jz), the sources contain both a condition
-    /// register and an immediate target address. We prefer the Immediate operand
-    /// since that's the branch target; the register is the condition (already
-    /// handled by the caller). For register-indirect branches (jl pN, ret lr,
-    /// jnzd), a PointerReg operand provides the target.
     fn get_branch_target(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
         // Prefer Immediate operand (the branch target address)
         for src in &op.sources {

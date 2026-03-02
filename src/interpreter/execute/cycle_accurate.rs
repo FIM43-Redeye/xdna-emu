@@ -39,8 +39,8 @@ use crate::interpreter::traits::{ExecuteResult, Executor};
 use super::cascade::{CascadeOps, CascadeResult};
 use super::control::ControlUnit;
 use super::memory::{MemoryUnit, NeighborMemory};
-use super::scalar::ScalarAlu;
 use super::semantic::execute_semantic;
+use super::stream::{StreamOps, StreamResult};
 use super::vector::VectorAlu;
 
 /// Cycle-accurate executor that models pipeline timing.
@@ -164,14 +164,10 @@ impl CycleAccurateExecutor {
         }
 
         // Execute using the functional units.
-        // Prefer TableGen-driven semantic dispatch for pure register operations.
-        // Falls through to legacy dispatch for unhandled ops (vector, memory,
-        // control flow, and any ops without SemanticOp mappings).
+        // Semantic dispatch handles pure register operations (scalar arithmetic,
+        // logic, moves, flags). Falls through for vector, memory, stream,
+        // cascade, and control flow ops.
         if execute_semantic(op, ctx) {
-            return None;
-        }
-
-        if ScalarAlu::execute(op, ctx) {
             return None;
         }
 
@@ -190,6 +186,14 @@ impl CycleAccurateExecutor {
             CascadeResult::Completed => return None,
             CascadeResult::Stall => return Some(ExecuteResult::WaitStream { port: 255 }),
             CascadeResult::NotCascadeOp => {}
+        }
+
+        // Stream operations: read/write between scalar registers and stream
+        // switch ports. Stall on blocking read from empty stream.
+        match StreamOps::execute(op, ctx, tile) {
+            StreamResult::Completed => return None,
+            StreamResult::Stall { port } => return Some(ExecuteResult::WaitStream { port }),
+            StreamResult::NotStreamOp => {}
         }
 
         if let Some(result) = ControlUnit::execute_with_mem_locks(op, ctx, tile, mem_tile_locks) {

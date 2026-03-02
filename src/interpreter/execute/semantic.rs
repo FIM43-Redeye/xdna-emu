@@ -119,14 +119,6 @@ pub fn execute_semantic(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         // Conditional select
         SemanticOp::Select => execute_select(op, ctx),
 
-        // Memory operations
-        SemanticOp::Load => execute_load(op, ctx),
-        SemanticOp::Store => execute_store(op, ctx),
-
-        // Control flow
-        SemanticOp::Br => execute_branch(op, ctx),
-        SemanticOp::BrCond => execute_branch_cond(op, ctx),
-
         // Bit manipulation
         SemanticOp::Ctlz => execute_clz(op, ctx),
         SemanticOp::Cttz => execute_ctz(op, ctx),
@@ -197,14 +189,14 @@ enum CmpOp {
 }
 
 /// Read a source operand as a 32-bit value.
-fn read_source(op: &SlotOp, ctx: &ExecutionContext, index: usize) -> u32 {
+pub(super) fn read_source(op: &SlotOp, ctx: &ExecutionContext, index: usize) -> u32 {
     op.sources.get(index).map_or(0, |src| read_operand(src, ctx))
 }
 
-/// Read an operand value from context.
+/// Read a scalar operand value from context.
 ///
 /// Uses VLIW-safe reads where available (scalar_read for scalar regs).
-fn read_operand(operand: &Operand, ctx: &ExecutionContext) -> u32 {
+pub(super) fn read_operand(operand: &Operand, ctx: &ExecutionContext) -> u32 {
     match operand {
         Operand::ScalarReg(r) => ctx.scalar_read(*r),
         Operand::PointerReg(r) => ctx.pointer_read(*r),
@@ -219,7 +211,7 @@ fn read_operand(operand: &Operand, ctx: &ExecutionContext) -> u32 {
 }
 
 /// Write a result to the destination operand.
-fn write_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: u32) {
+pub(super) fn write_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: u32) {
     if let Some(dest) = &op.dest {
         write_operand(dest, ctx, value);
     }
@@ -237,7 +229,7 @@ fn write_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: u32) {
 ///   Only reaches here if a scalar semantic op has vector operands (misclassification).
 /// - Non-writable (Immediate, Lock, etc.): should never reach here after decoder
 ///   validation in `extract_ordered_operands`. Debug-assert to catch regressions.
-fn write_operand(operand: &Operand, ctx: &mut ExecutionContext, value: u32) {
+pub(super) fn write_operand(operand: &Operand, ctx: &mut ExecutionContext, value: u32) {
     match operand {
         Operand::ScalarReg(r) => ctx.scalar.write(*r, value),
         Operand::PointerReg(r) => ctx.queue_pointer_write(*r, value, 1),
@@ -553,34 +545,6 @@ fn execute_select(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
 // ============================================================================
 // Memory operations
 // ============================================================================
-
-fn execute_load(_op: &SlotOp, _ctx: &mut ExecutionContext) -> bool {
-    // Memory operations need the full memory subsystem - fall back for now
-    log::trace!("[SEMANTIC] Load requires memory subsystem - falling back");
-    false
-}
-
-fn execute_store(_op: &SlotOp, _ctx: &mut ExecutionContext) -> bool {
-    log::trace!("[SEMANTIC] Store requires memory subsystem - falling back");
-    false
-}
-
-// ============================================================================
-// Control flow
-// ============================================================================
-
-fn execute_branch(_op: &SlotOp, _ctx: &mut ExecutionContext) -> bool {
-    log::trace!("[SEMANTIC] Branch requires control flow handling - falling back");
-    false
-}
-
-fn execute_branch_cond(_op: &SlotOp, _ctx: &mut ExecutionContext) -> bool {
-    log::trace!("[SEMANTIC] BranchCond requires control flow handling - falling back");
-    false
-}
-
-
-// ============================================================================
 // Special operations
 // ============================================================================
 
@@ -875,9 +839,6 @@ mod tests {
     #[test]
     fn test_control_reg_write_via_semantic_copy() {
         // Verify that movx crRnd, rN works through the semantic Copy path.
-        // Previously, ControlReg was not handled in write_operand, so
-        // control register writes were silently dropped when semantic
-        // dispatch returned true before ScalarAlu fallback could run.
         let mut ctx = make_test_context();
         ctx.scalar.write(5, 9); // rounding mode value
 
@@ -1274,5 +1235,77 @@ mod tests {
         // Load should delegate to MemoryUnit
         let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load);
         assert!(!execute_semantic(&op, &mut ctx));
+    }
+
+    // --- Tests migrated from scalar.rs (unique coverage not in above tests) ---
+
+    #[test]
+    fn test_add_overflow_sets_carry_and_zero() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(0, 0xFFFF_FFFF);
+        ctx.scalar.write(1, 1);
+
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
+            .with_dest(Operand::ScalarReg(2))
+            .with_source(Operand::ScalarReg(0))
+            .with_source(Operand::ScalarReg(1));
+        execute_semantic(&op, &mut ctx);
+        assert_eq!(ctx.scalar_read(2), 0);
+        assert!(ctx.flags().c); // Carry set
+        assert!(ctx.flags().z); // Zero set
+    }
+
+    #[test]
+    fn test_cmp_sets_flags() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(0, 10);
+        ctx.scalar.write(1, 10);
+
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Cmp)
+            .with_source(Operand::ScalarReg(0))
+            .with_source(Operand::ScalarReg(1));
+        execute_semantic(&op, &mut ctx);
+        assert!(ctx.flags().z);
+
+        ctx.scalar.write(1, 20);
+        execute_semantic(&op, &mut ctx);
+        assert!(!ctx.flags().z);
+        assert!(ctx.flags().n);
+    }
+
+    #[test]
+    fn test_copy_register() {
+        let mut ctx = make_test_context();
+        ctx.scalar.write(0, 42);
+
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Copy)
+            .with_dest(Operand::ScalarReg(1))
+            .with_source(Operand::ScalarReg(0));
+        execute_semantic(&op, &mut ctx);
+        assert_eq!(ctx.scalar_read(1), 42);
+    }
+
+    #[test]
+    fn test_copy_immediate() {
+        let mut ctx = make_test_context();
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Copy)
+            .with_dest(Operand::ScalarReg(5))
+            .with_source(Operand::Immediate(12345));
+        assert!(execute_semantic(&op, &mut ctx));
+        assert_eq!(ctx.scalar_read(5), 12345);
+    }
+
+    #[test]
+    fn test_pointer_reg_as_scalar_source() {
+        let mut ctx = make_test_context();
+        ctx.pointer.write(0, 0x1000);
+        ctx.scalar.write(0, 0x100);
+
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
+            .with_dest(Operand::ScalarReg(1))
+            .with_source(Operand::PointerReg(0))
+            .with_source(Operand::ScalarReg(0));
+        execute_semantic(&op, &mut ctx);
+        assert_eq!(ctx.scalar_read(1), 0x1100);
     }
 }

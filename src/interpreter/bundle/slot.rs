@@ -438,7 +438,7 @@ impl SlotOp {
     pub fn is_control_flow(&self) -> bool {
         matches!(
             self.semantic,
-            Some(SemanticOp::Br | SemanticOp::Call | SemanticOp::Ret)
+            Some(SemanticOp::Br | SemanticOp::BrCond | SemanticOp::Call | SemanticOp::Ret)
         )
     }
 

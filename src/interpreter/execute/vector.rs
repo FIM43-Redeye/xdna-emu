@@ -1,28 +1,18 @@
-//! Vector ALU execution unit (LEGACY FALLBACK).
+//! Vector ALU execution unit.
 //!
-//! Handles SIMD operations on 256-bit vectors (8 × 32-bit, 16 × 16-bit, 32 × 8-bit).
+//! Handles SIMD operations on 256-bit vectors (8 x 32-bit, 16 x 16-bit, 32 x 8-bit).
 //!
-//! # Architecture Note
-//!
-//! Like [`ScalarAlu`](super::ScalarAlu), this module is a **legacy fallback**.
-//! The preferred execution path is through the TableGen-driven semantic
-//! dispatcher in [`execute_semantic`](super::semantic::execute_semantic).
-//!
-//! ## Execution Flow
+//! # Execution Flow
 //!
 //! ```text
 //! CycleAccurateExecutor::execute_slot()
 //!         |
 //!         v
-//!   execute_semantic(op, ctx)  <-- TableGen-driven, preferred
-//!         |
-//!         | returns false (no semantic info or vector type not handled)
-//!         v
-//!   ScalarAlu::execute(op, ctx)
+//!   execute_semantic(op, ctx)  <-- scalar register ops
 //!         |
 //!         | returns false (not a scalar op)
 //!         v
-//!   VectorAlu::execute(op, ctx)  <-- Legacy fallback (this module)
+//!   VectorAlu::execute(op, ctx)  <-- SIMD operations (this module)
 //! ```
 //!
 //! ## Future Direction
