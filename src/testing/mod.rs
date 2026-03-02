@@ -34,6 +34,7 @@ pub mod lit_trace;
 pub mod trace_compare;
 pub mod emu_runner;
 pub mod quiescence;
+pub mod ground_truth;
 
 pub use xclbin_suite::{XclbinSuite, XclbinTest, TestOutcome, Compiler};
 pub use opcode_collector::{UnknownOpcode, OpcodeCollector};
