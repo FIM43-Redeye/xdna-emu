@@ -815,12 +815,21 @@ impl ExecutionContext {
         self.modifier_snapshot = None;
     }
 
-    // === Load Latency Methods ===
+    // === Deferred Write Methods ===
 
-    /// Queue a scalar load result for deferred register write.
+    /// Queue a deferred register write with pipeline latency.
     ///
-    /// The write will become visible after `latency` cycles, modeling
-    /// the AIE2 memory load pipeline.
+    /// The write will become visible after `latency` cycles. This models
+    /// the AIE2 pipeline: a write with latency N issued at cycle C becomes
+    /// visible at cycle C+N (committed by `commit_pending_writes()` at the
+    /// start of that cycle).
+    ///
+    /// Used for:
+    /// - Memory loads (latency 7): `queue_scalar_load()` / `queue_vector_load()`
+    /// - Pointer register writes (latency 1): `queue_pointer_write()`
+    ///
+    /// At branch boundaries, `delay_pending_writes(1)` adds an extra cycle
+    /// to model the loss of forwarding when the pipeline is flushed.
     pub fn queue_scalar_load(&mut self, dest: Operand, value: u32, latency: u64) {
         self.pending_writes.push(PendingWrite {
             dest,
@@ -838,6 +847,40 @@ impl ExecutionContext {
             vec_value: Some(value),
             ready_cycle: self.cycles + latency,
         });
+    }
+
+    /// Queue a pointer register write with pipeline latency.
+    ///
+    /// Pointer register writes from MOV/MOVXM/PADDA/PADDB have latency 1
+    /// in the scheduling model (II_MOV_P, II_PADDA). The write becomes
+    /// visible in the next sequential bundle.
+    ///
+    /// At branch boundaries (delay slot -> branch target), forwarding is
+    /// unavailable. `delay_pending_writes(1)` is called to push the write
+    /// one cycle later, so the branch target's first instruction reads
+    /// the pre-write value. This matches observed hardware behavior where
+    /// Peano generates "prologue stores" that rely on pointer registers
+    /// not being ready at function entry.
+    pub fn queue_pointer_write(&mut self, reg: u8, value: u32, latency: u64) {
+        self.pending_writes.push(PendingWrite {
+            dest: Operand::PointerReg(reg),
+            scalar_value: value,
+            vec_value: None,
+            ready_cycle: self.cycles + latency,
+        });
+    }
+
+    /// Delay all pending writes by the specified number of cycles.
+    ///
+    /// Called when a branch is taken (delay slots exhausted, PC redirected)
+    /// to model the loss of forwarding at pipeline flush boundaries.
+    /// On real hardware, the pipeline flush means that results from the
+    /// last delay slot instruction(s) are not forwarded to the branch
+    /// target's first instruction, adding effective latency.
+    pub fn delay_pending_writes(&mut self, extra_cycles: u64) {
+        for pw in &mut self.pending_writes {
+            pw.ready_cycle += extra_cycles;
+        }
     }
 
     /// Flush all pending writes immediately, ignoring cycle timing.

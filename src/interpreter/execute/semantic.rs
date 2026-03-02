@@ -235,7 +235,11 @@ fn write_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: u32) {
 /// Write a value to an operand.
 ///
 /// Three categories:
-/// - Scalar/pointer/modifier: fully implemented, write to register file.
+/// - Scalar: immediate write to register file.
+/// - Pointer/modifier: deferred write with pipeline latency 1. The value
+///   becomes visible in the next sequential bundle. At branch boundaries,
+///   `delay_pending_writes()` adds an extra cycle, modeling the loss of
+///   pipeline forwarding after a branch flush.
 /// - Vector/accum: valid destinations, but writes are handled by VectorAlu.
 ///   Only reaches here if a scalar semantic op has vector operands (misclassification).
 /// - Non-writable (Immediate, Lock, etc.): should never reach here after decoder
@@ -243,7 +247,7 @@ fn write_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: u32) {
 fn write_operand(operand: &Operand, ctx: &mut ExecutionContext, value: u32) {
     match operand {
         Operand::ScalarReg(r) => ctx.scalar.write(*r, value),
-        Operand::PointerReg(r) => ctx.pointer.write(*r, value),
+        Operand::PointerReg(r) => ctx.queue_pointer_write(*r, value, 1),
         Operand::ModifierReg(r) => ctx.modifier.write(*r, value),
         Operand::ControlReg(id) => {
             // Control register write: update SRS/UPS config.
@@ -317,10 +321,10 @@ fn execute_add(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
             None => 6, // SP = p6
             _ => return false, // Unexpected dest type
         };
-        let base = ctx.pointer.read(ptr_idx);
+        let base = ctx.pointer_read(ptr_idx);
         let offset = read_source(op, ctx, 0);
         let result = base.wrapping_add(offset);
-        ctx.pointer.write(ptr_idx, result);
+        ctx.queue_pointer_write(ptr_idx, result, 1);
         return true;
     }
 
@@ -1283,6 +1287,8 @@ mod tests {
         op.dest = Some(Operand::PointerReg(2));
 
         assert!(execute_semantic(&op, &mut ctx));
+        // Pointer write is deferred (pipeline latency 1); flush to make visible.
+        ctx.flush_pending_writes();
         assert_eq!(ctx.pointer.read(2), 0x1100);
     }
 

@@ -831,4 +831,95 @@ mod tests {
         // Cycles should have advanced (execution happened)
         assert!(ctx.cycles > 0, "Execution should advance cycles");
     }
+
+    // --- Deferred Pointer Write Tests ---
+
+    #[test]
+    fn test_pointer_write_deferred_by_one_cycle() {
+        // A MOV-to-pointer (via SemanticOp::Copy) should defer the write by 1 cycle.
+        // Within the same bundle, the old pointer value should be visible.
+        // After commit_pending_writes at the next cycle, the new value is visible.
+        use crate::tablegen::SemanticOp;
+
+        let mut executor = CycleAccurateExecutor::new();
+        let mut ctx = ExecutionContext::new();
+        let mut tile = Tile::compute(0, 2);
+
+        ctx.pointer.write(1, 0xDEAD); // Old p1 value
+
+        // movxm p1, #0x70400
+        let bundle = make_bundle(vec![
+            SlotOp::with_semantic(
+                SlotIndex::Scalar1, Operation::ScalarMov, SemanticOp::Copy,
+            )
+            .with_dest(Operand::PointerReg(1))
+            .with_source(Operand::Immediate(0x70400)),
+        ]);
+
+        executor.execute(&bundle, &mut ctx, &mut tile);
+
+        // After execution, p1 should still be the OLD value (write is deferred).
+        assert_eq!(
+            ctx.pointer.read(1), 0xDEAD,
+            "Pointer write should be deferred, not visible immediately"
+        );
+
+        // Execute another bundle (any NOP will do). This calls commit_pending_writes.
+        let nop = make_bundle(vec![]);
+        executor.execute(&nop, &mut ctx, &mut tile);
+
+        // Now p1 should have the new value (committed at start of cycle 2).
+        assert_eq!(
+            ctx.pointer.read(1), 0x70400,
+            "Pointer write should be committed after one cycle"
+        );
+    }
+
+    #[test]
+    fn test_delay_pending_writes_at_branch_boundary() {
+        // When delay_pending_writes(1) is called at a branch boundary,
+        // pointer writes from the last delay slot need an extra cycle.
+        // This test verifies the mechanism directly on ExecutionContext.
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(1, 0xDEAD);
+
+        // Simulate movxm p1, #0x70400 at cycle 5 (last delay slot)
+        ctx.cycles = 5;
+        ctx.queue_pointer_write(1, 0x70400, 1); // ready_cycle = 6
+
+        // Branch taken: delay pending writes by 1 extra cycle
+        ctx.delay_pending_writes(1); // ready_cycle becomes 7
+
+        // At cycle 6 (branch target first instruction): commit should NOT apply
+        ctx.cycles = 6;
+        ctx.commit_pending_writes();
+        assert_eq!(
+            ctx.pointer.read(1), 0xDEAD,
+            "Pointer write should NOT be visible at branch target (cycle 6)"
+        );
+
+        // At cycle 7 (branch target second instruction): commit SHOULD apply
+        ctx.cycles = 7;
+        ctx.commit_pending_writes();
+        assert_eq!(
+            ctx.pointer.read(1), 0x70400,
+            "Pointer write should be visible one cycle after branch target"
+        );
+    }
+
+    #[test]
+    fn test_pointer_write_sequential_latency_one() {
+        // In sequential (non-branch) code, pointer writes should have latency 1:
+        // movxm p1, #addr at cycle C → p1 available at cycle C+1.
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(1, 0);
+
+        ctx.cycles = 10;
+        ctx.queue_pointer_write(1, 0x1234, 1); // ready_cycle = 11
+
+        // At cycle 11: commit should apply (no branch delay)
+        ctx.cycles = 11;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.pointer.read(1), 0x1234);
+    }
 }

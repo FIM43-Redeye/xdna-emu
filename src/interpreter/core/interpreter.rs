@@ -161,6 +161,10 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                 ctx.advance_pc(bundle_size as u32);
                 if let Some(branch_target) = ctx.tick_delay_slots() {
                     ctx.set_pc(branch_target);
+                    // Pipeline flush at branch boundary: forwarding is unavailable,
+                    // so pending register writes need an extra cycle before they
+                    // become visible to the branch target's first instruction.
+                    ctx.delay_pending_writes(1);
                 } else {
                     ctx.check_hardware_loop(pc);
                 }
@@ -173,6 +177,7 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                 ctx.advance_pc(bundle_size as u32);
                 if let Some(branch_target) = ctx.tick_delay_slots() {
                     ctx.set_pc(branch_target);
+                    ctx.delay_pending_writes(1);
                 } else {
                     ctx.check_hardware_loop(pc);
                 }
@@ -185,6 +190,7 @@ impl CoreInterpreter<InstructionDecoder, CycleAccurateExecutor> {
                 ctx.advance_pc(bundle_size as u32);
                 if let Some(branch_target) = ctx.tick_delay_slots() {
                     ctx.set_pc(branch_target);
+                    ctx.delay_pending_writes(1);
                 } else {
                     ctx.check_hardware_loop(pc);
                 }
@@ -318,6 +324,7 @@ where
                 // Check if pending branch should now be taken
                 if let Some(branch_target) = ctx.tick_delay_slots() {
                     ctx.set_pc(branch_target);
+                    ctx.delay_pending_writes(1);
                 } else {
                     ctx.check_hardware_loop(pc);
                 }
@@ -333,6 +340,7 @@ where
                 // Check if this was a back-to-back branch and delay slots exhausted
                 if let Some(branch_target) = ctx.tick_delay_slots() {
                     ctx.set_pc(branch_target);
+                    ctx.delay_pending_writes(1);
                 } else {
                     ctx.check_hardware_loop(pc);
                 }
@@ -348,6 +356,7 @@ where
                 ctx.advance_pc(bundle_size as u32);
                 if let Some(branch_target) = ctx.tick_delay_slots() {
                     ctx.set_pc(branch_target);
+                    ctx.delay_pending_writes(1);
                 } else {
                     ctx.check_hardware_loop(pc);
                 }
