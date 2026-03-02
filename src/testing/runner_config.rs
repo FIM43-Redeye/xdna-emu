@@ -537,6 +537,8 @@ pub struct Options {
     pub fuzz_iterations: usize,
     /// Base seed for fuzz generation (None = use wall clock).
     pub fuzz_seed: Option<u64>,
+    /// Use full 13-group trace sweep for ground truth (statistical classification).
+    pub full_sweep: bool,
     /// Run trace event group sweep (multi-group trace capture + comparison).
     pub trace_sweep: bool,
     /// Number of NPU repetitions for trace determinism check (default 5).
@@ -746,6 +748,7 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
                 });
             }
             "--aiesim-trace" => aiesim_trace = true,
+            "--full" => trace_sweep = true, // reuse trace_sweep for full ground truth mode
 
             // --- Discovery ---
             "--list" => list_only = true,
@@ -875,6 +878,7 @@ pub fn parse_args(config: &RunnerConfig) -> Options {
         output_path: output_path.unwrap_or_else(|| PathBuf::from("build/results.json")),
         format_json,
 
+        full_sweep: trace_sweep,
         fuzz_iterations,
         fuzz_seed,
         trace_sweep,

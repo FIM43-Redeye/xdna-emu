@@ -1084,6 +1084,7 @@ mod tests {
             format_json: false,
             fuzz_iterations: 0,
             fuzz_seed: Some(1),
+            full_sweep: false,
             trace_sweep: false,
             trace_sweep_reps: 5,
         };
