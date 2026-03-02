@@ -25,11 +25,11 @@
 //! # Usage
 //!
 //! ```ignore
-//! use xdna_emu::interpreter::timing::{LatencyTable, MemoryModel};
+//! use xdna_emu::interpreter::timing::{LatencyTable, OperationKey, MemoryModel};
 //!
 //! let latencies = LatencyTable::aie2();
-//! let cycles = latencies.get(&Operation::ScalarMul);
-//! assert_eq!(cycles, 2);
+//! let timing = latencies.get(OperationKey::ScalarMul);
+//! assert_eq!(timing.latency, 2);
 //! ```
 
 pub mod latency;

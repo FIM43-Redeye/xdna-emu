@@ -55,12 +55,9 @@
 //!
 //! # Migration Path
 //!
-//! The goal is to migrate pure computational operations to `execute_semantic()`,
-//! which uses TableGen-derived SemanticOp patterns. This reduces the 133+
-//! Operation variants to ~40 semantic handlers and ensures operand ordering
-//! matches the ISA specification.
-//!
-//! See the plan at `~/.claude/plans/memoized-soaring-teapot.md` for details.
+//! All execution is driven by `SemanticOp` from TableGen, with ~85 semantic
+//! handlers covering the full instruction set. Metadata (element type, memory
+//! width, etc.) comes from SlotOp fields rather than enum variants.
 //!
 //! # Executor
 //!
@@ -110,7 +107,8 @@ mod tests {
     use crate::device::tile::Tile;
     use crate::interpreter::state::ExecutionContext;
     use crate::interpreter::traits::Executor;
-    use crate::interpreter::bundle::{VliwBundle, SlotOp, SlotIndex, Operation, Operand};
+    use crate::interpreter::bundle::{VliwBundle, SlotOp, SlotIndex, Operand};
+    use crate::tablegen::SemanticOp;
 
     fn make_bundle_with_op(op: SlotOp) -> VliwBundle {
         let mut bundle = VliwBundle::empty();
@@ -141,7 +139,7 @@ mod tests {
         ctx.scalar.write(1, 20);
 
         // r2 = r0 + r1
-        let op = SlotOp::new(SlotIndex::Scalar0, Operation::ScalarAdd)
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
             .with_dest(Operand::ScalarReg(2))
             .with_source(Operand::ScalarReg(0))
             .with_source(Operand::ScalarReg(1));

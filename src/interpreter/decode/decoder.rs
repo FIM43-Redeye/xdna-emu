@@ -24,8 +24,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::interpreter::bundle::{
-    BranchCondition, ElementType, MemWidth, Operand, Operation, PostModify, SelectVariant,
-    ShufflePattern, SlotIndex, SlotOp, VliwBundle,
+    MemWidth, Operand, PostModify, SlotIndex, SlotOp, VliwBundle,
 };
 use crate::interpreter::state::{MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN, MOD_BASE_M};
 use crate::interpreter::traits::{DecodeError, Decoder};
@@ -339,458 +338,6 @@ impl InstructionDecoder {
         }
 
         None
-    }
-
-    /// Convert a decoded instruction to a bundle Operation.
-    ///
-    /// Uses SemanticOp from TableGen for classification. All instructions should have
-    /// SemanticOp assigned via infer_semantic_from_mnemonic() during TableGen parsing.
-    /// If no semantic is available, logs a warning and returns Unknown.
-    fn to_operation(&self, decoded: &DecodedInstr) -> Operation {
-        // Cascade instructions: detected by name before SemanticOp lookup.
-        // These have hasSideEffects=true and no SemanticOp in TableGen.
-        // Names from llvm-aie AIE2GenFixupInstrInfo.td:
-        //   VMOV_mv_scd  -- full 384-bit cascade read
-        //   VMOV_HI      -- cascade read high half
-        //   VMOV_LO      -- cascade read low half
-        //   VMOV_mv_mcd  -- full 384-bit cascade write
-        let name = &decoded.encoding.name;
-        if name == "VMOV_mv_scd" || name == "VMOV_HI" || name == "VMOV_LO" {
-            return Operation::CascadeRead;
-        }
-        if name == "VMOV_mv_mcd" {
-            return Operation::CascadeWrite;
-        }
-
-        // Vector operation mnemonic dispatch.
-        //
-        // Many vector instructions share generic SemanticOps (Copy, Mul, etc.)
-        // that lose the specific operation type. For example, vsrs maps to
-        // SemanticOp::Copy which becomes VectorMov -- wrong. We intercept
-        // these here and create the correct Operation from the mnemonic.
-        if let Some(op) = Self::vector_op_from_mnemonic(decoded) {
-            return op;
-        }
-
-        // Use semantic info - this should be available for all instructions
-        if let Some(semantic) = decoded.encoding.semantic {
-            return self.semantic_to_operation(semantic, decoded);
-        }
-
-        // No SemanticOp assigned - this is a gap in our semantic inference.
-        // "opcodestr" is a parser artifact from unresolved TableGen template parameters
-        // in NOP class definitions; treat as NOP rather than Unknown.
-        if decoded.encoding.mnemonic == "opcodestr" || decoded.encoding.mnemonic.is_empty() {
-            return Operation::Nop;
-        }
-
-        log::warn!(
-            "[NO SEMANTIC] Instruction '{}' has no SemanticOp - add to infer_semantic_from_mnemonic()",
-            decoded.encoding.mnemonic
-        );
-        Operation::Unknown {
-            opcode: decoded.operands.get("word0").copied().unwrap_or(0) as u32,
-        }
-    }
-
-    /// Map vector instruction mnemonics to specific Operation variants.
-    ///
-    /// Many vector instructions share generic SemanticOps (e.g., vmac and vmul
-    /// both get SemanticOp::Mul, vsrs and vmov both get SemanticOp::Copy). This
-    /// method resolves the ambiguity by checking the mnemonic directly.
-    ///
-    /// Only matches mnemonics that would produce the WRONG Operation through
-    /// the SemanticOp path. Instructions that work correctly via semantic
-    /// dispatch (vadd, vsub, vmul, vand, vor, vxor, vnot, shifts, vmov, vneg,
-    /// loads, stores) are NOT matched here.
-    fn vector_op_from_mnemonic(decoded: &DecodedInstr) -> Option<Operation> {
-        let mnem = decoded.encoding.mnemonic.to_lowercase();
-        let element_type = decoded.encoding.element_type.unwrap_or(ElementType::Int32);
-
-        // ---- SRS / UPS (accumulator <-> vector conversions) ----
-
-        // vsrs/vsrsm: Shift-Round-Saturate (accumulator -> vector).
-        // vsrsm is the masked variant; same operation, mask handled separately.
-        // element_type gives the output width (e.g., vsrs.s8 -> Int8).
-        if mnem.starts_with("vsrs") {
-            return Some(Operation::VectorSRS {
-                from_type: ElementType::Int32,
-                to_type: element_type,
-            });
-        }
-
-        // vups: Upshift (vector -> accumulator).
-        // element_type gives the input width (e.g., vups.s8 -> Int8).
-        if mnem.starts_with("vups") {
-            return Some(Operation::VectorUpshift {
-                from_type: element_type,
-                to_type: ElementType::Int32,
-            });
-        }
-
-        // vpush: push vector to accumulator (functionally same as UPS).
-        if mnem.starts_with("vpush") {
-            return Some(Operation::VectorUpshift {
-                from_type: element_type,
-                to_type: ElementType::Int32,
-            });
-        }
-
-        // ---- MAC variants (must be checked before vmul/vneg) ----
-
-        // vaddmac: acc1 = acc1 + acc2 + A * B
-        if mnem.starts_with("vaddmac") {
-            return Some(Operation::VectorAddMac { element_type });
-        }
-        // vaddmsc: acc1 = acc1 + acc2 - A * B (sub-MAC variant)
-        if mnem.starts_with("vaddmsc") {
-            // No dedicated Operation yet; approximate as VectorAddMac.
-            // The subtraction vs addition of the product is a refinement.
-            return Some(Operation::VectorAddMac { element_type });
-        }
-        // vsubmac: acc1 = acc1 - acc2 + A * B
-        if mnem.starts_with("vsubmac") {
-            return Some(Operation::VectorSubMac { element_type });
-        }
-        // vsubmsc: acc1 = acc1 - acc2 - A * B
-        if mnem.starts_with("vsubmsc") {
-            return Some(Operation::VectorSubMac { element_type });
-        }
-        // vnegmac: acc += -(A * B)
-        if mnem.starts_with("vnegmac") {
-            return Some(Operation::VectorNegMatMulDense { element_type });
-        }
-        // vnegmsc: acc -= -(A * B)  (negate multiply-subtract-accumulate)
-        if mnem.starts_with("vnegmsc") {
-            return Some(Operation::VectorNegMatMulDense { element_type });
-        }
-
-        // vmac: multiply-accumulate (acc += A * B).
-        // vmac.f = bfloat16 variant.
-        if mnem.starts_with("vmac") {
-            if mnem.contains(".f") || mnem.contains(".bf") {
-                return Some(Operation::VectorMatMulAccFloat {
-                    element_type: ElementType::BFloat16,
-                });
-            }
-            return Some(Operation::VectorMac { element_type });
-        }
-        // vmsc: multiply-subtract-accumulate (acc -= A * B).
-        if mnem.starts_with("vmsc") {
-            if mnem.contains(".f") || mnem.contains(".bf") {
-                return Some(Operation::VectorMatMulSubFloat {
-                    element_type: ElementType::BFloat16,
-                });
-            }
-            return Some(Operation::VectorMatMulSubDense { element_type });
-        }
-
-        // ---- Negate-arithmetic variants (must be before vneg) ----
-
-        // vnegmul: acc += -(src1 * src2)
-        if mnem.starts_with("vnegmul") {
-            return Some(Operation::VectorNegMul { element_type });
-        }
-        // vnegadd: dst = -src1 + src2
-        if mnem.starts_with("vnegadd") {
-            return Some(Operation::VectorNegAdd { element_type });
-        }
-        // vnegsub: dst = -(src1) + src2 (same as negadd semantically)
-        if mnem.starts_with("vnegsub") {
-            return Some(Operation::VectorNegAdd { element_type });
-        }
-
-        // vaddsub: alternating add/subtract on even/odd lanes (FFT butterfly).
-        // No dedicated Operation yet; approximate as VectorAdd.
-        if mnem.starts_with("vaddsub") {
-            return Some(Operation::VectorAdd { element_type });
-        }
-
-        // ---- Conditional arithmetic (must be before vsub/comparison) ----
-
-        // vsub_lt: dst[i] = (a[i] < b[i]) ? a[i] - b[i] : a[i]
-        if mnem.starts_with("vsub_lt") {
-            return Some(Operation::VectorSubLt { element_type });
-        }
-        // vsub_ge: dst[i] = (a[i] >= b[i]) ? a[i] - b[i] : a[i]
-        if mnem.starts_with("vsub_ge") {
-            return Some(Operation::VectorSubGe { element_type });
-        }
-        // vmaxdiff_lt: dst[i] = max(a[i] - b[i], 0) when a < b
-        if mnem.starts_with("vmaxdiff_lt") {
-            return Some(Operation::VectorMaxDiffLt { element_type });
-        }
-        // vmax_lt: dst = max(a, b) with less-than flag
-        if mnem.starts_with("vmax_lt") {
-            return Some(Operation::VectorMaxLt { element_type });
-        }
-        // vmin_ge: dst = min(a, b) with greater-equal flag
-        if mnem.starts_with("vmin_ge") {
-            return Some(Operation::VectorMinGe { element_type });
-        }
-        // vmin (standalone): dst = min(a, b)
-        if mnem.starts_with("vmin") {
-            return Some(Operation::VectorMin { element_type });
-        }
-        // vmax (standalone, must come after vmax_lt/vmaxdiff_lt checks): dst = max(a, b)
-        if mnem.starts_with("vmax") {
-            return Some(Operation::VectorMax { element_type });
-        }
-
-        // ---- Absolute value / conditional negate ----
-
-        // vabs_gtz: dst[i] = (src[i] > 0) ? abs(src[i]) : src[i]
-        if mnem.starts_with("vabs_gtz") || mnem.starts_with("vabs") {
-            return Some(Operation::VectorAbsGtz { element_type });
-        }
-        // vneg_gtz: dst[i] = (src[i] > 0) ? -src[i] : src[i]
-        if mnem.starts_with("vneg_gtz") {
-            return Some(Operation::VectorNegGtz { element_type });
-        }
-        // vbneg_ltz: dst[i] = (src[i] < 0) ? -src[i] : src[i] (boolean negate)
-        if mnem.starts_with("vbneg_ltz") || mnem.starts_with("vbneg") {
-            return Some(Operation::VectorNegLtz { element_type });
-        }
-
-        // ---- Vector comparisons (produce mask output) ----
-
-        // veqz: dst[i] = (a[i] == 0) ? ~0 : 0
-        if mnem.starts_with("veqz") {
-            return Some(Operation::VectorEqz { element_type });
-        }
-        // veq: dst[i] = (a[i] == b[i]) ? ~0 : 0
-        if mnem.starts_with("veq.") || mnem == "veq" {
-            return Some(Operation::VectorCmp { element_type });
-        }
-        // vne: dst[i] = (a[i] != b[i]) ? ~0 : 0
-        // Approximate as bitwise XOR (nonzero where different).
-        if mnem.starts_with("vne.") || mnem == "vne" {
-            return Some(Operation::VectorCmp { element_type });
-        }
-        // vge/vgeu: dst[i] = (a[i] >= b[i]) ? ~0 : 0
-        if mnem.starts_with("vge") {
-            return Some(Operation::VectorGe { element_type });
-        }
-        // vlt: dst[i] = (a[i] < b[i]) ? ~0 : 0
-        // Must not match vlda, vldb.
-        if (mnem.starts_with("vlt") || mnem.starts_with("vltu"))
-            && !mnem.starts_with("vlda") && !mnem.starts_with("vldb")
-        {
-            return Some(Operation::VectorLt { element_type });
-        }
-        // vgt/vgtu: dst[i] = (a[i] > b[i]) ? ~0 : 0
-        // Approximate as VectorLt with swapped operands (handled at execution).
-        if mnem.starts_with("vgt") {
-            return Some(Operation::VectorLt { element_type });
-        }
-        // vle/vleu: dst[i] = (a[i] <= b[i]) ? ~0 : 0
-        // Approximate as VectorGe with swapped operands.
-        if mnem.starts_with("vle") {
-            return Some(Operation::VectorGe { element_type });
-        }
-
-        // ---- Data rearrangement ----
-
-        // vshuffle: vector lane permutation
-        if mnem.starts_with("vshuffle") {
-            return Some(Operation::VectorShuffle {
-                pattern: ShufflePattern::InterleaveLow,
-            });
-        }
-        // vshift: concatenate two vectors and shift (alignment)
-        if mnem.starts_with("vshift") {
-            return Some(Operation::VectorAlign { element_type });
-        }
-        // vsel: per-lane conditional select
-        if mnem.starts_with("vsel") {
-            return Some(Operation::VectorSelect { element_type });
-        }
-        // vclr: clear vector register to zero
-        if mnem == "vclr" || mnem.starts_with("vclr.") {
-            return Some(Operation::VectorClear);
-        }
-        // vextbcst / vbcst: extract-broadcast / broadcast scalar to all lanes
-        if mnem.starts_with("vextbcst") || mnem.starts_with("vbcst") {
-            return Some(Operation::VectorBroadcast { element_type });
-        }
-        // vpack: pack two vectors into one (narrow)
-        if mnem.starts_with("vpack") {
-            return Some(Operation::VectorPack);
-        }
-        // vunpack: unpack one vector into two (widen).
-        // Note: vldb.unpack goes through Load path, standalone vunpack goes here.
-        if mnem == "vunpack" || mnem.starts_with("vunpack.") {
-            return Some(Operation::VectorUnpack);
-        }
-        // vextract: extract single element from vector to scalar
-        if mnem.starts_with("vextract") {
-            return Some(Operation::VectorExtract { element_type });
-        }
-        // vinsert: insert scalar into vector lane
-        if mnem.starts_with("vinsert") {
-            return Some(Operation::VectorInsert { element_type });
-        }
-
-        // ---- Type conversion ----
-
-        // vconv: type conversion between vector element types
-        if mnem.starts_with("vconv") {
-            let (from_type, to_type) = if mnem.contains(".bf") {
-                (ElementType::Float32, ElementType::BFloat16)
-            } else if mnem.contains(".fp") {
-                (ElementType::BFloat16, ElementType::Float32)
-            } else {
-                (element_type, element_type)
-            };
-            return Some(Operation::VectorConvert { from_type, to_type });
-        }
-        // vfloor/vceil/vtrunc/vround: float-to-int conversions with rounding
-        if mnem.starts_with("vfloor") || mnem.starts_with("vceil")
-            || mnem.starts_with("vtrunc") || mnem.starts_with("vround")
-        {
-            return Some(Operation::VectorConvert {
-                from_type: ElementType::Float32,
-                to_type: element_type,
-            });
-        }
-
-        None // Not a specialized vector op; fall through to semantic dispatch.
-    }
-
-    /// Convert a SemanticOp to an Operation using pre-resolved metadata.
-    ///
-    /// All element type, branch condition, select variant, and load/store channel
-    /// disambiguation is resolved at TableGen load time on InstrEncoding. No mnemonic
-    /// string parsing happens here -- just field lookups and slot matching.
-    fn semantic_to_operation(&self, semantic: SemanticOp, decoded: &DecodedInstr) -> Operation {
-        let enc = &decoded.encoding;
-        let element_type = enc.element_type.unwrap_or(ElementType::Int32);
-
-        match semantic {
-            SemanticOp::Add if enc.is_vector => Operation::VectorAdd { element_type },
-            SemanticOp::Add => Operation::ScalarAdd,
-            SemanticOp::Sub if enc.is_vector => Operation::VectorSub { element_type },
-            SemanticOp::Sub => Operation::ScalarSub,
-            SemanticOp::Mul if enc.is_vector => Operation::VectorMul { element_type },
-            SemanticOp::Mul => Operation::ScalarMul,
-            SemanticOp::And if enc.is_vector => Operation::VectorAnd { element_type },
-            SemanticOp::And => Operation::ScalarAnd,
-            SemanticOp::Or if enc.is_vector => Operation::VectorOr { element_type },
-            SemanticOp::Or => Operation::ScalarOr,
-            SemanticOp::Xor if enc.is_vector => Operation::VectorXor { element_type },
-            SemanticOp::Xor => Operation::ScalarXor,
-            SemanticOp::Not if enc.is_vector => Operation::VectorNot { element_type },
-            SemanticOp::Not => Operation::ScalarXor, // scalar not = xor with -1
-            SemanticOp::Shl if enc.is_vector => Operation::VectorShiftLeft { element_type },
-            SemanticOp::Shl => Operation::ScalarShl,
-            SemanticOp::Sra if enc.is_vector => Operation::VectorArithShiftRight { element_type },
-            SemanticOp::Sra => Operation::ScalarSra,
-            SemanticOp::Srl if enc.is_vector => Operation::VectorShiftRight { element_type },
-            SemanticOp::Srl => Operation::ScalarShr,
-            SemanticOp::Load => {
-                // Channel discrimination: enc.slot is the authoritative
-                // functional-unit identifier from TableGen ("lda", "ldb", "st").
-                // The is_vector guard prevents scalar lda/ldb from matching.
-                match enc.slot.as_str() {
-                    "lda" if enc.is_vector => Operation::VectorLoadA { post_modify: PostModify::None },
-                    "ldb" if enc.is_vector => Operation::VectorLoadB { post_modify: PostModify::None },
-                    _ => {
-                        let width = match enc.mem_width {
-                            InstrMemWidth::Byte => MemWidth::Byte,
-                            InstrMemWidth::HalfWord => MemWidth::HalfWord,
-                            InstrMemWidth::Word => MemWidth::Word,
-                            InstrMemWidth::Vector256 => MemWidth::Vector256,
-                        };
-                        Operation::Load { width, post_modify: PostModify::None }
-                    }
-                }
-            },
-            SemanticOp::Store => {
-                match enc.slot.as_str() {
-                    "st" if enc.is_vector => Operation::VectorStore { post_modify: PostModify::None },
-                    _ => {
-                        let width = match enc.mem_width {
-                            InstrMemWidth::Byte => MemWidth::Byte,
-                            InstrMemWidth::HalfWord => MemWidth::HalfWord,
-                            InstrMemWidth::Word => MemWidth::Word,
-                            InstrMemWidth::Vector256 => MemWidth::Vector256,
-                        };
-                        Operation::Store { width, post_modify: PostModify::None }
-                    }
-                }
-            },
-            SemanticOp::Br => Operation::Branch {
-                condition: BranchCondition::Always,
-            },
-            SemanticOp::Call => Operation::Call,
-            SemanticOp::BrCond => Operation::Branch {
-                condition: enc.branch_condition.unwrap_or(BranchCondition::NotEqual),
-            },
-            SemanticOp::Nop => Operation::Nop,
-            SemanticOp::Copy if enc.is_vector => Operation::VectorMov { element_type },
-            SemanticOp::Copy => Operation::ScalarMov,
-
-            // Comparison operations (produce 0/1 result)
-            SemanticOp::SetLt => Operation::ScalarLt,
-            SemanticOp::SetLe => Operation::ScalarLe,
-            SemanticOp::SetGt => Operation::ScalarGt,
-            SemanticOp::SetGe => Operation::ScalarGe,
-            SemanticOp::SetUlt => Operation::ScalarLtu,
-            SemanticOp::SetUle => Operation::ScalarLeu,
-            SemanticOp::SetUgt => Operation::ScalarGtu,
-            SemanticOp::SetUge => Operation::ScalarGeu,
-            SemanticOp::SetEq => Operation::ScalarEq,
-            SemanticOp::SetNe => Operation::ScalarNe,
-            SemanticOp::Select => match enc.select_variant {
-                Some(SelectVariant::EqualZero) => Operation::ScalarSelEqz,
-                Some(SelectVariant::NotEqualZero) => Operation::ScalarSelNez,
-                _ => Operation::ScalarSel,
-            },
-
-            // Lock operations
-            SemanticOp::LockAcquire => Operation::LockAcquire,
-            SemanticOp::LockRelease => Operation::LockRelease,
-
-            // Abs/Neg
-            SemanticOp::Abs => Operation::ScalarAbs,
-            SemanticOp::Neg if enc.is_vector => Operation::VectorNegate { element_type },
-            SemanticOp::Neg => Operation::ScalarSub, // neg r = 0 - r
-
-            // Bit manipulation
-            SemanticOp::Ctlz => Operation::ScalarClz,
-
-            // Sign/zero extension
-            SemanticOp::SignExtend => Operation::ScalarExtendS16,
-            SemanticOp::ZeroExtend => Operation::ScalarExtendU16,
-
-            // Division
-            SemanticOp::SDiv => Operation::ScalarDiv,
-            SemanticOp::UDiv => Operation::ScalarDivu,
-            SemanticOp::SRem => Operation::ScalarMod,
-
-            // Control flow
-            SemanticOp::Ret => Operation::Return,
-            SemanticOp::Done => Operation::Halt,
-
-            // Truncate: narrow type conversion, treat as NOP for now
-            // (the narrowing happens implicitly in register writes)
-            SemanticOp::Truncate => Operation::Nop,
-
-            // Event: fires a trace event (INSTR_EVENT_0/1). No computational
-            // effect; the trace subsystem auto-starts events separately.
-            SemanticOp::Event => Operation::Nop,
-
-            // Not handled yet (URem, Rotl, Rotr, Cttz, Ctpop, Bswap, Intrinsic)
-            _ => {
-                log::warn!(
-                    "[UNHANDLED SEMANTIC] '{}' has SemanticOp::{:?} in slot '{}' - not yet implemented",
-                    decoded.encoding.mnemonic, semantic, decoded.encoding.slot
-                );
-                Operation::Unknown {
-                    opcode: decoded.encoding.fixed_bits as u32,
-                }
-            }
-        }
     }
 
     /// Extract operands from decoded instruction using data-driven dispatch.
@@ -1185,7 +732,6 @@ impl InstructionDecoder {
     fn build_slot_op(
         &self,
         slot_index: SlotIndex,
-        operation: Operation,
         decoded: &DecodedInstr,
         dest: Option<Operand>,
         sources: Vec<Operand>,
@@ -1193,11 +739,34 @@ impl InstructionDecoder {
     ) -> SlotOp {
         let enc = &decoded.encoding;
 
-        // Build SlotOp with semantic and implicit registers
-        let mut slot_op = if let Some(semantic) = enc.semantic {
-            SlotOp::with_semantic(slot_index, operation, semantic)
+        // Cascade instructions: detected by encoding name before SemanticOp lookup.
+        // These have hasSideEffects=true and mnemonic "vmov" (which maps to
+        // SemanticOp::Copy). Name-based detection is required because the
+        // mnemonic is shared with regular vmov instructions.
+        let semantic_override = match enc.name.as_str() {
+            "VMOV_mv_scd" | "VMOV_HI" | "VMOV_LO" => Some(SemanticOp::CascadeRead),
+            "VMOV_mv_mcd" => Some(SemanticOp::CascadeWrite),
+            _ => None,
+        };
+
+        // Build SlotOp directly from SemanticOp (no Operation bridge)
+        let effective_semantic = semantic_override.or(enc.semantic);
+        let mut slot_op = if let Some(semantic) = effective_semantic {
+            SlotOp::from_semantic(slot_index, semantic)
+        } else if enc.mnemonic == "opcodestr" || enc.mnemonic.is_empty() {
+            // "opcodestr" is a parser artifact from unresolved TableGen template
+            // parameters in NOP class definitions; treat as NOP.
+            SlotOp::nop(slot_index)
         } else {
-            SlotOp::new(slot_index, operation)
+            // No semantic -- unknown instruction
+            log::warn!(
+                "[NO SEMANTIC] Instruction '{}' has no SemanticOp - add to infer_semantic_from_mnemonic()",
+                enc.mnemonic
+            );
+            let mut s = SlotOp::nop(slot_index);
+            s.semantic = None;
+            s.raw_opcode = Some(decoded.operands.get("word0").copied().unwrap_or(0) as u32);
+            s
         };
 
         // ── Populate metadata from InstrEncoding ─────────────────────────
@@ -1317,29 +886,29 @@ impl Decoder for InstructionDecoder {
                 if slot.slot_type == SlotType::Nop || slot.bits == 0 {
                     bundle.set_slot(SlotOp::nop(slot_index));
                 } else if let Some(decoded) = self.decode_slot_bits(slot.bits, slot.slot_type) {
-                    let operation = self.to_operation(&decoded);
                     let (dest, sources, extracted_pm) = self.extract_operands(&decoded);
+
+                    // Build SlotOp directly from SemanticOp (no Operation bridge)
+                    let mut slot_op = self.build_slot_op(
+                        slot_index, &decoded, dest, sources, extracted_pm,
+                    );
 
                     // For LNG slot instructions, use the operation's natural slot since
                     // LNG can contain either control (JL, J) or vector/scalar (movxm).
                     let effective_slot = if slot.slot_type == SlotType::Lng {
-                        operation.natural_slot()
+                        slot_op.natural_slot()
                     } else {
                         slot_index
                     };
-
-                    // Build SlotOp with metadata from InstrEncoding + extracted PostModify
-                    let slot_op = self.build_slot_op(
-                        effective_slot, operation, &decoded, dest, sources, extracted_pm,
-                    );
+                    slot_op.slot = effective_slot;
 
                     // Warn if this overwrites a non-NOP instruction in the same slot
                     // (e.g., LDA and LDB both active -- would need separate slots).
                     if let Some(existing) = bundle.slot(effective_slot) {
-                        if !existing.op.is_nop() {
+                        if !existing.is_nop() {
                             log::warn!(
                                 "[SLOT COLLISION] PC=0x{:04X} {:?} slot {:?} already has {:?}, overwriting with {:?}",
-                                pc, slot.slot_type, effective_slot, existing.op, slot_op.op
+                                pc, slot.slot_type, effective_slot, existing.semantic, slot_op.semantic
                             );
                         }
                     }
@@ -1358,13 +927,11 @@ impl Decoder for InstructionDecoder {
                         SlotType::Lng => "lng",
                         SlotType::Nop => "nop",
                     };
-                    // For now, mark as unknown but we know the slot type
-                    bundle.set_slot(SlotOp::new(
-                        slot_index,
-                        Operation::Unknown {
-                            opcode: slot.bits as u32,
-                        },
-                    ));
+                    // Mark as unknown: semantic=None, raw_opcode for diagnostics
+                    let mut unknown_op = SlotOp::nop(slot_index);
+                    unknown_op.semantic = None;
+                    unknown_op.raw_opcode = Some(slot.bits as u32);
+                    bundle.set_slot(unknown_op);
                     let _ = slot_name; // Suppress unused warning for now
                 }
             }
@@ -1379,10 +946,10 @@ impl Decoder for InstructionDecoder {
             if word0 == 0 || word0 == 0x15010040 {
                 bundle.set_slot(SlotOp::nop(SlotIndex::Scalar0));
             } else {
-                bundle.set_slot(SlotOp::new(
-                    SlotIndex::Scalar0,
-                    Operation::Unknown { opcode: word0 },
-                ));
+                let mut unknown_op = SlotOp::nop(SlotIndex::Scalar0);
+                unknown_op.semantic = None;
+                unknown_op.raw_opcode = Some(word0);
+                bundle.set_slot(unknown_op);
             }
         }
 
@@ -1427,6 +994,7 @@ impl Decoder for InstructionDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interpreter::bundle::ElementType;
     use crate::tablegen::{CompositeEncoder, OperandField};
     use std::path::Path;
 
@@ -1449,7 +1017,7 @@ mod tests {
         let bundle = decoder.decode(&bytes, 0).expect("Should decode");
 
         let slot = bundle.slot(SlotIndex::Scalar0).expect("Should have slot");
-        assert!(matches!(slot.op, Operation::Unknown { .. }));
+        assert!(slot.semantic.is_none(), "Unknown instruction should have semantic: None");
     }
 
     #[test]
@@ -1534,17 +1102,18 @@ mod tests {
                     let mut op_names = Vec::new();
 
                     for slot_op in bundle.active_slots() {
-                        match &slot_op.op {
-                            Operation::Unknown { opcode } => {
+                        match slot_op.semantic {
+                            None => {
+                                let opcode = slot_op.raw_opcode.unwrap_or(0);
                                 op_names.push(format!("{:?}:??? (0x{:05X})", slot_op.slot, opcode));
                             }
-                            Operation::Nop => {
+                            Some(SemanticOp::Nop) => {
                                 found_known = true;
                                 op_names.push("Nop".to_string());
                             }
-                            op => {
+                            Some(sem) => {
                                 found_known = true;
-                                op_names.push(format!("{:?}", op));
+                                op_names.push(format!("{:?}", sem));
                             }
                         }
                     }
@@ -1604,10 +1173,10 @@ mod tests {
         let bundle = decoder.decode(&done_bytes, 0xbc).expect("Should decode 'done'");
 
         let has_halt = bundle.active_slots().any(|s|
-            matches!(s.op, Operation::Halt)
+            matches!(s.semantic, Some(SemanticOp::Halt) | Some(SemanticOp::Done))
         );
-        assert!(has_halt, "done instruction must decode to Operation::Halt, got: {:?}",
-            bundle.active_slots().map(|s| format!("{:?}", s.op)).collect::<Vec<_>>());
+        assert!(has_halt, "done instruction must decode to SemanticOp::Halt or Done, got: {:?}",
+            bundle.active_slots().map(|s| format!("{:?}", s.semantic)).collect::<Vec<_>>());
     }
 
     #[test]
@@ -1926,34 +1495,34 @@ mod tests {
             }
         };
 
-        // Vector load A (slot=lda, is_vector=true) -> VectorLoadA
+        // Vector load A (slot=lda, is_vector=true) -> Load + is_vector
         let decoded_vlda = DecodedInstr {
             encoding: make_load_enc("lda", true),
             operands: HashMap::new(),
         };
-        let op = decoder.to_operation(&decoded_vlda);
-        assert!(matches!(op, Operation::VectorLoadA { .. }),
-            "slot=lda + is_vector should produce VectorLoadA, got {:?}", op);
+        let op = decoder.build_slot_op(SlotIndex::LoadA, &decoded_vlda, None, vec![], None);
+        assert_eq!(op.semantic, Some(SemanticOp::Load));
+        assert!(op.is_vector, "slot=lda + is_vector should produce vector Load");
 
-        // Vector load B (slot=ldb, is_vector=true) -> VectorLoadB
+        // Vector load B (slot=ldb, is_vector=true) -> Load + is_vector
         let decoded_vldb = DecodedInstr {
             encoding: make_load_enc("ldb", true),
             operands: HashMap::new(),
         };
-        let op = decoder.to_operation(&decoded_vldb);
-        assert!(matches!(op, Operation::VectorLoadB { .. }),
-            "slot=ldb + is_vector should produce VectorLoadB, got {:?}", op);
+        let op = decoder.build_slot_op(SlotIndex::LoadB, &decoded_vldb, None, vec![], None);
+        assert_eq!(op.semantic, Some(SemanticOp::Load));
+        assert!(op.is_vector, "slot=ldb + is_vector should produce vector Load");
 
-        // Scalar load in lda slot (is_vector=false) -> plain Load
+        // Scalar load in lda slot (is_vector=false) -> Load + !is_vector
         let decoded_scl = DecodedInstr {
             encoding: make_load_enc("lda", false),
             operands: HashMap::new(),
         };
-        let op = decoder.to_operation(&decoded_scl);
-        assert!(matches!(op, Operation::Load { .. }),
-            "slot=lda + !is_vector should produce plain Load, got {:?}", op);
+        let op = decoder.build_slot_op(SlotIndex::LoadA, &decoded_scl, None, vec![], None);
+        assert_eq!(op.semantic, Some(SemanticOp::Load));
+        assert!(!op.is_vector, "slot=lda + !is_vector should produce scalar Load");
 
-        // Vector store (slot=st, is_vector=true) -> VectorStore
+        // Vector store (slot=st, is_vector=true) -> Store + is_vector
         let mut store_enc = make_load_enc("st", true);
         store_enc.semantic = Some(SemanticOp::Store);
         store_enc.may_load = false;
@@ -1962,9 +1531,9 @@ mod tests {
             encoding: store_enc,
             operands: HashMap::new(),
         };
-        let op = decoder.to_operation(&decoded_vst);
-        assert!(matches!(op, Operation::VectorStore { .. }),
-            "slot=st + is_vector should produce VectorStore, got {:?}", op);
+        let op = decoder.build_slot_op(SlotIndex::Store, &decoded_vst, None, vec![], None);
+        assert_eq!(op.semantic, Some(SemanticOp::Store));
+        assert!(op.is_vector, "slot=st + is_vector should produce vector Store");
     }
 
     /// Verify that PADD instructions produce PointerReg destination via
@@ -2078,7 +1647,7 @@ mod tests {
         let load_a = bundle.slot(SlotIndex::LoadA)
             .expect("LoadA slot should be present");
         assert!(
-            !load_a.op.is_nop(),
+            !load_a.is_nop(),
             "LoadA slot should have mova r0, #0x30"
         );
         assert_eq!(load_a.dest, Some(Operand::ScalarReg(0)),
@@ -2090,7 +1659,7 @@ mod tests {
         // LoadB slot should be NOP (nopb = LDB NOP).
         let load_b = bundle.slot(SlotIndex::LoadB)
             .expect("LoadB slot should be present (NOP)");
-        assert!(load_b.op.is_nop(), "LoadB slot should be NOP (nopb)");
+        assert!(load_b.is_nop(), "LoadB slot should be NOP (nopb)");
 
         // Scalar0 (ALU) should have movx r1, #0x1
         let scalar0 = bundle.slot(SlotIndex::Scalar0)
@@ -2135,242 +1704,113 @@ mod tests {
         }
     }
 
-    /// Helper: call vector_op_from_mnemonic and return the Operation.
-    fn dispatch_mnemonic(mnemonic: &str) -> Option<Operation> {
-        let enc = make_vec_encoding(mnemonic);
+    /// Helper: run a mnemonic through the semantic inference path and return
+    /// a SlotOp with semantic + metadata (element_type, from_type, etc.).
+    fn dispatch_semantic(mnemonic: &str) -> SlotOp {
+        use crate::tablegen::infer_semantic_from_mnemonic;
+        let mut enc = make_vec_encoding(mnemonic);
+        enc.semantic = infer_semantic_from_mnemonic(mnemonic);
         let decoded = DecodedInstr {
             encoding: enc,
             operands: HashMap::new(),
         };
-        InstructionDecoder::vector_op_from_mnemonic(&decoded)
+        let decoder = InstructionDecoder::load_default();
+        decoder.build_slot_op(SlotIndex::Vector, &decoded, None, vec![], None)
+    }
+
+    /// Helper: assert a dispatch_semantic result matches expected SemanticOp.
+    fn assert_sem(mnemonic: &str, expected: SemanticOp) {
+        let op = dispatch_semantic(mnemonic);
+        assert_eq!(op.semantic, Some(expected),
+            "mnemonic '{}' should dispatch to {:?}, got {:?}", mnemonic, expected, op.semantic);
     }
 
     #[test]
-    fn test_vector_mnemonic_dispatch_srs_ups() {
-        // SRS: accumulator -> vector
-        assert!(matches!(
-            dispatch_mnemonic("vsrs.s8"),
-            Some(Operation::VectorSRS { to_type: ElementType::Int8, .. })
-        ));
-        assert!(matches!(
-            dispatch_mnemonic("vsrs.d16"),
-            Some(Operation::VectorSRS { to_type: ElementType::Int16, .. })
-        ));
-
-        // UPS: vector -> accumulator
-        assert!(matches!(
-            dispatch_mnemonic("vups.s8"),
-            Some(Operation::VectorUpshift { from_type: ElementType::Int8, .. })
-        ));
-
-        // PUSH: also upshift
-        assert!(matches!(
-            dispatch_mnemonic("vpush.lo.s16"),
-            Some(Operation::VectorUpshift { from_type: ElementType::Int16, .. })
-        ));
+    fn test_vector_semantic_dispatch_srs_ups() {
+        assert_sem("vsrs.s8", SemanticOp::Srs);
+        assert_sem("vsrs.d16", SemanticOp::Srs);
+        assert_sem("vups.s8", SemanticOp::Ups);
+        assert_sem("vpush.lo.s16", SemanticOp::Ups);
     }
 
     #[test]
-    fn test_vector_mnemonic_dispatch_mac_variants() {
-        // vmac -> VectorMac (not VectorMul)
-        assert!(matches!(
-            dispatch_mnemonic("vmac"),
-            Some(Operation::VectorMac { .. })
-        ));
-
-        // vmac.f -> VectorMatMulAccFloat (bfloat16)
-        assert!(matches!(
-            dispatch_mnemonic("vmac.f"),
-            Some(Operation::VectorMatMulAccFloat { .. })
-        ));
-
-        // vmsc -> VectorMatMulSubDense (not VectorMul)
-        assert!(matches!(
-            dispatch_mnemonic("vmsc"),
-            Some(Operation::VectorMatMulSubDense { .. })
-        ));
-
-        // vmsc.f -> VectorMatMulSubFloat
-        assert!(matches!(
-            dispatch_mnemonic("vmsc.f"),
-            Some(Operation::VectorMatMulSubFloat { .. })
-        ));
-
-        // vnegmac -> VectorNegMatMulDense
-        assert!(matches!(
-            dispatch_mnemonic("vnegmac"),
-            Some(Operation::VectorNegMatMulDense { .. })
-        ));
-
-        // vaddmac -> VectorAddMac
-        assert!(matches!(
-            dispatch_mnemonic("vaddmac"),
-            Some(Operation::VectorAddMac { .. })
-        ));
-
-        // vsubmac -> VectorSubMac
-        assert!(matches!(
-            dispatch_mnemonic("vsubmac"),
-            Some(Operation::VectorSubMac { .. })
-        ));
-
-        // vnegmul -> VectorNegMul
-        assert!(matches!(
-            dispatch_mnemonic("vnegmul"),
-            Some(Operation::VectorNegMul { .. })
-        ));
+    fn test_vector_semantic_dispatch_mac_variants() {
+        assert_sem("vmac", SemanticOp::Mac);
+        assert_sem("vmac.f", SemanticOp::Mac);
+        assert_sem("vmsc", SemanticOp::MatMulSub);
+        assert_sem("vmsc.f", SemanticOp::MatMulSub);
+        assert_sem("vnegmac", SemanticOp::NegMatMul);
+        assert_sem("vaddmac", SemanticOp::AddMac);
+        assert_sem("vsubmac", SemanticOp::SubMac);
+        assert_sem("vnegmul", SemanticOp::NegMul);
     }
 
     #[test]
-    fn test_vector_mnemonic_dispatch_conditional() {
-        // Conditional arithmetic
-        assert!(matches!(
-            dispatch_mnemonic("vsub_lt.d32"),
-            Some(Operation::VectorSubLt { .. })
-        ));
-        assert!(matches!(
-            dispatch_mnemonic("vsub_ge.s16"),
-            Some(Operation::VectorSubGe { .. })
-        ));
-        assert!(matches!(
-            dispatch_mnemonic("vmaxdiff_lt.s8"),
-            Some(Operation::VectorMaxDiffLt { .. })
-        ));
-        assert!(matches!(
-            dispatch_mnemonic("vmax_lt.bf"),
-            Some(Operation::VectorMaxLt { .. })
-        ));
-        assert!(matches!(
-            dispatch_mnemonic("vmin_ge.d16"),
-            Some(Operation::VectorMinGe { .. })
-        ));
+    fn test_vector_semantic_dispatch_conditional() {
+        assert_sem("vsub_lt.d32", SemanticOp::SubLt);
+        assert_sem("vsub_ge.s16", SemanticOp::SubGe);
+        assert_sem("vmaxdiff_lt.s8", SemanticOp::MaxDiffLt);
+        assert_sem("vmax_lt.bf", SemanticOp::MaxLt);
+        assert_sem("vmin_ge.d16", SemanticOp::MinGe);
     }
 
     #[test]
-    fn test_vector_mnemonic_dispatch_comparisons() {
-        assert!(matches!(
-            dispatch_mnemonic("vge.s32"),
-            Some(Operation::VectorGe { .. })
-        ));
-        assert!(matches!(
-            dispatch_mnemonic("vlt.d8"),
-            Some(Operation::VectorLt { .. })
-        ));
-        assert!(matches!(
-            dispatch_mnemonic("veqz.s16"),
-            Some(Operation::VectorEqz { .. })
-        ));
+    fn test_vector_semantic_dispatch_comparisons() {
+        assert_sem("vge.s32", SemanticOp::SetGe);
+        assert_sem("vlt.d8", SemanticOp::SetLt);
+        assert_sem("veqz.s16", SemanticOp::SetEq);
     }
 
     #[test]
-    fn test_vector_mnemonic_dispatch_abs_neg() {
-        assert!(matches!(
-            dispatch_mnemonic("vabs_gtz.s32"),
-            Some(Operation::VectorAbsGtz { .. })
-        ));
-        assert!(matches!(
-            dispatch_mnemonic("vneg_gtz"),
-            Some(Operation::VectorNegGtz { .. })
-        ));
-        assert!(matches!(
-            dispatch_mnemonic("vbneg_ltz.s16"),
-            Some(Operation::VectorNegLtz { .. })
-        ));
+    fn test_vector_semantic_dispatch_abs_neg() {
+        assert_sem("vabs_gtz.s32", SemanticOp::AbsGtz);
+        assert_sem("vneg_gtz", SemanticOp::NegGtz);
+        assert_sem("vbneg_ltz.s16", SemanticOp::NegLtz);
     }
 
     #[test]
-    fn test_vector_mnemonic_dispatch_data_movement() {
-        assert!(matches!(
-            dispatch_mnemonic("vshuffle"),
-            Some(Operation::VectorShuffle { .. })
-        ));
-        assert!(matches!(
-            dispatch_mnemonic("vshift.align"),
-            Some(Operation::VectorAlign { .. })
-        ));
-        assert!(matches!(dispatch_mnemonic("vclr"), Some(Operation::VectorClear)));
-        assert!(matches!(
-            dispatch_mnemonic("vsel.s32"),
-            Some(Operation::VectorSelect { .. })
-        ));
-        assert!(matches!(
-            dispatch_mnemonic("vextbcst.s16"),
-            Some(Operation::VectorBroadcast { .. })
-        ));
-        assert!(matches!(
-            dispatch_mnemonic("vbcst.s32"),
-            Some(Operation::VectorBroadcast { .. })
-        ));
-        assert!(matches!(dispatch_mnemonic("vpack.d8"), Some(Operation::VectorPack)));
-        assert!(matches!(
-            dispatch_mnemonic("vunpack.s16"),
-            Some(Operation::VectorUnpack)
-        ));
-        assert!(matches!(
-            dispatch_mnemonic("vextract.s32"),
-            Some(Operation::VectorExtract { .. })
-        ));
-        assert!(matches!(
-            dispatch_mnemonic("vinsert.s16"),
-            Some(Operation::VectorInsert { .. })
-        ));
+    fn test_vector_semantic_dispatch_data_movement() {
+        assert_sem("vshuffle", SemanticOp::Shuffle);
+        assert_sem("vshift.align", SemanticOp::Align);
+        assert_sem("vclr", SemanticOp::VectorClear);
+        assert_sem("vsel.s32", SemanticOp::VectorSelect);
+        assert_sem("vextbcst.s16", SemanticOp::VectorBroadcast);
+        assert_sem("vbcst.s32", SemanticOp::VectorBroadcast);
+        assert_sem("vpack.d8", SemanticOp::Pack);
+        assert_sem("vunpack.s16", SemanticOp::Unpack);
+        assert_sem("vextract.s32", SemanticOp::VectorExtract);
+        assert_sem("vinsert.s16", SemanticOp::VectorInsert);
     }
 
     #[test]
-    fn test_vector_mnemonic_dispatch_conversion() {
-        assert!(matches!(
-            dispatch_mnemonic("vconv.bf16"),
-            Some(Operation::VectorConvert { from_type: ElementType::Float32, to_type: ElementType::BFloat16 })
-        ));
-        assert!(matches!(
-            dispatch_mnemonic("vconv.fp32"),
-            Some(Operation::VectorConvert { from_type: ElementType::BFloat16, to_type: ElementType::Float32 })
-        ));
-        assert!(matches!(
-            dispatch_mnemonic("vfloor.s32"),
-            Some(Operation::VectorConvert { from_type: ElementType::Float32, .. })
-        ));
+    fn test_vector_semantic_dispatch_conversion() {
+        assert_sem("vconv.bf16", SemanticOp::Convert);
+        assert_sem("vconv.fp32", SemanticOp::Convert);
+        assert_sem("vfloor.s32", SemanticOp::Convert);
     }
 
     #[test]
-    fn test_vector_mnemonic_dispatch_noop_for_basic_ops() {
-        // vadd, vsub, vmul should NOT be caught by mnemonic dispatch
-        // (they work correctly through semantic dispatch)
-        assert!(dispatch_mnemonic("vadd.s32").is_none());
-        assert!(dispatch_mnemonic("vsub.s16").is_none());
-        assert!(dispatch_mnemonic("vmul.s8").is_none());
-        assert!(dispatch_mnemonic("vmov").is_none());
-        assert!(dispatch_mnemonic("vand.s32").is_none());
-        assert!(dispatch_mnemonic("vor.s16").is_none());
-        assert!(dispatch_mnemonic("vxor.s32").is_none());
+    fn test_vector_semantic_dispatch_basic_ops() {
+        assert_sem("vadd.s32", SemanticOp::Add);
+        assert_sem("vsub.s16", SemanticOp::Sub);
+        assert_sem("vmul.s8", SemanticOp::Mul);
+        assert_sem("vmov", SemanticOp::Copy);
+        assert_sem("vand.s32", SemanticOp::And);
+        assert_sem("vor.s16", SemanticOp::Or);
+        assert_sem("vxor.s32", SemanticOp::Xor);
     }
 
     #[test]
-    fn test_vector_mnemonic_dispatch_negadd_negsub() {
-        // vnegadd -> VectorNegAdd
-        assert!(matches!(
-            dispatch_mnemonic("vnegadd.s32"),
-            Some(Operation::VectorNegAdd { .. })
-        ));
-        // vnegsub -> VectorNegAdd (same semantics: -a + b)
-        assert!(matches!(
-            dispatch_mnemonic("vnegsub.f"),
-            Some(Operation::VectorNegAdd { .. })
-        ));
+    fn test_vector_semantic_dispatch_negadd_negsub() {
+        assert_sem("vnegadd.s32", SemanticOp::NegAdd);
+        assert_sem("vnegsub.f", SemanticOp::NegAdd);
     }
 
-    /// Verify every vector mnemonic in the TableGen data either has a specialized
-    /// mnemonic dispatch entry or is one of the known "semantic-only" mnemonics
-    /// that work correctly through the generic SemanticOp path.
+    /// Verify every vector mnemonic in the TableGen data has a SemanticOp assigned
+    /// via infer_semantic_from_mnemonic.
     #[test]
-    fn test_all_vector_mnemonics_dispatched() {
-        // These mnemonics work correctly through SemanticOp dispatch
-        // and intentionally do NOT have mnemonic overrides.
-        let semantic_only: std::collections::HashSet<&str> = [
-            "vadd", "vsub", "vmul", "vmov", "vneg",
-            "vband", "vbor",
-            "vlda", "vldb", "vst",
-        ].into_iter().collect();
+    fn test_all_vector_mnemonics_have_semantic() {
+        use crate::tablegen::infer_semantic_from_mnemonic;
 
         let decoder = InstructionDecoder::load_default();
         let mut vec_mnemonics: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -2384,18 +1824,15 @@ mod tests {
 
         let mut uncovered = Vec::new();
         for m in &vec_mnemonics {
-            if semantic_only.contains(m.as_str()) {
-                continue;
-            }
-            if dispatch_mnemonic(m).is_none() {
+            if infer_semantic_from_mnemonic(m).is_none() {
                 uncovered.push(m.clone());
             }
         }
 
         assert!(
             uncovered.is_empty(),
-            "Vector mnemonics with no dispatch: {:?}\n\
-             Add them to vector_op_from_mnemonic() or the semantic_only set.",
+            "Vector mnemonics with no SemanticOp: {:?}\n\
+             Add them to infer_semantic_from_mnemonic().",
             uncovered,
         );
     }

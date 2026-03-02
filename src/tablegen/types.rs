@@ -308,6 +308,59 @@ pub enum SemanticOp {
     LockAcquire,  // Acquire lock
     LockRelease,  // Release lock
 
+    // Bit manipulation (scalar-only)
+    Clb,  // Count leading bits (ones or zeros, != CLZ)
+    Cmp,  // Compare (flag-setting, no destination register)
+
+    // Vector-specific operations
+    Mac,             // Multiply-accumulate: acc += A * B
+    MatMul,          // Matrix multiply (dense): acc = A * B
+    MatMulSub,       // Matrix multiply-subtract: acc -= A * B
+    NegMatMul,       // Negated matrix multiply: acc += -(A * B)
+    AddMac,          // Double accumulator: acc1 = acc1 + acc2 + A * B
+    SubMac,          // Double accumulator: acc1 = acc1 - acc2 + A * B
+    Srs,             // Shift-round-saturate: acc -> vec
+    Ups,             // Upshift: vec -> acc
+    Shuffle,         // Vector lane permutation
+    Pack,            // Pack two vectors (narrow)
+    Unpack,          // Unpack vector (widen)
+    Align,           // Concatenate and shift two vectors (vshift)
+    VectorBroadcast, // Broadcast scalar to all lanes
+    VectorExtract,   // Extract single element from vector
+    VectorInsert,    // Insert scalar into vector lane
+    VectorSelect,    // Per-lane conditional select
+    VectorClear,     // Clear vector to zero
+    Convert,         // Type conversion (vconv, vfloor, vceil, etc.)
+    Min,             // Minimum (scalar or vector)
+    Max,             // Maximum (scalar or vector)
+
+    // Conditional vector operations (AIE2 compound ops)
+    SubLt,        // dst[i] = (a < b) ? a - b : a
+    SubGe,        // dst[i] = (a >= b) ? a - b : a
+    MaxDiffLt,    // dst[i] = max(a - b, 0) when a < b
+    MaxLt,        // dst = max(a, b) with less-than flag
+    MinGe,        // dst = min(a, b) with greater-equal flag
+    AbsGtz,       // dst[i] = (src > 0) ? abs(src) : src
+    NegGtz,       // dst[i] = (src > 0) ? -src : src
+    NegLtz,       // dst[i] = (src < 0) ? -src : src
+    NegAdd,       // dst = -src1 + src2
+    NegMul,       // acc += -(src1 * src2)
+    Accumulate,   // acc += src (no multiply)
+
+    // Side-effect operations
+    CascadeRead,            // Read from cascade input
+    CascadeWrite,           // Write to cascade output
+    StreamRead,             // Read from slave stream
+    StreamWrite,            // Write to master stream
+    StreamWritePacketHeader, // Write packet header to master stream
+    DmaStart,               // Start DMA transfer
+    DmaWait,                // Wait for DMA completion
+    Halt,                   // Core termination (halt)
+
+    // Pointer operations
+    PointerAdd,  // Pointer arithmetic: ptr + offset
+    PointerMov,  // Pointer move: ptr = value
+
     // Target-specific intrinsic (needs name lookup)
     Intrinsic(u32),  // Index into intrinsic name table
 }

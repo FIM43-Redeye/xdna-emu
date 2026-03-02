@@ -18,7 +18,7 @@
 //!                            ; Must stall until cycle 3
 //! ```
 
-use crate::interpreter::bundle::{Operand, Operation, SlotOp};
+use crate::interpreter::bundle::{Operand, SlotOp};
 
 /// Type of data hazard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,17 +280,10 @@ impl HazardDetector {
     pub fn record_operation(&mut self, op: &SlotOp, latency: u8) {
         if let Some(dest) = op.destination_register() {
             // Determine register type from operation
-            match &op.op {
-                Operation::VectorAdd { .. }
-                | Operation::VectorSub { .. }
-                | Operation::VectorMul { .. }
-                | Operation::VectorMac { .. }
-                | Operation::VectorShuffle { .. } => {
-                    self.record_vector_write(dest, latency);
-                }
-                _ => {
-                    self.record_scalar_write(dest, latency);
-                }
+            if op.is_vector {
+                self.record_vector_write(dest, latency);
+            } else {
+                self.record_scalar_write(dest, latency);
             }
         }
 
@@ -441,25 +434,23 @@ impl SlotOpExt for SlotOp {
 
     fn modified_pointer_register(&self) -> Option<u8> {
         // Check for post-modify in load/store ops
-        match &self.op {
-            Operation::Load { post_modify, .. } | Operation::Store { post_modify, .. } => {
-                use crate::interpreter::bundle::PostModify;
-                match post_modify {
-                    PostModify::Register(reg) => Some(*reg),
-                    PostModify::Immediate(_) => {
-                        // Need to know which pointer reg was used
-                        // For now, check source operands
-                        for operand in &self.sources {
-                            if let Operand::PointerReg(reg) = operand {
-                                return Some(*reg);
-                            }
-                        }
-                        None
+        if !self.is_memory() {
+            return None;
+        }
+        use crate::interpreter::bundle::PostModify;
+        match &self.post_modify {
+            PostModify::Register(reg) => Some(*reg),
+            PostModify::Immediate(_) => {
+                // Need to know which pointer reg was used
+                // For now, check source operands
+                for operand in &self.sources {
+                    if let Operand::PointerReg(reg) = operand {
+                        return Some(*reg);
                     }
-                    PostModify::None => None,
                 }
+                None
             }
-            _ => None,
+            PostModify::None => None,
         }
     }
 }

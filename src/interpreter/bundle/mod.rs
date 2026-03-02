@@ -30,12 +30,12 @@
 //! # Example
 //!
 //! ```ignore
-//! use xdna_emu::interpreter::bundle::{VliwBundle, SlotOp, Operation};
+//! use xdna_emu::interpreter::bundle::{VliwBundle, SlotOp};
 //!
 //! let bundle = VliwBundle::from_bytes(&instruction_bytes)?;
 //!
 //! for slot_op in bundle.active_slots() {
-//!     println!("Slot {:?}: {:?}", slot_op.slot, slot_op.op);
+//!     println!("Slot {:?}: {:?}", slot_op.slot, slot_op.semantic);
 //! }
 //! ```
 
@@ -46,7 +46,7 @@ pub mod slot_layout;
 pub use encoding::{detect_format, is_nop_encoding, BundleFormat, SlotMask, NOP_ENCODINGS};
 pub use slot_layout::{extract_slots, ExtractedBundle, ExtractedSlot, SlotType};
 pub use slot::{
-    BranchCondition, ElementType, MemWidth, Operand, Operation, PostModify, Predicate,
+    BranchCondition, ElementType, MemWidth, Operand, PostModify, Predicate,
     SelectVariant, ShufflePattern, SlotIndex, SlotOp,
 };
 
@@ -200,28 +200,28 @@ impl VliwBundle {
 
     /// Check if this bundle is effectively a NOP.
     pub fn is_nop(&self) -> bool {
-        self.active_slots().all(|s| s.op.is_nop())
+        self.active_slots().all(|s| s.is_nop())
     }
 
     /// Check if this bundle contains a control flow operation.
     pub fn has_control_flow(&self) -> bool {
-        self.active_slots().any(|s| s.op.is_control_flow())
+        self.active_slots().any(|s| s.is_control_flow())
     }
 
     /// Check if this bundle contains a memory operation.
     pub fn has_memory_op(&self) -> bool {
-        self.active_slots().any(|s| s.op.is_memory())
+        self.active_slots().any(|s| s.is_memory())
     }
 
     /// Check if this bundle contains a synchronization operation.
     pub fn has_sync_op(&self) -> bool {
-        self.active_slots().any(|s| s.op.is_sync())
+        self.active_slots().any(|s| s.is_sync())
     }
 
     /// Get the control flow operation if present.
     pub fn control_op(&self) -> Option<&SlotOp> {
         self.slot(SlotIndex::Control)
-            .filter(|s| s.op.is_control_flow())
+            .filter(|s| s.is_control_flow())
     }
 
     /// Get a disassembly string for this bundle.
@@ -254,237 +254,19 @@ impl Default for VliwBundle {
 }
 
 /// Disassemble a single slot operation.
+///
+/// Uses `encoding_name` (from TableGen) when available, falling back to
+/// a SemanticOp-based mnemonic for test-constructed SlotOps.
 fn disassemble_op(slot_op: &SlotOp) -> String {
-    let op_name = match &slot_op.op {
-        Operation::ScalarAdd => "add",
-        Operation::ScalarSub => "sub",
-        Operation::ScalarMul => "mul",
-        Operation::ScalarAnd => "and",
-        Operation::ScalarOr => "or",
-        Operation::ScalarXor => "xor",
-        Operation::ScalarShl => "shl",
-        Operation::ScalarShr => "shr",
-        Operation::ScalarSra => "asr",
-        Operation::ScalarMov => "mov",
-        Operation::ScalarMovi { value } => return format!("movi #{}", value),
-        Operation::ScalarCmp => "cmp",
-        Operation::ScalarAbs => "abs",
-        Operation::ScalarClz => "clz",
-        Operation::ScalarClb => "clb",
-        Operation::ScalarAdc => "adc",
-        Operation::ScalarSbc => "sbc",
-        Operation::ScalarExtendS8 => "ext.s8",
-        Operation::ScalarExtendS16 => "ext.s16",
-        Operation::ScalarExtendU8 => "ext.u8",
-        Operation::ScalarExtendU16 => "ext.u16",
-
-        // Comparison operations
-        Operation::ScalarLt => "lt",
-        Operation::ScalarLtu => "ltu",
-        Operation::ScalarLe => "le",
-        Operation::ScalarLeu => "leu",
-        Operation::ScalarGt => "gt",
-        Operation::ScalarGtu => "gtu",
-        Operation::ScalarGe => "ge",
-        Operation::ScalarGeu => "geu",
-        Operation::ScalarEq => "eq",
-        Operation::ScalarNe => "ne",
-        Operation::ScalarSel => "sel",
-        Operation::ScalarSelEqz => "sel.eqz",
-        Operation::ScalarSelNez => "sel.nez",
-        Operation::ScalarDiv => "divs",
-        Operation::ScalarDivu => "divu",
-        Operation::ScalarMod => "mod",
-
-        Operation::VectorAdd { element_type } => {
-            return format!("vadd.{}", element_suffix(*element_type))
-        }
-        Operation::VectorSub { element_type } => {
-            return format!("vsub.{}", element_suffix(*element_type))
-        }
-        Operation::VectorMul { element_type } => {
-            return format!("vmul.{}", element_suffix(*element_type))
-        }
-        Operation::VectorMac { element_type } => {
-            return format!("vmac.{}", element_suffix(*element_type))
-        }
-        Operation::VectorShuffle { .. } => "vshuffle",
-        Operation::VectorPack => "vpack",
-        Operation::VectorUnpack => "vunpack",
-        Operation::VectorCmp { .. } => "vcmp",
-        Operation::VectorMin { .. } => "vmin",
-        Operation::VectorMax { .. } => "vmax",
-        // Vector comparison operations
-        Operation::VectorGe { element_type } => {
-            return format!("vge.{}", element_suffix(*element_type))
-        }
-        Operation::VectorLt { element_type } => {
-            return format!("vlt.{}", element_suffix(*element_type))
-        }
-        Operation::VectorEqz { element_type } => {
-            return format!("veqz.{}", element_suffix(*element_type))
-        }
-        Operation::VectorMaxLt { element_type } => {
-            return format!("vmax_lt.{}", element_suffix(*element_type))
-        }
-        Operation::VectorMinGe { element_type } => {
-            return format!("vmin_ge.{}", element_suffix(*element_type))
-        }
-        // Vector bitwise operations
-        Operation::VectorAnd { element_type } => {
-            return format!("vband.{}", element_suffix(*element_type))
-        }
-        Operation::VectorOr { element_type } => {
-            return format!("vbor.{}", element_suffix(*element_type))
-        }
-        Operation::VectorXor { element_type } => {
-            return format!("vbxor.{}", element_suffix(*element_type))
-        }
-        Operation::VectorNot { element_type } => {
-            return format!("vbnot.{}", element_suffix(*element_type))
-        }
-        // Vector conditional arithmetic
-        Operation::VectorSubLt { element_type } => {
-            return format!("vsub_lt.{}", element_suffix(*element_type))
-        }
-        Operation::VectorSubGe { element_type } => {
-            return format!("vsub_ge.{}", element_suffix(*element_type))
-        }
-        Operation::VectorMaxDiffLt { element_type } => {
-            return format!("vmaxdiff_lt.{}", element_suffix(*element_type))
-        }
-        Operation::VectorMatMulDense { element_type } => {
-            return format!("vmul.dense.{}", element_suffix(*element_type))
-        }
-        Operation::VectorMatMulSparse { element_type, wide } => {
-            let w = if *wide { "wide" } else { "narrow" };
-            return format!("vmul.sparse.{}.{}", w, element_suffix(*element_type))
-        }
-        // Convolution-related matrix operations
-        Operation::VectorMatMulSubDense { element_type } => {
-            return format!("vmsc.dense.{}", element_suffix(*element_type))
-        }
-        Operation::VectorMatMulSubSparse { element_type, wide } => {
-            let w = if *wide { "wide" } else { "narrow" };
-            return format!("vmsc.sparse.{}.{}", w, element_suffix(*element_type))
-        }
-        Operation::VectorNegMatMulDense { element_type } => {
-            return format!("vnegmac.{}", element_suffix(*element_type))
-        }
-        Operation::VectorNegMatMulSubDense { element_type } => {
-            return format!("vnegmsc.{}", element_suffix(*element_type))
-        }
-        Operation::VectorMatMulAccFloat { .. } => "vmac.f",
-        Operation::VectorMatMulSubFloat { .. } => "vmsc.f",
-        Operation::VectorAddMac { element_type } => {
-            return format!("vaddmac.{}", element_suffix(*element_type))
-        }
-        Operation::VectorSubMac { element_type } => {
-            return format!("vsubmac.{}", element_suffix(*element_type))
-        }
-        Operation::VectorSRS { from_type, to_type } => {
-            return format!("vsrs.{}.{}", element_suffix(*from_type), element_suffix(*to_type))
-        }
-        Operation::VectorConvert { from_type, to_type } => {
-            return format!("vconv.{}.{}", element_suffix(*from_type), element_suffix(*to_type))
-        }
-        Operation::VectorMov { element_type } => {
-            return format!("vmov.{}", element_suffix(*element_type))
-        }
-
-        // Vector element operations
-        Operation::VectorExtract { element_type } => {
-            return format!("vext.{}", element_suffix(*element_type))
-        }
-        Operation::VectorInsert { element_type } => {
-            return format!("vins.{}", element_suffix(*element_type))
-        }
-        Operation::VectorSelect { element_type } => {
-            return format!("vsel.{}", element_suffix(*element_type))
-        }
-        Operation::VectorClear => "vclr",
-        Operation::VectorBroadcast { element_type } => {
-            return format!("vbcst.{}", element_suffix(*element_type))
-        }
-
-        // Vector shift operations
-        Operation::VectorShiftLeft { element_type } => {
-            return format!("vshl.{}", element_suffix(*element_type))
-        }
-        Operation::VectorShiftRight { element_type } => {
-            return format!("vshr.{}", element_suffix(*element_type))
-        }
-        Operation::VectorArithShiftRight { element_type } => {
-            return format!("vasr.{}", element_suffix(*element_type))
-        }
-        Operation::VectorAlign { element_type } => {
-            return format!("valign.{}", element_suffix(*element_type))
-        }
-        Operation::VectorUpshift { from_type, to_type } => {
-            return format!("vups.{}.{}", element_suffix(*from_type), element_suffix(*to_type))
-        }
-
-        // Conditional vector operations
-        Operation::VectorAbsGtz { element_type } => {
-            return format!("vabs_gtz.{}", element_suffix(*element_type))
-        }
-        Operation::VectorNegGtz { element_type } => {
-            return format!("vneg_gtz.{}", element_suffix(*element_type))
-        }
-        Operation::VectorNegLtz { element_type } => {
-            return format!("vneg_ltz.{}", element_suffix(*element_type))
-        }
-        Operation::VectorAccumulate { element_type } => {
-            return format!("vacc.{}", element_suffix(*element_type))
-        }
-        Operation::VectorNegate { element_type } => {
-            return format!("vneg.{}", element_suffix(*element_type))
-        }
-        Operation::VectorNegAdd { element_type } => {
-            return format!("vnegadd.{}", element_suffix(*element_type))
-        }
-        Operation::VectorNegMul { element_type } => {
-            return format!("vnegmul.{}", element_suffix(*element_type))
-        }
-
-        Operation::PointerAdd => "padd",
-        Operation::PointerMov => "pmov",
-
-        Operation::Load { width, .. } => return format!("ld.{}", width_suffix(*width)),
-        Operation::Store { width, .. } => return format!("st.{}", width_suffix(*width)),
-        Operation::VectorLoadA { .. } => "vlda",
-        Operation::VectorLoadB { .. } => "vldb",
-        Operation::VectorLoadUnpack { from_type, to_type, .. } => {
-            return format!("vldb.unpack.{}.{}", element_suffix(*from_type), element_suffix(*to_type))
-        }
-        Operation::VectorStore { .. } => "vst",
-
-        Operation::Branch { condition } => return format!("b{}", condition_suffix(*condition)),
-        Operation::Call => "call",
-        Operation::Return => "ret",
-
-        Operation::LockAcquire => "lock.acquire",
-        Operation::LockRelease => "lock.release",
-        Operation::DmaStart => "dma.start",
-        Operation::DmaWait => "dma.wait",
-        Operation::CascadeRead => "vmov.scd",
-        Operation::CascadeWrite => "vmov.mcd",
-        Operation::StreamWriteScalar { blocking } => {
-            if *blocking { "stream.write.scl.blocking" } else { "stream.write.scl" }
-        }
-        Operation::StreamWritePacketHeader { blocking } => {
-            if *blocking { "stream.write.ph.blocking" } else { "stream.write.ph" }
-        }
-        Operation::StreamReadScalar { blocking } => {
-            if *blocking { "stream.read.scl.blocking" } else { "stream.read.scl" }
-        }
-
-        Operation::Nop => "nop",
-        Operation::Halt => "halt",
-        Operation::Unknown { opcode } => return format!(".word 0x{:08X}", opcode),
+    // Primary: use the actual encoding name from TableGen
+    let op_name = if let Some(name) = &slot_op.encoding_name {
+        name.clone()
+    } else {
+        // Fallback: build mnemonic from SemanticOp + metadata
+        disassemble_from_semantic(slot_op)
     };
 
-    let mut result = op_name.to_string();
+    let mut result = op_name;
 
     // Add destination
     if let Some(dest) = &slot_op.dest {
@@ -503,6 +285,188 @@ fn disassemble_op(slot_op: &SlotOp) -> String {
     }
 
     result
+}
+
+/// Build a mnemonic string from SemanticOp + SlotOp metadata.
+///
+/// This is the fallback path for SlotOps constructed in tests without
+/// an encoding_name. Real decoded instructions always have encoding_name.
+fn disassemble_from_semantic(slot_op: &SlotOp) -> String {
+    use crate::tablegen::SemanticOp;
+
+    let Some(semantic) = slot_op.semantic else {
+        return "unknown".to_string();
+    };
+
+    let et = slot_op.element_type;
+    let is_vec = slot_op.is_vector;
+
+    // Helper closures for common patterns
+    let vec_et = |prefix: &str| -> String {
+        if let Some(e) = et {
+            format!("{}.{}", prefix, element_suffix(e))
+        } else {
+            prefix.to_string()
+        }
+    };
+
+    let dual_et = |prefix: &str| -> String {
+        let from = slot_op.from_type.unwrap_or(crate::interpreter::bundle::ElementType::Int32);
+        let to = et.unwrap_or(crate::interpreter::bundle::ElementType::Int32);
+        format!("{}.{}.{}", prefix, element_suffix(from), element_suffix(to))
+    };
+
+    match semantic {
+        // Arithmetic
+        SemanticOp::Add => if is_vec { vec_et("vadd") } else { "add".into() },
+        SemanticOp::Sub => if is_vec { vec_et("vsub") } else { "sub".into() },
+        SemanticOp::Mul => if is_vec { vec_et("vmul") } else { "mul".into() },
+        SemanticOp::Adc => "adc".into(),
+        SemanticOp::Sbc => "sbc".into(),
+        SemanticOp::Abs => "abs".into(),
+        SemanticOp::Neg => if is_vec { vec_et("vneg") } else { "neg".into() },
+        SemanticOp::SDiv => "divs".into(),
+        SemanticOp::UDiv => "divu".into(),
+        SemanticOp::SRem | SemanticOp::URem => "mod".into(),
+
+        // Bitwise
+        SemanticOp::And => if is_vec { vec_et("vband") } else { "and".into() },
+        SemanticOp::Or => if is_vec { vec_et("vbor") } else { "or".into() },
+        SemanticOp::Xor => if is_vec { vec_et("vbxor") } else { "xor".into() },
+        SemanticOp::Not => if is_vec { vec_et("vbnot") } else { "not".into() },
+        SemanticOp::Shl => if is_vec { vec_et("vshl") } else { "shl".into() },
+        SemanticOp::Srl => if is_vec { vec_et("vshr") } else { "shr".into() },
+        SemanticOp::Sra => if is_vec { vec_et("vasr") } else { "asr".into() },
+        SemanticOp::Rotl => "rotl".into(),
+        SemanticOp::Rotr => "rotr".into(),
+
+        // Comparison
+        SemanticOp::SetLt => if is_vec { vec_et("vlt") } else { "lt".into() },
+        SemanticOp::SetLe => "le".into(),
+        SemanticOp::SetGt => "gt".into(),
+        SemanticOp::SetGe => if is_vec { vec_et("vge") } else { "ge".into() },
+        SemanticOp::SetEq => if is_vec { vec_et("veqz") } else { "eq".into() },
+        SemanticOp::SetNe => "ne".into(),
+        SemanticOp::SetUlt => "ltu".into(),
+        SemanticOp::SetUle => "leu".into(),
+        SemanticOp::SetUgt => "gtu".into(),
+        SemanticOp::SetUge => "geu".into(),
+        SemanticOp::Cmp => if is_vec { vec_et("vcmp") } else { "cmp".into() },
+        SemanticOp::Clb => "clb".into(),
+
+        // Bit manipulation
+        SemanticOp::Ctlz => "clz".into(),
+        SemanticOp::Cttz => "ctz".into(),
+        SemanticOp::Ctpop => "popcount".into(),
+        SemanticOp::Bswap => "bswap".into(),
+
+        // Copy/extend
+        SemanticOp::Copy => if is_vec { vec_et("vmov") } else { "mov".into() },
+        SemanticOp::SignExtend => "ext.s".into(),
+        SemanticOp::ZeroExtend => "ext.u".into(),
+        SemanticOp::Truncate => "trunc".into(),
+        SemanticOp::Select => "sel".into(),
+        SemanticOp::Nop => "nop".into(),
+
+        // Memory
+        SemanticOp::Load => {
+            if is_vec {
+                "vlda".into()
+            } else {
+                format!("ld.{}", width_suffix(slot_op.mem_width))
+            }
+        }
+        SemanticOp::Store => {
+            if is_vec {
+                "vst".into()
+            } else {
+                format!("st.{}", width_suffix(slot_op.mem_width))
+            }
+        }
+
+        // Control
+        SemanticOp::Br => {
+            if let Some(bc) = slot_op.branch_condition {
+                format!("b{}", condition_suffix(bc))
+            } else {
+                "b".into()
+            }
+        }
+        SemanticOp::BrCond => {
+            if let Some(bc) = slot_op.branch_condition {
+                format!("b{}", condition_suffix(bc))
+            } else {
+                "bcond".into()
+            }
+        }
+        SemanticOp::Call => "call".into(),
+        SemanticOp::Ret => "ret".into(),
+        SemanticOp::Done | SemanticOp::Halt => "halt".into(),
+        SemanticOp::Event => "event".into(),
+
+        // Sync
+        SemanticOp::LockAcquire => "lock.acquire".into(),
+        SemanticOp::LockRelease => "lock.release".into(),
+        SemanticOp::DmaStart => "dma.start".into(),
+        SemanticOp::DmaWait => "dma.wait".into(),
+
+        // Vector-specific
+        SemanticOp::Mac => vec_et("vmac"),
+        SemanticOp::MatMul => vec_et("vmul.dense"),
+        SemanticOp::MatMulSub => vec_et("vmsc.dense"),
+        SemanticOp::NegMatMul => vec_et("vnegmac"),
+        SemanticOp::AddMac => vec_et("vaddmac"),
+        SemanticOp::SubMac => vec_et("vsubmac"),
+        SemanticOp::Srs => dual_et("vsrs"),
+        SemanticOp::Ups => dual_et("vups"),
+        SemanticOp::Convert => dual_et("vconv"),
+        SemanticOp::Shuffle => "vshuffle".into(),
+        SemanticOp::Pack => "vpack".into(),
+        SemanticOp::Unpack => "vunpack".into(),
+        SemanticOp::Align => vec_et("valign"),
+        SemanticOp::VectorBroadcast => vec_et("vbcst"),
+        SemanticOp::VectorExtract => vec_et("vext"),
+        SemanticOp::VectorInsert => vec_et("vins"),
+        SemanticOp::VectorSelect => vec_et("vsel"),
+        SemanticOp::VectorClear => "vclr".into(),
+        SemanticOp::Min => if is_vec { vec_et("vmin") } else { "min".into() },
+        SemanticOp::Max => if is_vec { vec_et("vmax") } else { "max".into() },
+
+        // Conditional vector
+        SemanticOp::SubLt => vec_et("vsub_lt"),
+        SemanticOp::SubGe => vec_et("vsub_ge"),
+        SemanticOp::MaxDiffLt => vec_et("vmaxdiff_lt"),
+        SemanticOp::MaxLt => vec_et("vmax_lt"),
+        SemanticOp::MinGe => vec_et("vmin_ge"),
+        SemanticOp::AbsGtz => vec_et("vabs_gtz"),
+        SemanticOp::NegGtz => vec_et("vneg_gtz"),
+        SemanticOp::NegLtz => vec_et("vneg_ltz"),
+        SemanticOp::NegAdd => vec_et("vnegadd"),
+        SemanticOp::NegMul => vec_et("vnegmul"),
+        SemanticOp::Accumulate => vec_et("vacc"),
+
+        // Side-effect
+        SemanticOp::CascadeRead => "vmov.scd".into(),
+        SemanticOp::CascadeWrite => "vmov.mcd".into(),
+        SemanticOp::StreamRead => {
+            if slot_op.blocking { "stream.read.scl.blocking".into() }
+            else { "stream.read.scl".into() }
+        }
+        SemanticOp::StreamWrite => {
+            if slot_op.blocking { "stream.write.scl.blocking".into() }
+            else { "stream.write.scl".into() }
+        }
+        SemanticOp::StreamWritePacketHeader => {
+            if slot_op.blocking { "stream.write.ph.blocking".into() }
+            else { "stream.write.ph".into() }
+        }
+
+        // Pointer
+        SemanticOp::PointerAdd => "padd".into(),
+        SemanticOp::PointerMov => "pmov".into(),
+
+        _ => "?unknown".into(),
+    }
 }
 
 fn operand_str(op: &Operand) -> String {
@@ -581,6 +545,7 @@ fn condition_suffix(c: BranchCondition) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tablegen::SemanticOp;
 
     #[test]
     fn test_empty_bundle() {
@@ -610,7 +575,7 @@ mod tests {
     fn test_set_slot() {
         let mut bundle = VliwBundle::empty();
 
-        let op = SlotOp::new(SlotIndex::Scalar0, Operation::ScalarAdd)
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
             .with_dest(Operand::ScalarReg(0))
             .with_source(Operand::ScalarReg(1))
             .with_source(Operand::ScalarReg(2));
@@ -640,19 +605,17 @@ mod tests {
         let mut bundle = VliwBundle::empty();
         assert!(!bundle.has_control_flow());
 
-        bundle.set_slot(SlotOp::new(
-            SlotIndex::Control,
-            Operation::Branch {
-                condition: BranchCondition::Always,
-            },
-        ));
+        bundle.set_slot(
+            SlotOp::from_semantic(SlotIndex::Control, SemanticOp::Br)
+                .with_branch_condition(BranchCondition::Always),
+        );
         assert!(bundle.has_control_flow());
     }
 
     #[test]
     fn test_disassemble_scalar() {
         let mut bundle = VliwBundle::empty();
-        let op = SlotOp::new(SlotIndex::Scalar0, Operation::ScalarAdd)
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
             .with_dest(Operand::ScalarReg(0))
             .with_source(Operand::ScalarReg(1))
             .with_source(Operand::ScalarReg(2));
@@ -664,12 +627,8 @@ mod tests {
     #[test]
     fn test_disassemble_vector() {
         let mut bundle = VliwBundle::empty();
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorAdd {
-                element_type: ElementType::Int32,
-            },
-        );
+        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Add)
+            .as_vector(ElementType::Int32);
         bundle.set_slot(op);
 
         assert_eq!(bundle.disassemble(), "vadd.i32");
@@ -678,13 +637,11 @@ mod tests {
     #[test]
     fn test_disassemble_vliw() {
         let mut bundle = VliwBundle::empty();
-        bundle.set_slot(SlotOp::new(SlotIndex::Scalar0, Operation::ScalarAdd));
-        bundle.set_slot(SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorMul {
-                element_type: ElementType::Int16,
-            },
-        ));
+        bundle.set_slot(SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add));
+        bundle.set_slot(
+            SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Mul)
+                .as_vector(ElementType::Int16),
+        );
 
         let dis = bundle.disassemble();
         assert!(dis.starts_with("{"));

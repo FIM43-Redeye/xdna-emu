@@ -433,7 +433,7 @@ impl Default for TestRunner {
 mod tests {
     use super::*;
     #[allow(unused_imports)]
-    use crate::interpreter::bundle::{Operation, SlotOp, SlotIndex, Operand};
+    use crate::interpreter::bundle::{SlotOp, SlotIndex, Operand};
 
     // Integration test: validate single-tile execution
     //
@@ -758,8 +758,8 @@ mod tests {
                 Ok(bundle) => {
                     // Check first slot for operation type
                     let first_slot = bundle.slots().iter().find_map(|s| s.as_ref());
-                    let op_str = format!("{:?}", first_slot.map(|s| &s.op));
-                    if op_str.contains("Unknown") {
+                    let op_str = format!("{:?}", first_slot.map(|s| s.semantic));
+                    if op_str.contains("None") {
                         unknown += 1;
                     } else {
                         decoded += 1;

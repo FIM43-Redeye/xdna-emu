@@ -27,7 +27,8 @@
 
 use crate::device::aie2_spec::BRANCH_PENALTY_CYCLES;
 use crate::device::tile::Tile;
-use crate::interpreter::bundle::{Operation, SlotOp, VliwBundle};
+use crate::interpreter::bundle::{SlotOp, VliwBundle};
+use crate::tablegen::SemanticOp;
 use crate::interpreter::state::{EventType, ExecutionContext};
 use crate::interpreter::timing::{
     HazardDetector, HazardStats, LatencyTable, MemoryAccess, MemoryModel,
@@ -97,8 +98,7 @@ impl CycleAccurateExecutor {
 
     /// Calculate the execution cycles for a slot operation.
     ///
-    /// Prefers the TableGen-derived SemanticOp path when available,
-    /// falling back to the deprecated Operation enum for unmatched instructions.
+    /// Uses the TableGen-derived SemanticOp for latency lookup.
     fn operation_cycles(&self, op: &SlotOp) -> u8 {
         self.latencies.timing_for_slot_op(op).latency
     }
@@ -114,15 +114,15 @@ impl CycleAccurateExecutor {
     /// Check for memory bank conflicts.
     #[allow(dead_code)]
     fn check_memory_conflict(&self, op: &SlotOp) -> u8 {
-        match &op.op {
-            Operation::Load { width, .. } | Operation::Store { width, .. } => {
-                // Get address from pointer register source
+        match op.semantic {
+            Some(SemanticOp::Load) | Some(SemanticOp::Store) if !op.is_vector => {
                 let addr = self.get_memory_address(op);
+                let is_store = matches!(op.semantic, Some(SemanticOp::Store));
                 let access = MemoryAccess {
                     address: addr,
-                    width: width.bytes(),
-                    is_write: matches!(op.op, Operation::Store { .. }),
-                    port: if matches!(op.op, Operation::Load { .. }) { 0 } else { 2 },
+                    width: op.mem_width.bytes(),
+                    is_write: is_store,
+                    port: if is_store { 2 } else { 0 },
                 };
                 self.memory.check_conflict(&access).stall_cycles
             }
@@ -159,7 +159,7 @@ impl CycleAccurateExecutor {
         neighbors: Option<&mut NeighborMemory>,
     ) -> Option<ExecuteResult> {
         // Check for call - save return address
-        if matches!(op.op, Operation::Call) {
+        if matches!(op.semantic, Some(SemanticOp::Call)) {
             self.pending_call_return_addr = Some(ctx.pc());
         }
 
@@ -197,11 +197,11 @@ impl CycleAccurateExecutor {
         }
 
         // Unknown operation - fail loudly to prevent silent incorrect behavior
-        if let Operation::Unknown { opcode } = &op.op {
+        if op.semantic.is_none() {
             return Some(ExecuteResult::Error {
                 message: format!(
-                    "Unknown instruction opcode 0x{:08X} at slot {:?}",
-                    opcode, op.slot
+                    "Unknown instruction (no semantic) at slot {:?}",
+                    op.slot
                 ),
             });
         }
@@ -217,14 +217,15 @@ impl CycleAccurateExecutor {
 
     /// Record memory access for bank conflict tracking.
     fn record_memory_access(&mut self, op: &SlotOp) {
-        match &op.op {
-            Operation::Load { width, .. } | Operation::Store { width, .. } => {
+        match op.semantic {
+            Some(SemanticOp::Load) | Some(SemanticOp::Store) if !op.is_vector => {
                 let addr = self.get_memory_address(op);
+                let is_store = matches!(op.semantic, Some(SemanticOp::Store));
                 let access = MemoryAccess {
                     address: addr,
-                    width: width.bytes(),
-                    is_write: matches!(op.op, Operation::Store { .. }),
-                    port: if matches!(op.op, Operation::Load { .. }) { 0 } else { 2 },
+                    width: op.mem_width.bytes(),
+                    is_write: is_store,
+                    port: if is_store { 2 } else { 0 },
                 };
                 self.memory.record_access(&access);
             }
@@ -546,7 +547,8 @@ pub struct CycleAccurateStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::bundle::{MemWidth, Operand, PostModify, SlotIndex};
+    use crate::interpreter::bundle::{MemWidth, Operand, SlotIndex};
+    use crate::tablegen::SemanticOp;
 
     fn make_bundle(ops: Vec<SlotOp>) -> VliwBundle {
         let mut bundle = VliwBundle::empty();
@@ -585,7 +587,7 @@ mod tests {
 
         // Scalar add has 1 cycle latency
         let bundle = make_bundle(vec![
-            SlotOp::new(SlotIndex::Scalar0, Operation::ScalarAdd)
+            SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
                 .with_dest(Operand::ScalarReg(2))
                 .with_source(Operand::ScalarReg(0))
                 .with_source(Operand::ScalarReg(1)),
@@ -608,7 +610,7 @@ mod tests {
 
         // Scalar mul has 2 cycle latency
         let bundle = make_bundle(vec![
-            SlotOp::new(SlotIndex::Scalar1, Operation::ScalarMul)
+            SlotOp::from_semantic(SlotIndex::Scalar1, SemanticOp::Mul)
                 .with_dest(Operand::ScalarReg(2))
                 .with_source(Operand::ScalarReg(0))
                 .with_source(Operand::ScalarReg(1)),
@@ -630,15 +632,12 @@ mod tests {
         ctx.pointer.write(0, 0x100);
 
         // Memory load has 5 cycle latency
-        let bundle = make_bundle(vec![SlotOp::new(
-            SlotIndex::LoadA,
-            Operation::Load {
-                width: MemWidth::Word,
-                post_modify: PostModify::None,
-            },
-        )
-        .with_dest(Operand::ScalarReg(0))
-        .with_source(Operand::PointerReg(0))]);
+        let bundle = make_bundle(vec![
+            SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+                .with_mem_width(MemWidth::Word)
+                .with_dest(Operand::ScalarReg(0))
+                .with_source(Operand::PointerReg(0)),
+        ]);
 
         executor.execute(&bundle, &mut ctx, &mut tile);
 
@@ -683,10 +682,9 @@ mod tests {
 
         // Create a bundle with an unconditional branch instruction
         let bundle = make_bundle(vec![
-            SlotOp::new(SlotIndex::Control, Operation::Branch {
-                condition: BranchCondition::Always,
-            })
-            .with_source(Operand::Immediate(0x100)), // branch target
+            SlotOp::from_semantic(SlotIndex::Control, SemanticOp::Br)
+                .with_branch_condition(BranchCondition::Always)
+                .with_source(Operand::Immediate(0x100)), // branch target
         ]);
 
         let result = executor.execute(&bundle, &mut ctx, &mut tile);
@@ -718,10 +716,9 @@ mod tests {
 
         // Execute a branch to generate branch penalty stalls
         let bundle = make_bundle(vec![
-            SlotOp::new(SlotIndex::Control, Operation::Branch {
-                condition: BranchCondition::Always,
-            })
-            .with_source(Operand::Immediate(0x200)),
+            SlotOp::from_semantic(SlotIndex::Control, SemanticOp::Br)
+                .with_branch_condition(BranchCondition::Always)
+                .with_source(Operand::Immediate(0x200)),
         ]);
 
         executor.execute(&bundle, &mut ctx, &mut tile);
@@ -756,7 +753,7 @@ mod tests {
         ctx.scalar.write(1, 20);
 
         let bundle = make_bundle(vec![
-            SlotOp::new(SlotIndex::Scalar0, Operation::ScalarAdd)
+            SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
                 .with_dest(Operand::ScalarReg(2))
                 .with_source(Operand::ScalarReg(0))
                 .with_source(Operand::ScalarReg(1)),
@@ -790,10 +787,9 @@ mod tests {
 
         // Execute a branch instruction
         let bundle = make_bundle(vec![
-            SlotOp::new(SlotIndex::Control, Operation::Branch {
-                condition: BranchCondition::Always,
-            })
-            .with_source(Operand::Immediate(0x200)),
+            SlotOp::from_semantic(SlotIndex::Control, SemanticOp::Br)
+                .with_branch_condition(BranchCondition::Always)
+                .with_source(Operand::Immediate(0x200)),
         ]);
 
         executor.execute(&bundle, &mut ctx, &mut tile);
@@ -818,7 +814,7 @@ mod tests {
         let mut tile = Tile::compute(0, 2);
 
         let bundle = make_bundle(vec![
-            SlotOp::new(SlotIndex::Scalar0, Operation::ScalarAdd)
+            SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
                 .with_dest(Operand::ScalarReg(2))
                 .with_source(Operand::ScalarReg(0))
                 .with_source(Operand::ScalarReg(1)),
@@ -839,8 +835,6 @@ mod tests {
         // A MOV-to-pointer (via SemanticOp::Copy) should defer the write by 1 cycle.
         // Within the same bundle, the old pointer value should be visible.
         // After commit_pending_writes at the next cycle, the new value is visible.
-        use crate::tablegen::SemanticOp;
-
         let mut executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
         let mut tile = Tile::compute(0, 2);
@@ -849,11 +843,9 @@ mod tests {
 
         // movxm p1, #0x70400
         let bundle = make_bundle(vec![
-            SlotOp::with_semantic(
-                SlotIndex::Scalar1, Operation::ScalarMov, SemanticOp::Copy,
-            )
-            .with_dest(Operand::PointerReg(1))
-            .with_source(Operand::Immediate(0x70400)),
+            SlotOp::from_semantic(SlotIndex::Scalar1, SemanticOp::Copy)
+                .with_dest(Operand::PointerReg(1))
+                .with_source(Operand::Immediate(0x70400)),
         ]);
 
         executor.execute(&bundle, &mut ctx, &mut tile);

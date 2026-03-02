@@ -27,7 +27,6 @@ use std::path::Path;
 use std::process::Command;
 
 use super::InstructionDecoder;
-use crate::interpreter::bundle::Operation;
 use crate::interpreter::traits::Decoder;
 use crate::parser::elf::AieElf;
 
@@ -414,7 +413,7 @@ pub fn cross_reference_elf(
                 // Extract non-NOP mnemonics from our decoder.
                 // Filter out NOPs consistently to match the reference filtering.
                 let is_nop_slot = |s: &&crate::interpreter::bundle::SlotOp| -> bool {
-                    if matches!(s.op, Operation::Nop) {
+                    if s.is_nop() {
                         return true;
                     }
                     if let Some(ref name) = s.encoding_name {
@@ -426,16 +425,14 @@ pub fn cross_reference_elf(
                     false
                 };
 
-                // Operation-derived mnemonics (fallback)
+                // Semantic-derived mnemonics (fallback)
                 let emu_mnemonics: Vec<String> = bundle
                     .active_slots()
                     .filter(|s| !is_nop_slot(s))
                     .map(|s| {
-                        format!("{:?}", s.op)
-                            .split('(')
-                            .next()
-                            .unwrap_or("unknown")
-                            .to_lowercase()
+                        s.semantic.map_or("unknown".to_string(), |sem| {
+                            format!("{:?}", sem).to_lowercase()
+                        })
                     })
                     .collect();
 
@@ -543,22 +540,23 @@ pub fn cross_reference_elf(
 
 /// Get a display mnemonic from a SlotOp.
 fn slot_mnemonic(slot: &crate::interpreter::bundle::SlotOp) -> String {
-    if matches!(slot.op, Operation::Nop) {
+    if slot.is_nop() {
         return format!("nop({:?})", slot.slot).to_lowercase();
     }
-    // Use encoding_name if available, otherwise fall back to Operation debug
+    // Use encoding_name if available, otherwise fall back to SemanticOp debug
     if let Some(ref name) = slot.encoding_name {
         name.to_lowercase()
     } else {
-        let debug = format!("{:?}", slot.op);
-        debug.split('(').next().unwrap_or("unknown").to_lowercase()
+        slot.semantic.map_or("unknown".to_string(), |sem| {
+            format!("{:?}", sem).to_lowercase()
+        })
     }
 }
 
 /// Compare reference mnemonics against our decoded mnemonics.
 ///
 /// Returns true if all non-NOP mnemonics match (after normalization).
-/// Tries both the raw encoding mnemonic and the Operation-derived mnemonic.
+/// Tries both the raw encoding mnemonic and the semantic-derived mnemonic.
 fn compare_mnemonic_sets(
     reference: &[&str],
     emu_raw: &[String],
@@ -597,7 +595,7 @@ fn compare_mnemonic_sets(
         }
     }
 
-    // Try Operation-derived mnemonics as last resort
+    // Try semantic-derived mnemonics as last resort
     if reference.len() == emu_op.len() {
         let all_match = reference
             .iter()

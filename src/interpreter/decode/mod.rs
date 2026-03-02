@@ -42,9 +42,7 @@ pub mod crossref;
 
 pub use decoder::{DecodedInstr, InstructionDecoder};
 
-use crate::interpreter::bundle::{
-    Operand, Operation, SlotIndex, SlotOp,
-};
+use crate::interpreter::bundle::SlotIndex;
 
 /// AIE2 slot types based on TableGen definitions.
 ///
@@ -94,8 +92,7 @@ impl Aie2Slot {
             Aie2Slot::St => SlotIndex::Store,
             Aie2Slot::Vec => SlotIndex::Vector,
             // LNG is polymorphic: j/jl -> Control, movxm -> Scalar0.
-            // decode_bundle() resolves via operation.natural_slot() after decoding.
-            // This fallback is only used by SlotDecode::to_slot_op() (currently dead code).
+            // decode_bundle() resolves via slot_op.natural_slot() after decoding.
             Aie2Slot::Lng => SlotIndex::Control,
             Aie2Slot::Nop => SlotIndex::Control,
         }
@@ -139,31 +136,6 @@ pub mod opcodes {
         pub const VEC_2: u32 = 0xD;
         pub const VEC_3: u32 = 0xE;
         pub const VEC_4: u32 = 0xF;
-    }
-}
-
-/// Result of decoding a single slot from an instruction word.
-#[derive(Debug, Clone)]
-pub struct SlotDecode {
-    /// Which AIE2 slot this belongs to.
-    pub slot: Aie2Slot,
-    /// The decoded operation.
-    pub op: Operation,
-    /// Source operands.
-    pub sources: Vec<Operand>,
-    /// Destination operand.
-    pub dest: Option<Operand>,
-}
-
-impl SlotDecode {
-    /// Convert to a SlotOp for the bundle.
-    pub fn to_slot_op(self) -> SlotOp {
-        let mut op = SlotOp::new(self.slot.to_slot_index(), self.op);
-        op.dest = self.dest;
-        for src in self.sources {
-            op.sources.push(src);
-        }
-        op
     }
 }
 

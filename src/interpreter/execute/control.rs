@@ -50,7 +50,8 @@
 //! See AM020 Ch2 and AM025 Lock_Request register for details.
 
 use crate::device::tile::{Lock, Tile, LockResult};
-use crate::interpreter::bundle::{BranchCondition, Operation, Operand, SlotOp};
+use crate::interpreter::bundle::{BranchCondition, Operand, SlotOp};
+use crate::tablegen::SemanticOp;
 use crate::interpreter::state::ExecutionContext;
 use crate::interpreter::traits::{ExecuteResult, Flags, StateAccess};
 
@@ -78,8 +79,9 @@ impl ControlUnit {
         tile: &mut Tile,
         mut mem_tile_locks: Option<&mut [Lock]>,
     ) -> Option<ExecuteResult> {
-        match &op.op {
-            Operation::Branch { condition } => {
+        match op.semantic {
+            Some(SemanticOp::Br) | Some(SemanticOp::BrCond) => {
+                let condition = op.branch_condition.unwrap_or(BranchCondition::Always);
                 let target = Self::get_branch_target(op, ctx);
                 let should_branch = match condition {
                     // For jz/jnz, the test register is in dest (decoder maps
@@ -132,7 +134,7 @@ impl ControlUnit {
                         test_val != 0
                     }
                     // For other conditions, check flags
-                    _ => Self::evaluate_condition(*condition, ctx.flags()),
+                    _ => Self::evaluate_condition(condition, ctx.flags()),
                 };
                 if should_branch {
                     Some(ExecuteResult::Branch { target })
@@ -141,19 +143,19 @@ impl ControlUnit {
                 }
             }
 
-            Operation::Call => {
+            Some(SemanticOp::Call) => {
                 let target = Self::get_branch_target(op, ctx);
                 // Save return address (PC + instruction size handled by caller)
                 // Link register will be set by the executor after this returns
                 Some(ExecuteResult::Branch { target })
             }
 
-            Operation::Return => {
+            Some(SemanticOp::Ret) => {
                 let target = ctx.lr();
                 Some(ExecuteResult::Branch { target })
             }
 
-            Operation::LockAcquire => {
+            Some(SemanticOp::LockAcquire) => {
                 let (raw_lock_id, expected, delta) = Self::get_lock_acquire_params(op, ctx);
                 // AIE2 lock quadrant mapping (per mlir-aie getLockLocalBaseIndex
                 // and AIE2TargetModel::isMemEast = isInternal):
@@ -194,7 +196,7 @@ impl ControlUnit {
                 }
             }
 
-            Operation::LockRelease => {
+            Some(SemanticOp::LockRelease) => {
                 let (raw_lock_id, delta) = Self::get_lock_release_params(op, ctx);
                 let tile_col = tile.col;
                 let tile_row = tile.row;
@@ -214,14 +216,14 @@ impl ControlUnit {
                 Some(ExecuteResult::Continue)
             }
 
-            Operation::DmaStart => {
+            Some(SemanticOp::DmaStart) => {
                 let channel = Self::get_dma_channel(op);
                 let bd_index = Self::get_dma_bd(op);
                 Self::start_dma(tile, channel, bd_index);
                 Some(ExecuteResult::Continue)
             }
 
-            Operation::DmaWait => {
+            Some(SemanticOp::DmaWait) => {
                 let channel = Self::get_dma_channel(op);
                 if Self::is_dma_complete(tile, channel) {
                     Some(ExecuteResult::Continue)
@@ -230,9 +232,9 @@ impl ControlUnit {
                 }
             }
 
-            Operation::Halt => Some(ExecuteResult::Halt),
+            Some(SemanticOp::Halt) | Some(SemanticOp::Done) => Some(ExecuteResult::Halt),
 
-            Operation::Nop => Some(ExecuteResult::Continue),
+            Some(SemanticOp::Nop) => Some(ExecuteResult::Continue),
 
             _ => None, // Not a control operation
         }
@@ -448,6 +450,7 @@ impl ControlUnit {
 mod tests {
     use super::*;
     use crate::interpreter::bundle::SlotIndex;
+    use crate::tablegen::SemanticOp;
 
     fn make_ctx() -> ExecutionContext {
         ExecutionContext::new()
@@ -462,13 +465,9 @@ mod tests {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
-        let op = SlotOp::new(
-            SlotIndex::Control,
-            Operation::Branch {
-                condition: BranchCondition::Always,
-            },
-        )
-        .with_source(Operand::Immediate(0x1000));
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::Br)
+            .with_branch_condition(BranchCondition::Always)
+            .with_source(Operand::Immediate(0x1000));
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Branch { target: 0x1000 })));
@@ -487,13 +486,9 @@ mod tests {
             v: false,
         });
 
-        let op = SlotOp::new(
-            SlotIndex::Control,
-            Operation::Branch {
-                condition: BranchCondition::Equal,
-            },
-        )
-        .with_source(Operand::Immediate(0x2000));
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::BrCond)
+            .with_branch_condition(BranchCondition::Equal)
+            .with_source(Operand::Immediate(0x2000));
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Branch { target: 0x2000 })));
@@ -512,13 +507,9 @@ mod tests {
             v: false,
         });
 
-        let op = SlotOp::new(
-            SlotIndex::Control,
-            Operation::Branch {
-                condition: BranchCondition::Equal,
-            },
-        )
-        .with_source(Operand::Immediate(0x2000));
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::BrCond)
+            .with_branch_condition(BranchCondition::Equal)
+            .with_source(Operand::Immediate(0x2000));
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
@@ -531,7 +522,7 @@ mod tests {
 
         ctx.set_lr(0x5000);
 
-        let op = SlotOp::new(SlotIndex::Control, Operation::Return);
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::Ret);
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Branch { target: 0x5000 })));
@@ -545,7 +536,7 @@ mod tests {
         // Initialize lock with value 1 (available)
         tile.locks[5].value = 1;
 
-        let op = SlotOp::new(SlotIndex::Control, Operation::LockAcquire)
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockAcquire)
             .with_source(Operand::Lock(5));
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
@@ -561,7 +552,7 @@ mod tests {
         // Lock value 0 (unavailable)
         tile.locks[5].value = 0;
 
-        let op = SlotOp::new(SlotIndex::Control, Operation::LockAcquire)
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockAcquire)
             .with_source(Operand::Lock(5));
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
@@ -575,7 +566,7 @@ mod tests {
 
         tile.locks[3].value = 0;
 
-        let op = SlotOp::new(SlotIndex::Control, Operation::LockRelease)
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockRelease)
             .with_source(Operand::Lock(3));
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
@@ -592,7 +583,7 @@ mod tests {
         tile.locks[2].value = 5;
 
         // Acquire with expected=3, delta=-2 (should succeed)
-        let op = SlotOp::new(SlotIndex::Control, Operation::LockAcquire)
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockAcquire)
             .with_source(Operand::Lock(2))
             .with_source(Operand::Immediate(3)) // expected value
             .with_source(Operand::Immediate(-2)); // delta
@@ -611,7 +602,7 @@ mod tests {
         tile.locks[7].value = 2;
 
         // Acquire with expected=5 (should fail - only have 2)
-        let op = SlotOp::new(SlotIndex::Control, Operation::LockAcquire)
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockAcquire)
             .with_source(Operand::Lock(7))
             .with_source(Operand::Immediate(5)) // expected value
             .with_source(Operand::Immediate(-3)); // delta
@@ -629,7 +620,7 @@ mod tests {
         tile.locks[4].value = 5;
 
         // Release with delta=3
-        let op = SlotOp::new(SlotIndex::Control, Operation::LockRelease)
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockRelease)
             .with_source(Operand::Lock(4))
             .with_source(Operand::Immediate(3)); // delta
 
@@ -646,7 +637,7 @@ mod tests {
         tile.locks[6].value = 60;
 
         // Release with delta=10 (should saturate at 63)
-        let op = SlotOp::new(SlotIndex::Control, Operation::LockRelease)
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockRelease)
             .with_source(Operand::Lock(6))
             .with_source(Operand::Immediate(10)); // delta
 
@@ -666,7 +657,7 @@ mod tests {
         tile.locks[1].value = 1;
 
         // ACQ_mLockId_reg uses ScalarReg for lock ID
-        let op = SlotOp::new(SlotIndex::Control, Operation::LockAcquire)
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockAcquire)
             .with_source(Operand::ScalarReg(0)); // lock ID from register r0
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
@@ -684,7 +675,7 @@ mod tests {
         tile.locks[0].value = 0;
 
         // REL_mLockId_reg uses ScalarReg for lock ID
-        let op = SlotOp::new(SlotIndex::Control, Operation::LockRelease)
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockRelease)
             .with_source(Operand::ScalarReg(0)); // lock ID from register r0
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
@@ -697,7 +688,7 @@ mod tests {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
-        let op = SlotOp::new(SlotIndex::Control, Operation::Halt);
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::Halt);
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Halt)));
@@ -753,7 +744,7 @@ mod tests {
         let mut tile = make_tile();
 
         // Start DMA on channel 0 with BD 5
-        let op = SlotOp::new(SlotIndex::Control, Operation::DmaStart)
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::DmaStart)
             .with_source(Operand::DmaChannel(0))
             .with_source(Operand::Immediate(5)); // BD index
 
@@ -774,7 +765,7 @@ mod tests {
         tile.dma_channels[1].running = true;
 
         // DmaWait should return WaitDma since channel is busy
-        let op = SlotOp::new(SlotIndex::Control, Operation::DmaWait)
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::DmaWait)
             .with_source(Operand::DmaChannel(1));
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
@@ -790,7 +781,7 @@ mod tests {
         tile.dma_channels[2].running = false;
 
         // DmaWait should succeed
-        let op = SlotOp::new(SlotIndex::Control, Operation::DmaWait)
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::DmaWait)
             .with_source(Operand::DmaChannel(2));
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);

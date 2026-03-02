@@ -15,7 +15,7 @@
 //! | Vector MAC | 4+ cycles | Multiply-accumulate |
 
 use std::collections::HashMap;
-use crate::interpreter::bundle::{Operation, SlotOp};
+use crate::interpreter::bundle::SlotOp;
 use crate::tablegen::SemanticOp;
 
 /// Timing information for a single operation.
@@ -287,142 +287,6 @@ impl LatencyTable {
     pub fn latency(&self, key: OperationKey) -> u8 {
         self.get(key).latency
     }
-
-    /// Convert from Operation enum to OperationKey.
-    pub fn key_from_operation(op: &Operation) -> OperationKey {
-        match op {
-            Operation::Nop => OperationKey::Nop,
-            Operation::Halt => OperationKey::Unknown, // Treat halt as unknown for timing
-            Operation::ScalarAdd => OperationKey::ScalarAdd,
-            Operation::ScalarSub => OperationKey::ScalarSub,
-            Operation::ScalarMul => OperationKey::ScalarMul,
-            Operation::ScalarAnd => OperationKey::ScalarAnd,
-            Operation::ScalarOr => OperationKey::ScalarOr,
-            Operation::ScalarXor => OperationKey::ScalarXor,
-            Operation::ScalarShl => OperationKey::ScalarShl,
-            Operation::ScalarShr => OperationKey::ScalarShr,
-            Operation::ScalarSra => OperationKey::ScalarSra,
-            Operation::ScalarMov | Operation::ScalarMovi { .. } => OperationKey::ScalarMov,
-            Operation::ScalarCmp => OperationKey::ScalarCmp,
-            // New scalar operations - use existing timing categories
-            Operation::ScalarAbs
-            | Operation::ScalarClz
-            | Operation::ScalarClb
-            | Operation::ScalarExtendS8
-            | Operation::ScalarExtendS16
-            | Operation::ScalarExtendU8
-            | Operation::ScalarExtendU16 => OperationKey::ScalarAdd, // Single-cycle scalar ops
-            Operation::ScalarAdc | Operation::ScalarSbc => OperationKey::ScalarAdd, // Same as add/sub
-            // Division operations - multi-cycle
-            Operation::ScalarDiv | Operation::ScalarDivu | Operation::ScalarMod => OperationKey::ScalarDiv,
-            // Select operations - single cycle
-            Operation::ScalarSelEqz | Operation::ScalarSelNez => OperationKey::ScalarSel,
-            // Comparison operations have same timing as compare
-            Operation::ScalarLt
-            | Operation::ScalarLtu
-            | Operation::ScalarLe
-            | Operation::ScalarLeu
-            | Operation::ScalarGt
-            | Operation::ScalarGtu
-            | Operation::ScalarGe
-            | Operation::ScalarGeu
-            | Operation::ScalarEq
-            | Operation::ScalarNe
-            | Operation::ScalarSel => OperationKey::ScalarCmp,
-            Operation::PointerAdd | Operation::PointerMov => OperationKey::Load, // Pointer ops have similar timing to loads
-            Operation::Load { .. } => OperationKey::Load,
-            Operation::Store { .. } => OperationKey::Store,
-            Operation::Branch { .. } => OperationKey::Branch,
-            Operation::Call => OperationKey::Call,
-            Operation::Return => OperationKey::Return,
-            Operation::LockAcquire => OperationKey::LockAcquire,
-            Operation::LockRelease => OperationKey::LockRelease,
-            Operation::VectorAdd { .. } => OperationKey::VectorAdd,
-            Operation::VectorSub { .. } => OperationKey::VectorSub,
-            Operation::VectorMul { .. } => OperationKey::VectorMul,
-            Operation::VectorMac { .. } => OperationKey::VectorMac,
-            Operation::VectorShuffle { .. } => OperationKey::VectorShuffle,
-            Operation::VectorPack | Operation::VectorUnpack => OperationKey::VectorPack,
-            Operation::VectorCmp { .. } | Operation::VectorMin { .. } | Operation::VectorMax { .. } => {
-                OperationKey::VectorCmp
-            }
-            // Matrix multiply operations - use MAC timing (multi-cycle)
-            // All convolution-related operations share MAC timing
-            Operation::VectorMatMulDense { .. }
-            | Operation::VectorMatMulSparse { .. }
-            | Operation::VectorMatMulSubDense { .. }
-            | Operation::VectorMatMulSubSparse { .. }
-            | Operation::VectorNegMatMulDense { .. }
-            | Operation::VectorNegMatMulSubDense { .. }
-            | Operation::VectorMatMulAccFloat { .. }
-            | Operation::VectorMatMulSubFloat { .. }
-            | Operation::VectorAddMac { .. }
-            | Operation::VectorSubMac { .. } => OperationKey::VectorMac,
-            // Type conversion and move operations
-            Operation::VectorSRS { .. }
-            | Operation::VectorConvert { .. }
-            | Operation::VectorMov { .. } => OperationKey::VectorAdd, // Similar to vector ALU
-            // Vector element operations - single/double cycle
-            Operation::VectorExtract { .. }
-            | Operation::VectorInsert { .. }
-            | Operation::VectorSelect { .. }
-            | Operation::VectorClear
-            | Operation::VectorBroadcast { .. } => OperationKey::VectorAdd,
-            // Vector shift operations
-            Operation::VectorShiftLeft { .. }
-            | Operation::VectorShiftRight { .. }
-            | Operation::VectorArithShiftRight { .. } => OperationKey::VectorAdd,
-            // Align is similar to shuffle (concatenate and shift)
-            Operation::VectorAlign { .. } => OperationKey::VectorShuffle,
-            // Upshift for precision scaling
-            Operation::VectorUpshift { .. } => OperationKey::VectorAdd,
-            // Conditional vector operations - use simple vector ALU timing (2 cycles)
-            Operation::VectorAbsGtz { .. }
-            | Operation::VectorNegGtz { .. }
-            | Operation::VectorNegLtz { .. }
-            | Operation::VectorNegate { .. }
-            | Operation::VectorNegAdd { .. } => OperationKey::VectorAdd,
-            // Accumulator operations use MAC timing
-            Operation::VectorAccumulate { .. }
-            | Operation::VectorNegMul { .. } => OperationKey::VectorMac,
-            // Vector memory operations
-            Operation::VectorLoadA { .. }
-            | Operation::VectorLoadB { .. }
-            | Operation::VectorLoadUnpack { .. } => OperationKey::Load,
-            Operation::VectorStore { .. } => OperationKey::Store,
-            // Vector comparison operations - use compare timing (2 cycles)
-            Operation::VectorGe { .. }
-            | Operation::VectorLt { .. }
-            | Operation::VectorEqz { .. }
-            | Operation::VectorMaxLt { .. }
-            | Operation::VectorMinGe { .. } => OperationKey::VectorCmp,
-            // Vector bitwise operations - simple ALU timing (2 cycles)
-            Operation::VectorAnd { .. }
-            | Operation::VectorOr { .. }
-            | Operation::VectorXor { .. }
-            | Operation::VectorNot { .. } => OperationKey::VectorAdd,
-            // Vector conditional arithmetic - simple ALU timing (2 cycles)
-            Operation::VectorSubLt { .. }
-            | Operation::VectorSubGe { .. }
-            | Operation::VectorMaxDiffLt { .. } => OperationKey::VectorAdd,
-            // Cascade operations - use vector move timing
-            Operation::CascadeRead | Operation::CascadeWrite => OperationKey::VectorAdd,
-            // Stream operations - use DMA timing
-            Operation::StreamWriteScalar { .. }
-            | Operation::StreamWritePacketHeader { .. }
-            | Operation::StreamReadScalar { .. } => OperationKey::DmaStart,
-            Operation::DmaStart => OperationKey::DmaStart,
-            Operation::DmaWait => OperationKey::DmaWait,
-            Operation::Unknown { .. } => OperationKey::Unknown,
-        }
-    }
-
-    /// Get timing directly from an Operation.
-    #[inline]
-    pub fn timing_for(&self, op: &Operation) -> OperationTiming {
-        self.get(Self::key_from_operation(op))
-    }
-
     /// Convert from SemanticOp + vector flag to OperationKey.
     ///
     /// This is the preferred path for latency lookup -- it uses the TableGen-derived
@@ -511,22 +375,60 @@ impl LatencyTable {
             SemanticOp::LockAcquire => OperationKey::LockAcquire,
             SemanticOp::LockRelease => OperationKey::LockRelease,
 
+            // Bit manipulation (scalar only)
+            SemanticOp::Clb | SemanticOp::Cmp => OperationKey::ScalarAdd,
+
+            // Vector-specific operations
+            SemanticOp::Mac | SemanticOp::MatMul | SemanticOp::MatMulSub
+            | SemanticOp::NegMatMul | SemanticOp::AddMac | SemanticOp::SubMac
+            | SemanticOp::NegMul | SemanticOp::Accumulate
+                => OperationKey::VectorMac,
+            SemanticOp::Srs | SemanticOp::Ups | SemanticOp::Convert
+                => OperationKey::VectorPack,
+            SemanticOp::Shuffle | SemanticOp::Align
+                => OperationKey::VectorShuffle,
+            SemanticOp::Pack => OperationKey::VectorPack,
+            SemanticOp::Unpack => OperationKey::VectorPack,
+            SemanticOp::VectorBroadcast | SemanticOp::VectorExtract
+            | SemanticOp::VectorInsert | SemanticOp::VectorSelect
+            | SemanticOp::VectorClear
+                => OperationKey::VectorAdd,
+            SemanticOp::Min | SemanticOp::Max => OperationKey::VectorCmp,
+
+            // Conditional vector operations
+            SemanticOp::SubLt | SemanticOp::SubGe | SemanticOp::MaxDiffLt
+            | SemanticOp::MaxLt | SemanticOp::MinGe
+            | SemanticOp::AbsGtz | SemanticOp::NegGtz | SemanticOp::NegLtz
+            | SemanticOp::NegAdd
+                => OperationKey::VectorAdd,
+
+            // Side-effect operations
+            SemanticOp::CascadeRead | SemanticOp::CascadeWrite
+                => OperationKey::VectorAdd,
+            SemanticOp::StreamRead | SemanticOp::StreamWrite
+            | SemanticOp::StreamWritePacketHeader
+                => OperationKey::ScalarMov,
+            SemanticOp::DmaStart | SemanticOp::DmaWait
+                => OperationKey::Unknown,
+            SemanticOp::Halt => OperationKey::Unknown,
+
+            // Pointer operations
+            SemanticOp::PointerAdd | SemanticOp::PointerMov
+                => OperationKey::ScalarAdd,
+
             // Intrinsics -- default to vector MAC (conservative for high-latency ops)
             SemanticOp::Intrinsic(_) if is_vector => OperationKey::VectorMac,
             SemanticOp::Intrinsic(_) => OperationKey::ScalarMul,
         }
     }
 
-    /// Get timing for a SlotOp, preferring the semantic path when available.
-    ///
-    /// Falls back to the deprecated `Operation`-based lookup when no semantic
-    /// is set (e.g., for instructions not yet covered by the TableGen pattern matcher).
+    /// Get timing for a SlotOp using its SemanticOp.
     #[inline]
     pub fn timing_for_slot_op(&self, op: &SlotOp) -> OperationTiming {
         if let Some(semantic) = op.semantic {
             self.get(Self::key_from_semantic(semantic, op.is_vector))
         } else {
-            self.get(Self::key_from_operation(&op.op))
+            self.get(OperationKey::Nop)
         }
     }
 
@@ -634,18 +536,6 @@ mod tests {
         assert_eq!(timing.result_stage, 2);
     }
 
-    #[test]
-    fn test_key_from_operation() {
-        assert_eq!(
-            LatencyTable::key_from_operation(&Operation::ScalarAdd),
-            OperationKey::ScalarAdd
-        );
-        assert_eq!(
-            LatencyTable::key_from_operation(&Operation::Nop),
-            OperationKey::Nop
-        );
-    }
-
     // ── Semantic path tests ──────────────────────────────────────────
 
     #[test]
@@ -714,68 +604,59 @@ mod tests {
     }
 
     #[test]
-    fn test_timing_for_slot_op_prefers_semantic() {
-        use crate::interpreter::bundle::{SlotIndex, PostModify, MemWidth};
-
-        let table = LatencyTable::aie2();
-
-        // SlotOp with semantic set -> uses semantic path
-        let mut op = SlotOp::new(SlotIndex::Scalar0, Operation::ScalarAdd);
-        op.semantic = Some(SemanticOp::Mul); // Override: semantic says Mul
-        op.is_vector = false;
-
-        // Should get ScalarMul latency (2), not ScalarAdd latency (1)
-        let timing = table.timing_for_slot_op(&op);
-        assert_eq!(timing.latency, LATENCY_SCALAR_MUL);
-    }
-
-    #[test]
-    fn test_timing_for_slot_op_falls_back_to_operation() {
+    fn test_timing_for_slot_op_uses_semantic() {
         use crate::interpreter::bundle::SlotIndex;
 
         let table = LatencyTable::aie2();
 
-        // SlotOp without semantic -> falls back to Operation
-        let mut op = SlotOp::new(SlotIndex::Scalar1, Operation::ScalarMul);
-        op.semantic = None;
-
+        // SlotOp with Mul semantic -> ScalarMul latency (2)
+        let op = SlotOp::from_semantic(SlotIndex::Scalar1, SemanticOp::Mul);
         let timing = table.timing_for_slot_op(&op);
         assert_eq!(timing.latency, LATENCY_SCALAR_MUL);
     }
 
     #[test]
-    fn test_semantic_and_operation_paths_agree() {
-        // For the common operations where both paths are available, verify they
-        // produce the same latency. This catches divergence between the two maps.
+    fn test_timing_for_slot_op_nop_when_no_semantic() {
+        use crate::interpreter::bundle::SlotIndex;
+
         let table = LatencyTable::aie2();
 
-        let agreement_cases: &[(SemanticOp, bool, Operation)] = &[
-            (SemanticOp::Add, false, Operation::ScalarAdd),
-            (SemanticOp::Sub, false, Operation::ScalarSub),
-            (SemanticOp::Mul, false, Operation::ScalarMul),
-            (SemanticOp::And, false, Operation::ScalarAnd),
-            (SemanticOp::Or, false, Operation::ScalarOr),
-            (SemanticOp::Xor, false, Operation::ScalarXor),
-            (SemanticOp::Shl, false, Operation::ScalarShl),
-            (SemanticOp::Sra, false, Operation::ScalarSra),
-            (SemanticOp::Copy, false, Operation::ScalarMov),
-            (SemanticOp::Nop, false, Operation::Nop),
-            (SemanticOp::Call, false, Operation::Call),
-            (SemanticOp::Ret, false, Operation::Return),
-            (SemanticOp::LockAcquire, false, Operation::LockAcquire),
-            (SemanticOp::LockRelease, false, Operation::LockRelease),
+        // SlotOp without semantic -> treated as NOP
+        let mut op = SlotOp::from_semantic(SlotIndex::Scalar1, SemanticOp::Mul);
+        op.semantic = None;
+
+        let timing = table.timing_for_slot_op(&op);
+        assert_eq!(timing.latency, 0); // NOP latency
+    }
+
+    #[test]
+    fn test_semantic_key_matches_expected_latencies() {
+        // Verify the semantic path produces correct latencies for common ops.
+        let table = LatencyTable::aie2();
+
+        let cases: &[(SemanticOp, bool, u8)] = &[
+            (SemanticOp::Add, false, LATENCY_SCALAR_ADD),
+            (SemanticOp::Sub, false, LATENCY_SCALAR_ADD),
+            (SemanticOp::Mul, false, LATENCY_SCALAR_MUL),
+            (SemanticOp::And, false, LATENCY_SCALAR_LOGIC),
+            (SemanticOp::Or, false, LATENCY_SCALAR_LOGIC),
+            (SemanticOp::Xor, false, LATENCY_SCALAR_LOGIC),
+            (SemanticOp::Shl, false, LATENCY_SCALAR_SHIFT),
+            (SemanticOp::Sra, false, LATENCY_SCALAR_SHIFT),
+            (SemanticOp::Copy, false, LATENCY_SCALAR_MOV),
+            (SemanticOp::Nop, false, LATENCY_NOP),
+            (SemanticOp::Call, false, LATENCY_CALL),
+            (SemanticOp::Ret, false, LATENCY_RETURN),
+            (SemanticOp::LockAcquire, false, LATENCY_LOCK_ACQUIRE),
+            (SemanticOp::LockRelease, false, LATENCY_LOCK_RELEASE),
         ];
 
-        for (semantic, is_vector, operation) in agreement_cases {
-            let semantic_key = LatencyTable::key_from_semantic(*semantic, *is_vector);
-            let operation_key = LatencyTable::key_from_operation(operation);
+        for &(semantic, is_vector, expected) in cases {
+            let key = LatencyTable::key_from_semantic(semantic, is_vector);
             assert_eq!(
-                table.latency(semantic_key),
-                table.latency(operation_key),
-                "Latency mismatch for {:?} (is_vector={}) vs {:?}: semantic={}, operation={}",
-                semantic, is_vector, operation,
-                table.latency(semantic_key),
-                table.latency(operation_key),
+                table.latency(key), expected,
+                "Latency mismatch for {:?} (is_vector={}): got {}, expected {}",
+                semantic, is_vector, table.latency(key), expected,
             );
         }
     }

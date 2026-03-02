@@ -62,6 +62,7 @@ pub use resolver::{
     InstrMemWidth, OperandField, OperandType, RegisterKind, ResolveError, Resolver, SlotIndex,
     classify_operand_type, detect_addressing_mode, detect_mem_width,
     infer_branch_condition, infer_element_type, infer_select_variant,
+    infer_semantic_from_mnemonic,
 };
 pub use tblgen_records::{parse_tblgen_records, InstrRecord, SlotEncoding};
 pub use types::{

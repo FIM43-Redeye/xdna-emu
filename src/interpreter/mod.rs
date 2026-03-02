@@ -39,7 +39,7 @@
 //! | `Engine` | `InterpreterEngine` |
 //! | `CoreExecutor` | `CoreInterpreter` |
 //! | `Instruction` | `VliwBundle` |
-//! | `InstructionKind` | `Operation` |
+//! | `InstructionKind` | `SemanticOp` (via `SlotOp.semantic`) |
 
 pub mod traits;
 pub mod bundle;
@@ -56,7 +56,7 @@ pub use traits::{Decoder, Executor, StateAccess, ExecuteResult, DecodeError};
 
 // Bundle types
 pub use bundle::{
-    BundleFormat, Operation, Operand, SlotIndex, SlotMask, SlotOp, VliwBundle,
+    BundleFormat, Operand, SlotIndex, SlotMask, SlotOp, VliwBundle,
     BranchCondition, ElementType, MemWidth, PostModify, Predicate, ShufflePattern,
 };
 

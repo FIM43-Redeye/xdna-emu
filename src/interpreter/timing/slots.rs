@@ -24,7 +24,8 @@
 //! Example: Two stores in the same bundle (if that were possible) would
 //! conflict on the store port.
 
-use crate::interpreter::bundle::{Operation, SlotIndex, SlotOp, VliwBundle};
+use crate::interpreter::bundle::{SlotIndex, SlotOp, VliwBundle};
+use crate::tablegen::SemanticOp;
 
 /// Execution resources that can cause structural hazards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -113,7 +114,7 @@ pub fn get_requirements(op: &SlotOp) -> ResourceRequirements {
     match op.slot {
         SlotIndex::Scalar0 | SlotIndex::Scalar1 => {
             // Scalar multiply uses a shared resource
-            if matches!(op.op, Operation::ScalarMul) {
+            if matches!(op.semantic, Some(SemanticOp::Mul)) && !op.is_vector {
                 reqs.require(ExecutionResource::ScalarAlu);
             }
         }
@@ -137,18 +138,17 @@ pub fn get_requirements(op: &SlotOp) -> ResourceRequirements {
     }
 
     // Post-modify addressing uses AGU
-    match &op.op {
-        Operation::Load { post_modify, .. } | Operation::Store { post_modify, .. } => {
-            use crate::interpreter::bundle::PostModify;
-            if !matches!(post_modify, PostModify::None) {
+    {
+        use crate::interpreter::bundle::PostModify;
+        if !matches!(op.post_modify, PostModify::None) {
+            if matches!(op.semantic, Some(SemanticOp::Load) | Some(SemanticOp::Store)) {
                 reqs.require(ExecutionResource::AddressGen);
             }
         }
-        _ => {}
     }
 
     // Vector MAC uses accumulator write port
-    if matches!(op.op, Operation::VectorMac { .. }) {
+    if matches!(op.semantic, Some(SemanticOp::Mac)) {
         reqs.require(ExecutionResource::AccumulatorWrite);
     }
 
@@ -210,23 +210,14 @@ pub fn bundle_structural_penalty(bundle: &VliwBundle) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::bundle::{MemWidth, PostModify};
-
-    fn make_slot(slot: SlotIndex, op: Operation) -> SlotOp {
-        SlotOp::new(slot, op)
-    }
+    use crate::interpreter::bundle::PostModify;
+    use crate::tablegen::SemanticOp;
 
     #[test]
     fn test_no_conflict_independent_slots() {
         // Scalar0 and Load use different resources
-        let scalar = make_slot(SlotIndex::Scalar0, Operation::ScalarAdd);
-        let load = make_slot(
-            SlotIndex::LoadA,
-            Operation::Load {
-                width: MemWidth::Word,
-                post_modify: PostModify::None,
-            },
-        );
+        let scalar = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add);
+        let load = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load);
 
         assert!(check_slot_conflict(&scalar, &load).is_none());
     }
@@ -234,8 +225,8 @@ mod tests {
     #[test]
     fn test_conflict_dual_scalar_mul() {
         // Two scalar multiplies share the ALU
-        let mul0 = make_slot(SlotIndex::Scalar0, Operation::ScalarMul);
-        let mul1 = make_slot(SlotIndex::Scalar1, Operation::ScalarMul);
+        let mul0 = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Mul);
+        let mul1 = SlotOp::from_semantic(SlotIndex::Scalar1, SemanticOp::Mul);
 
         let conflict = check_slot_conflict(&mul0, &mul1);
         assert!(conflict.is_some());
@@ -245,8 +236,8 @@ mod tests {
     #[test]
     fn test_no_conflict_scalar_add_and_mul() {
         // Scalar add doesn't use the shared ALU
-        let add = make_slot(SlotIndex::Scalar0, Operation::ScalarAdd);
-        let mul = make_slot(SlotIndex::Scalar1, Operation::ScalarMul);
+        let add = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add);
+        let mul = SlotOp::from_semantic(SlotIndex::Scalar1, SemanticOp::Mul);
 
         assert!(check_slot_conflict(&add, &mul).is_none());
     }
@@ -254,20 +245,10 @@ mod tests {
     #[test]
     fn test_conflict_dual_post_modify() {
         // Both loads with post-modify share AGU
-        let load_a = SlotOp::new(
-            SlotIndex::LoadA,
-            Operation::Load {
-                width: MemWidth::Word,
-                post_modify: PostModify::Immediate(4),
-            },
-        );
-        let store = SlotOp::new(
-            SlotIndex::Store,
-            Operation::Store {
-                width: MemWidth::Word,
-                post_modify: PostModify::Immediate(4),
-            },
-        );
+        let load_a = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_post_modify(PostModify::Immediate(4));
+        let store = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+            .with_post_modify(PostModify::Immediate(4));
 
         let conflict = check_slot_conflict(&load_a, &store);
         assert!(conflict.is_some());
@@ -278,14 +259,8 @@ mod tests {
     fn test_bundle_no_conflicts() {
         // Bundle with independent operations
         let mut bundle = VliwBundle::empty();
-        bundle.set_slot(make_slot(SlotIndex::Scalar0, Operation::ScalarAdd));
-        bundle.set_slot(make_slot(
-            SlotIndex::LoadA,
-            Operation::Load {
-                width: MemWidth::Word,
-                post_modify: PostModify::None,
-            },
-        ));
+        bundle.set_slot(SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add));
+        bundle.set_slot(SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load));
 
         let hazards = check_bundle_conflicts(&bundle);
         assert!(hazards.is_empty());
@@ -296,8 +271,8 @@ mod tests {
     fn test_bundle_with_conflict() {
         // Bundle with conflicting scalar multiplies
         let mut bundle = VliwBundle::empty();
-        bundle.set_slot(make_slot(SlotIndex::Scalar0, Operation::ScalarMul));
-        bundle.set_slot(make_slot(SlotIndex::Scalar1, Operation::ScalarMul));
+        bundle.set_slot(SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Mul));
+        bundle.set_slot(SlotOp::from_semantic(SlotIndex::Scalar1, SemanticOp::Mul));
 
         let hazards = check_bundle_conflicts(&bundle);
         assert_eq!(hazards.len(), 1);
@@ -307,13 +282,8 @@ mod tests {
 
     #[test]
     fn test_resource_requirements() {
-        let load = SlotOp::new(
-            SlotIndex::LoadA,
-            Operation::Load {
-                width: MemWidth::Word,
-                post_modify: PostModify::Immediate(4),
-            },
-        );
+        let load = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_post_modify(PostModify::Immediate(4));
 
         let reqs = get_requirements(&load);
         assert!(reqs.resources.contains(&ExecutionResource::LoadPortA));

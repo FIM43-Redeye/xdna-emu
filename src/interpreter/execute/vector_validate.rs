@@ -16,7 +16,8 @@ use serde::Deserialize;
 use super::vector_srs::{self, RoundingMode};
 use super::vector_ups;
 use super::VectorAlu;
-use crate::interpreter::bundle::{ElementType, Operation, Operand, SlotIndex, SlotOp};
+use crate::interpreter::bundle::{ElementType, Operand, SlotIndex, SlotOp};
+use crate::tablegen::SemanticOp;
 use crate::interpreter::state::ExecutionContext;
 
 // ---------------------------------------------------------------------------
@@ -85,11 +86,12 @@ fn load_golden() -> GoldenData {
 }
 
 /// Run a binary vector operation through VectorAlu::execute.
-fn run_binary_vec_op(op: Operation, a: [u32; 8], b: [u32; 8]) -> [u32; 8] {
+fn run_binary_vec_op(semantic: SemanticOp, elem_type: ElementType, a: [u32; 8], b: [u32; 8]) -> [u32; 8] {
     let mut ctx = ExecutionContext::new();
     ctx.vector.write(0, a);
     ctx.vector.write(1, b);
-    let op = SlotOp::new(SlotIndex::Vector, op)
+    let op = SlotOp::from_semantic(SlotIndex::Vector, semantic)
+        .as_vector(elem_type)
         .with_dest(Operand::VectorReg(2))
         .with_source(Operand::VectorReg(0))
         .with_source(Operand::VectorReg(1));
@@ -110,14 +112,14 @@ fn parse_element_type(s: &str) -> Option<ElementType> {
     }
 }
 
-/// Build the Operation variant for a given op name and element type.
-fn build_operation(op_name: &str, elem_type: ElementType) -> Option<Operation> {
+/// Map an op name to its SemanticOp variant.
+fn semantic_for_op(op_name: &str) -> Option<SemanticOp> {
     match op_name {
-        "vadd" => Some(Operation::VectorAdd { element_type: elem_type }),
-        "vsub" => Some(Operation::VectorSub { element_type: elem_type }),
-        "vmul" => Some(Operation::VectorMul { element_type: elem_type }),
-        "vmin" => Some(Operation::VectorMin { element_type: elem_type }),
-        "vmax" => Some(Operation::VectorMax { element_type: elem_type }),
+        "vadd" => Some(SemanticOp::Add),
+        "vsub" => Some(SemanticOp::Sub),
+        "vmul" => Some(SemanticOp::Mul),
+        "vmin" => Some(SemanticOp::Min),
+        "vmax" => Some(SemanticOp::Max),
         _ => None,
     }
 }
@@ -249,14 +251,14 @@ fn validate_elementwise_golden() {
             Some(t) => t,
             None => continue,
         };
-        let operation = match build_operation(op_name, elem_type) {
-            Some(o) => o,
+        let semantic = match semantic_for_op(op_name) {
+            Some(s) => s,
             None => continue,
         };
 
         for case in cases {
             total += 1;
-            let actual = run_binary_vec_op(operation.clone(), case.a, case.b);
+            let actual = run_binary_vec_op(semantic, elem_type, case.a, case.b);
 
             if actual == case.expected {
                 pass += 1;

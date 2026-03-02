@@ -50,9 +50,10 @@
 //! - **Program Memory**: 16KB (read-only from core)
 
 use crate::device::tile::Tile;
-use crate::interpreter::bundle::{ElementType, MemWidth, Operation, Operand, PostModify, SlotOp};
+use crate::interpreter::bundle::{ElementType, MemWidth, Operand, PostModify, SlotIndex, SlotOp};
 use crate::interpreter::state::ExecutionContext;
 use crate::interpreter::timing::{LATENCY_MEMORY, CROSS_TILE_LATENCY};
+use crate::tablegen::SemanticOp;
 
 /// Address mask for local tile memory (64KB).
 /// Addresses from the AGU span 0x0000-0x3FFFF (256KB across 4 neighbors),
@@ -261,51 +262,49 @@ impl MemoryUnit {
         tile: &mut Tile,
         neighbors: Option<&mut NeighborMemory>,
     ) -> bool {
-        // PostModify comes from op.post_modify (populated directly from the
-        // AG field during decode) rather than from the Operation variant.
+        // PostModify comes from op.post_modify (populated from the AG field
+        // during decode).
         let pm = &op.post_modify;
 
-        match &op.op {
-            Operation::Load { width, .. } => {
-                Self::execute_load(op, ctx, tile, *width, pm, neighbors);
+        match op.semantic {
+            Some(SemanticOp::Load) if !op.is_vector => {
+                Self::execute_load(op, ctx, tile, op.mem_width, pm, neighbors);
                 true
             }
 
-            Operation::Store { width, .. } => {
-                Self::execute_store(op, ctx, tile, *width, pm, neighbors);
+            Some(SemanticOp::Store) if !op.is_vector => {
+                Self::execute_store(op, ctx, tile, op.mem_width, pm, neighbors);
                 true
             }
 
-            Operation::PointerAdd => {
+            Some(SemanticOp::PointerAdd) => {
                 Self::execute_pointer_add(op, ctx);
                 true
             }
 
-            Operation::PointerMov => {
+            Some(SemanticOp::PointerMov) => {
                 Self::execute_pointer_mov(op, ctx);
                 true
             }
 
-            Operation::VectorLoadA { .. } => {
+            Some(SemanticOp::Load) if op.slot == SlotIndex::LoadA => {
                 Self::execute_vector_load_a(op, ctx, tile, pm, neighbors);
                 true
             }
 
-            Operation::VectorLoadB { .. } => {
+            Some(SemanticOp::Load) if op.slot == SlotIndex::LoadB => {
                 Self::execute_vector_load_b(op, ctx, tile, pm, neighbors);
                 true
             }
 
-            Operation::VectorLoadUnpack {
-                from_type,
-                to_type,
-                ..
-            } => {
-                Self::execute_vector_load_unpack(op, ctx, tile, *from_type, *to_type, pm);
+            Some(SemanticOp::Unpack) => {
+                let from_type = op.from_type.unwrap_or(ElementType::Int32);
+                let to_type = op.element_type.unwrap_or(ElementType::Int32);
+                Self::execute_vector_load_unpack(op, ctx, tile, from_type, to_type, pm);
                 true
             }
 
-            Operation::VectorStore { .. } => {
+            Some(SemanticOp::Store) if op.is_vector => {
                 Self::execute_vector_store(op, ctx, tile, pm, neighbors);
                 true
             }
@@ -1114,7 +1113,8 @@ impl MemoryUnit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::bundle::SlotIndex;
+    use crate::interpreter::bundle::{ElementType, SlotIndex};
+    use crate::tablegen::SemanticOp;
 
     fn make_ctx() -> ExecutionContext {
         ExecutionContext::new()
@@ -1136,15 +1136,9 @@ mod tests {
         ctx.pointer.write(0, 0x100);
 
         // r0 = [p0]
-        let op = SlotOp::new(
-            SlotIndex::LoadA,
-            Operation::Load {
-                width: MemWidth::Word,
-                post_modify: PostModify::None,
-            },
-        )
-        .with_dest(Operand::ScalarReg(0))
-        .with_source(Operand::PointerReg(0));
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0));
 
         assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile, None));
         ctx.flush_pending_writes();
@@ -1160,15 +1154,9 @@ mod tests {
         ctx.pointer.write(0, 0x100);
 
         // r0 = [p0 + 8]
-        let op = SlotOp::new(
-            SlotIndex::LoadA,
-            Operation::Load {
-                width: MemWidth::Word,
-                post_modify: PostModify::None,
-            },
-        )
-        .with_dest(Operand::ScalarReg(0))
-        .with_source(Operand::Memory { base: 0, offset: 8 });
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::Memory { base: 0, offset: 8 });
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
@@ -1184,16 +1172,10 @@ mod tests {
         ctx.pointer.write(0, 0x100);
 
         // r0 = [p0], p0 += 4
-        let op = SlotOp::new(
-            SlotIndex::LoadA,
-            Operation::Load {
-                width: MemWidth::Word,
-                post_modify: PostModify::Immediate(4),
-            },
-        )
-        .with_post_modify(PostModify::Immediate(4))
-        .with_dest(Operand::ScalarReg(0))
-        .with_source(Operand::PointerReg(0));
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_post_modify(PostModify::Immediate(4))
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
@@ -1211,16 +1193,10 @@ mod tests {
         ctx.modifier.write(0, 0x10); // m0 = 16
 
         // r0 = [p0], p0 += m0
-        let op = SlotOp::new(
-            SlotIndex::LoadA,
-            Operation::Load {
-                width: MemWidth::Word,
-                post_modify: PostModify::Register(0),
-            },
-        )
-        .with_post_modify(PostModify::Register(0))
-        .with_dest(Operand::ScalarReg(0))
-        .with_source(Operand::PointerReg(0));
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_post_modify(PostModify::Register(0))
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
@@ -1237,15 +1213,9 @@ mod tests {
         ctx.scalar.write(1, 0xFEED_FACE);
 
         // [p0] = r1
-        let op = SlotOp::new(
-            SlotIndex::Store,
-            Operation::Store {
-                width: MemWidth::Word,
-                post_modify: PostModify::None,
-            },
-        )
-        .with_dest(Operand::ScalarReg(1))
-        .with_source(Operand::PointerReg(0));
+        let op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+            .with_dest(Operand::ScalarReg(1))
+            .with_source(Operand::PointerReg(0));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         assert_eq!(tile.read_data_u32(0x200), Some(0xFEED_FACE));
@@ -1259,15 +1229,10 @@ mod tests {
         tile.data_memory_mut()[0x50] = 0xAB;
         ctx.pointer.write(0, 0x50);
 
-        let op = SlotOp::new(
-            SlotIndex::LoadA,
-            Operation::Load {
-                width: MemWidth::Byte,
-                post_modify: PostModify::None,
-            },
-        )
-        .with_dest(Operand::ScalarReg(0))
-        .with_source(Operand::PointerReg(0));
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(MemWidth::Byte)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
@@ -1283,15 +1248,10 @@ mod tests {
         tile.data_memory_mut()[0x61] = 0xAB;
         ctx.pointer.write(0, 0x60);
 
-        let op = SlotOp::new(
-            SlotIndex::LoadA,
-            Operation::Load {
-                width: MemWidth::HalfWord,
-                post_modify: PostModify::None,
-            },
-        )
-        .with_dest(Operand::ScalarReg(0))
-        .with_source(Operand::PointerReg(0));
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(MemWidth::HalfWord)
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::PointerReg(0));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
@@ -1331,15 +1291,10 @@ mod tests {
         ctx.pointer.write(0, 0x400);
 
         // Load vector: v0 = [p0]
-        let op = SlotOp::new(
-            SlotIndex::LoadA,
-            Operation::Load {
-                width: MemWidth::Vector256,
-                post_modify: PostModify::None,
-            },
-        )
-        .with_dest(Operand::VectorReg(0))
-        .with_source(Operand::PointerReg(0));
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(MemWidth::Vector256)
+            .with_dest(Operand::VectorReg(0))
+            .with_source(Operand::PointerReg(0));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
@@ -1371,15 +1326,10 @@ mod tests {
         ctx.pointer.write(0, 0x500);
 
         // Store vector: [p0] = v1
-        let op = SlotOp::new(
-            SlotIndex::Store,
-            Operation::Store {
-                width: MemWidth::Vector256,
-                post_modify: PostModify::None,
-            },
-        )
-        .with_dest(Operand::VectorReg(1))
-        .with_source(Operand::PointerReg(0));
+        let op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+            .with_mem_width(MemWidth::Vector256)
+            .with_dest(Operand::VectorReg(1))
+            .with_source(Operand::PointerReg(0));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
 
@@ -1398,16 +1348,11 @@ mod tests {
         ctx.pointer.write(0, 0x600);
 
         // Load with post-modify: v0 = [p0], p0 += 32
-        let op = SlotOp::new(
-            SlotIndex::LoadA,
-            Operation::Load {
-                width: MemWidth::Vector256,
-                post_modify: PostModify::Immediate(32), // 256 bits = 32 bytes
-            },
-        )
-        .with_post_modify(PostModify::Immediate(32))
-        .with_dest(Operand::VectorReg(0))
-        .with_source(Operand::PointerReg(0));
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_mem_width(MemWidth::Vector256)
+            .with_post_modify(PostModify::Immediate(32)) // 256 bits = 32 bytes
+            .with_dest(Operand::VectorReg(0))
+            .with_source(Operand::PointerReg(0));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
@@ -1428,14 +1373,11 @@ mod tests {
         ctx.pointer.write(0, 0x700);
 
         // VLDA: v2 = [p0]
-        let op = SlotOp::new(
-            SlotIndex::LoadA,
-            Operation::VectorLoadA {
-                post_modify: PostModify::None,
-            },
-        )
-        .with_dest(Operand::VectorReg(2))
-        .with_source(Operand::PointerReg(0));
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .as_vector(ElementType::Int32)
+            .with_mem_width(MemWidth::Vector256)
+            .with_dest(Operand::VectorReg(2))
+            .with_source(Operand::PointerReg(0));
 
         assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile, None));
         ctx.flush_pending_writes();
@@ -1453,15 +1395,12 @@ mod tests {
         ctx.pointer.write(1, 0x800);
 
         // VLDA: v0 = [p1], p1 += 32
-        let op = SlotOp::new(
-            SlotIndex::LoadA,
-            Operation::VectorLoadA {
-                post_modify: PostModify::Immediate(32),
-            },
-        )
-        .with_post_modify(PostModify::Immediate(32))
-        .with_dest(Operand::VectorReg(0))
-        .with_source(Operand::PointerReg(1));
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .as_vector(ElementType::Int32)
+            .with_mem_width(MemWidth::Vector256)
+            .with_post_modify(PostModify::Immediate(32))
+            .with_dest(Operand::VectorReg(0))
+            .with_source(Operand::PointerReg(1));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
@@ -1480,14 +1419,11 @@ mod tests {
         ctx.pointer.write(4, 0x900); // B-channel typically uses p4-p7
 
         // VLDB: v3 = [p4]
-        let op = SlotOp::new(
-            SlotIndex::LoadA,
-            Operation::VectorLoadB {
-                post_modify: PostModify::None,
-            },
-        )
-        .with_dest(Operand::VectorReg(3))
-        .with_source(Operand::PointerReg(4));
+        let op = SlotOp::from_semantic(SlotIndex::LoadB, SemanticOp::Load)
+            .as_vector(ElementType::Int32)
+            .with_mem_width(MemWidth::Vector256)
+            .with_dest(Operand::VectorReg(3))
+            .with_source(Operand::PointerReg(4));
 
         assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile, None));
         ctx.flush_pending_writes();
@@ -1505,13 +1441,10 @@ mod tests {
         ctx.modifier.write(2, 64); // m2 = 64
 
         // VLDB: v1 = [p5], p5 += m2
-        let op = SlotOp::new(
-            SlotIndex::LoadA,
-            Operation::VectorLoadB {
-                post_modify: PostModify::Register(2),
-            },
-        )
-        .with_post_modify(PostModify::Register(2))
+        let op = SlotOp::from_semantic(SlotIndex::LoadB, SemanticOp::Load)
+            .as_vector(ElementType::Int32)
+            .with_mem_width(MemWidth::Vector256)
+            .with_post_modify(PostModify::Register(2))
         .with_dest(Operand::VectorReg(1))
         .with_source(Operand::PointerReg(5));
 
@@ -1532,14 +1465,11 @@ mod tests {
         ctx.pointer.write(2, 0xB00);
 
         // VST: [p2] = v4
-        let op = SlotOp::new(
-            SlotIndex::Store,
-            Operation::VectorStore {
-                post_modify: PostModify::None,
-            },
-        )
-        .with_dest(Operand::VectorReg(4))
-        .with_source(Operand::PointerReg(2));
+        let op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+            .as_vector(ElementType::Int32)
+            .with_mem_width(MemWidth::Vector256)
+            .with_dest(Operand::VectorReg(4))
+            .with_source(Operand::PointerReg(2));
 
         assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile, None));
 
@@ -1557,15 +1487,12 @@ mod tests {
         ctx.pointer.write(3, 0xC00);
 
         // VST: [p3] = v5, p3 += 32
-        let op = SlotOp::new(
-            SlotIndex::Store,
-            Operation::VectorStore {
-                post_modify: PostModify::Immediate(32),
-            },
-        )
-        .with_post_modify(PostModify::Immediate(32))
-        .with_dest(Operand::VectorReg(5))
-        .with_source(Operand::PointerReg(3));
+        let op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+            .as_vector(ElementType::Int32)
+            .with_mem_width(MemWidth::Vector256)
+            .with_post_modify(PostModify::Immediate(32))
+            .with_dest(Operand::VectorReg(5))
+            .with_source(Operand::PointerReg(3));
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
 
@@ -1576,8 +1503,6 @@ mod tests {
 
     #[test]
     fn test_vector_load_unpack_int8_to_int32() {
-        use crate::interpreter::bundle::ElementType;
-
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
@@ -1589,16 +1514,12 @@ mod tests {
         ctx.pointer.write(0, 0xD00);
 
         // VLDB_UNPACK: expand int8 to int32
-        let op = SlotOp::new(
-            SlotIndex::LoadA,
-            Operation::VectorLoadUnpack {
-                from_type: ElementType::UInt8,
-                to_type: ElementType::UInt32,
-                post_modify: PostModify::None,
-            },
-        )
-        .with_dest(Operand::VectorReg(6))
-        .with_source(Operand::PointerReg(0));
+        let mut op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Unpack)
+            .with_dest(Operand::VectorReg(6))
+            .with_source(Operand::PointerReg(0));
+        op.is_vector = true;
+        op.from_type = Some(ElementType::UInt8);
+        op.element_type = Some(ElementType::UInt32);
 
         assert!(MemoryUnit::execute(&op, &mut ctx, &mut tile, None));
         ctx.flush_pending_writes();
@@ -1617,8 +1538,6 @@ mod tests {
 
     #[test]
     fn test_vector_load_unpack_int8_to_int32_signed() {
-        use crate::interpreter::bundle::ElementType;
-
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
@@ -1635,16 +1554,12 @@ mod tests {
         ctx.pointer.write(1, 0xE00);
 
         // VLDB_UNPACK: expand signed int8 to int32
-        let op = SlotOp::new(
-            SlotIndex::LoadA,
-            Operation::VectorLoadUnpack {
-                from_type: ElementType::Int8,
-                to_type: ElementType::Int32,
-                post_modify: PostModify::None,
-            },
-        )
-        .with_dest(Operand::VectorReg(7))
-        .with_source(Operand::PointerReg(1));
+        let mut op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Unpack)
+            .with_dest(Operand::VectorReg(7))
+            .with_source(Operand::PointerReg(1));
+        op.is_vector = true;
+        op.from_type = Some(ElementType::Int8);
+        op.element_type = Some(ElementType::Int32);
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();
@@ -1662,8 +1577,6 @@ mod tests {
 
     #[test]
     fn test_vector_load_unpack_int16_to_int32() {
-        use crate::interpreter::bundle::ElementType;
-
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
@@ -1678,17 +1591,13 @@ mod tests {
         ctx.pointer.write(2, 0xF00);
 
         // VLDB_UNPACK: expand int16 to int32
-        let op = SlotOp::new(
-            SlotIndex::LoadA,
-            Operation::VectorLoadUnpack {
-                from_type: ElementType::Int16,
-                to_type: ElementType::Int32,
-                post_modify: PostModify::Immediate(16), // Read 16 bytes
-            },
-        )
-        .with_post_modify(PostModify::Immediate(16))
-        .with_dest(Operand::VectorReg(0))
-        .with_source(Operand::PointerReg(2));
+        let mut op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Unpack)
+            .with_post_modify(PostModify::Immediate(16)) // Read 16 bytes
+            .with_dest(Operand::VectorReg(0))
+            .with_source(Operand::PointerReg(2));
+        op.is_vector = true;
+        op.from_type = Some(ElementType::Int16);
+        op.element_type = Some(ElementType::Int32);
 
         MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
         ctx.flush_pending_writes();

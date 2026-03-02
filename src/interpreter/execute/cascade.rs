@@ -23,7 +23,8 @@
 //! - Accumulator register (512 bits = 8 x u64): low 6 of 8 lanes used
 
 use crate::device::tile::Tile;
-use crate::interpreter::bundle::{Operand, Operation, SlotOp};
+use crate::interpreter::bundle::{Operand, SlotOp};
+use crate::tablegen::SemanticOp;
 use crate::interpreter::state::ExecutionContext;
 
 /// Cascade operations execution unit.
@@ -50,9 +51,9 @@ impl CascadeOps {
         ctx: &mut ExecutionContext,
         tile: &mut Tile,
     ) -> CascadeResult {
-        match &op.op {
-            Operation::CascadeRead => Self::execute_read(op, ctx, tile),
-            Operation::CascadeWrite => Self::execute_write(op, ctx, tile),
+        match op.semantic {
+            Some(SemanticOp::CascadeRead) => Self::execute_read(op, ctx, tile),
+            Some(SemanticOp::CascadeWrite) => Self::execute_write(op, ctx, tile),
             _ => CascadeResult::NotCascadeOp,
         }
     }
@@ -205,6 +206,7 @@ fn cascade_to_accumulator(data: &[u64; 6]) -> [u64; 8] {
 mod tests {
     use super::*;
     use crate::interpreter::bundle::SlotIndex;
+    use crate::tablegen::SemanticOp;
 
     fn make_ctx() -> ExecutionContext {
         ExecutionContext::new()
@@ -219,7 +221,7 @@ mod tests {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
-        let op = SlotOp::new(SlotIndex::LoadA, Operation::CascadeRead)
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeRead)
             .with_dest(Operand::VectorReg(0));
 
         assert_eq!(CascadeOps::execute(&op, &mut ctx, &mut tile), CascadeResult::Stall);
@@ -235,7 +237,7 @@ mod tests {
                                     0xDEAD, 0xBEEF];
         tile.push_cascade_input(test_data);
 
-        let op = SlotOp::new(SlotIndex::LoadA, Operation::CascadeRead)
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeRead)
             .with_dest(Operand::VectorReg(5));
 
         assert_eq!(CascadeOps::execute(&op, &mut ctx, &mut tile), CascadeResult::Completed);
@@ -259,7 +261,7 @@ mod tests {
         let test_data: [u64; 6] = [10, 20, 30, 40, 50, 60];
         tile.push_cascade_input(test_data);
 
-        let op = SlotOp::new(SlotIndex::LoadA, Operation::CascadeRead)
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeRead)
             .with_dest(Operand::AccumReg(3));
 
         assert_eq!(CascadeOps::execute(&op, &mut ctx, &mut tile), CascadeResult::Completed);
@@ -278,7 +280,7 @@ mod tests {
 
         ctx.vector.write(2, [0xA, 0xB, 0xC, 0xD, 0xE, 0xF, 0x10, 0x11]);
 
-        let op = SlotOp::new(SlotIndex::LoadA, Operation::CascadeWrite)
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeWrite)
             .with_source(Operand::VectorReg(2));
 
         assert_eq!(CascadeOps::execute(&op, &mut ctx, &mut tile), CascadeResult::Completed);
@@ -302,7 +304,7 @@ mod tests {
         // Fill the MCD FIFO (depth 1)
         tile.push_cascade_output([0; 6]);
 
-        let op = SlotOp::new(SlotIndex::LoadA, Operation::CascadeWrite)
+        let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeWrite)
             .with_source(Operand::VectorReg(0));
 
         assert_eq!(CascadeOps::execute(&op, &mut ctx, &mut tile), CascadeResult::Stall);
@@ -313,7 +315,7 @@ mod tests {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
-        let op = SlotOp::new(SlotIndex::Scalar0, Operation::ScalarAdd);
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add);
         assert_eq!(CascadeOps::execute(&op, &mut ctx, &mut tile), CascadeResult::NotCascadeOp);
     }
 

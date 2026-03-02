@@ -39,8 +39,9 @@
 //! - **Compare**: vcmp, vmin, vmax
 //! - **Shuffle**: vshuffle, vpack, vunpack
 
-use crate::interpreter::bundle::{ElementType, Operation, Operand, ShufflePattern, SlotOp};
+use crate::interpreter::bundle::{ElementType, Operand, ShufflePattern, SlotOp};
 use crate::interpreter::state::ExecutionContext;
+use crate::tablegen::SemanticOp;
 
 use super::vector_srs::{self, RoundingMode};
 use super::vector_ups;
@@ -53,273 +54,301 @@ impl VectorAlu {
     /// Execute a vector operation.
     ///
     /// Returns `true` if the operation was handled, `false` if not a vector op.
+    /// Dispatches on `op.semantic` (SemanticOp) with metadata from SlotOp fields.
     pub fn execute(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
-        log::trace!("[VECTOR_ALU] Checking op={:?} dest={:?}", op.op, op.dest);
-        match &op.op {
-            Operation::VectorAdd { element_type } => {
-                log::debug!("[VECTOR_ALU] Executing VectorAdd element_type={:?} dest={:?} sources={:?}",
-                    element_type, op.dest, op.sources);
+        let Some(semantic) = op.semantic else {
+            return false;
+        };
+
+        // Only handle vector operations
+        if !op.is_vector {
+            return false;
+        }
+
+        let et = op.element_type.unwrap_or(ElementType::Int32);
+
+        log::trace!("[VECTOR_ALU] Checking semantic={:?} element_type={:?} dest={:?}",
+            semantic, op.element_type, op.dest);
+
+        match semantic {
+            // ========== Arithmetic ==========
+
+            SemanticOp::Add => {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_add(&a, &b, *element_type);
+                let result = Self::vector_add(&a, &b, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorSub { element_type } => {
+            SemanticOp::Sub => {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_sub(&a, &b, *element_type);
+                let result = Self::vector_sub(&a, &b, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorMul { element_type } => {
+            SemanticOp::Mul => {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_mul(&a, &b, *element_type);
+                let result = Self::vector_mul(&a, &b, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorMac { element_type } => {
+            SemanticOp::Mac => {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let acc_reg = Self::get_acc_dest(op);
-                Self::vector_mac(ctx, acc_reg, &a, &b, *element_type);
+                Self::vector_mac(ctx, acc_reg, &a, &b, et);
                 true
             }
 
-            Operation::VectorMin { element_type } => {
+            SemanticOp::Min => {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_min(&a, &b, *element_type);
+                let result = Self::vector_min(&a, &b, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorMax { element_type } => {
+            SemanticOp::Max => {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_max(&a, &b, *element_type);
+                let result = Self::vector_max(&a, &b, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorShuffle { pattern } => {
+            SemanticOp::Neg => {
                 let src = Self::get_vector_source(op, ctx, 0);
-                let result = Self::vector_shuffle(&src, *pattern);
+                let result = Self::vector_negate(&src, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorPack => {
-                // Pack two vectors into one (narrow)
+            // ========== Shuffle/Pack/Unpack ==========
+
+            SemanticOp::Shuffle => {
+                let src = Self::get_vector_source(op, ctx, 0);
+                let result = Self::vector_shuffle(&src, op.shuffle_pattern);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            SemanticOp::Pack => {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let result = Self::vector_pack(&a, &b);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorUnpack => {
-                // Unpack one vector into two (widen) - writes low half
+            SemanticOp::Unpack => {
                 let src = Self::get_vector_source(op, ctx, 0);
                 let result = Self::vector_unpack_low(&src);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorCmp { element_type } => {
+            // ========== Comparison ==========
+
+            SemanticOp::Cmp => {
+                // Vector compare equal
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_cmp_eq(&a, &b, *element_type);
+                let result = Self::vector_cmp_eq(&a, &b, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorMatMulDense { element_type } => {
-                // Dense matrix multiply: acc += A * B
-                // AIE2 processes 4x4 or 4x8 matrix tiles
+            SemanticOp::SetGe => {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let acc_reg = Self::get_acc_dest(op);
-                Self::vector_matmul_dense(ctx, acc_reg, &a, &b, *element_type);
+                let result = Self::vector_compare_ge(&a, &b, et);
+                Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorMatMulSparse { element_type, .. } => {
-                // Sparse matrix multiply: similar to dense but with sparse format
-                // For now, treat as dense - sparse format optimization is a refinement
+            SemanticOp::SetLt => {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let acc_reg = Self::get_acc_dest(op);
-                Self::vector_matmul_dense(ctx, acc_reg, &a, &b, *element_type);
+                let result = Self::vector_compare_lt(&a, &b, et);
+                Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            // ========== Convolution-Related Operations (VMSC/VNEGMAC variants) ==========
+            SemanticOp::SetEq => {
+                // Vector equal-to-zero (from VectorEqz)
+                let src = Self::get_vector_source(op, ctx, 0);
+                let result = Self::vector_compare_eqz(&src, et);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
 
-            Operation::VectorMatMulSubDense { element_type } => {
+            SemanticOp::MaxLt => {
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let result = Self::vector_max(&a, &b, et);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            SemanticOp::MinGe => {
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let result = Self::vector_min(&a, &b, et);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            // ========== Matrix Operations ==========
+
+            SemanticOp::MatMul => {
+                // Dense/sparse matrix multiply: acc += A * B
+                // BFloat16 variant uses dedicated bf16 path
+                let (a, b) = Self::get_two_vector_sources(op, ctx);
+                let acc_reg = Self::get_acc_dest(op);
+                match et {
+                    ElementType::BFloat16 => Self::vector_matmul_bf16(ctx, acc_reg, &a, &b, true),
+                    _ => Self::vector_matmul_dense(ctx, acc_reg, &a, &b, et),
+                }
+                true
+            }
+
+            SemanticOp::MatMulSub => {
                 // Matrix multiply-subtract: acc -= A * B
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let acc_reg = Self::get_acc_dest(op);
-                Self::vector_matmul_sub(ctx, acc_reg, &a, &b, *element_type);
+                match et {
+                    ElementType::BFloat16 => Self::vector_matmul_bf16(ctx, acc_reg, &a, &b, false),
+                    _ => Self::vector_matmul_sub(ctx, acc_reg, &a, &b, et),
+                }
                 true
             }
 
-            Operation::VectorMatMulSubSparse { element_type, .. } => {
-                // Sparse matrix multiply-subtract (treat as dense for now)
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let acc_reg = Self::get_acc_dest(op);
-                Self::vector_matmul_sub(ctx, acc_reg, &a, &b, *element_type);
-                true
-            }
-
-            Operation::VectorNegMatMulDense { element_type } => {
+            SemanticOp::NegMatMul => {
                 // Negated matrix multiply: acc += -(A * B)
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let acc_reg = Self::get_acc_dest(op);
-                Self::vector_neg_matmul(ctx, acc_reg, &a, &b, *element_type);
+                Self::vector_neg_matmul(ctx, acc_reg, &a, &b, et);
                 true
             }
 
-            Operation::VectorNegMatMulSubDense { element_type } => {
-                // Negated matrix multiply-subtract: acc -= -(A * B) = acc + (A * B)
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let acc_reg = Self::get_acc_dest(op);
-                // Note: acc -= -(A*B) is equivalent to acc += (A*B), same as dense
-                Self::vector_matmul_dense(ctx, acc_reg, &a, &b, *element_type);
-                true
-            }
-
-            Operation::VectorMatMulAccFloat { .. } => {
-                // BFloat16 matrix multiply-accumulate for CNN workloads
-                // Operands are bf16, accumulator is fp32
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let acc_reg = Self::get_acc_dest(op);
-                Self::vector_matmul_bf16(ctx, acc_reg, &a, &b, true);
-                true
-            }
-
-            Operation::VectorMatMulSubFloat { .. } => {
-                // BFloat16 matrix multiply-subtract for CNN workloads
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let acc_reg = Self::get_acc_dest(op);
-                Self::vector_matmul_bf16(ctx, acc_reg, &a, &b, false);
-                true
-            }
-
-            Operation::VectorAddMac { element_type } => {
+            SemanticOp::AddMac => {
                 // Double accumulator: acc1 = acc1 + acc2 + A * B
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let acc_reg = Self::get_acc_dest(op);
                 let acc2_reg = Self::get_acc_source(op);
-                Self::vector_double_acc_mac(ctx, acc_reg, acc2_reg, &a, &b, *element_type, true);
+                Self::vector_double_acc_mac(ctx, acc_reg, acc2_reg, &a, &b, et, true);
                 true
             }
 
-            Operation::VectorSubMac { element_type } => {
+            SemanticOp::SubMac => {
                 // Double accumulator: acc1 = acc1 - acc2 + A * B
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let acc_reg = Self::get_acc_dest(op);
                 let acc2_reg = Self::get_acc_source(op);
-                Self::vector_double_acc_mac(ctx, acc_reg, acc2_reg, &a, &b, *element_type, false);
+                Self::vector_double_acc_mac(ctx, acc_reg, acc2_reg, &a, &b, et, false);
                 true
             }
 
-            Operation::VectorSRS { from_type, to_type } => {
+            // ========== SRS/UPS/Convert ==========
+
+            SemanticOp::Srs => {
                 // Shift-Round-Saturate: convert accumulator to vector
                 let acc_reg = Self::get_acc_source(op);
                 let shift = Self::get_shift_amount(op, ctx);
-                let result = Self::vector_srs(ctx, acc_reg, shift, *from_type, *to_type);
+                let from = op.from_type.unwrap_or(ElementType::Int32);
+                let result = Self::vector_srs(ctx, acc_reg, shift, from, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorConvert { from_type, to_type } => {
+            SemanticOp::Convert => {
                 // Type conversion (e.g., bf16 <-> f32)
                 let src = Self::get_vector_source(op, ctx, 0);
-                let result = Self::vector_convert(&src, *from_type, *to_type);
+                let from = op.from_type.unwrap_or(ElementType::Int32);
+                let result = Self::vector_convert(&src, from, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorMov { .. } => {
-                // Vector register move
+            SemanticOp::Ups => {
+                // Vector upshift: shift left with saturation for precision scaling
+                let src = Self::get_vector_source(op, ctx, 0);
+                let shift = Self::get_lane_index(op, ctx);
+                let from = op.from_type.unwrap_or(ElementType::Int32);
+                let result = Self::vector_upshift(&src, shift, from, et);
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            // ========== Copy/Move ==========
+
+            SemanticOp::Copy => {
                 let src = Self::get_vector_source(op, ctx, 0);
                 Self::write_vector_dest(op, ctx, src);
                 true
             }
 
-            // ========== Vector Element Operations ==========
+            // ========== Element Operations ==========
 
-            Operation::VectorExtract { element_type } => {
+            SemanticOp::VectorExtract => {
                 // Extract single element from vector to scalar
-                // dst_scalar = src_vector[index]
                 let src = Self::get_vector_source(op, ctx, 0);
                 let index = Self::get_lane_index(op, ctx);
-                let result = Self::vector_extract(&src, index, *element_type);
+                let result = Self::vector_extract(&src, index, et);
                 Self::write_scalar_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorInsert { element_type } => {
+            SemanticOp::VectorInsert => {
                 // Insert scalar into vector lane
-                // dst_vector[index] = src_scalar; other lanes from src_vector
                 let mut dst = Self::get_vector_dest_value(op, ctx);
                 let value = Self::get_scalar_source(op, ctx);
                 let index = Self::get_lane_index(op, ctx);
-                Self::vector_insert(&mut dst, value, index, *element_type);
+                Self::vector_insert(&mut dst, value, index, et);
                 Self::write_vector_dest(op, ctx, dst);
                 true
             }
 
-            Operation::VectorSelect { element_type } => {
+            SemanticOp::VectorSelect => {
                 // Per-lane conditional select: dst[i] = sel[i] ? a[i] : b[i]
-                // vector_select takes (mask, src_if_true, src_if_false)
-                // Source order: mask, true_val, false_val
                 let sel = Self::get_vector_source(op, ctx, 0);
                 let a = Self::get_vector_source(op, ctx, 1);
                 let b = Self::get_vector_source(op, ctx, 2);
-                let result = Self::vector_select(&sel, &a, &b, *element_type);
+                let result = Self::vector_select(&sel, &a, &b, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorClear => {
-                // Clear vector register to zero
+            SemanticOp::VectorClear => {
                 Self::write_vector_dest(op, ctx, [0u32; 8]);
                 true
             }
 
-            Operation::VectorBroadcast { element_type } => {
-                // Broadcast scalar value to all vector lanes
+            SemanticOp::VectorBroadcast => {
                 let value = Self::get_scalar_source(op, ctx);
-                let result = Self::vector_broadcast(value, *element_type);
+                let result = Self::vector_broadcast(value, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            // ========== Vector Shift Operations ==========
+            // ========== Shift Operations ==========
 
-            Operation::VectorShiftLeft { element_type } => {
-                // Vector logical left shift: dst[i] = a[i] << shift[i]
+            SemanticOp::Shl => {
                 let (a, shift) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_shift_left(&a, &shift, *element_type);
+                let result = Self::vector_shift_left(&a, &shift, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorShiftRight { element_type } => {
-                // Vector logical right shift: dst[i] = a[i] >> shift[i]
+            SemanticOp::Srl => {
                 let (a, shift) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_shift_right_logical(&a, &shift, *element_type);
+                let result = Self::vector_shift_right_logical(&a, &shift, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorArithShiftRight { element_type } => {
-                // Vector arithmetic right shift: dst[i] = (signed)a[i] >> shift[i]
+            SemanticOp::Sra => {
                 let (a, shift) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_shift_right_arith(&a, &shift, *element_type);
+                let result = Self::vector_shift_right_arith(&a, &shift, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorAlign { .. } => {
-                // Vector align: concatenate two vectors and shift
-                // Result = (src1 || src2) >> (shift * element_size)
+            SemanticOp::Align => {
+                // Concatenate two vectors and shift
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let shift = Self::get_lane_index(op, ctx);
                 let result = Self::vector_align(&a, &b, shift);
@@ -327,177 +356,104 @@ impl VectorAlu {
                 true
             }
 
-            Operation::VectorUpshift { from_type, to_type } => {
-                // Vector upshift: shift left with saturation for precision scaling
-                let src = Self::get_vector_source(op, ctx, 0);
-                let shift = Self::get_lane_index(op, ctx);
-                let result = Self::vector_upshift(&src, shift, *from_type, *to_type);
-                Self::write_vector_dest(op, ctx, result);
-                true
-            }
-
             // ========== Conditional Vector Operations ==========
 
-            Operation::VectorAbsGtz { element_type } => {
-                // Absolute value if greater than zero: dst[i] = (src[i] > 0) ? abs(src[i]) : src[i]
+            SemanticOp::AbsGtz => {
                 let src = Self::get_vector_source(op, ctx, 0);
-                let result = Self::vector_abs_gtz(&src, *element_type);
+                let result = Self::vector_abs_gtz(&src, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorNegGtz { element_type } => {
-                // Negate if greater than zero: dst[i] = (src[i] > 0) ? -src[i] : src[i]
+            SemanticOp::NegGtz => {
                 let src = Self::get_vector_source(op, ctx, 0);
-                let result = Self::vector_neg_gtz(&src, *element_type);
+                let result = Self::vector_neg_gtz(&src, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorNegLtz { element_type } => {
-                // Negate if less than zero: dst[i] = (src[i] < 0) ? -src[i] : src[i]
-                // This is essentially abs()
+            SemanticOp::NegLtz => {
                 let src = Self::get_vector_source(op, ctx, 0);
-                let result = Self::vector_neg_ltz(&src, *element_type);
+                let result = Self::vector_neg_ltz(&src, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorAccumulate { element_type } => {
-                // Vector accumulate: acc += src (add to accumulator without multiply)
+            SemanticOp::Accumulate => {
                 let src = Self::get_vector_source(op, ctx, 0);
                 let acc_reg = Self::get_acc_dest(op);
-                Self::vector_accumulate(ctx, acc_reg, &src, *element_type);
+                Self::vector_accumulate(ctx, acc_reg, &src, et);
                 true
             }
 
-            Operation::VectorNegate { element_type } => {
-                // Vector negate: dst = -src
-                let src = Self::get_vector_source(op, ctx, 0);
-                let result = Self::vector_negate(&src, *element_type);
-                Self::write_vector_dest(op, ctx, result);
-                true
-            }
-
-            Operation::VectorNegAdd { element_type } => {
-                // Vector negate and add: dst = -src1 + src2
+            SemanticOp::NegAdd => {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_neg_add(&a, &b, *element_type);
+                let result = Self::vector_neg_add(&a, &b, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorNegMul { element_type } => {
-                // Vector negate multiply: acc += -(src1 * src2)
+            SemanticOp::NegMul => {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let acc_reg = Self::get_acc_dest(op);
-                Self::vector_neg_mul(ctx, acc_reg, &a, &b, *element_type);
+                Self::vector_neg_mul(ctx, acc_reg, &a, &b, et);
                 true
             }
 
-            // ========== Vector Comparison Operations ==========
+            // ========== Bitwise Operations ==========
 
-            Operation::VectorGe { element_type } => {
-                // Greater than or equal: dst[i] = (a[i] >= b[i]) ? ~0 : 0
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_compare_ge(&a, &b, *element_type);
-                Self::write_vector_dest(op, ctx, result);
-                true
-            }
-
-            Operation::VectorLt { element_type } => {
-                // Less than: dst[i] = (a[i] < b[i]) ? ~0 : 0
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_compare_lt(&a, &b, *element_type);
-                Self::write_vector_dest(op, ctx, result);
-                true
-            }
-
-            Operation::VectorEqz { element_type } => {
-                // Equal to zero: dst[i] = (a[i] == 0) ? ~0 : 0
-                let src = Self::get_vector_source(op, ctx, 0);
-                let result = Self::vector_compare_eqz(&src, *element_type);
-                Self::write_vector_dest(op, ctx, result);
-                true
-            }
-
-            Operation::VectorMaxLt { element_type } => {
-                // Maximum with less-than flag: dst = max(a, b), sets flags
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_max(&a, &b, *element_type);
-                Self::write_vector_dest(op, ctx, result);
-                true
-            }
-
-            Operation::VectorMinGe { element_type } => {
-                // Minimum with greater-equal flag: dst = min(a, b), sets flags
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_min(&a, &b, *element_type);
-                Self::write_vector_dest(op, ctx, result);
-                true
-            }
-
-            // ========== Vector Bitwise Operations ==========
-
-            Operation::VectorAnd { element_type: _ } => {
-                // Bitwise AND: dst = a & b
+            SemanticOp::And => {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let result = Self::vector_bitwise_and(&a, &b);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorOr { element_type: _ } => {
-                // Bitwise OR: dst = a | b
+            SemanticOp::Or => {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let result = Self::vector_bitwise_or(&a, &b);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorXor { element_type: _ } => {
-                // Bitwise XOR: dst = a ^ b
+            SemanticOp::Xor => {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let result = Self::vector_bitwise_xor(&a, &b);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorNot { element_type: _ } => {
-                // Bitwise NOT: dst = ~a
+            SemanticOp::Not => {
                 let src = Self::get_vector_source(op, ctx, 0);
                 let result = Self::vector_bitwise_not(&src);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            // ========== Vector Conditional Arithmetic Operations ==========
+            // ========== Conditional Arithmetic ==========
 
-            Operation::VectorSubLt { element_type } => {
-                // Subtract if less-than: dst[i] = (a[i] < b[i]) ? a[i] - b[i] : a[i]
+            SemanticOp::SubLt => {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_sub_lt(&a, &b, *element_type);
+                let result = Self::vector_sub_lt(&a, &b, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorSubGe { element_type } => {
-                // Subtract if greater-equal: dst[i] = (a[i] >= b[i]) ? a[i] - b[i] : a[i]
+            SemanticOp::SubGe => {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_sub_ge(&a, &b, *element_type);
+                let result = Self::vector_sub_ge(&a, &b, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            Operation::VectorMaxDiffLt { element_type } => {
-                // Maximum difference if less-than: dst[i] = max(a[i] - b[i], 0) if a < b
+            SemanticOp::MaxDiffLt => {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_maxdiff_lt(&a, &b, *element_type);
+                let result = Self::vector_maxdiff_lt(&a, &b, et);
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
 
-            _ => false, // Not a vector operation
+            _ => false, // Not a vector operation handled here
         }
     }
 
@@ -1506,8 +1462,8 @@ impl VectorAlu {
     ///
     /// Delegates to the `vector_pack` module. Takes two 256-bit vectors
     /// of 32-bit elements and produces one 256-bit vector of 16-bit elements.
-    /// Uses truncation mode (no saturation) since the Operation variant
-    /// does not carry saturation information.
+    /// Uses truncation mode (no saturation) since the SlotOp does not
+    /// currently carry pack saturation information.
     fn vector_pack(a: &[u32; 8], _b: &[u32; 8]) -> [u32; 8] {
         // The vector_pack module operates on a single register at a time,
         // narrowing from bits_i to bits_o. Pack the first source; the second
@@ -2870,15 +2826,11 @@ mod tests {
         ctx.vector.write(0, [1, 2, 3, 4, 5, 6, 7, 8]);
         ctx.vector.write(1, [10, 20, 30, 40, 50, 60, 70, 80]);
 
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorAdd {
-                element_type: ElementType::Int32,
-            },
-        )
-        .with_dest(Operand::VectorReg(2))
-        .with_source(Operand::VectorReg(0))
-        .with_source(Operand::VectorReg(1));
+        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Add)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::VectorReg(2))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(1));
 
         assert!(VectorAlu::execute(&op, &mut ctx));
         assert_eq!(ctx.vector.read(2), [11, 22, 33, 44, 55, 66, 77, 88]);
@@ -2891,15 +2843,11 @@ mod tests {
         ctx.vector.write(0, [0x0002_0001, 0, 0, 0, 0, 0, 0, 0]);
         ctx.vector.write(1, [0x0020_0010, 0, 0, 0, 0, 0, 0, 0]);
 
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorAdd {
-                element_type: ElementType::Int16,
-            },
-        )
-        .with_dest(Operand::VectorReg(2))
-        .with_source(Operand::VectorReg(0))
-        .with_source(Operand::VectorReg(1));
+        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Add)
+            .as_vector(ElementType::Int16)
+            .with_dest(Operand::VectorReg(2))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(1));
 
         VectorAlu::execute(&op, &mut ctx);
         assert_eq!(ctx.vector.read(2)[0], 0x0022_0011);
@@ -2911,15 +2859,11 @@ mod tests {
         ctx.vector.write(0, [100, 200, 300, 400, 500, 600, 700, 800]);
         ctx.vector.write(1, [10, 20, 30, 40, 50, 60, 70, 80]);
 
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorSub {
-                element_type: ElementType::Int32,
-            },
-        )
-        .with_dest(Operand::VectorReg(2))
-        .with_source(Operand::VectorReg(0))
-        .with_source(Operand::VectorReg(1));
+        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Sub)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::VectorReg(2))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(1));
 
         VectorAlu::execute(&op, &mut ctx);
         assert_eq!(ctx.vector.read(2), [90, 180, 270, 360, 450, 540, 630, 720]);
@@ -2931,15 +2875,11 @@ mod tests {
         ctx.vector.write(0, [2, 3, 4, 5, 6, 7, 8, 9]);
         ctx.vector.write(1, [10, 10, 10, 10, 10, 10, 10, 10]);
 
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorMul {
-                element_type: ElementType::Int32,
-            },
-        )
-        .with_dest(Operand::VectorReg(2))
-        .with_source(Operand::VectorReg(0))
-        .with_source(Operand::VectorReg(1));
+        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Mul)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::VectorReg(2))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(1));
 
         VectorAlu::execute(&op, &mut ctx);
         assert_eq!(ctx.vector.read(2), [20, 30, 40, 50, 60, 70, 80, 90]);
@@ -2952,15 +2892,11 @@ mod tests {
         ctx.vector.write(1, [2, 2, 2, 2, 2, 2, 2, 2]);
 
         // acc0 = v0 * v1
-        let op = SlotOp::new(
-            SlotIndex::Accumulator,
-            Operation::VectorMac {
-                element_type: ElementType::Int32,
-            },
-        )
-        .with_dest(Operand::AccumReg(0))
-        .with_source(Operand::VectorReg(0))
-        .with_source(Operand::VectorReg(1));
+        let op = SlotOp::from_semantic(SlotIndex::Accumulator, SemanticOp::Mac)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::AccumReg(0))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(1));
 
         VectorAlu::execute(&op, &mut ctx);
         let acc = ctx.accumulator.read(0);
@@ -2979,29 +2915,21 @@ mod tests {
         ctx.vector.write(1, [10, 5, 20, 15, 30, 25, 40, 35]);
 
         // Min
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorMin {
-                element_type: ElementType::UInt32,
-            },
-        )
-        .with_dest(Operand::VectorReg(2))
-        .with_source(Operand::VectorReg(0))
-        .with_source(Operand::VectorReg(1));
+        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Min)
+            .as_vector(ElementType::UInt32)
+            .with_dest(Operand::VectorReg(2))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(1));
 
         VectorAlu::execute(&op, &mut ctx);
         assert_eq!(ctx.vector.read(2), [5, 5, 15, 15, 25, 25, 35, 35]);
 
         // Max
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorMax {
-                element_type: ElementType::UInt32,
-            },
-        )
-        .with_dest(Operand::VectorReg(2))
-        .with_source(Operand::VectorReg(0))
-        .with_source(Operand::VectorReg(1));
+        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Max)
+            .as_vector(ElementType::UInt32)
+            .with_dest(Operand::VectorReg(2))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(1));
 
         VectorAlu::execute(&op, &mut ctx);
         assert_eq!(ctx.vector.read(2), [10, 10, 20, 20, 30, 30, 40, 40]);
@@ -3012,14 +2940,11 @@ mod tests {
         let mut ctx = make_ctx();
         ctx.vector.write(0, [1, 2, 3, 4, 5, 6, 7, 8]);
 
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorShuffle {
-                pattern: ShufflePattern::Reverse,
-            },
-        )
-        .with_dest(Operand::VectorReg(1))
-        .with_source(Operand::VectorReg(0));
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Shuffle)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::VectorReg(1))
+            .with_source(Operand::VectorReg(0));
+        op.shuffle_pattern = ShufflePattern::Reverse;
 
         VectorAlu::execute(&op, &mut ctx);
         assert_eq!(ctx.vector.read(1), [8, 7, 6, 5, 4, 3, 2, 1]);
@@ -3030,14 +2955,11 @@ mod tests {
         let mut ctx = make_ctx();
         ctx.vector.write(0, [10, 20, 30, 40, 50, 60, 70, 80]);
 
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorShuffle {
-                pattern: ShufflePattern::Broadcast(2),
-            },
-        )
-        .with_dest(Operand::VectorReg(1))
-        .with_source(Operand::VectorReg(0));
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Shuffle)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::VectorReg(1))
+            .with_source(Operand::VectorReg(0));
+        op.shuffle_pattern = ShufflePattern::Broadcast(2);
 
         VectorAlu::execute(&op, &mut ctx);
         assert_eq!(ctx.vector.read(1), [30, 30, 30, 30, 30, 30, 30, 30]);
@@ -3049,15 +2971,11 @@ mod tests {
         ctx.vector.write(0, [1, 2, 3, 4, 5, 6, 7, 8]);
         ctx.vector.write(1, [1, 0, 3, 0, 5, 0, 7, 0]);
 
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorCmp {
-                element_type: ElementType::Int32,
-            },
-        )
-        .with_dest(Operand::VectorReg(2))
-        .with_source(Operand::VectorReg(0))
-        .with_source(Operand::VectorReg(1));
+        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Cmp)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::VectorReg(2))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(1));
 
         VectorAlu::execute(&op, &mut ctx);
         let result = ctx.vector.read(2);
@@ -3087,15 +3005,11 @@ mod tests {
         ctx.vector.write(0, a);
         ctx.vector.write(1, b);
 
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorAdd {
-                element_type: ElementType::Float32,
-            },
-        )
-        .with_dest(Operand::VectorReg(2))
-        .with_source(Operand::VectorReg(0))
-        .with_source(Operand::VectorReg(1));
+        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Add)
+            .as_vector(ElementType::Float32)
+            .with_dest(Operand::VectorReg(2))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(1));
 
         VectorAlu::execute(&op, &mut ctx);
         let result = ctx.vector.read(2);
@@ -3127,15 +3041,11 @@ mod tests {
         ctx.vector.write(0, a);
         ctx.vector.write(1, b);
 
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorMul {
-                element_type: ElementType::Float32,
-            },
-        )
-        .with_dest(Operand::VectorReg(2))
-        .with_source(Operand::VectorReg(0))
-        .with_source(Operand::VectorReg(1));
+        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Mul)
+            .as_vector(ElementType::Float32)
+            .with_dest(Operand::VectorReg(2))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(1));
 
         VectorAlu::execute(&op, &mut ctx);
         let result = ctx.vector.read(2);
@@ -3176,15 +3086,11 @@ mod tests {
         ctx.vector.write(1, b);
 
         // Min
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorMin {
-                element_type: ElementType::Float32,
-            },
-        )
-        .with_dest(Operand::VectorReg(2))
-        .with_source(Operand::VectorReg(0))
-        .with_source(Operand::VectorReg(1));
+        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Min)
+            .as_vector(ElementType::Float32)
+            .with_dest(Operand::VectorReg(2))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(1));
 
         VectorAlu::execute(&op, &mut ctx);
         let result = ctx.vector.read(2);
@@ -3193,15 +3099,11 @@ mod tests {
         assert_eq!(f32::from_bits(result[3]), -5.0); // min(-4.0, -5.0)
 
         // Max
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorMax {
-                element_type: ElementType::Float32,
-            },
-        )
-        .with_dest(Operand::VectorReg(2))
-        .with_source(Operand::VectorReg(0))
-        .with_source(Operand::VectorReg(1));
+        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Max)
+            .as_vector(ElementType::Float32)
+            .with_dest(Operand::VectorReg(2))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(1));
 
         VectorAlu::execute(&op, &mut ctx);
         let result = ctx.vector.read(2);
@@ -3237,15 +3139,11 @@ mod tests {
         ctx.vector.write(0, a);
         ctx.vector.write(1, b);
 
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorAdd {
-                element_type: ElementType::BFloat16,
-            },
-        )
-        .with_dest(Operand::VectorReg(2))
-        .with_source(Operand::VectorReg(0))
-        .with_source(Operand::VectorReg(1));
+        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Add)
+            .as_vector(ElementType::BFloat16)
+            .with_dest(Operand::VectorReg(2))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(1));
 
         VectorAlu::execute(&op, &mut ctx);
         let result = ctx.vector.read(2);
@@ -3265,15 +3163,11 @@ mod tests {
         ctx.vector.write(0, [1, 2, 3, 4, 5, 6, 7, 8]);
         ctx.vector.write(1, [2, 2, 2, 2, 2, 2, 2, 2]);
 
-        let op = SlotOp::new(
-            SlotIndex::Accumulator,
-            Operation::VectorMatMulDense {
-                element_type: ElementType::Int32,
-            },
-        )
-        .with_dest(Operand::AccumReg(0))
-        .with_source(Operand::VectorReg(0))
-        .with_source(Operand::VectorReg(1));
+        let op = SlotOp::from_semantic(SlotIndex::Accumulator, SemanticOp::MatMul)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::AccumReg(0))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(1));
 
         VectorAlu::execute(&op, &mut ctx);
         let acc = ctx.accumulator.read(0);
@@ -3292,16 +3186,12 @@ mod tests {
         // Set up accumulator with values that need shifting
         ctx.accumulator.write(0, [256, 512, 768, 1024, 1280, 1536, 1792, 2048]);
 
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorSRS {
-                from_type: ElementType::Int32,
-                to_type: ElementType::Int32,
-            },
-        )
-        .with_dest(Operand::VectorReg(0))
-        .with_source(Operand::AccumReg(0))
-        .with_source(Operand::Immediate(4)); // Shift right by 4
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Srs)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::VectorReg(0))
+            .with_source(Operand::AccumReg(0))
+            .with_source(Operand::Immediate(4)); // Shift right by 4
+        op.from_type = Some(ElementType::Int32);
 
         VectorAlu::execute(&op, &mut ctx);
         let result = ctx.vector.read(0);
@@ -3334,15 +3224,11 @@ mod tests {
             ],
         );
 
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorConvert {
-                from_type: ElementType::BFloat16,
-                to_type: ElementType::Float32,
-            },
-        )
-        .with_dest(Operand::VectorReg(1))
-        .with_source(Operand::VectorReg(0));
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Convert)
+            .as_vector(ElementType::Float32)
+            .with_dest(Operand::VectorReg(1))
+            .with_source(Operand::VectorReg(0));
+        op.from_type = Some(ElementType::BFloat16);
 
         VectorAlu::execute(&op, &mut ctx);
         let result = ctx.vector.read(1);
@@ -3363,15 +3249,11 @@ mod tests {
         let mut ctx = make_ctx();
         ctx.vector.write(0, [1, 2, 3, 4, 5, 6, 7, 8]);
 
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorConvert {
-                from_type: ElementType::Int32,
-                to_type: ElementType::Float32,
-            },
-        )
-        .with_dest(Operand::VectorReg(1))
-        .with_source(Operand::VectorReg(0));
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Convert)
+            .as_vector(ElementType::Float32)
+            .with_dest(Operand::VectorReg(1))
+            .with_source(Operand::VectorReg(0));
+        op.from_type = Some(ElementType::Int32);
 
         VectorAlu::execute(&op, &mut ctx);
         let result = ctx.vector.read(1);
@@ -3387,14 +3269,10 @@ mod tests {
         let mut ctx = make_ctx();
         ctx.vector.write(0, [10, 20, 30, 40, 50, 60, 70, 80]);
 
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorMov {
-                element_type: ElementType::Int32,
-            },
-        )
-        .with_dest(Operand::VectorReg(1))
-        .with_source(Operand::VectorReg(0));
+        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Copy)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::VectorReg(1))
+            .with_source(Operand::VectorReg(0));
 
         VectorAlu::execute(&op, &mut ctx);
         assert_eq!(ctx.vector.read(1), [10, 20, 30, 40, 50, 60, 70, 80]);
@@ -3407,16 +3285,12 @@ mod tests {
         // Accumulator lane 0 = 264 (264 >> 4 = 16.5)
         ctx.accumulator.write(0, [264, 0, 0, 0, 0, 0, 0, 0]);
 
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorSRS {
-                from_type: ElementType::Int32,
-                to_type: ElementType::Int32,
-            },
-        )
-        .with_dest(Operand::VectorReg(0))
-        .with_source(Operand::AccumReg(0))
-        .with_source(Operand::Immediate(4));
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Srs)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::VectorReg(0))
+            .with_source(Operand::AccumReg(0))
+            .with_source(Operand::Immediate(4));
+        op.from_type = Some(ElementType::Int32);
 
         // PosInf (mode 9), saturation on, signed.
         // 16.5 with PosInf -> 17 (round toward +inf at halfway)
@@ -3446,16 +3320,12 @@ mod tests {
         let overflow_val = 32768i64 as u64;
         ctx.accumulator.write(0, [overflow_val, 0, 0, 0, 0, 0, 0, 0]);
 
-        let op = SlotOp::new(
-            SlotIndex::Vector,
-            Operation::VectorSRS {
-                from_type: ElementType::Int32,
-                to_type: ElementType::Int16,
-            },
-        )
-        .with_dest(Operand::VectorReg(0))
-        .with_source(Operand::AccumReg(0))
-        .with_source(Operand::Immediate(0)); // shift=0
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Srs)
+            .as_vector(ElementType::Int16)
+            .with_dest(Operand::VectorReg(0))
+            .with_source(Operand::AccumReg(0))
+            .with_source(Operand::Immediate(0)); // shift=0
+        op.from_type = Some(ElementType::Int32);
 
         // Saturation enabled, signed -> clamp to 32767
         ctx.srs_config.saturation_mode = 1; // Saturate

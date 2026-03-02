@@ -36,7 +36,8 @@
 //! The TileArray routes this data through the stream switch fabric.
 
 use crate::device::tile::Tile;
-use crate::interpreter::bundle::{Operation, Operand, SlotOp};
+use crate::interpreter::bundle::{Operand, SlotOp};
+use crate::tablegen::SemanticOp;
 use crate::interpreter::state::ExecutionContext;
 
 /// Stream operations execution unit.
@@ -70,8 +71,9 @@ impl StreamOps {
     /// * `ctx` - Execution context with register files
     /// * `tile` - The tile containing stream buffers
     pub fn execute(op: &SlotOp, ctx: &mut ExecutionContext, tile: &mut Tile) -> StreamResult {
-        match &op.op {
-            Operation::StreamWriteScalar { blocking } => {
+        let blocking = op.blocking;
+        match op.semantic {
+            Some(SemanticOp::StreamWrite) => {
                 // Get the source value from the scalar register
                 let value = Self::get_source_value(op, ctx);
 
@@ -97,7 +99,7 @@ impl StreamOps {
                 StreamResult::Completed
             }
 
-            Operation::StreamWritePacketHeader { blocking } => {
+            Some(SemanticOp::StreamWritePacketHeader) => {
                 // Get the header value from the scalar register
                 let header = Self::get_source_value(op, ctx);
 
@@ -119,7 +121,7 @@ impl StreamOps {
                 StreamResult::Completed
             }
 
-            Operation::StreamReadScalar { blocking } => {
+            Some(SemanticOp::StreamRead) => {
                 // Get the stream port from operands (default to port 0)
                 let port = Self::get_port_from_operands(op);
 
@@ -128,7 +130,7 @@ impl StreamOps {
                     // Data available - write to destination register
                     Self::write_dest(op, ctx, value);
                     StreamResult::Completed
-                } else if *blocking {
+                } else if blocking {
                     // No data and blocking - signal stall
                     // The interpreter will retry this instruction
                     StreamResult::Stall { port }
@@ -199,6 +201,7 @@ impl StreamOps {
 mod tests {
     use super::*;
     use crate::interpreter::bundle::SlotIndex;
+    use crate::tablegen::SemanticOp;
 
     fn make_ctx() -> ExecutionContext {
         ExecutionContext::new()
@@ -215,11 +218,9 @@ mod tests {
 
         ctx.scalar.write(0, 0xDEADBEEF);
 
-        let op = SlotOp::new(
-            SlotIndex::Scalar0,
-            Operation::StreamWriteScalar { blocking: true },
-        )
-        .with_source(Operand::ScalarReg(0));
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamWrite)
+            .with_blocking(true)
+            .with_source(Operand::ScalarReg(0));
 
         assert_eq!(
             StreamOps::execute(&op, &mut ctx, &mut tile),
@@ -238,12 +239,10 @@ mod tests {
         ctx.scalar.write(0, 0x12345678);
 
         // Write to port 3 using immediate operand
-        let op = SlotOp::new(
-            SlotIndex::Scalar0,
-            Operation::StreamWriteScalar { blocking: true },
-        )
-        .with_source(Operand::ScalarReg(0))
-        .with_source(Operand::Immediate(3)); // Port 3
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamWrite)
+            .with_blocking(true)
+            .with_source(Operand::ScalarReg(0))
+            .with_source(Operand::Immediate(3)); // Port 3
 
         assert_eq!(
             StreamOps::execute(&op, &mut ctx, &mut tile),
@@ -262,11 +261,9 @@ mod tests {
 
         ctx.scalar.write(1, 0x12345678);
 
-        let op = SlotOp::new(
-            SlotIndex::Scalar0,
-            Operation::StreamWritePacketHeader { blocking: false },
-        )
-        .with_source(Operand::ScalarReg(1));
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamWritePacketHeader)
+            .with_blocking(false)
+            .with_source(Operand::ScalarReg(1));
 
         assert_eq!(
             StreamOps::execute(&op, &mut ctx, &mut tile),
@@ -287,11 +284,9 @@ mod tests {
 
         ctx.scalar.write(5, 0xFFFFFFFF);
 
-        let op = SlotOp::new(
-            SlotIndex::Scalar0,
-            Operation::StreamReadScalar { blocking: true },
-        )
-        .with_dest(Operand::ScalarReg(5));
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamRead)
+            .with_blocking(true)
+            .with_dest(Operand::ScalarReg(5));
 
         assert_eq!(
             StreamOps::execute(&op, &mut ctx, &mut tile),
@@ -308,11 +303,9 @@ mod tests {
         let mut tile = make_tile();
 
         // No data in buffer - should stall
-        let op = SlotOp::new(
-            SlotIndex::Scalar0,
-            Operation::StreamReadScalar { blocking: true },
-        )
-        .with_dest(Operand::ScalarReg(5));
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamRead)
+            .with_blocking(true)
+            .with_dest(Operand::ScalarReg(5));
 
         assert_eq!(
             StreamOps::execute(&op, &mut ctx, &mut tile),
@@ -328,11 +321,9 @@ mod tests {
         ctx.scalar.write(5, 0xFFFFFFFF);
 
         // Non-blocking read with no data should return 0
-        let op = SlotOp::new(
-            SlotIndex::Scalar0,
-            Operation::StreamReadScalar { blocking: false },
-        )
-        .with_dest(Operand::ScalarReg(5));
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamRead)
+            .with_blocking(false)
+            .with_dest(Operand::ScalarReg(5));
 
         assert_eq!(
             StreamOps::execute(&op, &mut ctx, &mut tile),
@@ -349,7 +340,7 @@ mod tests {
         let mut tile = make_tile();
 
         // A scalar add should not be handled by StreamOps
-        let op = SlotOp::new(SlotIndex::Scalar0, Operation::ScalarAdd)
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Add)
             .with_dest(Operand::ScalarReg(2))
             .with_source(Operand::ScalarReg(0))
             .with_source(Operand::ScalarReg(1));
@@ -366,11 +357,9 @@ mod tests {
         let mut tile = make_tile();
 
         // Edge case: immediate as source (unusual but should work)
-        let op = SlotOp::new(
-            SlotIndex::Scalar0,
-            Operation::StreamWriteScalar { blocking: true },
-        )
-        .with_source(Operand::Immediate(42));
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamWrite)
+            .with_blocking(true)
+            .with_source(Operand::Immediate(42));
 
         assert_eq!(
             StreamOps::execute(&op, &mut ctx, &mut tile),
@@ -386,10 +375,8 @@ mod tests {
         // Push data - even without dest, should read and discard
         tile.push_stream_input(0, 0x12345678);
 
-        let op = SlotOp::new(
-            SlotIndex::Scalar0,
-            Operation::StreamReadScalar { blocking: false },
-        );
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamRead)
+            .with_blocking(false);
 
         // Should return Completed (data consumed but discarded)
         assert_eq!(

@@ -1218,15 +1218,14 @@ impl XclbinSuite {
                     .map(|ctx| ctx.pc())
                     .unwrap_or(0);
 
-                // Check the last bundle for unknown operations
+                // Check the last bundle for unknown operations (semantic: None)
                 if let Some(bundle) = engine.core_last_bundle(col, row) {
                     for op in bundle.active_slots() {
-                        if let crate::interpreter::bundle::Operation::Unknown { opcode } = &op.op
-                        {
+                        if op.semantic.is_none() {
                             return Some(TestOutcome::UnknownOpcode {
                                 details: UnknownOpcode {
                                     slot: op.slot,
-                                    opcode: *opcode,
+                                    opcode: op.raw_opcode.unwrap_or(0),
                                     pc,
                                     tile: (col as u8, row as u8),
                                     mnemonic: None,

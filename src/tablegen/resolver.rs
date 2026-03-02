@@ -1258,9 +1258,9 @@ pub fn infer_semantic_from_mnemonic(mnemonic: &str) -> Option<SemanticOp> {
         return Some(SemanticOp::SetUge);
     }
 
-    // Pointer add (treat as add)
+    // Pointer add
     if lower.starts_with("padd") {
-        return Some(SemanticOp::Add);
+        return Some(SemanticOp::PointerAdd);
     }
 
     // Call (jump-and-link) operations
@@ -1291,21 +1291,93 @@ pub fn infer_semantic_from_mnemonic(mnemonic: &str) -> Option<SemanticOp> {
         return Some(SemanticOp::Ret);
     }
 
-    // Vector operations (vadd, vsub, vmul, etc.)
-    // Map to same SemanticOp as scalar - execution will handle width
+    // Vector operations -- use dedicated SemanticOp variants where they
+    // differ from the scalar semantics.
+
+    // ---- MAC variants (must be checked before vmul/vneg) ----
+    // vaddmac/vaddmsc: acc1 = acc1 + acc2 +/- A * B
+    if lower.starts_with("vaddmac") || lower.starts_with("vaddmsc") {
+        return Some(SemanticOp::AddMac);
+    }
+    // vsubmac/vsubmsc: acc1 = acc1 - acc2 +/- A * B
+    if lower.starts_with("vsubmac") || lower.starts_with("vsubmsc") {
+        return Some(SemanticOp::SubMac);
+    }
+    // vnegmac/vnegmsc: acc += -(A * B) variants
+    if lower.starts_with("vnegmac") || lower.starts_with("vnegmsc") {
+        return Some(SemanticOp::NegMatMul);
+    }
+    // vmac: multiply-accumulate (acc += A * B)
+    if lower.starts_with("vmac") {
+        return Some(SemanticOp::Mac);
+    }
+    // vmsc: multiply-subtract-accumulate (acc -= A * B)
+    if lower.starts_with("vmsc") {
+        return Some(SemanticOp::MatMulSub);
+    }
+
+    // ---- Negate-arithmetic variants (must be before vneg) ----
+    if lower.starts_with("vnegmul") {
+        return Some(SemanticOp::NegMul);
+    }
+    if lower.starts_with("vnegadd") || lower.starts_with("vnegsub") {
+        return Some(SemanticOp::NegAdd);
+    }
+
+    // vaddsub: alternating add/subtract (FFT butterfly) -- approximate as Add
+    if lower.starts_with("vaddsub") {
+        return Some(SemanticOp::Add);
+    }
+
+    // ---- Conditional arithmetic (must be before vsub/comparison) ----
+    if lower.starts_with("vsub_lt") {
+        return Some(SemanticOp::SubLt);
+    }
+    if lower.starts_with("vsub_ge") {
+        return Some(SemanticOp::SubGe);
+    }
+    if lower.starts_with("vmaxdiff_lt") {
+        return Some(SemanticOp::MaxDiffLt);
+    }
+    if lower.starts_with("vmax_lt") {
+        return Some(SemanticOp::MaxLt);
+    }
+    if lower.starts_with("vmin_ge") {
+        return Some(SemanticOp::MinGe);
+    }
+    if lower.starts_with("vmin") {
+        return Some(SemanticOp::Min);
+    }
+    // vmax (standalone, must come after vmax_lt/vmaxdiff_lt checks)
+    if lower.starts_with("vmax") {
+        return Some(SemanticOp::Max);
+    }
+
+    // ---- Absolute value / conditional negate ----
+    if lower.starts_with("vabs_gtz") || lower.starts_with("vabs") {
+        return Some(SemanticOp::AbsGtz);
+    }
+    if lower.starts_with("vneg_gtz") {
+        return Some(SemanticOp::NegGtz);
+    }
+    if lower.starts_with("vbneg_ltz") || lower.starts_with("vbneg") {
+        return Some(SemanticOp::NegLtz);
+    }
+
+    // ---- Vector arithmetic (same semantics as scalar, but on vectors) ----
     if lower.starts_with("vadd") {
         return Some(SemanticOp::Add);
     }
     if lower.starts_with("vsub") {
         return Some(SemanticOp::Sub);
     }
-    if lower.starts_with("vmul") || lower.starts_with("vmac") || lower.starts_with("vmsc") {
+    if lower.starts_with("vmul") {
         return Some(SemanticOp::Mul);
     }
-    if lower.starts_with("vand") {
+    if lower.starts_with("vand") || lower.starts_with("vband") {
         return Some(SemanticOp::And);
     }
-    if lower.starts_with("vor") {
+    if lower.starts_with("vor") || lower.starts_with("vbor") {
         return Some(SemanticOp::Or);
     }
     if lower.starts_with("vxor") {
@@ -1324,7 +1396,7 @@ pub fn infer_semantic_from_mnemonic(mnemonic: &str) -> Option<SemanticOp> {
         return Some(SemanticOp::Sra);
     }
     if lower.starts_with("vsel") {
-        return Some(SemanticOp::Select);
+        return Some(SemanticOp::VectorSelect);
     }
     if lower.starts_with("vmov") {
         return Some(SemanticOp::Copy);
@@ -1362,10 +1434,7 @@ pub fn infer_semantic_from_mnemonic(mnemonic: &str) -> Option<SemanticOp> {
         return Some(SemanticOp::SetNe);
     }
 
-    // Vector abs/neg
-    if lower.starts_with("vabs") {
-        return Some(SemanticOp::Abs);
-    }
+    // Vector abs/neg (negate without conditional is plain Neg)
     if lower.starts_with("vneg") {
         return Some(SemanticOp::Neg);
     }
@@ -1375,7 +1444,7 @@ pub fn infer_semantic_from_mnemonic(mnemonic: &str) -> Option<SemanticOp> {
         return Some(SemanticOp::Ctlz);
     }
     if lower == "clb" || lower.starts_with("clb.") {
-        return Some(SemanticOp::Ctlz); // CLB (count leading bits) ~ CLZ variant
+        return Some(SemanticOp::Clb); // CLB (count leading bits) != CLZ
     }
 
     // Sign/zero extension (scalar)
@@ -1429,51 +1498,44 @@ pub fn infer_semantic_from_mnemonic(mnemonic: &str) -> Option<SemanticOp> {
         return Some(SemanticOp::Ret);
     }
 
-    // Vector boolean/bitwise ops (vband, vbor = vector boolean and/or)
-    if lower.starts_with("vband") {
-        return Some(SemanticOp::And);
+    // Vector data movement -- dedicated SemanticOp variants
+    if lower.starts_with("vshuffle") {
+        return Some(SemanticOp::Shuffle);
     }
-    if lower.starts_with("vbor") {
-        return Some(SemanticOp::Or);
-    }
-    if lower.starts_with("vbneg") {
-        return Some(SemanticOp::Neg);
-    }
-
-    // Vector conditional min/max (vmax_lt, vmin_ge, vmaxdiff_lt)
-    if lower.starts_with("vmax_lt") || lower.starts_with("vmaxdiff_lt") {
-        return Some(SemanticOp::SetLt);
-    }
-    if lower.starts_with("vmin_ge") {
-        return Some(SemanticOp::SetGe);
-    }
-
-    // Vector data movement (vshift, vshuffle, vconv, vunpack, vextbcst, vpush)
-    if lower.starts_with("vshift") || lower.starts_with("vshuffle") {
-        return Some(SemanticOp::Copy); // Data rearrangement
+    if lower.starts_with("vshift") {
+        return Some(SemanticOp::Align);
     }
     if lower.starts_with("vconv") || lower.starts_with("vfloor") || lower.starts_with("vceil")
         || lower.starts_with("vtrunc") || lower.starts_with("vround")
     {
-        return Some(SemanticOp::Copy); // Type conversion (including rounding variants)
+        return Some(SemanticOp::Convert);
     }
     if lower.starts_with("vunpack") {
-        return Some(SemanticOp::Load); // Unpack from load channel
+        return Some(SemanticOp::Unpack);
+    }
+    if lower.starts_with("vpack") {
+        return Some(SemanticOp::Pack);
     }
     if lower.starts_with("vextbcst") || lower.starts_with("vbcst") {
-        return Some(SemanticOp::Copy); // Extract-broadcast / broadcast
+        return Some(SemanticOp::VectorBroadcast);
+    }
+    if lower.starts_with("vextract") {
+        return Some(SemanticOp::VectorExtract);
+    }
+    if lower.starts_with("vinsert") {
+        return Some(SemanticOp::VectorInsert);
     }
     if lower.starts_with("vpush") {
-        return Some(SemanticOp::Copy); // Push vector to accumulator
+        return Some(SemanticOp::Ups);
     }
     if lower.starts_with("vsrs") {
-        return Some(SemanticOp::Copy); // Shift-round-saturate (acc -> vec)
+        return Some(SemanticOp::Srs);
     }
     if lower.starts_with("vups") {
-        return Some(SemanticOp::Copy); // Upshift (vec -> acc)
+        return Some(SemanticOp::Ups);
     }
     if lower == "vclr" || lower.starts_with("vclr.") {
-        return Some(SemanticOp::Copy); // Clear vector to zero
+        return Some(SemanticOp::VectorClear);
     }
 
     None
@@ -1866,8 +1928,8 @@ mod tests {
         assert_eq!(infer_semantic_from_mnemonic("ltu"), Some(SemanticOp::SetUlt));
         assert_eq!(infer_semantic_from_mnemonic("geu"), Some(SemanticOp::SetUge));
 
-        // Pointer ops (map to add)
-        assert_eq!(infer_semantic_from_mnemonic("paddb"), Some(SemanticOp::Add));
+        // Pointer ops
+        assert_eq!(infer_semantic_from_mnemonic("paddb"), Some(SemanticOp::PointerAdd));
 
         // Branch/call operations
         assert_eq!(infer_semantic_from_mnemonic("jl"), Some(SemanticOp::Call));
