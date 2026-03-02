@@ -1523,10 +1523,10 @@ def NOT_A_PATTERN {	// SomeOtherClass
             Some(SemanticOp::LockAcquire)
         );
 
-        // Pointer type prefix
+        // Pointer addition
         assert_eq!(
             extract_semantic_from_dag("dag PatternToMatch = (ptradd eP:$ptr, eM:$mod);"),
-            None // ptradd is not in from_sdnode()
+            Some(SemanticOp::PointerAdd)
         );
     }
 }

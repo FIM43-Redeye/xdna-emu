@@ -409,9 +409,15 @@ impl SemanticOp {
             "ctpop" => Self::Ctpop,
             "bswap" => Self::Bswap,
 
-            // Memory
+            // Floating-point arithmetic
+            "fadd" => Self::Add,
+            "fsub" => Self::Sub,
+            "fmul" => Self::Mul,
+
+            // Memory / pointer
             "load" => Self::Load,
             "store" => Self::Store,
+            "ptradd" => Self::PointerAdd,
 
             // Control
             "br" => Self::Br,
@@ -1128,6 +1134,10 @@ mod tests {
         assert_eq!(SemanticOp::from_sdnode("sra"), Some(SemanticOp::Sra));
         assert_eq!(SemanticOp::from_sdnode("ctlz"), Some(SemanticOp::Ctlz));
         assert_eq!(SemanticOp::from_sdnode("select"), Some(SemanticOp::Select));
+        assert_eq!(SemanticOp::from_sdnode("ptradd"), Some(SemanticOp::PointerAdd));
+        assert_eq!(SemanticOp::from_sdnode("fadd"), Some(SemanticOp::Add));
+        assert_eq!(SemanticOp::from_sdnode("fsub"), Some(SemanticOp::Sub));
+        assert_eq!(SemanticOp::from_sdnode("fmul"), Some(SemanticOp::Mul));
         assert_eq!(SemanticOp::from_sdnode("unknown_op"), None);
     }
 
