@@ -112,6 +112,10 @@ pub struct RunStats {
     pub hw_cascade_stopped_at: Option<usize>,
     /// Number of tests that were not attempted on hardware due to cascade.
     pub hw_cascade_skipped: usize,
+    // Ground truth comparison
+    pub gt_match: usize,
+    pub gt_diverge: usize,
+    pub gt_new: usize,
     // Per-test warnings (DMA queue full, parse errors, etc.)
     /// Total warnings across all tests.
     pub total_warnings: usize,
@@ -402,6 +406,20 @@ impl RunStats {
             println!("Correct:          {}", self.sim_correct);
             println!("Wrong:            {}", self.sim_wrong);
             println!("Error:            {} (build/invocation failures)", self.sim_error);
+        }
+
+        // Ground truth comparison
+        let gt_total = self.gt_match + self.gt_diverge + self.gt_new;
+        if gt_total > 0 {
+            println!("\n=== GROUND TRUTH ===");
+            println!("Compared:         {}", gt_total);
+            println!("Match:            {}", self.gt_match);
+            if self.gt_diverge > 0 {
+                println!("Diverge:          {}", self.gt_diverge);
+            }
+            if self.gt_new > 0 {
+                println!("New captures:     {}", self.gt_new);
+            }
         }
 
         // Differential summary (Peano vs Chess on HW, typically hw-only mode)

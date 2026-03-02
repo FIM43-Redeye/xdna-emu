@@ -372,6 +372,21 @@ fn process_test(
         auto_capture_reference(test, hw, ctx.reference_dir, compact);
     }
 
+    // --- Ground truth comparison ---
+    // Compare emulator output vs NPU output for ground truth verdict.
+    // Only runs when both are available (HW ran successfully + emu has output).
+    if let Some(hw) = capture_hw {
+        if let Some(ref r) = emu {
+            run_ground_truth_comparison(
+                &test.name,
+                r.raw_output.as_deref(),
+                &hw.output,
+                compact,
+                stats,
+            );
+        }
+    }
+
     // --- elfanalyzer ---
     if ctx.opts.elfanalyze && !compact {
         if let Some(ref tools) = ctx.aietools {
@@ -575,6 +590,103 @@ fn auto_capture_reference(
         Err(e) => {
             log::warn!("auto-capture: failed to write {}: {}", ref_path.display(), e);
         }
+    }
+}
+
+/// Compare emulator output against NPU output for ground truth verdict.
+///
+/// Loads prior ground truth if it exists (drift detection), saves new
+/// ground truth, then compares emulator vs NPU. Prints a verdict line.
+fn run_ground_truth_comparison(
+    test_name: &str,
+    emu_output: Option<&[u8]>,
+    npu_output: &[u8],
+    compact: bool,
+    stats: &mut RunStats,
+) {
+    use super::ground_truth::*;
+
+    let emu_out = match emu_output {
+        Some(out) if !out.is_empty() => out,
+        _ => return,
+    };
+    if npu_output.is_empty() {
+        return;
+    }
+
+    let gt_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("build/ground-truth")
+        .join(test_name);
+
+    // Check for drift vs stored ground truth
+    let prior = load_ground_truth(&gt_dir);
+    let drift = if let Some((ref _prior_trace, ref prior_output)) = prior {
+        let cmp = compare_output(prior_output, npu_output);
+        if !cmp.is_match() {
+            Some(format!("output changed ({} bytes differ)", cmp.differing_bytes))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Save new ground truth (NPU is always authoritative)
+    let trace = CanonicalTrace {
+        version: CURRENT_VERSION,
+        event_config: EventConfig::Base8,
+        tiles: HashMap::new(), // No trace data in default mode
+    };
+    let meta = CaptureMetadata {
+        captured_at: timestamp_now(),
+        kernel_hash: "unknown".into(),
+        driver_version: kernel_version(),
+        event_config: EventConfig::Base8,
+    };
+    if let Err(e) = save_ground_truth(&gt_dir, &trace, npu_output, &meta) {
+        log::warn!("ground-truth: failed to save for {}: {}", test_name, e);
+    }
+
+    // Compare emulator vs NPU (output layer only in default mode)
+    let output_cmp = compare_output(npu_output, emu_out);
+    let mut verdict = if output_cmp.is_match() {
+        GroundTruthVerdict::Match
+    } else {
+        GroundTruthVerdict::DivergeOutput {
+            first_diff: output_cmp.first_diff_byte.unwrap_or(0),
+            differing: output_cmp.differing_bytes,
+            total: output_cmp.total_bytes,
+        }
+    };
+
+    // Annotate with drift if present
+    if let (GroundTruthVerdict::Match, Some(d)) = (&verdict, drift) {
+        verdict = GroundTruthVerdict::MatchWithDrift { detail: d };
+    }
+
+    // First-capture override
+    if prior.is_none() {
+        verdict = GroundTruthVerdict::New;
+    }
+
+    // Track stats
+    match &verdict {
+        GroundTruthVerdict::Match | GroundTruthVerdict::MatchWithDrift { .. } => {
+            stats.gt_match += 1;
+        }
+        GroundTruthVerdict::New => {
+            stats.gt_new += 1;
+        }
+        _ => {
+            stats.gt_diverge += 1;
+        }
+    }
+
+    // Display
+    if compact {
+        print!("  [GT: {}]", verdict);
+    } else {
+        println!("      gt: {}", verdict);
     }
 }
 
