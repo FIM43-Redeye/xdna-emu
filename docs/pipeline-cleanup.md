@@ -76,7 +76,9 @@ full decode -> execute -> timing pipeline.
 - **Fix**: Consolidate pointer arithmetic in execute_semantic(). Move
   PointerAdd/PointerMov handlers from memory.rs. Merge the special
   padda/paddb tied-register pattern in execute_add().
-- **Status**: `[ ]`
+- **Status**: `[x]` -- PointerAdd/PointerMov moved to execute_semantic()
+  with deferred pipeline writes (queue_pointer_write). Handlers deleted
+  from MemoryUnit.
 
 ### 7. Dead hazard/stall infrastructure
 - **File**: `cycle_accurate.rs`
@@ -86,7 +88,9 @@ full decode -> execute -> timing pipeline.
   state never read back.
 - **Fix**: Delete or cfg-gate the dead methods. Remove the dead stall
   block. Keep record_* if hazard model is planned soon, otherwise gate.
-- **Status**: `[ ]`
+- **Status**: `[x]` -- Deleted check_hazards(), check_memory_conflict(),
+  execute_slot(), get_memory_address(), and dead stall block. Kept
+  record_writes() and record_memory_access() (feed stats).
 
 ---
 
@@ -98,7 +102,8 @@ full decode -> execute -> timing pipeline.
   high_nibble::*). Never referenced. Also `extract_reg()`/`extract_imm()`
   may be unused.
 - **Fix**: Delete module. Confirm helper functions have no callers.
-- **Status**: `[ ]`
+- **Status**: `[x]` -- Module deleted, including extract_reg() and
+  extract_imm() helpers.
 
 ### 9. OperationKey indirection layer
 - **File**: `src/interpreter/timing/latency.rs`
