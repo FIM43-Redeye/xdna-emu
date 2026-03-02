@@ -926,11 +926,14 @@ mod tests {
             }
         }
 
-        // Store instructions: mayStore=true
-        if let Some(st) = all.iter().find(|e| e.name.starts_with("ST_S") || e.name.starts_with("VST")) {
+        // Store instructions: mayStore=true && !mayLoad (pure stores).
+        // Some stores have both mayLoad and mayStore (post-increment addressing),
+        // which structural inference intentionally skips to avoid misclassifying.
+        if let Some(st) = all.iter().find(|e| e.may_store && !e.may_load
+            && (e.name.starts_with("ST_") || e.name.starts_with("VST")))
+        {
             assert_eq!(st.semantic, Some(SemanticOp::Store),
-                "{} should be Store (mayStore=true)", st.name);
-            assert!(st.may_store, "{} should have may_store flag", st.name);
+                "{} should be Store (mayStore=true, mayLoad=false)", st.name);
         }
 
         // Arithmetic: ADD gets semantic from Pat<> records (no structural signal)

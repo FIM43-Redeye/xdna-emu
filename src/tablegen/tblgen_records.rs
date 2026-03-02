@@ -627,6 +627,17 @@ impl InstrRecord {
         // without lr; the mnemonic distinguishes conditional from unconditional.
         let semantic = refine_branch_semantic(&self.mnemonic, semantic);
 
+        // Mnemonic-based fallback for pointer arithmetic. PADD instructions
+        // (padda, paddb, padds, padda.2d, etc.) have no Pat<> on the concrete
+        // encoding (patterns target PADD_*_pseudo which expands to these) and
+        // no structural flags (no mayLoad/mayStore/hasDelaySlot). The mnemonic
+        // is the only reliable signal.
+        let semantic = if semantic.is_none() && self.mnemonic.starts_with("padd") {
+            Some(SemanticOp::PointerAdd)
+        } else {
+            semantic
+        };
+
         // Cross-validate: isBranch/isCall/isReturn flags (set on Pseudo variants)
         // should agree with hasDelaySlot-based inference on hardware encodings.
         // These flags are secondary (Pseudos don't have hardware encodings), but
