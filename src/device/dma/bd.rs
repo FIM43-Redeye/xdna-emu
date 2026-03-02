@@ -16,11 +16,6 @@ use crate::device::tile::TileType;
 /// Consistent across compute, memtile, and shim; also derivable from regdb.
 pub const BD_SPACING: u64 = 0x20;
 
-/// Number of registers per BD
-pub const BD_REGS_COMPUTE: usize = 6;
-pub const BD_REGS_MEMTILE: usize = 8;
-pub const BD_REGS_SHIM: usize = 8;
-
 /// Parsed Buffer Descriptor fields (common to all tile types).
 ///
 /// All addresses and stepsizes are in 32-bit WORD units.
@@ -152,7 +147,8 @@ impl BufferDescriptor {
     /// All bit positions come from `BdFieldLayout::from_regdb()` rather than
     /// hardcoded shift/mask constants. This matches the pattern used by `parse_shim()`.
     fn parse_compute(words: &[u32]) -> Self {
-        assert!(words.len() >= BD_REGS_COMPUTE, "Compute BD needs 6 registers");
+        let expected = bd_register_count(TileType::Compute);
+        assert!(words.len() >= expected, "Compute BD needs {} registers", expected);
 
         let lay = &crate::device::regdb::device_reg_layout().memory_bd;
 
@@ -223,7 +219,8 @@ impl BufferDescriptor {
     /// module). All bit positions come from `MemTileBdFieldLayout::from_regdb()`
     /// rather than hardcoded shift/mask constants.
     fn parse_memtile(words: &[u32]) -> Self {
-        assert!(words.len() >= BD_REGS_MEMTILE, "MemTile BD needs 8 registers");
+        let expected = bd_register_count(TileType::MemTile);
+        assert!(words.len() >= expected, "MemTile BD needs {} registers", expected);
 
         let lay = &crate::device::regdb::device_reg_layout().memtile_bd;
 
@@ -301,7 +298,8 @@ impl BufferDescriptor {
     /// address (split across two registers), and AXI parameters (burst length,
     /// SMID, AxCache, AxQoS).
     fn parse_shim(words: &[u32]) -> Self {
-        assert!(words.len() >= BD_REGS_SHIM, "Shim BD needs 8 registers");
+        let expected = bd_register_count(TileType::Shim);
+        assert!(words.len() >= expected, "Shim BD needs {} registers", expected);
 
         let lay = &crate::device::regdb::device_reg_layout().shim_bd;
 
@@ -513,11 +511,16 @@ pub fn bd_base_address(tile_type: TileType) -> u64 {
     }
 }
 
-/// Get number of registers per BD for a tile type
+/// Get number of registers per BD for a tile type (derived from regdb).
+///
+/// Counts DMA_BD0_N registers in the register database for each module type.
+/// The regdb computes this at init time and stores in DeviceRegLayout.
 pub fn bd_register_count(tile_type: TileType) -> usize {
+    let lay = crate::device::regdb::device_reg_layout();
     match tile_type {
-        TileType::Compute => BD_REGS_COMPUTE,
-        TileType::MemTile | TileType::Shim => BD_REGS_MEMTILE, // Both use 8
+        TileType::Compute => lay.memory_bd_words,
+        TileType::MemTile => lay.memtile_bd_words,
+        TileType::Shim => lay.shim_bd_words,
     }
 }
 

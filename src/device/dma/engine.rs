@@ -34,11 +34,7 @@
 
 use std::collections::VecDeque;
 
-use super::{
-    BdConfig, ChannelType, DmaError, DmaResult,
-    COMPUTE_S2MM_CHANNELS, COMPUTE_MM2S_CHANNELS,
-    MEM_TILE_S2MM_CHANNELS, MEM_TILE_MM2S_CHANNELS,
-};
+use super::{BdConfig, ChannelType, DmaError, DmaResult};
 use super::compression;
 use super::transfer::{Transfer, TransferDirection, TransferEndpoint, PadAction};
 use super::channel::{ChannelFsm, ChannelContext, CompletionInfo};
@@ -289,6 +285,14 @@ pub struct DmaEngine {
     /// Used by resolve_lock_id() for cross-tile lock addressing.
     num_locks: u8,
 
+    /// Number of S2MM channels (stream-to-memory) for this tile.
+    /// Derived from architecture configuration at construction.
+    s2mm_count: usize,
+
+    /// Number of MM2S channels (memory-to-stream) for this tile.
+    /// Derived from architecture configuration at construction.
+    mm2s_count: usize,
+
     /// Number of memory banks for this tile type (8 for compute, 16 for MemTile).
     /// Used to compute bank indices for conflict detection.
     num_banks: usize,
@@ -305,9 +309,10 @@ impl DmaEngine {
     /// `num_channels` and `num_bds` come from the architecture configuration
     /// (ArchConfig) rather than compile-time constants. The caller is
     /// responsible for providing the correct values for the tile type.
-    pub fn new(col: u8, row: u8, tile_type: TileType, num_channels: usize, num_bds: usize, num_locks: u8) -> Self {
-        log::debug!("DmaEngine::new col={} row={} tile_type={:?} num_channels={} num_bds={} num_locks={}",
-            col, row, tile_type, num_channels, num_bds, num_locks);
+    pub fn new(col: u8, row: u8, tile_type: TileType, s2mm_channels: usize, mm2s_channels: usize, num_bds: usize, num_locks: u8) -> Self {
+        let num_channels = s2mm_channels + mm2s_channels;
+        log::debug!("DmaEngine::new col={} row={} tile_type={:?} num_channels={} (s2mm={}, mm2s={}) num_bds={} num_locks={}",
+            col, row, tile_type, num_channels, s2mm_channels, mm2s_channels, num_bds, num_locks);
 
         let channels = (0..num_channels)
             .map(|i| ChannelContext::new(i as u8))
@@ -326,6 +331,8 @@ impl DmaEngine {
             lock_timing: None,
             current_cycle: 0,
             trace_events: Vec::new(),
+            s2mm_count: s2mm_channels,
+            mm2s_count: mm2s_channels,
             num_locks,
             num_banks: match tile_type {
                 TileType::Compute => crate::device::aie2_spec::COMPUTE_TILE_MEMORY_BANKS,
@@ -341,20 +348,17 @@ impl DmaEngine {
     /// Uses hardcoded channel/BD counts matching Phoenix/HawkPoint.
     /// Production code should use `new()` with ArchConfig-derived values.
     pub fn new_compute_tile(col: u8, row: u8) -> Self {
-        Self::new(col, row, TileType::Compute,
-            COMPUTE_S2MM_CHANNELS + COMPUTE_MM2S_CHANNELS, 16, 16)
+        Self::new(col, row, TileType::Compute, 2, 2, 16, 16)
     }
 
     /// Create a new DMA engine for a memory tile (NPU1/AIE2 defaults).
     pub fn new_mem_tile(col: u8, row: u8) -> Self {
-        Self::new(col, row, TileType::MemTile,
-            MEM_TILE_S2MM_CHANNELS + MEM_TILE_MM2S_CHANNELS, 48, 64)
+        Self::new(col, row, TileType::MemTile, 6, 6, 48, 64)
     }
 
     /// Create a new DMA engine for a shim tile (NPU1/AIE2 defaults).
     pub fn new_shim_tile(col: u8, row: u8) -> Self {
-        Self::new(col, row, TileType::Shim,
-            COMPUTE_S2MM_CHANNELS + COMPUTE_MM2S_CHANNELS, 16, 0)
+        Self::new(col, row, TileType::Shim, 2, 2, 16, 0)
     }
 
     /// Configure custom timing parameters.
@@ -435,7 +439,7 @@ impl DmaEngine {
 
     /// Get the channel type (S2MM or MM2S).
     pub fn channel_type(&self, channel: ChannelId) -> ChannelType {
-        ChannelType::from_channel_index(channel as usize, self.tile_type)
+        ChannelType::from_channel_index(channel as usize, self.s2mm_count)
     }
 
     /// Resolve a BD lock ID to a local lock index on the own tile.
@@ -648,14 +652,8 @@ impl DmaEngine {
         // Convert relative channel to absolute channel index
         // For compute tiles: S2MM = 0-1, MM2S = 2-3
         // For mem tiles: S2MM = 0-5, MM2S = 6-11
-        let s2mm_count = if self.tile_type.is_mem_tile() {
-            MEM_TILE_S2MM_CHANNELS
-        } else {
-            COMPUTE_S2MM_CHANNELS
-        };
-
         let ch_idx = if is_mm2s {
-            s2mm_count + relative_channel as usize
+            self.s2mm_count + relative_channel as usize
         } else {
             relative_channel as usize
         };
@@ -2478,44 +2476,31 @@ impl DmaEngine {
         match self.tile_type {
             TileType::Compute => super::stream_io::compute::mm2s_slave_port(ch),
             TileType::MemTile => super::stream_io::memtile::mm2s_slave_port(ch),
-            TileType::Shim => {
-                // Shim MM2S typically goes to South ports for NoC access
-                // This mapping may need adjustment based on CDO configuration
-                super::stream_io::shim::slave::SOUTH_0 + ch
-            }
+            TileType::Shim => super::stream_io::shim::mm2s_slave_port(ch),
         }
     }
 
     /// Get the master port that S2MM channel `ch` receives data FROM.
     ///
-    /// For compute tiles: ch0 ← master port 1, ch1 ← master port 2
-    /// For memtiles: ch0-5 ← master ports 0-5
-    /// For shim tiles: ch0 ← master port 2, ch1 ← master port 3 (South ports)
+    /// For compute tiles: ch0 <- master port 1, ch1 <- master port 2
+    /// For memtiles: ch0-5 <- master ports 0-5
+    /// For shim tiles: ch0 <- master port 2, ch1 <- master port 3 (South ports)
     pub fn s2mm_master_port(&self, ch: u8) -> u8 {
         match self.tile_type {
             TileType::Compute => super::stream_io::compute::s2mm_master_port(ch),
             TileType::MemTile => super::stream_io::memtile::s2mm_master_port(ch),
-            TileType::Shim => {
-                // Shim S2MM typically receives from South ports
-                super::stream_io::shim::master::SOUTH_0 + ch
-            }
+            TileType::Shim => super::stream_io::shim::s2mm_master_port(ch),
         }
     }
 
-    /// Get the number of S2MM channels for this tile type.
+    /// Get the number of S2MM channels for this tile.
     pub fn s2mm_channel_count(&self) -> usize {
-        match self.tile_type {
-            TileType::Compute | TileType::Shim => COMPUTE_S2MM_CHANNELS,
-            TileType::MemTile => MEM_TILE_S2MM_CHANNELS,
-        }
+        self.s2mm_count
     }
 
-    /// Get the number of MM2S channels for this tile type.
+    /// Get the number of MM2S channels for this tile.
     pub fn mm2s_channel_count(&self) -> usize {
-        match self.tile_type {
-            TileType::Compute | TileType::Shim => COMPUTE_MM2S_CHANNELS,
-            TileType::MemTile => MEM_TILE_MM2S_CHANNELS,
-        }
+        self.mm2s_count
     }
 
     /// Convert a StreamWord to StreamData for a given channel.

@@ -77,27 +77,13 @@ pub use engine::{DmaEngine, ChannelState, ChannelId, StreamData, TaskCompleteTok
 pub use channel::{ChannelFsm, ChannelContext, CompletionInfo};
 pub use timing::DmaTimingConfig;
 
-use super::tile::TileType;
-
 // ============================================================================
 // DMA constants
 //
 // BD counts come from ArchConfig (data-driven from mlir-aie device models).
-// Channel counts are kept as constants pending future data-driving.
+// Channel counts are stored per-DmaEngine at construction from ArchConfig.
 // Values validated against mlir-aie by model::validate_against_spec().
 // ============================================================================
-
-/// Number of S2MM channels for compute tiles.
-pub const COMPUTE_S2MM_CHANNELS: usize = 2;
-
-/// Number of MM2S channels for compute tiles.
-pub const COMPUTE_MM2S_CHANNELS: usize = 2;
-
-/// Number of S2MM channels for memory tiles.
-pub const MEM_TILE_S2MM_CHANNELS: usize = 6;
-
-/// Number of MM2S channels for memory tiles.
-pub const MEM_TILE_MM2S_CHANNELS: usize = 6;
 
 /// DMA data width in bits.
 pub const DMA_DATA_WIDTH_BITS: usize = 32;
@@ -270,17 +256,11 @@ pub enum ChannelType {
 }
 
 impl ChannelType {
-    /// Get the channel type for a channel index.
+    /// Get the channel type for a channel index given the S2MM channel count.
     ///
-    /// For compute/shim tiles: channels 0-1 are S2MM, 2-3 are MM2S.
-    /// For memory tiles: channels 0-5 are S2MM, 6-11 are MM2S.
-    pub fn from_channel_index(idx: usize, tile_type: TileType) -> Self {
-        let s2mm_count = if tile_type.is_mem_tile() {
-            MEM_TILE_S2MM_CHANNELS
-        } else {
-            COMPUTE_S2MM_CHANNELS
-        };
-
+    /// For compute/shim tiles: s2mm_count=2, so channels 0-1 are S2MM, 2-3 are MM2S.
+    /// For memory tiles: s2mm_count=6, so channels 0-5 are S2MM, 6-11 are MM2S.
+    pub fn from_channel_index(idx: usize, s2mm_count: usize) -> Self {
         if idx < s2mm_count {
             ChannelType::S2MM
         } else {
@@ -424,18 +404,19 @@ mod tests {
 
     #[test]
     fn test_channel_type_compute() {
-        assert_eq!(ChannelType::from_channel_index(0, TileType::Compute), ChannelType::S2MM);
-        assert_eq!(ChannelType::from_channel_index(1, TileType::Compute), ChannelType::S2MM);
-        assert_eq!(ChannelType::from_channel_index(2, TileType::Compute), ChannelType::MM2S);
-        assert_eq!(ChannelType::from_channel_index(3, TileType::Compute), ChannelType::MM2S);
+        // Compute: 2 S2MM + 2 MM2S
+        assert_eq!(ChannelType::from_channel_index(0, 2), ChannelType::S2MM);
+        assert_eq!(ChannelType::from_channel_index(1, 2), ChannelType::S2MM);
+        assert_eq!(ChannelType::from_channel_index(2, 2), ChannelType::MM2S);
+        assert_eq!(ChannelType::from_channel_index(3, 2), ChannelType::MM2S);
     }
 
     #[test]
     fn test_channel_type_mem_tile() {
-        // Mem tile has 6 S2MM and 6 MM2S
-        assert_eq!(ChannelType::from_channel_index(0, TileType::MemTile), ChannelType::S2MM);
-        assert_eq!(ChannelType::from_channel_index(5, TileType::MemTile), ChannelType::S2MM);
-        assert_eq!(ChannelType::from_channel_index(6, TileType::MemTile), ChannelType::MM2S);
-        assert_eq!(ChannelType::from_channel_index(11, TileType::MemTile), ChannelType::MM2S);
+        // Mem tile: 6 S2MM + 6 MM2S
+        assert_eq!(ChannelType::from_channel_index(0, 6), ChannelType::S2MM);
+        assert_eq!(ChannelType::from_channel_index(5, 6), ChannelType::S2MM);
+        assert_eq!(ChannelType::from_channel_index(6, 6), ChannelType::MM2S);
+        assert_eq!(ChannelType::from_channel_index(11, 6), ChannelType::MM2S);
     }
 }

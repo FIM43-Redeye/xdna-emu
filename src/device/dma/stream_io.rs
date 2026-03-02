@@ -2,8 +2,13 @@
 //!
 //! This module defines:
 //! - Stream word representation with TLAST signaling
-//! - Packet header format per AM020 Table 2
-//! - Stream switch port mappings for all tile types
+//! - DMA-to-stream-switch port mapping functions (derived from generated data)
+//! - Inter-tile connection mappings (derived from generated range constants)
+//!
+//! Port layouts and ranges are generated at build time from AM025 register
+//! definitions in `gen_stream_ports.rs` and `gen_stream_ranges.rs`, included
+//! via `aie2_spec`. This module provides DMA-specific convenience functions
+//! on top of that generated data.
 //!
 //! Reference: AMD AM020/AM025 and docs/dma-reference.md
 
@@ -62,250 +67,151 @@ impl StreamWord {
 }
 
 // ============================================================================
-// Stream Switch Port Mappings
+// DMA Port Mapping Functions
 // ============================================================================
 //
-// These constants define how DMA channels connect to stream switch ports.
-// Master ports carry data OUT from the switch, Slave ports carry data IN.
+// These map DMA channel indices to stream switch port indices. Port layouts
+// are defined by the generated arrays in aie2_spec (from AM025).
 
-/// Compute Tile port mappings
+/// Compute tile DMA port mappings (derived from gen_stream_ranges.rs).
 pub mod compute {
-    /// Number of master ports (data OUT from switch)
-    pub const MASTER_PORT_COUNT: usize = 23;
-    /// Number of slave ports (data IN to switch)
-    pub const SLAVE_PORT_COUNT: usize = 25;
+    use crate::device::aie2_spec::stream_switch::compute as ranges;
 
-    /// Master ports (switch outputs TO these destinations)
-    pub mod master {
-        pub const CORE: u8 = 0;
-        pub const DMA_0: u8 = 1;       // S2MM ch0 receives FROM switch
-        pub const DMA_1: u8 = 2;       // S2MM ch1 receives FROM switch
-        pub const TILE_CTRL: u8 = 3;
-        pub const FIFO_0: u8 = 4;
-        pub const SOUTH_0: u8 = 5;
-        pub const SOUTH_1: u8 = 6;
-        pub const SOUTH_2: u8 = 7;
-        pub const SOUTH_3: u8 = 8;
-        pub const WEST_0: u8 = 9;
-        pub const WEST_1: u8 = 10;
-        pub const WEST_2: u8 = 11;
-        pub const WEST_3: u8 = 12;
-        pub const NORTH_0: u8 = 13;
-        pub const NORTH_1: u8 = 14;
-        pub const NORTH_2: u8 = 15;
-        pub const NORTH_3: u8 = 16;
-        pub const NORTH_4: u8 = 17;
-        pub const NORTH_5: u8 = 18;
-        pub const EAST_0: u8 = 19;
-        pub const EAST_1: u8 = 20;
-        pub const EAST_2: u8 = 21;
-        pub const EAST_3: u8 = 22;
-    }
+    /// Port count derived from generated port arrays.
+    pub const MASTER_PORT_COUNT: usize = crate::device::aie2_spec::COMPUTE_MASTER_PORTS.len();
+    /// Port count derived from generated port arrays.
+    pub const SLAVE_PORT_COUNT: usize = crate::device::aie2_spec::COMPUTE_SLAVE_PORTS.len();
 
-    /// Slave ports (switch receives FROM these sources)
-    pub mod slave {
-        pub const CORE: u8 = 0;
-        pub const DMA_0: u8 = 1;       // MM2S ch0 sends TO switch
-        pub const DMA_1: u8 = 2;       // MM2S ch1 sends TO switch
-        pub const TILE_CTRL: u8 = 3;
-        pub const FIFO_0: u8 = 4;
-        pub const SOUTH_0: u8 = 5;
-        pub const SOUTH_1: u8 = 6;
-        pub const SOUTH_2: u8 = 7;
-        pub const SOUTH_3: u8 = 8;
-        pub const SOUTH_4: u8 = 9;
-        pub const SOUTH_5: u8 = 10;
-        pub const WEST_0: u8 = 11;
-        pub const WEST_1: u8 = 12;
-        pub const WEST_2: u8 = 13;
-        pub const WEST_3: u8 = 14;
-        pub const NORTH_0: u8 = 15;
-        pub const NORTH_1: u8 = 16;
-        pub const NORTH_2: u8 = 17;
-        pub const NORTH_3: u8 = 18;
-        pub const EAST_0: u8 = 19;
-        pub const EAST_1: u8 = 20;
-        pub const EAST_2: u8 = 21;
-        pub const EAST_3: u8 = 22;
-        pub const AIE_TRACE: u8 = 23;
-        pub const MEM_TRACE: u8 = 24;
-    }
-
-    /// Get master port for S2MM channel (receives data FROM switch)
+    /// Get master port for S2MM channel (receives data FROM switch).
+    /// S2MM channels map to DMA master ports starting at DMA_MASTER_START.
     pub fn s2mm_master_port(channel: u8) -> u8 {
-        match channel {
-            0 => master::DMA_0,
-            1 => master::DMA_1,
-            _ => panic!("Invalid S2MM channel {} for compute tile", channel),
-        }
+        assert!(
+            ranges::DMA_MASTER_START + channel <= ranges::DMA_MASTER_END,
+            "Invalid S2MM channel {} for compute tile (DMA master range {}-{})",
+            channel, ranges::DMA_MASTER_START, ranges::DMA_MASTER_END
+        );
+        ranges::DMA_MASTER_START + channel
     }
 
-    /// Get slave port for MM2S channel (sends data TO switch)
+    /// Get slave port for MM2S channel (sends data TO switch).
+    /// MM2S channels map to DMA slave ports starting at DMA_SLAVE_START.
     pub fn mm2s_slave_port(channel: u8) -> u8 {
-        match channel {
-            0 => slave::DMA_0,
-            1 => slave::DMA_1,
-            _ => panic!("Invalid MM2S channel {} for compute tile", channel),
-        }
+        assert!(
+            ranges::DMA_SLAVE_START + channel <= ranges::DMA_SLAVE_END,
+            "Invalid MM2S channel {} for compute tile (DMA slave range {}-{})",
+            channel, ranges::DMA_SLAVE_START, ranges::DMA_SLAVE_END
+        );
+        ranges::DMA_SLAVE_START + channel
     }
 }
 
-/// MemTile port mappings
+/// MemTile DMA port mappings (derived from gen_stream_ranges.rs).
 pub mod memtile {
-    /// Number of master ports
-    pub const MASTER_PORT_COUNT: usize = 17;
-    /// Number of slave ports
-    pub const SLAVE_PORT_COUNT: usize = 18;
+    use crate::device::aie2_spec::stream_switch::mem_tile as ranges;
 
-    /// Master ports
-    pub mod master {
-        pub const DMA_0: u8 = 0;       // S2MM ch0
-        pub const DMA_1: u8 = 1;       // S2MM ch1
-        pub const DMA_2: u8 = 2;       // S2MM ch2
-        pub const DMA_3: u8 = 3;       // S2MM ch3
-        pub const DMA_4: u8 = 4;       // S2MM ch4
-        pub const DMA_5: u8 = 5;       // S2MM ch5
-        pub const TILE_CTRL: u8 = 6;
-        pub const SOUTH_0: u8 = 7;
-        pub const SOUTH_1: u8 = 8;
-        pub const SOUTH_2: u8 = 9;
-        pub const SOUTH_3: u8 = 10;
-        pub const NORTH_0: u8 = 11;
-        pub const NORTH_1: u8 = 12;
-        pub const NORTH_2: u8 = 13;
-        pub const NORTH_3: u8 = 14;
-        pub const NORTH_4: u8 = 15;
-        pub const NORTH_5: u8 = 16;
-    }
+    /// Port count derived from generated port arrays.
+    pub const MASTER_PORT_COUNT: usize = crate::device::aie2_spec::MEMTILE_MASTER_PORTS.len();
+    /// Port count derived from generated port arrays.
+    pub const SLAVE_PORT_COUNT: usize = crate::device::aie2_spec::MEMTILE_SLAVE_PORTS.len();
 
-    /// Slave ports
-    pub mod slave {
-        pub const DMA_0: u8 = 0;       // MM2S ch0
-        pub const DMA_1: u8 = 1;       // MM2S ch1
-        pub const DMA_2: u8 = 2;       // MM2S ch2
-        pub const DMA_3: u8 = 3;       // MM2S ch3
-        pub const DMA_4: u8 = 4;       // MM2S ch4
-        pub const DMA_5: u8 = 5;       // MM2S ch5
-        pub const TILE_CTRL: u8 = 6;
-        pub const SOUTH_0: u8 = 7;
-        pub const SOUTH_1: u8 = 8;
-        pub const SOUTH_2: u8 = 9;
-        pub const SOUTH_3: u8 = 10;
-        pub const SOUTH_4: u8 = 11;
-        pub const SOUTH_5: u8 = 12;
-        pub const NORTH_0: u8 = 13;
-        pub const NORTH_1: u8 = 14;
-        pub const NORTH_2: u8 = 15;
-        pub const NORTH_3: u8 = 16;
-        pub const TRACE: u8 = 17;
-    }
-
-    /// Get master port for S2MM channel
+    /// Get master port for S2MM channel.
+    /// MemTile DMA master ports start at DMA_MASTER_START (0).
     pub fn s2mm_master_port(channel: u8) -> u8 {
-        assert!(channel < 6, "Invalid S2MM channel {} for memtile", channel);
-        channel // DMA_0 through DMA_5 are ports 0-5
+        assert!(
+            ranges::DMA_MASTER_START + channel <= ranges::DMA_MASTER_END,
+            "Invalid S2MM channel {} for memtile (DMA master range {}-{})",
+            channel, ranges::DMA_MASTER_START, ranges::DMA_MASTER_END
+        );
+        ranges::DMA_MASTER_START + channel
     }
 
-    /// Get slave port for MM2S channel
+    /// Get slave port for MM2S channel.
+    /// MemTile DMA slave ports start at DMA_SLAVE_START (0).
     pub fn mm2s_slave_port(channel: u8) -> u8 {
-        assert!(channel < 6, "Invalid MM2S channel {} for memtile", channel);
-        channel // DMA_0 through DMA_5 are ports 0-5
+        assert!(
+            ranges::DMA_SLAVE_START + channel <= ranges::DMA_SLAVE_END,
+            "Invalid MM2S channel {} for memtile (DMA slave range {}-{})",
+            channel, ranges::DMA_SLAVE_START, ranges::DMA_SLAVE_END
+        );
+        ranges::DMA_SLAVE_START + channel
     }
 }
 
-/// Shim Tile port mappings
+/// Shim tile DMA port mappings.
+///
+/// Shim DMA ports come through the shim_mux (not the switchbox), so
+/// gen_stream_ranges.rs does not have DMA_MASTER/SLAVE ranges for shim.
+/// The DMA channels map to South-facing switchbox ports for NoC access.
 pub mod shim {
-    /// Master ports
-    pub mod master {
-        pub const FIFO: u8 = 0;
-        pub const TILE_CTRL: u8 = 1;
-        pub const SOUTH_0: u8 = 2;
-        pub const SOUTH_1: u8 = 3;
-        pub const SOUTH_2: u8 = 4;
-        pub const SOUTH_3: u8 = 5;
-        pub const SOUTH_4: u8 = 6;
-        pub const SOUTH_5: u8 = 7;
-        pub const WEST_0: u8 = 8;
-        pub const WEST_1: u8 = 9;
-        pub const WEST_2: u8 = 10;
-        pub const WEST_3: u8 = 11;
-        pub const NORTH_0: u8 = 12;
-        pub const NORTH_1: u8 = 13;
-        pub const NORTH_2: u8 = 14;
-        pub const NORTH_3: u8 = 15;
-        pub const NORTH_4: u8 = 16;
-        pub const NORTH_5: u8 = 17;
-        pub const EAST_0: u8 = 18;
-        pub const EAST_1: u8 = 19;
-        pub const EAST_2: u8 = 20;
-        pub const EAST_3: u8 = 21;
+    use crate::device::aie2_spec::stream_switch::shim as ranges;
+
+    /// Get master port for S2MM channel (shim receives from NoC via South).
+    pub fn s2mm_master_port(channel: u8) -> u8 {
+        assert!(
+            ranges::SOUTH_MASTER_START + channel <= ranges::SOUTH_MASTER_END,
+            "Invalid S2MM channel {} for shim (South master range {}-{})",
+            channel, ranges::SOUTH_MASTER_START, ranges::SOUTH_MASTER_END
+        );
+        ranges::SOUTH_MASTER_START + channel
     }
 
-    /// Slave ports
-    pub mod slave {
-        pub const FIFO: u8 = 0;
-        pub const TILE_CTRL: u8 = 1;
-        pub const SOUTH_0: u8 = 2;
-        pub const SOUTH_1: u8 = 3;
-        pub const SOUTH_2: u8 = 4;
-        pub const SOUTH_3: u8 = 5;
-        pub const SOUTH_4: u8 = 6;
-        pub const SOUTH_5: u8 = 7;
-        pub const SOUTH_6: u8 = 8;
-        pub const SOUTH_7: u8 = 9;
-        pub const WEST_0: u8 = 10;
-        pub const WEST_1: u8 = 11;
-        pub const WEST_2: u8 = 12;
-        pub const WEST_3: u8 = 13;
-        pub const NORTH_0: u8 = 14;
-        pub const NORTH_1: u8 = 15;
-        pub const NORTH_2: u8 = 16;
-        pub const NORTH_3: u8 = 17;
-        pub const EAST_0: u8 = 18;
-        pub const EAST_1: u8 = 19;
-        pub const EAST_2: u8 = 20;
-        pub const EAST_3: u8 = 21;
-        pub const TRACE: u8 = 22;
+    /// Get slave port for MM2S channel (shim sends to NoC via South).
+    pub fn mm2s_slave_port(channel: u8) -> u8 {
+        assert!(
+            ranges::SOUTH_SLAVE_START + channel <= ranges::SOUTH_SLAVE_END,
+            "Invalid MM2S channel {} for shim (South slave range {}-{})",
+            channel, ranges::SOUTH_SLAVE_START, ranges::SOUTH_SLAVE_END
+        );
+        ranges::SOUTH_SLAVE_START + channel
     }
 }
 
 // ============================================================================
 // Inter-Tile Connection Mappings
 // ============================================================================
+//
+// These define how ports on adjacent tiles connect. All range values come
+// from gen_stream_ranges.rs (derived from AM025 port layout arrays).
 
-/// Inter-tile stream connections (which ports connect between adjacent tiles)
+/// Inter-tile stream connections (which ports connect between adjacent tiles).
 pub mod connections {
-    /// Shim North masters [12-17] connect to MemTile South slaves [7-12]
+    use crate::device::aie2_spec::stream_switch::{shim, mem_tile, compute};
+
+    /// Shim North masters connect to MemTile South slaves.
     pub fn shim_north_to_memtile_south(shim_master: u8) -> Option<u8> {
-        if (12..=17).contains(&shim_master) {
-            Some(shim_master - 12 + 7) // 12->7, 13->8, ..., 17->12
+        let range = shim::NORTH_MASTER_START..=shim::NORTH_MASTER_END;
+        if range.contains(&shim_master) {
+            Some(shim_master - shim::NORTH_MASTER_START + mem_tile::SOUTH_SLAVE_START)
         } else {
             None
         }
     }
 
-    /// MemTile North masters [11-16] connect to Compute South slaves [5-10]
+    /// MemTile North masters connect to Compute South slaves.
     pub fn memtile_north_to_compute_south(memtile_master: u8) -> Option<u8> {
-        if (11..=16).contains(&memtile_master) {
-            Some(memtile_master - 11 + 5) // 11->5, 12->6, ..., 16->10
+        let range = mem_tile::NORTH_MASTER_START..=mem_tile::NORTH_MASTER_END;
+        if range.contains(&memtile_master) {
+            Some(memtile_master - mem_tile::NORTH_MASTER_START + compute::SOUTH_SLAVE_START)
         } else {
             None
         }
     }
 
-    /// Compute South masters [5-8] connect to MemTile North slaves [13-16]
+    /// Compute South masters connect to MemTile North slaves.
     pub fn compute_south_to_memtile_north(compute_master: u8) -> Option<u8> {
-        if (5..=8).contains(&compute_master) {
-            Some(compute_master - 5 + 13) // 5->13, 6->14, 7->15, 8->16
+        let range = compute::SOUTH_MASTER_START..=compute::SOUTH_MASTER_END;
+        if range.contains(&compute_master) {
+            Some(compute_master - compute::SOUTH_MASTER_START + mem_tile::NORTH_SLAVE_START)
         } else {
             None
         }
     }
 
-    /// MemTile South masters [7-10] connect to Shim North slaves [14-17]
+    /// MemTile South masters connect to Shim North slaves.
     pub fn memtile_south_to_shim_north(memtile_master: u8) -> Option<u8> {
-        if (7..=10).contains(&memtile_master) {
-            Some(memtile_master - 7 + 14) // 7->14, 8->15, 9->16, 10->17
+        let range = mem_tile::SOUTH_MASTER_START..=mem_tile::SOUTH_MASTER_END;
+        if range.contains(&memtile_master) {
+            Some(memtile_master - mem_tile::SOUTH_MASTER_START + shim::NORTH_SLAVE_START)
         } else {
             None
         }
@@ -315,6 +221,7 @@ pub mod connections {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::aie2_spec;
 
     #[test]
     fn test_stream_word() {
@@ -328,18 +235,24 @@ mod tests {
 
     #[test]
     fn test_compute_port_mappings() {
-        // S2MM channels receive from master ports
-        assert_eq!(compute::s2mm_master_port(0), compute::master::DMA_0);
-        assert_eq!(compute::s2mm_master_port(1), compute::master::DMA_1);
+        // S2MM channels map to DMA master ports (1, 2)
+        assert_eq!(compute::s2mm_master_port(0), 1);
+        assert_eq!(compute::s2mm_master_port(1), 2);
 
-        // MM2S channels send to slave ports
-        assert_eq!(compute::mm2s_slave_port(0), compute::slave::DMA_0);
-        assert_eq!(compute::mm2s_slave_port(1), compute::slave::DMA_1);
+        // MM2S channels map to DMA slave ports (1, 2)
+        assert_eq!(compute::mm2s_slave_port(0), 1);
+        assert_eq!(compute::mm2s_slave_port(1), 2);
+    }
+
+    #[test]
+    fn test_compute_port_counts_match_generated() {
+        assert_eq!(compute::MASTER_PORT_COUNT, aie2_spec::COMPUTE_MASTER_PORTS.len());
+        assert_eq!(compute::SLAVE_PORT_COUNT, aie2_spec::COMPUTE_SLAVE_PORTS.len());
     }
 
     #[test]
     fn test_memtile_port_mappings() {
-        // MemTile has 6 DMA channels each direction
+        // MemTile DMA ports start at 0
         for ch in 0..6 {
             assert_eq!(memtile::s2mm_master_port(ch), ch);
             assert_eq!(memtile::mm2s_slave_port(ch), ch);
@@ -347,13 +260,72 @@ mod tests {
     }
 
     #[test]
+    fn test_memtile_port_counts_match_generated() {
+        assert_eq!(memtile::MASTER_PORT_COUNT, aie2_spec::MEMTILE_MASTER_PORTS.len());
+        assert_eq!(memtile::SLAVE_PORT_COUNT, aie2_spec::MEMTILE_SLAVE_PORTS.len());
+    }
+
+    #[test]
+    fn test_shim_port_mappings() {
+        // Shim DMA ports map to South ports starting at SOUTH_MASTER/SLAVE_START
+        use aie2_spec::stream_switch::shim as ranges;
+        assert_eq!(shim::s2mm_master_port(0), ranges::SOUTH_MASTER_START);
+        assert_eq!(shim::mm2s_slave_port(0), ranges::SOUTH_SLAVE_START);
+    }
+
+    #[test]
     fn test_inter_tile_connections() {
-        // Shim North [12-17] -> MemTile South [7-12]
+        use aie2_spec::stream_switch::{shim as sr, mem_tile as mr, compute as cr};
+
+        // Shim North -> MemTile South
+        assert_eq!(
+            connections::shim_north_to_memtile_south(sr::NORTH_MASTER_START),
+            Some(mr::SOUTH_SLAVE_START)
+        );
+        assert_eq!(
+            connections::shim_north_to_memtile_south(sr::NORTH_MASTER_END),
+            Some(mr::SOUTH_SLAVE_END)
+        );
+        assert_eq!(
+            connections::shim_north_to_memtile_south(sr::NORTH_MASTER_START - 1),
+            None
+        );
+
+        // MemTile North -> Compute South
+        assert_eq!(
+            connections::memtile_north_to_compute_south(mr::NORTH_MASTER_START),
+            Some(cr::SOUTH_SLAVE_START)
+        );
+        assert_eq!(
+            connections::memtile_north_to_compute_south(mr::NORTH_MASTER_END),
+            Some(cr::SOUTH_SLAVE_END)
+        );
+    }
+
+    /// Validate that generated port ranges produce the same mappings as the
+    /// previously hardcoded values. This catches any drift between AM025 data
+    /// and the expected hardware behavior.
+    #[test]
+    fn test_backward_compatible_values() {
+        // Compute: DMA master ports at 1,2; DMA slave ports at 1,2
+        assert_eq!(compute::s2mm_master_port(0), 1);
+        assert_eq!(compute::s2mm_master_port(1), 2);
+        assert_eq!(compute::mm2s_slave_port(0), 1);
+        assert_eq!(compute::mm2s_slave_port(1), 2);
+
+        // MemTile: DMA at 0-5 for both directions
+        assert_eq!(memtile::s2mm_master_port(0), 0);
+        assert_eq!(memtile::s2mm_master_port(5), 5);
+
+        // Shim: South ports at 2+
+        assert_eq!(shim::s2mm_master_port(0), 2);
+        assert_eq!(shim::mm2s_slave_port(0), 2);
+
+        // Inter-tile: Shim North [12-17] -> MemTile South [7-12]
         assert_eq!(connections::shim_north_to_memtile_south(12), Some(7));
         assert_eq!(connections::shim_north_to_memtile_south(17), Some(12));
-        assert_eq!(connections::shim_north_to_memtile_south(11), None);
 
-        // MemTile North [11-16] -> Compute South [5-10]
+        // Inter-tile: MemTile North [11-16] -> Compute South [5-10]
         assert_eq!(connections::memtile_north_to_compute_south(11), Some(5));
         assert_eq!(connections::memtile_north_to_compute_south(16), Some(10));
     }

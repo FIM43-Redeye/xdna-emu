@@ -691,11 +691,6 @@ impl NpuExecutor {
         // Register layouts differ by tile type but all share the same format:
         //   Bits 3:0  = BD_ID (buffer descriptor index)
         //   Bits 23:16 = Repeat_Count (additional BD executions)
-        use crate::device::dma::{
-            COMPUTE_S2MM_CHANNELS, COMPUTE_MM2S_CHANNELS,
-            MEM_TILE_S2MM_CHANNELS, MEM_TILE_MM2S_CHANNELS,
-        };
-
         let reg_layout = crate::device::regdb::device_reg_layout();
         let tile_type = device.tile(col as usize, row as usize)
             .map(|t| t.tile_type);
@@ -703,6 +698,14 @@ impl NpuExecutor {
             Some(tt) => tt,
             None => return,
         };
+
+        // Get channel counts from DMA engine (data-driven from ArchConfig)
+        let dma = match device.array.dma_engine(col, row) {
+            Some(d) => d,
+            None => return,
+        };
+        let s2mm_channels = dma.s2mm_channel_count() as u8;
+        let mm2s_channels = dma.mm2s_channel_count() as u8;
 
         // Determine channel base(s), stride, and S2MM/MM2S channel counts
         // for the tile type. Compute and shim have a single contiguous block
@@ -712,8 +715,7 @@ impl NpuExecutor {
             TileType::Shim => {
                 let base = reg_layout.shim_channel_base;
                 let stride = reg_layout.shim_channel_stride;
-                let s2mm = COMPUTE_S2MM_CHANNELS as u8;
-                match Self::channel_from_queue_write(offset, base, stride, s2mm, s2mm + COMPUTE_MM2S_CHANNELS as u8) {
+                match Self::channel_from_queue_write(offset, base, stride, s2mm_channels, s2mm_channels + mm2s_channels) {
                     Some(r) => r,
                     None => return,
                 }
@@ -721,8 +723,7 @@ impl NpuExecutor {
             TileType::Compute => {
                 let base = reg_layout.memory_channel_base;
                 let stride = reg_layout.memory_channel_stride;
-                let s2mm = COMPUTE_S2MM_CHANNELS as u8;
-                match Self::channel_from_queue_write(offset, base, stride, s2mm, s2mm + COMPUTE_MM2S_CHANNELS as u8) {
+                match Self::channel_from_queue_write(offset, base, stride, s2mm_channels, s2mm_channels + mm2s_channels) {
                     Some(r) => r,
                     None => return,
                 }
@@ -732,15 +733,13 @@ impl NpuExecutor {
                 let stride = reg_layout.memtile_channel_stride;
                 let s2mm_base = reg_layout.memtile_channel_s2mm_base;
                 let mm2s_base = reg_layout.memtile_channel_mm2s_base;
-                let s2mm_count = MEM_TILE_S2MM_CHANNELS as u8;
-                let mm2s_count = MEM_TILE_MM2S_CHANNELS as u8;
 
                 // Try S2MM block first
-                if let Some((ch, _)) = Self::channel_from_queue_write(offset, s2mm_base, stride, s2mm_count, s2mm_count) {
+                if let Some((ch, _)) = Self::channel_from_queue_write(offset, s2mm_base, stride, s2mm_channels, s2mm_channels) {
                     (ch, false)
-                } else if let Some((ch_raw, _)) = Self::channel_from_queue_write(offset, mm2s_base, stride, mm2s_count, mm2s_count) {
+                } else if let Some((ch_raw, _)) = Self::channel_from_queue_write(offset, mm2s_base, stride, mm2s_channels, mm2s_channels) {
                     // MM2S channels are numbered after S2MM in the DMA engine
-                    (s2mm_count + ch_raw, true)
+                    (s2mm_channels + ch_raw, true)
                 } else {
                     return;
                 }

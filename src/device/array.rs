@@ -137,8 +137,9 @@ impl TileArray {
 
                 // Create DMA engine with ArchConfig-derived channel/BD/lock counts
                 dma_engines.push(DmaEngine::new(
-                    col, row, tile_type, params.num_channels, params.num_bds,
-                    params.num_locks as u8,
+                    col, row, tile_type,
+                    params.dma_s2mm_channels, params.dma_mm2s_channels,
+                    params.num_bds, params.num_locks as u8,
                 ));
             }
         }
@@ -507,23 +508,16 @@ impl TileArray {
     /// Convert MM2S DMA channel index to stream switch master port index.
     ///
     /// The `channel` argument is the absolute DMA channel index (S2MM channels
-    /// come first, MM2S channels follow). Port indices derived from AM025
-    /// gen_stream_ranges.rs and DMA channel constants.
+    /// come first, MM2S channels follow). `s2mm_count` is the number of S2MM
+    /// channels for this tile (from DmaEngine). Port indices derived from AM025
+    /// gen_stream_ranges.rs.
     #[allow(dead_code)] // Documented port mapping, may be used in future
-    fn mm2s_channel_to_master_port(tile_type: TileType, channel: u8) -> u8 {
+    fn mm2s_channel_to_master_port(tile_type: TileType, channel: u8, s2mm_count: u8) -> u8 {
+        let ch_offset = channel.saturating_sub(s2mm_count);
         match tile_type {
-            TileType::Compute => {
-                let ch_offset = channel.saturating_sub(dma::COMPUTE_S2MM_CHANNELS as u8);
-                compute::DMA_MASTER_START + ch_offset
-            }
-            TileType::MemTile => {
-                let ch_offset = channel.saturating_sub(dma::MEM_TILE_S2MM_CHANNELS as u8);
-                mem_tile::DMA_MASTER_START + ch_offset
-            }
-            TileType::Shim => {
-                let ch_offset = channel.saturating_sub(dma::COMPUTE_S2MM_CHANNELS as u8);
-                shim::NORTH_MASTER_START + ch_offset
-            }
+            TileType::Compute => compute::DMA_MASTER_START + ch_offset,
+            TileType::MemTile => mem_tile::DMA_MASTER_START + ch_offset,
+            TileType::Shim => shim::NORTH_MASTER_START + ch_offset,
         }
     }
 
@@ -956,7 +950,7 @@ impl TileArray {
                     //
                     // DMA channel indices: S2MM = 0-1, MM2S = 2-3 (absolute)
                     // MM2S ch0 = abs channel 2, ch1 = abs channel 3
-                    let s2mm_count = dma::COMPUTE_S2MM_CHANNELS;
+                    let s2mm_count = self.dma_engines[i].s2mm_channel_count();
                     let mm2s_ch = data.channel.saturating_sub(s2mm_count as u8) as usize;
                     let target_slave_idx = self.tiles[i].shim_mux_mm2s_slaves
                         .get(mm2s_ch)
@@ -996,16 +990,15 @@ impl TileArray {
                     continue;
                 }
 
+                let s2mm_count = self.dma_engines[i].s2mm_channel_count() as u8;
                 let slave_port = match tile_type {
                     TileType::MemTile => {
                         // MemTile MM2S channels start after S2MM channels
-                        let s2mm_count = dma::MEM_TILE_S2MM_CHANNELS as u8;
                         let ch_offset = data.channel.saturating_sub(s2mm_count);
                         (mem_tile::DMA_SLAVE_START + ch_offset) as usize
                     }
                     TileType::Compute => {
                         // Compute MM2S channels start after S2MM channels
-                        let s2mm_count = dma::COMPUTE_S2MM_CHANNELS as u8;
                         let ch_offset = data.channel.saturating_sub(s2mm_count);
                         (compute::DMA_SLAVE_START + ch_offset) as usize
                     }
