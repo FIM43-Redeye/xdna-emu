@@ -41,8 +41,8 @@
 
 use std::collections::HashMap;
 
-use super::resolver::{FieldFragment, InstrEncoding, OperandField, OperandType, classify_operand_type, detect_addressing_mode, detect_mem_width, infer_branch_condition, infer_element_type, infer_select_variant, infer_semantic_from_mnemonic, infer_semantic_from_structure};
-use super::types::ImplicitReg;
+use super::resolver::{FieldFragment, InstrEncoding, OperandField, OperandType, classify_operand_type, detect_addressing_mode, detect_mem_width, infer_branch_condition, infer_element_type, infer_select_variant, infer_semantic_from_structure, refine_branch_semantic};
+use super::types::{ImplicitReg, SemanticOp};
 
 /// A parsed instruction record from tblgen output.
 #[derive(Debug, Clone)]
@@ -86,6 +86,30 @@ pub struct InstrRecord {
     /// excluded from decoder tables since they are aliases (e.g., MOV_OR is
     /// `or $rd, $rs, $rs` with only one input operand).
     pub is_code_gen_only: bool,
+    /// isMoveImm flag -- instruction is an immediate-to-register move.
+    /// Used for structural semantic inference: isMoveImm -> SemanticOp::Copy.
+    pub is_move_imm: bool,
+    /// isMoveReg flag -- instruction is a register-to-register move.
+    /// Used for structural semantic inference: isMoveReg -> SemanticOp::Copy.
+    pub is_move_reg: bool,
+    /// isSlotNOP flag -- instruction is a slot-specific NOP (e.g., NOPA, NOPB).
+    /// Used for structural semantic inference: isSlotNOP -> SemanticOp::Nop.
+    pub is_slot_nop: bool,
+    /// isBranch flag -- instruction is a branch.
+    /// Note: on AIE2, this is only set on Pseudo variants, so hasDelaySlot is
+    /// more reliable for detecting hardware control-flow instructions.
+    pub is_branch: bool,
+    /// isCall flag -- instruction is a call.
+    pub is_call: bool,
+    /// isReturn flag -- instruction is a return.
+    pub is_return: bool,
+    /// isSelect flag -- instruction is a select/conditional-move.
+    /// Note: may be unreliable in llvm-aie (isSelect=0 for SELEQZ observed).
+    pub is_select: bool,
+    /// isTerminator flag -- instruction is a basic-block terminator.
+    pub is_terminator: bool,
+    /// isCompare flag -- instruction is a comparison.
+    pub is_compare: bool,
     /// Itinerary class name from `InstrItinClass Itinerary = II_ADD;`.
     /// Links this instruction to its pipeline timing data in the scheduling model.
     /// None only if the field is absent; "NoItinerary" means explicitly unscheduled.
@@ -297,6 +321,15 @@ fn parse_single_record(lines: &[&str], i: &mut usize) -> Option<InstrRecord> {
         has_complete_decoder: true, // Default to true; set false if field says 0
         has_delay_slot: false,
         is_code_gen_only: false,
+        is_move_imm: false,
+        is_move_reg: false,
+        is_slot_nop: false,
+        is_branch: false,
+        is_call: false,
+        is_return: false,
+        is_select: false,
+        is_terminator: false,
+        is_compare: false,
         itinerary_class: None,
     };
 
@@ -335,6 +368,24 @@ fn parse_single_record(lines: &[&str], i: &mut usize) -> Option<InstrRecord> {
             record.has_delay_slot = line.contains("= 1");
         } else if line.starts_with("bit isCodeGenOnly = ") {
             record.is_code_gen_only = line.contains("= 1");
+        } else if line.starts_with("bit isMoveImm = ") {
+            record.is_move_imm = line.contains("= 1");
+        } else if line.starts_with("bit isMoveReg = ") {
+            record.is_move_reg = line.contains("= 1");
+        } else if line.starts_with("bit isSlotNOP = ") {
+            record.is_slot_nop = line.contains("= 1");
+        } else if line.starts_with("bit isBranch = ") {
+            record.is_branch = line.contains("= 1");
+        } else if line.starts_with("bit isCall = ") {
+            record.is_call = line.contains("= 1");
+        } else if line.starts_with("bit isReturn = ") {
+            record.is_return = line.contains("= 1");
+        } else if line.starts_with("bit isSelect = ") {
+            record.is_select = line.contains("= 1");
+        } else if line.starts_with("bit isTerminator = ") {
+            record.is_terminator = line.contains("= 1");
+        } else if line.starts_with("bit isCompare = ") {
+            record.is_compare = line.contains("= 1");
         } else if line.starts_with("InstrItinClass Itinerary = ") {
             let val = line
                 .strip_prefix("InstrItinClass Itinerary = ")
@@ -557,13 +608,47 @@ impl InstrRecord {
             _ => return None,
         };
 
-        // Three-tier semantic inference: structure first, mnemonic fallback.
-        // (Pattern-based semantics are only available on the regex-parser path.)
-        let semantic = infer_semantic_from_structure(
+        // Structural semantic inference from TableGen attributes (mayLoad, Defs, etc.).
+        // Pattern-based semantics are applied as post-processing in parse_tblgen_output(),
+        // which parses Pat<> records and upgrades encodings after this step.
+        let semantic = if self.is_move_imm || self.is_move_reg {
+            Some(SemanticOp::Copy)
+        } else if self.is_slot_nop {
+            Some(SemanticOp::Nop)
+        } else {
+            infer_semantic_from_structure(
                 &self.defs, &self.uses, self.may_load, self.may_store,
                 self.has_delay_slot, &self.parents,
             )
-            .or_else(|| infer_semantic_from_mnemonic(&self.mnemonic));
+        };
+
+        // Refine Br -> BrCond for conditional branches (jnz, jz, jnzd, b*).
+        // Structural inference returns Br for all delay-slot instructions
+        // without lr; the mnemonic distinguishes conditional from unconditional.
+        let semantic = refine_branch_semantic(&self.mnemonic, semantic);
+
+        // Cross-validate: isBranch/isCall/isReturn flags (set on Pseudo variants)
+        // should agree with hasDelaySlot-based inference on hardware encodings.
+        // These flags are secondary (Pseudos don't have hardware encodings), but
+        // if they ARE set on a hardware encoding, they should agree.
+        if self.is_call && semantic != Some(SemanticOp::Call) {
+            log::trace!(
+                "[TBLGEN] {} has isCall=1 but inferred semantic {:?} (expected Call)",
+                self.name, semantic
+            );
+        }
+        if self.is_return && semantic != Some(SemanticOp::Ret) {
+            log::trace!(
+                "[TBLGEN] {} has isReturn=1 but inferred semantic {:?} (expected Return)",
+                self.name, semantic
+            );
+        }
+        if self.is_branch && !matches!(semantic, Some(SemanticOp::Br) | Some(SemanticOp::BrCond)) {
+            log::trace!(
+                "[TBLGEN] {} has isBranch=1 but inferred semantic {:?} (expected Br/BrCond)",
+                self.name, semantic
+            );
+        }
 
         // Build input/output ordering
         let input_order: Vec<String> = self.inputs.iter().map(|(_, n)| n.clone()).collect();
@@ -1042,6 +1127,165 @@ pub fn parse_composite_formats(content: &str) -> Vec<CompositeFormatDef> {
 }
 
 // ============================================================================
+// Pat<> record parsing for semantic inference
+// ============================================================================
+
+/// Parse anonymous Pat<> records from `--print-records` output.
+///
+/// These are fully resolved pattern instantiations that map SDNode/intrinsic
+/// operations to concrete hardware instructions. Each record looks like:
+///
+/// ```text
+/// def anonymous_9178 {  // Pattern Pat PatGprGpr
+///   dag PatternToMatch = (i32 (add (i32 eR:$rs1), (i32 eR:$rs2)));
+///   list<dag> ResultInstrs = [(ADD eR:$rs1, eR:$rs2)];
+///   ...
+/// }
+/// ```
+///
+/// Returns a map from instruction name to SemanticOp. If multiple patterns
+/// map the same instruction, the last one wins (they should agree).
+pub fn parse_pattern_records(content: &str) -> HashMap<String, SemanticOp> {
+    let mut result: HashMap<String, SemanticOp> = HashMap::new();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        // Look for "def anonymous_NNNN {  // Pattern Pat ..."
+        if lines[i].starts_with("def anonymous_") && lines[i].contains("Pattern Pat") {
+            i += 1;
+            let mut pattern_dag: Option<&str> = None;
+            let mut result_instr: Option<String> = None;
+
+            // Parse fields until closing brace
+            while i < lines.len() {
+                let line = lines[i].trim();
+                if line == "}" || line.starts_with('}') {
+                    break;
+                }
+
+                if line.starts_with("dag PatternToMatch = ") {
+                    pattern_dag = Some(line);
+                } else if line.starts_with("list<dag> ResultInstrs = ") {
+                    result_instr = extract_result_instruction(line);
+                }
+                i += 1;
+            }
+
+            // Map the pattern to a SemanticOp
+            if let (Some(dag), Some(instr_name)) = (pattern_dag, result_instr) {
+                if let Some(op) = extract_semantic_from_dag(dag) {
+                    result.insert(instr_name, op);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    result
+}
+
+/// Extract the first instruction name from ResultInstrs.
+///
+/// Format: `list<dag> ResultInstrs = [(INSTR_NAME operands...)];`
+/// We want "INSTR_NAME".
+fn extract_result_instruction(line: &str) -> Option<String> {
+    // Find the opening [ then (
+    let bracket = line.find('[')?;
+    let paren = line[bracket..].find('(')?;
+    let start = bracket + paren + 1;
+    let rest = &line[start..];
+
+    // First word is the instruction name
+    let end = rest.find(|c: char| c.is_whitespace() || c == ')' || c == ',')?;
+    let name = &rest[..end];
+
+    // Skip pseudo/meta instructions that don't appear in decoder tables
+    if name == "REG_SEQUENCE" || name == "COPY_TO_REGCLASS" || name.starts_with("Pseudo")
+        || name == "EXTRACT_SUBREG" || name == "INSERT_SUBREG"
+        || name == "IMPLICIT_DEF" || name == "NegateImm"
+    {
+        return None;
+    }
+
+    Some(name.to_string())
+}
+
+/// Extract a SemanticOp from the PatternToMatch DAG.
+///
+/// Format: `dag PatternToMatch = (TYPE (SDNODE ...))`
+///
+/// The DAG may have a ValueType prefix (i32, ptr0, v64i8, etc.) that we skip
+/// to find the actual SDNode name. For nested patterns like `(i32 (select ...))`,
+/// we look for the inner SDNode.
+fn extract_semantic_from_dag(dag_line: &str) -> Option<SemanticOp> {
+    // Extract content after "dag PatternToMatch = "
+    let content = dag_line.strip_prefix("dag PatternToMatch = ")
+        .unwrap_or(dag_line)
+        .trim()
+        .trim_end_matches(';');
+
+    // Find all words inside parentheses, skipping known ValueType prefixes.
+    // The structure is: (TYPE (SDNODE args...)) or (SDNODE args...) or
+    // (TYPE (SDNODE (TYPE2 (INNER_NODE ...)) ...))
+    //
+    // Strategy: collect all "first words after (" and try each as an SDNode
+    // or intrinsic name, taking the first match.
+    let candidates = extract_dag_first_words(content);
+
+    for word in &candidates {
+        // Try SDNode mapping
+        if let Some(op) = SemanticOp::from_sdnode(word) {
+            return Some(op);
+        }
+        // Try intrinsic mapping
+        if let Some(op) = SemanticOp::from_intrinsic(word) {
+            return Some(op);
+        }
+    }
+
+    None
+}
+
+/// Extract the "first word" from each parenthesized sub-expression in a DAG.
+///
+/// Given `(i32 (add (i32 eR:$rs1), (i32 eR:$rs2)))`, returns:
+/// `["i32", "add", "i32", "i32"]`
+///
+/// We skip known LLVM ValueType prefixes to find the actual SDNode names.
+fn extract_dag_first_words(dag: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let known_types = [
+        "i1", "i8", "i16", "i20", "i32", "i64",
+        "ptr0", "v2i32", "v4i16", "v8i8",
+        "v16i8", "v16i16", "v16i32",
+        "v32i8", "v32i16", "v32i32",
+        "v64i8", "v64i16",
+        "v128i8",
+        "f16", "f32", "f64", "bf16",
+        "v8f32", "v16f16", "v16bf16", "v32bf16",
+    ];
+
+    for (pos, _) in dag.char_indices().filter(|&(_, c)| c == '(') {
+        let rest = &dag[pos + 1..];
+        // Skip whitespace
+        let trimmed = rest.trim_start();
+        // Extract first word (alphanumeric + underscore)
+        let end = trimmed.find(|c: char| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(trimmed.len());
+        if end > 0 {
+            let word = &trimmed[..end];
+            // Skip ValueType prefixes
+            if !known_types.contains(&word) {
+                words.push(word.to_string());
+            }
+        }
+    }
+
+    words
+}
+
+// ============================================================================
 // Field parsing helpers
 // ============================================================================
 
@@ -1145,5 +1389,144 @@ mod tests {
         assert_eq!(mask, 0b00111);
         // Values: 1, 0, 1 = 0b101 = 5
         assert_eq!(bits, 0b00101);
+    }
+
+    #[test]
+    fn test_parse_pattern_records() {
+        // Synthesize tblgen Pat<> record output
+        let content = r#"
+def anonymous_100 {	// Pattern Pat PatGprGpr
+  dag PatternToMatch = (i32 (add (i32 eR:$rs1), (i32 eR:$rs2)));
+  list<dag> ResultInstrs = [(ADD eR:$rs1, eR:$rs2)];
+  bit ModelsInaccessibleMemThroughRegs = 0;
+  list<Predicate> Predicates = [];
+  int AddedComplexity = 0;
+  bit GISelShouldIgnore = 0;
+}
+def anonymous_101 {	// Pattern Pat PatGprGpr
+  dag PatternToMatch = (i32 (select (i32 (seteq eR27:$rs1, (i32 0))), (i32 eR:$rs2), (i32 eR:$rs3)));
+  list<dag> ResultInstrs = [(SELEQZ eR:$rs2, eR:$rs3, eR27:$rs1)];
+  bit ModelsInaccessibleMemThroughRegs = 0;
+  list<Predicate> Predicates = [];
+  int AddedComplexity = 0;
+  bit GISelShouldIgnore = 0;
+}
+def anonymous_102 {	// Pattern Pat
+  dag PatternToMatch = (int_aie2_acquire eR:$mRx, eR:$mRy);
+  list<dag> ResultInstrs = [(ACQ_mLockId_reg eR:$mRx, eR:$mRy)];
+  bit ModelsInaccessibleMemThroughRegs = 0;
+  list<Predicate> Predicates = [];
+  int AddedComplexity = 0;
+  bit GISelShouldIgnore = 0;
+}
+def anonymous_103 {	// Pattern Pat
+  dag PatternToMatch = (int_aie2_release imm6:$id, eR:$mRy);
+  list<dag> ResultInstrs = [(REL_mLockId_imm imm6:$id, eR:$mRy)];
+  bit ModelsInaccessibleMemThroughRegs = 0;
+  list<Predicate> Predicates = [];
+  int AddedComplexity = 0;
+  bit GISelShouldIgnore = 0;
+}
+def anonymous_104 {	// Pattern Pat
+  dag PatternToMatch = (brcond (i32 eR:$mRx), bb:$addr);
+  list<dag> ResultInstrs = [(PseudoJNZ eR:$mRx, bb:$addr)];
+  bit ModelsInaccessibleMemThroughRegs = 0;
+  list<Predicate> Predicates = [];
+  int AddedComplexity = 0;
+  bit GISelShouldIgnore = 0;
+}
+def anonymous_105 {	// Pattern Pat
+  dag PatternToMatch = (i32 (or (i32 eR:$rs1), (i32 eR:$rs2)));
+  list<dag> ResultInstrs = [(OR eR:$rs1, eR:$rs2)];
+  bit ModelsInaccessibleMemThroughRegs = 0;
+  list<Predicate> Predicates = [];
+  int AddedComplexity = 0;
+  bit GISelShouldIgnore = 0;
+}
+def NOT_A_PATTERN {	// SomeOtherClass
+  string Name = "irrelevant";
+}
+"#;
+
+        let map = parse_pattern_records(content);
+
+        // ADD -> SemanticOp::Add (from SDNode "add")
+        assert_eq!(map.get("ADD"), Some(&SemanticOp::Add));
+
+        // SELEQZ -> SemanticOp::Select (from SDNode "select")
+        assert_eq!(map.get("SELEQZ"), Some(&SemanticOp::Select));
+
+        // ACQ_mLockId_reg -> SemanticOp::LockAcquire (from intrinsic "int_aie2_acquire")
+        assert_eq!(map.get("ACQ_mLockId_reg"), Some(&SemanticOp::LockAcquire));
+
+        // REL_mLockId_imm -> SemanticOp::LockRelease (from intrinsic "int_aie2_release")
+        assert_eq!(map.get("REL_mLockId_imm"), Some(&SemanticOp::LockRelease));
+
+        // PseudoJNZ should be skipped (starts with "Pseudo")
+        assert!(!map.contains_key("PseudoJNZ"),
+            "Pseudo instructions should be excluded");
+
+        // OR -> SemanticOp::Or
+        assert_eq!(map.get("OR"), Some(&SemanticOp::Or));
+
+        // Should have exactly 4 entries (ADD, SELEQZ, ACQ, REL, OR = 5 minus PseudoJNZ)
+        assert_eq!(map.len(), 5, "Expected 5 pattern mappings, got {}: {:?}", map.len(), map);
+    }
+
+    #[test]
+    fn test_parse_pattern_records_with_real_data() {
+        let cache_path = std::path::Path::new(env!("HOME"))
+            .join(".cache/xdna-emu/tblgen/records.txt");
+        if !cache_path.exists() {
+            eprintln!("Skipping test: tblgen cache not found");
+            return;
+        }
+
+        let content = std::fs::read_to_string(&cache_path).unwrap();
+        let map = parse_pattern_records(&content);
+
+        eprintln!("Parsed {} unique instruction mappings from Pat<> records", map.len());
+
+        // Should have significantly more than the regex parser (plan says 269 vs 170)
+        assert!(map.len() >= 200,
+            "Expected >= 200 Pat<> mappings, got {}", map.len());
+
+        // Key instructions must be present
+        assert_eq!(map.get("ADD"), Some(&SemanticOp::Add), "ADD -> Add");
+        assert_eq!(map.get("SUB"), Some(&SemanticOp::Sub), "SUB -> Sub");
+        assert_eq!(map.get("OR"), Some(&SemanticOp::Or), "OR -> Or");
+        assert_eq!(map.get("AND"), Some(&SemanticOp::And), "AND -> And");
+        assert_eq!(map.get("XOR"), Some(&SemanticOp::Xor), "XOR -> Xor");
+        assert_eq!(map.get("SELEQZ"), Some(&SemanticOp::Select), "SELEQZ -> Select");
+        assert_eq!(map.get("SELNEZ"), Some(&SemanticOp::Select), "SELNEZ -> Select");
+        assert_eq!(map.get("ACQ_mLockId_reg"), Some(&SemanticOp::LockAcquire));
+        assert_eq!(map.get("REL_mLockId_reg"), Some(&SemanticOp::LockRelease));
+    }
+
+    #[test]
+    fn test_extract_semantic_from_dag() {
+        // Standard SDNode
+        assert_eq!(
+            extract_semantic_from_dag("dag PatternToMatch = (i32 (add (i32 eR:$rs1), (i32 eR:$rs2)));"),
+            Some(SemanticOp::Add)
+        );
+
+        // Nested SDNode with type prefix
+        assert_eq!(
+            extract_semantic_from_dag("dag PatternToMatch = (i32 (select (i32 eR27:$rs1), (i32 eR:$rs2), (i32 eR:$rs3)));"),
+            Some(SemanticOp::Select)
+        );
+
+        // Intrinsic
+        assert_eq!(
+            extract_semantic_from_dag("dag PatternToMatch = (int_aie2_acquire eR:$mRx, eR:$mRy);"),
+            Some(SemanticOp::LockAcquire)
+        );
+
+        // Pointer type prefix
+        assert_eq!(
+            extract_semantic_from_dag("dag PatternToMatch = (ptradd eP:$ptr, eM:$mod);"),
+            None // ptradd is not in from_sdnode()
+        );
     }
 }

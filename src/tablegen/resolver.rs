@@ -196,33 +196,30 @@ pub enum CompositeEncoder {
 /// appropriate `OperandType`. Falls back to field-name heuristics when
 /// `reg_class` is empty (e.g., for immediates not captured in DAG patterns).
 pub fn classify_operand_type(reg_class: &str, field_name: &str) -> OperandType {
-    // 1. Composite register operands (OP_* prefix from TableGen operand classes)
-    match reg_class {
-        "OP_mLdaScl" | "OP_mSclSt" | "OP_mSclMS" | "OP_mLdbScl"
-            => return OperandType::CompositeRegister(CompositeEncoder::LdaScl),
-        "OP_mMvSclSrc" | "OP_mMvSclDst" | "OP_mMvSclDstCg"
-            => return OperandType::CompositeRegister(CompositeEncoder::MvSclSrc),
-        "OP_mLdaCg" | "OP_mLdbCg"
-            => return OperandType::CompositeRegister(CompositeEncoder::LdaCg),
-        "OP_mAluCg"
-            => return OperandType::CompositeRegister(CompositeEncoder::AluCg),
-        "OP_mMvAMWQDst"
-            => return OperandType::CompositeRegister(CompositeEncoder::MvAMWQDst),
-        "OP_mMvAMWQSrc"
-            => return OperandType::CompositeRegister(CompositeEncoder::MvAMWQSrc),
-        "OP_mMvBMXSrc"
-            => return OperandType::CompositeRegister(CompositeEncoder::MvBMXSrc),
-        "OP_mMvBMXDst"
-            => return OperandType::CompositeRegister(CompositeEncoder::MvBMXDst),
-        "OP_eRS4"
-            => return OperandType::CompositeRegister(CompositeEncoder::ERS4),
-        "OP_mShflDst"
-            => return OperandType::CompositeRegister(CompositeEncoder::ShflDst),
-        "OP_mWm_1"
-            => return OperandType::CompositeRegister(CompositeEncoder::Wm1),
-        "OP_mQXHLb"
-            => return OperandType::CompositeRegister(CompositeEncoder::QXHLb),
-        _ => {}
+    // 1. Composite register operands (OP_* prefix from TableGen operand classes).
+    // Lookup table mapping reg_class names to their CompositeEncoder variant.
+    const COMPOSITE_LOOKUP: &[(&str, CompositeEncoder)] = &[
+        ("OP_mLdaScl",    CompositeEncoder::LdaScl),
+        ("OP_mSclSt",     CompositeEncoder::LdaScl),
+        ("OP_mSclMS",     CompositeEncoder::LdaScl),
+        ("OP_mLdbScl",    CompositeEncoder::LdaScl),
+        ("OP_mMvSclSrc",  CompositeEncoder::MvSclSrc),
+        ("OP_mMvSclDst",  CompositeEncoder::MvSclSrc),
+        ("OP_mMvSclDstCg",CompositeEncoder::MvSclSrc),
+        ("OP_mLdaCg",     CompositeEncoder::LdaCg),
+        ("OP_mLdbCg",     CompositeEncoder::LdaCg),
+        ("OP_mAluCg",     CompositeEncoder::AluCg),
+        ("OP_mMvAMWQDst", CompositeEncoder::MvAMWQDst),
+        ("OP_mMvAMWQSrc", CompositeEncoder::MvAMWQSrc),
+        ("OP_mMvBMXSrc",  CompositeEncoder::MvBMXSrc),
+        ("OP_mMvBMXDst",  CompositeEncoder::MvBMXDst),
+        ("OP_eRS4",       CompositeEncoder::ERS4),
+        ("OP_mShflDst",   CompositeEncoder::ShflDst),
+        ("OP_mWm_1",      CompositeEncoder::Wm1),
+        ("OP_mQXHLb",     CompositeEncoder::QXHLb),
+    ];
+    if let Some((_, encoder)) = COMPOSITE_LOOKUP.iter().find(|(name, _)| *name == reg_class) {
+        return OperandType::CompositeRegister(*encoder);
     }
 
     // 2. Simple register classes (exact match or prefix)
@@ -692,7 +689,10 @@ impl<'a> Resolver<'a> {
             }
         }
 
-        // Three-tier semantic inference: pattern -> structural -> mnemonic.
+        // Two-tier semantic inference: pattern -> structural.
+        // Pattern-based semantics come from parsed Pat<> entries in TableGenData.
+        // Structural inference uses TableGen attributes (mayLoad, Defs, etc.).
+        // No mnemonic fallback -- all semantics are data-driven.
         let defs_vec: Vec<String> = instr.attributes.defs.iter().cloned().collect();
         let uses_vec: Vec<String> = instr.attributes.uses.iter().cloned().collect();
         let semantic = self.data.semantic_for_instruction(&instr.name)
@@ -702,8 +702,10 @@ impl<'a> Resolver<'a> {
                 instr.attributes.may_load, instr.attributes.may_store,
                 false, // regex parser doesn't extract hasDelaySlot
                 &[],   // regex parser doesn't have parent class chain
-            ))
-            .or_else(|| infer_semantic_from_mnemonic(&instr.mnemonic));
+            ));
+
+        // Refine Br -> BrCond for conditional branches
+        let semantic = refine_branch_semantic(&instr.mnemonic, semantic);
 
         // Extract operand ordering from InstrDef
         let input_order: Vec<String> = instr.inputs.iter().map(|o| o.name.clone()).collect();
@@ -1101,9 +1103,10 @@ pub fn infer_semantic_from_structure(
         if uses_lr {
             return Some(SemanticOp::Ret);
         }
-        // Other delay-slot instructions are branches; the mnemonic fallback
-        // will disambiguate unconditional vs conditional + condition code.
-        // We don't return here because we can't tell j vs jnz vs jz structurally.
+        // Other delay-slot instructions are branches. Return Br as the
+        // baseline; callers upgrade to BrCond via `refine_branch_semantic()`
+        // using the mnemonic to distinguish conditional vs unconditional.
+        return Some(SemanticOp::Br);
     }
 
     // Memory operations: mayLoad/mayStore are authoritative flags from TableGen.
@@ -1133,413 +1136,6 @@ pub fn infer_semantic_from_structure(
     None
 }
 
-/// Infer semantic operation from instruction mnemonic.
-///
-/// This is the final fallback for instructions not classified by patterns
-/// or structural attributes. It handles arithmetic, comparison, bitwise,
-/// and other operations where no structured TableGen flag exists.
-///
-/// Used by both the resolver and tblgen_records modules.
-pub fn infer_semantic_from_mnemonic(mnemonic: &str) -> Option<SemanticOp> {
-    let lower = mnemonic.to_lowercase();
-
-    // Select operations
-    if lower.starts_with("sel") {
-        return Some(SemanticOp::Select);
-    }
-
-    // Arithmetic operations
-    if lower == "add" || lower.starts_with("add.") {
-        return Some(SemanticOp::Add);
-    }
-    if lower == "sub" || lower.starts_with("sub.") {
-        return Some(SemanticOp::Sub);
-    }
-    if lower == "mul" || lower.starts_with("mul.") {
-        return Some(SemanticOp::Mul);
-    }
-    if lower == "abs" || lower.starts_with("abs.") {
-        return Some(SemanticOp::Abs);
-    }
-    if lower == "neg" || lower.starts_with("neg.") {
-        return Some(SemanticOp::Neg);
-    }
-
-    // Comparison operations
-    if lower == "lt" || lower.starts_with("lt.") {
-        return Some(SemanticOp::SetLt);
-    }
-    if lower == "le" || lower.starts_with("le.") {
-        return Some(SemanticOp::SetLe);
-    }
-    if lower == "gt" || lower.starts_with("gt.") {
-        return Some(SemanticOp::SetGt);
-    }
-    if lower == "ge" || lower.starts_with("ge.") {
-        return Some(SemanticOp::SetGe);
-    }
-    if lower == "eq" || lower.starts_with("eq.") {
-        return Some(SemanticOp::SetEq);
-    }
-    if lower == "ne" || lower.starts_with("ne.") {
-        return Some(SemanticOp::SetNe);
-    }
-
-    // Bitwise operations
-    if lower == "and" || lower.starts_with("and.") {
-        return Some(SemanticOp::And);
-    }
-    if lower == "or" || lower.starts_with("or.") {
-        return Some(SemanticOp::Or);
-    }
-    if lower == "xor" || lower.starts_with("xor.") {
-        return Some(SemanticOp::Xor);
-    }
-    if lower == "not" || lower.starts_with("not.") {
-        return Some(SemanticOp::Not);
-    }
-
-    // Shift operations
-    if lower.starts_with("lshl") || lower == "shl" {
-        return Some(SemanticOp::Shl);
-    }
-    if lower.starts_with("ashr") || lower == "asr" {
-        return Some(SemanticOp::Sra);
-    }
-    if lower.starts_with("lshr") || lower == "lsr" {
-        return Some(SemanticOp::Srl);
-    }
-
-    // Move/copy (mov, mova, movx, movxm, mov.* variants)
-    if lower.starts_with("mov") {
-        return Some(SemanticOp::Copy);
-    }
-
-    // Memory operations
-    // Vector load/store must come before scalar to avoid vlda matching "lda"
-    if lower.starts_with("vlda") || lower.starts_with("vldb") {
-        return Some(SemanticOp::Load);
-    }
-    if lower.starts_with("vst") {
-        return Some(SemanticOp::Store);
-    }
-    // Scalar load B channel
-    if lower.starts_with("ldb") {
-        return Some(SemanticOp::Load);
-    }
-    if lower.starts_with("lda") || lower.starts_with("ld.") {
-        return Some(SemanticOp::Load);
-    }
-    if lower.starts_with("st.") || lower == "st" || lower.starts_with("st ") {
-        return Some(SemanticOp::Store);
-    }
-
-    // Nop
-    if lower == "nop" || lower.starts_with("nop") {
-        return Some(SemanticOp::Nop);
-    }
-
-    // Done (core termination/halt)
-    if lower == "done" {
-        return Some(SemanticOp::Done);
-    }
-
-    // Unsigned comparisons (ltu, leu, gtu, geu)
-    if lower == "ltu" || lower.starts_with("ltu.") {
-        return Some(SemanticOp::SetUlt);
-    }
-    if lower == "leu" || lower.starts_with("leu.") {
-        return Some(SemanticOp::SetUle);
-    }
-    if lower == "gtu" || lower.starts_with("gtu.") {
-        return Some(SemanticOp::SetUgt);
-    }
-    if lower == "geu" || lower.starts_with("geu.") {
-        return Some(SemanticOp::SetUge);
-    }
-
-    // Pointer add
-    if lower.starts_with("padd") {
-        return Some(SemanticOp::PointerAdd);
-    }
-
-    // Call (jump-and-link) operations
-    if lower == "jl" || lower.starts_with("call") {
-        return Some(SemanticOp::Call);
-    }
-    // Unconditional jumps
-    if lower == "j" {
-        return Some(SemanticOp::Br);
-    }
-    // Conditional branches: register-based (jnz/jz) and flag-based (b*)
-    if lower == "jnz" || lower == "jz" || lower == "jnzd"
-        || lower.starts_with("b") && !lower.starts_with("bswap")
-    {
-        return Some(SemanticOp::BrCond);
-    }
-
-    // Lock operations
-    if lower.starts_with("acq") {
-        return Some(SemanticOp::LockAcquire);
-    }
-    if lower.starts_with("rel") {
-        return Some(SemanticOp::LockRelease);
-    }
-
-    // Return
-    if lower == "ret" || lower.starts_with("ret.") {
-        return Some(SemanticOp::Ret);
-    }
-
-    // Vector operations -- use dedicated SemanticOp variants where they
-    // differ from the scalar semantics.
-
-    // ---- MAC variants (must be checked before vmul/vneg) ----
-    // vaddmac/vaddmsc: acc1 = acc1 + acc2 +/- A * B
-    if lower.starts_with("vaddmac") || lower.starts_with("vaddmsc") {
-        return Some(SemanticOp::AddMac);
-    }
-    // vsubmac/vsubmsc: acc1 = acc1 - acc2 +/- A * B
-    if lower.starts_with("vsubmac") || lower.starts_with("vsubmsc") {
-        return Some(SemanticOp::SubMac);
-    }
-    // vnegmac/vnegmsc: acc += -(A * B) variants
-    if lower.starts_with("vnegmac") || lower.starts_with("vnegmsc") {
-        return Some(SemanticOp::NegMatMul);
-    }
-    // vmac: multiply-accumulate (acc += A * B)
-    if lower.starts_with("vmac") {
-        return Some(SemanticOp::Mac);
-    }
-    // vmsc: multiply-subtract-accumulate (acc -= A * B)
-    if lower.starts_with("vmsc") {
-        return Some(SemanticOp::MatMulSub);
-    }
-
-    // ---- Negate-arithmetic variants (must be before vneg) ----
-    if lower.starts_with("vnegmul") {
-        return Some(SemanticOp::NegMul);
-    }
-    if lower.starts_with("vnegadd") || lower.starts_with("vnegsub") {
-        return Some(SemanticOp::NegAdd);
-    }
-
-    // vaddsub: alternating add/subtract (FFT butterfly) -- approximate as Add
-    if lower.starts_with("vaddsub") {
-        return Some(SemanticOp::Add);
-    }
-
-    // ---- Conditional arithmetic (must be before vsub/comparison) ----
-    if lower.starts_with("vsub_lt") {
-        return Some(SemanticOp::SubLt);
-    }
-    if lower.starts_with("vsub_ge") {
-        return Some(SemanticOp::SubGe);
-    }
-    if lower.starts_with("vmaxdiff_lt") {
-        return Some(SemanticOp::MaxDiffLt);
-    }
-    if lower.starts_with("vmax_lt") {
-        return Some(SemanticOp::MaxLt);
-    }
-    if lower.starts_with("vmin_ge") {
-        return Some(SemanticOp::MinGe);
-    }
-    if lower.starts_with("vmin") {
-        return Some(SemanticOp::Min);
-    }
-    // vmax (standalone, must come after vmax_lt/vmaxdiff_lt checks)
-    if lower.starts_with("vmax") {
-        return Some(SemanticOp::Max);
-    }
-
-    // ---- Absolute value / conditional negate ----
-    if lower.starts_with("vabs_gtz") || lower.starts_with("vabs") {
-        return Some(SemanticOp::AbsGtz);
-    }
-    if lower.starts_with("vneg_gtz") {
-        return Some(SemanticOp::NegGtz);
-    }
-    if lower.starts_with("vbneg_ltz") || lower.starts_with("vbneg") {
-        return Some(SemanticOp::NegLtz);
-    }
-
-    // ---- Vector arithmetic (same semantics as scalar, but on vectors) ----
-    if lower.starts_with("vadd") {
-        return Some(SemanticOp::Add);
-    }
-    if lower.starts_with("vsub") {
-        return Some(SemanticOp::Sub);
-    }
-    if lower.starts_with("vmul") {
-        return Some(SemanticOp::Mul);
-    }
-    if lower.starts_with("vand") || lower.starts_with("vband") {
-        return Some(SemanticOp::And);
-    }
-    if lower.starts_with("vor") || lower.starts_with("vbor") {
-        return Some(SemanticOp::Or);
-    }
-    if lower.starts_with("vxor") {
-        return Some(SemanticOp::Xor);
-    }
-    if lower.starts_with("vnot") || lower.starts_with("vbnot") {
-        return Some(SemanticOp::Not);
-    }
-    if lower.starts_with("vshl") || lower.starts_with("vlshl") {
-        return Some(SemanticOp::Shl);
-    }
-    if lower.starts_with("vshr") || lower.starts_with("vlshr") {
-        return Some(SemanticOp::Srl);
-    }
-    if lower.starts_with("vashr") {
-        return Some(SemanticOp::Sra);
-    }
-    if lower.starts_with("vsel") {
-        return Some(SemanticOp::VectorSelect);
-    }
-    if lower.starts_with("vmov") {
-        return Some(SemanticOp::Copy);
-    }
-
-    // Vector comparison operations
-    if lower.starts_with("vlt") && !lower.starts_with("vltu") {
-        return Some(SemanticOp::SetLt);
-    }
-    if lower.starts_with("vltu") {
-        return Some(SemanticOp::SetUlt);
-    }
-    if lower.starts_with("vle") && !lower.starts_with("vleu") {
-        return Some(SemanticOp::SetLe);
-    }
-    if lower.starts_with("vleu") {
-        return Some(SemanticOp::SetUle);
-    }
-    if lower.starts_with("vgt") && !lower.starts_with("vgtu") {
-        return Some(SemanticOp::SetGt);
-    }
-    if lower.starts_with("vgtu") {
-        return Some(SemanticOp::SetUgt);
-    }
-    if lower.starts_with("vge") && !lower.starts_with("vgeu") {
-        return Some(SemanticOp::SetGe);
-    }
-    if lower.starts_with("vgeu") {
-        return Some(SemanticOp::SetUge);
-    }
-    if lower.starts_with("veq") {
-        return Some(SemanticOp::SetEq);
-    }
-    if lower.starts_with("vne") {
-        return Some(SemanticOp::SetNe);
-    }
-
-    // Vector abs/neg (negate without conditional is plain Neg)
-    if lower.starts_with("vneg") {
-        return Some(SemanticOp::Neg);
-    }
-
-    // Bit manipulation (scalar)
-    if lower == "clz" || lower.starts_with("clz.") {
-        return Some(SemanticOp::Ctlz);
-    }
-    if lower == "clb" || lower.starts_with("clb.") {
-        return Some(SemanticOp::Clb); // CLB (count leading bits) != CLZ
-    }
-
-    // Sign/zero extension (scalar)
-    if lower.starts_with("extend.s") || lower.starts_with("ext.s") || lower.starts_with("sext") {
-        return Some(SemanticOp::SignExtend);
-    }
-    if lower.starts_with("extend.u") || lower.starts_with("ext.u") || lower.starts_with("zext") {
-        return Some(SemanticOp::ZeroExtend);
-    }
-
-    // Division (scalar)
-    if lower == "div" || lower == "divs" || lower.starts_with("div.") {
-        return Some(SemanticOp::SDiv);
-    }
-    if lower == "divu" || lower.starts_with("divu.") {
-        return Some(SemanticOp::UDiv);
-    }
-    if lower == "mod" || lower.starts_with("mod.") {
-        return Some(SemanticOp::SRem);
-    }
-
-    // Carry ops (scalar, add/subtract with carry flag input)
-    if lower == "adc" || lower.starts_with("adc.") {
-        return Some(SemanticOp::Adc);
-    }
-    if lower == "sbc" || lower.starts_with("sbc.") {
-        return Some(SemanticOp::Sbc);
-    }
-
-    // Shift (alternate naming: ashl = arithmetic shift left)
-    if lower == "ashl" || lower.starts_with("ashl.") {
-        return Some(SemanticOp::Shl);
-    }
-
-    // Zero/nonzero test (scalar comparison, produce 0/1)
-    if lower == "eqz" || lower.starts_with("eqz.") {
-        return Some(SemanticOp::SetEq);
-    }
-    if lower == "nez" || lower.starts_with("nez.") {
-        return Some(SemanticOp::SetNe);
-    }
-
-    // Event instruction: generates INSTR_EVENT_0/1 trace events.
-    // Operand is a 2-bit immediate selecting which event to fire.
-    if lower == "event" || lower.starts_with("event.") {
-        return Some(SemanticOp::Event);
-    }
-
-    // "ret lr" is a return (alternate mnemonic form)
-    if lower == "ret lr" {
-        return Some(SemanticOp::Ret);
-    }
-
-    // Vector data movement -- dedicated SemanticOp variants
-    if lower.starts_with("vshuffle") {
-        return Some(SemanticOp::Shuffle);
-    }
-    if lower.starts_with("vshift") {
-        return Some(SemanticOp::Align);
-    }
-    if lower.starts_with("vconv") || lower.starts_with("vfloor") || lower.starts_with("vceil")
-        || lower.starts_with("vtrunc") || lower.starts_with("vround")
-    {
-        return Some(SemanticOp::Convert);
-    }
-    if lower.starts_with("vunpack") {
-        return Some(SemanticOp::Unpack);
-    }
-    if lower.starts_with("vpack") {
-        return Some(SemanticOp::Pack);
-    }
-    if lower.starts_with("vextbcst") || lower.starts_with("vbcst") {
-        return Some(SemanticOp::VectorBroadcast);
-    }
-    if lower.starts_with("vextract") {
-        return Some(SemanticOp::VectorExtract);
-    }
-    if lower.starts_with("vinsert") {
-        return Some(SemanticOp::VectorInsert);
-    }
-    if lower.starts_with("vpush") {
-        return Some(SemanticOp::Ups);
-    }
-    if lower.starts_with("vsrs") {
-        return Some(SemanticOp::Srs);
-    }
-    if lower.starts_with("vups") {
-        return Some(SemanticOp::Ups);
-    }
-    if lower == "vclr" || lower.starts_with("vclr.") {
-        return Some(SemanticOp::VectorClear);
-    }
-
-    None
-}
 
 /// Infer element type from a mnemonic suffix.
 ///
@@ -1572,6 +1168,25 @@ pub fn infer_element_type(mnemonic: &str) -> Option<ElementType> {
         Some(ElementType::Float32)
     } else {
         None
+    }
+}
+
+/// Refine a Br semantic to BrCond when the mnemonic indicates a condition.
+///
+/// Structural inference returns `Br` for all delay-slot instructions without lr.
+/// This function upgrades `Br` -> `BrCond` when the mnemonic encodes a condition
+/// (jnz, jz, jnzd, b*). Unconditional jumps (j) stay as `Br`.
+pub fn refine_branch_semantic(mnemonic: &str, semantic: Option<SemanticOp>) -> Option<SemanticOp> {
+    if semantic != Some(SemanticOp::Br) {
+        return semantic;
+    }
+    let mn = mnemonic.to_lowercase();
+    if mn.starts_with("jnz") || mn.starts_with("jz")
+        || (mn.starts_with('b') && !mn.starts_with("bswap"))
+    {
+        Some(SemanticOp::BrCond)
+    } else {
+        semantic
     }
 }
 
@@ -1622,7 +1237,7 @@ pub fn infer_select_variant(mnemonic: &str, semantic: Option<SemanticOp>) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tablegen::types::{InstrAttributes, OperandDef, TemplateParam};
+    use crate::tablegen::types::{InstrAttributes, OperandDef, SemanticPattern, TemplateParam};
 
     fn make_test_data() -> TableGenData {
         let mut data = TableGenData::new();
@@ -1906,46 +1521,6 @@ mod tests {
         assert_eq!(encoding.output_order, vec!["mRx"]);
     }
 
-    #[test]
-    fn test_semantic_inference_from_mnemonic() {
-        // Test that mnemonics get semantic ops inferred
-        assert_eq!(infer_semantic_from_mnemonic("sel.eqz"), Some(SemanticOp::Select));
-        assert_eq!(infer_semantic_from_mnemonic("sel.nez"), Some(SemanticOp::Select));
-        assert_eq!(infer_semantic_from_mnemonic("add"), Some(SemanticOp::Add));
-        assert_eq!(infer_semantic_from_mnemonic("add.nc"), Some(SemanticOp::Add));
-        assert_eq!(infer_semantic_from_mnemonic("sub"), Some(SemanticOp::Sub));
-        assert_eq!(infer_semantic_from_mnemonic("mov"), Some(SemanticOp::Copy));
-        assert_eq!(infer_semantic_from_mnemonic("lt"), Some(SemanticOp::SetLt));
-        assert_eq!(infer_semantic_from_mnemonic("ge.s32"), Some(SemanticOp::SetGe));
-        assert_eq!(infer_semantic_from_mnemonic("and"), Some(SemanticOp::And));
-        assert_eq!(infer_semantic_from_mnemonic("or"), Some(SemanticOp::Or));
-        assert_eq!(infer_semantic_from_mnemonic("xor"), Some(SemanticOp::Xor));
-        assert_eq!(infer_semantic_from_mnemonic("lshl"), Some(SemanticOp::Shl));
-        assert_eq!(infer_semantic_from_mnemonic("ashr"), Some(SemanticOp::Sra));
-        assert_eq!(infer_semantic_from_mnemonic("lshr"), Some(SemanticOp::Srl));
-
-        // Unsigned comparisons
-        assert_eq!(infer_semantic_from_mnemonic("ltu"), Some(SemanticOp::SetUlt));
-        assert_eq!(infer_semantic_from_mnemonic("geu"), Some(SemanticOp::SetUge));
-
-        // Pointer ops
-        assert_eq!(infer_semantic_from_mnemonic("paddb"), Some(SemanticOp::PointerAdd));
-
-        // Branch/call operations
-        assert_eq!(infer_semantic_from_mnemonic("jl"), Some(SemanticOp::Call));
-        assert_eq!(infer_semantic_from_mnemonic("jnz"), Some(SemanticOp::BrCond));
-        assert_eq!(infer_semantic_from_mnemonic("bz"), Some(SemanticOp::BrCond));
-
-        // Lock operations
-        assert_eq!(infer_semantic_from_mnemonic("acq"), Some(SemanticOp::LockAcquire));
-        assert_eq!(infer_semantic_from_mnemonic("rel"), Some(SemanticOp::LockRelease));
-
-        // Done (halt) operation
-        assert_eq!(infer_semantic_from_mnemonic("done"), Some(SemanticOp::Done));
-
-        // Unknown mnemonics return None
-        assert_eq!(infer_semantic_from_mnemonic("unknown"), None);
-    }
 
     #[test]
     fn test_semantic_inference_from_structure() {
@@ -1990,13 +1565,13 @@ mod tests {
             Some(SemanticOp::Done),
         );
 
-        // hasDelaySlot alone (without lr) returns None -- needs mnemonic
-        // to distinguish j vs jnz vs jz
+        // hasDelaySlot alone (without lr) returns Br (baseline branch).
+        // Callers use refine_branch_semantic() to upgrade to BrCond.
         assert_eq!(
             infer_semantic_from_structure(
                 &["srCarry".into()], &[], false, false, true, &[],
             ),
-            None,
+            Some(SemanticOp::Br),
         );
 
         // Pure arithmetic: no structural signals -> None
@@ -2009,20 +1584,36 @@ mod tests {
     }
 
     #[test]
-    fn test_semantic_attached_to_encoding() {
-        // Verify semantic is attached when resolving instructions
-        let data = make_test_data();
+    fn test_semantic_attached_to_encoding_via_pattern() {
+        // Verify semantic is attached when resolving instructions with pattern data.
+        // Without patterns, pure arithmetic instructions (no mayLoad/mayStore/hasDelaySlot)
+        // have no structural signals, so semantic is None.
+        let mut data = make_test_data();
 
-        // ADD has "add" mnemonic, resolver should infer SemanticOp::Add
+        // Without patterns, ADD has no semantic (structural inference yields None
+        // for plain arithmetic)
         let resolver = Resolver::new(&data);
         let add = data.instructions.get("ADD").unwrap();
         let encoding = resolver.resolve_instruction(add).unwrap();
+        assert_eq!(encoding.semantic, None);
 
+        // Add a pattern entry for ADD -> SemanticOp::Add
+        data.patterns.push(SemanticPattern {
+            operation: SemanticOp::Add,
+            instruction: "ADD".to_string(),
+            operand_count: 2,
+            intrinsic_name: None,
+        });
+
+        // Now ADD should get its semantic from the pattern
+        let resolver = Resolver::new(&data);
+        let add = data.instructions.get("ADD").unwrap();
+        let encoding = resolver.resolve_instruction(add).unwrap();
         assert_eq!(encoding.semantic, Some(SemanticOp::Add));
     }
 
     #[test]
-    fn test_select_semantic_from_mnemonic() {
+    fn test_select_semantic_from_pattern() {
         let mut data = make_test_data();
 
         // Add a SELEQZ instruction
@@ -2058,11 +1649,19 @@ mod tests {
             attributes: InstrAttributes::default(),
         });
 
+        // Add a pattern for SELEQZ -> Select
+        data.patterns.push(SemanticPattern {
+            operation: SemanticOp::Select,
+            instruction: "SELEQZ".to_string(),
+            operand_count: 2,
+            intrinsic_name: None,
+        });
+
         let resolver = Resolver::new(&data);
         let seleqz = data.instructions.get("SELEQZ").unwrap();
         let encoding = resolver.resolve_instruction(seleqz).unwrap();
 
-        // Should have Select semantic from mnemonic inference
+        // Should have Select semantic from pattern
         assert_eq!(encoding.semantic, Some(SemanticOp::Select));
 
         // Should have implicit register r27
@@ -2151,14 +1750,13 @@ mod tests {
 
         // Check some key instructions have correct operand ordering
 
-        // SELEQZ should have Select semantic and r27 implicit
+        // SELEQZ: the regex parser can't follow template-parameterized patterns
+        // (SelectNotPat<ValueType type>), so Select semantic is only available
+        // on the tblgen path via pattern post-processing. Verify implicit regs.
         if let Some(seleqz) = data.instructions.get("SELEQZ") {
             let encoding = resolver.resolve_instruction(seleqz).unwrap();
             eprintln!("SELEQZ: semantic={:?}, input_order={:?}, implicit_regs={:?}",
                 encoding.semantic, encoding.input_order, encoding.implicit_regs);
-
-            assert_eq!(encoding.semantic, Some(SemanticOp::Select),
-                "SELEQZ should have Select semantic");
 
             // Check for r27 in implicit registers
             let has_r27 = encoding.implicit_regs.iter()

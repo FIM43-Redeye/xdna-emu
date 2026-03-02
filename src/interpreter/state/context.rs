@@ -369,31 +369,41 @@ pub struct PendingBranch {
     /// The target address to branch to.
     pub target: u32,
     /// Number of delay slots remaining.
-    /// Starts at 6: first tick (on branch cycle) -> 5, then 5 DS instructions -> 0.
+    /// Starts at BRANCH_DELAY_INITIAL: first tick (on branch cycle) -> BRANCH_DELAY_SLOTS,
+    /// then BRANCH_DELAY_SLOTS DS instructions -> 0.
     pub delay_slots: u8,
     /// Whether this branch is a call (jl) that should update LR on completion.
     pub is_call: bool,
 }
 
+/// Branch delay slot count for AIE2 (AM020 Ch4: "5 instruction delay slots").
+/// FIXME: Extract from llvm-aie if/when AIE2SchedModel adds BranchDelaySlots.
+const BRANCH_DELAY_SLOTS: u8 = 5;
+
+/// Initial counter value: BRANCH_DELAY_SLOTS + 1 because tick() is called on
+/// the branch cycle itself (before the first delay-slot instruction executes).
+const BRANCH_DELAY_INITIAL: u8 = BRANCH_DELAY_SLOTS + 1;
+
 impl PendingBranch {
-    /// Create a new pending branch with 5 delay slots.
+    /// Create a new pending branch with BRANCH_DELAY_SLOTS delay slots.
     ///
-    /// Uses initial count of 6 because tick() is called on the branch cycle.
+    /// Uses initial count of BRANCH_DELAY_INITIAL because tick() is called
+    /// on the branch cycle.
     pub fn new(target: u32) -> Self {
         Self {
             target,
-            delay_slots: 6,
+            delay_slots: BRANCH_DELAY_INITIAL,
             is_call: false,
         }
     }
 
-    /// Create a new pending call (jl) with 5 delay slots.
+    /// Create a new pending call (jl) with BRANCH_DELAY_SLOTS delay slots.
     ///
     /// When delay slots are exhausted, the caller should set LR = current PC.
     pub fn new_call(target: u32) -> Self {
         Self {
             target,
-            delay_slots: 6,
+            delay_slots: BRANCH_DELAY_INITIAL,
             is_call: true,
         }
     }

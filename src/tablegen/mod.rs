@@ -61,8 +61,7 @@ pub use resolver::{
     build_decoder_tables, AddressingMode, CompositeEncoder, DecoderIndex, InstrEncoding,
     InstrMemWidth, OperandField, OperandType, RegisterKind, ResolveError, Resolver, SlotIndex,
     classify_operand_type, detect_addressing_mode, detect_mem_width,
-    infer_branch_condition, infer_element_type, infer_select_variant,
-    infer_semantic_from_mnemonic,
+    infer_branch_condition, infer_element_type, infer_select_variant, refine_branch_semantic,
 };
 pub use tblgen_records::{parse_tblgen_records, InstrRecord, SlotEncoding};
 pub use types::{
@@ -353,6 +352,25 @@ fn parse_tblgen_output(
         }
     }
 
+    // Apply Pat<>-derived semantics from fully resolved pattern records.
+    // These override structural inference because they carry more specific
+    // semantic information (e.g., ADD->Add, SELEQZ->Select, ACQ->LockAcquire).
+    let pattern_map = tblgen_records::parse_pattern_records(records_text);
+    let mut pattern_upgraded = 0usize;
+    for encodings in by_slot.values_mut() {
+        for enc in encodings.iter_mut() {
+            if let Some(&op) = pattern_map.get(enc.name.as_str()) {
+                enc.semantic = Some(op);
+                pattern_upgraded += 1;
+            }
+        }
+    }
+    log::info!(
+        "Applied {} pattern-based semantics from {} unique Pat<> records",
+        pattern_upgraded,
+        pattern_map.len(),
+    );
+
     // Log slot counts
     for (slot, encodings) in &by_slot {
         log::debug!("Slot '{}': {} encodings", slot, encodings.len());
@@ -633,7 +651,15 @@ mod tests {
 
         let data = load_from_llvm_aie(llvm_aie_path).unwrap();
 
-        eprintln!("Found {} semantic patterns", data.patterns.len());
+        // Count total patterns and break down by source
+        let total = data.patterns.len();
+        let intrinsic_count = data.patterns.iter()
+            .filter(|p| p.intrinsic_name.is_some())
+            .count();
+        let sdnode_count = total - intrinsic_count;
+
+        eprintln!("Found {} semantic patterns ({} SDNode, {} intrinsic)",
+            total, sdnode_count, intrinsic_count);
 
         // Check that we found some common operations
         let add_patterns = data.instructions_for_semantic(SemanticOp::Add);
@@ -647,13 +673,47 @@ mod tests {
             and_patterns.len()
         );
 
-        // Print some pattern details
-        for pattern in data.patterns.iter().take(10) {
-            eprintln!("  {:?} -> {}", pattern.operation, pattern.instruction);
+        // Check intrinsic-derived patterns exist for key vector operations
+        let matmul = data.instructions_for_semantic(SemanticOp::MatMul);
+        let mac = data.instructions_for_semantic(SemanticOp::Mac);
+        let srs = data.instructions_for_semantic(SemanticOp::Srs);
+        let ups = data.instructions_for_semantic(SemanticOp::Ups);
+        let shuffle = data.instructions_for_semantic(SemanticOp::Shuffle);
+        let lock_acq = data.instructions_for_semantic(SemanticOp::LockAcquire);
+
+        eprintln!(
+            "Intrinsic-derived: {} MatMul, {} Mac, {} Srs, {} Ups, {} Shuffle, {} LockAcquire",
+            matmul.len(), mac.len(), srs.len(), ups.len(), shuffle.len(), lock_acq.len()
+        );
+
+        // Print breakdown by operation type
+        let mut op_counts: std::collections::HashMap<SemanticOp, usize> = std::collections::HashMap::new();
+        for p in &data.patterns {
+            *op_counts.entry(p.operation).or_default() += 1;
+        }
+        let mut sorted: Vec<_> = op_counts.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        eprintln!("All pattern operations:");
+        for (op, count) in &sorted {
+            eprintln!("  {:?}: {}", op, count);
         }
 
         // We should have found at least the basic ALU operations
         assert!(!data.patterns.is_empty(), "Should have found some patterns");
+
+        // Intrinsic patterns should contribute significantly (>50 patterns)
+        assert!(
+            intrinsic_count > 50,
+            "Expected >50 intrinsic-derived patterns, got {}",
+            intrinsic_count
+        );
+
+        // Key vector operations should be present
+        assert!(!matmul.is_empty(), "MatMul patterns should exist");
+        assert!(!srs.is_empty(), "SRS patterns should exist");
+        assert!(!ups.is_empty(), "UPS patterns should exist");
+        assert!(!shuffle.is_empty(), "Shuffle patterns should exist");
+        assert!(!lock_acq.is_empty(), "LockAcquire patterns should exist");
     }
 
     #[test]
@@ -873,34 +933,47 @@ mod tests {
             assert!(st.may_store, "{} should have may_store flag", st.name);
         }
 
-        // Arithmetic: still needs mnemonic fallback (no structural signal)
+        // Arithmetic: ADD gets semantic from Pat<> records (no structural signal)
         if let Some(add) = all.iter().find(|e| e.name == "ADD") {
             assert_eq!(add.semantic, Some(SemanticOp::Add),
-                "ADD should be Add (from mnemonic fallback)");
+                "ADD should be Add (from Pat<> record)");
             assert!(!add.may_load && !add.may_store,
                 "ADD should not have memory flags");
         }
 
-        // Count how many instructions use structural vs mnemonic inference
+        // Move instructions: isMoveImm/isMoveReg structural flags
+        if let Some(mova) = all.iter().find(|e| e.name == "MOVA_lda_cg") {
+            assert_eq!(mova.semantic, Some(SemanticOp::Copy),
+                "MOVA_lda_cg should be Copy (isMoveImm=1)");
+        }
+
+        // NOP instructions: isSlotNOP structural flag
+        if let Some(nopx) = all.iter().find(|e| e.name == "NOPX") {
+            assert_eq!(nopx.semantic, Some(SemanticOp::Nop),
+                "NOPX should be Nop (isSlotNOP=1)");
+        }
+
+        // Count semantics by source
+        let mut pattern_count = 0;
         let mut structural_count = 0;
         let mut total_with_semantic = 0;
         for enc in &all {
             if enc.semantic.is_some() {
                 total_with_semantic += 1;
-                // Check if structure alone would have produced this semantic
+                // Classify source: structural signals vs pattern-derived
                 match enc.semantic {
                     Some(SemanticOp::Load) if enc.may_load => structural_count += 1,
                     Some(SemanticOp::Store) if enc.may_store => structural_count += 1,
-                    Some(SemanticOp::Call) | Some(SemanticOp::Ret) | Some(SemanticOp::Done) =>
+                    Some(SemanticOp::Call) | Some(SemanticOp::Ret) | Some(SemanticOp::Done)
+                    | Some(SemanticOp::Copy) | Some(SemanticOp::Nop) =>
                         structural_count += 1,
-                    _ => {}
+                    _ => pattern_count += 1,
                 }
             }
         }
         eprintln!(
-            "Structural inference: {}/{} instructions ({:.0}% of semantically-typed instructions)",
-            structural_count, total_with_semantic,
-            structural_count as f64 / total_with_semantic.max(1) as f64 * 100.0,
+            "Semantics: {}/{} instructions ({} structural, {} pattern-derived)",
+            total_with_semantic, all.len(), structural_count, pattern_count,
         );
     }
 

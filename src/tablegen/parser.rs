@@ -92,6 +92,14 @@ struct Patterns {
     pat_gpr_gpr: Regex,
     /// Matches PatGpr: `PatGpr<sdnode, INSTR, type>`
     pat_gpr: Regex,
+
+    // Intrinsic pattern patterns
+    /// Matches Pat/PatInaccessibleMem with intrinsic: `Pat<(int_aie2_... args), (INSTR ...)>`
+    /// Also handles zero-arg: `Pat<(int_aie2_done), (DONE)>`
+    intrinsic_pat: Regex,
+    /// Matches foreach with intrinsic list and Pat body.
+    /// Captures: 1=intrinsic list, 2=instruction name from inner Pat
+    foreach_pat: Regex,
 }
 
 static PATTERNS: LazyLock<Patterns> = LazyLock::new(|| Patterns {
@@ -138,6 +146,20 @@ static PATTERNS: LazyLock<Patterns> = LazyLock::new(|| Patterns {
     simple_pat: Regex::new(r"Pat<\s*\(\s*(\w+)\s+[^)]*\)\s*,\s*\(\s*(\w+)").unwrap(),
     pat_gpr_gpr: Regex::new(r"PatGprGpr<\s*(\w+)\s*,\s*(\w+)").unwrap(),
     pat_gpr: Regex::new(r"PatGpr<\s*(\w+)\s*,\s*(\w+)").unwrap(),
+
+    // Intrinsic patterns - Pat/PatInaccessibleMem with int_aie2_ first operand.
+    // Matches both with-args and zero-arg forms:
+    //   Pat<(int_aie2_done), (DONE)>
+    //   Pat<(int_aie2_vshuffle VEC512:$s1, ...), (VSHUFFLE ...)>
+    //   PatInaccessibleMem<(int_aie2_bf_mul16_conf ...), (VMUL_F ...)>
+    intrinsic_pat: Regex::new(
+        r"Pat(?:InaccessibleMem)?<\s*\(\s*(int_aie2_\w+)[^)]*\)\s*,\s*\(\s*(\w+)"
+    ).unwrap(),
+    // foreach Intr = [int_aie2_A, int_aie2_B] in { ... Pat<(Intr ...), (INSTR ...)> ... }
+    // Captures: 1=comma-separated intrinsic list, 2=instruction name
+    foreach_pat: Regex::new(
+        r"(?s)foreach\s+\w+\s*=\s*\[([^\]]+)\]\s*in\s*\{[^}]*\(\s*(\w+)\s+[^)]*\)\s*>"
+    ).unwrap(),
 });
 
 /// Error type for parsing failures.
@@ -894,27 +916,18 @@ pub fn parse_instructions(content: &str) -> Vec<InstrDef> {
 
 /// Parse semantic patterns from AIE2InstrPatterns.td content.
 ///
-/// Extracts mappings from LLVM SDNodes to AIE2 instructions.
+/// Extracts mappings from LLVM SDNodes and intrinsics to AIE2 instructions.
+/// Three tiers of patterns:
+/// - SDNode patterns: `Pat<(add ...), (ADD ...)>` via `from_sdnode()`
+/// - Intrinsic patterns: `Pat<(int_aie2_vshuffle ...), (VSHUFFLE ...)>` via `from_intrinsic()`
+/// - Template patterns: `PatGpr<int_aie2_clb, CLB, i32>` via fallback to `from_intrinsic()`
 pub fn parse_patterns(content: &str) -> Vec<SemanticPattern> {
     let mut patterns = Vec::new();
 
-    // Parse simple Pat<(sdnode ...), (INSTR ...)> patterns
+    // --- Tier 1a: SDNode patterns via Pat<(sdnode ...), (INSTR ...)> ---
+    // The simple_pat regex matches both SDNode and intrinsic names as first
+    // word, but from_sdnode() returns None for intrinsics, so they fall through.
     for caps in PATTERNS.simple_pat.captures_iter(content) {
-        let sdnode = caps.get(1).unwrap().as_str();
-        let instr = caps.get(2).unwrap().as_str().to_string();
-
-        if let Some(op) = SemanticOp::from_sdnode(sdnode) {
-            patterns.push(SemanticPattern {
-                operation: op,
-                instruction: instr,
-                operand_count: 2, // Default assumption
-                intrinsic_name: None,
-            });
-        }
-    }
-
-    // Parse PatGprGpr<sdnode, INSTR, type> patterns
-    for caps in PATTERNS.pat_gpr_gpr.captures_iter(content) {
         let sdnode = caps.get(1).unwrap().as_str();
         let instr = caps.get(2).unwrap().as_str().to_string();
 
@@ -928,18 +941,87 @@ pub fn parse_patterns(content: &str) -> Vec<SemanticPattern> {
         }
     }
 
-    // Parse PatGpr<sdnode, INSTR, type> patterns (unary ops)
-    for caps in PATTERNS.pat_gpr.captures_iter(content) {
-        let sdnode = caps.get(1).unwrap().as_str();
+    // --- Tier 1a: SDNode patterns via PatGprGpr/PatGpr ---
+    for caps in PATTERNS.pat_gpr_gpr.captures_iter(content) {
+        let name = caps.get(1).unwrap().as_str();
         let instr = caps.get(2).unwrap().as_str().to_string();
 
-        if let Some(op) = SemanticOp::from_sdnode(sdnode) {
+        // Try SDNode first, then intrinsic fallback
+        if let Some(op) = SemanticOp::from_sdnode(name)
+            .or_else(|| SemanticOp::from_intrinsic(name))
+        {
+            let intrinsic_name = if name.starts_with("int_aie2_") {
+                Some(name.to_string())
+            } else {
+                None
+            };
+            patterns.push(SemanticPattern {
+                operation: op,
+                instruction: instr,
+                operand_count: 2,
+                intrinsic_name,
+            });
+        }
+    }
+
+    for caps in PATTERNS.pat_gpr.captures_iter(content) {
+        let name = caps.get(1).unwrap().as_str();
+        let instr = caps.get(2).unwrap().as_str().to_string();
+
+        // Try SDNode first, then intrinsic fallback
+        if let Some(op) = SemanticOp::from_sdnode(name)
+            .or_else(|| SemanticOp::from_intrinsic(name))
+        {
+            let intrinsic_name = if name.starts_with("int_aie2_") {
+                Some(name.to_string())
+            } else {
+                None
+            };
             patterns.push(SemanticPattern {
                 operation: op,
                 instruction: instr,
                 operand_count: 1,
-                intrinsic_name: None,
+                intrinsic_name,
             });
+        }
+    }
+
+    // --- Tier 1b: Intrinsic patterns via Pat/PatInaccessibleMem ---
+    // These match `Pat<(int_aie2_... args), (INSTR ...)>` and
+    // `PatInaccessibleMem<(int_aie2_... args), (INSTR ...)>`.
+    for caps in PATTERNS.intrinsic_pat.captures_iter(content) {
+        let intrinsic = caps.get(1).unwrap().as_str();
+        let instr = caps.get(2).unwrap().as_str().to_string();
+
+        if let Some(op) = SemanticOp::from_intrinsic(intrinsic) {
+            patterns.push(SemanticPattern {
+                operation: op,
+                instruction: instr,
+                operand_count: 2,
+                intrinsic_name: Some(intrinsic.to_string()),
+            });
+        }
+    }
+
+    // --- Tier 1c: foreach Intr = [int_aie2_A, int_aie2_B] in { Pat<...> } ---
+    // Each intrinsic in the list maps to the same instruction.
+    for caps in PATTERNS.foreach_pat.captures_iter(content) {
+        let intrinsic_list = caps.get(1).unwrap().as_str();
+        let instr = caps.get(2).unwrap().as_str().to_string();
+
+        for item in intrinsic_list.split(',') {
+            let intrinsic = item.trim();
+            if !intrinsic.starts_with("int_aie2_") {
+                continue;
+            }
+            if let Some(op) = SemanticOp::from_intrinsic(intrinsic) {
+                patterns.push(SemanticPattern {
+                    operation: op,
+                    instruction: instr.clone(),
+                    operand_count: 2,
+                    intrinsic_name: Some(intrinsic.to_string()),
+                });
+            }
         }
     }
 
@@ -1301,5 +1383,146 @@ def : Pat<(mul eR:$s1, eR:$s2), (MUL_mul_r_rr eR:$s1, eR:$s2)>;
         assert_eq!(fields.get("mRx"), Some(&5));
         assert_eq!(fields.get("mRy"), Some(&5));
         assert_eq!(fields.get("c7s"), Some(&7));
+    }
+
+    // =====================================================================
+    // Intrinsic pattern tests
+    // =====================================================================
+
+    const TEST_INTRINSIC_PATTERNS: &str = r#"
+// Pat with intrinsic (zero-arg)
+def : Pat<(int_aie2_done), (DONE)>;
+
+// Pat with intrinsic (multi-arg)
+def : Pat<(int_aie2_vshuffle VEC512:$s1, VEC512:$s2, eR:$mod),
+          (VSHUFFLE_u8_mv VEC512:$s1, VEC512:$s2, eR:$mod)>;
+
+// Pat with matmul intrinsic
+def : Pat<(int_aie2_I512_I512_acc64_mul_conf VEC512:$s1, VEC512:$s2, eR:$c),
+           (VMUL_vmac_cm_core_dense VEC512:$s1, VEC512:$s2, eR:$c)>;
+
+// PatInaccessibleMem with intrinsic (bfloat multiply)
+def : PatInaccessibleMem<(int_aie2_bf_mul16_conf VEC512:$s1, VEC512:$s2, eR:$c),
+           (VMUL_F_vmac_bm_core_dense VEC512:$s1, VEC512:$s2, eR:$c)>;
+
+// PatInaccessibleMem with SRS intrinsic
+def : PatInaccessibleMem<(int_aie2_I256_v16_acc32_srs ACC512:$src, mSs:$shft, 0x0),
+           (VSRS_D16_S32_mv_w_srs ACC512:$src, mSs:$shft)>;
+
+// PatGpr with intrinsic (clb is int_aie2_clb)
+def : PatGpr<int_aie2_clb, CLB, i32>;
+
+// Lock acquire via Pat
+def : Pat<(int_aie2_acquire eR:$mRx, eR:$mRy), (ACQ_mLockId_reg eR:$mRx, eR:$mRy)>;
+"#;
+
+    #[test]
+    fn test_parse_intrinsic_pat() {
+        let patterns = parse_patterns(TEST_INTRINSIC_PATTERNS);
+
+        // Should find Done, Shuffle, MatMul (x2 from Pat and PatInaccessibleMem),
+        // Srs, Clb, LockAcquire
+        let find = |op: SemanticOp| -> Vec<&SemanticPattern> {
+            patterns.iter().filter(|p| p.operation == op).collect()
+        };
+
+        // Done from Pat<(int_aie2_done), (DONE)>
+        let done = find(SemanticOp::Done);
+        assert!(!done.is_empty(), "should find Done pattern");
+        assert_eq!(done[0].instruction, "DONE");
+        assert_eq!(done[0].intrinsic_name.as_deref(), Some("int_aie2_done"));
+
+        // Shuffle from Pat<(int_aie2_vshuffle ...), (VSHUFFLE_u8_mv ...)>
+        let shuf = find(SemanticOp::Shuffle);
+        assert!(!shuf.is_empty(), "should find Shuffle pattern");
+        assert_eq!(shuf[0].instruction, "VSHUFFLE_u8_mv");
+
+        // MatMul from two patterns (Pat and PatInaccessibleMem)
+        let mm = find(SemanticOp::MatMul);
+        assert!(mm.len() >= 2, "should find at least 2 MatMul patterns, got {}", mm.len());
+        let mm_instrs: Vec<&str> = mm.iter().map(|p| p.instruction.as_str()).collect();
+        assert!(mm_instrs.contains(&"VMUL_vmac_cm_core_dense"));
+        assert!(mm_instrs.contains(&"VMUL_F_vmac_bm_core_dense"));
+
+        // Srs from PatInaccessibleMem
+        let srs = find(SemanticOp::Srs);
+        assert!(!srs.is_empty(), "should find Srs pattern");
+        assert_eq!(srs[0].instruction, "VSRS_D16_S32_mv_w_srs");
+
+        // Clb from PatGpr<int_aie2_clb, CLB, i32>
+        let clb = find(SemanticOp::Clb);
+        assert!(!clb.is_empty(), "should find Clb pattern");
+        assert_eq!(clb[0].instruction, "CLB");
+        assert_eq!(clb[0].intrinsic_name.as_deref(), Some("int_aie2_clb"));
+
+        // LockAcquire from Pat
+        let acq = find(SemanticOp::LockAcquire);
+        assert!(!acq.is_empty(), "should find LockAcquire pattern");
+        assert_eq!(acq[0].instruction, "ACQ_mLockId_reg");
+    }
+
+    const TEST_FOREACH_PATTERNS: &str = r#"
+foreach Intr = [int_aie2_I512_I1024_ACC1024_acc32_mul_conf,
+                int_aie2_I512_I1024_ACC1024_acc64_mul_conf] in {
+  def : Pat<(Intr VEC512:$s1, VEC512:$s2, VEC128:$q, eR:$c),
+            (VMUL_vmac_cm_core_sparse_narrow VEC512:$s1, VEC512:$s2, eR:$c)>;
+}
+
+foreach Intr = [int_aie2_I512_I1024_ACC1024_acc32_negmul_conf,
+                int_aie2_I512_I1024_ACC1024_acc64_negmul_conf] in {
+  def : Pat<(Intr VEC512:$s1, VEC512:$s2, VEC128:$q, eR:$c),
+            (VNEGMUL_vmac_cm_core_sparse_narrow VEC512:$s1, VEC512:$s2, eR:$c)>;
+}
+"#;
+
+    #[test]
+    fn test_parse_foreach_intrinsic() {
+        let patterns = parse_patterns(TEST_FOREACH_PATTERNS);
+
+        // Both mul intrinsics map to same (MatMul, VMUL...) so dedup keeps one
+        let mm: Vec<_> = patterns.iter()
+            .filter(|p| p.operation == SemanticOp::MatMul)
+            .collect();
+        assert_eq!(mm.len(), 1, "deduped MatMul pattern");
+        assert_eq!(mm[0].instruction, "VMUL_vmac_cm_core_sparse_narrow");
+        assert!(mm[0].intrinsic_name.is_some());
+
+        // NegMatMul from second foreach
+        let nmm: Vec<_> = patterns.iter()
+            .filter(|p| p.operation == SemanticOp::NegMatMul)
+            .collect();
+        assert_eq!(nmm.len(), 1, "deduped NegMatMul pattern");
+        assert_eq!(nmm[0].instruction, "VNEGMUL_vmac_cm_core_sparse_narrow");
+    }
+
+    #[test]
+    fn test_intrinsic_patterns_dedup() {
+        // If the same (op, instruction) pair appears twice, dedup keeps first
+        let content = r#"
+def : Pat<(int_aie2_vshuffle VEC512:$s1, VEC512:$s2, eR:$mod),
+          (VSHUFFLE_u8_mv VEC512:$s1, VEC512:$s2, eR:$mod)>;
+def : Pat<(int_aie2_vshuffle VEC512:$s1, VEC512:$s2, eR:$mod),
+          (VSHUFFLE_u8_mv VEC512:$s1, VEC512:$s2, eR:$mod)>;
+"#;
+        let patterns = parse_patterns(content);
+        let shuf: Vec<_> = patterns.iter()
+            .filter(|p| p.operation == SemanticOp::Shuffle && p.instruction == "VSHUFFLE_u8_mv")
+            .collect();
+        assert_eq!(shuf.len(), 1, "dedup should keep only one Shuffle->VSHUFFLE_u8_mv");
+    }
+
+    #[test]
+    fn test_sdnode_patterns_still_work() {
+        // Verify the SDNode path still works after the refactor
+        let patterns = parse_patterns(TEST_PATTERNS);
+        let ops: Vec<_> = patterns.iter().map(|p| p.operation).collect();
+        assert!(ops.contains(&SemanticOp::Add));
+        assert!(ops.contains(&SemanticOp::Sub));
+        assert!(ops.contains(&SemanticOp::And));
+        assert!(ops.contains(&SemanticOp::Abs));
+        // SDNode patterns should have no intrinsic_name
+        for p in &patterns {
+            assert!(p.intrinsic_name.is_none(), "SDNode pattern should not have intrinsic_name");
+        }
     }
 }
