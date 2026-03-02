@@ -393,6 +393,7 @@ cargo run -- path/to/binary.xclbin
 ./scripts/run-tests.sh --lib    # Fast: library tests only
 ./scripts/run-tests.sh --doc    # Doc tests only (nice'd, limited parallelism)
 cargo test --lib                # Direct: library tests without script
+TMPDIR=/tmp/claude-1000 cargo test --lib  # Same, but sandbox-safe (temp dirs)
 
 # Benchmark
 cargo bench
@@ -412,6 +413,18 @@ the filter waits for EOF. Instead, redirect output to a file and read it
 afterward, or use `run_in_background` and check the output file with Read.
 The same applies to `dmesg -w` and other streaming commands: redirect to a
 file, never pipe interactively.
+
+**Sandbox mode**: The sandbox is used to enable unattended work, not to
+prevent tool use. `dangerouslyDisableSandbox` still requires user
+authorization, so it is safe to use -- but use it sparingly, because each
+invocation pauses work until the user approves. Prefer staying in the
+sandbox by default:
+- Use `$TMPDIR` (or `/tmp/claude-1000/`) instead of `/tmp` for temp files
+- Many tests that create temp dirs will fail in the sandbox because they
+  use `std::env::temp_dir()` which resolves to `/tmp`. Set
+  `TMPDIR=/tmp/claude-1000` when running `cargo test` to fix this.
+- Only reach for `dangerouslyDisableSandbox` when the sandbox is genuinely
+  blocking (e.g., network access, writing outside allowed paths).
 
 ## How To Begin
 
