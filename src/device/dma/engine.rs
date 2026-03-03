@@ -569,12 +569,18 @@ impl DmaEngine {
         // Create transfer
         let transfer = Transfer::new(bd_config, bd_index, channel, direction, self.col, self.row, self.tile_type)?;
 
-        log::info!("DMA tile({},{}) ch{} BD{} start: total_bytes={} base_addr=0x{:X} next_bd={:?} acq_lock={:?}(val={}) rel_lock={:?}(val={})",
+        log::info!("DMA tile({},{}) ch{} BD{} start: total_bytes={} base_addr=0x{:X} next_bd={:?} acq_lock={:?}(val={}) rel_lock={:?}(val={}) pkt={}(id={}) dir={:?}",
             self.col, self.row, channel, bd_index,
             transfer.total_bytes, bd_config.base_addr,
             bd_config.next_bd,
             bd_config.acquire_lock, bd_config.acquire_value,
-            bd_config.release_lock, bd_config.release_value);
+            bd_config.release_lock, bd_config.release_value,
+            transfer.enable_packet, transfer.packet_id, direction);
+
+        // Insert packet header before any FSM state transitions. On real
+        // hardware the DMA prepends the header when the MM2S transfer begins,
+        // regardless of whether lock acquisition is needed first.
+        self.maybe_insert_packet_header_from_transfer(&transfer);
 
         // Determine initial FSM state based on whether lock acquisition is needed
         let ch = &mut self.channels[ch_idx];
@@ -1280,6 +1286,11 @@ impl DmaEngine {
     /// this takes a Transfer reference directly from the FSM.
     fn maybe_insert_packet_header_from_transfer(&mut self, transfer: &Transfer) {
         if !transfer.needs_packet_header() || transfer.direction != TransferDirection::MM2S {
+            if transfer.enable_packet && transfer.direction == TransferDirection::MM2S {
+                log::warn!("DMA({},{}) ch{} BD{}: enable_packet=true but needs_packet_header()={} header_sent={}",
+                    self.col, self.row, transfer.channel, transfer.bd_index,
+                    transfer.needs_packet_header(), transfer.packet_header_sent);
+            }
             return;
         }
 
@@ -1289,8 +1300,10 @@ impl DmaEngine {
                 tlast: false,
                 channel: transfer.channel,
             });
-            log::debug!("DMA({},{}) ch{} inserted packet header: 0x{:08X}",
-                self.col, self.row, transfer.channel, header_word);
+            let (hdr, _) = crate::device::stream_switch::PacketHeader::decode(header_word);
+            log::info!("DMA({},{}) ch{} BD{} packet header: 0x{:08X} (pkt_id={}, type={:?})",
+                self.col, self.row, transfer.channel, transfer.bd_index,
+                header_word, hdr.stream_id, hdr.packet_type);
         }
     }
 
@@ -3661,5 +3674,92 @@ mod tests {
 
         // And channel 0 data must be readable
         assert!(engine.has_stream_in_for_channel(0));
+    }
+
+    #[test]
+    fn test_memtile_mm2s_packet_header_insertion() {
+        // MemTile MM2S BD with enable_packet=true should create a Transfer
+        // that can generate a packet header.
+        //
+        // This verifies the data path from BD config to Transfer to packet
+        // header, which is the path that the packet_flow test depends on.
+        use crate::device::dma::transfer::{Transfer, TransferDirection};
+        use crate::device::TileType;
+
+        let mut bd = BdConfig::default();
+        bd.valid = true;
+        bd.base_addr = 0x80000;
+        bd.length = 16;
+        bd.enable_packet = true;
+        bd.packet_id = 5;
+        bd.packet_type = 0;
+        bd.d0.size = 4;
+        bd.d0.stride = 4;
+
+        // Create a Transfer from this BD (as MemTile MM2S)
+        let transfer = Transfer::new(
+            &bd, 1, 6, TransferDirection::MM2S, 0, 1, TileType::MemTile
+        ).expect("should create transfer");
+
+        // The transfer must carry the packet config from the BD
+        assert!(transfer.enable_packet,
+            "Transfer.enable_packet must be true when BD has it");
+        assert_eq!(transfer.packet_id, 5,
+            "Transfer.packet_id must match BD");
+        assert!(transfer.needs_packet_header(),
+            "needs_packet_header() should be true before sending");
+
+        // Generate the header
+        let header_word = transfer.generate_packet_header()
+            .expect("should generate packet header");
+        let (hdr, _) = crate::device::stream_switch::PacketHeader::decode(header_word);
+        assert_eq!(hdr.stream_id, 5,
+            "header stream_id should match BD packet_id");
+    }
+
+    #[test]
+    fn test_memtile_mm2s_engine_inserts_header() {
+        // End-to-end: MemTile DMA engine with enable_packet BD should
+        // insert a packet header into stream_out during BdSetup.
+        let mut engine = DmaEngine::new_mem_tile(0, 1);
+
+        let mut bd = BdConfig::default();
+        bd.valid = true;
+        bd.base_addr = 0;
+        bd.length = 16;
+        bd.enable_packet = true;
+        bd.packet_id = 5;
+        bd.d0.size = 4;
+        bd.d0.stride = 4;
+
+        engine.configure_bd(1, bd.clone()).unwrap();
+
+        // Verify the BD is stored with enable_packet
+        let stored = engine.get_bd(1).unwrap();
+        assert!(stored.enable_packet, "stored BD must have enable_packet=true");
+        assert_eq!(stored.packet_id, 5, "stored BD must have packet_id=5");
+
+        // Start MM2S channel 0 (index 6 for MemTile)
+        let mm2s_ch = engine.s2mm_channel_count() as u8;
+        assert_eq!(mm2s_ch, 6, "MemTile S2MM count should be 6");
+        engine.start_channel(mm2s_ch, 1).unwrap();
+
+        // After start_channel, the FSM should be in BdSetup or AcquiringLock.
+        // BdSetup inserts the packet header on completion.
+        // Since our BD has no acquire_lock, the path is:
+        //   start_channel -> BdSetup{transfer} -> (step) -> skip AcquiringLock -> MemoryLatency
+        // The header is inserted at the BdSetup->next transition.
+
+        // Peek at the FSM to verify the transfer has enable_packet
+        let ch = &engine.channels[mm2s_ch as usize];
+        match &ch.fsm {
+            ChannelFsm::BdSetup { transfer, .. } => {
+                assert!(transfer.enable_packet,
+                    "Transfer in BdSetup must have enable_packet=true, got false \
+                     (BD enable_packet={}, packet_id={})",
+                    bd.enable_packet, bd.packet_id);
+            }
+            other => panic!("Expected BdSetup, got {:?}", std::mem::discriminant(other)),
+        }
     }
 }

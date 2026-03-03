@@ -984,11 +984,18 @@ impl DeviceState {
         } else if (ss.slave_base..ss.slave_end).contains(&offset) {
             let port = ((offset - ss.slave_base) / 4) as usize;
             let enable = (value >> ENABLE_BIT) & 1 != 0;
+            let packet_enable = (value >> 30) & 1 != 0;
 
             if let Some(tile) = self.array.get_mut(col, row) {
                 if port < tile.stream_switch.slaves.len() {
                     tile.stream_switch.slaves[port].config = value;
                     tile.stream_switch.slaves[port].enabled = enable;
+                    tile.stream_switch.slaves[port].packet_enable = packet_enable;
+
+                    if packet_enable {
+                        log::info!("Tile ({},{}) stream switch: slave[{}] packet mode enabled",
+                            col, row, port);
+                    }
                 }
             }
         // Slave slot registers (packet routing config per slave port)
@@ -1082,12 +1089,13 @@ impl DeviceState {
                     log::debug!("Failed to configure MemTile BD {} on DmaEngine ({},{}): {:?}",
                         bd_idx, col, row, e);
                 } else if config.valid {
-                    log::info!("CDO configured MemTile BD {} on tile ({},{}) addr=0x{:X} len={} d0=[{},{}] d1=[{},{}] acq={:?} rel={:?} next={:?}",
+                    log::info!("CDO configured MemTile BD {} on tile ({},{}) addr=0x{:X} len={} d0=[{},{}] d1=[{},{}] acq={:?} rel={:?} next={:?} pkt={}(id={},type={})",
                         bd_idx, col, row, config.base_addr, config.length,
                         config.d0.size, config.d0.stride, config.d1.size, config.d1.stride,
                         config.acquire_lock.map(|id| (id, config.acquire_value)),
                         config.release_lock.map(|id| (id, config.release_value)),
-                        config.next_bd);
+                        config.next_bd,
+                        config.enable_packet, config.packet_id, config.packet_type);
                 }
             }
         }
@@ -1164,12 +1172,13 @@ impl DeviceState {
                         bd_idx, col, row, e,
                     ));
                 } else if config.valid {
-                    log::info!("CDO configured MemTile BD {} on tile ({},{}) addr=0x{:X} len={} d0=[{},{}] d1=[{},{}] acq={:?} rel={:?} next={:?}",
+                    log::info!("CDO configured MemTile BD {} on tile ({},{}) addr=0x{:X} len={} d0=[{},{}] d1=[{},{}] acq={:?} rel={:?} next={:?} pkt={}(id={},type={})",
                         bd_idx, col, row, config.base_addr, config.length,
                         config.d0.size, config.d0.stride, config.d1.size, config.d1.stride,
                         config.acquire_lock.map(|id| (id, config.acquire_value)),
                         config.release_lock.map(|id| (id, config.release_value)),
-                        config.next_bd);
+                        config.next_bd,
+                        config.enable_packet, config.packet_id, config.packet_type);
                 }
             }
         }
@@ -1348,6 +1357,7 @@ impl DeviceState {
         } else if (ss.slave_base..ss.slave_end).contains(&offset) {
             let port = ((offset - ss.slave_base) / 4) as usize;
             let enable = (value >> ENABLE_BIT) & 1 != 0;
+            let packet_enable = (value >> 30) & 1 != 0;
 
             let tile = match self.array.get_mut(col, row) {
                 Some(t) => t,
@@ -1358,10 +1368,16 @@ impl DeviceState {
             if port < tile.stream_switch.slaves.len() {
                 tile.stream_switch.slaves[port].config = value;
                 tile.stream_switch.slaves[port].enabled = enable;
+                tile.stream_switch.slaves[port].packet_enable = packet_enable;
             }
 
-            log::debug!("MemTile ({},{}) stream switch slave[{}] = 0x{:08X} (en={})",
-                col, row, port, value, enable);
+            if packet_enable {
+                log::info!("MemTile ({},{}) stream switch slave[{}] packet mode (0x{:08X})",
+                    col, row, port, value);
+            } else {
+                log::debug!("MemTile ({},{}) stream switch slave[{}] = 0x{:08X} (en={})",
+                    col, row, port, value, enable);
+            }
         // Slave slot registers (packet routing config per slave port)
         } else if (ss.slave_slot_base..ss.slave_slot_end).contains(&offset) {
             let slot_offset = offset - ss.slave_slot_base;

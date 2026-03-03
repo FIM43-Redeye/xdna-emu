@@ -136,6 +136,10 @@ pub struct StreamPort {
     pub route_to: Option<(u8, u8, u8)>, // (col, row, port_index)
     /// Port is enabled
     pub enabled: bool,
+    /// Port is in packet-switched mode (bit 30 of slave config register).
+    /// When true, step_packet_routes() processes this port's data as packets.
+    /// When false, data flows through circuit routes only.
+    pub packet_enable: bool,
 }
 
 impl StreamPort {
@@ -156,6 +160,7 @@ impl StreamPort {
             config: 0,
             route_to: None,
             enabled: false,
+            packet_enable: false,
             cycle_active: false,
             cycle_stalled: false,
             cycle_tlast: false,
@@ -818,7 +823,15 @@ impl StreamSwitch {
         let num_slaves = self.slaves.len();
 
         for slave_idx in 0..num_slaves {
-            // Skip slaves with no enabled packet slots
+            // Skip slaves not in packet mode. The slave config register's
+            // packet_enable bit (bit 30) determines whether this port uses
+            // packet routing. Without this check, raw data on circuit-mode
+            // ports would be misinterpreted as packet headers.
+            if !self.slaves[slave_idx].packet_enable {
+                continue;
+            }
+
+            // Also skip if no slots are configured (defensive)
             let has_any_slot = self.slave_slots.get(slave_idx)
                 .map_or(false, |slots| slots.iter().any(|s| s.enable));
             if !has_any_slot {
@@ -909,10 +922,21 @@ impl StreamSwitch {
                         // No route configured. On real hardware, packets
                         // always have a valid route (CDO sets them up).
                         // This indicates a CDO parsing or configuration bug.
+                        //
+                        // Dump full slot config for this slave to aid diagnosis.
+                        let port_type = &self.slaves[slave_idx].port_type;
+                        let slots: Vec<String> = self.slave_slots[slave_idx].iter()
+                            .enumerate()
+                            .map(|(i, s)| format!(
+                                "slot[{}]: en={} id={} mask=0x{:02X} msel={} arb={}",
+                                i, s.enable, s.pkt_id, s.mask, s.msel, s.arbiter
+                            ))
+                            .collect();
                         let msg = format!(
-                            "TileSwitch({},{}): no packet route for pkt_id={} on slave[{}] -- \
-                             impossible on real hardware (missing CDO route config?)",
-                            self.col, self.row, pkt_id, slave_idx,
+                            "TileSwitch({},{}): no packet route for pkt_id={} on slave[{}] ({:?}) \
+                             header=0x{:08X} -- configured slots: [{}]",
+                            self.col, self.row, pkt_id, slave_idx, port_type,
+                            header_word, slots.join(", "),
                         );
                         log::error!("{}", msg);
                         self.fatal_errors.push(msg);
@@ -980,6 +1004,9 @@ impl StreamSwitch {
         for slave_idx in 0..self.slaves.len() {
             if self.active_packets[slave_idx].is_some() {
                 return true;
+            }
+            if !self.slaves[slave_idx].packet_enable {
+                continue;
             }
             let has_any_slot = self.slave_slots.get(slave_idx)
                 .map_or(false, |slots| slots.iter().any(|s| s.enable));
@@ -1847,6 +1874,9 @@ mod tests {
         // With locking, one completes its full packet before the other starts.
         let mut ss = StreamSwitch::new_compute_tile(0, 2);
 
+        // Enable packet mode on trace slave ports
+        ss.slaves[23].packet_enable = true;
+        ss.slaves[24].packet_enable = true;
         // Slave 23 (core trace): pkt_id=1, arbiter=0, msel=0
         ss.configure_slave_slot(23, 0, make_slot_reg(1, 0x1F, 0, 0));
         // Slave 24 (mem trace): pkt_id=2, arbiter=0, msel=0
@@ -1910,6 +1940,9 @@ mod tests {
         // Two slaves use DIFFERENT arbiters -- both proceed simultaneously.
         let mut ss = StreamSwitch::new_compute_tile(0, 2);
 
+        // Enable packet mode on trace slave ports
+        ss.slaves[23].packet_enable = true;
+        ss.slaves[24].packet_enable = true;
         // Slave 23: pkt_id=1, arbiter=0, msel=0
         ss.configure_slave_slot(23, 0, make_slot_reg(1, 0x1F, 0, 0));
         // Slave 24: pkt_id=2, arbiter=1, msel=0
@@ -1954,6 +1987,9 @@ mod tests {
         // Verify the arbiter is freed after TLAST so the next packet can proceed.
         let mut ss = StreamSwitch::new_compute_tile(0, 2);
 
+        // Enable packet mode on trace slave ports
+        ss.slaves[23].packet_enable = true;
+        ss.slaves[24].packet_enable = true;
         // Slave 23: arbiter=0
         ss.configure_slave_slot(23, 0, make_slot_reg(1, 0x1F, 0, 0));
         // Slave 24: arbiter=0 (same!)
@@ -2089,5 +2125,157 @@ mod tests {
         assert!(!ss.slaves[0].cycle_tlast);
         assert!(!ss.masters[0].cycle_stalled);
         assert!(!ss.masters[0].cycle_tlast);
+    }
+
+    // ========================================================================
+    // Packet routing integration tests (MemTile-focused)
+    // ========================================================================
+
+    #[test]
+    fn test_packet_routing_basic_memtile() {
+        // MemTile DMA slave[0] routes pkt_id=0 to North master[12].
+        // Verifies the fundamental packet path: header match -> arbiter -> master.
+        let mut ss = StreamSwitch::new_mem_tile(0, 1);
+
+        // Enable packet mode on slave[0] (bit 31=enable, bit 30=packet_enable)
+        ss.slaves[0].packet_enable = true;
+        // Slave[0] (DMA:0): pkt_id=0, mask=0x1F, arbiter=0, msel=0
+        ss.configure_slave_slot(0, 0, make_slot_reg(0, 0x1F, 0, 0));
+        // Master[12] (North:1): packet mode, arbiter=0, msel_enable=0b0001
+        ss.configure_master_packet(12, make_master_pkt_reg(0, 0b0001, false));
+
+        // Build a 4-word packet: header + 2 data + data+TLAST
+        let hdr = PacketHeader::new(0, 0, 1).encode();
+        ss.slaves[0].push_with_tlast(hdr, false);
+        ss.slaves[0].push_with_tlast(0xDA7A_0001, false);
+        ss.slaves[0].push_with_tlast(0xDA7A_0002, false);
+        ss.slaves[0].push_with_tlast(0xDA7A_0003, true);
+
+        // Step and drain master each time (FIFO capacity is 2)
+        let mut output = Vec::new();
+        for _ in 0..8 {
+            ss.step();
+            while let Some((w, _)) = ss.masters[12].pop_with_tlast() {
+                output.push(w);
+            }
+        }
+
+        assert_eq!(output.len(), 4, "master[12] should have 4 words: {:08X?}", output);
+        assert_eq!(output[0], hdr, "first word should be the header");
+        assert_eq!(output[1], 0xDA7A_0001);
+        assert_eq!(output[2], 0xDA7A_0002);
+        assert_eq!(output[3], 0xDA7A_0003);
+
+        // No other master should have data (spot-check DMA and South masters)
+        for m in [0, 1, 7, 8, 9, 10, 11, 13] {
+            assert!(!ss.masters[m].has_data(),
+                "master[{}] should be empty but has data", m);
+        }
+    }
+
+    #[test]
+    fn test_packet_routing_multi_slave_memtile() {
+        // Two MemTile slaves with different pkt_ids route to different masters.
+        // slave[0] (DMA:0) pkt_id=0 -> master[9] (South:2)
+        // slave[13] (North:0) pkt_id=1 -> master[0] (DMA:0)
+        let mut ss = StreamSwitch::new_mem_tile(0, 1);
+
+        // Enable packet mode on both slaves
+        ss.slaves[0].packet_enable = true;
+        ss.slaves[13].packet_enable = true;
+        // Slave[0]: pkt_id=0, arbiter=0, msel=0
+        ss.configure_slave_slot(0, 0, make_slot_reg(0, 0x1F, 0, 0));
+        // Slave[13]: pkt_id=1, arbiter=1, msel=0
+        ss.configure_slave_slot(13, 0, make_slot_reg(1, 0x1F, 0, 1));
+
+        // Master[9] (South:2): arbiter=0, msel_enable=0b0001
+        ss.configure_master_packet(9, make_master_pkt_reg(0, 0b0001, false));
+        // Master[0] (DMA:0): arbiter=1, msel_enable=0b0001
+        ss.configure_master_packet(0, make_master_pkt_reg(1, 0b0001, false));
+
+        // Packet from DMA slave (pkt_id=0): 2 words
+        let hdr0 = PacketHeader::new(0, 0, 1).encode();
+        ss.slaves[0].push_with_tlast(hdr0, false);
+        ss.slaves[0].push_with_tlast(0xAAAA_0001, true);
+
+        // Packet from North slave (pkt_id=1): 2 words
+        let hdr1 = PacketHeader::new(1, 0, 2).encode();
+        ss.slaves[13].push_with_tlast(hdr1, false);
+        ss.slaves[13].push_with_tlast(0xBBBB_0001, true);
+
+        // Step enough times
+        for _ in 0..4 {
+            ss.step();
+        }
+
+        // Master[9] should have pkt_id=0 data
+        let (w, _) = ss.masters[9].pop_with_tlast().unwrap();
+        assert_eq!(w & 0x1F, 0, "master[9] should have pkt_id=0");
+
+        // Master[0] should have pkt_id=1 data
+        let (w, _) = ss.masters[0].pop_with_tlast().unwrap();
+        assert_eq!(w & 0x1F, 1, "master[0] should have pkt_id=1");
+    }
+
+    #[test]
+    fn test_packet_routing_drop_header() {
+        // When drop_header=true, the header word is consumed from the slave
+        // but NOT forwarded to the master. Only data words appear in output.
+        let mut ss = StreamSwitch::new_mem_tile(0, 1);
+
+        // Enable packet mode on slave[0]
+        ss.slaves[0].packet_enable = true;
+        // Slave[0]: pkt_id=0, arbiter=0, msel=0
+        ss.configure_slave_slot(0, 0, make_slot_reg(0, 0x1F, 0, 0));
+        // Master[0]: arbiter=0, msel_enable=0b0001, drop_header=TRUE
+        ss.configure_master_packet(0, make_master_pkt_reg(0, 0b0001, true));
+
+        // 3-word packet: header + data + data+TLAST
+        let hdr = PacketHeader::new(0, 0, 1).encode();
+        ss.slaves[0].push_with_tlast(hdr, false);
+        ss.slaves[0].push_with_tlast(0xDA7A_0001, false);
+        ss.slaves[0].push_with_tlast(0xDA7A_0002, true);
+
+        for _ in 0..4 {
+            ss.step();
+        }
+
+        // Master should have only the 2 data words (header dropped)
+        let mut output = Vec::new();
+        while let Some((w, _)) = ss.masters[0].pop_with_tlast() {
+            output.push(w);
+        }
+        assert_eq!(output.len(), 2,
+            "drop_header should remove header, leaving 2 data words: {:08X?}", output);
+        assert_eq!(output[0], 0xDA7A_0001);
+        assert_eq!(output[1], 0xDA7A_0002);
+
+        // Slave should be empty (header was consumed, not left behind)
+        assert!(!ss.slaves[0].has_data(), "slave should be drained");
+    }
+
+    #[test]
+    fn test_packet_routing_no_route_is_fatal() {
+        // A packet with no matching route should produce a fatal error.
+        let mut ss = StreamSwitch::new_mem_tile(0, 1);
+
+        // Enable packet mode on slave[0]
+        ss.slaves[0].packet_enable = true;
+        // Configure slave[0] for pkt_id=0 only
+        ss.configure_slave_slot(0, 0, make_slot_reg(0, 0x1F, 0, 0));
+        ss.configure_master_packet(9, make_master_pkt_reg(0, 0b0001, false));
+
+        // Push a packet with pkt_id=1 (unmatched)
+        let hdr = PacketHeader::new(1, 0, 1).encode();
+        ss.slaves[0].push_with_tlast(hdr, false);
+        ss.slaves[0].push_with_tlast(0xDA7A_0001, true);
+
+        ss.step();
+
+        // Should produce a fatal error
+        assert!(!ss.fatal_errors.is_empty(),
+            "unroutable packet should produce fatal error");
+        assert!(ss.fatal_errors[0].contains("no packet route"),
+            "error should mention 'no packet route': {}", ss.fatal_errors[0]);
     }
 }
