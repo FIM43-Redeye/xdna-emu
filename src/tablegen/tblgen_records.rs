@@ -110,6 +110,10 @@ pub struct InstrRecord {
     pub is_terminator: bool,
     /// isCompare flag -- instruction is a comparison.
     pub is_compare: bool,
+    /// isComposite flag -- this record is a VLIW bundle envelope (e.g.,
+    /// I128_LDB_LDA_ST_ALU_MV_VEC), not a real instruction. These define
+    /// bundle layout and are handled separately via CompositeFormatDef.
+    pub is_composite: bool,
     /// Itinerary class name from `InstrItinClass Itinerary = II_ADD;`.
     /// Links this instruction to its pipeline timing data in the scheduling model.
     /// None only if the field is absent; "NoItinerary" means explicitly unscheduled.
@@ -330,6 +334,7 @@ fn parse_single_record(lines: &[&str], i: &mut usize) -> Option<InstrRecord> {
         is_select: false,
         is_terminator: false,
         is_compare: false,
+        is_composite: false,
         itinerary_class: None,
     };
 
@@ -386,6 +391,8 @@ fn parse_single_record(lines: &[&str], i: &mut usize) -> Option<InstrRecord> {
             record.is_terminator = line.contains("= 1");
         } else if line.starts_with("bit isCompare = ") {
             record.is_compare = line.contains("= 1");
+        } else if line.starts_with("bit isComposite = ") {
+            record.is_composite = line.contains("= 1");
         } else if line.starts_with("InstrItinClass Itinerary = ") {
             let val = line
                 .strip_prefix("InstrItinClass Itinerary = ")
@@ -562,12 +569,15 @@ fn parse_encoding_bits(content: &str) -> Vec<EncodingBit> {
 impl InstrRecord {
     /// Convert to InstrEncoding for the decoder.
     ///
-    /// Returns None for isCodeGenOnly instructions, which exist only for the
-    /// compiler's instruction selection and must not participate in decoding.
-    /// Including them causes ambiguous matches (e.g., MOV_OR vs OR have identical
-    /// fixed bits but different operand counts, leading to lost source operands).
+    /// Returns None for:
+    /// - `isCodeGenOnly` instructions: exist only for the compiler's instruction
+    ///   selection and must not participate in decoding (e.g., MOV_OR vs OR have
+    ///   identical fixed bits but different operand counts).
+    /// - `isComposite` records: VLIW bundle envelope definitions (e.g.,
+    ///   I128_LDB_LDA_ST_ALU_MV_VEC) that describe bundle layout, not real
+    ///   instructions. These are handled separately via CompositeFormatDef.
     pub fn to_encoding(&self) -> Option<InstrEncoding> {
-        if self.is_code_gen_only {
+        if self.is_code_gen_only || self.is_composite {
             return None;
         }
         let enc = self.slot_encoding.as_ref()?;
@@ -1146,19 +1156,40 @@ pub fn parse_composite_formats(content: &str) -> Vec<CompositeFormatDef> {
 /// }
 /// ```
 ///
-/// Returns a map from instruction name to SemanticOp. If multiple patterns
-/// map the same instruction, the last one wins (they should agree).
+/// Returns a map from instruction name to SemanticOp.
+///
+/// Multiple Pat<> records can map the same hardware instruction because LLVM
+/// uses operand transformations (swapping, negation, wrapping) at compile time
+/// to reuse instructions for different SDNode operations. For example:
+///
+/// - `(setult a, b) -> (LTU a, b)` -- direct: LTU computes less-than
+/// - `(setugt a, b) -> (LTU b, a)` -- compiler swaps operands at selection time
+/// - `(add a, imm) -> (ADD a, imm)` -- direct: ADD adds
+/// - `(sub a, imm) -> (ADD a, (NegateImm imm))` -- compiler negates at selection
+/// - `(srl a, b) -> (LSHL a, (SUB 0, b))` -- compiler negates shift amount
+///
+/// By the time the emulator decodes the binary, these compiler transformations
+/// are already baked into the operands. The hardware always performs its native
+/// operation: LTU compares <, ADD adds, LSHL shifts left. We need the semantic
+/// that matches the hardware's actual behavior, not the compiler's intent.
+///
+/// **Selection rule**: "direct" patterns (where ResultInstrs contains only the
+/// target instruction with plain operand references) win over "compound" patterns
+/// (where ResultInstrs wraps the instruction in NegateImm, SUB, or other ops).
+/// CmpSwapPat patterns (operand-swapped) also lose to CmpPat (direct).
 pub fn parse_pattern_records(content: &str) -> HashMap<String, SemanticOp> {
-    let mut result: HashMap<String, SemanticOp> = HashMap::new();
+    // Collect ALL candidates per instruction, then pick the best one.
+    let mut candidates: HashMap<String, Vec<(SemanticOp, bool)>> = HashMap::new();
     let lines: Vec<&str> = content.lines().collect();
     let mut i = 0;
 
     while i < lines.len() {
         // Look for "def anonymous_NNNN {  // Pattern Pat ..."
         if lines[i].starts_with("def anonymous_") && lines[i].contains("Pattern Pat") {
+            let is_direct = !lines[i].contains("CmpSwapPat");
             i += 1;
             let mut pattern_dag: Option<&str> = None;
-            let mut result_instr: Option<String> = None;
+            let mut result_instrs_line: Option<&str> = None;
 
             // Parse fields until closing brace
             while i < lines.len() {
@@ -1170,19 +1201,43 @@ pub fn parse_pattern_records(content: &str) -> HashMap<String, SemanticOp> {
                 if line.starts_with("dag PatternToMatch = ") {
                     pattern_dag = Some(line);
                 } else if line.starts_with("list<dag> ResultInstrs = ") {
-                    result_instr = extract_result_instruction(line);
+                    result_instrs_line = Some(line);
                 }
                 i += 1;
             }
 
-            // Map the pattern to a SemanticOp
-            if let (Some(dag), Some(instr_name)) = (pattern_dag, result_instr) {
-                if let Some(op) = extract_semantic_from_dag(dag) {
-                    result.insert(instr_name, op);
+            if let (Some(dag), Some(result_line)) = (pattern_dag, result_instrs_line) {
+                if let Some(instr_name) = extract_result_instruction(result_line) {
+                    if let Some(op) = extract_semantic_from_dag(dag) {
+                        // A "direct" pattern has simple operand references in
+                        // ResultInstrs -- no nested instruction calls like
+                        // (NegateImm ...) or (SUB ...) that transform operands.
+                        let is_simple_result = is_direct
+                            && !result_line.contains("NegateImm")
+                            && !result_line.contains("(SUB ")
+                            && !result_line.contains("(ADD ");
+                        candidates
+                            .entry(instr_name)
+                            .or_default()
+                            .push((op, is_simple_result));
+                    }
                 }
             }
         }
         i += 1;
+    }
+
+    // Pick the best candidate for each instruction.
+    // Prefer "simple/direct" patterns over compound/swapped ones.
+    let mut result: HashMap<String, SemanticOp> = HashMap::new();
+    for (instr_name, cands) in &candidates {
+        // First try: a simple/direct pattern (hardware-matching)
+        if let Some((op, _)) = cands.iter().find(|(_, is_simple)| *is_simple) {
+            result.insert(instr_name.clone(), *op);
+        } else if let Some((op, _)) = cands.first() {
+            // Fallback: use the first pattern (better than nothing)
+            result.insert(instr_name.clone(), *op);
+        }
     }
 
     result
@@ -1530,6 +1585,107 @@ def NOT_A_PATTERN {	// SomeOtherClass
 
         // Should have exactly 4 entries (ADD, SELEQZ, ACQ, REL, OR = 5 minus PseudoJNZ)
         assert_eq!(map.len(), 5, "Expected 5 pattern mappings, got {}: {:?}", map.len(), map);
+    }
+
+    /// Verify that conflicting Pat<> records resolve to the hardware-native
+    /// semantic, not a compiler selection trick.
+    ///
+    /// LLVM reuses instructions for multiple SDNode operations via operand
+    /// transforms (CmpSwapPat swaps operands, NegateImm negates immediates).
+    /// These transforms happen at compile time -- by the time the emulator
+    /// decodes the binary, the hardware instruction always performs its
+    /// native operation. We must pick the "direct" pattern, not the
+    /// compiler-transformed one.
+    #[test]
+    fn test_parse_pattern_records_conflicting_semantics() {
+        let content = r#"
+def anonymous_200 {	// Pattern Pat CmpPat
+  dag PatternToMatch = (i32 (setult (i32 eR:$rs1), (i32 eR:$rs2)));
+  list<dag> ResultInstrs = [(LTU eR:$rs1, eR:$rs2)];
+  int AddedComplexity = 0;
+  bit GISelShouldIgnore = 0;
+}
+def anonymous_201 {	// Pattern Pat CmpSwapPat
+  dag PatternToMatch = (i32 (setugt (i32 eR:$rs1), (i32 eR:$rs2)));
+  list<dag> ResultInstrs = [(LTU eR:$rs2, eR:$rs1)];
+  int AddedComplexity = 0;
+  bit GISelShouldIgnore = 0;
+}
+def anonymous_202 {	// Pattern Pat
+  dag PatternToMatch = (i32 (add (i32 eR:$s0), simm7:$imm));
+  list<dag> ResultInstrs = [(ADD_ri eR:$s0, simm7:$imm)];
+  int AddedComplexity = 0;
+  bit GISelShouldIgnore = 0;
+}
+def anonymous_203 {	// Pattern Pat
+  dag PatternToMatch = (i32 (sub (i32 eR:$s0), simm7_negated:$imm));
+  list<dag> ResultInstrs = [(ADD_ri eR:$s0, (NegateImm simm7_negated:$imm))];
+  int AddedComplexity = 0;
+  bit GISelShouldIgnore = 0;
+}
+def anonymous_204 {	// Pattern Pat
+  dag PatternToMatch = (srl (i32 eR:$rs1), (i32 eR:$rs2));
+  list<dag> ResultInstrs = [(LSHL eR:$rs1, (SUB (MOV (i32 0)), eR:$rs2))];
+  int AddedComplexity = 0;
+  bit GISelShouldIgnore = 0;
+}
+def anonymous_205 {	// Pattern Pat
+  dag PatternToMatch = (shl (i32 eR:$rs1), (i32 eR:$rs2));
+  list<dag> ResultInstrs = [(LSHL eR:$rs1, eR:$rs2)];
+  int AddedComplexity = 0;
+  bit GISelShouldIgnore = 0;
+}
+"#;
+
+        let map = parse_pattern_records(content);
+
+        // LTU: CmpPat (setult) must win over CmpSwapPat (setugt).
+        // Hardware LTU always computes operand1 < operand2.
+        assert_eq!(map.get("LTU"), Some(&SemanticOp::SetUlt),
+            "LTU must get SetUlt (direct CmpPat), not SetUgt (CmpSwapPat)");
+
+        // ADD_ri: direct add pattern must win over compound sub+NegateImm.
+        // Hardware ADD always adds; compiler negates immediate for sub.
+        assert_eq!(map.get("ADD_ri"), Some(&SemanticOp::Add),
+            "ADD_ri must get Add (direct), not Sub (compound NegateImm)");
+
+        // LSHL: direct shl pattern must win over compound srl+SUB wrapper.
+        // Hardware LSHL always shifts left; compiler negates amount for srl.
+        assert_eq!(map.get("LSHL"), Some(&SemanticOp::Shl),
+            "LSHL must get Shl (direct), not Srl (compound SUB wrapper)");
+    }
+
+    /// Verify with real tblgen data that comparison instructions get
+    /// the correct hardware-native semantics.
+    #[test]
+    fn test_parse_pattern_records_real_comparisons() {
+        let cache_path = std::path::Path::new(env!("HOME"))
+            .join(".cache/xdna-emu/tblgen/records.txt");
+        if !cache_path.exists() {
+            eprintln!("Skipping test: tblgen cache not found");
+            return;
+        }
+
+        let content = std::fs::read_to_string(&cache_path).unwrap();
+        let map = parse_pattern_records(&content);
+
+        // Every comparison instruction must get the semantic matching its
+        // hardware behavior, not the CmpSwapPat/compiler-trick version.
+        assert_eq!(map.get("LTU"), Some(&SemanticOp::SetUlt), "LTU -> SetUlt");
+        assert_eq!(map.get("LT"), Some(&SemanticOp::SetLt), "LT -> SetLt");
+        assert_eq!(map.get("GEU"), Some(&SemanticOp::SetUge), "GEU -> SetUge");
+        assert_eq!(map.get("GE"), Some(&SemanticOp::SetGe), "GE -> SetGe");
+        assert_eq!(map.get("EQ"), Some(&SemanticOp::SetEq), "EQ -> SetEq");
+        assert_eq!(map.get("NE"), Some(&SemanticOp::SetNe), "NE -> SetNe");
+
+        // ADD with immediate must be Add, not Sub
+        if let Some(op) = map.get("ADD_add_r_ri") {
+            assert_eq!(*op, SemanticOp::Add,
+                "ADD_add_r_ri must be Add, not {:?}", op);
+        }
+
+        // LSHL must be Shl, not Srl
+        assert_eq!(map.get("LSHL"), Some(&SemanticOp::Shl), "LSHL -> Shl");
     }
 
     #[test]
