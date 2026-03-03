@@ -1113,10 +1113,10 @@ impl TileArray {
                             self.tiles[i].col, self.tiles[i].row, master_port, ch, fifo_len);
                     }
 
-                    // Backpressure: only pop from master if DMA can accept.
-                    // Without this check, data is lost when the stream-in FIFO
-                    // is full -- the pop consumes the word but the push drops it.
-                    if !self.dma_engines[i].can_accept_stream_in() {
+                    // Per-channel backpressure: only pop from master if the
+                    // target channel's FIFO has space. Each S2MM channel has its
+                    // own buffer, so one channel can't block another.
+                    if !self.dma_engines[i].can_accept_stream_in_for_channel(ch) {
                         continue;
                     }
 

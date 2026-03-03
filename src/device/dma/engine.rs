@@ -260,9 +260,11 @@ pub struct DmaEngine {
     /// Data is read from tile memory and queued for the stream router.
     stream_out: VecDeque<StreamData>,
 
-    /// Stream input buffer (S2MM channels consume data from here).
-    /// Data from the stream router is queued here for writing to tile memory.
-    stream_in: VecDeque<StreamData>,
+    /// Per-channel stream input buffers (S2MM channels consume data from here).
+    /// Each S2MM channel has its own FIFO, matching real hardware where each
+    /// channel connects to a dedicated stream switch master port. This prevents
+    /// one channel's traffic (e.g., trace) from blocking another (e.g., output).
+    stream_in: Vec<VecDeque<StreamData>>,
 
     /// Task complete token output buffer.
     /// Tokens are emitted when tasks complete with Enable_Token_Issue set.
@@ -333,7 +335,7 @@ impl DmaEngine {
             channels,
             timing_config: DmaTimingConfig::from_aie2_spec(),
             stream_out: VecDeque::with_capacity(16),
-            stream_in: VecDeque::with_capacity(16),
+            stream_in: (0..s2mm_channels).map(|_| VecDeque::with_capacity(16)).collect(),
             task_tokens: VecDeque::with_capacity(4),
             lock_timing: None,
             current_cycle: 0,
@@ -2127,12 +2129,24 @@ impl DmaEngine {
         self.stream_out.front()
     }
 
-    /// Push a word to the stream input buffer (for S2MM to consume).
+    /// Push a word to the per-channel stream input buffer (for S2MM to consume).
     ///
-    /// Returns true if successful, false if buffer is full.
+    /// Each S2MM channel has its own FIFO with independent capacity, matching
+    /// real hardware where each channel connects to a dedicated stream switch
+    /// master port. Returns true if successful, false if channel buffer is full.
     pub fn push_stream_in(&mut self, data: StreamData) -> bool {
-        if self.stream_in.len() < 256 {
-            self.stream_in.push_back(data);
+        let ch = data.channel as usize;
+        if ch >= self.stream_in.len() {
+            let msg = format!(
+                "DMA({},{}) push_stream_in: channel {} out of range (have {} S2MM channels)",
+                self.col, self.row, ch, self.stream_in.len()
+            );
+            log::error!("{}", msg);
+            self.fatal_errors.push(msg);
+            return false;
+        }
+        if self.stream_in[ch].len() < 256 {
+            self.stream_in[ch].push_back(data);
             true
         } else {
             let msg = format!(
@@ -2151,9 +2165,18 @@ impl DmaEngine {
         !self.stream_out.is_empty()
     }
 
-    /// Check if stream input buffer has space.
+    /// Check if any S2MM channel's stream input buffer has space.
+    ///
+    /// Returns true if at least one channel can accept data. Callers that
+    /// know the target channel should use `can_accept_stream_in_for_channel`
+    /// for precise per-channel backpressure.
     pub fn can_accept_stream_in(&self) -> bool {
-        self.stream_in.len() < 256
+        self.stream_in.iter().any(|q| q.len() < 256)
+    }
+
+    /// Check if a specific S2MM channel's stream input buffer has space.
+    pub fn can_accept_stream_in_for_channel(&self, channel: u8) -> bool {
+        self.stream_in.get(channel as usize).map_or(false, |q| q.len() < 256)
     }
 
     /// Get the number of words in stream output buffer.
@@ -2161,24 +2184,21 @@ impl DmaEngine {
         self.stream_out.len()
     }
 
-    /// Get the number of words in stream input buffer.
+    /// Get the total number of words across all stream input channel buffers.
     pub fn stream_in_len(&self) -> usize {
-        self.stream_in.len()
+        self.stream_in.iter().map(|q| q.len()).sum()
     }
 
     /// Check if stream input buffer has data for a specific channel.
     pub fn has_stream_in_for_channel(&self, channel: u8) -> bool {
-        self.stream_in.iter().any(|d| d.channel == channel)
+        self.stream_in.get(channel as usize).map_or(false, |q| !q.is_empty())
     }
 
-    /// Pop data from stream input buffer for a specific channel.
+    /// Pop data from a specific channel's stream input buffer.
     ///
-    /// Scans the buffer for the first entry matching the channel and removes it.
-    /// Returns None if no data for this channel is available.
+    /// Each channel has its own FIFO, so this is O(1) (front pop).
     fn pop_stream_in_for_channel(&mut self, channel: u8) -> Option<StreamData> {
-        // Find index of first matching entry
-        let idx = self.stream_in.iter().position(|d| d.channel == channel)?;
-        self.stream_in.remove(idx)
+        self.stream_in.get_mut(channel as usize)?.pop_front()
     }
 
     /// Check if any S2MM channel needs to receive stream data.
@@ -3609,5 +3629,37 @@ mod tests {
         // West tile lock 3 should have been incremented by +1 (release delta)
         assert_eq!(west_tile.locks[3].value, 1,
             "West neighbor lock 3 should be 1 after release with delta +1");
+    }
+
+    #[test]
+    fn test_stream_in_per_channel_isolation() {
+        // Bug: shared stream_in buffer lets one S2MM channel's data block another.
+        // In real hardware, each S2MM channel has its own input FIFO connected to
+        // a dedicated stream switch master port. One channel flooding its FIFO
+        // must not prevent another channel from receiving data.
+        let mut engine = DmaEngine::new_shim_tile(0, 0);
+
+        // Fill stream_in with channel 1 (trace) data up to capacity.
+        // With a shared buffer of 256 entries, this would block channel 0.
+        for i in 0..256 {
+            let pushed = engine.push_stream_in(StreamData {
+                data: 0xFEED_0000 | i as u32,
+                tlast: false,
+                channel: 1,
+            });
+            assert!(pushed, "channel 1 push {} should succeed", i);
+        }
+
+        // Channel 0 (output) must still be able to receive data.
+        // On real hardware, channel 0's FIFO is independent of channel 1's.
+        let pushed = engine.push_stream_in(StreamData {
+            data: 0x0010_0001,
+            tlast: false,
+            channel: 0,
+        });
+        assert!(pushed, "channel 0 push must succeed even when channel 1 is full");
+
+        // And channel 0 data must be readable
+        assert!(engine.has_stream_in_for_channel(0));
     }
 }
