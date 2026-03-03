@@ -243,8 +243,7 @@ impl InterpreterEngine {
                             self.device.ctrl_packet_write(col, row, offset, value);
                         }
                         CtrlPacketAction::ReadRegisters { col, row, offset, count, response_id } => {
-                            log::warn!(
-                                "ctrl_pkt READ not yet implemented (flush): tile({},{}) offset=0x{:05X} count={} resp_id={}",
+                            self.device.array.handle_read_registers(
                                 col, row, offset, count, response_id,
                             );
                         }
@@ -473,8 +472,7 @@ impl InterpreterEngine {
                     self.device.ctrl_packet_write(col, row, offset, value);
                 }
                 CtrlPacketAction::ReadRegisters { col, row, offset, count, response_id } => {
-                    log::warn!(
-                        "ctrl_pkt READ not yet implemented: tile({},{}) offset=0x{:05X} count={} resp_id={}",
+                    self.device.array.handle_read_registers(
                         col, row, offset, count, response_id,
                     );
                 }

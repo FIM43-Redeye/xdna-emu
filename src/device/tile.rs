@@ -809,6 +809,17 @@ pub struct Tile {
     /// or NPU executor) drains this after each write and propagates to the
     /// column.
     pub pending_broadcasts: Vec<u8>,
+
+    /// Pending control packet read response words.
+    ///
+    /// When an OP_READ control packet is processed, the response (stream
+    /// header + data words) is queued here. Each routing cycle, words are
+    /// drained into the TileCtrl slave port as FIFO space permits, matching
+    /// the backpressure-aware pattern used by trace unit injection.
+    ///
+    /// Each entry is (word, tlast). The header is first, followed by data
+    /// words, with TLAST on the final data word.
+    pub pending_ctrl_response: std::collections::VecDeque<(u32, bool)>,
 }
 
 /// Single edge detection circuit.
@@ -896,6 +907,7 @@ impl Tile {
             mem_edge_detectors: [EdgeDetector::default(); 2],
             broadcast_channels: [0; 16],
             pending_broadcasts: Vec::new(),
+            pending_ctrl_response: std::collections::VecDeque::new(),
         }
     }
 

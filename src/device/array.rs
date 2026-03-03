@@ -197,6 +197,106 @@ impl TileArray {
         std::mem::take(&mut self.pending_ctrl_actions)
     }
 
+    /// Handle a control packet OP_READ by reading registers and queuing
+    /// a response packet for injection into the tile's TileCtrl slave port.
+    ///
+    /// The response consists of a stream packet header (with pkt_id =
+    /// response_id, packet_type = Data) followed by `count` data words,
+    /// with TLAST set on the final word.
+    ///
+    /// Response words are buffered in `tile.pending_ctrl_response` and
+    /// drained into the TileCtrl slave port each routing cycle as FIFO
+    /// space permits (same backpressure-aware pattern as trace injection).
+    ///
+    /// Returns true if the response was successfully queued.
+    pub fn handle_read_registers(
+        &mut self,
+        col: u8,
+        row: u8,
+        offset: u32,
+        count: u8,
+        response_id: u8,
+    ) -> bool {
+        use super::stream_switch::{PacketHeader, PacketType};
+
+        let tile = match self.get_mut(col, row) {
+            Some(t) => t,
+            None => {
+                log::error!(
+                    "handle_read_registers: tile({},{}) not found", col, row
+                );
+                return false;
+            }
+        };
+
+        // Verify the TileCtrl slave port exists.
+        if tile.stream_switch.tile_ctrl_slave_port().is_none() {
+            log::error!(
+                "handle_read_registers: tile({},{}) has no TileCtrl slave port",
+                col, row,
+            );
+            return false;
+        }
+
+        // Read the register values (pure reads, no side effects).
+        let mut values = Vec::with_capacity(count as usize);
+        for i in 0..count as u32 {
+            values.push(tile.read_register_pure(offset + i * 4));
+        }
+
+        // Build stream packet header: pkt_id = response_id, type = Data,
+        // source = this tile's (col, row).
+        let header = PacketHeader::new(response_id & 0x1F, col, row)
+            .with_type(PacketType::Data);
+        let header_word = header.encode();
+
+        // Queue header + data words into pending buffer.
+        // TLAST is set on the last data word (or on the header if count=0).
+        tile.pending_ctrl_response.push_back((header_word, count == 0));
+        for (i, &value) in values.iter().enumerate() {
+            let is_last = i == values.len() - 1;
+            tile.pending_ctrl_response.push_back((value, is_last));
+        }
+
+        log::info!(
+            "handle_read_registers: tile({},{}) read {} regs from 0x{:05X}, \
+             {} response words queued (resp_id={})",
+            col, row, count, offset, count as usize + 1, response_id,
+        );
+
+        true
+    }
+
+    /// Drain pending control packet read responses into TileCtrl slave ports.
+    ///
+    /// Called during each routing cycle. Pushes as many queued response words
+    /// as the TileCtrl slave FIFO can accept, respecting backpressure.
+    /// Returns the number of words injected.
+    pub fn drain_ctrl_responses(&mut self) -> usize {
+        let mut words_injected = 0;
+
+        for i in 0..self.tiles.len() {
+            if self.tiles[i].pending_ctrl_response.is_empty() {
+                continue;
+            }
+
+            let slave_idx = match self.tiles[i].stream_switch.tile_ctrl_slave_port() {
+                Some(idx) => idx,
+                None => continue,
+            };
+
+            while !self.tiles[i].pending_ctrl_response.is_empty()
+                && self.tiles[i].stream_switch.slaves[slave_idx].can_accept()
+            {
+                let (word, tlast) = self.tiles[i].pending_ctrl_response.pop_front().unwrap();
+                self.tiles[i].stream_switch.slaves[slave_idx].push_with_tlast(word, tlast);
+                words_injected += 1;
+            }
+        }
+
+        words_injected
+    }
+
     /// Get the architecture configuration.
     #[inline]
     pub fn arch(&self) -> &dyn ArchConfig {
@@ -735,6 +835,11 @@ impl TileArray {
         // Binary trace packets enter on dedicated trace slave ports
         // (indices from AM025 gen_stream_ranges.rs)
         words_routed += self.route_trace_to_tile_switches();
+
+        // Step 2c: Control packet read responses → TileCtrl slave ports
+        // Queued OP_READ response words drain into TileCtrl slave ports
+        // as FIFO space permits (backpressure-aware, same as trace).
+        words_routed += self.drain_ctrl_responses();
 
         // Step 3: StreamSwitch local routing (first pass)
         // Apply configured routes within each tile: slave → master
@@ -1714,5 +1819,137 @@ mod tests {
         // No transfer because directions don't match
         assert!(array.tile(1, 3).has_cascade_output());
         assert!(!array.tile(1, 2).has_cascade_input());
+    }
+
+    /// OP_READ response injection: handle_read_registers queues response
+    /// words, drain_ctrl_responses pushes them into the TileCtrl slave
+    /// port's FIFO across multiple drain cycles.
+    #[test]
+    fn test_handle_read_registers_injects_response() {
+        use crate::device::stream_switch::{PacketHeader, PortType};
+
+        let mut array = TileArray::npu1();
+
+        // Use compute tile at (2,3)
+        let col: u8 = 2;
+        let row: u8 = 3;
+
+        // Pre-populate 4 consecutive registers with known values
+        let base_offset: u32 = 0x440;
+        let values = [0xAAAA_0001u32, 0xBBBB_0002, 0xCCCC_0003, 0xDDDD_0004];
+        for (i, &val) in values.iter().enumerate() {
+            array.tile_mut(col, row).write_register(base_offset + (i as u32) * 4, val);
+        }
+
+        // Verify the TileCtrl slave port exists (port 3 on compute tiles)
+        let ctrl_slave_idx = array.tile(col, row).stream_switch
+            .tile_ctrl_slave_port()
+            .expect("compute tile should have TileCtrl slave port");
+        assert!(
+            matches!(
+                array.tile(col, row).stream_switch.slave(ctrl_slave_idx).unwrap().port_type,
+                PortType::TileCtrl,
+            ),
+            "slave port at ctrl index should be TileCtrl"
+        );
+
+        // Call handle_read_registers with response_id=5, count=4
+        let response_id: u8 = 5;
+        let count: u8 = 4;
+        let ok = array.handle_read_registers(col, row, base_offset, count, response_id);
+        assert!(ok, "handle_read_registers should succeed");
+
+        // Response words are queued, not yet in the FIFO
+        assert_eq!(
+            array.tile(col, row).pending_ctrl_response.len(), 5,
+            "pending buffer should have header + 4 data words"
+        );
+
+        // Drain cycle 1: fills slave FIFO up to capacity (4 words)
+        let injected1 = array.drain_ctrl_responses();
+        assert_eq!(injected1, 4, "first drain should inject 4 words (FIFO capacity)");
+        assert_eq!(
+            array.tile(col, row).pending_ctrl_response.len(), 1,
+            "1 word should remain in pending buffer"
+        );
+
+        // Pop and verify the stream header
+        let slave = array.tile_mut(col, row).stream_switch.slave_mut(ctrl_slave_idx).unwrap();
+        let (header_word, header_tlast) = slave.pop_with_tlast().unwrap();
+        assert!(!header_tlast, "header should not have TLAST");
+
+        let (decoded, parity_ok) = PacketHeader::decode(header_word);
+        assert!(parity_ok, "packet header parity should be valid");
+        assert_eq!(decoded.stream_id, response_id, "stream_id should equal response_id");
+        assert_eq!(decoded.src_col, col, "src_col should match tile column");
+        assert_eq!(decoded.src_row, row, "src_row should match tile row");
+
+        // Pop first 3 data words (popping frees FIFO space)
+        for (i, &expected) in values[..3].iter().enumerate() {
+            let slave = array.tile_mut(col, row).stream_switch.slave_mut(ctrl_slave_idx).unwrap();
+            let (data, tlast) = slave.pop_with_tlast().unwrap();
+            assert_eq!(data, expected, "data word {} should match register value", i);
+            assert!(!tlast, "non-last data word {} should not have TLAST", i);
+        }
+
+        // Drain cycle 2: pushes the remaining word
+        let injected2 = array.drain_ctrl_responses();
+        assert_eq!(injected2, 1, "second drain should inject remaining 1 word");
+        assert!(
+            array.tile(col, row).pending_ctrl_response.is_empty(),
+            "pending buffer should be empty after second drain"
+        );
+
+        // Pop and verify the last data word
+        let slave = array.tile_mut(col, row).stream_switch.slave_mut(ctrl_slave_idx).unwrap();
+        let (data, tlast) = slave.pop_with_tlast().unwrap();
+        assert_eq!(data, values[3], "last data word should match register value");
+        assert!(tlast, "last data word should have TLAST");
+
+        // FIFO should be empty now
+        let slave = array.tile(col, row).stream_switch.slave(ctrl_slave_idx).unwrap();
+        assert_eq!(slave.fifo_level(), 0, "FIFO should be empty after draining");
+    }
+
+    /// OP_READ with count=1: queue + drain produces header + 1 data word,
+    /// where the data word has TLAST set.
+    #[test]
+    fn test_handle_read_registers_single_word() {
+        let mut array = TileArray::npu1();
+
+        let col: u8 = 1;
+        let row: u8 = 2;
+        let offset: u32 = 0x500;
+        let expected: u32 = 0x1234_5678;
+        array.tile_mut(col, row).write_register(offset, expected);
+
+        let ok = array.handle_read_registers(col, row, offset, 1, 0);
+        assert!(ok);
+
+        // Drain response into FIFO
+        let injected = array.drain_ctrl_responses();
+        assert_eq!(injected, 2, "header + 1 data word should fit in one drain");
+
+        let ctrl_idx = array.tile(col, row).stream_switch.tile_ctrl_slave_port().unwrap();
+        let slave = array.tile(col, row).stream_switch.slave(ctrl_idx).unwrap();
+        assert_eq!(slave.fifo_level(), 2, "header + 1 data word");
+
+        // Pop header (no TLAST)
+        let slave = array.tile_mut(col, row).stream_switch.slave_mut(ctrl_idx).unwrap();
+        let (_, h_tlast) = slave.pop_with_tlast().unwrap();
+        assert!(!h_tlast, "header should not have TLAST when count > 0");
+
+        // Pop data word (with TLAST)
+        let (data, d_tlast) = slave.pop_with_tlast().unwrap();
+        assert_eq!(data, expected);
+        assert!(d_tlast, "single data word should have TLAST");
+    }
+
+    /// OP_READ for a non-existent tile should fail gracefully.
+    #[test]
+    fn test_handle_read_registers_bad_tile() {
+        let mut array = TileArray::npu1();
+        let ok = array.handle_read_registers(99, 99, 0x440, 4, 0);
+        assert!(!ok, "should fail for out-of-bounds tile");
     }
 }

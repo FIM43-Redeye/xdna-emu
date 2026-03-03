@@ -570,6 +570,24 @@ impl StreamSwitch {
         self.master_packet_config.get(index)
     }
 
+    /// Find the TileCtrl slave port index.
+    ///
+    /// Returns the index into `self.slaves` for the port tagged as
+    /// `PortType::TileCtrl`. This is port 3 on compute tiles, port 6 on
+    /// mem tiles, and port 0 on shim tiles (per AM025).
+    ///
+    /// Used by OP_READ response injection: the response packet is pushed
+    /// into this slave port so the packet routing infrastructure can
+    /// deliver it to the configured destination.
+    pub fn tile_ctrl_slave_port(&self) -> Option<usize> {
+        self.slaves.iter().position(|p| matches!(p.port_type, PortType::TileCtrl))
+    }
+
+    /// Find a mutable reference to the TileCtrl slave port.
+    pub fn tile_ctrl_slave_mut(&mut self) -> Option<&mut StreamPort> {
+        self.slaves.iter_mut().find(|p| matches!(p.port_type, PortType::TileCtrl))
+    }
+
     /// Find a DMA master port (for MM2S).
     pub fn dma_master(&self, channel: u8) -> Option<&StreamPort> {
         self.masters.iter().find(|p| matches!(p.port_type, PortType::Dma(ch) if ch == channel))
