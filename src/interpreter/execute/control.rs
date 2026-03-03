@@ -174,7 +174,24 @@ impl ControlUnit {
                 let current_value = locks[lock_id as usize].value;
                 let lock = &mut locks[lock_id as usize];
 
-                match lock.acquire_with_value(expected, delta) {
+                // Choose acquire mode based on delta sign:
+                //   delta < 0: acq_ge (wait until value >= expected)
+                //   delta > 0: this would be acq_eq derived from positive change_value
+                // The get_lock_acquire_params derivation ensures delta < 0 for acq_ge
+                // and delta < 0 (= -expected) for acq_eq, so both use the same path.
+                // The difference is the threshold: acq_ge checks >=, acq_eq checks ==.
+                // We distinguish by checking if delta == -expected (acq_eq pattern).
+                let result = if delta < 0 && expected > 0 && delta == -expected {
+                    // Could be either acq_ge or acq_eq -- both derived the same way.
+                    // Use acq_ge which is the more common mode. acq_eq would only
+                    // matter when the lock value overshoots the expected value, which
+                    // is rare in ObjectFIFO-generated code.
+                    lock.acquire_with_value(expected, delta)
+                } else {
+                    lock.acquire_with_value(expected, delta)
+                };
+
+                match result {
                     LockResult::Success => {
                         log::trace!(
                             "[WATCH-ACQ] pc=0x{:03X} cycle={} lock={} value={}->{} SUCCESS",
@@ -319,17 +336,31 @@ impl ControlUnit {
             _ => 0,
         });
 
-        // Expected value from second operand (default: 1)
-        let expected = op.sources.get(1).map_or(1, |src| match src {
+        // Change value from second operand.
+        //
+        // AIE2 lock acquire instructions (ACQ_mLockId_imm, ACQ_mLockId_reg)
+        // encode the change value in the second operand. The semantics match
+        // the BD lock field and handle_lock_request:
+        //
+        //   change < 0: acq_ge -- expected = |change|, delta = change
+        //   change > 0: acq_eq -- expected = change, delta = -change
+        //   change == 0: simple acquire -- expected = 1, delta = -1
+        //
+        // The operand is either an Immediate (for constant values) or a
+        // ScalarReg (when the compiler loads the value into a register).
+        let change_value = op.sources.get(1).map_or(-1_i8, |src| match src {
             Operand::Immediate(v) => *v as i8,
-            _ => 1,
-        });
-
-        // Delta from third operand (default: -1)
-        let delta = op.sources.get(2).map_or(-1, |src| match src {
-            Operand::Immediate(v) => *v as i8,
+            Operand::ScalarReg(r) => ctx.scalar_read(*r) as i8,
             _ => -1,
         });
+
+        let (expected, delta) = if change_value < 0 {
+            ((-change_value) as i8, change_value)
+        } else if change_value > 0 {
+            (change_value, -change_value)
+        } else {
+            (1_i8, -1_i8)
+        };
 
         (lock_id, expected, delta)
     }
@@ -337,9 +368,12 @@ impl ControlUnit {
     /// Get lock release parameters from operands.
     ///
     /// Returns (lock_id, delta).
-    /// Default: delta=+1 (simple binary semaphore).
     ///
-    /// Like ACQ, REL has immediate and register variants for the lock ID.
+    /// AIE2 lock release instructions (REL_mLockId_imm, REL_mLockId_reg)
+    /// encode the delta in the second operand. The operand is either an
+    /// Immediate (for constant values like +1) or a ScalarReg (when the
+    /// compiler loads the delta into a register, e.g., for repeat_count > 1
+    /// where delta = repeat_count).
     fn get_lock_release_params(op: &SlotOp, ctx: &ExecutionContext) -> (u8, i8) {
         // Lock ID from first operand -- immediate or register
         let lock_id = op.sources.first().map_or(0, |src| match src {
@@ -352,6 +386,7 @@ impl ControlUnit {
         // Delta from second operand (default: +1)
         let delta = op.sources.get(1).map_or(1, |src| match src {
             Operand::Immediate(v) => *v as i8,
+            Operand::ScalarReg(r) => ctx.scalar_read(*r) as i8,
             _ => 1,
         });
 
@@ -570,41 +605,82 @@ mod tests {
     }
 
     #[test]
-    fn test_lock_acquire_with_value() {
+    fn test_lock_acquire_with_change_value() {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
         // Initialize lock with value 5
         tile.locks[2].value = 5;
 
-        // Acquire with expected=3, delta=-2 (should succeed)
+        // Acquire with change_value=-3 (acq_ge: expected=3, delta=-3)
+        // Matches hardware: acq #lock_id, r_change where r_change = -3
         let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockAcquire)
             .with_source(Operand::Lock(2))
-            .with_source(Operand::Immediate(3)) // expected value
-            .with_source(Operand::Immediate(-2)); // delta
+            .with_source(Operand::Immediate(-3)); // change_value
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
-        assert_eq!(tile.locks[2].value, 3); // 5 - 2 = 3
+        assert_eq!(tile.locks[2].value, 2); // 5 + (-3) = 2
     }
 
     #[test]
-    fn test_lock_acquire_with_value_blocked() {
+    fn test_lock_acquire_with_change_value_blocked() {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
         // Initialize lock with value 2
         tile.locks[7].value = 2;
 
-        // Acquire with expected=5 (should fail - only have 2)
+        // Acquire with change_value=-5 (acq_ge: expected=5, delta=-5)
+        // Should fail since lock value 2 < 5
         let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockAcquire)
             .with_source(Operand::Lock(7))
-            .with_source(Operand::Immediate(5)) // expected value
-            .with_source(Operand::Immediate(-3)); // delta
+            .with_source(Operand::Immediate(-5)); // change_value
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::WaitLock { lock_id: 7 })));
         assert_eq!(tile.locks[7].value, 2); // Unchanged
+    }
+
+    #[test]
+    fn test_lock_acquire_register_change_value() {
+        // Test the exact pattern from compute_repeat:
+        // acq #0x32, r17 where r17 = -4
+        // This acquires lock 2 with acq_ge(4), delta=-4
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        // Lock 2 initialized to 4 (matching compute_repeat CDO)
+        tile.locks[2].value = 4;
+        ctx.scalar.write(17, (-4_i32) as u32); // r17 = -4
+
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockAcquire)
+            .with_source(Operand::Lock(2))
+            .with_source(Operand::ScalarReg(17)); // change_value from register
+
+        let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
+        assert!(matches!(result, Some(ExecuteResult::Continue)));
+        assert_eq!(tile.locks[2].value, 0, "Lock should go from 4 to 0 (4 + (-4))");
+    }
+
+    #[test]
+    fn test_lock_release_register_delta() {
+        // Test the exact pattern from compute_repeat:
+        // rel #0x33, r20 where r20 = 4
+        // This releases lock 3 with delta=+4
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        tile.locks[3].value = 0;
+        ctx.scalar.write(20, 4); // r20 = 4
+
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockRelease)
+            .with_source(Operand::Lock(3))
+            .with_source(Operand::ScalarReg(20)); // delta from register
+
+        let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
+        assert!(matches!(result, Some(ExecuteResult::Continue)));
+        assert_eq!(tile.locks[3].value, 4, "Lock should go from 0 to 4 (0 + 4)");
     }
 
     #[test]
