@@ -140,6 +140,7 @@ impl CycleAccurateExecutor {
             CascadeResult::Completed => return None,
             CascadeResult::Stall => return Some(ExecuteResult::WaitStream { port: 255 }),
             CascadeResult::NotCascadeOp => {}
+            CascadeResult::Error(msg) => return Some(ExecuteResult::Error { message: msg }),
         }
 
         // Stream operations: read/write between scalar registers and stream
@@ -154,17 +155,28 @@ impl CycleAccurateExecutor {
             return Some(result);
         }
 
-        // Unknown operation - fail loudly to prevent silent incorrect behavior
+        // Defense in depth: instructions without a semantic label have no
+        // routing information at all. With 100% semantic coverage this path
+        // should be unreachable, but keep it as a safety net.
         if op.semantic.is_none() {
             return Some(ExecuteResult::Error {
                 message: format!(
-                    "Unknown instruction (no semantic) at slot {:?}",
-                    op.slot
+                    "Unknown instruction (no semantic): slot={:?}, name={:?}, opcode={:#X?}",
+                    op.slot, op.encoding_name, op.raw_opcode,
                 ),
             });
         }
 
-        None
+        // Every instruction with a semantic label should be claimed by one
+        // of the execution units above. Reaching here means a labeled but
+        // unimplemented op -- abort immediately rather than silently
+        // producing wrong results by pretending execution succeeded.
+        Some(ExecuteResult::Error {
+            message: format!(
+                "Unhandled instruction: semantic={:?}, slot={:?}, name={:?}",
+                op.semantic, op.slot, op.encoding_name,
+            ),
+        })
     }
 
     /// Record register writes for hazard tracking.

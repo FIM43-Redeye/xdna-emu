@@ -108,6 +108,13 @@ pub struct TileArray {
     /// DMA engines stored in parallel with tiles.
     /// Each tile has exactly one DMA engine.
     pub(crate) dma_engines: Vec<DmaEngine>,
+
+    /// Fatal errors accumulated during data movement.
+    ///
+    /// These represent conditions that are impossible on real hardware
+    /// (e.g., packet with no route, stream push failure). The coordinator
+    /// checks this after each step and aborts if non-empty.
+    pub(crate) fatal_errors: Vec<String>,
 }
 
 impl TileArray {
@@ -144,7 +151,7 @@ impl TileArray {
             }
         }
 
-        Self { arch, cols, rows, tiles, dma_engines }
+        Self { arch, cols, rows, tiles, dma_engines, fatal_errors: Vec::new() }
     }
 
     /// Create an NPU1 (Phoenix/HawkPoint) array.
@@ -157,6 +164,15 @@ impl TileArray {
     #[inline]
     pub fn npu2() -> Self {
         Self::new(ModelConfig::npu2())
+    }
+
+    /// Drain accumulated fatal errors from data movement.
+    ///
+    /// Returns the errors and clears the internal list. The coordinator
+    /// calls this after each step to detect impossible-on-hardware
+    /// conditions and abort immediately.
+    pub fn drain_fatal_errors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.fatal_errors)
     }
 
     /// Get the architecture configuration.
@@ -391,6 +407,15 @@ impl TileArray {
             // MM2S/S2MM record on engine.cycle_dma_banks. Merge both.
             tiles[i].cycle_dma_banks |= engines[i].cycle_dma_banks;
         }
+        // Drain fatal errors from all DMA engines into the array-level collector.
+        // Use index loop to avoid conflicting borrows on self.
+        for i in 0..self.dma_engines.len() {
+            if !self.dma_engines[i].fatal_errors.is_empty() {
+                let mut errs = std::mem::take(&mut self.dma_engines[i].fatal_errors);
+                self.fatal_errors.append(&mut errs);
+            }
+        }
+
         any_active
     }
 
@@ -489,6 +514,8 @@ impl TileArray {
         let mut total_forwarded = 0;
         for tile in &mut self.tiles {
             total_forwarded += tile.stream_switch.step();
+            // Drain any fatal errors from this tile's stream switch
+            self.fatal_errors.append(&mut tile.stream_switch.fatal_errors);
         }
         total_forwarded
     }
@@ -928,43 +955,34 @@ impl TileArray {
         let mut words_routed = 0;
 
         for i in 0..self.tiles.len() {
-            // Process ALL tiles - DMA MM2S output needs to reach the tile switch
-            // for any tile with configured routes (even if we don't count them all)
+            // Route DMA MM2S stream_out to tile switch slave ports with backpressure.
+            // Peek first, determine target slave, check if it can accept. Only pop
+            // when the push will succeed. This prevents silent data loss when the
+            // downstream FIFO is full -- the data stays in stream_out until the
+            // next cycle, matching real hardware credit-based flow control.
+            loop {
+                let data = match self.dma_engines[i].peek_stream_out() {
+                    Some(d) => d.clone(),
+                    None => break,
+                };
 
-            // Pop data from DMA stream_out and push to tile switch SLAVE ports
-            // (DMA MM2S output is an arbiter source, presented as a slave)
-            while let Some(data) = self.dma_engines[i].pop_stream_out() {
                 let tile_type = self.tiles[i].tile_type;
                 let col = self.tiles[i].col;
                 let row = self.tiles[i].row;
 
-                // Map DMA MM2S channel to tile switch SLAVE port
-                // MM2S output appears as a slave source for the arbiter
-                // For Shim tiles, we need special handling because Shim has no DMA ports in stream switch.
-                // Shim DMA MM2S output needs to go to a South slave port (where DDR data would appear)
-                // and then local routes forward to North master for MemTile.
-                if tile_type == TileType::Shim {
-                    // Use the Shim Mux config to route DMA MM2S to the correct South slave.
-                    // The Shim Mux (0x1F000) maps each DMA MM2S channel to a specific
-                    // switchbox South slave port (e.g., MM2S ch0 -> South3 = slave[5]).
-                    //
-                    // DMA channel indices: S2MM = 0-1, MM2S = 2-3 (absolute)
-                    // MM2S ch0 = abs channel 2, ch1 = abs channel 3
+                // Determine the target slave port for this DMA MM2S word.
+                let target_slave = if tile_type == TileType::Shim {
                     let s2mm_count = self.dma_engines[i].s2mm_channel_count();
                     let mm2s_ch = data.channel.saturating_sub(s2mm_count as u8) as usize;
-                    let target_slave_idx = self.tiles[i].shim_mux_mm2s_slaves
+                    let from_mux = self.tiles[i].shim_mux_mm2s_slaves
                         .get(mm2s_ch)
                         .copied()
                         .flatten();
 
-                    if let Some(slave_idx) = target_slave_idx {
-                        if self.tiles[i].stream_switch.slaves[slave_idx].push_with_tlast(data.data, data.tlast) {
-                            words_routed += 1;
-                            log::info!("DMA_MM2S->TileSwitch: Shim ({},{}) slave[{}] <- 0x{:08X}{} (Shim Mux MM2S ch{})",
-                                col, row, slave_idx, data.data, if data.tlast { " TLAST" } else { "" }, mm2s_ch);
-                        }
+                    if let Some(slave_idx) = from_mux {
+                        Some((slave_idx, format!("Shim Mux MM2S ch{}", mm2s_ch)))
                     } else {
-                        // Fallback: find South slave with circuit route to North (pre-Shim-Mux behavior)
+                        // Fallback: find South slave with circuit route to North
                         let mut fallback_slave = None;
                         for route in &self.tiles[i].stream_switch.local_routes {
                             let s = route.slave_idx as usize;
@@ -978,49 +996,67 @@ impl TileArray {
                             }
                         }
                         if let Some(slave_idx) = fallback_slave {
-                            if self.tiles[i].stream_switch.slaves[slave_idx].push_with_tlast(data.data, data.tlast) {
-                                words_routed += 1;
-                                log::info!("DMA_MM2S->TileSwitch: Shim ({},{}) slave[{}] <- 0x{:08X}{} (fallback South->North)",
-                                    col, row, slave_idx, data.data, if data.tlast { " TLAST" } else { "" });
-                            }
+                            Some((slave_idx, "fallback South->North".to_string()))
                         } else {
-                            log::debug!("DMA_MM2S->TileSwitch: Shim ({},{}) no route for MM2S ch{}", col, row, mm2s_ch);
+                            let msg = format!(
+                                "DMA_MM2S->TileSwitch: Shim ({},{}) no route for MM2S ch{} -- \
+                                 no slave port or fallback available",
+                                col, row, mm2s_ch,
+                            );
+                            log::error!("{}", msg);
+                            self.fatal_errors.push(msg);
+                            // Pop to avoid infinite loop on permanently unroutable data
+                            self.dma_engines[i].pop_stream_out();
+                            continue;
                         }
                     }
-                    continue;
-                }
+                } else {
+                    let s2mm_count = self.dma_engines[i].s2mm_channel_count() as u8;
+                    let slave_port = match tile_type {
+                        TileType::MemTile => {
+                            let ch_offset = data.channel.saturating_sub(s2mm_count);
+                            (mem_tile::DMA_SLAVE_START + ch_offset) as usize
+                        }
+                        TileType::Compute => {
+                            let ch_offset = data.channel.saturating_sub(s2mm_count);
+                            (compute::DMA_SLAVE_START + ch_offset) as usize
+                        }
+                        TileType::Shim => unreachable!(),
+                    };
 
-                let s2mm_count = self.dma_engines[i].s2mm_channel_count() as u8;
-                let slave_port = match tile_type {
-                    TileType::MemTile => {
-                        // MemTile MM2S channels start after S2MM channels
-                        let ch_offset = data.channel.saturating_sub(s2mm_count);
-                        (mem_tile::DMA_SLAVE_START + ch_offset) as usize
-                    }
-                    TileType::Compute => {
-                        // Compute MM2S channels start after S2MM channels
-                        let ch_offset = data.channel.saturating_sub(s2mm_count);
-                        (compute::DMA_SLAVE_START + ch_offset) as usize
-                    }
-                    TileType::Shim => unreachable!(), // Handled above
-                };
-
-                if slave_port < self.tiles[i].stream_switch.slaves.len() {
-                    // Copy port type to avoid borrow conflict
-                    let port_type = self.tiles[i].stream_switch.slaves[slave_port].port_type;
-
-                    // MM2S output should go to DMA-type slave ports
-                    if matches!(port_type, PortType::Dma(_)) {
-                        if self.tiles[i].stream_switch.slaves[slave_port].push_with_tlast(data.data, data.tlast) {
-                            words_routed += 1;
-                            log::info!("DMA_MM2S->TileSwitch: tile ({},{}) slave[{}] <- 0x{:08X}{} (ch {}, type={:?})",
-                                col, row, slave_port, data.data, if data.tlast { " TLAST" } else { "" },
-                                data.channel, port_type);
+                    if slave_port < self.tiles[i].stream_switch.slaves.len() {
+                        let port_type = self.tiles[i].stream_switch.slaves[slave_port].port_type;
+                        if matches!(port_type, PortType::Dma(_)) {
+                            Some((slave_port, format!("ch {}, type={:?}", data.channel, port_type)))
+                        } else {
+                            log::debug!("DMA_MM2S->TileSwitch: tile ({},{}) slave[{}] rejected - wrong type {:?}",
+                                col, row, slave_port, port_type);
+                            // Pop to avoid infinite loop on misconfigured port
+                            self.dma_engines[i].pop_stream_out();
+                            continue;
                         }
                     } else {
-                        log::debug!("DMA_MM2S->TileSwitch: tile ({},{}) slave[{}] rejected - wrong type {:?}",
-                            col, row, slave_port, port_type);
+                        // Pop to avoid infinite loop on out-of-range port
+                        self.dma_engines[i].pop_stream_out();
+                        continue;
                     }
+                };
+
+                // Backpressure: only pop and push if the target can accept.
+                if let Some((slave_idx, desc)) = target_slave {
+                    if !self.tiles[i].stream_switch.slaves[slave_idx].can_accept() {
+                        // Target FIFO full -- leave data in stream_out (backpressure).
+                        break;
+                    }
+
+                    // Safe to pop and push -- downstream has space.
+                    let data = self.dma_engines[i].pop_stream_out().unwrap();
+                    self.tiles[i].stream_switch.slaves[slave_idx].push_with_tlast(data.data, data.tlast);
+                    words_routed += 1;
+
+                    let prefix = if tile_type == TileType::Shim { "Shim" } else { "tile" };
+                    log::info!("DMA_MM2S->TileSwitch: {} ({},{}) slave[{}] <- 0x{:08X}{} ({})",
+                        prefix, col, row, slave_idx, data.data, if data.tlast { " TLAST" } else { "" }, desc);
                 }
             }
         }
@@ -1098,8 +1134,13 @@ impl TileArray {
                             log::info!("TileSwitch->DMA: tile ({},{}) master[{}] -> DMA ch {} = 0x{:08X} (stream_in_len={})",
                                 self.tiles[i].col, self.tiles[i].row, master_port, ch, data, new_len);
                         } else {
-                            log::warn!("TileSwitch->DMA: push_stream_in FAILED for tile ({},{}) ch {} data=0x{:08X}",
-                                self.tiles[i].col, self.tiles[i].row, ch, data);
+                            let msg = format!(
+                                "TileSwitch->DMA: push_stream_in FAILED for tile ({},{}) ch {} data=0x{:08X} -- \
+                                 DMA input buffer overflow (impossible with hardware backpressure)",
+                                self.tiles[i].col, self.tiles[i].row, ch, data,
+                            );
+                            log::error!("{}", msg);
+                            self.fatal_errors.push(msg);
                         }
                     }
                 }
@@ -1329,10 +1370,12 @@ impl TileArray {
                         if tlast { " TLAST" } else { "" }
                     );
                 } else {
-                    log::warn!(
-                        "InterTile: push failed ({},{}) slave[{}] full",
-                        dst_col, dst_row, dst_slave
+                    let msg = format!(
+                        "InterTile: push failed ({},{}) slave[{}] full -- backpressure violation",
+                        dst_col, dst_row, dst_slave,
                     );
+                    log::error!("{}", msg);
+                    self.fatal_errors.push(msg);
                 }
             }
         }

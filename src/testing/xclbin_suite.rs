@@ -1121,13 +1121,20 @@ impl XclbinSuite {
         mut npu_executor: Option<&mut NpuExecutor>,
         output_addr: u64,
     ) -> TestOutcome {
-        use super::quiescence::{QuiescenceDetector, QuiescenceStatus};
+        use super::quiescence::{
+            QuiescenceDetector, QuiescenceStatus,
+            StallDetector, StallStatus,
+        };
 
         const QUIESCENCE_CYCLES: u64 = 100;
+        /// No DMA byte progress for this many cycles with pending syncs = stall.
+        /// Longest passing test is ~20K cycles; 50K is generous.
+        const STALL_CYCLES: u64 = 50_000;
 
         let mut cycles = 0u64;
         let mut quiescence = QuiescenceDetector::new(QUIESCENCE_CYCLES);
-        // 0 means no hard limit -- rely on quiescence only
+        let mut stall = StallDetector::new(STALL_CYCLES);
+        // 0 means no hard limit -- rely on quiescence/stall detection only
         let cycle_limit = if self.max_cycles == 0 { u64::MAX } else { self.max_cycles };
 
         while cycles < cycle_limit {
@@ -1137,7 +1144,10 @@ impl XclbinSuite {
             // below drains the queue naturally via full system simulation.
             if let Some(executor) = npu_executor.as_mut() {
                 let (device, host_mem) = engine.device_and_host_memory();
-                executor.try_advance(device, host_mem);
+                if let crate::npu::AdvanceResult::Error(msg) = executor.try_advance(device, host_mem) {
+                    log::error!("NPU executor fatal: {}", msg);
+                    return TestOutcome::Fail { message: msg, cycles };
+                }
             }
 
             engine.step();
@@ -1186,9 +1196,7 @@ impl XclbinSuite {
                 }
             }
 
-            // Quiescence detection: check if the entire system has settled with
-            // no possible forward progress. All cores terminal, all DMA terminal,
-            // no data in flight, executor done -- sustained for QUIESCENCE_CYCLES.
+            // Quiescence detection: all subsystems terminal for 100 cycles.
             match quiescence.check(engine, npu_executor.as_deref()) {
                 QuiescenceStatus::Quiescent(diagnosis) => {
                     log::info!(
@@ -1199,8 +1207,31 @@ impl XclbinSuite {
                 }
                 QuiescenceStatus::Running => {}
             }
+
+            // Stall detection: cores running but no DMA byte progress for
+            // STALL_CYCLES while syncs remain unsatisfied. Catches livelocks
+            // where quiescence can't fire because cores are still Running.
+            match stall.check(engine, npu_executor.as_deref()) {
+                StallStatus::Stalled(diagnosis) => {
+                    let dma_bytes = engine.device().array.total_dma_bytes_transferred();
+                    log::warn!(
+                        "DMA stall after {} cycles in test {} ({} bytes transferred): {}",
+                        cycles, test.name, dma_bytes, diagnosis,
+                    );
+                    return TestOutcome::Timeout { cycles };
+                }
+                StallStatus::Progressing => {}
+            }
         }
 
+        // Hard cycle limit reached -- produce diagnostic so we know why
+        // neither quiescence nor stall detection fired.
+        let diagnosis = QuiescenceDetector::diagnose(engine, npu_executor.as_deref());
+        let dma_bytes = engine.device().array.total_dma_bytes_transferred();
+        log::warn!(
+            "Hard cycle limit ({}) reached in test {} ({} bytes transferred): {}",
+            cycle_limit, test.name, dma_bytes, diagnosis,
+        );
         TestOutcome::Timeout { cycles }
     }
 

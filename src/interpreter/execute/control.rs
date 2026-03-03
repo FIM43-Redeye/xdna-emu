@@ -293,8 +293,10 @@ impl ControlUnit {
             BranchCondition::Zero
             | BranchCondition::NotZero
             | BranchCondition::NotZeroDecrement => {
-                log::warn!("Zero/NotZero/NotZeroDecrement condition should be handled in execute(), not here");
-                false
+                panic!(
+                    "Zero/NotZero/NotZeroDecrement condition reached evaluate_condition() -- \
+                     must be handled in execute() using register values"
+                );
             }
         }
     }

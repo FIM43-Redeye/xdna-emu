@@ -2003,9 +2003,12 @@ impl Tile {
                 }
             }
             CTRL_PKT_OP_READ => {
-                // Read: would need to send response back via stream
-                log::warn!("Tile ({},{}) ctrl_pkt: read operation not yet supported (addr=0x{:05X})",
-                    self.col, self.row, base_address);
+                let msg = format!(
+                    "Tile ({},{}) ctrl_pkt: read operation not implemented (addr=0x{:05X}) -- protocol violation",
+                    self.col, self.row, base_address,
+                );
+                log::error!("{}", msg);
+                self.stream_switch.fatal_errors.push(msg);
             }
             CTRL_PKT_OP_WRITE_INCR => {
                 // Write with increment: write data to address, then address+4, etc.
@@ -2017,8 +2020,12 @@ impl Tile {
                 }
             }
             _ => {
-                log::warn!("Tile ({},{}) ctrl_pkt: unknown operation {} (addr=0x{:05X})",
-                    self.col, self.row, operation, base_address);
+                let msg = format!(
+                    "Tile ({},{}) ctrl_pkt: unknown operation {} (addr=0x{:05X}) -- impossible on hardware",
+                    self.col, self.row, operation, base_address,
+                );
+                log::error!("{}", msg);
+                self.stream_switch.fatal_errors.push(msg);
             }
         }
     }

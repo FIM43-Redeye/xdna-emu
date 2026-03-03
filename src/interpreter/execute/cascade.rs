@@ -31,7 +31,7 @@ use crate::interpreter::state::ExecutionContext;
 pub struct CascadeOps;
 
 /// Result of cascade operation execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CascadeResult {
     /// Operation completed successfully.
     Completed,
@@ -39,6 +39,8 @@ pub enum CascadeResult {
     Stall,
     /// Not a cascade operation -- pass to next execution unit.
     NotCascadeOp,
+    /// Fatal error in cascade operation.
+    Error(String),
 }
 
 impl CascadeOps {
@@ -95,10 +97,10 @@ impl CascadeOps {
                     );
                 }
                 _ => {
-                    log::warn!(
-                        "[CASCADE] Read SCD: unexpected dest {:?} (tile {},{})",
-                        dest, tile.col, tile.row
-                    );
+                    return CascadeResult::Error(format!(
+                        "[CASCADE] Read SCD: unexpected dest {:?} (tile {},{}) -- impossible operand",
+                        dest, tile.col, tile.row,
+                    ));
                 }
             }
         }
@@ -143,19 +145,17 @@ impl CascadeOps {
                     d
                 }
                 _ => {
-                    log::warn!(
-                        "[CASCADE] Write MCD: unexpected src {:?} (tile {},{})",
-                        src, tile.col, tile.row
-                    );
-                    [0u64; 6]
+                    return CascadeResult::Error(format!(
+                        "[CASCADE] Write MCD: unexpected src {:?} (tile {},{}) -- impossible operand",
+                        src, tile.col, tile.row,
+                    ));
                 }
             }
         } else {
-            log::warn!(
-                "[CASCADE] Write MCD: no source operand (tile {},{})",
-                tile.col, tile.row
-            );
-            [0u64; 6]
+            return CascadeResult::Error(format!(
+                "[CASCADE] Write MCD: no source operand (tile {},{}) -- malformed instruction",
+                tile.col, tile.row,
+            ));
         };
 
         tile.push_cascade_output(data);

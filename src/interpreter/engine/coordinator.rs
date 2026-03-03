@@ -223,6 +223,16 @@ impl InterpreterEngine {
             total_flush_words += words_routed;
             flush_iters += 1;
 
+            // Check for fatal errors from data movement during flush too
+            let fatal_errors = self.device.array.drain_fatal_errors();
+            if !fatal_errors.is_empty() {
+                for err in &fatal_errors {
+                    log::error!("Data movement fatal (flush): {}", err);
+                }
+                self.status = EngineStatus::Error;
+                return;
+            }
+
             // Keep routing as long as trace data is anywhere in the pipeline:
             // pending in trace units, in stream switch slave/master FIFOs, or
             // awaiting inter-tile propagation.
@@ -419,6 +429,17 @@ impl InterpreterEngine {
 
         let (dma_active, streams_moved, words_routed) =
             self.device.array.step_data_movement(&mut self.host_memory);
+
+        // Check for fatal errors from data movement (impossible-on-hardware
+        // conditions like missing packet routes or stream buffer overflows).
+        let fatal_errors = self.device.array.drain_fatal_errors();
+        if !fatal_errors.is_empty() {
+            for err in &fatal_errors {
+                log::error!("Data movement fatal: {}", err);
+            }
+            self.status = EngineStatus::Error;
+            return;
+        }
 
         // Drain DMA trace events into the global trace log and notify
         // trace units so they can produce binary trace packets.

@@ -165,7 +165,7 @@ impl QuiescenceDetector {
     }
 
     /// Build a diagnostic snapshot of the current system state.
-    fn diagnose(
+    pub(crate) fn diagnose(
         engine: &InterpreterEngine,
         npu_executor: Option<&NpuExecutor>,
     ) -> QuiescenceDiagnosis {
@@ -207,16 +207,11 @@ impl QuiescenceDetector {
                 if let Some(dma) = device.array.dma_engine(col as u8, row as u8) {
                     for ch in 0..dma.num_channels() {
                         let state = dma.channel_state(ch as u8);
-                        let desc = match state {
-                            ChannelState::Idle => "Idle".to_string(),
-                            ChannelState::Active => "Active".to_string(),
-                            ChannelState::Paused => "Paused".to_string(),
-                            ChannelState::WaitingForLock(id) => {
-                                format!("WaitingForLock({})", id)
-                            }
-                            ChannelState::Error => "Error".to_string(),
-                        };
                         if !matches!(state, ChannelState::Idle) {
+                            // Use detailed FSM description instead of the
+                            // coarse ChannelState to distinguish Transferring
+                            // from ReleasingLock, BdChaining, etc.
+                            let desc = dma.channel_fsm_description(ch as u8);
                             dma_states.push((col as u8, row as u8, ch as u8, desc));
                         }
                     }
@@ -239,6 +234,92 @@ impl QuiescenceDetector {
             dma_states,
             data_in_flight: device.array.any_data_in_flight(),
             pending_syncs,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DMA Stall Detection
+// ---------------------------------------------------------------------------
+
+/// Result of a stall check on a single cycle.
+pub enum StallStatus {
+    /// DMA is making byte-level progress (or no syncs pending yet).
+    Progressing,
+    /// DMA has not transferred any new bytes for `threshold` consecutive cycles
+    /// while syncs remain unsatisfied. Contains a diagnostic snapshot.
+    Stalled(QuiescenceDiagnosis),
+}
+
+/// Detects DMA stalls by monitoring byte transfer progress.
+///
+/// Complements [`QuiescenceDetector`] which catches true deadlocks (all
+/// subsystems terminal). This detector catches **livelocks** where cores
+/// are still running (e.g. infinite kernel loops) but DMA is not moving
+/// data, so the workload can never complete.
+///
+/// The stall counter resets whenever `total_dma_bytes_transferred()` changes.
+/// It only fires when there are unsatisfied pending syncs -- otherwise the
+/// test may legitimately be doing pure computation.
+pub struct StallDetector {
+    /// Last observed total DMA bytes transferred.
+    last_dma_bytes: u64,
+    /// Consecutive cycles with no DMA byte progress.
+    cycles_since_progress: u64,
+    /// Threshold before declaring a stall.
+    threshold: u64,
+}
+
+impl StallDetector {
+    /// Create a new stall detector with the given cycle threshold.
+    pub fn new(threshold: u64) -> Self {
+        Self {
+            last_dma_bytes: 0,
+            cycles_since_progress: 0,
+            threshold,
+        }
+    }
+
+    /// Check whether DMA has stalled this cycle.
+    ///
+    /// Must be called once per cycle. Returns:
+    /// - `Progressing` if DMA bytes are moving or no syncs are pending
+    /// - `Stalled(diagnosis)` if no byte progress for `threshold` cycles
+    ///   with unsatisfied syncs
+    pub fn check(
+        &mut self,
+        engine: &InterpreterEngine,
+        npu_executor: Option<&NpuExecutor>,
+    ) -> StallStatus {
+        // Only check if there are pending syncs to satisfy. Without syncs,
+        // there is no DMA completion target and the test may be purely
+        // compute-based (or hasn't started DMA yet).
+        let has_pending_syncs = if let Some(executor) = npu_executor {
+            !executor.pending_syncs().is_empty()
+        } else {
+            false
+        };
+
+        if !has_pending_syncs {
+            self.cycles_since_progress = 0;
+            return StallStatus::Progressing;
+        }
+
+        let current_bytes = engine.device().array.total_dma_bytes_transferred();
+
+        if current_bytes != self.last_dma_bytes {
+            self.last_dma_bytes = current_bytes;
+            self.cycles_since_progress = 0;
+            StallStatus::Progressing
+        } else {
+            self.cycles_since_progress += 1;
+            if self.cycles_since_progress >= self.threshold {
+                StallStatus::Stalled(
+                    QuiescenceDetector::diagnose(engine, npu_executor)
+                )
+            } else {
+                StallStatus::Progressing
+            }
         }
     }
 }

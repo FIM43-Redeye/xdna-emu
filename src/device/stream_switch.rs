@@ -420,6 +420,13 @@ pub struct StreamSwitch {
     /// until TLAST. Prevents packet interleaving when multiple slaves route
     /// through the same arbiter simultaneously. 8 arbiters max (3-bit field).
     arbiter_locks: [Option<usize>; 8],
+
+    /// Fatal errors accumulated during routing.
+    ///
+    /// Conditions that are impossible on real hardware (e.g., packet with no
+    /// configured route) are collected here. The owning TileArray drains
+    /// these after each step and propagates them to the coordinator.
+    pub fatal_errors: Vec<String>,
 }
 
 impl StreamSwitch {
@@ -463,6 +470,7 @@ impl StreamSwitch {
             master_packet_config: vec![MasterPacketConfig::default(); num_masters],
             active_packets: vec![None; num_slaves],
             arbiter_locks: [None; 8],
+            fatal_errors: Vec::new(),
         }
     }
 
@@ -496,6 +504,7 @@ impl StreamSwitch {
             master_packet_config: vec![MasterPacketConfig::default(); num_masters],
             active_packets: vec![None; num_slaves],
             arbiter_locks: [None; 8],
+            fatal_errors: Vec::new(),
         }
     }
 
@@ -527,6 +536,7 @@ impl StreamSwitch {
             master_packet_config: vec![MasterPacketConfig::default(); num_masters],
             active_packets: vec![None; num_slaves],
             arbiter_locks: [None; 8],
+            fatal_errors: Vec::new(),
         }
     }
 
@@ -896,9 +906,16 @@ impl StreamSwitch {
                         }
                     }
                     None => {
-                        // No route found -- drop the word
-                        log::warn!("TileSwitch({},{}): no packet route for pkt_id={} on slave[{}], dropping",
-                            self.col, self.row, pkt_id, slave_idx);
+                        // No route configured. On real hardware, packets
+                        // always have a valid route (CDO sets them up).
+                        // This indicates a CDO parsing or configuration bug.
+                        let msg = format!(
+                            "TileSwitch({},{}): no packet route for pkt_id={} on slave[{}] -- \
+                             impossible on real hardware (missing CDO route config?)",
+                            self.col, self.row, pkt_id, slave_idx,
+                        );
+                        log::error!("{}", msg);
+                        self.fatal_errors.push(msg);
                         self.slaves[slave_idx].pop();
                     }
                 }

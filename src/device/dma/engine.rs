@@ -301,6 +301,13 @@ pub struct DmaEngine {
     /// Transferred to the tile at the end of each DMA step for comparison
     /// with core bank accesses.
     pub cycle_dma_banks: u16,
+
+    /// Fatal errors accumulated during DMA operations.
+    ///
+    /// Conditions that are impossible on real hardware (memory bounds
+    /// violations, lock address overflow, missing neighbor tiles, buffer
+    /// overflow). The owning TileArray drains these after each step.
+    pub fatal_errors: Vec<String>,
 }
 
 impl DmaEngine {
@@ -340,6 +347,7 @@ impl DmaEngine {
                 TileType::Shim => 0,
             },
             cycle_dma_banks: 0,
+            fatal_errors: Vec::new(),
         }
     }
 
@@ -485,10 +493,12 @@ impl DmaEngine {
         } else if lock_id < num_locks * 3 {
             Some(LockTarget::East(lock_id - num_locks * 2))
         } else {
-            log::warn!(
+            let msg = format!(
                 "DMA tile({},{}) lock_id={} out of {}-entry address space",
-                col, row, lock_id, num_locks as u16 * 3
+                col, row, lock_id, num_locks as u16 * 3,
             );
+            log::error!("{}", msg);
+            // Cannot push to fatal_errors from static method; caller must handle None.
             None
         }
     }
@@ -659,10 +669,12 @@ impl DmaEngine {
         };
 
         if ch_idx >= self.num_channels() {
-            log::warn!(
-                "DmaEngine::enable_channel: invalid channel {} (is_mm2s={}, rel={})",
-                ch_idx, is_mm2s, relative_channel
+            let msg = format!(
+                "DmaEngine({},{})::enable_channel: invalid channel {} (is_mm2s={}, rel={})",
+                self.col, self.row, ch_idx, is_mm2s, relative_channel,
             );
+            log::error!("{}", msg);
+            self.fatal_errors.push(msg);
             return;
         }
 
@@ -709,6 +721,15 @@ impl DmaEngine {
             return ChannelState::Idle;
         }
         self.channels[ch_idx].state()
+    }
+
+    /// Get detailed FSM description for diagnostics.
+    pub fn channel_fsm_description(&self, channel: ChannelId) -> String {
+        let ch_idx = channel as usize;
+        if ch_idx >= self.num_channels() {
+            return "Invalid".to_string();
+        }
+        self.channels[ch_idx].fsm_description()
     }
 
     /// Get channel statistics.
@@ -1210,16 +1231,24 @@ impl DmaEngine {
             LockTarget::West(id) => match neighbors.west.as_deref_mut() {
                 Some(west) => (west, id),
                 None => {
-                    log::warn!("DMA tile({},{}) release lock_id={} targets west neighbor but none exists",
-                        self.col, self.row, lock_id);
+                    let msg = format!(
+                        "DMA tile({},{}) release lock_id={} targets west neighbor but none exists -- lock deadlock",
+                        self.col, self.row, lock_id,
+                    );
+                    log::error!("{}", msg);
+                    self.fatal_errors.push(msg);
                     return;
                 }
             },
             LockTarget::East(id) => match neighbors.east.as_deref_mut() {
                 Some(east) => (east, id),
                 None => {
-                    log::warn!("DMA tile({},{}) release lock_id={} targets east neighbor but none exists",
-                        self.col, self.row, lock_id);
+                    let msg = format!(
+                        "DMA tile({},{}) release lock_id={} targets east neighbor but none exists -- lock deadlock",
+                        self.col, self.row, lock_id,
+                    );
+                    log::error!("{}", msg);
+                    self.fatal_errors.push(msg);
                     return;
                 }
             },
@@ -1383,8 +1412,12 @@ impl DmaEngine {
         );
 
         if offset + bytes > mem_size {
-            log::warn!("DMA({},{}) MM2S addr=0x{:X} bytes={} wraps past memory end (size=0x{:X})",
-                self.col, self.row, addr, bytes, mem_size);
+            let msg = format!(
+                "DMA({},{}) MM2S addr=0x{:X} bytes={} wraps past memory end (size=0x{:X}) -- bus error",
+                self.col, self.row, addr, bytes, mem_size,
+            );
+            log::error!("{}", msg);
+            self.fatal_errors.push(msg);
             return false;
         }
 
@@ -1474,8 +1507,12 @@ impl DmaEngine {
             let compressed = match compression::compress(&block) {
                 Some(c) => c,
                 None => {
-                    log::error!("DMA({},{}) MM2S ch{} compression failed at block {}",
-                        self.col, self.row, channel, block_idx);
+                    let msg = format!(
+                        "DMA({},{}) MM2S ch{} compression failed at block {} -- data corruption",
+                        self.col, self.row, channel, block_idx,
+                    );
+                    log::error!("{}", msg);
+                    self.fatal_errors.push(msg);
                     return false;
                 }
             };
@@ -1526,8 +1563,12 @@ impl DmaEngine {
         );
 
         if offset + bytes > mem_size {
-            log::warn!("DMA({},{}) S2MM addr=0x{:X} bytes={} wraps past memory end (size=0x{:X})",
-                self.col, self.row, addr, bytes, mem_size);
+            let msg = format!(
+                "DMA({},{}) S2MM addr=0x{:X} bytes={} wraps past memory end (size=0x{:X}) -- bus error",
+                self.col, self.row, addr, bytes, mem_size,
+            );
+            log::error!("{}", msg);
+            self.fatal_errors.push(msg);
             return S2mmResult { success: false, stall: false, tlast_received: false, bytes_written: 0 };
         }
 
@@ -1657,8 +1698,12 @@ impl DmaEngine {
                         self.col, self.row, channel, mask, non_zero_count, actual_write);
                 }
                 None => {
-                    log::error!("DMA({},{}) S2MM ch{} decompression failed (mask=0x{:08X}, buf_len={})",
-                        self.col, self.row, channel, mask, compressed_buf.len());
+                    let msg = format!(
+                        "DMA({},{}) S2MM ch{} decompression failed (mask=0x{:08X}, buf_len={}) -- data corruption",
+                        self.col, self.row, channel, mask, compressed_buf.len(),
+                    );
+                    log::error!("{}", msg);
+                    self.fatal_errors.push(msg);
                     return S2mmResult {
                         success: false, stall: false, tlast_received: false,
                         bytes_written: mem_bytes_written,
@@ -2071,6 +2116,11 @@ impl DmaEngine {
         self.stream_out.pop_front()
     }
 
+    /// Peek at the next word in stream output buffer without removing it.
+    pub fn peek_stream_out(&self) -> Option<&StreamData> {
+        self.stream_out.front()
+    }
+
     /// Push a word to the stream input buffer (for S2MM to consume).
     ///
     /// Returns true if successful, false if buffer is full.
@@ -2079,10 +2129,13 @@ impl DmaEngine {
             self.stream_in.push_back(data);
             true
         } else {
-            log::warn!(
-                "DMA({},{}) stream_in buffer full (256), dropping ch{} data: 0x{:08X}",
-                self.col, self.row, data.channel, data.data
+            let msg = format!(
+                "DMA({},{}) stream_in buffer full (256), dropping ch{} data: 0x{:08X} -- \
+                 backpressure violation",
+                self.col, self.row, data.channel, data.data,
             );
+            log::error!("{}", msg);
+            self.fatal_errors.push(msg);
             false
         }
     }

@@ -519,7 +519,10 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
         // Advance NPU instruction execution (interleaved with engine step)
         {
             let (device, host_mem) = handle.engine.device_and_host_memory();
-            handle.npu_executor.try_advance(device, host_mem);
+            if let crate::npu::AdvanceResult::Error(msg) = handle.npu_executor.try_advance(device, host_mem) {
+                log::error!("NPU executor fatal: {}", msg);
+                break;
+            }
         }
 
         handle.engine.step();

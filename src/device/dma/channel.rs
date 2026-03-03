@@ -248,6 +248,43 @@ impl ChannelContext {
         }
     }
 
+    /// Detailed FSM state description for diagnostics.
+    ///
+    /// Unlike `state()` which collapses most variants to Active, this returns
+    /// the exact FSM variant name so stall diagnostics can distinguish
+    /// Transferring from ReleasingLock from BdChaining etc.
+    pub fn fsm_description(&self) -> String {
+        match &self.fsm {
+            ChannelFsm::Idle => "Idle".to_string(),
+            ChannelFsm::BdSetup { cycles_remaining, .. } => {
+                format!("BdSetup({})", cycles_remaining)
+            }
+            ChannelFsm::AcquiringLock { lock_id, acquired, .. } => {
+                if *acquired {
+                    format!("AcquiringLock({}, acquired)", lock_id)
+                } else {
+                    format!("AcquiringLock({})", lock_id)
+                }
+            }
+            ChannelFsm::MemoryLatency { cycles_remaining, .. } => {
+                format!("MemoryLatency({})", cycles_remaining)
+            }
+            ChannelFsm::Transferring { transfer } => {
+                format!("Transferring({}/{})",
+                    transfer.bytes_transferred, transfer.total_bytes)
+            }
+            ChannelFsm::ReleasingLock { lock_id, release_value, cycles_remaining, .. } => {
+                format!("ReleasingLock({}, delta={}, {}cyc)",
+                    lock_id, release_value, cycles_remaining)
+            }
+            ChannelFsm::BdChaining { cycles_remaining, next_bd } => {
+                format!("BdChaining(bd={}, {}cyc)", next_bd, cycles_remaining)
+            }
+            ChannelFsm::Paused { .. } => "Paused".to_string(),
+            ChannelFsm::Error => "Error".to_string(),
+        }
+    }
+
     /// Whether this channel has active work.
     pub fn is_active(&self) -> bool {
         self.fsm.is_active()
