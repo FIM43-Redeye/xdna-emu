@@ -2794,4 +2794,61 @@ mod tests {
             "MemTile BD0 length should be updated via ctrl_packet_write dispatch"
         );
     }
+
+    /// OP_READ (operation=1) produces a ReadRegisters action immediately upon
+    /// receiving the header, with no data payload. The action carries the
+    /// offset, count (beats+1), and response_id from the header.
+    #[test]
+    fn test_ctrl_packet_op_read_produces_read_registers_action() {
+        use crate::device::aie2_spec::*;
+
+        let mut tile = Tile::compute(2, 3);
+
+        // Pre-populate registers at 0x440, 0x444, 0x448, 0x44C with known values.
+        tile.write_register(0x440, 0xDEAD_0001);
+        tile.write_register(0x444, 0xDEAD_0002);
+        tile.write_register(0x448, 0xDEAD_0003);
+        tile.write_register(0x44C, 0xDEAD_0004);
+
+        // Build OP_READ control packet header:
+        //   address   = 0x440 (bits 19:0)
+        //   beats     = 3 (bits 21:20) -> actual count = 3 + 1 = 4
+        //   operation = 1 (bits 23:22) = OP_READ
+        //   response_id = 2 (bits 30:24)
+        let address: u32 = 0x440;
+        let beats_raw: u32 = 3; // means 4 words
+        let operation: u32 = CTRL_PKT_OP_READ as u32;
+        let response_id: u32 = 2;
+
+        let header = address
+            | (beats_raw << CTRL_PKT_LENGTH_SHIFT)
+            | (operation << CTRL_PKT_OPERATION_SHIFT)
+            | (response_id << CTRL_PKT_RESPONSE_ID_SHIFT);
+
+        // Start from Idle state (skip stream header)
+        tile.ctrl_pkt_state = ControlPacketState::Idle;
+
+        // OP_READ has no data payload -- TLAST on the header itself
+        let actions = tile.process_ctrl_packet_word(header, true);
+
+        // Should produce exactly one ReadRegisters action
+        assert_eq!(actions.len(), 1, "OP_READ should produce exactly one action");
+
+        match &actions[0] {
+            CtrlPacketAction::ReadRegisters { col, row, offset, count, response_id: rid } => {
+                assert_eq!(*col, 2, "col should match tile col");
+                assert_eq!(*row, 3, "row should match tile row");
+                assert_eq!(*offset, 0x440, "offset should be the address from header");
+                assert_eq!(*count, 4, "count should be beats+1 = 4");
+                assert_eq!(*rid, 2, "response_id should match header");
+            }
+            other => panic!("Expected ReadRegisters, got {:?}", other),
+        }
+
+        // State machine should return to Idle (header was dropped)
+        assert!(
+            matches!(tile.ctrl_pkt_state, ControlPacketState::Idle),
+            "State should be Idle after OP_READ with TLAST and drop_header=true"
+        );
+    }
 }
