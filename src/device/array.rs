@@ -115,6 +115,14 @@ pub struct TileArray {
     /// (e.g., packet with no route, stream push failure). The coordinator
     /// checks this after each step and aborts if non-empty.
     pub(crate) fatal_errors: Vec<String>,
+
+    /// Control packet actions produced during stream routing.
+    ///
+    /// Control packet writes from tiles are collected here instead of being
+    /// executed immediately. The caller (DeviceState or coordinator) drains
+    /// these and routes them through `DeviceState::ctrl_packet_write()` for
+    /// full module dispatch.
+    pub(crate) pending_ctrl_actions: Vec<super::tile::CtrlPacketAction>,
 }
 
 impl TileArray {
@@ -151,7 +159,11 @@ impl TileArray {
             }
         }
 
-        Self { arch, cols, rows, tiles, dma_engines, fatal_errors: Vec::new() }
+        Self {
+            arch, cols, rows, tiles, dma_engines,
+            fatal_errors: Vec::new(),
+            pending_ctrl_actions: Vec::new(),
+        }
     }
 
     /// Create an NPU1 (Phoenix/HawkPoint) array.
@@ -173,6 +185,16 @@ impl TileArray {
     /// conditions and abort immediately.
     pub fn drain_fatal_errors(&mut self) -> Vec<String> {
         std::mem::take(&mut self.fatal_errors)
+    }
+
+    /// Drain pending control packet actions produced during stream routing.
+    ///
+    /// Control packets arrive via the stream switch network at individual tiles.
+    /// Rather than writing registers directly (which misses the full module
+    /// dispatch in DeviceState), the tile returns actions. The caller drains
+    /// these and routes them through `DeviceState::ctrl_packet_write()`.
+    pub fn drain_ctrl_packet_actions(&mut self) -> Vec<super::tile::CtrlPacketAction> {
+        std::mem::take(&mut self.pending_ctrl_actions)
     }
 
     /// Get the architecture configuration.
@@ -817,7 +839,10 @@ impl TileArray {
             // Drain all pending words from the TileCtrl master port
             while self.tiles[i].stream_switch.masters[master_idx].has_data() {
                 if let Some((data, tlast)) = self.tiles[i].stream_switch.masters[master_idx].pop_with_tlast() {
-                    self.tiles[i].process_ctrl_packet_word(data, tlast);
+                    let actions = self.tiles[i].process_ctrl_packet_word(data, tlast);
+                    if !actions.is_empty() {
+                        self.pending_ctrl_actions.extend(actions);
+                    }
                     words_routed += 1;
                     log::debug!(
                         "TileSwitch->Ctrl: tile ({},{}) master[{}] -> ctrl_pkt = 0x{:08X}{}",

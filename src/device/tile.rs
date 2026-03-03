@@ -617,6 +617,22 @@ pub enum ControlPacketState {
     },
 }
 
+/// An action produced by processing a control packet.
+///
+/// Control packets are register writes that arrive via the stream switch
+/// network. Rather than writing directly within the tile (which misses the
+/// full module dispatch in DeviceState), the tile returns actions that the
+/// caller routes through `DeviceState::ctrl_packet_write()`.
+#[derive(Debug)]
+pub enum CtrlPacketAction {
+    /// Write a value to a tile-local register offset.
+    WriteRegister { col: u8, row: u8, offset: u32, value: u32 },
+    /// Read registers starting at offset (not yet implemented; logged).
+    ReadRegisters { col: u8, row: u8, offset: u32, count: u8, response_id: u8 },
+    /// An error occurred during control packet processing.
+    Error(String),
+}
+
 #[derive(Debug)]
 pub struct Tile {
     /// Tile type
@@ -1913,7 +1929,7 @@ impl Tile {
     /// - Bits 23:22 = Operation (00=write, 01=read, 10=write_incr, 11=block_write)
     /// - Bits 30:24 = Stream_ID (for response routing)
     /// - Bit 31 = Parity
-    pub fn process_ctrl_packet_word(&mut self, word: u32, tlast: bool) {
+    pub fn process_ctrl_packet_word(&mut self, word: u32, tlast: bool) -> Vec<CtrlPacketAction> {
         match std::mem::take(&mut self.ctrl_pkt_state) {
             ControlPacketState::WaitingForStreamHeader => {
                 // Stream header forwarded because Drop_Header=false on master.
@@ -1923,6 +1939,7 @@ impl Tile {
                 log::debug!("Tile ({},{}) ctrl_pkt: consuming stream header 0x{:08X} (pkt_id={}, pkt_type={})",
                     self.col, self.row, word, pkt_id, pkt_type);
                 self.ctrl_pkt_state = ControlPacketState::Idle;
+                Vec::new()
             }
             ControlPacketState::Idle => {
                 // Parse control packet header (AM020 Table 3)
@@ -1935,6 +1952,19 @@ impl Tile {
                 log::info!("Tile ({},{}) ctrl_pkt: header 0x{:08X} addr=0x{:05X} op={} beats={} resp_id={}",
                     self.col, self.row, word, address, operation, beats, response_id);
 
+                // OP_READ has no data payload -- execute immediately
+                if operation == CTRL_PKT_OP_READ {
+                    let actions = self.execute_ctrl_packet(
+                        address, operation, response_id, beats, &[],
+                    );
+                    self.ctrl_pkt_state = if tlast && !self.ctrl_pkt_drop_header {
+                        ControlPacketState::WaitingForStreamHeader
+                    } else {
+                        ControlPacketState::Idle
+                    };
+                    return actions;
+                }
+
                 self.ctrl_pkt_state = ControlPacketState::Collecting {
                     address,
                     operation,
@@ -1943,6 +1973,7 @@ impl Tile {
                     beats_collected: 0,
                     data: [0; 4],
                 };
+                Vec::new()
             }
             ControlPacketState::Collecting {
                 address,
@@ -1960,7 +1991,10 @@ impl Tile {
 
                 if beats_collected >= beats_total {
                     // All beats received -- execute the operation
-                    self.execute_ctrl_packet(address, operation, response_id, &data[..beats_collected as usize]);
+                    let actions = self.execute_ctrl_packet(
+                        address, operation, response_id, beats_total,
+                        &data[..beats_collected as usize],
+                    );
                     // After completion: if TLAST marks end of stream packet AND
                     // headers aren't dropped, expect a stream header next time.
                     // Otherwise stay Idle for the next ctrl packet within this
@@ -1970,6 +2004,7 @@ impl Tile {
                     } else {
                         ControlPacketState::Idle
                     };
+                    actions
                 } else {
                     // Still collecting
                     self.ctrl_pkt_state = ControlPacketState::Collecting {
@@ -1980,6 +2015,7 @@ impl Tile {
                         beats_collected,
                         data,
                     };
+                    Vec::new()
                 }
             }
         }
@@ -1987,36 +2023,65 @@ impl Tile {
 
     /// Execute a complete control packet operation.
     ///
+    /// Returns a list of actions for the caller to dispatch through
+    /// `DeviceState::ctrl_packet_write()`, which provides the full module
+    /// dispatch (MemTile DMA BDs, stream switch, etc.) that
+    /// `tile.write_register()` alone cannot.
+    ///
     /// Currently supports:
     /// - Operation 0 (write): Write data words to consecutive register addresses
-    /// - Operation 1 (read): Not yet implemented (would need response routing)
-    fn execute_ctrl_packet(&mut self, base_address: u32, operation: u8, _response_id: u8, data: &[u32]) {
+    /// - Operation 1 (read): Logged, returns ReadRegisters action
+    /// - Operation 2 (write_incr): Same as write
+    /// - Operation 3 (block_write): Same as write
+    fn execute_ctrl_packet(
+        &self,
+        base_address: u32,
+        operation: u8,
+        response_id: u8,
+        beats_total: u8,
+        data: &[u32],
+    ) -> Vec<CtrlPacketAction> {
         use crate::device::aie2_spec::*;
+        let mut actions = Vec::new();
+
         match operation {
             CTRL_PKT_OP_WRITE | CTRL_PKT_OP_BLOCK_WRITE => {
-                // Write / Block write: write data to consecutive 32-bit registers
                 for (i, &value) in data.iter().enumerate() {
                     let addr = base_address + (i as u32) * 4;
                     log::info!("Tile ({},{}) ctrl_pkt WRITE: [0x{:05X}] = 0x{:08X}",
                         self.col, self.row, addr, value);
-                    self.write_register(addr, value);
+                    actions.push(CtrlPacketAction::WriteRegister {
+                        col: self.col,
+                        row: self.row,
+                        offset: addr,
+                        value,
+                    });
                 }
             }
             CTRL_PKT_OP_READ => {
-                let msg = format!(
-                    "Tile ({},{}) ctrl_pkt: read operation not implemented (addr=0x{:05X}) -- protocol violation",
-                    self.col, self.row, base_address,
+                log::info!(
+                    "Tile ({},{}) ctrl_pkt READ: addr=0x{:05X} beats={} resp_id={}",
+                    self.col, self.row, base_address, beats_total, response_id,
                 );
-                log::error!("{}", msg);
-                self.stream_switch.fatal_errors.push(msg);
+                actions.push(CtrlPacketAction::ReadRegisters {
+                    col: self.col,
+                    row: self.row,
+                    offset: base_address,
+                    count: beats_total,
+                    response_id,
+                });
             }
             CTRL_PKT_OP_WRITE_INCR => {
-                // Write with increment: write data to address, then address+4, etc.
                 for (i, &value) in data.iter().enumerate() {
                     let addr = base_address + (i as u32) * 4;
                     log::info!("Tile ({},{}) ctrl_pkt WRITE_INCR: [0x{:05X}] = 0x{:08X}",
                         self.col, self.row, addr, value);
-                    self.write_register(addr, value);
+                    actions.push(CtrlPacketAction::WriteRegister {
+                        col: self.col,
+                        row: self.row,
+                        offset: addr,
+                        value,
+                    });
                 }
             }
             _ => {
@@ -2025,9 +2090,11 @@ impl Tile {
                     self.col, self.row, operation, base_address,
                 );
                 log::error!("{}", msg);
-                self.stream_switch.fatal_errors.push(msg);
+                actions.push(CtrlPacketAction::Error(msg));
             }
         }
+
+        actions
     }
 
     // === Lock_Request Register Handling ===
@@ -2668,45 +2735,63 @@ mod tests {
         assert!(!tile.has_cascade_output());
     }
 
-    /// RED test: proves that tile.write_register() does NOT update structured
-    /// BD state for MemTile BDs. MemTile BDs live at 0xA0000 (from regdb),
-    /// but tile.write_register() only handles the compute BD range 0x1D000-0x1D200.
-    ///
-    /// This test writes to a MemTile BD0 register (word 2 = length field) and
-    /// checks whether the structured dma_bds[0].length was updated.
-    ///
-    /// Expected: FAIL -- tile.write_register() stores the value in the
-    /// register HashMap but never touches dma_bds[].
+    /// Documents that tile.write_register() does NOT update structured BD
+    /// state for MemTile BDs. This is a known limitation, not a bug -- the
+    /// fix is that control packets now return CtrlPacketAction::WriteRegister
+    /// which the caller routes through DeviceState::ctrl_packet_write().
     #[test]
-    fn test_ctrl_packet_write_memtile_bd_dispatch_gap() {
+    fn test_tile_write_register_does_not_handle_memtile_bds() {
         let reg_layout = super::super::regdb::device_reg_layout();
         let bd0_word2_offset = reg_layout.memtile_bd_base + 2 * 4; // BD0, word 2 (length)
 
         let mut tile = Tile::mem_tile(1, 1);
-
-        // Verify BD starts zeroed
-        assert_eq!(tile.dma_bds[0].length, 0, "BD0 length should start at 0");
-
-        // Write via tile.write_register() -- this is what ctrl packets do
         let test_length: u32 = 0x0000_1000;
         tile.write_register(bd0_word2_offset, test_length);
 
-        // The register HashMap WILL have the value (write_register always stores)
+        // Register HashMap stores the value
         assert_eq!(
             *tile.registers_ref().get(&bd0_word2_offset).unwrap_or(&0),
             test_length,
             "Register HashMap should have the value"
         );
 
-        // But the structured BD should ALSO be updated for the DMA engine to
-        // work correctly. This is the gap: tile.write_register() only handles
-        // the compute BD range (0x1D000-0x1D200), not the MemTile range.
+        // Structured BD is NOT updated (known limitation of tile-level dispatch)
+        assert_eq!(
+            tile.dma_bds[0].length, 0,
+            "tile.write_register() should NOT update MemTile BDs -- \
+             this is handled by DeviceState::ctrl_packet_write()"
+        );
+    }
+
+    /// Proves that DeviceState::ctrl_packet_write() correctly dispatches
+    /// MemTile BD writes through the full module dispatch path. This is the
+    /// path that control packet actions now follow.
+    #[test]
+    fn test_ctrl_packet_write_updates_memtile_bd() {
+        let reg_layout = super::super::regdb::device_reg_layout();
+        let bd0_word2_offset = reg_layout.memtile_bd_base + 2 * 4; // BD0, word 2 (length)
+
+        let mut device = super::super::state::DeviceState::new_npu1();
+
+        // Verify BD starts zeroed on the MemTile (col=1, row=1)
+        let tile = device.array.get(1, 1).expect("tile(1,1) should exist");
+        assert!(tile.is_mem_tile(), "tile(1,1) should be a MemTile");
+        assert_eq!(tile.dma_bds[0].length, 0, "BD0 length should start at 0");
+
+        // Write via ctrl_packet_write -- this is the new fixed path
+        let test_length: u32 = 0x0000_1000;
+        device.ctrl_packet_write(1, 1, bd0_word2_offset, test_length);
+
+        // Both the register HashMap AND the structured BD should be updated
+        let tile = device.array.get(1, 1).unwrap();
+        assert_eq!(
+            *tile.registers_ref().get(&bd0_word2_offset).unwrap_or(&0),
+            test_length,
+            "Register HashMap should have the value"
+        );
         assert_eq!(
             tile.dma_bds[0].length, test_length,
-            "BUG: MemTile BD0 length not updated by tile.write_register() -- \
-             ctrl packets go through tile.write_register() which only handles \
-             compute BD range 0x1D000-0x1D200, not MemTile range 0x{:05X}+",
-            reg_layout.memtile_bd_base
+            "MemTile BD0 length should be updated via ctrl_packet_write dispatch"
         );
     }
 }

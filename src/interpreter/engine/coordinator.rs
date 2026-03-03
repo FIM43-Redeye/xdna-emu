@@ -233,6 +233,28 @@ impl InterpreterEngine {
                 return;
             }
 
+            // Dispatch any ctrl packet actions produced during flush routing
+            {
+                use crate::device::tile::CtrlPacketAction;
+                let ctrl_actions = self.device.array.drain_ctrl_packet_actions();
+                for action in ctrl_actions {
+                    match action {
+                        CtrlPacketAction::WriteRegister { col, row, offset, value } => {
+                            self.device.ctrl_packet_write(col, row, offset, value);
+                        }
+                        CtrlPacketAction::ReadRegisters { col, row, offset, count, response_id } => {
+                            log::warn!(
+                                "ctrl_pkt READ not yet implemented (flush): tile({},{}) offset=0x{:05X} count={} resp_id={}",
+                                col, row, offset, count, response_id,
+                            );
+                        }
+                        CtrlPacketAction::Error(msg) => {
+                            self.device.array.fatal_errors.push(msg);
+                        }
+                    }
+                }
+            }
+
             // Keep routing as long as trace data is anywhere in the pipeline:
             // pending in trace units, in stream switch slave/master FIFOs, or
             // awaiting inter-tile propagation.
@@ -439,6 +461,27 @@ impl InterpreterEngine {
             }
             self.status = EngineStatus::Error;
             return;
+        }
+
+        // Dispatch control packet actions through DeviceState for full
+        // module dispatch (MemTile DMA BDs, stream switch, etc.).
+        use crate::device::tile::CtrlPacketAction;
+        let ctrl_actions = self.device.array.drain_ctrl_packet_actions();
+        for action in ctrl_actions {
+            match action {
+                CtrlPacketAction::WriteRegister { col, row, offset, value } => {
+                    self.device.ctrl_packet_write(col, row, offset, value);
+                }
+                CtrlPacketAction::ReadRegisters { col, row, offset, count, response_id } => {
+                    log::warn!(
+                        "ctrl_pkt READ not yet implemented: tile({},{}) offset=0x{:05X} count={} resp_id={}",
+                        col, row, offset, count, response_id,
+                    );
+                }
+                CtrlPacketAction::Error(msg) => {
+                    self.device.array.fatal_errors.push(msg);
+                }
+            }
         }
 
         // Drain DMA trace events into the global trace log and notify
