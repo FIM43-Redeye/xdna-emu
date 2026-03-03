@@ -112,6 +112,26 @@ impl DeviceState {
         Ok(())
     }
 
+    /// Write a register via the full module-dispatch path, reconstructing the
+    /// 32-bit tile address from (col, row, offset).
+    ///
+    /// Control packets arrive at individual tiles with a tile-local register
+    /// offset. The tile's own `write_register()` only handles a subset of
+    /// register types (compute-tile DMA BDs, locks, channel control). This
+    /// method encodes the full address and routes through
+    /// `DeviceState::write_register()`, which dispatches to the correct
+    /// module handler (MemTile DMA BDs, MemTile stream switch, core module,
+    /// shim DMA channels, etc.).
+    pub fn ctrl_packet_write(&mut self, col: u8, row: u8, offset: u32, value: u32) {
+        let address = TileAddress::encode(col, row, offset);
+        log::debug!("ctrl_packet_write: tile({},{}) offset=0x{:05X} value=0x{:08X} -> addr=0x{:08X}",
+            col, row, offset, value, address);
+        if let Err(e) = self.write_register(address, value) {
+            log::error!("ctrl_packet_write failed: tile({},{}) offset=0x{:05X}: {:?}",
+                col, row, offset, e);
+        }
+    }
+
     /// Apply a single CDO command.
     fn apply_command(&mut self, cmd: &CdoCommand) -> Result<()> {
         match cmd {
