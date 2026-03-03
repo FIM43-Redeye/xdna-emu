@@ -687,29 +687,21 @@ impl MemoryUnit {
 
     /// Get value to store.
     ///
-    /// Handles two operand layouts:
-    /// 1. Decoded kernel: sources[0]=value, sources[1]=ptr/memory, sources[2]=offset
-    /// 2. Test/legacy: sources[0]=ptr, dest=value
+    /// For TableGen-decoded instructions (encoding_name is Some), LLVM's
+    /// InOperandList invariant guarantees sources[0] is always the value.
+    /// This is true across every AIE2 store family: ST, ST_S8, VST, spills.
     ///
-    /// Disambiguation: if sources[1] is an address operand (Memory or PointerReg),
-    /// then sources[0] is the value (layout 1). Otherwise, if sources[0] is an
-    /// address operand, the value is in dest (layout 2).
-    ///
-    /// Uses `ctx.scalar_read()` / `ctx.pointer_read()` for VLIW-safe reads that
-    /// respect the bundle snapshot when inside a VLIW bundle.
+    /// For hand-constructed test SlotOps (encoding_name is None), falls back
+    /// to a legacy heuristic that checks operand types.
     fn get_store_value(op: &SlotOp, ctx: &ExecutionContext, width: MemWidth) -> u64 {
-        // Check if sources[1] looks like an address. If so, sources[0] is the
-        // value regardless of its type (handles `st pN, [sp, #off]` where the
-        // value is a PointerReg).
-        let address_in_later_source = op.sources.get(1).map_or(false, |s| {
-            matches!(s, Operand::PointerReg(_) | Operand::Memory { .. })
-        });
-
-        let operand = if address_in_later_source {
-            // Standard kernel layout: sources[0] is the value
+        let operand = if op.encoding_name.is_some() {
+            // TableGen-decoded: sources[0] is always the value (LLVM convention).
+            // The InOperandList for every AIE2 store puts the value register
+            // class (mSclSt, eR, mWs, etc.) first, followed by address/offset.
             op.sources.first()
         } else {
-            // Legacy/test layout: if sources[0] is an address, value is in dest
+            // Hand-constructed SlotOp (tests): use legacy layout detection.
+            // If sources[0] is an address, value is in dest.
             op.sources.first().and_then(|first| {
                 match first {
                     Operand::PointerReg(_) | Operand::Memory { .. } => op.dest.as_ref(),
@@ -718,14 +710,18 @@ impl MemoryUnit {
             }).or(op.dest.as_ref())
         };
 
+        Self::read_store_operand(operand, ctx, width)
+    }
+
+    /// Read a store value from an operand reference.
+    fn read_store_operand(operand: Option<&Operand>, ctx: &ExecutionContext, width: MemWidth) -> u64 {
         operand.map_or(0, |src| match src {
             Operand::ScalarReg(r) => ctx.scalar_read(*r) as u64,
             Operand::PointerReg(r) => ctx.pointer_read(*r) as u64,
+            Operand::ModifierReg(r) => ctx.modifier_read(*r) as u64,
             Operand::VectorReg(r) => {
-                // For vector stores, pack into u64 (first 2 lanes)
                 let vec = ctx.vector.read(*r);
                 if width == MemWidth::Vector256 {
-                    // Full vector - return first 64 bits for now
                     ((vec[1] as u64) << 32) | (vec[0] as u64)
                 } else {
                     vec[0] as u64
@@ -2075,13 +2071,21 @@ mod tests {
     // Pointer Register Store/Load (callee-save pattern)
     // =====================================================================
 
+    /// Build a store SlotOp that mimics TableGen-decoded output.
+    /// Sets encoding_name so get_store_value uses the LLVM convention
+    /// (sources[0] = value) instead of the legacy heuristic.
+    fn make_decoded_store() -> SlotOp {
+        let mut op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store);
+        op.encoding_name = Some("ST_dms_spill".into());
+        op
+    }
+
     #[test]
     fn test_store_pointer_register_value() {
         // `st p7, [sp, #-32]` -- stores p7's VALUE to memory.
-        // This is the callee-save pattern used by every function prologue.
-        // Bug history: get_store_value saw PointerReg in sources[0] and
-        // incorrectly assumed it was an address (test layout), causing all
-        // pointer register stores to write 0 instead of the register value.
+        // LLVM's InOperandList puts the value at sources[0] for all stores.
+        // The mSclSt register class covers ScalarReg, PointerReg, ModifierReg,
+        // and LR, so the value can be any of these types.
         let mut ctx = make_ctx();
         let mut tile = make_tile();
         ctx.set_sp(0x100);
@@ -2091,7 +2095,7 @@ mod tests {
         assert_eq!(ctx.pointer.read(7), 0x78000);
 
         // st p7, [sp, #-32]: sources[0]=PointerReg(7), sources[1]=Memory{sp, -32}
-        let op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+        let op = make_decoded_store()
             .with_source(Operand::PointerReg(7))
             .with_source(Operand::Memory { base: SP_PTR_INDEX, offset: -32 });
 
@@ -2113,8 +2117,8 @@ mod tests {
         ctx.cycles = 1;
         ctx.commit_pending_writes();
 
-        // Store p7 to stack
-        let store_op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+        // Store p7 to stack (TableGen path)
+        let store_op = make_decoded_store()
             .with_source(Operand::PointerReg(7))
             .with_source(Operand::Memory { base: SP_PTR_INDEX, offset: -32 });
         MemoryUnit::execute(&store_op, &mut ctx, &mut tile, None);
@@ -2148,7 +2152,7 @@ mod tests {
         ctx.cycles = 1;
         ctx.commit_pending_writes();
 
-        let op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+        let op = make_decoded_store()
             .with_source(Operand::PointerReg(6))
             .with_source(Operand::Memory { base: SP_PTR_INDEX, offset: -36 });
 
@@ -2158,5 +2162,25 @@ mod tests {
         let stored = tile.read_data_u32(0x1DC);
         assert_eq!(stored, Some(0x74000),
             "st p6 must store p6's value correctly");
+    }
+
+    #[test]
+    fn test_store_modifier_register() {
+        // mSclSt also covers modifier registers (eDJ, eM).
+        // Verify st djN, [sp, #off] works via the TableGen path.
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        ctx.set_sp(0x100);
+        ctx.modifier.write(0, 0x42);
+
+        let op = make_decoded_store()
+            .with_source(Operand::ModifierReg(0))
+            .with_source(Operand::Memory { base: SP_PTR_INDEX, offset: -4 });
+
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
+
+        let stored = tile.read_data_u32(0xFC); // 0x100 - 4
+        assert_eq!(stored, Some(0x42),
+            "st dj0 must store modifier register value");
     }
 }
