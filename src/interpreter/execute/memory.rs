@@ -688,23 +688,39 @@ impl MemoryUnit {
     /// Get value to store.
     ///
     /// Handles two operand layouts:
-    /// 1. Decoded kernel: sources[0]=value, sources[1]=ptr, sources[2]=offset
+    /// 1. Decoded kernel: sources[0]=value, sources[1]=ptr/memory, sources[2]=offset
     /// 2. Test/legacy: sources[0]=ptr, dest=value
     ///
-    /// Uses `ctx.scalar_read()` for VLIW-safe reads that respect the
-    /// bundle snapshot when inside a VLIW bundle.
+    /// Disambiguation: if sources[1] is an address operand (Memory or PointerReg),
+    /// then sources[0] is the value (layout 1). Otherwise, if sources[0] is an
+    /// address operand, the value is in dest (layout 2).
+    ///
+    /// Uses `ctx.scalar_read()` / `ctx.pointer_read()` for VLIW-safe reads that
+    /// respect the bundle snapshot when inside a VLIW bundle.
     fn get_store_value(op: &SlotOp, ctx: &ExecutionContext, width: MemWidth) -> u64 {
-        // If sources[0] is a pointer/memory operand, value is in dest (test layout)
-        // Otherwise, sources[0] is the value (kernel layout)
-        let operand = op.sources.first().and_then(|first| {
-            match first {
-                Operand::PointerReg(_) | Operand::Memory { .. } => op.dest.as_ref(),
-                _ => Some(first),
-            }
-        }).or(op.dest.as_ref());
+        // Check if sources[1] looks like an address. If so, sources[0] is the
+        // value regardless of its type (handles `st pN, [sp, #off]` where the
+        // value is a PointerReg).
+        let address_in_later_source = op.sources.get(1).map_or(false, |s| {
+            matches!(s, Operand::PointerReg(_) | Operand::Memory { .. })
+        });
+
+        let operand = if address_in_later_source {
+            // Standard kernel layout: sources[0] is the value
+            op.sources.first()
+        } else {
+            // Legacy/test layout: if sources[0] is an address, value is in dest
+            op.sources.first().and_then(|first| {
+                match first {
+                    Operand::PointerReg(_) | Operand::Memory { .. } => op.dest.as_ref(),
+                    _ => Some(first),
+                }
+            }).or(op.dest.as_ref())
+        };
 
         operand.map_or(0, |src| match src {
             Operand::ScalarReg(r) => ctx.scalar_read(*r) as u64,
+            Operand::PointerReg(r) => ctx.pointer_read(*r) as u64,
             Operand::VectorReg(r) => {
                 // For vector stores, pack into u64 (first 2 lanes)
                 let vec = ctx.vector.read(*r);
@@ -1047,6 +1063,7 @@ impl MemoryUnit {
 mod tests {
     use super::*;
     use crate::interpreter::bundle::{ElementType, SlotIndex};
+    use crate::interpreter::state::SP_PTR_INDEX;
     use crate::tablegen::SemanticOp;
 
     fn make_ctx() -> ExecutionContext {
@@ -2052,5 +2069,94 @@ mod tests {
 
         ctx.flush_pending_writes();
         assert_eq!(ctx.scalar.read(0), 0x42);
+    }
+
+    // =====================================================================
+    // Pointer Register Store/Load (callee-save pattern)
+    // =====================================================================
+
+    #[test]
+    fn test_store_pointer_register_value() {
+        // `st p7, [sp, #-32]` -- stores p7's VALUE to memory.
+        // This is the callee-save pattern used by every function prologue.
+        // Bug history: get_store_value saw PointerReg in sources[0] and
+        // incorrectly assumed it was an address (test layout), causing all
+        // pointer register stores to write 0 instead of the register value.
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        ctx.set_sp(0x100);
+        ctx.queue_pointer_write(7, 0x78000, 1);
+        ctx.cycles = 1;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.pointer.read(7), 0x78000);
+
+        // st p7, [sp, #-32]: sources[0]=PointerReg(7), sources[1]=Memory{sp, -32}
+        let op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+            .with_source(Operand::PointerReg(7))
+            .with_source(Operand::Memory { base: SP_PTR_INDEX, offset: -32 });
+
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
+
+        // Memory at sp-32 = 0x100-0x20 = 0xE0 should contain 0x78000
+        let stored = tile.read_data_u32(0xE0);
+        assert_eq!(stored, Some(0x78000),
+            "st p7 must store p7's VALUE (0x78000), not 0");
+    }
+
+    #[test]
+    fn test_store_and_load_pointer_register_roundtrip() {
+        // Full callee-save/restore: st p7 -> clobber p7 -> lda p7
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        ctx.set_sp(0x100);
+        ctx.queue_pointer_write(7, 0x78000, 1);
+        ctx.cycles = 1;
+        ctx.commit_pending_writes();
+
+        // Store p7 to stack
+        let store_op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+            .with_source(Operand::PointerReg(7))
+            .with_source(Operand::Memory { base: SP_PTR_INDEX, offset: -32 });
+        MemoryUnit::execute(&store_op, &mut ctx, &mut tile, None);
+
+        // Clobber p7
+        ctx.cycles = 2;
+        ctx.queue_pointer_write(7, 0xDEAD, 1);
+        ctx.cycles = 3;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.pointer.read(7), 0xDEAD);
+
+        // Load p7 back from stack
+        ctx.cycles = 10;
+        let load_op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_dest(Operand::PointerReg(7))
+            .with_source(Operand::Memory { base: SP_PTR_INDEX, offset: -32 });
+        MemoryUnit::execute(&load_op, &mut ctx, &mut tile, None);
+        ctx.flush_pending_writes();
+
+        assert_eq!(ctx.pointer.read(7), 0x78000,
+            "p7 must be restored to original value after store/load roundtrip");
+    }
+
+    #[test]
+    fn test_store_pointer_register_p6() {
+        // Verify the fix works for all pointer registers, not just p7
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+        ctx.set_sp(0x200);
+        ctx.queue_pointer_write(6, 0x74000, 1);
+        ctx.cycles = 1;
+        ctx.commit_pending_writes();
+
+        let op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+            .with_source(Operand::PointerReg(6))
+            .with_source(Operand::Memory { base: SP_PTR_INDEX, offset: -36 });
+
+        MemoryUnit::execute(&op, &mut ctx, &mut tile, None);
+
+        // sp-36 = 0x200-0x24 = 0x1DC
+        let stored = tile.read_data_u32(0x1DC);
+        assert_eq!(stored, Some(0x74000),
+            "st p6 must store p6's value correctly");
     }
 }

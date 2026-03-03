@@ -2184,4 +2184,154 @@ mod tests {
         assert_eq!(ctx.pointer.read(3), 0x1234);
         assert!(ctx.pending_writes.is_empty());
     }
+
+    // =====================================================================
+    // Full Call/Return/Recall Sequence (init_values_repeat reproduction)
+    // =====================================================================
+
+    #[test]
+    fn test_p7_survives_memcpy_return_and_loop_back() {
+        // Simulates the EXACT sequence from init_values_repeat:
+        //
+        // 1. p7 = 0x78000 (set in main prologue via movxm)
+        // 2. Call memcpy (jl): delay slot 4 does `mov p2, p7` -> p2 = 0x78000
+        // 3. memcpy: save p7 to stack, clobber with sp, padda, loop body
+        // 4. memcpy epilogue: `lda p7, [sp, #-32]` (deferred, latency 7)
+        // 5. `ret lr`: 5 delay slots, then delay_pending_writes(1)
+        // 6. Back in caller: arithmetic + jnz loop back + its delay_pending_writes(1)
+        // 7. Second call to memcpy: delay slot 4 reads p7 -> must be 0x78000
+        //
+        // If this test fails, the pipeline mechanism is broken.
+        // If it passes, the bug is in the executor or decoder layer.
+        let mut ctx = ExecutionContext::new();
+        ctx.set_sp(0x70040);
+
+        // === Phase 1: main prologue - set p7 = 0x78000 ===
+        ctx.cycles = 10;
+        ctx.queue_pointer_write(7, 0x78000, 1); // movxm p7, #0x78000
+        ctx.cycles = 11;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.pointer.read(7), 0x78000, "p7 set in prologue");
+
+        // === Phase 2: First jl call - delay slot reads p7 ===
+        ctx.cycles = 15;
+        assert_eq!(ctx.pointer_read(7), 0x78000, "First call delay slot: p7 correct");
+
+        // === Phase 3: memcpy prologue ===
+        // paddb sp, #0x20
+        ctx.set_sp(0x70060);
+
+        // st p7, [sp, #-32]: saves p7 to memory (simulated - memory write)
+        ctx.cycles = 20;
+        let saved = ctx.pointer_read(7);
+        assert_eq!(saved, 0x78000, "memcpy prologue saves correct p7");
+
+        // mov p7, sp: clobber p7 with frame pointer
+        ctx.cycles = 21;
+        ctx.queue_pointer_write(7, 0x70060, 1);
+        ctx.cycles = 22;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.pointer.read(7), 0x70060, "p7 clobbered to sp");
+
+        // padda [p7], #-32: p7 = sp - 32
+        ctx.cycles = 22;
+        ctx.queue_pointer_write(7, 0x70060 - 32, 1);
+        ctx.cycles = 23;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.pointer.read(7), 0x70040, "p7 after padda");
+
+        // === Phase 4: memcpy body runs (many cycles, p7 untouched) ===
+
+        // === Phase 5: memcpy epilogue - lda p7, [sp, #-32] ===
+        // Memory at sp-32 contains 0x78000 (saved in Phase 3)
+        ctx.cycles = 100;
+        ctx.queue_scalar_load(Operand::PointerReg(7), 0x78000, 7); // ready=107
+
+        // ret lr at cycle 101
+        ctx.cycles = 101;
+        // (5 delay slots execute at cycles 102-106)
+
+        // Last delay slot at cycle 106
+        ctx.cycles = 106;
+        // After branch takes effect: delay_pending_writes(1)
+        ctx.delay_pending_writes(1); // p7 ready: 107 -> 108
+
+        // === Phase 6: Back at caller (return point) ===
+        ctx.cycles = 107;
+        ctx.commit_pending_writes(); // p7 ready=108 > 107, NOT committed
+        // But forwarding should cover it:
+        assert_eq!(ctx.pointer_read(7), 0x78000,
+            "p7 forwarded at return point (not yet committed)");
+
+        ctx.cycles = 108;
+        ctx.commit_pending_writes(); // p7 ready=108 <= 108, COMMITTED!
+        assert_eq!(ctx.pointer.read(7), 0x78000,
+            "p7 committed in register file after return");
+        assert!(ctx.pending_writes.iter().all(|pw| {
+            !matches!(&pw.dest, Operand::PointerReg(7))
+        }), "p7 pending write drained from queue");
+
+        // === Phase 7: Several instructions in caller (no p7 writes) ===
+        // rel, add, ltu, add, xor, xor, or at cycles 107-114
+        for c in 109..=115 {
+            ctx.cycles = c;
+            ctx.commit_pending_writes(); // no-op for p7
+        }
+
+        // === Phase 8: jnz loop back (second branch) ===
+        ctx.cycles = 116; // jnz
+        // 5 delay slots at 117-121
+        ctx.cycles = 121;
+        // Branch takes effect - delay_pending_writes(1) on empty queue
+        ctx.delay_pending_writes(1); // no-op (p7 already committed)
+
+        // === Phase 9: Back at loop start ===
+        ctx.cycles = 122;
+        ctx.commit_pending_writes(); // nothing pending
+        assert_eq!(ctx.pointer.read(7), 0x78000,
+            "p7 intact after jnz loop back");
+
+        // === Phase 10: acq (stalls, cycles advance) ===
+        for c in 123..=130 {
+            ctx.cycles = c;
+            ctx.commit_pending_writes();
+        }
+
+        // === Phase 11: Second jl call - delay slot reads p7 ===
+        ctx.cycles = 135;
+        let p7_second_call = ctx.pointer_read(7);
+        assert_eq!(p7_second_call, 0x78000,
+            "CRITICAL: p7 must be 0x78000 at second memcpy call");
+    }
+
+    #[test]
+    fn test_multiple_delay_pending_writes_dont_corrupt() {
+        // Regression test: two branches in sequence, only the first
+        // has a pending p7 write. The second delay_pending_writes(1)
+        // must not corrupt or duplicate anything.
+        let mut ctx = ExecutionContext::new();
+
+        // Queue a p7 load at cycle 50
+        ctx.cycles = 50;
+        ctx.queue_scalar_load(Operand::PointerReg(7), 0xDEAD, 7); // ready=57
+
+        // First branch: delay_pending_writes(1) → ready=58
+        ctx.delay_pending_writes(1);
+
+        // p7 commits at cycle 58
+        ctx.cycles = 58;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.pointer.read(7), 0xDEAD);
+        assert!(ctx.pending_writes.is_empty(), "Queue should be empty");
+
+        // Second branch: delay_pending_writes(1) on empty queue
+        ctx.cycles = 70;
+        ctx.delay_pending_writes(1); // no-op
+        assert_eq!(ctx.pointer.read(7), 0xDEAD, "p7 unchanged by second delay");
+
+        // Third branch: still OK
+        ctx.cycles = 80;
+        ctx.delay_pending_writes(1);
+        assert_eq!(ctx.pointer.read(7), 0xDEAD, "p7 still correct");
+    }
 }
