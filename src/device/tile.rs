@@ -2667,4 +2667,46 @@ mod tests {
         assert_eq!(result, data);
         assert!(!tile.has_cascade_output());
     }
+
+    /// RED test: proves that tile.write_register() does NOT update structured
+    /// BD state for MemTile BDs. MemTile BDs live at 0xA0000 (from regdb),
+    /// but tile.write_register() only handles the compute BD range 0x1D000-0x1D200.
+    ///
+    /// This test writes to a MemTile BD0 register (word 2 = length field) and
+    /// checks whether the structured dma_bds[0].length was updated.
+    ///
+    /// Expected: FAIL -- tile.write_register() stores the value in the
+    /// register HashMap but never touches dma_bds[].
+    #[test]
+    fn test_ctrl_packet_write_memtile_bd_dispatch_gap() {
+        let reg_layout = super::super::regdb::device_reg_layout();
+        let bd0_word2_offset = reg_layout.memtile_bd_base + 2 * 4; // BD0, word 2 (length)
+
+        let mut tile = Tile::mem_tile(1, 1);
+
+        // Verify BD starts zeroed
+        assert_eq!(tile.dma_bds[0].length, 0, "BD0 length should start at 0");
+
+        // Write via tile.write_register() -- this is what ctrl packets do
+        let test_length: u32 = 0x0000_1000;
+        tile.write_register(bd0_word2_offset, test_length);
+
+        // The register HashMap WILL have the value (write_register always stores)
+        assert_eq!(
+            *tile.registers_ref().get(&bd0_word2_offset).unwrap_or(&0),
+            test_length,
+            "Register HashMap should have the value"
+        );
+
+        // But the structured BD should ALSO be updated for the DMA engine to
+        // work correctly. This is the gap: tile.write_register() only handles
+        // the compute BD range (0x1D000-0x1D200), not the MemTile range.
+        assert_eq!(
+            tile.dma_bds[0].length, test_length,
+            "BUG: MemTile BD0 length not updated by tile.write_register() -- \
+             ctrl packets go through tile.write_register() which only handles \
+             compute BD range 0x1D000-0x1D200, not MemTile range 0x{:05X}+",
+            reg_layout.memtile_bd_base
+        );
+    }
 }
