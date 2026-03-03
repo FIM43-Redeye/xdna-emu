@@ -481,6 +481,23 @@ impl SemanticOp {
             if base.starts_with("vaddsub") {
                 return Some(Self::Add);
             }
+            // clr16f_conf and similar vector clear intrinsics
+            if base.starts_with("clr") {
+                return Some(Self::VectorClear);
+            }
+        }
+
+        // Accumulate intrinsics: add_acc, sub_acc, negadd_acc, negsub_acc
+        // These are accumulator operations without multiply (acc += src).
+        if stem.starts_with("add_acc") || stem.starts_with("sub_acc")
+            || stem.starts_with("negadd_acc") || stem.starts_with("negsub_acc")
+        {
+            return Some(Self::Accumulate);
+        }
+
+        // Concat intrinsics: concat_I512_I256, concat_bf1024_bf512, etc.
+        if stem.starts_with("concat_") {
+            return Some(Self::Shuffle);
         }
 
         // Suffix-based matching (non-_conf)
@@ -572,6 +589,8 @@ impl SemanticOp {
             "done" => Some(Self::Done),
             "event" | "event0" | "event1" => Some(Self::Event),
             "clb" => Some(Self::Clb),
+            "divs" => Some(Self::SDiv),
+            "sched_barrier" => Some(Self::Nop),
             _ => None,
         }
     }

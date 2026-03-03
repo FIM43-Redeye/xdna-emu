@@ -763,8 +763,9 @@ impl InstructionDecoder {
             // parameters in NOP class definitions; treat as NOP.
             SlotOp::nop(slot_index)
         } else {
-            // No semantic -- unknown instruction
-            log::warn!(
+            // No semantic -- unknown instruction. This will hit the executor's
+            // "no semantic" error path and abort on first execution.
+            log::error!(
                 "[NO SEMANTIC] Instruction '{}' has no SemanticOp (no pattern or structural match)",
                 enc.mnemonic
             );
@@ -907,11 +908,11 @@ impl Decoder for InstructionDecoder {
                     };
                     slot_op.slot = effective_slot;
 
-                    // Warn if this overwrites a non-NOP instruction in the same slot
-                    // (e.g., LDA and LDB both active -- would need separate slots).
+                    // Slot collision: two non-NOP instructions decoded into the same
+                    // VLIW slot. This is a decoder bug, not a valid encoding.
                     if let Some(existing) = bundle.slot(effective_slot) {
                         if !existing.is_nop() {
-                            log::warn!(
+                            log::error!(
                                 "[SLOT COLLISION] PC=0x{:04X} {:?} slot {:?} already has {:?}, overwriting with {:?}",
                                 pc, slot.slot_type, effective_slot, existing.semantic, slot_op.semantic
                             );
@@ -1838,6 +1839,64 @@ mod tests {
                 "INFO: {} vector encodings without SemanticOp (out of coverage):\n  {:?}",
                 uncovered.len(),
                 &uncovered[..uncovered.len().min(20)],
+            );
+        }
+    }
+
+    /// Cross-reference our decoder against llvm-objdump on a real ELF binary.
+    ///
+    /// This wires `crossref::cross_reference_elf()` into the test suite so
+    /// decoder verification runs automatically rather than manually.
+    #[test]
+    fn test_crossref_integration() {
+        use crate::config::Config;
+        use crate::interpreter::decode::crossref::cross_reference_elf;
+
+        let Some(elf_path) = Config::get().add_one_elf() else {
+            eprintln!("Skipping test_crossref_integration: ELF not found (set MLIR_AIE_PATH)");
+            return;
+        };
+
+        let objdump_path = std::path::PathBuf::from(Config::get().llvm_aie_path())
+            .join("build/bin/llvm-objdump");
+        if !objdump_path.exists() {
+            eprintln!(
+                "Skipping test_crossref_integration: llvm-objdump not found at {}",
+                objdump_path.display()
+            );
+            return;
+        }
+
+        let decoder = InstructionDecoder::load_default();
+        let report = cross_reference_elf(&elf_path, &objdump_path, &decoder)
+            .expect("Cross-reference failed");
+
+        eprintln!("{}", report);
+
+        assert!(
+            report.total_instructions > 0,
+            "Should decode at least one instruction"
+        );
+
+        // Require >= 95% match rate, leaving room for known mnemonic
+        // normalization gaps (dot-suffixed variants, NOP aliasing, etc.)
+        let rate = report.match_rate();
+        assert!(
+            rate >= 95.0,
+            "Decoder match rate {:.1}% is below 95% threshold.\n\
+             Mismatches: {}, Decode failures: {}, Size mismatches: {}",
+            rate,
+            report.mnemonic_mismatches.len(),
+            report.decode_failures.len(),
+            report.size_mismatches.len(),
+        );
+
+        // Log mismatches for investigation even when passing
+        if report.discrepancy_count() > 0 {
+            eprintln!(
+                "NOTE: {} discrepancies at {:.1}% match rate (above 95% threshold)",
+                report.discrepancy_count(),
+                rate,
             );
         }
     }

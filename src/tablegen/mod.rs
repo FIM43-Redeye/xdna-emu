@@ -47,6 +47,7 @@
 //! └── AIE2InstrPatterns.td   # Semantic patterns
 //! ```
 
+mod cpp_switch;
 pub mod decoder_bytecode;
 mod parser;
 mod resolver;
@@ -246,7 +247,7 @@ pub fn load_full_via_tblgen(llvm_aie_path: impl AsRef<Path>) -> Result<types::Tb
     if let Some(ref key) = cache_key {
         if let Some((records_text, disasm_text)) = try_load_cached_tblgen(key) {
             log::info!("Using cached tblgen output (key: {}...)", &key[..12]);
-            return parse_tblgen_output(&records_text, &disasm_text);
+            return parse_tblgen_output(&records_text, &disasm_text, llvm_aie);
         }
     }
 
@@ -259,7 +260,7 @@ pub fn load_full_via_tblgen(llvm_aie_path: impl AsRef<Path>) -> Result<types::Tb
         write_tblgen_cache(key, &records_text, &disasm_text);
     }
 
-    parse_tblgen_output(&records_text, &disasm_text)
+    parse_tblgen_output(&records_text, &disasm_text, llvm_aie)
 }
 
 /// Run both llvm-tblgen subprocesses and return raw stdout text.
@@ -337,6 +338,7 @@ fn run_tblgen_subprocesses(
 fn parse_tblgen_output(
     records_text: &str,
     disasm_text: &str,
+    llvm_aie_path: &Path,
 ) -> Result<types::TblgenOutput, std::io::Error> {
     // Parse instruction records
     let records = tblgen_records::parse_tblgen_records(records_text);
@@ -408,24 +410,102 @@ fn parse_tblgen_output(
         pseudo_map.len(),
     );
 
-    // Itinerary-based inference for instruction families without pseudo expansion.
+    // Layer 3: C++ selection propagation.
     //
-    // The 2D/3D PADD variants (PADDA_2D, PADDB_3D, etc.) have no MultiSlot_Pseudo
-    // parent and no Pat<> records -- the compiler emits them via custom C++ lowering
-    // for multi-dimensional addressing. Similarly, PADD_sp_imm_pseudo expands to
-    // PADDB_sp_imm/PADDA_sp_imm but has no ptradd SDNode pattern (it's used for
-    // stack frame adjustment). The scheduling model's Itinerary field (II_PADD,
-    // II_PADD_2D, II_PADD_3D) groups all pointer arithmetic instructions, providing
-    // a structural classification from LLVM that doesn't depend on string matching
-    // the assembly mnemonic.
+    // Many instructions are selected via C++ switch statements in
+    // AIE2InstrInfo::getOpCode() rather than Pat<> records. Parse those
+    // switches to extract intrinsic -> opcode mappings, then propagate
+    // semantics from the intrinsic to the concrete opcode.
+    let cpp_map = cpp_switch::parse_cpp_opcode_switch(llvm_aie_path);
+    let mut cpp_propagated = 0usize;
+    for (intrinsic_stem, opcodes) in &cpp_map {
+        if let Some(op) = types::SemanticOp::from_intrinsic(
+            &format!("int_aie2_{}", intrinsic_stem),
+        ) {
+            for opcode_name in opcodes {
+                for encodings in by_slot.values_mut() {
+                    for enc in encodings.iter_mut() {
+                        if enc.semantic.is_none() && enc.name == *opcode_name {
+                            enc.semantic = Some(op);
+                            cpp_propagated += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if cpp_propagated > 0 {
+        log::info!(
+            "Propagated {} semantics via C++ selection from {} intrinsic mappings",
+            cpp_propagated,
+            cpp_map.len(),
+        );
+    }
+
+    // Layer 4: Itinerary-based inference for instructions without Pat<>, pseudo
+    // expansion, or C++ selection. The scheduling model's Itinerary field groups
+    // instructions by functional family, providing structural classification from
+    // LLVM that doesn't depend on mnemonic string matching.
+    //
+    // Entries are checked as prefixes (starts_with), sorted longest-first to
+    // ensure more specific prefixes match before less specific ones.
+    const ITINERARY_SEMANTICS: &[(&str, types::SemanticOp)] = &[
+        // Pointer arithmetic (2D/3D variants, stack frame adjustment)
+        ("II_PADD", types::SemanticOp::PointerAdd),
+        // Store half-byte variants (dual mayLoad+mayStore, skipped by structural)
+        ("II_STHB", types::SemanticOp::Store),
+        // Stream write: push to master stream (packet header and cascade variants)
+        ("II_MOV_CPH", types::SemanticOp::StreamWritePacketHeader),
+        ("II_MOV_PH", types::SemanticOp::StreamWritePacketHeader),
+        ("II_ST_MS", types::SemanticOp::StreamWrite),
+        // Stream read: slave stream -> scalar
+        ("II_MOV_SS", types::SemanticOp::StreamRead),
+        // Vector cascade stream access
+        ("II_VMOV_CASCADE_READ", types::SemanticOp::CascadeRead),
+        ("II_VMOV_CASCADE_WRITE", types::SemanticOp::CascadeWrite),
+        // Vector move/copy
+        ("II_VMOV", types::SemanticOp::Copy),
+        // Pack/unpack (backup if C++ parse misses them)
+        ("II_VPACK", types::SemanticOp::Pack),
+        ("II_VUNPACK", types::SemanticOp::Unpack),
+        // Vector sub-register insert
+        ("II_VPUSH_HI", types::SemanticOp::VectorInsert),
+        ("II_VPUSH_LO", types::SemanticOp::VectorInsert),
+        // Masked SRS variants
+        ("II_VSRSM", types::SemanticOp::Srs),
+        // Extract-broadcast
+        ("II_VEXTBCST", types::SemanticOp::VectorBroadcast),
+        // Carry arithmetic
+        ("II_ADC", types::SemanticOp::Adc),
+        ("II_SBC", types::SemanticOp::Sbc),
+        // Add no-carry variants
+        ("II_ADD_NC", types::SemanticOp::Add),
+        // Delay slot moves
+        ("II_MOVd", types::SemanticOp::Copy),
+        // Counter move
+        ("II_MOV_CNTR", types::SemanticOp::Copy),
+        // Float conversion (vfloor)
+        ("II_VFLOORs32bf16", types::SemanticOp::Convert),
+        // Division
+        ("II_DIVS", types::SemanticOp::SDiv),
+        // Vector add-subtract compound operations
+        ("II_VADDSUB", types::SemanticOp::Add),
+        // Sign/zero extension
+        ("II_EXTENDs", types::SemanticOp::SignExtend),
+        ("II_EXTENDu", types::SemanticOp::ZeroExtend),
+    ];
+
     let mut itinerary_inferred = 0usize;
     for encodings in by_slot.values_mut() {
         for enc in encodings.iter_mut() {
             if enc.semantic.is_none() {
                 if let Some(ref sched) = enc.sched_class {
-                    if sched.starts_with("II_PADD") {
-                        enc.semantic = Some(types::SemanticOp::PointerAdd);
-                        itinerary_inferred += 1;
+                    for &(prefix, op) in ITINERARY_SEMANTICS {
+                        if sched.starts_with(prefix) {
+                            enc.semantic = Some(op);
+                            itinerary_inferred += 1;
+                            break;
+                        }
                     }
                 }
             }
@@ -1066,6 +1146,14 @@ mod tests {
         eprintln!(
             "Semantics: {}/{} instructions ({} structural, {} pattern-derived)",
             total_with_semantic, all.len(), structural_count, pattern_count,
+        );
+        // All real instructions should have semantics. VLIW bundle envelopes
+        // (isComposite=1) are filtered out by to_encoding(), so everything
+        // here is a real instruction.
+        assert_eq!(
+            total_with_semantic, all.len(),
+            "Expected 100% semantic coverage ({} missing)",
+            all.len() - total_with_semantic,
         );
     }
 
