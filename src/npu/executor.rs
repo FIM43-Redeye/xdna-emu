@@ -62,6 +62,18 @@ pub(crate) enum ExecutorState {
         /// Enable_Token_Issue bit (Start_Queue bit 31). Stubbed for future use.
         enable_token: bool,
     },
+    /// Blocked waiting for a Sync (dma_await_task) to be satisfied.
+    ///
+    /// On real hardware, the NPU firmware blocks at each dma_await_task
+    /// until the DMA channel signals completion (via task token or
+    /// channel idle). This prevents subsequent BD reconfiguration from
+    /// racing against live transfers.
+    BlockedOnSync {
+        /// Index of the NEXT instruction after the sync completes.
+        next_index: usize,
+        /// Index into pending_syncs identifying which sync we're waiting on.
+        sync_index: usize,
+    },
     /// All instructions executed.
     Done,
 }
@@ -157,50 +169,85 @@ impl NpuExecutor {
         &self.pending_syncs
     }
 
-    /// Check if all sync conditions are satisfied.
-    ///
-    /// Polls the DMA status register's `Channel_Running` bit (bit 19),
-    /// matching the hardware polling loop in `_XAieMl_DmaWaitForDone()`.
-    /// A sync is only satisfied when the channel has been observed running
-    /// at least once AND has since returned to not-running. This avoids
-    /// the false-positive where initial idle is mistaken for completion.
-    pub fn syncs_satisfied(&mut self, device: &DeviceState) -> bool {
-        let reg_layout = crate::device::regdb::device_reg_layout();
+    /// Map a sync's (direction, channel) to absolute DMA channel index.
+    fn sync_abs_channel(sync: &PendingSync, device: &DeviceState) -> u8 {
+        // S2MM channels come first, then MM2S. The number of S2MM channels
+        // varies by tile type: 2 for Compute/Shim, 6 for MemTile.
+        let s2mm_count = device.array.dma_engine(sync.column, sync.row)
+            .map_or(2, |dma| dma.s2mm_channel_count() as u8);
+        if sync.direction == 1 {
+            s2mm_count + sync.channel
+        } else {
+            sync.channel
+        }
+    }
 
+    /// Check if a single sync condition is satisfied.
+    ///
+    /// A sync is satisfied when the DMA channel has no remaining work:
+    /// it was started, ran its BD chain, and is now idle with nothing
+    /// queued. Two detection paths handle timing variations:
+    ///
+    /// 1. **Normal**: we observe channel_running=true, then later
+    ///    channel_running=false. The `started` flag tracks this.
+    ///
+    /// 2. **Fast completion**: the DMA finished between the task start
+    ///    instruction and the sync registration. The channel is already
+    ///    idle when we first poll. We detect this by checking that the
+    ///    channel has no pending work (no active FSM, no queued tasks)
+    ///    AND has completed at least one transfer total.
+    fn is_sync_satisfied(sync: &mut PendingSync, device: &DeviceState) -> bool {
+        let abs_channel = Self::sync_abs_channel(sync, device);
+
+        if let Some(dma) = device.array.dma_engine(sync.column, sync.row) {
+            let reg_layout = crate::device::regdb::device_reg_layout();
+            let status = dma.get_channel_status(abs_channel);
+            let status_layout = if dma.tile_type.is_mem_tile() {
+                &reg_layout.memtile_status
+            } else {
+                &reg_layout.memory_status
+            };
+            let channel_running = status_layout.channel_running.extract_bool(status);
+
+            if channel_running {
+                // Channel is active -- mark as started and keep waiting.
+                sync.started = true;
+                return false;
+            }
+
+            // Channel is idle. Check the two satisfaction conditions:
+
+            // 1. We previously observed it running (normal polling path)
+            if sync.started {
+                return true;
+            }
+
+            // 2. Fast completion: channel finished before we first polled.
+            //    The channel has no pending work AND has done at least one
+            //    transfer (not just initial idle).
+            if let Some(stats) = dma.channel_stats(abs_channel) {
+                if stats.transfers_completed > 0
+                    && dma.task_queue_size(abs_channel) == 0
+                {
+                    return true;
+                }
+            }
+
+            false
+        } else {
+            false
+        }
+    }
+
+    /// Check if all sync conditions are satisfied.
+    pub fn syncs_satisfied(&mut self, device: &DeviceState) -> bool {
         if self.pending_syncs.is_empty() {
             return true;
         }
 
         for sync in &mut self.pending_syncs {
-            // Map (channel, direction) to absolute channel index, matching
-            // the encoding in check_dma_trigger: S2MM ch0=0, ch1=1;
-            // MM2S ch0=2, ch1=3.
-            let abs_channel = if sync.direction == 1 {
-                2 + sync.channel
-            } else {
-                sync.channel
-            };
-
-            if let Some(dma) = device.array.dma_engine(sync.column, sync.row) {
-                let status = dma.get_channel_status(abs_channel);
-                let status_layout = if dma.tile_type.is_mem_tile() {
-                    &reg_layout.memtile_status
-                } else {
-                    &reg_layout.memory_status
-                };
-                let channel_running = status_layout.channel_running.extract_bool(status);
-
-                if channel_running {
-                    // Channel is active -- mark as started and keep waiting.
-                    sync.started = true;
-                    return false;
-                }
-
-                // Channel is not running. Only count as "done" if it was
-                // previously observed running.
-                if !sync.started {
-                    return false;
-                }
+            if !Self::is_sync_satisfied(sync, device) {
+                return false;
             }
         }
         true
@@ -284,11 +331,19 @@ impl NpuExecutor {
                 }
                 self.executed_count += 1;
 
-                // check_dma_trigger may have transitioned us to BlockedOnQueue.
-                // If so, fix up the next_index and return Blocked.
-                if let ExecutorState::BlockedOnQueue { next_index: ref mut ni, .. } = self.state {
-                    *ni = next_index + 1;
-                    return AdvanceResult::Blocked;
+                // check_dma_trigger may have transitioned us to BlockedOnQueue,
+                // or execute_instruction may have transitioned to BlockedOnSync.
+                // Fix up next_index in either case and return Blocked.
+                match &mut self.state {
+                    ExecutorState::BlockedOnQueue { next_index: ref mut ni, .. } => {
+                        *ni = next_index + 1;
+                        return AdvanceResult::Blocked;
+                    }
+                    ExecutorState::BlockedOnSync { next_index: ref mut ni, .. } => {
+                        *ni = next_index + 1;
+                        return AdvanceResult::Blocked;
+                    }
+                    _ => {}
                 }
 
                 // Normal progression
@@ -319,6 +374,37 @@ impl NpuExecutor {
                         }
                     }
                     // Advance to next instruction
+                    if next_index >= self.instructions.len() {
+                        self.state = ExecutorState::Done;
+                        AdvanceResult::Done
+                    } else {
+                        self.state = ExecutorState::Executing { next_index };
+                        AdvanceResult::Progressed
+                    }
+                } else {
+                    AdvanceResult::Blocked
+                }
+            }
+
+            ExecutorState::BlockedOnSync { next_index, sync_index } => {
+                // Poll the sync condition each cycle. On real hardware,
+                // dma_await_task blocks until the DMA channel's task token
+                // returns (or Channel_Running goes idle). We poll the same
+                // Channel_Running status.
+                let satisfied = if sync_index < self.pending_syncs.len() {
+                    Self::is_sync_satisfied(
+                        &mut self.pending_syncs[sync_index],
+                        device,
+                    )
+                } else {
+                    true // Invalid index -- treat as satisfied
+                };
+
+                if satisfied {
+                    log::info!(
+                        "NPU Sync #{} satisfied, resuming instruction {}",
+                        sync_index, next_index,
+                    );
                     if next_index >= self.instructions.len() {
                         self.state = ExecutorState::Done;
                         AdvanceResult::Done
@@ -366,17 +452,28 @@ impl NpuExecutor {
                         }
                     }
                     if !drained {
-                        if let ExecutorState::BlockedOnQueue {
-                            col, row, channel, bd_id, ..
-                        } = self.state.clone() {
-                            let msg = format!(
+                        let msg = match self.state.clone() {
+                            ExecutorState::BlockedOnQueue {
+                                col, row, channel, bd_id, ..
+                            } => format!(
                                 "DMA tile({},{}) ch{} task queue full, BD {} dropped \
                                  (batch mode: queue could not drain) -- task lost",
                                 col, row, channel, bd_id,
-                            );
-                            log::error!("{}", msg);
-                            return Err(msg);
-                        }
+                            ),
+                            ExecutorState::BlockedOnSync { sync_index, .. } => {
+                                let sync = &self.pending_syncs[sync_index];
+                                let dir = if sync.direction == 0 { "S2MM" } else { "MM2S" };
+                                format!(
+                                    "Sync #{} on ({},{}) {} ch{} not satisfied after {} DMA-only cycles \
+                                     (batch mode: needs full engine loop)",
+                                    sync_index, sync.column, sync.row, dir, sync.channel,
+                                    MAX_BLOCKED_CYCLES,
+                                )
+                            }
+                            _ => "Blocked state could not resolve (batch mode)".to_string(),
+                        };
+                        log::error!("{}", msg);
+                        return Err(msg);
                     }
                 }
             }
@@ -414,11 +511,15 @@ impl NpuExecutor {
             }
 
             NpuInstruction::Sync { channel, column, row, direction, .. } => {
-                log::debug!(
-                    "NPU Sync: channel={} column={} row={} direction={}",
-                    channel, column, row, direction
+                let dir_str = if *direction == 0 { "S2MM" } else { "MM2S" };
+                log::info!(
+                    "NPU Sync: blocking on ({},{}) {} ch{} (sync #{})",
+                    column, row, dir_str, channel, self.pending_syncs.len(),
                 );
-                // Record this sync condition - the run is complete when all syncs are satisfied
+                // Record this sync condition and block until it's satisfied.
+                // On real hardware, the firmware blocks at dma_await_task until
+                // the DMA channel signals completion. This prevents subsequent
+                // BD reconfiguration from racing against live transfers.
                 self.pending_syncs.push(PendingSync {
                     column: *column,
                     row: *row,
@@ -426,6 +527,14 @@ impl NpuExecutor {
                     direction: *direction,
                     started: false,
                 });
+                let sync_index = self.pending_syncs.len() - 1;
+                // Transition to BlockedOnSync -- try_advance() will poll this
+                // sync each cycle and only advance when it's satisfied.
+                // (The caller sets next_index after execute_instruction returns.)
+                self.state = ExecutorState::BlockedOnSync {
+                    next_index: 0, // placeholder, fixed up by try_advance
+                    sync_index,
+                };
                 Ok(())
             }
 
