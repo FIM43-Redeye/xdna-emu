@@ -473,12 +473,16 @@ impl InstructionDecoder {
 
         // SP-relative load/store (spill/fill): Uses = [SP] in TableGen.
         // The immediate field is a stack offset, not a standalone value.
-        // Convert to Memory { base: 6 (SP), offset: imm }.
+        // Convert to Memory { base: SP_PTR_INDEX, offset: imm }.
+        // AIE2's SP is a dedicated register (SPLReg<12>), not p6.
         // Exclude pointer arithmetic (padda/paddb [sp]) -- those have their
-        // own implicit SP handling in execute_add.
+        // own implicit SP handling in execute_pointer_add.
         if decoded.encoding.is_sp_relative && !decoded.encoding.is_ptr_arithmetic {
             if let Some(Operand::Immediate(offset)) = field_operands.get("imm").cloned() {
-                extra_sources.push(Operand::Memory { base: 6, offset: offset as i16 });
+                extra_sources.push(Operand::Memory {
+                    base: crate::interpreter::state::SP_PTR_INDEX,
+                    offset: offset as i16,
+                });
                 field_operands.remove("imm");
             }
         }
@@ -1420,7 +1424,7 @@ mod tests {
         let decoded = decoder.decode_slot_bits(bits, SlotType::Lng)
             .expect("Should decode movxm sp, #0x70000");
         let (dest, sources, _) = decoder.extract_operands(&decoded);
-        assert_eq!(dest, Some(Operand::PointerReg(6)), "SP should map to p6");
+        assert_eq!(dest, Some(Operand::PointerReg(crate::interpreter::state::SP_PTR_INDEX)), "SP should map to dedicated SP");
         assert_eq!(sources, vec![Operand::Immediate(0x70000)]);
 
         // Case 4: movxm lr, #0x1234

@@ -46,6 +46,12 @@ pub struct PendingWrite {
     pub vec_value: Option<[u32; 8]>,
     /// Cycle at which this write becomes visible.
     pub ready_cycle: u64,
+    /// Cycle at which this write was issued (for forwarding discrimination).
+    ///
+    /// Used to distinguish pending writes from previous bundles (forwardable)
+    /// vs writes from the current bundle (not forwardable -- VLIW semantics
+    /// require same-bundle reads to see pre-execution values).
+    pub issued_cycle: u64,
 }
 
 // ============================================================================
@@ -519,9 +525,10 @@ pub struct ExecutionContext {
     /// Core is halted.
     pub halted: bool,
 
-    /// Stack pointer register (alias to a scalar or pointer reg).
-    /// By convention, often p0 or r13.
+    /// Stack pointer register mapping.
     sp_reg: SpRegister,
+    /// Dedicated SP register value (used when sp_reg == Dedicated).
+    sp_value: u32,
 
     /// Link register (alias to a scalar reg).
     /// By convention, often r0 or r14.
@@ -580,11 +587,18 @@ pub enum SpRegister {
     Pointer(u8),
     /// Use scalar register (r0-r31).
     Scalar(u8),
+    /// Dedicated SP register (AIE2: SPLReg<12, "sp">).
+    ///
+    /// AIE2's stack pointer is a separate special register, not aliased
+    /// to any general-purpose pointer register. `PADDB_sp_imm` and
+    /// `st/lda [sp, #offset]` operate on this dedicated register, while
+    /// p0-p7 remain freely available for user code.
+    Dedicated,
 }
 
 impl Default for SpRegister {
     fn default() -> Self {
-        SpRegister::Pointer(0) // p0 is typical stack pointer
+        SpRegister::Dedicated
     }
 }
 
@@ -617,6 +631,7 @@ impl ExecutionContext {
             stall_cycles: 0,
             halted: false,
             sp_reg: SpRegister::default(),
+            sp_value: 0,
             lr_reg: super::registers::LR_REG_INDEX, // Dedicated special register index
             timing,
             scalar_snapshot: None,
@@ -747,15 +762,19 @@ impl ExecutionContext {
         match self.sp_reg {
             SpRegister::Pointer(r) => self.pointer.read(r),
             SpRegister::Scalar(r) => self.scalar.read(r),
+            SpRegister::Dedicated => self.sp_value,
         }
     }
 
     /// Set the stack pointer value.
     #[inline]
     pub fn set_sp(&mut self, value: u32) {
+
+
         match self.sp_reg {
             SpRegister::Pointer(r) => self.pointer.write(r, value),
             SpRegister::Scalar(r) => self.scalar.write(r, value),
+            SpRegister::Dedicated => self.sp_value = value,
         }
     }
 
@@ -846,6 +865,7 @@ impl ExecutionContext {
             scalar_value: value,
             vec_value: None,
             ready_cycle: self.cycles + latency,
+            issued_cycle: self.cycles,
         });
     }
 
@@ -856,6 +876,7 @@ impl ExecutionContext {
             scalar_value: 0,
             vec_value: Some(value),
             ready_cycle: self.cycles + latency,
+            issued_cycle: self.cycles,
         });
     }
 
@@ -872,11 +893,17 @@ impl ExecutionContext {
     /// Peano generates "prologue stores" that rely on pointer registers
     /// not being ready at function entry.
     pub fn queue_pointer_write(&mut self, reg: u8, value: u32, latency: u64) {
+        if reg == super::registers::SP_PTR_INDEX {
+            // Dedicated SP -- write immediately, no pipeline delay
+            self.sp_value = value;
+            return;
+        }
         self.pending_writes.push(PendingWrite {
             dest: Operand::PointerReg(reg),
             scalar_value: value,
             vec_value: None,
             ready_cycle: self.cycles + latency,
+            issued_cycle: self.cycles,
         });
     }
 
@@ -968,7 +995,12 @@ impl ExecutionContext {
     fn apply_pending_write(&mut self, pw: &PendingWrite) {
         match &pw.dest {
             Operand::ScalarReg(r) => self.scalar.write(*r, pw.scalar_value),
-            Operand::PointerReg(r) => self.pointer.write(*r, pw.scalar_value),
+            Operand::PointerReg(r) if *r == super::registers::SP_PTR_INDEX => {
+                self.sp_value = pw.scalar_value;
+            }
+            Operand::PointerReg(r) => {
+                self.pointer.write(*r, pw.scalar_value);
+            }
             Operand::ModifierReg(r) => self.modifier.write(*r, pw.scalar_value),
             Operand::VectorReg(r) => {
                 if let Some(vec) = &pw.vec_value {
@@ -979,12 +1011,20 @@ impl ExecutionContext {
         }
     }
 
-    /// Read a scalar register with VLIW semantics.
+    /// Read a scalar register with VLIW semantics and load forwarding.
     ///
-    /// If inside a bundle (snapshot exists), returns the pre-execution value.
-    /// Otherwise, returns the current (live) value.
+    /// If a pending load from a **previous** bundle targets this register,
+    /// the pending value is forwarded (simulating hardware scoreboard stall).
+    /// Pending writes from the **current** bundle are excluded to preserve
+    /// VLIW read-before-write semantics.
+    ///
+    /// If no forwarding applies, returns the snapshot value (inside a bundle)
+    /// or the current live value (outside a bundle).
     #[inline]
     pub fn scalar_read(&self, reg: u8) -> u32 {
+        if let Some(val) = self.forward_scalar(reg) {
+            return val;
+        }
         if let Some(snapshot) = &self.scalar_snapshot {
             snapshot.read(reg)
         } else {
@@ -992,9 +1032,18 @@ impl ExecutionContext {
         }
     }
 
-    /// Read a pointer register with VLIW semantics.
+    /// Read a pointer register with VLIW semantics and load forwarding.
+    ///
+    /// SP_PTR_INDEX (255) is intercepted and routed to the dedicated SP register.
     #[inline]
     pub fn pointer_read(&self, reg: u8) -> u32 {
+        use crate::interpreter::state::SP_PTR_INDEX;
+        if reg == SP_PTR_INDEX {
+            return self.sp();
+        }
+        if let Some(val) = self.forward_pointer(reg) {
+            return val;
+        }
         if let Some(snapshot) = &self.pointer_snapshot {
             snapshot.read(reg)
         } else {
@@ -1002,14 +1051,61 @@ impl ExecutionContext {
         }
     }
 
-    /// Read a modifier register with VLIW semantics.
+    /// Read a modifier register with VLIW semantics and load forwarding.
     #[inline]
     pub fn modifier_read(&self, reg: u8) -> u32 {
+        if let Some(val) = self.forward_modifier(reg) {
+            return val;
+        }
         if let Some(snapshot) = &self.modifier_snapshot {
             snapshot.read(reg)
         } else {
             self.modifier.read(reg)
         }
+    }
+
+    // === Load Forwarding ===
+    //
+    // AIE2 has a hardware scoreboard that stalls the pipeline when an
+    // instruction reads a register with a pending load. Rather than
+    // modeling stall cycles (which requires precise per-stage tracking),
+    // we forward the pending value directly. This is functionally correct:
+    // the instruction sees the same value it would after the stall.
+
+    /// Forward a pending scalar load value if one exists from a previous bundle.
+    fn forward_scalar(&self, reg: u8) -> Option<u32> {
+        self.pending_writes.iter().rev().find_map(|pw| {
+            if pw.issued_cycle < self.cycles {
+                if let Operand::ScalarReg(r) = &pw.dest {
+                    if *r == reg { return Some(pw.scalar_value); }
+                }
+            }
+            None
+        })
+    }
+
+    /// Forward a pending pointer load value if one exists from a previous bundle.
+    fn forward_pointer(&self, reg: u8) -> Option<u32> {
+        self.pending_writes.iter().rev().find_map(|pw| {
+            if pw.issued_cycle < self.cycles {
+                if let Operand::PointerReg(r) = &pw.dest {
+                    if *r == reg { return Some(pw.scalar_value); }
+                }
+            }
+            None
+        })
+    }
+
+    /// Forward a pending modifier load value if one exists from a previous bundle.
+    fn forward_modifier(&self, reg: u8) -> Option<u32> {
+        self.pending_writes.iter().rev().find_map(|pw| {
+            if pw.issued_cycle < self.cycles {
+                if let Operand::ModifierReg(r) = &pw.dest {
+                    if *r == reg { return Some(pw.scalar_value); }
+                }
+            }
+            None
+        })
     }
 
     // === Branch Delay Slot Support ===
@@ -1288,11 +1384,13 @@ mod tests {
     fn test_sp_register_config() {
         let mut ctx = ExecutionContext::new();
 
-        // Default: pointer register p0
+        // Default: dedicated SP register (not aliased to any pointer reg)
         ctx.set_sp(0x1000);
-        assert_eq!(ctx.pointer.read(0), 0x1000);
+        assert_eq!(ctx.sp(), 0x1000);
+        // Verify p0 is NOT affected (SP is separate)
+        assert_eq!(ctx.pointer.read(0), 0);
 
-        // Switch to scalar register r13
+        // Switch to scalar register r13 (for testing alternate configs)
         ctx.set_sp_register(SpRegister::Scalar(13));
         ctx.set_sp(0x2000);
         assert_eq!(ctx.scalar.read(13), 0x2000);
@@ -1538,5 +1636,552 @@ mod tests {
         ctx.check_hardware_loop(0x17C);
         assert_eq!(ctx.pc(), 0x180); // Unchanged
         assert_eq!(ctx.scalar.read(LC_REG_INDEX), 5); // Unchanged
+    }
+
+    // =====================================================================
+    // Load Forwarding Tests
+    // =====================================================================
+
+    #[test]
+    fn test_scalar_load_forwarding_basic() {
+        // A scalar load queued at cycle 10 with latency 7 should be
+        // forwardable at cycles 11-16, committed at cycle 17.
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(5, 111);
+
+        ctx.cycles = 10;
+        ctx.queue_scalar_load(Operand::ScalarReg(5), 222, 7);
+
+        // At cycle 11: not committed yet, but forward should work
+        ctx.cycles = 11;
+        assert_eq!(ctx.scalar_read(5), 222,
+            "Forwarding should return pending load value");
+        // Live register is still old (not yet committed)
+        assert_eq!(ctx.scalar.read(5), 111,
+            "Live register should still have old value");
+
+        // At cycle 16: still pending, still forwarding
+        ctx.cycles = 16;
+        assert_eq!(ctx.scalar_read(5), 222);
+
+        // At cycle 17: commit should apply the write
+        ctx.cycles = 17;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.scalar.read(5), 222,
+            "After commit, live register should have new value");
+        // No more pending writes, read should return live value
+        assert_eq!(ctx.scalar_read(5), 222);
+    }
+
+    #[test]
+    fn test_pointer_load_forwarding_basic() {
+        // Same as scalar but for pointer registers. This is the pattern
+        // that matters for memcpy: lda pN, [sp, #-32] queues a pending
+        // pointer write with latency 7.
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(7, 0xDEAD);
+
+        ctx.cycles = 10;
+        // Simulate: lda p7, [sp, #-32] loaded value 0x78000
+        ctx.queue_scalar_load(Operand::PointerReg(7), 0x78000, 7);
+
+        // Before ready: forwarding should work
+        ctx.cycles = 12;
+        assert_eq!(ctx.pointer_read(7), 0x78000,
+            "Pointer forwarding should return pending load value");
+        assert_eq!(ctx.pointer.read(7), 0xDEAD,
+            "Live pointer register should still have old value");
+
+        // After ready: commit should apply
+        ctx.cycles = 17;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.pointer.read(7), 0x78000);
+        assert_eq!(ctx.pointer_read(7), 0x78000);
+    }
+
+    #[test]
+    fn test_modifier_load_forwarding_basic() {
+        let mut ctx = ExecutionContext::new();
+        ctx.modifier.write(3, 0x10);
+
+        ctx.cycles = 5;
+        ctx.queue_scalar_load(Operand::ModifierReg(3), 0x20, 7);
+
+        ctx.cycles = 6;
+        assert_eq!(ctx.modifier_read(3), 0x20,
+            "Modifier forwarding should return pending value");
+        assert_eq!(ctx.modifier.read(3), 0x10,
+            "Live modifier should still have old value");
+    }
+
+    #[test]
+    fn test_forwarding_not_in_same_cycle() {
+        // VLIW semantics: a write issued in the current cycle must NOT
+        // be forwarded to reads in the same bundle.
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(5, 111);
+
+        ctx.cycles = 10;
+        ctx.queue_scalar_load(Operand::ScalarReg(5), 222, 7);
+
+        // Same cycle: forward_scalar should return None
+        assert_eq!(ctx.forward_scalar(5), None,
+            "Same-cycle pending write must not be forwarded");
+        // scalar_read falls through to live value
+        assert_eq!(ctx.scalar_read(5), 111);
+    }
+
+    #[test]
+    fn test_forwarding_cleared_after_commit() {
+        // After commit_pending_writes drains a pending write, forward
+        // should return None (the value is now in the live register).
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(5, 0);
+
+        ctx.cycles = 10;
+        ctx.queue_scalar_load(Operand::ScalarReg(5), 42, 3);
+
+        // Verify forwarding works before commit
+        ctx.cycles = 12;
+        assert_eq!(ctx.forward_scalar(5), Some(42));
+
+        // Commit at ready_cycle
+        ctx.cycles = 13;
+        ctx.commit_pending_writes();
+
+        // Forward should now return None (pending write drained)
+        assert_eq!(ctx.forward_scalar(5), None);
+        // Value is in the live register
+        assert_eq!(ctx.scalar.read(5), 42);
+    }
+
+    #[test]
+    fn test_multiple_pending_loads_most_recent_wins() {
+        // Two loads to the same register: later load's value should be
+        // forwarded (reverse iteration finds the last push first).
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(5, 0);
+
+        ctx.cycles = 10;
+        ctx.queue_scalar_load(Operand::ScalarReg(5), 1001, 7); // ready=17
+
+        ctx.cycles = 12;
+        ctx.queue_scalar_load(Operand::ScalarReg(5), 1002, 7); // ready=19
+
+        // At cycle 13: both pending, forward should return the LATER one
+        ctx.cycles = 13;
+        assert_eq!(ctx.scalar_read(5), 1002,
+            "Most recently queued pending write should win forwarding");
+
+        // After first commits (cycle 17), second still pending
+        ctx.cycles = 17;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.scalar.read(5), 1001,
+            "First load should have committed to live register");
+        // Forward still returns second (still pending)
+        assert_eq!(ctx.scalar_read(5), 1002,
+            "Second load should still be forwarded over committed first");
+
+        // After second commits (cycle 19), both done
+        ctx.cycles = 19;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.scalar.read(5), 1002,
+            "Second load should overwrite first in live register");
+    }
+
+    #[test]
+    fn test_forwarding_wrong_register_no_match() {
+        // Forward should return None for a different register.
+        let mut ctx = ExecutionContext::new();
+
+        ctx.cycles = 10;
+        ctx.queue_scalar_load(Operand::ScalarReg(5), 42, 7);
+
+        ctx.cycles = 11;
+        assert_eq!(ctx.forward_scalar(6), None,
+            "Forward should not match different register");
+        assert_eq!(ctx.forward_pointer(5), None,
+            "Forward should not match different register class");
+    }
+
+    // =====================================================================
+    // SP Register Isolation Tests
+    // =====================================================================
+
+    #[test]
+    fn test_sp_does_not_alias_pointer_regs() {
+        // Dedicated SP must not affect any pointer register p0-p7.
+        let mut ctx = ExecutionContext::new();
+
+        // Write distinctive values to all pointer regs
+        for i in 0..8u8 {
+            ctx.pointer.write(i, 0x1000 + i as u32);
+        }
+
+        // Write SP via set_sp
+        ctx.set_sp(0xDEAD);
+        assert_eq!(ctx.sp(), 0xDEAD);
+
+        // All pointer regs should be unaffected
+        for i in 0..8u8 {
+            assert_eq!(ctx.pointer.read(i), 0x1000 + i as u32,
+                "p{} should be unaffected by SP write", i);
+        }
+    }
+
+    #[test]
+    fn test_pointer_writes_dont_affect_sp() {
+        let mut ctx = ExecutionContext::new();
+        ctx.set_sp(0x70000);
+
+        // Write all pointer regs
+        for i in 0..8u8 {
+            ctx.pointer.write(i, 0xBEEF);
+        }
+
+        assert_eq!(ctx.sp(), 0x70000,
+            "SP should be unaffected by pointer register writes");
+    }
+
+    #[test]
+    fn test_sp_via_pointer_read_intercept() {
+        use crate::interpreter::state::SP_PTR_INDEX;
+        let mut ctx = ExecutionContext::new();
+        ctx.set_sp(0x70080);
+
+        // pointer_read(SP_PTR_INDEX) should return SP, not a real pointer reg
+        assert_eq!(ctx.pointer_read(SP_PTR_INDEX), 0x70080);
+    }
+
+    #[test]
+    fn test_sp_via_queue_pointer_write_immediate() {
+        use crate::interpreter::state::SP_PTR_INDEX;
+        let mut ctx = ExecutionContext::new();
+
+        // queue_pointer_write(SP_PTR_INDEX) should write immediately (no latency)
+        ctx.cycles = 10;
+        ctx.queue_pointer_write(SP_PTR_INDEX, 0x70080, 1);
+
+        // SP should be updated immediately, NOT deferred
+        assert_eq!(ctx.sp(), 0x70080);
+
+        // No pending write should have been created
+        assert!(ctx.pending_writes.is_empty(),
+            "SP write should not create a pending write");
+    }
+
+    #[test]
+    fn test_sp_not_affected_by_p0_clobber() {
+        // This is the exact scenario that caused the memcpy bug:
+        // SP = 0x70080, then mov p0, p1 clobbers p0.
+        // With dedicated SP, SP must survive.
+        let mut ctx = ExecutionContext::new();
+        ctx.set_sp(0x70080);
+        ctx.pointer.write(0, 0x74000); // p0 = output buffer
+        ctx.pointer.write(1, 0x78000); // p1 = input buffer
+
+        // Simulate: mov p0, p1 (clobbers p0)
+        ctx.pointer.write(0, ctx.pointer.read(1));
+
+        assert_eq!(ctx.pointer.read(0), 0x78000, "p0 should be clobbered");
+        assert_eq!(ctx.sp(), 0x70080, "SP must survive p0 clobber");
+    }
+
+    // =====================================================================
+    // VLIW Snapshot + Forwarding Interaction
+    // =====================================================================
+
+    #[test]
+    fn test_forwarding_overrides_snapshot() {
+        // When a pending write exists from a previous bundle, forwarding
+        // should take priority over the snapshot value.
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(5, 333);
+
+        // Queue a load at cycle 10
+        ctx.cycles = 10;
+        ctx.queue_scalar_load(Operand::ScalarReg(5), 444, 7);
+
+        // At cycle 11: begin a new bundle (takes snapshot of 333)
+        ctx.cycles = 11;
+        ctx.begin_bundle();
+
+        // scalar_read should return forwarded value, NOT snapshot
+        assert_eq!(ctx.scalar_read(5), 444,
+            "Forwarding must override snapshot");
+
+        ctx.end_bundle();
+    }
+
+    #[test]
+    fn test_same_bundle_write_uses_snapshot_not_forward() {
+        // A load issued in the current bundle must NOT be forwarded.
+        // Instead, the snapshot (pre-execution) value is returned.
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(5, 333);
+
+        ctx.cycles = 10;
+        ctx.begin_bundle();
+
+        // Queue a load in this same bundle
+        ctx.queue_scalar_load(Operand::ScalarReg(5), 222, 7);
+
+        // Read in same bundle: should get snapshot value, not the pending load
+        assert_eq!(ctx.scalar_read(5), 333,
+            "Same-bundle load must not be forwarded");
+
+        ctx.end_bundle();
+    }
+
+    // =====================================================================
+    // commit_pending_writes Edge Cases
+    // =====================================================================
+
+    #[test]
+    fn test_commit_multiple_writes_same_register_ordering() {
+        // Two pending writes to the same register with different ready_cycles.
+        // The later ready_cycle should win (applied last).
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(5, 0);
+
+        ctx.cycles = 10;
+        ctx.queue_scalar_load(Operand::ScalarReg(5), 2001, 2); // ready=12
+        ctx.queue_scalar_load(Operand::ScalarReg(5), 2002, 5); // ready=15
+
+        // Commit at cycle 15: both should be ready
+        ctx.cycles = 15;
+        ctx.commit_pending_writes();
+
+        // Later ready_cycle writes second, overwriting the earlier one
+        assert_eq!(ctx.scalar.read(5), 2002,
+            "Later-ready write should overwrite earlier-ready write");
+    }
+
+    #[test]
+    fn test_commit_partial_drain() {
+        // Only writes whose ready_cycle <= current should be committed.
+        // Others should remain in the queue.
+        let mut ctx = ExecutionContext::new();
+
+        ctx.cycles = 10;
+        ctx.queue_scalar_load(Operand::ScalarReg(0), 0xA, 2); // ready=12
+        ctx.queue_scalar_load(Operand::ScalarReg(1), 0xB, 5); // ready=15
+        ctx.queue_scalar_load(Operand::ScalarReg(2), 0xC, 3); // ready=13
+
+        // Commit at cycle 13: r0 (ready=12) and r2 (ready=13) should commit
+        ctx.cycles = 13;
+        ctx.commit_pending_writes();
+
+        assert_eq!(ctx.scalar.read(0), 0xA, "r0 should be committed");
+        assert_eq!(ctx.scalar.read(2), 0xC, "r2 should be committed");
+        assert_eq!(ctx.scalar.read(1), 0, "r1 should NOT be committed yet");
+
+        // One pending write should remain
+        assert_eq!(ctx.pending_writes.len(), 1);
+
+        // Commit at cycle 15: r1 should now commit
+        ctx.cycles = 15;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.scalar.read(1), 0xB);
+        assert!(ctx.pending_writes.is_empty());
+    }
+
+    #[test]
+    fn test_commit_swap_remove_correctness() {
+        // Regression test for the swap_remove drain pattern.
+        // With many pending writes, partial commit must not corrupt indices.
+        let mut ctx = ExecutionContext::new();
+
+        ctx.cycles = 10;
+        // Queue 6 writes with staggered ready_cycles
+        for i in 0..6u8 {
+            ctx.queue_scalar_load(
+                Operand::ScalarReg(i),
+                (i as u32 + 1) * 100,
+                (i as u64 + 1) * 2, // ready: 12, 14, 16, 18, 20, 22
+            );
+        }
+
+        // Commit at cycle 16: r0 (12), r1 (14), r2 (16) should commit
+        ctx.cycles = 16;
+        ctx.commit_pending_writes();
+
+        for i in 0..3u8 {
+            assert_eq!(ctx.scalar.read(i), (i as u32 + 1) * 100,
+                "r{} should be committed", i);
+        }
+        for i in 3..6u8 {
+            assert_eq!(ctx.scalar.read(i), 0,
+                "r{} should NOT be committed yet", i);
+        }
+        assert_eq!(ctx.pending_writes.len(), 3);
+
+        // Commit the rest
+        ctx.cycles = 22;
+        ctx.commit_pending_writes();
+        for i in 3..6u8 {
+            assert_eq!(ctx.scalar.read(i), (i as u32 + 1) * 100,
+                "r{} should now be committed", i);
+        }
+        assert!(ctx.pending_writes.is_empty());
+    }
+
+    #[test]
+    fn test_delay_pending_writes_extends_forwarding_window() {
+        // delay_pending_writes(1) at a branch boundary should push
+        // the ready_cycle of all pending writes, extending the window
+        // during which forwarding is active.
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(7, 0);
+
+        ctx.cycles = 10;
+        ctx.queue_scalar_load(Operand::PointerReg(7), 0x78000, 7); // ready=17
+
+        // Simulate branch taken: delay by 1
+        ctx.delay_pending_writes(1); // ready=18
+
+        // At cycle 17: should NOT be committed yet (was delayed)
+        ctx.cycles = 17;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.pointer.read(7), 0,
+            "Delayed write should not commit at original ready_cycle");
+
+        // But forward should still work
+        assert_eq!(ctx.pointer_read(7), 0x78000,
+            "Forwarding should still work for delayed write");
+
+        // At cycle 18: should commit
+        ctx.cycles = 18;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.pointer.read(7), 0x78000);
+    }
+
+    // =====================================================================
+    // Save/Restore Pattern (memcpy scenario)
+    // =====================================================================
+
+    #[test]
+    fn test_pointer_save_restore_roundtrip() {
+        // Simulate the memcpy prologue/epilogue pattern:
+        // 1. Save p7 to stack via store
+        // 2. Clobber p7 (mov p7, sp)
+        // 3. Restore p7 from stack via load
+        //
+        // This tests that the register pipeline correctly handles the
+        // save -> clobber -> restore sequence.
+        let mut ctx = ExecutionContext::new();
+        ctx.set_sp(0x70080);
+        ctx.pointer.write(7, 0x78000); // original p7
+
+        // Step 1: Read p7 for store (at cycle 10)
+        ctx.cycles = 10;
+        let saved_value = ctx.pointer_read(7);
+        assert_eq!(saved_value, 0x78000);
+
+        // Step 2: Clobber p7 via queue_pointer_write (mov p7, sp)
+        ctx.cycles = 11;
+        ctx.queue_pointer_write(7, ctx.sp(), 1); // latency 1, ready=12
+
+        // Step 3: Commit the clobber
+        ctx.cycles = 12;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.pointer.read(7), 0x70080, "p7 = sp after clobber");
+
+        // ... memcpy body runs ...
+
+        // Step 4: Restore p7 from stack (lda p7, [sp, #-32])
+        // The "loaded value" would come from memory (0x78000 was stored there)
+        ctx.cycles = 100;
+        ctx.queue_scalar_load(Operand::PointerReg(7), 0x78000, 7); // ready=107
+
+        // Step 5: Before commit, forwarding should return the restored value
+        ctx.cycles = 101;
+        assert_eq!(ctx.pointer_read(7), 0x78000,
+            "Forward should return restored value");
+
+        // After commit, live register should have restored value
+        ctx.cycles = 107;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.pointer.read(7), 0x78000,
+            "p7 should be restored to original value");
+    }
+
+    #[test]
+    fn test_pointer_forwarding_survives_branch_delay() {
+        // Full memcpy scenario with branch:
+        // 1. lda p7, [sp, #-32] at cycle 50 (latency 7, ready=57)
+        // 2. ret at cycle 54 (5 delay slots from cycle 50)
+        // 3. delay_pending_writes(1) when branch takes effect: ready=58
+        // 4. mov p2, p7 at cycle 55 (at branch target)
+        //
+        // At step 4, p7 should be forwarded from the pending load.
+        let mut ctx = ExecutionContext::new();
+        ctx.pointer.write(7, 0); // clobbered value (frame ptr)
+
+        // Step 1: lda p7 restore
+        ctx.cycles = 50;
+        ctx.queue_scalar_load(Operand::PointerReg(7), 0x78000, 7); // ready=57
+
+        // Step 2-3: Branch taken after delay slots
+        ctx.delay_pending_writes(1); // ready=58
+
+        // Step 4: At branch target, reading p7 for mov p2, p7
+        ctx.cycles = 55;
+        let p7_value = ctx.pointer_read(7);
+        assert_eq!(p7_value, 0x78000,
+            "p7 should be forwarded from pending load at branch target");
+    }
+
+    #[test]
+    fn test_forwarding_does_not_return_stale_over_committed() {
+        // Edge case: if a pending write to reg X exists, and a LATER
+        // write to reg X has already been committed (because it had
+        // shorter latency), the forwarding should still return the
+        // pending value (because the pending load will eventually
+        // overwrite the committed value when it completes).
+        //
+        // This matches hardware behavior: on real silicon, the scoreboard
+        // would prevent the later write from executing until the load
+        // completes. In our forwarding model, we allow both writes and
+        // the pending load value represents the eventual correct state.
+        let mut ctx = ExecutionContext::new();
+
+        // Cycle 10: lda r5, [...] with latency 7 (ready=17)
+        ctx.cycles = 10;
+        ctx.queue_scalar_load(Operand::ScalarReg(5), 3002, 7);
+
+        // Cycle 12: mov r5, #3001 (immediate write, no latency)
+        ctx.cycles = 12;
+        ctx.scalar.write(5, 3001);
+
+        // At cycle 13: forward should return the pending load value
+        ctx.cycles = 13;
+        assert_eq!(ctx.scalar_read(5), 3002,
+            "Pending load should be forwarded even though MOV committed later");
+
+        // At cycle 17: load commits, overwrites MOV value
+        ctx.cycles = 17;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.scalar.read(5), 3002,
+            "Load should overwrite the MOV value when committed");
+    }
+
+    // =====================================================================
+    // Flush / Test Utility
+    // =====================================================================
+
+    #[test]
+    fn test_flush_pending_writes() {
+        // flush_pending_writes() ignores timing and applies all writes immediately.
+        let mut ctx = ExecutionContext::new();
+        ctx.cycles = 10;
+        ctx.queue_scalar_load(Operand::ScalarReg(0), 42, 100); // ready=110
+        ctx.queue_scalar_load(Operand::PointerReg(3), 0x1234, 100);
+
+        ctx.flush_pending_writes();
+
+        assert_eq!(ctx.scalar.read(0), 42);
+        assert_eq!(ctx.pointer.read(3), 0x1234);
+        assert!(ctx.pending_writes.is_empty());
     }
 }

@@ -27,7 +27,7 @@
 use crate::interpreter::bundle::Operand;
 use crate::interpreter::state::{
     CORE_ID_REG_INDEX, DP_REG_INDEX, LC_REG_INDEX, LE_REG_INDEX, LR_REG_INDEX, LS_REG_INDEX,
-    MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN, MOD_BASE_M,
+    MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN, MOD_BASE_M, SP_PTR_INDEX,
 };
 use crate::tablegen::CompositeEncoder;
 
@@ -167,7 +167,7 @@ fn decode_mv_scl_src(raw: u64) -> Operand {
             6  => Operand::ScalarReg(CORE_ID_REG_INDEX),
             8  => Operand::ScalarReg(LE_REG_INDEX),
             10 => Operand::ScalarReg(LC_REG_INDEX),
-            12 => Operand::PointerReg(6), // SP = p6
+            12 => Operand::PointerReg(SP_PTR_INDEX), // SP = dedicated register
             _  => Operand::ScalarReg(0),
         };
     }
@@ -382,7 +382,7 @@ mod tests {
         assert_eq!(luts.decode(CompositeEncoder::MvSclSrc, 0b0110111),
             Operand::ScalarReg(CORE_ID_REG_INDEX)); // CORE_ID, id=6
         assert_eq!(luts.decode(CompositeEncoder::MvSclSrc, 0b1100111),
-            Operand::PointerReg(6)); // SP = p6, id=12
+            Operand::PointerReg(SP_PTR_INDEX)); // SP = dedicated, id=12
     }
 
     #[test]

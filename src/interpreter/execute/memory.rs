@@ -300,7 +300,6 @@ impl MemoryUnit {
 
         log::trace!("[LOAD] addr=0x{:X} width={:?} dest={:?} srcs={:?} latency={}",
             addr, width, op.dest, op.sources, latency);
-
         // Handle full vector loads specially
         if width == MemWidth::Vector256 {
             let vec_data = Self::read_vector_from_memory(tile, addr, neighbors.map(|n| &*n));
@@ -310,6 +309,7 @@ impl MemoryUnit {
         } else {
             // Scalar/partial loads go through write_dest_with_latency (which queues)
             let value = Self::read_memory(tile, addr, width, neighbors.map(|n| &*n));
+
 
             if log::log_enabled!(log::Level::Trace) {
                 let masked = addr & 0xFFFF;
@@ -365,6 +365,7 @@ impl MemoryUnit {
         } else {
             // Scalar/partial stores
             let value = Self::get_store_value(op, ctx, width);
+
 
             Self::write_memory(tile, addr, value, width, neighbors);
         }
@@ -952,11 +953,23 @@ impl MemoryUnit {
             match post_modify {
                 PostModify::None => {}
                 PostModify::Immediate(imm) => {
-                    ctx.pointer.add(reg, *imm as i32);
+                    use crate::interpreter::state::SP_PTR_INDEX;
+                    if reg == SP_PTR_INDEX {
+                        let sp = ctx.sp();
+                        ctx.set_sp(sp.wrapping_add(*imm as i32 as u32));
+                    } else {
+                        ctx.pointer.add(reg, *imm as i32);
+                    }
                 }
                 PostModify::Register(m) => {
+                    use crate::interpreter::state::SP_PTR_INDEX;
                     let modifier = ctx.modifier_read(*m) as i32;
-                    ctx.pointer.add(reg, modifier);
+                    if reg == SP_PTR_INDEX {
+                        let sp = ctx.sp();
+                        ctx.set_sp(sp.wrapping_add(modifier as u32));
+                    } else {
+                        ctx.pointer.add(reg, modifier);
+                    }
                 }
             }
         }
@@ -1810,5 +1823,234 @@ mod tests {
         let reg_layout = crate::device::regdb::device_reg_layout();
         let lock3_offset = reg_layout.memory_lock_base + 3 * reg_layout.memory_lock_stride;
         assert_eq!(tile.read_register_pure(lock3_offset), 7);
+    }
+
+    // =====================================================================
+    // SP-Relative Addressing Tests
+    // =====================================================================
+
+    #[test]
+    fn test_sp_relative_store_and_load() {
+        // Test the fundamental save/restore pattern:
+        //   st p7, [sp, #-32]    -- save p7 to stack
+        //   lda p7, [sp, #-32]   -- restore p7 from stack
+        //
+        // This is the exact pattern used in function prologues/epilogues.
+        use crate::interpreter::state::SP_PTR_INDEX;
+
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        // Set up: sp = 0x70060, p7 = 0x78000
+        ctx.set_sp(0x70060);
+        ctx.pointer.write(7, 0x78000);
+
+        // Store p7 to [sp - 32].
+        // The store has: sources[0]=value(ScalarReg from p7), Memory{base=SP, offset=-32}
+        // In the kernel layout: sources contain Memory operand.
+        // For simplicity, construct as: dest=value, source=Memory{SP, -32}
+        //
+        // Actually the kernel store layout is:
+        //   sources[0] = value (PointerReg(7) treated as ScalarReg for store)
+        //   sources[1..] = Memory or Pointer for address
+        //
+        // But the test store layout uses dest=value, source=ptr.
+        // Let me use the Memory operand directly.
+
+        // First, compute the address manually and write directly
+        // to verify the address computation is correct.
+        let store_addr = ctx.sp().wrapping_add(-32_i32 as u32);
+        let (quadrant, local_offset) = decode_data_address(store_addr);
+        assert_eq!(quadrant, 0, "Stack should be in local memory");
+        assert_eq!(local_offset, 0x0040, "0x70060 - 32 = 0x70040, masked to 0x40");
+
+        // Write p7's value to memory at the stack slot
+        let p7_val = ctx.pointer_read(7);
+        assert_eq!(p7_val, 0x78000);
+        MemoryUnit::write_memory(&mut tile, store_addr, p7_val as u64, MemWidth::Word, None);
+
+        // Verify the value is in memory
+        assert_eq!(tile.read_data_u32(local_offset), Some(0x78000));
+
+        // Now clobber p7 (simulating mov p7, sp in the prologue)
+        ctx.pointer.write(7, ctx.sp());
+        assert_eq!(ctx.pointer.read(7), 0x70060);
+
+        // Load p7 back from [sp - 32] using the Memory operand
+        let load_op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_dest(Operand::PointerReg(7))
+            .with_source(Operand::Memory { base: SP_PTR_INDEX, offset: -32 });
+
+        MemoryUnit::execute(&load_op, &mut ctx, &mut tile, None);
+        ctx.flush_pending_writes();
+
+        assert_eq!(ctx.pointer.read(7), 0x78000,
+            "p7 should be restored to original value after load from [sp, #-32]");
+    }
+
+    #[test]
+    fn test_sp_relative_load_with_latency() {
+        // Same as above but verify the load goes through the pending write
+        // queue with proper latency (not flushed immediately).
+        use crate::interpreter::state::SP_PTR_INDEX;
+        use crate::interpreter::timing::LATENCY_MEMORY;
+
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        ctx.set_sp(0x70080);
+        ctx.cycles = 100;
+
+        // Write test value to [sp - 32] = 0x70060 -> local 0x0060
+        let addr = ctx.sp().wrapping_add(-32_i32 as u32);
+        MemoryUnit::write_memory(&mut tile, addr, 0x78000, MemWidth::Word, None);
+
+        // Load from [sp, #-32] into p7
+        let load_op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_dest(Operand::PointerReg(7))
+            .with_source(Operand::Memory { base: SP_PTR_INDEX, offset: -32 });
+
+        MemoryUnit::execute(&load_op, &mut ctx, &mut tile, None);
+
+        // Should NOT be committed yet (load latency = 7)
+        assert_eq!(ctx.pointer.read(7), 0,
+            "Load should not be committed immediately (latency pending)");
+
+        // But forwarding should work
+        ctx.cycles = 101;
+        assert_eq!(ctx.pointer_read(7), 0x78000,
+            "Forward should return pending load value");
+
+        // Commit at ready_cycle
+        ctx.cycles = 100 + LATENCY_MEMORY as u64;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.pointer.read(7), 0x78000,
+            "After commit, p7 should have restored value");
+    }
+
+    #[test]
+    fn test_sp_relative_store_via_memory_operand() {
+        // Test store using Memory operand with SP_PTR_INDEX as base.
+        // st r5, [sp, #-8]
+        use crate::interpreter::state::SP_PTR_INDEX;
+
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        ctx.set_sp(0x70040);
+        ctx.scalar.write(5, 0xDEAD_BEEF);
+
+        // Store r5 to [sp - 8] using kernel layout:
+        // sources[0] = value (ScalarReg(5))
+        // sources[1] = Memory { base: SP_PTR_INDEX, offset: -8 }
+        let store_op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Store)
+            .with_source(Operand::ScalarReg(5))
+            .with_source(Operand::Memory { base: SP_PTR_INDEX, offset: -8 });
+
+        MemoryUnit::execute(&store_op, &mut ctx, &mut tile, None);
+
+        // Verify: [sp - 8] = 0x70040 - 8 = 0x70038 -> local 0x0038
+        assert_eq!(tile.read_data_u32(0x38), Some(0xDEAD_BEEF),
+            "Store via SP-relative addressing should write to correct local offset");
+    }
+
+    #[test]
+    fn test_full_save_clobber_restore_with_forwarding() {
+        // Full prologue/epilogue sequence with cycle-accurate timing:
+        //   Cycle 10: st p7, [sp, #-32]       (save p7 = 0x78000)
+        //   Cycle 11: mov p7, sp               (clobber p7 = sp)
+        //   Cycle 12: commit p7 = sp           (latency 1)
+        //   ... (function body, p7 used as frame pointer) ...
+        //   Cycle 50: lda p7, [sp, #-32]       (restore, latency 7, ready=57)
+        //   Cycle 51: forwarding returns 0x78000
+        //   Cycle 55: mov p2, p7               (reads forwarded value = 0x78000)
+        use crate::interpreter::state::SP_PTR_INDEX;
+
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        ctx.set_sp(0x70060);
+        ctx.pointer.write(7, 0x78000);
+
+        // Cycle 10: Store p7 to [sp - 32] (Memory-based address)
+        ctx.cycles = 10;
+        let store_addr = ctx.sp().wrapping_add(-32_i32 as u32);
+        MemoryUnit::write_memory(&mut tile, store_addr, ctx.pointer_read(7) as u64, MemWidth::Word, None);
+
+        // Cycle 11: mov p7, sp (clobber)
+        ctx.cycles = 11;
+        ctx.queue_pointer_write(7, ctx.sp(), 1); // ready=12
+
+        // Verify p7 is still old (deferred by 1)
+        assert_eq!(ctx.pointer.read(7), 0x78000,
+            "p7 live should still be old value (write deferred)");
+        // But forward returns new value
+        ctx.cycles = 12;
+        assert_eq!(ctx.pointer_read(7), 0x70060,
+            "p7 forward should return sp value after clobber");
+
+        // Commit the clobber
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.pointer.read(7), 0x70060, "p7 committed to sp value");
+
+        // ... function body ...
+
+        // Cycle 50: Restore p7 from [sp, #-32]
+        ctx.cycles = 50;
+        let load_op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_dest(Operand::PointerReg(7))
+            .with_source(Operand::Memory { base: SP_PTR_INDEX, offset: -32 });
+        MemoryUnit::execute(&load_op, &mut ctx, &mut tile, None);
+
+        // Cycle 51: Forward should return the restored value
+        ctx.cycles = 51;
+        assert_eq!(ctx.pointer_read(7), 0x78000,
+            "Forwarding should return restored p7 value");
+
+        // Cycle 55: Simulate mov p2, p7 in delay slot
+        ctx.cycles = 55;
+        let p7_for_p2 = ctx.pointer_read(7);
+        assert_eq!(p7_for_p2, 0x78000,
+            "p7 should be forwarded correctly for mov p2, p7");
+
+        // Cycle 57: Commit the load
+        ctx.cycles = 57;
+        ctx.commit_pending_writes();
+        assert_eq!(ctx.pointer.read(7), 0x78000,
+            "p7 should be committed to restored value");
+    }
+
+    #[test]
+    fn test_post_modify_with_sp_base() {
+        // Verify that apply_post_modify correctly handles SP_PTR_INDEX.
+        // If post-modify occurs on an SP-relative load, it should modify SP,
+        // not alias to p7.
+        use crate::interpreter::state::SP_PTR_INDEX;
+
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        ctx.set_sp(0x70100);
+        ctx.pointer.write(7, 0xBEEF); // p7 should NOT be modified
+        tile.write_data_u32(0x100, 0x42);
+
+        // lda r0, [sp], #4 -- load from sp, then sp += 4
+        let load_op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Load)
+            .with_post_modify(PostModify::Immediate(4))
+            .with_dest(Operand::ScalarReg(0))
+            .with_source(Operand::Memory { base: SP_PTR_INDEX, offset: 0 });
+
+        MemoryUnit::execute(&load_op, &mut ctx, &mut tile, None);
+
+        // SP should be post-modified: 0x70100 + 4 = 0x70104
+        assert_eq!(ctx.sp(), 0x70104,
+            "SP should be post-modified by +4");
+
+        // p7 should be UNAFFECTED
+        assert_eq!(ctx.pointer.read(7), 0xBEEF,
+            "p7 must not be affected by SP post-modify");
+
+        ctx.flush_pending_writes();
+        assert_eq!(ctx.scalar.read(0), 0x42);
     }
 }

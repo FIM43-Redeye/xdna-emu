@@ -236,6 +236,10 @@ pub(super) fn write_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: u32) {
 pub(super) fn write_operand(operand: &Operand, ctx: &mut ExecutionContext, value: u32) {
     match operand {
         Operand::ScalarReg(r) => ctx.scalar.write(*r, value),
+        Operand::PointerReg(r) if *r == crate::interpreter::state::SP_PTR_INDEX => {
+            // Dedicated SP register -- write immediately (no pipeline alias)
+            ctx.set_sp(value);
+        }
         Operand::PointerReg(r) => ctx.queue_pointer_write(*r, value, 1),
         Operand::ModifierReg(r) => ctx.modifier.write(*r, value),
         Operand::ControlReg(id) => {
@@ -568,15 +572,23 @@ fn execute_mov(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
 /// pN for the base address). Uses deferred pipeline write (latency 1) to
 /// match hardware pointer write timing.
 fn execute_pointer_add(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
-    let ptr_idx = match op.dest {
-        Some(Operand::PointerReg(p)) => p,
-        None => 6, // SP = p6 (PADDA_sp_imm / PADDB_sp_imm: Defs=[SP], Uses=[SP])
+    match op.dest {
+        Some(Operand::PointerReg(p)) => {
+            let base = ctx.pointer_read(p);
+            let offset = read_source(op, ctx, 0);
+            let result = base.wrapping_add(offset);
+            ctx.queue_pointer_write(p, result, 1);
+        }
+        None => {
+            // PADDA_sp_imm / PADDB_sp_imm: operates on the dedicated SP register.
+            // AIE2 SP is SPLReg<12>, separate from pointer registers p0-p7.
+            let base = ctx.sp();
+            let offset = read_source(op, ctx, 0);
+            let result = base.wrapping_add(offset);
+            ctx.set_sp(result);
+        }
         _ => return false,
-    };
-    let base = ctx.pointer_read(ptr_idx);
-    let offset = read_source(op, ctx, 0);
-    let result = base.wrapping_add(offset);
-    ctx.queue_pointer_write(ptr_idx, result, 1);
+    }
     true
 }
 

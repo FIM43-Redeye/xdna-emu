@@ -567,9 +567,12 @@ impl DmaEngine {
         // Create transfer
         let transfer = Transfer::new(bd_config, bd_index, channel, direction, self.col, self.row, self.tile_type)?;
 
-        log::debug!("DMA tile({},{}) ch{} transfer: total_bytes={} src={:?} dst={:?}",
-            self.col, self.row, channel,
-            transfer.total_bytes, transfer.source, transfer.dest);
+        log::info!("DMA tile({},{}) ch{} BD{} start: total_bytes={} base_addr=0x{:X} next_bd={:?} acq_lock={:?}(val={}) rel_lock={:?}(val={})",
+            self.col, self.row, channel, bd_index,
+            transfer.total_bytes, bd_config.base_addr,
+            bd_config.next_bd,
+            bd_config.acquire_lock, bd_config.acquire_value,
+            bd_config.release_lock, bd_config.release_value);
 
         // Determine initial FSM state based on whether lock acquisition is needed
         let ch = &mut self.channels[ch_idx];
@@ -933,6 +936,8 @@ impl DmaEngine {
             ChannelFsm::BdChaining { cycles_remaining, next_bd } => {
                 if cycles_remaining <= 1 {
                     // Load next BD and start transfer
+                    let bd_addr = self.bd_configs.get(next_bd as usize).map(|c| c.base_addr).unwrap_or(0);
+                    log::info!("DMA tile({},{}) ch{} BD chain -> BD{} (base_addr=0x{:X})", self.col, self.row, ch_idx, next_bd, bd_addr);
                     match self.create_transfer_from_bd(next_bd, ch_idx as u8) {
                         Ok(transfer) => {
                             self.channels[ch_idx].current_bd = Some(next_bd);
@@ -1434,6 +1439,7 @@ impl DmaEngine {
 
         log::debug!("DMA({},{}) MM2S ch{}: addr=0x{:X} offset=0x{:X} bytes={} words={}",
             self.col, self.row, channel, addr, offset, bytes, word_count);
+
         for i in 0..word_count {
             let word_offset = offset + i * 4;
             let word = if word_offset + 4 <= data.len() {

@@ -39,6 +39,17 @@ pub const DP_REG_INDEX: u8 = 36;
 /// Core ID register (CORE_ID) -- read-only in hardware.
 pub const CORE_ID_REG_INDEX: u8 = 37;
 
+/// Stack pointer sentinel index for PointerReg operands.
+///
+/// AIE2's SP is a dedicated special register (SPLReg<12, "sp">), separate
+/// from general-purpose pointer registers p0-p7. Using index 255 as a
+/// sentinel in `Operand::PointerReg(SP_PTR_INDEX)` allows the decoder to
+/// distinguish SP from p0-p7 without adding a new Operand variant.
+///
+/// `pointer_read(SP_PTR_INDEX)` and `pointer_write(SP_PTR_INDEX, _)` are
+/// intercepted by the execution context to route to the dedicated SP storage.
+pub const SP_PTR_INDEX: u8 = 255;
+
 /// Number of pointer registers.
 pub const NUM_POINTER_REGS: usize = 8;
 
