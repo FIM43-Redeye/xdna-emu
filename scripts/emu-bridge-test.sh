@@ -98,11 +98,9 @@ is_standard_test() {
   [[ -f "$dir/test.cpp" ]] && [[ -f "$dir/aie.mlir" || -f "$dir/run.lit" ]]
 }
 
-# Check if a test requires Chess compiler (we skip those).
+# Check if a test requires Chess compiler.
+# We have Chess (aietools) installed, so this always returns false.
 requires_chess() {
-  local dir="$1"
-  local lit="$dir/run.lit"
-  [[ -f "$lit" ]] && grep -q 'chess' "$lit" && return 0
   return 1
 }
 
@@ -176,85 +174,190 @@ discover_tests() {
 }
 
 # ---------------------------------------------------------------------------
-# Compilation
+# Compilation -- driven by run.lit RUN lines
 # ---------------------------------------------------------------------------
 
-compile_aie() {
+# Substitutions for lit RUN lines.
+AIETOOLS_DIR="${AIETOOLS_DIR:-/home/triple/npu-work/aietools}"
+
+apply_lit_subs() {
+  local src_dir="$1"
+  local cmd="$2"
+  # Strip the "// RUN: " prefix.
+  cmd="${cmd#*RUN: }"
+  # Lit substitutions.
+  cmd="${cmd//'%S'/$src_dir}"
+  cmd="${cmd//'%aietools'/$AIETOOLS_DIR}"
+  cmd="${cmd//'%python'/python3}"
+  cmd="${cmd//'%xrt_flags'/-I$XRT_INCLUDE -L$XRT_LIB -luuid -lxrt_coreutil}"
+  cmd="${cmd//'%test_utils_flags'/-I$TEST_UTILS_INCLUDE -L$TEST_UTILS_LIB -ltest_utils}"
+  cmd="${cmd//'%test_lib_flags'/-I$TEST_UTILS_INCLUDE -L$TEST_UTILS_LIB -ltest_lib}"
+  # Strip run_on_npu wrappers (we handle execution separately).
+  cmd="${cmd//'%run_on_npu1%'/}"
+  cmd="${cmd//'%run_on_npu2%'/}"
+  # Replace bare 'clang' with system clang++ (avoid aietools wrapper).
+  # Match 'clang ' at start of command (after substitution stripping).
+  if [[ "$cmd" == clang\ * ]]; then
+    cmd="/usr/bin/clang++ ${cmd#clang }"
+  elif [[ "$cmd" == g++\ * ]]; then
+    cmd="/usr/bin/g++ ${cmd#g++ }"
+  fi
+  echo "$cmd"
+}
+
+# Parse run.lit and extract build commands (everything before the
+# run_on_npu execution line).  Returns commands one per line.
+extract_build_commands() {
+  local lit_file="$1"
+  local src_dir="$2"
+  [[ -f "$lit_file" ]] || return 1
+
+  while IFS= read -r line; do
+    # Only process RUN lines.
+    [[ "$line" == *"RUN:"* ]] || continue
+    local cmd
+    cmd="$(apply_lit_subs "$src_dir" "$line")"
+    # Skip execution lines (the actual test run).
+    [[ "$cmd" == *"./test.exe"* ]] && continue
+    [[ "$cmd" == *"run_on_npu"* ]] && continue
+    # Skip sed for NPUDEVICE -- we handle that separately.
+    [[ "$cmd" == *"NPUDEVICE"* ]] && continue
+    # Skip cp of aie.mlir -- we handle that.
+    [[ "$cmd" == "cp "* ]] && continue
+    echo "$cmd"
+  done < "$lit_file"
+}
+
+compile_test() {
   local name="$1"
   local src_dir="$TEST_SRC/$name"
   local build_dir="$BUILD_BASE/$name"
 
   mkdir -p "$build_dir"
 
-  # Check if already compiled.
-  if [[ -f "$build_dir/aie.xclbin" ]] && [[ -f "$build_dir/insts.bin" ]] && ! $FORCE_COMPILE; then
+  # Check if already compiled (xclbin + test.exe both present).
+  if [[ -f "$build_dir/aie.xclbin" ]] && [[ -f "$build_dir/test.exe" ]] && ! $FORCE_COMPILE; then
     return 0
   fi
 
-  info "Compiling AIE: $name"
+  info "Compiling: $name"
 
-  # Prepare architecture MLIR.
+  local log_file="$RESULTS_DIR/${name//\//_}_compile.log"
+
+  # Prepare architecture MLIR (NPUDEVICE substitution).
   local npu_dev
   npu_dev="$(get_npu_device "$src_dir")"
-  cp "$src_dir/aie.mlir" "$build_dir/aie_arch.mlir"
-  sed "s/NPUDEVICE/${npu_dev}/g" -i "$build_dir/aie_arch.mlir"
-
-  # Run aiecc.py.
-  (
-    cd "$build_dir"
-    nice -n 19 aiecc.py \
-      --no-aiesim \
-      --aie-generate-xclbin \
-      --aie-generate-npu-insts \
-      --no-compile-host \
-      --alloc-scheme=basic-sequential \
-      --xclbin-name=aie.xclbin \
-      --npu-insts-name=insts.bin \
-      ./aie_arch.mlir
-  ) > "$RESULTS_DIR/${name//\//_}_compile.log" 2>&1
-
-  return $?
-}
-
-compile_host() {
-  local name="$1"
-  local src_dir="$TEST_SRC/$name"
-  local build_dir="$BUILD_BASE/$name"
-
-  # Check if already compiled.
-  if [[ -f "$build_dir/test.exe" ]] && ! $FORCE_COMPILE; then
-    return 0
+  if [[ -f "$src_dir/aie.mlir" ]]; then
+    cp "$src_dir/aie.mlir" "$build_dir/aie_arch.mlir"
+    sed "s/NPUDEVICE/${npu_dev}/g" -i "$build_dir/aie_arch.mlir"
   fi
 
-  info "Compiling host: $name"
+  # Extract and execute all build commands from run.lit.
+  local lit_file="$src_dir/run.lit"
+  if [[ ! -f "$lit_file" ]]; then
+    err "No run.lit found for $name"
+    return 1
+  fi
 
-  /usr/bin/clang++ "$src_dir/test.cpp" -o "$build_dir/test.exe" \
-    -std=c++17 -Wall \
-    -I"$XRT_INCLUDE" -L"$XRT_LIB" \
-    -I"$TEST_UTILS_INCLUDE" -L"$TEST_UTILS_LIB" \
-    -luuid -lxrt_coreutil -ltest_utils -lrt -lstdc++ \
-    2> "$RESULTS_DIR/${name//\//_}_host_compile.log"
+  local failed=false
+  while IFS= read -r cmd; do
+    [[ -z "$cmd" ]] && continue
+    # Replace references to ./aie_arch.mlir or aie.mlir in aiecc.py
+    # commands to use our prepared copy.
+    if [[ "$cmd" == *aiecc.py* ]]; then
+      # Replace source MLIR path with our prepared copy.
+      cmd="${cmd//$src_dir\/aie.mlir/./aie_arch.mlir}"
+      cmd="${cmd//\.\/aie.mlir/./aie_arch.mlir}"
+    fi
+    if ! ( cd "$build_dir" && nice -n 19 eval "$cmd" ) >> "$log_file" 2>&1; then
+      err "Build step failed for $name: $cmd"
+      failed=true
+      break
+    fi
+  done < <(extract_build_commands "$lit_file" "$src_dir")
+
+  if $failed; then
+    return 1
+  fi
+
+  # If run.lit didn't produce test.exe (some tests have non-standard
+  # build), try a fallback compilation.
+  if [[ ! -f "$build_dir/test.exe" ]] && [[ -f "$src_dir/test.cpp" ]]; then
+    /usr/bin/clang++ "$src_dir/test.cpp" -o "$build_dir/test.exe" \
+      -std=c++17 -Wall \
+      -I"$XRT_INCLUDE" -L"$XRT_LIB" \
+      -I"$TEST_UTILS_INCLUDE" -L"$TEST_UTILS_LIB" \
+      -luuid -lxrt_coreutil -ltest_utils -lrt -lstdc++ \
+      >> "$log_file" 2>&1 || true
+  fi
+
+  # Check that we got the expected artifacts.
+  if [[ ! -f "$build_dir/aie.xclbin" ]]; then
+    # Some tests produce differently-named xclbins.
+    local any_xclbin
+    any_xclbin=$(find "$build_dir" -name "*.xclbin" -print -quit 2>/dev/null)
+    if [[ -z "$any_xclbin" ]]; then
+      err "No xclbin produced for $name"
+      return 1
+    fi
+  fi
+
+  return 0
 }
 
 # ---------------------------------------------------------------------------
 # Execution
 # ---------------------------------------------------------------------------
 
+# Extract the test execution command from run.lit to get correct args.
+get_run_cmd() {
+  local src_dir="$1"
+  local lit_file="$src_dir/run.lit"
+  [[ -f "$lit_file" ]] || return 1
+
+  # Find the first npu1 execution line (prefer npu1, fall back to any).
+  while IFS= read -r line; do
+    [[ "$line" == *"RUN:"* ]] || continue
+    if [[ "$line" == *"./test.exe"* ]] && [[ "$line" == *"npu1"* || "$line" != *"npu2"* ]]; then
+      local cmd
+      cmd="$(apply_lit_subs "$src_dir" "$line")"
+      # Trim leading whitespace from stripping run_on_npu wrappers.
+      cmd="${cmd#"${cmd%%[![:space:]]*}"}"
+      echo "$cmd"
+      return 0
+    fi
+  done < "$lit_file"
+
+  # Fallback: standard invocation.
+  echo "./test.exe -x aie.xclbin -k MLIR_AIE -i insts.bin"
+}
+
 # Run test.exe through XRT bridge (XDNA_EMU=1).
 run_bridge() {
   local name="$1"
   local build_dir="$BUILD_BASE/$name"
+  local src_dir="$TEST_SRC/$name"
   local log_file="$RESULTS_DIR/${name//\//_}_bridge.log"
 
-  if [[ ! -f "$build_dir/test.exe" ]] || [[ ! -f "$build_dir/aie.xclbin" ]]; then
-    echo "SKIP_NOARTIFACT"
+  if [[ ! -f "$build_dir/test.exe" ]]; then
+    echo "SKIP_NOEXE"
     return
   fi
 
+  # Find any xclbin in the build dir.
+  if ! ls "$build_dir"/*.xclbin &>/dev/null; then
+    echo "SKIP_NOXCLBIN"
+    return
+  fi
+
+  # Extract the run command from run.lit for correct args.
+  local run_cmd
+  run_cmd="$(get_run_cmd "$src_dir")"
+
   (
     cd "$build_dir"
-    timeout 60 env XDNA_EMU=1 ./test.exe \
-      -x aie.xclbin -k MLIR_AIE -i insts.bin
+    export XDNA_EMU=1
+    timeout 60 bash -c "$run_cmd"
   ) > "$log_file" 2>&1
 
   local rc=$?
@@ -278,12 +381,14 @@ run_nputest() {
   ) > "$log_file" 2>&1
 
   local rc=$?
-  if [[ $rc -eq 0 ]] && grep -qE "PASS|pass" "$log_file"; then
+  if [[ $rc -eq 0 ]] && grep -qE 'Passed: *[1-9]' "$log_file"; then
     echo "PASS"
   elif [[ $rc -eq 124 ]]; then
     echo "TIMEOUT"
-  elif grep -qE "SKIP|skip|Skipped" "$log_file"; then
+  elif grep -qE 'Skipped: *[1-9]' "$log_file"; then
     echo "SKIP"
+  elif grep -qE 'Unknown: *[1-9]' "$log_file"; then
+    echo "UNKNOWN"
   else
     echo "FAIL"
   fi
@@ -392,8 +497,8 @@ main() {
       continue
     fi
 
-    # Compile AIE (xclbin + insts.bin).
-    if ! compile_aie "$name" 2>/dev/null; then
+    # Compile everything (kernel objects, xclbin, host test.exe).
+    if ! compile_test "$name" 2>/dev/null; then
       notes="compile_fail"
       printf "%-45s  %-10s" "$name" "COMP_FAIL"
       if ! $BRIDGE_ONLY; then
@@ -408,16 +513,8 @@ main() {
       continue
     fi
 
-    # Compile host test.cpp.
-    if ! compile_host "$name" 2>/dev/null; then
-      notes="host_compile_fail"
-      bridge_result="HOST_FAIL"
-    fi
-
     # Run XRT bridge path.
-    if [[ "$bridge_result" != "HOST_FAIL" ]]; then
-      bridge_result=$(run_bridge "$name")
-    fi
+    bridge_result=$(run_bridge "$name")
 
     case "$bridge_result" in
       PASS) ((pass_bridge++)) || true ;;
