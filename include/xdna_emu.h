@@ -204,6 +204,104 @@ XdnaEmuResult xdna_emu_set_max_cycles(
 XdnaEmuExecStatus xdna_emu_run(XdnaEmuHandle* handle);
 
 /**
+ * Allocate a host memory buffer.
+ *
+ * Returns a page-aligned (4096-byte) base address on success, or 0 on failure.
+ * The address is automatically assigned and registered with the emulator's
+ * host memory system.
+ *
+ * @param handle Valid emulator handle.
+ * @param size   Buffer size in bytes (rounded up to page boundary).
+ * @return Base address (page-aligned, non-zero) on success, 0 on failure.
+ */
+uint64_t xdna_emu_alloc_buffer(XdnaEmuHandle* handle, uint64_t size);
+
+/**
+ * Free a previously allocated host memory buffer.
+ *
+ * Removes the region from host memory tracking. The underlying sparse pages
+ * are reclaimed when the emulator handle is destroyed.
+ *
+ * @param handle Valid emulator handle.
+ * @param addr   Address returned by xdna_emu_alloc_buffer().
+ */
+void xdna_emu_free_buffer(XdnaEmuHandle* handle, uint64_t addr);
+
+/**
+ * Read a 32-bit register from a specific tile.
+ *
+ * @param handle   Valid emulator handle.
+ * @param col      Tile column index.
+ * @param row      Tile row index.
+ * @param reg_addr Register offset within the tile (20-bit).
+ * @return Register value, or 0 on error.
+ */
+uint32_t xdna_emu_read_register(
+    XdnaEmuHandle* handle,
+    uint16_t col,
+    uint16_t row,
+    uint32_t reg_addr
+);
+
+/**
+ * Write a 32-bit value to a tile register.
+ *
+ * @param handle   Valid emulator handle.
+ * @param col      Tile column index.
+ * @param row      Tile row index.
+ * @param reg_addr Register offset within the tile (20-bit).
+ * @param value    Value to write.
+ * @return 0 on success, negative on error.
+ */
+int32_t xdna_emu_write_register(
+    XdnaEmuHandle* handle,
+    uint16_t col,
+    uint16_t row,
+    uint32_t reg_addr,
+    uint32_t value
+);
+
+/**
+ * Read bytes from a tile's local data memory.
+ *
+ * @param handle Valid emulator handle.
+ * @param col    Tile column index.
+ * @param row    Tile row index.
+ * @param offset Byte offset within tile data memory.
+ * @param size   Number of bytes to read.
+ * @param out    Pointer to buffer to receive data (at least size bytes).
+ * @return 0 on success, negative on error.
+ */
+int32_t xdna_emu_read_tile_memory(
+    XdnaEmuHandle* handle,
+    uint16_t col,
+    uint16_t row,
+    uint32_t offset,
+    uint32_t size,
+    uint8_t* out
+);
+
+/**
+ * Write bytes to a tile's local data memory.
+ *
+ * @param handle Valid emulator handle.
+ * @param col    Tile column index.
+ * @param row    Tile row index.
+ * @param offset Byte offset within tile data memory.
+ * @param size   Number of bytes to write.
+ * @param data   Pointer to data to write (at least size bytes).
+ * @return 0 on success, negative on error.
+ */
+int32_t xdna_emu_write_tile_memory(
+    XdnaEmuHandle* handle,
+    uint16_t col,
+    uint16_t row,
+    uint32_t offset,
+    uint32_t size,
+    const uint8_t* data
+);
+
+/**
  * Get the last error message (for debugging).
  *
  * @param buffer Buffer to receive error message.

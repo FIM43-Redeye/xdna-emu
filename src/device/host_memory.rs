@@ -224,6 +224,18 @@ impl HostMemory {
         &self.regions
     }
 
+    /// Remove a region by its base address.
+    ///
+    /// Returns true if a region was found and removed, false otherwise.
+    /// Note: this does NOT deallocate the underlying pages. Sparse pages
+    /// remain in the BTreeMap but are harmless (they'll be overwritten if
+    /// the address range is reused).
+    pub fn free_region(&mut self, base_address: u64) -> bool {
+        let before = self.regions.len();
+        self.regions.retain(|r| r.base_address != base_address);
+        self.regions.len() < before
+    }
+
     /// Get or create a page for the given address.
     fn get_or_create_page(&mut self, addr: u64) -> &mut [u8; Self::PAGE_SIZE] {
         let page_addr = addr & Self::PAGE_MASK;

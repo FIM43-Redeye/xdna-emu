@@ -31,6 +31,9 @@ pub struct XdnaEmuHandle {
     xclbin_path: Option<String>,
     npu_executor: NpuExecutor,
     max_cycles: u64,
+    /// Next address to allocate for xdna_emu_alloc_buffer.
+    /// Starts at a high address to avoid conflicts with user-specified regions.
+    next_alloc_addr: u64,
 }
 
 /// Result codes for FFI operations.
@@ -75,6 +78,9 @@ pub unsafe extern "C" fn xdna_emu_create() -> *mut XdnaEmuHandle {
         xclbin_path: None,
         npu_executor: NpuExecutor::new(),
         max_cycles: 100000,
+        // Start auto-allocation at 0x8000_0000_0000 to avoid conflicts
+        // with user-specified host regions (typically < 0x1_0000_0000).
+        next_alloc_addr: 0x8000_0000_0000,
     });
 
     Box::into_raw(handle)
@@ -571,9 +577,495 @@ pub unsafe extern "C" fn xdna_emu_get_error(
     0
 }
 
+/// Allocate a host memory buffer of the given size.
+///
+/// Returns a page-aligned base address (u64) on success, or 0 on failure.
+/// The address is automatically assigned from an internal allocator and
+/// registered with the emulator's host memory system.
+///
+/// # Safety
+/// - `handle` must be valid
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_alloc_buffer(
+    handle: *mut XdnaEmuHandle,
+    size: u64,
+) -> u64 {
+    if handle.is_null() || size == 0 {
+        return 0;
+    }
+
+    let handle = &mut *handle;
+
+    // Round size up to page boundary (4096 bytes).
+    let page_size: u64 = 4096;
+    let aligned_size = (size + page_size - 1) & !(page_size - 1);
+
+    // The address is already page-aligned because next_alloc_addr starts
+    // page-aligned and we always advance by page-aligned sizes.
+    let addr = handle.next_alloc_addr;
+
+    let host_mem = handle.engine.host_memory_mut();
+    let name = format!("alloc_{:x}", addr);
+    if host_mem.allocate_region(&name, addr, aligned_size as usize).is_err() {
+        log::error!("Failed to allocate buffer at 0x{:x} size {}", addr, aligned_size);
+        return 0;
+    }
+
+    // Also register with NPU executor for address patching.
+    handle.npu_executor.add_host_buffer(addr, aligned_size as usize);
+
+    handle.next_alloc_addr = addr + aligned_size;
+
+    log::debug!("Allocated buffer at 0x{:x} size {}", addr, aligned_size);
+    addr
+}
+
+/// Free a previously allocated host memory buffer.
+///
+/// Removes the region from host memory tracking. The underlying sparse
+/// pages are not deallocated (they will be reclaimed when the emulator
+/// handle is destroyed).
+///
+/// # Safety
+/// - `handle` must be valid
+/// - `addr` should be a value previously returned by `xdna_emu_alloc_buffer`
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_free_buffer(
+    handle: *mut XdnaEmuHandle,
+    addr: u64,
+) {
+    if handle.is_null() {
+        return;
+    }
+
+    let handle = &mut *handle;
+    let host_mem = handle.engine.host_memory_mut();
+    if !host_mem.free_region(addr) {
+        log::warn!("free_buffer: no region at 0x{:x}", addr);
+    } else {
+        log::debug!("Freed buffer at 0x{:x}", addr);
+    }
+}
+
+/// Read a 32-bit register from a specific tile.
+///
+/// Uses the AIE address encoding to locate the tile and read the register
+/// at the given offset within that tile.
+///
+/// # Safety
+/// - `handle` must be valid
+///
+/// # Returns
+/// The register value, or 0 if the tile coordinates are out of bounds.
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_read_register(
+    handle: *mut XdnaEmuHandle,
+    col: u16,
+    row: u16,
+    reg_addr: u32,
+) -> u32 {
+    if handle.is_null() {
+        return 0;
+    }
+
+    let handle = &mut *handle;
+    let device = handle.engine.device_mut();
+
+    if let Some(tile) = device.tile_mut(col as usize, row as usize) {
+        tile.read_register(reg_addr)
+    } else {
+        log::warn!("read_register: tile ({}, {}) out of bounds", col, row);
+        0
+    }
+}
+
+/// Write a 32-bit value to a tile register.
+///
+/// Uses the AIE address encoding to locate the tile and write the value
+/// at the given offset within that tile.
+///
+/// # Safety
+/// - `handle` must be valid
+///
+/// # Returns
+/// 0 on success, -1 if the handle is invalid, -2 if the tile is out of bounds.
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_write_register(
+    handle: *mut XdnaEmuHandle,
+    col: u16,
+    row: u16,
+    reg_addr: u32,
+    value: u32,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+
+    let handle = &mut *handle;
+    let device = handle.engine.device_mut();
+
+    if let Some(tile) = device.tile_mut(col as usize, row as usize) {
+        tile.write_register(reg_addr, value);
+        0
+    } else {
+        log::warn!("write_register: tile ({}, {}) out of bounds", col, row);
+        -2
+    }
+}
+
+/// Read bytes from a tile's local data memory.
+///
+/// Copies `size` bytes starting at `offset` within the tile's data memory
+/// into the caller-provided `out` buffer.
+///
+/// # Safety
+/// - `handle` must be valid
+/// - `out` must point to at least `size` bytes
+///
+/// # Returns
+/// 0 on success, -1 if handle is invalid, -2 if tile is out of bounds,
+/// -3 if the read would exceed memory bounds, -4 if `out` is null.
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_read_tile_memory(
+    handle: *mut XdnaEmuHandle,
+    col: u16,
+    row: u16,
+    offset: u32,
+    size: u32,
+    out: *mut u8,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    if out.is_null() && size > 0 {
+        return -4;
+    }
+
+    let handle = &mut *handle;
+    let device = handle.engine.device_mut();
+
+    let tile = match device.tile_mut(col as usize, row as usize) {
+        Some(t) => t,
+        None => {
+            log::warn!("read_tile_memory: tile ({}, {}) out of bounds", col, row);
+            return -2;
+        }
+    };
+
+    let mem = tile.data_memory();
+    let start = offset as usize;
+    let end = start + size as usize;
+
+    if end > mem.len() {
+        log::warn!(
+            "read_tile_memory: offset {} + size {} exceeds memory size {}",
+            offset, size, mem.len()
+        );
+        return -3;
+    }
+
+    let out_slice = slice::from_raw_parts_mut(out, size as usize);
+    out_slice.copy_from_slice(&mem[start..end]);
+    0
+}
+
+/// Write bytes to a tile's local data memory.
+///
+/// Copies `size` bytes from the caller-provided `data` buffer into the
+/// tile's data memory starting at `offset`.
+///
+/// # Safety
+/// - `handle` must be valid
+/// - `data` must point to at least `size` bytes
+///
+/// # Returns
+/// 0 on success, -1 if handle is invalid, -2 if tile is out of bounds,
+/// -3 if the write would exceed memory bounds, -4 if `data` is null.
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_write_tile_memory(
+    handle: *mut XdnaEmuHandle,
+    col: u16,
+    row: u16,
+    offset: u32,
+    size: u32,
+    data: *const u8,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    if data.is_null() && size > 0 {
+        return -4;
+    }
+
+    let handle = &mut *handle;
+    let device = handle.engine.device_mut();
+
+    let tile = match device.tile_mut(col as usize, row as usize) {
+        Some(t) => t,
+        None => {
+            log::warn!("write_tile_memory: tile ({}, {}) out of bounds", col, row);
+            return -2;
+        }
+    };
+
+    let data_slice = slice::from_raw_parts(data, size as usize);
+    if !tile.write_data(offset as usize, data_slice) {
+        log::warn!(
+            "write_tile_memory: offset {} + size {} exceeds memory bounds",
+            offset, size
+        );
+        return -3;
+    }
+
+    0
+}
+
 /// Get version information.
 #[no_mangle]
 pub extern "C" fn xdna_emu_version() -> u32 {
     // Version 0.1.0 = 0x000100
     0x000100
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: create a handle, run a closure, then destroy it.
+    unsafe fn with_handle(f: impl FnOnce(*mut XdnaEmuHandle)) {
+        let handle = xdna_emu_create();
+        assert!(!handle.is_null(), "xdna_emu_create returned null");
+        f(handle);
+        xdna_emu_destroy(handle);
+    }
+
+    #[test]
+    fn test_alloc_buffer_returns_page_aligned_address() {
+        unsafe {
+            with_handle(|h| {
+                let addr = xdna_emu_alloc_buffer(h, 1024);
+                assert_ne!(addr, 0, "alloc_buffer should return non-zero");
+                assert_eq!(addr % 4096, 0, "address should be page-aligned");
+            });
+        }
+    }
+
+    #[test]
+    fn test_alloc_buffer_successive_non_overlapping() {
+        unsafe {
+            with_handle(|h| {
+                let a1 = xdna_emu_alloc_buffer(h, 4096);
+                let a2 = xdna_emu_alloc_buffer(h, 8192);
+                assert_ne!(a1, 0);
+                assert_ne!(a2, 0);
+                assert_ne!(a1, a2, "successive allocations must not overlap");
+                // Second allocation should come after first.
+                assert!(a2 >= a1 + 4096);
+            });
+        }
+    }
+
+    #[test]
+    fn test_alloc_buffer_rounds_up_size() {
+        unsafe {
+            with_handle(|h| {
+                // Allocating 1 byte should still consume a full page.
+                let a1 = xdna_emu_alloc_buffer(h, 1);
+                let a2 = xdna_emu_alloc_buffer(h, 1);
+                assert_eq!(a2 - a1, 4096, "1-byte alloc should round up to 4096");
+            });
+        }
+    }
+
+    #[test]
+    fn test_alloc_buffer_zero_size_returns_zero() {
+        unsafe {
+            with_handle(|h| {
+                let addr = xdna_emu_alloc_buffer(h, 0);
+                assert_eq!(addr, 0, "zero-size alloc should return 0");
+            });
+        }
+    }
+
+    #[test]
+    fn test_alloc_buffer_null_handle() {
+        unsafe {
+            let addr = xdna_emu_alloc_buffer(std::ptr::null_mut(), 4096);
+            assert_eq!(addr, 0, "null handle should return 0");
+        }
+    }
+
+    #[test]
+    fn test_free_buffer() {
+        unsafe {
+            with_handle(|h| {
+                let addr = xdna_emu_alloc_buffer(h, 4096);
+                assert_ne!(addr, 0);
+                // Should not panic or error.
+                xdna_emu_free_buffer(h, addr);
+                // Freeing a non-existent address should be a no-op (just logs).
+                xdna_emu_free_buffer(h, 0xDEAD_BEEF);
+            });
+        }
+    }
+
+    #[test]
+    fn test_alloc_buffer_read_write_roundtrip() {
+        unsafe {
+            with_handle(|h| {
+                let addr = xdna_emu_alloc_buffer(h, 256);
+                assert_ne!(addr, 0);
+
+                // Write data through host memory interface.
+                let data: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+                let result = xdna_emu_write_host_memory(h, addr, data.as_ptr(), 16);
+                assert_eq!(result, XdnaEmuResult::Success);
+
+                // Read it back.
+                let mut buf = [0u8; 16];
+                let result = xdna_emu_read_host_memory(h, addr, buf.as_mut_ptr(), 16);
+                assert_eq!(result, XdnaEmuResult::Success);
+                assert_eq!(buf, data);
+            });
+        }
+    }
+
+    #[test]
+    fn test_read_register_valid_tile() {
+        unsafe {
+            with_handle(|h| {
+                // Write a known value to a lock register on tile (0, 2).
+                // Lock_Value registers for compute tiles start at 0x1F100,
+                // spaced 16 bytes apart.
+                let lock_value_0 = 0x1F100u32; // Lock 0 value register
+
+                let rc = xdna_emu_write_register(h, 0, 2, lock_value_0, 0x42);
+                assert_eq!(rc, 0, "write_register should succeed");
+
+                let val = xdna_emu_read_register(h, 0, 2, lock_value_0);
+                assert_eq!(val, 0x42, "read back should match written value");
+            });
+        }
+    }
+
+    #[test]
+    fn test_write_register_out_of_bounds_tile() {
+        unsafe {
+            with_handle(|h| {
+                // Tile (99, 99) does not exist.
+                let rc = xdna_emu_write_register(h, 99, 99, 0x1F100, 0);
+                assert_eq!(rc, -2, "out-of-bounds tile should return -2");
+            });
+        }
+    }
+
+    #[test]
+    fn test_read_register_null_handle() {
+        unsafe {
+            let val = xdna_emu_read_register(std::ptr::null_mut(), 0, 2, 0x1F100);
+            assert_eq!(val, 0, "null handle should return 0");
+        }
+    }
+
+    #[test]
+    fn test_write_register_null_handle() {
+        unsafe {
+            let rc = xdna_emu_write_register(std::ptr::null_mut(), 0, 2, 0x1F100, 0);
+            assert_eq!(rc, -1, "null handle should return -1");
+        }
+    }
+
+    #[test]
+    fn test_tile_memory_write_read_roundtrip() {
+        unsafe {
+            with_handle(|h| {
+                // Tile (0, 2) is a compute tile with 64KB data memory.
+                let pattern: [u8; 8] = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE];
+
+                let rc = xdna_emu_write_tile_memory(h, 0, 2, 0, 8, pattern.as_ptr());
+                assert_eq!(rc, 0, "write_tile_memory should succeed");
+
+                let mut buf = [0u8; 8];
+                let rc = xdna_emu_read_tile_memory(h, 0, 2, 0, 8, buf.as_mut_ptr());
+                assert_eq!(rc, 0, "read_tile_memory should succeed");
+                assert_eq!(buf, pattern, "read should match written data");
+            });
+        }
+    }
+
+    #[test]
+    fn test_tile_memory_nonzero_offset() {
+        unsafe {
+            with_handle(|h| {
+                let data: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+                let offset = 1024u32;
+
+                let rc = xdna_emu_write_tile_memory(h, 0, 2, offset, 4, data.as_ptr());
+                assert_eq!(rc, 0);
+
+                let mut buf = [0u8; 4];
+                let rc = xdna_emu_read_tile_memory(h, 0, 2, offset, 4, buf.as_mut_ptr());
+                assert_eq!(rc, 0);
+                assert_eq!(buf, data);
+            });
+        }
+    }
+
+    #[test]
+    fn test_tile_memory_out_of_bounds() {
+        unsafe {
+            with_handle(|h| {
+                // Compute tile has 64KB (65536 bytes). Writing at offset 65535
+                // with size 2 should fail.
+                let data = [0u8; 2];
+                let rc = xdna_emu_write_tile_memory(h, 0, 2, 65535, 2, data.as_ptr());
+                assert_eq!(rc, -3, "exceeding bounds should return -3");
+
+                let mut buf = [0u8; 2];
+                let rc = xdna_emu_read_tile_memory(h, 0, 2, 65535, 2, buf.as_mut_ptr());
+                assert_eq!(rc, -3, "exceeding bounds should return -3");
+            });
+        }
+    }
+
+    #[test]
+    fn test_tile_memory_invalid_tile() {
+        unsafe {
+            with_handle(|h| {
+                let mut buf = [0u8; 4];
+                let rc = xdna_emu_read_tile_memory(h, 99, 99, 0, 4, buf.as_mut_ptr());
+                assert_eq!(rc, -2, "invalid tile should return -2");
+            });
+        }
+    }
+
+    #[test]
+    fn test_tile_memory_null_pointer() {
+        unsafe {
+            with_handle(|h| {
+                let rc = xdna_emu_read_tile_memory(h, 0, 2, 0, 4, std::ptr::null_mut());
+                assert_eq!(rc, -4, "null out pointer should return -4");
+
+                let rc = xdna_emu_write_tile_memory(h, 0, 2, 0, 4, std::ptr::null());
+                assert_eq!(rc, -4, "null data pointer should return -4");
+            });
+        }
+    }
+
+    #[test]
+    fn test_tile_memory_null_handle() {
+        unsafe {
+            let mut buf = [0u8; 4];
+            let rc = xdna_emu_read_tile_memory(
+                std::ptr::null_mut(), 0, 2, 0, 4, buf.as_mut_ptr(),
+            );
+            assert_eq!(rc, -1, "null handle should return -1");
+
+            let data = [0u8; 4];
+            let rc = xdna_emu_write_tile_memory(
+                std::ptr::null_mut(), 0, 2, 0, 4, data.as_ptr(),
+            );
+            assert_eq!(rc, -1, "null handle should return -1");
+        }
+    }
 }
