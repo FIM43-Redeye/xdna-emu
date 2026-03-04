@@ -35,6 +35,7 @@ public:
 
     void load_xclbin(const std::string& path,
                      uint8_t uuid_out[16]) override;
+    void load_pdi(const void* data, size_t size) override;
 
     uint64_t alloc_buffer(size_t size) override;
     void     free_buffer(uint64_t addr) override;
@@ -96,6 +97,7 @@ private:
     using fn_create             = XdnaEmuHandle* (*)();
     using fn_destroy            = void (*)(XdnaEmuHandle*);
     using fn_load_xclbin        = Result (*)(XdnaEmuHandle*, const char*, uint8_t*);
+    using fn_load_pdi           = Result (*)(XdnaEmuHandle*, const uint8_t*, uint64_t);
     using fn_alloc_host_region  = Result (*)(XdnaEmuHandle*, const char*,
                                              uint64_t, uint64_t);
     using fn_write_host_memory  = Result (*)(XdnaEmuHandle*, uint64_t,
@@ -157,6 +159,7 @@ private:
     fn_create             sym_create_             = nullptr;
     fn_destroy            sym_destroy_            = nullptr;
     fn_load_xclbin        sym_load_xclbin_        = nullptr;
+    fn_load_pdi           sym_load_pdi_           = nullptr;
     fn_alloc_host_region  sym_alloc_host_region_  = nullptr;
     fn_write_host_memory  sym_write_host_memory_  = nullptr;
     fn_read_host_memory   sym_read_host_memory_   = nullptr;

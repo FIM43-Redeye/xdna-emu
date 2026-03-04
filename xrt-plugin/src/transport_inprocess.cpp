@@ -89,6 +89,7 @@ emu_transport_inprocess::emu_transport_inprocess(const std::string& lib_path)
     sym_create_             = resolve_required<fn_create>("xdna_emu_create");
     sym_destroy_            = resolve_required<fn_destroy>("xdna_emu_destroy");
     sym_load_xclbin_        = resolve_required<fn_load_xclbin>("xdna_emu_load_xclbin");
+    sym_load_pdi_           = resolve_required<fn_load_pdi>("xdna_emu_load_pdi");
     sym_alloc_host_region_  = resolve_required<fn_alloc_host_region>("xdna_emu_alloc_host_region");
     sym_write_host_memory_  = resolve_required<fn_write_host_memory>("xdna_emu_write_host_memory");
     sym_read_host_memory_   = resolve_required<fn_read_host_memory>("xdna_emu_read_host_memory");
@@ -150,6 +151,14 @@ void emu_transport_inprocess::load_xclbin(const std::string& path,
 {
     Result rc = sym_load_xclbin_(emu_, path.c_str(), uuid_out);
     check(rc, "load_xclbin");
+}
+
+void emu_transport_inprocess::load_pdi(const void* data, size_t size)
+{
+    Result rc = sym_load_pdi_(emu_,
+                              static_cast<const uint8_t*>(data),
+                              static_cast<uint64_t>(size));
+    check(rc, "load_pdi");
 }
 
 // ---------------------------------------------------------------------------

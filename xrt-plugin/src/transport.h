@@ -25,6 +25,9 @@ public:
     virtual void load_xclbin(const std::string& path,
                              uint8_t uuid_out[16]) = 0;
 
+    /// Load raw PDI data (CDO + ELFs) into the emulator.
+    virtual void load_pdi(const void* data, size_t size) = 0;
+
     // -- Buffer management ---------------------------------------------------
 
     /// Allocate a host-visible buffer.  Returns the device address.

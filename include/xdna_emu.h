@@ -69,6 +69,23 @@ XdnaEmuResult xdna_emu_load_xclbin(
 );
 
 /**
+ * Load a raw PDI (Programmable Device Image) into the emulator.
+ *
+ * The PDI contains a CDO stream that configures DMA descriptors, routing,
+ * and loads ELF programs via blockwrite instructions.
+ *
+ * @param handle   Valid emulator handle.
+ * @param pdi_data Pointer to raw PDI data.
+ * @param pdi_size Size of PDI data in bytes.
+ * @return XDNA_EMU_SUCCESS on success.
+ */
+XdnaEmuResult xdna_emu_load_pdi(
+    XdnaEmuHandle* handle,
+    const uint8_t* pdi_data,
+    uint64_t pdi_size
+);
+
+/**
  * Allocate a region in host memory.
  *
  * @param handle Valid emulator handle.

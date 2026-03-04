@@ -256,6 +256,62 @@ pub unsafe extern "C" fn xdna_emu_load_xclbin(
     XdnaEmuResult::Success
 }
 
+/// Load a raw PDI (Programmable Device Image) into the emulator.
+///
+/// The PDI contains a CDO stream that configures DMA descriptors, routing,
+/// and loads ELF programs via blockwrite instructions.  This is the same
+/// data that `load_xclbin` extracts from the xclbin container -- this
+/// entry point lets the XRT bridge pass PDI data directly without needing
+/// a file path.
+///
+/// # Safety
+/// - `handle` must be valid
+/// - `pdi_data` must point to at least `pdi_size` bytes
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_load_pdi(
+    handle: *mut XdnaEmuHandle,
+    pdi_data: *const u8,
+    pdi_size: u64,
+) -> XdnaEmuResult {
+    if handle.is_null() {
+        return XdnaEmuResult::InvalidHandle;
+    }
+    if pdi_data.is_null() && pdi_size > 0 {
+        return XdnaEmuResult::NullPointer;
+    }
+
+    let handle = &mut *handle;
+    let data = slice::from_raw_parts(pdi_data, pdi_size as usize);
+
+    // Find CDO offset within the PDI.  Some PDIs have a bootgen header,
+    // others are raw CDO data.  Try the header search first, then fall
+    // back to parsing from offset 0.
+    let cdo_offset = find_cdo_offset(data).unwrap_or(0);
+
+    // Parse CDO.
+    let cdo = match Cdo::parse(&data[cdo_offset..]) {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("Failed to parse CDO from PDI ({} bytes, offset {}): {}",
+                        pdi_size, cdo_offset, e);
+            // Log first 16 bytes for debugging.
+            if data.len() >= 16 {
+                log::error!("  PDI header: {:02x?}", &data[..16]);
+            }
+            return XdnaEmuResult::ParseError;
+        }
+    };
+
+    // Apply CDO to device.
+    if let Err(e) = handle.engine.device_mut().apply_cdo(&cdo) {
+        log::error!("Failed to apply CDO from PDI: {}", e);
+        return XdnaEmuResult::ExecutionError;
+    }
+
+    log::info!("Loaded PDI ({} bytes, CDO at offset {})", pdi_size, cdo_offset);
+    XdnaEmuResult::Success
+}
+
 /// Allocate a region in host memory.
 ///
 /// # Safety
@@ -373,7 +429,7 @@ pub unsafe extern "C" fn xdna_emu_clear_host_buffers(
     }
 
     let handle = &mut *handle;
-    handle.npu_executor = NpuExecutor::new();
+    handle.npu_executor.set_host_buffers(Vec::new());
 
     XdnaEmuResult::Success
 }

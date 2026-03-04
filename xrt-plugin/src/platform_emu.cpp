@@ -40,12 +40,14 @@ drv_open(const std::string& /*sysfs_name*/) const
     shim_err(errno, "drv_open: memfd_create failed");
 
   m_dev_fd = fd;
+  EMU_DBG("drv_open: memfd_create -> fd=%d", fd);
 }
 
 void
 platform_drv_emu::
 drv_close() const
 {
+  EMU_DBG("drv_close: m_dev_fd=%d", m_dev_fd);
   m_transport = nullptr;
 
   if (m_dev_fd >= 0) {
@@ -91,9 +93,9 @@ config_ctx_cu_config(shim_xdna::config_ctx_cu_config_arg& arg) const
 {
   // The conf_buf contains amdxdna_hwctx_param_config_cu: a count of CUs
   // followed by per-CU entries (cu_bo handle + cu_func).  On real hardware,
-  // this pushes PDI data to firmware.  The emulator receives kernels through
-  // load_xclbin(), so CU config is informational -- but we log and track it
-  // for debugging and future use (e.g., control packet routing).
+  // this pushes PDI data to firmware.  For the emulator, we read the PDI
+  // data from each CU's BO and load it -- the PDI contains the CDO stream
+  // that configures DMA descriptors, routing, and core ELF programs.
 
   if (arg.conf_buf.size() < sizeof(amdxdna_hwctx_param_config_cu))
     return;  // Malformed, nothing to do.
@@ -112,9 +114,36 @@ config_ctx_cu_config(shim_xdna::config_ctx_cu_config_arg& arg) const
     }
   }
 
+  // Load each CU's PDI into the emulator.
   for (uint16_t i = 0; i < conf->num_cus; i++) {
     auto& cu = conf->cu_configs[i];
     shim_debug("  CU[%u]: bo=%u func=%u", i, cu.cu_bo, cu.cu_func);
+
+    if (!m_transport)
+      continue;
+
+    // The PDI BO was synced to the emulator's host memory by the
+    // hwctx_kmq constructor (sync host2device).  Read it back from
+    // the emulator to get the raw PDI bytes.
+    bo_entry entry{};
+    {
+      const std::lock_guard<std::mutex> lock(m_bo_lock);
+      auto it = m_bo_map.find(cu.cu_bo);
+      if (it == m_bo_map.end())
+        continue;
+      entry = it->second;
+    }
+
+    if (entry.size == 0)
+      continue;
+
+    std::vector<uint8_t> pdi_data(entry.size);
+    m_transport->read_memory(entry.dev_addr, pdi_data.data(), entry.size);
+
+    EMU_INFO("config_ctx_cu_config: loading PDI from BO %u "
+             "(dev=0x%" PRIx64 " size=%zu)", cu.cu_bo, entry.dev_addr, entry.size);
+
+    m_transport->load_pdi(pdi_data.data(), pdi_data.size());
   }
 }
 
@@ -182,6 +211,7 @@ create_bo(shim_xdna::bo_info& arg) const
 
   // Store in the base class BO info map for later lookup.
   save_bo_info(handle, arg);
+
 }
 
 void
