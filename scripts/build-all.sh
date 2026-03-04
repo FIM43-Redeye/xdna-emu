@@ -12,9 +12,16 @@
 # Prerequisites:
 #   - GCC 14 or 15 (NOT 13 -- aietools must not shadow it)
 #   - cmake, ninja or make, boost headers
-#   - sudo for deb installation (will prompt for fingerprint once)
+#   - pkexec for privileged installation steps
+#
+# Install prefix:
+#   Everything installs to /opt/xilinx/xrt.  XRT's build.sh sets this
+#   automatically; the xdna plugin and emulator plugin must be told
+#   explicitly via CMAKE_INSTALL_PREFIX.
 
 set -euo pipefail
+
+XRT_PREFIX="/opt/xilinx/xrt"
 
 EMU_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 XDNA_DRIVER="$EMU_ROOT/xdna-driver"
@@ -62,6 +69,7 @@ echo "=== build-all.sh ==="
 echo "  GCC:          $(gcc --version | head -1)"
 echo "  EMU_ROOT:     $EMU_ROOT"
 echo "  XDNA_DRIVER:  $XDNA_DRIVER"
+echo "  XRT_PREFIX:   $XRT_PREFIX"
 echo "  JOBS:         $JOBS"
 echo "  BUILD_XRT:    $BUILD_XRT"
 echo ""
@@ -89,23 +97,17 @@ echo ""
 # -- 2. Build XRT ------------------------------------------------------------
 
 if $BUILD_XRT; then
-  echo "--- Building XRT (Release) ---"
-  mkdir -p "$XRT_BUILD"
-  if [ ! -f "$XRT_BUILD/Makefile" ]; then
-    echo "  Configuring..."
-    (cd "$XRT_BUILD" && cmake "$XRT_SRC" -DCMAKE_BUILD_TYPE=Release)
-  fi
-  nice -n 19 make -C "$XRT_BUILD" -j"$JOBS"
+  echo "--- Building XRT (Release, NPU split packages) ---"
+  # Use XRT's own build.sh which sets CMAKE_INSTALL_PREFIX=/opt/xilinx/xrt,
+  # enables the NPU component split (xrt-base, xrt-base-dev, xrt-npu),
+  # and handles all the cmake flags correctly.
+  (cd "$XRT_SRC/build" && nice -n 19 bash build.sh -npu -noctest -j "$JOBS")
   echo ""
 
-  echo "--- Packaging XRT debs ---"
-  nice -n 19 make -C "$XRT_BUILD" -j"$JOBS" package
-  echo ""
-
-  echo "--- Installing XRT debs (sudo required) ---"
-  debs=("$XRT_BUILD"/xrt_*-amd64-*.deb)
+  echo "--- Installing XRT debs ---"
+  debs=("$XRT_BUILD"/xrt_*-amd64-base.deb "$XRT_BUILD"/xrt_*-amd64-base-dev.deb "$XRT_BUILD"/xrt_*-amd64-npu.deb)
   if [ ${#debs[@]} -gt 0 ]; then
-    sudo dpkg -i "${debs[@]}"
+    pkexec dpkg -i "${debs[@]}"
   else
     echo "  WARNING: No debs found, skipping install"
   fi
@@ -118,7 +120,9 @@ echo "--- Building xdna driver plugin (Release) ---"
 mkdir -p "$XDNA_BUILD"
 if [ ! -f "$XDNA_BUILD/Makefile" ]; then
   echo "  Configuring..."
-  (cd "$XDNA_BUILD" && cmake "$XDNA_DRIVER" -DCMAKE_BUILD_TYPE=Release)
+  (cd "$XDNA_BUILD" && cmake "$XDNA_DRIVER" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$XRT_PREFIX")
 fi
 nice -n 19 make -C "$XDNA_BUILD" -j"$JOBS"
 echo ""
@@ -127,10 +131,10 @@ echo "--- Packaging xdna plugin deb ---"
 nice -n 19 make -C "$XDNA_BUILD" -j"$JOBS" package
 echo ""
 
-echo "--- Installing xdna plugin (sudo required) ---"
+echo "--- Installing xdna plugin ---"
 xdna_debs=("$XDNA_BUILD"/xrt_plugin*.deb)
 if [ ${#xdna_debs[@]} -gt 0 ]; then
-  sudo dpkg -i "${xdna_debs[@]}"
+  pkexec dpkg -i "${xdna_debs[@]}"
 else
   echo "  WARNING: No xdna plugin debs found, skipping install"
 fi
@@ -150,13 +154,17 @@ mkdir -p "$PLUGIN_BUILD"
 nice -n 19 make -C "$PLUGIN_BUILD" -j"$JOBS"
 echo ""
 
-echo "--- Installing emulator plugin (sudo required) ---"
-emu_so="$PLUGIN_BUILD/libxrt_driver_emu.so.2.21.0"
-if [ -f "$emu_so" ]; then
-  sudo cp "$emu_so" /opt/xilinx/xrt/lib/
-  sudo ldconfig /opt/xilinx/xrt/lib/
+echo "--- Installing emulator libraries ---"
+emu_plugin="$PLUGIN_BUILD/libxrt_driver_emu.so.2.21.0"
+emu_lib="$EMU_ROOT/target/release/libxdna_emu.so"
+install_files=""
+[ -f "$emu_plugin" ] && install_files="$install_files '$emu_plugin'"
+[ -f "$emu_lib" ]    && install_files="$install_files '$emu_lib'"
+
+if [ -n "$install_files" ]; then
+  eval pkexec sh -c "\"cp $install_files '$XRT_PREFIX/lib/' && ldconfig '$XRT_PREFIX/lib/'\""
 else
-  echo "  WARNING: emulator plugin not found at $emu_so"
+  echo "  WARNING: no emulator libraries found to install"
 fi
 echo ""
 
