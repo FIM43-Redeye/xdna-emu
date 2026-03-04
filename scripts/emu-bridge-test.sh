@@ -589,22 +589,46 @@ trace_one_test() {
       return
     fi
 
-    # Step 3: Run on hardware (if enabled)
+    # Step 3+4: Run HW and EMU concurrently.
+    # HW is I/O-bound (NPU), EMU is CPU-bound -- no contention.
+    local hw_dir="$trace_dir/hw"
+    local emu_dir="$trace_dir/emu"
+    local hw_ok=true emu_ok=true
+
+    # Launch EMU in background
+    (
+      XDNA_EMU=1 XRT_DEVICE_BDF="ffff:ff:1f.0" \
+        python3 "$tools_dir/trace-run.py" "$manifest" -o "$emu_dir" \
+        >> "$log_file.emu" 2>&1
+    ) &
+    local emu_pid=$!
+
+    # Run HW in foreground (with cooldown after)
     if [[ "$RUN_HW" == "true" ]]; then
-      local hw_dir="$trace_dir/hw"
       if ! python3 "$tools_dir/trace-run.py" "$manifest" -o "$hw_dir" \
-          >> "$log_file" 2>&1; then
-        echo "ERROR hw_run_failed" > "$summary_file"
-        echo "  TRACE $name: ERROR (hw run failed)"
-        return
+          >> "$log_file.hw" 2>&1; then
+        hw_ok=false
       fi
+      # Cooldown: let driver settle before next test's HW run
+      sleep 2
     fi
 
-    # Step 4: Run on emulator
-    local emu_dir="$trace_dir/emu"
-    if ! XDNA_EMU=1 XRT_DEVICE_BDF="ffff:ff:1f.0" \
-        python3 "$tools_dir/trace-run.py" "$manifest" -o "$emu_dir" \
-        >> "$log_file" 2>&1; then
+    # Wait for EMU
+    if ! wait "$emu_pid"; then
+      emu_ok=false
+    fi
+
+    # Merge sub-logs
+    cat "$log_file.hw" >> "$log_file" 2>/dev/null || true
+    cat "$log_file.emu" >> "$log_file" 2>/dev/null || true
+    rm -f "$log_file.hw" "$log_file.emu"
+
+    if ! $hw_ok && [[ "$RUN_HW" == "true" ]]; then
+      echo "ERROR hw_run_failed" > "$summary_file"
+      echo "  TRACE $name: ERROR (hw run failed)"
+      return
+    fi
+    if ! $emu_ok; then
       echo "ERROR emu_run_failed" > "$summary_file"
       echo "  TRACE $name: ERROR (emu run failed)"
       return
@@ -990,6 +1014,10 @@ main() {
 
     if [[ ${#trace_targets[@]} -gt 0 ]]; then
       info "Phase 4b: Trace comparison for ${#trace_targets[@]} test(s) (mode=$trace_mode_arg)"
+      # Each trace_one_test internally runs HW serial + EMU parallel via
+      # trace-sweep.py. We run tests serially here because each test's HW
+      # runs need the NPU exclusively. The EMU runs within each test are
+      # already parallelized.
       for name in "${trace_targets[@]}"; do
         trace_one_test "$name" "$trace_mode_arg"
       done

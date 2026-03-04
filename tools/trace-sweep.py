@@ -187,23 +187,18 @@ def compile_base_trace(
     return traced_dir, manifest_path
 
 
-def run_patched_batch(
+def prepare_batch(
     batch_idx: int,
     core_batch: list[str],
     mem_batch: list[str],
     base_dir: Path,
     manifest_path: Path,
     output_dir: Path,
-    run_hw: bool,
-    run_emu: bool,
 ) -> dict:
-    """Run one batch by patching insts.bin events (no recompile).
+    """Prepare one batch directory: copy+patch insts.bin, write manifest.
 
-    The base xclbin and insts.bin were compiled once by compile_base_trace().
-    This function:
-    1. Copies insts.bin from base_dir to batch_dir
-    2. Patches Trace_Event0/Event1 register writes for the batch's events
-    3. Runs HW and/or EMU using the patched insts + original xclbin
+    Returns a batch info dict with paths. Does NOT run anything -- the caller
+    decides whether to run HW (serial) and/or EMU (parallel) separately.
     """
     import shutil
 
@@ -257,45 +252,85 @@ def run_patched_batch(
     )
     if patch_result.returncode != 0:
         print(f"    Patch failed: {patch_result.stderr}", file=sys.stderr)
-        # Fall back: batch still has the base events, run anyway
-        print(f"    (running with base events instead)")
+        print(f"    (will run with base events instead)")
 
-    # Run
+    return {
+        "batch": batch_idx,
+        "status": "ok",
+        "events": events_config,
+        "manifest": str(batch_manifest),
+        "batch_dir": str(batch_dir),
+    }
+
+
+def trim_trace_dir(path: Path):
+    """Trim all trace_raw.bin files under a directory."""
+    script_dir = Path(__file__).parent
+    trim_script = script_dir / "trace-trim.py"
+    if trim_script.exists():
+        subprocess.run(
+            [sys.executable, str(trim_script), "--dir", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+
+
+def run_batch_hw(batch_info: dict, hw_cooldown: float = 2.0) -> dict:
+    """Run one batch on hardware (serial, with cooldown)."""
+    import time
+
+    script_dir = Path(__file__).parent
     trace_run = script_dir / "trace-run.py"
-    batch_result = {"batch": batch_idx, "status": "ok", "events": events_config}
+    batch_idx = batch_info["batch"]
+    batch_dir = Path(batch_info["batch_dir"])
+    manifest = batch_info["manifest"]
 
-    if run_hw:
-        hw_dir = batch_dir / "hw"
-        print(f"  Batch {batch_idx}: running on hardware...")
-        hw_result = subprocess.run(
-            [sys.executable, str(trace_run), str(batch_manifest), "-o", str(hw_dir)],
-            capture_output=True, text=True, timeout=300,
-        )
-        if hw_result.returncode != 0:
-            batch_result["hw_status"] = "failed"
-            (batch_dir / "hw-run.log").write_text(hw_result.stdout + hw_result.stderr)
-        else:
-            batch_result["hw_status"] = "ok"
-            batch_result["hw_trace"] = str(hw_dir / "trace.json")
+    hw_dir = batch_dir / "hw"
+    print(f"  Batch {batch_idx}: running on hardware...")
+    hw_result = subprocess.run(
+        [sys.executable, str(trace_run), str(manifest), "-o", str(hw_dir)],
+        capture_output=True, text=True, timeout=300,
+    )
+    if hw_result.returncode != 0:
+        batch_info["hw_status"] = "failed"
+        (batch_dir / "hw-run.log").write_text(hw_result.stdout + hw_result.stderr)
+    else:
+        batch_info["hw_status"] = "ok"
+        batch_info["hw_trace"] = str(hw_dir / "trace.json")
+        trim_trace_dir(hw_dir)
 
-    if run_emu:
-        emu_dir = batch_dir / "emu"
-        print(f"  Batch {batch_idx}: running on emulator...")
-        env = os.environ.copy()
-        env["XDNA_EMU"] = "1"
-        emu_result = subprocess.run(
-            [sys.executable, str(trace_run), str(batch_manifest), "-o", str(emu_dir)],
-            capture_output=True, text=True, timeout=300,
-            env=env,
-        )
-        if emu_result.returncode != 0:
-            batch_result["emu_status"] = "failed"
-            (batch_dir / "emu-run.log").write_text(emu_result.stdout + emu_result.stderr)
-        else:
-            batch_result["emu_status"] = "ok"
-            batch_result["emu_trace"] = str(emu_dir / "trace.json")
+    # Cooldown: let the driver settle before the next context creation
+    if hw_cooldown > 0:
+        time.sleep(hw_cooldown)
 
-    return batch_result
+    return batch_info
+
+
+def run_batch_emu(batch_info: dict) -> dict:
+    """Run one batch on the emulator (safe to parallelize)."""
+    script_dir = Path(__file__).parent
+    trace_run = script_dir / "trace-run.py"
+    batch_idx = batch_info["batch"]
+    batch_dir = Path(batch_info["batch_dir"])
+    manifest = batch_info["manifest"]
+
+    emu_dir = batch_dir / "emu"
+    print(f"  Batch {batch_idx}: running on emulator...")
+    env = os.environ.copy()
+    env["XDNA_EMU"] = "1"
+    emu_result = subprocess.run(
+        [sys.executable, str(trace_run), str(manifest), "-o", str(emu_dir)],
+        capture_output=True, text=True, timeout=300,
+        env=env,
+    )
+    if emu_result.returncode != 0:
+        batch_info["emu_status"] = "failed"
+        (batch_dir / "emu-run.log").write_text(emu_result.stdout + emu_result.stderr)
+    else:
+        batch_info["emu_status"] = "ok"
+        batch_info["emu_trace"] = str(emu_dir / "trace.json")
+        trim_trace_dir(emu_dir)
+
+    return batch_info
 
 
 def main():
@@ -317,6 +352,14 @@ def main():
     parser.add_argument(
         "--trace-size", type=int, default=1048576,
         help="Trace buffer size per batch (default: 1MB)",
+    )
+    parser.add_argument(
+        "--hw-cooldown", type=float, default=2.0,
+        help="Seconds between hardware runs to let the driver settle (default: 2)",
+    )
+    parser.add_argument(
+        "--emu-jobs", type=int, default=0,
+        help="Parallel emulator jobs (default: nproc)",
     )
     parser.add_argument(
         "--core-only", action="store_true",
@@ -366,15 +409,49 @@ def main():
         sys.exit(1)
     print()
 
-    # Run all batches (patch events, no recompile)
-    results = []
+    # Prepare all batches (patch insts.bin, no execution yet)
+    batches = []
     for i in range(num_batches):
-        result = run_patched_batch(
+        info = prepare_batch(
             i, core_batches[i], mem_batches[i],
             base_dir, base_manifest, output_dir,
-            run_hw=not args.no_hw, run_emu=not args.no_emu,
         )
-        results.append(result)
+        batches.append(info)
+    print()
+
+    # Run HW (serial + cooldown) and EMU (parallel) simultaneously.
+    # HW runs are I/O-bound (waiting on NPU), EMU runs are CPU-bound.
+    # No conflicts: each writes to its own hw/ or emu/ subdirectory.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    runnable = [b for b in batches if b["status"] == "ok"]
+    emu_jobs = args.emu_jobs if args.emu_jobs > 0 else os.cpu_count() or 4
+
+    def hw_serial_runner():
+        """Run all HW batches serially with cooldown."""
+        for b in runnable:
+            run_batch_hw(b, hw_cooldown=args.hw_cooldown)
+
+    with ThreadPoolExecutor(max_workers=emu_jobs + 1) as pool:
+        # One thread drives all serial HW runs
+        hw_future = None
+        if not args.no_hw:
+            print(f"  HW:  {len(runnable)} batches (serial, {args.hw_cooldown}s cooldown)")
+            hw_future = pool.submit(hw_serial_runner)
+
+        # All EMU batches run in parallel across remaining threads
+        emu_futures = []
+        if not args.no_emu:
+            print(f"  EMU: {len(runnable)} batches (parallel, -j{emu_jobs})")
+            emu_futures = [pool.submit(run_batch_emu, b) for b in runnable]
+
+        # Wait for everything
+        for f in emu_futures:
+            f.result()
+        if hw_future:
+            hw_future.result()
+
+    print()
+    results = batches
 
     # Write sweep manifest
     sweep_manifest = {
