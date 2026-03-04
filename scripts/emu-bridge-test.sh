@@ -240,33 +240,67 @@ compile_test() {
 
   mkdir -p "$build_dir"
 
-  # Check if already compiled (xclbin + test.exe both present).
-  if [[ -f "$build_dir/aie.xclbin" ]] && [[ -f "$build_dir/test.exe" ]] && ! $FORCE_COMPILE; then
-    return 0
-  fi
-
-  info "Compiling: $name"
-
   local log_file="$RESULTS_DIR/${name//\//_}_compile.log"
-
-  # Prepare architecture MLIR (NPUDEVICE substitution).
-  local npu_dev
-  npu_dev="$(get_npu_device "$src_dir")"
-  if [[ -f "$src_dir/aie.mlir" ]]; then
-    cp "$src_dir/aie.mlir" "$build_dir/aie_arch.mlir"
-    sed "s/NPUDEVICE/${npu_dev}/g" -i "$build_dir/aie_arch.mlir"
-  fi
-
-  # Extract and execute all build commands from run.lit.
   local lit_file="$src_dir/run.lit"
   if [[ ! -f "$lit_file" ]]; then
     err "No run.lit found for $name"
     return 1
   fi
 
+  # --- xclbin build (expensive, skip if cached) --------------------------
+
+  local have_xclbin=false
+  if [[ -f "$build_dir/aie.xclbin" ]] || ls "$build_dir"/*.xclbin &>/dev/null; then
+    have_xclbin=true
+  fi
+
+  if ! $have_xclbin || $FORCE_COMPILE; then
+    info "Compiling: $name"
+
+    # Prepare architecture MLIR (NPUDEVICE substitution).
+    local npu_dev
+    npu_dev="$(get_npu_device "$src_dir")"
+    if [[ -f "$src_dir/aie.mlir" ]]; then
+      cp "$src_dir/aie.mlir" "$build_dir/aie_arch.mlir"
+      sed "s/NPUDEVICE/${npu_dev}/g" -i "$build_dir/aie_arch.mlir"
+    fi
+
+    local failed=false
+    while IFS= read -r cmd; do
+      [[ -z "$cmd" ]] && continue
+      # Skip host compilation lines -- we handle test.exe separately.
+      [[ "$cmd" == *clang*test.cpp* ]] && continue
+      [[ "$cmd" == *g++*test.cpp* ]] && continue
+      # Replace references to aie.mlir in aiecc.py commands.
+      if [[ "$cmd" == *aiecc.py* ]]; then
+        cmd="${cmd//$src_dir\/aie.mlir/./aie_arch.mlir}"
+        cmd="${cmd//\.\/aie.mlir/./aie_arch.mlir}"
+      fi
+      if ! ( cd "$build_dir" && nice -n 19 bash -c "$cmd" ) >> "$log_file" 2>&1; then
+        err "Build step failed for $name: $cmd"
+        failed=true
+        break
+      fi
+    done < <(extract_build_commands "$lit_file" "$src_dir")
+
+    if $failed; then
+      return 1
+    fi
+
+    # Verify xclbin was produced.
+    if [[ ! -f "$build_dir/aie.xclbin" ]]; then
+      local any_xclbin
+      any_xclbin=$(find "$build_dir" -name "*.xclbin" -print -quit 2>/dev/null)
+      if [[ -z "$any_xclbin" ]]; then
+        err "No xclbin produced for $name"
+        return 1
+      fi
+    fi
+  fi
+
+  # --- test.exe build (cheap, always rebuild with BDF patch) -------------
+
   # Patch test.cpp: read XRT_DEVICE_BDF env var for device selection.
-  # This lets us compile once and run against either the real NPU or
-  # the emulated device by setting the BDF at runtime.
   if [[ -f "$src_dir/test.cpp" ]]; then
     sed \
       -e 's/unsigned int device_index = 0;/const char* _bdf = std::getenv("XRT_DEVICE_BDF");/' \
@@ -274,48 +308,30 @@ compile_test() {
       "$src_dir/test.cpp" > "$build_dir/test.cpp"
   fi
 
-  local failed=false
-  while IFS= read -r cmd; do
-    [[ -z "$cmd" ]] && continue
-    # Replace references to ./aie_arch.mlir or aie.mlir in aiecc.py
-    # commands to use our prepared copy.
-    if [[ "$cmd" == *aiecc.py* ]]; then
-      cmd="${cmd//$src_dir\/aie.mlir/./aie_arch.mlir}"
-      cmd="${cmd//\.\/aie.mlir/./aie_arch.mlir}"
-    fi
-    # Point clang at our patched test.cpp in the build dir.
-    cmd="${cmd//$src_dir\/test.cpp/./test.cpp}"
-    if ! ( cd "$build_dir" && nice -n 19 bash -c "$cmd" ) >> "$log_file" 2>&1; then
-      err "Build step failed for $name: $cmd"
-      failed=true
+  # Find the clang line from run.lit for correct flags, or use fallback.
+  local clang_cmd=""
+  while IFS= read -r line; do
+    [[ "$line" == *"RUN:"* ]] || continue
+    local cmd
+    cmd="$(apply_lit_subs "$src_dir" "$line")"
+    if [[ "$cmd" == *clang*test.cpp* ]] || [[ "$cmd" == *g++*test.cpp* ]]; then
+      # Point at our patched test.cpp.
+      cmd="${cmd//$src_dir\/test.cpp/./test.cpp}"
+      clang_cmd="$cmd"
       break
     fi
-  done < <(extract_build_commands "$lit_file" "$src_dir")
+  done < "$lit_file"
 
-  if $failed; then
-    return 1
-  fi
-
-  # If run.lit didn't produce test.exe (some tests have non-standard
-  # build), try a fallback compilation using the patched copy.
-  if [[ ! -f "$build_dir/test.exe" ]] && [[ -f "$build_dir/test.cpp" ]]; then
+  if [[ -n "$clang_cmd" ]]; then
+    ( cd "$build_dir" && bash -c "$clang_cmd" ) >> "$log_file" 2>&1
+  else
+    # Fallback: standard compilation.
     /usr/bin/clang++ "$build_dir/test.cpp" -o "$build_dir/test.exe" \
       -std=c++17 -Wall \
       -I"$XRT_INCLUDE" -L"$XRT_LIB" \
       -I"$TEST_UTILS_INCLUDE" -L"$TEST_UTILS_LIB" \
       -luuid -lxrt_coreutil -ltest_utils -lrt -lstdc++ \
       >> "$log_file" 2>&1 || true
-  fi
-
-  # Check that we got the expected artifacts.
-  if [[ ! -f "$build_dir/aie.xclbin" ]]; then
-    # Some tests produce differently-named xclbins.
-    local any_xclbin
-    any_xclbin=$(find "$build_dir" -name "*.xclbin" -print -quit 2>/dev/null)
-    if [[ -z "$any_xclbin" ]]; then
-      err "No xclbin produced for $name"
-      return 1
-    fi
   fi
 
   return 0
@@ -373,7 +389,9 @@ run_bridge() {
   (
     cd "$build_dir"
     export XDNA_EMU=1
+    export XDNA_EMU_DEBUG=1
     export XRT_DEVICE_BDF="ffff:ff:1f.0"
+    export RUST_LOG=info
     timeout 60 bash -c "$run_cmd"
   ) > "$log_file" 2>&1
 
