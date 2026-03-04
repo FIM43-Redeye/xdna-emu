@@ -82,6 +82,14 @@ static INIT_LOCK: Mutex<()> = Mutex::new(());
 pub unsafe extern "C" fn xdna_emu_create() -> *mut XdnaEmuHandle {
     let _lock = INIT_LOCK.lock().unwrap();
 
+    // If XDNA_EMU_LOG_LEVEL is set but RUST_LOG is not, bridge the two
+    // so that a single env var controls both C++ plugin and Rust logging.
+    if std::env::var("RUST_LOG").is_err() {
+        if let Ok(level) = std::env::var("XDNA_EMU_LOG_LEVEL") {
+            std::env::set_var("RUST_LOG", &level);
+        }
+    }
+
     // Initialize logging if not already done
     let _ = env_logger::try_init();
 

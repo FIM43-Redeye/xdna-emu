@@ -468,9 +468,8 @@ run_one_bridge() {
   (
     cd "$build_dir"
     export XDNA_EMU=1
-    export XDNA_EMU_DEBUG=1
+    export XDNA_EMU_LOG_LEVEL="${XDNA_EMU_LOG_LEVEL:-info}"
     export XRT_DEVICE_BDF="ffff:ff:1f.0"
-    export RUST_LOG=info
     timeout 120 bash -c "$run_cmd"
   ) > "$log_file" 2>&1 || rc=$?
   local result

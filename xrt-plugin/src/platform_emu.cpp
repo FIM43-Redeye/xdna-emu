@@ -531,7 +531,7 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
   m_transport->execute_from_device(instr_addr, instr_size);
 
   // Post-execution diagnostics: dump DMA state for any non-idle channels.
-  if (xdna_emu::detail::emu_debug_enabled()) {
+  if (xdna_emu::detail::emu_log_level() >= 4) {
     uint8_t cols = m_transport->get_columns();
     uint8_t rows = m_transport->get_rows();
     for (uint8_t c = 0; c < cols; c++) {

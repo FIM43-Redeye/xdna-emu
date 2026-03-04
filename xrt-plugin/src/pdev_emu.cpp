@@ -3,6 +3,7 @@
 // pdev_emu.cpp -- Synthetic PCI device for the emulator.
 
 #include "pdev_emu.h"
+#include "emu_debug.h"
 #include "platform_emu.h"
 #include "shim/shim_debug.h"
 #include <cstdlib>
@@ -20,6 +21,16 @@ on_first_open() const
   std::string lib_path = lib_env ? lib_env : "libxdna_emu.so";
 
   m_transport = emu_transport::create_inprocess(lib_path);
+
+  // Pass XDNA_EMU_LOG_LEVEL through to the Rust emulator so that both
+  // the C++ plugin and Rust emulator use the same verbosity setting.
+  const char* log_level = std::getenv("XDNA_EMU_LOG_LEVEL");
+  if (log_level && m_transport) {
+    if (m_transport->set_log_level(log_level))
+      EMU_INFO("Set emulator log level: %s", log_level);
+    else
+      EMU_WARN("Failed to set emulator log level: %s", log_level);
+  }
 
   // Wire the transport into the platform driver so that its ioctl
   // handlers (create_bo, sync_bo, submit_cmd, etc.) can reach it.
