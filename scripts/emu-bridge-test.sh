@@ -188,6 +188,9 @@ apply_lit_subs() {
   # Lit substitutions.
   cmd="${cmd//'%S'/$src_dir}"
   cmd="${cmd//'%aietools'/$AIETOOLS_DIR}"
+  # %python is used as "python3 script.py" but scripts are on PATH
+  # with shebangs, so just strip the python3 prefix entirely.
+  cmd="${cmd//'%python '/}"
   cmd="${cmd//'%python'/python3}"
   cmd="${cmd//'%xrt_flags'/-I$XRT_INCLUDE -L$XRT_LIB -luuid -lxrt_coreutil}"
   cmd="${cmd//'%test_utils_flags'/-I$TEST_UTILS_INCLUDE -L$TEST_UTILS_LIB -ltest_utils}"
@@ -195,8 +198,10 @@ apply_lit_subs() {
   # Strip run_on_npu wrappers (we handle execution separately).
   cmd="${cmd//'%run_on_npu1%'/}"
   cmd="${cmd//'%run_on_npu2%'/}"
+  # Trim leading/trailing whitespace.
+  cmd="${cmd#"${cmd%%[![:space:]]*}"}"
+  cmd="${cmd%"${cmd##*[![:space:]]}"}"
   # Replace bare 'clang' with system clang++ (avoid aietools wrapper).
-  # Match 'clang ' at start of command (after substitution stripping).
   if [[ "$cmd" == clang\ * ]]; then
     cmd="/usr/bin/clang++ ${cmd#clang }"
   elif [[ "$cmd" == g++\ * ]]; then
@@ -259,17 +264,28 @@ compile_test() {
     return 1
   fi
 
+  # Patch test.cpp: read XRT_DEVICE_BDF env var for device selection.
+  # This lets us compile once and run against either the real NPU or
+  # the emulated device by setting the BDF at runtime.
+  if [[ -f "$src_dir/test.cpp" ]]; then
+    sed \
+      -e 's/unsigned int device_index = 0;/const char* _bdf = std::getenv("XRT_DEVICE_BDF");/' \
+      -e 's/auto device = xrt::device(device_index);/auto device = _bdf ? xrt::device(std::string(_bdf)) : xrt::device(0);/' \
+      "$src_dir/test.cpp" > "$build_dir/test.cpp"
+  fi
+
   local failed=false
   while IFS= read -r cmd; do
     [[ -z "$cmd" ]] && continue
     # Replace references to ./aie_arch.mlir or aie.mlir in aiecc.py
     # commands to use our prepared copy.
     if [[ "$cmd" == *aiecc.py* ]]; then
-      # Replace source MLIR path with our prepared copy.
       cmd="${cmd//$src_dir\/aie.mlir/./aie_arch.mlir}"
       cmd="${cmd//\.\/aie.mlir/./aie_arch.mlir}"
     fi
-    if ! ( cd "$build_dir" && nice -n 19 eval "$cmd" ) >> "$log_file" 2>&1; then
+    # Point clang at our patched test.cpp in the build dir.
+    cmd="${cmd//$src_dir\/test.cpp/./test.cpp}"
+    if ! ( cd "$build_dir" && nice -n 19 bash -c "$cmd" ) >> "$log_file" 2>&1; then
       err "Build step failed for $name: $cmd"
       failed=true
       break
@@ -281,9 +297,9 @@ compile_test() {
   fi
 
   # If run.lit didn't produce test.exe (some tests have non-standard
-  # build), try a fallback compilation.
-  if [[ ! -f "$build_dir/test.exe" ]] && [[ -f "$src_dir/test.cpp" ]]; then
-    /usr/bin/clang++ "$src_dir/test.cpp" -o "$build_dir/test.exe" \
+  # build), try a fallback compilation using the patched copy.
+  if [[ ! -f "$build_dir/test.exe" ]] && [[ -f "$build_dir/test.cpp" ]]; then
+    /usr/bin/clang++ "$build_dir/test.cpp" -o "$build_dir/test.exe" \
       -std=c++17 -Wall \
       -I"$XRT_INCLUDE" -L"$XRT_LIB" \
       -I"$TEST_UTILS_INCLUDE" -L"$TEST_UTILS_LIB" \
@@ -357,6 +373,7 @@ run_bridge() {
   (
     cd "$build_dir"
     export XDNA_EMU=1
+    export XRT_DEVICE_BDF="ffff:ff:1f.0"
     timeout 60 bash -c "$run_cmd"
   ) > "$log_file" 2>&1
 
@@ -394,21 +411,33 @@ run_nputest() {
   fi
 }
 
-# Run test.exe on real hardware (no XDNA_EMU).
+# Real NPU BDF -- detected once at startup.
+REAL_NPU_BDF="$(xrt-smi examine 2>/dev/null | grep -oP '\[0000:[0-9a-f:\.]+\]' | head -1 | tr -d '[]')"
+
+# Run test.exe on real hardware via BDF selection.
 run_hardware() {
   local name="$1"
   local build_dir="$BUILD_BASE/$name"
+  local src_dir="$TEST_SRC/$name"
   local log_file="$RESULTS_DIR/${name//\//_}_hw.log"
 
-  if [[ ! -f "$build_dir/test.exe" ]] || [[ ! -f "$build_dir/aie.xclbin" ]]; then
-    echo "SKIP_NOARTIFACT"
+  if [[ ! -f "$build_dir/test.exe" ]]; then
+    echo "SKIP_NOEXE"
     return
   fi
 
+  if [[ -z "$REAL_NPU_BDF" ]]; then
+    echo "SKIP_NOHW"
+    return
+  fi
+
+  local run_cmd
+  run_cmd="$(get_run_cmd "$src_dir")"
+
   (
     cd "$build_dir"
-    timeout 30 ./test.exe \
-      -x aie.xclbin -k MLIR_AIE -i insts.bin
+    export XRT_DEVICE_BDF="$REAL_NPU_BDF"
+    timeout 30 bash -c "$run_cmd"
   ) > "$log_file" 2>&1
 
   local rc=$?
