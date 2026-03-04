@@ -43,6 +43,9 @@ public:
     void     read_memory(uint64_t addr, void* data,
                          size_t size) override;
 
+    void clear_host_buffers() override;
+    void add_host_buffer(uint64_t addr, uint64_t size) override;
+
     void execute(const void* instructions, size_t size) override;
     void execute_from_device(uint64_t dev_addr, uint32_t size) override;
     bool poll_completion() override;

@@ -421,6 +421,51 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
             m_bo_map.size());
   }
 
+  // Register host buffers for DdrPatch address patching.
+  //
+  // The NPU instruction stream contains DdrPatch instructions that
+  // reference host buffers by index (arg_idx).  The emulator's NPU
+  // executor looks up host_buffers[arg_idx] to get the device address
+  // to write into DMA BD registers.
+  //
+  // For ERT_START_CU, the kernel's data BO addresses are packed in the
+  // register map starting at offset 0x14 (arg3), each 8 bytes, matching
+  // the xclbin kernel metadata layout:
+  //   arg3 (gid=3) at +0x14 -> DdrPatch arg_idx=0
+  //   arg4 (gid=4) at +0x1c -> DdrPatch arg_idx=1
+  //   arg5 (gid=5) at +0x24 -> DdrPatch arg_idx=2
+  //   ...
+  m_transport->clear_host_buffers();
+
+  if (pkt->opcode == ERT_START_CU) {
+    auto* regmap = reinterpret_cast<const uint8_t*>(
+        pkt->data + pkt->extra_cu_masks);
+    uint32_t regmap_bytes = (pkt->count - pkt->extra_cu_masks) * 4;
+    // Data BO addresses start at offset 0x14, each 8 bytes.
+    for (uint32_t off = 0x14; off + 8 <= regmap_bytes; off += 8) {
+      uint64_t bo_addr = 0;
+      std::memcpy(&bo_addr, regmap + off, sizeof(bo_addr));
+      if (bo_addr == 0)
+        continue;
+      // Find this BO's size from our tracking map.
+      uint64_t bo_size = 0;
+      {
+        const std::lock_guard<std::mutex> lock(m_bo_lock);
+        for (const auto& [h, bo] : m_bo_map) {
+          if (bo.dev_addr == bo_addr) {
+            bo_size = bo.size;
+            break;
+          }
+        }
+      }
+      if (bo_size == 0)
+        bo_size = 4096;  // fallback: DdrPatch only needs the address
+      m_transport->add_host_buffer(bo_addr, bo_size);
+      EMU_DBG("submit_cmd: registered host buffer arg_idx=%u addr=0x%" PRIx64
+              " size=%" PRIu64, (off - 0x14) / 8, bo_addr, bo_size);
+    }
+  }
+
   // Execute the NPU instruction buffer from emulator host memory.
   m_transport->execute_from_device(instr_addr, instr_size);
 

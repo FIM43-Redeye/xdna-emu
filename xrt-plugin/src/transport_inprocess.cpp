@@ -203,6 +203,22 @@ void emu_transport_inprocess::read_memory(uint64_t addr, void* data,
 }
 
 // ---------------------------------------------------------------------------
+// Host buffer registration
+// ---------------------------------------------------------------------------
+
+void emu_transport_inprocess::clear_host_buffers()
+{
+    Result rc = sym_clear_host_buffers_(emu_);
+    check(rc, "clear_host_buffers");
+}
+
+void emu_transport_inprocess::add_host_buffer(uint64_t addr, uint64_t size)
+{
+    Result rc = sym_add_host_buffer_(emu_, addr, size);
+    check(rc, "add_host_buffer");
+}
+
+// ---------------------------------------------------------------------------
 // Execution
 // ---------------------------------------------------------------------------
 

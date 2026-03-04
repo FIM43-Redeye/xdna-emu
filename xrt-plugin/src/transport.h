@@ -41,6 +41,17 @@ public:
     virtual void read_memory(uint64_t addr, void* data,
                              size_t size) = 0;
 
+    // -- Host buffer registration --------------------------------------------
+
+    /// Clear the NPU executor's host buffer list.
+    /// Must be called before add_host_buffer() for a new submission.
+    virtual void clear_host_buffers() = 0;
+
+    /// Register a host buffer for DdrPatch address patching.
+    /// Buffers must be added in order matching the runtime_sequence
+    /// arguments: add_host_buffer[0] = DdrPatch arg_idx 0, etc.
+    virtual void add_host_buffer(uint64_t addr, uint64_t size) = 0;
+
     // -- Execution -----------------------------------------------------------
 
     /// Submit NPU instructions (from host memory) and run to completion.
