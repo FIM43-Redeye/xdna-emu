@@ -45,8 +45,6 @@ pub(crate) enum ExecutorState {
     /// Blocked on a full DMA task queue. Holds the pending enqueue
     /// parameters so we can retry without re-executing the instruction.
     BlockedOnQueue {
-        /// Index of the instruction that triggered the block (for logging).
-        instr_index: usize,
         /// Index of the NEXT instruction after the blocked one completes.
         next_index: usize,
         /// Tile column with the full queue.
@@ -148,6 +146,7 @@ impl NpuExecutor {
     }
 
     /// Get the current executor state (for testing/debugging).
+    #[cfg(test)]
     pub(crate) fn state(&self) -> &ExecutorState {
         &self.state
     }
@@ -794,7 +793,7 @@ impl NpuExecutor {
     }
 
     /// Check if a register write triggers DMA operation.
-    fn check_dma_trigger(&mut self, col: u8, row: u8, offset: u32, value: u32, device: &mut DeviceState, host_memory: &mut HostMemory) {
+    fn check_dma_trigger(&mut self, col: u8, row: u8, offset: u32, value: u32, device: &mut DeviceState, _host_memory: &mut HostMemory) {
         // DMA Task_Queue registers trigger DMA channel start when written.
         // Each channel has Ctrl at +0 and Task_Queue at +4 within its stride.
         // Register layouts differ by tile type but all share the same format:
@@ -881,7 +880,6 @@ impl NpuExecutor {
                 col, row, abs_channel, bd_index
             );
             self.state = ExecutorState::BlockedOnQueue {
-                instr_index: self.executed_count,
                 next_index: self.executed_count + 1,
                 col, row,
                 channel: abs_channel,
