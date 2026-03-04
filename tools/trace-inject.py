@@ -23,6 +23,47 @@ import sys
 from pathlib import Path
 
 
+def resolve_events(names: list[str], event_enum) -> list:
+    """Resolve event name strings to enum values.
+
+    Accepts names like "TRUE", "INSTR_VECTOR", "LOCK_STALL".  Raises
+    ValueError for unknown names.
+    """
+    result = []
+    for name in names:
+        name = name.strip().upper()
+        if not name or name == "NONE":
+            from aie.utils.trace.events import CoreEvent  # type: ignore
+            result.append(event_enum(0))  # NONE = 0 for all enums
+            continue
+        try:
+            result.append(event_enum[name])
+        except KeyError:
+            raise ValueError(
+                f"Unknown event '{name}' for {event_enum.__name__}. "
+                f"Available: {', '.join(e.name for e in event_enum)}"
+            )
+    return result
+
+
+def load_events_config(path: Path) -> dict:
+    """Load a JSON events configuration file.
+
+    Expected format::
+
+        {
+            "core_events": ["TRUE", "INSTR_VECTOR", ...],
+            "mem_events": ["TRUE", "DMA_S2MM_0_START_TASK", ...],
+            "memtile_events": ["TRUE", "PORT_RUNNING_0", ...],
+            "shim_events": ["TRUE", "DMA_S2MM_0_START_TASK", ...]
+        }
+
+    Each list has up to 8 entries (trace slot count).
+    """
+    with open(path) as f:
+        return json.load(f)
+
+
 def detect_source_type(test_dir: Path) -> str:
     """Detect whether this test uses raw MLIR or a Python generator.
 
@@ -148,7 +189,11 @@ def has_existing_trace(mlir_text: str) -> bool:
     return "aie.packet_source" in mlir_text and "Trace :" in mlir_text
 
 
-def inject_trace(mlir_text: str, trace_size: int) -> tuple[str, dict]:
+def inject_trace(
+    mlir_text: str,
+    trace_size: int,
+    events_config: dict | None = None,
+) -> tuple[str, dict]:
     """Inject trace configuration into parsed MLIR and return modified text.
 
     Uses the mlir-aie Python API to:
@@ -245,12 +290,36 @@ def inject_trace(mlir_text: str, trace_size: int) -> tuple[str, dict]:
 
         # -- Insert trace config at sequence start --------------------------
 
+        # Build optional custom event kwargs from events_config.
+        custom_event_kwargs: dict = {}
+        if events_config:
+            from aie.utils.trace.events import (  # type: ignore
+                CoreEvent, MemEvent, MemTileEvent, ShimTileEvent,
+            )
+            if "core_events" in events_config:
+                custom_event_kwargs["coretile_events"] = resolve_events(
+                    events_config["core_events"], CoreEvent,
+                )
+            if "mem_events" in events_config:
+                custom_event_kwargs["coremem_events"] = resolve_events(
+                    events_config["mem_events"], MemEvent,
+                )
+            if "memtile_events" in events_config:
+                custom_event_kwargs["memtile_events"] = resolve_events(
+                    events_config["memtile_events"], MemTileEvent,
+                )
+            if "shim_events" in events_config:
+                custom_event_kwargs["shimtile_events"] = resolve_events(
+                    events_config["shim_events"], ShimTileEvent,
+                )
+
         with InsertionPoint.at_block_begin(seq_block):
             configure_packet_tracing_aie2(
                 tiles_to_trace,
                 shim_tile,
                 trace_size,
                 ddr_id=trace_ddr_id,
+                **custom_event_kwargs,
             )
 
         # -- Insert trace done after the last DMA wait ----------------------
@@ -445,6 +514,12 @@ def main():
         default="auto",
         help="Device target for NPUDEVICE substitution (default: auto-detect)",
     )
+    parser.add_argument(
+        "--events-json",
+        type=Path,
+        default=None,
+        help="JSON file with custom event slot configuration (see load_events_config)",
+    )
     args = parser.parse_args()
 
     test_dir = args.test_dir.resolve()
@@ -473,9 +548,16 @@ def main():
         )
         sys.exit(0)
 
+    # Load custom events config if provided
+    events_config = None
+    if args.events_json:
+        events_config = load_events_config(args.events_json)
+
     # Inject trace
     try:
-        traced_mlir, manifest_partial = inject_trace(mlir_text, args.trace_size)
+        traced_mlir, manifest_partial = inject_trace(
+            mlir_text, args.trace_size, events_config,
+        )
     except Exception as e:
         print(f"Error injecting trace: {e}", file=sys.stderr)
         sys.exit(1)

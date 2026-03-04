@@ -610,6 +610,11 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
         }
     }
 
+    // Flush any pending trace packets through the stream switch to host DDR.
+    // Trace units may have partial packets buffered; flush() pads and emits
+    // them, then step_data_movement() routes them through the network.
+    handle.engine.flush_trace_to_host();
+
     let halted = handle.engine.status() == EngineStatus::Halted
         || (handle.npu_executor.is_done()
             && handle.npu_executor.syncs_satisfied(handle.engine.device()));

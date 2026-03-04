@@ -65,6 +65,7 @@ FORCE_COMPILE=false
 RUN_HW=true
 LIST_ONLY=false
 VERBOSE=false
+TRACE_MODE=""  # "", "default", "all", "sweep", "sweep-all"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -72,6 +73,14 @@ while [[ $# -gt 0 ]]; do
     --no-hw)       RUN_HW=false; shift ;;
     --list)        LIST_ONLY=true; shift ;;
     -v|--verbose)  VERBOSE=true; shift ;;
+    --trace)       TRACE_MODE="default"; shift ;;
+    --trace=*)
+      TRACE_MODE="${1#--trace=}"
+      case "$TRACE_MODE" in
+        all|sweep|sweep-all) ;;
+        *) echo "Unknown --trace mode: $TRACE_MODE (use: all, sweep, sweep-all)" >&2; exit 1 ;;
+      esac
+      shift ;;
     -j*)
       JOBS="${1#-j}"
       if [[ -z "$JOBS" ]] || ! [[ "$JOBS" =~ ^[0-9]+$ ]]; then
@@ -86,6 +95,10 @@ Options:
   --compile       Force recompile all xclbins (default: use cached)
   --no-hw         Skip real hardware runs (default: hardware enabled)
   --list          List available tests and exit
+  --trace         Run trace comparison (default events, passing tests only)
+  --trace=all     Trace all tests (pass + fail)
+  --trace=sweep   Full event sweep (passing tests only)
+  --trace=sweep-all  Full sweep, all tests
   -jN             Override parallelism (default: nproc)
   -v, --verbose   Show log snippets on failure
 
@@ -103,7 +116,7 @@ USAGE
 done
 
 # Export variables that parallel jobs need.
-export RESULTS_DIR FORCE_COMPILE VERBOSE
+export RESULTS_DIR FORCE_COMPILE VERBOSE TRACE_MODE
 export MLIR_AIE TEST_SRC BUILD_BASE EMU_ROOT
 export XRT_DIR XRT_INCLUDE XRT_LIB
 export TEST_LIB_DIR TEST_UTILS_INCLUDE TEST_UTILS_LIB
@@ -494,12 +507,177 @@ run_one_bridge() {
 export -f run_one_bridge
 
 # ---------------------------------------------------------------------------
+# Phase 4b: Trace comparison
+# ---------------------------------------------------------------------------
+
+# Run trace comparison for a single test.
+# Uses trace-sweep.py for sweep mode, or trace-inject + trace-run +
+# trace-compare for default (8-event) mode.
+#
+# Writes $RESULTS_DIR/${safe}.trace.summary (one line) and full report
+# to $RESULTS_DIR/${safe}.trace.log.
+trace_one_test() {
+  local name="$1"
+  local mode="$2"  # "default" or "sweep"
+  local safe
+  safe="$(sanitize_name "$name")"
+  local src_dir="$TEST_SRC/$name"
+  local trace_dir="$RESULTS_DIR/${safe}.trace"
+  local summary_file="$RESULTS_DIR/${safe}.trace.summary"
+  local log_file="$RESULTS_DIR/${safe}.trace.log"
+  local tools_dir="$EMU_ROOT/tools"
+
+  mkdir -p "$trace_dir"
+  : > "$log_file"
+
+  if [[ "$mode" == "sweep" || "$mode" == "sweep-all" ]]; then
+    # Full sweep: delegate to trace-sweep.py
+    local sweep_args=("$src_dir" -o "$trace_dir/sweep")
+    if [[ "$RUN_HW" != "true" ]]; then
+      sweep_args+=(--no-hw)
+    fi
+    if ! python3 "$tools_dir/trace-sweep.py" "${sweep_args[@]}" >> "$log_file" 2>&1; then
+      echo "ERROR sweep_failed" > "$summary_file"
+      echo "  TRACE $name: ERROR (sweep failed)"
+      return
+    fi
+
+    # Trim trace buffers to actual data length
+    python3 "$tools_dir/trace-trim.py" --dir "$trace_dir/sweep" >> "$log_file" 2>&1 || true
+
+    # Compare
+    if ! python3 "$tools_dir/trace-compare.py" --sweep "$trace_dir/sweep" \
+        -o "$trace_dir/report.txt" >> "$log_file" 2>&1; then
+      echo "ERROR compare_failed" > "$summary_file"
+      echo "  TRACE $name: ERROR (compare failed)"
+      return
+    fi
+  else
+    # Default 8-event mode: inject, compile, run HW+EMU, compare.
+
+    # Step 1: Inject tracing into MLIR
+    local traced_dir="$trace_dir/traced"
+    if ! python3 "$tools_dir/trace-inject.py" "$src_dir" -o "$traced_dir" \
+        >> "$log_file" 2>&1; then
+      echo "ERROR injection_failed" > "$summary_file"
+      echo "  TRACE $name: ERROR (injection failed)"
+      return
+    fi
+
+    local manifest="$traced_dir/manifest.json"
+    if [[ ! -f "$manifest" ]]; then
+      echo "ERROR no_manifest" > "$summary_file"
+      echo "  TRACE $name: ERROR (no manifest)"
+      return
+    fi
+
+    # Check if injection was skipped (unsupported test)
+    if python3 -c "import json,sys; m=json.load(open('$manifest')); sys.exit(0 if m.get('skipped') else 1)" 2>/dev/null; then
+      echo "SKIP unsupported" > "$summary_file"
+      echo "  TRACE $name: SKIP (unsupported)"
+      return
+    fi
+
+    # Step 2: Compile traced xclbin
+    if ! ( cd "$traced_dir" && nice -n 19 aiecc.py \
+        --no-aiesim --aie-generate-xclbin --aie-generate-npu-insts \
+        --no-compile-host --alloc-scheme=basic-sequential --no-xchesscc \
+        --xclbin-name=aie.xclbin --npu-insts-name=insts.bin \
+        ./aie_traced.mlir ) >> "$log_file" 2>&1; then
+      echo "ERROR compile_failed" > "$summary_file"
+      echo "  TRACE $name: ERROR (compile failed)"
+      return
+    fi
+
+    # Step 3: Run on hardware (if enabled)
+    if [[ "$RUN_HW" == "true" ]]; then
+      local hw_dir="$trace_dir/hw"
+      if ! python3 "$tools_dir/trace-run.py" "$manifest" -o "$hw_dir" \
+          >> "$log_file" 2>&1; then
+        echo "ERROR hw_run_failed" > "$summary_file"
+        echo "  TRACE $name: ERROR (hw run failed)"
+        return
+      fi
+    fi
+
+    # Step 4: Run on emulator
+    local emu_dir="$trace_dir/emu"
+    if ! XDNA_EMU=1 XRT_DEVICE_BDF="ffff:ff:1f.0" \
+        python3 "$tools_dir/trace-run.py" "$manifest" -o "$emu_dir" \
+        >> "$log_file" 2>&1; then
+      echo "ERROR emu_run_failed" > "$summary_file"
+      echo "  TRACE $name: ERROR (emu run failed)"
+      return
+    fi
+
+    # Trim trace buffers to actual data length
+    python3 "$tools_dir/trace-trim.py" --dir "$trace_dir" >> "$log_file" 2>&1 || true
+
+    # Step 5: Compare (only if both traces exist)
+    if [[ "$RUN_HW" == "true" ]] && [[ -f "$trace_dir/hw/trace_raw.bin" ]] \
+        && [[ -f "$trace_dir/emu/trace_raw.bin" ]]; then
+      if ! python3 "$tools_dir/trace-compare.py" \
+          --hw "$trace_dir/hw/trace_raw.bin" \
+          --emu "$trace_dir/emu/trace_raw.bin" \
+          -o "$trace_dir/report.txt" >> "$log_file" 2>&1; then
+        echo "ERROR compare_failed" > "$summary_file"
+        echo "  TRACE $name: ERROR (compare failed)"
+        return
+      fi
+    else
+      # EMU-only: no comparison possible, just record that trace was collected
+      echo "EMU_ONLY collected" > "$summary_file"
+      echo "  TRACE $name: EMU_ONLY (trace collected, no HW to compare)"
+      return
+    fi
+  fi
+
+  # Parse the report to produce a one-line summary.
+  local report="$trace_dir/report.txt"
+  if [[ ! -f "$report" ]]; then
+    echo "ERROR no_report" > "$summary_file"
+    echo "  TRACE $name: ERROR (no report)"
+    return
+  fi
+
+  # Extract key stats from the report's summary section.
+  local edge_line level_line pairs_line
+  edge_line="$(grep '^Edge event types:' "$report" 2>/dev/null || true)"
+  pairs_line="$(grep '^  Pairs:' "$report" 2>/dev/null || true)"
+
+  if [[ -n "$edge_line" ]]; then
+    # Parse: "Edge event types:    N clean, M diverged, K count mismatch"
+    local clean diverged
+    clean="$(echo "$edge_line" | grep -oP '\d+ clean' | grep -oP '\d+')"
+    diverged="$(echo "$edge_line" | grep -oP '\d+ diverged' | grep -oP '\d+')"
+    local pairs="0"
+    if [[ -n "$pairs_line" ]]; then
+      pairs="$(echo "$pairs_line" | grep -oP '\d+')"
+    fi
+
+    if [[ "${diverged:-0}" -eq 0 ]]; then
+      echo "CLEAN ${clean:-0} event types, ${pairs} pairs" > "$summary_file"
+      echo "  TRACE $name: CLEAN (${clean:-0} event types, ${pairs} pairs)"
+    else
+      echo "DIVERGE ${diverged} of $((${clean:-0}+${diverged})) event types" > "$summary_file"
+      echo "  TRACE $name: DIVERGE (${diverged} of $((${clean:-0}+${diverged})) event types)"
+    fi
+  else
+    echo "UNKNOWN parse_error" > "$summary_file"
+    echo "  TRACE $name: UNKNOWN (could not parse report)"
+  fi
+}
+export -f trace_one_test
+
+# ---------------------------------------------------------------------------
 # Phase 5: Report
 # ---------------------------------------------------------------------------
 
 print_report() {
   local -n test_list=$1
   local run_hw=$2
+  local has_trace=false
+  [[ -n "$TRACE_MODE" ]] && has_trace=true
 
   echo ""
   echo "==========================================================================="
@@ -507,11 +685,21 @@ print_report() {
   echo "==========================================================================="
   echo ""
 
-  if [[ "$run_hw" == "true" ]]; then
+  # Header row adapts to which columns are active.
+  if [[ "$run_hw" == "true" ]] && $has_trace; then
+    printf "%-40s  %-10s  %-10s  %-5s  %s\n" "TEST" "BRIDGE" "HARDWARE" "MATCH" "TRACE"
+    printf "%-40s  %-10s  %-10s  %-5s  %s\n" \
+      "----------------------------------------" \
+      "----------" "----------" "-----" "------------------------------"
+  elif [[ "$run_hw" == "true" ]]; then
     printf "%-45s  %-10s  %-10s  %-5s\n" "TEST" "BRIDGE" "HARDWARE" "MATCH"
     printf "%-45s  %-10s  %-10s  %-5s\n" \
       "---------------------------------------------" \
       "----------" "----------" "-----"
+  elif $has_trace; then
+    printf "%-40s  %-10s  %s\n" "TEST" "BRIDGE" "TRACE"
+    printf "%-40s  %-10s  %s\n" \
+      "----------------------------------------" "----------" "------------------------------"
   else
     printf "%-45s  %-10s\n" "TEST" "BRIDGE"
     printf "%-45s  %-10s\n" \
@@ -521,6 +709,7 @@ print_report() {
   local pass_bridge=0 fail_bridge=0 skip_bridge=0 timeout_bridge=0 emumiss_bridge=0
   local pass_hw=0 fail_hw=0 skip_hw=0 timeout_hw=0
   local match_count=0 mismatch_count=0
+  local trace_clean=0 trace_diverge=0 trace_error=0 trace_skip=0
 
   for name in "${test_list[@]}"; do
     local safe
@@ -532,8 +721,12 @@ print_report() {
       compile_result="$(< "$RESULTS_DIR/${safe}.compile.result")"
     fi
     if [[ "$compile_result" != "OK" ]]; then
-      if [[ "$run_hw" == "true" ]]; then
+      if [[ "$run_hw" == "true" ]] && $has_trace; then
+        printf "%-40s  %-10s  %-10s  %-5s  %s\n" "$name" "COMP_FAIL" "COMP_FAIL" "-" "-"
+      elif [[ "$run_hw" == "true" ]]; then
         printf "%-45s  %-10s  %-10s  %-5s\n" "$name" "COMP_FAIL" "COMP_FAIL" "-"
+      elif $has_trace; then
+        printf "%-40s  %-10s  %s\n" "$name" "COMP_FAIL" "-"
       else
         printf "%-45s  %-10s\n" "$name" "COMP_FAIL"
       fi
@@ -569,9 +762,23 @@ print_report() {
       esac
     fi
 
-    # Print row.
+    # Read trace summary (if tracing was enabled).
+    local trace_summary="-"
+    if $has_trace && [[ -f "$RESULTS_DIR/${safe}.trace.summary" ]]; then
+      trace_summary="$(< "$RESULTS_DIR/${safe}.trace.summary")"
+      case "$trace_summary" in
+        CLEAN*)   ((trace_clean++)) || true ;;
+        DIVERGE*) ((trace_diverge++)) || true ;;
+        ERROR*)   ((trace_error++)) || true ;;
+        SKIP*|EMU_ONLY*) ((trace_skip++)) || true ;;
+      esac
+    elif $has_trace; then
+      ((trace_skip++)) || true
+    fi
+
+    # Compute match column.
+    local match="-"
     if [[ "$run_hw" == "true" ]]; then
-      local match="-"
       if [[ "$bridge_result" == "SKIP"* ]] || [[ "$hw_result" == "SKIP"* ]]; then
         match="-"
       elif [[ "$bridge_result" == "$hw_result" ]]; then
@@ -581,7 +788,15 @@ print_report() {
         match="NO"
         ((mismatch_count++)) || true
       fi
+    fi
+
+    # Print row.
+    if [[ "$run_hw" == "true" ]] && $has_trace; then
+      printf "%-40s  %-10s  %-10s  %-5s  %s\n" "$name" "$bridge_result" "$hw_result" "$match" "$trace_summary"
+    elif [[ "$run_hw" == "true" ]]; then
       printf "%-45s  %-10s  %-10s  %-5s\n" "$name" "$bridge_result" "$hw_result" "$match"
+    elif $has_trace; then
+      printf "%-40s  %-10s  %s\n" "$name" "$bridge_result" "$trace_summary"
     else
       printf "%-45s  %-10s\n" "$name" "$bridge_result"
     fi
@@ -620,6 +835,9 @@ print_report() {
       echo "          ($timeout_hw timeout)"
     fi
     echo "Match:    $match_count match, $mismatch_count mismatch"
+  fi
+  if $has_trace; then
+    echo "Trace:    $trace_clean clean, $trace_diverge diverge, $trace_error error, $trace_skip skip"
   fi
   echo "Logs:     $RESULTS_DIR/"
 }
@@ -735,6 +953,52 @@ main() {
 
   info "Phase 4 done"
   echo ""
+
+  # ---- Phase 4b: Trace comparison (optional) ------------------------------
+
+  if [[ -n "$TRACE_MODE" ]]; then
+    # Determine which tests to trace.
+    local trace_targets=()
+    local trace_include_failing=false
+    local trace_sweep=false
+
+    case "$TRACE_MODE" in
+      default) ;;
+      all)       trace_include_failing=true ;;
+      sweep)     trace_sweep=true ;;
+      sweep-all) trace_sweep=true; trace_include_failing=true ;;
+    esac
+
+    for name in "${compiled[@]}"; do
+      if ! $trace_include_failing; then
+        # Only trace tests that passed the bridge run.
+        local safe
+        safe="$(sanitize_name "$name")"
+        local br="FAIL"
+        [[ -f "$RESULTS_DIR/${safe}.bridge.result" ]] && br="$(< "$RESULTS_DIR/${safe}.bridge.result")"
+        if [[ "$br" != "PASS" ]]; then
+          continue
+        fi
+      fi
+      trace_targets+=("$name")
+    done
+
+    local trace_mode_arg="default"
+    if $trace_sweep; then
+      trace_mode_arg="sweep"
+    fi
+
+    if [[ ${#trace_targets[@]} -gt 0 ]]; then
+      info "Phase 4b: Trace comparison for ${#trace_targets[@]} test(s) (mode=$trace_mode_arg)"
+      for name in "${trace_targets[@]}"; do
+        trace_one_test "$name" "$trace_mode_arg"
+      done
+      info "Phase 4b done"
+    else
+      info "Phase 4b: No tests eligible for tracing"
+    fi
+    echo ""
+  fi
 
   # ---- Phase 5: Report ---------------------------------------------------
 

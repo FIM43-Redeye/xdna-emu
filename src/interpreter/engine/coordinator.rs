@@ -752,11 +752,31 @@ impl InterpreterEngine {
             }
         }
 
-        // Phase 3c: Evaluate edge detectors.
+        // Phase 3c: Fire TRUE (event code 1) on every configured trace unit.
+        //
+        // Hardware fires TRUE unconditionally every cycle. When a trace
+        // unit has TRUE in one of its 8 event slots, it records it --
+        // otherwise notify_event() returns immediately (no slot match).
+        // This enables the "metronome" alignment strategy for multi-run
+        // trace sweeps.
+        {
+            let cycle = self.total_cycles;
+            const TRUE_EVENT: u8 = 1;
+            for tile in &mut self.device.array.tiles {
+                if tile.core_trace.is_configured() {
+                    tile.core_trace.notify_event(TRUE_EVENT, cycle);
+                }
+                if tile.mem_trace.is_configured() {
+                    tile.mem_trace.notify_event(TRUE_EVENT, cycle);
+                }
+            }
+        }
+
+        // Phase 3d: Evaluate edge detectors.
         //
         // After all raw events have been generated (DMA, port, core, bank
-        // conflict), check edge detectors for rising/falling transitions
-        // and fire EDGE_DETECTION_EVENT_0/1 as needed.
+        // conflict, TRUE), check edge detectors for rising/falling
+        // transitions and fire EDGE_DETECTION_EVENT_0/1 as needed.
         {
             let cycle = self.total_cycles;
             for tile in &mut self.device.array.tiles {
