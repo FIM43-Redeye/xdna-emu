@@ -892,11 +892,29 @@ pub struct RegisterModel {
 // Composite Bundle Formats (from AIE2CompositeFormats.td)
 // ============================================================================
 
+/// Bit-level extraction map for a single slot within a composite format.
+///
+/// Slot bits are always contiguous in AIE2 composite formats (verified across
+/// all 78 defs), so `start_bit + width` fully describes the extraction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotBitMap {
+    /// Slot name (e.g., "st", "mv", "alu", "lda", "ldb", "vec", "lng", "nop").
+    pub slot_name: String,
+    /// Slot bit width.
+    pub width: u8,
+    /// LSB position of this slot in the bundle word (little-endian bit numbering).
+    pub start_bit: u8,
+}
+
 /// A composite instruction format (VLIW bundle layout).
 ///
 /// Extracted from records with `isComposite = 1` in the `--print-records`
 /// output. Each format defines the total bundle size and which VLIW slots
 /// are present at what bit positions.
+///
+/// The `fixed_mask`/`fixed_value` pair enables format discrimination:
+/// `(word & fixed_mask) == fixed_value` uniquely identifies this format
+/// within its size group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompositeFormatDef {
     /// Record name (e.g., "I128_LDB_LDA_ST_ALU_MV_VEC").
@@ -908,6 +926,12 @@ pub struct CompositeFormatDef {
     /// Slot fields present: (slot_name, bit_width).
     /// Example: [("ldb", 16), ("lda", 21), ("st", 21), ("alu", 20), ("mv", 22), ("vec", 26)]
     pub slots: Vec<(String, u16)>,
+    /// Bitmask: bit N = 1 if that position in the Inst field is a fixed 0 or 1.
+    pub fixed_mask: u128,
+    /// Expected value at fixed positions: `(word & fixed_mask) == fixed_value`.
+    pub fixed_value: u128,
+    /// Per-slot extraction info derived from the Inst field.
+    pub slot_maps: Vec<SlotBitMap>,
 }
 
 // ============================================================================

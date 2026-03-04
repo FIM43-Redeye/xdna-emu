@@ -69,7 +69,7 @@ pub use types::{
     BranchCondition, CompositeFormatDef, ElementType, EncodingPart, FormatClass, ImplicitReg,
     InstrAttributes, InstrDef, ItineraryInfo, OperandDef, PipelineStage, ProcessorModel,
     RegisterClassDef, RegisterDef, RegisterModel, SelectVariant, SemanticOp, SemanticPattern,
-    SlotDef, TableGenData, TblgenOutput, TemplateParam,
+    SlotBitMap, SlotDef, TableGenData, TblgenOutput, TemplateParam,
 };
 
 use std::collections::HashMap;

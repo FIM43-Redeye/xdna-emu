@@ -733,7 +733,7 @@ impl InstrRecord {
 
 use super::types::{
     CompositeFormatDef, ItineraryInfo, PipelineStage, ProcessorModel,
-    RegisterClassDef, RegisterDef, RegisterModel,
+    RegisterClassDef, RegisterDef, RegisterModel, SlotBitMap,
 };
 
 /// Parse the AIE2SchedModel record from `--print-records` output.
@@ -1065,7 +1065,9 @@ pub fn parse_register_model(content: &str) -> RegisterModel {
 /// Parse composite format definitions (records with `isComposite = 1`).
 ///
 /// These define the VLIW bundle layouts: which slots are present and their
-/// bit widths. Extracted from the `InOperandList` (slot fields) and `Size`.
+/// bit widths. Extracted from the `InOperandList` (slot fields), `Size`,
+/// and the `Inst` field (which provides exact bit positions for discrimination
+/// and extraction).
 pub fn parse_composite_formats(content: &str) -> Vec<CompositeFormatDef> {
     let lines: Vec<&str> = content.lines().collect();
     let mut formats = Vec::new();
@@ -1078,6 +1080,7 @@ pub fn parse_composite_formats(content: &str) -> Vec<CompositeFormatDef> {
                 let mut total_bytes = 0u8;
                 let mut is_composite = false;
                 let mut slots: Vec<(String, u16)> = Vec::new();
+                let mut inst_line: Option<String> = None;
 
                 while i < lines.len() {
                     let line = lines[i].trim();
@@ -1093,12 +1096,14 @@ pub fn parse_composite_formats(content: &str) -> Vec<CompositeFormatDef> {
                         // Parse slot operands: (ins ldb_slot:$ldb, lda_slot:$lda, ...)
                         let operands = parse_dag_operands(line);
                         for (slot_type, slot_name) in &operands {
-                            // Extract bit width from corresponding bits<N> field
-                            // The slot_name should match a field defined in the record
-                            let _ = slot_type; // We'll use the bits<N> field instead
+                            let _ = slot_type;
                             slots.push((slot_name.clone(), 0)); // Width filled below
                         }
-                    } else if line.starts_with("bits<") && !line.contains("Inst =")
+                    } else if line.contains("Inst = {") && line.starts_with("bits<") {
+                        // Capture the Inst field: bits<128> Inst = { ldb{15}, ..., 0 };
+                        inst_line = Some(line.to_string());
+                    } else if line.starts_with("bits<")
+                        && !line.contains("Inst =")
                         && !line.contains("TSFlags") && !line.contains("HWEncoding")
                         && !line.contains("dontcare")
                     {
@@ -1108,7 +1113,6 @@ pub fn parse_composite_formats(content: &str) -> Vec<CompositeFormatDef> {
                             let after = line[gt_pos + 1..].trim();
                             if let Some(eq_pos) = after.find(" = ") {
                                 let field_name = after[..eq_pos].trim();
-                                // Update slot width if this field was in InOperandList
                                 for slot in &mut slots {
                                     if slot.0 == field_name {
                                         slot.1 = width;
@@ -1124,11 +1128,20 @@ pub fn parse_composite_formats(content: &str) -> Vec<CompositeFormatDef> {
                     // Remove slots with zero width (intermediate fields like alu_mv)
                     slots.retain(|s| s.1 > 0);
 
+                    let total_bits = total_bytes as u16 * 8;
+                    let (fixed_mask, fixed_value, slot_maps) =
+                        inst_line.as_deref()
+                            .map(|l| parse_inst_field(l, total_bits))
+                            .unwrap_or((0, 0, Vec::new()));
+
                     formats.push(CompositeFormatDef {
                         name,
                         total_bytes,
-                        total_bits: total_bytes as u16 * 8,
+                        total_bits,
                         slots,
+                        fixed_mask,
+                        fixed_value,
+                        slot_maps,
                     });
                 }
             }
@@ -1137,6 +1150,112 @@ pub fn parse_composite_formats(content: &str) -> Vec<CompositeFormatDef> {
     }
 
     formats
+}
+
+/// Parse a `bits<N> Inst = { elem0, elem1, ..., elemN-1 };` line.
+///
+/// LLVM uses MSB-first ordering: element at position `i` from left corresponds
+/// to bit `total_bits - 1 - i` in the runtime little-endian word.
+///
+/// Each element is one of:
+/// - `"0"` or `"1"` -- fixed discriminator bit
+/// - `"name{index}"` -- belongs to a named slot
+/// - `"?"` -- don't-care (treated as variable, ignored in mask)
+///
+/// Returns `(fixed_mask, fixed_value, slot_maps)`.
+fn parse_inst_field(line: &str, total_bits: u16) -> (u128, u128, Vec<SlotBitMap>) {
+    // Extract the content between { and };
+    let brace_start = match line.find("= {") {
+        Some(pos) => pos + 3,
+        None => return (0, 0, Vec::new()),
+    };
+    let brace_end = match line.rfind('}') {
+        Some(pos) => pos,
+        None => return (0, 0, Vec::new()),
+    };
+    let content = &line[brace_start..brace_end];
+
+    let elements: Vec<&str> = content.split(',').map(|s| s.trim()).collect();
+    if elements.len() != total_bits as usize {
+        log::warn!(
+            "Inst field has {} elements but expected {} bits",
+            elements.len(), total_bits
+        );
+        return (0, 0, Vec::new());
+    }
+
+    let mut fixed_mask: u128 = 0;
+    let mut fixed_value: u128 = 0;
+    // Collect per-slot bit positions: slot_name -> Vec<(slot_bit_index, word_bit_pos)>
+    let mut slot_bits: std::collections::HashMap<String, Vec<(u16, u8)>> =
+        std::collections::HashMap::new();
+
+    for (i, elem) in elements.iter().enumerate() {
+        let bit_pos = (total_bits - 1 - i as u16) as u8;
+
+        match *elem {
+            "0" => {
+                fixed_mask |= 1u128 << bit_pos;
+                // fixed_value bit stays 0
+            }
+            "1" => {
+                fixed_mask |= 1u128 << bit_pos;
+                fixed_value |= 1u128 << bit_pos;
+            }
+            "?" => {
+                // Don't-care: not in mask, not in value
+            }
+            other => {
+                // Expected format: "name{index}" (e.g., "ldb{15}", "vec{0}")
+                if let Some(brace) = other.find('{') {
+                    let slot_name = &other[..brace];
+                    if let Some(close) = other.find('}') {
+                        if let Ok(slot_bit) = other[brace + 1..close].parse::<u16>() {
+                            slot_bits
+                                .entry(slot_name.to_string())
+                                .or_default()
+                                .push((slot_bit, bit_pos));
+                        }
+                    }
+                } else {
+                    // Intermediate field reference (e.g., "instr112{N}")
+                    // should not appear in concrete composite defs
+                    log::trace!("Unexpected Inst element: {}", other);
+                }
+            }
+        }
+    }
+
+    // Consolidate per-slot bit positions into SlotBitMap entries.
+    // Each slot's mapped bits should be contiguous (ascending slot bit index
+    // maps to ascending word bit position).
+    let mut slot_maps: Vec<SlotBitMap> = Vec::new();
+    for (slot_name, mut bits) in slot_bits {
+        bits.sort_by_key(|&(slot_bit, _)| slot_bit);
+        let start_bit = bits[0].1;
+        let width = bits.len() as u8;
+
+        // Validate contiguity
+        let contiguous = bits.windows(2).all(|w| w[1].1 == w[0].1 + 1);
+        if !contiguous {
+            log::warn!(
+                "Slot '{}' has non-contiguous bit mapping (start_bit={}, width={})",
+                slot_name, start_bit, width
+            );
+        }
+
+        slot_maps.push(SlotBitMap {
+            slot_name,
+            width,
+            start_bit,
+        });
+    }
+
+    // Sort slot_maps by start_bit descending (highest slot first, matching
+    // typical MSB-first ordering in format names like LDB_LDA_ST_ALU_MV_VEC)
+    slot_maps.sort_by(|a, b| b.start_bit.cmp(&a.start_bit));
+
+    (fixed_mask, fixed_value, slot_maps)
 }
 
 // ============================================================================
@@ -1825,5 +1944,144 @@ def EMPTY_PSEUDO {	// InstructionEncoding Instruction InstFormat AIEBaseInst AIE
             extract_semantic_from_dag("dag PatternToMatch = (ptradd eP:$ptr, eM:$mod);"),
             Some(SemanticOp::PointerAdd)
         );
+    }
+
+    #[test]
+    fn test_parse_inst_field_32bit() {
+        // Simulate I32_ALU: bits<32> Inst = { 0, 0, 0, 1, 0, alu{19}, ..., alu{0}, 0, 0, 1, 1, 0, 0, 1 };
+        // That's: 5 fixed bits (00010), 20 alu bits, 7 fixed bits (0011001)
+        let mut elements = Vec::new();
+        // bits 31..27 = 00010
+        elements.extend(["0", "0", "0", "1", "0"].iter());
+        // bits 26..7 = alu{19}..alu{0}
+        for i in (0..20).rev() {
+            elements.push("PLACEHOLDER"); // will be replaced
+            let _ = i; // just for clarity
+        }
+        // bits 6..0 = 0011001
+        elements.extend(["0", "0", "1", "1", "0", "0", "1"].iter());
+
+        // Build the actual Inst line
+        let mut parts = Vec::new();
+        parts.extend(["0", "0", "0", "1", "0"].iter().map(|s| s.to_string()));
+        for i in (0..20).rev() {
+            parts.push(format!("alu{{{}}}", i));
+        }
+        parts.extend(["0", "0", "1", "1", "0", "0", "1"].iter().map(|s| s.to_string()));
+
+        let inst_line = format!("  bits<32> Inst = {{ {} }};", parts.join(", "));
+        let (mask, value, slot_maps) = parse_inst_field(&inst_line, 32);
+
+        // Fixed bits: positions 31..27 = 00010, positions 6..0 = 0011001
+        // Bit 29 (position 29) = 1, bit 27 (position 27) = 0
+        // mask should have all 12 fixed bit positions set
+        assert_eq!(mask.count_ones(), 12, "Expected 12 fixed bits, got {}", mask.count_ones());
+
+        // Value: "00010" = bit 28 is 1; "0011001" = bits 4,3,0 are 1
+        assert_ne!(value & (1u128 << 28), 0, "Bit 28 should be 1 (from '00010')");
+        assert_eq!(value & (1u128 << 31), 0, "Bit 31 should be 0");
+
+        // Should have exactly one slot: alu
+        assert_eq!(slot_maps.len(), 1);
+        assert_eq!(slot_maps[0].slot_name, "alu");
+        assert_eq!(slot_maps[0].width, 20);
+        assert_eq!(slot_maps[0].start_bit, 7);
+    }
+
+    #[test]
+    fn test_parse_inst_field_128bit() {
+        // Simulate I128_LDB_LDA_ST_ALU_MV_VEC from real tblgen output
+        // bits<128> Inst = { ldb{15},...,ldb{0}, lda{20},...,lda{0},
+        //                    st{20},...,st{0}, alu{19},...,alu{0},
+        //                    mv{21},...,mv{0}, 1, vec{25},...,vec{0}, 0 };
+        let mut parts = Vec::new();
+
+        // ldb: bits 127..112 (16 bits)
+        for i in (0..16).rev() {
+            parts.push(format!("ldb{{{}}}", i));
+        }
+        // lda: bits 111..91 (21 bits)
+        for i in (0..21).rev() {
+            parts.push(format!("lda{{{}}}", i));
+        }
+        // st: bits 90..70 (21 bits)
+        for i in (0..21).rev() {
+            parts.push(format!("st{{{}}}", i));
+        }
+        // alu: bits 69..50 (20 bits)
+        for i in (0..20).rev() {
+            parts.push(format!("alu{{{}}}", i));
+        }
+        // mv: bits 49..28 (22 bits)
+        for i in (0..22).rev() {
+            parts.push(format!("mv{{{}}}", i));
+        }
+        // fixed 1 at bit 27
+        parts.push("1".to_string());
+        // vec: bits 26..1 (26 bits)
+        for i in (0..26).rev() {
+            parts.push(format!("vec{{{}}}", i));
+        }
+        // fixed 0 at bit 0
+        parts.push("0".to_string());
+
+        assert_eq!(parts.len(), 128);
+
+        let inst_line = format!("  bits<128> Inst = {{ {} }};", parts.join(", "));
+        let (mask, value, slot_maps) = parse_inst_field(&inst_line, 128);
+
+        // 2 fixed bits: bit 27 = 1, bit 0 = 0
+        assert_eq!(mask.count_ones(), 2);
+        assert_ne!(value & (1u128 << 27), 0, "Bit 27 should be 1");
+        assert_eq!(value & (1u128 << 0), 0, "Bit 0 should be 0");
+
+        // Should have 6 slots
+        assert_eq!(slot_maps.len(), 6);
+
+        // Verify slot positions (sorted by start_bit descending)
+        let by_name: std::collections::HashMap<&str, &SlotBitMap> =
+            slot_maps.iter().map(|s| (s.slot_name.as_str(), s)).collect();
+
+        assert_eq!(by_name["ldb"].start_bit, 112);
+        assert_eq!(by_name["ldb"].width, 16);
+        assert_eq!(by_name["lda"].start_bit, 91);
+        assert_eq!(by_name["lda"].width, 21);
+        assert_eq!(by_name["st"].start_bit, 70);
+        assert_eq!(by_name["st"].width, 21);
+        assert_eq!(by_name["alu"].start_bit, 50);
+        assert_eq!(by_name["alu"].width, 20);
+        assert_eq!(by_name["mv"].start_bit, 28);
+        assert_eq!(by_name["mv"].width, 22);
+        assert_eq!(by_name["vec"].start_bit, 1);
+        assert_eq!(by_name["vec"].width, 26);
+    }
+
+    #[test]
+    fn test_parse_composite_formats_with_inst() {
+        // Integration test: parse real tblgen output and verify Inst fields are populated
+        let cache_path = dirs::home_dir()
+            .unwrap()
+            .join(".cache/xdna-emu/tblgen/records.txt");
+        if !cache_path.exists() {
+            eprintln!("Skipping: cached tblgen records not found");
+            return;
+        }
+        let content = std::fs::read_to_string(&cache_path).unwrap();
+        let formats = parse_composite_formats(&content);
+
+        assert!(!formats.is_empty());
+        // Count how many have Inst-derived layout
+        let with_inst = formats.iter().filter(|f| !f.slot_maps.is_empty()).count();
+        assert_eq!(with_inst, formats.len(),
+            "All {} formats should have Inst-derived layout, only {} do",
+            formats.len(), with_inst);
+
+        // Spot-check I128_LDB_LDA_ST_ALU_MV_VEC
+        let i128_alu_mv = formats.iter().find(|f| f.name == "I128_LDB_LDA_ST_ALU_MV_VEC");
+        assert!(i128_alu_mv.is_some(), "I128_LDB_LDA_ST_ALU_MV_VEC not found");
+        let i128 = i128_alu_mv.unwrap();
+        assert_eq!(i128.total_bytes, 16);
+        assert_eq!(i128.slot_maps.len(), 6);
+        assert_ne!(i128.fixed_mask, 0);
     }
 }

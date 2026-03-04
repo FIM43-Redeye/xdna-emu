@@ -24,7 +24,8 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::interpreter::bundle::{
-    MemWidth, Operand, PostModify, SlotIndex, SlotOp, VliwBundle,
+    ExtractedBundle, MemWidth, Operand, PostModify, SlotIndex, SlotOp, VliwBundle,
+    extract_slots,
 };
 use crate::interpreter::state::{MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN, MOD_BASE_M};
 use crate::interpreter::traits::{DecodeError, Decoder};
@@ -99,6 +100,10 @@ pub struct InstructionDecoder {
     /// Each composite encoder variant has a dedicated LUT for O(1) decode.
     composite_luts: CompositeLuts,
 
+    /// Data-driven VLIW slot extraction table, built from tblgen Inst fields.
+    /// When present, replaces the hand-coded extract_* functions in slot_layout.
+    format_table: Option<crate::interpreter::bundle::FormatTable>,
+
     /// Statistics: successful decodes.
     decode_count: u64,
     /// Statistics: unknown patterns.
@@ -166,6 +171,7 @@ impl InstructionDecoder {
         Self {
             index: DecoderIndex::default(),
             composite_luts: CompositeLuts::build(),
+            format_table: None,
             decode_count: 0,
             unknown_count: 0,
         }
@@ -242,10 +248,26 @@ impl InstructionDecoder {
 
         // Use load_full_via_tblgen to get both encodings and LLVM decoder tables
         let output = crate::tablegen::load_full_via_tblgen(path)?;
-        Ok(Self::from_tables_with_decoders(
+
+        // Build data-driven format table from composite format Inst fields
+        let format_table = if output.composite_formats.iter().any(|f| !f.slot_maps.is_empty()) {
+            let table = crate::interpreter::bundle::FormatTable::build(&output.composite_formats);
+            log::info!(
+                "Built data-driven format table: {} entries",
+                table.total_entries(),
+            );
+            Some(table)
+        } else {
+            log::warn!("No Inst-derived format layouts; falling back to hand-coded extraction");
+            None
+        };
+
+        let mut decoder = Self::from_tables_with_decoders(
             output.encodings_by_slot,
             output.decoder_tables,
-        ))
+        );
+        decoder.format_table = format_table;
+        Ok(decoder)
     }
 
     /// Check if llvm-aie is available (checks config and env var).
@@ -275,6 +297,7 @@ impl InstructionDecoder {
         Self {
             index,
             composite_luts: CompositeLuts::build(),
+            format_table: None,
             decode_count: 0,
             unknown_count: 0,
         }
@@ -285,6 +308,7 @@ impl InstructionDecoder {
         Self {
             index,
             composite_luts: CompositeLuts::build(),
+            format_table: None,
             decode_count: 0,
             unknown_count: 0,
         }
@@ -299,6 +323,26 @@ impl InstructionDecoder {
     pub fn reset_stats(&mut self) {
         self.decode_count = 0;
         self.unknown_count = 0;
+    }
+
+    /// Extract slot data from a bundle, preferring the data-driven format table
+    /// when available, falling back to the hand-coded extract_slots().
+    pub fn extract_bundle_slots(&self, bytes: &[u8]) -> ExtractedBundle {
+        if bytes.len() < 2 {
+            return ExtractedBundle::new();
+        }
+        let format = crate::interpreter::bundle::detect_format(bytes);
+
+        // Try the data-driven table first
+        if let Some(ref table) = self.format_table {
+            if let Some(bundle) = table.extract(bytes, format) {
+                return bundle;
+            }
+            // No match in table -- fall through to legacy
+        }
+
+        // Legacy hand-coded path
+        extract_slots(bytes)
     }
 
     /// Get the underlying decoder index.
@@ -815,7 +859,7 @@ impl InstructionDecoder {
 
 impl Decoder for InstructionDecoder {
     fn decode(&self, bytes: &[u8], pc: u32) -> Result<VliwBundle, DecodeError> {
-        use crate::interpreter::bundle::{extract_slots, SlotType};
+        use crate::interpreter::bundle::SlotType;
 
         if bytes.len() < 2 {
             return Err(DecodeError::Incomplete {
@@ -860,8 +904,8 @@ impl Decoder for InstructionDecoder {
 
         let mut bundle = VliwBundle::from_raw(&bytes[..effective_size.min(bytes.len())], pc);
 
-        // Extract slots from the bundle
-        let extracted = extract_slots(bytes);
+        // Extract slots from the bundle (data-driven when available)
+        let extracted = self.extract_bundle_slots(bytes);
 
         if log::log_enabled!(log::Level::Trace) {
             static DECODE_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1266,12 +1310,12 @@ mod tests {
 
     /// Decode an 80-bit VLIW bundle and return (mnemonic, dest, sources) for each slot.
     /// Helper for the bundle decode diagnosis tests below.
-    fn decode_80bit_bundle_slots(decoder: &InstructionDecoder, bytes: &[u8], pc: u32)
+    fn decode_80bit_bundle_slots(decoder: &InstructionDecoder, bytes: &[u8], _pc: u32)
         -> Vec<(String, Option<Operand>, Vec<Operand>)>
     {
-        use crate::interpreter::bundle::{extract_slots, SlotType};
+        use crate::interpreter::bundle::SlotType;
 
-        let extracted = extract_slots(bytes);
+        let extracted = decoder.extract_bundle_slots(bytes);
         let mut results = Vec::new();
 
         for slot in &extracted.slots {

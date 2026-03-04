@@ -44,7 +44,7 @@ pub mod slot;
 pub mod slot_layout;
 
 pub use encoding::{detect_format, is_nop_encoding, BundleFormat, SlotMask, NOP_ENCODINGS};
-pub use slot_layout::{extract_slots, ExtractedBundle, ExtractedSlot, SlotType};
+pub use slot_layout::{extract_slots, ExtractedBundle, ExtractedSlot, FormatTable, SlotType};
 pub use slot::{
     BranchCondition, ElementType, MemWidth, Operand, PostModify, Predicate,
     SelectVariant, ShufflePattern, SlotIndex, SlotOp,
