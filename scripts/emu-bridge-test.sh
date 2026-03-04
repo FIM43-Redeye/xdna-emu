@@ -1,22 +1,28 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 #
-# emu-bridge-test.sh -- Automated comparison of emulator execution paths.
+# emu-bridge-test.sh -- Phased parallel comparison of emulator vs hardware.
 #
-# Runs mlir-aie NPU integration tests through multiple execution paths
-# and produces a comparison matrix:
+# Runs mlir-aie NPU integration tests through two execution paths and
+# produces a comparison matrix:
 #
 #   1. XRT bridge + emulator  (XDNA_EMU=1 ./test.exe)
-#   2. npu-test runner + emulator  (cargo run --bin npu-test)
-#   3. XRT bridge + real hardware  (./test.exe, no XDNA_EMU)
+#   2. XRT bridge + real hardware  (./test.exe with real BDF)
+#
+# Five-phase architecture:
+#   Phase 1: Discover     -- find tests, filter, skip npu2-only
+#   Phase 2: Compile      -- parallel xclbin + test.exe builds
+#   Phase 3: Run hardware -- serial (NPU jams under parallel load)
+#   Phase 4: Run emulator -- parallel -j$(nproc)
+#   Phase 5: Report       -- comparison matrix + summary
 #
 # Usage:
-#   ./scripts/emu-bridge-test.sh                    # all tests
+#   ./scripts/emu-bridge-test.sh                    # all tests, emulator + hardware
 #   ./scripts/emu-bridge-test.sh add_one_using_dma  # single test
-#   ./scripts/emu-bridge-test.sh --bridge-only       # skip npu-test & hw
-#   ./scripts/emu-bridge-test.sh --compile           # force recompile
-#   ./scripts/emu-bridge-test.sh --hw                # include hardware run
-#   ./scripts/emu-bridge-test.sh --list              # list available tests
+#   ./scripts/emu-bridge-test.sh --no-hw            # emulator only, skip hardware
+#   ./scripts/emu-bridge-test.sh --compile          # force recompile xclbins
+#   ./scripts/emu-bridge-test.sh --list             # list available tests
+#   ./scripts/emu-bridge-test.sh -j4 add_one        # limit parallelism
 
 set -euo pipefail
 
@@ -40,41 +46,53 @@ TEST_LIB_DIR="${MLIR_AIE}/build/runtime_lib/x86_64/test_lib"
 TEST_UTILS_INCLUDE="${TEST_LIB_DIR}/include"
 TEST_UTILS_LIB="${TEST_LIB_DIR}/lib"
 
-# Results directory
+# aietools
+AIETOOLS_DIR="${AIETOOLS_DIR:-/home/triple/npu-work/aietools}"
+
+# Results directory -- one per day, phases append into it
 RESULTS_DIR="/tmp/emu-bridge-results-$(date +%Y%m%d)"
 mkdir -p "$RESULTS_DIR"
+
+# Default parallelism
+JOBS="$(nproc)"
 
 # ---------------------------------------------------------------------------
 # Option parsing
 # ---------------------------------------------------------------------------
 
 FILTER=""
-BRIDGE_ONLY=false
 FORCE_COMPILE=false
-RUN_HW=false
+RUN_HW=true
 LIST_ONLY=false
 VERBOSE=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --bridge-only) BRIDGE_ONLY=true; shift ;;
     --compile)     FORCE_COMPILE=true; shift ;;
-    --hw)          RUN_HW=true; shift ;;
+    --no-hw)       RUN_HW=false; shift ;;
     --list)        LIST_ONLY=true; shift ;;
     -v|--verbose)  VERBOSE=true; shift ;;
+    -j*)
+      JOBS="${1#-j}"
+      if [[ -z "$JOBS" ]] || ! [[ "$JOBS" =~ ^[0-9]+$ ]]; then
+        echo "Invalid -j value: $1" >&2; exit 1
+      fi
+      shift ;;
     --help|-h)
-      echo "Usage: $0 [options] [test-name-filter]"
-      echo ""
-      echo "Options:"
-      echo "  --bridge-only   Only run XRT bridge path (skip npu-test)"
-      echo "  --compile       Force recompile all tests"
-      echo "  --hw            Also run on real hardware"
-      echo "  --list          List available tests and exit"
-      echo "  -v, --verbose   Show test output"
-      echo ""
-      echo "Filter:"
-      echo "  Substring match on test directory name."
-      echo "  e.g., 'add_one' matches add_one_using_dma, add_one_two, etc."
+      cat <<'USAGE'
+Usage: emu-bridge-test.sh [options] [test-name-filter]
+
+Options:
+  --compile       Force recompile all xclbins (default: use cached)
+  --no-hw         Skip real hardware runs (default: hardware enabled)
+  --list          List available tests and exit
+  -jN             Override parallelism (default: nproc)
+  -v, --verbose   Show log snippets on failure
+
+Filter:
+  Substring match on test directory name.
+  e.g., 'add_one' matches add_one_using_dma, add_one_two, etc.
+USAGE
       exit 0
       ;;
     -*)
@@ -84,24 +102,28 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Export variables that parallel jobs need.
+export RESULTS_DIR FORCE_COMPILE VERBOSE
+export MLIR_AIE TEST_SRC BUILD_BASE EMU_ROOT
+export XRT_DIR XRT_INCLUDE XRT_LIB
+export TEST_LIB_DIR TEST_UTILS_INCLUDE TEST_UTILS_LIB
+export AIETOOLS_DIR
+
 # ---------------------------------------------------------------------------
-# Helpers
+# Logging
 # ---------------------------------------------------------------------------
 
-log()  { echo "  $*"; }
 info() { echo ">>> $*"; }
 err()  { echo "ERROR: $*" >&2; }
 
-# Check if a test directory has a standard test.cpp + aie.mlir.
+# ---------------------------------------------------------------------------
+# Helpers (shared with parallel jobs via export -f)
+# ---------------------------------------------------------------------------
+
+# Check if a test directory has a standard test.cpp + aie.mlir/run.lit.
 is_standard_test() {
   local dir="$1"
   [[ -f "$dir/test.cpp" ]] && [[ -f "$dir/aie.mlir" || -f "$dir/run.lit" ]]
-}
-
-# Check if a test requires Chess compiler.
-# We have Chess (aietools) installed, so this always returns false.
-requires_chess() {
-  return 1
 }
 
 # Check if a test requires npu2 (AIE2P -- skip for now).
@@ -120,31 +142,100 @@ get_npu_device() {
   elif [[ -f "$lit" ]] && grep -q 'npu1_4col' "$lit"; then
     echo "npu1_4col"
   else
-    echo "npu1_1col"  # default
+    echo "npu1_1col"
   fi
 }
 
+# Apply lit-style substitutions to a RUN line.
+apply_lit_subs() {
+  local src_dir="$1"
+  local cmd="$2"
+  cmd="${cmd#*RUN: }"
+  cmd="${cmd//'%S'/$src_dir}"
+  cmd="${cmd//'%aietools'/$AIETOOLS_DIR}"
+  cmd="${cmd//'%python '/}"
+  cmd="${cmd//'%python'/python3}"
+  cmd="${cmd//'%xrt_flags'/-I$XRT_INCLUDE -L$XRT_LIB -luuid -lxrt_coreutil}"
+  cmd="${cmd//'%test_utils_flags'/-I$TEST_UTILS_INCLUDE -L$TEST_UTILS_LIB -ltest_utils}"
+  cmd="${cmd//'%test_lib_flags'/-I$TEST_UTILS_INCLUDE -L$TEST_UTILS_LIB -ltest_lib}"
+  cmd="${cmd//'%run_on_npu1%'/}"
+  cmd="${cmd//'%run_on_npu2%'/}"
+  cmd="${cmd#"${cmd%%[![:space:]]*}"}"
+  cmd="${cmd%"${cmd##*[![:space:]]}"}"
+  if [[ "$cmd" == clang\ * ]]; then
+    cmd="/usr/bin/clang++ ${cmd#clang }"
+  elif [[ "$cmd" == g++\ * ]]; then
+    cmd="/usr/bin/g++ ${cmd#g++ }"
+  fi
+  echo "$cmd"
+}
+
+# Parse run.lit and extract build commands (everything except execution lines).
+extract_build_commands() {
+  local lit_file="$1"
+  local src_dir="$2"
+  [[ -f "$lit_file" ]] || return 1
+
+  while IFS= read -r line; do
+    [[ "$line" == *"RUN:"* ]] || continue
+    local cmd
+    cmd="$(apply_lit_subs "$src_dir" "$line")"
+    [[ "$cmd" == *"./test.exe"* ]] && continue
+    [[ "$cmd" == *"run_on_npu"* ]] && continue
+    [[ "$cmd" == *"NPUDEVICE"* ]] && continue
+    [[ "$cmd" == "cp "* ]] && continue
+    echo "$cmd"
+  done < "$lit_file"
+}
+
+# Extract the test execution command from run.lit.
+get_run_cmd() {
+  local src_dir="$1"
+  local lit_file="$src_dir/run.lit"
+  [[ -f "$lit_file" ]] || return 1
+
+  while IFS= read -r line; do
+    [[ "$line" == *"RUN:"* ]] || continue
+    if [[ "$line" == *"./test.exe"* ]] && [[ "$line" == *"npu1"* || "$line" != *"npu2"* ]]; then
+      local cmd
+      cmd="$(apply_lit_subs "$src_dir" "$line")"
+      cmd="${cmd#"${cmd%%[![:space:]]*}"}"
+      echo "$cmd"
+      return 0
+    fi
+  done < "$lit_file"
+
+  echo "./test.exe -x aie.xclbin -k MLIR_AIE -i insts.bin"
+}
+
+# Sanitize test name for use as filename (replace / with _).
+sanitize_name() {
+  echo "${1//\//_}"
+}
+
+# Export all helpers for xargs subshells.
+export -f is_standard_test requires_npu2 get_npu_device apply_lit_subs
+export -f extract_build_commands get_run_cmd sanitize_name
+
 # ---------------------------------------------------------------------------
-# Test discovery
+# Phase 1: Discover tests
 # ---------------------------------------------------------------------------
 
 discover_tests() {
   local tests=()
+
   for dir in "$TEST_SRC"/*/; do
     local name
     name="$(basename "$dir")"
 
-    # Skip non-test directories.
     [[ "$name" == "makefile-common" ]] && continue
     [[ "$name" == "lit.local.cfg" ]] && continue
-    [[ "$name" == "core_dmas" ]] && continue  # subdirectory container
+    [[ "$name" == "core_dmas" ]] && continue
 
-    # Apply filter.
     if [[ -n "$FILTER" ]] && [[ "$name" != *"$FILTER"* ]]; then
       continue
     fi
 
-    # Must have test.cpp and either aie.mlir or run.lit.
     if ! is_standard_test "$dir"; then
       continue
     fi
@@ -152,14 +243,13 @@ discover_tests() {
     tests+=("$name")
   done
 
-  # Also check subdirectories (e.g., core_dmas/*)
+  # Also check subdirectories (e.g., core_dmas/*).
   for subdir in "$TEST_SRC"/*/*/; do
     [[ -d "$subdir" ]] || continue
-    local parent
+    local parent child name
     parent="$(basename "$(dirname "$subdir")")"
-    local child
     child="$(basename "$subdir")"
-    local name="${parent}/${child}"
+    name="${parent}/${child}"
 
     if [[ -n "$FILTER" ]] && [[ "$name" != *"$FILTER"* ]]; then
       continue
@@ -174,89 +264,42 @@ discover_tests() {
 }
 
 # ---------------------------------------------------------------------------
-# Compilation -- driven by run.lit RUN lines
+# Phase 2: Compile (parallel xclbin + test.exe)
 # ---------------------------------------------------------------------------
 
-# Substitutions for lit RUN lines.
-AIETOOLS_DIR="${AIETOOLS_DIR:-/home/triple/npu-work/aietools}"
-
-apply_lit_subs() {
-  local src_dir="$1"
-  local cmd="$2"
-  # Strip the "// RUN: " prefix.
-  cmd="${cmd#*RUN: }"
-  # Lit substitutions.
-  cmd="${cmd//'%S'/$src_dir}"
-  cmd="${cmd//'%aietools'/$AIETOOLS_DIR}"
-  # %python is used as "python3 script.py" but scripts are on PATH
-  # with shebangs, so just strip the python3 prefix entirely.
-  cmd="${cmd//'%python '/}"
-  cmd="${cmd//'%python'/python3}"
-  cmd="${cmd//'%xrt_flags'/-I$XRT_INCLUDE -L$XRT_LIB -luuid -lxrt_coreutil}"
-  cmd="${cmd//'%test_utils_flags'/-I$TEST_UTILS_INCLUDE -L$TEST_UTILS_LIB -ltest_utils}"
-  cmd="${cmd//'%test_lib_flags'/-I$TEST_UTILS_INCLUDE -L$TEST_UTILS_LIB -ltest_lib}"
-  # Strip run_on_npu wrappers (we handle execution separately).
-  cmd="${cmd//'%run_on_npu1%'/}"
-  cmd="${cmd//'%run_on_npu2%'/}"
-  # Trim leading/trailing whitespace.
-  cmd="${cmd#"${cmd%%[![:space:]]*}"}"
-  cmd="${cmd%"${cmd##*[![:space:]]}"}"
-  # Replace bare 'clang' with system clang++ (avoid aietools wrapper).
-  if [[ "$cmd" == clang\ * ]]; then
-    cmd="/usr/bin/clang++ ${cmd#clang }"
-  elif [[ "$cmd" == g++\ * ]]; then
-    cmd="/usr/bin/g++ ${cmd#g++ }"
-  fi
-  echo "$cmd"
-}
-
-# Parse run.lit and extract build commands (everything before the
-# run_on_npu execution line).  Returns commands one per line.
-extract_build_commands() {
-  local lit_file="$1"
-  local src_dir="$2"
-  [[ -f "$lit_file" ]] || return 1
-
-  while IFS= read -r line; do
-    # Only process RUN lines.
-    [[ "$line" == *"RUN:"* ]] || continue
-    local cmd
-    cmd="$(apply_lit_subs "$src_dir" "$line")"
-    # Skip execution lines (the actual test run).
-    [[ "$cmd" == *"./test.exe"* ]] && continue
-    [[ "$cmd" == *"run_on_npu"* ]] && continue
-    # Skip sed for NPUDEVICE -- we handle that separately.
-    [[ "$cmd" == *"NPUDEVICE"* ]] && continue
-    # Skip cp of aie.mlir -- we handle that.
-    [[ "$cmd" == "cp "* ]] && continue
-    echo "$cmd"
-  done < "$lit_file"
-}
-
-compile_test() {
+# Compile one test's xclbin and test.exe. Called via xargs.
+# Writes $RESULTS_DIR/$safe.compile.result and $RESULTS_DIR/$safe.compile.log.
+compile_one() {
   local name="$1"
+  local safe
+  safe="$(sanitize_name "$name")"
   local src_dir="$TEST_SRC/$name"
   local build_dir="$BUILD_BASE/$name"
+  local log_file="$RESULTS_DIR/${safe}.compile.log"
+  local result_file="$RESULTS_DIR/${safe}.compile.result"
+  local lit_file="$src_dir/run.lit"
 
   mkdir -p "$build_dir"
+  : > "$log_file"
 
-  local log_file="$RESULTS_DIR/${name//\//_}_compile.log"
-  local lit_file="$src_dir/run.lit"
   if [[ ! -f "$lit_file" ]]; then
-    err "No run.lit found for $name"
-    return 1
+    echo "FAIL" > "$result_file"
+    echo "No run.lit found" >> "$log_file"
+    echo "  COMPILE $name: FAIL (no run.lit)"
+    return 0
   fi
 
-  # --- xclbin build (expensive, skip if cached) --------------------------
+  # --- 2a: xclbin build (expensive, skip if cached) -----------------------
 
   local have_xclbin=false
   if [[ -f "$build_dir/aie.xclbin" ]] || ls "$build_dir"/*.xclbin &>/dev/null; then
     have_xclbin=true
   fi
 
-  if ! $have_xclbin || $FORCE_COMPILE; then
-    info "Compiling: $name"
-
+  local cached=false
+  if $have_xclbin && [[ "$FORCE_COMPILE" != "true" ]]; then
+    cached=true
+  else
     # Prepare architecture MLIR (NPUDEVICE substitution).
     local npu_dev
     npu_dev="$(get_npu_device "$src_dir")"
@@ -268,39 +311,40 @@ compile_test() {
     local failed=false
     while IFS= read -r cmd; do
       [[ -z "$cmd" ]] && continue
-      # Skip host compilation lines -- we handle test.exe separately.
+      # Skip host compilation -- handled in 2b.
       [[ "$cmd" == *clang*test.cpp* ]] && continue
       [[ "$cmd" == *g++*test.cpp* ]] && continue
-      # Replace references to aie.mlir in aiecc.py commands.
+      # Fix aie.mlir references in aiecc.py commands.
       if [[ "$cmd" == *aiecc.py* ]]; then
         cmd="${cmd//$src_dir\/aie.mlir/./aie_arch.mlir}"
         cmd="${cmd//\.\/aie.mlir/./aie_arch.mlir}"
       fi
       if ! ( cd "$build_dir" && nice -n 19 bash -c "$cmd" ) >> "$log_file" 2>&1; then
-        err "Build step failed for $name: $cmd"
         failed=true
         break
       fi
     done < <(extract_build_commands "$lit_file" "$src_dir")
 
     if $failed; then
-      return 1
+      echo "FAIL" > "$result_file"
+      echo "  COMPILE $name: FAIL"
+      return 0
     fi
 
     # Verify xclbin was produced.
     if [[ ! -f "$build_dir/aie.xclbin" ]]; then
       local any_xclbin
-      any_xclbin=$(find "$build_dir" -name "*.xclbin" -print -quit 2>/dev/null)
+      any_xclbin=$(find "$build_dir" -name "*.xclbin" -print -quit 2>/dev/null || true)
       if [[ -z "$any_xclbin" ]]; then
-        err "No xclbin produced for $name"
-        return 1
+        echo "FAIL" > "$result_file"
+        echo "  COMPILE $name: FAIL (no xclbin produced)"
+        return 0
       fi
     fi
   fi
 
-  # --- test.exe build (cheap, always rebuild with BDF patch) -------------
+  # --- 2b: test.exe build (always, BDF patch must be present) --------------
 
-  # Patch test.cpp: read XRT_DEVICE_BDF env var for device selection.
   if [[ -f "$src_dir/test.cpp" ]]; then
     sed \
       -e 's/unsigned int device_index = 0;/const char* _bdf = std::getenv("XRT_DEVICE_BDF");/' \
@@ -308,14 +352,13 @@ compile_test() {
       "$src_dir/test.cpp" > "$build_dir/test.cpp"
   fi
 
-  # Find the clang line from run.lit for correct flags, or use fallback.
+  # Find the clang/g++ line from run.lit for correct flags.
   local clang_cmd=""
   while IFS= read -r line; do
     [[ "$line" == *"RUN:"* ]] || continue
     local cmd
     cmd="$(apply_lit_subs "$src_dir" "$line")"
     if [[ "$cmd" == *clang*test.cpp* ]] || [[ "$cmd" == *g++*test.cpp* ]]; then
-      # Point at our patched test.cpp.
       cmd="${cmd//$src_dir\/test.cpp/./test.cpp}"
       clang_cmd="$cmd"
       break
@@ -323,149 +366,263 @@ compile_test() {
   done < "$lit_file"
 
   if [[ -n "$clang_cmd" ]]; then
-    ( cd "$build_dir" && bash -c "$clang_cmd" ) >> "$log_file" 2>&1
-  else
-    # Fallback: standard compilation.
-    /usr/bin/clang++ "$build_dir/test.cpp" -o "$build_dir/test.exe" \
-      -std=c++17 -Wall \
-      -I"$XRT_INCLUDE" -L"$XRT_LIB" \
-      -I"$TEST_UTILS_INCLUDE" -L"$TEST_UTILS_LIB" \
-      -luuid -lxrt_coreutil -ltest_utils -lrt -lstdc++ \
-      >> "$log_file" 2>&1 || true
-  fi
-
-  return 0
-}
-
-# ---------------------------------------------------------------------------
-# Execution
-# ---------------------------------------------------------------------------
-
-# Extract the test execution command from run.lit to get correct args.
-get_run_cmd() {
-  local src_dir="$1"
-  local lit_file="$src_dir/run.lit"
-  [[ -f "$lit_file" ]] || return 1
-
-  # Find the first npu1 execution line (prefer npu1, fall back to any).
-  while IFS= read -r line; do
-    [[ "$line" == *"RUN:"* ]] || continue
-    if [[ "$line" == *"./test.exe"* ]] && [[ "$line" == *"npu1"* || "$line" != *"npu2"* ]]; then
-      local cmd
-      cmd="$(apply_lit_subs "$src_dir" "$line")"
-      # Trim leading whitespace from stripping run_on_npu wrappers.
-      cmd="${cmd#"${cmd%%[![:space:]]*}"}"
-      echo "$cmd"
+    if ! ( cd "$build_dir" && bash -c "$clang_cmd" ) >> "$log_file" 2>&1; then
+      echo "FAIL" > "$result_file"
+      echo "  COMPILE $name: FAIL (test.exe)"
       return 0
     fi
-  done < "$lit_file"
+  else
+    if ! /usr/bin/clang++ "$build_dir/test.cpp" -o "$build_dir/test.exe" \
+        -std=c++17 -Wall \
+        -I"$XRT_INCLUDE" -L"$XRT_LIB" \
+        -I"$TEST_UTILS_INCLUDE" -L"$TEST_UTILS_LIB" \
+        -luuid -lxrt_coreutil -ltest_utils -lrt -lstdc++ \
+        >> "$log_file" 2>&1; then
+      echo "FAIL" > "$result_file"
+      echo "  COMPILE $name: FAIL (test.exe fallback)"
+      return 0
+    fi
+  fi
 
-  # Fallback: standard invocation.
-  echo "./test.exe -x aie.xclbin -k MLIR_AIE -i insts.bin"
+  echo "OK" > "$result_file"
+  if $cached; then
+    echo "  COMPILE $name: OK (cached)"
+  else
+    echo "  COMPILE $name: OK"
+  fi
 }
+export -f compile_one
 
-# Run test.exe through XRT bridge (XDNA_EMU=1).
-run_bridge() {
+# ---------------------------------------------------------------------------
+# Phase 3: Hardware runs (serial)
+# ---------------------------------------------------------------------------
+
+run_one_hardware() {
   local name="$1"
+  local bdf="$2"
+  local safe
+  safe="$(sanitize_name "$name")"
   local build_dir="$BUILD_BASE/$name"
   local src_dir="$TEST_SRC/$name"
-  local log_file="$RESULTS_DIR/${name//\//_}_bridge.log"
+  local log_file="$RESULTS_DIR/${safe}.hw.log"
+  local result_file="$RESULTS_DIR/${safe}.hw.result"
 
   if [[ ! -f "$build_dir/test.exe" ]]; then
-    echo "SKIP_NOEXE"
+    echo "SKIP" > "$result_file"
     return
   fi
 
-  # Find any xclbin in the build dir.
   if ! ls "$build_dir"/*.xclbin &>/dev/null; then
-    echo "SKIP_NOXCLBIN"
+    echo "SKIP" > "$result_file"
     return
   fi
 
-  # Extract the run command from run.lit for correct args.
   local run_cmd
   run_cmd="$(get_run_cmd "$src_dir")"
 
+  local rc=0
+  (
+    cd "$build_dir"
+    export XRT_DEVICE_BDF="$bdf"
+    timeout 30 bash -c "$run_cmd"
+  ) > "$log_file" 2>&1 || rc=$?
+
+  if [[ $rc -eq 0 ]] && grep -q "PASS" "$log_file"; then
+    echo "PASS" > "$result_file"
+  elif [[ $rc -eq 124 ]]; then
+    echo "TIMEOUT" > "$result_file"
+  else
+    echo "FAIL" > "$result_file"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Phase 4: Emulator runs (parallel)
+# ---------------------------------------------------------------------------
+
+run_one_bridge() {
+  local name="$1"
+  local safe
+  safe="$(sanitize_name "$name")"
+  local build_dir="$BUILD_BASE/$name"
+  local src_dir="$TEST_SRC/$name"
+  local log_file="$RESULTS_DIR/${safe}.bridge.log"
+  local result_file="$RESULTS_DIR/${safe}.bridge.result"
+
+  if [[ ! -f "$build_dir/test.exe" ]]; then
+    echo "SKIP" > "$result_file"
+    echo "  BRIDGE $name: SKIP (no test.exe)"
+    return
+  fi
+
+  if ! ls "$build_dir"/*.xclbin &>/dev/null; then
+    echo "SKIP" > "$result_file"
+    echo "  BRIDGE $name: SKIP (no xclbin)"
+    return
+  fi
+
+  local run_cmd
+  run_cmd="$(get_run_cmd "$src_dir")"
+
+  local rc=0
   (
     cd "$build_dir"
     export XDNA_EMU=1
     export XDNA_EMU_DEBUG=1
     export XRT_DEVICE_BDF="ffff:ff:1f.0"
     export RUST_LOG=info
-    timeout 60 bash -c "$run_cmd"
-  ) > "$log_file" 2>&1
-
-  local rc=$?
+    timeout 120 bash -c "$run_cmd"
+  ) > "$log_file" 2>&1 || rc=$?
+  local result
   if [[ $rc -eq 0 ]] && grep -q "PASS" "$log_file"; then
-    echo "PASS"
+    result="PASS"
   elif [[ $rc -eq 124 ]]; then
-    echo "TIMEOUT"
+    result="TIMEOUT"
   else
-    echo "FAIL"
+    result="FAIL"
   fi
+
+  # Verify emulator actually ran (catch silent fallthrough to real NPU).
+  if [[ "$result" == "PASS" ]]; then
+    if ! grep -qE '(Loaded PDI|xdna_emu|XDNA emulator)' "$log_file"; then
+      result="EMU_MISS"
+    fi
+  fi
+
+  echo "$result" > "$result_file"
+  echo "  BRIDGE $name: $result"
 }
+export -f run_one_bridge
 
-# Run through npu-test runner (emulator direct API).
-run_nputest() {
-  local name="$1"
-  local log_file="$RESULTS_DIR/${name//\//_}_nputest.log"
+# ---------------------------------------------------------------------------
+# Phase 5: Report
+# ---------------------------------------------------------------------------
 
-  (
-    cd "$EMU_ROOT"
-    timeout 120 cargo run --release --bin npu-test -- "$name" --no-build 2>&1
-  ) > "$log_file" 2>&1
+print_report() {
+  local -n test_list=$1
+  local run_hw=$2
 
-  local rc=$?
-  if [[ $rc -eq 0 ]] && grep -qE 'Passed: *[1-9]' "$log_file"; then
-    echo "PASS"
-  elif [[ $rc -eq 124 ]]; then
-    echo "TIMEOUT"
-  elif grep -qE 'Skipped: *[1-9]' "$log_file"; then
-    echo "SKIP"
-  elif grep -qE 'Unknown: *[1-9]' "$log_file"; then
-    echo "UNKNOWN"
+  echo ""
+  echo "==========================================================================="
+  echo "  RESULTS"
+  echo "==========================================================================="
+  echo ""
+
+  if [[ "$run_hw" == "true" ]]; then
+    printf "%-45s  %-10s  %-10s  %-5s\n" "TEST" "BRIDGE" "HARDWARE" "MATCH"
+    printf "%-45s  %-10s  %-10s  %-5s\n" \
+      "---------------------------------------------" \
+      "----------" "----------" "-----"
   else
-    echo "FAIL"
-  fi
-}
-
-# Real NPU BDF -- detected once at startup.
-REAL_NPU_BDF="$(xrt-smi examine 2>/dev/null | grep -oP '\[0000:[0-9a-f:\.]+\]' | head -1 | tr -d '[]')"
-
-# Run test.exe on real hardware via BDF selection.
-run_hardware() {
-  local name="$1"
-  local build_dir="$BUILD_BASE/$name"
-  local src_dir="$TEST_SRC/$name"
-  local log_file="$RESULTS_DIR/${name//\//_}_hw.log"
-
-  if [[ ! -f "$build_dir/test.exe" ]]; then
-    echo "SKIP_NOEXE"
-    return
+    printf "%-45s  %-10s\n" "TEST" "BRIDGE"
+    printf "%-45s  %-10s\n" \
+      "---------------------------------------------" "----------"
   fi
 
-  if [[ -z "$REAL_NPU_BDF" ]]; then
-    echo "SKIP_NOHW"
-    return
+  local pass_bridge=0 fail_bridge=0 skip_bridge=0 timeout_bridge=0 emumiss_bridge=0
+  local pass_hw=0 fail_hw=0 skip_hw=0 timeout_hw=0
+  local match_count=0 mismatch_count=0
+
+  for name in "${test_list[@]}"; do
+    local safe
+    safe="$(sanitize_name "$name")"
+
+    # Read compile result -- skip tests that failed to compile.
+    local compile_result="OK"
+    if [[ -f "$RESULTS_DIR/${safe}.compile.result" ]]; then
+      compile_result="$(< "$RESULTS_DIR/${safe}.compile.result")"
+    fi
+    if [[ "$compile_result" != "OK" ]]; then
+      if [[ "$run_hw" == "true" ]]; then
+        printf "%-45s  %-10s  %-10s  %-5s\n" "$name" "COMP_FAIL" "COMP_FAIL" "-"
+      else
+        printf "%-45s  %-10s\n" "$name" "COMP_FAIL"
+      fi
+      ((skip_bridge++)) || true
+      ((skip_hw++)) || true
+      continue
+    fi
+
+    # Read bridge result.
+    local bridge_result="SKIP"
+    if [[ -f "$RESULTS_DIR/${safe}.bridge.result" ]]; then
+      bridge_result="$(< "$RESULTS_DIR/${safe}.bridge.result")"
+    fi
+    case "$bridge_result" in
+      PASS)     ((pass_bridge++)) || true ;;
+      TIMEOUT)  ((timeout_bridge++)); ((fail_bridge++)) || true ;;
+      EMU_MISS) ((emumiss_bridge++)); ((fail_bridge++)) || true ;;
+      SKIP*)    ((skip_bridge++)) || true ;;
+      *)        ((fail_bridge++)) || true ;;
+    esac
+
+    # Read hardware result.
+    local hw_result="SKIP"
+    if [[ "$run_hw" == "true" ]] && [[ -f "$RESULTS_DIR/${safe}.hw.result" ]]; then
+      hw_result="$(< "$RESULTS_DIR/${safe}.hw.result")"
+    fi
+    if [[ "$run_hw" == "true" ]]; then
+      case "$hw_result" in
+        PASS)    ((pass_hw++)) || true ;;
+        TIMEOUT) ((timeout_hw++)); ((fail_hw++)) || true ;;
+        SKIP*)   ((skip_hw++)) || true ;;
+        *)       ((fail_hw++)) || true ;;
+      esac
+    fi
+
+    # Print row.
+    if [[ "$run_hw" == "true" ]]; then
+      local match="-"
+      if [[ "$bridge_result" == "SKIP"* ]] || [[ "$hw_result" == "SKIP"* ]]; then
+        match="-"
+      elif [[ "$bridge_result" == "$hw_result" ]]; then
+        match="yes"
+        ((match_count++)) || true
+      else
+        match="NO"
+        ((mismatch_count++)) || true
+      fi
+      printf "%-45s  %-10s  %-10s  %-5s\n" "$name" "$bridge_result" "$hw_result" "$match"
+    else
+      printf "%-45s  %-10s\n" "$name" "$bridge_result"
+    fi
+
+    # Verbose: show log tail on failure.
+    if [[ "$VERBOSE" == "true" ]] && [[ "$bridge_result" != "PASS" ]] && [[ "$bridge_result" != "SKIP"* ]]; then
+      local logf="$RESULTS_DIR/${safe}.bridge.log"
+      if [[ -f "$logf" ]]; then
+        echo "    --- bridge log tail ---"
+        tail -5 "$logf" | sed 's/^/    /'
+      fi
+    fi
+    if [[ "$VERBOSE" == "true" ]] && [[ "$run_hw" == "true" ]] && \
+       [[ "$hw_result" != "PASS" ]] && [[ "$hw_result" != "SKIP"* ]]; then
+      local logf="$RESULTS_DIR/${safe}.hw.log"
+      if [[ -f "$logf" ]]; then
+        echo "    --- hw log tail ---"
+        tail -5 "$logf" | sed 's/^/    /'
+      fi
+    fi
+  done
+
+  # Summary.
+  echo ""
+  echo "=== Summary ==="
+  echo "Bridge:   $pass_bridge pass, $fail_bridge fail, $skip_bridge skip"
+  if [[ $timeout_bridge -gt 0 ]]; then
+    echo "          ($timeout_bridge timeout)"
   fi
-
-  local run_cmd
-  run_cmd="$(get_run_cmd "$src_dir")"
-
-  (
-    cd "$build_dir"
-    export XRT_DEVICE_BDF="$REAL_NPU_BDF"
-    timeout 30 bash -c "$run_cmd"
-  ) > "$log_file" 2>&1
-
-  local rc=$?
-  if [[ $rc -eq 0 ]] && grep -q "PASS" "$log_file"; then
-    echo "PASS"
-  elif [[ $rc -eq 124 ]]; then
-    echo "TIMEOUT"
-  else
-    echo "FAIL"
+  if [[ $emumiss_bridge -gt 0 ]]; then
+    echo "          ($emumiss_bridge EMU_MISS -- emulator not detected in log!)"
   fi
+  if [[ "$run_hw" == "true" ]]; then
+    echo "Hardware: $pass_hw pass, $fail_hw fail, $skip_hw skip"
+    if [[ $timeout_hw -gt 0 ]]; then
+      echo "          ($timeout_hw timeout)"
+    fi
+    echo "Match:    $match_count match, $mismatch_count mismatch"
+  fi
+  echo "Logs:     $RESULTS_DIR/"
 }
 
 # ---------------------------------------------------------------------------
@@ -473,6 +630,8 @@ run_hardware() {
 # ---------------------------------------------------------------------------
 
 main() {
+  # ---- Phase 1: Discover -------------------------------------------------
+
   mapfile -t tests < <(discover_tests)
 
   if [[ ${#tests[@]} -eq 0 ]]; then
@@ -486,160 +645,102 @@ main() {
     exit 0
   fi
 
-  info "Found ${#tests[@]} test(s) to run"
+  info "Found ${#tests[@]} test(s), parallelism: -j${JOBS}"
   info "Results in: $RESULTS_DIR"
   echo ""
 
-  # Header
-  if $BRIDGE_ONLY; then
-    printf "%-45s  %-10s  %-10s\n" "TEST" "BRIDGE" "NOTES"
-    printf "%-45s  %-10s  %-10s\n" "----" "------" "-----"
-  elif $RUN_HW; then
-    printf "%-45s  %-10s  %-10s  %-10s  %-10s\n" "TEST" "BRIDGE" "NPU-TEST" "HARDWARE" "MATCH"
-    printf "%-45s  %-10s  %-10s  %-10s  %-10s\n" "----" "------" "--------" "--------" "-----"
-  else
-    printf "%-45s  %-10s  %-10s  %-10s\n" "TEST" "BRIDGE" "NPU-TEST" "MATCH"
-    printf "%-45s  %-10s  %-10s  %-10s\n" "----" "------" "--------" "-----"
-  fi
-
-  local pass_bridge=0 fail_bridge=0 skip_bridge=0
-  local pass_nputest=0 fail_nputest=0 skip_nputest=0
-  local pass_hw=0 fail_hw=0 skip_hw=0
-  local match_count=0 mismatch_count=0
-
+  # Filter out npu2-only tests before running phases.
+  local runnable=()
+  local skipped_npu2=0
   for name in "${tests[@]}"; do
-    local notes=""
-    local bridge_result="SKIP"
-    local nputest_result="SKIP"
-    local hw_result="SKIP"
-
-    # Skip Chess-only and NPU2-only tests.
-    if requires_chess "$TEST_SRC/$name"; then
-      notes="chess"
-      printf "%-45s  %-10s" "$name" "SKIP_CHESS"
-      if ! $BRIDGE_ONLY; then
-        printf "  %-10s" "SKIP_CHESS"
-      fi
-      if $RUN_HW; then
-        printf "  %-10s" "SKIP_CHESS"
-      fi
-      printf "  %-10s\n" "$notes"
-      ((skip_bridge++)) || true
-      ((skip_nputest++)) || true
-      continue
-    fi
-
     if requires_npu2 "$TEST_SRC/$name"; then
-      notes="npu2"
-      printf "%-45s  %-10s" "$name" "SKIP_NPU2"
-      if ! $BRIDGE_ONLY; then
-        printf "  %-10s" "SKIP_NPU2"
-      fi
-      if $RUN_HW; then
-        printf "  %-10s" "SKIP_NPU2"
-      fi
-      printf "  %-10s\n" "$notes"
-      ((skip_bridge++)) || true
-      ((skip_nputest++)) || true
-      continue
-    fi
-
-    # Compile everything (kernel objects, xclbin, host test.exe).
-    if ! compile_test "$name" 2>/dev/null; then
-      notes="compile_fail"
-      printf "%-45s  %-10s" "$name" "COMP_FAIL"
-      if ! $BRIDGE_ONLY; then
-        printf "  %-10s" "COMP_FAIL"
-      fi
-      if $RUN_HW; then
-        printf "  %-10s" "COMP_FAIL"
-      fi
-      printf "  %-10s\n" "$notes"
-      ((skip_bridge++)) || true
-      ((skip_nputest++)) || true
-      continue
-    fi
-
-    # Run XRT bridge path.
-    bridge_result=$(run_bridge "$name")
-
-    case "$bridge_result" in
-      PASS) ((pass_bridge++)) || true ;;
-      SKIP*) ((skip_bridge++)) || true ;;
-      *) ((fail_bridge++)) || true ;;
-    esac
-
-    # Run npu-test runner path.
-    if ! $BRIDGE_ONLY; then
-      nputest_result=$(run_nputest "$name")
-      case "$nputest_result" in
-        PASS) ((pass_nputest++)) || true ;;
-        SKIP*) ((skip_nputest++)) || true ;;
-        *) ((fail_nputest++)) || true ;;
-      esac
-    fi
-
-    # Run on hardware.
-    if $RUN_HW; then
-      hw_result=$(run_hardware "$name")
-      case "$hw_result" in
-        PASS) ((pass_hw++)) || true ;;
-        SKIP*) ((skip_hw++)) || true ;;
-        *) ((fail_hw++)) || true ;;
-      esac
-    fi
-
-    # Determine match.
-    local match=""
-    if ! $BRIDGE_ONLY; then
-      if [[ "$bridge_result" == "$nputest_result" ]]; then
-        match="yes"
-        ((match_count++)) || true
-      elif [[ "$bridge_result" == "SKIP"* ]] || [[ "$nputest_result" == "SKIP"* ]]; then
-        match="-"
-      else
-        match="NO"
-        ((mismatch_count++)) || true
-      fi
-    fi
-
-    # Print row.
-    printf "%-45s  %-10s" "$name" "$bridge_result"
-    if ! $BRIDGE_ONLY; then
-      printf "  %-10s" "$nputest_result"
-    fi
-    if $RUN_HW; then
-      printf "  %-10s" "$hw_result"
-    fi
-    if [[ -n "$match" ]]; then
-      printf "  %-10s" "$match"
-    fi
-    if [[ -n "$notes" ]]; then
-      printf "  %s" "$notes"
-    fi
-    printf "\n"
-
-    # Show verbose output on failure.
-    if $VERBOSE && [[ "$bridge_result" != "PASS" ]] && [[ "$bridge_result" != "SKIP"* ]]; then
-      local logf="$RESULTS_DIR/${name//\//_}_bridge.log"
-      [[ -f "$logf" ]] && tail -5 "$logf" | sed 's/^/    /'
+      local safe
+      safe="$(sanitize_name "$name")"
+      echo "SKIP_NPU2" > "$RESULTS_DIR/${safe}.bridge.result"
+      echo "SKIP_NPU2" > "$RESULTS_DIR/${safe}.compile.result"
+      ((skipped_npu2++)) || true
+    else
+      runnable+=("$name")
     fi
   done
 
-  # Summary
+  if [[ $skipped_npu2 -gt 0 ]]; then
+    info "Skipped $skipped_npu2 npu2-only test(s)"
+  fi
+
+  # ---- Phase 2: Compile --------------------------------------------------
+
+  info "Phase 2: Compiling ${#runnable[@]} test(s) (-j${JOBS})"
+
+  printf '%s\n' "${runnable[@]}" | xargs -P"$JOBS" -I{} bash -c 'compile_one "$@"' _ {}
+
+  # Count compile results.
+  local compile_ok=0 compile_fail=0
+  for name in "${runnable[@]}"; do
+    local safe
+    safe="$(sanitize_name "$name")"
+    local cr="OK"
+    [[ -f "$RESULTS_DIR/${safe}.compile.result" ]] && cr="$(< "$RESULTS_DIR/${safe}.compile.result")"
+    if [[ "$cr" == "OK" ]]; then
+      ((compile_ok++)) || true
+    else
+      ((compile_fail++)) || true
+    fi
+  done
+  info "Phase 2 done: $compile_ok OK, $compile_fail failed"
   echo ""
-  echo "=== Summary ==="
-  echo "Bridge:   $pass_bridge pass, $fail_bridge fail, $skip_bridge skip"
-  if ! $BRIDGE_ONLY; then
-    echo "npu-test: $pass_nputest pass, $fail_nputest fail, $skip_nputest skip"
-  fi
+
+  # Build list of tests that compiled successfully.
+  local compiled=()
+  for name in "${runnable[@]}"; do
+    local safe
+    safe="$(sanitize_name "$name")"
+    local cr="FAIL"
+    [[ -f "$RESULTS_DIR/${safe}.compile.result" ]] && cr="$(< "$RESULTS_DIR/${safe}.compile.result")"
+    if [[ "$cr" == "OK" ]]; then
+      compiled+=("$name")
+    fi
+  done
+
+  # ---- Phase 3: Hardware runs (serial, opt-in) ---------------------------
+
   if $RUN_HW; then
-    echo "Hardware: $pass_hw pass, $fail_hw fail, $skip_hw skip"
+    local real_bdf
+    real_bdf="$(xrt-smi examine 2>/dev/null | grep -oP '\[0000:[0-9a-f:\.]+\]' | head -1 | tr -d '[]')" || true
+
+    if [[ -z "$real_bdf" ]]; then
+      info "Phase 3: SKIPPED -- no NPU hardware detected"
+      RUN_HW=false
+    else
+      info "Phase 3: Running ${#compiled[@]} test(s) on hardware (serial, BDF=$real_bdf)"
+      local hw_done=0
+      for name in "${compiled[@]}"; do
+        ((hw_done++)) || true
+        run_one_hardware "$name" "$real_bdf"
+        local safe
+        safe="$(sanitize_name "$name")"
+        local hr="SKIP"
+        [[ -f "$RESULTS_DIR/${safe}.hw.result" ]] && hr="$(< "$RESULTS_DIR/${safe}.hw.result")"
+        echo "  [${hw_done}/${#compiled[@]}] HW $name: $hr"
+      done
+      info "Phase 3 done"
+      echo ""
+    fi
   fi
-  if ! $BRIDGE_ONLY; then
-    echo "Match:    $match_count match, $mismatch_count mismatch"
-  fi
-  echo "Logs:     $RESULTS_DIR/"
+
+  # ---- Phase 4: Emulator runs (parallel) ---------------------------------
+
+  info "Phase 4: Running ${#compiled[@]} test(s) on emulator (-j${JOBS})"
+
+  printf '%s\n' "${compiled[@]}" | xargs -P"$JOBS" -I{} bash -c 'run_one_bridge "$@"' _ {}
+
+  info "Phase 4 done"
+  echo ""
+
+  # ---- Phase 5: Report ---------------------------------------------------
+
+  info "Phase 5: Report"
+  print_report tests "$RUN_HW"
 }
 
 main
