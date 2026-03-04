@@ -44,6 +44,9 @@ message(STATUS "XRT coreutil: ${XRT_COREUTIL_LIB}")
 
 add_library(xrt_driver_emu SHARED
   src/transport_inprocess.cpp
+  src/drv_emu.cpp
+  src/pdev_emu.cpp
+  src/platform_emu.cpp
 )
 
 set_target_properties(xrt_driver_emu PROPERTIES
@@ -58,11 +61,12 @@ target_compile_definitions(xrt_driver_emu PRIVATE
 )
 
 target_include_directories(xrt_driver_emu PRIVATE
-  # XRT public headers (installed).
-  "${XRT_INSTALL_DIR}/include"
-  # XRT internal headers (source tree inside xdna-driver submodule).
+  # XRT internal headers (source tree) FIRST -- they must shadow the
+  # installed XRT headers when the xdna-driver submodule is newer.
   "${XRT_RUNTIME_SRC}"
   "${XRT_RUNTIME_SRC}/core/include"
+  # XRT public headers (installed) -- fallback for anything not in source.
+  "${XRT_INSTALL_DIR}/include"
   # XDNA shim sources (for local includes within the shim).
   "${XDNA_SHIM_DIR}"
   # XDNA src root (for "shim/foo.h" style includes).
