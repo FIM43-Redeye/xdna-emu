@@ -43,8 +43,13 @@ public:
 
     // -- Execution -----------------------------------------------------------
 
-    /// Submit NPU instructions and run the emulator to completion.
+    /// Submit NPU instructions (from host memory) and run to completion.
     virtual void execute(const void* instructions, size_t size) = 0;
+
+    /// Execute NPU instructions already in emulator memory at @dev_addr.
+    /// This is the normal XRT path: instructions were sync'd to device
+    /// memory via sync_bo, and the ert_packet tells us the address.
+    virtual void execute_from_device(uint64_t dev_addr, uint32_t size) = 0;
 
     /// Check whether the last execution has completed.
     virtual bool poll_completion() = 0;

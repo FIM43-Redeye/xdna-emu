@@ -44,6 +44,7 @@ public:
                          size_t size) override;
 
     void execute(const void* instructions, size_t size) override;
+    void execute_from_device(uint64_t dev_addr, uint32_t size) override;
     bool poll_completion() override;
 
     uint32_t read_reg(uint16_t col, uint16_t row,

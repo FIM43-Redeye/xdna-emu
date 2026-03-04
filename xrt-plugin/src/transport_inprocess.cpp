@@ -9,6 +9,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace xdna_emu {
 
@@ -214,6 +215,20 @@ void emu_transport_inprocess::execute(const void* instructions, size_t size)
     ExecStatus status = sym_run_(emu_);
     check(status.result, "execute (run)");
     last_run_complete_ = (status.halted != 0);
+}
+
+void emu_transport_inprocess::execute_from_device(uint64_t dev_addr,
+                                                   uint32_t size)
+{
+    // Read the instruction bytes from emulator memory, then execute them
+    // through the normal path.  This is the XRT flow: the host wrote
+    // instructions into a BO, sync'd it to device, and the ert_packet
+    // tells us the device address.
+    std::vector<uint8_t> instr(size);
+    Result rc = sym_read_host_memory_(emu_, dev_addr, instr.data(),
+                                       static_cast<uint64_t>(size));
+    check(rc, "execute_from_device (read instructions)");
+    execute(instr.data(), size);
 }
 
 bool emu_transport_inprocess::poll_completion()

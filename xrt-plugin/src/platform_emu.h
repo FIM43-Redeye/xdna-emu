@@ -44,6 +44,9 @@ private:
   create_bo(shim_xdna::bo_info& arg) const override;
 
   void
+  create_uptr_bo(shim_xdna::bo_info& arg) const override;
+
+  void
   destroy_bo(shim_xdna::destroy_bo_arg& arg) const override;
 
   void
@@ -118,20 +121,28 @@ private:
   // -- Internal state --------------------------------------------------------
 
   // The transport is owned by pdev_emu; we hold a non-owning pointer
-  // set during drv_open via the pdev_emu that opened us.
+  // set by pdev_emu::on_first_open() after creating the transport.
   mutable emu_transport* m_transport = nullptr;
+
+public:
+  void
+  set_transport(emu_transport* t) const { m_transport = t; }
+
+private:
 
   // Monotonic counters for synthetic handles.
   mutable std::atomic<uint32_t> m_next_ctx_handle{1};
   mutable std::atomic<uint32_t> m_next_bo_handle{1};
   mutable std::atomic<uint64_t> m_next_seq{1};
   mutable std::atomic<uint32_t> m_next_syncobj{1};
+  mutable std::atomic<uint64_t> m_memfd_size{0};  // Current memfd file size.
 
-  // Map BO handle -> {device_addr, size, host_ptr}.
+  // Map BO handle -> {device_addr, size, host_ptr, user_ptr}.
   struct bo_entry {
-    uint64_t dev_addr;
-    size_t   size;
-    void*    host_ptr;
+    uint64_t dev_addr  = 0;
+    size_t   size      = 0;
+    void*    host_ptr  = nullptr;
+    bool     user_ptr  = false;  // true = caller-owned, do not free
   };
   mutable std::mutex m_bo_lock;
   mutable std::unordered_map<uint32_t, bo_entry> m_bo_map;
@@ -143,6 +154,8 @@ private:
     int64_t  pid       = 0;
     uint64_t submissions = 0;
     uint64_t completions = 0;
+    uint16_t num_cus   = 0;
+    uint32_t debug_bo  = 0;  // 0 = no debug buffer attached
   };
   mutable std::mutex m_ctx_lock;
   mutable std::unordered_map<uint32_t, ctx_entry> m_ctx_map;

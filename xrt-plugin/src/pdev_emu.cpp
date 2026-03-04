@@ -3,6 +3,7 @@
 // pdev_emu.cpp -- Synthetic PCI device for the emulator.
 
 #include "pdev_emu.h"
+#include "platform_emu.h"
 #include "shim/shim_debug.h"
 #include <cstdlib>
 
@@ -19,6 +20,11 @@ on_first_open() const
   std::string lib_path = lib_env ? lib_env : "libxdna_emu.so";
 
   m_transport = emu_transport::create_inprocess(lib_path);
+
+  // Wire the transport into the platform driver so that its ioctl
+  // handlers (create_bo, sync_bo, submit_cmd, etc.) can reach it.
+  if (m_platform)
+    m_platform->set_transport(m_transport.get());
 }
 
 void
@@ -26,6 +32,8 @@ pdev_emu::
 on_last_close() const
 {
   const std::lock_guard<std::mutex> lock(m_lock);
+  if (m_platform)
+    m_platform->set_transport(nullptr);
   m_transport.reset();
 }
 
@@ -33,8 +41,10 @@ bool
 pdev_emu::
 is_cache_coherent() const
 {
-  // Emulation runs entirely in host memory -- always coherent.
-  return true;
+  // Return false so that sync_bo is called by the shim.  The emulator
+  // has its own internal memory -- sync_bo copies data between the
+  // host-side memfd and the emulator's device memory.
+  return false;
 }
 
 uint64_t

@@ -9,10 +9,12 @@
 #include "platform_emu.h"
 #include "shim/shim_debug.h"
 #include "drm_local/amdxdna_accel.h"
+#include "core/include/ert.h"
 
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <sys/mman.h>
 #include <thread>
 #include <unistd.h>
 
@@ -26,19 +28,27 @@ void
 platform_drv_emu::
 drv_open(const std::string& /*sysfs_name*/) const
 {
-  // No real device node to open.  The base class drv_open() would try
-  // to open /dev/accel/accelN which does not exist for emulation.
-  //
-  // The transport is owned by pdev_emu and will be set separately.
-  // We do NOT call the base implementation.
+  // Create an anonymous memory-backed fd via memfd_create.  The base
+  // class drv_mmap() calls ::mmap(fd, offset) which works on memfds,
+  // so the entire buffer mmap machinery works unchanged.  We grow the
+  // memfd with ftruncate() each time a BO needs mmap space.
+  int fd = memfd_create("xdna-emu", MFD_CLOEXEC);
+  if (fd < 0)
+    shim_err(errno, "drv_open: memfd_create failed");
+
+  m_dev_fd = fd;
 }
 
 void
 platform_drv_emu::
 drv_close() const
 {
-  // Nothing to close -- no real fd was opened.
   m_transport = nullptr;
+
+  if (m_dev_fd >= 0) {
+    ::close(m_dev_fd);
+    m_dev_fd = -1;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -74,18 +84,57 @@ destroy_ctx(shim_xdna::destroy_ctx_arg& arg) const
 
 void
 platform_drv_emu::
-config_ctx_cu_config(shim_xdna::config_ctx_cu_config_arg& /*arg*/) const
+config_ctx_cu_config(shim_xdna::config_ctx_cu_config_arg& arg) const
 {
-  // Accept kernel configuration silently.  The real driver would push
-  // the configuration buffer to firmware; the emulator receives kernels
-  // through the xclbin load path instead.
+  // The conf_buf contains amdxdna_hwctx_param_config_cu: a count of CUs
+  // followed by per-CU entries (cu_bo handle + cu_func).  On real hardware,
+  // this pushes PDI data to firmware.  The emulator receives kernels through
+  // load_xclbin(), so CU config is informational -- but we log and track it
+  // for debugging and future use (e.g., control packet routing).
+
+  if (arg.conf_buf.size() < sizeof(amdxdna_hwctx_param_config_cu))
+    return;  // Malformed, nothing to do.
+
+  auto* conf = reinterpret_cast<const amdxdna_hwctx_param_config_cu*>(
+    arg.conf_buf.data());
+
+  shim_debug("config_ctx_cu_config: ctx %u, %u CUs", arg.ctx_handle, conf->num_cus);
+
+  // Track CU config per context for diagnostics.
+  {
+    const std::lock_guard<std::mutex> lock(m_ctx_lock);
+    auto it = m_ctx_map.find(arg.ctx_handle);
+    if (it != m_ctx_map.end()) {
+      it->second.num_cus = conf->num_cus;
+    }
+  }
+
+  for (uint16_t i = 0; i < conf->num_cus; i++) {
+    auto& cu = conf->cu_configs[i];
+    shim_debug("  CU[%u]: bo=%u func=%u", i, cu.cu_bo, cu.cu_func);
+  }
 }
 
 void
 platform_drv_emu::
-config_ctx_debug_bo(shim_xdna::config_ctx_debug_bo_arg& /*arg*/) const
+config_ctx_debug_bo(shim_xdna::config_ctx_debug_bo_arg& arg) const
 {
-  // Debug buffer attach/detach is a no-op for emulation.
+  // Track debug buffer association per context.  The emulator can use
+  // this for diagnostic data output in the future.
+  const std::lock_guard<std::mutex> lock(m_ctx_lock);
+  auto it = m_ctx_map.find(arg.ctx_handle);
+  if (it == m_ctx_map.end())
+    return;
+
+  if (arg.is_detach) {
+    shim_debug("config_ctx_debug_bo: detach bo %u from ctx %u",
+               arg.bo.handle, arg.ctx_handle);
+    it->second.debug_bo = 0;
+  } else {
+    shim_debug("config_ctx_debug_bo: attach bo %u to ctx %u",
+               arg.bo.handle, arg.ctx_handle);
+    it->second.debug_bo = arg.bo.handle;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -102,11 +151,15 @@ create_bo(shim_xdna::bo_info& arg) const
   // Ask the emulator to allocate a buffer and return a device address.
   uint64_t dev_addr = m_transport->alloc_buffer(arg.size);
 
-  // Allocate a host-side mapping for the caller.
-  void* host_ptr = std::aligned_alloc(4096, (arg.size + 4095) & ~4095UL);
-  if (!host_ptr)
-    shim_err(ENOMEM, "create_bo: aligned_alloc failed for %zu bytes", arg.size);
-  std::memset(host_ptr, 0, arg.size);
+  // Grow the memfd to accommodate this BO and record its mmap offset.
+  size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+  size_t aligned_size = (arg.size + page_size - 1) & ~(page_size - 1);
+  uint64_t offset = m_memfd_size.fetch_add(aligned_size);
+  fprintf(stderr, "[EMU] create_bo: size=%zu dev_addr=0x%lx map_offset=0x%lx\n",
+          arg.size, dev_addr, offset);
+
+  if (ftruncate(m_dev_fd, static_cast<off_t>(offset + aligned_size)) < 0)
+    shim_err(errno, "create_bo: ftruncate memfd to %zu failed", offset + aligned_size);
 
   // Assign a synthetic BO handle.
   uint32_t handle = m_next_bo_handle.fetch_add(1);
@@ -115,20 +168,43 @@ create_bo(shim_xdna::bo_info& arg) const
   arg.bo.handle = handle;
   arg.bo.res_id = AMDXDNA_INVALID_BO_HANDLE;
   arg.xdna_addr = dev_addr;
-  arg.vaddr = host_ptr;
-
-  // Use AMDXDNA_INVALID_ADDR so that the shim's mmap_drm_bo() skips
-  // the mmap path entirely (it checks for this sentinel).  The vaddr
-  // is already usable via the host_ptr we allocated.
-  arg.map_offset = AMDXDNA_INVALID_ADDR;
+  arg.vaddr = nullptr;       // Will be set by shim's mmap path.
+  arg.map_offset = offset;   // Valid offset into our memfd.
 
   // Track the allocation.
   {
     const std::lock_guard<std::mutex> lock(m_bo_lock);
-    m_bo_map[handle] = {dev_addr, arg.size, host_ptr};
+    m_bo_map[handle] = {dev_addr, arg.size, nullptr, /*user_ptr=*/false};
   }
 
   // Store in the base class BO info map for later lookup.
+  save_bo_info(handle, arg);
+}
+
+void
+platform_drv_emu::
+create_uptr_bo(shim_xdna::bo_info& arg) const
+{
+  if (!m_transport)
+    shim_err(ENODEV, "create_uptr_bo: transport not initialized");
+
+  // User-pointer BOs wrap an existing host allocation.  The caller
+  // already set arg.vaddr to their buffer.  We allocate a device
+  // address but the shim handles the vaddr via its uptr path.
+  uint64_t dev_addr = m_transport->alloc_buffer(arg.size);
+
+  uint32_t handle = m_next_bo_handle.fetch_add(1);
+  arg.bo.handle = handle;
+  arg.bo.res_id = AMDXDNA_INVALID_BO_HANDLE;
+  arg.xdna_addr = dev_addr;
+  // uptr BOs skip mmap_drm_bo entirely (buffer::vaddr returns m_uptr).
+  arg.map_offset = AMDXDNA_INVALID_ADDR;
+
+  {
+    const std::lock_guard<std::mutex> lock(m_bo_lock);
+    m_bo_map[handle] = {dev_addr, arg.size, arg.vaddr, /*user_ptr=*/true};
+  }
+
   save_bo_info(handle, arg);
 }
 
@@ -149,9 +225,9 @@ destroy_bo(shim_xdna::destroy_bo_arg& arg) const
     }
   }
 
-  if (entry.host_ptr)
-    std::free(entry.host_ptr);
-
+  // Regular BOs are backed by memfd (freed when fd is closed).
+  // User-pointer BOs have caller-owned memory -- never freed by us.
+  // Only the emulator-side device address needs explicit cleanup.
   if (m_transport && entry.dev_addr)
     m_transport->free_buffer(entry.dev_addr);
 }
@@ -163,7 +239,7 @@ sync_bo(shim_xdna::sync_bo_arg& arg) const
   if (!m_transport)
     shim_err(ENODEV, "sync_bo: transport not initialized");
 
-  // Look up the BO's host and device addresses.
+  // Look up the BO's device address and saved bo_info (for mmap offset).
   bo_entry entry{};
   {
     const std::lock_guard<std::mutex> lock(m_bo_lock);
@@ -173,17 +249,43 @@ sync_bo(shim_xdna::sync_bo_arg& arg) const
     entry = it->second;
   }
 
-  auto* host = static_cast<uint8_t*>(entry.host_ptr);
   uint64_t dev = entry.dev_addr;
 
+  if (entry.user_ptr) {
+    // User-pointer BOs have a direct host pointer.
+    auto* host = static_cast<uint8_t*>(entry.host_ptr);
+    if (arg.direction == xrt_core::buffer_handle::direction::host2device)
+      m_transport->write_memory(dev + arg.offset, host + arg.offset, arg.size);
+    else
+      m_transport->read_memory(dev + arg.offset, host + arg.offset, arg.size);
+    return;
+  }
+
+  // Regular BOs are backed by the memfd.  Use the base-class bo_info
+  // to find the mmap offset, then pread/pwrite the memfd directly.
+  shim_xdna::bo_info info{};
+  if (!load_bo_info(arg.bo.handle, info))
+    shim_err(ENOENT, "sync_bo: no bo_info for handle %u", arg.bo.handle);
+
+  std::vector<uint8_t> buf(arg.size);
+
   if (arg.direction == xrt_core::buffer_handle::direction::host2device) {
-    m_transport->write_memory(dev + arg.offset,
-                              host + arg.offset,
-                              arg.size);
+    // Read from memfd (host) -> write to emulator (device).
+    ssize_t n = pread(m_dev_fd, buf.data(), arg.size,
+                      static_cast<off_t>(info.map_offset + arg.offset));
+    if (n < 0)
+      shim_err(errno, "sync_bo: pread memfd failed");
+    fprintf(stderr, "[EMU] sync_bo h2d: bo=%u dev=0x%lx offset=0x%lx pread=%zd first=0x%08x\n",
+            arg.bo.handle, dev, info.map_offset + arg.offset, n,
+            arg.size >= 4 ? *reinterpret_cast<uint32_t*>(buf.data()) : 0);
+    m_transport->write_memory(dev + arg.offset, buf.data(), arg.size);
   } else {
-    m_transport->read_memory(dev + arg.offset,
-                             host + arg.offset,
-                             arg.size);
+    // Read from emulator (device) -> write to memfd (host).
+    m_transport->read_memory(dev + arg.offset, buf.data(), arg.size);
+    ssize_t n = pwrite(m_dev_fd, buf.data(), arg.size,
+                       static_cast<off_t>(info.map_offset + arg.offset));
+    if (n < 0)
+      shim_err(errno, "sync_bo: pwrite memfd failed");
   }
 }
 
@@ -213,7 +315,12 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
   if (!m_transport)
     shim_err(ENODEV, "submit_cmd: transport not initialized");
 
-  // Retrieve the command BO's host pointer to find the instruction buffer.
+  // Look up the command BO's mmap offset in the memfd so we can read
+  // the instruction payload and write back the completion state.
+  shim_xdna::bo_info info{};
+  if (!load_bo_info(arg.cmd_bo.handle, info))
+    shim_err(ENOENT, "submit_cmd: no bo_info for cmd BO handle %u", arg.cmd_bo.handle);
+
   bo_entry entry{};
   {
     const std::lock_guard<std::mutex> lock(m_bo_lock);
@@ -223,8 +330,57 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
     entry = it->second;
   }
 
-  // The command BO contains NPU instructions.
-  m_transport->execute(entry.host_ptr, entry.size);
+  // Read the command BO (ert_packet) from the memfd.
+  std::vector<uint8_t> buf(entry.size);
+  ssize_t n = pread(m_dev_fd, buf.data(), entry.size,
+                    static_cast<off_t>(info.map_offset));
+  if (n < 0)
+    shim_err(errno, "submit_cmd: pread memfd failed");
+
+  // Parse the ert_packet to find the NPU instruction buffer.
+  // Supported opcodes:
+  //   ERT_START_NPU  -- ert_npu_data after cu_mask(s) has instruction_buffer
+  //   ERT_START_CU   -- kernel regmap after cu_mask(s), instruction address
+  //                     at the offset defined in the xclbin kernel metadata
+  auto* pkt = reinterpret_cast<ert_start_kernel_cmd*>(buf.data());
+  uint64_t instr_addr = 0;
+  uint32_t instr_size = 0;
+
+  if (auto* npu = get_ert_npu_data(pkt)) {
+    // ERT_START_NPU: explicit instruction buffer in ert_npu_data.
+    instr_addr = npu->instruction_buffer;
+    instr_size = npu->instruction_buffer_size;
+  } else if (pkt->opcode == ERT_START_CU) {
+    // ERT_START_CU: kernel arguments packed in the register map after
+    // the header (4 bytes) + cu_mask (4 bytes) + extra_cu_masks.
+    // The xclbin metadata defines the argument layout:
+    //   arg1 "instr"  offset=0x08  size=8  (device address of instr BO)
+    //   arg2 "ninstr" offset=0x10  size=4  (instruction count in uint32_t)
+    // Regmap starts at &pkt->data[0 + extra_cu_masks].
+    auto* regmap = reinterpret_cast<uint8_t*>(
+        pkt->data + pkt->extra_cu_masks);
+    instr_addr = *reinterpret_cast<uint64_t*>(regmap + 0x08);
+    uint32_t ninstr = *reinterpret_cast<uint32_t*>(regmap + 0x10);
+    instr_size = ninstr * sizeof(uint32_t);
+  } else {
+    uint32_t op = pkt->opcode;
+    shim_err(EINVAL, "submit_cmd: unsupported opcode %u", op);
+  }
+
+  fprintf(stderr, "[EMU] submit_cmd: instr_addr=0x%lx instr_size=%u opcode=%u\n",
+          instr_addr, instr_size, (unsigned)pkt->opcode);
+
+  // The instruction buffer lives in emulator memory (was sync'd there
+  // by a prior host2device sync_bo).  Tell the emulator to execute
+  // from that device address.
+  m_transport->execute_from_device(instr_addr, instr_size);
+
+  // Mark the packet as completed so that poll_command() (which checks
+  // the state field at the BO's vaddr via mmap) sees the result.
+  auto* hdr = reinterpret_cast<ert_packet*>(buf.data());
+  hdr->state = ERT_CMD_STATE_COMPLETED;
+  pwrite(m_dev_fd, buf.data(), sizeof(ert_packet),
+         static_cast<off_t>(info.map_offset));
 
   arg.seq = m_next_seq.fetch_add(1);
 
@@ -329,6 +485,39 @@ get_info(amdxdna_drm_get_info& arg) const
     ver->major = 2;
     ver->minor = 0;
     arg.buffer_size = sizeof(amdxdna_drm_query_aie_version);
+    break;
+  }
+
+  case DRM_AMDXDNA_READ_AIE_MEM: {
+    if (arg.buffer_size < sizeof(amdxdna_drm_aie_mem))
+      shim_err(EINVAL, "get_info: buffer too small for AIE mem read");
+
+    auto* mem = reinterpret_cast<amdxdna_drm_aie_mem*>(arg.buffer);
+    if (!m_transport)
+      shim_err(ENODEV, "get_info: transport not initialized for AIE mem read");
+
+    m_transport->read_tile_memory(
+      static_cast<uint16_t>(mem->col),
+      static_cast<uint16_t>(mem->row),
+      mem->addr, mem->size,
+      reinterpret_cast<void*>(mem->buf_p));
+    arg.buffer_size = sizeof(amdxdna_drm_aie_mem);
+    break;
+  }
+
+  case DRM_AMDXDNA_READ_AIE_REG: {
+    if (arg.buffer_size < sizeof(amdxdna_drm_aie_reg))
+      shim_err(EINVAL, "get_info: buffer too small for AIE reg read");
+
+    auto* reg = reinterpret_cast<amdxdna_drm_aie_reg*>(arg.buffer);
+    if (!m_transport)
+      shim_err(ENODEV, "get_info: transport not initialized for AIE reg read");
+
+    reg->val = m_transport->read_reg(
+      static_cast<uint16_t>(reg->col),
+      static_cast<uint16_t>(reg->row),
+      reg->addr);
+    arg.buffer_size = sizeof(amdxdna_drm_aie_reg);
     break;
   }
 
@@ -558,10 +747,34 @@ set_state(amdxdna_drm_set_state& arg) const
     break;
   }
 
-  case DRM_AMDXDNA_WRITE_AIE_MEM:
+  case DRM_AMDXDNA_WRITE_AIE_MEM: {
+    if (arg.buffer_size < sizeof(amdxdna_drm_aie_mem))
+      shim_err(EINVAL, "set_state: buffer too small for AIE mem write");
+
+    auto* mem = reinterpret_cast<const amdxdna_drm_aie_mem*>(arg.buffer);
+    if (!m_transport)
+      shim_err(ENODEV, "set_state: transport not initialized for AIE mem write");
+
+    m_transport->write_tile_memory(
+      static_cast<uint16_t>(mem->col),
+      static_cast<uint16_t>(mem->row),
+      mem->addr, mem->size,
+      reinterpret_cast<const void*>(mem->buf_p));
+    break;
+  }
+
   case DRM_AMDXDNA_WRITE_AIE_REG: {
-    // Direct AIE memory/register writes could be routed through the
-    // transport in the future.  For now, accept silently.
+    if (arg.buffer_size < sizeof(amdxdna_drm_aie_reg))
+      shim_err(EINVAL, "set_state: buffer too small for AIE reg write");
+
+    auto* reg = reinterpret_cast<const amdxdna_drm_aie_reg*>(arg.buffer);
+    if (!m_transport)
+      shim_err(ENODEV, "set_state: transport not initialized for AIE reg write");
+
+    m_transport->write_reg(
+      static_cast<uint16_t>(reg->col),
+      static_cast<uint16_t>(reg->row),
+      reg->addr, reg->val);
     break;
   }
 

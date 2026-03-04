@@ -15,10 +15,16 @@
 
 namespace xdna_emu {
 
+class platform_drv_emu;
+
 class pdev_emu : public shim_xdna::pdev
 {
 public:
-  using pdev::pdev;
+  pdev_emu(std::shared_ptr<const shim_xdna::platform_drv>& driver,
+           const std::string& sysfs_name)
+    : pdev(driver, sysfs_name)
+    , m_platform(std::dynamic_pointer_cast<const platform_drv_emu>(driver))
+  {}
 
   bool
   is_cache_coherent() const override;
@@ -47,6 +53,7 @@ private:
   void
   on_last_close() const override;
 
+  std::shared_ptr<const platform_drv_emu> m_platform;
   mutable std::unique_ptr<emu_transport> m_transport;
   mutable std::mutex m_lock;
 };
