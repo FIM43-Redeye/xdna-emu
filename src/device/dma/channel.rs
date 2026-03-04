@@ -65,6 +65,15 @@ pub enum ChannelFsm {
         transfer: Box<Transfer>,
     },
 
+    /// NoC + DDR pipeline fill latency for shim tile host memory access.
+    /// Fires once per BD, between MemoryLatency and Transferring, only for
+    /// shim tiles whose transfer involves host DDR memory.
+    /// Latency: DmaTimingConfig::host_memory_latency_cycles (default 100).
+    HostPipelineLatency {
+        cycles_remaining: u16,
+        transfer: Box<Transfer>,
+    },
+
     /// Actively moving data word by word.
     /// Exits when transfer.remaining_bytes() == 0 or FoT TLAST received.
     /// S2MM stalls transparently (stays in this state, no advancement).
@@ -111,6 +120,7 @@ impl ChannelFsm {
             ChannelFsm::BdSetup { .. } => "BdSetup",
             ChannelFsm::AcquiringLock { .. } => "AcquiringLock",
             ChannelFsm::MemoryLatency { .. } => "MemoryLatency",
+            ChannelFsm::HostPipelineLatency { .. } => "HostPipelineLatency",
             ChannelFsm::Transferring { .. } => "Transferring",
             ChannelFsm::ReleasingLock { .. } => "ReleasingLock",
             ChannelFsm::BdChaining { .. } => "BdChaining",
@@ -130,6 +140,7 @@ impl ChannelFsm {
             ChannelFsm::BdSetup { transfer, .. }
             | ChannelFsm::AcquiringLock { transfer, .. }
             | ChannelFsm::MemoryLatency { transfer, .. }
+            | ChannelFsm::HostPipelineLatency { transfer, .. }
             | ChannelFsm::Transferring { transfer } => Some(transfer),
             _ => None,
         }
@@ -141,6 +152,7 @@ impl ChannelFsm {
             ChannelFsm::BdSetup { transfer, .. }
             | ChannelFsm::AcquiringLock { transfer, .. }
             | ChannelFsm::MemoryLatency { transfer, .. }
+            | ChannelFsm::HostPipelineLatency { transfer, .. }
             | ChannelFsm::Transferring { transfer } => Some(transfer),
             _ => None,
         }
@@ -157,6 +169,8 @@ impl fmt::Display for ChannelFsm {
                 write!(f, "AcquiringLock(lock={}, acquired={})", lock_id, acquired),
             ChannelFsm::MemoryLatency { cycles_remaining, .. } =>
                 write!(f, "MemoryLatency(cycles={})", cycles_remaining),
+            ChannelFsm::HostPipelineLatency { cycles_remaining, .. } =>
+                write!(f, "HostPipelineLatency(cycles={})", cycles_remaining),
             ChannelFsm::Transferring { transfer } =>
                 write!(f, "Transferring({} bytes remaining)", transfer.remaining_bytes()),
             ChannelFsm::ReleasingLock { lock_id, cycles_remaining, .. } =>
@@ -268,6 +282,9 @@ impl ChannelContext {
             }
             ChannelFsm::MemoryLatency { cycles_remaining, .. } => {
                 format!("MemoryLatency({})", cycles_remaining)
+            }
+            ChannelFsm::HostPipelineLatency { cycles_remaining, .. } => {
+                format!("HostPipelineLatency({})", cycles_remaining)
             }
             ChannelFsm::Transferring { transfer } => {
                 format!("Transferring({}/{})",

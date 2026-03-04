@@ -737,6 +737,13 @@ impl Transfer {
         self.total_bytes.saturating_sub(self.bytes_transferred)
     }
 
+    /// Whether this transfer touches host DDR memory (via shim tile NoC).
+    /// Used to determine if extra pipeline latency should be applied.
+    pub fn involves_host_memory(&self) -> bool {
+        matches!(self.source, TransferEndpoint::HostMemory)
+            || matches!(self.dest, TransferEndpoint::HostMemory)
+    }
+
     /// Advance the transfer by the given number of bytes.
     ///
     /// Updates `bytes_transferred`, advances the address generator, and

@@ -151,6 +151,15 @@ pub const DMA_LOCK_RELEASE_CYCLES: u8 = 1;
 /// DMA BD chain latency: cycles between finishing one BD and starting next
 pub const DMA_BD_CHAIN_CYCLES: u8 = 2;
 
+/// DMA host memory pipeline latency: extra cycles for shim tile DDR access.
+/// On real hardware, the first word from DDR traverses the NoC and DDR
+/// controller pipeline (~100 cycles beyond tile-local SRAM latency). Once the
+/// pipeline fills, throughput is 1 word/cycle (same as tile memory). This
+/// models the initial pipeline fill penalty only.
+/// Derived from trace comparison: observed ~110 cycle offset minus ~10 cycles
+/// already covered by bd_setup + memory_latency.
+pub const DMA_HOST_MEMORY_LATENCY_CYCLES: u16 = 100;
+
 // ============================================================================
 // Stream Switch Configuration (AM020 Ch2)
 // ============================================================================

@@ -39,6 +39,11 @@ pub struct DmaTimingConfig {
 
     /// Cycles between BD completion and next BD start
     pub bd_chain_cycles: u8,
+
+    /// Extra pipeline latency for shim tile DDR access (NoC + DDR controller).
+    /// Applied once per BD, between MemoryLatency and Transferring, only for
+    /// shim tiles with host memory endpoints.
+    pub host_memory_latency_cycles: u16,
 }
 
 impl Default for DmaTimingConfig {
@@ -58,6 +63,7 @@ impl DmaTimingConfig {
             lock_acquire_cycles: aie2_spec::DMA_LOCK_ACQUIRE_CYCLES,
             lock_release_cycles: aie2_spec::DMA_LOCK_RELEASE_CYCLES,
             bd_chain_cycles: aie2_spec::DMA_BD_CHAIN_CYCLES,
+            host_memory_latency_cycles: aie2_spec::DMA_HOST_MEMORY_LATENCY_CYCLES,
         }
     }
 

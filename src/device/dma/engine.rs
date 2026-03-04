@@ -886,9 +886,32 @@ impl DmaEngine {
 
             ChannelFsm::MemoryLatency { cycles_remaining, transfer } => {
                 if cycles_remaining <= 1 {
-                    ChannelFsm::Transferring { transfer }
+                    // For shim tiles accessing host DDR, add NoC+DDR pipeline
+                    // latency. This is the extra time for the first word to
+                    // traverse the NoC to DDR and back. Once the pipeline
+                    // fills, throughput is 1 word/cycle (same as tile memory).
+                    let host_lat = self.timing_config.host_memory_latency_cycles;
+                    if host_lat > 0 && transfer.involves_host_memory() {
+                        ChannelFsm::HostPipelineLatency {
+                            cycles_remaining: host_lat,
+                            transfer,
+                        }
+                    } else {
+                        ChannelFsm::Transferring { transfer }
+                    }
                 } else {
                     ChannelFsm::MemoryLatency {
+                        cycles_remaining: cycles_remaining - 1,
+                        transfer,
+                    }
+                }
+            }
+
+            ChannelFsm::HostPipelineLatency { cycles_remaining, transfer } => {
+                if cycles_remaining <= 1 {
+                    ChannelFsm::Transferring { transfer }
+                } else {
+                    ChannelFsm::HostPipelineLatency {
                         cycles_remaining: cycles_remaining - 1,
                         transfer,
                     }
