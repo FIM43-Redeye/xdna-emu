@@ -122,9 +122,7 @@ config_ctx_cu_config(shim_xdna::config_ctx_cu_config_arg& arg) const
     if (!m_transport)
       continue;
 
-    // The PDI BO was synced to the emulator's host memory by the
-    // hwctx_kmq constructor (sync host2device).  Read it back from
-    // the emulator to get the raw PDI bytes.
+    // Look up the BO's device address and size.
     bo_entry entry{};
     {
       const std::lock_guard<std::mutex> lock(m_bo_lock);
@@ -137,11 +135,38 @@ config_ctx_cu_config(shim_xdna::config_ctx_cu_config_arg& arg) const
     if (entry.size == 0)
       continue;
 
+    // Read PDI data from the memfd (not emulator memory).
+    //
+    // XRT's hwctx_kmq writes PDI bytes directly to the mmap'd BO
+    // address, then calls buffer::sync(HOST2DEVICE).  On cache-coherent
+    // devices (like NPU), sync is a no-op (just clflush or skip), so
+    // our platform_drv_emu::sync_bo is never called and the data never
+    // reaches the emulator's internal host memory.
+    //
+    // The data IS in the memfd because XRT wrote it via mmap.  Read it
+    // with pread, then also copy it into the emulator so that later
+    // accesses (e.g., from the NPU executor) can find it.
     std::vector<uint8_t> pdi_data(entry.size);
-    m_transport->read_memory(entry.dev_addr, pdi_data.data(), entry.size);
+    shim_xdna::bo_info bo_info{};
+    if (!load_bo_info(cu.cu_bo, bo_info)) {
+      EMU_WARN("config_ctx_cu_config: no bo_info for BO %u", cu.cu_bo);
+      continue;
+    }
+
+    ssize_t nr = pread(m_dev_fd, pdi_data.data(), entry.size,
+                       static_cast<off_t>(bo_info.map_offset));
+    if (nr <= 0) {
+      EMU_WARN("config_ctx_cu_config: pread BO %u failed (nr=%zd)", cu.cu_bo, nr);
+      continue;
+    }
 
     EMU_INFO("config_ctx_cu_config: loading PDI from BO %u "
-             "(dev=0x%" PRIx64 " size=%zu)", cu.cu_bo, entry.dev_addr, entry.size);
+             "(dev=0x%" PRIx64 " size=%zu pread=%zd)",
+             cu.cu_bo, entry.dev_addr, entry.size, nr);
+
+    // Also sync this BO into the emulator's host memory so other
+    // subsystems see it.
+    m_transport->write_memory(entry.dev_addr, pdi_data.data(), entry.size);
 
     m_transport->load_pdi(pdi_data.data(), pdi_data.size());
   }

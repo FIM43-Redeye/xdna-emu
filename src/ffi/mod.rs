@@ -283,9 +283,8 @@ pub unsafe extern "C" fn xdna_emu_load_pdi(
     let handle = &mut *handle;
     let data = slice::from_raw_parts(pdi_data, pdi_size as usize);
 
-    // Find CDO offset within the PDI.  Some PDIs have a bootgen header,
-    // others are raw CDO data.  Try the header search first, then fall
-    // back to parsing from offset 0.
+    // Find CDO offset within the PDI.  PDIs have a bootgen header
+    // (typically ~336 bytes) before the CDO stream.  Scan for CDO magic.
     let cdo_offset = find_cdo_offset(data).unwrap_or(0);
 
     // Parse CDO.
@@ -294,9 +293,15 @@ pub unsafe extern "C" fn xdna_emu_load_pdi(
         Err(e) => {
             log::error!("Failed to parse CDO from PDI ({} bytes, offset {}): {}",
                         pdi_size, cdo_offset, e);
-            // Log first 16 bytes for debugging.
-            if data.len() >= 16 {
-                log::error!("  PDI header: {:02x?}", &data[..16]);
+            // Dump first 32 bytes for debugging on failure.
+            let dump_len = std::cmp::min(data.len(), 32);
+            if dump_len > 0 {
+                log::error!("  PDI header: {:02x?}", &data[..dump_len]);
+            }
+            if cdo_offset == 0 && data.len() >= 8 {
+                let num_words = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                let ident = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                log::error!("  At offset 0: num_words=0x{:08x} ident=0x{:08x}", num_words, ident);
             }
             return XdnaEmuResult::ParseError;
         }
@@ -308,7 +313,8 @@ pub unsafe extern "C" fn xdna_emu_load_pdi(
         return XdnaEmuResult::ExecutionError;
     }
 
-    log::info!("Loaded PDI ({} bytes, CDO at offset {})", pdi_size, cdo_offset);
+    log::info!("Loaded PDI ({} bytes, CDO at offset {}, {} cmd words)",
+               pdi_size, cdo_offset, cdo.command_length_words());
     XdnaEmuResult::Success
 }
 
