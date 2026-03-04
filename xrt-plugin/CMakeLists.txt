@@ -42,11 +42,32 @@ message(STATUS "XRT coreutil: ${XRT_COREUTIL_LIB}")
 # Plugin shared library
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Shim base sources from xdna-driver.
+# We compile the common shim infrastructure but NOT the hardware-specific
+# backends (host/, kmq/, umq/, virtio/) -- those are replaced by our
+# emulator implementations in src/.
+# ---------------------------------------------------------------------------
+
+set(SHIM_SOURCES
+  ${XDNA_SHIM_DIR}/pcidrv.cpp
+  ${XDNA_SHIM_DIR}/pcidev.cpp
+  ${XDNA_SHIM_DIR}/platform.cpp
+  ${XDNA_SHIM_DIR}/device.cpp
+  ${XDNA_SHIM_DIR}/hwctx.cpp
+  ${XDNA_SHIM_DIR}/hwq.cpp
+  ${XDNA_SHIM_DIR}/buffer.cpp
+  ${XDNA_SHIM_DIR}/fence.cpp
+  ${XDNA_SHIM_DIR}/smi_xdna.cpp
+)
+
 add_library(xrt_driver_emu SHARED
   src/transport_inprocess.cpp
   src/drv_emu.cpp
   src/pdev_emu.cpp
   src/platform_emu.cpp
+  src/hwctx_stubs.cpp
+  ${SHIM_SOURCES}
 )
 
 set_target_properties(xrt_driver_emu PROPERTIES
