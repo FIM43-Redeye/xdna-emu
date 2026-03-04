@@ -44,9 +44,9 @@ message(STATUS "XRT coreutil: ${XRT_COREUTIL_LIB}")
 
 # ---------------------------------------------------------------------------
 # Shim base sources from xdna-driver.
-# We compile the common shim infrastructure but NOT the hardware-specific
-# backends (host/, kmq/, umq/, virtio/) -- those are replaced by our
-# emulator implementations in src/.
+# We compile the common shim infrastructure plus the KMQ backend (which
+# is lightweight and works with our platform_drv_emu).  UMQ, host, and
+# virtio backends are NOT compiled -- UMQ stubs satisfy the linker.
 # ---------------------------------------------------------------------------
 
 set(SHIM_SOURCES
@@ -66,8 +66,11 @@ add_library(xrt_driver_emu SHARED
   src/drv_emu.cpp
   src/pdev_emu.cpp
   src/platform_emu.cpp
-  src/hwctx_stubs.cpp
+  src/umq_stubs.cpp
   ${SHIM_SOURCES}
+  # KMQ backend -- lightweight, works with platform_drv_emu.
+  ${XDNA_SHIM_DIR}/kmq/hwctx.cpp
+  ${XDNA_SHIM_DIR}/kmq/hwq.cpp
 )
 
 set_target_properties(xrt_driver_emu PROPERTIES
