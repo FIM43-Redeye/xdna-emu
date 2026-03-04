@@ -12,9 +12,11 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # XRT install root (system-wide).
 set(XRT_INSTALL_DIR "/opt/xilinx/xrt" CACHE PATH "XRT install prefix")
 
-# xdna-driver submodule relative to this CMakeLists.txt.
-set(XDNA_DRIVER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../xdna-driver" CACHE PATH
-    "Path to the xdna-driver submodule")
+# xdna-driver source tree.  Defaults to the sibling directory in npu-work.
+# Override with -DXDNA_DRIVER_DIR=/path/to/xdna-driver on the cmake line.
+# NOTE: Two patches are required -- see ../patches/ for details.
+set(XDNA_DRIVER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../xdna-driver" CACHE PATH
+    "Path to the xdna-driver source tree")
 
 # Derived paths inside xdna-driver.
 set(XRT_RUNTIME_SRC "${XDNA_DRIVER_DIR}/xrt/src/runtime_src")

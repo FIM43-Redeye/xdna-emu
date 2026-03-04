@@ -23,7 +23,6 @@ tests/mlir-aie-extracted/*
 reports/
 
 # Temporary/scratch files
-*.patch
 *.zip
 *.tar.gz
 fake.xclbin
@@ -31,6 +30,12 @@ stdout
 
 # Documentation drafts (not ready for commit)
 CURRENT-REFACTOR.md
+
+# xdna-driver (external dependency, not a submodule -- see patches/)
+/xdna-driver
+
+# XRT plugin build artifacts
+/xrt-plugin/build/
 
 # Build script output
 /build/

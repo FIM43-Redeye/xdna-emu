@@ -1,0 +1,30 @@
+From: xdna-emu project
+Subject: Make m_dev_fd and m_driver protected in platform_drv
+
+The emulator's platform_drv_emu subclass needs write access to m_dev_fd
+so that drv_open() can replace the real DRM device fd with a memfd_create
+fd.  The base class's non-virtual drv_mmap() reads m_dev_fd directly, so
+there is no virtual seam to override -- the subclass must set the field.
+
+Apply from the xdna-driver root:
+  git apply /path/to/xdna-driver-platform-protected.patch
+
+--- a/src/shim/platform.h
++++ b/src/shim/platform.h
+@@ -215,7 +215,7 @@ protected:
+   bool
+   load_bo_info(uint32_t key, bo_info& info) const;
+
+-private:
++protected:
+   std::shared_ptr<const drv> m_driver;
+
+   // Supposed to be set once and used till object is destroyed.
+@@ -223,6 +223,7 @@ private:
+   mutable int m_dev_fd = -1;
+   mutable std::string m_sysfs_root;
+
++private:
+   // Proces-wide drm_bo map to allow retrieving the bo by handle.
+   // If a bo is exported, then imported within the same process, we will
+   // get back the same bo handle. We can, then, retrieve the bo back
