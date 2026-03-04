@@ -1678,20 +1678,18 @@ mod tests {
         let tile = state.array.tile(0, 2);
         let dm = tile.data_memory();
 
-        // Read first 16 words from offset 0x400
+        // Read all 256 words from offset 0x400 and verify CDO init is correct.
         let mut values = Vec::new();
-        for i in 0..16 {
+        for i in 0..256 {
             let off = 0x400 + i * 4;
             let word = u32::from_le_bytes([dm[off], dm[off+1], dm[off+2], dm[off+3]]);
             values.push(word);
         }
-        eprintln!("tile(0,2) data mem @0x400: first 16 words = {:?}", values);
 
-        // First word should be 0, second should be 1, etc.
-        assert_eq!(values[0], 0, "in2_mem_buff_0[0] should be 0");
-        assert_eq!(values[1], 1, "in2_mem_buff_0[1] should be 1");
-        assert_eq!(values[2], 2, "in2_mem_buff_0[2] should be 2");
-        assert_eq!(values[15], 15, "in2_mem_buff_0[15] should be 15");
+        for i in 0..256 {
+            assert_eq!(values[i], i as u32,
+                "in2_mem_buff_0[{}] should be {} but was {}", i, i, values[i]);
+        }
 
         // Also verify data_bytes was counted
         assert!(state.stats.data_bytes >= 1024,

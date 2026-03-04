@@ -213,6 +213,8 @@ pub fn classify_operand_type(reg_class: &str, field_name: &str) -> OperandType {
         ("OP_mMvAMWQSrc", CompositeEncoder::MvAMWQSrc),
         ("OP_mMvBMXSrc",  CompositeEncoder::MvBMXSrc),
         ("OP_mMvBMXDst",  CompositeEncoder::MvBMXDst),
+        ("OP_mMcdSrc",    CompositeEncoder::MvBMXDst),
+        ("OP_mScdDst",    CompositeEncoder::MvBMXDst),
         ("OP_eRS4",       CompositeEncoder::ERS4),
         ("OP_mShflDst",   CompositeEncoder::ShflDst),
         ("OP_mWm_1",      CompositeEncoder::Wm1),
