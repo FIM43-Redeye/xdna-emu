@@ -368,4 +368,5 @@ mod tests {
         let cdo_offset = find_cdo_offset(pdi.pdi_image);
         assert!(cdo_offset.is_some(), "Should find CDO within PDI image");
     }
+
 }

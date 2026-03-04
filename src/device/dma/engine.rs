@@ -3316,7 +3316,7 @@ mod tests {
     #[test]
     fn test_mm2s_compression_all_zeros() {
         let mut engine = DmaEngine::new_compute_tile(1, 2);
-        let mut tile = make_tile();
+        let tile = make_tile();
 
         engine.set_channel_compression_config(2, true, false, false);
 

@@ -677,8 +677,6 @@ mod tests {
 
     #[test]
     fn test_event_recording_instruction_cycle() {
-        use crate::interpreter::state::EventType;
-
         let mut executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
         let mut tile = Tile::compute(0, 2);

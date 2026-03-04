@@ -459,7 +459,7 @@ counter                0x20400    4       .bss
 
     #[test]
     fn test_cross_validation_matching() {
-        let analysis = ElfAnalysis {
+        let _analysis = ElfAnalysis {
             pm_sizes: [
                 ("main".to_string(), 256),
                 ("helper".to_string(), 64),

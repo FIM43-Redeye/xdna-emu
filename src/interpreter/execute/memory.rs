@@ -1739,7 +1739,7 @@ mod tests {
     fn test_quadrant_0_fast_path_unchanged() {
         // Verify that quadrant 0 (local memory) works exactly as before,
         // even when NeighborMemory is Some.
-        let mut device = crate::device::DeviceState::new_npu1();
+        let device = crate::device::DeviceState::new_npu1();
         let mut nbr = NeighborMemory::new(1, 2);
         nbr.ensure_snapshot(1, &device);
 

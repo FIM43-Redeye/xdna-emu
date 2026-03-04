@@ -160,13 +160,19 @@ config_ctx_cu_config(shim_xdna::config_ctx_cu_config_arg& arg) const
       continue;
     }
 
-    EMU_INFO("config_ctx_cu_config: loading PDI from BO %u "
-             "(dev=0x%" PRIx64 " size=%zu pread=%zd)",
-             cu.cu_bo, entry.dev_addr, entry.size, nr);
-
-    // Also sync this BO into the emulator's host memory so other
-    // subsystems see it.
-    m_transport->write_memory(entry.dev_addr, pdi_data.data(), entry.size);
+    // Log entry with hex dump for bridge debugging.
+    {
+      std::string hex;
+      size_t dump_len = std::min(pdi_data.size(), static_cast<size_t>(16));
+      for (size_t j = 0; j < dump_len; j++) {
+        char buf[4];
+        snprintf(buf, sizeof(buf), "%02x ", pdi_data[j]);
+        hex += buf;
+      }
+      EMU_INFO("config_ctx_cu_config: PDI BO %u: %zu bytes (pread=%zd), "
+               "first %zu: %s",
+               cu.cu_bo, pdi_data.size(), nr, dump_len, hex.c_str());
+    }
 
     m_transport->load_pdi(pdi_data.data(), pdi_data.size());
   }

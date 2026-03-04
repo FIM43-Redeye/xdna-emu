@@ -184,75 +184,65 @@ pub unsafe extern "C" fn xdna_emu_load_xclbin(
         }
     };
 
-    // Find CDO offset
-    let cdo_offset = match find_cdo_offset(pdi.pdi_image) {
-        Some(o) => o,
+    // Apply PDI through the shared golden path.
+    let result = apply_pdi_data(handle, pdi.pdi_image);
+    if result != XdnaEmuResult::Success {
+        return result;
+    }
+
+    handle.xclbin_path = Some(path_str.to_string());
+    log::info!("Loaded xclbin: {}", path_str);
+    XdnaEmuResult::Success
+}
+
+/// Apply PDI data to the emulator device.  This is the ONE golden path
+/// for device configuration -- both `load_xclbin` and `load_pdi` converge
+/// here.  Finds CDO within the bootgen container, parses it, and applies
+/// it to the device.
+fn apply_pdi_data(handle: &mut XdnaEmuHandle, data: &[u8]) -> XdnaEmuResult {
+    log::info!("apply_pdi_data: {} bytes, head={:02x?}",
+               data.len(), &data[..data.len().min(16)]);
+
+    // Find CDO within bootgen container.
+    let cdo_offset = match find_cdo_offset(data) {
+        Some(off) => {
+            log::info!("  CDO found at offset {}", off);
+            off
+        }
         None => {
-            log::error!("No CDO found in PDI");
-            return XdnaEmuResult::ParseError;
+            // Try offset 0 as fallback (raw CDO without bootgen header).
+            log::warn!("  No bootgen header found, trying offset 0");
+            0
         }
     };
 
-    // Parse CDO
-    let cdo = match Cdo::parse(&pdi.pdi_image[cdo_offset..]) {
-        Ok(c) => c,
+    // Parse CDO.
+    let cdo = match Cdo::parse(&data[cdo_offset..]) {
+        Ok(c) => {
+            log::info!("  CDO: {} command words", c.command_length_words());
+            c
+        }
         Err(e) => {
-            log::error!("Failed to parse CDO: {}", e);
+            let msg = format!("Failed to parse CDO from PDI ({} bytes, offset {}): {}",
+                              data.len(), cdo_offset, e);
+            log::error!("{}", msg);
+            if data.len() >= 8 {
+                log::error!("  At offset {}: {:02x?}", cdo_offset,
+                            &data[cdo_offset..data.len().min(cdo_offset + 20)]);
+            }
+            set_last_error(msg);
             return XdnaEmuResult::ParseError;
         }
     };
 
-    // Apply CDO to device
+    // Apply CDO to device.
     if let Err(e) = handle.engine.device_mut().apply_cdo(&cdo) {
-        log::error!("Failed to apply CDO: {}", e);
+        let msg = format!("Failed to apply CDO: {}", e);
+        log::error!("{}", msg);
+        set_last_error(msg);
         return XdnaEmuResult::ExecutionError;
     }
 
-    // Load ELF files from xclbin if present
-    // The ELF files are embedded in the AIE partition
-    // For now, we rely on the test directory containing ELF files separately
-
-    handle.xclbin_path = Some(path_str.to_string());
-
-    // Try to auto-load ELF files from the project directory
-    // Convention: xclbin at <dir>/aie.xclbin, ELFs at <dir>/aie_arch.mlir.prj/*.elf
-    let xclbin_path = std::path::Path::new(path_str);
-    if let Some(parent) = xclbin_path.parent() {
-        // Try common project directory names
-        for prj_name in &["aie_arch.mlir.prj", "aie.mlir.prj"] {
-            let prj_dir = parent.join(prj_name);
-            if prj_dir.exists() {
-                // Scan for ELF files named like: main_core_<col>_<row>.elf
-                if let Ok(entries) = std::fs::read_dir(&prj_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.extension().map(|e| e == "elf").unwrap_or(false) {
-                            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                                // Parse tile coordinates from filename
-                                // Pattern: main_core_<col>_<row> or core_<col>_<row>
-                                let parts: Vec<&str> = stem.split('_').collect();
-                                if parts.len() >= 4 && parts[parts.len()-3] == "core" {
-                                    if let (Ok(col), Ok(row)) = (
-                                        parts[parts.len()-2].parse::<u8>(),
-                                        parts[parts.len()-1].parse::<u8>()
-                                    ) {
-                                        if let Ok(elf_data) = std::fs::read(&path) {
-                                            if handle.engine.load_elf_bytes(col as usize, row as usize, &elf_data).is_ok() {
-                                                log::info!("Loaded ELF for tile ({}, {}): {:?}", col, row, path);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                break;
-            }
-        }
-    }
-
-    log::info!("Loaded xclbin: {}", path_str);
     XdnaEmuResult::Success
 }
 
@@ -283,39 +273,11 @@ pub unsafe extern "C" fn xdna_emu_load_pdi(
     let handle = &mut *handle;
     let data = slice::from_raw_parts(pdi_data, pdi_size as usize);
 
-    // Find CDO offset within the PDI.  PDIs have a bootgen header
-    // (typically ~336 bytes) before the CDO stream.  Scan for CDO magic.
-    let cdo_offset = find_cdo_offset(data).unwrap_or(0);
-
-    // Parse CDO.
-    let cdo = match Cdo::parse(&data[cdo_offset..]) {
-        Ok(c) => c,
-        Err(e) => {
-            log::error!("Failed to parse CDO from PDI ({} bytes, offset {}): {}",
-                        pdi_size, cdo_offset, e);
-            // Dump first 32 bytes for debugging on failure.
-            let dump_len = std::cmp::min(data.len(), 32);
-            if dump_len > 0 {
-                log::error!("  PDI header: {:02x?}", &data[..dump_len]);
-            }
-            if cdo_offset == 0 && data.len() >= 8 {
-                let num_words = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                let ident = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-                log::error!("  At offset 0: num_words=0x{:08x} ident=0x{:08x}", num_words, ident);
-            }
-            return XdnaEmuResult::ParseError;
-        }
-    };
-
-    // Apply CDO to device.
-    if let Err(e) = handle.engine.device_mut().apply_cdo(&cdo) {
-        log::error!("Failed to apply CDO from PDI: {}", e);
-        return XdnaEmuResult::ExecutionError;
+    let result = apply_pdi_data(handle, data);
+    if result == XdnaEmuResult::Success {
+        log::info!("Loaded PDI ({} bytes)", pdi_size);
     }
-
-    log::info!("Loaded PDI ({} bytes, CDO at offset {}, {} cmd words)",
-               pdi_size, cdo_offset, cdo.command_length_words());
-    XdnaEmuResult::Success
+    result
 }
 
 /// Allocate a region in host memory.
@@ -611,14 +573,29 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
         cycles += 1;
 
         if handle.engine.status() == EngineStatus::Halted {
-            log::info!("Cores halted after {} cycles", cycles);
-            break;
+            // For DMA-only tests (no cores loaded), the engine halts
+            // immediately because no cores are enabled.  But the NPU
+            // executor may still be issuing instructions that configure
+            // and trigger DMA, or DMA channels may already be running.
+            // Keep running while any of: executor pending, DMA active,
+            // or sync conditions unsatisfied.
+            let executor_pending = !handle.npu_executor.is_done()
+                || !handle.npu_executor.syncs_satisfied(handle.engine.device());
+            let dma_active = handle.engine.device().array.any_dma_active();
+            if executor_pending || dma_active {
+                handle.engine.force_running();
+            } else {
+                log::info!("Cores halted after {} cycles", cycles);
+                break;
+            }
         }
 
         // Check if DMA syncs are satisfied (execution complete).
-        // Only check after all NPU instructions have been processed.
+        // Only check after all NPU instructions have been processed
+        // and no DMA channels are still running.
         if handle.npu_executor.is_done()
             && handle.npu_executor.syncs_satisfied(handle.engine.device())
+            && !handle.engine.device().array.any_dma_active()
         {
             log::info!("All DMA syncs satisfied after {} cycles", cycles);
             break;
