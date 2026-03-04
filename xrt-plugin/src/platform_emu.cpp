@@ -7,11 +7,14 @@
 // virtual interface so that XRT treats the emulator like real hardware.
 
 #include "platform_emu.h"
+#include "emu_debug.h"
+#include "emu_ert_decode.h"
 #include "shim/shim_debug.h"
 #include "drm_local/amdxdna_accel.h"
 #include "core/include/ert.h"
 
 #include <chrono>
+#include <cinttypes>
 #include <cstdlib>
 #include <cstring>
 #include <sys/mman.h>
@@ -155,7 +158,7 @@ create_bo(shim_xdna::bo_info& arg) const
   size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
   size_t aligned_size = (arg.size + page_size - 1) & ~(page_size - 1);
   uint64_t offset = m_memfd_size.fetch_add(aligned_size);
-  fprintf(stderr, "[EMU] create_bo: size=%zu dev_addr=0x%lx map_offset=0x%lx\n",
+  EMU_DBG("create_bo: size=%zu dev_addr=0x%" PRIx64 " map_offset=0x%" PRIx64,
           arg.size, dev_addr, offset);
 
   if (ftruncate(m_dev_fd, static_cast<off_t>(offset + aligned_size)) < 0)
@@ -275,7 +278,8 @@ sync_bo(shim_xdna::sync_bo_arg& arg) const
                       static_cast<off_t>(info.map_offset + arg.offset));
     if (n < 0)
       shim_err(errno, "sync_bo: pread memfd failed");
-    fprintf(stderr, "[EMU] sync_bo h2d: bo=%u dev=0x%lx offset=0x%lx pread=%zd first=0x%08x\n",
+    EMU_DBG("sync_bo h2d: bo=%u dev=0x%" PRIx64 " offset=0x%" PRIx64
+            " pread=%zd first=0x%08x",
             arg.bo.handle, dev, info.map_offset + arg.offset, n,
             arg.size >= 4 ? *reinterpret_cast<uint32_t*>(buf.data()) : 0);
     m_transport->write_memory(dev + arg.offset, buf.data(), arg.size);
@@ -286,6 +290,19 @@ sync_bo(shim_xdna::sync_bo_arg& arg) const
                        static_cast<off_t>(info.map_offset + arg.offset));
     if (n < 0)
       shim_err(errno, "sync_bo: pwrite memfd failed");
+
+    // Log first words of d2h readback for quick zero-check.
+    if (arg.size >= 4) {
+      auto* words = reinterpret_cast<const uint32_t*>(buf.data());
+      uint32_t nwords = std::min(static_cast<uint32_t>(arg.size / 4), 4u);
+      if (nwords >= 4) {
+        EMU_DBG("sync_bo d2h: bo=%u dev=0x%" PRIx64 " first4=[0x%08x 0x%08x 0x%08x 0x%08x]",
+                arg.bo.handle, dev, words[0], words[1], words[2], words[3]);
+      } else if (nwords >= 1) {
+        EMU_DBG("sync_bo d2h: bo=%u dev=0x%" PRIx64 " first=0x%08x",
+                arg.bo.handle, dev, words[0]);
+      }
+    }
   }
 }
 
@@ -367,13 +384,95 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
     shim_err(EINVAL, "submit_cmd: unsupported opcode %u", op);
   }
 
-  fprintf(stderr, "[EMU] submit_cmd: instr_addr=0x%lx instr_size=%u opcode=%u\n",
-          instr_addr, instr_size, (unsigned)pkt->opcode);
+  EMU_INFO("submit_cmd: instr_addr=0x%" PRIx64 " instr_size=%u opcode=%u",
+           instr_addr, instr_size, (unsigned)pkt->opcode);
+  xdna_emu::detail::emu_log_ert_packet(pkt, "submit_cmd");
 
-  // The instruction buffer lives in emulator memory (was sync'd there
-  // by a prior host2device sync_bo).  Tell the emulator to execute
-  // from that device address.
+  // Log BO table at debug level for context.
+  dump_bo_table("submit_cmd");
+
+  // Sync all tracked BOs from the memfd into the emulator's host memory.
+  //
+  // On real hardware the CPU and NPU share physical memory, so
+  // buffer::sync() just flushes CPU caches (clflush_data).  In the
+  // emulator the memory spaces are separate: the app writes via mmap
+  // on the memfd, but the emulator has its own internal host memory.
+  // We bridge the gap by copying every BO's content from the memfd
+  // into the emulator before execution.
+  {
+    const std::lock_guard<std::mutex> lock(m_bo_lock);
+    for (const auto& [handle, bo] : m_bo_map) {
+      if (bo.user_ptr || bo.size == 0)
+        continue;
+
+      // Look up this BO's mmap offset in the memfd.
+      shim_xdna::bo_info bi{};
+      if (!load_bo_info(handle, bi))
+        continue;
+
+      std::vector<uint8_t> tmp(bo.size);
+      ssize_t nr = pread(m_dev_fd, tmp.data(), bo.size,
+                         static_cast<off_t>(bi.map_offset));
+      if (nr > 0)
+        m_transport->write_memory(bo.dev_addr, tmp.data(),
+                                  static_cast<size_t>(nr));
+    }
+    EMU_DBG("submit_cmd: synced %zu BOs from memfd to emulator",
+            m_bo_map.size());
+  }
+
+  // Execute the NPU instruction buffer from emulator host memory.
   m_transport->execute_from_device(instr_addr, instr_size);
+
+  // Post-execution diagnostics: dump DMA state for any non-idle channels.
+  if (xdna_emu::detail::emu_debug_enabled()) {
+    uint8_t cols = m_transport->get_columns();
+    uint8_t rows = m_transport->get_rows();
+    for (uint8_t c = 0; c < cols; c++) {
+      for (uint8_t r = 0; r < rows; r++) {
+        for (uint8_t dir = 0; dir < 2; dir++) {
+          for (uint8_t ch = 0; ch < 2; ch++) {
+            auto state = m_transport->get_dma_channel_state(c, r, dir, ch);
+            if (state != 0) {
+              emu_transport::DmaChannelStats stats{};
+              m_transport->get_dma_channel_stats(c, r, dir, ch, stats);
+              EMU_DBG("  tile(%u,%u) %s ch%u: state=%u xfr=%" PRIu64
+                      " bytes=%" PRIu64,
+                      c, r, dir ? "s2mm" : "mm2s", ch,
+                      state & 0xFF,
+                      stats.transfers_completed,
+                      stats.bytes_transferred);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Sync results back: emulator host memory -> memfd.
+  //
+  // Same issue as the pre-execution sync above: the app will read
+  // results via mmap on the memfd, but the emulator wrote them to its
+  // internal host memory.  Copy everything back so the mmap'd view
+  // reflects what the emulator produced.
+  {
+    const std::lock_guard<std::mutex> lock(m_bo_lock);
+    for (const auto& [handle, bo] : m_bo_map) {
+      if (bo.user_ptr || bo.size == 0)
+        continue;
+
+      shim_xdna::bo_info bi{};
+      if (!load_bo_info(handle, bi))
+        continue;
+
+      std::vector<uint8_t> tmp(bo.size);
+      m_transport->read_memory(bo.dev_addr, tmp.data(), bo.size);
+      pwrite(m_dev_fd, tmp.data(), bo.size,
+             static_cast<off_t>(bi.map_offset));
+    }
+    EMU_DBG("submit_cmd: synced %zu BOs from emulator back to memfd",
+            m_bo_map.size());
+  }
 
   // Mark the packet as completed so that poll_command() (which checks
   // the state field at the BO's vaddr via mmap) sees the result.
@@ -880,6 +979,34 @@ platform_drv_emu::
 signal_syncobj(shim_xdna::signal_syncobj_arg& /*arg*/) const
 {
   // No-op in emulation.
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic dumps
+// ---------------------------------------------------------------------------
+
+void
+platform_drv_emu::
+dump_bo_table(const char* context) const
+{
+  const std::lock_guard<std::mutex> lock(m_bo_lock);
+  EMU_DBG("%s: %zu BOs tracked", context, m_bo_map.size());
+  for (const auto& [handle, bo] : m_bo_map) {
+    EMU_DBG("  BO %u: dev=0x%" PRIx64 " size=%zu uptr=%d",
+            handle, bo.dev_addr, bo.size, bo.user_ptr ? 1 : 0);
+  }
+}
+
+void
+platform_drv_emu::
+dump_ctx_table(const char* context) const
+{
+  const std::lock_guard<std::mutex> lock(m_ctx_lock);
+  EMU_DBG("%s: %zu contexts", context, m_ctx_map.size());
+  for (const auto& [handle, ctx] : m_ctx_map) {
+    EMU_DBG("  ctx %u: cols=%u cus=%u submissions=%" PRIu64,
+            handle, ctx.num_col, ctx.num_cus, ctx.submissions);
+  }
 }
 
 } // namespace xdna_emu

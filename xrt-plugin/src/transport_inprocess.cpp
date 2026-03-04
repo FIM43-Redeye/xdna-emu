@@ -112,6 +112,13 @@ emu_transport_inprocess::emu_transport_inprocess(const std::string& lib_path)
     sym_get_rows_           = resolve_optional<fn_get_rows>("xdna_emu_get_rows");
     sym_get_device_name_    = resolve_optional<fn_get_device_name>("xdna_emu_get_device_name");
 
+    // Diagnostic queries (optional -- may not exist in older builds).
+    sym_get_lock_value_     = resolve_optional<fn_get_lock_value>("xdna_emu_get_lock_value");
+    sym_get_dma_ch_state_   = resolve_optional<fn_get_dma_ch_state>("xdna_emu_get_dma_channel_state");
+    sym_get_dma_ch_stats_   = resolve_optional<fn_get_dma_ch_stats>("xdna_emu_get_dma_channel_stats");
+    sym_set_log_level_      = resolve_optional<fn_set_log_level>("xdna_emu_set_log_level");
+    sym_dump_tile_state_    = resolve_optional<fn_dump_tile_state>("xdna_emu_dump_tile_state");
+
     // Create the emulator instance.
     emu_ = sym_create_();
     if (!emu_) {
@@ -304,6 +311,64 @@ std::string emu_transport_inprocess::get_device_name()
             return std::string(buf, static_cast<size_t>(len));
     }
     return "NPU Phoenix (Emulated)";  // fallback
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic queries
+// ---------------------------------------------------------------------------
+
+int8_t emu_transport_inprocess::get_lock_value(uint16_t col, uint16_t row,
+                                               uint8_t lock_id)
+{
+    if (sym_get_lock_value_)
+        return sym_get_lock_value_(emu_, col, row, lock_id);
+    return -128;  // not available
+}
+
+uint32_t emu_transport_inprocess::get_dma_channel_state(uint16_t col,
+                                                         uint16_t row,
+                                                         uint8_t is_s2mm,
+                                                         uint8_t channel_index)
+{
+    if (sym_get_dma_ch_state_)
+        return sym_get_dma_ch_state_(emu_, col, row, is_s2mm, channel_index);
+    return 0;  // Idle
+}
+
+bool emu_transport_inprocess::get_dma_channel_stats(uint16_t col,
+                                                     uint16_t row,
+                                                     uint8_t is_s2mm,
+                                                     uint8_t channel_index,
+                                                     DmaChannelStats& out)
+{
+    if (!sym_get_dma_ch_stats_)
+        return false;
+
+    // The Rust FFI uses the same layout as our DmaChannelStats struct:
+    // 4 x uint64_t.  Pass the address directly.
+    int32_t rc = sym_get_dma_ch_stats_(emu_, col, row, is_s2mm,
+                                        channel_index, &out);
+    return rc == 0;
+}
+
+bool emu_transport_inprocess::set_log_level(const std::string& level)
+{
+    if (!sym_set_log_level_)
+        return false;
+    return sym_set_log_level_(level.c_str()) == 0;
+}
+
+std::string emu_transport_inprocess::dump_tile_state(uint16_t col,
+                                                      uint16_t row)
+{
+    if (!sym_dump_tile_state_)
+        return {};
+
+    char buf[4096];
+    int32_t len = sym_dump_tile_state_(emu_, col, row, buf, sizeof(buf));
+    if (len > 0 && static_cast<uint32_t>(len) < sizeof(buf))
+        return std::string(buf, static_cast<size_t>(len));
+    return {};
 }
 
 } // namespace xdna_emu

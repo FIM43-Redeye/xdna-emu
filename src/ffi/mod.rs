@@ -14,6 +14,7 @@
 //! - Buffer data is copied during write/read operations; the caller
 //!   retains ownership of their pointers.
 
+use std::cell::RefCell;
 use std::ffi::{CStr, c_char};
 use std::slice;
 use std::sync::Mutex;
@@ -23,6 +24,17 @@ use crate::parser::xclbin::SectionKind;
 use crate::parser::cdo::find_cdo_offset;
 use crate::interpreter::engine::InterpreterEngine;
 use crate::npu::{NpuInstructionStream, NpuExecutor};
+
+// Thread-local error storage for xdna_emu_get_error().
+thread_local! {
+    static LAST_ERROR: RefCell<String> = RefCell::new(String::new());
+}
+
+fn set_last_error(msg: String) {
+    LAST_ERROR.with(|e| {
+        *e.borrow_mut() = msg;
+    });
+}
 
 /// Opaque handle to emulator state.
 /// Wraps InterpreterEngine and related state.
@@ -132,7 +144,9 @@ pub unsafe extern "C" fn xdna_emu_load_xclbin(
     let xclbin = match Xclbin::from_file(path_str) {
         Ok(x) => x,
         Err(e) => {
-            log::error!("Failed to parse xclbin: {}", e);
+            let msg = format!("Failed to parse xclbin: {}", e);
+            log::error!("{}", msg);
+            set_last_error(msg);
             return XdnaEmuResult::ParseError;
         }
     };
@@ -562,6 +576,8 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
 
 /// Get the last error message (for debugging).
 ///
+/// Reads the thread-local error string set by failed FFI operations.
+///
 /// # Safety
 /// - `buffer` must point to at least `buffer_size` bytes
 /// - Returns the number of bytes written (excluding null terminator)
@@ -570,11 +586,22 @@ pub unsafe extern "C" fn xdna_emu_get_error(
     buffer: *mut c_char,
     buffer_size: u64,
 ) -> u64 {
-    // For now, just return empty - we'd need thread-local storage for proper error handling
-    if !buffer.is_null() && buffer_size > 0 {
-        *buffer = 0;
+    if buffer.is_null() || buffer_size == 0 {
+        return 0;
     }
-    0
+
+    LAST_ERROR.with(|e| {
+        let msg = e.borrow();
+        if msg.is_empty() {
+            *buffer = 0;
+            return 0;
+        }
+        let bytes = msg.as_bytes();
+        let copy_len = bytes.len().min((buffer_size - 1) as usize);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer as *mut u8, copy_len);
+        *buffer.add(copy_len) = 0; // null terminator
+        copy_len as u64
+    })
 }
 
 /// Allocate a host memory buffer of the given size.
@@ -882,6 +909,279 @@ pub extern "C" fn xdna_emu_version() -> u32 {
     0x000100
 }
 
+// ---------------------------------------------------------------------------
+// Diagnostic query functions
+// ---------------------------------------------------------------------------
+
+/// Get the current value of a tile lock.
+///
+/// # Safety
+/// - `handle` must be valid
+///
+/// # Returns
+/// Lock value (-64..63), or -128 on error.
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_get_lock_value(
+    handle: *mut XdnaEmuHandle,
+    col: u16,
+    row: u16,
+    lock_id: u8,
+) -> i8 {
+    if handle.is_null() {
+        return -128;
+    }
+
+    let handle = &*handle;
+    let device = handle.engine.device();
+
+    let tile = match device.tile(col as usize, row as usize) {
+        Some(t) => t,
+        None => {
+            set_last_error(format!(
+                "get_lock_value: tile ({}, {}) out of bounds", col, row
+            ));
+            return -128;
+        }
+    };
+
+    let id = lock_id as usize;
+    if id < tile.locks.len() {
+        tile.locks[id].value
+    } else {
+        set_last_error(format!(
+            "get_lock_value: lock_id {} out of range (tile has {})",
+            lock_id, tile.locks.len()
+        ));
+        -128
+    }
+}
+
+/// Get the state of a DMA channel.
+///
+/// Returns a packed u32: bits 0-7 = state enum, bits 8-15 = lock_id
+/// when state == WaitingForLock.
+///
+/// State values: 0=Idle, 1=Active, 2=Paused, 3=WaitingForLock, 4=Error.
+///
+/// The `is_s2mm` parameter selects the direction: 1 for S2MM channels
+/// (indices 0..s2mm_count-1), 0 for MM2S channels (indices
+/// s2mm_count..num_channels-1).  The `channel_index` is zero-based
+/// within the selected direction.
+///
+/// # Safety
+/// - `handle` must be valid
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_get_dma_channel_state(
+    handle: *mut XdnaEmuHandle,
+    col: u16,
+    row: u16,
+    is_s2mm: u8,
+    channel_index: u8,
+) -> u32 {
+    use crate::device::dma::ChannelState;
+
+    if handle.is_null() {
+        return 0;
+    }
+
+    let handle = &*handle;
+    let device = handle.engine.device();
+
+    let engine = match device.array.dma_engine(col as u8, row as u8) {
+        Some(e) => e,
+        None => return 0,
+    };
+
+    // Convert direction + index to absolute channel ID.
+    // S2MM channels come first, then MM2S.
+    let abs_ch = if is_s2mm != 0 {
+        channel_index
+    } else {
+        engine.s2mm_channel_count() as u8 + channel_index
+    };
+
+    let state = engine.channel_state(abs_ch);
+    match state {
+        ChannelState::Idle => 0,
+        ChannelState::Active => 1,
+        ChannelState::Paused => 2,
+        ChannelState::WaitingForLock(lock_id) => 3 | ((lock_id as u32) << 8),
+        ChannelState::Error => 4,
+    }
+}
+
+/// DMA channel statistics (mirrors C struct XdnaEmuChannelStats).
+#[repr(C)]
+pub struct XdnaEmuChannelStats {
+    pub transfers_completed: u64,
+    pub bytes_transferred: u64,
+    pub cycles_spent: u64,
+    pub lock_wait_cycles: u64,
+}
+
+/// Get performance statistics for a DMA channel.
+///
+/// # Safety
+/// - `handle` must be valid
+/// - `out` must point to a valid XdnaEmuChannelStats
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_get_dma_channel_stats(
+    handle: *mut XdnaEmuHandle,
+    col: u16,
+    row: u16,
+    is_s2mm: u8,
+    channel_index: u8,
+    out: *mut XdnaEmuChannelStats,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    if out.is_null() {
+        return -4;
+    }
+
+    let handle = &*handle;
+    let device = handle.engine.device();
+
+    let engine = match device.array.dma_engine(col as u8, row as u8) {
+        Some(e) => e,
+        None => return -2,
+    };
+
+    let abs_ch = if is_s2mm != 0 {
+        channel_index
+    } else {
+        engine.s2mm_channel_count() as u8 + channel_index
+    };
+
+    match engine.channel_stats(abs_ch) {
+        Some(stats) => {
+            (*out).transfers_completed = stats.transfers_completed;
+            (*out).bytes_transferred = stats.bytes_transferred;
+            (*out).cycles_spent = stats.cycles_spent;
+            (*out).lock_wait_cycles = stats.lock_wait_cycles;
+            0
+        }
+        None => {
+            set_last_error(format!(
+                "get_dma_channel_stats: channel {} out of range", abs_ch
+            ));
+            -3
+        }
+    }
+}
+
+/// Set the emulator log level at runtime.
+///
+/// # Safety
+/// - `level` must be a valid null-terminated C string
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_set_log_level(level: *const c_char) -> i32 {
+    if level.is_null() {
+        return -1;
+    }
+
+    let level_str = match CStr::from_ptr(level).to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+
+    let filter = match level_str {
+        "error" => log::LevelFilter::Error,
+        "warn"  => log::LevelFilter::Warn,
+        "info"  => log::LevelFilter::Info,
+        "debug" => log::LevelFilter::Debug,
+        "trace" => log::LevelFilter::Trace,
+        _ => {
+            set_last_error(format!("set_log_level: unknown level '{}'", level_str));
+            return -1;
+        }
+    };
+
+    log::set_max_level(filter);
+    0
+}
+
+/// Dump a human-readable summary of a tile's state (locks + DMA).
+///
+/// # Safety
+/// - `handle` must be valid
+/// - `buf` must point to at least `buf_size` bytes
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_dump_tile_state(
+    handle: *mut XdnaEmuHandle,
+    col: u16,
+    row: u16,
+    buf: *mut c_char,
+    buf_size: u32,
+) -> i32 {
+    use std::fmt::Write;
+
+    if handle.is_null() || buf.is_null() || buf_size == 0 {
+        return -1;
+    }
+
+    let handle = &*handle;
+    let device = handle.engine.device();
+
+    let tile = match device.tile(col as usize, row as usize) {
+        Some(t) => t,
+        None => {
+            set_last_error(format!("dump_tile_state: tile ({}, {}) out of bounds", col, row));
+            return -2;
+        }
+    };
+
+    let mut out = String::with_capacity(512);
+
+    // Lock values.
+    let _ = write!(out, "tile({},{}) locks:", col, row);
+    for (i, lock) in tile.locks.iter().enumerate() {
+        if lock.value != 0 {
+            let _ = write!(out, " [{}]={}", i, lock.value);
+        }
+    }
+    out.push('\n');
+
+    // DMA channel state.
+    if let Some(engine) = device.array.dma_engine(col as u8, row as u8) {
+        let s2mm_count = engine.s2mm_channel_count();
+        let mm2s_count = engine.mm2s_channel_count();
+
+        for i in 0..s2mm_count {
+            let state = engine.channel_state(i as u8);
+            let stats = engine.channel_stats(i as u8);
+            let _ = write!(out, "  s2mm[{}]: {:?}", i, state);
+            if let Some(s) = stats {
+                let _ = write!(out, " xfr={} bytes={}", s.transfers_completed, s.bytes_transferred);
+            }
+            out.push('\n');
+        }
+
+        for i in 0..mm2s_count {
+            let abs = s2mm_count as u8 + i as u8;
+            let state = engine.channel_state(abs);
+            let stats = engine.channel_stats(abs);
+            let _ = write!(out, "  mm2s[{}]: {:?}", i, state);
+            if let Some(s) = stats {
+                let _ = write!(out, " xfr={} bytes={}", s.transfers_completed, s.bytes_transferred);
+            }
+            out.push('\n');
+        }
+    }
+
+    let bytes = out.as_bytes();
+    let needed = bytes.len();
+    if needed >= buf_size as usize {
+        // Buffer too small -- return required size.
+        return needed as i32 + 1;
+    }
+
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, needed);
+    *buf.add(needed) = 0;
+    needed as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1179,6 +1479,141 @@ mod tests {
                 // Should be null-terminated.
                 assert_eq!(buf[9], 0);
             });
+        }
+    }
+
+    // -- Diagnostic query tests -------------------------------------------
+
+    #[test]
+    fn test_get_lock_value_default_zero() {
+        unsafe {
+            with_handle(|h| {
+                // Compute tile (0, 2) has 16 locks, all initially 0.
+                let val = xdna_emu_get_lock_value(h, 0, 2, 0);
+                assert_eq!(val, 0, "default lock value should be 0");
+            });
+        }
+    }
+
+    #[test]
+    fn test_get_lock_value_after_write_register() {
+        unsafe {
+            with_handle(|h| {
+                // Write lock 0 value via register interface.
+                // Lock_Value registers for compute tiles start at 0x1F000
+                // (Lock0_value), spaced 0x10 bytes apart.
+                let lock_value_0 = 0x1F000u32;
+                let rc = xdna_emu_write_register(h, 0, 2, lock_value_0, 3);
+                assert_eq!(rc, 0);
+
+                let val = xdna_emu_get_lock_value(h, 0, 2, 0);
+                assert_eq!(val, 3, "lock should reflect written value");
+            });
+        }
+    }
+
+    #[test]
+    fn test_get_lock_value_invalid_tile() {
+        unsafe {
+            with_handle(|h| {
+                let val = xdna_emu_get_lock_value(h, 99, 99, 0);
+                assert_eq!(val, -128, "invalid tile should return -128");
+            });
+        }
+    }
+
+    #[test]
+    fn test_get_lock_value_null_handle() {
+        unsafe {
+            let val = xdna_emu_get_lock_value(std::ptr::null_mut(), 0, 2, 0);
+            assert_eq!(val, -128);
+        }
+    }
+
+    #[test]
+    fn test_get_dma_channel_state_idle_by_default() {
+        unsafe {
+            with_handle(|h| {
+                // All channels should be idle at startup.
+                let state = xdna_emu_get_dma_channel_state(h, 0, 2, 1, 0);
+                assert_eq!(state & 0xFF, 0, "s2mm ch0 should be idle");
+
+                let state = xdna_emu_get_dma_channel_state(h, 0, 2, 0, 0);
+                assert_eq!(state & 0xFF, 0, "mm2s ch0 should be idle");
+            });
+        }
+    }
+
+    #[test]
+    fn test_get_dma_channel_stats_default_zeros() {
+        unsafe {
+            with_handle(|h| {
+                let mut stats = XdnaEmuChannelStats {
+                    transfers_completed: 0xFF,
+                    bytes_transferred: 0xFF,
+                    cycles_spent: 0xFF,
+                    lock_wait_cycles: 0xFF,
+                };
+                let rc = xdna_emu_get_dma_channel_stats(h, 0, 2, 1, 0, &mut stats);
+                assert_eq!(rc, 0, "should succeed for valid tile/channel");
+                assert_eq!(stats.transfers_completed, 0);
+                assert_eq!(stats.bytes_transferred, 0);
+            });
+        }
+    }
+
+    #[test]
+    fn test_set_log_level() {
+        unsafe {
+            let level = b"debug\0";
+            let rc = xdna_emu_set_log_level(level.as_ptr() as *const c_char);
+            assert_eq!(rc, 0, "setting debug level should succeed");
+
+            let bad = b"nonsense\0";
+            let rc = xdna_emu_set_log_level(bad.as_ptr() as *const c_char);
+            assert_eq!(rc, -1, "invalid level should return -1");
+        }
+    }
+
+    #[test]
+    fn test_dump_tile_state() {
+        unsafe {
+            with_handle(|h| {
+                let mut buf = [0i8; 1024];
+                let len = xdna_emu_dump_tile_state(h, 0, 2, buf.as_mut_ptr(), 1024);
+                assert!(len > 0, "should produce non-empty output");
+                let text = CStr::from_ptr(buf.as_ptr()).to_str().unwrap();
+                assert!(text.contains("tile(0,2)"), "should mention tile coords");
+                assert!(text.contains("locks:"), "should mention locks");
+            });
+        }
+    }
+
+    #[test]
+    fn test_dump_tile_state_invalid_tile() {
+        unsafe {
+            with_handle(|h| {
+                let mut buf = [0i8; 64];
+                let rc = xdna_emu_dump_tile_state(h, 99, 99, buf.as_mut_ptr(), 64);
+                assert_eq!(rc, -2);
+            });
+        }
+    }
+
+    #[test]
+    fn test_get_error_returns_last_error() {
+        unsafe {
+            // Trigger an error by querying an invalid tile.
+            let _ = xdna_emu_get_lock_value(
+                // Need a valid handle but invalid tile.
+                xdna_emu_create(), 99, 99, 0,
+            );
+
+            let mut buf = [0i8; 256];
+            let len = xdna_emu_get_error(buf.as_mut_ptr(), 256);
+            assert!(len > 0, "should have an error message");
+            let msg = CStr::from_ptr(buf.as_ptr()).to_str().unwrap();
+            assert!(msg.contains("out of bounds"), "error should mention bounds: {}", msg);
         }
     }
 }

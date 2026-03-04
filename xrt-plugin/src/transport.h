@@ -85,6 +85,43 @@ public:
     /// Device name string (e.g. "NPU Phoenix (Emulated) [AIE2]").
     virtual std::string get_device_name() = 0;
 
+    // -- Diagnostics ---------------------------------------------------------
+    // Default implementations return "not available" so that future
+    // transport backends (socket, etc.) work without implementing these.
+
+    struct DmaChannelStats {
+        uint64_t transfers_completed = 0;
+        uint64_t bytes_transferred   = 0;
+        uint64_t cycles_spent        = 0;
+        uint64_t lock_wait_cycles    = 0;
+    };
+
+    /// Get the current value of a tile lock (-128 = not available).
+    virtual int8_t get_lock_value(uint16_t col, uint16_t row,
+                                  uint8_t lock_id)
+    { return -128; }
+
+    /// Get packed DMA channel state (bits 0-7 = state enum, 8-15 = lock_id).
+    virtual uint32_t get_dma_channel_state(uint16_t col, uint16_t row,
+                                           uint8_t is_s2mm,
+                                           uint8_t channel_index)
+    { return 0; }
+
+    /// Get DMA channel statistics.  Returns true on success.
+    virtual bool get_dma_channel_stats(uint16_t col, uint16_t row,
+                                       uint8_t is_s2mm,
+                                       uint8_t channel_index,
+                                       DmaChannelStats& out)
+    { return false; }
+
+    /// Set the emulator's internal log level.  Returns true on success.
+    virtual bool set_log_level(const std::string& level)
+    { return false; }
+
+    /// Dump a human-readable summary of a tile's state.
+    virtual std::string dump_tile_state(uint16_t col, uint16_t row)
+    { return {}; }
+
     // -- Factory -------------------------------------------------------------
 
     /// Create an in-process transport by dlopen'ing the emulator shared lib.

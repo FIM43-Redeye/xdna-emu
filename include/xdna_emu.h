@@ -347,6 +347,112 @@ int32_t xdna_emu_get_device_name(XdnaEmuHandle* handle,
  */
 uint32_t xdna_emu_version(void);
 
+/* -----------------------------------------------------------------------
+ * Diagnostic query functions
+ * ----------------------------------------------------------------------- */
+
+/**
+ * DMA channel statistics for diagnostic queries.
+ */
+typedef struct {
+    uint64_t transfers_completed;
+    uint64_t bytes_transferred;
+    uint64_t cycles_spent;
+    uint64_t lock_wait_cycles;
+} XdnaEmuChannelStats;
+
+/**
+ * DMA channel state values returned by xdna_emu_get_dma_channel_state().
+ *
+ * Bits 0-7: state enum.  Bits 8-15: lock_id when state == WaitingForLock.
+ */
+enum {
+    XDNA_EMU_DMA_IDLE            = 0,
+    XDNA_EMU_DMA_ACTIVE          = 1,
+    XDNA_EMU_DMA_PAUSED          = 2,
+    XDNA_EMU_DMA_WAITING_FOR_LOCK = 3,
+    XDNA_EMU_DMA_ERROR           = 4,
+};
+
+/**
+ * Get the current value of a tile lock.
+ *
+ * @param handle   Valid emulator handle.
+ * @param col      Tile column.
+ * @param row      Tile row.
+ * @param lock_id  Lock index within the tile.
+ * @return Lock value (-64..63), or -128 on error (invalid handle/tile/id).
+ */
+int8_t xdna_emu_get_lock_value(
+    XdnaEmuHandle* handle,
+    uint16_t col, uint16_t row,
+    uint8_t lock_id
+);
+
+/**
+ * Get the state of a DMA channel.
+ *
+ * @param handle        Valid emulator handle.
+ * @param col           Tile column.
+ * @param row           Tile row.
+ * @param is_s2mm       1 for S2MM (stream-to-memory), 0 for MM2S.
+ * @param channel_index Channel number within the direction (0-based).
+ * @return Packed state: bits 0-7 = XDNA_EMU_DMA_* enum,
+ *         bits 8-15 = lock_id if state == WAITING_FOR_LOCK, else 0.
+ *         Returns 0 (Idle) on error.
+ */
+uint32_t xdna_emu_get_dma_channel_state(
+    XdnaEmuHandle* handle,
+    uint16_t col, uint16_t row,
+    uint8_t is_s2mm,
+    uint8_t channel_index
+);
+
+/**
+ * Get performance statistics for a DMA channel.
+ *
+ * @param handle        Valid emulator handle.
+ * @param col           Tile column.
+ * @param row           Tile row.
+ * @param is_s2mm       1 for S2MM, 0 for MM2S.
+ * @param channel_index Channel number within the direction (0-based).
+ * @param out           Pointer to stats structure to fill.
+ * @return 0 on success, negative on error.
+ */
+int32_t xdna_emu_get_dma_channel_stats(
+    XdnaEmuHandle* handle,
+    uint16_t col, uint16_t row,
+    uint8_t is_s2mm,
+    uint8_t channel_index,
+    XdnaEmuChannelStats* out
+);
+
+/**
+ * Set the emulator log level at runtime.
+ *
+ * @param level Null-terminated level string: "error", "warn", "info",
+ *              "debug", or "trace".
+ * @return 0 on success, -1 on invalid level.
+ */
+int32_t xdna_emu_set_log_level(const char* level);
+
+/**
+ * Dump a human-readable summary of a tile's state (locks + DMA).
+ *
+ * @param handle   Valid emulator handle.
+ * @param col      Tile column.
+ * @param row      Tile row.
+ * @param buf      Buffer to receive null-terminated text.
+ * @param buf_size Size of buffer.
+ * @return Number of bytes written (excluding null terminator),
+ *         or -1 on error, or required size if buf_size is too small.
+ */
+int32_t xdna_emu_dump_tile_state(
+    XdnaEmuHandle* handle,
+    uint16_t col, uint16_t row,
+    char* buf, uint32_t buf_size
+);
+
 #ifdef __cplusplus
 }
 #endif

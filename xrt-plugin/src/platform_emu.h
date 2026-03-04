@@ -128,6 +128,12 @@ public:
   void
   set_transport(emu_transport* t) const { m_transport = t; }
 
+  /// Log all tracked BOs (EMU_DBG level).
+  void dump_bo_table(const char* context) const;
+
+  /// Log all active contexts (EMU_DBG level).
+  void dump_ctx_table(const char* context) const;
+
 private:
 
   // Monotonic counters for synthetic handles.

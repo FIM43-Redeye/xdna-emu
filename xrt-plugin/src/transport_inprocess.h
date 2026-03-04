@@ -62,6 +62,19 @@ public:
     uint8_t     get_rows() override;
     std::string get_device_name() override;
 
+    // -- Diagnostic overrides ------------------------------------------------
+    int8_t      get_lock_value(uint16_t col, uint16_t row,
+                               uint8_t lock_id) override;
+    uint32_t    get_dma_channel_state(uint16_t col, uint16_t row,
+                                      uint8_t is_s2mm,
+                                      uint8_t channel_index) override;
+    bool        get_dma_channel_stats(uint16_t col, uint16_t row,
+                                      uint8_t is_s2mm,
+                                      uint8_t channel_index,
+                                      DmaChannelStats& out) override;
+    bool        set_log_level(const std::string& level) override;
+    std::string dump_tile_state(uint16_t col, uint16_t row) override;
+
 private:
     // -----------------------------------------------------------------------
     // FFI function-pointer types.
@@ -112,6 +125,18 @@ private:
     using fn_get_rows           = uint8_t (*)(XdnaEmuHandle*);
     using fn_get_device_name    = int32_t (*)(XdnaEmuHandle*, char*, uint32_t);
 
+    // -- Diagnostic FFI (may be nullptr) -----------------------------------
+    using fn_get_lock_value     = int8_t (*)(XdnaEmuHandle*, uint16_t,
+                                             uint16_t, uint8_t);
+    using fn_get_dma_ch_state   = uint32_t (*)(XdnaEmuHandle*, uint16_t,
+                                               uint16_t, uint8_t, uint8_t);
+    using fn_get_dma_ch_stats   = int32_t (*)(XdnaEmuHandle*, uint16_t,
+                                              uint16_t, uint8_t, uint8_t,
+                                              void*);
+    using fn_set_log_level      = int32_t (*)(const char*);
+    using fn_dump_tile_state    = int32_t (*)(XdnaEmuHandle*, uint16_t,
+                                             uint16_t, char*, uint32_t);
+
     // -----------------------------------------------------------------------
     // State
     // -----------------------------------------------------------------------
@@ -151,6 +176,13 @@ private:
     fn_get_columns        sym_get_columns_        = nullptr;
     fn_get_rows           sym_get_rows_           = nullptr;
     fn_get_device_name    sym_get_device_name_    = nullptr;
+
+    // -- Diagnostic (nullable) ---------------------------------------------
+    fn_get_lock_value     sym_get_lock_value_     = nullptr;
+    fn_get_dma_ch_state   sym_get_dma_ch_state_   = nullptr;
+    fn_get_dma_ch_stats   sym_get_dma_ch_stats_   = nullptr;
+    fn_set_log_level      sym_set_log_level_      = nullptr;
+    fn_dump_tile_state    sym_dump_tile_state_     = nullptr;
 
     // -----------------------------------------------------------------------
     // Helpers
