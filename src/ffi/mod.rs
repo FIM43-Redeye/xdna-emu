@@ -820,6 +820,61 @@ pub unsafe extern "C" fn xdna_emu_write_tile_memory(
     0
 }
 
+/// Get the number of tile columns in the emulated device.
+///
+/// # Safety
+/// - `handle` must be valid
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_get_columns(handle: *mut XdnaEmuHandle) -> u8 {
+    if handle.is_null() {
+        return 0;
+    }
+    let handle = &*handle;
+    handle.engine.device().cols() as u8
+}
+
+/// Get the number of tile rows in the emulated device.
+///
+/// # Safety
+/// - `handle` must be valid
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_get_rows(handle: *mut XdnaEmuHandle) -> u8 {
+    if handle.is_null() {
+        return 0;
+    }
+    let handle = &*handle;
+    handle.engine.device().rows() as u8
+}
+
+/// Get the device name string (e.g. "NPU Phoenix (Emulated)").
+///
+/// Writes a null-terminated string into `buf`. Returns the number of
+/// bytes written excluding the null terminator, or -1 on error.
+///
+/// # Safety
+/// - `handle` must be valid
+/// - `buf` must point to at least `buf_size` bytes
+#[no_mangle]
+pub unsafe extern "C" fn xdna_emu_get_device_name(
+    handle: *mut XdnaEmuHandle,
+    buf: *mut c_char,
+    buf_size: u32,
+) -> i32 {
+    if handle.is_null() || buf.is_null() || buf_size == 0 {
+        return -1;
+    }
+
+    let handle = &*handle;
+    let arch_name = handle.engine.device().arch_name();
+    let name = format!("NPU Phoenix (Emulated) [{}]", arch_name);
+
+    let bytes = name.as_bytes();
+    let copy_len = bytes.len().min((buf_size - 1) as usize);
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, copy_len);
+    *buf.add(copy_len) = 0; // null terminator
+    copy_len as i32
+}
+
 /// Get version information.
 #[no_mangle]
 pub extern "C" fn xdna_emu_version() -> u32 {
@@ -1066,6 +1121,64 @@ mod tests {
                 std::ptr::null_mut(), 0, 2, 0, 4, data.as_ptr(),
             );
             assert_eq!(rc, -1, "null handle should return -1");
+        }
+    }
+
+    #[test]
+    fn test_get_columns_rows() {
+        unsafe {
+            with_handle(|h| {
+                let cols = xdna_emu_get_columns(h);
+                let rows = xdna_emu_get_rows(h);
+                // NPU1 default: 5 columns, 6 rows.
+                assert_eq!(cols, 5, "NPU1 should have 5 columns");
+                assert_eq!(rows, 6, "NPU1 should have 6 rows");
+            });
+        }
+    }
+
+    #[test]
+    fn test_get_columns_rows_null_handle() {
+        unsafe {
+            assert_eq!(xdna_emu_get_columns(std::ptr::null_mut()), 0);
+            assert_eq!(xdna_emu_get_rows(std::ptr::null_mut()), 0);
+        }
+    }
+
+    #[test]
+    fn test_get_device_name() {
+        unsafe {
+            with_handle(|h| {
+                let mut buf = [0i8; 256];
+                let len = xdna_emu_get_device_name(h, buf.as_mut_ptr(), 256);
+                assert!(len > 0, "should return positive length");
+                let name = CStr::from_ptr(buf.as_ptr()).to_str().unwrap();
+                assert!(name.contains("Emulated"), "name should contain 'Emulated': {}", name);
+                assert!(name.contains("AIE2"), "name should contain 'AIE2': {}", name);
+            });
+        }
+    }
+
+    #[test]
+    fn test_get_device_name_null_handle() {
+        unsafe {
+            let mut buf = [0i8; 64];
+            let rc = xdna_emu_get_device_name(std::ptr::null_mut(), buf.as_mut_ptr(), 64);
+            assert_eq!(rc, -1, "null handle should return -1");
+        }
+    }
+
+    #[test]
+    fn test_get_device_name_small_buffer() {
+        unsafe {
+            with_handle(|h| {
+                // Buffer of 10 should truncate but not crash.
+                let mut buf = [0i8; 10];
+                let len = xdna_emu_get_device_name(h, buf.as_mut_ptr(), 10);
+                assert_eq!(len, 9, "should truncate to buf_size - 1");
+                // Should be null-terminated.
+                assert_eq!(buf[9], 0);
+            });
         }
     }
 }

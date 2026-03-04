@@ -107,6 +107,9 @@ emu_transport_inprocess::emu_transport_inprocess(const std::string& lib_path)
     sym_write_register_     = resolve_optional<fn_write_register>("xdna_emu_write_register");
     sym_read_tile_mem_      = resolve_optional<fn_read_tile_mem>("xdna_emu_read_tile_memory");
     sym_write_tile_mem_     = resolve_optional<fn_write_tile_mem>("xdna_emu_write_tile_memory");
+    sym_get_columns_        = resolve_optional<fn_get_columns>("xdna_emu_get_columns");
+    sym_get_rows_           = resolve_optional<fn_get_rows>("xdna_emu_get_rows");
+    sym_get_device_name_    = resolve_optional<fn_get_device_name>("xdna_emu_get_device_name");
 
     // Create the emulator instance.
     emu_ = sym_create_();
@@ -257,6 +260,35 @@ void emu_transport_inprocess::write_tile_memory(uint16_t col, uint16_t row,
         throw std::runtime_error("write_tile_memory: FFI function not available");
     Result rc = sym_write_tile_mem_(emu_, col, row, offset, size, data);
     check(rc, "write_tile_memory");
+}
+
+// ---------------------------------------------------------------------------
+// Device metadata
+// ---------------------------------------------------------------------------
+
+uint8_t emu_transport_inprocess::get_columns()
+{
+    if (sym_get_columns_)
+        return sym_get_columns_(emu_);
+    return 5;  // Phoenix default
+}
+
+uint8_t emu_transport_inprocess::get_rows()
+{
+    if (sym_get_rows_)
+        return sym_get_rows_(emu_);
+    return 6;  // Phoenix default
+}
+
+std::string emu_transport_inprocess::get_device_name()
+{
+    if (sym_get_device_name_) {
+        char buf[256];
+        int32_t len = sym_get_device_name_(emu_, buf, sizeof(buf));
+        if (len > 0)
+            return std::string(buf, static_cast<size_t>(len));
+    }
+    return "NPU Phoenix (Emulated)";  // fallback
 }
 
 } // namespace xdna_emu

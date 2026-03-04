@@ -69,6 +69,17 @@ public:
                                    uint32_t offset, uint32_t size,
                                    const void* data) = 0;
 
+    // -- Device metadata -----------------------------------------------------
+
+    /// Number of tile columns in the emulated device.
+    virtual uint8_t get_columns() = 0;
+
+    /// Number of tile rows in the emulated device.
+    virtual uint8_t get_rows() = 0;
+
+    /// Device name string (e.g. "NPU Phoenix (Emulated) [AIE2]").
+    virtual std::string get_device_name() = 0;
+
     // -- Factory -------------------------------------------------------------
 
     /// Create an in-process transport by dlopen'ing the emulator shared lib.

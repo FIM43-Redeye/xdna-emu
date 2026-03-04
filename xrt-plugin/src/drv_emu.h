@@ -5,12 +5,8 @@
 // Registers drv_emu with XRT's driver list via the same static-init
 // pattern used by the real xdna shim (pcidrv_amdxdna.cpp).
 //
-// LIMITATION: The base xrt_core::pci::drv::scan_devices() is
-// non-virtual and walks /sys/bus/pci/drivers/{name()}/. Since we have
-// no real PCI device, that directory does not exist and scan_devices
-// returns without adding anything. A future task will provide an
-// alternative discovery path (e.g. XRT patch or environment-variable
-// triggered direct device injection).
+// When XDNA_EMU=1, scan_devices() injects a synthetic pdev_emu into
+// the ready list. Otherwise the driver is loaded but invisible.
 
 #pragma once
 
@@ -27,6 +23,9 @@ public:
   std::string
   name() const override;
 
+  bool
+  is_user() const override;
+
   std::string
   dev_node_prefix() const override;
 
@@ -35,6 +34,10 @@ public:
 
   std::string
   sysfs_dev_node_dir() const override;
+
+  void
+  scan_devices(std::vector<std::shared_ptr<xrt_core::pci::dev>>& ready_list,
+               std::vector<std::shared_ptr<xrt_core::pci::dev>>& nonready_list) const override;
 
 private:
   std::shared_ptr<xrt_core::pci::dev>

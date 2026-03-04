@@ -1488,6 +1488,12 @@ impl DeviceState {
         self.array.rows() as usize
     }
 
+    /// Get the architecture name (e.g. "AIE2", "AIE2P").
+    #[inline]
+    pub fn arch_name(&self) -> &str {
+        self.array.arch().name()
+    }
+
     /// Get a tile by coordinates, or None if out of bounds.
     #[inline]
     pub fn tile(&self, col: usize, row: usize) -> Option<&Tile> {

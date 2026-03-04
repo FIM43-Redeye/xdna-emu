@@ -57,13 +57,43 @@ private:
   void
   wait_cmd_ioctl(shim_xdna::wait_cmd_arg& arg) const override;
 
-  // -- Info / sysfs ----------------------------------------------------------
+  // -- Context configuration -------------------------------------------------
+
+  void
+  config_ctx_cu_config(shim_xdna::config_ctx_cu_config_arg& arg) const override;
+
+  void
+  config_ctx_debug_bo(shim_xdna::config_ctx_debug_bo_arg& arg) const override;
+
+  // -- Buffer management (unsupported operations) ---------------------------
+
+  void
+  export_bo(shim_xdna::export_bo_arg& arg) const override;
+
+  void
+  import_bo(shim_xdna::import_bo_arg& arg) const override;
+
+  // -- Execution (syncobj path) ---------------------------------------------
+
+  void
+  wait_cmd_syncobj(shim_xdna::wait_cmd_arg& arg) const override;
+
+  // -- Info / sysfs / state -------------------------------------------------
 
   void
   get_info(amdxdna_drm_get_info& arg) const override;
 
   void
+  get_info_array(amdxdna_drm_get_array& arg) const override;
+
+  void
+  set_state(amdxdna_drm_set_state& arg) const override;
+
+  void
   get_sysfs(shim_xdna::get_sysfs_arg& arg) const override;
+
+  void
+  put_sysfs(shim_xdna::put_sysfs_arg& arg) const override;
 
   // -- Syncobj stubs (no real DRM fd available) ------------------------------
 
@@ -72,6 +102,12 @@ private:
 
   void
   destroy_syncobj(shim_xdna::create_destroy_syncobj_arg& arg) const override;
+
+  void
+  export_syncobj(shim_xdna::export_import_syncobj_arg& arg) const override;
+
+  void
+  import_syncobj(shim_xdna::export_import_syncobj_arg& arg) const override;
 
   void
   wait_syncobj(shim_xdna::wait_syncobj_arg& arg) const override;
@@ -95,10 +131,26 @@ private:
   struct bo_entry {
     uint64_t dev_addr;
     size_t   size;
-    void*    host_ptr; // mmap'd region (malloc'd for emulation)
+    void*    host_ptr;
   };
   mutable std::mutex m_bo_lock;
   mutable std::unordered_map<uint32_t, bo_entry> m_bo_map;
+
+  // Active contexts: handle -> {start_col, num_cols, pid, submissions, completions}.
+  struct ctx_entry {
+    uint32_t start_col = 0;
+    uint32_t num_col   = 5;
+    int64_t  pid       = 0;
+    uint64_t submissions = 0;
+    uint64_t completions = 0;
+  };
+  mutable std::mutex m_ctx_lock;
+  mutable std::unordered_map<uint32_t, ctx_entry> m_ctx_map;
+
+  // Settable state (round-trips through set_state / get_info).
+  mutable uint8_t m_power_mode  = POWER_MODE_DEFAULT;
+  mutable uint8_t m_preemption  = 0;  // disabled
+  mutable uint8_t m_fbp_mode    = 0;  // disabled
 };
 
 } // namespace xdna_emu

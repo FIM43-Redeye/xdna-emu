@@ -57,6 +57,10 @@ public:
                                uint32_t offset, uint32_t size,
                                const void* data) override;
 
+    uint8_t     get_columns() override;
+    uint8_t     get_rows() override;
+    std::string get_device_name() override;
+
 private:
     // -----------------------------------------------------------------------
     // FFI function-pointer types.
@@ -103,6 +107,9 @@ private:
     using fn_write_tile_mem     = Result (*)(XdnaEmuHandle*, uint16_t,
                                              uint16_t, uint32_t, uint32_t,
                                              const void*);
+    using fn_get_columns        = uint8_t (*)(XdnaEmuHandle*);
+    using fn_get_rows           = uint8_t (*)(XdnaEmuHandle*);
+    using fn_get_device_name    = int32_t (*)(XdnaEmuHandle*, char*, uint32_t);
 
     // -----------------------------------------------------------------------
     // State
@@ -140,6 +147,9 @@ private:
     fn_write_register     sym_write_register_     = nullptr;
     fn_read_tile_mem      sym_read_tile_mem_      = nullptr;
     fn_write_tile_mem     sym_write_tile_mem_     = nullptr;
+    fn_get_columns        sym_get_columns_        = nullptr;
+    fn_get_rows           sym_get_rows_           = nullptr;
+    fn_get_device_name    sym_get_device_name_    = nullptr;
 
     // -----------------------------------------------------------------------
     // Helpers

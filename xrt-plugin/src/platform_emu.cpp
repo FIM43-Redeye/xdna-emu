@@ -3,7 +3,8 @@
 // platform_emu.cpp -- Emulator platform driver.
 //
 // Routes ioctl-like operations through emu_transport instead of
-// through the real DRM device.
+// through the real DRM device.  Implements the complete platform_drv
+// virtual interface so that XRT treats the emulator like real hardware.
 
 #include "platform_emu.h"
 #include "shim/shim_debug.h"
@@ -13,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#include <unistd.h>
 
 namespace xdna_emu {
 
@@ -40,23 +42,50 @@ drv_close() const
 }
 
 // ---------------------------------------------------------------------------
-// Context management -- assign monotonic IDs.
+// Context management -- assign monotonic IDs, track active contexts.
 // ---------------------------------------------------------------------------
 
 void
 platform_drv_emu::
 create_ctx(shim_xdna::create_ctx_arg& arg) const
 {
-  arg.ctx_handle = m_next_ctx_handle.fetch_add(1);
+  uint32_t handle = m_next_ctx_handle.fetch_add(1);
+  arg.ctx_handle = handle;
   arg.umq_doorbell = AMDXDNA_INVALID_DOORBELL_OFFSET;
   arg.syncobj_handle = AMDXDNA_INVALID_FENCE_HANDLE;
+
+  // Track the context for get_info_array(HW_CONTEXT_ALL).
+  {
+    const std::lock_guard<std::mutex> lock(m_ctx_lock);
+    ctx_entry entry{};
+    entry.num_col = arg.num_tiles;
+    entry.pid = static_cast<int64_t>(getpid());
+    m_ctx_map[handle] = entry;
+  }
 }
 
 void
 platform_drv_emu::
-destroy_ctx(shim_xdna::destroy_ctx_arg& /*arg*/) const
+destroy_ctx(shim_xdna::destroy_ctx_arg& arg) const
 {
-  // Nothing to tear down -- context tracking is just an ID.
+  const std::lock_guard<std::mutex> lock(m_ctx_lock);
+  m_ctx_map.erase(arg.ctx_handle);
+}
+
+void
+platform_drv_emu::
+config_ctx_cu_config(shim_xdna::config_ctx_cu_config_arg& /*arg*/) const
+{
+  // Accept kernel configuration silently.  The real driver would push
+  // the configuration buffer to firmware; the emulator receives kernels
+  // through the xclbin load path instead.
+}
+
+void
+platform_drv_emu::
+config_ctx_debug_bo(shim_xdna::config_ctx_debug_bo_arg& /*arg*/) const
+{
+  // Debug buffer attach/detach is a no-op for emulation.
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +187,21 @@ sync_bo(shim_xdna::sync_bo_arg& arg) const
   }
 }
 
+void
+platform_drv_emu::
+export_bo(shim_xdna::export_bo_arg& /*arg*/) const
+{
+  // BO export requires a real DRM fd for dma-buf sharing.
+  shim_not_supported_err("export_bo: not supported in emulation (no DRM fd)");
+}
+
+void
+platform_drv_emu::
+import_bo(shim_xdna::import_bo_arg& /*arg*/) const
+{
+  shim_not_supported_err("import_bo: not supported in emulation (no DRM fd)");
+}
+
 // ---------------------------------------------------------------------------
 // Execution
 // ---------------------------------------------------------------------------
@@ -183,6 +227,14 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
   m_transport->execute(entry.host_ptr, entry.size);
 
   arg.seq = m_next_seq.fetch_add(1);
+
+  // Update context stats.
+  {
+    const std::lock_guard<std::mutex> lock(m_ctx_lock);
+    auto it = m_ctx_map.find(arg.ctx_handle);
+    if (it != m_ctx_map.end())
+      it->second.submissions++;
+  }
 }
 
 void
@@ -208,8 +260,16 @@ wait_cmd_ioctl(shim_xdna::wait_cmd_arg& arg) const
   }
 }
 
+void
+platform_drv_emu::
+wait_cmd_syncobj(shim_xdna::wait_cmd_arg& arg) const
+{
+  // Delegate to the ioctl-based wait since we don't have real syncobjs.
+  wait_cmd_ioctl(arg);
+}
+
 // ---------------------------------------------------------------------------
-// Info / sysfs -- return canned Phoenix/NPU1 values.
+// get_info -- device queries via DRM_AMDXDNA_GET_INFO.
 // ---------------------------------------------------------------------------
 
 void
@@ -224,9 +284,14 @@ get_info(amdxdna_drm_get_info& arg) const
     auto* md = reinterpret_cast<amdxdna_drm_query_aie_metadata*>(arg.buffer);
     std::memset(md, 0, sizeof(*md));
 
-    // Phoenix / NPU1 topology: 5 columns, 6 rows (including shim row).
-    md->cols = 5;
-    md->rows = 6;
+    // Query the emulator for actual array dimensions.
+    if (m_transport) {
+      md->cols = m_transport->get_columns();
+      md->rows = m_transport->get_rows();
+    } else {
+      md->cols = 5;
+      md->rows = 6;
+    }
     md->col_size = 0;  // Not meaningful for emulation.
     md->version.major = 2;
     md->version.minor = 0;
@@ -299,8 +364,106 @@ get_info(amdxdna_drm_get_info& arg) const
       shim_err(EINVAL, "get_info: buffer too small for power mode");
 
     auto* pm = reinterpret_cast<amdxdna_drm_get_power_mode*>(arg.buffer);
-    pm->power_mode = POWER_MODE_DEFAULT;
+    std::memset(pm, 0, sizeof(*pm));
+    pm->power_mode = m_power_mode;
     arg.buffer_size = sizeof(amdxdna_drm_get_power_mode);
+    break;
+  }
+
+  case DRM_AMDXDNA_QUERY_AIE_STATUS: {
+    // Tile status query.  The caller provides a nested buffer pointer
+    // inside amdxdna_drm_query_aie_status.  We zero-fill it (no tile
+    // status data available from emulation).
+    if (arg.buffer_size < sizeof(amdxdna_drm_query_aie_status))
+      shim_err(EINVAL, "get_info: buffer too small for AIE status");
+
+    auto* st = reinterpret_cast<amdxdna_drm_query_aie_status*>(arg.buffer);
+    if (st->buffer && st->buffer_size > 0)
+      std::memset(reinterpret_cast<void*>(st->buffer), 0, st->buffer_size);
+    st->cols_filled = 0;
+    arg.buffer_size = sizeof(amdxdna_drm_query_aie_status);
+    break;
+  }
+
+  case DRM_AMDXDNA_QUERY_SENSORS: {
+    // Sensor data not available in emulation.
+    arg.buffer_size = 0;
+    break;
+  }
+
+  case DRM_AMDXDNA_QUERY_HW_CONTEXTS: {
+    // Legacy hardware context query (superseded by get_info_array).
+    // Return the list of active contexts as amdxdna_drm_query_hwctx[].
+    const std::lock_guard<std::mutex> lock(m_ctx_lock);
+    uint32_t needed = static_cast<uint32_t>(
+      m_ctx_map.size() * sizeof(amdxdna_drm_query_hwctx));
+
+    if (arg.buffer_size < needed) {
+      arg.buffer_size = needed;
+      break;
+    }
+
+    auto* out = reinterpret_cast<amdxdna_drm_query_hwctx*>(arg.buffer);
+    uint32_t idx = 0;
+    for (const auto& [handle, ctx] : m_ctx_map) {
+      auto& entry = out[idx++];
+      std::memset(&entry, 0, sizeof(entry));
+      entry.context_id = handle;
+      entry.start_col = ctx.start_col;
+      entry.num_col = ctx.num_col;
+      entry.pid = ctx.pid;
+      entry.command_submissions = ctx.submissions;
+      entry.command_completions = ctx.completions;
+    }
+    arg.buffer_size = needed;
+    break;
+  }
+
+  case DRM_AMDXDNA_QUERY_TELEMETRY: {
+    // Telemetry not available in emulation.  Return an empty header.
+    if (arg.buffer_size < sizeof(amdxdna_drm_query_telemetry_header))
+      shim_err(EINVAL, "get_info: buffer too small for telemetry header");
+
+    auto* hdr = reinterpret_cast<amdxdna_drm_query_telemetry_header*>(arg.buffer);
+    std::memset(hdr, 0, sizeof(*hdr));
+    arg.buffer_size = sizeof(amdxdna_drm_query_telemetry_header);
+    break;
+  }
+
+  case DRM_AMDXDNA_GET_FORCE_PREEMPT_STATE: {
+    if (arg.buffer_size < sizeof(amdxdna_drm_attribute_state))
+      shim_err(EINVAL, "get_info: buffer too small for preemption state");
+
+    auto* st = reinterpret_cast<amdxdna_drm_attribute_state*>(arg.buffer);
+    std::memset(st, 0, sizeof(*st));
+    st->state = m_preemption;
+    arg.buffer_size = sizeof(amdxdna_drm_attribute_state);
+    break;
+  }
+
+  case DRM_AMDXDNA_QUERY_RESOURCE_INFO: {
+    if (arg.buffer_size < sizeof(amdxdna_drm_get_resource_info))
+      shim_err(EINVAL, "get_info: buffer too small for resource info");
+
+    auto* res = reinterpret_cast<amdxdna_drm_get_resource_info*>(arg.buffer);
+    std::memset(res, 0, sizeof(*res));
+    res->npu_clk_max = 1000;   // MHz
+    res->npu_tops_max = 0;     // Not applicable for emulation.
+    res->npu_task_max = 256;
+    res->npu_tops_curr = 0;
+    res->npu_task_curr = 0;
+    arg.buffer_size = sizeof(amdxdna_drm_get_resource_info);
+    break;
+  }
+
+  case DRM_AMDXDNA_GET_FRAME_BOUNDARY_PREEMPT_STATE: {
+    if (arg.buffer_size < sizeof(amdxdna_drm_attribute_state))
+      shim_err(EINVAL, "get_info: buffer too small for FBP state");
+
+    auto* st = reinterpret_cast<amdxdna_drm_attribute_state*>(arg.buffer);
+    std::memset(st, 0, sizeof(*st));
+    st->state = m_fbp_mode;
+    arg.buffer_size = sizeof(amdxdna_drm_attribute_state);
     break;
   }
 
@@ -309,12 +472,155 @@ get_info(amdxdna_drm_get_info& arg) const
   }
 }
 
+// ---------------------------------------------------------------------------
+// get_info_array -- array queries via DRM_AMDXDNA_GET_ARRAY.
+// ---------------------------------------------------------------------------
+
+void
+platform_drv_emu::
+get_info_array(amdxdna_drm_get_array& arg) const
+{
+  switch (arg.param) {
+  case DRM_AMDXDNA_HW_CONTEXT_ALL: {
+    const std::lock_guard<std::mutex> lock(m_ctx_lock);
+    uint32_t count = static_cast<uint32_t>(m_ctx_map.size());
+
+    if (count == 0) {
+      arg.num_element = 0;
+      break;
+    }
+
+    uint32_t avail = std::min(arg.num_element, count);
+    auto* out = reinterpret_cast<amdxdna_drm_hwctx_entry*>(arg.buffer);
+    uint32_t idx = 0;
+    for (const auto& [handle, ctx] : m_ctx_map) {
+      if (idx >= avail)
+        break;
+      auto& entry = out[idx++];
+      std::memset(&entry, 0, sizeof(entry));
+      entry.context_id = handle;
+      entry.hwctx_id = handle;
+      entry.start_col = ctx.start_col;
+      entry.num_col = ctx.num_col;
+      entry.pid = ctx.pid;
+      entry.command_submissions = ctx.submissions;
+      entry.command_completions = ctx.completions;
+      entry.state = AMDXDNA_HWCTX_STATE_IDLE;
+    }
+    arg.num_element = idx;
+    break;
+  }
+
+  case DRM_AMDXDNA_HW_LAST_ASYNC_ERR: {
+    // No async errors in emulation.
+    arg.num_element = 0;
+    break;
+  }
+
+  default:
+    shim_not_supported_err("get_info_array: unsupported param");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// set_state -- device state changes via DRM_AMDXDNA_SET_STATE.
+// ---------------------------------------------------------------------------
+
+void
+platform_drv_emu::
+set_state(amdxdna_drm_set_state& arg) const
+{
+  switch (arg.param) {
+  case DRM_AMDXDNA_SET_POWER_MODE: {
+    if (arg.buffer_size < sizeof(amdxdna_drm_set_power_mode))
+      shim_err(EINVAL, "set_state: buffer too small for power mode");
+
+    auto* pm = reinterpret_cast<const amdxdna_drm_set_power_mode*>(arg.buffer);
+    m_power_mode = pm->power_mode;
+    break;
+  }
+
+  case DRM_AMDXDNA_SET_FORCE_PREEMPT: {
+    if (arg.buffer_size < sizeof(amdxdna_drm_attribute_state))
+      shim_err(EINVAL, "set_state: buffer too small for preemption");
+
+    auto* st = reinterpret_cast<const amdxdna_drm_attribute_state*>(arg.buffer);
+    m_preemption = st->state;
+    break;
+  }
+
+  case DRM_AMDXDNA_SET_FRAME_BOUNDARY_PREEMPT: {
+    if (arg.buffer_size < sizeof(amdxdna_drm_attribute_state))
+      shim_err(EINVAL, "set_state: buffer too small for FBP");
+
+    auto* st = reinterpret_cast<const amdxdna_drm_attribute_state*>(arg.buffer);
+    m_fbp_mode = st->state;
+    break;
+  }
+
+  case DRM_AMDXDNA_WRITE_AIE_MEM:
+  case DRM_AMDXDNA_WRITE_AIE_REG: {
+    // Direct AIE memory/register writes could be routed through the
+    // transport in the future.  For now, accept silently.
+    break;
+  }
+
+  default:
+    shim_not_supported_err("set_state: unsupported param");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// sysfs -- respond to sysfs queries used for device identification.
+// ---------------------------------------------------------------------------
+
 void
 platform_drv_emu::
 get_sysfs(shim_xdna::get_sysfs_arg& arg) const
 {
-  // Return empty data for any sysfs query -- no real sysfs nodes exist.
-  arg.real_size = 0;
+  // The xdna shim registers queries with empty subdev and lowercase
+  // entry names.  The sysfs_node field contains just the entry name.
+  std::string value;
+
+  if (arg.sysfs_node == "vbnv") {
+    // rom_vbnv query -- device name shown in xrt-smi Name column.
+    if (m_transport)
+      value = m_transport->get_device_name();
+    else
+      value = "NPU Phoenix (Emulated)";
+  } else if (arg.sysfs_node == "device") {
+    // PCI device ID -- Phoenix = 0x1502.
+    value = "0x1502";
+  } else if (arg.sysfs_node == "revision") {
+    value = "0x0";
+  } else if (arg.sysfs_node == "vendor") {
+    value = "0x1022";
+  } else if (arg.sysfs_node == "subsystem_device") {
+    value = "0x0000";
+  } else if (arg.sysfs_node == "subsystem_vendor") {
+    value = "0x0000";
+  } else if (arg.sysfs_node == "link_width" ||
+             arg.sysfs_node == "link_width_max") {
+    value = "0";
+  } else if (arg.sysfs_node == "link_speed" ||
+             arg.sysfs_node == "link_speed_max") {
+    value = "0";
+  } else {
+    // Unknown sysfs node -- return empty.
+    arg.real_size = 0;
+    return;
+  }
+
+  size_t copy_len = std::min(value.size(), arg.data.size());
+  std::memcpy(arg.data.data(), value.data(), copy_len);
+  arg.real_size = copy_len;
+}
+
+void
+platform_drv_emu::
+put_sysfs(shim_xdna::put_sysfs_arg& /*arg*/) const
+{
+  // Sysfs writes are not meaningful for emulation.
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +639,20 @@ platform_drv_emu::
 destroy_syncobj(shim_xdna::create_destroy_syncobj_arg& /*arg*/) const
 {
   // Nothing to destroy.
+}
+
+void
+platform_drv_emu::
+export_syncobj(shim_xdna::export_import_syncobj_arg& /*arg*/) const
+{
+  shim_not_supported_err("export_syncobj: not supported in emulation (no DRM fd)");
+}
+
+void
+platform_drv_emu::
+import_syncobj(shim_xdna::export_import_syncobj_arg& /*arg*/) const
+{
+  shim_not_supported_err("import_syncobj: not supported in emulation (no DRM fd)");
 }
 
 void

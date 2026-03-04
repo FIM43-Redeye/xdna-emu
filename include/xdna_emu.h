@@ -311,6 +311,36 @@ int32_t xdna_emu_write_tile_memory(
 uint64_t xdna_emu_get_error(char* buffer, uint64_t buffer_size);
 
 /**
+ * Get the number of tile columns in the emulated device.
+ *
+ * @param handle Valid emulator handle.
+ * @return Column count (e.g. 5 for NPU1), or 0 on error.
+ */
+uint8_t xdna_emu_get_columns(XdnaEmuHandle* handle);
+
+/**
+ * Get the number of tile rows in the emulated device.
+ *
+ * @param handle Valid emulator handle.
+ * @return Row count (e.g. 6 for NPU1), or 0 on error.
+ */
+uint8_t xdna_emu_get_rows(XdnaEmuHandle* handle);
+
+/**
+ * Get the device name string (e.g. "NPU Phoenix (Emulated) [AIE2]").
+ *
+ * Writes a null-terminated string into @buf.
+ *
+ * @param handle   Valid emulator handle.
+ * @param buf      Buffer to receive the name.
+ * @param buf_size Size of buffer in bytes.
+ * @return Number of bytes written (excluding null terminator),
+ *         or -1 on error.
+ */
+int32_t xdna_emu_get_device_name(XdnaEmuHandle* handle,
+                                  char* buf, uint32_t buf_size);
+
+/**
  * Get version information.
  *
  * @return Version as 0x00MMNN00 (major.minor.patch).
