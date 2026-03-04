@@ -1,0 +1,163 @@
+// SPDX-License-Identifier: MIT
+//
+// transport_inprocess.h -- In-process emulator transport.
+//
+// dlopen's libxdna_emu.so and resolves the C FFI symbols defined in
+// include/xdna_emu.h.  New FFI symbols that may not exist yet are
+// resolved with graceful fallback (nullptr stored, exception thrown if
+// the caller actually tries to use the missing function).
+
+#pragma once
+
+#include "transport.h"
+
+#include <cstdint>
+#include <string>
+
+// Forward-declare the opaque handle so we don't pull in xdna_emu.h here.
+struct XdnaEmuHandle;
+
+namespace xdna_emu {
+
+class emu_transport_inprocess final : public emu_transport {
+public:
+    /// Construct by loading @lib_path via dlopen.
+    /// Throws std::runtime_error on dlopen/dlsym failure.
+    explicit emu_transport_inprocess(const std::string& lib_path);
+
+    ~emu_transport_inprocess() override;
+
+    // Non-copyable, non-movable (owns dlopen handle + emulator state).
+    emu_transport_inprocess(const emu_transport_inprocess&) = delete;
+    emu_transport_inprocess& operator=(const emu_transport_inprocess&) = delete;
+
+    // -- emu_transport interface ---------------------------------------------
+
+    void load_xclbin(const std::string& path,
+                     uint8_t uuid_out[16]) override;
+
+    uint64_t alloc_buffer(size_t size) override;
+    void     free_buffer(uint64_t addr) override;
+    void     write_memory(uint64_t addr, const void* data,
+                          size_t size) override;
+    void     read_memory(uint64_t addr, void* data,
+                         size_t size) override;
+
+    void execute(const void* instructions, size_t size) override;
+    bool poll_completion() override;
+
+    uint32_t read_reg(uint16_t col, uint16_t row,
+                      uint32_t addr) override;
+    void     write_reg(uint16_t col, uint16_t row,
+                       uint32_t addr, uint32_t val) override;
+    void     read_tile_memory(uint16_t col, uint16_t row,
+                              uint32_t offset, uint32_t size,
+                              void* out) override;
+    void     write_tile_memory(uint16_t col, uint16_t row,
+                               uint32_t offset, uint32_t size,
+                               const void* data) override;
+
+private:
+    // -----------------------------------------------------------------------
+    // FFI function-pointer types.
+    //
+    // "Existing" functions are guaranteed present in any libxdna_emu.so that
+    // matches the current include/xdna_emu.h.  "Future" functions may not
+    // exist yet -- dlsym may return nullptr.
+    // -----------------------------------------------------------------------
+
+    // -- Result / status types (mirrored from xdna_emu.h) -------------------
+    // We only need these as typedefs for the function pointers.
+    using Result = int;          // XdnaEmuResult enum (0 = success)
+    struct ExecStatus { Result result; uint64_t cycles; int halted; };
+
+    // -- Existing FFI -------------------------------------------------------
+    using fn_create             = XdnaEmuHandle* (*)();
+    using fn_destroy            = void (*)(XdnaEmuHandle*);
+    using fn_load_xclbin        = Result (*)(XdnaEmuHandle*, const char*, uint8_t*);
+    using fn_alloc_host_region  = Result (*)(XdnaEmuHandle*, const char*,
+                                             uint64_t, uint64_t);
+    using fn_write_host_memory  = Result (*)(XdnaEmuHandle*, uint64_t,
+                                             const uint8_t*, uint64_t);
+    using fn_read_host_memory   = Result (*)(XdnaEmuHandle*, uint64_t,
+                                             uint8_t*, uint64_t);
+    using fn_clear_host_buffers = Result (*)(XdnaEmuHandle*);
+    using fn_add_host_buffer    = Result (*)(XdnaEmuHandle*, uint64_t, uint64_t);
+    using fn_exec_npu_instr     = Result (*)(XdnaEmuHandle*, const uint8_t*, uint64_t);
+    using fn_sync_cores         = Result (*)(XdnaEmuHandle*);
+    using fn_set_max_cycles     = Result (*)(XdnaEmuHandle*, uint64_t);
+    using fn_run                = ExecStatus (*)(XdnaEmuHandle*);
+    using fn_get_error          = uint64_t (*)(char*, uint64_t);
+    using fn_version            = uint32_t (*)();
+
+    // -- Future FFI (may be nullptr) ----------------------------------------
+    using fn_alloc_buffer       = uint64_t (*)(XdnaEmuHandle*, uint64_t);
+    using fn_free_buffer        = Result (*)(XdnaEmuHandle*, uint64_t);
+    using fn_read_register      = uint32_t (*)(XdnaEmuHandle*, uint16_t,
+                                               uint16_t, uint32_t);
+    using fn_write_register     = Result (*)(XdnaEmuHandle*, uint16_t,
+                                             uint16_t, uint32_t, uint32_t);
+    using fn_read_tile_mem      = Result (*)(XdnaEmuHandle*, uint16_t,
+                                             uint16_t, uint32_t, uint32_t,
+                                             void*);
+    using fn_write_tile_mem     = Result (*)(XdnaEmuHandle*, uint16_t,
+                                             uint16_t, uint32_t, uint32_t,
+                                             const void*);
+
+    // -----------------------------------------------------------------------
+    // State
+    // -----------------------------------------------------------------------
+
+    void*           dl_handle_ = nullptr;   // dlopen handle
+    XdnaEmuHandle*  emu_       = nullptr;   // emulator instance
+
+    // Tracks whether the last execute() has finished.
+    bool            last_run_complete_ = true;
+
+    // Counter for generating unique buffer addresses in fallback mode.
+    uint64_t        next_alloc_addr_ = 0x100000000ULL;
+
+    // -- Resolved function pointers (existing) ------------------------------
+    fn_create             sym_create_             = nullptr;
+    fn_destroy            sym_destroy_            = nullptr;
+    fn_load_xclbin        sym_load_xclbin_        = nullptr;
+    fn_alloc_host_region  sym_alloc_host_region_  = nullptr;
+    fn_write_host_memory  sym_write_host_memory_  = nullptr;
+    fn_read_host_memory   sym_read_host_memory_   = nullptr;
+    fn_clear_host_buffers sym_clear_host_buffers_ = nullptr;
+    fn_add_host_buffer    sym_add_host_buffer_    = nullptr;
+    fn_exec_npu_instr     sym_exec_npu_instr_     = nullptr;
+    fn_sync_cores         sym_sync_cores_         = nullptr;
+    fn_set_max_cycles     sym_set_max_cycles_     = nullptr;
+    fn_run                sym_run_                 = nullptr;
+    fn_get_error          sym_get_error_          = nullptr;
+    fn_version            sym_version_            = nullptr;
+
+    // -- Resolved function pointers (future, nullable) ----------------------
+    fn_alloc_buffer       sym_alloc_buffer_       = nullptr;
+    fn_free_buffer        sym_free_buffer_        = nullptr;
+    fn_read_register      sym_read_register_      = nullptr;
+    fn_write_register     sym_write_register_     = nullptr;
+    fn_read_tile_mem      sym_read_tile_mem_      = nullptr;
+    fn_write_tile_mem     sym_write_tile_mem_     = nullptr;
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    /// Resolve a required symbol.  Throws std::runtime_error if missing.
+    template <typename T>
+    T resolve_required(const char* name);
+
+    /// Resolve an optional symbol.  Returns nullptr if missing.
+    template <typename T>
+    T resolve_optional(const char* name);
+
+    /// Throw if @rc indicates an error, pulling the message from get_error().
+    void check(Result rc, const char* context);
+
+    /// Retrieve the last error string from the emulator library.
+    std::string last_error();
+};
+
+} // namespace xdna_emu

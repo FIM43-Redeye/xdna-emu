@@ -43,7 +43,7 @@ message(STATUS "XRT coreutil: ${XRT_COREUTIL_LIB}")
 # ---------------------------------------------------------------------------
 
 add_library(xrt_driver_emu SHARED
-  src/stub.cpp
+  src/transport_inprocess.cpp
 )
 
 set_target_properties(xrt_driver_emu PROPERTIES
@@ -74,6 +74,7 @@ target_include_directories(xrt_driver_emu PRIVATE
 target_link_libraries(xrt_driver_emu PRIVATE
   ${XRT_CORE_LIB}
   ${XRT_COREUTIL_LIB}
+  ${CMAKE_DL_LIBS}
 )
 
 # ---------------------------------------------------------------------------
