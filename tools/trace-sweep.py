@@ -274,10 +274,28 @@ def trim_trace_dir(path: Path):
         )
 
 
-def run_batch_hw(batch_info: dict, hw_cooldown: float = 2.0) -> dict:
-    """Run one batch on hardware (serial, with cooldown)."""
+def wait_npu_idle(timeout: float = 10.0, poll_interval: float = 0.1) -> bool:
+    """Wait until the NPU has no active hardware contexts.
+
+    Polls `xrt-smi examine -r aie-partitions` for the "No hardware contexts"
+    message. Returns True if idle detected within timeout, False if timed out.
+    """
     import time
 
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            ["xrt-smi", "examine", "-r", "aie-partitions"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if "No hardware contexts running" in result.stdout:
+            return True
+        time.sleep(poll_interval)
+    return False
+
+
+def run_batch_hw(batch_info: dict, hw_cooldown: float = 2.0) -> dict:
+    """Run one batch on hardware (serial, with idle-wait between runs)."""
     script_dir = Path(__file__).parent
     trace_run = script_dir / "trace-run.py"
     batch_idx = batch_info["batch"]
@@ -298,9 +316,11 @@ def run_batch_hw(batch_info: dict, hw_cooldown: float = 2.0) -> dict:
         batch_info["hw_trace"] = str(hw_dir / "trace.json")
         trim_trace_dir(hw_dir)
 
-    # Cooldown: let the driver settle before the next context creation
-    if hw_cooldown > 0:
-        time.sleep(hw_cooldown)
+    # Wait for NPU to be idle before next run.  Falls back to fixed sleep
+    # if xrt-smi is unavailable or times out.
+    if not wait_npu_idle(timeout=hw_cooldown):
+        import time
+        time.sleep(0.5)  # Brief fallback if poll failed
 
     return batch_info
 

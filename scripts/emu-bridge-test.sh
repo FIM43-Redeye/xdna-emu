@@ -226,9 +226,24 @@ sanitize_name() {
   echo "${1//\//_}"
 }
 
+# Wait for NPU to have zero active hardware contexts.
+# Polls xrt-smi at 100ms intervals, times out after 10s, falls back to 0.5s sleep.
+wait_npu_idle() {
+  local deadline=$((SECONDS + 10))
+  while [[ $SECONDS -lt $deadline ]]; do
+    if xrt-smi examine -r aie-partitions 2>/dev/null \
+        | grep -q 'No hardware contexts running'; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  # Fallback: xrt-smi unavailable or contexts stuck
+  sleep 0.5
+}
+
 # Export all helpers for xargs subshells.
 export -f is_standard_test requires_npu2 get_npu_device apply_lit_subs
-export -f extract_build_commands get_run_cmd sanitize_name
+export -f extract_build_commands get_run_cmd sanitize_name wait_npu_idle
 
 # ---------------------------------------------------------------------------
 # Phase 1: Discover tests
@@ -603,14 +618,14 @@ trace_one_test() {
     ) &
     local emu_pid=$!
 
-    # Run HW in foreground (with cooldown after)
+    # Run HW in foreground, then wait for NPU idle before next test
     if [[ "$RUN_HW" == "true" ]]; then
       if ! python3 "$tools_dir/trace-run.py" "$manifest" -o "$hw_dir" \
           >> "$log_file.hw" 2>&1; then
         hw_ok=false
       fi
-      # Cooldown: let driver settle before next test's HW run
-      sleep 2
+      # Wait for NPU to release hardware contexts (fast poll, not fixed sleep)
+      wait_npu_idle
     fi
 
     # Wait for EMU
