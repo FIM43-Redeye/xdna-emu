@@ -96,8 +96,8 @@ while [[ $# -gt 0 ]]; do
     --trace=*)
       TRACE_MODE="${1#--trace=}"
       case "$TRACE_MODE" in
-        all|sweep|sweep-all) ;;
-        *) echo "Unknown --trace mode: $TRACE_MODE (use: all, sweep, sweep-all)" >&2; exit 1 ;;
+        all|sweep|sweep-all|compare|compare-all) ;;
+        *) echo "Unknown --trace mode: $TRACE_MODE (use: all, sweep, sweep-all, compare, compare-all)" >&2; exit 1 ;;
       esac
       shift ;;
     -j*)
@@ -122,6 +122,8 @@ Options:
   --trace=all     Trace all tests (pass + fail)
   --trace=sweep   Full event sweep (passing tests only)
   --trace=sweep-all  Full sweep, all tests
+  --trace=compare    Sweep + serial-vs-parallel determinism check (HW-passing)
+  --trace=compare-all  Determinism check, all tests
   -jN             Override parallelism (default: nproc)
   -v, --verbose   Show log snippets on failure
   --chess-only    Only compile/run with Chess compiler (ground truth)
@@ -200,6 +202,28 @@ is_quarantined() {
 }
 
 # ---------------------------------------------------------------------------
+# Trace quarantine (tests that are dangerous when trace-injected)
+# ---------------------------------------------------------------------------
+
+TRACE_QUARANTINE_FILE="${SCRIPT_DIR}/trace-quarantine.txt"
+declare -A TRACE_QUARANTINE=()   # "test_name" -> 1
+if [[ -f "$TRACE_QUARANTINE_FILE" ]]; then
+  while IFS= read -r line; do
+    line="${line%%#*}"        # strip comments
+    line="${line// /}"        # strip spaces
+    [[ -z "$line" ]] && continue
+    TRACE_QUARANTINE["$line"]=1
+  done < "$TRACE_QUARANTINE_FILE"
+  if [[ ${#TRACE_QUARANTINE[@]} -gt 0 ]]; then
+    echo ">>> Trace quarantine: ${#TRACE_QUARANTINE[@]} test(s) excluded from tracing"
+  fi
+fi
+
+is_trace_quarantined() {
+  [[ -n "${TRACE_QUARANTINE[${1}]+x}" ]]
+}
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
@@ -213,11 +237,23 @@ tdr_count() {
 }
 export -f tdr_count
 
+# Count IOMMU page faults in dmesg.
+iommu_fault_count() {
+  dmesg 2>/dev/null | grep -c 'IO_PAGE_FAULT' || echo 0
+}
+export -f iommu_fault_count
+
 # Current system uptime in seconds (integer), for dmesg correlation.
 uptime_sec() {
   awk '{printf "%.0f", $1}' /proc/uptime
 }
 export -f uptime_sec
+
+# Check NPU health: can it create contexts?  Returns 0 if healthy.
+npu_health_check() {
+  xrt-smi examine -r aie-partitions &>/dev/null
+}
+export -f npu_health_check
 
 # ---------------------------------------------------------------------------
 # Helpers (shared with parallel jobs via export -f)
@@ -1519,59 +1555,188 @@ main() {
     local trace_targets=()
     local trace_include_failing=false
     local trace_sweep=false
+    local trace_compare=false
 
     case "$TRACE_MODE" in
-      default) ;;
-      all)       trace_include_failing=true ;;
-      sweep)     trace_sweep=true ;;
-      sweep-all) trace_sweep=true; trace_include_failing=true ;;
+      default)     ;;
+      all)         trace_include_failing=true ;;
+      sweep)       trace_sweep=true ;;
+      sweep-all)   trace_sweep=true; trace_include_failing=true ;;
+      compare)     trace_sweep=true; trace_compare=true ;;
+      compare-all) trace_sweep=true; trace_compare=true; trace_include_failing=true ;;
     esac
 
+    # For compare mode, filter on HW pass (not bridge pass) since we're
+    # measuring NPU determinism, not emulator accuracy.
     for name in "${compiled[@]}"; do
       if ! $trace_include_failing; then
-        # Only trace tests where at least one compiler passed the bridge run.
         local safe
         safe="$(sanitize_name "$name")"
         local any_pass=false
         for compiler in "${compilers[@]}"; do
-          local br="FAIL"
-          [[ -f "$RESULTS_DIR/${safe}.${compiler}.bridge.result" ]] && br="$(< "$RESULTS_DIR/${safe}.${compiler}.bridge.result")"
-          if [[ "$br" == "PASS" ]]; then
-            any_pass=true
-            break
+          if $trace_compare; then
+            # Compare mode: require HW pass.
+            local hr="FAIL"
+            [[ -f "$RESULTS_DIR/${safe}.${compiler}.hw.result" ]] && hr="$(< "$RESULTS_DIR/${safe}.${compiler}.hw.result")"
+            [[ "$hr" == "PASS" ]] && any_pass=true
+          else
+            # Normal trace mode: require bridge (EMU) pass.
+            local br="FAIL"
+            [[ -f "$RESULTS_DIR/${safe}.${compiler}.bridge.result" ]] && br="$(< "$RESULTS_DIR/${safe}.${compiler}.bridge.result")"
+            [[ "$br" == "PASS" ]] && any_pass=true
           fi
+          $any_pass && break
         done
         if ! $any_pass; then
           continue
         fi
       fi
+      # Skip trace-quarantined tests (IOMMU faults, NPU wedge).
+      if $trace_compare && is_trace_quarantined "$name"; then
+        continue
+      fi
+      # Skip HW-quarantined tests in compare mode (they TDR).
+      if $trace_compare && is_quarantined "$name:chess" && is_quarantined "$name:peano"; then
+        continue
+      fi
       trace_targets+=("$name")
     done
 
-    local trace_mode_arg="default"
-    if $trace_sweep; then
-      trace_mode_arg="sweep"
-    fi
+    if $trace_compare; then
+      # --- Compare mode: serial-vs-parallel determinism check ---
+      if [[ ${#trace_targets[@]} -gt 0 ]]; then
+        info "Phase 4b: Serial vs Parallel trace comparison for ${#trace_targets[@]} test(s)"
+        local cmp_pass=0 cmp_fail=0 cmp_err=0 cmp_skip=0
+        local cmp_results_file="$RESULTS_DIR/trace-compare-results.txt"
+        : > "$cmp_results_file"
 
-    if [[ ${#trace_targets[@]} -gt 0 ]]; then
-      info "Phase 4b: Trace comparison for ${#trace_targets[@]} test(s) (mode=$trace_mode_arg)"
-      # Each trace_one_test internally runs HW serial + EMU parallel via
-      # trace-sweep.py. We run tests serially here because each test's HW
-      # runs need the NPU exclusively. The EMU runs within each test are
-      # already parallelized.
-      for name in "${trace_targets[@]}"; do
-        for compiler in "${compilers[@]}"; do
+        # Snapshot IOMMU fault count before starting.
+        local iommu_before
+        iommu_before="$(iommu_fault_count)"
+
+        for name in "${trace_targets[@]}"; do
           local safe
           safe="$(sanitize_name "$name")"
-          # Only trace if this compiler compiled successfully
-          [[ -f "$RESULTS_DIR/${safe}.${compiler}.compile.result" ]] || continue
-          [[ "$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")" == "OK" ]] || continue
-          trace_one_test "$name" "$trace_mode_arg" "$compiler"
+          local src_dir="$TEST_SRC/$name"
+          local cmp_dir="$RESULTS_DIR/${safe}.trace-compare"
+          local cmp_log="$RESULTS_DIR/${safe}.trace-compare.log"
+
+          # Pre-flight: check NPU health and IOMMU state.
+          if ! npu_health_check; then
+            err "NPU health check FAILED before $name -- aborting trace comparison"
+            echo "ABORT npu_wedged" > "$RESULTS_DIR/${safe}.trace-compare.result"
+            ((cmp_err++)) || true
+            break
+          fi
+          local iommu_now
+          iommu_now="$(iommu_fault_count)"
+          if [[ $iommu_now -gt $iommu_before ]]; then
+            err "IOMMU page faults detected ($((iommu_now - iommu_before)) new) -- aborting"
+            echo "ABORT iommu_fault" > "$RESULTS_DIR/${safe}.trace-compare.result"
+            ((cmp_err++)) || true
+            break
+          fi
+
+          echo "  [$((cmp_pass + cmp_fail + cmp_err + cmp_skip + 1))/${#trace_targets[@]}] COMPARE $name  @$(uptime_sec)s"
+
+          # Run trace-sweep.py with --compare-parallel.
+          local iommu_pre_test
+          iommu_pre_test="$(iommu_fault_count)"
+          local sweep_result
+          sweep_result=$(
+            python3 "$EMU_ROOT/tools/trace-sweep.py" "$src_dir" \
+              -o "$cmp_dir" \
+              --compare-parallel --hw-jobs "$NPU_HW_JOBS" --no-emu \
+              2>&1
+          ) || true
+          echo "$sweep_result" > "$cmp_log"
+
+          # Post-flight: check for IOMMU faults from THIS test.
+          local iommu_post_test
+          iommu_post_test="$(iommu_fault_count)"
+          if [[ $iommu_post_test -gt $iommu_pre_test ]]; then
+            local new_faults=$((iommu_post_test - iommu_pre_test))
+            err "IOMMU FAULT: $name caused $new_faults page fault(s) -- ABORTING"
+            echo "ABORT iommu_fault ($new_faults faults)" > "$RESULTS_DIR/${safe}.trace-compare.result"
+            echo "  COMPARE $name: ABORT (IOMMU page fault)"
+            ((cmp_err++)) || true
+            break
+          fi
+
+          # Parse the serial-vs-parallel report.
+          local report="$cmp_dir/serial-vs-parallel-report.txt"
+          if [[ -f "$report" ]]; then
+            if grep -q 'DETERMINISTIC' "$report"; then
+              local batches diverged
+              batches="$(grep 'batches compared' "$report" | grep -oP '\d+')"
+              diverged="$(grep 'Diverged:' "$report" | grep -oP '\d+')"
+              if [[ "${diverged:-0}" -eq 0 ]]; then
+                echo "DETERMINISTIC ${batches:-?} batches" > "$RESULTS_DIR/${safe}.trace-compare.result"
+                echo "    -> DETERMINISTIC (${batches:-?} batches)"
+                ((cmp_pass++)) || true
+              else
+                echo "NON-DETERMINISTIC ${diverged}/${batches} diverged" > "$RESULTS_DIR/${safe}.trace-compare.result"
+                echo "    -> NON-DETERMINISTIC (${diverged}/${batches} diverged)"
+                ((cmp_fail++)) || true
+              fi
+            else
+              echo "ERROR no_verdict" > "$RESULTS_DIR/${safe}.trace-compare.result"
+              echo "    -> ERROR (no verdict in report)"
+              ((cmp_err++)) || true
+            fi
+          elif grep -q 'skipped' "$cmp_log" 2>/dev/null; then
+            echo "SKIP" > "$RESULTS_DIR/${safe}.trace-compare.result"
+            echo "    -> SKIP (trace injection unsupported)"
+            ((cmp_skip++)) || true
+          else
+            echo "ERROR no_report" > "$RESULTS_DIR/${safe}.trace-compare.result"
+            echo "    -> ERROR (no report generated)"
+            ((cmp_err++)) || true
+          fi
         done
-      done
-      info "Phase 4b done"
+
+        echo ""
+        echo "=== Determinism Summary ==="
+        echo "  Tests:             ${#trace_targets[@]}"
+        echo "  Deterministic:     $cmp_pass"
+        echo "  Non-deterministic: $cmp_fail"
+        echo "  Skipped:           $cmp_skip"
+        echo "  Errors/aborts:     $cmp_err"
+        # Save summary
+        {
+          echo "tests=${#trace_targets[@]}"
+          echo "deterministic=$cmp_pass"
+          echo "non_deterministic=$cmp_fail"
+          echo "skipped=$cmp_skip"
+          echo "errors=$cmp_err"
+        } > "$RESULTS_DIR/trace-compare-summary.txt"
+
+        info "Phase 4b done"
+      else
+        info "Phase 4b: No tests eligible for determinism comparison"
+      fi
     else
-      info "Phase 4b: No tests eligible for tracing"
+      # --- Normal trace modes: sweep or default ---
+      local trace_mode_arg="default"
+      if $trace_sweep; then
+        trace_mode_arg="sweep"
+      fi
+
+      if [[ ${#trace_targets[@]} -gt 0 ]]; then
+        info "Phase 4b: Trace comparison for ${#trace_targets[@]} test(s) (mode=$trace_mode_arg)"
+        for name in "${trace_targets[@]}"; do
+          for compiler in "${compilers[@]}"; do
+            local safe
+            safe="$(sanitize_name "$name")"
+            [[ -f "$RESULTS_DIR/${safe}.${compiler}.compile.result" ]] || continue
+            [[ "$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")" == "OK" ]] || continue
+            trace_one_test "$name" "$trace_mode_arg" "$compiler"
+          done
+        done
+        info "Phase 4b done"
+      else
+        info "Phase 4b: No tests eligible for tracing"
+      fi
     fi
     echo ""
   fi

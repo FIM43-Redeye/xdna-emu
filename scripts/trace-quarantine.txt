@@ -1,0 +1,23 @@
+# Trace quarantine -- tests that are DANGEROUS when trace-injected.
+#
+# These tests cause IOMMU page faults, NPU wedges, or other catastrophic
+# failures when trace routing is injected into their MLIR. They work fine
+# for normal (non-traced) HW runs.
+#
+# Format: one test directory name per line (comments with #).
+#
+# The bridge script skips these entirely in --trace=compare mode.
+# trace-sweep.py also checks this file when invoked standalone.
+
+# Control packet tests: trace injection conflicts with the control packet
+# stream routing, causing DMA to address 0x0 -> IOMMU IO_PAGE_FAULT.
+# 45k+ page faults observed, IOMMU event log restart, full NPU wedge.
+# Discovered 2026-03-05.  Root cause: trace-inject.py adds stream switch
+# routes that collide with control packet paths.
+ctrl_packet_reconfig
+ctrl_packet_reconfig_1x4_cores
+ctrl_packet_reconfig_4x1_cores
+ctrl_packet_reconfig_elf
+add_one_ctrl_packet
+add_one_ctrl_packet_4_cores
+add_one_ctrl_packet_col_overlay
