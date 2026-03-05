@@ -35,10 +35,10 @@ The emulator should be a drop-in component that works with:
 
 | Driver ID | Product | Codename | Architecture | Array Size | Status |
 |-----------|---------|----------|--------------|------------|--------|
-| NPU1 | Ryzen AI | Phoenix/Hawk Point | AIE2 (XDNA) | 4 cols x 6 rows | **Primary target** |
-| NPU4 | Ryzen AI 300 | Strix Point | AIE2P (XDNA2) | 4 cols x 6 rows | Planned |
-| NPU5 | Ryzen AI Max | Strix Halo | AIE2P (XDNA2) | 8 cols x 6 rows | Planned |
-| NPU6 | (TBD) | Krackan | AIE2P (XDNA2) | 4 cols x 6 rows | Planned |
+| NPU1 | Ryzen AI | Phoenix/Hawk Point | AIE2 (XDNA) | 5 cols x 6 rows | **Primary target** |
+| NPU4 | Ryzen AI 300 | Strix Point | AIE2P (XDNA2) | 5 cols x 6 rows | Planned |
+| NPU5 | Ryzen AI Max | Strix Halo | AIE2P (XDNA2) | 8+ cols x 6 rows | Planned |
+| NPU6 | (TBD) | Krackan | AIE2P (XDNA2) | 5 cols x 6 rows | Planned |
 
 Array sizes include the shim tile row (row 0). Driver IDs NPU2/NPU3 are
 prototypes marked for deprecation -- not consumer devices.
