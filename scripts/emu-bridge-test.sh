@@ -191,10 +191,16 @@ requires_npu2() {
 # Extract NPUDEVICE substitution from run.lit.
 get_npu_device() {
   local lit="$1/run.lit"
-  if [[ -f "$lit" ]] && grep -q 'npu1_1col' "$lit"; then
+  if [[ ! -f "$lit" ]]; then
     echo "npu1_1col"
-  elif [[ -f "$lit" ]] && grep -q 'npu1_4col' "$lit"; then
-    echo "npu1_4col"
+    return
+  fi
+  # Check for specific device variants in the run.lit sed commands.
+  # The pattern is: sed 's/NPUDEVICE/<device>/g'
+  local device
+  device="$(grep -oP "NPUDEVICE/\K[a-z0-9_]+" "$lit" | head -1)" || true
+  if [[ -n "$device" ]]; then
+    echo "$device"
   else
     echo "npu1_1col"
   fi
