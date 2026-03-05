@@ -415,44 +415,144 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
   if (n < 0)
     shim_err(errno, "submit_cmd: pread memfd failed");
 
-  // Parse the ert_packet to find the NPU instruction buffer.
-  // Supported opcodes:
-  //   ERT_START_NPU  -- ert_npu_data after cu_mask(s) has instruction_buffer
-  //   ERT_START_CU   -- kernel regmap after cu_mask(s), instruction address
-  //                     at the offset defined in the xclbin kernel metadata
   auto* pkt = reinterpret_cast<ert_start_kernel_cmd*>(buf.data());
-  uint64_t instr_addr = 0;
-  uint32_t instr_size = 0;
-
-  if (auto* npu = get_ert_npu_data(pkt)) {
-    // ERT_START_NPU: explicit instruction buffer in ert_npu_data.
-    instr_addr = npu->instruction_buffer;
-    instr_size = npu->instruction_buffer_size;
-  } else if (pkt->opcode == ERT_START_CU) {
-    // ERT_START_CU: kernel arguments packed in the register map after
-    // the header (4 bytes) + cu_mask (4 bytes) + extra_cu_masks.
-    // The xclbin metadata defines the argument layout:
-    //   arg1 "instr"  offset=0x08  size=8  (device address of instr BO)
-    //   arg2 "ninstr" offset=0x10  size=4  (instruction count in uint32_t)
-    // Regmap starts at &pkt->data[0 + extra_cu_masks].
-    auto* regmap = reinterpret_cast<uint8_t*>(
-        pkt->data + pkt->extra_cu_masks);
-    instr_addr = *reinterpret_cast<uint64_t*>(regmap + 0x08);
-    uint32_t ninstr = *reinterpret_cast<uint32_t*>(regmap + 0x10);
-    instr_size = ninstr * sizeof(uint32_t);
-  } else {
-    uint32_t op = pkt->opcode;
-    shim_err(EINVAL, "submit_cmd: unsupported opcode %u", op);
-  }
-
-  EMU_INFO("submit_cmd: instr_addr=0x%" PRIx64 " instr_size=%u opcode=%u",
-           instr_addr, instr_size, (unsigned)pkt->opcode);
   xdna_emu::detail::emu_log_ert_packet(pkt, "submit_cmd");
-
-  // Log BO table at debug level for context.
   dump_bo_table("submit_cmd");
 
-  // Sync all tracked BOs from the memfd into the emulator's host memory.
+  // -- Collect sub-commands --------------------------------------------------
+  //
+  // Build a list of (instr_addr, instr_size) pairs to execute.  For
+  // single commands (ERT_START_NPU, ERT_START_CU) there is one entry.
+  // For ERT_CMD_CHAIN, each chained BO contributes one entry.
+
+  struct sub_cmd {
+    uint64_t instr_addr;
+    uint32_t instr_size;
+    // Sub-command packet data (for ERT_START_CU host buffer registration).
+    // Null for ERT_START_NPU.
+    const ert_start_kernel_cmd* pkt;
+  };
+  std::vector<sub_cmd> sub_cmds;
+
+  // Buffers to hold sub-command BO data read from memfd (keep alive
+  // until after execution so that pkt pointers remain valid).
+  std::vector<std::vector<uint8_t>> sub_cmd_bufs;
+
+  // Sub-command BO memfd offsets for marking completion afterward.
+  struct sub_cmd_completion {
+    uint64_t map_offset;
+    size_t   buf_size;
+  };
+  std::vector<sub_cmd_completion> sub_cmd_completions;
+
+  // Helper: extract instr_addr/instr_size from a single ERT packet.
+  auto parse_single_cmd = [](const ert_start_kernel_cmd* p,
+                             uint64_t& addr, uint32_t& size) -> bool {
+    if (auto* npu = get_ert_npu_data(
+            const_cast<ert_start_kernel_cmd*>(p))) {
+      addr = npu->instruction_buffer;
+      size = npu->instruction_buffer_size;
+      return true;
+    }
+    if (p->opcode == ERT_START_CU) {
+      auto* regmap = reinterpret_cast<const uint8_t*>(
+          p->data + p->extra_cu_masks);
+      uint64_t a = 0;
+      uint32_t n = 0;
+      std::memcpy(&a, regmap + 0x08, sizeof(a));
+      std::memcpy(&n, regmap + 0x10, sizeof(n));
+      addr = a;
+      size = n * sizeof(uint32_t);
+      return true;
+    }
+    return false;
+  };
+
+  if (pkt->opcode == ERT_CMD_CHAIN) {
+    // ERT_CMD_CHAIN: the payload is ert_cmd_chain_data with an array of
+    // sub-command BO handles.  Each BO contains its own ERT packet.
+    auto* chain = get_ert_cmd_chain_data(
+        reinterpret_cast<ert_packet*>(buf.data()));
+    if (!chain)
+      shim_err(EINVAL, "submit_cmd: malformed ERT_CMD_CHAIN packet");
+
+    EMU_INFO("submit_cmd: ERT_CMD_CHAIN with %u sub-command(s)",
+             chain->command_count);
+
+    sub_cmd_bufs.resize(chain->command_count);
+
+    for (uint32_t i = 0; i < chain->command_count; i++) {
+      // data[i] is the BO handle (kmhdl) of the sub-command BO.
+      auto sub_handle = static_cast<uint32_t>(chain->data[i]);
+
+      // Look up the sub-command BO.
+      bo_entry sub_entry{};
+      {
+        const std::lock_guard<std::mutex> lock(m_bo_lock);
+        auto it = m_bo_map.find(sub_handle);
+        if (it == m_bo_map.end()) {
+          EMU_WARN("submit_cmd: chain[%u] unknown BO handle %u, skipping",
+                   i, sub_handle);
+          continue;
+        }
+        sub_entry = it->second;
+      }
+
+      shim_xdna::bo_info sub_bi{};
+      if (!load_bo_info(sub_handle, sub_bi)) {
+        EMU_WARN("submit_cmd: chain[%u] no bo_info for handle %u, skipping",
+                 i, sub_handle);
+        continue;
+      }
+
+      // Read the sub-command BO from the memfd.
+      sub_cmd_bufs[i].resize(sub_entry.size);
+      ssize_t nr = pread(m_dev_fd, sub_cmd_bufs[i].data(),
+                         sub_entry.size,
+                         static_cast<off_t>(sub_bi.map_offset));
+      if (nr <= 0) {
+        EMU_WARN("submit_cmd: chain[%u] pread failed for handle %u",
+                 i, sub_handle);
+        continue;
+      }
+
+      auto* sub_pkt = reinterpret_cast<ert_start_kernel_cmd*>(
+          sub_cmd_bufs[i].data());
+      xdna_emu::detail::emu_log_ert_packet(sub_pkt,
+          ("submit_cmd chain[" + std::to_string(i) + "]").c_str());
+
+      uint64_t addr = 0;
+      uint32_t size = 0;
+      if (!parse_single_cmd(sub_pkt, addr, size)) {
+        EMU_WARN("submit_cmd: chain[%u] unsupported sub-opcode %u",
+                 i, sub_pkt->opcode);
+        continue;
+      }
+
+      sub_cmds.push_back({addr, size, sub_pkt});
+      sub_cmd_completions.push_back(
+          {sub_bi.map_offset, sub_cmd_bufs[i].size()});
+
+      EMU_INFO("submit_cmd: chain[%u] instr_addr=0x%" PRIx64
+               " instr_size=%u opcode=%u",
+               i, addr, size, (unsigned)sub_pkt->opcode);
+    }
+  } else {
+    // Single command: ERT_START_NPU or ERT_START_CU.
+    uint64_t addr = 0;
+    uint32_t size = 0;
+    if (!parse_single_cmd(pkt, addr, size)) {
+      uint32_t op = pkt->opcode;
+      shim_err(EINVAL, "submit_cmd: unsupported opcode %u (err=%d): %s",
+               op, EINVAL, "Invalid argument");
+    }
+
+    EMU_INFO("submit_cmd: instr_addr=0x%" PRIx64 " instr_size=%u opcode=%u",
+             addr, size, (unsigned)pkt->opcode);
+    sub_cmds.push_back({addr, size, pkt});
+  }
+
+  // -- Sync all BOs from memfd into emulator host memory ---------------------
   //
   // On real hardware the CPU and NPU share physical memory, so
   // buffer::sync() just flushes CPU caches (clflush_data).  In the
@@ -466,7 +566,6 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
       if (bo.user_ptr || bo.size == 0)
         continue;
 
-      // Look up this BO's mmap offset in the memfd.
       shim_xdna::bo_info bi{};
       if (!load_bo_info(handle, bi))
         continue;
@@ -482,53 +581,50 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
             m_bo_map.size());
   }
 
-  // Register host buffers for DdrPatch address patching.
-  //
-  // The NPU instruction stream contains DdrPatch instructions that
-  // reference host buffers by index (arg_idx).  The emulator's NPU
-  // executor looks up host_buffers[arg_idx] to get the device address
-  // to write into DMA BD registers.
-  //
-  // For ERT_START_CU, the kernel's data BO addresses are packed in the
-  // register map starting at offset 0x14 (arg3), each 8 bytes, matching
-  // the xclbin kernel metadata layout:
-  //   arg3 (gid=3) at +0x14 -> DdrPatch arg_idx=0
-  //   arg4 (gid=4) at +0x1c -> DdrPatch arg_idx=1
-  //   arg5 (gid=5) at +0x24 -> DdrPatch arg_idx=2
-  //   ...
-  m_transport->clear_host_buffers();
+  // -- Execute each sub-command ----------------------------------------------
 
-  if (pkt->opcode == ERT_START_CU) {
-    auto* regmap = reinterpret_cast<const uint8_t*>(
-        pkt->data + pkt->extra_cu_masks);
-    uint32_t regmap_bytes = (pkt->count - pkt->extra_cu_masks) * 4;
-    // Data BO addresses start at offset 0x14, each 8 bytes.
-    for (uint32_t off = 0x14; off + 8 <= regmap_bytes; off += 8) {
-      uint64_t bo_addr = 0;
-      std::memcpy(&bo_addr, regmap + off, sizeof(bo_addr));
-      if (bo_addr == 0)
-        continue;
-      // Find this BO's size from our tracking map.
-      uint64_t bo_size = 0;
-      {
-        const std::lock_guard<std::mutex> lock(m_bo_lock);
-        for (const auto& [h, bo] : m_bo_map) {
-          if (bo.dev_addr == bo_addr) {
-            bo_size = bo.size;
-            break;
+  for (size_t cmd_idx = 0; cmd_idx < sub_cmds.size(); cmd_idx++) {
+    const auto& sc = sub_cmds[cmd_idx];
+
+    // Register host buffers for DdrPatch address patching.
+    //
+    // The NPU instruction stream contains DdrPatch instructions that
+    // reference host buffers by index (arg_idx).  The emulator's NPU
+    // executor looks up host_buffers[arg_idx] to get the device address
+    // to write into DMA BD registers.
+    m_transport->clear_host_buffers();
+
+    if (sc.pkt && sc.pkt->opcode == ERT_START_CU) {
+      auto* regmap = reinterpret_cast<const uint8_t*>(
+          sc.pkt->data + sc.pkt->extra_cu_masks);
+      uint32_t regmap_bytes = (sc.pkt->count - sc.pkt->extra_cu_masks) * 4;
+      for (uint32_t off = 0x14; off + 8 <= regmap_bytes; off += 8) {
+        uint64_t bo_addr = 0;
+        std::memcpy(&bo_addr, regmap + off, sizeof(bo_addr));
+        if (bo_addr == 0)
+          continue;
+        uint64_t bo_size = 0;
+        {
+          const std::lock_guard<std::mutex> lock(m_bo_lock);
+          for (const auto& [h, bo] : m_bo_map) {
+            if (bo.dev_addr == bo_addr) {
+              bo_size = bo.size;
+              break;
+            }
           }
         }
+        if (bo_size == 0)
+          bo_size = 4096;
+        m_transport->add_host_buffer(bo_addr, bo_size);
+        EMU_DBG("submit_cmd[%zu]: registered host buffer arg_idx=%u "
+                "addr=0x%" PRIx64 " size=%" PRIu64,
+                cmd_idx, (off - 0x14) / 8, bo_addr, bo_size);
       }
-      if (bo_size == 0)
-        bo_size = 4096;  // fallback: DdrPatch only needs the address
-      m_transport->add_host_buffer(bo_addr, bo_size);
-      EMU_DBG("submit_cmd: registered host buffer arg_idx=%u addr=0x%" PRIx64
-              " size=%" PRIu64, (off - 0x14) / 8, bo_addr, bo_size);
     }
-  }
 
-  // Execute the NPU instruction buffer from emulator host memory.
-  m_transport->execute_from_device(instr_addr, instr_size);
+    // Execute the NPU instruction buffer from emulator host memory.
+    m_transport->execute_from_device(sc.instr_addr, sc.instr_size);
+  }
 
   // Post-execution diagnostics: dump DMA state for any non-idle channels.
   if (xdna_emu::detail::emu_log_level() >= 4) {
@@ -555,12 +651,11 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
     }
   }
 
-  // Sync results back: emulator host memory -> memfd.
+  // -- Sync results back: emulator host memory -> memfd ----------------------
   //
-  // Same issue as the pre-execution sync above: the app will read
-  // results via mmap on the memfd, but the emulator wrote them to its
-  // internal host memory.  Copy everything back so the mmap'd view
-  // reflects what the emulator produced.
+  // The app will read results via mmap on the memfd, but the emulator
+  // wrote them to its internal host memory.  Copy everything back so
+  // the mmap'd view reflects what the emulator produced.
   {
     const std::lock_guard<std::mutex> lock(m_bo_lock);
     for (const auto& [handle, bo] : m_bo_map) {
@@ -580,12 +675,20 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
             m_bo_map.size());
   }
 
-  // Mark the packet as completed so that poll_command() (which checks
-  // the state field at the BO's vaddr via mmap) sees the result.
+  // Mark the outer packet as completed so that poll_command() sees it.
   auto* hdr = reinterpret_cast<ert_packet*>(buf.data());
   hdr->state = ERT_CMD_STATE_COMPLETED;
   pwrite(m_dev_fd, buf.data(), sizeof(ert_packet),
          static_cast<off_t>(info.map_offset));
+
+  // For chains, mark each sub-command packet as completed too.
+  for (size_t i = 0; i < sub_cmd_completions.size(); i++) {
+    auto& sc = sub_cmd_completions[i];
+    auto* sub_hdr = reinterpret_cast<ert_packet*>(sub_cmd_bufs[i].data());
+    sub_hdr->state = ERT_CMD_STATE_COMPLETED;
+    pwrite(m_dev_fd, sub_cmd_bufs[i].data(), sizeof(ert_packet),
+           static_cast<off_t>(sc.map_offset));
+  }
 
   arg.seq = m_next_seq.fetch_add(1);
 

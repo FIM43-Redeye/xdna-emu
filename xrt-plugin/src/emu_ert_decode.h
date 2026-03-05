@@ -20,6 +20,7 @@ inline const char* ert_opcode_name(unsigned op)
 {
     switch (op) {
     case ERT_START_CU:      return "START_CU";
+    case ERT_CMD_CHAIN:     return "CMD_CHAIN";
     case ERT_START_NPU:     return "START_NPU";
     case ERT_START_DPU:     return "START_DPU";
     case ERT_CONFIGURE:     return "CONFIGURE";
