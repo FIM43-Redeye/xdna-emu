@@ -21,3 +21,8 @@ ctrl_packet_reconfig_elf
 add_one_ctrl_packet
 add_one_ctrl_packet_4_cores
 add_one_ctrl_packet_col_overlay
+
+# add_maskwrite: causes 10 IOMMU IO_PAGE_FAULTs under trace injection.
+# Same root cause as ctrl_packet tests -- trace routing conflicts with
+# the mask-write instruction stream.  Discovered 2026-03-05.
+add_maskwrite

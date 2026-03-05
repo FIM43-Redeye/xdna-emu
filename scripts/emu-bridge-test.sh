@@ -1621,23 +1621,28 @@ main() {
           local cmp_dir="$RESULTS_DIR/${safe}.trace-compare"
           local cmp_log="$RESULTS_DIR/${safe}.trace-compare.log"
 
-          # Pre-flight: check NPU health and IOMMU state.
-          if ! npu_health_check; then
-            err "NPU health check FAILED before $name -- aborting trace comparison"
+          local test_idx=$((cmp_pass + cmp_fail + cmp_err + cmp_skip + 1))
+
+          # Pre-flight: wait for NPU health (may need recovery from prior fault).
+          local wait_start
+          wait_start="$(uptime_sec)"
+          local npu_ok=false
+          for _w in $(seq 1 30); do
+            if npu_health_check; then
+              npu_ok=true
+              break
+            fi
+            echo "    waiting for NPU recovery... ($(( $(uptime_sec) - wait_start ))s)"
+            sleep 2
+          done
+          if ! $npu_ok; then
+            err "NPU did not recover after 60s -- aborting remaining tests"
             echo "ABORT npu_wedged" > "$RESULTS_DIR/${safe}.trace-compare.result"
             ((cmp_err++)) || true
             break
           fi
-          local iommu_now
-          iommu_now="$(iommu_fault_count)"
-          if [[ $iommu_now -gt $iommu_before ]]; then
-            err "IOMMU page faults detected ($((iommu_now - iommu_before)) new) -- aborting"
-            echo "ABORT iommu_fault" > "$RESULTS_DIR/${safe}.trace-compare.result"
-            ((cmp_err++)) || true
-            break
-          fi
 
-          echo "  [$((cmp_pass + cmp_fail + cmp_err + cmp_skip + 1))/${#trace_targets[@]}] COMPARE $name  @$(uptime_sec)s"
+          echo "  [${test_idx}/${#trace_targets[@]}] COMPARE $name  @$(uptime_sec)s"
 
           # Run trace-sweep.py with --compare-parallel.
           local iommu_pre_test
@@ -1656,11 +1661,12 @@ main() {
           iommu_post_test="$(iommu_fault_count)"
           if [[ $iommu_post_test -gt $iommu_pre_test ]]; then
             local new_faults=$((iommu_post_test - iommu_pre_test))
-            err "IOMMU FAULT: $name caused $new_faults page fault(s) -- ABORTING"
-            echo "ABORT iommu_fault ($new_faults faults)" > "$RESULTS_DIR/${safe}.trace-compare.result"
-            echo "  COMPARE $name: ABORT (IOMMU page fault)"
+            err "IOMMU FAULT: $name caused $new_faults page fault(s)"
+            echo "IOMMU_FAULT $new_faults faults" > "$RESULTS_DIR/${safe}.trace-compare.result"
+            echo "    -> IOMMU_FAULT ($new_faults page faults -- waiting for NPU recovery)"
             ((cmp_err++)) || true
-            break
+            # Don't break -- wait for recovery and continue with next test.
+            continue
           fi
 
           # Parse the serial-vs-parallel report.
