@@ -49,6 +49,16 @@ TEST_UTILS_LIB="${TEST_LIB_DIR}/lib"
 # aietools
 AIETOOLS_DIR="${AIETOOLS_DIR:-/home/triple/npu-work/aietools}"
 
+# Compiler paths (auto-detect from environment)
+PEANO_CLANG="${PEANO_INSTALL_DIR:-${MLIR_AIE}/../llvm-aie/install}/bin/clang++"
+PEANO_INCLUDE="${MLIR_AIE_INSTALL_DIR:-${MLIR_AIE}/install}/include"
+CHESS_INCLUDE="${AIETOOLS_DIR}/include"
+
+# Peano kernel compilation flags (from mlir-aie makefile-common)
+PEANO_KERNEL_FLAGS="-O2 -std=c++20 --target=aie2-none-unknown-elf -DNDEBUG"
+PEANO_KERNEL_FLAGS+=" -Wno-parentheses -Wno-attributes -Wno-macro-redefined"
+PEANO_KERNEL_FLAGS+=" -Wno-empty-body -Wno-missing-template-arg-list-after-template-kw"
+
 # Results directory -- one per day, phases append into it
 RESULTS_DIR="/tmp/emu-bridge-results-$(date +%Y%m%d)"
 mkdir -p "$RESULTS_DIR"
@@ -66,6 +76,7 @@ RUN_HW=true
 LIST_ONLY=false
 VERBOSE=false
 TRACE_MODE=""  # "", "default", "all", "sweep", "sweep-all"
+COMPILER_MODE="both"  # "both", "chess", "peano"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -87,6 +98,8 @@ while [[ $# -gt 0 ]]; do
         echo "Invalid -j value: $1" >&2; exit 1
       fi
       shift ;;
+    --chess-only|--chess)  COMPILER_MODE="chess"; shift ;;
+    --peano-only|--peano)  COMPILER_MODE="peano"; shift ;;
     --help|-h)
       cat <<'USAGE'
 Usage: emu-bridge-test.sh [options] [test-name-filter]
@@ -101,6 +114,9 @@ Options:
   --trace=sweep-all  Full sweep, all tests
   -jN             Override parallelism (default: nproc)
   -v, --verbose   Show log snippets on failure
+  --chess-only    Only compile/run with Chess compiler (ground truth)
+  --peano-only    Only compile/run with Peano compiler
+  (default: both compilers, Chess is ground truth)
 
 Filter:
   Substring match on test directory name.
@@ -115,12 +131,31 @@ USAGE
   esac
 done
 
+# Build compiler list from mode
+case "$COMPILER_MODE" in
+  chess) COMPILERS=("chess") ;;
+  peano) COMPILERS=("peano") ;;
+  both)  COMPILERS=("chess" "peano") ;;
+esac
+
+# Validate compiler availability
+for _c in "${COMPILERS[@]}"; do
+  if [[ "$_c" == "chess" ]] && ! command -v xchesscc_wrapper &>/dev/null; then
+    echo "Warning: xchesscc_wrapper not found, Chess builds will fail" >&2
+  fi
+  if [[ "$_c" == "peano" ]] && [[ ! -x "$PEANO_CLANG" ]]; then
+    echo "Warning: Peano clang not found at $PEANO_CLANG" >&2
+  fi
+done
+
 # Export variables that parallel jobs need.
 export RESULTS_DIR FORCE_COMPILE VERBOSE TRACE_MODE
 export MLIR_AIE TEST_SRC BUILD_BASE EMU_ROOT
 export XRT_DIR XRT_INCLUDE XRT_LIB
 export TEST_LIB_DIR TEST_UTILS_INCLUDE TEST_UTILS_LIB
 export AIETOOLS_DIR
+export COMPILER_MODE PEANO_CLANG PEANO_INCLUDE CHESS_INCLUDE PEANO_KERNEL_FLAGS
+export COMPILERS_STR="${COMPILERS[*]}"
 
 # ---------------------------------------------------------------------------
 # Logging
