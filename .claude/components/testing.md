@@ -115,3 +115,24 @@ validation.
 - Unit tests are concentrated in individual modules; run `cargo test --lib` for the fast suite
 - Doc tests spawn separate processes that each load TableGen files -- the script runs them with `nice -n 19` and limited parallelism
 - Integration tests (real binary execution) require feature flags and pre-built test artifacts
+
+## Bridge Test Suite (`scripts/emu-bridge-test.sh`)
+
+The primary validation target. Exercises the full XRT bridge path:
+`test.exe -> XRT -> plugin -> emulator`. Dual-compiler by default (Chess
+ground truth, Peano informational). Five phases: discover, compile, run HW
+(parallel -j5), run EMU (parallel -j nproc), report per-compiler matrix.
+
+Key flags: `--chess-only`, `--peano-only`, `--no-hw`, `--compile`,
+`--serial-hw`, `--trace=sweep`, `-v`.
+
+## Trace Pipeline
+
+Binary trace comparison between emulator and real NPU hardware:
+- `tools/trace-inject.py` -- inject trace routing into MLIR
+- `tools/trace-sweep.py` -- multi-batch sweep across event types
+- `src/bin/trace_compare.rs` -- Rust binary comparison (replaced Python OOM)
+- `src/trace/compare.rs` -- core comparison logic
+- `src/trace/vcd.rs` -- aiesimulator VCD parser
+
+Build: `cargo build --release --bin trace-compare`
