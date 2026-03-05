@@ -169,11 +169,55 @@ export COMPILER_MODE PEANO_CLANG PEANO_INCLUDE CHESS_INCLUDE PEANO_KERNEL_FLAGS
 export COMPILERS_STR="${COMPILERS[*]}"
 
 # ---------------------------------------------------------------------------
+# Hardware quarantine (tests that cause TDRs, run last + isolated)
+# ---------------------------------------------------------------------------
+
+QUARANTINE_FILE="${SCRIPT_DIR}/hw-quarantine.txt"
+declare -A QUARANTINE=()   # "name:compiler" -> 1
+if [[ -f "$QUARANTINE_FILE" ]]; then
+  while IFS= read -r line; do
+    line="${line%%#*}"        # strip comments
+    line="${line// /}"        # strip spaces
+    [[ -z "$line" ]] && continue
+    local_name="${line%%:*}"
+    local_comp="${line##*:}"
+    if [[ "$local_comp" == "*" ]]; then
+      QUARANTINE["${local_name}:chess"]=1
+      QUARANTINE["${local_name}:peano"]=1
+    else
+      QUARANTINE["${line}"]=1
+    fi
+  done < "$QUARANTINE_FILE"
+  if [[ ${#QUARANTINE[@]} -gt 0 ]]; then
+    echo ">>> Quarantine: ${#QUARANTINE[@]} test:compiler pair(s) will run last, isolated"
+  fi
+fi
+export QUARANTINE_FILE
+
+# Check if a job is quarantined.
+is_quarantined() {
+  [[ -n "${QUARANTINE[${1}]+x}" ]]
+}
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
 info() { echo ">>> $*"; }
 err()  { echo "ERROR: $*" >&2; }
+
+# Count TDR events in dmesg.  Returns the number of "aie2_tdr_work" lines.
+# Usage: before=$(tdr_count); run test; after=$(tdr_count); new=$((after-before))
+tdr_count() {
+  dmesg 2>/dev/null | grep -c 'aie2_tdr_work' || echo 0
+}
+export -f tdr_count
+
+# Current system uptime in seconds (integer), for dmesg correlation.
+uptime_sec() {
+  awk '{printf "%.0f", $1}' /proc/uptime
+}
+export -f uptime_sec
 
 # ---------------------------------------------------------------------------
 # Helpers (shared with parallel jobs via export -f)
@@ -635,6 +679,12 @@ run_one_hardware() {
   local run_cmd
   run_cmd="$(get_run_cmd "$src_dir")"
 
+  # Snapshot TDR count and uptime for post-test attribution.
+  local tdr_before
+  tdr_before="$(tdr_count)"
+  local t_start
+  t_start="$(uptime_sec)"
+
   local rc=0
   (
     cd "$build_dir"
@@ -642,7 +692,14 @@ run_one_hardware() {
     timeout 30 bash -c "$run_cmd"
   ) > "$log_file" 2>&1 || rc=$?
 
-  if [[ $rc -eq 0 ]] && grep -q "PASS" "$log_file"; then
+  local tdr_after
+  tdr_after="$(tdr_count)"
+  local tdr_new=$(( tdr_after - tdr_before ))
+
+  if [[ $tdr_new -gt 0 ]]; then
+    echo "TDR" > "$result_file"
+    echo "TDR detected: $tdr_new new aie2_tdr_work events (uptime ${t_start}s)" >> "$log_file"
+  elif [[ $rc -eq 0 ]] && grep -q "PASS" "$log_file"; then
     echo "PASS" > "$result_file"
   elif [[ $rc -eq 124 ]]; then
     echo "TIMEOUT" > "$result_file"
@@ -1007,7 +1064,7 @@ print_report() {
   # Use associative arrays keyed by compiler.
   declare -A compile_ok compile_fail
   declare -A bridge_pass bridge_fail bridge_skip bridge_timeout bridge_emumiss
-  declare -A hw_pass hw_fail hw_skip hw_timeout
+  declare -A hw_pass hw_fail hw_skip hw_timeout hw_tdr
   for compiler in "${compilers[@]}"; do
     compile_ok[$compiler]=0
     compile_fail[$compiler]=0
@@ -1020,6 +1077,7 @@ print_report() {
     hw_fail[$compiler]=0
     hw_skip[$compiler]=0
     hw_timeout[$compiler]=0
+    hw_tdr[$compiler]=0
   done
   declare -A trace_clean trace_diverge trace_error trace_skip
   for compiler in "${compilers[@]}"; do
@@ -1064,6 +1122,8 @@ print_report() {
         printf "  %-${col_width}s" "$hr"
         case "$hr" in
           PASS)    hw_pass[$compiler]=$(( ${hw_pass[$compiler]} + 1 )) ;;
+          TDR)     hw_tdr[$compiler]=$(( ${hw_tdr[$compiler]} + 1 ))
+                   hw_fail[$compiler]=$(( ${hw_fail[$compiler]} + 1 )) ;;
           TIMEOUT) hw_timeout[$compiler]=$(( ${hw_timeout[$compiler]} + 1 ))
                    hw_fail[$compiler]=$(( ${hw_fail[$compiler]} + 1 )) ;;
           SKIP*)   hw_skip[$compiler]=$(( ${hw_skip[$compiler]} + 1 )) ;;
@@ -1138,9 +1198,24 @@ print_report() {
   done
 
   # Footnote.
-  if $has_compile_fail; then
+  local has_tdr=false
+  for compiler in "${compilers[@]}"; do
+    [[ ${hw_tdr[$compiler]} -gt 0 ]] && has_tdr=true
+  done
+  if $has_compile_fail || $has_tdr; then
     echo ""
-    echo "* = compile failed"
+    $has_compile_fail && echo "* = compile failed"
+    $has_tdr && echo "TDR = hardware timeout detection and recovery (NPU hung)"
+  fi
+
+  # Show TDR suspect groups (from parallel runs).
+  if [[ -s "$RESULTS_DIR/tdr_suspects.log" ]]; then
+    echo ""
+    echo "=== TDR Suspect Groups ==="
+    echo "(Tests running concurrently when TDR was detected)"
+    while IFS= read -r line; do
+      echo "  $line"
+    done < "$RESULTS_DIR/tdr_suspects.log"
   fi
 
   # --- Summary ---
@@ -1158,7 +1233,10 @@ print_report() {
       echo "  (${bridge_emumiss[$compiler]} EMU_MISS)"
     fi
     if [[ "$run_hw" == "true" ]]; then
-      echo "  HW: ${hw_pass[$compiler]} pass, ${hw_fail[$compiler]} fail, ${hw_skip[$compiler]} skip"
+      local hw_extra=""
+      [[ ${hw_tdr[$compiler]} -gt 0 ]] && hw_extra+=" (${hw_tdr[$compiler]} TDR)"
+      [[ ${hw_timeout[$compiler]} -gt 0 ]] && hw_extra+=" (${hw_timeout[$compiler]} timeout)"
+      echo "  HW: ${hw_pass[$compiler]} pass, ${hw_fail[$compiler]} fail, ${hw_skip[$compiler]} skip${hw_extra}"
     fi
   done
   if $has_trace; then
@@ -1266,7 +1344,10 @@ main() {
   # ---- Phase 3+4: Run HW+EMU concurrently --------------------------------
 
   # Build job list: (name:compiler) pairs that compiled successfully.
+  # Split into parallel (safe) and quarantine (known TDR) pools.
   local all_jobs=()
+  local hw_parallel_jobs=()
+  local hw_quarantine_jobs=()
   for name in "${compiled[@]}"; do
     for compiler in "${compilers[@]}"; do
       local safe
@@ -1274,6 +1355,11 @@ main() {
       [[ -f "$RESULTS_DIR/${safe}.${compiler}.compile.result" ]] || continue
       [[ "$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")" == "OK" ]] || continue
       all_jobs+=("$name:$compiler")
+      if is_quarantined "$name:$compiler"; then
+        hw_quarantine_jobs+=("$name:$compiler")
+      else
+        hw_parallel_jobs+=("$name:$compiler")
+      fi
     done
   done
 
@@ -1290,7 +1376,9 @@ main() {
   local hw_label="" emu_label=""
   $RUN_HW && hw_label="HW -j${NPU_HW_JOBS}"
   $RUN_EMU && emu_label="EMU -j${JOBS}"
-  info "Phase 3+4: Running ${#all_jobs[@]} job(s) (${hw_label:+$hw_label }${emu_label:+$emu_label})"
+  local q_label=""
+  [[ ${#hw_quarantine_jobs[@]} -gt 0 ]] && q_label=", ${#hw_quarantine_jobs[@]} quarantined"
+  info "Phase 3+4: Running ${#all_jobs[@]} job(s) (${hw_label:+$hw_label }${emu_label:+$emu_label}${q_label})"
 
   # Launch EMU for all jobs (parallel, no NPU constraint).
   local emu_pool_pid=""
@@ -1304,47 +1392,79 @@ main() {
 
   # Launch HW with NPU job pool (if enabled), concurrently with EMU.
   if $RUN_HW; then
-    # Parallel job pool capped at NPU_HW_JOBS concurrent contexts.
-    # Uses wait -n -p (bash 5.1+) to detect when a slot opens.
-    declare -A hw_pids=()   # pid -> "name:compiler"
+    local tdr_suspect_file="$RESULTS_DIR/tdr_suspects.log"
+    : > "$tdr_suspect_file"
+    local hw_total=$(( ${#hw_parallel_jobs[@]} + ${#hw_quarantine_jobs[@]} ))
     local hw_done=0
-    local hw_idx=0
 
-    while [[ $hw_idx -lt ${#all_jobs[@]} ]] || [[ ${#hw_pids[@]} -gt 0 ]]; do
-      # Launch jobs while slots available and queue not empty.
-      while [[ ${#hw_pids[@]} -lt $NPU_HW_JOBS ]] && [[ $hw_idx -lt ${#all_jobs[@]} ]]; do
-        local entry="${all_jobs[$hw_idx]}"
-        local hw_name="${entry%%:*}"
-        local hw_compiler="${entry##*:}"
-        ((hw_idx++)) || true
+    # --- Parallel pool: safe tests at -j$NPU_HW_JOBS ---
+    if [[ ${#hw_parallel_jobs[@]} -gt 0 ]]; then
+      declare -A hw_pids=()   # pid -> "name:compiler"
+      local hw_idx=0
 
-        # Launch in background subshell
-        (
-          run_one_hardware "$hw_name" "$real_bdf" "$hw_compiler"
-        ) &
-        hw_pids[$!]="$entry"
-      done
+      while [[ $hw_idx -lt ${#hw_parallel_jobs[@]} ]] || [[ ${#hw_pids[@]} -gt 0 ]]; do
+        # Launch jobs while slots available and queue not empty.
+        while [[ ${#hw_pids[@]} -lt $NPU_HW_JOBS ]] && [[ $hw_idx -lt ${#hw_parallel_jobs[@]} ]]; do
+          local entry="${hw_parallel_jobs[$hw_idx]}"
+          local hw_name="${entry%%:*}"
+          local hw_compiler="${entry##*:}"
+          ((hw_idx++)) || true
 
-      # Wait for any one job to finish (if any are running).
-      if [[ ${#hw_pids[@]} -gt 0 ]]; then
-        local done_pid=0
-        wait -n -p done_pid "${!hw_pids[@]}" 2>/dev/null || true
+          (
+            run_one_hardware "$hw_name" "$real_bdf" "$hw_compiler"
+          ) &
+          hw_pids[$!]="$entry"
+        done
 
-        if [[ $done_pid -ne 0 ]] && [[ -n "${hw_pids[$done_pid]+x}" ]]; then
-          local finished="${hw_pids[$done_pid]}"
-          unset 'hw_pids[$done_pid]'
-          local fin_name="${finished%%:*}"
-          local fin_compiler="${finished##*:}"
-          local fin_safe
-          fin_safe="$(sanitize_name "$fin_name")"
-          local hr="SKIP"
-          [[ -f "$RESULTS_DIR/${fin_safe}.${fin_compiler}.hw.result" ]] && \
-            hr="$(< "$RESULTS_DIR/${fin_safe}.${fin_compiler}.hw.result")"
-          ((hw_done++)) || true
-          echo "  [${hw_done}/${#all_jobs[@]}] HW $fin_name ($fin_compiler): $hr"
+        # Wait for any one job to finish.
+        if [[ ${#hw_pids[@]} -gt 0 ]]; then
+          local done_pid=0
+          wait -n -p done_pid "${!hw_pids[@]}" 2>/dev/null || true
+
+          if [[ $done_pid -ne 0 ]] && [[ -n "${hw_pids[$done_pid]+x}" ]]; then
+            local finished="${hw_pids[$done_pid]}"
+            unset 'hw_pids[$done_pid]'
+            local fin_name="${finished%%:*}"
+            local fin_compiler="${finished##*:}"
+            local fin_safe
+            fin_safe="$(sanitize_name "$fin_name")"
+            local hr="SKIP"
+            [[ -f "$RESULTS_DIR/${fin_safe}.${fin_compiler}.hw.result" ]] && \
+              hr="$(< "$RESULTS_DIR/${fin_safe}.${fin_compiler}.hw.result")"
+            ((hw_done++)) || true
+            local tdr_tag=""
+            if [[ "$hr" == "TDR" ]]; then
+              tdr_tag=" *** TDR DETECTED ***"
+              local suspects="$finished"
+              for spid in "${!hw_pids[@]}"; do
+                suspects+=", ${hw_pids[$spid]}"
+              done
+              echo "TDR @$(uptime_sec)s -- concurrent: $suspects" >> "$tdr_suspect_file"
+            fi
+            echo "  [${hw_done}/${hw_total}] HW $fin_name ($fin_compiler): $hr  @$(uptime_sec)s${tdr_tag}"
+          fi
         fi
-      fi
-    done
+      done
+    fi
+
+    # --- Quarantine pool: known TDR tests, run last, serially ---
+    if [[ ${#hw_quarantine_jobs[@]} -gt 0 ]]; then
+      info "HW quarantine: running ${#hw_quarantine_jobs[@]} isolated test(s)"
+      for entry in "${hw_quarantine_jobs[@]}"; do
+        local q_name="${entry%%:*}"
+        local q_compiler="${entry##*:}"
+        run_one_hardware "$q_name" "$real_bdf" "$q_compiler"
+        local q_safe
+        q_safe="$(sanitize_name "$q_name")"
+        local qr="SKIP"
+        [[ -f "$RESULTS_DIR/${q_safe}.${q_compiler}.hw.result" ]] && \
+          qr="$(< "$RESULTS_DIR/${q_safe}.${q_compiler}.hw.result")"
+        ((hw_done++)) || true
+        local q_tag=""
+        [[ "$qr" == "TDR" ]] && q_tag=" *** TDR ***"
+        echo "  [${hw_done}/${hw_total}] HW $q_name ($q_compiler): $qr  @$(uptime_sec)s [QUARANTINE]${q_tag}"
+      done
+    fi
 
     info "HW runs done"
   fi

@@ -1,0 +1,16 @@
+# Hardware quarantine list -- tests that cause TDRs on the NPU.
+#
+# Format: test_name:compiler
+#   test_name  = directory name under mlir-aie/test/npu-xrt/
+#   compiler   = chess, peano, or * (both)
+#
+# Quarantined tests are NOT skipped -- they run last, serially, isolated
+# from the parallel pool so a TDR cannot poison other results.
+#
+# Add tests here when TDR suspect group analysis confirms them as the
+# source.  Remove when the root cause is fixed.
+
+# two_col: Peano deterministic TDR in isolation (codegen bug).
+# Chess passes in serial but causes collateral TDRs under parallel
+# load (2026-03-05).  Quarantine both to protect the parallel pool.
+two_col:*
