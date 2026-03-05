@@ -25,14 +25,12 @@
 //! The AIE2 has 8 memory banks. Accessing the same bank from multiple ports
 //! in the same cycle causes a stall.
 
-use crate::device::aie2_spec::BRANCH_PENALTY_CYCLES;
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{SlotOp, VliwBundle};
 use crate::tablegen::SemanticOp;
 use crate::interpreter::state::{EventType, ExecutionContext};
 use crate::interpreter::timing::{
     HazardDetector, HazardStats, LatencyTable, MemoryAccess, MemoryModel,
-    StallReason,
 };
 use crate::interpreter::traits::{ExecuteResult, Executor};
 
@@ -413,21 +411,21 @@ impl CycleAccurateExecutor {
             _ => {}
         }
 
-        // Apply branch penalty if a branch was taken
-        // (Pipeline flush due to mispredicted/unconditional branch)
+        // Emit branch event (no explicit penalty -- delay slots handle it).
+        //
+        // AIE2 has 5 delay slots after every taken branch. The compiler
+        // fills them with useful work (or NOPs if it can't). Each delay
+        // slot instruction costs 1 cycle via record_instruction(1) like
+        // any other bundle. This naturally produces the correct branch
+        // cost: filled slots = 0 extra cycles, unfilled = 1 per NOP.
+        //
+        // Adding BRANCH_PENALTY_CYCLES on top of delay slots would
+        // double-count: the pipeline flush IS the delay slots.
         let branch_target = match final_result {
             ExecuteResult::Branch { target } | ExecuteResult::Call { target } => Some(target),
             _ => None,
         };
         if let Some(target) = branch_target {
-            let penalty = BRANCH_PENALTY_CYCLES;
-            self.total_branch_stalls += penalty as u64;
-            ctx.record_stall(penalty as u64);
-
-            // Record in detailed stats
-            self.detailed_stats.record(&StallReason::BranchPenalty { cycles: penalty });
-
-            // Emit branch event
             let branch_cycle = ctx.cycles;
             ctx.timing_context_mut().record_event(
                 branch_cycle,
@@ -608,18 +606,17 @@ mod tests {
     }
 
     #[test]
-    fn test_branch_penalty() {
+    fn test_branch_no_explicit_penalty() {
         use crate::interpreter::bundle::BranchCondition;
 
         let mut executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
         let mut tile = Tile::compute(0, 2);
 
-        // Create a bundle with an unconditional branch instruction
         let bundle = make_bundle(vec![
             SlotOp::from_semantic(SlotIndex::Control, SemanticOp::Br)
                 .with_branch_condition(BranchCondition::Always)
-                .with_source(Operand::Immediate(0x100)), // branch target
+                .with_source(Operand::Immediate(0x100)),
         ]);
 
         let result = executor.execute(&bundle, &mut ctx, &mut tile);
@@ -627,29 +624,21 @@ mod tests {
         // Should return Branch result
         assert!(matches!(result, ExecuteResult::Branch { target: 0x100 }));
 
-        // Should have recorded branch penalty (3 cycles)
-        assert_eq!(executor.total_branch_stalls, 3);
-
-        // Context should have penalty in stall count
-        // (1 cycle for instruction + 3 for branch penalty = 4 total cycles,
-        // but stalls are 3)
-        assert!(ctx.stall_cycles >= 3);
-
-        // Detailed stats should track branch stalls
-        let detailed = executor.detailed_stats();
-        assert_eq!(detailed.branch_stall_cycles, 3);
-        assert_eq!(detailed.total_stall_cycles, 3);
+        // No explicit branch penalty -- delay slots handle the pipeline cost.
+        // Branch instruction itself costs 1 cycle (pipelined issue).
+        assert_eq!(executor.total_branch_stalls, 0);
+        assert_eq!(ctx.stall_cycles, 0);
+        assert_eq!(ctx.cycles, 1); // Just the 1-cycle issue cost
     }
 
     #[test]
-    fn test_detailed_stats_integration() {
+    fn test_detailed_stats_no_branch_penalty() {
         use crate::interpreter::bundle::BranchCondition;
 
         let mut executor = CycleAccurateExecutor::new();
         let mut ctx = ExecutionContext::new();
         let mut tile = Tile::compute(0, 2);
 
-        // Execute a branch to generate branch penalty stalls
         let bundle = make_bundle(vec![
             SlotOp::from_semantic(SlotIndex::Control, SemanticOp::Br)
                 .with_branch_condition(BranchCondition::Always)
@@ -658,17 +647,12 @@ mod tests {
 
         executor.execute(&bundle, &mut ctx, &mut tile);
 
-        // Get full stats
         let stats = executor.stats();
 
-        // Branch stalls should be tracked
-        assert_eq!(stats.branch_stalls, 3);
-
-        // Hazard stats should include branch stalls in breakdown
-        assert_eq!(stats.hazard_stats.branch_stall_cycles, 3);
-        assert_eq!(stats.hazard_stats.total_stall_cycles, 3);
-
-        // Register and memory stalls should be zero (no hazards in this bundle)
+        // No explicit penalty -- delay slots are the penalty mechanism
+        assert_eq!(stats.branch_stalls, 0);
+        assert_eq!(stats.hazard_stats.branch_stall_cycles, 0);
+        assert_eq!(stats.hazard_stats.total_stall_cycles, 0);
         assert_eq!(stats.hazard_stats.register_stall_cycles, 0);
         assert_eq!(stats.hazard_stats.memory_stall_cycles, 0);
     }
