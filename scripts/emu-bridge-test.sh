@@ -106,6 +106,7 @@ while [[ $# -gt 0 ]]; do
       shift ;;
     --chess-only|--chess)  COMPILER_MODE="chess"; shift ;;
     --peano-only|--peano)  COMPILER_MODE="peano"; shift ;;
+    --serial-hw)           NPU_HW_JOBS=1; shift ;;
     --help|-h)
       cat <<'USAGE'
 Usage: emu-bridge-test.sh [options] [test-name-filter]
@@ -122,7 +123,8 @@ Options:
   -v, --verbose   Show log snippets on failure
   --chess-only    Only compile/run with Chess compiler (ground truth)
   --peano-only    Only compile/run with Peano compiler
-  (default: both compilers, Chess is ground truth)
+  --serial-hw     Run hardware tests sequentially (for crash classification)
+  (default: both compilers, Chess is ground truth, HW parallel -j5)
 
 Filter:
   Substring match on test directory name.
@@ -592,7 +594,7 @@ export -f compile_one_compiler compile_one
 # Maximum concurrent NPU hardware contexts.  NPU1 supports 6, but we
 # use 5 to leave headroom for the driver and avoid context-exhaustion
 # crashes observed at 10+ concurrent jobs.
-NPU_HW_JOBS=5
+NPU_HW_JOBS="${NPU_HW_JOBS:-5}"
 export NPU_HW_JOBS
 
 run_one_hardware() {
