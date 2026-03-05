@@ -1001,14 +1001,61 @@ def _run_multi_pass(
     print(f"\nView in Perfetto: https://ui.perfetto.dev/")
 
 
+def _wait_npu_recovery(timeout: float = 60.0) -> bool:
+    """Wait for NPU to become healthy after a fault.  Returns True if OK."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if wait_npu_idle(timeout=2.0):
+            return True
+        print(f"    waiting for NPU recovery... ({int(deadline - time.monotonic())}s left)")
+        time.sleep(2)
+    return False
+
+
+def _retry_batch_serial(
+    batch: dict,
+    output_subdir: str,
+    hw_cooldown: float,
+    max_attempts: int = 3,
+) -> str:
+    """Retry a single batch serially with up to max_attempts for TDRs.
+
+    Returns the final status ("ok", "tdr", "iommu_fault", "failed").
+    """
+    status_key = f"{output_subdir}_status"
+    for attempt in range(1, max_attempts + 1):
+        _wait_npu_recovery(timeout=30.0)
+        run_batch_hw(batch, hw_cooldown=hw_cooldown, output_subdir=output_subdir)
+        status = batch.get(status_key, "failed")
+        if status == "ok":
+            return "ok"
+        if status == "iommu_fault":
+            print(f"    Batch {batch['batch']}: IOMMU fault on retry -- culprit identified")
+            return "iommu_fault"
+        if status == "tdr" and attempt < max_attempts:
+            print(f"    Batch {batch['batch']}: TDR on attempt {attempt}/{max_attempts}, retrying")
+        else:
+            print(f"    Batch {batch['batch']}: {status} after {attempt} attempt(s)")
+    return batch.get(status_key, "failed")
+
+
 def _run_hw_batches(
     runnable: list[dict],
     hw_jobs: int,
     hw_cooldown: float,
     output_subdir: str = "hw",
 ):
-    """Run HW batches, serial or parallel depending on hw_jobs."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    """Run HW batches, serial or parallel depending on hw_jobs.
+
+    Parallel mode monitors for faults after each batch completion:
+    - TDR: pause pool, wait for recovery, retry that batch serially
+      (3 attempts), then resume parallel.
+    - IOMMU fault: stop all running batches, wait for recovery, then
+      run every in-flight batch serially to identify the culprit.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 
     if hw_jobs <= 1:
         # Serial: one at a time with cooldown between runs.
@@ -1016,21 +1063,97 @@ def _run_hw_batches(
         print(f"  HW:  {len(runnable)} batches ({label}, -> {output_subdir}/)")
         for b in runnable:
             run_batch_hw(b, hw_cooldown=hw_cooldown, output_subdir=output_subdir)
-    else:
-        # Parallel: up to hw_jobs concurrent NPU contexts.
-        label = f"parallel, -j{hw_jobs}"
-        print(f"  HW:  {len(runnable)} batches ({label}, -> {output_subdir}/)")
-        with ThreadPoolExecutor(max_workers=hw_jobs) as pool:
-            futures = {
-                pool.submit(
+        return
+
+    # --- Parallel with fault monitoring ---
+    label = f"parallel, -j{hw_jobs}"
+    print(f"  HW:  {len(runnable)} batches ({label}, -> {output_subdir}/)")
+    status_key = f"{output_subdir}_status" if output_subdir != "hw" else "hw_status"
+    queue = list(runnable)  # batches still to submit
+    done = []               # completed batches
+
+    with ThreadPoolExecutor(max_workers=hw_jobs) as pool:
+        active: dict[Future, dict] = {}  # future -> batch
+
+        def _fill_pool():
+            while len(active) < hw_jobs and queue:
+                b = queue.pop(0)
+                f = pool.submit(
                     run_batch_hw, b,
                     hw_cooldown=0.2,
                     output_subdir=output_subdir,
-                ): b
-                for b in runnable
-            }
-            for f in as_completed(futures):
-                f.result()  # propagate exceptions
+                )
+                active[f] = b
+
+        _fill_pool()
+
+        while active:
+            # Wait for the next batch to complete.
+            completed_futures = []
+            for f in as_completed(active):
+                completed_futures.append(f)
+                break  # process one at a time to check faults
+
+            for f in completed_futures:
+                batch = active.pop(f)
+                try:
+                    f.result()
+                except Exception as e:
+                    print(f"  Batch {batch['batch']}: exception: {e}")
+
+                status = batch.get(status_key, "failed")
+
+                if status == "iommu_fault":
+                    # IOMMU fault: stop everything, recover, then run
+                    # all in-flight batches serially to find the culprit.
+                    print(f"\n  IOMMU FAULT in batch {batch['batch']} -- "
+                          f"pausing pool, recovering NPU...")
+
+                    # Collect all in-flight batches (let them finish,
+                    # they may already be done or about to fault too).
+                    suspects = [batch]
+                    for af in list(active):
+                        try:
+                            af.result(timeout=30)
+                        except Exception:
+                            pass
+                        suspects.append(active.pop(af))
+
+                    # Wait for NPU recovery.
+                    if not _wait_npu_recovery(timeout=60.0):
+                        print("  NPU did not recover -- skipping remaining batches")
+                        for s in suspects[1:]:
+                            s[status_key] = "skipped_iommu"
+                        done.extend(suspects)
+                        queue.clear()
+                        break
+
+                    # Re-run all suspects serially to identify the culprit.
+                    print(f"  Re-running {len(suspects)} suspect(s) serially...")
+                    for s in suspects:
+                        result = _retry_batch_serial(
+                            s, output_subdir, hw_cooldown, max_attempts=1,
+                        )
+                        print(f"    Batch {s['batch']}: {result}")
+                        done.append(s)
+
+                    # Resume parallel pool with remaining queue.
+                    _fill_pool()
+
+                elif status == "tdr":
+                    # TDR: pause, recover, retry this one batch.
+                    print(f"  Batch {batch['batch']}: TDR -- "
+                          f"retrying serially (up to 3 attempts)...")
+                    result = _retry_batch_serial(
+                        batch, output_subdir, hw_cooldown, max_attempts=3,
+                    )
+                    done.append(batch)
+                    _fill_pool()
+
+                else:
+                    # Clean completion (ok or failed).
+                    done.append(batch)
+                    _fill_pool()
 
 
 def _compare_serial_vs_parallel(
@@ -1213,11 +1336,11 @@ def _execute_and_merge(
         # --- Compare mode: run HW serial, then HW parallel, then compare ---
         print("  === Serial vs Parallel comparison mode ===")
 
-        # Pass 1: serial
+        # Pass 1: serial (ground truth, one at a time).
         _run_hw_batches(runnable, hw_jobs=1, hw_cooldown=args.hw_cooldown,
                         output_subdir="hw-serial")
 
-        # Pass 2: parallel
+        # Pass 2: parallel.
         parallel_jobs = hw_jobs if hw_jobs > 1 else 5
         _run_hw_batches(runnable, hw_jobs=parallel_jobs,
                         hw_cooldown=0.2, output_subdir="hw-parallel")
