@@ -1447,6 +1447,42 @@ main() {
       done
     fi
 
+    # --- Retry: rerun non-quarantine TDR results serially ---
+    # TDRs in the parallel pool are often collateral damage from a stuck
+    # context left by another test.  Rerunning in isolation distinguishes
+    # real failures from contention artifacts.
+    local retry_jobs=()
+    for entry in "${hw_parallel_jobs[@]}"; do
+      local r_name="${entry%%:*}" r_compiler="${entry##*:}"
+      local r_safe
+      r_safe="$(sanitize_name "$r_name")"
+      local r_result=""
+      [[ -f "$RESULTS_DIR/${r_safe}.${r_compiler}.hw.result" ]] && \
+        r_result="$(< "$RESULTS_DIR/${r_safe}.${r_compiler}.hw.result")"
+      [[ "$r_result" == "TDR" ]] && retry_jobs+=("$entry")
+    done
+
+    if [[ ${#retry_jobs[@]} -gt 0 ]]; then
+      info "HW retry: ${#retry_jobs[@]} TDR result(s) rerunning serially"
+      for entry in "${retry_jobs[@]}"; do
+        local r_name="${entry%%:*}" r_compiler="${entry##*:}"
+        local r_safe
+        r_safe="$(sanitize_name "$r_name")"
+        # Save original log, then rerun.
+        local orig_log="$RESULTS_DIR/${r_safe}.${r_compiler}.hw.log"
+        [[ -f "$orig_log" ]] && cp "$orig_log" "${orig_log%.log}.tdr-orig.log"
+        run_one_hardware "$r_name" "$real_bdf" "$r_compiler"
+        local rr="SKIP"
+        [[ -f "$RESULTS_DIR/${r_safe}.${r_compiler}.hw.result" ]] && \
+          rr="$(< "$RESULTS_DIR/${r_safe}.${r_compiler}.hw.result")"
+        if [[ "$rr" == "PASS" ]]; then
+          echo "  RETRY $r_name ($r_compiler): PASS (was TDR collateral)"
+        else
+          echo "  RETRY $r_name ($r_compiler): $rr (confirmed failure)"
+        fi
+      done
+    fi
+
     # --- Quarantine pool: known TDR tests, run last, serially ---
     if [[ ${#hw_quarantine_jobs[@]} -gt 0 ]]; then
       info "HW quarantine: running ${#hw_quarantine_jobs[@]} isolated test(s)"
