@@ -836,6 +836,30 @@ run_trace_compare() {
 }
 export -f run_trace_compare
 
+# Compile traced xclbin base for a single test (used by compile-ahead).
+# Delegates to trace-sweep.py --compile-only, writes status to
+# $RESULTS_DIR/${safe}.trace-compile/compile-status.txt.
+compile_trace_base_one() {
+  local name="$1"
+  local safe
+  safe="$(sanitize_name "$name")"
+  local src_dir="$TEST_SRC/$name"
+  local compile_dir="$RESULTS_DIR/${safe}.trace-compile"
+
+  python3 "$EMU_ROOT/tools/trace-sweep.py" "$src_dir" \
+    -o "$compile_dir" --compile-only \
+    > "$RESULTS_DIR/${safe}.trace-compile.log" 2>&1
+  local rc=$?
+
+  if [[ $rc -eq 0 ]] && [[ -f "$compile_dir/compile-status.txt" ]] \
+      && grep -q '^OK' "$compile_dir/compile-status.txt"; then
+    echo "  TRACE COMPILE $name: OK"
+  else
+    echo "  TRACE COMPILE $name: FAIL"
+  fi
+}
+export -f compile_trace_base_one
+
 # Run trace comparison for a single test.
 # Uses trace-sweep.py for sweep mode, or trace-inject + trace-run +
 # trace-compare for default (8-event) mode.
@@ -1426,6 +1450,25 @@ main() {
     emu_pool_pid=$!
   fi
 
+  # Launch background trace compile-ahead (overlaps with HW+EMU runs).
+  local trace_compile_pid=""
+  if [[ -n "$TRACE_MODE" ]] && [[ "$TRACE_MODE" == "compare" || "$TRACE_MODE" == "compare-all" ]]; then
+    local trace_compile_targets=()
+    for name in "${compiled[@]}"; do
+      is_trace_quarantined "$name" && continue
+      trace_compile_targets+=("$name")
+    done
+
+    if [[ ${#trace_compile_targets[@]} -gt 0 ]]; then
+      info "Background: compiling ${#trace_compile_targets[@]} traced xclbin(s) (-j${JOBS})"
+      (
+        printf '%s\n' "${trace_compile_targets[@]}" | \
+          xargs -P"$JOBS" -I{} bash -c 'compile_trace_base_one "$@"' _ {}
+      ) &
+      trace_compile_pid=$!
+    fi
+  fi
+
   # Launch HW with NPU job pool (if enabled), concurrently with EMU.
   if $RUN_HW; then
     local tdr_suspect_file="$RESULTS_DIR/tdr_suspects.log"
@@ -1604,6 +1647,14 @@ main() {
 
     if $trace_compare; then
       # --- Compare mode: serial-vs-parallel determinism check ---
+      # Wait for background trace compile-ahead to finish.
+      if [[ -n "$trace_compile_pid" ]]; then
+        info "Phase 4b: waiting for trace compile-ahead to finish..."
+        wait "$trace_compile_pid" 2>/dev/null || true
+        trace_compile_pid=""
+        info "Phase 4b: trace compile-ahead done"
+      fi
+
       if [[ ${#trace_targets[@]} -gt 0 ]]; then
         info "Phase 4b: Serial vs Parallel trace comparison for ${#trace_targets[@]} test(s)"
         local cmp_pass=0 cmp_fail=0 cmp_err=0 cmp_skip=0
@@ -1645,13 +1696,25 @@ main() {
           echo "  [${test_idx}/${#trace_targets[@]}] COMPARE $name  @$(uptime_sec)s"
 
           # Run trace-sweep.py with --compare-parallel.
+          # Use pre-compiled base if compile-ahead succeeded.
+          local compile_dir="$RESULTS_DIR/${safe}.trace-compile"
+          local sweep_args=("$src_dir" -o "$cmp_dir" --compare-parallel --hw-jobs "$NPU_HW_JOBS" --no-emu)
+          if [[ -f "$compile_dir/compile-status.txt" ]] \
+              && grep -q '^OK' "$compile_dir/compile-status.txt"; then
+            # Single-pass: base/ dir directly under compile_dir.
+            # Multi-pass: pass_NN/base/ dirs under compile_dir.
+            if [[ -d "$compile_dir/base" ]]; then
+              sweep_args+=(--use-base "$compile_dir/base")
+            elif [[ -d "$compile_dir/pass_00" ]]; then
+              sweep_args+=(--use-base "$compile_dir")
+            fi
+          fi
+
           local iommu_pre_test
           iommu_pre_test="$(iommu_fault_count)"
           local sweep_result
           sweep_result=$(
-            python3 "$EMU_ROOT/tools/trace-sweep.py" "$src_dir" \
-              -o "$cmp_dir" \
-              --compare-parallel --hw-jobs "$NPU_HW_JOBS" --no-emu \
+            python3 "$EMU_ROOT/tools/trace-sweep.py" "${sweep_args[@]}" \
               2>&1
           ) || true
           echo "$sweep_result" > "$cmp_log"
@@ -1745,6 +1808,11 @@ main() {
       fi
     fi
     echo ""
+  fi
+
+  # Clean up any remaining background trace compile.
+  if [[ -n "$trace_compile_pid" ]]; then
+    wait "$trace_compile_pid" 2>/dev/null || true
   fi
 
   # ---- Phase 5: Report ---------------------------------------------------

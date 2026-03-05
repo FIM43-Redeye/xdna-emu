@@ -579,6 +579,14 @@ def main():
         "--mem-only", action="store_true",
         help="Only sweep memory events (skip core events)",
     )
+    parser.add_argument(
+        "--compile-only", action="store_true",
+        help="Only inject and compile traced xclbin, skip HW/EMU runs",
+    )
+    parser.add_argument(
+        "--use-base", type=Path, default=None,
+        help="Use pre-compiled base dir (skip inject+compile)",
+    )
     args = parser.parse_args()
 
     test_dir = resolve_test_dir(args.test)
@@ -663,6 +671,58 @@ def main():
         print(f"Sweep skipped: capacity_exceeded")
         sys.exit(0)
 
+    # --- Compile-only mode: compile base(s) and exit -----------------------
+
+    if args.compile_only:
+        status_file = output_dir / "compile-status.txt"
+        try:
+            if plan and plan["num_passes"] > 1:
+                # Multi-pass: compile each pass's base into its own subdir.
+                all_ok = True
+                for pass_idx, trace_pass in enumerate(plan["passes"]):
+                    tile_specs = []
+                    for t in trace_pass["tiles"]:
+                        tile_specs.append(f"{t['col']}.{t['row']}:{t['module']}")
+                    tile_filter = ",".join(tile_specs)
+
+                    pass_dir = output_dir / f"pass_{pass_idx:02d}"
+                    pass_dir.mkdir(parents=True, exist_ok=True)
+                    print(f"\n  Pass {pass_idx}: compiling "
+                          f"({len(trace_pass['tiles'])} tiles)")
+
+                    base_dir, base_manifest = compile_base_trace(
+                        test_dir, pass_dir, args.trace_size,
+                        tile_filter=tile_filter,
+                    )
+                    if base_dir is None:
+                        print(f"    Pass {pass_idx} compile failed")
+                        all_ok = False
+
+                if all_ok:
+                    status_file.write_text("OK\n")
+                    print(f"\nCompile-only: all passes compiled successfully")
+                else:
+                    status_file.write_text("FAIL some passes failed to compile\n")
+                    print(f"\nCompile-only: some passes failed")
+                    sys.exit(1)
+            else:
+                # Single pass: compile one base.
+                base_dir, base_manifest = compile_base_trace(
+                    test_dir, output_dir, args.trace_size,
+                )
+                if base_dir is not None:
+                    status_file.write_text("OK\n")
+                    print(f"\nCompile-only: OK")
+                else:
+                    status_file.write_text("FAIL compile_base_trace failed\n")
+                    print(f"\nCompile-only: FAIL")
+                    sys.exit(1)
+        except Exception as e:
+            status_file.write_text(f"FAIL {e}\n")
+            print(f"\nCompile-only: FAIL ({e})")
+            sys.exit(1)
+        return
+
     # --- Multi-pass vs single-pass execution ------------------------------
 
     if plan and plan["num_passes"] > 1:
@@ -697,10 +757,22 @@ def _run_single_pass(
     """Run the standard single-pass sweep (original behavior)."""
     trace_size = args.trace_size
 
-    # Compile base trace once (all batches share xclbin, patch insts.bin)
-    base_dir, base_manifest = compile_base_trace(
-        test_dir, output_dir, trace_size,
-    )
+    # Use pre-compiled base if provided, otherwise compile fresh.
+    if getattr(args, "use_base", None) is not None:
+        use_base = args.use_base.resolve()
+        base_manifest_path = use_base / "manifest.json"
+        if not use_base.is_dir() or not base_manifest_path.exists():
+            print(f"Error: --use-base dir missing or lacks manifest.json: {use_base}",
+                  file=sys.stderr)
+            sys.exit(1)
+        base_dir = use_base
+        base_manifest = base_manifest_path
+        print(f"  Using pre-compiled base: {use_base}")
+    else:
+        # Compile base trace once (all batches share xclbin, patch insts.bin)
+        base_dir, base_manifest = compile_base_trace(
+            test_dir, output_dir, trace_size,
+        )
     if base_dir is None:
         # Check if a skip manifest was written with a specific reason
         skip_manifest = output_dir / "base" / "sweep-manifest.json"
@@ -803,9 +875,25 @@ def _run_multi_pass(
         print(f"\n  Pass {pass_idx}: {len(trace_pass['tiles'])} tiles "
               f"-> shim col {trace_pass['shim_col']}")
 
-        base_dir, base_manifest = compile_base_trace(
-            test_dir, pass_dir, trace_size, tile_filter=tile_filter,
-        )
+        # Use pre-compiled base if provided, otherwise compile fresh.
+        if getattr(args, "use_base", None) is not None:
+            use_base = args.use_base.resolve()
+            pre_pass_dir = use_base / f"pass_{pass_idx:02d}" / "base"
+            pre_manifest = pre_pass_dir / "manifest.json"
+            if pre_pass_dir.is_dir() and pre_manifest.exists():
+                base_dir = pre_pass_dir
+                base_manifest = pre_manifest
+                print(f"    Using pre-compiled base: {pre_pass_dir}")
+            else:
+                # Fall back to compiling if pre-compiled pass not found.
+                print(f"    Pre-compiled pass {pass_idx} not found, compiling...")
+                base_dir, base_manifest = compile_base_trace(
+                    test_dir, pass_dir, trace_size, tile_filter=tile_filter,
+                )
+        else:
+            base_dir, base_manifest = compile_base_trace(
+                test_dir, pass_dir, trace_size, tile_filter=tile_filter,
+            )
         if base_dir is None:
             print(f"    Pass {pass_idx} compile failed, skipping")
             pass_manifests.append({
