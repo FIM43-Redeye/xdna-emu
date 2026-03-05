@@ -448,13 +448,12 @@ impl InterpreterEngine {
         // request per clock cycle (AM020), so a core release at cycle N
         // becomes visible to DMA at cycle N+1.
         //
-        // The deferred deltas are applied in end_lock_cycle() during Phase 3,
-        // so the NEXT cycle's begin_lock_cycle() snapshot will include them.
+        // The deferred requests are resolved by the arbiter during Phase 3,
+        // so the NEXT cycle's DMA operations will see the updated values.
         //
         // Core lock acquires still read lock.value directly (committed state
-        // from previous cycles). This is correct: the arbiter snapshot at
-        // cycle start determines acquire success, and the acquire decrement
-        // is immediate (the core stalls if precondition isn't met).
+        // from previous cycles). This is correct: the core stalls if the
+        // precondition isn't met, and the acquire decrement is immediate.
         //
         // DMA-to-core lock visibility (the reverse direction) is handled by
         // step_data_movement's internal lock snapshot/commit, which commits
@@ -556,13 +555,12 @@ impl InterpreterEngine {
                     neighbors.apply_writes(&mut self.device);
                 }
 
-                // Defer modified memory tile locks to the MemTile's core_lock_deltas.
+                // Submit modified memory tile locks to the MemTile's arbiter.
                 //
                 // Instead of writing back directly (which would make core lock
                 // releases visible to MemTile DMA in the same cycle), we compute
-                // the diff and add it to core_lock_deltas. This models the 1-cycle
-                // lock arbiter pipeline: core releases at cycle N become visible
-                // to DMA at cycle N+1.
+                // the diff and submit it as a core release to the arbiter. The
+                // arbiter resolves in Phase 3, providing the 1-cycle delay.
                 if let Some(mem_locks) = mem_tile_locks_copy {
                     if let Some(mem_tile) = self.device.tile_mut(col, mem_tile_row) {
                         for i in 0..mem_locks.len().min(mem_tile.locks.len()) {
@@ -578,10 +576,10 @@ impl InterpreterEngine {
 
         // Phase 3: Step all DMA engines and stream routing.
         //
-        // Core lock releases from Phase 2 are in core_lock_deltas (deferred).
-        // begin_lock_cycle() snapshots lock.value (without core releases).
-        // end_lock_cycle() applies both DMA deltas and core_lock_deltas,
-        // so the new values become visible in the NEXT cycle's snapshot.
+        // Core lock releases from Phase 2 are pending in tile arbiters.
+        // step_data_movement() does: submit DMA lock requests -> resolve
+        // all tile arbiters (core + DMA together) -> step DMA channels
+        // checking arbiter results -> route streams.
         //
         // Set cycle timestamp on DMA engines before stepping so trace
         // events get the correct cycle number.

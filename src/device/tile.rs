@@ -136,6 +136,286 @@ pub enum LockResult {
     WouldOverflow,
 }
 
+// ---------------------------------------------------------------------------
+// Lock Arbiter -- round-robin arbitration per AM020
+// ---------------------------------------------------------------------------
+
+/// Identifies the source of a lock request.
+///
+/// The hardware lock arbiter processes requests from the core and each DMA
+/// channel independently. Priority rotates among all requestors using
+/// round-robin to ensure fairness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockRequestor {
+    /// Core processor (lock acquire/release instructions)
+    Core,
+    /// DMA S2MM channel (stream-to-memory, index 0..n)
+    DmaS2mm(u8),
+    /// DMA MM2S channel (memory-to-stream, index 0..n)
+    DmaMm2s(u8),
+}
+
+impl LockRequestor {
+    /// Map requestor to a priority index for round-robin ordering.
+    ///
+    /// Layout: [Core, S2MM_0, S2MM_1, ..., MM2S_0, MM2S_1, ...]
+    pub fn to_priority_index(&self, s2mm_count: u8) -> usize {
+        match self {
+            LockRequestor::Core => 0,
+            LockRequestor::DmaS2mm(ch) => 1 + *ch as usize,
+            LockRequestor::DmaMm2s(ch) => 1 + s2mm_count as usize + *ch as usize,
+        }
+    }
+}
+
+/// A pending lock request submitted to the arbiter.
+#[derive(Debug, Clone)]
+pub struct LockRequest {
+    /// Who is requesting
+    pub requestor: LockRequestor,
+    /// Which lock
+    pub lock_id: usize,
+    /// True = acquire (blocking), false = release (non-blocking)
+    pub is_acquire: bool,
+    /// For acquire: value threshold (acq_ge: lock >= expected; acq_eq: lock == expected)
+    pub expected: i8,
+    /// Change to apply to the lock value
+    pub delta: i8,
+    /// For acquire: true = exact match (acq_eq), false = greater-or-equal (acq_ge)
+    pub equal_mode: bool,
+}
+
+/// Per-lock contention statistics for debugging.
+#[derive(Debug, Clone, Default)]
+pub struct LockArbiterStats {
+    /// Total grants (successful arbitrations)
+    pub grants: u64,
+    /// Contentions (multiple requestors wanted the same lock in the same cycle)
+    pub contentions: u64,
+    /// Stalls (request denied due to contention, not precondition failure)
+    pub stalls: u64,
+}
+
+/// Round-robin lock arbiter for a tile's memory module.
+///
+/// Per AM020, the lock arbiter sits in each tile's memory module and handles
+/// competing lock requests from multiple sources (core, DMA S2MM channels,
+/// DMA MM2S channels). It uses round-robin arbitration and processes one
+/// request per lock per clock cycle.
+///
+/// # Design
+///
+/// Requests are submitted during the cycle (by core execution and DMA steps).
+/// At the end of the cycle, `resolve()` is called to arbitrate and apply
+/// granted requests. Denied requests (due to contention) must be resubmitted
+/// next cycle.
+#[derive(Debug)]
+pub struct LockArbiter {
+    /// Pending requests for this cycle, grouped by lock_id
+    pending: Vec<LockRequest>,
+
+    /// Round-robin priority pointer (index into the requestor ordering).
+    /// Rotates after each grant to ensure fairness.
+    priority: usize,
+
+    /// Number of S2MM channels (for priority index calculation)
+    s2mm_count: u8,
+
+    /// Total number of requestors (Core + S2MM + MM2S)
+    num_requestors: usize,
+
+    /// Per-lock statistics (indexed by lock_id)
+    stats: Vec<LockArbiterStats>,
+
+    /// Results of the last arbitration round.
+    /// (requestor, lock_id, granted)
+    results: Vec<(LockRequestor, usize, bool)>,
+}
+
+impl LockArbiter {
+    /// Create a new arbiter for a tile.
+    pub fn new(num_locks: usize, s2mm_channels: u8, mm2s_channels: u8) -> Self {
+        Self {
+            pending: Vec::with_capacity(8),
+            priority: 0,
+            s2mm_count: s2mm_channels,
+            num_requestors: 1 + s2mm_channels as usize + mm2s_channels as usize,
+            stats: vec![LockArbiterStats::default(); num_locks],
+            results: Vec::with_capacity(8),
+        }
+    }
+
+    /// Submit a lock request to the arbiter.
+    pub fn submit(&mut self, request: LockRequest) {
+        self.pending.push(request);
+    }
+
+    /// Resolve all pending requests using round-robin arbitration.
+    ///
+    /// For each lock that has pending requests:
+    /// - If only one requestor: grant if precondition met (fast path)
+    /// - If multiple requestors: grant to the one closest to the current
+    ///   priority pointer (round-robin), deny others
+    ///
+    /// Granted acquire requests are applied to the lock values. Releases
+    /// always succeed when granted. The priority pointer rotates after
+    /// each contended grant.
+    pub fn resolve(&mut self, locks: &mut [Lock]) -> &[(LockRequestor, usize, bool)] {
+        self.results.clear();
+
+        if self.pending.is_empty() {
+            return &self.results;
+        }
+
+        // Group pending requests by lock_id using simple O(n^2) grouping.
+        let mut processed = vec![false; self.pending.len()];
+
+        for i in 0..self.pending.len() {
+            if processed[i] {
+                continue;
+            }
+
+            let lock_id = self.pending[i].lock_id;
+
+            // Collect all requests for this lock_id
+            let mut group: Vec<usize> = vec![i];
+            for j in (i + 1)..self.pending.len() {
+                if !processed[j] && self.pending[j].lock_id == lock_id {
+                    group.push(j);
+                    processed[j] = true;
+                }
+            }
+            processed[i] = true;
+
+            if group.len() == 1 {
+                // Fast path: single requestor, no contention
+                let req = &self.pending[group[0]];
+                let granted = Self::try_apply(req, locks);
+                if lock_id < self.stats.len() {
+                    self.stats[lock_id].grants += granted as u64;
+                }
+                self.results.push((req.requestor, lock_id, granted));
+            } else {
+                // Contention: multiple requestors want the same lock
+                if lock_id < self.stats.len() {
+                    self.stats[lock_id].contentions += 1;
+                }
+
+                // Sort by round-robin distance from priority pointer
+                let s2mm_count = self.s2mm_count;
+                let priority = self.priority;
+                let num_requestors = self.num_requestors;
+                let pending = &self.pending;
+
+                let mut group_with_dist: Vec<(usize, usize)> = group
+                    .iter()
+                    .map(|&idx| {
+                        let pi = pending[idx].requestor.to_priority_index(s2mm_count);
+                        let dist = (pi + num_requestors - priority) % num_requestors;
+                        (idx, dist)
+                    })
+                    .collect();
+                group_with_dist.sort_by_key(|&(_, dist)| dist);
+
+                // Grant to closest requestor first. Only ONE grant per lock
+                // per cycle (hardware serialization). Others are denied.
+                let mut any_granted = false;
+                for &(idx, _) in &group_with_dist {
+                    let req = &self.pending[idx];
+                    if !any_granted {
+                        let granted = Self::try_apply(req, locks);
+                        if granted {
+                            any_granted = true;
+                            if lock_id < self.stats.len() {
+                                self.stats[lock_id].grants += 1;
+                            }
+                            // Rotate priority past the winner
+                            let winner_pi = req.requestor.to_priority_index(s2mm_count);
+                            self.priority = (winner_pi + 1) % num_requestors;
+                        }
+                        self.results.push((req.requestor, lock_id, granted));
+                    } else {
+                        // Denied due to contention
+                        if lock_id < self.stats.len() {
+                            self.stats[lock_id].stalls += 1;
+                        }
+                        self.results.push((req.requestor, lock_id, false));
+                    }
+                }
+            }
+        }
+
+        self.pending.clear();
+        &self.results
+    }
+
+    /// Try to apply a single lock request. Returns true if granted.
+    fn try_apply(req: &LockRequest, locks: &mut [Lock]) -> bool {
+        if req.lock_id >= locks.len() {
+            return false;
+        }
+        let lock = &mut locks[req.lock_id];
+
+        if req.is_acquire {
+            // Check precondition based on mode
+            let precondition_met = if req.equal_mode {
+                lock.value == req.expected
+            } else {
+                lock.value >= req.expected
+            };
+
+            if !precondition_met {
+                return false;
+            }
+
+            // Apply delta
+            let new_value = (lock.value as i16) + (req.delta as i16);
+            if new_value < Lock::MIN_VALUE as i16 {
+                lock.underflow = true;
+                return false;
+            }
+            if new_value > Lock::MAX_VALUE as i16 {
+                lock.overflow = true;
+                lock.value = Lock::MAX_VALUE;
+            } else {
+                lock.value = new_value as i8;
+            }
+            true
+        } else {
+            // Release: always succeeds (non-blocking), apply delta
+            lock.release_with_value(req.delta);
+            true
+        }
+    }
+
+    /// Check if a specific requestor was granted in the last resolve.
+    pub fn was_granted(&self, requestor: LockRequestor, lock_id: usize) -> bool {
+        self.results
+            .iter()
+            .any(|&(ref r, lid, granted)| *r == requestor && lid == lock_id && granted)
+    }
+
+    /// Get per-lock statistics.
+    pub fn lock_stats(&self, lock_id: usize) -> Option<&LockArbiterStats> {
+        self.stats.get(lock_id)
+    }
+
+    /// Returns true if there are pending requests.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Reset the arbiter state (priority, stats, pending).
+    pub fn reset(&mut self) {
+        self.pending.clear();
+        self.results.clear();
+        self.priority = 0;
+        for s in &mut self.stats {
+            *s = LockArbiterStats::default();
+        }
+    }
+}
+
 /// Lock state.
 ///
 /// AIE2 uses semaphore locks with acquire/release semantics.
@@ -652,28 +932,14 @@ pub struct Tile {
     /// Lock states (sized from TileParams: 16 for compute, 64 for mem tile, 0 for shim)
     pub locks: Vec<Lock>,
 
-    /// Lock value snapshot for cycle-accurate arbitration.
-    /// All lock operations within a cycle check against this snapshot,
-    /// ensuring all requestors see the same values regardless of processing order.
-    lock_snapshot: Vec<i8>,
-
-    /// Pending lock deltas from DMA operations to apply at end of cycle.
-    /// Releases add positive deltas, acquires add negative deltas.
-    lock_deltas: Vec<i8>,
-
-    /// Pending lock deltas from core operations (lock release instructions).
+    /// Round-robin lock arbiter for this tile's memory module.
     ///
-    /// Core lock releases are deferred by 1 cycle to model the hardware lock
-    /// arbiter pipeline. On real AIE2 hardware, a core lock release instruction
-    /// sends a request to the lock arbiter, which processes it and makes the
-    /// new value visible to other requestors (DMA, other cores) in the NEXT
-    /// cycle. The AM020 architecture manual states the lock arbiter "handles
-    /// a new request every clock cycle" with round-robin arbitration.
-    ///
-    /// These deltas are accumulated during Phase 2 (core stepping) and applied
-    /// alongside DMA deltas in `end_lock_cycle()` during Phase 3. This means
-    /// DMA sees core releases with a 1-cycle delay, matching hardware.
-    core_lock_deltas: Vec<i8>,
+    /// Per AM020, the lock arbiter serializes competing lock requests from
+    /// the core and DMA channels. Requests are submitted during the cycle
+    /// and resolved at end-of-cycle. Core releases submitted in Phase 2
+    /// are resolved alongside DMA requests in Phase 3, providing the
+    /// 1-cycle visibility delay that matches hardware.
+    pub lock_arbiter: LockArbiter,
 
     // === Warm data (accessed during DMA) ===
 
@@ -891,9 +1157,11 @@ impl Tile {
             row,
             core: CoreState::default(),
             locks: vec![Lock::default(); params.num_locks],
-            lock_snapshot: vec![0; params.num_locks],
-            lock_deltas: vec![0; params.num_locks],
-            core_lock_deltas: vec![0; params.num_locks],
+            lock_arbiter: LockArbiter::new(
+                params.num_locks,
+                params.dma_s2mm_channels as u8,
+                params.dma_mm2s_channels as u8,
+            ),
             dma_bds: vec![DmaBufferDescriptor::default(); params.num_bds],
             dma_channels: vec![DmaChannel::default(); params.num_channels],
             stream_input: Default::default(),
@@ -1178,217 +1446,86 @@ impl Tile {
         );
     }
 
-    // === Core Lock Release Deferral ===
+    // === Lock Arbiter Interface ===
     //
-    // Core lock releases are deferred by 1 cycle to model the hardware lock
-    // arbiter pipeline. Core release deltas accumulate in `core_lock_deltas`
-    // during Phase 2 (core stepping) and are applied to `lock.value` in
-    // `end_lock_cycle()` during Phase 3.
+    // All lock operations go through the round-robin arbiter. Requests are
+    // submitted during the cycle (core in Phase 2, DMA in Phase 3) and
+    // resolved at the end of Phase 3. The arbiter serializes competing
+    // requests: one grant per lock per cycle, with round-robin fairness.
+    //
+    // Core lock releases submitted in Phase 2 are resolved alongside DMA
+    // requests in Phase 3, providing the 1-cycle visibility delay that
+    // matches hardware (core release at cycle N visible to DMA at cycle N+1).
 
-    /// Defer a core lock release by 1 cycle.
+    /// Submit a lock request to the arbiter.
     ///
-    /// Called from core instruction execution (LockRelease semantic op).
-    /// The delta is buffered and applied at `end_lock_cycle()`, making it
-    /// visible to DMA in the NEXT cycle's snapshot -- matching hardware's
-    /// lock arbiter pipeline latency.
+    /// Called by core (lock release instructions) and DMA (acquire/release).
+    /// The request is queued until `resolve_lock_requests()` is called.
+    #[inline]
+    pub fn submit_lock_request(&mut self, request: LockRequest) {
+        log::debug!("Tile({},{}) submit_lock_request: {:?} lock={} acquire={} expected={} delta={}",
+            self.col, self.row, request.requestor, request.lock_id,
+            request.is_acquire, request.expected, request.delta);
+        self.lock_arbiter.submit(request);
+    }
+
+    /// Defer a core lock release through the arbiter.
+    ///
+    /// Core releases are deferred by 1 cycle: submitted during Phase 2
+    /// (core stepping), resolved at end of Phase 3 (data movement).
+    /// This matches hardware's lock arbiter pipeline latency.
     #[inline]
     pub fn defer_core_lock_release(&mut self, lock_id: usize, delta: i8) {
-        if lock_id < self.core_lock_deltas.len() {
-            let old = self.core_lock_deltas[lock_id];
-            self.core_lock_deltas[lock_id] = self.core_lock_deltas[lock_id].saturating_add(delta);
-            log::debug!("Tile({},{}) defer_core_lock_release lock {} delta {} (old_delta={}, new_delta={})",
-                self.col, self.row, lock_id, delta, old, self.core_lock_deltas[lock_id]);
+        if lock_id < self.locks.len() {
+            log::debug!("Tile({},{}) defer_core_lock_release lock {} delta {}",
+                self.col, self.row, lock_id, delta);
+            self.lock_arbiter.submit(LockRequest {
+                requestor: LockRequestor::Core,
+                lock_id,
+                is_acquire: false,
+                expected: 0,
+                delta,
+                equal_mode: false,
+            });
         }
     }
 
-    /// Get the effective lock value including pending core release deltas.
+    /// Resolve all pending lock requests using round-robin arbitration.
     ///
-    /// Returns the committed lock value plus any deferred core release deltas
-    /// that haven't been applied yet. Useful for testing and debugging.
+    /// Call at end of Phase 3, after all requestors have submitted.
+    /// Applies granted requests directly to lock values. Returns results
+    /// for callers that need to check grant status (e.g., DMA engine).
+    pub fn resolve_lock_requests(&mut self) -> Vec<(LockRequestor, usize, bool)> {
+        let results = self.lock_arbiter.resolve(&mut self.locks);
+        results.to_vec()
+    }
+
+    /// Check if a specific requestor was granted a lock in the last resolve.
+    #[inline]
+    pub fn lock_was_granted(&self, requestor: LockRequestor, lock_id: usize) -> bool {
+        self.lock_arbiter.was_granted(requestor, lock_id)
+    }
+
+    /// Get the current committed lock value.
+    ///
+    /// Returns the live lock value. Pending arbiter requests that have
+    /// not yet been resolved are NOT reflected.
     #[inline]
     pub fn effective_lock_value(&self, lock_id: usize) -> i8 {
         if lock_id < self.locks.len() {
-            let committed = self.locks[lock_id].value;
-            let core_delta = self.core_lock_deltas[lock_id];
-            (committed as i16 + core_delta as i16).clamp(Lock::MIN_VALUE as i16, Lock::MAX_VALUE as i16) as i8
+            self.locks[lock_id].value
         } else {
             0
         }
     }
 
-    // === Lock Arbiter Methods ===
-    //
-    // These methods implement snapshot-based lock arbitration for cycle-accurate
-    // emulation. Within a single cycle:
-    // 1. `begin_lock_cycle()` - snapshot current lock values
-    // 2. All DMA lock operations use `try_acquire_snapshot()` / `release_snapshot()`
-    // 3. `end_lock_cycle()` - apply accumulated DMA deltas AND deferred core deltas
-    //
-    // This ensures all requestors see the same lock state regardless of processing
-    // order within a cycle, matching hardware arbiter behavior.
-
-    /// Begin a lock cycle by snapshotting current lock values.
+    /// Get the current lock value (same as effective_lock_value).
     ///
-    /// Call this at the start of each simulation cycle, before any lock operations.
-    /// All subsequent `try_acquire_snapshot()` and `release_snapshot()` calls will
-    /// check/modify based on this snapshot rather than live values.
-    #[inline]
-    pub fn begin_lock_cycle(&mut self) {
-        // Debug: log any non-zero deltas that are being cleared for Tile(0,1)
-        if self.col == 0 && self.row == 1 {
-            let non_zero: Vec<_> = self.lock_deltas.iter().enumerate()
-                .filter(|(_, &d)| d != 0)
-                .map(|(i, &d)| format!("{}:{}", i, d))
-                .collect();
-            if !non_zero.is_empty() {
-                log::debug!("Tile(0,1) begin_lock_cycle: CLEARING non-zero deltas = [{}] self_ptr={:p}",
-                    non_zero.join(", "), self);
-            }
-        }
-        // Snapshot current values and clear DMA deltas.
-        // Note: core_lock_deltas are NOT cleared here -- they persist from
-        // Phase 2 (core stepping) until end_lock_cycle() applies them.
-        let num_locks = self.locks.len();
-        for i in 0..num_locks {
-            self.lock_snapshot[i] = self.locks[i].value;
-            self.lock_deltas[i] = 0;
-        }
-    }
-
-    /// Try to acquire a lock using snapshot-based arbitration.
-    ///
-    /// Checks the lock's snapshot value against the expected threshold.
-    /// If successful, records a negative delta to be applied at cycle end.
-    ///
-    /// # Arguments
-    /// * `lock_id` - Lock index (0-63)
-    /// * `expected` - Minimum value required (for acq_ge mode)
-    /// * `delta` - Change to apply (typically negative for acquire)
-    /// * `equal_mode` - If true, requires exact match (acq_eq mode)
-    ///
-    /// # Returns
-    /// `LockResult::Success` if acquire would succeed, error otherwise.
-    pub fn try_acquire_snapshot(&mut self, lock_id: usize, expected: i8, delta: i8, equal_mode: bool) -> LockResult {
-        if lock_id >= self.locks.len() {
-            return LockResult::PreconditionNotMet;
-        }
-
-        // Calculate effective value: snapshot + any deltas already recorded this cycle
-        let snapshot_val = self.lock_snapshot[lock_id];
-        let delta_val = self.lock_deltas[lock_id];
-        let effective = (snapshot_val as i16 + delta_val as i16) as i8;
-
-        let success = if equal_mode {
-            effective == expected
-        } else {
-            effective >= expected
-        };
-
-        // Debug: log acquire attempts for lock 1 on Tile(0,1)
-        if self.col == 0 && self.row == 1 && lock_id == 1 {
-            log::debug!("Tile(0,1) try_acquire lock 1: snapshot={} delta={} effective={} expected={} success={}",
-                snapshot_val, delta_val, effective, expected, success);
-        }
-
-        if success {
-            // Record the delta - will be applied at end of cycle
-            self.lock_deltas[lock_id] = self.lock_deltas[lock_id].saturating_add(delta);
-            LockResult::Success
-        } else {
-            LockResult::PreconditionNotMet
-        }
-    }
-
-    /// Release a lock using snapshot-based arbitration.
-    ///
-    /// Records a positive delta to be applied at cycle end.
-    /// Release operations always succeed (no blocking).
-    ///
-    /// # Arguments
-    /// * `lock_id` - Lock index (0-63)
-    /// * `delta` - Change to apply (typically positive for release)
-    #[inline]
-    pub fn release_snapshot(&mut self, lock_id: usize, delta: i8) {
-        if lock_id < self.locks.len() {
-            let old = self.lock_deltas[lock_id];
-            self.lock_deltas[lock_id] = self.lock_deltas[lock_id].saturating_add(delta);
-            log::debug!("Tile({},{}) release_snapshot lock {} delta {} (old_delta={}, new_delta={}) self_ptr={:p}",
-                self.col, self.row, lock_id, delta, old, self.lock_deltas[lock_id], self);
-        }
-    }
-
-    /// End a lock cycle by applying accumulated DMA and core deltas.
-    ///
-    /// Call this at the end of each simulation cycle, after all lock operations.
-    /// Applies both DMA deltas (from snapshot-based operations) and deferred
-    /// core lock release deltas to the actual lock values, with clamping.
-    /// Clears both delta buffers.
-    #[inline]
-    pub fn end_lock_cycle(&mut self) {
-        // Debug: log all non-zero deltas for Tile(0,1)
-        if self.col == 0 && self.row == 1 {
-            let non_zero_dma: Vec<_> = self.lock_deltas.iter().enumerate()
-                .filter(|(_, &d)| d != 0)
-                .map(|(i, &d)| format!("{}:{}", i, d))
-                .collect();
-            let non_zero_core: Vec<_> = self.core_lock_deltas.iter().enumerate()
-                .filter(|(_, &d)| d != 0)
-                .map(|(i, &d)| format!("{}:{}", i, d))
-                .collect();
-            if !non_zero_dma.is_empty() || !non_zero_core.is_empty() {
-                log::debug!("Tile(0,1) end_lock_cycle: dma_deltas=[{}] core_deltas=[{}] self_ptr={:p}",
-                    non_zero_dma.join(", "), non_zero_core.join(", "), self);
-            }
-        }
-        let num_locks = self.locks.len();
-        for i in 0..num_locks {
-            // Combine DMA deltas and deferred core release deltas
-            let dma_delta = self.lock_deltas[i];
-            let core_delta = self.core_lock_deltas[i];
-            let total_delta = (dma_delta as i16) + (core_delta as i16);
-            if total_delta != 0 {
-                let old_value = self.locks[i].value;
-                let new_value = (old_value as i16) + total_delta;
-                if new_value < Lock::MIN_VALUE as i16 {
-                    self.locks[i].underflow = true;
-                    self.locks[i].value = Lock::MIN_VALUE;
-                    log::debug!("Tile({},{}) lock {} end_cycle: {}+({})=MIN (clamped, underflow)",
-                        self.col, self.row, i, old_value, total_delta);
-                } else if new_value > Lock::MAX_VALUE as i16 {
-                    self.locks[i].overflow = true;
-                    self.locks[i].value = Lock::MAX_VALUE;
-                    log::debug!("Tile({},{}) lock {} end_cycle: {}+({})->MAX (overflow)",
-                        self.col, self.row, i, old_value, total_delta);
-                } else {
-                    self.locks[i].value = new_value as i8;
-                    log::debug!("Tile({},{}) lock {} end_cycle: {}+({})={}",
-                        self.col, self.row, i, old_value, total_delta, new_value);
-                }
-            }
-            // Clear both delta buffers
-            self.lock_deltas[i] = 0;
-            self.core_lock_deltas[i] = 0;
-        }
-    }
-
-    /// Get the snapshot value for a lock (for debugging/logging).
+    /// Compatibility shim -- previously returned the snapshot value.
+    /// Now returns the live committed value.
     #[inline]
     pub fn lock_snapshot_value(&self, lock_id: usize) -> i8 {
-        if lock_id < self.locks.len() {
-            self.lock_snapshot[lock_id]
-        } else {
-            0
-        }
-    }
-
-    /// Get the pending delta for a lock (for debugging/logging).
-    #[inline]
-    pub fn lock_pending_delta(&self, lock_id: usize) -> i8 {
-        if lock_id < self.locks.len() {
-            self.lock_deltas[lock_id]
-        } else {
-            0
-        }
+        self.effective_lock_value(lock_id)
     }
 
     // === Register Access (for NPU instruction execution) ===

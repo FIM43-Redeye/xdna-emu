@@ -522,6 +522,33 @@ impl TileArray {
     ///
     /// Returns true if any DMA engine is still active.
     /// MemTile engines receive neighbor lock access for cross-tile lock operations.
+    /// Pre-step pass: submit all DMA lock requests to tile arbiters.
+    ///
+    /// Scans all DMA engine channels and submits pending lock acquire/release
+    /// requests to the appropriate tile arbiters. Called before arbiter
+    /// resolution so that all requests are collected before round-robin
+    /// arbitration runs.
+    pub fn submit_all_dma_lock_requests(&mut self, _host_memory: &mut HostMemory) {
+        let rows = self.rows as usize;
+        let cols = self.cols as usize;
+        let tiles = &mut self.tiles;
+        let engines = &self.dma_engines;
+
+        for i in 0..tiles.len() {
+            let is_mem_tile = engines[i].tile_type.is_mem_tile();
+            if is_mem_tile {
+                let col = i / rows;
+                let (west_ref, own_ref, east_ref) = get_three_mut(
+                    tiles, i, col, rows, cols,
+                );
+                let mut neighbors = dma::NeighborLocks { west: west_ref, east: east_ref };
+                engines[i].submit_lock_requests(own_ref, &mut neighbors);
+            } else {
+                engines[i].submit_lock_requests(&mut tiles[i], &mut dma::NeighborLocks::empty());
+            }
+        }
+    }
+
     pub fn step_all_dma(&mut self, host_memory: &mut HostMemory) -> bool {
         let mut any_active = false;
         let rows = self.rows as usize;
@@ -729,31 +756,31 @@ impl TileArray {
             tile.stream_switch.begin_routing_cycle();
         }
 
-        // Phase 1: Lock Snapshot
-        // Freeze lock values so all operations in this cycle see consistent state.
+        // Phase 1: DMA Lock Request Submission
+        // Each DMA engine submits lock acquire/release requests to tile arbiters.
+        // Core lock releases from the coordinator's Phase 2 are already pending.
+        self.submit_all_dma_lock_requests(host_memory);
+
+        // Phase 2: Lock Arbiter Resolution
+        // Resolve all tile arbiters using round-robin. Applies granted requests
+        // directly to lock values. DMA channels check results in Phase 3.
         for tile in &mut self.tiles {
-            tile.begin_lock_cycle();
+            tile.resolve_lock_requests();
         }
 
-        // Phase 2: DMA Step
-        // All DMA engines transfer data to/from tile memory.
+        // Phase 3: DMA Step
+        // All DMA engines advance channel FSMs, checking arbiter results.
         // MM2S channels produce stream words, S2MM channels consume them.
         let dma_active = self.step_all_dma(host_memory);
 
-        // Phase 3: Stream Routing
+        // Phase 4: Stream Routing
         // Route all stream data through the stream switch network.
         let words_routed = self.route_streams();
 
-        // Phase 3.5: Cascade Propagation
+        // Phase 4.5: Cascade Propagation
         // Dedicated point-to-point 384-bit links between compute tiles.
         // Entirely separate from the stream switch fabric.
         self.route_cascade();
-
-        // Phase 4: Lock Commit
-        // Apply accumulated lock deltas. Changes become visible next cycle.
-        for tile in &mut self.tiles {
-            tile.end_lock_cycle();
-        }
 
         let switch_pipelines_active = self.tiles.iter()
             .any(|t| t.stream_switch.has_pipeline_data());

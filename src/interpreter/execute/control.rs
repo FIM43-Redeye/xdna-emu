@@ -225,9 +225,8 @@ impl ControlUnit {
 
                 if is_own_tile {
                     // Own-tile release: defer by 1 cycle to model hardware lock
-                    // arbiter pipeline. The delta is buffered in core_lock_deltas
-                    // and applied at end_lock_cycle(), making it visible to DMA
-                    // in the next cycle's snapshot.
+                    // arbiter pipeline. The request is submitted to the arbiter
+                    // and resolved in Phase 3, making it visible to DMA next cycle.
                     let old_value = locks[lock_id as usize].value;
                     tile.defer_core_lock_release(lock_id as usize, delta);
                     log::info!("LockRelease tile({},{}) raw={} mapped={} delta={} value={} DEFERRED (own_tile)",
@@ -612,12 +611,11 @@ mod tests {
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
-        // Release is deferred: committed value unchanged, effective includes delta
-        assert_eq!(tile.locks[3].value, 0, "Committed value unchanged (deferred)");
-        assert_eq!(tile.effective_lock_value(3), 1, "Effective value includes pending release");
-        // After end_lock_cycle, the release is committed
-        tile.end_lock_cycle();
-        assert_eq!(tile.locks[3].value, 1, "Committed after end_lock_cycle");
+        // Release is deferred: submitted to arbiter, not yet applied
+        assert_eq!(tile.locks[3].value, 0, "Not yet committed (pending in arbiter)");
+        // Resolve the arbiter to apply the deferred release
+        tile.resolve_lock_requests();
+        assert_eq!(tile.locks[3].value, 1, "Committed after arbiter resolve");
     }
 
     #[test]
@@ -696,9 +694,9 @@ mod tests {
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
-        assert_eq!(tile.effective_lock_value(3), 4, "Effective: 0 + 4 = 4");
-        tile.end_lock_cycle();
-        assert_eq!(tile.locks[3].value, 4, "Committed after end_lock_cycle");
+        assert_eq!(tile.locks[3].value, 0, "Not yet committed (pending in arbiter)");
+        tile.resolve_lock_requests();
+        assert_eq!(tile.locks[3].value, 4, "Committed after arbiter resolve");
     }
 
     #[test]
@@ -715,9 +713,9 @@ mod tests {
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
-        assert_eq!(tile.effective_lock_value(4), 8, "Effective: 5 + 3 = 8");
-        tile.end_lock_cycle();
-        assert_eq!(tile.locks[4].value, 8);
+        assert_eq!(tile.locks[4].value, 5, "Not yet committed (pending in arbiter)");
+        tile.resolve_lock_requests();
+        assert_eq!(tile.locks[4].value, 8, "5 + 3 = 8 after arbiter resolve");
     }
 
     #[test]
@@ -734,9 +732,8 @@ mod tests {
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
-        // Deferred: effective value saturates, committed unchanged
-        assert_eq!(tile.effective_lock_value(6), 63, "Effective saturates at MAX");
-        tile.end_lock_cycle();
+        assert_eq!(tile.locks[6].value, 60, "Not yet committed (pending in arbiter)");
+        tile.resolve_lock_requests();
         assert_eq!(tile.locks[6].value, 63, "Committed saturated at MAX");
         assert!(tile.locks[6].overflow, "Overflow flag set");
     }
@@ -775,46 +772,64 @@ mod tests {
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
         // Lock ID 48 maps to own-tile lock 0 (East/Internal quadrant), deferred
-        assert_eq!(tile.effective_lock_value(0), 1, "Effective: 0 + 1 = 1");
-        tile.end_lock_cycle();
-        assert_eq!(tile.locks[0].value, 1, "Committed after end_lock_cycle");
+        assert_eq!(tile.locks[0].value, 0, "Not yet committed (pending in arbiter)");
+        tile.resolve_lock_requests();
+        assert_eq!(tile.locks[0].value, 1, "Committed after arbiter resolve");
     }
 
     #[test]
-    fn test_lock_release_deferred_not_visible_to_snapshot() {
+    fn test_lock_release_deferred_not_visible_until_resolve() {
         // Verify the 1-cycle lock arbiter pipeline: a core lock release
-        // at cycle N is NOT visible to snapshot-based operations (DMA)
-        // until cycle N+1.
+        // submitted in Phase 2 is NOT visible until the arbiter resolves
+        // in Phase 3. DMA acquire requests submitted before resolve will
+        // compete with the core release through round-robin arbitration.
+        use crate::device::tile::{LockRequest, LockRequestor};
+
         let mut tile = make_tile();
         let mut ctx = make_ctx();
-        use crate::device::tile::LockResult;
 
         tile.locks[5].value = 0;
 
-        // Core releases lock 5 (deferred)
+        // Phase 2: Core releases lock 5 (submits to arbiter, not yet applied)
         let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockRelease)
             .with_source(Operand::Lock(5));
         ControlUnit::execute(&op, &mut ctx, &mut tile);
 
-        // Simulate DMA phase: snapshot sees committed value (0), not deferred (+1)
-        tile.begin_lock_cycle();
-        assert_eq!(tile.lock_snapshot_value(5), 0, "Snapshot must NOT see deferred release");
+        // Lock value is still 0 (release pending in arbiter)
+        assert_eq!(tile.locks[5].value, 0, "Release pending, not yet applied");
 
-        // DMA tries to acquire lock 5 (needs value >= 1) -- should FAIL
-        let result = tile.try_acquire_snapshot(5, 1, -1, false);
-        assert_eq!(result, LockResult::PreconditionNotMet, "DMA cannot acquire yet");
+        // Simulate DMA submitting an acquire for lock 5 (needs >= 1)
+        // This goes into the same arbiter batch as the core release
+        tile.submit_lock_request(LockRequest {
+            requestor: LockRequestor::DmaS2mm(0),
+            lock_id: 5,
+            is_acquire: true,
+            expected: 1,
+            delta: -1,
+            equal_mode: false,
+        });
 
-        // End cycle: applies both DMA deltas (none) and core deltas (+1)
-        tile.end_lock_cycle();
-        assert_eq!(tile.locks[5].value, 1, "Core release now committed");
+        // Resolve arbiter: core release (+1) and DMA acquire (needs >=1)
+        // The arbiter processes one request per lock per cycle. Since both
+        // target lock 5, only one gets granted. Core (priority 0) wins
+        // round-robin over DMA S2MM ch0 (priority 1).
+        tile.resolve_lock_requests();
 
-        // NEXT cycle: snapshot sees the committed release
-        tile.begin_lock_cycle();
-        assert_eq!(tile.lock_snapshot_value(5), 1, "Next cycle snapshot sees release");
+        // Core release was granted: lock goes 0 -> 1
+        // DMA acquire was denied (contention -- core won round-robin)
+        assert_eq!(tile.locks[5].value, 1, "Core release applied, DMA denied by contention");
 
-        // DMA can now acquire
-        let result = tile.try_acquire_snapshot(5, 1, -1, false);
-        assert_eq!(result, LockResult::Success, "DMA acquires on next cycle");
+        // Next cycle: DMA resubmits acquire, no contention this time
+        tile.submit_lock_request(LockRequest {
+            requestor: LockRequestor::DmaS2mm(0),
+            lock_id: 5,
+            is_acquire: true,
+            expected: 1,
+            delta: -1,
+            equal_mode: false,
+        });
+        tile.resolve_lock_requests();
+        assert_eq!(tile.locks[5].value, 0, "DMA acquires on next cycle");
     }
 
     #[test]

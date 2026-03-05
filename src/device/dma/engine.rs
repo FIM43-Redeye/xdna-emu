@@ -452,6 +452,127 @@ impl DmaEngine {
         ChannelType::from_channel_index(channel as usize, self.s2mm_count)
     }
 
+    /// Map a channel index to a LockRequestor for arbiter submission.
+    pub fn channel_requestor(&self, ch_idx: u8) -> crate::device::tile::LockRequestor {
+        use crate::device::tile::LockRequestor;
+        let ct = self.channel_type(ch_idx);
+        match ct {
+            ChannelType::S2MM => LockRequestor::DmaS2mm(ch_idx),
+            ChannelType::MM2S => LockRequestor::DmaMm2s(ch_idx - self.s2mm_count as u8),
+        }
+    }
+
+    /// Pre-step pass: submit all pending lock requests to tile arbiters.
+    ///
+    /// Scans channels for those needing lock operations:
+    /// - `AcquiringLock { acquired: false }` -> submit acquire request
+    /// - `ReleasingLock { cycles_remaining: 1 }` -> submit release request
+    ///
+    /// Called before arbiter resolution. After resolution, `step()` checks
+    /// arbiter results to determine which operations succeeded.
+    pub fn submit_lock_requests(&self, tile: &mut Tile, neighbors: &mut NeighborLocks<'_>) {
+        for ch_idx in 0..self.channels.len() {
+            match &self.channels[ch_idx].fsm {
+                ChannelFsm::AcquiringLock { lock_id, acquired: false, transfer, .. } => {
+                    self.submit_acquire_request(*lock_id, transfer, tile, neighbors, ch_idx as u8);
+                }
+                ChannelFsm::ReleasingLock { lock_id, release_value, cycles_remaining, .. }
+                    if *cycles_remaining <= 1 =>
+                {
+                    self.submit_release_request(*lock_id, *release_value, tile, neighbors, ch_idx as u8);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Submit an acquire request to the appropriate tile's arbiter.
+    fn submit_acquire_request(
+        &self,
+        lock_id: u8,
+        transfer: &Transfer,
+        tile: &mut Tile,
+        neighbors: &mut NeighborLocks<'_>,
+        ch_idx: u8,
+    ) {
+        use crate::device::tile::LockRequest;
+
+        let lock_target = match self.resolve_lock_id(lock_id) {
+            Some(target) => target,
+            None => return,
+        };
+
+        let (target_tile, local_id): (&mut Tile, u8) = match lock_target {
+            LockTarget::Own(id) => (tile, id),
+            LockTarget::West(id) => match neighbors.west.as_deref_mut() {
+                Some(west) => (west, id),
+                None => return,
+            },
+            LockTarget::East(id) => match neighbors.east.as_deref_mut() {
+                Some(east) => (east, id),
+                None => return,
+            },
+        };
+
+        let acquire_value = transfer.acquire_value;
+        let (expected, delta, equal_mode) = if acquire_value < 0 {
+            ((-acquire_value) as i8, acquire_value, false)
+        } else if acquire_value > 0 {
+            (acquire_value as i8, -acquire_value, true)
+        } else {
+            (1i8, -1i8, false)
+        };
+
+        target_tile.submit_lock_request(LockRequest {
+            requestor: self.channel_requestor(ch_idx),
+            lock_id: local_id as usize,
+            is_acquire: true,
+            expected,
+            delta,
+            equal_mode,
+        });
+    }
+
+    /// Submit a release request to the appropriate tile's arbiter.
+    fn submit_release_request(
+        &self,
+        lock_id: u8,
+        release_value: i8,
+        tile: &mut Tile,
+        neighbors: &mut NeighborLocks<'_>,
+        ch_idx: u8,
+    ) {
+        use crate::device::tile::LockRequest;
+
+        let lock_target = match Self::resolve_lock_id_static(
+            self.tile_type, self.col, self.row, self.num_locks, lock_id,
+        ) {
+            Some(target) => target,
+            None => return,
+        };
+
+        let (target_tile, local_id): (&mut Tile, u8) = match lock_target {
+            LockTarget::Own(id) => (tile, id),
+            LockTarget::West(id) => match neighbors.west.as_deref_mut() {
+                Some(west) => (west, id),
+                None => return,
+            },
+            LockTarget::East(id) => match neighbors.east.as_deref_mut() {
+                Some(east) => (east, id),
+                None => return,
+            },
+        };
+
+        target_tile.submit_lock_request(LockRequest {
+            requestor: self.channel_requestor(ch_idx),
+            lock_id: local_id as usize,
+            is_acquire: false,
+            expected: 0,
+            delta: release_value,
+            equal_mode: false,
+        });
+    }
+
     /// Resolve a BD lock ID to a local lock index on the own tile.
     ///
     /// MemTile DMA BDs use an 8-bit lock ID field that addresses 192 locks
@@ -863,8 +984,8 @@ impl DmaEngine {
                         }
                     }
                 } else {
-                    // Try to acquire lock
-                    if self.try_acquire_lock_fsm(lock_id, &transfer, tile, neighbors) {
+                    // Check if arbiter granted the acquire (submitted in pre-step pass)
+                    if self.check_acquire_granted(lock_id, tile, neighbors, ch_idx) {
                         ChannelFsm::AcquiringLock {
                             lock_id,
                             cycles_remaining,
@@ -1185,122 +1306,61 @@ impl DmaEngine {
         }
     }
 
-    /// Try to acquire a lock for an FSM channel (no Transfer state mutation).
+    /// Check if a lock acquire was granted by the arbiter.
     ///
-    /// Unlike the old try_acquire_lock, this doesn't call transfer.lock_acquired().
-    /// The FSM tracks acquisition state via the `acquired` flag in AcquiringLock.
-    fn try_acquire_lock_fsm(
+    /// The request was submitted in `submit_lock_requests()` before stepping.
+    /// This checks whether the arbiter granted it during resolution.
+    fn check_acquire_granted(
         &mut self,
         lock_id: u8,
-        transfer: &Transfer,
-        tile: &mut Tile,
-        neighbors: &mut NeighborLocks<'_>,
+        tile: &Tile,
+        neighbors: &NeighborLocks<'_>,
+        ch_idx: usize,
     ) -> bool {
-        use crate::device::tile::LockResult;
-
         let lock_target = match self.resolve_lock_id(lock_id) {
             Some(target) => target,
             None => return false,
         };
 
-        let (target_tile, local_id): (&mut Tile, u8) = match lock_target {
+        let (target_tile, local_id): (&Tile, u8) = match lock_target {
             LockTarget::Own(id) => (tile, id),
-            LockTarget::West(id) => match neighbors.west.as_deref_mut() {
+            LockTarget::West(id) => match neighbors.west.as_deref() {
                 Some(west) => (west, id),
                 None => return false,
             },
-            LockTarget::East(id) => match neighbors.east.as_deref_mut() {
+            LockTarget::East(id) => match neighbors.east.as_deref() {
                 Some(east) => (east, id),
                 None => return false,
             },
         };
 
-        if (local_id as usize) >= target_tile.locks.len() {
-            return false;
-        }
+        let requestor = self.channel_requestor(ch_idx as u8);
+        let granted = target_tile.lock_was_granted(requestor, local_id as usize);
 
-        let acquire_value = transfer.acquire_value;
-        let snapshot_value = target_tile.lock_snapshot_value(local_id as usize);
-
-        let (expected, delta, equal_mode) = if acquire_value < 0 {
-            ((-acquire_value) as i8, acquire_value, false)
-        } else if acquire_value > 0 {
-            (acquire_value as i8, -acquire_value, true)
-        } else {
-            (1i8, -1i8, false)
-        };
-
-        let result = target_tile.try_acquire_snapshot(local_id as usize, expected, delta, equal_mode);
-        let success = matches!(result, LockResult::Success);
-
-        log::info!("DMA try_acquire_lock tile({},{}) bd_lock={} target={:?} local_lock={} expected={} delta={} snapshot={} result={:?}",
-            self.col, self.row, lock_id, lock_target, local_id, expected, delta, snapshot_value, result);
+        log::info!("DMA check_acquire_granted tile({},{}) ch{} bd_lock={} target={:?} local_lock={} granted={}",
+            self.col, self.row, ch_idx, lock_id, lock_target, local_id, granted);
 
         if let Some(ref mut timing) = self.lock_timing {
-            timing.track_acquire(local_id as usize, success);
+            timing.track_acquire(local_id as usize, granted);
         }
 
-        success
+        granted
     }
 
-    /// Execute a lock release operation.
+    /// Execute a lock release operation (post-arbiter).
     ///
-    /// Called from the ReleasingLock FSM state when the countdown expires.
+    /// The release was already submitted to the arbiter in `submit_lock_requests()`
+    /// and resolved before `step()`. This method just logs for debugging.
+    /// The lock value was already updated by the arbiter's `resolve()`.
     fn execute_lock_release(
         &mut self,
         lock_id: u8,
         release_value: i8,
-        tile: &mut Tile,
-        neighbors: &mut NeighborLocks<'_>,
+        _tile: &mut Tile,
+        _neighbors: &mut NeighborLocks<'_>,
     ) {
-        use crate::device::tile::Lock;
-
-        let lock_target = match Self::resolve_lock_id_static(
-            self.tile_type, self.col, self.row, self.num_locks, lock_id,
-        ) {
-            Some(target) => target,
-            None => return,
-        };
-
-        let (target_tile, local_id) = match lock_target {
-            LockTarget::Own(id) => (tile as &mut Tile, id),
-            LockTarget::West(id) => match neighbors.west.as_deref_mut() {
-                Some(west) => (west, id),
-                None => {
-                    let msg = format!(
-                        "DMA tile({},{}) release lock_id={} targets west neighbor but none exists -- lock deadlock",
-                        self.col, self.row, lock_id,
-                    );
-                    log::error!("{}", msg);
-                    self.fatal_errors.push(msg);
-                    return;
-                }
-            },
-            LockTarget::East(id) => match neighbors.east.as_deref_mut() {
-                Some(east) => (east, id),
-                None => {
-                    let msg = format!(
-                        "DMA tile({},{}) release lock_id={} targets east neighbor but none exists -- lock deadlock",
-                        self.col, self.row, lock_id,
-                    );
-                    log::error!("{}", msg);
-                    self.fatal_errors.push(msg);
-                    return;
-                }
-            },
-        };
-
-        log::info!("DMA tile({},{}) releasing bd_lock={} target={:?} local_lock={} with delta {} (snapshot-based)",
-            self.col, self.row, lock_id, lock_target, local_id, release_value);
-
-        if (local_id as usize) < target_tile.locks.len() {
-            target_tile.release_snapshot(local_id as usize, release_value);
-            let current = target_tile.locks[local_id as usize].value;
-            let new_val = (current as i16 + release_value as i16)
-                .clamp(Lock::MIN_VALUE as i16, Lock::MAX_VALUE as i16) as i8;
-            log::info!("Tile lock {} pending delta {} (current={}, will be {} at cycle end)",
-                local_id, release_value, current, new_val);
-        }
+        log::info!("DMA tile({},{}) lock release bd_lock={} delta={} (applied by arbiter)",
+            self.col, self.row, lock_id, release_value);
     }
 
     /// Insert a packet header from a Transfer reference (used during BdSetup).
@@ -2858,12 +2918,12 @@ mod tests {
         engine.start_channel(2, 0).unwrap();
 
         // Step until complete (cycle-accurate timing needs more cycles)
-        // Snapshot-based lock arbitration requires begin_lock_cycle() each cycle
+        // Arbiter-based lock arbitration: submit -> resolve -> step
         let mut cycles = 0;
         while engine.channel_active(2) {
-            tile.begin_lock_cycle();  // Snapshot lock values for this cycle
+            engine.submit_lock_requests(&mut tile, &mut NeighborLocks::empty());
+            tile.resolve_lock_requests();
             engine.step(&mut tile, &mut NeighborLocks::empty(), &mut host_mem);
-            tile.end_lock_cycle();    // Apply accumulated deltas at end of cycle
             cycles += 1;
             if cycles > 500 {
                 panic!("Transfer took too long: {} cycles", cycles);
@@ -3550,11 +3610,17 @@ mod tests {
         engine.start_channel(6, 0).unwrap();
         assert!(matches!(engine.channel_state(6), ChannelState::WaitingForLock(5)));
 
-        // Snapshot locks for this cycle
-        own_tile.begin_lock_cycle();
-        west_tile.begin_lock_cycle();
+        // Submit lock requests, resolve arbiters, then step
+        {
+            let mut neighbors = NeighborLocks {
+                west: Some(&mut west_tile),
+                east: None,
+            };
+            engine.submit_lock_requests(&mut own_tile, &mut neighbors);
+        }
+        own_tile.resolve_lock_requests();
+        west_tile.resolve_lock_requests();
 
-        // Step with neighbor access -- lock should be acquired from west
         let mut neighbors = NeighborLocks {
             west: Some(&mut west_tile),
             east: None,
@@ -3587,8 +3653,15 @@ mod tests {
         engine.start_channel(6, 0).unwrap();
         assert!(matches!(engine.channel_state(6), ChannelState::WaitingForLock(138)));
 
-        own_tile.begin_lock_cycle();
-        east_tile.begin_lock_cycle();
+        {
+            let mut neighbors = NeighborLocks {
+                west: None,
+                east: Some(&mut east_tile),
+            };
+            engine.submit_lock_requests(&mut own_tile, &mut neighbors);
+        }
+        own_tile.resolve_lock_requests();
+        east_tile.resolve_lock_requests();
 
         let mut neighbors = NeighborLocks {
             west: None,
@@ -3606,8 +3679,6 @@ mod tests {
         // MemTile at col 0 has no west neighbor
         let mut engine = DmaEngine::new_mem_tile(0, 1);
         let mut own_tile = Tile::mem_tile(0, 1);
-        own_tile.begin_lock_cycle();
-
         let bd = BdConfig::simple_1d(0x100, 32)
             .with_acquire(5, 1);  // West lock -- but no west neighbor at col 0
         engine.configure_bd(0, bd).unwrap();
@@ -3646,16 +3717,21 @@ mod tests {
         // Run to completion
         let mut cycles = 0;
         while engine.channel_active(6) {
-            own_tile.begin_lock_cycle();
-            west_tile.begin_lock_cycle();
+            {
+                let mut neighbors = NeighborLocks {
+                    west: Some(&mut west_tile),
+                    east: None,
+                };
+                engine.submit_lock_requests(&mut own_tile, &mut neighbors);
+            }
+            own_tile.resolve_lock_requests();
+            west_tile.resolve_lock_requests();
             let mut neighbors = NeighborLocks {
                 west: Some(&mut west_tile),
                 east: None,
             };
             let mut host_mem = make_host_memory();
             engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
-            own_tile.end_lock_cycle();
-            west_tile.end_lock_cycle();
             cycles += 1;
             if cycles > 500 {
                 panic!("Transfer took too long: {} cycles, state={:?}", cycles, engine.channel_state(6));
