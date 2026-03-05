@@ -16,7 +16,7 @@
 # Five-phase architecture:
 #   Phase 1: Discover     -- find tests, filter, skip npu2-only
 #   Phase 2: Compile      -- parallel xclbin builds (both compilers) + test.exe
-#   Phase 3: Run hardware -- serial per (test, compiler) pair
+#   Phase 3: Run hardware -- parallel (-j5, NPU context pool)
 #   Phase 4: Run emulator -- parallel -j$(nproc) per (test, compiler) pair
 #   Phase 5: Report       -- per-compiler comparison matrix + summary
 #
@@ -586,8 +586,14 @@ compile_one() {
 export -f compile_one_compiler compile_one
 
 # ---------------------------------------------------------------------------
-# Phase 3: Hardware runs (serial)
+# Phase 3: Hardware runs (parallel, capped at NPU context limit)
 # ---------------------------------------------------------------------------
+
+# Maximum concurrent NPU hardware contexts.  NPU1 supports 6, but we
+# use 5 to leave headroom for the driver and avoid context-exhaustion
+# crashes observed at 10+ concurrent jobs.
+NPU_HW_JOBS=5
+export NPU_HW_JOBS
 
 run_one_hardware() {
   local name="$1"
@@ -1257,22 +1263,62 @@ main() {
       info "Phase 3: SKIPPED -- no NPU hardware detected"
       RUN_HW=false
     else
-      info "Phase 3: Running ${#compiled[@]} test(s) on hardware (serial, BDF=$real_bdf)"
-      local hw_done=0
+      # Build job queue: (name, compiler) pairs that compiled successfully.
+      local hw_queue=()
       for name in "${compiled[@]}"; do
         for compiler in "${compilers[@]}"; do
           local safe
           safe="$(sanitize_name "$name")"
-          # Skip if this compiler did not compile successfully.
           [[ -f "$RESULTS_DIR/${safe}.${compiler}.compile.result" ]] || continue
           [[ "$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")" == "OK" ]] || continue
-          ((hw_done++)) || true
-          run_one_hardware "$name" "$real_bdf" "$compiler"
-          local hr="SKIP"
-          [[ -f "$RESULTS_DIR/${safe}.${compiler}.hw.result" ]] && hr="$(< "$RESULTS_DIR/${safe}.${compiler}.hw.result")"
-          echo "  [${hw_done}] HW $name ($compiler): $hr"
+          hw_queue+=("$name:$compiler")
         done
       done
+
+      info "Phase 3: Running ${#hw_queue[@]} HW job(s) (-j${NPU_HW_JOBS}, BDF=$real_bdf)"
+
+      # Parallel job pool capped at NPU_HW_JOBS concurrent contexts.
+      # Uses wait -n (bash 4.3+) to detect when a slot opens.
+      declare -A hw_pids=()   # pid -> "name:compiler"
+      local hw_done=0
+      local hw_idx=0
+
+      while [[ $hw_idx -lt ${#hw_queue[@]} ]] || [[ ${#hw_pids[@]} -gt 0 ]]; do
+        # Launch jobs while slots available and queue not empty.
+        while [[ ${#hw_pids[@]} -lt $NPU_HW_JOBS ]] && [[ $hw_idx -lt ${#hw_queue[@]} ]]; do
+          local entry="${hw_queue[$hw_idx]}"
+          local hw_name="${entry%%:*}"
+          local hw_compiler="${entry##*:}"
+          ((hw_idx++)) || true
+
+          # Launch in background subshell
+          (
+            run_one_hardware "$hw_name" "$real_bdf" "$hw_compiler"
+          ) &
+          hw_pids[$!]="$entry"
+        done
+
+        # Wait for any one job to finish (if any are running).
+        if [[ ${#hw_pids[@]} -gt 0 ]]; then
+          local done_pid=0
+          wait -n -p done_pid "${!hw_pids[@]}" 2>/dev/null || true
+
+          if [[ $done_pid -ne 0 ]] && [[ -n "${hw_pids[$done_pid]+x}" ]]; then
+            local finished="${hw_pids[$done_pid]}"
+            unset 'hw_pids[$done_pid]'
+            local fin_name="${finished%%:*}"
+            local fin_compiler="${finished##*:}"
+            local fin_safe
+            fin_safe="$(sanitize_name "$fin_name")"
+            local hr="SKIP"
+            [[ -f "$RESULTS_DIR/${fin_safe}.${fin_compiler}.hw.result" ]] && \
+              hr="$(< "$RESULTS_DIR/${fin_safe}.${fin_compiler}.hw.result")"
+            ((hw_done++)) || true
+            echo "  [${hw_done}/${#hw_queue[@]}] HW $fin_name ($fin_compiler): $hr"
+          fi
+        fi
+      done
+
       info "Phase 3 done"
       echo ""
     fi
