@@ -2507,14 +2507,15 @@ def main():
     device = args.device
     source_type = detect_source_type(test_dir)
 
+    mlir_text = get_mlir_text(test_dir, source_type, device)
+
     # Plan-only mode: output JSON routing plan without injection.
+    # Runs BEFORE the quarantine check so quarantined tests can still
+    # be inspected for diagnostic purposes.
     if args.plan_only:
-        mlir_text = get_mlir_text(test_dir, source_type, device)
-        plan = plan_trace_passes(mlir_text, device_name=device)
+        plan = plan_trace_route(mlir_text)
         print(json.dumps(plan.to_dict(), indent=2))
         sys.exit(0)
-
-    mlir_text = get_mlir_text(test_dir, source_type, device)
 
     # Parse --tiles filter if provided.
     tile_filter = None
@@ -2570,55 +2571,46 @@ def main():
             )
             sys.exit(0)
 
-    # Strict feasibility analysis: parse the MLIR and check whether trace
-    # injection is safe (free shim DMA channel, no control packet conflicts).
-    plan = strict_analyze_feasibility(mlir_text)
-    trace_channel = 1  # default
+    # Pathfinder-driven feasibility analysis: evaluate all (shim_col, channel)
+    # candidates in parallel and pick the best route.
+    plan = plan_trace_route(mlir_text)
 
     if not plan.feasible:
         reason = f"infeasible: {plan.reason}"
         print(f"Skipping {test_dir.name}: {reason}", file=sys.stderr)
-        if plan.cross_column_option:
-            print(f"  Hint: {plan.cross_column_option}", file=sys.stderr)
         output_dir.mkdir(parents=True, exist_ok=True)
         manifest = {
             "test_name": test_dir.name,
             "skipped": True,
             "reason": reason,
         }
-        if plan.shim_states:
-            manifest["shim_analysis"] = {
-                str(col): {
-                    "s2mm_used": sorted(st.s2mm_used),
-                    "s2mm_total": st.s2mm_total,
-                    "has_ctrl_packets": st.has_ctrl_packets,
+        if plan.candidates:
+            manifest["candidates"] = [
+                {
+                    "shim_col": c.shim_col,
+                    "channel": c.channel,
+                    "failure_reason": c.failure_reason or "failed",
                 }
-                for col, st in plan.shim_states.items()
-            }
-        if plan.cross_column_option:
-            manifest["cross_column_hint"] = plan.cross_column_option
+                for c in plan.candidates
+            ]
         (output_dir / "manifest.json").write_text(
             json.dumps(manifest, indent=2) + "\n"
         )
         sys.exit(0)
 
-    # Planner chose a shim and channel -- use them.
-    trace_channel = plan.trace_channel
-    print(f"  Planner: shim col {plan.shim_col}, "
-          f"S2MM channel {trace_channel}", file=sys.stderr)
-    if plan.shim_states:
-        for col, st in plan.shim_states.items():
-            status = []
-            if st.s2mm_used:
-                status.append(f"S2MM ch {sorted(st.s2mm_used)} used")
-            if st.has_ctrl_packets:
-                status.append("ctrl_pkts")
-            if st.has_trace_flows:
-                status.append("has_trace")
-            if status:
-                print(f"    col {col}: {', '.join(status)}", file=sys.stderr)
-    if plan.cross_column_option:
-        print(f"    Note: {plan.cross_column_option}", file=sys.stderr)
+    # Print planner diagnostic table
+    print(f"  Planner: shim col {plan.shim_col}, S2MM channel {plan.trace_channel}",
+          file=sys.stderr)
+    if plan.candidates:
+        for c in plan.candidates:
+            status = "WINNER" if (c.shim_col == plan.shim_col
+                                  and c.channel == plan.trace_channel) else ""
+            flag = ("ok" if c.success and c.existing_flows_intact
+                    else (c.failure_reason or "failed"))
+            print(f"    col {c.shim_col} ch {c.channel}: {flag} "
+                  f"(test_cols={c.trace_connections_on_test_cols}, "
+                  f"total={c.total_trace_connections}) {status}",
+                  file=sys.stderr)
 
     # Load custom events config if provided
     events_config = None
@@ -2640,9 +2632,9 @@ def main():
     else:
         try:
             traced_mlir, manifest_partial = inject_trace(
-                mlir_text, args.trace_size, events_config,
+                mlir_text, args.trace_size, plan,
+                events_config=events_config,
                 tile_filter=tile_filter,
-                trace_channel=trace_channel,
             )
         except Exception as e:
             print(f"Error injecting trace: {e}", file=sys.stderr)
@@ -2663,12 +2655,7 @@ def main():
         test_name, test_dir, output_dir, traced_mlir, manifest_partial,
     )
     # Add planner analysis to manifest for diagnostics.
-    manifest["planner"] = {
-        "shim_col": plan.shim_col,
-        "trace_channel": trace_channel,
-    }
-    if plan.cross_column_option:
-        manifest["planner"]["cross_column_hint"] = plan.cross_column_option
+    manifest["planner"] = plan.to_dict()
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n"
     )
