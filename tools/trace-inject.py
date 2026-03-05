@@ -1559,20 +1559,23 @@ def has_existing_trace(mlir_text: str) -> bool:
 def inject_trace(
     mlir_text: str,
     trace_size: int,
+    plan: "TracePlan",
     events_config: dict | None = None,
     tile_filter: list[tuple[int, int, str]] | None = None,
-    trace_channel: int = 1,
 ) -> tuple[str, dict]:
     """Inject trace configuration into parsed MLIR and return modified text.
 
     Uses the mlir-aie Python API to:
     1. Parse the MLIR into a live Module
     2. Locate device, tile, and runtime_sequence ops
-    3. Insert packet flow routing for trace data
+    3. Insert packet flow routing for trace data (via add_trace_flows)
     4. Insert trace register configuration at sequence start
     5. Insert trace done/flush after the last DMA wait
     6. Serialize back to text
     7. Append trace buffer argument via regex on the canonical form
+
+    The ``plan`` argument is a TracePlan produced by plan_trace_route(),
+    which specifies the shim column and DMA channel to use.
 
     Returns (modified_mlir_text, manifest_partial) where manifest_partial
     contains trace metadata (tile list, ddr_id, trace_size).
@@ -1582,7 +1585,7 @@ def inject_trace(
     from aie.extras.util import find_ops  # type: ignore
     import aie.dialects.aie as aiedialect  # type: ignore
     import aie.dialects.aiex as aiexdialect  # type: ignore
-    from aie.dialects.aie import packetflow, WireBundle, get_target_model as _gtm  # type: ignore
+    from aie.dialects.aie import get_target_model as _gtm  # type: ignore
     from aie.utils.trace.events import (  # type: ignore
         PacketType,
     )
@@ -1600,107 +1603,76 @@ def inject_trace(
         gen_trace_done_aie2,
     )
 
+    # Extract routing parameters from the plan.
+    shim_col = plan.shim_col
+    trace_channel = plan.trace_channel
+
     with Context(), Location.unknown():
         module = Module.parse(mlir_text)
 
         # -- Locate key operations ------------------------------------------
 
-        # DeviceOp: the top-level aie.device container.
-        # Multi-device modules (e.g. ctrl_packet_reconfig) have @base (empty
-        # topology) and @main (full design).  We need the device that contains
-        # the runtime_sequence -- that's the one we inject into.
-        device_ops = find_ops(
-            module.operation,
-            lambda o: isinstance(o.opview, aiedialect.DeviceOp),
-        )
-        if not device_ops:
-            raise RuntimeError("No aie.device op found in MLIR")
-
-        device_op = None
-        for dop in device_ops:
-            rs = find_ops(
-                dop,
-                lambda o: isinstance(o.opview, aiedialect.RuntimeSequenceOp),
-            )
-            if rs:
-                device_op = dop.opview
-                break
-        if device_op is None:
-            # Fallback: single-device module without runtime_sequence yet
-            device_op = device_ops[0].opview
-        device_block = device_op.body_region.blocks[0]
-
-        # Scope all subsequent searches to THIS device (not the whole module)
-        # to avoid cross-region SSA references in multi-device MLIR.
+        device_op = find_device_with_sequence(module)
         search_root = device_op.operation
 
-        # TileOps: tile declarations within this device
+        tm = _gtm(device_op.operation.attributes["device"])
+
+        # -- Build explicit trace targets -----------------------------------
+        # classify_tiles() produces (col, row, trace_port) tuples: Core tiles
+        # get two entries (port 0 for Core, port 1 for Mem), others get one.
+
         tile_ops = find_ops(
             search_root,
             lambda o: isinstance(o.opview, aiedialect.TileOp),
         )
 
-        # Classify tiles: one shim as trace destination, everything else traced.
-        # Only trace tiles that are actually USED (have SSA references from
-        # other ops).  Tests like matrix_transpose declare 24 tiles but only
-        # use 2 -- tracing all of them overwhelms the router.
-        shim_tiles = []
-        tiles_to_trace = []
+        # Identify used non-shim tiles (same filter as classify_tiles)
+        used_tile_ops = []
         for t in tile_ops:
             top = t.opview
-            col = top.col.value
-            row = top.row.value
+            col, row = top.col.value, top.row.value
             if row == 0:
-                shim_tiles.append(top)
                 continue
-            # Skip tiles with no uses (declared but not connected to anything)
             if len(list(top.result.uses)) == 0:
                 continue
-            tiles_to_trace.append(top)
+            used_tile_ops.append(top)
 
-        if not shim_tiles:
-            raise RuntimeError("No shim tile (row 0) found")
-
-        # Pick the shim tile with the fewest existing connections (SSA uses)
-        # to minimize routing pressure and avoid packet ID conflicts with
-        # existing control/data flows on busy shims.
-        shim_tile = min(shim_tiles, key=lambda s: len(list(s.result.uses)))
-        if not tiles_to_trace:
+        if not used_tile_ops:
             raise RuntimeError("No used tiles to trace (all non-shim tiles are unused)")
 
-        # Duplicate core tiles so both Core (Trace port 0) and Mem module
-        # (Trace port 1) get traced.  The mlir-aie configure_packet_tracing*
-        # functions use a "first visit = Core, second visit = Mem" pattern.
-        from aie.dialects.aie import get_target_model  # type: ignore
-        tm = get_target_model(device_op.operation.attributes["device"])
-        expanded = []
-        for tile in tiles_to_trace:
-            expanded.append(tile)
-            tc, tr = tile.col.value, tile.row.value
-            if tm.is_core_tile(tc, tr):
-                expanded.append(tile)  # second entry for Mem module
-        tiles_to_trace = expanded
+        # Build explicit trace targets and parallel config list
+        trace_targets = []
+        tiles_for_config = []  # (TileOp, trace_port) for register config
+
+        for t_op in used_tile_ops:
+            col, row = t_op.col.value, t_op.row.value
+            if tm.is_core_tile(col, row):
+                trace_targets.append((col, row, 0))
+                tiles_for_config.append((t_op, 0))
+                trace_targets.append((col, row, 1))
+                tiles_for_config.append((t_op, 1))
+            elif tm.is_mem_tile(col, row):
+                trace_targets.append((col, row, 0))
+                tiles_for_config.append((t_op, 0))
 
         # Apply tile filter if provided (from --tiles CLI flag).
-        # The filter specifies (col, row, module_type) tuples.  We rebuild
-        # tiles_to_trace to match: "core" = first visit, "mem" = second visit.
+        # Filter trace_targets and tiles_for_config in parallel.
         if tile_filter is not None:
-            # Build a lookup from (col, row) to TileOp.
-            tile_op_lookup: dict[tuple[int, int], object] = {}
-            for t in tile_ops:
-                top = t.opview
-                tile_op_lookup[(top.col.value, top.row.value)] = top
-
-            filtered = []
-            for col, row, module in tile_filter:
-                top = tile_op_lookup.get((col, row))
-                if top is None:
-                    print(f"Warning: tile ({col},{row}) not found in MLIR, "
-                          f"skipping", file=sys.stderr)
-                    continue
-                filtered.append(top)
-            tiles_to_trace = filtered
-            if not tiles_to_trace:
+            # Map filter module names to trace ports
+            module_to_port = {"core": 0, "mem": 1, "memtile": 0}
+            filter_set = set()
+            for col, row, mod in tile_filter:
+                port = module_to_port.get(mod, 0)
+                filter_set.add((col, row, port))
+            filtered_targets = []
+            filtered_config = []
+            for target, config in zip(trace_targets, tiles_for_config):
+                if target in filter_set:
+                    filtered_targets.append(target)
+                    filtered_config.append(config)
+            trace_targets = filtered_targets
+            tiles_for_config = filtered_config
+            if not trace_targets:
                 raise RuntimeError("No valid tiles after applying --tiles filter")
 
         # RuntimeSequenceOp: the host instruction sequence (within this device)
@@ -1719,49 +1691,15 @@ def inject_trace(
 
         # -- Insert trace packet flows at device level ----------------------
 
-        # Scan for existing packet IDs to avoid collisions with control
-        # packet flows and other packet routing already in the MLIR.
-        used_ids = find_used_packet_ids(mlir_text)
-        num_trace = len(tiles_to_trace)
-        trace_id_start = choose_trace_id_start(used_ids, num_trace)
-        max_trace_id = trace_id_start + num_trace - 1
-        if used_ids:
-            print(f"  Existing packet IDs: {sorted(used_ids)}, "
-                  f"trace IDs: {trace_id_start}-{max_trace_id}",
-                  file=sys.stderr)
-        if max_trace_id > 31:
-            print(f"  WARNING: trace packet IDs exceed 5-bit limit "
-                  f"({max_trace_id} > 31), routing may fail",
-                  file=sys.stderr)
-
-        with InsertionPoint.at_block_terminator(device_block):
-            # Inline equivalent of configure_packet_tracing_flow() but with
-            # collision-aware packet ID assignment starting above used IDs.
-            exist_traces = []
-            for i, tile in enumerate(tiles_to_trace):
-                p_id = trace_id_start + i
-                if tile not in exist_traces:
-                    # Core module: Trace port 0
-                    packetflow(
-                        p_id, tile, WireBundle.Trace, 0,
-                        dests={"dest": shim_tile, "port": WireBundle.DMA,
-                               "channel": trace_channel},
-                        keep_pkt_header=True,
-                    )
-                    exist_traces.append(tile)
-                else:
-                    # Mem module: Trace port 1 (second visit to same tile)
-                    packetflow(
-                        p_id, tile, WireBundle.Trace, 1,
-                        dests={"dest": shim_tile, "port": WireBundle.DMA,
-                               "channel": trace_channel},
-                        keep_pkt_header=True,
-                    )
+        used_ids = find_used_packet_ids_ir(device_op)
+        trace_id_start, shim_tile = add_trace_flows(
+            device_op, shim_col, trace_channel, trace_targets, used_ids,
+        )
 
         # -- Insert trace config at sequence start --------------------------
         #
-        # Inline equivalent of configure_packet_tracing_aie2() so that the
-        # per-tile packet IDs match our collision-aware routing above.
+        # Configure each tile's trace unit with events and packet IDs that
+        # match the packet flows created by add_trace_flows() above.
 
         from aie.utils.trace.events import (  # type: ignore
             CoreEvent, MemEvent, MemTileEvent, ShimTileEvent,
@@ -1848,55 +1786,51 @@ def inject_trace(
         stop_memtile_broadcast = MemTileEvent(142 + stop_broadcast_num)
 
         with InsertionPoint.at_block_begin(seq_block):
-            exist_core_traces = []
-            for i, tile in enumerate(tiles_to_trace):
+            for i, (tile_op, trace_port) in enumerate(tiles_for_config):
                 p_id = trace_id_start + i
-                tile_tm = _gtm(tile.parent.attributes["device"])
-                tc, tr = int(tile.col), int(tile.row)
+                tc, tr = int(tile_op.col), int(tile_op.row)
 
-                if tile_tm.is_shim_noc_or_pl_tile(tc, tr):
-                    start_ev = start_user_event if tile == shim_tile else \
+                if tm.is_shim_noc_or_pl_tile(tc, tr):
+                    start_ev = start_user_event if tile_op == shim_tile else \
                         ShimTileEvent(110 + start_broadcast_num)
-                    stop_ev = stop_user_event if tile == shim_tile else \
+                    stop_ev = stop_user_event if tile_op == shim_tile else \
                         ShimTileEvent(110 + stop_broadcast_num)
                     configure_shimtile_tracing_aie2(
-                        tile=tile, start=start_ev, stop=stop_ev,
+                        tile=tile_op, start=start_ev, stop=stop_ev,
                         events=shimtile_events, enable_packet=1,
                         packet_id=p_id, packet_type=PacketType.SHIMTILE,
                     )
-                    configure_timer_ctrl_shimtile_aie2(tile, start_ev)
-                elif tile_tm.is_mem_tile(tc, tr):
+                    configure_timer_ctrl_shimtile_aie2(tile_op, start_ev)
+                elif tm.is_mem_tile(tc, tr):
                     configure_memtile_tracing_aie2(
-                        tile=tile, start=start_memtile_broadcast,
+                        tile=tile_op, start=start_memtile_broadcast,
                         stop=stop_memtile_broadcast,
                         events=memtile_events, enable_packet=1,
                         packet_id=p_id, packet_type=PacketType.MEMTILE,
                     )
                     configure_timer_ctrl_memtile_aie2(
-                        tile, start_memtile_broadcast,
+                        tile_op, start_memtile_broadcast,
                     )
-                elif tile_tm.is_core_tile(tc, tr):
-                    if tile not in exist_core_traces:
-                        configure_coretile_tracing_aie2(
-                            tile=tile, start=start_core_broadcast,
-                            stop=stop_core_broadcast,
-                            events=coretile_events, enable_packet=1,
-                            packet_id=p_id, packet_type=PacketType.CORE,
-                        )
-                        configure_timer_ctrl_coretile_aie2(
-                            tile, start_core_broadcast,
-                        )
-                        exist_core_traces.append(tile)
-                    else:
-                        configure_coremem_tracing_aie2(
-                            tile=tile, start=start_mem_broadcast,
-                            stop=stop_mem_broadcast,
-                            events=coremem_events, enable_packet=1,
-                            packet_id=p_id, packet_type=PacketType.MEM,
-                        )
-                        configure_timer_ctrl_coremem_aie2(
-                            tile, start_mem_broadcast,
-                        )
+                elif tm.is_core_tile(tc, tr) and trace_port == 0:
+                    configure_coretile_tracing_aie2(
+                        tile=tile_op, start=start_core_broadcast,
+                        stop=stop_core_broadcast,
+                        events=coretile_events, enable_packet=1,
+                        packet_id=p_id, packet_type=PacketType.CORE,
+                    )
+                    configure_timer_ctrl_coretile_aie2(
+                        tile_op, start_core_broadcast,
+                    )
+                elif tm.is_core_tile(tc, tr) and trace_port == 1:
+                    configure_coremem_tracing_aie2(
+                        tile=tile_op, start=start_mem_broadcast,
+                        stop=stop_mem_broadcast,
+                        events=coremem_events, enable_packet=1,
+                        packet_id=p_id, packet_type=PacketType.MEM,
+                    )
+                    configure_timer_ctrl_coremem_aie2(
+                        tile_op, start_mem_broadcast,
+                    )
 
             # Configure shim DMA for trace collection
             configure_shimtile_dma_aie2(
@@ -1947,7 +1881,7 @@ def inject_trace(
     # The runtime_sequence signature in canonical MLIR looks like:
     #   aie.runtime_sequence(%arg0: memref<...>, %arg1: memref<...>) {
     # We append a trace buffer argument.
-    trace_arg_name = f"%trace_buf"
+    trace_arg_name = "%trace_buf"
     trace_words = trace_size // 4
     trace_memref = f"memref<{trace_words}xi32>"
 
@@ -1960,28 +1894,26 @@ def inject_trace(
     )
 
     # Build manifest partial with per-tile type classification.
-    # tiles_to_trace may have duplicated core tiles (Core + Mem module);
-    # track which (col, row) pairs have been seen to label the second as "mem".
+    # tiles_for_config has explicit (tile_op, trace_port) pairs, so we can
+    # classify directly without the old "seen" tracking hack.
     tiles_traced = []
-    seen_core_manifest = []
-    for tile in tiles_to_trace:
-        col = tile.col.value
-        row = tile.row.value
+    for tile_op, trace_port in tiles_for_config:
+        col = int(tile_op.col)
+        row = int(tile_op.row)
         if row == 0:
             tile_type = "shim"
             events = "default_shim_8"
-        elif row == 1:
+        elif tm.is_mem_tile(col, row):
             tile_type = "memtile"
             events = "default_memtile_8"
-        elif (col, row) not in seen_core_manifest:
+        elif trace_port == 0:
             tile_type = "core"
             events = "default_core_8"
-            seen_core_manifest.append((col, row))
         else:
             tile_type = "mem"
             events = "default_mem_8"
         tiles_traced.append({
-            "col": tile.col.value,
+            "col": col,
             "row": row,
             "tile_type": tile_type,
             "events": events,
