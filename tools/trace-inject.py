@@ -492,6 +492,197 @@ def check_trace_feasibility(
     return (True, "ok")
 
 
+@dataclass
+class TracePass:
+    """One injection pass: a set of tiles routed to a specific shim."""
+    tiles: list[tuple[int, int, str]]   # (col, row, module_type)
+    shim_col: int
+    estimated_flows: int
+
+
+@dataclass
+class TracePlan:
+    """Plan for multi-pass trace injection."""
+    passes: list[TracePass]
+    total_tiles: int
+    reason: str     # "single_pass", "multi_pass: <why>", or "error: <why>"
+
+    def to_dict(self) -> dict:
+        """Serialize to JSON-friendly dict."""
+        return {
+            "total_tiles": self.total_tiles,
+            "num_passes": len(self.passes),
+            "reason": self.reason,
+            "passes": [
+                {
+                    "tiles": [
+                        {"col": c, "row": r, "module": m}
+                        for c, r, m in p.tiles
+                    ],
+                    "shim_col": p.shim_col,
+                    "estimated_flows": p.estimated_flows,
+                }
+                for p in self.passes
+            ],
+        }
+
+
+def _find_best_shim(
+    tiles: list[tuple[int, int, str]],
+    shim_cols: list[int],
+    cap: dict[tuple[int, int], SwitchboxCapacity],
+    used_ids: set[int],
+) -> int | None:
+    """Find the least-busy shim column that can route the given tiles.
+
+    Returns the shim column index, or None if no shim works.
+    """
+    for sc in shim_cols:
+        feasible, _reason = check_trace_feasibility(tiles, sc, cap, used_ids)
+        if feasible:
+            return sc
+    return None
+
+
+def _split_and_assign(
+    tiles: list[tuple[int, int, str]],
+    shim_cols: list[int],
+    cap: dict[tuple[int, int], SwitchboxCapacity],
+    used_ids: set[int],
+) -> tuple[list[TracePass], list[tuple[int, int, str]]]:
+    """Recursively split a tile group until each subgroup fits on a shim.
+
+    Returns (passes, skipped_tiles) where skipped_tiles are tiles that
+    could not be routed on any shim even individually.
+    """
+    if not tiles:
+        return [], []
+
+    # Try to fit the whole group first.
+    shim = _find_best_shim(tiles, shim_cols, cap, used_ids)
+    if shim is not None:
+        return [TracePass(tiles=tiles, shim_col=shim,
+                          estimated_flows=len(tiles))], []
+
+    # Single tile that doesn't fit -- skip it.
+    if len(tiles) == 1:
+        return [], tiles
+
+    # Split in half and recurse.
+    mid = len(tiles) // 2
+    passes_a, skip_a = _split_and_assign(tiles[:mid], shim_cols, cap, used_ids)
+    passes_b, skip_b = _split_and_assign(tiles[mid:], shim_cols, cap, used_ids)
+    return passes_a + passes_b, skip_a + skip_b
+
+
+def plan_trace_passes(
+    mlir_text: str,
+    device_name: str = "auto",
+    device_model_path: Path | None = None,
+) -> TracePlan:
+    """Partition tiles into routable trace groups (passes).
+
+    Analyzes the MLIR to find all traceable tiles, checks stream switch
+    capacity, and produces a plan that maps each group of tiles to a shim
+    column for trace collection.  When all tiles fit through one shim, the
+    plan is a single pass; otherwise it splits by module type and further
+    subdivides as needed.
+    """
+    # Resolve device.
+    if device_name == "auto":
+        device_name = auto_detect_device(mlir_text)
+
+    # Parse tile declarations from MLIR.
+    shim_cols = []
+    core_tiles = []  # (col, row)
+    mem_tiles = []   # (col, row) -- memtiles (row 1 on npu1)
+    for m in re.finditer(
+        r"aie\.tile\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)", mlir_text
+    ):
+        col, row = int(m.group(1)), int(m.group(2))
+        if row == 0:
+            if col not in shim_cols:
+                shim_cols.append(col)
+        elif row == 1:
+            # Row 1 is memtile on npu1 devices.
+            if (col, row) not in mem_tiles:
+                mem_tiles.append((col, row))
+        else:
+            if (col, row) not in core_tiles:
+                core_tiles.append((col, row))
+
+    if not shim_cols:
+        return TracePlan(passes=[], total_tiles=0,
+                         reason="error: no shim tiles found in MLIR")
+
+    # Build the full traceable tile list with module types.
+    all_tiles: list[tuple[int, int, str]] = []
+    for col, row in core_tiles:
+        all_tiles.append((col, row, "core"))
+        all_tiles.append((col, row, "mem"))
+    for col, row in mem_tiles:
+        all_tiles.append((col, row, "memtile"))
+
+    if not all_tiles:
+        return TracePlan(passes=[], total_tiles=0,
+                         reason="error: no traceable tiles found in MLIR")
+
+    total_tiles = len(all_tiles)
+
+    # Extract flows and build capacity map.
+    flows = extract_flows(mlir_text)
+    cap = build_capacity_map(flows, device_name, device_model_path)
+    used_ids = find_used_packet_ids(mlir_text)
+
+    # Sort shims by fewest existing uses (least busy first).
+    shim_use_count: dict[int, int] = {}
+    for flow in flows:
+        if flow.dst_row == 0:
+            sc = flow.dst_col
+            shim_use_count[sc] = shim_use_count.get(sc, 0) + 1
+        if flow.src_row == 0:
+            sc = flow.src_col
+            shim_use_count[sc] = shim_use_count.get(sc, 0) + 1
+    shim_cols.sort(key=lambda c: shim_use_count.get(c, 0))
+
+    # Try single pass: all tiles through one shim.
+    shim = _find_best_shim(all_tiles, shim_cols, cap, used_ids)
+    if shim is not None:
+        return TracePlan(
+            passes=[TracePass(tiles=all_tiles, shim_col=shim,
+                              estimated_flows=len(all_tiles))],
+            total_tiles=total_tiles,
+            reason="single_pass",
+        )
+
+    # Multi-pass: group by module type, then split as needed.
+    core_group = [(c, r, m) for c, r, m in all_tiles if m == "core"]
+    mem_group = [(c, r, m) for c, r, m in all_tiles if m == "mem"]
+    memtile_group = [(c, r, m) for c, r, m in all_tiles if m == "memtile"]
+
+    all_passes: list[TracePass] = []
+    all_skipped: list[tuple[int, int, str]] = []
+
+    for group in [core_group, mem_group, memtile_group]:
+        passes, skipped = _split_and_assign(group, shim_cols, cap, used_ids)
+        all_passes.extend(passes)
+        all_skipped.extend(skipped)
+
+    reason_parts = ["multi_pass"]
+    if all_skipped:
+        skip_desc = ", ".join(
+            f"({c},{r}):{m}" for c, r, m in all_skipped
+        )
+        reason_parts.append(f"skipped {len(all_skipped)} tiles: {skip_desc}")
+
+    return TracePlan(
+        passes=all_passes,
+        total_tiles=total_tiles,
+        reason=": ".join(reason_parts) if len(reason_parts) > 1
+               else reason_parts[0],
+    )
+
+
 def auto_detect_device(mlir_text: str) -> str:
     """Detect the required device target from tile column indices in MLIR.
 
@@ -562,6 +753,7 @@ def inject_trace(
     mlir_text: str,
     trace_size: int,
     events_config: dict | None = None,
+    tile_filter: list[tuple[int, int, str]] | None = None,
 ) -> tuple[str, dict]:
     """Inject trace configuration into parsed MLIR and return modified text.
 
@@ -667,6 +859,28 @@ def inject_trace(
             if tm.is_core_tile(tc, tr):
                 expanded.append(tile)  # second entry for Mem module
         tiles_to_trace = expanded
+
+        # Apply tile filter if provided (from --tiles CLI flag).
+        # The filter specifies (col, row, module_type) tuples.  We rebuild
+        # tiles_to_trace to match: "core" = first visit, "mem" = second visit.
+        if tile_filter is not None:
+            # Build a lookup from (col, row) to TileOp.
+            tile_op_lookup: dict[tuple[int, int], object] = {}
+            for t in tile_ops:
+                top = t.opview
+                tile_op_lookup[(top.col.value, top.row.value)] = top
+
+            filtered = []
+            for col, row, module in tile_filter:
+                top = tile_op_lookup.get((col, row))
+                if top is None:
+                    print(f"Warning: tile ({col},{row}) not found in MLIR, "
+                          f"skipping", file=sys.stderr)
+                    continue
+                filtered.append(top)
+            tiles_to_trace = filtered
+            if not tiles_to_trace:
+                raise RuntimeError("No valid tiles after applying --tiles filter")
 
         # RuntimeSequenceOp: the host instruction sequence (within this device)
         seq_ops = find_ops(
@@ -1490,6 +1704,18 @@ def main():
         action="store_true",
         help="Route each column's trace to its own shim DMA for higher bandwidth",
     )
+    parser.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="Output a trace routing plan as JSON without injecting",
+    )
+    parser.add_argument(
+        "--tiles",
+        type=str,
+        default=None,
+        help="Trace only specific tiles (col.row:module,...). "
+             "Example: '0.2:core,0.2:mem,0.3:core'",
+    )
     args = parser.parse_args()
 
     test_dir = args.test_dir.resolve()
@@ -1499,9 +1725,28 @@ def main():
         print(f"Error: {test_dir} is not a directory", file=sys.stderr)
         sys.exit(1)
 
-    # Detect source type and get MLIR
+    # Detect source type and resolve device
+    device = args.device
     source_type = detect_source_type(test_dir)
-    mlir_text = get_mlir_text(test_dir, source_type, args.device)
+
+    # Plan-only mode: output JSON routing plan without injection.
+    if args.plan_only:
+        mlir_text = get_mlir_text(test_dir, source_type, device)
+        plan = plan_trace_passes(mlir_text, device_name=device)
+        print(json.dumps(plan.to_dict(), indent=2))
+        sys.exit(0)
+
+    mlir_text = get_mlir_text(test_dir, source_type, device)
+
+    # Parse --tiles filter if provided.
+    tile_filter = None
+    if args.tiles:
+        tile_filter = []
+        for spec in args.tiles.split(","):
+            parts = spec.strip().split(":")
+            coord = parts[0].split(".")
+            module = parts[1] if len(parts) > 1 else "core"
+            tile_filter.append((int(coord[0]), int(coord[1]), module))
 
     # Check for already-traced MLIR
     if has_existing_trace(mlir_text):
@@ -1524,14 +1769,26 @@ def main():
         events_config = load_events_config(args.events_json)
 
     # Inject trace
-    inject_fn = inject_trace_per_column if args.per_column else inject_trace
-    try:
-        traced_mlir, manifest_partial = inject_fn(
-            mlir_text, args.trace_size, events_config,
-        )
-    except Exception as e:
-        print(f"Error injecting trace: {e}", file=sys.stderr)
-        sys.exit(1)
+    if args.per_column:
+        if tile_filter is not None:
+            print("Warning: --tiles is not supported with --per-column, "
+                  "ignoring filter", file=sys.stderr)
+        try:
+            traced_mlir, manifest_partial = inject_trace_per_column(
+                mlir_text, args.trace_size, events_config,
+            )
+        except Exception as e:
+            print(f"Error injecting trace: {e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        try:
+            traced_mlir, manifest_partial = inject_trace(
+                mlir_text, args.trace_size, events_config,
+                tile_filter=tile_filter,
+            )
+        except Exception as e:
+            print(f"Error injecting trace: {e}", file=sys.stderr)
+            sys.exit(1)
 
     # Write outputs
     output_dir.mkdir(parents=True, exist_ok=True)
