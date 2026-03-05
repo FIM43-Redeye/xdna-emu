@@ -724,12 +724,13 @@ export -f run_trace_compare
 trace_one_test() {
   local name="$1"
   local mode="$2"  # "default" or "sweep"
+  local compiler="${3:-peano}"  # defaults to peano for backward compat
   local safe
   safe="$(sanitize_name "$name")"
   local src_dir="$TEST_SRC/$name"
-  local trace_dir="$RESULTS_DIR/${safe}.trace"
-  local summary_file="$RESULTS_DIR/${safe}.trace.summary"
-  local log_file="$RESULTS_DIR/${safe}.trace.log"
+  local trace_dir="$RESULTS_DIR/${safe}.${compiler}.trace"
+  local summary_file="$RESULTS_DIR/${safe}.${compiler}.trace.summary"
+  local log_file="$RESULTS_DIR/${safe}.${compiler}.trace.log"
   local tools_dir="$EMU_ROOT/tools"
 
   mkdir -p "$trace_dir"
@@ -737,13 +738,15 @@ trace_one_test() {
 
   if [[ "$mode" == "sweep" || "$mode" == "sweep-all" ]]; then
     # Full sweep: delegate to trace-sweep.py
+    # TODO: pass compiler flags to trace-sweep.py when it supports them.
+    # For now, sweep always uses the default (peano) compiler.
     local sweep_args=("$src_dir" -o "$trace_dir/sweep")
     if [[ "$RUN_HW" != "true" ]]; then
       sweep_args+=(--no-hw)
     fi
     if ! python3 "$tools_dir/trace-sweep.py" "${sweep_args[@]}" >> "$log_file" 2>&1; then
       echo "ERROR sweep_failed" > "$summary_file"
-      echo "  TRACE $name: ERROR (sweep failed)"
+      echo "  TRACE $name ($compiler): ERROR (sweep failed)"
       return
     fi
 
@@ -753,7 +756,7 @@ trace_one_test() {
       local skip_reason
       skip_reason="$(python3 -c "import json,sys; m=json.load(open('$sweep_manifest')); print(m.get('reason','')) if m.get('skipped') else sys.exit(1)" 2>/dev/null)" && {
         echo "SKIP $skip_reason" > "$summary_file"
-        echo "  TRACE $name: SKIP ($skip_reason)"
+        echo "  TRACE $name ($compiler): SKIP ($skip_reason)"
         return
       }
     fi
@@ -765,7 +768,7 @@ trace_one_test() {
     if ! run_trace_compare --sweep "$trace_dir/sweep" \
         -o "$trace_dir/report.txt" >> "$log_file" 2>&1; then
       echo "ERROR compare_failed" > "$summary_file"
-      echo "  TRACE $name: ERROR (compare failed)"
+      echo "  TRACE $name ($compiler): ERROR (compare failed)"
       return
     fi
   else
@@ -776,32 +779,36 @@ trace_one_test() {
     if ! python3 "$tools_dir/trace-inject.py" "$src_dir" -o "$traced_dir" \
         >> "$log_file" 2>&1; then
       echo "ERROR injection_failed" > "$summary_file"
-      echo "  TRACE $name: ERROR (injection failed)"
+      echo "  TRACE $name ($compiler): ERROR (injection failed)"
       return
     fi
 
     local manifest="$traced_dir/manifest.json"
     if [[ ! -f "$manifest" ]]; then
       echo "ERROR no_manifest" > "$summary_file"
-      echo "  TRACE $name: ERROR (no manifest)"
+      echo "  TRACE $name ($compiler): ERROR (no manifest)"
       return
     fi
 
     # Check if injection was skipped (unsupported test)
     if python3 -c "import json,sys; m=json.load(open('$manifest')); sys.exit(0 if m.get('skipped') else 1)" 2>/dev/null; then
       echo "SKIP unsupported" > "$summary_file"
-      echo "  TRACE $name: SKIP (unsupported)"
+      echo "  TRACE $name ($compiler): SKIP (unsupported)"
       return
     fi
 
     # Step 2: Compile traced xclbin
+    local aiecc_compiler_flags="--no-xchesscc"
+    if [[ "$compiler" == "chess" ]]; then
+      aiecc_compiler_flags="--xchesscc --xbridge"
+    fi
     if ! ( cd "$traced_dir" && nice -n 19 aiecc.py \
         --no-aiesim --aie-generate-xclbin --aie-generate-npu-insts \
-        --no-compile-host --alloc-scheme=basic-sequential --no-xchesscc \
+        --no-compile-host --alloc-scheme=basic-sequential $aiecc_compiler_flags \
         --xclbin-name=aie.xclbin --npu-insts-name=insts.bin \
         ./aie_traced.mlir ) >> "$log_file" 2>&1; then
       echo "ERROR compile_failed" > "$summary_file"
-      echo "  TRACE $name: ERROR (compile failed)"
+      echo "  TRACE $name ($compiler): ERROR (compile failed)"
       return
     fi
 
@@ -841,12 +848,12 @@ trace_one_test() {
 
     if ! $hw_ok && [[ "$RUN_HW" == "true" ]]; then
       echo "ERROR hw_run_failed" > "$summary_file"
-      echo "  TRACE $name: ERROR (hw run failed)"
+      echo "  TRACE $name ($compiler): ERROR (hw run failed)"
       return
     fi
     if ! $emu_ok; then
       echo "ERROR emu_run_failed" > "$summary_file"
-      echo "  TRACE $name: ERROR (emu run failed)"
+      echo "  TRACE $name ($compiler): ERROR (emu run failed)"
       return
     fi
 
@@ -861,13 +868,13 @@ trace_one_test() {
           --emu "$trace_dir/emu/trace_raw.bin" \
           -o "$trace_dir/report.txt" >> "$log_file" 2>&1; then
         echo "ERROR compare_failed" > "$summary_file"
-        echo "  TRACE $name: ERROR (compare failed)"
+        echo "  TRACE $name ($compiler): ERROR (compare failed)"
         return
       fi
     else
       # EMU-only: no comparison possible, just record that trace was collected
       echo "EMU_ONLY collected" > "$summary_file"
-      echo "  TRACE $name: EMU_ONLY (trace collected, no HW to compare)"
+      echo "  TRACE $name ($compiler): EMU_ONLY (trace collected, no HW to compare)"
       return
     fi
   fi
@@ -876,7 +883,7 @@ trace_one_test() {
   local report="$trace_dir/report.txt"
   if [[ ! -f "$report" ]]; then
     echo "ERROR no_report" > "$summary_file"
-    echo "  TRACE $name: ERROR (no report)"
+    echo "  TRACE $name ($compiler): ERROR (no report)"
     return
   fi
 
@@ -897,14 +904,14 @@ trace_one_test() {
 
     if [[ "${diverged:-0}" -eq 0 ]]; then
       echo "CLEAN ${clean:-0} event types, ${pairs} pairs" > "$summary_file"
-      echo "  TRACE $name: CLEAN (${clean:-0} event types, ${pairs} pairs)"
+      echo "  TRACE $name ($compiler): CLEAN (${clean:-0} event types, ${pairs} pairs)"
     else
       echo "DIVERGE ${diverged} of $((${clean:-0}+${diverged})) event types" > "$summary_file"
-      echo "  TRACE $name: DIVERGE (${diverged} of $((${clean:-0}+${diverged})) event types)"
+      echo "  TRACE $name ($compiler): DIVERGE (${diverged} of $((${clean:-0}+${diverged})) event types)"
     fi
   else
     echo "UNKNOWN parse_error" > "$summary_file"
-    echo "  TRACE $name: UNKNOWN (could not parse report)"
+    echo "  TRACE $name ($compiler): UNKNOWN (could not parse report)"
   fi
 }
 export -f trace_one_test
@@ -945,7 +952,11 @@ print_report() {
     printf "  %-${col_width}s" "${label}/EMU"
   done
   if $has_trace; then
-    printf "  %s" "TRACE"
+    for compiler in "${compilers[@]}"; do
+      local label
+      label="$(echo "$compiler" | sed 's/./\U&/')"
+      printf "  %-20s" "${label}/TRACE"
+    done
   fi
   echo ""
 
@@ -958,7 +969,9 @@ print_report() {
     printf "  %-${col_width}s" "$(printf '%0.s-' $(seq 1 $col_width))"
   done
   if $has_trace; then
-    printf "  %s" "$(printf '%0.s-' $(seq 1 30))"
+    for _ in "${compilers[@]}"; do
+      printf "  %-20s" "$(printf '%0.s-' $(seq 1 20))"
+    done
   fi
   echo ""
 
@@ -980,7 +993,13 @@ print_report() {
     hw_skip[$compiler]=0
     hw_timeout[$compiler]=0
   done
-  local trace_clean=0 trace_diverge=0 trace_error=0 trace_skip=0
+  declare -A trace_clean trace_diverge trace_error trace_skip
+  for compiler in "${compilers[@]}"; do
+    trace_clean[$compiler]=0
+    trace_diverge[$compiler]=0
+    trace_error[$compiler]=0
+    trace_skip[$compiler]=0
+  done
 
   local has_compile_fail=false
 
@@ -1040,21 +1059,23 @@ print_report() {
       esac
     done
 
-    # Trace column (not per-compiler yet).
+    # Trace columns (per-compiler).
     if $has_trace; then
-      local trace_summary="-"
-      if [[ -f "$RESULTS_DIR/${safe}.trace.summary" ]]; then
-        trace_summary="$(< "$RESULTS_DIR/${safe}.trace.summary")"
-        case "$trace_summary" in
-          CLEAN*)   ((trace_clean++)) || true ;;
-          DIVERGE*) ((trace_diverge++)) || true ;;
-          ERROR*)   ((trace_error++)) || true ;;
-          SKIP*|EMU_ONLY*) ((trace_skip++)) || true ;;
-        esac
-      else
-        ((trace_skip++)) || true
-      fi
-      printf "  %s" "$trace_summary"
+      for compiler in "${compilers[@]}"; do
+        local trace_summary="-"
+        if [[ -f "$RESULTS_DIR/${safe}.${compiler}.trace.summary" ]]; then
+          trace_summary="$(< "$RESULTS_DIR/${safe}.${compiler}.trace.summary")"
+          case "$trace_summary" in
+            CLEAN*)   trace_clean[$compiler]=$(( ${trace_clean[$compiler]} + 1 )) ;;
+            DIVERGE*) trace_diverge[$compiler]=$(( ${trace_diverge[$compiler]} + 1 )) ;;
+            ERROR*)   trace_error[$compiler]=$(( ${trace_error[$compiler]} + 1 )) ;;
+            SKIP*|EMU_ONLY*) trace_skip[$compiler]=$(( ${trace_skip[$compiler]} + 1 )) ;;
+          esac
+        else
+          trace_skip[$compiler]=$(( ${trace_skip[$compiler]} + 1 ))
+        fi
+        printf "  %-20s" "$trace_summary"
+      done
     fi
 
     echo ""
@@ -1113,7 +1134,11 @@ print_report() {
     fi
   done
   if $has_trace; then
-    echo "Trace: $trace_clean clean, $trace_diverge diverge, $trace_error error, $trace_skip skip"
+    for compiler in "${compilers[@]}"; do
+      local label
+      label="$(echo "$compiler" | sed 's/./\U&/')"
+      echo "${label} trace: ${trace_clean[$compiler]} clean, ${trace_diverge[$compiler]} diverge, ${trace_error[$compiler]} error, ${trace_skip[$compiler]} skip"
+    done
   fi
   echo "Logs: $RESULTS_DIR/"
 }
@@ -1306,7 +1331,14 @@ main() {
       # runs need the NPU exclusively. The EMU runs within each test are
       # already parallelized.
       for name in "${trace_targets[@]}"; do
-        trace_one_test "$name" "$trace_mode_arg"
+        for compiler in "${compilers[@]}"; do
+          local safe
+          safe="$(sanitize_name "$name")"
+          # Only trace if this compiler compiled successfully
+          [[ -f "$RESULTS_DIR/${safe}.${compiler}.compile.result" ]] || continue
+          [[ "$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")" == "OK" ]] || continue
+          trace_one_test "$name" "$trace_mode_arg" "$compiler"
+        done
       done
       info "Phase 4b done"
     else
