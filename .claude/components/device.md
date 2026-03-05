@@ -69,3 +69,14 @@ Row 0 = shim (DDR interface), row 1 = mem tile (512KB), rows 2-5 = compute (64KB
 - AM020: AIE-ML Architecture Manual (DMA, locks, memory layout)
 - AM025: Register Reference (offsets, field definitions)
 - Extracted docs: `docs/xdna/` (text format, use Explore agents to navigate)
+
+## Trace Unit
+
+The trace subsystem (`src/trace/`) handles emulator event tracing:
+- `mod.rs` -- Perfetto JSON trace output, event recording
+- `store.rs` -- trace event storage
+- `compare.rs` -- binary trace comparison (HW vs EMU)
+- `vcd.rs` -- aiesimulator VCD trace parser
+
+The trace unit records DMA transfers, lock operations, core events, and
+stream switch activity. Output is Perfetto JSON viewable at ui.perfetto.dev.
