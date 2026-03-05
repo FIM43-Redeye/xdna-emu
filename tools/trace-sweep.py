@@ -402,6 +402,17 @@ def trim_trace_dir(path: Path):
         )
 
 
+def _dmesg_count(pattern: str) -> int:
+    """Count lines matching pattern in dmesg output."""
+    try:
+        result = subprocess.run(
+            ["dmesg"], capture_output=True, text=True, timeout=5,
+        )
+        return sum(1 for line in result.stdout.splitlines() if pattern in line)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return 0
+
+
 def wait_npu_idle(timeout: float = 10.0, poll_interval: float = 0.1) -> bool:
     """Wait until the NPU has no active hardware contexts.
 
@@ -443,6 +454,11 @@ def run_batch_hw(
 
     hw_dir = batch_dir / output_subdir
     print(f"  Batch {batch_idx}: running on hardware ({output_subdir})...")
+
+    # Snapshot TDR and IOMMU fault counts for post-run detection.
+    tdr_before = _dmesg_count("aie2_tdr_work")
+    iommu_before = _dmesg_count("IO_PAGE_FAULT")
+
     hw_result = subprocess.run(
         [sys.executable, str(trace_run), str(manifest), "-o", str(hw_dir)],
         capture_output=True, text=True, timeout=300,
@@ -451,7 +467,27 @@ def run_batch_hw(
     status_key = "hw_status" if output_subdir == "hw" else f"{output_subdir}_status"
     trace_key = "hw_trace" if output_subdir == "hw" else f"{output_subdir}_trace"
 
-    if hw_result.returncode != 0:
+    # Check for TDR or IOMMU faults.
+    tdr_after = _dmesg_count("aie2_tdr_work")
+    iommu_after = _dmesg_count("IO_PAGE_FAULT")
+    tdr_new = tdr_after - tdr_before
+    iommu_new = iommu_after - iommu_before
+
+    if iommu_new > 0:
+        batch_info[status_key] = "iommu_fault"
+        print(f"  Batch {batch_idx}: IOMMU FAULT ({iommu_new} page faults)")
+        (batch_dir / f"{output_subdir}-run.log").write_text(
+            hw_result.stdout + hw_result.stderr
+            + f"\nIOMMU FAULT: {iommu_new} new page faults\n"
+        )
+    elif tdr_new > 0:
+        batch_info[status_key] = "tdr"
+        print(f"  Batch {batch_idx}: TDR ({tdr_new} events)")
+        (batch_dir / f"{output_subdir}-run.log").write_text(
+            hw_result.stdout + hw_result.stderr
+            + f"\nTDR: {tdr_new} new aie2_tdr_work events\n"
+        )
+    elif hw_result.returncode != 0:
         batch_info[status_key] = "failed"
         (batch_dir / f"{output_subdir}-run.log").write_text(
             hw_result.stdout + hw_result.stderr
@@ -941,6 +977,27 @@ def _compare_serial_vs_parallel(
             errors += 1
             continue
 
+        # Reject all-zeros traces -- they indicate a failed/TDR'd run.
+        def _is_all_zeros(path: Path) -> bool:
+            with open(path, "rb") as f:
+                chunk = f.read(4096)
+                return len(chunk) > 0 and chunk == b"\x00" * len(chunk)
+
+        serial_zeros = _is_all_zeros(serial_raw)
+        parallel_zeros = _is_all_zeros(parallel_raw)
+        if serial_zeros and parallel_zeros:
+            lines.append(f"Batch {batch_idx}: EMPTY (both traces all-zeros -- TDR/fault?)")
+            errors += 1
+            continue
+        if serial_zeros:
+            lines.append(f"Batch {batch_idx}: SERIAL_EMPTY (serial trace all-zeros)")
+            diverged += 1
+            continue
+        if parallel_zeros:
+            lines.append(f"Batch {batch_idx}: PARALLEL_EMPTY (parallel trace all-zeros -- TDR?)")
+            diverged += 1
+            continue
+
         total += 1
         batch_report = batch_dir / "serial-vs-parallel.txt"
 
@@ -961,15 +1018,17 @@ def _compare_serial_vs_parallel(
             identical += 1
         elif result.returncode == 0 and batch_report.exists():
             report_text = batch_report.read_text()
-            # Check if event sequences match despite raw byte differences.
-            if "0 diverged" in report_text or "0 count mismatch" in report_text:
+            # Both "diverged" and "count mismatch" indicate real differences.
+            has_diverged = "diverged" in report_text and "0 diverged" not in report_text
+            has_count_mismatch = "COUNTS DIFFER" in report_text
+            if has_diverged or has_count_mismatch:
+                lines.append(f"Batch {batch_idx}: DIVERGED (see {batch_report})")
+                diverged += 1
+            else:
                 lines.append(
                     f"Batch {batch_idx}: TIMING_ONLY (events match, timestamps differ)"
                 )
                 identical += 1  # functionally identical
-            else:
-                lines.append(f"Batch {batch_idx}: DIVERGED (see {batch_report})")
-                diverged += 1
         else:
             lines.append(f"Batch {batch_idx}: ERROR (compare failed)")
             errors += 1
