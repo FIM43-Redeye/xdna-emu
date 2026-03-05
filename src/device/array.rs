@@ -123,6 +123,34 @@ pub struct TileArray {
     /// these and routes them through `DeviceState::ctrl_packet_write()` for
     /// full module dispatch.
     pub(crate) pending_ctrl_actions: Vec<super::tile::CtrlPacketAction>,
+
+    /// In-flight words traversing inter-tile links.
+    ///
+    /// On real AIE2 hardware, data takes ROUTE_LATENCY_PER_HOP cycles to
+    /// traverse each inter-tile link (physical wire + switch pipeline). This
+    /// buffer models that latency: words enter with a countdown timer and
+    /// are delivered to the destination slave port when the countdown reaches 0.
+    ///
+    /// Without this, data would teleport instantly between tiles, making stream
+    /// delivery ~12x faster than hardware (observed: EMU=645cy vs HW=8185cy
+    /// starvation on tile_dmas_writebd).
+    inter_tile_pipeline: Vec<InFlightWord>,
+}
+
+/// A word in flight between adjacent tiles.
+///
+/// Models the propagation delay through inter-tile stream switch links.
+/// The word was popped from the source master port and will be pushed to
+/// the destination slave port after `cycles_remaining` reaches 0.
+#[derive(Debug, Clone)]
+struct InFlightWord {
+    dst_tile_idx: usize,
+    dst_slave_idx: usize,
+    data: u32,
+    tlast: bool,
+    /// Cycles until delivery. Decremented each coordinator cycle.
+    /// Word is delivered when this reaches 0.
+    cycles_remaining: u8,
 }
 
 impl TileArray {
@@ -163,6 +191,7 @@ impl TileArray {
             arch, cols, rows, tiles, dma_engines,
             fatal_errors: Vec::new(),
             pending_ctrl_actions: Vec::new(),
+            inter_tile_pipeline: Vec::new(),
         }
     }
 
@@ -726,7 +755,8 @@ impl TileArray {
             tile.end_lock_cycle();
         }
 
-        (dma_active, words_routed > 0, words_routed)
+        let streams_active = words_routed > 0 || !self.inter_tile_pipeline.is_empty();
+        (dma_active, streams_active, words_routed)
     }
 
     /// Route cascade data between adjacent compute tiles.
@@ -819,7 +849,8 @@ impl TileArray {
     /// Data flows: DMA MM2S → slave → [route] → master → [wire] → slave → [route] → master → DMA S2MM
     ///
     /// For multi-hop paths (e.g., Shim → MemTile → Compute), data takes multiple
-    /// cycles to traverse. This is cycle-accurate to real hardware.
+    /// cycles to traverse. Inter-tile links add ROUTE_LATENCY_PER_HOP cycles per
+    /// hop, matching the AM020 stream switch pipeline specification.
     fn route_streams(&mut self) -> usize {
         let mut words_routed = 0;
 
@@ -1301,9 +1332,11 @@ impl TileArray {
     ///
     /// Returns the number of words transferred between tiles.
     fn propagate_inter_tile(&mut self) -> usize {
-        let mut words_transferred = 0;
+        // Phase 1: Advance the pipeline -- deliver words that have completed
+        // their inter-tile traversal and decrement countdown timers.
+        let words_transferred = self.advance_inter_tile_pipeline();
 
-        // We need to collect transfers first to avoid borrow issues
+        // Phase 2: Accept new words from source masters into the pipeline.
         // Each transfer: (src_col, src_row, src_master_idx, dst_col, dst_row, dst_slave_idx, data, tlast)
         let mut transfers: Vec<(u8, u8, usize, u8, u8, usize, u32, bool)> = Vec::new();
 
@@ -1484,33 +1517,77 @@ impl TileArray {
             }
         }
 
-        // Now apply all transfers (with TLAST propagation)
+        // Pop words from source masters into the inter-tile pipeline.
+        // Words will be delivered after ROUTE_LATENCY_PER_HOP cycles.
+        use super::aie2_spec::ROUTE_LATENCY_PER_HOP;
+
         for (src_col, src_row, src_master, dst_col, dst_row, dst_slave, _data, _tlast) in transfers {
             let src_idx = self.tile_index(src_col, src_row);
             let dst_idx = self.tile_index(dst_col, dst_row);
 
             // Pop from source master (with TLAST)
             if let Some((data, tlast)) = self.tiles[src_idx].stream_switch.masters[src_master].pop_with_tlast() {
-                // Push to destination slave (with TLAST)
-                if self.tiles[dst_idx].stream_switch.slaves[dst_slave].push_with_tlast(data, tlast) {
-                    words_transferred += 1;
-                    log::debug!(
-                        "InterTile: ({},{}) master[{}] -> ({},{}) slave[{}] = 0x{:08X}{}",
-                        src_col, src_row, src_master, dst_col, dst_row, dst_slave, data,
-                        if tlast { " TLAST" } else { "" }
-                    );
-                } else {
-                    let msg = format!(
-                        "InterTile: push failed ({},{}) slave[{}] full -- backpressure violation",
-                        dst_col, dst_row, dst_slave,
-                    );
-                    log::error!("{}", msg);
-                    self.fatal_errors.push(msg);
-                }
+                self.inter_tile_pipeline.push(InFlightWord {
+                    dst_tile_idx: dst_idx,
+                    dst_slave_idx: dst_slave,
+                    data,
+                    tlast,
+                    cycles_remaining: ROUTE_LATENCY_PER_HOP,
+                });
+                log::debug!(
+                    "InterTile: ({},{}) master[{}] -> pipeline({}) -> ({},{}) slave[{}] = 0x{:08X}{} delay={}cy",
+                    src_col, src_row, src_master, ROUTE_LATENCY_PER_HOP,
+                    dst_col, dst_row, dst_slave, data,
+                    if tlast { " TLAST" } else { "" },
+                    ROUTE_LATENCY_PER_HOP,
+                );
             }
         }
 
         words_transferred
+    }
+
+    /// Advance the inter-tile pipeline by one cycle.
+    ///
+    /// Called at the start of `propagate_inter_tile()`. Decrements countdown
+    /// timers and delivers words that have completed their traversal.
+    /// Returns the number of words delivered.
+    fn advance_inter_tile_pipeline(&mut self) -> usize {
+        let mut delivered = 0;
+        let mut i = 0;
+
+        while i < self.inter_tile_pipeline.len() {
+            let word = &mut self.inter_tile_pipeline[i];
+            if word.cycles_remaining > 0 {
+                word.cycles_remaining -= 1;
+            }
+
+            if word.cycles_remaining == 0 {
+                // Try to deliver to destination slave
+                let dst_idx = word.dst_tile_idx;
+                let dst_slave = word.dst_slave_idx;
+
+                if dst_slave < self.tiles[dst_idx].stream_switch.slaves.len()
+                    && self.tiles[dst_idx].stream_switch.slaves[dst_slave].can_accept()
+                {
+                    let data = word.data;
+                    let tlast = word.tlast;
+                    self.tiles[dst_idx].stream_switch.slaves[dst_slave]
+                        .push_with_tlast(data, tlast);
+                    self.inter_tile_pipeline.swap_remove(i);
+                    delivered += 1;
+                    // Don't increment i -- swap_remove moved the last element here
+                } else {
+                    // Destination can't accept -- word stays in pipeline (backpressure).
+                    // It will be retried next cycle with cycles_remaining still at 0.
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+
+        delivered
     }
     /// Count tiles by type.
     pub fn count_by_type(&self) -> (usize, usize, usize) {
@@ -1554,6 +1631,9 @@ impl TileArray {
         for engine in &mut self.dma_engines {
             engine.reset();
         }
+
+        // Clear inter-tile pipeline
+        self.inter_tile_pipeline.clear();
     }
 
     /// Zero all tile memory (slow, use only during initialization).
