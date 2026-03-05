@@ -91,6 +91,107 @@ MEM_EVENTS = [
 ]
 
 
+# MemTile events worth sweeping.  Uses SEL0/SEL1 naming (MemTileEvent enum).
+MEMTILE_EVENTS = [
+    # DMA activity
+    "DMA_S2MM_SEL0_START_TASK",
+    "DMA_S2MM_SEL1_START_TASK",
+    "DMA_MM2S_SEL0_START_TASK",
+    "DMA_MM2S_SEL1_START_TASK",
+    "DMA_S2MM_SEL0_FINISHED_BD",
+    "DMA_S2MM_SEL1_FINISHED_BD",
+    "DMA_MM2S_SEL0_FINISHED_BD",
+    "DMA_MM2S_SEL1_FINISHED_BD",
+    "DMA_S2MM_SEL0_FINISHED_TASK",
+    "DMA_S2MM_SEL1_FINISHED_TASK",
+    "DMA_MM2S_SEL0_FINISHED_TASK",
+    "DMA_MM2S_SEL1_FINISHED_TASK",
+    # DMA stalls
+    "DMA_S2MM_SEL0_STALLED_LOCK",
+    "DMA_S2MM_SEL1_STALLED_LOCK",
+    "DMA_MM2S_SEL0_STALLED_LOCK",
+    "DMA_MM2S_SEL1_STALLED_LOCK",
+    "DMA_S2MM_SEL0_STREAM_STARVATION",
+    "DMA_S2MM_SEL1_STREAM_STARVATION",
+    "DMA_MM2S_SEL0_STREAM_BACKPRESSURE",
+    "DMA_MM2S_SEL1_STREAM_BACKPRESSURE",
+]
+
+
+def _write_skip_manifest(output_dir: Path, reason: str, detail: str = ""):
+    """Write a sweep-manifest.json marking this test as skipped."""
+    manifest = {
+        "skipped": True,
+        "reason": reason,
+        "detail": detail[:500] if detail else "",
+    }
+    (output_dir / "sweep-manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n"
+    )
+
+
+def compile_kernel_objects(test_dir: Path, build_dir: Path) -> tuple[bool, str]:
+    """Compile kernel object files referenced in run.lit.
+
+    Extracts kernel compile commands (xchesscc_wrapper, clang with -c) from
+    run.lit, resolves lit-style variables, and runs them in build_dir.
+
+    Returns (success, error_detail).
+    """
+    lit_file = test_dir / "run.lit"
+    if not lit_file.exists():
+        return True, ""  # No run.lit = no kernel objects needed
+
+    # Environment for variable resolution (mirrors bridge script's apply_lit_subs)
+    peano_dir = os.environ.get("PEANO_INSTALL_DIR", "")
+    aietools_dir = os.environ.get("AIETOOLS_DIR",
+                                   str(test_dir.parent.parent.parent / "aietools"))
+    aie_runtime_lib = os.environ.get("AIE_RUNTIME_LIB", "")
+
+    commands = []
+    for line in lit_file.read_text().splitlines():
+        if "RUN:" not in line:
+            continue
+        cmd = line.split("RUN:", 1)[1].strip()
+
+        # Only kernel compile commands: xchesscc or clang/clang++ with -c producing .o
+        is_kernel_compile = False
+        if cmd.startswith("xchesscc_wrapper ") and " -c " in cmd:
+            is_kernel_compile = True
+        elif ("%cxx" in cmd or "clang" in cmd) and " -c " in cmd and ".o" in cmd:
+            # Peano kernel compile (not host test.cpp)
+            if "test.cpp" not in cmd:
+                is_kernel_compile = True
+
+        if not is_kernel_compile:
+            continue
+
+        # Resolve lit variables
+        cmd = cmd.replace("%S", str(test_dir))
+        cmd = cmd.replace("%aietools", aietools_dir)
+        cmd = cmd.replace("%aie_runtime_lib%", aie_runtime_lib)
+        if "%cxx" in cmd:
+            cxx = f"{peano_dir}/bin/clang++" if peano_dir else "clang++"
+            cmd = cmd.replace("%cxx", cxx)
+
+        commands.append(cmd)
+
+    if not commands:
+        return True, ""  # No kernel objects to compile
+
+    for cmd in commands:
+        print(f"    Kernel: {cmd.split('/')[-1] if '/' in cmd else cmd[:60]}")
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True,
+            timeout=120, cwd=str(build_dir),
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip().split("\n")[-1] if result.stderr else "unknown"
+            return False, detail
+
+    return True, ""
+
+
 def batch_events(events: list[str], batch_size: int = 7) -> list[list[str]]:
     """Split events into batches of batch_size, each prefixed with TRUE."""
     batches = []
@@ -154,6 +255,7 @@ def compile_base_trace(
     )
     if result.returncode != 0:
         print(f"    Inject failed: {result.stderr}", file=sys.stderr)
+        _write_skip_manifest(traced_dir, "inject_failed", result.stderr)
         return None, None
 
     manifest_path = traced_dir / "manifest.json"
@@ -162,7 +264,15 @@ def compile_base_trace(
         print(f"    Skipped: {manifest.get('reason', 'unknown')}")
         return None, None
 
-    # Compile once
+    # Compile kernel objects referenced in run.lit (scale.o, etc.)
+    print("  Base: compiling kernel objects...")
+    kernel_ok, kernel_err = compile_kernel_objects(test_dir, traced_dir)
+    if not kernel_ok:
+        print(f"    Kernel compile failed: {kernel_err}", file=sys.stderr)
+        _write_skip_manifest(traced_dir, "kernel_compile_failed", kernel_err)
+        return None, None
+
+    # Compile traced xclbin
     print("  Base: compiling traced xclbin (one-time)...")
     compile_result = subprocess.run(
         [
@@ -177,10 +287,17 @@ def compile_base_trace(
         cwd=str(traced_dir),
     )
     if compile_result.returncode != 0:
+        stderr = compile_result.stderr
         (output_dir / "compile.log").write_text(
-            compile_result.stdout + compile_result.stderr
+            compile_result.stdout + stderr
         )
-        print("    Compile failed (see compile.log)", file=sys.stderr)
+        # Distinguish routing conflicts from generic compile failures
+        if "pathfinder-flows" in stderr or "could not route" in stderr.lower():
+            reason = "routing_conflict"
+        else:
+            reason = "compile_failed"
+        print(f"    Compile failed: {reason} (see compile.log)", file=sys.stderr)
+        _write_skip_manifest(traced_dir, reason, stderr.strip().split("\n")[-1])
         return None, None
 
     print("  Base: compile OK")
@@ -194,6 +311,7 @@ def prepare_batch(
     base_dir: Path,
     manifest_path: Path,
     output_dir: Path,
+    memtile_batch: list[str] | None = None,
 ) -> dict:
     """Prepare one batch directory: copy+patch insts.bin, write manifest.
 
@@ -211,6 +329,8 @@ def prepare_batch(
         "core_events": core_batch,
         "mem_events": mem_batch,
     }
+    if memtile_batch is not None:
+        events_config["memtile_events"] = memtile_batch
     events_json = batch_dir / "events.json"
     events_json.write_text(json.dumps(events_config, indent=2) + "\n")
 
@@ -409,6 +529,11 @@ def main():
     core_batches = batch_events(CORE_EVENTS) if not args.mem_only else [["TRUE"] + ["NONE"] * 7]
     mem_batches = batch_events(MEM_EVENTS) if not args.core_only else [["TRUE"] + ["NONE"] * 7]
 
+    # Memtile batches are generated only if the design contains memtiles.
+    # Detection happens after base compilation (manifest has tile list),
+    # so we initialize to None here and populate after compile_base_trace.
+    memtile_batches: list[list[str]] | None = None
+
     # Pair core and mem batches. If counts differ, extend the shorter with NONEs.
     num_batches = max(len(core_batches), len(mem_batches))
     noop_batch = ["TRUE"] + ["NONE"] * 7
@@ -417,7 +542,7 @@ def main():
     while len(mem_batches) < num_batches:
         mem_batches.append(noop_batch)
 
-    print(f"  Batches:   {num_batches}")
+    print(f"  Batches:   {num_batches} (before memtile detection)")
     print()
 
     # Compile base trace once (all batches share xclbin, patch insts.bin)
@@ -425,16 +550,58 @@ def main():
         test_dir, output_dir, args.trace_size,
     )
     if base_dir is None:
+        # Check if a skip manifest was written with a specific reason
+        skip_manifest = output_dir / "base" / "sweep-manifest.json"
+        if skip_manifest.exists():
+            skip_info = json.loads(skip_manifest.read_text())
+            reason = skip_info.get("reason", "unknown")
+            # Copy to top-level sweep manifest so the bridge script can parse it
+            sweep_manifest = {
+                "test_name": test_name,
+                "skipped": True,
+                "reason": reason,
+                "detail": skip_info.get("detail", ""),
+                "num_batches": 0,
+                "batches": [],
+            }
+            (output_dir / "sweep-manifest.json").write_text(
+                json.dumps(sweep_manifest, indent=2) + "\n"
+            )
+            print(f"Sweep skipped: {reason}")
+            sys.exit(0)
         print("Failed to compile base trace. Aborting sweep.", file=sys.stderr)
         sys.exit(1)
+    print()
+
+    # Detect memtiles from manifest and generate memtile event batches
+    manifest_data = json.loads(base_manifest.read_text())
+    has_memtiles = any(
+        t.get("tile_type") == "memtile" or t.get("row") == 1
+        for t in manifest_data.get("tiles_traced", [])
+    )
+    if has_memtiles:
+        memtile_batches = batch_events(MEMTILE_EVENTS)
+        # Extend core/mem batch lists to cover memtile batches too
+        new_total = max(num_batches, len(memtile_batches))
+        while len(core_batches) < new_total:
+            core_batches.append(noop_batch)
+        while len(mem_batches) < new_total:
+            mem_batches.append(noop_batch)
+        while len(memtile_batches) < new_total:
+            memtile_batches.append(noop_batch)
+        num_batches = new_total
+        print(f"  Memtiles detected: adding {len(batch_events(MEMTILE_EVENTS))} memtile batches")
+        print(f"  Total batches: {num_batches}")
     print()
 
     # Prepare all batches (patch insts.bin, no execution yet)
     batches = []
     for i in range(num_batches):
+        mt_batch = memtile_batches[i] if memtile_batches is not None else None
         info = prepare_batch(
             i, core_batches[i], mem_batches[i],
             base_dir, base_manifest, output_dir,
+            memtile_batch=mt_batch,
         )
         batches.append(info)
     print()

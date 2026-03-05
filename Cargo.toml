@@ -71,5 +71,9 @@ hex = "0.4"                                             # Hex dump utilities for
 name = "npu-test"
 path = "src/bin/npu_test.rs"
 
+[[bin]]
+name = "trace-compare"
+path = "src/bin/trace_compare.rs"
+
 [profile.release]
 lto = true

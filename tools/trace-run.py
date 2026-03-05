@@ -27,6 +27,26 @@ DTYPE_MAP = {
 }
 
 
+def trim_trace_data(data: bytes) -> bytes:
+    """Trim raw trace buffer to real data, excluding the sentinel.
+
+    Finds the 0xFEFEFEFE sentinel followed by two zero words and returns
+    only the data before it.  Used to strip per-column buffers before
+    concatenation so sentinels don't appear as garbage in the merged trace.
+    """
+    import struct
+    word_count = len(data) // 4
+    for i in range(word_count):
+        off = i * 4
+        word = struct.unpack_from("<I", data, off)[0]
+        if word == 0xFEFEFEFE and i + 2 < word_count:
+            w1 = struct.unpack_from("<I", data, off + 4)[0]
+            w2 = struct.unpack_from("<I", data, off + 8)[0]
+            if w1 == 0 and w2 == 0:
+                return data[:off]
+    return data
+
+
 def load_manifest(manifest_path: Path) -> dict:
     """Load and validate a trace manifest JSON file."""
     with open(manifest_path) as f:
@@ -163,21 +183,36 @@ def run_on_npu(manifest_dir: Path, manifest: dict, output_dir: Path) -> bool:
 
         data_bos.append(bo)
 
-    # Allocate trace buffer
-    trace_bo = pyxrt.bo(
-        device,
-        trace_size,
-        pyxrt.bo.host_only,
-        kernel.group_id(DATA_GROUP_ID_BASE + trace_ddr_id),
-    )
-    # Zero the trace buffer so we can detect actual data
-    trace_bo.write(bytes(trace_size), 0)
-    trace_bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+    # Allocate trace buffer(s).
+    # Per-column mode: one buffer per active shim column.
+    # Single-shim mode: one buffer at trace_ddr_id.
+    per_column = manifest.get("per_column_trace")
+    trace_bos = []
+
+    if per_column:
+        for pc in per_column:
+            pc_size = pc["trace_size"]
+            pc_ddr_id = pc["ddr_id"]
+            bo = pyxrt.bo(
+                device, pc_size, pyxrt.bo.host_only,
+                kernel.group_id(DATA_GROUP_ID_BASE + pc_ddr_id),
+            )
+            bo.write(bytes(pc_size), 0)
+            bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+            trace_bos.append((pc["shim_col"], pc_size, bo))
+    else:
+        trace_bo = pyxrt.bo(
+            device, trace_size, pyxrt.bo.host_only,
+            kernel.group_id(DATA_GROUP_ID_BASE + trace_ddr_id),
+        )
+        trace_bo.write(bytes(trace_size), 0)
+        trace_bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
+        trace_bos.append((None, trace_size, trace_bo))
 
     # Run the kernel
     # The XRT kernel call convention for mlir-aie:
-    #   kernel(opcode, instr_bo, instr_len, *data_bos, trace_bo)
-    all_bos = data_bos + [trace_bo]
+    #   kernel(opcode, instr_bo, instr_len, *data_bos, *trace_bos)
+    all_bos = data_bos + [bo for _, _, bo in trace_bos]
     run = kernel(3, instr_bo, len(insts_data), *all_bos)
     run.wait()
 
@@ -198,20 +233,37 @@ def run_on_npu(manifest_dir: Path, manifest: dict, output_dir: Path) -> bool:
             out_data.tofile(str(out_path))
             print(f"  Output: {out_path} ({len(out_data)} elements)")
 
-    # Sync and save trace buffer
-    trace_bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
-    trace_raw = np.frombuffer(
-        trace_bo.read(trace_size, 0),
-        dtype=np.uint32,
-    )
+    # Sync trace buffers, trim individually, then merge into one trace_raw.bin.
+    # Trimming before concatenation is critical: each per-column buffer has its
+    # own 0xFEFEFEFE sentinel + zero padding that would corrupt the merged
+    # trace if left in place.
+    merged_trace = bytearray()
+    for shim_col, buf_size, bo in trace_bos:
+        bo.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_FROM_DEVICE)
+        raw_bytes = bo.read(buf_size, 0)
 
+        if per_column:
+            # Save individual per-column file (pre-trim, for debugging)
+            col_path = output_dir / f"trace_raw_col{shim_col}.bin"
+            col_path.write_bytes(raw_bytes)
+
+        # Trim to real data (exclude sentinel + zero padding)
+        trimmed = trim_trace_data(bytes(raw_bytes))
+        merged_trace.extend(trimmed)
+
+        col_label = f" col{shim_col}" if shim_col is not None else ""
+        words = len(trimmed) // 4
+        print(f"  Trace{col_label}: {words} words"
+              f" ({len(raw_bytes) - len(trimmed)} bytes trimmed)")
+
+    # Write merged trace
+    trace_raw = np.frombuffer(bytes(merged_trace), dtype=np.uint32)
     trace_raw_path = output_dir / "trace_raw.bin"
     trace_raw.tofile(str(trace_raw_path))
-    print(f"  Trace:  {trace_raw_path} ({len(trace_raw)} words)")
+    total_words = len(trace_raw)
+    print(f"  Merged: {trace_raw_path} ({total_words} words)")
 
-    # Check if trace buffer has any data
-    nonzero = np.count_nonzero(trace_raw)
-    if nonzero == 0:
+    if total_words == 0:
         print("  Warning: trace buffer is all zeros (no trace data captured)")
 
     # Parse trace to Perfetto JSON

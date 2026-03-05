@@ -7,6 +7,7 @@
 //! Also provides build-time generated event code tables, a GUI trace store,
 //! and VCD-to-Perfetto conversion for aiesimulator integration.
 
+pub mod compare;
 pub mod store;
 pub mod vcd;
 

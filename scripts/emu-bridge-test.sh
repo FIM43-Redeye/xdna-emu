@@ -525,6 +525,18 @@ export -f run_one_bridge
 # Phase 4b: Trace comparison
 # ---------------------------------------------------------------------------
 
+# Run trace-compare: prefer Rust binary, fall back to Python.
+# Uses the same CLI interface for both.
+run_trace_compare() {
+  local rust_bin="$EMU_ROOT/target/release/trace-compare"
+  if [[ -x "$rust_bin" ]]; then
+    "$rust_bin" "$@"
+  else
+    python3 "$EMU_ROOT/tools/trace-compare.py" "$@"
+  fi
+}
+export -f run_trace_compare
+
 # Run trace comparison for a single test.
 # Uses trace-sweep.py for sweep mode, or trace-inject + trace-run +
 # trace-compare for default (8-event) mode.
@@ -557,11 +569,22 @@ trace_one_test() {
       return
     fi
 
+    # Check if sweep was skipped (exit 0 but with skipped manifest)
+    local sweep_manifest="$trace_dir/sweep/sweep-manifest.json"
+    if [[ -f "$sweep_manifest" ]]; then
+      local skip_reason
+      skip_reason="$(python3 -c "import json,sys; m=json.load(open('$sweep_manifest')); print(m.get('reason','')) if m.get('skipped') else sys.exit(1)" 2>/dev/null)" && {
+        echo "SKIP $skip_reason" > "$summary_file"
+        echo "  TRACE $name: SKIP ($skip_reason)"
+        return
+      }
+    fi
+
     # Trim trace buffers to actual data length
     python3 "$tools_dir/trace-trim.py" --dir "$trace_dir/sweep" >> "$log_file" 2>&1 || true
 
     # Compare
-    if ! python3 "$tools_dir/trace-compare.py" --sweep "$trace_dir/sweep" \
+    if ! run_trace_compare --sweep "$trace_dir/sweep" \
         -o "$trace_dir/report.txt" >> "$log_file" 2>&1; then
       echo "ERROR compare_failed" > "$summary_file"
       echo "  TRACE $name: ERROR (compare failed)"
@@ -655,7 +678,7 @@ trace_one_test() {
     # Step 5: Compare (only if both traces exist)
     if [[ "$RUN_HW" == "true" ]] && [[ -f "$trace_dir/hw/trace_raw.bin" ]] \
         && [[ -f "$trace_dir/emu/trace_raw.bin" ]]; then
-      if ! python3 "$tools_dir/trace-compare.py" \
+      if ! run_trace_compare \
           --hw "$trace_dir/hw/trace_raw.bin" \
           --emu "$trace_dir/emu/trace_raw.bin" \
           -o "$trace_dir/report.txt" >> "$log_file" 2>&1; then
