@@ -446,12 +446,37 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
   std::vector<sub_cmd_completion> sub_cmd_completions;
 
   // Helper: extract instr_addr/instr_size from a single ERT packet.
+  // Handles all instruction-bearing opcodes used by the XDNA driver:
+  //   ERT_START_NPU (20)             -- standard NPU submission
+  //   ERT_START_DPU (18)             -- DPU with dtrace + chaining
+  //   ERT_START_NPU_PREEMPT (21)     -- NPU with save/restore
+  //   ERT_START_NPU_PREEMPT_ELF (22) -- same, ELF-based
+  //   ERT_START_CU (0)               -- legacy kernel launch
   auto parse_single_cmd = [](const ert_start_kernel_cmd* p,
                              uint64_t& addr, uint32_t& size) -> bool {
-    if (auto* npu = get_ert_npu_data(
-            const_cast<ert_start_kernel_cmd*>(p))) {
+    auto* mp = const_cast<ert_start_kernel_cmd*>(p);
+
+    if (auto* npu = get_ert_npu_data(mp)) {
       addr = npu->instruction_buffer;
       size = npu->instruction_buffer_size;
+      return true;
+    }
+    if (auto* dpu = get_ert_dpu_data(mp)) {
+      addr = dpu->instruction_buffer;
+      size = dpu->instruction_buffer_size;
+      return true;
+    }
+    if (auto* pre = get_ert_npu_preempt_data(mp)) {
+      // Preemption: we execute the main instruction buffer.
+      // Save/restore buffers are for context switching -- not
+      // relevant for emulation (single-context, no preemption).
+      addr = pre->instruction_buffer;
+      size = pre->instruction_buffer_size;
+      return true;
+    }
+    if (auto* elf = get_ert_npu_elf_data(mp)) {
+      addr = elf->instruction_buffer;
+      size = elf->instruction_buffer_size;
       return true;
     }
     if (p->opcode == ERT_START_CU) {
@@ -592,17 +617,35 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
     // reference host buffers by index (arg_idx).  The emulator's NPU
     // executor looks up host_buffers[arg_idx] to get the device address
     // to write into DMA BD registers.
+    //
+    // The regmap follows the opcode-specific header in every ERT packet
+    // type.  BO addresses are packed as 8-byte entries.  For ERT_START_CU
+    // they start at offset 0x14 from regmap; for other opcodes the regmap
+    // IS the BO argument list (offset 0x00).
     m_transport->clear_host_buffers();
 
-    if (sc.pkt && sc.pkt->opcode == ERT_START_CU) {
-      auto* regmap = reinterpret_cast<const uint8_t*>(
-          sc.pkt->data + sc.pkt->extra_cu_masks);
-      uint32_t regmap_bytes = (sc.pkt->count - sc.pkt->extra_cu_masks) * 4;
-      for (uint32_t off = 0x14; off + 8 <= regmap_bytes; off += 8) {
+    if (sc.pkt) {
+      auto* mp = const_cast<ert_start_kernel_cmd*>(sc.pkt);
+      auto* regmap_begin = get_ert_regmap_begin(mp);
+      auto* regmap_end   = get_ert_regmap_end(mp);
+      auto  regmap_bytes = static_cast<uint32_t>(
+          (regmap_end - regmap_begin) * sizeof(uint32_t));
+
+      // For ERT_START_CU, the regmap starts with opcode(4B), instr(8B),
+      // ninstr(4B), then BO addresses at offset 0x14.  For all other
+      // opcodes (START_NPU, START_DPU, etc.) the regmap IS the BO list
+      // starting at offset 0x00.
+      uint32_t bo_start = (sc.pkt->opcode == ERT_START_CU) ? 0x14 : 0x00;
+      auto* regmap = reinterpret_cast<const uint8_t*>(regmap_begin);
+
+      uint32_t arg_idx = 0;
+      for (uint32_t off = bo_start; off + 8 <= regmap_bytes; off += 8) {
         uint64_t bo_addr = 0;
         std::memcpy(&bo_addr, regmap + off, sizeof(bo_addr));
-        if (bo_addr == 0)
+        if (bo_addr == 0) {
+          arg_idx++;
           continue;
+        }
         uint64_t bo_size = 0;
         {
           const std::lock_guard<std::mutex> lock(m_bo_lock);
@@ -618,7 +661,8 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
         m_transport->add_host_buffer(bo_addr, bo_size);
         EMU_DBG("submit_cmd[%zu]: registered host buffer arg_idx=%u "
                 "addr=0x%" PRIx64 " size=%" PRIu64,
-                cmd_idx, (off - 0x14) / 8, bo_addr, bo_size);
+                cmd_idx, arg_idx, bo_addr, bo_size);
+        arg_idx++;
       }
     }
 

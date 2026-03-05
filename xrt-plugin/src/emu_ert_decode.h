@@ -19,14 +19,16 @@ namespace detail {
 inline const char* ert_opcode_name(unsigned op)
 {
     switch (op) {
-    case ERT_START_CU:      return "START_CU";
-    case ERT_CMD_CHAIN:     return "CMD_CHAIN";
-    case ERT_START_NPU:     return "START_NPU";
-    case ERT_START_DPU:     return "START_DPU";
-    case ERT_CONFIGURE:     return "CONFIGURE";
-    case ERT_SK_START:      return "SK_START";
-    case ERT_SK_CONFIG:     return "SK_CONFIG";
-    default:                return "UNKNOWN";
+    case ERT_START_CU:              return "START_CU";
+    case ERT_CONFIGURE:             return "CONFIGURE";
+    case ERT_START_DPU:             return "START_DPU";
+    case ERT_CMD_CHAIN:             return "CMD_CHAIN";
+    case ERT_START_NPU:             return "START_NPU";
+    case ERT_START_NPU_PREEMPT:     return "START_NPU_PREEMPT";
+    case ERT_START_NPU_PREEMPT_ELF: return "START_NPU_PREEMPT_ELF";
+    case ERT_SK_START:              return "SK_START";
+    case ERT_SK_CONFIG:             return "SK_CONFIG";
+    default:                        return "UNKNOWN";
     }
 }
 
@@ -47,6 +49,56 @@ inline void emu_log_ert_packet(const struct ert_start_kernel_cmd* pkt,
                     npu->instruction_buffer,
                     npu->instruction_buffer_size,
                     npu->instruction_prop_count);
+        }
+        return;
+    }
+
+    // Decode ERT_START_DPU payload.
+    if (pkt->opcode == ERT_START_DPU) {
+        auto* dpu = get_ert_dpu_data(
+            const_cast<struct ert_start_kernel_cmd*>(pkt));
+        if (dpu) {
+            EMU_DBG("  START_DPU: instr_buf=0x%" PRIx64 " instr_size=%u"
+                    " dtrace=0x%" PRIx64 " chained=%u",
+                    dpu->instruction_buffer,
+                    dpu->instruction_buffer_size,
+                    dpu->dtrace_buffer,
+                    dpu->chained);
+        }
+        return;
+    }
+
+    // Decode ERT_START_NPU_PREEMPT / ERT_START_NPU_PREEMPT_ELF payload.
+    if (pkt->opcode == ERT_START_NPU_PREEMPT ||
+        pkt->opcode == ERT_START_NPU_PREEMPT_ELF) {
+        auto* pre = get_ert_npu_preempt_data(
+            const_cast<struct ert_start_kernel_cmd*>(pkt));
+        if (!pre)
+            pre = get_ert_npu_elf_data(
+                const_cast<struct ert_start_kernel_cmd*>(pkt));
+        if (pre) {
+            EMU_DBG("  START_NPU_PREEMPT: instr_buf=0x%" PRIx64
+                    " instr_size=%u save=0x%" PRIx64 "/%u"
+                    " restore=0x%" PRIx64 "/%u prop_count=%u",
+                    pre->instruction_buffer,
+                    pre->instruction_buffer_size,
+                    pre->save_buffer, pre->save_buffer_size,
+                    pre->restore_buffer, pre->restore_buffer_size,
+                    pre->instruction_prop_count);
+        }
+        return;
+    }
+
+    // Decode ERT_CMD_CHAIN payload.
+    if (pkt->opcode == ERT_CMD_CHAIN) {
+        auto* chain = get_ert_cmd_chain_data(
+            reinterpret_cast<struct ert_packet*>(
+                const_cast<struct ert_start_kernel_cmd*>(pkt)));
+        if (chain) {
+            EMU_DBG("  CMD_CHAIN: command_count=%u submit_index=%u"
+                    " error_index=%u",
+                    chain->command_count, chain->submit_index,
+                    chain->error_index);
         }
         return;
     }
