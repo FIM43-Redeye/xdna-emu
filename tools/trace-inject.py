@@ -976,6 +976,200 @@ def extract_connections(module) -> set[tuple]:
     return connections
 
 
+# ---------------------------------------------------------------------------
+# Pathfinder-driven trace route planner
+# ---------------------------------------------------------------------------
+
+def _evaluate_candidate(
+    mlir_asm: str,
+    shim_col: int,
+    channel: int,
+    trace_targets: list[tuple[int, int, int]],
+    baseline_connections: set[tuple],
+    test_cols: set[int],
+) -> dict:
+    """Evaluate one (shim_col, channel) candidate in a subprocess.
+
+    MLIR Contexts are not thread-safe, so each candidate gets a fresh
+    Context + Module.  Returns a plain dict (not CandidateResult) for
+    pickling across the process boundary.
+    """
+    result = {
+        "shim_col": shim_col,
+        "channel": channel,
+        "success": False,
+        "existing_flows_intact": False,
+        "failure_reason": None,
+        "trace_connections_on_test_cols": 0,
+        "total_trace_connections": 0,
+    }
+    try:
+        from aie.ir import Context, Location, Module  # type: ignore
+
+        with Context(), Location.unknown():
+            module = Module.parse(mlir_asm)
+            device_op = find_device_with_sequence(module)
+            used_ids = find_used_packet_ids_ir(device_op)
+
+            add_trace_flows(
+                device_op, shim_col, channel, trace_targets, used_ids,
+            )
+
+            ok = run_pathfinder(module)
+            if not ok:
+                result["failure_reason"] = "pathfinder failed to route"
+                return result
+
+            routed = extract_connections(module)
+
+        result["success"] = True
+        result["existing_flows_intact"] = baseline_connections.issubset(routed)
+
+        # Score: count trace-specific connections (those not in baseline)
+        trace_conns = routed - baseline_connections
+        on_test = sum(1 for c in trace_conns if c[0] in test_cols)
+        result["trace_connections_on_test_cols"] = on_test
+        result["total_trace_connections"] = len(trace_conns)
+
+    except Exception as exc:
+        result["failure_reason"] = str(exc).splitlines()[0][:200]
+
+    return result
+
+
+def plan_trace_route(mlir_text: str) -> TracePlan:
+    """Plan the best (shim_col, channel) for trace collection.
+
+    Evaluates all possible candidates in parallel via subprocess workers
+    (one per shim column x channel combination).  Each worker injects trace
+    flows, runs the pathfinder, and checks that existing connections survive.
+
+    Returns a TracePlan with the winning candidate or an infeasibility reason.
+    """
+    import concurrent.futures
+
+    from aie.ir import Context, Location, Module  # type: ignore
+    from aie.dialects.aie import get_target_model as _gtm  # type: ignore
+
+    # -- Parse and extract baseline info inside a Context -----------------
+    with Context(), Location.unknown():
+        try:
+            module = Module.parse(mlir_text)
+        except Exception as e:
+            return TracePlan(
+                False,
+                f"MLIR parse error: {str(e).splitlines()[0][:120]}",
+            )
+
+        device_op = find_device_with_sequence(module)
+        tm = _gtm(device_op.operation.attributes["device"])
+        shim_cols_list, trace_targets, test_cols = classify_tiles(device_op)
+
+        if not trace_targets:
+            return TracePlan(False, "no traceable tiles found")
+
+        # Run pathfinder on the unmodified module to get baseline connections
+        ok = run_pathfinder(module)
+        if not ok:
+            return TracePlan(
+                False, "pathfinder failed on unmodified design",
+            )
+        baseline_connections = extract_connections(module)
+
+        # Serialize the ORIGINAL (pre-pathfinder) ASM for workers.
+        # We need to re-parse from the original text, so just use mlir_text.
+        # But we need an ASM string that workers can parse -- mlir_text is it.
+
+    # -- Generate candidates: all device columns x 2 channels -------------
+    # Use the full device column range (0..cols-1), not just columns with
+    # existing shim tiles, because trace can use any shim column.
+    num_cols = tm.columns()
+    candidates_params = [
+        (col, ch) for col in range(num_cols) for ch in range(2)
+    ]
+
+    # -- Evaluate in parallel via ProcessPoolExecutor ---------------------
+    raw_results: list[dict] = []
+    with concurrent.futures.ProcessPoolExecutor() as pool:
+        futures = {
+            pool.submit(
+                _evaluate_candidate,
+                mlir_text,
+                col,
+                ch,
+                trace_targets,
+                baseline_connections,
+                test_cols,
+            ): (col, ch)
+            for col, ch in candidates_params
+        }
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                raw_results.append(future.result())
+            except Exception as exc:
+                col, ch = futures[future]
+                raw_results.append({
+                    "shim_col": col,
+                    "channel": ch,
+                    "success": False,
+                    "existing_flows_intact": False,
+                    "failure_reason": f"subprocess error: {exc}",
+                    "trace_connections_on_test_cols": 0,
+                    "total_trace_connections": 0,
+                })
+
+    # -- Convert to CandidateResult objects -------------------------------
+    candidates = [
+        CandidateResult(
+            shim_col=r["shim_col"],
+            channel=r["channel"],
+            success=r["success"],
+            existing_flows_intact=r["existing_flows_intact"],
+            failure_reason=r.get("failure_reason"),
+            trace_connections_on_test_cols=r.get(
+                "trace_connections_on_test_cols", 0,
+            ),
+            total_trace_connections=r.get("total_trace_connections", 0),
+        )
+        for r in raw_results
+    ]
+
+    # -- Pick winner: viable = success AND existing_flows_intact ----------
+    viable = [
+        c for c in candidates
+        if c.success and c.existing_flows_intact
+    ]
+
+    if not viable:
+        return TracePlan(
+            False,
+            "no candidate preserves existing flows",
+            candidates=candidates,
+        )
+
+    # Tiebreak: fewer trace connections on test columns, then fewer total.
+    # Lower is better -- less routing pressure on the columns the test uses.
+    winner = min(
+        viable,
+        key=lambda c: (
+            c.trace_connections_on_test_cols,
+            c.total_trace_connections,
+        ),
+    )
+
+    return TracePlan(
+        feasible=True,
+        reason=(
+            f"shim col {winner.shim_col} ch {winner.channel}: "
+            f"{winner.total_trace_connections} trace connections "
+            f"({winner.trace_connections_on_test_cols} on test cols)"
+        ),
+        shim_col=winner.shim_col,
+        trace_channel=winner.channel,
+        candidates=candidates,
+    )
+
+
 def strict_analyze_feasibility(mlir_text: str) -> StrictTracePlan:
     """Analyze trace feasibility using mlir-aie IR parsing.
 
