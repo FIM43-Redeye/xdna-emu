@@ -380,16 +380,51 @@ pub struct LocalRoute {
     pub master_idx: u8,
     /// Is route enabled
     pub enabled: bool,
+    /// Pipeline latency for this route (cycles from slave input to master output).
+    /// Determined by source/destination port types per AM020:
+    /// - local->local: STREAM_LOCAL_TO_LOCAL_LATENCY (3)
+    /// - local->external: STREAM_LOCAL_TO_EXTERNAL_LATENCY (4)
+    /// - external->local: STREAM_LOCAL_TO_LOCAL_LATENCY (3)
+    /// - external->external: STREAM_EXTERNAL_TO_EXTERNAL_LATENCY (4)
+    pub latency: u8,
+}
+
+/// A word traversing the intra-tile switch pipeline.
+#[derive(Debug, Clone)]
+struct InSwitchWord {
+    master_idx: u8,
+    data: u32,
+    tlast: bool,
+    cycles_remaining: u8,
 }
 
 impl LocalRoute {
-    /// Create a new local route.
+    /// Create a new local route with default latency.
     pub fn new(slave_idx: u8, master_idx: u8) -> Self {
         Self {
             slave_idx,
             master_idx,
             enabled: true,
+            latency: aie2_spec::STREAM_LOCAL_TO_LOCAL_LATENCY,
         }
+    }
+
+    /// Create a route with latency determined by port types.
+    pub fn with_port_latency(slave_idx: u8, master_idx: u8, slave_type: &PortType, master_type: &PortType) -> Self {
+        let latency = match (slave_type.is_external(), master_type.is_external()) {
+            (false, false) => aie2_spec::STREAM_LOCAL_TO_LOCAL_LATENCY,
+            (false, true)  => aie2_spec::STREAM_LOCAL_TO_EXTERNAL_LATENCY,
+            (true, false)  => aie2_spec::STREAM_LOCAL_TO_LOCAL_LATENCY, // ext->local same as local->local
+            (true, true)   => aie2_spec::STREAM_EXTERNAL_TO_EXTERNAL_LATENCY,
+        };
+        Self { slave_idx, master_idx, enabled: true, latency }
+    }
+}
+
+impl PortType {
+    /// Whether this port connects to another tile (external/inter-tile).
+    pub fn is_external(&self) -> bool {
+        matches!(self, PortType::North | PortType::South | PortType::East | PortType::West)
     }
 }
 
@@ -425,6 +460,13 @@ pub struct StreamSwitch {
     /// until TLAST. Prevents packet interleaving when multiple slaves route
     /// through the same arbiter simultaneously. 8 arbiters max (3-bit field).
     arbiter_locks: [Option<usize>; 8],
+
+    /// Words traversing the intra-tile switch pipeline.
+    ///
+    /// Models the AM020 switch pipeline latency: data takes 3-4 cycles to
+    /// traverse from slave input to master output within a single tile's
+    /// stream switch. Without this, data moves slave->master in 1 cycle.
+    switch_pipeline: Vec<InSwitchWord>,
 
     /// Fatal errors accumulated during routing.
     ///
@@ -475,6 +517,7 @@ impl StreamSwitch {
             master_packet_config: vec![MasterPacketConfig::default(); num_masters],
             active_packets: vec![None; num_slaves],
             arbiter_locks: [None; 8],
+            switch_pipeline: Vec::new(),
             fatal_errors: Vec::new(),
         }
     }
@@ -509,6 +552,7 @@ impl StreamSwitch {
             master_packet_config: vec![MasterPacketConfig::default(); num_masters],
             active_packets: vec![None; num_slaves],
             arbiter_locks: [None; 8],
+            switch_pipeline: Vec::new(),
             fatal_errors: Vec::new(),
         }
     }
@@ -541,6 +585,7 @@ impl StreamSwitch {
             master_packet_config: vec![MasterPacketConfig::default(); num_masters],
             active_packets: vec![None; num_slaves],
             arbiter_locks: [None; 8],
+            switch_pipeline: Vec::new(),
             fatal_errors: Vec::new(),
         }
     }
@@ -608,9 +653,16 @@ impl StreamSwitch {
         self.slaves.iter_mut().find(|p| matches!(p.port_type, PortType::Dma(ch) if ch == channel))
     }
 
-    /// Check if any port has pending data.
+    /// Check if any port or pipeline has pending data.
     pub fn has_pending_data(&self) -> bool {
-        self.masters.iter().any(|p| p.has_data()) || self.slaves.iter().any(|p| p.has_data())
+        !self.switch_pipeline.is_empty()
+            || self.masters.iter().any(|p| p.has_data())
+            || self.slaves.iter().any(|p| p.has_data())
+    }
+
+    /// Check if the switch pipeline has in-flight words.
+    pub fn has_pipeline_data(&self) -> bool {
+        !self.switch_pipeline.is_empty()
     }
 
     /// Begin a new routing cycle for port activity tracking.
@@ -663,8 +715,10 @@ impl StreamSwitch {
             slave.enabled = true;
         }
 
-        // Add the local route (avoid duplicates)
-        let route = LocalRoute::new(slave_idx as u8, master_idx as u8);
+        // Add the local route with latency based on port types (avoid duplicates)
+        let slave_type = self.slaves.get(slave_idx).map(|p| p.port_type).unwrap_or(PortType::Core);
+        let master_type = self.masters.get(master_idx).map(|p| p.port_type).unwrap_or(PortType::Core);
+        let route = LocalRoute::with_port_latency(slave_idx as u8, master_idx as u8, &slave_type, &master_type);
         if !self.local_routes.iter().any(|r| {
             r.slave_idx == route.slave_idx && r.master_idx == route.master_idx
         }) {
@@ -694,11 +748,14 @@ impl StreamSwitch {
     pub fn step(&mut self) -> usize {
         let mut words_forwarded = 0;
 
-        // Step packet-switched routes first (they consume from slave FIFOs
+        // Phase 1: Advance pipeline -- deliver words that have completed traversal
+        words_forwarded += self.advance_switch_pipeline();
+
+        // Step packet-switched routes (they consume from slave FIFOs
         // that circuit routes should not also consume from)
         words_forwarded += self.step_packet_routes();
 
-        // Process each circuit-switched local route
+        // Phase 2: Accept new words from slaves into the pipeline
         for route in &self.local_routes {
             if !route.enabled {
                 continue;
@@ -712,26 +769,27 @@ impl StreamSwitch {
                 continue;
             }
 
-            // Check if we can forward (slave has data, master has space)
             let slave_has_data = self.slaves[slave_idx].has_data();
-            let master_can_accept = self.masters[master_idx].can_accept();
 
             // Debug: trace all routes for tiles with local routes
             if slave_has_data || self.row >= 1 {
                 let fifo_len = self.slaves[slave_idx].fifo.len();
-                log::trace!("TileSwitch({},{}): route slave[{}]->master[{}] has_data={} fifo_len={} can_accept={}",
-                    self.col, self.row, slave_idx, master_idx, slave_has_data, fifo_len, master_can_accept);
+                log::trace!("TileSwitch({},{}): route slave[{}]->master[{}] has_data={} fifo_len={}",
+                    self.col, self.row, slave_idx, master_idx, slave_has_data, fifo_len);
             }
 
-            if slave_has_data && master_can_accept {
-                // Forward one word with TLAST sideband
+            if slave_has_data {
+                // Pop from slave and enter the switch pipeline with route-specific latency
                 if let Some((data, tlast)) = self.slaves[slave_idx].pop_with_tlast() {
-                    if self.masters[master_idx].push_with_tlast(data, tlast) {
-                        words_forwarded += 1;
-                        log::debug!("TileSwitch({},{}): slave[{}] -> master[{}] data=0x{:08X}{}",
-                            self.col, self.row, slave_idx, master_idx, data,
-                            if tlast { " TLAST" } else { "" });
-                    }
+                    self.switch_pipeline.push(InSwitchWord {
+                        master_idx: master_idx as u8,
+                        data,
+                        tlast,
+                        cycles_remaining: route.latency,
+                    });
+                    log::debug!("TileSwitch({},{}): slave[{}] -> pipeline({}) -> master[{}] data=0x{:08X}{}",
+                        self.col, self.row, slave_idx, route.latency, master_idx, data,
+                        if tlast { " TLAST" } else { "" });
                 }
             }
         }
@@ -739,8 +797,45 @@ impl StreamSwitch {
         words_forwarded
     }
 
-    /// Check if any local route has data pending.
+    /// Advance the intra-tile switch pipeline by one cycle.
+    ///
+    /// Decrements countdown timers and delivers words whose traversal is complete.
+    /// Returns the number of words delivered to master ports.
+    fn advance_switch_pipeline(&mut self) -> usize {
+        let mut delivered = 0;
+        let mut i = 0;
+
+        while i < self.switch_pipeline.len() {
+            let word = &mut self.switch_pipeline[i];
+            if word.cycles_remaining > 0 {
+                word.cycles_remaining -= 1;
+            }
+
+            if word.cycles_remaining == 0 {
+                let master_idx = word.master_idx as usize;
+                if master_idx < self.masters.len() && self.masters[master_idx].can_accept() {
+                    let data = word.data;
+                    let tlast = word.tlast;
+                    self.masters[master_idx].push_with_tlast(data, tlast);
+                    self.switch_pipeline.swap_remove(i);
+                    delivered += 1;
+                } else {
+                    // Master full -- backpressure, retry next cycle
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+
+        delivered
+    }
+
+    /// Check if any local route has data pending (including in pipeline).
     pub fn has_pending_local(&self) -> bool {
+        if !self.switch_pipeline.is_empty() {
+            return true;
+        }
         for route in &self.local_routes {
             if !route.enabled {
                 continue;
@@ -1544,21 +1639,30 @@ mod tests {
     fn test_switch_step_basic() {
         let mut ss = StreamSwitch::new_compute_tile(0, 2);
 
-        // Configure route from slave 0 to master 0
+        // Configure route from slave 0 (Core) to master 0 (Core) -- local->local = 3 cycles
         ss.configure_local_route(0, 0);
+        let latency = ss.local_routes[0].latency;
+        assert_eq!(latency, 3, "Core->Core should be local->local latency");
 
         // Put data in slave port
         ss.slaves[0].push(0xDEADBEEF);
         assert!(ss.slaves[0].has_data());
         assert!(!ss.masters[0].has_data());
 
-        // Step should forward the data
+        // First step: data enters pipeline (popped from slave)
         let forwarded = ss.step();
-        assert_eq!(forwarded, 1);
+        assert_eq!(forwarded, 0, "Data in pipeline, not yet delivered");
+        assert!(!ss.slaves[0].has_data(), "Slave popped");
+        assert!(!ss.masters[0].has_data(), "Master not yet received");
 
-        // Data should now be in master port
-        assert!(!ss.slaves[0].has_data());
-        assert!(ss.masters[0].has_data());
+        // Step through pipeline: needs 'latency' more steps to deliver
+        // (countdown: latency -> latency-1 -> ... -> 1 -> 0=deliver)
+        for _ in 0..latency {
+            ss.step();
+        }
+
+        // After latency+1 total steps, data should be in master
+        assert!(ss.masters[0].has_data(), "Delivered after {} pipeline cycles", latency);
         assert_eq!(ss.masters[0].peek(), Some(0xDEADBEEF));
     }
 
@@ -1566,17 +1670,19 @@ mod tests {
     fn test_switch_step_multiple_routes() {
         let mut ss = StreamSwitch::new_compute_tile(0, 2);
 
-        // Configure two routes
+        // Configure two routes (both local->local)
         ss.configure_local_route(0, 0);
         ss.configure_local_route(1, 1);
+        let latency = ss.local_routes[0].latency;
 
         // Put data in both slave ports
         ss.slaves[0].push(0x11111111);
         ss.slaves[1].push(0x22222222);
 
-        // Step should forward both
-        let forwarded = ss.step();
-        assert_eq!(forwarded, 2);
+        // Step through pipeline: 1 accept + latency delivery
+        for _ in 0..=latency {
+            ss.step();
+        }
 
         assert_eq!(ss.masters[0].pop(), Some(0x11111111));
         assert_eq!(ss.masters[1].pop(), Some(0x22222222));
@@ -1586,6 +1692,7 @@ mod tests {
     fn test_switch_step_backpressure() {
         let mut ss = StreamSwitch::new_compute_tile(0, 2);
         ss.configure_local_route(0, 0);
+        let latency = ss.local_routes[0].latency;
 
         // Fill the master port's FIFO
         while ss.masters[0].can_accept() {
@@ -1595,12 +1702,20 @@ mod tests {
         // Put data in slave
         ss.slaves[0].push(0xDEADBEEF);
 
-        // Step should not forward (backpressure)
-        let forwarded = ss.step();
-        assert_eq!(forwarded, 0);
+        // Step through pipeline -- data should NOT be delivered (master full)
+        for _ in 0..latency + 2 {
+            ss.step();
+        }
+        assert!(!ss.slaves[0].has_data(), "Slave was popped into pipeline");
+        // Data is stuck in pipeline (backpressure at master)
+        assert!(!ss.switch_pipeline.is_empty(), "Data stuck in pipeline due to backpressure");
 
-        // Data still in slave
-        assert!(ss.slaves[0].has_data());
+        // Make room in master
+        ss.masters[0].pop();
+
+        // Next step should deliver
+        ss.step();
+        assert!(ss.switch_pipeline.is_empty(), "Delivered after backpressure cleared");
     }
 
     #[test]
@@ -1623,8 +1738,23 @@ mod tests {
         ss.slaves[0].push(0x12345678);
         assert!(ss.has_pending_local());
 
+        // After 1 step, data is in pipeline (still pending)
         ss.step();
-        assert!(!ss.has_pending_local());
+        assert!(ss.has_pending_local(), "Pipeline has in-flight data");
+
+        // Step through pipeline delivery
+        let latency = ss.local_routes[0].latency;
+        for _ in 0..latency {
+            ss.step();
+        }
+        // Data delivered to master -- master has data so has_pending_data is true
+        // but has_pending_local checks slaves and pipeline, not masters
+        // Pipeline should be empty now, and slave is empty
+        assert!(!ss.switch_pipeline.is_empty() || ss.masters[0].has_data(),
+            "Data should be delivered or in pipeline");
+        // Clear pipeline check
+        ss.masters[0].pop();
+        assert!(!ss.has_pending_local(), "Pipeline empty after delivery and drain");
     }
 
     #[test]

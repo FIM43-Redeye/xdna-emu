@@ -755,7 +755,11 @@ impl TileArray {
             tile.end_lock_cycle();
         }
 
-        let streams_active = words_routed > 0 || !self.inter_tile_pipeline.is_empty();
+        let switch_pipelines_active = self.tiles.iter()
+            .any(|t| t.stream_switch.has_pipeline_data());
+        let streams_active = words_routed > 0
+            || !self.inter_tile_pipeline.is_empty()
+            || switch_pipelines_active;
         (dma_active, streams_active, words_routed)
     }
 
