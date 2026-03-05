@@ -433,16 +433,6 @@ sandbox by default:
 3. Run `cargo test --lib` to verify everything works
 4. Read the component doc (`.claude/components/`) for the module you are working on
 
-## Session Continuity
-
-Use `/resume-skill` at the start of a session and `/checkpoint` before ending
-one. These skills manage `.claude/session-state.md` to preserve context across
-sessions.
-
-When resuming, always verify context with the user before diving into
-exploration or code changes -- stale session state from days ago is worse
-than no session state at all.
-
 ## Debugging Guidelines
 
 **Match real hardware behavior.** When debugging emulator issues, the goal is
