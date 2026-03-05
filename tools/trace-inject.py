@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -206,6 +207,97 @@ def choose_trace_id_start(used_ids: set[int], num_trace_ids: int) -> int:
         return min_dist
 
     return max(candidates, key=min_bit_distance)
+
+
+@dataclass
+class FlowInfo:
+    """A single flow (circuit or packet) extracted from MLIR."""
+    flow_type: str          # "circuit" or "packet"
+    src_col: int
+    src_row: int
+    src_bundle: str         # "DMA", "Trace", "Core", "TileControl", etc.
+    src_channel: int
+    dst_col: int
+    dst_row: int
+    dst_bundle: str
+    dst_channel: int
+    packet_id: int | None   # None for circuit flows
+
+
+def extract_flows(mlir_text: str) -> list[FlowInfo]:
+    """Extract all circuit and packet flows from MLIR text.
+
+    Parses aie.tile declarations to build a name-to-coordinate map, then
+    extracts aie.flow (circuit) and aie.packet_flow (packet) declarations.
+    Packet flows with multiple destinations produce one FlowInfo per
+    src->dst pair.
+    """
+    # Build tile name -> (col, row) map
+    tiles: dict[str, tuple[int, int]] = {}
+    for m in re.finditer(
+        r"%(\w+)\s*=\s*aie\.tile\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)", mlir_text
+    ):
+        tiles[m.group(1)] = (int(m.group(2)), int(m.group(3)))
+
+    flows: list[FlowInfo] = []
+
+    # Circuit flows: aie.flow(%tile, Bundle : chan, %tile, Bundle : chan)
+    for m in re.finditer(
+        r"aie\.flow\(\s*%(\w+)\s*,\s*(\w+)\s*:\s*(\d+)\s*,"
+        r"\s*%(\w+)\s*,\s*(\w+)\s*:\s*(\d+)\s*\)",
+        mlir_text,
+    ):
+        src_name, src_bundle, src_chan = m.group(1), m.group(2), int(m.group(3))
+        dst_name, dst_bundle, dst_chan = m.group(4), m.group(5), int(m.group(6))
+        src_col, src_row = tiles.get(src_name, (0, 0))
+        dst_col, dst_row = tiles.get(dst_name, (0, 0))
+        flows.append(FlowInfo(
+            flow_type="circuit",
+            src_col=src_col, src_row=src_row,
+            src_bundle=src_bundle, src_channel=src_chan,
+            dst_col=dst_col, dst_row=dst_row,
+            dst_bundle=dst_bundle, dst_channel=dst_chan,
+            packet_id=None,
+        ))
+
+    # Packet flows: aie.packet_flow(ID) { source... dest... dest... }
+    for m in re.finditer(
+        r"aie\.packet_flow\s*\(\s*(0x[0-9a-fA-F]+|\d+)\s*\)\s*\{([^}]*)\}",
+        mlir_text,
+    ):
+        pkt_id = int(m.group(1), 0)
+        body = m.group(2)
+
+        src_m = re.search(
+            r"aie\.packet_source\s*<\s*%(\w+)\s*,\s*(\w+)\s*:\s*(\d+)\s*>",
+            body,
+        )
+        if not src_m:
+            continue
+        src_name = src_m.group(1)
+        src_bundle = src_m.group(2)
+        src_chan = int(src_m.group(3))
+        src_col, src_row = tiles.get(src_name, (0, 0))
+
+        # One FlowInfo per destination
+        for dst_m in re.finditer(
+            r"aie\.packet_dest\s*<\s*%(\w+)\s*,\s*(\w+)\s*:\s*(\d+)\s*>",
+            body,
+        ):
+            dst_name = dst_m.group(1)
+            dst_bundle = dst_m.group(2)
+            dst_chan = int(dst_m.group(3))
+            dst_col, dst_row = tiles.get(dst_name, (0, 0))
+            flows.append(FlowInfo(
+                flow_type="packet",
+                src_col=src_col, src_row=src_row,
+                src_bundle=src_bundle, src_channel=src_chan,
+                dst_col=dst_col, dst_row=dst_row,
+                dst_bundle=dst_bundle, dst_channel=dst_chan,
+                packet_id=pkt_id,
+            ))
+
+    return flows
 
 
 def auto_detect_device(mlir_text: str) -> str:
