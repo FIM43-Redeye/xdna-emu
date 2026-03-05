@@ -683,6 +683,355 @@ def plan_trace_passes(
     )
 
 
+# ---------------------------------------------------------------------------
+# Strict planner -- uses mlir-aie Module.parse for accurate analysis
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ShimChannelState:
+    """DMA channel usage for one shim tile."""
+    col: int
+    s2mm_used: set  # set of int channel indices consumed by existing flows
+    s2mm_total: int
+    has_ctrl_packets: bool  # TileControl flows touch this shim
+    has_trace_flows: bool   # existing Trace flows already route here
+
+    @property
+    def free_s2mm(self) -> list[int]:
+        """S2MM channel indices available for trace."""
+        return [ch for ch in range(self.s2mm_total) if ch not in self.s2mm_used]
+
+
+@dataclass
+class StrictTracePlan:
+    """Result of strict feasibility analysis."""
+    feasible: bool
+    reason: str
+    shim_col: int | None = None
+    trace_channel: int | None = None  # S2MM channel to use for trace
+    tiles_to_trace: list | None = None  # (col, row, module) tuples
+    shim_states: dict | None = None  # col -> ShimChannelState
+    cross_column_option: str | None = None  # hint for future routing
+
+
+def strict_analyze_feasibility(mlir_text: str) -> StrictTracePlan:
+    """Analyze trace feasibility using mlir-aie IR parsing.
+
+    Parses the MLIR into a live module and inspects all FlowOp and
+    PacketFlowOp operations to determine:
+    1. Which shim DMA S2MM channels are already consumed
+    2. Whether control packet flows create routing hazards
+    3. Which shim + channel combination is safe for trace
+
+    Returns a StrictTracePlan with the recommended shim column, channel,
+    and tiles to trace, or a clear infeasibility reason.
+    """
+    from aie.ir import Context, Location, Module  # type: ignore
+    from aie.extras.util import find_ops  # type: ignore
+    import aie.dialects.aie as aiedialect  # type: ignore
+    from aie.dialects.aie import (  # type: ignore
+        get_target_model as _gtm,
+        WireBundle,
+    )
+
+    with Context(), Location.unknown():
+        try:
+            module = Module.parse(mlir_text)
+        except Exception as e:
+            return StrictTracePlan(
+                False,
+                f"MLIR parse error: {str(e).splitlines()[0][:120]}",
+            )
+
+        # Find the device op that contains a runtime_sequence (same logic
+        # as inject_trace).
+        device_ops = find_ops(
+            module.operation,
+            lambda o: isinstance(o.opview, aiedialect.DeviceOp),
+        )
+        if not device_ops:
+            return StrictTracePlan(False, "no aie.device op found")
+
+        device_op = None
+        for dop in device_ops:
+            rs = find_ops(
+                dop,
+                lambda o: isinstance(o.opview, aiedialect.RuntimeSequenceOp),
+            )
+            if rs:
+                device_op = dop.opview
+                break
+        if device_op is None:
+            device_op = device_ops[0].opview
+
+        search_root = device_op.operation
+        tm = _gtm(device_op.operation.attributes["device"])
+
+        # -- Classify tiles ------------------------------------------------
+
+        tile_ops = find_ops(
+            search_root,
+            lambda o: isinstance(o.opview, aiedialect.TileOp),
+        )
+
+        shim_cols: list[int] = []
+        traceable_tiles: list[tuple[int, int, str]] = []
+
+        for t in tile_ops:
+            top = t.opview
+            col, row = top.col.value, top.row.value
+            if row == 0:
+                if col not in shim_cols:
+                    shim_cols.append(col)
+            elif len(list(top.result.uses)) > 0:
+                # Used tile -- traceable
+                if tm.is_core_tile(col, row):
+                    traceable_tiles.append((col, row, "core"))
+                    traceable_tiles.append((col, row, "mem"))
+                elif tm.is_mem_tile(col, row):
+                    traceable_tiles.append((col, row, "memtile"))
+
+        if not shim_cols:
+            return StrictTracePlan(False, "no shim tiles in MLIR")
+        if not traceable_tiles:
+            return StrictTracePlan(False, "no used tiles to trace")
+
+        # -- Audit shim DMA channels and control packet flows ---------------
+
+        # Initialize per-shim state.  S2MM total comes from the device
+        # model: shim mux DMA master ports = S2MM channels.
+        shim_states: dict[int, ShimChannelState] = {}
+        for col in shim_cols:
+            s2mm_total = tm.get_num_dest_shim_mux_connections(
+                col, 0, WireBundle.DMA,
+            )
+            shim_states[col] = ShimChannelState(
+                col=col,
+                s2mm_used=set(),
+                s2mm_total=s2mm_total,
+                has_ctrl_packets=False,
+                has_trace_flows=False,
+            )
+
+        # Scan circuit flows (FlowOp).
+        flow_ops = find_ops(
+            search_root,
+            lambda o: isinstance(o.opview, aiedialect.FlowOp),
+        )
+        for fop in flow_ops:
+            f = fop.opview
+            dst_col = f.dest.owner.opview.col.value
+            dst_row = f.dest.owner.opview.row.value
+            dst_bundle = int(f.dest_bundle)
+            dst_channel = int(f.dest_channel)
+
+            if dst_row == 0 and dst_bundle == int(WireBundle.DMA):
+                if dst_col in shim_states:
+                    shim_states[dst_col].s2mm_used.add(dst_channel)
+
+        # Scan packet flows (PacketFlowOp).
+        pkt_flow_ops = find_ops(
+            search_root,
+            lambda o: isinstance(o.opview, aiedialect.PacketFlowOp),
+        )
+        for pfop in pkt_flow_ops:
+            pf = pfop.opview
+            ports_block = pf.ports.blocks[0]
+
+            has_tile_control_src = False
+            has_trace_src = False
+
+            for op in ports_block:
+                ov = op.opview
+                if isinstance(ov, aiedialect.PacketSourceOp):
+                    src_bundle = int(ov.bundle)
+                    if src_bundle == int(WireBundle.TileControl):
+                        has_tile_control_src = True
+                    if src_bundle == int(WireBundle.Trace):
+                        has_trace_src = True
+
+                elif isinstance(ov, aiedialect.PacketDestOp):
+                    dst_col = ov.tile.owner.opview.col.value
+                    dst_row = ov.tile.owner.opview.row.value
+                    dst_bundle = int(ov.bundle)
+                    dst_channel = int(ov.channel)
+
+                    if dst_row == 0 and dst_bundle == int(WireBundle.DMA):
+                        if dst_col in shim_states:
+                            shim_states[dst_col].s2mm_used.add(dst_channel)
+
+                    # Track which shims have ctrl or trace flows.
+                    if dst_row == 0 and dst_col in shim_states:
+                        if has_tile_control_src:
+                            shim_states[dst_col].has_ctrl_packets = True
+                        if has_trace_src:
+                            shim_states[dst_col].has_trace_flows = True
+
+        # -- Check packet rule density at intermediate tiles -----------------
+        #
+        # Each packet flow from (src_col, src_row) to (dst_col, dst_row)
+        # transits through intermediate switchboxes.  At each intermediate
+        # tile, the packet needs a rule slot on the North slave port (if
+        # coming from above) or South slave port (if coming from below).
+        # Each slave port has SS_SLOTS_PER_SLAVE_PORT rule slots (4).
+        #
+        # If the existing packet flows already consume most slots at a
+        # bottleneck tile, adding trace packet flows will fail.
+
+        # Count southbound packet rules per (col, row).
+        pkt_rules_at: dict[tuple[int, int], int] = {}
+
+        for pfop in pkt_flow_ops:
+            pf = pfop.opview
+            ports_block = pf.ports.blocks[0]
+
+            src_col = src_row = None
+            for op in ports_block:
+                ov = op.opview
+                if isinstance(ov, aiedialect.PacketSourceOp):
+                    src_col = ov.tile.owner.opview.col.value
+                    src_row = ov.tile.owner.opview.row.value
+                elif isinstance(ov, aiedialect.PacketDestOp):
+                    dst_col = ov.tile.owner.opview.col.value
+                    dst_row = ov.tile.owner.opview.row.value
+                    if src_col is not None and src_col == dst_col:
+                        # Same column -- walks vertically through intermediates
+                        top = max(src_row, dst_row)
+                        bot = min(src_row, dst_row)
+                        for r in range(top - 1, bot, -1):
+                            key = (src_col, r)
+                            pkt_rules_at[key] = pkt_rules_at.get(key, 0) + 1
+
+        # For each traceable tile, count how many trace flows would pass
+        # through intermediate tiles on the way to each candidate shim.
+        # A trace flow from (col, row) to shim (col, 0) passes through
+        # rows row-1 ... 1 in the same column.
+        trace_demand: dict[tuple[int, int], int] = {}
+        for col, row, _mod in traceable_tiles:
+            for r in range(row - 1, 0, -1):
+                key = (col, r)
+                trace_demand[key] = trace_demand.get(key, 0) + 1
+
+        # Check if any intermediate tile would exceed rule slot capacity.
+        rule_bottleneck = None
+        for key, new_demand in trace_demand.items():
+            existing = pkt_rules_at.get(key, 0)
+            # Each slave port has SS_SLOTS_PER_SLAVE_PORT slots.
+            # Wildcard masking can compress trace rules (factor ~2-4), but
+            # existing non-trace rules each consume one slot.
+            # Conservative: trace rules compress by 2, existing by 1.
+            available = SS_SLOTS_PER_SLAVE_PORT - existing
+            needed = (new_demand + 1) // 2  # optimistic: 2 traces per rule
+            if needed > available:
+                rule_bottleneck = (
+                    f"packet rule bottleneck at tile ({key[0]},{key[1]}): "
+                    f"{existing} existing rules + {new_demand} trace flows "
+                    f"exceeds {SS_SLOTS_PER_SLAVE_PORT} slots/port"
+                )
+                break
+
+        # -- Find best shim + channel for trace ----------------------------
+
+        # Columns actually used by the test (for cross-column hint).
+        used_cols = sorted({c for c, r, m in traceable_tiles})
+
+        # Prefer same-column shim with a free channel, no ctrl packets.
+        # Score: lower is better.
+        def shim_score(col: int) -> tuple[int, int, int]:
+            st = shim_states[col]
+            # Penalty tiers:
+            #   0 = ideal (has free channel, no ctrl packets, same column)
+            #   1 = free channel but has ctrl packets (risky)
+            #   2 = no free channel
+            if not st.free_s2mm:
+                tier = 2
+            elif st.has_ctrl_packets:
+                tier = 1
+            else:
+                tier = 0
+            # Within tier: prefer columns that overlap with used tiles.
+            in_used = 0 if col in used_cols else 1
+            # Within that: prefer fewer existing DMA uses.
+            return (tier, in_used, len(st.s2mm_used))
+
+        ranked = sorted(shim_cols, key=shim_score)
+
+        best_col = ranked[0]
+        best_state = shim_states[best_col]
+
+        # Build cross-column hint for informational purposes.
+        all_cols_in_device = list(range(tm.columns()))
+        unused_cols = [c for c in all_cols_in_device if c not in used_cols]
+        cross_col_hint = None
+        if unused_cols:
+            cross_col_hint = (
+                f"columns {unused_cols} are unused by this test -- "
+                f"cross-column trace routing could use their shim DMA"
+            )
+
+        if rule_bottleneck:
+            return StrictTracePlan(
+                feasible=False,
+                reason=rule_bottleneck,
+                shim_states=shim_states,
+                cross_column_option=cross_col_hint,
+            )
+
+        if not best_state.free_s2mm:
+            return StrictTracePlan(
+                feasible=False,
+                reason=(
+                    f"all shim DMA S2MM channels occupied: "
+                    + ", ".join(
+                        f"col {c}: ch {sorted(shim_states[c].s2mm_used)}/{shim_states[c].s2mm_total}"
+                        for c in shim_cols
+                    )
+                ),
+                shim_states=shim_states,
+                cross_column_option=cross_col_hint,
+            )
+
+        if best_state.has_ctrl_packets:
+            # Control packets on the best shim -- hazardous.  Check if any
+            # shim has both free channels AND no ctrl packets.
+            safe = [
+                c for c in ranked
+                if shim_states[c].free_s2mm and not shim_states[c].has_ctrl_packets
+            ]
+            if safe:
+                best_col = safe[0]
+                best_state = shim_states[best_col]
+            else:
+                return StrictTracePlan(
+                    feasible=False,
+                    reason=(
+                        f"all shims with free DMA channels have control packet "
+                        f"routing conflicts: "
+                        + ", ".join(
+                            f"col {c}: ctrl={shim_states[c].has_ctrl_packets}, "
+                            f"free_ch={shim_states[c].free_s2mm}"
+                            for c in shim_cols
+                        )
+                    ),
+                    shim_states=shim_states,
+                    cross_column_option=cross_col_hint,
+                )
+
+        # Pick the highest free channel (convention: channel 1 preferred,
+        # fall back to 0 if 1 is taken).
+        trace_channel = max(best_state.free_s2mm)
+
+        return StrictTracePlan(
+            feasible=True,
+            reason="ok",
+            shim_col=best_col,
+            trace_channel=trace_channel,
+            tiles_to_trace=traceable_tiles,
+            shim_states=shim_states,
+            cross_column_option=cross_col_hint,
+        )
+
+
 def auto_detect_device(mlir_text: str) -> str:
     """Detect the required device target from tile column indices in MLIR.
 
@@ -756,6 +1105,7 @@ def inject_trace(
     trace_size: int,
     events_config: dict | None = None,
     tile_filter: list[tuple[int, int, str]] | None = None,
+    trace_channel: int = 1,
 ) -> tuple[str, dict]:
     """Inject trace configuration into parsed MLIR and return modified text.
 
@@ -939,7 +1289,7 @@ def inject_trace(
                     packetflow(
                         p_id, tile, WireBundle.Trace, 0,
                         dests={"dest": shim_tile, "port": WireBundle.DMA,
-                               "channel": 1},
+                               "channel": trace_channel},
                         keep_pkt_header=True,
                     )
                     exist_traces.append(tile)
@@ -948,7 +1298,7 @@ def inject_trace(
                     packetflow(
                         p_id, tile, WireBundle.Trace, 1,
                         dests={"dest": shim_tile, "port": WireBundle.DMA,
-                               "channel": 1},
+                               "channel": trace_channel},
                         keep_pkt_header=True,
                     )
 
@@ -987,16 +1337,30 @@ def inject_trace(
             MemTilePortEvent(MemTileEvent.PORT_RUNNING_6, 4, False),
             MemTilePortEvent(MemTileEvent.PORT_RUNNING_7, 5, False),
         ]
-        shimtile_events = [
-            ShimTileEvent.DMA_S2MM_0_START_TASK,
-            ShimTileEvent.DMA_S2MM_1_START_TASK,
-            ShimTileEvent.DMA_MM2S_0_START_TASK,
-            ShimTileEvent.DMA_S2MM_0_FINISHED_TASK,
-            ShimTileEvent.DMA_S2MM_1_FINISHED_TASK,
-            ShimTileEvent.DMA_MM2S_0_FINISHED_TASK,
-            ShimTileEvent.DMA_S2MM_0_STREAM_STARVATION,
-            ShimTileEvent.DMA_S2MM_1_STREAM_STARVATION,
-        ]
+        # Shim events should monitor the trace channel specifically.
+        if trace_channel == 1:
+            shimtile_events = [
+                ShimTileEvent.DMA_S2MM_0_START_TASK,
+                ShimTileEvent.DMA_S2MM_1_START_TASK,
+                ShimTileEvent.DMA_MM2S_0_START_TASK,
+                ShimTileEvent.DMA_S2MM_0_FINISHED_TASK,
+                ShimTileEvent.DMA_S2MM_1_FINISHED_TASK,
+                ShimTileEvent.DMA_MM2S_0_FINISHED_TASK,
+                ShimTileEvent.DMA_S2MM_0_STREAM_STARVATION,
+                ShimTileEvent.DMA_S2MM_1_STREAM_STARVATION,
+            ]
+        else:
+            # Channel 0 for trace -- swap focus to S2MM_0 events
+            shimtile_events = [
+                ShimTileEvent.DMA_S2MM_0_START_TASK,
+                ShimTileEvent.DMA_S2MM_0_FINISHED_TASK,
+                ShimTileEvent.DMA_S2MM_0_STREAM_STARVATION,
+                ShimTileEvent.DMA_S2MM_1_START_TASK,
+                ShimTileEvent.DMA_MM2S_0_START_TASK,
+                ShimTileEvent.DMA_S2MM_1_FINISHED_TASK,
+                ShimTileEvent.DMA_MM2S_0_FINISHED_TASK,
+                ShimTileEvent.DMA_S2MM_1_STREAM_STARVATION,
+            ]
 
         if events_config:
             if "core_events" in events_config:
@@ -1080,7 +1444,7 @@ def inject_trace(
 
             # Configure shim DMA for trace collection
             configure_shimtile_dma_aie2(
-                shim=shim_tile, channel=1, bd_id=15,
+                shim=shim_tile, channel=trace_channel, bd_id=15,
                 ddr_id=trace_ddr_id,
                 size=trace_size // 4,  # convert to words
                 offset=0, enable_token=1,
@@ -1818,6 +2182,56 @@ def main():
             )
             sys.exit(0)
 
+    # Strict feasibility analysis: parse the MLIR and check whether trace
+    # injection is safe (free shim DMA channel, no control packet conflicts).
+    plan = strict_analyze_feasibility(mlir_text)
+    trace_channel = 1  # default
+
+    if not plan.feasible:
+        reason = f"infeasible: {plan.reason}"
+        print(f"Skipping {test_dir.name}: {reason}", file=sys.stderr)
+        if plan.cross_column_option:
+            print(f"  Hint: {plan.cross_column_option}", file=sys.stderr)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "test_name": test_dir.name,
+            "skipped": True,
+            "reason": reason,
+        }
+        if plan.shim_states:
+            manifest["shim_analysis"] = {
+                str(col): {
+                    "s2mm_used": sorted(st.s2mm_used),
+                    "s2mm_total": st.s2mm_total,
+                    "has_ctrl_packets": st.has_ctrl_packets,
+                }
+                for col, st in plan.shim_states.items()
+            }
+        if plan.cross_column_option:
+            manifest["cross_column_hint"] = plan.cross_column_option
+        (output_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2) + "\n"
+        )
+        sys.exit(0)
+
+    # Planner chose a shim and channel -- use them.
+    trace_channel = plan.trace_channel
+    print(f"  Planner: shim col {plan.shim_col}, "
+          f"S2MM channel {trace_channel}", file=sys.stderr)
+    if plan.shim_states:
+        for col, st in plan.shim_states.items():
+            status = []
+            if st.s2mm_used:
+                status.append(f"S2MM ch {sorted(st.s2mm_used)} used")
+            if st.has_ctrl_packets:
+                status.append("ctrl_pkts")
+            if st.has_trace_flows:
+                status.append("has_trace")
+            if status:
+                print(f"    col {col}: {', '.join(status)}", file=sys.stderr)
+    if plan.cross_column_option:
+        print(f"    Note: {plan.cross_column_option}", file=sys.stderr)
+
     # Load custom events config if provided
     events_config = None
     if args.events_json:
@@ -1840,6 +2254,7 @@ def main():
             traced_mlir, manifest_partial = inject_trace(
                 mlir_text, args.trace_size, events_config,
                 tile_filter=tile_filter,
+                trace_channel=trace_channel,
             )
         except Exception as e:
             print(f"Error injecting trace: {e}", file=sys.stderr)
@@ -1859,6 +2274,13 @@ def main():
     manifest = build_manifest(
         test_name, test_dir, output_dir, traced_mlir, manifest_partial,
     )
+    # Add planner analysis to manifest for diagnostics.
+    manifest["planner"] = {
+        "shim_col": plan.shim_col,
+        "trace_channel": trace_channel,
+    }
+    if plan.cross_column_option:
+        manifest["planner"]["cross_column_hint"] = plan.cross_column_option
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n"
     )
