@@ -233,13 +233,17 @@ err()  { echo "ERROR: $*" >&2; }
 # Count TDR events in dmesg.  Returns the number of "aie2_tdr_work" lines.
 # Usage: before=$(tdr_count); run test; after=$(tdr_count); new=$((after-before))
 tdr_count() {
-  dmesg 2>/dev/null | grep -c 'aie2_tdr_work' || echo 0
+  local n
+  n=$(dmesg 2>/dev/null | grep -c 'aie2_tdr_work') || true
+  echo "$n"
 }
 export -f tdr_count
 
 # Count IOMMU page faults in dmesg.
 iommu_fault_count() {
-  dmesg 2>/dev/null | grep -c 'IO_PAGE_FAULT' || echo 0
+  local n
+  n=$(dmesg 2>/dev/null | grep -c 'IO_PAGE_FAULT') || true
+  echo "$n"
 }
 export -f iommu_fault_count
 
