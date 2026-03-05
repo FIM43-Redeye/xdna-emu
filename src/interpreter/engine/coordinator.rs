@@ -440,9 +440,127 @@ impl InterpreterEngine {
         // Phase 1: Sync DMA start requests from tiles to DMA engines
         self.sync_dma_start_requests();
 
-        // Phase 2: Step all DMA engines and stream routing.
-        // This ensures lock releases from DMA are visible when cores
-        // snapshot MemTile locks for memory module access.
+        // Phase 2: Step each enabled core FIRST.
+        //
+        // On real hardware, cores and DMAs run truly concurrently -- a lock
+        // released by the core at cycle N is visible to DMA in the same
+        // cycle. In our turn-based simulation, whoever runs second sees
+        // stale lock state. Running cores first means core lock releases
+        // (the producer side of the producer-consumer handoff) are committed
+        // before DMA checks them, matching hardware's same-cycle visibility.
+        //
+        // DMA-to-core lock visibility (the reverse direction) is handled by
+        // step_data_movement's internal lock snapshot/commit, which commits
+        // DMA lock releases at the end of the data movement phase. Cores
+        // read committed lock state, so DMA releases from cycle N-1 are
+        // visible to cores at cycle N -- the same 1-cycle latency as the
+        // hardware's lock pipeline.
+        for col in 0..self.cols {
+            for row in self.compute_row_start..self.rows {
+                let idx = col * self.rows + row;
+
+                if !self.cores[idx].enabled {
+                    continue;
+                }
+
+                // For compute tiles, we need memory module lock routing.
+                // Memory module locks (48-63) should access the MemTile (row 1) locks.
+                // Copy MemTile locks before stepping, then copy changes back after.
+                let mem_tile_row = 1; // MemTile is always row 1
+                let mut mem_tile_locks_copy: Option<Vec<crate::device::tile::Lock>> = None;
+
+                // Copy memory tile locks if we're in a compute row
+                if row > mem_tile_row {
+                    if let Some(mem_tile) = self.device.tile(col, mem_tile_row) {
+                        mem_tile_locks_copy = Some(mem_tile.locks.clone());
+                    }
+                }
+
+                // Build cross-tile neighbor memory context.
+                let mut neighbors = NeighborMemory::new(col, row);
+                neighbors.ensure_snapshot(1, &self.device); // West
+                neighbors.ensure_snapshot(2, &self.device); // North
+                neighbors.ensure_snapshot(3, &self.device); // East
+
+                // Get tile for this core
+                if let Some(tile) = self.device.tile_mut(col, row) {
+                    if tile.tile_type != TileType::Compute {
+                        continue;
+                    }
+
+                    let core = &mut self.cores[idx];
+
+                    // Step with memory tile locks and neighbor memory
+                    let result = if let Some(ref mut mem_locks) = mem_tile_locks_copy {
+                        core.interpreter.step_with_mem_locks(
+                            &mut core.context, tile,
+                            Some(mem_locks.as_mut_slice()),
+                            Some(&mut neighbors),
+                        )
+                    } else {
+                        core.interpreter.step_with_mem_locks(
+                            &mut core.context, tile,
+                            None,
+                            Some(&mut neighbors),
+                        )
+                    };
+
+                    match result {
+                        StepResult::Continue => {
+                            all_halted = false;
+                            any_running = true;
+                            self.total_instructions += 1;
+                        }
+                        StepResult::WaitLock { .. } | StepResult::WaitDma { .. } | StepResult::WaitStream { .. } => {
+                            // Stalled, but still active - not halted
+                            all_halted = false;
+                            any_running = true;
+                        }
+                        StepResult::Halt => {
+                            // This core halted - don't set all_halted=false
+                        }
+                        StepResult::DecodeError(ref e) => {
+                            log::error!("Core({},{}) DecodeError at cycle {}: {:?}", col, row, self.total_cycles, e);
+                            self.status = EngineStatus::Error;
+                            return;
+                        }
+                        StepResult::ExecError(ref e) => {
+                            log::error!("Core({},{}) ExecError at cycle {}: {:?}", col, row, self.total_cycles, e);
+                            self.status = EngineStatus::Error;
+                            return;
+                        }
+                    }
+
+                    // Notify core trace unit with any new events since last cycle.
+                    let events = core.context.timing_context().events.events();
+                    let new_start = core.trace_events_consumed;
+                    if new_start < events.len() {
+                        for evt in &events[new_start..] {
+                            if let Some(hw_id) = crate::trace::core_event_to_hw_id(&evt.event) {
+                                tile.notify_core_trace_event(hw_id, evt.cycle);
+                            }
+                        }
+                        core.trace_events_consumed = events.len();
+                    }
+                }
+
+                // Apply buffered cross-tile writes to neighbor tiles
+                if neighbors.has_pending_writes() {
+                    neighbors.apply_writes(&mut self.device);
+                }
+
+                // Copy modified memory tile locks back to the MemTile
+                if let Some(mem_locks) = mem_tile_locks_copy {
+                    if let Some(mem_tile) = self.device.tile_mut(col, mem_tile_row) {
+                        mem_tile.locks.copy_from_slice(&mem_locks);
+                    }
+                }
+            }
+        }
+
+        // Phase 3: Step all DMA engines and stream routing.
+        // Core lock releases from Phase 2 are now committed, so DMA lock
+        // acquisition checks see same-cycle core releases (matching hardware).
         //
         // Set cycle timestamp on DMA engines before stepping so trace
         // events get the correct cycle number.
@@ -506,7 +624,7 @@ impl InterpreterEngine {
             }
         }
 
-        // Phase 2b: Generate stream switch port events from cycle flags.
+        // Phase 3b: Generate stream switch port events from cycle flags.
         //
         // Four event types per monitored port, all level events:
         // - PORT_IDLE: port had no data this cycle
@@ -593,123 +711,7 @@ impl InterpreterEngine {
             any_running = true;
         }
 
-        // Phase 3: Step each enabled core (after DMA, so locks are up-to-date)
-        for col in 0..self.cols {
-            for row in self.compute_row_start..self.rows {
-                let idx = col * self.rows + row;
-
-                if !self.cores[idx].enabled {
-                    continue;
-                }
-
-                // For compute tiles, we need memory module lock routing.
-                // Memory module locks (48-63) should access the MemTile (row 1) locks.
-                // Copy MemTile locks before stepping, then copy changes back after.
-                let mem_tile_row = 1; // MemTile is always row 1
-                let mut mem_tile_locks_copy: Option<Vec<crate::device::tile::Lock>> = None;
-
-                // Copy memory tile locks if we're in a compute row
-                if row > mem_tile_row {
-                    if let Some(mem_tile) = self.device.tile(col, mem_tile_row) {
-                        mem_tile_locks_copy = Some(mem_tile.locks.clone());
-                    }
-                }
-
-                // Build cross-tile neighbor memory context.
-                // Snapshots are loaded eagerly before the mutable tile borrow
-                // because the memory functions can't access DeviceState during
-                // execution. Only existing neighbors are cloned (edge tiles
-                // have fewer). This costs up to 192KB per core per cycle.
-                //
-                // Optimization paths if profiling shows this matters:
-                // 1. Pre-allocate per-core snapshot buffers and reuse across cycles
-                // 2. Use shared immutable &[u8] instead of clones (requires proving
-                //    no cross-tile writes within the same cycle)
-                // 3. Track which cores use cross-tile addressing and skip others
-                let mut neighbors = NeighborMemory::new(col, row);
-                neighbors.ensure_snapshot(1, &self.device); // West
-                neighbors.ensure_snapshot(2, &self.device); // North
-                neighbors.ensure_snapshot(3, &self.device); // East
-
-                // Get tile for this core
-                if let Some(tile) = self.device.tile_mut(col, row) {
-                    if tile.tile_type != TileType::Compute {
-                        continue;
-                    }
-
-                    let core = &mut self.cores[idx];
-
-                    // Step with memory tile locks and neighbor memory
-                    let result = if let Some(ref mut mem_locks) = mem_tile_locks_copy {
-                        core.interpreter.step_with_mem_locks(
-                            &mut core.context, tile,
-                            Some(mem_locks.as_mut_slice()),
-                            Some(&mut neighbors),
-                        )
-                    } else {
-                        core.interpreter.step_with_mem_locks(
-                            &mut core.context, tile,
-                            None,
-                            Some(&mut neighbors),
-                        )
-                    };
-
-                    match result {
-                        StepResult::Continue => {
-                            all_halted = false;
-                            any_running = true;
-                            self.total_instructions += 1;
-                        }
-                        StepResult::WaitLock { .. } | StepResult::WaitDma { .. } | StepResult::WaitStream { .. } => {
-                            // Stalled, but still active - not halted
-                            all_halted = false;
-                            any_running = true;
-                        }
-                        StepResult::Halt => {
-                            // This core halted - don't set all_halted=false
-                        }
-                        StepResult::DecodeError(ref e) => {
-                            log::error!("Core({},{}) DecodeError at cycle {}: {:?}", col, row, self.total_cycles, e);
-                            self.status = EngineStatus::Error;
-                            return;
-                        }
-                        StepResult::ExecError(ref e) => {
-                            log::error!("Core({},{}) ExecError at cycle {}: {:?}", col, row, self.total_cycles, e);
-                            self.status = EngineStatus::Error;
-                            return;
-                        }
-                    }
-
-                    // Notify core trace unit with any new events since last cycle.
-                    // We track how many events have been consumed to avoid re-processing
-                    // the full EventLog history every cycle.
-                    let events = core.context.timing_context().events.events();
-                    let new_start = core.trace_events_consumed;
-                    if new_start < events.len() {
-                        for evt in &events[new_start..] {
-                            if let Some(hw_id) = crate::trace::core_event_to_hw_id(&evt.event) {
-                                tile.notify_core_trace_event(hw_id, evt.cycle);
-                            }
-                        }
-                        core.trace_events_consumed = events.len();
-                    }
-                }
-
-                // Apply buffered cross-tile writes to neighbor tiles
-                if neighbors.has_pending_writes() {
-                    neighbors.apply_writes(&mut self.device);
-                }
-
-                // Copy modified memory tile locks back to the MemTile
-                if let Some(mem_locks) = mem_tile_locks_copy {
-                    if let Some(mem_tile) = self.device.tile_mut(col, mem_tile_row) {
-                        mem_tile.locks.copy_from_slice(&mem_locks);
-                    }
-                }
-            }
-        }
-
-        // Phase 3b: Detect memory bank conflicts (core vs DMA).
+        // Phase 4: Detect memory bank conflicts (core vs DMA).
         //
         // CONFLICT_DM_BANK events fire when the core and DMA access the same
         // memory bank in the same cycle. The hardware resolves conflicts by
