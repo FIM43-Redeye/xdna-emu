@@ -415,16 +415,17 @@ discover_tests() {
 # Phase 2: Compile (parallel xclbin + test.exe)
 # ---------------------------------------------------------------------------
 
-# Compile one test's xclbin and test.exe. Called via xargs.
-# Writes $RESULTS_DIR/$safe.compile.result and $RESULTS_DIR/$safe.compile.log.
-compile_one() {
+# Compile a test's xclbin with a specific compiler.
+# Args: $1=test_name  $2=compiler ("chess"|"peano")
+compile_one_compiler() {
   local name="$1"
+  local compiler="$2"
   local safe
   safe="$(sanitize_name "$name")"
   local src_dir="$TEST_SRC/$name"
-  local build_dir="$BUILD_BASE/$name"
-  local log_file="$RESULTS_DIR/${safe}.compile.log"
-  local result_file="$RESULTS_DIR/${safe}.compile.result"
+  local build_dir="$BUILD_BASE/$name/$compiler"
+  local log_file="$RESULTS_DIR/${safe}.${compiler}.compile.log"
+  local result_file="$RESULTS_DIR/${safe}.${compiler}.compile.result"
   local lit_file="$src_dir/run.lit"
 
   mkdir -p "$build_dir"
@@ -433,65 +434,103 @@ compile_one() {
   if [[ ! -f "$lit_file" ]]; then
     echo "FAIL" > "$result_file"
     echo "No run.lit found" >> "$log_file"
-    echo "  COMPILE $name: FAIL (no run.lit)"
+    echo "  COMPILE $name ($compiler): FAIL (no run.lit)"
     return 0
   fi
 
-  # --- 2a: xclbin build (expensive, skip if cached) -----------------------
-
+  # Check cache
   local have_xclbin=false
   if [[ -f "$build_dir/aie.xclbin" ]] || ls "$build_dir"/*.xclbin &>/dev/null; then
     have_xclbin=true
   fi
 
-  local cached=false
   if $have_xclbin && [[ "$FORCE_COMPILE" != "true" ]]; then
-    cached=true
-  else
-    # Prepare architecture MLIR (NPUDEVICE substitution).
-    local npu_dev
-    npu_dev="$(get_npu_device "$src_dir")"
-    if [[ -f "$src_dir/aie.mlir" ]]; then
-      cp "$src_dir/aie.mlir" "$build_dir/aie_arch.mlir"
-      sed "s/NPUDEVICE/${npu_dev}/g" -i "$build_dir/aie_arch.mlir"
+    echo "  COMPILE $name ($compiler): cached"
+    echo "OK" > "$result_file"
+    return 0
+  fi
+
+  # Prepare architecture MLIR (NPUDEVICE substitution)
+  local npu_dev
+  npu_dev="$(get_npu_device "$src_dir")"
+  if [[ -f "$src_dir/aie.mlir" ]]; then
+    cp "$src_dir/aie.mlir" "$build_dir/aie_arch.mlir"
+    sed "s/NPUDEVICE/${npu_dev}/g" -i "$build_dir/aie_arch.mlir"
+  fi
+
+  local failed=false
+  while IFS= read -r cmd; do
+    [[ -z "$cmd" ]] && continue
+    # Skip host compilation -- handled separately
+    [[ "$cmd" == *clang*test.cpp* ]] && continue
+    [[ "$cmd" == *g++*test.cpp* ]] && continue
+
+    # Fix MLIR path references
+    if [[ "$cmd" == *aiecc.py* ]]; then
+      cmd="${cmd//$src_dir\/aie.mlir/./aie_arch.mlir}"
+      cmd="${cmd//\.\/aie.mlir/./aie_arch.mlir}"
     fi
 
-    local failed=false
-    while IFS= read -r cmd; do
-      [[ -z "$cmd" ]] && continue
-      # Skip host compilation -- handled in 2b.
-      [[ "$cmd" == *clang*test.cpp* ]] && continue
-      [[ "$cmd" == *g++*test.cpp* ]] && continue
-      # Fix aie.mlir references in aiecc.py commands.
-      if [[ "$cmd" == *aiecc.py* ]]; then
-        cmd="${cmd//$src_dir\/aie.mlir/./aie_arch.mlir}"
-        cmd="${cmd//\.\/aie.mlir/./aie_arch.mlir}"
-      fi
-      if ! ( cd "$build_dir" && nice -n 19 bash -c "$cmd" ) >> "$log_file" 2>&1; then
-        failed=true
-        break
-      fi
-    done < <(extract_build_commands "$lit_file" "$src_dir")
+    # Transform command for this compiler
+    if [[ "$compiler" == "chess" ]]; then
+      cmd="$(transform_for_chess "$cmd")"
+    else
+      cmd="$(transform_for_peano "$cmd" "$src_dir")"
+    fi
 
-    if $failed; then
+    # Skip commands that couldn't be transformed
+    [[ "$cmd" == "# SKIP"* ]] && { echo "$cmd" >> "$log_file"; continue; }
+
+    if ! ( cd "$build_dir" && nice -n 19 bash -c "$cmd" ) >> "$log_file" 2>&1; then
+      failed=true
+      break
+    fi
+  done < <(extract_build_commands "$lit_file" "$src_dir")
+
+  if $failed; then
+    echo "FAIL" > "$result_file"
+    echo "  COMPILE $name ($compiler): FAIL"
+    return 0
+  fi
+
+  # Verify xclbin was produced
+  if [[ ! -f "$build_dir/aie.xclbin" ]]; then
+    local any_xclbin
+    any_xclbin=$(find "$build_dir" -name "*.xclbin" -print -quit 2>/dev/null || true)
+    if [[ -z "$any_xclbin" ]]; then
       echo "FAIL" > "$result_file"
-      echo "  COMPILE $name: FAIL"
+      echo "  COMPILE $name ($compiler): FAIL (no xclbin produced)"
       return 0
-    fi
-
-    # Verify xclbin was produced.
-    if [[ ! -f "$build_dir/aie.xclbin" ]]; then
-      local any_xclbin
-      any_xclbin=$(find "$build_dir" -name "*.xclbin" -print -quit 2>/dev/null || true)
-      if [[ -z "$any_xclbin" ]]; then
-        echo "FAIL" > "$result_file"
-        echo "  COMPILE $name: FAIL (no xclbin produced)"
-        return 0
-      fi
     fi
   fi
 
-  # --- 2b: test.exe build (always, BDF patch must be present) --------------
+  echo "OK" > "$result_file"
+  echo "  COMPILE $name ($compiler): OK"
+}
+
+# Compile one test for all active compilers + build shared test.exe.
+# Called via xargs. Writes per-compiler compile results and shared test.exe.
+compile_one() {
+  local name="$1"
+  local safe
+  safe="$(sanitize_name "$name")"
+  local src_dir="$TEST_SRC/$name"
+  local build_dir="$BUILD_BASE/$name"
+  local lit_file="$src_dir/run.lit"
+
+  # Reconstruct COMPILERS array from serialized string
+  local compilers
+  read -ra compilers <<< "$COMPILERS_STR"
+
+  # Compile xclbin for each compiler
+  for compiler in "${compilers[@]}"; do
+    compile_one_compiler "$name" "$compiler"
+  done
+
+  # Build shared test.exe (compiler-agnostic, only needs XRT)
+  local log_file="$RESULTS_DIR/${safe}.testexe.log"
+  mkdir -p "$build_dir"
+  : > "$log_file"
 
   if [[ -f "$src_dir/test.cpp" ]]; then
     sed \
@@ -500,46 +539,39 @@ compile_one() {
       "$src_dir/test.cpp" > "$build_dir/test.cpp"
   fi
 
-  # Find the clang/g++ line from run.lit for correct flags.
+  # Find the clang/g++ line from run.lit for correct flags
   local clang_cmd=""
-  while IFS= read -r line; do
-    [[ "$line" == *"RUN:"* ]] || continue
-    local cmd
-    cmd="$(apply_lit_subs "$src_dir" "$line")"
-    if [[ "$cmd" == *clang*test.cpp* ]] || [[ "$cmd" == *g++*test.cpp* ]]; then
-      cmd="${cmd//$src_dir\/test.cpp/./test.cpp}"
-      clang_cmd="$cmd"
-      break
-    fi
-  done < "$lit_file"
+  if [[ -f "$lit_file" ]]; then
+    while IFS= read -r line; do
+      [[ "$line" == *"RUN:"* ]] || continue
+      local cmd
+      cmd="$(apply_lit_subs "$src_dir" "$line")"
+      if [[ "$cmd" == *clang*test.cpp* ]] || [[ "$cmd" == *g++*test.cpp* ]]; then
+        cmd="${cmd//$src_dir\/test.cpp/./test.cpp}"
+        clang_cmd="$cmd"
+        break
+      fi
+    done < "$lit_file"
+  fi
 
   if [[ -n "$clang_cmd" ]]; then
     if ! ( cd "$build_dir" && bash -c "$clang_cmd" ) >> "$log_file" 2>&1; then
-      echo "FAIL" > "$result_file"
       echo "  COMPILE $name: FAIL (test.exe)"
       return 0
     fi
-  else
+  elif [[ -f "$build_dir/test.cpp" ]]; then
     if ! /usr/bin/clang++ "$build_dir/test.cpp" -o "$build_dir/test.exe" \
         -std=c++17 -Wall \
         -I"$XRT_INCLUDE" -L"$XRT_LIB" \
         -I"$TEST_UTILS_INCLUDE" -L"$TEST_UTILS_LIB" \
         -luuid -lxrt_coreutil -ltest_utils -lrt -lstdc++ \
         >> "$log_file" 2>&1; then
-      echo "FAIL" > "$result_file"
       echo "  COMPILE $name: FAIL (test.exe fallback)"
       return 0
     fi
   fi
-
-  echo "OK" > "$result_file"
-  if $cached; then
-    echo "  COMPILE $name: OK (cached)"
-  else
-    echo "  COMPILE $name: OK"
-  fi
 }
-export -f compile_one
+export -f compile_one_compiler compile_one
 
 # ---------------------------------------------------------------------------
 # Phase 3: Hardware runs (serial)
