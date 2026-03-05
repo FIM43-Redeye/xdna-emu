@@ -23,6 +23,14 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+# Stream switch hardware constants (AIE2, from mlir-aie pathfinder).
+# These are architecture-level -- same for all AIE2 variants.
+# Override for future architectures if needed.
+SS_NUM_ARBITERS = 6
+SS_MSELS_PER_ARBITER = 4
+SS_SLOTS_PER_SLAVE_PORT = 4
+SS_PACKET_ID_BITS = 5
+
 
 def resolve_events(names: list[str], event_enum) -> list:
     """Resolve event name strings to enum values.
@@ -298,6 +306,190 @@ def extract_flows(mlir_text: str) -> list[FlowInfo]:
             ))
 
     return flows
+
+
+# ---------------------------------------------------------------------------
+# Switchbox capacity model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SwitchboxCapacity:
+    """Routing capacity for one switchbox after existing flows are accounted."""
+    col: int
+    row: int
+    tile_type: str
+    south_master_total: int
+    south_master_circuit: int       # consumed by circuit flows going south
+    north_slave_packet_rules: int   # consumed by packet flows entering from north
+    south_slave_packet_rules: int   # consumed by packet flows entering from south
+    trace_slave_ports: int          # how many trace ports this tile has
+
+
+def _load_device_model(device_name: str, device_model_path: Path | None = None) -> dict:
+    """Load device model JSON and return the device dict for *device_name*."""
+    if device_model_path is None:
+        device_model_path = Path(__file__).parent / "aie-device-models.json"
+    with open(device_model_path) as f:
+        model = json.load(f)
+    devices = model.get("devices", {})
+    if device_name not in devices:
+        raise ValueError(
+            f"Unknown device '{device_name}'. "
+            f"Available: {', '.join(devices.keys())}"
+        )
+    return devices[device_name]
+
+
+def build_capacity_map(
+    flows: list[FlowInfo],
+    device_name: str,
+    device_model_path: Path | None = None,
+) -> dict[tuple[int, int], SwitchboxCapacity]:
+    """Build a per-tile routing capacity map from existing flows.
+
+    For each tile in the device, computes how many southbound routing
+    resources are consumed by existing circuit and packet flows.  This lets
+    the trace planner know how much headroom remains for new trace flows.
+
+    Routing model (simplified): a flow from (src_col, src_row) to
+    (dst_col, dst_row) travels straight south within src_col down to row 0.
+    East/west hops at row 0 are not modeled -- trace always targets the
+    same-column shim or a nearby one, so the vertical bottleneck dominates.
+    """
+    dev = _load_device_model(device_name, device_model_path)
+    tile_types = dev["tile_types"]
+
+    # Build (col, row) -> tile type info lookup.
+    tile_info: dict[tuple[int, int], dict] = {}
+    for entry in dev["tile_map"]:
+        c, r = entry["col"], entry["row"]
+        ttype = entry["type"]
+        tile_info[(c, r)] = {"type": ttype, **tile_types.get(ttype, {})}
+
+    # Initialize capacity for every tile.
+    cap: dict[tuple[int, int], SwitchboxCapacity] = {}
+    for (c, r), info in tile_info.items():
+        sw_ports = info.get("switchbox_ports", {})
+        south_master = sw_ports.get("South", {}).get("master", 0)
+        trace_slave = sw_ports.get("Trace", {}).get("slave", 0)
+        cap[(c, r)] = SwitchboxCapacity(
+            col=c, row=r,
+            tile_type=info["type"],
+            south_master_total=south_master,
+            south_master_circuit=0,
+            north_slave_packet_rules=0,
+            south_slave_packet_rules=0,
+            trace_slave_ports=trace_slave,
+        )
+
+    # Walk each flow and account for consumed resources at intermediate tiles.
+    for flow in flows:
+        if flow.src_col != flow.dst_col:
+            # Cross-column flow -- only model the vertical segment in src_col.
+            # Horizontal hops at row 0 are a secondary bottleneck we skip.
+            pass
+
+        # Vertical path: src goes south toward dst (or toward row 0 for
+        # cross-column flows).  Only count INTERMEDIATE tiles -- the source
+        # and destination tiles are not "pass-through" for routing purposes.
+        col = flow.src_col
+        top_row = flow.src_row
+        bot_row = flow.dst_row if flow.src_col == flow.dst_col else 0
+
+        if top_row <= bot_row:
+            # Flow goes north or is same-tile -- not a southbound consumer.
+            continue
+
+        for r in range(top_row - 1, bot_row, -1):
+            key = (col, r)
+            if key not in cap:
+                continue
+            sc = cap[key]
+            if flow.flow_type == "circuit":
+                sc.south_master_circuit += 1
+            else:
+                # Packet flow enters from North slave, exits South master.
+                # Consumes one slave rule slot on the North slave port.
+                sc.north_slave_packet_rules += 1
+
+    return cap
+
+
+def check_trace_feasibility(
+    trace_tiles: list[tuple[int, int, str]],  # (col, row, module_type)
+    shim_col: int,
+    capacity_map: dict[tuple[int, int], SwitchboxCapacity],
+    used_packet_ids: set[int],
+) -> tuple[bool, str]:
+    """Check whether trace flows from the given tiles can route to the shim.
+
+    Walks the southbound path from each trace tile to (shim_col, 0) and
+    checks that the aggregate trace demand at every intermediate tile does
+    not exceed the available packet rule capacity.
+
+    Returns (feasible, reason).  *reason* is ``"ok"`` on success, or a
+    human-readable bottleneck description on failure.
+    """
+    max_packet_ids = 1 << SS_PACKET_ID_BITS  # 32
+
+    # Each trace tile produces one trace flow (core trace or mem trace).
+    num_new_ids = len(trace_tiles)
+    total_ids = len(used_packet_ids) + num_new_ids
+    if total_ids > max_packet_ids:
+        return (
+            False,
+            f"packet ID space exhausted: {total_ids} needed but only "
+            f"{max_packet_ids} available (5-bit ID field)",
+        )
+
+    # Count how many NEW trace flows pass through each intermediate tile.
+    # A trace flow from (col, row) to (shim_col, 0) goes south through
+    # every tile at (col, row-1), (col, row-2), ..., (col, 1).
+    # Row 0 is the destination shim -- not an intermediate.
+    trace_load: dict[tuple[int, int], int] = {}
+    for col, row, _module in trace_tiles:
+        # Trace always routes within the same column down to the shim.
+        # If shim_col differs, we'd need a horizontal hop at row 0/1 --
+        # for now, route within src column (conservative: the planner
+        # should pick a shim in the same column).
+        for r in range(row - 1, 0, -1):
+            key = (col, r)
+            trace_load[key] = trace_load.get(key, 0) + 1
+
+    # Check capacity at each intermediate tile.
+    for key, new_flows in trace_load.items():
+        sc = capacity_map.get(key)
+        if sc is None:
+            return (False, f"tile {key} not in device model")
+
+        # Conservative model: assume all trace packet flows converge on a
+        # single North slave port.  Each port has SS_SLOTS_PER_SLAVE_PORT
+        # rule slots.  Existing packet flows already consume some.
+        existing_rules = sc.north_slave_packet_rules
+        available_slots = SS_SLOTS_PER_SLAVE_PORT - existing_rules
+
+        # Packet rules can use mask/value wildcards.  A single rule with
+        # N wildcard bits covers up to 2^N flows.  Conservatively assume
+        # each rule can cover up to 4 flows (2 wildcard bits), which is
+        # achievable when trace IDs are chosen with aligned bit patterns.
+        effective_capacity = available_slots * 4
+
+        if new_flows > effective_capacity:
+            return (
+                False,
+                f"bottleneck at ({sc.col},{sc.row}) [{sc.tile_type}]: "
+                f"{new_flows} trace flows but only {effective_capacity} "
+                f"effective capacity ({available_slots} free rule slots "
+                f"x4 wildcard, {existing_rules} existing rules)",
+            )
+
+        # Note: we do NOT check South master port availability here.
+        # Packet-switched trace flows share master ports with circuit flows
+        # via arbiter multiplexing.  The pathfinder handles master port
+        # allocation with more nuance than we can model statically.
+        # The slave rule slot check above is the real bottleneck.
+
+    return (True, "ok")
 
 
 def auto_detect_device(mlir_text: str) -> str:
