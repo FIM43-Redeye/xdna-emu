@@ -232,25 +232,33 @@ def compile_base_trace(
     test_dir: Path,
     output_dir: Path,
     trace_size: int,
+    tile_filter: str | None = None,
 ) -> tuple[Path | None, Path | None]:
     """Inject tracing with default events and compile ONCE.
 
     Returns (traced_dir, manifest_path) on success, (None, None) on failure.
     All batches will reuse this compiled xclbin + patched insts.bin.
+
+    If tile_filter is set, passes --tiles to trace-inject.py to limit
+    which tiles are traced.  Format: "col.row:module,col.row:module,...".
     """
     script_dir = Path(__file__).parent
     traced_dir = output_dir / "base"
     traced_dir.mkdir(parents=True, exist_ok=True)
 
     # Inject with default events (no --events-json = defaults)
-    print("  Base: injecting trace routing...")
+    label = "Base" if tile_filter is None else f"Pass (tiles={tile_filter})"
+    print(f"  {label}: injecting trace routing...")
+    cmd = [
+        sys.executable, str(script_dir / "trace-inject.py"),
+        str(test_dir),
+        "--output", str(traced_dir),
+        "--trace-size", str(trace_size),
+    ]
+    if tile_filter:
+        cmd.extend(["--tiles", tile_filter])
     result = subprocess.run(
-        [
-            sys.executable, str(script_dir / "trace-inject.py"),
-            str(test_dir),
-            "--output", str(traced_dir),
-            "--trace-size", str(trace_size),
-        ],
+        cmd,
         capture_output=True, text=True, timeout=120,
     )
     if result.returncode != 0:
@@ -265,7 +273,7 @@ def compile_base_trace(
         return None, None
 
     # Compile kernel objects referenced in run.lit (scale.o, etc.)
-    print("  Base: compiling kernel objects...")
+    print(f"  {label}: compiling kernel objects...")
     kernel_ok, kernel_err = compile_kernel_objects(test_dir, traced_dir)
     if not kernel_ok:
         print(f"    Kernel compile failed: {kernel_err}", file=sys.stderr)
@@ -273,7 +281,7 @@ def compile_base_trace(
         return None, None
 
     # Compile traced xclbin
-    print("  Base: compiling traced xclbin (one-time)...")
+    print(f"  {label}: compiling traced xclbin...")
     compile_result = subprocess.run(
         [
             "aiecc.py",
@@ -300,7 +308,7 @@ def compile_base_trace(
         _write_skip_manifest(traced_dir, reason, stderr.strip().split("\n")[-1])
         return None, None
 
-    print("  Base: compile OK")
+    print(f"  {label}: compile OK")
     return traced_dir, manifest_path
 
 
@@ -545,9 +553,91 @@ def main():
     print(f"  Batches:   {num_batches} (before memtile detection)")
     print()
 
+    # --- Plan trace passes ------------------------------------------------
+    # Call the planner to determine whether all tiles fit through one shim
+    # (single pass) or need multiple injection+compile passes.
+    script_dir = Path(__file__).parent
+    plan = None
+    print("  Planning trace routing...")
+    try:
+        plan_result = subprocess.run(
+            [
+                sys.executable, str(script_dir / "trace-inject.py"),
+                str(test_dir),
+                "--output", str(output_dir / "plan_tmp"),
+                "--plan-only",
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+        if plan_result.returncode != 0:
+            print(f"  Planner failed: {plan_result.stderr.strip()}", file=sys.stderr)
+            print("  Falling back to single-pass (existing behavior)")
+        else:
+            plan = json.loads(plan_result.stdout)
+            num_passes = plan["num_passes"]
+            print(f"  Plan: {plan['reason']} "
+                  f"({num_passes} pass{'es' if num_passes != 1 else ''}, "
+                  f"{plan['total_tiles']} tiles)")
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, KeyError) as e:
+        print(f"  Planner error: {e}", file=sys.stderr)
+        print("  Falling back to single-pass (existing behavior)")
+
+    # Task 7: clear error when tracing is impossible (zero passes).
+    if plan and plan["num_passes"] == 0:
+        reason = plan.get("reason", "unknown")
+        print(f"\n  TRACE CAPACITY ERROR: {reason}")
+        _write_skip_manifest(output_dir, "capacity_exceeded", reason)
+        sweep_manifest = {
+            "test_name": test_name,
+            "skipped": True,
+            "reason": "capacity_exceeded",
+            "detail": reason,
+            "num_batches": 0,
+            "batches": [],
+        }
+        (output_dir / "sweep-manifest.json").write_text(
+            json.dumps(sweep_manifest, indent=2) + "\n"
+        )
+        print(f"Sweep skipped: capacity_exceeded")
+        sys.exit(0)
+
+    # --- Multi-pass vs single-pass execution ------------------------------
+
+    if plan and plan["num_passes"] > 1:
+        # Multi-pass: each pass compiles and sweeps independently in its own
+        # subdirectory, then results are aggregated into the top-level manifest.
+        _run_multi_pass(
+            plan, test_dir, output_dir, test_name, args,
+            core_batches, mem_batches, memtile_batches,
+            num_batches, noop_batch, script_dir,
+        )
+    else:
+        # Single pass: existing behavior (compile once, sweep all batches).
+        _run_single_pass(
+            test_dir, output_dir, test_name, args,
+            core_batches, mem_batches, memtile_batches,
+            num_batches, noop_batch, script_dir,
+        )
+
+
+def _run_single_pass(
+    test_dir: Path,
+    output_dir: Path,
+    test_name: str,
+    args,
+    core_batches: list[list[str]],
+    mem_batches: list[list[str]],
+    memtile_batches: list[list[str]] | None,
+    num_batches: int,
+    noop_batch: list[str],
+    script_dir: Path,
+):
+    """Run the standard single-pass sweep (original behavior)."""
+    trace_size = args.trace_size
+
     # Compile base trace once (all batches share xclbin, patch insts.bin)
     base_dir, base_manifest = compile_base_trace(
-        test_dir, output_dir, args.trace_size,
+        test_dir, output_dir, trace_size,
     )
     if base_dir is None:
         # Check if a skip manifest was written with a specific reason
@@ -606,10 +696,174 @@ def main():
         batches.append(info)
     print()
 
-    # Run HW (serial + cooldown) and EMU (parallel) simultaneously.
-    # HW runs are I/O-bound (waiting on NPU), EMU runs are CPU-bound.
-    # No conflicts: each writes to its own hw/ or emu/ subdirectory.
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    # Execute batches and write results.
+    results = _execute_and_merge(
+        batches, output_dir, test_name, args, script_dir,
+    )
+
+    _write_single_pass_manifest(output_dir, test_name, num_batches, results)
+    _print_summary(output_dir, test_name, num_batches, results)
+
+
+def _run_multi_pass(
+    plan: dict,
+    test_dir: Path,
+    output_dir: Path,
+    test_name: str,
+    args,
+    core_batches: list[list[str]],
+    mem_batches: list[list[str]],
+    memtile_batches: list[list[str]] | None,
+    num_batches: int,
+    noop_batch: list[str],
+    script_dir: Path,
+):
+    """Run a multi-pass sweep: each pass is an independent sub-sweep.
+
+    Each pass compiles with a tile filter, then runs the full batch+execute
+    flow in its own pass_NN/ subdirectory.  The top-level sweep manifest
+    aggregates all pass results.
+    """
+    trace_size = args.trace_size
+    pass_manifests = []
+    total_batches_across_passes = 0
+
+    for pass_idx, trace_pass in enumerate(plan["passes"]):
+        # Build tile filter string: "col.row:module,col.row:module,..."
+        tile_specs = []
+        for t in trace_pass["tiles"]:
+            tile_specs.append(f"{t['col']}.{t['row']}:{t['module']}")
+        tile_filter = ",".join(tile_specs)
+
+        pass_dir = output_dir / f"pass_{pass_idx:02d}"
+        pass_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"\n  Pass {pass_idx}: {len(trace_pass['tiles'])} tiles "
+              f"-> shim col {trace_pass['shim_col']}")
+
+        base_dir, base_manifest = compile_base_trace(
+            test_dir, pass_dir, trace_size, tile_filter=tile_filter,
+        )
+        if base_dir is None:
+            print(f"    Pass {pass_idx} compile failed, skipping")
+            pass_manifests.append({
+                "pass_idx": pass_idx,
+                "tiles": trace_pass["tiles"],
+                "shim_col": trace_pass["shim_col"],
+                "status": "compile_failed",
+                "num_batches": 0,
+                "batches": [],
+            })
+            continue
+
+        # Detect memtiles in this pass and build batches accordingly.
+        manifest_data = json.loads(base_manifest.read_text())
+        pass_has_memtiles = any(
+            t.get("tile_type") == "memtile" or t.get("row") == 1
+            for t in manifest_data.get("tiles_traced", [])
+        )
+
+        # Copy batch lists so per-pass extensions don't mutate the originals.
+        pass_core = list(core_batches)
+        pass_mem = list(mem_batches)
+        pass_mt: list[list[str]] | None = (
+            list(memtile_batches) if memtile_batches is not None else None
+        )
+        pass_num_batches = num_batches
+
+        if pass_has_memtiles:
+            if pass_mt is None:
+                pass_mt = batch_events(MEMTILE_EVENTS)
+            new_total = max(pass_num_batches, len(pass_mt))
+            while len(pass_core) < new_total:
+                pass_core.append(noop_batch)
+            while len(pass_mem) < new_total:
+                pass_mem.append(noop_batch)
+            while len(pass_mt) < new_total:
+                pass_mt.append(noop_batch)
+            pass_num_batches = new_total
+
+        # Prepare batches for this pass.
+        batches = []
+        for i in range(pass_num_batches):
+            mt_batch = pass_mt[i] if pass_mt is not None else None
+            info = prepare_batch(
+                i, pass_core[i], pass_mem[i],
+                base_dir, base_manifest, pass_dir,
+                memtile_batch=mt_batch,
+            )
+            batches.append(info)
+
+        # Execute and merge within this pass's directory.
+        results = _execute_and_merge(
+            batches, pass_dir, test_name, args, script_dir,
+        )
+
+        total_batches_across_passes += pass_num_batches
+        pass_manifests.append({
+            "pass_idx": pass_idx,
+            "tiles": trace_pass["tiles"],
+            "shim_col": trace_pass["shim_col"],
+            "status": "ok",
+            "num_batches": pass_num_batches,
+            "batches": results,
+        })
+
+    # Check if all passes failed.
+    if all(p["status"] != "ok" for p in pass_manifests):
+        _write_skip_manifest(output_dir, "all_passes_failed",
+                             "Multi-pass trace: all injection passes failed to compile")
+        sweep_manifest = {
+            "test_name": test_name,
+            "skipped": True,
+            "reason": "all_passes_failed",
+            "detail": "Multi-pass trace: all injection passes failed to compile",
+            "num_batches": 0,
+            "batches": [],
+        }
+        (output_dir / "sweep-manifest.json").write_text(
+            json.dumps(sweep_manifest, indent=2) + "\n"
+        )
+        print(f"\nSweep skipped: all passes failed")
+        sys.exit(0)
+
+    # Write top-level multi-pass sweep manifest.
+    sweep_manifest = {
+        "test_name": test_name,
+        "num_passes": len(pass_manifests),
+        "passes": pass_manifests,
+        "num_batches": total_batches_across_passes,
+    }
+    manifest_path = output_dir / "sweep-manifest.json"
+    manifest_path.write_text(json.dumps(sweep_manifest, indent=2) + "\n")
+
+    # Summary.
+    ok_passes = sum(1 for p in pass_manifests if p["status"] == "ok")
+    ok_batches = sum(
+        sum(1 for b in p.get("batches", [])
+            if isinstance(b, dict) and b.get("status") == "ok")
+        for p in pass_manifests
+    )
+    print(f"\nSweep complete: {test_name}")
+    print(f"  Passes:   {ok_passes}/{len(pass_manifests)}")
+    print(f"  Batches:  {ok_batches}/{total_batches_across_passes}")
+    print(f"  Manifest: {manifest_path}")
+    print(f"\nView in Perfetto: https://ui.perfetto.dev/")
+
+
+def _execute_and_merge(
+    batches: list[dict],
+    output_dir: Path,
+    test_name: str,
+    args,
+    script_dir: Path,
+) -> list[dict]:
+    """Execute batches (HW serial + EMU parallel) and merge traces.
+
+    Returns the batch results list (mutated in place with hw/emu status).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
     runnable = [b for b in batches if b["status"] == "ok"]
     emu_jobs = args.emu_jobs if args.emu_jobs > 0 else os.cpu_count() or 4
 
@@ -619,45 +873,30 @@ def main():
             run_batch_hw(b, hw_cooldown=args.hw_cooldown)
 
     with ThreadPoolExecutor(max_workers=emu_jobs + 1) as pool:
-        # One thread drives all serial HW runs
         hw_future = None
         if not args.no_hw:
             print(f"  HW:  {len(runnable)} batches (serial, {args.hw_cooldown}s cooldown)")
             hw_future = pool.submit(hw_serial_runner)
 
-        # All EMU batches run in parallel across remaining threads
         emu_futures = []
         if not args.no_emu:
             print(f"  EMU: {len(runnable)} batches (parallel, -j{emu_jobs})")
             emu_futures = [pool.submit(run_batch_emu, b) for b in runnable]
 
-        # Wait for everything
         for f in emu_futures:
             f.result()
         if hw_future:
             hw_future.result()
 
     print()
-    results = batches
 
-    # Write sweep manifest
-    sweep_manifest = {
-        "test_name": test_name,
-        "num_batches": num_batches,
-        "batches": results,
-    }
-    manifest_path = output_dir / "sweep-manifest.json"
-    manifest_path.write_text(json.dumps(sweep_manifest, indent=2) + "\n")
-
-    # Collect trace files for merging
-    hw_traces = [r["hw_trace"] for r in results if r.get("hw_trace")]
-    emu_traces = [r["emu_trace"] for r in results if r.get("emu_trace")]
-
-    script_dir = Path(__file__).parent
+    # Merge traces.
     merge_script = script_dir / "trace-merge.py"
+    hw_traces = [r["hw_trace"] for r in batches if r.get("hw_trace")]
+    emu_traces = [r["emu_trace"] for r in batches if r.get("emu_trace")]
 
     if hw_traces and merge_script.exists():
-        print(f"\nMerging {len(hw_traces)} hardware traces...")
+        print(f"  Merging {len(hw_traces)} hardware traces...")
         hw_merged = output_dir / "hw-merged.json"
         subprocess.run(
             [sys.executable, str(merge_script)] + hw_traces + ["-o", str(hw_merged)],
@@ -665,21 +904,21 @@ def main():
         )
 
     if emu_traces and merge_script.exists():
-        print(f"\nMerging {len(emu_traces)} emulator traces...")
+        print(f"  Merging {len(emu_traces)} emulator traces...")
         emu_merged = output_dir / "emu-merged.json"
         subprocess.run(
             [sys.executable, str(merge_script)] + emu_traces + ["-o", str(emu_merged)],
             timeout=120,
         )
 
-    # Cross-platform comparison (if both HW and EMU ran)
+    # Cross-platform comparison (if both HW and EMU ran).
     compare_script = script_dir / "trace-compare.py"
     hw_merged = output_dir / "hw-merged.json"
     emu_merged = output_dir / "emu-merged.json"
     report_path = output_dir / "comparison-report.txt"
 
     if hw_merged.exists() and emu_merged.exists() and compare_script.exists():
-        print(f"\nComparing HW vs EMU (boot-normalized)...")
+        print(f"  Comparing HW vs EMU (boot-normalized)...")
         subprocess.run(
             [
                 sys.executable, str(compare_script),
@@ -689,7 +928,37 @@ def main():
             timeout=120,
         )
 
-    # Summary
+    return batches
+
+
+def _write_single_pass_manifest(
+    output_dir: Path,
+    test_name: str,
+    num_batches: int,
+    results: list[dict],
+):
+    """Write the sweep-manifest.json for a single-pass sweep."""
+    sweep_manifest = {
+        "test_name": test_name,
+        "num_batches": num_batches,
+        "batches": results,
+    }
+    manifest_path = output_dir / "sweep-manifest.json"
+    manifest_path.write_text(json.dumps(sweep_manifest, indent=2) + "\n")
+
+
+def _print_summary(
+    output_dir: Path,
+    test_name: str,
+    num_batches: int,
+    results: list[dict],
+):
+    """Print end-of-sweep summary for a single-pass sweep."""
+    manifest_path = output_dir / "sweep-manifest.json"
+    hw_merged = output_dir / "hw-merged.json"
+    emu_merged = output_dir / "emu-merged.json"
+    report_path = output_dir / "comparison-report.txt"
+
     print(f"\nSweep complete: {test_name}")
     print(f"  Batches:  {num_batches}")
     ok = sum(1 for r in results if r["status"] == "ok")
