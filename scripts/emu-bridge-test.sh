@@ -939,12 +939,20 @@ trace_one_test() {
       return
     fi
 
-    # Check if injection was skipped (unsupported test)
-    if python3 -c "import json,sys; m=json.load(open('$manifest')); sys.exit(0 if m.get('skipped') else 1)" 2>/dev/null; then
-      echo "SKIP unsupported" > "$summary_file"
-      echo "  TRACE $name ($compiler): SKIP (unsupported)"
+    # Check if injection was skipped (routing infeasible, already traced, etc.)
+    local skip_reason
+    skip_reason="$(python3 -c "
+import json, sys
+m = json.load(open('$manifest'))
+if m.get('skipped'):
+    print(m.get('reason', 'unsupported'))
+else:
+    sys.exit(1)
+" 2>/dev/null)" && {
+      echo "SKIP $skip_reason" > "$summary_file"
+      echo "  TRACE $name ($compiler): SKIP ($skip_reason)"
       return
-    fi
+    }
 
     # Step 2: Compile traced xclbin
     local aiecc_compiler_flags="--no-xchesscc"

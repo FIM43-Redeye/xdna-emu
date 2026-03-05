@@ -1789,6 +1789,35 @@ def main():
         )
         sys.exit(0)
 
+    # Hard guard: check trace quarantine list.
+    # Some tests cause IOMMU page faults and full NPU wedge when trace
+    # routes are injected (control packet stream collisions, shim DMA
+    # port contention).  The quarantine file is the authoritative list
+    # of known-dangerous tests.  This guard runs here (not just in the
+    # bridge script) so that standalone trace-inject.py calls are also
+    # protected.
+    quarantine_file = Path(__file__).parent.parent / "scripts" / "trace-quarantine.txt"
+    if quarantine_file.exists():
+        quarantined = set()
+        for line in quarantine_file.read_text().splitlines():
+            entry = line.split("#")[0].strip()
+            if entry:
+                quarantined.add(entry)
+        if test_dir.name in quarantined:
+            reason = "routing_conflict"
+            print(f"Skipping {test_dir.name}: trace-quarantined ({reason})",
+                  file=sys.stderr)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            manifest = {
+                "test_name": test_dir.name,
+                "skipped": True,
+                "reason": reason,
+            }
+            (output_dir / "manifest.json").write_text(
+                json.dumps(manifest, indent=2) + "\n"
+            )
+            sys.exit(0)
+
     # Load custom events config if provided
     events_config = None
     if args.events_json:
