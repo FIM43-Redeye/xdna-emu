@@ -223,13 +223,24 @@ impl ControlUnit {
                     raw_lock_id, tile, &mut mem_tile_locks,
                 );
 
-                let old_value = locks[lock_id as usize].value;
-                let lock = &mut locks[lock_id as usize];
-
-                // Release is non-blocking; overflow just saturates
-                lock.release_with_value(delta);
-                log::info!("LockRelease tile({},{}) raw={} mapped={} delta={} {} -> {} (own_tile={})",
-                    tile_col, tile_row, raw_lock_id, lock_id, delta, old_value, lock.value, is_own_tile);
+                if is_own_tile {
+                    // Own-tile release: defer by 1 cycle to model hardware lock
+                    // arbiter pipeline. The delta is buffered in core_lock_deltas
+                    // and applied at end_lock_cycle(), making it visible to DMA
+                    // in the next cycle's snapshot.
+                    let old_value = locks[lock_id as usize].value;
+                    tile.defer_core_lock_release(lock_id as usize, delta);
+                    log::info!("LockRelease tile({},{}) raw={} mapped={} delta={} value={} DEFERRED (own_tile)",
+                        tile_col, tile_row, raw_lock_id, lock_id, delta, old_value);
+                } else {
+                    // Cross-tile release (memtile path): the clone-modify-writeback
+                    // mechanism in the coordinator handles deferral separately.
+                    let old_value = locks[lock_id as usize].value;
+                    let lock = &mut locks[lock_id as usize];
+                    lock.release_with_value(delta);
+                    log::info!("LockRelease tile({},{}) raw={} mapped={} delta={} {} -> {} (cross_tile)",
+                        tile_col, tile_row, raw_lock_id, lock_id, delta, old_value, lock.value);
+                }
                 Some(ExecuteResult::Continue)
             }
 
@@ -601,7 +612,12 @@ mod tests {
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
-        assert_eq!(tile.locks[3].value, 1); // Lock released
+        // Release is deferred: committed value unchanged, effective includes delta
+        assert_eq!(tile.locks[3].value, 0, "Committed value unchanged (deferred)");
+        assert_eq!(tile.effective_lock_value(3), 1, "Effective value includes pending release");
+        // After end_lock_cycle, the release is committed
+        tile.end_lock_cycle();
+        assert_eq!(tile.locks[3].value, 1, "Committed after end_lock_cycle");
     }
 
     #[test]
@@ -680,7 +696,9 @@ mod tests {
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
-        assert_eq!(tile.locks[3].value, 4, "Lock should go from 0 to 4 (0 + 4)");
+        assert_eq!(tile.effective_lock_value(3), 4, "Effective: 0 + 4 = 4");
+        tile.end_lock_cycle();
+        assert_eq!(tile.locks[3].value, 4, "Committed after end_lock_cycle");
     }
 
     #[test]
@@ -697,7 +715,9 @@ mod tests {
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
-        assert_eq!(tile.locks[4].value, 8); // 5 + 3 = 8
+        assert_eq!(tile.effective_lock_value(4), 8, "Effective: 5 + 3 = 8");
+        tile.end_lock_cycle();
+        assert_eq!(tile.locks[4].value, 8);
     }
 
     #[test]
@@ -714,8 +734,11 @@ mod tests {
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
-        assert_eq!(tile.locks[6].value, 63); // Saturated at MAX
-        assert!(tile.locks[6].overflow); // Overflow flag set
+        // Deferred: effective value saturates, committed unchanged
+        assert_eq!(tile.effective_lock_value(6), 63, "Effective saturates at MAX");
+        tile.end_lock_cycle();
+        assert_eq!(tile.locks[6].value, 63, "Committed saturated at MAX");
+        assert!(tile.locks[6].overflow, "Overflow flag set");
     }
 
     #[test]
@@ -751,7 +774,47 @@ mod tests {
 
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
-        assert_eq!(tile.locks[0].value, 1); // Lock 0 released (mapped from 48)
+        // Lock ID 48 maps to own-tile lock 0 (East/Internal quadrant), deferred
+        assert_eq!(tile.effective_lock_value(0), 1, "Effective: 0 + 1 = 1");
+        tile.end_lock_cycle();
+        assert_eq!(tile.locks[0].value, 1, "Committed after end_lock_cycle");
+    }
+
+    #[test]
+    fn test_lock_release_deferred_not_visible_to_snapshot() {
+        // Verify the 1-cycle lock arbiter pipeline: a core lock release
+        // at cycle N is NOT visible to snapshot-based operations (DMA)
+        // until cycle N+1.
+        let mut tile = make_tile();
+        let mut ctx = make_ctx();
+        use crate::device::tile::LockResult;
+
+        tile.locks[5].value = 0;
+
+        // Core releases lock 5 (deferred)
+        let op = SlotOp::from_semantic(SlotIndex::Control, SemanticOp::LockRelease)
+            .with_source(Operand::Lock(5));
+        ControlUnit::execute(&op, &mut ctx, &mut tile);
+
+        // Simulate DMA phase: snapshot sees committed value (0), not deferred (+1)
+        tile.begin_lock_cycle();
+        assert_eq!(tile.lock_snapshot_value(5), 0, "Snapshot must NOT see deferred release");
+
+        // DMA tries to acquire lock 5 (needs value >= 1) -- should FAIL
+        let result = tile.try_acquire_snapshot(5, 1, -1, false);
+        assert_eq!(result, LockResult::PreconditionNotMet, "DMA cannot acquire yet");
+
+        // End cycle: applies both DMA deltas (none) and core deltas (+1)
+        tile.end_lock_cycle();
+        assert_eq!(tile.locks[5].value, 1, "Core release now committed");
+
+        // NEXT cycle: snapshot sees the committed release
+        tile.begin_lock_cycle();
+        assert_eq!(tile.lock_snapshot_value(5), 1, "Next cycle snapshot sees release");
+
+        // DMA can now acquire
+        let result = tile.try_acquire_snapshot(5, 1, -1, false);
+        assert_eq!(result, LockResult::Success, "DMA acquires on next cycle");
     }
 
     #[test]

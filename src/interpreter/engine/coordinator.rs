@@ -440,14 +440,21 @@ impl InterpreterEngine {
         // Phase 1: Sync DMA start requests from tiles to DMA engines
         self.sync_dma_start_requests();
 
-        // Phase 2: Step each enabled core FIRST.
+        // Phase 2: Step each enabled core.
         //
-        // On real hardware, cores and DMAs run truly concurrently -- a lock
-        // released by the core at cycle N is visible to DMA in the same
-        // cycle. In our turn-based simulation, whoever runs second sees
-        // stale lock state. Running cores first means core lock releases
-        // (the producer side of the producer-consumer handoff) are committed
-        // before DMA checks them, matching hardware's same-cycle visibility.
+        // Core lock releases are DEFERRED: they write to core_lock_deltas
+        // instead of modifying lock.value directly. This models the hardware
+        // lock arbiter pipeline -- on real AIE2, the arbiter handles one
+        // request per clock cycle (AM020), so a core release at cycle N
+        // becomes visible to DMA at cycle N+1.
+        //
+        // The deferred deltas are applied in end_lock_cycle() during Phase 3,
+        // so the NEXT cycle's begin_lock_cycle() snapshot will include them.
+        //
+        // Core lock acquires still read lock.value directly (committed state
+        // from previous cycles). This is correct: the arbiter snapshot at
+        // cycle start determines acquire success, and the acquire decrement
+        // is immediate (the core stalls if precondition isn't met).
         //
         // DMA-to-core lock visibility (the reverse direction) is handled by
         // step_data_movement's internal lock snapshot/commit, which commits
@@ -549,18 +556,32 @@ impl InterpreterEngine {
                     neighbors.apply_writes(&mut self.device);
                 }
 
-                // Copy modified memory tile locks back to the MemTile
+                // Defer modified memory tile locks to the MemTile's core_lock_deltas.
+                //
+                // Instead of writing back directly (which would make core lock
+                // releases visible to MemTile DMA in the same cycle), we compute
+                // the diff and add it to core_lock_deltas. This models the 1-cycle
+                // lock arbiter pipeline: core releases at cycle N become visible
+                // to DMA at cycle N+1.
                 if let Some(mem_locks) = mem_tile_locks_copy {
                     if let Some(mem_tile) = self.device.tile_mut(col, mem_tile_row) {
-                        mem_tile.locks.copy_from_slice(&mem_locks);
+                        for i in 0..mem_locks.len().min(mem_tile.locks.len()) {
+                            let delta = (mem_locks[i].value as i16) - (mem_tile.locks[i].value as i16);
+                            if delta != 0 {
+                                mem_tile.defer_core_lock_release(i, delta as i8);
+                            }
+                        }
                     }
                 }
             }
         }
 
         // Phase 3: Step all DMA engines and stream routing.
-        // Core lock releases from Phase 2 are now committed, so DMA lock
-        // acquisition checks see same-cycle core releases (matching hardware).
+        //
+        // Core lock releases from Phase 2 are in core_lock_deltas (deferred).
+        // begin_lock_cycle() snapshots lock.value (without core releases).
+        // end_lock_cycle() applies both DMA deltas and core_lock_deltas,
+        // so the new values become visible in the NEXT cycle's snapshot.
         //
         // Set cycle timestamp on DMA engines before stepping so trace
         // events get the correct cycle number.

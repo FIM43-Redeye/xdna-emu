@@ -657,9 +657,23 @@ pub struct Tile {
     /// ensuring all requestors see the same values regardless of processing order.
     lock_snapshot: Vec<i8>,
 
-    /// Pending lock deltas to apply at end of cycle.
+    /// Pending lock deltas from DMA operations to apply at end of cycle.
     /// Releases add positive deltas, acquires add negative deltas.
     lock_deltas: Vec<i8>,
+
+    /// Pending lock deltas from core operations (lock release instructions).
+    ///
+    /// Core lock releases are deferred by 1 cycle to model the hardware lock
+    /// arbiter pipeline. On real AIE2 hardware, a core lock release instruction
+    /// sends a request to the lock arbiter, which processes it and makes the
+    /// new value visible to other requestors (DMA, other cores) in the NEXT
+    /// cycle. The AM020 architecture manual states the lock arbiter "handles
+    /// a new request every clock cycle" with round-robin arbitration.
+    ///
+    /// These deltas are accumulated during Phase 2 (core stepping) and applied
+    /// alongside DMA deltas in `end_lock_cycle()` during Phase 3. This means
+    /// DMA sees core releases with a 1-cycle delay, matching hardware.
+    core_lock_deltas: Vec<i8>,
 
     // === Warm data (accessed during DMA) ===
 
@@ -879,6 +893,7 @@ impl Tile {
             locks: vec![Lock::default(); params.num_locks],
             lock_snapshot: vec![0; params.num_locks],
             lock_deltas: vec![0; params.num_locks],
+            core_lock_deltas: vec![0; params.num_locks],
             dma_bds: vec![DmaBufferDescriptor::default(); params.num_bds],
             dma_channels: vec![DmaChannel::default(); params.num_channels],
             stream_input: Default::default(),
@@ -1163,13 +1178,51 @@ impl Tile {
         );
     }
 
+    // === Core Lock Release Deferral ===
+    //
+    // Core lock releases are deferred by 1 cycle to model the hardware lock
+    // arbiter pipeline. Core release deltas accumulate in `core_lock_deltas`
+    // during Phase 2 (core stepping) and are applied to `lock.value` in
+    // `end_lock_cycle()` during Phase 3.
+
+    /// Defer a core lock release by 1 cycle.
+    ///
+    /// Called from core instruction execution (LockRelease semantic op).
+    /// The delta is buffered and applied at `end_lock_cycle()`, making it
+    /// visible to DMA in the NEXT cycle's snapshot -- matching hardware's
+    /// lock arbiter pipeline latency.
+    #[inline]
+    pub fn defer_core_lock_release(&mut self, lock_id: usize, delta: i8) {
+        if lock_id < self.core_lock_deltas.len() {
+            let old = self.core_lock_deltas[lock_id];
+            self.core_lock_deltas[lock_id] = self.core_lock_deltas[lock_id].saturating_add(delta);
+            log::debug!("Tile({},{}) defer_core_lock_release lock {} delta {} (old_delta={}, new_delta={})",
+                self.col, self.row, lock_id, delta, old, self.core_lock_deltas[lock_id]);
+        }
+    }
+
+    /// Get the effective lock value including pending core release deltas.
+    ///
+    /// Returns the committed lock value plus any deferred core release deltas
+    /// that haven't been applied yet. Useful for testing and debugging.
+    #[inline]
+    pub fn effective_lock_value(&self, lock_id: usize) -> i8 {
+        if lock_id < self.locks.len() {
+            let committed = self.locks[lock_id].value;
+            let core_delta = self.core_lock_deltas[lock_id];
+            (committed as i16 + core_delta as i16).clamp(Lock::MIN_VALUE as i16, Lock::MAX_VALUE as i16) as i8
+        } else {
+            0
+        }
+    }
+
     // === Lock Arbiter Methods ===
     //
     // These methods implement snapshot-based lock arbitration for cycle-accurate
     // emulation. Within a single cycle:
     // 1. `begin_lock_cycle()` - snapshot current lock values
-    // 2. All lock operations (DMA, core) use `try_acquire_snapshot()` / `release_snapshot()`
-    // 3. `end_lock_cycle()` - apply accumulated deltas to actual lock values
+    // 2. All DMA lock operations use `try_acquire_snapshot()` / `release_snapshot()`
+    // 3. `end_lock_cycle()` - apply accumulated DMA deltas AND deferred core deltas
     //
     // This ensures all requestors see the same lock state regardless of processing
     // order within a cycle, matching hardware arbiter behavior.
@@ -1192,7 +1245,9 @@ impl Tile {
                     non_zero.join(", "), self);
             }
         }
-        // Snapshot current values and clear deltas from previous cycle
+        // Snapshot current values and clear DMA deltas.
+        // Note: core_lock_deltas are NOT cleared here -- they persist from
+        // Phase 2 (core stepping) until end_lock_cycle() applies them.
         let num_locks = self.locks.len();
         for i in 0..num_locks {
             self.lock_snapshot[i] = self.locks[i].value;
@@ -1262,45 +1317,57 @@ impl Tile {
         }
     }
 
-    /// End a lock cycle by applying accumulated deltas.
+    /// End a lock cycle by applying accumulated DMA and core deltas.
     ///
     /// Call this at the end of each simulation cycle, after all lock operations.
-    /// Applies all recorded deltas to the actual lock values, with clamping.
+    /// Applies both DMA deltas (from snapshot-based operations) and deferred
+    /// core lock release deltas to the actual lock values, with clamping.
+    /// Clears both delta buffers.
     #[inline]
     pub fn end_lock_cycle(&mut self) {
         // Debug: log all non-zero deltas for Tile(0,1)
         if self.col == 0 && self.row == 1 {
-            let non_zero: Vec<_> = self.lock_deltas.iter().enumerate()
+            let non_zero_dma: Vec<_> = self.lock_deltas.iter().enumerate()
                 .filter(|(_, &d)| d != 0)
                 .map(|(i, &d)| format!("{}:{}", i, d))
                 .collect();
-            if !non_zero.is_empty() {
-                log::debug!("Tile(0,1) end_lock_cycle: non-zero deltas = [{}] self_ptr={:p}",
-                    non_zero.join(", "), self);
+            let non_zero_core: Vec<_> = self.core_lock_deltas.iter().enumerate()
+                .filter(|(_, &d)| d != 0)
+                .map(|(i, &d)| format!("{}:{}", i, d))
+                .collect();
+            if !non_zero_dma.is_empty() || !non_zero_core.is_empty() {
+                log::debug!("Tile(0,1) end_lock_cycle: dma_deltas=[{}] core_deltas=[{}] self_ptr={:p}",
+                    non_zero_dma.join(", "), non_zero_core.join(", "), self);
             }
         }
         let num_locks = self.locks.len();
         for i in 0..num_locks {
-            let delta = self.lock_deltas[i];
-            if delta != 0 {
+            // Combine DMA deltas and deferred core release deltas
+            let dma_delta = self.lock_deltas[i];
+            let core_delta = self.core_lock_deltas[i];
+            let total_delta = (dma_delta as i16) + (core_delta as i16);
+            if total_delta != 0 {
                 let old_value = self.locks[i].value;
-                let new_value = (old_value as i16) + (delta as i16);
+                let new_value = (old_value as i16) + total_delta;
                 if new_value < Lock::MIN_VALUE as i16 {
                     self.locks[i].underflow = true;
                     self.locks[i].value = Lock::MIN_VALUE;
                     log::debug!("Tile({},{}) lock {} end_cycle: {}+({})=MIN (clamped, underflow)",
-                        self.col, self.row, i, old_value, delta);
+                        self.col, self.row, i, old_value, total_delta);
                 } else if new_value > Lock::MAX_VALUE as i16 {
                     self.locks[i].overflow = true;
                     self.locks[i].value = Lock::MAX_VALUE;
                     log::debug!("Tile({},{}) lock {} end_cycle: {}+({})->MAX (overflow)",
-                        self.col, self.row, i, old_value, delta);
+                        self.col, self.row, i, old_value, total_delta);
                 } else {
                     self.locks[i].value = new_value as i8;
                     log::debug!("Tile({},{}) lock {} end_cycle: {}+({})={}",
-                        self.col, self.row, i, old_value, delta, new_value);
+                        self.col, self.row, i, old_value, total_delta, new_value);
                 }
             }
+            // Clear both delta buffers
+            self.lock_deltas[i] = 0;
+            self.core_lock_deltas[i] = 0;
         }
     }
 
