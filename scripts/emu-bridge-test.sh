@@ -914,7 +914,7 @@ trace_one_test() {
     python3 "$tools_dir/trace-trim.py" --dir "$trace_dir/sweep" >> "$log_file" 2>&1 || true
 
     # Compare
-    if ! run_trace_compare --sweep "$trace_dir/sweep" \
+    if ! run_trace_compare --sweep "$trace_dir/sweep" --remap-columns \
         -o "$trace_dir/report.txt" >> "$log_file" 2>&1; then
       echo "ERROR compare_failed" > "$summary_file"
       echo "  TRACE $name ($compiler): ERROR (compare failed)"
@@ -1015,6 +1015,7 @@ trace_one_test() {
       if ! run_trace_compare \
           --hw "$trace_dir/hw/trace_raw.bin" \
           --emu "$trace_dir/emu/trace_raw.bin" \
+          --remap-columns \
           -o "$trace_dir/report.txt" >> "$log_file" 2>&1; then
         echo "ERROR compare_failed" > "$summary_file"
         echo "  TRACE $name ($compiler): ERROR (compare failed)"
