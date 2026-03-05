@@ -276,9 +276,94 @@ wait_npu_idle() {
   sleep 0.5
 }
 
+# Transform a build command for Chess compilation.
+# - xchesscc_wrapper commands: pass through unchanged
+# - aiecc.py commands: ensure --xchesscc and --xbridge are present
+# - Other commands: pass through unchanged
+transform_for_chess() {
+  local cmd="$1"
+
+  if [[ "$cmd" == *xchesscc_wrapper* ]]; then
+    echo "$cmd"
+    return
+  fi
+
+  if [[ "$cmd" == *aiecc.py* ]]; then
+    # Remove any --no-xchesscc or --no-xbridge
+    cmd="${cmd//--no-xchesscc/}"
+    cmd="${cmd//--no-xbridge/}"
+    # Add --xchesscc if not present
+    if [[ "$cmd" != *"--xchesscc"* ]]; then
+      cmd="${cmd/aiecc.py/aiecc.py --xchesscc}"
+    fi
+    # Add --xbridge if not present
+    if [[ "$cmd" != *"--xbridge"* ]]; then
+      cmd="${cmd/aiecc.py/aiecc.py --xbridge}"
+    fi
+    echo "$cmd"
+    return
+  fi
+
+  echo "$cmd"
+}
+
+# Transform a build command for Peano compilation.
+# - xchesscc_wrapper commands: replace with Peano clang++ equivalent
+# - aiecc.py commands: strip --xchesscc and --xbridge, add --no-xchesscc
+# - Other commands: pass through unchanged
+transform_for_peano() {
+  local cmd="$1"
+  local src_dir="$2"
+
+  if [[ "$cmd" == *xchesscc_wrapper* ]]; then
+    # Extract -c source and -o output arguments.
+    # Pattern: xchesscc_wrapper aie2 [flags...] -c source.cc -o output.o
+    local source output
+    # Use grep -oP for argument extraction
+    source="$(echo "$cmd" | grep -oP '(?<=-c\s)\S+' || true)"
+    output="$(echo "$cmd" | grep -oP '(?<=-o\s)\S+' || true)"
+
+    if [[ -n "$source" ]] && [[ -n "$output" ]]; then
+      # Resolve source path relative to src_dir if not absolute
+      local resolved_source="$source"
+      if [[ "$source" != /* ]]; then
+        resolved_source="$src_dir/$source"
+      fi
+      # Extract any -D defines and extra -I paths from original command
+      local extra_flags=""
+      while read -r flag; do
+        [[ -n "$flag" ]] && extra_flags+=" $flag"
+      done < <(echo "$cmd" | grep -oP '\-D\S+' || true)
+      while read -r flag; do
+        [[ -n "$flag" ]] && extra_flags+=" $flag"
+      done < <(echo "$cmd" | grep -oP '\-I\s*\S+' || true)
+      # Use Peano clang with correct include path
+      echo "$PEANO_CLANG $PEANO_KERNEL_FLAGS -I$PEANO_INCLUDE${extra_flags} -c $resolved_source -o $output"
+    else
+      echo "# SKIP (unparseable xchesscc): $cmd"
+    fi
+    return
+  fi
+
+  if [[ "$cmd" == *aiecc.py* ]]; then
+    # Strip Chess flags
+    cmd="${cmd//--xchesscc/}"
+    cmd="${cmd//--xbridge/}"
+    # Ensure --no-xchesscc is present
+    if [[ "$cmd" != *"--no-xchesscc"* ]]; then
+      cmd="${cmd/aiecc.py/aiecc.py --no-xchesscc}"
+    fi
+    echo "$cmd"
+    return
+  fi
+
+  echo "$cmd"
+}
+
 # Export all helpers for xargs subshells.
 export -f is_standard_test requires_npu2 get_npu_device apply_lit_subs
 export -f extract_build_commands get_run_cmd sanitize_name wait_npu_idle
+export -f transform_for_chess transform_for_peano
 
 # ---------------------------------------------------------------------------
 # Phase 1: Discover tests
