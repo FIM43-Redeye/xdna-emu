@@ -919,167 +919,203 @@ print_report() {
   local has_trace=false
   [[ -n "$TRACE_MODE" ]] && has_trace=true
 
+  local compilers
+  read -ra compilers <<< "$COMPILERS_STR"
+  local num_compilers=${#compilers[@]}
+
   echo ""
   echo "==========================================================================="
   echo "  RESULTS"
   echo "==========================================================================="
   echo ""
 
-  # Header row adapts to which columns are active.
-  if [[ "$run_hw" == "true" ]] && $has_trace; then
-    printf "%-40s  %-10s  %-10s  %-5s  %s\n" "TEST" "BRIDGE" "HARDWARE" "MATCH" "TRACE"
-    printf "%-40s  %-10s  %-10s  %-5s  %s\n" \
-      "----------------------------------------" \
-      "----------" "----------" "-----" "------------------------------"
-  elif [[ "$run_hw" == "true" ]]; then
-    printf "%-45s  %-10s  %-10s  %-5s\n" "TEST" "BRIDGE" "HARDWARE" "MATCH"
-    printf "%-45s  %-10s  %-10s  %-5s\n" \
-      "---------------------------------------------" \
-      "----------" "----------" "-----"
-  elif $has_trace; then
-    printf "%-40s  %-10s  %s\n" "TEST" "BRIDGE" "TRACE"
-    printf "%-40s  %-10s  %s\n" \
-      "----------------------------------------" "----------" "------------------------------"
-  else
-    printf "%-45s  %-10s\n" "TEST" "BRIDGE"
-    printf "%-45s  %-10s\n" \
-      "---------------------------------------------" "----------"
-  fi
+  # --- Header ---
+  # Build dynamic header based on active compilers and modes.
+  local name_width=40
+  local col_width=10
 
-  local pass_bridge=0 fail_bridge=0 skip_bridge=0 timeout_bridge=0 emumiss_bridge=0
-  local pass_hw=0 fail_hw=0 skip_hw=0 timeout_hw=0
-  local match_count=0 mismatch_count=0
+  # Print header.
+  printf "%-${name_width}s" "TEST"
+  for compiler in "${compilers[@]}"; do
+    local label
+    label="$(echo "$compiler" | sed 's/./\U&/')"  # Capitalize first letter
+    if [[ "$run_hw" == "true" ]]; then
+      printf "  %-${col_width}s" "${label}/HW"
+    fi
+    printf "  %-${col_width}s" "${label}/EMU"
+  done
+  if $has_trace; then
+    printf "  %s" "TRACE"
+  fi
+  echo ""
+
+  # Print separator.
+  printf "%-${name_width}s" "$(printf '%0.s-' $(seq 1 $name_width))"
+  for compiler in "${compilers[@]}"; do
+    if [[ "$run_hw" == "true" ]]; then
+      printf "  %-${col_width}s" "$(printf '%0.s-' $(seq 1 $col_width))"
+    fi
+    printf "  %-${col_width}s" "$(printf '%0.s-' $(seq 1 $col_width))"
+  done
+  if $has_trace; then
+    printf "  %s" "$(printf '%0.s-' $(seq 1 30))"
+  fi
+  echo ""
+
+  # --- Per-compiler counters ---
+  # Use associative arrays keyed by compiler.
+  declare -A compile_ok compile_fail
+  declare -A bridge_pass bridge_fail bridge_skip bridge_timeout bridge_emumiss
+  declare -A hw_pass hw_fail hw_skip hw_timeout
+  for compiler in "${compilers[@]}"; do
+    compile_ok[$compiler]=0
+    compile_fail[$compiler]=0
+    bridge_pass[$compiler]=0
+    bridge_fail[$compiler]=0
+    bridge_skip[$compiler]=0
+    bridge_timeout[$compiler]=0
+    bridge_emumiss[$compiler]=0
+    hw_pass[$compiler]=0
+    hw_fail[$compiler]=0
+    hw_skip[$compiler]=0
+    hw_timeout[$compiler]=0
+  done
   local trace_clean=0 trace_diverge=0 trace_error=0 trace_skip=0
 
+  local has_compile_fail=false
+
+  # --- Data rows ---
   for name in "${test_list[@]}"; do
     local safe
     safe="$(sanitize_name "$name")"
 
-    # Read compile result -- skip tests that failed to compile.
-    local compile_result="OK"
-    if [[ -f "$RESULTS_DIR/${safe}.compile.result" ]]; then
-      compile_result="$(< "$RESULTS_DIR/${safe}.compile.result")"
-    fi
-    if [[ "$compile_result" != "OK" ]]; then
-      if [[ "$run_hw" == "true" ]] && $has_trace; then
-        printf "%-40s  %-10s  %-10s  %-5s  %s\n" "$name" "COMP_FAIL" "COMP_FAIL" "-" "-"
-      elif [[ "$run_hw" == "true" ]]; then
-        printf "%-45s  %-10s  %-10s  %-5s\n" "$name" "COMP_FAIL" "COMP_FAIL" "-"
-      elif $has_trace; then
-        printf "%-40s  %-10s  %s\n" "$name" "COMP_FAIL" "-"
-      else
-        printf "%-45s  %-10s\n" "$name" "COMP_FAIL"
+    printf "%-${name_width}s" "$name"
+
+    for compiler in "${compilers[@]}"; do
+      # Read compile result.
+      local cr="FAIL"
+      [[ -f "$RESULTS_DIR/${safe}.${compiler}.compile.result" ]] && \
+        cr="$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")"
+
+      if [[ "$cr" != "OK" ]]; then
+        compile_fail[$compiler]=$(( ${compile_fail[$compiler]} + 1 ))
+        has_compile_fail=true
+        if [[ "$run_hw" == "true" ]]; then
+          printf "  %-${col_width}s" "FAIL*"
+        fi
+        printf "  %-${col_width}s" "FAIL*"
+        continue
       fi
-      ((skip_bridge++)) || true
-      ((skip_hw++)) || true
-      continue
-    fi
 
-    # Read bridge result.
-    local bridge_result="SKIP"
-    if [[ -f "$RESULTS_DIR/${safe}.bridge.result" ]]; then
-      bridge_result="$(< "$RESULTS_DIR/${safe}.bridge.result")"
-    fi
-    case "$bridge_result" in
-      PASS)     ((pass_bridge++)) || true ;;
-      TIMEOUT)  ((timeout_bridge++)); ((fail_bridge++)) || true ;;
-      EMU_MISS) ((emumiss_bridge++)); ((fail_bridge++)) || true ;;
-      SKIP*)    ((skip_bridge++)) || true ;;
-      *)        ((fail_bridge++)) || true ;;
-    esac
+      compile_ok[$compiler]=$(( ${compile_ok[$compiler]} + 1 ))
 
-    # Read hardware result.
-    local hw_result="SKIP"
-    if [[ "$run_hw" == "true" ]] && [[ -f "$RESULTS_DIR/${safe}.hw.result" ]]; then
-      hw_result="$(< "$RESULTS_DIR/${safe}.hw.result")"
-    fi
-    if [[ "$run_hw" == "true" ]]; then
-      case "$hw_result" in
-        PASS)    ((pass_hw++)) || true ;;
-        TIMEOUT) ((timeout_hw++)); ((fail_hw++)) || true ;;
-        SKIP*)   ((skip_hw++)) || true ;;
-        *)       ((fail_hw++)) || true ;;
-      esac
-    fi
-
-    # Read trace summary (if tracing was enabled).
-    local trace_summary="-"
-    if $has_trace && [[ -f "$RESULTS_DIR/${safe}.trace.summary" ]]; then
-      trace_summary="$(< "$RESULTS_DIR/${safe}.trace.summary")"
-      case "$trace_summary" in
-        CLEAN*)   ((trace_clean++)) || true ;;
-        DIVERGE*) ((trace_diverge++)) || true ;;
-        ERROR*)   ((trace_error++)) || true ;;
-        SKIP*|EMU_ONLY*) ((trace_skip++)) || true ;;
-      esac
-    elif $has_trace; then
-      ((trace_skip++)) || true
-    fi
-
-    # Compute match column.
-    local match="-"
-    if [[ "$run_hw" == "true" ]]; then
-      if [[ "$bridge_result" == "SKIP"* ]] || [[ "$hw_result" == "SKIP"* ]]; then
-        match="-"
-      elif [[ "$bridge_result" == "$hw_result" ]]; then
-        match="yes"
-        ((match_count++)) || true
-      else
-        match="NO"
-        ((mismatch_count++)) || true
+      # Read HW result.
+      if [[ "$run_hw" == "true" ]]; then
+        local hr="SKIP"
+        [[ -f "$RESULTS_DIR/${safe}.${compiler}.hw.result" ]] && \
+          hr="$(< "$RESULTS_DIR/${safe}.${compiler}.hw.result")"
+        printf "  %-${col_width}s" "$hr"
+        case "$hr" in
+          PASS)    hw_pass[$compiler]=$(( ${hw_pass[$compiler]} + 1 )) ;;
+          TIMEOUT) hw_timeout[$compiler]=$(( ${hw_timeout[$compiler]} + 1 ))
+                   hw_fail[$compiler]=$(( ${hw_fail[$compiler]} + 1 )) ;;
+          SKIP*)   hw_skip[$compiler]=$(( ${hw_skip[$compiler]} + 1 )) ;;
+          *)       hw_fail[$compiler]=$(( ${hw_fail[$compiler]} + 1 )) ;;
+        esac
       fi
+
+      # Read bridge (EMU) result.
+      local br="SKIP"
+      [[ -f "$RESULTS_DIR/${safe}.${compiler}.bridge.result" ]] && \
+        br="$(< "$RESULTS_DIR/${safe}.${compiler}.bridge.result")"
+      printf "  %-${col_width}s" "$br"
+      case "$br" in
+        PASS)     bridge_pass[$compiler]=$(( ${bridge_pass[$compiler]} + 1 )) ;;
+        TIMEOUT)  bridge_timeout[$compiler]=$(( ${bridge_timeout[$compiler]} + 1 ))
+                  bridge_fail[$compiler]=$(( ${bridge_fail[$compiler]} + 1 )) ;;
+        EMU_MISS) bridge_emumiss[$compiler]=$(( ${bridge_emumiss[$compiler]} + 1 ))
+                  bridge_fail[$compiler]=$(( ${bridge_fail[$compiler]} + 1 )) ;;
+        SKIP*)    bridge_skip[$compiler]=$(( ${bridge_skip[$compiler]} + 1 )) ;;
+        *)        bridge_fail[$compiler]=$(( ${bridge_fail[$compiler]} + 1 )) ;;
+      esac
+    done
+
+    # Trace column (not per-compiler yet).
+    if $has_trace; then
+      local trace_summary="-"
+      if [[ -f "$RESULTS_DIR/${safe}.trace.summary" ]]; then
+        trace_summary="$(< "$RESULTS_DIR/${safe}.trace.summary")"
+        case "$trace_summary" in
+          CLEAN*)   ((trace_clean++)) || true ;;
+          DIVERGE*) ((trace_diverge++)) || true ;;
+          ERROR*)   ((trace_error++)) || true ;;
+          SKIP*|EMU_ONLY*) ((trace_skip++)) || true ;;
+        esac
+      else
+        ((trace_skip++)) || true
+      fi
+      printf "  %s" "$trace_summary"
     fi
 
-    # Print row.
-    if [[ "$run_hw" == "true" ]] && $has_trace; then
-      printf "%-40s  %-10s  %-10s  %-5s  %s\n" "$name" "$bridge_result" "$hw_result" "$match" "$trace_summary"
-    elif [[ "$run_hw" == "true" ]]; then
-      printf "%-45s  %-10s  %-10s  %-5s\n" "$name" "$bridge_result" "$hw_result" "$match"
-    elif $has_trace; then
-      printf "%-40s  %-10s  %s\n" "$name" "$bridge_result" "$trace_summary"
-    else
-      printf "%-45s  %-10s\n" "$name" "$bridge_result"
-    fi
+    echo ""
 
     # Verbose: show log tail on failure.
-    if [[ "$VERBOSE" == "true" ]] && [[ "$bridge_result" != "PASS" ]] && [[ "$bridge_result" != "SKIP"* ]]; then
-      local logf="$RESULTS_DIR/${safe}.bridge.log"
-      if [[ -f "$logf" ]]; then
-        echo "    --- bridge log tail ---"
-        tail -5 "$logf" | sed 's/^/    /'
-      fi
-    fi
-    if [[ "$VERBOSE" == "true" ]] && [[ "$run_hw" == "true" ]] && \
-       [[ "$hw_result" != "PASS" ]] && [[ "$hw_result" != "SKIP"* ]]; then
-      local logf="$RESULTS_DIR/${safe}.hw.log"
-      if [[ -f "$logf" ]]; then
-        echo "    --- hw log tail ---"
-        tail -5 "$logf" | sed 's/^/    /'
-      fi
+    if [[ "$VERBOSE" == "true" ]]; then
+      for compiler in "${compilers[@]}"; do
+        local br="SKIP"
+        [[ -f "$RESULTS_DIR/${safe}.${compiler}.bridge.result" ]] && \
+          br="$(< "$RESULTS_DIR/${safe}.${compiler}.bridge.result")"
+        if [[ "$br" != "PASS" ]] && [[ "$br" != "SKIP"* ]]; then
+          local logf="$RESULTS_DIR/${safe}.${compiler}.bridge.log"
+          if [[ -f "$logf" ]]; then
+            echo "    --- $compiler bridge log tail ---"
+            tail -5 "$logf" | sed 's/^/    /'
+          fi
+        fi
+        if [[ "$run_hw" == "true" ]]; then
+          local hr="SKIP"
+          [[ -f "$RESULTS_DIR/${safe}.${compiler}.hw.result" ]] && \
+            hr="$(< "$RESULTS_DIR/${safe}.${compiler}.hw.result")"
+          if [[ "$hr" != "PASS" ]] && [[ "$hr" != "SKIP"* ]]; then
+            local logf="$RESULTS_DIR/${safe}.${compiler}.hw.log"
+            if [[ -f "$logf" ]]; then
+              echo "    --- $compiler hw log tail ---"
+              tail -5 "$logf" | sed 's/^/    /'
+            fi
+          fi
+        fi
+      done
     fi
   done
 
-  # Summary.
+  # Footnote.
+  if $has_compile_fail; then
+    echo ""
+    echo "* = compile failed"
+  fi
+
+  # --- Summary ---
   echo ""
   echo "=== Summary ==="
-  echo "Bridge:   $pass_bridge pass, $fail_bridge fail, $skip_bridge skip"
-  if [[ $timeout_bridge -gt 0 ]]; then
-    echo "          ($timeout_bridge timeout)"
-  fi
-  if [[ $emumiss_bridge -gt 0 ]]; then
-    echo "          ($emumiss_bridge EMU_MISS -- emulator not detected in log!)"
-  fi
-  if [[ "$run_hw" == "true" ]]; then
-    echo "Hardware: $pass_hw pass, $fail_hw fail, $skip_hw skip"
-    if [[ $timeout_hw -gt 0 ]]; then
-      echo "          ($timeout_hw timeout)"
+  for compiler in "${compilers[@]}"; do
+    local label
+    label="$(echo "$compiler" | sed 's/./\U&/')"
+    local total=$(( ${compile_ok[$compiler]} + ${compile_fail[$compiler]} ))
+    echo "${label}: ${compile_ok[$compiler]}/${total} compiled, ${bridge_pass[$compiler]} bridge pass, ${bridge_fail[$compiler]} bridge fail"
+    if [[ ${bridge_timeout[$compiler]} -gt 0 ]]; then
+      echo "  (${bridge_timeout[$compiler]} timeout)"
     fi
-    echo "Match:    $match_count match, $mismatch_count mismatch"
-  fi
+    if [[ ${bridge_emumiss[$compiler]} -gt 0 ]]; then
+      echo "  (${bridge_emumiss[$compiler]} EMU_MISS)"
+    fi
+    if [[ "$run_hw" == "true" ]]; then
+      echo "  HW: ${hw_pass[$compiler]} pass, ${hw_fail[$compiler]} fail, ${hw_skip[$compiler]} skip"
+    fi
+  done
   if $has_trace; then
-    echo "Trace:    $trace_clean clean, $trace_diverge diverge, $trace_error error, $trace_skip skip"
+    echo "Trace: $trace_clean clean, $trace_diverge diverge, $trace_error error, $trace_skip skip"
   fi
-  echo "Logs:     $RESULTS_DIR/"
+  echo "Logs: $RESULTS_DIR/"
 }
 
 # ---------------------------------------------------------------------------
