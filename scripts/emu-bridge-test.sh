@@ -13,12 +13,12 @@
 # Chess is the ground truth compiler. Peano results are informational --
 # compile failures with Peano are expected for some Chess-specific tests.
 #
-# Five-phase architecture:
-#   Phase 1: Discover     -- find tests, filter, skip npu2-only
-#   Phase 2: Compile      -- parallel xclbin builds (both compilers) + test.exe
-#   Phase 3: Run hardware -- parallel (-j5, NPU context pool)
-#   Phase 4: Run emulator -- parallel -j$(nproc) per (test, compiler) pair
-#   Phase 5: Report       -- per-compiler comparison matrix + summary
+# Four-phase pipelined architecture:
+#   Phase 1: Discover       -- find tests, filter, skip npu2-only
+#   Phase 2: Compile        -- parallel xclbin builds (both compilers in parallel) + test.exe
+#   Phase 3+4: Run HW+EMU  -- HW (-j5) and EMU (-j$JOBS) run concurrently
+#   Phase 4b: Trace         -- trace comparison (needs both HW+EMU results)
+#   Phase 5: Report         -- per-compiler comparison matrix + summary
 #
 # Usage:
 #   ./scripts/emu-bridge-test.sh                    # all tests, both compilers
@@ -536,9 +536,14 @@ compile_one() {
   local compilers
   read -ra compilers <<< "$COMPILERS_STR"
 
-  # Compile xclbin for each compiler
+  # Compile xclbin for each compiler IN PARALLEL (independent build dirs)
+  local pids=()
   for compiler in "${compilers[@]}"; do
-    compile_one_compiler "$name" "$compiler"
+    compile_one_compiler "$name" "$compiler" &
+    pids+=($!)
+  done
+  for pid in "${pids[@]}"; do
+    wait "$pid" || true
   done
 
   # Build shared test.exe (compiler-agnostic, only needs XRT)
@@ -588,7 +593,7 @@ compile_one() {
 export -f compile_one_compiler compile_one
 
 # ---------------------------------------------------------------------------
-# Phase 3: Hardware runs (parallel, capped at NPU context limit)
+# Phase 3+4: Hardware + Emulator runs (concurrent)
 # ---------------------------------------------------------------------------
 
 # Maximum concurrent NPU hardware contexts.  NPU1 supports 6, but we
@@ -645,7 +650,7 @@ run_one_hardware() {
 export -f run_one_hardware
 
 # ---------------------------------------------------------------------------
-# Phase 4: Emulator runs (parallel)
+# Emulator bridge runner (used by Phase 3+4)
 # ---------------------------------------------------------------------------
 
 run_one_bridge() {
@@ -1255,92 +1260,89 @@ main() {
     fi
   done
 
-  # ---- Phase 3: Hardware runs (serial, opt-in) ---------------------------
+  # ---- Phase 3+4: Run HW+EMU concurrently --------------------------------
 
-  if $RUN_HW; then
-    local real_bdf
-    real_bdf="$(xrt-smi examine 2>/dev/null | grep -oP '\[0000:[0-9a-f:\.]+\]' | head -1 | tr -d '[]')" || true
-
-    if [[ -z "$real_bdf" ]]; then
-      info "Phase 3: SKIPPED -- no NPU hardware detected"
-      RUN_HW=false
-    else
-      # Build job queue: (name, compiler) pairs that compiled successfully.
-      local hw_queue=()
-      for name in "${compiled[@]}"; do
-        for compiler in "${compilers[@]}"; do
-          local safe
-          safe="$(sanitize_name "$name")"
-          [[ -f "$RESULTS_DIR/${safe}.${compiler}.compile.result" ]] || continue
-          [[ "$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")" == "OK" ]] || continue
-          hw_queue+=("$name:$compiler")
-        done
-      done
-
-      info "Phase 3: Running ${#hw_queue[@]} HW job(s) (-j${NPU_HW_JOBS}, BDF=$real_bdf)"
-
-      # Parallel job pool capped at NPU_HW_JOBS concurrent contexts.
-      # Uses wait -n (bash 4.3+) to detect when a slot opens.
-      declare -A hw_pids=()   # pid -> "name:compiler"
-      local hw_done=0
-      local hw_idx=0
-
-      while [[ $hw_idx -lt ${#hw_queue[@]} ]] || [[ ${#hw_pids[@]} -gt 0 ]]; do
-        # Launch jobs while slots available and queue not empty.
-        while [[ ${#hw_pids[@]} -lt $NPU_HW_JOBS ]] && [[ $hw_idx -lt ${#hw_queue[@]} ]]; do
-          local entry="${hw_queue[$hw_idx]}"
-          local hw_name="${entry%%:*}"
-          local hw_compiler="${entry##*:}"
-          ((hw_idx++)) || true
-
-          # Launch in background subshell
-          (
-            run_one_hardware "$hw_name" "$real_bdf" "$hw_compiler"
-          ) &
-          hw_pids[$!]="$entry"
-        done
-
-        # Wait for any one job to finish (if any are running).
-        if [[ ${#hw_pids[@]} -gt 0 ]]; then
-          local done_pid=0
-          wait -n -p done_pid "${!hw_pids[@]}" 2>/dev/null || true
-
-          if [[ $done_pid -ne 0 ]] && [[ -n "${hw_pids[$done_pid]+x}" ]]; then
-            local finished="${hw_pids[$done_pid]}"
-            unset 'hw_pids[$done_pid]'
-            local fin_name="${finished%%:*}"
-            local fin_compiler="${finished##*:}"
-            local fin_safe
-            fin_safe="$(sanitize_name "$fin_name")"
-            local hr="SKIP"
-            [[ -f "$RESULTS_DIR/${fin_safe}.${fin_compiler}.hw.result" ]] && \
-              hr="$(< "$RESULTS_DIR/${fin_safe}.${fin_compiler}.hw.result")"
-            ((hw_done++)) || true
-            echo "  [${hw_done}/${#hw_queue[@]}] HW $fin_name ($fin_compiler): $hr"
-          fi
-        fi
-      done
-
-      info "Phase 3 done"
-      echo ""
-    fi
-  fi
-
-  # ---- Phase 4: Emulator runs (parallel) ---------------------------------
-
-  info "Phase 4: Running ${#compiled[@]} test(s) on emulator (-j${JOBS})"
-
+  # Build job list: (name:compiler) pairs that compiled successfully.
+  local all_jobs=()
   for name in "${compiled[@]}"; do
     for compiler in "${compilers[@]}"; do
       local safe
       safe="$(sanitize_name "$name")"
       [[ -f "$RESULTS_DIR/${safe}.${compiler}.compile.result" ]] || continue
       [[ "$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")" == "OK" ]] || continue
-      echo "$name $compiler"
+      all_jobs+=("$name:$compiler")
     done
-  done | xargs -P"$JOBS" -n2 bash -c 'run_one_bridge "$@"' _
+  done
 
-  info "Phase 4 done"
+  # Detect NPU hardware for HW runs.
+  local real_bdf=""
+  if $RUN_HW; then
+    real_bdf="$(xrt-smi examine 2>/dev/null | grep -oP '\[0000:[0-9a-f:\.]+\]' | head -1 | tr -d '[]')" || true
+    if [[ -z "$real_bdf" ]]; then
+      info "HW: SKIPPED -- no NPU hardware detected"
+      RUN_HW=false
+    fi
+  fi
+
+  info "Phase 3+4: Running ${#all_jobs[@]} job(s) (HW -j${NPU_HW_JOBS}, EMU -j${JOBS})"
+
+  # Launch EMU for all jobs (parallel, no NPU constraint).
+  for entry in "${all_jobs[@]}"; do
+    local name="${entry%%:*}" compiler="${entry##*:}"
+    echo "$name $compiler"
+  done | xargs -P"$JOBS" -n2 bash -c 'run_one_bridge "$@"' _ &
+  local emu_pool_pid=$!
+
+  # Launch HW with NPU job pool (if enabled), concurrently with EMU.
+  if $RUN_HW; then
+    # Parallel job pool capped at NPU_HW_JOBS concurrent contexts.
+    # Uses wait -n -p (bash 5.1+) to detect when a slot opens.
+    declare -A hw_pids=()   # pid -> "name:compiler"
+    local hw_done=0
+    local hw_idx=0
+
+    while [[ $hw_idx -lt ${#all_jobs[@]} ]] || [[ ${#hw_pids[@]} -gt 0 ]]; do
+      # Launch jobs while slots available and queue not empty.
+      while [[ ${#hw_pids[@]} -lt $NPU_HW_JOBS ]] && [[ $hw_idx -lt ${#all_jobs[@]} ]]; do
+        local entry="${all_jobs[$hw_idx]}"
+        local hw_name="${entry%%:*}"
+        local hw_compiler="${entry##*:}"
+        ((hw_idx++)) || true
+
+        # Launch in background subshell
+        (
+          run_one_hardware "$hw_name" "$real_bdf" "$hw_compiler"
+        ) &
+        hw_pids[$!]="$entry"
+      done
+
+      # Wait for any one job to finish (if any are running).
+      if [[ ${#hw_pids[@]} -gt 0 ]]; then
+        local done_pid=0
+        wait -n -p done_pid "${!hw_pids[@]}" 2>/dev/null || true
+
+        if [[ $done_pid -ne 0 ]] && [[ -n "${hw_pids[$done_pid]+x}" ]]; then
+          local finished="${hw_pids[$done_pid]}"
+          unset 'hw_pids[$done_pid]'
+          local fin_name="${finished%%:*}"
+          local fin_compiler="${finished##*:}"
+          local fin_safe
+          fin_safe="$(sanitize_name "$fin_name")"
+          local hr="SKIP"
+          [[ -f "$RESULTS_DIR/${fin_safe}.${fin_compiler}.hw.result" ]] && \
+            hr="$(< "$RESULTS_DIR/${fin_safe}.${fin_compiler}.hw.result")"
+          ((hw_done++)) || true
+          echo "  [${hw_done}/${#all_jobs[@]}] HW $fin_name ($fin_compiler): $hr"
+        fi
+      fi
+    done
+
+    info "HW runs done"
+  fi
+
+  # Wait for EMU pool to finish.
+  wait "$emu_pool_pid" 2>/dev/null || true
+  info "EMU runs done"
   echo ""
 
   # ---- Phase 4b: Trace comparison (optional) ------------------------------
