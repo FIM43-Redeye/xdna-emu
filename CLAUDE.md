@@ -102,10 +102,10 @@ See [ROADMAP.md](ROADMAP.md) for detailed status with confidence markers
 
 | Phase | Status | Summary |
 |-------|--------|---------|
-| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | Functional | Unit tests pass; real-binary coverage is thin |
+| [1. Core Accuracy](docs/roadmap/phase1-core-accuracy.md) | Functional | 1,635+ unit tests; 12+ bridge tests pass |
 | [2. Toolchain Integration](docs/roadmap/phase2-toolchain-integration.md) | Not started | Peano-first; Vitis deferred to post-1.0 |
 | [3. Developer Experience](docs/roadmap/phase3-developer-experience.md) | GUI exists | GUI renders; debugging features not built |
-| [4. Validation & Testing](docs/roadmap/phase4-validation-testing.md) | In progress | Test harness exists; coverage has major gaps |
+| [4. Validation & Testing](docs/roadmap/phase4-validation-testing.md) | Active | Dual-compiler bridge tests, trace sweep, parallel HW |
 | [5. Production Readiness](docs/roadmap/phase5-production-readiness.md) | Not started | |
 | [6. Community & Ecosystem](docs/roadmap/phase6-community-ecosystem.md) | Not started | |
 
@@ -401,6 +401,13 @@ cargo bench
 # Profile (generates flamegraph.svg)
 cargo install flamegraph
 cargo flamegraph --release -- path/to/binary.xclbin
+
+# Bridge tests (dual-compiler, requires XRT + NPU)
+./scripts/emu-bridge-test.sh                    # Full run
+./scripts/emu-bridge-test.sh --no-hw add_one    # Quick EMU-only
+
+# Trace comparison binary
+cargo build --release --bin trace-compare
 ```
 
 **Note on doc tests**: Doc tests spawn separate processes that each load TableGen
@@ -425,6 +432,55 @@ sandbox by default:
   `TMPDIR=/tmp/claude-1000` when running `cargo test` to fix this.
 - Only reach for `dangerouslyDisableSandbox` when the sandbox is genuinely
   blocking (e.g., network access, writing outside allowed paths).
+
+## Test Infrastructure
+
+### Primary: Bridge Test Suite (`scripts/emu-bridge-test.sh`)
+
+The **XRT bridge path is the real validation target.** It exercises the full
+hardware-equivalent flow: `test.exe -> XRT -> plugin -> emulator`.
+
+**Dual-compiler**: Every test is compiled with BOTH compilers by default.
+Chess is ground truth; Peano failures are informational. Five phases:
+discover, compile (parallel), run HW (-j5), run EMU (-j nproc), report.
+
+Flags: `--chess-only`, `--peano-only`, `--no-hw`, `--compile`,
+`--serial-hw`, `--trace=sweep`, `-v <filter>`.
+
+**Build dirs**: `mlir-aie/build/test/npu-xrt/$name/chess/` and `peano/`
+**Results**: `/tmp/emu-bridge-results-YYYYMMDD/`
+**Plugin**: `pkexec cp xrt-plugin/build/libxrt_driver_emu.so.2 /opt/xilinx/xrt/lib/`
+
+### Backup: npu-test (standalone harness)
+
+`npu-test` bypasses XRT entirely -- useful for isolated subsystem testing.
+**NEVER run inside the Claude Code sandbox** (license checks, filesystem issues).
+
+## Tracing Ecosystem
+
+Binary trace comparison between emulator and real NPU hardware. All traces
+converge to Perfetto JSON (viewable at ui.perfetto.dev).
+
+| Tool | Purpose |
+|------|---------|
+| `tools/trace-inject.py` | Inject trace routing into MLIR (capacity planner, collision-aware IDs) |
+| `tools/trace-sweep.py` | Multi-batch event sweep (HW serial + EMU parallel) |
+| `tools/trace-run.py` | Execute traced xclbin, collect raw trace data |
+| `tools/trace-trim.py` | Strip sentinel padding from raw trace buffers |
+| `tools/trace-merge.py` | Merge per-batch Perfetto JSON with TRUE anchor alignment |
+| `tools/trace-patch-events.py` | Patch event slots in compiled insts.bin without recompilation |
+| `src/bin/trace_compare.rs` | **Rust** binary trace comparison (replaced Python -- 65GB OOM -> 11MB) |
+
+Build: `cargo build --release --bin trace-compare`
+
+## XRT Plugin (`xrt-plugin/`)
+
+Driver plugin replacing the real XDNA kernel driver. XRT loads the .so,
+which delegates to the Rust emulator via FFI (`src/ffi/`).
+
+**Build**: `./scripts/rebuild-plugin.sh`
+**Install**: `pkexec cp xrt-plugin/build/libxrt_driver_emu.so.2 /opt/xilinx/xrt/lib/`
+**Activation**: Set `XDNA_EMU=1` before running test.exe.
 
 ## How To Begin
 
