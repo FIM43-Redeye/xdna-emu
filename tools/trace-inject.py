@@ -700,8 +700,10 @@ def auto_detect_device(mlir_text: str) -> str:
         return "npu1_2col"
     elif max_col == 2:
         return "npu1_3col"
-    elif max_col == 3:
-        return "npu1_4col"
+    elif max_col <= 4:
+        # npu1 is the full 5-column device (cols 0-4).
+        # There is no npu1_4col variant -- use full npu1 for 4+ columns.
+        return "npu1"
     else:
         return "npu1"
 
@@ -797,7 +799,10 @@ def inject_trace(
 
         # -- Locate key operations ------------------------------------------
 
-        # DeviceOp: the top-level aie.device container
+        # DeviceOp: the top-level aie.device container.
+        # Multi-device modules (e.g. ctrl_packet_reconfig) have @base (empty
+        # topology) and @main (full design).  We need the device that contains
+        # the runtime_sequence -- that's the one we inject into.
         device_ops = find_ops(
             module.operation,
             lambda o: isinstance(o.opview, aiedialect.DeviceOp),
@@ -805,8 +810,18 @@ def inject_trace(
         if not device_ops:
             raise RuntimeError("No aie.device op found in MLIR")
 
-        # For multi-device modules, inject into the first device only.
-        device_op = device_ops[0].opview
+        device_op = None
+        for dop in device_ops:
+            rs = find_ops(
+                dop,
+                lambda o: isinstance(o.opview, aiedialect.RuntimeSequenceOp),
+            )
+            if rs:
+                device_op = dop.opview
+                break
+        if device_op is None:
+            # Fallback: single-device module without runtime_sequence yet
+            device_op = device_ops[0].opview
         device_block = device_op.body_region.blocks[0]
 
         # Scope all subsequent searches to THIS device (not the whole module)
@@ -1211,6 +1226,7 @@ def inject_trace_per_column(
         module = Module.parse(mlir_text)
 
         # -- Locate key operations (same as inject_trace) ----------------------
+        # For multi-device modules, find the device with runtime_sequence.
 
         device_ops = find_ops(
             module.operation,
@@ -1219,7 +1235,17 @@ def inject_trace_per_column(
         if not device_ops:
             raise RuntimeError("No aie.device op found in MLIR")
 
-        device_op = device_ops[0].opview
+        device_op = None
+        for dop in device_ops:
+            rs = find_ops(
+                dop,
+                lambda o: isinstance(o.opview, aiedialect.RuntimeSequenceOp),
+            )
+            if rs:
+                device_op = dop.opview
+                break
+        if device_op is None:
+            device_op = device_ops[0].opview
         device_block = device_op.body_region.blocks[0]
         search_root = device_op.operation
 
