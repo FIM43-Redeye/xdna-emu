@@ -501,8 +501,8 @@ class TracePass:
 
 
 @dataclass
-class TracePlan:
-    """Plan for multi-pass trace injection."""
+class CapacityTracePlan:
+    """Plan for multi-pass trace injection (capacity planner, legacy)."""
     passes: list[TracePass]
     total_tiles: int
     reason: str     # "single_pass", "multi_pass: <why>", or "error: <why>"
@@ -579,7 +579,7 @@ def plan_trace_passes(
     mlir_text: str,
     device_name: str = "auto",
     device_model_path: Path | None = None,
-) -> TracePlan:
+) -> CapacityTracePlan:
     """Partition tiles into routable trace groups (passes).
 
     Analyzes the MLIR to find all traceable tiles, checks stream switch
@@ -612,8 +612,8 @@ def plan_trace_passes(
                 core_tiles.append((col, row))
 
     if not shim_cols:
-        return TracePlan(passes=[], total_tiles=0,
-                         reason="error: no shim tiles found in MLIR")
+        return CapacityTracePlan(passes=[], total_tiles=0,
+                                 reason="error: no shim tiles found in MLIR")
 
     # Build the full traceable tile list with module types.
     all_tiles: list[tuple[int, int, str]] = []
@@ -624,8 +624,8 @@ def plan_trace_passes(
         all_tiles.append((col, row, "memtile"))
 
     if not all_tiles:
-        return TracePlan(passes=[], total_tiles=0,
-                         reason="error: no traceable tiles found in MLIR")
+        return CapacityTracePlan(passes=[], total_tiles=0,
+                                 reason="error: no traceable tiles found in MLIR")
 
     total_tiles = len(all_tiles)
 
@@ -648,7 +648,7 @@ def plan_trace_passes(
     # Try single pass: all tiles through one shim.
     shim = _find_best_shim(all_tiles, shim_cols, cap, used_ids)
     if shim is not None:
-        return TracePlan(
+        return CapacityTracePlan(
             passes=[TracePass(tiles=all_tiles, shim_col=shim,
                               estimated_flows=len(all_tiles))],
             total_tiles=total_tiles,
@@ -675,7 +675,7 @@ def plan_trace_passes(
         )
         reason_parts.append(f"skipped {len(all_skipped)} tiles: {skip_desc}")
 
-    return TracePlan(
+    return CapacityTracePlan(
         passes=all_passes,
         total_tiles=total_tiles,
         reason=": ".join(reason_parts) if len(reason_parts) > 1
@@ -688,30 +688,292 @@ def plan_trace_passes(
 # ---------------------------------------------------------------------------
 
 @dataclass
-class ShimChannelState:
-    """DMA channel usage for one shim tile."""
-    col: int
-    s2mm_used: set  # set of int channel indices consumed by existing flows
-    s2mm_total: int
-    has_ctrl_packets: bool  # TileControl flows touch this shim
-    has_trace_flows: bool   # existing Trace flows already route here
-
-    @property
-    def free_s2mm(self) -> list[int]:
-        """S2MM channel indices available for trace."""
-        return [ch for ch in range(self.s2mm_total) if ch not in self.s2mm_used]
+class CandidateResult:
+    """Pathfinder result for one (shim_col, channel) candidate."""
+    shim_col: int
+    channel: int
+    success: bool                      # pathfinder found a valid route
+    existing_flows_intact: bool        # baseline connections unchanged
+    failure_reason: str | None = None
+    # Tiebreaker metrics (set when success=True)
+    trace_connections_on_test_cols: int = 0
+    total_trace_connections: int = 0
 
 
 @dataclass
-class StrictTracePlan:
-    """Result of strict feasibility analysis."""
+class TracePlan:
+    """Result of trace route planning."""
     feasible: bool
     reason: str
     shim_col: int | None = None
-    trace_channel: int | None = None  # S2MM channel to use for trace
-    tiles_to_trace: list | None = None  # (col, row, module) tuples
-    shim_states: dict | None = None  # col -> ShimChannelState
-    cross_column_option: str | None = None  # hint for future routing
+    trace_channel: int | None = None
+    candidates: list[CandidateResult] | None = None
+
+    def to_dict(self) -> dict:
+        """Serialize for JSON manifest output."""
+        d = {
+            "feasible": self.feasible,
+            "reason": self.reason,
+            "shim_col": self.shim_col,
+            "trace_channel": self.trace_channel,
+        }
+        if self.candidates:
+            d["candidates"] = [
+                {
+                    "shim_col": c.shim_col,
+                    "channel": c.channel,
+                    "success": c.success,
+                    "existing_flows_intact": c.existing_flows_intact,
+                    "failure_reason": c.failure_reason,
+                    "trace_on_test_cols": c.trace_connections_on_test_cols,
+                    "total_trace_connections": c.total_trace_connections,
+                }
+                for c in self.candidates
+            ]
+        return d
+
+
+# ---------------------------------------------------------------------------
+# IR-walking helpers -- shared by planner and injector
+# ---------------------------------------------------------------------------
+
+def find_device_with_sequence(module):
+    """Find the DeviceOp containing a runtime_sequence.
+
+    Multi-device modules (e.g. ctrl_packet_reconfig) have @base (empty)
+    and @main (full design).  Returns the device with runtime_sequence,
+    or the first device if none has one.
+    """
+    from aie.extras.util import find_ops  # type: ignore
+    import aie.dialects.aie as aiedialect  # type: ignore
+
+    device_ops = find_ops(
+        module.operation,
+        lambda o: isinstance(o.opview, aiedialect.DeviceOp),
+    )
+    if not device_ops:
+        raise RuntimeError("No aie.device op found in MLIR")
+
+    for dop in device_ops:
+        rs = find_ops(
+            dop,
+            lambda o: isinstance(o.opview, aiedialect.RuntimeSequenceOp),
+        )
+        if rs:
+            return dop.opview
+    return device_ops[0].opview
+
+
+def find_tile_op(device_op, col: int, row: int):
+    """Find an existing TileOp for (col, row) within a device, or None."""
+    from aie.extras.util import find_ops  # type: ignore
+    import aie.dialects.aie as aiedialect  # type: ignore
+
+    tile_ops = find_ops(
+        device_op.operation,
+        lambda o: isinstance(o.opview, aiedialect.TileOp),
+    )
+    for t in tile_ops:
+        top = t.opview
+        if top.col.value == col and top.row.value == row:
+            return top
+    return None
+
+
+def find_used_packet_ids_ir(device_op) -> set[int]:
+    """Scan a parsed device op for all packet IDs in use.
+
+    Walks PacketFlowOp operations in the IR instead of regex on text.
+    """
+    from aie.extras.util import find_ops  # type: ignore
+    import aie.dialects.aie as aiedialect  # type: ignore
+
+    ids: set[int] = set()
+    pkt_ops = find_ops(
+        device_op.operation,
+        lambda o: isinstance(o.opview, aiedialect.PacketFlowOp),
+    )
+    for pfop in pkt_ops:
+        ids.add(pfop.opview.ID.value)
+    return ids
+
+
+def classify_tiles(device_op) -> tuple[list[int], list[tuple], set[int]]:
+    """Classify tiles in a device into shim columns, trace targets, and test columns.
+
+    Returns:
+        shim_cols: list of column indices with shim tiles (row 0)
+        trace_targets: list of (col, row, trace_port) tuples for traceable tiles
+            Core tiles produce two entries: (col, row, 0) for Core, (col, row, 1) for Mem
+        test_cols: set of column indices used by the test (non-shim tiles with uses)
+    """
+    from aie.extras.util import find_ops  # type: ignore
+    import aie.dialects.aie as aiedialect  # type: ignore
+    from aie.dialects.aie import get_target_model as _gtm  # type: ignore
+
+    tm = _gtm(device_op.operation.attributes["device"])
+
+    tile_ops = find_ops(
+        device_op.operation,
+        lambda o: isinstance(o.opview, aiedialect.TileOp),
+    )
+
+    shim_cols = []
+    trace_targets = []
+    test_cols = set()
+
+    for t in tile_ops:
+        top = t.opview
+        col, row = top.col.value, top.row.value
+        if row == 0:
+            if col not in shim_cols:
+                shim_cols.append(col)
+            continue
+        if len(list(top.result.uses)) == 0:
+            continue
+        test_cols.add(col)
+        if tm.is_core_tile(col, row):
+            trace_targets.append((col, row, 0))  # Core trace port
+            trace_targets.append((col, row, 1))  # Mem trace port
+        elif tm.is_mem_tile(col, row):
+            trace_targets.append((col, row, 0))  # MemTile trace port
+
+    return shim_cols, trace_targets, test_cols
+
+
+# ---------------------------------------------------------------------------
+# Shared flow helper -- declares trace packet flows on a parsed module
+# ---------------------------------------------------------------------------
+
+def add_trace_flows(
+    device_op,
+    shim_col: int,
+    trace_channel: int,
+    trace_targets: list[tuple[int, int, int]],
+    used_packet_ids: set[int],
+) -> tuple[int, object]:
+    """Declare trace packet flows from tiles to a target shim.
+
+    Injects:
+    - aie.tile declaration for the shim (if not already present)
+    - aie.packet_flow ops routing each tile's Trace ports to the shim DMA
+
+    Does NOT configure trace registers, timers, DMA, or buffers.
+
+    Args:
+        device_op: the DeviceOp to modify
+        shim_col: target shim tile column
+        trace_channel: S2MM DMA channel on the shim
+        trace_targets: list of (col, row, trace_port) -- explicit, no guessing
+        used_packet_ids: existing packet IDs to avoid
+
+    Returns:
+        (trace_id_start, shim_tile_op) -- first packet ID used and the shim TileOp
+    """
+    from aie.ir import InsertionPoint  # type: ignore
+    from aie.dialects.aie import packetflow, tile, WireBundle  # type: ignore
+
+    device_block = device_op.body_region.blocks[0]
+
+    # Find or create shim tile
+    shim_tile = find_tile_op(device_op, shim_col, 0)
+    if shim_tile is None:
+        with InsertionPoint.at_block_begin(device_block):
+            shim_tile = tile(shim_col, 0)
+
+    # Allocate packet IDs
+    trace_id_start = choose_trace_id_start(used_packet_ids, len(trace_targets))
+
+    # Build a lookup from (col, row) to existing TileOp
+    from aie.extras.util import find_ops  # type: ignore
+    import aie.dialects.aie as aiedialect  # type: ignore
+    tile_ops = find_ops(
+        device_op.operation,
+        lambda o: isinstance(o.opview, aiedialect.TileOp),
+    )
+    tile_lookup = {}
+    for t in tile_ops:
+        top = t.opview
+        tile_lookup[(top.col.value, top.row.value)] = top
+
+    # Declare packet flows
+    with InsertionPoint.at_block_terminator(device_block):
+        for i, (col, row, trace_port) in enumerate(trace_targets):
+            p_id = trace_id_start + i
+            src_tile = tile_lookup.get((col, row))
+            if src_tile is None:
+                raise RuntimeError(
+                    f"Tile ({col},{row}) referenced in trace_targets "
+                    f"but not found in MLIR"
+                )
+            packetflow(
+                p_id, src_tile, WireBundle.Trace, trace_port,
+                dests={"dest": shim_tile, "port": WireBundle.DMA,
+                       "channel": trace_channel},
+                keep_pkt_header=True,
+            )
+
+    return trace_id_start, shim_tile
+
+
+# ---------------------------------------------------------------------------
+# Pathfinder runner and connection extractor
+# ---------------------------------------------------------------------------
+
+def run_pathfinder(module) -> bool:
+    """Run the pathfinder pass on a module. Returns True if successful.
+
+    Mutates the module in place: FlowOps and PacketFlowOps are replaced
+    with concrete SwitchboxOp/ConnectOp routing.
+    """
+    from aie.passmanager import PassManager  # type: ignore
+
+    pipeline = "builtin.module(aie.device(aie-create-pathfinder-flows))"
+    try:
+        pm = PassManager.parse(pipeline)
+        pm.run(module.operation)
+        return True
+    except Exception:
+        return False
+
+
+def extract_connections(module) -> set[tuple]:
+    """Extract all switch connections from a routed module.
+
+    After the pathfinder runs, the module contains SwitchboxOp with
+    ConnectOp inside them. This extracts each connection as a tuple:
+        (col, row, src_bundle, src_channel, dst_bundle, dst_channel)
+
+    Returns a set for easy comparison via issubset().
+    """
+    from aie.extras.util import find_ops  # type: ignore
+    import aie.dialects.aie as aiedialect  # type: ignore
+
+    connections = set()
+
+    switchbox_ops = find_ops(
+        module.operation,
+        lambda o: isinstance(o.opview, aiedialect.SwitchboxOp),
+    )
+
+    for sb_op in switchbox_ops:
+        sb = sb_op.opview
+        col = sb.col.value
+        row = sb.row.value
+
+        connect_ops = find_ops(
+            sb_op,
+            lambda o: isinstance(o.opview, aiedialect.ConnectOp),
+        )
+        for cop in connect_ops:
+            c = cop.opview
+            connections.add((
+                col, row,
+                int(c.source_bundle), int(c.source_channel),
+                int(c.dest_bundle), int(c.dest_channel),
+            ))
+
+    return connections
 
 
 def strict_analyze_feasibility(mlir_text: str) -> StrictTracePlan:
