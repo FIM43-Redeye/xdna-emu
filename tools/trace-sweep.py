@@ -422,31 +422,47 @@ def wait_npu_idle(timeout: float = 10.0, poll_interval: float = 0.1) -> bool:
     return False
 
 
-def run_batch_hw(batch_info: dict, hw_cooldown: float = 2.0) -> dict:
-    """Run one batch on hardware (serial, with idle-wait between runs)."""
+def run_batch_hw(
+    batch_info: dict,
+    hw_cooldown: float = 2.0,
+    output_subdir: str = "hw",
+) -> dict:
+    """Run one batch on hardware.
+
+    Args:
+        batch_info: Batch metadata dict (mutated in place).
+        hw_cooldown: Seconds to wait for NPU idle after run.
+        output_subdir: Directory name under batch_dir for output
+            (default "hw"; use "hw-serial"/"hw-parallel" for comparison).
+    """
     script_dir = Path(__file__).parent
     trace_run = script_dir / "trace-run.py"
     batch_idx = batch_info["batch"]
     batch_dir = Path(batch_info["batch_dir"])
     manifest = batch_info["manifest"]
 
-    hw_dir = batch_dir / "hw"
-    print(f"  Batch {batch_idx}: running on hardware...")
+    hw_dir = batch_dir / output_subdir
+    print(f"  Batch {batch_idx}: running on hardware ({output_subdir})...")
     hw_result = subprocess.run(
         [sys.executable, str(trace_run), str(manifest), "-o", str(hw_dir)],
         capture_output=True, text=True, timeout=300,
     )
+    # Use namespaced keys for non-default output dirs, standard keys for "hw".
+    status_key = "hw_status" if output_subdir == "hw" else f"{output_subdir}_status"
+    trace_key = "hw_trace" if output_subdir == "hw" else f"{output_subdir}_trace"
+
     if hw_result.returncode != 0:
-        batch_info["hw_status"] = "failed"
-        (batch_dir / "hw-run.log").write_text(hw_result.stdout + hw_result.stderr)
+        batch_info[status_key] = "failed"
+        (batch_dir / f"{output_subdir}-run.log").write_text(
+            hw_result.stdout + hw_result.stderr
+        )
     else:
-        batch_info["hw_status"] = "ok"
-        batch_info["hw_trace"] = str(hw_dir / "trace.json")
+        batch_info[status_key] = "ok"
+        batch_info[trace_key] = str(hw_dir / "trace.json")
         trim_trace_dir(hw_dir)
 
-    # Wait for NPU to be idle before next run.  Falls back to fixed sleep
-    # if xrt-smi is unavailable or times out.
-    if not wait_npu_idle(timeout=hw_cooldown):
+    # Wait for NPU to be idle before next run.
+    if hw_cooldown > 0 and not wait_npu_idle(timeout=hw_cooldown):
         import time
         time.sleep(0.5)  # Brief fallback if poll failed
 
@@ -506,8 +522,18 @@ def main():
         help="Seconds between hardware runs to let the driver settle (default: 2)",
     )
     parser.add_argument(
+        "--hw-jobs", type=int, default=1,
+        help="Parallel hardware batch jobs (default: 1 = serial). "
+             "NPU1 supports up to 5 concurrent contexts.",
+    )
+    parser.add_argument(
         "--emu-jobs", type=int, default=0,
         help="Parallel emulator jobs (default: nproc)",
+    )
+    parser.add_argument(
+        "--compare-parallel", action="store_true",
+        help="Run HW batches twice (serial then parallel at --hw-jobs), "
+             "compare traces to measure determinism under concurrent load.",
     )
     parser.add_argument(
         "--core-only", action="store_true",
@@ -851,6 +877,123 @@ def _run_multi_pass(
     print(f"\nView in Perfetto: https://ui.perfetto.dev/")
 
 
+def _run_hw_batches(
+    runnable: list[dict],
+    hw_jobs: int,
+    hw_cooldown: float,
+    output_subdir: str = "hw",
+):
+    """Run HW batches, serial or parallel depending on hw_jobs."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if hw_jobs <= 1:
+        # Serial: one at a time with cooldown between runs.
+        label = f"serial, {hw_cooldown}s cooldown"
+        print(f"  HW:  {len(runnable)} batches ({label}, -> {output_subdir}/)")
+        for b in runnable:
+            run_batch_hw(b, hw_cooldown=hw_cooldown, output_subdir=output_subdir)
+    else:
+        # Parallel: up to hw_jobs concurrent NPU contexts.
+        label = f"parallel, -j{hw_jobs}"
+        print(f"  HW:  {len(runnable)} batches ({label}, -> {output_subdir}/)")
+        with ThreadPoolExecutor(max_workers=hw_jobs) as pool:
+            futures = {
+                pool.submit(
+                    run_batch_hw, b,
+                    hw_cooldown=0.2,
+                    output_subdir=output_subdir,
+                ): b
+                for b in runnable
+            }
+            for f in as_completed(futures):
+                f.result()  # propagate exceptions
+
+
+def _compare_serial_vs_parallel(
+    batches: list[dict],
+    output_dir: Path,
+    script_dir: Path,
+):
+    """Compare serial vs parallel HW traces per-batch using trace-compare."""
+    # Prefer Rust binary, fall back to Python.
+    rust_bin = script_dir.parent / "target" / "release" / "trace-compare"
+    compare_cmd = (
+        [str(rust_bin)] if rust_bin.exists()
+        else [sys.executable, str(script_dir / "trace-compare.py")]
+    )
+
+    report_path = output_dir / "serial-vs-parallel-report.txt"
+    lines = ["=== Serial vs Parallel Trace Comparison ===", ""]
+
+    total = 0
+    identical = 0
+    diverged = 0
+    errors = 0
+
+    for b in batches:
+        batch_idx = b["batch"]
+        batch_dir = Path(b["batch_dir"])
+        serial_raw = batch_dir / "hw-serial" / "trace_raw.bin"
+        parallel_raw = batch_dir / "hw-parallel" / "trace_raw.bin"
+
+        if not serial_raw.exists() or not parallel_raw.exists():
+            lines.append(f"Batch {batch_idx}: SKIP (missing trace data)")
+            errors += 1
+            continue
+
+        total += 1
+        batch_report = batch_dir / "serial-vs-parallel.txt"
+
+        # Use trace-compare with --hw=serial --emu=parallel (labels cosmetic).
+        result = subprocess.run(
+            compare_cmd + [
+                "--hw", str(serial_raw),
+                "--emu", str(parallel_raw),
+                "-o", str(batch_report),
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+
+        # Check if raw bytes are identical first (fast path).
+        import filecmp
+        if filecmp.cmp(str(serial_raw), str(parallel_raw), shallow=False):
+            lines.append(f"Batch {batch_idx}: IDENTICAL (byte-for-byte)")
+            identical += 1
+        elif result.returncode == 0 and batch_report.exists():
+            report_text = batch_report.read_text()
+            # Check if event sequences match despite raw byte differences.
+            if "0 diverged" in report_text or "0 count mismatch" in report_text:
+                lines.append(
+                    f"Batch {batch_idx}: TIMING_ONLY (events match, timestamps differ)"
+                )
+                identical += 1  # functionally identical
+            else:
+                lines.append(f"Batch {batch_idx}: DIVERGED (see {batch_report})")
+                diverged += 1
+        else:
+            lines.append(f"Batch {batch_idx}: ERROR (compare failed)")
+            errors += 1
+
+    lines.append("")
+    lines.append(f"Summary: {total} batches compared")
+    lines.append(f"  Identical/timing-only: {identical}")
+    lines.append(f"  Diverged:              {diverged}")
+    lines.append(f"  Errors:                {errors}")
+
+    if diverged == 0 and errors == 0:
+        lines.append("")
+        lines.append("DETERMINISTIC: Parallel execution does not affect trace event sequences.")
+    elif diverged > 0:
+        lines.append("")
+        lines.append(
+            f"NON-DETERMINISTIC: {diverged} batch(es) show different events under parallel load."
+        )
+
+    report_text = "\n".join(lines) + "\n"
+    report_path.write_text(report_text)
+    print(report_text)
+
+
 def _execute_and_merge(
     batches: list[dict],
     output_dir: Path,
@@ -858,7 +1001,7 @@ def _execute_and_merge(
     args,
     script_dir: Path,
 ) -> list[dict]:
-    """Execute batches (HW serial + EMU parallel) and merge traces.
+    """Execute batches (HW + EMU) and merge traces.
 
     Returns the batch results list (mutated in place with hw/emu status).
     """
@@ -866,27 +1009,59 @@ def _execute_and_merge(
 
     runnable = [b for b in batches if b["status"] == "ok"]
     emu_jobs = args.emu_jobs if args.emu_jobs > 0 else os.cpu_count() or 4
+    hw_jobs = getattr(args, "hw_jobs", 1)
 
-    def hw_serial_runner():
-        """Run all HW batches serially with cooldown."""
+    compare_parallel = getattr(args, "compare_parallel", False)
+
+    if compare_parallel and not args.no_hw:
+        # --- Compare mode: run HW serial, then HW parallel, then compare ---
+        print("  === Serial vs Parallel comparison mode ===")
+
+        # Pass 1: serial
+        _run_hw_batches(runnable, hw_jobs=1, hw_cooldown=args.hw_cooldown,
+                        output_subdir="hw-serial")
+
+        # Pass 2: parallel
+        parallel_jobs = hw_jobs if hw_jobs > 1 else 5
+        _run_hw_batches(runnable, hw_jobs=parallel_jobs,
+                        hw_cooldown=0.2, output_subdir="hw-parallel")
+
+        # Copy serial results into default "hw" keys for merge compatibility.
         for b in runnable:
-            run_batch_hw(b, hw_cooldown=args.hw_cooldown)
+            b["hw_status"] = b.get("hw-serial_status", "failed")
+            if "hw-serial_trace" in b:
+                b["hw_trace"] = b["hw-serial_trace"]
 
-    with ThreadPoolExecutor(max_workers=emu_jobs + 1) as pool:
-        hw_future = None
-        if not args.no_hw:
-            print(f"  HW:  {len(runnable)} batches (serial, {args.hw_cooldown}s cooldown)")
-            hw_future = pool.submit(hw_serial_runner)
+        # Run EMU concurrently (already done by the time we get here, or now).
+        with ThreadPoolExecutor(max_workers=emu_jobs) as pool:
+            if not args.no_emu:
+                print(f"  EMU: {len(runnable)} batches (parallel, -j{emu_jobs})")
+                emu_futures = [pool.submit(run_batch_emu, b) for b in runnable]
+                for f in emu_futures:
+                    f.result()
 
-        emu_futures = []
-        if not args.no_emu:
-            print(f"  EMU: {len(runnable)} batches (parallel, -j{emu_jobs})")
-            emu_futures = [pool.submit(run_batch_emu, b) for b in runnable]
+        # Compare serial vs parallel per-batch.
+        print()
+        _compare_serial_vs_parallel(runnable, output_dir, script_dir)
 
-        for f in emu_futures:
-            f.result()
-        if hw_future:
-            hw_future.result()
+    else:
+        # --- Normal mode: single HW pass + EMU ---
+        with ThreadPoolExecutor(max_workers=emu_jobs + 1) as pool:
+            hw_future = None
+            if not args.no_hw:
+                hw_future = pool.submit(
+                    _run_hw_batches, runnable, hw_jobs, args.hw_cooldown
+                )
+
+            emu_futures = []
+            if not args.no_emu:
+                print(f"  EMU: {len(runnable)} batches (parallel, -j{emu_jobs})")
+                emu_futures = [pool.submit(run_batch_emu, b) for b in runnable]
+
+            for f in emu_futures:
+                f.result()
+            if hw_future:
+                hw_future.result()
 
     print()
 
