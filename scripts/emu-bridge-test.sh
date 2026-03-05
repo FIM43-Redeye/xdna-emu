@@ -580,12 +580,19 @@ export -f compile_one_compiler compile_one
 run_one_hardware() {
   local name="$1"
   local bdf="$2"
+  local compiler="$3"
   local safe
   safe="$(sanitize_name "$name")"
-  local build_dir="$BUILD_BASE/$name"
+  local build_dir="$BUILD_BASE/$name/$compiler"
+  local test_exe="$BUILD_BASE/$name/test.exe"
   local src_dir="$TEST_SRC/$name"
-  local log_file="$RESULTS_DIR/${safe}.hw.log"
-  local result_file="$RESULTS_DIR/${safe}.hw.result"
+  local log_file="$RESULTS_DIR/${safe}.${compiler}.hw.log"
+  local result_file="$RESULTS_DIR/${safe}.${compiler}.hw.result"
+
+  # Symlink shared test.exe into per-compiler build dir
+  if [[ -f "$test_exe" ]] && [[ ! -f "$build_dir/test.exe" ]]; then
+    ln -sf "$test_exe" "$build_dir/test.exe"
+  fi
 
   if [[ ! -f "$build_dir/test.exe" ]]; then
     echo "SKIP" > "$result_file"
@@ -615,6 +622,7 @@ run_one_hardware() {
     echo "FAIL" > "$result_file"
   fi
 }
+export -f run_one_hardware
 
 # ---------------------------------------------------------------------------
 # Phase 4: Emulator runs (parallel)
@@ -622,22 +630,40 @@ run_one_hardware() {
 
 run_one_bridge() {
   local name="$1"
+  local compiler="${2:-}"
   local safe
   safe="$(sanitize_name "$name")"
-  local build_dir="$BUILD_BASE/$name"
+
+  # If no compiler specified, deserialize from COMPILERS_STR and run all.
+  if [[ -z "$compiler" ]]; then
+    local compilers
+    read -ra compilers <<< "$COMPILERS_STR"
+    for c in "${compilers[@]}"; do
+      run_one_bridge "$name" "$c"
+    done
+    return
+  fi
+
+  local build_dir="$BUILD_BASE/$name/$compiler"
+  local test_exe="$BUILD_BASE/$name/test.exe"
   local src_dir="$TEST_SRC/$name"
-  local log_file="$RESULTS_DIR/${safe}.bridge.log"
-  local result_file="$RESULTS_DIR/${safe}.bridge.result"
+  local log_file="$RESULTS_DIR/${safe}.${compiler}.bridge.log"
+  local result_file="$RESULTS_DIR/${safe}.${compiler}.bridge.result"
+
+  # Symlink shared test.exe into per-compiler build dir.
+  if [[ -f "$test_exe" ]] && [[ ! -f "$build_dir/test.exe" ]]; then
+    ln -sf "$test_exe" "$build_dir/test.exe"
+  fi
 
   if [[ ! -f "$build_dir/test.exe" ]]; then
     echo "SKIP" > "$result_file"
-    echo "  BRIDGE $name: SKIP (no test.exe)"
+    echo "  BRIDGE $name ($compiler): SKIP (no test.exe)"
     return
   fi
 
   if ! ls "$build_dir"/*.xclbin &>/dev/null; then
     echo "SKIP" > "$result_file"
-    echo "  BRIDGE $name: SKIP (no xclbin)"
+    echo "  BRIDGE $name ($compiler): SKIP (no xclbin)"
     return
   fi
 
@@ -669,7 +695,7 @@ run_one_bridge() {
   fi
 
   echo "$result" > "$result_file"
-  echo "  BRIDGE $name: $result"
+  echo "  BRIDGE $name ($compiler): $result"
 }
 export -f run_one_bridge
 
@@ -1087,8 +1113,12 @@ main() {
     if requires_npu2 "$TEST_SRC/$name"; then
       local safe
       safe="$(sanitize_name "$name")"
-      echo "SKIP_NPU2" > "$RESULTS_DIR/${safe}.bridge.result"
-      echo "SKIP_NPU2" > "$RESULTS_DIR/${safe}.compile.result"
+      local compilers
+      read -ra compilers <<< "$COMPILERS_STR"
+      for _c in "${compilers[@]}"; do
+        echo "SKIP_NPU2" > "$RESULTS_DIR/${safe}.${_c}.bridge.result"
+        echo "SKIP_NPU2" > "$RESULTS_DIR/${safe}.${_c}.compile.result"
+      done
       ((skipped_npu2++)) || true
     else
       runnable+=("$name")
@@ -1105,30 +1135,41 @@ main() {
 
   printf '%s\n' "${runnable[@]}" | xargs -P"$JOBS" -I{} bash -c 'compile_one "$@"' _ {}
 
-  # Count compile results.
+  # Count compile results (per-compiler).
   local compile_ok=0 compile_fail=0
+  local compilers
+  read -ra compilers <<< "$COMPILERS_STR"
   for name in "${runnable[@]}"; do
     local safe
     safe="$(sanitize_name "$name")"
-    local cr="OK"
-    [[ -f "$RESULTS_DIR/${safe}.compile.result" ]] && cr="$(< "$RESULTS_DIR/${safe}.compile.result")"
-    if [[ "$cr" == "OK" ]]; then
-      ((compile_ok++)) || true
-    else
-      ((compile_fail++)) || true
-    fi
+    for compiler in "${compilers[@]}"; do
+      local cr="FAIL"
+      [[ -f "$RESULTS_DIR/${safe}.${compiler}.compile.result" ]] && cr="$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")"
+      if [[ "$cr" == "OK" ]]; then
+        ((compile_ok++)) || true
+      else
+        ((compile_fail++)) || true
+      fi
+    done
   done
-  info "Phase 2 done: $compile_ok OK, $compile_fail failed"
+  info "Phase 2 done: $compile_ok OK, $compile_fail failed (across ${#compilers[@]} compiler(s))"
   echo ""
 
-  # Build list of tests that compiled successfully.
+  # Build list of tests where at least one compiler succeeded.
   local compiled=()
   for name in "${runnable[@]}"; do
     local safe
     safe="$(sanitize_name "$name")"
-    local cr="FAIL"
-    [[ -f "$RESULTS_DIR/${safe}.compile.result" ]] && cr="$(< "$RESULTS_DIR/${safe}.compile.result")"
-    if [[ "$cr" == "OK" ]]; then
+    local any_ok=false
+    for compiler in "${compilers[@]}"; do
+      local cr="FAIL"
+      [[ -f "$RESULTS_DIR/${safe}.${compiler}.compile.result" ]] && cr="$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")"
+      if [[ "$cr" == "OK" ]]; then
+        any_ok=true
+        break
+      fi
+    done
+    if $any_ok; then
       compiled+=("$name")
     fi
   done
@@ -1146,13 +1187,18 @@ main() {
       info "Phase 3: Running ${#compiled[@]} test(s) on hardware (serial, BDF=$real_bdf)"
       local hw_done=0
       for name in "${compiled[@]}"; do
-        ((hw_done++)) || true
-        run_one_hardware "$name" "$real_bdf"
-        local safe
-        safe="$(sanitize_name "$name")"
-        local hr="SKIP"
-        [[ -f "$RESULTS_DIR/${safe}.hw.result" ]] && hr="$(< "$RESULTS_DIR/${safe}.hw.result")"
-        echo "  [${hw_done}/${#compiled[@]}] HW $name: $hr"
+        for compiler in "${compilers[@]}"; do
+          local safe
+          safe="$(sanitize_name "$name")"
+          # Skip if this compiler did not compile successfully.
+          [[ -f "$RESULTS_DIR/${safe}.${compiler}.compile.result" ]] || continue
+          [[ "$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")" == "OK" ]] || continue
+          ((hw_done++)) || true
+          run_one_hardware "$name" "$real_bdf" "$compiler"
+          local hr="SKIP"
+          [[ -f "$RESULTS_DIR/${safe}.${compiler}.hw.result" ]] && hr="$(< "$RESULTS_DIR/${safe}.${compiler}.hw.result")"
+          echo "  [${hw_done}] HW $name ($compiler): $hr"
+        done
       done
       info "Phase 3 done"
       echo ""
@@ -1163,7 +1209,15 @@ main() {
 
   info "Phase 4: Running ${#compiled[@]} test(s) on emulator (-j${JOBS})"
 
-  printf '%s\n' "${compiled[@]}" | xargs -P"$JOBS" -I{} bash -c 'run_one_bridge "$@"' _ {}
+  for name in "${compiled[@]}"; do
+    for compiler in "${compilers[@]}"; do
+      local safe
+      safe="$(sanitize_name "$name")"
+      [[ -f "$RESULTS_DIR/${safe}.${compiler}.compile.result" ]] || continue
+      [[ "$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")" == "OK" ]] || continue
+      echo "$name $compiler"
+    done
+  done | xargs -P"$JOBS" -n2 bash -c 'run_one_bridge "$@"' _
 
   info "Phase 4 done"
   echo ""
@@ -1185,12 +1239,19 @@ main() {
 
     for name in "${compiled[@]}"; do
       if ! $trace_include_failing; then
-        # Only trace tests that passed the bridge run.
+        # Only trace tests where at least one compiler passed the bridge run.
         local safe
         safe="$(sanitize_name "$name")"
-        local br="FAIL"
-        [[ -f "$RESULTS_DIR/${safe}.bridge.result" ]] && br="$(< "$RESULTS_DIR/${safe}.bridge.result")"
-        if [[ "$br" != "PASS" ]]; then
+        local any_pass=false
+        for compiler in "${compilers[@]}"; do
+          local br="FAIL"
+          [[ -f "$RESULTS_DIR/${safe}.${compiler}.bridge.result" ]] && br="$(< "$RESULTS_DIR/${safe}.${compiler}.bridge.result")"
+          if [[ "$br" == "PASS" ]]; then
+            any_pass=true
+            break
+          fi
+        done
+        if ! $any_pass; then
           continue
         fi
       fi
