@@ -1,24 +1,30 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 #
-# emu-bridge-test.sh -- Phased parallel comparison of emulator vs hardware.
+# emu-bridge-test.sh -- Dual-compiler phased comparison of emulator vs hardware.
 #
-# Runs mlir-aie NPU integration tests through two execution paths and
-# produces a comparison matrix:
+# Compiles and runs mlir-aie NPU integration tests with BOTH compilers
+# (Chess and Peano) through two execution paths, producing a per-compiler
+# comparison matrix:
 #
 #   1. XRT bridge + emulator  (XDNA_EMU=1 ./test.exe)
 #   2. XRT bridge + real hardware  (./test.exe with real BDF)
 #
+# Chess is the ground truth compiler. Peano results are informational --
+# compile failures with Peano are expected for some Chess-specific tests.
+#
 # Five-phase architecture:
 #   Phase 1: Discover     -- find tests, filter, skip npu2-only
-#   Phase 2: Compile      -- parallel xclbin + test.exe builds
-#   Phase 3: Run hardware -- serial (NPU jams under parallel load)
-#   Phase 4: Run emulator -- parallel -j$(nproc)
-#   Phase 5: Report       -- comparison matrix + summary
+#   Phase 2: Compile      -- parallel xclbin builds (both compilers) + test.exe
+#   Phase 3: Run hardware -- serial per (test, compiler) pair
+#   Phase 4: Run emulator -- parallel -j$(nproc) per (test, compiler) pair
+#   Phase 5: Report       -- per-compiler comparison matrix + summary
 #
 # Usage:
-#   ./scripts/emu-bridge-test.sh                    # all tests, emulator + hardware
-#   ./scripts/emu-bridge-test.sh add_one_using_dma  # single test
+#   ./scripts/emu-bridge-test.sh                    # all tests, both compilers
+#   ./scripts/emu-bridge-test.sh add_one_using_dma  # single test, both compilers
+#   ./scripts/emu-bridge-test.sh --chess-only       # Chess only (ground truth)
+#   ./scripts/emu-bridge-test.sh --peano-only       # Peano only
 #   ./scripts/emu-bridge-test.sh --no-hw            # emulator only, skip hardware
 #   ./scripts/emu-bridge-test.sh --compile          # force recompile xclbins
 #   ./scripts/emu-bridge-test.sh --list             # list available tests
