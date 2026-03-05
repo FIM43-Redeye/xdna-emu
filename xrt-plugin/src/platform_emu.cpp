@@ -561,9 +561,26 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
       EMU_INFO("submit_cmd: chain[%u] instr_addr=0x%" PRIx64
                " instr_size=%u opcode=%u",
                i, addr, size, (unsigned)sub_pkt->opcode);
+
+      // Expand inline DPU chaining within the chain sub-command.
+      if (sub_pkt->opcode == ERT_START_DPU) {
+        auto* dpu = get_ert_dpu_data(
+            const_cast<ert_start_kernel_cmd*>(sub_pkt));
+        while (dpu && dpu->chained > 0) {
+          dpu = get_ert_dpu_data_next(dpu);
+          if (dpu) {
+            EMU_INFO("submit_cmd: chain[%u] DPU chained instr_addr=0x%"
+                     PRIx64 " instr_size=%u",
+                     i, dpu->instruction_buffer,
+                     dpu->instruction_buffer_size);
+            sub_cmds.push_back({dpu->instruction_buffer,
+                                dpu->instruction_buffer_size, sub_pkt});
+          }
+        }
+      }
     }
   } else {
-    // Single command: ERT_START_NPU or ERT_START_CU.
+    // Single command: ERT_START_NPU, ERT_START_DPU, ERT_START_CU, etc.
     uint64_t addr = 0;
     uint32_t size = 0;
     if (!parse_single_cmd(pkt, addr, size)) {
@@ -575,6 +592,26 @@ submit_cmd(shim_xdna::submit_cmd_arg& arg) const
     EMU_INFO("submit_cmd: instr_addr=0x%" PRIx64 " instr_size=%u opcode=%u",
              addr, size, (unsigned)pkt->opcode);
     sub_cmds.push_back({addr, size, pkt});
+
+    // ERT_START_DPU supports inline chaining: when chained > 0, there
+    // are additional ert_dpu_data elements concatenated after the first.
+    // Each has its own instruction buffer that must be executed.
+    if (pkt->opcode == ERT_START_DPU) {
+      auto* dpu = get_ert_dpu_data(
+          const_cast<ert_start_kernel_cmd*>(pkt));
+      while (dpu && dpu->chained > 0) {
+        dpu = get_ert_dpu_data_next(dpu);
+        if (dpu) {
+          EMU_INFO("submit_cmd: DPU chained instr_addr=0x%" PRIx64
+                   " instr_size=%u chained=%u",
+                   dpu->instruction_buffer,
+                   dpu->instruction_buffer_size,
+                   dpu->chained);
+          sub_cmds.push_back({dpu->instruction_buffer,
+                              dpu->instruction_buffer_size, pkt});
+        }
+      }
+    }
   }
 
   // -- Sync all BOs from memfd into emulator host memory ---------------------
