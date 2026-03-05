@@ -72,6 +72,9 @@ fn main() {
             "--cross-tile" => {
                 opts.cross_tile = true;
             }
+            "--remap-columns" => {
+                opts.remap_columns = true;
+            }
             "--help" | "-h" => usage(),
             other => {
                 eprintln!("Unknown argument: {}", other);

@@ -36,6 +36,7 @@ pub struct TileKey {
 }
 
 /// Decoded trace event with absolute cycle.
+#[derive(Clone)]
 pub struct TileEvent {
     pub slot: u8,
     pub abs_cycle: u64,
@@ -96,6 +97,10 @@ pub struct AnalysisOptions {
     pub stalls: bool,
     /// Enable cross-tile correlation (edge-to-edge across modules).
     pub cross_tile: bool,
+    /// Remap physical columns to logical 0-indexed before comparison.
+    /// Use for serial-vs-parallel HW traces where the driver assigns
+    /// different physical columns to each run.
+    pub remap_columns: bool,
 }
 
 impl AnalysisOptions {
@@ -105,6 +110,7 @@ impl AnalysisOptions {
             iterations: true,
             stalls: true,
             cross_tile: true,
+            remap_columns: false,
         }
     }
 
@@ -643,6 +649,30 @@ pub fn decode_per_tile(data: &[u8]) -> TileEvents {
     }
 
     tiles
+}
+
+/// Remap physical columns to 0-indexed logical columns.
+///
+/// The NPU driver assigns physical columns dynamically -- serial runs
+/// might use column 1 while parallel runs use column 3 for the same
+/// test.  This function normalizes column numbers so traces from
+/// different runs can be compared by tile structure.
+fn remap_tile_columns(tiles: &TileEvents) -> TileEvents {
+    let mut cols: Vec<u8> = tiles.keys().map(|k| k.col).collect::<BTreeSet<_>>().into_iter().collect();
+    cols.sort();
+    let col_map: HashMap<u8, u8> = cols.into_iter().enumerate().map(|(i, c)| (c, i as u8)).collect();
+
+    tiles
+        .iter()
+        .map(|(key, events)| {
+            let new_key = TileKey {
+                col: col_map[&key.col],
+                row: key.row,
+                pkt_type: key.pkt_type,
+            };
+            (new_key, events.to_vec())
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -1688,6 +1718,14 @@ pub fn compare_batch_with_opts(
 
     let hw_tiles = decode_per_tile(&hw_data);
     let emu_tiles = decode_per_tile(&emu_data);
+
+    // When remap_columns is enabled, normalize physical columns to logical
+    // 0-indexed so traces from different NPU column assignments can be compared.
+    let (hw_tiles, emu_tiles) = if opts.remap_columns {
+        (remap_tile_columns(&hw_tiles), remap_tile_columns(&emu_tiles))
+    } else {
+        (hw_tiles, emu_tiles)
+    };
 
     let all_keys: BTreeSet<TileKey> =
         hw_tiles.keys().chain(emu_tiles.keys()).copied().collect();
