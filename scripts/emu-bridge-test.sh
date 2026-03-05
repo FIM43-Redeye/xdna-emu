@@ -79,6 +79,7 @@ JOBS="$(nproc)"
 FILTER=""
 FORCE_COMPILE=false
 RUN_HW=true
+RUN_EMU=true
 LIST_ONLY=false
 VERBOSE=false
 TRACE_MODE=""  # "", "default", "all", "sweep", "sweep-all"
@@ -88,6 +89,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --compile)     FORCE_COMPILE=true; shift ;;
     --no-hw)       RUN_HW=false; shift ;;
+    --no-emu)      RUN_EMU=false; shift ;;
     --list)        LIST_ONLY=true; shift ;;
     -v|--verbose)  VERBOSE=true; shift ;;
     --trace)       TRACE_MODE="default"; shift ;;
@@ -114,6 +116,7 @@ Usage: emu-bridge-test.sh [options] [test-name-filter]
 Options:
   --compile       Force recompile all xclbins (default: use cached)
   --no-hw         Skip real hardware runs (default: hardware enabled)
+  --no-emu        Skip emulator runs (default: emulator enabled)
   --list          List available tests and exit
   --trace         Run trace comparison (default events, passing tests only)
   --trace=all     Trace all tests (pass + fail)
@@ -157,7 +160,7 @@ for _c in "${COMPILERS[@]}"; do
 done
 
 # Export variables that parallel jobs need.
-export RESULTS_DIR FORCE_COMPILE VERBOSE TRACE_MODE
+export RESULTS_DIR FORCE_COMPILE VERBOSE TRACE_MODE RUN_EMU
 export MLIR_AIE TEST_SRC BUILD_BASE EMU_ROOT
 export XRT_DIR XRT_INCLUDE XRT_LIB
 export TEST_LIB_DIR TEST_UTILS_INCLUDE TEST_UTILS_LIB
@@ -1284,14 +1287,20 @@ main() {
     fi
   fi
 
-  info "Phase 3+4: Running ${#all_jobs[@]} job(s) (HW -j${NPU_HW_JOBS}, EMU -j${JOBS})"
+  local hw_label="" emu_label=""
+  $RUN_HW && hw_label="HW -j${NPU_HW_JOBS}"
+  $RUN_EMU && emu_label="EMU -j${JOBS}"
+  info "Phase 3+4: Running ${#all_jobs[@]} job(s) (${hw_label:+$hw_label }${emu_label:+$emu_label})"
 
   # Launch EMU for all jobs (parallel, no NPU constraint).
-  for entry in "${all_jobs[@]}"; do
-    local name="${entry%%:*}" compiler="${entry##*:}"
-    echo "$name $compiler"
-  done | xargs -P"$JOBS" -n2 bash -c 'run_one_bridge "$@"' _ &
-  local emu_pool_pid=$!
+  local emu_pool_pid=""
+  if $RUN_EMU; then
+    for entry in "${all_jobs[@]}"; do
+      local name="${entry%%:*}" compiler="${entry##*:}"
+      echo "$name $compiler"
+    done | xargs -P"$JOBS" -n2 bash -c 'run_one_bridge "$@"' _ &
+    emu_pool_pid=$!
+  fi
 
   # Launch HW with NPU job pool (if enabled), concurrently with EMU.
   if $RUN_HW; then
@@ -1341,7 +1350,9 @@ main() {
   fi
 
   # Wait for EMU pool to finish.
-  wait "$emu_pool_pid" 2>/dev/null || true
+  if [[ -n "$emu_pool_pid" ]]; then
+    wait "$emu_pool_pid" 2>/dev/null || true
+  fi
   info "EMU runs done"
   echo ""
 
