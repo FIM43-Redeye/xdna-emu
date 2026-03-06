@@ -252,6 +252,7 @@ impl InterpreterEngine {
                         }
                     }
                 }
+                self.drain_core_enables();
             }
 
             // Keep routing as long as trace data is anywhere in the pipeline:
@@ -322,6 +323,23 @@ impl InterpreterEngine {
         self.get_core(col, row)
             .map(|c| c.enabled)
             .unwrap_or(false)
+    }
+
+    /// Drain pending core enable/disable events from device state.
+    ///
+    /// Core_Control register writes (from NPU instructions, CDO, or control
+    /// packets) push events to `device.pending_core_enables`. This syncs
+    /// those to the engine's internal core state, matching how real hardware
+    /// immediately reacts to the register write.
+    fn drain_core_enables(&mut self) {
+        let events: Vec<_> = self.device.pending_core_enables.drain(..).collect();
+        for (col, row, enabled) in events {
+            if enabled {
+                self.enable_core(col as usize, row as usize);
+            } else {
+                self.disable_core(col as usize, row as usize);
+            }
+        }
     }
 
     /// Get core status at (col, row).
@@ -618,6 +636,7 @@ impl InterpreterEngine {
                 }
             }
         }
+        self.drain_core_enables();
 
         // Drain DMA trace events into the global trace log and notify
         // trace units so they can produce binary trace packets.
