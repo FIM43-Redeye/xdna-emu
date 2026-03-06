@@ -24,20 +24,20 @@
 //! let records = load_instruction_records(td_file, includes)?;
 //! ```
 
-#[cfg(feature = "native-tblgen")]
+
 use std::path::Path;
 
-#[cfg(feature = "native-tblgen")]
+
 use tblgen::TableGenParser;
 
-#[cfg(feature = "native-tblgen")]
+
 use super::tblgen_records::{EncodingBit, InstrRecord, SlotEncoding};
-#[cfg(feature = "native-tblgen")]
+
 use super::types::{
     CompositeFormatDef, ItineraryInfo, PipelineStage, ProcessorModel,
     RegisterClassDef, RegisterDef, RegisterModel, SemanticOp, SlotBitMap,
 };
-#[cfg(feature = "native-tblgen")]
+
 use std::collections::HashMap;
 
 /// Extract composite VLIW format definitions from TableGen records.
@@ -50,7 +50,7 @@ use std::collections::HashMap;
 ///
 /// Returns fully populated CompositeFormatDef with correct slot_maps,
 /// fixed_mask, and fixed_value.
-#[cfg(feature = "native-tblgen")]
+
 pub fn load_composite_formats(
     td_file: &Path,
     include_paths: &[&Path],
@@ -81,7 +81,7 @@ pub fn load_composite_formats(
 /// Reads all records that are subclasses of "Instruction" and have encoding
 /// fields (Inst bits, Size, DecoderNamespace). Produces InstrRecord values
 /// compatible with the existing `to_encoding()` pipeline.
-#[cfg(feature = "native-tblgen")]
+
 pub fn load_instruction_records(
     td_file: &Path,
     include_paths: &[&Path],
@@ -108,7 +108,7 @@ pub fn load_instruction_records(
 // ============================================================================
 
 /// Parse a .td file and return the RecordKeeper.
-#[cfg(feature = "native-tblgen")]
+
 fn parse_td_file<'a>(
     td_file: &Path,
     include_paths: &[&Path],
@@ -125,7 +125,7 @@ fn parse_td_file<'a>(
 }
 
 /// Extract a CompositeFormatDef from a single TableGen record.
-#[cfg(feature = "native-tblgen")]
+
 fn extract_composite_format(record: &tblgen::Record<'_>) -> Option<CompositeFormatDef> {
     let name = record.name().ok()?.to_string();
 
@@ -224,7 +224,7 @@ fn extract_composite_format(record: &tblgen::Record<'_>) -> Option<CompositeForm
 ///
 /// Filters out composite instructions and codegen-only pseudo instructions.
 /// Extracts the slot encoding from the Inst field using VarBitInit resolution.
-#[cfg(feature = "native-tblgen")]
+
 fn extract_instruction_record(record: &tblgen::Record<'_>) -> Option<InstrRecord> {
     let name = record.name().ok()?.to_string();
 
@@ -403,7 +403,7 @@ fn extract_instruction_record(record: &tblgen::Record<'_>) -> Option<InstrRecord
 }
 
 /// Extract (reg_class, operand_name) pairs from an InOperandList or OutOperandList dag.
-#[cfg(feature = "native-tblgen")]
+
 fn extract_dag_operands(record: &tblgen::Record<'_>, field_name: &str) -> Vec<(String, String)> {
     let val = match record.value(field_name) {
         Ok(v) => v,
@@ -430,7 +430,7 @@ fn extract_dag_operands(record: &tblgen::Record<'_>, field_name: &str) -> Vec<(S
 }
 
 /// Extract a list of register names from a Defs or Uses field (list<Register>).
-#[cfg(feature = "native-tblgen")]
+
 fn extract_def_list(record: &tblgen::Record<'_>, field_name: &str) -> Vec<String> {
     let val = match record.value(field_name) {
         Ok(v) => v,
@@ -463,7 +463,7 @@ fn extract_def_list(record: &tblgen::Record<'_>, field_name: &str) -> Vec<String
 /// Walks all records derived from "Pattern" and extracts the SDNode/intrinsic
 /// from PatternToMatch and the target instruction from ResultInstrs.
 /// Applies the same "direct beats compound" selection logic as the text parser.
-#[cfg(feature = "native-tblgen")]
+
 pub fn load_pattern_records(
     td_file: &Path,
     include_paths: &[&Path],
@@ -566,7 +566,7 @@ pub fn load_pattern_records(
 ///
 /// Walks the dag operator and nested sub-dags to find the first SDNode or
 /// intrinsic name that maps to a SemanticOp.
-#[cfg(feature = "native-tblgen")]
+
 fn extract_semantic_from_dag_init(dag: &tblgen::init::DagInit) -> Option<SemanticOp> {
     // Try the operator of this dag (operator() returns Record directly)
     let op_rec = dag.operator();
@@ -597,7 +597,7 @@ fn extract_semantic_from_dag_init(dag: &tblgen::init::DagInit) -> Option<Semanti
 }
 
 /// Check if a result DAG contains compound operations (NegateImm, SUB, ADD).
-#[cfg(feature = "native-tblgen")]
+
 fn result_dag_has_compound_ops(dag: &tblgen::init::DagInit) -> bool {
     for i in 0..dag.num_args() {
         if let Some(arg_init) = dag.get(i) {
@@ -622,7 +622,7 @@ fn result_dag_has_compound_ops(dag: &tblgen::init::DagInit) -> bool {
 ///
 /// Reads all records derived from "MultiSlot_Pseudo" and extracts the
 /// `materializableInto` field (list<AIE2Inst>).
-#[cfg(feature = "native-tblgen")]
+
 pub fn load_pseudo_expansion_map(
     td_file: &Path,
     include_paths: &[&Path],
@@ -675,7 +675,7 @@ pub fn load_pseudo_expansion_map(
 ///
 /// Reads the single record derived from "SchedMachineModel" and extracts
 /// latency/penalty/width parameters.
-#[cfg(feature = "native-tblgen")]
+
 pub fn load_processor_model(
     td_file: &Path,
     include_paths: &[&Path],
@@ -718,7 +718,7 @@ pub fn load_processor_model(
 /// Two-pass extraction matching the text parser:
 /// 1. Collect all InstrStage records (anonymous) into a name->stage map
 /// 2. Collect all InstrItinData records, resolving stage references
-#[cfg(feature = "native-tblgen")]
+
 pub fn load_itinerary_data(
     td_file: &Path,
     include_paths: &[&Path],
@@ -880,7 +880,7 @@ pub fn load_itinerary_data(
 /// NOTE: We use indexed access (`dag.get(i)`) instead of `dag.args()` because
 /// the DagIter requires both name AND value to be Some, but MemberList args
 /// are unnamed positional arguments. Using `dag.args()` silently yields nothing.
-#[cfg(feature = "native-tblgen")]
+
 fn collect_dag_register_refs(dag: &tblgen::init::DagInit, out: &mut Vec<String>) {
     for i in 0..dag.num_args() {
         let arg_init = match dag.get(i) {
@@ -902,7 +902,7 @@ fn collect_dag_register_refs(dag: &tblgen::init::DagInit, out: &mut Vec<String>)
 }
 
 /// Extract the complete register model (registers + register classes).
-#[cfg(feature = "native-tblgen")]
+
 pub fn load_register_model(
     td_file: &Path,
     include_paths: &[&Path],
@@ -1041,7 +1041,7 @@ pub fn load_register_model(
 }
 
 #[cfg(test)]
-#[cfg(feature = "native-tblgen")]
+
 mod tests {
     use super::*;
     use std::path::PathBuf;

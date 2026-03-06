@@ -32,8 +32,8 @@ crossterm = "0.29"                                       # Terminal control for 
 libc = "0.2"                                              # POSIX FFI: setsid, killpg for process control
 sha2 = "0.10"                                             # SHA256 for trace staleness checking
 
-# TableGen integration (optional, requires LLVM)
-tblgen = { git = "https://github.com/FIM43-Redeye/tblgen-rs.git", branch = "feat/varbit-init", default-features = false, features = ["llvm20-0"], optional = true }
+# TableGen integration (links directly to LLVM's TableGen library)
+tblgen = { git = "https://github.com/FIM43-Redeye/tblgen-rs.git", branch = "feat/varbit-init", default-features = false, features = ["llvm20-0"] }
 
 # Serialization (for test manifests and register database)
 serde = { version = "1", features = ["derive"] }
@@ -62,9 +62,6 @@ xclbin-tests = []
 # Capture first: cargo run --example capture_npu_outputs
 # Run tests: cargo test --features hardware-compare
 hardware-compare = []
-# Native TableGen integration via tblgen crate (requires LLVM/llvm-aie build).
-# Set TABLEGEN_200_PREFIX to point at llvm-aie build directory.
-native-tblgen = ["dep:tblgen"]
 
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }
