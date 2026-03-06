@@ -688,7 +688,7 @@ impl DmaEngine {
         };
 
         // Create transfer
-        let transfer = Transfer::new(bd_config, bd_index, channel, direction, self.col, self.row, self.tile_type)?;
+        let mut transfer = Transfer::new(bd_config, bd_index, channel, direction, self.col, self.row, self.tile_type)?;
 
         log::info!("DMA tile({},{}) ch{} BD{} start: total_bytes={} base_addr=0x{:X} next_bd={:?} acq_lock={:?}(val={}) rel_lock={:?}(val={}) pkt={}(id={}) dir={:?}",
             self.col, self.row, channel, bd_index,
@@ -701,7 +701,7 @@ impl DmaEngine {
         // Insert packet header before any FSM state transitions. On real
         // hardware the DMA prepends the header when the MM2S transfer begins,
         // regardless of whether lock acquisition is needed first.
-        self.maybe_insert_packet_header_from_transfer(&transfer);
+        self.maybe_insert_packet_header_from_transfer(&mut transfer);
 
         // Determine initial FSM state based on whether lock acquisition is needed
         let ch = &mut self.channels[ch_idx];
@@ -941,10 +941,10 @@ impl DmaEngine {
         let fsm = std::mem::take(&mut self.channels[ch_idx].fsm);
 
         let new_fsm = match fsm {
-            ChannelFsm::BdSetup { cycles_remaining, transfer } => {
+            ChannelFsm::BdSetup { cycles_remaining, mut transfer } => {
                 if cycles_remaining <= 1 {
                     // BD setup done. Insert packet header if needed.
-                    self.maybe_insert_packet_header_from_transfer(&transfer);
+                    self.maybe_insert_packet_header_from_transfer(&mut transfer);
                     // Check if lock acquisition is needed
                     if let Some(lock_id) = transfer.acquire_lock {
                         ChannelFsm::AcquiringLock {
@@ -1367,7 +1367,12 @@ impl DmaEngine {
     ///
     /// Unlike the old maybe_insert_packet_header which accessed self.transfers[],
     /// this takes a Transfer reference directly from the FSM.
-    fn maybe_insert_packet_header_from_transfer(&mut self, transfer: &Transfer) {
+    ///
+    /// Takes `&mut Transfer` so it can call `mark_packet_header_sent()` after
+    /// successful insertion. This prevents double-insertion when the same
+    /// Transfer passes through both `start_channel_with_repeat` and `BdSetup`
+    /// completion (the no-lock path).
+    fn maybe_insert_packet_header_from_transfer(&mut self, transfer: &mut Transfer) {
         if !transfer.needs_packet_header() || transfer.direction != TransferDirection::MM2S {
             if transfer.enable_packet && transfer.direction == TransferDirection::MM2S {
                 log::warn!("DMA({},{}) ch{} BD{}: enable_packet=true but needs_packet_header()={} header_sent={}",
@@ -1383,6 +1388,7 @@ impl DmaEngine {
                 tlast: false,
                 channel: transfer.channel,
             });
+            transfer.mark_packet_header_sent();
             let (hdr, _) = crate::device::stream_switch::PacketHeader::decode(header_word);
             log::info!("DMA({},{}) ch{} BD{} packet header: 0x{:08X} (pkt_id={}, type={:?})",
                 self.col, self.row, transfer.channel, transfer.bd_index,
