@@ -49,6 +49,8 @@
 
 mod cpp_switch;
 pub mod decoder_bytecode;
+#[cfg(feature = "native-tblgen")]
+pub mod native;
 mod parser;
 mod resolver;
 pub mod tblgen_records;
@@ -340,8 +342,30 @@ fn parse_tblgen_output(
     disasm_text: &str,
     llvm_aie_path: &Path,
 ) -> Result<types::TblgenOutput, std::io::Error> {
-    // Parse instruction records
+    // Parse instruction records -- native path gets full 607+ coverage,
+    // subprocess path gets ~210 from --print-records.
+    #[cfg(feature = "native-tblgen")]
+    let records = {
+        let td_file = llvm_aie_path.join("llvm/lib/Target/AIE/AIE2.td");
+        let inc_paths = vec![
+            llvm_aie_path.join("llvm/include"),
+            llvm_aie_path.join("llvm/lib/Target/AIE"),
+        ];
+        let incs: Vec<&std::path::Path> = inc_paths.iter().map(|p| p.as_path()).collect();
+        match native::load_instruction_records(&td_file, &incs) {
+            Ok(r) => {
+                log::info!("Native TableGen: {} instruction records (full coverage)", r.len());
+                r
+            }
+            Err(e) => {
+                log::warn!("Native TableGen failed, falling back to subprocess: {}", e);
+                tblgen_records::parse_tblgen_records(records_text)
+            }
+        }
+    };
+    #[cfg(not(feature = "native-tblgen"))]
     let records = tblgen_records::parse_tblgen_records(records_text);
+    #[cfg(not(feature = "native-tblgen"))]
     log::info!("Parsed {} instruction records from llvm-tblgen", records.len());
 
     // Convert to encodings grouped by slot
@@ -538,6 +562,29 @@ fn parse_tblgen_output(
     let processor_model = tblgen_records::parse_processor_model(records_text);
     let itineraries = tblgen_records::parse_itinerary_data(records_text);
     let register_model = tblgen_records::parse_register_model(records_text);
+
+    // Composite formats -- native path gets fully resolved slot maps,
+    // subprocess path often produces empty slot maps for 80-bit+ bundles.
+    #[cfg(feature = "native-tblgen")]
+    let composite_formats = {
+        let td_file = llvm_aie_path.join("llvm/lib/Target/AIE/AIE2.td");
+        let inc_paths = vec![
+            llvm_aie_path.join("llvm/include"),
+            llvm_aie_path.join("llvm/lib/Target/AIE"),
+        ];
+        let incs: Vec<&std::path::Path> = inc_paths.iter().map(|p| p.as_path()).collect();
+        match native::load_composite_formats(&td_file, &incs) {
+            Ok(f) => {
+                log::info!("Native TableGen: {} composite formats (fully resolved)", f.len());
+                f
+            }
+            Err(e) => {
+                log::warn!("Native format extraction failed, falling back: {}", e);
+                tblgen_records::parse_composite_formats(records_text)
+            }
+        }
+    };
+    #[cfg(not(feature = "native-tblgen"))]
     let composite_formats = tblgen_records::parse_composite_formats(records_text);
 
     log::info!(
