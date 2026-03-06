@@ -83,7 +83,7 @@ impl StreamOps {
                 // AIE2 stream ops typically encode the port as an immediate operand
                 let port = Self::get_port_from_operands(op);
 
-                log::debug!(
+                log::info!(
                     "[STREAM] WriteScalar: value=0x{:08X} port={} blocking={} (tile {},{})",
                     value, port, blocking, tile.col, tile.row
                 );
@@ -108,7 +108,7 @@ impl StreamOps {
                 // Get the port from operands
                 let port = Self::get_port_from_operands(op);
 
-                log::debug!(
+                log::info!(
                     "[STREAM] WritePacketHeader: header=0x{:08X} port={} blocking={} (tile {},{})",
                     header, port, blocking, tile.col, tile.row
                 );

@@ -69,7 +69,7 @@ impl CascadeOps {
         let data = match tile.pop_cascade_input() {
             Some(d) => d,
             None => {
-                log::debug!(
+                log::info!(
                     "[CASCADE] Read stall: SCD empty (tile {},{}, pc=0x{:X})",
                     tile.col, tile.row, ctx.pc()
                 );
@@ -116,7 +116,7 @@ impl CascadeOps {
     ) -> CascadeResult {
         // Backpressure: if MCD FIFO is full (depth 1), stall
         if tile.cascade_output.len() >= 1 {
-            log::debug!(
+            log::info!(
                 "[CASCADE] Write stall: MCD full (tile {},{}, pc=0x{:X})",
                 tile.col, tile.row, ctx.pc()
             );

@@ -365,18 +365,24 @@ where
             }
 
             ExecuteResult::WaitLock { lock_id } => {
+                log::info!("Core({},{}) stall: WaitingLock lock={} pc=0x{:X}",
+                    tile.col, tile.row, lock_id, ctx.pc());
                 self.status = CoreStatus::WaitingLock { lock_id };
                 ctx.record_stall(1);
                 StepResult::WaitLock { lock_id }
             }
 
             ExecuteResult::WaitDma { channel } => {
+                log::info!("Core({},{}) stall: WaitingDma ch={} pc=0x{:X}",
+                    tile.col, tile.row, channel, ctx.pc());
                 self.status = CoreStatus::WaitingDma { channel };
                 ctx.record_stall(1);
                 StepResult::WaitDma { channel }
             }
 
             ExecuteResult::WaitStream { port } => {
+                log::info!("Core({},{}) stall: WaitingStream port={} pc=0x{:X}",
+                    tile.col, tile.row, port, ctx.pc());
                 self.status = CoreStatus::WaitingStream { port };
                 ctx.record_stall(1);
                 StepResult::WaitStream { port }
@@ -420,6 +426,7 @@ where
             CoreStatus::WaitingDma { channel } => {
                 // Check if DMA is complete
                 if !tile.dma_channels[channel as usize].running {
+                    log::info!("DMA ch{} complete, resuming execution", channel);
                     self.status = CoreStatus::Ready;
                     None
                 } else {
@@ -436,6 +443,7 @@ where
                     let can_resume = tile.has_cascade_input()
                         || tile.cascade_output.is_empty();
                     if can_resume {
+                        log::info!("Cascade available, resuming execution");
                         self.status = CoreStatus::Ready;
                         None
                     } else {
@@ -445,6 +453,7 @@ where
                 } else {
                     // Regular stream stall: check if stream data is available
                     if tile.has_stream_input(port) {
+                        log::info!("Stream port {} data available, resuming execution", port);
                         self.status = CoreStatus::Ready;
                         // Re-execute the instruction now that data is available
                         None
