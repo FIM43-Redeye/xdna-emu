@@ -1547,16 +1547,6 @@ impl Tile {
 
     /// Write a 32-bit value to a register offset.
     ///
-    /// For shim tiles, this stores to a sparse register map.
-    /// For other tiles, this may route to DMA BDs, locks, or other subsystems
-    /// based on the offset.
-    ///
-    /// # Register Offset Ranges (from AM020/AM025)
-    ///
-    /// - 0x14000-0x147FF: Lock registers
-    /// - 0x1D000-0x1D3FF: DMA BD registers
-    /// - 0x1D400-0x1D7FF: DMA channel control
-    /// - 0x3F000-0x3FFFF: Stream switch configuration
     /// Get an immutable reference to the register map.
     ///
     /// Used by mask_write_register in state.rs to read current values without
@@ -1565,304 +1555,6 @@ impl Tile {
         &self.registers
     }
 
-    pub fn write_register(&mut self, offset: u32, value: u32) {
-        // Always store in the register map for later retrieval
-        self.registers.insert(offset, value);
-
-        // For specific ranges, also update internal state
-        // DMA BD range: 0x1D000-0x1D3FF (16 BDs × 32 bytes each)
-        if (0x1D000..0x1D200).contains(&offset) {
-            let bd_offset = offset - 0x1D000;
-            let bd_index = (bd_offset / 0x20) as usize;
-            let reg_in_bd = (bd_offset % 0x20) as usize / 4;
-
-            if bd_index < self.dma_bds.len() {
-                let bd = &mut self.dma_bds[bd_index];
-                match reg_in_bd {
-                    0 => bd.addr_low = value,
-                    1 => bd.addr_high = value,
-                    2 => bd.length = value,
-                    3 => bd.control = value,
-                    4 => bd.d0 = value,
-                    5 => bd.d1 = value,
-                    _ => {}
-                }
-            }
-        }
-
-        // Lock value registers (from AM025 regdb: Lock0_value @ 0x1F000, stride 0x10)
-        let reg_layout = super::regdb::device_reg_layout();
-        let lock_base = if self.tile_type == TileType::MemTile {
-            reg_layout.memtile_lock_base
-        } else {
-            reg_layout.memory_lock_base
-        };
-        let lock_stride = if self.tile_type == TileType::MemTile {
-            reg_layout.memtile_lock_stride
-        } else {
-            reg_layout.memory_lock_stride
-        };
-        let lock_end = lock_base + (self.locks.len() as u32) * lock_stride;
-        if (lock_base..lock_end).contains(&offset) {
-            let lock_id = ((offset - lock_base) / lock_stride) as usize;
-            let sub_offset = (offset - lock_base) % lock_stride;
-            if lock_id < self.locks.len() && sub_offset == 0 {
-                // Lock_value field width derived from AM025 register database.
-                let signed = reg_layout.sign_extend_lock_value(value);
-                self.locks[lock_id].set(signed);
-                log::info!("Tile ({},{}) write_register: Lock{} = {} (raw=0x{:08X})",
-                    self.col, self.row, lock_id, signed, value);
-            }
-        }
-
-        // DMA channel control: 0x1D200-0x1D3FF
-        if (0x1D200..0x1D400).contains(&offset) {
-            let ch_offset = offset - 0x1D200;
-            let ch_index = (ch_offset / 0x8) as usize;
-            if ch_index < self.dma_channels.len() {
-                let ch = &mut self.dma_channels[ch_index];
-                if ch_offset % 0x8 == 0 {
-                    ch.control = value;
-                } else {
-                    ch.start_queue = value;
-                }
-            }
-        }
-
-        // Accumulator cascade control register (compute tiles only).
-        // Offset 0x36060 per aie-rt xaie_core.c:993-1046.
-        //   Bit 0: cascade input direction (0=North, 1=West)
-        //   Bit 1: cascade output direction (0=South, 1=East)
-        if offset == 0x36060 && self.is_compute() {
-            self.cascade_input_dir = (value & 0x1) as u8;
-            self.cascade_output_dir = ((value >> 1) & 0x1) as u8;
-            log::info!(
-                "Tile ({},{}) cascade config: input_dir={} output_dir={}",
-                self.col, self.row,
-                if self.cascade_input_dir == 0 { "North" } else { "West" },
-                if self.cascade_output_dir == 0 { "South" } else { "East" },
-            );
-        }
-
-        // Shim Mux config registers (shim tiles only)
-        // Mux_Config (0x1F000): selects source for switchbox South slave ports
-        //   Each 2-bit field: 0=South/PL, 1=DMA, 2=NoC
-        // Shim Mux/Demux config registers: select DMA/PL/NoC sources/dests
-        // for switchbox South ports. Offsets and field layout are data-driven.
-        let reg_layout = super::regdb::device_reg_layout();
-        if self.tile_type == TileType::Shim {
-            if offset == reg_layout.shim_mux.mux_offset {
-                self.parse_shim_mux_config(value);
-            } else if offset == reg_layout.shim_mux.demux_offset {
-                self.parse_shim_demux_config(value);
-            }
-        }
-
-        // Lock status registers (write-to-clear)
-        // Writing 1 to a bit clears that lock's overflow/underflow status
-        if self.is_mem_tile() {
-            if offset == reg_layout.memtile_locks_overflow_0 {
-                self.clear_lock_overflow_bits(0, 32, value);
-            } else if offset == reg_layout.memtile_locks_overflow_1 {
-                self.clear_lock_overflow_bits(32, 64, value);
-            } else if offset == reg_layout.memtile_locks_underflow_0 {
-                self.clear_lock_underflow_bits(0, 32, value);
-            } else if offset == reg_layout.memtile_locks_underflow_1 {
-                self.clear_lock_underflow_bits(32, 64, value);
-            }
-        } else if self.is_compute() {
-            if offset == reg_layout.memory_locks_overflow {
-                self.clear_lock_overflow_bits(0, 16, value);
-            } else if offset == reg_layout.memory_locks_underflow {
-                self.clear_lock_underflow_bits(0, 16, value);
-            }
-        }
-
-        // Trace register routing.
-        //
-        // Core module trace registers (compute tiles):
-        //   0x340D0 (Control0), 0x340D4 (Control1), 0x340E0 (Event0), 0x340E4 (Event1)
-        //
-        // Memory module trace registers (compute tiles):
-        //   0x140D0 (Control0), 0x140D4 (Control1), 0x140E0 (Event0), 0x140E4 (Event1)
-        //
-        // MemTile trace registers:
-        //   0x940D0 (Control0), 0x940D4 (Control1), 0x940E0 (Event0), 0x940E4 (Event1)
-        //
-        // Shim (PL module) trace registers:
-        //   0x340D0 (Control0), 0x340D4 (Control1), 0x340E0 (Event0), 0x340E4 (Event1)
-        //   Same offset as core module. Uses core_trace since shim has one trace unit.
-        if self.is_compute() {
-            // Core module trace: base 0x340D0
-            if offset >= 0x340D0 && offset <= 0x340E4 {
-                let trace_offset = offset - 0x340D0;
-                self.core_trace.write_register(trace_offset, value);
-            }
-            // Memory module trace: base 0x140D0
-            if offset >= 0x140D0 && offset <= 0x140E4 {
-                let trace_offset = offset - 0x140D0;
-                self.mem_trace.write_register(trace_offset, value);
-            }
-        } else if self.is_mem_tile() {
-            // MemTile trace: base 0x940D0
-            if offset >= 0x940D0 && offset <= 0x940E4 {
-                let trace_offset = offset - 0x940D0;
-                self.mem_trace.write_register(trace_offset, value);
-            }
-        } else if self.is_shim() {
-            // Shim PL module trace: base 0x340D0, stored in core_trace
-            if offset >= 0x340D0 && offset <= 0x340E4 {
-                let trace_offset = offset - 0x340D0;
-                self.core_trace.write_register(trace_offset, value);
-            }
-        }
-
-        // Edge detection event control registers.
-        //
-        // Each module has one register with two independent edge detectors.
-        // Compute tile: 0x34408 (core module), 0x14408 (memory module)
-        // MemTile: 0x94408
-        // Shim: 0x34408 (PL module, uses core_edge_detectors)
-        if self.is_compute() {
-            if offset == 0x34408 {
-                Self::configure_edge_detectors(&mut self.core_edge_detectors, value, false);
-            }
-            if offset == 0x14408 {
-                Self::configure_edge_detectors(&mut self.mem_edge_detectors, value, false);
-            }
-        } else if self.is_mem_tile() {
-            if offset == 0x94408 {
-                Self::configure_edge_detectors(&mut self.mem_edge_detectors, value, true);
-            }
-        } else if self.is_shim() {
-            if offset == 0x34408 {
-                Self::configure_edge_detectors(&mut self.core_edge_detectors, value, false);
-            }
-        }
-
-        // Event port selection registers.
-        //
-        // These configure which physical stream switch ports map to logical
-        // event ports 0-7 for PORT_RUNNING/IDLE/STALLED trace events.
-        //
-        // Register layout: 4 x 8-bit entries per register.
-        // Per entry: bit 5 = master (1) / slave (0), bits 4:0 = port index.
-        //
-        // Compute/Shim: 0x3FF00 (ports 0-3), 0x3FF04 (ports 4-7)
-        // MemTile:      0xB0F00 (ports 0-3), 0xB0F04 (ports 4-7)
-        let port_sel_base = match self.tile_type {
-            TileType::Compute | TileType::Shim => Some((0x3FF00u32, 0x3FF04u32)),
-            TileType::MemTile => Some((0xB0F00, 0xB0F04)),
-        };
-        if let Some((reg0, reg1)) = port_sel_base {
-            if offset == reg0 || offset == reg1 {
-                let base_slot = if offset == reg0 { 0 } else { 4 };
-                for i in 0..4usize {
-                    let byte = ((value >> (i * 8)) & 0xFF) as u8;
-                    let port_idx = byte & 0x1F;
-                    let is_master = (byte & 0x20) != 0;
-                    self.event_port_selection[base_slot + i] = Some((port_idx, is_master));
-                }
-                log::debug!(
-                    "Tile({},{}) event port sel @0x{:X}: {:?}",
-                    self.col, self.row, offset, &self.event_port_selection[base_slot..base_slot+4]
-                );
-            }
-        }
-
-        // Event broadcast channel registers.
-        //
-        // 16 channels per module, each mapping a local event ID to a broadcast line.
-        // When Event_Generate fires an event matching a channel's configured value,
-        // the corresponding BROADCAST_N event (hw_id 107+N) is generated.
-        //
-        // Per aie-rt xaiemlgbl_params.h:
-        //   Core module:   0x34010 + N*4 (CORE_MODULE_EVENT_BROADCAST0..15)
-        //   Memory module: 0x14010 + N*4 (MEMORY_MODULE_EVENT_BROADCAST0..15)
-        //   MemTile:       0x94010 + N*4 (MEM_TILE_MODULE_EVENT_BROADCAST0..15)
-        //   Shim/PL:       0x34010 + N*4 (same as core module offsets)
-        let bcast_base = match self.tile_type {
-            TileType::Compute => {
-                // Core module broadcasts at 0x34010, memory module at 0x14010.
-                // CDO typically configures shim tile broadcasts for trace start/stop,
-                // but compute tiles may also have broadcast config.
-                if (0x34010..=0x3404C).contains(&offset) {
-                    Some(0x34010u32)
-                } else if (0x14010..=0x1404C).contains(&offset) {
-                    Some(0x14010)
-                } else {
-                    None
-                }
-            }
-            TileType::MemTile => {
-                if (0x94010..=0x9404C).contains(&offset) {
-                    Some(0x94010)
-                } else {
-                    None
-                }
-            }
-            TileType::Shim => {
-                if (0x34010..=0x3404C).contains(&offset) {
-                    Some(0x34010)
-                } else {
-                    None
-                }
-            }
-        };
-        if let Some(base) = bcast_base {
-            let channel = ((offset - base) / 4) as usize;
-            if channel < 16 {
-                self.broadcast_channels[channel] = (value & 0xFF) as u8;
-                log::debug!(
-                    "Tile({},{}) broadcast channel {} = event {}",
-                    self.col, self.row, channel, self.broadcast_channels[channel]
-                );
-            }
-        }
-
-        // Event_Generate register.
-        //
-        // Writing fires the specified event on the module's event bus.
-        // If the event matches a configured broadcast channel, the
-        // corresponding BROADCAST_N event is queued for column propagation.
-        //
-        // Per aie-rt xaiemlgbl_params.h:
-        //   Core module:   0x34008 (CORE_MODULE_EVENT_GENERATE)
-        //   Memory module: 0x14008 (MEMORY_MODULE_EVENT_GENERATE)
-        //   MemTile:       0x94008 (MEM_TILE_MODULE_EVENT_GENERATE)
-        //   Shim/PL:       0x34008 (PL_MODULE_EVENT_GENERATE)
-        let is_event_generate = match self.tile_type {
-            TileType::Compute => offset == 0x34008 || offset == 0x14008,
-            TileType::MemTile => offset == 0x94008,
-            TileType::Shim => offset == 0x34008,
-        };
-        if is_event_generate {
-            let event_id = (value & 0x7F) as u8;
-            log::info!(
-                "Tile({},{}) Event_Generate: event_id={} (offset=0x{:X})",
-                self.col, self.row, event_id, offset
-            );
-
-            // Fire the event directly on local trace units.
-            // On real hardware, Event_Generate fires the event on the module's
-            // event bus, which the trace unit monitors. We notify directly.
-            self.core_trace.notify_event(event_id, 0);
-            self.mem_trace.notify_event(event_id, 0);
-
-            // Check broadcast channel mapping: if the generated event matches
-            // any channel's configured value, generate BROADCAST_N.
-            for ch in 0..16u8 {
-                if self.broadcast_channels[ch as usize] == event_id && event_id != 0 {
-                    let broadcast_hw_id = 107 + ch; // BROADCAST_0 = 107
-                    log::info!(
-                        "Tile({},{}) Event_Generate: event {} -> BROADCAST_{} (hw_id={})",
-                        self.col, self.row, event_id, ch, broadcast_hw_id
-                    );
-                    self.pending_broadcasts.push(broadcast_hw_id);
-                }
-            }
-        }
-    }
 
     /// Read a 32-bit value from a register offset.
     ///
@@ -2256,8 +1948,7 @@ impl Tile {
     ///
     /// Returns a list of actions for the caller to dispatch through
     /// `DeviceState::write_tile_register()`, which provides the full module
-    /// dispatch (MemTile DMA BDs, stream switch, etc.) that
-    /// `tile.write_register()` alone cannot.
+    /// dispatch (MemTile DMA BDs, stream switch, etc.).
     ///
     /// Currently supports:
     /// - Operation 0 (write): Write data words to consecutive register addresses
@@ -2796,10 +2487,10 @@ mod tests {
     #[test]
     fn test_edge_detector_register_write() {
         let mut tile = Tile::compute(0, 2);
-        // Write core module edge detection register (0x34408)
+        // Core module edge detection register (0x34408)
         // Event 0: event=42, rising=1; Event 1: event=50, falling=1
         let value = (1u32 << 26) | (50 << 16) | (1 << 9) | 42;
-        tile.write_register(0x34408, value);
+        Tile::configure_edge_detectors(&mut tile.core_edge_detectors, value, false);
 
         assert_eq!(tile.core_edge_detectors[0].input_event, 42);
         assert!(tile.core_edge_detectors[0].trigger_rising);
@@ -2813,9 +2504,9 @@ mod tests {
     #[test]
     fn test_edge_detector_mem_module_register() {
         let mut tile = Tile::compute(0, 2);
-        // Write memory module edge detection register (0x14408)
+        // Memory module edge detection register (0x14408)
         let value = (1u32 << 25) | (30 << 16) | (1 << 10) | (1 << 9) | 20;
-        tile.write_register(0x14408, value);
+        Tile::configure_edge_detectors(&mut tile.mem_edge_detectors, value, false);
 
         assert_eq!(tile.mem_edge_detectors[0].input_event, 20);
         assert!(tile.mem_edge_detectors[0].trigger_rising);
@@ -2829,10 +2520,10 @@ mod tests {
     #[test]
     fn test_edge_detector_memtile_register() {
         let mut tile = Tile::mem_tile(0, 1);
-        // Write MemTile edge detection register (0x94408)
-        // Use event > 127 to verify 8-bit field
+        // MemTile edge detection register (0x94408)
+        // Use event > 127 to verify 8-bit field (is_memtile=true)
         let value = (1u32 << 25) | (200 << 16) | (1 << 9) | 180;
-        tile.write_register(0x94408, value);
+        Tile::configure_edge_detectors(&mut tile.mem_edge_detectors, value, true);
 
         assert_eq!(tile.mem_edge_detectors[0].input_event, 180);
         assert!(tile.mem_edge_detectors[0].trigger_rising);
@@ -2856,23 +2547,24 @@ mod tests {
 
     #[test]
     fn test_shim_trace_register_write() {
-        let mut tile = Tile::shim(0, 0);
+        let mut device = super::super::state::DeviceState::new_npu1();
         // Write Trace_Control0 at 0x340D0 (same offset as core module)
         // start_event=1 (TRUE), stop_event=0 (NONE), mode=0 (event-time)
-        let ctrl0 = (0 << 24) | (1 << 16) | 0;
-        tile.write_register(0x340D0, ctrl0);
+        let ctrl0 = (0u32 << 24) | (1 << 16) | 0;
+        device.write_tile_register(0, 0, 0x340D0, ctrl0);
         // Trace unit should now be configured
+        let tile = device.array.get(0, 0).unwrap();
         assert!(tile.core_trace.is_configured());
     }
 
     #[test]
     fn test_shim_edge_detection_register() {
         let mut tile = Tile::shim(0, 0);
-        // Write edge detection register at 0x34408 for PL module
-        let value = (1u32 << 25) | (14 << 16) | (1 << 9) | 22;
-        tile.write_register(0x34408, value);
-
+        // Edge detection register at 0x34408 for PL module
         // Shim uses core_edge_detectors for its PL module
+        let value = (1u32 << 25) | (14 << 16) | (1 << 9) | 22;
+        Tile::configure_edge_detectors(&mut tile.core_edge_detectors, value, false);
+
         assert_eq!(tile.core_edge_detectors[0].input_event, 22);
         assert!(tile.core_edge_detectors[0].trigger_rising);
 
@@ -2882,12 +2574,13 @@ mod tests {
 
     #[test]
     fn test_shim_dma_event_notification() {
-        let mut tile = Tile::shim(0, 0);
+        let mut device = super::super::state::DeviceState::new_npu1();
         // Configure trace unit with start=TRUE(1)
-        tile.write_register(0x340D0, (1 << 16) | 0); // start=1, mode=0
+        device.write_tile_register(0, 0, 0x340D0, (1 << 16) | 0); // start=1, mode=0
 
         // Shim DMA events go through core_trace (PL module)
         // DMA_S2MM_0_START_TASK = PL event 14
+        let tile = device.array.get_mut(0, 0).unwrap();
         tile.notify_core_trace_event(14, 100);
         // Should not panic, trace unit accepts it
     }
@@ -2905,34 +2598,39 @@ mod tests {
 
     #[test]
     fn test_cascade_register_write() {
-        let mut tile = Tile::compute(1, 2);
+        let mut device = super::super::state::DeviceState::new_npu1();
 
         // Input=North(0), Output=South(0)
-        tile.write_register(0x36060, 0b00);
+        device.write_tile_register(1, 2, 0x36060, 0b00);
+        let tile = device.array.get(1, 2).unwrap();
         assert_eq!(tile.cascade_input_dir, 0);
         assert_eq!(tile.cascade_output_dir, 0);
 
         // Input=West(1), Output=East(1)
-        tile.write_register(0x36060, 0b11);
+        device.write_tile_register(1, 2, 0x36060, 0b11);
+        let tile = device.array.get(1, 2).unwrap();
         assert_eq!(tile.cascade_input_dir, 1);
         assert_eq!(tile.cascade_output_dir, 1);
 
         // Input=West(1), Output=South(0)
-        tile.write_register(0x36060, 0b01);
+        device.write_tile_register(1, 2, 0x36060, 0b01);
+        let tile = device.array.get(1, 2).unwrap();
         assert_eq!(tile.cascade_input_dir, 1);
         assert_eq!(tile.cascade_output_dir, 0);
 
         // Input=North(0), Output=East(1)
-        tile.write_register(0x36060, 0b10);
+        device.write_tile_register(1, 2, 0x36060, 0b10);
+        let tile = device.array.get(1, 2).unwrap();
         assert_eq!(tile.cascade_input_dir, 0);
         assert_eq!(tile.cascade_output_dir, 1);
     }
 
     #[test]
     fn test_cascade_register_ignored_for_non_compute() {
-        let mut tile = Tile::mem_tile(1, 1);
-        tile.write_register(0x36060, 0b11);
+        let mut device = super::super::state::DeviceState::new_npu1();
+        device.write_tile_register(1, 1, 0x36060, 0b11);
         // MemTile should not have cascade direction changed
+        let tile = device.array.get(1, 1).unwrap();
         assert_eq!(tile.cascade_input_dir, 0);
         assert_eq!(tile.cascade_output_dir, 0);
     }
@@ -2964,34 +2662,6 @@ mod tests {
         let result = tile.pop_cascade_output().unwrap();
         assert_eq!(result, data);
         assert!(!tile.has_cascade_output());
-    }
-
-    /// Documents that tile.write_register() does NOT update structured BD
-    /// state for MemTile BDs. This is a known limitation, not a bug -- the
-    /// fix is that control packets now return CtrlPacketAction::WriteRegister
-    /// which the caller routes through DeviceState::write_tile_register().
-    #[test]
-    fn test_tile_write_register_does_not_handle_memtile_bds() {
-        let reg_layout = super::super::regdb::device_reg_layout();
-        let bd0_word2_offset = reg_layout.memtile_bd_base + 2 * 4; // BD0, word 2 (length)
-
-        let mut tile = Tile::mem_tile(1, 1);
-        let test_length: u32 = 0x0000_1000;
-        tile.write_register(bd0_word2_offset, test_length);
-
-        // Register HashMap stores the value
-        assert_eq!(
-            *tile.registers_ref().get(&bd0_word2_offset).unwrap_or(&0),
-            test_length,
-            "Register HashMap should have the value"
-        );
-
-        // Structured BD is NOT updated (known limitation of tile-level dispatch)
-        assert_eq!(
-            tile.dma_bds[0].length, 0,
-            "tile.write_register() should NOT update MemTile BDs -- \
-             this is handled by DeviceState::write_tile_register()"
-        );
     }
 
     /// Proves that DeviceState::write_tile_register() correctly dispatches
@@ -3037,10 +2707,11 @@ mod tests {
         let mut tile = Tile::compute(2, 3);
 
         // Pre-populate registers at 0x440, 0x444, 0x448, 0x44C with known values.
-        tile.write_register(0x440, 0xDEAD_0001);
-        tile.write_register(0x444, 0xDEAD_0002);
-        tile.write_register(0x448, 0xDEAD_0003);
-        tile.write_register(0x44C, 0xDEAD_0004);
+        // Direct register map insertion -- no side effects needed for these offsets.
+        tile.registers.insert(0x440, 0xDEAD_0001);
+        tile.registers.insert(0x444, 0xDEAD_0002);
+        tile.registers.insert(0x448, 0xDEAD_0003);
+        tile.registers.insert(0x44C, 0xDEAD_0004);
 
         // Build OP_READ control packet header:
         //   address   = 0x440 (bits 19:0)

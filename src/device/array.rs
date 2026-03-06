@@ -1852,8 +1852,12 @@ mod tests {
 
         // Configure tile (1,3): output direction = South (0)
         // Configure tile (1,2): input direction = North (0)
-        array.tile_mut(1, 3).write_register(0x36060, 0b00); // in=North, out=South
-        array.tile_mut(1, 2).write_register(0x36060, 0b00); // in=North, out=South
+        // cascade_input_dir: bit 0 (0=North, 1=West)
+        // cascade_output_dir: bit 1 (0=South, 1=East)
+        array.tile_mut(1, 3).cascade_input_dir = 0;  // North
+        array.tile_mut(1, 3).cascade_output_dir = 0;  // South
+        array.tile_mut(1, 2).cascade_input_dir = 0;  // North
+        array.tile_mut(1, 2).cascade_output_dir = 0;  // South
 
         // Push cascade data to tile (1,3) output
         let data: [u64; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
@@ -1875,9 +1879,11 @@ mod tests {
         let mut array = TileArray::npu1();
 
         // Configure tile (1,3): output direction = East (1)
-        array.tile_mut(1, 3).write_register(0x36060, 0b10); // in=North, out=East
+        array.tile_mut(1, 3).cascade_input_dir = 0;  // North
+        array.tile_mut(1, 3).cascade_output_dir = 1;  // East
         // Configure tile (2,3): input direction = West (1)
-        array.tile_mut(2, 3).write_register(0x36060, 0b01); // in=West, out=South
+        array.tile_mut(2, 3).cascade_input_dir = 1;  // West
+        array.tile_mut(2, 3).cascade_output_dir = 0;  // South
 
         let data: [u64; 6] = [1, 2, 3, 4, 5, 6];
         array.tile_mut(1, 3).push_cascade_output(data);
@@ -1896,8 +1902,10 @@ mod tests {
         let mut array = TileArray::npu1();
 
         // Configure South cascade path: (1,3) -> (1,2)
-        array.tile_mut(1, 3).write_register(0x36060, 0b00);
-        array.tile_mut(1, 2).write_register(0x36060, 0b00);
+        array.tile_mut(1, 3).cascade_input_dir = 0;
+        array.tile_mut(1, 3).cascade_output_dir = 0;
+        array.tile_mut(1, 2).cascade_input_dir = 0;
+        array.tile_mut(1, 2).cascade_output_dir = 0;
 
         // Fill destination's input FIFO
         array.tile_mut(1, 2).push_cascade_input([0; 6]);
@@ -1919,8 +1927,10 @@ mod tests {
         let mut array = TileArray::npu1();
 
         // Source outputs South, but destination expects West (mismatch)
-        array.tile_mut(1, 3).write_register(0x36060, 0b00); // out=South
-        array.tile_mut(1, 2).write_register(0x36060, 0b01); // in=West (wrong!)
+        array.tile_mut(1, 3).cascade_input_dir = 0;
+        array.tile_mut(1, 3).cascade_output_dir = 0;  // South
+        array.tile_mut(1, 2).cascade_input_dir = 1;  // West (wrong!)
+        array.tile_mut(1, 2).cascade_output_dir = 0;
 
         let data: [u64; 6] = [99; 6];
         array.tile_mut(1, 3).push_cascade_output(data);
@@ -1945,11 +1955,12 @@ mod tests {
         let col: u8 = 2;
         let row: u8 = 3;
 
-        // Pre-populate 4 consecutive registers with known values
+        // Pre-populate 4 consecutive registers with known values.
+        // Direct register map insertion -- no side effects needed for these offsets.
         let base_offset: u32 = 0x440;
         let values = [0xAAAA_0001u32, 0xBBBB_0002, 0xCCCC_0003, 0xDDDD_0004];
         for (i, &val) in values.iter().enumerate() {
-            array.tile_mut(col, row).write_register(base_offset + (i as u32) * 4, val);
+            array.tile_mut(col, row).registers.insert(base_offset + (i as u32) * 4, val);
         }
 
         // Verify the TileCtrl slave port exists (port 3 on compute tiles)
@@ -2032,7 +2043,7 @@ mod tests {
         let row: u8 = 2;
         let offset: u32 = 0x500;
         let expected: u32 = 0x1234_5678;
-        array.tile_mut(col, row).write_register(offset, expected);
+        array.tile_mut(col, row).registers.insert(offset, expected);
 
         let ok = array.handle_read_registers(col, row, offset, 1, 0);
         assert!(ok);

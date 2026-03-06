@@ -979,7 +979,7 @@ impl Default for NpuExecutor {
 /// - Shim tiles: no data memory
 ///
 /// Writes to these offsets must go through tile.write_data() rather
-/// than tile.write_register() to actually reach data memory.
+/// than the register bus to actually reach data memory.
 fn is_data_memory_offset(tile: &crate::device::tile::Tile, offset: u32) -> bool {
     let dm_size = tile.data_memory().len() as u32;
     dm_size > 0 && offset < dm_size
