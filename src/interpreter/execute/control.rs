@@ -197,12 +197,12 @@ impl ControlUnit {
                             "[WATCH-ACQ] pc=0x{:03X} cycle={} lock={} value={}->{} SUCCESS",
                             ctx.pc(), ctx.cycles, raw_lock_id, current_value, lock.value
                         );
-                        log::debug!("LockAcquire raw={} mapped={} expected={} delta={} current={} -> {} SUCCESS (own_tile={})",
+                        log::info!("LockAcquire raw={} mapped={} expected={} delta={} current={} -> {} SUCCESS (own_tile={})",
                             raw_lock_id, lock_id, expected, delta, current_value, lock.value, is_own_tile);
                         Some(ExecuteResult::Continue)
                     }
                     LockResult::PreconditionNotMet => {
-                        log::debug!("LockAcquire raw={} mapped={} expected={} current={} -> WAIT (own_tile={})",
+                        log::info!("LockAcquire raw={} mapped={} expected={} current={} -> WAIT (own_tile={})",
                             raw_lock_id, lock_id, expected, current_value, is_own_tile);
                         Some(ExecuteResult::WaitLock { lock_id })
                     }
