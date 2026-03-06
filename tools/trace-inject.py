@@ -229,20 +229,30 @@ class CandidateResult:
 
 @dataclass
 class TracePlan:
-    """Result of trace route planning."""
+    """Result of trace route planning.
+
+    The plan provides routing info (shim_col, trace_channel) and a
+    classified tile list.  Event batching is NOT part of the plan --
+    that is the sweep tool's responsibility.
+    """
     feasible: bool
     reason: str
     shim_col: int | None = None
     trace_channel: int | None = None
+    # Classified tiles: list of {"col", "row", "tile_type"} dicts.
+    # tile_type is "core" or "memtile".  Core tiles produce two trace
+    # ports (core + mem module); memtiles produce one.
+    tiles: list[dict] | None = None
     candidates: list[CandidateResult] | None = None
 
     def to_dict(self) -> dict:
-        """Serialize for JSON manifest output."""
+        """Serialize for JSON output (--plan-only and manifests)."""
         d = {
             "feasible": self.feasible,
             "reason": self.reason,
             "shim_col": self.shim_col,
             "trace_channel": self.trace_channel,
+            "tiles": self.tiles or [],
         }
         if self.candidates:
             d["candidates"] = [
@@ -324,7 +334,7 @@ def find_used_packet_ids_ir(device_op) -> set[int]:
     return ids
 
 
-def classify_tiles(device_op) -> tuple[list[int], list[tuple], set[int]]:
+def classify_tiles(device_op) -> tuple[list[int], list[tuple], set[int], list[dict]]:
     """Classify tiles in a device into shim columns, trace targets, and test columns.
 
     Returns:
@@ -332,6 +342,8 @@ def classify_tiles(device_op) -> tuple[list[int], list[tuple], set[int]]:
         trace_targets: list of (col, row, trace_port) tuples for traceable tiles
             Core tiles produce two entries: (col, row, 0) for Core, (col, row, 1) for Mem
         test_cols: set of column indices used by the test (non-shim tiles with uses)
+        tile_info: list of {"col", "row", "tile_type"} dicts (deduplicated,
+            one per physical tile -- core tiles appear once, not twice)
     """
     from aie.extras.util import find_ops  # type: ignore
     import aie.dialects.aie as aiedialect  # type: ignore
@@ -347,6 +359,7 @@ def classify_tiles(device_op) -> tuple[list[int], list[tuple], set[int]]:
     shim_cols = []
     trace_targets = []
     test_cols = set()
+    tile_info = []
 
     for t in tile_ops:
         top = t.opview
@@ -361,10 +374,12 @@ def classify_tiles(device_op) -> tuple[list[int], list[tuple], set[int]]:
         if tm.is_core_tile(col, row):
             trace_targets.append((col, row, 0))  # Core trace port
             trace_targets.append((col, row, 1))  # Mem trace port
+            tile_info.append({"col": col, "row": row, "tile_type": "core"})
         elif tm.is_mem_tile(col, row):
             trace_targets.append((col, row, 0))  # MemTile trace port
+            tile_info.append({"col": col, "row": row, "tile_type": "memtile"})
 
-    return shim_cols, trace_targets, test_cols
+    return shim_cols, trace_targets, test_cols, tile_info
 
 
 # ---------------------------------------------------------------------------
@@ -623,7 +638,9 @@ def plan_trace_route(mlir_text: str) -> TracePlan:
 
         device_op = find_device_with_sequence(module)
         tm = _gtm(device_op.operation.attributes["device"])
-        shim_cols_list, trace_targets, test_cols = classify_tiles(device_op)
+        shim_cols_list, trace_targets, test_cols, tile_info = classify_tiles(
+            device_op,
+        )
 
         if not trace_targets:
             return TracePlan(False, "no traceable tiles found")
@@ -707,6 +724,7 @@ def plan_trace_route(mlir_text: str) -> TracePlan:
         ),
         shim_col=winner.shim_col,
         trace_channel=winner.channel,
+        tiles=tile_info,
         candidates=candidates,
     )
 

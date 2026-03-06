@@ -587,6 +587,12 @@ def main():
         "--use-base", type=Path, default=None,
         help="Use pre-compiled base dir (skip inject+compile)",
     )
+    parser.add_argument(
+        "--batches", type=Path, default=None,
+        help="JSON file with explicit event batches. Array of objects, "
+             'each with "core", "mem", "memtile" keys mapping to 8-element '
+             "event name arrays. Overrides default sweep-all-events behavior.",
+    )
     args = parser.parse_args()
 
     test_dir = resolve_test_dir(args.test)
@@ -600,32 +606,9 @@ def main():
     print(f"  HW:        {'yes' if not args.no_hw else 'no'}")
     print(f"  EMU:       {'yes' if not args.no_emu else 'no'}")
 
-    # Build batches: core events and mem events independently.
-    # Each batch has TRUE in slot 0 + 7 events in slots 1-7.
-    # Core and mem events are separate trace units, so we can sweep them
-    # in the same run (core_batch[i] paired with mem_batch[i]).
-    core_batches = batch_events(CORE_EVENTS) if not args.mem_only else [["TRUE"] + ["NONE"] * 7]
-    mem_batches = batch_events(MEM_EVENTS) if not args.core_only else [["TRUE"] + ["NONE"] * 7]
-
-    # Memtile batches are generated only if the design contains memtiles.
-    # Detection happens after base compilation (manifest has tile list),
-    # so we initialize to None here and populate after compile_base_trace.
-    memtile_batches: list[list[str]] | None = None
-
-    # Pair core and mem batches. If counts differ, extend the shorter with NONEs.
-    num_batches = max(len(core_batches), len(mem_batches))
-    noop_batch = ["TRUE"] + ["NONE"] * 7
-    while len(core_batches) < num_batches:
-        core_batches.append(noop_batch)
-    while len(mem_batches) < num_batches:
-        mem_batches.append(noop_batch)
-
-    print(f"  Batches:   {num_batches} (before memtile detection)")
-    print()
-
-    # --- Plan trace passes ------------------------------------------------
-    # Call the planner to determine whether all tiles fit through one shim
-    # (single pass) or need multiple injection+compile passes.
+    # --- Plan trace routing -----------------------------------------------
+    # The planner determines routing (shim col, channel) and classifies
+    # tiles.  Event batching is our responsibility, not the planner's.
     script_dir = Path(__file__).parent
     plan = None
     print("  Planning trace routing...")
@@ -641,26 +624,25 @@ def main():
         )
         if plan_result.returncode != 0:
             print(f"  Planner failed: {plan_result.stderr.strip()}", file=sys.stderr)
-            print("  Falling back to single-pass (existing behavior)")
         else:
             plan = json.loads(plan_result.stdout)
-            num_passes = plan["num_passes"]
-            print(f"  Plan: {plan['reason']} "
-                  f"({num_passes} pass{'es' if num_passes != 1 else ''}, "
-                  f"{plan['total_tiles']} tiles)")
+            tiles = plan.get("tiles", [])
+            has_core = any(t["tile_type"] == "core" for t in tiles)
+            has_memtile = any(t["tile_type"] == "memtile" for t in tiles)
+            print(f"  Plan: {plan['reason']} ({len(tiles)} tiles"
+                  f"{', memtile' if has_memtile else ''})")
     except (subprocess.TimeoutExpired, json.JSONDecodeError, KeyError) as e:
         print(f"  Planner error: {e}", file=sys.stderr)
-        print("  Falling back to single-pass (existing behavior)")
 
-    # Task 7: clear error when tracing is impossible (zero passes).
-    if plan and plan["num_passes"] == 0:
+    # Bail out if trace routing is infeasible.
+    if plan and not plan.get("feasible", False):
         reason = plan.get("reason", "unknown")
-        print(f"\n  TRACE CAPACITY ERROR: {reason}")
-        _write_skip_manifest(output_dir, "capacity_exceeded", reason)
+        print(f"\n  TRACE INFEASIBLE: {reason}")
+        _write_skip_manifest(output_dir, "infeasible", reason)
         sweep_manifest = {
             "test_name": test_name,
             "skipped": True,
-            "reason": "capacity_exceeded",
+            "reason": "infeasible",
             "detail": reason,
             "num_batches": 0,
             "batches": [],
@@ -668,78 +650,85 @@ def main():
         (output_dir / "sweep-manifest.json").write_text(
             json.dumps(sweep_manifest, indent=2) + "\n"
         )
-        print(f"Sweep skipped: capacity_exceeded")
+        print(f"Sweep skipped: {reason}")
         sys.exit(0)
+
+    # --- Generate event batches -------------------------------------------
+    # Event batching is independent of routing.  Each batch contains 8
+    # event slots per trace port type (core, mem, memtile).  Slot 0 is
+    # always TRUE (anchor event); slots 1-7 are swept across runs.
+    #
+    # Memtile batches are generated only if the plan includes memtiles.
+    # The plan's tile list is authoritative -- no post-compile detection.
+    has_memtile = plan and any(
+        t["tile_type"] == "memtile" for t in plan.get("tiles", [])
+    )
+
+    noop_batch = ["TRUE"] + ["NONE"] * 7
+
+    if args.batches:
+        # Explicit event batches from JSON file.
+        explicit = json.loads(args.batches.read_text())
+        core_batches = [b["core"] for b in explicit]
+        mem_batches = [b["mem"] for b in explicit]
+        memtile_batches = (
+            [b.get("memtile", noop_batch) for b in explicit]
+            if has_memtile else None
+        )
+        print(f"  Batches:   {len(explicit)} (from {args.batches})")
+    else:
+        # Default: sweep all known events.
+        core_batches = batch_events(CORE_EVENTS) if not args.mem_only else [noop_batch]
+        mem_batches = batch_events(MEM_EVENTS) if not args.core_only else [noop_batch]
+        memtile_batches = batch_events(MEMTILE_EVENTS) if has_memtile else None
+        print(f"  Batches:   auto-generated"
+              f" (core: {len(CORE_EVENTS)} events"
+              f", mem: {len(MEM_EVENTS)} events"
+              f"{f', memtile: {len(MEMTILE_EVENTS)} events' if has_memtile else ''})")
+
+    # Align all batch lists to the same length.
+    num_batches = max(len(core_batches), len(mem_batches))
+    if memtile_batches:
+        num_batches = max(num_batches, len(memtile_batches))
+    while len(core_batches) < num_batches:
+        core_batches.append(noop_batch)
+    while len(mem_batches) < num_batches:
+        mem_batches.append(noop_batch)
+    if memtile_batches:
+        while len(memtile_batches) < num_batches:
+            memtile_batches.append(noop_batch)
+
+    print(f"  Total:     {num_batches} batches")
+    print()
 
     # --- Compile-only mode: compile base(s) and exit -----------------------
 
     if args.compile_only:
         status_file = output_dir / "compile-status.txt"
         try:
-            if plan and plan["num_passes"] > 1:
-                # Multi-pass: compile each pass's base into its own subdir.
-                all_ok = True
-                for pass_idx, trace_pass in enumerate(plan["passes"]):
-                    tile_specs = []
-                    for t in trace_pass["tiles"]:
-                        tile_specs.append(f"{t['col']}.{t['row']}:{t['module']}")
-                    tile_filter = ",".join(tile_specs)
-
-                    pass_dir = output_dir / f"pass_{pass_idx:02d}"
-                    pass_dir.mkdir(parents=True, exist_ok=True)
-                    print(f"\n  Pass {pass_idx}: compiling "
-                          f"({len(trace_pass['tiles'])} tiles)")
-
-                    base_dir, base_manifest = compile_base_trace(
-                        test_dir, pass_dir, args.trace_size,
-                        tile_filter=tile_filter,
-                    )
-                    if base_dir is None:
-                        print(f"    Pass {pass_idx} compile failed")
-                        all_ok = False
-
-                if all_ok:
-                    status_file.write_text("OK\n")
-                    print(f"\nCompile-only: all passes compiled successfully")
-                else:
-                    status_file.write_text("FAIL some passes failed to compile\n")
-                    print(f"\nCompile-only: some passes failed")
-                    sys.exit(1)
+            base_dir, base_manifest = compile_base_trace(
+                test_dir, output_dir, args.trace_size,
+            )
+            if base_dir is not None:
+                status_file.write_text("OK\n")
+                print(f"\nCompile-only: OK")
             else:
-                # Single pass: compile one base.
-                base_dir, base_manifest = compile_base_trace(
-                    test_dir, output_dir, args.trace_size,
-                )
-                if base_dir is not None:
-                    status_file.write_text("OK\n")
-                    print(f"\nCompile-only: OK")
-                else:
-                    status_file.write_text("FAIL compile_base_trace failed\n")
-                    print(f"\nCompile-only: FAIL")
-                    sys.exit(1)
+                status_file.write_text("FAIL compile_base_trace failed\n")
+                print(f"\nCompile-only: FAIL")
+                sys.exit(1)
         except Exception as e:
             status_file.write_text(f"FAIL {e}\n")
             print(f"\nCompile-only: FAIL ({e})")
             sys.exit(1)
         return
 
-    # --- Multi-pass vs single-pass execution ------------------------------
+    # --- Execute sweep: compile once, run all event batches ---------------
 
-    if plan and plan["num_passes"] > 1:
-        # Multi-pass: each pass compiles and sweeps independently in its own
-        # subdirectory, then results are aggregated into the top-level manifest.
-        _run_multi_pass(
-            plan, test_dir, output_dir, test_name, args,
-            core_batches, mem_batches, memtile_batches,
-            num_batches, noop_batch, script_dir,
-        )
-    else:
-        # Single pass: existing behavior (compile once, sweep all batches).
-        _run_single_pass(
-            test_dir, output_dir, test_name, args,
-            core_batches, mem_batches, memtile_batches,
-            num_batches, noop_batch, script_dir,
-        )
+    _run_single_pass(
+        test_dir, output_dir, test_name, args,
+        core_batches, mem_batches, memtile_batches,
+        num_batches, noop_batch, script_dir,
+    )
 
 
 def _run_single_pass(
@@ -797,26 +786,8 @@ def _run_single_pass(
         sys.exit(1)
     print()
 
-    # Detect memtiles from manifest and generate memtile event batches
-    manifest_data = json.loads(base_manifest.read_text())
-    has_memtiles = any(
-        t.get("tile_type") == "memtile" or t.get("row") == 1
-        for t in manifest_data.get("tiles_traced", [])
-    )
-    if has_memtiles:
-        memtile_batches = batch_events(MEMTILE_EVENTS)
-        # Extend core/mem batch lists to cover memtile batches too
-        new_total = max(num_batches, len(memtile_batches))
-        while len(core_batches) < new_total:
-            core_batches.append(noop_batch)
-        while len(mem_batches) < new_total:
-            mem_batches.append(noop_batch)
-        while len(memtile_batches) < new_total:
-            memtile_batches.append(noop_batch)
-        num_batches = new_total
-        print(f"  Memtiles detected: adding {len(batch_events(MEMTILE_EVENTS))} memtile batches")
-        print(f"  Total batches: {num_batches}")
-    print()
+    # Memtile detection is done upfront from the routing plan's tile list,
+    # so memtile_batches are already populated if needed.
 
     # Prepare all batches (patch insts.bin, no execution yet)
     batches = []
@@ -839,166 +810,6 @@ def _run_single_pass(
     _print_summary(output_dir, test_name, num_batches, results)
 
 
-def _run_multi_pass(
-    plan: dict,
-    test_dir: Path,
-    output_dir: Path,
-    test_name: str,
-    args,
-    core_batches: list[list[str]],
-    mem_batches: list[list[str]],
-    memtile_batches: list[list[str]] | None,
-    num_batches: int,
-    noop_batch: list[str],
-    script_dir: Path,
-):
-    """Run a multi-pass sweep: each pass is an independent sub-sweep.
-
-    Each pass compiles with a tile filter, then runs the full batch+execute
-    flow in its own pass_NN/ subdirectory.  The top-level sweep manifest
-    aggregates all pass results.
-    """
-    trace_size = args.trace_size
-    pass_manifests = []
-    total_batches_across_passes = 0
-
-    for pass_idx, trace_pass in enumerate(plan["passes"]):
-        # Build tile filter string: "col.row:module,col.row:module,..."
-        tile_specs = []
-        for t in trace_pass["tiles"]:
-            tile_specs.append(f"{t['col']}.{t['row']}:{t['module']}")
-        tile_filter = ",".join(tile_specs)
-
-        pass_dir = output_dir / f"pass_{pass_idx:02d}"
-        pass_dir.mkdir(parents=True, exist_ok=True)
-
-        print(f"\n  Pass {pass_idx}: {len(trace_pass['tiles'])} tiles "
-              f"-> shim col {trace_pass['shim_col']}")
-
-        # Use pre-compiled base if provided, otherwise compile fresh.
-        if getattr(args, "use_base", None) is not None:
-            use_base = args.use_base.resolve()
-            pre_pass_dir = use_base / f"pass_{pass_idx:02d}" / "base"
-            pre_manifest = pre_pass_dir / "manifest.json"
-            if pre_pass_dir.is_dir() and pre_manifest.exists():
-                base_dir = pre_pass_dir
-                base_manifest = pre_manifest
-                print(f"    Using pre-compiled base: {pre_pass_dir}")
-            else:
-                # Fall back to compiling if pre-compiled pass not found.
-                print(f"    Pre-compiled pass {pass_idx} not found, compiling...")
-                base_dir, base_manifest = compile_base_trace(
-                    test_dir, pass_dir, trace_size, tile_filter=tile_filter,
-                )
-        else:
-            base_dir, base_manifest = compile_base_trace(
-                test_dir, pass_dir, trace_size, tile_filter=tile_filter,
-            )
-        if base_dir is None:
-            print(f"    Pass {pass_idx} compile failed, skipping")
-            pass_manifests.append({
-                "pass_idx": pass_idx,
-                "tiles": trace_pass["tiles"],
-                "shim_col": trace_pass["shim_col"],
-                "status": "compile_failed",
-                "num_batches": 0,
-                "batches": [],
-            })
-            continue
-
-        # Detect memtiles in this pass and build batches accordingly.
-        manifest_data = json.loads(base_manifest.read_text())
-        pass_has_memtiles = any(
-            t.get("tile_type") == "memtile" or t.get("row") == 1
-            for t in manifest_data.get("tiles_traced", [])
-        )
-
-        # Copy batch lists so per-pass extensions don't mutate the originals.
-        pass_core = list(core_batches)
-        pass_mem = list(mem_batches)
-        pass_mt: list[list[str]] | None = (
-            list(memtile_batches) if memtile_batches is not None else None
-        )
-        pass_num_batches = num_batches
-
-        if pass_has_memtiles:
-            if pass_mt is None:
-                pass_mt = batch_events(MEMTILE_EVENTS)
-            new_total = max(pass_num_batches, len(pass_mt))
-            while len(pass_core) < new_total:
-                pass_core.append(noop_batch)
-            while len(pass_mem) < new_total:
-                pass_mem.append(noop_batch)
-            while len(pass_mt) < new_total:
-                pass_mt.append(noop_batch)
-            pass_num_batches = new_total
-
-        # Prepare batches for this pass.
-        batches = []
-        for i in range(pass_num_batches):
-            mt_batch = pass_mt[i] if pass_mt is not None else None
-            info = prepare_batch(
-                i, pass_core[i], pass_mem[i],
-                base_dir, base_manifest, pass_dir,
-                memtile_batch=mt_batch,
-            )
-            batches.append(info)
-
-        # Execute and merge within this pass's directory.
-        results = _execute_and_merge(
-            batches, pass_dir, test_name, args, script_dir,
-        )
-
-        total_batches_across_passes += pass_num_batches
-        pass_manifests.append({
-            "pass_idx": pass_idx,
-            "tiles": trace_pass["tiles"],
-            "shim_col": trace_pass["shim_col"],
-            "status": "ok",
-            "num_batches": pass_num_batches,
-            "batches": results,
-        })
-
-    # Check if all passes failed.
-    if all(p["status"] != "ok" for p in pass_manifests):
-        _write_skip_manifest(output_dir, "all_passes_failed",
-                             "Multi-pass trace: all injection passes failed to compile")
-        sweep_manifest = {
-            "test_name": test_name,
-            "skipped": True,
-            "reason": "all_passes_failed",
-            "detail": "Multi-pass trace: all injection passes failed to compile",
-            "num_batches": 0,
-            "batches": [],
-        }
-        (output_dir / "sweep-manifest.json").write_text(
-            json.dumps(sweep_manifest, indent=2) + "\n"
-        )
-        print(f"\nSweep skipped: all passes failed")
-        sys.exit(0)
-
-    # Write top-level multi-pass sweep manifest.
-    sweep_manifest = {
-        "test_name": test_name,
-        "num_passes": len(pass_manifests),
-        "passes": pass_manifests,
-        "num_batches": total_batches_across_passes,
-    }
-    manifest_path = output_dir / "sweep-manifest.json"
-    manifest_path.write_text(json.dumps(sweep_manifest, indent=2) + "\n")
-
-    # Summary.
-    ok_passes = sum(1 for p in pass_manifests if p["status"] == "ok")
-    ok_batches = sum(
-        sum(1 for b in p.get("batches", [])
-            if isinstance(b, dict) and b.get("status") == "ok")
-        for p in pass_manifests
-    )
-    print(f"\nSweep complete: {test_name}")
-    print(f"  Passes:   {ok_passes}/{len(pass_manifests)}")
-    print(f"  Batches:  {ok_batches}/{total_batches_across_passes}")
-    print(f"  Manifest: {manifest_path}")
-    print(f"\nView in Perfetto: https://ui.perfetto.dev/")
 
 
 def _wait_npu_recovery(timeout: float = 60.0) -> bool:
