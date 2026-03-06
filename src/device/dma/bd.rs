@@ -93,17 +93,26 @@ pub struct BufferDescriptor {
     pub compression_enable: bool,
 
     // MemTile-specific: zero padding (MM2S only)
-    /// D0 zeros before
+    //
+    // Unit convention: D0 padding is in 32-bit WORD units (matching d0_wrap).
+    // D1/D2 padding is in iteration counts (matching d1_wrap/d2_wrap).
+    //
+    // NOTE: mlir-aie has two paths that program these fields:
+    // - CDO path (AIERT.cpp): converts D0 padding from elements to words
+    // - NPU task path (AIEDMATasksToNPU.cpp): writes raw element counts
+    // The CDO path is standard; the NPU task path inconsistency may be
+    // an mlir-aie bug. Our emulator treats these as word units per aie-rt.
+    /// D0 zeros before (in 32-bit word units)
     pub d0_zero_before: u8,
-    /// D0 zeros after
+    /// D0 zeros after (in 32-bit word units)
     pub d0_zero_after: u8,
-    /// D1 zeros before
+    /// D1 zeros before (iteration count)
     pub d1_zero_before: u8,
-    /// D1 zeros after
+    /// D1 zeros after (iteration count)
     pub d1_zero_after: u8,
-    /// D2 zeros before
+    /// D2 zeros before (iteration count)
     pub d2_zero_before: u8,
-    /// D2 zeros after
+    /// D2 zeros after (iteration count)
     pub d2_zero_after: u8,
 
     // Shim-specific: AXI parameters

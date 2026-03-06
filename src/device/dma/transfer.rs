@@ -1297,4 +1297,45 @@ mod tests {
         ).unwrap();
         assert!(!transfer_s2mm.has_zero_padding());
     }
+
+    /// Validates the CDO-path i8 padding scenario from add_21_i8 test.
+    ///
+    /// In the CDO path, mlir-aie converts D0 padding from element counts to
+    /// 32-bit word counts before writing to BD registers. For i8 data with
+    /// pad_before=4 elements and pad_after=4 elements:
+    /// - d0_size = 8 elements * (8/32) = 2 words
+    /// - d0_zero_before = 4 elements * (8/32) = 1 word
+    /// - d0_zero_after = 4 elements * (8/32) = 1 word
+    /// - buffer_length = 16 elements * (8/32) = 4 words
+    ///
+    /// Total output should be 1 + 2 + 1 = 4 words = 16 bytes.
+    #[test]
+    fn test_pad_state_i8_cdo_path() {
+        // Simulates the BD register values from CDO-compiled
+        // add_21_i8_using_dma_op_with_padding test:
+        // memref<16xi8>, size=8, stride=1, pad_before=4, pad_after=4
+        let config = ZeroPadConfig {
+            d0_before: 1,  // 4 i8 elements -> 1 word (CDO converts)
+            d0_after: 1,   // 4 i8 elements -> 1 word (CDO converts)
+            ..Default::default()
+        };
+        // d0_size = 2 words (8 i8 elements)
+        let mut state = ZeroPadState::new(config, 2, 1, 1);
+        let gen = AddressGenerator::new_1d(0x0, 2, 4);
+
+        // Total: 1 pad + 2 data + 1 pad = 4 words
+        assert_eq!(state.total_output_words(), 4);
+
+        let mut actions = Vec::new();
+        while !state.is_finished() {
+            actions.push(state.current_action(&gen));
+            state.advance();
+        }
+
+        assert_eq!(actions.len(), 4);
+        assert_eq!(actions[0], PadAction::Zero);  // 1 word of zeros (4 i8 zeros)
+        assert!(matches!(actions[1], PadAction::Data(_)));
+        assert!(matches!(actions[2], PadAction::Data(_)));
+        assert_eq!(actions[3], PadAction::Zero);  // 1 word of zeros (4 i8 zeros)
+    }
 }
