@@ -467,10 +467,15 @@ def extract_connections(module) -> set[tuple]:
     """Extract all switch connections from a routed module.
 
     After the pathfinder runs, the module contains SwitchboxOp with
-    ConnectOp inside them. This extracts each connection as a tuple:
-        (col, row, src_bundle, src_channel, dst_bundle, dst_channel)
+    ConnectOp (circuit-switched) and PacketRulesOp/MasterSetOp
+    (packet-switched) inside them.
 
-    Returns a set for easy comparison via issubset().
+    Each connection is extracted as a tuple:
+        ("circuit", col, row, src_bundle, src_ch, dst_bundle, dst_ch)
+        ("packet",  col, row, src_bundle, src_ch)     -- PacketRulesOp
+        ("master",  col, row, dst_bundle, dst_ch)      -- MasterSetOp
+
+    Returns a set for easy comparison via set subtraction.
     """
     from aie.extras.util import find_ops  # type: ignore
     import aie.dialects.aie as aiedialect  # type: ignore
@@ -484,22 +489,28 @@ def extract_connections(module) -> set[tuple]:
 
     for sb_op in switchbox_ops:
         sb = sb_op.opview
-        # SwitchboxOp takes a tile operand, not col/row attributes
         tile_op = sb.tile.owner.opview
         col = tile_op.col.value
         row = tile_op.row.value
 
-        connect_ops = find_ops(
-            sb_op,
-            lambda o: isinstance(o.opview, aiedialect.ConnectOp),
-        )
-        for cop in connect_ops:
-            c = cop.opview
-            connections.add((
-                col, row,
-                int(c.source_bundle), int(c.source_channel),
-                int(c.dest_bundle), int(c.dest_channel),
-            ))
+        for child in sb_op.regions[0].blocks[0]:
+            op = child.opview
+            if isinstance(op, aiedialect.ConnectOp):
+                connections.add((
+                    "circuit", col, row,
+                    int(op.source_bundle), int(op.source_channel),
+                    int(op.dest_bundle), int(op.dest_channel),
+                ))
+            elif isinstance(op, aiedialect.PacketRulesOp):
+                connections.add((
+                    "packet", col, row,
+                    int(op.source_bundle), int(op.source_channel),
+                ))
+            elif isinstance(op, aiedialect.MasterSetOp):
+                connections.add((
+                    "master", col, row,
+                    int(op.dest_bundle), int(op.dest_channel),
+                ))
 
     return connections
 
@@ -572,7 +583,7 @@ def _evaluate_candidate(
             # Score: connections added by trace routing
             all_conns = extract_connections(module)
             trace_conns = all_conns - data_conns
-            on_test = sum(1 for c in trace_conns if c[0] in test_cols)
+            on_test = sum(1 for c in trace_conns if c[1] in test_cols)
             result["trace_connections_on_test_cols"] = on_test
             result["total_trace_connections"] = len(trace_conns)
 
