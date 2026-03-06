@@ -121,17 +121,18 @@ impl DeviceState {
         Ok(())
     }
 
-    /// Write a tile register through the unified dispatch path.
+    /// Hardware register bus -- single entry point for all register writes.
     ///
-    /// This is the emulator's equivalent of the hardware register bus: a
-    /// single entry point for all register writes regardless of source (CDO,
-    /// NPU instruction, control packet). It dispatches to module-specific
-    /// handlers (stream switch, DMA engine, locks, etc.) and then runs
-    /// tile-local side effects (trace config, shim mux, cascade, event
-    /// broadcast, etc.) via `apply_tile_local_effects()`.
+    /// This is the emulator's equivalent of the real NPU's per-tile register
+    /// bus. A write to any offset produces the same side effects regardless
+    /// of source (CDO, NPU instruction, control packet, FFI).
     ///
-    /// All external callers should use this method to ensure stream switch
-    /// config, DMA engine integration, and other module handlers run.
+    /// Dispatches to module-specific handlers (stream switch, DMA engine,
+    /// locks, etc.) and then runs tile-local side effects (trace config,
+    /// shim mux, cascade, event broadcast) via `apply_tile_local_effects()`.
+    ///
+    /// All external callers MUST use this method. Never write to tile state
+    /// directly.
     pub(crate) fn write_tile_register(&mut self, col: u8, row: u8, offset: u32, value: u32) {
         let address = TileAddress::encode(col, row, offset);
         if let Err(e) = self.write_register(address, value) {
