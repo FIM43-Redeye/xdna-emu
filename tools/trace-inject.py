@@ -220,8 +220,7 @@ class CandidateResult:
     """Pathfinder result for one (shim_col, channel) candidate."""
     shim_col: int
     channel: int
-    success: bool                      # pathfinder found a valid route
-    existing_flows_intact: bool        # baseline connections unchanged
+    success: bool                      # pathfinder routed trace successfully
     failure_reason: str | None = None
     # Tiebreaker metrics (set when success=True)
     trace_connections_on_test_cols: int = 0
@@ -251,7 +250,6 @@ class TracePlan:
                     "shim_col": c.shim_col,
                     "channel": c.channel,
                     "success": c.success,
-                    "existing_flows_intact": c.existing_flows_intact,
                     "failure_reason": c.failure_reason,
                     "trace_on_test_cols": c.trace_connections_on_test_cols,
                     "total_trace_connections": c.total_trace_connections,
@@ -486,8 +484,10 @@ def extract_connections(module) -> set[tuple]:
 
     for sb_op in switchbox_ops:
         sb = sb_op.opview
-        col = sb.col.value
-        row = sb.row.value
+        # SwitchboxOp takes a tile operand, not col/row attributes
+        tile_op = sb.tile.owner.opview
+        col = tile_op.col.value
+        row = tile_op.row.value
 
         connect_ops = find_ops(
             sb_op,
@@ -513,20 +513,28 @@ def _evaluate_candidate(
     shim_col: int,
     channel: int,
     trace_targets: list[tuple[int, int, int]],
-    baseline_connections: set[tuple],
     test_cols: set[int],
+    data_conn_count: int,
 ) -> dict:
     """Evaluate one (shim_col, channel) candidate in a subprocess.
 
-    MLIR Contexts are not thread-safe, so each candidate gets a fresh
-    Context + Module.  Returns a plain dict (not CandidateResult) for
-    pickling across the process boundary.
+    Uses a two-pass pathfinder approach:
+    1. Route the test's data flows first (FlowOp/PacketFlowOp -> SwitchboxOp)
+    2. Add trace PacketFlowOps to the already-routed module
+    3. Run pathfinder again -- it calls addFixedConnection() on existing
+       SwitchboxOps, marking those ports as INVALID, then routes trace
+       using only the leftover switch fabric.
+
+    This guarantees zero interference: the trace router literally cannot
+    touch ports used by existing data flows.
+
+    Returns a plain dict (not CandidateResult) for pickling across the
+    process boundary.
     """
     result = {
         "shim_col": shim_col,
         "channel": channel,
         "success": False,
-        "existing_flows_intact": False,
         "failure_reason": None,
         "trace_connections_on_test_cols": 0,
         "total_trace_connections": 0,
@@ -536,6 +544,20 @@ def _evaluate_candidate(
 
         with Context(), Location.unknown():
             module = Module.parse(mlir_asm)
+
+            # Pass 1: route the test's own data flows.
+            # This converts FlowOp/PacketFlowOp into SwitchboxOp/ConnectOp.
+            if not run_pathfinder(module):
+                result["failure_reason"] = "pathfinder failed on data flows"
+                return result
+
+            # Count data connections for scoring later
+            data_conns = extract_connections(module)
+
+            # Pass 2: add trace flows and route them on the locked fabric.
+            # The existing SwitchboxOps from pass 1 will be picked up by
+            # addFixedConnection() -- their ports become INVALID to the
+            # trace router.
             device_op = find_device_with_sequence(module)
             used_ids = find_used_packet_ids_ir(device_op)
 
@@ -543,21 +565,18 @@ def _evaluate_candidate(
                 device_op, shim_col, channel, trace_targets, used_ids,
             )
 
-            ok = run_pathfinder(module)
-            if not ok:
-                result["failure_reason"] = "pathfinder failed to route"
+            if not run_pathfinder(module):
+                result["failure_reason"] = "no route for trace on remaining fabric"
                 return result
 
-            routed = extract_connections(module)
+            # Score: connections added by trace routing
+            all_conns = extract_connections(module)
+            trace_conns = all_conns - data_conns
+            on_test = sum(1 for c in trace_conns if c[0] in test_cols)
+            result["trace_connections_on_test_cols"] = on_test
+            result["total_trace_connections"] = len(trace_conns)
 
         result["success"] = True
-        result["existing_flows_intact"] = baseline_connections.issubset(routed)
-
-        # Score: count trace-specific connections (those not in baseline)
-        trace_conns = routed - baseline_connections
-        on_test = sum(1 for c in trace_conns if c[0] in test_cols)
-        result["trace_connections_on_test_cols"] = on_test
-        result["total_trace_connections"] = len(trace_conns)
 
     except Exception as exc:
         result["failure_reason"] = str(exc).splitlines()[0][:200]
@@ -568,9 +587,11 @@ def _evaluate_candidate(
 def plan_trace_route(mlir_text: str) -> TracePlan:
     """Plan the best (shim_col, channel) for trace collection.
 
-    Evaluates all possible candidates in parallel via subprocess workers
-    (one per shim column x channel combination).  Each worker injects trace
-    flows, runs the pathfinder, and checks that existing connections survive.
+    Evaluates all (shim_col, channel) candidates in parallel.  Each worker
+    uses a two-pass pathfinder: first routes the test's data flows (locking
+    them via addFixedConnection), then routes trace on the remaining fabric.
+    If the second pass succeeds, the candidate is viable -- guaranteed
+    zero interference with existing data flows.
 
     Returns a TracePlan with the winning candidate or an infeasibility reason.
     """
@@ -579,7 +600,7 @@ def plan_trace_route(mlir_text: str) -> TracePlan:
     from aie.ir import Context, Location, Module  # type: ignore
     from aie.dialects.aie import get_target_model as _gtm  # type: ignore
 
-    # -- Parse and extract baseline info inside a Context -----------------
+    # -- Parse and classify tiles -----------------------------------------
     with Context(), Location.unknown():
         try:
             module = Module.parse(mlir_text)
@@ -596,21 +617,7 @@ def plan_trace_route(mlir_text: str) -> TracePlan:
         if not trace_targets:
             return TracePlan(False, "no traceable tiles found")
 
-        # Run pathfinder on the unmodified module to get baseline connections
-        ok = run_pathfinder(module)
-        if not ok:
-            return TracePlan(
-                False, "pathfinder failed on unmodified design",
-            )
-        baseline_connections = extract_connections(module)
-
-        # Serialize the ORIGINAL (pre-pathfinder) ASM for workers.
-        # We need to re-parse from the original text, so just use mlir_text.
-        # But we need an ASM string that workers can parse -- mlir_text is it.
-
     # -- Generate candidates: all device columns x 2 channels -------------
-    # Use the full device column range (0..cols-1), not just columns with
-    # existing shim tiles, because trace can use any shim column.
     num_cols = tm.columns()
     candidates_params = [
         (col, ch) for col in range(num_cols) for ch in range(2)
@@ -626,8 +633,8 @@ def plan_trace_route(mlir_text: str) -> TracePlan:
                 col,
                 ch,
                 trace_targets,
-                baseline_connections,
                 test_cols,
+                0,  # data_conn_count (unused, reserved)
             ): (col, ch)
             for col, ch in candidates_params
         }
@@ -640,7 +647,6 @@ def plan_trace_route(mlir_text: str) -> TracePlan:
                     "shim_col": col,
                     "channel": ch,
                     "success": False,
-                    "existing_flows_intact": False,
                     "failure_reason": f"subprocess error: {exc}",
                     "trace_connections_on_test_cols": 0,
                     "total_trace_connections": 0,
@@ -652,7 +658,6 @@ def plan_trace_route(mlir_text: str) -> TracePlan:
             shim_col=r["shim_col"],
             channel=r["channel"],
             success=r["success"],
-            existing_flows_intact=r["existing_flows_intact"],
             failure_reason=r.get("failure_reason"),
             trace_connections_on_test_cols=r.get(
                 "trace_connections_on_test_cols", 0,
@@ -662,16 +667,13 @@ def plan_trace_route(mlir_text: str) -> TracePlan:
         for r in raw_results
     ]
 
-    # -- Pick winner: viable = success AND existing_flows_intact ----------
-    viable = [
-        c for c in candidates
-        if c.success and c.existing_flows_intact
-    ]
+    # -- Pick winner: viable = pathfinder succeeded -----------------------
+    viable = [c for c in candidates if c.success]
 
     if not viable:
         return TracePlan(
             False,
-            "no candidate preserves existing flows",
+            "no candidate found a route for trace",
             candidates=candidates,
         )
 
@@ -1816,7 +1818,7 @@ def main():
         for c in plan.candidates:
             status = "WINNER" if (c.shim_col == plan.shim_col
                                   and c.channel == plan.trace_channel) else ""
-            flag = ("ok" if c.success and c.existing_flows_intact
+            flag = ("ok" if c.success
                     else (c.failure_reason or "failed"))
             print(f"    col {c.shim_col} ch {c.channel}: {flag} "
                   f"(test_cols={c.trace_connections_on_test_cols}, "
