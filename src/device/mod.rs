@@ -60,6 +60,7 @@ pub mod host_memory;
 pub mod dma;
 pub mod stream_switch;
 pub mod trace_unit;
+pub mod aiert_validation;
 
 pub use arch_config::{ArchConfig, ModelConfig, default_arch};
 pub use registers::{RegisterInfo, RegisterModule, TileAddress};
