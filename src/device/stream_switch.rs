@@ -1013,9 +1013,9 @@ impl StreamSwitch {
                         }
                         words_forwarded += 1;
 
-                        log::debug!("TileSwitch({},{}): pkt header 0x{:08X} (id={}) slave[{}] -> masters {:?} arb={}{}{}",
+                        log::info!("TileSwitch({},{}): pkt header 0x{:08X} (id={}) slave[{}] -> masters {:?} arb={} all_drop={}{}",
                             self.col, self.row, data, pkt_id, slave_idx, masters, arbiter,
-                            if all_drop_header { " (header dropped)" } else { "" },
+                            all_drop_header,
                             if tlast { " TLAST" } else { "" });
 
                         if tlast {

@@ -40,14 +40,15 @@ fi
 echo ">>> Building plugin..."
 nice -n 19 cmake --build "$BUILD_DIR" 2>&1
 
-# Find the Rust emulator library: prefer debug (matches dev workflow),
-# fall back to release.  Always install it alongside the C++ plugin so
+# Find the Rust emulator library: prefer release (matches bridge test
+# workflow), fall back to debug.  Always install it alongside the C++
+# plugin so
 # the dlopen at runtime picks up the matching build.
 RUST_LIB=""
-if [[ -f "$EMU_DIR/target/debug/libxdna_emu.so" ]]; then
-    RUST_LIB="$EMU_DIR/target/debug/libxdna_emu.so"
-elif [[ -f "$EMU_DIR/target/release/libxdna_emu.so" ]]; then
+if [[ -f "$EMU_DIR/target/release/libxdna_emu.so" ]]; then
     RUST_LIB="$EMU_DIR/target/release/libxdna_emu.so"
+elif [[ -f "$EMU_DIR/target/debug/libxdna_emu.so" ]]; then
+    RUST_LIB="$EMU_DIR/target/debug/libxdna_emu.so"
 fi
 
 # Install (requires polkit auth).

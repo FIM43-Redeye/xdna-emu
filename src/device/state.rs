@@ -986,8 +986,10 @@ impl DeviceState {
 
                     if packet_enable {
                         // Packet mode: routing is done by arbiter/msel, not circuit route
-                        log::info!("Tile ({},{}) stream switch: master[{}] packet mode (arb/msel from config)",
-                            col, row, port);
+                        let (dh, arb, msel) = tile.stream_switch.master_packet_cfg(port)
+                            .map_or((false, 0, 0), |c| (c.drop_header, c.arbiter, c.msel_enable));
+                        log::info!("Tile ({},{}) stream switch: master[{}] packet mode = 0x{:08X} (drop_hdr={} arb={} msel_en=0b{:04b})",
+                            col, row, port, value, dh, arb, msel);
                     } else if enable && slave_select < tile.stream_switch.slaves.len() {
                         // Circuit mode: configure local route
                         tile.stream_switch.configure_local_route(slave_select, port);
