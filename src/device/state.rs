@@ -507,8 +507,6 @@ impl DeviceState {
     /// Both share the same BD base address (0x1D000) and stride (0x20),
     /// so we determine tile type from the row to select the correct parser.
     fn write_dma_bd(&mut self, col: u8, row: u8, offset: u32, value: u32) {
-        use crate::device::dma::bd::BufferDescriptor;
-
         let tile_type = self.array.arch().tile_type(col, row);
         let reg_layout = super::regdb::device_reg_layout();
 
@@ -550,73 +548,15 @@ impl DeviceState {
             }
         }
 
-        // Build the word array and parse using the correct tile-type parser.
-        let bd_config = self.array.get(col, row).map(|tile| {
-            let tile_bd = &tile.dma_bds[bd_idx];
-
-            match tile_type {
-                TileType::Shim => {
-                    // Shim BDs: 8 words. Words 6-7 from register map.
-                    let w6_off = bd_base + (bd_idx as u32) * bd_stride + 24;
-                    let w7_off = bd_base + (bd_idx as u32) * bd_stride + 28;
-                    let w6 = *tile.registers_ref().get(&w6_off).unwrap_or(&0);
-                    let w7 = *tile.registers_ref().get(&w7_off).unwrap_or(&0);
-                    let words = [
-                        tile_bd.addr_low, tile_bd.addr_high, tile_bd.length,
-                        tile_bd.control, tile_bd.d0, tile_bd.d1, w6, w7,
-                    ];
-
-                    log::trace!("  Shim BD {} words=[{:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}]",
-                        bd_idx, words[0], words[1], words[2], words[3],
-                        words[4], words[5], words[6], words[7]);
-
-                    let parsed = BufferDescriptor::from_registers(&words, TileType::Shim);
-                    let mut config = parsed.to_bd_config();
-
-                    if !config.valid && words.iter().any(|&w| w != 0) {
-                        config.valid = true;
-                    }
-                    config
-                }
-                _ => {
-                    // Compute tile BDs: 6 words.
-                    let words = [
-                        tile_bd.addr_low, tile_bd.addr_high, tile_bd.length,
-                        tile_bd.control, tile_bd.d0, tile_bd.d1,
-                    ];
-
-                    log::trace!("  BD {} words=[0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}]",
-                        bd_idx, words[0], words[1], words[2], words[3], words[4], words[5]);
-
-                    let parsed = BufferDescriptor::from_registers(&words, TileType::Compute);
-                    let mut config = parsed.to_bd_config();
-
-                    if !config.valid && words.iter().any(|&w| w != 0) {
-                        config.valid = true;
-                    }
-                    config
-                }
-            }
-        });
-
-        if let Some(config) = bd_config {
-            log::trace!("  BD {} word {} tile({},{}) -> addr=0x{:X} len={} valid={}",
-                bd_idx, word, col, row, config.base_addr, config.length, config.valid);
-
-            if let Some(dma) = self.array.dma_engine_mut(col, row) {
-                if let Err(e) = dma.configure_bd(bd_idx as u8, config.clone()) {
-                    log::debug!("Failed to configure BD {} on DmaEngine ({},{}): {:?}",
-                        bd_idx, col, row, e);
-                } else if config.valid {
-                    log::info!("CDO configured BD {} on tile ({},{}) addr=0x{:X} len={} d0=[{},{}] d1=[{},{}] acq={:?} rel={:?} next={:?}",
-                        bd_idx, col, row, config.base_addr, config.length,
-                        config.d0.size, config.d0.stride, config.d1.size, config.d1.stride,
-                        config.acquire_lock.map(|id| (id, config.acquire_value)),
-                        config.release_lock.map(|id| (id, config.release_value)),
-                        config.next_bd);
-                }
-            }
+        // Mark BD dirty -- it will be re-parsed from raw words when the
+        // DMA channel start queue is written. This avoids corrupt intermediate
+        // configs when control packets write one word at a time.
+        if let Some(dma) = self.array.dma_engine_mut(col, row) {
+            dma.mark_bd_dirty(bd_idx as u8);
         }
+
+        log::trace!("  BD {} word {} tile({},{}) marked dirty (deferred parse)",
+            bd_idx, word, col, row);
     }
 
     /// Write to a DMA channel register.
@@ -705,6 +645,9 @@ impl DeviceState {
                 })
                 .unwrap_or((0, 0));
 
+            // Re-parse BD if it was written word-by-word (control packets)
+            self.reparse_dirty_bd(col, row, bd_idx as usize);
+
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 // Set task config before enqueuing the task
                 dma.set_channel_task_config(ch_idx as u8, enable_token_issue, controller_id, fot_mode);
@@ -762,6 +705,8 @@ impl DeviceState {
         if let Some(queue_val) = new_start_queue {
             let bd_idx = lay.start_bd_id.extract(queue_val) as u8;
             let repeat_count = lay.repeat_count.extract(queue_val) as u8;
+            // Re-parse BD if it was written word-by-word (control packets)
+            self.reparse_dirty_bd(col, row, bd_idx as usize);
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
                     dma.fatal_errors.push(format!(
@@ -847,6 +792,9 @@ impl DeviceState {
                 })
                 .unwrap_or((0, 0));
 
+            // Re-parse BD if it was written word-by-word (control packets)
+            self.reparse_dirty_bd(col, row, bd_idx as usize);
+
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 dma.set_channel_task_config(ch_idx as u8, enable_token_issue, controller_id, fot_mode);
 
@@ -893,6 +841,8 @@ impl DeviceState {
         if let Some(queue_val) = new_start_queue {
             let bd_idx = lay.start_bd_id.extract(queue_val) as u8;
             let repeat_count = lay.repeat_count.extract(queue_val) as u8;
+            // Re-parse BD if it was written word-by-word (control packets)
+            self.reparse_dirty_bd(col, row, bd_idx as usize);
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
                     dma.fatal_errors.push(format!(
@@ -1087,40 +1037,15 @@ impl DeviceState {
             }
         }
 
-        // Parse using the data-driven parser. Words 0-5 from legacy struct,
-        // words 6-7 from register map (populated by single-word writes above
-        // or by the bulk DMA write path).
-        let bd_config = self.array.get(col, row).map(|tile| {
-            let tile_bd = &tile.dma_bds[bd_idx];
-            let w6_off = reg_layout.memtile_bd_base
-                + (bd_idx as u32) * reg_layout.memtile_bd_stride + 24;
-            let w7_off = reg_layout.memtile_bd_base
-                + (bd_idx as u32) * reg_layout.memtile_bd_stride + 28;
-            let w6 = *tile.registers_ref().get(&w6_off).unwrap_or(&0);
-            let w7 = *tile.registers_ref().get(&w7_off).unwrap_or(&0);
-            let words = [
-                tile_bd.addr_low, tile_bd.addr_high, tile_bd.length,
-                tile_bd.control, tile_bd.d0, tile_bd.d1, w6, w7,
-            ];
-            self.parse_memtile_bd_from_words(&words)
-        });
-
-        if let Some(config) = bd_config {
-            if let Some(dma) = self.array.dma_engine_mut(col, row) {
-                if let Err(e) = dma.configure_bd(bd_idx as u8, config.clone()) {
-                    log::debug!("Failed to configure MemTile BD {} on DmaEngine ({},{}): {:?}",
-                        bd_idx, col, row, e);
-                } else if config.valid {
-                    log::info!("CDO configured MemTile BD {} on tile ({},{}) addr=0x{:X} len={} d0=[{},{}] d1=[{},{}] acq={:?} rel={:?} next={:?} pkt={}(id={},type={})",
-                        bd_idx, col, row, config.base_addr, config.length,
-                        config.d0.size, config.d0.stride, config.d1.size, config.d1.stride,
-                        config.acquire_lock.map(|id| (id, config.acquire_value)),
-                        config.release_lock.map(|id| (id, config.release_value)),
-                        config.next_bd,
-                        config.enable_packet, config.packet_id, config.packet_type);
-                }
-            }
+        // Mark BD dirty -- it will be re-parsed from raw words when the
+        // DMA channel start queue is written. This avoids corrupt intermediate
+        // configs when control packets write one word at a time.
+        if let Some(dma) = self.array.dma_engine_mut(col, row) {
+            dma.mark_bd_dirty(bd_idx as u8);
         }
+
+        log::trace!("  MemTile BD {} word {} tile({},{}) marked dirty (deferred parse)",
+            bd_idx, word, col, row);
     }
 
     /// Parse MemTile BD words into a BdConfig using the data-driven parser.
@@ -1142,6 +1067,81 @@ impl DeviceState {
         }
 
         config
+    }
+
+    /// Re-parse a dirty BD from tile raw storage into the DMA engine's BdConfig.
+    ///
+    /// Called just before the DMA engine snapshots a BD (enqueue_task), to ensure
+    /// single-word control packet writes have been fully assembled. If the BD is
+    /// not dirty, this is a no-op.
+    fn reparse_dirty_bd(&mut self, col: u8, row: u8, bd_idx: usize) {
+        use crate::device::dma::bd::BufferDescriptor;
+
+        let is_dirty = self.array.dma_engine(col, row)
+            .map_or(false, |dma| dma.is_bd_dirty(bd_idx as u8));
+        if !is_dirty {
+            return;
+        }
+
+        let tile_type = self.array.arch().tile_type(col, row);
+        let reg_layout = super::regdb::device_reg_layout();
+
+        let bd_config = self.array.get(col, row).map(|tile| {
+            if bd_idx >= tile.dma_bds.len() {
+                return None;
+            }
+            let bd = &tile.dma_bds[bd_idx];
+
+            match tile_type {
+                TileType::MemTile => {
+                    let w6_off = reg_layout.memtile_bd_base
+                        + (bd_idx as u32) * reg_layout.memtile_bd_stride + 24;
+                    let w7_off = reg_layout.memtile_bd_base
+                        + (bd_idx as u32) * reg_layout.memtile_bd_stride + 28;
+                    let w6 = *tile.registers_ref().get(&w6_off).unwrap_or(&0);
+                    let w7 = *tile.registers_ref().get(&w7_off).unwrap_or(&0);
+                    let words = [bd.addr_low, bd.addr_high, bd.length,
+                                 bd.control, bd.d0, bd.d1, w6, w7];
+                    Some(self.parse_memtile_bd_from_words(&words))
+                }
+                TileType::Shim => {
+                    let w6_off = reg_layout.shim_bd_base
+                        + (bd_idx as u32) * reg_layout.shim_bd_stride + 24;
+                    let w7_off = reg_layout.shim_bd_base
+                        + (bd_idx as u32) * reg_layout.shim_bd_stride + 28;
+                    let w6 = *tile.registers_ref().get(&w6_off).unwrap_or(&0);
+                    let w7 = *tile.registers_ref().get(&w7_off).unwrap_or(&0);
+                    let words = [bd.addr_low, bd.addr_high, bd.length,
+                                 bd.control, bd.d0, bd.d1, w6, w7];
+                    let parsed = BufferDescriptor::from_registers(&words, TileType::Shim);
+                    let mut config = parsed.to_bd_config();
+                    if !config.valid && words.iter().any(|&w| w != 0) {
+                        config.valid = true;
+                    }
+                    Some(config)
+                }
+                _ => {
+                    // Compute tile: 6 words
+                    let words = [bd.addr_low, bd.addr_high, bd.length,
+                                 bd.control, bd.d0, bd.d1];
+                    let parsed = BufferDescriptor::from_registers(&words, TileType::Compute);
+                    let mut config = parsed.to_bd_config();
+                    if !config.valid && words.iter().any(|&w| w != 0) {
+                        config.valid = true;
+                    }
+                    Some(config)
+                }
+            }
+        }).flatten();
+
+        if let Some(config) = bd_config {
+            log::debug!("Re-parsed dirty BD {} on tile ({},{}) addr=0x{:X} len={} valid={}",
+                bd_idx, col, row, config.base_addr, config.length, config.valid);
+            if let Some(dma) = self.array.dma_engine_mut(col, row) {
+                // configure_bd automatically clears the dirty flag
+                let _ = dma.configure_bd(bd_idx as u8, config);
+            }
+        }
     }
 
     /// Write MemTile BD data from a byte array.
@@ -1242,6 +1242,8 @@ impl DeviceState {
         if is_start_queue {
             let bd_idx = lay.start_bd_id.extract(value) as u8;
             let repeat_count = lay.repeat_count.extract(value) as u8;
+            // Re-parse BD if it was written word-by-word (control packets)
+            self.reparse_dirty_bd(col, row, bd_idx as usize);
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
                     dma.fatal_errors.push(format!(
@@ -1290,6 +1292,8 @@ impl DeviceState {
         if let Some(queue_val) = new_start_queue {
             let bd_idx = lay.start_bd_id.extract(queue_val) as u8;
             let repeat_count = lay.repeat_count.extract(queue_val) as u8;
+            // Re-parse BD if it was written word-by-word (control packets)
+            self.reparse_dirty_bd(col, row, bd_idx as usize);
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
                     dma.fatal_errors.push(format!(
@@ -1696,5 +1700,87 @@ mod tests {
         // Also verify data_bytes was counted
         assert!(state.stats.data_bytes >= 1024,
             "Expected at least 1024 data bytes written, got {}", state.stats.data_bytes);
+    }
+
+    /// Test that single-word BD writes (as from control packets) defer parsing
+    /// until the DMA channel start queue is written.
+    #[test]
+    fn test_lazy_bd_parsing_single_word_writes() {
+        use crate::device::registers::TileAddress;
+        use crate::device::regdb::device_reg_layout;
+
+        let mut state = DeviceState::new_npu1();
+        let col: u8 = 1;
+        let row: u8 = 2; // Compute tile
+
+        let reg_layout = device_reg_layout();
+        let bd_base = reg_layout.memory_bd_base;   // 0x1D000
+        let bd_stride = reg_layout.memory_bd_stride; // 0x20
+        let bd_idx: usize = 3;
+
+        // Build known BD words for a compute tile (6 words).
+        // Use the real parser to construct expected values, then write
+        // those words one at a time.
+        let base_addr_words: u32 = 0x100; // 256 words = 1024 bytes
+        let length_words: u32 = 64;       // 64 words = 256 bytes
+
+        // Word 0: Base_Address | Buffer_Length (from regdb field layout)
+        let lay = &reg_layout.memory_bd;
+        let w0 = lay.base_address.insert(0, base_addr_words)
+                   | lay.buffer_length.insert(0, length_words);
+        // Word 1-4: leave as zero (no packet, no strides, no iteration)
+        let w1: u32 = 0;
+        let w2: u32 = 0;
+        let w3: u32 = 0;
+        let w4: u32 = 0;
+        // Word 5: Valid_BD = 1 (and no locks, no chaining)
+        let w5 = lay.valid_bd.insert(0, 1);
+
+        let words = [w0, w1, w2, w3, w4, w5];
+
+        // Write each word individually (simulating control packet path)
+        for (i, &word) in words.iter().enumerate() {
+            let offset = bd_base + (bd_idx as u32) * bd_stride + (i as u32) * 4;
+            let addr = TileAddress::encode(col, row, offset);
+            state.write_register(addr, word).unwrap();
+        }
+
+        // Verify the BD is marked dirty in the DMA engine
+        let dma = state.array.dma_engine(col, row).unwrap();
+        assert!(dma.is_bd_dirty(bd_idx as u8),
+            "BD should be dirty after single-word writes");
+
+        // Verify the BD config has NOT been updated yet (should be default)
+        let bd_before = dma.get_bd(bd_idx as u8).unwrap();
+        assert_eq!(bd_before.base_addr, 0,
+            "BD config should not be updated until channel start");
+        assert_eq!(bd_before.length, 0,
+            "BD length should be 0 before channel start");
+
+        // Now write the channel start queue register to trigger re-parse.
+        // MM2S channel 0 = channel index 2 (after S2MM_0, S2MM_1).
+        // Start queue offset = channel_base + ch_idx * stride + 4
+        let ch_idx: usize = 2; // MM2S_0
+        let start_queue_offset = reg_layout.memory_channel_base
+            + (ch_idx as u32) * reg_layout.memory_channel_stride + 4;
+
+        // Start_BD_ID field value = bd_idx, repeat_count = 0
+        let queue_val = reg_layout.memory_channel.start_bd_id.insert(0, bd_idx as u32);
+
+        let addr = TileAddress::encode(col, row, start_queue_offset);
+        state.write_register(addr, queue_val).unwrap();
+
+        // Now the BD should have been re-parsed and configured
+        let dma = state.array.dma_engine(col, row).unwrap();
+        assert!(!dma.is_bd_dirty(bd_idx as u8),
+            "BD should no longer be dirty after channel start");
+
+        let bd_after = dma.get_bd(bd_idx as u8).unwrap();
+        assert_eq!(bd_after.base_addr, (base_addr_words * 4) as u64,
+            "BD base_addr should be {} bytes", base_addr_words * 4);
+        assert_eq!(bd_after.length, length_words * 4,
+            "BD length should be {} bytes", length_words * 4);
+        assert!(bd_after.valid,
+            "BD should be valid after re-parse");
     }
 }

@@ -249,6 +249,10 @@ pub struct DmaEngine {
     /// Buffer descriptor configurations
     bd_configs: Vec<BdConfig>,
 
+    /// Dirty flags for BDs written word-by-word (e.g., control packets).
+    /// When true, the BD must be re-parsed from tile raw storage before use.
+    bd_dirty: Vec<bool>,
+
     /// Per-channel state (FSM, task queue, stats, BD tracking).
     /// Replaces 12 parallel Vec<T> fields with one struct per channel.
     channels: Vec<ChannelContext>,
@@ -332,6 +336,7 @@ impl DmaEngine {
             row,
             tile_type,
             bd_configs: vec![BdConfig::default(); num_bds],
+            bd_dirty: vec![false; num_bds],
             channels,
             timing_config: DmaTimingConfig::from_aie2_spec(),
             stream_out: VecDeque::with_capacity(16),
@@ -633,7 +638,30 @@ impl DmaEngine {
         }
 
         self.bd_configs[bd_index as usize] = config;
+        self.clear_bd_dirty(bd_index);
         Ok(())
+    }
+
+    /// Mark a BD as needing re-parse from raw words before use.
+    ///
+    /// Called when single-word BD register writes modify the BD storage
+    /// without providing the full word set needed for parsing.
+    pub fn mark_bd_dirty(&mut self, bd_index: u8) {
+        if let Some(d) = self.bd_dirty.get_mut(bd_index as usize) {
+            *d = true;
+        }
+    }
+
+    /// Clear the dirty flag for a BD (called after configure_bd or re-parse).
+    pub fn clear_bd_dirty(&mut self, bd_index: u8) {
+        if let Some(d) = self.bd_dirty.get_mut(bd_index as usize) {
+            *d = false;
+        }
+    }
+
+    /// Check whether a BD needs re-parsing from raw tile storage.
+    pub fn is_bd_dirty(&self, bd_index: u8) -> bool {
+        self.bd_dirty.get(bd_index as usize).copied().unwrap_or(false)
     }
 
     /// Get a buffer descriptor configuration.
