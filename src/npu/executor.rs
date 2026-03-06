@@ -330,7 +330,7 @@ impl NpuExecutor {
                 }
                 self.executed_count += 1;
 
-                // check_dma_trigger may have transitioned us to BlockedOnQueue,
+                // would_block_on_queue may have transitioned us to BlockedOnQueue,
                 // or execute_instruction may have transitioned to BlockedOnSync.
                 // Fix up next_index in either case and return Blocked.
                 match &mut self.state {
@@ -551,7 +551,7 @@ impl NpuExecutor {
     }
 
     /// Execute a Write32 instruction.
-    fn execute_write32(&mut self, reg_off: u32, value: u32, device: &mut DeviceState, host_memory: &mut HostMemory) -> Result<(), String> {
+    fn execute_write32(&mut self, reg_off: u32, value: u32, device: &mut DeviceState, _host_memory: &mut HostMemory) -> Result<(), String> {
         log::debug!("NPU Write32: reg=0x{:08X} value=0x{:08X}", reg_off, value);
 
         // Decode tile address from register offset
@@ -569,17 +569,15 @@ impl NpuExecutor {
                 tile.write_data_u32(offset as usize, value);
             }
         } else if device.tile(col as usize, row as usize).is_some() {
+            // Pre-flight: block if writing to a full DMA task queue.
+            if self.would_block_on_queue(col, row, offset, value, device) {
+                return Ok(());
+            }
             // Route through the unified register bus (same path as CDO and
             // control packets). This handles stream switch config, DMA engine
             // integration, locks, trace, shim mux, and all other register
             // types through a single dispatch.
             device.write_tile_register(col, row, offset, value);
-
-            // Check if this is a DMA Task_Queue write (triggers DMA start).
-            // This is NPU-executor-specific: on real hardware the host
-            // firmware polls queue depth before writing; we detect the write
-            // and enqueue directly.
-            self.check_dma_trigger(col, row, offset, value, device, host_memory);
         } else {
             return Err(format!(
                 "NPU Write32 to non-existent tile ({}, {}): offset=0x{:05X} -- config targets missing tile",
@@ -591,7 +589,7 @@ impl NpuExecutor {
     }
 
     /// Execute a BlockWrite instruction.
-    fn execute_blockwrite(&mut self, reg_off: u32, values: &[u32], device: &mut DeviceState, host_memory: &mut HostMemory) -> Result<(), String> {
+    fn execute_blockwrite(&mut self, reg_off: u32, values: &[u32], device: &mut DeviceState, _host_memory: &mut HostMemory) -> Result<(), String> {
         log::debug!(
             "NPU BlockWrite: reg=0x{:08X} count={}",
             reg_off,
@@ -612,82 +610,25 @@ impl NpuExecutor {
                 tile.write_data(base_offset as usize, &bytes);
             }
         } else if device.tile(col as usize, row as usize).is_some() {
+            // Pre-flight: check if any word targets a full DMA task queue.
+            for (i, &value) in values.iter().enumerate() {
+                let offset = base_offset + (i as u32) * 4;
+                if self.would_block_on_queue(col, row, offset, value, device) {
+                    return Ok(());
+                }
+            }
             // Route each word through the unified register bus.
             for (i, &value) in values.iter().enumerate() {
                 let offset = base_offset + (i as u32) * 4;
                 device.write_tile_register(col, row, offset, value);
             }
-
-            // Check for DMA triggers in the written range
-            for (i, &value) in values.iter().enumerate() {
-                let offset = base_offset + (i as u32) * 4;
-                self.check_dma_trigger(col, row, offset, value, device, host_memory);
-            }
-        }
-
-        // If writing to a DMA BD region, sync BD data to the DMA engine.
-        // Read the FULL BD back from tile registers rather than using the
-        // blockwrite values directly -- the compiler may write fewer than 8
-        // words when trailing words are zero, and partial writes compose
-        // correctly when read back from register space.
-        if let Some((bd_index, tile_type)) = bd_index_for_blockwrite(row, base_offset) {
-            Self::sync_bd_from_registers(col, row, bd_index, tile_type, device);
         }
 
         Ok(())
     }
 
-    /// Read a full BD from tile registers and sync it to the DMA engine.
-    ///
-    /// Uses `BufferDescriptor::from_registers()` to parse ALL BD fields
-    /// (multi-dimensional addressing, BD chaining, locks, packet mode, iteration,
-    /// AXI parameters) from the register words, then converts to the runtime
-    /// BdConfig. Reads from tile register space so partial writes compose
-    /// correctly.
-    fn sync_bd_from_registers(
-        col: u8, row: u8, bd_index: u8, tile_type: TileType, device: &mut DeviceState,
-    ) {
-        use crate::device::dma::bd::BufferDescriptor;
-
-        let layout = crate::device::regdb::device_reg_layout();
-        let (bd_base, bd_stride) = match tile_type {
-            TileType::Shim => (layout.shim_bd_base, layout.shim_bd_stride),
-            TileType::MemTile => (layout.memtile_bd_base, layout.memtile_bd_stride),
-            TileType::Compute => (layout.memory_bd_base, layout.memory_bd_stride),
-        };
-        let bd_words = (bd_stride / 4) as usize;
-
-        // Read full BD from tile register space
-        let values = if let Some(tile) = device.tile_mut(col as usize, row as usize) {
-            let start = bd_base + bd_index as u32 * bd_stride;
-            (0..bd_words).map(|i| tile.read_register(start + i as u32 * 4)).collect::<Vec<_>>()
-        } else {
-            return;
-        };
-
-        log::debug!("{:?} BD {} (col={},row={}) raw: {:08X?}", tile_type, bd_index, col, row, values);
-
-        let bd = BufferDescriptor::from_registers(&values, tile_type);
-        let config = bd.to_bd_config();
-
-        if let Some(dma) = device.array.dma_engine_mut(col, row) {
-            if let Err(e) = dma.configure_bd(bd_index, config.clone()) {
-                dma.fatal_errors.push(format!(
-                    "Failed to configure {:?} BD {}: {:?}", tile_type, bd_index, e,
-                ));
-            } else {
-                log::debug!("Configured {:?} BD {} addr=0x{:X} len={} d0=[{},{}] d1=[{},{}] next={:?} acq={:?} rel={:?}",
-                    tile_type, bd_index, config.base_addr, config.length,
-                    config.d0.size, config.d0.stride, config.d1.size, config.d1.stride,
-                    config.next_bd,
-                    config.acquire_lock.map(|id| (id, config.acquire_value)),
-                    config.release_lock.map(|id| (id, config.release_value)));
-            }
-        }
-    }
-
     /// Execute a MaskWrite instruction.
-    fn execute_maskwrite(&mut self, reg_off: u32, value: u32, mask: u32, device: &mut DeviceState, host_memory: &mut HostMemory) -> Result<(), String> {
+    fn execute_maskwrite(&mut self, reg_off: u32, value: u32, mask: u32, device: &mut DeviceState, _host_memory: &mut HostMemory) -> Result<(), String> {
         log::debug!(
             "NPU MaskWrite: reg=0x{:08X} value=0x{:08X} mask=0x{:08X}",
             reg_off, value, mask
@@ -711,8 +652,10 @@ impl NpuExecutor {
             let current = device.tile_mut(col as usize, row as usize)
                 .map(|t| t.read_register(offset)).unwrap_or(0);
             let new_value = (current & !mask) | (value & mask);
+            if self.would_block_on_queue(col, row, offset, new_value, device) {
+                return Ok(());
+            }
             device.write_tile_register(col, row, offset, new_value);
-            self.check_dma_trigger(col, row, offset, new_value, device, host_memory);
         }
 
         Ok(())
@@ -781,160 +724,104 @@ impl NpuExecutor {
             device.write_tile_register(col, row, offset + 4, high_bits);
         }
 
-        // Re-sync the BD to DMA engine if patching BD address field.
-        // DDR patches always target word 1 (address low) within a BD, so
-        // we only re-sync when the patched offset falls on that word.
-        if let Some((bd_index, tile_type)) = bd_index_for_blockwrite(row, offset) {
-            let layout = crate::device::regdb::device_reg_layout();
-            let (bd_base_addr, bd_stride) = match tile_type {
-                TileType::Shim => (layout.shim_bd_base, layout.shim_bd_stride),
-                TileType::MemTile => (layout.memtile_bd_base, layout.memtile_bd_stride),
-                TileType::Compute => (layout.memory_bd_base, layout.memory_bd_stride),
-            };
-            let bd_rel = offset - bd_base_addr;
-            let word_in_bd = (bd_rel % bd_stride) / 4;
-
-            if word_in_bd == 1 {
-                Self::sync_bd_from_registers(col, row, bd_index, tile_type, device);
-            }
-        }
+        // The register bus marks BD words dirty when written via
+        // write_tile_register(). They will be reparsed at enqueue time
+        // (reparse_dirty_bd is called from write_dma_channel).
 
         Ok(())
     }
 
-    /// Check if a register write triggers DMA operation.
-    fn check_dma_trigger(&mut self, col: u8, row: u8, offset: u32, value: u32, device: &mut DeviceState, _host_memory: &mut HostMemory) {
-        // DMA Task_Queue registers trigger DMA channel start when written.
-        // Each channel has Ctrl at +0 and Task_Queue at +4 within its stride.
-        // Register layouts differ by tile type but all share the same format:
-        //   Bits 3:0  = BD_ID (buffer descriptor index)
-        //   Bits 23:16 = Repeat_Count (additional BD executions)
-        let reg_layout = crate::device::regdb::device_reg_layout();
-        let tile_type = device.tile(col as usize, row as usize)
-            .map(|t| t.tile_type);
-        let tile_type = match tile_type {
+    /// Pre-flight check: would writing this value block on a full DMA task queue?
+    ///
+    /// If the offset is a DMA Start_Queue register and the channel's task queue
+    /// is already full, transitions to `BlockedOnQueue` and returns `true`.
+    /// The caller must skip the write and return early when this returns `true`.
+    ///
+    /// This replaces the old post-write `check_dma_trigger()` approach: we now
+    /// block BEFORE the write (matching real hardware where firmware polls
+    /// Task_Queue_Size before writing Start_Queue).
+    fn would_block_on_queue(
+        &mut self, col: u8, row: u8, offset: u32, value: u32,
+        device: &DeviceState,
+    ) -> bool {
+        use crate::device::dma::MAX_TASK_QUEUE_DEPTH;
+
+        let tile_type = match device.tile(col as usize, row as usize)
+            .map(|t| t.tile_type) {
             Some(tt) => tt,
-            None => {
-                log::debug!("check_dma_trigger: tile({},{}) not found", col, row);
-                return;
-            }
+            None => return false,
         };
 
-        // Get channel counts from DMA engine (data-driven from ArchConfig)
         let dma = match device.array.dma_engine(col, row) {
             Some(d) => d,
-            None => {
-                log::debug!("check_dma_trigger: no DMA engine for tile({},{})", col, row);
-                return;
-            }
+            None => return false,
         };
         let s2mm_channels = dma.s2mm_channel_count() as u8;
         let mm2s_channels = dma.mm2s_channel_count() as u8;
 
-        // Determine channel base(s), stride, and S2MM/MM2S channel counts
-        // for the tile type. Compute and shim have a single contiguous block
-        // (S2MM channels first, then MM2S). MemTile has separate S2MM and
-        // MM2S base addresses because it has 6 channels of each type.
-        let (abs_channel, is_mm2s) = match tile_type {
+        let reg_layout = crate::device::regdb::device_reg_layout();
+
+        // Identify if this offset is a start queue write
+        let (abs_channel, _is_mm2s) = match tile_type {
+            TileType::Compute => {
+                let base = reg_layout.memory_channel_base;
+                let stride = reg_layout.memory_channel_stride;
+                match Self::channel_from_queue_write(offset, base, stride, s2mm_channels, s2mm_channels + mm2s_channels) {
+                    Some(r) => r,
+                    None => return false,
+                }
+            }
+            TileType::MemTile => {
+                let stride = reg_layout.memtile_channel_stride;
+                let s2mm_base = reg_layout.memtile_channel_s2mm_base;
+                let mm2s_base = reg_layout.memtile_channel_mm2s_base;
+                if let Some((ch, _)) = Self::channel_from_queue_write(offset, s2mm_base, stride, s2mm_channels, s2mm_channels) {
+                    (ch, false)
+                } else if let Some((ch, _)) = Self::channel_from_queue_write(offset, mm2s_base, stride, mm2s_channels, mm2s_channels) {
+                    (s2mm_channels + ch, true)
+                } else {
+                    return false;
+                }
+            }
             TileType::Shim => {
                 let base = reg_layout.shim_channel_base;
                 let stride = reg_layout.shim_channel_stride;
                 match Self::channel_from_queue_write(offset, base, stride, s2mm_channels, s2mm_channels + mm2s_channels) {
                     Some(r) => r,
-                    None => return,
-                }
-            }
-            TileType::Compute => {
-                let base = reg_layout.memory_channel_base;
-                let stride = reg_layout.memory_channel_stride;
-                log::debug!("check_dma_trigger: Compute offset=0x{:05X} base=0x{:05X} stride={} s2mm={} mm2s={}",
-                    offset, base, stride, s2mm_channels, mm2s_channels);
-                match Self::channel_from_queue_write(offset, base, stride, s2mm_channels, s2mm_channels + mm2s_channels) {
-                    Some(r) => r,
-                    None => return,
-                }
-            }
-            TileType::MemTile => {
-                // MemTile has separate S2MM and MM2S register blocks
-                let stride = reg_layout.memtile_channel_stride;
-                let s2mm_base = reg_layout.memtile_channel_s2mm_base;
-                let mm2s_base = reg_layout.memtile_channel_mm2s_base;
-                log::debug!("check_dma_trigger: MemTile offset=0x{:05X} s2mm_base=0x{:05X} mm2s_base=0x{:05X} stride={} s2mm={} mm2s={}",
-                    offset, s2mm_base, mm2s_base, stride, s2mm_channels, mm2s_channels);
-
-                // Try S2MM block first
-                if let Some((ch, _)) = Self::channel_from_queue_write(offset, s2mm_base, stride, s2mm_channels, s2mm_channels) {
-                    (ch, false)
-                } else if let Some((ch_raw, _)) = Self::channel_from_queue_write(offset, mm2s_base, stride, mm2s_channels, mm2s_channels) {
-                    // MM2S channels are numbered after S2MM in the DMA engine
-                    (s2mm_channels + ch_raw, true)
-                } else {
-                    return;
+                    None => return false,
                 }
             }
         };
 
-        // Start_BD_ID field width differs by tile type:
-        // Compute/Shim: 4 bits (16 BDs), MemTile: 6 bits (48 BDs).
-        // Per AM025 DMA_S2MM_0_Start_Queue register spec.
-        let bd_mask = match tile_type {
-            TileType::MemTile => 0x3F, // 6 bits for 48 BDs
-            _ => 0xF,                  // 4 bits for 16 BDs
-        };
-        let bd_index = (value & bd_mask) as u8;
-        let repeat_count = ((value >> 16) & 0xFF) as u8;
-
-        log::info!(
-            "NPU DMA start: col={} row={} {:?} {} ch={} bd={} repeat={}",
-            col, row, tile_type,
-            if is_mm2s { "MM2S" } else { "S2MM" }, abs_channel, bd_index, repeat_count
-        );
-
-        // Try to enqueue. If queue is full, transition to BlockedOnQueue
-        // and let the caller handle draining (engine stepping in interleaved
-        // mode, or bounded DMA-only stepping in batch execute() mode).
-        // This matches real hardware where the host firmware blocks on
-        // Start_Queue writes when the queue is full (aie-rt
-        // _XAieMl_DmaWaitForBdTaskQueue polls Task_Queue_Size before writing).
-        use crate::device::dma::MAX_TASK_QUEUE_DEPTH;
-
+        // Check queue depth
         let queue_full = device.array.dma_engine(col, row)
             .map_or(false, |dma| dma.task_queue_size(abs_channel) >= MAX_TASK_QUEUE_DEPTH);
 
         if queue_full {
+            let bd_mask = match tile_type {
+                TileType::MemTile => 0x3F,
+                _ => 0xF,
+            };
+            let bd_id = (value & bd_mask) as u8;
+            let repeat = ((value >> 16) & 0xFF) as u8;
+            let enable_token = (value >> 31) & 1 != 0;
+
             log::debug!(
                 "DMA tile({},{}) ch{} queue full, deferring BD {} enqueue",
-                col, row, abs_channel, bd_index
+                col, row, abs_channel, bd_id
             );
             self.state = ExecutorState::BlockedOnQueue {
                 next_index: self.executed_count + 1,
                 col, row,
                 channel: abs_channel,
-                bd_id: bd_index,
-                repeat: repeat_count,
-                enable_token: (value >> 31) & 1 != 0,
+                bd_id,
+                repeat,
+                enable_token,
             };
-            return;
+            return true;
         }
 
-        // Re-parse BD if it was written word-by-word (control packets).
-        // Control packets write individual BD register words via
-        // DeviceState::write_register(), which defers parsing (marks BD dirty).
-        // We must reparse before enqueue_task() snapshots the BD config.
-        device.reparse_dirty_bd(col, row, bd_index as usize);
-
-        let enable_token = (value >> 31) & 1 != 0;
-        if let Some(dma) = device.array.dma_engine_mut(col, row) {
-            if dma.enqueue_task(abs_channel, bd_index, repeat_count, enable_token) {
-                log::info!("  DMA channel {} enqueued BD {} repeat={} token={}",
-                    abs_channel, bd_index, repeat_count, enable_token);
-            } else {
-                dma.fatal_errors.push(format!(
-                    "DMA channel {} enqueue failed for BD {} on tile ({},{}) -- task lost",
-                    abs_channel, bd_index, col, row,
-                ));
-            }
-        }
+        false
     }
 
     /// Check if a register offset is a DMA Task_Queue write within a channel block.
