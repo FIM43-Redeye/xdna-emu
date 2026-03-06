@@ -317,25 +317,40 @@ impl LockArbiter {
                     .collect();
                 group_with_dist.sort_by_key(|&(_, dist)| dist);
 
-                // Grant to closest requestor first. Only ONE grant per lock
-                // per cycle (hardware serialization). Others are denied.
-                let mut any_granted = false;
+                // Process releases first: they are non-blocking and always
+                // succeed on real hardware. A release must not prevent a
+                // same-cycle acquire from seeing the updated value.
                 for &(idx, _) in &group_with_dist {
                     let req = &self.pending[idx];
-                    if !any_granted {
+                    if !req.is_acquire {
+                        Self::try_apply(req, locks);
+                        if lock_id < self.stats.len() {
+                            self.stats[lock_id].grants += 1;
+                        }
+                        self.results.push((req.requestor, lock_id, true));
+                    }
+                }
+
+                // Then process acquires with round-robin arbitration.
+                // Only ONE acquire granted per lock per cycle.
+                let mut any_acquire_granted = false;
+                for &(idx, _) in &group_with_dist {
+                    let req = &self.pending[idx];
+                    if !req.is_acquire {
+                        continue; // already handled above
+                    }
+                    if !any_acquire_granted {
                         let granted = Self::try_apply(req, locks);
                         if granted {
-                            any_granted = true;
+                            any_acquire_granted = true;
                             if lock_id < self.stats.len() {
                                 self.stats[lock_id].grants += 1;
                             }
-                            // Rotate priority past the winner
                             let winner_pi = req.requestor.to_priority_index(s2mm_count);
                             self.priority = (winner_pi + 1) % num_requestors;
                         }
                         self.results.push((req.requestor, lock_id, granted));
                     } else {
-                        // Denied due to contention
                         if lock_id < self.stats.len() {
                             self.stats[lock_id].stalls += 1;
                         }

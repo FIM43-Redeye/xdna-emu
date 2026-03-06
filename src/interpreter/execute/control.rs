@@ -778,11 +778,11 @@ mod tests {
     }
 
     #[test]
-    fn test_lock_release_deferred_not_visible_until_resolve() {
-        // Verify the 1-cycle lock arbiter pipeline: a core lock release
-        // submitted in Phase 2 is NOT visible until the arbiter resolves
-        // in Phase 3. DMA acquire requests submitted before resolve will
-        // compete with the core release through round-robin arbitration.
+    fn test_lock_release_and_acquire_same_cycle() {
+        // Verify that a core lock release and DMA acquire targeting the
+        // same lock both succeed in the same arbiter resolution cycle.
+        // Releases are non-blocking on real hardware and must not prevent
+        // a same-cycle acquire from seeing the updated value.
         use crate::device::tile::{LockRequest, LockRequestor};
 
         let mut tile = make_tile();
@@ -809,27 +809,12 @@ mod tests {
             equal_mode: false,
         });
 
-        // Resolve arbiter: core release (+1) and DMA acquire (needs >=1)
-        // The arbiter processes one request per lock per cycle. Since both
-        // target lock 5, only one gets granted. Core (priority 0) wins
-        // round-robin over DMA S2MM ch0 (priority 1).
+        // Resolve arbiter: release applied first (lock 0 -> 1), then
+        // acquire sees updated value (1 >= 1, granted, lock 1 -> 0).
         tile.resolve_lock_requests();
 
-        // Core release was granted: lock goes 0 -> 1
-        // DMA acquire was denied (contention -- core won round-robin)
-        assert_eq!(tile.locks[5].value, 1, "Core release applied, DMA denied by contention");
-
-        // Next cycle: DMA resubmits acquire, no contention this time
-        tile.submit_lock_request(LockRequest {
-            requestor: LockRequestor::DmaS2mm(0),
-            lock_id: 5,
-            is_acquire: true,
-            expected: 1,
-            delta: -1,
-            equal_mode: false,
-        });
-        tile.resolve_lock_requests();
-        assert_eq!(tile.locks[5].value, 0, "DMA acquires on next cycle");
+        // Both succeeded in the same cycle: release +1 then acquire -1
+        assert_eq!(tile.locks[5].value, 0, "Release then acquire in same cycle");
     }
 
     #[test]
