@@ -917,7 +917,7 @@ pub enum ControlPacketState {
 /// Control packets are register writes that arrive via the stream switch
 /// network. Rather than writing directly within the tile (which misses the
 /// full module dispatch in DeviceState), the tile returns actions that the
-/// caller routes through `DeviceState::ctrl_packet_write()`.
+/// caller routes through `DeviceState::write_tile_register()`.
 #[derive(Debug)]
 pub enum CtrlPacketAction {
     /// Write a value to a tile-local register offset.
@@ -2255,7 +2255,7 @@ impl Tile {
     /// Execute a complete control packet operation.
     ///
     /// Returns a list of actions for the caller to dispatch through
-    /// `DeviceState::ctrl_packet_write()`, which provides the full module
+    /// `DeviceState::write_tile_register()`, which provides the full module
     /// dispatch (MemTile DMA BDs, stream switch, etc.) that
     /// `tile.write_register()` alone cannot.
     ///
@@ -2969,7 +2969,7 @@ mod tests {
     /// Documents that tile.write_register() does NOT update structured BD
     /// state for MemTile BDs. This is a known limitation, not a bug -- the
     /// fix is that control packets now return CtrlPacketAction::WriteRegister
-    /// which the caller routes through DeviceState::ctrl_packet_write().
+    /// which the caller routes through DeviceState::write_tile_register().
     #[test]
     fn test_tile_write_register_does_not_handle_memtile_bds() {
         let reg_layout = super::super::regdb::device_reg_layout();
@@ -2990,15 +2990,16 @@ mod tests {
         assert_eq!(
             tile.dma_bds[0].length, 0,
             "tile.write_register() should NOT update MemTile BDs -- \
-             this is handled by DeviceState::ctrl_packet_write()"
+             this is handled by DeviceState::write_tile_register()"
         );
     }
 
-    /// Proves that DeviceState::ctrl_packet_write() correctly dispatches
+    /// Proves that DeviceState::write_tile_register() correctly dispatches
     /// MemTile BD writes through the full module dispatch path. This is the
-    /// path that control packet actions now follow.
+    /// unified path used by all register write sources (CDO, NPU executor,
+    /// control packets).
     #[test]
-    fn test_ctrl_packet_write_updates_memtile_bd() {
+    fn test_write_tile_register_updates_memtile_bd() {
         let reg_layout = super::super::regdb::device_reg_layout();
         let bd0_word2_offset = reg_layout.memtile_bd_base + 2 * 4; // BD0, word 2 (length)
 
@@ -3009,9 +3010,9 @@ mod tests {
         assert!(tile.is_mem_tile(), "tile(1,1) should be a MemTile");
         assert_eq!(tile.dma_bds[0].length, 0, "BD0 length should start at 0");
 
-        // Write via ctrl_packet_write -- this is the new fixed path
+        // Write via write_tile_register -- the unified register bus
         let test_length: u32 = 0x0000_1000;
-        device.ctrl_packet_write(1, 1, bd0_word2_offset, test_length);
+        device.write_tile_register(1, 1, bd0_word2_offset, test_length);
 
         // Both the register HashMap AND the structured BD should be updated
         let tile = device.array.get(1, 1).unwrap();
@@ -3022,7 +3023,7 @@ mod tests {
         );
         assert_eq!(
             tile.dma_bds[0].length, test_length,
-            "MemTile BD0 length should be updated via ctrl_packet_write dispatch"
+            "MemTile BD0 length should be updated via write_tile_register dispatch"
         );
     }
 

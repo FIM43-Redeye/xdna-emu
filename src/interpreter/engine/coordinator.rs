@@ -240,7 +240,7 @@ impl InterpreterEngine {
                 for action in ctrl_actions {
                     match action {
                         CtrlPacketAction::WriteRegister { col, row, offset, value } => {
-                            self.device.ctrl_packet_write(col, row, offset, value);
+                            self.device.write_tile_register(col, row, offset, value);
                         }
                         CtrlPacketAction::ReadRegisters { col, row, offset, count, response_id } => {
                             self.device.array.handle_read_registers(
@@ -606,7 +606,7 @@ impl InterpreterEngine {
         for action in ctrl_actions {
             match action {
                 CtrlPacketAction::WriteRegister { col, row, offset, value } => {
-                    self.device.ctrl_packet_write(col, row, offset, value);
+                    self.device.write_tile_register(col, row, offset, value);
                 }
                 CtrlPacketAction::ReadRegisters { col, row, offset, count, response_id } => {
                     self.device.array.handle_read_registers(

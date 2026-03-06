@@ -112,22 +112,22 @@ impl DeviceState {
         Ok(())
     }
 
-    /// Write a register via the full module-dispatch path, reconstructing the
-    /// 32-bit tile address from (col, row, offset).
+    /// Write a tile register through the unified dispatch path.
     ///
-    /// Control packets arrive at individual tiles with a tile-local register
-    /// offset. The tile's own `write_register()` only handles a subset of
-    /// register types (compute-tile DMA BDs, locks, channel control). This
-    /// method encodes the full address and routes through
-    /// `DeviceState::write_register()`, which dispatches to the correct
-    /// module handler (MemTile DMA BDs, MemTile stream switch, core module,
-    /// shim DMA channels, etc.).
-    pub fn ctrl_packet_write(&mut self, col: u8, row: u8, offset: u32, value: u32) {
+    /// This is the emulator's equivalent of the hardware register bus: a
+    /// single entry point for all register writes regardless of source (CDO,
+    /// NPU instruction, control packet). It dispatches to module-specific
+    /// handlers (stream switch, DMA engine, locks, etc.) and then calls
+    /// `tile.write_register()` for tile-local state (raw register storage,
+    /// trace config, shim mux, cascade, event broadcast, etc.).
+    ///
+    /// All external callers should use this method rather than calling
+    /// `tile.write_register()` directly, to ensure stream switch config,
+    /// DMA engine integration, and other module handlers run.
+    pub(crate) fn write_tile_register(&mut self, col: u8, row: u8, offset: u32, value: u32) {
         let address = TileAddress::encode(col, row, offset);
-        log::debug!("ctrl_packet_write: tile({},{}) offset=0x{:05X} value=0x{:08X} -> addr=0x{:08X}",
-            col, row, offset, value, address);
         if let Err(e) = self.write_register(address, value) {
-            log::error!("ctrl_packet_write failed: tile({},{}) offset=0x{:05X}: {:?}",
+            log::error!("write_tile_register failed: tile({},{}) offset=0x{:05X}: {:?}",
                 col, row, offset, e);
         }
     }
@@ -263,6 +263,15 @@ impl DeviceState {
 
             RegisterModule::MemTileStreamSwitch => {
                 self.write_memtile_stream_switch(tile_addr.col, tile_addr.row, tile_addr.offset, value);
+            }
+
+            RegisterModule::ProgramMemory => {
+                // Write 32-bit value to program memory. Control packets
+                // deliver ELF code word-by-word; CDO uses bulk dma_write.
+                if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
+                    let pm_offset = (tile_addr.offset - 0x20000) as usize;
+                    tile.write_program(pm_offset, &value.to_le_bytes());
+                }
             }
 
             _ => {
@@ -1074,11 +1083,13 @@ impl DeviceState {
     /// Called just before the DMA engine snapshots a BD (enqueue_task), to ensure
     /// single-word control packet writes have been fully assembled. If the BD is
     /// not dirty, this is a no-op.
-    fn reparse_dirty_bd(&mut self, col: u8, row: u8, bd_idx: usize) {
+    pub(crate) fn reparse_dirty_bd(&mut self, col: u8, row: u8, bd_idx: usize) {
         use crate::device::dma::bd::BufferDescriptor;
 
         let is_dirty = self.array.dma_engine(col, row)
             .map_or(false, |dma| dma.is_bd_dirty(bd_idx as u8));
+        log::debug!("reparse_dirty_bd: tile({},{}) BD {} is_dirty={}",
+            col, row, bd_idx, is_dirty);
         if !is_dirty {
             return;
         }

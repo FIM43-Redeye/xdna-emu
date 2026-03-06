@@ -783,8 +783,8 @@ pub unsafe extern "C" fn xdna_emu_write_register(
     let handle = &mut *handle;
     let device = handle.engine.device_mut();
 
-    if let Some(tile) = device.tile_mut(col as usize, row as usize) {
-        tile.write_register(reg_addr, value);
+    if device.tile(col as usize, row as usize).is_some() {
+        device.write_tile_register(col as u8, row as u8, reg_addr, value);
         0
     } else {
         log::warn!("write_register: tile ({}, {}) out of bounds", col, row);

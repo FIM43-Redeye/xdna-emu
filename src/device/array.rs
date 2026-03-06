@@ -120,7 +120,7 @@ pub struct TileArray {
     ///
     /// Control packet writes from tiles are collected here instead of being
     /// executed immediately. The caller (DeviceState or coordinator) drains
-    /// these and routes them through `DeviceState::ctrl_packet_write()` for
+    /// these and routes them through `DeviceState::write_tile_register()` for
     /// full module dispatch.
     pub(crate) pending_ctrl_actions: Vec<super::tile::CtrlPacketAction>,
 
@@ -221,7 +221,7 @@ impl TileArray {
     /// Control packets arrive via the stream switch network at individual tiles.
     /// Rather than writing registers directly (which misses the full module
     /// dispatch in DeviceState), the tile returns actions. The caller drains
-    /// these and routes them through `DeviceState::ctrl_packet_write()`.
+    /// these and routes them through `DeviceState::write_tile_register()`.
     pub fn drain_ctrl_packet_actions(&mut self) -> Vec<super::tile::CtrlPacketAction> {
         std::mem::take(&mut self.pending_ctrl_actions)
     }
