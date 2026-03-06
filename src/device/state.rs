@@ -222,7 +222,8 @@ impl DeviceState {
         Ok(())
     }
 
-    /// Write a value to a register.
+    /// Internal register bus dispatch. Decodes an encoded tile address and
+    /// routes the write through module-specific handlers.
     fn write_register(&mut self, address: u32, value: u32) -> Result<()> {
         let tile_addr = TileAddress::decode(address);
 
@@ -314,7 +315,8 @@ impl DeviceState {
         Ok(())
     }
 
-    /// Masked write to a register.
+    /// Internal masked register bus dispatch. Reads the current value,
+    /// applies the mask, and delegates to `write_register()`.
     fn mask_write_register(&mut self, address: u32, mask: u32, value: u32) -> Result<()> {
         let tile_addr = TileAddress::decode(address);
         let module = tile_addr.module();
@@ -690,10 +692,10 @@ impl DeviceState {
                 // channel -- it queues the task for execution when the current
                 // transfer finishes.
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, enable_token_issue) {
-                    dma.fatal_errors.push(format!(
-                        "DMA channel {} task queue overflow on tile ({},{}) -- task lost",
-                        ch_idx, col, row,
-                    ));
+                    log::warn!(
+                        "DMA tile({},{}) ch{} task queue overflow (BD {} dropped)",
+                        col, row, ch_idx, bd_idx,
+                    );
                 } else if enable_token_issue {
                     log::debug!("CDO enqueued DMA channel {} BD {} repeat={} token_issue=true controller_id={} on tile ({},{})",
                         ch_idx, bd_idx, repeat_count, controller_id, col, row);
@@ -742,10 +744,10 @@ impl DeviceState {
             self.reparse_dirty_bd(col, row, bd_idx as usize);
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
-                    dma.fatal_errors.push(format!(
-                        "DMA channel {} task queue overflow on tile ({},{}) -- task lost",
-                        ch_idx, col, row,
-                    ));
+                    log::warn!(
+                        "DMA tile({},{}) ch{} task queue overflow (BD {} dropped)",
+                        col, row, ch_idx, bd_idx,
+                    );
                 } else {
                     log::info!("CDO enqueued DMA channel {} BD {} repeat={} on tile ({},{})",
                         ch_idx, bd_idx, repeat_count, col, row);
@@ -832,10 +834,10 @@ impl DeviceState {
                 dma.set_channel_task_config(ch_idx as u8, enable_token_issue, controller_id, fot_mode);
 
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, enable_token_issue) {
-                    dma.fatal_errors.push(format!(
-                        "Shim DMA channel {} task queue overflow on tile ({},{}) -- task lost",
-                        ch_idx, col, row,
-                    ));
+                    log::warn!(
+                        "Shim DMA tile({},{}) ch{} task queue overflow (BD {} dropped)",
+                        col, row, ch_idx, bd_idx,
+                    );
                 } else {
                     log::info!("CDO enqueued Shim DMA channel {} BD {} repeat={} on tile ({},{})",
                         ch_idx, bd_idx, repeat_count, col, row);
@@ -878,10 +880,10 @@ impl DeviceState {
             self.reparse_dirty_bd(col, row, bd_idx as usize);
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
-                    dma.fatal_errors.push(format!(
-                        "Shim DMA channel {} task queue overflow on tile ({},{}) -- task lost",
-                        ch_idx, col, row,
-                    ));
+                    log::warn!(
+                        "Shim DMA tile({},{}) ch{} task queue overflow (BD {} dropped)",
+                        col, row, ch_idx, bd_idx,
+                    );
                 } else {
                     log::info!("CDO enqueued Shim DMA channel {} BD {} repeat={} on tile ({},{})",
                         ch_idx, bd_idx, repeat_count, col, row);
@@ -1293,10 +1295,10 @@ impl DeviceState {
             self.reparse_dirty_bd(col, row, bd_idx as usize);
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
-                    dma.fatal_errors.push(format!(
-                        "MemTile DMA channel {} task queue overflow on tile ({},{}) -- task lost",
-                        ch_idx, col, row,
-                    ));
+                    log::warn!(
+                        "MemTile DMA tile({},{}) ch{} task queue overflow (BD {} dropped)",
+                        col, row, ch_idx, bd_idx,
+                    );
                 } else {
                     let dir = if ch_idx < 6 { "S2MM" } else { "MM2S" };
                     let local_ch = if ch_idx < 6 { ch_idx } else { ch_idx - 6 };
@@ -1343,10 +1345,10 @@ impl DeviceState {
             self.reparse_dirty_bd(col, row, bd_idx as usize);
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
-                    dma.fatal_errors.push(format!(
-                        "MemTile DMA channel {} task queue overflow on tile ({},{}) -- task lost",
-                        ch_idx, col, row,
-                    ));
+                    log::warn!(
+                        "MemTile DMA tile({},{}) ch{} task queue overflow (BD {} dropped)",
+                        col, row, ch_idx, bd_idx,
+                    );
                 } else {
                     let dir = if ch_idx < 6 { "S2MM" } else { "MM2S" };
                     let local_ch = if ch_idx < 6 { ch_idx } else { ch_idx - 6 };
