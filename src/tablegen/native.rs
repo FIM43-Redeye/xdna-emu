@@ -33,7 +33,12 @@ use tblgen::TableGenParser;
 #[cfg(feature = "native-tblgen")]
 use super::tblgen_records::{EncodingBit, InstrRecord, SlotEncoding};
 #[cfg(feature = "native-tblgen")]
-use super::types::{CompositeFormatDef, SlotBitMap};
+use super::types::{
+    CompositeFormatDef, ItineraryInfo, PipelineStage, ProcessorModel,
+    RegisterClassDef, RegisterDef, RegisterModel, SemanticOp, SlotBitMap,
+};
+#[cfg(feature = "native-tblgen")]
+use std::collections::HashMap;
 
 /// Extract composite VLIW format definitions from TableGen records.
 ///
@@ -449,6 +454,592 @@ fn extract_def_list(record: &tblgen::Record<'_>, field_name: &str) -> Vec<String
     result
 }
 
+// ============================================================================
+// Pattern records: Pat<> -> SemanticOp mapping
+// ============================================================================
+
+/// Extract Pat<> semantic mappings from TableGen Pattern records.
+///
+/// Walks all records derived from "Pattern" and extracts the SDNode/intrinsic
+/// from PatternToMatch and the target instruction from ResultInstrs.
+/// Applies the same "direct beats compound" selection logic as the text parser.
+#[cfg(feature = "native-tblgen")]
+pub fn load_pattern_records(
+    td_file: &Path,
+    include_paths: &[&Path],
+) -> Result<HashMap<String, SemanticOp>, String> {
+    let keeper = parse_td_file(td_file, include_paths)?;
+
+    // Collect all candidates per instruction, then pick the best one.
+    let mut candidates: HashMap<String, Vec<(SemanticOp, bool)>> = HashMap::new();
+
+    for record in keeper.all_derived_definitions("Pattern") {
+        // Extract the target instruction name from ResultInstrs (list<dag>)
+        let result_instrs = match record.value("ResultInstrs") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let result_list: tblgen::init::ListInit = match result_instrs.init.as_list() {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if result_list.len() == 0 {
+            continue;
+        }
+
+        // Get first result dag: (INSTR_NAME operands...)
+        let first_result = match result_list.iter().next() {
+            Some(item) => item,
+            None => continue,
+        };
+        let result_dag: tblgen::init::DagInit = match first_result.as_dag() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        // The operator of the result dag is the target instruction
+        let instr_name = match result_dag.operator().name() {
+            Ok(n) => n.to_string(),
+            Err(_) => continue,
+        };
+
+        // Skip pseudo/meta instructions
+        if instr_name == "REG_SEQUENCE"
+            || instr_name == "COPY_TO_REGCLASS"
+            || instr_name.starts_with("Pseudo")
+            || instr_name == "EXTRACT_SUBREG"
+            || instr_name == "INSERT_SUBREG"
+            || instr_name == "IMPLICIT_DEF"
+            || instr_name == "NegateImm"
+        {
+            continue;
+        }
+
+        // Extract semantic from PatternToMatch dag
+        let pattern_val = match record.value("PatternToMatch") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let pattern_dag: tblgen::init::DagInit = match pattern_val.init.as_dag() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let semantic = match extract_semantic_from_dag_init(&pattern_dag) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // Determine if this is a "direct/simple" pattern.
+        // Check if the record is a CmpSwapPat (swapped comparison operands).
+        let is_swap = record.subclass_of("CmpSwapPat");
+        // Check if result dag args contain nested instruction applications
+        // (compound patterns like NegateImm, SUB wrapping).
+        let has_compound_result = result_dag_has_compound_ops(&result_dag);
+        let is_simple = !is_swap && !has_compound_result;
+
+        candidates
+            .entry(instr_name)
+            .or_default()
+            .push((semantic, is_simple));
+    }
+
+    // Pick the best candidate for each instruction.
+    let mut result: HashMap<String, SemanticOp> = HashMap::new();
+    for (instr_name, cands) in &candidates {
+        if let Some((op, _)) = cands.iter().find(|(_, is_simple)| *is_simple) {
+            result.insert(instr_name.clone(), *op);
+        } else if let Some((op, _)) = cands.first() {
+            result.insert(instr_name.clone(), *op);
+        }
+    }
+
+    log::info!(
+        "Native TableGen: extracted {} pattern semantics from {} Pattern records",
+        result.len(),
+        candidates.len(),
+    );
+    Ok(result)
+}
+
+/// Recursively extract a SemanticOp from a DAG init tree.
+///
+/// Walks the dag operator and nested sub-dags to find the first SDNode or
+/// intrinsic name that maps to a SemanticOp.
+#[cfg(feature = "native-tblgen")]
+fn extract_semantic_from_dag_init(dag: &tblgen::init::DagInit) -> Option<SemanticOp> {
+    // Try the operator of this dag (operator() returns Record directly)
+    let op_rec = dag.operator();
+    if let Ok(name) = op_rec.name() {
+        // Try as SDNode
+        if let Some(op) = SemanticOp::from_sdnode(&name) {
+            return Some(op);
+        }
+        // Try as intrinsic
+        if let Some(op) = SemanticOp::from_intrinsic(&name) {
+            return Some(op);
+        }
+    }
+
+    // Recurse into arguments that are themselves dags.
+    // Use indexed access since dag args may be unnamed (DagIter skips those).
+    for i in 0..dag.num_args() {
+        if let Some(arg_init) = dag.get(i) {
+            if let Ok(sub_dag) = arg_init.as_dag() {
+                if let Some(op) = extract_semantic_from_dag_init(&sub_dag) {
+                    return Some(op);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Check if a result DAG contains compound operations (NegateImm, SUB, ADD).
+#[cfg(feature = "native-tblgen")]
+fn result_dag_has_compound_ops(dag: &tblgen::init::DagInit) -> bool {
+    for i in 0..dag.num_args() {
+        if let Some(arg_init) = dag.get(i) {
+            if let Ok(sub_dag) = arg_init.as_dag() {
+                let op_rec = sub_dag.operator();
+                if let Ok(name) = op_rec.name() {
+                    if name == "NegateImm" || name == "SUB" || name == "ADD" {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+// ============================================================================
+// Pseudo expansion map: MultiSlot_Pseudo -> concrete instructions
+// ============================================================================
+
+/// Extract pseudo -> concrete instruction expansion maps.
+///
+/// Reads all records derived from "MultiSlot_Pseudo" and extracts the
+/// `materializableInto` field (list<AIE2Inst>).
+#[cfg(feature = "native-tblgen")]
+pub fn load_pseudo_expansion_map(
+    td_file: &Path,
+    include_paths: &[&Path],
+) -> Result<HashMap<String, Vec<String>>, String> {
+    let keeper = parse_td_file(td_file, include_paths)?;
+    let mut result: HashMap<String, Vec<String>> = HashMap::new();
+
+    for record in keeper.all_derived_definitions("MultiSlot_Pseudo") {
+        let name = match record.name() {
+            Ok(n) => n.to_string(),
+            Err(_) => continue,
+        };
+
+        let mat_val = match record.value("materializableInto") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let mat_list: tblgen::init::ListInit = match mat_val.init.as_list() {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+
+        let mut concretes = Vec::new();
+        for item in mat_list.iter() {
+            if let Ok(def_init) = item.as_def() {
+                let rec: tblgen::Record = def_init.into();
+                if let Ok(n) = rec.name() {
+                    concretes.push(n.to_string());
+                }
+            }
+        }
+
+        if !concretes.is_empty() {
+            result.insert(name, concretes);
+        }
+    }
+
+    log::info!(
+        "Native TableGen: extracted {} pseudo expansion maps",
+        result.len(),
+    );
+    Ok(result)
+}
+
+// ============================================================================
+// Processor model: SchedMachineModel
+// ============================================================================
+
+/// Extract the processor scheduling model.
+///
+/// Reads the single record derived from "SchedMachineModel" and extracts
+/// latency/penalty/width parameters.
+#[cfg(feature = "native-tblgen")]
+pub fn load_processor_model(
+    td_file: &Path,
+    include_paths: &[&Path],
+) -> Result<Option<ProcessorModel>, String> {
+    let keeper = parse_td_file(td_file, include_paths)?;
+
+    for record in keeper.all_derived_definitions("SchedMachineModel") {
+        let int_field = |name: &str, default: i64| -> i64 {
+            record.int_value(name).unwrap_or(default)
+        };
+
+        let itinerary_name = record
+            .value("Itineraries")
+            .ok()
+            .and_then(|v| {
+                let def = v.init.as_def().ok()?;
+                let rec: tblgen::Record = def.into();
+                Some(rec.name().ok()?.to_string())
+            })
+            .unwrap_or_default();
+
+        return Ok(Some(ProcessorModel {
+            load_latency: int_field("LoadLatency", 5) as u8,
+            high_latency: int_field("HighLatency", 37) as u8,
+            mispredict_penalty: int_field("MispredictPenalty", 4) as u8,
+            issue_width: int_field("IssueWidth", 1000) as u16,
+            itinerary_name,
+        }));
+    }
+
+    Ok(None)
+}
+
+// ============================================================================
+// Itinerary data: InstrItinData + InstrStage
+// ============================================================================
+
+/// Extract instruction itinerary data (per-class pipeline timing).
+///
+/// Two-pass extraction matching the text parser:
+/// 1. Collect all InstrStage records (anonymous) into a name->stage map
+/// 2. Collect all InstrItinData records, resolving stage references
+#[cfg(feature = "native-tblgen")]
+pub fn load_itinerary_data(
+    td_file: &Path,
+    include_paths: &[&Path],
+) -> Result<HashMap<String, ItineraryInfo>, String> {
+    let keeper = parse_td_file(td_file, include_paths)?;
+
+    // Pass 1: collect InstrStage records
+    let mut stages_map: HashMap<String, PipelineStage> = HashMap::new();
+    for record in keeper.all_derived_definitions("InstrStage") {
+        let name = match record.name() {
+            Ok(n) => n.to_string(),
+            Err(_) => continue,
+        };
+
+        let cycles = record.int_value("Cycles").unwrap_or(0) as u8;
+        let time_inc = record.int_value("TimeInc").unwrap_or(1) as i8;
+
+        let units_val = record.value("Units");
+        let units = match units_val {
+            Ok(v) => {
+                match v.init.as_list() {
+                    Ok(list) => {
+                        let mut u = Vec::new();
+                        for item in list.iter() {
+                            if let Ok(def_init) = item.as_def() {
+                                let rec: tblgen::Record = def_init.into();
+                                if let Ok(n) = rec.name() {
+                                    u.push(n.to_string());
+                                }
+                            }
+                        }
+                        u
+                    }
+                    Err(_) => Vec::new(),
+                }
+            }
+            Err(_) => Vec::new(),
+        };
+
+        stages_map.insert(name, PipelineStage { cycles, units, time_inc });
+    }
+
+    // Pass 2: collect InstrItinData records
+    let mut result: HashMap<String, ItineraryInfo> = HashMap::new();
+    for record in keeper.all_derived_definitions("InstrItinData") {
+        // Get the itinerary class name from TheClass field
+        let class_name = match record.value("TheClass") {
+            Ok(v) => {
+                match v.init.as_def() {
+                    Ok(def_init) => {
+                        let rec: tblgen::Record = def_init.into();
+                        match rec.name() {
+                            Ok(n) => n.to_string(),
+                            Err(_) => continue,
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+            Err(_) => continue,
+        };
+
+        // Get stage references
+        let stages: Vec<PipelineStage> = match record.value("Stages") {
+            Ok(v) => {
+                match v.init.as_list() {
+                    Ok(list) => {
+                        let mut s = Vec::new();
+                        for item in list.iter() {
+                            if let Ok(def_init) = item.as_def() {
+                                let rec: tblgen::Record = def_init.into();
+                                if let Ok(n) = rec.name() {
+                                    if let Some(stage) = stages_map.get(n) {
+                                        s.push(stage.clone());
+                                    }
+                                }
+                            }
+                        }
+                        s
+                    }
+                    Err(_) => Vec::new(),
+                }
+            }
+            Err(_) => Vec::new(),
+        };
+
+        // Get operand cycles
+        let operand_cycles: Vec<u8> = match record.value("OperandCycles") {
+            Ok(v) => {
+                match v.init.as_list() {
+                    Ok(list) => {
+                        list.iter()
+                            .filter_map(|item| {
+                                let int_init: tblgen::init::IntInit = item.as_int().ok()?;
+                                let val: i64 = int_init.into();
+                                Some(val as u8)
+                            })
+                            .collect()
+                    }
+                    Err(_) => Vec::new(),
+                }
+            }
+            Err(_) => Vec::new(),
+        };
+
+        // Get bypasses
+        let bypasses: Vec<String> = match record.value("Bypasses") {
+            Ok(v) => {
+                match v.init.as_list() {
+                    Ok(list) => {
+                        let mut b = Vec::new();
+                        for item in list.iter() {
+                            if let Ok(def_init) = item.as_def() {
+                                let rec: tblgen::Record = def_init.into();
+                                if let Ok(n) = rec.name() {
+                                    b.push(n.to_string());
+                                }
+                            }
+                        }
+                        b
+                    }
+                    Err(_) => Vec::new(),
+                }
+            }
+            Err(_) => Vec::new(),
+        };
+
+        let total_latency = stages.iter().map(|s| s.cycles).sum::<u8>();
+
+        result.insert(
+            class_name.clone(),
+            ItineraryInfo {
+                class_name,
+                total_latency,
+                operand_cycles,
+                stages,
+                bypasses,
+            },
+        );
+    }
+
+    log::info!(
+        "Native TableGen: extracted {} itinerary classes, {} stage definitions",
+        result.len(),
+        stages_map.len(),
+    );
+    Ok(result)
+}
+
+// ============================================================================
+// Register model: Register defs + RegisterClass
+// ============================================================================
+
+/// Recursively collect register names from a MemberList dag.
+///
+/// MemberList is typically `(add reg1, reg2, ...)` but may contain nested
+/// `(add ...)` sub-dags for large register classes, or `(sequence ...)` nodes.
+///
+/// NOTE: We use indexed access (`dag.get(i)`) instead of `dag.args()` because
+/// the DagIter requires both name AND value to be Some, but MemberList args
+/// are unnamed positional arguments. Using `dag.args()` silently yields nothing.
+#[cfg(feature = "native-tblgen")]
+fn collect_dag_register_refs(dag: &tblgen::init::DagInit, out: &mut Vec<String>) {
+    for i in 0..dag.num_args() {
+        let arg_init = match dag.get(i) {
+            Some(a) => a,
+            None => continue,
+        };
+        // Try as a register reference (DefInit -> Record)
+        if let Ok(def_init) = arg_init.as_def() {
+            let rec: tblgen::Record = def_init.into();
+            if let Ok(n) = rec.name() {
+                out.push(n.to_string());
+            }
+        }
+        // Try as a nested dag (add ...)
+        else if let Ok(sub_dag) = arg_init.as_dag() {
+            collect_dag_register_refs(&sub_dag, out);
+        }
+    }
+}
+
+/// Extract the complete register model (registers + register classes).
+#[cfg(feature = "native-tblgen")]
+pub fn load_register_model(
+    td_file: &Path,
+    include_paths: &[&Path],
+) -> Result<RegisterModel, String> {
+    let keeper = parse_td_file(td_file, include_paths)?;
+
+    // Extract individual register definitions
+    let mut registers: HashMap<String, RegisterDef> = HashMap::new();
+    for record in keeper.all_derived_definitions("Register") {
+        // Skip RegisterClass records
+        if record.subclass_of("RegisterClass") {
+            continue;
+        }
+
+        let name = match record.name() {
+            Ok(n) => n.to_string(),
+            Err(_) => continue,
+        };
+
+        // Only include AIE2 registers
+        let namespace = record
+            .string_value("Namespace")
+            .unwrap_or_default();
+        if namespace != "AIE2" {
+            continue;
+        }
+
+        // Extract HWEncoding (bits<16>)
+        let hw_encoding = match record.value("HWEncoding") {
+            Ok(v) => {
+                match v.init.as_bits() {
+                    Ok(bits) => {
+                        let mut val: u16 = 0;
+                        for i in 0..bits.num_bits().min(16) {
+                            if let Some(bit) = bits.bit(i) {
+                                if let Some(true) = bit.as_literal() {
+                                    val |= 1u16 << i;
+                                }
+                            }
+                        }
+                        val
+                    }
+                    Err(_) => continue,
+                }
+            }
+            Err(_) => continue,
+        };
+
+        // Extract parent class names
+        let mut parents = Vec::new();
+        for class in &["AIE2GPReg", "DwarfRegNum", "AIE2Reg"] {
+            if record.subclass_of(class) {
+                parents.push(class.to_string());
+            }
+        }
+
+        registers.insert(
+            name.clone(),
+            RegisterDef {
+                name,
+                hw_encoding,
+                parents,
+            },
+        );
+    }
+
+    // Extract register classes.
+    // Try multiple class names -- LLVM's RegisterClass may be stored under
+    // different names depending on the TableGen version.
+    let mut classes: HashMap<String, RegisterClassDef> = HashMap::new();
+    let class_names = ["RegisterClass", "AIE2RegisterClass", "AIEBaseRegisterClass"];
+    let class_iter = class_names.iter()
+        .flat_map(|cn| keeper.all_derived_definitions(cn));
+    for record in class_iter {
+        let name = match record.name() {
+            Ok(n) => n.to_string(),
+            Err(_) => continue,
+        };
+
+        // Only include AIE2 register classes
+        let namespace = record
+            .string_value("Namespace")
+            .unwrap_or_default();
+        if namespace != "AIE2" {
+            continue;
+        }
+
+        // Extract MemberList (dag with (add reg1, reg2, ...))
+        // The MemberList may contain nested (add ...) dags for large classes,
+        // so we recursively flatten all register references.
+        let members: Vec<String> = match record.value("MemberList") {
+            Ok(v) => {
+                match v.init.as_dag() {
+                    Ok(dag) => {
+                        let mut m = Vec::new();
+                        collect_dag_register_refs(&dag, &mut m);
+                        m
+                    }
+                    Err(_) => Vec::new(),
+                }
+            }
+            Err(_) => Vec::new(),
+        };
+
+        if members.is_empty() {
+            continue;
+        }
+
+        let alignment = record.int_value("Alignment").unwrap_or(0) as u16;
+
+        // Extract parent class names
+        let mut parents = Vec::new();
+        for class in &["RegisterClass", "AIE2RegisterClass"] {
+            if record.subclass_of(class) {
+                parents.push(class.to_string());
+            }
+        }
+
+        classes.insert(
+            name.clone(),
+            RegisterClassDef {
+                name,
+                members,
+                alignment,
+                parents,
+            },
+        );
+    }
+
+    log::info!(
+        "Native TableGen: extracted {} registers, {} register classes",
+        registers.len(),
+        classes.len(),
+    );
+    Ok(RegisterModel { registers, classes })
+}
+
 #[cfg(test)]
 #[cfg(feature = "native-tblgen")]
 mod tests {
@@ -551,5 +1142,140 @@ mod tests {
             }
         }
         log::info!("Instruction records by slot: {:?}", by_slot);
+    }
+
+    #[test]
+    fn test_load_pattern_records() {
+        let td = td_file();
+        if !td.exists() {
+            eprintln!("Skipping: llvm-aie not found at {:?}", td);
+            return;
+        }
+        let inc_paths = include_paths();
+        let incs: Vec<&Path> = inc_paths.iter().map(|p| p.as_path()).collect();
+        let patterns = load_pattern_records(&td, &incs).expect("should parse");
+
+        // We expect a reasonable number of pattern-derived semantics
+        assert!(
+            patterns.len() >= 30,
+            "expected >= 30 pattern semantics, got {}",
+            patterns.len(),
+        );
+
+        // Spot-check: ADD should map to SemanticOp::Add
+        if let Some(op) = patterns.get("ADD_alu_r_ri") {
+            assert_eq!(*op, super::super::types::SemanticOp::Add);
+        }
+    }
+
+    #[test]
+    fn test_load_pseudo_expansion_map() {
+        let td = td_file();
+        if !td.exists() {
+            eprintln!("Skipping: llvm-aie not found at {:?}", td);
+            return;
+        }
+        let inc_paths = include_paths();
+        let incs: Vec<&Path> = inc_paths.iter().map(|p| p.as_path()).collect();
+        let pseudo_map = load_pseudo_expansion_map(&td, &incs).expect("should parse");
+
+        // We expect some pseudo expansion maps
+        assert!(
+            pseudo_map.len() >= 5,
+            "expected >= 5 pseudo expansion maps, got {}",
+            pseudo_map.len(),
+        );
+
+        // Each pseudo should expand to at least one concrete
+        for (name, concretes) in &pseudo_map {
+            assert!(
+                !concretes.is_empty(),
+                "pseudo {} has empty expansion list",
+                name,
+            );
+        }
+    }
+
+    #[test]
+    fn test_load_processor_model() {
+        let td = td_file();
+        if !td.exists() {
+            eprintln!("Skipping: llvm-aie not found at {:?}", td);
+            return;
+        }
+        let inc_paths = include_paths();
+        let incs: Vec<&Path> = inc_paths.iter().map(|p| p.as_path()).collect();
+        let model = load_processor_model(&td, &incs)
+            .expect("should parse")
+            .expect("should find a SchedMachineModel");
+
+        assert!(model.load_latency > 0, "load_latency should be > 0");
+        assert!(model.mispredict_penalty > 0, "mispredict_penalty should be > 0");
+        assert!(!model.itinerary_name.is_empty(), "itinerary_name should not be empty");
+    }
+
+    #[test]
+    fn test_load_itinerary_data() {
+        let td = td_file();
+        if !td.exists() {
+            eprintln!("Skipping: llvm-aie not found at {:?}", td);
+            return;
+        }
+        let inc_paths = include_paths();
+        let incs: Vec<&Path> = inc_paths.iter().map(|p| p.as_path()).collect();
+        let itineraries = load_itinerary_data(&td, &incs).expect("should parse");
+
+        // We expect ~278 itinerary classes
+        assert!(
+            itineraries.len() >= 100,
+            "expected >= 100 itinerary classes, got {}",
+            itineraries.len(),
+        );
+
+        // Spot-check: II_ADD should exist with reasonable latency
+        if let Some(ii_add) = itineraries.get("II_ADD") {
+            assert!(ii_add.total_latency > 0, "II_ADD should have non-zero latency");
+            assert!(!ii_add.stages.is_empty(), "II_ADD should have pipeline stages");
+        }
+    }
+
+    #[test]
+    fn test_load_register_model() {
+        let td = td_file();
+        if !td.exists() {
+            eprintln!("Skipping: llvm-aie not found at {:?}", td);
+            return;
+        }
+        let inc_paths = include_paths();
+        let incs: Vec<&Path> = inc_paths.iter().map(|p| p.as_path()).collect();
+        let model = load_register_model(&td, &incs).expect("should parse");
+
+        // We expect ~50 registers
+        assert!(
+            model.registers.len() >= 20,
+            "expected >= 20 registers, got {}",
+            model.registers.len(),
+        );
+
+        // We expect ~30 register classes
+        assert!(
+            model.classes.len() >= 10,
+            "expected >= 10 register classes, got {}",
+            model.classes.len(),
+        );
+
+        // Spot-check: r0 should exist
+        assert!(
+            model.registers.contains_key("r0"),
+            "r0 should be in register model",
+        );
+
+        // Spot-check: eR class should exist with members
+        if let Some(er_class) = model.classes.get("eR") {
+            assert!(
+                !er_class.members.is_empty(),
+                "eR class should have members",
+            );
+        }
     }
 }

@@ -265,11 +265,14 @@ pub fn load_full_via_tblgen(llvm_aie_path: impl AsRef<Path>) -> Result<types::Tb
     parse_tblgen_output(&records_text, &disasm_text, llvm_aie)
 }
 
-/// Run both llvm-tblgen subprocesses and return raw stdout text.
+/// Run llvm-tblgen subprocesses and return raw stdout text.
 ///
-/// Spawns `--print-records` and `-gen-disassembler` concurrently. The records
-/// output is required (errors are propagated); the disassembler output is
-/// best-effort (failures produce an empty string, logged as warnings).
+/// With `native-tblgen` enabled, only `-gen-disassembler` is needed (all other
+/// data is extracted in-process via the tblgen crate). Without it, both
+/// `--print-records` and `-gen-disassembler` are spawned concurrently.
+///
+/// The disassembler output is always best-effort (failures produce an empty
+/// string, logged as warnings).
 fn run_tblgen_subprocesses(
     tblgen_path: &Path,
     base: &Path,
@@ -291,23 +294,34 @@ fn run_tblgen_subprocesses(
         .stderr(std::process::Stdio::piped())
         .spawn();
 
-    // Run --print-records synchronously
-    let records_output = Command::new(tblgen_path)
-        .arg("--print-records")
-        .args(&tblgen_args)
-        .current_dir(base)
-        .env_remove("LD_LIBRARY_PATH")
-        .output()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other,
-            format!("Failed to run llvm-tblgen at {}: {}", tblgen_path.display(), e)))?;
+    // With native-tblgen, --print-records is not needed -- all data is
+    // extracted in-process. Skip the subprocess to save ~5s of startup time.
+    #[cfg(feature = "native-tblgen")]
+    let records_text = {
+        log::info!("Native TableGen enabled: skipping --print-records subprocess");
+        String::new()
+    };
 
-    if !records_output.status.success() {
-        let stderr = String::from_utf8_lossy(&records_output.stderr);
-        return Err(std::io::Error::new(std::io::ErrorKind::Other,
-            format!("llvm-tblgen --print-records failed: {}", stderr)));
-    }
+    #[cfg(not(feature = "native-tblgen"))]
+    let records_text = {
+        // Run --print-records synchronously
+        let records_output = Command::new(tblgen_path)
+            .arg("--print-records")
+            .args(&tblgen_args)
+            .current_dir(base)
+            .env_remove("LD_LIBRARY_PATH")
+            .output()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other,
+                format!("Failed to run llvm-tblgen at {}: {}", tblgen_path.display(), e)))?;
 
-    let records_text = String::from_utf8_lossy(&records_output.stdout).into_owned();
+        if !records_output.status.success() {
+            let stderr = String::from_utf8_lossy(&records_output.stderr);
+            return Err(std::io::Error::new(std::io::ErrorKind::Other,
+                format!("llvm-tblgen --print-records failed: {}", stderr)));
+        }
+
+        String::from_utf8_lossy(&records_output.stdout).into_owned()
+    };
 
     // Collect the -gen-disassembler output (best-effort)
     let disasm_text = match disasm_child {
@@ -381,6 +395,23 @@ fn parse_tblgen_output(
     // Apply Pat<>-derived semantics from fully resolved pattern records.
     // These override structural inference because they carry more specific
     // semantic information (e.g., ADD->Add, SELEQZ->Select, ACQ->LockAcquire).
+    #[cfg(feature = "native-tblgen")]
+    let pattern_map = {
+        let td_file = llvm_aie_path.join("llvm/lib/Target/AIE/AIE2.td");
+        let inc_paths = vec![
+            llvm_aie_path.join("llvm/include"),
+            llvm_aie_path.join("llvm/lib/Target/AIE"),
+        ];
+        let incs: Vec<&std::path::Path> = inc_paths.iter().map(|p| p.as_path()).collect();
+        match native::load_pattern_records(&td_file, &incs) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("Native pattern extraction failed, falling back: {}", e);
+                tblgen_records::parse_pattern_records(records_text)
+            }
+        }
+    };
+    #[cfg(not(feature = "native-tblgen"))]
     let pattern_map = tblgen_records::parse_pattern_records(records_text);
     let mut pattern_upgraded = 0usize;
     for encodings in by_slot.values_mut() {
@@ -406,6 +437,23 @@ fn parse_tblgen_output(
     //
     // Build a reverse map: for each pseudo that has a known semantic (from
     // pattern_map), propagate that semantic to all its concrete alternatives.
+    #[cfg(feature = "native-tblgen")]
+    let pseudo_map = {
+        let td_file = llvm_aie_path.join("llvm/lib/Target/AIE/AIE2.td");
+        let inc_paths = vec![
+            llvm_aie_path.join("llvm/include"),
+            llvm_aie_path.join("llvm/lib/Target/AIE"),
+        ];
+        let incs: Vec<&std::path::Path> = inc_paths.iter().map(|p| p.as_path()).collect();
+        match native::load_pseudo_expansion_map(&td_file, &incs) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("Native pseudo expansion failed, falling back: {}", e);
+                tblgen_records::parse_pseudo_expansion_map(records_text)
+            }
+        }
+    };
+    #[cfg(not(feature = "native-tblgen"))]
     let pseudo_map = tblgen_records::parse_pseudo_expansion_map(records_text);
     let mut pseudo_propagated = 0usize;
     // Build concrete_name -> semantic from pseudo expansions
@@ -559,8 +607,43 @@ fn parse_tblgen_output(
     }
 
     // Parse extended data
+    #[cfg(feature = "native-tblgen")]
+    let (processor_model, itineraries, register_model) = {
+        let td_file = llvm_aie_path.join("llvm/lib/Target/AIE/AIE2.td");
+        let inc_paths = vec![
+            llvm_aie_path.join("llvm/include"),
+            llvm_aie_path.join("llvm/lib/Target/AIE"),
+        ];
+        let incs: Vec<&std::path::Path> = inc_paths.iter().map(|p| p.as_path()).collect();
+
+        let pm = match native::load_processor_model(&td_file, &incs) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("Native processor model failed, falling back: {}", e);
+                tblgen_records::parse_processor_model(records_text)
+            }
+        };
+        let it = match native::load_itinerary_data(&td_file, &incs) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("Native itinerary data failed, falling back: {}", e);
+                tblgen_records::parse_itinerary_data(records_text)
+            }
+        };
+        let rm = match native::load_register_model(&td_file, &incs) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("Native register model failed, falling back: {}", e);
+                tblgen_records::parse_register_model(records_text)
+            }
+        };
+        (pm, it, rm)
+    };
+    #[cfg(not(feature = "native-tblgen"))]
     let processor_model = tblgen_records::parse_processor_model(records_text);
+    #[cfg(not(feature = "native-tblgen"))]
     let itineraries = tblgen_records::parse_itinerary_data(records_text);
+    #[cfg(not(feature = "native-tblgen"))]
     let register_model = tblgen_records::parse_register_model(records_text);
 
     // Composite formats -- native path gets fully resolved slot maps,
