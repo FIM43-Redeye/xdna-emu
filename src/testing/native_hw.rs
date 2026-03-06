@@ -36,6 +36,34 @@ use std::time::Instant;
 use super::npu_runner;
 use super::process_control::{self, ProcessOutcome};
 
+/// Structured outcome of a hardware test execution.
+///
+/// Separates semantics (what happened) from display (how to show it).
+/// All branching on test outcome should use this enum, not string parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HwOutcome {
+    /// Test executed and produced correct results.
+    Pass,
+    /// Test executed but produced wrong results.
+    Fail,
+    /// Test execution failed (timeout, crash, unknown error).
+    Error,
+    /// Device entered D-state (survived SIGKILL). Unrecoverable.
+    Wedged,
+}
+
+/// Result from running a single test on real NPU hardware.
+pub struct HwRunResult {
+    /// Structured outcome for branching (pass/fail/error/wedged).
+    pub outcome: HwOutcome,
+    /// Display label (e.g. "PASS (64/64)", "FAIL (3/8)", "ERROR (...)").
+    pub label: String,
+    /// Raw output bytes from the NPU (empty on execution error).
+    pub output: Vec<u8>,
+    /// Wall-clock time in seconds.
+    pub elapsed_secs: f64,
+}
+
 /// Check if an exit code indicates death by signal (negative on Unix).
 fn is_signal_death(exit_code: Option<i32>) -> bool {
     // On Unix, processes killed by signal have exit code = 128 + signum
@@ -522,8 +550,7 @@ pub fn run_native_and_print(
     pattern: TestCppPattern,
     prefix: &str,
     compact: bool,
-) -> super::runner_stats::HwRunResult {
-    use super::runner_stats::{HwOutcome, HwRunResult};
+) -> HwRunResult {
 
     let result = run_native_test(test_exe, xclbin, insts, pattern, DEFAULT_HW_TIMEOUT_SECS);
 

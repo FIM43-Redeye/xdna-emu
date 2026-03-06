@@ -19,7 +19,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::aietools::AieTools;
 use super::bridge;
 use crate::config::Config;
 use crate::testing::artifacts;
@@ -1335,47 +1334,6 @@ fn rewrite_xchesscc_to_peano(cmd: &str, clang: &Path) -> String {
     result.join(" ")
 }
 
-/// Required environment variables for Chess builds (legacy check).
-const REQUIRED_ENV: &[(&str, &str)] = &[
-    ("PEANO_INSTALL_DIR", "Peano compiler (needed by mlir-aie build system)"),
-    ("XILINX_VITIS_AIETOOLS", "AMD aietools installation"),
-];
-
-/// Check that all required environment variables are set for Chess builds.
-///
-/// Returns a list of (var_name, description) pairs for missing variables.
-pub fn check_environment() -> Vec<(&'static str, &'static str)> {
-    REQUIRED_ENV
-        .iter()
-        .filter(|(var, _)| std::env::var(var).is_err())
-        .copied()
-        .collect()
-}
-
-/// Build a test with Chess, producing a xclbin alongside the Peano version.
-///
-/// This is a convenience wrapper around `BuildEnv::build()` for callers
-/// that already have an `AieTools` reference and want the legacy signature.
-///
-/// For new code, prefer using `BuildEnv::discover()` + `BuildEnv::build()`
-/// directly.
-pub fn build_with_chess(
-    _tools: &AieTools,
-    build_env: &BuildEnv,
-    mlir_source: &Path,
-    output_dir: &Path,
-    device: &str,
-    gen_sim: bool,
-) -> Result<BuildResult, String> {
-    build_env.build(mlir_source, output_dir, &BuildOpts {
-        use_chess: true,
-        gen_sim,
-        device: device.to_string(),
-        nice: None,
-        force_rebuild: false,
-    })
-}
-
 /// Find ALL xclbin files in a directory, each paired with its insts file.
 ///
 /// For multi-xclbin tests (like matrix_multiplication_using_cascade), the
@@ -1454,17 +1412,6 @@ fn extract_flag_value(cmd: &str, flag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_check_environment_reports_missing() {
-        // This test will report missing vars if the env isn't set up,
-        // which is the expected behavior in a CI/test environment.
-        let missing = check_environment();
-        for (var, desc) in &missing {
-            assert!(!var.is_empty());
-            assert!(!desc.is_empty());
-        }
-    }
 
     // Basic artifact helper tests moved to testing::artifacts module.
     // These remain as integration-level checks that the imports work.

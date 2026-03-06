@@ -21,7 +21,6 @@ pub mod hardware_comparison;
 pub mod unit_test;
 pub mod npu_test;
 pub mod test_cpp_parser;
-pub mod runner_stats;
 pub mod native_hw;
 pub mod process_control;
 pub mod host_defines;
