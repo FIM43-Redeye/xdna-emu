@@ -1,7 +1,6 @@
 //! Parallel build orchestrator with ncurses-style grid display.
 //!
-//! **Status: integrated into `npu-test` (default emu+hw mode).**
-//! Called from `emu_runner::run()` for parallel test builds.
+//! Parallel build orchestrator used by the test compilation pipeline.
 //!
 //! Replaces the sequential `batch_build_primary()` and `batch_build_chess_comparison()`
 //! with a parallel build system that shows progress as a compact, color-coded grid

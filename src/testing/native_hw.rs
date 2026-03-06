@@ -506,7 +506,7 @@ pub fn parse_test_output(stdout: &str) -> (bool, usize, usize) {
     (passed, total, correct)
 }
 
-use super::runner_config::DEFAULT_HW_TIMEOUT_SECS;
+use super::DEFAULT_HW_TIMEOUT_SECS;
 
 /// Run a native test on hardware and produce an HwRunResult for display.
 ///

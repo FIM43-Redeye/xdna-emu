@@ -13,8 +13,29 @@ use std::time::Instant;
 use crate::fuzzer::gen;
 use crate::fuzzer::lower_cpp;
 use crate::fuzzer::params::{FuzzParams, ScalarType};
-use crate::testing::runner_config::Options;
 use crate::testing::xclbin_suite::{XclbinSuite, XclbinTest};
+
+/// Options for the fuzz runner.
+///
+/// Previously lived in `runner_config::Options` as part of the npu-test
+/// binary's monolithic config. Extracted here since the fuzzer will be
+/// invoked through the bridge test infrastructure going forward.
+pub struct FuzzOptions {
+    pub verbose: bool,
+    pub jobs: usize,
+    /// Run on real NPU hardware in addition to emulator.
+    pub hw: bool,
+    /// Maximum emulator cycles before timeout.
+    pub max_cycles: u64,
+    /// Number of fuzz iterations to run.
+    pub fuzz_iterations: usize,
+    /// Base seed for fuzz generation (None = use wall clock).
+    pub fuzz_seed: Option<u64>,
+    /// Run trace event group sweep (multi-group trace capture + comparison).
+    pub trace_sweep: bool,
+    /// Number of NPU repetitions for trace determinism check (default 5).
+    pub trace_sweep_reps: usize,
+}
 
 /// Paths to external tools needed for compilation.
 struct ToolPaths {
@@ -104,7 +125,7 @@ struct CompiledCase {
 }
 
 /// Run the fuzz loop: batch-compile, then run on emulator + NPU and compare.
-pub fn run_fuzz(opts: &Options) {
+pub fn run_fuzz(opts: &FuzzOptions) {
     let iterations = opts.fuzz_iterations;
     let base_seed = opts.fuzz_seed.unwrap_or_else(|| {
         std::time::SystemTime::now()
@@ -540,7 +561,7 @@ fn execute_emulator_only(
 /// 3. Run emulator once per event group, collecting traces.
 /// 4. Decode and compare NPU vs emulator event sequences per group.
 /// 5. Write per-seed results to `trace_sweep/` subdirectory.
-fn execute_trace_sweep(cases: &[CompiledCase], opts: &Options) {
+fn execute_trace_sweep(cases: &[CompiledCase], opts: &FuzzOptions) {
     use crate::fuzzer::trace_sweep::{
         TRACE_EVENT_GROUPS, NUM_GROUPS, check_determinism, compare_event_sequences,
         compare_canonical, decode_binary_trace, write_sweep_summary,
@@ -1051,40 +1072,13 @@ mod tests {
     #[test]
     fn test_run_fuzz_zero_iterations() {
         // Zero iterations should complete without error.
-        let opts = crate::testing::runner_config::Options {
-            mode: crate::testing::runner_config::RunMode::Fuzz,
+        let opts = FuzzOptions {
             verbose: false,
             jobs: 1,
-            filters: vec![],
-            chess_only: false,
-            elfanalyze: false,
-            chess_build: false,
-            chess_emulator: false,
-            chess_hardware: false,
             hw: false,
-            aiesim: false,
-            build_nice: 19,
             max_cycles: 100_000,
-            unit_tests: false,
-            unit_tests_aiesim: false,
-            unit_tests_aiesim_timeout: 0,
-            no_build: false,
-            hw_only: false,
-            examples: false,
-            rebuild: false,
-            timeout_secs: None,
-            build_dir: None,
-            max_failures: None,
-            lit_args: vec![],
-            watchdog_secs: 3600,
-            trace_size: 0,
-            aiesim_trace: false,
-            list_only: false,
-            output_path: std::path::PathBuf::from("/dev/null"),
-            format_json: false,
             fuzz_iterations: 0,
             fuzz_seed: Some(1),
-            full_sweep: false,
             trace_sweep: false,
             trace_sweep_reps: 5,
         };

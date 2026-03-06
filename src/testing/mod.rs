@@ -21,20 +21,17 @@ pub mod hardware_comparison;
 pub mod unit_test;
 pub mod npu_test;
 pub mod test_cpp_parser;
-pub mod runner_config;
 pub mod runner_stats;
-pub mod hw_executor;
-pub mod runner_display;
-pub mod host_defines;
 pub mod native_hw;
 pub mod process_control;
-pub mod lit_wrapper;
-pub mod lit_progress;
-pub mod lit_trace;
-pub mod trace_compare;
-pub mod emu_runner;
+pub mod host_defines;
 pub mod quiescence;
-pub mod ground_truth;
+
+/// Default maximum emulator cycles before timeout.
+pub const DEFAULT_MAX_CYCLES: u64 = 1_000_000;
+
+/// Default hardware execution timeout in seconds.
+pub const DEFAULT_HW_TIMEOUT_SECS: u32 = 30;
 
 pub use xclbin_suite::{XclbinSuite, XclbinTest, TestOutcome, Compiler};
 pub use opcode_collector::{UnknownOpcode, OpcodeCollector};

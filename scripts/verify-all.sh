@@ -110,17 +110,14 @@ else
     warn "Some integration tests failed (check if binaries are built)"
 fi
 
-# Step 4: Full binary suite
-section "Step 4: Full Binary Suite"
+# Step 4: Bridge test suite
+section "Step 4: Bridge Test Suite"
 
-if cargo build --bin npu-test 2>/dev/null; then
-    if cargo run --release --bin npu-test 2>&1; then
-        pass "Binary suite completed"
-    else
-        warn "Binary suite had failures (check output above)"
-    fi
+if [ -x scripts/emu-bridge-test.sh ]; then
+    info "Run bridge tests manually: ./scripts/emu-bridge-test.sh"
+    info "(Requires XRT, NPU hardware, and driver plugin installed)"
 else
-    info "npu-test binary not available, skipping"
+    info "Bridge test script not found, skipping"
 fi
 
 # Step 5: Hardware cross-validation (conditional on NPU availability)

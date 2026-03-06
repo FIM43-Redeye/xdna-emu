@@ -382,7 +382,7 @@ impl XclbinSuite {
         Self {
             tests: Vec::new(),
             collector: OpcodeCollector::new(),
-            max_cycles: super::runner_config::DEFAULT_MAX_CYCLES,
+            max_cycles: super::DEFAULT_MAX_CYCLES,
             results: Vec::new(),
             reference_dir: None,
             npu_output_dir: None,

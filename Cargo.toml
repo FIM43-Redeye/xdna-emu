@@ -53,15 +53,6 @@ env_logger = "0.11"
 
 [features]
 default = []
-# Enable integration tests that require built mlir-aie test binaries (xclbin files).
-# Build binaries first: ./scripts/build-mlir-aie-tests.sh
-# Run tests: cargo test --features xclbin-tests
-xclbin-tests = []
-# Enable hardware cross-validation tests (emulator vs real NPU).
-# Requires: built test binaries + captured NPU outputs in tests/npu-outputs/
-# Capture first: cargo run --example capture_npu_outputs
-# Run tests: cargo test --features hardware-compare
-hardware-compare = []
 
 [build-dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -69,10 +60,6 @@ serde_json = "1"
 
 [dev-dependencies]
 hex = "0.4"                                             # Hex dump utilities for debugging
-
-[[bin]]
-name = "npu-test"
-path = "src/bin/npu_test.rs"
 
 [[bin]]
 name = "trace-compare"
