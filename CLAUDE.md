@@ -489,6 +489,18 @@ which delegates to the Rust emulator via FFI (`src/ffi/`).
 3. Run `cargo test --lib` to verify everything works
 4. Read the component doc (`.claude/components/`) for the module you are working on
 
+## Feature Implementation Policy
+
+**Finish what you start.** When implementing an isolated subsystem (control
+packets, DMA padding, cascade flows, etc.), build it to 100% coverage before
+moving on. A half-implemented feature is worse than an unimplemented one --
+it creates false confidence and makes debugging harder because you can never
+be sure whether a failure is "the feature isn't done yet" or a real bug.
+
+This means: all test cases for the feature pass, edge cases are handled, and
+the implementation matches hardware behavior across the full test matrix
+(both compilers, both HW and EMU). Only then move to the next feature.
+
 ## Debugging Guidelines
 
 **Match real hardware behavior.** When debugging emulator issues, the goal is
