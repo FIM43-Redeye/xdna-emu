@@ -2,7 +2,7 @@
 
 **Goal**: Build an open-source community.
 
-**Status**: 🔴 Not Started
+**Status**: Not Started
 
 ---
 
@@ -20,10 +20,10 @@ A healthy open-source project needs:
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Clear contribution guidelines | 🔲 TODO | |
-| Code of conduct | 🔲 TODO | |
-| Issue/PR templates | 🔲 TODO | |
-| Good first issues labeled | 🔲 TODO | |
+| Clear contribution guidelines | TODO | |
+| Code of conduct | TODO | |
+| Issue/PR templates | TODO | |
+| Good first issues labeled | TODO | |
 
 ---
 
@@ -31,10 +31,10 @@ A healthy open-source project needs:
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Discord/Matrix for discussion | 🔲 TODO | |
-| Regular releases with changelogs | 🔲 TODO | |
-| Blog posts / tutorials | 🔲 TODO | |
-| Conference talks | 🔲 TODO | |
+| Discord/Matrix for discussion | TODO | |
+| Regular releases with changelogs | TODO | |
+| Blog posts / tutorials | TODO | |
+| Conference talks | TODO | |
 
 ---
 
@@ -42,16 +42,16 @@ A healthy open-source project needs:
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Package for major distros | 🔲 TODO | |
-| Homebrew formula | 🔲 TODO | |
-| Nix package | 🔲 TODO | |
-| Docker image | 🔲 TODO | |
+| Package for major distros | TODO | |
+| Homebrew formula | TODO | |
+| Nix package | TODO | |
+| Docker image | TODO | |
 
 ---
 
 ## Current State
 
-- Licensed under Unlicense (public domain)
+- Licensed under X11 License (MIT variant with advertising clause)
 - Repository: (to be published)
 - No releases yet
 

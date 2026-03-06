@@ -2,11 +2,11 @@
 
 **Goal**: Plug into existing AMD XDNA development flows.
 
-**Status**: Not Started
+**Status**: Partial -- XRT plugin works, bridge tests run, direct compilation not integrated
 
-**Compiler strategy**: Peano (open-source LLVM-based) is the primary and only
-supported compiler for xdna-emu workflows. Vitis/xchesscc compatibility is
-deferred to post-1.0 as an optional target.
+**Compiler strategy**: Both Peano (open-source LLVM-based) and Chess (AMD
+proprietary, from aietools) are supported for test compilation via the bridge
+test suite. Direct invocation from the emulator is not yet implemented.
 
 ---
 
@@ -60,10 +60,11 @@ still work if they use standard formats, but explicit support is not a priority.
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Link against XRT libraries | TODO | |
-| `xrt::device` emulation backend | TODO | |
-| Run same host code against emulator or hardware | TODO | |
-| Result comparison mode | TODO | |
+| XRT driver plugin (`xrt-plugin/`) | VERIFIED | Replaces kernel driver, delegates to Rust emulator via FFI |
+| Run same host code against emulator or hardware | VERIFIED | Set `XDNA_EMU=1` to use emulator backend |
+| Bridge test suite (`emu-bridge-test.sh`) | VERIFIED | Dual-compiler, HW comparison, trace sweep |
+| Result comparison mode | VERIFIED | Bridge tests compare EMU vs HW output buffers |
+| Device auto-detection from xclbin | TODO | |
 
 ---
 

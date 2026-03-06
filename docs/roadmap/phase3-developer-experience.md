@@ -2,7 +2,7 @@
 
 **Goal**: Make debugging and profiling excellent.
 
-**Status**: 🟡 GUI Exists (needs debugging features)
+**Status**: GUI exists (needs debugging features, disconnected from live emulator state)
 
 ---
 
@@ -20,11 +20,11 @@ The visual debugger should provide:
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Breakpoints (PC, memory access, lock) | 🔲 TODO | |
-| Watchpoints (memory write triggers) | 🔲 TODO | |
-| Step into/over/out | 🔲 TODO | |
-| Call stack visualization | 🔲 TODO | |
-| Register inspection with symbolic names | 🔲 TODO | |
+| Breakpoints (PC, memory access, lock) | TODO | |
+| Watchpoints (memory write triggers) | TODO | |
+| Step into/over/out | TODO | |
+| Call stack visualization | TODO | |
+| Register inspection with symbolic names | TODO | |
 
 ---
 
@@ -32,11 +32,11 @@ The visual debugger should provide:
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Cycle counts per function | 🔲 TODO | |
-| IPC (instructions per cycle) analysis | 🔲 TODO | |
-| Stall analysis (memory, lock, DMA) | 🔲 TODO | |
-| Hot path identification | 🔲 TODO | |
-| Vector utilization metrics | 🔲 TODO | |
+| Cycle counts per function | TODO | |
+| IPC (instructions per cycle) analysis | TODO | |
+| Stall analysis (memory, lock, DMA) | TODO | |
+| Hot path identification | TODO | |
+| Vector utilization metrics | TODO | |
 
 ---
 
@@ -44,11 +44,11 @@ The visual debugger should provide:
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Execution timeline (all cores) | 🔲 TODO | |
-| DMA transfer visualization | 🔲 TODO | |
-| Lock contention graph | 🔲 TODO | |
-| Memory access heatmap | 🔲 TODO | |
-| Data flow animation | 🔲 TODO | |
+| Execution timeline (all cores) | TODO | |
+| DMA transfer visualization | TODO | |
+| Lock contention graph | TODO | |
+| Memory access heatmap | TODO | |
+| Data flow animation | TODO | |
 
 ---
 
@@ -56,10 +56,10 @@ The visual debugger should provide:
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Record execution trace | 🔲 TODO | |
-| Replay from trace file | 🔲 TODO | |
-| Compare traces (emulator vs hardware) | 🔲 TODO | |
-| Export to VCD/FST for waveform viewers | 🔲 TODO | |
+| Record execution trace | TODO | Emulator produces Perfetto JSON via --trace |
+| Replay from trace file | TODO | |
+| Compare traces (emulator vs hardware) | VERIFIED | Rust trace-compare binary and trace-sweep.py |
+| Export to VCD/FST for waveform viewers | TODO | |
 
 ---
 

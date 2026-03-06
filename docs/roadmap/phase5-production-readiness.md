@@ -2,7 +2,7 @@
 
 **Goal**: Polish for real-world use.
 
-**Status**: 🔴 Not Started
+**Status**: Not Started
 
 ---
 
@@ -20,10 +20,10 @@ Making xdna-emu production-ready means:
 
 | Task | Status | Notes |
 |------|--------|-------|
-| JIT-compiled simulation (optional) | 🔲 TODO | |
-| Parallel core execution | 🔲 TODO | |
-| Fast mode (skip cycle accuracy for speed) | 🔲 TODO | |
-| Incremental state updates | 🔲 TODO | |
+| JIT-compiled simulation (optional) | TODO | |
+| Parallel core execution | TODO | |
+| Fast mode (skip cycle accuracy for speed) | TODO | |
+| Incremental state updates | TODO | |
 
 ---
 
@@ -33,20 +33,20 @@ The project is designed to be generic from the start. We're building on **AIE2 (
 
 | Task | Status | Notes |
 |------|--------|-------|
-| NPU1 (Phoenix) - AIE2 | 🟡 Primary target | Current development focus |
-| NPU4 (Strix Point) - AIE2P | 🔲 TODO | Incremental from AIE2 |
-| NPU5 (Strix Halo) - AIE2P, larger array | 🔲 TODO | Same as NPU4, different array size |
-| NPU6 (Krackan) - AIE2P | 🔲 TODO | Same as NPU4 |
-| Device auto-detection from xclbin | 🔲 TODO | |
+| NPU1 (Phoenix) - AIE2 | Primary target | Current development focus |
+| NPU4 (Strix Point) - AIE2P | TODO | Incremental from AIE2 |
+| NPU5 (Strix Halo) - AIE2P, larger array | TODO | Same as NPU4, different array size |
+| NPU6 (Krackan) - AIE2P | TODO | Same as NPU4 |
+| Device auto-detection from xclbin | TODO | |
 
 ### Device Matrix
 
 | Device | Codename | Architecture | Array Size |
 |--------|----------|--------------|------------|
-| NPU1 | Phoenix/Hawk Point | AIE2 (XDNA) | 4 cols x 6 rows |
-| NPU4 | Strix Point | AIE2P (XDNA2) | 4 cols x 6 rows |
-| NPU5 | Strix Halo | AIE2P (XDNA2) | 8 cols x 6 rows |
-| NPU6 | Krackan | AIE2P (XDNA2) | 4 cols x 6 rows |
+| NPU1 | Phoenix/Hawk Point | AIE2 (XDNA) | 5 cols x 6 rows |
+| NPU4 | Strix Point | AIE2P (XDNA2) | 5 cols x 6 rows |
+| NPU5 | Strix Halo | AIE2P (XDNA2) | 8+ cols x 6 rows |
+| NPU6 | Krackan | AIE2P (XDNA2) | 5 cols x 6 rows |
 
 **Note**: Driver IDs NPU2/NPU3 are prototypes marked for deprecation -- not consumer devices.
 Array sizes include the shim tile row (row 0).
@@ -64,10 +64,10 @@ AIE2 and AIE2P share most of the architecture. Key differences are isolated:
 
 | Task | Status | Notes |
 |------|--------|-------|
-| C API for integration | 🔲 TODO | |
-| Python bindings | 🔲 TODO | |
-| Plugin system for custom analysis | 🔲 TODO | |
-| Scripting support (Lua or Python) | 🔲 TODO | |
+| C API for integration | Partial | C FFI exists for XRT plugin (src/ffi/, include/xdna_emu.h) |
+| Python bindings | TODO | |
+| Plugin system for custom analysis | TODO | |
+| Scripting support (Lua or Python) | TODO | |
 
 ---
 
@@ -75,10 +75,10 @@ AIE2 and AIE2P share most of the architecture. Key differences are isolated:
 
 | Task | Status | Notes |
 |------|--------|-------|
-| User guide | 🔲 TODO | |
-| API reference | 🔲 TODO | |
-| Architecture deep-dive | 🔲 TODO | |
-| Tutorial: debugging your first kernel | 🔲 TODO | |
+| User guide | TODO | |
+| API reference | TODO | |
+| Architecture deep-dive | Partial | CLAUDE.md and .claude/components/ docs exist |
+| Tutorial: debugging your first kernel | TODO | |
 
 ---
 
