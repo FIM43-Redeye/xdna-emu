@@ -991,7 +991,7 @@ pub struct Tile {
     /// Register store for shim tiles (NPU configuration registers).
     /// Shim tiles don't have data memory but need to store DMA/stream config.
     /// Stored as sparse map since most addresses won't be written.
-    registers: std::collections::HashMap<u32, u32>,
+    pub(crate) registers: std::collections::HashMap<u32, u32>,
 
     /// Control packet state machine for TileCtrl port.
     pub ctrl_pkt_state: ControlPacketState,

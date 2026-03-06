@@ -67,6 +67,14 @@ pub struct DeviceState {
     pub array: TileArray,
     /// Statistics from last CDO application
     pub stats: CdoStats,
+    /// Pending core enable/disable events from Core_Control register writes.
+    ///
+    /// When `write_core_register` or `mask_write_core_register` changes the
+    /// enable bit of Core_Control (offset 0x32000), it pushes (col, row, enabled)
+    /// here. The coordinator drains this each cycle to sync the engine's internal
+    /// core state, matching how real hardware immediately reacts to the register
+    /// write regardless of source (CDO, NPU instruction, or control packet).
+    pub(crate) pending_core_enables: Vec<(u8, u8, bool)>,
 }
 
 impl DeviceState {
@@ -75,6 +83,7 @@ impl DeviceState {
         Self {
             array: TileArray::new(arch),
             stats: CdoStats::default(),
+            pending_core_enables: Vec::new(),
         }
     }
 
@@ -217,24 +226,30 @@ impl DeviceState {
     fn write_register(&mut self, address: u32, value: u32) -> Result<()> {
         let tile_addr = TileAddress::decode(address);
 
-        // Get the tile
-        let tile = match self.array.get_mut(tile_addr.col, tile_addr.row) {
-            Some(t) => t,
-            None => return Ok(()), // Ignore writes to non-existent tiles
-        };
+        // Raw register storage -- single source of truth, always first.
+        // Must happen before module dispatch since handlers re-borrow self.
+        if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
+            tile.registers.insert(tile_addr.offset, value);
+        } else {
+            return Ok(());
+        }
 
         // Dispatch based on register module
         let reg_layout = super::regdb::device_reg_layout();
 
         match tile_addr.module() {
             RegisterModule::Locks => {
-                Self::write_lock_value(reg_layout, tile, tile_addr,
-                    reg_layout.memory_lock_base, reg_layout.memory_lock_stride, value, false);
+                if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
+                    Self::write_lock_value(reg_layout, tile, tile_addr,
+                        reg_layout.memory_lock_base, reg_layout.memory_lock_stride, value, false);
+                }
             }
 
             RegisterModule::MemTileLocks => {
-                Self::write_lock_value(reg_layout, tile, tile_addr,
-                    reg_layout.memtile_lock_base, reg_layout.memtile_lock_stride, value, true);
+                if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
+                    Self::write_lock_value(reg_layout, tile, tile_addr,
+                        reg_layout.memtile_lock_base, reg_layout.memtile_lock_stride, value, true);
+                }
             }
 
             RegisterModule::DmaBufferDescriptor => {
@@ -877,8 +892,14 @@ impl DeviceState {
 
         match offset {
             cm::CORE_CONTROL => {
+                let was_enabled = tile.core.enabled;
                 tile.core.control = value;
                 tile.core.enabled = value & 1 != 0;
+                if tile.core.enabled != was_enabled {
+                    log::info!("Core ({},{}) {}", col, row,
+                        if tile.core.enabled { "ENABLED" } else { "DISABLED" });
+                    self.pending_core_enables.push((col, row, tile.core.enabled));
+                }
             }
             cm::CORE_STATUS => {
                 tile.core.status = value;
@@ -907,8 +928,14 @@ impl DeviceState {
 
         match offset {
             cm::CORE_CONTROL => {
+                let was_enabled = tile.core.enabled;
                 tile.core.control = (tile.core.control & !mask) | (value & mask);
                 tile.core.enabled = tile.core.control & 1 != 0;
+                if tile.core.enabled != was_enabled {
+                    log::info!("Core ({},{}) {}", col, row,
+                        if tile.core.enabled { "ENABLED" } else { "DISABLED" });
+                    self.pending_core_enables.push((col, row, tile.core.enabled));
+                }
             }
             cm::CORE_STATUS => {
                 tile.core.status = (tile.core.status & !mask) | (value & mask);
