@@ -126,13 +126,12 @@ impl DeviceState {
     /// This is the emulator's equivalent of the hardware register bus: a
     /// single entry point for all register writes regardless of source (CDO,
     /// NPU instruction, control packet). It dispatches to module-specific
-    /// handlers (stream switch, DMA engine, locks, etc.) and then calls
-    /// `tile.write_register()` for tile-local state (raw register storage,
-    /// trace config, shim mux, cascade, event broadcast, etc.).
+    /// handlers (stream switch, DMA engine, locks, etc.) and then runs
+    /// tile-local side effects (trace config, shim mux, cascade, event
+    /// broadcast, etc.) via `apply_tile_local_effects()`.
     ///
-    /// All external callers should use this method rather than calling
-    /// `tile.write_register()` directly, to ensure stream switch config,
-    /// DMA engine integration, and other module handlers run.
+    /// All external callers should use this method to ensure stream switch
+    /// config, DMA engine integration, and other module handlers run.
     pub(crate) fn write_tile_register(&mut self, col: u8, row: u8, offset: u32, value: u32) {
         let address = TileAddress::encode(col, row, offset);
         if let Err(e) = self.write_register(address, value) {
@@ -303,15 +302,10 @@ impl DeviceState {
             }
         }
 
-        // Forward all writes to tile.write_register() for general handling:
-        // register HashMap storage, trace config, edge detection, event port
-        // selection, cascade config, event broadcast, and Event_Generate.
-        // The specialized handlers above extract structured data (BD fields,
-        // channel control, etc.); this ensures the tile-level handlers also
-        // run for every write.
-        if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
-            tile.write_register(tile_addr.offset, value);
-        }
+        // Tile-local register side effects: trace config, edge detection,
+        // event port selection, cascade config, shim mux, lock overflow/
+        // underflow clear, event broadcast, and Event_Generate.
+        self.apply_tile_local_effects(tile_addr.col, tile_addr.row, tile_addr.offset, value);
 
         // Propagate broadcast events to all tiles in the column.
         self.propagate_broadcasts(tile_addr.col, tile_addr.row);
@@ -327,39 +321,49 @@ impl DeviceState {
         log::trace!("mask_write_register: addr=0x{:08X} tile({},{}) offset=0x{:05X} module={:?}",
             address, tile_addr.col, tile_addr.row, tile_addr.offset, module);
 
-        // Get the tile
-        let tile = match self.array.get_mut(tile_addr.col, tile_addr.row) {
-            Some(t) => t,
-            None => {
-                log::trace!("mask_write_register: tile({},{}) not in array", tile_addr.col, tile_addr.row);
-                return Ok(());
-            }
-        };
+        if self.array.get_mut(tile_addr.col, tile_addr.row).is_none() {
+            log::trace!("mask_write_register: tile({},{}) not in array", tile_addr.col, tile_addr.row);
+            return Ok(());
+        }
 
-        // For most registers, we can just apply the masked value directly
-        // since we're initializing from zero state
         let reg_layout = super::regdb::device_reg_layout();
 
-        match module {
-            RegisterModule::Locks => {
-                // Lock offsets (0x1F000+) collide with Shim Mux/Demux Config
-                // (0x1F000/0x1F004). For shim tiles, route through write_register()
-                // so the Shim Mux parser fires. For other tiles, handle as lock write.
-                if tile.is_shim() {
-                    let current = *tile.registers_ref().get(&tile_addr.offset).unwrap_or(&0);
-                    let new_value = (current & !mask) | (value & mask);
-                    tile.write_register(tile_addr.offset, new_value);
-                } else {
-                    Self::mask_write_lock_value(reg_layout, tile, tile_addr.offset,
-                        reg_layout.memory_lock_base, reg_layout.memory_lock_stride, mask, value);
+        // Track whether we need to run tile-local effects after the match.
+        // Some arms do RMW and need the shim mux parser or other tile-local
+        // handlers to fire on the merged value.
+        let mut tile_local_value: Option<u32> = None;
+
+        // Scope the tile borrow so it ends before apply_tile_local_effects.
+        {
+            let tile = self.array.get_mut(tile_addr.col, tile_addr.row).unwrap();
+
+            match module {
+                RegisterModule::Locks => {
+                    // Lock offsets (0x1F000+) collide with Shim Mux/Demux Config
+                    // (0x1F000/0x1F004). For shim tiles, do RMW and run tile-local
+                    // effects (shim mux parser). For other tiles, handle as lock write.
+                    if tile.is_shim() {
+                        let current = *tile.registers_ref().get(&tile_addr.offset).unwrap_or(&0);
+                        let new_value = (current & !mask) | (value & mask);
+                        tile.registers.insert(tile_addr.offset, new_value);
+                        tile_local_value = Some(new_value);
+                    } else {
+                        Self::mask_write_lock_value(reg_layout, tile, tile_addr.offset,
+                            reg_layout.memory_lock_base, reg_layout.memory_lock_stride, mask, value);
+                    }
                 }
-            }
 
-            RegisterModule::MemTileLocks => {
-                Self::mask_write_lock_value(reg_layout, tile, tile_addr.offset,
-                    reg_layout.memtile_lock_base, reg_layout.memtile_lock_stride, mask, value);
-            }
+                RegisterModule::MemTileLocks => {
+                    Self::mask_write_lock_value(reg_layout, tile, tile_addr.offset,
+                        reg_layout.memtile_lock_base, reg_layout.memtile_lock_stride, mask, value);
+                }
 
+                _ => {}
+            }
+        }
+
+        // Arms that take &mut self must be outside the tile borrow scope.
+        match module {
             RegisterModule::DmaChannel => {
                 self.mask_write_dma_channel(tile_addr.col, tile_addr.row, tile_addr.offset, mask, value);
             }
@@ -372,6 +376,10 @@ impl DeviceState {
                 self.mask_write_core_register(tile_addr.col, tile_addr.row, tile_addr.offset, mask, value);
             }
 
+            RegisterModule::Locks | RegisterModule::MemTileLocks => {
+                // Already handled in the scoped block above.
+            }
+
             _ => {
                 // Shim DMA channels at 0x1D200 (see write_register for details).
                 let shim_ch_base = reg_layout.shim_channel_base;
@@ -382,20 +390,20 @@ impl DeviceState {
                     // Read-modify-write: preserve bits not covered by mask.
                     // Multiple MaskWrites to the same register (e.g., Shim Mux config at
                     // 0x1F000) must accumulate rather than clobber each other.
-                    if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
-                        let current = *tile.registers_ref().get(&tile_addr.offset).unwrap_or(&0);
-                        let new_value = (current & !mask) | (value & mask);
-                        log::debug!("CDO MaskWrite RMW: tile({},{}) offset=0x{:05X} current=0x{:08X} -> 0x{:08X} (mask=0x{:08X} val=0x{:08X})",
-                            tile_addr.col, tile_addr.row, tile_addr.offset, current, new_value, mask, value);
-                        tile.write_register(tile_addr.offset, new_value);
-                    } else {
-                        anyhow::bail!(
-                            "CDO MaskWrite: tile({},{}) not found for offset=0x{:05X} -- config targets missing tile",
-                            tile_addr.col, tile_addr.row, tile_addr.offset,
-                        );
-                    }
+                    let tile = self.array.get_mut(tile_addr.col, tile_addr.row).unwrap();
+                    let current = *tile.registers_ref().get(&tile_addr.offset).unwrap_or(&0);
+                    let new_value = (current & !mask) | (value & mask);
+                    log::debug!("CDO MaskWrite RMW: tile({},{}) offset=0x{:05X} current=0x{:08X} -> 0x{:08X} (mask=0x{:08X} val=0x{:08X})",
+                        tile_addr.col, tile_addr.row, tile_addr.offset, current, new_value, mask, value);
+                    tile.registers.insert(tile_addr.offset, new_value);
+                    tile_local_value = Some(new_value);
                 }
             }
+        }
+
+        // Run tile-local effects for arms that did RMW (shim mux, generic fallthrough).
+        if let Some(merged) = tile_local_value {
+            self.apply_tile_local_effects(tile_addr.col, tile_addr.row, tile_addr.offset, merged);
         }
 
         Ok(())
@@ -566,7 +574,7 @@ impl DeviceState {
                 // Words 6-7 (shim): store in the tile register map
                 w if w >= 6 => {
                     let reg_off = bd_base + (bd_idx as u32) * bd_stride + (w as u32) * 4;
-                    tile.write_register(reg_off, value);
+                    tile.registers.insert(reg_off, value);
                 }
                 _ => {}
             }
@@ -1067,7 +1075,7 @@ impl DeviceState {
                     let reg_off = reg_layout.memtile_bd_base
                         + (bd_idx as u32) * reg_layout.memtile_bd_stride
                         + (w as u32) * 4;
-                    tile.write_register(reg_off, value);
+                    tile.registers.insert(reg_off, value);
                 }
                 _ => {}
             }
@@ -1555,6 +1563,215 @@ impl DeviceState {
             Some(self.array.tile_mut(col as u8, row as u8))
         } else {
             None
+        }
+    }
+
+    /// Apply tile-local register side effects.
+    ///
+    /// Handles concerns that update tile-internal state without interacting
+    /// with cross-tile subsystems (DMA engine, stream switch routing):
+    /// cascade config, shim mux/demux, lock overflow/underflow clear, trace
+    /// registers, edge detection, event port selection, and event broadcast
+    /// with Event_Generate.
+    ///
+    /// Called from both `write_register()` and `mask_write_register()` after
+    /// structured module dispatch has run.
+    fn apply_tile_local_effects(&mut self, col: u8, row: u8, offset: u32, value: u32) {
+        let reg_layout = super::regdb::device_reg_layout();
+
+        let tile = match self.array.get_mut(col, row) {
+            Some(t) => t,
+            None => return,
+        };
+
+        // 1. Cascade config (compute tiles only).
+        // Offset 0x36060 per aie-rt xaie_core.c:993-1046.
+        //   Bit 0: cascade input direction (0=North, 1=West)
+        //   Bit 1: cascade output direction (0=South, 1=East)
+        if offset == 0x36060 && tile.is_compute() {
+            tile.cascade_input_dir = (value & 0x1) as u8;
+            tile.cascade_output_dir = ((value >> 1) & 0x1) as u8;
+            log::info!(
+                "Tile ({},{}) cascade config: input_dir={} output_dir={}",
+                col, row,
+                if tile.cascade_input_dir == 0 { "North" } else { "West" },
+                if tile.cascade_output_dir == 0 { "South" } else { "East" },
+            );
+        }
+
+        // 2. Shim mux/demux config (shim tiles only).
+        // Mux_Config: selects source for switchbox South slave ports.
+        // Demux_Config: selects destination for switchbox South master ports.
+        if tile.is_shim() {
+            if offset == reg_layout.shim_mux.mux_offset {
+                tile.parse_shim_mux_config(value);
+            } else if offset == reg_layout.shim_mux.demux_offset {
+                tile.parse_shim_demux_config(value);
+            }
+        }
+
+        // 3. Lock overflow/underflow status registers (write-to-clear).
+        // Writing 1 to a bit clears that lock's overflow/underflow status.
+        if tile.is_mem_tile() {
+            if offset == reg_layout.memtile_locks_overflow_0 {
+                tile.clear_lock_overflow_bits(0, 32, value);
+            } else if offset == reg_layout.memtile_locks_overflow_1 {
+                tile.clear_lock_overflow_bits(32, 64, value);
+            } else if offset == reg_layout.memtile_locks_underflow_0 {
+                tile.clear_lock_underflow_bits(0, 32, value);
+            } else if offset == reg_layout.memtile_locks_underflow_1 {
+                tile.clear_lock_underflow_bits(32, 64, value);
+            }
+        } else if tile.is_compute() {
+            if offset == reg_layout.memory_locks_overflow {
+                tile.clear_lock_overflow_bits(0, 16, value);
+            } else if offset == reg_layout.memory_locks_underflow {
+                tile.clear_lock_underflow_bits(0, 16, value);
+            }
+        }
+
+        // 4. Trace register routing.
+        //
+        // Core module trace registers (compute tiles):
+        //   0x340D0 (Control0), 0x340D4 (Control1), 0x340E0 (Event0), 0x340E4 (Event1)
+        // Memory module trace registers (compute tiles):
+        //   0x140D0..0x140E4
+        // MemTile trace registers:
+        //   0x940D0..0x940E4
+        // Shim (PL module) trace registers:
+        //   0x340D0..0x340E4 (same offset as core, uses core_trace)
+        if tile.is_compute() {
+            if offset >= 0x340D0 && offset <= 0x340E4 {
+                tile.core_trace.write_register(offset - 0x340D0, value);
+            }
+            if offset >= 0x140D0 && offset <= 0x140E4 {
+                tile.mem_trace.write_register(offset - 0x140D0, value);
+            }
+        } else if tile.is_mem_tile() {
+            if offset >= 0x940D0 && offset <= 0x940E4 {
+                tile.mem_trace.write_register(offset - 0x940D0, value);
+            }
+        } else if tile.is_shim() {
+            if offset >= 0x340D0 && offset <= 0x340E4 {
+                tile.core_trace.write_register(offset - 0x340D0, value);
+            }
+        }
+
+        // 5. Edge detection event control registers.
+        // Each module has one register with two independent edge detectors.
+        if tile.is_compute() {
+            if offset == 0x34408 {
+                Tile::configure_edge_detectors(&mut tile.core_edge_detectors, value, false);
+            }
+            if offset == 0x14408 {
+                Tile::configure_edge_detectors(&mut tile.mem_edge_detectors, value, false);
+            }
+        } else if tile.is_mem_tile() {
+            if offset == 0x94408 {
+                Tile::configure_edge_detectors(&mut tile.mem_edge_detectors, value, true);
+            }
+        } else if tile.is_shim() {
+            if offset == 0x34408 {
+                Tile::configure_edge_detectors(&mut tile.core_edge_detectors, value, false);
+            }
+        }
+
+        // 6. Event port selection registers.
+        // Configure which physical stream switch ports map to logical event
+        // ports 0-7 for PORT_RUNNING/IDLE/STALLED trace events.
+        let port_sel_base = match tile.tile_type {
+            TileType::Compute | TileType::Shim => Some((0x3FF00u32, 0x3FF04u32)),
+            TileType::MemTile => Some((0xB0F00, 0xB0F04)),
+        };
+        if let Some((reg0, reg1)) = port_sel_base {
+            if offset == reg0 || offset == reg1 {
+                let base_slot = if offset == reg0 { 0 } else { 4 };
+                for i in 0..4usize {
+                    let byte = ((value >> (i * 8)) & 0xFF) as u8;
+                    let port_idx = byte & 0x1F;
+                    let is_master = (byte & 0x20) != 0;
+                    tile.event_port_selection[base_slot + i] = Some((port_idx, is_master));
+                }
+                log::debug!(
+                    "Tile({},{}) event port sel @0x{:X}: {:?}",
+                    col, row, offset, &tile.event_port_selection[base_slot..base_slot+4]
+                );
+            }
+        }
+
+        // 7. Event broadcast channel registers and Event_Generate.
+        //
+        // Broadcast channels: 16 per module, each mapping a local event ID
+        // to a broadcast line. When Event_Generate fires an event matching
+        // a channel's value, BROADCAST_N (hw_id 107+N) is generated.
+        let bcast_base = match tile.tile_type {
+            TileType::Compute => {
+                if (0x34010..=0x3404C).contains(&offset) {
+                    Some(0x34010u32)
+                } else if (0x14010..=0x1404C).contains(&offset) {
+                    Some(0x14010)
+                } else {
+                    None
+                }
+            }
+            TileType::MemTile => {
+                if (0x94010..=0x9404C).contains(&offset) {
+                    Some(0x94010)
+                } else {
+                    None
+                }
+            }
+            TileType::Shim => {
+                if (0x34010..=0x3404C).contains(&offset) {
+                    Some(0x34010)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(base) = bcast_base {
+            let channel = ((offset - base) / 4) as usize;
+            if channel < 16 {
+                tile.broadcast_channels[channel] = (value & 0xFF) as u8;
+                log::debug!(
+                    "Tile({},{}) broadcast channel {} = event {}",
+                    col, row, channel, tile.broadcast_channels[channel]
+                );
+            }
+        }
+
+        // Event_Generate register.
+        // Writing fires the specified event on the module's event bus.
+        // If the event matches a configured broadcast channel, the
+        // corresponding BROADCAST_N event is queued for column propagation.
+        let is_event_generate = match tile.tile_type {
+            TileType::Compute => offset == 0x34008 || offset == 0x14008,
+            TileType::MemTile => offset == 0x94008,
+            TileType::Shim => offset == 0x34008,
+        };
+        if is_event_generate {
+            let event_id = (value & 0x7F) as u8;
+            log::info!(
+                "Tile({},{}) Event_Generate: event_id={} (offset=0x{:X})",
+                col, row, event_id, offset
+            );
+
+            // Fire the event directly on local trace units.
+            tile.core_trace.notify_event(event_id, 0);
+            tile.mem_trace.notify_event(event_id, 0);
+
+            // Check broadcast channel mapping: if the generated event matches
+            // any channel's configured value, generate BROADCAST_N.
+            for ch in 0..16u8 {
+                if tile.broadcast_channels[ch as usize] == event_id && event_id != 0 {
+                    let broadcast_hw_id = 107 + ch;
+                    log::info!(
+                        "Tile({},{}) Event_Generate: event {} -> BROADCAST_{} (hw_id={})",
+                        col, row, event_id, ch, broadcast_hw_id
+                    );
+                    tile.pending_broadcasts.push(broadcast_hw_id);
+                }
+            }
         }
     }
 

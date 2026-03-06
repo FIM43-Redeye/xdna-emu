@@ -1441,7 +1441,7 @@ impl Tile {
     /// Parses the Edge_Detection_event_control register value and updates
     /// the specified detector pair. `is_memtile` controls whether event
     /// fields are 7-bit (compute/shim) or 8-bit (MemTile).
-    fn configure_edge_detectors(detectors: &mut [EdgeDetector; 2], value: u32, is_memtile: bool) {
+    pub(crate) fn configure_edge_detectors(detectors: &mut [EdgeDetector; 2], value: u32, is_memtile: bool) {
         // Event 0: bits [6:0] or [7:0], rising=bit 9, falling=bit 10
         let event_mask_0: u32 = if is_memtile { 0xFF } else { 0x7F };
         detectors[0].input_event = (value & event_mask_0) as u8;
@@ -2103,7 +2103,7 @@ impl Tile {
     ///
     /// Field layout and port mappings are derived from the AM025 register database.
     /// Select values: 0=South/PL, 1=DMA, 2=NoC
-    fn parse_shim_mux_config(&mut self, value: u32) {
+    pub(crate) fn parse_shim_mux_config(&mut self, value: u32) {
         let mux = &super::regdb::device_reg_layout().shim_mux;
 
         // Reset mapping (register may be rewritten with different config)
@@ -2129,7 +2129,7 @@ impl Tile {
     ///
     /// Field layout and port mappings are derived from the AM025 register database.
     /// Select values: 0=South/PL, 1=DMA, 2=NoC
-    fn parse_shim_demux_config(&mut self, value: u32) {
+    pub(crate) fn parse_shim_demux_config(&mut self, value: u32) {
         let mux = &super::regdb::device_reg_layout().shim_mux;
 
         // Reset mapping
@@ -2421,7 +2421,7 @@ impl Tile {
     }
 
     /// Clear lock overflow bits for a range (write-to-clear behavior).
-    fn clear_lock_overflow_bits(&mut self, start: usize, end: usize, bits: u32) {
+    pub(crate) fn clear_lock_overflow_bits(&mut self, start: usize, end: usize, bits: u32) {
         for i in start..end.min(self.locks.len()) {
             if bits & (1 << (i - start)) != 0 {
                 self.locks[i].overflow = false;
@@ -2430,7 +2430,7 @@ impl Tile {
     }
 
     /// Clear lock underflow bits for a range (write-to-clear behavior).
-    fn clear_lock_underflow_bits(&mut self, start: usize, end: usize, bits: u32) {
+    pub(crate) fn clear_lock_underflow_bits(&mut self, start: usize, end: usize, bits: u32) {
         for i in start..end.min(self.locks.len()) {
             if bits & (1 << (i - start)) != 0 {
                 self.locks[i].underflow = false;
