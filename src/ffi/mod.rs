@@ -1668,4 +1668,171 @@ mod tests {
             assert!(msg.contains("out of bounds"), "error should mention bounds: {}", msg);
         }
     }
+
+    // =====================================================================
+    // FFI interface completeness -- parsed from the C++ transport source.
+    //
+    // This test reads `xrt-plugin/src/transport_inprocess.cpp` and extracts
+    // every symbol name passed to `resolve_required` or `resolve_optional`.
+    // It then reads our own source (`src/ffi/mod.rs`) and extracts every
+    // `#[no_mangle]` exported function name. The test asserts that every
+    // symbol the C++ side expects is present in our Rust exports.
+    //
+    // If someone adds a new FFI function to the C++ transport, this test
+    // fails until the corresponding Rust function is implemented.
+    // =====================================================================
+
+    /// Extract FFI symbol names from the C++ transport source.
+    /// Matches `resolve_required<...>("symbol_name")` and
+    /// `resolve_optional<...>("symbol_name")` patterns.
+    fn parse_cpp_expected_symbols(cpp_source: &str) -> Vec<(String, bool)> {
+        let mut symbols = Vec::new();
+        for line in cpp_source.lines() {
+            let trimmed = line.trim();
+            let required = trimmed.contains("resolve_required");
+            let optional = trimmed.contains("resolve_optional");
+            if !required && !optional {
+                continue;
+            }
+            // Extract the string literal: find the quoted symbol name.
+            if let Some(start) = trimmed.find('"') {
+                if let Some(end) = trimmed[start + 1..].find('"') {
+                    let name = &trimmed[start + 1..start + 1 + end];
+                    symbols.push((name.to_string(), required));
+                }
+            }
+        }
+        symbols
+    }
+
+    /// Extract `#[no_mangle]` exported function names from our Rust FFI source.
+    fn parse_rust_exported_symbols(rust_source: &str) -> Vec<String> {
+        let mut symbols = Vec::new();
+        let mut next_is_export = false;
+        for line in rust_source.lines() {
+            let trimmed = line.trim();
+            if trimmed == "#[no_mangle]" {
+                next_is_export = true;
+                continue;
+            }
+            if next_is_export {
+                next_is_export = false;
+                // Extract function name from lines like:
+                //   pub unsafe extern "C" fn xdna_emu_create(...
+                //   pub extern "C" fn xdna_emu_version() -> u32 {
+                if let Some(fn_pos) = trimmed.find("fn ") {
+                    let after_fn = &trimmed[fn_pos + 3..];
+                    let name_end = after_fn.find('(').unwrap_or(after_fn.len());
+                    let name = after_fn[..name_end].trim();
+                    if !name.is_empty() {
+                        symbols.push(name.to_string());
+                    }
+                }
+            }
+        }
+        symbols
+    }
+
+    #[test]
+    fn test_ffi_interface_completeness() {
+        use std::path::PathBuf;
+
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let cpp_path = manifest_dir.join("xrt-plugin/src/transport_inprocess.cpp");
+        let rust_path = manifest_dir.join("src/ffi/mod.rs");
+
+        let cpp_source = std::fs::read_to_string(&cpp_path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {}", cpp_path.display(), e));
+        let rust_source = std::fs::read_to_string(&rust_path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {}", rust_path.display(), e));
+
+        let expected = parse_cpp_expected_symbols(&cpp_source);
+        let exported = parse_rust_exported_symbols(&rust_source);
+
+        assert!(!expected.is_empty(), "parsed zero symbols from C++ source -- parser broken?");
+        assert!(!exported.is_empty(), "parsed zero symbols from Rust source -- parser broken?");
+
+        let mut missing_required = Vec::new();
+        let mut missing_optional = Vec::new();
+
+        for (sym, required) in &expected {
+            if !exported.iter().any(|e| e == sym) {
+                if *required {
+                    missing_required.push(sym.as_str());
+                } else {
+                    missing_optional.push(sym.as_str());
+                }
+            }
+        }
+
+        if !missing_required.is_empty() || !missing_optional.is_empty() {
+            let mut msg = String::new();
+            if !missing_required.is_empty() {
+                msg.push_str(&format!(
+                    "REQUIRED symbols missing from Rust FFI ({}):\n",
+                    missing_required.len()
+                ));
+                for sym in &missing_required {
+                    msg.push_str(&format!("  - {}\n", sym));
+                }
+            }
+            if !missing_optional.is_empty() {
+                msg.push_str(&format!(
+                    "OPTIONAL symbols missing from Rust FFI ({}):\n",
+                    missing_optional.len()
+                ));
+                for sym in &missing_optional {
+                    msg.push_str(&format!("  - {}\n", sym));
+                }
+            }
+            panic!(
+                "FFI interface incomplete!\n\n{}\n\
+                 C++ transport expects {} symbols, Rust exports {} symbols.\n\
+                 Add the missing functions to src/ffi/mod.rs.",
+                msg,
+                expected.len(),
+                exported.len()
+            );
+        }
+
+        // Informational: symbols we export but C++ doesn't consume.
+        let extra: Vec<&str> = exported
+            .iter()
+            .filter(|e| !expected.iter().any(|(s, _)| s == *e))
+            .map(|s| s.as_str())
+            .collect();
+        if !extra.is_empty() {
+            eprintln!(
+                "Note: {} Rust FFI symbols not consumed by C++ transport: {:?}",
+                extra.len(),
+                extra
+            );
+        }
+    }
+
+    #[test]
+    fn test_ffi_symbol_parser_helpers() {
+        // Verify the parsers work on representative input.
+        let cpp = r#"
+            sym_create_ = resolve_required<fn_create>("xdna_emu_create");
+            sym_version_ = resolve_required<fn_version>("xdna_emu_version");
+            sym_alloc_buffer_ = resolve_optional<fn_alloc_buffer>("xdna_emu_alloc_buffer");
+        "#;
+        let symbols = parse_cpp_expected_symbols(cpp);
+        assert_eq!(symbols.len(), 3);
+        assert_eq!(symbols[0], ("xdna_emu_create".to_string(), true));
+        assert_eq!(symbols[1], ("xdna_emu_version".to_string(), true));
+        assert_eq!(symbols[2], ("xdna_emu_alloc_buffer".to_string(), false));
+
+        let rust = r#"
+            #[no_mangle]
+            pub unsafe extern "C" fn xdna_emu_create() -> *mut XdnaEmuHandle {
+            #[no_mangle]
+            pub extern "C" fn xdna_emu_version() -> u32 {
+        "#;
+        let exports = parse_rust_exported_symbols(rust);
+        assert_eq!(exports.len(), 2);
+        assert_eq!(exports[0], "xdna_emu_create");
+        assert_eq!(exports[1], "xdna_emu_version");
+    }
 }
