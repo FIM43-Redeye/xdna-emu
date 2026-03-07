@@ -6,8 +6,9 @@
 //! base/stride) and all bit field layouts are now derived from the register
 //! database at runtime via [`super::regdb::device_reg_layout()`].
 //!
-//! Core module offsets, lock request constants, and data memory sizes are
-//! generated at build time by `build.rs` from the same AM025 JSON. See the
+//! Core module offsets and lock request constants are generated at build time
+//! by `build.rs` from the same AM025 JSON. Data memory sizes come from the
+//! `arch` module (generated from the validated ArchModel). See the
 //! `include!()` directives below.
 //!
 //! This module retains only constants with **no machine-readable source**:
@@ -139,9 +140,11 @@ pub const PROGRAM_MEMORY_END: u32 = 0x2FFFF;
 /// Data memory base offset
 pub const DATA_MEMORY_BASE: u32 = 0x00000;
 
-// Compute and mem tile data memory end offsets are generated from the device
-// model JSON at build time.
-include!(concat!(env!("OUT_DIR"), "/gen_data_memory.rs"));
+/// Data memory end offset for compute tile (derived from arch model).
+pub const COMPUTE_DATA_MEMORY_END: u32 = crate::arch::compute::MEMORY_SIZE as u32 - 1;
+
+/// Data memory end offset for memory tile (derived from arch model).
+pub const MEM_TILE_DATA_MEMORY_END: u32 = crate::arch::memtile::MEMORY_SIZE as u32 - 1;
 
 // ============================================================================
 // Helper Functions

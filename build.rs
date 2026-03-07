@@ -1,14 +1,14 @@
-//! Build-time code generation from AMD AM025 register database and device model.
+//! Build-time code generation from the NPU architecture graph.
 //!
-//! This build script reads the same JSON sources that the runtime `regdb.rs`
-//! uses, and generates Rust source files with `const` definitions that replace
-//! hand-transcribed register constants.
+//! This build script constructs the full ArchModel at compile time (device
+//! topology + AM025 register database, cross-validated via Confirmed<T>) and
+//! generates Rust source files with validated `const` definitions.
 //!
 //! Generated files (written to `$OUT_DIR/`):
+//! - `gen_arch.rs`          -- comprehensive architecture constants (included by `arch` module)
 //! - `gen_core_module.rs`   -- core register offsets (included by `registers_spec.rs`)
 //! - `gen_memory_lock.rs`   -- memory module lock constants (included by `registers_spec.rs`)
 //! - `gen_memtile_lock.rs`  -- mem tile lock constants (included by `registers_spec.rs`)
-//! - `gen_data_memory.rs`   -- data memory size constants (included by `registers_spec.rs`)
 //! - `gen_stream_ports.rs`  -- port type arrays (included by `aie2_spec.rs`)
 //! - `gen_stream_ranges.rs` -- port range constants (included by `aie2_spec.rs`)
 
@@ -78,19 +78,20 @@ fn main() {
         )
     });
 
-    // Load device model via the graph crate's extractor.
-    let device_models = xdna_graph::device_model::extract_device_models(&device_model_path)
-        .unwrap_or_else(|e| panic!("Failed to parse device model: {}", e));
+    // Build the full ArchModel (device topology + register data, cross-validated).
+    // This is the graph as compile-time truth: Confirmed<T> panics on conflicts.
+    let arch_model = xdna_graph::build_arch_model(&device_model_path, &regdb, "npu1")
+        .unwrap_or_else(|e| panic!("Failed to build ArchModel: {}", e));
 
     // Bridge script for trace events
     let bridge_path = manifest_dir.join("tools/mlir-aie-bridge.py");
     println!("cargo:rerun-if-changed={}", bridge_path.display());
 
     // Generate all files from the graph crate's parsed data.
+    gen_arch(&arch_model, &out_dir);
     gen_core_module(&regdb, &out_dir);
     gen_lock_request(&regdb, &out_dir, "memory", "gen_memory_lock.rs");
     gen_lock_request(&regdb, &out_dir, "memory_tile", "gen_memtile_lock.rs");
-    gen_data_memory(&device_models, &out_dir);
     let port_data = gen_stream_ports(&regdb, &out_dir);
     gen_stream_ranges(&regdb, &port_data, &out_dir);
     gen_trace_events(&bridge_path, &out_dir);
@@ -110,6 +111,82 @@ fn gen_header(source_desc: &str) -> String {
          // Do not edit manually.\n\n",
         source_desc
     )
+}
+
+// ============================================================================
+// Step 0: Comprehensive architecture constants from ArchModel
+// ============================================================================
+
+fn gen_arch(model: &xdna_graph::types::ArchModel, out_dir: &Path) {
+    use xdna_graph::types::TileKind;
+
+    let mut out = gen_header("ArchModel (device model + AM025, cross-validated)");
+
+    // Device-level constants
+    if let Some(ref dc) = model.device_constants {
+        writeln!(out, "/// Maximum lock counter value.").unwrap();
+        writeln!(out, "pub const MAX_LOCK_VALUE: i32 = {};", dc.max_lock_value).unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "/// Minimum lock counter value.").unwrap();
+        writeln!(out, "pub const MIN_LOCK_VALUE: i32 = {};", dc.min_lock_value).unwrap();
+        writeln!(out).unwrap();
+    }
+
+    // Array topology
+    if let Some(ref topo) = model.array_topology {
+        writeln!(out, "/// Number of columns in the NPU array.").unwrap();
+        writeln!(out, "pub const COLUMNS: u8 = {};", topo.columns).unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "/// Number of rows in the NPU array (including shim row).").unwrap();
+        writeln!(out, "pub const ROWS: u8 = {};", topo.rows).unwrap();
+        writeln!(out).unwrap();
+    }
+
+    // Per-tile-type modules
+    let tile_types: &[(&str, TileKind)] = &[
+        ("compute", TileKind::Compute),
+        ("memtile", TileKind::Mem),
+        ("shim", TileKind::ShimNoc),
+    ];
+
+    for &(mod_name, kind) in tile_types {
+        let tile = model.tile_types.iter().find(|t| t.kind == kind);
+        let tile = match tile {
+            Some(t) => t,
+            None => continue,
+        };
+
+        writeln!(out, "/// {} tile constants.", tile.name).unwrap();
+        writeln!(out, "pub mod {} {{", mod_name).unwrap();
+
+        // Memory model
+        if let Some(ref mem) = tile.memory {
+            writeln!(out, "    /// Total data memory size in bytes.").unwrap();
+            writeln!(out, "    pub const MEMORY_SIZE: u64 = {};", mem.size_bytes).unwrap();
+            writeln!(out, "    /// Number of memory banks.").unwrap();
+            writeln!(out, "    pub const MEMORY_BANKS: u8 = {};", mem.num_banks).unwrap();
+            writeln!(out, "    /// Size of each memory bank in bytes.").unwrap();
+            writeln!(out, "    pub const BANK_SIZE: u64 = {};", mem.bank_size_bytes).unwrap();
+            if let Some(pmem) = mem.program_memory_bytes {
+                writeln!(out, "    /// Program (instruction) memory size in bytes.").unwrap();
+                writeln!(out, "    pub const PROGRAM_MEMORY_SIZE: u64 = {};", pmem).unwrap();
+            }
+        }
+
+        // Resource counts (from Confirmed<T> -- cross-validated)
+        let inst = &tile.instances;
+        writeln!(out).unwrap();
+        writeln!(out, "    /// Number of locks (cross-validated).").unwrap();
+        writeln!(out, "    pub const NUM_LOCKS: u8 = {};", inst.locks.value()).unwrap();
+        writeln!(out, "    /// Number of buffer descriptors (cross-validated).").unwrap();
+        writeln!(out, "    pub const NUM_BDS: u8 = {};", inst.bds.value()).unwrap();
+        writeln!(out, "    /// Number of DMA channels per direction (cross-validated).").unwrap();
+        writeln!(out, "    pub const NUM_DMA_CHANNELS: u8 = {};", inst.channels.value()).unwrap();
+
+        writeln!(out, "}}\n").unwrap();
+    }
+
+    fs::write(out_dir.join("gen_arch.rs"), out).unwrap();
 }
 
 // ============================================================================
@@ -333,62 +410,7 @@ fn parse_desc_single_bit(desc: &str, field_name: &str, module_name: &str) -> u32
 }
 
 // ============================================================================
-// Step 3: Data memory sizes
-// ============================================================================
-
-fn gen_data_memory(
-    device_models: &std::collections::HashMap<String, xdna_graph::types::ArchModel>,
-    out_dir: &Path,
-) {
-    let npu1 = device_models
-        .get("npu1")
-        .expect("Device model missing 'npu1' device");
-
-    let core_mem = npu1.tile_types.iter()
-        .find(|t| t.name == "core")
-        .and_then(|t| t.memory.as_ref())
-        .expect("npu1 core tile missing memory model");
-    let memtile_mem = npu1.tile_types.iter()
-        .find(|t| t.name == "mem_tile")
-        .and_then(|t| t.memory.as_ref())
-        .expect("npu1 mem_tile missing memory model");
-
-    let compute_end = core_mem.size_bytes - 1;
-    let memtile_end = memtile_mem.size_bytes - 1;
-
-    let mut out = gen_header("device model (npu1) memory sizes");
-
-    writeln!(
-        out,
-        "/// Data memory end offset for compute tile ({} KB)",
-        core_mem.size_bytes / 1024
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "pub const COMPUTE_DATA_MEMORY_END: u32 = {:#07X};",
-        compute_end
-    )
-    .unwrap();
-    writeln!(out).unwrap();
-    writeln!(
-        out,
-        "/// Data memory end offset for memory tile ({} KB)",
-        memtile_mem.size_bytes / 1024
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "pub const MEM_TILE_DATA_MEMORY_END: u32 = {:#07X};",
-        memtile_end
-    )
-    .unwrap();
-
-    fs::write(out_dir.join("gen_data_memory.rs"), out).unwrap();
-}
-
-// ============================================================================
-// Step 4: Stream switch port type arrays
+// Step 3: Stream switch port type arrays
 // ============================================================================
 
 /// Collected port arrays for deriving ranges in Step 5.
