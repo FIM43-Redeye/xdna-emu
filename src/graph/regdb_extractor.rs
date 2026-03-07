@@ -80,8 +80,8 @@ pub fn classify_register(reg: &regdb::RegisterDef, is_grouped: bool) -> Register
 /// All fields are extracted from register properties -- nothing is hardcoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubsystemProfile {
-    /// Which subsystem this profile describes.
-    pub subsystem: &'static str,
+    /// Which subsystem this profile describes (e.g., "DMA", "Lock", "Event").
+    pub subsystem: String,
     /// Number of independent instances (derived from State register group count).
     /// e.g., 16 locks in memory module, 64 in memtile.
     pub instance_count: u32,
@@ -97,7 +97,7 @@ pub struct SubsystemProfile {
 /// registers in a module), groups them, classifies each, and derives
 /// behavioral properties.
 pub fn build_subsystem_profile(
-    subsystem: &'static str,
+    subsystem: &str,
     registers: &[regdb::RegisterDef],
 ) -> SubsystemProfile {
     let groups = group_registers(registers);
@@ -148,7 +148,7 @@ pub fn build_subsystem_profile(
         .unwrap_or(0);
 
     SubsystemProfile {
-        subsystem,
+        subsystem: subsystem.to_string(),
         instance_count,
         register_groups: classified_groups,
         singletons,
@@ -492,6 +492,89 @@ fn detect_dimensions_by_index_extraction(
     ])
 }
 
+// ============================================================================
+// Subsystem key extraction: identify which subsystem a register belongs to
+// ============================================================================
+
+/// AM025 naming convention aliases that map to canonical subsystem names.
+///
+/// These are structural properties of how AMD names registers in the
+/// AM025 register reference, not semantic assumptions about hardware.
+/// The convention is stable across architecture revisions (AIE2, AIE2P).
+const SUBSYSTEM_ALIASES: &[(&str, &str)] = &[
+    ("Locks", "Lock"),  // "Locks_Overflow" -> Lock subsystem
+    ("Combo", "Event"), // "Combo_event_inputs0" -> Event subsystem
+    ("Edge", "Event"),  // "Edge_Detection_event_0" -> Event subsystem
+];
+
+/// Extract the subsystem identity from a register name.
+///
+/// Uses the AM025 naming convention: the first underscore-delimited segment
+/// (with trailing digits stripped) identifies the subsystem. A small alias
+/// table normalizes known naming irregularities.
+///
+/// Examples:
+/// - "DMA_BD0_0" -> "DMA"
+/// - "Lock0_value" -> "Lock"
+/// - "Locks_Overflow" -> "Lock" (alias normalization)
+/// - "Combo_event_inputs0" -> "Event" (alias normalization)
+pub fn subsystem_key(name: &str) -> &str {
+    // First underscore-delimited segment
+    let first = name.split('_').next().unwrap_or(name);
+    // Strip trailing digits (e.g., "Lock0" -> "Lock")
+    let stem = first.trim_end_matches(|c: char| c.is_ascii_digit());
+
+    // Check alias table
+    for &(alias, canonical) in SUBSYSTEM_ALIASES {
+        if stem == alias {
+            return canonical;
+        }
+    }
+
+    stem
+}
+
+/// Extract subsystem profiles for all subsystems in a module.
+///
+/// This is the primary entry point for register analysis. It replaces
+/// manual `filter_by_prefix` calls with automatic subsystem discovery:
+///
+/// 1. Partition registers by `subsystem_key()` (name-stem extraction)
+/// 2. Build a `SubsystemProfile` for each partition
+/// 3. Return sorted by subsystem name
+pub fn extract_module_profiles(
+    registers: &[regdb::RegisterDef],
+) -> Vec<SubsystemProfile> {
+    let segments = segment_by_subsystem(registers);
+    let mut profiles: Vec<SubsystemProfile> = segments
+        .into_iter()
+        .map(|(key, regs)| build_subsystem_profile(&key, &regs))
+        .collect();
+    profiles.sort_by(|a, b| a.subsystem.cmp(&b.subsystem));
+    profiles
+}
+
+/// Partition a module's registers into subsystem groups.
+///
+/// Each register is assigned to a subsystem based on its name (via
+/// `subsystem_key`). Returns a map from subsystem name to the registers
+/// belonging to that subsystem, sorted by offset within each group.
+pub fn segment_by_subsystem(
+    registers: &[regdb::RegisterDef],
+) -> std::collections::BTreeMap<String, Vec<regdb::RegisterDef>> {
+    let mut segments: std::collections::BTreeMap<String, Vec<regdb::RegisterDef>> =
+        std::collections::BTreeMap::new();
+    for reg in registers {
+        let key = subsystem_key(&reg.name).to_string();
+        segments.entry(key).or_default().push(reg.clone());
+    }
+    // Sort each group by offset for consistent downstream processing
+    for regs in segments.values_mut() {
+        regs.sort_by_key(|r| r.offset);
+    }
+    segments
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,6 +838,92 @@ mod tests {
             .iter()
             .any(|(cat, name)| *cat == RegisterCategory::Status
                 && name == "Locks_Overflow"));
+    }
+
+    // ====================================================================
+    // Subsystem key extraction tests
+    // ====================================================================
+
+    #[test]
+    fn subsystem_key_extracts_dma() {
+        assert_eq!(subsystem_key("DMA_BD0_0"), "DMA");
+        assert_eq!(subsystem_key("DMA_S2MM_0_Ctrl"), "DMA");
+        assert_eq!(subsystem_key("DMA_MM2S_0_Ctrl"), "DMA");
+    }
+
+    #[test]
+    fn subsystem_key_extracts_lock() {
+        assert_eq!(subsystem_key("Lock0_value"), "Lock");
+        assert_eq!(subsystem_key("Lock_Request"), "Lock");
+    }
+
+    #[test]
+    fn subsystem_key_normalizes_locks_plural() {
+        assert_eq!(subsystem_key("Locks_Overflow"), "Lock");
+        assert_eq!(subsystem_key("Locks_Underflow"), "Lock");
+        assert_eq!(subsystem_key("Locks_Event_Selection_0"), "Lock");
+    }
+
+    #[test]
+    fn subsystem_key_normalizes_combo_to_event() {
+        assert_eq!(subsystem_key("Combo_event_inputs0"), "Event");
+    }
+
+    #[test]
+    fn subsystem_key_normalizes_edge_to_event() {
+        assert_eq!(subsystem_key("Edge_Detection_event_0"), "Event");
+    }
+
+    #[test]
+    fn subsystem_key_extracts_other_subsystems() {
+        assert_eq!(subsystem_key("Performance_Counter0"), "Performance");
+        assert_eq!(subsystem_key("Stream_Switch_Master_Config_AIE_Core0"), "Stream");
+        assert_eq!(subsystem_key("Event_Broadcast0"), "Event");
+        assert_eq!(subsystem_key("Event_Status0"), "Event");
+    }
+
+    #[test]
+    fn subsystem_key_handles_no_underscore() {
+        assert_eq!(subsystem_key("DataMemory"), "DataMemory");
+    }
+
+    // ====================================================================
+    // Subsystem segmentation tests
+    // ====================================================================
+
+    #[test]
+    fn segment_groups_by_subsystem_key() {
+        let regs = vec![
+            make_reg("DMA_BD0_0", 0x1D000, &["field"]),
+            make_reg("DMA_BD0_1", 0x1D004, &["field"]),
+            make_reg("Lock0_value", 0x1F000, &["Lock_value"]),
+            make_reg("Lock1_value", 0x1F010, &["Lock_value"]),
+            make_reg("Locks_Overflow", 0x1F120, &["Overflow"]),
+        ];
+
+        let segments = segment_by_subsystem(&regs);
+
+        assert_eq!(segments.len(), 2, "DMA and Lock (Locks merged)");
+        assert!(segments.contains_key("DMA"));
+        assert!(segments.contains_key("Lock"));
+        assert_eq!(segments["DMA"].len(), 2);
+        assert_eq!(segments["Lock"].len(), 3, "Lock0, Lock1, Locks_Overflow");
+    }
+
+    #[test]
+    fn segment_merges_event_aliases() {
+        let regs = vec![
+            make_reg("Event_Broadcast0", 0x14000, &["field"]),
+            make_reg("Event_Broadcast1", 0x14004, &["field"]),
+            make_reg("Combo_event_inputs0", 0x14400, &["field"]),
+            make_reg("Edge_Detection_event_0", 0x14408, &["field"]),
+        ];
+
+        let segments = segment_by_subsystem(&regs);
+
+        assert_eq!(segments.len(), 1, "All should merge into Event");
+        assert!(segments.contains_key("Event"));
+        assert_eq!(segments["Event"].len(), 4);
     }
 
     // ====================================================================
@@ -1086,6 +1255,155 @@ mod tests {
             "MM2S Ctrl should group under DMA_MM{{}}S_{{}}_Ctrl"
         );
         assert_eq!(ctrl_mm2s.unwrap().total_count(), 2);
+    }
+
+    // ====================================================================
+    // Module-level extraction tests (replaces filter_by_prefix)
+    // ====================================================================
+
+    #[test]
+    fn integration_extract_memory_module_profiles() {
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database not found");
+            return;
+        };
+
+        let mem = db.module("memory").expect("memory module should exist");
+        let profiles = extract_module_profiles(&mem.registers);
+
+        // Should find DMA and Lock subsystems (among others)
+        let dma = profiles.iter().find(|p| p.subsystem == "DMA");
+        let lock = profiles.iter().find(|p| p.subsystem == "Lock");
+
+        assert!(dma.is_some(), "DMA profile should be extracted");
+        assert!(lock.is_some(), "Lock profile should be extracted");
+
+        // DMA: 16 BDs (same as the old filter_by_prefix test)
+        assert_eq!(dma.unwrap().instance_count, 16, "DMA: 16 BD instances");
+
+        // Lock: 16 instances (same as old test)
+        assert_eq!(lock.unwrap().instance_count, 16, "Lock: 16 lock instances");
+
+        // Lock_Request should be in the Lock profile (not a separate subsystem)
+        let lock_p = lock.unwrap();
+        assert!(
+            lock_p.singletons.iter().any(|(_, name)| name == "Lock_Request"),
+            "Lock_Request should be in Lock profile"
+        );
+
+        // Locks_Overflow should be in Lock profile (alias merge)
+        assert!(
+            lock_p.singletons.iter().any(|(_, name)| name == "Locks_Overflow"),
+            "Locks_Overflow should be in Lock profile (via alias merge)"
+        );
+
+        // Report all discovered subsystems
+        eprintln!("=== Memory Module Subsystems ===");
+        for p in &profiles {
+            eprintln!(
+                "  {} -- {} instances, {} groups, {} singletons",
+                p.subsystem,
+                p.instance_count,
+                p.register_groups.len(),
+                p.singletons.len()
+            );
+        }
+    }
+
+    #[test]
+    fn integration_extract_memtile_profiles() {
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database not found");
+            return;
+        };
+
+        let mt = db.module("memory_tile").expect("memory_tile module should exist");
+        let profiles = extract_module_profiles(&mt.registers);
+
+        let dma = profiles.iter().find(|p| p.subsystem == "DMA");
+        let lock = profiles.iter().find(|p| p.subsystem == "Lock");
+
+        assert!(dma.is_some(), "DMA profile should be extracted from memtile");
+        assert!(lock.is_some(), "Lock profile should be extracted from memtile");
+
+        // MemTile: 48 BDs, 64 locks
+        assert_eq!(dma.unwrap().instance_count, 48, "MemTile DMA: 48 BDs");
+        assert_eq!(lock.unwrap().instance_count, 64, "MemTile Lock: 64 instances");
+
+        eprintln!("=== MemTile Subsystems ===");
+        for p in &profiles {
+            eprintln!(
+                "  {} -- {} instances, {} groups, {} singletons",
+                p.subsystem,
+                p.instance_count,
+                p.register_groups.len(),
+                p.singletons.len()
+            );
+        }
+    }
+
+    #[test]
+    fn integration_extract_core_module_profiles() {
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database not found");
+            return;
+        };
+
+        let core = db.module("core").expect("core module should exist");
+        let profiles = extract_module_profiles(&core.registers);
+
+        // Core should NOT have Lock or DMA subsystems
+        let lock = profiles.iter().find(|p| p.subsystem == "Lock");
+        let dma = profiles.iter().find(|p| p.subsystem == "DMA");
+        assert!(lock.is_none(), "Core should have no Lock subsystem");
+        assert!(dma.is_none(), "Core should have no DMA subsystem");
+
+        // Event subsystem should exist and include Combo/Edge aliases
+        let event = profiles.iter().find(|p| p.subsystem == "Event");
+        assert!(event.is_some(), "Core should have Event subsystem");
+
+        eprintln!("=== Core Module Subsystems ===");
+        for p in &profiles {
+            eprintln!(
+                "  {} -- {} instances, {} groups, {} singletons",
+                p.subsystem,
+                p.instance_count,
+                p.register_groups.len(),
+                p.singletons.len()
+            );
+        }
+    }
+
+    #[test]
+    fn integration_extract_shim_profiles() {
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database not found");
+            return;
+        };
+
+        let shim = db.module("shim").expect("shim module should exist");
+        let profiles = extract_module_profiles(&shim.registers);
+
+        let dma = profiles.iter().find(|p| p.subsystem == "DMA");
+        let lock = profiles.iter().find(|p| p.subsystem == "Lock");
+
+        assert!(dma.is_some(), "Shim DMA profile should be extracted");
+        assert!(lock.is_some(), "Shim Lock profile should be extracted");
+
+        // Shim: 16 BDs, 16 locks
+        assert_eq!(dma.unwrap().instance_count, 16, "Shim DMA: 16 BDs");
+        assert_eq!(lock.unwrap().instance_count, 16, "Shim Lock: 16 instances");
+
+        eprintln!("=== Shim Subsystems ===");
+        for p in &profiles {
+            eprintln!(
+                "  {} -- {} instances, {} groups, {} singletons",
+                p.subsystem,
+                p.instance_count,
+                p.register_groups.len(),
+                p.singletons.len()
+            );
+        }
     }
 
     // ====================================================================
