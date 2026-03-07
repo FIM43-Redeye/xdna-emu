@@ -7,4 +7,5 @@
 //! relationships.
 
 pub mod device_model;
+pub mod regdb_extractor;
 pub mod types;
