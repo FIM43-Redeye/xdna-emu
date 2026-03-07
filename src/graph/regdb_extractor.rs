@@ -578,6 +578,38 @@ pub fn build_module_model(kind: ModuleKind, module: &regdb::ModuleDef) -> Module
 }
 
 // ============================================================================
+// Populate ArchModel with register data from AM025
+// ============================================================================
+
+use crate::graph::types::ArchModel;
+
+/// Tile type name -> (ModuleKind, AM025 module name) pairs.
+const TILE_MODULE_MAP: &[(&str, &[(ModuleKind, &str)])] = &[
+    ("core", &[(ModuleKind::Core, "core"), (ModuleKind::Memory, "memory")]),
+    ("mem_tile", &[(ModuleKind::MemTile, "memory_tile")]),
+    ("shim_noc", &[(ModuleKind::Shim, "shim")]),
+    ("shim_pl", &[(ModuleKind::Shim, "shim")]),
+];
+
+/// Populate the `modules` field on each `TileTypeModel` in an `ArchModel`
+/// using register definitions from the AM025 register database.
+pub fn populate_tile_modules(model: &mut ArchModel, db: &regdb::RegisterDb) {
+    for tile_type in &mut model.tile_types {
+        let mapping = TILE_MODULE_MAP
+            .iter()
+            .find(|(name, _)| *name == tile_type.name);
+
+        if let Some((_, module_pairs)) = mapping {
+            for &(kind, am025_name) in *module_pairs {
+                if let Some(module_def) = db.module(am025_name) {
+                    tile_type.modules.push(build_module_model(kind, module_def));
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Subsystem key extraction: identify which subsystem a register belongs to
 // ============================================================================
 
@@ -1744,6 +1776,55 @@ mod tests {
                 unknown.len()
             );
         }
+    }
+
+    #[test]
+    fn integration_populate_tile_modules() {
+        use crate::graph::device_model;
+        use std::path::PathBuf;
+
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database not found");
+            return;
+        };
+
+        let json_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tools/aie-device-models.json");
+        let mut model = device_model::extract_device_model(&json_path, "npu1")
+            .expect("device model parse failed");
+
+        // Before: modules are empty
+        let core_tt = model.tile_types.iter().find(|t| t.name == "core").unwrap();
+        assert!(core_tt.modules.is_empty(), "modules should start empty");
+
+        // Populate
+        populate_tile_modules(&mut model, &db);
+
+        // Compute tile gets 2 modules (Core + Memory)
+        let core_tt = model.tile_types.iter().find(|t| t.name == "core").unwrap();
+        assert_eq!(core_tt.modules.len(), 2, "compute tile: Core + Memory");
+        assert!(core_tt.modules.iter().any(|m| m.kind == ModuleKind::Core));
+        assert!(core_tt.modules.iter().any(|m| m.kind == ModuleKind::Memory));
+
+        // Core module should have registers with Processor subsystem
+        let core_mod = core_tt.modules.iter().find(|m| m.kind == ModuleKind::Core).unwrap();
+        assert!(core_mod.registers.iter().any(|r| r.subsystem == SubsystemKind::Processor));
+        assert!(!core_mod.registers.iter().any(|r| r.subsystem == SubsystemKind::Lock));
+
+        // Memory module should have Lock and DMA
+        let mem_mod = core_tt.modules.iter().find(|m| m.kind == ModuleKind::Memory).unwrap();
+        assert!(mem_mod.registers.iter().any(|r| r.subsystem == SubsystemKind::Lock));
+        assert!(mem_mod.registers.iter().any(|r| r.subsystem == SubsystemKind::Dma));
+
+        // MemTile gets 1 module
+        let mt_tt = model.tile_types.iter().find(|t| t.name == "mem_tile").unwrap();
+        assert_eq!(mt_tt.modules.len(), 1);
+        assert_eq!(mt_tt.modules[0].kind, ModuleKind::MemTile);
+
+        // Shim gets 1 module
+        let shim_tt = model.tile_types.iter().find(|t| t.name == "shim_noc").unwrap();
+        assert_eq!(shim_tt.modules.len(), 1);
+        assert_eq!(shim_tt.modules[0].kind, ModuleKind::Shim);
     }
 
     #[test]
