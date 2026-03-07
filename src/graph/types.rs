@@ -929,32 +929,102 @@ pub struct ArrayTopology {
 }
 
 // ============================================================================
-// Relationships
+// Graph edges: node identity and relationships
 // ============================================================================
 
-/// A node identifier in the graph (dot-separated path).
+/// Unique identity for a node in the architecture graph.
+///
+/// Each variant carries exactly the coordinates needed to identify that
+/// kind of node. Hierarchical nodes (registers, fields) carry their
+/// parent coordinates. Cross-cutting nodes (schema fields) carry only
+/// the coordinates relevant to their identity.
+///
+/// This is designed to grow incrementally -- add variants as new node
+/// kinds enter the graph, not preemptively.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NodeId(pub String);
+pub enum NodeId {
+    /// A tile type definition.
+    TileType {
+        kind: TileKind,
+    },
+
+    /// A hardware module within a tile type.
+    Module {
+        tile: TileKind,
+        module: ModuleKind,
+    },
+
+    /// A register within a module.
+    Register {
+        tile: TileKind,
+        module: ModuleKind,
+        name: String,
+    },
+
+    /// A bit field within a register.
+    RegisterField {
+        tile: TileKind,
+        module: ModuleKind,
+        register: String,
+        field: String,
+    },
+
+    /// A field in the BD programming schema.
+    BdField {
+        tile: TileKind,
+        role: BdFieldRole,
+    },
+
+    /// A field in the DMA channel programming schema.
+    ChannelField {
+        tile: TileKind,
+        direction: DmaDirection,
+        role: DmaChannelFieldRole,
+    },
+}
 
 impl fmt::Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        match self {
+            Self::TileType { kind } => write!(f, "{:?}", kind),
+            Self::Module { tile, module } => write!(f, "{:?}.{:?}", tile, module),
+            Self::Register { tile, module, name } => {
+                write!(f, "{:?}.{:?}.{}", tile, module, name)
+            }
+            Self::RegisterField { tile, module, register, field } => {
+                write!(f, "{:?}.{:?}.{}.{}", tile, module, register, field)
+            }
+            Self::BdField { tile, role } => {
+                write!(f, "{:?}.bd.{:?}", tile, role)
+            }
+            Self::ChannelField { tile, direction, role } => {
+                write!(f, "{:?}.channel.{}.{:?}", tile, direction, role)
+            }
+        }
     }
 }
 
-/// Type of relationship between two nodes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Type of directed relationship between two graph nodes.
+///
+/// Start minimal. Add variants as real extraction code needs them, not
+/// speculatively. Each variant should have at least one producer before
+/// being added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RelationshipKind {
-    DataFlow,
-    Configures,
-    BlocksOn,
-    Triggers,
-    RoutesTo,
-    Produces,
+    /// A schema field was derived from a register field.
+    /// Direction: schema field -> register field (target is the source of truth).
+    DerivedFrom,
+
+    /// A node structurally contains another node.
+    /// Direction: parent -> child.
     Contains,
 }
 
-/// A directed relationship between two nodes.
+/// A directed relationship between two nodes in the architecture graph.
+///
+/// Edges are first-class objects with source attribution, just like node
+/// data. Every edge was created by a specific extraction step and can be
+/// traced back to its origin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Relationship {
     pub from: NodeId,
@@ -1317,8 +1387,8 @@ mod tests {
             },
         });
         model.relationships.push(Relationship {
-            from: NodeId("compute".to_string()),
-            to: NodeId("compute.dma".to_string()),
+            from: NodeId::TileType { kind: TileKind::Compute },
+            to: NodeId::Module { tile: TileKind::Compute, module: ModuleKind::Memory },
             kind: RelationshipKind::Contains,
             source: SourceAttribution {
                 origin: Source::DeviceModel,

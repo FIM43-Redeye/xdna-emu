@@ -14,8 +14,8 @@ use crate::device::regdb;
 use crate::graph::types::{
     Access, BdFieldRole, BdFieldSpec, BdSchema, BitRange, DmaChannelFieldRole,
     DmaChannelFieldSpec, DmaChannelRegKind, DmaChannelSchema, DmaDirection, FieldModel,
-    FieldSemantics, ModuleKind, ModuleModel, RegisterModel, Source, SourceAttribution,
-    SubsystemKind,
+    FieldSemantics, ModuleKind, ModuleModel, RegisterModel, Relationship, Source,
+    SourceAttribution, SubsystemKind, TileKind,
 };
 
 // ============================================================================
@@ -600,6 +600,10 @@ const TILE_MODULE_MAP: &[(&str, &[(ModuleKind, &str)])] = &[
 /// analysis -- the AM025 register patterns independently reveal how many
 /// locks and BDs each module has.
 pub fn populate_tile_modules(model: &mut ArchModel, db: &regdb::RegisterDb) {
+    use crate::graph::types::Relationship;
+
+    let mut new_edges: Vec<Relationship> = Vec::new();
+
     for tile_type in &mut model.tile_types {
         let mapping = TILE_MODULE_MAP
             .iter()
@@ -641,20 +645,34 @@ pub fn populate_tile_modules(model: &mut ArchModel, db: &regdb::RegisterDb) {
                     // Extract BD schema from DMA BD registers if this
                     // module contains them and we haven't extracted one yet.
                     if tile_type.bd_schema.is_none() {
-                        tile_type.bd_schema =
-                            extract_bd_schema(&module_def.registers, am025_name);
+                        let (schema, edges) = extract_bd_schema(
+                            &module_def.registers,
+                            am025_name,
+                            tile_type.kind,
+                            kind,
+                        );
+                        tile_type.bd_schema = schema;
+                        new_edges.extend(edges);
                     }
 
                     // Extract DMA channel schema from channel control/status
                     // registers if this module contains them.
                     if tile_type.channel_schema.is_none() {
-                        tile_type.channel_schema =
-                            extract_channel_schema(&module_def.registers, am025_name);
+                        let (schema, edges) = extract_channel_schema(
+                            &module_def.registers,
+                            am025_name,
+                            tile_type.kind,
+                            kind,
+                        );
+                        tile_type.channel_schema = schema;
+                        new_edges.extend(edges);
                     }
                 }
             }
         }
     }
+
+    model.relationships.extend(new_edges);
 }
 
 // ============================================================================
@@ -707,15 +725,22 @@ fn bd_field_name_to_role(name: &str) -> BdFieldRole {
     }
 }
 
-/// Extract a BD schema from a module's registers.
+/// Extract a BD schema from a module's registers, with DerivedFrom edges.
 ///
 /// Finds DMA_BD0_* registers (the representative BD), extracts all fields
-/// with their bit positions and semantic roles. Returns `None` if the module
-/// has no DMA BD registers.
+/// with their bit positions and semantic roles. Returns `(None, [])` if the
+/// module has no DMA BD registers.
+///
+/// For each non-Reserved field, emits a `DerivedFrom` edge linking the
+/// schema field node to the source register field node.
 fn extract_bd_schema(
     registers: &[regdb::RegisterDef],
     module_name: &str,
-) -> Option<BdSchema> {
+    tile_kind: TileKind,
+    module_kind: ModuleKind,
+) -> (Option<BdSchema>, Vec<Relationship>) {
+    use crate::graph::types::{NodeId, Relationship, RelationshipKind};
+
     // Find all BD0 registers: DMA_BD0_0, DMA_BD0_1, ... sorted by offset.
     let mut bd0_regs: Vec<&regdb::RegisterDef> = registers
         .iter()
@@ -723,14 +748,21 @@ fn extract_bd_schema(
         .collect();
 
     if bd0_regs.is_empty() {
-        return None;
+        return (None, Vec::new());
     }
 
     bd0_regs.sort_by_key(|r| r.offset);
     let words_per_bd = bd0_regs.len() as u8;
 
-    // Extract fields from each word of BD0.
+    // Extract fields from each word of BD0, emitting DerivedFrom edges.
     let mut fields = Vec::new();
+    let mut edges = Vec::new();
+    let edge_source = SourceAttribution {
+        origin: Source::Am025Json,
+        file: "aie_registers_aie2.json".into(),
+        detail: format!("module={} BD schema derivation", module_name),
+    };
+
     for (word_idx, reg) in bd0_regs.iter().enumerate() {
         for field_def in &reg.fields {
             let role = bd_field_name_to_role(&field_def.name);
@@ -747,8 +779,26 @@ fn extract_bd_schema(
                 name: field_def.name.clone(),
                 word: word_idx as u8,
                 bits,
-                role,
+                role: role.clone(),
             });
+
+            // Emit DerivedFrom edge for non-Reserved fields.
+            if role != BdFieldRole::Reserved {
+                edges.push(Relationship {
+                    from: NodeId::BdField {
+                        tile: tile_kind,
+                        role,
+                    },
+                    to: NodeId::RegisterField {
+                        tile: tile_kind,
+                        module: module_kind,
+                        register: reg.name.clone(),
+                        field: field_def.name.clone(),
+                    },
+                    kind: RelationshipKind::DerivedFrom,
+                    source: edge_source.clone(),
+                });
+            }
         }
     }
 
@@ -785,18 +835,21 @@ fn extract_bd_schema(
         0
     };
 
-    Some(BdSchema {
-        words_per_bd,
-        num_dimensions,
-        has_zero_padding,
-        has_axi_fields,
-        fields,
-        source: SourceAttribution {
-            origin: Source::Am025Json,
-            file: "aie_registers_aie2.json".into(),
-            detail: format!("module={} DMA_BD0 field layout", module_name),
-        },
-    })
+    (
+        Some(BdSchema {
+            words_per_bd,
+            num_dimensions,
+            has_zero_padding,
+            has_axi_fields,
+            fields,
+            source: SourceAttribution {
+                origin: Source::Am025Json,
+                file: "aie_registers_aie2.json".into(),
+                detail: format!("module={} DMA_BD0 field layout", module_name),
+            },
+        }),
+        edges,
+    )
 }
 
 // ============================================================================
@@ -938,15 +991,22 @@ fn classify_channel_register(
     None
 }
 
-/// Extract a DMA channel schema from a module's registers.
+/// Extract a DMA channel schema from a module's registers, with DerivedFrom edges.
 ///
 /// Finds the representative channel registers (channel 0 for each direction)
 /// and extracts all fields with their bit positions and semantic roles.
 /// Also counts total channels per direction from the register set.
+///
+/// For each non-Reserved field, emits a `DerivedFrom` edge linking the
+/// schema field node to the source register field node.
 fn extract_channel_schema(
     registers: &[regdb::RegisterDef],
     module_name: &str,
-) -> Option<DmaChannelSchema> {
+    tile_kind: TileKind,
+    module_kind: ModuleKind,
+) -> (Option<DmaChannelSchema>, Vec<Relationship>) {
+    use crate::graph::types::{NodeId, Relationship, RelationshipKind};
+
     // Classify all DMA channel registers
     let mut channel_regs: Vec<(DmaChannelRegKind, DmaDirection, u8, &str, &regdb::RegisterDef)> =
         Vec::new();
@@ -957,7 +1017,7 @@ fn extract_channel_schema(
     }
 
     if channel_regs.is_empty() {
-        return None;
+        return (None, Vec::new());
     }
 
     // Count channels per direction from S2MM Control registers
@@ -974,8 +1034,15 @@ fn extract_channel_schema(
         .unwrap_or_else(|| "Start_Queue".to_string());
 
     // Extract fields from representative channel (channel 0) for each
-    // (register kind, direction) combination
+    // (register kind, direction) combination, emitting DerivedFrom edges.
     let mut fields = Vec::new();
+    let mut edges = Vec::new();
+    let edge_source = SourceAttribution {
+        origin: Source::Am025Json,
+        file: "aie_registers_aie2.json".into(),
+        detail: format!("module={} channel schema derivation", module_name),
+    };
+
     for &(reg_kind, dir, ch, _, reg) in &channel_regs {
         if ch != 0 {
             continue; // Only use channel 0 as representative
@@ -997,8 +1064,27 @@ fn extract_channel_schema(
                 register: reg_kind,
                 direction: dir,
                 bits,
-                role,
+                role: role.clone(),
             });
+
+            // Emit DerivedFrom edge for non-Reserved fields.
+            if role != DmaChannelFieldRole::Reserved {
+                edges.push(Relationship {
+                    from: NodeId::ChannelField {
+                        tile: tile_kind,
+                        direction: dir,
+                        role,
+                    },
+                    to: NodeId::RegisterField {
+                        tile: tile_kind,
+                        module: module_kind,
+                        register: reg.name.clone(),
+                        field: field_def.name.clone(),
+                    },
+                    kind: RelationshipKind::DerivedFrom,
+                    source: edge_source.clone(),
+                });
+            }
         }
     }
 
@@ -1040,23 +1126,26 @@ fn extract_channel_schema(
         .map(|f| f.bits.width())
         .unwrap_or(4);
 
-    Some(DmaChannelSchema {
-        channels_per_direction: s2mm_ctrl_count,
-        start_bd_id_width,
-        has_compression,
-        has_out_of_order,
-        has_pause,
-        has_fot,
-        has_axi_errors,
-        has_cross_tile_errors,
-        queue_name,
-        fields,
-        source: SourceAttribution {
-            origin: Source::Am025Json,
-            file: "aie_registers_aie2.json".into(),
-            detail: format!("module={} DMA channel registers", module_name),
-        },
-    })
+    (
+        Some(DmaChannelSchema {
+            channels_per_direction: s2mm_ctrl_count,
+            start_bd_id_width,
+            has_compression,
+            has_out_of_order,
+            has_pause,
+            has_fot,
+            has_axi_errors,
+            has_cross_tile_errors,
+            queue_name,
+            fields,
+            source: SourceAttribution {
+                origin: Source::Am025Json,
+                file: "aie_registers_aie2.json".into(),
+                detail: format!("module={} DMA channel registers", module_name),
+            },
+        }),
+        edges,
+    )
 }
 
 // ============================================================================
@@ -2784,5 +2873,108 @@ mod tests {
             s2mm_status.iter().any(|f| f.role == DmaChannelFieldRole::AxiMmSlaveError),
             "Shim Status should have AXI_MM_Slave_Error"
         );
+    }
+
+    // ====================================================================
+    // Edge (relationship) tests -- DerivedFrom wiring
+    // ====================================================================
+
+    #[test]
+    fn bd_schema_fields_have_derived_from_edges() {
+        use crate::graph::types::{BdFieldRole, NodeId, RelationshipKind, TileKind};
+
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database not found");
+            return;
+        };
+
+        let json_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+        let mut model =
+            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        populate_tile_modules(&mut model, &db);
+
+        // Every BD field in the compute tile schema should have a DerivedFrom
+        // edge pointing to the register field it was extracted from.
+        let core = model.tile_types.iter().find(|t| t.name == "core").unwrap();
+        let schema = core.bd_schema.as_ref().expect("should have BD schema");
+
+        let derived_edges: Vec<_> = model
+            .relationships
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::DerivedFrom)
+            .collect();
+
+        // There should be at least one DerivedFrom edge per non-Reserved BD field
+        let non_reserved_fields: Vec<_> = schema
+            .fields
+            .iter()
+            .filter(|f| f.role != BdFieldRole::Reserved)
+            .collect();
+        assert!(
+            !non_reserved_fields.is_empty(),
+            "BD schema should have non-reserved fields"
+        );
+
+        // Check that Buffer_Length has a DerivedFrom edge to a RegisterField
+        let buf_len_node = NodeId::BdField {
+            tile: TileKind::Compute,
+            role: BdFieldRole::BufferLength,
+        };
+        let buf_len_edge = derived_edges
+            .iter()
+            .find(|e| e.from == buf_len_node)
+            .expect("Buffer_Length BD field should have a DerivedFrom edge");
+
+        // The target should be a RegisterField in DMA_BD0_0
+        match &buf_len_edge.to {
+            NodeId::RegisterField { register, field, .. } => {
+                assert_eq!(register, "DMA_BD0_0");
+                assert_eq!(field, "Buffer_Length");
+            }
+            other => panic!("Expected RegisterField, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn channel_schema_fields_have_derived_from_edges() {
+        use crate::graph::types::{DmaChannelFieldRole, DmaDirection, NodeId, RelationshipKind, TileKind};
+
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database not found");
+            return;
+        };
+
+        let json_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+        let mut model =
+            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        populate_tile_modules(&mut model, &db);
+
+        let derived_edges: Vec<_> = model
+            .relationships
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::DerivedFrom)
+            .collect();
+
+        // Check that S2MM FoT_Mode has a DerivedFrom edge
+        let fot_node = NodeId::ChannelField {
+            tile: TileKind::Compute,
+            direction: DmaDirection::S2mm,
+            role: DmaChannelFieldRole::FotMode,
+        };
+        let fot_edge = derived_edges
+            .iter()
+            .find(|e| e.from == fot_node)
+            .expect("FoT_Mode channel field should have a DerivedFrom edge");
+
+        // Target should be a RegisterField in DMA_S2MM_0_Ctrl
+        match &fot_edge.to {
+            NodeId::RegisterField { register, field, .. } => {
+                assert_eq!(register, "DMA_S2MM_0_Ctrl");
+                assert_eq!(field, "FoT_Mode");
+            }
+            other => panic!("Expected RegisterField, got {:?}", other),
+        }
     }
 }
