@@ -11,7 +11,10 @@
 //! - **Status**: Exceptional condition tracking (Overflow, Underflow)
 
 use crate::device::regdb;
-use crate::graph::types::SubsystemKind;
+use crate::graph::types::{
+    Access, BitRange, FieldModel, FieldSemantics, ModuleKind, ModuleModel, RegisterModel,
+    Source, SourceAttribution, SubsystemKind,
+};
 
 // ============================================================================
 // Register classification by hardware properties
@@ -494,6 +497,84 @@ fn detect_dimensions_by_index_extraction(
             stride: inner_stride,
         },
     ])
+}
+
+// ============================================================================
+// Register-to-graph conversion: populate typed RegisterModel from regdb
+// ============================================================================
+
+/// Convert a regdb access mode to the graph type system's Access enum.
+fn convert_access(mode: regdb::AccessMode) -> Access {
+    match mode {
+        regdb::AccessMode::ReadWrite => Access::ReadWrite,
+        regdb::AccessMode::ReadOnly => Access::ReadOnly,
+        regdb::AccessMode::WriteOnly => Access::WriteOnly,
+        regdb::AccessMode::WriteToClear => Access::WriteToClear,
+        regdb::AccessMode::Mixed => Access::Mixed,
+    }
+}
+
+/// Convert a single regdb register definition to a typed RegisterModel.
+///
+/// The `module_name` parameter is the AM025 module name (e.g., "memory",
+/// "core") used for source attribution.
+pub fn register_def_to_model(reg: &regdb::RegisterDef, module_name: &str) -> RegisterModel {
+    let subsystem = subsystem_name_to_kind(subsystem_key(&reg.name));
+
+    let fields: Vec<FieldModel> = reg
+        .fields
+        .iter()
+        .map(|f| FieldModel {
+            name: f.name.clone(),
+            bits: BitRange::Contiguous {
+                msb: f.msb,
+                lsb: f.lsb,
+            },
+            meaning: FieldSemantics::Unknown,
+            source: SourceAttribution {
+                origin: Source::Am025Json,
+                file: "aie_registers_aie2.json".into(),
+                detail: format!("{}.{}.{}", module_name, reg.name, f.name),
+            },
+        })
+        .collect();
+
+    RegisterModel {
+        name: reg.name.clone(),
+        offset: reg.offset,
+        width: reg.width as u8,
+        reset_value: reg.reset_value,
+        fields,
+        subsystem,
+        access: convert_access(reg.access),
+        source: SourceAttribution {
+            origin: Source::Am025Json,
+            file: "aie_registers_aie2.json".into(),
+            detail: format!("{}.{}", module_name, reg.name),
+        },
+    }
+}
+
+/// Build a complete ModuleModel from a regdb module definition.
+///
+/// Converts every register in the AM025 module to a typed RegisterModel
+/// with subsystem classification derived from register names.
+pub fn build_module_model(kind: ModuleKind, module: &regdb::ModuleDef) -> ModuleModel {
+    let registers: Vec<RegisterModel> = module
+        .registers
+        .iter()
+        .map(|reg| register_def_to_model(reg, &module.name))
+        .collect();
+
+    ModuleModel {
+        kind,
+        registers,
+        source: SourceAttribution {
+            origin: Source::Am025Json,
+            file: "aie_registers_aie2.json".into(),
+            detail: format!("module={}", module.name),
+        },
+    }
 }
 
 // ============================================================================
@@ -1680,5 +1761,79 @@ mod tests {
             lock.is_none(),
             "Core module should have no Lock subsystem"
         );
+    }
+
+    // ====================================================================
+    // Register-to-graph wiring tests
+    // ====================================================================
+
+    #[test]
+    fn converts_regdb_register_to_register_model() {
+        let reg = make_reg_with_access(
+            "Lock0_value",
+            0x1F000,
+            AccessMode::ReadWrite,
+            &["Lock_value"],
+        );
+
+        let model = register_def_to_model(&reg, "memory");
+
+        assert_eq!(model.name, "Lock0_value");
+        assert_eq!(model.offset, 0x1F000);
+        assert_eq!(model.width, 32);
+        assert_eq!(model.reset_value, 0);
+        assert_eq!(model.access, Access::ReadWrite);
+        assert_eq!(model.subsystem, SubsystemKind::Lock);
+        assert_eq!(model.source.origin, Source::Am025Json);
+        assert_eq!(model.fields.len(), 1);
+        assert_eq!(model.fields[0].name, "Lock_value");
+    }
+
+    #[test]
+    fn converts_readonly_access_mode() {
+        let reg = make_reg_with_access(
+            "Lock_Request",
+            0x40000,
+            AccessMode::ReadOnly,
+            &["Request_Result"],
+        );
+
+        let model = register_def_to_model(&reg, "memory");
+        assert_eq!(model.access, crate::graph::types::Access::ReadOnly);
+        assert_eq!(model.subsystem, SubsystemKind::Lock);
+    }
+
+    #[test]
+    fn builds_module_model_from_regdb() {
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database not found");
+            return;
+        };
+
+        let mem = db.module("memory").expect("memory module should exist");
+        let module_model = build_module_model(ModuleKind::Memory, mem);
+
+        assert_eq!(module_model.kind, ModuleKind::Memory);
+        assert_eq!(module_model.source.origin, crate::graph::types::Source::Am025Json);
+
+        // Every register in the AM025 memory module should be converted
+        assert_eq!(
+            module_model.registers.len(),
+            mem.registers.len(),
+            "all registers should be converted"
+        );
+
+        // Spot-check: Lock0_value should have SubsystemKind::Lock
+        let lock0 = module_model.registers.iter()
+            .find(|r| r.name == "Lock0_value")
+            .expect("Lock0_value should exist");
+        assert_eq!(lock0.subsystem, SubsystemKind::Lock);
+        assert_eq!(lock0.offset, 0x1F000);
+
+        // DMA_BD0_0 should have SubsystemKind::Dma
+        let dma0 = module_model.registers.iter()
+            .find(|r| r.name == "DMA_BD0_0")
+            .expect("DMA_BD0_0 should exist");
+        assert_eq!(dma0.subsystem, SubsystemKind::Dma);
     }
 }
