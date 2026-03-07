@@ -303,7 +303,7 @@ pub struct Relationship {
 // ============================================================================
 
 /// Complete architecture model for one NPU architecture.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchModel {
     pub arch: Architecture,
     pub tile_types: Vec<TileTypeModel>,
@@ -373,5 +373,76 @@ mod tests {
         assert_eq!(model.arch, Architecture::Aie2);
         assert!(model.tile_types.is_empty());
         assert!(model.relationships.is_empty());
+    }
+
+    #[test]
+    fn test_serde_round_trip() {
+        let mut model = ArchModel::new(Architecture::Aie2);
+        model.tile_types.push(TileTypeModel {
+            kind: TileKind::Compute,
+            name: "aie2_compute".to_string(),
+            modules: vec![ModuleModel {
+                kind: ModuleKind::Dma,
+                registers: vec![RegisterModel {
+                    name: "DMA_BD0_0".to_string(),
+                    offset: 0x1D000,
+                    width: 32,
+                    reset_value: 0,
+                    fields: vec![FieldModel {
+                        name: "Buffer_Length".to_string(),
+                        bits: BitRange::Contiguous { msb: 13, lsb: 0 },
+                        meaning: FieldSemantics::Count,
+                        source: SourceAttribution {
+                            origin: Source::Am025Json,
+                            file: "test.json".to_string(),
+                            detail: "test".to_string(),
+                        },
+                    }],
+                    module: ModuleKind::Dma,
+                    access: Access::ReadWrite,
+                    source: SourceAttribution {
+                        origin: Source::Am025Json,
+                        file: "test.json".to_string(),
+                        detail: "test".to_string(),
+                    },
+                }],
+                ports: Vec::new(),
+                instances: Some(InstanceCount { channels: 2, bds: 16, locks: 0 }),
+                source: SourceAttribution {
+                    origin: Source::DeviceModel,
+                    file: "test.json".to_string(),
+                    detail: "test".to_string(),
+                },
+            }],
+            memory: Some(MemoryModel {
+                size_bytes: 65536,
+                num_banks: 4,
+                bank_size_bytes: 16384,
+                source: SourceAttribution {
+                    origin: Source::DeviceModel,
+                    file: "test.json".to_string(),
+                    detail: "test".to_string(),
+                },
+            }),
+            source: SourceAttribution {
+                origin: Source::DeviceModel,
+                file: "test.json".to_string(),
+                detail: "test".to_string(),
+            },
+        });
+        model.relationships.push(Relationship {
+            from: NodeId("compute".to_string()),
+            to: NodeId("compute.dma".to_string()),
+            kind: RelationshipKind::Contains,
+            source: SourceAttribution {
+                origin: Source::DeviceModel,
+                file: "derived".to_string(),
+                detail: "test".to_string(),
+            },
+        });
+
+        let json = serde_json::to_string(&model).expect("serialize failed");
+        let deserialized: ArchModel = serde_json::from_str(&json).expect("deserialize failed");
+        assert_eq!(model, deserialized);
     }
 }
