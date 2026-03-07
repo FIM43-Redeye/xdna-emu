@@ -575,8 +575,8 @@ pub fn subsystem_key(name: &str) -> &str {
 
 /// Extract subsystem profiles for all subsystems in a module.
 ///
-/// This is the primary entry point for register analysis. It replaces
-/// manual `filter_by_prefix` calls with automatic subsystem discovery:
+/// This is the primary entry point for register analysis. Automatic
+/// subsystem discovery from register names:
 ///
 /// 1. Partition registers by `subsystem_key()` (name-stem extraction)
 /// 2. Build a `SubsystemProfile` for each partition
@@ -996,16 +996,13 @@ mod tests {
         regdb::RegisterDb::load_for_device("aie2").ok()
     }
 
-    /// Filter registers whose name starts with any of the given prefixes.
-    fn filter_by_prefix<'a>(
-        registers: &'a [regdb::RegisterDef],
-        prefixes: &[&str],
-    ) -> Vec<regdb::RegisterDef> {
-        registers
-            .iter()
-            .filter(|r| prefixes.iter().any(|p| r.name.starts_with(p)))
-            .cloned()
-            .collect()
+    /// Helper: extract one subsystem profile from a module's registers.
+    fn profile_from_module(
+        module: &regdb::ModuleDef,
+        subsystem: &str,
+    ) -> Option<SubsystemProfile> {
+        let profiles = extract_module_profiles(&module.registers);
+        profiles.into_iter().find(|p| p.subsystem == subsystem)
     }
 
     #[test]
@@ -1016,19 +1013,10 @@ mod tests {
         };
 
         let mem = db.module("memory").expect("memory module should exist");
-        let lock_regs = filter_by_prefix(&mem.registers, &["Lock", "Locks_"]);
+        let profile = profile_from_module(mem, "Lock")
+            .expect("Lock profile should be extracted from memory module");
 
-        // We know from exploration: 16 value + 1 request + 8 event sel
-        // + 1 overflow + 1 underflow = 27 lock registers
-        assert!(
-            lock_regs.len() >= 27,
-            "Expected at least 27 lock registers in memory module, got {}",
-            lock_regs.len()
-        );
-
-        let profile = build_subsystem_profile("lock", &lock_regs);
-
-        // Core behavioral property: 16 lock instances
+        assert_eq!(profile.kind, SubsystemKind::Lock);
         assert_eq!(profile.instance_count, 16);
 
         // Lock value registers: grouped, State, stride 0x10
@@ -1081,11 +1069,10 @@ mod tests {
         };
 
         let mt = db.module("memory_tile").expect("memory_tile module should exist");
-        let lock_regs = filter_by_prefix(&mt.registers, &["Lock", "Locks_"]);
+        let profile = profile_from_module(mt, "Lock")
+            .expect("Lock profile should be extracted from memtile");
 
-        let profile = build_subsystem_profile("lock", &lock_regs);
-
-        // MemTile has 64 locks, not 16
+        assert_eq!(profile.kind, SubsystemKind::Lock);
         assert_eq!(profile.instance_count, 64);
 
         let value_group = profile
@@ -1106,11 +1093,10 @@ mod tests {
         };
 
         let shim = db.module("shim").expect("shim module should exist");
-        let lock_regs = filter_by_prefix(&shim.registers, &["Lock", "Locks_"]);
+        let profile = profile_from_module(shim, "Lock")
+            .expect("Lock profile should be extracted from shim");
 
-        let profile = build_subsystem_profile("lock", &lock_regs);
-
-        // Shim has 16 locks (same as compute memory module)
+        assert_eq!(profile.kind, SubsystemKind::Lock);
         assert_eq!(profile.instance_count, 16);
 
         // Shim has only 6 event selectors, not 8
@@ -1297,7 +1283,7 @@ mod tests {
     }
 
     // ====================================================================
-    // Module-level extraction tests (replaces filter_by_prefix)
+    // Module-level extraction tests
     // ====================================================================
 
     #[test]
@@ -1317,7 +1303,7 @@ mod tests {
         assert!(dma.is_some(), "DMA profile should be extracted");
         assert!(lock.is_some(), "Lock profile should be extracted");
 
-        // DMA: 16 BDs (same as the old filter_by_prefix test)
+        // DMA: 16 BDs
         assert_eq!(dma.unwrap().instance_count, 16, "DMA: 16 BD instances");
 
         // Lock: 16 instances (same as old test)
@@ -1541,31 +1527,10 @@ mod tests {
         };
 
         let mem = db.module("memory").expect("memory module should exist");
-        let dma_regs = filter_by_prefix(&mem.registers, &["DMA_"]);
+        let profile = profile_from_module(mem, "DMA")
+            .expect("DMA profile should be extracted from memory module");
 
-        // Memory module has ~112 DMA registers per the AM025 survey
-        assert!(
-            dma_regs.len() >= 100,
-            "Expected at least 100 DMA registers in memory module, got {}",
-            dma_regs.len()
-        );
-
-        let profile = build_subsystem_profile("dma", &dma_regs);
-
-        // Report what we found
-        eprintln!("=== Memory Module DMA Profile ===");
-        eprintln!("Instance count: {}", profile.instance_count);
-        eprintln!("Groups ({}):", profile.register_groups.len());
-        for (cat, g) in &profile.register_groups {
-            eprintln!(
-                "  {:?} | {} (dims={:?}, base=0x{:X})",
-                cat, g.pattern, g.dimensions, g.base_offset
-            );
-        }
-        eprintln!("Singletons ({}):", profile.singletons.len());
-        for (cat, name) in &profile.singletons {
-            eprintln!("  {:?} | {}", cat, name);
-        }
+        assert_eq!(profile.kind, SubsystemKind::Dma);
 
         // BD group should exist with 2D structure
         let bd_group = profile
@@ -1574,7 +1539,6 @@ mod tests {
             .find(|(_, g)| g.pattern == "DMA_BD{}_{}")
             .expect("BD group should exist");
         assert_eq!(bd_group.0, RegisterCategory::State, "BDs are R/W grouped");
-        // 2D: 16 BDs x 6 words
         assert_eq!(bd_group.1.dimensions.len(), 2, "BDs should be 2D");
         assert_eq!(bd_group.1.instance_count(), 16, "16 BDs");
         assert_eq!(bd_group.1.total_count(), 96, "16 BDs x 6 words = 96");
@@ -1589,7 +1553,6 @@ mod tests {
             "S2MM Ctrl group should exist in DMA profile"
         );
 
-        // With 2D BD detection, instance_count should be 16 (not 96)
         assert_eq!(profile.instance_count, 16, "DMA instance count = BD count");
     }
 
@@ -1601,30 +1564,10 @@ mod tests {
         };
 
         let mt = db.module("memory_tile").expect("memory_tile module should exist");
-        let dma_regs = filter_by_prefix(&mt.registers, &["DMA_"]);
+        let profile = profile_from_module(mt, "DMA")
+            .expect("DMA profile should be extracted from memtile");
 
-        // MemTile has ~433 DMA registers (48 BDs x 8 words + 6 channels each dir)
-        assert!(
-            dma_regs.len() >= 400,
-            "Expected at least 400 DMA registers in memtile, got {}",
-            dma_regs.len()
-        );
-
-        let profile = build_subsystem_profile("dma", &dma_regs);
-
-        eprintln!("=== MemTile DMA Profile ===");
-        eprintln!("Instance count: {}", profile.instance_count);
-        eprintln!("Groups ({}):", profile.register_groups.len());
-        for (cat, g) in &profile.register_groups {
-            eprintln!(
-                "  {:?} | {} (dims={:?}, base=0x{:X})",
-                cat, g.pattern, g.dimensions, g.base_offset
-            );
-        }
-        eprintln!("Singletons ({}):", profile.singletons.len());
-        for (cat, name) in &profile.singletons {
-            eprintln!("  {:?} | {}", cat, name);
-        }
+        assert_eq!(profile.kind, SubsystemKind::Dma);
 
         // 48 BDs x 8 words = 384 BD registers, detected as 2D
         let bd_group = profile
@@ -1646,23 +1589,10 @@ mod tests {
         };
 
         let shim = db.module("shim").expect("shim module should exist");
-        let dma_regs = filter_by_prefix(&shim.registers, &["DMA_"]);
+        let profile = profile_from_module(shim, "DMA")
+            .expect("DMA profile should be extracted from shim");
 
-        let profile = build_subsystem_profile("dma", &dma_regs);
-
-        eprintln!("=== Shim DMA Profile ===");
-        eprintln!("Instance count: {}", profile.instance_count);
-        eprintln!("Groups ({}):", profile.register_groups.len());
-        for (cat, g) in &profile.register_groups {
-            eprintln!(
-                "  {:?} | {} (dims={:?}, base=0x{:X})",
-                cat, g.pattern, g.dimensions, g.base_offset
-            );
-        }
-        eprintln!("Singletons ({}):", profile.singletons.len());
-        for (cat, name) in &profile.singletons {
-            eprintln!("  {:?} | {}", cat, name);
-        }
+        assert_eq!(profile.kind, SubsystemKind::Dma);
 
         // Shim: 16 BDs x 8 words = 128 BD registers, 2D
         let bd_group = profile
@@ -1743,13 +1673,12 @@ mod tests {
         };
 
         let core = db.module("core").expect("core module should exist");
-        let lock_regs = filter_by_prefix(&core.registers, &["Lock", "Locks_"]);
 
         // Core module has NO lock registers (locks are in the memory module)
+        let lock = profile_from_module(core, "Lock");
         assert!(
-            lock_regs.is_empty(),
-            "Core module should have no lock registers, found: {:?}",
-            lock_regs.iter().map(|r| &r.name).collect::<Vec<_>>()
+            lock.is_none(),
+            "Core module should have no Lock subsystem"
         );
     }
 }
