@@ -60,6 +60,7 @@ serde_json = "1"
 
 [dev-dependencies]
 hex = "0.4"                                             # Hex dump utilities for debugging
+tempfile = "3"                                          # Temp files for JSON extraction tests
 
 [[bin]]
 name = "trace-compare"

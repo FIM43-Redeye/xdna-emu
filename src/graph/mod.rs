@@ -6,4 +6,5 @@
 //! (AIE, AIE2, AIE2P) with all its tile types, registers, and
 //! relationships.
 
+pub mod device_model;
 pub mod types;
