@@ -12,8 +12,10 @@
 
 use crate::device::regdb;
 use crate::graph::types::{
-    Access, BdFieldRole, BdFieldSpec, BdSchema, BitRange, FieldModel, FieldSemantics,
-    ModuleKind, ModuleModel, RegisterModel, Source, SourceAttribution, SubsystemKind,
+    Access, BdFieldRole, BdFieldSpec, BdSchema, BitRange, DmaChannelFieldRole,
+    DmaChannelFieldSpec, DmaChannelRegKind, DmaChannelSchema, DmaDirection, FieldModel,
+    FieldSemantics, ModuleKind, ModuleModel, RegisterModel, Source, SourceAttribution,
+    SubsystemKind,
 };
 
 // ============================================================================
@@ -642,6 +644,13 @@ pub fn populate_tile_modules(model: &mut ArchModel, db: &regdb::RegisterDb) {
                         tile_type.bd_schema =
                             extract_bd_schema(&module_def.registers, am025_name);
                     }
+
+                    // Extract DMA channel schema from channel control/status
+                    // registers if this module contains them.
+                    if tile_type.channel_schema.is_none() {
+                        tile_type.channel_schema =
+                            extract_channel_schema(&module_def.registers, am025_name);
+                    }
                 }
             }
         }
@@ -786,6 +795,266 @@ fn extract_bd_schema(
             origin: Source::Am025Json,
             file: "aie_registers_aie2.json".into(),
             detail: format!("module={} DMA_BD0 field layout", module_name),
+        },
+    })
+}
+
+// ============================================================================
+// DMA channel schema extraction
+// ============================================================================
+
+/// Map an AM025 DMA channel register field name to its semantic role.
+fn channel_field_name_to_role(name: &str) -> DmaChannelFieldRole {
+    match name {
+        // Control register fields
+        "Reset" => DmaChannelFieldRole::Reset,
+        "Pause_Mem" => DmaChannelFieldRole::PauseMem,
+        "Pause_Stream" => DmaChannelFieldRole::PauseStream,
+        "Compression_Enable" => DmaChannelFieldRole::CompressionEnable,
+        "Decompression_Enable" => DmaChannelFieldRole::DecompressionEnable,
+        "Enable_Out_of_Order" => DmaChannelFieldRole::EnableOutOfOrder,
+        "Controller_ID" => DmaChannelFieldRole::ControllerId,
+        "FoT_Mode" => DmaChannelFieldRole::FotMode,
+
+        // Start/Task Queue fields
+        "Start_BD_ID" => DmaChannelFieldRole::StartBdId,
+        "Repeat_Count" => DmaChannelFieldRole::RepeatCount,
+        "Enable_Token_Issue" => DmaChannelFieldRole::EnableTokenIssue,
+
+        // Status register fields
+        "Status" => DmaChannelFieldRole::ChannelStatus,
+        "Stalled_Lock_Acq" => DmaChannelFieldRole::StalledLockAcq,
+        "Stalled_Lock_Rel" => DmaChannelFieldRole::StalledLockRel,
+        "Stalled_Stream_Starvation" => DmaChannelFieldRole::StalledStreamStarvation,
+        "Stalled_Stream_Backpressure" => DmaChannelFieldRole::StalledStreamBackpressure,
+        "Stalled_TCT" => DmaChannelFieldRole::StalledTct,
+        "Stalled_TCT_or_Count_FIFO_Full" => DmaChannelFieldRole::StalledTctOrCountFifoFull,
+        "Error_BD_Unavailable" => DmaChannelFieldRole::ErrorBdUnavailable,
+        "Error_BD_Invalid" => DmaChannelFieldRole::ErrorBdInvalid,
+        "Error_FoT_Length_Exceeded" => DmaChannelFieldRole::ErrorFotLengthExceeded,
+        "Error_FoT_BDs_per_Task" => DmaChannelFieldRole::ErrorFotBdsPerTask,
+        "Error_Lock_Access_to_Unavailable" => DmaChannelFieldRole::ErrorLockAccessUnavailable,
+        "Error_DM_Access_to_Unavailable" => DmaChannelFieldRole::ErrorDmAccessUnavailable,
+        "AXI_MM_Decode_Error" => DmaChannelFieldRole::AxiMmDecodeError,
+        "AXI_MM_Slave_Error" => DmaChannelFieldRole::AxiMmSlaveError,
+        "Task_Queue_Overflow" => DmaChannelFieldRole::TaskQueueOverflow,
+        "Channel_Running" => DmaChannelFieldRole::ChannelRunning,
+        "Task_Queue_Size" => DmaChannelFieldRole::TaskQueueSize,
+        "Cur_BD" => DmaChannelFieldRole::CurrentBdId,
+
+        // Write Count register fields (S2MM only)
+        "Current_Write_Count" => DmaChannelFieldRole::CurrentWriteCount,
+
+        // FoT Count FIFO fields (S2MM only)
+        "Write_Count" => DmaChannelFieldRole::FotWriteCount,
+        "BD_ID" => DmaChannelFieldRole::FotBdId,
+        "Last_in_Task" => DmaChannelFieldRole::FotLastInTask,
+        "Valid" => DmaChannelFieldRole::FotValid,
+
+        "Reserved" | _ => DmaChannelFieldRole::Reserved,
+    }
+}
+
+/// Classify a DMA channel register by its name pattern, returning the
+/// register kind, direction, and channel index.
+///
+/// Register naming patterns in AM025:
+/// - Control:    `DMA_{S2MM|MM2S}_{ch}_Ctrl`
+/// - Queue:      `DMA_{S2MM|MM2S}_{ch}_Start_Queue` or `_Task_Queue`
+/// - Status:     `DMA_{S2MM|MM2S}_Status_{ch}`
+/// - WriteCount: `DMA_S2MM_Current_Write_Count_{ch}`
+/// - FoT FIFO:   `DMA_S2MM_FoT_Count_FIFO_Pop_{ch}`
+fn classify_channel_register(
+    name: &str,
+) -> Option<(DmaChannelRegKind, DmaDirection, u8, &str)> {
+    // Must start with DMA_ and not be a BD register
+    if !name.starts_with("DMA_") || name.contains("_BD") {
+        return None;
+    }
+
+    // Determine direction
+    let direction = if name.starts_with("DMA_S2MM_") {
+        DmaDirection::S2mm
+    } else if name.starts_with("DMA_MM2S_") {
+        DmaDirection::Mm2s
+    } else {
+        return None;
+    };
+
+    // Try each pattern in order of specificity
+
+    // Write Count: DMA_S2MM_Current_Write_Count_{ch}
+    if let Some(rest) = name.strip_prefix("DMA_S2MM_Current_Write_Count_") {
+        if let Ok(ch) = rest.parse::<u8>() {
+            return Some((DmaChannelRegKind::WriteCount, direction, ch, ""));
+        }
+    }
+
+    // FoT FIFO: DMA_S2MM_FoT_Count_FIFO_Pop_{ch}
+    if let Some(rest) = name.strip_prefix("DMA_S2MM_FoT_Count_FIFO_Pop_") {
+        if let Ok(ch) = rest.parse::<u8>() {
+            return Some((DmaChannelRegKind::FotCountFifo, direction, ch, ""));
+        }
+    }
+
+    // Status: DMA_{dir}_Status_{ch}
+    let dir_prefix = if direction == DmaDirection::S2mm {
+        "DMA_S2MM_Status_"
+    } else {
+        "DMA_MM2S_Status_"
+    };
+    if let Some(rest) = name.strip_prefix(dir_prefix) {
+        if let Ok(ch) = rest.parse::<u8>() {
+            return Some((DmaChannelRegKind::Status, direction, ch, ""));
+        }
+    }
+
+    // Control and Queue: DMA_{dir}_{ch}_{Ctrl|Start_Queue|Task_Queue}
+    let dir_stem = if direction == DmaDirection::S2mm {
+        "DMA_S2MM_"
+    } else {
+        "DMA_MM2S_"
+    };
+    if let Some(rest) = name.strip_prefix(dir_stem) {
+        // rest should be "{ch}_Ctrl" or "{ch}_Start_Queue" or "{ch}_Task_Queue"
+        if let Some(underscore_pos) = rest.find('_') {
+            let ch_str = &rest[..underscore_pos];
+            let suffix = &rest[underscore_pos + 1..];
+            if let Ok(ch) = ch_str.parse::<u8>() {
+                match suffix {
+                    "Ctrl" => return Some((DmaChannelRegKind::Control, direction, ch, "")),
+                    "Start_Queue" => {
+                        return Some((DmaChannelRegKind::StartQueue, direction, ch, "Start_Queue"))
+                    }
+                    "Task_Queue" => {
+                        return Some((DmaChannelRegKind::StartQueue, direction, ch, "Task_Queue"))
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Extract a DMA channel schema from a module's registers.
+///
+/// Finds the representative channel registers (channel 0 for each direction)
+/// and extracts all fields with their bit positions and semantic roles.
+/// Also counts total channels per direction from the register set.
+fn extract_channel_schema(
+    registers: &[regdb::RegisterDef],
+    module_name: &str,
+) -> Option<DmaChannelSchema> {
+    // Classify all DMA channel registers
+    let mut channel_regs: Vec<(DmaChannelRegKind, DmaDirection, u8, &str, &regdb::RegisterDef)> =
+        Vec::new();
+    for reg in registers {
+        if let Some((kind, dir, ch, queue_name)) = classify_channel_register(&reg.name) {
+            channel_regs.push((kind, dir, ch, queue_name, reg));
+        }
+    }
+
+    if channel_regs.is_empty() {
+        return None;
+    }
+
+    // Count channels per direction from S2MM Control registers
+    let s2mm_ctrl_count = channel_regs
+        .iter()
+        .filter(|(k, d, _, _, _)| *k == DmaChannelRegKind::Control && *d == DmaDirection::S2mm)
+        .count() as u8;
+
+    // Determine queue register name from the first queue register found
+    let queue_name = channel_regs
+        .iter()
+        .find(|(k, _, _, _, _)| *k == DmaChannelRegKind::StartQueue)
+        .map(|(_, _, _, qn, _)| qn.to_string())
+        .unwrap_or_else(|| "Start_Queue".to_string());
+
+    // Extract fields from representative channel (channel 0) for each
+    // (register kind, direction) combination
+    let mut fields = Vec::new();
+    for &(reg_kind, dir, ch, _, reg) in &channel_regs {
+        if ch != 0 {
+            continue; // Only use channel 0 as representative
+        }
+
+        for field_def in &reg.fields {
+            let role = channel_field_name_to_role(&field_def.name);
+            let bits = if field_def.msb >= field_def.lsb {
+                BitRange::Contiguous {
+                    msb: field_def.msb as u8,
+                    lsb: field_def.lsb as u8,
+                }
+            } else {
+                BitRange::Contiguous { msb: 0, lsb: 0 }
+            };
+
+            fields.push(DmaChannelFieldSpec {
+                name: field_def.name.clone(),
+                register: reg_kind,
+                direction: dir,
+                bits,
+                role,
+            });
+        }
+    }
+
+    // Sort by (register, direction, lsb) for deterministic ordering
+    fields.sort_by(|a, b| {
+        let a_reg = a.register as u8;
+        let b_reg = b.register as u8;
+        let a_dir = a.direction as u8;
+        let b_dir = b.direction as u8;
+        let a_lsb = match &a.bits {
+            BitRange::Contiguous { lsb, .. } => *lsb,
+            BitRange::Split(frags) => frags.last().map(|(_, l)| *l).unwrap_or(0),
+        };
+        let b_lsb = match &b.bits {
+            BitRange::Contiguous { lsb, .. } => *lsb,
+            BitRange::Split(frags) => frags.last().map(|(_, l)| *l).unwrap_or(0),
+        };
+        (a_reg, a_dir, a_lsb).cmp(&(b_reg, b_dir, b_lsb))
+    });
+
+    // Derive capability flags from field presence
+    let has_role = |role: &DmaChannelFieldRole| fields.iter().any(|f| &f.role == role);
+
+    let has_compression = has_role(&DmaChannelFieldRole::CompressionEnable)
+        || has_role(&DmaChannelFieldRole::DecompressionEnable);
+    let has_out_of_order = has_role(&DmaChannelFieldRole::EnableOutOfOrder);
+    let has_pause =
+        has_role(&DmaChannelFieldRole::PauseMem) || has_role(&DmaChannelFieldRole::PauseStream);
+    let has_fot = has_role(&DmaChannelFieldRole::FotMode);
+    let has_axi_errors = has_role(&DmaChannelFieldRole::AxiMmDecodeError)
+        || has_role(&DmaChannelFieldRole::AxiMmSlaveError);
+    let has_cross_tile_errors = has_role(&DmaChannelFieldRole::ErrorLockAccessUnavailable)
+        || has_role(&DmaChannelFieldRole::ErrorDmAccessUnavailable);
+
+    // Start_BD_ID width from the field itself
+    let start_bd_id_width = fields
+        .iter()
+        .find(|f| f.role == DmaChannelFieldRole::StartBdId)
+        .map(|f| f.bits.width())
+        .unwrap_or(4);
+
+    Some(DmaChannelSchema {
+        channels_per_direction: s2mm_ctrl_count,
+        start_bd_id_width,
+        has_compression,
+        has_out_of_order,
+        has_pause,
+        has_fot,
+        has_axi_errors,
+        has_cross_tile_errors,
+        queue_name,
+        fields,
+        source: SourceAttribution {
+            origin: Source::Am025Json,
+            file: "aie_registers_aie2.json".into(),
+            detail: format!("module={} DMA channel registers", module_name),
         },
     })
 }
@@ -2296,5 +2565,224 @@ mod tests {
         // 4-bit lock IDs (same as compute)
         let lock_acq_id = schema.field(&BdFieldRole::LockAcqId).unwrap();
         assert_eq!(lock_acq_id.bits.width(), 4);
+    }
+
+    // ====================================================================
+    // DMA channel schema extraction tests
+    // ====================================================================
+
+    #[test]
+    fn extract_compute_channel_schema() {
+        use crate::graph::types::{DmaChannelFieldRole, DmaChannelRegKind, DmaDirection};
+
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database not found");
+            return;
+        };
+
+        let json_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+        let mut model =
+            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        populate_tile_modules(&mut model, &db);
+
+        let core = model.tile_types.iter().find(|t| t.name == "core").unwrap();
+        let schema = core
+            .channel_schema
+            .as_ref()
+            .expect("compute tile should have channel schema");
+
+        // Compute tile: 2 channels per direction
+        assert_eq!(schema.channels_per_direction, 2);
+
+        // 4-bit Start_BD_ID (16 BDs)
+        assert_eq!(schema.start_bd_id_width, 4);
+
+        // Compute tile supports compression, OOO, FoT but not pause or AXI errors
+        assert!(schema.has_compression, "compute has compression");
+        assert!(schema.has_out_of_order, "compute has out-of-order");
+        assert!(schema.has_fot, "compute has FoT");
+        assert!(!schema.has_pause, "compute has no pause");
+        assert!(!schema.has_axi_errors, "compute has no AXI errors");
+        assert!(!schema.has_cross_tile_errors, "compute has no cross-tile errors");
+
+        // Queue register named "Start_Queue"
+        assert_eq!(schema.queue_name, "Start_Queue");
+
+        // S2MM Control fields
+        let s2mm_ctrl = schema.fields_for(DmaChannelRegKind::Control, DmaDirection::S2mm);
+        assert!(
+            s2mm_ctrl.iter().any(|f| f.role == DmaChannelFieldRole::FotMode),
+            "S2MM Ctrl should have FoT_Mode"
+        );
+        assert!(
+            s2mm_ctrl.iter().any(|f| f.role == DmaChannelFieldRole::DecompressionEnable),
+            "S2MM Ctrl should have Decompression_Enable"
+        );
+        assert!(
+            s2mm_ctrl.iter().any(|f| f.role == DmaChannelFieldRole::EnableOutOfOrder),
+            "S2MM Ctrl should have Enable_Out_of_Order"
+        );
+
+        // MM2S Control fields -- has Compression, no FoT/OOO
+        let mm2s_ctrl = schema.fields_for(DmaChannelRegKind::Control, DmaDirection::Mm2s);
+        assert!(
+            mm2s_ctrl.iter().any(|f| f.role == DmaChannelFieldRole::CompressionEnable),
+            "MM2S Ctrl should have Compression_Enable"
+        );
+        assert!(
+            !mm2s_ctrl.iter().any(|f| f.role == DmaChannelFieldRole::FotMode),
+            "MM2S Ctrl should NOT have FoT_Mode"
+        );
+
+        // Start Queue: BD_ID width = 4 bits
+        let s2mm_queue = schema.fields_for(DmaChannelRegKind::StartQueue, DmaDirection::S2mm);
+        let bd_id_field = s2mm_queue
+            .iter()
+            .find(|f| f.role == DmaChannelFieldRole::StartBdId)
+            .expect("StartQueue should have Start_BD_ID");
+        assert_eq!(bd_id_field.bits.width(), 4);
+
+        // Status: has Channel_Running, Cur_BD (4-bit)
+        let s2mm_status = schema.fields_for(DmaChannelRegKind::Status, DmaDirection::S2mm);
+        assert!(s2mm_status.iter().any(|f| f.role == DmaChannelFieldRole::ChannelRunning));
+        let cur_bd = s2mm_status
+            .iter()
+            .find(|f| f.role == DmaChannelFieldRole::CurrentBdId)
+            .expect("Status should have Cur_BD");
+        assert_eq!(cur_bd.bits.width(), 4);
+
+        // S2MM-specific stall
+        assert!(s2mm_status.iter().any(|f| f.role == DmaChannelFieldRole::StalledStreamStarvation));
+
+        // MM2S-specific stall
+        let mm2s_status = schema.fields_for(DmaChannelRegKind::Status, DmaDirection::Mm2s);
+        assert!(mm2s_status.iter().any(|f| f.role == DmaChannelFieldRole::StalledStreamBackpressure));
+    }
+
+    #[test]
+    fn extract_memtile_channel_schema() {
+        use crate::graph::types::{DmaChannelFieldRole, DmaChannelRegKind, DmaDirection};
+
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database not found");
+            return;
+        };
+
+        let json_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+        let mut model =
+            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        populate_tile_modules(&mut model, &db);
+
+        let memtile = model.tile_types.iter().find(|t| t.name == "mem_tile").unwrap();
+        let schema = memtile
+            .channel_schema
+            .as_ref()
+            .expect("memtile should have channel schema");
+
+        // MemTile: 6 channels per direction
+        assert_eq!(schema.channels_per_direction, 6);
+
+        // 6-bit Start_BD_ID (64 BDs)
+        assert_eq!(schema.start_bd_id_width, 6);
+
+        // MemTile has cross-tile errors
+        assert!(schema.has_cross_tile_errors, "memtile has cross-tile errors");
+        assert!(!schema.has_axi_errors, "memtile has no AXI errors");
+        assert!(!schema.has_pause, "memtile has no pause");
+
+        // Queue register named "Start_Queue"
+        assert_eq!(schema.queue_name, "Start_Queue");
+
+        // Status Cur_BD should be 6-bit
+        let s2mm_status = schema.fields_for(DmaChannelRegKind::Status, DmaDirection::S2mm);
+        let cur_bd = s2mm_status
+            .iter()
+            .find(|f| f.role == DmaChannelFieldRole::CurrentBdId)
+            .expect("Status should have Cur_BD");
+        assert_eq!(cur_bd.bits.width(), 6, "memtile Cur_BD is 6-bit (64 BDs)");
+
+        // Cross-tile error fields
+        assert!(
+            s2mm_status.iter().any(|f| f.role == DmaChannelFieldRole::ErrorLockAccessUnavailable),
+            "memtile S2MM Status should have Error_Lock_Access_to_Unavailable"
+        );
+        assert!(
+            s2mm_status.iter().any(|f| f.role == DmaChannelFieldRole::ErrorDmAccessUnavailable),
+            "memtile S2MM Status should have Error_DM_Access_to_Unavailable"
+        );
+
+        // Write Count register (S2MM only) -- 17-bit on memtile
+        let wc_fields = schema.fields_for(DmaChannelRegKind::WriteCount, DmaDirection::S2mm);
+        assert!(!wc_fields.is_empty(), "memtile should have WriteCount registers");
+        let wc = wc_fields
+            .iter()
+            .find(|f| f.role == DmaChannelFieldRole::CurrentWriteCount)
+            .expect("WriteCount should have Current_Write_Count");
+        assert_eq!(wc.bits.width(), 17, "memtile write count is 17-bit");
+    }
+
+    #[test]
+    fn extract_shim_channel_schema() {
+        use crate::graph::types::{DmaChannelFieldRole, DmaChannelRegKind, DmaDirection};
+
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database not found");
+            return;
+        };
+
+        let json_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+        let mut model =
+            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        populate_tile_modules(&mut model, &db);
+
+        let shim = model.tile_types.iter().find(|t| t.name == "shim_noc").unwrap();
+        let schema = shim
+            .channel_schema
+            .as_ref()
+            .expect("shim should have channel schema");
+
+        // Shim: 2 channels per direction
+        assert_eq!(schema.channels_per_direction, 2);
+
+        // 4-bit Start_BD_ID
+        assert_eq!(schema.start_bd_id_width, 4);
+
+        // Shim has pause and AXI errors but not compression or cross-tile errors
+        assert!(schema.has_pause, "shim has pause");
+        assert!(schema.has_axi_errors, "shim has AXI errors");
+        assert!(!schema.has_compression, "shim has no compression");
+        assert!(!schema.has_cross_tile_errors, "shim has no cross-tile errors");
+
+        // Queue register named "Task_Queue" (different from compute/memtile!)
+        assert_eq!(schema.queue_name, "Task_Queue");
+
+        // S2MM Control: Pause_Mem, Pause_Stream, no Reset
+        let s2mm_ctrl = schema.fields_for(DmaChannelRegKind::Control, DmaDirection::S2mm);
+        assert!(
+            s2mm_ctrl.iter().any(|f| f.role == DmaChannelFieldRole::PauseMem),
+            "Shim S2MM Ctrl should have Pause_Mem"
+        );
+        assert!(
+            s2mm_ctrl.iter().any(|f| f.role == DmaChannelFieldRole::PauseStream),
+            "Shim S2MM Ctrl should have Pause_Stream"
+        );
+        assert!(
+            !s2mm_ctrl.iter().any(|f| f.role == DmaChannelFieldRole::Reset),
+            "Shim S2MM Ctrl should NOT have Reset"
+        );
+
+        // Status: AXI error fields
+        let s2mm_status = schema.fields_for(DmaChannelRegKind::Status, DmaDirection::S2mm);
+        assert!(
+            s2mm_status.iter().any(|f| f.role == DmaChannelFieldRole::AxiMmDecodeError),
+            "Shim Status should have AXI_MM_Decode_Error"
+        );
+        assert!(
+            s2mm_status.iter().any(|f| f.role == DmaChannelFieldRole::AxiMmSlaveError),
+            "Shim Status should have AXI_MM_Slave_Error"
+        );
     }
 }

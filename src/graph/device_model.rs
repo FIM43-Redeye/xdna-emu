@@ -463,7 +463,8 @@ fn extract_tile_type(
         switchbox_ports,
         shim_mux_ports,
         modules: Vec::new(), // populated by AM025 regdb extractor
-        bd_schema: None,     // populated by BD schema extraction
+        bd_schema: None,        // populated by BD schema extraction
+        channel_schema: None,   // populated by channel schema extraction
         source: SourceAttribution {
             origin: Source::DeviceModel,
             file: file.into(),

@@ -510,6 +510,8 @@ pub struct TileTypeModel {
     pub modules: Vec<ModuleModel>,
     /// DMA buffer descriptor programming schema (populated from register analysis).
     pub bd_schema: Option<BdSchema>,
+    /// DMA channel control/status schema (populated from register analysis).
+    pub channel_schema: Option<DmaChannelSchema>,
     pub source: SourceAttribution,
 }
 
@@ -641,6 +643,214 @@ impl BdSchema {
     /// Find a field by its semantic role.
     pub fn field(&self, role: &BdFieldRole) -> Option<&BdFieldSpec> {
         self.fields.iter().find(|f| &f.role == role)
+    }
+}
+
+// ============================================================================
+// DMA Channel schema
+// ============================================================================
+
+/// DMA transfer direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DmaDirection {
+    /// Stream to Memory (inbound DMA).
+    S2mm,
+    /// Memory to Stream (outbound DMA).
+    Mm2s,
+}
+
+impl fmt::Display for DmaDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::S2mm => write!(f, "S2MM"),
+            Self::Mm2s => write!(f, "MM2S"),
+        }
+    }
+}
+
+/// Which register within the per-channel register set.
+///
+/// Each DMA channel has a fixed set of register types. Control and StartQueue
+/// are per-direction, per-channel. Status registers use a slightly different
+/// naming convention (channel index as suffix, not infix) but are logically
+/// part of the same channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DmaChannelRegKind {
+    /// Channel configuration (enable, reset, compression, FoT mode).
+    Control,
+    /// Task enqueue register (BD ID, repeat count, token issue).
+    /// Named "Start_Queue" on compute/memtile, "Task_Queue" on shim.
+    StartQueue,
+    /// Channel status and error reporting (read-only / write-to-clear).
+    Status,
+    /// Current write count for S2MM channels (read-only, S2MM only).
+    WriteCount,
+    /// Finish-on-TLAST count FIFO (read-only, S2MM only).
+    FotCountFifo,
+}
+
+/// Semantic role of a DMA channel register field.
+///
+/// Derived from AM025 register field names. The roles capture what each
+/// field controls or reports, independent of its bit position (which
+/// varies by tile type).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DmaChannelFieldRole {
+    // -- Control register fields --
+    /// Soft reset the channel.
+    Reset,
+    /// Pause memory-side transfers (shim only).
+    PauseMem,
+    /// Pause stream-side transfers (shim only).
+    PauseStream,
+    /// Enable hardware compression on MM2S output.
+    CompressionEnable,
+    /// Enable hardware decompression on S2MM input.
+    DecompressionEnable,
+    /// Allow out-of-order BD completion (S2MM only).
+    EnableOutOfOrder,
+    /// Token controller ID for completion signaling.
+    ControllerId,
+    /// Finish-on-TLAST mode (S2MM only, 2-bit).
+    FotMode,
+
+    // -- Start/Task Queue fields --
+    /// BD index to start executing.
+    StartBdId,
+    /// Number of times to repeat the task.
+    RepeatCount,
+    /// Emit a completion token when the task finishes.
+    EnableTokenIssue,
+
+    // -- Status register fields --
+    /// Channel state machine (2-bit: IDLE/STARTING/RUNNING).
+    ChannelStatus,
+    /// Stalled waiting for lock acquire.
+    StalledLockAcq,
+    /// Stalled waiting for lock release.
+    StalledLockRel,
+    /// Stalled due to stream starvation (S2MM: no input data).
+    StalledStreamStarvation,
+    /// Stalled due to stream backpressure (MM2S: output blocked).
+    StalledStreamBackpressure,
+    /// Stalled on task completion token (MM2S).
+    StalledTct,
+    /// Stalled on TCT or count FIFO full (S2MM).
+    StalledTctOrCountFifoFull,
+    /// Error: no BD available in chain.
+    ErrorBdUnavailable,
+    /// Error: BD has invalid configuration.
+    ErrorBdInvalid,
+    /// Error: FoT transfer length exceeded.
+    ErrorFotLengthExceeded,
+    /// Error: too many BDs per FoT task.
+    ErrorFotBdsPerTask,
+    /// Error: lock access to unavailable tile (memtile only).
+    ErrorLockAccessUnavailable,
+    /// Error: data memory access to unavailable tile (memtile only).
+    ErrorDmAccessUnavailable,
+    /// AXI memory-mapped decode error (shim only).
+    AxiMmDecodeError,
+    /// AXI memory-mapped slave error (shim only).
+    AxiMmSlaveError,
+    /// Task queue overflow (write-to-clear).
+    TaskQueueOverflow,
+    /// Channel is currently running a task.
+    ChannelRunning,
+    /// Number of tasks queued (3-bit, 0-8).
+    TaskQueueSize,
+    /// Currently executing BD index.
+    CurrentBdId,
+
+    // -- Write Count register fields (S2MM only) --
+    /// Current write byte count for the active transfer.
+    CurrentWriteCount,
+
+    // -- FoT Count FIFO fields (S2MM only) --
+    /// Write count from completed FoT transfer.
+    FotWriteCount,
+    /// BD ID of completed FoT transfer.
+    FotBdId,
+    /// Whether this was the last BD in the task.
+    FotLastInTask,
+    /// Whether this FIFO entry is valid.
+    FotValid,
+
+    /// Reserved or unclassified field.
+    Reserved,
+}
+
+/// One field within a DMA channel register set -- its position and semantic role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DmaChannelFieldSpec {
+    /// AM025 field name (e.g., "Start_BD_ID", "Channel_Running").
+    pub name: String,
+    /// Which register this field belongs to.
+    pub register: DmaChannelRegKind,
+    /// Which DMA direction this field applies to.
+    pub direction: DmaDirection,
+    /// Bit range within the register.
+    pub bits: BitRange,
+    /// What this field controls or reports.
+    pub role: DmaChannelFieldRole,
+}
+
+/// Complete DMA channel programming schema for one tile type.
+///
+/// Derived from DMA channel control/status registers in the AM025 register
+/// database. Captures the per-channel register layout that defines how
+/// software configures and monitors DMA channels on this tile type.
+///
+/// This is the channel-level complement to `BdSchema` (which captures the
+/// per-BD programming interface). Together they define the complete DMA
+/// programming model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DmaChannelSchema {
+    /// Number of channels per direction (e.g., 2 for compute/shim, 6 for memtile).
+    pub channels_per_direction: u8,
+    /// Width of Start_BD_ID field in bits (4 for compute/shim, 6 for memtile).
+    pub start_bd_id_width: u8,
+    /// Whether compression/decompression fields are present.
+    pub has_compression: bool,
+    /// Whether out-of-order BD completion is supported (S2MM only).
+    pub has_out_of_order: bool,
+    /// Whether pause (mem/stream) fields are present (shim only).
+    pub has_pause: bool,
+    /// Whether Finish-on-TLAST mode is supported.
+    pub has_fot: bool,
+    /// Whether AXI bus error fields are present (shim only).
+    pub has_axi_errors: bool,
+    /// Whether cross-tile error fields are present (memtile only).
+    pub has_cross_tile_errors: bool,
+    /// Name of the queue register ("Start_Queue" or "Task_Queue").
+    pub queue_name: String,
+    /// All fields across all channel register types and directions.
+    pub fields: Vec<DmaChannelFieldSpec>,
+    pub source: SourceAttribution,
+}
+
+impl DmaChannelSchema {
+    /// Find a field by its semantic role and direction.
+    pub fn field(
+        &self,
+        role: &DmaChannelFieldRole,
+        direction: DmaDirection,
+    ) -> Option<&DmaChannelFieldSpec> {
+        self.fields
+            .iter()
+            .find(|f| &f.role == role && f.direction == direction)
+    }
+
+    /// Find all fields for a given register kind and direction.
+    pub fn fields_for(
+        &self,
+        reg: DmaChannelRegKind,
+        direction: DmaDirection,
+    ) -> Vec<&DmaChannelFieldSpec> {
+        self.fields
+            .iter()
+            .filter(|f| f.register == reg && f.direction == direction)
+            .collect()
     }
 }
 
@@ -1099,6 +1309,7 @@ mod tests {
             ],
             shim_mux_ports: Vec::new(),
             bd_schema: None,
+            channel_schema: None,
             source: SourceAttribution {
                 origin: Source::DeviceModel,
                 file: "test.json".to_string(),
@@ -1198,6 +1409,7 @@ mod tests {
             ],
             modules: Vec::new(),
             bd_schema: None,
+            channel_schema: None,
             source: SourceAttribution {
                 origin: Source::DeviceModel,
                 file: "test.json".to_string(),
