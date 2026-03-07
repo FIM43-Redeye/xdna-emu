@@ -10,8 +10,8 @@
 //! - **Events**: Cross-subsystem trigger configuration (Event_Selection)
 //! - **Status**: Exceptional condition tracking (Overflow, Underflow)
 
-use crate::device::regdb;
-use crate::graph::types::{
+use crate::regdb;
+use crate::types::{
     Access, BdFieldRole, BdFieldSpec, BdSchema, BitRange, DmaChannelFieldRole,
     DmaChannelFieldSpec, DmaChannelRegKind, DmaChannelSchema, DmaDirection, FieldModel,
     FieldSemantics, ModuleKind, ModuleModel, RegisterModel, Relationship, Source,
@@ -583,7 +583,7 @@ pub fn build_module_model(kind: ModuleKind, module: &regdb::ModuleDef) -> Module
 // Populate ArchModel with register data from AM025
 // ============================================================================
 
-use crate::graph::types::ArchModel;
+use crate::types::ArchModel;
 
 /// Tile type name -> (ModuleKind, AM025 module name) pairs.
 const TILE_MODULE_MAP: &[(&str, &[(ModuleKind, &str)])] = &[
@@ -600,7 +600,7 @@ const TILE_MODULE_MAP: &[(&str, &[(ModuleKind, &str)])] = &[
 /// analysis -- the AM025 register patterns independently reveal how many
 /// locks and BDs each module has.
 pub fn populate_tile_modules(model: &mut ArchModel, db: &regdb::RegisterDb) {
-    use crate::graph::types::{NodeId, Relationship, RelationshipKind};
+    use crate::types::{NodeId, Relationship, RelationshipKind};
 
     let mut new_edges: Vec<Relationship> = Vec::new();
 
@@ -821,7 +821,7 @@ fn extract_bd_schema(
     tile_kind: TileKind,
     module_kind: ModuleKind,
 ) -> (Option<BdSchema>, Vec<Relationship>) {
-    use crate::graph::types::{NodeId, Relationship, RelationshipKind};
+    use crate::types::{NodeId, Relationship, RelationshipKind};
 
     // Find all BD0 registers: DMA_BD0_0, DMA_BD0_1, ... sorted by offset.
     let mut bd0_regs: Vec<&regdb::RegisterDef> = registers
@@ -1087,7 +1087,7 @@ fn extract_channel_schema(
     tile_kind: TileKind,
     module_kind: ModuleKind,
 ) -> (Option<DmaChannelSchema>, Vec<Relationship>) {
-    use crate::graph::types::{NodeId, Relationship, RelationshipKind};
+    use crate::types::{NodeId, Relationship, RelationshipKind};
 
     // Classify all DMA channel registers
     let mut channel_regs: Vec<(DmaChannelRegKind, DmaDirection, u8, &str, &regdb::RegisterDef)> =
@@ -1246,7 +1246,7 @@ fn emit_cross_reference_edges(
     bd_schema: Option<&BdSchema>,
     channel_schema: Option<&DmaChannelSchema>,
 ) -> Vec<Relationship> {
-    use crate::graph::types::{NodeId, RelationshipKind};
+    use crate::types::{NodeId, RelationshipKind};
 
     let mut edges = Vec::new();
     let source = SourceAttribution {
@@ -1471,7 +1471,7 @@ pub fn segment_by_subsystem(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::regdb::{AccessMode, BitField, RegisterDef};
+    use crate::regdb::{AccessMode, BitField, RegisterDef};
 
     /// Helper: create a minimal RegisterDef with given name, offset, and field names.
     fn make_reg(name: &str, offset: u32, field_names: &[&str]) -> RegisterDef {
@@ -1847,7 +1847,11 @@ mod tests {
 
     /// Load the real register database, or skip if unavailable.
     fn load_test_db() -> Option<regdb::RegisterDb> {
-        regdb::RegisterDb::load_for_device("aie2").ok()
+        // CARGO_MANIFEST_DIR is crates/xdna-graph/, go up to npu-work/
+        let json_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..") // up to npu-work/
+            .join("mlir-aie/lib/Dialect/AIE/Util/aie_registers_aie2.json");
+        regdb::RegisterDb::from_file(&json_path).ok()
     }
 
     /// Helper: extract one subsystem profile from a module's registers.
@@ -2521,7 +2525,7 @@ mod tests {
 
     #[test]
     fn integration_populate_tile_modules() {
-        use crate::graph::device_model;
+        use crate::device_model;
         use std::path::PathBuf;
 
         let Some(db) = load_test_db() else {
@@ -2530,7 +2534,7 @@ mod tests {
         };
 
         let json_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tools/aie-device-models.json");
+            .join("../../tools/aie-device-models.json");
         let mut model = device_model::extract_device_model(&json_path, "npu1")
             .expect("device model parse failed");
 
@@ -2621,7 +2625,7 @@ mod tests {
         );
 
         let model = register_def_to_model(&reg, "memory");
-        assert_eq!(model.access, crate::graph::types::Access::ReadOnly);
+        assert_eq!(model.access, crate::types::Access::ReadOnly);
         assert_eq!(model.subsystem, SubsystemKind::Lock);
     }
 
@@ -2636,7 +2640,7 @@ mod tests {
         let module_model = build_module_model(ModuleKind::Memory, mem);
 
         assert_eq!(module_model.kind, ModuleKind::Memory);
-        assert_eq!(module_model.source.origin, crate::graph::types::Source::Am025Json);
+        assert_eq!(module_model.source.origin, crate::types::Source::Am025Json);
 
         // Every register in the AM025 memory module should be converted
         assert_eq!(
@@ -2661,8 +2665,8 @@ mod tests {
 
     #[test]
     fn integration_populate_confirms_instance_counts() {
-        use crate::graph::device_model;
-        use crate::graph::types::Source;
+        use crate::device_model;
+        use crate::types::Source;
         use std::path::PathBuf;
 
         let Some(db) = load_test_db() else {
@@ -2671,7 +2675,7 @@ mod tests {
         };
 
         let json_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tools/aie-device-models.json");
+            .join("../../tools/aie-device-models.json");
         let mut model = device_model::extract_device_model(&json_path, "npu1")
             .expect("device model parse failed");
 
@@ -2719,7 +2723,7 @@ mod tests {
 
     #[test]
     fn extract_compute_bd_schema() {
-        use crate::graph::types::BdFieldRole;
+        use crate::types::BdFieldRole;
 
         let Some(db) = load_test_db() else {
             eprintln!("Skipping: register database not found");
@@ -2727,9 +2731,9 @@ mod tests {
         };
 
         let json_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
         let mut model =
-            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         let core = model.tile_types.iter().find(|t| t.name == "core").unwrap();
@@ -2768,7 +2772,7 @@ mod tests {
 
     #[test]
     fn extract_memtile_bd_schema() {
-        use crate::graph::types::BdFieldRole;
+        use crate::types::BdFieldRole;
 
         let Some(db) = load_test_db() else {
             eprintln!("Skipping: register database not found");
@@ -2776,9 +2780,9 @@ mod tests {
         };
 
         let json_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
         let mut model =
-            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         let mt = model.tile_types.iter().find(|t| t.name == "mem_tile").unwrap();
@@ -2814,7 +2818,7 @@ mod tests {
 
     #[test]
     fn extract_shim_bd_schema() {
-        use crate::graph::types::BdFieldRole;
+        use crate::types::BdFieldRole;
 
         let Some(db) = load_test_db() else {
             eprintln!("Skipping: register database not found");
@@ -2822,9 +2826,9 @@ mod tests {
         };
 
         let json_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
         let mut model =
-            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         let shim = model.tile_types.iter().find(|t| t.name == "shim_noc").unwrap();
@@ -2864,7 +2868,7 @@ mod tests {
 
     #[test]
     fn extract_compute_channel_schema() {
-        use crate::graph::types::{DmaChannelFieldRole, DmaChannelRegKind, DmaDirection};
+        use crate::types::{DmaChannelFieldRole, DmaChannelRegKind, DmaDirection};
 
         let Some(db) = load_test_db() else {
             eprintln!("Skipping: register database not found");
@@ -2872,9 +2876,9 @@ mod tests {
         };
 
         let json_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
         let mut model =
-            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         let core = model.tile_types.iter().find(|t| t.name == "core").unwrap();
@@ -2953,7 +2957,7 @@ mod tests {
 
     #[test]
     fn extract_memtile_channel_schema() {
-        use crate::graph::types::{DmaChannelFieldRole, DmaChannelRegKind, DmaDirection};
+        use crate::types::{DmaChannelFieldRole, DmaChannelRegKind, DmaDirection};
 
         let Some(db) = load_test_db() else {
             eprintln!("Skipping: register database not found");
@@ -2961,9 +2965,9 @@ mod tests {
         };
 
         let json_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
         let mut model =
-            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         let memtile = model.tile_types.iter().find(|t| t.name == "mem_tile").unwrap();
@@ -3016,7 +3020,7 @@ mod tests {
 
     #[test]
     fn extract_shim_channel_schema() {
-        use crate::graph::types::{DmaChannelFieldRole, DmaChannelRegKind, DmaDirection};
+        use crate::types::{DmaChannelFieldRole, DmaChannelRegKind, DmaDirection};
 
         let Some(db) = load_test_db() else {
             eprintln!("Skipping: register database not found");
@@ -3024,9 +3028,9 @@ mod tests {
         };
 
         let json_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
         let mut model =
-            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         let shim = model.tile_types.iter().find(|t| t.name == "shim_noc").unwrap();
@@ -3083,7 +3087,7 @@ mod tests {
 
     #[test]
     fn bd_schema_fields_have_derived_from_edges() {
-        use crate::graph::types::{BdFieldRole, NodeId, RelationshipKind, TileKind};
+        use crate::types::{BdFieldRole, NodeId, RelationshipKind, TileKind};
 
         let Some(db) = load_test_db() else {
             eprintln!("Skipping: register database not found");
@@ -3091,9 +3095,9 @@ mod tests {
         };
 
         let json_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
         let mut model =
-            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         // Every BD field in the compute tile schema should have a DerivedFrom
@@ -3140,7 +3144,7 @@ mod tests {
 
     #[test]
     fn channel_schema_fields_have_derived_from_edges() {
-        use crate::graph::types::{DmaChannelFieldRole, DmaDirection, NodeId, RelationshipKind, TileKind};
+        use crate::types::{DmaChannelFieldRole, DmaDirection, NodeId, RelationshipKind, TileKind};
 
         let Some(db) = load_test_db() else {
             eprintln!("Skipping: register database not found");
@@ -3148,9 +3152,9 @@ mod tests {
         };
 
         let json_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
         let mut model =
-            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         let derived_edges: Vec<_> = model
@@ -3182,7 +3186,7 @@ mod tests {
 
     #[test]
     fn contains_edges_form_hierarchy() {
-        use crate::graph::types::{NodeId, RelationshipKind, TileKind};
+        use crate::types::{NodeId, RelationshipKind, TileKind};
 
         let Some(db) = load_test_db() else {
             eprintln!("Skipping: register database not found");
@@ -3190,9 +3194,9 @@ mod tests {
         };
 
         let json_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
         let mut model =
-            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         let contains: Vec<_> = model
@@ -3252,7 +3256,7 @@ mod tests {
 
     #[test]
     fn belongs_to_edges_classify_registers() {
-        use crate::graph::types::{NodeId, RelationshipKind, SubsystemKind};
+        use crate::types::{NodeId, RelationshipKind, SubsystemKind};
 
         let Some(db) = load_test_db() else {
             eprintln!("Skipping: register database not found");
@@ -3260,9 +3264,9 @@ mod tests {
         };
 
         let json_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
         let mut model =
-            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         let belongs_to: Vec<_> = model
@@ -3300,7 +3304,7 @@ mod tests {
 
     #[test]
     fn references_edges_connect_cross_resource_fields() {
-        use crate::graph::types::{
+        use crate::types::{
             BdFieldRole, DmaChannelFieldRole, DmaDirection, NodeId, RelationshipKind,
             SubsystemKind,
         };
@@ -3311,9 +3315,9 @@ mod tests {
         };
 
         let json_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/aie-device-models.json");
         let mut model =
-            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+            crate::device_model::extract_device_model(&json_path, "npu1").unwrap();
         populate_tile_modules(&mut model, &db);
 
         let refs: Vec<_> = model

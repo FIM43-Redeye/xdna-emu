@@ -1,11 +1,10 @@
 //! NPU Architecture Graph -- queryable hardware model.
 //!
-//! Extracts hardware architecture from the open-source NPU toolchain
-//! (aie-rt, AM025 JSON, device model) into a single typed Rust model.
-//! Multi-architecture: each `ArchModel` represents one architecture
-//! (AIE, AIE2, AIE2P) with all its tile types, registers, and
-//! relationships.
+//! This module re-exports from the `xdna-graph` workspace crate, which
+//! contains the canonical graph types, extractors, and register database
+//! parser. The separate crate enables use from both runtime code and
+//! build.rs for compile-time code generation.
 
-pub mod device_model;
-pub mod regdb_extractor;
-pub mod types;
+pub use xdna_graph::device_model;
+pub use xdna_graph::regdb_extractor;
+pub use xdna_graph::types;

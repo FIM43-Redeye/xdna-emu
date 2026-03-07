@@ -1,19 +1,10 @@
 //! Data-driven register database loaded from AMD AM025 JSON.
 //!
-//! This module loads register definitions from `aie_registers_aie2.json`,
-//! a structured JSON file with 1,806 registers and 6,412 bit fields parsed
-//! from AMD's AM025 (AIE-ML Register Reference) documentation.
-//!
-//! # Why data-driven?
-//!
-//! The emulator previously hand-coded every register offset and bit mask in
-//! `registers_spec.rs`, transcribed from prose documentation. This was
-//! error-prone and hard to keep in sync across architecture revisions.
-//!
-//! By loading from the same JSON that mlir-aie uses, we get:
-//! - **Correctness by construction**: bit layouts come from AMD's own docs
-//! - **Multi-architecture readiness**: load different JSON for AIE2 vs AIE2P
-//! - **Cross-validation**: compare JSON values against our hand-coded constants
+//! Base parsing types (BitField, AccessMode, RegisterDef, ModuleDef,
+//! RegisterDb) are defined in the `xdna-graph` crate and re-exported here.
+//! This module adds emulator-specific extensions: pre-resolved field layouts
+//! for hot-path register access, and the `load_for_device()` convenience
+//! function that uses the emulator's config system for path resolution.
 //!
 //! # Performance
 //!
@@ -24,331 +15,26 @@
 //! # Example
 //!
 //! ```ignore
-//! let db = RegisterDb::load_for_device("aie2").unwrap();
+//! let db = load_for_device("aie2").unwrap();
 //! let mem = db.module("memory").unwrap();
 //! let bd0_0 = mem.register("DMA_BD0_0").unwrap();
 //! let buf_len = bd0_0.field("Buffer_Length").unwrap();
 //! assert_eq!(buf_len.extract(0x0000FFFF), 0x3FFF);
 //! ```
 
-use serde::Deserialize;
-use std::collections::HashMap;
-use std::path::Path;
+// Re-export base types from the graph crate. All consumers of
+// `crate::device::regdb::BitField` etc. continue to work unchanged.
+pub use xdna_graph::regdb::*;
 
-// ============================================================================
-// JSON deserialization types (matching aie_registers_aie2.json schema)
-// ============================================================================
 
-/// Raw JSON structure matching the top level of aie_registers_aie2.json.
-#[derive(Debug, Deserialize)]
-struct RawRegisterDb {
-    version: String,
-    #[allow(dead_code)]
-    source: Option<String>,
-    #[allow(dead_code)]
-    parsed_date: Option<String>,
-    modules: HashMap<String, RawModule>,
-}
-
-/// A module section in the JSON (core, memory, memory_tile, shim).
-#[derive(Debug, Deserialize)]
-struct RawModule {
-    registers: Vec<RawRegister>,
-}
-
-/// A single register definition in the JSON.
-#[derive(Debug, Deserialize)]
-struct RawRegister {
-    name: String,
-    /// Hex string like "0x000001D000"
-    offset: String,
-    /// Register width in bits (default 32).
-    width: Option<u32>,
-    /// Access mode string (e.g. "rwNormal read/write", "roRead-only").
-    #[serde(rename = "type")]
-    access_type: Option<String>,
-    /// Reset value as hex string (e.g. "0x00000000").
-    reset: Option<String>,
-    bit_fields: Vec<RawBitField>,
-}
-
-/// A single bit field within a register.
-#[derive(Debug, Deserialize)]
-struct RawBitField {
-    name: String,
-    /// Array [lsb, msb], e.g. [14, 27] for bits 27:14
-    bit_range: Vec<u32>,
-}
-
-// ============================================================================
-// Processed runtime types (efficient access)
-// ============================================================================
-
-/// A single bit field within a register.
-///
-/// Pre-computed mask and shift enable O(1) field extraction with the same
-/// performance as hand-coded `(value >> SHIFT) & MASK` constants.
-#[derive(Debug, Clone)]
-pub struct BitField {
-    pub name: String,
-    pub lsb: u8,
-    pub msb: u8,
-    pub width: u8,
-    /// Pre-computed mask: `(1 << width) - 1`
-    pub mask: u32,
-    /// Shift amount (same as lsb)
-    pub shift: u8,
-}
-
-impl BitField {
-    /// Extract this field's value from a raw 32-bit register value.
-    #[inline]
-    pub fn extract(&self, value: u32) -> u32 {
-        (value >> self.shift) & self.mask
-    }
-
-    /// Extract this field as a boolean (for single-bit fields).
-    #[inline]
-    pub fn extract_bool(&self, value: u32) -> bool {
-        self.extract(value) != 0
-    }
-
-    /// Insert a value into a register word at this field's position.
-    ///
-    /// Clears the field's bits in `word`, then ORs in `value` (masked to
-    /// field width). Returns the modified word.
-    #[inline]
-    pub fn insert(&self, word: u32, value: u32) -> u32 {
-        let cleared = word & !(self.mask << self.shift);
-        cleared | ((value & self.mask) << self.shift)
-    }
-
-    /// Set this field's single bit to 1 in a register word.
-    ///
-    /// For multi-bit fields, sets only the LSB of the field range.
-    #[inline]
-    pub fn set_bit(&self, word: u32) -> u32 {
-        word | (1 << self.shift)
-    }
-
-    /// Build a BitField from LSB and MSB bit positions.
-    fn from_range(name: String, lsb: u8, msb: u8) -> Self {
-        let width = msb - lsb + 1;
-        let mask = if width >= 32 { u32::MAX } else { (1u32 << width) - 1 };
-        Self { name, lsb, msb, width, mask, shift: lsb }
-    }
-}
-
-/// Register access mode parsed from the JSON "type" field.
-///
-/// These come from the AM025 register reference and describe how the
-/// hardware responds to reads and writes. The emulator uses them to
-/// enforce correct behavior (e.g., ignoring writes to read-only registers).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccessMode {
-    /// Normal read/write register.
-    ReadWrite,
-    /// Read-only register (writes ignored by hardware).
-    ReadOnly,
-    /// Write-only register (reads return reset value or 0).
-    WriteOnly,
-    /// Readable, write-1-to-clear: writing a 1 to a bit clears it.
-    WriteToClear,
-    /// Mixed: individual bit fields have different access modes.
-    Mixed,
-}
-
-impl AccessMode {
-    /// Parse from the JSON type string.
-    fn from_json(s: &str) -> Self {
-        if s.starts_with("rw") {
-            AccessMode::ReadWrite
-        } else if s.starts_with("ro") {
-            AccessMode::ReadOnly
-        } else if s.starts_with("wo") {
-            AccessMode::WriteOnly
-        } else if s.starts_with("wtc") {
-            AccessMode::WriteToClear
-        } else if s.starts_with("mixed") {
-            AccessMode::Mixed
-        } else {
-            // Default to ReadWrite for unknown types
-            AccessMode::ReadWrite
-        }
-    }
-}
-
-/// A register definition with its offset, access mode, reset value,
-/// and bit fields.
-#[derive(Debug, Clone)]
-pub struct RegisterDef {
-    pub name: String,
-    /// Byte offset within the module's address space
-    pub offset: u32,
-    /// Register width in bits (default 32).
-    pub width: u32,
-    /// Access mode (read-write, read-only, write-only, etc.)
-    pub access: AccessMode,
-    /// Power-on reset value for this register.
-    pub reset_value: u32,
-    pub fields: Vec<BitField>,
-}
-
-impl RegisterDef {
-    /// Look up a bit field by name.
-    pub fn field(&self, name: &str) -> Option<&BitField> {
-        self.fields.iter().find(|f| f.name == name)
-    }
-}
-
-/// A module (core, memory, memory_tile, shim) containing registers.
-#[derive(Debug, Clone)]
-pub struct ModuleDef {
-    pub name: String,
-    pub registers: Vec<RegisterDef>,
-    /// Index by name for O(1) lookup
-    register_index: HashMap<String, usize>,
-}
-
-impl ModuleDef {
-    /// Look up a register by name.
-    pub fn register(&self, name: &str) -> Option<&RegisterDef> {
-        self.register_index.get(name).map(|&i| &self.registers[i])
-    }
-
-    /// Iterate over (offset, reset_value) pairs for registers with non-zero
-    /// reset values. Used during tile initialization to set power-on state.
-    pub fn non_zero_reset_values(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
-        self.registers.iter()
-            .filter(|r| r.reset_value != 0)
-            .map(|r| (r.offset, r.reset_value))
-    }
-
-    /// Get all registers with a specific access mode.
-    pub fn registers_with_access(&self, mode: AccessMode) -> impl Iterator<Item = &RegisterDef> {
-        self.registers.iter().filter(move |r| r.access == mode)
-    }
-}
-
-/// The complete register database for one architecture.
-///
-/// Loaded from the AMD AM025 JSON register reference.
-#[derive(Debug, Clone)]
-pub struct RegisterDb {
-    pub version: String,
-    pub modules: HashMap<String, ModuleDef>,
-}
-
-impl RegisterDb {
-    /// Load a register database from a JSON file.
-    pub fn from_file(path: &Path) -> Result<Self, String> {
-        let data = std::fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        Self::from_json(&data)
-    }
-
-    /// Parse a register database from a JSON string.
-    pub fn from_json(json: &str) -> Result<Self, String> {
-        let raw: RawRegisterDb = serde_json::from_str(json)
-            .map_err(|e| format!("Failed to parse register database JSON: {}", e))?;
-
-        let mut modules = HashMap::new();
-
-        for (mod_name, raw_module) in raw.modules {
-            let mut registers = Vec::with_capacity(raw_module.registers.len());
-            let mut register_index = HashMap::new();
-
-            for raw_reg in raw_module.registers {
-                let offset = parse_hex_offset(&raw_reg.offset)?;
-
-                let fields: Vec<BitField> = raw_reg.bit_fields.iter()
-                    .filter(|f| f.name != "Reserved")
-                    .map(|f| {
-                        if f.bit_range.len() != 2 {
-                            return Err(format!(
-                                "Invalid bit_range for {}.{}: expected [lsb, msb]",
-                                raw_reg.name, f.name
-                            ));
-                        }
-                        let lsb = f.bit_range[0] as u8;
-                        let msb = f.bit_range[1] as u8;
-                        Ok(BitField::from_range(f.name.clone(), lsb, msb))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                let width = raw_reg.width.unwrap_or(32);
-                let access = AccessMode::from_json(
-                    raw_reg.access_type.as_deref().unwrap_or("rwNormal")
-                );
-                let reset_value = raw_reg.reset.as_deref()
-                    .map(parse_reset_value)
-                    .unwrap_or(0);
-
-                let idx = registers.len();
-                register_index.insert(raw_reg.name.clone(), idx);
-                registers.push(RegisterDef {
-                    name: raw_reg.name,
-                    offset,
-                    width,
-                    access,
-                    reset_value,
-                    fields,
-                });
-            }
-
-            modules.insert(mod_name.clone(), ModuleDef {
-                name: mod_name,
-                registers,
-                register_index,
-            });
-        }
-
-        Ok(Self {
-            version: raw.version,
-            modules,
-        })
-    }
-
-    /// Load from the mlir-aie install, using the config system.
-    ///
-    /// Resolves the JSON path via `Config::mlir_aie_subpath()`.
-    pub fn load_for_device(device: &str) -> Result<Self, String> {
-        let config = crate::config::Config::get();
-        let json_path = config.mlir_aie_subpath(
-            &format!("lib/Dialect/AIE/Util/aie_registers_{}.json", device)
-        );
-        Self::from_file(&json_path)
-    }
-
-    /// Get a module by name.
-    pub fn module(&self, name: &str) -> Option<&ModuleDef> {
-        self.modules.get(name)
-    }
-}
-
-/// Parse a hex string like "0x000001D000" into a u32 offset.
-///
-/// The JSON uses full 40-bit addresses but we only need the 20-bit tile-local
-/// offset (the lower portion). Since tile-local offsets fit in u32, we parse
-/// as u64 then truncate.
-fn parse_hex_offset(s: &str) -> Result<u32, String> {
-    let hex_str = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))
-        .ok_or_else(|| format!("Expected hex string, got: {}", s))?;
-    let full = u64::from_str_radix(hex_str, 16)
-        .map_err(|e| format!("Invalid hex '{}': {}", s, e))?;
-    // Tile-local offsets are 20 bits (TILE_OFFSET_MASK = 0xFFFFF)
-    Ok(full as u32)
-}
-
-/// Parse a hex reset value string like "0x000006DB" into a u32.
-///
-/// Returns 0 for unparseable values (defensive -- the JSON is well-formed
-/// but we don't want to panic on a missing or malformed reset field).
-fn parse_reset_value(s: &str) -> u32 {
-    let hex_str = s.strip_prefix("0x")
-        .or_else(|| s.strip_prefix("0X"))
-        .unwrap_or(s);
-    u32::from_str_radix(hex_str, 16).unwrap_or(0)
+/// Load a register database from the mlir-aie install, using the
+/// emulator's config system for path resolution.
+pub fn load_for_device(device: &str) -> Result<RegisterDb, String> {
+    let config = crate::config::Config::get();
+    let json_path = config.mlir_aie_subpath(
+        &format!("lib/Dialect/AIE/Util/aie_registers_{}.json", device)
+    );
+    RegisterDb::from_file(&json_path)
 }
 
 // ============================================================================
@@ -1263,7 +949,7 @@ impl DeviceRegLayout {
 
     /// Load from the mlir-aie install for a given device.
     pub fn load_for_device(device: &str) -> Result<Self, String> {
-        let db = RegisterDb::load_for_device(device)?;
+        let db = super::regdb::load_for_device(device)?;
         Self::from_regdb(db)
     }
 }
@@ -1308,7 +994,7 @@ mod tests {
 
     /// Helper to load the real database (skips if not available).
     fn load_test_db() -> Option<RegisterDb> {
-        RegisterDb::load_for_device("aie2").ok()
+        super::load_for_device("aie2").ok()
     }
 
     #[test]
@@ -1410,14 +1096,6 @@ mod tests {
             assert_eq!(bf.extract(word), max_val,
                 "Roundtrip failed for field '{}' [{},{}]", bf.name, bf.lsb, bf.msb);
         }
-    }
-
-    #[test]
-    fn test_parse_hex_offset() {
-        assert_eq!(parse_hex_offset("0x000001D000").unwrap(), 0x1D000);
-        assert_eq!(parse_hex_offset("0x000001F000").unwrap(), 0x1F000);
-        assert_eq!(parse_hex_offset("0x0000000000").unwrap(), 0x0);
-        assert_eq!(parse_hex_offset("0x00000A0000").unwrap(), 0xA0000);
     }
 
     #[test]
@@ -1921,27 +1599,6 @@ mod tests {
     // ====================================================================
     // Tier 3: Register metadata (reset values, access modes, widths)
     // ====================================================================
-
-    #[test]
-    fn test_parse_reset_value() {
-        assert_eq!(parse_reset_value("0x00000000"), 0);
-        assert_eq!(parse_reset_value("0x000006DB"), 0x6DB);
-        assert_eq!(parse_reset_value("0xFFFFFFFF"), 0xFFFFFFFF);
-        assert_eq!(parse_reset_value("0x00000002"), 2);
-        // Defensive: garbage input returns 0
-        assert_eq!(parse_reset_value("not_hex"), 0);
-    }
-
-    #[test]
-    fn test_access_mode_from_json() {
-        assert_eq!(AccessMode::from_json("rwNormal read/write"), AccessMode::ReadWrite);
-        assert_eq!(AccessMode::from_json("roRead-only"), AccessMode::ReadOnly);
-        assert_eq!(AccessMode::from_json("woWrite-only"), AccessMode::WriteOnly);
-        assert_eq!(AccessMode::from_json("wtcReadable, write a 1 to clear"), AccessMode::WriteToClear);
-        assert_eq!(AccessMode::from_json("mixedMixed types"), AccessMode::Mixed);
-        // Unknown defaults to ReadWrite
-        assert_eq!(AccessMode::from_json("unknown"), AccessMode::ReadWrite);
-    }
 
     #[test]
     fn test_register_width_and_access_parsed() {

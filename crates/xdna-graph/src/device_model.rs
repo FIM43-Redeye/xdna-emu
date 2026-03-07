@@ -16,7 +16,7 @@ use std::path::Path;
 
 use serde_json::{Map, Value};
 
-use super::types::*;
+use crate::types::*;
 
 // ============================================================================
 // Error type
@@ -610,7 +610,9 @@ mod tests {
     use std::path::PathBuf;
 
     fn json_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json")
+        // CARGO_MANIFEST_DIR is crates/xdna-graph/, go up to xdna-emu root
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/aie-device-models.json")
     }
 
     // Test 1: Full parse -- all 12 devices parse without error.

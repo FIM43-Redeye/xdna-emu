@@ -4535,10 +4535,21 @@ dependencies = [
  "sha2",
  "smallvec",
  "tblgen",
+ "tempfile",
  "thiserror 2.0.17",
  "toml",
  "uuid",
+ "xdna-graph",
  "zerocopy",
+]
+
+[[package]]
+name = "xdna-graph"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
