@@ -12,8 +12,8 @@
 
 use crate::device::regdb;
 use crate::graph::types::{
-    Access, BitRange, FieldModel, FieldSemantics, ModuleKind, ModuleModel, RegisterModel,
-    Source, SourceAttribution, SubsystemKind,
+    Access, BdFieldRole, BdFieldSpec, BdSchema, BitRange, FieldModel, FieldSemantics,
+    ModuleKind, ModuleModel, RegisterModel, Source, SourceAttribution, SubsystemKind,
 };
 
 // ============================================================================
@@ -593,6 +593,10 @@ const TILE_MODULE_MAP: &[(&str, &[(ModuleKind, &str)])] = &[
 
 /// Populate the `modules` field on each `TileTypeModel` in an `ArchModel`
 /// using register definitions from the AM025 register database.
+///
+/// Also confirms `instances.locks` and `instances.bds` from register group
+/// analysis -- the AM025 register patterns independently reveal how many
+/// locks and BDs each module has.
 pub fn populate_tile_modules(model: &mut ArchModel, db: &regdb::RegisterDb) {
     for tile_type in &mut model.tile_types {
         let mapping = TILE_MODULE_MAP
@@ -603,10 +607,187 @@ pub fn populate_tile_modules(model: &mut ArchModel, db: &regdb::RegisterDb) {
             for &(kind, am025_name) in *module_pairs {
                 if let Some(module_def) = db.module(am025_name) {
                     tile_type.modules.push(build_module_model(kind, module_def));
+
+                    // Confirm instance counts from register group analysis.
+                    let profiles = extract_module_profiles(&module_def.registers);
+                    for profile in &profiles {
+                        let am025_source = SourceAttribution {
+                            origin: Source::Am025Json,
+                            file: "aie_registers_aie2.json".into(),
+                            detail: format!(
+                                "module={}, subsystem={} register grouping",
+                                am025_name, profile.subsystem
+                            ),
+                        };
+                        match profile.kind {
+                            SubsystemKind::Lock => {
+                                tile_type.instances.locks.confirm(
+                                    profile.instance_count as u8,
+                                    am025_source,
+                                );
+                            }
+                            SubsystemKind::Dma => {
+                                tile_type.instances.bds.confirm(
+                                    profile.instance_count as u8,
+                                    am025_source,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // Extract BD schema from DMA BD registers if this
+                    // module contains them and we haven't extracted one yet.
+                    if tile_type.bd_schema.is_none() {
+                        tile_type.bd_schema =
+                            extract_bd_schema(&module_def.registers, am025_name);
+                    }
                 }
             }
         }
     }
+}
+
+// ============================================================================
+// BD schema extraction
+// ============================================================================
+
+/// Map an AM025 BD field name to its semantic role.
+fn bd_field_name_to_role(name: &str) -> BdFieldRole {
+    match name {
+        "Buffer_Length" => BdFieldRole::BufferLength,
+        "Base_Address" | "Base_Address_Low" => BdFieldRole::BaseAddress,
+        "Base_Address_High" => BdFieldRole::BaseAddressHigh,
+        "D0_Stepsize" => BdFieldRole::Stepsize(0),
+        "D1_Stepsize" => BdFieldRole::Stepsize(1),
+        "D2_Stepsize" => BdFieldRole::Stepsize(2),
+        "D3_Stepsize" => BdFieldRole::Stepsize(3),
+        "D0_Wrap" => BdFieldRole::Wrap(0),
+        "D1_Wrap" => BdFieldRole::Wrap(1),
+        "D2_Wrap" => BdFieldRole::Wrap(2),
+        "D0_Zero_Before" => BdFieldRole::ZeroPadBefore(0),
+        "D1_Zero_Before" => BdFieldRole::ZeroPadBefore(1),
+        "D2_Zero_Before" => BdFieldRole::ZeroPadBefore(2),
+        "D0_Zero_After" => BdFieldRole::ZeroPadAfter(0),
+        "D1_Zero_After" => BdFieldRole::ZeroPadAfter(1),
+        "D2_Zero_After" => BdFieldRole::ZeroPadAfter(2),
+        "Iteration_Stepsize" => BdFieldRole::IterationStepsize,
+        "Iteration_Wrap" => BdFieldRole::IterationWrap,
+        "Iteration_Current" => BdFieldRole::IterationCurrent,
+        "Lock_Acq_ID" => BdFieldRole::LockAcqId,
+        "Lock_Acq_Value" => BdFieldRole::LockAcqValue,
+        "Lock_Acq_Enable" => BdFieldRole::LockAcqEnable,
+        "Lock_Rel_ID" => BdFieldRole::LockRelId,
+        "Lock_Rel_Value" => BdFieldRole::LockRelValue,
+        "Valid_BD" => BdFieldRole::ValidBd,
+        "Use_Next_BD" => BdFieldRole::UseNextBd,
+        "Next_BD" => BdFieldRole::NextBd,
+        "Enable_Packet" => BdFieldRole::EnablePacket,
+        "Packet_ID" => BdFieldRole::PacketId,
+        "Packet_Type" => BdFieldRole::PacketType,
+        "Out_Of_Order_BD_ID" => BdFieldRole::OutOfOrderBdId,
+        "TLAST_Suppress" => BdFieldRole::TlastSuppress,
+        "Enable_Compression" => BdFieldRole::EnableCompression,
+        "Burst_Length" => BdFieldRole::BurstLength,
+        "SMID" => BdFieldRole::Smid,
+        "AxCache" => BdFieldRole::AxCache,
+        "AxQoS" => BdFieldRole::AxQos,
+        "Secure_Access" => BdFieldRole::SecureAccess,
+        "Reserved" => BdFieldRole::Reserved,
+        _ => BdFieldRole::Reserved,
+    }
+}
+
+/// Extract a BD schema from a module's registers.
+///
+/// Finds DMA_BD0_* registers (the representative BD), extracts all fields
+/// with their bit positions and semantic roles. Returns `None` if the module
+/// has no DMA BD registers.
+fn extract_bd_schema(
+    registers: &[regdb::RegisterDef],
+    module_name: &str,
+) -> Option<BdSchema> {
+    // Find all BD0 registers: DMA_BD0_0, DMA_BD0_1, ... sorted by offset.
+    let mut bd0_regs: Vec<&regdb::RegisterDef> = registers
+        .iter()
+        .filter(|r| r.name.starts_with("DMA_BD0_"))
+        .collect();
+
+    if bd0_regs.is_empty() {
+        return None;
+    }
+
+    bd0_regs.sort_by_key(|r| r.offset);
+    let words_per_bd = bd0_regs.len() as u8;
+
+    // Extract fields from each word of BD0.
+    let mut fields = Vec::new();
+    for (word_idx, reg) in bd0_regs.iter().enumerate() {
+        for field_def in &reg.fields {
+            let role = bd_field_name_to_role(&field_def.name);
+            let bits = if field_def.msb >= field_def.lsb {
+                BitRange::Contiguous {
+                    msb: field_def.msb as u8,
+                    lsb: field_def.lsb as u8,
+                }
+            } else {
+                BitRange::Contiguous { msb: 0, lsb: 0 }
+            };
+
+            fields.push(BdFieldSpec {
+                name: field_def.name.clone(),
+                word: word_idx as u8,
+                bits,
+                role,
+            });
+        }
+    }
+
+    // Sort by (word, lsb) for deterministic ordering.
+    fields.sort_by(|a, b| {
+        let a_lsb = match &a.bits {
+            BitRange::Contiguous { lsb, .. } => *lsb,
+            BitRange::Split(frags) => frags.last().map(|(_, l)| *l).unwrap_or(0),
+        };
+        let b_lsb = match &b.bits {
+            BitRange::Contiguous { lsb, .. } => *lsb,
+            BitRange::Split(frags) => frags.last().map(|(_, l)| *l).unwrap_or(0),
+        };
+        (a.word, a_lsb).cmp(&(b.word, b_lsb))
+    });
+
+    // Derive capabilities from field presence.
+    let has_field = |role: &BdFieldRole| fields.iter().any(|f| &f.role == role);
+    let has_zero_padding = has_field(&BdFieldRole::ZeroPadBefore(0));
+    let has_axi_fields = has_field(&BdFieldRole::BurstLength)
+        || has_field(&BdFieldRole::Smid)
+        || has_field(&BdFieldRole::AxCache);
+
+    // Count addressing dimensions: D0 always present, check D1/D2/D3.
+    let num_dimensions = if has_field(&BdFieldRole::Stepsize(3)) {
+        4
+    } else if has_field(&BdFieldRole::Stepsize(2)) {
+        3
+    } else if has_field(&BdFieldRole::Stepsize(1)) {
+        2
+    } else if has_field(&BdFieldRole::Stepsize(0)) {
+        1
+    } else {
+        0
+    };
+
+    Some(BdSchema {
+        words_per_bd,
+        num_dimensions,
+        has_zero_padding,
+        has_axi_fields,
+        fields,
+        source: SourceAttribution {
+            origin: Source::Am025Json,
+            file: "aie_registers_aie2.json".into(),
+            detail: format!("module={} DMA_BD0 field layout", module_name),
+        },
+    })
 }
 
 // ============================================================================
@@ -1916,5 +2097,204 @@ mod tests {
             .find(|r| r.name == "DMA_BD0_0")
             .expect("DMA_BD0_0 should exist");
         assert_eq!(dma0.subsystem, SubsystemKind::Dma);
+    }
+
+    #[test]
+    fn integration_populate_confirms_instance_counts() {
+        use crate::graph::device_model;
+        use crate::graph::types::Source;
+        use std::path::PathBuf;
+
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database not found");
+            return;
+        };
+
+        let json_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tools/aie-device-models.json");
+        let mut model = device_model::extract_device_model(&json_path, "npu1")
+            .expect("device model parse failed");
+
+        // Before populate: instances come from device model only (1 source each)
+        let core = model.tile_types.iter().find(|t| t.name == "core").unwrap();
+        assert_eq!(core.instances.locks.sources().len(), 1);
+        assert_eq!(core.instances.bds.sources().len(), 1);
+        assert_eq!(core.instances.channels.sources().len(), 1);
+
+        populate_tile_modules(&mut model, &db);
+
+        // After populate: locks and bds confirmed by AM025 (2 sources),
+        // channels has no register-level signal (stays at 1 source)
+        let core = model.tile_types.iter().find(|t| t.name == "core").unwrap();
+        assert_eq!(core.instances.locks.sources().len(), 2, "locks should be confirmed by AM025");
+        assert_eq!(core.instances.bds.sources().len(), 2, "bds should be confirmed by AM025");
+        assert_eq!(core.instances.channels.sources().len(), 1, "channels has no register signal");
+
+        // Values should match what device model provided
+        assert_eq!(*core.instances.locks.value(), 16);
+        assert_eq!(*core.instances.bds.value(), 16);
+
+        // Second source should be AM025
+        assert_eq!(core.instances.locks.sources()[1].origin, Source::Am025Json);
+        assert_eq!(core.instances.bds.sources()[1].origin, Source::Am025Json);
+
+        // MemTile too
+        let mt = model.tile_types.iter().find(|t| t.name == "mem_tile").unwrap();
+        assert_eq!(mt.instances.locks.sources().len(), 2);
+        assert_eq!(mt.instances.bds.sources().len(), 2);
+        assert_eq!(*mt.instances.locks.value(), 64);
+        assert_eq!(*mt.instances.bds.value(), 48);
+
+        // Shim too
+        let shim = model.tile_types.iter().find(|t| t.name == "shim_noc").unwrap();
+        assert_eq!(shim.instances.locks.sources().len(), 2);
+        assert_eq!(shim.instances.bds.sources().len(), 2);
+        assert_eq!(*shim.instances.locks.value(), 16);
+        assert_eq!(*shim.instances.bds.value(), 16);
+    }
+
+    // ====================================================================
+    // BD schema extraction tests
+    // ====================================================================
+
+    #[test]
+    fn extract_compute_bd_schema() {
+        use crate::graph::types::BdFieldRole;
+
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database not found");
+            return;
+        };
+
+        let json_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+        let mut model =
+            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        populate_tile_modules(&mut model, &db);
+
+        let core = model.tile_types.iter().find(|t| t.name == "core").unwrap();
+        let schema = core.bd_schema.as_ref().expect("compute tile should have BD schema");
+
+        // Compute tile: 6 words per BD, 3 addressing dimensions
+        assert_eq!(schema.words_per_bd, 6);
+        assert_eq!(schema.num_dimensions, 3);
+        assert!(!schema.has_zero_padding, "compute tile has no zero padding");
+        assert!(!schema.has_axi_fields, "compute tile has no AXI fields");
+
+        // Check key fields exist with correct bit widths
+        let buf_len = schema.field(&BdFieldRole::BufferLength)
+            .expect("should have BufferLength");
+        assert_eq!(buf_len.word, 0);
+        assert_eq!(buf_len.bits.width(), 14);
+
+        let base_addr = schema.field(&BdFieldRole::BaseAddress)
+            .expect("should have BaseAddress");
+        assert_eq!(base_addr.word, 0);
+        assert_eq!(base_addr.bits.width(), 14);
+
+        let d0_step = schema.field(&BdFieldRole::Stepsize(0))
+            .expect("should have D0_Stepsize");
+        assert_eq!(d0_step.bits.width(), 13);
+
+        let lock_acq_id = schema.field(&BdFieldRole::LockAcqId)
+            .expect("should have LockAcqId");
+        assert_eq!(lock_acq_id.bits.width(), 4);
+
+        // No shim-only or memtile-only fields
+        assert!(schema.field(&BdFieldRole::BaseAddressHigh).is_none());
+        assert!(schema.field(&BdFieldRole::ZeroPadBefore(0)).is_none());
+        assert!(schema.field(&BdFieldRole::BurstLength).is_none());
+    }
+
+    #[test]
+    fn extract_memtile_bd_schema() {
+        use crate::graph::types::BdFieldRole;
+
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database not found");
+            return;
+        };
+
+        let json_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+        let mut model =
+            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        populate_tile_modules(&mut model, &db);
+
+        let mt = model.tile_types.iter().find(|t| t.name == "mem_tile").unwrap();
+        let schema = mt.bd_schema.as_ref().expect("memtile should have BD schema");
+
+        // MemTile: 8 words per BD, 4 addressing dimensions, zero padding
+        assert_eq!(schema.words_per_bd, 8);
+        assert_eq!(schema.num_dimensions, 4);
+        assert!(schema.has_zero_padding, "memtile has zero padding");
+        assert!(!schema.has_axi_fields, "memtile has no AXI fields");
+
+        // Wider fields than compute
+        let buf_len = schema.field(&BdFieldRole::BufferLength).unwrap();
+        assert_eq!(buf_len.bits.width(), 17);
+
+        let base_addr = schema.field(&BdFieldRole::BaseAddress).unwrap();
+        assert_eq!(base_addr.bits.width(), 19);
+
+        let d0_step = schema.field(&BdFieldRole::Stepsize(0)).unwrap();
+        assert_eq!(d0_step.bits.width(), 17);
+
+        // Memtile has D3 stepsize (4th dimension)
+        assert!(schema.field(&BdFieldRole::Stepsize(3)).is_some());
+
+        // Zero padding fields present
+        assert!(schema.field(&BdFieldRole::ZeroPadBefore(0)).is_some());
+        assert!(schema.field(&BdFieldRole::ZeroPadAfter(0)).is_some());
+
+        // 8-bit lock IDs (192-entry address space for cross-column)
+        let lock_acq_id = schema.field(&BdFieldRole::LockAcqId).unwrap();
+        assert_eq!(lock_acq_id.bits.width(), 8);
+    }
+
+    #[test]
+    fn extract_shim_bd_schema() {
+        use crate::graph::types::BdFieldRole;
+
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database not found");
+            return;
+        };
+
+        let json_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+        let mut model =
+            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        populate_tile_modules(&mut model, &db);
+
+        let shim = model.tile_types.iter().find(|t| t.name == "shim_noc").unwrap();
+        let schema = shim.bd_schema.as_ref().expect("shim should have BD schema");
+
+        // Shim: 8 words per BD, 3 addressing dimensions, AXI fields
+        assert_eq!(schema.words_per_bd, 8);
+        assert_eq!(schema.num_dimensions, 3);
+        assert!(!schema.has_zero_padding, "shim has no zero padding");
+        assert!(schema.has_axi_fields, "shim has AXI fields");
+
+        // 32-bit buffer length (full word), 46-bit split address
+        let buf_len = schema.field(&BdFieldRole::BufferLength).unwrap();
+        assert_eq!(buf_len.bits.width(), 32);
+
+        let base_low = schema.field(&BdFieldRole::BaseAddress).unwrap();
+        assert_eq!(base_low.bits.width(), 30);
+
+        let base_high = schema.field(&BdFieldRole::BaseAddressHigh)
+            .expect("shim has split base address");
+        assert_eq!(base_high.bits.width(), 16);
+
+        // AXI-specific fields
+        assert!(schema.field(&BdFieldRole::BurstLength).is_some());
+        assert!(schema.field(&BdFieldRole::Smid).is_some());
+        assert!(schema.field(&BdFieldRole::AxCache).is_some());
+        assert!(schema.field(&BdFieldRole::SecureAccess).is_some());
+
+        // 4-bit lock IDs (same as compute)
+        let lock_acq_id = schema.field(&BdFieldRole::LockAcqId).unwrap();
+        assert_eq!(lock_acq_id.bits.width(), 4);
     }
 }

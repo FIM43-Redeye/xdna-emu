@@ -444,20 +444,26 @@ fn extract_tile_type(
         }
     };
 
+    let instance_source = SourceAttribution {
+        origin: Source::DeviceModel,
+        file: file.into(),
+        detail: format!("{}.instances", ctx),
+    };
     Ok(TileTypeModel {
         kind,
         name: name.to_string(),
         representative,
         instances: InstanceCount {
-            locks: num_locks,
-            bds: num_bds,
-            channels,
+            locks: Confirmed::new(num_locks, instance_source.clone()),
+            bds: Confirmed::new(num_bds, instance_source.clone()),
+            channels: Confirmed::new(channels, instance_source),
         },
         memory,
         dma_capabilities: None, // populated by aie-rt extractor
         switchbox_ports,
         shim_mux_ports,
         modules: Vec::new(), // populated by AM025 regdb extractor
+        bd_schema: None,     // populated by BD schema extraction
         source: SourceAttribution {
             origin: Source::DeviceModel,
             file: file.into(),
@@ -661,14 +667,14 @@ mod tests {
         let core_mem = core.memory.as_ref().expect("core should have memory");
         assert_eq!(core_mem.program_memory_bytes, Some(16384));
         assert_eq!(core_mem.size_bytes, 65536);
-        assert_eq!(core.instances.locks, 16);
-        assert_eq!(core.instances.bds, 16);
+        assert_eq!(*core.instances.locks.value(), 16);
+        assert_eq!(*core.instances.bds.value(), 16);
 
         // Memtile
         let memtile = model.tile_types.iter().find(|t| t.name == "mem_tile").expect("no memtile");
         assert_eq!(memtile.kind, TileKind::Mem);
-        assert_eq!(memtile.instances.bds, 48);
-        assert_eq!(memtile.instances.locks, 64);
+        assert_eq!(*memtile.instances.bds.value(), 48);
+        assert_eq!(*memtile.instances.locks.value(), 64);
         let mt_mem = memtile.memory.as_ref().expect("memtile should have memory");
         assert_eq!(mt_mem.size_bytes, 524288);
         assert_eq!(mt_mem.program_memory_bytes, None);
@@ -816,13 +822,13 @@ mod tests {
         let model = extract_device_model(&json_path(), "npu1").expect("parse failed");
 
         let core = model.tile_types.iter().find(|t| t.name == "core").unwrap();
-        assert_eq!(core.instances.channels, 2, "core should have 2 DMA channels");
+        assert_eq!(*core.instances.channels.value(), 2, "core should have 2 DMA channels");
 
         let memtile = model.tile_types.iter().find(|t| t.name == "mem_tile").unwrap();
-        assert_eq!(memtile.instances.channels, 6, "memtile should have 6 DMA channels");
+        assert_eq!(*memtile.instances.channels.value(), 6, "memtile should have 6 DMA channels");
 
         let shim = model.tile_types.iter().find(|t| t.name == "shim_noc").unwrap();
-        assert_eq!(shim.instances.channels, 2, "shim should have 2 DMA channels (from shim_mux)");
+        assert_eq!(*shim.instances.channels.value(), 2, "shim should have 2 DMA channels (from shim_mux)");
     }
 
     // Test: DeviceConstants populated correctly.

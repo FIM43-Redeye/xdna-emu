@@ -85,26 +85,6 @@ impl fmt::Display for TileKind {
 // Cross-source confirmation
 // ============================================================================
 
-/// Error when sources disagree on a fact's value.
-#[derive(Debug, Clone)]
-pub struct ConflictError {
-    pub existing_sources: Vec<SourceAttribution>,
-    pub new_source: SourceAttribution,
-    pub detail: String,
-}
-
-impl fmt::Display for ConflictError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "source conflict: {} disagrees with {} existing source(s): {}",
-            self.new_source,
-            self.existing_sources.len(),
-            self.detail,
-        )
-    }
-}
-
 /// Compare hardware-relevant content, ignoring provenance metadata.
 ///
 /// Types that carry `SourceAttribution` or other metadata should implement
@@ -136,13 +116,12 @@ impl NoProvenance for u64 {}
 impl NoProvenance for i32 {}
 impl NoProvenance for bool {}
 impl NoProvenance for String {}
-impl NoProvenance for InstanceCount {}
 
 /// A fact confirmed by one or more toolchain sources.
 ///
 /// Every fact in the graph is wrapped in `Confirmed<T>`. The first source
 /// establishes the value; subsequent sources must agree (via `FactEquals`)
-/// or the confirmation fails with `ConflictError`.
+/// or the confirmation panics with a detailed conflict message.
 ///
 /// Comparison between `Confirmed` values uses only the inner value, not
 /// the source list -- two facts are equal if the hardware data matches,
@@ -163,21 +142,21 @@ impl<T: FactEquals> Confirmed<T> {
     }
 
     /// Confirm the fact from an additional source.
-    /// Returns `Err(ConflictError)` if the value disagrees.
-    pub fn confirm(
-        &mut self,
-        value: T,
-        source: SourceAttribution,
-    ) -> Result<(), ConflictError> {
+    ///
+    /// Panics if the new value disagrees with the existing value. A conflict
+    /// means either a parser bug or a real inconsistency between toolchain
+    /// sources -- both demand immediate attention.
+    pub fn confirm(&mut self, value: T, source: SourceAttribution) {
         if self.value.fact_equals(&value) {
             self.sources.push(source);
-            Ok(())
         } else {
-            Err(ConflictError {
-                existing_sources: self.sources.clone(),
-                new_source: source,
-                detail: String::new(),
-            })
+            let existing: Vec<String> =
+                self.sources.iter().map(|s| format!("{}", s)).collect();
+            panic!(
+                "GRAPH CONFLICT: {} disagrees with existing source(s) [{}]",
+                source,
+                existing.join(", "),
+            );
         }
     }
 
@@ -450,12 +429,17 @@ pub struct PortBundle {
 
 /// Instance counts for repeated hardware elements within a tile type.
 ///
+/// Each field is independently `Confirmed` because sources are patchwork:
+/// the device model provides all three, AM025 register analysis can confirm
+/// locks and BDs (from register group counts), but has no signal for channels.
+/// Single-source fields are automatically correct; multi-source fields must agree.
+///
 /// Memory banking info (num_banks, bank_size) lives in `MemoryModel`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceCount {
-    pub locks: u8,
-    pub bds: u8,
-    pub channels: u8,
+    pub locks: Confirmed<u8>,
+    pub bds: Confirmed<u8>,
+    pub channels: Confirmed<u8>,
 }
 
 /// A functional module within a tile (Layer 2+: registers grouped by function).
@@ -524,6 +508,8 @@ pub struct TileTypeModel {
     pub shim_mux_ports: Vec<PortBundle>,
     /// Register modules (populated in Layer 2).
     pub modules: Vec<ModuleModel>,
+    /// DMA buffer descriptor programming schema (populated from register analysis).
+    pub bd_schema: Option<BdSchema>,
     pub source: SourceAttribution,
 }
 
@@ -544,6 +530,118 @@ pub struct DmaCapabilities {
     pub supports_tlast_suppress: bool,
     /// Number of addressing dimensions (typically 3 or 4).
     pub max_address_dimensions: u8,
+}
+
+// ============================================================================
+// DMA Buffer Descriptor schema
+// ============================================================================
+
+/// Semantic role of a BD field -- what this field controls in the DMA engine.
+///
+/// Derived from AM025 register field names via pattern matching. The naming
+/// convention is stable across architecture revisions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BdFieldRole {
+    /// Transfer length in address generation granularity units.
+    BufferLength,
+    /// Base address (or low half for shim split addresses).
+    BaseAddress,
+    /// High bits of base address (shim tiles only, 46-bit DDR addressing).
+    BaseAddressHigh,
+    /// Per-dimension step size. Dimension 0-3.
+    Stepsize(u8),
+    /// Per-dimension wrap count. Dimension 0-3.
+    Wrap(u8),
+    /// Zero-padding before transfer, per dimension (memtile only).
+    ZeroPadBefore(u8),
+    /// Zero-padding after transfer, per dimension (memtile only).
+    ZeroPadAfter(u8),
+    /// Iteration (outermost loop) step size.
+    IterationStepsize,
+    /// Iteration wrap count.
+    IterationWrap,
+    /// Iteration current counter.
+    IterationCurrent,
+    /// Lock ID to acquire before transfer.
+    LockAcqId,
+    /// Lock value for acquire operation.
+    LockAcqValue,
+    /// Whether lock acquire is enabled.
+    LockAcqEnable,
+    /// Lock ID to release after transfer.
+    LockRelId,
+    /// Lock value for release operation.
+    LockRelValue,
+    /// BD contains valid configuration.
+    ValidBd,
+    /// Chain to next BD after completion.
+    UseNextBd,
+    /// Index of the next BD in chain.
+    NextBd,
+    /// Enable packet header insertion (MM2S).
+    EnablePacket,
+    /// Packet ID for header.
+    PacketId,
+    /// Packet type for header.
+    PacketType,
+    /// Out-of-order BD ID for reordering.
+    OutOfOrderBdId,
+    /// Suppress TLAST signal on last beat.
+    TlastSuppress,
+    /// Enable hardware compression/decompression.
+    EnableCompression,
+    /// AXI burst length (shim only).
+    BurstLength,
+    /// AXI stream master ID (shim only).
+    Smid,
+    /// AXI cache policy (shim only).
+    AxCache,
+    /// AXI quality of service (shim only).
+    AxQos,
+    /// AXI secure access flag (shim only).
+    SecureAccess,
+    /// Reserved or unclassified field.
+    Reserved,
+}
+
+/// One field within a buffer descriptor -- its position and semantic role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BdFieldSpec {
+    /// AM025 field name (e.g., "Buffer_Length", "D0_Stepsize").
+    pub name: String,
+    /// Which BD word this field lives in (0-based).
+    pub word: u8,
+    /// Bit range within that word.
+    pub bits: BitRange,
+    /// What this field controls.
+    pub role: BdFieldRole,
+}
+
+/// Complete BD programming schema for one tile type.
+///
+/// Derived from DMA BD register groups in the AM025 register database.
+/// Captures the BD layout (how many words, what fields, what widths) that
+/// defines the DMA programming interface for this tile type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BdSchema {
+    /// How many 32-bit words per BD (6 for compute, 8 for memtile/shim).
+    pub words_per_bd: u8,
+    /// Number of addressing dimensions (3 for compute, 4 for memtile/shim).
+    pub num_dimensions: u8,
+    /// Whether zero-padding fields are present (memtile only).
+    pub has_zero_padding: bool,
+    /// Whether AXI bus fields are present (shim only).
+    pub has_axi_fields: bool,
+    /// All fields in the BD, ordered by (word, lsb).
+    pub fields: Vec<BdFieldSpec>,
+    pub source: SourceAttribution,
+}
+
+impl BdSchema {
+    /// Find a field by its semantic role.
+    pub fn field(&self, role: &BdFieldRole) -> Option<&BdFieldSpec> {
+        self.fields.iter().find(|f| &f.role == role)
+    }
 }
 
 /// Device-level hardware constants.
@@ -703,6 +801,16 @@ mod tests {
         }
     }
 
+    /// Convenience: create an InstanceCount with a test source for all fields.
+    fn test_instances(locks: u8, bds: u8, channels: u8) -> InstanceCount {
+        let src = test_source(Source::DeviceModel, "test");
+        InstanceCount {
+            locks: Confirmed::new(locks, src.clone()),
+            bds: Confirmed::new(bds, src.clone()),
+            channels: Confirmed::new(channels, src),
+        }
+    }
+
     #[test]
     fn confirmed_new_has_one_source() {
         let c = Confirmed::new(16u8, test_source(Source::DeviceModel, "locks"));
@@ -714,18 +822,15 @@ mod tests {
     #[test]
     fn confirmed_matching_value_succeeds() {
         let mut c = Confirmed::new(16u8, test_source(Source::DeviceModel, "locks"));
-        let result = c.confirm(16u8, test_source(Source::Am025Json, "register analysis"));
-        assert!(result.is_ok());
+        c.confirm(16u8, test_source(Source::Am025Json, "register analysis"));
         assert_eq!(c.sources().len(), 2);
     }
 
     #[test]
     fn confirmed_multiple_sources_number_agnostic() {
         let mut c = Confirmed::new(16u8, test_source(Source::DeviceModel, "device model"));
-        c.confirm(16u8, test_source(Source::Am025Json, "register analysis"))
-            .unwrap();
-        c.confirm(16u8, test_source(Source::AieRt, "aie-rt"))
-            .unwrap();
+        c.confirm(16u8, test_source(Source::Am025Json, "register analysis"));
+        c.confirm(16u8, test_source(Source::AieRt, "aie-rt"));
         assert_eq!(*c.value(), 16u8);
         assert_eq!(c.sources().len(), 3);
         assert_eq!(c.sources()[0].origin, Source::DeviceModel);
@@ -734,40 +839,47 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_instance_count_cross_validation() {
-        // Device model says 16 locks, 16 BDs, 2 channels
-        let dm_counts = InstanceCount { locks: 16, bds: 16, channels: 2 };
-        let mut c = Confirmed::new(
-            dm_counts,
-            test_source(Source::DeviceModel, "npu1 core"),
-        );
-        // Register analysis independently discovers the same counts
-        let reg_counts = InstanceCount { locks: 16, bds: 16, channels: 2 };
-        c.confirm(reg_counts, test_source(Source::Am025Json, "register grouping"))
-            .unwrap();
-        assert_eq!(c.sources().len(), 2);
+    fn instance_count_per_field_confirmation() {
+        let dm_src = test_source(Source::DeviceModel, "npu1 core");
+        let am_src = test_source(Source::Am025Json, "register grouping");
 
-        // aie-rt would be a third source confirming the same
-        let rt_counts = InstanceCount { locks: 16, bds: 16, channels: 2 };
-        c.confirm(rt_counts, test_source(Source::AieRt, "DmaMod"))
-            .unwrap();
-        assert_eq!(c.sources().len(), 3);
+        // Device model provides all three fields
+        let mut counts = InstanceCount {
+            locks: Confirmed::new(16, dm_src.clone()),
+            bds: Confirmed::new(16, dm_src.clone()),
+            channels: Confirmed::new(2, dm_src),
+        };
+
+        // AM025 register analysis can confirm locks and bds (from register
+        // group counts), but has no signal for channels.
+        counts.locks.confirm(16, am_src.clone());
+        counts.bds.confirm(16, am_src);
+
+        // locks and bds confirmed by 2 sources, channels by 1
+        assert_eq!(counts.locks.sources().len(), 2);
+        assert_eq!(counts.bds.sources().len(), 2);
+        assert_eq!(counts.channels.sources().len(), 1);
+
+        // Values accessible through .value()
+        assert_eq!(*counts.locks.value(), 16);
+        assert_eq!(*counts.bds.value(), 16);
+        assert_eq!(*counts.channels.value(), 2);
     }
 
     #[test]
-    fn confirmed_instance_count_catches_disagreement() {
-        let dm_counts = InstanceCount { locks: 16, bds: 16, channels: 2 };
-        let mut c = Confirmed::new(
-            dm_counts,
-            test_source(Source::DeviceModel, "npu1 core"),
-        );
+    #[should_panic(expected = "GRAPH CONFLICT")]
+    fn instance_count_catches_per_field_disagreement() {
+        let dm_src = test_source(Source::DeviceModel, "npu1 core");
+        let am_src = test_source(Source::Am025Json, "register grouping");
+
+        let mut counts = InstanceCount {
+            locks: Confirmed::new(16, dm_src.clone()),
+            bds: Confirmed::new(16, dm_src.clone()),
+            channels: Confirmed::new(2, dm_src),
+        };
+
         // Register analysis finds 48 BDs (memtile value for a core tile -- bug!)
-        let wrong_counts = InstanceCount { locks: 16, bds: 48, channels: 2 };
-        let result = c.confirm(
-            wrong_counts,
-            test_source(Source::Am025Json, "register grouping"),
-        );
-        assert!(result.is_err());
+        counts.bds.confirm(48, am_src);
     }
 
     #[test]
@@ -778,13 +890,10 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_conflicting_value_errors() {
+    #[should_panic(expected = "GRAPH CONFLICT")]
+    fn confirmed_conflicting_value_panics() {
         let mut c = Confirmed::new(16u8, test_source(Source::DeviceModel, "locks"));
-        let result = c.confirm(48u8, test_source(Source::Am025Json, "register analysis"));
-        assert!(result.is_err());
-        // Original value unchanged
-        assert_eq!(*c.value(), 16u8);
-        assert_eq!(c.sources().len(), 1);
+        c.confirm(48u8, test_source(Source::Am025Json, "register analysis"));
     }
 
     #[test]
@@ -880,8 +989,7 @@ mod tests {
         };
         let mut c = Confirmed::new(reg, test_source(Source::Am025Json, "first"));
         // Should succeed despite different source in the RegisterModel
-        let result = c.confirm(reg_same_data, test_source(Source::AieRt, "second"));
-        assert!(result.is_ok());
+        c.confirm(reg_same_data, test_source(Source::AieRt, "second"));
         assert_eq!(c.sources().len(), 2);
     }
 
@@ -931,7 +1039,7 @@ mod tests {
             kind: TileKind::Compute,
             name: "core".to_string(),
             representative: Some((1, 2)),
-            instances: InstanceCount { locks: 16, bds: 16, channels: 2 },
+            instances: test_instances(16, 16, 2),
             modules: vec![ModuleModel {
                 kind: ModuleKind::Core,
                 registers: vec![RegisterModel {
@@ -990,6 +1098,7 @@ mod tests {
                 PortBundle { bundle: "Core".to_string(), masters: 1, slaves: 1 },
             ],
             shim_mux_ports: Vec::new(),
+            bd_schema: None,
             source: SourceAttribution {
                 origin: Source::DeviceModel,
                 file: "test.json".to_string(),
@@ -1075,7 +1184,7 @@ mod tests {
             kind: TileKind::ShimNoc,
             name: "shim_noc".to_string(),
             representative: Some((1, 0)),
-            instances: InstanceCount { locks: 16, bds: 16, channels: 2 },
+            instances: test_instances(16, 16, 2),
             memory: None,
             dma_capabilities: None,
             switchbox_ports: vec![
@@ -1088,6 +1197,7 @@ mod tests {
                 PortBundle { bundle: "South".to_string(), masters: 8, slaves: 6 },
             ],
             modules: Vec::new(),
+            bd_schema: None,
             source: SourceAttribution {
                 origin: Source::DeviceModel,
                 file: "test.json".to_string(),
