@@ -11,6 +11,7 @@
 //! - **Status**: Exceptional condition tracking (Overflow, Underflow)
 
 use crate::device::regdb;
+use crate::graph::types::SubsystemKind;
 
 // ============================================================================
 // Register classification by hardware properties
@@ -82,6 +83,8 @@ pub fn classify_register(reg: &regdb::RegisterDef, is_grouped: bool) -> Register
 pub struct SubsystemProfile {
     /// Which subsystem this profile describes (e.g., "DMA", "Lock", "Event").
     pub subsystem: String,
+    /// Typed subsystem kind, mapped from the discovered name.
+    pub kind: SubsystemKind,
     /// Number of independent instances (derived from State register group count).
     /// e.g., 16 locks in memory module, 64 in memtile.
     pub instance_count: u32,
@@ -149,6 +152,7 @@ pub fn build_subsystem_profile(
 
     SubsystemProfile {
         subsystem: subsystem.to_string(),
+        kind: subsystem_name_to_kind(subsystem),
         instance_count,
         register_groups: classified_groups,
         singletons,
@@ -506,6 +510,41 @@ const SUBSYSTEM_ALIASES: &[(&str, &str)] = &[
     ("Combo", "Event"), // "Combo_event_inputs0" -> Event subsystem
     ("Edge", "Event"),  // "Edge_Detection_event_0" -> Event subsystem
 ];
+
+/// Map a discovered subsystem name (from `subsystem_key()`) to its typed
+/// `SubsystemKind` variant.
+///
+/// The mapping covers three tiers:
+/// - **aie-rt modules**: DMA, Lock, Event, Trace, Performance, Timer, Stream
+/// - **Hardware groupings**: WatchPoint, Debug, PC, Interrupt, NoC, DataMemory
+/// - **Naming conventions**: Core->Processor, Program->ProgramMemory
+///
+/// Everything else maps to `Unknown` -- safe for future subsystem names that
+/// may appear in new architecture revisions.
+pub fn subsystem_name_to_kind(name: &str) -> SubsystemKind {
+    match name {
+        // Tier 1: aie-rt functional modules
+        "DMA" => SubsystemKind::Dma,
+        "Lock" => SubsystemKind::Lock,
+        "Event" => SubsystemKind::Event,
+        "Trace" => SubsystemKind::Trace,
+        "Performance" => SubsystemKind::Performance,
+        "Timer" => SubsystemKind::Timer,
+        "Stream" => SubsystemKind::StreamSwitch,
+        // Tier 2: hardware groupings
+        "WatchPoint" => SubsystemKind::WatchPoint,
+        "Debug" => SubsystemKind::Debug,
+        "PC" => SubsystemKind::ProgramCounter,
+        "Interrupt" => SubsystemKind::Interrupt,
+        "NoC" => SubsystemKind::NoC,
+        "DataMemory" => SubsystemKind::DataMemory,
+        // Tier 3: naming convention translations
+        "Core" => SubsystemKind::Processor,
+        "Program" => SubsystemKind::ProgramMemory,
+        // Catch-all: naming artifacts and future unknowns
+        _ => SubsystemKind::Unknown,
+    }
+}
 
 /// Extract the subsystem identity from a register name.
 ///
@@ -1407,6 +1446,90 @@ mod tests {
     }
 
     // ====================================================================
+    // SubsystemKind mapping tests
+    // ====================================================================
+
+    #[test]
+    fn maps_primary_subsystem_names_to_kind() {
+        // These are the core subsystems that aie-rt defines as distinct modules.
+        assert_eq!(subsystem_name_to_kind("DMA"), SubsystemKind::Dma);
+        assert_eq!(subsystem_name_to_kind("Lock"), SubsystemKind::Lock);
+        assert_eq!(subsystem_name_to_kind("Event"), SubsystemKind::Event);
+        assert_eq!(subsystem_name_to_kind("Trace"), SubsystemKind::Trace);
+        assert_eq!(subsystem_name_to_kind("Performance"), SubsystemKind::Performance);
+        assert_eq!(subsystem_name_to_kind("Timer"), SubsystemKind::Timer);
+        assert_eq!(subsystem_name_to_kind("Stream"), SubsystemKind::StreamSwitch);
+    }
+
+    #[test]
+    fn maps_hardware_grouping_names_to_kind() {
+        // Real hardware groupings visible in registers but not aie-rt modules.
+        assert_eq!(subsystem_name_to_kind("WatchPoint"), SubsystemKind::WatchPoint);
+        assert_eq!(subsystem_name_to_kind("Debug"), SubsystemKind::Debug);
+        assert_eq!(subsystem_name_to_kind("PC"), SubsystemKind::ProgramCounter);
+        assert_eq!(subsystem_name_to_kind("Interrupt"), SubsystemKind::Interrupt);
+        assert_eq!(subsystem_name_to_kind("NoC"), SubsystemKind::NoC);
+        assert_eq!(subsystem_name_to_kind("DataMemory"), SubsystemKind::DataMemory);
+    }
+
+    #[test]
+    fn maps_core_processor_names_to_kind() {
+        // "Core" in the core module's registers = processor control regs.
+        // "Program" = program memory.
+        assert_eq!(subsystem_name_to_kind("Core"), SubsystemKind::Processor);
+        assert_eq!(subsystem_name_to_kind("Program"), SubsystemKind::ProgramMemory);
+    }
+
+    #[test]
+    fn profile_carries_subsystem_kind() {
+        // extract_module_profiles should populate both the string name
+        // and the typed SubsystemKind on each profile.
+        let mut regs = Vec::new();
+        for i in 0..16u32 {
+            regs.push(make_reg(
+                &format!("Lock{}_value", i),
+                0x1F000 + i * 0x10,
+                &["Lock_value"],
+            ));
+        }
+        regs.push(make_reg("DMA_BD0_0", 0x1D000, &["field"]));
+        regs.push(make_reg("DMA_BD0_1", 0x1D004, &["field"]));
+
+        let profiles = extract_module_profiles(&regs);
+        let lock_p = profiles.iter().find(|p| p.subsystem == "Lock").unwrap();
+        let dma_p = profiles.iter().find(|p| p.subsystem == "DMA").unwrap();
+
+        assert_eq!(lock_p.kind, SubsystemKind::Lock);
+        assert_eq!(dma_p.kind, SubsystemKind::Dma);
+    }
+
+    #[test]
+    fn profile_unknown_kind_for_naming_artifacts() {
+        // Register name stems that don't map to real subsystems get Unknown.
+        let regs = vec![
+            make_reg("Tile_Status", 0x0, &["field"]),
+            make_reg("Tile_Control", 0x4, &["field"]),
+        ];
+
+        let profiles = extract_module_profiles(&regs);
+        let tile_p = profiles.iter().find(|p| p.subsystem == "Tile").unwrap();
+        assert_eq!(tile_p.kind, SubsystemKind::Unknown);
+    }
+
+    #[test]
+    fn maps_naming_artifacts_to_unknown() {
+        // These stem from register naming conventions, not real subsystems.
+        // They get Unknown until a future pass assigns them properly.
+        assert_eq!(subsystem_name_to_kind("AIE"), SubsystemKind::Unknown);
+        assert_eq!(subsystem_name_to_kind("Column"), SubsystemKind::Unknown);
+        assert_eq!(subsystem_name_to_kind("Tile"), SubsystemKind::Unknown);
+        assert_eq!(subsystem_name_to_kind("Module"), SubsystemKind::Unknown);
+        assert_eq!(subsystem_name_to_kind("Enable"), SubsystemKind::Unknown);
+        assert_eq!(subsystem_name_to_kind("Reset"), SubsystemKind::Unknown);
+        assert_eq!(subsystem_name_to_kind("SomeFutureSubsystem"), SubsystemKind::Unknown);
+    }
+
+    // ====================================================================
     // DMA integration tests -- real AM025 data
     // ====================================================================
 
@@ -1558,6 +1681,58 @@ mod tests {
             .iter()
             .any(|(_, g)| g.pattern.contains("Task_Queue"));
         assert!(has_task_queue, "Shim should have Task_Queue registers");
+    }
+
+    #[test]
+    fn integration_all_profiles_have_typed_kinds() {
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database not found");
+            return;
+        };
+
+        let module_names = ["core", "memory", "memory_tile", "shim"];
+        for module_name in &module_names {
+            let module = db.module(module_name).unwrap();
+            let profiles = extract_module_profiles(&module.registers);
+
+            // Every real subsystem should get a non-Unknown kind.
+            // Naming artifacts are allowed to be Unknown.
+            let known: Vec<_> = profiles.iter().filter(|p| p.kind != SubsystemKind::Unknown).collect();
+            let unknown: Vec<_> = profiles.iter().filter(|p| p.kind == SubsystemKind::Unknown).collect();
+
+            eprintln!("=== {} ===", module_name);
+            for p in &profiles {
+                eprintln!("  {} -> {:?} ({} instances)", p.subsystem, p.kind, p.instance_count);
+            }
+
+            // The major subsystems must all be typed (not Unknown).
+            // Each module should have at least Event, Trace, Performance, Timer.
+            let required = ["Event", "Trace", "Performance", "Timer"];
+            for name in &required {
+                let found = profiles.iter().find(|p| p.subsystem == *name);
+                assert!(found.is_some(), "{} should have {} subsystem", module_name, name);
+                assert_ne!(
+                    found.unwrap().kind, SubsystemKind::Unknown,
+                    "{}: {} should have a typed kind", module_name, name
+                );
+            }
+
+            // Unknown profiles should only be naming artifacts (low register count).
+            // Real subsystems have at least a few registers.
+            for p in &unknown {
+                assert!(
+                    p.instance_count <= 2 && p.register_groups.len() <= 1,
+                    "{}: '{}' is Unknown but has {} instances and {} groups -- should it be mapped?",
+                    module_name, p.subsystem, p.instance_count, p.register_groups.len()
+                );
+            }
+
+            eprintln!(
+                "  -> {} known, {} unknown (naming artifacts)",
+                known.len(),
+                unknown.len()
+            );
+        }
     }
 
     #[test]

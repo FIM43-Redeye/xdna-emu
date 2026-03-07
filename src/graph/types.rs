@@ -249,6 +249,20 @@ pub enum SubsystemKind {
     DataMemory,
     Trace,
     Event,
+    /// Hardware performance counters (aie-rt PerfMod).
+    Performance,
+    /// Cycle counter / timer (aie-rt TimerMod).
+    Timer,
+    /// Data watchpoint units.
+    WatchPoint,
+    /// Core debug interface (debug halt, single step, breakpoints).
+    Debug,
+    /// Program counter sampling registers.
+    ProgramCounter,
+    /// Interrupt controller (shim tiles).
+    Interrupt,
+    /// Network-on-chip interface (shim tiles).
+    NoC,
     ShimMux,
     /// Subsystem not yet classified.
     Unknown,
@@ -265,6 +279,13 @@ impl fmt::Display for SubsystemKind {
             Self::DataMemory => write!(f, "data_memory"),
             Self::Trace => write!(f, "trace"),
             Self::Event => write!(f, "event"),
+            Self::Performance => write!(f, "performance"),
+            Self::Timer => write!(f, "timer"),
+            Self::WatchPoint => write!(f, "watchpoint"),
+            Self::Debug => write!(f, "debug"),
+            Self::ProgramCounter => write!(f, "program_counter"),
+            Self::Interrupt => write!(f, "interrupt"),
+            Self::NoC => write!(f, "noc"),
             Self::ShimMux => write!(f, "shim_mux"),
             Self::Unknown => write!(f, "unknown"),
         }
