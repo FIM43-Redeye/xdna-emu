@@ -981,6 +981,13 @@ pub enum NodeId {
         direction: DmaDirection,
         role: DmaChannelFieldRole,
     },
+
+    /// A functional subsystem within a module (DMA, Lock, StreamSwitch, etc.).
+    Subsystem {
+        tile: TileKind,
+        module: ModuleKind,
+        subsystem: SubsystemKind,
+    },
 }
 
 impl fmt::Display for NodeId {
@@ -1000,6 +1007,9 @@ impl fmt::Display for NodeId {
             Self::ChannelField { tile, direction, role } => {
                 write!(f, "{:?}.channel.{}.{:?}", tile, direction, role)
             }
+            Self::Subsystem { tile, module, subsystem } => {
+                write!(f, "{:?}.{:?}.{:?}", tile, module, subsystem)
+            }
         }
     }
 }
@@ -1018,6 +1028,10 @@ pub enum RelationshipKind {
     /// A node structurally contains another node.
     /// Direction: parent -> child.
     Contains,
+
+    /// A node belongs to a functional grouping.
+    /// Direction: member -> group (e.g., register -> subsystem).
+    BelongsTo,
 }
 
 /// A directed relationship between two nodes in the architecture graph.

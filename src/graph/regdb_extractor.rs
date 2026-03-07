@@ -600,7 +600,7 @@ const TILE_MODULE_MAP: &[(&str, &[(ModuleKind, &str)])] = &[
 /// analysis -- the AM025 register patterns independently reveal how many
 /// locks and BDs each module has.
 pub fn populate_tile_modules(model: &mut ArchModel, db: &regdb::RegisterDb) {
-    use crate::graph::types::Relationship;
+    use crate::graph::types::{NodeId, Relationship, RelationshipKind};
 
     let mut new_edges: Vec<Relationship> = Vec::new();
 
@@ -613,6 +613,66 @@ pub fn populate_tile_modules(model: &mut ArchModel, db: &regdb::RegisterDb) {
             for &(kind, am025_name) in *module_pairs {
                 if let Some(module_def) = db.module(am025_name) {
                     tile_type.modules.push(build_module_model(kind, module_def));
+
+                    let edge_source = SourceAttribution {
+                        origin: Source::Am025Json,
+                        file: "aie_registers_aie2.json".into(),
+                        detail: format!("module={} structural hierarchy", am025_name),
+                    };
+
+                    // Edge: TileType -> Module (Contains)
+                    new_edges.push(Relationship {
+                        from: NodeId::TileType { kind: tile_type.kind },
+                        to: NodeId::Module { tile: tile_type.kind, module: kind },
+                        kind: RelationshipKind::Contains,
+                        source: edge_source.clone(),
+                    });
+
+                    // Edges: Module -> Register (Contains),
+                    //        Register -> RegisterField (Contains),
+                    //        Register -> Subsystem (BelongsTo)
+                    for reg in &module_def.registers {
+                        let reg_node = NodeId::Register {
+                            tile: tile_type.kind,
+                            module: kind,
+                            name: reg.name.clone(),
+                        };
+
+                        new_edges.push(Relationship {
+                            from: NodeId::Module { tile: tile_type.kind, module: kind },
+                            to: reg_node.clone(),
+                            kind: RelationshipKind::Contains,
+                            source: edge_source.clone(),
+                        });
+
+                        // Register -> Subsystem (BelongsTo)
+                        let subsystem_kind = subsystem_name_to_kind(subsystem_key(&reg.name));
+                        new_edges.push(Relationship {
+                            from: reg_node.clone(),
+                            to: NodeId::Subsystem {
+                                tile: tile_type.kind,
+                                module: kind,
+                                subsystem: subsystem_kind,
+                            },
+                            kind: RelationshipKind::BelongsTo,
+                            source: edge_source.clone(),
+                        });
+
+                        // Register -> RegisterField (Contains)
+                        for field in &reg.fields {
+                            new_edges.push(Relationship {
+                                from: reg_node.clone(),
+                                to: NodeId::RegisterField {
+                                    tile: tile_type.kind,
+                                    module: kind,
+                                    register: reg.name.clone(),
+                                    field: field.name.clone(),
+                                },
+                                kind: RelationshipKind::Contains,
+                                source: edge_source.clone(),
+                            });
+                        }
+                    }
 
                     // Confirm instance counts from register group analysis.
                     let profiles = extract_module_profiles(&module_def.registers);
@@ -2975,6 +3035,124 @@ mod tests {
                 assert_eq!(field, "FoT_Mode");
             }
             other => panic!("Expected RegisterField, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn contains_edges_form_hierarchy() {
+        use crate::graph::types::{NodeId, RelationshipKind, TileKind};
+
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database not found");
+            return;
+        };
+
+        let json_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+        let mut model =
+            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        populate_tile_modules(&mut model, &db);
+
+        let contains: Vec<_> = model
+            .relationships
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::Contains)
+            .collect();
+
+        // TileType -> Module: compute tile has Core and Memory modules
+        let tile_to_module: Vec<_> = contains
+            .iter()
+            .filter(|e| matches!(&e.from, NodeId::TileType { kind: TileKind::Compute }))
+            .filter(|e| matches!(&e.to, NodeId::Module { .. }))
+            .collect();
+        assert_eq!(
+            tile_to_module.len(),
+            2,
+            "compute tile should contain 2 modules (Core + Memory)"
+        );
+
+        // Module -> Register: memory module should contain many registers
+        let module_to_reg: Vec<_> = contains
+            .iter()
+            .filter(|e| matches!(
+                &e.from,
+                NodeId::Module { tile: TileKind::Compute, module: ModuleKind::Memory }
+            ))
+            .filter(|e| matches!(&e.to, NodeId::Register { .. }))
+            .collect();
+        assert!(
+            module_to_reg.len() > 100,
+            "memory module should contain hundreds of registers, got {}",
+            module_to_reg.len()
+        );
+
+        // Register -> RegisterField: DMA_BD0_0 should contain its fields
+        let bd0_0_to_fields: Vec<_> = contains
+            .iter()
+            .filter(|e| matches!(
+                &e.from,
+                NodeId::Register { name, .. } if name == "DMA_BD0_0"
+            ))
+            .filter(|e| matches!(&e.to, NodeId::RegisterField { .. }))
+            .collect();
+        assert!(
+            !bd0_0_to_fields.is_empty(),
+            "DMA_BD0_0 should contain field edges"
+        );
+
+        // Verify a specific field exists
+        let has_buf_len = bd0_0_to_fields.iter().any(|e| matches!(
+            &e.to,
+            NodeId::RegisterField { field, .. } if field == "Buffer_Length"
+        ));
+        assert!(has_buf_len, "DMA_BD0_0 should contain Buffer_Length field");
+    }
+
+    #[test]
+    fn belongs_to_edges_classify_registers() {
+        use crate::graph::types::{NodeId, RelationshipKind, SubsystemKind};
+
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database not found");
+            return;
+        };
+
+        let json_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+        let mut model =
+            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        populate_tile_modules(&mut model, &db);
+
+        let belongs_to: Vec<_> = model
+            .relationships
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::BelongsTo)
+            .collect();
+
+        // DMA registers should belong to DMA subsystem
+        let dma_bd0_belongs = belongs_to.iter().find(|e| matches!(
+            &e.from,
+            NodeId::Register { name, .. } if name == "DMA_BD0_0"
+        ));
+        assert!(dma_bd0_belongs.is_some(), "DMA_BD0_0 should have a BelongsTo edge");
+        match &dma_bd0_belongs.unwrap().to {
+            NodeId::Subsystem { subsystem, .. } => {
+                assert_eq!(*subsystem, SubsystemKind::Dma);
+            }
+            other => panic!("Expected Subsystem node, got {:?}", other),
+        }
+
+        // Lock registers should belong to Lock subsystem
+        let lock_belongs = belongs_to.iter().find(|e| matches!(
+            &e.from,
+            NodeId::Register { name, .. } if name == "Lock0_value"
+        ));
+        assert!(lock_belongs.is_some(), "Lock0_value should have a BelongsTo edge");
+        match &lock_belongs.unwrap().to {
+            NodeId::Subsystem { subsystem, .. } => {
+                assert_eq!(*subsystem, SubsystemKind::Lock);
+            }
+            other => panic!("Expected Subsystem node, got {:?}", other),
         }
     }
 }
