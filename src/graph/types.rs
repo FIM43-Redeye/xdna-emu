@@ -81,6 +81,127 @@ impl fmt::Display for TileKind {
 // Source attribution
 // ============================================================================
 
+// ============================================================================
+// Cross-source confirmation
+// ============================================================================
+
+/// Error when sources disagree on a fact's value.
+#[derive(Debug, Clone)]
+pub struct ConflictError {
+    pub existing_sources: Vec<SourceAttribution>,
+    pub new_source: SourceAttribution,
+    pub detail: String,
+}
+
+impl fmt::Display for ConflictError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "source conflict: {} disagrees with {} existing source(s): {}",
+            self.new_source,
+            self.existing_sources.len(),
+            self.detail,
+        )
+    }
+}
+
+/// Compare hardware-relevant content, ignoring provenance metadata.
+///
+/// Types that carry `SourceAttribution` or other metadata should implement
+/// this to compare only the hardware facts. For simple types (u8, String,
+/// etc.), `PartialEq` and `FactEquals` are equivalent.
+pub trait FactEquals {
+    fn fact_equals(&self, other: &Self) -> bool;
+}
+
+/// Blanket impl: any `PartialEq` type that doesn't need special handling
+/// can use `PartialEq` as its `FactEquals`.
+impl<T: PartialEq> FactEquals for T
+where
+    T: NoProvenance,
+{
+    fn fact_equals(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+/// Marker trait for types that contain no provenance metadata,
+/// so `PartialEq` is sufficient for fact comparison.
+/// Implemented for primitive and simple types.
+pub trait NoProvenance {}
+impl NoProvenance for u8 {}
+impl NoProvenance for u16 {}
+impl NoProvenance for u32 {}
+impl NoProvenance for u64 {}
+impl NoProvenance for i32 {}
+impl NoProvenance for bool {}
+impl NoProvenance for String {}
+impl NoProvenance for InstanceCount {}
+
+/// A fact confirmed by one or more toolchain sources.
+///
+/// Every fact in the graph is wrapped in `Confirmed<T>`. The first source
+/// establishes the value; subsequent sources must agree (via `FactEquals`)
+/// or the confirmation fails with `ConflictError`.
+///
+/// Comparison between `Confirmed` values uses only the inner value, not
+/// the source list -- two facts are equal if the hardware data matches,
+/// regardless of where it came from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Confirmed<T> {
+    value: T,
+    sources: Vec<SourceAttribution>,
+}
+
+impl<T: FactEquals> Confirmed<T> {
+    /// Create a new fact with its first source.
+    pub fn new(value: T, source: SourceAttribution) -> Self {
+        Self {
+            value,
+            sources: vec![source],
+        }
+    }
+
+    /// Confirm the fact from an additional source.
+    /// Returns `Err(ConflictError)` if the value disagrees.
+    pub fn confirm(
+        &mut self,
+        value: T,
+        source: SourceAttribution,
+    ) -> Result<(), ConflictError> {
+        if self.value.fact_equals(&value) {
+            self.sources.push(source);
+            Ok(())
+        } else {
+            Err(ConflictError {
+                existing_sources: self.sources.clone(),
+                new_source: source,
+                detail: String::new(),
+            })
+        }
+    }
+
+    /// The confirmed value.
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    /// All sources that confirmed this value.
+    pub fn sources(&self) -> &[SourceAttribution] {
+        &self.sources
+    }
+}
+
+/// `Confirmed` values are equal when their hardware data matches,
+/// regardless of provenance.
+impl<T: FactEquals> PartialEq for Confirmed<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.value.fact_equals(&other.value)
+    }
+}
+
+impl<T: FactEquals + Eq> Eq for Confirmed<T> {}
+
 /// Which toolchain source a fact was derived from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Source {
@@ -179,6 +300,12 @@ pub struct FieldModel {
     pub source: SourceAttribution,
 }
 
+impl FactEquals for FieldModel {
+    fn fact_equals(&self, other: &Self) -> bool {
+        self.name == other.name && self.bits == other.bits && self.meaning == other.meaning
+    }
+}
+
 /// A hardware register.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterModel {
@@ -191,6 +318,23 @@ pub struct RegisterModel {
     pub subsystem: SubsystemKind,
     pub access: Access,
     pub source: SourceAttribution,
+}
+
+impl FactEquals for RegisterModel {
+    fn fact_equals(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.offset == other.offset
+            && self.width == other.width
+            && self.reset_value == other.reset_value
+            && self.subsystem == other.subsystem
+            && self.access == other.access
+            && self.fields.len() == other.fields.len()
+            && self
+                .fields
+                .iter()
+                .zip(other.fields.iter())
+                .all(|(a, b)| a.fact_equals(b))
+    }
 }
 
 // ============================================================================
@@ -322,6 +466,18 @@ pub struct ModuleModel {
     pub source: SourceAttribution,
 }
 
+impl FactEquals for ModuleModel {
+    fn fact_equals(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.registers.len() == other.registers.len()
+            && self
+                .registers
+                .iter()
+                .zip(other.registers.iter())
+                .all(|(a, b)| a.fact_equals(b))
+    }
+}
+
 // ============================================================================
 // Tile and array topology
 // ============================================================================
@@ -338,6 +494,15 @@ pub struct MemoryModel {
     /// Instruction memory size. Only present on compute tiles.
     pub program_memory_bytes: Option<u64>,
     pub source: SourceAttribution,
+}
+
+impl FactEquals for MemoryModel {
+    fn fact_equals(&self, other: &Self) -> bool {
+        self.size_bytes == other.size_bytes
+            && self.num_banks == other.num_banks
+            && self.bank_size_bytes == other.bank_size_bytes
+            && self.program_memory_bytes == other.program_memory_bytes
+    }
 }
 
 /// A tile type definition (e.g., "core", "mem_tile", "shim_noc").
@@ -530,6 +695,98 @@ impl ArchModel {
 mod tests {
     use super::*;
 
+    fn test_source(origin: Source, detail: &str) -> SourceAttribution {
+        SourceAttribution {
+            origin,
+            file: "test.json".to_string(),
+            detail: detail.to_string(),
+        }
+    }
+
+    #[test]
+    fn confirmed_new_has_one_source() {
+        let c = Confirmed::new(16u8, test_source(Source::DeviceModel, "locks"));
+        assert_eq!(*c.value(), 16u8);
+        assert_eq!(c.sources().len(), 1);
+        assert_eq!(c.sources()[0].origin, Source::DeviceModel);
+    }
+
+    #[test]
+    fn confirmed_matching_value_succeeds() {
+        let mut c = Confirmed::new(16u8, test_source(Source::DeviceModel, "locks"));
+        let result = c.confirm(16u8, test_source(Source::Am025Json, "register analysis"));
+        assert!(result.is_ok());
+        assert_eq!(c.sources().len(), 2);
+    }
+
+    #[test]
+    fn confirmed_multiple_sources_number_agnostic() {
+        let mut c = Confirmed::new(16u8, test_source(Source::DeviceModel, "device model"));
+        c.confirm(16u8, test_source(Source::Am025Json, "register analysis"))
+            .unwrap();
+        c.confirm(16u8, test_source(Source::AieRt, "aie-rt"))
+            .unwrap();
+        assert_eq!(*c.value(), 16u8);
+        assert_eq!(c.sources().len(), 3);
+        assert_eq!(c.sources()[0].origin, Source::DeviceModel);
+        assert_eq!(c.sources()[1].origin, Source::Am025Json);
+        assert_eq!(c.sources()[2].origin, Source::AieRt);
+    }
+
+    #[test]
+    fn confirmed_instance_count_cross_validation() {
+        // Device model says 16 locks, 16 BDs, 2 channels
+        let dm_counts = InstanceCount { locks: 16, bds: 16, channels: 2 };
+        let mut c = Confirmed::new(
+            dm_counts,
+            test_source(Source::DeviceModel, "npu1 core"),
+        );
+        // Register analysis independently discovers the same counts
+        let reg_counts = InstanceCount { locks: 16, bds: 16, channels: 2 };
+        c.confirm(reg_counts, test_source(Source::Am025Json, "register grouping"))
+            .unwrap();
+        assert_eq!(c.sources().len(), 2);
+
+        // aie-rt would be a third source confirming the same
+        let rt_counts = InstanceCount { locks: 16, bds: 16, channels: 2 };
+        c.confirm(rt_counts, test_source(Source::AieRt, "DmaMod"))
+            .unwrap();
+        assert_eq!(c.sources().len(), 3);
+    }
+
+    #[test]
+    fn confirmed_instance_count_catches_disagreement() {
+        let dm_counts = InstanceCount { locks: 16, bds: 16, channels: 2 };
+        let mut c = Confirmed::new(
+            dm_counts,
+            test_source(Source::DeviceModel, "npu1 core"),
+        );
+        // Register analysis finds 48 BDs (memtile value for a core tile -- bug!)
+        let wrong_counts = InstanceCount { locks: 16, bds: 48, channels: 2 };
+        let result = c.confirm(
+            wrong_counts,
+            test_source(Source::Am025Json, "register grouping"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn confirmed_equality_ignores_sources() {
+        let c1 = Confirmed::new(16u8, test_source(Source::DeviceModel, "dm"));
+        let c2 = Confirmed::new(16u8, test_source(Source::AieRt, "rt"));
+        assert_eq!(c1, c2); // same value, different sources -> equal
+    }
+
+    #[test]
+    fn confirmed_conflicting_value_errors() {
+        let mut c = Confirmed::new(16u8, test_source(Source::DeviceModel, "locks"));
+        let result = c.confirm(48u8, test_source(Source::Am025Json, "register analysis"));
+        assert!(result.is_err());
+        // Original value unchanged
+        assert_eq!(*c.value(), 16u8);
+        assert_eq!(c.sources().len(), 1);
+    }
+
     #[test]
     fn test_architecture_enum_variants() {
         // Verify all expected architectures exist
@@ -543,6 +800,89 @@ mod tests {
         assert_eq!(kinds.len(), 4);
         assert_eq!(format!("{}", TileKind::ShimNoc), "shim_noc");
         assert_eq!(format!("{}", TileKind::ShimPl), "shim_pl");
+    }
+
+    #[test]
+    fn confirmed_with_custom_fact_equals() {
+        // Two RegisterModels from different sources but same hardware data.
+        // They should confirm successfully because FactEquals ignores `source`.
+        let reg1 = RegisterModel {
+            name: "DMA_BD0_0".to_string(),
+            offset: 0x1D000,
+            width: 32,
+            reset_value: 0,
+            fields: vec![],
+            subsystem: SubsystemKind::Dma,
+            access: Access::ReadWrite,
+            source: test_source(Source::Am025Json, "am025"),
+        };
+        let reg2 = RegisterModel {
+            name: "DMA_BD0_0".to_string(),
+            offset: 0x1D000,
+            width: 32,
+            reset_value: 0,
+            fields: vec![],
+            subsystem: SubsystemKind::Dma,
+            access: Access::ReadWrite,
+            source: test_source(Source::AieRt, "aie-rt"),
+        };
+        // PartialEq would fail because sources differ.
+        // fact_equals should succeed because hardware data matches.
+        assert!(reg1.fact_equals(&reg2));
+    }
+
+    #[test]
+    fn confirmed_fact_equals_detects_real_difference() {
+        let reg1 = RegisterModel {
+            name: "DMA_BD0_0".to_string(),
+            offset: 0x1D000,
+            width: 32,
+            reset_value: 0,
+            fields: vec![],
+            subsystem: SubsystemKind::Dma,
+            access: Access::ReadWrite,
+            source: test_source(Source::Am025Json, "am025"),
+        };
+        let reg2 = RegisterModel {
+            name: "DMA_BD0_0".to_string(),
+            offset: 0x1E000, // different offset -- real disagreement
+            width: 32,
+            reset_value: 0,
+            fields: vec![],
+            subsystem: SubsystemKind::Dma,
+            access: Access::ReadWrite,
+            source: test_source(Source::AieRt, "aie-rt"),
+        };
+        assert!(!reg1.fact_equals(&reg2));
+    }
+
+    #[test]
+    fn confirmed_confirm_uses_fact_equals() {
+        let reg = RegisterModel {
+            name: "DMA_BD0_0".to_string(),
+            offset: 0x1D000,
+            width: 32,
+            reset_value: 0,
+            fields: vec![],
+            subsystem: SubsystemKind::Dma,
+            access: Access::ReadWrite,
+            source: test_source(Source::Am025Json, "am025"),
+        };
+        let reg_same_data = RegisterModel {
+            name: "DMA_BD0_0".to_string(),
+            offset: 0x1D000,
+            width: 32,
+            reset_value: 0,
+            fields: vec![],
+            subsystem: SubsystemKind::Dma,
+            access: Access::ReadWrite,
+            source: test_source(Source::AieRt, "aie-rt"), // different source
+        };
+        let mut c = Confirmed::new(reg, test_source(Source::Am025Json, "first"));
+        // Should succeed despite different source in the RegisterModel
+        let result = c.confirm(reg_same_data, test_source(Source::AieRt, "second"));
+        assert!(result.is_ok());
+        assert_eq!(c.sources().len(), 2);
     }
 
     #[test]
