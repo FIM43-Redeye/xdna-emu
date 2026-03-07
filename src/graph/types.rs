@@ -187,38 +187,80 @@ pub struct RegisterModel {
     pub width: u8,
     pub reset_value: u32,
     pub fields: Vec<FieldModel>,
-    pub module: ModuleKind,
+    /// Which functional subsystem this register belongs to (DMA, Lock, etc.).
+    pub subsystem: SubsystemKind,
     pub access: Access,
     pub source: SourceAttribution,
 }
 
 // ============================================================================
-// Module model
+// Module and subsystem model
 // ============================================================================
 
-/// Functional module within a tile.
+/// Physical hardware module within a tile, each with its own register address
+/// space. Matches AMD's aie-rt module identifiers (XAIE_CORE_MOD, etc.).
+///
+/// This is the mid-level of the hardware hierarchy:
+///   Tile (TileKind) -> Module (ModuleKind) -> Subsystem (SubsystemKind)
+///
+/// A compute tile contains two modules (Core + Memory). Memtiles and shim
+/// tiles each contain one module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModuleKind {
-    Dma,
-    Lock,
-    StreamSwitch,
+    /// Core module within a compute tile (AM025 "core", aie-rt XAIE_CORE_MOD).
+    /// Contains: processor, program memory, accumulators, core control.
     Core,
-    ProgramMemory,
-    DataMemory,
-    Trace,
-    Event,
-    ShimMux,
-    /// Module not yet classified.
-    Unknown,
+    /// Memory module within a compute tile (AM025 "memory", aie-rt XAIE_MEM_MOD).
+    /// Contains: data memory, DMA, locks, stream switch (memory side).
+    Memory,
+    /// Memtile module (AM025 "memory_tile"). Like an expanded memory module
+    /// with no core -- more BDs, more locks, larger memory.
+    MemTile,
+    /// Shim module (AM025 "shim", aie-rt XAIE_PL_MOD).
+    /// Contains: NoC interface, DMA, locks, stream switch.
+    Shim,
 }
 
 impl fmt::Display for ModuleKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Core => write!(f, "core"),
+            Self::Memory => write!(f, "memory"),
+            Self::MemTile => write!(f, "mem_tile"),
+            Self::Shim => write!(f, "shim"),
+        }
+    }
+}
+
+/// Functional subsystem within a module. Registers are grouped by the
+/// subsystem they control.
+///
+/// This is the finest level of the hardware hierarchy:
+///   Tile (TileKind) -> Module (ModuleKind) -> Subsystem (SubsystemKind)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SubsystemKind {
+    Dma,
+    Lock,
+    StreamSwitch,
+    /// The processor (VLIW core). Named "Processor" to avoid confusion with
+    /// `ModuleKind::Core` which is the physical core module.
+    Processor,
+    ProgramMemory,
+    DataMemory,
+    Trace,
+    Event,
+    ShimMux,
+    /// Subsystem not yet classified.
+    Unknown,
+}
+
+impl fmt::Display for SubsystemKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
             Self::Dma => write!(f, "dma"),
             Self::Lock => write!(f, "lock"),
             Self::StreamSwitch => write!(f, "stream_switch"),
-            Self::Core => write!(f, "core"),
+            Self::Processor => write!(f, "processor"),
             Self::ProgramMemory => write!(f, "program_memory"),
             Self::DataMemory => write!(f, "data_memory"),
             Self::Trace => write!(f, "trace"),
@@ -530,7 +572,7 @@ mod tests {
             representative: Some((1, 2)),
             instances: InstanceCount { locks: 16, bds: 16, channels: 2 },
             modules: vec![ModuleModel {
-                kind: ModuleKind::Dma,
+                kind: ModuleKind::Core,
                 registers: vec![RegisterModel {
                     name: "DMA_BD0_0".to_string(),
                     offset: 0x1D000,
@@ -546,7 +588,7 @@ mod tests {
                             detail: "test".to_string(),
                         },
                     }],
-                    module: ModuleKind::Dma,
+                    subsystem: SubsystemKind::Dma,
                     access: Access::ReadWrite,
                     source: SourceAttribution {
                         origin: Source::Am025Json,
@@ -555,7 +597,7 @@ mod tests {
                     },
                 }],
                 source: SourceAttribution {
-                    origin: Source::DeviceModel,
+                    origin: Source::Am025Json,
                     file: "test.json".to_string(),
                     detail: "test".to_string(),
                 },
