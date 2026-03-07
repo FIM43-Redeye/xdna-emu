@@ -730,6 +730,28 @@ pub fn populate_tile_modules(model: &mut ArchModel, db: &regdb::RegisterDb) {
                 }
             }
         }
+
+        // After all modules for this tile type are processed, emit
+        // cross-resource References edges between schemas and subsystems.
+        // We need to find the module kind that contains the DMA subsystem
+        // to correctly address the Lock subsystem node.
+        let dma_module_kind = TILE_MODULE_MAP
+            .iter()
+            .find(|(name, _)| *name == tile_type.name)
+            .and_then(|(_, pairs)| {
+                // The module containing DMA registers (Memory for compute,
+                // MemTile for memtile, Shim for shim).
+                pairs.iter().find(|(_, am025)| *am025 != "core").map(|(k, _)| *k)
+            });
+
+        if let Some(mod_kind) = dma_module_kind {
+            new_edges.extend(emit_cross_reference_edges(
+                tile_type.kind,
+                mod_kind,
+                tile_type.bd_schema.as_ref(),
+                tile_type.channel_schema.as_ref(),
+            ));
+        }
     }
 
     model.relationships.extend(new_edges);
@@ -1206,6 +1228,126 @@ fn extract_channel_schema(
         }),
         edges,
     )
+}
+
+// ============================================================================
+// Cross-resource References edges
+// ============================================================================
+
+/// Emit References edges for fields that index into other resource spaces.
+///
+/// These are static architectural facts: a BD's LockAcqId field always
+/// references the Lock subsystem, a channel's StartBdId always points into
+/// the BD space, etc. They don't vary by register content -- they're
+/// inherent to the hardware programming model.
+fn emit_cross_reference_edges(
+    tile_kind: TileKind,
+    module_kind: ModuleKind,
+    bd_schema: Option<&BdSchema>,
+    channel_schema: Option<&DmaChannelSchema>,
+) -> Vec<Relationship> {
+    use crate::graph::types::{NodeId, RelationshipKind};
+
+    let mut edges = Vec::new();
+    let source = SourceAttribution {
+        origin: Source::Am025Json,
+        file: "aie_registers_aie2.json".into(),
+        detail: "cross-resource field references".into(),
+    };
+
+    let lock_subsystem = NodeId::Subsystem {
+        tile: tile_kind,
+        module: module_kind,
+        subsystem: SubsystemKind::Lock,
+    };
+
+    // BD field -> ValidBd is the representative node for the BD resource space.
+    let bd_space = NodeId::BdField {
+        tile: tile_kind,
+        role: BdFieldRole::ValidBd,
+    };
+
+    // BD fields that reference other resource spaces
+    if let Some(schema) = bd_schema {
+        let has_role = |role: &BdFieldRole| schema.fields.iter().any(|f| &f.role == role);
+
+        // LockAcqId, LockRelId -> Lock subsystem
+        if has_role(&BdFieldRole::LockAcqId) {
+            edges.push(Relationship {
+                from: NodeId::BdField { tile: tile_kind, role: BdFieldRole::LockAcqId },
+                to: lock_subsystem.clone(),
+                kind: RelationshipKind::References,
+                source: source.clone(),
+            });
+        }
+        if has_role(&BdFieldRole::LockRelId) {
+            edges.push(Relationship {
+                from: NodeId::BdField { tile: tile_kind, role: BdFieldRole::LockRelId },
+                to: lock_subsystem.clone(),
+                kind: RelationshipKind::References,
+                source: source.clone(),
+            });
+        }
+
+        // NextBd -> BD space (chains to another BD)
+        if has_role(&BdFieldRole::NextBd) {
+            edges.push(Relationship {
+                from: NodeId::BdField { tile: tile_kind, role: BdFieldRole::NextBd },
+                to: bd_space.clone(),
+                kind: RelationshipKind::References,
+                source: source.clone(),
+            });
+        }
+
+        // OutOfOrderBdId -> BD space
+        if has_role(&BdFieldRole::OutOfOrderBdId) {
+            edges.push(Relationship {
+                from: NodeId::BdField { tile: tile_kind, role: BdFieldRole::OutOfOrderBdId },
+                to: bd_space.clone(),
+                kind: RelationshipKind::References,
+                source: source.clone(),
+            });
+        }
+    }
+
+    // Channel fields that reference other resource spaces
+    if let Some(schema) = channel_schema {
+        let has_field = |dir: DmaDirection, role: &DmaChannelFieldRole| {
+            schema.fields.iter().any(|f| f.direction == dir && &f.role == role)
+        };
+
+        // StartBdId -> BD space (both directions)
+        for dir in [DmaDirection::S2mm, DmaDirection::Mm2s] {
+            if has_field(dir, &DmaChannelFieldRole::StartBdId) {
+                edges.push(Relationship {
+                    from: NodeId::ChannelField {
+                        tile: tile_kind,
+                        direction: dir,
+                        role: DmaChannelFieldRole::StartBdId,
+                    },
+                    to: bd_space.clone(),
+                    kind: RelationshipKind::References,
+                    source: source.clone(),
+                });
+            }
+
+            // CurrentBdId -> BD space
+            if has_field(dir, &DmaChannelFieldRole::CurrentBdId) {
+                edges.push(Relationship {
+                    from: NodeId::ChannelField {
+                        tile: tile_kind,
+                        direction: dir,
+                        role: DmaChannelFieldRole::CurrentBdId,
+                    },
+                    to: bd_space.clone(),
+                    kind: RelationshipKind::References,
+                    source: source.clone(),
+                });
+            }
+        }
+    }
+
+    edges
 }
 
 // ============================================================================
@@ -3154,5 +3296,89 @@ mod tests {
             }
             other => panic!("Expected Subsystem node, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn references_edges_connect_cross_resource_fields() {
+        use crate::graph::types::{
+            BdFieldRole, DmaChannelFieldRole, DmaDirection, NodeId, RelationshipKind,
+            SubsystemKind,
+        };
+
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database not found");
+            return;
+        };
+
+        let json_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/aie-device-models.json");
+        let mut model =
+            crate::graph::device_model::extract_device_model(&json_path, "npu1").unwrap();
+        populate_tile_modules(&mut model, &db);
+
+        let refs: Vec<_> = model
+            .relationships
+            .iter()
+            .filter(|r| r.kind == RelationshipKind::References)
+            .collect();
+
+        assert!(!refs.is_empty(), "should have References edges");
+
+        // BD LockAcqId -> Lock subsystem
+        let lock_acq_ref = refs.iter().find(|e| matches!(
+            &e.from,
+            NodeId::BdField { role: BdFieldRole::LockAcqId, .. }
+        ));
+        assert!(lock_acq_ref.is_some(), "LockAcqId should reference Lock subsystem");
+        match &lock_acq_ref.unwrap().to {
+            NodeId::Subsystem { subsystem, .. } => {
+                assert_eq!(*subsystem, SubsystemKind::Lock);
+            }
+            other => panic!("Expected Subsystem, got {:?}", other),
+        }
+
+        // BD LockRelId -> Lock subsystem
+        let lock_rel_ref = refs.iter().find(|e| matches!(
+            &e.from,
+            NodeId::BdField { role: BdFieldRole::LockRelId, .. }
+        ));
+        assert!(lock_rel_ref.is_some(), "LockRelId should reference Lock subsystem");
+
+        // BD NextBd -> BD resource space (ValidBd as representative)
+        let next_bd_ref = refs.iter().find(|e| matches!(
+            &e.from,
+            NodeId::BdField { role: BdFieldRole::NextBd, .. }
+        ));
+        assert!(next_bd_ref.is_some(), "NextBd should reference BD space");
+        match &next_bd_ref.unwrap().to {
+            NodeId::BdField { role: BdFieldRole::ValidBd, .. } => {}
+            other => panic!("NextBd should reference ValidBd, got {:?}", other),
+        }
+
+        // Channel StartBdId -> BD resource space
+        let start_bd_ref = refs.iter().find(|e| matches!(
+            &e.from,
+            NodeId::ChannelField {
+                role: DmaChannelFieldRole::StartBdId,
+                direction: DmaDirection::S2mm,
+                ..
+            }
+        ));
+        assert!(start_bd_ref.is_some(), "StartBdId should reference BD space");
+        match &start_bd_ref.unwrap().to {
+            NodeId::BdField { role: BdFieldRole::ValidBd, .. } => {}
+            other => panic!("StartBdId should reference ValidBd, got {:?}", other),
+        }
+
+        // Channel CurrentBdId -> BD resource space
+        let cur_bd_ref = refs.iter().find(|e| matches!(
+            &e.from,
+            NodeId::ChannelField {
+                role: DmaChannelFieldRole::CurrentBdId,
+                direction: DmaDirection::S2mm,
+                ..
+            }
+        ));
+        assert!(cur_bd_ref.is_some(), "CurrentBdId should reference BD space");
     }
 }

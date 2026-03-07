@@ -1032,6 +1032,11 @@ pub enum RelationshipKind {
     /// A node belongs to a functional grouping.
     /// Direction: member -> group (e.g., register -> subsystem).
     BelongsTo,
+
+    /// A field's value indexes into or points at another resource space.
+    /// Direction: referencing field -> referenced resource.
+    /// Example: BD's LockAcqId field -> Lock subsystem.
+    References,
 }
 
 /// A directed relationship between two nodes in the architecture graph.
