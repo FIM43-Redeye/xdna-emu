@@ -25,6 +25,34 @@ impl fmt::Display for Architecture {
     }
 }
 
+/// Fine-grained device generation, matching aie-rt's XAIE_DEV_GEN_* constants.
+///
+/// `Architecture` is the coarse bucket (AIE/AIE2/AIE2P); this enum captures
+/// the specific silicon revision within each architecture family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DeviceGeneration {
+    /// Generic/unknown (XAIE_DEV_GENERIC_DEVICE = 0)
+    Generic,
+    /// AIE1 -- Versal FPGA (XAIE_DEV_GEN_AIE = 1)
+    Aie,
+    /// AIE-ML -- AIE2 base (XAIE_DEV_GEN_AIEML = 2)
+    AieMl,
+    /// AIE2 IPU variant (XAIE_DEV_GEN_AIE2IPU = 3)
+    Aie2Ipu,
+    /// AIE2P (XAIE_DEV_GEN_AIE2P = 4)
+    Aie2P,
+    /// AIE2PS (XAIE_DEV_GEN_AIE2PS = 5)
+    Aie2Ps,
+    /// S100 (XAIE_DEV_GEN_S100 = 6)
+    S100,
+    /// S200 (XAIE_DEV_GEN_S200 = 7)
+    S200,
+    /// AIE2P Strix A0 stepping (XAIE_DEV_GEN_AIE2P_STRIX_A0 = 8)
+    Aie2PStrixA0,
+    /// AIE2P Strix B0 stepping (XAIE_DEV_GEN_AIE2P_STRIX_B0 = 9)
+    Aie2PStrixB0,
+}
+
 /// Tile type within the NPU array.
 ///
 /// aie-rt distinguishes four tile types (AIETILE, SHIMNOC, SHIMPL, MEMTILE).
@@ -260,6 +288,8 @@ pub struct TileTypeModel {
     pub instances: InstanceCount,
     /// Data/program memory model.
     pub memory: Option<MemoryModel>,
+    /// DMA feature capabilities (compression, padding, etc.).
+    pub dma_capabilities: Option<DmaCapabilities>,
     /// Switchbox port bundles (present on all tile types).
     pub switchbox_ports: Vec<PortBundle>,
     /// Shim mux port bundles (only present on shim tiles).
@@ -269,20 +299,57 @@ pub struct TileTypeModel {
     pub source: SourceAttribution,
 }
 
+/// DMA feature capabilities for a tile type.
+///
+/// These flags describe what optional DMA features the hardware supports.
+/// Derived from aie-rt's `XAie_DmaMod` structure, which defines these
+/// per architecture generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DmaCapabilities {
+    pub supports_compression: bool,
+    pub supports_zero_padding: bool,
+    pub supports_out_of_order_bd: bool,
+    pub supports_interleave: bool,
+    pub supports_fifo_mode: bool,
+    pub supports_token_issue: bool,
+    pub supports_repeat_count: bool,
+    pub supports_tlast_suppress: bool,
+    /// Number of addressing dimensions (typically 3 or 4).
+    pub max_address_dimensions: u8,
+}
+
 /// Device-level hardware constants.
 ///
 /// These are properties of the device as a whole, not of any specific tile.
-/// All values come from the mlir-aie device model.
+/// Values come from the mlir-aie device model and aie-rt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceConstants {
     /// Maximum lock counter value (e.g., 63 for AIE2).
     pub max_lock_value: u32,
+    /// Minimum lock counter value (e.g., -64 for AIE-ML, 0 for AIE1).
+    pub min_lock_value: i32,
     /// DMA address generation granularity in bytes (e.g., 32).
     pub address_gen_granularity: u32,
+    /// Accumulator cascade width in bits (384 for AIE1, 512 for AIE2).
+    pub accumulator_cascade_bits: Option<u32>,
     /// Memory base addresses per cardinal direction, used for cross-tile
     /// memory access routing. Keys: south, west, north, east.
     pub mem_base_addresses: std::collections::BTreeMap<String, u64>,
+    /// Architecture-level capability flags.
+    pub properties: DeviceProperties,
     pub source: SourceAttribution,
+}
+
+/// Architecture-level capability flags.
+///
+/// Derived from mlir-aie's `ModelProperty` enum. These describe fundamental
+/// behavioral differences between architecture generations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceProperties {
+    /// Uses semaphore-style locks (AIE2+) vs. binary locks (AIE1).
+    pub uses_semaphore_locks: bool,
+    /// Supports multi-dimensional buffer descriptors.
+    pub uses_multi_dim_bds: bool,
 }
 
 /// Directional flags (north/south/east/west).
@@ -368,6 +435,8 @@ pub struct Relationship {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchModel {
     pub arch: Architecture,
+    /// Fine-grained device generation (aie-rt XAIE_DEV_GEN_*).
+    pub generation: Option<DeviceGeneration>,
     /// mlir-aie device ID (e.g., npu1=4, npu2=8).
     pub device_id: Option<u32>,
     /// Whether this device is an NPU (vs. Versal FPGA).
@@ -383,6 +452,7 @@ impl ArchModel {
     pub fn new(arch: Architecture) -> Self {
         Self {
             arch,
+            generation: None,
             device_id: None,
             is_npu: false,
             tile_types: Vec::new(),
@@ -501,6 +571,17 @@ mod tests {
                     detail: "test".to_string(),
                 },
             }),
+            dma_capabilities: Some(DmaCapabilities {
+                supports_compression: true,
+                supports_zero_padding: true,
+                supports_out_of_order_bd: false,
+                supports_interleave: false,
+                supports_fifo_mode: true,
+                supports_token_issue: true,
+                supports_repeat_count: true,
+                supports_tlast_suppress: false,
+                max_address_dimensions: 4,
+            }),
             switchbox_ports: vec![
                 PortBundle { bundle: "DMA".to_string(), masters: 2, slaves: 2 },
                 PortBundle { bundle: "Core".to_string(), masters: 1, slaves: 1 },
@@ -538,8 +619,14 @@ mod tests {
 
         let constants = DeviceConstants {
             max_lock_value: 63,
+            min_lock_value: -64,
             address_gen_granularity: 32,
+            accumulator_cascade_bits: Some(512),
             mem_base_addresses: mem_bases,
+            properties: DeviceProperties {
+                uses_semaphore_locks: true,
+                uses_multi_dim_bds: true,
+            },
             source: SourceAttribution {
                 origin: Source::DeviceModel,
                 file: "test.json".to_string(),
@@ -547,6 +634,9 @@ mod tests {
             },
         };
         assert_eq!(constants.max_lock_value, 63);
+        assert_eq!(constants.min_lock_value, -64);
+        assert_eq!(constants.accumulator_cascade_bits, Some(512));
+        assert!(constants.properties.uses_semaphore_locks);
         assert_eq!(constants.mem_base_addresses.len(), 4);
         assert_eq!(constants.mem_base_addresses["south"], 262144);
     }
@@ -584,6 +674,7 @@ mod tests {
             representative: Some((1, 0)),
             instances: InstanceCount { locks: 16, bds: 16, channels: 2 },
             memory: None,
+            dma_capabilities: None,
             switchbox_ports: vec![
                 PortBundle { bundle: "South".to_string(), masters: 6, slaves: 8 },
                 PortBundle { bundle: "North".to_string(), masters: 6, slaves: 4 },
@@ -643,10 +734,17 @@ mod tests {
         let mut mem_bases = std::collections::BTreeMap::new();
         mem_bases.insert("south".to_string(), 262144);
 
+        model.generation = Some(DeviceGeneration::Aie2Ipu);
         model.device_constants = Some(DeviceConstants {
             max_lock_value: 63,
+            min_lock_value: -64,
             address_gen_granularity: 32,
+            accumulator_cascade_bits: Some(512),
             mem_base_addresses: mem_bases,
+            properties: DeviceProperties {
+                uses_semaphore_locks: true,
+                uses_multi_dim_bds: true,
+            },
             source: SourceAttribution {
                 origin: Source::DeviceModel,
                 file: "test.json".to_string(),
