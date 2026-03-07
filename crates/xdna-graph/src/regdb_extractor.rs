@@ -1481,6 +1481,7 @@ mod tests {
             width: 32,
             access: AccessMode::ReadWrite,
             reset_value: 0,
+            description: None,
             fields: field_names
                 .iter()
                 .map(|n| BitField {
@@ -1571,6 +1572,7 @@ mod tests {
             width: 32,
             access,
             reset_value: 0,
+            description: None,
             fields: field_names
                 .iter()
                 .map(|n| BitField {

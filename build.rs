@@ -12,58 +12,17 @@
 //! - `gen_stream_ports.rs`  -- port type arrays (included by `aie2_spec.rs`)
 //! - `gen_stream_ranges.rs` -- port range constants (included by `aie2_spec.rs`)
 
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-// ============================================================================
-// JSON deserialization types -- AM025 register database
-// ============================================================================
-// Cannot share types with regdb.rs because build scripts compile separately.
-
-#[derive(Deserialize)]
-struct RawRegisterDb {
-    #[allow(dead_code)]
-    version: String,
-    modules: HashMap<String, RawModule>,
-}
-
-#[derive(Deserialize)]
-struct RawModule {
-    registers: Vec<RawRegister>,
-}
-
-#[derive(Deserialize)]
-struct RawRegister {
-    name: String,
-    offset: String,
-    description: String,
-    bit_fields: Vec<RawBitField>,
-}
-
-#[derive(Deserialize)]
-struct RawBitField {
-    name: String,
-    bit_range: Vec<u32>,
-}
-
-// ============================================================================
-// JSON deserialization types -- device model
-// ============================================================================
-
-#[derive(Deserialize)]
-struct DeviceModelSet {
-    devices: HashMap<String, DeviceModel>,
-}
-
-#[derive(Deserialize)]
-struct DeviceModel {
-    local_memory_size: u64,
-    mem_tile_size: u64,
-}
+// AM025 register database types come from the graph crate.
+// This eliminates the duplicate JSON parsing types that build.rs
+// previously maintained separately (build scripts can now share
+// types via workspace member crates).
+use xdna_graph::regdb::RegisterDb;
 
 // ============================================================================
 // Port type constants -- mirrors aie2_spec::port_type for codegen output
@@ -109,34 +68,25 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MLIR_AIE_PATH");
     println!("cargo:rerun-if-changed=build.rs");
 
-    // Load AM025 register database
-    let am025_text = fs::read_to_string(&am025_path).unwrap_or_else(|e| {
+    // Load AM025 register database via the graph crate's parser.
+    let regdb = RegisterDb::from_file(&am025_path).unwrap_or_else(|e| {
         panic!(
-            "Cannot read AM025 register database at {}:\n  {}\n\
+            "Cannot load AM025 register database at {}:\n  {}\n\
              Set MLIR_AIE_PATH to override the mlir-aie location.",
             am025_path.display(),
             e
         )
     });
-    let regdb: RawRegisterDb = serde_json::from_str(&am025_text)
-        .unwrap_or_else(|e| panic!("Failed to parse AM025 JSON: {}", e));
 
-    // Load device model
-    let device_text = fs::read_to_string(&device_model_path).unwrap_or_else(|e| {
-        panic!(
-            "Cannot read device model at {}: {}",
-            device_model_path.display(),
-            e
-        )
-    });
-    let device_models: DeviceModelSet = serde_json::from_str(&device_text)
-        .unwrap_or_else(|e| panic!("Failed to parse device model JSON: {}", e));
+    // Load device model via the graph crate's extractor.
+    let device_models = xdna_graph::device_model::extract_device_models(&device_model_path)
+        .unwrap_or_else(|e| panic!("Failed to parse device model: {}", e));
 
     // Bridge script for trace events
     let bridge_path = manifest_dir.join("tools/mlir-aie-bridge.py");
     println!("cargo:rerun-if-changed={}", bridge_path.display());
 
-    // Generate all files
+    // Generate all files from the graph crate's parsed data.
     gen_core_module(&regdb, &out_dir);
     gen_lock_request(&regdb, &out_dir, "memory", "gen_memory_lock.rs");
     gen_lock_request(&regdb, &out_dir, "memory_tile", "gen_memtile_lock.rs");
@@ -153,16 +103,6 @@ fn main() {
 // Helpers
 // ============================================================================
 
-/// Parse a hex offset string like "0x0000032000" to a u32 tile-local offset.
-/// The JSON stores full 40-bit addresses; we mask to 20-bit tile-local offset.
-fn parse_offset(s: &str) -> u32 {
-    let s = s.trim_start_matches("0x").trim_start_matches("0X");
-    let full = u64::from_str_radix(s, 16)
-        .unwrap_or_else(|e| panic!("Bad hex offset '{}': {}", s, e));
-    // Tile-local offset is the low 20 bits (0xFFFFF mask)
-    (full & 0xFFFFF) as u32
-}
-
 /// File header comment for generated source.
 fn gen_header(source_desc: &str) -> String {
     format!(
@@ -176,10 +116,9 @@ fn gen_header(source_desc: &str) -> String {
 // Step 1: Core module register offsets
 // ============================================================================
 
-fn gen_core_module(regdb: &RawRegisterDb, out_dir: &Path) {
+fn gen_core_module(regdb: &RegisterDb, out_dir: &Path) {
     let core = regdb
-        .modules
-        .get("core")
+        .module("core")
         .expect("AM025 JSON missing 'core' module");
 
     // Map of JSON register name -> Rust constant name
@@ -200,15 +139,12 @@ fn gen_core_module(regdb: &RawRegisterDb, out_dir: &Path) {
 
     for &(json_name, const_name) in register_map {
         let reg = core
-            .registers
-            .iter()
-            .find(|r| r.name == json_name)
+            .register(json_name)
             .unwrap_or_else(|| {
                 panic!("Core register '{}' not found in AM025 JSON", json_name)
             });
-        let offset = parse_offset(&reg.offset);
         writeln!(out, "/// {} (AM025: {})", const_name, json_name).unwrap();
-        writeln!(out, "pub const {}: u32 = {:#07X};", const_name, offset).unwrap();
+        writeln!(out, "pub const {}: u32 = {:#07X};", const_name, reg.offset).unwrap();
         writeln!(out).unwrap();
     }
 
@@ -219,7 +155,7 @@ fn gen_core_module(regdb: &RawRegisterDb, out_dir: &Path) {
         .registers
         .iter()
         .filter(|r| !r.name.starts_with("Stream_Switch"))
-        .map(|r| parse_offset(&r.offset))
+        .map(|r| r.offset)
         .filter(|&o| (0x30000..0x3F000).contains(&o))
         .collect();
 
@@ -252,20 +188,17 @@ fn gen_core_module(regdb: &RawRegisterDb, out_dir: &Path) {
 // ============================================================================
 
 fn gen_lock_request(
-    regdb: &RawRegisterDb,
+    regdb: &RegisterDb,
     out_dir: &Path,
     module_name: &str,
     output_file: &str,
 ) {
     let module = regdb
-        .modules
-        .get(module_name)
+        .module(module_name)
         .unwrap_or_else(|| panic!("AM025 JSON missing '{}' module", module_name));
 
     let lock_req = module
-        .registers
-        .iter()
-        .find(|r| r.name == "Lock_Request")
+        .register("Lock_Request")
         .unwrap_or_else(|| {
             panic!(
                 "Lock_Request register not found in '{}' module",
@@ -273,8 +206,8 @@ fn gen_lock_request(
             )
         });
 
-    let base_offset = parse_offset(&lock_req.offset);
-    let desc = &lock_req.description;
+    let base_offset = lock_req.offset;
+    let desc = lock_req.description.as_deref().unwrap_or("");
 
     // Parse end address from description: "... address space: 0xBASE - 0xLAST, ..."
     // End (exclusive) = LAST + 4 (since registers are 4-byte aligned)
@@ -403,21 +336,32 @@ fn parse_desc_single_bit(desc: &str, field_name: &str, module_name: &str) -> u32
 // Step 3: Data memory sizes
 // ============================================================================
 
-fn gen_data_memory(device_models: &DeviceModelSet, out_dir: &Path) {
+fn gen_data_memory(
+    device_models: &std::collections::HashMap<String, xdna_graph::types::ArchModel>,
+    out_dir: &Path,
+) {
     let npu1 = device_models
-        .devices
         .get("npu1")
         .expect("Device model missing 'npu1' device");
 
-    let compute_end = npu1.local_memory_size - 1;
-    let memtile_end = npu1.mem_tile_size - 1;
+    let core_mem = npu1.tile_types.iter()
+        .find(|t| t.name == "core")
+        .and_then(|t| t.memory.as_ref())
+        .expect("npu1 core tile missing memory model");
+    let memtile_mem = npu1.tile_types.iter()
+        .find(|t| t.name == "mem_tile")
+        .and_then(|t| t.memory.as_ref())
+        .expect("npu1 mem_tile missing memory model");
+
+    let compute_end = core_mem.size_bytes - 1;
+    let memtile_end = memtile_mem.size_bytes - 1;
 
     let mut out = gen_header("device model (npu1) memory sizes");
 
     writeln!(
         out,
         "/// Data memory end offset for compute tile ({} KB)",
-        npu1.local_memory_size / 1024
+        core_mem.size_bytes / 1024
     )
     .unwrap();
     writeln!(
@@ -430,7 +374,7 @@ fn gen_data_memory(device_models: &DeviceModelSet, out_dir: &Path) {
     writeln!(
         out,
         "/// Data memory end offset for memory tile ({} KB)",
-        npu1.mem_tile_size / 1024
+        memtile_mem.size_bytes / 1024
     )
     .unwrap();
     writeln!(
@@ -463,7 +407,7 @@ struct PortEntry {
     suffix: String,
 }
 
-fn gen_stream_ports(regdb: &RawRegisterDb, out_dir: &Path) -> PortArrayData {
+fn gen_stream_ports(regdb: &RegisterDb, out_dir: &Path) -> PortArrayData {
     let mut out = gen_header("AM025 Stream_Switch_*_Config registers");
     // Note: the generated code references `port_type::*` which is defined
     // in the including module (aie2_spec.rs), before the include!() point.
@@ -538,13 +482,12 @@ fn gen_stream_ports(regdb: &RawRegisterDb, out_dir: &Path) -> PortArrayData {
 
 /// Collect and sort port entries for a given module and register prefix.
 fn collect_port_array(
-    regdb: &RawRegisterDb,
+    regdb: &RegisterDb,
     module_name: &str,
     prefix: &str,
 ) -> Vec<PortEntry> {
     let module = regdb
-        .modules
-        .get(module_name)
+        .module(module_name)
         .unwrap_or_else(|| panic!("AM025 JSON missing '{}' module", module_name));
 
     let mut entries: Vec<(u32, PortEntry)> = module
@@ -554,9 +497,8 @@ fn collect_port_array(
         .map(|r| {
             let suffix = r.name[prefix.len()..].to_string();
             let (port_type_value, port_type_expr) = suffix_to_port_type(&suffix);
-            let offset = parse_offset(&r.offset);
             (
-                offset,
+                r.offset,
                 PortEntry {
                     port_type_value,
                     port_type_expr,
@@ -644,7 +586,7 @@ fn write_port_array(
 // ============================================================================
 
 fn gen_stream_ranges(
-    regdb: &RawRegisterDb,
+    regdb: &RegisterDb,
     port_data: &PortArrayData,
     out_dir: &Path,
 ) {
@@ -876,24 +818,17 @@ fn find_port_range(ports: &[PortEntry], base: u8) -> Option<(u8, u8)> {
 }
 
 /// Find the Master_Enable bit position from any Stream_Switch_Master_Config register.
-fn find_master_enable_bit(regdb: &RawRegisterDb) -> u32 {
+fn find_master_enable_bit(regdb: &RegisterDb) -> u32 {
     for module in regdb.modules.values() {
         for reg in &module.registers {
             if reg.name.starts_with("Stream_Switch_Master_Config_") {
-                for field in &reg.bit_fields {
-                    if field.name == "Master_Enable" {
-                        // bit_range is [high, low] for a range, or [bit] for single
-                        let bit = if field.bit_range.len() == 2 {
-                            assert_eq!(
-                                field.bit_range[0], field.bit_range[1],
-                                "Master_Enable should be a single bit"
-                            );
-                            field.bit_range[0]
-                        } else {
-                            field.bit_range[0]
-                        };
-                        return bit;
-                    }
+                if let Some(field) = reg.field("Master_Enable") {
+                    // Graph crate's BitField has lsb/msb already parsed.
+                    assert_eq!(
+                        field.lsb, field.msb,
+                        "Master_Enable should be a single bit"
+                    );
+                    return field.lsb as u32;
                 }
             }
         }

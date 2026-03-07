@@ -47,6 +47,9 @@ struct RawRegister {
     access_type: Option<String>,
     /// Reset value as hex string (e.g. "0x00000000").
     reset: Option<String>,
+    /// Prose description (may encode address-mapped fields for special registers).
+    #[serde(default)]
+    description: Option<String>,
     bit_fields: Vec<RawBitField>,
 }
 
@@ -167,6 +170,8 @@ pub struct RegisterDef {
     pub access: AccessMode,
     /// Power-on reset value for this register.
     pub reset_value: u32,
+    /// Prose description (may encode address-mapped fields for special registers).
+    pub description: Option<String>,
     pub fields: Vec<BitField>,
 }
 
@@ -268,6 +273,7 @@ impl RegisterDb {
                     width,
                     access,
                     reset_value,
+                    description: raw_reg.description,
                     fields,
                 });
             }
