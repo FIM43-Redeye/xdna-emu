@@ -26,11 +26,16 @@ impl fmt::Display for Architecture {
 }
 
 /// Tile type within the NPU array.
+///
+/// aie-rt distinguishes four tile types (AIETILE, SHIMNOC, SHIMPL, MEMTILE).
+/// ShimPl tiles exist in the hardware but are not software-accessible on NPU
+/// devices, so they typically don't appear in device model extractions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TileKind {
     Compute,
     Mem,
-    Shim,
+    ShimNoc,
+    ShimPl,
 }
 
 impl fmt::Display for TileKind {
@@ -38,7 +43,8 @@ impl fmt::Display for TileKind {
         match self {
             Self::Compute => write!(f, "compute"),
             Self::Mem => write!(f, "mem"),
-            Self::Shim => write!(f, "shim"),
+            Self::ShimNoc => write!(f, "shim_noc"),
+            Self::ShimPl => write!(f, "shim_pl"),
         }
     }
 }
@@ -195,48 +201,33 @@ impl fmt::Display for ModuleKind {
     }
 }
 
-/// Port direction for stream switch and DMA connections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PortDirection {
-    Master,
-    Slave,
-}
-
-/// Which port namespace a port belongs to.
+/// A bundle of ports in one direction group (e.g., "DMA" with 2 masters + 2 slaves).
 ///
-/// Shim tiles have two distinct port namespaces: the switchbox (shared with
-/// all tile types) and the shim mux (shim-only, connects DMA and South).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum PortNamespace {
-    Switchbox,
-    ShimMux,
-}
-
-/// A connection point on a module.
+/// The device model stores port counts per bundle, not individual ports.
+/// All ports within a bundle+direction are identical -- they differ only by
+/// index, which can be enumerated from the count.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PortModel {
-    pub namespace: PortNamespace,
+pub struct PortBundle {
     pub bundle: String,
-    pub index: u8,
-    pub direction: PortDirection,
-    pub source: SourceAttribution,
+    pub masters: u8,
+    pub slaves: u8,
 }
 
-/// Instance counts for repeated hardware elements.
+/// Instance counts for repeated hardware elements within a tile type.
+///
+/// Memory banking info (num_banks, bank_size) lives in `MemoryModel`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceCount {
-    pub channels: u8,
-    pub bds: u8,
     pub locks: u8,
+    pub bds: u8,
+    pub channels: u8,
 }
 
-/// A functional module within a tile.
+/// A functional module within a tile (Layer 2+: registers grouped by function).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModuleModel {
     pub kind: ModuleKind,
     pub registers: Vec<RegisterModel>,
-    pub ports: Vec<PortModel>,
-    pub instances: Option<InstanceCount>,
     pub source: SourceAttribution,
 }
 
@@ -258,13 +249,23 @@ pub struct MemoryModel {
     pub source: SourceAttribution,
 }
 
-/// A tile type definition (e.g., "aie2_compute").
+/// A tile type definition (e.g., "core", "mem_tile", "shim_noc").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TileTypeModel {
     pub kind: TileKind,
     pub name: String,
-    pub modules: Vec<ModuleModel>,
+    /// Representative tile coordinates [col, row] for this type.
+    pub representative: Option<(u8, u8)>,
+    /// Hardware resource counts (locks, BDs, channels, banks).
+    pub instances: InstanceCount,
+    /// Data/program memory model.
     pub memory: Option<MemoryModel>,
+    /// Switchbox port bundles (present on all tile types).
+    pub switchbox_ports: Vec<PortBundle>,
+    /// Shim mux port bundles (only present on shim tiles).
+    pub shim_mux_ports: Vec<PortBundle>,
+    /// Register modules (populated in Layer 2).
+    pub modules: Vec<ModuleModel>,
     pub source: SourceAttribution,
 }
 
@@ -363,10 +364,14 @@ pub struct Relationship {
 // Top-level model
 // ============================================================================
 
-/// Complete architecture model for one NPU architecture.
+/// Complete architecture model for one NPU device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchModel {
     pub arch: Architecture,
+    /// mlir-aie device ID (e.g., npu1=4, npu2=8).
+    pub device_id: Option<u32>,
+    /// Whether this device is an NPU (vs. Versal FPGA).
+    pub is_npu: bool,
     pub tile_types: Vec<TileTypeModel>,
     pub array_topology: Option<ArrayTopology>,
     pub device_constants: Option<DeviceConstants>,
@@ -378,6 +383,8 @@ impl ArchModel {
     pub fn new(arch: Architecture) -> Self {
         Self {
             arch,
+            device_id: None,
+            is_npu: false,
             tile_types: Vec::new(),
             array_topology: None,
             device_constants: None,
@@ -399,8 +406,10 @@ mod tests {
 
     #[test]
     fn test_tile_kind_variants() {
-        let kinds = [TileKind::Compute, TileKind::Mem, TileKind::Shim];
-        assert_eq!(kinds.len(), 3);
+        let kinds = [TileKind::Compute, TileKind::Mem, TileKind::ShimNoc, TileKind::ShimPl];
+        assert_eq!(kinds.len(), 4);
+        assert_eq!(format!("{}", TileKind::ShimNoc), "shim_noc");
+        assert_eq!(format!("{}", TileKind::ShimPl), "shim_pl");
     }
 
     #[test]
@@ -434,6 +443,8 @@ mod tests {
     fn test_arch_model_empty() {
         let model = ArchModel::new(Architecture::Aie2);
         assert_eq!(model.arch, Architecture::Aie2);
+        assert_eq!(model.device_id, None);
+        assert!(!model.is_npu);
         assert!(model.tile_types.is_empty());
         assert!(model.relationships.is_empty());
     }
@@ -441,9 +452,13 @@ mod tests {
     #[test]
     fn test_serde_round_trip() {
         let mut model = ArchModel::new(Architecture::Aie2);
+        model.device_id = Some(4);
+        model.is_npu = true;
         model.tile_types.push(TileTypeModel {
             kind: TileKind::Compute,
-            name: "aie2_compute".to_string(),
+            name: "core".to_string(),
+            representative: Some((1, 2)),
+            instances: InstanceCount { locks: 16, bds: 16, channels: 2 },
             modules: vec![ModuleModel {
                 kind: ModuleKind::Dma,
                 registers: vec![RegisterModel {
@@ -469,8 +484,6 @@ mod tests {
                         detail: "test".to_string(),
                     },
                 }],
-                ports: Vec::new(),
-                instances: Some(InstanceCount { channels: 2, bds: 16, locks: 0 }),
                 source: SourceAttribution {
                     origin: Source::DeviceModel,
                     file: "test.json".to_string(),
@@ -488,6 +501,11 @@ mod tests {
                     detail: "test".to_string(),
                 },
             }),
+            switchbox_ports: vec![
+                PortBundle { bundle: "DMA".to_string(), masters: 2, slaves: 2 },
+                PortBundle { bundle: "Core".to_string(), masters: 1, slaves: 1 },
+            ],
+            shim_mux_ports: Vec::new(),
             source: SourceAttribution {
                 origin: Source::DeviceModel,
                 file: "test.json".to_string(),
@@ -559,31 +577,35 @@ mod tests {
     }
 
     #[test]
-    fn test_port_namespace() {
-        let switchbox_port = PortModel {
-            namespace: PortNamespace::Switchbox,
-            bundle: "DMA".to_string(),
-            index: 0,
-            direction: PortDirection::Master,
+    fn test_port_bundles() {
+        let tile = TileTypeModel {
+            kind: TileKind::ShimNoc,
+            name: "shim_noc".to_string(),
+            representative: Some((1, 0)),
+            instances: InstanceCount { locks: 16, bds: 16, channels: 2 },
+            memory: None,
+            switchbox_ports: vec![
+                PortBundle { bundle: "South".to_string(), masters: 6, slaves: 8 },
+                PortBundle { bundle: "North".to_string(), masters: 6, slaves: 4 },
+                PortBundle { bundle: "Ctrl".to_string(), masters: 1, slaves: 1 },
+            ],
+            shim_mux_ports: vec![
+                PortBundle { bundle: "DMA".to_string(), masters: 2, slaves: 2 },
+                PortBundle { bundle: "South".to_string(), masters: 8, slaves: 6 },
+            ],
+            modules: Vec::new(),
             source: SourceAttribution {
                 origin: Source::DeviceModel,
                 file: "test.json".to_string(),
-                detail: "test".to_string(),
+                detail: "shim_noc".to_string(),
             },
         };
-        let shim_mux_port = PortModel {
-            namespace: PortNamespace::ShimMux,
-            bundle: "DMA".to_string(),
-            index: 0,
-            direction: PortDirection::Master,
-            source: SourceAttribution {
-                origin: Source::DeviceModel,
-                file: "test.json".to_string(),
-                detail: "test".to_string(),
-            },
-        };
-        // Same bundle+index+direction, different namespace -- distinct ports
-        assert_ne!(switchbox_port, shim_mux_port);
+        // Switchbox and shim_mux are distinct port namespaces
+        assert_eq!(tile.switchbox_ports.len(), 3);
+        assert_eq!(tile.shim_mux_ports.len(), 2);
+        // DMA ports only appear in shim_mux for shim tiles
+        assert!(tile.switchbox_ports.iter().all(|p| p.bundle != "DMA"));
+        assert!(tile.shim_mux_ports.iter().any(|p| p.bundle == "DMA"));
     }
 
     #[test]
