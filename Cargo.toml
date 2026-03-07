@@ -65,5 +65,9 @@ hex = "0.4"                                             # Hex dump utilities for
 name = "trace-compare"
 path = "src/bin/trace_compare.rs"
 
+[[bin]]
+name = "npu-graph"
+path = "src/bin/npu_graph.rs"
+
 [profile.release]
 lto = true

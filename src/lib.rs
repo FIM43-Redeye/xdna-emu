@@ -29,3 +29,4 @@ pub mod testing;
 pub mod ffi;
 pub mod build_progress;
 pub mod fuzzer;
+pub mod graph;
