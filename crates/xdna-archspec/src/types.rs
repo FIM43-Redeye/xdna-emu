@@ -472,9 +472,9 @@ pub struct SubsystemModel {
     pub offset_start: Confirmed<u32>,
     /// End offset (exclusive).
     pub offset_end: Confirmed<u32>,
-    /// Indices into parent ModuleModel.registers for registers owned
-    /// by this subsystem.
-    pub register_indices: Vec<usize>,
+    /// Registers owned by this subsystem, moved here from ModuleModel
+    /// during subsystem population.
+    pub registers: Vec<RegisterModel>,
 }
 
 impl SubsystemModel {
@@ -490,21 +490,32 @@ impl SubsystemModel {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModuleModel {
     pub kind: ModuleKind,
-    pub registers: Vec<RegisterModel>,
-    /// Subsystems derived from register grouping. Populated after register
-    /// extraction by analyzing offset ranges per `SubsystemKind`.
+    /// Subsystems derived from register grouping. Each subsystem owns the
+    /// registers that belong to it (moved from the module level during
+    /// subsystem population).
     pub subsystems: Vec<SubsystemModel>,
     pub source: SourceAttribution,
+}
+
+impl ModuleModel {
+    /// Iterate over all registers across all subsystems.
+    pub fn all_registers(&self) -> impl Iterator<Item = &RegisterModel> {
+        self.subsystems.iter().flat_map(|s| s.registers.iter())
+    }
+
+    /// Total register count across all subsystems.
+    pub fn register_count(&self) -> usize {
+        self.subsystems.iter().map(|s| s.registers.len()).sum()
+    }
 }
 
 impl FactEquals for ModuleModel {
     fn fact_equals(&self, other: &Self) -> bool {
         self.kind == other.kind
-            && self.registers.len() == other.registers.len()
+            && self.register_count() == other.register_count()
             && self
-                .registers
-                .iter()
-                .zip(other.registers.iter())
+                .all_registers()
+                .zip(other.all_registers())
                 .all(|(a, b)| a.fact_equals(b))
     }
 }
@@ -1685,30 +1696,42 @@ mod tests {
             instances: test_instances(16, 16, 2),
             modules: vec![ModuleModel {
                 kind: ModuleKind::Core,
-                registers: vec![RegisterModel {
-                    name: "DMA_BD0_0".to_string(),
-                    offset: 0x1D000,
-                    width: 32,
-                    reset_value: 0,
-                    fields: vec![FieldModel {
-                        name: "Buffer_Length".to_string(),
-                        bits: BitRange::Contiguous { msb: 13, lsb: 0 },
-                        meaning: FieldSemantics::Count,
+                subsystems: vec![SubsystemModel {
+                    kind: SubsystemKind::Dma,
+                    offset_start: Confirmed::new(0x1D000, SourceAttribution {
+                        origin: Source::Am025Json,
+                        file: "test.json".to_string(),
+                        detail: "test".to_string(),
+                    }),
+                    offset_end: Confirmed::new(0x1D004, SourceAttribution {
+                        origin: Source::Am025Json,
+                        file: "test.json".to_string(),
+                        detail: "test".to_string(),
+                    }),
+                    registers: vec![RegisterModel {
+                        name: "DMA_BD0_0".to_string(),
+                        offset: 0x1D000,
+                        width: 32,
+                        reset_value: 0,
+                        fields: vec![FieldModel {
+                            name: "Buffer_Length".to_string(),
+                            bits: BitRange::Contiguous { msb: 13, lsb: 0 },
+                            meaning: FieldSemantics::Count,
+                            source: SourceAttribution {
+                                origin: Source::Am025Json,
+                                file: "test.json".to_string(),
+                                detail: "test".to_string(),
+                            },
+                        }],
+                        subsystem: SubsystemKind::Dma,
+                        access: Access::ReadWrite,
                         source: SourceAttribution {
                             origin: Source::Am025Json,
                             file: "test.json".to_string(),
                             detail: "test".to_string(),
                         },
                     }],
-                    subsystem: SubsystemKind::Dma,
-                    access: Access::ReadWrite,
-                    source: SourceAttribution {
-                        origin: Source::Am025Json,
-                        file: "test.json".to_string(),
-                        detail: "test".to_string(),
-                    },
                 }],
-                subsystems: Vec::new(),
                 source: SourceAttribution {
                     origin: Source::Am025Json,
                     file: "test.json".to_string(),
@@ -2109,12 +2132,43 @@ mod tests {
             kind: SubsystemKind::Dma,
             offset_start: Confirmed::new(0x1D000, src.clone()),
             offset_end: Confirmed::new(0x1E000, src.clone()),
-            register_indices: vec![0, 1, 2],
+            registers: vec![
+                RegisterModel {
+                    name: "BD0".into(),
+                    offset: 0x1D000,
+                    width: 32,
+                    reset_value: 0,
+                    fields: vec![],
+                    subsystem: SubsystemKind::Dma,
+                    access: Access::ReadWrite,
+                    source: src.clone(),
+                },
+                RegisterModel {
+                    name: "BD1".into(),
+                    offset: 0x1D004,
+                    width: 32,
+                    reset_value: 0,
+                    fields: vec![],
+                    subsystem: SubsystemKind::Dma,
+                    access: Access::ReadWrite,
+                    source: src.clone(),
+                },
+                RegisterModel {
+                    name: "BD2".into(),
+                    offset: 0x1D008,
+                    width: 32,
+                    reset_value: 0,
+                    fields: vec![],
+                    subsystem: SubsystemKind::Dma,
+                    access: Access::ReadWrite,
+                    source: src.clone(),
+                },
+            ],
         };
         assert_eq!(sub.kind, SubsystemKind::Dma);
         assert_eq!(*sub.offset_start.value(), 0x1D000);
         assert_eq!(*sub.offset_end.value(), 0x1E000);
-        assert_eq!(sub.register_indices.len(), 3);
+        assert_eq!(sub.registers.len(), 3);
     }
 
     #[test]
@@ -2124,7 +2178,7 @@ mod tests {
             kind: SubsystemKind::Lock,
             offset_start: Confirmed::new(0x1F000, src.clone()),
             offset_end: Confirmed::new(0x1F100, src),
-            register_indices: vec![],
+            registers: vec![],
         };
         assert!(sub.contains_offset(0x1F000));  // inclusive start
         assert!(sub.contains_offset(0x1F0FF));  // last byte before end

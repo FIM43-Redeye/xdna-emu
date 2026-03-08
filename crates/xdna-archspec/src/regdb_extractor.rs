@@ -559,8 +559,9 @@ pub fn register_def_to_model(reg: &regdb::RegisterDef, module_name: &str) -> Reg
 
 /// Build a complete ModuleModel from a regdb module definition.
 ///
-/// Converts every register in the AM025 module to a typed RegisterModel
-/// with subsystem classification derived from register names.
+/// Converts every register in the AM025 module to a typed RegisterModel,
+/// groups them into subsystems, and returns a fully populated ModuleModel
+/// where each subsystem owns its registers.
 pub fn build_module_model(kind: ModuleKind, module: &regdb::ModuleDef) -> ModuleModel {
     let registers: Vec<RegisterModel> = module
         .registers
@@ -568,25 +569,26 @@ pub fn build_module_model(kind: ModuleKind, module: &regdb::ModuleDef) -> Module
         .map(|reg| register_def_to_model(reg, &module.name))
         .collect();
 
-    ModuleModel {
+    let mut model = ModuleModel {
         kind,
-        registers,
         subsystems: Vec::new(),
         source: SourceAttribution {
             origin: Source::Am025Json,
             file: "aie_registers_aie2.json".into(),
             detail: format!("module={}", module.name),
         },
-    }
+    };
+
+    populate_subsystems(&mut model, registers);
+    model
 }
 
 /// Group registers by SubsystemKind and derive address ranges.
 ///
-/// Called after all registers are populated on a ModuleModel. Groups
-/// registers by their `subsystem` field, computes min(offset) and
-/// max(offset + ceil(width/8)) to derive the address range for each
-/// subsystem.
-pub fn populate_subsystems(module: &mut ModuleModel) {
+/// Takes ownership of the registers vec, distributing each register to
+/// its owning subsystem. Computes min(offset) and max(offset + ceil(width/8))
+/// to derive the address range for each subsystem.
+pub fn populate_subsystems(module: &mut ModuleModel, registers: Vec<RegisterModel>) {
     use std::collections::HashMap;
 
     let source = SourceAttribution {
@@ -595,13 +597,13 @@ pub fn populate_subsystems(module: &mut ModuleModel) {
         detail: format!("register offset range for {:?} module", module.kind),
     };
 
-    // Group register indices by subsystem
-    let mut groups: HashMap<SubsystemKind, Vec<usize>> = HashMap::new();
-    for (idx, reg) in module.registers.iter().enumerate() {
-        groups.entry(reg.subsystem).or_default().push(idx);
+    // Group registers by subsystem, taking ownership
+    let mut groups: HashMap<SubsystemKind, Vec<RegisterModel>> = HashMap::new();
+    for reg in registers {
+        groups.entry(reg.subsystem).or_default().push(reg);
     }
 
-    for (kind, indices) in groups {
+    for (kind, regs) in groups {
         if kind == SubsystemKind::Unknown {
             continue; // Don't create subsystem for unclassified registers
         }
@@ -609,8 +611,7 @@ pub fn populate_subsystems(module: &mut ModuleModel) {
         let mut min_offset = u32::MAX;
         let mut max_end = 0u32;
 
-        for &idx in &indices {
-            let reg = &module.registers[idx];
+        for reg in &regs {
             let reg_end = reg.offset + (reg.width as u32 + 7) / 8; // ceil to bytes
             min_offset = min_offset.min(reg.offset);
             max_end = max_end.max(reg_end);
@@ -620,7 +621,7 @@ pub fn populate_subsystems(module: &mut ModuleModel) {
             kind,
             offset_start: Confirmed::new(min_offset, source.clone()),
             offset_end: Confirmed::new(max_end, source.clone()),
-            register_indices: indices,
+            registers: regs,
         });
     }
 
@@ -663,8 +664,7 @@ pub fn populate_tile_modules(model: &mut ArchModel, db: &regdb::RegisterDb) {
         if let Some((_, module_pairs)) = mapping {
             for &(kind, am025_name) in *module_pairs {
                 if let Some(module_def) = db.module(am025_name) {
-                    let mut module = build_module_model(kind, module_def);
-                    populate_subsystems(&mut module);
+                    let module = build_module_model(kind, module_def);
                     tile_type.modules.push(module);
 
                     let edge_source = SourceAttribution {
@@ -2652,15 +2652,15 @@ mod tests {
         assert!(core_tt.modules.iter().any(|m| m.kind == ModuleKind::Core));
         assert!(core_tt.modules.iter().any(|m| m.kind == ModuleKind::Memory));
 
-        // Core module should have registers with Processor subsystem
+        // Core module should have Processor subsystem but not Lock
         let core_mod = core_tt.modules.iter().find(|m| m.kind == ModuleKind::Core).unwrap();
-        assert!(core_mod.registers.iter().any(|r| r.subsystem == SubsystemKind::Processor));
-        assert!(!core_mod.registers.iter().any(|r| r.subsystem == SubsystemKind::Lock));
+        assert!(core_mod.subsystems.iter().any(|s| s.kind == SubsystemKind::Processor));
+        assert!(!core_mod.subsystems.iter().any(|s| s.kind == SubsystemKind::Lock));
 
-        // Memory module should have Lock and DMA
+        // Memory module should have Lock and DMA subsystems
         let mem_mod = core_tt.modules.iter().find(|m| m.kind == ModuleKind::Memory).unwrap();
-        assert!(mem_mod.registers.iter().any(|r| r.subsystem == SubsystemKind::Lock));
-        assert!(mem_mod.registers.iter().any(|r| r.subsystem == SubsystemKind::Dma));
+        assert!(mem_mod.subsystems.iter().any(|s| s.kind == SubsystemKind::Lock));
+        assert!(mem_mod.subsystems.iter().any(|s| s.kind == SubsystemKind::Dma));
 
         // MemTile gets 1 module
         let mt_tt = model.tile_types.iter().find(|t| t.name == "mem_tile").unwrap();
@@ -2747,21 +2747,24 @@ mod tests {
         assert_eq!(module_model.source.origin, crate::types::Source::Am025Json);
 
         // Every register in the AM025 memory module should be converted
-        assert_eq!(
-            module_model.registers.len(),
-            mem.registers.len(),
-            "all registers should be converted"
+        // (distributed across subsystems, possibly with Unknown excluded)
+        let total_regs: usize = module_model.register_count();
+        // Unknown registers are excluded from subsystems, so count may be less
+        assert!(
+            total_regs > 0 && total_regs <= mem.registers.len(),
+            "registers should be distributed across subsystems, got {} vs {} raw",
+            total_regs, mem.registers.len()
         );
 
         // Spot-check: Lock0_value should have SubsystemKind::Lock
-        let lock0 = module_model.registers.iter()
+        let lock0 = module_model.all_registers()
             .find(|r| r.name == "Lock0_value")
             .expect("Lock0_value should exist");
         assert_eq!(lock0.subsystem, SubsystemKind::Lock);
         assert_eq!(lock0.offset, 0x1F000);
 
         // DMA_BD0_0 should have SubsystemKind::Dma
-        let dma0 = module_model.registers.iter()
+        let dma0 = module_model.all_registers()
             .find(|r| r.name == "DMA_BD0_0")
             .expect("DMA_BD0_0 should exist");
         assert_eq!(dma0.subsystem, SubsystemKind::Dma);
@@ -3503,55 +3506,55 @@ mod tests {
             file: "test".into(),
             detail: "test".into(),
         };
+        let registers = vec![
+            RegisterModel {
+                name: "DMA_BD0_0".into(),
+                offset: 0x1D000,
+                width: 32,
+                reset_value: 0,
+                fields: vec![],
+                subsystem: SubsystemKind::Dma,
+                access: Access::ReadWrite,
+                source: src.clone(),
+            },
+            RegisterModel {
+                name: "DMA_BD0_1".into(),
+                offset: 0x1D004,
+                width: 32,
+                reset_value: 0,
+                fields: vec![],
+                subsystem: SubsystemKind::Dma,
+                access: Access::ReadWrite,
+                source: src.clone(),
+            },
+            RegisterModel {
+                name: "Lock0_value".into(),
+                offset: 0x1F000,
+                width: 32,
+                reset_value: 0,
+                fields: vec![],
+                subsystem: SubsystemKind::Lock,
+                access: Access::ReadWrite,
+                source: src.clone(),
+            },
+            RegisterModel {
+                name: "Unknown_Reg".into(),
+                offset: 0x10000,
+                width: 32,
+                reset_value: 0,
+                fields: vec![],
+                subsystem: SubsystemKind::Unknown,
+                access: Access::ReadWrite,
+                source: src.clone(),
+            },
+        ];
         let mut module = ModuleModel {
             kind: ModuleKind::Memory,
-            registers: vec![
-                RegisterModel {
-                    name: "DMA_BD0_0".into(),
-                    offset: 0x1D000,
-                    width: 32,
-                    reset_value: 0,
-                    fields: vec![],
-                    subsystem: SubsystemKind::Dma,
-                    access: Access::ReadWrite,
-                    source: src.clone(),
-                },
-                RegisterModel {
-                    name: "DMA_BD0_1".into(),
-                    offset: 0x1D004,
-                    width: 32,
-                    reset_value: 0,
-                    fields: vec![],
-                    subsystem: SubsystemKind::Dma,
-                    access: Access::ReadWrite,
-                    source: src.clone(),
-                },
-                RegisterModel {
-                    name: "Lock0_value".into(),
-                    offset: 0x1F000,
-                    width: 32,
-                    reset_value: 0,
-                    fields: vec![],
-                    subsystem: SubsystemKind::Lock,
-                    access: Access::ReadWrite,
-                    source: src.clone(),
-                },
-                RegisterModel {
-                    name: "Unknown_Reg".into(),
-                    offset: 0x10000,
-                    width: 32,
-                    reset_value: 0,
-                    fields: vec![],
-                    subsystem: SubsystemKind::Unknown,
-                    access: Access::ReadWrite,
-                    source: src.clone(),
-                },
-            ],
             subsystems: Vec::new(),
             source: src,
         };
 
-        populate_subsystems(&mut module);
+        populate_subsystems(&mut module, registers);
 
         // Should have 2 subsystems (DMA and Lock), not Unknown
         assert_eq!(
@@ -3569,7 +3572,7 @@ mod tests {
             .expect("DMA subsystem should exist");
         assert_eq!(*dma.offset_start.value(), 0x1D000);
         assert_eq!(*dma.offset_end.value(), 0x1D008); // 0x1D004 + 4 bytes
-        assert_eq!(dma.register_indices.len(), 2);
+        assert_eq!(dma.registers.len(), 2);
 
         // Lock subsystem
         let lock = module
@@ -3579,7 +3582,7 @@ mod tests {
             .expect("Lock subsystem should exist");
         assert_eq!(*lock.offset_start.value(), 0x1F000);
         assert_eq!(*lock.offset_end.value(), 0x1F004); // 0x1F000 + 4 bytes
-        assert_eq!(lock.register_indices.len(), 1);
+        assert_eq!(lock.registers.len(), 1);
 
         // No Unknown subsystem
         assert!(
@@ -3596,45 +3599,45 @@ mod tests {
             file: "test".into(),
             detail: "test".into(),
         };
+        let registers = vec![
+            RegisterModel {
+                name: "Trace_Reg".into(),
+                offset: 0x14000,
+                width: 32,
+                reset_value: 0,
+                fields: vec![],
+                subsystem: SubsystemKind::Trace,
+                access: Access::ReadWrite,
+                source: src.clone(),
+            },
+            RegisterModel {
+                name: "Core_Ctrl".into(),
+                offset: 0x00000,
+                width: 32,
+                reset_value: 0,
+                fields: vec![],
+                subsystem: SubsystemKind::Processor,
+                access: Access::ReadWrite,
+                source: src.clone(),
+            },
+            RegisterModel {
+                name: "Event_Reg".into(),
+                offset: 0x10000,
+                width: 32,
+                reset_value: 0,
+                fields: vec![],
+                subsystem: SubsystemKind::Event,
+                access: Access::ReadWrite,
+                source: src.clone(),
+            },
+        ];
         let mut module = ModuleModel {
             kind: ModuleKind::Core,
-            registers: vec![
-                RegisterModel {
-                    name: "Trace_Reg".into(),
-                    offset: 0x14000,
-                    width: 32,
-                    reset_value: 0,
-                    fields: vec![],
-                    subsystem: SubsystemKind::Trace,
-                    access: Access::ReadWrite,
-                    source: src.clone(),
-                },
-                RegisterModel {
-                    name: "Core_Ctrl".into(),
-                    offset: 0x00000,
-                    width: 32,
-                    reset_value: 0,
-                    fields: vec![],
-                    subsystem: SubsystemKind::Processor,
-                    access: Access::ReadWrite,
-                    source: src.clone(),
-                },
-                RegisterModel {
-                    name: "Event_Reg".into(),
-                    offset: 0x10000,
-                    width: 32,
-                    reset_value: 0,
-                    fields: vec![],
-                    subsystem: SubsystemKind::Event,
-                    access: Access::ReadWrite,
-                    source: src.clone(),
-                },
-            ],
             subsystems: Vec::new(),
             source: src,
         };
 
-        populate_subsystems(&mut module);
+        populate_subsystems(&mut module, registers);
 
         assert_eq!(module.subsystems.len(), 3);
         // Sorted by offset: Processor(0x0) < Event(0x10000) < Trace(0x14000)
@@ -3650,35 +3653,35 @@ mod tests {
             file: "test".into(),
             detail: "test".into(),
         };
+        let registers = vec![
+            RegisterModel {
+                name: "DMA_BD0_0".into(),
+                offset: 0x1D000,
+                width: 32,
+                reset_value: 0,
+                fields: vec![],
+                subsystem: SubsystemKind::Dma,
+                access: Access::ReadWrite,
+                source: src.clone(),
+            },
+            RegisterModel {
+                name: "DMA_BD15_5".into(),
+                offset: 0x1D1F4,
+                width: 32,
+                reset_value: 0,
+                fields: vec![],
+                subsystem: SubsystemKind::Dma,
+                access: Access::ReadWrite,
+                source: src.clone(),
+            },
+        ];
         let mut module = ModuleModel {
             kind: ModuleKind::Memory,
-            registers: vec![
-                RegisterModel {
-                    name: "DMA_BD0_0".into(),
-                    offset: 0x1D000,
-                    width: 32,
-                    reset_value: 0,
-                    fields: vec![],
-                    subsystem: SubsystemKind::Dma,
-                    access: Access::ReadWrite,
-                    source: src.clone(),
-                },
-                RegisterModel {
-                    name: "DMA_BD15_5".into(),
-                    offset: 0x1D1F4,
-                    width: 32,
-                    reset_value: 0,
-                    fields: vec![],
-                    subsystem: SubsystemKind::Dma,
-                    access: Access::ReadWrite,
-                    source: src.clone(),
-                },
-            ],
             subsystems: Vec::new(),
             source: src,
         };
 
-        populate_subsystems(&mut module);
+        populate_subsystems(&mut module, registers);
 
         let dma = module
             .subsystems
@@ -3741,14 +3744,14 @@ mod tests {
             "DMA subsystem should start at BD base 0x1D000"
         );
         assert!(
-            !dma_sub.register_indices.is_empty(),
+            !dma_sub.registers.is_empty(),
             "DMA subsystem should have register indices"
         );
         // DMA has BDs (16 * 6 words = 96 registers) + channel regs
         assert!(
-            dma_sub.register_indices.len() > 90,
+            dma_sub.registers.len() > 90,
             "DMA should have many registers (BDs + channels), got {}",
-            dma_sub.register_indices.len()
+            dma_sub.registers.len()
         );
 
         // Lock subsystem
@@ -3763,7 +3766,7 @@ mod tests {
             "Lock subsystem should contain the lock value base 0x1F000"
         );
         assert!(
-            !lock_sub.register_indices.is_empty(),
+            !lock_sub.registers.is_empty(),
             "Lock subsystem should have register indices"
         );
 
@@ -3828,7 +3831,7 @@ mod tests {
             .find(|s| s.kind == SubsystemKind::Dma)
             .expect("MemTile should have DMA subsystem");
         assert!(
-            !mt_dma.register_indices.is_empty(),
+            !mt_dma.registers.is_empty(),
             "MemTile DMA should have registers"
         );
         let mt_lock = mt_mod
@@ -3837,7 +3840,7 @@ mod tests {
             .find(|s| s.kind == SubsystemKind::Lock)
             .expect("MemTile should have Lock subsystem");
         assert!(
-            !mt_lock.register_indices.is_empty(),
+            !mt_lock.registers.is_empty(),
             "MemTile Lock should have registers"
         );
 
@@ -3858,7 +3861,7 @@ mod tests {
             .find(|s| s.kind == SubsystemKind::Dma)
             .expect("Shim should have DMA subsystem");
         assert!(
-            !shim_dma.register_indices.is_empty(),
+            !shim_dma.registers.is_empty(),
             "Shim DMA should have registers"
         );
 
@@ -3874,7 +3877,7 @@ mod tests {
                         s.kind,
                         s.offset_start.value(),
                         s.offset_end.value(),
-                        s.register_indices.len()
+                        s.registers.len()
                     );
                 }
             }

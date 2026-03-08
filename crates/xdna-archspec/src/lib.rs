@@ -242,11 +242,10 @@ mod tests {
             kind: sub_kind,
             offset_start: Confirmed::new(offset_start, src.clone()),
             offset_end: Confirmed::new(offset_start + 0x1000, src.clone()),
-            register_indices: vec![],
+            registers: vec![],
         };
         let module = ModuleModel {
             kind: mod_kind,
-            registers: vec![],
             subsystems: vec![subsystem],
             source: src.clone(),
         };
@@ -390,17 +389,16 @@ mod tests {
             kind: SubsystemKind::Dma,
             offset_start: Confirmed::new(0x1D000, src.clone()),
             offset_end: Confirmed::new(0x1E000, src.clone()),
-            register_indices: vec![],
+            registers: vec![],
         };
         let lock_sub = SubsystemModel {
             kind: SubsystemKind::Lock,
             offset_start: Confirmed::new(0x1F000, src.clone()),
             offset_end: Confirmed::new(0x1F100, src.clone()),
-            register_indices: vec![],
+            registers: vec![],
         };
         let module = ModuleModel {
             kind: ModuleKind::Memory,
-            registers: vec![],
             subsystems: vec![dma_sub, lock_sub],
             source: src.clone(),
         };
