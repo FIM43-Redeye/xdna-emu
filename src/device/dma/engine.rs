@@ -664,6 +664,11 @@ impl DmaEngine {
         self.bd_dirty.get(bd_index as usize).copied().unwrap_or(false)
     }
 
+    /// Number of buffer descriptors available on this DMA engine.
+    pub fn num_bds(&self) -> usize {
+        self.bd_configs.len()
+    }
+
     /// Get a buffer descriptor configuration.
     pub fn get_bd(&self, bd_index: u8) -> Option<&BdConfig> {
         self.bd_configs.get(bd_index as usize)

@@ -634,8 +634,8 @@ impl DeviceState {
             dma.mark_bd_dirty(bd_idx as u8);
         }
 
-        log::trace!("  BD {} word {} tile({},{}) marked dirty (deferred parse)",
-            bd_idx, word, col, row);
+        log::trace!("  BD {} word {} = 0x{:08X} tile({},{}) marked dirty",
+            bd_idx, word, value, col, row);
     }
 
     /// Write to a DMA channel register.
@@ -724,8 +724,8 @@ impl DeviceState {
                 })
                 .unwrap_or((0, 0));
 
-            // Re-parse BD if it was written word-by-word (control packets)
-            self.reparse_dirty_bd(col, row, bd_idx as usize);
+            // Re-parse ALL dirty BDs so chained BDs are also configured
+            self.reparse_all_dirty_bds(col, row);
 
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 // Set task config before enqueuing the task
@@ -784,8 +784,8 @@ impl DeviceState {
         if let Some(queue_val) = new_start_queue {
             let bd_idx = lay.start_bd_id.extract(queue_val) as u8;
             let repeat_count = lay.repeat_count.extract(queue_val) as u8;
-            // Re-parse BD if it was written word-by-word (control packets)
-            self.reparse_dirty_bd(col, row, bd_idx as usize);
+            // Re-parse ALL dirty BDs so chained BDs are also configured
+            self.reparse_all_dirty_bds(col, row);
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
                     log::warn!(
@@ -871,8 +871,8 @@ impl DeviceState {
                 })
                 .unwrap_or((0, 0));
 
-            // Re-parse BD if it was written word-by-word (control packets)
-            self.reparse_dirty_bd(col, row, bd_idx as usize);
+            // Re-parse ALL dirty BDs so chained BDs are also configured
+            self.reparse_all_dirty_bds(col, row);
 
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 dma.set_channel_task_config(ch_idx as u8, enable_token_issue, controller_id, fot_mode);
@@ -920,8 +920,8 @@ impl DeviceState {
         if let Some(queue_val) = new_start_queue {
             let bd_idx = lay.start_bd_id.extract(queue_val) as u8;
             let repeat_count = lay.repeat_count.extract(queue_val) as u8;
-            // Re-parse BD if it was written word-by-word (control packets)
-            self.reparse_dirty_bd(col, row, bd_idx as usize);
+            // Re-parse ALL dirty BDs so chained BDs are also configured
+            self.reparse_all_dirty_bds(col, row);
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
                     log::warn!(
@@ -1237,6 +1237,20 @@ impl DeviceState {
         }
     }
 
+    /// Re-parse ALL dirty BDs on a tile.
+    ///
+    /// Called when a DMA channel's START_QUEUE register is written, to ensure
+    /// that every BD in the chain has been configured -- not just the starting
+    /// BD. Without this, chained BDs (e.g., BD0->BD1 for double buffering)
+    /// remain unconfigured and cause BdNotValid errors at chain time.
+    fn reparse_all_dirty_bds(&mut self, col: u8, row: u8) {
+        let num_bds = self.array.dma_engine(col, row)
+            .map_or(0, |dma| dma.num_bds());
+        for i in 0..num_bds {
+            self.reparse_dirty_bd(col, row, i);
+        }
+    }
+
     /// Write MemTile BD data from a byte array.
     ///
     /// MemTile DMA_WRITE commands write 32 bytes (8 words) per BD.
@@ -1335,8 +1349,8 @@ impl DeviceState {
         if is_start_queue {
             let bd_idx = lay.start_bd_id.extract(value) as u8;
             let repeat_count = lay.repeat_count.extract(value) as u8;
-            // Re-parse BD if it was written word-by-word (control packets)
-            self.reparse_dirty_bd(col, row, bd_idx as usize);
+            // Re-parse ALL dirty BDs so chained BDs are also configured
+            self.reparse_all_dirty_bds(col, row);
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
                     log::warn!(
@@ -1386,8 +1400,8 @@ impl DeviceState {
         if let Some(queue_val) = new_start_queue {
             let bd_idx = lay.start_bd_id.extract(queue_val) as u8;
             let repeat_count = lay.repeat_count.extract(queue_val) as u8;
-            // Re-parse BD if it was written word-by-word (control packets)
-            self.reparse_dirty_bd(col, row, bd_idx as usize);
+            // Re-parse ALL dirty BDs so chained BDs are also configured
+            self.reparse_all_dirty_bds(col, row);
             if let Some(dma) = self.array.dma_engine_mut(col, row) {
                 if !dma.enqueue_task(ch_idx as u8, bd_idx, repeat_count, false) {
                     log::warn!(
