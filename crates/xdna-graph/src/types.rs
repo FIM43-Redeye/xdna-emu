@@ -466,25 +466,111 @@ impl FactEquals for ModuleModel {
 // Tile and array topology
 // ============================================================================
 
+/// Memory banking at a single abstraction level.
+///
+/// Represents either the logical view (programmer/compiler, from mlir-aie)
+/// or the physical view (SRAM arrays, from AM020/AM025).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BankingModel {
+    pub num_banks: u8,
+    pub bank_size: u64,
+    pub bank_width_bits: u16,
+    pub source: SourceAttribution,
+}
+
+impl FactEquals for BankingModel {
+    fn fact_equals(&self, other: &Self) -> bool {
+        self.num_banks == other.num_banks
+            && self.bank_size == other.bank_size
+            && self.bank_width_bits == other.bank_width_bits
+    }
+}
+
 /// Memory model for a tile type.
 ///
-/// `size_bytes` is data memory (64KB compute, 512KB memtile).
+/// `size_bytes` is total data memory (64KB compute, 512KB memtile).
+/// Banking is modeled at two abstraction levels:
+/// - **logical**: programmer/compiler view (from mlir-aie). Always present.
+/// - **physical**: SRAM array view (from AM020/AM025). Optional -- not all
+///   sources provide physical banking information.
+///
+/// The structural invariant `num_banks * bank_size == size_bytes` is enforced
+/// at construction time for both levels.
+///
 /// `program_memory_bytes` is instruction memory (16KB, compute tiles only).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryModel {
     pub size_bytes: u64,
-    pub num_banks: u8,
-    pub bank_size_bytes: u64,
+    /// Logical banking: programmer/compiler view (from mlir-aie).
+    pub logical: BankingModel,
+    /// Physical banking: SRAM array view (from AM020/AM025). Optional.
+    pub physical: Option<BankingModel>,
     /// Instruction memory size. Only present on compute tiles.
     pub program_memory_bytes: Option<u64>,
     pub source: SourceAttribution,
 }
 
+impl MemoryModel {
+    /// Create a new memory model with structural invariant validation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `logical.num_banks * logical.bank_size != size_bytes`
+    /// (with message containing "logical banking invariant"), or if
+    /// `physical` is `Some` and its banks do not cover `size_bytes`
+    /// (with message containing "physical banking invariant").
+    pub fn new(
+        size_bytes: u64,
+        logical: BankingModel,
+        physical: Option<BankingModel>,
+        program_memory_bytes: Option<u64>,
+        source: SourceAttribution,
+    ) -> Self {
+        assert_eq!(
+            logical.num_banks as u64 * logical.bank_size,
+            size_bytes,
+            "logical banking invariant: {} banks * {} bytes != {} total",
+            logical.num_banks,
+            logical.bank_size,
+            size_bytes,
+        );
+        if let Some(ref phys) = physical {
+            assert_eq!(
+                phys.num_banks as u64 * phys.bank_size,
+                size_bytes,
+                "physical banking invariant: {} banks * {} bytes != {} total",
+                phys.num_banks,
+                phys.bank_size,
+                size_bytes,
+            );
+        }
+        Self {
+            size_bytes,
+            logical,
+            physical,
+            program_memory_bytes,
+            source,
+        }
+    }
+
+    /// Return the effective physical banking model.
+    ///
+    /// If physical banking information is available, returns it. Otherwise
+    /// falls back to the logical banking model (which is always present).
+    pub fn effective_physical(&self) -> &BankingModel {
+        self.physical.as_ref().unwrap_or(&self.logical)
+    }
+}
+
 impl FactEquals for MemoryModel {
     fn fact_equals(&self, other: &Self) -> bool {
         self.size_bytes == other.size_bytes
-            && self.num_banks == other.num_banks
-            && self.bank_size_bytes == other.bank_size_bytes
+            && self.logical.fact_equals(&other.logical)
+            && match (&self.physical, &other.physical) {
+                (Some(a), Some(b)) => a.fact_equals(b),
+                (None, None) => true,
+                _ => false,
+            }
             && self.program_memory_bytes == other.program_memory_bytes
     }
 }
@@ -1370,17 +1456,26 @@ mod tests {
                     detail: "test".to_string(),
                 },
             }],
-            memory: Some(MemoryModel {
-                size_bytes: 65536,
-                num_banks: 4,
-                bank_size_bytes: 16384,
-                program_memory_bytes: Some(16384),
-                source: SourceAttribution {
+            memory: Some(MemoryModel::new(
+                65536,
+                BankingModel {
+                    num_banks: 4,
+                    bank_size: 16384,
+                    bank_width_bits: 32,
+                    source: SourceAttribution {
+                        origin: Source::DeviceModel,
+                        file: "test.json".to_string(),
+                        detail: "test".to_string(),
+                    },
+                },
+                None,
+                Some(16384),
+                SourceAttribution {
                     origin: Source::DeviceModel,
                     file: "test.json".to_string(),
                     detail: "test".to_string(),
                 },
-            }),
+            )),
             dma_capabilities: Some(DmaCapabilities {
                 supports_compression: true,
                 supports_zero_padding: true,
@@ -1515,28 +1610,31 @@ mod tests {
 
     #[test]
     fn test_memory_model_program_memory() {
-        let compute_mem = MemoryModel {
-            size_bytes: 65536,
-            num_banks: 4,
-            bank_size_bytes: 16384,
-            program_memory_bytes: Some(16384),
-            source: SourceAttribution {
-                origin: Source::DeviceModel,
-                file: "test.json".to_string(),
-                detail: "test".to_string(),
+        let src = test_source(Source::DeviceModel, "test");
+        let compute_mem = MemoryModel::new(
+            65536,
+            BankingModel {
+                num_banks: 4,
+                bank_size: 16384,
+                bank_width_bits: 32,
+                source: src.clone(),
             },
-        };
-        let memtile_mem = MemoryModel {
-            size_bytes: 524288,
-            num_banks: 8,
-            bank_size_bytes: 65536,
-            program_memory_bytes: None,
-            source: SourceAttribution {
-                origin: Source::DeviceModel,
-                file: "test.json".to_string(),
-                detail: "test".to_string(),
+            None,
+            Some(16384),
+            src.clone(),
+        );
+        let memtile_mem = MemoryModel::new(
+            524288,
+            BankingModel {
+                num_banks: 8,
+                bank_size: 65536,
+                bank_width_bits: 128,
+                source: src.clone(),
             },
-        };
+            None,
+            None,
+            src,
+        );
         assert_eq!(compute_mem.program_memory_bytes, Some(16384));
         assert_eq!(memtile_mem.program_memory_bytes, None);
     }
@@ -1612,5 +1710,130 @@ mod tests {
         assert_eq!(topo.tile_map.len(), 2);
         assert_eq!(topo.tile_map[0].tile_type, "shim_noc");
         assert!(topo.tile_map[1].mem_affinity.unwrap().south);
+    }
+
+    // ========================================================================
+    // BankingModel / MemoryModel tests
+    // ========================================================================
+
+    #[test]
+    fn memory_model_structural_invariant() {
+        let src = test_source(Source::DeviceModel, "compute tile");
+        let mem = MemoryModel::new(
+            65536,
+            BankingModel {
+                num_banks: 4,
+                bank_size: 16384,
+                bank_width_bits: 32,
+                source: src.clone(),
+            },
+            None,
+            Some(16384),
+            src,
+        );
+        assert_eq!(mem.size_bytes, 65536);
+        assert_eq!(mem.logical.num_banks, 4);
+        assert_eq!(mem.logical.bank_size, 16384);
+        assert_eq!(mem.logical.bank_width_bits, 32);
+        assert_eq!(mem.program_memory_bytes, Some(16384));
+        assert!(mem.physical.is_none());
+    }
+
+    #[test]
+    fn memory_model_with_physical() {
+        let src = test_source(Source::DeviceModel, "compute tile");
+        let phys_src = test_source(Source::Am025Json, "AM020 SRAM");
+        let mem = MemoryModel::new(
+            65536,
+            BankingModel {
+                num_banks: 4,
+                bank_size: 16384,
+                bank_width_bits: 32,
+                source: src.clone(),
+            },
+            Some(BankingModel {
+                num_banks: 8,
+                bank_size: 8192,
+                bank_width_bits: 128,
+                source: phys_src,
+            }),
+            Some(16384),
+            src,
+        );
+        assert!(mem.physical.is_some());
+        let phys = mem.physical.as_ref().unwrap();
+        assert_eq!(phys.num_banks, 8);
+        assert_eq!(phys.bank_size, 8192);
+        assert_eq!(phys.bank_width_bits, 128);
+        // effective_physical returns the physical level when present
+        let eff = mem.effective_physical();
+        assert_eq!(eff.num_banks, 8);
+        assert_eq!(eff.bank_size, 8192);
+    }
+
+    #[test]
+    fn memory_model_effective_physical_fallback() {
+        let src = test_source(Source::DeviceModel, "compute tile");
+        let mem = MemoryModel::new(
+            65536,
+            BankingModel {
+                num_banks: 4,
+                bank_size: 16384,
+                bank_width_bits: 32,
+                source: src.clone(),
+            },
+            None,
+            None,
+            src,
+        );
+        // No physical level -- effective_physical falls back to logical
+        let eff = mem.effective_physical();
+        assert_eq!(eff.num_banks, 4);
+        assert_eq!(eff.bank_size, 16384);
+        assert_eq!(eff.bank_width_bits, 32);
+    }
+
+    #[test]
+    #[should_panic(expected = "logical banking invariant")]
+    fn memory_model_rejects_bad_logical() {
+        let src = test_source(Source::DeviceModel, "bad");
+        // 4 banks * 8192 = 32768, not 65536
+        MemoryModel::new(
+            65536,
+            BankingModel {
+                num_banks: 4,
+                bank_size: 8192,
+                bank_width_bits: 32,
+                source: src.clone(),
+            },
+            None,
+            None,
+            src,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "physical banking invariant")]
+    fn memory_model_rejects_bad_physical() {
+        let src = test_source(Source::DeviceModel, "bad");
+        // logical is correct: 4 * 16384 = 65536
+        // physical is wrong: 8 * 4096 = 32768, not 65536
+        MemoryModel::new(
+            65536,
+            BankingModel {
+                num_banks: 4,
+                bank_size: 16384,
+                bank_width_bits: 32,
+                source: src.clone(),
+            },
+            Some(BankingModel {
+                num_banks: 8,
+                bank_size: 4096,
+                bank_width_bits: 128,
+                source: src.clone(),
+            }),
+            None,
+            src,
+        );
     }
 }

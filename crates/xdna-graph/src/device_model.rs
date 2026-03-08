@@ -400,17 +400,25 @@ fn extract_tile_type(
         TileKind::ShimNoc | TileKind::ShimPl => bank_size * num_banks as u64,
     };
 
-    let memory = Some(MemoryModel {
+    let mem_source = SourceAttribution {
+        origin: Source::DeviceModel,
+        file: file.into(),
+        detail: format!("{}.memory", ctx),
+    };
+    let memory = Some(MemoryModel::new(
         size_bytes,
-        num_banks,
-        bank_size_bytes: bank_size,
-        program_memory_bytes,
-        source: SourceAttribution {
-            origin: Source::DeviceModel,
-            file: file.into(),
-            detail: format!("{}.memory", ctx),
+        BankingModel {
+            num_banks,
+            bank_size,
+            // Device model JSON does not provide bank width; default to 0
+            // until a richer source (AM020/AM025) populates it.
+            bank_width_bits: 0,
+            source: mem_source.clone(),
         },
-    });
+        None, // physical banking not available from device model
+        program_memory_bytes,
+        mem_source,
+    ));
 
     // Extract port bundles
     let switchbox_ports = if let Some(sp_val) = obj.get("switchbox_ports") {
