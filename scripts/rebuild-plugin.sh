@@ -51,16 +51,27 @@ elif [[ -f "$EMU_DIR/target/debug/libxdna_emu.so" ]]; then
     RUST_LIB="$EMU_DIR/target/debug/libxdna_emu.so"
 fi
 
-# Install (requires polkit auth).
+# Install plugin files. The plugin files in INSTALL_DIR should be
+# user-owned (chown'd once) so no pkexec is needed for routine updates.
 echo ">>> Installing to $INSTALL_DIR..."
-pkexec bash -c "
-    cp '$BUILD_DIR/$SONAME' '$INSTALL_DIR/$SONAME' && \
-    cp '$BUILD_DIR/$SONAME' '$INSTALL_DIR/libxrt_driver_emu.so.2' && \
-    if [[ -n '$RUST_LIB' ]]; then
-        cp '$RUST_LIB' '$INSTALL_DIR/libxdna_emu.so'
-    fi && \
-    echo '>>> Installed OK'
-"
+if [[ -w "$INSTALL_DIR/libxrt_driver_emu.so.2" ]]; then
+    cp "$BUILD_DIR/$SONAME" "$INSTALL_DIR/$SONAME"
+    cp "$BUILD_DIR/$SONAME" "$INSTALL_DIR/libxrt_driver_emu.so.2"
+    if [[ -n "$RUST_LIB" ]]; then
+        cp "$RUST_LIB" "$INSTALL_DIR/libxdna_emu.so"
+    fi
+    echo ">>> Installed OK"
+else
+    echo ">>> Plugin files not writable -- falling back to pkexec"
+    pkexec bash -c "
+        cp '$BUILD_DIR/$SONAME' '$INSTALL_DIR/$SONAME' && \
+        cp '$BUILD_DIR/$SONAME' '$INSTALL_DIR/libxrt_driver_emu.so.2' && \
+        if [[ -n '$RUST_LIB' ]]; then
+            cp '$RUST_LIB' '$INSTALL_DIR/libxdna_emu.so'
+        fi && \
+        echo '>>> Installed OK'
+    "
+fi
 
 if [[ -n "$RUST_LIB" ]]; then
     echo ">>> Rust lib: $RUST_LIB"
