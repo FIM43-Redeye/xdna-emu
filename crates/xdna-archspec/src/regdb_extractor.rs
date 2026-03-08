@@ -12,10 +12,10 @@
 
 use crate::regdb;
 use crate::types::{
-    Access, BdFieldRole, BdFieldSpec, BdSchema, BitRange, DmaChannelFieldRole,
+    Access, BdFieldRole, BdFieldSpec, BdSchema, BitRange, Confirmed, DmaChannelFieldRole,
     DmaChannelFieldSpec, DmaChannelRegKind, DmaChannelSchema, DmaDirection, FieldModel,
     FieldSemantics, ModuleKind, ModuleModel, RegisterModel, Relationship, Source,
-    SourceAttribution, SubsystemKind, TileKind,
+    SourceAttribution, SubsystemKind, SubsystemModel, TileKind,
 };
 
 // ============================================================================
@@ -580,6 +580,56 @@ pub fn build_module_model(kind: ModuleKind, module: &regdb::ModuleDef) -> Module
     }
 }
 
+/// Group registers by SubsystemKind and derive address ranges.
+///
+/// Called after all registers are populated on a ModuleModel. Groups
+/// registers by their `subsystem` field, computes min(offset) and
+/// max(offset + ceil(width/8)) to derive the address range for each
+/// subsystem.
+pub fn populate_subsystems(module: &mut ModuleModel) {
+    use std::collections::HashMap;
+
+    let source = SourceAttribution {
+        origin: Source::Am025Json,
+        file: "aie_registers_aie2.json".into(),
+        detail: format!("register offset range for {:?} module", module.kind),
+    };
+
+    // Group register indices by subsystem
+    let mut groups: HashMap<SubsystemKind, Vec<usize>> = HashMap::new();
+    for (idx, reg) in module.registers.iter().enumerate() {
+        groups.entry(reg.subsystem).or_default().push(idx);
+    }
+
+    for (kind, indices) in groups {
+        if kind == SubsystemKind::Unknown {
+            continue; // Don't create subsystem for unclassified registers
+        }
+
+        let mut min_offset = u32::MAX;
+        let mut max_end = 0u32;
+
+        for &idx in &indices {
+            let reg = &module.registers[idx];
+            let reg_end = reg.offset + (reg.width as u32 + 7) / 8; // ceil to bytes
+            min_offset = min_offset.min(reg.offset);
+            max_end = max_end.max(reg_end);
+        }
+
+        module.subsystems.push(SubsystemModel {
+            kind,
+            offset_start: Confirmed::new(min_offset, source.clone()),
+            offset_end: Confirmed::new(max_end, source.clone()),
+            register_indices: indices,
+        });
+    }
+
+    // Sort subsystems by offset_start for deterministic ordering
+    module
+        .subsystems
+        .sort_by_key(|s| *s.offset_start.value());
+}
+
 // ============================================================================
 // Populate ArchModel with register data from AM025
 // ============================================================================
@@ -613,7 +663,9 @@ pub fn populate_tile_modules(model: &mut ArchModel, db: &regdb::RegisterDb) {
         if let Some((_, module_pairs)) = mapping {
             for &(kind, am025_name) in *module_pairs {
                 if let Some(module_def) = db.module(am025_name) {
-                    tile_type.modules.push(build_module_model(kind, module_def));
+                    let mut module = build_module_model(kind, module_def);
+                    populate_subsystems(&mut module);
+                    tile_type.modules.push(module);
 
                     let edge_source = SourceAttribution {
                         origin: Source::Am025Json,
@@ -3387,5 +3439,396 @@ mod tests {
             }
         ));
         assert!(cur_bd_ref.is_some(), "CurrentBdId should reference BD space");
+    }
+
+    // ====================================================================
+    // Subsystem population tests
+    // ====================================================================
+
+    #[test]
+    fn populate_subsystems_groups_by_kind() {
+        // Synthetic test: build a module with DMA and Lock registers,
+        // verify populate_subsystems creates the right subsystem entries.
+        let src = SourceAttribution {
+            origin: Source::Am025Json,
+            file: "test".into(),
+            detail: "test".into(),
+        };
+        let mut module = ModuleModel {
+            kind: ModuleKind::Memory,
+            registers: vec![
+                RegisterModel {
+                    name: "DMA_BD0_0".into(),
+                    offset: 0x1D000,
+                    width: 32,
+                    reset_value: 0,
+                    fields: vec![],
+                    subsystem: SubsystemKind::Dma,
+                    access: Access::ReadWrite,
+                    source: src.clone(),
+                },
+                RegisterModel {
+                    name: "DMA_BD0_1".into(),
+                    offset: 0x1D004,
+                    width: 32,
+                    reset_value: 0,
+                    fields: vec![],
+                    subsystem: SubsystemKind::Dma,
+                    access: Access::ReadWrite,
+                    source: src.clone(),
+                },
+                RegisterModel {
+                    name: "Lock0_value".into(),
+                    offset: 0x1F000,
+                    width: 32,
+                    reset_value: 0,
+                    fields: vec![],
+                    subsystem: SubsystemKind::Lock,
+                    access: Access::ReadWrite,
+                    source: src.clone(),
+                },
+                RegisterModel {
+                    name: "Unknown_Reg".into(),
+                    offset: 0x10000,
+                    width: 32,
+                    reset_value: 0,
+                    fields: vec![],
+                    subsystem: SubsystemKind::Unknown,
+                    access: Access::ReadWrite,
+                    source: src.clone(),
+                },
+            ],
+            subsystems: Vec::new(),
+            source: src,
+        };
+
+        populate_subsystems(&mut module);
+
+        // Should have 2 subsystems (DMA and Lock), not Unknown
+        assert_eq!(
+            module.subsystems.len(),
+            2,
+            "should have DMA and Lock subsystems, got {:?}",
+            module.subsystems.iter().map(|s| s.kind).collect::<Vec<_>>()
+        );
+
+        // DMA subsystem
+        let dma = module
+            .subsystems
+            .iter()
+            .find(|s| s.kind == SubsystemKind::Dma)
+            .expect("DMA subsystem should exist");
+        assert_eq!(*dma.offset_start.value(), 0x1D000);
+        assert_eq!(*dma.offset_end.value(), 0x1D008); // 0x1D004 + 4 bytes
+        assert_eq!(dma.register_indices.len(), 2);
+
+        // Lock subsystem
+        let lock = module
+            .subsystems
+            .iter()
+            .find(|s| s.kind == SubsystemKind::Lock)
+            .expect("Lock subsystem should exist");
+        assert_eq!(*lock.offset_start.value(), 0x1F000);
+        assert_eq!(*lock.offset_end.value(), 0x1F004); // 0x1F000 + 4 bytes
+        assert_eq!(lock.register_indices.len(), 1);
+
+        // No Unknown subsystem
+        assert!(
+            !module.subsystems.iter().any(|s| s.kind == SubsystemKind::Unknown),
+            "Unknown registers should not form a subsystem"
+        );
+    }
+
+    #[test]
+    fn populate_subsystems_sorted_by_offset() {
+        // Verify subsystems are sorted by offset_start for determinism
+        let src = SourceAttribution {
+            origin: Source::Am025Json,
+            file: "test".into(),
+            detail: "test".into(),
+        };
+        let mut module = ModuleModel {
+            kind: ModuleKind::Core,
+            registers: vec![
+                RegisterModel {
+                    name: "Trace_Reg".into(),
+                    offset: 0x14000,
+                    width: 32,
+                    reset_value: 0,
+                    fields: vec![],
+                    subsystem: SubsystemKind::Trace,
+                    access: Access::ReadWrite,
+                    source: src.clone(),
+                },
+                RegisterModel {
+                    name: "Core_Ctrl".into(),
+                    offset: 0x00000,
+                    width: 32,
+                    reset_value: 0,
+                    fields: vec![],
+                    subsystem: SubsystemKind::Processor,
+                    access: Access::ReadWrite,
+                    source: src.clone(),
+                },
+                RegisterModel {
+                    name: "Event_Reg".into(),
+                    offset: 0x10000,
+                    width: 32,
+                    reset_value: 0,
+                    fields: vec![],
+                    subsystem: SubsystemKind::Event,
+                    access: Access::ReadWrite,
+                    source: src.clone(),
+                },
+            ],
+            subsystems: Vec::new(),
+            source: src,
+        };
+
+        populate_subsystems(&mut module);
+
+        assert_eq!(module.subsystems.len(), 3);
+        // Sorted by offset: Processor(0x0) < Event(0x10000) < Trace(0x14000)
+        assert_eq!(module.subsystems[0].kind, SubsystemKind::Processor);
+        assert_eq!(module.subsystems[1].kind, SubsystemKind::Event);
+        assert_eq!(module.subsystems[2].kind, SubsystemKind::Trace);
+    }
+
+    #[test]
+    fn populate_subsystems_contains_offset_works() {
+        let src = SourceAttribution {
+            origin: Source::Am025Json,
+            file: "test".into(),
+            detail: "test".into(),
+        };
+        let mut module = ModuleModel {
+            kind: ModuleKind::Memory,
+            registers: vec![
+                RegisterModel {
+                    name: "DMA_BD0_0".into(),
+                    offset: 0x1D000,
+                    width: 32,
+                    reset_value: 0,
+                    fields: vec![],
+                    subsystem: SubsystemKind::Dma,
+                    access: Access::ReadWrite,
+                    source: src.clone(),
+                },
+                RegisterModel {
+                    name: "DMA_BD15_5".into(),
+                    offset: 0x1D1F4,
+                    width: 32,
+                    reset_value: 0,
+                    fields: vec![],
+                    subsystem: SubsystemKind::Dma,
+                    access: Access::ReadWrite,
+                    source: src.clone(),
+                },
+            ],
+            subsystems: Vec::new(),
+            source: src,
+        };
+
+        populate_subsystems(&mut module);
+
+        let dma = module
+            .subsystems
+            .iter()
+            .find(|s| s.kind == SubsystemKind::Dma)
+            .expect("DMA subsystem should exist");
+
+        // Within range
+        assert!(dma.contains_offset(0x1D000), "start is inclusive");
+        assert!(dma.contains_offset(0x1D100), "middle of range");
+        assert!(dma.contains_offset(0x1D1F7), "last byte of last register");
+
+        // Outside range
+        assert!(!dma.contains_offset(0x1CFFF), "before start");
+        assert!(!dma.contains_offset(0x1D1F8), "end is exclusive");
+        assert!(!dma.contains_offset(0x1F000), "well past end");
+    }
+
+    #[test]
+    fn integration_populate_subsystems_on_real_data() {
+        use crate::device_model;
+        use std::path::PathBuf;
+
+        let Some(db) = load_test_db() else {
+            eprintln!("Skipping: register database not found");
+            return;
+        };
+
+        let json_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/aie-device-models.json");
+        let mut model = device_model::extract_device_model(&json_path, "npu1")
+            .expect("device model parse failed");
+
+        populate_tile_modules(&mut model, &db);
+
+        // -- Compute tile: Memory module --
+        let core_tt = model.tile_types.iter().find(|t| t.name == "core").unwrap();
+        let mem_mod = core_tt
+            .modules
+            .iter()
+            .find(|m| m.kind == ModuleKind::Memory)
+            .expect("compute tile should have Memory module");
+
+        // Should have at least DMA, Lock, Event, Trace subsystems
+        assert!(
+            !mem_mod.subsystems.is_empty(),
+            "Memory module should have populated subsystems"
+        );
+
+        let dma_sub = mem_mod
+            .subsystems
+            .iter()
+            .find(|s| s.kind == SubsystemKind::Dma)
+            .expect("Memory module should have DMA subsystem");
+
+        // DMA BD base for compute tiles is 0x1D000 (well-known value)
+        assert_eq!(
+            *dma_sub.offset_start.value(),
+            0x1D000,
+            "DMA subsystem should start at BD base 0x1D000"
+        );
+        assert!(
+            !dma_sub.register_indices.is_empty(),
+            "DMA subsystem should have register indices"
+        );
+        // DMA has BDs (16 * 6 words = 96 registers) + channel regs
+        assert!(
+            dma_sub.register_indices.len() > 90,
+            "DMA should have many registers (BDs + channels), got {}",
+            dma_sub.register_indices.len()
+        );
+
+        // Lock subsystem
+        let lock_sub = mem_mod
+            .subsystems
+            .iter()
+            .find(|s| s.kind == SubsystemKind::Lock)
+            .expect("Memory module should have Lock subsystem");
+        // Lock value registers start at 0x1F000 (compute tile)
+        assert!(
+            lock_sub.contains_offset(0x1F000),
+            "Lock subsystem should contain the lock value base 0x1F000"
+        );
+        assert!(
+            !lock_sub.register_indices.is_empty(),
+            "Lock subsystem should have register indices"
+        );
+
+        // contains_offset works for known DMA offsets
+        assert!(
+            dma_sub.contains_offset(0x1D000),
+            "BD0 word 0 should be in DMA"
+        );
+        assert!(
+            dma_sub.contains_offset(0x1D004),
+            "BD0 word 1 should be in DMA"
+        );
+
+        // -- Compute tile: Core module --
+        let core_mod = core_tt
+            .modules
+            .iter()
+            .find(|m| m.kind == ModuleKind::Core)
+            .expect("compute tile should have Core module");
+        assert!(
+            !core_mod.subsystems.is_empty(),
+            "Core module should have populated subsystems"
+        );
+        // Core module should have Processor subsystem
+        assert!(
+            core_mod
+                .subsystems
+                .iter()
+                .any(|s| s.kind == SubsystemKind::Processor),
+            "Core module should have Processor subsystem"
+        );
+        // Core module should NOT have Lock or DMA
+        assert!(
+            !core_mod
+                .subsystems
+                .iter()
+                .any(|s| s.kind == SubsystemKind::Lock),
+            "Core module should not have Lock subsystem"
+        );
+        assert!(
+            !core_mod
+                .subsystems
+                .iter()
+                .any(|s| s.kind == SubsystemKind::Dma),
+            "Core module should not have DMA subsystem"
+        );
+
+        // -- MemTile --
+        let mt_tt = model
+            .tile_types
+            .iter()
+            .find(|t| t.name == "mem_tile")
+            .unwrap();
+        let mt_mod = &mt_tt.modules[0];
+        assert!(
+            !mt_mod.subsystems.is_empty(),
+            "MemTile module should have populated subsystems"
+        );
+        let mt_dma = mt_mod
+            .subsystems
+            .iter()
+            .find(|s| s.kind == SubsystemKind::Dma)
+            .expect("MemTile should have DMA subsystem");
+        assert!(
+            !mt_dma.register_indices.is_empty(),
+            "MemTile DMA should have registers"
+        );
+        let mt_lock = mt_mod
+            .subsystems
+            .iter()
+            .find(|s| s.kind == SubsystemKind::Lock)
+            .expect("MemTile should have Lock subsystem");
+        assert!(
+            !mt_lock.register_indices.is_empty(),
+            "MemTile Lock should have registers"
+        );
+
+        // -- Shim --
+        let shim_tt = model
+            .tile_types
+            .iter()
+            .find(|t| t.name == "shim_noc")
+            .unwrap();
+        let shim_mod = &shim_tt.modules[0];
+        assert!(
+            !shim_mod.subsystems.is_empty(),
+            "Shim module should have populated subsystems"
+        );
+        let shim_dma = shim_mod
+            .subsystems
+            .iter()
+            .find(|s| s.kind == SubsystemKind::Dma)
+            .expect("Shim should have DMA subsystem");
+        assert!(
+            !shim_dma.register_indices.is_empty(),
+            "Shim DMA should have registers"
+        );
+
+        // Report what we found
+        eprintln!("=== Subsystem Summary ===");
+        for tt in &model.tile_types {
+            eprintln!("  {} tile:", tt.name);
+            for m in &tt.modules {
+                eprintln!("    {:?} module: {} subsystems", m.kind, m.subsystems.len());
+                for s in &m.subsystems {
+                    eprintln!(
+                        "      {:?}: 0x{:05X}..0x{:05X} ({} registers)",
+                        s.kind,
+                        s.offset_start.value(),
+                        s.offset_end.value(),
+                        s.register_indices.len()
+                    );
+                }
+            }
+        }
     }
 }
