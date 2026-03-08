@@ -46,18 +46,19 @@ pub const NUM_BANKS: usize = crate::arch::compute::PHYSICAL_BANKS as usize;
 // Cross-Tile Memory Access Latency (AM020 Ch4)
 // ============================================================================
 //
-// Each compute tile can access 256KB of data memory across 4 tiles:
-// - Quadrant 0 (0x00000-0x0FFFF): Local tile memory (64KB)
-// - Quadrant 1 (0x10000-0x1FFFF): West neighbor tile (col-1, same row)
-// - Quadrant 2 (0x20000-0x2FFFF): North neighbor tile (same col, row+1)
-// - Quadrant 3 (0x30000-0x3FFFF): East neighbor tile (col+1, same row)
+// Each compute tile can access 256KB of data memory across 4 tiles via
+// cardinal directions. The core's AGU generates 20-bit addresses in the
+// range 0x40000-0x7FFFF, with CardDir = address / MEMORY_SIZE:
 //
-// Note: the hardware's AGU quadrant mapping per aie-rt and mlir-aie is
-// actually 0=South, 1=West, 2=North, 3=East(local). The emulator uses
-// quadrant 0 as local because linker-assigned addresses (0x70000+) are
-// masked to 16-bit offsets landing in quadrant 0 (see decode_data_address
-// in execute/memory.rs). This simplified mapping works for all current
-// code paths.
+// - CardDir 4 (0x40000-0x4FFFF): South neighbor (same col, row-1)
+// - CardDir 5 (0x50000-0x5FFFF): West neighbor (col-1, same row)
+// - CardDir 6 (0x60000-0x6FFFF): North neighbor (same col, row+1)
+// - CardDir 7 (0x70000-0x7FFFF): East = LOCAL memory (AIE2, IsCheckerBoard=0)
+//
+// Source: aie-rt `_XAie_GetTargetTileLoc()` (xaie_elfloader.c:124-183).
+// AIE2 forces RowParity=1 (IsCheckerBoard=0), making East always local.
+// The ELF linker places data at 0x70000 because that IS the hardware
+// address for the core's own data memory.
 //
 // Cross-tile memory access incurs routing latency through the stream switch.
 // Per AM020 Ch2, local-to-external routing is 4 cycles per hop.
@@ -72,48 +73,81 @@ pub const CROSS_TILE_LATENCY: u8 = crate::arch::timing::ROUTE_LOCAL_TO_EXTERNAL;
 
 /// Memory quadrant (which tile's memory is being accessed).
 ///
-/// Mapping matches execute/memory.rs NeighborMemory and decode_data_address().
-/// See comment block above for the relationship to the hardware's actual
-/// AGU quadrant numbering (South/West/North/East per aie-rt).
+/// Cardinal directions match the hardware's AGU routing per aie-rt
+/// `_XAie_GetTargetTileLoc()`. Which direction is "local" depends on
+/// architecture and (for checkerboard) row parity:
+///
+/// - **AIE2** (IsCheckerBoard=0): East is always local.
+/// - **AIE1** (IsCheckerBoard=1): Local alternates by row parity
+///   (even rows: West is local; odd rows: East is local).
+///
+/// `from_address()` resolves this and returns `Local` for the local
+/// direction. The `East` variant is only returned on checkerboard
+/// architectures where East is a real cross-tile neighbor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryQuadrant {
-    /// Local tile memory (0x00000-0x0FFFF) - no routing latency.
+    /// Local tile memory -- no routing latency.
+    /// On AIE2, this corresponds to CardDir 7 (East).
     Local,
-    /// West neighbor tile (0x10000-0x1FFFF) - 1 hop (col-1, same row).
+    /// South neighbor (CardDir 4, 0x40000-0x4FFFF) - 1 hop (same col, row-1).
+    South,
+    /// West neighbor (CardDir 5, 0x50000-0x5FFFF) - 1 hop (col-1, same row).
     West,
-    /// North neighbor tile (0x20000-0x2FFFF) - 1 hop (same col, row+1).
+    /// North neighbor (CardDir 6, 0x60000-0x6FFFF) - 1 hop (same col, row+1).
     North,
-    /// East neighbor tile (0x30000-0x3FFFF) - 1 hop (col+1, same row).
+    /// East neighbor (CardDir 7, 0x70000-0x7FFFF) - 1 hop (col+1, same row).
+    /// Only used on checkerboard architectures (AIE1) where East is a real
+    /// cross-tile neighbor. On AIE2, CardDir 7 maps to `Local` instead.
     East,
 }
 
 impl MemoryQuadrant {
-    /// Determine which quadrant an address falls into.
+    /// Determine which cardinal direction an address targets.
     ///
-    /// Address bits [17:16] determine the quadrant:
-    /// - 0b00: Local (own tile memory)
-    /// - 0b01: West neighbor (col-1, same row)
-    /// - 0b10: North neighbor (same col, row+1)
-    /// - 0b11: East neighbor (col+1, same row)
+    /// Uses the hardware's CardDir model: `CardDir = address / MEMORY_SIZE`.
+    /// - CardDir 4: South (same col, row-1)
+    /// - CardDir 5: West (col-1, same row)
+    /// - CardDir 6: North (same col, row+1)
+    /// - CardDir 7: East = Local on AIE2 (IsCheckerBoard=0)
+    ///
+    /// On checkerboard architectures (AIE1), the local direction depends on
+    /// row parity. This function currently handles AIE2 only; checkerboard
+    /// support would extend the East arm to check row parity.
+    ///
+    /// Addresses below DATA_MEM_ADDR (0x40000) fall back to Local since
+    /// the core AGU should not generate them for data access.
+    ///
+    /// Source: aie-rt `_XAie_GetTargetTileLoc()` (xaie_elfloader.c:124-183)
     #[inline]
     pub fn from_address(address: u32) -> Self {
-        match (address >> 16) & 0x3 {
-            0 => Self::Local,
-            1 => Self::West,
-            2 => Self::North,
-            3 => Self::East,
-            _ => unreachable!(),
+        use crate::arch;
+        let card_dir = (address / arch::compute::MEMORY_SIZE as u32) as u8;
+        match card_dir {
+            d if d == arch::cardinal::SOUTH => Self::South,
+            d if d == arch::cardinal::WEST => Self::West,
+            d if d == arch::cardinal::NORTH => Self::North,
+            d if d == arch::cardinal::EAST => {
+                // AIE2: East is always local (IsCheckerBoard=false).
+                // Checkerboard architectures would check row parity here.
+                if arch::compute::IS_CHECKERBOARD {
+                    Self::East // Cross-tile access to eastern neighbor
+                } else {
+                    Self::Local
+                }
+            }
+            // Below DATA_MEM_ADDR or invalid CardDir -- treat as local
+            _ => Self::Local,
         }
     }
 
     /// Get the number of hops to reach this quadrant.
     ///
-    /// All cross-tile neighbors (West, North, East) are 1 hop away.
+    /// All cross-tile neighbors (South, West, North, East) are 1 hop away.
     #[inline]
     pub fn hop_count(&self) -> u8 {
         match self {
             Self::Local => 0,
-            Self::West | Self::North | Self::East => 1,
+            Self::South | Self::West | Self::North | Self::East => 1,
         }
     }
 
@@ -280,8 +314,8 @@ impl MemoryAccess {
 
     /// Get the memory quadrant for this access.
     ///
-    /// Determines which of the 4 tiles (local or neighbor) this address
-    /// falls into based on address bits [17:16].
+    /// Determines which tile (local or neighbor) this address targets
+    /// using CardDir = address / MEMORY_SIZE.
     #[inline]
     pub fn quadrant(&self) -> MemoryQuadrant {
         MemoryQuadrant::from_address(self.address)
@@ -731,30 +765,34 @@ mod tests {
 
     #[test]
     fn test_memory_quadrant_from_address() {
-        // Quadrant 0: Local (0x00000-0x0FFFF)
+        // CardDir 7: East = Local (0x70000-0x7FFFF)
+        assert_eq!(MemoryQuadrant::from_address(0x70000), MemoryQuadrant::Local);
+        assert_eq!(MemoryQuadrant::from_address(0x78000), MemoryQuadrant::Local);
+        assert_eq!(MemoryQuadrant::from_address(0x7FFFF), MemoryQuadrant::Local);
+
+        // CardDir 4: South (0x40000-0x4FFFF)
+        assert_eq!(MemoryQuadrant::from_address(0x40000), MemoryQuadrant::South);
+        assert_eq!(MemoryQuadrant::from_address(0x4FFFF), MemoryQuadrant::South);
+
+        // CardDir 5: West (0x50000-0x5FFFF)
+        assert_eq!(MemoryQuadrant::from_address(0x50000), MemoryQuadrant::West);
+        assert_eq!(MemoryQuadrant::from_address(0x5FFFF), MemoryQuadrant::West);
+
+        // CardDir 6: North (0x60000-0x6FFFF)
+        assert_eq!(MemoryQuadrant::from_address(0x60000), MemoryQuadrant::North);
+        assert_eq!(MemoryQuadrant::from_address(0x6FFFF), MemoryQuadrant::North);
+
+        // Addresses below DATA_MEM_ADDR (0x40000) fall back to Local
         assert_eq!(MemoryQuadrant::from_address(0x00000), MemoryQuadrant::Local);
-        assert_eq!(MemoryQuadrant::from_address(0x08000), MemoryQuadrant::Local);
-        assert_eq!(MemoryQuadrant::from_address(0x0FFFF), MemoryQuadrant::Local);
-
-        // Quadrant 1: West (0x10000-0x1FFFF)
-        assert_eq!(MemoryQuadrant::from_address(0x10000), MemoryQuadrant::West);
-        assert_eq!(MemoryQuadrant::from_address(0x1FFFF), MemoryQuadrant::West);
-
-        // Quadrant 2: North (0x20000-0x2FFFF)
-        assert_eq!(MemoryQuadrant::from_address(0x20000), MemoryQuadrant::North);
-        assert_eq!(MemoryQuadrant::from_address(0x2FFFF), MemoryQuadrant::North);
-
-        // Quadrant 3: East (0x30000-0x3FFFF)
-        assert_eq!(MemoryQuadrant::from_address(0x30000), MemoryQuadrant::East);
-        assert_eq!(MemoryQuadrant::from_address(0x3FFFF), MemoryQuadrant::East);
+        assert_eq!(MemoryQuadrant::from_address(0x3FFFF), MemoryQuadrant::Local);
     }
 
     #[test]
     fn test_quadrant_hop_count() {
         assert_eq!(MemoryQuadrant::Local.hop_count(), 0);
+        assert_eq!(MemoryQuadrant::South.hop_count(), 1);
         assert_eq!(MemoryQuadrant::West.hop_count(), 1);
         assert_eq!(MemoryQuadrant::North.hop_count(), 1);
-        assert_eq!(MemoryQuadrant::East.hop_count(), 1);
     }
 
     #[test]
@@ -763,34 +801,34 @@ mod tests {
         assert_eq!(MemoryQuadrant::Local.routing_latency(), 0);
 
         // 1 hop: 4 cycles (LOCAL_TO_EXTERNAL) for all neighbors
+        assert_eq!(MemoryQuadrant::South.routing_latency(), CROSS_TILE_LATENCY);
         assert_eq!(MemoryQuadrant::West.routing_latency(), CROSS_TILE_LATENCY);
         assert_eq!(MemoryQuadrant::North.routing_latency(), CROSS_TILE_LATENCY);
-        assert_eq!(MemoryQuadrant::East.routing_latency(), CROSS_TILE_LATENCY);
     }
 
     #[test]
     fn test_memory_access_quadrant() {
-        // Local access
-        let access = MemoryAccess::load(0x1000, 4);
+        // Local access (CardDir 7 = East = local)
+        let access = MemoryAccess::load(0x71000, 4);
         assert_eq!(access.quadrant(), MemoryQuadrant::Local);
         assert!(!access.is_cross_tile());
         assert_eq!(access.cross_tile_latency(), 0);
 
-        // West neighbor access
-        let access = MemoryAccess::load(0x11000, 4);
+        // South neighbor access (CardDir 4)
+        let access = MemoryAccess::load(0x41000, 4);
+        assert_eq!(access.quadrant(), MemoryQuadrant::South);
+        assert!(access.is_cross_tile());
+        assert_eq!(access.cross_tile_latency(), CROSS_TILE_LATENCY);
+
+        // West neighbor access (CardDir 5)
+        let access = MemoryAccess::load(0x51000, 4);
         assert_eq!(access.quadrant(), MemoryQuadrant::West);
         assert!(access.is_cross_tile());
         assert_eq!(access.cross_tile_latency(), CROSS_TILE_LATENCY);
 
-        // North neighbor access
-        let access = MemoryAccess::load(0x21000, 4);
+        // North neighbor access (CardDir 6)
+        let access = MemoryAccess::load(0x61000, 4);
         assert_eq!(access.quadrant(), MemoryQuadrant::North);
-        assert!(access.is_cross_tile());
-        assert_eq!(access.cross_tile_latency(), CROSS_TILE_LATENCY);
-
-        // East neighbor access
-        let access = MemoryAccess::load(0x31000, 4);
-        assert_eq!(access.quadrant(), MemoryQuadrant::East);
         assert!(access.is_cross_tile());
         assert_eq!(access.cross_tile_latency(), CROSS_TILE_LATENCY);
     }
@@ -799,8 +837,8 @@ mod tests {
     fn test_access_latency_local() {
         let model = MemoryModel::new();
 
-        // Local access: base latency only (5 cycles)
-        let access = MemoryAccess::load(0x1000, 4);
+        // Local access (CardDir 7): base latency only (5 cycles)
+        let access = MemoryAccess::load(0x71000, 4);
         let latency = model.access_latency(&access);
         assert_eq!(latency, BASE_LATENCY);
     }
@@ -809,18 +847,18 @@ mod tests {
     fn test_access_latency_cross_tile_west() {
         let model = MemoryModel::new();
 
-        // West neighbor: base + 4 cycles routing (5 + 4 = 9)
-        let access = MemoryAccess::load(0x11000, 4);
+        // West neighbor (CardDir 5): base + 4 cycles routing (5 + 4 = 9)
+        let access = MemoryAccess::load(0x51000, 4);
         let latency = model.access_latency(&access);
         assert_eq!(latency, BASE_LATENCY + CROSS_TILE_LATENCY);
     }
 
     #[test]
-    fn test_access_latency_cross_tile_east() {
+    fn test_access_latency_cross_tile_south() {
         let model = MemoryModel::new();
 
-        // East neighbor: base + 4 cycles routing (5 + 4 = 9)
-        let access = MemoryAccess::load(0x31000, 4);
+        // South neighbor (CardDir 4): base + 4 cycles routing (5 + 4 = 9)
+        let access = MemoryAccess::load(0x41000, 4);
         let latency = model.access_latency(&access);
         assert_eq!(latency, BASE_LATENCY + CROSS_TILE_LATENCY);
     }
@@ -830,17 +868,17 @@ mod tests {
         let mut model = MemoryModel::new();
         model.advance_to(1);
 
-        // Local access (no cross-tile)
-        model.record_access(&MemoryAccess::load(0x1000, 4));
+        // Local access (CardDir 7, no cross-tile)
+        model.record_access(&MemoryAccess::load(0x71000, 4));
 
-        // West neighbor access (1 hop)
-        model.record_access(&MemoryAccess::load(0x11000, 4));
+        // South neighbor access (CardDir 4, 1 hop)
+        model.record_access(&MemoryAccess::load(0x41000, 4));
 
-        // North neighbor access (1 hop)
-        model.record_access(&MemoryAccess::load(0x21000, 4));
+        // West neighbor access (CardDir 5, 1 hop)
+        model.record_access(&MemoryAccess::load(0x51000, 4));
 
-        // East neighbor access (1 hop)
-        model.record_access(&MemoryAccess::load(0x31000, 4));
+        // North neighbor access (CardDir 6, 1 hop)
+        model.record_access(&MemoryAccess::load(0x61000, 4));
 
         let stats = model.stats();
         assert_eq!(stats.total_accesses, 4);
@@ -855,13 +893,14 @@ mod tests {
         let mut model = MemoryModel::new();
         model.advance_to(1);
 
-        // First access to bank 0 in local memory
-        let access1 = MemoryAccess::load(0x00, 4);
+        // First access to bank 0 in local memory (CardDir 7)
+        let access1 = MemoryAccess::load(0x70000, 4);
         model.record_access(&access1);
 
-        // Second access to bank 0 (conflict) + cross-tile (west)
+        // Second access to bank 0 (conflict) + cross-tile (west, CardDir 5)
         // Should have: base (5) + conflict (1) + cross-tile (4) = 10
-        let access2 = MemoryAccess::load(0x10080, 4);
+        // 0x50080: CardDir 5 = West, offset 0x0080, bank = (0x80 >> 4) & 7 = 0
+        let access2 = MemoryAccess::load(0x50080, 4);
         let latency = model.access_latency(&access2);
 
         // Cross-tile to west + bank 0 conflict

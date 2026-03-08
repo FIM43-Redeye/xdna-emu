@@ -10,74 +10,63 @@
 //! AIE2 uses pointer registers (p0-p7) for addressing with optional
 //! post-modify (add immediate or modifier register after access).
 //!
-//! The AGU (Address Generation Unit) generates 20-bit addresses spanning
-//! 0x0000-0x3FFFF (256KB) across the 4 neighboring memory modules:
-//! - 0x00000-0x0FFFF: Local tile memory (quadrant 0)
-//! - 0x10000-0x1FFFF: West neighbor (col-1, same row)
-//! - 0x20000-0x2FFFF: North neighbor (same col, row+1)
-//! - 0x30000-0x3FFFF: East neighbor (col+1, same row)
+//! The AGU (Address Generation Unit) generates 20-bit addresses in the
+//! range 0x40000-0x7FFFF (256KB across 4 cardinal directions):
+//! - 0x40000-0x4FFFF: South neighbor (same col, row-1) [CardDir 4]
+//! - 0x50000-0x5FFFF: West neighbor (col-1, same row)  [CardDir 5]
+//! - 0x60000-0x6FFFF: North neighbor (same col, row+1) [CardDir 6]
+//! - 0x70000-0x7FFFF: East = LOCAL memory (AIE2)       [CardDir 7]
 //!
-//! Linker-assigned addresses (like 0x70440) use higher bits to indicate
-//! memory regions; these must be masked to the 18-bit AGU range.
+//! The cardinal direction is `CardDir = address / MEMORY_SIZE`. On AIE2
+//! (IsCheckerBoard=0), East is always the local tile's own memory. On
+//! checkerboard architectures (AIE1), the local direction depends on
+//! row parity.
+//!
+//! Source: aie-rt `_XAie_GetTargetTileLoc()` (xaie_elfloader.c:124-183)
 //!
 //! # Memory Layout
 //!
-//! - **Data Memory**: 64KB at 0x00000-0x0FFFF (compute tile)
+//! - **Data Memory**: 64KB at 0x70000-0x7FFFF in core view (compute tile)
 //! - **Program Memory**: 16KB (read-only from core)
 
 use crate::device::tile::Tile;
 use crate::interpreter::bundle::{ElementType, MemWidth, Operand, PostModify, SlotIndex, SlotOp};
 use crate::interpreter::state::ExecutionContext;
-use crate::interpreter::timing::{LATENCY_MEMORY, CROSS_TILE_LATENCY};
+use crate::interpreter::timing::{LATENCY_MEMORY, CROSS_TILE_LATENCY, MemoryQuadrant};
 use crate::tablegen::SemanticOp;
 
-/// Address mask for local tile memory (64KB).
-/// Addresses from the AGU span 0x0000-0x3FFFF (256KB across 4 neighbors),
-/// but local memory access only uses the lower 16 bits.
-const LOCAL_MEMORY_MASK: u32 = 0xFFFF;
+/// Offset mask for extracting the local address within a tile's memory.
+/// `address & OFFSET_MASK` gives the byte offset within the target tile.
+const OFFSET_MASK: u32 = crate::arch::compute::MEMORY_SIZE as u32 - 1;
 
-/// Maximum valid data memory address for the 18-bit quadrant address space.
-/// Addresses above this come from the linker's system address map (e.g.,
-/// 0x70000 for a compute tile) and should be masked to a 16-bit local offset.
-const DATA_MEMORY_ADDRESS_LIMIT: u32 = 0x3FFFF;
-
-/// Extract the quadrant (0-3) and local offset from a data memory address.
+/// Decode a data memory address into its cardinal direction and local offset.
 ///
-/// AIE2 cores use an 18-bit address space for data memory:
-///   - bits 17:16 select the quadrant (0=Local, 1=West, 2=North, 3=East)
-///   - bits 15:0  are the 64KB offset within the quadrant
+/// AIE2 cores use a 20-bit data address space (0x40000-0x7FFFF):
+///   - `CardDir = address / MEMORY_SIZE` selects the target tile
+///   - `address & OFFSET_MASK` is the byte offset within that tile
 ///
-/// Quadrant 0 is treated as local memory. Linker-assigned system addresses
-/// (e.g. 0x70000 for East/local) are masked to 16-bit offsets, also landing
-/// in quadrant 0.
+/// CardDir 4=South, 5=West, 6=North, 7=East(local on AIE2).
 ///
-/// However, addresses loaded from the ELF/linker may include the tile's
-/// system base address (e.g., 0x70000 for tile at col 0, row 2). These
-/// addresses exceed the 18-bit window and must be masked to a 16-bit local
-/// offset (quadrant 0).
+/// The ELF linker places data at 0x70000 because that IS the hardware
+/// address for the core's own data memory (CardDir 7 = East = local).
+///
+/// Source: aie-rt `_XAie_GetTargetTileLoc()` (xaie_elfloader.c:124-183)
 #[inline]
-fn decode_data_address(addr: u32) -> (u32, usize) {
-    if addr > DATA_MEMORY_ADDRESS_LIMIT {
-        // Linker/system address -- strip to local 16-bit offset
-        (0, (addr & LOCAL_MEMORY_MASK) as usize)
-    } else {
-        // Valid 18-bit data memory address -- use quadrant routing
-        let quadrant = (addr >> 16) & 0x3;
-        let offset = (addr & LOCAL_MEMORY_MASK) as usize;
-        (quadrant, offset)
-    }
+fn decode_data_address(addr: u32) -> (MemoryQuadrant, usize) {
+    let offset = (addr & OFFSET_MASK) as usize;
+    (MemoryQuadrant::from_address(addr), offset)
 }
 
 /// Compute the total load latency for a data memory address.
 ///
-/// Local memory (quadrant 0) uses the base LATENCY_MEMORY (7 cycles).
-/// Cross-tile accesses (quadrants 1-3) add CROSS_TILE_LATENCY (4 cycles)
-/// per hop to model the routing delay through the stream switch.
+/// Local memory uses the base LATENCY_MEMORY (7 cycles).
+/// Cross-tile accesses add CROSS_TILE_LATENCY (4 cycles) per hop
+/// to model the routing delay through the stream switch.
 #[inline]
 fn load_latency_for_address(addr: u32) -> u64 {
     let (quadrant, _) = decode_data_address(addr);
     let base = LATENCY_MEMORY as u64;
-    if quadrant == 0 {
+    if quadrant == MemoryQuadrant::Local {
         base
     } else {
         base + CROSS_TILE_LATENCY as u64
@@ -88,37 +77,51 @@ fn load_latency_for_address(addr: u32) -> u64 {
 ///
 /// Built lazily before each core step. Neighbor memory is only cloned on
 /// the first cross-tile access, so cores that only touch local memory
-/// (quadrant 0) pay zero allocation cost.
+/// pay zero allocation cost.
 ///
 /// Cross-tile writes are buffered and applied after the core step completes,
 /// matching hardware behavior where cross-tile writes have higher latency
 /// and become visible on the next cycle.
 ///
-/// # Quadrant Mapping
+/// # Cardinal Direction Mapping
 ///
-/// | Quadrant | Direction | Neighbor offset        |
-/// |----------|-----------|------------------------|
-/// | 0        | Local     | Own tile memory         |
-/// | 1        | West      | (col-1, row)           |
-/// | 2        | North     | (col, row+1)           |
-/// | 3        | East      | (col+1, row)           |
+/// | CardDir | Direction | Neighbor offset        | AIE2 behavior |
+/// |---------|-----------|------------------------|---------------|
+/// | 4       | South     | (col, row-1)           | Cross-tile    |
+/// | 5       | West      | (col-1, row)           | Cross-tile    |
+/// | 6       | North     | (col, row+1)           | Cross-tile    |
+/// | 7       | East      | (col+1, row) or LOCAL  | Local (AIE2)  |
 ///
-/// Note: the hardware's AGU quadrant numbering per aie-rt/mlir-aie is
-/// 0=South, 1=West, 2=North, 3=East(local). The emulator uses quadrant 0
-/// as local because linker-assigned addresses (0x70000+) are masked to
-/// 16-bit offsets landing in quadrant 0 (see [`decode_data_address`]).
+/// On AIE2 (IsCheckerBoard=0), East is always local -- `decode_data_address`
+/// maps CardDir 7 to `MemoryQuadrant::Local`, so the East slot is unused.
+/// On checkerboard architectures (AIE1), East may be a real cross-tile
+/// neighbor depending on row parity.
 pub struct NeighborMemory {
     /// Source tile coordinates (needed for resolving neighbors).
     col: usize,
     row: usize,
 
-    /// Neighbor data memory snapshots indexed by quadrant-1 (0=West, 1=North, 2=East).
+    /// Neighbor data memory snapshots indexed by cardinal direction:
+    /// 0=South, 1=West, 2=North, 3=East.
     /// None until first access (lazy clone). Inner None if neighbor doesn't exist.
-    snapshots: [Option<Option<Vec<u8>>>; 3],
+    snapshots: [Option<Option<Vec<u8>>>; 4],
 
-    /// Buffered cross-tile writes: (quadrant, offset_within_tile, data).
+    /// Buffered cross-tile writes: (direction, offset_within_tile, data).
     /// Applied after core step completes.
-    pub pending_writes: Vec<(u8, usize, Vec<u8>)>,
+    pub pending_writes: Vec<(MemoryQuadrant, usize, Vec<u8>)>,
+}
+
+/// Map a cardinal direction to its snapshot array index.
+///
+/// Returns None for `Local` (no snapshot needed -- use own tile memory).
+fn dir_index(dir: MemoryQuadrant) -> Option<usize> {
+    match dir {
+        MemoryQuadrant::South => Some(0),
+        MemoryQuadrant::West => Some(1),
+        MemoryQuadrant::North => Some(2),
+        MemoryQuadrant::East => Some(3),
+        MemoryQuadrant::Local => None,
+    }
 }
 
 impl NeighborMemory {
@@ -129,43 +132,43 @@ impl NeighborMemory {
         Self {
             col,
             row,
-            snapshots: [None, None, None],
+            snapshots: [None, None, None, None],
             pending_writes: Vec::new(),
         }
     }
 
-    /// Resolve a quadrant (1-3) to the neighbor tile coordinates.
+    /// Resolve a cardinal direction to the neighbor tile coordinates.
     ///
-    /// Returns None if the neighbor is outside the array bounds.
-    fn neighbor_coords(&self, quadrant: u8) -> Option<(usize, usize)> {
-        match quadrant {
-            1 => {
-                // West: col-1, same row
+    /// Returns None if the neighbor is outside the array bounds or if
+    /// the direction is `Local`.
+    fn neighbor_coords(&self, dir: MemoryQuadrant) -> Option<(usize, usize)> {
+        match dir {
+            MemoryQuadrant::South => {
+                if self.row > 0 { Some((self.col, self.row - 1)) } else { None }
+            }
+            MemoryQuadrant::West => {
                 if self.col > 0 { Some((self.col - 1, self.row)) } else { None }
             }
-            2 => {
-                // North: same col, row+1
-                Some((self.col, self.row + 1))
-            }
-            3 => {
-                // East: col+1, same row
-                Some((self.col + 1, self.row))
-            }
-            _ => None,
+            MemoryQuadrant::North => Some((self.col, self.row + 1)),
+            MemoryQuadrant::East => Some((self.col + 1, self.row)),
+            MemoryQuadrant::Local => None,
         }
     }
 
     /// Lazily snapshot a neighbor tile's data memory.
     ///
-    /// Called internally on first cross-tile access for a given quadrant.
+    /// Called before execution for each direction that might be accessed.
     /// The `device` reference is only needed for this initial clone.
-    pub fn ensure_snapshot(&mut self, quadrant: u8, device: &crate::device::DeviceState) {
-        let idx = (quadrant - 1) as usize;
-        if idx >= 3 || self.snapshots[idx].is_some() {
-            return; // Already loaded or invalid quadrant
+    pub fn ensure_snapshot(&mut self, dir: MemoryQuadrant, device: &crate::device::DeviceState) {
+        let idx = match dir_index(dir) {
+            Some(i) => i,
+            None => return, // Local -- no snapshot needed
+        };
+        if self.snapshots[idx].is_some() {
+            return; // Already loaded
         }
 
-        let snapshot = self.neighbor_coords(quadrant)
+        let snapshot = self.neighbor_coords(dir)
             .and_then(|(c, r)| device.tile(c, r))
             .map(|tile| tile.data_memory().to_vec());
 
@@ -175,35 +178,32 @@ impl NeighborMemory {
     /// Get a reference to a neighbor's data memory snapshot.
     ///
     /// Returns None if the neighbor doesn't exist or hasn't been snapshotted.
-    pub fn get_memory(&self, quadrant: u8) -> Option<&[u8]> {
-        let idx = (quadrant - 1) as usize;
-        if idx >= 3 {
-            return None;
-        }
+    pub fn get_memory(&self, dir: MemoryQuadrant) -> Option<&[u8]> {
+        let idx = dir_index(dir)?;
         self.snapshots[idx]
             .as_ref()
             .and_then(|opt| opt.as_deref())
     }
 
     /// Buffer a cross-tile write for deferred application.
-    pub fn buffer_write(&mut self, quadrant: u8, offset: usize, data: &[u8]) {
-        self.pending_writes.push((quadrant, offset, data.to_vec()));
+    pub fn buffer_write(&mut self, dir: MemoryQuadrant, offset: usize, data: &[u8]) {
+        self.pending_writes.push((dir, offset, data.to_vec()));
     }
 
     /// Apply all buffered cross-tile writes to the device.
     ///
-    /// Resolves each quadrant to the target tile and writes the data.
+    /// Resolves each direction to the target tile and writes the data.
     /// Called after the core step completes.
     pub fn apply_writes(self, device: &mut crate::device::DeviceState) {
         let col = self.col;
         let row = self.row;
-        for (quadrant, offset, data) in self.pending_writes {
-            // Resolve quadrant to neighbor coordinates inline (self is consumed)
-            let coords = match quadrant {
-                1 => if col > 0 { Some((col - 1, row)) } else { None },
-                2 => Some((col, row + 1)),
-                3 => Some((col + 1, row)),
-                _ => None,
+        for (dir, offset, data) in self.pending_writes {
+            let coords = match dir {
+                MemoryQuadrant::South => if row > 0 { Some((col, row - 1)) } else { None },
+                MemoryQuadrant::West => if col > 0 { Some((col - 1, row)) } else { None },
+                MemoryQuadrant::North => Some((col, row + 1)),
+                MemoryQuadrant::East => Some((col + 1, row)),
+                MemoryQuadrant::Local => None,
             };
             if let Some((c, r)) = coords {
                 if let Some(tile) = device.tile_mut(c, r) {
@@ -228,7 +228,7 @@ pub struct MemoryUnit;
 impl MemoryUnit {
     /// Execute a memory operation.
     ///
-    /// The `neighbors` parameter enables cross-tile memory access (quadrants 1-3).
+    /// The `neighbors` parameter enables cross-tile memory access.
     /// Pass `None` for local-only access (unit tests, simple mode).
     ///
     /// Returns `true` if the operation was handled, `false` if not a memory op.
@@ -294,7 +294,7 @@ impl MemoryUnit {
 
         // Track bank access for conflict detection (local memory only)
         let (quadrant, local_offset) = decode_data_address(addr);
-        if quadrant == 0 {
+        if quadrant == MemoryQuadrant::Local {
             ctx.record_core_bank_access(local_offset as u32, width.bytes() as usize, tile.num_banks());
         }
 
@@ -342,7 +342,7 @@ impl MemoryUnit {
 
         // Track bank access for conflict detection (local memory only)
         let (quadrant, local_offset) = decode_data_address(addr);
-        if quadrant == 0 {
+        if quadrant == MemoryQuadrant::Local {
             ctx.record_core_bank_access(local_offset as u32, width.bytes() as usize, tile.num_banks());
         }
 
@@ -391,7 +391,7 @@ impl MemoryUnit {
 
         // Track bank access for conflict detection (local memory only)
         let (quadrant, local_offset) = decode_data_address(addr);
-        if quadrant == 0 {
+        if quadrant == MemoryQuadrant::Local {
             ctx.record_core_bank_access(local_offset as u32, 32, tile.num_banks());
         }
 
@@ -424,7 +424,7 @@ impl MemoryUnit {
 
         // Track bank access for conflict detection (local memory only)
         let (quadrant, local_offset) = decode_data_address(addr);
-        if quadrant == 0 {
+        if quadrant == MemoryQuadrant::Local {
             ctx.record_core_bank_access(local_offset as u32, 32, tile.num_banks());
         }
 
@@ -575,7 +575,7 @@ impl MemoryUnit {
 
         // Track bank access for conflict detection (local memory only)
         let (quadrant, local_offset) = decode_data_address(addr);
-        if quadrant == 0 {
+        if quadrant == MemoryQuadrant::Local {
             ctx.record_core_bank_access(local_offset as u32, 32, tile.num_banks());
         }
 
@@ -732,28 +732,25 @@ impl MemoryUnit {
         })
     }
 
-    /// Read from tile memory with cross-tile quadrant routing.
+    /// Read from tile memory with cross-tile cardinal direction routing.
     ///
-    /// Address bits 17:16 select the memory quadrant:
-    /// - 0: Local tile memory (fast path)
-    /// - 1: West neighbor
-    /// - 2: North neighbor
-    /// - 3: East neighbor
+    /// CardDir = address / MEMORY_SIZE selects the target tile:
+    /// - 4: South neighbor   - 5: West neighbor
+    /// - 6: North neighbor   - 7: East = Local (AIE2)
     ///
-    /// Linker-assigned addresses (e.g., 0x70440) are masked to the 16-bit
-    /// local offset within the selected quadrant.
+    /// Offset within the target tile is `address & OFFSET_MASK`.
     fn read_memory(tile: &Tile, addr: u32, width: MemWidth, neighbors: Option<&NeighborMemory>) -> u64 {
         let (quadrant, offset) = decode_data_address(addr);
 
         // Select memory source based on quadrant
-        let mem: &[u8] = if quadrant == 0 || neighbors.is_none() {
+        let mem: &[u8] = if quadrant == MemoryQuadrant::Local || neighbors.is_none() {
             // Fast path: local tile memory
             tile.data_memory()
-        } else if let Some(neighbor_mem) = neighbors.and_then(|n| n.get_memory(quadrant as u8)) {
+        } else if let Some(neighbor_mem) = neighbors.and_then(|n| n.get_memory(quadrant)) {
             neighbor_mem
         } else {
             // Neighbor doesn't exist (edge of array) - return zero
-            log::trace!("[LOAD] cross-tile read to non-existent neighbor quadrant {}", quadrant);
+            log::trace!("[LOAD] cross-tile read to non-existent neighbor {:?}", quadrant);
             return 0;
         };
 
@@ -825,25 +822,24 @@ impl MemoryUnit {
         }
     }
 
-    /// Write to tile memory with cross-tile quadrant routing.
+    /// Write to tile memory with cross-tile cardinal direction routing.
     ///
-    /// Address bits 17:16 select the memory quadrant. Cross-tile writes
-    /// (quadrants 1-3) are buffered in the NeighborMemory for deferred
-    /// application after the core step completes.
+    /// Cross-tile writes (South/West/North/East) are buffered in the
+    /// NeighborMemory for deferred application after the core step completes.
     fn write_memory(tile: &mut Tile, addr: u32, value: u64, width: MemWidth, neighbors: Option<&mut NeighborMemory>) {
         let (quadrant, offset) = decode_data_address(addr);
 
-        if quadrant != 0 {
+        if quadrant != MemoryQuadrant::Local {
             if let Some(nbr) = neighbors {
                 // Cross-tile write: serialize value and buffer it
                 let data = Self::serialize_value(value, width);
-                nbr.buffer_write(quadrant as u8, offset, &data);
+                nbr.buffer_write(quadrant, offset, &data);
                 return;
             }
             // No neighbor context -- fall through to local write (legacy behavior)
         }
 
-        // Local tile write (quadrant 0 or no neighbor context)
+        // Local tile write (Local direction or no neighbor context)
         let mem = tile.data_memory_mut();
         Self::write_to_slice(mem, offset, value, width);
     }
@@ -921,7 +917,7 @@ impl MemoryUnit {
     /// Queue a loaded scalar value for deferred write to the destination register.
     ///
     /// Load results are deferred by the given latency to model the AIE2
-    /// memory pipeline. Cross-tile accesses (quadrants 1-3) incur additional
+    /// memory pipeline. Cross-tile accesses (South/West/North) incur additional
     /// routing latency on top of the base LATENCY_MEMORY. The compiler relies
     /// on this latency to pipeline multiple loads to the same register.
     fn write_dest_with_latency(op: &SlotOp, ctx: &mut ExecutionContext, value: u64, width: MemWidth, latency: u64) {
@@ -992,9 +988,9 @@ impl MemoryUnit {
         let (quadrant, offset) = decode_data_address(addr);
 
         // Select memory source
-        let mem: &[u8] = if quadrant == 0 || neighbors.is_none() {
+        let mem: &[u8] = if quadrant == MemoryQuadrant::Local || neighbors.is_none() {
             tile.data_memory()
-        } else if let Some(neighbor_mem) = neighbors.and_then(|n| n.get_memory(quadrant as u8)) {
+        } else if let Some(neighbor_mem) = neighbors.and_then(|n| n.get_memory(quadrant)) {
             neighbor_mem
         } else {
             return [0u32; 8];
@@ -1026,14 +1022,14 @@ impl MemoryUnit {
     pub fn write_vector_to_memory(tile: &mut Tile, addr: u32, value: [u32; 8], neighbors: Option<&mut NeighborMemory>) {
         let (quadrant, offset) = decode_data_address(addr);
 
-        if quadrant != 0 {
+        if quadrant != MemoryQuadrant::Local {
             if let Some(nbr) = neighbors {
                 // Cross-tile vector write: serialize all 8 words and buffer
                 let mut data = Vec::with_capacity(32);
                 for word in &value {
                     data.extend_from_slice(&word.to_le_bytes());
                 }
-                nbr.buffer_write(quadrant as u8, offset, &data);
+                nbr.buffer_write(quadrant, offset, &data);
                 return;
             }
         }
@@ -1564,50 +1560,50 @@ mod tests {
 
     #[test]
     fn test_neighbor_memory_build_and_read() {
-        // Create a device with tiles. Tile(1,2) is the executing core.
-        // Neighbor mapping:
-        //   Quadrant 1 (West)  = tile(0, 2)
-        //   Quadrant 2 (North) = tile(1, 3)
-        //   Quadrant 3 (East)  = tile(2, 2)
+        // Create a device with tiles. Tile(1,3) is the executing core.
+        // Neighbor mapping (CardDir model):
+        //   South = tile(1, 2) [CardDir 4]
+        //   West  = tile(0, 3) [CardDir 5]
+        //   North = tile(1, 4) [CardDir 6]
         let mut device = crate::device::DeviceState::new_npu1();
 
+        // Write known data into south neighbor's memory
+        if let Some(south) = device.tile_mut(1, 2) {
+            south.data_memory_mut()[0x100..0x104].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        }
+
         // Write known data into west neighbor's memory
-        if let Some(west) = device.tile_mut(0, 2) {
-            west.data_memory_mut()[0x100..0x104].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        if let Some(west) = device.tile_mut(0, 3) {
+            west.data_memory_mut()[0x200..0x204].copy_from_slice(&0xCAFE_BABEu32.to_le_bytes());
         }
 
         // Write known data into north neighbor's memory
-        if let Some(north) = device.tile_mut(1, 3) {
-            north.data_memory_mut()[0x200..0x204].copy_from_slice(&0xCAFE_BABEu32.to_le_bytes());
+        if let Some(north) = device.tile_mut(1, 4) {
+            north.data_memory_mut()[0x300..0x304].copy_from_slice(&0x1234_5678u32.to_le_bytes());
         }
 
-        // Write known data into east neighbor's memory
-        if let Some(east) = device.tile_mut(2, 2) {
-            east.data_memory_mut()[0x300..0x304].copy_from_slice(&0x1234_5678u32.to_le_bytes());
-        }
+        // Build NeighborMemory for tile(1,3) and load snapshots
+        let mut nbr = NeighborMemory::new(1, 3);
+        nbr.ensure_snapshot(MemoryQuadrant::South, &device);
+        nbr.ensure_snapshot(MemoryQuadrant::West, &device);
+        nbr.ensure_snapshot(MemoryQuadrant::North, &device);
 
-        // Build NeighborMemory for tile(1,2) and load snapshots
-        let mut nbr = NeighborMemory::new(1, 2);
-        nbr.ensure_snapshot(1, &device); // West
-        nbr.ensure_snapshot(2, &device); // North
-        nbr.ensure_snapshot(3, &device); // East
-
-        // Verify reads from each quadrant
-        let west_mem = nbr.get_memory(1).expect("West neighbor should exist");
+        // Verify reads from each direction
+        let south_mem = nbr.get_memory(MemoryQuadrant::South).expect("South neighbor should exist");
         assert_eq!(
-            u32::from_le_bytes([west_mem[0x100], west_mem[0x101], west_mem[0x102], west_mem[0x103]]),
+            u32::from_le_bytes([south_mem[0x100], south_mem[0x101], south_mem[0x102], south_mem[0x103]]),
             0xDEAD_BEEF
         );
 
-        let north_mem = nbr.get_memory(2).expect("North neighbor should exist");
+        let west_mem = nbr.get_memory(MemoryQuadrant::West).expect("West neighbor should exist");
         assert_eq!(
-            u32::from_le_bytes([north_mem[0x200], north_mem[0x201], north_mem[0x202], north_mem[0x203]]),
+            u32::from_le_bytes([west_mem[0x200], west_mem[0x201], west_mem[0x202], west_mem[0x203]]),
             0xCAFE_BABE
         );
 
-        let east_mem = nbr.get_memory(3).expect("East neighbor should exist");
+        let north_mem = nbr.get_memory(MemoryQuadrant::North).expect("North neighbor should exist");
         assert_eq!(
-            u32::from_le_bytes([east_mem[0x300], east_mem[0x301], east_mem[0x302], east_mem[0x303]]),
+            u32::from_le_bytes([north_mem[0x300], north_mem[0x301], north_mem[0x302], north_mem[0x303]]),
             0x1234_5678
         );
     }
@@ -1616,21 +1612,21 @@ mod tests {
     fn test_neighbor_memory_buffer_write_and_apply() {
         let mut device = crate::device::DeviceState::new_npu1();
 
-        // Build NeighborMemory for tile(1,2)
-        let mut nbr = NeighborMemory::new(1, 2);
-        nbr.ensure_snapshot(1, &device);
+        // Build NeighborMemory for tile(1,3)
+        let mut nbr = NeighborMemory::new(1, 3);
+        nbr.ensure_snapshot(MemoryQuadrant::West, &device);
 
         // Buffer a write to west neighbor at offset 0x400
         let write_data = 0xAAAA_BBBBu32.to_le_bytes();
-        nbr.buffer_write(1, 0x400, &write_data);
+        nbr.buffer_write(MemoryQuadrant::West, 0x400, &write_data);
 
         assert!(nbr.has_pending_writes());
 
         // Apply writes to the device
         nbr.apply_writes(&mut device);
 
-        // Verify the write landed in the west neighbor tile
-        let west = device.tile(0, 2).unwrap();
+        // Verify the write landed in the west neighbor tile (0,3)
+        let west = device.tile(0, 3).unwrap();
         let mem = west.data_memory();
         let value = u32::from_le_bytes([mem[0x400], mem[0x401], mem[0x402], mem[0x403]]);
         assert_eq!(value, 0xAAAA_BBBB);
@@ -1638,22 +1634,22 @@ mod tests {
 
     #[test]
     fn test_cross_tile_scalar_load() {
-        // Test that a load with address in quadrant 1 (0x1xxxx) reads from
-        // the west neighbor's memory snapshot.
+        // Test that a load with CardDir 5 address reads from the west
+        // neighbor's memory snapshot.
         let mut device = crate::device::DeviceState::new_npu1();
 
-        // Write test data to west neighbor (tile 0,2)
-        if let Some(west) = device.tile_mut(0, 2) {
+        // Write test data to west neighbor (tile 0,3)
+        if let Some(west) = device.tile_mut(0, 3) {
             west.write_data_u32(0x100, 0xFEED_FACE);
         }
 
-        // Build neighbor snapshot for tile(1,2)
-        let mut nbr = NeighborMemory::new(1, 2);
-        nbr.ensure_snapshot(1, &device);
+        // Build neighbor snapshot for tile(1,3)
+        let mut nbr = NeighborMemory::new(1, 3);
+        nbr.ensure_snapshot(MemoryQuadrant::West, &device);
 
-        // Read from quadrant 1 address: 0x10100 = west neighbor, offset 0x100
-        let tile = Tile::compute(1, 2);
-        let value = MemoryUnit::read_memory(&tile, 0x10100, MemWidth::Word, Some(&nbr));
+        // Read from CardDir 5 address: 0x50100 = west neighbor, offset 0x100
+        let tile = Tile::compute(1, 3);
+        let value = MemoryUnit::read_memory(&tile, 0x50100, MemWidth::Word, Some(&nbr));
         assert_eq!(value, 0xFEED_FACE);
     }
 
@@ -1661,9 +1657,9 @@ mod tests {
     fn test_cross_tile_vector_load() {
         let mut device = crate::device::DeviceState::new_npu1();
 
-        // Write vector data to north neighbor (tile 1,3)
+        // Write vector data to north neighbor (tile 1,4)
         let test_data = [10u32, 20, 30, 40, 50, 60, 70, 80];
-        if let Some(north) = device.tile_mut(1, 3) {
+        if let Some(north) = device.tile_mut(1, 4) {
             let mem = north.data_memory_mut();
             for (i, &val) in test_data.iter().enumerate() {
                 let offset = 0x200 + i * 4;
@@ -1673,12 +1669,12 @@ mod tests {
         }
 
         // Build neighbor snapshot
-        let mut nbr = NeighborMemory::new(1, 2);
-        nbr.ensure_snapshot(2, &device); // North
+        let mut nbr = NeighborMemory::new(1, 3);
+        nbr.ensure_snapshot(MemoryQuadrant::North, &device);
 
-        // Read vector from quadrant 2: 0x20200 = north neighbor, offset 0x200
-        let tile = Tile::compute(1, 2);
-        let result = MemoryUnit::read_vector_from_memory(&tile, 0x20200, Some(&nbr));
+        // Read vector from CardDir 6: 0x60200 = north neighbor, offset 0x200
+        let tile = Tile::compute(1, 3);
+        let result = MemoryUnit::read_vector_from_memory(&tile, 0x60200, Some(&nbr));
         assert_eq!(result, test_data);
     }
 
@@ -1687,16 +1683,16 @@ mod tests {
         // Cross-tile stores are buffered, not immediately written.
         let mut device = crate::device::DeviceState::new_npu1();
 
-        let mut nbr = NeighborMemory::new(1, 2);
-        nbr.ensure_snapshot(3, &device); // East
+        let mut nbr = NeighborMemory::new(1, 3);
+        nbr.ensure_snapshot(MemoryQuadrant::South, &device);
 
-        // Write to quadrant 3 (east) address 0x30400
-        let mut tile = Tile::compute(1, 2);
-        MemoryUnit::write_memory(&mut tile, 0x30400, 0xBAAD_F00D, MemWidth::Word, Some(&mut nbr));
+        // Write to CardDir 4 (south) address 0x40400
+        let mut tile = Tile::compute(1, 3);
+        MemoryUnit::write_memory(&mut tile, 0x40400, 0xBAAD_F00D, MemWidth::Word, Some(&mut nbr));
 
-        // Should be buffered, not yet in the east neighbor
-        let east = device.tile(2, 2).unwrap();
-        let mem = east.data_memory();
+        // Should be buffered, not yet in the south neighbor
+        let south = device.tile(1, 2).unwrap();
+        let mem = south.data_memory();
         let value = u32::from_le_bytes([mem[0x400], mem[0x401], mem[0x402], mem[0x403]]);
         assert_eq!(value, 0, "Write should be buffered, not applied yet");
 
@@ -1705,8 +1701,8 @@ mod tests {
         nbr.apply_writes(&mut device);
 
         // Now it should be visible
-        let east = device.tile(2, 2).unwrap();
-        let mem = east.data_memory();
+        let south = device.tile(1, 2).unwrap();
+        let mem = south.data_memory();
         let value = u32::from_le_bytes([mem[0x400], mem[0x401], mem[0x402], mem[0x403]]);
         assert_eq!(value, 0xBAAD_F00D);
     }
@@ -1715,18 +1711,18 @@ mod tests {
     fn test_cross_tile_vector_store_buffered() {
         let mut device = crate::device::DeviceState::new_npu1();
 
-        let mut nbr = NeighborMemory::new(1, 2);
-        nbr.ensure_snapshot(1, &device); // West
+        let mut nbr = NeighborMemory::new(1, 3);
+        nbr.ensure_snapshot(MemoryQuadrant::West, &device);
 
-        // Write vector to quadrant 1 (west) address 0x10800
+        // Write vector to CardDir 5 (west) address 0x50800
         let test_data = [1u32, 2, 3, 4, 5, 6, 7, 8];
-        let mut tile = Tile::compute(1, 2);
-        MemoryUnit::write_vector_to_memory(&mut tile, 0x10800, test_data, Some(&mut nbr));
+        let mut tile = Tile::compute(1, 3);
+        MemoryUnit::write_vector_to_memory(&mut tile, 0x50800, test_data, Some(&mut nbr));
 
         // Apply and verify
         nbr.apply_writes(&mut device);
 
-        let west = device.tile(0, 2).unwrap();
+        let west = device.tile(0, 3).unwrap();
         let mem = west.data_memory();
         for (i, &expected) in test_data.iter().enumerate() {
             let offset = 0x800 + i * 4;
@@ -1736,22 +1732,22 @@ mod tests {
     }
 
     #[test]
-    fn test_quadrant_0_fast_path_unchanged() {
-        // Verify that quadrant 0 (local memory) works exactly as before,
+    fn test_local_fast_path_with_neighbors() {
+        // Verify that local memory (CardDir 7 = East) works correctly
         // even when NeighborMemory is Some.
         let device = crate::device::DeviceState::new_npu1();
-        let mut nbr = NeighborMemory::new(1, 2);
-        nbr.ensure_snapshot(1, &device);
+        let mut nbr = NeighborMemory::new(1, 3);
+        nbr.ensure_snapshot(MemoryQuadrant::West, &device);
 
         let mut tile = make_tile();
         tile.write_data_u32(0x100, 0x42424242);
 
-        // Read from local memory (quadrant 0) with neighbors present
-        let value = MemoryUnit::read_memory(&tile, 0x100, MemWidth::Word, Some(&nbr));
+        // Read from local memory (CardDir 7) with neighbors present
+        let value = MemoryUnit::read_memory(&tile, 0x70100, MemWidth::Word, Some(&nbr));
         assert_eq!(value, 0x42424242);
 
-        // Write to local memory (quadrant 0) with neighbors present
-        MemoryUnit::write_memory(&mut tile, 0x200, 0x99887766, MemWidth::Word, Some(&mut nbr));
+        // Write to local memory (CardDir 7) with neighbors present
+        MemoryUnit::write_memory(&mut tile, 0x70200, 0x99887766, MemWidth::Word, Some(&mut nbr));
         assert_eq!(tile.read_data_u32(0x200), Some(0x99887766));
 
         // No cross-tile writes should have been buffered
@@ -1760,14 +1756,15 @@ mod tests {
 
     #[test]
     fn test_edge_tile_no_west_neighbor() {
-        // Tile(0,2) has no west neighbor (col 0).
+        // Tile(0,3) has no west neighbor (col 0).
         // Cross-tile read should return 0.
         let device = crate::device::DeviceState::new_npu1();
-        let mut nbr = NeighborMemory::new(0, 2);
-        nbr.ensure_snapshot(1, &device); // West -- doesn't exist
+        let mut nbr = NeighborMemory::new(0, 3);
+        nbr.ensure_snapshot(MemoryQuadrant::West, &device);
 
-        let tile = Tile::compute(0, 2);
-        let value = MemoryUnit::read_memory(&tile, 0x10100, MemWidth::Word, Some(&nbr));
+        let tile = Tile::compute(0, 3);
+        // CardDir 5 = West, but col 0 has no west neighbor
+        let value = MemoryUnit::read_memory(&tile, 0x50100, MemWidth::Word, Some(&nbr));
         assert_eq!(value, 0, "Read from non-existent west neighbor should return 0");
     }
 
@@ -1775,51 +1772,45 @@ mod tests {
     fn test_load_latency_local_vs_cross_tile() {
         use crate::interpreter::timing::CROSS_TILE_LATENCY;
 
-        // Local memory (quadrant 0): base latency only
-        assert_eq!(load_latency_for_address(0x0000), LATENCY_MEMORY as u64);
-        assert_eq!(load_latency_for_address(0x0FFFF), LATENCY_MEMORY as u64);
+        // Local memory (CardDir 7 = East = local): base latency only
+        assert_eq!(load_latency_for_address(0x70000), LATENCY_MEMORY as u64);
+        assert_eq!(load_latency_for_address(0x7FFFF), LATENCY_MEMORY as u64);
 
-        // West neighbor (quadrant 1): base + cross-tile
+        // West neighbor (CardDir 5): base + cross-tile
         let expected_cross = LATENCY_MEMORY as u64 + CROSS_TILE_LATENCY as u64;
-        assert_eq!(load_latency_for_address(0x10000), expected_cross);
-        assert_eq!(load_latency_for_address(0x1FFFF), expected_cross);
+        assert_eq!(load_latency_for_address(0x50000), expected_cross);
+        assert_eq!(load_latency_for_address(0x5FFFF), expected_cross);
 
-        // North neighbor (quadrant 2): base + cross-tile
-        assert_eq!(load_latency_for_address(0x20000), expected_cross);
+        // North neighbor (CardDir 6): base + cross-tile
+        assert_eq!(load_latency_for_address(0x60000), expected_cross);
 
-        // East neighbor (quadrant 3): base + cross-tile
-        assert_eq!(load_latency_for_address(0x30000), expected_cross);
+        // South neighbor (CardDir 4): base + cross-tile
+        assert_eq!(load_latency_for_address(0x40000), expected_cross);
 
-        // High linker address (>0x3FFFF) maps to local (quadrant 0)
+        // CardDir 7 at different offset: still local
         assert_eq!(load_latency_for_address(0x70440), LATENCY_MEMORY as u64);
     }
 
     #[test]
-    fn test_linker_high_bits_masked_to_local() {
-        // Linker-assigned addresses like 0x70440 have high bits beyond the
-        // 18-bit AGU range. They should be masked to quadrant 0 local access.
-        // 0x70440 & 0x3FFFF = 0x30440 -> quadrant 3, offset 0x0440
-        // But actually, linker addresses are typically resolved by ELF loading
-        // which subtracts the base (0x70000). The AGU only sees 20-bit addresses.
-        //
-        // For addresses where bits above 17 are set but below 20, they map
-        // correctly to quadrants 0-3. Addresses above 0x3FFFF wrap via the
-        // mask to whatever quadrant the lower bits indicate.
+    fn test_carddir7_is_local_memory() {
+        // On AIE2, the linker places data at 0x70000+ because CardDir 7
+        // (East) IS the local tile's data memory. Verify that 0x70440
+        // correctly accesses local memory at offset 0x440.
         let mut tile = make_tile();
         tile.write_data_u32(0x440, 0xABCDABCD);
 
-        // 0x00440 = quadrant 0, offset 0x440 -> local memory
-        let value = MemoryUnit::read_memory(&tile, 0x00440, MemWidth::Word, None);
+        // 0x70440 = CardDir 7 = Local, offset 0x0440
+        let value = MemoryUnit::read_memory(&tile, 0x70440, MemWidth::Word, None);
         assert_eq!(value, 0xABCDABCD);
     }
 
     // === read_register_pure tests (direct, not through load/store) ===
     //
-    // Note: core load/store instructions use the 18-bit quadrant-routed data
-    // address space (bits 17:16 = quadrant, 15:0 = offset). Register access
-    // happens through dedicated paths (CDO, lock instructions, control register
-    // writes), NOT through load/store MMIO. read_register_pure exists for those
-    // dedicated paths.
+    // Note: core load/store instructions use the 20-bit CardDir-routed data
+    // address space (CardDir = addr / MEMORY_SIZE, offset = addr & 0xFFFF).
+    // Register access happens through dedicated paths (CDO, lock instructions,
+    // control register writes), NOT through load/store MMIO.
+    // read_register_pure exists for those dedicated paths.
 
     #[test]
     fn test_read_register_pure_dma_bd() {
@@ -1874,8 +1865,8 @@ mod tests {
         // to verify the address computation is correct.
         let store_addr = ctx.sp().wrapping_add(-32_i32 as u32);
         let (quadrant, local_offset) = decode_data_address(store_addr);
-        assert_eq!(quadrant, 0, "Stack should be in local memory");
-        assert_eq!(local_offset, 0x0040, "0x70060 - 32 = 0x70040, masked to 0x40");
+        assert_eq!(quadrant, MemoryQuadrant::Local, "Stack should be in local memory");
+        assert_eq!(local_offset, 0x0040, "0x70060 - 32 = 0x70040, CardDir 7 local, offset 0x40");
 
         // Write p7's value to memory at the stack slot
         let p7_val = ctx.pointer_read(7);

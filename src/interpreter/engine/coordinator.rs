@@ -20,6 +20,7 @@ use crate::interpreter::core::{CoreInterpreter, CoreStatus, StepResult};
 use crate::interpreter::decode::InstructionDecoder;
 use crate::interpreter::execute::{CycleAccurateExecutor, NeighborMemory};
 use crate::interpreter::state::{EventType, ExecutionContext};
+use crate::interpreter::timing::MemoryQuadrant;
 
 /// Engine execution status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -502,9 +503,9 @@ impl InterpreterEngine {
 
                 // Build cross-tile neighbor memory context.
                 let mut neighbors = NeighborMemory::new(col, row);
-                neighbors.ensure_snapshot(1, &self.device); // West
-                neighbors.ensure_snapshot(2, &self.device); // North
-                neighbors.ensure_snapshot(3, &self.device); // East
+                neighbors.ensure_snapshot(MemoryQuadrant::South, &self.device);
+                neighbors.ensure_snapshot(MemoryQuadrant::West, &self.device);
+                neighbors.ensure_snapshot(MemoryQuadrant::North, &self.device);
 
                 // Get tile for this core
                 if let Some(tile) = self.device.tile_mut(col, row) {
