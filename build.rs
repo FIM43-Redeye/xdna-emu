@@ -6,6 +6,7 @@
 //!
 //! Generated files (written to `$OUT_DIR/`):
 //! - `gen_arch.rs`          -- comprehensive architecture constants (included by `arch` module)
+//! - `gen_subsystems.rs`    -- per-tile-type subsystem address ranges (included by `arch::subsystem`)
 //! - `gen_core_module.rs`   -- core register offsets (included by `registers_spec.rs`)
 //! - `gen_memory_lock.rs`   -- memory module lock constants (included by `registers_spec.rs`)
 //! - `gen_memtile_lock.rs`  -- mem tile lock constants (included by `registers_spec.rs`)
@@ -94,6 +95,7 @@ fn main() {
 
     // Generate all files from the graph crate's parsed data.
     gen_arch(&arch_model, &out_dir);
+    gen_subsystems(&arch_model, &out_dir);
     gen_core_module(&regdb, &out_dir);
     gen_lock_request(&regdb, &out_dir, "memory", "gen_memory_lock.rs");
     gen_lock_request(&regdb, &out_dir, "memory_tile", "gen_memtile_lock.rs");
@@ -363,6 +365,133 @@ fn gen_arch(model: &xdna_archspec::types::ArchModel, out_dir: &Path) {
     }
 
     fs::write(out_dir.join("gen_arch.rs"), out).unwrap();
+}
+
+// ============================================================================
+// Step 0b: Per-tile-type subsystem address ranges from ArchModel
+// ============================================================================
+
+/// Map SubsystemKind to a Rust module name for code generation.
+fn subsystem_mod_name(kind: xdna_archspec::types::SubsystemKind) -> &'static str {
+    use xdna_archspec::types::SubsystemKind;
+    match kind {
+        SubsystemKind::Dma => "dma",
+        SubsystemKind::Lock => "lock",
+        SubsystemKind::StreamSwitch => "stream_switch",
+        SubsystemKind::Processor => "processor",
+        SubsystemKind::ProgramMemory => "program_memory",
+        SubsystemKind::DataMemory => "data_memory",
+        SubsystemKind::Trace => "trace",
+        SubsystemKind::Event => "event",
+        SubsystemKind::Performance => "performance",
+        SubsystemKind::Timer => "timer",
+        SubsystemKind::WatchPoint => "watchpoint",
+        SubsystemKind::Debug => "debug",
+        SubsystemKind::ProgramCounter => "program_counter",
+        SubsystemKind::Interrupt => "interrupt",
+        SubsystemKind::NoC => "noc",
+        SubsystemKind::ShimMux => "shim_mux",
+        SubsystemKind::Unknown => "unknown",
+    }
+}
+
+/// Generate per-tile-type, per-subsystem offset constants.
+///
+/// Produces `gen_subsystems.rs` with nested modules:
+///   `compute::dma::OFFSET_START`, `memtile::lock::OFFSET_END`, etc.
+///
+/// Each constant is the cross-validated (AM025 + aie-rt) Confirmed<u32> value
+/// from the SubsystemModel populated during ArchModel construction.
+///
+/// When a SubsystemKind appears in multiple modules within the same tile type
+/// (e.g., compute tile has performance counters in both Core and Memory modules),
+/// the module name is prefixed: `core_performance`, `memory_performance`.
+/// Subsystems unique to a single module use the plain name: `dma`, `lock`.
+fn gen_subsystems(model: &xdna_archspec::types::ArchModel, out_dir: &Path) {
+    use xdna_archspec::types::{ModuleKind, SubsystemKind, TileKind};
+
+    let mut out = gen_header("ArchModel subsystem address ranges");
+
+    let tile_types: &[(&str, &str, TileKind)] = &[
+        ("compute", "Compute", TileKind::Compute),
+        ("memtile", "MemTile", TileKind::Mem),
+        ("shim", "Shim", TileKind::ShimNoc),
+    ];
+
+    for &(mod_name, doc_name, kind) in tile_types {
+        let tile = match model.tile_types.iter().find(|t| t.kind == kind) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        writeln!(out, "/// {} tile subsystems.", doc_name).unwrap();
+        writeln!(out, "pub mod {} {{", mod_name).unwrap();
+
+        // Collect (module_kind, subsystem) pairs, filtering Unknown.
+        let mut entries: Vec<(ModuleKind, &xdna_archspec::types::SubsystemModel)> = tile
+            .modules
+            .iter()
+            .flat_map(|m| m.subsystems.iter().map(move |s| (m.kind, s)))
+            .filter(|(_, s)| s.kind != SubsystemKind::Unknown)
+            .collect();
+
+        // Sort by offset for deterministic output.
+        entries.sort_by_key(|(_, s)| *s.offset_start.value());
+
+        // Detect which SubsystemKinds appear in more than one module.
+        // Those need module-prefixed names to avoid collisions.
+        let mut kind_modules: HashMap<SubsystemKind, Vec<ModuleKind>> = HashMap::new();
+        for &(mk, sub) in &entries {
+            let entry = kind_modules.entry(sub.kind).or_default();
+            if !entry.contains(&mk) {
+                entry.push(mk);
+            }
+        }
+
+        for &(mk, sub) in &entries {
+            let base_name = subsystem_mod_name(sub.kind);
+            let needs_prefix = kind_modules
+                .get(&sub.kind)
+                .map_or(false, |mods| mods.len() > 1);
+
+            let full_name = if needs_prefix {
+                let prefix = match mk {
+                    ModuleKind::Core => "core",
+                    ModuleKind::Memory => "memory",
+                    ModuleKind::MemTile => "memtile",
+                    ModuleKind::Shim => "shim",
+                };
+                format!("{}_{}", prefix, base_name)
+            } else {
+                base_name.to_string()
+            };
+
+            let start = *sub.offset_start.value();
+            let end = *sub.offset_end.value();
+            let doc_label = full_name.replace('_', " ");
+
+            writeln!(out, "    pub mod {} {{", full_name).unwrap();
+            writeln!(
+                out,
+                "        /// Start of {} register space (inclusive).",
+                doc_label
+            )
+            .unwrap();
+            writeln!(out, "        pub const OFFSET_START: u32 = 0x{:X};", start).unwrap();
+            writeln!(
+                out,
+                "        /// End of {} register space (exclusive).",
+                doc_label
+            )
+            .unwrap();
+            writeln!(out, "        pub const OFFSET_END: u32 = 0x{:X};", end).unwrap();
+            writeln!(out, "    }}").unwrap();
+        }
+
+        writeln!(out, "}}\n").unwrap();
+    }
+
+    fs::write(out_dir.join("gen_subsystems.rs"), out).unwrap();
 }
 
 // ============================================================================

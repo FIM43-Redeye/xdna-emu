@@ -601,4 +601,33 @@ mod tests {
         let info = RegisterInfo::lookup_aie2(0x39999);
         assert!(info.is_none());
     }
+
+    #[test]
+    fn gen_subsystems_accessible() {
+        // Verify the generated subsystem module compiles and has expected constants.
+        // Values come from AM025 register ranges, cross-validated with aie-rt.
+        use crate::arch::subsystem;
+
+        // Compute tile: DMA at 0x1D000, Lock at 0x1F000
+        assert_eq!(subsystem::compute::dma::OFFSET_START, 0x1D000);
+        assert!(subsystem::compute::dma::OFFSET_END > subsystem::compute::dma::OFFSET_START);
+        assert_eq!(subsystem::compute::lock::OFFSET_START, 0x1F000);
+        assert!(subsystem::compute::lock::OFFSET_END > subsystem::compute::lock::OFFSET_START);
+
+        // Compute tile: subsystems duplicated across Core and Memory modules
+        // are prefixed with the module name to avoid collisions.
+        assert!(subsystem::compute::core_event::OFFSET_END > subsystem::compute::core_event::OFFSET_START);
+        assert!(subsystem::compute::memory_event::OFFSET_END > subsystem::compute::memory_event::OFFSET_START);
+        assert!(subsystem::compute::core_trace::OFFSET_END > subsystem::compute::core_trace::OFFSET_START);
+        assert!(subsystem::compute::memory_trace::OFFSET_END > subsystem::compute::memory_trace::OFFSET_START);
+
+        // MemTile: DMA at 0xA0000 (single module, no prefix needed)
+        assert_eq!(subsystem::memtile::dma::OFFSET_START, 0xA0000);
+        assert!(subsystem::memtile::dma::OFFSET_END > subsystem::memtile::dma::OFFSET_START);
+
+        // Shim tile: basic range checks
+        assert!(subsystem::shim::dma::OFFSET_END > subsystem::shim::dma::OFFSET_START);
+        assert!(subsystem::shim::event::OFFSET_END > subsystem::shim::event::OFFSET_START);
+        assert!(subsystem::shim::trace::OFFSET_END > subsystem::shim::trace::OFFSET_START);
+    }
 }

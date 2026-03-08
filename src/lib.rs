@@ -39,6 +39,7 @@ pub mod archspec;
 ///
 /// Includes:
 /// - Array topology and per-tile-type resource counts (gen_arch.rs)
+/// - Per-tile-type subsystem address ranges (gen_subsystems.rs)
 /// - Stream switch port type arrays (gen_stream_ports.rs)
 /// - Stream switch port ranges and config bits (gen_stream_ranges.rs)
 pub mod arch {
@@ -63,6 +64,11 @@ pub mod arch {
         pub const fn east(n: u8) -> u8 { EAST_BASE + n }
         pub const fn west(n: u8) -> u8 { WEST_BASE + n }
         pub const fn dma(n: u8) -> u8 { DMA_BASE + n }
+    }
+
+    /// Subsystem address ranges per tile type (generated from ArchModel).
+    pub mod subsystem {
+        include!(concat!(env!("OUT_DIR"), "/gen_subsystems.rs"));
     }
 
     // Port type arrays generated from AM025 Stream_Switch_*_Config registers.
