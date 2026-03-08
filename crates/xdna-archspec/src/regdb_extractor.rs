@@ -571,6 +571,7 @@ pub fn build_module_model(kind: ModuleKind, module: &regdb::ModuleDef) -> Module
     ModuleModel {
         kind,
         registers,
+        subsystems: Vec::new(),
         source: SourceAttribution {
             origin: Source::Am025Json,
             file: "aie_registers_aie2.json".into(),

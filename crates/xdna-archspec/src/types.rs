@@ -446,11 +446,46 @@ pub struct InstanceCount {
     pub channels: Confirmed<u8>,
 }
 
+/// A hardware subsystem within a module, materialized as a queryable object.
+///
+/// Subsystems partition a module's register space into functional units
+/// (DMA, Lock, StreamSwitch, etc.). Each subsystem owns a contiguous offset
+/// range within the tile's 20-bit address space and a set of registers.
+///
+/// Hierarchy: `TileTypeModel -> ModuleModel -> SubsystemModel`.
+///
+/// Offset ranges use `Confirmed<u32>` for cross-validation: the bottom-up
+/// range (derived from AM025 register min/max offsets) will later be confirmed
+/// against the top-down range (from aie-rt module base/size definitions).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubsystemModel {
+    pub kind: SubsystemKind,
+    /// Start offset within the tile's 20-bit address space (inclusive).
+    pub offset_start: Confirmed<u32>,
+    /// End offset (exclusive).
+    pub offset_end: Confirmed<u32>,
+    /// Indices into parent ModuleModel.registers for registers owned
+    /// by this subsystem.
+    pub register_indices: Vec<usize>,
+}
+
+impl SubsystemModel {
+    /// Returns true if `offset` falls within this subsystem's address range.
+    ///
+    /// The range is half-open: `[offset_start, offset_end)`.
+    pub fn contains_offset(&self, offset: u32) -> bool {
+        offset >= *self.offset_start.value() && offset < *self.offset_end.value()
+    }
+}
+
 /// A functional module within a tile (Layer 2+: registers grouped by function).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModuleModel {
     pub kind: ModuleKind,
     pub registers: Vec<RegisterModel>,
+    /// Subsystems derived from register grouping. Populated after register
+    /// extraction by analyzing offset ranges per `SubsystemKind`.
+    pub subsystems: Vec<SubsystemModel>,
     pub source: SourceAttribution,
 }
 
@@ -1665,6 +1700,7 @@ mod tests {
                         detail: "test".to_string(),
                     },
                 }],
+                subsystems: Vec::new(),
                 source: SourceAttribution {
                     origin: Source::Am025Json,
                     file: "test.json".to_string(),
@@ -2052,5 +2088,39 @@ mod tests {
             None,
             src,
         );
+    }
+
+    // ========================================================================
+    // SubsystemModel tests
+    // ========================================================================
+
+    #[test]
+    fn subsystem_model_basic_construction() {
+        let src = test_source(Source::Am025Json, "register grouping");
+        let sub = SubsystemModel {
+            kind: SubsystemKind::Dma,
+            offset_start: Confirmed::new(0x1D000, src.clone()),
+            offset_end: Confirmed::new(0x1E000, src.clone()),
+            register_indices: vec![0, 1, 2],
+        };
+        assert_eq!(sub.kind, SubsystemKind::Dma);
+        assert_eq!(*sub.offset_start.value(), 0x1D000);
+        assert_eq!(*sub.offset_end.value(), 0x1E000);
+        assert_eq!(sub.register_indices.len(), 3);
+    }
+
+    #[test]
+    fn subsystem_model_contains_offset() {
+        let src = test_source(Source::Am025Json, "register grouping");
+        let sub = SubsystemModel {
+            kind: SubsystemKind::Lock,
+            offset_start: Confirmed::new(0x1F000, src.clone()),
+            offset_end: Confirmed::new(0x1F100, src),
+            register_indices: vec![],
+        };
+        assert!(sub.contains_offset(0x1F000));  // inclusive start
+        assert!(sub.contains_offset(0x1F0FF));  // last byte before end
+        assert!(!sub.contains_offset(0x1F100)); // exclusive end
+        assert!(!sub.contains_offset(0x1D000)); // outside
     }
 }
