@@ -11,7 +11,7 @@
 //! # Architecture Constants
 //!
 //! All constants are derived from AMD AM020 (AIE-ML Architecture Manual).
-//! See `crate::arch` module for the authoritative values.
+//! See `crate::arch` module for the authoritative constants.
 //!
 //! # Performance
 //!
@@ -48,78 +48,45 @@ pub struct TileParams {
 }
 
 impl TileParams {
-    /// NPU1/AIE2 compute tile params, loaded from device model JSON.
+    /// NPU1/AIE2 compute tile params, from compile-time arch constants.
     pub fn compute() -> Self {
-        Self::from_npu1_model(TileType::Compute)
+        use crate::arch;
+        let ch = arch::compute::NUM_DMA_CHANNELS as usize;
+        Self {
+            data_memory_size: arch::compute::MEMORY_SIZE as usize,
+            num_locks: arch::compute::NUM_LOCKS as usize,
+            num_bds: arch::compute::NUM_BDS as usize,
+            num_channels: ch * 2,
+            dma_s2mm_channels: ch,
+            dma_mm2s_channels: ch,
+        }
     }
 
-    /// NPU1/AIE2 memory tile params, loaded from device model JSON.
+    /// NPU1/AIE2 memory tile params, from compile-time arch constants.
     pub fn mem_tile() -> Self {
-        Self::from_npu1_model(TileType::MemTile)
+        use crate::arch;
+        let ch = arch::memtile::NUM_DMA_CHANNELS as usize;
+        Self {
+            data_memory_size: arch::memtile::MEMORY_SIZE as usize,
+            num_locks: arch::memtile::NUM_LOCKS as usize,
+            num_bds: arch::memtile::NUM_BDS as usize,
+            num_channels: ch * 2,
+            dma_s2mm_channels: ch,
+            dma_mm2s_channels: ch,
+        }
     }
 
-    /// NPU1/AIE2 shim tile params, loaded from device model JSON.
+    /// NPU1/AIE2 shim tile params, from compile-time arch constants.
     pub fn shim() -> Self {
-        Self::from_npu1_model(TileType::Shim)
-    }
-
-    /// Build TileParams from the NPU1 device model for the given tile type.
-    ///
-    /// All values are extracted from `tools/aie-device-models.json` via the
-    /// same `DEVICE_MODELS` LazyLock used by the production `ModelConfig` path.
-    fn from_npu1_model(tile_type: TileType) -> Self {
-        use super::arch_config::DEVICE_MODELS;
-
-        let model = DEVICE_MODELS.npu1()
-            .expect("npu1 device not found in device model JSON");
-
-        match tile_type {
-            TileType::Compute => {
-                let c = model.core_config()
-                    .expect("core tile type missing from device model JSON");
-                let (s2mm, mm2s) = c.switchbox_ports.get("DMA")
-                    .map(|dma| (dma.slave as usize, dma.master as usize))
-                    .unwrap_or((2, 2));
-                Self {
-                    data_memory_size: model.local_memory_size as usize,
-                    num_locks: c.num_locks as usize,
-                    num_bds: c.num_bds as usize,
-                    num_channels: s2mm + mm2s,
-                    dma_s2mm_channels: s2mm,
-                    dma_mm2s_channels: mm2s,
-                }
-            }
-            TileType::MemTile => {
-                let c = model.mem_tile_config()
-                    .expect("mem_tile tile type missing from device model JSON");
-                let (s2mm, mm2s) = c.switchbox_ports.get("DMA")
-                    .map(|dma| (dma.slave as usize, dma.master as usize))
-                    .unwrap_or((6, 6));
-                Self {
-                    data_memory_size: model.mem_tile_size as usize,
-                    num_locks: c.num_locks as usize,
-                    num_bds: c.num_bds as usize,
-                    num_channels: s2mm + mm2s,
-                    dma_s2mm_channels: s2mm,
-                    dma_mm2s_channels: mm2s,
-                }
-            }
-            TileType::Shim => {
-                let c = model.shim_noc_config()
-                    .expect("shim_noc tile type missing from device model JSON");
-                let (s2mm, mm2s) = c.shim_mux_ports.get("DMA")
-                    .or_else(|| c.switchbox_ports.get("DMA"))
-                    .map(|dma| (dma.slave as usize, dma.master as usize))
-                    .unwrap_or((2, 2));
-                Self {
-                    data_memory_size: 0,
-                    num_locks: c.num_locks as usize,
-                    num_bds: c.num_bds as usize,
-                    num_channels: s2mm + mm2s,
-                    dma_s2mm_channels: s2mm,
-                    dma_mm2s_channels: mm2s,
-                }
-            }
+        use crate::arch;
+        let ch = arch::shim::NUM_DMA_CHANNELS as usize;
+        Self {
+            data_memory_size: 0,
+            num_locks: arch::shim::NUM_LOCKS as usize,
+            num_bds: arch::shim::NUM_BDS as usize,
+            num_channels: ch * 2,
+            dma_s2mm_channels: ch,
+            dma_mm2s_channels: ch,
         }
     }
 }

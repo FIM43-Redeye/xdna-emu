@@ -140,6 +140,9 @@ fn gen_arch(model: &xdna_archspec::types::ArchModel, out_dir: &Path) {
         writeln!(out, "/// Number of rows in the NPU array (including shim row).").unwrap();
         writeln!(out, "pub const ROWS: u8 = {};", topo.rows).unwrap();
         writeln!(out).unwrap();
+        writeln!(out, "/// Number of memory tile rows (row 1 through row N are mem tiles).").unwrap();
+        writeln!(out, "pub const NUM_MEM_TILE_ROWS: u8 = {};", topo.num_mem_tile_rows).unwrap();
+        writeln!(out).unwrap();
     }
 
     // Per-tile-type modules
