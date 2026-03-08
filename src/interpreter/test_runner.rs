@@ -24,9 +24,59 @@
 //! ```
 
 use anyhow::{anyhow, Result};
+use crate::arch;
+use crate::arch::stream_switch as ss;
 use crate::device::dma::BdConfig;
 use crate::interpreter::engine::{InterpreterEngine, EngineStatus};
 use crate::parser::AieElf;
+
+// ---------------------------------------------------------------------------
+// Stream switch port index helpers (row -> first port of that direction)
+// ---------------------------------------------------------------------------
+
+/// First North-facing master port index for the tile at `row`.
+fn north_master_start(row: u8) -> u8 {
+    if row >= arch::COMPUTE_ROW_START {
+        ss::compute::NORTH_MASTER_START
+    } else if row > arch::SHIM_ROW {
+        ss::mem_tile::NORTH_MASTER_START
+    } else {
+        ss::shim::NORTH_MASTER_START
+    }
+}
+
+/// First South-facing slave port index for the tile at `row`.
+fn south_slave_start(row: u8) -> u8 {
+    if row >= arch::COMPUTE_ROW_START {
+        ss::compute::SOUTH_SLAVE_START
+    } else if row > arch::SHIM_ROW {
+        ss::mem_tile::SOUTH_SLAVE_START
+    } else {
+        ss::shim::SOUTH_SLAVE_START
+    }
+}
+
+/// First South-facing master port index for the tile at `row`.
+fn south_master_start(row: u8) -> u8 {
+    if row >= arch::COMPUTE_ROW_START {
+        ss::compute::SOUTH_MASTER_START
+    } else if row > arch::SHIM_ROW {
+        ss::mem_tile::SOUTH_MASTER_START
+    } else {
+        ss::shim::SOUTH_MASTER_START
+    }
+}
+
+/// First North-facing slave port index for the tile at `row`.
+fn north_slave_start(row: u8) -> u8 {
+    if row >= arch::COMPUTE_ROW_START {
+        ss::compute::NORTH_SLAVE_START
+    } else if row > arch::SHIM_ROW {
+        ss::mem_tile::NORTH_SLAVE_START
+    } else {
+        ss::shim::NORTH_SLAVE_START
+    }
+}
 
 /// Result of a test run.
 #[derive(Debug, Clone)]
@@ -206,25 +256,39 @@ impl TestRunner {
         src_col: u8, src_row: u8, mm2s_channel: u8,
         dst_col: u8, dst_row: u8, s2mm_channel: u8,
     ) {
-        // Get DMA slave/master port indices
-        // Compute tile: DMA slave ports 1-2 (MM2S), DMA master ports 1-2 (S2MM)
-        // MemTile: DMA slave ports 0-5 (MM2S), DMA master ports 0-5 (S2MM)
-        let dma_slave = if src_row >= 2 {
-            // Compute tile: MM2S ch2 → slave[1], ch3 → slave[2]
-            if mm2s_channel >= 2 { mm2s_channel - 1 } else { mm2s_channel + 1 }
-        } else if src_row == 1 {
-            // MemTile: MM2S ch6-11 → slave[0-5]
-            if mm2s_channel >= 6 { mm2s_channel - 6 } else { mm2s_channel }
+        // Map DMA channel index to stream switch port index.
+        //
+        // Test API convention: S2MM channels = 0..N, MM2S channels = N..2N
+        // (where N = NUM_DMA_CHANNELS for the tile type).
+        //
+        // DMA slave ports carry MM2S (memory-to-stream) data.
+        // DMA master ports carry S2MM (stream-to-memory) data.
+        let dma_slave = if src_row >= arch::COMPUTE_ROW_START {
+            // Compute tile: DMA slave ports start at DMA_SLAVE_START
+            let local_ch = if mm2s_channel >= arch::compute::NUM_DMA_CHANNELS {
+                mm2s_channel - arch::compute::NUM_DMA_CHANNELS
+            } else {
+                mm2s_channel
+            };
+            ss::compute::DMA_SLAVE_START + local_ch
+        } else if src_row > arch::SHIM_ROW {
+            // MemTile: DMA slave ports start at DMA_SLAVE_START
+            let local_ch = if mm2s_channel >= arch::memtile::NUM_DMA_CHANNELS {
+                mm2s_channel - arch::memtile::NUM_DMA_CHANNELS
+            } else {
+                mm2s_channel
+            };
+            ss::mem_tile::DMA_SLAVE_START + local_ch
         } else {
             mm2s_channel
         };
 
-        let dma_master = if dst_row >= 2 {
-            // Compute tile: S2MM ch0 → master[1], ch1 → master[2]
-            s2mm_channel + 1
-        } else if dst_row == 1 {
-            // MemTile: S2MM ch0-5 → master[0-5]
-            s2mm_channel
+        let dma_master = if dst_row >= arch::COMPUTE_ROW_START {
+            // Compute tile: DMA master ports start at DMA_MASTER_START
+            ss::compute::DMA_MASTER_START + s2mm_channel
+        } else if dst_row > arch::SHIM_ROW {
+            // MemTile: DMA master ports start at DMA_MASTER_START
+            ss::mem_tile::DMA_MASTER_START + s2mm_channel
         } else {
             s2mm_channel
         };
@@ -248,25 +312,21 @@ impl TestRunner {
                 let tile = &mut array.tiles[tile_idx];
 
                 if row == src_row {
-                    // Source tile: DMA slave → North master
-                    // Compute tile: North masters start at 13 (North0-5 = 13-18)
-                    // MemTile: North masters start at 11 (North0-5 = 11-16)
-                    let north_master: usize = if row >= 2 { 13 } else if row == 1 { 11 } else { 12 };
+                    // Source tile: DMA slave -> North master
+                    let north_master = north_master_start(row) as usize;
                     tile.stream_switch.configure_local_route(dma_slave as usize, north_master);
                     log::debug!("  Route ({},{}) slave[{}] -> master[{}] (DMA->North)",
                         src_col, row, dma_slave, north_master);
                 } else if row == dst_row {
-                    // Destination tile: South slave → DMA master
-                    // Compute tile: South slaves start at 5 (South0-5 = 5-10)
-                    // MemTile: South slaves start at 7 (South0-5 = 7-12)
-                    let south_slave: usize = if row >= 2 { 5 } else if row == 1 { 7 } else { 7 };
+                    // Destination tile: South slave -> DMA master
+                    let south_slave = south_slave_start(row) as usize;
                     tile.stream_switch.configure_local_route(south_slave, dma_master as usize);
                     log::debug!("  Route ({},{}) slave[{}] -> master[{}] (South->DMA)",
                         src_col, row, south_slave, dma_master);
                 } else {
-                    // Intermediate tile: South slave → North master (passthrough)
-                    let south_slave: usize = if row >= 2 { 5 } else if row == 1 { 7 } else { 7 };
-                    let north_master: usize = if row >= 2 { 13 } else if row == 1 { 11 } else { 12 };
+                    // Intermediate tile: South slave -> North master (passthrough)
+                    let south_slave = south_slave_start(row) as usize;
+                    let north_master = north_master_start(row) as usize;
                     tile.stream_switch.configure_local_route(south_slave, north_master);
                     log::debug!("  Route ({},{}) slave[{}] -> master[{}] (passthrough)",
                         src_col, row, south_slave, north_master);
@@ -279,25 +339,21 @@ impl TestRunner {
                 let tile = &mut array.tiles[tile_idx];
 
                 if row == src_row {
-                    // Source tile: DMA slave → South master
-                    // Compute tile: South masters start at 5 (South0-3 = 5-8)
-                    // MemTile: South masters start at 7 (South0-3 = 7-10)
-                    let south_master: usize = if row >= 2 { 5 } else if row == 1 { 7 } else { 2 };
+                    // Source tile: DMA slave -> South master
+                    let south_master = south_master_start(row) as usize;
                     tile.stream_switch.configure_local_route(dma_slave as usize, south_master);
                     log::debug!("  Route ({},{}) slave[{}] -> master[{}] (DMA->South)",
                         src_col, row, dma_slave, south_master);
                 } else if row == dst_row {
-                    // Destination tile: North slave → DMA master
-                    // Compute tile: North slaves start at 15 (North0-3 = 15-18)
-                    // MemTile: North slaves start at 13 (North0-3 = 13-16)
-                    let north_slave: usize = if row >= 2 { 15 } else if row == 1 { 13 } else { 14 };
+                    // Destination tile: North slave -> DMA master
+                    let north_slave = north_slave_start(row) as usize;
                     tile.stream_switch.configure_local_route(north_slave, dma_master as usize);
                     log::debug!("  Route ({},{}) slave[{}] -> master[{}] (North->DMA)",
                         src_col, row, north_slave, dma_master);
                 } else {
-                    // Intermediate tile: North slave → South master (passthrough)
-                    let north_slave: usize = if row >= 2 { 15 } else if row == 1 { 13 } else { 14 };
-                    let south_master: usize = if row >= 2 { 5 } else if row == 1 { 7 } else { 2 };
+                    // Intermediate tile: North slave -> South master (passthrough)
+                    let north_slave = north_slave_start(row) as usize;
+                    let south_master = south_master_start(row) as usize;
                     tile.stream_switch.configure_local_route(north_slave, south_master);
                     log::debug!("  Route ({},{}) slave[{}] -> master[{}] (passthrough)",
                         src_col, row, north_slave, south_master);

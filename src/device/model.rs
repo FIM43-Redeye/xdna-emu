@@ -305,9 +305,11 @@ pub fn validate_against_spec(model: &DeviceModel) -> Result<(), DeviceModelError
         };
     }
 
-    // --- Global parameters ---
-    check!("max_lock_value", model.max_lock_value, 63_u32);           // 0x3F
-    check!("address_gen_granularity", model.address_gen_granularity, 32_u32); // 32-bit words
+    use crate::arch;
+
+    // --- Global parameters (cross-validate JSON model vs arch::* constants) ---
+    check!("max_lock_value", model.max_lock_value as i32, arch::MAX_LOCK_VALUE);
+    check!("address_gen_granularity", model.address_gen_granularity, 32_u32); // 32-bit words (no arch const yet)
 
     // Cross-validate: the compile-time Lock::MAX_VALUE const must agree with
     // the model. This catches silent drift if a future architecture changes
@@ -319,18 +321,18 @@ pub fn validate_against_spec(model: &DeviceModel) -> Result<(), DeviceModelError
     );
 
     // --- Memory sizes ---
-    check!("local_memory_size", model.local_memory_size, 65536_u32);   // 64 KB
-    check!("mem_tile_size", model.mem_tile_size, 524288_u32);          // 512 KB
+    check!("local_memory_size", model.local_memory_size, arch::compute::MEMORY_SIZE as u32);
+    check!("mem_tile_size", model.mem_tile_size, arch::memtile::MEMORY_SIZE as u32);
 
     // --- Tile type: core ---
     if let Some(core) = model.core_config() {
-        check!("core.num_locks", core.num_locks, 16_u32);
-        check!("core.num_bds", core.num_bds, 16_u32);
+        check!("core.num_locks", core.num_locks, arch::compute::NUM_LOCKS as u32);
+        check!("core.num_bds", core.num_bds, arch::compute::NUM_BDS as u32);
 
         // Stream switch port counts for compute tiles
         if let Some(dma) = core.switchbox_ports.get("DMA") {
-            check!("core.dma_mm2s_ports", dma.master, 2_u32);
-            check!("core.dma_s2mm_ports", dma.slave, 2_u32);
+            check!("core.dma_mm2s_ports", dma.master, arch::compute::NUM_DMA_CHANNELS as u32);
+            check!("core.dma_s2mm_ports", dma.slave, arch::compute::NUM_DMA_CHANNELS as u32);
         } else {
             mismatches.push("core: missing DMA switchbox_ports".to_string());
         }
@@ -340,13 +342,13 @@ pub fn validate_against_spec(model: &DeviceModel) -> Result<(), DeviceModelError
 
     // --- Tile type: mem_tile ---
     if let Some(mem) = model.mem_tile_config() {
-        check!("mem_tile.num_locks", mem.num_locks, 64_u32);
-        check!("mem_tile.num_bds", mem.num_bds, 48_u32);
+        check!("mem_tile.num_locks", mem.num_locks, arch::memtile::NUM_LOCKS as u32);
+        check!("mem_tile.num_bds", mem.num_bds, arch::memtile::NUM_BDS as u32);
 
         // DMA channels for memory tiles
         if let Some(dma) = mem.switchbox_ports.get("DMA") {
-            check!("mem_tile.dma_mm2s_ports", dma.master, 6_u32);
-            check!("mem_tile.dma_s2mm_ports", dma.slave, 6_u32);
+            check!("mem_tile.dma_mm2s_ports", dma.master, arch::memtile::NUM_DMA_CHANNELS as u32);
+            check!("mem_tile.dma_s2mm_ports", dma.slave, arch::memtile::NUM_DMA_CHANNELS as u32);
         } else {
             mismatches.push("mem_tile: missing DMA switchbox_ports".to_string());
         }
@@ -356,40 +358,37 @@ pub fn validate_against_spec(model: &DeviceModel) -> Result<(), DeviceModelError
 
     // --- Tile type: shim_noc ---
     if let Some(shim) = model.shim_noc_config() {
-        check!("shim_noc.num_locks", shim.num_locks, 16_u32);
-        check!("shim_noc.num_bds", shim.num_bds, 16_u32);
+        check!("shim_noc.num_locks", shim.num_locks, arch::shim::NUM_LOCKS as u32);
+        check!("shim_noc.num_bds", shim.num_bds, arch::shim::NUM_BDS as u32);
     } else {
         mismatches.push("missing shim_noc tile type".to_string());
     }
 
-    // --- Memory base addresses ---
-    // These map to the AGU address regions for neighboring tile memories.
-    // The values 0x40000, 0x50000, 0x60000, 0x70000 are each 64 KB apart,
-    // representing the four quadrants of the 256 KB addressable space.
+    // --- Memory base addresses (cardinal direction * MEMORY_SIZE) ---
     check!(
         "mem_base_south",
-        model.mem_base_addresses.south as usize,
-        0x40000
+        model.mem_base_addresses.south,
+        arch::cardinal::SOUTH as u32 * arch::compute::MEMORY_SIZE as u32
     );
     check!(
         "mem_base_west",
-        model.mem_base_addresses.west as usize,
-        0x50000
+        model.mem_base_addresses.west,
+        arch::cardinal::WEST as u32 * arch::compute::MEMORY_SIZE as u32
     );
     check!(
         "mem_base_north",
-        model.mem_base_addresses.north as usize,
-        0x60000
+        model.mem_base_addresses.north,
+        arch::cardinal::NORTH as u32 * arch::compute::MEMORY_SIZE as u32
     );
     check!(
         "mem_base_east",
-        model.mem_base_addresses.east as usize,
-        0x70000
+        model.mem_base_addresses.east,
+        arch::cardinal::EAST as u32 * arch::compute::MEMORY_SIZE as u32
     );
 
     // --- Address space ---
-    check!("column_shift", model.column_shift as usize, 25);
-    check!("row_shift", model.row_shift as usize, 20);
+    check!("column_shift", model.column_shift, arch::TILE_COL_SHIFT);
+    check!("row_shift", model.row_shift, arch::TILE_ROW_SHIFT);
 
     if mismatches.is_empty() {
         Ok(())

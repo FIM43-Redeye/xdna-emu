@@ -115,14 +115,16 @@ impl RegisterModule {
 
         let lay = super::regdb::device_reg_layout();
 
-        // Compute tile BD end: base + count * stride. Use 16 BDs (from model config).
-        let memory_bd_end = lay.memory_bd_base + 16 * lay.memory_bd_stride;
+        use crate::arch;
 
-        // MemTile lock end: base + 64 locks * stride
-        let memtile_lock_end = lay.memtile_lock_base + 64 * lay.memtile_lock_stride;
+        // Compute tile BD end: base + count * stride
+        let memory_bd_end = lay.memory_bd_base + arch::compute::NUM_BDS as u32 * lay.memory_bd_stride;
 
-        // Compute tile lock end: base + 16 locks * stride
-        let memory_lock_end = lay.memory_lock_base + 16 * lay.memory_lock_stride;
+        // MemTile lock end: base + lock_count * stride
+        let memtile_lock_end = lay.memtile_lock_base + arch::memtile::NUM_LOCKS as u32 * lay.memtile_lock_stride;
+
+        // Compute tile lock end: base + lock_count * stride
+        let memory_lock_end = lay.memory_lock_base + arch::compute::NUM_LOCKS as u32 * lay.memory_lock_stride;
 
         let ss = &lay.memory_stream_switch;
         let mt_ss = &lay.memtile_stream_switch;
@@ -232,7 +234,7 @@ impl fmt::Display for RegisterInfo {
 /// BD base/stride/words derived from register database (AM025).
 fn lookup_dma_bd(offset: u32) -> Option<RegisterInfo> {
     let lay = super::regdb::device_reg_layout();
-    let bd_end = lay.memory_bd_base + 16 * lay.memory_bd_stride;
+    let bd_end = lay.memory_bd_base + crate::arch::compute::NUM_BDS as u32 * lay.memory_bd_stride;
 
     if !(lay.memory_bd_base..bd_end).contains(&offset) {
         return None;
@@ -269,7 +271,7 @@ fn lookup_dma_bd(offset: u32) -> Option<RegisterInfo> {
 /// Lock base/stride derived from register database (AM025).
 fn lookup_lock(offset: u32) -> Option<RegisterInfo> {
     let lay = super::regdb::device_reg_layout();
-    let lock_end = lay.memory_lock_base + 16 * lay.memory_lock_stride;
+    let lock_end = lay.memory_lock_base + crate::arch::compute::NUM_LOCKS as u32 * lay.memory_lock_stride;
 
     if !(lay.memory_lock_base..lock_end).contains(&offset) {
         return None;
