@@ -17,19 +17,19 @@ use xdna_emu::arch;
 
 #[test]
 fn compute_tile_memory() {
-    // 4 banks * 16KB = 64KB total (mlir-aie memory groups)
+    // 4 logical banks * 16KB = 64KB total (mlir-aie memory groups)
     assert_eq!(arch::compute::MEMORY_SIZE, 64 * 1024);
-    assert_eq!(arch::compute::MEMORY_BANKS, 4);
-    assert_eq!(arch::compute::BANK_SIZE, 16 * 1024);
+    assert_eq!(arch::compute::LOGICAL_BANKS, 4);
+    assert_eq!(arch::compute::LOGICAL_BANK_SIZE, 16 * 1024);
     assert_eq!(arch::compute::PROGRAM_MEMORY_SIZE, 16 * 1024);
 }
 
 #[test]
 fn memtile_memory() {
-    // 8 banks * 64KB = 512KB total (mlir-aie memory groups)
+    // 8 logical banks * 64KB = 512KB total (mlir-aie memory groups)
     assert_eq!(arch::memtile::MEMORY_SIZE, 512 * 1024);
-    assert_eq!(arch::memtile::MEMORY_BANKS, 8);
-    assert_eq!(arch::memtile::BANK_SIZE, 64 * 1024);
+    assert_eq!(arch::memtile::LOGICAL_BANKS, 8);
+    assert_eq!(arch::memtile::LOGICAL_BANK_SIZE, 64 * 1024);
 }
 
 // ============================================================================

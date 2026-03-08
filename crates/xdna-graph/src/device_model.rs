@@ -410,9 +410,8 @@ fn extract_tile_type(
         BankingModel {
             num_banks,
             bank_size,
-            // Device model JSON does not provide bank width; default to 0
-            // until a richer source (AM020/AM025) populates it.
-            bank_width_bits: 0,
+            // mlir-aie standard memory width is 128-bit (16 bytes per row).
+            bank_width_bits: 128,
             source: mem_source.clone(),
         },
         None, // physical banking not available from device model

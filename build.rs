@@ -163,10 +163,16 @@ fn gen_arch(model: &xdna_graph::types::ArchModel, out_dir: &Path) {
         if let Some(ref mem) = tile.memory {
             writeln!(out, "    /// Total data memory size in bytes.").unwrap();
             writeln!(out, "    pub const MEMORY_SIZE: u64 = {};", mem.size_bytes).unwrap();
-            writeln!(out, "    /// Number of memory banks.").unwrap();
-            writeln!(out, "    pub const MEMORY_BANKS: u8 = {};", mem.num_banks).unwrap();
-            writeln!(out, "    /// Size of each memory bank in bytes.").unwrap();
-            writeln!(out, "    pub const BANK_SIZE: u64 = {};", mem.bank_size_bytes).unwrap();
+            writeln!(out, "    /// Logical bank count (programmer/compiler view).").unwrap();
+            writeln!(out, "    pub const LOGICAL_BANKS: u8 = {};", mem.logical.num_banks).unwrap();
+            writeln!(out, "    /// Logical bank size in bytes.").unwrap();
+            writeln!(out, "    pub const LOGICAL_BANK_SIZE: u64 = {};", mem.logical.bank_size).unwrap();
+            if let Some(ref phys) = mem.physical {
+                writeln!(out, "    /// Physical bank count (SRAM arrays, for conflict detection).").unwrap();
+                writeln!(out, "    pub const PHYSICAL_BANKS: u8 = {};", phys.num_banks).unwrap();
+                writeln!(out, "    /// Physical bank size in bytes.").unwrap();
+                writeln!(out, "    pub const PHYSICAL_BANK_SIZE: u64 = {};", phys.bank_size).unwrap();
+            }
             if let Some(pmem) = mem.program_memory_bytes {
                 writeln!(out, "    /// Program (instruction) memory size in bytes.").unwrap();
                 writeln!(out, "    pub const PROGRAM_MEMORY_SIZE: u64 = {};", pmem).unwrap();
