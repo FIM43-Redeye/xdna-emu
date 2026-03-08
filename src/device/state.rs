@@ -963,7 +963,7 @@ impl DeviceState {
     /// Master config format: bit 31 = enable, bits 4:0 = slave select
     /// Slave config format: bit 31 = enable
     fn write_stream_switch(&mut self, col: u8, row: u8, offset: u32, value: u32) {
-        use super::aie2_spec::stream_switch::{ENABLE_BIT, SLAVE_SELECT_MASK};
+        use crate::arch::stream_switch::{ENABLE_BIT, SLAVE_SELECT_MASK};
         let ss = &super::regdb::device_reg_layout().memory_stream_switch;
 
         // Master ports: base + (port * 4), Slave ports: base + (port * 4)
@@ -1390,7 +1390,7 @@ impl DeviceState {
     /// Master config format: bit 31 = enable, bits 4:0 = slave select
     /// Slave config format: bit 31 = enable
     fn write_memtile_stream_switch(&mut self, col: u8, row: u8, offset: u32, value: u32) {
-        use super::aie2_spec::stream_switch::{ENABLE_BIT, SLAVE_SELECT_MASK};
+        use crate::arch::stream_switch::{ENABLE_BIT, SLAVE_SELECT_MASK};
         let ss = &super::regdb::device_reg_layout().memtile_stream_switch;
 
         // MemTile master ports: base + (port * 4), slave ports: base + (port * 4)

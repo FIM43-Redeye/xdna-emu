@@ -25,10 +25,7 @@
 // Memory Architecture (AM020 Ch2, Ch4)
 // ============================================================================
 
-/// Program memory size per compute tile: 16 KB
-/// "The program memory size on the AIE-ML is 16 KB, which allows storing
-/// 1024 instructions of 128-bit each." (AM020 Ch4)
-pub const PROGRAM_MEMORY_SIZE: usize = 16 * 1024;
+// PROGRAM_MEMORY_SIZE: migrated to arch::compute::PROGRAM_MEMORY_SIZE (from archspec)
 
 /// Number of memory banks per compute tile: 8
 /// "The AIE-ML data memory is 64 KB, organized as eight memory banks" (AM020 Ch2)
@@ -279,55 +276,9 @@ pub const FOT_COUNTS_WITH_TOKENS: u8 = 2;
 /// FoT counts from register: length comes from a separate count register
 pub const FOT_COUNTS_FROM_REGISTER: u8 = 3;
 
-// ============================================================================
-// Stream Switch Port Layouts (AM025)
-// ============================================================================
-//
-// These define the port types at each index for each tile type.
-// The hardware has fixed port assignments documented in AM025.
-
-/// Stream switch port type identifier.
-pub mod port_type {
-    pub const CORE: u8 = 0;
-    pub const FIFO: u8 = 1;
-    pub const TRACE: u8 = 2;
-    pub const NORTH_BASE: u8 = 10;
-    pub const SOUTH_BASE: u8 = 20;
-    pub const EAST_BASE: u8 = 30;
-    pub const WEST_BASE: u8 = 40;
-    pub const DMA_BASE: u8 = 50;
-
-    pub const fn north(n: u8) -> u8 {
-        NORTH_BASE + n
-    }
-    pub const fn south(n: u8) -> u8 {
-        SOUTH_BASE + n
-    }
-    pub const fn east(n: u8) -> u8 {
-        EAST_BASE + n
-    }
-    pub const fn west(n: u8) -> u8 {
-        WEST_BASE + n
-    }
-    pub const fn dma(n: u8) -> u8 {
-        DMA_BASE + n
-    }
-}
-
-// Port type arrays are generated at build time from AM025 Stream_Switch_*_Config
-// register names, sorted by offset. See build.rs for the generation logic.
-include!(concat!(env!("OUT_DIR"), "/gen_stream_ports.rs"));
-
-// ============================================================================
-// Stream Switch Port Ranges (derived from AM025 port layout arrays above)
-// ============================================================================
-
-pub mod stream_switch {
-    // Port range constants and ENABLE_BIT are generated at build time by
-    // scanning the generated port arrays above. SLAVE_SELECT_MASK stays
-    // hardcoded (sub-field not individually specified in AM025 JSON).
-    include!(concat!(env!("OUT_DIR"), "/gen_stream_ranges.rs"));
-}
+// Stream Switch Port Layouts and Ranges: migrated to crate::arch
+// (generated from AM025 by build.rs). Port type encoding, port arrays,
+// and port range constants are all in crate::arch.
 
 // ============================================================================
 // Tests

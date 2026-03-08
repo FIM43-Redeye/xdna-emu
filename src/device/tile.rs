@@ -20,12 +20,11 @@
 //! - Direct field access (no hash maps)
 //! - Cache-friendly layout (related data together)
 
-use super::aie2_spec;
 use super::stream_switch::StreamSwitch as FunctionalStreamSwitch;
 use super::trace_unit::TraceUnit;
 
 /// Size of program memory (16 KB = 1024 x 128-bit instructions).
-pub const PROGRAM_MEMORY_SIZE: usize = aie2_spec::PROGRAM_MEMORY_SIZE;
+pub const PROGRAM_MEMORY_SIZE: usize = crate::arch::compute::PROGRAM_MEMORY_SIZE as usize;
 
 /// Parameters for constructing a Tile with correct per-tile-type sizing.
 ///

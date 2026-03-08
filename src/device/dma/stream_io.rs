@@ -7,7 +7,7 @@
 //!
 //! Port layouts and ranges are generated at build time from AM025 register
 //! definitions in `gen_stream_ports.rs` and `gen_stream_ranges.rs`, included
-//! via `aie2_spec`. This module provides DMA-specific convenience functions
+//! via `crate::arch`. This module provides DMA-specific convenience functions
 //! on top of that generated data.
 //!
 //! Reference: AMD AM020/AM025 and docs/dma-reference.md
@@ -71,16 +71,16 @@ impl StreamWord {
 // ============================================================================
 //
 // These map DMA channel indices to stream switch port indices. Port layouts
-// are defined by the generated arrays in aie2_spec (from AM025).
+// are defined by the generated arrays in crate::arch (from AM025).
 
 /// Compute tile DMA port mappings (derived from gen_stream_ranges.rs).
 pub mod compute {
-    use crate::device::aie2_spec::stream_switch::compute as ranges;
+    use crate::arch::stream_switch::compute as ranges;
 
     /// Port count derived from generated port arrays.
-    pub const MASTER_PORT_COUNT: usize = crate::device::aie2_spec::COMPUTE_MASTER_PORTS.len();
+    pub const MASTER_PORT_COUNT: usize = crate::arch::COMPUTE_MASTER_PORTS.len();
     /// Port count derived from generated port arrays.
-    pub const SLAVE_PORT_COUNT: usize = crate::device::aie2_spec::COMPUTE_SLAVE_PORTS.len();
+    pub const SLAVE_PORT_COUNT: usize = crate::arch::COMPUTE_SLAVE_PORTS.len();
 
     /// Get master port for S2MM channel (receives data FROM switch).
     /// S2MM channels map to DMA master ports starting at DMA_MASTER_START.
@@ -107,12 +107,12 @@ pub mod compute {
 
 /// MemTile DMA port mappings (derived from gen_stream_ranges.rs).
 pub mod memtile {
-    use crate::device::aie2_spec::stream_switch::mem_tile as ranges;
+    use crate::arch::stream_switch::mem_tile as ranges;
 
     /// Port count derived from generated port arrays.
-    pub const MASTER_PORT_COUNT: usize = crate::device::aie2_spec::MEMTILE_MASTER_PORTS.len();
+    pub const MASTER_PORT_COUNT: usize = crate::arch::MEMTILE_MASTER_PORTS.len();
     /// Port count derived from generated port arrays.
-    pub const SLAVE_PORT_COUNT: usize = crate::device::aie2_spec::MEMTILE_SLAVE_PORTS.len();
+    pub const SLAVE_PORT_COUNT: usize = crate::arch::MEMTILE_SLAVE_PORTS.len();
 
     /// Get master port for S2MM channel.
     /// MemTile DMA master ports start at DMA_MASTER_START (0).
@@ -143,7 +143,7 @@ pub mod memtile {
 /// gen_stream_ranges.rs does not have DMA_MASTER/SLAVE ranges for shim.
 /// The DMA channels map to South-facing switchbox ports for NoC access.
 pub mod shim {
-    use crate::device::aie2_spec::stream_switch::shim as ranges;
+    use crate::arch::stream_switch::shim as ranges;
 
     /// Get master port for S2MM channel (shim receives from NoC via South).
     pub fn s2mm_master_port(channel: u8) -> u8 {
@@ -175,7 +175,7 @@ pub mod shim {
 
 /// Inter-tile stream connections (which ports connect between adjacent tiles).
 pub mod connections {
-    use crate::device::aie2_spec::stream_switch::{shim, mem_tile, compute};
+    use crate::arch::stream_switch::{shim, mem_tile, compute};
 
     /// Shim North masters connect to MemTile South slaves.
     pub fn shim_north_to_memtile_south(shim_master: u8) -> Option<u8> {
@@ -221,7 +221,7 @@ pub mod connections {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::aie2_spec;
+    use crate::arch;
 
     #[test]
     fn test_stream_word() {
@@ -246,8 +246,8 @@ mod tests {
 
     #[test]
     fn test_compute_port_counts_match_generated() {
-        assert_eq!(compute::MASTER_PORT_COUNT, aie2_spec::COMPUTE_MASTER_PORTS.len());
-        assert_eq!(compute::SLAVE_PORT_COUNT, aie2_spec::COMPUTE_SLAVE_PORTS.len());
+        assert_eq!(compute::MASTER_PORT_COUNT, arch::COMPUTE_MASTER_PORTS.len());
+        assert_eq!(compute::SLAVE_PORT_COUNT, arch::COMPUTE_SLAVE_PORTS.len());
     }
 
     #[test]
@@ -261,21 +261,21 @@ mod tests {
 
     #[test]
     fn test_memtile_port_counts_match_generated() {
-        assert_eq!(memtile::MASTER_PORT_COUNT, aie2_spec::MEMTILE_MASTER_PORTS.len());
-        assert_eq!(memtile::SLAVE_PORT_COUNT, aie2_spec::MEMTILE_SLAVE_PORTS.len());
+        assert_eq!(memtile::MASTER_PORT_COUNT, arch::MEMTILE_MASTER_PORTS.len());
+        assert_eq!(memtile::SLAVE_PORT_COUNT, arch::MEMTILE_SLAVE_PORTS.len());
     }
 
     #[test]
     fn test_shim_port_mappings() {
         // Shim DMA ports map to South ports starting at SOUTH_MASTER/SLAVE_START
-        use aie2_spec::stream_switch::shim as ranges;
+        use arch::stream_switch::shim as ranges;
         assert_eq!(shim::s2mm_master_port(0), ranges::SOUTH_MASTER_START);
         assert_eq!(shim::mm2s_slave_port(0), ranges::SOUTH_SLAVE_START);
     }
 
     #[test]
     fn test_inter_tile_connections() {
-        use aie2_spec::stream_switch::{shim as sr, mem_tile as mr, compute as cr};
+        use arch::stream_switch::{shim as sr, mem_tile as mr, compute as cr};
 
         // Shim North -> MemTile South
         assert_eq!(

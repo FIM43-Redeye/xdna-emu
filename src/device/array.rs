@@ -22,7 +22,7 @@
 //! DMA engines are accessed via `dma_engine(col, row)` and stepped via
 //! `step_dma(col, row, host_memory)`.
 
-use super::aie2_spec::stream_switch::{compute, mem_tile, shim};
+use crate::arch::stream_switch::{compute, mem_tile, shim};
 use super::arch_config::{ArchConfig, ModelConfig};
 use super::dma::{self, DmaEngine, DmaResult};
 use super::host_memory::HostMemory;

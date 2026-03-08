@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use xdna_archspec::regdb::RegisterDb;
 
 // ============================================================================
-// Port type constants -- mirrors aie2_spec::port_type for codegen output
+// Port type constants -- mirrors arch::port_type for codegen output
 // ============================================================================
 // These are our encoding convention, not hardware-defined. The generated code
 // references `port_type::*` which is defined in the same module scope.
@@ -438,7 +438,7 @@ struct PortEntry {
 fn gen_stream_ports(regdb: &RegisterDb, out_dir: &Path) -> PortArrayData {
     let mut out = gen_header("AM025 Stream_Switch_*_Config registers");
     // Note: the generated code references `port_type::*` which is defined
-    // in the including module (aie2_spec.rs), before the include!() point.
+    // in the `arch` module (lib.rs), before the include!() point.
 
     let compute_master =
         collect_port_array(regdb, "core", "Stream_Switch_Master_Config_");

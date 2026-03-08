@@ -85,7 +85,7 @@ impl PortType {
     /// - 40+n: West(n)
     /// - 50+n: DMA(n)
     pub fn from_spec(encoded: u8) -> Self {
-        use aie2_spec::port_type;
+        use crate::arch::port_type;
         match encoded {
             port_type::CORE => PortType::Core,
             port_type::FIFO => PortType::Fifo,
@@ -496,8 +496,8 @@ impl StreamSwitch {
     /// Port layout is defined in aie2_spec::{COMPUTE_MASTER_PORTS, COMPUTE_SLAVE_PORTS}.
     /// Port 3 (master and slave) is Tile_Ctrl, not Core.
     pub fn new_compute_tile(col: u8, row: u8) -> Self {
-        let mut masters = Self::build_ports_from_spec(aie2_spec::COMPUTE_MASTER_PORTS, PortDirection::Master);
-        let mut slaves = Self::build_ports_from_spec(aie2_spec::COMPUTE_SLAVE_PORTS, PortDirection::Slave);
+        let mut masters = Self::build_ports_from_spec(crate::arch::COMPUTE_MASTER_PORTS, PortDirection::Master);
+        let mut slaves = Self::build_ports_from_spec(crate::arch::COMPUTE_SLAVE_PORTS, PortDirection::Slave);
 
         // Tag port 3 as TileCtrl (AM025: Compute port 3 = Tile_Ctrl)
         if masters.len() > 3 { masters[3].port_type = PortType::TileCtrl; }
@@ -531,8 +531,8 @@ impl StreamSwitch {
     /// 4 South masters but 6 South slaves. This matches MemTile's role as
     /// a buffer between Shim (which has 6 North outputs) and Compute tiles.
     pub fn new_mem_tile(col: u8, row: u8) -> Self {
-        let mut masters = Self::build_ports_from_spec(aie2_spec::MEMTILE_MASTER_PORTS, PortDirection::Master);
-        let mut slaves = Self::build_ports_from_spec(aie2_spec::MEMTILE_SLAVE_PORTS, PortDirection::Slave);
+        let mut masters = Self::build_ports_from_spec(crate::arch::MEMTILE_MASTER_PORTS, PortDirection::Master);
+        let mut slaves = Self::build_ports_from_spec(crate::arch::MEMTILE_SLAVE_PORTS, PortDirection::Slave);
 
         // Tag port 6 as TileCtrl (AM025: MemTile port 6 = Tile_Ctrl)
         if masters.len() > 6 { masters[6].port_type = PortType::TileCtrl; }
@@ -564,8 +564,8 @@ impl StreamSwitch {
     ///
     /// The 6 North masters (12-17) connect 1:1 to MemTile South slaves (7-12).
     pub fn new_shim_tile(col: u8) -> Self {
-        let mut masters = Self::build_ports_from_spec(aie2_spec::SHIM_MASTER_PORTS, PortDirection::Master);
-        let mut slaves = Self::build_ports_from_spec(aie2_spec::SHIM_SLAVE_PORTS, PortDirection::Slave);
+        let mut masters = Self::build_ports_from_spec(crate::arch::SHIM_MASTER_PORTS, PortDirection::Master);
+        let mut slaves = Self::build_ports_from_spec(crate::arch::SHIM_SLAVE_PORTS, PortDirection::Slave);
 
         // Tag port 0 as TileCtrl (AM025: Shim port 0 = Tile_Ctrl)
         if !masters.is_empty() { masters[0].port_type = PortType::TileCtrl; }
