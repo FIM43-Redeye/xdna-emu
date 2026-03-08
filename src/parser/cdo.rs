@@ -272,7 +272,7 @@ impl CdoCommand {
     /// Decode tile coordinates from AIE address
     /// Returns (column, row, offset) for standard AIE2 addressing
     pub fn decode_aie_address(&self) -> Option<(u8, u8, u32)> {
-        use crate::device::registers_spec::{TILE_COL_SHIFT, TILE_ROW_SHIFT, TILE_OFFSET_MASK};
+        use crate::arch::{TILE_COL_SHIFT, TILE_ROW_SHIFT, TILE_OFFSET_MASK};
         let addr = self.address()?;
         // AIE2: col = bits[29:25], row = bits[24:20], offset = bits[19:0]
         let col = ((addr >> TILE_COL_SHIFT) & 0x1F) as u8;

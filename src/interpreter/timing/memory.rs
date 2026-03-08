@@ -63,8 +63,8 @@ pub const NUM_BANKS: usize = crate::arch::compute::PHYSICAL_BANKS as usize;
 // Per AM020 Ch2, local-to-external routing is 4 cycles per hop.
 //
 
-/// Size of each memory quadrant (64KB).
-pub const QUADRANT_SIZE: u32 = 0x10000;
+/// Size of each memory quadrant (64KB = compute tile data memory).
+pub const QUADRANT_SIZE: u32 = crate::arch::compute::MEMORY_SIZE as u32;
 
 /// Latency for accessing neighbor tile memory (1 hop).
 /// Per AM020 Ch2: local-to-external routing is 4 cycles.

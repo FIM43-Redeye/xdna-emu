@@ -12,49 +12,23 @@
 //! `include!()` directives below.
 //!
 //! This module retains only constants with **no machine-readable source**:
-//! - Address space layout (tile encoding shifts/masks)
 //! - Program/data memory base addresses
-//! - Tile layout row indices
+//! - ELF linker conventions (`AIE_DATA_MEMORY_BASE`)
 //! - Helper functions (`sign_extend_7bit`)
+//!
+//! Address space layout (tile encoding shifts/masks) and tile row indices
+//! are now in `crate::arch` (generated from ArchModel).
 //!
 //! Reference: docs/xdna/am025-compact/
 
 // ============================================================================
-// Address Space Layout (AM020 Ch2)
+// Linker Convention (not hardware)
 // ============================================================================
 
-/// Column shift for tile address encoding (bits 31:25)
-pub const TILE_COL_SHIFT: u32 = 25;
-
-/// Row shift for tile address encoding (bits 24:20)
-pub const TILE_ROW_SHIFT: u32 = 20;
-
-/// Offset mask for tile-local addresses (bits 19:0)
-pub const TILE_OFFSET_MASK: u32 = 0xFFFFF;
-
-/// Row bits in tile address: 5 bits
-pub const TILE_ROW_BITS: u32 = 5;
-
-/// Column bits in tile address: 7 bits
-pub const TILE_COL_BITS: u32 = 7;
-
-/// AIE data memory base in linker address space
+/// AIE data memory base in linker address space.
 /// ELF binaries use addresses starting at 0x00070000 for data memory.
 /// This is the linker convention, not a hardware address.
 pub const AIE_DATA_MEMORY_BASE: u32 = 0x0007_0000;
-
-// ============================================================================
-// Tile Layout (AM020 Ch2)
-// ============================================================================
-
-/// Shim tile row index (row 0)
-pub const SHIM_TILE_ROW: u8 = 0;
-
-/// Memory tile row index (row 1)
-pub const MEM_TILE_ROW: u8 = 1;
-
-/// First compute tile row index (rows 2-5 for NPU1)
-pub const COMPUTE_TILE_ROW_START: u8 = 2;
 
 // ============================================================================
 // Memory Module Registers (Compute Tiles)

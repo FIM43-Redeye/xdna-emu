@@ -40,16 +40,18 @@ impl TileAddress {
     /// [19:0]  = offset
     /// ```
     pub fn decode(addr: u32) -> Self {
+        use crate::arch::{TILE_COL_SHIFT, TILE_ROW_SHIFT, TILE_OFFSET_MASK};
         Self {
-            col: ((addr >> 25) & 0x1F) as u8,
-            row: ((addr >> 20) & 0x1F) as u8,
-            offset: addr & 0xFFFFF,
+            col: ((addr >> TILE_COL_SHIFT) & 0x1F) as u8,
+            row: ((addr >> TILE_ROW_SHIFT) & 0x1F) as u8,
+            offset: addr & TILE_OFFSET_MASK,
         }
     }
 
     /// Encode tile coordinates and offset into a 32-bit address.
     pub fn encode(col: u8, row: u8, offset: u32) -> u32 {
-        ((col as u32) << 25) | ((row as u32) << 20) | (offset & 0xFFFFF)
+        use crate::arch::{TILE_COL_SHIFT, TILE_ROW_SHIFT, TILE_OFFSET_MASK};
+        ((col as u32) << TILE_COL_SHIFT) | ((row as u32) << TILE_ROW_SHIFT) | (offset & TILE_OFFSET_MASK)
     }
 
     /// Get the module this offset belongs to.

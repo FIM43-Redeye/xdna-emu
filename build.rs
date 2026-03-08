@@ -143,6 +143,37 @@ fn gen_arch(model: &xdna_archspec::types::ArchModel, out_dir: &Path) {
         writeln!(out, "/// Number of memory tile rows (row 1 through row N are mem tiles).").unwrap();
         writeln!(out, "pub const NUM_MEM_TILE_ROWS: u8 = {};", topo.num_mem_tile_rows).unwrap();
         writeln!(out).unwrap();
+
+        // Tile address encoding (AM020 Ch2)
+        writeln!(out, "/// Column shift for tile address encoding (bits 31:25).").unwrap();
+        writeln!(out, "pub const TILE_COL_SHIFT: u32 = {};", topo.column_shift).unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "/// Row shift for tile address encoding (bits 24:20).").unwrap();
+        writeln!(out, "pub const TILE_ROW_SHIFT: u32 = {};", topo.row_shift).unwrap();
+        writeln!(out).unwrap();
+
+        // Derived from shifts
+        let offset_bits = topo.row_shift;
+        let row_bits = topo.column_shift - topo.row_shift;
+        let col_bits = 32 - topo.column_shift;
+        let offset_mask = (1u32 << offset_bits) - 1;
+        writeln!(out, "/// Offset mask for tile-local addresses (bits {}:0).", offset_bits - 1).unwrap();
+        writeln!(out, "pub const TILE_OFFSET_MASK: u32 = 0x{:X};", offset_mask).unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "/// Row bits in tile address.").unwrap();
+        writeln!(out, "pub const TILE_ROW_BITS: u32 = {};", row_bits).unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "/// Column bits in tile address.").unwrap();
+        writeln!(out, "pub const TILE_COL_BITS: u32 = {};", col_bits).unwrap();
+        writeln!(out).unwrap();
+
+        // Row indices (derived from topology)
+        writeln!(out, "/// Shim tile row index.").unwrap();
+        writeln!(out, "pub const SHIM_ROW: u8 = 0;").unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "/// First compute tile row index.").unwrap();
+        writeln!(out, "pub const COMPUTE_ROW_START: u8 = {} + 1;", topo.num_mem_tile_rows).unwrap();
+        writeln!(out).unwrap();
     }
 
     // Per-tile-type modules
