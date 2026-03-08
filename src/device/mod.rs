@@ -63,7 +63,7 @@ pub mod trace_unit;
 pub mod aiert_validation;
 
 pub use arch_config::{ArchConfig, ModelConfig, default_arch};
-pub use registers::{RegisterInfo, RegisterModule, TileAddress};
+pub use registers::{RegisterInfo, TileAddress};
 pub use tile::{Tile, TileType, Lock, LockResult, DmaBufferDescriptor, DmaChannel, CoreState};
 pub use array::TileArray;
 pub use state::{DeviceState, CdoStats};

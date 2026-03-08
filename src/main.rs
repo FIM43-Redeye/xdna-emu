@@ -6,7 +6,9 @@ use std::path::Path;
 use xdna_emu::parser::{Xclbin, AiePartition, Cdo, AieElf};
 use xdna_emu::parser::xclbin::SectionKind;
 use xdna_emu::parser::cdo::{find_cdo_offset, CdoCommand};
-use xdna_emu::device::{TileAddress, RegisterInfo, RegisterModule, DeviceState};
+use xdna_emu::device::{TileAddress, RegisterInfo, DeviceState};
+use xdna_emu::device::registers::{subsystem_from_offset, tile_kind_from_row};
+use xdna_emu::archspec::types::SubsystemKind;
 use xdna_emu::visual::EmulatorApp;
 use xdna_emu::testing::XclbinSuite;
 
@@ -148,9 +150,9 @@ fn main() -> anyhow::Result<()> {
                                     for (j, cmd) in cdo.commands().enumerate() {
                                         if let CdoCommand::DmaWrite { address, data } = &cmd {
                                             let addr = TileAddress::decode(*address);
-                                            let module = addr.module();
+                                            let subsystem = subsystem_from_offset(addr.offset, tile_kind_from_row(addr.row));
                                             println!("  [{:2}] tile({},{}) offset=0x{:05X} {} {} bytes",
-                                                j, addr.col, addr.row, addr.offset, module, data.len());
+                                                j, addr.col, addr.row, addr.offset, subsystem, data.len());
                                         }
                                     }
 
@@ -201,14 +203,14 @@ fn parse_elf(path: &str) -> anyhow::Result<()> {
 
 /// Print register usage analysis for a CDO
 fn print_register_analysis(cdo: &Cdo) {
-    let mut module_counts: HashMap<RegisterModule, usize> = HashMap::new();
+    let mut module_counts: HashMap<SubsystemKind, usize> = HashMap::new();
     let mut tile_counts: HashMap<(u8, u8), usize> = HashMap::new();
     let mut register_hits: HashMap<String, usize> = HashMap::new();
 
     for cmd in cdo.commands() {
         if let Some((col, row, offset)) = cmd.decode_aie_address() {
             let tile = TileAddress { col, row, offset };
-            *module_counts.entry(tile.module()).or_insert(0) += 1;
+            *module_counts.entry(subsystem_from_offset(tile.offset, tile_kind_from_row(tile.row))).or_insert(0) += 1;
             *tile_counts.entry((col, row)).or_insert(0) += 1;
 
             if let Some(info) = RegisterInfo::lookup_aie2(offset) {
@@ -260,9 +262,9 @@ fn print_command(idx: usize, cmd: &CdoCommand) {
         let reg_name = reg_info
             .as_ref()
             .map(|r| r.name)
-            .unwrap_or_else(|| match tile.module() {
-                RegisterModule::Memory => "DATA",
-                RegisterModule::ProgramMemory => "CODE",
+            .unwrap_or_else(|| match subsystem_from_offset(tile.offset, tile_kind_from_row(tile.row)) {
+                SubsystemKind::DataMemory => "DATA",
+                SubsystemKind::ProgramMemory => "CODE",
                 _ => "???",
             });
 

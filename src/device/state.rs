@@ -27,26 +27,10 @@ use std::sync::Arc;
 use super::arch_config::{ArchConfig, ModelConfig};
 use super::array::TileArray;
 use super::registers::TileAddress;
-use super::registers::subsystem_from_offset;
+use super::registers::{subsystem_from_offset, tile_kind_from_row};
 use super::tile::{Tile, TileType};
 use crate::archspec::types::{SubsystemKind, TileKind};
 use crate::parser::cdo::{Cdo, CdoCommand};
-
-/// Derive the tile kind from the row index.
-///
-/// Uses compile-time arch constants to classify:
-/// - Row 0: ShimNoc
-/// - Rows 1..COMPUTE_ROW_START: Mem (memtile)
-/// - Rows >= COMPUTE_ROW_START: Compute
-fn tile_kind_from_row(row: u8) -> TileKind {
-    if row == crate::arch::SHIM_ROW {
-        TileKind::ShimNoc
-    } else if row < crate::arch::COMPUTE_ROW_START {
-        TileKind::Mem
-    } else {
-        TileKind::Compute
-    }
-}
 
 /// Sign-extend a lock value from a register u32 to i8.
 ///

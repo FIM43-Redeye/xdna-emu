@@ -18,6 +18,7 @@
 //! ```
 
 use std::fmt;
+use crate::archspec::types::SubsystemKind;
 
 /// Decoded tile address with column, row, and register offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,10 +55,6 @@ impl TileAddress {
         ((col as u32) << TILE_COL_SHIFT) | ((row as u32) << TILE_ROW_SHIFT) | (offset & TILE_OFFSET_MASK)
     }
 
-    /// Get the module this offset belongs to.
-    pub fn module(&self) -> RegisterModule {
-        RegisterModule::from_offset(self.offset)
-    }
 }
 
 impl fmt::Display for TileAddress {
@@ -66,111 +63,6 @@ impl fmt::Display for TileAddress {
     }
 }
 
-/// Register module (region within a tile).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RegisterModule {
-    /// Tile data memory (0x00000 - 0x0FFFF for compute, 0x00000 - 0x7FFFF for mem tile)
-    Memory,
-    /// DMA buffer descriptors (compute: 0x1D000, memtile: 0xA0000)
-    DmaBufferDescriptor,
-    /// DMA channel control (compute: 0x1DE00, memtile: 0xA0600)
-    DmaChannel,
-    /// Lock registers (compute: 0x1F000, memtile: 0xC0000)
-    Locks,
-    /// Program memory (0x20000 - 0x2FFFF) - compute tiles only
-    ProgramMemory,
-    /// Core module registers (0x30000 - 0x3FFFF) - compute tiles only
-    CoreModule,
-    /// Stream switch (compute: 0x3F000, memtile: 0xB0000)
-    StreamSwitch,
-    /// Memory module misc (0x1E000 - 0x1EFFF)
-    MemoryModule,
-    /// MemTile DMA buffer descriptors (0xA0000 - 0xA03FF)
-    MemTileDmaBufferDescriptor,
-    /// MemTile DMA channel control (0xA0600 - 0xA06FF)
-    MemTileDmaChannel,
-    /// MemTile locks (0xC0000 - 0xC03FF)
-    MemTileLocks,
-    /// MemTile stream switch (0xB0000 - 0xB01FF)
-    MemTileStreamSwitch,
-    /// Unknown region
-    Unknown,
-}
-
-impl RegisterModule {
-    /// Determine module from offset.
-    ///
-    /// Note: This function determines the module type from offset alone.
-    /// For row-specific handling (e.g., MemTile vs Compute), use `from_offset_with_row`.
-    ///
-    /// Structural constants (BD base, channel base, lock base, etc.) are derived
-    /// from the register database. Only core module, program/data memory ranges,
-    /// and stream switch addresses remain as constants (no regdb equivalent).
-    pub fn from_offset(offset: u32) -> Self {
-        use super::registers_spec::{
-            core_module,
-            DATA_MEMORY_BASE, COMPUTE_DATA_MEMORY_END,
-            PROGRAM_MEMORY_BASE, PROGRAM_MEMORY_END,
-        };
-
-        let lay = super::regdb::device_reg_layout();
-
-        use crate::arch;
-
-        // Compute tile BD end: base + count * stride
-        let memory_bd_end = lay.memory_bd_base + arch::compute::NUM_BDS as u32 * lay.memory_bd_stride;
-
-        // MemTile lock end: base + lock_count * stride
-        let memtile_lock_end = lay.memtile_lock_base + arch::memtile::NUM_LOCKS as u32 * lay.memtile_lock_stride;
-
-        // Compute tile lock end: base + lock_count * stride
-        let memory_lock_end = lay.memory_lock_base + arch::compute::NUM_LOCKS as u32 * lay.memory_lock_stride;
-
-        let ss = &lay.memory_stream_switch;
-        let mt_ss = &lay.memtile_stream_switch;
-
-        match offset {
-            // Compute tile registers (AM025 MEMORY_MODULE, CORE_MODULE)
-            DATA_MEMORY_BASE..=COMPUTE_DATA_MEMORY_END => RegisterModule::Memory,
-            o if (lay.memory_bd_base..memory_bd_end).contains(&o) => RegisterModule::DmaBufferDescriptor,
-            o if (lay.memory_channel_base..lay.memory_status_base).contains(&o) => RegisterModule::DmaChannel,
-            0x1E000..=0x1EFFF => RegisterModule::MemoryModule,  // Memory module misc
-            o if (lay.memory_lock_base..memory_lock_end).contains(&o) => RegisterModule::Locks,
-            PROGRAM_MEMORY_BASE..=PROGRAM_MEMORY_END => RegisterModule::ProgramMemory,
-            core_module::OFFSET_START..=core_module::OFFSET_END => RegisterModule::CoreModule,
-            o if (ss.master_base..ss.slave_slot_end).contains(&o) => RegisterModule::StreamSwitch,
-
-            // MemTile registers (row 1) - AM025 MEMORY_TILE_MODULE
-            // MemTile has 512KB data memory (0x00000-0x7FFFF) - handled by Memory above
-            o if (lay.memtile_bd_base..lay.memtile_bd_base + 0x400).contains(&o) => RegisterModule::MemTileDmaBufferDescriptor,
-            o if (lay.memtile_channel_s2mm_base..lay.memtile_channel_s2mm_base + 0x100).contains(&o) => RegisterModule::MemTileDmaChannel,
-            o if (mt_ss.master_base..mt_ss.slave_slot_end).contains(&o) => RegisterModule::MemTileStreamSwitch,
-            o if (lay.memtile_lock_base..memtile_lock_end).contains(&o) => RegisterModule::MemTileLocks,
-
-            _ => RegisterModule::Unknown,
-        }
-    }
-}
-
-impl fmt::Display for RegisterModule {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RegisterModule::Memory => write!(f, "Memory"),
-            RegisterModule::DmaBufferDescriptor => write!(f, "DMA_BD"),
-            RegisterModule::DmaChannel => write!(f, "DMA_CH"),
-            RegisterModule::Locks => write!(f, "Locks"),
-            RegisterModule::ProgramMemory => write!(f, "ProgMem"),
-            RegisterModule::CoreModule => write!(f, "Core"),
-            RegisterModule::StreamSwitch => write!(f, "StrmSw"),
-            RegisterModule::MemoryModule => write!(f, "MemMod"),
-            RegisterModule::MemTileDmaBufferDescriptor => write!(f, "MT_DMA_BD"),
-            RegisterModule::MemTileDmaChannel => write!(f, "MT_DMA_CH"),
-            RegisterModule::MemTileLocks => write!(f, "MT_Locks"),
-            RegisterModule::MemTileStreamSwitch => write!(f, "MT_StrmSw"),
-            RegisterModule::Unknown => write!(f, "Unknown"),
-        }
-    }
-}
 
 /// Information about a specific register.
 #[derive(Debug, Clone)]
@@ -181,8 +73,8 @@ pub struct RegisterInfo {
     pub offset: u32,
     /// Brief description
     pub description: &'static str,
-    /// Which module this belongs to
-    pub module: RegisterModule,
+    /// Which subsystem this belongs to
+    pub module: crate::archspec::types::SubsystemKind,
 }
 
 impl RegisterInfo {
@@ -262,7 +154,7 @@ fn lookup_dma_bd(offset: u32) -> Option<RegisterInfo> {
         name,
         offset,
         description: Box::leak(format!("DMA BD{} word {}", bd_num, word).into_boxed_str()),
-        module: RegisterModule::DmaBufferDescriptor,
+        module: SubsystemKind::Dma,
     })
 }
 
@@ -284,7 +176,7 @@ fn lookup_lock(offset: u32) -> Option<RegisterInfo> {
         name: "LOCK_VALUE",
         offset,
         description: Box::leak(format!("Lock {} value", lock_num).into_boxed_str()),
-        module: RegisterModule::Locks,
+        module: SubsystemKind::Lock,
     })
 }
 
@@ -298,61 +190,61 @@ static CORE_REGISTERS: &[RegisterInfo] = &[
         name: "CORE_CONTROL",
         offset: 0x32000,
         description: "Core enable/disable control",
-        module: RegisterModule::CoreModule,
+        module: SubsystemKind::Processor,
     },
     RegisterInfo {
         name: "CORE_STATUS",
         offset: 0x32004,
         description: "Core status (running, halted, etc.)",
-        module: RegisterModule::CoreModule,
+        module: SubsystemKind::Processor,
     },
     RegisterInfo {
         name: "CORE_ENABLE_EVENTS",
         offset: 0x32008,
         description: "Core event enable",
-        module: RegisterModule::CoreModule,
+        module: SubsystemKind::Processor,
     },
     RegisterInfo {
         name: "CORE_RESET_EVENT",
         offset: 0x3200C,
         description: "Core reset on event",
-        module: RegisterModule::CoreModule,
+        module: SubsystemKind::Processor,
     },
     RegisterInfo {
         name: "CORE_DEBUG_CONTROL0",
         offset: 0x32010,
         description: "Debug control 0",
-        module: RegisterModule::CoreModule,
+        module: SubsystemKind::Processor,
     },
     RegisterInfo {
         name: "CORE_PC",
         offset: 0x31100,
         description: "Program counter",
-        module: RegisterModule::CoreModule,
+        module: SubsystemKind::Processor,
     },
     RegisterInfo {
         name: "CORE_SP",
         offset: 0x31120,
         description: "Stack pointer",
-        module: RegisterModule::CoreModule,
+        module: SubsystemKind::Processor,
     },
     RegisterInfo {
         name: "CORE_LR",
         offset: 0x31130,
         description: "Link register",
-        module: RegisterModule::CoreModule,
+        module: SubsystemKind::Processor,
     },
     RegisterInfo {
         name: "TILE_CONTROL",
         offset: 0x36030,
         description: "Tile control (isolation, etc.)",
-        module: RegisterModule::CoreModule,
+        module: SubsystemKind::Processor,
     },
     RegisterInfo {
         name: "MEMORY_CONTROL",
         offset: 0x36070,
         description: "Memory control (zeroization)",
-        module: RegisterModule::CoreModule,
+        module: SubsystemKind::Processor,
     },
 ];
 
@@ -362,73 +254,73 @@ static DMA_CHANNEL_REGISTERS: &[RegisterInfo] = &[
         name: "DMA_S2MM_0_CTRL",
         offset: 0x1DE00,
         description: "S2MM channel 0 control",
-        module: RegisterModule::DmaChannel,
+        module: SubsystemKind::Dma,
     },
     RegisterInfo {
         name: "DMA_S2MM_0_START_QUEUE",
         offset: 0x1DE04,
         description: "S2MM channel 0 start BD queue",
-        module: RegisterModule::DmaChannel,
+        module: SubsystemKind::Dma,
     },
     RegisterInfo {
         name: "DMA_S2MM_1_CTRL",
         offset: 0x1DE08,
         description: "S2MM channel 1 control",
-        module: RegisterModule::DmaChannel,
+        module: SubsystemKind::Dma,
     },
     RegisterInfo {
         name: "DMA_S2MM_1_START_QUEUE",
         offset: 0x1DE0C,
         description: "S2MM channel 1 start BD queue",
-        module: RegisterModule::DmaChannel,
+        module: SubsystemKind::Dma,
     },
     RegisterInfo {
         name: "DMA_MM2S_0_CTRL",
         offset: 0x1DE10,
         description: "MM2S channel 0 control",
-        module: RegisterModule::DmaChannel,
+        module: SubsystemKind::Dma,
     },
     RegisterInfo {
         name: "DMA_MM2S_0_START_QUEUE",
         offset: 0x1DE14,
         description: "MM2S channel 0 start BD queue",
-        module: RegisterModule::DmaChannel,
+        module: SubsystemKind::Dma,
     },
     RegisterInfo {
         name: "DMA_MM2S_1_CTRL",
         offset: 0x1DE18,
         description: "MM2S channel 1 control",
-        module: RegisterModule::DmaChannel,
+        module: SubsystemKind::Dma,
     },
     RegisterInfo {
         name: "DMA_MM2S_1_START_QUEUE",
         offset: 0x1DE1C,
         description: "MM2S channel 1 start BD queue",
-        module: RegisterModule::DmaChannel,
+        module: SubsystemKind::Dma,
     },
     RegisterInfo {
         name: "DMA_S2MM_STATUS_0",
         offset: 0x1DF00,
         description: "S2MM channel 0 status",
-        module: RegisterModule::DmaChannel,
+        module: SubsystemKind::Dma,
     },
     RegisterInfo {
         name: "DMA_S2MM_STATUS_1",
         offset: 0x1DF04,
         description: "S2MM channel 1 status",
-        module: RegisterModule::DmaChannel,
+        module: SubsystemKind::Dma,
     },
     RegisterInfo {
         name: "DMA_MM2S_STATUS_0",
         offset: 0x1DF10,
         description: "MM2S channel 0 status",
-        module: RegisterModule::DmaChannel,
+        module: SubsystemKind::Dma,
     },
     RegisterInfo {
         name: "DMA_MM2S_STATUS_1",
         offset: 0x1DF14,
         description: "MM2S channel 1 status",
-        module: RegisterModule::DmaChannel,
+        module: SubsystemKind::Dma,
     },
 ];
 
@@ -438,13 +330,13 @@ static MEMORY_MODULE_REGISTERS: &[RegisterInfo] = &[
         name: "MEM_ECC_CONTROL",
         offset: 0x1E000,
         description: "Memory ECC control",
-        module: RegisterModule::MemoryModule,
+        module: SubsystemKind::Event,
     },
     RegisterInfo {
         name: "MEM_ECC_SCRUB_PERIOD",
         offset: 0x1E008,
         description: "ECC scrub period",
-        module: RegisterModule::MemoryModule,
+        module: SubsystemKind::Event,
     },
 ];
 
@@ -454,25 +346,25 @@ static STREAM_SWITCH_REGISTERS: &[RegisterInfo] = &[
         name: "SS_MASTER_CONFIG_0",
         offset: 0x3F000,
         description: "Master port 0 config",
-        module: RegisterModule::StreamSwitch,
+        module: SubsystemKind::StreamSwitch,
     },
     RegisterInfo {
         name: "SS_SLAVE_CONFIG_0",
         offset: 0x3F100,
         description: "Slave port 0 config",
-        module: RegisterModule::StreamSwitch,
+        module: SubsystemKind::StreamSwitch,
     },
     RegisterInfo {
         name: "SS_CTRL_PKT_HANDLER_CTRL",
         offset: 0x3F500,
         description: "Control packet handler",
-        module: RegisterModule::StreamSwitch,
+        module: SubsystemKind::StreamSwitch,
     },
     RegisterInfo {
         name: "SS_DETERMINISTIC_MERGE_CTRL",
         offset: 0x3F800,
         description: "Deterministic merge arbiter",
-        module: RegisterModule::StreamSwitch,
+        module: SubsystemKind::StreamSwitch,
     },
 ];
 
@@ -709,13 +601,31 @@ fn in_range(offset: u32, start: u32, end: u32) -> bool {
     offset >= start && offset < end
 }
 
+/// Derive the tile kind from the row index.
+///
+/// Uses compile-time arch constants to classify:
+/// - Row 0: ShimNoc
+/// - Rows 1..COMPUTE_ROW_START: Mem (memtile)
+/// - Rows >= COMPUTE_ROW_START: Compute
+pub fn tile_kind_from_row(row: u8) -> crate::archspec::types::TileKind {
+    use crate::archspec::types::TileKind;
+    if row == crate::arch::SHIM_ROW {
+        TileKind::ShimNoc
+    } else if row < crate::arch::COMPUTE_ROW_START {
+        TileKind::Mem
+    } else {
+        TileKind::Compute
+    }
+}
+
 /// Format an address decode result for display.
 pub fn format_address(addr: u32) -> String {
     let (tile, info) = decode_register(addr);
     if let Some(reg) = info {
         format!("{} {} ({})", tile, reg.name, reg.description)
     } else {
-        format!("{} [{}]", tile, tile.module())
+        let subsystem = subsystem_from_offset(tile.offset, tile_kind_from_row(tile.row));
+        format!("{} [{}]", tile, subsystem)
     }
 }
 
@@ -758,22 +668,11 @@ mod tests {
     }
 
     #[test]
-    fn test_register_module_from_offset() {
-        assert_eq!(RegisterModule::from_offset(0x00000), RegisterModule::Memory);
-        assert_eq!(RegisterModule::from_offset(0x0FFFF), RegisterModule::Memory);
-        assert_eq!(RegisterModule::from_offset(0x1D000), RegisterModule::DmaBufferDescriptor);
-        assert_eq!(RegisterModule::from_offset(0x1DE00), RegisterModule::DmaChannel);
-        assert_eq!(RegisterModule::from_offset(0x1F000), RegisterModule::Locks);
-        assert_eq!(RegisterModule::from_offset(0x20000), RegisterModule::ProgramMemory);
-        assert_eq!(RegisterModule::from_offset(0x32000), RegisterModule::CoreModule);
-        assert_eq!(RegisterModule::from_offset(0x3F000), RegisterModule::StreamSwitch);
-    }
-
-    #[test]
     fn test_lookup_core_control() {
+        use crate::archspec::types::SubsystemKind;
         let info = RegisterInfo::lookup_aie2(0x32000).unwrap();
         assert_eq!(info.name, "CORE_CONTROL");
-        assert_eq!(info.module, RegisterModule::CoreModule);
+        assert_eq!(info.module, SubsystemKind::Processor);
     }
 
     #[test]
