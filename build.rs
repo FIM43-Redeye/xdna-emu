@@ -223,8 +223,53 @@ fn gen_arch(model: &xdna_archspec::types::ArchModel, out_dir: &Path) {
         writeln!(out, "    /// Number of DMA channels per direction (cross-validated).").unwrap();
         writeln!(out, "    pub const NUM_DMA_CHANNELS: u8 = {};", inst.channels.value()).unwrap();
 
+        // Core address map (compute tiles only)
+        if let Some(ref cam) = tile.core_address_map {
+            writeln!(out).unwrap();
+            writeln!(out, "    /// Start of data memory in core address space.").unwrap();
+            writeln!(out, "    /// Cardinal direction = address / MEMORY_SIZE.").unwrap();
+            writeln!(out, "    /// Source: aie-rt AieMlCoreMod.DataMemAddr.").unwrap();
+            writeln!(out, "    pub const DATA_MEM_ADDR: u32 = 0x{:X};", cam.data_mem_addr).unwrap();
+            writeln!(out, "    /// Log2 of data memory size per quadrant (address shift).").unwrap();
+            writeln!(out, "    /// Source: aie-rt AieMlCoreMod.DataMemShift.").unwrap();
+            writeln!(out, "    pub const DATA_MEM_SHIFT: u8 = {};", cam.data_mem_shift).unwrap();
+            writeln!(out, "    /// Whether memory modules alternate sides by row.").unwrap();
+            writeln!(out, "    /// AIE1=true (checkerboard), AIE2=false (East always local).").unwrap();
+            writeln!(out, "    pub const IS_CHECKERBOARD: bool = {};", cam.is_checkerboard).unwrap();
+            writeln!(out, "    /// Program memory offset in host/CDO address space.").unwrap();
+            writeln!(out, "    /// Source: aie-rt XAIEMLGBL_CORE_MODULE_PROGRAM_MEMORY.").unwrap();
+            writeln!(out, "    pub const PROGRAM_MEM_HOST_OFFSET: u32 = 0x{:X};", cam.program_mem_host_offset).unwrap();
+        }
+
         writeln!(out, "}}\n").unwrap();
     }
+
+    // Cardinal direction constants for core data address space.
+    // These are the quotient of (address / DataMemSize) as used by
+    // aie-rt's _XAie_GetTargetTileLoc() for ELF loading and memory routing.
+    writeln!(out, "/// Cardinal direction constants for core data memory addressing.").unwrap();
+    writeln!(out, "///").unwrap();
+    writeln!(out, "/// The core addresses data memory via `address / MEMORY_SIZE`,").unwrap();
+    writeln!(out, "/// yielding a cardinal direction index 4-7.").unwrap();
+    writeln!(out, "///").unwrap();
+    writeln!(out, "/// Source: aie-rt `_XAie_GetTargetTileLoc()` (xaie_elfloader.c).").unwrap();
+    writeln!(out, "pub mod cardinal {{").unwrap();
+    writeln!(out, "    /// South neighbor (row - 1).").unwrap();
+    writeln!(out, "    pub const SOUTH: u8 = 4;").unwrap();
+    writeln!(out, "    /// West neighbor (col - 1 for non-checkerboard, or row-dependent).").unwrap();
+    writeln!(out, "    pub const WEST: u8 = 5;").unwrap();
+    writeln!(out, "    /// North neighbor (row + 1).").unwrap();
+    writeln!(out, "    pub const NORTH: u8 = 6;").unwrap();
+    writeln!(out, "    /// East / local (same tile for non-checkerboard, or row-dependent).").unwrap();
+    writeln!(out, "    pub const EAST: u8 = 7;").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // Data memory host offset (always 0 for all tile types -- data memory
+    // is at the start of the tile register space in the host/CDO view).
+    writeln!(out, "/// Data memory offset in host/CDO address space (always 0).").unwrap();
+    writeln!(out, "pub const DATA_MEM_HOST_OFFSET: u32 = 0;").unwrap();
+    writeln!(out).unwrap();
 
     // -- Timing model --
     if let Some(ref t) = model.timing {

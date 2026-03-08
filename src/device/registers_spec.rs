@@ -11,9 +11,9 @@
 //! `arch` module (generated from the validated ArchModel). See the
 //! `include!()` directives below.
 //!
-//! This module retains only constants with **no machine-readable source**:
-//! - Program/data memory base addresses
-//! - ELF linker conventions (`AIE_DATA_MEMORY_BASE`)
+//! This module retains derived constants and helpers:
+//! - Program/data memory base addresses (now derived from `arch::*`)
+//! - Core data memory base (`AIE_DATA_MEMORY_BASE`, derived from cardinal direction)
 //! - Helper functions (`sign_extend_7bit`)
 //!
 //! Address space layout (tile encoding shifts/masks) and tile row indices
@@ -22,13 +22,22 @@
 //! Reference: docs/xdna/am025-compact/
 
 // ============================================================================
-// Linker Convention (not hardware)
+// Core data memory base (hardware addressing)
 // ============================================================================
 
-/// AIE data memory base in linker address space.
-/// ELF binaries use addresses starting at 0x00070000 for data memory.
-/// This is the linker convention, not a hardware address.
-pub const AIE_DATA_MEMORY_BASE: u32 = 0x0007_0000;
+/// AIE data memory base in the core's data address space.
+///
+/// This is the East cardinal direction (local memory for AIE2) base address:
+/// `cardinal::EAST * MEMORY_SIZE = 7 * 0x10000 = 0x70000`.
+///
+/// ELF binaries place data at this address because it IS the hardware address
+/// for the core's own data memory. The linker respects the hardware memory map;
+/// this is NOT merely a linker convention.
+///
+/// Source: aie-rt `_XAie_GetTargetTileLoc()` -- `CardDir = Addr / DataMemSize`,
+/// where CardDir 7 = East = local tile (for AIE2 with IsCheckerBoard=0).
+pub const AIE_DATA_MEMORY_BASE: u32 =
+    crate::arch::cardinal::EAST as u32 * crate::arch::compute::MEMORY_SIZE as u32;
 
 // ============================================================================
 // Memory Module Registers (Compute Tiles)
@@ -100,18 +109,20 @@ pub mod mem_tile_module {
 // Program Memory (Compute Tiles Only)
 // ============================================================================
 
-/// Program memory base offset
-pub const PROGRAM_MEMORY_BASE: u32 = 0x20000;
+/// Program memory base offset in host/CDO address space (derived from arch model).
+pub const PROGRAM_MEMORY_BASE: u32 = crate::arch::compute::PROGRAM_MEM_HOST_OFFSET;
 
-/// Program memory end offset
-pub const PROGRAM_MEMORY_END: u32 = 0x2FFFF;
+/// Program memory end offset (base + 64KB window - 1).
+/// Note: only 16KB is implemented (PROGRAM_MEMORY_SIZE), but the address
+/// window spans a full 64KB region in the tile's host address space.
+pub const PROGRAM_MEMORY_END: u32 = PROGRAM_MEMORY_BASE + 0xFFFF;
 
 // ============================================================================
 // Data Memory
 // ============================================================================
 
-/// Data memory base offset
-pub const DATA_MEMORY_BASE: u32 = 0x00000;
+/// Data memory base offset in host/CDO address space (derived from arch model).
+pub const DATA_MEMORY_BASE: u32 = crate::arch::DATA_MEM_HOST_OFFSET;
 
 /// Data memory end offset for compute tile (derived from arch model).
 pub const COMPUTE_DATA_MEMORY_END: u32 = crate::arch::compute::MEMORY_SIZE as u32 - 1;

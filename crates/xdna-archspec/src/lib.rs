@@ -90,6 +90,26 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
         }
     }
 
+    // -- Core address map --
+    // From aie-rt AieMlCoreMod (xaiemlgbl_reginit.c:2318-2326) and
+    // XAIEMLGBL_CORE_MODULE_PROGRAM_MEMORY (xaiemlgbl_params.h:32).
+    let addr_src = SourceAttribution {
+        origin: Source::AieRt,
+        file: "aie-rt/driver/src/global/xaiemlgbl_reginit.c".into(),
+        detail: "AieMlCoreMod: DataMemAddr, DataMemShift, IsCheckerBoard, ProgMemHostOffset".into(),
+    };
+    for tile_type in &mut model.tile_types {
+        if tile_type.kind == TileKind::Compute {
+            tile_type.core_address_map = Some(CoreAddressMap {
+                data_mem_addr: 0x40000,   // AieMlCoreMod.DataMemAddr
+                data_mem_shift: 16,       // AieMlCoreMod.DataMemShift
+                is_checkerboard: false,   // AieMlCoreMod.IsCheckerBoard = 0
+                program_mem_host_offset: 0x20000,  // XAIEMLGBL_CORE_MODULE_PROGRAM_MEMORY
+                source: addr_src.clone(),
+            });
+        }
+    }
+
     // -- Timing model --
     model.timing = Some(TimingModel {
         lock: LockTiming {

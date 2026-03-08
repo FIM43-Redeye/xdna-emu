@@ -592,6 +592,8 @@ pub struct TileTypeModel {
     pub memory: Option<MemoryModel>,
     /// DMA feature capabilities (compression, padding, etc.).
     pub dma_capabilities: Option<DmaCapabilities>,
+    /// Core address space model (compute tiles only).
+    pub core_address_map: Option<CoreAddressMap>,
     /// Switchbox port bundles (present on all tile types).
     pub switchbox_ports: Vec<PortBundle>,
     /// Shim mux port bundles (only present on shim tiles).
@@ -602,6 +604,39 @@ pub struct TileTypeModel {
     pub bd_schema: Option<BdSchema>,
     /// DMA channel control/status schema (populated from register analysis).
     pub channel_schema: Option<DmaChannelSchema>,
+    pub source: SourceAttribution,
+}
+
+/// Core data address space model.
+///
+/// Describes how the compute core addresses data memory via load/store
+/// instructions. The core uses cardinal directions (South/West/North/East)
+/// to address its own and neighboring tiles' data memory.
+///
+/// The address space layout is determined by `data_mem_addr` (start of
+/// data memory in core view) and `data_mem_size` (size per quadrant,
+/// equal to `MemoryModel.size_bytes` for compute tiles).
+///
+/// Cardinal direction = `address / data_mem_size`:
+///   4=South, 5=West, 6=North, 7=East
+///
+/// For AIE2 (`is_checkerboard = false`), East is always the local tile.
+/// For AIE1 (`is_checkerboard = true`), East/West alternate by row parity.
+///
+/// Source: aie-rt `XAie_CoreMod` struct, `_XAie_GetTargetTileLoc()`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreAddressMap {
+    /// Start of data memory in core address space (0x40000 for AIE2).
+    /// Cardinal direction = address / data_mem_size.
+    pub data_mem_addr: u32,
+    /// Log2 of data memory size per quadrant (16 for AIE2 = 64KB boundaries).
+    pub data_mem_shift: u8,
+    /// Whether memory modules alternate sides by row (AIE1=true, AIE2=false).
+    pub is_checkerboard: bool,
+    /// Program memory offset in host/CDO address space (0x20000 for AIE2).
+    /// This is the offset within the tile's register space where program
+    /// memory is mapped, used by CDO writes and ELF loading.
+    pub program_mem_host_offset: u32,
     pub source: SourceAttribution,
 }
 
@@ -1667,6 +1702,7 @@ mod tests {
                 supports_tlast_suppress: false,
                 max_address_dimensions: 4,
             }),
+            core_address_map: None,
             switchbox_ports: vec![
                 PortBundle { bundle: "DMA".to_string(), masters: 2, slaves: 2 },
                 PortBundle { bundle: "Core".to_string(), masters: 1, slaves: 1 },
@@ -1762,6 +1798,7 @@ mod tests {
             instances: test_instances(16, 16, 2),
             memory: None,
             dma_capabilities: None,
+            core_address_map: None,
             switchbox_ports: vec![
                 PortBundle { bundle: "South".to_string(), masters: 6, slaves: 8 },
                 PortBundle { bundle: "North".to_string(), masters: 6, slaves: 4 },

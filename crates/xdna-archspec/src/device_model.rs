@@ -469,6 +469,7 @@ fn extract_tile_type(
         },
         memory,
         dma_capabilities: None, // populated by aie-rt extractor
+        core_address_map: None, // populated by manual constants
         switchbox_ports,
         shim_mux_ports,
         modules: Vec::new(), // populated by AM025 regdb extractor

@@ -77,3 +77,42 @@ fn array_dimensions() {
     assert_eq!(arch::COLUMNS, 4);
     assert_eq!(arch::ROWS, 6);
 }
+
+// ============================================================================
+// Core address space (from aie-rt AieMlCoreMod)
+// ============================================================================
+
+#[test]
+fn core_address_map() {
+    // AIE2 core data address space starts at 0x40000 (aie-rt DataMemAddr)
+    assert_eq!(arch::compute::DATA_MEM_ADDR, 0x40000);
+    // 64KB per quadrant = shift 16
+    assert_eq!(arch::compute::DATA_MEM_SHIFT, 16);
+    // AIE2 is NOT checkerboard (East is always local)
+    assert_eq!(arch::compute::IS_CHECKERBOARD, false);
+    // Program memory at 0x20000 in host/CDO view
+    assert_eq!(arch::compute::PROGRAM_MEM_HOST_OFFSET, 0x20000);
+}
+
+#[test]
+fn cardinal_directions() {
+    // Cardinal direction = address / MEMORY_SIZE
+    // Matches aie-rt _XAie_GetTargetTileLoc()
+    assert_eq!(arch::cardinal::SOUTH, 4);
+    assert_eq!(arch::cardinal::WEST, 5);
+    assert_eq!(arch::cardinal::NORTH, 6);
+    assert_eq!(arch::cardinal::EAST, 7);
+
+    // East * MEMORY_SIZE = 0x70000 (the "AIE_DATA_MEMORY_BASE" value
+    // that was previously mislabeled as a linker convention)
+    assert_eq!(
+        arch::cardinal::EAST as u32 * arch::compute::MEMORY_SIZE as u32,
+        0x70000,
+    );
+}
+
+#[test]
+fn data_mem_host_offset() {
+    // Data memory is always at offset 0 in the tile's host/CDO view
+    assert_eq!(arch::DATA_MEM_HOST_OFFSET, 0);
+}
