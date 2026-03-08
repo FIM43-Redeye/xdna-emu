@@ -37,6 +37,43 @@ pub fn build_arch_model(
     Ok(model)
 }
 
+/// Cross-validate subsystem address ranges against aie-rt extracted constants.
+///
+/// Called after subsystems are populated from AM025. The aie-rt values come
+/// from the gcc -E pipeline in build.rs (DMA BaseAddr, Lock LockSetValBase).
+///
+/// Each entry is (TileKind, ModuleKind, SubsystemKind, aiert_base_offset, source).
+/// The aiert_base_offset is confirmed against the subsystem's offset_start.
+/// If AM025 and aie-rt disagree, `Confirmed::confirm()` panics with a
+/// detailed conflict message.
+pub fn confirm_subsystem_ranges(
+    model: &mut types::ArchModel,
+    confirmations: &[(
+        types::TileKind,
+        types::ModuleKind,
+        types::SubsystemKind,
+        u32,
+        types::SourceAttribution,
+    )],
+) {
+    for (tile_kind, mod_kind, sub_kind, aiert_base, source) in confirmations {
+        let tile = model.tile_types.iter_mut().find(|t| t.kind == *tile_kind);
+        let tile = match tile {
+            Some(t) => t,
+            None => continue, // Tile type not in model, skip
+        };
+        let module = tile.modules.iter_mut().find(|m| m.kind == *mod_kind);
+        let module = match module {
+            Some(m) => m,
+            None => continue, // Module not in model, skip
+        };
+        let subsystem = module.subsystems.iter_mut().find(|s| s.kind == *sub_kind);
+        if let Some(sub) = subsystem {
+            sub.offset_start.confirm(*aiert_base, source.clone());
+        }
+    }
+}
+
 /// Populate architecture constants that have no machine-readable source.
 ///
 /// These values come from AM020 prose, AM025 register descriptions, and
@@ -177,4 +214,252 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
         },
         source: src,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use types::*;
+
+    fn test_source(origin: Source, detail: &str) -> SourceAttribution {
+        SourceAttribution {
+            origin,
+            file: "test".into(),
+            detail: detail.into(),
+        }
+    }
+
+    /// Build a minimal ArchModel with one tile type, one module, and one
+    /// subsystem to test confirm_subsystem_ranges() in isolation.
+    fn minimal_model_with_subsystem(
+        tile_kind: TileKind,
+        mod_kind: ModuleKind,
+        sub_kind: SubsystemKind,
+        offset_start: u32,
+    ) -> ArchModel {
+        let src = test_source(Source::Am025Json, "test register grouping");
+        let subsystem = SubsystemModel {
+            kind: sub_kind,
+            offset_start: Confirmed::new(offset_start, src.clone()),
+            offset_end: Confirmed::new(offset_start + 0x1000, src.clone()),
+            register_indices: vec![],
+        };
+        let module = ModuleModel {
+            kind: mod_kind,
+            registers: vec![],
+            subsystems: vec![subsystem],
+            source: src.clone(),
+        };
+        let tile = TileTypeModel {
+            kind: tile_kind,
+            name: format!("{:?}", tile_kind),
+            representative: None,
+            instances: InstanceCount {
+                locks: Confirmed::new(16, src.clone()),
+                bds: Confirmed::new(16, src.clone()),
+                channels: Confirmed::new(2, src.clone()),
+            },
+            memory: None,
+            dma_capabilities: None,
+            core_address_map: None,
+            switchbox_ports: vec![],
+            shim_mux_ports: vec![],
+            modules: vec![module],
+            bd_schema: None,
+            channel_schema: None,
+            source: test_source(Source::Am025Json, "test tile"),
+        };
+        ArchModel {
+            arch: Architecture::Aie2,
+            generation: Some(DeviceGeneration::Aie2Ipu),
+            device_id: None,
+            is_npu: true,
+            tile_types: vec![tile],
+            relationships: vec![],
+            device_constants: None,
+            array_topology: None,
+            timing: None,
+            packet: None,
+        }
+    }
+
+    #[test]
+    fn confirm_subsystem_ranges_matching_value_adds_source() {
+        let mut model = minimal_model_with_subsystem(
+            TileKind::Compute,
+            ModuleKind::Memory,
+            SubsystemKind::Dma,
+            0x1D000,
+        );
+
+        // Before confirmation: 1 source (AM025)
+        let dma = &model.tile_types[0].modules[0].subsystems[0];
+        assert_eq!(dma.offset_start.sources().len(), 1);
+
+        // Confirm with matching aie-rt value
+        let confirmations = vec![(
+            TileKind::Compute,
+            ModuleKind::Memory,
+            SubsystemKind::Dma,
+            0x1D000u32,
+            test_source(Source::AieRt, "AieMlTileDmaMod.BaseAddr"),
+        )];
+        confirm_subsystem_ranges(&mut model, &confirmations);
+
+        // After confirmation: 2 sources
+        let dma = &model.tile_types[0].modules[0].subsystems[0];
+        assert_eq!(dma.offset_start.sources().len(), 2);
+        assert_eq!(dma.offset_start.sources()[0].origin, Source::Am025Json);
+        assert_eq!(dma.offset_start.sources()[1].origin, Source::AieRt);
+    }
+
+    #[test]
+    #[should_panic(expected = "GRAPH CONFLICT")]
+    fn confirm_subsystem_ranges_mismatched_value_panics() {
+        let mut model = minimal_model_with_subsystem(
+            TileKind::Compute,
+            ModuleKind::Memory,
+            SubsystemKind::Dma,
+            0x1D000,
+        );
+
+        // Confirm with WRONG aie-rt value -- should panic
+        let confirmations = vec![(
+            TileKind::Compute,
+            ModuleKind::Memory,
+            SubsystemKind::Dma,
+            0xDEAD,
+            test_source(Source::AieRt, "wrong value"),
+        )];
+        confirm_subsystem_ranges(&mut model, &confirmations);
+    }
+
+    #[test]
+    fn confirm_subsystem_ranges_missing_tile_skips_gracefully() {
+        let mut model = minimal_model_with_subsystem(
+            TileKind::Compute,
+            ModuleKind::Memory,
+            SubsystemKind::Dma,
+            0x1D000,
+        );
+
+        // Try to confirm a tile type that doesn't exist -- should skip
+        let confirmations = vec![(
+            TileKind::Mem,
+            ModuleKind::MemTile,
+            SubsystemKind::Dma,
+            0xA0000,
+            test_source(Source::AieRt, "nonexistent tile"),
+        )];
+        confirm_subsystem_ranges(&mut model, &confirmations);
+
+        // Original subsystem unchanged (still 1 source)
+        let dma = &model.tile_types[0].modules[0].subsystems[0];
+        assert_eq!(dma.offset_start.sources().len(), 1);
+    }
+
+    #[test]
+    fn confirm_subsystem_ranges_missing_subsystem_skips_gracefully() {
+        let mut model = minimal_model_with_subsystem(
+            TileKind::Compute,
+            ModuleKind::Memory,
+            SubsystemKind::Dma,
+            0x1D000,
+        );
+
+        // Try to confirm a subsystem that doesn't exist in this module
+        let confirmations = vec![(
+            TileKind::Compute,
+            ModuleKind::Memory,
+            SubsystemKind::Lock,
+            0x1F000,
+            test_source(Source::AieRt, "lock in module without lock subsystem"),
+        )];
+        confirm_subsystem_ranges(&mut model, &confirmations);
+
+        // Original DMA subsystem unchanged
+        let dma = &model.tile_types[0].modules[0].subsystems[0];
+        assert_eq!(dma.offset_start.sources().len(), 1);
+    }
+
+    #[test]
+    fn confirm_subsystem_ranges_multiple_confirmations() {
+        // Build a model with both DMA and Lock subsystems
+        let src = test_source(Source::Am025Json, "register grouping");
+        let dma_sub = SubsystemModel {
+            kind: SubsystemKind::Dma,
+            offset_start: Confirmed::new(0x1D000, src.clone()),
+            offset_end: Confirmed::new(0x1E000, src.clone()),
+            register_indices: vec![],
+        };
+        let lock_sub = SubsystemModel {
+            kind: SubsystemKind::Lock,
+            offset_start: Confirmed::new(0x1F000, src.clone()),
+            offset_end: Confirmed::new(0x1F100, src.clone()),
+            register_indices: vec![],
+        };
+        let module = ModuleModel {
+            kind: ModuleKind::Memory,
+            registers: vec![],
+            subsystems: vec![dma_sub, lock_sub],
+            source: src.clone(),
+        };
+        let tile = TileTypeModel {
+            kind: TileKind::Compute,
+            name: "compute".into(),
+            representative: None,
+            instances: InstanceCount {
+                locks: Confirmed::new(16, src.clone()),
+                bds: Confirmed::new(16, src.clone()),
+                channels: Confirmed::new(2, src.clone()),
+            },
+            memory: None,
+            dma_capabilities: None,
+            core_address_map: None,
+            switchbox_ports: vec![],
+            shim_mux_ports: vec![],
+            modules: vec![module],
+            bd_schema: None,
+            channel_schema: None,
+            source: test_source(Source::Am025Json, "test tile"),
+        };
+        let mut model = ArchModel {
+            arch: Architecture::Aie2,
+            generation: Some(DeviceGeneration::Aie2Ipu),
+            device_id: None,
+            is_npu: true,
+            tile_types: vec![tile],
+            relationships: vec![],
+            device_constants: None,
+            array_topology: None,
+            timing: None,
+            packet: None,
+        };
+
+        // Confirm both DMA and Lock in one call
+        let confirmations = vec![
+            (
+                TileKind::Compute,
+                ModuleKind::Memory,
+                SubsystemKind::Dma,
+                0x1D000,
+                test_source(Source::AieRt, "AieMlTileDmaMod.BaseAddr"),
+            ),
+            (
+                TileKind::Compute,
+                ModuleKind::Memory,
+                SubsystemKind::Lock,
+                0x1F000,
+                test_source(Source::AieRt, "AieMlTileLockMod.LockSetValBase"),
+            ),
+        ];
+        confirm_subsystem_ranges(&mut model, &confirmations);
+
+        // Both should now have 2 sources
+        let subs = &model.tile_types[0].modules[0].subsystems;
+        assert_eq!(subs[0].kind, SubsystemKind::Dma);
+        assert_eq!(subs[0].offset_start.sources().len(), 2);
+        assert_eq!(subs[1].kind, SubsystemKind::Lock);
+        assert_eq!(subs[1].offset_start.sources().len(), 2);
+    }
 }

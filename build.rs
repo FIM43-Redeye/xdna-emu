@@ -80,12 +80,17 @@ fn main() {
 
     // Build the full ArchModel (device topology + register data, cross-validated).
     // This is the graph as compile-time truth: Confirmed<T> panics on conflicts.
-    let arch_model = xdna_archspec::build_arch_model(&device_model_path, &regdb, "npu1")
+    let mut arch_model = xdna_archspec::build_arch_model(&device_model_path, &regdb, "npu1")
         .unwrap_or_else(|e| panic!("Failed to build ArchModel: {}", e));
 
     // Bridge script for trace events
     let bridge_path = manifest_dir.join("tools/mlir-aie-bridge.py");
     println!("cargo:rerun-if-changed={}", bridge_path.display());
+
+    // Generate aie-rt extracted constants and cross-validate subsystem ranges.
+    // This must happen before gen_arch() so the model's Confirmed<T> sources
+    // reflect both AM025 and aie-rt when code is generated.
+    extract_aiert(&manifest_dir, &out_dir, &mut arch_model);
 
     // Generate all files from the graph crate's parsed data.
     gen_arch(&arch_model, &out_dir);
@@ -95,9 +100,6 @@ fn main() {
     let port_data = gen_stream_ports(&regdb, &out_dir);
     gen_stream_ranges(&regdb, &port_data, &out_dir);
     gen_trace_events(&bridge_path, &out_dir);
-
-    // Generate aie-rt extracted constants (graceful fallback if unavailable)
-    extract_aiert(&manifest_dir, &out_dir);
 }
 
 // ============================================================================
@@ -1177,8 +1179,17 @@ pub fn shim_event_name(_code: u8) -> &'static str { \"UNKNOWN\" }
 // Step 7: aie-rt header extraction (DMA, Lock, Stream Switch)
 // ============================================================================
 
-/// Top-level: locate aie-rt, run gcc -E, parse, generate all 3 files.
-fn extract_aiert(manifest_dir: &Path, out_dir: &Path) {
+/// Top-level: locate aie-rt, run gcc -E, parse, generate all 3 files,
+/// and cross-validate subsystem address ranges in the ArchModel.
+fn extract_aiert(
+    manifest_dir: &Path,
+    out_dir: &Path,
+    arch_model: &mut xdna_archspec::types::ArchModel,
+) {
+    use xdna_archspec::types::{
+        ModuleKind, Source, SourceAttribution, SubsystemKind, TileKind,
+    };
+
     // Rebuild triggers
     println!("cargo:rerun-if-env-changed=AIE_RT_PATH");
 
@@ -1207,6 +1218,53 @@ fn extract_aiert(manifest_dir: &Path, out_dir: &Path) {
     let dma_modules = parse_dma_modules(&preprocessed);
     let lock_modules = parse_lock_modules(&preprocessed);
     let port_maps = parse_port_maps(&preprocessed);
+
+    // Cross-validate subsystem offset_start values against aie-rt.
+    // DMA BaseAddr is the BD base offset, matching the DMA subsystem's
+    // offset_start from AM025 register grouping.
+    // Lock LockSetValBase is the lock value register base, matching the
+    // Lock subsystem's offset_start from AM025 register grouping.
+    let mut confirmations = Vec::new();
+
+    // Map aie-rt DMA module names to (TileKind, ModuleKind)
+    for m in &dma_modules {
+        let (tile_kind, mod_kind) = if m.name.contains("MemTile") {
+            (TileKind::Mem, ModuleKind::MemTile)
+        } else if m.name.contains("Shim") {
+            (TileKind::ShimNoc, ModuleKind::Shim)
+        } else {
+            (TileKind::Compute, ModuleKind::Memory)
+        };
+
+        let base_addr = get_field(&m.fields, "BaseAddr", &m.name);
+        let source = SourceAttribution {
+            origin: Source::AieRt,
+            file: "xaiemlgbl_reginit.c".into(),
+            detail: format!("{}.BaseAddr", m.name),
+        };
+        confirmations.push((tile_kind, mod_kind, SubsystemKind::Dma, base_addr, source));
+    }
+
+    // Map aie-rt Lock module names to (TileKind, ModuleKind)
+    for m in &lock_modules {
+        let (tile_kind, mod_kind) = if m.name.contains("MemTile") {
+            (TileKind::Mem, ModuleKind::MemTile)
+        } else if m.name.contains("Shim") {
+            (TileKind::ShimNoc, ModuleKind::Shim)
+        } else {
+            (TileKind::Compute, ModuleKind::Memory)
+        };
+
+        let set_val_base = get_field(&m.fields, "LockSetValBase", &m.name);
+        let source = SourceAttribution {
+            origin: Source::AieRt,
+            file: "xaiemlgbl_reginit.c".into(),
+            detail: format!("{}.LockSetValBase", m.name),
+        };
+        confirmations.push((tile_kind, mod_kind, SubsystemKind::Lock, set_val_base, source));
+    }
+
+    xdna_archspec::confirm_subsystem_ranges(arch_model, &confirmations);
 
     gen_aiert_dma(&dma_modules, out_dir);
     gen_aiert_locks(&lock_modules, out_dir);
