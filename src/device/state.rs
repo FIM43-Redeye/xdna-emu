@@ -298,7 +298,7 @@ impl DeviceState {
                 let reg_layout = super::regdb::device_reg_layout();
                 let shim_ch_base = reg_layout.shim_channel_base;
                 let shim_ch_end = shim_ch_base + 4 * reg_layout.shim_channel_stride;
-                if tile_addr.row == 0 && (shim_ch_base..shim_ch_end).contains(&tile_addr.offset) {
+                if tile_addr.row == crate::arch::SHIM_ROW && (shim_ch_base..shim_ch_end).contains(&tile_addr.offset) {
                     self.write_shim_dma_channel(tile_addr.col, tile_addr.row, tile_addr.offset, value);
                 }
             }
@@ -387,7 +387,7 @@ impl DeviceState {
                 // Shim DMA channels at 0x1D200 (see write_register for details).
                 let shim_ch_base = reg_layout.shim_channel_base;
                 let shim_ch_end = shim_ch_base + 4 * reg_layout.shim_channel_stride;
-                if tile_addr.row == 0 && (shim_ch_base..shim_ch_end).contains(&tile_addr.offset) {
+                if tile_addr.row == crate::arch::SHIM_ROW && (shim_ch_base..shim_ch_end).contains(&tile_addr.offset) {
                     self.mask_write_shim_dma_channel(tile_addr.col, tile_addr.row, tile_addr.offset, mask, value);
                 } else {
                     // Read-modify-write: preserve bits not covered by mask.
@@ -605,7 +605,7 @@ impl DeviceState {
         let rel = offset - reg_layout.memory_channel_base;
         let ch_idx = (rel / reg_layout.memory_channel_stride) as usize;
         let is_start_queue = (rel % reg_layout.memory_channel_stride) >= 4;
-        let is_s2mm = ch_idx < 2; // First 2 channels are S2MM
+        let is_s2mm = ch_idx < crate::arch::compute::NUM_DMA_CHANNELS as usize;
 
         let num_channels = self.array.get(col, row).map_or(0, |t| t.dma_channels.len());
         if ch_idx >= num_channels {
@@ -768,7 +768,7 @@ impl DeviceState {
         let rel = offset - reg_layout.shim_channel_base;
         let ch_idx = (rel / reg_layout.shim_channel_stride) as usize;
         let is_start_queue = (rel % reg_layout.shim_channel_stride) >= 4;
-        let is_s2mm = ch_idx < 2;
+        let is_s2mm = ch_idx < crate::arch::shim::NUM_DMA_CHANNELS as usize;
 
         let num_channels = self.array.get(col, row).map_or(0, |t| t.dma_channels.len());
         if ch_idx >= num_channels {
@@ -1269,7 +1269,7 @@ impl DeviceState {
         // Determine channel index and whether this is a start queue write
         let (ch_idx, is_start_queue) = self.decode_memtile_channel_offset(offset);
 
-        if ch_idx >= 12 {
+        if ch_idx >= crate::arch::memtile::NUM_DMA_CHANNELS as usize * 2 {
             return;
         }
 
@@ -1300,8 +1300,9 @@ impl DeviceState {
                         col, row, ch_idx, bd_idx,
                     );
                 } else {
-                    let dir = if ch_idx < 6 { "S2MM" } else { "MM2S" };
-                    let local_ch = if ch_idx < 6 { ch_idx } else { ch_idx - 6 };
+                    let mt_s2mm = crate::arch::memtile::NUM_DMA_CHANNELS as usize;
+                    let dir = if ch_idx < mt_s2mm { "S2MM" } else { "MM2S" };
+                    let local_ch = if ch_idx < mt_s2mm { ch_idx } else { ch_idx - mt_s2mm };
                     log::info!("CDO enqueued MemTile DMA {} ch {} BD {} repeat={} on tile ({},{})",
                         dir, local_ch, bd_idx, repeat_count, col, row);
                 }
@@ -1315,7 +1316,7 @@ impl DeviceState {
         let lay = &reg_layout.memtile_channel;
         let (ch_idx, is_start_queue) = self.decode_memtile_channel_offset(offset);
 
-        if ch_idx >= 12 {
+        if ch_idx >= crate::arch::memtile::NUM_DMA_CHANNELS as usize * 2 {
             return;
         }
 
@@ -1350,8 +1351,9 @@ impl DeviceState {
                         col, row, ch_idx, bd_idx,
                     );
                 } else {
-                    let dir = if ch_idx < 6 { "S2MM" } else { "MM2S" };
-                    let local_ch = if ch_idx < 6 { ch_idx } else { ch_idx - 6 };
+                    let mt_s2mm = crate::arch::memtile::NUM_DMA_CHANNELS as usize;
+                    let dir = if ch_idx < mt_s2mm { "S2MM" } else { "MM2S" };
+                    let local_ch = if ch_idx < mt_s2mm { ch_idx } else { ch_idx - mt_s2mm };
                     log::info!("CDO enqueued MemTile DMA {} ch {} BD {} repeat={} on tile ({},{})",
                         dir, local_ch, bd_idx, repeat_count, col, row);
                 }

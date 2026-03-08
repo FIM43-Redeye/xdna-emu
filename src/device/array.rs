@@ -1270,7 +1270,7 @@ impl TileArray {
             // Process ALL tiles - DMA master ports can receive data from any slave source
             // via local routes or direct connections. Removing the local_route_count guard
             // ensures compute tiles can receive stream data from MemTile.
-            let is_shim = self.tiles[i].row == 0;
+            let is_shim = self.tiles[i].row == crate::arch::SHIM_ROW;
 
             // Check DMA master ports for outgoing data
             let num_masters = self.tiles[i].stream_switch.masters.len();
