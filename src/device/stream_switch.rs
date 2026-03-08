@@ -73,7 +73,7 @@ pub enum PortType {
 }
 
 impl PortType {
-    /// Convert from the u8 encoding used in aie2_spec port layouts.
+    /// Convert from the u8 encoding used in arch port layouts.
     ///
     /// The encoding is:
     /// - 0: Core/Tile_Ctrl
@@ -479,7 +479,7 @@ pub struct StreamSwitch {
 impl StreamSwitch {
     /// Build ports from a spec layout.
     ///
-    /// This takes a slice of encoded port types from aie2_spec and converts
+    /// This takes a slice of encoded port types from the arch module and converts
     /// them into StreamPort instances with the correct indices and types.
     fn build_ports_from_spec(layout: &[u8], direction: PortDirection) -> Vec<StreamPort> {
         layout

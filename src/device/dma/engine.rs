@@ -1544,7 +1544,7 @@ impl DmaEngine {
         let offset = (addr as usize) % mem_size;
 
         // Record bank access for conflict detection
-        self.cycle_dma_banks |= crate::device::aie2_spec::banks_for_access(
+        self.cycle_dma_banks |= crate::device::banking::banks_for_access(
             offset as u32, bytes, self.num_banks,
         );
 
@@ -1696,7 +1696,7 @@ impl DmaEngine {
         let offset = (addr as usize) % mem_size;
 
         // Record bank access for conflict detection
-        self.cycle_dma_banks |= crate::device::aie2_spec::banks_for_access(
+        self.cycle_dma_banks |= crate::device::banking::banks_for_access(
             offset as u32, bytes, self.num_banks,
         );
 

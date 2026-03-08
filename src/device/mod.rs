@@ -47,7 +47,7 @@
 //! assert_eq!(addr.row, 2);
 //! ```
 
-pub mod aie2_spec;
+pub mod banking;
 pub mod arch_config;
 pub mod model;
 pub mod regdb;

@@ -1,14 +1,11 @@
-//! AIE2 (AIE-ML) Memory Banking Utilities
+//! AIE2 Memory Banking Utilities
 //!
 //! Interleaved banking functions for memory conflict detection.
-//! Bank counts and sizes are now in `crate::arch` (generated from ArchModel).
+//! Bank counts and sizes are in `crate::arch` (generated from ArchModel).
 //!
-//! All other constants previously in this module have been migrated:
-//! - **Timing** (lock, DMA, stream switch, route latency): `crate::arch::timing`
-//! - **Packet format** (stream header, control packet, FoT): `crate::arch::packet`,
-//!   `crate::arch::ctrl_packet`, `crate::arch::fot`
-//! - **Physical banking** (bank counts, sizes): `crate::arch::compute::PHYSICAL_BANKS`, etc.
-//! - **Stream switch ports**: `crate::arch::port_type`, `crate::arch::stream_switch`
+//! AIE2 uses 128-bit (16-byte) interleaved banking: consecutive 16-byte
+//! lines map to different physical banks, enabling parallel access from
+//! core load/store units and DMA engines.
 
 /// Compute the bank index for a local memory address.
 ///

@@ -9,8 +9,8 @@
 //! - `gen_core_module.rs`   -- core register offsets (included by `registers_spec.rs`)
 //! - `gen_memory_lock.rs`   -- memory module lock constants (included by `registers_spec.rs`)
 //! - `gen_memtile_lock.rs`  -- mem tile lock constants (included by `registers_spec.rs`)
-//! - `gen_stream_ports.rs`  -- port type arrays (included by `aie2_spec.rs`)
-//! - `gen_stream_ranges.rs` -- port range constants (included by `aie2_spec.rs`)
+//! - `gen_stream_ports.rs`  -- port type arrays (included by `arch` module)
+//! - `gen_stream_ranges.rs` -- port range constants (included by `arch` module)
 
 use std::collections::HashMap;
 use std::env;

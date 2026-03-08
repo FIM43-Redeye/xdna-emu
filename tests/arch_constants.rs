@@ -6,8 +6,8 @@
 //! Note: bank counts come from mlir-aie's getNumBanks(), which reports memory
 //! groups (4 for compute, 8 for memtile). AM020 documents physical 128-bit
 //! bank rows (8 for compute, 16 for memtile). Both are correct at different
-//! abstraction levels. aie2_spec.rs uses the AM020 physical count for bank
-//! conflict detection; this module exposes the device model values.
+//! abstraction levels. The `banking` module uses the AM020 physical count for
+//! bank conflict detection; the `arch` module exposes the device model values.
 
 use xdna_emu::arch;
 

@@ -11,7 +11,7 @@
 //! # Architecture Constants
 //!
 //! All constants are derived from AMD AM020 (AIE-ML Architecture Manual).
-//! See `aie2_spec` module for the authoritative values.
+//! See `crate::arch` module for the authoritative values.
 //!
 //! # Performance
 //!
@@ -1349,7 +1349,7 @@ impl Tile {
     pub fn record_dma_bank_access(&mut self, addr: u32, bytes: usize) {
         let nb = self.num_banks();
         if nb > 0 {
-            self.cycle_dma_banks |= crate::device::aie2_spec::banks_for_access(addr, bytes, nb);
+            self.cycle_dma_banks |= crate::device::banking::banks_for_access(addr, bytes, nb);
         }
     }
 

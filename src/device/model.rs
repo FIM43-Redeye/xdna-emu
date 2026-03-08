@@ -283,7 +283,7 @@ impl std::error::Error for DeviceModelError {}
 // ---------------------------------------------------------------------------
 
 /// Validate that a parsed NPU1 device model contains the expected reference
-/// values. These values were originally validated against our aie2_spec
+/// values. These values were originally validated against our architecture
 /// constants and are now checked directly as regression guards -- if the
 /// model JSON is regenerated and values change unexpectedly, this catches it.
 ///
