@@ -1369,6 +1369,20 @@ main() {
     info "Skipped $skipped_npu2 npu2-only test(s)"
   fi
 
+  # ---- Phase 1b: Auto-rebuild plugin if Rust lib is newer ----------------
+
+  local rust_lib="$EMU_ROOT/target/release/libxdna_emu.so"
+  local installed_lib="$XRT_LIB/libxdna_emu.so"
+
+  if [[ -f "$rust_lib" ]]; then
+    if [[ ! -f "$installed_lib" ]] || [[ "$rust_lib" -nt "$installed_lib" ]]; then
+      info "Plugin outdated -- rebuilding from $rust_lib"
+      "$SCRIPT_DIR/rebuild-plugin.sh" 2>&1 | sed 's/^/  /'
+    fi
+  else
+    warn "No release build found -- run 'cargo build --release' first"
+  fi
+
   # ---- Phase 2: Compile --------------------------------------------------
 
   info "Phase 2: Compiling ${#runnable[@]} test(s) (-j${JOBS})"
