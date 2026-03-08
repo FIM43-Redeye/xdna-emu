@@ -36,7 +36,7 @@
 //! - FIFO buffering (data can be queued)
 //! - Basic latency (cycles for data to traverse)
 
-use crate::device::aie2_spec;
+use crate::arch::timing as arch_timing;
 
 /// Stream port direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,8 +146,8 @@ impl StreamPort {
     /// Create a new stream port.
     pub fn new(index: u8, direction: PortDirection, port_type: PortType) -> Self {
         let fifo_capacity = match direction {
-            PortDirection::Master => aie2_spec::STREAM_LOCAL_MASTER_FIFO_DEPTH as usize,
-            PortDirection::Slave => aie2_spec::STREAM_LOCAL_SLAVE_FIFO_DEPTH as usize,
+            PortDirection::Master => arch_timing::STREAM_LOCAL_MASTER_FIFO_DEPTH as usize,
+            PortDirection::Slave => arch_timing::STREAM_LOCAL_SLAVE_FIFO_DEPTH as usize,
         };
 
         Self {
@@ -405,17 +405,17 @@ impl LocalRoute {
             slave_idx,
             master_idx,
             enabled: true,
-            latency: aie2_spec::STREAM_LOCAL_TO_LOCAL_LATENCY,
+            latency: arch_timing::STREAM_LOCAL_TO_LOCAL_LATENCY,
         }
     }
 
     /// Create a route with latency determined by port types.
     pub fn with_port_latency(slave_idx: u8, master_idx: u8, slave_type: &PortType, master_type: &PortType) -> Self {
         let latency = match (slave_type.is_external(), master_type.is_external()) {
-            (false, false) => aie2_spec::STREAM_LOCAL_TO_LOCAL_LATENCY,
-            (false, true)  => aie2_spec::STREAM_LOCAL_TO_EXTERNAL_LATENCY,
-            (true, false)  => aie2_spec::STREAM_LOCAL_TO_LOCAL_LATENCY, // ext->local same as local->local
-            (true, true)   => aie2_spec::STREAM_EXTERNAL_TO_EXTERNAL_LATENCY,
+            (false, false) => arch_timing::STREAM_LOCAL_TO_LOCAL_LATENCY,
+            (false, true)  => arch_timing::STREAM_LOCAL_TO_EXTERNAL_LATENCY,
+            (true, false)  => arch_timing::STREAM_LOCAL_TO_LOCAL_LATENCY, // ext->local same as local->local
+            (true, true)   => arch_timing::STREAM_EXTERNAL_TO_EXTERNAL_LATENCY,
         };
         Self { slave_idx, master_idx, enabled: true, latency }
     }
@@ -493,7 +493,7 @@ impl StreamSwitch {
 
     /// Create a new stream switch for a compute tile.
     ///
-    /// Port layout is defined in aie2_spec::{COMPUTE_MASTER_PORTS, COMPUTE_SLAVE_PORTS}.
+    /// Port layout is defined in arch::{COMPUTE_MASTER_PORTS, COMPUTE_SLAVE_PORTS}.
     /// Port 3 (master and slave) is Tile_Ctrl, not Core.
     pub fn new_compute_tile(col: u8, row: u8) -> Self {
         let mut masters = Self::build_ports_from_spec(crate::arch::COMPUTE_MASTER_PORTS, PortDirection::Master);
@@ -511,8 +511,8 @@ impl StreamSwitch {
             masters,
             slaves,
             local_routes: Vec::new(),
-            local_latency: aie2_spec::STREAM_LOCAL_TO_LOCAL_LATENCY,
-            external_latency: aie2_spec::STREAM_LOCAL_TO_EXTERNAL_LATENCY,
+            local_latency: arch_timing::STREAM_LOCAL_TO_LOCAL_LATENCY,
+            external_latency: arch_timing::STREAM_LOCAL_TO_EXTERNAL_LATENCY,
             slave_slots: vec![[PacketSlot::default(); 4]; num_slaves],
             master_packet_config: vec![MasterPacketConfig::default(); num_masters],
             active_packets: vec![None; num_slaves],
@@ -524,7 +524,7 @@ impl StreamSwitch {
 
     /// Create a new stream switch for a memory tile.
     ///
-    /// Port layout is defined in aie2_spec::{MEMTILE_MASTER_PORTS, MEMTILE_SLAVE_PORTS}.
+    /// Port layout is defined in arch::{MEMTILE_MASTER_PORTS, MEMTILE_SLAVE_PORTS}.
     /// Port 6 (master and slave) is Tile_Ctrl, not Core.
     ///
     /// Note the asymmetry: 6 North masters but only 4 North slaves, and
@@ -546,8 +546,8 @@ impl StreamSwitch {
             masters,
             slaves,
             local_routes: Vec::new(),
-            local_latency: aie2_spec::STREAM_LOCAL_TO_LOCAL_LATENCY,
-            external_latency: aie2_spec::STREAM_LOCAL_TO_EXTERNAL_LATENCY,
+            local_latency: arch_timing::STREAM_LOCAL_TO_LOCAL_LATENCY,
+            external_latency: arch_timing::STREAM_LOCAL_TO_EXTERNAL_LATENCY,
             slave_slots: vec![[PacketSlot::default(); 4]; num_slaves],
             master_packet_config: vec![MasterPacketConfig::default(); num_masters],
             active_packets: vec![None; num_slaves],
@@ -559,7 +559,7 @@ impl StreamSwitch {
 
     /// Create a new stream switch for a shim tile.
     ///
-    /// Port layout is defined in aie2_spec::{SHIM_MASTER_PORTS, SHIM_SLAVE_PORTS}.
+    /// Port layout is defined in arch::{SHIM_MASTER_PORTS, SHIM_SLAVE_PORTS}.
     /// Port 0 (master and slave) is Tile_Ctrl, not Core.
     ///
     /// The 6 North masters (12-17) connect 1:1 to MemTile South slaves (7-12).
@@ -579,8 +579,8 @@ impl StreamSwitch {
             masters,
             slaves,
             local_routes: Vec::new(),
-            local_latency: aie2_spec::STREAM_LOCAL_TO_LOCAL_LATENCY,
-            external_latency: aie2_spec::STREAM_EXTERNAL_TO_EXTERNAL_LATENCY,
+            local_latency: arch_timing::STREAM_LOCAL_TO_LOCAL_LATENCY,
+            external_latency: arch_timing::STREAM_EXTERNAL_TO_EXTERNAL_LATENCY,
             slave_slots: vec![[PacketSlot::default(); 4]; num_slaves],
             master_packet_config: vec![MasterPacketConfig::default(); num_masters],
             active_packets: vec![None; num_slaves],
@@ -1262,23 +1262,23 @@ impl PacketHeader {
         let mut word: u32 = 0;
 
         // Stream ID: bits 4-0
-        word |= (self.stream_id as u32) & aie2_spec::PACKET_STREAM_ID_MASK;
+        word |= (self.stream_id as u32) & crate::arch::packet::STREAM_ID_MASK;
 
         // Packet Type: bits 14-12
-        word |= ((self.packet_type as u32) & aie2_spec::PACKET_TYPE_MASK)
-            << aie2_spec::PACKET_TYPE_SHIFT;
+        word |= ((self.packet_type as u32) & crate::arch::packet::TYPE_MASK)
+            << crate::arch::packet::TYPE_SHIFT as usize;
 
         // Source Row: bits 20-16
-        word |= ((self.src_row as u32) & aie2_spec::PACKET_SRC_ROW_MASK)
-            << aie2_spec::PACKET_SRC_ROW_SHIFT;
+        word |= ((self.src_row as u32) & crate::arch::packet::SRC_ROW_MASK)
+            << crate::arch::packet::SRC_ROW_SHIFT as usize;
 
         // Source Column: bits 27-21
-        word |= ((self.src_col as u32) & aie2_spec::PACKET_SRC_COL_MASK)
-            << aie2_spec::PACKET_SRC_COL_SHIFT;
+        word |= ((self.src_col as u32) & crate::arch::packet::SRC_COL_MASK)
+            << crate::arch::packet::SRC_COL_SHIFT as usize;
 
         // Calculate odd parity over bits 30-0
         let parity = (word.count_ones() & 1) ^ 1; // Odd parity
-        word |= parity << aie2_spec::PACKET_PARITY_SHIFT;
+        word |= parity << crate::arch::packet::PARITY_SHIFT as usize;
 
         word
     }
@@ -1288,17 +1288,17 @@ impl PacketHeader {
     /// Returns (header, parity_ok) tuple.
     pub fn decode(word: u32) -> (Self, bool) {
         // Extract fields
-        let stream_id = (word & aie2_spec::PACKET_STREAM_ID_MASK) as u8;
+        let stream_id = (word & crate::arch::packet::STREAM_ID_MASK) as u8;
 
         let packet_type = PacketType::from_u8(
-            ((word >> aie2_spec::PACKET_TYPE_SHIFT) & aie2_spec::PACKET_TYPE_MASK) as u8,
+            ((word >> crate::arch::packet::TYPE_SHIFT as usize) & crate::arch::packet::TYPE_MASK) as u8,
         );
 
         let src_row =
-            ((word >> aie2_spec::PACKET_SRC_ROW_SHIFT) & aie2_spec::PACKET_SRC_ROW_MASK) as u8;
+            ((word >> crate::arch::packet::SRC_ROW_SHIFT as usize) & crate::arch::packet::SRC_ROW_MASK) as u8;
 
         let src_col =
-            ((word >> aie2_spec::PACKET_SRC_COL_SHIFT) & aie2_spec::PACKET_SRC_COL_MASK) as u8;
+            ((word >> crate::arch::packet::SRC_COL_SHIFT as usize) & crate::arch::packet::SRC_COL_MASK) as u8;
 
         // Check parity (odd parity means total 1-bits should be odd)
         let parity_ok = word.count_ones() & 1 == 1;
@@ -1433,7 +1433,7 @@ impl PacketSwitch {
         if let Some(dests) = self.lookup(header.stream_id) {
             let dest_vec = dests.to_vec();
             self.current_packet = Some((header, 0));
-            self.arb_delay = aie2_spec::PACKET_ARBITRATION_OVERHEAD_CYCLES;
+            self.arb_delay = arch_timing::PACKET_ARBITRATION_OVERHEAD;
             Some((header, dest_vec))
         } else {
             // No route for this stream ID

@@ -1550,7 +1550,7 @@ impl TileArray {
 
         // Pop words from source masters into the inter-tile pipeline.
         // Words will be delivered after ROUTE_LATENCY_PER_HOP cycles.
-        use super::aie2_spec::ROUTE_LATENCY_PER_HOP;
+        use crate::arch::timing::ROUTE_PER_HOP as ROUTE_LATENCY_PER_HOP;
 
         for (src_col, src_row, src_master, dst_col, dst_row, dst_slave, _data, _tlast) in transfers {
             let src_idx = self.tile_index(src_col, src_row);

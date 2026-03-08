@@ -39,11 +39,8 @@
 //! - 16-bit halfword: requires 2-byte alignment
 //! - Unaligned access is undefined behavior (may fault or produce wrong results)
 
-use crate::device::aie2_spec;
-
 /// Number of physical memory banks per compute tile (for conflict detection).
-/// TODO: migrate to arch::compute::PHYSICAL_BANKS when physical banking flows through the graph.
-pub const NUM_BANKS: usize = aie2_spec::COMPUTE_TILE_MEMORY_BANKS;
+pub const NUM_BANKS: usize = crate::arch::compute::PHYSICAL_BANKS as usize;
 
 // ============================================================================
 // Cross-Tile Memory Access Latency (AM020 Ch4)
@@ -71,7 +68,7 @@ pub const QUADRANT_SIZE: u32 = 0x10000;
 
 /// Latency for accessing neighbor tile memory (1 hop).
 /// Per AM020 Ch2: local-to-external routing is 4 cycles.
-pub const CROSS_TILE_LATENCY: u8 = aie2_spec::ROUTE_LATENCY_LOCAL_TO_EXTERNAL;
+pub const CROSS_TILE_LATENCY: u8 = crate::arch::timing::ROUTE_LOCAL_TO_EXTERNAL;
 
 /// Memory quadrant (which tile's memory is being accessed).
 ///
@@ -139,13 +136,13 @@ impl MemoryQuadrant {
 }
 
 /// Size of each bank in bytes.
-pub const BANK_SIZE: usize = aie2_spec::COMPUTE_TILE_BANK_SIZE;
+pub const BANK_SIZE: usize = crate::arch::compute::PHYSICAL_BANK_SIZE as usize;
 
 /// Bank width in bytes (128 bits = 16 bytes).
-pub const BANK_WIDTH_BYTES: usize = aie2_spec::MEMORY_BANK_WIDTH_BITS / 8;
+pub const BANK_WIDTH_BYTES: usize = 128 / 8; // TODO: generate from ArchModel bank_width_bits
 
 /// Base memory access latency (cycles).
-pub const BASE_LATENCY: u8 = aie2_spec::LATENCY_DATA_MEMORY;
+pub const BASE_LATENCY: u8 = crate::arch::timing::DATA_MEMORY_LATENCY;
 
 /// Additional stall cycles on bank conflict.
 pub const CONFLICT_PENALTY: u8 = 1;

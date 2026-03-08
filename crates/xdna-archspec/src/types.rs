@@ -188,6 +188,9 @@ pub enum Source {
     AieRt,
     DeviceModel,
     TableGen,
+    /// Hand-written constants from AM020 architecture manual prose.
+    /// Used for values with no machine-readable source (timing, packet format).
+    Am020,
 }
 
 impl fmt::Display for Source {
@@ -197,6 +200,7 @@ impl fmt::Display for Source {
             Self::AieRt => write!(f, "aie-rt"),
             Self::DeviceModel => write!(f, "device model"),
             Self::TableGen => write!(f, "TableGen"),
+            Self::Am020 => write!(f, "AM020 manual"),
         }
     }
 }
@@ -940,6 +944,176 @@ impl DmaChannelSchema {
     }
 }
 
+// ============================================================================
+// Timing, packet format, and FoT models (AM020-sourced)
+// ============================================================================
+
+/// Lock subsystem timing constants.
+///
+/// Source: AM020 Ch2 ("The lock module can handle a new request every clock
+/// cycle"). These have no machine-readable source -- they come from
+/// architecture manual prose and hardware observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockTiming {
+    /// Uncontested acquire latency in cycles.
+    pub acquire_latency: u8,
+    /// Release latency in cycles.
+    pub release_latency: u8,
+    /// Retry interval when acquire fails (core stalls and retries each cycle).
+    pub retry_interval: u8,
+}
+
+/// DMA engine timing constants.
+///
+/// Source: AM020 Ch2 (architecture description) and hardware observation
+/// (host memory latency from trace comparison).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DmaTiming {
+    /// Cycles to parse and configure a buffer descriptor.
+    pub bd_setup_cycles: u8,
+    /// Cycles from start trigger to first data.
+    pub channel_start_cycles: u8,
+    /// Throughput: words (32-bit) per cycle per channel.
+    pub words_per_cycle: u8,
+    /// Memory access latency in cycles (same as data memory pipeline depth).
+    pub memory_latency_cycles: u8,
+    /// Cycles to check and acquire a lock.
+    pub lock_acquire_cycles: u8,
+    /// Cycles to release a lock.
+    pub lock_release_cycles: u8,
+    /// Cycles between finishing one BD and starting next in chain.
+    pub bd_chain_cycles: u8,
+    /// Extra cycles for shim tile DDR access (initial pipeline fill penalty).
+    /// Derived from trace comparison: ~110cy observed minus ~10cy already
+    /// covered by bd_setup + memory_latency.
+    pub host_memory_latency_cycles: u16,
+}
+
+/// Stream switch timing and physical constants.
+///
+/// Source: AM020 Ch2 ("Local slave ports are 2-cycle latency and a 4-deep
+/// FIFO", "Local master ports have 1-cycle latency and a 2-deep FIFO").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamSwitchTiming {
+    /// Slave port FIFO depth (words).
+    pub local_slave_fifo_depth: u8,
+    /// Master port FIFO depth (words).
+    pub local_master_fifo_depth: u8,
+    /// Local slave to local master latency in cycles.
+    pub local_to_local_latency: u8,
+    /// Local slave to external master latency in cycles.
+    pub local_to_external_latency: u8,
+    /// External slave to external master latency in cycles.
+    pub external_to_external_latency: u8,
+    /// External slave to local master latency in cycles.
+    pub external_to_local_latency: u8,
+    /// Packet switch arbitration overhead per packet header.
+    pub packet_arbitration_overhead: u8,
+}
+
+/// Instruction-level timing constants.
+///
+/// Source: AM020 Ch4 ("Load and store units manage the 5-cycle latency of
+/// data memory").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstructionTiming {
+    /// Data memory access pipeline depth in cycles.
+    pub data_memory_latency: u8,
+    /// Branch penalty: cycles lost when a branch is taken.
+    pub branch_penalty: u8,
+}
+
+/// Complete timing model for one architecture.
+///
+/// All values sourced from AM020 prose and hardware observation. No
+/// machine-readable source exists for these constants. Structured so
+/// that if a data source is found later, values can be cross-validated
+/// via `Confirmed<T>` without changing the generated output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimingModel {
+    pub lock: LockTiming,
+    pub dma: DmaTiming,
+    pub stream_switch: StreamSwitchTiming,
+    pub instruction: InstructionTiming,
+    pub source: SourceAttribution,
+}
+
+/// Stream packet header bit layout.
+///
+/// 32-bit header: parity(31) | rsvd(30-28) | src_col(27-21) |
+/// src_row(20-16) | rsvd(15) | pkt_type(14-12) | rsvd(11-5) | stream_id(4-0)
+///
+/// Source: AM020 Ch2, Table 2. Also confirmed in mlir-aie
+/// `AIETargetNPU.cpp:309-336` (packet header construction).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamPacketFormat {
+    pub stream_id_mask: u32,
+    pub packet_type_shift: u8,
+    pub packet_type_mask: u32,
+    pub src_row_shift: u8,
+    pub src_row_mask: u32,
+    pub src_col_shift: u8,
+    pub src_col_mask: u32,
+    pub parity_shift: u8,
+}
+
+/// Control packet header bit layout and operation codes.
+///
+/// Control packets reprogram tile registers at runtime via the
+/// TileControl stream master port.
+///
+/// Source: AM020 Table 3. Operation codes not found in any open-source
+/// toolchain code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlPacketFormat {
+    /// Address field mask (bits 19:0).
+    pub address_mask: u32,
+    /// Length field shift (bits 21:20, value+1 = beats).
+    pub length_shift: u8,
+    pub length_mask: u32,
+    /// Operation field shift (bits 23:22).
+    pub operation_shift: u8,
+    pub operation_mask: u32,
+    /// Response_ID field shift (bits 30:24).
+    pub response_id_shift: u8,
+    pub response_id_mask: u32,
+    /// Parity bit position (bit 31).
+    pub parity_bit: u8,
+    /// Operation code: write data to register(s).
+    pub op_write: u8,
+    /// Operation code: read register.
+    pub op_read: u8,
+    /// Operation code: write with auto-increment address.
+    pub op_write_incr: u8,
+    /// Operation code: block write.
+    pub op_block_write: u8,
+}
+
+/// DMA Finish-on-TLAST mode values.
+///
+/// Source: AM025 DMA_S2MM_x_Ctrl.FoT_Mode field (confirmed in aie-rt
+/// `xaiegbl.h:419-424`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FotConfig {
+    /// FoT disabled: channel runs until BD transfer count is exhausted.
+    pub disabled: u8,
+    /// Transfer finishes on TLAST regardless of count.
+    pub no_counts: u8,
+    /// Finish on TLAST, issue task-complete token.
+    pub counts_with_tokens: u8,
+    /// Length comes from a separate count register.
+    pub counts_from_register: u8,
+}
+
+/// Complete packet and protocol format model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PacketModel {
+    pub stream: StreamPacketFormat,
+    pub control: ControlPacketFormat,
+    pub fot: FotConfig,
+    pub source: SourceAttribution,
+}
+
 /// Device-level hardware constants.
 ///
 /// These are properties of the device as a whole, not of any specific tile.
@@ -1155,6 +1329,10 @@ pub struct ArchModel {
     pub tile_types: Vec<TileTypeModel>,
     pub array_topology: Option<ArrayTopology>,
     pub device_constants: Option<DeviceConstants>,
+    /// Timing model (lock, DMA, stream switch, instruction latencies).
+    pub timing: Option<TimingModel>,
+    /// Packet format model (stream headers, control packets, FoT modes).
+    pub packet: Option<PacketModel>,
     pub relationships: Vec<Relationship>,
 }
 
@@ -1169,6 +1347,8 @@ impl ArchModel {
             tile_types: Vec::new(),
             array_topology: None,
             device_constants: None,
+            timing: None,
+            packet: None,
             relationships: Vec::new(),
         }
     }

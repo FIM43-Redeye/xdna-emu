@@ -824,9 +824,9 @@ impl Transfer {
 ///
 /// Returns (col, row) extracted from header bits 27:21 and 20:16.
 pub fn parse_source_tile_from_header(header: u32) -> (u8, u8) {
-    use crate::device::aie2_spec;
-    let col = ((header >> aie2_spec::PACKET_SRC_COL_SHIFT) & aie2_spec::PACKET_SRC_COL_MASK) as u8;
-    let row = ((header >> aie2_spec::PACKET_SRC_ROW_SHIFT) & aie2_spec::PACKET_SRC_ROW_MASK) as u8;
+    use crate::arch::packet;
+    let col = ((header >> packet::SRC_COL_SHIFT) & packet::SRC_COL_MASK) as u8;
+    let row = ((header >> packet::SRC_ROW_SHIFT) & packet::SRC_ROW_MASK) as u8;
     (col, row)
 }
 
@@ -834,16 +834,16 @@ pub fn parse_source_tile_from_header(header: u32) -> (u8, u8) {
 ///
 /// Returns the 3-bit packet type from bits 14:12.
 pub fn parse_packet_type_from_header(header: u32) -> u8 {
-    use crate::device::aie2_spec;
-    ((header >> aie2_spec::PACKET_TYPE_SHIFT) & aie2_spec::PACKET_TYPE_MASK) as u8
+    use crate::arch::packet;
+    ((header >> packet::TYPE_SHIFT) & packet::TYPE_MASK) as u8
 }
 
 /// Parse stream/packet ID from a packet header (AM020 Table 2).
 ///
 /// Returns the 5-bit stream ID from bits 4:0.
 pub fn parse_stream_id_from_header(header: u32) -> u8 {
-    use crate::device::aie2_spec;
-    (header & aie2_spec::PACKET_STREAM_ID_MASK) as u8
+    use crate::arch::packet;
+    (header & packet::STREAM_ID_MASK) as u8
 }
 
 #[cfg(test)]

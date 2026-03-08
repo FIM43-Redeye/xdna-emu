@@ -192,6 +192,95 @@ fn gen_arch(model: &xdna_archspec::types::ArchModel, out_dir: &Path) {
         writeln!(out, "}}\n").unwrap();
     }
 
+    // -- Timing model --
+    if let Some(ref t) = model.timing {
+        writeln!(out, "/// Timing constants (AM020 prose + hardware observation).").unwrap();
+        writeln!(out, "pub mod timing {{").unwrap();
+
+        writeln!(out, "    // Lock timing").unwrap();
+        writeln!(out, "    pub const LOCK_ACQUIRE_LATENCY: u8 = {};", t.lock.acquire_latency).unwrap();
+        writeln!(out, "    pub const LOCK_RELEASE_LATENCY: u8 = {};", t.lock.release_latency).unwrap();
+        writeln!(out, "    pub const LOCK_RETRY_INTERVAL: u8 = {};", t.lock.retry_interval).unwrap();
+        writeln!(out).unwrap();
+
+        writeln!(out, "    // Instruction timing").unwrap();
+        writeln!(out, "    /// Data memory access pipeline depth.").unwrap();
+        writeln!(out, "    pub const DATA_MEMORY_LATENCY: u8 = {};", t.instruction.data_memory_latency).unwrap();
+        writeln!(out, "    /// Branch penalty: cycles lost on taken branch.").unwrap();
+        writeln!(out, "    pub const BRANCH_PENALTY: u8 = {};", t.instruction.branch_penalty).unwrap();
+        writeln!(out).unwrap();
+
+        writeln!(out, "    // DMA timing").unwrap();
+        writeln!(out, "    pub const DMA_BD_SETUP_CYCLES: u8 = {};", t.dma.bd_setup_cycles).unwrap();
+        writeln!(out, "    pub const DMA_CHANNEL_START_CYCLES: u8 = {};", t.dma.channel_start_cycles).unwrap();
+        writeln!(out, "    pub const DMA_WORDS_PER_CYCLE: u8 = {};", t.dma.words_per_cycle).unwrap();
+        writeln!(out, "    pub const DMA_MEMORY_LATENCY_CYCLES: u8 = {};", t.dma.memory_latency_cycles).unwrap();
+        writeln!(out, "    pub const DMA_LOCK_ACQUIRE_CYCLES: u8 = {};", t.dma.lock_acquire_cycles).unwrap();
+        writeln!(out, "    pub const DMA_LOCK_RELEASE_CYCLES: u8 = {};", t.dma.lock_release_cycles).unwrap();
+        writeln!(out, "    pub const DMA_BD_CHAIN_CYCLES: u8 = {};", t.dma.bd_chain_cycles).unwrap();
+        writeln!(out, "    pub const DMA_HOST_MEMORY_LATENCY_CYCLES: u16 = {};", t.dma.host_memory_latency_cycles).unwrap();
+        writeln!(out).unwrap();
+
+        writeln!(out, "    // Stream switch timing").unwrap();
+        writeln!(out, "    pub const STREAM_LOCAL_SLAVE_FIFO_DEPTH: u8 = {};", t.stream_switch.local_slave_fifo_depth).unwrap();
+        writeln!(out, "    pub const STREAM_LOCAL_MASTER_FIFO_DEPTH: u8 = {};", t.stream_switch.local_master_fifo_depth).unwrap();
+        writeln!(out, "    pub const STREAM_LOCAL_TO_LOCAL_LATENCY: u8 = {};", t.stream_switch.local_to_local_latency).unwrap();
+        writeln!(out, "    pub const STREAM_LOCAL_TO_EXTERNAL_LATENCY: u8 = {};", t.stream_switch.local_to_external_latency).unwrap();
+        writeln!(out, "    pub const STREAM_EXTERNAL_TO_EXTERNAL_LATENCY: u8 = {};", t.stream_switch.external_to_external_latency).unwrap();
+        writeln!(out, "    pub const STREAM_EXTERNAL_TO_LOCAL_LATENCY: u8 = {};", t.stream_switch.external_to_local_latency).unwrap();
+        writeln!(out, "    pub const PACKET_ARBITRATION_OVERHEAD: u8 = {};", t.stream_switch.packet_arbitration_overhead).unwrap();
+        writeln!(out).unwrap();
+
+        writeln!(out, "    // Route latency (derived from stream switch timing)").unwrap();
+        writeln!(out, "    pub const ROUTE_LOCAL_TO_LOCAL: u8 = STREAM_LOCAL_TO_LOCAL_LATENCY;").unwrap();
+        writeln!(out, "    pub const ROUTE_LOCAL_TO_EXTERNAL: u8 = STREAM_LOCAL_TO_EXTERNAL_LATENCY;").unwrap();
+        writeln!(out, "    pub const ROUTE_EXTERNAL_TO_LOCAL: u8 = STREAM_EXTERNAL_TO_LOCAL_LATENCY;").unwrap();
+        writeln!(out, "    pub const ROUTE_EXTERNAL_TO_EXTERNAL: u8 = STREAM_EXTERNAL_TO_EXTERNAL_LATENCY;").unwrap();
+        writeln!(out, "    pub const ROUTE_PER_HOP: u8 = ROUTE_EXTERNAL_TO_EXTERNAL;").unwrap();
+
+        writeln!(out, "}}\n").unwrap();
+    }
+
+    // -- Packet format --
+    if let Some(ref p) = model.packet {
+        writeln!(out, "/// Stream packet header bit layout (AM020 Table 2).").unwrap();
+        writeln!(out, "pub mod packet {{").unwrap();
+        writeln!(out, "    pub const STREAM_ID_MASK: u32 = {:#X};", p.stream.stream_id_mask).unwrap();
+        writeln!(out, "    pub const TYPE_SHIFT: u8 = {};", p.stream.packet_type_shift).unwrap();
+        writeln!(out, "    pub const TYPE_MASK: u32 = {:#X};", p.stream.packet_type_mask).unwrap();
+        writeln!(out, "    pub const SRC_ROW_SHIFT: u8 = {};", p.stream.src_row_shift).unwrap();
+        writeln!(out, "    pub const SRC_ROW_MASK: u32 = {:#X};", p.stream.src_row_mask).unwrap();
+        writeln!(out, "    pub const SRC_COL_SHIFT: u8 = {};", p.stream.src_col_shift).unwrap();
+        writeln!(out, "    pub const SRC_COL_MASK: u32 = {:#X};", p.stream.src_col_mask).unwrap();
+        writeln!(out, "    pub const PARITY_SHIFT: u8 = {};", p.stream.parity_shift).unwrap();
+        writeln!(out, "}}\n").unwrap();
+
+        writeln!(out, "/// Control packet header format and operation codes (AM020 Table 3).").unwrap();
+        writeln!(out, "pub mod ctrl_packet {{").unwrap();
+        writeln!(out, "    pub const ADDRESS_MASK: u32 = {:#010X};", p.control.address_mask).unwrap();
+        writeln!(out, "    pub const LENGTH_SHIFT: u8 = {};", p.control.length_shift).unwrap();
+        writeln!(out, "    pub const LENGTH_MASK: u32 = {:#X};", p.control.length_mask).unwrap();
+        writeln!(out, "    pub const OPERATION_SHIFT: u8 = {};", p.control.operation_shift).unwrap();
+        writeln!(out, "    pub const OPERATION_MASK: u32 = {:#X};", p.control.operation_mask).unwrap();
+        writeln!(out, "    pub const RESPONSE_ID_SHIFT: u8 = {};", p.control.response_id_shift).unwrap();
+        writeln!(out, "    pub const RESPONSE_ID_MASK: u32 = {:#X};", p.control.response_id_mask).unwrap();
+        writeln!(out, "    pub const PARITY_BIT: u8 = {};", p.control.parity_bit).unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "    pub const OP_WRITE: u8 = {};", p.control.op_write).unwrap();
+        writeln!(out, "    pub const OP_READ: u8 = {};", p.control.op_read).unwrap();
+        writeln!(out, "    pub const OP_WRITE_INCR: u8 = {};", p.control.op_write_incr).unwrap();
+        writeln!(out, "    pub const OP_BLOCK_WRITE: u8 = {};", p.control.op_block_write).unwrap();
+        writeln!(out, "}}\n").unwrap();
+
+        writeln!(out, "/// DMA Finish-on-TLAST mode values (AM025 + aie-rt).").unwrap();
+        writeln!(out, "pub mod fot {{").unwrap();
+        writeln!(out, "    pub const DISABLED: u8 = {};", p.fot.disabled).unwrap();
+        writeln!(out, "    pub const NO_COUNTS: u8 = {};", p.fot.no_counts).unwrap();
+        writeln!(out, "    pub const COUNTS_WITH_TOKENS: u8 = {};", p.fot.counts_with_tokens).unwrap();
+        writeln!(out, "    pub const COUNTS_FROM_REGISTER: u8 = {};", p.fot.counts_from_register).unwrap();
+        writeln!(out, "}}\n").unwrap();
+    }
+
     fs::write(out_dir.join("gen_arch.rs"), out).unwrap();
 }
 

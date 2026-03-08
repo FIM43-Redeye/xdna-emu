@@ -33,5 +33,128 @@ pub fn build_arch_model(
     let mut model = device_model::extract_device_model(device_model_path, device_name)
         .map_err(|e| format!("Device model extraction failed: {}", e))?;
     regdb_extractor::populate_tile_modules(&mut model, regdb);
+    populate_manual_constants(&mut model);
     Ok(model)
+}
+
+/// Populate architecture constants that have no machine-readable source.
+///
+/// These values come from AM020 prose, AM025 register descriptions, and
+/// hardware observation. They are hand-written here so that ArchModel is
+/// the single home for all architecture data regardless of provenance.
+///
+/// When a data-driven extractor is added for any of these values, it
+/// should call `Confirmed::confirm()` to cross-validate against the
+/// hand-written baseline.
+fn populate_manual_constants(model: &mut types::ArchModel) {
+    match model.arch {
+        types::Architecture::Aie2 => populate_aie2_manual_constants(model),
+        // Other architectures: add population functions as needed.
+        _ => {}
+    }
+}
+
+fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
+    use types::*;
+
+    let src = SourceAttribution {
+        origin: Source::Am020,
+        file: "AM020 AIE-ML Architecture Manual".into(),
+        detail: "hand-written constants (Ch2, Ch4, Table 2, Table 3)".into(),
+    };
+
+    // -- Physical banking --
+    // Device model provides logical banking (from mlir-aie). Physical
+    // banking comes from AM020 Ch2: "8 memory banks" for compute tiles,
+    // 16 for memtiles, each 128 bits wide.
+    let phys_src = SourceAttribution {
+        origin: Source::Am020,
+        file: "AM020 AIE-ML Architecture Manual".into(),
+        detail: "Ch2: physical SRAM bank organization".into(),
+    };
+    for tile_type in &mut model.tile_types {
+        if let Some(ref mut mem) = tile_type.memory {
+            let (num_banks, bank_size) = match tile_type.kind {
+                TileKind::Compute => (8u8, 8 * 1024u64),   // 64KB / 8 banks
+                TileKind::Mem => (16u8, 32 * 1024u64),     // 512KB / 16 banks
+                _ => continue,
+            };
+            if mem.physical.is_none() {
+                mem.physical = Some(BankingModel {
+                    num_banks,
+                    bank_size,
+                    bank_width_bits: 128,
+                    source: phys_src.clone(),
+                });
+            }
+        }
+    }
+
+    // -- Timing model --
+    model.timing = Some(TimingModel {
+        lock: LockTiming {
+            acquire_latency: 1,
+            release_latency: 1,
+            retry_interval: 1,
+        },
+        dma: DmaTiming {
+            bd_setup_cycles: 4,
+            channel_start_cycles: 2,
+            words_per_cycle: 1,
+            memory_latency_cycles: 5,
+            lock_acquire_cycles: 1,
+            lock_release_cycles: 1,
+            bd_chain_cycles: 2,
+            host_memory_latency_cycles: 100,
+        },
+        stream_switch: StreamSwitchTiming {
+            local_slave_fifo_depth: 4,
+            local_master_fifo_depth: 2,
+            local_to_local_latency: 3,
+            local_to_external_latency: 4,
+            external_to_external_latency: 4,
+            external_to_local_latency: 3,
+            packet_arbitration_overhead: 1,
+        },
+        instruction: InstructionTiming {
+            data_memory_latency: 5,
+            branch_penalty: 3,
+        },
+        source: src.clone(),
+    });
+
+    // -- Packet and protocol model --
+    model.packet = Some(PacketModel {
+        stream: StreamPacketFormat {
+            stream_id_mask: 0x1F,
+            packet_type_shift: 12,
+            packet_type_mask: 0x7,
+            src_row_shift: 16,
+            src_row_mask: 0x1F,
+            src_col_shift: 21,
+            src_col_mask: 0x7F,
+            parity_shift: 31,
+        },
+        control: ControlPacketFormat {
+            address_mask: 0x000F_FFFF,
+            length_shift: 20,
+            length_mask: 0x3,
+            operation_shift: 22,
+            operation_mask: 0x3,
+            response_id_shift: 24,
+            response_id_mask: 0x7F,
+            parity_bit: 31,
+            op_write: 0,
+            op_read: 1,
+            op_write_incr: 2,
+            op_block_write: 3,
+        },
+        fot: FotConfig {
+            disabled: 0,
+            no_counts: 1,
+            counts_with_tokens: 2,
+            counts_from_register: 3,
+        },
+        source: src,
+    });
 }

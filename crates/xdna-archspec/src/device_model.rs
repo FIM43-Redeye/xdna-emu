@@ -245,6 +245,8 @@ fn extract_device(name: &str, value: &Value, file: &str) -> Result<ArchModel, Ex
         tile_types,
         array_topology: Some(topology),
         device_constants: Some(constants),
+        timing: None,
+        packet: None,
         relationships: Vec::new(),
     })
 }

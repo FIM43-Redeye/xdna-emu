@@ -80,8 +80,7 @@ pub mod memory_module {
     // DMA channel status register fields are now data-driven via
     // `regdb::device_reg_layout().memory_status` (StatusFieldLayout).
     //
-    // FoT mode enum values moved to `aie2_spec.rs`
-    // (FOT_DISABLED, FOT_NO_COUNTS, FOT_COUNTS_WITH_TOKENS, FOT_COUNTS_FROM_REGISTER).
+    // FoT mode values: `crate::arch::fot::*` (DISABLED, NO_COUNTS, etc.)
 
     // Stream switch base/end addresses are now data-driven via
     // `regdb::device_reg_layout().memory_stream_switch` (StreamSwitchLayout).

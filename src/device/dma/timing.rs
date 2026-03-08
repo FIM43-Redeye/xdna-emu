@@ -14,8 +14,6 @@
 //! └──────────┘  └─────────┘  └──────────────┘  └─────────┘  └──────────┘
 //! ```
 
-use crate::device::aie2_spec;
-
 /// DMA timing configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct DmaTimingConfig {
@@ -48,22 +46,23 @@ pub struct DmaTimingConfig {
 
 impl Default for DmaTimingConfig {
     fn default() -> Self {
-        Self::from_aie2_spec()
+        Self::from_arch()
     }
 }
 
 impl DmaTimingConfig {
-    /// Create timing config from AIE2 specification constants.
-    pub fn from_aie2_spec() -> Self {
+    /// Create timing config from architecture constants.
+    pub fn from_arch() -> Self {
+        use crate::arch::timing;
         Self {
-            bd_setup_cycles: aie2_spec::DMA_BD_SETUP_CYCLES,
-            channel_start_cycles: aie2_spec::DMA_CHANNEL_START_CYCLES,
-            words_per_cycle: aie2_spec::DMA_WORDS_PER_CYCLE,
-            memory_latency_cycles: aie2_spec::DMA_MEMORY_LATENCY_CYCLES,
-            lock_acquire_cycles: aie2_spec::DMA_LOCK_ACQUIRE_CYCLES,
-            lock_release_cycles: aie2_spec::DMA_LOCK_RELEASE_CYCLES,
-            bd_chain_cycles: aie2_spec::DMA_BD_CHAIN_CYCLES,
-            host_memory_latency_cycles: aie2_spec::DMA_HOST_MEMORY_LATENCY_CYCLES,
+            bd_setup_cycles: timing::DMA_BD_SETUP_CYCLES,
+            channel_start_cycles: timing::DMA_CHANNEL_START_CYCLES,
+            words_per_cycle: timing::DMA_WORDS_PER_CYCLE,
+            memory_latency_cycles: timing::DMA_MEMORY_LATENCY_CYCLES,
+            lock_acquire_cycles: timing::DMA_LOCK_ACQUIRE_CYCLES,
+            lock_release_cycles: timing::DMA_LOCK_RELEASE_CYCLES,
+            bd_chain_cycles: timing::DMA_BD_CHAIN_CYCLES,
+            host_memory_latency_cycles: timing::DMA_HOST_MEMORY_LATENCY_CYCLES,
         }
     }
 

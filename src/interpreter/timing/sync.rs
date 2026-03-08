@@ -23,7 +23,7 @@
 //! ```ignore
 //! use xdna_emu::interpreter::timing::sync::{LockTimingState, SyncTimingConfig};
 //!
-//! let config = SyncTimingConfig::from_aie2_spec();
+//! let config = SyncTimingConfig::from_arch();
 //! let mut state = LockTimingState::new(16); // 16 locks
 //!
 //! // Track a lock acquire attempt
@@ -33,8 +33,6 @@
 //!
 //! println!("Lock 5 contention cycles: {}", state.contention_cycles(5));
 //! ```
-
-use crate::device::aie2_spec;
 
 /// Configuration for synchronization timing.
 #[derive(Debug, Clone, Copy)]
@@ -49,17 +47,18 @@ pub struct SyncTimingConfig {
 
 impl Default for SyncTimingConfig {
     fn default() -> Self {
-        Self::from_aie2_spec()
+        Self::from_arch()
     }
 }
 
 impl SyncTimingConfig {
-    /// Create configuration from AIE2 spec constants.
-    pub fn from_aie2_spec() -> Self {
+    /// Create configuration from architecture timing constants.
+    pub fn from_arch() -> Self {
+        use crate::arch::timing;
         Self {
-            acquire_latency: aie2_spec::LOCK_ACQUIRE_LATENCY,
-            release_latency: aie2_spec::LOCK_RELEASE_LATENCY,
-            retry_interval: aie2_spec::LOCK_RETRY_INTERVAL,
+            acquire_latency: timing::LOCK_ACQUIRE_LATENCY,
+            release_latency: timing::LOCK_RELEASE_LATENCY,
+            retry_interval: timing::LOCK_RETRY_INTERVAL,
         }
     }
 
@@ -133,7 +132,7 @@ impl LockTimingState {
     /// Create a new lock timing state for the given number of locks.
     pub fn new(num_locks: usize) -> Self {
         Self {
-            config: SyncTimingConfig::from_aie2_spec(),
+            config: SyncTimingConfig::from_arch(),
             stats: vec![LockStats::default(); num_locks],
         }
     }
@@ -256,7 +255,7 @@ mod tests {
 
     #[test]
     fn test_sync_timing_config() {
-        let config = SyncTimingConfig::from_aie2_spec();
+        let config = SyncTimingConfig::from_arch();
         assert_eq!(config.acquire_latency, 1);
         assert_eq!(config.release_latency, 1);
         assert_eq!(config.retry_interval, 1);

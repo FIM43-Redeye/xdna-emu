@@ -338,7 +338,7 @@ impl DmaEngine {
             bd_configs: vec![BdConfig::default(); num_bds],
             bd_dirty: vec![false; num_bds],
             channels,
-            timing_config: DmaTimingConfig::from_aie2_spec(),
+            timing_config: DmaTimingConfig::from_arch(),
             stream_out: VecDeque::with_capacity(16),
             stream_in: (0..s2mm_channels).map(|_| VecDeque::with_capacity(16)).collect(),
             task_tokens: VecDeque::with_capacity(4),
@@ -348,11 +348,9 @@ impl DmaEngine {
             s2mm_count: s2mm_channels,
             mm2s_count: mm2s_channels,
             num_locks,
-            // Physical bank count for conflict detection.
-            // TODO: migrate to arch::PHYSICAL_BANKS when physical banking flows through the graph.
             num_banks: match tile_type {
-                TileType::Compute => crate::device::aie2_spec::COMPUTE_TILE_MEMORY_BANKS,
-                TileType::MemTile => crate::device::aie2_spec::MEMTILE_MEMORY_BANKS,
+                TileType::Compute => crate::arch::compute::PHYSICAL_BANKS as usize,
+                TileType::MemTile => crate::arch::memtile::PHYSICAL_BANKS as usize,
                 TileType::Shim => 0,
             },
             cycle_dma_banks: 0,
@@ -380,7 +378,7 @@ impl DmaEngine {
 
     /// Configure custom timing parameters.
     ///
-    /// The default is already cycle-accurate (`DmaTimingConfig::from_aie2_spec()`).
+    /// The default is already cycle-accurate (`DmaTimingConfig::from_arch()`).
     /// This method allows tuning specific timing values if needed.
     pub fn with_timing(mut self, config: DmaTimingConfig) -> Self {
         self.timing_config = config;

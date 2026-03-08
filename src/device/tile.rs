@@ -1335,11 +1335,10 @@ impl Tile {
     // === Memory Bank Conflict Detection ===
 
     /// Number of physical memory banks for this tile type (for conflict detection).
-    /// TODO: migrate to arch::compute::PHYSICAL_BANKS when physical banking flows through the graph.
     pub fn num_banks(&self) -> usize {
         match self.tile_type {
-            TileType::Compute => crate::device::aie2_spec::COMPUTE_TILE_MEMORY_BANKS,
-            TileType::MemTile => crate::device::aie2_spec::MEMTILE_MEMORY_BANKS,
+            TileType::Compute => crate::arch::compute::PHYSICAL_BANKS as usize,
+            TileType::MemTile => crate::arch::memtile::PHYSICAL_BANKS as usize,
             TileType::Shim => 0,
         }
     }
@@ -1866,17 +1865,17 @@ impl Tile {
             }
             ControlPacketState::Idle => {
                 // Parse control packet header (AM020 Table 3)
-                use crate::device::aie2_spec::*;
-                let address = word & CTRL_PKT_ADDRESS_MASK;
-                let beats = ((word >> CTRL_PKT_LENGTH_SHIFT) & CTRL_PKT_LENGTH_MASK) as u8 + 1;
-                let operation = ((word >> CTRL_PKT_OPERATION_SHIFT) & CTRL_PKT_OPERATION_MASK) as u8;
-                let response_id = ((word >> CTRL_PKT_RESPONSE_ID_SHIFT) & CTRL_PKT_RESPONSE_ID_MASK) as u8;
+                use crate::arch::ctrl_packet::*;
+                let address = word & ADDRESS_MASK;
+                let beats = ((word >> LENGTH_SHIFT) & LENGTH_MASK) as u8 + 1;
+                let operation = ((word >> OPERATION_SHIFT) & OPERATION_MASK) as u8;
+                let response_id = ((word >> RESPONSE_ID_SHIFT) & RESPONSE_ID_MASK) as u8;
 
                 log::info!("Tile ({},{}) ctrl_pkt: header 0x{:08X} addr=0x{:05X} op={} beats={} resp_id={}",
                     self.col, self.row, word, address, operation, beats, response_id);
 
                 // OP_READ has no data payload -- execute immediately
-                if operation == CTRL_PKT_OP_READ {
+                if operation == OP_READ {
                     let actions = self.execute_ctrl_packet(
                         address, operation, response_id, beats, &[],
                     );
@@ -1963,11 +1962,11 @@ impl Tile {
         beats_total: u8,
         data: &[u32],
     ) -> Vec<CtrlPacketAction> {
-        use crate::device::aie2_spec::*;
+        use crate::arch::ctrl_packet::*;
         let mut actions = Vec::new();
 
         match operation {
-            CTRL_PKT_OP_WRITE | CTRL_PKT_OP_BLOCK_WRITE => {
+            OP_WRITE | OP_BLOCK_WRITE => {
                 for (i, &value) in data.iter().enumerate() {
                     let addr = base_address + (i as u32) * 4;
                     log::info!("Tile ({},{}) ctrl_pkt WRITE: [0x{:05X}] = 0x{:08X}",
@@ -1980,7 +1979,7 @@ impl Tile {
                     });
                 }
             }
-            CTRL_PKT_OP_READ => {
+            OP_READ => {
                 log::info!(
                     "Tile ({},{}) ctrl_pkt READ: addr=0x{:05X} beats={} resp_id={}",
                     self.col, self.row, base_address, beats_total, response_id,
@@ -1993,7 +1992,7 @@ impl Tile {
                     response_id,
                 });
             }
-            CTRL_PKT_OP_WRITE_INCR => {
+            OP_WRITE_INCR => {
                 for (i, &value) in data.iter().enumerate() {
                     let addr = base_address + (i as u32) * 4;
                     log::info!("Tile ({},{}) ctrl_pkt WRITE_INCR: [0x{:05X}] = 0x{:08X}",
@@ -2702,7 +2701,7 @@ mod tests {
     /// offset, count (beats+1), and response_id from the header.
     #[test]
     fn test_ctrl_packet_op_read_produces_read_registers_action() {
-        use crate::device::aie2_spec::*;
+        use crate::arch::ctrl_packet::*;
 
         let mut tile = Tile::compute(2, 3);
 
@@ -2720,13 +2719,13 @@ mod tests {
         //   response_id = 2 (bits 30:24)
         let address: u32 = 0x440;
         let beats_raw: u32 = 3; // means 4 words
-        let operation: u32 = CTRL_PKT_OP_READ as u32;
+        let operation: u32 = OP_READ as u32;
         let response_id: u32 = 2;
 
         let header = address
-            | (beats_raw << CTRL_PKT_LENGTH_SHIFT)
-            | (operation << CTRL_PKT_OPERATION_SHIFT)
-            | (response_id << CTRL_PKT_RESPONSE_ID_SHIFT);
+            | (beats_raw << LENGTH_SHIFT)
+            | (operation << OPERATION_SHIFT)
+            | (response_id << RESPONSE_ID_SHIFT);
 
         // Start from Idle state (skip stream header)
         tile.ctrl_pkt_state = ControlPacketState::Idle;
