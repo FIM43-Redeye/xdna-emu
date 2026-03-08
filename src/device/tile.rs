@@ -1335,7 +1335,8 @@ impl Tile {
 
     // === Memory Bank Conflict Detection ===
 
-    /// Number of memory banks for this tile type.
+    /// Number of physical memory banks for this tile type (for conflict detection).
+    /// TODO: migrate to arch::compute::PHYSICAL_BANKS when physical banking flows through the graph.
     pub fn num_banks(&self) -> usize {
         match self.tile_type {
             TileType::Compute => crate::device::aie2_spec::COMPUTE_TILE_MEMORY_BANKS,

@@ -41,7 +41,8 @@
 
 use crate::device::aie2_spec;
 
-/// Number of memory banks per compute tile.
+/// Number of physical memory banks per compute tile (for conflict detection).
+/// TODO: migrate to arch::compute::PHYSICAL_BANKS when physical banking flows through the graph.
 pub const NUM_BANKS: usize = aie2_spec::COMPUTE_TILE_MEMORY_BANKS;
 
 // ============================================================================

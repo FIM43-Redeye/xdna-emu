@@ -348,6 +348,8 @@ impl DmaEngine {
             s2mm_count: s2mm_channels,
             mm2s_count: mm2s_channels,
             num_locks,
+            // Physical bank count for conflict detection.
+            // TODO: migrate to arch::PHYSICAL_BANKS when physical banking flows through the graph.
             num_banks: match tile_type {
                 TileType::Compute => crate::device::aie2_spec::COMPUTE_TILE_MEMORY_BANKS,
                 TileType::MemTile => crate::device::aie2_spec::MEMTILE_MEMORY_BANKS,
