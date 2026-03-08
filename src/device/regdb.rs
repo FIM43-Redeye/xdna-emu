@@ -1,7 +1,7 @@
 //! Data-driven register database loaded from AMD AM025 JSON.
 //!
 //! Base parsing types (BitField, AccessMode, RegisterDef, ModuleDef,
-//! RegisterDb) are defined in the `xdna-graph` crate and re-exported here.
+//! RegisterDb) are defined in the `xdna-archspec` crate and re-exported here.
 //! This module adds emulator-specific extensions: pre-resolved field layouts
 //! for hot-path register access, and the `load_for_device()` convenience
 //! function that uses the emulator's config system for path resolution.
@@ -24,7 +24,7 @@
 
 // Re-export base types from the graph crate. All consumers of
 // `crate::device::regdb::BitField` etc. continue to work unchanged.
-pub use xdna_graph::regdb::*;
+pub use xdna_archspec::regdb::*;
 
 
 /// Load a register database from the mlir-aie install, using the

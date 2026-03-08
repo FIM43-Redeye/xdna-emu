@@ -1,4 +1,4 @@
-//! Build-time code generation from the NPU architecture graph.
+//! Build-time code generation from the NPU architecture specification.
 //!
 //! This build script constructs the full ArchModel at compile time (device
 //! topology + AM025 register database, cross-validated via Confirmed<T>) and
@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 // This eliminates the duplicate JSON parsing types that build.rs
 // previously maintained separately (build scripts can now share
 // types via workspace member crates).
-use xdna_graph::regdb::RegisterDb;
+use xdna_archspec::regdb::RegisterDb;
 
 // ============================================================================
 // Port type constants -- mirrors aie2_spec::port_type for codegen output
@@ -80,7 +80,7 @@ fn main() {
 
     // Build the full ArchModel (device topology + register data, cross-validated).
     // This is the graph as compile-time truth: Confirmed<T> panics on conflicts.
-    let arch_model = xdna_graph::build_arch_model(&device_model_path, &regdb, "npu1")
+    let arch_model = xdna_archspec::build_arch_model(&device_model_path, &regdb, "npu1")
         .unwrap_or_else(|e| panic!("Failed to build ArchModel: {}", e));
 
     // Bridge script for trace events
@@ -117,8 +117,8 @@ fn gen_header(source_desc: &str) -> String {
 // Step 0: Comprehensive architecture constants from ArchModel
 // ============================================================================
 
-fn gen_arch(model: &xdna_graph::types::ArchModel, out_dir: &Path) {
-    use xdna_graph::types::TileKind;
+fn gen_arch(model: &xdna_archspec::types::ArchModel, out_dir: &Path) {
+    use xdna_archspec::types::TileKind;
 
     let mut out = gen_header("ArchModel (device model + AM025, cross-validated)");
 

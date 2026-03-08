@@ -617,7 +617,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn json_path() -> PathBuf {
-        // CARGO_MANIFEST_DIR is crates/xdna-graph/, go up to xdna-emu root
+        // CARGO_MANIFEST_DIR is crates/xdna-archspec/, go up to xdna-emu root
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tools/aie-device-models.json")
     }

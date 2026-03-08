@@ -1,4 +1,4 @@
-//! NPU Architecture Graph -- queryable hardware model.
+//! NPU Architecture Specification -- validated hardware model.
 //!
 //! Extracts hardware architecture from the open-source NPU toolchain
 //! (aie-rt, AM025 JSON, device model) into a single typed Rust model.
@@ -8,7 +8,7 @@
 //!
 //! This crate is a workspace member of xdna-emu, usable as both a
 //! library dependency (for runtime queries) and a build dependency
-//! (for compile-time code generation from the validated graph).
+//! (for compile-time code generation from the validated spec).
 
 pub mod device_model;
 pub mod regdb;
@@ -24,7 +24,7 @@ use std::path::Path;
 /// 2. Enriches with register data from the AM025 register database
 /// 3. Cross-validates via Confirmed<T> (panics on conflicts)
 ///
-/// The result is the validated architecture graph, ready for code generation.
+/// The result is the validated architecture spec, ready for code generation.
 pub fn build_arch_model(
     device_model_path: &Path,
     regdb: &regdb::RegisterDb,

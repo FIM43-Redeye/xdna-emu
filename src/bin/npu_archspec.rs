@@ -1,4 +1,4 @@
-//! NPU Architecture Graph -- standalone extraction and query tool.
+//! NPU Architecture Specification -- standalone extraction and query tool.
 
 use std::env;
 use std::process;
@@ -6,7 +6,7 @@ use std::process;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: npu-graph <command> [options]");
+        eprintln!("Usage: npu-archspec <command> [options]");
         eprintln!("Commands:");
         eprintln!("  extract  --arch <aie|aie2|aie2p> [source options]");
         eprintln!("  query    --model <path.json> <query>");

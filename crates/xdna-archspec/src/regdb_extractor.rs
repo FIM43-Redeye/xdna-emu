@@ -1849,7 +1849,7 @@ mod tests {
 
     /// Load the real register database, or skip if unavailable.
     fn load_test_db() -> Option<regdb::RegisterDb> {
-        // CARGO_MANIFEST_DIR is crates/xdna-graph/, go up to npu-work/
+        // CARGO_MANIFEST_DIR is crates/xdna-archspec/, go up to npu-work/
         let json_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../..") // up to npu-work/
             .join("mlir-aie/lib/Dialect/AIE/Util/aie_registers_aie2.json");

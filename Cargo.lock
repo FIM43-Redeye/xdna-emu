@@ -4513,6 +4513,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "xdna-archspec"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "xdna-emu"
 version = "0.1.0"
 dependencies = [
@@ -4539,17 +4548,8 @@ dependencies = [
  "thiserror 2.0.17",
  "toml",
  "uuid",
- "xdna-graph",
+ "xdna-archspec",
  "zerocopy",
-]
-
-[[package]]
-name = "xdna-graph"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]
