@@ -368,6 +368,13 @@ impl fmt::Display for ModuleKind {
 pub enum SubsystemKind {
     Dma,
     Lock,
+    /// Address-encoded lock acquire/release command interface.
+    ///
+    /// Lock_Request (0x40000 on compute, 0xD0000 on memtile) is architecturally
+    /// distinct from lock value registers: the address bits encode lock_id,
+    /// acquire/release, and value. Separating it from `Lock` prevents a 131KB
+    /// span that would overlap ProgramMemory and Processor subsystems.
+    LockRequest,
     StreamSwitch,
     /// The processor (VLIW core). Named "Processor" to avoid confusion with
     /// `ModuleKind::Core` which is the physical core module.
@@ -400,6 +407,7 @@ impl fmt::Display for SubsystemKind {
         match self {
             Self::Dma => write!(f, "dma"),
             Self::Lock => write!(f, "lock"),
+            Self::LockRequest => write!(f, "lock_request"),
             Self::StreamSwitch => write!(f, "stream_switch"),
             Self::Processor => write!(f, "processor"),
             Self::ProgramMemory => write!(f, "program_memory"),

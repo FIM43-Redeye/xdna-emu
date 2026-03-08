@@ -521,7 +521,7 @@ fn convert_access(mode: regdb::AccessMode) -> Access {
 /// The `module_name` parameter is the AM025 module name (e.g., "memory",
 /// "core") used for source attribution.
 pub fn register_def_to_model(reg: &regdb::RegisterDef, module_name: &str) -> RegisterModel {
-    let subsystem = subsystem_name_to_kind(subsystem_key(&reg.name));
+    let subsystem = classify_register_subsystem(&reg.name);
 
     let fields: Vec<FieldModel> = reg
         .fields
@@ -699,7 +699,7 @@ pub fn populate_tile_modules(model: &mut ArchModel, db: &regdb::RegisterDb) {
                         });
 
                         // Register -> Subsystem (BelongsTo)
-                        let subsystem_kind = subsystem_name_to_kind(subsystem_key(&reg.name));
+                        let subsystem_kind = classify_register_subsystem(&reg.name);
                         new_edges.push(Relationship {
                             from: reg_node.clone(),
                             to: NodeId::Subsystem {
@@ -1480,6 +1480,23 @@ pub fn subsystem_key(name: &str) -> &str {
     stem
 }
 
+/// Classify a register's subsystem from its name.
+///
+/// Handles special cases before falling back to the general
+/// `subsystem_key()` -> `subsystem_name_to_kind()` pipeline.
+///
+/// Lock_Request is architecturally distinct from lock value registers:
+/// it is an address-encoded command interface (lock_id, acq/rel, value
+/// packed into address bits), not a normal register. Classifying it
+/// separately prevents the Lock subsystem from spanning ~131KB
+/// (0x1F000-0x40004) and overlapping with ProgramMemory and Processor.
+pub fn classify_register_subsystem(name: &str) -> SubsystemKind {
+    if name.starts_with("Lock_Request") {
+        return SubsystemKind::LockRequest;
+    }
+    subsystem_name_to_kind(subsystem_key(name))
+}
+
 /// Extract subsystem profiles for all subsystems in a module.
 ///
 /// This is the primary entry point for register analysis. Automatic
@@ -1833,6 +1850,35 @@ mod tests {
     #[test]
     fn subsystem_key_handles_no_underscore() {
         assert_eq!(subsystem_key("DataMemory"), "DataMemory");
+    }
+
+    // ====================================================================
+    // classify_register_subsystem tests
+    // ====================================================================
+
+    #[test]
+    fn classify_register_subsystem_lock_value() {
+        assert_eq!(classify_register_subsystem("Lock0_value"), SubsystemKind::Lock);
+        assert_eq!(classify_register_subsystem("Lock15_value"), SubsystemKind::Lock);
+    }
+
+    #[test]
+    fn classify_register_subsystem_lock_request() {
+        // Lock_Request is an address-encoded command interface, not a lock
+        // value register. It must be classified as LockRequest to avoid
+        // the Lock subsystem spanning from 0x1F000 to 0x40004.
+        assert_eq!(
+            classify_register_subsystem("Lock_Request"),
+            SubsystemKind::LockRequest
+        );
+    }
+
+    #[test]
+    fn classify_register_subsystem_delegates_to_general_pipeline() {
+        // Non-Lock_Request registers fall through to the general pipeline.
+        assert_eq!(classify_register_subsystem("DMA_BD0_0"), SubsystemKind::Dma);
+        assert_eq!(classify_register_subsystem("Event_Broadcast0"), SubsystemKind::Event);
+        assert_eq!(classify_register_subsystem("Locks_Overflow"), SubsystemKind::Lock);
     }
 
     // ====================================================================
@@ -2681,7 +2727,10 @@ mod tests {
 
         let model = register_def_to_model(&reg, "memory");
         assert_eq!(model.access, crate::types::Access::ReadOnly);
-        assert_eq!(model.subsystem, SubsystemKind::Lock);
+        // Lock_Request is an address-encoded command interface, not a normal
+        // lock value register. It gets its own subsystem to prevent a 131KB
+        // span that would overlap ProgramMemory and Processor.
+        assert_eq!(model.subsystem, SubsystemKind::LockRequest);
     }
 
     #[test]

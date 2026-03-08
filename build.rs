@@ -377,6 +377,7 @@ fn subsystem_mod_name(kind: xdna_archspec::types::SubsystemKind) -> &'static str
     match kind {
         SubsystemKind::Dma => "dma",
         SubsystemKind::Lock => "lock",
+        SubsystemKind::LockRequest => "lock_request",
         SubsystemKind::StreamSwitch => "stream_switch",
         SubsystemKind::Processor => "processor",
         SubsystemKind::ProgramMemory => "program_memory",
