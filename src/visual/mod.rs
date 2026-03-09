@@ -5,7 +5,10 @@
 //! supports piecewise alignment for phase-aware comparison.
 
 pub mod alignment;
+pub mod app;
 pub mod data;
 pub mod event_detail;
 pub mod theme;
 pub mod tile_selector;
+
+pub use app::TraceViewerApp;

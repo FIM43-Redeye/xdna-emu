@@ -362,7 +362,17 @@ fn print_help() {
 
 /// Run the GUI application.
 fn run_gui(_file_path: Option<&str>) -> anyhow::Result<()> {
-    println!("Trace visualizer is under construction.");
-    println!("Use --help for CLI options.");
-    Ok(())
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([1400.0, 800.0])
+            .with_title("xdna-emu Trace Visualizer"),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "xdna-emu",
+        options,
+        Box::new(|_cc| Ok(Box::new(xdna_emu::visual::TraceViewerApp::default()))),
+    )
+    .map_err(|e| anyhow::anyhow!("GUI error: {}", e))
 }

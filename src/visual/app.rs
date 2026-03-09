@@ -1,0 +1,188 @@
+//! Main application shell for the trace comparison visualizer.
+//!
+//! [`TraceViewerApp`] implements [`eframe::App`] and orchestrates the
+//! top-level layout: menu bar, tile sidebar, event detail panel, status
+//! bar, and central timeline area (placeholder for Phase 3).
+
+use eframe::egui;
+
+use crate::trace::compare::TileKey;
+
+use super::data::{LoadedComparison, TraceSource};
+use super::event_detail::{self, SelectedEvent};
+use super::tile_selector;
+
+// ============================================================================
+// TraceViewerApp
+// ============================================================================
+
+/// Top-level application state for the trace comparison visualizer.
+pub struct TraceViewerApp {
+    /// Loaded trace comparison data, if any.
+    source: Option<LoadedComparison>,
+    /// Currently selected tile in the sidebar.
+    selected_tile: Option<TileKey>,
+    /// Currently selected event (from timeline interaction).
+    selected_event: Option<SelectedEvent>,
+    /// Status bar message.
+    status: String,
+    /// Error message to display in a popup window.
+    error: Option<String>,
+}
+
+impl Default for TraceViewerApp {
+    fn default() -> Self {
+        Self {
+            source: None,
+            selected_tile: None,
+            selected_event: None,
+            status: "Ready. Open a trace pair to begin.".to_string(),
+            error: None,
+        }
+    }
+}
+
+impl TraceViewerApp {
+    /// Open a file dialog to select HW and EMU trace directories, then load.
+    fn open_trace_pair(&mut self) {
+        let hw_dir = rfd::FileDialog::new()
+            .set_title("Select HW trace directory")
+            .pick_folder();
+
+        let hw_dir = match hw_dir {
+            Some(d) => d,
+            None => return, // User cancelled.
+        };
+
+        let emu_dir = rfd::FileDialog::new()
+            .set_title("Select EMU trace directory")
+            .pick_folder();
+
+        let emu_dir = match emu_dir {
+            Some(d) => d,
+            None => return, // User cancelled.
+        };
+
+        self.load_trace_pair(&hw_dir, &emu_dir);
+    }
+
+    /// Load and compare traces from the given directories.
+    ///
+    /// On success, auto-selects the first tile (most divergent).
+    /// On failure, stores the error for popup display.
+    fn load_trace_pair(&mut self, hw_dir: &std::path::Path, emu_dir: &std::path::Path) {
+        match LoadedComparison::from_trace_dirs(hw_dir, emu_dir) {
+            Ok(comparison) => {
+                // Auto-select the most divergent tile.
+                let first_tile = comparison.tile_keys().first().copied();
+                let tile_count = comparison.tile_keys().len();
+
+                self.source = Some(comparison);
+                self.selected_tile = first_tile;
+                self.selected_event = None;
+                self.status = format!(
+                    "Loaded {} tiles from {} / {}",
+                    tile_count,
+                    hw_dir.display(),
+                    emu_dir.display(),
+                );
+                self.error = None;
+            }
+            Err(e) => {
+                self.error = Some(e);
+            }
+        }
+    }
+}
+
+impl eframe::App for TraceViewerApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ====================================================================
+        // Menu bar (top panel)
+        // ====================================================================
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Open Trace Pair...").clicked() {
+                        ui.close_menu();
+                        self.open_trace_pair();
+                    }
+                    ui.separator();
+                    if ui.button("Quit").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+            });
+        });
+
+        // ====================================================================
+        // Status bar (bottom panel, below everything)
+        // ====================================================================
+        egui::TopBottomPanel::bottom("status_bar")
+            .max_height(20.0)
+            .show(ctx, |ui| {
+                ui.label(&self.status);
+            });
+
+        // ====================================================================
+        // Event detail panel (bottom, above status bar)
+        // ====================================================================
+        egui::TopBottomPanel::bottom("detail_panel")
+            .max_height(40.0)
+            .show(ctx, |ui| {
+                event_detail::show_event_detail(ui, self.selected_event.as_ref());
+            });
+
+        // ====================================================================
+        // Error popup (if any)
+        // ====================================================================
+        if self.error.is_some() {
+            let mut open = true;
+            egui::Window::new("Error")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    if let Some(ref msg) = self.error {
+                        ui.label(msg);
+                    }
+                });
+            if !open {
+                self.error = None;
+            }
+        }
+
+        // ====================================================================
+        // Tile sidebar (left panel, only when data is loaded)
+        // ====================================================================
+        if let Some(ref source) = self.source {
+            egui::SidePanel::left("tile_sidebar")
+                .default_width(160.0)
+                .show(ctx, |ui| {
+                    if let Some(new_tile) = tile_selector::show_tile_selector(
+                        ui,
+                        source,
+                        self.selected_tile.as_ref(),
+                    ) {
+                        self.selected_tile = Some(new_tile);
+                        self.selected_event = None;
+                    }
+                });
+        }
+
+        // ====================================================================
+        // Central panel (timeline placeholder)
+        // ====================================================================
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.source.is_some() {
+                ui.centered_and_justified(|ui| {
+                    ui.label("Timeline will render here.");
+                });
+            } else {
+                ui.centered_and_justified(|ui| {
+                    ui.label("No traces loaded. Use File > Open Trace Pair...");
+                });
+            }
+        });
+    }
+}
