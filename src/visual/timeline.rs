@@ -131,6 +131,102 @@ fn compute_lanes(
 // Public API
 // ============================================================================
 
+/// Compute the total cycle extent (min, max) for a tile's events.
+///
+/// Scans all HW and EMU events, maps them through the alignment into
+/// unified coordinates, and returns (min_cycle, max_cycle). Returns
+/// `None` if there are no events at all.
+fn compute_extent(
+    source: &dyn TraceSource,
+    tile: &TileKey,
+    alignment: &super::alignment::AlignmentMap,
+) -> Option<(f64, f64)> {
+    let hw_events = source.hw_events(tile);
+    let emu_events = source.emu_events(tile);
+
+    let mut min_cycle = f64::MAX;
+    let mut max_cycle = f64::MIN;
+
+    for ev in hw_events {
+        let unified = alignment.hw_to_unified(ev.abs_cycle);
+        min_cycle = min_cycle.min(unified);
+        max_cycle = max_cycle.max(unified);
+    }
+    for ev in emu_events {
+        let unified = alignment.emu_to_unified(ev.abs_cycle);
+        min_cycle = min_cycle.min(unified);
+        max_cycle = max_cycle.max(unified);
+    }
+
+    if min_cycle <= max_cycle {
+        Some((min_cycle, max_cycle))
+    } else {
+        None
+    }
+}
+
+/// Draw a minimap bar showing the full trace extent with the current
+/// viewport highlighted. Clicking on the minimap pans the viewport to
+/// center on the clicked position.
+fn draw_minimap(
+    ui: &mut egui::Ui,
+    total_min: f64,
+    total_max: f64,
+    viewport: &mut Viewport,
+) {
+    let available_width = ui.available_width();
+    let (response, painter) = ui.allocate_painter(
+        egui::Vec2::new(available_width, theme::MINIMAP_HEIGHT),
+        egui::Sense::click(),
+    );
+    let rect = response.rect;
+
+    // Fill background.
+    painter.rect_filled(rect, 2.0, theme::MINIMAP_BG);
+
+    let total_span = total_max - total_min;
+    if total_span <= 0.0 {
+        return;
+    }
+
+    // Calculate viewport position as fraction of total range.
+    let vp_start_frac = ((viewport.start_cycle - total_min) / total_span)
+        .clamp(0.0, 1.0) as f32;
+    let vp_end_frac = ((viewport.end_cycle() - total_min) / total_span)
+        .clamp(0.0, 1.0) as f32;
+
+    // Ensure the viewport indicator is at least 2 pixels wide so it is
+    // always visible even when zoomed far out.
+    let vp_left = rect.left() + vp_start_frac * rect.width();
+    let vp_right_raw = rect.left() + vp_end_frac * rect.width();
+    let vp_right = vp_right_raw.max(vp_left + 2.0).min(rect.right());
+
+    let vp_rect = egui::Rect::from_min_max(
+        egui::pos2(vp_left, rect.top() + 1.0),
+        egui::pos2(vp_right, rect.bottom() - 1.0),
+    );
+
+    // Draw viewport indicator.
+    painter.rect_stroke(
+        vp_rect,
+        1.0,
+        egui::Stroke::new(1.0, theme::MINIMAP_VIEWPORT),
+        egui::StrokeKind::Outside,
+    );
+
+    // Click to pan: center the viewport on the clicked position.
+    if response.clicked() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let click_frac = ((pos.x - rect.left()) / rect.width())
+                .clamp(0.0, 1.0) as f64;
+            let target_cycle = total_min + click_frac * total_span;
+            // Center the viewport on the target cycle.
+            let half_visible = viewport.visible_cycles() / 2.0;
+            viewport.start_cycle = target_cycle - half_visible;
+        }
+    }
+}
+
 /// Render the timeline for a selected tile.
 ///
 /// Returns `Some(SelectedEvent)` if the user hovered over an event tick.
@@ -151,6 +247,15 @@ pub fn show_timeline(
         return None;
     }
 
+    // Compute the total cycle extent for minimap and initial fit.
+    let extent = compute_extent(source, tile, alignment);
+
+    // Draw the minimap bar above the event lanes.
+    if let Some((total_min, total_max)) = extent {
+        draw_minimap(ui, total_min, total_max, &mut state.viewport);
+        ui.add_space(2.0);
+    }
+
     // Allocate the drawing area. Use a scroll area for vertical overflow,
     // but the horizontal axis is managed by the viewport (zoom/pan).
     let desired_height = total_height.max(100.0);
@@ -166,24 +271,7 @@ pub fn show_timeline(
 
     // First-time initialization: fit viewport to the data range.
     if !state.initialized {
-        let hw_events = source.hw_events(tile);
-        let emu_events = source.emu_events(tile);
-
-        let mut min_cycle = f64::MAX;
-        let mut max_cycle = f64::MIN;
-
-        for ev in hw_events {
-            let unified = alignment.hw_to_unified(ev.abs_cycle);
-            min_cycle = min_cycle.min(unified);
-            max_cycle = max_cycle.max(unified);
-        }
-        for ev in emu_events {
-            let unified = alignment.emu_to_unified(ev.abs_cycle);
-            min_cycle = min_cycle.min(unified);
-            max_cycle = max_cycle.max(unified);
-        }
-
-        if min_cycle <= max_cycle {
+        if let Some((min_cycle, max_cycle)) = extent {
             state.viewport.fit_range(min_cycle, max_cycle);
         }
         state.initialized = true;
