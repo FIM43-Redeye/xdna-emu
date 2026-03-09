@@ -31,6 +31,10 @@ pub struct TraceViewerApp {
     status: String,
     /// Error message to display in a popup window.
     error: Option<String>,
+    /// Names of available trace batches (for sweep directories).
+    batch_names: Vec<String>,
+    /// Currently selected batch index.
+    selected_batch: usize,
 }
 
 impl Default for TraceViewerApp {
@@ -42,6 +46,8 @@ impl Default for TraceViewerApp {
             timeline_state: timeline::TimelineState::default(),
             status: "Ready. Open a trace pair to begin.".to_string(),
             error: None,
+            batch_names: vec!["Batch 0".to_string()],
+            selected_batch: 0,
         }
     }
 }
@@ -116,6 +122,20 @@ impl eframe::App for TraceViewerApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
+
+                // Batch selector: only shown when multiple batches are
+                // available (sweep directories with different event
+                // configurations). Single-batch loads hide this.
+                if self.batch_names.len() > 1 {
+                    ui.separator();
+                    egui::ComboBox::from_label("Batch")
+                        .selected_text(&self.batch_names[self.selected_batch])
+                        .show_ui(ui, |ui| {
+                            for (i, name) in self.batch_names.iter().enumerate() {
+                                ui.selectable_value(&mut self.selected_batch, i, name);
+                            }
+                        });
+                }
             });
         });
 
