@@ -272,7 +272,7 @@ class TestBDFPatch:
 
 class TestMissingFiles:
     def test_no_aie_mlir(self, tmp_path):
-        """Error when test dir has no aie.mlir or aie2.py."""
+        """Error when test dir has no aie.mlir or aie2.py, with status file."""
         test_dir = tmp_path / "empty_test"
         test_dir.mkdir()
         (test_dir / "test.cpp").write_text("int main() { return 0; }\n")
@@ -283,6 +283,10 @@ class TestMissingFiles:
             "--output", str(output_dir),
         )
         assert result.returncode != 0
+        # prepare-status.txt must be written even on failure
+        status_file = output_dir / "prepare-status.txt"
+        assert status_file.exists(), "prepare-status.txt not written on failure"
+        assert status_file.read_text().startswith("FAIL")
 
 
 # ---------------------------------------------------------------------------

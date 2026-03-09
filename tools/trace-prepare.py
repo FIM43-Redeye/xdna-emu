@@ -139,8 +139,16 @@ def prepare_trace(
         sys.modules["trace_inject"] = trace_inject
         _spec.loader.exec_module(trace_inject)
 
-        source_type = trace_inject.detect_source_type(test_dir)
-        mlir_text = trace_inject.get_mlir_text(test_dir, source_type, device)
+        try:
+            source_type = trace_inject.detect_source_type(test_dir)
+            mlir_text = trace_inject.get_mlir_text(
+                test_dir, source_type, device,
+            )
+        except SystemExit:
+            msg = "FAIL source detection or MLIR loading"
+            write_status(output_dir, msg)
+            print(f"FAIL {test_name}: {msg}", file=sys.stderr)
+            return 1
 
         # Check for already-traced MLIR.
         if trace_inject.has_existing_trace(mlir_text):
