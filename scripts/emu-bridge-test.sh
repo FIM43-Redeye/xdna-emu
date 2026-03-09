@@ -17,7 +17,6 @@
 #   Phase 1: Discover       -- find tests, filter, skip npu2-only
 #   Phase 2: Compile        -- parallel xclbin builds (both compilers in parallel) + test.exe
 #   Phase 3+4: Run HW+EMU  -- HW (-j5) and EMU (-j$JOBS) run concurrently
-#   Phase 4b: Trace         -- trace comparison (needs both HW+EMU results)
 #   Phase 5: Report         -- per-compiler comparison matrix + summary
 #
 # Usage:
@@ -82,7 +81,6 @@ RUN_HW=true
 RUN_EMU=true
 LIST_ONLY=false
 VERBOSE=false
-TRACE_MODE=""  # "", "default", "all", "sweep", "sweep-all"
 COMPILER_MODE="both"  # "both", "chess", "peano"
 NO_TRACE="${NO_TRACE:-false}"
 
@@ -93,14 +91,6 @@ while [[ $# -gt 0 ]]; do
     --no-emu)      RUN_EMU=false; shift ;;
     --list)        LIST_ONLY=true; shift ;;
     -v|--verbose)  VERBOSE=true; shift ;;
-    --trace)       TRACE_MODE="default"; shift ;;
-    --trace=*)
-      TRACE_MODE="${1#--trace=}"
-      case "$TRACE_MODE" in
-        all|sweep|sweep-all|compare|compare-all) ;;
-        *) echo "Unknown --trace mode: $TRACE_MODE (use: all, sweep, sweep-all, compare, compare-all)" >&2; exit 1 ;;
-      esac
-      shift ;;
     -j*)
       JOBS="${1#-j}"
       if [[ -z "$JOBS" ]] || ! [[ "$JOBS" =~ ^[0-9]+$ ]]; then
@@ -121,12 +111,6 @@ Options:
   --no-emu        Skip emulator runs (default: emulator enabled)
   --no-trace      Disable always-on trace preparation (default: traces enabled)
   --list          List available tests and exit
-  --trace         Run trace comparison (default events, passing tests only)
-  --trace=all     Trace all tests (pass + fail)
-  --trace=sweep   Full event sweep (passing tests only)
-  --trace=sweep-all  Full sweep, all tests
-  --trace=compare    Sweep + serial-vs-parallel determinism check (HW-passing)
-  --trace=compare-all  Determinism check, all tests
   -jN             Override parallelism (default: nproc)
   -v, --verbose   Show log snippets on failure
   --chess-only    Only compile/run with Chess compiler (ground truth)
@@ -165,7 +149,7 @@ for _c in "${COMPILERS[@]}"; do
 done
 
 # Export variables that parallel jobs need.
-export RESULTS_DIR FORCE_COMPILE VERBOSE TRACE_MODE RUN_EMU NO_TRACE
+export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE
 export MLIR_AIE TEST_SRC BUILD_BASE EMU_ROOT SCRIPT_DIR TRACE_QUARANTINE_FILE
 export XRT_DIR XRT_INCLUDE XRT_LIB
 export TEST_LIB_DIR TEST_UTILS_INCLUDE TEST_UTILS_LIB
@@ -926,7 +910,7 @@ run_one_bridge() {
 export -f run_one_bridge
 
 # ---------------------------------------------------------------------------
-# Phase 4b: Trace comparison
+# Trace comparison helper
 # ---------------------------------------------------------------------------
 
 # Run trace-compare: prefer Rust binary, fall back to Python.
@@ -941,240 +925,6 @@ run_trace_compare() {
 }
 export -f run_trace_compare
 
-# Compile traced xclbin base for a single test (used by compile-ahead).
-# Delegates to trace-sweep.py --compile-only, writes status to
-# $RESULTS_DIR/${safe}.trace-compile/compile-status.txt.
-compile_trace_base_one() {
-  local name="$1"
-  local safe
-  safe="$(sanitize_name "$name")"
-  local src_dir="$TEST_SRC/$name"
-  local compile_dir="$RESULTS_DIR/${safe}.trace-compile"
-
-  python3 "$EMU_ROOT/tools/trace-sweep.py" "$src_dir" \
-    -o "$compile_dir" --compile-only \
-    > "$RESULTS_DIR/${safe}.trace-compile.log" 2>&1
-  local rc=$?
-
-  if [[ $rc -eq 0 ]] && [[ -f "$compile_dir/compile-status.txt" ]] \
-      && grep -q '^OK' "$compile_dir/compile-status.txt"; then
-    echo "  TRACE COMPILE $name: OK"
-  else
-    echo "  TRACE COMPILE $name: FAIL"
-  fi
-}
-export -f compile_trace_base_one
-
-# Run trace comparison for a single test.
-# Uses trace-sweep.py for sweep mode, or trace-inject + trace-run +
-# trace-compare for default (8-event) mode.
-#
-# Writes $RESULTS_DIR/${safe}.trace.summary (one line) and full report
-# to $RESULTS_DIR/${safe}.trace.log.
-trace_one_test() {
-  local name="$1"
-  local mode="$2"  # "default" or "sweep"
-  local compiler="${3:-peano}"  # defaults to peano for backward compat
-  local safe
-  safe="$(sanitize_name "$name")"
-  local src_dir="$TEST_SRC/$name"
-  local trace_dir="$RESULTS_DIR/${safe}.${compiler}.trace"
-  local summary_file="$RESULTS_DIR/${safe}.${compiler}.trace.summary"
-  local log_file="$RESULTS_DIR/${safe}.${compiler}.trace.log"
-  local tools_dir="$EMU_ROOT/tools"
-
-  mkdir -p "$trace_dir"
-  : > "$log_file"
-
-  if [[ "$mode" == "sweep" || "$mode" == "sweep-all" ]]; then
-    # Full sweep: delegate to trace-sweep.py
-    # TODO: pass compiler flags to trace-sweep.py when it supports them.
-    # For now, sweep always uses the default (peano) compiler.
-    local sweep_args=("$src_dir" -o "$trace_dir/sweep")
-    if [[ "$RUN_HW" != "true" ]]; then
-      sweep_args+=(--no-hw)
-    fi
-    if ! python3 "$tools_dir/trace-sweep.py" "${sweep_args[@]}" >> "$log_file" 2>&1; then
-      echo "ERROR sweep_failed" > "$summary_file"
-      echo "  TRACE $name ($compiler): ERROR (sweep failed)"
-      return
-    fi
-
-    # Check if sweep was skipped (exit 0 but with skipped manifest)
-    local sweep_manifest="$trace_dir/sweep/sweep-manifest.json"
-    if [[ -f "$sweep_manifest" ]]; then
-      local skip_reason
-      skip_reason="$(python3 -c "import json,sys; m=json.load(open('$sweep_manifest')); print(m.get('reason','')) if m.get('skipped') else sys.exit(1)" 2>/dev/null)" && {
-        echo "SKIP $skip_reason" > "$summary_file"
-        echo "  TRACE $name ($compiler): SKIP ($skip_reason)"
-        return
-      }
-    fi
-
-    # Trim trace buffers to actual data length
-    python3 "$tools_dir/trace-trim.py" --dir "$trace_dir/sweep" >> "$log_file" 2>&1 || true
-
-    # Compare
-    if ! run_trace_compare --sweep "$trace_dir/sweep" --remap-columns \
-        -o "$trace_dir/report.txt" >> "$log_file" 2>&1; then
-      echo "ERROR compare_failed" > "$summary_file"
-      echo "  TRACE $name ($compiler): ERROR (compare failed)"
-      return
-    fi
-  else
-    # Default 8-event mode: inject, compile, run HW+EMU, compare.
-
-    # Step 1: Inject tracing into MLIR
-    local traced_dir="$trace_dir/traced"
-    if ! python3 "$tools_dir/trace-inject.py" "$src_dir" -o "$traced_dir" \
-        >> "$log_file" 2>&1; then
-      echo "ERROR injection_failed" > "$summary_file"
-      echo "  TRACE $name ($compiler): ERROR (injection failed)"
-      return
-    fi
-
-    local manifest="$traced_dir/manifest.json"
-    if [[ ! -f "$manifest" ]]; then
-      echo "ERROR no_manifest" > "$summary_file"
-      echo "  TRACE $name ($compiler): ERROR (no manifest)"
-      return
-    fi
-
-    # Check if injection was skipped (routing infeasible, already traced, etc.)
-    local skip_reason
-    skip_reason="$(python3 -c "
-import json, sys
-m = json.load(open('$manifest'))
-if m.get('skipped'):
-    print(m.get('reason', 'unsupported'))
-else:
-    sys.exit(1)
-" 2>/dev/null)" && {
-      echo "SKIP $skip_reason" > "$summary_file"
-      echo "  TRACE $name ($compiler): SKIP ($skip_reason)"
-      return
-    }
-
-    # Step 2: Compile traced xclbin
-    local aiecc_compiler_flags="--no-xchesscc"
-    if [[ "$compiler" == "chess" ]]; then
-      aiecc_compiler_flags="--xchesscc --xbridge"
-    fi
-    if ! ( cd "$traced_dir" && nice -n 19 aiecc.py \
-        --no-aiesim --aie-generate-xclbin --aie-generate-npu-insts \
-        --no-compile-host --alloc-scheme=basic-sequential $aiecc_compiler_flags \
-        --xclbin-name=aie.xclbin --npu-insts-name=insts.bin \
-        ./aie_traced.mlir ) >> "$log_file" 2>&1; then
-      echo "ERROR compile_failed" > "$summary_file"
-      echo "  TRACE $name ($compiler): ERROR (compile failed)"
-      return
-    fi
-
-    # Step 3+4: Run HW and EMU concurrently.
-    # HW is I/O-bound (NPU), EMU is CPU-bound -- no contention.
-    local hw_dir="$trace_dir/hw"
-    local emu_dir="$trace_dir/emu"
-    local hw_ok=true emu_ok=true
-
-    # Launch EMU in background
-    (
-      XDNA_EMU=1 XRT_DEVICE_BDF="ffff:ff:1f.0" \
-        python3 "$tools_dir/trace-run.py" "$manifest" -o "$emu_dir" \
-        >> "$log_file.emu" 2>&1
-    ) &
-    local emu_pid=$!
-
-    # Run HW in foreground, then wait for NPU idle before next test
-    if [[ "$RUN_HW" == "true" ]]; then
-      if ! python3 "$tools_dir/trace-run.py" "$manifest" -o "$hw_dir" \
-          >> "$log_file.hw" 2>&1; then
-        hw_ok=false
-      fi
-      # Wait for NPU to release hardware contexts (fast poll, not fixed sleep)
-      wait_npu_idle
-    fi
-
-    # Wait for EMU
-    if ! wait "$emu_pid"; then
-      emu_ok=false
-    fi
-
-    # Merge sub-logs
-    cat "$log_file.hw" >> "$log_file" 2>/dev/null || true
-    cat "$log_file.emu" >> "$log_file" 2>/dev/null || true
-    rm -f "$log_file.hw" "$log_file.emu"
-
-    if ! $hw_ok && [[ "$RUN_HW" == "true" ]]; then
-      echo "ERROR hw_run_failed" > "$summary_file"
-      echo "  TRACE $name ($compiler): ERROR (hw run failed)"
-      return
-    fi
-    if ! $emu_ok; then
-      echo "ERROR emu_run_failed" > "$summary_file"
-      echo "  TRACE $name ($compiler): ERROR (emu run failed)"
-      return
-    fi
-
-    # Trim trace buffers to actual data length
-    python3 "$tools_dir/trace-trim.py" --dir "$trace_dir" >> "$log_file" 2>&1 || true
-
-    # Step 5: Compare (only if both traces exist)
-    if [[ "$RUN_HW" == "true" ]] && [[ -f "$trace_dir/hw/trace_raw.bin" ]] \
-        && [[ -f "$trace_dir/emu/trace_raw.bin" ]]; then
-      if ! run_trace_compare \
-          --hw "$trace_dir/hw/trace_raw.bin" \
-          --emu "$trace_dir/emu/trace_raw.bin" \
-          --remap-columns \
-          -o "$trace_dir/report.txt" >> "$log_file" 2>&1; then
-        echo "ERROR compare_failed" > "$summary_file"
-        echo "  TRACE $name ($compiler): ERROR (compare failed)"
-        return
-      fi
-    else
-      # EMU-only: no comparison possible, just record that trace was collected
-      echo "EMU_ONLY collected" > "$summary_file"
-      echo "  TRACE $name ($compiler): EMU_ONLY (trace collected, no HW to compare)"
-      return
-    fi
-  fi
-
-  # Parse the report to produce a one-line summary.
-  local report="$trace_dir/report.txt"
-  if [[ ! -f "$report" ]]; then
-    echo "ERROR no_report" > "$summary_file"
-    echo "  TRACE $name ($compiler): ERROR (no report)"
-    return
-  fi
-
-  # Extract key stats from the report's summary section.
-  local edge_line level_line pairs_line
-  edge_line="$(grep '^Edge event types:' "$report" 2>/dev/null || true)"
-  pairs_line="$(grep '^  Pairs:' "$report" 2>/dev/null || true)"
-
-  if [[ -n "$edge_line" ]]; then
-    # Parse: "Edge event types:    N clean, M diverged, K count mismatch"
-    local clean diverged
-    clean="$(echo "$edge_line" | grep -oP '\d+ clean' | grep -oP '\d+')"
-    diverged="$(echo "$edge_line" | grep -oP '\d+ diverged' | grep -oP '\d+')"
-    local pairs="0"
-    if [[ -n "$pairs_line" ]]; then
-      pairs="$(echo "$pairs_line" | grep -oP '\d+')"
-    fi
-
-    if [[ "${diverged:-0}" -eq 0 ]]; then
-      echo "CLEAN ${clean:-0} event types, ${pairs} pairs" > "$summary_file"
-      echo "  TRACE $name ($compiler): CLEAN (${clean:-0} event types, ${pairs} pairs)"
-    else
-      echo "DIVERGE ${diverged} of $((${clean:-0}+${diverged})) event types" > "$summary_file"
-      echo "  TRACE $name ($compiler): DIVERGE (${diverged} of $((${clean:-0}+${diverged})) event types)"
-    fi
-  else
-    echo "UNKNOWN parse_error" > "$summary_file"
-    echo "  TRACE $name ($compiler): UNKNOWN (could not parse report)"
-  fi
-}
-export -f trace_one_test
-
 # ---------------------------------------------------------------------------
 # Phase 5: Report
 # ---------------------------------------------------------------------------
@@ -1183,7 +933,9 @@ print_report() {
   local -n test_list=$1
   local run_hw=$2
   local has_trace=false
-  [[ -n "$TRACE_MODE" ]] && has_trace=true
+  # NOTE: Old TRACE_MODE variable removed. Task 6 will update this to
+  # use always-on trace results instead.
+  [[ -n "${TRACE_MODE:-}" ]] && has_trace=true
 
   local compilers
   read -ra compilers <<< "$COMPILERS_STR"
@@ -1578,25 +1330,6 @@ main() {
     emu_pool_pid=$!
   fi
 
-  # Launch background trace compile-ahead (overlaps with HW+EMU runs).
-  local trace_compile_pid=""
-  if [[ -n "$TRACE_MODE" ]] && [[ "$TRACE_MODE" == "compare" || "$TRACE_MODE" == "compare-all" ]]; then
-    local trace_compile_targets=()
-    for name in "${compiled[@]}"; do
-      is_trace_quarantined "$name" && continue
-      trace_compile_targets+=("$name")
-    done
-
-    if [[ ${#trace_compile_targets[@]} -gt 0 ]]; then
-      info "Background: compiling ${#trace_compile_targets[@]} traced xclbin(s) (-j${JOBS})"
-      (
-        printf '%s\n' "${trace_compile_targets[@]}" | \
-          xargs -P"$JOBS" -I{} bash -c 'compile_trace_base_one "$@"' _ {}
-      ) &
-      trace_compile_pid=$!
-    fi
-  fi
-
   # Launch HW with NPU job pool (if enabled), concurrently with EMU.
   if $RUN_HW; then
     local tdr_suspect_file="$RESULTS_DIR/tdr_suspects.log"
@@ -1718,230 +1451,6 @@ main() {
   fi
   info "EMU runs done"
   echo ""
-
-  # ---- Phase 4b: Trace comparison (optional) ------------------------------
-
-  if [[ -n "$TRACE_MODE" ]]; then
-    # Determine which tests to trace.
-    local trace_targets=()
-    local trace_include_failing=false
-    local trace_sweep=false
-    local trace_compare=false
-
-    case "$TRACE_MODE" in
-      default)     ;;
-      all)         trace_include_failing=true ;;
-      sweep)       trace_sweep=true ;;
-      sweep-all)   trace_sweep=true; trace_include_failing=true ;;
-      compare)     trace_sweep=true; trace_compare=true ;;
-      compare-all) trace_sweep=true; trace_compare=true; trace_include_failing=true ;;
-    esac
-
-    # For compare mode, filter on HW pass (not bridge pass) since we're
-    # measuring NPU determinism, not emulator accuracy.
-    for name in "${compiled[@]}"; do
-      if ! $trace_include_failing; then
-        local safe
-        safe="$(sanitize_name "$name")"
-        local any_pass=false
-        for compiler in "${compilers[@]}"; do
-          if $trace_compare; then
-            # Compare mode: require HW pass.
-            local hr="FAIL"
-            [[ -f "$RESULTS_DIR/${safe}.${compiler}.hw.result" ]] && hr="$(< "$RESULTS_DIR/${safe}.${compiler}.hw.result")"
-            [[ "$hr" == "PASS" ]] && any_pass=true
-          else
-            # Normal trace mode: require bridge (EMU) pass.
-            local br="FAIL"
-            [[ -f "$RESULTS_DIR/${safe}.${compiler}.bridge.result" ]] && br="$(< "$RESULTS_DIR/${safe}.${compiler}.bridge.result")"
-            [[ "$br" == "PASS" ]] && any_pass=true
-          fi
-          $any_pass && break
-        done
-        if ! $any_pass; then
-          continue
-        fi
-      fi
-      # Skip trace-quarantined tests (IOMMU faults, NPU wedge).
-      if $trace_compare && is_trace_quarantined "$name"; then
-        continue
-      fi
-      # Skip HW-quarantined tests in compare mode (they TDR).
-      if $trace_compare && is_quarantined "$name:chess" && is_quarantined "$name:peano"; then
-        continue
-      fi
-      trace_targets+=("$name")
-    done
-
-    if $trace_compare; then
-      # --- Compare mode: serial-vs-parallel determinism check ---
-      # Wait for background trace compile-ahead to finish.
-      if [[ -n "$trace_compile_pid" ]]; then
-        info "Phase 4b: waiting for trace compile-ahead to finish..."
-        wait "$trace_compile_pid" 2>/dev/null || true
-        trace_compile_pid=""
-        info "Phase 4b: trace compile-ahead done"
-      fi
-
-      if [[ ${#trace_targets[@]} -gt 0 ]]; then
-        info "Phase 4b: Serial vs Parallel trace comparison for ${#trace_targets[@]} test(s)"
-        local cmp_pass=0 cmp_fail=0 cmp_err=0 cmp_skip=0
-        local cmp_results_file="$RESULTS_DIR/trace-compare-results.txt"
-        : > "$cmp_results_file"
-
-        # Snapshot IOMMU fault count before starting.
-        local iommu_before
-        iommu_before="$(iommu_fault_count)"
-
-        for name in "${trace_targets[@]}"; do
-          local safe
-          safe="$(sanitize_name "$name")"
-          local src_dir="$TEST_SRC/$name"
-          local cmp_dir="$RESULTS_DIR/${safe}.trace-compare"
-          local cmp_log="$RESULTS_DIR/${safe}.trace-compare.log"
-
-          local test_idx=$((cmp_pass + cmp_fail + cmp_err + cmp_skip + 1))
-
-          # Pre-flight: wait for NPU health (may need recovery from prior fault).
-          local wait_start
-          wait_start="$(uptime_sec)"
-          local npu_ok=false
-          for _w in $(seq 1 30); do
-            if npu_health_check; then
-              npu_ok=true
-              break
-            fi
-            echo "    waiting for NPU recovery... ($(( $(uptime_sec) - wait_start ))s)"
-            sleep 2
-          done
-          if ! $npu_ok; then
-            err "NPU did not recover after 60s -- aborting remaining tests"
-            echo "ABORT npu_wedged" > "$RESULTS_DIR/${safe}.trace-compare.result"
-            ((cmp_err++)) || true
-            break
-          fi
-
-          echo "  [${test_idx}/${#trace_targets[@]}] COMPARE $name  @$(uptime_sec)s"
-
-          # Run trace-sweep.py with --compare-parallel.
-          # Use pre-compiled base if compile-ahead succeeded.
-          local compile_dir="$RESULTS_DIR/${safe}.trace-compile"
-          local sweep_args=("$src_dir" -o "$cmp_dir" --compare-parallel --hw-jobs "$NPU_HW_JOBS" --no-emu)
-          if [[ -f "$compile_dir/compile-status.txt" ]] \
-              && grep -q '^OK' "$compile_dir/compile-status.txt"; then
-            # Single-pass: base/ dir directly under compile_dir.
-            # Multi-pass: pass_NN/base/ dirs under compile_dir.
-            if [[ -d "$compile_dir/base" ]]; then
-              sweep_args+=(--use-base "$compile_dir/base")
-            elif [[ -d "$compile_dir/pass_00" ]]; then
-              sweep_args+=(--use-base "$compile_dir")
-            fi
-          fi
-
-          local iommu_pre_test
-          iommu_pre_test="$(iommu_fault_count)"
-          local sweep_result
-          sweep_result=$(
-            python3 "$EMU_ROOT/tools/trace-sweep.py" "${sweep_args[@]}" \
-              2>&1
-          ) || true
-          echo "$sweep_result" > "$cmp_log"
-
-          # Post-flight: check for IOMMU faults from THIS test.
-          local iommu_post_test
-          iommu_post_test="$(iommu_fault_count)"
-          if [[ $iommu_post_test -gt $iommu_pre_test ]]; then
-            local new_faults=$((iommu_post_test - iommu_pre_test))
-            err "IOMMU FAULT: $name caused $new_faults page fault(s)"
-            echo "IOMMU_FAULT $new_faults faults" > "$RESULTS_DIR/${safe}.trace-compare.result"
-            echo "    -> IOMMU_FAULT ($new_faults page faults -- waiting for NPU recovery)"
-            ((cmp_err++)) || true
-            # Don't break -- wait for recovery and continue with next test.
-            continue
-          fi
-
-          # Parse the serial-vs-parallel report.
-          local report="$cmp_dir/serial-vs-parallel-report.txt"
-          if [[ -f "$report" ]]; then
-            if grep -q 'DETERMINISTIC' "$report"; then
-              local batches diverged
-              batches="$(grep 'batches compared' "$report" | grep -oP '\d+')"
-              diverged="$(grep 'Diverged:' "$report" | grep -oP '\d+')"
-              if [[ "${diverged:-0}" -eq 0 ]]; then
-                echo "DETERMINISTIC ${batches:-?} batches" > "$RESULTS_DIR/${safe}.trace-compare.result"
-                echo "    -> DETERMINISTIC (${batches:-?} batches)"
-                ((cmp_pass++)) || true
-              else
-                echo "NON-DETERMINISTIC ${diverged}/${batches} diverged" > "$RESULTS_DIR/${safe}.trace-compare.result"
-                echo "    -> NON-DETERMINISTIC (${diverged}/${batches} diverged)"
-                ((cmp_fail++)) || true
-              fi
-            else
-              echo "ERROR no_verdict" > "$RESULTS_DIR/${safe}.trace-compare.result"
-              echo "    -> ERROR (no verdict in report)"
-              ((cmp_err++)) || true
-            fi
-          elif grep -q 'skipped' "$cmp_log" 2>/dev/null; then
-            echo "SKIP" > "$RESULTS_DIR/${safe}.trace-compare.result"
-            echo "    -> SKIP (trace injection unsupported)"
-            ((cmp_skip++)) || true
-          else
-            echo "ERROR no_report" > "$RESULTS_DIR/${safe}.trace-compare.result"
-            echo "    -> ERROR (no report generated)"
-            ((cmp_err++)) || true
-          fi
-        done
-
-        echo ""
-        echo "=== Determinism Summary ==="
-        echo "  Tests:             ${#trace_targets[@]}"
-        echo "  Deterministic:     $cmp_pass"
-        echo "  Non-deterministic: $cmp_fail"
-        echo "  Skipped:           $cmp_skip"
-        echo "  Errors/aborts:     $cmp_err"
-        # Save summary
-        {
-          echo "tests=${#trace_targets[@]}"
-          echo "deterministic=$cmp_pass"
-          echo "non_deterministic=$cmp_fail"
-          echo "skipped=$cmp_skip"
-          echo "errors=$cmp_err"
-        } > "$RESULTS_DIR/trace-compare-summary.txt"
-
-        info "Phase 4b done"
-      else
-        info "Phase 4b: No tests eligible for determinism comparison"
-      fi
-    else
-      # --- Normal trace modes: sweep or default ---
-      local trace_mode_arg="default"
-      if $trace_sweep; then
-        trace_mode_arg="sweep"
-      fi
-
-      if [[ ${#trace_targets[@]} -gt 0 ]]; then
-        info "Phase 4b: Trace comparison for ${#trace_targets[@]} test(s) (mode=$trace_mode_arg)"
-        for name in "${trace_targets[@]}"; do
-          for compiler in "${compilers[@]}"; do
-            local safe
-            safe="$(sanitize_name "$name")"
-            [[ -f "$RESULTS_DIR/${safe}.${compiler}.compile.result" ]] || continue
-            [[ "$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")" == "OK" ]] || continue
-            trace_one_test "$name" "$trace_mode_arg" "$compiler"
-          done
-        done
-        info "Phase 4b done"
-      else
-        info "Phase 4b: No tests eligible for tracing"
-      fi
-    fi
-    echo ""
-  fi
-
-  # Clean up any remaining background trace compile.
-  if [[ -n "$trace_compile_pid" ]]; then
-    wait "$trace_compile_pid" 2>/dev/null || true
-  fi
 
   # ---- Phase 5: Report ---------------------------------------------------
 
