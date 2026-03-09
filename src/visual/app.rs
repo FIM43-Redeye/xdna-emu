@@ -85,7 +85,7 @@ impl TraceViewerApp {
     ///
     /// On success, auto-selects the first tile (most divergent).
     /// On failure, stores the error for popup display.
-    fn load_trace_pair(&mut self, hw_dir: &std::path::Path, emu_dir: &std::path::Path) {
+    pub fn load_trace_pair(&mut self, hw_dir: &std::path::Path, emu_dir: &std::path::Path) {
         match LoadedComparison::from_trace_dirs(hw_dir, emu_dir) {
             Ok(comparison) => {
                 // Auto-select the most divergent tile.

@@ -46,8 +46,27 @@ fn main() -> anyhow::Result<()> {
         .find(|a| !a.starts_with('-') && a.as_str() != "--trace")
         .map(|s| s.as_str());
 
+    // Parse --trace-view-hw / --trace-view-emu flags for pre-loaded trace viewer.
+    let mut trace_hw: Option<&str> = None;
+    let mut trace_emu: Option<&str> = None;
+    {
+        let mut iter = args.iter().skip(1);
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "--trace-view-hw" => trace_hw = iter.next().map(|s| s.as_str()),
+                "--trace-view-emu" => trace_emu = iter.next().map(|s| s.as_str()),
+                _ => {}
+            }
+        }
+    }
+
+    // If trace viewer flags are present, launch GUI with trace pair loaded.
+    if trace_hw.is_some() || trace_emu.is_some() {
+        return run_gui(file_arg, trace_hw, trace_emu);
+    }
+
     if gui_mode || args.len() < 2 {
-        return run_gui(file_arg);
+        return run_gui(file_arg, None, None);
     }
 
     // Parse remaining options for CLI mode
@@ -67,7 +86,7 @@ fn main() -> anyhow::Result<()> {
     let path = match path {
         Some(p) => p,
         None => {
-            return run_gui(None);
+            return run_gui(None, None, None);
         }
     };
     println!("Loading: {}", path);
@@ -348,6 +367,8 @@ fn print_help() {
     println!("    -g, --gui           Launch visual debugger (default if no file)");
     println!("    --dump-state        Parse binary and dump device state");
     println!("    --trace <FILE>      Export Perfetto trace JSON after execution");
+    println!("    --trace-view-hw DIR   HW trace directory for trace viewer");
+    println!("    --trace-view-emu DIR  EMU trace directory for trace viewer");
     println!();
     println!("COMMANDS:");
     println!("    test-suite <PATH>   Run xclbin test suite from directory");
@@ -358,10 +379,18 @@ fn print_help() {
     println!("    xdna-emu --dump-state kernel.xclbin");
     println!("    xdna-emu --trace trace.json test-suite ./tests/");
     println!("    xdna-emu kernel.elf              # Parse ELF file");
+    println!("    xdna-emu --trace-view-hw hw/ --trace-view-emu emu/  # Compare traces");
 }
 
 /// Run the GUI application.
-fn run_gui(_file_path: Option<&str>) -> anyhow::Result<()> {
+///
+/// When `trace_hw` and `trace_emu` are both provided, the trace viewer
+/// opens with that pair pre-loaded (no file dialog needed).
+fn run_gui(
+    _file_path: Option<&str>,
+    trace_hw: Option<&str>,
+    trace_emu: Option<&str>,
+) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 800.0])
@@ -369,10 +398,20 @@ fn run_gui(_file_path: Option<&str>) -> anyhow::Result<()> {
         ..Default::default()
     };
 
+    // Convert to owned paths before moving into the closure.
+    let hw_path = trace_hw.map(std::path::PathBuf::from);
+    let emu_path = trace_emu.map(std::path::PathBuf::from);
+
     eframe::run_native(
         "xdna-emu",
         options,
-        Box::new(|_cc| Ok(Box::new(xdna_emu::visual::TraceViewerApp::default()))),
+        Box::new(move |_cc| {
+            let mut app = xdna_emu::visual::TraceViewerApp::default();
+            if let (Some(hw), Some(emu)) = (&hw_path, &emu_path) {
+                app.load_trace_pair(hw, emu);
+            }
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("GUI error: {}", e))
 }
