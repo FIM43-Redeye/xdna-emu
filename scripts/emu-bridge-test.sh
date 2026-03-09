@@ -563,18 +563,6 @@ compile_one_compiler() {
     return 0
   fi
 
-  # Check cache
-  local have_xclbin=false
-  if [[ -f "$build_dir/aie.xclbin" ]] || ls "$build_dir"/*.xclbin &>/dev/null; then
-    have_xclbin=true
-  fi
-
-  if $have_xclbin && [[ "$FORCE_COMPILE" != "true" ]]; then
-    echo "  COMPILE $name ($compiler): cached"
-    echo "OK" > "$result_file"
-    return 0
-  fi
-
   # Prepare architecture MLIR (NPUDEVICE substitution)
   local npu_dev
   npu_dev="$(get_npu_device "$src_dir")"
@@ -586,6 +574,28 @@ compile_one_compiler() {
   # Use traced MLIR if trace preparation succeeded.
   if [[ "$TRACE_OK" == "true" ]] && [[ -f "$TRACED_DIR/aie_traced.mlir" ]]; then
     cp "$TRACED_DIR/aie_traced.mlir" "$build_dir/aie_arch.mlir"
+  fi
+
+  # Check cache -- must come AFTER traced MLIR substitution so that
+  # the cache is invalidated when the MLIR has changed (e.g., tracing
+  # was enabled on a previously-compiled test).
+  local have_xclbin=false
+  if [[ -f "$build_dir/aie.xclbin" ]] || ls "$build_dir"/*.xclbin &>/dev/null; then
+    have_xclbin=true
+  fi
+
+  # Invalidate cache if MLIR changed since last compile.
+  if $have_xclbin && [[ -f "$build_dir/aie_arch.mlir" ]] \
+      && [[ -f "$build_dir/aie.xclbin" ]]; then
+    if [[ "$build_dir/aie_arch.mlir" -nt "$build_dir/aie.xclbin" ]]; then
+      have_xclbin=false
+    fi
+  fi
+
+  if $have_xclbin && [[ "$FORCE_COMPILE" != "true" ]]; then
+    echo "  COMPILE $name ($compiler): cached"
+    echo "OK" > "$result_file"
+    return 0
   fi
 
   local failed=false
