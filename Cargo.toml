@@ -50,6 +50,7 @@ goblin = "0.10"
 # GUI framework
 eframe = "0.31"                                         # egui framework for native apps
 egui_extras = { version = "0.31", features = ["image"] } # Extra widgets
+rfd = "0.15"                                            # Native file dialogs
 
 # Logging
 log = "0.4"
