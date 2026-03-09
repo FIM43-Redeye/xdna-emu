@@ -4,4 +4,5 @@
 //! HW vs EMU event timelines side by side, highlights divergences, and
 //! supports piecewise alignment for phase-aware comparison.
 
+pub mod alignment;
 pub mod theme;
