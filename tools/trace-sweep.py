@@ -287,8 +287,13 @@ def run_batch(
     trace_out = batch_dir / mode
     trace_out.mkdir(parents=True, exist_ok=True)
 
-    # Substitute insts.bin path in run command.
-    cmd = run_cmd.replace("insts.bin", str(batch_insts))
+    # Substitute the trailing insts.bin argument in the run command.
+    # Use -i flag replacement first (most test.exe invocations), fall back
+    # to bare trailing replacement.
+    if " -i insts.bin" in run_cmd:
+        cmd = run_cmd.replace(" -i insts.bin", f" -i {batch_insts}")
+    else:
+        cmd = run_cmd.replace("insts.bin", str(batch_insts))
 
     env = os.environ.copy()
     env["XDNA_TRACE_DIR"] = str(trace_out)
@@ -427,7 +432,6 @@ def run_sweep(
     base_insts = build_dir / "insts.bin"
 
     # Prepare all batches (patch only, no execution).
-    noop_batch = ["TRUE"] + ["NONE"] * 7
     batches = []
     for i in range(num_batches):
         info = prepare_batch(
@@ -575,12 +579,12 @@ def main():
 
     # Pad to same length.
     while len(core_batches) < num_batches:
-        core_batches.append(noop_batch)
+        core_batches.append(noop_batch[:])
     while len(mem_batches) < num_batches:
-        mem_batches.append(noop_batch)
+        mem_batches.append(noop_batch[:])
     if memtile_batches:
         while len(memtile_batches) < num_batches:
-            memtile_batches.append(noop_batch)
+            memtile_batches.append(noop_batch[:])
 
     print(f"Trace sweep: {build_dir.name}")
     print(f"  Build:     {build_dir}")
