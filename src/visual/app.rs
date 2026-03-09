@@ -4,6 +4,8 @@
 //! top-level layout: menu bar, tile sidebar, event detail panel, status
 //! bar, and the central timeline rendering area.
 
+use std::path::PathBuf;
+
 use eframe::egui;
 
 use crate::trace::compare::TileKey;
@@ -35,6 +37,8 @@ pub struct TraceViewerApp {
     batch_names: Vec<String>,
     /// Currently selected batch index.
     selected_batch: usize,
+    /// Path from a drag-and-drop operation, consumed on the next frame.
+    dropped_path: Option<PathBuf>,
 }
 
 impl Default for TraceViewerApp {
@@ -48,6 +52,7 @@ impl Default for TraceViewerApp {
             error: None,
             batch_names: vec!["Batch 0".to_string()],
             selected_batch: 0,
+            dropped_path: None,
         }
     }
 }
@@ -107,6 +112,66 @@ impl TraceViewerApp {
 
 impl eframe::App for TraceViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ====================================================================
+        // Keyboard shortcuts (must be outside any panel closure)
+        // ====================================================================
+        ctx.input(|i| {
+            // Home or F: fit timeline to full range.
+            if i.key_pressed(egui::Key::Home) || i.key_pressed(egui::Key::F) {
+                self.timeline_state.reset();
+            }
+
+            // Escape: clear event selection.
+            if i.key_pressed(egui::Key::Escape) {
+                self.selected_event = None;
+            }
+
+            // Arrow keys: pan the viewport.
+            if i.key_pressed(egui::Key::ArrowLeft) {
+                self.timeline_state.viewport.pan_px(50.0);
+            }
+            if i.key_pressed(egui::Key::ArrowRight) {
+                self.timeline_state.viewport.pan_px(-50.0);
+            }
+
+            // Plus/Equals: zoom in. Minus: zoom out.
+            if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
+                let center = self.timeline_state.viewport.width_px / 2.0;
+                self.timeline_state.viewport.zoom_at(1.2, center);
+            }
+            if i.key_pressed(egui::Key::Minus) {
+                let center = self.timeline_state.viewport.width_px / 2.0;
+                self.timeline_state.viewport.zoom_at(0.8, center);
+            }
+        });
+
+        // ====================================================================
+        // Drag-and-drop: accept dropped directories as trace sources
+        // ====================================================================
+        ctx.input(|i| {
+            if !i.raw.dropped_files.is_empty() {
+                if let Some(file) = i.raw.dropped_files.first() {
+                    if let Some(path) = &file.path {
+                        self.dropped_path = Some(path.clone());
+                    }
+                }
+            }
+        });
+
+        if let Some(path) = self.dropped_path.take() {
+            if path.is_dir() {
+                // Ask for the second directory via native file dialog.
+                if let Some(other) = rfd::FileDialog::new()
+                    .set_title("Select the other trace directory (HW or EMU)")
+                    .pick_folder()
+                {
+                    // Try both orderings -- load_trace_pair checks for
+                    // trace_raw.bin existence internally.
+                    self.load_trace_pair(&path, &other);
+                }
+            }
+        }
+
         // ====================================================================
         // Menu bar (top panel)
         // ====================================================================
