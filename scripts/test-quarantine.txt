@@ -1,0 +1,11 @@
+# test-quarantine.txt -- Tests that are fundamentally broken.
+#
+# Tests listed here are skipped entirely: no compile, no run, no trace.
+# Unlike trace-quarantine.txt (which only skips trace injection), these
+# tests have structural problems (segfault, compile failure, missing
+# dependencies) that make them unable to run at all.
+#
+# Format: one test directory name per line.
+# Lines starting with # are comments.
+
+# (none yet -- add tests here as they are identified)
