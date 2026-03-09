@@ -314,7 +314,7 @@ def run_batch(
     try:
         result = subprocess.run(
             ["bash", "-c", cmd],
-            capture_output=True, text=True,
+            capture_output=True, text=True, errors="replace",
             timeout=300, cwd=str(build_dir), env=env,
         )
     except subprocess.TimeoutExpired:
