@@ -95,15 +95,31 @@ def _find_last_xrt_bo_declaration(root: Node, source_bytes: bytes) -> Optional[N
 
 
 def _extract_group_ids(root: Node, source_bytes: bytes) -> list[int]:
-    """Extract all integer arguments to kernel.group_id(N) calls."""
-    ids = []
+    """Extract all integer arguments to kernel.group_id(N) calls.
+
+    Only matches leaf-level group_id call expressions (not their parents)
+    to avoid double-counting when a group_id call is nested inside an
+    xrt::bo constructor call.
+    """
+    ids: set[int] = set()
     for node in _walk_all(root):
         if node.type == "call_expression":
-            text = source_bytes[node.start_byte:node.end_byte].decode()
-            # Match kernel.group_id(N) or similar patterns
-            for m in re.finditer(r'\.group_id\((\d+)\)', text):
-                ids.append(int(m.group(1)))
-    return ids
+            # Only match nodes whose callee ends with .group_id
+            func = node.child_by_field_name("function")
+            if func is None:
+                continue
+            func_text = source_bytes[func.start_byte:func.end_byte].decode()
+            if not func_text.endswith(".group_id"):
+                continue
+            # Extract the integer argument
+            args = node.child_by_field_name("arguments")
+            if args is None:
+                continue
+            args_text = source_bytes[args.start_byte:args.end_byte].decode()
+            m = re.search(r'\((\d+)\)', args_text)
+            if m:
+                ids.add(int(m.group(1)))
+    return sorted(ids)
 
 
 def _find_kernel_call(root: Node, source_bytes: bytes) -> Optional[Node]:
@@ -287,8 +303,8 @@ def patch_test_cpp(source: str, trace_size: int = 1048576) -> str:
     Raises:
         PatchError: If required insertion points cannot be found.
     """
-    # Skip if already traced
-    if "trace_size" in source:
+    # Skip if already traced (look for the specific declaration pattern)
+    if re.search(r'\btrace_size\b', source):
         return source
 
     source_bytes = source.encode("utf-8")

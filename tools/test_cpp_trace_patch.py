@@ -69,6 +69,14 @@ class TestTraceBufferAllocation:
         # Existing group_ids are 1, 3, 5 -> max is 5, next is 6
         assert "kernel.group_id(6)" in result
 
+    def test_next_group_id_dense(self):
+        """Dense group_id allocation (0, 1, 2) -> next is 3."""
+        cpp = MINIMAL_CPP.replace("group_id(1)", "group_id(0)")
+        cpp = cpp.replace("group_id(3)", "group_id(1)")
+        cpp = cpp.replace("group_id(5)", "group_id(2)")
+        result = patch_test_cpp(cpp)
+        assert "kernel.group_id(3)" in result
+
     def test_trace_size_default(self):
         result = patch_test_cpp(MINIMAL_CPP)
         assert "constexpr size_t trace_size = 1048576;" in result
