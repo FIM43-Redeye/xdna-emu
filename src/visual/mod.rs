@@ -1,26 +1,7 @@
-//! GUI visualization for AMD XDNA NPU emulation.
+//! Trace comparison visualizer for AMD XDNA NPU emulation.
 //!
-//! This module provides an egui-based visual debugger that shows:
-//! - Tile array grid with status colors
-//! - Core state details (PC, registers, status)
-//! - Memory hex view
-//! - Lock states
-//! - DMA buffer descriptors
-//! - Emulation controls (run, step, pause, reset)
-//!
-//! # Usage
-//!
-//! ```ignore
-//! use xdna_emu::visual::EmulatorApp;
-//!
-//! let app = EmulatorApp::default();
-//! eframe::run_native("xdna-emu", options, Box::new(|_| Ok(Box::new(app))));
-//! ```
+//! Replaces the old emulator GUI with a trace-focused tool that renders
+//! HW vs EMU event timelines side by side, highlights divergences, and
+//! supports piecewise alignment for phase-aware comparison.
 
-mod app;
-mod tile_grid;
-mod tile_detail;
-mod controls;
-mod memory_view;
-
-pub use app::EmulatorApp;
+// Modules will be added in subsequent tasks.

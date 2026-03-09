@@ -9,7 +9,6 @@ use xdna_emu::parser::cdo::{find_cdo_offset, CdoCommand};
 use xdna_emu::device::{TileAddress, RegisterInfo, DeviceState};
 use xdna_emu::device::registers::{subsystem_from_offset, tile_kind_from_row};
 use xdna_emu::archspec::types::SubsystemKind;
-use xdna_emu::visual::EmulatorApp;
 use xdna_emu::testing::XclbinSuite;
 
 fn main() -> anyhow::Result<()> {
@@ -362,28 +361,8 @@ fn print_help() {
 }
 
 /// Run the GUI application.
-fn run_gui(file_path: Option<&str>) -> anyhow::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0])
-            .with_title("xdna-emu - AMD XDNA NPU Emulator"),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "xdna-emu",
-        options,
-        Box::new(move |_cc| {
-            let mut app = EmulatorApp::default();
-
-            // Load file if provided
-            if let Some(path) = file_path {
-                if let Err(e) = app.load_xclbin(std::path::Path::new(path)) {
-                    app.error_message = Some(format!("Failed to load: {}", e));
-                }
-            }
-
-            Ok(Box::new(app))
-        }),
-    ).map_err(|e| anyhow::anyhow!("GUI error: {}", e))
+fn run_gui(_file_path: Option<&str>) -> anyhow::Result<()> {
+    println!("Trace visualizer is under construction.");
+    println!("Use --help for CLI options.");
+    Ok(())
 }

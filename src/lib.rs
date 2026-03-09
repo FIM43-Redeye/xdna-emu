@@ -10,7 +10,7 @@
 //! - [`interpreter`]: Accurate AIE2 interpreter
 //! - [`tablegen`]: TableGen parser for instruction definitions
 //! - [`npu`]: Host-to-NPU instruction execution
-//! - [`visual`]: GUI visualization (egui-based)
+//! - [`visual`]: Trace comparison visualizer (egui-based)
 //! - [`integration`]: External tool integration
 //! - [`testing`]: Test harness for XCLBIN binary compatibility
 //! - [`ffi`]: C-compatible Foreign Function Interface
