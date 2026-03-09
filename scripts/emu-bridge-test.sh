@@ -13,11 +13,12 @@
 # Chess is the ground truth compiler. Peano results are informational --
 # compile failures with Peano are expected for some Chess-specific tests.
 #
-# Four-phase pipelined architecture:
-#   Phase 1: Discover       -- find tests, filter, skip npu2-only
-#   Phase 2: Compile        -- parallel xclbin builds (both compilers in parallel) + test.exe
-#   Phase 3+4: Run HW+EMU  -- HW (-j5) and EMU (-j$JOBS) run concurrently
-#   Phase 5: Report         -- per-compiler comparison matrix + summary
+# Six-phase pipelined architecture:
+#   Phase 1: Discover        -- find tests, filter, skip npu2-only
+#   Phase 2: Compile         -- parallel xclbin builds (both compilers in parallel) + test.exe
+#   Phase 3+4: Run HW+EMU   -- HW (-j5) and EMU (-j$JOBS) run concurrently
+#   Phase 5: Trace compare   -- automatic trace comparison (HW vs EMU)
+#   Phase 6: Report          -- per-compiler comparison matrix + summary
 #
 # Usage:
 #   ./scripts/emu-bridge-test.sh                    # all tests, both compilers
@@ -926,16 +927,14 @@ run_trace_compare() {
 export -f run_trace_compare
 
 # ---------------------------------------------------------------------------
-# Phase 5: Report
+# Phase 6: Report
 # ---------------------------------------------------------------------------
 
 print_report() {
   local -n test_list=$1
   local run_hw=$2
   local has_trace=false
-  # NOTE: Old TRACE_MODE variable removed. Task 6 will update this to
-  # use always-on trace results instead.
-  [[ -n "${TRACE_MODE:-}" ]] && has_trace=true
+  [[ "$NO_TRACE" != "true" ]] && has_trace=true
 
   local compilers
   read -ra compilers <<< "$COMPILERS_STR"
@@ -1083,7 +1082,7 @@ print_report() {
             CLEAN*)   trace_clean[$compiler]=$(( ${trace_clean[$compiler]} + 1 )) ;;
             DIVERGE*) trace_diverge[$compiler]=$(( ${trace_diverge[$compiler]} + 1 )) ;;
             ERROR*)   trace_error[$compiler]=$(( ${trace_error[$compiler]} + 1 )) ;;
-            SKIP*|EMU_ONLY*) trace_skip[$compiler]=$(( ${trace_skip[$compiler]} + 1 )) ;;
+            SKIP*|EMU_ONLY*|HW_ONLY*|NONE*) trace_skip[$compiler]=$(( ${trace_skip[$compiler]} + 1 )) ;;
           esac
         else
           trace_skip[$compiler]=$(( ${trace_skip[$compiler]} + 1 ))
@@ -1452,9 +1451,47 @@ main() {
   info "EMU runs done"
   echo ""
 
-  # ---- Phase 5: Report ---------------------------------------------------
+  # ---- Phase 5: Automatic trace comparison --------------------------------
 
-  info "Phase 5: Report"
+  if [[ "$NO_TRACE" != "true" ]]; then
+    info "Phase 5: Comparing traces"
+    for name in "${compiled[@]}"; do
+      local safe
+      safe="$(sanitize_name "$name")"
+      for compiler in "${compilers[@]}"; do
+        local hw_trace="$RESULTS_DIR/${safe}.${compiler}.hw/trace_raw.bin"
+        local emu_trace="$RESULTS_DIR/${safe}.${compiler}.emu/trace_raw.bin"
+        local events_file="$RESULTS_DIR/${safe}.${compiler}.hw/events.json"
+        [[ ! -f "$events_file" ]] && events_file="$RESULTS_DIR/${safe}.${compiler}.emu/events.json"
+        local summary_file="$RESULTS_DIR/${safe}.${compiler}.trace.summary"
+
+        if [[ -f "$hw_trace" ]] && [[ -f "$emu_trace" ]]; then
+          local cmp_log="$RESULTS_DIR/${safe}.${compiler}.trace.log"
+          local cmp_out
+          cmp_out="$(run_trace_compare --hw "$hw_trace" --emu "$emu_trace" 2>&1)" || true
+          echo "$cmp_out" > "$cmp_log"
+
+          if echo "$cmp_out" | grep -q "CLEAN"; then
+            echo "CLEAN" > "$summary_file"
+          elif echo "$cmp_out" | grep -q "DIVERGE"; then
+            echo "DIVERGE" > "$summary_file"
+          else
+            echo "ERROR" > "$summary_file"
+          fi
+        elif [[ -f "$emu_trace" ]]; then
+          echo "EMU_ONLY" > "$summary_file"
+        elif [[ -f "$hw_trace" ]]; then
+          echo "HW_ONLY" > "$summary_file"
+        else
+          echo "NONE" > "$summary_file"
+        fi
+      done
+    done
+  fi
+
+  # ---- Phase 6: Report ---------------------------------------------------
+
+  info "Phase 6: Report"
   print_report tests "$RUN_HW"
 }
 
