@@ -10,5 +10,7 @@ pub mod data;
 pub mod event_detail;
 pub mod theme;
 pub mod tile_selector;
+pub mod timeline;
+pub mod viewport;
 
 pub use app::TraceViewerApp;

@@ -2,7 +2,7 @@
 //!
 //! [`TraceViewerApp`] implements [`eframe::App`] and orchestrates the
 //! top-level layout: menu bar, tile sidebar, event detail panel, status
-//! bar, and central timeline area (placeholder for Phase 3).
+//! bar, and the central timeline rendering area.
 
 use eframe::egui;
 
@@ -11,6 +11,7 @@ use crate::trace::compare::TileKey;
 use super::data::{LoadedComparison, TraceSource};
 use super::event_detail::{self, SelectedEvent};
 use super::tile_selector;
+use super::timeline;
 
 // ============================================================================
 // TraceViewerApp
@@ -24,6 +25,8 @@ pub struct TraceViewerApp {
     selected_tile: Option<TileKey>,
     /// Currently selected event (from timeline interaction).
     selected_event: Option<SelectedEvent>,
+    /// Persistent state for the timeline widget (viewport, initialization).
+    timeline_state: timeline::TimelineState,
     /// Status bar message.
     status: String,
     /// Error message to display in a popup window.
@@ -36,6 +39,7 @@ impl Default for TraceViewerApp {
             source: None,
             selected_tile: None,
             selected_event: None,
+            timeline_state: timeline::TimelineState::default(),
             status: "Ready. Open a trace pair to begin.".to_string(),
             error: None,
         }
@@ -166,17 +170,27 @@ impl eframe::App for TraceViewerApp {
                     ) {
                         self.selected_tile = Some(new_tile);
                         self.selected_event = None;
+                        self.timeline_state.reset();
                     }
                 });
         }
 
         // ====================================================================
-        // Central panel (timeline placeholder)
+        // Central panel (timeline)
         // ====================================================================
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.source.is_some() {
+            if let (Some(ref source), Some(ref tile)) = (&self.source, &self.selected_tile) {
+                if let Some(event) = timeline::show_timeline(
+                    ui,
+                    source as &dyn TraceSource,
+                    tile,
+                    &mut self.timeline_state,
+                ) {
+                    self.selected_event = Some(event);
+                }
+            } else if self.source.is_some() {
                 ui.centered_and_justified(|ui| {
-                    ui.label("Timeline will render here.");
+                    ui.label("Select a tile from the sidebar.");
                 });
             } else {
                 ui.centered_and_justified(|ui| {
