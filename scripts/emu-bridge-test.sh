@@ -84,6 +84,7 @@ LIST_ONLY=false
 VERBOSE=false
 TRACE_MODE=""  # "", "default", "all", "sweep", "sweep-all"
 COMPILER_MODE="both"  # "both", "chess", "peano"
+NO_TRACE="${NO_TRACE:-false}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -108,6 +109,7 @@ while [[ $# -gt 0 ]]; do
       shift ;;
     --chess-only|--chess)  COMPILER_MODE="chess"; shift ;;
     --peano-only|--peano)  COMPILER_MODE="peano"; shift ;;
+    --no-trace)            NO_TRACE=true; shift ;;
     --serial-hw)           NPU_HW_JOBS=1; shift ;;
     --help|-h)
       cat <<'USAGE'
@@ -117,6 +119,7 @@ Options:
   --compile       Force recompile all xclbins (default: use cached)
   --no-hw         Skip real hardware runs (default: hardware enabled)
   --no-emu        Skip emulator runs (default: emulator enabled)
+  --no-trace      Disable always-on trace preparation (default: traces enabled)
   --list          List available tests and exit
   --trace         Run trace comparison (default events, passing tests only)
   --trace=all     Trace all tests (pass + fail)
@@ -162,8 +165,8 @@ for _c in "${COMPILERS[@]}"; do
 done
 
 # Export variables that parallel jobs need.
-export RESULTS_DIR FORCE_COMPILE VERBOSE TRACE_MODE RUN_EMU
-export MLIR_AIE TEST_SRC BUILD_BASE EMU_ROOT
+export RESULTS_DIR FORCE_COMPILE VERBOSE TRACE_MODE RUN_EMU NO_TRACE
+export MLIR_AIE TEST_SRC BUILD_BASE EMU_ROOT SCRIPT_DIR TRACE_QUARANTINE_FILE
 export XRT_DIR XRT_INCLUDE XRT_LIB
 export TEST_LIB_DIR TEST_UTILS_INCLUDE TEST_UTILS_LIB
 export AIETOOLS_DIR
@@ -220,8 +223,41 @@ if [[ -f "$TRACE_QUARANTINE_FILE" ]]; then
 fi
 
 is_trace_quarantined() {
-  [[ -n "${TRACE_QUARANTINE[${1}]+x}" ]]
+  # Fast path: associative array (main process only -- not exported).
+  if [[ ${#TRACE_QUARANTINE[@]} -gt 0 ]] 2>/dev/null; then
+    [[ -n "${TRACE_QUARANTINE[${1}]+x}" ]]
+    return
+  fi
+  # Slow path: file read (subshells via xargs).
+  local name="$1"
+  [[ -f "$TRACE_QUARANTINE_FILE" ]] || return 1
+  while IFS= read -r line; do
+    local entry="${line%%#*}"
+    entry="${entry// /}"
+    [[ -z "$entry" ]] && continue
+    [[ "$entry" == "$name" ]] && return 0
+  done < "$TRACE_QUARANTINE_FILE"
+  return 1
 }
+export -f is_trace_quarantined
+
+# ---------------------------------------------------------------------------
+# Test quarantine (fundamentally broken tests -- skip entirely)
+# ---------------------------------------------------------------------------
+
+is_test_quarantined() {
+  local name="${1%%:*}"  # Strip compiler suffix if present.
+  local quarantine_file="$SCRIPT_DIR/test-quarantine.txt"
+  [[ -f "$quarantine_file" ]] || return 1
+  while IFS= read -r line; do
+    local entry="${line%%#*}"
+    entry="${entry// /}"
+    [[ -z "$entry" ]] && continue
+    [[ "$entry" == "$name" ]] && return 0
+  done < "$quarantine_file"
+  return 1
+}
+export -f is_test_quarantined
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -559,6 +595,11 @@ compile_one_compiler() {
     sed "s/NPUDEVICE/${npu_dev}/g" -i "$build_dir/aie_arch.mlir"
   fi
 
+  # Use traced MLIR if trace preparation succeeded.
+  if [[ "$TRACE_OK" == "true" ]] && [[ -f "$TRACED_DIR/aie_traced.mlir" ]]; then
+    cp "$TRACED_DIR/aie_traced.mlir" "$build_dir/aie_arch.mlir"
+  fi
+
   local failed=false
   while IFS= read -r cmd; do
     [[ -z "$cmd" ]] && continue
@@ -619,6 +660,39 @@ compile_one() {
   local build_dir="$BUILD_BASE/$name"
   local lit_file="$src_dir/run.lit"
 
+  # Check test quarantine (fundamentally broken tests -- skip entirely).
+  if is_test_quarantined "$name"; then
+    local compilers
+    read -ra compilers <<< "$COMPILERS_STR"
+    for compiler in "${compilers[@]}"; do
+      echo "SKIP_QUARANTINED" > "$RESULTS_DIR/${safe}.${compiler}.compile.result"
+    done
+    echo "  COMPILE $name: SKIP (test-quarantined)"
+    return 0
+  fi
+
+  # ---- Trace preparation (always-on unless --no-trace) ----
+  local traced_dir="$build_dir/traced"
+  local trace_ok=false
+
+  if [[ "$NO_TRACE" != "true" ]] && ! is_trace_quarantined "$name"; then
+    local trace_log="$RESULTS_DIR/${safe}.trace-prepare.log"
+    if nice -n 19 python3 "$EMU_ROOT/tools/trace-prepare.py" "$src_dir" \
+        -o "$traced_dir" > "$trace_log" 2>&1; then
+      if [[ -f "$traced_dir/prepare-status.txt" ]] \
+          && grep -q '^OK' "$traced_dir/prepare-status.txt"; then
+        trace_ok=true
+        echo "  TRACE PREP $name: OK"
+      else
+        echo "  TRACE PREP $name: FAIL (status)"
+      fi
+    else
+      echo "  TRACE PREP $name: FAIL (exit code)"
+    fi
+  fi
+  export TRACE_OK="$trace_ok"
+  export TRACED_DIR="$traced_dir"
+
   # Reconstruct COMPILERS array from serialized string
   local compilers
   read -ra compilers <<< "$COMPILERS_STR"
@@ -639,10 +713,16 @@ compile_one() {
   : > "$log_file"
 
   if [[ -f "$src_dir/test.cpp" ]]; then
-    sed \
-      -e 's/unsigned int device_index = 0;/const char* _bdf = std::getenv("XRT_DEVICE_BDF");/' \
-      -e 's/auto device = xrt::device(device_index);/auto device = _bdf ? xrt::device(std::string(_bdf)) : xrt::device(0);/' \
-      "$src_dir/test.cpp" > "$build_dir/test.cpp"
+    if [[ "$TRACE_OK" == "true" ]] && [[ -f "$traced_dir/test_traced.cpp" ]]; then
+      # Use tree-sitter-patched version (includes BDF + trace transforms).
+      cp "$traced_dir/test_traced.cpp" "$build_dir/test.cpp"
+    else
+      # No tracing -- just apply BDF patch.
+      sed \
+        -e 's/unsigned int device_index = 0;/const char* _bdf = std::getenv("XRT_DEVICE_BDF");/' \
+        -e 's/auto device = xrt::device(device_index);/auto device = _bdf ? xrt::device(std::string(_bdf)) : xrt::device(0);/' \
+        "$src_dir/test.cpp" > "$build_dir/test.cpp"
+    fi
   fi
 
   # Find the clang/g++ line from run.lit for correct flags
@@ -719,6 +799,9 @@ run_one_hardware() {
   local run_cmd
   run_cmd="$(get_run_cmd "$src_dir")"
 
+  local trace_out_dir="$RESULTS_DIR/${safe}.${compiler}.hw"
+  mkdir -p "$trace_out_dir"
+
   # Snapshot TDR count and uptime for post-test attribution.
   local tdr_before
   tdr_before="$(tdr_count)"
@@ -729,6 +812,7 @@ run_one_hardware() {
   (
     cd "$build_dir"
     export XRT_DEVICE_BDF="$bdf"
+    export XDNA_TRACE_DIR="$trace_out_dir"
     timeout 30 bash -c "$run_cmd"
   ) > "$log_file" 2>&1 || rc=$?
 
@@ -745,6 +829,12 @@ run_one_hardware() {
     echo "TIMEOUT" > "$result_file"
   else
     echo "FAIL" > "$result_file"
+  fi
+
+  # Copy events.json for trace decoding.
+  local build_traced="$BUILD_BASE/$name/traced"
+  if [[ -f "$build_traced/events.json" ]]; then
+    cp "$build_traced/events.json" "$trace_out_dir/"
   fi
 }
 export -f run_one_hardware
@@ -795,12 +885,16 @@ run_one_bridge() {
   local run_cmd
   run_cmd="$(get_run_cmd "$src_dir")"
 
+  local trace_out_dir="$RESULTS_DIR/${safe}.${compiler}.emu"
+  mkdir -p "$trace_out_dir"
+
   local rc=0
   (
     cd "$build_dir"
     export XDNA_EMU=1
     export XDNA_EMU_LOG_LEVEL="${XDNA_EMU_LOG_LEVEL:-info}"
     export XRT_DEVICE_BDF="ffff:ff:1f.0"
+    export XDNA_TRACE_DIR="$trace_out_dir"
     timeout 120 bash -c "$run_cmd"
   ) > "$log_file" 2>&1 || rc=$?
   local result
@@ -820,6 +914,13 @@ run_one_bridge() {
   fi
 
   echo "$result" > "$result_file"
+
+  # Copy events.json for trace decoding.
+  local build_traced="$BUILD_BASE/$name/traced"
+  if [[ -f "$build_traced/events.json" ]]; then
+    cp "$build_traced/events.json" "$trace_out_dir/"
+  fi
+
   echo "  BRIDGE $name ($compiler): $result"
 }
 export -f run_one_bridge
