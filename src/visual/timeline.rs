@@ -19,20 +19,12 @@ use super::theme;
 // ============================================================================
 
 /// Persistent state for the timeline widget.
+#[derive(Default)]
 pub struct TimelineState {
     /// Viewport mapping cycles to screen coordinates.
     pub viewport: Viewport,
     /// Whether the viewport has been fitted to data on first render.
     initialized: bool,
-}
-
-impl Default for TimelineState {
-    fn default() -> Self {
-        Self {
-            viewport: Viewport::default(),
-            initialized: false,
-        }
-    }
 }
 
 impl TimelineState {
