@@ -1671,7 +1671,7 @@ def build_manifest(
     mlir_text: str,
     manifest_partial: dict,
 ) -> dict:
-    """Build a complete manifest JSON for trace-run.py."""
+    """Build a complete manifest JSON for trace metadata."""
     buffers = parse_buffers_from_runtime_sequence(mlir_text)
 
     manifest = {

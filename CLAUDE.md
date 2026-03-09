@@ -464,8 +464,7 @@ converge to Perfetto JSON (viewable at ui.perfetto.dev).
 | Tool | Purpose |
 |------|---------|
 | `tools/trace-inject.py` | Inject trace routing into MLIR (capacity planner, collision-aware IDs) |
-| `tools/trace-sweep.py` | Multi-batch event sweep (HW serial + EMU parallel) |
-| `tools/trace-run.py` | Execute traced xclbin, collect raw trace data |
+| `tools/trace-sweep.py` | Multi-batch event sweep orchestrator (pre-compiled artifacts, HW serial + EMU parallel) |
 | `tools/trace-trim.py` | Strip sentinel padding from raw trace buffers |
 | `tools/trace-merge.py` | Merge per-batch Perfetto JSON with TRUE anchor alignment |
 | `tools/trace-patch-events.py` | Patch event slots in compiled insts.bin without recompilation |
