@@ -5,4 +5,5 @@
 //! supports piecewise alignment for phase-aware comparison.
 
 pub mod alignment;
+pub mod data;
 pub mod theme;
