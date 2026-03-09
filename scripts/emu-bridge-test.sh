@@ -1505,8 +1505,6 @@ main() {
   # ---- Phase 5b: Event sweep (optional) -----------------------------------
 
   if [[ "$SWEEP" == "true" ]]; then
-    # Build list of tests eligible for sweep: must have passed on at least
-    # one platform (HW or EMU) and not be trace-quarantined.
     local sweep_targets=()
     for name in "${compiled[@]}"; do
       is_trace_quarantined "$name" && continue
@@ -1529,21 +1527,42 @@ main() {
         local safe
         safe="$(sanitize_name "$name")"
         local src_dir="$TEST_SRC/$name"
-        local sweep_dir="$RESULTS_DIR/${safe}.sweep"
-        local sweep_log="$RESULTS_DIR/${safe}.sweep.log"
-        local sweep_args=("$src_dir" -o "$sweep_dir")
 
-        # Pass through HW/EMU flags.
-        $RUN_HW || sweep_args+=(--no-hw)
-        $RUN_EMU || sweep_args+=(--no-emu)
+        for compiler in "${compilers[@]}"; do
+          local build_dir="$BUILD_BASE/$name/$compiler"
+          local test_exe="$BUILD_BASE/$name/test.exe"
+          local sweep_dir="$RESULTS_DIR/${safe}.${compiler}.sweep"
+          local sweep_log="$RESULTS_DIR/${safe}.${compiler}.sweep.log"
 
-        echo "  SWEEP $name ..."
-        if python3 "$EMU_ROOT/tools/trace-sweep.py" "${sweep_args[@]}" \
-            > "$sweep_log" 2>&1; then
-          echo "  SWEEP $name: OK (see $sweep_dir/)"
-        else
-          echo "  SWEEP $name: FAIL (see $sweep_log)"
-        fi
+          # Skip if this compiler didn't compile successfully.
+          local cr="FAIL"
+          [[ -f "$RESULTS_DIR/${safe}.${compiler}.compile.result" ]] && \
+            cr="$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")"
+          [[ "$cr" != "OK" ]] && continue
+
+          [[ ! -f "$test_exe" ]] && continue
+          [[ ! -f "$build_dir/insts.bin" ]] && continue
+
+          local run_cmd
+          run_cmd="$(get_run_cmd "$src_dir")"
+
+          local sweep_args=(
+            --build-dir "$build_dir"
+            --test-exe "$test_exe"
+            --output "$sweep_dir"
+            --run-cmd "$run_cmd"
+          )
+          $RUN_HW || sweep_args+=(--no-hw)
+          $RUN_EMU || sweep_args+=(--no-emu)
+
+          echo "  SWEEP $name ($compiler) ..."
+          if python3 "$EMU_ROOT/tools/trace-sweep.py" "${sweep_args[@]}" \
+              > "$sweep_log" 2>&1; then
+            echo "  SWEEP $name ($compiler): OK (see $sweep_dir/)"
+          else
+            echo "  SWEEP $name ($compiler): FAIL (see $sweep_log)"
+          fi
+        done
       done
     else
       info "Phase 5b: no tests eligible for sweep"
