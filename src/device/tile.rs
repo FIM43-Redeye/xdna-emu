@@ -22,6 +22,7 @@
 
 use super::stream_switch::StreamSwitch as FunctionalStreamSwitch;
 use super::trace_unit::TraceUnit;
+use crate::interpreter::state::EventType;
 
 /// Size of program memory (16 KB = 1024 x 128-bit instructions).
 pub const PROGRAM_MEMORY_SIZE: usize = crate::arch::compute::PROGRAM_MEMORY_SIZE as usize;
@@ -194,8 +195,8 @@ pub struct LockArbiter {
     stats: Vec<LockArbiterStats>,
 
     /// Results of the last arbitration round.
-    /// (requestor, lock_id, granted)
-    results: Vec<(LockRequestor, usize, bool)>,
+    /// (requestor, lock_id, granted, is_acquire)
+    results: Vec<(LockRequestor, usize, bool, bool)>,
 }
 
 impl LockArbiter {
@@ -226,7 +227,7 @@ impl LockArbiter {
     /// Granted acquire requests are applied to the lock values. Releases
     /// always succeed when granted. The priority pointer rotates after
     /// each contended grant.
-    pub fn resolve(&mut self, locks: &mut [Lock]) -> &[(LockRequestor, usize, bool)] {
+    pub fn resolve(&mut self, locks: &mut [Lock]) -> &[(LockRequestor, usize, bool, bool)] {
         self.results.clear();
 
         if self.pending.is_empty() {
@@ -260,7 +261,7 @@ impl LockArbiter {
                 if lock_id < self.stats.len() {
                     self.stats[lock_id].grants += granted as u64;
                 }
-                self.results.push((req.requestor, lock_id, granted));
+                self.results.push((req.requestor, lock_id, granted, req.is_acquire));
             } else {
                 // Contention: multiple requestors want the same lock
                 if lock_id < self.stats.len() {
@@ -293,7 +294,7 @@ impl LockArbiter {
                         if lock_id < self.stats.len() {
                             self.stats[lock_id].grants += 1;
                         }
-                        self.results.push((req.requestor, lock_id, true));
+                        self.results.push((req.requestor, lock_id, true, false));
                     }
                 }
 
@@ -315,12 +316,12 @@ impl LockArbiter {
                             let winner_pi = req.requestor.to_priority_index(s2mm_count);
                             self.priority = (winner_pi + 1) % num_requestors;
                         }
-                        self.results.push((req.requestor, lock_id, granted));
+                        self.results.push((req.requestor, lock_id, granted, true));
                     } else {
                         if lock_id < self.stats.len() {
                             self.stats[lock_id].stalls += 1;
                         }
-                        self.results.push((req.requestor, lock_id, false));
+                        self.results.push((req.requestor, lock_id, false, true));
                     }
                 }
             }
@@ -373,7 +374,7 @@ impl LockArbiter {
     pub fn was_granted(&self, requestor: LockRequestor, lock_id: usize) -> bool {
         self.results
             .iter()
-            .any(|&(ref r, lid, granted)| *r == requestor && lid == lock_id && granted)
+            .any(|&(ref r, lid, granted, _)| *r == requestor && lid == lock_id && granted)
     }
 
     /// Get per-lock statistics.
@@ -995,6 +996,15 @@ pub struct Tile {
     /// slave[17] = TRACE for memtile).
     pub mem_trace: TraceUnit,
 
+    /// Pending memory-module trace events from all sources (DMA, locks, etc.).
+    ///
+    /// On real hardware, the mem trace unit monitors event wires from the
+    /// entire memory module -- it doesn't distinguish DMA events from lock
+    /// events. This buffer unifies all memory-module event sources. The
+    /// coordinator drains it each cycle and routes events to the mem trace
+    /// unit via `notify_mem_trace_event()`.
+    pub mem_trace_pending: Vec<(u64, crate::interpreter::state::EventType)>,
+
     /// Stream switch event port selection (8 logical event ports).
     ///
     /// Each entry maps a logical event port (0-7) to a physical stream switch
@@ -1165,6 +1175,7 @@ impl Tile {
             cascade_output_dir: 0,
             core_trace: TraceUnit::new(col, row),
             mem_trace: TraceUnit::new(col, row),
+            mem_trace_pending: Vec::new(),
             event_port_selection: [None; 8],
             cycle_dma_banks: 0,
             core_edge_detectors: [EdgeDetector::default(); 2],
@@ -1476,8 +1487,23 @@ impl Tile {
     /// Call at end of Phase 3, after all requestors have submitted.
     /// Applies granted requests directly to lock values. Returns results
     /// for callers that need to check grant status (e.g., DMA engine).
-    pub fn resolve_lock_requests(&mut self) -> Vec<(LockRequestor, usize, bool)> {
+    ///
+    /// Granted lock operations emit trace events into `mem_trace_pending`,
+    /// matching real hardware where the memory module trace unit monitors
+    /// all lock state changes regardless of source.
+    pub fn resolve_lock_requests(&mut self, cycle: u64) -> Vec<(LockRequestor, usize, bool, bool)> {
         let results = self.lock_arbiter.resolve(&mut self.locks);
+        // Emit trace events for granted lock operations.
+        for &(_, lock_id, granted, is_acquire) in results {
+            if granted {
+                let event = if is_acquire {
+                    EventType::LockAcquire { lock_id: lock_id as u8 }
+                } else {
+                    EventType::LockRelease { lock_id: lock_id as u8 }
+                };
+                self.mem_trace_pending.push((cycle, event));
+            }
+        }
         results.to_vec()
     }
 

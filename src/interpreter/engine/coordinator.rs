@@ -639,13 +639,13 @@ impl InterpreterEngine {
         }
         self.drain_core_enables();
 
-        // Drain DMA trace events into the global trace log and notify
-        // trace units so they can produce binary trace packets.
-        // Each tile type uses a different event ID namespace and trace unit:
+        // Drain memory-module trace events (DMA + locks) into the global
+        // trace log and notify trace units so they can produce binary trace
+        // packets. Each tile type uses a different event ID namespace:
         // - Compute tiles: mem_event_to_hw_id -> mem_trace
         // - MemTiles: memtile_event_to_hw_id -> mem_trace
         // - Shim tiles: shim_event_to_hw_id -> core_trace (PL module)
-        for (col, row, cycle, event) in self.device.array.drain_dma_trace_events() {
+        for (col, row, cycle, event) in self.device.array.drain_mem_trace_events() {
             if let Some(tile) = self.device.array.get_mut(col, row) {
                 if tile.is_shim() {
                     if let Some(id) = crate::trace::shim_event_to_hw_id(&event) {

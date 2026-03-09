@@ -2961,7 +2961,7 @@ mod tests {
         let mut cycles = 0;
         while engine.channel_active(2) {
             engine.submit_lock_requests(&mut tile, &mut NeighborLocks::empty());
-            tile.resolve_lock_requests();
+            tile.resolve_lock_requests(0);
             engine.step(&mut tile, &mut NeighborLocks::empty(), &mut host_mem);
             cycles += 1;
             if cycles > 500 {
@@ -3657,8 +3657,8 @@ mod tests {
             };
             engine.submit_lock_requests(&mut own_tile, &mut neighbors);
         }
-        own_tile.resolve_lock_requests();
-        west_tile.resolve_lock_requests();
+        own_tile.resolve_lock_requests(0);
+        west_tile.resolve_lock_requests(0);
 
         let mut neighbors = NeighborLocks {
             west: Some(&mut west_tile),
@@ -3699,8 +3699,8 @@ mod tests {
             };
             engine.submit_lock_requests(&mut own_tile, &mut neighbors);
         }
-        own_tile.resolve_lock_requests();
-        east_tile.resolve_lock_requests();
+        own_tile.resolve_lock_requests(0);
+        east_tile.resolve_lock_requests(0);
 
         let mut neighbors = NeighborLocks {
             west: None,
@@ -3763,8 +3763,8 @@ mod tests {
                 };
                 engine.submit_lock_requests(&mut own_tile, &mut neighbors);
             }
-            own_tile.resolve_lock_requests();
-            west_tile.resolve_lock_requests();
+            own_tile.resolve_lock_requests(0);
+            west_tile.resolve_lock_requests(0);
             let mut neighbors = NeighborLocks {
                 west: Some(&mut west_tile),
                 east: None,

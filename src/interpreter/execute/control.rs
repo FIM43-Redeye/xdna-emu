@@ -614,7 +614,7 @@ mod tests {
         // Release is deferred: submitted to arbiter, not yet applied
         assert_eq!(tile.locks[3].value, 0, "Not yet committed (pending in arbiter)");
         // Resolve the arbiter to apply the deferred release
-        tile.resolve_lock_requests();
+        tile.resolve_lock_requests(0);
         assert_eq!(tile.locks[3].value, 1, "Committed after arbiter resolve");
     }
 
@@ -695,7 +695,7 @@ mod tests {
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
         assert_eq!(tile.locks[3].value, 0, "Not yet committed (pending in arbiter)");
-        tile.resolve_lock_requests();
+        tile.resolve_lock_requests(0);
         assert_eq!(tile.locks[3].value, 4, "Committed after arbiter resolve");
     }
 
@@ -714,7 +714,7 @@ mod tests {
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
         assert_eq!(tile.locks[4].value, 5, "Not yet committed (pending in arbiter)");
-        tile.resolve_lock_requests();
+        tile.resolve_lock_requests(0);
         assert_eq!(tile.locks[4].value, 8, "5 + 3 = 8 after arbiter resolve");
     }
 
@@ -733,7 +733,7 @@ mod tests {
         let result = ControlUnit::execute(&op, &mut ctx, &mut tile);
         assert!(matches!(result, Some(ExecuteResult::Continue)));
         assert_eq!(tile.locks[6].value, 60, "Not yet committed (pending in arbiter)");
-        tile.resolve_lock_requests();
+        tile.resolve_lock_requests(0);
         assert_eq!(tile.locks[6].value, 63, "Committed saturated at MAX");
         assert!(tile.locks[6].overflow, "Overflow flag set");
     }
@@ -773,7 +773,7 @@ mod tests {
         assert!(matches!(result, Some(ExecuteResult::Continue)));
         // Lock ID 48 maps to own-tile lock 0 (East/Internal quadrant), deferred
         assert_eq!(tile.locks[0].value, 0, "Not yet committed (pending in arbiter)");
-        tile.resolve_lock_requests();
+        tile.resolve_lock_requests(0);
         assert_eq!(tile.locks[0].value, 1, "Committed after arbiter resolve");
     }
 
@@ -811,7 +811,7 @@ mod tests {
 
         // Resolve arbiter: release applied first (lock 0 -> 1), then
         // acquire sees updated value (1 >= 1, granted, lock 1 -> 0).
-        tile.resolve_lock_requests();
+        tile.resolve_lock_requests(0);
 
         // Both succeeded in the same cycle: release +1 then acquire -1
         assert_eq!(tile.locks[5].value, 0, "Release then acquire in same cycle");

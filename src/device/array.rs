@@ -124,6 +124,12 @@ pub struct TileArray {
     /// full module dispatch.
     pub(crate) pending_ctrl_actions: Vec<super::tile::CtrlPacketAction>,
 
+    /// Current cycle, set by the coordinator before each step.
+    ///
+    /// Used for timestamping memory-module trace events (lock acquire/release)
+    /// that are generated during lock arbiter resolution in `step_data_movement()`.
+    current_cycle: u64,
+
     /// In-flight words traversing inter-tile links.
     ///
     /// On real AIE2 hardware, data takes ROUTE_LATENCY_PER_HOP cycles to
@@ -191,6 +197,7 @@ impl TileArray {
             arch, cols, rows, tiles, dma_engines,
             fatal_errors: Vec::new(),
             pending_ctrl_actions: Vec::new(),
+            current_cycle: 0,
             inter_tile_pipeline: Vec::new(),
         }
     }
@@ -471,21 +478,38 @@ impl TileArray {
     /// Set the current cycle on all DMA engines for trace event timestamps.
     /// Called by the coordinator before each step.
     pub fn set_dma_cycle(&mut self, cycle: u64) {
+        self.current_cycle = cycle;
         for engine in &mut self.dma_engines {
             engine.set_current_cycle(cycle);
         }
     }
 
-    /// Drain trace events from all DMA engines.
+    /// Drain memory-module trace events from all sources (DMA engines, locks).
+    ///
+    /// On real hardware, the memory trace unit doesn't distinguish DMA from
+    /// lock events -- it monitors all hardware event IDs from the memory
+    /// module. This method unifies both sources into a single event stream.
+    ///
     /// Returns (col, row, cycle, event) tuples for each buffered event.
-    pub fn drain_dma_trace_events(&mut self) -> Vec<(u8, u8, u64, EventType)> {
+    pub fn drain_mem_trace_events(&mut self) -> Vec<(u8, u8, u64, EventType)> {
         let mut all_events = Vec::new();
+        // Drain DMA engine events (per-engine internal buffer).
         for engine in &mut self.dma_engines {
             let events = engine.drain_trace_events();
             if !events.is_empty() {
                 let col = engine.col;
                 let row = engine.row;
                 for (cycle, event) in events {
+                    all_events.push((col, row, cycle, event));
+                }
+            }
+        }
+        // Drain tile-level events (locks, etc.).
+        for tile in &mut self.tiles {
+            if !tile.mem_trace_pending.is_empty() {
+                let col = tile.col;
+                let row = tile.row;
+                for (cycle, event) in tile.mem_trace_pending.drain(..) {
                     all_events.push((col, row, cycle, event));
                 }
             }
@@ -764,8 +788,9 @@ impl TileArray {
         // Phase 2: Lock Arbiter Resolution
         // Resolve all tile arbiters using round-robin. Applies granted requests
         // directly to lock values. DMA channels check results in Phase 3.
+        let cycle = self.current_cycle;
         for tile in &mut self.tiles {
-            tile.resolve_lock_requests();
+            tile.resolve_lock_requests(cycle);
         }
 
         // Phase 3: DMA Step
