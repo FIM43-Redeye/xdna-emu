@@ -6,5 +6,6 @@
 
 pub mod alignment;
 pub mod data;
+pub mod event_detail;
 pub mod theme;
 pub mod tile_selector;
