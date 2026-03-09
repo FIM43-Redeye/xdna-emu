@@ -7,3 +7,4 @@
 pub mod alignment;
 pub mod data;
 pub mod theme;
+pub mod tile_selector;
