@@ -84,6 +84,7 @@ LIST_ONLY=false
 VERBOSE=false
 COMPILER_MODE="both"  # "both", "chess", "peano"
 NO_TRACE="${NO_TRACE:-false}"
+SWEEP=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -101,6 +102,7 @@ while [[ $# -gt 0 ]]; do
     --chess-only|--chess)  COMPILER_MODE="chess"; shift ;;
     --peano-only|--peano)  COMPILER_MODE="peano"; shift ;;
     --no-trace)            NO_TRACE=true; shift ;;
+    --sweep)               SWEEP=true; shift ;;
     --serial-hw)           NPU_HW_JOBS=1; shift ;;
     --help|-h)
       cat <<'USAGE'
@@ -111,6 +113,7 @@ Options:
   --no-hw         Skip real hardware runs (default: hardware enabled)
   --no-emu        Skip emulator runs (default: emulator enabled)
   --no-trace      Disable always-on trace preparation (default: traces enabled)
+  --sweep         Run full event sweep (trace-sweep.py) on passing tests after runs
   --list          List available tests and exit
   -jN             Override parallelism (default: nproc)
   -v, --verbose   Show log snippets on failure
@@ -150,7 +153,7 @@ for _c in "${COMPILERS[@]}"; do
 done
 
 # Export variables that parallel jobs need.
-export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE
+export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP
 export MLIR_AIE TEST_SRC BUILD_BASE EMU_ROOT SCRIPT_DIR TRACE_QUARANTINE_FILE
 export XRT_DIR XRT_INCLUDE XRT_LIB
 export TEST_LIB_DIR TEST_UTILS_INCLUDE TEST_UTILS_LIB
@@ -821,6 +824,11 @@ run_one_hardware() {
   if [[ -f "$build_traced/events.json" ]]; then
     cp "$build_traced/events.json" "$trace_out_dir/"
   fi
+
+  # Trim trace buffer to actual data length.
+  if [[ -f "$trace_out_dir/trace_raw.bin" ]]; then
+    python3 "$EMU_ROOT/tools/trace-trim.py" "$trace_out_dir/trace_raw.bin" 2>/dev/null || true
+  fi
 }
 export -f run_one_hardware
 
@@ -904,6 +912,11 @@ run_one_bridge() {
   local build_traced="$BUILD_BASE/$name/traced"
   if [[ -f "$build_traced/events.json" ]]; then
     cp "$build_traced/events.json" "$trace_out_dir/"
+  fi
+
+  # Trim trace buffer to actual data length.
+  if [[ -f "$trace_out_dir/trace_raw.bin" ]]; then
+    python3 "$EMU_ROOT/tools/trace-trim.py" "$trace_out_dir/trace_raw.bin" 2>/dev/null || true
   fi
 
   echo "  BRIDGE $name ($compiler): $result"
@@ -1487,6 +1500,54 @@ main() {
         fi
       done
     done
+  fi
+
+  # ---- Phase 5b: Event sweep (optional) -----------------------------------
+
+  if [[ "$SWEEP" == "true" ]]; then
+    # Build list of tests eligible for sweep: must have passed on at least
+    # one platform (HW or EMU) and not be trace-quarantined.
+    local sweep_targets=()
+    for name in "${compiled[@]}"; do
+      is_trace_quarantined "$name" && continue
+      local safe
+      safe="$(sanitize_name "$name")"
+      local any_pass=false
+      for compiler in "${compilers[@]}"; do
+        for suffix in hw bridge; do
+          local rf="$RESULTS_DIR/${safe}.${compiler}.${suffix}.result"
+          [[ -f "$rf" ]] && [[ "$(< "$rf")" == "PASS" ]] && any_pass=true
+        done
+        $any_pass && break
+      done
+      $any_pass && sweep_targets+=("$name")
+    done
+
+    if [[ ${#sweep_targets[@]} -gt 0 ]]; then
+      info "Phase 5b: Event sweep for ${#sweep_targets[@]} test(s)"
+      for name in "${sweep_targets[@]}"; do
+        local safe
+        safe="$(sanitize_name "$name")"
+        local src_dir="$TEST_SRC/$name"
+        local sweep_dir="$RESULTS_DIR/${safe}.sweep"
+        local sweep_log="$RESULTS_DIR/${safe}.sweep.log"
+        local sweep_args=("$src_dir" -o "$sweep_dir")
+
+        # Pass through HW/EMU flags.
+        $RUN_HW || sweep_args+=(--no-hw)
+        $RUN_EMU || sweep_args+=(--no-emu)
+
+        echo "  SWEEP $name ..."
+        if python3 "$EMU_ROOT/tools/trace-sweep.py" "${sweep_args[@]}" \
+            > "$sweep_log" 2>&1; then
+          echo "  SWEEP $name: OK (see $sweep_dir/)"
+        else
+          echo "  SWEEP $name: FAIL (see $sweep_log)"
+        fi
+      done
+    else
+      info "Phase 5b: no tests eligible for sweep"
+    fi
   fi
 
   # ---- Phase 6: Report ---------------------------------------------------
