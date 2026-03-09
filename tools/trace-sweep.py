@@ -6,18 +6,23 @@ through all events of interest across multiple runs.  After all runs
 complete, invokes trace-merge.py to stitch them into a single unified
 trace using TRUE timestamps as the alignment anchor.
 
-Usage:
-    trace-sweep.py <test-source-dir> --output <dir> [--no-hw] [--no-emu]
-    trace-sweep.py add_one_using_dma -o /tmp/sweep-results
+Operates on pre-compiled artifacts from the bridge script.  Does NOT
+compile anything -- that is the bridge script's responsibility.
 
-The test name is resolved as a path or substring of mlir-aie/test/npu-xrt/.
+Usage:
+    trace-sweep.py --build-dir <path> --test-exe <path> -o <dir>
+    trace-sweep.py --build-dir build/test/npu-xrt/add_one/chess \
+                   --test-exe build/test/npu-xrt/add_one/test.exe \
+                   -o /tmp/sweep-results
 """
 
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -118,80 +123,6 @@ MEMTILE_EVENTS = [
 ]
 
 
-def _write_skip_manifest(output_dir: Path, reason: str, detail: str = ""):
-    """Write a sweep-manifest.json marking this test as skipped."""
-    manifest = {
-        "skipped": True,
-        "reason": reason,
-        "detail": detail[:500] if detail else "",
-    }
-    (output_dir / "sweep-manifest.json").write_text(
-        json.dumps(manifest, indent=2) + "\n"
-    )
-
-
-def compile_kernel_objects(test_dir: Path, build_dir: Path) -> tuple[bool, str]:
-    """Compile kernel object files referenced in run.lit.
-
-    Extracts kernel compile commands (xchesscc_wrapper, clang with -c) from
-    run.lit, resolves lit-style variables, and runs them in build_dir.
-
-    Returns (success, error_detail).
-    """
-    lit_file = test_dir / "run.lit"
-    if not lit_file.exists():
-        return True, ""  # No run.lit = no kernel objects needed
-
-    # Environment for variable resolution (mirrors bridge script's apply_lit_subs)
-    peano_dir = os.environ.get("PEANO_INSTALL_DIR", "")
-    aietools_dir = os.environ.get("AIETOOLS_DIR",
-                                   str(test_dir.parent.parent.parent / "aietools"))
-    aie_runtime_lib = os.environ.get("AIE_RUNTIME_LIB", "")
-
-    commands = []
-    for line in lit_file.read_text().splitlines():
-        if "RUN:" not in line:
-            continue
-        cmd = line.split("RUN:", 1)[1].strip()
-
-        # Only kernel compile commands: xchesscc or clang/clang++ with -c producing .o
-        is_kernel_compile = False
-        if cmd.startswith("xchesscc_wrapper ") and " -c " in cmd:
-            is_kernel_compile = True
-        elif ("%cxx" in cmd or "clang" in cmd) and " -c " in cmd and ".o" in cmd:
-            # Peano kernel compile (not host test.cpp)
-            if "test.cpp" not in cmd:
-                is_kernel_compile = True
-
-        if not is_kernel_compile:
-            continue
-
-        # Resolve lit variables
-        cmd = cmd.replace("%S", str(test_dir))
-        cmd = cmd.replace("%aietools", aietools_dir)
-        cmd = cmd.replace("%aie_runtime_lib%", aie_runtime_lib)
-        if "%cxx" in cmd:
-            cxx = f"{peano_dir}/bin/clang++" if peano_dir else "clang++"
-            cmd = cmd.replace("%cxx", cxx)
-
-        commands.append(cmd)
-
-    if not commands:
-        return True, ""  # No kernel objects to compile
-
-    for cmd in commands:
-        print(f"    Kernel: {cmd.split('/')[-1] if '/' in cmd else cmd[:60]}")
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True,
-            timeout=120, cwd=str(build_dir),
-        )
-        if result.returncode != 0:
-            detail = result.stderr.strip().split("\n")[-1] if result.stderr else "unknown"
-            return False, detail
-
-    return True, ""
-
-
 def batch_events(events: list[str], batch_size: int = 7) -> list[list[str]]:
     """Split events into batches of batch_size, each prefixed with TRUE."""
     batches = []
@@ -204,206 +135,12 @@ def batch_events(events: list[str], batch_size: int = 7) -> list[list[str]]:
     return batches
 
 
-def resolve_test_dir(name_or_path: str) -> Path:
-    """Resolve a test name or path to a test source directory."""
-    p = Path(name_or_path)
-    if p.is_dir():
-        return p.resolve()
-
-    # Search in mlir-aie/test/npu-xrt/
-    script_dir = Path(__file__).parent
-    test_base = script_dir.parent.parent / "mlir-aie" / "test" / "npu-xrt"
-    if not test_base.is_dir():
-        print(f"Error: test base not found: {test_base}", file=sys.stderr)
-        sys.exit(1)
-
-    matches = [d for d in test_base.iterdir() if d.is_dir() and name_or_path in d.name]
-    if len(matches) == 0:
-        print(f"Error: no test matching '{name_or_path}' in {test_base}", file=sys.stderr)
-        sys.exit(1)
-    if len(matches) > 1:
-        names = ", ".join(m.name for m in matches)
-        print(f"Error: ambiguous '{name_or_path}': {names}", file=sys.stderr)
-        sys.exit(1)
-    return matches[0]
-
-
-def compile_base_trace(
-    test_dir: Path,
-    output_dir: Path,
-    trace_size: int,
-    tile_filter: str | None = None,
-) -> tuple[Path | None, Path | None]:
-    """Inject tracing with default events and compile ONCE.
-
-    Returns (traced_dir, manifest_path) on success, (None, None) on failure.
-    All batches will reuse this compiled xclbin + patched insts.bin.
-
-    If tile_filter is set, passes --tiles to trace-inject.py to limit
-    which tiles are traced.  Format: "col.row:module,col.row:module,...".
-    """
-    script_dir = Path(__file__).parent
-    traced_dir = output_dir / "base"
-    traced_dir.mkdir(parents=True, exist_ok=True)
-
-    # Inject with default events (no --events-json = defaults)
-    label = "Base" if tile_filter is None else f"Pass (tiles={tile_filter})"
-    print(f"  {label}: injecting trace routing...")
-    cmd = [
-        sys.executable, str(script_dir / "trace-inject.py"),
-        str(test_dir),
-        "--output", str(traced_dir),
-        "--trace-size", str(trace_size),
-    ]
-    if tile_filter:
-        cmd.extend(["--tiles", tile_filter])
-    result = subprocess.run(
-        cmd,
-        capture_output=True, text=True, timeout=120,
-    )
-    if result.returncode != 0:
-        print(f"    Inject failed: {result.stderr}", file=sys.stderr)
-        _write_skip_manifest(traced_dir, "inject_failed", result.stderr)
-        return None, None
-
-    manifest_path = traced_dir / "manifest.json"
-    manifest = json.loads(manifest_path.read_text())
-    if manifest.get("skipped"):
-        print(f"    Skipped: {manifest.get('reason', 'unknown')}")
-        return None, None
-
-    # Compile kernel objects referenced in run.lit (scale.o, etc.)
-    print(f"  {label}: compiling kernel objects...")
-    kernel_ok, kernel_err = compile_kernel_objects(test_dir, traced_dir)
-    if not kernel_ok:
-        print(f"    Kernel compile failed: {kernel_err}", file=sys.stderr)
-        _write_skip_manifest(traced_dir, "kernel_compile_failed", kernel_err)
-        return None, None
-
-    # Compile traced xclbin
-    print(f"  {label}: compiling traced xclbin...")
-    compile_result = subprocess.run(
-        [
-            "aiecc.py",
-            "--no-aiesim", "--aie-generate-xclbin", "--aie-generate-npu-insts",
-            "--no-compile-host", "--alloc-scheme=basic-sequential",
-            "--no-xchesscc",
-            "--xclbin-name=aie.xclbin", "--npu-insts-name=insts.bin",
-            "./aie_traced.mlir",
-        ],
-        capture_output=True, text=True, timeout=600,
-        cwd=str(traced_dir),
-    )
-    if compile_result.returncode != 0:
-        stderr = compile_result.stderr
-        (output_dir / "compile.log").write_text(
-            compile_result.stdout + stderr
-        )
-        # Distinguish routing conflicts from generic compile failures
-        if "pathfinder-flows" in stderr or "could not route" in stderr.lower():
-            reason = "routing_conflict"
-        else:
-            reason = "compile_failed"
-        print(f"    Compile failed: {reason} (see compile.log)", file=sys.stderr)
-        _write_skip_manifest(traced_dir, reason, stderr.strip().split("\n")[-1])
-        return None, None
-
-    print(f"  {label}: compile OK")
-    return traced_dir, manifest_path
-
-
-def prepare_batch(
-    batch_idx: int,
-    core_batch: list[str],
-    mem_batch: list[str],
-    base_dir: Path,
-    manifest_path: Path,
-    output_dir: Path,
-    memtile_batch: list[str] | None = None,
-) -> dict:
-    """Prepare one batch directory: copy+patch insts.bin, write manifest.
-
-    Returns a batch info dict with paths. Does NOT run anything -- the caller
-    decides whether to run HW (serial) and/or EMU (parallel) separately.
-    """
-    import shutil
-
-    script_dir = Path(__file__).parent
-    batch_dir = output_dir / f"batch_{batch_idx:02d}"
-    batch_dir.mkdir(parents=True, exist_ok=True)
-
-    # Write events config JSON
-    events_config = {
-        "core_events": core_batch,
-        "mem_events": mem_batch,
-    }
-    if memtile_batch is not None:
-        events_config["memtile_events"] = memtile_batch
-    events_json = batch_dir / "events.json"
-    events_json.write_text(json.dumps(events_config, indent=2) + "\n")
-
-    # Set up batch traced directory: symlink xclbin, copy+patch insts.bin
-    traced_dir = batch_dir / "traced"
-    traced_dir.mkdir(parents=True, exist_ok=True)
-
-    base_xclbin = base_dir / "aie.xclbin"
-    base_insts = base_dir / "insts.bin"
-    batch_xclbin = traced_dir / "aie.xclbin"
-    batch_insts = traced_dir / "insts.bin"
-
-    if not base_xclbin.exists() or not base_insts.exists():
-        return {"batch": batch_idx, "status": "missing_base"}
-
-    # Symlink xclbin (identical across batches), copy insts for patching
-    if not batch_xclbin.exists():
-        batch_xclbin.symlink_to(base_xclbin)
-    shutil.copy2(base_insts, batch_insts)
-
-    # Copy manifest (paths stay relative -- xclbin and insts.bin are in traced_dir)
-    base_manifest = json.loads(manifest_path.read_text())
-    base_manifest["insts"] = "insts.bin"
-    base_manifest["xclbin"] = "aie.xclbin"
-    batch_manifest = traced_dir / "manifest.json"
-    batch_manifest.write_text(json.dumps(base_manifest, indent=2) + "\n")
-
-    # Patch event registers in insts.bin
-    print(f"  Batch {batch_idx}: patching events "
-          f"(core={core_batch[:3]}..., mem={mem_batch[:3]}...)")
-    patch_result = subprocess.run(
-        [
-            sys.executable, str(script_dir / "trace-patch-events.py"),
-            str(batch_insts),
-            "--manifest", str(batch_manifest),
-            "--events-json", str(events_json),
-        ],
-        capture_output=True, text=True, timeout=30,
-    )
-    if patch_result.returncode != 0:
-        print(f"    Patch failed: {patch_result.stderr}", file=sys.stderr)
-        print(f"    (will run with base events instead)")
-
-    return {
-        "batch": batch_idx,
-        "status": "ok",
-        "events": events_config,
-        "manifest": str(batch_manifest),
-        "batch_dir": str(batch_dir),
-    }
-
-
-def trim_trace_dir(path: Path):
-    """Trim all trace_raw.bin files under a directory."""
-    script_dir = Path(__file__).parent
-    trim_script = script_dir / "trace-trim.py"
-    if trim_script.exists():
-        subprocess.run(
-            [sys.executable, str(trim_script), "--dir", str(path)],
-            capture_output=True, text=True, timeout=30,
-        )
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _dmesg_count(pattern: str) -> int:
-    """Count lines matching pattern in dmesg output."""
+    """Count dmesg lines matching pattern."""
     try:
         result = subprocess.run(
             ["dmesg"], capture_output=True, text=True, timeout=5,
@@ -414,282 +151,429 @@ def _dmesg_count(pattern: str) -> int:
 
 
 def wait_npu_idle(timeout: float = 10.0, poll_interval: float = 0.1) -> bool:
-    """Wait until the NPU has no active hardware contexts.
-
-    Polls `xrt-smi examine -r aie-partitions` for the "No hardware contexts"
-    message. Returns True if idle detected within timeout, False if timed out.
-    """
+    """Poll xrt-smi until no hardware contexts are running."""
     import time
-
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        result = subprocess.run(
-            ["xrt-smi", "examine", "-r", "aie-partitions"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if "No hardware contexts running" in result.stdout:
-            return True
+        try:
+            result = subprocess.run(
+                ["xrt-smi", "examine", "-r", "aie-partitions"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if "No hardware contexts running" in result.stdout:
+                return True
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
         time.sleep(poll_interval)
     return False
 
 
-def run_batch_hw(
-    batch_info: dict,
-    hw_cooldown: float = 2.0,
-    output_subdir: str = "hw",
+def _write_skip_manifest(output_dir: Path, reason: str, detail: str = ""):
+    """Write a sweep-manifest.json marking this test as skipped."""
+    manifest = {
+        "skipped": True,
+        "reason": reason,
+        "detail": detail[:500] if detail else "",
+    }
+    (output_dir / "sweep-manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Batch preparation
+# ---------------------------------------------------------------------------
+
+def prepare_batch(
+    batch_idx: int,
+    core_batch: list[str],
+    mem_batch: list[str],
+    base_insts: Path,
+    manifest: dict,
+    output_dir: Path,
+    memtile_batch: list[str] | None = None,
 ) -> dict:
-    """Run one batch on hardware.
+    """Prepare one batch: copy insts.bin and patch event registers.
 
     Args:
-        batch_info: Batch metadata dict (mutated in place).
-        hw_cooldown: Seconds to wait for NPU idle after run.
-        output_subdir: Directory name under batch_dir for output
-            (default "hw"; use "hw-serial"/"hw-parallel" for comparison).
+        batch_idx: Batch number (0-indexed).
+        core_batch: 8-element list of core event names.
+        mem_batch: 8-element list of mem event names.
+        base_insts: Path to the base (unpatched) insts.bin.
+        manifest: Trace manifest dict (needs "tiles_traced" for event targeting).
+        output_dir: Root sweep output directory.
+        memtile_batch: Optional 8-element memtile event list.
+
+    Returns:
+        Batch info dict with keys: batch, status, events, batch_dir, insts.
     """
     script_dir = Path(__file__).parent
-    trace_run = script_dir / "trace-run.py"
+    batch_dir = output_dir / f"batch_{batch_idx:02d}"
+    batch_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write events.json for this batch.
+    events_config = {
+        "core_events": core_batch,
+        "mem_events": mem_batch,
+    }
+    if memtile_batch is not None:
+        events_config["memtile_events"] = memtile_batch
+    events_path = batch_dir / "events.json"
+    events_path.write_text(json.dumps(events_config, indent=2) + "\n")
+
+    # Copy base insts.bin into batch dir for patching.
+    batch_insts = batch_dir / "insts.bin"
+    shutil.copy2(base_insts, batch_insts)
+
+    # Write a minimal manifest for trace-patch-events.py.
+    # It needs "tiles_traced" to know which tile addresses to patch.
+    batch_manifest = batch_dir / "manifest.json"
+    batch_manifest.write_text(json.dumps(manifest, indent=2) + "\n")
+
+    # Patch event registers in copied insts.bin.
+    patch_result = subprocess.run(
+        [
+            sys.executable, str(script_dir / "trace-patch-events.py"),
+            str(batch_insts),
+            "--manifest", str(batch_manifest),
+            "--events-json", str(events_path),
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+
+    if patch_result.returncode != 0:
+        return {
+            "batch": batch_idx,
+            "status": "patch_failed",
+            "error": patch_result.stderr.strip(),
+            "events": events_config,
+            "batch_dir": str(batch_dir),
+        }
+
+    return {
+        "batch": batch_idx,
+        "status": "ok",
+        "events": events_config,
+        "batch_dir": str(batch_dir),
+        "insts": str(batch_insts),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Batch execution
+# ---------------------------------------------------------------------------
+
+def run_batch(
+    batch_info: dict,
+    build_dir: Path,
+    run_cmd: str,
+    mode: str,
+    hw_cooldown: float = 2.0,
+) -> None:
+    """Run one batch on HW or EMU by invoking test.exe.
+
+    Modifies batch_info in place to add status and trace paths.
+
+    Args:
+        batch_info: Batch metadata dict (mutated).
+        build_dir: Directory containing aie.xclbin (test.exe runs from here).
+        run_cmd: Run command template (e.g., "./test.exe -x aie.xclbin -k MLIR_AIE -i insts.bin").
+        mode: "hw" or "emu".
+        hw_cooldown: Seconds between HW runs (ignored for EMU).
+    """
     batch_idx = batch_info["batch"]
     batch_dir = Path(batch_info["batch_dir"])
-    manifest = batch_info["manifest"]
+    batch_insts = batch_dir / "insts.bin"
+    trace_out = batch_dir / mode
+    trace_out.mkdir(parents=True, exist_ok=True)
 
-    hw_dir = batch_dir / output_subdir
-    print(f"  Batch {batch_idx}: running on hardware ({output_subdir})...")
+    # Substitute insts.bin path in run command.
+    cmd = run_cmd.replace("insts.bin", str(batch_insts))
 
-    # Snapshot TDR and IOMMU fault counts for post-run detection.
-    tdr_before = _dmesg_count("aie2_tdr_work")
-    iommu_before = _dmesg_count("IO_PAGE_FAULT")
+    env = os.environ.copy()
+    env["XDNA_TRACE_DIR"] = str(trace_out)
 
-    hw_result = subprocess.run(
-        [sys.executable, str(trace_run), str(manifest), "-o", str(hw_dir)],
-        capture_output=True, text=True, timeout=300,
-    )
-    # Use namespaced keys for non-default output dirs, standard keys for "hw".
-    status_key = "hw_status" if output_subdir == "hw" else f"{output_subdir}_status"
-    trace_key = "hw_trace" if output_subdir == "hw" else f"{output_subdir}_trace"
+    if mode == "emu":
+        env["XDNA_EMU"] = "1"
+        env["XDNA_EMU_LOG_LEVEL"] = env.get("XDNA_EMU_LOG_LEVEL", "info")
+        env["XRT_DEVICE_BDF"] = "ffff:ff:1f.0"
+    # For HW, XRT_DEVICE_BDF should already be set in the environment.
 
-    # Check for TDR or IOMMU faults.
-    tdr_after = _dmesg_count("aie2_tdr_work")
-    iommu_after = _dmesg_count("IO_PAGE_FAULT")
-    tdr_new = tdr_after - tdr_before
-    iommu_new = iommu_after - iommu_before
+    status_key = f"{mode}_status"
+    trace_key = f"{mode}_trace_raw"
 
-    if iommu_new > 0:
-        batch_info[status_key] = "iommu_fault"
-        print(f"  Batch {batch_idx}: IOMMU FAULT ({iommu_new} page faults)")
-        (batch_dir / f"{output_subdir}-run.log").write_text(
-            hw_result.stdout + hw_result.stderr
-            + f"\nIOMMU FAULT: {iommu_new} new page faults\n"
+    # Monitor for TDR/IOMMU (HW only).
+    tdr_before = _dmesg_count("aie2_tdr_work") if mode == "hw" else 0
+    iommu_before = _dmesg_count("IO_PAGE_FAULT") if mode == "hw" else 0
+
+    try:
+        result = subprocess.run(
+            ["bash", "-c", cmd],
+            capture_output=True, text=True,
+            timeout=300, cwd=str(build_dir), env=env,
         )
-    elif tdr_new > 0:
-        batch_info[status_key] = "tdr"
-        print(f"  Batch {batch_idx}: TDR ({tdr_new} events)")
-        (batch_dir / f"{output_subdir}-run.log").write_text(
-            hw_result.stdout + hw_result.stderr
-            + f"\nTDR: {tdr_new} new aie2_tdr_work events\n"
-        )
-    elif hw_result.returncode != 0:
+    except subprocess.TimeoutExpired:
+        batch_info[status_key] = "timeout"
+        return
+
+    # Check for HW faults.
+    if mode == "hw":
+        tdr_after = _dmesg_count("aie2_tdr_work")
+        iommu_after = _dmesg_count("IO_PAGE_FAULT")
+        if iommu_after - iommu_before > 0:
+            batch_info[status_key] = "iommu_fault"
+            (batch_dir / f"{mode}-run.log").write_text(result.stdout + result.stderr)
+            return
+        if tdr_after - tdr_before > 0:
+            batch_info[status_key] = "tdr"
+            (batch_dir / f"{mode}-run.log").write_text(result.stdout + result.stderr)
+            return
+
+    if result.returncode != 0:
         batch_info[status_key] = "failed"
-        (batch_dir / f"{output_subdir}-run.log").write_text(
-            hw_result.stdout + hw_result.stderr
-        )
+        (batch_dir / f"{mode}-run.log").write_text(result.stdout + result.stderr)
     else:
         batch_info[status_key] = "ok"
-        batch_info[trace_key] = str(hw_dir / "trace.json")
-        trim_trace_dir(hw_dir)
+        trace_raw = trace_out / "trace_raw.bin"
+        if trace_raw.exists():
+            batch_info[trace_key] = str(trace_raw)
 
-    # Wait for NPU to be idle before next run.
-    if hw_cooldown > 0 and not wait_npu_idle(timeout=hw_cooldown):
-        import time
-        time.sleep(0.5)  # Brief fallback if poll failed
+    # Trim trace.
+    trim_script = Path(__file__).parent / "trace-trim.py"
+    trace_raw = trace_out / "trace_raw.bin"
+    if trace_raw.exists():
+        subprocess.run(
+            [sys.executable, str(trim_script), str(trace_raw)],
+            capture_output=True, timeout=30,
+        )
 
-    return batch_info
+    # Convert raw trace to Perfetto JSON for merge.
+    trace_raw = trace_out / "trace_raw.bin"
+    if trace_raw.exists():
+        _convert_trace_to_json(trace_raw, build_dir, trace_out)
+
+    # HW cooldown.
+    if mode == "hw" and hw_cooldown > 0:
+        if not wait_npu_idle(timeout=hw_cooldown):
+            import time
+            time.sleep(0.5)
 
 
-def run_batch_emu(batch_info: dict) -> dict:
-    """Run one batch on the emulator (safe to parallelize)."""
+def _convert_trace_to_json(
+    trace_raw_path: Path,
+    build_dir: Path,
+    output_dir: Path,
+) -> None:
+    """Convert trace_raw.bin to Perfetto JSON using mlir-aie parse_trace.
+
+    Looks for aie_traced.mlir (or aie_arch.mlir) in the build dir or
+    its traced/ sibling. Writes trace.json alongside trace_raw.bin.
+    """
+    import numpy as np
+
+    trace_data = np.fromfile(str(trace_raw_path), dtype=np.uint32)
+    if len(trace_data) == 0:
+        return
+
+    # Find traced MLIR for parse_trace.
+    mlir_candidates = [
+        build_dir / "aie_arch.mlir",
+        build_dir.parent / "traced" / "aie_traced.mlir",
+        build_dir / "aie_traced.mlir",
+    ]
+    mlir_path = None
+    for candidate in mlir_candidates:
+        if candidate.exists():
+            mlir_path = candidate
+            break
+
+    if mlir_path is None:
+        return
+
+    try:
+        from aie.utils.trace import parse_trace  # type: ignore
+        mlir_text = mlir_path.read_text()
+        events = parse_trace(trace_data, mlir_text)
+        trace_json = output_dir / "trace.json"
+        with open(trace_json, "w") as f:
+            json.dump(events, f, indent=2)
+    except Exception:
+        pass  # Non-fatal: merge will skip batches without trace.json
+
+
+# ---------------------------------------------------------------------------
+# Sweep orchestration
+# ---------------------------------------------------------------------------
+
+def run_sweep(
+    build_dir: Path,
+    test_exe: Path,
+    output_dir: Path,
+    run_cmd: str,
+    core_batches: list[list[str]],
+    mem_batches: list[list[str]],
+    memtile_batches: list[list[str]] | None,
+    num_batches: int,
+    manifest: dict,
+    run_hw: bool = True,
+    run_emu: bool = True,
+    hw_cooldown: float = 2.0,
+) -> list[dict]:
+    """Execute all sweep batches and merge traces.
+
+    Returns list of batch_info dicts with status and trace paths.
+    """
     script_dir = Path(__file__).parent
-    trace_run = script_dir / "trace-run.py"
-    batch_idx = batch_info["batch"]
-    batch_dir = Path(batch_info["batch_dir"])
-    manifest = batch_info["manifest"]
+    base_insts = build_dir / "insts.bin"
 
-    emu_dir = batch_dir / "emu"
-    print(f"  Batch {batch_idx}: running on emulator...")
-    env = os.environ.copy()
-    env["XDNA_EMU"] = "1"
-    emu_result = subprocess.run(
-        [sys.executable, str(trace_run), str(manifest), "-o", str(emu_dir)],
-        capture_output=True, text=True, timeout=300,
-        env=env,
+    # Prepare all batches (patch only, no execution).
+    noop_batch = ["TRUE"] + ["NONE"] * 7
+    batches = []
+    for i in range(num_batches):
+        info = prepare_batch(
+            i,
+            core_batches[i],
+            mem_batches[i],
+            base_insts,
+            manifest,
+            output_dir,
+            memtile_batches[i] if memtile_batches else None,
+        )
+        batches.append(info)
+        if info["status"] != "ok":
+            print(f"  Batch {i}: PATCH FAILED -- {info.get('error', '?')}")
+
+    runnable = [b for b in batches if b["status"] == "ok"]
+    print(f"  Prepared {len(runnable)}/{num_batches} batches")
+
+    # Run HW batches serially.
+    if run_hw and runnable:
+        print(f"\n  Running {len(runnable)} HW batches (serial)...")
+        for b in runnable:
+            print(f"    Batch {b['batch']}...", end=" ", flush=True)
+            run_batch(b, build_dir, run_cmd, "hw", hw_cooldown)
+            print(b.get("hw_status", "?"))
+
+    # Run EMU batches in parallel.
+    if run_emu and runnable:
+        emu_jobs = os.cpu_count() or 4
+        print(f"\n  Running {len(runnable)} EMU batches (-j{emu_jobs})...")
+        with ThreadPoolExecutor(max_workers=emu_jobs) as pool:
+            futures = [
+                pool.submit(run_batch, b, build_dir, run_cmd, "emu")
+                for b in runnable
+            ]
+            for f in futures:
+                f.result()
+        for b in runnable:
+            print(f"    Batch {b['batch']}: {b.get('emu_status', '?')}")
+
+    # Merge traces.
+    merge_script = script_dir / "trace-merge.py"
+    if merge_script.exists():
+        for mode in ("hw", "emu"):
+            traces = [
+                str(Path(b["batch_dir"]) / mode / "trace.json")
+                for b in runnable
+                if (Path(b["batch_dir"]) / mode / "trace.json").exists()
+            ]
+            if traces:
+                merged = output_dir / f"{mode}-merged.json"
+                print(f"\n  Merging {len(traces)} {mode} traces...")
+                subprocess.run(
+                    [sys.executable, str(merge_script)] + traces + ["-o", str(merged)],
+                    timeout=120,
+                )
+
+    # Write sweep manifest.
+    sweep_manifest = {
+        "num_batches": num_batches,
+        "batches": batches,
+    }
+    (output_dir / "sweep-manifest.json").write_text(
+        json.dumps(sweep_manifest, indent=2) + "\n"
     )
-    if emu_result.returncode != 0:
-        batch_info["emu_status"] = "failed"
-        (batch_dir / "emu-run.log").write_text(emu_result.stdout + emu_result.stderr)
-    else:
-        batch_info["emu_status"] = "ok"
-        batch_info["emu_trace"] = str(emu_dir / "trace.json")
-        trim_trace_dir(emu_dir)
 
-    return batch_info
+    return batches
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Multi-run trace sweep with TRUE metronome alignment",
+        description="Multi-run trace sweep with TRUE metronome alignment. "
+                    "Operates on pre-compiled artifacts from the bridge script.",
     )
     parser.add_argument(
-        "test",
-        help="Test name (substring match) or path to test source directory",
+        "--build-dir", type=Path, required=True,
+        help="Build directory containing aie.xclbin and insts.bin",
     )
     parser.add_argument(
-        "--output", "-o",
-        type=Path,
-        required=True,
+        "--test-exe", type=Path, required=True,
+        help="Path to compiled test.exe",
+    )
+    parser.add_argument(
+        "--output", "-o", type=Path, required=True,
         help="Output directory for sweep results",
+    )
+    parser.add_argument(
+        "--run-cmd", type=str, default=None,
+        help="Run command template (default: auto from test.exe path)",
     )
     parser.add_argument("--no-hw", action="store_true", help="Skip hardware runs")
     parser.add_argument("--no-emu", action="store_true", help="Skip emulator runs")
-    parser.add_argument(
-        "--trace-size", type=int, default=1048576,
-        help="Trace buffer size per batch (default: 1MB)",
-    )
+    parser.add_argument("--core-only", action="store_true")
+    parser.add_argument("--mem-only", action="store_true")
     parser.add_argument(
         "--hw-cooldown", type=float, default=2.0,
-        help="Seconds between hardware runs to let the driver settle (default: 2)",
-    )
-    parser.add_argument(
-        "--hw-jobs", type=int, default=1,
-        help="Parallel hardware batch jobs (default: 1 = serial). "
-             "NPU1 supports up to 5 concurrent contexts.",
-    )
-    parser.add_argument(
-        "--emu-jobs", type=int, default=0,
-        help="Parallel emulator jobs (default: nproc)",
-    )
-    parser.add_argument(
-        "--compare-parallel", action="store_true",
-        help="Run HW batches twice (serial then parallel at --hw-jobs), "
-             "compare traces to measure determinism under concurrent load.",
-    )
-    parser.add_argument(
-        "--core-only", action="store_true",
-        help="Only sweep core events (skip memory events)",
-    )
-    parser.add_argument(
-        "--mem-only", action="store_true",
-        help="Only sweep memory events (skip core events)",
-    )
-    parser.add_argument(
-        "--compile-only", action="store_true",
-        help="Only inject and compile traced xclbin, skip HW/EMU runs",
-    )
-    parser.add_argument(
-        "--use-base", type=Path, default=None,
-        help="Use pre-compiled base dir (skip inject+compile)",
-    )
-    parser.add_argument(
-        "--batches", type=Path, default=None,
-        help="JSON file with explicit event batches. Array of objects, "
-             'each with "core", "mem", "memtile" keys mapping to 8-element '
-             "event name arrays. Overrides default sweep-all-events behavior.",
+        help="Seconds between HW runs (default: 2)",
     )
     args = parser.parse_args()
 
-    test_dir = resolve_test_dir(args.test)
+    build_dir = args.build_dir.resolve()
+    test_exe = args.test_exe.resolve()
     output_dir = args.output.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    test_name = test_dir.name
-    print(f"Trace sweep: {test_name}")
-    print(f"  Test dir:  {test_dir}")
-    print(f"  Output:    {output_dir}")
-    print(f"  HW:        {'yes' if not args.no_hw else 'no'}")
-    print(f"  EMU:       {'yes' if not args.no_emu else 'no'}")
+    # Validate inputs.
+    if not (build_dir / "insts.bin").exists():
+        print(f"Error: {build_dir}/insts.bin not found", file=sys.stderr)
+        sys.exit(1)
+    if not test_exe.exists():
+        print(f"Error: {test_exe} not found", file=sys.stderr)
+        sys.exit(1)
 
-    # --- Plan trace routing -----------------------------------------------
-    # The planner determines routing (shim col, channel) and classifies
-    # tiles.  Event batching is our responsibility, not the planner's.
-    script_dir = Path(__file__).parent
-    plan = None
-    print("  Planning trace routing...")
-    try:
-        plan_result = subprocess.run(
-            [
-                sys.executable, str(script_dir / "trace-inject.py"),
-                str(test_dir),
-                "--output", str(output_dir / "plan_tmp"),
-                "--plan-only",
-            ],
-            capture_output=True, text=True, timeout=60,
-        )
-        if plan_result.returncode != 0:
-            print(f"  Planner failed: {plan_result.stderr.strip()}", file=sys.stderr)
-        else:
-            plan = json.loads(plan_result.stdout)
-            tiles = plan.get("tiles", [])
-            has_core = any(t["tile_type"] == "core" for t in tiles)
-            has_memtile = any(t["tile_type"] == "memtile" for t in tiles)
-            print(f"  Plan: {plan['reason']} ({len(tiles)} tiles"
-                  f"{', memtile' if has_memtile else ''})")
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, KeyError) as e:
-        print(f"  Planner error: {e}", file=sys.stderr)
+    # Load trace manifest for tile targeting.
+    manifest_candidates = [
+        build_dir.parent / "traced" / "manifest.json",
+        build_dir / "manifest.json",
+        build_dir.parent / "traced" / "events.json",
+    ]
+    manifest = {}
+    for candidate in manifest_candidates:
+        if candidate.exists():
+            manifest = json.loads(candidate.read_text())
+            break
 
-    # Bail out if trace routing is infeasible.
-    if plan and not plan.get("feasible", False):
-        reason = plan.get("reason", "unknown")
-        print(f"\n  TRACE INFEASIBLE: {reason}")
-        _write_skip_manifest(output_dir, "infeasible", reason)
-        sweep_manifest = {
-            "test_name": test_name,
-            "skipped": True,
-            "reason": "infeasible",
-            "detail": reason,
-            "num_batches": 0,
-            "batches": [],
-        }
-        (output_dir / "sweep-manifest.json").write_text(
-            json.dumps(sweep_manifest, indent=2) + "\n"
-        )
-        print(f"Sweep skipped: {reason}")
-        sys.exit(0)
+    # Determine if memtiles are present.
+    tiles = manifest.get("tiles_traced", [])
+    has_memtile = any(t.get("tile_type") == "memtile" for t in tiles)
 
-    # --- Generate event batches -------------------------------------------
-    # Event batching is independent of routing.  Each batch contains 8
-    # event slots per trace port type (core, mem, memtile).  Slot 0 is
-    # always TRUE (anchor event); slots 1-7 are swept across runs.
-    #
-    # Memtile batches are generated only if the plan includes memtiles.
-    # The plan's tile list is authoritative -- no post-compile detection.
-    has_memtile = plan and any(
-        t["tile_type"] == "memtile" for t in plan.get("tiles", [])
-    )
-
-    noop_batch = ["TRUE"] + ["NONE"] * 7
-
-    if args.batches:
-        # Explicit event batches from JSON file.
-        explicit = json.loads(args.batches.read_text())
-        core_batches = [b["core"] for b in explicit]
-        mem_batches = [b["mem"] for b in explicit]
-        memtile_batches = (
-            [b.get("memtile", noop_batch) for b in explicit]
-            if has_memtile else None
-        )
-        print(f"  Batches:   {len(explicit)} (from {args.batches})")
+    # Build run command.
+    if args.run_cmd:
+        run_cmd = args.run_cmd
     else:
-        # Default: sweep all known events.
-        core_batches = batch_events(CORE_EVENTS) if not args.mem_only else [noop_batch]
-        mem_batches = batch_events(MEM_EVENTS) if not args.core_only else [noop_batch]
-        memtile_batches = batch_events(MEMTILE_EVENTS) if has_memtile else None
-        print(f"  Batches:   auto-generated"
-              f" (core: {len(CORE_EVENTS)} events"
-              f", mem: {len(MEM_EVENTS)} events"
-              f"{f', memtile: {len(MEMTILE_EVENTS)} events' if has_memtile else ''})")
+        run_cmd = f"{test_exe} -x aie.xclbin -k MLIR_AIE -i insts.bin"
 
-    # Align all batch lists to the same length.
+    # Generate event batches.
+    noop_batch = ["TRUE"] + ["NONE"] * 7
+    core_batches = batch_events(CORE_EVENTS) if not args.mem_only else [noop_batch]
+    mem_batches = batch_events(MEM_EVENTS) if not args.core_only else [noop_batch]
+    memtile_batches = batch_events(MEMTILE_EVENTS) if has_memtile else None
+
     num_batches = max(len(core_batches), len(mem_batches))
     if memtile_batches:
         num_batches = max(num_batches, len(memtile_batches))
+
+    # Pad to same length.
     while len(core_batches) < num_batches:
         core_batches.append(noop_batch)
     while len(mem_batches) < num_batches:
@@ -698,584 +582,40 @@ def main():
         while len(memtile_batches) < num_batches:
             memtile_batches.append(noop_batch)
 
-    print(f"  Total:     {num_batches} batches")
+    print(f"Trace sweep: {build_dir.name}")
+    print(f"  Build:     {build_dir}")
+    print(f"  Test exe:  {test_exe}")
+    print(f"  Output:    {output_dir}")
+    print(f"  HW:        {'yes' if not args.no_hw else 'no'}")
+    print(f"  EMU:       {'yes' if not args.no_emu else 'no'}")
+    print(f"  Batches:   {num_batches}")
     print()
 
-    # --- Compile-only mode: compile base(s) and exit -----------------------
-
-    if args.compile_only:
-        status_file = output_dir / "compile-status.txt"
-        try:
-            base_dir, base_manifest = compile_base_trace(
-                test_dir, output_dir, args.trace_size,
-            )
-            if base_dir is not None:
-                status_file.write_text("OK\n")
-                print(f"\nCompile-only: OK")
-            else:
-                status_file.write_text("FAIL compile_base_trace failed\n")
-                print(f"\nCompile-only: FAIL")
-                sys.exit(1)
-        except Exception as e:
-            status_file.write_text(f"FAIL {e}\n")
-            print(f"\nCompile-only: FAIL ({e})")
-            sys.exit(1)
-        return
-
-    # --- Execute sweep: compile once, run all event batches ---------------
-
-    _run_single_pass(
-        test_dir, output_dir, test_name, args,
-        core_batches, mem_batches, memtile_batches,
-        num_batches, noop_batch, script_dir,
+    # Execute sweep.
+    batches = run_sweep(
+        build_dir=build_dir,
+        test_exe=test_exe,
+        output_dir=output_dir,
+        run_cmd=run_cmd,
+        core_batches=core_batches,
+        mem_batches=mem_batches,
+        memtile_batches=memtile_batches,
+        num_batches=num_batches,
+        manifest=manifest,
+        run_hw=not args.no_hw,
+        run_emu=not args.no_emu,
+        hw_cooldown=args.hw_cooldown,
     )
 
-
-def _run_single_pass(
-    test_dir: Path,
-    output_dir: Path,
-    test_name: str,
-    args,
-    core_batches: list[list[str]],
-    mem_batches: list[list[str]],
-    memtile_batches: list[list[str]] | None,
-    num_batches: int,
-    noop_batch: list[str],
-    script_dir: Path,
-):
-    """Run the standard single-pass sweep (original behavior)."""
-    trace_size = args.trace_size
-
-    # Use pre-compiled base if provided, otherwise compile fresh.
-    if getattr(args, "use_base", None) is not None:
-        use_base = args.use_base.resolve()
-        base_manifest_path = use_base / "manifest.json"
-        if not use_base.is_dir() or not base_manifest_path.exists():
-            print(f"Error: --use-base dir missing or lacks manifest.json: {use_base}",
-                  file=sys.stderr)
-            sys.exit(1)
-        base_dir = use_base
-        base_manifest = base_manifest_path
-        print(f"  Using pre-compiled base: {use_base}")
-    else:
-        # Compile base trace once (all batches share xclbin, patch insts.bin)
-        base_dir, base_manifest = compile_base_trace(
-            test_dir, output_dir, trace_size,
-        )
-    if base_dir is None:
-        # Check if a skip manifest was written with a specific reason
-        skip_manifest = output_dir / "base" / "sweep-manifest.json"
-        if skip_manifest.exists():
-            skip_info = json.loads(skip_manifest.read_text())
-            reason = skip_info.get("reason", "unknown")
-            # Copy to top-level sweep manifest so the bridge script can parse it
-            sweep_manifest = {
-                "test_name": test_name,
-                "skipped": True,
-                "reason": reason,
-                "detail": skip_info.get("detail", ""),
-                "num_batches": 0,
-                "batches": [],
-            }
-            (output_dir / "sweep-manifest.json").write_text(
-                json.dumps(sweep_manifest, indent=2) + "\n"
-            )
-            print(f"Sweep skipped: {reason}")
-            sys.exit(0)
-        print("Failed to compile base trace. Aborting sweep.", file=sys.stderr)
-        sys.exit(1)
-    print()
-
-    # Memtile detection is done upfront from the routing plan's tile list,
-    # so memtile_batches are already populated if needed.
-
-    # Prepare all batches (patch insts.bin, no execution yet)
-    batches = []
-    for i in range(num_batches):
-        mt_batch = memtile_batches[i] if memtile_batches is not None else None
-        info = prepare_batch(
-            i, core_batches[i], mem_batches[i],
-            base_dir, base_manifest, output_dir,
-            memtile_batch=mt_batch,
-        )
-        batches.append(info)
-    print()
-
-    # Execute batches and write results.
-    results = _execute_and_merge(
-        batches, output_dir, test_name, args, script_dir,
-    )
-
-    _write_single_pass_manifest(output_dir, test_name, num_batches, results)
-    _print_summary(output_dir, test_name, num_batches, results)
-
-
-
-
-def _wait_npu_recovery(timeout: float = 60.0) -> bool:
-    """Wait for NPU to become healthy after a fault.  Returns True if OK."""
-    import time
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if wait_npu_idle(timeout=2.0):
-            return True
-        print(f"    waiting for NPU recovery... ({int(deadline - time.monotonic())}s left)")
-        time.sleep(2)
-    return False
-
-
-def _retry_batch_serial(
-    batch: dict,
-    output_subdir: str,
-    hw_cooldown: float,
-    max_attempts: int = 3,
-) -> str:
-    """Retry a single batch serially with up to max_attempts for TDRs.
-
-    Returns the final status ("ok", "tdr", "iommu_fault", "failed").
-    """
-    status_key = f"{output_subdir}_status"
-    for attempt in range(1, max_attempts + 1):
-        _wait_npu_recovery(timeout=30.0)
-        run_batch_hw(batch, hw_cooldown=hw_cooldown, output_subdir=output_subdir)
-        status = batch.get(status_key, "failed")
-        if status == "ok":
-            return "ok"
-        if status == "iommu_fault":
-            print(f"    Batch {batch['batch']}: IOMMU fault on retry -- culprit identified")
-            return "iommu_fault"
-        if status == "tdr" and attempt < max_attempts:
-            print(f"    Batch {batch['batch']}: TDR on attempt {attempt}/{max_attempts}, retrying")
-        else:
-            print(f"    Batch {batch['batch']}: {status} after {attempt} attempt(s)")
-    return batch.get(status_key, "failed")
-
-
-def _run_hw_batches(
-    runnable: list[dict],
-    hw_jobs: int,
-    hw_cooldown: float,
-    output_subdir: str = "hw",
-):
-    """Run HW batches, serial or parallel depending on hw_jobs.
-
-    Parallel mode monitors for faults after each batch completion:
-    - TDR: pause pool, wait for recovery, retry that batch serially
-      (3 attempts), then resume parallel.
-    - IOMMU fault: stop all running batches, wait for recovery, then
-      run every in-flight batch serially to identify the culprit.
-    """
-    from concurrent.futures import ThreadPoolExecutor, as_completed, Future
-
-    if hw_jobs <= 1:
-        # Serial: one at a time with cooldown between runs.
-        label = f"serial, {hw_cooldown}s cooldown"
-        print(f"  HW:  {len(runnable)} batches ({label}, -> {output_subdir}/)")
-        for b in runnable:
-            run_batch_hw(b, hw_cooldown=hw_cooldown, output_subdir=output_subdir)
-        return
-
-    # --- Parallel with fault monitoring ---
-    label = f"parallel, -j{hw_jobs}"
-    print(f"  HW:  {len(runnable)} batches ({label}, -> {output_subdir}/)")
-    status_key = f"{output_subdir}_status" if output_subdir != "hw" else "hw_status"
-    queue = list(runnable)  # batches still to submit
-    done = []               # completed batches
-
-    with ThreadPoolExecutor(max_workers=hw_jobs) as pool:
-        active: dict[Future, dict] = {}  # future -> batch
-
-        def _fill_pool():
-            while len(active) < hw_jobs and queue:
-                b = queue.pop(0)
-                f = pool.submit(
-                    run_batch_hw, b,
-                    hw_cooldown=0.2,
-                    output_subdir=output_subdir,
-                )
-                active[f] = b
-
-        _fill_pool()
-
-        while active:
-            # Wait for the next batch to complete.
-            completed_futures = []
-            for f in as_completed(active):
-                completed_futures.append(f)
-                break  # process one at a time to check faults
-
-            for f in completed_futures:
-                batch = active.pop(f)
-                try:
-                    f.result()
-                except Exception as e:
-                    print(f"  Batch {batch['batch']}: exception: {e}")
-
-                status = batch.get(status_key, "failed")
-
-                if status == "iommu_fault":
-                    # IOMMU fault: stop everything, recover, then run
-                    # all in-flight batches serially to find the culprit.
-                    print(f"\n  IOMMU FAULT in batch {batch['batch']} -- "
-                          f"pausing pool, recovering NPU...")
-
-                    # Collect all in-flight batches (let them finish,
-                    # they may already be done or about to fault too).
-                    suspects = [batch]
-                    for af in list(active):
-                        try:
-                            af.result(timeout=30)
-                        except Exception:
-                            pass
-                        suspects.append(active.pop(af))
-
-                    # Wait for NPU recovery.
-                    if not _wait_npu_recovery(timeout=60.0):
-                        print("  NPU did not recover -- skipping remaining batches")
-                        for s in suspects[1:]:
-                            s[status_key] = "skipped_iommu"
-                        done.extend(suspects)
-                        queue.clear()
-                        break
-
-                    # Re-run all suspects serially to identify the culprit.
-                    print(f"  Re-running {len(suspects)} suspect(s) serially...")
-                    for s in suspects:
-                        result = _retry_batch_serial(
-                            s, output_subdir, hw_cooldown, max_attempts=1,
-                        )
-                        print(f"    Batch {s['batch']}: {result}")
-                        done.append(s)
-
-                    # Resume parallel pool with remaining queue.
-                    _fill_pool()
-
-                elif status == "tdr":
-                    # TDR: pause, recover, retry this one batch.
-                    print(f"  Batch {batch['batch']}: TDR -- "
-                          f"retrying serially (up to 3 attempts)...")
-                    result = _retry_batch_serial(
-                        batch, output_subdir, hw_cooldown, max_attempts=3,
-                    )
-                    done.append(batch)
-                    _fill_pool()
-
-                else:
-                    # Clean completion (ok or failed).
-                    done.append(batch)
-                    _fill_pool()
-
-
-def _compare_serial_vs_parallel(
-    batches: list[dict],
-    output_dir: Path,
-    script_dir: Path,
-):
-    """Compare serial vs parallel HW traces per-batch using trace-compare."""
-    # Prefer Rust binary, fall back to Python.
-    rust_bin = script_dir.parent / "target" / "release" / "trace-compare"
-    compare_cmd = (
-        [str(rust_bin)] if rust_bin.exists()
-        else [sys.executable, str(script_dir / "trace-compare.py")]
-    )
-
-    report_path = output_dir / "serial-vs-parallel-report.txt"
-    lines = ["=== Serial vs Parallel Trace Comparison ===", ""]
-
-    total = 0
-    identical = 0
-    diverged = 0
-    errors = 0
-
-    for b in batches:
-        batch_idx = b["batch"]
-        batch_dir = Path(b["batch_dir"])
-        serial_raw = batch_dir / "hw-serial" / "trace_raw.bin"
-        parallel_raw = batch_dir / "hw-parallel" / "trace_raw.bin"
-
-        if not serial_raw.exists() or not parallel_raw.exists():
-            lines.append(f"Batch {batch_idx}: SKIP (missing trace data)")
-            errors += 1
-            continue
-
-        # Reject all-zeros traces -- they indicate a failed/TDR'd run.
-        def _is_all_zeros(path: Path) -> bool:
-            with open(path, "rb") as f:
-                chunk = f.read(4096)
-                return len(chunk) > 0 and chunk == b"\x00" * len(chunk)
-
-        serial_zeros = _is_all_zeros(serial_raw)
-        parallel_zeros = _is_all_zeros(parallel_raw)
-        if serial_zeros and parallel_zeros:
-            lines.append(f"Batch {batch_idx}: EMPTY (both traces all-zeros -- TDR/fault?)")
-            errors += 1
-            continue
-        if serial_zeros:
-            lines.append(f"Batch {batch_idx}: SERIAL_EMPTY (serial trace all-zeros)")
-            diverged += 1
-            continue
-        if parallel_zeros:
-            lines.append(f"Batch {batch_idx}: PARALLEL_EMPTY (parallel trace all-zeros -- TDR?)")
-            diverged += 1
-            continue
-
-        total += 1
-        batch_report = batch_dir / "serial-vs-parallel.txt"
-
-        # Compare with --remap-columns: the NPU driver assigns different
-        # physical columns to each run, so we normalize to logical columns.
-        result = subprocess.run(
-            compare_cmd + [
-                "--remap-columns",
-                "--hw", str(serial_raw),
-                "--emu", str(parallel_raw),
-                "-o", str(batch_report),
-            ],
-            capture_output=True, text=True, timeout=60,
-        )
-
-        # Check if raw bytes are identical first (fast path).
-        import filecmp
-        if filecmp.cmp(str(serial_raw), str(parallel_raw), shallow=False):
-            lines.append(f"Batch {batch_idx}: IDENTICAL (byte-for-byte)")
-            identical += 1
-        elif result.returncode == 0 and batch_report.exists():
-            report_text = batch_report.read_text()
-
-            # For serial-vs-parallel HW comparison, the right question is:
-            # "do both runs observe the same event types?"
-            #
-            # Expected differences between any two HW runs:
-            # - Absolute timestamps differ (different NPU clock start)
-            # - Total event counts differ (trace buffer fills at different
-            #   rates under different load)
-            # - Timing drift accumulates (DMA startup jitter, NoC latency)
-            #
-            # Real non-determinism would be:
-            # - An event type present in one trace but completely absent
-            #   in the other (count N/0 or 0/N with no overlap at all)
-            # - Events in fundamentally different order (not just shifted)
-
-            # Parse the summary line for clean/diverged/count-mismatch.
-            import re
-            edge_m = re.search(
-                r"Edge event types:\s+(\d+) clean, (\d+) diverged, (\d+) count mismatch",
-                report_text,
-            )
-            if edge_m:
-                n_clean = int(edge_m.group(1))
-                n_diverged = int(edge_m.group(2))
-                n_count_mm = int(edge_m.group(3))
-                n_total_types = n_clean + n_diverged + n_count_mm
-
-                # Check for missing event types: N/0 or 0/N in paired counts.
-                # This would indicate a real non-determinism.
-                missing_types = 0
-                for line_text in report_text.splitlines():
-                    m = re.search(r"\[edge\]\s+\S+\s+(\d+)/(\d+)", line_text)
-                    if m:
-                        hw_n, emu_n = int(m.group(1)), int(m.group(2))
-                        if (hw_n == 0) != (emu_n == 0):
-                            missing_types += 1
-
-                if missing_types > 0:
-                    lines.append(
-                        f"Batch {batch_idx}: MISSING_EVENTS "
-                        f"({missing_types} types absent in one run)"
-                    )
-                    diverged += 1
-                else:
-                    # All event types present in both runs.  Timing drift
-                    # and count differences are expected between HW runs.
-                    lines.append(
-                        f"Batch {batch_idx}: DETERMINISTIC "
-                        f"({n_total_types} event types, "
-                        f"{n_clean} timing-clean, "
-                        f"{n_diverged} timing-shifted, "
-                        f"{n_count_mm} count-differ)"
-                    )
-                    identical += 1
-            else:
-                # Couldn't parse summary -- fall back to old heuristic.
-                lines.append(f"Batch {batch_idx}: UNKNOWN (see {batch_report})")
-                errors += 1
-        else:
-            lines.append(f"Batch {batch_idx}: ERROR (compare failed)")
-            errors += 1
-
-    lines.append("")
-    lines.append(f"Summary: {total} batches compared")
-    lines.append(f"  Identical/timing-only: {identical}")
-    lines.append(f"  Diverged:              {diverged}")
-    lines.append(f"  Errors:                {errors}")
-
-    if diverged == 0 and errors == 0:
-        lines.append("")
-        lines.append("DETERMINISTIC: Parallel execution does not affect trace event sequences.")
-    elif diverged > 0:
-        lines.append("")
-        lines.append(
-            f"NON-DETERMINISTIC: {diverged} batch(es) show different events under parallel load."
-        )
-
-    report_text = "\n".join(lines) + "\n"
-    report_path.write_text(report_text)
-    print(report_text)
-
-
-def _execute_and_merge(
-    batches: list[dict],
-    output_dir: Path,
-    test_name: str,
-    args,
-    script_dir: Path,
-) -> list[dict]:
-    """Execute batches (HW + EMU) and merge traces.
-
-    Returns the batch results list (mutated in place with hw/emu status).
-    """
-    from concurrent.futures import ThreadPoolExecutor
-
-    runnable = [b for b in batches if b["status"] == "ok"]
-    emu_jobs = args.emu_jobs if args.emu_jobs > 0 else os.cpu_count() or 4
-    hw_jobs = getattr(args, "hw_jobs", 1)
-
-    compare_parallel = getattr(args, "compare_parallel", False)
-
-    if compare_parallel and not args.no_hw:
-        # --- Compare mode: run HW serial, then HW parallel, then compare ---
-        print("  === Serial vs Parallel comparison mode ===")
-
-        # Pass 1: serial (ground truth, one at a time).
-        _run_hw_batches(runnable, hw_jobs=1, hw_cooldown=args.hw_cooldown,
-                        output_subdir="hw-serial")
-
-        # Pass 2: parallel.
-        parallel_jobs = hw_jobs if hw_jobs > 1 else 5
-        _run_hw_batches(runnable, hw_jobs=parallel_jobs,
-                        hw_cooldown=0.2, output_subdir="hw-parallel")
-
-        # Copy serial results into default "hw" keys for merge compatibility.
-        for b in runnable:
-            b["hw_status"] = b.get("hw-serial_status", "failed")
-            if "hw-serial_trace" in b:
-                b["hw_trace"] = b["hw-serial_trace"]
-
-        # Run EMU concurrently (already done by the time we get here, or now).
-        with ThreadPoolExecutor(max_workers=emu_jobs) as pool:
-            if not args.no_emu:
-                print(f"  EMU: {len(runnable)} batches (parallel, -j{emu_jobs})")
-                emu_futures = [pool.submit(run_batch_emu, b) for b in runnable]
-                for f in emu_futures:
-                    f.result()
-
-        # Compare serial vs parallel per-batch.
-        print()
-        _compare_serial_vs_parallel(runnable, output_dir, script_dir)
-
-    else:
-        # --- Normal mode: single HW pass + EMU ---
-        with ThreadPoolExecutor(max_workers=emu_jobs + 1) as pool:
-            hw_future = None
-            if not args.no_hw:
-                hw_future = pool.submit(
-                    _run_hw_batches, runnable, hw_jobs, args.hw_cooldown
-                )
-
-            emu_futures = []
-            if not args.no_emu:
-                print(f"  EMU: {len(runnable)} batches (parallel, -j{emu_jobs})")
-                emu_futures = [pool.submit(run_batch_emu, b) for b in runnable]
-
-            for f in emu_futures:
-                f.result()
-            if hw_future:
-                hw_future.result()
-
-    print()
-
-    # Merge traces.
-    merge_script = script_dir / "trace-merge.py"
-    hw_traces = [r["hw_trace"] for r in batches if r.get("hw_trace")]
-    emu_traces = [r["emu_trace"] for r in batches if r.get("emu_trace")]
-
-    if hw_traces and merge_script.exists():
-        print(f"  Merging {len(hw_traces)} hardware traces...")
-        hw_merged = output_dir / "hw-merged.json"
-        subprocess.run(
-            [sys.executable, str(merge_script)] + hw_traces + ["-o", str(hw_merged)],
-            timeout=120,
-        )
-
-    if emu_traces and merge_script.exists():
-        print(f"  Merging {len(emu_traces)} emulator traces...")
-        emu_merged = output_dir / "emu-merged.json"
-        subprocess.run(
-            [sys.executable, str(merge_script)] + emu_traces + ["-o", str(emu_merged)],
-            timeout=120,
-        )
-
-    # Cross-platform comparison (if both HW and EMU ran).
-    compare_script = script_dir / "trace-compare.py"
-    hw_merged = output_dir / "hw-merged.json"
-    emu_merged = output_dir / "emu-merged.json"
-    report_path = output_dir / "comparison-report.txt"
-
-    if hw_merged.exists() and emu_merged.exists() and compare_script.exists():
-        print(f"  Comparing HW vs EMU (boot-normalized)...")
-        subprocess.run(
-            [
-                sys.executable, str(compare_script),
-                str(hw_merged), str(emu_merged),
-                "-o", str(report_path),
-            ],
-            timeout=120,
-        )
-
-    return batches
-
-
-def _write_single_pass_manifest(
-    output_dir: Path,
-    test_name: str,
-    num_batches: int,
-    results: list[dict],
-):
-    """Write the sweep-manifest.json for a single-pass sweep."""
-    sweep_manifest = {
-        "test_name": test_name,
-        "num_batches": num_batches,
-        "batches": results,
-    }
-    manifest_path = output_dir / "sweep-manifest.json"
-    manifest_path.write_text(json.dumps(sweep_manifest, indent=2) + "\n")
-
-
-def _print_summary(
-    output_dir: Path,
-    test_name: str,
-    num_batches: int,
-    results: list[dict],
-):
-    """Print end-of-sweep summary for a single-pass sweep."""
-    manifest_path = output_dir / "sweep-manifest.json"
-    hw_merged = output_dir / "hw-merged.json"
-    emu_merged = output_dir / "emu-merged.json"
-    report_path = output_dir / "comparison-report.txt"
-
-    print(f"\nSweep complete: {test_name}")
-    print(f"  Batches:  {num_batches}")
-    ok = sum(1 for r in results if r["status"] == "ok")
-    print(f"  Success:  {ok}/{num_batches}")
-    print(f"  Manifest: {manifest_path}")
-    if hw_merged.exists():
-        print(f"  HW merged:  {hw_merged}")
-    if emu_merged.exists():
-        print(f"  EMU merged: {emu_merged}")
-    if report_path.exists():
-        print(f"  Report:     {report_path}")
-    print(f"\nView in Perfetto: https://ui.perfetto.dev/")
+    # Summary.
+    ok = sum(1 for b in batches if b["status"] == "ok")
+    hw_ok = sum(1 for b in batches if b.get("hw_status") == "ok")
+    emu_ok = sum(1 for b in batches if b.get("emu_status") == "ok")
+    print(f"\nSweep complete: {ok}/{num_batches} patched")
+    if not args.no_hw:
+        print(f"  HW:  {hw_ok}/{ok} OK")
+    if not args.no_emu:
+        print(f"  EMU: {emu_ok}/{ok} OK")
 
 
 if __name__ == "__main__":
