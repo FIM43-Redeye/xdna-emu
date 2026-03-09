@@ -69,11 +69,16 @@ scan_devices(std::vector<std::shared_ptr<xrt_core::pci::dev>>& ready_list,
   if (!env || std::string(env) == "0")
     return;
 
-  // Inject a synthetic device via the same create_pcidev path used
-  // by the base class, but without any sysfs backing.
-  // Use a synthetic BDF that won't collide with real PCI devices.
-  // The base class parses this as domain:bus:dev.func via sscanf.
-  ready_list.push_back(create_pcidev("ffff:ff:1f.0"));
+  // Insert the emulator device at index 0 so that `xrt::device(0)` -- the
+  // convention used by all mlir-aie test binaries -- selects the emulator
+  // instead of real hardware.  This way `XDNA_EMU=1 ./test.exe` just works
+  // without needing XRT_DEVICE_BDF or patched test sources.
+  //
+  // XRT calls scan_devices() on each registered driver in load order,
+  // appending to the shared ready_list.  By inserting at the front, the
+  // emulator stays at index 0 regardless of whether other drivers have
+  // already added real devices.
+  ready_list.insert(ready_list.begin(), create_pcidev("ffff:ff:1f.0"));
 }
 
 std::shared_ptr<xrt_core::pci::dev>
