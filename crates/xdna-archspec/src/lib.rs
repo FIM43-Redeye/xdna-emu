@@ -13,6 +13,7 @@
 pub mod device_model;
 pub mod regdb;
 pub mod regdb_extractor;
+pub mod tablegen;
 pub mod types;
 
 use std::path::Path;

@@ -214,57 +214,7 @@ impl InstructionDecoder {
             );
         });
 
-        // Cross-validate archspec processor constants against parsed TableGen.
-        // This catches drift if the .td files change but archspec isn't updated.
-        Self::validate_archspec_against_tablegen(std::path::Path::new(&path));
-
         decoder
-    }
-
-    /// Validate that archspec processor model constants match the llvm-aie
-    /// TableGen source files. Logs warnings on mismatch (non-fatal).
-    fn validate_archspec_against_tablegen(llvm_aie_path: &std::path::Path) {
-        let data = match crate::tablegen::load_from_llvm_aie(llvm_aie_path) {
-            Ok(d) => d,
-            Err(e) => {
-                log::warn!("Cannot validate archspec against TableGen: {}", e);
-                return;
-            }
-        };
-
-        // Validate slot widths against archspec::processor constants.
-        use crate::arch::processor;
-        let expected: &[(&str, u8)] = &[
-            ("lda", processor::LDA_WIDTH),
-            ("ldb", processor::LDB_WIDTH),
-            ("alu", processor::ALU_WIDTH),
-            ("mv", processor::MV_WIDTH),
-            ("st", processor::ST_WIDTH),
-            ("vec", processor::VEC_WIDTH),
-            ("lng", processor::LNG_WIDTH),
-        ];
-
-        let mut mismatches = 0;
-        for &(name, archspec_width) in expected {
-            let slot_name = format!("{}_slot", name);
-            if let Some(slot_def) = data.slots.get(&slot_name) {
-                if slot_def.bits != archspec_width {
-                    log::error!(
-                        "archspec/TableGen mismatch: slot '{}' width = {} (archspec) vs {} (TableGen)",
-                        name, archspec_width, slot_def.bits
-                    );
-                    mismatches += 1;
-                }
-            } else {
-                log::warn!("Slot '{}' not found in TableGen data", slot_name);
-            }
-        }
-
-        if mismatches == 0 {
-            log::info!("archspec processor constants validated against TableGen ({} slots checked)", expected.len());
-        } else {
-            log::error!("{} archspec/TableGen mismatches detected -- update xdna-archspec ProcessorModel", mismatches);
-        }
     }
 
     /// Load a decoder from llvm-aie.

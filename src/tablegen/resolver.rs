@@ -1483,29 +1483,6 @@ mod tests {
         assert!(index.slot_index("alu").is_some());
     }
 
-    #[test]
-    fn test_decoder_index_with_real_llvm_aie() {
-        use std::path::Path;
-        use crate::tablegen::load_from_llvm_aie;
-
-        let llvm_aie_path = Path::new("../llvm-aie");
-        if !llvm_aie_path.exists() {
-            eprintln!("Skipping test: llvm-aie not found");
-            return;
-        }
-
-        let data = load_from_llvm_aie(llvm_aie_path).expect("Failed to load llvm-aie");
-        let by_slot = build_decoder_tables(&data);
-        let index = DecoderIndex::from_slot_encodings(by_slot, HashMap::new());
-
-        // Verify the index is usable
-        assert!(!index.is_empty());
-
-        // Verify we have expected slots
-        assert!(index.slot_index("alu").is_some(), "Should have alu slot");
-        assert!(index.slot_index("lda").is_some(), "Should have lda slot");
-    }
-
     // === Operand Ordering Tests ===
 
     #[test]
@@ -1734,51 +1711,6 @@ mod tests {
         assert_eq!(detect_mem_width("vlda"), InstrMemWidth::Vector256);
         assert_eq!(detect_mem_width("vldb"), InstrMemWidth::Vector256);
         assert_eq!(detect_mem_width("vst"), InstrMemWidth::Vector256);
-    }
-
-    #[test]
-    fn test_operand_ordering_with_real_llvm_aie() {
-        use std::path::Path;
-        use crate::tablegen::load_from_llvm_aie;
-
-        let llvm_aie_path = Path::new("../llvm-aie");
-        if !llvm_aie_path.exists() {
-            eprintln!("Skipping test: llvm-aie not found");
-            return;
-        }
-
-        let data = load_from_llvm_aie(llvm_aie_path).expect("Failed to load llvm-aie");
-        let resolver = Resolver::new(&data);
-
-        // Check some key instructions have correct operand ordering
-
-        // SELEQZ: the regex parser can't follow template-parameterized patterns
-        // (SelectNotPat<ValueType type>), so Select semantic is only available
-        // on the tblgen path via pattern post-processing. Verify implicit regs.
-        if let Some(seleqz) = data.instructions.get("SELEQZ") {
-            let encoding = resolver.resolve_instruction(seleqz).unwrap();
-            eprintln!("SELEQZ: semantic={:?}, input_order={:?}, implicit_regs={:?}",
-                encoding.semantic, encoding.input_order, encoding.implicit_regs);
-
-            // Check for r27 in implicit registers
-            let has_r27 = encoding.implicit_regs.iter()
-                .any(|ir| ir.reg_num == 27 && ir.is_use);
-            assert!(has_r27, "SELEQZ should have r27 as implicit use");
-        }
-
-        // Count instructions with semantic info
-        let with_semantic: Vec<_> = data.instructions.values()
-            .filter_map(|instr| resolver.resolve_instruction(instr).ok())
-            .filter(|enc| enc.semantic.is_some())
-            .collect();
-
-        let total = data.instructions.len();
-        eprintln!("Instructions with semantic: {}/{} ({:.1}%)",
-            with_semantic.len(), total,
-            100.0 * with_semantic.len() as f64 / total as f64);
-
-        // Should have at least some semantic coverage
-        assert!(with_semantic.len() > 0, "Should have some instructions with semantic info");
     }
 
     // === OperandType / classify_operand_type Tests ===

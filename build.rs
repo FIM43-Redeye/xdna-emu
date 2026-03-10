@@ -93,6 +93,48 @@ fn main() {
     // reflect both AM025 and aie-rt when code is generated.
     extract_aiert(&manifest_dir, &out_dir, &mut arch_model);
 
+    // Cross-validate processor model slot widths against llvm-aie TableGen.
+    // The manual constants (from populate_aie2_manual_constants) are the baseline;
+    // this extraction from AIE2Slots.td confirms them at compile time.
+    let llvm_aie = env::var("LLVM_AIE_PATH").unwrap_or_else(|_| {
+        manifest_dir
+            .parent()
+            .expect("Cargo manifest has no parent directory")
+            .join("llvm-aie")
+            .to_string_lossy()
+            .to_string()
+    });
+    let llvm_aie_path = Path::new(&llvm_aie);
+    let slots_td = llvm_aie_path.join("llvm/lib/Target/AIE/AIE2Slots.td");
+    println!("cargo:rerun-if-env-changed=LLVM_AIE_PATH");
+    if slots_td.exists() {
+        println!("cargo:rerun-if-changed={}", slots_td.display());
+        match xdna_archspec::tablegen::confirm_processor_slots(
+            &mut arch_model,
+            llvm_aie_path,
+        ) {
+            Ok(count) => {
+                println!(
+                    "cargo:warning=TableGen: confirmed {} slot widths from {}",
+                    count,
+                    slots_td.display()
+                );
+            }
+            Err(e) => {
+                panic!(
+                    "TableGen slot validation failed:\n  {}\n\
+                     Set LLVM_AIE_PATH to override the llvm-aie location.",
+                    e
+                );
+            }
+        }
+    } else {
+        println!(
+            "cargo:warning=llvm-aie not found at {} -- using manual slot widths only",
+            llvm_aie_path.display()
+        );
+    }
+
     // Generate all files from the graph crate's parsed data.
     gen_arch(&arch_model, &out_dir);
     gen_subsystems(&arch_model, &out_dir);
