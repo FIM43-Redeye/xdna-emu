@@ -552,11 +552,11 @@ impl Transfer {
             None
         };
 
-        // Total output includes padding words (each is 4 bytes)
-        let pad_bytes = zero_pad_state.as_ref()
-            .map(|s| (s.total_output_words() - address_gen.total_elements()) * 4)
-            .unwrap_or(0);
-        let total_bytes = data_bytes + pad_bytes;
+        // For padded MemTile MM2S: Buffer_Length already includes both data
+        // and padding words (the CDO lowering sets length = data + padding).
+        // Don't add padding on top or it gets double-counted, causing extra
+        // zero words to bleed into subsequent BD firings.
+        let total_bytes = data_bytes;
 
         // Determine endpoints based on direction and tile type
         let is_shim = tile_type == TileType::Shim;
@@ -1337,12 +1337,20 @@ mod tests {
 
     #[test]
     fn test_transfer_with_padding_total_bytes() {
-        // Verify total_bytes includes padding words
+        // Verify total_bytes for padded transfers.
+        //
+        // Per CDO lowering: Buffer_Length includes both data and padding words.
+        // The padding state machine handles data/padding interleaving, so
+        // total_bytes = Buffer_Length (no additional padding added on top).
         use crate::device::dma::DimensionConfig;
 
+        // Simulate CDO-style BD: d0=5 data words, d0_pad 1+1, d1=2 rows
+        // D0 wrap = 1+5+1 = 7 words per row
+        // Total output = 2 * 7 = 14 words = 56 bytes
+        // CDO sets Buffer_Length = 14 words (total output including padding)
         let bd = BdConfig {
             base_addr: 0x80000,
-            length: 40,  // 10 data words * 4 bytes (d0=5 * d1=2)
+            length: 56,  // 14 words * 4 bytes (CDO: data + padding)
             d0: DimensionConfig::new(5, 4),
             d1: DimensionConfig::new(2, 20),
             valid: true,
@@ -1354,26 +1362,21 @@ mod tests {
             ..Default::default()
         };
 
-        // On a MemTile MM2S transfer, padding should increase total_bytes
+        // MemTile MM2S: padding active, total_bytes = Buffer_Length
         let transfer = Transfer::new(
             &bd, 0, 0, TransferDirection::MM2S, 1, 1, TileType::MemTile,
         ).unwrap();
-
-        // Data: d0=5, d1=2 -> 10 words = 40 bytes
-        // D0 wrap = 1+5+1 = 7 words per row
-        // D1 total = 0+2+0 = 2 (no D1 padding)
-        // Total output = 2 * 7 = 14 words = 56 bytes
         assert_eq!(transfer.total_bytes, 56);
         assert!(transfer.has_zero_padding());
 
-        // Same BD on compute tile (not MemTile) -- no padding applied
+        // Same BD on compute tile -- no padding applied (compute doesn't pad)
         let transfer_compute = Transfer::new(
             &bd, 0, 0, TransferDirection::MM2S, 1, 2, TileType::Compute,
         ).unwrap();
-        assert_eq!(transfer_compute.total_bytes, 40);
+        assert_eq!(transfer_compute.total_bytes, 56);
         assert!(!transfer_compute.has_zero_padding());
 
-        // Same BD on MemTile S2MM -- no padding (S2MM ignores padding)
+        // MemTile S2MM -- no padding (S2MM ignores padding config)
         let transfer_s2mm = Transfer::new(
             &bd, 0, 0, TransferDirection::S2MM, 1, 1, TileType::MemTile,
         ).unwrap();
@@ -1419,5 +1422,40 @@ mod tests {
         assert!(matches!(actions[1], PadAction::Data(_)));
         assert!(matches!(actions[2], PadAction::Data(_)));
         assert_eq!(actions[3], PadAction::Zero);  // 1 word of zeros (4 i8 zeros)
+    }
+
+    /// Validates transfer total_bytes for the add_378_i32 padding scenario.
+    ///
+    /// BD config from CDO: 13 data words + 2 pad_before + 1 pad_after = 16 total.
+    /// Buffer_Length = 16 words = 64 bytes. The transfer must produce exactly
+    /// 16 words, not 19 (which was the bug: padding double-counted).
+    #[test]
+    fn test_transfer_padding_no_double_count() {
+        use crate::device::dma::DimensionConfig;
+
+        let bd = BdConfig {
+            base_addr: 0x80000,
+            length: 64,  // 16 words * 4 bytes (CDO: total including padding)
+            d0: DimensionConfig::new(13, 4),  // 13 data words
+            valid: true,
+            zero_padding: ZeroPadConfig {
+                d0_before: 2,
+                d0_after: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let transfer = Transfer::new(
+            &bd, 0, 0, TransferDirection::MM2S, 1, 1, TileType::MemTile,
+        ).unwrap();
+
+        // total_bytes must equal Buffer_Length (64), not Buffer_Length + pad (76)
+        assert_eq!(transfer.total_bytes, 64);
+        assert!(transfer.has_zero_padding());
+
+        // ZeroPadState's total must match: 2 + 13 + 1 = 16 words
+        let pad = transfer.zero_pad_state.as_ref().unwrap();
+        assert_eq!(pad.total_output_words(), 16);
     }
 }
