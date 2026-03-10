@@ -212,7 +212,34 @@ fn populate_aie2_manual_constants(model: &mut types::ArchModel) {
             counts_with_tokens: 2,
             counts_from_register: 3,
         },
-        source: src,
+        source: src.clone(),
+    });
+
+    // -- Processor model --
+    // VLIW slot widths from llvm-aie AIE2Slots.td, register sizes from
+    // AIE2GenRegisterInfo.td, pipeline constants from AM020 Ch4.
+    let proc_src = SourceAttribution {
+        origin: Source::Am020,
+        file: "llvm-aie AIE2Slots.td + AIE2GenRegisterInfo.td + AM020 Ch4".into(),
+        detail: "VLIW slot widths, register sizes, pipeline constants".into(),
+    };
+    model.processor = Some(ProcessorModel {
+        slot_widths: vec![
+            ("lda".into(), 21),
+            ("ldb".into(), 16),
+            ("alu".into(), 20),
+            ("mv".into(), 22),
+            ("st".into(), 21),
+            ("vec".into(), 26),
+            ("lng".into(), 42),
+        ],
+        vector_register_bits: 512,
+        vector_pair_bits: 1024,
+        accumulator_bits: 512,
+        branch_delay_slots: 5,
+        partial_store_data_latency: 6,
+        srs_shift_bias: 4,
+        source: proc_src,
     });
 }
 
@@ -279,6 +306,7 @@ mod tests {
             array_topology: None,
             timing: None,
             packet: None,
+            processor: None,
         }
     }
 
@@ -432,6 +460,7 @@ mod tests {
             array_topology: None,
             timing: None,
             packet: None,
+            processor: None,
         };
 
         // Confirm both DMA and Lock in one call

@@ -1127,6 +1127,43 @@ pub struct TimingModel {
     pub source: SourceAttribution,
 }
 
+/// VLIW processor model: slot widths, register sizes, pipeline constants.
+///
+/// Sources: llvm-aie AIE2Slots.td (slot widths), AIE2GenRegisterInfo.td
+/// (register widths), AM020 Ch4 (pipeline constants).
+///
+/// Slot widths and register sizes can be cross-validated at runtime against
+/// the llvm-aie TableGen parser output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessorModel {
+    /// VLIW slot widths in bits, keyed by slot name (lda, ldb, alu, mv, st, vec, lng).
+    /// Source: llvm-aie AIE2Slots.td `InstSlot<"Name", width>`.
+    pub slot_widths: Vec<(String, u8)>,
+    /// Vector register width in bits (512 for AIE2).
+    /// Source: llvm-aie AIE2GenRegisterInfo.td `AIE2Vector512RegisterClass`.
+    pub vector_register_bits: u16,
+    /// Vector pair width in bits (1024 for AIE2, used by shuffle/permute).
+    /// Source: llvm-aie AIE2GenRegisterInfo.td `AIE2Vector1024RegisterClass`.
+    pub vector_pair_bits: u16,
+    /// Accumulator register width in bits (512 for AIE2 standard accumulators).
+    /// Source: llvm-aie AIE2GenRegisterInfo.td `AIE2Acc512RegisterClass`.
+    pub accumulator_bits: u16,
+    /// Branch delay slot count (pipeline depth, NOT branch penalty).
+    /// The number of instructions after a branch that execute regardless.
+    /// Source: AM020 Ch4 "5 instruction delay slots".
+    pub branch_delay_slots: u8,
+    /// Partial-word store (st.s8/u8/s16/u16) data register read latency.
+    /// The cycle offset from issue at which the data register is read.
+    /// Source: hardware observation (llvm-aie II_STHB scheduling class).
+    pub partial_store_data_latency: u8,
+    /// SRS (Scale/Round/Shift) hardware bias in bits.
+    /// The accumulator is effectively left-shifted by this many bits
+    /// before the user-specified shift is applied.
+    /// Source: AM020 / aietools vector model.
+    pub srs_shift_bias: u8,
+    pub source: SourceAttribution,
+}
+
 /// Stream packet header bit layout.
 ///
 /// 32-bit header: parity(31) | rsvd(30-28) | src_col(27-21) |
@@ -1422,6 +1459,8 @@ pub struct ArchModel {
     pub timing: Option<TimingModel>,
     /// Packet format model (stream headers, control packets, FoT modes).
     pub packet: Option<PacketModel>,
+    /// VLIW processor model (slot widths, register sizes, pipeline constants).
+    pub processor: Option<ProcessorModel>,
     pub relationships: Vec<Relationship>,
 }
 
@@ -1438,6 +1477,7 @@ impl ArchModel {
             device_constants: None,
             timing: None,
             packet: None,
+            processor: None,
             relationships: Vec::new(),
         }
     }

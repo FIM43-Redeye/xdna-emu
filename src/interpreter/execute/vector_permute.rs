@@ -42,11 +42,11 @@
 //! TODO: MAC permutation modes are not yet implemented. They will be needed
 //! when the emulator implements cycle-accurate MAC pipeline behavior.
 
-/// Number of bytes in a 512-bit vector.
-const VEC_BYTES: usize = 64;
+/// Number of bytes in a vector register (from archspec processor model).
+const VEC_BYTES: usize = crate::arch::processor::VECTOR_REGISTER_BYTES;
 
-/// Number of bytes in a 1024-bit vector pair (shuffle unit input).
-const PAIR_BYTES: usize = 128;
+/// Number of bytes in a vector pair (shuffle unit input, from archspec).
+const PAIR_BYTES: usize = crate::arch::processor::VECTOR_PAIR_BYTES;
 
 // ============================================================================
 // Shuffle modes (from me_enums.h)

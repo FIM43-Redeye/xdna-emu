@@ -23,14 +23,14 @@
 
 use super::BundleFormat;
 
-/// Slot widths in bits (from AIE2Slots.td).
-pub const LDA_WIDTH: u8 = 21;
-pub const LDB_WIDTH: u8 = 16;
-pub const ALU_WIDTH: u8 = 20;
-pub const MV_WIDTH: u8 = 22;
-pub const ST_WIDTH: u8 = 21;
-pub const VEC_WIDTH: u8 = 26;
-pub const LNG_WIDTH: u8 = 42;
+/// Slot widths in bits (from archspec processor model, sourced from AIE2Slots.td).
+pub const LDA_WIDTH: u8 = crate::arch::processor::LDA_WIDTH;
+pub const LDB_WIDTH: u8 = crate::arch::processor::LDB_WIDTH;
+pub const ALU_WIDTH: u8 = crate::arch::processor::ALU_WIDTH;
+pub const MV_WIDTH: u8 = crate::arch::processor::MV_WIDTH;
+pub const ST_WIDTH: u8 = crate::arch::processor::ST_WIDTH;
+pub const VEC_WIDTH: u8 = crate::arch::processor::VEC_WIDTH;
+pub const LNG_WIDTH: u8 = crate::arch::processor::LNG_WIDTH;
 
 /// Which slot type was detected in a bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

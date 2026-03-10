@@ -429,6 +429,39 @@ fn gen_arch(model: &xdna_archspec::types::ArchModel, out_dir: &Path) {
         writeln!(out, "}}\n").unwrap();
     }
 
+    // -- Processor model (VLIW, registers, pipeline) --
+    if let Some(ref proc) = model.processor {
+        writeln!(out, "/// VLIW processor model (slot widths, register sizes, pipeline).").unwrap();
+        writeln!(out, "pub mod processor {{").unwrap();
+
+        // Per-slot width constants
+        writeln!(out, "    // VLIW slot widths in bits (from llvm-aie AIE2Slots.td)").unwrap();
+        for (name, width) in &proc.slot_widths {
+            writeln!(out, "    pub const {}_WIDTH: u8 = {};", name.to_ascii_uppercase(), width).unwrap();
+        }
+        writeln!(out).unwrap();
+
+        // Register widths
+        writeln!(out, "    // Register widths in bits (from llvm-aie AIE2GenRegisterInfo.td)").unwrap();
+        writeln!(out, "    pub const VECTOR_REGISTER_BITS: u16 = {};", proc.vector_register_bits).unwrap();
+        writeln!(out, "    pub const VECTOR_PAIR_BITS: u16 = {};", proc.vector_pair_bits).unwrap();
+        writeln!(out, "    pub const ACCUMULATOR_BITS: u16 = {};", proc.accumulator_bits).unwrap();
+        writeln!(out).unwrap();
+
+        // Derived byte sizes (commonly needed)
+        writeln!(out, "    // Derived byte sizes").unwrap();
+        writeln!(out, "    pub const VECTOR_REGISTER_BYTES: usize = {} / 8;", proc.vector_register_bits).unwrap();
+        writeln!(out, "    pub const VECTOR_PAIR_BYTES: usize = {} / 8;", proc.vector_pair_bits).unwrap();
+        writeln!(out).unwrap();
+
+        // Pipeline constants
+        writeln!(out, "    // Pipeline constants").unwrap();
+        writeln!(out, "    pub const BRANCH_DELAY_SLOTS: u8 = {};", proc.branch_delay_slots).unwrap();
+        writeln!(out, "    pub const PARTIAL_STORE_DATA_LATENCY: u8 = {};", proc.partial_store_data_latency).unwrap();
+        writeln!(out, "    pub const SRS_SHIFT_BIAS: u8 = {};", proc.srs_shift_bias).unwrap();
+        writeln!(out, "}}\n").unwrap();
+    }
+
     fs::write(out_dir.join("gen_arch.rs"), out).unwrap();
 }
 

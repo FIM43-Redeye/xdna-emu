@@ -247,6 +247,7 @@ fn extract_device(name: &str, value: &Value, file: &str) -> Result<ArchModel, Ex
         device_constants: Some(constants),
         timing: None,
         packet: None,
+        processor: None,
         relationships: Vec::new(),
     })
 }

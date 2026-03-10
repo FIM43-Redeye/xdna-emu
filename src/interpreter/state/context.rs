@@ -202,7 +202,7 @@ pub struct PendingStore {
 /// - add_21_i8: add.nc at store+5 → result at store+6 → read at store+6 ✓
 /// - add_12_i8: add.nc at store+6 → result at store+7 → read at store+6
 ///   reads the OLD r0 from the previous iteration (add.nc hasn't written yet) ✓
-const PARTIAL_WORD_STORE_DATA_LATENCY: u64 = 6;
+const PARTIAL_WORD_STORE_DATA_LATENCY: u64 = crate::arch::processor::PARTIAL_STORE_DATA_LATENCY as u64;
 
 /// A timestamped event for profiling.
 #[derive(Debug, Clone, Copy)]
@@ -413,12 +413,8 @@ pub struct PendingBranch {
     pub is_call: bool,
 }
 
-/// Branch delay slot count for AIE2 (AM020 Ch4: "5 instruction delay slots").
-///
-/// This is the pipeline depth (instructions after a branch that execute
-/// regardless), NOT the branch penalty (cycles lost on taken branch).
-/// TODO: Add to xdna-archspec as a separate field from branch_penalty.
-const BRANCH_DELAY_SLOTS: u8 = 5;
+/// Branch delay slot count (pipeline depth, from archspec processor model).
+const BRANCH_DELAY_SLOTS: u8 = crate::arch::processor::BRANCH_DELAY_SLOTS;
 
 /// Initial counter value: BRANCH_DELAY_SLOTS + 1 because tick() is called on
 /// the branch cycle itself (before the first delay-slot instruction executes).
