@@ -120,6 +120,16 @@ impl MemWidth {
             MemWidth::Vector256 => 32,
         }
     }
+
+    /// True for sub-word widths that use the read-modify-write pipeline.
+    ///
+    /// AIE2 partial-word stores (st.s8/st.u8/st.s16/st.u16) use a RMW
+    /// pipeline where the data register is read 7 cycles after issue
+    /// (II_STHB in AIE2Schedule.td). Full-word and vector stores read
+    /// their data register at issue time.
+    pub fn is_partial_word(self) -> bool {
+        matches!(self, MemWidth::Byte | MemWidth::HalfWord)
+    }
 }
 
 /// Post-modify mode for addressing.

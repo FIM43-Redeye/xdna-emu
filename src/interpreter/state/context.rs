@@ -173,6 +173,37 @@ pub enum EventType {
     BranchTaken { from_pc: u32, to_pc: u32 },
 }
 
+/// A deferred partial-word store awaiting its data register read.
+///
+/// AIE2 partial-word stores (st.s8/st.u8/st.s16/st.u16) use a read-modify-write
+/// pipeline (II_STHB in AIE2Schedule.td). The address is computed at issue time,
+/// but the data register is not read until 7 cycles later (operand latency = 7).
+/// This allows the compiler to schedule computations that produce the store value
+/// AFTER the store instruction itself (a common software-pipelining technique).
+#[derive(Debug, Clone)]
+pub struct PendingStore {
+    /// Target byte address in core memory space (computed at issue time).
+    pub address: u32,
+    /// Source register operand to read when the store data is sampled.
+    pub source: Operand,
+    /// Memory access width (Byte or HalfWord).
+    pub width: super::super::bundle::slot::MemWidth,
+    /// Cycle at which the data register is read and the write occurs.
+    pub ready_cycle: u64,
+}
+
+/// Latency for partial-word store data register read (II_STHB operand 0).
+///
+/// AIE2Schedule.td specifies OperandCycles=[7,1,1] for II_STHB. The
+/// operand cycle of 7 means a producer with latency 1 can be scheduled
+/// up to 6 cycles AFTER the store. The actual hardware read occurs at
+/// cycle 6 (before the cycle-7 write-back boundary), giving 1 cycle of
+/// scheduling slack. Using 6 here ensures that:
+/// - add_21_i8: add.nc at store+5 → result at store+6 → read at store+6 ✓
+/// - add_12_i8: add.nc at store+6 → result at store+7 → read at store+6
+///   reads the OLD r0 from the previous iteration (add.nc hasn't written yet) ✓
+const PARTIAL_WORD_STORE_DATA_LATENCY: u64 = 6;
+
 /// A timestamped event for profiling.
 #[derive(Debug, Clone, Copy)]
 pub struct TimestampedEvent {
@@ -559,6 +590,13 @@ pub struct ExecutionContext {
     /// the destination register is deferred until `ready_cycle` is reached.
     pending_writes: Vec<PendingWrite>,
 
+    // === Partial-Word Store Pipeline ===
+    /// Deferred partial-word stores awaiting data register read.
+    /// Partial-word stores (st.s8, st.u8, etc.) use a RMW pipeline where
+    /// the data register is sampled 7 cycles after issue. The address and
+    /// post-modify are computed at issue time; only the data read is deferred.
+    pending_stores: Vec<PendingStore>,
+
     // === Memory Bank Conflict Detection ===
     /// Bitmask of memory banks accessed by the core during this cycle.
     /// Bit N set = bank N was accessed via load/store. Compared against
@@ -639,6 +677,7 @@ impl ExecutionContext {
             modifier_snapshot: None,
             pending_branch: None,
             pending_writes: Vec::new(),
+            pending_stores: Vec::new(),
             cycle_core_banks: 0,
             srs_config: SrsConfig::default(),
         }
@@ -1009,6 +1048,50 @@ impl ExecutionContext {
             }
             _ => {}
         }
+    }
+
+    /// Queue a deferred partial-word store.
+    ///
+    /// The address is captured at issue time, but the data register will be
+    /// read when `ready_cycle` is reached. This models the II_STHB RMW
+    /// pipeline where the data operand has latency 7.
+    pub fn queue_pending_store(
+        &mut self,
+        address: u32,
+        source: Operand,
+        width: super::super::bundle::slot::MemWidth,
+    ) {
+        self.pending_stores.push(PendingStore {
+            address,
+            source,
+            width,
+            ready_cycle: self.cycles + PARTIAL_WORD_STORE_DATA_LATENCY,
+        });
+    }
+
+    /// Check if there are pending stores waiting to commit.
+    pub fn pending_stores_empty(&self) -> bool {
+        self.pending_stores.is_empty()
+    }
+
+    /// Drain pending stores whose data-read cycle has been reached.
+    ///
+    /// Returns the ready stores so the caller can read the registers and
+    /// write to tile memory (which is not accessible from ExecutionContext).
+    pub fn drain_ready_stores(&mut self) -> Vec<PendingStore> {
+        let current = self.cycles;
+        let mut ready = Vec::new();
+        self.pending_stores.retain(|ps| {
+            if ps.ready_cycle <= current {
+                ready.push(ps.clone());
+                false
+            } else {
+                true
+            }
+        });
+        // Sort by ready_cycle so earlier stores commit first
+        ready.sort_by_key(|ps| ps.ready_cycle);
+        ready
     }
 
     /// Read a scalar register with VLIW semantics and load forwarding.

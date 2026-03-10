@@ -327,6 +327,20 @@ impl CycleAccurateExecutor {
         // become visible at the correct cycle and are captured by begin_bundle().
         ctx.commit_pending_writes();
 
+        // Commit deferred partial-word stores whose data-read cycle has arrived.
+        // The data register is read NOW (at ready_cycle), not at issue time.
+        // This models the II_STHB RMW pipeline (operand latency 7).
+        let ready_stores = ctx.drain_ready_stores();
+        for ps in &ready_stores {
+            let value = super::memory::MemoryUnit::read_store_register(
+                &ps.source, ctx, ps.width,
+            );
+            let neighbor_ref = neighbors.as_mut().map(|n| &mut **n);
+            super::memory::MemoryUnit::write_memory(
+                tile, ps.address, value, ps.width, neighbor_ref,
+            );
+        }
+
         // AIE2 uses pure VLIW semantics: all reads within a bundle see the
         // pre-execution values. This is confirmed by the llvm-aie scheduling
         // model (AIE2Schedule.td) and hazard recognizer which handle data
@@ -406,6 +420,25 @@ impl CycleAccurateExecutor {
             }
             ExecuteResult::Halt => {
                 ctx.timing_context_mut().record_event(start_cycle, EventType::CoreDisabled);
+                // Flush remaining pending stores: advance cycles and drain until empty.
+                // When the core halts, partial-word stores queued in the last 7 cycles
+                // haven't committed yet. The hardware pipeline drains them before
+                // the core truly stops.
+                for _ in 0..10 {
+                    if ctx.pending_stores_empty() { break; }
+                    ctx.cycles += 1;
+                    ctx.commit_pending_writes();
+                    let stores = ctx.drain_ready_stores();
+                    for ps in &stores {
+                        let value = super::memory::MemoryUnit::read_store_register(
+                            &ps.source, ctx, ps.width,
+                        );
+                        let neighbor_ref = neighbors.as_mut().map(|n| &mut **n);
+                        super::memory::MemoryUnit::write_memory(
+                            tile, ps.address, value, ps.width, neighbor_ref,
+                        );
+                    }
+                }
             }
             ExecuteResult::WaitLock { .. } => {
                 ctx.timing_context_mut().record_event(start_cycle, EventType::LockStall { cycles: 1 });

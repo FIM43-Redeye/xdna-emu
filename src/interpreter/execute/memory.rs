@@ -364,10 +364,19 @@ impl MemoryUnit {
             }
         } else {
             // Scalar/partial stores
-            let value = Self::get_store_value(op, ctx, width);
-
-
-            Self::write_memory(tile, addr, value, width, neighbors);
+            // AIE2 partial-word stores (st.s8, st.u8, st.s16, st.u16) use a
+            // read-modify-write pipeline. The DATA register is read 7 cycles
+            // after issue (II_STHB operand latency = 7 in AIE2Schedule.td).
+            // The address is computed at issue time; only the data read is late.
+            // This allows the compiler to schedule computations between the
+            // store instruction and the data read cycle.
+            if width.is_partial_word() {
+                let source = Self::get_store_source_operand(op);
+                ctx.queue_pending_store(addr, source, width);
+            } else {
+                let value = Self::get_store_value(op, ctx, width);
+                Self::write_memory(tile, addr, value, width, neighbors);
+            }
         }
 
         // Apply post-modify to address register
@@ -714,6 +723,33 @@ impl MemoryUnit {
     }
 
     /// Read a store value from an operand reference.
+    /// Extract the source register operand for a store instruction.
+    ///
+    /// Uses the same logic as `get_store_value` but returns the Operand
+    /// instead of reading it, for use with deferred partial-word stores.
+    fn get_store_source_operand(op: &SlotOp) -> Operand {
+        let operand = if op.encoding_name.is_some() {
+            op.sources.first().cloned()
+        } else {
+            op.sources.first().and_then(|first| {
+                match first {
+                    Operand::PointerReg(_) | Operand::Memory { .. } => op.dest.clone(),
+                    _ => Some(first.clone()),
+                }
+            }).or_else(|| op.dest.clone())
+        };
+        operand.unwrap_or(Operand::ScalarReg(0))
+    }
+
+    /// Read a register value for a deferred partial-word store.
+    ///
+    /// Called from the cycle-accurate execution loop when a pending store's
+    /// data-read cycle arrives. Uses the same register read path as immediate
+    /// stores, including VLIW forwarding.
+    pub fn read_store_register(operand: &Operand, ctx: &ExecutionContext, width: MemWidth) -> u64 {
+        Self::read_store_operand(Some(operand), ctx, width)
+    }
+
     fn read_store_operand(operand: Option<&Operand>, ctx: &ExecutionContext, width: MemWidth) -> u64 {
         operand.map_or(0, |src| match src {
             Operand::ScalarReg(r) => ctx.scalar_read(*r) as u64,
@@ -826,7 +862,7 @@ impl MemoryUnit {
     ///
     /// Cross-tile writes (South/West/North/East) are buffered in the
     /// NeighborMemory for deferred application after the core step completes.
-    fn write_memory(tile: &mut Tile, addr: u32, value: u64, width: MemWidth, neighbors: Option<&mut NeighborMemory>) {
+    pub fn write_memory(tile: &mut Tile, addr: u32, value: u64, width: MemWidth, neighbors: Option<&mut NeighborMemory>) {
         let (quadrant, offset) = decode_data_address(addr);
 
         if quadrant != MemoryQuadrant::Local {
