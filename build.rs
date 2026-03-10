@@ -102,6 +102,71 @@ fn main() {
     let port_data = gen_stream_ports(&regdb, &out_dir);
     gen_stream_ranges(&regdb, &port_data, &out_dir);
     gen_trace_events(&bridge_path, &out_dir);
+
+    // ========================================================================
+    // Post-codegen: rebuild and install XRT plugin
+    // ========================================================================
+    //
+    // The C++ plugin (libxrt_driver_emu.so) loads the Rust emulator at
+    // runtime via dlopen -- there is no link-time dependency. This lets
+    // us build and install the plugin from build.rs without circularity.
+    //
+    // The plugin .so is installed to /opt/xilinx/xrt/lib/ so XRT can
+    // find it. The Rust lib is NOT copied -- the plugin resolves it at
+    // runtime via XDNA_EMU_DIR/target/$profile/libxdna_emu.so.
+
+    // Rebuild triggers for plugin C++ sources
+    let plugin_src = manifest_dir.join("xrt-plugin/src");
+    if plugin_src.exists() {
+        for entry in fs::read_dir(&plugin_src).unwrap() {
+            let entry = entry.unwrap();
+            println!("cargo:rerun-if-changed={}", entry.path().display());
+        }
+        println!("cargo:rerun-if-changed=xrt-plugin/CMakeLists.txt");
+    }
+
+    // Only build the plugin if the cmake build directory exists.
+    // First-time setup still requires: mkdir -p xrt-plugin/build && cd xrt-plugin/build && cmake ..
+    let plugin_build = manifest_dir.join("xrt-plugin/build");
+    let xrt_lib = Path::new("/opt/xilinx/xrt/lib");
+    if plugin_build.join("CMakeCache.txt").exists() && xrt_lib.exists() {
+        // Incremental cmake build (~2s when nothing changed)
+        let status = std::process::Command::new("cmake")
+            .args(["--build", "."])
+            .current_dir(&plugin_build)
+            .status();
+
+        match status {
+            Ok(s) if s.success() => {
+                // Install plugin .so to XRT lib directory
+                let src = plugin_build.join("libxrt_driver_emu.so.2.21.0");
+                let dst = xrt_lib.join("libxrt_driver_emu.so.2.21.0");
+                let link = xrt_lib.join("libxrt_driver_emu.so.2");
+                if src.exists() {
+                    if let Err(e) = fs::copy(&src, &dst) {
+                        println!("cargo:warning=Plugin install failed: {e}");
+                    } else {
+                        // Create/update symlink
+                        let _ = fs::remove_file(&link);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::symlink;
+                            let _ = symlink("libxrt_driver_emu.so.2.21.0", &link);
+                        }
+                    }
+                }
+            }
+            Ok(s) => {
+                println!(
+                    "cargo:warning=Plugin cmake build failed (exit {})",
+                    s.code().unwrap_or(-1)
+                );
+            }
+            Err(e) => {
+                println!("cargo:warning=Plugin cmake build failed: {e}");
+            }
+        }
+    }
 }
 
 // ============================================================================

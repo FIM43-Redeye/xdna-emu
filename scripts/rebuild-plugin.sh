@@ -1,82 +1,42 @@
-#!/bin/bash
-# rebuild-plugin.sh -- Build the XRT emulator plugin and install it.
+#!/usr/bin/env bash
+# rebuild-plugin.sh -- Build emulator + XRT plugin.
 #
-# Usage: ./scripts/rebuild-plugin.sh [--reconfigure] [--rust]
+# This is a convenience wrapper around cargo build. The build.rs script
+# handles cmake and plugin installation automatically.
 #
-# --reconfigure  Force cmake reconfigure
-# --rust         Also rebuild the Rust emulator library (cargo build --release)
-
+# Usage:
+#   ./scripts/rebuild-plugin.sh             # Debug build (default)
+#   ./scripts/rebuild-plugin.sh --release   # Release build
+#   ./scripts/rebuild-plugin.sh --reconfigure  # Force cmake reconfigure
 set -euo pipefail
 
-EMU_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-PLUGIN_DIR="$EMU_DIR/xrt-plugin"
-BUILD_DIR="$PLUGIN_DIR/build"
-INSTALL_DIR="/opt/xilinx/xrt/lib"
-SONAME="libxrt_driver_emu.so.2.21.0"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+EMU_DIR="$(dirname "$SCRIPT_DIR")"
+BUILD_DIR="$EMU_DIR/xrt-plugin/build"
 
-BUILD_RUST=false
-RECONFIGURE=false
+CARGO_FLAGS=""
 for arg in "$@"; do
-    case "$arg" in
-        --rust) BUILD_RUST=true ;;
-        --reconfigure) RECONFIGURE=true ;;
-    esac
+  case "$arg" in
+    --release) CARGO_FLAGS="--release" ;;
+    --reconfigure)
+      echo ">>> Reconfiguring cmake..."
+      rm -rf "$BUILD_DIR/CMakeCache.txt"
+      mkdir -p "$BUILD_DIR"
+      ( cd "$BUILD_DIR" && cmake .. )
+      ;;
+  esac
 done
 
-# Optionally rebuild the Rust emulator library.
-if $BUILD_RUST; then
-    echo ">>> Building Rust emulator library..."
-    (cd "$EMU_DIR" && nice -n 19 cargo build --release 2>&1)
+# Ensure cmake is configured (first-time setup)
+if [[ ! -f "$BUILD_DIR/CMakeCache.txt" ]]; then
+  echo ">>> First-time cmake configure..."
+  mkdir -p "$BUILD_DIR"
+  ( cd "$BUILD_DIR" && cmake .. )
 fi
 
-# Reconfigure if requested or if cache is missing.
-if $RECONFIGURE || [[ ! -f "$BUILD_DIR/CMakeCache.txt" ]]; then
-    echo ">>> Configuring..."
-    mkdir -p "$BUILD_DIR"
-    nice -n 19 cmake -S "$PLUGIN_DIR" -B "$BUILD_DIR" 2>&1
-fi
+echo ">>> Building (cargo build handles plugin automatically)..."
+nice -n 19 cargo build $CARGO_FLAGS
 
-# Build plugin.
-echo ">>> Building plugin..."
-nice -n 19 cmake --build "$BUILD_DIR" 2>&1
-
-# Find the Rust emulator library: prefer release (matches bridge test
-# workflow), fall back to debug.
-#
-# NOTE: If XDNA_EMU_LIB is set in the environment (e.g. by
-# activate-npu-env.sh), dlopen uses that path directly and the copy
-# here is just a fallback for non-activated sessions.
-RUST_LIB=""
-if [[ -f "$EMU_DIR/target/release/libxdna_emu.so" ]]; then
-    RUST_LIB="$EMU_DIR/target/release/libxdna_emu.so"
-elif [[ -f "$EMU_DIR/target/debug/libxdna_emu.so" ]]; then
-    RUST_LIB="$EMU_DIR/target/debug/libxdna_emu.so"
-fi
-
-# Install plugin files. The plugin files in INSTALL_DIR should be
-# user-owned (chown'd once) so no pkexec is needed for routine updates.
-echo ">>> Installing to $INSTALL_DIR..."
-if [[ -w "$INSTALL_DIR/libxrt_driver_emu.so.2" ]]; then
-    cp "$BUILD_DIR/$SONAME" "$INSTALL_DIR/$SONAME"
-    cp "$BUILD_DIR/$SONAME" "$INSTALL_DIR/libxrt_driver_emu.so.2"
-    if [[ -n "$RUST_LIB" ]]; then
-        cp "$RUST_LIB" "$INSTALL_DIR/libxdna_emu.so"
-    fi
-    echo ">>> Installed OK"
-else
-    echo ">>> Plugin files not writable -- falling back to pkexec"
-    pkexec bash -c "
-        cp '$BUILD_DIR/$SONAME' '$INSTALL_DIR/$SONAME' && \
-        cp '$BUILD_DIR/$SONAME' '$INSTALL_DIR/libxrt_driver_emu.so.2' && \
-        if [[ -n '$RUST_LIB' ]]; then
-            cp '$RUST_LIB' '$INSTALL_DIR/libxdna_emu.so'
-        fi && \
-        echo '>>> Installed OK'
-    "
-fi
-
-if [[ -n "$RUST_LIB" ]]; then
-    echo ">>> Rust lib: $RUST_LIB"
-else
-    echo ">>> WARNING: No Rust library found -- run 'cargo build' first"
-fi
+PROFILE="debug"
+[[ "$CARGO_FLAGS" == *"--release"* ]] && PROFILE="release"
+echo ">>> Done. Rust lib: $EMU_DIR/target/$PROFILE/libxdna_emu.so"
