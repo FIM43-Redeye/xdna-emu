@@ -783,6 +783,42 @@ pub struct DeviceRegLayout {
     pub shim_channel_base: u32,
     /// DMA channel stride in bytes (shim)
     pub shim_channel_stride: u32,
+
+    // -- Per-module event/trace register layout (derived from register names) --
+    // These are looked up by name from the register database, so they
+    // automatically adapt when switching to a different architecture
+    // (e.g., AIE2P with different register offsets).
+    /// Core module event registers (compute + shim tiles)
+    pub core_events: ModuleEventLayout,
+    /// Memory module event registers (compute tiles)
+    pub memory_events: ModuleEventLayout,
+    /// MemTile event registers
+    pub memtile_events: ModuleEventLayout,
+
+    /// Cascade configuration register (compute tiles, core module)
+    pub cascade_config_offset: u32,
+}
+
+/// Per-module event and trace register layout.
+///
+/// Looked up by register name from the AM025 database, so offsets adapt
+/// automatically for different architectures (AIE2, AIE2P, etc.).
+#[derive(Debug, Clone)]
+pub struct ModuleEventLayout {
+    /// Trace_Control0 offset (first trace config register)
+    pub trace_control_base: u32,
+    /// Trace_Event1 offset (last trace config register, inclusive)
+    pub trace_control_end: u32,
+    /// Event_Generate offset
+    pub event_generate: u32,
+    /// Event_Broadcast0 offset (first broadcast channel register)
+    pub event_broadcast_base: u32,
+    /// Last broadcast channel register offset (inclusive)
+    pub event_broadcast_end: u32,
+    /// Edge_Detection_event_control offset
+    pub edge_detection: u32,
+    /// Stream_Switch_Event_Port_Selection_0 and _1 offsets
+    pub event_port_select: Option<[u32; 2]>,
 }
 
 impl DeviceRegLayout {
@@ -902,6 +938,60 @@ impl DeviceRegLayout {
         let shim_channel_base = reg_offset("shim", "DMA_S2MM_0_Ctrl")?;
         let shim_channel_stride = reg_offset("shim", "DMA_S2MM_1_Ctrl")? - shim_channel_base;
 
+        // -- Per-module event/trace registers --
+        // Helper: look up a register offset, returning 0 if not found
+        // (some modules may not have all event registers).
+        let reg_offset_opt = |module: &str, reg: &str| -> u32 {
+            db.module(module)
+                .and_then(|m| m.register(reg))
+                .map(|r| r.offset)
+                .unwrap_or(0)
+        };
+
+        let build_event_layout = |module: &str| -> ModuleEventLayout {
+            let trace_control_base = reg_offset_opt(module, "Trace_Control0");
+            let trace_control_end = reg_offset_opt(module, "Trace_Event1");
+            let event_generate = reg_offset_opt(module, "Event_Generate");
+            // Broadcast register naming: "Event_Broadcast0" in core/memory/
+            // memory_tile, but "Event_Broadcast0_A" in shim. Try both.
+            let mut event_broadcast_base = reg_offset_opt(module, "Event_Broadcast0");
+            if event_broadcast_base == 0 {
+                event_broadcast_base = reg_offset_opt(module, "Event_Broadcast0_A");
+            }
+            // 16 broadcast channels at stride 4: last = base + 15*4
+            let event_broadcast_end = if event_broadcast_base != 0 {
+                event_broadcast_base + 15 * 4
+            } else {
+                0
+            };
+            let edge_detection = reg_offset_opt(module, "Edge_Detection_event_control");
+            let port_sel_0 = reg_offset_opt(module, "Stream_Switch_Event_Port_Selection_0");
+            let port_sel_1 = reg_offset_opt(module, "Stream_Switch_Event_Port_Selection_1");
+            let event_port_select = if port_sel_0 != 0 {
+                Some([port_sel_0, port_sel_1])
+            } else {
+                None
+            };
+            ModuleEventLayout {
+                trace_control_base,
+                trace_control_end,
+                event_generate,
+                event_broadcast_base,
+                event_broadcast_end,
+                edge_detection,
+                event_port_select,
+            }
+        };
+
+        let core_events = build_event_layout("core");
+        let memory_events = build_event_layout("memory");
+        let memtile_events = build_event_layout("memory_tile");
+
+        // Cascade/accumulator control register (core module, compute tiles).
+        // AM025 names this "Accumulator_Control" -- it configures cascade
+        // input/output directions (bit 0 = input dir, bit 1 = output dir).
+        let cascade_config_offset = reg_offset_opt("core", "Accumulator_Control");
+
         Ok(Self {
             memory_bd,
             memory_channel,
@@ -943,6 +1033,10 @@ impl DeviceRegLayout {
             shim_bd_words,
             shim_channel_base,
             shim_channel_stride,
+            core_events,
+            memory_events,
+            memtile_events,
+            cascade_config_offset,
             db,
         })
     }
@@ -1214,6 +1308,26 @@ mod tests {
         // Verify shim BD field layout was populated
         assert_eq!(layout.shim_bd.buffer_length.width, 32, "Shim buffer_length is 32-bit");
         assert_eq!(layout.shim_bd.base_address_low.lsb, 2, "Shim addr_low starts at bit 2");
+
+        // Verify event/trace register layout (from register database)
+        assert_eq!(layout.core_events.trace_control_base, 0x340D0, "Core Trace_Control0");
+        assert_eq!(layout.core_events.trace_control_end, 0x340E4, "Core Trace_Event1");
+        assert_eq!(layout.core_events.event_generate, 0x34008, "Core Event_Generate");
+        assert_eq!(layout.core_events.event_broadcast_base, 0x34010, "Core Event_Broadcast0");
+        assert_eq!(layout.core_events.edge_detection, 0x34408, "Core Edge_Detection");
+        assert_eq!(layout.core_events.event_port_select, Some([0x3FF00, 0x3FF04]), "Core port select");
+
+        assert_eq!(layout.memory_events.trace_control_base, 0x140D0, "Memory Trace_Control0");
+        assert_eq!(layout.memory_events.event_generate, 0x14008, "Memory Event_Generate");
+        assert_eq!(layout.memory_events.edge_detection, 0x14408, "Memory Edge_Detection");
+        assert_eq!(layout.memory_events.event_port_select, None, "Memory has no port select");
+
+        assert_eq!(layout.memtile_events.trace_control_base, 0x940D0, "MemTile Trace_Control0");
+        assert_eq!(layout.memtile_events.event_generate, 0x94008, "MemTile Event_Generate");
+        assert_eq!(layout.memtile_events.edge_detection, 0x94408, "MemTile Edge_Detection");
+        assert_eq!(layout.memtile_events.event_port_select, Some([0xB0F00, 0xB0F04]), "MemTile port select");
+
+        assert_eq!(layout.cascade_config_offset, 0x36060, "Accumulator_Control (cascade config)");
     }
 
     #[test]

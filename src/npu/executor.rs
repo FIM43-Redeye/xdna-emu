@@ -942,17 +942,11 @@ fn decode_npu_address(addr: u32) -> (u8, u8, u32) {
     // Shim DMA registers are typically at offset 0x1D000-0x1DFFF
     // This is for column 0, row 0
 
-    // For now, decode based on known patterns:
-    // 0x0001xxxx = col 0, row 0 (shim)
-    // 0x0002xxxx = col 0, row 1 (memtile)
-    // etc.
-
-    // Actually the real format from mlir-aie for NPU1:
-    // Address = (col << 25) | (row << 20) | offset
-
-    let col = ((addr >> 25) & 0x7F) as u8;
-    let row = ((addr >> 20) & 0x1F) as u8;
-    let offset = addr & 0xFFFFF;
+    // Tile address encoding: col|row|offset (AM020 Ch2, derived from ArchModel).
+    use crate::arch::{TILE_COL_SHIFT, TILE_ROW_SHIFT, TILE_OFFSET_MASK};
+    let col = ((addr >> TILE_COL_SHIFT) & 0x7F) as u8;
+    let row = ((addr >> TILE_ROW_SHIFT) & 0x1F) as u8;
+    let offset = addr & TILE_OFFSET_MASK;
 
     (col, row, offset)
 }

@@ -1648,10 +1648,10 @@ impl DeviceState {
         };
 
         // 1. Cascade config (compute tiles only).
-        // Offset 0x36060 per aie-rt xaie_core.c:993-1046.
+        // Accumulator_Control register per AM025 (offset from register database).
         //   Bit 0: cascade input direction (0=North, 1=West)
         //   Bit 1: cascade output direction (0=South, 1=East)
-        if offset == 0x36060 && tile.is_compute() {
+        if offset == reg_layout.cascade_config_offset && tile.is_compute() {
             tile.cascade_input_dir = (value & 0x1) as u8;
             tile.cascade_output_dir = ((value >> 1) & 0x1) as u8;
             log::info!(
@@ -1693,58 +1693,55 @@ impl DeviceState {
             }
         }
 
-        // 4. Trace register routing.
-        //
-        // Core module trace registers (compute tiles):
-        //   0x340D0 (Control0), 0x340D4 (Control1), 0x340E0 (Event0), 0x340E4 (Event1)
-        // Memory module trace registers (compute tiles):
-        //   0x140D0..0x140E4
-        // MemTile trace registers:
-        //   0x940D0..0x940E4
-        // Shim (PL module) trace registers:
-        //   0x340D0..0x340E4 (same offset as core, uses core_trace)
+        // 4. Trace register routing (offsets from register database).
+        let ce = &reg_layout.core_events;
+        let me = &reg_layout.memory_events;
+        let mte = &reg_layout.memtile_events;
         if tile.is_compute() {
-            if offset >= 0x340D0 && offset <= 0x340E4 {
-                tile.core_trace.write_register(offset - 0x340D0, value);
+            if offset >= ce.trace_control_base && offset <= ce.trace_control_end {
+                tile.core_trace.write_register(offset - ce.trace_control_base, value);
             }
-            if offset >= 0x140D0 && offset <= 0x140E4 {
-                tile.mem_trace.write_register(offset - 0x140D0, value);
+            if offset >= me.trace_control_base && offset <= me.trace_control_end {
+                tile.mem_trace.write_register(offset - me.trace_control_base, value);
             }
         } else if tile.is_mem_tile() {
-            if offset >= 0x940D0 && offset <= 0x940E4 {
-                tile.mem_trace.write_register(offset - 0x940D0, value);
+            if offset >= mte.trace_control_base && offset <= mte.trace_control_end {
+                tile.mem_trace.write_register(offset - mte.trace_control_base, value);
             }
         } else if tile.is_shim() {
-            if offset >= 0x340D0 && offset <= 0x340E4 {
-                tile.core_trace.write_register(offset - 0x340D0, value);
+            if offset >= ce.trace_control_base && offset <= ce.trace_control_end {
+                tile.core_trace.write_register(offset - ce.trace_control_base, value);
             }
         }
 
-        // 5. Edge detection event control registers.
-        // Each module has one register with two independent edge detectors.
+        // 5. Edge detection event control registers (offsets from register database).
         if tile.is_compute() {
-            if offset == 0x34408 {
+            if offset == ce.edge_detection {
                 Tile::configure_edge_detectors(&mut tile.core_edge_detectors, value, false);
             }
-            if offset == 0x14408 {
+            if offset == me.edge_detection {
                 Tile::configure_edge_detectors(&mut tile.mem_edge_detectors, value, false);
             }
         } else if tile.is_mem_tile() {
-            if offset == 0x94408 {
+            if offset == mte.edge_detection {
                 Tile::configure_edge_detectors(&mut tile.mem_edge_detectors, value, true);
             }
         } else if tile.is_shim() {
-            if offset == 0x34408 {
+            if offset == ce.edge_detection {
                 Tile::configure_edge_detectors(&mut tile.core_edge_detectors, value, false);
             }
         }
 
-        // 6. Event port selection registers.
+        // 6. Event port selection registers (offsets from register database).
         // Configure which physical stream switch ports map to logical event
         // ports 0-7 for PORT_RUNNING/IDLE/STALLED trace events.
         let port_sel_base = match tile.tile_type {
-            TileType::Compute | TileType::Shim => Some((0x3FF00u32, 0x3FF04u32)),
-            TileType::MemTile => Some((0xB0F00, 0xB0F04)),
+            TileType::Compute | TileType::Shim => {
+                ce.event_port_select.map(|[r0, r1]| (r0, r1))
+            }
+            TileType::MemTile => {
+                mte.event_port_select.map(|[r0, r1]| (r0, r1))
+            }
         };
         if let Some((reg0, reg1)) = port_sel_base {
             if offset == reg0 || offset == reg1 {
@@ -1767,26 +1764,35 @@ impl DeviceState {
         // Broadcast channels: 16 per module, each mapping a local event ID
         // to a broadcast line. When Event_Generate fires an event matching
         // a channel's value, BROADCAST_N (hw_id 107+N) is generated.
+        // Offsets from register database (Event_Broadcast0 per module).
         let bcast_base = match tile.tile_type {
             TileType::Compute => {
-                if (0x34010..=0x3404C).contains(&offset) {
-                    Some(0x34010u32)
-                } else if (0x14010..=0x1404C).contains(&offset) {
-                    Some(0x14010)
+                if ce.event_broadcast_base != 0
+                    && (ce.event_broadcast_base..=ce.event_broadcast_end).contains(&offset)
+                {
+                    Some(ce.event_broadcast_base)
+                } else if me.event_broadcast_base != 0
+                    && (me.event_broadcast_base..=me.event_broadcast_end).contains(&offset)
+                {
+                    Some(me.event_broadcast_base)
                 } else {
                     None
                 }
             }
             TileType::MemTile => {
-                if (0x94010..=0x9404C).contains(&offset) {
-                    Some(0x94010)
+                if mte.event_broadcast_base != 0
+                    && (mte.event_broadcast_base..=mte.event_broadcast_end).contains(&offset)
+                {
+                    Some(mte.event_broadcast_base)
                 } else {
                     None
                 }
             }
             TileType::Shim => {
-                if (0x34010..=0x3404C).contains(&offset) {
-                    Some(0x34010)
+                if ce.event_broadcast_base != 0
+                    && (ce.event_broadcast_base..=ce.event_broadcast_end).contains(&offset)
+                {
+                    Some(ce.event_broadcast_base)
                 } else {
                     None
                 }
@@ -1803,14 +1809,14 @@ impl DeviceState {
             }
         }
 
-        // Event_Generate register.
+        // Event_Generate register (offset from register database).
         // Writing fires the specified event on the module's event bus.
         // If the event matches a configured broadcast channel, the
         // corresponding BROADCAST_N event is queued for column propagation.
         let is_event_generate = match tile.tile_type {
-            TileType::Compute => offset == 0x34008 || offset == 0x14008,
-            TileType::MemTile => offset == 0x94008,
-            TileType::Shim => offset == 0x34008,
+            TileType::Compute => offset == ce.event_generate || offset == me.event_generate,
+            TileType::MemTile => offset == mte.event_generate,
+            TileType::Shim => offset == ce.event_generate,
         };
         if is_event_generate {
             let event_id = (value & 0x7F) as u8;
