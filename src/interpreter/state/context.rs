@@ -413,8 +413,12 @@ pub struct PendingBranch {
     pub is_call: bool,
 }
 
-/// Branch delay slot count for AIE2 (from archspec timing model).
-const BRANCH_DELAY_SLOTS: u8 = crate::arch::timing::BRANCH_PENALTY;
+/// Branch delay slot count for AIE2 (AM020 Ch4: "5 instruction delay slots").
+///
+/// This is the pipeline depth (instructions after a branch that execute
+/// regardless), NOT the branch penalty (cycles lost on taken branch).
+/// TODO: Add to xdna-archspec as a separate field from branch_penalty.
+const BRANCH_DELAY_SLOTS: u8 = 5;
 
 /// Initial counter value: BRANCH_DELAY_SLOTS + 1 because tick() is called on
 /// the branch cycle itself (before the first delay-slot instruction executes).
