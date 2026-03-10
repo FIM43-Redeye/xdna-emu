@@ -1041,6 +1041,21 @@ impl InterpreterEngine {
             .count()
     }
 
+    /// Check if all enabled cores are blocked (stalled on lock/DMA or halted).
+    ///
+    /// Returns true when no enabled core can make forward progress. This is
+    /// used by the NPU executor warm-up phase: on real hardware, cores run
+    /// for thousands of cycles before NPU instructions arrive through the
+    /// NoC, so they always reach their first blocking point (typically a lock
+    /// acquire) before any host-issued writes modify tile memory.
+    pub fn all_cores_blocked(&self) -> bool {
+        let enabled: Vec<_> = self.cores.iter().filter(|c| c.enabled).collect();
+        !enabled.is_empty()
+            && enabled.iter().all(|c| {
+                c.interpreter.is_stalled() || c.interpreter.is_halted()
+            })
+    }
+
     /// Set auto-run mode.
     pub fn set_auto_run(&mut self, auto: bool) {
         self.auto_run = auto;

@@ -567,6 +567,24 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
 
     log::info!("Running emulator (max {} cycles)", max);
 
+    // Warm-up: let cores run to their first blocking point before
+    // processing NPU instructions.  On real hardware, the core has been
+    // running for thousands of cycles (CDO enables the core well before
+    // NPU instructions arrive through firmware + NoC).  Without this,
+    // maskwrite/blockwrite instructions modify tile memory before the
+    // core's init loop has written its initial values.
+    if handle.engine.enabled_cores() > 0 && !handle.npu_executor.is_done() {
+        const MAX_WARMUP: u64 = 100_000;
+        while cycles < MAX_WARMUP {
+            handle.engine.step();
+            cycles += 1;
+            if handle.engine.all_cores_blocked() {
+                break;
+            }
+        }
+        log::info!("Core warm-up: {} cycles (all cores at first blocking point)", cycles);
+    }
+
     while cycles < max {
         // Advance NPU instruction execution (interleaved with engine step)
         {

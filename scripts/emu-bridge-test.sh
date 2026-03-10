@@ -563,17 +563,37 @@ compile_one_compiler() {
     return 0
   fi
 
-  # Prepare architecture MLIR (NPUDEVICE substitution)
+  # Prepare architecture MLIR (NPUDEVICE substitution).
+  # Only copy/modify if the cached copy is missing, stale, or --compile was passed,
+  # so that timestamps are preserved and the xclbin cache check below works.
   local npu_dev
   npu_dev="$(get_npu_device "$src_dir")"
-  if [[ -f "$src_dir/aie.mlir" ]]; then
-    cp "$src_dir/aie.mlir" "$build_dir/aie_arch.mlir"
-    sed "s/NPUDEVICE/${npu_dev}/g" -i "$build_dir/aie_arch.mlir"
+
+  # Determine which source MLIR to use.
+  local src_mlir=""
+  if [[ "$TRACE_OK" == "true" ]] && [[ -f "$TRACED_DIR/aie_traced.mlir" ]]; then
+    src_mlir="$TRACED_DIR/aie_traced.mlir"
+  elif [[ -f "$src_dir/aie.mlir" ]]; then
+    src_mlir="$src_dir/aie.mlir"
   fi
 
-  # Use traced MLIR if trace preparation succeeded.
-  if [[ "$TRACE_OK" == "true" ]] && [[ -f "$TRACED_DIR/aie_traced.mlir" ]]; then
-    cp "$TRACED_DIR/aie_traced.mlir" "$build_dir/aie_arch.mlir"
+  if [[ -n "$src_mlir" ]]; then
+    local need_copy=false
+    if [[ "$FORCE_COMPILE" == "true" ]]; then
+      need_copy=true
+    elif [[ ! -f "$build_dir/aie_arch.mlir" ]]; then
+      need_copy=true
+    elif [[ "$src_mlir" -nt "$build_dir/aie_arch.mlir" ]]; then
+      need_copy=true
+    fi
+
+    if $need_copy; then
+      cp "$src_mlir" "$build_dir/aie_arch.mlir"
+      # Traced MLIR already has the device substituted by trace-inject.py.
+      if [[ "$src_mlir" == "$src_dir/aie.mlir" ]]; then
+        sed "s/NPUDEVICE/${npu_dev}/g" -i "$build_dir/aie_arch.mlir"
+      fi
+    fi
   fi
 
   # Check cache -- must come AFTER traced MLIR substitution so that
@@ -894,8 +914,10 @@ run_one_bridge() {
   local rc=0
   (
     cd "$build_dir"
-    export XDNA_EMU=1
+    export XDNA_EMU="${XDNA_EMU:-debug}"
     export XDNA_EMU_LOG_LEVEL="${XDNA_EMU_LOG_LEVEL:-info}"
+    # Pass through XDNA_EMU_LIB if set (explicit override).
+    [[ -n "${XDNA_EMU_LIB:-}" ]] && export XDNA_EMU_LIB
     export XRT_DEVICE_BDF="ffff:ff:1f.0"
     export XDNA_TRACE_DIR="$trace_out_dir"
     timeout 120 bash -c "$run_cmd"
