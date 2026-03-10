@@ -413,9 +413,8 @@ pub struct PendingBranch {
     pub is_call: bool,
 }
 
-/// Branch delay slot count for AIE2 (AM020 Ch4: "5 instruction delay slots").
-/// FIXME: Extract from llvm-aie if/when AIE2SchedModel adds BranchDelaySlots.
-const BRANCH_DELAY_SLOTS: u8 = 5;
+/// Branch delay slot count for AIE2 (from archspec timing model).
+const BRANCH_DELAY_SLOTS: u8 = crate::arch::timing::BRANCH_PENALTY;
 
 /// Initial counter value: BRANCH_DELAY_SLOTS + 1 because tick() is called on
 /// the branch cycle itself (before the first delay-slot instruction executes).

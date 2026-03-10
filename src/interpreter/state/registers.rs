@@ -75,8 +75,8 @@ pub const NUM_VECTOR_REGS: usize = 32;
 /// Number of accumulator registers.
 pub const NUM_ACCUMULATOR_REGS: usize = 8;
 
-/// Mask for 20-bit pointer/modifier values.
-const PTR_MASK: u32 = 0x000F_FFFF;
+/// Mask for pointer/modifier values (tile-local address width, from archspec).
+const PTR_MASK: u32 = crate::arch::TILE_OFFSET_MASK;
 
 /// Scalar register file including special-purpose registers.
 ///

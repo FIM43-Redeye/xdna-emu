@@ -60,12 +60,16 @@ impl From<u32> for AieArchitecture {
     }
 }
 
-/// Memory region type for AIE address interpretation
+/// Memory region type for AIE address interpretation.
+///
+/// Boundaries derived from the architecture specification:
+/// - Program memory: core's instruction address window (16-bit PC = 64KB)
+/// - Data memory: all 4 cardinal quadrants starting at DATA_MEM_ADDR
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryRegion {
-    /// Program memory (code) - 0x00000000 to 0x0000FFFF
+    /// Program memory (code)
     Program,
-    /// Data memory - 0x00070000 to 0x0007FFFF
+    /// Data memory (any of the 4 cardinal quadrants)
     Data,
     /// Stack region in data memory
     Stack,
@@ -74,11 +78,22 @@ pub enum MemoryRegion {
 }
 
 impl MemoryRegion {
-    /// Classify an address into a memory region
+    /// Classify a core-local address into a memory region.
+    ///
+    /// Uses architecture constants from xdna-archspec (DATA_MEM_ADDR,
+    /// MEMORY_SIZE) so boundaries adapt automatically for AIE2P.
     pub fn from_address(addr: u32) -> Self {
+        use crate::arch::compute::{DATA_MEM_ADDR, MEMORY_SIZE};
+        // Data memory: 4 quadrants (S/W/N/E) starting at DATA_MEM_ADDR.
+        const DATA_START: u32 = DATA_MEM_ADDR;
+        const DATA_END: u32 = DATA_MEM_ADDR + 4 * MEMORY_SIZE as u32 - 1;
+        // Program memory: core's instruction address window (below data region).
+        // The core PC is 16-bit, giving a 64KB address window even though
+        // physical PM may be smaller (16KB for AIE2).
+        const PM_END: u32 = MEMORY_SIZE as u32 - 1;
         match addr {
-            0x00000000..=0x0000FFFF => MemoryRegion::Program,
-            0x00070000..=0x0007FFFF => MemoryRegion::Data,
+            0..=PM_END => MemoryRegion::Program,
+            DATA_START..=DATA_END => MemoryRegion::Data,
             _ => MemoryRegion::Unknown,
         }
     }
@@ -462,15 +477,22 @@ mod tests {
 
     #[test]
     fn test_memory_region_classification() {
+        // Program memory (core's 64KB instruction address window)
         assert_eq!(MemoryRegion::from_address(0x00000000), MemoryRegion::Program);
         assert_eq!(MemoryRegion::from_address(0x00000100), MemoryRegion::Program);
         assert_eq!(MemoryRegion::from_address(0x0000FFFF), MemoryRegion::Program);
 
-        assert_eq!(MemoryRegion::from_address(0x00070000), MemoryRegion::Data);
+        // Data memory (all 4 cardinal quadrants: 0x40000-0x7FFFF)
+        assert_eq!(MemoryRegion::from_address(0x00040000), MemoryRegion::Data); // South
+        assert_eq!(MemoryRegion::from_address(0x00050000), MemoryRegion::Data); // West
+        assert_eq!(MemoryRegion::from_address(0x00060000), MemoryRegion::Data); // North
+        assert_eq!(MemoryRegion::from_address(0x00070000), MemoryRegion::Data); // East (local)
         assert_eq!(MemoryRegion::from_address(0x00078000), MemoryRegion::Data);
         assert_eq!(MemoryRegion::from_address(0x0007FFFF), MemoryRegion::Data);
 
+        // Gaps and beyond
         assert_eq!(MemoryRegion::from_address(0x00010000), MemoryRegion::Unknown);
+        assert_eq!(MemoryRegion::from_address(0x0003FFFF), MemoryRegion::Unknown);
         assert_eq!(MemoryRegion::from_address(0x00080000), MemoryRegion::Unknown);
     }
 
