@@ -316,8 +316,8 @@ impl MemoryUnit {
                 if masked >= 0x0400 && masked < 0x0420 {
                     let elem = (masked - 0x0400) / 4;
                     log::trace!(
-                        "[WATCH-LD] pc=0x{:03X} cycle={} elem={} addr=0x{:05X} value={} dest={:?}",
-                        ctx.pc(), ctx.cycles, elem, masked, value as i32, op.dest
+                        "[WATCH-LD] pc=0x{:03X} cycle={} elem={} addr=0x{:05X} value=0x{:08X} dest={:?}",
+                        ctx.pc(), ctx.cycles, elem, masked, value as u32, op.dest
                     );
                 }
             }

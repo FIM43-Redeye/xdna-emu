@@ -802,8 +802,16 @@ impl InstructionDecoder {
             _ => None,
         };
 
-        // Build SlotOp directly from SemanticOp (no Operation bridge)
-        let effective_semantic = semantic_override.or(enc.semantic);
+        // Build SlotOp directly from SemanticOp (no Operation bridge).
+        // Force PointerAdd for all pointer arithmetic instructions.
+        // Some PADDB/PADDA variants get SemanticOp::Add from pattern
+        // matching instead of PointerAdd. The is_ptr_arithmetic flag
+        // (derived from mnemonic "padd*") is the reliable indicator.
+        let effective_semantic = if enc.is_ptr_arithmetic {
+            Some(SemanticOp::PointerAdd)
+        } else {
+            semantic_override.or(enc.semantic)
+        };
         let mut slot_op = if let Some(semantic) = effective_semantic {
             SlotOp::from_semantic(slot_index, semantic)
         } else if enc.mnemonic == "opcodestr" || enc.mnemonic.is_empty() {

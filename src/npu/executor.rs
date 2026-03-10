@@ -629,12 +629,11 @@ impl NpuExecutor {
 
     /// Execute a MaskWrite instruction.
     fn execute_maskwrite(&mut self, reg_off: u32, value: u32, mask: u32, device: &mut DeviceState, _host_memory: &mut HostMemory) -> Result<(), String> {
-        log::debug!(
-            "NPU MaskWrite: reg=0x{:08X} value=0x{:08X} mask=0x{:08X}",
-            reg_off, value, mask
-        );
-
         let (col, row, offset) = decode_npu_address(reg_off);
+        log::debug!(
+            "NPU MaskWrite: reg=0x{:08X} -> tile({},{}) offset=0x{:05X} value=0x{:08X} mask=0x{:08X}",
+            reg_off, col, row, offset, value, mask
+        );
 
         let is_data_mem = device.tile(col as usize, row as usize)
             .map_or(false, |tile| is_data_memory_offset(tile, offset));
@@ -643,7 +642,7 @@ impl NpuExecutor {
             if let Some(tile) = device.tile_mut(col as usize, row as usize) {
                 let current = tile.read_data_u32(offset as usize).unwrap_or(0);
                 let new_value = (current & !mask) | (value & mask);
-                log::debug!("NPU MaskWrite -> data memory: tile({},{}) offset=0x{:05X} \
+                log::info!("NPU MaskWrite -> data memory: tile({},{}) offset=0x{:05X} \
                     current=0x{:08X} -> 0x{:08X}", col, row, offset, current, new_value);
                 tile.write_data_u32(offset as usize, new_value);
             }
