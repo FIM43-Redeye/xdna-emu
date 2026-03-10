@@ -16,9 +16,29 @@ on_first_open() const
 {
   const std::lock_guard<std::mutex> lock(m_lock);
 
-  // Determine library path from environment or use a default.
-  const char* lib_env = std::getenv("XDNA_EMU_LIB");
-  std::string lib_path = lib_env ? lib_env : "libxdna_emu.so";
+  // Determine library path.
+  //
+  // Resolution order:
+  //   1. XDNA_EMU_DIR + XDNA_EMU profile -- e.g. $XDNA_EMU_DIR/target/debug/libxdna_emu.so
+  //      XDNA_EMU="debug" or "release" selects the Cargo profile.
+  //      XDNA_EMU="1" (or any other truthy value) defaults to "debug".
+  //   2. Plain dlopen fallback -- "libxdna_emu.so" via ldconfig/LD_LIBRARY_PATH
+  std::string lib_path;
+  const char* dir_env = std::getenv("XDNA_EMU_DIR");
+  const char* emu_env = std::getenv("XDNA_EMU");
+  std::string profile = "debug";  // default
+  if (emu_env) {
+    std::string val(emu_env);
+    if (val == "release")
+      profile = "release";
+    // "debug", "1", or any other truthy value -> debug
+  }
+  if (dir_env && dir_env[0] != '\0') {
+    lib_path = std::string(dir_env) + "/target/" + profile + "/libxdna_emu.so";
+  } else {
+    lib_path = "libxdna_emu.so";
+  }
+  EMU_INFO("Loading emulator library: %s (profile=%s)", lib_path.c_str(), profile.c_str());
 
   m_transport = emu_transport::create_inprocess(lib_path);
 
