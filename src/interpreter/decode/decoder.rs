@@ -200,7 +200,7 @@ impl InstructionDecoder {
     fn load_fresh() -> Self {
         use crate::config::Config;
         let path = Config::get().llvm_aie_path();
-        Self::try_load_via_tblgen(&path).unwrap_or_else(|e| {
+        let decoder = Self::try_load_via_tblgen(&path).unwrap_or_else(|e| {
             let config_path = Config::user_config_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "~/.config/xdna-emu/config.toml".to_string());
@@ -212,7 +212,59 @@ impl InstructionDecoder {
                 config_path,
                 Config::sample_config()
             );
-        })
+        });
+
+        // Cross-validate archspec processor constants against parsed TableGen.
+        // This catches drift if the .td files change but archspec isn't updated.
+        Self::validate_archspec_against_tablegen(std::path::Path::new(&path));
+
+        decoder
+    }
+
+    /// Validate that archspec processor model constants match the llvm-aie
+    /// TableGen source files. Logs warnings on mismatch (non-fatal).
+    fn validate_archspec_against_tablegen(llvm_aie_path: &std::path::Path) {
+        let data = match crate::tablegen::load_from_llvm_aie(llvm_aie_path) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("Cannot validate archspec against TableGen: {}", e);
+                return;
+            }
+        };
+
+        // Validate slot widths against archspec::processor constants.
+        use crate::arch::processor;
+        let expected: &[(&str, u8)] = &[
+            ("lda", processor::LDA_WIDTH),
+            ("ldb", processor::LDB_WIDTH),
+            ("alu", processor::ALU_WIDTH),
+            ("mv", processor::MV_WIDTH),
+            ("st", processor::ST_WIDTH),
+            ("vec", processor::VEC_WIDTH),
+            ("lng", processor::LNG_WIDTH),
+        ];
+
+        let mut mismatches = 0;
+        for &(name, archspec_width) in expected {
+            let slot_name = format!("{}_slot", name);
+            if let Some(slot_def) = data.slots.get(&slot_name) {
+                if slot_def.bits != archspec_width {
+                    log::error!(
+                        "archspec/TableGen mismatch: slot '{}' width = {} (archspec) vs {} (TableGen)",
+                        name, archspec_width, slot_def.bits
+                    );
+                    mismatches += 1;
+                }
+            } else {
+                log::warn!("Slot '{}' not found in TableGen data", slot_name);
+            }
+        }
+
+        if mismatches == 0 {
+            log::info!("archspec processor constants validated against TableGen ({} slots checked)", expected.len());
+        } else {
+            log::error!("{} archspec/TableGen mismatches detected -- update xdna-archspec ProcessorModel", mismatches);
+        }
     }
 
     /// Load a decoder from llvm-aie.
