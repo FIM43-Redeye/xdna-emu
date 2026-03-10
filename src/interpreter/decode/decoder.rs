@@ -16,7 +16,7 @@
 //! ```ignore
 //! use xdna_emu::interpreter::decode::InstructionDecoder;
 //!
-//! let decoder = InstructionDecoder::try_load_via_tblgen("../llvm-aie")?;
+//! let decoder = InstructionDecoder::load_from_generated();
 //! ```
 
 use std::collections::HashMap;
@@ -198,58 +198,15 @@ impl InstructionDecoder {
     /// Panics if the TableGen parser fails. This is intentional - we want to
     /// fail fast rather than silently falling back to broken behavior.
     fn load_fresh() -> Self {
-        use crate::config::Config;
-        let path = Config::get().llvm_aie_path();
-        let decoder = Self::try_load_via_tblgen(&path).unwrap_or_else(|e| {
-            let config_path = Config::user_config_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "~/.config/xdna-emu/config.toml".to_string());
-            panic!(
-                "TableGen decoder loading failed: {}\n\n\
-                 Configure llvm_aie_path in {} or set LLVM_AIE_PATH environment variable.\n\n\
-                 Sample config:\n{}",
-                e,
-                config_path,
-                Config::sample_config()
-            );
-        });
-
-        decoder
+        Self::load_from_generated()
     }
 
-    /// Load a decoder from llvm-aie.
+    /// Load a decoder from build-time generated constants.
     ///
-    /// Uses config file or environment variable to find llvm-aie path.
-    /// Uses `llvm-tblgen` for accurate encodings.
-    ///
-    /// NOTE: Prefer `load_cached()` which avoids repeatedly parsing TableGen.
-    ///
-    /// # Panics
-    ///
-    /// Panics if llvm-aie is not found or TableGen parsing fails.
-    pub fn load_default() -> Self {
-        Self::load_cached()
-    }
-
-    /// Load a decoder using llvm-tblgen for fully resolved encodings.
-    ///
-    /// This is the preferred loading method - it uses `llvm-tblgen --print-records`
-    /// to get ground truth encodings with all inheritance and mixin field assignments
-    /// resolved. This correctly distinguishes instruction variants like ACQ_mLockId_imm
-    /// vs ACQ_mLockId_reg based on their literal encoding bits.
-    ///
-    /// Requires `llvm-tblgen` to be in PATH.
-    pub fn try_load_via_tblgen(llvm_aie_path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
-        let path = llvm_aie_path.as_ref();
-        if !path.exists() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("llvm-aie not found at: {}", path.display()),
-            ));
-        }
-
-        // Use load_full_via_tblgen to get both encodings and LLVM decoder tables
-        let output = crate::tablegen::load_full_via_tblgen(path)?;
+    /// All instruction encodings, decoder bytecode, and metadata were extracted
+    /// from llvm-aie at compile time. No filesystem access required at runtime.
+    fn load_from_generated() -> Self {
+        let output = crate::tablegen::load_from_generated();
 
         // Build data-driven format table from composite format Inst fields
         let format_table = if output.composite_formats.iter().any(|f| !f.slot_maps.is_empty()) {
@@ -269,7 +226,29 @@ impl InstructionDecoder {
             output.decoder_tables,
         );
         decoder.format_table = format_table;
-        Ok(decoder)
+        decoder
+    }
+
+    /// Load a decoder from llvm-aie.
+    ///
+    /// Uses config file or environment variable to find llvm-aie path.
+    /// Uses `llvm-tblgen` for accurate encodings.
+    ///
+    /// NOTE: Prefer `load_cached()` which avoids repeatedly parsing TableGen.
+    ///
+    /// # Panics
+    ///
+    /// Panics if llvm-aie is not found or TableGen parsing fails.
+    pub fn load_default() -> Self {
+        Self::load_cached()
+    }
+
+    /// Load a decoder using build-time generated data.
+    ///
+    /// The `llvm_aie_path` parameter is ignored -- all data is compiled in.
+    /// This signature is kept for backward compatibility with existing tests.
+    pub fn try_load_via_tblgen(_llvm_aie_path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
+        Ok(Self::load_from_generated())
     }
 
     /// Check if llvm-aie is available (checks config and env var).

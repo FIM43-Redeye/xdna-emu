@@ -12,6 +12,10 @@
 //! - `gen_memtile_lock.rs`  -- mem tile lock constants (included by `registers_spec.rs`)
 //! - `gen_stream_ports.rs`  -- port type arrays (included by `arch` module)
 //! - `gen_stream_ranges.rs` -- port range constants (included by `arch` module)
+//! - `gen_tablegen.rs`      -- complete instruction decoder tables (included by `tablegen` module)
+
+#[path = "build_helpers/mod.rs"]
+mod build_helpers;
 
 use std::collections::HashMap;
 use std::env;
@@ -144,6 +148,43 @@ fn main() {
     let port_data = gen_stream_ports(&regdb, &out_dir);
     gen_stream_ranges(&regdb, &port_data, &out_dir);
     gen_trace_events(&bridge_path, &out_dir);
+
+    // ========================================================================
+    // Full TableGen extraction for decoder tables (build-time)
+    // ========================================================================
+
+    // Rebuild triggers for build_helpers source files
+    for helper in &["mod.rs", "extract.rs", "records.rs", "semantics.rs",
+                     "cpp_switch.rs", "bytecode.rs", "codegen.rs"] {
+        println!("cargo:rerun-if-changed=build_helpers/{}", helper);
+    }
+
+    let aie2_td = llvm_aie_path.join("llvm/lib/Target/AIE/AIE2.td");
+    if aie2_td.exists() {
+        println!("cargo:rerun-if-changed={}", aie2_td.display());
+        for td in &["AIE2InstrFormats.td", "AIE2InstrInfo.td", "AIE2InstrPatterns.td",
+                     "AIE2Slots.td", "AIE2Schedule.td", "AIE2RegisterInfo.td"] {
+            let p = llvm_aie_path.join(format!("llvm/lib/Target/AIE/{}", td));
+            if p.exists() { println!("cargo:rerun-if-changed={}", p.display()); }
+        }
+        let cpp = llvm_aie_path.join("llvm/lib/Target/AIE/AIE2InstrInfo.cpp");
+        if cpp.exists() { println!("cargo:rerun-if-changed={}", cpp.display()); }
+
+        match build_helpers::extract::extract_all(llvm_aie_path) {
+            Ok(output) => {
+                println!("cargo:warning=TableGen: extracted {} instructions across {} slots",
+                    output.total_instructions(), output.slot_count());
+                build_helpers::codegen::generate_tablegen_file(&output, &out_dir);
+            }
+            Err(e) => {
+                panic!("TableGen extraction failed:\n  {}\n\
+                        Set LLVM_AIE_PATH to override.", e);
+            }
+        }
+    } else {
+        panic!("llvm-aie not found at {} -- required for build-time TableGen extraction.\n\
+                Set LLVM_AIE_PATH to override.", llvm_aie_path.display());
+    }
 
     // ========================================================================
     // Post-codegen: rebuild and install XRT plugin

@@ -436,15 +436,7 @@ mod tests {
 
     #[test]
     fn test_validate_bundle_formats_with_live_data() {
-        use std::path::Path;
-        let llvm_aie_path = Path::new("../llvm-aie");
-        if !llvm_aie_path.exists() {
-            eprintln!("Skipping test: llvm-aie not found");
-            return;
-        }
-
-        let output = crate::tablegen::load_full_via_tblgen(llvm_aie_path)
-            .expect("Failed to load via tblgen");
+        let output = crate::tablegen::load_from_generated();
 
         // Should not panic
         validate_bundle_formats(&output.composite_formats);

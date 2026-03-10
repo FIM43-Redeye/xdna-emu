@@ -1570,14 +1570,9 @@ mod tests {
     // FormatTable tests
     // ========================================================================
 
-    /// Build a FormatTable from the real tblgen output (requires llvm-aie).
-    /// Returns None if llvm-aie is not available.
+    /// Build a FormatTable from the build-time generated tblgen output.
     fn try_build_format_table() -> Option<FormatTable> {
-        let llvm_aie = std::path::Path::new("../llvm-aie");
-        if !llvm_aie.exists() {
-            return None;
-        }
-        let output = crate::tablegen::load_full_via_tblgen(llvm_aie).ok()?;
+        let output = crate::tablegen::load_from_generated();
         Some(FormatTable::build(&output.composite_formats))
     }
 
@@ -1640,13 +1635,7 @@ mod tests {
 
     #[test]
     fn test_format_table_roundtrip_all_formats() {
-        let llvm_aie = std::path::Path::new("../llvm-aie");
-        if !llvm_aie.exists() {
-            eprintln!("Skipping: llvm-aie not found");
-            return;
-        }
-        let output = crate::tablegen::load_full_via_tblgen(llvm_aie)
-            .expect("Failed to load tblgen");
+        let output = crate::tablegen::load_from_generated();
         let table = FormatTable::build(&output.composite_formats);
 
         // For each composite format, construct a synthetic bundle with known

@@ -6,6 +6,10 @@
 //! ambiguous instruction encodings (like MOV vs VGE in the MV slot) via
 //! definition order and operand validation rather than heuristics.
 //!
+//! The bytecode tables are extracted at build time (see `build_helpers/bytecode.rs`)
+//! and embedded in `gen_tablegen.rs`. This module contains only the runtime
+//! interpreter -- no parsing, no subprocess.
+//!
 //! # Bytecode Format
 //!
 //! The table is a flat `Vec<u8>` interpreted as a sequence of opcodes:
@@ -20,17 +24,6 @@
 //! | 6 | TryDecode | uleb128(opcode), uleb128(decoder_idx), u24_le(skip) |
 //! | 7 | SoftFail | uleb128(pos_mask), uleb128(neg_mask) |
 //! | 8 | Fail | (none) |
-//!
-//! All multi-byte integers use ULEB128 encoding except NumToSkip which is
-//! 24-bit little-endian. The decision tree walks these opcodes sequentially,
-//! branching on instruction bit fields until it reaches Decode (definitive
-//! match), TryDecode (tentative match with fallback), or Fail (no match).
-//!
-//! # Source
-//!
-//! The bytecode format is defined in `llvm/include/llvm/MC/MCDecoderOps.h`
-//! and the interpreter in the generated `decodeInstruction()` function from
-//! `llvm-tblgen -gen-disassembler`.
 
 use std::collections::HashMap;
 
@@ -46,7 +39,7 @@ mod opc {
     pub const FAIL: u8 = 8;
 }
 
-/// A decoder table extracted from LLVM's `-gen-disassembler` output.
+/// A decoder table containing bytecode and opcode name mapping.
 ///
 /// Contains the raw bytecode and a mapping from LLVM opcode IDs to
 /// instruction definition names (e.g., 693 -> "MOV_mv_cg").
@@ -68,9 +61,6 @@ impl DecoderTable {
     ///
     /// Returns the instruction name (e.g., "MOV_mv_cg") if a match is found,
     /// or None if the bytecode reaches OPC_Fail.
-    ///
-    /// The `insn_bits` parameter should contain the instruction bits for this
-    /// slot, right-aligned (LSB at bit 0).
     pub fn decode(&self, insn_bits: u64) -> Option<&str> {
         let bytes = &self.bytes;
         let len = bytes.len();
@@ -83,7 +73,6 @@ impl DecoderTable {
 
             match opcode {
                 opc::EXTRACT_FIELD => {
-                    // uleb128(start), u8(len)
                     let start = read_uleb128(bytes, &mut ptr);
                     let field_len = bytes[ptr] as u32;
                     ptr += 1;
@@ -91,7 +80,6 @@ impl DecoderTable {
                 }
 
                 opc::FILTER_VALUE => {
-                    // uleb128(val), u24_le(num_to_skip)
                     let val = read_uleb128(bytes, &mut ptr) as u64;
                     let num_to_skip = read_u24_le(bytes, &mut ptr);
                     if val != cur_field_value {
@@ -100,7 +88,6 @@ impl DecoderTable {
                 }
 
                 opc::CHECK_FIELD => {
-                    // uleb128(start), u8(len), uleb128(expected_val), u24_le(num_to_skip)
                     let start = read_uleb128(bytes, &mut ptr);
                     let field_len = bytes[ptr] as u32;
                     ptr += 1;
@@ -113,41 +100,28 @@ impl DecoderTable {
                 }
 
                 opc::CHECK_PREDICATE => {
-                    // uleb128(pidx), u24_le(num_to_skip)
-                    // We have no feature predicates -- always pass.
                     let _pidx = read_uleb128(bytes, &mut ptr);
                     let _num_to_skip = read_u24_le(bytes, &mut ptr);
-                    // Pass: don't skip.
                 }
 
                 opc::DECODE => {
-                    // uleb128(opcode_id), uleb128(decoder_idx)
                     let opcode_id = read_uleb128(bytes, &mut ptr);
                     let _decoder_idx = read_uleb128(bytes, &mut ptr);
                     return self.opcode_names.get(&opcode_id).map(|s| s.as_str());
                 }
 
                 opc::TRY_DECODE => {
-                    // uleb128(opcode_id), uleb128(decoder_idx), u24_le(num_to_skip)
                     let opcode_id = read_uleb128(bytes, &mut ptr);
                     let _decoder_idx = read_uleb128(bytes, &mut ptr);
                     let num_to_skip = read_u24_le(bytes, &mut ptr);
 
-                    // In LLVM, TryDecode calls decodeToMCInst which may fail
-                    // if operand fields decode to invalid register indices.
-                    // Our inputs are valid compiler output, so we assume decode
-                    // succeeds. If the opcode name isn't in our map (shouldn't
-                    // happen), fall through to the skip target.
                     if self.opcode_names.contains_key(&opcode_id) {
                         return self.opcode_names.get(&opcode_id).map(|s| s.as_str());
                     }
-                    // Unknown opcode: skip to fallback
                     ptr += num_to_skip as usize;
                 }
 
                 opc::SOFT_FAIL => {
-                    // uleb128(pos_mask), uleb128(neg_mask)
-                    // Soft failures are warnings, not errors. Continue.
                     let _pos_mask = read_uleb128(bytes, &mut ptr);
                     let _neg_mask = read_uleb128(bytes, &mut ptr);
                 }
@@ -182,8 +156,6 @@ impl DecoderTable {
 }
 
 /// Extract a bit field from an instruction word.
-///
-/// Equivalent to LLVM's `fieldFromInstruction(insn, startBit, numBits)`.
 #[inline]
 fn field_from_instruction(insn: u64, start_bit: u32, num_bits: u32) -> u64 {
     if num_bits == 64 {
@@ -195,10 +167,6 @@ fn field_from_instruction(insn: u64, start_bit: u32, num_bits: u32) -> u64 {
 }
 
 /// Read a ULEB128-encoded value from a byte slice, advancing the pointer.
-///
-/// ULEB128 encodes unsigned integers in 7-bit groups with a continuation
-/// bit in the MSB of each byte. The encoding is little-endian (least
-/// significant group first).
 #[inline]
 fn read_uleb128(bytes: &[u8], ptr: &mut usize) -> u32 {
     let mut result: u32 = 0;
@@ -216,8 +184,6 @@ fn read_uleb128(bytes: &[u8], ptr: &mut usize) -> u32 {
 }
 
 /// Read a 24-bit little-endian integer from a byte slice.
-///
-/// LLVM uses this for NumToSkip fields in the decoder bytecode.
 #[inline]
 fn read_u24_le(bytes: &[u8], ptr: &mut usize) -> u32 {
     let b0 = bytes[*ptr] as u32;
@@ -227,252 +193,26 @@ fn read_u24_le(bytes: &[u8], ptr: &mut usize) -> u32 {
     b0 | (b1 << 8) | (b2 << 16)
 }
 
-/// Parse the opcode name mapping from comments in LLVM's disassembler output.
-///
-/// The output contains lines like:
-/// ```text
-/// /* 23 */      MCD::OPC_Decode, 188, 5, 0, // Opcode: NOPX
-/// /* 39 */      MCD::OPC_TryDecode, 230, 4, 1, 106, 2, 0, // Opcode: J_jump_ind, skip to: 664
-/// ```
-///
-/// We extract (opcode_id, name) pairs by parsing the ULEB128-encoded opcode
-/// from the byte values and matching with the comment.
-///
-/// Returns a mapping from LLVM opcode ID to instruction name.
-pub fn parse_opcode_names_from_disasm(disasm_output: &str) -> HashMap<u32, String> {
-    let mut names: HashMap<u32, String> = HashMap::new();
-
-    for line in disasm_output.lines() {
-        let line = line.trim();
-
-        // Match lines with OPC_Decode or OPC_TryDecode that have an Opcode: comment
-        let (is_decode, is_try_decode) = (
-            line.contains("MCD::OPC_Decode,"),
-            line.contains("MCD::OPC_TryDecode,"),
-        );
-        if !is_decode && !is_try_decode {
-            continue;
-        }
-
-        // Extract the instruction name from the "// Opcode: NAME" comment
-        let name = if let Some(idx) = line.find("// Opcode: ") {
-            let rest = &line[idx + 11..];
-            // Name ends at comma, space, or end of line
-            let end = rest.find(|c: char| c == ',' || c == '\n')
-                .unwrap_or(rest.len());
-            rest[..end].trim().to_string()
-        } else {
-            continue;
-        };
-
-        // Extract the byte values after "OPC_Decode," or "OPC_TryDecode,"
-        let marker = if is_decode { "MCD::OPC_Decode," } else { "MCD::OPC_TryDecode," };
-        let after_marker = if let Some(idx) = line.find(marker) {
-            &line[idx + marker.len()..]
-        } else {
-            continue;
-        };
-
-        // Parse comma-separated byte values until "//" comment
-        let bytes_str = if let Some(comment_idx) = after_marker.find("//") {
-            &after_marker[..comment_idx]
-        } else {
-            after_marker
-        };
-
-        let byte_values: Vec<u8> = bytes_str
-            .split(',')
-            .filter_map(|s| s.trim().parse::<u8>().ok())
-            .collect();
-
-        if byte_values.is_empty() {
-            continue;
-        }
-
-        // The first ULEB128 value after the opcode byte is the opcode_id
-        let mut ptr = 0;
-        let opcode_id = read_uleb128(&byte_values, &mut ptr);
-
-        names.insert(opcode_id, name);
-    }
-
-    names
-}
-
-/// Parse a single decoder table array from the C++ output.
-///
-/// Expects input like:
-/// ```text
-/// static const uint8_t DecoderTableAlu32[] = {
-/// /* 0 */       MCD::OPC_ExtractField, 0, 3,  // Inst{2-0} ...
-/// ...
-/// /* 664 */     MCD::OPC_Fail,
-///   0
-/// };
-/// ```
-///
-/// Returns the raw byte array.
-pub fn parse_decoder_table_bytes(table_text: &str) -> Vec<u8> {
-    let mut bytes = Vec::new();
-
-    for line in table_text.lines() {
-        let line = line.trim();
-
-        // Skip empty lines, the opening brace, and the closing };
-        if line.is_empty() || line == "{" || line.starts_with("};") || line.starts_with("static ") {
-            continue;
-        }
-
-        // Strip the "/* offset */ " comment prefix
-        let data_part = if let Some(idx) = line.find("*/") {
-            &line[idx + 2..]
-        } else {
-            line
-        };
-
-        // Strip the "// comment" suffix
-        let data_part = if let Some(idx) = data_part.find("//") {
-            &data_part[..idx]
-        } else {
-            data_part
-        };
-
-        // Parse "MCD::OPC_xxx" symbolic names to their numeric values
-        // and regular numeric values
-        for token in data_part.split(',') {
-            let token = token.trim();
-            if token.is_empty() {
-                continue;
-            }
-
-            if let Some(val) = match_mcd_opcode(token) {
-                bytes.push(val);
-            } else if let Ok(val) = token.parse::<u8>() {
-                bytes.push(val);
-            }
-            // Skip tokens we can't parse (trailing 0 after array, etc.)
-        }
-    }
-
-    bytes
-}
-
-/// Map MCD::OPC_xxx symbolic names to their numeric values.
-fn match_mcd_opcode(token: &str) -> Option<u8> {
-    match token {
-        "MCD::OPC_ExtractField" => Some(opc::EXTRACT_FIELD),
-        "MCD::OPC_FilterValue" => Some(opc::FILTER_VALUE),
-        "MCD::OPC_CheckField" => Some(opc::CHECK_FIELD),
-        "MCD::OPC_CheckPredicate" => Some(opc::CHECK_PREDICATE),
-        "MCD::OPC_Decode" => Some(opc::DECODE),
-        "MCD::OPC_TryDecode" => Some(opc::TRY_DECODE),
-        "MCD::OPC_SoftFail" => Some(opc::SOFT_FAIL),
-        "MCD::OPC_Fail" => Some(opc::FAIL),
-        _ => None,
-    }
-}
-
-/// Extract all decoder tables from the full `-gen-disassembler` output.
-///
-/// Finds each `static const uint8_t DecoderTableXxx##[] = { ... };` block,
-/// parses the bytes and opcode names, and returns them keyed by a normalized
-/// slot name (e.g., "Alu32" -> "alu", "Mv32" -> "mv").
-///
-/// Only extracts per-slot tables (Alu, Lda, Ldb, Mv, St, Vec, Nop, Lng),
-/// not the composite format tables (Formats16, Formats32, etc.).
-pub fn extract_all_tables(disasm_output: &str) -> HashMap<String, DecoderTable> {
-    let mut result = HashMap::new();
-
-    // Map from C++ table name suffix to our canonical slot name
-    let slot_map: &[(&str, &str)] = &[
-        ("DecoderTableAlu32", "alu"),
-        ("DecoderTableLda32", "lda"),
-        ("DecoderTableLdb32", "ldb"),
-        ("DecoderTableMv32", "mv"),
-        ("DecoderTableSt32", "st"),
-        ("DecoderTableVec32", "vec"),
-        ("DecoderTableNop16", "nop"),
-        ("DecoderTableLng48", "lng"),
-    ];
-
-    for (table_name, slot_name) in slot_map {
-        let search = format!("static const uint8_t {}[]", table_name);
-        if let Some(start_idx) = disasm_output.find(&search) {
-            // Find the end of this table ("};" on its own line or preceded by content)
-            let rest = &disasm_output[start_idx..];
-            if let Some(end_offset) = find_table_end(rest) {
-                let table_text = &rest[..end_offset];
-
-                // Parse bytes from this table's text
-                let bytes = parse_decoder_table_bytes(table_text);
-
-                // Parse opcode names from the same block's comments
-                let opcode_names = parse_opcode_names_from_disasm(table_text);
-
-                if !bytes.is_empty() {
-                    log::debug!(
-                        "Extracted decoder table '{}' ({} slot): {} bytes, {} opcodes",
-                        table_name, slot_name, bytes.len(), opcode_names.len(),
-                    );
-                    result.insert(
-                        slot_name.to_string(),
-                        DecoderTable::new(bytes, opcode_names),
-                    );
-                }
-            }
-        }
-    }
-
-    result
-}
-
-/// Find the end of a C array definition (`};`).
-///
-/// Returns the byte offset (from the start of the input) of the character
-/// just after `};`.
-fn find_table_end(text: &str) -> Option<usize> {
-    // Find the first `};` that terminates the array
-    // We search line by line to avoid matching `};` in comments
-    let mut offset = 0;
-    for line in text.lines() {
-        let next_offset = offset + line.len() + 1; // +1 for newline
-        let trimmed = line.trim();
-        if trimmed == "};" || trimmed.starts_with("};") {
-            return Some(next_offset);
-        }
-        offset = next_offset;
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_uleb128() {
-        // Single byte: 0x00 = 0
         let bytes = [0x00];
         let mut ptr = 0;
         assert_eq!(read_uleb128(&bytes, &mut ptr), 0);
         assert_eq!(ptr, 1);
 
-        // Single byte: 0x7F = 127
         let bytes = [0x7F];
         ptr = 0;
         assert_eq!(read_uleb128(&bytes, &mut ptr), 127);
 
-        // Two bytes: 0x80 0x01 = 128
         let bytes = [0x80, 0x01];
         ptr = 0;
         assert_eq!(read_uleb128(&bytes, &mut ptr), 128);
         assert_eq!(ptr, 2);
 
-        // Two bytes: 0xBC 0x05 = 700 (from LLVM output: 188, 5)
-        // 188 = 0xBC = 0b10111100, 5 = 0x05
-        // low 7 bits of 0xBC = 0b0111100 = 60
-        // next 7 bits of 0x05 = 0b0000101 = 5
-        // result = 60 | (5 << 7) = 60 + 640 = 700
         let bytes = [0xBC, 0x05];
         ptr = 0;
         assert_eq!(read_uleb128(&bytes, &mut ptr), 700);
@@ -488,51 +228,38 @@ mod tests {
 
     #[test]
     fn test_field_from_instruction() {
-        // Extract bits 2-0 from 0b101 = 5
         assert_eq!(field_from_instruction(0b101, 0, 3), 5);
-        // Extract bits 4-3 from 0b11000 = 24 -> field = 0b11 = 3
         assert_eq!(field_from_instruction(0b11000, 3, 2), 3);
-        // Extract bit 0 from 0b110 -> 0
         assert_eq!(field_from_instruction(0b110, 0, 1), 0);
     }
 
     #[test]
     fn test_simple_decode() {
-        // Minimal table: ExtractField(0, 2), FilterValue(1, skip=4),
-        //                Decode(42, 0), Fail
         let bytes = vec![
-            opc::EXTRACT_FIELD, 0, 2,        // ExtractField(start=0, len=2)
-            opc::FILTER_VALUE, 1, 4, 0, 0,   // FilterValue(val=1, skip=4)
-            opc::DECODE, 42, 0,              // Decode(opcode=42, decoder=0)
-            opc::FAIL,                        // Fail
+            opc::EXTRACT_FIELD, 0, 2,
+            opc::FILTER_VALUE, 1, 4, 0, 0,
+            opc::DECODE, 42, 0,
+            opc::FAIL,
         ];
 
         let mut names = HashMap::new();
         names.insert(42, "TEST_INSTR".to_string());
         let table = DecoderTable::new(bytes, names);
 
-        // bits=0b01 (field[1:0]=1) -> FilterValue passes -> Decode 42
         assert_eq!(table.decode(0b01), Some("TEST_INSTR"));
-        // bits=0b00 (field[1:0]=0) -> FilterValue skips -> Fail
         assert_eq!(table.decode(0b00), None);
-        // bits=0b10 (field[1:0]=2) -> FilterValue skips -> Fail
         assert_eq!(table.decode(0b10), None);
     }
 
     #[test]
     fn test_try_decode_fallthrough() {
-        // Table: TryDecode(42, skip to Decode(99)), Decode(99), Fail
-        // When TryDecode for opcode 42 fails (not in name map), it skips
-        // forward to the Decode instruction. skip=0 means "stay at current ptr"
-        // which lands on the Decode right after the TryDecode args.
         let bytes = vec![
-            opc::TRY_DECODE, 42, 0, 0, 0, 0, // TryDecode(opcode=42, decoder=0, skip=0)
-            opc::DECODE, 99, 0,               // Decode(opcode=99, decoder=0)
+            opc::TRY_DECODE, 42, 0, 0, 0, 0,
+            opc::DECODE, 99, 0,
             opc::FAIL,
         ];
 
         let mut names = HashMap::new();
-        // Only opcode 99 is known; 42 is not -> TryDecode falls through
         names.insert(99, "FALLBACK".to_string());
         let table = DecoderTable::new(bytes, names);
 
@@ -541,10 +268,9 @@ mod tests {
 
     #[test]
     fn test_check_field() {
-        // CheckField(start=4, len=2, expected=3, skip=4), Decode(10), Fail
         let bytes = vec![
-            opc::CHECK_FIELD, 4, 2, 3, 4, 0, 0,  // CheckField(4, 2, 3, skip=4)
-            opc::DECODE, 10, 0,                    // Decode(opcode=10, decoder=0)
+            opc::CHECK_FIELD, 4, 2, 3, 4, 0, 0,
+            opc::DECODE, 10, 0,
             opc::FAIL,
         ];
 
@@ -552,118 +278,30 @@ mod tests {
         names.insert(10, "MATCHED".to_string());
         let table = DecoderTable::new(bytes, names);
 
-        // bits[5:4] = 3 -> pass -> Decode
         assert_eq!(table.decode(0b110000), Some("MATCHED"));
-        // bits[5:4] = 1 -> skip -> Fail
         assert_eq!(table.decode(0b010000), None);
     }
 
-    #[test]
-    fn test_parse_opcode_names() {
-        let input = r#"
-/* 23 */      MCD::OPC_Decode, 188, 5, 0, // Opcode: NOPX
-/* 39 */      MCD::OPC_TryDecode, 230, 4, 1, 106, 2, 0, // Opcode: J_jump_ind, skip to: 664
-/* 86 */      MCD::OPC_Decode, 139, 4, 3, // Opcode: EVENT
-"#;
-        let names = parse_opcode_names_from_disasm(input);
-
-        // 188, 5 -> ULEB128: (188 & 0x7F) | ((5 & 0x7F) << 7) = 60 + 640 = 700
-        assert_eq!(names.get(&700), Some(&"NOPX".to_string()));
-
-        // 230, 4 -> ULEB128: (230 & 0x7F) | ((4 & 0x7F) << 7) = 102 + 512 = 614
-        assert_eq!(names.get(&614), Some(&"J_jump_ind".to_string()));
-
-        // 139, 4 -> ULEB128: (139 & 0x7F) | ((4 & 0x7F) << 7) = 11 + 512 = 523
-        assert_eq!(names.get(&523), Some(&"EVENT".to_string()));
-    }
-
-    #[test]
-    fn test_parse_decoder_table_bytes() {
-        let input = r#"static const uint8_t DecoderTableAlu32[] = {
-/* 0 */       MCD::OPC_ExtractField, 0, 3,  // Inst{2-0} ...
-/* 3 */       MCD::OPC_FilterValue, 0, 4, 1, 0, // Skip to: 268
-/* 664 */     MCD::OPC_Fail,
-  0
-};
-"#;
-        let bytes = parse_decoder_table_bytes(input);
-        // Should have: [1, 0, 3, 2, 0, 4, 1, 0, 8, 0]
-        assert_eq!(bytes[0], opc::EXTRACT_FIELD); // 1
-        assert_eq!(bytes[1], 0);                   // start=0
-        assert_eq!(bytes[2], 3);                   // len=3
-        assert_eq!(bytes[3], opc::FILTER_VALUE);  // 2
-        assert_eq!(bytes[4], 0);                   // val=0
-        assert_eq!(bytes[5], 4);                   // skip low
-        assert_eq!(bytes[6], 1);                   // skip mid
-        assert_eq!(bytes[7], 0);                   // skip high
-        assert_eq!(bytes[8], opc::FAIL);          // 8
-        // The trailing "0" after the array is also parsed as a byte
-    }
-
-    /// Integration test: load actual LLVM decoder tables and verify MOV vs VGE.
+    /// Integration test: verify MOV vs VGE disambiguation using generated tables.
     #[test]
     fn test_real_mv_slot_decode() {
-        use std::path::Path;
-        use std::process::Command;
+        let output = crate::tablegen::load_from_generated();
+        let mv_table = output.decoder_tables.get("mv")
+            .expect("Should have mv decoder table");
 
-        let llvm_aie = Path::new("../llvm-aie");
-        let tblgen = llvm_aie.join("build/bin/llvm-tblgen");
-        if !tblgen.exists() {
-            eprintln!("Skipping: llvm-tblgen not found");
-            return;
-        }
-
-        let base = llvm_aie.join("llvm/lib/Target/AIE");
-        let output = match Command::new(&tblgen)
-            .arg("-gen-disassembler")
-            .arg("AIE2.td")
-            .arg("-I.")
-            .arg("-I../../..")
-            .arg("-I../../../include")
-            .current_dir(&base)
-            .env_remove("LD_LIBRARY_PATH")
-            .output()
-        {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("Skipping: failed to run llvm-tblgen: {}", e);
-                return;
-            }
-        };
-
-        assert!(output.status.success(), "llvm-tblgen failed");
-        let content = String::from_utf8_lossy(&output.stdout);
-        let tables = extract_all_tables(&content);
-
-        // Verify we got the expected slot tables
-        assert!(tables.contains_key("mv"), "Should have mv slot table");
-        assert!(tables.contains_key("alu"), "Should have alu slot table");
-
-        let mv_table = tables.get("mv").unwrap();
-        eprintln!(
-            "MV table: {} bytes, {} opcodes",
-            mv_table.byte_count(),
-            mv_table.opcode_count(),
-        );
-
-        // The critical test: 0x00713c should decode as MOV, not VGE
         let mv_bits: u64 = 0x00713c;
         let result = mv_table.decode(mv_bits);
-        eprintln!("MV 0x{:06x} -> {:?}", mv_bits, result);
 
         if let Some(name) = result {
             assert!(
                 !name.starts_with("VGE"),
                 "MV bits 0x{:06x} decoded as '{}' but should be MOV variant",
-                mv_bits,
-                name,
+                mv_bits, name,
             );
-            // Should be a MOV instruction
             assert!(
                 name.contains("MOV") || name.contains("mov"),
                 "MV bits 0x{:06x} decoded as '{}', expected a MOV instruction",
-                mv_bits,
-                name,
+                mv_bits, name,
             );
         } else {
             panic!("MV bits 0x{:06x} failed to decode", mv_bits);

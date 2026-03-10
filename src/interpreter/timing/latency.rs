@@ -589,15 +589,7 @@ mod tests {
     ///   branch cost, which is a different concept.
     #[test]
     fn test_latency_cross_validation_against_itineraries() {
-        let tblgen = match crate::tablegen::load_full_via_tblgen(
-            std::path::Path::new("/home/triple/npu-work/llvm-aie"),
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("Skipping itinerary cross-validation (llvm-aie not available): {}", e);
-                return;
-            }
-        };
+        let tblgen = crate::tablegen::load_from_generated();
 
         let mut checked = 0u32;
         let mut mismatches = Vec::new();

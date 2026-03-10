@@ -33,11 +33,7 @@ byteorder = "1.5"                                       # Byte order utilities f
 dirs = "6"                                              # Platform-specific config directories
 crossterm = "0.29"                                       # Terminal control for build progress grid
 libc = "0.2"                                              # POSIX FFI: setsid, killpg for process control
-sha2 = "0.10"                                             # SHA256 for trace staleness checking
 xdna-archspec = { path = "crates/xdna-archspec" }           # Architecture specification (shared with build.rs)
-
-# TableGen integration (links directly to LLVM's TableGen library)
-tblgen = { git = "https://github.com/FIM43-Redeye/tblgen-rs.git", branch = "feat/varbit-init", default-features = false, features = ["llvm20-0"] }
 
 # Serialization (for test manifests and register database)
 serde = { version = "1", features = ["derive"] }
@@ -62,6 +58,7 @@ default = []
 [build-dependencies]
 serde_json = "1"                              # Used by extract_aiert for JSON Value parsing
 xdna-archspec = { path = "crates/xdna-archspec" }
+tblgen = { git = "https://github.com/FIM43-Redeye/tblgen-rs.git", branch = "feat/varbit-init", default-features = false, features = ["llvm20-0"] }
 
 [dev-dependencies]
 hex = "0.4"                                             # Hex dump utilities for debugging
@@ -76,4 +73,6 @@ name = "npu-archspec"
 path = "src/bin/npu_archspec.rs"
 
 [profile.release]
-lto = true
+# LTO disabled: the 37k-line gen_tablegen.rs makes full LTO very slow.
+# Re-evaluate after splitting generated code into per-slot modules.
+# lto = true

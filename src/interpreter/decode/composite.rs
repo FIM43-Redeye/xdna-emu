@@ -408,14 +408,7 @@ mod tests {
     /// composite value that our LUT inverts back to the correct register.
     #[test]
     fn test_lut_against_hwencodings() {
-        let llvm_aie_path = std::path::Path::new("../llvm-aie");
-        if !llvm_aie_path.exists() {
-            eprintln!("Skipping test: llvm-aie not found");
-            return;
-        }
-
-        let output = crate::tablegen::load_full_via_tblgen(llvm_aie_path)
-            .expect("Failed to load tblgen data");
+        let output = crate::tablegen::load_from_generated();
         let reg_model = &output.register_model;
 
         let luts = CompositeLuts::build();
