@@ -2746,4 +2746,107 @@ mod tests {
             "State should be Idle after OP_READ with TLAST and drop_header=true"
         );
     }
+
+    // === Lock Trace Event Pipeline Tests ===
+
+    #[test]
+    fn test_lock_event_reaches_trace_unit() {
+        // Verify end-to-end: lock acquire -> mem_trace_pending -> trace unit capture.
+        //
+        // This tests the full pipeline that sweep batch 3 exercises:
+        // 1. Lock acquire resolves -> pushes EventType::LockAcquire{lock_id:0}
+        // 2. mem_event_to_hw_id maps to 45 (LOCK_SEL0_ACQ_GE)
+        // 3. Trace unit with slot configured to 45 captures the event
+        let mut tile = Tile::compute(0, 2);
+
+        // Initialize lock 0 to value 1 so an acquire(>=1) will succeed.
+        tile.locks[0] = Lock { value: 1, ..Default::default() };
+
+        // Configure mem trace unit:
+        //   Control0: mode=EventTime(0), start=1 (TRUE), stop=0
+        //   Event0: slot0=1(TRUE), slot1=45(LOCK_SEL0_ACQ_GE), slot2=46(LOCK_0_REL)
+        tile.mem_trace.write_register(0x00, 0 | (1 << 16) | (0 << 24)); // start=TRUE(1)
+        tile.mem_trace.write_register(0x04, (1 << 12) | 1); // pkt_type=1, pkt_id=1
+        tile.mem_trace.write_register(0x10, 1 | (45 << 8) | (46 << 16)); // slots 0-2
+
+        // Start the trace unit by firing TRUE event
+        tile.mem_trace.notify_event(1, 0); // TRUE at cycle 0
+        assert!(tile.mem_trace.is_configured());
+
+        // Submit and resolve a lock acquire on lock 0
+        tile.submit_lock_request(LockRequest {
+            requestor: LockRequestor::DmaS2mm(0),
+            lock_id: 0,
+            is_acquire: true,
+            expected: 1,
+            delta: -1,
+            equal_mode: false,
+        });
+        let results = tile.resolve_lock_requests(100);
+
+        // Lock should be granted (value was 1, needed >=1)
+        assert_eq!(results.len(), 1, "Expected one lock result");
+        assert!(results[0].2, "Lock acquire should be granted");
+        assert!(results[0].3, "Should be marked as acquire");
+
+        // mem_trace_pending should have the lock event
+        assert_eq!(tile.mem_trace_pending.len(), 1, "Expected one pending trace event");
+        let (cycle, ref event) = tile.mem_trace_pending[0];
+        assert_eq!(cycle, 100);
+        assert!(
+            matches!(event, crate::interpreter::state::EventType::LockAcquire { lock_id: 0 }),
+            "Expected LockAcquire{{lock_id:0}}, got {:?}", event
+        );
+
+        // Map through mem_event_to_hw_id -- should return 45
+        let hw_id = crate::trace::mem_event_to_hw_id(event);
+        assert_eq!(hw_id, Some(45), "LOCK_SEL0_ACQ_GE should be event ID 45");
+
+        // Notify the trace unit and flush to check capture
+        tile.mem_trace.notify_event(45, 100);
+        tile.mem_trace.flush();
+        assert!(
+            tile.mem_trace.has_pending_packets(),
+            "Trace unit should have recorded the lock event (packet pending after flush)"
+        );
+    }
+
+    #[test]
+    fn test_lock_release_event_reaches_trace_unit() {
+        let mut tile = Tile::compute(0, 2);
+
+        // Configure mem trace with LOCK_0_REL (46) in slot 1
+        tile.mem_trace.write_register(0x00, 0 | (1 << 16)); // start=TRUE(1)
+        tile.mem_trace.write_register(0x04, (1 << 12) | 1);
+        tile.mem_trace.write_register(0x10, 1 | (46 << 8)); // slot0=TRUE, slot1=LOCK_0_REL
+        tile.mem_trace.notify_event(1, 0); // start
+
+        // Submit a lock release on lock 0
+        tile.submit_lock_request(LockRequest {
+            requestor: LockRequestor::Core,
+            lock_id: 0,
+            is_acquire: false,
+            expected: 0,
+            delta: 1,
+            equal_mode: false,
+        });
+        let results = tile.resolve_lock_requests(50);
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].2, "Release should be granted");
+        assert!(!results[0].3, "Should be marked as release");
+
+        // Check pending event
+        assert_eq!(tile.mem_trace_pending.len(), 1);
+        let hw_id = crate::trace::mem_event_to_hw_id(&tile.mem_trace_pending[0].1);
+        assert_eq!(hw_id, Some(46), "LOCK_0_REL should be event ID 46");
+
+        // Notify, flush, and verify capture
+        tile.mem_trace.notify_event(46, 50);
+        tile.mem_trace.flush();
+        assert!(
+            tile.mem_trace.has_pending_packets(),
+            "Trace unit should have recorded the lock release event"
+        );
+    }
 }

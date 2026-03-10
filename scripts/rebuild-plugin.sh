@@ -41,9 +41,11 @@ echo ">>> Building plugin..."
 nice -n 19 cmake --build "$BUILD_DIR" 2>&1
 
 # Find the Rust emulator library: prefer release (matches bridge test
-# workflow), fall back to debug.  Always install it alongside the C++
-# plugin so
-# the dlopen at runtime picks up the matching build.
+# workflow), fall back to debug.
+#
+# NOTE: If XDNA_EMU_LIB is set in the environment (e.g. by
+# activate-npu-env.sh), dlopen uses that path directly and the copy
+# here is just a fallback for non-activated sessions.
 RUST_LIB=""
 if [[ -f "$EMU_DIR/target/release/libxdna_emu.so" ]]; then
     RUST_LIB="$EMU_DIR/target/release/libxdna_emu.so"
