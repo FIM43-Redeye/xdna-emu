@@ -63,6 +63,11 @@ enum PadPhase {
 /// Wraps around the address generator: on each `next()` call, returns either
 /// `PadAction::Data(addr)` (read from memory) or `PadAction::Zero` (emit zero).
 /// The address generator only advances for data words.
+///
+/// Per AM025, the padding dimensions have different units:
+/// - D0 before/after: individual 32-bit zero words
+/// - D1 before/after: "wraps of dim0" (complete D0 output rows of zeros)
+/// - D2 before/after: "wraps of dim0dim1" (complete D1 output blocks of zeros)
 #[derive(Debug, Clone)]
 pub struct ZeroPadState {
     config: ZeroPadConfig,
@@ -71,11 +76,15 @@ pub struct ZeroPadState {
     phase_remaining: u32,
     /// D0 data size (from dimension config)
     d0_size: u32,
-    /// D1 iteration count
+    /// Size of one complete D0 output row (d0_before + d0_size + d0_after)
+    d0_wrap_size: u32,
+    /// D1 data iteration count
     d1_size: u32,
+    /// Total D1 iterations including padding (d1_before + d1_size + d1_after)
+    d1_total: u32,
     /// D2 iteration count
     d2_size: u32,
-    /// Current D1 counter (0..d1_size)
+    /// Current D1 counter (0..d1_size, data iterations only)
     d1_counter: u32,
     /// Current D2 counter (0..d2_size)
     d2_counter: u32,
@@ -97,20 +106,32 @@ impl ZeroPadState {
         let d1_eff = if d1_size == 0 { 1 } else { d1_size };
         let d2_eff = if d2_size == 0 { 1 } else { d2_size };
 
+        // D0 wrap = one complete D0 output row including D0 padding
+        let d0_wrap = config.d0_before as u32 + d0_eff + config.d0_after as u32;
+        // D1 total = data iterations + D1 padding iterations
+        let d1_total = config.d1_before as u32 + d1_eff + config.d1_after as u32;
+
         let data_words = d0_eff as u64 * d1_eff as u64 * d2_eff as u64;
-        let pad_words = config.total_pad_words(d1_eff, d2_eff);
+        let pad_words = config.total_pad_words(d0_eff, d1_eff, d2_eff);
         let total = data_words + pad_words;
 
         // Start at D2Before if there are D2-level before zeros, otherwise
         // cascade down through the phase hierarchy
-        let (phase, phase_remaining) = Self::enter_d2_iteration(&config, d0_eff);
+        let (phase, phase_remaining) = if config.d2_before > 0 {
+            // D2 before: emit d2_before complete D1 blocks of zeros
+            (PadPhase::D2Before, config.d2_before as u32 * d1_total * d0_wrap)
+        } else {
+            Self::enter_d1_iteration(&config, d0_eff, d0_wrap)
+        };
 
         Self {
             config,
             phase,
             phase_remaining,
             d0_size: d0_eff,
+            d0_wrap_size: d0_wrap,
             d1_size: d1_eff,
+            d1_total,
             d2_size: d2_eff,
             d1_counter: 0,
             d2_counter: 0,
@@ -167,11 +188,15 @@ impl ZeroPadState {
     fn transition(&mut self) {
         match self.phase {
             PadPhase::D2Before => {
-                let (phase, remaining) = Self::enter_d1_iteration(&self.config, self.d0_size);
+                // D2 before padding done, start first D1 iteration
+                let (phase, remaining) = Self::enter_d1_iteration(
+                    &self.config, self.d0_size, self.d0_wrap_size,
+                );
                 self.phase = phase;
                 self.phase_remaining = remaining;
             }
             PadPhase::D1Before => {
+                // D1 before padding done, start D0 data pattern
                 self.phase = if self.config.d0_before > 0 {
                     PadPhase::D0Before
                 } else {
@@ -192,37 +217,35 @@ impl ZeroPadState {
                     self.phase = PadPhase::D0After;
                     self.phase_remaining = self.config.d0_after as u32;
                 } else {
-                    // D0 done, emit d1_after for this D1 iteration
-                    self.emit_d1_after();
+                    self.advance_d1_data_iter();
                 }
             }
             PadPhase::D0After => {
-                // D0 done, emit d1_after for this D1 iteration
-                self.emit_d1_after();
+                // D0 complete for this D1 data iteration.
+                // Advance to next D1 data iteration, or emit D1 after.
+                self.advance_d1_data_iter();
             }
             PadPhase::D1After => {
-                // D1 after emitted for this iteration, advance D1 counter
-                self.d1_counter += 1;
-                if self.d1_counter < self.d1_size {
-                    // More D1 iterations remain
-                    let (phase, remaining) = Self::enter_d1_iteration(
-                        &self.config, self.d0_size,
-                    );
-                    self.phase = phase;
-                    self.phase_remaining = remaining;
-                } else {
-                    // All D1 iterations done
-                    self.finish_d2_iteration();
-                }
+                // D1 after padding done (all D1 data iterations complete).
+                // Advance to the next D2 iteration.
+                self.finish_d2_iteration();
             }
             PadPhase::D2After => {
                 self.d2_counter += 1;
                 if self.d2_counter < self.d2_size {
-                    let (phase, remaining) = Self::enter_d2_iteration(
-                        &self.config, self.d0_size,
-                    );
-                    self.phase = phase;
-                    self.phase_remaining = remaining;
+                    // Start next D2 iteration
+                    if self.config.d2_before > 0 {
+                        self.phase = PadPhase::D2Before;
+                        self.phase_remaining = self.config.d2_before as u32
+                            * self.d1_total * self.d0_wrap_size;
+                    } else {
+                        let (phase, remaining) = Self::enter_d1_iteration(
+                            &self.config, self.d0_size, self.d0_wrap_size,
+                        );
+                        self.phase = phase;
+                        self.phase_remaining = remaining;
+                    }
+                    self.d1_counter = 0;
                 } else {
                     self.phase = PadPhase::Done;
                     self.phase_remaining = 0;
@@ -232,40 +255,60 @@ impl ZeroPadState {
         }
     }
 
-    /// Emit D1 after-padding for the current D1 iteration, or skip to
-    /// the next phase if d1_after is zero.
-    fn emit_d1_after(&mut self) {
-        if self.config.d1_after > 0 {
-            self.phase = PadPhase::D1After;
-            self.phase_remaining = self.config.d1_after as u32;
+    /// Advance after completing one D1 data iteration's D0 pattern.
+    ///
+    /// If more D1 data iterations remain, start the next D0 pattern.
+    /// If all D1 data iterations are done, emit D1 after padding (or
+    /// advance to the next D2 iteration if no D1 after padding).
+    fn advance_d1_data_iter(&mut self) {
+        self.d1_counter += 1;
+        if self.d1_counter < self.d1_size {
+            // More D1 data iterations -- start next D0 pattern directly
+            // (D1 before was already emitted once at the start of this D1 block)
+            self.phase = if self.config.d0_before > 0 {
+                PadPhase::D0Before
+            } else {
+                PadPhase::D0Data
+            };
+            self.phase_remaining = if self.config.d0_before > 0 {
+                self.config.d0_before as u32
+            } else {
+                self.d0_size
+            };
         } else {
-            // No d1_after, advance D1 counter directly
-            self.d1_counter += 1;
-            if self.d1_counter < self.d1_size {
-                let (phase, remaining) = Self::enter_d1_iteration(
-                    &self.config, self.d0_size,
-                );
-                self.phase = phase;
-                self.phase_remaining = remaining;
+            // All D1 data iterations done -- emit D1 after padding
+            if self.config.d1_after > 0 {
+                self.phase = PadPhase::D1After;
+                // Each D1 after unit = one complete D0 output row of zeros
+                self.phase_remaining = self.config.d1_after as u32 * self.d0_wrap_size;
             } else {
                 self.finish_d2_iteration();
             }
         }
     }
 
-    /// Called when all D1 iterations within a D2 iteration are done.
+    /// Called when all data D1 iterations within a D2 iteration are done.
     fn finish_d2_iteration(&mut self) {
         if self.config.d2_after > 0 {
             self.phase = PadPhase::D2After;
-            self.phase_remaining = self.config.d2_after as u32;
+            // Each D2 after unit = one complete D1 block of zeros
+            self.phase_remaining = self.config.d2_after as u32
+                * self.d1_total * self.d0_wrap_size;
         } else {
             self.d2_counter += 1;
             if self.d2_counter < self.d2_size {
-                let (phase, remaining) = Self::enter_d2_iteration(
-                    &self.config, self.d0_size,
-                );
-                self.phase = phase;
-                self.phase_remaining = remaining;
+                self.d1_counter = 0;
+                if self.config.d2_before > 0 {
+                    self.phase = PadPhase::D2Before;
+                    self.phase_remaining = self.config.d2_before as u32
+                        * self.d1_total * self.d0_wrap_size;
+                } else {
+                    let (phase, remaining) = Self::enter_d1_iteration(
+                        &self.config, self.d0_size, self.d0_wrap_size,
+                    );
+                    self.phase = phase;
+                    self.phase_remaining = remaining;
+                }
             } else {
                 self.phase = PadPhase::Done;
                 self.phase_remaining = 0;
@@ -273,19 +316,16 @@ impl ZeroPadState {
         }
     }
 
-    /// Determine initial phase when entering a new D2 iteration.
-    fn enter_d2_iteration(config: &ZeroPadConfig, d0_size: u32) -> (PadPhase, u32) {
-        if config.d2_before > 0 {
-            (PadPhase::D2Before, config.d2_before as u32)
-        } else {
-            Self::enter_d1_iteration(config, d0_size)
-        }
-    }
-
     /// Determine initial phase when entering a new D1 iteration.
-    fn enter_d1_iteration(config: &ZeroPadConfig, d0_size: u32) -> (PadPhase, u32) {
+    ///
+    /// D1 before padding = d1_before complete D0 wraps of zeros (per AM025:
+    /// "wraps of dim0 before dim1").
+    fn enter_d1_iteration(
+        config: &ZeroPadConfig, d0_size: u32, d0_wrap_size: u32,
+    ) -> (PadPhase, u32) {
         if config.d1_before > 0 {
-            (PadPhase::D1Before, config.d1_before as u32)
+            // Each D1 before unit = one complete D0 output row of zeros
+            (PadPhase::D1Before, config.d1_before as u32 * d0_wrap_size)
         } else if config.d0_before > 0 {
             (PadPhase::D0Before, config.d0_before as u32)
         } else {
@@ -1200,16 +1240,24 @@ mod tests {
     #[test]
     fn test_pad_state_all_dimensions() {
         // D0 before=1, d0_size=2, D1 before=1, after=1, d1=2, D2 before=1, after=1, d2=1
-        // Pattern:
-        //   [d2_before=1]
-        //     [d1_before=1]
-        //       [d0_before=1] [D,D]
-        //     [d1_after=1]
-        //     [d1_before=1]
-        //       [d0_before=1] [D,D]
-        //     [d1_after=1]
-        //   [d2_after=1]
-        // = 1 + (1+1+2+1) * 2 + 1 = 12 words total
+        //
+        // Per AM025:
+        // - D0 padding: individual words
+        // - D1 padding: "wraps of dim0" (complete D0 rows of zeros)
+        // - D2 padding: "wraps of dim0dim1" (complete D1 blocks of zeros)
+        //
+        // d0_wrap = 1+2+0 = 3 words per D0 output row
+        // d1_total = 1+2+1 = 4 D0 wraps per D1 block (including D1 padding)
+        //
+        // D2 before = 1 D1 block = 4 * 3 = 12 zero words
+        // D1 iteration 0:
+        //   D1 before = 1 D0 wrap = 3 zero words
+        //   D0 data row: [0, D, D] = 3 words (1 d0_before zero + 2 data)
+        //   D1 after = 1 D0 wrap = 3 zero words
+        // D1 iteration 1: same as iter 0
+        // D2 after = 1 D1 block = 12 zero words
+        //
+        // Total = 12 + (3+3+3)*2 + 12 = 12 + 18 + 12 = 42 words
         let config = ZeroPadConfig {
             d0_before: 1,
             d0_after: 0,
@@ -1221,7 +1269,9 @@ mod tests {
         let mut state = ZeroPadState::new(config, 2, 2, 1);
         let gen = AddressGenerator::new_2d(0x1000, 2, 4, 2, 8);
 
-        assert_eq!(state.total_output_words(), 12);
+        // total = (1+1+1)*(1+2+1)*(1+2+0) = 3*4*3 = 36; data = 2*2*1 = 4; pad = 36-4 = 32
+        // Hmm, total output should be d2_total * d1_total * d0_wrap = 3 * 4 * 3 = 36
+        assert_eq!(state.total_output_words(), 36);
 
         let mut sequence = Vec::new();
         while !state.is_finished() {
@@ -1231,9 +1281,40 @@ mod tests {
         }
 
         let pattern: String = sequence.into_iter().collect();
-        // d2_before(1) | d1_before(1) d0_before(1) DD d1_after(1)
-        //              | d1_before(1) d0_before(1) DD d1_after(1) | d2_after(1)
-        assert_eq!(pattern, "000DD000DD00");
+        // D2 before: 12 zeros
+        // D1 iter 0: d1_before(3 zeros) + d0_before(1)+data(2) + d1_after(3 zeros) = 9 words
+        // D1 iter 1: same = 9 words
+        // D2 after: 12 zeros
+        // Total: 12 + 9 + 9 + 12 = 42... but total_output says 36?
+        //
+        // Wait: total_output = d2_total * d1_total * d0_wrap = 3 * 4 * 3 = 36
+        // D2 before: 1 D1 block = d1_total * d0_wrap = 4 * 3 = 12 zeros
+        // Data D1 iterations: 2 * (d1_before_wraps + d0_row + d1_after_wraps)
+        //   = 2 * (1*3 + 3 + 1*3) = 2 * 9 = 18 words (but only 4 are data)
+        // D2 after: 12 zeros
+        // Total: 12 + 18 + 12 = 42 -- but formula says 36!
+        //
+        // The discrepancy is because d1_total already includes d1_before+d1_after,
+        // so the data D1 iterations should NOT add their own d1_before/d1_after again.
+        // Actually d1_total = d1_before + d1_size + d1_after = 1+2+1 = 4
+        // And d2_total = d2_before + d2_size + d2_after = 1+1+1 = 3
+        // total = 3 * 4 * 3 = 36.
+        // This means: 3 D2 blocks, each containing 4 D0 wraps, each of 3 words.
+        // D2 block 0 (d2_before): all zeros = 4*3 = 12 zeros
+        // D2 block 1 (data):
+        //   D1 wrap 0 (d1_before): 3 zeros
+        //   D1 wrap 1 (data iter 0): 1 zero + 2 data = 0DD
+        //   D1 wrap 2 (data iter 1): 1 zero + 2 data = 0DD
+        //   D1 wrap 3 (d1_after): 3 zeros
+        // D2 block 2 (d2_after): all zeros = 12 zeros
+        // Total: 12 + 3 + 3 + 3 + 3 + 12 = 36
+        assert_eq!(pattern, "000000000000" // D2 before (12 zeros)
+            .to_owned()
+            + "000" // D1 before wrap (3 zeros)
+            + "0DD" // data D1 iter 0
+            + "0DD" // data D1 iter 1
+            + "000" // D1 after wrap (3 zeros)
+            + "000000000000"); // D2 after (12 zeros)
     }
 
     #[test]
@@ -1278,9 +1359,10 @@ mod tests {
             &bd, 0, 0, TransferDirection::MM2S, 1, 1, TileType::MemTile,
         ).unwrap();
 
-        // Data: 10 words = 40 bytes
-        // Padding: (1+1) * 2 d1_iters = 4 words = 16 bytes
-        // Total: 56 bytes
+        // Data: d0=5, d1=2 -> 10 words = 40 bytes
+        // D0 wrap = 1+5+1 = 7 words per row
+        // D1 total = 0+2+0 = 2 (no D1 padding)
+        // Total output = 2 * 7 = 14 words = 56 bytes
         assert_eq!(transfer.total_bytes, 56);
         assert!(transfer.has_zero_padding());
 

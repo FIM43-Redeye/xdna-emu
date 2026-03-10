@@ -166,21 +166,27 @@ impl ZeroPadConfig {
     /// dimension boundary. This computes the total additional words
     /// from padding alone (not including data words).
     ///
-    /// Dimension sizes should be effective sizes (0 treated as 1 by caller).
+    /// All sizes should be effective sizes (0 treated as 1 by caller).
     ///
-    /// Per the nested loop structure:
-    /// - D0 before/after: emitted once per D1 iteration
-    /// - D1 before/after: emitted once per D1 iteration
-    /// - D2 before/after: emitted once per D2 iteration
-    pub fn total_pad_words(&self, d1_size: u32, d2_size: u32) -> u64 {
-        let d0_pad = self.d0_before as u64 + self.d0_after as u64;
-        let d1_pad = self.d1_before as u64 + self.d1_after as u64;
-        let d2_pad = self.d2_before as u64 + self.d2_after as u64;
+    /// Per AM025 register documentation:
+    /// - D0 before/after: individual 32-bit zero words
+    /// - D1 before/after: "wraps of dim0" -- complete D0 output rows of zeros
+    /// - D2 before/after: "wraps of dim0dim1" -- complete D1 output blocks of zeros
+    ///
+    /// Total output words:
+    ///   (d2_before + d2_size + d2_after) *
+    ///   (d1_before + d1_size + d1_after) *
+    ///   (d0_before + d0_size + d0_after)
+    ///
+    /// Padding words = total output - data words (d0_size * d1_size * d2_size).
+    pub fn total_pad_words(&self, d0_size: u32, d1_size: u32, d2_size: u32) -> u64 {
+        let d0_wrap = self.d0_before as u64 + d0_size as u64 + self.d0_after as u64;
+        let d1_total = self.d1_before as u64 + d1_size as u64 + self.d1_after as u64;
+        let d2_total = self.d2_before as u64 + d2_size as u64 + self.d2_after as u64;
 
-        // Both D0 and D1 padding occur once per D1 iteration
-        // D2 padding occurs once per D2 iteration
-        (d0_pad + d1_pad) * d1_size as u64 * d2_size as u64
-            + d2_pad * d2_size as u64
+        let total_output = d2_total * d1_total * d0_wrap;
+        let data_words = d0_size as u64 * d1_size as u64 * d2_size as u64;
+        total_output - data_words
     }
 }
 
@@ -729,7 +735,7 @@ mod tests {
     fn test_zero_pad_disabled_by_default() {
         let pad = ZeroPadConfig::default();
         assert!(!pad.is_enabled());
-        assert_eq!(pad.total_pad_words(1, 1), 0);
+        assert_eq!(pad.total_pad_words(4, 1, 1), 0);
     }
 
     #[test]
@@ -740,17 +746,17 @@ mod tests {
             ..Default::default()
         };
         assert!(pad.is_enabled());
-        // D0 padding = (2+3) = 5 per D1 iter, with d1=1 d2=1: 5 total
-        assert_eq!(pad.total_pad_words(1, 1), 5);
-        // With d1=4, d2=1: 5 * 4 = 20
-        assert_eq!(pad.total_pad_words(4, 1), 20);
-        // With d1=4, d2=2: 5 * 4 * 2 = 40
-        assert_eq!(pad.total_pad_words(4, 2), 40);
+        // d0_size=4: total = (2+4+3)*1*1 - 4*1*1 = 9-4 = 5
+        assert_eq!(pad.total_pad_words(4, 1, 1), 5);
+        // d0_size=4, d1=4: total = (2+4+3)*4*1 - 4*4*1 = 36-16 = 20
+        assert_eq!(pad.total_pad_words(4, 4, 1), 20);
+        // d0_size=4, d1=4, d2=2: total = (2+4+3)*4*2 - 4*4*2 = 72-32 = 40
+        assert_eq!(pad.total_pad_words(4, 4, 2), 40);
     }
 
     #[test]
     fn test_zero_pad_all_dimensions() {
-        // Matches aie-rt test: d0 before=2 after=3, d1 before=2 after=3, d2 before=3 after=3
+        // d0 before=2 after=3, d1 before=2 after=3, d2 before=3 after=3
         let pad = ZeroPadConfig {
             d0_before: 2,
             d0_after: 3,
@@ -759,11 +765,34 @@ mod tests {
             d2_before: 3,
             d2_after: 3,
         };
-        // d1=10, d2=1
-        // D0+D1 pad per D1 iter: (2+3) + (2+3) = 10
-        // Total D0+D1: 10 * 10 * 1 = 100
-        // D2 pad: (3+3) * 1 = 6
-        // Total: 100 + 6 = 106
-        assert_eq!(pad.total_pad_words(10, 1), 106);
+        // d0_size=8, d1=10, d2=1
+        // d0_wrap = 2+8+3 = 13
+        // d1_total = 2+10+3 = 15
+        // d2_total = 3+1+3 = 7
+        // total_output = 7 * 15 * 13 = 1365
+        // data = 8 * 10 * 1 = 80
+        // padding = 1365 - 80 = 1285
+        assert_eq!(pad.total_pad_words(8, 10, 1), 1285);
+    }
+
+    #[test]
+    fn test_zero_pad_add_12_i8_2d() {
+        // Matches the add_12_i8_using_2d_dma_op_with_padding test:
+        // d0_size=14 (56 i8 elements), d1_size=61, d2_size=1
+        // d0_before=1, d0_after=1, d1_before=2, d1_after=1
+        let pad = ZeroPadConfig {
+            d0_before: 1,
+            d0_after: 1,
+            d1_before: 2,
+            d1_after: 1,
+            ..Default::default()
+        };
+        // d0_wrap = 1+14+1 = 16
+        // d1_total = 2+61+1 = 64
+        // d2_total = 1
+        // total_output = 1 * 64 * 16 = 1024
+        // data = 14 * 61 * 1 = 854
+        // padding = 1024 - 854 = 170
+        assert_eq!(pad.total_pad_words(14, 61, 1), 170);
     }
 }
