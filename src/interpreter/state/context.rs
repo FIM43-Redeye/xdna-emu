@@ -1013,10 +1013,10 @@ impl ExecutionContext {
 
     /// Read a scalar register with VLIW semantics and load forwarding.
     ///
-    /// If a pending load from a **previous** bundle targets this register,
-    /// the pending value is forwarded (simulating hardware scoreboard stall).
-    /// Pending writes from the **current** bundle are excluded to preserve
-    /// VLIW read-before-write semantics.
+    /// If a pending load from a **previous** bundle targets this register
+    /// AND has reached its ready_cycle, the pending value is forwarded.
+    /// Pending writes from the **current** bundle or that haven't completed
+    /// their latency are excluded.
     ///
     /// If no forwarding applies, returns the snapshot value (inside a bundle)
     /// or the current live value (outside a bundle).
@@ -1066,16 +1066,29 @@ impl ExecutionContext {
 
     // === Load Forwarding ===
     //
-    // AIE2 has a hardware scoreboard that stalls the pipeline when an
-    // instruction reads a register with a pending load. Rather than
-    // modeling stall cycles (which requires precise per-stage tracking),
-    // we forward the pending value directly. This is functionally correct:
-    // the instruction sees the same value it would after the stall.
+    // AIE2 uses a write-back pipeline WITHOUT a hardware scoreboard.
+    // Loads queue a pending write with ready_cycle = issued_cycle + latency.
+    // The result is written back to the register file when commit_pending_writes()
+    // runs at the start of a future cycle whose cycle >= ready_cycle.
+    //
+    // Forwarding covers the window between ready_cycle and the next commit:
+    // if a load has completed its latency but commit hasn't run yet, the
+    // forwarding functions return the loaded value.
+    //
+    // Two conditions gate forwarding:
+    //   1. issued_cycle < current: excludes same-bundle writes (VLIW semantics)
+    //   2. ready_cycle <= current: respects load latency
+    //
+    // If code reads a register BEFORE its load's ready_cycle (within the
+    // latency window), forwarding returns None and the read falls through
+    // to the register file, returning the OLD value. This is correct --
+    // the compiler schedules around load latencies, and software-pipelined
+    // code intentionally reads "stale" values from previous iterations.
 
-    /// Forward a pending scalar load value if one exists from a previous bundle.
+    /// Forward a pending scalar load value if ready and from a previous bundle.
     fn forward_scalar(&self, reg: u8) -> Option<u32> {
         self.pending_writes.iter().rev().find_map(|pw| {
-            if pw.issued_cycle < self.cycles {
+            if pw.issued_cycle < self.cycles && pw.ready_cycle <= self.cycles {
                 if let Operand::ScalarReg(r) = &pw.dest {
                     if *r == reg { return Some(pw.scalar_value); }
                 }
@@ -1084,10 +1097,10 @@ impl ExecutionContext {
         })
     }
 
-    /// Forward a pending pointer load value if one exists from a previous bundle.
+    /// Forward a pending pointer load value if ready and from a previous bundle.
     fn forward_pointer(&self, reg: u8) -> Option<u32> {
         self.pending_writes.iter().rev().find_map(|pw| {
-            if pw.issued_cycle < self.cycles {
+            if pw.issued_cycle < self.cycles && pw.ready_cycle <= self.cycles {
                 if let Operand::PointerReg(r) = &pw.dest {
                     if *r == reg { return Some(pw.scalar_value); }
                 }
@@ -1096,10 +1109,10 @@ impl ExecutionContext {
         })
     }
 
-    /// Forward a pending modifier load value if one exists from a previous bundle.
+    /// Forward a pending modifier load value if ready and from a previous bundle.
     fn forward_modifier(&self, reg: u8) -> Option<u32> {
         self.pending_writes.iter().rev().find_map(|pw| {
-            if pw.issued_cycle < self.cycles {
+            if pw.issued_cycle < self.cycles && pw.ready_cycle <= self.cycles {
                 if let Operand::ModifierReg(r) = &pw.dest {
                     if *r == reg { return Some(pw.scalar_value); }
                 }
@@ -1644,28 +1657,31 @@ mod tests {
 
     #[test]
     fn test_scalar_load_forwarding_basic() {
-        // A scalar load queued at cycle 10 with latency 7 should be
-        // forwardable at cycles 11-16, committed at cycle 17.
+        // A scalar load queued at cycle 10 with latency 7 should NOT be
+        // forwardable before ready_cycle (17). Reads see the old value
+        // until the load completes.
         let mut ctx = ExecutionContext::new();
         ctx.scalar.write(5, 111);
 
         ctx.cycles = 10;
-        ctx.queue_scalar_load(Operand::ScalarReg(5), 222, 7);
+        ctx.queue_scalar_load(Operand::ScalarReg(5), 222, 7); // ready=17
 
-        // At cycle 11: not committed yet, but forward should work
+        // At cycle 11: load not ready -- read old value
         ctx.cycles = 11;
-        assert_eq!(ctx.scalar_read(5), 222,
-            "Forwarding should return pending load value");
-        // Live register is still old (not yet committed)
+        assert_eq!(ctx.scalar_read(5), 111,
+            "Before ready_cycle, should return old register value");
         assert_eq!(ctx.scalar.read(5), 111,
             "Live register should still have old value");
 
-        // At cycle 16: still pending, still forwarding
+        // At cycle 16: still pending, still not ready
         ctx.cycles = 16;
-        assert_eq!(ctx.scalar_read(5), 222);
+        assert_eq!(ctx.scalar_read(5), 111,
+            "Still before ready_cycle, should return old value");
 
-        // At cycle 17: commit should apply the write
+        // At cycle 17: ready -- forward then commit
         ctx.cycles = 17;
+        assert_eq!(ctx.scalar_read(5), 222,
+            "At ready_cycle, forwarding should return load value");
         ctx.commit_pending_writes();
         assert_eq!(ctx.scalar.read(5), 222,
             "After commit, live register should have new value");
@@ -1685,12 +1701,17 @@ mod tests {
         // Simulate: lda p7, [sp, #-32] loaded value 0x78000
         ctx.queue_scalar_load(Operand::PointerReg(7), 0x78000, 7);
 
-        // Before ready: forwarding should work
+        // Before ready_cycle: forwarding should NOT return the value
         ctx.cycles = 12;
-        assert_eq!(ctx.pointer_read(7), 0x78000,
-            "Pointer forwarding should return pending load value");
+        assert_eq!(ctx.pointer_read(7), 0xDEAD,
+            "Before ready_cycle, pointer_read should return old value");
         assert_eq!(ctx.pointer.read(7), 0xDEAD,
             "Live pointer register should still have old value");
+
+        // At ready_cycle: forwarding should work
+        ctx.cycles = 17;
+        assert_eq!(ctx.pointer_read(7), 0x78000,
+            "At ready_cycle, pointer forwarding should return pending load value");
 
         // After ready: commit should apply
         ctx.cycles = 17;
@@ -1707,11 +1728,17 @@ mod tests {
         ctx.cycles = 5;
         ctx.queue_scalar_load(Operand::ModifierReg(3), 0x20, 7);
 
+        // Before ready_cycle: should read old value
         ctx.cycles = 6;
-        assert_eq!(ctx.modifier_read(3), 0x20,
-            "Modifier forwarding should return pending value");
+        assert_eq!(ctx.modifier_read(3), 0x10,
+            "Before ready_cycle, modifier_read should return old value");
         assert_eq!(ctx.modifier.read(3), 0x10,
             "Live modifier should still have old value");
+
+        // At ready_cycle (5 + 7 = 12): forwarding should work
+        ctx.cycles = 12;
+        assert_eq!(ctx.modifier_read(3), 0x20,
+            "At ready_cycle, modifier forwarding should return pending value");
     }
 
     #[test]
@@ -1739,26 +1766,32 @@ mod tests {
         ctx.scalar.write(5, 0);
 
         ctx.cycles = 10;
-        ctx.queue_scalar_load(Operand::ScalarReg(5), 42, 3);
+        ctx.queue_scalar_load(Operand::ScalarReg(5), 42, 3); // ready=13
 
-        // Verify forwarding works before commit
+        // Before ready_cycle: forward should NOT return the value
+        // (load latency hasn't elapsed yet)
         ctx.cycles = 12;
-        assert_eq!(ctx.forward_scalar(5), Some(42));
+        assert_eq!(ctx.forward_scalar(5), None,
+            "Before ready_cycle, forward should not return pending value");
+        assert_eq!(ctx.scalar_read(5), 0,
+            "Before ready_cycle, scalar_read should return old value");
 
-        // Commit at ready_cycle
+        // At ready_cycle: forward should work
         ctx.cycles = 13;
-        ctx.commit_pending_writes();
+        assert_eq!(ctx.forward_scalar(5), Some(42),
+            "At ready_cycle, forward should return pending value");
 
-        // Forward should now return None (pending write drained)
+        // Commit drains it
+        ctx.commit_pending_writes();
         assert_eq!(ctx.forward_scalar(5), None);
-        // Value is in the live register
         assert_eq!(ctx.scalar.read(5), 42);
     }
 
     #[test]
     fn test_multiple_pending_loads_most_recent_wins() {
         // Two loads to the same register: later load's value should be
-        // forwarded (reverse iteration finds the last push first).
+        // forwarded only after its ready_cycle. Before that, reads see
+        // either the earlier load's value (if ready) or the old value.
         let mut ctx = ExecutionContext::new();
         ctx.scalar.write(5, 0);
 
@@ -1768,25 +1801,63 @@ mod tests {
         ctx.cycles = 12;
         ctx.queue_scalar_load(Operand::ScalarReg(5), 1002, 7); // ready=19
 
-        // At cycle 13: both pending, forward should return the LATER one
+        // At cycle 13: neither load is ready yet -- read old value
         ctx.cycles = 13;
-        assert_eq!(ctx.scalar_read(5), 1002,
-            "Most recently queued pending write should win forwarding");
+        assert_eq!(ctx.scalar_read(5), 0,
+            "Neither load ready yet, should read old register value");
 
-        // After first commits (cycle 17), second still pending
+        // At cycle 17: first load is ready, second is not -- forward first
         ctx.cycles = 17;
+        assert_eq!(ctx.forward_scalar(5), Some(1001),
+            "First load ready, second not yet -- should forward first");
+
+        // Commit at 17 drains first load
         ctx.commit_pending_writes();
         assert_eq!(ctx.scalar.read(5), 1001,
             "First load should have committed to live register");
-        // Forward still returns second (still pending)
-        assert_eq!(ctx.scalar_read(5), 1002,
-            "Second load should still be forwarded over committed first");
+        // Second still pending but not ready -- read committed value
+        assert_eq!(ctx.scalar_read(5), 1001,
+            "Second load not ready yet, should read committed first");
 
-        // After second commits (cycle 19), both done
+        // At cycle 19: second load ready -- forward it
         ctx.cycles = 19;
+        assert_eq!(ctx.forward_scalar(5), Some(1002),
+            "Second load now ready, should be forwarded");
+
         ctx.commit_pending_writes();
         assert_eq!(ctx.scalar.read(5), 1002,
             "Second load should overwrite first in live register");
+    }
+
+    #[test]
+    fn test_forwarding_software_pipeline_pattern() {
+        // Models the Chess software-pipelined byte store pattern from
+        // add_21_i8: loads with 7-cycle latency interleaved with stores
+        // of previous-iteration results. The pipeline relies on loads
+        // NOT being visible until ready_cycle, so stores write the OLD
+        // register value (from the previous iteration's computation).
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(24, 0); // r24 initially 0
+
+        // Iteration 0: compute r24 = old_val + 21
+        ctx.scalar.write(24, 42); // r24 = 21 + 21 = 42 (previous result)
+
+        // Cycle 100: lda.u8 r24, [p7] -- loads new byte (say 5)
+        ctx.cycles = 100;
+        ctx.queue_scalar_load(Operand::ScalarReg(24), 5, 7); // ready=107
+
+        // Cycles 101-106: the store of r24 should see 42 (old value),
+        // NOT 5 (the pending load value)
+        for c in 101..=106 {
+            ctx.cycles = c;
+            assert_eq!(ctx.scalar_read(24), 42,
+                "At cycle {c}, load not ready, must read old value 42");
+        }
+
+        // Cycle 107: load completes, r24 becomes 5
+        ctx.cycles = 107;
+        assert_eq!(ctx.scalar_read(24), 5,
+            "At ready_cycle 107, should forward new value 5");
     }
 
     #[test]
@@ -1803,6 +1874,10 @@ mod tests {
         assert_eq!(ctx.forward_pointer(5), None,
             "Forward should not match different register class");
     }
+
+    // =====================================================================
+    // Scoreboard Stall Detection Tests
+    // =====================================================================
 
     // =====================================================================
     // SP Register Isolation Tests
@@ -1893,23 +1968,29 @@ mod tests {
 
     #[test]
     fn test_forwarding_overrides_snapshot() {
-        // When a pending write exists from a previous bundle, forwarding
-        // should take priority over the snapshot value.
+        // When a pending write from a previous bundle has reached its
+        // ready_cycle, forwarding should take priority over the snapshot.
+        // Before ready_cycle, the snapshot (old) value is returned.
         let mut ctx = ExecutionContext::new();
         ctx.scalar.write(5, 333);
 
-        // Queue a load at cycle 10
+        // Queue a load at cycle 10, ready at 17
         ctx.cycles = 10;
         ctx.queue_scalar_load(Operand::ScalarReg(5), 444, 7);
 
         // At cycle 11: begin a new bundle (takes snapshot of 333)
+        // Load not ready yet -- snapshot value should be returned
         ctx.cycles = 11;
         ctx.begin_bundle();
+        assert_eq!(ctx.scalar_read(5), 333,
+            "Before ready_cycle, snapshot value should be returned");
+        ctx.end_bundle();
 
-        // scalar_read should return forwarded value, NOT snapshot
+        // At cycle 17: load is ready -- forwarding overrides snapshot
+        ctx.cycles = 17;
+        ctx.begin_bundle();
         assert_eq!(ctx.scalar_read(5), 444,
-            "Forwarding must override snapshot");
-
+            "At ready_cycle, forwarding must override snapshot");
         ctx.end_bundle();
     }
 
@@ -2040,18 +2121,19 @@ mod tests {
         // Simulate branch taken: delay by 1
         ctx.delay_pending_writes(1); // ready=18
 
-        // At cycle 17: should NOT be committed yet (was delayed)
+        // At cycle 17: should NOT be committed yet (was delayed to 18)
         ctx.cycles = 17;
         ctx.commit_pending_writes();
         assert_eq!(ctx.pointer.read(7), 0,
             "Delayed write should not commit at original ready_cycle");
+        // Forward also should not work (ready_cycle is 18)
+        assert_eq!(ctx.pointer_read(7), 0,
+            "Before delayed ready_cycle, forward should return old value");
 
-        // But forward should still work
-        assert_eq!(ctx.pointer_read(7), 0x78000,
-            "Forwarding should still work for delayed write");
-
-        // At cycle 18: should commit
+        // At cycle 18: ready -- forward and commit
         ctx.cycles = 18;
+        assert_eq!(ctx.pointer_read(7), 0x78000,
+            "At delayed ready_cycle, forward should return value");
         ctx.commit_pending_writes();
         assert_eq!(ctx.pointer.read(7), 0x78000);
     }
@@ -2094,13 +2176,15 @@ mod tests {
         ctx.cycles = 100;
         ctx.queue_scalar_load(Operand::PointerReg(7), 0x78000, 7); // ready=107
 
-        // Step 5: Before commit, forwarding should return the restored value
+        // Step 5: Before ready_cycle, read returns the clobbered value
         ctx.cycles = 101;
-        assert_eq!(ctx.pointer_read(7), 0x78000,
-            "Forward should return restored value");
+        assert_eq!(ctx.pointer_read(7), 0x70080,
+            "Before ready_cycle, should read clobbered sp value");
 
-        // After commit, live register should have restored value
+        // At ready_cycle (107), forward works and commit applies
         ctx.cycles = 107;
+        assert_eq!(ctx.pointer_read(7), 0x78000,
+            "At ready_cycle, forward should return restored value");
         ctx.commit_pending_writes();
         assert_eq!(ctx.pointer.read(7), 0x78000,
             "p7 should be restored to original value");
@@ -2125,25 +2209,22 @@ mod tests {
         // Step 2-3: Branch taken after delay slots
         ctx.delay_pending_writes(1); // ready=58
 
-        // Step 4: At branch target, reading p7 for mov p2, p7
+        // Step 4: At cycle 55 (before ready_cycle 58), reads old clobbered value
         ctx.cycles = 55;
-        let p7_value = ctx.pointer_read(7);
-        assert_eq!(p7_value, 0x78000,
-            "p7 should be forwarded from pending load at branch target");
+        assert_eq!(ctx.pointer_read(7), 0,
+            "Before ready_cycle, p7 should return old (clobbered) value");
+
+        // At ready_cycle 58: forwarding works
+        ctx.cycles = 58;
+        assert_eq!(ctx.pointer_read(7), 0x78000,
+            "At ready_cycle, p7 should be forwarded from pending load");
     }
 
     #[test]
     fn test_forwarding_does_not_return_stale_over_committed() {
-        // Edge case: if a pending write to reg X exists, and a LATER
-        // write to reg X has already been committed (because it had
-        // shorter latency), the forwarding should still return the
-        // pending value (because the pending load will eventually
-        // overwrite the committed value when it completes).
-        //
-        // This matches hardware behavior: on real silicon, the scoreboard
-        // would prevent the later write from executing until the load
-        // completes. In our forwarding model, we allow both writes and
-        // the pending load value represents the eventual correct state.
+        // Edge case: pending load to reg X, then a direct MOV to reg X.
+        // Before the load's ready_cycle, the MOV value is visible.
+        // After ready_cycle, the load value overwrites.
         let mut ctx = ExecutionContext::new();
 
         // Cycle 10: lda r5, [...] with latency 7 (ready=17)
@@ -2154,13 +2235,17 @@ mod tests {
         ctx.cycles = 12;
         ctx.scalar.write(5, 3001);
 
-        // At cycle 13: forward should return the pending load value
+        // At cycle 13: load not ready yet -- read the MOV value
         ctx.cycles = 13;
-        assert_eq!(ctx.scalar_read(5), 3002,
-            "Pending load should be forwarded even though MOV committed later");
+        assert_eq!(ctx.scalar_read(5), 3001,
+            "Before ready_cycle, MOV value should be visible");
 
-        // At cycle 17: load commits, overwrites MOV value
+        // At cycle 17: load ready -- forward overrides MOV
         ctx.cycles = 17;
+        assert_eq!(ctx.scalar_read(5), 3002,
+            "At ready_cycle, pending load should override MOV value");
+
+        // Commit applies the load to the register file
         ctx.commit_pending_writes();
         assert_eq!(ctx.scalar.read(5), 3002,
             "Load should overwrite the MOV value when committed");
@@ -2259,11 +2344,14 @@ mod tests {
         // === Phase 6: Back at caller (return point) ===
         ctx.cycles = 107;
         ctx.commit_pending_writes(); // p7 ready=108 > 107, NOT committed
-        // But forwarding should cover it:
-        assert_eq!(ctx.pointer_read(7), 0x78000,
-            "p7 forwarded at return point (not yet committed)");
+        // Before ready_cycle: reads old clobbered value
+        assert_eq!(ctx.pointer_read(7), 0x70040,
+            "Before ready_cycle, p7 should read clobbered value (from padda)");
 
+        // At ready_cycle 108: forward works and commit applies
         ctx.cycles = 108;
+        assert_eq!(ctx.pointer_read(7), 0x78000,
+            "At ready_cycle, p7 should be forwarded");
         ctx.commit_pending_writes(); // p7 ready=108 <= 108, COMMITTED!
         assert_eq!(ctx.pointer.read(7), 0x78000,
             "p7 committed in register file after return");

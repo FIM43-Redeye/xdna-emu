@@ -276,18 +276,23 @@ impl CycleAccurateExecutor {
         self.hazards.advance_to(ctx.cycles);
         self.memory.advance_to(ctx.cycles);
 
-        // Phase 1: Calculate stalls
+        // Phase 1: No scoreboard stalls
         //
-        // NOTE: Register hazard stalls and memory bank conflict stalls are
-        // currently DISABLED. The LLVM scheduler (Peano) produces code that
-        // already resolves data hazards via instruction scheduling -- it places
-        // enough independent instructions between a write and its dependent
-        // read to cover the pipeline latency. Adding scoreboard-based stalls
-        // on top of compiler-scheduled code produces incorrect timing: extra
-        // NOTE: Hazard stalls are disabled. The AIE2 scoreboard model needs
-        // precise per-stage tracking before stalls can be re-enabled. The
-        // compiler's schedule is trusted for now. See timing/hazards.rs for
-        // the detection infrastructure (recording is active for stats).
+        // AIE2 uses a write-back pipeline WITHOUT a hardware scoreboard.
+        // The compiler (Chess/Peano) is responsible for scheduling loads
+        // far enough ahead that no instruction reads the register before
+        // the load result is written back. If code reads a register with
+        // a pending load before ready_cycle, it gets the OLD value from
+        // the register file -- this is correct hardware behavior.
+        //
+        // Chess software-pipelined code RELIES on this: prolog stores
+        // intentionally read registers within the load latency window
+        // to capture the previous iteration's computed values, while the
+        // current iteration's load hasn't arrived yet.
+        //
+        // The forwarding functions (forward_scalar/pointer/modifier) in
+        // ExecutionContext enforce the ready_cycle check, returning the
+        // old register value when the load hasn't completed.
 
         // Phase 2: Execute all slot operations
         //

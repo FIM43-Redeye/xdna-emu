@@ -1920,13 +1920,15 @@ mod tests {
         assert_eq!(ctx.pointer.read(7), 0,
             "Load should not be committed immediately (latency pending)");
 
-        // But forwarding should work
+        // Before ready_cycle: read returns old value
         ctx.cycles = 101;
-        assert_eq!(ctx.pointer_read(7), 0x78000,
-            "Forward should return pending load value");
+        assert_eq!(ctx.pointer_read(7), 0,
+            "Before ready_cycle, should return old register value");
 
-        // Commit at ready_cycle
+        // At ready_cycle: forward works, then commit
         ctx.cycles = 100 + LATENCY_MEMORY as u64;
+        assert_eq!(ctx.pointer_read(7), 0x78000,
+            "At ready_cycle, forward should return pending load value");
         ctx.commit_pending_writes();
         assert_eq!(ctx.pointer.read(7), 0x78000,
             "After commit, p7 should have restored value");
@@ -1966,8 +1968,8 @@ mod tests {
         //   Cycle 12: commit p7 = sp           (latency 1)
         //   ... (function body, p7 used as frame pointer) ...
         //   Cycle 50: lda p7, [sp, #-32]       (restore, latency 7, ready=57)
-        //   Cycle 51: forwarding returns 0x78000
-        //   Cycle 55: mov p2, p7               (reads forwarded value = 0x78000)
+        //   Cycles 51-56: reads return clobbered sp value (load not ready)
+        //   Cycle 57: load ready, forwarding returns 0x78000
         use crate::interpreter::state::SP_PTR_INDEX;
 
         let mut ctx = make_ctx();
@@ -2006,19 +2008,20 @@ mod tests {
             .with_source(Operand::Memory { base: SP_PTR_INDEX, offset: -32 });
         MemoryUnit::execute(&load_op, &mut ctx, &mut tile, None);
 
-        // Cycle 51: Forward should return the restored value
+        // Cycle 51: load not ready -- read returns clobbered sp value
         ctx.cycles = 51;
-        assert_eq!(ctx.pointer_read(7), 0x78000,
-            "Forwarding should return restored p7 value");
+        assert_eq!(ctx.pointer_read(7), 0x70060,
+            "Before ready_cycle, should read clobbered sp value");
 
-        // Cycle 55: Simulate mov p2, p7 in delay slot
+        // Cycle 55: still not ready
         ctx.cycles = 55;
-        let p7_for_p2 = ctx.pointer_read(7);
-        assert_eq!(p7_for_p2, 0x78000,
-            "p7 should be forwarded correctly for mov p2, p7");
+        assert_eq!(ctx.pointer_read(7), 0x70060,
+            "Still before ready_cycle, should read clobbered sp value");
 
-        // Cycle 57: Commit the load
+        // Cycle 57: load ready -- forward returns restored value, then commit
         ctx.cycles = 57;
+        assert_eq!(ctx.pointer_read(7), 0x78000,
+            "At ready_cycle, forwarding should return restored p7 value");
         ctx.commit_pending_writes();
         assert_eq!(ctx.pointer.read(7), 0x78000,
             "p7 should be committed to restored value");
