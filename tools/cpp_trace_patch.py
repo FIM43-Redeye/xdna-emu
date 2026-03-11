@@ -323,29 +323,37 @@ class _DirectCallPoints:
     last_bo_end: int
     kernel_call_close_paren: int
     wait_end: int
-    next_group_id: int
+    trace_group_id: int
     kernel_name: str
 
 
 @dataclass
 class _SetArgPoints:
-    """Injection via set_arg: run.set_arg(N+1, bo_trace)."""
+    """Injection via set_arg: run.set_arg(N, bo_trace)."""
     last_bo_end: int
     last_set_arg_end: int
-    next_arg_index: int
+    trace_set_arg_index: int
     wait_end: int
-    next_group_id: int
+    trace_group_id: int
     kernel_name: str
     run_var: str
 
 
 def _find_insertion_points(
     source_bytes: bytes,
+    trace_arg_index: int | None = None,
 ) -> _DirectCallPoints | _SetArgPoints:
     """Parse the source and locate injection points.
 
     Tries direct-call pattern first, falls back to set_arg pattern.
     Raises PatchError if neither pattern is found.
+
+    Args:
+        trace_arg_index: The kernel argument index for the trace buffer,
+            derived from the compiled xclbin (trace_ddr_id + 3).  When
+            provided, this is used as both the group_id for BO allocation
+            and the set_arg index.  When None, falls back to heuristics
+            (max existing group_id + 1, or argument count).
     """
     tree = _PARSER.parse(source_bytes)
     root = tree.root_node
@@ -368,9 +376,6 @@ def _find_insertion_points(
     # 3. Try direct-call pattern first: kernel(opcode, ...)
     kernel_call, kernel_name = _find_kernel_call(root, source_bytes)
     if kernel_call is not None:
-        group_ids = _extract_group_ids(root, source_bytes, kernel_name)
-        next_id = max(group_ids) + 1 if group_ids else 1
-
         arg_list = None
         for child in kernel_call.children:
             if child.type == "argument_list":
@@ -383,20 +388,26 @@ def _find_insertion_points(
         close_paren = arg_list.children[-1]
         assert close_paren.type == ")", f"Expected ')' but got {close_paren.type}"
 
+        # Determine group_id: prefer trace_arg_index from xclbin metadata,
+        # fall back to counting arguments in the call (call position = arg
+        # index on NPU where all data slots share the HOST bank).
+        if trace_arg_index is not None:
+            gid = trace_arg_index
+        else:
+            arg_count = len(arg_list.named_children)
+            gid = arg_count  # bo_trace will be at this position
+
         return _DirectCallPoints(
             last_bo_end=last_bo.end_byte,
             kernel_call_close_paren=close_paren.start_byte,
             wait_end=wait_stmt.end_byte,
-            next_group_id=next_id,
+            trace_group_id=gid,
             kernel_name=kernel_name,
         )
 
     # 4. Try set_arg pattern: xrt::run(kernel) + run.set_arg(N, ...)
     run_var, kernel_name = _find_xrt_run_constructor(root, source_bytes)
     if run_var is not None and kernel_name is not None:
-        group_ids = _extract_group_ids(root, source_bytes, kernel_name)
-        next_id = max(group_ids) + 1 if group_ids else 1
-
         last_set_arg_stmt, max_idx = _find_last_set_arg(
             root, source_bytes, run_var
         )
@@ -406,12 +417,24 @@ def _find_insertion_points(
                 f"{run_var}.set_arg() calls."
             )
 
+        # Determine the set_arg index and group_id for the trace BO.
+        # With trace_arg_index from xclbin metadata, use the exact slot
+        # (overrides any padding at that index via a later set_arg call).
+        # Without metadata, append after the last existing set_arg.
+        if trace_arg_index is not None:
+            sa_idx = trace_arg_index
+            gid = trace_arg_index
+        else:
+            sa_idx = max_idx + 1
+            group_ids = _extract_group_ids(root, source_bytes, kernel_name)
+            gid = max(group_ids) + 1 if group_ids else sa_idx
+
         return _SetArgPoints(
             last_bo_end=last_bo.end_byte,
             last_set_arg_end=last_set_arg_stmt.end_byte,
-            next_arg_index=max_idx + 1,
+            trace_set_arg_index=sa_idx,
             wait_end=wait_stmt.end_byte,
-            next_group_id=next_id,
+            trace_group_id=gid,
             kernel_name=kernel_name,
             run_var=run_var,
         )
@@ -423,7 +446,11 @@ def _find_insertion_points(
     )
 
 
-def patch_test_cpp(source: str, trace_size: int = 1048576) -> str:
+def patch_test_cpp(
+    source: str,
+    trace_size: int = 1048576,
+    trace_arg_index: int | None = None,
+) -> str:
     """Apply trace buffer injection transforms to a test.cpp source.
 
     Applies three transforms:
@@ -436,6 +463,10 @@ def patch_test_cpp(source: str, trace_size: int = 1048576) -> str:
     Args:
         source: The C++ source code as a string.
         trace_size: Size of the trace buffer in bytes (default: 1MB).
+        trace_arg_index: Kernel argument index for the trace buffer,
+            derived from the xclbin (trace_ddr_id + 3).  Determines
+            the group_id for BO allocation and the set_arg index.
+            When None, falls back to heuristics.
 
     Returns:
         The transformed source code.
@@ -451,21 +482,14 @@ def patch_test_cpp(source: str, trace_size: int = 1048576) -> str:
     if "injected by trace-prepare.py" in source:
         return source
 
-    # Skip xrt::ext::kernel tests.  The ext API uses a different BO mapping
-    # model (positional, no group_id) that is incompatible with our trace BO
-    # injection.  Allocating with kernel.group_id(N) creates a bank mismatch
-    # when XRT maps the BO by argument position, causing IOMMU page faults.
-    if "xrt::ext::kernel" in source:
-        return source
-
     source_bytes = source.encode("utf-8")
-    points = _find_insertion_points(source_bytes)
+    points = _find_insertion_points(source_bytes, trace_arg_index)
 
     # Build the trace buffer allocation snippet (same for both modes).
     trace_bo_snippet = _TRACE_BO_TEMPLATE.format(
         trace_size=trace_size,
         trace_size_comment=_human_size(trace_size),
-        next_id=points.next_group_id,
+        next_id=points.trace_group_id,
         kernel_name=points.kernel_name,
     )
 
@@ -492,9 +516,13 @@ def patch_test_cpp(source: str, trace_size: int = 1048576) -> str:
         writeout = _TRACE_WRITEOUT_TEMPLATE.encode("utf-8")
         result[points.wait_end:points.wait_end] = writeout
 
-        # 2. Insert set_arg for trace buffer after last set_arg
+        # 2. Insert set_arg for trace buffer after last set_arg.
+        # Uses trace_set_arg_index (from xclbin metadata or heuristic).
+        # If a padding set_arg already exists at this index, the later
+        # call overrides it (XRT uses the last value for each index).
         set_arg_line = (
-            f"\n  {points.run_var}.set_arg({points.next_arg_index}, bo_trace);"
+            f"\n  {points.run_var}.set_arg("
+            f"{points.trace_set_arg_index}, bo_trace);"
         ).encode("utf-8")
         result[points.last_set_arg_end:points.last_set_arg_end] = set_arg_line
 

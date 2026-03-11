@@ -119,6 +119,8 @@ def prepare_trace(
 
     # -- MLIR preparation ---------------------------------------------------
 
+    manifest_partial = None  # set by MLIR injection below; None when skipped
+
     if not skip_mlir:
         # Import trace_inject as a library.  The file is named with a
         # hyphen (trace-inject.py), so we use importlib for the import.
@@ -220,8 +222,22 @@ def prepare_trace(
             print(f"FAIL {test_name}: {msg}", file=sys.stderr)
             return 1
 
+        # Compute the kernel argument index for the trace buffer from the
+        # MLIR metadata.  trace_ddr_id is the runtime_sequence position;
+        # the kernel arg index is offset by 3 (opcode, instr BO, instr count).
+        # When --skip-mlir is used, manifest_partial is None -> falls back
+        # to heuristic in the patcher.
+        trace_arg_index = None
+        if manifest_partial is not None:
+            trace_ddr_id = manifest_partial.get("trace_ddr_id")
+            if trace_ddr_id is not None:
+                trace_arg_index = trace_ddr_id + 3
+
         try:
-            cpp_source = patch_test_cpp(cpp_source, trace_size=trace_size)
+            cpp_source = patch_test_cpp(
+                cpp_source, trace_size=trace_size,
+                trace_arg_index=trace_arg_index,
+            )
         except PatchError as e:
             msg = f"FAIL C++ patching: {e}"
             write_status(output_dir, msg)

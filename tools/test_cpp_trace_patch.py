@@ -64,18 +64,17 @@ class TestTraceBufferAllocation:
         map_pos = result.index("void *bufInstr = bo_instr.map<void *>()")
         assert trace_pos < map_pos
 
-    def test_next_group_id_computed(self):
+    def test_group_id_from_arg_count(self):
+        """Without trace_arg_index, group_id = call arg count (position)."""
         result = patch_test_cpp(MINIMAL_CPP)
-        # Existing group_ids are 1, 3, 5 -> max is 5, next is 6
-        assert "kernel.group_id(6)" in result
+        # kernel(opcode, bo_instr, 256, bo_in, bo_out) has 5 args,
+        # so bo_trace goes at position 5 -> group_id(5)
+        assert "kernel.group_id(5)" in result
 
-    def test_next_group_id_dense(self):
-        """Dense group_id allocation (0, 1, 2) -> next is 3."""
-        cpp = MINIMAL_CPP.replace("group_id(1)", "group_id(0)")
-        cpp = cpp.replace("group_id(3)", "group_id(1)")
-        cpp = cpp.replace("group_id(5)", "group_id(2)")
-        result = patch_test_cpp(cpp)
-        assert "kernel.group_id(3)" in result
+    def test_group_id_from_trace_arg_index(self):
+        """With trace_arg_index, group_id uses the exact value."""
+        result = patch_test_cpp(MINIMAL_CPP, trace_arg_index=6)
+        assert "kernel.group_id(6)" in result
 
     def test_trace_size_default(self):
         result = patch_test_cpp(MINIMAL_CPP)
@@ -168,17 +167,52 @@ class TestAlreadyTracedSkip:
         assert "auto bo_trace = xrt::bo(" in result  # patched, not skipped
 
 
-class TestExtKernelSkip:
-    """xrt::ext::kernel tests are skipped (incompatible BO mapping)."""
+class TestTraceArgIndex:
+    """trace_arg_index from xclbin metadata controls group_id and set_arg."""
 
-    def test_skip_ext_kernel(self):
-        """Files using xrt::ext::kernel are returned unchanged."""
+    def test_ext_kernel_patched_with_correct_group_id(self):
+        """ext::kernel tests work when trace_arg_index is provided.
+
+        Previously these were skipped because the heuristic defaulted to
+        group_id(1) (SRAM bank).  With trace_arg_index, group_id matches
+        the xclbin connectivity (HOST bank).
+        """
         src = MINIMAL_CPP.replace(
             'auto kernel = xrt::kernel(context, "test");',
             'auto kernel = xrt::ext::kernel(context, mod, "test");',
         )
-        result = patch_test_cpp(src)
-        assert result == src
+        result = patch_test_cpp(src, trace_arg_index=6)
+        assert "kernel.group_id(6)" in result
+        assert "auto bo_trace = xrt::bo(" in result
+
+    def test_set_arg_uses_trace_arg_index(self):
+        """set_arg pattern uses trace_arg_index instead of max+1."""
+        src = """\
+#include <iostream>
+#include "xrt/xrt_bo.h"
+#include "xrt/xrt_kernel.h"
+int main() {
+  auto device = xrt::device(0);
+  auto kernel = xrt::kernel(context, "test");
+  auto bo_out = xrt::bo(device, 256,
+                        XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(4));
+  xrt::run run0 = xrt::run(kernel);
+  run0.set_arg(0, 3);
+  run0.set_arg(3, bo_out);
+  run0.set_arg(4, 0);
+  run0.set_arg(5, 0);
+  run0.set_arg(6, 0);
+  run0.set_arg(7, 0);
+  run0.wait();
+  bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  return 0;
+}
+"""
+        # trace_arg_index=5 means trace goes at set_arg(5), overriding
+        # the padding set_arg(5, 0) that came earlier.
+        result = patch_test_cpp(src, trace_arg_index=5)
+        assert "run0.set_arg(5, bo_trace);" in result
+        assert "kernel.group_id(5)" in result
 
 
 class TestPatchError:
@@ -229,11 +263,11 @@ int main() {
 
 
 class TestExtKernelPattern:
-    """Tests using xrt::ext::kernel are skipped (incompatible BO mapping).
+    """xrt::ext::kernel tests work with trace_arg_index from xclbin metadata.
 
-    The ext API uses positional argument mapping with no group_id, so our
-    trace BO injection (which relies on group_id) would cause bank mismatches
-    and IOMMU page faults.
+    Without trace_arg_index, the fallback uses call arg count which maps to
+    the correct HOST bank position.  With trace_arg_index, the exact kernel
+    arg slot is used.
     """
 
     EXT_CPP = """\
@@ -264,7 +298,14 @@ int main(int argc, const char *argv[]) {
 }
 """
 
-    def test_ext_kernel_skipped(self):
-        """ext::kernel files are returned unchanged -- no trace injection."""
+    def test_ext_kernel_patched_with_arg_index(self):
+        """ext::kernel patched correctly with trace_arg_index from xclbin."""
+        result = patch_test_cpp(self.EXT_CPP, trace_arg_index=6)
+        assert "kernel.group_id(6)" in result
+        assert "bo_out, bo_trace)" in result
+
+    def test_ext_kernel_fallback_uses_arg_count(self):
+        """Without trace_arg_index, falls back to call arg count."""
         result = patch_test_cpp(self.EXT_CPP)
-        assert result == self.EXT_CPP
+        # kernel(opcode, 0, 0, bo_inA, bo_out) = 5 args -> group_id(5)
+        assert "kernel.group_id(5)" in result
