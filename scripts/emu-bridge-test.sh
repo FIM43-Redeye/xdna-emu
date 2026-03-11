@@ -678,6 +678,37 @@ compile_one_compiler() {
     fi
   fi
 
+  # For multi-step builds with tracing active, secondary aiecc commands
+  # (those that generate auxiliary artifacts such as control packets and
+  # transaction binaries rather than the xclbin) should use the original
+  # untraced MLIR so that trace instrumentation does not contaminate them.
+  # Count aiecc steps first to determine whether this applies.
+  local aiecc_count=0
+  while IFS= read -r _cmd; do
+    [[ "$_cmd" == *aiecc.py* ]] && aiecc_count=$((aiecc_count + 1)) || true
+  done < <(extract_build_commands "$lit_file" "$src_dir")
+
+  # When tracing is active, multiple aiecc steps exist, and the original
+  # MLIR is available in the source directory, copy it (with NPUDEVICE
+  # substituted) as aie_arch_orig.mlir for use by secondary aiecc steps.
+  local orig_mlir_available=false
+  if [[ "$TRACE_OK" == "true" ]] && [[ $aiecc_count -gt 1 ]] \
+      && [[ -f "$src_dir/aie.mlir" ]]; then
+    local need_orig_copy=false
+    if [[ "$FORCE_COMPILE" == "true" ]]; then
+      need_orig_copy=true
+    elif [[ ! -f "$build_dir/aie_arch_orig.mlir" ]]; then
+      need_orig_copy=true
+    elif [[ "$src_dir/aie.mlir" -nt "$build_dir/aie_arch_orig.mlir" ]]; then
+      need_orig_copy=true
+    fi
+    if $need_orig_copy; then
+      cp "$src_dir/aie.mlir" "$build_dir/aie_arch_orig.mlir"
+      sed "s/NPUDEVICE/${npu_dev}/g" -i "$build_dir/aie_arch_orig.mlir"
+    fi
+    orig_mlir_available=true
+  fi
+
   # Check cache -- must come AFTER traced MLIR substitution so that
   # the cache is invalidated when the MLIR has changed (e.g., tracing
   # was enabled on a previously-compiled test).
@@ -700,6 +731,12 @@ compile_one_compiler() {
     return 0
   fi
 
+  # Run all build steps in order: aie-opt, aiecc (one or more), aie-translate.
+  # The first aiecc command (which produces the xclbin) uses the traced MLIR
+  # (aie_arch.mlir).  Subsequent aiecc commands use the original untraced MLIR
+  # (aie_arch_orig.mlir, if available) so that trace instrumentation does not
+  # contaminate auxiliary artifacts such as control packets and txn binaries.
+  local first_aiecc_done=false
   local failed=false
   while IFS= read -r cmd; do
     [[ -z "$cmd" ]] && continue
@@ -707,10 +744,15 @@ compile_one_compiler() {
     [[ "$cmd" == *clang*test.cpp* ]] && continue
     [[ "$cmd" == *g++*test.cpp* ]] && continue
 
-    # Fix MLIR path references
+    # Fix MLIR path references for aiecc commands.
     if [[ "$cmd" == *aiecc.py* ]]; then
       cmd="${cmd//$src_dir\/aie.mlir/./aie_arch.mlir}"
       cmd="${cmd//\.\/aie.mlir/./aie_arch.mlir}"
+      # Secondary aiecc steps (post-xclbin) use original MLIR when available.
+      if $first_aiecc_done && $orig_mlir_available; then
+        cmd="${cmd//aie_arch.mlir/aie_arch_orig.mlir}"
+      fi
+      first_aiecc_done=true
     fi
 
     # Transform command for this compiler
