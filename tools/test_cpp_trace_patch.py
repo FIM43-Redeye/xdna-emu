@@ -168,6 +168,19 @@ class TestAlreadyTracedSkip:
         assert "auto bo_trace = xrt::bo(" in result  # patched, not skipped
 
 
+class TestExtKernelSkip:
+    """xrt::ext::kernel tests are skipped (incompatible BO mapping)."""
+
+    def test_skip_ext_kernel(self):
+        """Files using xrt::ext::kernel are returned unchanged."""
+        src = MINIMAL_CPP.replace(
+            'auto kernel = xrt::kernel(context, "test");',
+            'auto kernel = xrt::ext::kernel(context, mod, "test");',
+        )
+        result = patch_test_cpp(src)
+        assert result == src
+
+
 class TestPatchError:
     """PatchError raised when insertion points cannot be found."""
 
@@ -216,7 +229,12 @@ int main() {
 
 
 class TestExtKernelPattern:
-    """Tests using xrt::ext::kernel (no group_id on BOs)."""
+    """Tests using xrt::ext::kernel are skipped (incompatible BO mapping).
+
+    The ext API uses positional argument mapping with no group_id, so our
+    trace BO injection (which relies on group_id) would cause bank mismatches
+    and IOMMU page faults.
+    """
 
     EXT_CPP = """\
 #include <cstdint>
@@ -246,22 +264,7 @@ int main(int argc, const char *argv[]) {
 }
 """
 
-    def test_ext_kernel_bo_trace_inserted(self):
+    def test_ext_kernel_skipped(self):
+        """ext::kernel files are returned unchanged -- no trace injection."""
         result = patch_test_cpp(self.EXT_CPP)
-        assert "auto bo_trace = xrt::bo(" in result
-
-    def test_ext_kernel_no_group_id_uses_default(self):
-        """When no group_id calls exist, use a reasonable default (1)."""
-        result = patch_test_cpp(self.EXT_CPP)
-        # ext::bo has no group_id, so the trace bo should use group_id(1)
-        # (default fallback since no existing group_ids to max over)
-        assert "kernel.group_id(" in result
-
-    def test_ext_kernel_call_patched(self):
-        result = patch_test_cpp(self.EXT_CPP)
-        assert "bo_out, bo_trace)" in result
-
-    def test_ext_kernel_wait2_handled(self):
-        result = patch_test_cpp(self.EXT_CPP)
-        # run.wait2() should be found as the wait point
-        assert 'std::getenv("XDNA_TRACE_DIR")' in result
+        assert result == self.EXT_CPP

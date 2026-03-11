@@ -451,6 +451,13 @@ def patch_test_cpp(source: str, trace_size: int = 1048576) -> str:
     if "injected by trace-prepare.py" in source:
         return source
 
+    # Skip xrt::ext::kernel tests.  The ext API uses a different BO mapping
+    # model (positional, no group_id) that is incompatible with our trace BO
+    # injection.  Allocating with kernel.group_id(N) creates a bank mismatch
+    # when XRT maps the BO by argument position, causing IOMMU page faults.
+    if "xrt::ext::kernel" in source:
+        return source
+
     source_bytes = source.encode("utf-8")
     points = _find_insertion_points(source_bytes)
 
