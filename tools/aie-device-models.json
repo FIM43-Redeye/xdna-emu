@@ -10,8 +10,6 @@
       "local_memory_size": 65536,
       "mem_tile_size": 524288,
       "num_mem_tile_rows": 1,
-      "max_lock_value": 63,
-      "address_gen_granularity": 32,
       "column_shift": 25,
       "row_shift": 20,
       "mem_base_addresses": {
@@ -24,12 +22,10 @@
         "shim_noc": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             1,
             0
           ],
-          "bank_size": 16384,
           "switchbox_ports": {
             "FIFO": {
               "master": 1,
@@ -74,12 +70,10 @@
         "mem_tile": {
           "num_locks": 64,
           "num_bds": 48,
-          "num_banks": 8,
           "representative": [
             1,
             1
           ],
-          "bank_size": 65536,
           "switchbox_ports": {
             "DMA": {
               "master": 6,
@@ -106,12 +100,10 @@
         "core": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             1,
             2
           ],
-          "bank_size": 16384,
           "program_memory_size": 16384,
           "switchbox_ports": {
             "Core": {
@@ -548,8 +540,6 @@
       "local_memory_size": 65536,
       "mem_tile_size": 524288,
       "num_mem_tile_rows": 1,
-      "max_lock_value": 63,
-      "address_gen_granularity": 32,
       "column_shift": 25,
       "row_shift": 20,
       "mem_base_addresses": {
@@ -562,12 +552,10 @@
         "shim_noc": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             0,
             0
           ],
-          "bank_size": 16384,
           "switchbox_ports": {
             "FIFO": {
               "master": 1,
@@ -604,12 +592,10 @@
         "mem_tile": {
           "num_locks": 64,
           "num_bds": 48,
-          "num_banks": 8,
           "representative": [
             0,
             1
           ],
-          "bank_size": 65536,
           "switchbox_ports": {
             "DMA": {
               "master": 6,
@@ -636,12 +622,10 @@
         "core": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             0,
             2
           ],
-          "bank_size": 16384,
           "program_memory_size": 16384,
           "switchbox_ports": {
             "Core": {
@@ -782,8 +766,6 @@
       "local_memory_size": 65536,
       "mem_tile_size": 524288,
       "num_mem_tile_rows": 1,
-      "max_lock_value": 63,
-      "address_gen_granularity": 32,
       "column_shift": 25,
       "row_shift": 20,
       "mem_base_addresses": {
@@ -796,12 +778,10 @@
         "shim_noc": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             0,
             0
           ],
-          "bank_size": 16384,
           "switchbox_ports": {
             "FIFO": {
               "master": 1,
@@ -842,12 +822,10 @@
         "mem_tile": {
           "num_locks": 64,
           "num_bds": 48,
-          "num_banks": 8,
           "representative": [
             0,
             1
           ],
-          "bank_size": 65536,
           "switchbox_ports": {
             "DMA": {
               "master": 6,
@@ -874,12 +852,10 @@
         "core": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             0,
             2
           ],
-          "bank_size": 16384,
           "program_memory_size": 16384,
           "switchbox_ports": {
             "Core": {
@@ -1120,8 +1096,6 @@
       "local_memory_size": 65536,
       "mem_tile_size": 524288,
       "num_mem_tile_rows": 1,
-      "max_lock_value": 63,
-      "address_gen_granularity": 32,
       "column_shift": 25,
       "row_shift": 20,
       "mem_base_addresses": {
@@ -1134,12 +1108,10 @@
         "shim_noc": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             1,
             0
           ],
-          "bank_size": 16384,
           "switchbox_ports": {
             "FIFO": {
               "master": 1,
@@ -1184,12 +1156,10 @@
         "mem_tile": {
           "num_locks": 64,
           "num_bds": 48,
-          "num_banks": 8,
           "representative": [
             1,
             1
           ],
-          "bank_size": 65536,
           "switchbox_ports": {
             "DMA": {
               "master": 6,
@@ -1216,12 +1186,10 @@
         "core": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             1,
             2
           ],
-          "bank_size": 16384,
           "program_memory_size": 16384,
           "switchbox_ports": {
             "Core": {
@@ -1562,8 +1530,6 @@
       "local_memory_size": 65536,
       "mem_tile_size": 524288,
       "num_mem_tile_rows": 1,
-      "max_lock_value": 63,
-      "address_gen_granularity": 32,
       "column_shift": 25,
       "row_shift": 20,
       "mem_base_addresses": {
@@ -1576,12 +1542,10 @@
         "shim_noc": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             1,
             0
           ],
-          "bank_size": 16384,
           "switchbox_ports": {
             "FIFO": {
               "master": 1,
@@ -1626,12 +1590,10 @@
         "mem_tile": {
           "num_locks": 64,
           "num_bds": 48,
-          "num_banks": 8,
           "representative": [
             1,
             1
           ],
-          "bank_size": 65536,
           "switchbox_ports": {
             "DMA": {
               "master": 6,
@@ -1658,12 +1620,10 @@
         "core": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             1,
             2
           ],
-          "bank_size": 16384,
           "program_memory_size": 16384,
           "switchbox_ports": {
             "Core": {
@@ -2484,8 +2444,6 @@
       "local_memory_size": 65536,
       "mem_tile_size": 524288,
       "num_mem_tile_rows": 1,
-      "max_lock_value": 63,
-      "address_gen_granularity": 32,
       "column_shift": 25,
       "row_shift": 20,
       "mem_base_addresses": {
@@ -2498,12 +2456,10 @@
         "shim_noc": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             0,
             0
           ],
-          "bank_size": 16384,
           "switchbox_ports": {
             "FIFO": {
               "master": 1,
@@ -2540,12 +2496,10 @@
         "mem_tile": {
           "num_locks": 64,
           "num_bds": 48,
-          "num_banks": 8,
           "representative": [
             0,
             1
           ],
-          "bank_size": 65536,
           "switchbox_ports": {
             "DMA": {
               "master": 6,
@@ -2572,12 +2526,10 @@
         "core": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             0,
             2
           ],
-          "bank_size": 16384,
           "program_memory_size": 16384,
           "switchbox_ports": {
             "Core": {
@@ -2718,8 +2670,6 @@
       "local_memory_size": 65536,
       "mem_tile_size": 524288,
       "num_mem_tile_rows": 1,
-      "max_lock_value": 63,
-      "address_gen_granularity": 32,
       "column_shift": 25,
       "row_shift": 20,
       "mem_base_addresses": {
@@ -2732,12 +2682,10 @@
         "shim_noc": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             0,
             0
           ],
-          "bank_size": 16384,
           "switchbox_ports": {
             "FIFO": {
               "master": 1,
@@ -2778,12 +2726,10 @@
         "mem_tile": {
           "num_locks": 64,
           "num_bds": 48,
-          "num_banks": 8,
           "representative": [
             0,
             1
           ],
-          "bank_size": 65536,
           "switchbox_ports": {
             "DMA": {
               "master": 6,
@@ -2810,12 +2756,10 @@
         "core": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             0,
             2
           ],
-          "bank_size": 16384,
           "program_memory_size": 16384,
           "switchbox_ports": {
             "Core": {
@@ -3056,8 +3000,6 @@
       "local_memory_size": 65536,
       "mem_tile_size": 524288,
       "num_mem_tile_rows": 1,
-      "max_lock_value": 63,
-      "address_gen_granularity": 32,
       "column_shift": 25,
       "row_shift": 20,
       "mem_base_addresses": {
@@ -3070,12 +3012,10 @@
         "shim_noc": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             1,
             0
           ],
-          "bank_size": 16384,
           "switchbox_ports": {
             "FIFO": {
               "master": 1,
@@ -3120,12 +3060,10 @@
         "mem_tile": {
           "num_locks": 64,
           "num_bds": 48,
-          "num_banks": 8,
           "representative": [
             1,
             1
           ],
-          "bank_size": 65536,
           "switchbox_ports": {
             "DMA": {
               "master": 6,
@@ -3152,12 +3090,10 @@
         "core": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             1,
             2
           ],
-          "bank_size": 16384,
           "program_memory_size": 16384,
           "switchbox_ports": {
             "Core": {
@@ -3498,8 +3434,6 @@
       "local_memory_size": 65536,
       "mem_tile_size": 524288,
       "num_mem_tile_rows": 1,
-      "max_lock_value": 63,
-      "address_gen_granularity": 32,
       "column_shift": 25,
       "row_shift": 20,
       "mem_base_addresses": {
@@ -3512,12 +3446,10 @@
         "shim_noc": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             1,
             0
           ],
-          "bank_size": 16384,
           "switchbox_ports": {
             "FIFO": {
               "master": 1,
@@ -3562,12 +3494,10 @@
         "mem_tile": {
           "num_locks": 64,
           "num_bds": 48,
-          "num_banks": 8,
           "representative": [
             1,
             1
           ],
-          "bank_size": 65536,
           "switchbox_ports": {
             "DMA": {
               "master": 6,
@@ -3594,12 +3524,10 @@
         "core": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             1,
             2
           ],
-          "bank_size": 16384,
           "program_memory_size": 16384,
           "switchbox_ports": {
             "Core": {
@@ -4036,8 +3964,6 @@
       "local_memory_size": 65536,
       "mem_tile_size": 524288,
       "num_mem_tile_rows": 1,
-      "max_lock_value": 63,
-      "address_gen_granularity": 32,
       "column_shift": 25,
       "row_shift": 20,
       "mem_base_addresses": {
@@ -4050,12 +3976,10 @@
         "shim_noc": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             1,
             0
           ],
-          "bank_size": 16384,
           "switchbox_ports": {
             "FIFO": {
               "master": 1,
@@ -4100,12 +4024,10 @@
         "mem_tile": {
           "num_locks": 64,
           "num_bds": 48,
-          "num_banks": 8,
           "representative": [
             1,
             1
           ],
-          "bank_size": 65536,
           "switchbox_ports": {
             "DMA": {
               "master": 6,
@@ -4132,12 +4054,10 @@
         "core": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             1,
             2
           ],
-          "bank_size": 16384,
           "program_memory_size": 16384,
           "switchbox_ports": {
             "Core": {
@@ -4670,8 +4590,6 @@
       "local_memory_size": 65536,
       "mem_tile_size": 524288,
       "num_mem_tile_rows": 1,
-      "max_lock_value": 63,
-      "address_gen_granularity": 32,
       "column_shift": 25,
       "row_shift": 20,
       "mem_base_addresses": {
@@ -4684,12 +4602,10 @@
         "shim_noc": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             1,
             0
           ],
-          "bank_size": 16384,
           "switchbox_ports": {
             "FIFO": {
               "master": 1,
@@ -4734,12 +4650,10 @@
         "mem_tile": {
           "num_locks": 64,
           "num_bds": 48,
-          "num_banks": 8,
           "representative": [
             1,
             1
           ],
-          "bank_size": 65536,
           "switchbox_ports": {
             "DMA": {
               "master": 6,
@@ -4766,12 +4680,10 @@
         "core": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             1,
             2
           ],
-          "bank_size": 16384,
           "program_memory_size": 16384,
           "switchbox_ports": {
             "Core": {
@@ -5400,8 +5312,6 @@
       "local_memory_size": 65536,
       "mem_tile_size": 524288,
       "num_mem_tile_rows": 1,
-      "max_lock_value": 63,
-      "address_gen_granularity": 32,
       "column_shift": 25,
       "row_shift": 20,
       "mem_base_addresses": {
@@ -5414,12 +5324,10 @@
         "shim_noc": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             1,
             0
           ],
-          "bank_size": 16384,
           "switchbox_ports": {
             "FIFO": {
               "master": 1,
@@ -5464,12 +5372,10 @@
         "mem_tile": {
           "num_locks": 64,
           "num_bds": 48,
-          "num_banks": 8,
           "representative": [
             1,
             1
           ],
-          "bank_size": 65536,
           "switchbox_ports": {
             "DMA": {
               "master": 6,
@@ -5496,12 +5402,10 @@
         "core": {
           "num_locks": 16,
           "num_bds": 16,
-          "num_banks": 4,
           "representative": [
             1,
             2
           ],
-          "bank_size": 16384,
           "program_memory_size": 16384,
           "switchbox_ports": {
             "Core": {

@@ -156,8 +156,6 @@ def dump_device(model, device_id):
         "local_memory_size": model.get_local_memory_size(),
         "mem_tile_size": model.get_mem_tile_size(),
         "num_mem_tile_rows": model.get_num_mem_tile_rows(),
-        "max_lock_value": model.get_max_lock_value(),
-        "address_gen_granularity": model.get_address_gen_granularity(),
         "column_shift": model.get_column_shift(),
         "row_shift": model.get_row_shift(),
         "mem_base_addresses": {
@@ -167,6 +165,13 @@ def dump_device(model, device_id):
             "east": model.get_mem_east_base_address(),
         },
     }
+
+    # These methods were removed in mlir-aie after LLVM 23 update.
+    # Populate them only if the API still exposes them.
+    if hasattr(model, "get_max_lock_value"):
+        device["max_lock_value"] = model.get_max_lock_value()
+    if hasattr(model, "get_address_gen_granularity"):
+        device["address_gen_granularity"] = model.get_address_gen_granularity()
 
     # Per-tile data: type classification, edge info.
     tile_map = []
@@ -227,7 +232,6 @@ def dump_device(model, device_id):
         interior = [(c, r) for c, r in positions if 0 < c < cols - 1]
         rep_col, rep_row = interior[0] if interior else positions[0]
 
-        num_banks = model.get_num_banks(rep_col, rep_row)
         local_mem = model.get_local_memory_size()
         if type_name == "mem_tile":
             local_mem = model.get_mem_tile_size()
@@ -235,13 +239,15 @@ def dump_device(model, device_id):
         config = {
             "num_locks": model.get_num_locks(rep_col, rep_row),
             "num_bds": model.get_num_bds(rep_col, rep_row),
-            "num_banks": num_banks,
             "representative": [rep_col, rep_row],
         }
 
-        # Bank size = memory / banks (if banks > 0).
-        if num_banks > 0:
-            config["bank_size"] = local_mem // num_banks
+        # get_num_banks was removed in mlir-aie after LLVM 23 update.
+        if hasattr(model, "get_num_banks"):
+            num_banks = model.get_num_banks(rep_col, rep_row)
+            config["num_banks"] = num_banks
+            if num_banks > 0:
+                config["bank_size"] = local_mem // num_banks
 
         # Program memory size is not queryable from the API.
         if type_name == "core":
@@ -775,10 +781,12 @@ def cmd_build_manifest(args):
     # Join backslash-continuation lines before parsing
     output = output.replace("\\\n", " ")
 
-    # Parse aiecc.py invocations from make dry-run output
+    # Parse aiecc invocations from make dry-run output.
+    # Match both the old Python wrapper (aiecc.py) and the new C++ binary
+    # (aiecc) that replaced it in the LLVM 23 rewrite.
     designs = []
     for line in output.splitlines():
-        if "aiecc.py" not in line:
+        if "aiecc" not in line:
             continue
 
         xclbin_name = None

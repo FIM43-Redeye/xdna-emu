@@ -103,6 +103,11 @@ impl DeviceModelSet {
 /// | npu2     | NPU4        | AIE2P (XDNA2)| Strix    |
 ///
 /// The `_Ncol` variants (npu1_1col, etc.) are column-count subsets.
+
+// Serde defaults for fields removed from mlir-aie Python API after LLVM 23.
+fn default_max_lock_value() -> u32 { 63 }          // AIE2: signed 7-bit, range -64..+63
+fn default_address_gen_granularity() -> u32 { 32 }  // AIE2: 32-byte DMA alignment
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeviceModel {
     /// AIEDevice enum value from AIEAttrs.td.
@@ -129,9 +134,13 @@ pub struct DeviceModel {
     pub num_mem_tile_rows: u32,
 
     /// Maximum value storable in a lock register (e.g. 63 for AIE2).
+    /// Removed from mlir-aie Python API after LLVM 23; defaults to 63.
+    #[serde(default = "default_max_lock_value")]
     pub max_lock_value: u32,
 
     /// Address generation granularity in bits (e.g. 32 for word-addressed).
+    /// Removed from mlir-aie Python API after LLVM 23; defaults to 32.
+    #[serde(default = "default_address_gen_granularity")]
     pub address_gen_granularity: u32,
 
     /// Bit shift to extract column from tile address.
@@ -216,6 +225,8 @@ pub struct TileTypeConfig {
     /// Note: mlir-aie returns 4 for compute tiles while AM020 lists 8 physical
     /// banks. This is because mlir-aie counts bank groups (each containing 2
     /// interleaved banks). Use with care.
+    /// Removed from mlir-aie Python API after LLVM 23; defaults to 0.
+    #[serde(default)]
     pub num_banks: u32,
 
     /// Representative tile position [col, row] used for querying.
@@ -472,11 +483,20 @@ mod tests {
         let npu1 = models.npu1().expect("npu1 not found");
 
         let core = npu1.core_config().expect("core config");
-        // mlir-aie returns 4 (bank groups); AM020 says 8 (physical banks)
-        assert_eq!(core.num_banks, 4);
+        // num_banks was removed from mlir-aie Python API after LLVM 23.
+        // When present: mlir-aie returns 4 (bank groups); AM020 says 8
+        // (physical banks). When absent: serde defaults to 0.
+        // Either value is acceptable here.
+        assert!(
+            core.num_banks == 0 || core.num_banks == 4,
+            "unexpected num_banks: {}",
+            core.num_banks
+        );
 
-        let mem = npu1.mem_tile_config().expect("mem_tile config");
-        assert_eq!(mem.num_banks, 8);
+        if core.num_banks > 0 {
+            let mem = npu1.mem_tile_config().expect("mem_tile config");
+            assert_eq!(mem.num_banks, 8);
+        }
     }
 
     #[test]

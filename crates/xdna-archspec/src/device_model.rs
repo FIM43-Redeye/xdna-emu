@@ -261,8 +261,18 @@ fn extract_constants(
     ctx: &str,
     file: &str,
 ) -> Result<DeviceConstants, ExtractError> {
-    let max_lock_value = require_u64(obj, "max_lock_value", ctx)? as u32;
-    let address_gen_granularity = require_u64(obj, "address_gen_granularity", ctx)? as u32;
+    // These fields were removed from the mlir-aie Python API after the
+    // LLVM 23 update. Use architecture-appropriate defaults when absent.
+    // AIE2/AIE2P: max_lock_value=63 (signed 7-bit counter, aie-rt
+    // VAL_UPPER_BOUND), address_gen_granularity=32 bytes.
+    let max_lock_value = obj
+        .get("max_lock_value")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(63) as u32;
+    let address_gen_granularity = obj
+        .get("address_gen_granularity")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(32) as u32;
 
     let mem_ctx = format!("{}.mem_base_addresses", ctx);
     let mem_val = require_field(obj, "mem_base_addresses", ctx)?;
@@ -374,8 +384,30 @@ fn extract_tile_type(
 
     let num_locks = require_u64(obj, "num_locks", ctx)? as u8;
     let num_bds = require_u64(obj, "num_bds", ctx)? as u8;
-    let num_banks = require_u64(obj, "num_banks", ctx)? as u8;
-    let bank_size = require_u64(obj, "bank_size", ctx)?;
+
+    // num_banks and bank_size were removed from the mlir-aie Python API
+    // after LLVM 23. Derive from architecture defaults when absent:
+    // AIE2 compute: 4 banks of 16KB (64KB total), memtile: 8 banks of
+    // 64KB (512KB total). These come from aie-rt NUM_MEM_WORD_BANKS.
+    let num_banks = obj
+        .get("num_banks")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(match name {
+            "core" => 4,
+            "mem_tile" => 8,
+            _ => 1, // shim tiles don't have meaningful banking
+        }) as u8;
+    let bank_size = obj
+        .get("bank_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| {
+            // Derive from total memory / num_banks.
+            let total = match name {
+                "mem_tile" => mem_tile_size,
+                _ => local_memory_size,
+            };
+            if num_banks > 0 { total / num_banks as u64 } else { total }
+        });
 
     let representative = if let Some(rep_val) = obj.get("representative") {
         let arr = rep_val.as_array().ok_or_else(|| ExtractError::MissingField {
