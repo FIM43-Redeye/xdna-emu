@@ -106,7 +106,7 @@ while [[ $# -gt 0 ]]; do
     --serial-hw)           NPU_HW_JOBS=1; shift ;;
     --help|-h)
       cat <<'USAGE'
-Usage: emu-bridge-test.sh [options] [test-name-filter]
+Usage: emu-bridge-test.sh [options] [test-name-regex]
 
 Options:
   --compile       Force recompile all xclbins (default: use cached)
@@ -563,7 +563,7 @@ discover_tests() {
     [[ "$name" == "lit.local.cfg" ]] && continue
     [[ "$name" == "core_dmas" ]] && continue
 
-    if [[ -n "$FILTER" ]] && [[ "$name" != *"$FILTER"* ]]; then
+    if [[ -n "$FILTER" ]] && ! echo "$name" | grep -qE "$FILTER"; then
       continue
     fi
 
@@ -582,7 +582,7 @@ discover_tests() {
     child="$(basename "$subdir")"
     name="${parent}/${child}"
 
-    if [[ -n "$FILTER" ]] && [[ "$name" != *"$FILTER"* ]]; then
+    if [[ -n "$FILTER" ]] && ! echo "$name" | grep -qE "$FILTER"; then
       continue
     fi
 

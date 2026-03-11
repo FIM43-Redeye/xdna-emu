@@ -1,36 +1,13 @@
-# Trace quarantine -- tests that are DANGEROUS when trace-injected.
-#
-# These tests cause IOMMU page faults, NPU wedges, or other catastrophic
-# failures when trace routing is injected into their MLIR. They work fine
-# for normal (non-traced) HW runs.
+# Trace quarantine -- tests excluded from trace injection.
 #
 # Format: one test directory name per line (comments with #).
 #
-# The bridge script skips these entirely in --trace=compare mode.
+# The bridge script skips these in --trace=compare mode.
 # trace-sweep.py also checks this file when invoked standalone.
-
-# Control packet tests: trace injection conflicts with the control packet
-# stream routing, causing DMA to address 0x0 -> IOMMU IO_PAGE_FAULT.
-# 45k+ page faults observed, IOMMU event log restart, full NPU wedge.
-# Discovered 2026-03-05.  Root cause: trace-inject.py adds stream switch
-# routes that collide with control packet paths.
-ctrl_packet_reconfig
-ctrl_packet_reconfig_1x4_cores
-ctrl_packet_reconfig_4x1_cores
-ctrl_packet_reconfig_elf
-add_one_ctrl_packet
-add_one_ctrl_packet_4_cores
-add_one_ctrl_packet_col_overlay
-
-# add_maskwrite: causes 10 IOMMU IO_PAGE_FAULTs under trace injection.
-# Trace routing conflicts with mask-write instruction stream.
-add_maskwrite
-
-# dmabd_task_queue: 10 IOMMU faults under trace injection.
-dmabd_task_queue
-
-# packet_flow_fanin/fanout: 10 IOMMU faults each under trace injection.
-# packet_flow (non-fan) works fine -- the fan variants have different
-# stream routing that conflicts with trace injection.
-packet_flow_fanin
-packet_flow_fanout
+#
+# 2026-03-11: Quarantine cleared. All 11 previously quarantined tests
+# confirmed safe on HW without tracing (zero IOMMU faults). The old
+# faults were caused by the two-pass trace planner producing invalid
+# routes that conflicted with data flows. The new single-pass planner
+# (derived from aiecc.cpp, with verifier enabled) produces routes that
+# match the compiler's own routing, eliminating the conflicts.
