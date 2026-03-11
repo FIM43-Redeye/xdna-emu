@@ -414,6 +414,9 @@ extract_build_commands() {
 }
 
 # Extract the test execution command from the test's .lit file.
+# When our trace injection is active (NO_TRACE != "true"), strips the legacy
+# --trace_sz and --trace_file flags so the test's built-in tracing is voided
+# and our separate bo_trace mechanism is used uniformly.
 get_run_cmd() {
   local src_dir="$1"
   local lit_file
@@ -426,6 +429,16 @@ get_run_cmd() {
       local cmd
       cmd="$(apply_lit_subs "$src_dir" "$line")"
       cmd="${cmd#"${cmd%%[![:space:]]*}"}"
+      # When our trace injection is active, strip legacy trace flags so the
+      # test's built-in tracing allocates nothing (trace_size defaults to 0).
+      if [[ "${NO_TRACE:-false}" != "true" ]]; then
+        # Strip --trace_sz <N> (flag + numeric argument)
+        cmd="$(echo "$cmd" | sed 's/--trace_sz[[:space:]]\+[0-9]\+//g')"
+        # Strip --trace_file <path> (flag + non-space argument)
+        cmd="$(echo "$cmd" | sed 's/--trace_file[[:space:]]\+[^[:space:]]\+//g')"
+        # Collapse any resulting double spaces
+        cmd="$(echo "$cmd" | sed 's/[[:space:]]\+/ /g' | sed 's/[[:space:]]*$//')"
+      fi
       echo "$cmd"
       return 0
     fi

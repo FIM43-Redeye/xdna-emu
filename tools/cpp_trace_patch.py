@@ -443,8 +443,12 @@ def patch_test_cpp(source: str, trace_size: int = 1048576) -> str:
     Raises:
         PatchError: If required insertion points cannot be found.
     """
-    # Skip if already traced (look for the specific declaration pattern)
-    if re.search(r'\btrace_size\b', source):
+    # Skip if already patched by us -- the injected BO declaration is the marker.
+    # We do NOT skip on the bare name 'trace_size', because some tests define
+    # their own trace_size variable for the legacy --trace_sz mechanism.  That
+    # legacy path is now voided at the bridge level (--trace_sz stripped from
+    # test.exe commands), so those tests need our injection like any other.
+    if "injected by trace-prepare.py" in source:
         return source
 
     source_bytes = source.encode("utf-8")
