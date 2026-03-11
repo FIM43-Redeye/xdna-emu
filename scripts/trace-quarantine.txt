@@ -11,3 +11,16 @@
 # routes that conflicted with data flows. The new single-pass planner
 # (derived from aiecc.cpp, with verifier enabled) produces routes that
 # match the compiler's own routing, eliminating the conflicts.
+#
+# 2026-03-11: Two tests quarantined -- shim DMA channel conflict.
+# Root cause: application packet_flow ops already occupy the shim DMA
+# channels that trace injection targets.  Pathfinder correctly routes
+# the packet flows, but the host-side BD setup conflicts: both trace
+# and application share the same physical S2MM channel, causing data
+# corruption or TDR.
+# Fix: find_occupied_shim_dma_channels() guard in trace-inject.py
+# (see docs/plans/2026-03-11-trace-routing-guard.md)
+#
+# 2026-03-11: Quarantine cleared.  Guard now detects occupied channels
+# and routes trace to free channels on a widened device (npu1_2col).
+# Both tests confirmed routable via --plan-only.

@@ -819,8 +819,71 @@ def extract_connections(module) -> set[tuple]:
 
 
 # ---------------------------------------------------------------------------
+# Shim DMA channel occupancy -- pre-filter for trace candidate selection
+# ---------------------------------------------------------------------------
+
+def find_occupied_shim_dma_channels(mlir_text: str) -> set[tuple[int, int]]:
+    """Find (shim_col, channel) pairs used by application packet_flow ops.
+
+    Scans BOTH source and destination ports of aie.packet_flow ops for
+    references to shim tile DMA ports (row 0).  These channels are occupied
+    by the application and must not be reused for trace collection.
+
+    Source conflicts: application sends data FROM shim DMA to tiles
+    (e.g., control packets, input data via packet routing).
+
+    Dest conflicts: application receives data AT shim DMA from tiles
+    (e.g., output data via packet routing).
+
+    Both directions occupy the physical DMA channel and its BD queue.
+    The host-side setup (xrt::bo, set_arg) assumes exclusive channel
+    ownership -- sharing causes data corruption or TDR.
+
+    Derived from the MLIR source text (no compilation needed).
+    """
+    occupied: set[tuple[int, int]] = set()
+    # Match both packet_source and packet_dest targeting shim DMA ports.
+    # Shim tiles are row 0: %tile_C_0, %shim_noc_tile_C_0, %shim_tile_C_0.
+    for m in re.finditer(
+        r'aie\.packet_(?:source|dest)\s*<\s*'
+        r'%(?:shim_noc_tile|shim_tile|tile)_(\d+)_0\s*,\s*'
+        r'DMA\s*:\s*(\d+)\s*>',
+        mlir_text,
+    ):
+        col, ch = int(m.group(1)), int(m.group(2))
+        occupied.add((col, ch))
+    return occupied
+
+
+# ---------------------------------------------------------------------------
 # Pathfinder-driven trace route planner
 # ---------------------------------------------------------------------------
+#
+# Trace resource assumptions (validated by audit 2026-03-11):
+#
+# - Shim DMA channels: CHECKED.  find_occupied_shim_dma_channels() scans
+#   application packet_flow ops for both source and dest ports on shim
+#   tiles.  Occupied channels are excluded from candidate evaluation.
+#
+# - Broadcast events 14-15: reserved for trace start/stop signaling.
+#   Applications rarely use broadcast events directly.  No guard needed.
+#
+# - Timer: trace configures tile timers for timestamp generation.
+#   Applications almost never configure timers (compiler doesn't emit
+#   timer configuration).  No guard needed.
+#
+# - Trace ports: Trace:0 (core module) and Trace:1 (mem module) are
+#   assumed available on all tiles.  No mlir-aie API exposes manual
+#   trace port configuration.  No guard needed.
+#
+# - Locks: trace uses token-based DMA sync (enable_token=1) which
+#   operates independently of lock-based application synchronization.
+#   The aie-assign-lock-ids pass handles lock allocation for the
+#   application; trace tokens use a separate mechanism.  No guard needed.
+#
+# - BD 15: trace hardcodes BD 15 for shim DMA trace collection.
+#   mlir-aie allocates BDs 0..N from the bottom, so BD 15 is almost
+#   always free.  A future diagnostic check could verify this.
 
 def _evaluate_candidate(
     mlir_asm: str,
@@ -932,10 +995,25 @@ def plan_trace_route(mlir_text: str, _widen_attempts: int = 0) -> TracePlan:
             return TracePlan(False, "no traceable tiles found")
 
     # -- Generate candidates: all device columns x 2 channels -------------
+    # Exclude (col, ch) pairs already used by application packet_flow ops.
+    # Sharing a shim DMA channel between trace and application causes data
+    # corruption: both sides set up BDs on the same channel, interleaving
+    # trace events with computation data.
+    occupied = find_occupied_shim_dma_channels(mlir_text)
+    if occupied:
+        print(f"  Planner: shim DMA channels occupied by application: "
+              f"{sorted(occupied)}", file=sys.stderr)
+
     num_cols = tm.columns()
     candidates_params = [
         (col, ch) for col in range(num_cols) for ch in range(2)
+        if (col, ch) not in occupied
     ]
+
+    # If all candidates are filtered out, the evaluation loop below runs
+    # zero iterations, producing no viable results.  This naturally triggers
+    # the widen retry logic (npu1_1col -> npu1_2col etc.), which adds extra
+    # columns with free DMA channels.  No early return needed here.
 
     # -- Evaluate in parallel via ProcessPoolExecutor ---------------------
     raw_results: list[dict] = []
