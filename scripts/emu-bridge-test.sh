@@ -16,7 +16,7 @@
 # Six-phase pipelined architecture:
 #   Phase 1: Discover        -- find tests, filter, skip npu2-only
 #   Phase 2: Compile         -- parallel xclbin builds (both compilers in parallel) + test.exe
-#   Phase 3+4: Run HW+EMU   -- HW (-j5) and EMU (-j$JOBS) run concurrently
+#   Phase 3+4: Run HW+EMU   -- HW (serial) and EMU (-j$JOBS) run concurrently
 #   Phase 5: Trace compare   -- automatic trace comparison (HW vs EMU)
 #   Phase 6: Report          -- per-compiler comparison matrix + summary
 #
@@ -104,6 +104,7 @@ while [[ $# -gt 0 ]]; do
     --no-trace)            NO_TRACE=true; shift ;;
     --sweep)               SWEEP=true; shift ;;
     --serial-hw)           NPU_HW_JOBS=1; shift ;;
+    --parallel-hw)         NPU_HW_JOBS="${NPU_HW_JOBS_PARALLEL:-5}"; shift ;;
     --help|-h)
       cat <<'USAGE'
 Usage: emu-bridge-test.sh [options] [test-name-regex]
@@ -119,8 +120,9 @@ Options:
   -v, --verbose   Show log snippets on failure
   --chess-only    Only compile/run with Chess compiler (ground truth)
   --peano-only    Only compile/run with Peano compiler
-  --serial-hw     Run hardware tests sequentially (for crash classification)
-  (default: both compilers, Chess is ground truth, HW parallel -j5)
+  --serial-hw     Run hardware tests sequentially (explicit, same as default)
+  --parallel-hw   Run hardware tests in parallel (-j5) for speed
+  (default: both compilers, Chess is ground truth, HW serial)
 
 Filter:
   Substring match on test directory name.
@@ -911,10 +913,12 @@ export -f compile_one_compiler compile_one
 # Phase 3+4: Hardware + Emulator runs (concurrent)
 # ---------------------------------------------------------------------------
 
-# Maximum concurrent NPU hardware contexts.  NPU1 supports 6, but we
-# use 5 to leave headroom for the driver and avoid context-exhaustion
-# crashes observed at 10+ concurrent jobs.
-NPU_HW_JOBS="${NPU_HW_JOBS:-5}"
+# Maximum concurrent NPU hardware contexts.  Default serial (1) to avoid
+# TDR cascade -- a single bad test can poison all concurrent tests.
+# Use --parallel-hw for speed (5 jobs, leaving headroom from NPU1's 6
+# context limit).
+NPU_HW_JOBS="${NPU_HW_JOBS:-1}"
+NPU_HW_JOBS_PARALLEL="${NPU_HW_JOBS_PARALLEL:-5}"
 export NPU_HW_JOBS
 
 run_one_hardware() {
