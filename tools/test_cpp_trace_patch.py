@@ -148,12 +148,24 @@ class TestFstreamInclude:
 
 
 class TestAlreadyTracedSkip:
-    """Tests with existing trace_size variable should be returned unchanged."""
+    """Already-patched files should be returned unchanged."""
 
-    def test_skip_if_trace_size_exists(self):
-        src = "constexpr size_t trace_size = 1048576;\n" + MINIMAL_CPP
+    def test_skip_if_already_injected(self):
+        """Files containing our injection marker are returned as-is."""
+        src = "// injected by trace-prepare.py\n" + MINIMAL_CPP
         result = patch_test_cpp(src)
         assert result == src  # returned unchanged
+
+    def test_legacy_trace_size_still_patched(self):
+        """Files with a legacy trace_size variable ARE patched (not skipped).
+
+        The old guard skipped any file containing 'trace_size'. Now that the
+        bridge strips --trace_sz from test.exe commands, these tests need our
+        injection like any other.
+        """
+        src = "constexpr size_t trace_size = 1048576;\n" + MINIMAL_CPP
+        result = patch_test_cpp(src)
+        assert "auto bo_trace = xrt::bo(" in result  # patched, not skipped
 
 
 class TestPatchError:
@@ -177,12 +189,14 @@ int main() {
 #include <iostream>
 int main() {
   auto device = xrt::device(0);
+  auto kernel = xrt::kernel(context, "test");
   auto bo_out = xrt::bo(device, 256,
                         XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(5));
   return 0;
 }
 """
-        with pytest.raises(PatchError, match="kernel.*call"):
+        # No kernel() invocation and no wait() -- hits wait error first.
+        with pytest.raises(PatchError, match="wait"):
             patch_test_cpp(src)
 
     def test_error_no_run_wait(self):
