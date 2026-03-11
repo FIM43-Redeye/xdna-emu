@@ -165,6 +165,13 @@ def prepare_trace(
             print(f"FAIL {test_name}: {msg}", file=sys.stderr)
             return 1
 
+        # If the planner widened the device for trace routing room,
+        # apply the same widening to the MLIR before injection.
+        if plan.widened_device:
+            mlir_text, _ = trace_inject.widen_device(mlir_text)
+            print(f"  {test_name}: widened to {plan.widened_device} for trace",
+                  file=sys.stderr)
+
         # Inject trace.
         try:
             traced_mlir, manifest_partial = trace_inject.inject_trace(

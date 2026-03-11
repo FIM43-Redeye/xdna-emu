@@ -213,14 +213,15 @@ fn main() {
     let plugin_build = manifest_dir.join("xrt-plugin/build");
     let xrt_lib = Path::new("/opt/xilinx/xrt/lib");
     if plugin_build.join("CMakeCache.txt").exists() && xrt_lib.exists() {
-        // Incremental cmake build (~2s when nothing changed)
-        let status = std::process::Command::new("cmake")
+        // Incremental cmake build (~2s when nothing changed).
+        // Use .output() to capture stderr for diagnostics on failure.
+        let result = std::process::Command::new("cmake")
             .args(["--build", "."])
             .current_dir(&plugin_build)
-            .status();
+            .output();
 
-        match status {
-            Ok(s) if s.success() => {
+        match result {
+            Ok(output) if output.status.success() => {
                 // Install plugin .so to XRT lib directory
                 let src = plugin_build.join("libxrt_driver_emu.so.2.21.0");
                 let dst = xrt_lib.join("libxrt_driver_emu.so.2.21.0");
@@ -239,11 +240,14 @@ fn main() {
                     }
                 }
             }
-            Ok(s) => {
-                println!(
-                    "cargo:warning=Plugin cmake build failed (exit {})",
-                    s.code().unwrap_or(-1)
-                );
+            Ok(output) => {
+                let code = output.status.code().unwrap_or(-1);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                println!("cargo:warning=Plugin cmake build failed (exit {code})");
+                // Print first few lines of stderr for diagnostics.
+                for line in stderr.lines().take(10) {
+                    println!("cargo:warning=  plugin: {line}");
+                }
             }
             Err(e) => {
                 println!("cargo:warning=Plugin cmake build failed: {e}");

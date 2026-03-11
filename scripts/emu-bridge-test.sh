@@ -287,24 +287,75 @@ export -f npu_health_check
 # Helpers (shared with parallel jobs via export -f)
 # ---------------------------------------------------------------------------
 
+# Find the best .lit file in a test directory.
+# Prefers run.lit, falls back to the first *.lit file alphabetically.
+# Returns empty string if no .lit file found.
+find_lit_file() {
+  local dir="$1"
+  if [[ -f "$dir/run.lit" ]]; then
+    echo "$dir/run.lit"
+    return
+  fi
+  # Fall back to first *.lit file (alphabetically).
+  local first
+  first="$(find "$dir" -maxdepth 1 -name '*.lit' -print 2>/dev/null | sort | head -1)"
+  [[ -n "$first" ]] && echo "$first"
+}
+
 # Check if a test directory has a standard test.cpp + aie.mlir/run.lit.
 is_standard_test() {
   local dir="$1"
-  [[ -f "$dir/test.cpp" ]] && [[ -f "$dir/aie.mlir" || -f "$dir/run.lit" ]]
+  local lit
+  lit="$(find_lit_file "$dir")"
+  [[ -f "$dir/test.cpp" ]] && [[ -f "$dir/aie.mlir" || -n "$lit" ]]
 }
 
 # Check if a test requires npu2 (AIE2P -- skip for now).
+# A test is npu2-only if it mentions ryzen_ai_npu2 in REQUIRES but has no
+# npu1 support (no ryzen_ai_npu1 REQUIRES and no %run_on_npu1% commands).
+# Checks ALL .lit files in the directory.
 requires_npu2() {
   local dir="$1"
-  local lit="$dir/run.lit"
-  [[ -f "$lit" ]] && grep -q 'ryzen_ai_npu2' "$lit" && ! grep -q 'ryzen_ai_npu1' "$lit" && return 0
+  local any_lit=false
+  local any_npu2=false
+  for lit in "$dir"/*.lit; do
+    [[ -f "$lit" ]] || continue
+    any_lit=true
+    if grep -q 'ryzen_ai_npu2' "$lit"; then
+      any_npu2=true
+      # Has npu1 support if REQUIRES mentions it or run commands use it.
+      grep -q 'ryzen_ai_npu1' "$lit" && return 1
+      grep -q 'run_on_npu1' "$lit" && return 1
+    fi
+  done
+  $any_lit && $any_npu2 && return 0
   return 1
 }
 
-# Extract NPUDEVICE substitution from run.lit.
+# Check if a test requires a specific compiler (chess or peano).
+# Returns 0 if the lit file has a REQUIRES line naming only the other compiler.
+requires_only_compiler() {
+  local dir="$1"
+  local required_compiler="$2"  # "chess" or "peano"
+  local lit
+  lit="$(find_lit_file "$dir")"
+  [[ -n "$lit" ]] || return 1
+  # Look for REQUIRES line with the other compiler explicitly listed.
+  # Pattern: "REQUIRES: ..., chess" or "REQUIRES: chess, ..."
+  local other
+  [[ "$required_compiler" == "chess" ]] && other="peano" || other="chess"
+  # If the lit file requires the other compiler and does NOT mention ours,
+  # then this test requires only the other compiler.
+  grep -qE "REQUIRES:.*\\b${other}\\b" "$lit" || return 1
+  grep -qE "REQUIRES:.*\\b${required_compiler}\\b" "$lit" && return 1
+  return 0
+}
+
+# Extract NPUDEVICE substitution from the test's .lit file.
 get_npu_device() {
-  local lit="$1/run.lit"
-  if [[ ! -f "$lit" ]]; then
+  local lit
+  lit="$(find_lit_file "$1")"
+  if [[ -z "$lit" ]]; then
     echo "npu1_1col"
     return
   fi
@@ -354,6 +405,7 @@ extract_build_commands() {
     local cmd
     cmd="$(apply_lit_subs "$src_dir" "$line")"
     [[ "$cmd" == *"./test.exe"* ]] && continue
+    [[ "$cmd" == *"test.py"* ]] && continue
     [[ "$cmd" == *"run_on_npu"* ]] && continue
     [[ "$cmd" == *"NPUDEVICE"* ]] && continue
     [[ "$cmd" == "cp "* ]] && continue
@@ -361,11 +413,12 @@ extract_build_commands() {
   done < "$lit_file"
 }
 
-# Extract the test execution command from run.lit.
+# Extract the test execution command from the test's .lit file.
 get_run_cmd() {
   local src_dir="$1"
-  local lit_file="$src_dir/run.lit"
-  [[ -f "$lit_file" ]] || return 1
+  local lit_file
+  lit_file="$(find_lit_file "$src_dir")"
+  [[ -n "$lit_file" ]] || return 1
 
   while IFS= read -r line; do
     [[ "$line" == *"RUN:"* ]] || continue
@@ -474,9 +527,13 @@ transform_for_peano() {
     # Strip Chess flags
     cmd="${cmd//--xchesscc/}"
     cmd="${cmd//--xbridge/}"
-    # Ensure --no-xchesscc is present
+    # Ensure --no-xchesscc and --no-xbridge are present (the new C++ aiecc
+    # defaults to xbridge when Chess is available; we must opt out explicitly).
     if [[ "$cmd" != *"--no-xchesscc"* ]]; then
       cmd="${cmd/aiecc.py/aiecc.py --no-xchesscc}"
+    fi
+    if [[ "$cmd" != *"--no-xbridge"* ]]; then
+      cmd="${cmd/aiecc.py/aiecc.py --no-xbridge}"
     fi
     echo "$cmd"
     return
@@ -486,7 +543,8 @@ transform_for_peano() {
 }
 
 # Export all helpers for xargs subshells.
-export -f is_standard_test requires_npu2 get_npu_device apply_lit_subs
+export -f find_lit_file is_standard_test requires_npu2 requires_only_compiler
+export -f get_npu_device apply_lit_subs
 export -f extract_build_commands get_run_cmd sanitize_name wait_npu_idle
 export -f transform_for_chess transform_for_peano
 
@@ -551,15 +609,26 @@ compile_one_compiler() {
   local build_dir="$BUILD_BASE/$name/$compiler"
   local log_file="$RESULTS_DIR/${safe}.${compiler}.compile.log"
   local result_file="$RESULTS_DIR/${safe}.${compiler}.compile.result"
-  local lit_file="$src_dir/run.lit"
+  local lit_file
+  lit_file="$(find_lit_file "$src_dir")"
 
   mkdir -p "$build_dir"
   : > "$log_file"
 
-  if [[ ! -f "$lit_file" ]]; then
+  if [[ -z "$lit_file" ]]; then
     echo "FAIL" > "$result_file"
-    echo "No run.lit found" >> "$log_file"
-    echo "  COMPILE $name ($compiler): FAIL (no run.lit)"
+    echo "No .lit file found in $src_dir" >> "$log_file"
+    echo "  COMPILE $name ($compiler): FAIL (no .lit file)"
+    return 0
+  fi
+
+  # Skip if the lit file requires only the other compiler.
+  if requires_only_compiler "$src_dir" "$compiler"; then
+    local other
+    [[ "$compiler" == "chess" ]] && other="peano" || other="chess"
+    echo "SKIP_COMPILER" > "$result_file"
+    echo "Test requires $other (REQUIRES line in $(basename "$lit_file"))" >> "$log_file"
+    echo "  COMPILE $name ($compiler): SKIP ($other-only)"
     return 0
   fi
 
@@ -676,7 +745,8 @@ compile_one() {
   safe="$(sanitize_name "$name")"
   local src_dir="$TEST_SRC/$name"
   local build_dir="$BUILD_BASE/$name"
-  local lit_file="$src_dir/run.lit"
+  local lit_file
+  lit_file="$(find_lit_file "$src_dir")"
 
   # Check test quarantine (fundamentally broken tests -- skip entirely).
   if is_test_quarantined "$name"; then
@@ -1072,6 +1142,18 @@ print_report() {
       [[ -f "$RESULTS_DIR/${safe}.${compiler}.compile.result" ]] && \
         cr="$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")"
 
+      if [[ "$cr" == SKIP_* ]]; then
+        local skip_label="SKIP"
+        [[ "$cr" == "SKIP_NPU2" ]] && skip_label="SKIP(npu2)"
+        [[ "$cr" == "SKIP_COMPILER" ]] && skip_label="SKIP(compiler)"
+        [[ "$cr" == "SKIP_QUARANTINED" ]] && skip_label="SKIP(quarantine)"
+        if [[ "$run_hw" == "true" ]]; then
+          printf "  %-${col_width}s" "$skip_label"
+        fi
+        printf "  %-${col_width}s" "$skip_label"
+        continue
+      fi
+
       if [[ "$cr" != "OK" ]]; then
         compile_fail[$compiler]=$(( ${compile_fail[$compiler]} + 1 ))
         has_compile_fail=true
@@ -1268,16 +1350,23 @@ main() {
 
   # ---- Phase 1b: Auto-rebuild plugin if Rust lib is newer ----------------
 
-  local rust_lib="$EMU_ROOT/target/release/libxdna_emu.so"
-  local installed_lib="$XRT_LIB/libxdna_emu.so"
+  # Determine profile from XDNA_EMU env (matches runtime selection).
+  local emu_profile="${XDNA_EMU:-debug}"
+  # XDNA_EMU=1 is legacy shorthand for "debug".
+  [[ "$emu_profile" == "1" ]] && emu_profile="debug"
+  local rust_lib="$EMU_ROOT/target/$emu_profile/libxdna_emu.so"
+  local installed_plugin="$XRT_LIB/libxrt_driver_emu.so.2.21.0"
+
+  local rebuild_flags=""
+  [[ "$emu_profile" == "release" ]] && rebuild_flags="--release"
 
   if [[ -f "$rust_lib" ]]; then
-    if [[ ! -f "$installed_lib" ]] || [[ "$rust_lib" -nt "$installed_lib" ]]; then
-      info "Plugin outdated -- rebuilding from $rust_lib"
-      "$SCRIPT_DIR/rebuild-plugin.sh" 2>&1 | sed 's/^/  /'
+    if [[ ! -f "$installed_plugin" ]] || [[ "$rust_lib" -nt "$installed_plugin" ]]; then
+      info "Plugin outdated -- rebuilding ($emu_profile profile)"
+      "$SCRIPT_DIR/rebuild-plugin.sh" $rebuild_flags 2>&1 | sed 's/^/  /'
     fi
   else
-    warn "No release build found -- run 'cargo build --release' first"
+    warn "No $emu_profile build found -- run 'cargo build${rebuild_flags:+ $rebuild_flags}' first"
   fi
 
   # ---- Phase 2: Compile --------------------------------------------------
@@ -1287,7 +1376,7 @@ main() {
   printf '%s\n' "${runnable[@]}" | xargs -P"$JOBS" -I{} bash -c 'compile_one "$@"' _ {}
 
   # Count compile results (per-compiler).
-  local compile_ok=0 compile_fail=0
+  local compile_ok=0 compile_fail=0 compile_skip=0
   local compilers
   read -ra compilers <<< "$COMPILERS_STR"
   for name in "${runnable[@]}"; do
@@ -1298,12 +1387,16 @@ main() {
       [[ -f "$RESULTS_DIR/${safe}.${compiler}.compile.result" ]] && cr="$(< "$RESULTS_DIR/${safe}.${compiler}.compile.result")"
       if [[ "$cr" == "OK" ]]; then
         ((compile_ok++)) || true
+      elif [[ "$cr" == SKIP_* ]]; then
+        ((compile_skip++)) || true
       else
         ((compile_fail++)) || true
       fi
     done
   done
-  info "Phase 2 done: $compile_ok OK, $compile_fail failed (across ${#compilers[@]} compiler(s))"
+  local skip_msg=""
+  [[ $compile_skip -gt 0 ]] && skip_msg=", $compile_skip skipped"
+  info "Phase 2 done: $compile_ok OK, $compile_fail failed${skip_msg} (across ${#compilers[@]} compiler(s))"
   echo ""
 
   # Build list of tests where at least one compiler succeeded.

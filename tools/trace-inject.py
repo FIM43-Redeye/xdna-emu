@@ -244,6 +244,10 @@ class TracePlan:
     # ports (core + mem module); memtiles produce one.
     tiles: list[dict] | None = None
     candidates: list[CandidateResult] | None = None
+    # Set when the device was widened to provide trace routing room.
+    # Contains the new device name (e.g. "npu1_2col") or None if no
+    # widening was needed.
+    widened_device: str | None = None
 
     def to_dict(self) -> dict:
         """Serialize for JSON output (--plan-only and manifests)."""
@@ -253,6 +257,7 @@ class TracePlan:
             "shim_col": self.shim_col,
             "trace_channel": self.trace_channel,
             "tiles": self.tiles or [],
+            "widened_device": self.widened_device,
         }
         if self.candidates:
             d["candidates"] = [
@@ -461,18 +466,63 @@ def add_trace_flows(
 # Pathfinder runner and connection extractor
 # ---------------------------------------------------------------------------
 
-def run_pathfinder(module) -> bool:
-    """Run the pathfinder pass on a module. Returns True if successful.
+def run_lowering_and_pathfinder(module) -> bool:
+    """Lower objectFifos to flows, then route everything via pathfinder.
 
-    Mutates the module in place: FlowOps and PacketFlowOps are replaced
-    with concrete SwitchboxOp/ConnectOp routing.
+    This replicates aiecc's actual compilation sequence:
+    1. Resource allocation (objectFifo -> explicit FlowOp/DMA/locks)
+    2. Routing (pathfinder converts FlowOps to SwitchboxOp routing)
+
+    Without step 1, the pathfinder only sees trace PacketFlowOps and
+    misses data flows hidden inside objectFifo declarations -- producing
+    false feasibility results.
+
+    The verifier is enabled to catch routing constraint violations
+    (e.g. MasterSetOp + ConnectOp targeting the same destination port).
     """
     from aie.passmanager import PassManager  # type: ignore
 
-    pipeline = "builtin.module(aie.device(aie-create-pathfinder-flows))"
+    # Resource allocation passes that expand objectFifos into flows.
+    # This matches the passes aiecc runs before routing (aiecc.cpp
+    # runResourceAllocationPipeline).  We include only the passes
+    # that affect routing topology -- vector lowering, SCF conversion,
+    # and buffer address assignment are irrelevant for route planning.
+    # Pass names from `aie-opt --help` (NOT from C++ function names,
+    # which use different conventions like createAIEBroadcastPacketPass
+    # vs the registered name aie-lower-broadcast-packet).
+    lowering = (
+        "builtin.module("
+        "aie-canonicalize-device,"
+        "aie.device("
+        "aie-assign-lock-ids,"
+        "aie-register-objectFifos,"
+        "aie-objectFifo-stateful-transform,"
+        "aie-assign-bd-ids,"
+        "aie-lower-cascade-flows,"
+        "aie-lower-broadcast-packet,"
+        "aie-lower-multicast,"
+        "aie-assign-tile-controller-ids,"
+        "aie-generate-column-control-overlay"
+        ")"  # close aie.device
+        ")"  # close builtin.module
+    )
+    routing = "builtin.module(aie.device(aie-create-pathfinder-flows))"
+
     try:
-        pm = PassManager.parse(pipeline)
-        pm.run(module.operation)
+        # Step 1: lower objectFifos to explicit flows
+        pm1 = PassManager.parse(lowering)
+        pm1.enable_verifier(True)
+        pm1.run(module.operation)
+    except Exception:
+        # Lowering failure (e.g. malformed objectFifo) -- not a routing
+        # issue, but the test won't compile anyway.
+        return False
+
+    try:
+        # Step 2: route all flows (data + trace) together
+        pm2 = PassManager.parse(routing)
+        pm2.enable_verifier(True)
+        pm2.run(module.operation)
         return True
     except Exception:
         return False
@@ -544,15 +594,13 @@ def _evaluate_candidate(
 ) -> dict:
     """Evaluate one (shim_col, channel) candidate in a subprocess.
 
-    Uses a two-pass pathfinder approach:
-    1. Route the test's data flows first (FlowOp/PacketFlowOp -> SwitchboxOp)
-    2. Add trace PacketFlowOps to the already-routed module
-    3. Run pathfinder again -- it calls addFixedConnection() on existing
-       SwitchboxOps, marking those ports as INVALID, then routes trace
-       using only the leftover switch fabric.
+    Single-pass approach that matches aiecc's actual routing behavior:
+    1. Add trace PacketFlowOps to the unrouted module
+    2. Run pathfinder ONCE on all flows together (data + trace)
 
-    This guarantees zero interference: the trace router literally cannot
-    touch ports used by existing data flows.
+    This ensures the planner's feasibility verdict matches what aiecc
+    will actually produce -- no false positives from a two-pass strategy
+    that is more flexible than the single-pass compiler.
 
     Returns a plain dict (not CandidateResult) for pickling across the
     process boundary.
@@ -569,21 +617,17 @@ def _evaluate_candidate(
         from aie.ir import Context, Location, Module  # type: ignore
 
         with Context(), Location.unknown():
-            module = Module.parse(mlir_asm)
-
-            # Pass 1: route the test's own data flows.
-            # This converts FlowOp/PacketFlowOp into SwitchboxOp/ConnectOp.
-            if not run_pathfinder(module):
+            # First, route data flows alone to count baseline connections.
+            data_module = Module.parse(mlir_asm)
+            if not run_lowering_and_pathfinder(data_module):
                 result["failure_reason"] = "pathfinder failed on data flows"
                 return result
+            data_conns = extract_connections(data_module)
 
-            # Count data connections for scoring later
-            data_conns = extract_connections(module)
-
-            # Pass 2: add trace flows and route them on the locked fabric.
-            # The existing SwitchboxOps from pass 1 will be picked up by
-            # addFixedConnection() -- their ports become INVALID to the
-            # trace router.
+            # Now evaluate the real thing: add trace flows to the UNROUTED
+            # module and route everything together in a single pass --
+            # exactly as aiecc will do.
+            module = Module.parse(mlir_asm)
             device_op = find_device_with_sequence(module)
             used_ids = find_used_packet_ids_ir(device_op)
 
@@ -591,8 +635,8 @@ def _evaluate_candidate(
                 device_op, shim_col, channel, trace_targets, used_ids,
             )
 
-            if not run_pathfinder(module):
-                result["failure_reason"] = "no route for trace on remaining fabric"
+            if not run_lowering_and_pathfinder(module):
+                result["failure_reason"] = "routing failed with trace flows"
                 return result
 
             # Score: connections added by trace routing
@@ -610,7 +654,7 @@ def _evaluate_candidate(
     return result
 
 
-def plan_trace_route(mlir_text: str) -> TracePlan:
+def plan_trace_route(mlir_text: str, _widen_attempts: int = 0) -> TracePlan:
     """Plan the best (shim_col, channel) for trace collection.
 
     Evaluates all (shim_col, channel) candidates in parallel.  Each worker
@@ -618,6 +662,10 @@ def plan_trace_route(mlir_text: str) -> TracePlan:
     them via addFixedConnection), then routes trace on the remaining fabric.
     If the second pass succeeds, the candidate is viable -- guaranteed
     zero interference with existing data flows.
+
+    If no candidate is viable and the device can be widened (e.g. npu1_1col
+    to npu1_2col), retries with the wider device.  The extra column provides
+    switch fabric for trace routing without affecting compute behavior.
 
     Returns a TracePlan with the winning candidate or an infeasibility reason.
     """
@@ -699,6 +747,22 @@ def plan_trace_route(mlir_text: str) -> TracePlan:
     viable = [c for c in candidates if c.success]
 
     if not viable:
+        # Retry with a wider device if possible.  The extra column provides
+        # switch fabric for trace packets without affecting compute.
+        if _widen_attempts < 3:
+            wider_text, wider_device = widen_device(mlir_text)
+            if wider_device:
+                print(
+                    f"  Planner: routing exhausted, widening to {wider_device}",
+                    file=sys.stderr,
+                )
+                plan = plan_trace_route(wider_text, _widen_attempts + 1)
+                if plan.feasible:
+                    # Record that widening was used (propagate from deepest
+                    # successful retry if nested).
+                    plan.widened_device = plan.widened_device or wider_device
+                return plan
+
         return TracePlan(
             False,
             "no candidate found a route for trace",
@@ -753,6 +817,36 @@ def auto_detect_device(mlir_text: str) -> str:
         return "npu1"
     else:
         return "npu1"
+
+
+# Device widening sequence: each entry maps to the next-wider device.
+_DEVICE_WIDEN = {
+    "npu1_1col": "npu1_2col",
+    "npu1_2col": "npu1_3col",
+    "npu1_3col": "npu1",
+    # npu1 is already 5 columns (max for NPU1) -- cannot widen further.
+}
+
+
+def widen_device(mlir_text: str) -> tuple[str, str | None]:
+    """Widen the device target by one column to provide trace routing room.
+
+    Returns (new_mlir_text, new_device_name) if widening was possible,
+    or (original_text, None) if the device is already at maximum width.
+    The MLIR text is modified in-place via regex substitution of the
+    aie.device() attribute.
+    """
+    m = re.search(r'aie\.device\(\s*(npu1(?:_\d+col)?)\s*\)', mlir_text)
+    if not m:
+        return mlir_text, None
+
+    current = m.group(1)
+    wider = _DEVICE_WIDEN.get(current)
+    if not wider:
+        return mlir_text, None
+
+    new_text = mlir_text[:m.start(1)] + wider + mlir_text[m.end(1):]
+    return new_text, wider
 
 
 def get_mlir_text(test_dir: Path, source_type: str, device: str) -> str:
@@ -1839,6 +1933,13 @@ def main():
             json.dumps(manifest, indent=2) + "\n"
         )
         sys.exit(0)
+
+    # If the planner widened the device for trace routing room,
+    # apply the same widening to the MLIR before injection.
+    if plan.widened_device:
+        mlir_text, _ = widen_device(mlir_text)
+        print(f"  Planner: widened device to {plan.widened_device} for trace routing",
+              file=sys.stderr)
 
     # Print planner diagnostic table
     print(f"  Planner: shim col {plan.shim_col}, S2MM channel {plan.trace_channel}",
