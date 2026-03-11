@@ -434,7 +434,7 @@ impl Lock {
     /// Maximum lock value (+63, per aie-rt LockValUpperBound).
     ///
     /// This compile-time constant is validated against the mlir-aie device
-    /// model at startup (see `model::validate_against_spec()`). It is kept
+    /// model in tests (see `device::model::validate_against_spec()`). It is kept
     /// as a const for hot-path efficiency in lock acquire/release.
     pub const MAX_VALUE: i8 = 63;
 

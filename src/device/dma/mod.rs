@@ -82,7 +82,7 @@ pub use timing::DmaTimingConfig;
 //
 // BD counts come from ArchConfig (data-driven from mlir-aie device models).
 // Channel counts are stored per-DmaEngine at construction from ArchConfig.
-// Values validated against mlir-aie by model::validate_against_spec().
+// Values validated against mlir-aie by device::model::validate_against_spec() (test only).
 // ============================================================================
 
 /// DMA data width in bits.
