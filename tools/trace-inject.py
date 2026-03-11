@@ -463,6 +463,263 @@ def add_trace_flows(
 
 
 # ---------------------------------------------------------------------------
+# Pipeline derivation from mlir-aie source
+# ---------------------------------------------------------------------------
+#
+# Instead of hardcoding pass names (which go stale after mlir-aie updates),
+# derive the lowering pipeline from the toolchain:
+#   1. Parse AIEPasses.td + AIEXPasses.td for constructor -> CLI name mapping
+#   2. Parse aiecc.cpp's runResourceAllocationPipeline() for pass ordering
+#   3. Filter to AIE-specific passes (skip generic MLIR passes)
+#   4. Fall back to a dated snapshot if derivation fails
+#
+# This follows the "derive from the toolchain" principle in CLAUDE.md.
+
+# Cached pipeline string (computed once per process).
+_derived_lowering_pipeline: str | None = None
+_pipeline_derived = False
+
+
+def _find_mlir_aie_source() -> Path | None:
+    """Find the mlir-aie source tree from the aie-opt binary location.
+
+    aie-opt is at <mlir-aie>/install/bin/aie-opt, so the source root
+    is three levels up from the binary.
+    """
+    import shutil
+
+    aie_opt = shutil.which("aie-opt")
+    if not aie_opt:
+        return None
+    # install/bin/aie-opt -> source root
+    src_root = Path(aie_opt).resolve().parent.parent.parent
+    if (src_root / "tools" / "aiecc" / "aiecc.cpp").exists():
+        return src_root
+    return None
+
+
+def _parse_td_constructor_map(*td_paths: Path) -> dict[str, str]:
+    """Parse .td files to build constructor-function -> CLI-name mapping.
+
+    Each .td pass definition has a ``Pass<"cli-name">`` declaration and
+    a ``let constructor = "...::createFuncPass()"`` field.  This function
+    extracts both and maps them::
+
+        createAIELowerMulticastPass -> aie-lower-multicast
+        createAIEAssignLockIDsPass  -> aie-assign-lock-ids
+    """
+    result: dict[str, str] = {}
+    for td_path in td_paths:
+        if not td_path.exists():
+            continue
+        cli_name = None
+        for line in td_path.read_text().splitlines():
+            m = re.search(r'Pass<"([^"]+)"', line)
+            if m:
+                cli_name = m.group(1)
+            m = re.search(
+                r'let\s+constructor\s*=\s*"[^"]*::(create\w+)\(\)"', line
+            )
+            if m and cli_name:
+                result[m.group(1)] = cli_name
+                cli_name = None
+    return result
+
+
+def _extract_pipeline_from_aiecc(
+    aiecc_path: Path,
+    constructor_map: dict[str, str],
+    function_name: str = "runResourceAllocationPipeline",
+) -> list[tuple[str, str]] | None:
+    """Extract the ordered pass list from a function in aiecc.cpp.
+
+    Scans the function body line-by-line for:
+
+    1. ``(devicePm|pm).addPass(xilinx::..::createXxxPass(...))``
+       -- looked up in *constructor_map* for the CLI name.
+    2. String literals containing ``"aie-<name>..."`` (from
+       ``parsePassPipeline`` calls with dynamic option strings).
+
+    Returns a list of ``(level, cli_name)`` tuples where *level* is
+    ``"module"`` or ``"device"``, preserving source order.  Returns
+    ``None`` if the function cannot be found.
+    """
+    text = aiecc_path.read_text()
+
+    # Find the function body (brace-delimited).
+    fn_start = text.find(function_name + "(")
+    if fn_start < 0:
+        return None
+    brace_start = text.find("{", fn_start)
+    if brace_start < 0:
+        return None
+
+    depth = 0
+    fn_end = brace_start
+    for i in range(brace_start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                fn_end = i
+                break
+
+    fn_body = text[brace_start : fn_end + 1]
+
+    # Scan line-by-line to preserve ordering between addPass and
+    # parsePassPipeline calls.
+    passes: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    for line in fn_body.splitlines():
+        # Pattern 1: addPass(xilinx::AIE[X]::createXxxPass(...))
+        m = re.search(
+            r"(devicePm|pm)\.addPass\(\s*xilinx::(?:AIE|AIEX)::(create\w+)\(",
+            line,
+        )
+        if m:
+            level = "device" if m.group(1) == "devicePm" else "module"
+            func_name = m.group(2)
+            cli_name = constructor_map.get(func_name)
+            if cli_name and cli_name not in seen:
+                passes.append((level, cli_name))
+                seen.add(cli_name)
+            continue
+
+        # Pattern 2: string literal with "aie-<pass-name>" (from
+        # parsePassPipeline or pipeline string construction).
+        m = re.search(r'"(aie-[\w-]+)', line)
+        if m:
+            cli_name = m.group(1)
+            if cli_name not in seen:
+                passes.append(("device", cli_name))
+                seen.add(cli_name)
+
+    return passes if passes else None
+
+
+def _build_pipeline_string(passes: list[tuple[str, str]]) -> str:
+    """Build an MLIR pipeline string from ordered (level, cli_name) pairs.
+
+    Module-level passes go before the ``aie.device(...)`` nesting.
+    Device-level passes go inside it.  Only AIE-specific passes
+    (names starting with ``aie-``) are included -- generic MLIR passes
+    like ``lower-affine`` or ``convert-scf-to-cf`` are irrelevant for
+    route planning and may not be registered in the Python bindings.
+    """
+    module_passes = [p for lvl, p in passes if lvl == "module" and p.startswith("aie-")]
+    device_passes = [p for lvl, p in passes if lvl == "device" and p.startswith("aie-")]
+
+    if not device_passes:
+        return ""
+
+    device_str = ",".join(device_passes)
+    if module_passes:
+        module_str = ",".join(module_passes)
+        return f"builtin.module({module_str},aie.device({device_str}))"
+    return f"builtin.module(aie.device({device_str}))"
+
+
+def _fallback_lowering_pipeline() -> str:
+    """Hardcoded pipeline snapshot as fallback.
+
+    Matches aiecc.cpp runResourceAllocationPipeline() as of 2026-03-10.
+    Used when the mlir-aie source tree is not found or parsing fails.
+    """
+    return (
+        "builtin.module("
+        "aie-canonicalize-device,"
+        "aie.device("
+        "aie-assign-lock-ids,"
+        "aie-register-objectFifos,"
+        "aie-objectFifo-stateful-transform,"
+        "aie-assign-bd-ids,"
+        "aie-lower-cascade-flows,"
+        "aie-lower-broadcast-packet,"
+        "aie-lower-multicast,"
+        "aie-assign-tile-controller-ids,"
+        "aie-generate-column-control-overlay"
+        ")"
+        ")"
+    )
+
+
+def derive_lowering_pipeline() -> str:
+    """Derive the pre-routing lowering pipeline from aiecc.cpp source.
+
+    Reads the mlir-aie source tree to extract pass names and ordering,
+    matching the compiler's actual resource allocation pipeline.  Only
+    AIE-specific passes are included (those registered in AIEPasses.td
+    and AIEXPasses.td) -- generic MLIR passes are irrelevant for route
+    planning.
+
+    Falls back to a dated hardcoded snapshot with a warning if the
+    source tree is not found or parsing fails.
+    """
+    global _derived_lowering_pipeline, _pipeline_derived
+    if _pipeline_derived:
+        return _derived_lowering_pipeline or _fallback_lowering_pipeline()
+    _pipeline_derived = True
+
+    src_root = _find_mlir_aie_source()
+    if not src_root:
+        print(
+            "trace-inject: WARNING: mlir-aie source tree not found, "
+            "using hardcoded pipeline (may be stale)",
+            file=sys.stderr,
+        )
+        return _fallback_lowering_pipeline()
+
+    # Step 1: build constructor -> CLI name mapping from .td files.
+    td_paths = [
+        src_root / "include" / "aie" / "Dialect" / "AIE" / "Transforms" / "AIEPasses.td",
+        src_root / "include" / "aie" / "Dialect" / "AIEX" / "Transforms" / "AIEXPasses.td",
+    ]
+    constructor_map = _parse_td_constructor_map(*td_paths)
+    if not constructor_map:
+        print(
+            "trace-inject: WARNING: no .td pass definitions found at "
+            f"{src_root}, using hardcoded pipeline",
+            file=sys.stderr,
+        )
+        return _fallback_lowering_pipeline()
+
+    # Step 2: extract ordered pass list from aiecc.cpp.
+    aiecc_path = src_root / "tools" / "aiecc" / "aiecc.cpp"
+    passes = _extract_pipeline_from_aiecc(aiecc_path, constructor_map)
+    if not passes:
+        print(
+            "trace-inject: WARNING: could not parse pipeline from "
+            f"{aiecc_path.name}, using hardcoded pipeline",
+            file=sys.stderr,
+        )
+        return _fallback_lowering_pipeline()
+
+    # Step 3: build pipeline string.
+    pipeline = _build_pipeline_string(passes)
+    if not pipeline:
+        print(
+            "trace-inject: WARNING: derived pipeline has no device passes, "
+            "using hardcoded pipeline",
+            file=sys.stderr,
+        )
+        return _fallback_lowering_pipeline()
+
+    _derived_lowering_pipeline = pipeline
+
+    # Report what was derived (helpful for debugging pipeline mismatches).
+    n_device = sum(1 for lvl, _ in passes if lvl == "device")
+    n_module = sum(1 for lvl, _ in passes if lvl == "module")
+    print(
+        f"trace-inject: derived pipeline from {aiecc_path.name}: "
+        f"{n_module} module + {n_device} device passes",
+        file=sys.stderr,
+    )
+    return pipeline
+
+
+# ---------------------------------------------------------------------------
 # Pathfinder runner and connection extractor
 # ---------------------------------------------------------------------------
 
@@ -479,33 +736,14 @@ def run_lowering_and_pathfinder(module) -> bool:
 
     The verifier is enabled to catch routing constraint violations
     (e.g. MasterSetOp + ConnectOp targeting the same destination port).
+
+    The lowering pipeline is derived from aiecc.cpp source at runtime
+    (see derive_lowering_pipeline()) rather than hardcoded, so it
+    stays in sync with toolchain updates.
     """
     from aie.passmanager import PassManager  # type: ignore
 
-    # Resource allocation passes that expand objectFifos into flows.
-    # This matches the passes aiecc runs before routing (aiecc.cpp
-    # runResourceAllocationPipeline).  We include only the passes
-    # that affect routing topology -- vector lowering, SCF conversion,
-    # and buffer address assignment are irrelevant for route planning.
-    # Pass names from `aie-opt --help` (NOT from C++ function names,
-    # which use different conventions like createAIEBroadcastPacketPass
-    # vs the registered name aie-lower-broadcast-packet).
-    lowering = (
-        "builtin.module("
-        "aie-canonicalize-device,"
-        "aie.device("
-        "aie-assign-lock-ids,"
-        "aie-register-objectFifos,"
-        "aie-objectFifo-stateful-transform,"
-        "aie-assign-bd-ids,"
-        "aie-lower-cascade-flows,"
-        "aie-lower-broadcast-packet,"
-        "aie-lower-multicast,"
-        "aie-assign-tile-controller-ids,"
-        "aie-generate-column-control-overlay"
-        ")"  # close aie.device
-        ")"  # close builtin.module
-    )
+    lowering = derive_lowering_pipeline()
     routing = "builtin.module(aie.device(aie-create-pathfinder-flows))"
 
     try:
