@@ -39,7 +39,7 @@ _TRACE_BO_TEMPLATE = """\
   // Trace buffer (injected by trace-prepare.py)
   constexpr size_t trace_size = {trace_size};  // {trace_size_comment}
   auto bo_trace = xrt::bo(device, trace_size, XRT_BO_FLAGS_HOST_ONLY,
-                           kernel.group_id({next_id}));
+                           {kernel_name}.group_id({next_id}));
   memset(bo_trace.map<void*>(), 0, trace_size);
   bo_trace.sync(XCL_BO_SYNC_BO_TO_DEVICE);"""
 
@@ -94,24 +94,33 @@ def _find_last_xrt_bo_declaration(root: Node, source_bytes: bytes) -> Optional[N
     return last
 
 
-def _extract_group_ids(root: Node, source_bytes: bytes) -> list[int]:
-    """Extract all integer arguments to kernel.group_id(N) calls.
+def _extract_group_ids(
+    root: Node, source_bytes: bytes, kernel_name: str = "kernel"
+) -> list[int]:
+    """Extract integer arguments to <kernel_name>.group_id(N) calls.
+
+    When *kernel_name* is provided, only extracts group_ids for that
+    specific kernel variable (e.g., ``kernel0.group_id(3)`` but not
+    ``kernel1.group_id(3)``).  This is important for multi-kernel tests
+    where different kernels reuse the same group_id numbers.
 
     Only matches leaf-level group_id call expressions (not their parents)
     to avoid double-counting when a group_id call is nested inside an
     xrt::bo constructor call.
     """
+    expected_suffix = f"{kernel_name}.group_id"
     ids: set[int] = set()
     for node in _walk_all(root):
         if node.type == "call_expression":
-            # Only match nodes whose callee ends with .group_id
             func = node.child_by_field_name("function")
             if func is None:
                 continue
             func_text = source_bytes[func.start_byte:func.end_byte].decode()
             if not func_text.endswith(".group_id"):
                 continue
-            # Extract the integer argument
+            # For multi-kernel tests, only match the specific kernel
+            if not func_text.endswith(expected_suffix):
+                continue
             args = node.child_by_field_name("arguments")
             if args is None:
                 continue
@@ -122,29 +131,35 @@ def _extract_group_ids(root: Node, source_bytes: bytes) -> list[int]:
     return sorted(ids)
 
 
-def _find_kernel_call(root: Node, source_bytes: bytes) -> Optional[Node]:
-    """Find the kernel(...) call expression that produces a 'run' variable.
+def _find_kernel_call(
+    root: Node, source_bytes: bytes
+) -> tuple[Optional[Node], str]:
+    """Find the first kernel call expression that produces a run variable.
 
-    Looks for: auto run = kernel(opcode, bo_instr, ...)
-    The kernel call is the call_expression whose callee is 'kernel'.
+    Matches single-kernel patterns (``auto run = kernel(...)``), and
+    multi-kernel patterns (``auto run0 = kernel0(...)``).
+
+    Returns ``(call_node, kernel_name)`` where *kernel_name* is the
+    callee identifier (e.g., ``"kernel"`` or ``"kernel0"``).  Returns
+    ``(None, "")`` if no kernel call is found.
     """
     for node in _walk_all(root):
         if node.type != "declaration":
             continue
         text = source_bytes[node.start_byte:node.end_byte].decode()
-        # Must declare 'run' and call 'kernel'
+        # Must declare a run variable
         if "run" not in text:
             continue
-        # Find the call_expression child
         for desc in _walk_all(node):
             if desc.type == "call_expression":
                 callee = desc.children[0] if desc.children else None
                 if callee is None:
                     continue
                 callee_text = source_bytes[callee.start_byte:callee.end_byte].decode()
-                if callee_text == "kernel":
-                    return desc
-    return None
+                # Match "kernel", "kernel0", "kernel1", etc.
+                if re.match(r'^kernel\w*$', callee_text):
+                    return desc, callee_text
+    return None, ""
 
 
 def _find_last_run_wait(root: Node, source_bytes: bytes) -> Optional[Node]:
@@ -162,7 +177,8 @@ def _find_last_run_wait(root: Node, source_bytes: bytes) -> Optional[Node]:
         if callee is None or callee.type != "field_expression":
             continue
         callee_text = source_bytes[callee.start_byte:callee.end_byte].decode()
-        if not re.match(r'^run\.wait\d*$', callee_text):
+        # Match run.wait(), run.wait2(), run0.wait(), run1.wait(), etc.
+        if not re.match(r'^run\w*\.wait\d*$', callee_text):
             continue
         # Walk up to find the enclosing statement.
         # run.wait() may be in:
@@ -223,10 +239,16 @@ class _InsertionPoints:
     run_wait_end: int
     # Next group_id to use
     next_group_id: int
+    # Kernel variable name (e.g., "kernel" or "kernel0")
+    kernel_name: str
 
 
 def _find_insertion_points(source_bytes: bytes) -> _InsertionPoints:
     """Parse the source and locate all three insertion points.
+
+    Supports both single-kernel tests (``kernel(opcode, ...)``) and
+    multi-kernel tests (``kernel0(opcode, ...)``, ``kernel1(...)``).
+    For multi-kernel, traces the FIRST kernel call.
 
     Raises PatchError if any required point cannot be found.
     """
@@ -241,17 +263,18 @@ def _find_insertion_points(source_bytes: bytes) -> _InsertionPoints:
             "The source does not follow the expected test.cpp pattern."
         )
 
-    # 2. Group IDs
-    group_ids = _extract_group_ids(root, source_bytes)
-    next_id = max(group_ids) + 1 if group_ids else 1
-
-    # 3. Kernel call
-    kernel_call = _find_kernel_call(root, source_bytes)
+    # 2. Kernel call (may be "kernel", "kernel0", etc.)
+    kernel_call, kernel_name = _find_kernel_call(root, source_bytes)
     if kernel_call is None:
         raise PatchError(
-            "Cannot find kernel(...) call expression. "
-            "Expected: auto run = kernel(opcode, bo_instr, ...);"
+            "Cannot find kernel call expression. "
+            "Expected: auto run = kernel(opcode, ...) or "
+            "auto run0 = kernel0(opcode, ...);"
         )
+
+    # 3. Group IDs -- only for the traced kernel
+    group_ids = _extract_group_ids(root, source_bytes, kernel_name)
+    next_id = max(group_ids) + 1 if group_ids else 1
 
     # Find the closing paren of the argument list
     arg_list = None
@@ -280,6 +303,7 @@ def _find_insertion_points(source_bytes: bytes) -> _InsertionPoints:
         kernel_call_close_paren=close_paren.start_byte,
         next_group_id=next_id,
         run_wait_end=run_wait_stmt.end_byte,
+        kernel_name=kernel_name,
     )
 
 
@@ -315,6 +339,7 @@ def patch_test_cpp(source: str, trace_size: int = 1048576) -> str:
         trace_size=trace_size,
         trace_size_comment=_human_size(trace_size),
         next_id=points.next_group_id,
+        kernel_name=points.kernel_name,
     )
 
     # Apply transforms in reverse byte order to preserve offsets.
