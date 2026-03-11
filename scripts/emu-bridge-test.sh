@@ -311,8 +311,14 @@ is_standard_test() {
 }
 
 # Check if a test requires npu2 (AIE2P -- skip for now).
-# A test is npu2-only if it mentions ryzen_ai_npu2 in REQUIRES but has no
-# npu1 support (no ryzen_ai_npu1 REQUIRES and no %run_on_npu1% commands).
+# A test is npu2-only if its REQUIRES line mentions ryzen_ai_npu2 but NOT
+# ryzen_ai_npu1.  The REQUIRES directive is authoritative.
+#
+# NOTE: %run_on_npu1% commands in the lit file are conditional execution
+# prefixes, NOT compatibility indicators.  A test with REQUIRES: npu2 and
+# %run_on_npu1% commands is still npu2-only -- the conditional commands
+# exist for the lit infrastructure, not to signal NPU1 support.
+# (add_one_two_txn was incorrectly included on NPU1 because of this.)
 # Checks ALL .lit files in the directory.
 requires_npu2() {
   local dir="$1"
@@ -321,11 +327,10 @@ requires_npu2() {
   for lit in "$dir"/*.lit; do
     [[ -f "$lit" ]] || continue
     any_lit=true
-    if grep -q 'ryzen_ai_npu2' "$lit"; then
+    if grep -q 'REQUIRES:.*ryzen_ai_npu2' "$lit"; then
       any_npu2=true
-      # Has npu1 support if REQUIRES mentions it or run commands use it.
-      grep -q 'ryzen_ai_npu1' "$lit" && return 1
-      grep -q 'run_on_npu1' "$lit" && return 1
+      # Only NPU1-compatible if REQUIRES explicitly includes npu1.
+      grep -q 'REQUIRES:.*ryzen_ai_npu1' "$lit" && return 1
     fi
   done
   $any_lit && $any_npu2 && return 0
