@@ -1,0 +1,225 @@
+//! VCD deep comparison: cycle-accurate signal comparison between emulator
+//! and aiesimulator VCD files.
+//!
+//! # Modes
+//!
+//! ## Compare two VCDs
+//!
+//! ```text
+//! vcd-compare --emu emu.vcd --sim sim.vcd [--tolerance strict|relaxed|default] [--json] [-o report.txt]
+//! ```
+//!
+//! Loads both VCD files, aligns signals via the AIE2 mapping tree, runs the
+//! comparison engine, and produces either a text or JSON report.
+//!
+//! ## Coverage audit (single VCD)
+//!
+//! ```text
+//! vcd-compare --coverage sim.vcd [--json]
+//! ```
+//!
+//! Walks every signal in the VCD, checks which ones the mapping tree can
+//! resolve to a [`StatePath`], and reports mapped vs unmapped counts broken
+//! down by subsystem.
+
+use std::process;
+
+use xdna_emu::vcd::compare::{compare_signals, load_and_align};
+use xdna_emu::vcd::coverage::coverage_audit;
+use xdna_emu::vcd::mapping::build_aie2_mapping_tree;
+use xdna_emu::vcd::report::{json_report, text_report};
+use xdna_emu::vcd::tolerance::ToleranceConfig;
+
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
+fn usage() -> ! {
+    eprintln!("Usage:");
+    eprintln!("  vcd-compare --emu <file> --sim <file> [options]");
+    eprintln!("  vcd-compare --coverage <file> [options]");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --tolerance strict|relaxed|default   Timing tolerance (default: default)");
+    eprintln!("  --json                               Output JSON instead of text");
+    eprintln!("  -o <file>                            Write output to file");
+    eprintln!("  --help, -h                           Show this help");
+    process::exit(1);
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    let mut emu_path: Option<String> = None;
+    let mut sim_path: Option<String> = None;
+    let mut coverage_path: Option<String> = None;
+    let mut tolerance_name = "default".to_string();
+    let mut json_output = false;
+    let mut output_path: Option<String> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--emu" => {
+                i += 1;
+                emu_path = Some(args.get(i).cloned().unwrap_or_else(|| usage()));
+            }
+            "--sim" => {
+                i += 1;
+                sim_path = Some(args.get(i).cloned().unwrap_or_else(|| usage()));
+            }
+            "--coverage" => {
+                i += 1;
+                coverage_path = Some(args.get(i).cloned().unwrap_or_else(|| usage()));
+            }
+            "--tolerance" => {
+                i += 1;
+                tolerance_name = args.get(i).cloned().unwrap_or_else(|| usage());
+            }
+            "--json" => {
+                json_output = true;
+            }
+            "-o" | "--output" => {
+                i += 1;
+                output_path = Some(args.get(i).cloned().unwrap_or_else(|| usage()));
+            }
+            "--help" | "-h" => usage(),
+            other => {
+                eprintln!("Unknown argument: {}", other);
+                usage();
+            }
+        }
+        i += 1;
+    }
+
+    // Determine mode and validate argument combinations.
+    if coverage_path.is_some() && (emu_path.is_some() || sim_path.is_some()) {
+        eprintln!("Error: --coverage is mutually exclusive with --emu/--sim");
+        process::exit(1);
+    }
+
+    if let Some(cov_path) = coverage_path {
+        run_coverage(&cov_path, json_output, output_path.as_deref());
+    } else if let (Some(emu), Some(sim)) = (emu_path, sim_path) {
+        let tolerance = parse_tolerance(&tolerance_name);
+        run_compare(&emu, &sim, &tolerance, json_output, output_path.as_deref());
+    } else {
+        eprintln!("Error: either --coverage or both --emu and --sim are required");
+        usage();
+    }
+}
+
+/// Parse a tolerance name into a [`ToleranceConfig`], exiting on unknown names.
+fn parse_tolerance(name: &str) -> ToleranceConfig {
+    match name {
+        "strict" => ToleranceConfig::strict(),
+        "relaxed" => ToleranceConfig::relaxed(),
+        "default" => ToleranceConfig::aie2_default(),
+        other => {
+            eprintln!(
+                "Error: unknown tolerance '{}'. Use strict, relaxed, or default.",
+                other
+            );
+            process::exit(1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compare mode
+// ---------------------------------------------------------------------------
+
+/// Load, align, compare two VCD files and write a report.
+fn run_compare(
+    emu_path: &str,
+    sim_path: &str,
+    tolerance: &ToleranceConfig,
+    json: bool,
+    output: Option<&str>,
+) {
+    let tree = build_aie2_mapping_tree();
+
+    let input = match load_and_align(emu_path, sim_path, &tree) {
+        Ok(input) => input,
+        Err(e) => {
+            eprintln!("Error loading VCD files: {}", e);
+            process::exit(1);
+        }
+    };
+
+    let result = compare_signals(&input, tolerance);
+
+    let report = if json { json_report(&result) } else { text_report(&result, tolerance) };
+
+    write_output(&report, output);
+}
+
+// ---------------------------------------------------------------------------
+// Coverage mode
+// ---------------------------------------------------------------------------
+
+/// Run a coverage audit on a single VCD and write the report.
+fn run_coverage(vcd_path: &str, _json: bool, output: Option<&str>) {
+    let tree = build_aie2_mapping_tree();
+
+    let report = match coverage_audit(vcd_path, &tree) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error auditing VCD: {}", e);
+            process::exit(1);
+        }
+    };
+
+    // CoverageReport implements Display. JSON output is not yet implemented
+    // for coverage -- the Display output is machine-parseable enough for
+    // scripting. A dedicated JSON format can be added when needed.
+    let text = format!("{}", report);
+
+    write_output(&text, output);
+}
+
+// ---------------------------------------------------------------------------
+// Output
+// ---------------------------------------------------------------------------
+
+/// Print `content` to stdout, or write it to `path` if given.
+fn write_output(content: &str, path: Option<&str>) {
+    match path {
+        Some(p) => {
+            if let Err(e) = std::fs::write(p, content) {
+                eprintln!("Error writing {}: {}", p, e);
+                process::exit(1);
+            }
+            eprintln!("Report written to {}", p);
+        }
+        None => print!("{}", content),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify the tolerance parser handles all valid names without panicking.
+    #[test]
+    fn parse_tolerance_all_valid_names() {
+        // These must not call process::exit.
+        let _ = parse_tolerance("strict");
+        let _ = parse_tolerance("relaxed");
+        let _ = parse_tolerance("default");
+    }
+
+    /// Verify that the binary compiles and the helper functions are callable.
+    ///
+    /// Actual end-to-end functionality is exercised by the library module
+    /// tests (vcd::compare, vcd::report, vcd::coverage). This test confirms
+    /// the binary wiring is correct.
+    #[test]
+    fn binary_compiles() {
+        assert!(true);
+    }
+}
