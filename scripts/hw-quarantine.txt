@@ -14,3 +14,14 @@
 # Chess passes in serial but causes collateral TDRs under parallel
 # load (2026-03-05).  Quarantine both to protect the parallel pool.
 two_col:*
+
+# ctrl_packet_reconfig: Permanent TDR (both compilers).
+# Control overlay deadlock: -aie-generate-column-control-overlay adds
+# priority_route packet flows from shim DMA to tile TileControl ports.
+# With 4 application packet_flow ops, the overlay's control packets
+# deadlock in the stream switch fabric at runtime.  Evidence:
+# - ctrl_packet_reconfig_elf (same routing, no ctrlpkt.bin) passes
+# - ctrl_packet_reconfig_1x4_cores (1 packet_flow) passes
+# - Root cause is compiler/hardware limitation, not emulator issue
+ctrl_packet_reconfig:*
+ctrl_packet_reconfig_4x1_cores:*

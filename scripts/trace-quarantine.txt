@@ -24,3 +24,18 @@
 # 2026-03-11: Quarantine cleared.  Guard now detects occupied channels
 # and routes trace to free channels on a widened device (npu1_2col).
 # Both tests confirmed routable via --plan-only.
+#
+# 2026-03-11: Permanent TDR -- control packet reconfiguration deadlock.
+# ctrl_packet_reconfig and ctrl_packet_reconfig_4x1_cores TDR on real
+# hardware (both compilers, serial execution, fresh reboot -- confirmed
+# not a cascade).  Root cause: -aie-generate-column-control-overlay adds
+# priority_route packet flows from shim DMA (MM2S) to tile TileControl
+# ports.  When the application already has 4 packet_flow ops using the
+# stream switch fabric, the overlay's control packets deadlock at runtime
+# -- data flows wait for reconfiguration, control packets can't traverse
+# congested fabric.  Evidence: ctrl_packet_reconfig_elf (same routing,
+# no ctrlpkt.bin) passes; ctrl_packet_reconfig_1x4_cores (1 packet_flow
+# instead of 4) passes.  This is a compiler/hardware limitation, not an
+# emulator or tracing issue.
+ctrl_packet_reconfig
+ctrl_packet_reconfig_4x1_cores
