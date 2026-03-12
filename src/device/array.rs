@@ -1980,12 +1980,14 @@ mod tests {
         let col: u8 = 2;
         let row: u8 = 3;
 
-        // Pre-populate 4 consecutive registers with known values.
-        // Direct register map insertion -- no side effects needed for these offsets.
+        // Pre-populate 4 consecutive data memory locations with known values.
+        // Uses write_data_u32 to match how cores actually write data memory.
         let base_offset: u32 = 0x440;
         let values = [0xAAAA_0001u32, 0xBBBB_0002, 0xCCCC_0003, 0xDDDD_0004];
         for (i, &val) in values.iter().enumerate() {
-            array.tile_mut(col, row).registers.insert(base_offset + (i as u32) * 4, val);
+            array.tile_mut(col, row).write_data_u32(
+                (base_offset + (i as u32) * 4) as usize, val,
+            );
         }
 
         // Verify the TileCtrl slave port exists (port 3 on compute tiles)
@@ -2068,7 +2070,7 @@ mod tests {
         let row: u8 = 2;
         let offset: u32 = 0x500;
         let expected: u32 = 0x1234_5678;
-        array.tile_mut(col, row).registers.insert(offset, expected);
+        array.tile_mut(col, row).write_data_u32(offset as usize, expected);
 
         let ok = array.handle_read_registers(col, row, offset, 1, 0);
         assert!(ok);

@@ -1647,6 +1647,20 @@ impl Tile {
     pub fn read_register_pure(&self, offset: u32) -> u32 {
         let reg_layout = super::regdb::device_reg_layout();
 
+        // Data memory: read from the flat byte array where cores and DMA
+        // actually store data. Control packet OP_READ targets this space
+        // for addresses below the data memory size (0x10000 for compute,
+        // 0x80000 for memtile).
+        let mem_size = self.data_memory.len() as u32;
+        if mem_size > 0 && offset + 4 <= mem_size {
+            return u32::from_le_bytes([
+                self.data_memory[offset as usize],
+                self.data_memory[offset as usize + 1],
+                self.data_memory[offset as usize + 2],
+                self.data_memory[offset as usize + 3],
+            ]);
+        }
+
         // DMA BD range (per-tile-type from register database)
         let (bd_base, bd_stride) = self.bd_layout(reg_layout);
         let bd_end = bd_base + (self.dma_bds.len() as u32) * bd_stride;

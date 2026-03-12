@@ -321,6 +321,14 @@ impl DeviceState {
                 }
             }
 
+            SubsystemKind::DataMemory => {
+                // Write 32-bit value to data memory. Control packets can
+                // write to data memory word-by-word; CDO uses bulk dma_write.
+                if let Some(tile) = self.array.get_mut(tile_addr.col, tile_addr.row) {
+                    tile.write_data_u32(tile_addr.offset as usize, value);
+                }
+            }
+
             _ => {}
         }
 
