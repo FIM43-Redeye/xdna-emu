@@ -1,0 +1,1 @@
+//! Hierarchical signal mapping tree.

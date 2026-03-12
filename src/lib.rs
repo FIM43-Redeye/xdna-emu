@@ -30,6 +30,7 @@ pub mod ffi;
 pub mod build_progress;
 pub mod fuzzer;
 pub mod archspec;
+pub mod vcd;
 
 /// Compile-time architecture constants generated from the validated ArchModel.
 ///

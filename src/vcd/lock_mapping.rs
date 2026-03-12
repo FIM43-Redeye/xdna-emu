@@ -1,0 +1,1 @@
+//! Lock subsystem signal mapping.
