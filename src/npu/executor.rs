@@ -72,6 +72,20 @@ pub(crate) enum ExecutorState {
         /// Index into pending_syncs identifying which sync we're waiting on.
         sync_index: usize,
     },
+    /// Flushing stream switch after sync satisfaction.
+    ///
+    /// Control packet data may still be in-transit through the stream
+    /// switch when the sync completes (sync only confirms the shim DMA
+    /// finished sending). On real hardware, the firmware's instruction
+    /// pipeline latency gives the stream switch time to deliver data
+    /// before follow-up writes take effect. We model this by waiting
+    /// a few routing cycles before resuming instruction execution.
+    FlushingStreams {
+        /// Index of the NEXT instruction to execute after flush.
+        next_index: usize,
+        /// Remaining routing cycles before resuming.
+        remaining: u8,
+    },
     /// All instructions executed.
     Done,
 }
@@ -410,12 +424,38 @@ impl NpuExecutor {
                         self.state = ExecutorState::Done;
                         AdvanceResult::Done
                     } else {
-                        self.state = ExecutorState::Executing { next_index };
+                        // Flush stream switch before resuming. Control packet
+                        // data from the just-completed shim DMA may still be
+                        // in-transit through the stream switch pipeline. On real
+                        // hardware, firmware instruction latency (~4-8 cycles)
+                        // gives the switch time to deliver this data. We model
+                        // the same delay by waiting before executing the next
+                        // instruction.
+                        const STREAM_FLUSH_CYCLES: u8 = 4;
+                        self.state = ExecutorState::FlushingStreams {
+                            next_index,
+                            remaining: STREAM_FLUSH_CYCLES,
+                        };
                         AdvanceResult::Progressed
                     }
                 } else {
                     AdvanceResult::Blocked
                 }
+            }
+
+            ExecutorState::FlushingStreams { next_index, remaining } => {
+                // Wait for stream switch to propagate in-transit data.
+                // Each cycle the caller runs the routing, delivering
+                // control packet data one hop closer to target tiles.
+                if remaining <= 1 {
+                    self.state = ExecutorState::Executing { next_index };
+                } else {
+                    self.state = ExecutorState::FlushingStreams {
+                        next_index,
+                        remaining: remaining - 1,
+                    };
+                }
+                AdvanceResult::Progressed
             }
         }
     }
