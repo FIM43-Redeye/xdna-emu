@@ -18,6 +18,7 @@
 #   Phase 2: Compile         -- parallel xclbin builds (both compilers in parallel) + test.exe
 #   Phase 3+4: Run HW+EMU   -- HW (serial) and EMU (-j$JOBS) run concurrently
 #   Phase 5: Trace compare   -- automatic trace comparison (HW vs EMU)
+#   Phase 5c: aiesim        -- run aiesimulator on Chess builds + VCD coverage
 #   Phase 6: Report          -- per-compiler comparison matrix + summary
 #
 # Usage:
@@ -29,6 +30,7 @@
 #   ./scripts/emu-bridge-test.sh --compile          # force recompile xclbins
 #   ./scripts/emu-bridge-test.sh --list             # list available tests
 #   ./scripts/emu-bridge-test.sh -j4 add_one        # limit parallelism
+#   ./scripts/emu-bridge-test.sh --aiesim           # also run aiesimulator + VCD audit
 
 set -euo pipefail
 
@@ -85,6 +87,7 @@ VERBOSE=false
 COMPILER_MODE="both"  # "both", "chess", "peano"
 NO_TRACE="${NO_TRACE:-false}"
 SWEEP=false
+RUN_AIESIM=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -103,6 +106,7 @@ while [[ $# -gt 0 ]]; do
     --peano-only|--peano)  COMPILER_MODE="peano"; shift ;;
     --no-trace)            NO_TRACE=true; shift ;;
     --sweep)               SWEEP=true; shift ;;
+    --aiesim)              RUN_AIESIM=true; shift ;;
     --serial-hw)           NPU_HW_JOBS=1; shift ;;
     --parallel-hw)         NPU_HW_JOBS="${NPU_HW_JOBS_PARALLEL:-5}"; shift ;;
     --help|-h)
@@ -115,6 +119,7 @@ Options:
   --no-emu        Skip emulator runs (default: emulator enabled)
   --no-trace      Disable always-on trace preparation (default: traces enabled)
   --sweep         Run full event sweep (trace-sweep.py) on passing tests after runs
+  --aiesim        Run aiesimulator on Chess builds + VCD coverage audit
   --list          List available tests and exit
   -jN             Override parallelism (default: nproc)
   -v, --verbose   Show log snippets on failure
@@ -155,7 +160,7 @@ for _c in "${COMPILERS[@]}"; do
 done
 
 # Export variables that parallel jobs need.
-export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP
+export RESULTS_DIR FORCE_COMPILE VERBOSE RUN_EMU NO_TRACE SWEEP RUN_AIESIM
 export MLIR_AIE TEST_SRC BUILD_BASE EMU_ROOT SCRIPT_DIR TRACE_QUARANTINE_FILE
 export XRT_DIR XRT_INCLUDE XRT_LIB
 export TEST_LIB_DIR TEST_UTILS_INCLUDE TEST_UTILS_LIB
@@ -498,6 +503,10 @@ transform_for_chess() {
     if [[ "$cmd" != *"--xbridge"* ]]; then
       cmd="${cmd/aiecc.py/aiecc.py --xbridge}"
     fi
+    # Add --aiesim if requested (requires --xbridge, which Chess builds have)
+    if [[ "${RUN_AIESIM:-false}" == "true" ]] && [[ "$cmd" != *"--aiesim"* ]]; then
+      cmd="${cmd/aiecc.py/aiecc.py --aiesim}"
+    fi
     echo "$cmd"
     return
   fi
@@ -728,6 +737,16 @@ compile_one_compiler() {
   if $have_xclbin && [[ -f "$build_dir/aie_arch.mlir" ]] \
       && [[ -f "$build_dir/aie.xclbin" ]]; then
     if [[ "$build_dir/aie_arch.mlir" -nt "$build_dir/aie.xclbin" ]]; then
+      have_xclbin=false
+    fi
+  fi
+
+  # Invalidate cache if --aiesim requested but sim/ artifacts are missing.
+  if $have_xclbin && [[ "${RUN_AIESIM:-false}" == "true" ]] \
+      && [[ "$compiler" == "chess" ]]; then
+    local prj_check
+    prj_check="$(find "$build_dir" -maxdepth 1 -name '*.prj' -type d -print -quit 2>/dev/null || true)"
+    if [[ -z "$prj_check" ]] || [[ ! -d "$prj_check/sim" ]]; then
       have_xclbin=false
     fi
   fi
@@ -1755,6 +1774,114 @@ main() {
       done
     else
       info "Phase 5b: no tests eligible for sweep"
+    fi
+  fi
+
+  # ---- Phase 5c: aiesimulator VCD coverage audit -------------------------
+
+  if [[ "$RUN_AIESIM" == "true" ]]; then
+    # Find the vcd_compare binary (prefer release, fall back to debug).
+    local vcd_compare_bin=""
+    if [[ -x "$EMU_ROOT/target/release/vcd_compare" ]]; then
+      vcd_compare_bin="$EMU_ROOT/target/release/vcd_compare"
+    elif [[ -x "$EMU_ROOT/target/debug/vcd_compare" ]]; then
+      vcd_compare_bin="$EMU_ROOT/target/debug/vcd_compare"
+    fi
+
+    if [[ -z "$vcd_compare_bin" ]]; then
+      info "Phase 5c: SKIP -- vcd_compare binary not found (cargo build --bin vcd_compare)"
+    elif ! command -v aiesimulator &>/dev/null; then
+      info "Phase 5c: SKIP -- aiesimulator not in PATH"
+    else
+      # Collect Chess tests that compiled successfully and have sim artifacts.
+      local aiesim_targets=()
+      for name in "${compiled[@]}"; do
+        local safe
+        safe="$(sanitize_name "$name")"
+        local cr="FAIL"
+        [[ -f "$RESULTS_DIR/${safe}.chess.compile.result" ]] && \
+          cr="$(< "$RESULTS_DIR/${safe}.chess.compile.result")"
+        [[ "$cr" != "OK" ]] && continue
+        # Check for the sim/ directory (produced by --aiesim flag on aiecc).
+        local build_dir="$BUILD_BASE/$name/chess"
+        local prj_dir
+        prj_dir="$(find "$build_dir" -maxdepth 1 -name '*.prj' -type d -print -quit 2>/dev/null || true)"
+        [[ -z "$prj_dir" ]] && continue
+        [[ -d "$prj_dir/sim" ]] || continue
+        aiesim_targets+=("$name")
+      done
+
+      if [[ ${#aiesim_targets[@]} -eq 0 ]]; then
+        info "Phase 5c: no Chess builds with sim/ artifacts found"
+      else
+        info "Phase 5c: Running aiesimulator on ${#aiesim_targets[@]} Chess build(s)"
+
+        local aiesim_pass=0 aiesim_fail=0 aiesim_skip=0
+        for name in "${aiesim_targets[@]}"; do
+          local safe
+          safe="$(sanitize_name "$name")"
+          local build_dir="$BUILD_BASE/$name/chess"
+          local prj_dir
+          prj_dir="$(find "$build_dir" -maxdepth 1 -name '*.prj' -type d -print -quit 2>/dev/null)"
+          local sim_log="$RESULTS_DIR/${safe}.chess.aiesim.log"
+          local sim_result_file="$RESULTS_DIR/${safe}.chess.aiesim.result"
+          local sim_out_dir="$build_dir/aiesimulator_output"
+
+          # Run aiesimulator from the build directory so output lands there.
+          local sim_rc=0
+          (
+            cd "$build_dir"
+            nice -n 19 timeout 120 aiesimulator \
+              --pkg-dir="$prj_dir/sim" \
+              --dump-vcd=aiesim_trace
+          ) > "$sim_log" 2>&1 || sim_rc=$?
+
+          if [[ $sim_rc -ne 0 ]]; then
+            echo "FAIL" > "$sim_result_file"
+            echo "  AIESIM $name: FAIL (exit $sim_rc)"
+            ((aiesim_fail++)) || true
+            continue
+          fi
+
+          # Find the VCD file. aiesimulator creates it as
+          # <build_dir>/aiesimulator_output/aiesim_trace.vcd (or similar).
+          local vcd_file=""
+          if [[ -d "$sim_out_dir" ]]; then
+            vcd_file="$(find "$sim_out_dir" -name '*.vcd' -print -quit 2>/dev/null || true)"
+          fi
+          # Also check build_dir directly (some versions place it there).
+          if [[ -z "$vcd_file" ]]; then
+            vcd_file="$(find "$build_dir" -maxdepth 1 -name '*.vcd' -print -quit 2>/dev/null || true)"
+          fi
+
+          if [[ -z "$vcd_file" ]]; then
+            echo "FAIL" > "$sim_result_file"
+            echo "  AIESIM $name: FAIL (no VCD produced)"
+            ((aiesim_fail++)) || true
+            continue
+          fi
+
+          # Run VCD coverage audit.
+          local coverage_log="$RESULTS_DIR/${safe}.chess.aiesim-coverage.log"
+          local cov_rc=0
+          "$vcd_compare_bin" --coverage "$vcd_file" > "$coverage_log" 2>&1 || cov_rc=$?
+
+          if [[ $cov_rc -eq 0 ]]; then
+            echo "PASS" > "$sim_result_file"
+            # Extract signal count from coverage output for summary.
+            local sig_count
+            sig_count="$(grep -oP '\d+ signals?' "$coverage_log" | head -1 || true)"
+            echo "  AIESIM $name: PASS${sig_count:+ ($sig_count)}"
+            ((aiesim_pass++)) || true
+          else
+            echo "FAIL" > "$sim_result_file"
+            echo "  AIESIM $name: VCD coverage FAIL (see $coverage_log)"
+            ((aiesim_fail++)) || true
+          fi
+        done
+
+        info "Phase 5c done: $aiesim_pass pass, $aiesim_fail fail"
+      fi
     fi
   fi
 
