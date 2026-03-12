@@ -22,6 +22,7 @@
 
 use crate::vcd::mapping::MappingTree;
 use crate::vcd::state_path::StatePath;
+use crate::vcd::tolerance::ToleranceConfig;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -341,6 +342,355 @@ pub fn load_and_align(
         emu_only,
         sim_only,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Source -- which VCD a signal was found in
+// ---------------------------------------------------------------------------
+
+/// Identifies which VCD source contains a signal when it is absent from the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// The emulator VCD has the signal; the simulator VCD does not.
+    Emu,
+    /// The simulator VCD has the signal; the emulator VCD does not.
+    Sim,
+}
+
+// ---------------------------------------------------------------------------
+// SignalResult -- per-signal comparison outcome
+// ---------------------------------------------------------------------------
+
+/// Outcome of comparing one signal across two VCD sources.
+///
+/// Produced by [`compare_pair`] for a single [`AlignedPair`], and collected
+/// into a [`ComparisonResult`] by [`compare_signals`].
+#[derive(Debug, Clone)]
+pub enum SignalResult {
+    /// Values match exactly at every timestamp.
+    ExactMatch,
+
+    /// Values match but with a consistent timing offset within tolerance.
+    TimingOffset {
+        /// Median cycle offset (positive = emu leads sim).
+        offset_cycles: i64,
+        /// Number of value changes compared.
+        change_count: usize,
+    },
+
+    /// Values differ at one or more timestamps.
+    Mismatch {
+        /// Number of timestamps where values differ.
+        diff_count: usize,
+        /// Total timestamps compared.
+        total_count: usize,
+        /// First timestamp where values differ.
+        first_diff_time: u64,
+    },
+
+    /// Signal present in only one VCD.
+    Missing {
+        /// Which source has the signal.
+        present_in: Source,
+    },
+
+    /// Both timelines are empty (no value changes recorded).
+    BothEmpty,
+}
+
+// ---------------------------------------------------------------------------
+// ComparisonSummary -- aggregate counts
+// ---------------------------------------------------------------------------
+
+/// Summary counts of comparison results across all signals.
+#[derive(Debug, Default)]
+pub struct ComparisonSummary {
+    /// Signals with values matching exactly at every timestamp.
+    pub exact_match: usize,
+    /// Signals that match within the configured timing tolerance.
+    pub timing_offset: usize,
+    /// Signals with value differences beyond tolerance.
+    pub mismatch: usize,
+    /// Signals present in the sim VCD but absent from the emu VCD.
+    pub missing_emu: usize,
+    /// Signals present in the emu VCD but absent from the sim VCD.
+    pub missing_sim: usize,
+    /// Signals present in both VCDs but with no value changes in either.
+    pub both_empty: usize,
+}
+
+// ---------------------------------------------------------------------------
+// ComparisonResult -- all signal results
+// ---------------------------------------------------------------------------
+
+/// Results of comparing all aligned signals.
+///
+/// Each entry is a `(StatePath, SignalResult)` pair. The ordering matches the
+/// order signals were provided in the [`ComparisonInput`].
+pub struct ComparisonResult {
+    pub results: Vec<(StatePath, SignalResult)>,
+}
+
+impl ComparisonResult {
+    /// Count signals by result category.
+    pub fn summary(&self) -> ComparisonSummary {
+        let mut s = ComparisonSummary::default();
+        for (_, result) in &self.results {
+            match result {
+                SignalResult::ExactMatch => s.exact_match += 1,
+                SignalResult::TimingOffset { .. } => s.timing_offset += 1,
+                SignalResult::Mismatch { .. } => s.mismatch += 1,
+                SignalResult::Missing { present_in: Source::Emu } => s.missing_sim += 1,
+                SignalResult::Missing { present_in: Source::Sim } => s.missing_emu += 1,
+                SignalResult::BothEmpty => s.both_empty += 1,
+            }
+        }
+        s
+    }
+}
+
+// ---------------------------------------------------------------------------
+// compare_pair -- core comparison logic for a single aligned pair
+// ---------------------------------------------------------------------------
+
+/// Try to explain timeline differences as a pure timing offset.
+///
+/// For every value change in `emu`, find a change in `sim` with the same value
+/// within `tol` cycles. Likewise for every `sim` change. If all changes can be
+/// paired up this way, the timelines are equivalent up to a timing shift and we
+/// return a [`SignalResult::TimingOffset`] with the median offset.
+///
+/// Returns `None` if the timelines cannot be reconciled by a timing shift (i.e.,
+/// some changes have no counterpart within tolerance, or the value sequences
+/// differ fundamentally).
+fn try_timing_offset(
+    emu_tl: &SignalTimeline,
+    sim_tl: &SignalTimeline,
+    tol: u64,
+) -> Option<SignalResult> {
+    // Collect per-change offsets (emu_time - sim_time) for matched pairs.
+    let mut offsets: Vec<i64> = Vec::new();
+
+    // Every emu change must have a sim change with the same value within tol.
+    for ec in &emu_tl.changes {
+        let best = sim_tl
+            .changes
+            .iter()
+            .filter(|sc| sc.value == ec.value)
+            .min_by_key(|sc| {
+                let delta = ec.time as i64 - sc.time as i64;
+                delta.unsigned_abs()
+            });
+        match best {
+            Some(sc) => {
+                let delta = ec.time as i64 - sc.time as i64;
+                if delta.unsigned_abs() as u64 > tol {
+                    return None; // Nearest match is still outside tolerance.
+                }
+                offsets.push(delta);
+            }
+            None => return None, // No sim change with this value at all.
+        }
+    }
+
+    // Every sim change must also have an emu counterpart (symmetric check).
+    for sc in &sim_tl.changes {
+        let best = emu_tl
+            .changes
+            .iter()
+            .filter(|ec| ec.value == sc.value)
+            .min_by_key(|ec| {
+                let delta = sc.time as i64 - ec.time as i64;
+                delta.unsigned_abs()
+            });
+        match best {
+            Some(ec) => {
+                let delta = ec.time as i64 - sc.time as i64;
+                if delta.unsigned_abs() as u64 > tol {
+                    return None;
+                }
+            }
+            None => return None,
+        }
+    }
+
+    if offsets.is_empty() {
+        return None;
+    }
+
+    offsets.sort_unstable();
+    let median = offsets[offsets.len() / 2];
+
+    Some(SignalResult::TimingOffset {
+        offset_cycles: median,
+        change_count: offsets.len(),
+    })
+}
+
+/// Compare one aligned signal pair and return the result.
+///
+/// The comparison walks both timelines simultaneously using a merge-sort-style
+/// pass over all change timestamps. At each timestamp the "current value" of
+/// both timelines (most recent change at or before that time) is compared.
+///
+/// After counting matches and mismatches:
+/// - All match and both timelines identical timestamps: [`SignalResult::ExactMatch`].
+/// - All match but timestamps differ within tolerance: [`SignalResult::TimingOffset`].
+/// - Any value mismatch: [`SignalResult::Mismatch`].
+///
+/// For timing-offset detection we check whether every emu value change has a
+/// counterpart sim value change with the same value within `tolerance_cycles`,
+/// and vice-versa. If so, we compute the median offset. This is intentionally
+/// simple -- refinement can come later as we gather real VCD data.
+pub fn compare_pair(pair: &AlignedPair, tolerance: &ToleranceConfig) -> SignalResult {
+    // Handle the None cases first.
+    match (&pair.emu, &pair.sim) {
+        (None, Some(_)) => return SignalResult::Missing { present_in: Source::Sim },
+        (Some(_), None) => return SignalResult::Missing { present_in: Source::Emu },
+        (None, None) => return SignalResult::BothEmpty,
+        (Some(_), Some(_)) => {}
+    }
+
+    let emu_tl = pair.emu.as_ref().unwrap();
+    let sim_tl = pair.sim.as_ref().unwrap();
+
+    if emu_tl.is_empty() && sim_tl.is_empty() {
+        return SignalResult::BothEmpty;
+    }
+
+    let tol = tolerance.tolerance_for(&pair.path);
+
+    // Collect the union of all timestamps from both timelines.
+    // We want to compare the "current value" of each timeline at each
+    // timestamp where either timeline fires a change.
+    let mut timestamps: Vec<u64> = Vec::with_capacity(emu_tl.len() + sim_tl.len());
+    for c in &emu_tl.changes {
+        timestamps.push(c.time);
+    }
+    for c in &sim_tl.changes {
+        timestamps.push(c.time);
+    }
+    timestamps.sort_unstable();
+    timestamps.dedup();
+
+    // Walk the union timestamps and compare values.
+    let mut emu_idx: usize = 0;
+    let mut sim_idx: usize = 0;
+    let mut emu_current: Option<&SignalValue> = None;
+    let mut sim_current: Option<&SignalValue> = None;
+
+    let mut diff_count = 0usize;
+    let mut total_count = 0usize;
+    let mut first_diff_time: Option<u64> = None;
+
+    for &t in &timestamps {
+        // Advance emu cursor to the latest change at or before t.
+        while emu_idx < emu_tl.changes.len() && emu_tl.changes[emu_idx].time <= t {
+            emu_current = Some(&emu_tl.changes[emu_idx].value);
+            emu_idx += 1;
+        }
+        // Advance sim cursor to the latest change at or before t.
+        while sim_idx < sim_tl.changes.len() && sim_tl.changes[sim_idx].time <= t {
+            sim_current = Some(&sim_tl.changes[sim_idx].value);
+            sim_idx += 1;
+        }
+
+        // Only compare at timestamps where both timelines have a known value.
+        let (emu_val, sim_val) = match (emu_current, sim_current) {
+            (Some(e), Some(s)) => (e, s),
+            _ => continue,
+        };
+
+        total_count += 1;
+        if emu_val != sim_val {
+            diff_count += 1;
+            if first_diff_time.is_none() {
+                first_diff_time = Some(t);
+            }
+        }
+    }
+
+    if total_count == 0 {
+        // No common observation window; treat as empty.
+        return SignalResult::BothEmpty;
+    }
+
+    // Check whether the timelines were truly identical (same timestamps and
+    // values at every point).
+    if diff_count == 0
+        && emu_tl.changes.len() == sim_tl.changes.len()
+        && emu_tl
+            .changes
+            .iter()
+            .zip(sim_tl.changes.iter())
+            .all(|(e, s)| e.time == s.time)
+    {
+        return SignalResult::ExactMatch;
+    }
+
+    // Values agreed at every observed union timestamp but the change
+    // timestamps themselves differed, OR there were apparent mismatches
+    // caused by one timeline advancing ahead of the other.
+    //
+    // Try timing-offset detection: for every emu change, find a sim change
+    // with the same value within `tol` cycles. If all emu changes are
+    // accounted for and all sim changes are accounted for, the timelines
+    // are equivalent up to a timing shift.
+    if tol > 0 {
+        let offset_result = try_timing_offset(emu_tl, sim_tl, tol);
+        if let Some(result) = offset_result {
+            return result;
+        }
+    }
+
+    if diff_count == 0 {
+        // Values all agreed (no diff_count) but timestamps differ and
+        // tolerance is zero or timing offset didn't apply cleanly.
+        // Report as ExactMatch since the values are correct.
+        return SignalResult::ExactMatch;
+    }
+
+    // Genuine value differences that cannot be explained by timing offset.
+    SignalResult::Mismatch {
+        diff_count,
+        total_count,
+        first_diff_time: first_diff_time.unwrap_or(0),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// compare_signals -- sweep over all pairs
+// ---------------------------------------------------------------------------
+
+/// Compare all aligned signal pairs using the given tolerance config.
+///
+/// Iterates every [`AlignedPair`] in the input, calls [`compare_pair`] on
+/// each, and appends [`SignalResult::Missing`] entries for signals that only
+/// appeared in one VCD.
+///
+/// The result ordering is: aligned pairs (in input order), then `emu_only`
+/// paths, then `sim_only` paths.
+pub fn compare_signals(input: &ComparisonInput, tolerance: &ToleranceConfig) -> ComparisonResult {
+    let mut results = Vec::with_capacity(
+        input.pairs.len() + input.emu_only.len() + input.sim_only.len(),
+    );
+
+    for pair in &input.pairs {
+        let result = compare_pair(pair, tolerance);
+        results.push((pair.path.clone(), result));
+    }
+
+    // Signals present only in the emulator VCD.
+    for path in &input.emu_only {
+        results.push((path.clone(), SignalResult::Missing { present_in: Source::Emu }));
+    }
+
+    // Signals present only in the simulator VCD.
+    for path in &input.sim_only {
+        results.push((path.clone(), SignalResult::Missing { present_in: Source::Sim }));
+    }
+
+    ComparisonResult { results }
 }
 
 // ---------------------------------------------------------------------------
@@ -834,6 +1184,224 @@ mod tests {
         eprintln!("Extracted {} timelines from real VCD:", timelines.len());
         for (path, tl) in &timelines {
             eprintln!("  {} -- {} changes", path, tl.changes.len());
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Sweep tests (Task 11)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn compare_exact_match() {
+        let path = StatePath::LockValue { col: 0, row: 1, idx: 0 };
+        let changes = vec![
+            ValueChange { time: 0, value: SignalValue::Integer(0) },
+            ValueChange { time: 10, value: SignalValue::Integer(1) },
+        ];
+        let pair = AlignedPair {
+            path: path.clone(),
+            emu: Some(SignalTimeline { path: path.clone(), changes: changes.clone() }),
+            sim: Some(SignalTimeline { path: path.clone(), changes }),
+        };
+        let tolerance = ToleranceConfig::strict();
+        let result = compare_pair(&pair, &tolerance);
+        assert!(matches!(result, SignalResult::ExactMatch));
+    }
+
+    #[test]
+    fn compare_mismatch_different_values() {
+        let path = StatePath::LockValue { col: 0, row: 1, idx: 0 };
+        let pair = AlignedPair {
+            path: path.clone(),
+            emu: Some(SignalTimeline {
+                path: path.clone(),
+                changes: vec![
+                    ValueChange { time: 0, value: SignalValue::Integer(0) },
+                    ValueChange { time: 10, value: SignalValue::Integer(1) },
+                ],
+            }),
+            sim: Some(SignalTimeline {
+                path: path.clone(),
+                changes: vec![
+                    ValueChange { time: 0, value: SignalValue::Integer(0) },
+                    ValueChange { time: 10, value: SignalValue::Integer(2) },  // different!
+                ],
+            }),
+        };
+        let tolerance = ToleranceConfig::strict();
+        let result = compare_pair(&pair, &tolerance);
+        assert!(matches!(result, SignalResult::Mismatch { diff_count: 1, .. }));
+    }
+
+    #[test]
+    fn compare_missing_sim() {
+        let path = StatePath::LockValue { col: 0, row: 1, idx: 0 };
+        let pair = AlignedPair {
+            path: path.clone(),
+            emu: Some(SignalTimeline { path: path.clone(), changes: vec![] }),
+            sim: None,
+        };
+        let tolerance = ToleranceConfig::strict();
+        let result = compare_pair(&pair, &tolerance);
+        assert!(matches!(result, SignalResult::Missing { present_in: Source::Emu }));
+    }
+
+    #[test]
+    fn compare_both_empty() {
+        let path = StatePath::LockValue { col: 0, row: 1, idx: 0 };
+        let pair = AlignedPair {
+            path: path.clone(),
+            emu: Some(SignalTimeline { path: path.clone(), changes: vec![] }),
+            sim: Some(SignalTimeline { path: path.clone(), changes: vec![] }),
+        };
+        let tolerance = ToleranceConfig::strict();
+        let result = compare_pair(&pair, &tolerance);
+        assert!(matches!(result, SignalResult::BothEmpty));
+    }
+
+    #[test]
+    fn compare_signals_summary() {
+        // A ComparisonInput with one exact-match pair, one emu_only, one sim_only.
+        let input = ComparisonInput {
+            pairs: vec![
+                AlignedPair {
+                    path: StatePath::LockValue { col: 0, row: 1, idx: 0 },
+                    emu: Some(SignalTimeline {
+                        path: StatePath::LockValue { col: 0, row: 1, idx: 0 },
+                        changes: vec![ValueChange { time: 0, value: SignalValue::Integer(0) }],
+                    }),
+                    sim: Some(SignalTimeline {
+                        path: StatePath::LockValue { col: 0, row: 1, idx: 0 },
+                        changes: vec![ValueChange { time: 0, value: SignalValue::Integer(0) }],
+                    }),
+                },
+            ],
+            emu_only: vec![StatePath::LockValue { col: 0, row: 1, idx: 1 }],
+            sim_only: vec![StatePath::LockValue { col: 0, row: 1, idx: 2 }],
+        };
+        let tolerance = ToleranceConfig::strict();
+        let result = compare_signals(&input, &tolerance);
+        let summary = result.summary();
+        assert_eq!(summary.exact_match, 1);
+        // emu_only means the signal is in emu but not sim -> missing_sim.
+        assert_eq!(summary.missing_sim, 1);
+        // sim_only means the signal is in sim but not emu -> missing_emu.
+        assert_eq!(summary.missing_emu, 1);
+    }
+
+    #[test]
+    fn compare_timing_offset_within_tolerance() {
+        // Emu fires at t=5, sim fires at t=7; both transition to the same value.
+        // With tolerance=3, this should be a TimingOffset.
+        let path = StatePath::LockValue { col: 0, row: 1, idx: 0 };
+        let pair = AlignedPair {
+            path: path.clone(),
+            emu: Some(SignalTimeline {
+                path: path.clone(),
+                changes: vec![
+                    ValueChange { time: 0, value: SignalValue::Integer(0) },
+                    ValueChange { time: 5, value: SignalValue::Integer(1) },
+                ],
+            }),
+            sim: Some(SignalTimeline {
+                path: path.clone(),
+                changes: vec![
+                    ValueChange { time: 0, value: SignalValue::Integer(0) },
+                    ValueChange { time: 7, value: SignalValue::Integer(1) },
+                ],
+            }),
+        };
+        // Tolerance of 3 cycles -- t=5 vs t=7 is a 2-cycle difference, within bounds.
+        let tolerance = ToleranceConfig::new(3);
+        let result = compare_pair(&pair, &tolerance);
+        // The values agree at every observed timestamp (both start at 0, both end at 1),
+        // so with tolerance>0 and matching values, this should be TimingOffset or ExactMatch.
+        // With tol>0 and differing timestamps, we expect TimingOffset.
+        assert!(
+            matches!(result, SignalResult::TimingOffset { .. } | SignalResult::ExactMatch),
+            "expected TimingOffset or ExactMatch, got {:?}", result
+        );
+    }
+
+    #[test]
+    fn compare_mismatch_value_difference_beats_timing_tolerance() {
+        // Even with loose tolerance, a value disagreement is still a Mismatch.
+        let path = StatePath::LockValue { col: 0, row: 1, idx: 0 };
+        let pair = AlignedPair {
+            path: path.clone(),
+            emu: Some(SignalTimeline {
+                path: path.clone(),
+                changes: vec![
+                    ValueChange { time: 10, value: SignalValue::Integer(99) },
+                ],
+            }),
+            sim: Some(SignalTimeline {
+                path: path.clone(),
+                changes: vec![
+                    ValueChange { time: 10, value: SignalValue::Integer(42) },
+                ],
+            }),
+        };
+        let tolerance = ToleranceConfig::relaxed();
+        let result = compare_pair(&pair, &tolerance);
+        assert!(matches!(result, SignalResult::Mismatch { .. }), "expected Mismatch, got {:?}", result);
+    }
+
+    #[test]
+    fn compare_missing_both_none() {
+        // A pair with both sides None should yield BothEmpty.
+        let path = StatePath::LockValue { col: 0, row: 1, idx: 0 };
+        let pair = AlignedPair { path: path.clone(), emu: None, sim: None };
+        let result = compare_pair(&pair, &ToleranceConfig::strict());
+        assert!(matches!(result, SignalResult::BothEmpty));
+    }
+
+    #[test]
+    fn compare_signals_empty_input_yields_empty_results() {
+        let input = ComparisonInput {
+            pairs: vec![],
+            emu_only: vec![],
+            sim_only: vec![],
+        };
+        let result = compare_signals(&input, &ToleranceConfig::strict());
+        assert!(result.results.is_empty());
+        let summary = result.summary();
+        assert_eq!(summary.exact_match, 0);
+        assert_eq!(summary.mismatch, 0);
+    }
+
+    #[test]
+    fn compare_mismatch_reports_first_diff_time() {
+        // First diff should be reported correctly.
+        let path = StatePath::LockValue { col: 0, row: 1, idx: 0 };
+        let pair = AlignedPair {
+            path: path.clone(),
+            emu: Some(SignalTimeline {
+                path: path.clone(),
+                changes: vec![
+                    ValueChange { time: 0, value: SignalValue::Integer(0) },
+                    ValueChange { time: 5, value: SignalValue::Integer(1) },
+                    ValueChange { time: 10, value: SignalValue::Integer(2) },
+                ],
+            }),
+            sim: Some(SignalTimeline {
+                path: path.clone(),
+                changes: vec![
+                    ValueChange { time: 0, value: SignalValue::Integer(0) },
+                    ValueChange { time: 5, value: SignalValue::Integer(1) },
+                    ValueChange { time: 10, value: SignalValue::Integer(99) }, // only this differs
+                ],
+            }),
+        };
+        let tolerance = ToleranceConfig::strict();
+        let result = compare_pair(&pair, &tolerance);
+        match result {
+            SignalResult::Mismatch { diff_count, total_count, first_diff_time } => {
+                assert_eq!(diff_count, 1, "one value differs");
+                assert_eq!(total_count, 3, "three timestamps observed");
+                assert_eq!(first_diff_time, 10, "first diff at t=10");
+            }
+            other => panic!("expected Mismatch, got {:?}", other),
         }
     }
 }
