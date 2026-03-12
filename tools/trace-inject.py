@@ -228,6 +228,19 @@ class CandidateResult:
 
 
 @dataclass
+class TraceSlot:
+    """One shim DMA destination in a distributed trace plan.
+
+    Each slot maps a (shim_col, channel) pair to the trace targets that
+    should route through it.  The injector creates one packet_flow per
+    target pointing to this slot's shim DMA.
+    """
+    shim_col: int
+    channel: int
+    targets: list[tuple[int, int, int]]  # (col, row, trace_port)
+
+
+@dataclass
 class TracePlan:
     """Result of trace route planning.
 
@@ -248,6 +261,11 @@ class TracePlan:
     # Contains the new device name (e.g. "npu1_2col") or None if no
     # widening was needed.
     widened_device: str | None = None
+    # Multi-destination distributed plan.  When set, each slot maps a
+    # shim DMA channel to its assigned trace targets.  shim_col and
+    # trace_channel point to the first slot for backward compatibility.
+    # Single-destination plans leave this as None.
+    slots: list[TraceSlot] | None = None
 
     def to_dict(self) -> dict:
         """Serialize for JSON output (--plan-only and manifests)."""
@@ -259,6 +277,15 @@ class TracePlan:
             "tiles": self.tiles or [],
             "widened_device": self.widened_device,
         }
+        if self.slots:
+            d["slots"] = [
+                {
+                    "shim_col": s.shim_col,
+                    "channel": s.channel,
+                    "targets": s.targets,
+                }
+                for s in self.slots
+            ]
         if self.candidates:
             d["candidates"] = [
                 {
@@ -823,36 +850,127 @@ def extract_connections(module) -> set[tuple]:
 # ---------------------------------------------------------------------------
 
 def find_occupied_shim_dma_channels(mlir_text: str) -> set[tuple[int, int]]:
-    """Find (shim_col, channel) pairs used by application packet_flow ops.
+    """Find (shim_col, channel) pairs occupied for S2MM on shim tiles.
 
-    Scans BOTH source and destination ports of aie.packet_flow ops for
-    references to shim tile DMA ports (row 0).  These channels are occupied
-    by the application and must not be reused for trace collection.
+    Trace collection uses S2MM channels to receive trace data from tiles
+    into DDR.  Only S2MM-occupied channels conflict with trace.  MM2S
+    channels (sending data from DDR to tiles) are physically independent
+    -- separate BD queues, separate stream switch ports -- and do not
+    conflict with trace S2MM usage.
 
-    Source conflicts: application sends data FROM shim DMA to tiles
-    (e.g., control packets, input data via packet routing).
+    Detects S2MM occupancy from two sources in the MLIR text:
 
-    Dest conflicts: application receives data AT shim DMA from tiles
-    (e.g., output data via packet routing).
+    1. aie.packet_dest on shim DMA ports (packet_dest = S2MM direction).
+    2. aie.shim_dma_allocation ops with S2MM direction.
 
-    Both directions occupy the physical DMA channel and its BD queue.
-    The host-side setup (xrt::bo, set_arg) assumes exclusive channel
-    ownership -- sharing causes data corruption or TDR.
+    Source (1) catches packet-switched flows that route data TO the shim.
+    Source (2) catches explicit DMA reservations that may not appear in
+    packet_flow ops (e.g., circuit-switched flows with explicit allocation,
+    or tests that declare allocations for host-side DMA setup).
 
-    Derived from the MLIR source text (no compilation needed).
+    Derived from the MLIR source text (no compilation needed).  Does not
+    see overlay-added allocations (control packet overlay adds MM2S
+    channels during compilation, which don't conflict with trace S2MM).
     """
     occupied: set[tuple[int, int]] = set()
-    # Match both packet_source and packet_dest targeting shim DMA ports.
+
+    # Source 1: packet_dest on shim DMA = S2MM (data flows INTO shim).
     # Shim tiles are row 0: %tile_C_0, %shim_noc_tile_C_0, %shim_tile_C_0.
     for m in re.finditer(
-        r'aie\.packet_(?:source|dest)\s*<\s*'
+        r'aie\.packet_dest\s*<\s*'
         r'%(?:shim_noc_tile|shim_tile|tile)_(\d+)_0\s*,\s*'
         r'DMA\s*:\s*(\d+)\s*>',
         mlir_text,
     ):
         col, ch = int(m.group(1)), int(m.group(2))
         occupied.add((col, ch))
+
+    # Source 2: shim_dma_allocation with S2MM direction.
+    # Format: aie.shim_dma_allocation @name (%tile_C_0, S2MM, CH)
+    for m in re.finditer(
+        r'aie\.shim_dma_allocation\s+@\w+\s*\(\s*'
+        r'%(?:shim_noc_tile|shim_tile|tile)_(\d+)_0\s*,\s*'
+        r'S2MM\s*,\s*(\d+)\s*\)',
+        mlir_text,
+    ):
+        col, ch = int(m.group(1)), int(m.group(2))
+        occupied.add((col, ch))
+
     return occupied
+
+
+def has_control_overlay(mlir_text: str) -> bool:
+    """Detect whether the MLIR uses the column control packet overlay.
+
+    The overlay is indicated by a @base device block in the module.  When
+    present, the -aie-generate-column-control-overlay pass will add MM2S
+    packet flows from shim DMA to tile TileControl ports during
+    compilation.  These overlay flows use MM2S (not S2MM), so they don't
+    conflict with trace DMA channels.  However, they add packet flows to
+    the stream switch fabric that pathfinder must route alongside trace.
+    """
+    return bool(re.search(r'aie\.device\s*\([^)]*\)\s*@base\b', mlir_text))
+
+
+# ---------------------------------------------------------------------------
+# Distributed trace target assignment
+# ---------------------------------------------------------------------------
+
+def assign_targets_to_shims(
+    trace_targets: list[tuple[int, int, int]],
+    occupied: set[tuple[int, int]],
+    num_cols: int,
+) -> dict[tuple[int, int], list[tuple[int, int, int]]]:
+    """Assign trace targets to shim DMA channels for distributed routing.
+
+    Pure function -- no mlir-aie dependency.  Assigns each trace target
+    to a (shim_col, channel) slot, preferring same-column shims and
+    balancing load across available slots.
+
+    Priority:
+    1. Same-column shim (shortest path, lowest congestion)
+    2. Nearest free shim (distance-ordered fallback)
+    3. Load balance (tiebreak by fewest targets already assigned)
+
+    Args:
+        trace_targets: list of (col, row, trace_port) for all traceable tiles
+        occupied: set of (col, ch) S2MM channels already in use
+        num_cols: total device columns
+
+    Returns:
+        dict mapping (shim_col, channel) -> [targets].
+        Empty dict if no free slots are available.
+    """
+    # Build list of free (col, ch) slots, preferring ch 0 first.
+    free_slots = [
+        (col, ch)
+        for col in range(num_cols)
+        for ch in range(2)
+        if (col, ch) not in occupied
+    ]
+
+    if not free_slots:
+        return {}
+
+    # Track assignment: slot -> list of targets
+    assignment: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
+
+    for target in trace_targets:
+        target_col = target[0]
+
+        # Build candidate list sorted by preference:
+        # 1. Same-column slots first
+        # 2. Then by distance to target column
+        # 3. Then by current load (fewer assigned targets = better)
+        def slot_key(slot):
+            dist = abs(slot[0] - target_col)
+            load = len(assignment.get(slot, []))
+            return (dist, load, slot[1])  # ch as final tiebreak
+
+        best = min(free_slots, key=slot_key)
+        assignment.setdefault(best, []).append(target)
+
+    return assignment
 
 
 # ---------------------------------------------------------------------------
@@ -862,8 +980,11 @@ def find_occupied_shim_dma_channels(mlir_text: str) -> set[tuple[int, int]]:
 # Trace resource assumptions (validated by audit 2026-03-11):
 #
 # - Shim DMA channels: CHECKED.  find_occupied_shim_dma_channels() scans
-#   application packet_flow ops for both source and dest ports on shim
-#   tiles.  Occupied channels are excluded from candidate evaluation.
+#   S2MM-occupied channels from two sources: (a) aie.packet_dest on shim
+#   DMA ports (packet routing to shim), (b) aie.shim_dma_allocation ops
+#   with S2MM direction.  Only S2MM conflicts matter because trace uses
+#   S2MM; MM2S (including control overlay) is physically independent.
+#   Occupied S2MM channels are excluded from candidate evaluation.
 #
 # - Broadcast events 14-15: reserved for trace start/stop signaling.
 #   Applications rarely use broadcast events directly.  No guard needed.
@@ -955,14 +1076,160 @@ def _evaluate_candidate(
     return result
 
 
-def plan_trace_route(mlir_text: str, _widen_attempts: int = 0) -> TracePlan:
-    """Plan the best (shim_col, channel) for trace collection.
+def _evaluate_distributed(
+    mlir_asm: str,
+    assignment: dict[tuple[int, int], list[tuple[int, int, int]]],
+    test_cols: set[int],
+) -> dict:
+    """Evaluate a full distributed assignment in a subprocess.
 
-    Evaluates all (shim_col, channel) candidates in parallel.  Each worker
-    uses a two-pass pathfinder: first routes the test's data flows (locking
-    them via addFixedConnection), then routes trace on the remaining fabric.
-    If the second pass succeeds, the candidate is viable -- guaranteed
-    zero interference with existing data flows.
+    Takes the ENTIRE assignment (multiple slots), adds all trace flows
+    to a single unrouted module, and runs pathfinder ONCE on all data +
+    trace flows combined -- exactly as aiecc will compile it.
+
+    Returns a plain dict for pickling across the process boundary.
+    """
+    result = {
+        "success": False,
+        "failure_reason": None,
+        "trace_connections_on_test_cols": 0,
+        "total_trace_connections": 0,
+    }
+    try:
+        from aie.ir import Context, Location, Module  # type: ignore
+
+        with Context(), Location.unknown():
+            # Route data flows alone for baseline connection count.
+            data_module = Module.parse(mlir_asm)
+            if not run_lowering_and_pathfinder(data_module):
+                result["failure_reason"] = "pathfinder failed on data flows"
+                return result
+            data_conns = extract_connections(data_module)
+
+            # Add ALL trace flows to the unrouted module, one slot at a time.
+            module = Module.parse(mlir_asm)
+            device_op = find_device_with_sequence(module)
+            used_ids = find_used_packet_ids_ir(device_op)
+
+            for (shim_col, channel), targets in sorted(assignment.items()):
+                trace_id_start, _ = add_trace_flows(
+                    device_op, shim_col, channel, targets, used_ids,
+                )
+                # Update used_ids with the IDs that add_trace_flows
+                # actually allocated so subsequent slots do not collide.
+                used_ids.update(range(trace_id_start, trace_id_start + len(targets)))
+
+            if not run_lowering_and_pathfinder(module):
+                result["failure_reason"] = "routing failed with distributed trace"
+                return result
+
+            all_conns = extract_connections(module)
+            trace_conns = all_conns - data_conns
+            on_test = sum(1 for c in trace_conns if c[1] in test_cols)
+            result["trace_connections_on_test_cols"] = on_test
+            result["total_trace_connections"] = len(trace_conns)
+
+        result["success"] = True
+
+    except Exception as exc:
+        result["failure_reason"] = str(exc).splitlines()[0][:200]
+
+    return result
+
+
+def _try_distributed_plan(
+    mlir_text: str,
+    trace_targets: list[tuple[int, int, int]],
+    test_cols: set[int],
+    tile_info: list[dict],
+    occupied: set[tuple[int, int]],
+    num_cols: int,
+) -> TracePlan | None:
+    """Attempt distributed multi-shim trace routing.
+
+    Returns a feasible TracePlan with populated ``slots`` if distributed
+    routing works, or None if it fails (caller falls back to single-dest).
+
+    Only attempted when trace targets span multiple columns -- single-column
+    designs gain nothing from distributed routing.
+    """
+    import concurrent.futures
+
+    # Only distribute when targets span multiple columns.
+    target_cols = {t[0] for t in trace_targets}
+    if len(target_cols) < 2:
+        return None
+
+    assignment = assign_targets_to_shims(trace_targets, occupied, num_cols)
+    if not assignment:
+        return None
+
+    # If the assignment collapsed to a single slot, distributed routing
+    # offers no benefit -- skip and let single-dest handle it.
+    if len(assignment) < 2:
+        return None
+
+    print(
+        f"  Planner: trying distributed plan across "
+        f"{len(assignment)} shim DMA slots",
+        file=sys.stderr,
+    )
+
+    # Validate the entire assignment in a subprocess.
+    with concurrent.futures.ProcessPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            _evaluate_distributed,
+            mlir_text,
+            assignment,
+            test_cols,
+        )
+        try:
+            result = future.result()
+        except Exception as exc:
+            print(
+                f"  Planner: distributed evaluation failed: {exc}",
+                file=sys.stderr,
+            )
+            return None
+
+    if not result["success"]:
+        print(
+            f"  Planner: distributed routing failed: "
+            f"{result.get('failure_reason', 'unknown')}",
+            file=sys.stderr,
+        )
+        return None
+
+    # Build TraceSlot list from assignment.
+    slots = [
+        TraceSlot(shim_col=col, channel=ch, targets=targets)
+        for (col, ch), targets in sorted(assignment.items())
+    ]
+
+    # Primary slot for backward-compat fields.
+    primary = slots[0]
+
+    slot_desc = ", ".join(
+        f"col {s.shim_col} ch {s.channel} ({len(s.targets)} targets)"
+        for s in slots
+    )
+
+    return TracePlan(
+        feasible=True,
+        reason=f"distributed: {slot_desc}",
+        shim_col=primary.shim_col,
+        trace_channel=primary.channel,
+        tiles=tile_info,
+        slots=slots,
+    )
+
+
+def plan_trace_route(mlir_text: str, _widen_attempts: int = 0) -> TracePlan:
+    """Plan the best trace route -- distributed first, single-dest fallback.
+
+    For multi-column designs, first attempts distributed routing (one shim
+    DMA per column).  If that fails, falls back to single-destination
+    routing which evaluates all (shim_col, channel) candidates in parallel.
 
     If no candidate is viable and the device can be widened (e.g. npu1_1col
     to npu1_2col), retries with the wider device.  The extra column provides
@@ -995,16 +1262,29 @@ def plan_trace_route(mlir_text: str, _widen_attempts: int = 0) -> TracePlan:
             return TracePlan(False, "no traceable tiles found")
 
     # -- Generate candidates: all device columns x 2 channels -------------
-    # Exclude (col, ch) pairs already used by application packet_flow ops.
-    # Sharing a shim DMA channel between trace and application causes data
-    # corruption: both sides set up BDs on the same channel, interleaving
-    # trace events with computation data.
+    # Exclude (col, ch) pairs with occupied S2MM channels.  Trace uses
+    # S2MM to receive data from tiles; MM2S (including control overlay)
+    # is physically independent and not excluded.
     occupied = find_occupied_shim_dma_channels(mlir_text)
     if occupied:
-        print(f"  Planner: shim DMA channels occupied by application: "
+        print(f"  Planner: shim S2MM channels occupied by application: "
               f"{sorted(occupied)}", file=sys.stderr)
+    if has_control_overlay(mlir_text):
+        print("  Planner: control packet overlay detected (@base device); "
+              "overlay MM2S flows will be added during compilation",
+              file=sys.stderr)
 
     num_cols = tm.columns()
+
+    # -- Try distributed routing first (multi-column designs) -------------
+    distributed = _try_distributed_plan(
+        mlir_text, trace_targets, test_cols, tile_info,
+        occupied, num_cols,
+    )
+    if distributed is not None:
+        return distributed
+
+    # -- Single-destination fallback --------------------------------------
     candidates_params = [
         (col, ch) for col in range(num_cols) for ch in range(2)
         if (col, ch) not in occupied
@@ -1583,6 +1863,7 @@ def inject_trace(
 def inject_trace_per_column(
     mlir_text: str,
     trace_size: int,
+    plan: "TracePlan | None" = None,
     events_config: dict | None = None,
 ) -> tuple[str, dict]:
     """Inject per-column trace routing for higher bandwidth multi-tile tracing.
@@ -1590,6 +1871,11 @@ def inject_trace_per_column(
     Instead of routing all trace packets to a single shim DMA channel, this
     groups tiles by column and routes each column's trace to that column's own
     shim DMA.  This provides up to 4x bandwidth on npu1 (4 columns).
+
+    When a ``plan`` with populated ``slots`` is provided, the slot assignments
+    (shim_col, channel, targets) are used directly instead of the legacy
+    hardcoded channel-1 assignment.  This ensures the pathfinder-validated
+    routing from the planner is respected.
 
     The implementation calls the same mlir-aie primitives as
     configure_packet_tracing_aie2() but decomposes the operation to support
@@ -1697,6 +1983,22 @@ def inject_trace_per_column(
             col = tile.col.value
             tiles_by_col.setdefault(col, []).append(tile)
 
+        # -- Build slot-based routing map ------------------------------------
+        # When the plan provides slots (pathfinder-validated distributed
+        # assignments), use them.  Otherwise fall back to legacy logic
+        # that assigns each column to its own shim with hardcoded channel.
+        #
+        # slot_map: (col, row, trace_port) -> (shim_col, channel)
+        # This maps each trace target to its destination shim DMA.
+        slot_map: dict[tuple[int, int, int], tuple[int, int]] = {}
+        slot_channels: dict[int, int] = {}  # shim_col -> channel
+
+        if plan and plan.slots:
+            for slot in plan.slots:
+                slot_channels[slot.shim_col] = slot.channel
+                for target in slot.targets:
+                    slot_map[tuple(target)] = (slot.shim_col, slot.channel)
+
         # Each active column needs a shim.  If a column has tiles but no shim
         # tile declared, route to the nearest column that has one.
         active_cols = sorted(tiles_by_col.keys())
@@ -1709,11 +2011,39 @@ def inject_trace_per_column(
                 nearest = min(shim_tiles.keys(), key=lambda c: abs(c - col))
                 col_to_shim[col] = shim_tiles[nearest]
 
+        # If we have plan slots, also ensure shim tiles exist for all slot
+        # shim columns (they may not be in the original MLIR).
+        if plan and plan.slots:
+            for slot in plan.slots:
+                if slot.shim_col not in shim_tiles:
+                    # Create the shim tile if needed (will be created below
+                    # during packet flow insertion).
+                    col_to_shim[slot.shim_col] = None  # placeholder
+
         # Deduplicate: group columns that share a shim
         shim_to_cols: dict[int, list[int]] = {}
         for col in active_cols:
-            shim_col = col_to_shim[col].col.value
-            shim_to_cols.setdefault(shim_col, []).append(col)
+            if slot_map:
+                # With plan slots, group by slot assignment
+                for tile in tiles_by_col[col]:
+                    tc, tr = tile.col.value, tile.row.value
+                    # Use the first target's shim as the representative
+                    target_key = (tc, tr, 0)
+                    if target_key in slot_map:
+                        shim_col = slot_map[target_key][0]
+                        shim_to_cols.setdefault(shim_col, [])
+                        if col not in shim_to_cols[shim_col]:
+                            shim_to_cols[shim_col].append(col)
+                        break
+                else:
+                    # Fallback: use the column's own shim
+                    shim_col = col_to_shim[col].col.value if col_to_shim.get(col) else col
+                    shim_to_cols.setdefault(shim_col, [])
+                    if col not in shim_to_cols[shim_col]:
+                        shim_to_cols[shim_col].append(col)
+            else:
+                shim_col = col_to_shim[col].col.value
+                shim_to_cols.setdefault(shim_col, []).append(col)
 
         # The primary shim (for start/stop broadcast) is the first one
         primary_shim = col_to_shim[active_cols[0]]
@@ -1744,9 +2074,29 @@ def inject_trace_per_column(
                   f"trace IDs: {trace_id_start}-{max_trace_id}",
                   file=sys.stderr)
 
+        # Determine channel for each shim.  Plan slots have pathfinder-
+        # validated channels; legacy path uses find_occupied to pick a
+        # free channel (defaulting to 1 for backward compat).
+        occupied = find_occupied_shim_dma_channels(mlir_text) if not slot_map else set()
+
+        def _channel_for_shim(shim_col: int) -> int:
+            """Get the trace S2MM channel for a shim column."""
+            if shim_col in slot_channels:
+                return slot_channels[shim_col]
+            # Legacy fallback: pick the first free channel, prefer ch 1.
+            if (shim_col, 1) not in occupied:
+                return 1
+            if (shim_col, 0) not in occupied:
+                return 0
+            # Both occupied -- use ch 1 and hope for the best (the planner
+            # should have caught this, but defensive fallback).
+            return 1
+
         with InsertionPoint.at_block_terminator(device_block):
             for col in active_cols:
                 shim = col_to_shim[col]
+                shim_col_val = shim.col.value if shim else col
+                channel = _channel_for_shim(shim_col_val)
                 col_tiles = tiles_by_col[col]
                 seen = []
                 for i, tile in enumerate(col_tiles):
@@ -1754,7 +2104,8 @@ def inject_trace_per_column(
                     if tile not in seen:
                         packetflow(
                             p_id, tile, WireBundle.Trace, 0,
-                            dests={"dest": shim, "port": WireBundle.DMA, "channel": 1},
+                            dests={"dest": shim, "port": WireBundle.DMA,
+                                   "channel": channel},
                             keep_pkt_header=True,
                         )
                         seen.append(tile)
@@ -1762,7 +2113,8 @@ def inject_trace_per_column(
                         # Second trace port (memory module) for same tile
                         packetflow(
                             p_id, tile, WireBundle.Trace, 1,
-                            dests={"dest": shim, "port": WireBundle.DMA, "channel": 1},
+                            dests={"dest": shim, "port": WireBundle.DMA,
+                                   "channel": channel},
                             keep_pkt_header=True,
                         )
 
@@ -1911,8 +2263,9 @@ def inject_trace_per_column(
                 trace_ddr_ids[shim_col] = ddr_id
                 # BD IDs: use 15 for first shim, 14 for second, etc.
                 bd_id = 15 - idx
+                channel = _channel_for_shim(shim_col)
                 configure_shimtile_dma_aie2(
-                    shim=shim, channel=1, bd_id=bd_id,
+                    shim=shim, channel=channel, bd_id=bd_id,
                     ddr_id=ddr_id, size=trace_size // 4,
                     offset=0, enable_token=1,
                 )
@@ -2258,8 +2611,16 @@ def main():
               file=sys.stderr)
 
     # Print planner diagnostic table
-    print(f"  Planner: shim col {plan.shim_col}, S2MM channel {plan.trace_channel}",
-          file=sys.stderr)
+    if plan.slots:
+        print(f"  Planner: distributed across {len(plan.slots)} slots:",
+              file=sys.stderr)
+        for s in plan.slots:
+            print(f"    col {s.shim_col} ch {s.channel}: "
+                  f"{len(s.targets)} targets",
+                  file=sys.stderr)
+    else:
+        print(f"  Planner: shim col {plan.shim_col}, S2MM channel {plan.trace_channel}",
+              file=sys.stderr)
     if plan.candidates:
         for c in plan.candidates:
             status = "WINNER" if (c.shim_col == plan.shim_col
@@ -2283,7 +2644,8 @@ def main():
                   "ignoring filter", file=sys.stderr)
         try:
             traced_mlir, manifest_partial = inject_trace_per_column(
-                mlir_text, args.trace_size, events_config,
+                mlir_text, args.trace_size, plan=plan,
+                events_config=events_config,
             )
         except Exception as e:
             print(f"Error injecting trace: {e}", file=sys.stderr)
