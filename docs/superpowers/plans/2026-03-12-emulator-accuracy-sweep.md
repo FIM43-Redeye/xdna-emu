@@ -194,8 +194,20 @@ git commit -m "docs: WS2 complete -- aie-rt cross-verification results"
 **Goal:** Complete vector compute implementation: migrate ops to semantic
 dispatch, implement config word extraction, fill remaining gaps.
 
-**Dispatch 5 agents in parallel**, each in its own worktree. Each agent
-owns a specific file and does NOT touch files owned by other agents.
+**WS2 carryover -- CASCADE-2:** Cascade instructions are not connected to
+FIFO data movement. This crosses the interpreter/device boundary and belongs
+in WS1. Agent A should wire cascade put/get instructions in the semantic
+dispatcher to the device cascade FIFOs as part of the migration work.
+
+**Dispatch 5 agents in parallel.** Each agent owns a specific file and
+does NOT touch files owned by other agents.
+
+**LESSON FROM WS2:** Do NOT use worktrees for audit/read-heavy agents.
+Worktrees snapshot at creation time and diverge as other agents modify dev.
+WS2 round 1 audited stale code, producing false positives and missing real
+bugs. Use worktrees only for agents that need file-level isolation for
+concurrent writes. For WS1, worktrees ARE appropriate since agents write
+to different files.
 
 **Agent A: Semantic Dispatch Migration**
 - Create: `src/interpreter/execute/vector_semantic.rs`
