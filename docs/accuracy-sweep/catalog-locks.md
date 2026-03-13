@@ -1,151 +1,162 @@
 # Lock Subsystem Divergence Catalog
 
-**Audit date**: 2026-03-12
+**Audit date**: 2026-03-12 (re-audit)
 **Reference**: aie-rt branch xlnx_rel_v2025.2
 
 ---
 
-## [LOCKS-1] Lock register stride wrong (4 instead of 0x10)
+## [LOCKS-1] Lock register stride wrong (4 instead of 0x10) -- RESOLVED
 
 - **Severity**: CRITICAL
-- **Our behavior**: Lock value registers were indexed at 4-byte stride:
-  `lock_idx = (offset - 0x1F000) / 4`. This means offset 0x1F010 decoded
-  as lock 4, and lock 5 was at offset 0x1F014. CDO lock initialization
-  writes were going to the wrong lock indices.
-- **aie-rt behavior**: `LockSetValOff = 0x10` (16 bytes between consecutive
-  lock value registers). LOCK0_VALUE = 0x1F000, LOCK1_VALUE = 0x1F010, ...,
-  LOCK15_VALUE = 0x1F0F0. See `xaiemlgbl_reginit.c:2455` and
-  `xaiemlgbl_params.h:10697`.
-- **Impact**: Every CDO that initializes locks via register writes would set
-  the wrong lock indices. This affects all bridge tests that use DMA with
-  lock synchronization (add_one_using_dma, matrix_mult, etc.). The bug was
-  latent because most test patterns only used a few locks and the addressing
-  happened to work by accident for lock 0.
-- **Suggested fix**: Change `/4` to `/0x10` in state.rs and registers.rs.
-- **Fixed in-place**: yes
-  - `src/device/state.rs`: two occurrences (write_register, mask_write_register)
-  - `src/device/registers.rs`: one occurrence (lookup_lock)
-  - `src/device/registers.rs`: test_lookup_lock updated
+- **Status**: FIXED (previous sweep)
+- **Description**: Lock value registers were indexed at 4-byte stride
+  instead of the correct 0x10 (16 bytes). CDO lock initialization writes
+  went to wrong lock indices.
+- **Resolution**: Lock base/stride are now derived from the AM025 register
+  database via `DeviceRegLayout` (`memory_lock_base`, `memory_lock_stride`,
+  `memtile_lock_base`, `memtile_lock_stride`). Cross-validated at build time
+  against aie-rt constants.
 
 ---
 
-## [LOCKS-2] DMA lock acquire ignores BD's acquire_value
+## [LOCKS-2] DMA lock acquire ignores BD's acquire_value -- RESOLVED
 
 - **Severity**: HIGH
-- **Our behavior**: `DmaEngine::try_acquire_lock()` called `lock.acquire()`
-  (simple decrement by 1) instead of using the BD's `acquire_value` as the
-  signed delta. The transfer's `acquire_value` field was stored but never
-  used during acquire.
-- **aie-rt behavior**: DMA BD lock acquire uses a signed change_value delta.
-  `LockAcqVal` is stored in the BD word and the hardware checks
-  `value + delta >= 0` before applying the delta. Negative deltas are the
-  typical consume pattern (e.g., delta=-1 means "wait for value >= 1, then
-  decrement"). See `xaie_dma_aieml.c:150-151` for BD field setup,
-  `xaie_locks_aieml.c:112-133` for acquire semantics.
-- **Impact**: DMA transfers with non-default lock values (delta != -1)
-  would behave incorrectly. For the common delta=-1 case, the old simple
-  `acquire()` happened to produce the same effect by coincidence.
-- **Suggested fix**: Use `lock.acquire_with_value(expected, delta)` with
-  expected derived from the delta.
-- **Fixed in-place**: yes
-  - `src/device/dma/engine.rs`: try_acquire_lock() rewritten
+- **Status**: FIXED (previous sweep)
+- **Description**: DMA engine used simple `lock.acquire()` (decrement by 1)
+  instead of the BD's `acquire_value` delta.
+- **Resolution**: DMA lock acquire now routes through the lock arbiter with
+  proper delta values derived from the BD's `Lock_Acq_Value` field.
+  `submit_acquire_request()` maps the signed `acquire_value` to
+  `(expected, delta, equal_mode)` for the arbiter.
 
 ---
 
-## [LOCKS-3] DMA lock release ignores BD's release_value
+## [LOCKS-3] DMA lock release ignores BD's release_value -- RESOLVED
 
 - **Severity**: HIGH
-- **Our behavior**: `DmaEngine::complete_transfer()` called `lock.release()`
-  (simple increment by 1) instead of using the BD's `release_value` as the
-  signed delta. The transfer's `release_value` field was stored but never
-  used during release.
-- **aie-rt behavior**: DMA BD lock release uses a signed change_value delta.
-  `LockRelVal` is stored in the BD word and the hardware applies the delta
-  unconditionally (release is non-blocking). See `xaie_dma_aieml.c:389-390`
-  for BD word encoding.
-- **Impact**: DMA transfers with non-default lock release values (delta != +1)
-  would behave incorrectly. For the common delta=+1 case, the old simple
-  `release()` happened to produce the same effect.
-- **Suggested fix**: Use `lock.release_with_value(delta)` with delta from the
-  transfer's release_value.
-- **Fixed in-place**: yes
-  - `src/device/dma/engine.rs`: complete_transfer() updated
+- **Status**: FIXED (previous sweep)
+- **Description**: DMA engine used simple `lock.release()` (increment by 1)
+  instead of the BD's `release_value` delta.
+- **Resolution**: DMA lock release now routes through the lock arbiter with
+  the BD's `Lock_Rel_Value` as the delta. The `ReleasingLock` FSM state
+  carries the `release_value` from the transfer.
 
 ---
 
-## [LOCKS-4] DMA lock test values used wrong sign convention
+## [LOCKS-4] DMA lock test values used wrong sign convention -- RESOLVED
 
 - **Severity**: MEDIUM
-- **Our behavior**: Tests used `with_acquire(5, 1)` (acquire_value=+1) and
-  `with_release(5, 0)` (release_value=0), which doesn't match the hardware
-  convention. With the old broken code these tests passed by accident because
-  the values were ignored.
-- **aie-rt behavior**: In hardware DMA BDs, the acquire value for a consume
-  pattern is negative (delta=-1 means "wait for value >= 1, then decrement").
-  Release for a produce pattern is positive (delta=+1 means "increment by 1").
-  See mlir-aie `AcquireGreaterEqual, 1` which compiles to `acq_val = -1` in
-  the BD, and `Release, 1` which compiles to `rel_val = +1`.
-- **Impact**: Tests were encoding incorrect hardware semantics. Now that the
-  engine uses the values, the tests needed to match hardware convention.
-- **Suggested fix**: Update test values to use hardware-correct deltas.
-- **Fixed in-place**: yes
-  - `src/device/dma/engine.rs`: test_transfer_with_lock, test_lock_timing_integration
-  - `src/device/dma/mod.rs`: test_bd_config_with_locks
+- **Status**: FIXED (previous sweep)
+- **Description**: Tests used incorrect sign conventions for lock values,
+  masked by the fact that values were previously ignored.
+- **Resolution**: Tests updated to match hardware convention (negative
+  acquire values for GE mode, positive release values for produce pattern).
 
 ---
 
-## [LOCKS-5] Mem tile / shim tile lock registers not handled
+## [LOCKS-5] Mem tile / shim tile lock registers not handled -- RESOLVED
 
-- **Severity**: MEDIUM (deferred -- not lock-specific)
-- **Our behavior**: `RegisterModule::from_offset()` only maps the compute tile
-  lock range (0x1F000-0x1F0FF). Mem tile locks (base 0xC0000) and shim NOC
-  locks (base 0x14000) map to `RegisterModule::Unknown`.
-- **aie-rt behavior**: Each tile type has its own lock base address:
-  - Compute: `LOCK0_VALUE = 0x1F000` (MEMORY_MODULE)
-  - MemTile: `LOCK0_VALUE = 0xC0000` (MEM_TILE_MODULE)
-  - ShimNOC: `LOCK0_VALUE = 0x14000` (NOC_MODULE)
-  All use the same stride (`LockSetValOff = 0x10`).
-  See `xaiemlgbl_params.h:10697,15911,32348`.
-- **Impact**: CDO writes to mem tile or shim tile locks are silently ignored.
-  This will become critical when mem tile DMA is fully implemented.
-- **Suggested fix**: Implement tile-type-aware register dispatch that uses
-  different offset maps per tile type.
-- **Fixed in-place**: no (requires broader register architecture work)
+- **Severity**: MEDIUM
+- **Status**: FIXED
+- **Description**: `write_tile_register()` only mapped compute tile lock
+  range. Mem tile and shim tile lock offsets fell through to Unknown.
+- **Resolution**: `DeviceState::write_tile_register()` now dispatches
+  `SubsystemKind::Lock` for all tile types. The `subsystem_from_offset()`
+  function uses tile-kind-aware offset ranges from `xdna-archspec`. Compute
+  and memtile locks are properly routed to `write_lock_value()` with the
+  correct base/stride. Shim locks are stored in the raw register map.
 
 ---
 
-## [LOCKS-6] Cross-tile lock access (core IDs 48-63) not implemented
+## [LOCKS-6] Cross-tile lock access (core IDs 48-63) -- RESOLVED
 
-- **Severity**: LOW (no tests exercise this path yet)
-- **Our behavior**: Core instruction lock operations use the lock ID directly
-  as an index into `tile.locks[]`. Lock IDs 48-63 are supposed to map to the
-  tile's own memory module locks 0-15 (East=Internal quadrant per AM025).
-- **aie-rt behavior**: The core uses lock IDs in the instruction encoding.
-  IDs 48-63 access the compute tile's own memory module locks (which are the
-  same physical locks but addressed differently by the core vs memory module).
-  The memory module locks (0-15) and core-visible locks (48-63) refer to the
-  same hardware resources.
-- **Impact**: None currently -- generated code from mlir-aie uses the memory
-  module lock IDs (0-15) in DMA BDs and the remapped IDs (48-63) in core
-  instructions. The emulator would access out-of-bounds if a core instruction
-  used lock ID >= 64.
-- **Suggested fix**: Add ID remapping in the core lock instruction handler:
-  if lock_id >= 48 && lock_id <= 63, remap to lock_id - 48.
-- **Fixed in-place**: no (needs investigation of real instruction encodings)
+- **Severity**: MEDIUM
+- **Status**: FIXED
+- **Description**: Core instruction lock operations used the raw lock ID
+  as an index, ignoring the quadrant routing where IDs 48-63 map to the
+  tile's own memory module locks 0-15.
+- **Resolution**: `route_lock()` in `control.rs` implements full quadrant
+  routing:
+  - IDs 48-63 -> own tile locks 0-15 (East = Internal)
+  - IDs 0-15 -> MemTile locks (South, when provided)
+  - IDs 16-47 -> fallback to own tile (West/North not yet connected)
+
+  The coordinator passes MemTile lock copies to the core interpreter,
+  enabling proper synchronization between compute tile cores and MemTile
+  DMA operations.
 
 ---
 
-## [LOCKS-7] MemTile DMA 192-entry lock address space not implemented
+## [LOCKS-7] MemTile DMA 192-entry lock address space -- RESOLVED
 
-- **Severity**: LOW (memtile DMA not yet functional)
-- **Our behavior**: MemTile locks use the same 64-entry array as compute tiles
-  (just with 64 entries instead of 16). No cross-tile lock addressing.
-- **aie-rt behavior**: MemTile DMA BD lock IDs use an 8-bit field addressing
-  a 192-entry space: W=0-63, Own=64-127, E=128-191. This allows DMA BDs in
-  a mem tile to synchronize with locks in adjacent columns.
-  See `AieMlMemTileDmaMod.NumLocks = 192U` (xaiemlgbl_reginit.c:421).
-- **Impact**: None currently -- memtile DMA is not yet functional in the
-  emulator.
-- **Suggested fix**: Implement when memtile DMA cross-column synchronization
-  is needed.
-- **Fixed in-place**: no
+- **Severity**: MEDIUM
+- **Status**: FIXED
+- **Description**: MemTile locks used a flat 64-entry array with no
+  cross-tile lock addressing.
+- **Resolution**: `resolve_lock_id_static()` in `engine.rs` implements
+  the full 192-entry address space:
+  - IDs 0-63: West neighbor (col-1) via `LockTarget::West`
+  - IDs 64-127: Own tile via `LockTarget::Own`
+  - IDs 128-191: East neighbor (col+1) via `LockTarget::East`
+
+  `NeighborLocks` provides safe disjoint borrows for cross-tile access.
+  `submit_lock_requests()` and `check_acquire_granted()` route operations
+  to the correct tile's arbiter.
+
+---
+
+## [LOCKS-8] Shim tile locks not connected to functional state -- OPEN
+
+- **Severity**: LOW
+- **Status**: OPEN (by design)
+- **Description**: Shim tile CDO lock writes are stored in the raw register
+  map but do not update functional `Lock` state. The shim tile lock value
+  registers (base 0x14000, stride 0x10) are recognized as
+  `SubsystemKind::Lock` but the handler only logs and stores.
+- **aie-rt behavior**: `AieMlShimNocLockMod` has the same structure as
+  compute/memtile lock modules (NumLocks=16, LockSetValOff=0x10,
+  LockValUpperBound=63, LockValLowerBound=-64).
+- **Impact**: None in practice. Shim tile DMA uses locks for host buffer
+  synchronization, which the emulator handles through the XRT plugin's
+  synchronous execution model rather than lock polling.
+- **Fix when**: Shim tile DMA lock synchronization is needed for a test case.
+
+---
+
+## [LOCKS-9] West/North quadrant routing for core lock instructions -- OPEN
+
+- **Severity**: LOW
+- **Status**: OPEN
+- **Description**: Core lock IDs 16-31 (West) and 32-47 (North) fall back
+  to own tile locks instead of routing to neighbor tiles. Only East
+  (Internal, IDs 48-63) and South (IDs 0-15) are properly routed.
+- **aie-rt behavior**: The hardware routes all four quadrants to their
+  respective neighbor tiles. West goes to col-1 compute tile, North goes
+  to row+1 compute tile.
+- **Impact**: Minimal. Standard AIE2 patterns use East/Internal for own
+  locks and South for MemTile synchronization. West/North cross-tile lock
+  access is rare in practice (only used in multi-tile compute kernels with
+  horizontal/vertical lock chaining).
+- **Fix when**: A test case exercises West or North lock access.
+
+---
+
+## [LOCKS-10] Lock_Request register MMIO not modeled -- OPEN (by design)
+
+- **Severity**: INFORMATIONAL
+- **Status**: OPEN (by design)
+- **Description**: The emulator does not model the Lock_Request register
+  address space (compute: 0x40000+, memtile: 0xD0000+). In hardware, the
+  host or a DMA control packet can issue lock operations by writing to
+  these MMIO addresses. The emulator handles lock operations through
+  structured `LockRequest` values instead.
+- **aie-rt behavior**: `_XAieMl_LockAcquire/Release()` write to computed
+  offsets within the Lock_Request space, encoding the lock ID and
+  change_value in the address bits.
+- **Impact**: None for current use cases. CDO-based lock initialization
+  uses the Lock_Value registers (SetVal interface). Core instructions and
+  DMA BDs use the arbiter directly. Control packets that target lock
+  request registers would silently fail.
+- **Fix when**: A control packet or CDO command targets the Lock_Request
+  address space rather than the Lock_Value registers.
