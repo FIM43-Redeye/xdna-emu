@@ -3843,6 +3843,198 @@ mod tests {
     }
 
     #[test]
+    fn test_cross_tile_lock_release_east() {
+        // Symmetric to test_cross_tile_lock_release_west: verify release
+        // targets east neighbor lock via the 128-191 ID range.
+        let mut engine = DmaEngine::new_mem_tile(1, 1);
+        let mut own_tile = Tile::mem_tile(1, 1);
+        let mut east_tile = Tile::mem_tile(2, 1);
+
+        // BD: acquire own lock 0 (ID 64), release east lock 7 (ID 128+7=135)
+        let bd = BdConfig::simple_1d(0x100, 32)
+            .with_acquire(64, 1)   // own lock 0, acq_eq value=1
+            .with_release(135, 1); // east lock 7, release delta +1
+        engine.configure_bd(0, bd).unwrap();
+        own_tile.data_memory_mut()[0x100..0x100 + 32].copy_from_slice(&[0xEE; 32]);
+
+        // Set own lock 0 to 1 so acquire succeeds
+        own_tile.locks[0].set(1);
+
+        engine.start_channel(6, 0).unwrap();
+
+        // Run to completion
+        let mut cycles = 0;
+        while engine.channel_active(6) {
+            {
+                let mut neighbors = NeighborLocks {
+                    west: None,
+                    east: Some(&mut east_tile),
+                };
+                engine.submit_lock_requests(&mut own_tile, &mut neighbors);
+            }
+            own_tile.resolve_lock_requests(0);
+            east_tile.resolve_lock_requests(0);
+            let mut neighbors = NeighborLocks {
+                west: None,
+                east: Some(&mut east_tile),
+            };
+            let mut host_mem = make_host_memory();
+            engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
+            cycles += 1;
+            if cycles > 500 {
+                panic!("Transfer took too long: {} cycles, state={:?}", cycles, engine.channel_state(6));
+            }
+        }
+
+        // East tile lock 7 should have been incremented by +1 (release delta)
+        assert_eq!(east_tile.locks[7].value, 1,
+            "East neighbor lock 7 should be 1 after release with delta +1");
+    }
+
+    #[test]
+    fn test_cross_tile_lock_own_acquire_memtile() {
+        // Verify that lock_id in the 64-127 range (Own) works for MemTile DMA.
+        // This exercises the second region of the 192-entry address space.
+        let mut engine = DmaEngine::new_mem_tile(1, 1);
+        let mut own_tile = Tile::mem_tile(1, 1);
+
+        // Set own lock 10 to value 1 (lock_id = 64 + 10 = 74)
+        own_tile.locks[10].set(1);
+
+        let bd = BdConfig::simple_1d(0x100, 32)
+            .with_acquire(74, 1);  // own lock 10, acq_eq value=1
+        engine.configure_bd(0, bd).unwrap();
+        own_tile.data_memory_mut()[0x100..0x100 + 32].copy_from_slice(&[0xCC; 32]);
+
+        engine.start_channel(6, 0).unwrap();
+        assert!(matches!(engine.channel_state(6), ChannelState::WaitingForLock(74)));
+
+        // Submit and resolve -- no neighbors needed for own-tile lock
+        {
+            let mut neighbors = NeighborLocks::empty();
+            engine.submit_lock_requests(&mut own_tile, &mut neighbors);
+        }
+        own_tile.resolve_lock_requests(0);
+
+        let mut neighbors = NeighborLocks::empty();
+        let mut host_mem = make_host_memory();
+        engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
+
+        assert_eq!(engine.channel_state(6), ChannelState::Active,
+            "Channel should be active after acquiring own lock via memtile ID 74");
+    }
+
+    #[test]
+    fn test_cross_tile_lock_acquire_no_east_neighbor() {
+        // MemTile at col 3 (rightmost in 4-column array) has no east neighbor.
+        // East lock access should remain waiting.
+        let mut engine = DmaEngine::new_mem_tile(3, 1);
+        let mut own_tile = Tile::mem_tile(3, 1);
+
+        // East lock 0 = lock_id 128
+        let bd = BdConfig::simple_1d(0x100, 32)
+            .with_acquire(128, 1);
+        engine.configure_bd(0, bd).unwrap();
+        own_tile.data_memory_mut()[0x100..0x100 + 32].copy_from_slice(&[0xDD; 32]);
+
+        engine.start_channel(6, 0).unwrap();
+
+        let mut neighbors = NeighborLocks::empty();
+        let mut host_mem = make_host_memory();
+        engine.step(&mut own_tile, &mut neighbors, &mut host_mem);
+
+        // Should remain waiting -- no east neighbor to satisfy lock
+        assert!(matches!(engine.channel_state(6), ChannelState::WaitingForLock(128)),
+            "Should stay waiting when east neighbor tile is absent");
+    }
+
+    #[test]
+    fn test_resolve_lock_id_memtile_boundary_values() {
+        // Exhaustive boundary test for all three regions of the 192-entry space.
+        let tile_type = TileType::MemTile;
+        let num_locks: u8 = 64;
+
+        // Region boundaries: 0, 63, 64, 127, 128, 191, 192
+        // West region: [0, 64)
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 0),
+            Some(LockTarget::West(0)),
+            "lock_id=0 -> West(0)"
+        );
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 32),
+            Some(LockTarget::West(32)),
+            "lock_id=32 -> West(32) (mid-range)"
+        );
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 63),
+            Some(LockTarget::West(63)),
+            "lock_id=63 -> West(63) (last in West region)"
+        );
+
+        // Own region: [64, 128)
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 64),
+            Some(LockTarget::Own(0)),
+            "lock_id=64 -> Own(0) (first in Own region)"
+        );
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 96),
+            Some(LockTarget::Own(32)),
+            "lock_id=96 -> Own(32) (mid-range)"
+        );
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 127),
+            Some(LockTarget::Own(63)),
+            "lock_id=127 -> Own(63) (last in Own region)"
+        );
+
+        // East region: [128, 192)
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 128),
+            Some(LockTarget::East(0)),
+            "lock_id=128 -> East(0) (first in East region)"
+        );
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 160),
+            Some(LockTarget::East(32)),
+            "lock_id=160 -> East(32) (mid-range)"
+        );
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 191),
+            Some(LockTarget::East(63)),
+            "lock_id=191 -> East(63) (last in East region)"
+        );
+
+        // Out of range
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 192),
+            None,
+            "lock_id=192 -> None (out of range)"
+        );
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 2, 1, num_locks, 255),
+            None,
+            "lock_id=255 -> None (out of range, max u8)"
+        );
+    }
+
+    #[test]
+    fn test_resolve_lock_id_shim_passthrough() {
+        // Shim tiles use a small lock ID field, always maps to Own.
+        let tile_type = TileType::Shim;
+        let num_locks = 16;
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 0, 0, num_locks, 0),
+            Some(LockTarget::Own(0))
+        );
+        assert_eq!(
+            DmaEngine::resolve_lock_id_static(tile_type, 0, 0, num_locks, 15),
+            Some(LockTarget::Own(15))
+        );
+    }
+
+    #[test]
     fn test_stream_in_per_channel_isolation() {
         // Bug: shared stream_in buffer lets one S2MM channel's data block another.
         // In real hardware, each S2MM channel has its own input FIFO connected to
