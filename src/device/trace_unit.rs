@@ -457,15 +457,18 @@ impl TraceUnit {
     /// Consume 28 bytes from the buffer and emit one packet as individual words.
     fn emit_packet_from_buffer(&mut self) {
         // Word 0: packet header
-        // Format from mlir-aie parse.py:
+        // Format from mlir-aie utils/trace/utils.py extract_tile():
         //   [4:0]   = packet_id
-        //   [12:11] = packet_type
+        //   [11:5]  = reserved (must be 0)
+        //   [13:12] = packet_type
+        //   [15:14] = reserved
         //   [20:16] = row
-        //   [28:21] = col
+        //   [27:21] = col
+        //   [30:28] = reserved (must be 0)
         //   [31]    = parity (odd parity)
         let mut header: u32 = 0;
         header |= (self.packet_id as u32) & 0x1F;
-        header |= ((self.packet_type as u32) & 0x3) << 11;
+        header |= ((self.packet_type as u32) & 0x3) << 12;
         header |= ((self.row as u32) & 0x1F) << 16;
         header |= ((self.col as u32) & 0x7F) << 21;
         // Compute odd parity over bits 30:0
@@ -704,9 +707,15 @@ mod tests {
         let packet = tu.pop_packet().unwrap();
 
         // Verify header: col=1, row=3, pkt_type=0, pkt_id=5
+        // Per mlir-aie utils/trace/utils.py extract_tile():
+        //   pkt_id  = (data >> 0)  & 0x1F  -- bits [4:0]
+        //   pkt_type = (data >> 12) & 0x3  -- bits [13:12]
+        //   row     = (data >> 16) & 0x1F  -- bits [20:16]
+        //   col     = (data >> 21) & 0x7F  -- bits [27:21]
+        //   parity  = bit 31 (odd parity)
         let header = packet[0];
         assert_eq!(header & 0x1F, 5); // packet_id
-        assert_eq!((header >> 11) & 0x3, 0); // packet_type
+        assert_eq!((header >> 12) & 0x3, 0); // packet_type
         assert_eq!((header >> 16) & 0x1F, 3); // row
         assert_eq!((header >> 21) & 0x7F, 1); // col
     }
@@ -943,5 +952,74 @@ mod tests {
         // Stop tracing -> state becomes Stopped
         tu.notify_event(29, 100);
         assert_eq!(tu.read_register(0x08), 2 << 8); // Stopped=2 at bits [9:8]
+    }
+
+    /// Validate packet header against mlir-aie decode logic for all packet types.
+    ///
+    /// The mlir-aie utils/trace/utils.py `parse_pkt_hdr_in_stream()` function
+    /// checks that bits [11:5] and [30:28] are zero and bit 19 is zero,
+    /// rejecting the header as invalid otherwise. This test exercises all
+    /// PacketType values (0=Core, 1=Mem, 2=ShimTile, 3=MemTile) to ensure
+    /// the emulator's header format passes the decoder's validity checks.
+    #[test]
+    fn test_packet_header_matches_mlir_aie_decoder() {
+        /// Reimplements mlir-aie `parse_pkt_hdr_in_stream` validity check.
+        fn mlir_aie_valid(w: u32) -> bool {
+            // Odd parity check
+            if w.count_ones() % 2 != 1 {
+                return false;
+            }
+            // Reserved fields must be zero
+            if ((w >> 5) & 0x7F) != 0 {
+                return false;
+            }
+            if ((w >> 19) & 0x1) != 0 {
+                return false;
+            }
+            if ((w >> 28) & 0x7) != 0 {
+                return false;
+            }
+            true
+        }
+
+        /// Reimplements mlir-aie `extract_tile`.
+        fn extract_tile(w: u32) -> (u32, u32, u32, u32) {
+            let col = (w >> 21) & 0x7F;
+            let row = (w >> 16) & 0x1F;
+            let pkt_type = (w >> 12) & 0x3;
+            let pkt_id = w & 0x1F;
+            (col, row, pkt_type, pkt_id)
+        }
+
+        for pkt_type in 0u8..4 {
+            let col = 2u8;
+            let row = 3u8;
+            let pkt_id = 5u8;
+
+            let mut tu = TraceUnit::new(col, row);
+            tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+            tu.write_register(0x04, ((pkt_type as u32) << 12) | (pkt_id as u32));
+            tu.write_register(0x10, 37);
+
+            tu.notify_event(28, 0);
+            for i in 1..=20 {
+                tu.notify_event(37, i as u64);
+            }
+
+            let packet = tu.pop_packet().unwrap();
+            let header = packet[0];
+
+            assert!(
+                mlir_aie_valid(header),
+                "pkt_type={}: header 0x{:08X} rejected by mlir-aie decoder",
+                pkt_type, header
+            );
+
+            let (dec_col, dec_row, dec_type, dec_id) = extract_tile(header);
+            assert_eq!(dec_col, col as u32, "col mismatch for pkt_type={}", pkt_type);
+            assert_eq!(dec_row, row as u32, "row mismatch for pkt_type={}", pkt_type);
+            assert_eq!(dec_type, pkt_type as u32, "pkt_type mismatch for pkt_type={}", pkt_type);
+            assert_eq!(dec_id, pkt_id as u32, "pkt_id mismatch for pkt_type={}", pkt_type);
+        }
     }
 }
