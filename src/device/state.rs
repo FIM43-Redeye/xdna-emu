@@ -1701,7 +1701,44 @@ impl DeviceState {
             }
         }
 
-        // 4. Trace register routing (offsets from register database).
+        // 4. Performance counter register routing.
+        //
+        // Offsets from aie-rt (xaiemlgbl_params.h). Each module's perf
+        // counter block starts at a base address; we compute the in-block
+        // offset and delegate to the Tile method that parses the fields.
+        {
+            use crate::arch::subsystem;
+            if tile.is_compute() {
+                // Core module perf counters: 0x31500-0x3158C
+                let base = subsystem::compute::core_performance::OFFSET_START;
+                let end = subsystem::compute::core_performance::OFFSET_END;
+                if offset >= base && offset < end {
+                    tile.write_core_perf_register(offset - base, value);
+                }
+                // Memory module perf counters: 0x11000-0x11084
+                let base = subsystem::compute::memory_performance::OFFSET_START;
+                let end = subsystem::compute::memory_performance::OFFSET_END;
+                if offset >= base && offset < end {
+                    tile.write_mem_perf_register(offset - base, value);
+                }
+            } else if tile.is_mem_tile() {
+                // MemTile perf counters: 0x91000-0x9108C
+                let base = subsystem::memtile::performance::OFFSET_START;
+                let end = subsystem::memtile::performance::OFFSET_END;
+                if offset >= base && offset < end {
+                    tile.write_mem_perf_register(offset - base, value);
+                }
+            } else if tile.is_shim() {
+                // Shim PL module perf counters: 0x31000-0x31084
+                let base = subsystem::shim::performance::OFFSET_START;
+                let end = subsystem::shim::performance::OFFSET_END;
+                if offset >= base && offset < end {
+                    tile.write_core_perf_register(offset - base, value);
+                }
+            }
+        }
+
+        // 5. Trace register routing (offsets from register database).
         let ce = &reg_layout.core_events;
         let me = &reg_layout.memory_events;
         let mte = &reg_layout.memtile_events;
@@ -1722,7 +1759,7 @@ impl DeviceState {
             }
         }
 
-        // 5. Edge detection event control registers (offsets from register database).
+        // 6. Edge detection event control registers (offsets from register database).
         if tile.is_compute() {
             if offset == ce.edge_detection {
                 Tile::configure_edge_detectors(&mut tile.core_edge_detectors, value, false);
@@ -1740,7 +1777,7 @@ impl DeviceState {
             }
         }
 
-        // 6. Event port selection registers (offsets from register database).
+        // 7. Event port selection registers (offsets from register database).
         // Configure which physical stream switch ports map to logical event
         // ports 0-7 for PORT_RUNNING/IDLE/STALLED trace events.
         let port_sel_base = match tile.tile_type {
@@ -1767,7 +1804,7 @@ impl DeviceState {
             }
         }
 
-        // 7. Event broadcast channel registers and Event_Generate.
+        // 8. Event broadcast channel registers and Event_Generate.
         //
         // Broadcast channels: 16 per module, each mapping a local event ID
         // to a broadcast line. When Event_Generate fires an event matching
