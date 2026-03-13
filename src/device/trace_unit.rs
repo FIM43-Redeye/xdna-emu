@@ -149,6 +149,55 @@ impl TraceUnit {
         }
     }
 
+    /// Read a trace register (offset relative to the trace register block).
+    ///
+    /// Offsets:
+    /// - 0x00: Trace_Control0
+    /// - 0x04: Trace_Control1
+    /// - 0x08: Trace_Status (state[9:8], mode[2:0])
+    /// - 0x10: Trace_Event0
+    /// - 0x14: Trace_Event1
+    pub fn read_register(&self, offset: u32) -> u32 {
+        match offset {
+            0x00 => {
+                // Trace_Control0: mode[1:0], start_event[23:16], stop_event[31:24]
+                (self.mode as u32)
+                    | ((self.start_event as u32) << 16)
+                    | ((self.stop_event as u32) << 24)
+            }
+            0x04 => {
+                // Trace_Control1: packet_type[14:12], packet_id[4:0]
+                ((self.packet_type as u32) << 12) | (self.packet_id as u32)
+            }
+            0x08 => {
+                // Trace_Status: state[9:8], mode[2:0]
+                // Per aie-rt xaie_trace.c: XAie_TraceGetState reads STATE,
+                // XAie_TraceGetMode reads MODE from this register.
+                let state_bits: u32 = match self.state {
+                    TraceState::Idle => 0,
+                    TraceState::Running => 1,
+                    TraceState::Stopped => 2,
+                };
+                (state_bits << 8) | (self.mode as u32)
+            }
+            0x10 => {
+                // Trace_Event0: evt3[31:24], evt2[23:16], evt1[15:8], evt0[7:0]
+                (self.event_slots[0] as u32)
+                    | ((self.event_slots[1] as u32) << 8)
+                    | ((self.event_slots[2] as u32) << 16)
+                    | ((self.event_slots[3] as u32) << 24)
+            }
+            0x14 => {
+                // Trace_Event1: evt7[31:24], evt6[23:16], evt5[15:8], evt4[7:0]
+                (self.event_slots[4] as u32)
+                    | ((self.event_slots[5] as u32) << 8)
+                    | ((self.event_slots[6] as u32) << 16)
+                    | ((self.event_slots[7] as u32) << 24)
+            }
+            _ => 0,
+        }
+    }
+
     /// Write a trace register (offset relative to the trace register block).
     ///
     /// Offsets:
@@ -860,5 +909,39 @@ mod tests {
                 assert_eq!(consumed, expected_size, "size mismatch: slot={} delta={}", slot, d);
             }
         }
+    }
+
+    #[test]
+    fn test_read_register_roundtrip() {
+        let mut tu = TraceUnit::new(3, 5);
+
+        // Write Control0: mode=0, start_event=28, stop_event=29
+        let ctrl0 = 0 | (28 << 16) | (29 << 24);
+        tu.write_register(0x00, ctrl0);
+        assert_eq!(tu.read_register(0x00), ctrl0);
+
+        // Write Control1: packet_type=3, packet_id=7
+        let ctrl1 = (3 << 12) | 7;
+        tu.write_register(0x04, ctrl1);
+        assert_eq!(tu.read_register(0x04), ctrl1);
+
+        // Write Event0/Event1
+        let evt0 = 37 | (38 << 8) | (39 << 16) | (40 << 24);
+        let evt1 = 41 | (42 << 8) | (43 << 16) | (44 << 24);
+        tu.write_register(0x10, evt0);
+        tu.write_register(0x14, evt1);
+        assert_eq!(tu.read_register(0x10), evt0);
+        assert_eq!(tu.read_register(0x14), evt1);
+
+        // Read Status: should be Idle (0) + mode EventTime (0)
+        assert_eq!(tu.read_register(0x08), 0);
+
+        // Start tracing -> state becomes Running
+        tu.notify_event(28, 0);
+        assert_eq!(tu.read_register(0x08), 1 << 8); // Running=1 at bits [9:8]
+
+        // Stop tracing -> state becomes Stopped
+        tu.notify_event(29, 100);
+        assert_eq!(tu.read_register(0x08), 2 << 8); // Stopped=2 at bits [9:8]
     }
 }
