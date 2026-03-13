@@ -457,6 +457,50 @@ impl DmaEngine {
         ChannelType::from_channel_index(channel as usize, self.s2mm_count)
     }
 
+    /// Convert a flat channel index to its per-direction channel number.
+    ///
+    /// In the emulator, channels are numbered as a flat array: S2MM channels
+    /// first, then MM2S. For a MemTile with 6 S2MM + 6 MM2S:
+    ///   - Flat 0..5  -> S2MM per-direction 0..5
+    ///   - Flat 6..11 -> MM2S per-direction 0..5
+    ///
+    /// This matches aie-rt's convention where ChNum is always per-direction.
+    fn per_direction_channel(&self, channel: ChannelId) -> u8 {
+        let ch = channel as usize;
+        if ch < self.s2mm_count {
+            channel
+        } else {
+            (ch - self.s2mm_count) as u8
+        }
+    }
+
+    /// Check MemTile BD-channel validity per aie-rt
+    /// `_XAieMl_MemTileDmaCheckBdChValidity()`.
+    ///
+    /// MemTile BDs 0-23 are valid only for even per-direction channels (0, 2, 4)
+    /// and BDs 24-47 are valid only for odd per-direction channels (1, 3, 5).
+    /// This constraint reflects hardware wiring of BD register banks to DMA
+    /// channel pairs.
+    ///
+    /// Returns true if the combination is valid (or the tile is not a MemTile).
+    /// Returns false for invalid MemTile BD-channel combinations.
+    fn check_memtile_bd_channel_validity(&self, bd_index: u8, channel: ChannelId) -> bool {
+        if !self.tile_type.is_mem_tile() {
+            return true;
+        }
+
+        let dir_ch = self.per_direction_channel(channel);
+
+        if bd_index < 24 && dir_ch % 2 == 0 {
+            return true;
+        }
+        if bd_index >= 24 && dir_ch % 2 == 1 {
+            return true;
+        }
+
+        false
+    }
+
     /// Map a channel index to a LockRequestor for arbiter submission.
     pub fn channel_requestor(&self, ch_idx: u8) -> crate::device::tile::LockRequestor {
         use crate::device::tile::LockRequestor;
@@ -705,6 +749,22 @@ impl DmaEngine {
 
         if bd_index as usize >= self.bd_configs.len() {
             return Err(DmaError::InvalidBd(bd_index));
+        }
+
+        // MemTile BD-channel validity check (per aie-rt
+        // _XAieMl_MemTileDmaCheckBdChValidity): BDs 0-23 are valid only
+        // for even per-direction channels (0, 2, 4) and BDs 24-47 are
+        // valid only for odd per-direction channels (1, 3, 5).
+        if !self.check_memtile_bd_channel_validity(bd_index, channel) {
+            let dir_ch = self.per_direction_channel(channel);
+            log::warn!(
+                "DMA tile({},{}) invalid MemTile BD-channel combination: \
+                 BD {} is only valid for {} channels, but per-direction channel {} is {}",
+                self.col, self.row, bd_index,
+                if bd_index < 24 { "even" } else { "odd" },
+                dir_ch,
+                if dir_ch % 2 == 0 { "even" } else { "odd" },
+            );
         }
 
         // Check if channel is already busy
@@ -3899,5 +3959,107 @@ mod tests {
             }
             other => panic!("Expected BdSetup, got {:?}", std::mem::discriminant(other)),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // MemTile BD-channel validity tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_memtile_bd_channel_validity_even_channels_low_bds() {
+        // BDs 0-23 are valid only for even per-direction channels (0, 2, 4).
+        let engine = DmaEngine::new_mem_tile(0, 1);
+
+        // Even S2MM channels (flat 0, 2, 4) with low BDs -> valid
+        assert!(engine.check_memtile_bd_channel_validity(0, 0));
+        assert!(engine.check_memtile_bd_channel_validity(10, 2));
+        assert!(engine.check_memtile_bd_channel_validity(23, 4));
+
+        // Even MM2S channels (flat 6, 8, 10 -> per-dir 0, 2, 4) with low BDs -> valid
+        assert!(engine.check_memtile_bd_channel_validity(0, 6));
+        assert!(engine.check_memtile_bd_channel_validity(15, 8));
+        assert!(engine.check_memtile_bd_channel_validity(23, 10));
+    }
+
+    #[test]
+    fn test_memtile_bd_channel_validity_odd_channels_high_bds() {
+        // BDs 24-47 are valid only for odd per-direction channels (1, 3, 5).
+        let engine = DmaEngine::new_mem_tile(0, 1);
+
+        // Odd S2MM channels (flat 1, 3, 5) with high BDs -> valid
+        assert!(engine.check_memtile_bd_channel_validity(24, 1));
+        assert!(engine.check_memtile_bd_channel_validity(35, 3));
+        assert!(engine.check_memtile_bd_channel_validity(47, 5));
+
+        // Odd MM2S channels (flat 7, 9, 11 -> per-dir 1, 3, 5) with high BDs -> valid
+        assert!(engine.check_memtile_bd_channel_validity(24, 7));
+        assert!(engine.check_memtile_bd_channel_validity(36, 9));
+        assert!(engine.check_memtile_bd_channel_validity(47, 11));
+    }
+
+    #[test]
+    fn test_memtile_bd_channel_validity_invalid_combinations() {
+        // Even channel + high BD -> invalid
+        // Odd channel + low BD -> invalid
+        let engine = DmaEngine::new_mem_tile(0, 1);
+
+        // Even S2MM channel with high BD -> invalid
+        assert!(!engine.check_memtile_bd_channel_validity(24, 0));
+        assert!(!engine.check_memtile_bd_channel_validity(47, 2));
+
+        // Odd S2MM channel with low BD -> invalid
+        assert!(!engine.check_memtile_bd_channel_validity(0, 1));
+        assert!(!engine.check_memtile_bd_channel_validity(23, 3));
+
+        // Even MM2S channel with high BD -> invalid
+        assert!(!engine.check_memtile_bd_channel_validity(30, 6));
+        assert!(!engine.check_memtile_bd_channel_validity(47, 8));
+
+        // Odd MM2S channel with low BD -> invalid
+        assert!(!engine.check_memtile_bd_channel_validity(0, 7));
+        assert!(!engine.check_memtile_bd_channel_validity(10, 9));
+    }
+
+    #[test]
+    fn test_memtile_bd_channel_validity_non_memtile_always_valid() {
+        // Compute and shim tiles should always pass (no BD-channel constraint).
+        let compute = DmaEngine::new_compute_tile(1, 2);
+        assert!(compute.check_memtile_bd_channel_validity(0, 0));
+        assert!(compute.check_memtile_bd_channel_validity(15, 1));
+
+        let shim = DmaEngine::new_shim_tile(0, 0);
+        assert!(shim.check_memtile_bd_channel_validity(0, 0));
+        assert!(shim.check_memtile_bd_channel_validity(15, 1));
+    }
+
+    #[test]
+    fn test_memtile_bd_channel_validity_boundary_bd23_bd24() {
+        // BD 23 is the last "low" BD, BD 24 is the first "high" BD.
+        let engine = DmaEngine::new_mem_tile(0, 1);
+
+        // BD 23, even channel -> valid
+        assert!(engine.check_memtile_bd_channel_validity(23, 0));
+        // BD 23, odd channel -> invalid
+        assert!(!engine.check_memtile_bd_channel_validity(23, 1));
+
+        // BD 24, odd channel -> valid
+        assert!(engine.check_memtile_bd_channel_validity(24, 1));
+        // BD 24, even channel -> invalid
+        assert!(!engine.check_memtile_bd_channel_validity(24, 0));
+    }
+
+    #[test]
+    fn test_per_direction_channel() {
+        let engine = DmaEngine::new_mem_tile(0, 1);
+
+        // S2MM channels: flat index IS the per-direction index
+        assert_eq!(engine.per_direction_channel(0), 0);
+        assert_eq!(engine.per_direction_channel(3), 3);
+        assert_eq!(engine.per_direction_channel(5), 5);
+
+        // MM2S channels: flat index 6..11 -> per-direction 0..5
+        assert_eq!(engine.per_direction_channel(6), 0);
+        assert_eq!(engine.per_direction_channel(7), 1);
+        assert_eq!(engine.per_direction_channel(11), 5);
     }
 }
