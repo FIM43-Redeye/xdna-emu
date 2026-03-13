@@ -766,6 +766,16 @@ pub struct DeviceRegLayout {
     /// Shim mux/demux register field layout
     pub shim_mux: ShimMuxLayout,
 
+    // -- Shim lock layout (derived from Lock0_value, Lock1_value in shim module) --
+    /// Lock register base offset (shim)
+    pub shim_lock_base: u32,
+    /// Lock register stride (shim)
+    pub shim_lock_stride: u32,
+    /// Lock overflow status register (shim, write-to-clear)
+    pub shim_locks_overflow: u32,
+    /// Lock underflow status register (shim, write-to-clear)
+    pub shim_locks_underflow: u32,
+
     // -- Shim BD field layout --
     /// Shim (NOC module) BD field layout
     pub shim_bd: ShimBdFieldLayout,
@@ -922,6 +932,12 @@ impl DeviceRegLayout {
         // -- Shim mux/demux --
         let shim_mux = ShimMuxLayout::from_regdb(&db)?;
 
+        // -- Shim locks --
+        let shim_lock_base = reg_offset("shim", "Lock0_value")?;
+        let shim_lock_stride = reg_offset("shim", "Lock1_value")? - shim_lock_base;
+        let shim_locks_overflow = reg_offset("shim", "Locks_Overflow")?;
+        let shim_locks_underflow = reg_offset("shim", "Locks_Underflow")?;
+
         // -- Shim BD fields --
         let shim_bd = ShimBdFieldLayout::from_regdb(&db)?;
 
@@ -1027,6 +1043,10 @@ impl DeviceRegLayout {
             memory_stream_switch,
             memtile_stream_switch,
             shim_mux,
+            shim_lock_base,
+            shim_lock_stride,
+            shim_locks_overflow,
+            shim_locks_underflow,
             shim_bd,
             shim_bd_base,
             shim_bd_stride,
@@ -1253,6 +1273,10 @@ mod tests {
         assert_eq!(layout.memory_lock_stride, 0x10);
         assert_eq!(layout.memtile_lock_base, 0xC0000);
         assert_eq!(layout.memtile_lock_stride, 0x10);
+        assert_eq!(layout.shim_lock_base, 0x14000, "Shim Lock0 offset");
+        assert_eq!(layout.shim_lock_stride, 0x10, "Shim lock stride");
+        assert_eq!(layout.shim_locks_overflow, 0x14120, "Shim Locks_Overflow offset");
+        assert_eq!(layout.shim_locks_underflow, 0x14128, "Shim Locks_Underflow offset");
 
         // Verify Lock_value field (data-driven from regdb)
         assert_eq!(layout.lock_value_width, 6, "Lock_value field width");
@@ -1490,6 +1514,23 @@ mod tests {
 
         let mt_lock1 = mt_mod.register("Lock1_value").unwrap();
         assert_eq!(mt_lock1.offset - mt_lock0.offset, 0x10, "MemTile Lock stride");
+
+        // Shim tile locks (AM025: Lock0_value @ 0x14000, stride 0x10)
+        let shim_mod = db.module("shim").unwrap();
+        let shim_lock0 = shim_mod.register("Lock0_value").unwrap();
+        assert_eq!(shim_lock0.offset, 0x14000, "Shim Lock0 offset");
+
+        let shim_lock1 = shim_mod.register("Lock1_value").unwrap();
+        assert_eq!(shim_lock1.offset - shim_lock0.offset, 0x10, "Shim Lock stride");
+
+        let shim_lock_field = shim_lock0.field("Lock_value").unwrap();
+        assert_eq!((shim_lock_field.lsb, shim_lock_field.msb), (0, 5), "Shim Lock_value bits");
+
+        // Shim lock overflow/underflow status registers
+        let shim_overflow = shim_mod.register("Locks_Overflow").unwrap();
+        assert_eq!(shim_overflow.offset, 0x14120, "Shim Locks_Overflow offset");
+        let shim_underflow = shim_mod.register("Locks_Underflow").unwrap();
+        assert_eq!(shim_underflow.offset, 0x14128, "Shim Locks_Underflow offset");
     }
 
     #[test]

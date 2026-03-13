@@ -249,17 +249,15 @@ impl DeviceState {
                     match tile_kind {
                         TileKind::Mem => {
                             Self::write_lock_value(reg_layout, tile, tile_addr,
-                                reg_layout.memtile_lock_base, reg_layout.memtile_lock_stride, value, true);
+                                reg_layout.memtile_lock_base, reg_layout.memtile_lock_stride, value, "MemTile");
                         }
                         TileKind::Compute => {
                             Self::write_lock_value(reg_layout, tile, tile_addr,
-                                reg_layout.memory_lock_base, reg_layout.memory_lock_stride, value, false);
+                                reg_layout.memory_lock_base, reg_layout.memory_lock_stride, value, "Compute");
                         }
                         TileKind::ShimNoc | TileKind::ShimPl => {
-                            // Shim lock value registers (0x14000+) are not yet
-                            // wired to lock state. Store in raw register map only
-                            // (already done above). This matches the old behavior
-                            // where shim lock offsets fell through to Unknown.
+                            Self::write_lock_value(reg_layout, tile, tile_addr,
+                                reg_layout.shim_lock_base, reg_layout.shim_lock_stride, value, "Shim");
                         }
                     }
                 }
@@ -381,12 +379,8 @@ impl DeviceState {
                                 reg_layout.memory_lock_base, reg_layout.memory_lock_stride, mask, value);
                         }
                         TileKind::ShimNoc | TileKind::ShimPl => {
-                            // Shim lock value registers not wired yet.
-                            // Do RMW on raw register map and run tile-local effects.
-                            let current = *tile.registers_ref().get(&tile_addr.offset).unwrap_or(&0);
-                            let new_value = (current & !mask) | (value & mask);
-                            tile.registers.insert(tile_addr.offset, new_value);
-                            tile_local_value = Some(new_value);
+                            Self::mask_write_lock_value(reg_layout, tile, tile_addr.offset,
+                                reg_layout.shim_lock_base, reg_layout.shim_lock_stride, mask, value);
                         }
                     }
                 }
@@ -533,14 +527,13 @@ impl DeviceState {
         base: u32,
         stride: u32,
         value: u32,
-        is_memtile: bool,
+        tile_type: &str,
     ) {
         let lock_idx = ((tile_addr.offset - base) / stride) as usize;
         if lock_idx < tile.locks.len() {
             let signed = sign_extend_lock_value(reg_layout, value);
             tile.locks[lock_idx].set(signed);
             if value != 0 {
-                let tile_type = if is_memtile { "MemTile" } else { "Compute" };
                 log::info!("CDO init {} lock {} on tile ({},{}) = {}",
                     tile_type, lock_idx, tile_addr.col, tile_addr.row, signed);
             }
@@ -1699,6 +1692,12 @@ impl DeviceState {
             } else if offset == reg_layout.memory_locks_underflow {
                 tile.clear_lock_underflow_bits(0, 16, value);
             }
+        } else if tile.is_shim() {
+            if offset == reg_layout.shim_locks_overflow {
+                tile.clear_lock_overflow_bits(0, 16, value);
+            } else if offset == reg_layout.shim_locks_underflow {
+                tile.clear_lock_underflow_bits(0, 16, value);
+            }
         }
 
         // 4. Performance counter register routing.
@@ -2000,6 +1999,59 @@ mod tests {
         // Value 31 = max positive in 6-bit signed.
         state.write_register(addr, 31).unwrap();
         assert_eq!(state.array.tile(1, 2).locks[5].value, 31);
+    }
+
+    #[test]
+    fn test_shim_lock_write() {
+        let mut state = DeviceState::new_npu1();
+
+        // Shim tile lock registers start at 0x14000, stride 0x10 (per AM025).
+        // Row 0 is the shim row.
+        let col: u8 = 0;
+        let row: u8 = 0;
+
+        // Write to lock 3 in shim tile(0,0)
+        let addr = TileAddress::encode(col, row, 0x14030); // Lock 3 = 0x14000 + 3*0x10
+        state.write_register(addr, 7).unwrap();
+        assert_eq!(state.array.tile(col, row).locks[3].value, 7);
+
+        // Negative value: 0x3F = -1 in 6-bit signed.
+        state.write_register(addr, 0x3F).unwrap();
+        assert_eq!(state.array.tile(col, row).locks[3].value, -1);
+
+        // Write to lock 0 (base address)
+        let addr0 = TileAddress::encode(col, row, 0x14000);
+        state.write_register(addr0, 10).unwrap();
+        assert_eq!(state.array.tile(col, row).locks[0].value, 10);
+
+        // Write to lock 15 (last lock)
+        let addr15 = TileAddress::encode(col, row, 0x140F0); // Lock 15 = 0x14000 + 15*0x10
+        state.write_register(addr15, 1).unwrap();
+        assert_eq!(state.array.tile(col, row).locks[15].value, 1);
+
+        // Verify lock 3 was not disturbed by other writes.
+        assert_eq!(state.array.tile(col, row).locks[3].value, -1);
+    }
+
+    #[test]
+    fn test_shim_lock_mask_write() {
+        let mut state = DeviceState::new_npu1();
+
+        let col: u8 = 1;
+        let row: u8 = 0; // Shim row
+
+        // Set lock 5 to value 10 via direct write first.
+        let addr = TileAddress::encode(col, row, 0x14050); // Lock 5
+        state.write_register(addr, 10).unwrap();
+        assert_eq!(state.array.tile(col, row).locks[5].value, 10);
+
+        // Mask write: clear bit 1 (mask=0x02, value=0x00) -> 10 & !2 = 8
+        state.mask_write_register(addr, 0x02, 0x00).unwrap();
+        assert_eq!(state.array.tile(col, row).locks[5].value, 8);
+
+        // Mask write: set bit 0 (mask=0x01, value=0x01) -> 8 | 1 = 9
+        state.mask_write_register(addr, 0x01, 0x01).unwrap();
+        assert_eq!(state.array.tile(col, row).locks[5].value, 9);
     }
 
     #[test]
