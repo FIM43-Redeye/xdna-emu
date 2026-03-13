@@ -15,6 +15,7 @@
 //! - [`testing`]: Test harness for XCLBIN binary compatibility
 //! - [`ffi`]: C-compatible Foreign Function Interface
 //! - [`fuzzer`]: Differential logic fuzzer for emulator validation
+//! - [`aiesim`]: aiesimulator subprocess harness for VCD cross-validation
 
 pub mod config;
 pub mod parser;
@@ -31,6 +32,7 @@ pub mod build_progress;
 pub mod fuzzer;
 pub mod archspec;
 pub mod vcd;
+pub mod aiesim;
 
 /// Compile-time architecture constants generated from the validated ArchModel.
 ///
