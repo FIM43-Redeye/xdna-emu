@@ -1,7 +1,7 @@
-//! Stream switch stub for DMA integration.
+//! Stream switch model for DMA and inter-tile data movement.
 //!
-//! This module provides a simplified model of the AIE2 stream switch,
-//! focusing on the functionality needed for DMA data movement.
+//! This module models the AIE2 stream switch, supporting both circuit-switched
+//! and packet-switched routing modes with FIFO-based backpressure.
 //!
 //! # Architecture
 //!
@@ -10,6 +10,7 @@
 //! - Slave ports (input): receive data from other tiles
 //! - DMA integration: DMA channels connect to specific ports
 //! - FIFOs for buffering
+//! - Arbiter/msel packet routing with slot-based header matching
 //!
 //! ```text
 //!                    North
@@ -24,17 +25,20 @@
 //!              South / Core / DMA
 //! ```
 //!
-//! # Simplifications
+//! # What is modeled
 //!
-//! This stub does NOT model:
-//! - Packet switching (only circuit switching)
-//! - Backpressure propagation delays
-//! - Route configuration complexity
+//! - Circuit-switched routing (slave -> master via slave index)
+//! - Packet-switched routing (header match, arbiter locking, msel selection)
+//! - Per-port FIFO buffering with backpressure
+//! - Intra-tile pipeline latency (3-4 cycles per AM020)
+//! - Drop-header mode for packet masters
+//! - Port activity tracking for trace events (PORT_RUNNING, PORT_STALLED, PORT_TLAST)
 //!
-//! It DOES model:
-//! - Port connectivity (which ports connect to what)
-//! - FIFO buffering (data can be queued)
-//! - Basic latency (cycles for data to traverse)
+//! # Not yet modeled
+//!
+//! - Deterministic merge (registers absorbed, no behavioral effect)
+//! - Per-tile-type port validity enforcement (CDO always programs valid routes)
+//! - Micro-timing: NoC latency, memory bank conflicts
 
 use crate::arch::timing as arch_timing;
 
