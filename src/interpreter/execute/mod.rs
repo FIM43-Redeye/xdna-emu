@@ -76,11 +76,15 @@
 //! ```
 
 mod vector;
+pub mod vector_semantic;
 pub mod vector_pack;
 pub mod vector_permute;
 pub mod vector_srs;
 pub mod vector_ups;
+pub mod vector_config;
+pub mod vector_float;
 pub mod vector_matmul;
+pub mod vector_matmul_sparse;
 mod memory;
 mod control;
 mod stream;

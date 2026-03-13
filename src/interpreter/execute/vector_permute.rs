@@ -25,6 +25,23 @@
 //! of elements, transposes it, then returns either the low or high 512-bit
 //! half of the result.
 //!
+//! # MAC Permutation Modes
+//!
+//! All 26 MAC permutation modes from the aietools constants.py are
+//! implemented. Cross-reference audit (2026-03-12):
+//!
+//! The aietools `Constants.__make_perm_modes()` generates exactly 26 modes
+//! from 26 base configuration tuples (lines 268-300 of constants.py). The
+//! stride/ordering iteration produces only one permutation per base config
+//! because:
+//! - `order_o == COL_MAJOR` and `order_y == COL_MAJOR` are always skipped
+//! - `order_x == COL_MAJOR` is always skipped (commented-out allow list)
+//! - Any stride > 1 is always skipped
+//!
+//! This yields modes 0-25 with all strides = 1 and all orderings = ROW_MAJOR.
+//! Every mode in our `MacPermuteMode` enum has been verified to match its
+//! corresponding aietools base configuration tuple field-by-field.
+//!
 //! # Implementation
 //!
 //! All permutations operate at the byte level on 64-byte (512-bit) vectors.
@@ -38,9 +55,6 @@
 //! routed to the multiplier array. Each mode defines a multi-dimensional
 //! index function (`rc2i`) that computes source positions from (row, col,
 //! inner, channel) coordinates.
-//!
-//! TODO: MAC permutation modes are not yet implemented. They will be needed
-//! when the emulator implements cycle-accurate MAC pipeline behavior.
 
 /// Number of bytes in a vector register (from archspec processor model).
 const VEC_BYTES: usize = crate::arch::processor::VECTOR_REGISTER_BYTES;
@@ -322,45 +336,78 @@ fn transpose_exact(
 ///
 /// The mode index is passed as part of the MAC instruction encoding.
 ///
-/// TODO: Full MAC permutation implementation is deferred until the emulator
-/// implements cycle-accurate MAC pipeline behavior. The mode definitions
-/// below document the hardware's capabilities.
+/// All 26 modes (0-25) correspond 1:1 with the 26 base configuration tuples
+/// in aietools constants.py `__make_perm_modes()`. This has been verified
+/// by cross-referencing each field (bits_x, bits_y, acc_cmb, bfloat, rows,
+/// inner, cols, channels, complex_x, complex_y, convolve_x, sparse) against
+/// the aietools source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 #[allow(non_camel_case_types)]
 pub enum MacPermuteMode {
-    // Matrix multiply modes
-    Mode_8x4_4x16_16x8            =  0,  // 8b x 4b,  1 ch, 4x16x8
-    Mode_8x8_4x8_8x8              =  1,  // 8b x 8b,  1 ch, 4x8x8
-    Mode_16x8_4x4_4x8             =  2,  // 16b x 8b, 1 ch, 4x4x8
-    Mode_16x16_4x2_2x8            =  3,  // 16b x16b, 1 ch, 4x2x8
-    Mode_16x8_2x8_8x8             =  4,  // 16b x 8b, 2acc, 2x8x8
-    Mode_16x8_4x8_8x4             =  5,  // 16b x 8b, 2acc, 4x8x4
-    Mode_16x16_2x4_4x8            =  6,  // 16b x16b, 2acc, 2x4x8
-    Mode_16x16_4x4_4x4            =  7,  // 16b x16b, 2acc, 4x4x4
-    Mode_BF16_4x8_8x4             =  8,  // bf16xbf16,1 ch, 4x8x4
-    // Element-wise modes
-    Mode_16x8_4x4_2ch             =  9,  // 16b x 8b, 2 ch, 4x4x4
-    Mode_8x8_Elem2                = 10,  // 8b x 8b, 32 ch, 1x2x1
-    Mode_16x16_Elem               = 11,  // 16bx16b, 32 ch, 1x1x1
-    Mode_16x16_Elem2              = 12,  // 16bx16b, 16 ch, 1x2x1 (2acc)
-    // Convolution modes
-    Mode_8x8_Conv_4x4_8ch         = 13,  // 8b x 8b,  8 ch, 4x4x1 conv
-    Mode_8x8_Conv_8x8_4ch         = 14,  // 8b x 8b,  4 ch, 8x8x1 conv
-    Mode_8x8_Conv_32x8            = 15,  // 8b x 8b,  1 ch, 32x8x1 conv
-    Mode_16x16_Conv_16x4          = 16,  // 16bx16b,  1 ch, 16x4x1 conv (2acc)
-    // BFloat16 element-wise
-    Mode_BF16_Elem2               = 17,  // bf16, 16 ch, 1x2x1
-    // FFT modes
-    Mode_32x16_4x2_2x4            = 18,  // 32bx16b, 1 ch, 4x2x4 (2acc)
-    Mode_32x16_Elem_Cplx          = 19,  // 32bx16b, 8 ch, cplx elem
-    Mode_16x16_Elem2_Cplx         = 20,  // 16bx16b, 8 ch, cplx elem (2acc)
-    // Sparse modes
-    Mode_8x4_Sparse               = 21,  // sparse variant of mode 0
-    Mode_8x8_Sparse               = 22,  // sparse variant of mode 1
-    Mode_16x8_Sparse              = 23,  // sparse variant of mode 4
-    Mode_16x16_Sparse             = 24,  // sparse variant of mode 6
-    Mode_BF16_Sparse              = 25,  // sparse variant of mode 8
+    // Matrix multiply modes (modes 0-8)
+    /// 8b x 4b, 1 channel, 4x16x8 matrix multiply.
+    Mode_8x4_4x16_16x8            =  0,
+    /// 8b x 8b, 1 channel, 4x8x8 matrix multiply.
+    Mode_8x8_4x8_8x8              =  1,
+    /// 16b x 8b, 1 channel, 4x4x8 matrix multiply (red9).
+    Mode_16x8_4x4_4x8             =  2,
+    /// 16b x 16b, 1 channel, 4x2x8 matrix multiply.
+    Mode_16x16_4x2_2x8            =  3,
+    /// 16b x 8b, 2-accumulator, 2x8x8 matrix multiply.
+    Mode_16x8_2x8_8x8             =  4,
+    /// 16b x 8b, 2-accumulator, 4x8x4 matrix multiply.
+    Mode_16x8_4x8_8x4             =  5,
+    /// 16b x 16b, 2-accumulator, 2x4x8 matrix multiply.
+    Mode_16x16_2x4_4x8            =  6,
+    /// 16b x 16b, 2-accumulator, 4x4x4 matrix multiply.
+    Mode_16x16_4x4_4x4            =  7,
+    /// BFloat16 x BFloat16, 1 channel, 4x8x4 matrix multiply.
+    Mode_BF16_4x8_8x4             =  8,
+
+    // Element-wise modes (modes 9-12)
+    /// 16b x 8b, 2 channels, 4x4x4 element-wise (red9).
+    Mode_16x8_4x4_2ch             =  9,
+    /// 8b x 8b, 32 channels, 1x2x1 element-wise.
+    Mode_8x8_Elem2                = 10,
+    /// 16b x 16b, 32 channels, 1x1x1 element-wise.
+    Mode_16x16_Elem               = 11,
+    /// 16b x 16b, 16 channels, 1x2x1 element-wise (2-accumulator).
+    Mode_16x16_Elem2              = 12,
+
+    // Convolution modes (modes 13-16)
+    /// 8b x 8b, 8 channels, 4x4x1 depth-wise convolution (red10).
+    Mode_8x8_Conv_4x4_8ch         = 13,
+    /// 8b x 8b, 4 channels, 8x8x1 depth-wise convolution (red10).
+    Mode_8x8_Conv_8x8_4ch         = 14,
+    /// 8b x 8b, 1 channel, 32x8x1 2D filter convolution.
+    Mode_8x8_Conv_32x8            = 15,
+    /// 16b x 16b, 1 channel, 16x4x1 2D filter convolution (2-accumulator).
+    Mode_16x16_Conv_16x4          = 16,
+
+    // Additional modes (mode 17)
+    /// BFloat16, 16 channels, 1x2x1 element-wise.
+    Mode_BF16_Elem2               = 17,
+
+    // FFT modes (modes 18-20)
+    /// 32b x 16b, 1 channel, 4x2x4 matrix multiply (2-accumulator).
+    Mode_32x16_4x2_2x4            = 18,
+    /// 32b x 16b, 8 channels, complex element-wise (2-accumulator).
+    Mode_32x16_Elem_Cplx          = 19,
+    /// 16b x 16b, 8 channels, complex element-wise (2-accumulator).
+    Mode_16x16_Elem2_Cplx         = 20,
+
+    // Sparse modes (modes 21-25)
+    /// Sparse: 8b x 4b, 1 channel, 4x32x8 (sparse variant of mode 0).
+    Mode_8x4_Sparse               = 21,
+    /// Sparse: 8b x 8b, 1 channel, 4x16x8 (sparse variant of mode 1).
+    Mode_8x8_Sparse               = 22,
+    /// Sparse: 16b x 8b, 2-accumulator, 2x16x8 (sparse variant of mode 4).
+    Mode_16x8_Sparse              = 23,
+    /// Sparse: 16b x 16b, 2-accumulator, 2x8x8 (sparse variant of mode 6).
+    Mode_16x16_Sparse             = 24,
+    /// Sparse: BFloat16, 1 channel, 4x16x4 (sparse variant of mode 8).
+    Mode_BF16_Sparse              = 25,
 }
 
 impl MacPermuteMode {
@@ -422,11 +469,21 @@ pub struct MacPermuteConfig {
 ///
 /// Returns the multi-dimensional parameters that define how data is routed
 /// to the multiplier array for the given mode.
+///
+/// Every entry has been verified against the corresponding base configuration
+/// tuple in aietools `constants.py` `__make_perm_modes()` (lines 268-300).
 pub fn mac_permute_config(mode: MacPermuteMode) -> MacPermuteConfig {
     use MacPermuteMode::*;
 
-    // (bits_x, bits_y, acc_cmb, bfloat, rows, inner, cols, channels, complex_x, complex_y, convolve_x, sparse)
+    // Fields: (bits_x, bits_y, acc_cmb, bfloat, rows, inner, cols, channels,
+    //          complex_x, complex_y, convolve_x, sparse)
+    //
+    // Cross-reference key (aietools constants.py tuple order):
+    //   (bits_x, bits_y, acc_cmb, channels, rows, inner, cols,
+    //    complex_x, complex_y, bfloat, convolve_x, convolve_y, sparse)
+    // Note: convolve_y is always False in all 26 modes.
     let (bx, by, ac, bf, r, i, c, ch, cx, cy, cv, sp) = match mode {
+        // Matrix multiply modes
         Mode_8x4_4x16_16x8            => ( 8,  4, 1, false,  4, 16,  8,  1, false, false, false, false),
         Mode_8x8_4x8_8x8              => ( 8,  8, 1, false,  4,  8,  8,  1, false, false, false, false),
         Mode_16x8_4x4_4x8             => (16,  8, 1, false,  4,  4,  8,  1, false, false, false, false),
@@ -436,18 +493,23 @@ pub fn mac_permute_config(mode: MacPermuteMode) -> MacPermuteConfig {
         Mode_16x16_2x4_4x8            => (16, 16, 2, false,  2,  4,  8,  1, false, false, false, false),
         Mode_16x16_4x4_4x4            => (16, 16, 2, false,  4,  4,  4,  1, false, false, false, false),
         Mode_BF16_4x8_8x4             => (16, 16, 1, true,   4,  8,  4,  1, false, false, false, false),
+        // Element-wise modes
         Mode_16x8_4x4_2ch             => (16,  8, 1, false,  4,  4,  4,  2, false, false, false, false),
         Mode_8x8_Elem2                => ( 8,  8, 1, false,  1,  2,  1, 32, false, false, false, false),
         Mode_16x16_Elem               => (16, 16, 1, false,  1,  1,  1, 32, false, false, false, false),
         Mode_16x16_Elem2              => (16, 16, 2, false,  1,  2,  1, 16, false, false, false, false),
+        // Convolution modes
         Mode_8x8_Conv_4x4_8ch         => ( 8,  8, 1, false,  4,  4,  1,  8, false, false, true,  false),
         Mode_8x8_Conv_8x8_4ch         => ( 8,  8, 1, false,  8,  8,  1,  4, false, false, true,  false),
         Mode_8x8_Conv_32x8            => ( 8,  8, 1, false, 32,  8,  1,  1, false, false, true,  false),
         Mode_16x16_Conv_16x4          => (16, 16, 2, false, 16,  4,  1,  1, false, false, true,  false),
+        // BFloat16 element-wise
         Mode_BF16_Elem2               => (16, 16, 1, true,   1,  2,  1, 16, false, false, false, false),
+        // FFT modes
         Mode_32x16_4x2_2x4            => (32, 16, 2, false,  4,  2,  4,  1, false, false, false, false),
         Mode_32x16_Elem_Cplx          => (32, 16, 2, false,  1,  1,  1,  8, true,  true,  false, false),
         Mode_16x16_Elem2_Cplx         => (16, 16, 2, false,  1,  2,  1,  8, true,  true,  false, false),
+        // Sparse modes
         Mode_8x4_Sparse               => ( 8,  4, 1, false,  4, 32,  8,  1, false, false, false, true),
         Mode_8x8_Sparse               => ( 8,  8, 1, false,  4, 16,  8,  1, false, false, false, true),
         Mode_16x8_Sparse              => (16,  8, 2, false,  2, 16,  8,  1, false, false, false, true),
@@ -522,6 +584,10 @@ pub fn rc2i(
 mod tests {
     use super::*;
 
+    // ========================================================================
+    // Shuffle mode tests
+    // ========================================================================
+
     // Helper: build a 64-byte vector from a pattern function.
     fn make_vec<F: Fn(usize) -> u8>(f: F) -> [u8; VEC_BYTES] {
         let mut v = [0u8; VEC_BYTES];
@@ -567,16 +633,10 @@ mod tests {
 
     #[test]
     fn test_t256_2x2_lo() {
-        // 1024 bits = 2 elements of 256 bits (32 bytes) arranged as 2x2 matrix.
-        // Input layout: [A0(32B), A1(32B), A2(32B), A3(32B)]
-        // As 2x2: [[A0, A1], [A2, A3]]
-        // Transposed: [[A0, A2], [A1, A3]]
-        // Lo 512 bits: [A0, A2]
         let lo = identity_lo();
         let hi = identity_hi();
         let result = shuffle_vectors(&lo, &hi, ShuffleMode::T256_2x2Lo);
 
-        // Element 0 stays (bytes 0..32 from lo), element 1 is from hi bytes 0..32
         let mut expected = [0u8; VEC_BYTES];
         expected[..32].copy_from_slice(&lo[..32]);
         expected[32..64].copy_from_slice(&hi[..32]);
@@ -589,7 +649,6 @@ mod tests {
         let hi = identity_hi();
         let result = shuffle_vectors(&lo, &hi, ShuffleMode::T256_2x2Hi);
 
-        // Transposed hi: [A1, A3]
         let mut expected = [0u8; VEC_BYTES];
         expected[..32].copy_from_slice(&lo[32..64]);
         expected[32..64].copy_from_slice(&hi[32..64]);
@@ -598,23 +657,16 @@ mod tests {
 
     #[test]
     fn test_t32_16x2_lo_deinterleave() {
-        // 1024 bits = 16x2 matrix of 32-bit (4-byte) elements.
-        // Input: [e0, e1, e2, e3, ..., e31] (each 4 bytes)
-        //   As 16x2: [[e0,e1], [e2,e3], ..., [e30,e31]]
-        // Transposed (2x16): [[e0,e2,...,e30], [e1,e3,...,e31]]
-        // Lo: even-indexed elements [e0, e2, e4, ..., e30]
         let lo = identity_lo();
         let hi = identity_hi();
         let result = shuffle_vectors(&lo, &hi, ShuffleMode::T32_16x2Lo);
 
-        // Build 128-byte input
         let mut input = [0u8; PAIR_BYTES];
         input[..VEC_BYTES].copy_from_slice(&lo);
         input[VEC_BYTES..].copy_from_slice(&hi);
 
-        // Check: result should contain elements at even column indices
         for i in 0..16 {
-            let src_elem = i * 2; // even elements
+            let src_elem = i * 2;
             let src_off = src_elem * 4;
             let dst_off = i * 4;
             assert_eq!(
@@ -635,7 +687,6 @@ mod tests {
         input[..VEC_BYTES].copy_from_slice(&lo);
         input[VEC_BYTES..].copy_from_slice(&hi);
 
-        // Hi: odd-indexed elements [e1, e3, e5, ..., e31]
         for i in 0..16 {
             let src_elem = i * 2 + 1;
             let src_off = src_elem * 4;
@@ -650,8 +701,6 @@ mod tests {
 
     #[test]
     fn test_t8_64x2_deinterleave() {
-        // 64x2 matrix of 8-bit elements -> deinterleave bytes
-        // Lo result should contain even-indexed bytes
         let lo = identity_lo();
         let hi = identity_hi();
         let result = shuffle_vectors(&lo, &hi, ShuffleMode::T8_64x2Lo);
@@ -672,9 +721,6 @@ mod tests {
 
     #[test]
     fn test_t8_2x64_interleave() {
-        // 2x64 matrix of 8-bit elements -> interleave bytes
-        // Transposed to 64x2: pairs of (lo[i], hi[i])
-        // Lo result: bytes 0..63 of interleaved data
         let lo = identity_lo();
         let hi = identity_hi();
         let result = shuffle_vectors(&lo, &hi, ShuffleMode::T8_2x64Lo);
@@ -683,13 +729,9 @@ mod tests {
         input[..VEC_BYTES].copy_from_slice(&lo);
         input[VEC_BYTES..].copy_from_slice(&hi);
 
-        // Input as 2x64: row 0 = lo[0..64], row 1 = hi[0..64]
-        // Transposed to 64x2: element (c, r) at position c*2+r
-        // Lo result = first 64 bytes = elements (0,0),(0,1),(1,0),(1,1),...,(31,0),(31,1)
         for c in 0..32 {
             for r in 0..2 {
                 let dst_byte = c * 2 + r;
-                // Source was at (r, c) in the 2x64 layout
                 let src_byte = r * 64 + c;
                 assert_eq!(
                     result[dst_byte],
@@ -702,7 +744,6 @@ mod tests {
 
     #[test]
     fn test_t16_1x2_flip() {
-        // Swap adjacent 16-bit pairs
         let mut lo = [0u8; VEC_BYTES];
         for i in 0..32 {
             let base = i * 2;
@@ -712,11 +753,8 @@ mod tests {
         let hi = [0u8; VEC_BYTES];
         let result = shuffle_vectors(&lo, &hi, ShuffleMode::T16_1x2Flip);
 
-        // Each pair of 16-bit values should be swapped
         for i in 0..16 {
             let base = i * 4;
-            // Original: [A_lo, A_hi, B_lo, B_hi]
-            // Flipped:  [B_lo, B_hi, A_lo, A_hi]
             assert_eq!(result[base], lo[base + 2]);
             assert_eq!(result[base + 1], lo[base + 3]);
             assert_eq!(result[base + 2], lo[base]);
@@ -726,13 +764,10 @@ mod tests {
 
     #[test]
     fn test_t32_4x4_transpose() {
-        // 4x4 matrix of 32-bit (4-byte) elements = 64 bytes = exactly 512 bits
-        // Transpose within a single vector
         let lo = identity_lo();
-        let hi = [0u8; VEC_BYTES]; // unused for exact modes
+        let hi = [0u8; VEC_BYTES];
         let result = shuffle_vectors(&lo, &hi, ShuffleMode::T32_4x4);
 
-        // Element (r, c) at byte offset (r*4+c)*4 moves to (c*4+r)*4
         for r in 0..4 {
             for c in 0..4 {
                 let src_off = (r * 4 + c) * 4;
@@ -748,7 +783,6 @@ mod tests {
 
     #[test]
     fn test_t8_8x8_transpose() {
-        // 8x8 matrix of 8-bit elements = 64 bytes = exactly 512 bits
         let lo = identity_lo();
         let hi = [0u8; VEC_BYTES];
         let result = shuffle_vectors(&lo, &hi, ShuffleMode::T8_8x8);
@@ -768,13 +802,10 @@ mod tests {
 
     #[test]
     fn test_t16_4x4_exact() {
-        // 4x4 matrix of 16-bit (2-byte) elements = 32 bytes < 64 bytes
-        // Only uses first 32 bytes of input
         let lo = identity_lo();
         let hi = [0u8; VEC_BYTES];
         let result = shuffle_vectors(&lo, &hi, ShuffleMode::T16_4x4);
 
-        // Check that elements within the 4x4 block are transposed
         for r in 0..4 {
             for c in 0..4 {
                 let src_off = (r * 4 + c) * 2;
@@ -866,11 +897,8 @@ mod tests {
     }
 
     // Verify a known common shuffle pattern: 32-bit deinterleave.
-    // This is how the AIE API implements filter_even for 32-bit types.
     #[test]
     fn test_deinterleave_32bit_pattern() {
-        // Put sequential 32-bit values across lo and hi:
-        // lo = [0, 1, 2, ..., 15], hi = [16, 17, ..., 31]
         let mut lo = [0u8; VEC_BYTES];
         let mut hi = [0u8; VEC_BYTES];
         for i in 0..16u32 {
@@ -882,10 +910,6 @@ mod tests {
 
         let result = shuffle_vectors(&lo, &hi, ShuffleMode::T32_16x2Lo);
 
-        // 128 bytes = 32 elements of 4 bytes, as 16x2 matrix:
-        //   Row 0: [elem_0, elem_1], Row 1: [elem_2, elem_3], ...
-        // Transposed to 2x16:
-        //   Row 0 (lo result): [elem_0, elem_2, elem_4, ..., elem_30] = even indices
         for i in 0..16 {
             let val = u32::from_le_bytes([
                 result[i * 4],
@@ -904,15 +928,715 @@ mod tests {
         let lo = identity_lo();
         let hi = identity_hi();
 
-        // Deinterleave 16-bit: T16_32x2 separates even/odd 16-bit elements
         let evens = shuffle_vectors(&lo, &hi, ShuffleMode::T16_32x2Lo);
         let odds = shuffle_vectors(&lo, &hi, ShuffleMode::T16_32x2Hi);
 
-        // Interleave them back: T16_2x32 should reconstruct the original
         let reconstructed_lo = shuffle_vectors(&evens, &odds, ShuffleMode::T16_2x32Lo);
         let reconstructed_hi = shuffle_vectors(&evens, &odds, ShuffleMode::T16_2x32Hi);
 
         assert_eq!(reconstructed_lo, lo, "lo mismatch after roundtrip");
         assert_eq!(reconstructed_hi, hi, "hi mismatch after roundtrip");
+    }
+
+    // ========================================================================
+    // Comprehensive MAC permute mode verification against aietools constants
+    // ========================================================================
+    //
+    // These tests verify every field of every MAC permute mode against the
+    // exact values from aietools constants.py __make_perm_modes() (lines
+    // 268-300). The aietools tuple format is:
+    //   (bits_x, bits_y, acc_cmb, channels, rows, inner, cols,
+    //    complex_x, complex_y, bfloat, convolve_x, convolve_y, sparse)
+    //
+    // Note: convolve_y is always False for all modes.
+
+    /// Verify a single MAC permute mode against expected aietools values.
+    fn assert_mac_mode(
+        mode_idx: u8,
+        expected_bits_x: u32,
+        expected_bits_y: u32,
+        expected_acc_combine: u32,
+        expected_bfloat: bool,
+        expected_rows: u32,
+        expected_inner: u32,
+        expected_cols: u32,
+        expected_channels: u32,
+        expected_complex_x: bool,
+        expected_complex_y: bool,
+        expected_convolve_x: bool,
+        expected_sparse: bool,
+    ) {
+        let mode = MacPermuteMode::from_mode(mode_idx)
+            .unwrap_or_else(|| panic!("mode {mode_idx} should be valid"));
+        let cfg = mac_permute_config(mode);
+
+        assert_eq!(cfg.bits_x, expected_bits_x,
+            "mode {mode_idx}: bits_x mismatch");
+        assert_eq!(cfg.bits_y, expected_bits_y,
+            "mode {mode_idx}: bits_y mismatch");
+        assert_eq!(cfg.acc_combine, expected_acc_combine,
+            "mode {mode_idx}: acc_combine mismatch");
+        assert_eq!(cfg.bfloat, expected_bfloat,
+            "mode {mode_idx}: bfloat mismatch");
+        assert_eq!(cfg.rows, expected_rows,
+            "mode {mode_idx}: rows mismatch");
+        assert_eq!(cfg.inner, expected_inner,
+            "mode {mode_idx}: inner mismatch");
+        assert_eq!(cfg.cols, expected_cols,
+            "mode {mode_idx}: cols mismatch");
+        assert_eq!(cfg.channels, expected_channels,
+            "mode {mode_idx}: channels mismatch");
+        assert_eq!(cfg.complex_x, expected_complex_x,
+            "mode {mode_idx}: complex_x mismatch");
+        assert_eq!(cfg.complex_y, expected_complex_y,
+            "mode {mode_idx}: complex_y mismatch");
+        assert_eq!(cfg.convolve_x, expected_convolve_x,
+            "mode {mode_idx}: convolve_x mismatch");
+        assert_eq!(cfg.sparse, expected_sparse,
+            "mode {mode_idx}: sparse mismatch");
+    }
+
+    // --- Matrix multiply modes (modes 0-8) ---
+
+    #[test]
+    fn test_aietools_mode_00_8x4_matmul() {
+        // aietools: ( 8, 4, 1,  1,  4,16, 8,  False, False,  False, False, False, False)
+        assert_mac_mode(0, 8, 4, 1, false, 4, 16, 8, 1, false, false, false, false);
+    }
+
+    #[test]
+    fn test_aietools_mode_01_8x8_matmul() {
+        // aietools: ( 8, 8, 1,  1,  4, 8, 8,  False, False,  False, False, False, False)
+        assert_mac_mode(1, 8, 8, 1, false, 4, 8, 8, 1, false, false, false, false);
+    }
+
+    #[test]
+    fn test_aietools_mode_02_16x8_matmul() {
+        // aietools: (16, 8, 1,  1,  4, 4, 8,  False, False,  False, False, False, False)
+        assert_mac_mode(2, 16, 8, 1, false, 4, 4, 8, 1, false, false, false, false);
+    }
+
+    #[test]
+    fn test_aietools_mode_03_16x16_matmul() {
+        // aietools: (16,16, 1,  1,  4, 2, 8,  False, False,  False, False, False, False)
+        assert_mac_mode(3, 16, 16, 1, false, 4, 2, 8, 1, false, false, false, false);
+    }
+
+    #[test]
+    fn test_aietools_mode_04_16x8_2acc_matmul() {
+        // aietools: (16, 8, 2,  1,  2, 8, 8,  False, False,  False, False, False, False)
+        assert_mac_mode(4, 16, 8, 2, false, 2, 8, 8, 1, false, false, false, false);
+    }
+
+    #[test]
+    fn test_aietools_mode_05_16x8_2acc_matmul_alt() {
+        // aietools: (16, 8, 2,  1,  4, 8, 4,  False, False,  False, False, False, False)
+        assert_mac_mode(5, 16, 8, 2, false, 4, 8, 4, 1, false, false, false, false);
+    }
+
+    #[test]
+    fn test_aietools_mode_06_16x16_2acc_matmul() {
+        // aietools: (16,16, 2,  1,  2, 4, 8,  False, False,  False, False, False, False)
+        assert_mac_mode(6, 16, 16, 2, false, 2, 4, 8, 1, false, false, false, false);
+    }
+
+    #[test]
+    fn test_aietools_mode_07_16x16_2acc_matmul_alt() {
+        // aietools: (16,16, 2,  1,  4, 4, 4,  False, False,  False, False, False, False)
+        assert_mac_mode(7, 16, 16, 2, false, 4, 4, 4, 1, false, false, false, false);
+    }
+
+    #[test]
+    fn test_aietools_mode_08_bf16_matmul() {
+        // aietools: (16,16, 1,  1,  4, 8, 4,  False, False,  True , False, False, False)
+        assert_mac_mode(8, 16, 16, 1, true, 4, 8, 4, 1, false, false, false, false);
+    }
+
+    // --- Element-wise modes (modes 9-12) ---
+
+    #[test]
+    fn test_aietools_mode_09_16x8_2ch_elemwise() {
+        // aietools: (16, 8, 1,  2,  4, 4, 4,  False, False,  False, False, False, False)
+        assert_mac_mode(9, 16, 8, 1, false, 4, 4, 4, 2, false, false, false, false);
+    }
+
+    #[test]
+    fn test_aietools_mode_10_8x8_32ch_elemwise() {
+        // aietools: ( 8, 8, 1, 32,  1, 2, 1,  False, False,  False, False, False, False)
+        assert_mac_mode(10, 8, 8, 1, false, 1, 2, 1, 32, false, false, false, false);
+    }
+
+    #[test]
+    fn test_aietools_mode_11_16x16_32ch_elemwise() {
+        // aietools: (16,16, 1, 32,  1, 1, 1,  False, False,  False, False, False, False)
+        assert_mac_mode(11, 16, 16, 1, false, 1, 1, 1, 32, false, false, false, false);
+    }
+
+    #[test]
+    fn test_aietools_mode_12_16x16_16ch_2acc_elemwise() {
+        // aietools: (16,16, 2, 16,  1, 2, 1,  False, False,  False, False, False, False)
+        assert_mac_mode(12, 16, 16, 2, false, 1, 2, 1, 16, false, false, false, false);
+    }
+
+    // --- Convolution modes (modes 13-16) ---
+
+    #[test]
+    fn test_aietools_mode_13_8x8_conv_8ch() {
+        // aietools: ( 8, 8, 1,  8,  4, 4, 1,  False, False,  False, True,  False, False)
+        assert_mac_mode(13, 8, 8, 1, false, 4, 4, 1, 8, false, false, true, false);
+    }
+
+    #[test]
+    fn test_aietools_mode_14_8x8_conv_4ch() {
+        // aietools: ( 8, 8, 1,  4,  8, 8, 1,  False, False,  False, True,  False, False)
+        assert_mac_mode(14, 8, 8, 1, false, 8, 8, 1, 4, false, false, true, false);
+    }
+
+    #[test]
+    fn test_aietools_mode_15_8x8_conv_1ch_2d() {
+        // aietools: ( 8, 8, 1,  1, 32, 8, 1,  False, False,  False, True,  False, False)
+        assert_mac_mode(15, 8, 8, 1, false, 32, 8, 1, 1, false, false, true, false);
+    }
+
+    #[test]
+    fn test_aietools_mode_16_16x16_conv_2acc() {
+        // aietools: (16,16, 2,  1, 16, 4, 1,  False, False,  False, True,  False, False)
+        assert_mac_mode(16, 16, 16, 2, false, 16, 4, 1, 1, false, false, true, false);
+    }
+
+    // --- BFloat16 element-wise (mode 17) ---
+
+    #[test]
+    fn test_aietools_mode_17_bf16_16ch_elemwise() {
+        // aietools: (16,16, 1, 16,  1, 2, 1,  False, False,  True,  False, False, False)
+        assert_mac_mode(17, 16, 16, 1, true, 1, 2, 1, 16, false, false, false, false);
+    }
+
+    // --- FFT modes (modes 18-20) ---
+
+    #[test]
+    fn test_aietools_mode_18_32x16_matmul() {
+        // aietools: (32,16, 2,  1,  4, 2, 4,  False, False,  False, False, False, False)
+        assert_mac_mode(18, 32, 16, 2, false, 4, 2, 4, 1, false, false, false, false);
+    }
+
+    #[test]
+    fn test_aietools_mode_19_32x16_cplx_elemwise() {
+        // aietools: (32,16, 2,  8,  1, 1, 1,  True,  True,   False, False, False, False)
+        assert_mac_mode(19, 32, 16, 2, false, 1, 1, 1, 8, true, true, false, false);
+    }
+
+    #[test]
+    fn test_aietools_mode_20_16x16_cplx_elemwise() {
+        // aietools: (16,16, 2,  8,  1, 2, 1,  True,  True,   False, False, False, False)
+        assert_mac_mode(20, 16, 16, 2, false, 1, 2, 1, 8, true, true, false, false);
+    }
+
+    // --- Sparse modes (modes 21-25) ---
+
+    #[test]
+    fn test_aietools_mode_21_8x4_sparse() {
+        // aietools: ( 8, 4, 1,  1,  4,32, 8,  False, False,  False, False, False, True )
+        assert_mac_mode(21, 8, 4, 1, false, 4, 32, 8, 1, false, false, false, true);
+    }
+
+    #[test]
+    fn test_aietools_mode_22_8x8_sparse() {
+        // aietools: ( 8, 8, 1,  1,  4,16, 8,  False, False,  False, False, False, True )
+        assert_mac_mode(22, 8, 8, 1, false, 4, 16, 8, 1, false, false, false, true);
+    }
+
+    #[test]
+    fn test_aietools_mode_23_16x8_sparse() {
+        // aietools: (16, 8, 2,  1,  2,16, 8,  False, False,  False, False, False, True )
+        assert_mac_mode(23, 16, 8, 2, false, 2, 16, 8, 1, false, false, false, true);
+    }
+
+    #[test]
+    fn test_aietools_mode_24_16x16_sparse() {
+        // aietools: (16,16, 2,  1,  2, 8, 8,  False, False,  False, False, False, True )
+        assert_mac_mode(24, 16, 16, 2, false, 2, 8, 8, 1, false, false, false, true);
+    }
+
+    #[test]
+    fn test_aietools_mode_25_bf16_sparse() {
+        // aietools: (16,16, 1,  1,  4,16, 4,  False, False,  True , False, False, True )
+        assert_mac_mode(25, 16, 16, 1, true, 4, 16, 4, 1, false, false, false, true);
+    }
+
+    // ========================================================================
+    // Cross-cutting MAC permute mode property tests
+    // ========================================================================
+
+    /// Verify that the total number of MAC permute modes is exactly 26,
+    /// matching aietools constants.py.
+    #[test]
+    fn test_mac_mode_count_matches_aietools() {
+        let mut count = 0u8;
+        while MacPermuteMode::from_mode(count).is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 26,
+            "Expected exactly 26 MAC permute modes (aietools constants.py generates 26)");
+    }
+
+    /// Verify that all modes produce the expected number of output lanes.
+    ///
+    /// Hardware constraint: the AIE2 has acc_num accumulators (32 for
+    /// integer, 16 for bfloat). The number of output lanes is
+    /// acc_num / acc_combine. Output elements (rows * cols * channels)
+    /// must equal this lane count.
+    ///
+    /// Per aietools:
+    ///   - acc_num = 32 for non-bfloat modes, 16 for bfloat
+    ///   - lanes_num = acc_num / acc_combine
+    #[test]
+    fn test_output_lanes_constraint() {
+        for i in 0..=25u8 {
+            let mode = MacPermuteMode::from_mode(i).unwrap();
+            let cfg = mac_permute_config(mode);
+
+            let output_elements = cfg.rows * cfg.cols * cfg.channels;
+            if cfg.complex_x || cfg.complex_y {
+                // Complex modes double the output due to real+imag parts
+                continue;
+            }
+
+            let acc_num: u32 = if cfg.bfloat { 16 } else { 32 };
+            let expected_lanes = acc_num / cfg.acc_combine;
+
+            assert_eq!(output_elements, expected_lanes,
+                "mode {i}: output elements ({output_elements}) != expected lanes ({expected_lanes}) \
+                 [acc_num={acc_num}, acc_combine={}]", cfg.acc_combine);
+        }
+    }
+
+    /// Verify that bfloat modes always use 16x16 element sizes.
+    ///
+    /// BFloat16 is encoded as 16-bit in the MAC pipeline.
+    #[test]
+    fn test_bfloat_modes_are_16x16() {
+        for i in 0..=25u8 {
+            let mode = MacPermuteMode::from_mode(i).unwrap();
+            let cfg = mac_permute_config(mode);
+
+            if cfg.bfloat {
+                assert_eq!(cfg.bits_x, 16,
+                    "mode {i}: bfloat mode should have bits_x=16");
+                assert_eq!(cfg.bits_y, 16,
+                    "mode {i}: bfloat mode should have bits_y=16");
+            }
+        }
+    }
+
+    /// Verify that sparse modes double the inner dimension compared to
+    /// their non-sparse counterparts.
+    ///
+    /// Sparse modes use 50% sparsity, so the X buffer is twice as wide
+    /// to hold the same number of non-zero elements.
+    #[test]
+    fn test_sparse_modes_double_inner() {
+        // Sparse mode 21 (8x4) vs mode 0 (8x4): inner 32 vs 16
+        let dense = mac_permute_config(MacPermuteMode::Mode_8x4_4x16_16x8);
+        let sparse = mac_permute_config(MacPermuteMode::Mode_8x4_Sparse);
+        assert_eq!(sparse.inner, dense.inner * 2,
+            "sparse 8x4: inner should be 2x dense");
+        assert_eq!(sparse.rows, dense.rows);
+        assert_eq!(sparse.cols, dense.cols);
+
+        // Sparse mode 22 (8x8) vs mode 1 (8x8): inner 16 vs 8
+        let dense = mac_permute_config(MacPermuteMode::Mode_8x8_4x8_8x8);
+        let sparse = mac_permute_config(MacPermuteMode::Mode_8x8_Sparse);
+        assert_eq!(sparse.inner, dense.inner * 2,
+            "sparse 8x8: inner should be 2x dense");
+
+        // Sparse mode 23 (16x8) vs mode 4 (16x8): inner 16 vs 8
+        let dense = mac_permute_config(MacPermuteMode::Mode_16x8_2x8_8x8);
+        let sparse = mac_permute_config(MacPermuteMode::Mode_16x8_Sparse);
+        assert_eq!(sparse.inner, dense.inner * 2,
+            "sparse 16x8: inner should be 2x dense");
+
+        // Sparse mode 24 (16x16) vs mode 6 (16x16): inner 8 vs 4
+        let dense = mac_permute_config(MacPermuteMode::Mode_16x16_2x4_4x8);
+        let sparse = mac_permute_config(MacPermuteMode::Mode_16x16_Sparse);
+        assert_eq!(sparse.inner, dense.inner * 2,
+            "sparse 16x16: inner should be 2x dense");
+
+        // Sparse mode 25 (bf16) vs mode 8 (bf16): inner 16 vs 8
+        let dense = mac_permute_config(MacPermuteMode::Mode_BF16_4x8_8x4);
+        let sparse = mac_permute_config(MacPermuteMode::Mode_BF16_Sparse);
+        assert_eq!(sparse.inner, dense.inner * 2,
+            "sparse bf16: inner should be 2x dense");
+    }
+
+    /// Verify that all sparse modes have channels=1 (no multi-channel
+    /// sparse modes exist in hardware).
+    #[test]
+    fn test_sparse_modes_single_channel() {
+        for i in 0..=25u8 {
+            let mode = MacPermuteMode::from_mode(i).unwrap();
+            let cfg = mac_permute_config(mode);
+
+            if cfg.sparse {
+                assert_eq!(cfg.channels, 1,
+                    "mode {i}: sparse modes must have channels=1");
+            }
+        }
+    }
+
+    /// Verify that convolution modes always have cols=1 (1D output in
+    /// the column dimension).
+    #[test]
+    fn test_convolution_modes_cols_1() {
+        for i in 0..=25u8 {
+            let mode = MacPermuteMode::from_mode(i).unwrap();
+            let cfg = mac_permute_config(mode);
+
+            if cfg.convolve_x {
+                assert_eq!(cfg.cols, 1,
+                    "mode {i}: convolution modes must have cols=1");
+            }
+        }
+    }
+
+    /// Verify that complex modes always have complex_x AND complex_y set
+    /// (the hardware does not support mixed real/complex operands).
+    #[test]
+    fn test_complex_modes_both_xy() {
+        for i in 0..=25u8 {
+            let mode = MacPermuteMode::from_mode(i).unwrap();
+            let cfg = mac_permute_config(mode);
+
+            if cfg.complex_x || cfg.complex_y {
+                assert!(cfg.complex_x && cfg.complex_y,
+                    "mode {i}: complex modes must have both complex_x and complex_y");
+            }
+        }
+    }
+
+    /// Verify that each lane gets the correct number of multiplier operations.
+    ///
+    /// The AIE2 has 512 multipliers feeding acc_num accumulators (32 for
+    /// integer, 16 for bfloat). With acc_combine, adjacent accumulators
+    /// merge, yielding `output_lanes = acc_num / acc_combine` outputs.
+    ///
+    /// Each output lane gets `mult_per_lane = (mult_num / acc_num) * acc_combine`
+    /// multiplier operations. These decompose into:
+    ///   - `mul_per_op = (bx / 8) * (by / 4)` multipliers per element pair
+    ///   - `dup = mult_per_lane / (mul_per_op * complex_factor)` post-addition depth
+    ///   - `inner * mul_per_op` actual unique multiply-index combinations
+    ///   - `dup` repeats of the inner loop for post-addition accumulation
+    ///
+    /// The useful constraint: `inner * mul_per_op * dup * complex_factor == mult_per_lane`
+    /// and `mult_per_lane * output_lanes == 512`.
+    #[test]
+    fn test_multiplier_lane_constraint() {
+        const MULT_NUM: u32 = 512;
+        const MULT_GRAN_X: u32 = 8;
+        const MULT_GRAN_Y: u32 = 4;
+
+        for i in 0..=25u8 {
+            let mode = MacPermuteMode::from_mode(i).unwrap();
+            let cfg = mac_permute_config(mode);
+
+            if cfg.sparse || cfg.convolve_x || cfg.bfloat {
+                continue;
+            }
+
+            let acc_num: u32 = 32;
+            let output_lanes = acc_num / cfg.acc_combine;
+            let mult_per_lane = (MULT_NUM / acc_num) * cfg.acc_combine;
+
+            // Verify the fundamental identity
+            assert_eq!(output_lanes * mult_per_lane, MULT_NUM,
+                "mode {i}: output_lanes * mult_per_lane != 512");
+
+            // Verify output_lanes matches mode dimensions
+            let complex_factor = if cfg.complex_x || cfg.complex_y { 2 } else { 1 };
+            let computed_lanes = cfg.rows * cfg.cols * cfg.channels;
+            // Complex modes produce complex outputs (real+imag per lane)
+            if complex_factor == 1 {
+                assert_eq!(computed_lanes, output_lanes,
+                    "mode {i}: dimension product doesn't match output_lanes");
+            }
+
+            // Verify mul_per_op makes sense
+            let bx = cfg.bits_x;
+            let by = cfg.bits_y;
+            let mul_per_op = (bx / MULT_GRAN_X) * (by / MULT_GRAN_Y);
+            assert!(mul_per_op > 0,
+                "mode {i}: mul_per_op should be > 0");
+
+            // Verify dup (post-addition depth) is a whole number
+            let inner_muls = cfg.inner * mul_per_op * complex_factor;
+            assert!(mult_per_lane % inner_muls == 0,
+                "mode {i}: mult_per_lane ({mult_per_lane}) not divisible by \
+                 inner_muls ({inner_muls})");
+
+            let dup = mult_per_lane / inner_muls;
+            assert!(dup >= 1,
+                "mode {i}: dup={dup} should be >= 1");
+        }
+    }
+
+    /// Verify the X-buffer fits within the 512-bit permutation width for
+    /// all non-sparse, non-convolve modes.
+    ///
+    /// aietools uses perm_width_x = 512 bits. For sparse modes, the
+    /// effective width doubles to 1024. For convolution modes, the
+    /// addressing is sliding-window and the formula is different.
+    #[test]
+    fn test_x_buffer_fits_perm_width() {
+        for i in 0..=25u8 {
+            let mode = MacPermuteMode::from_mode(i).unwrap();
+            let cfg = mac_permute_config(mode);
+
+            if cfg.convolve_x {
+                // Convolution X size: (rows-1)*row_stride + 1 + inner*inner_stride - 1
+                // With all strides = 1: rows + inner - 1
+                let x_elements = cfg.rows + cfg.inner - 1;
+                let x_bits = cfg.bits_x * cfg.channels * x_elements;
+                assert!(x_bits <= 512,
+                    "mode {i} (conv): X buffer {x_bits} bits exceeds 512");
+            } else if cfg.sparse {
+                // Sparse modes: X permutation width doubles to 1024
+                let x_bits = cfg.bits_x * cfg.channels * cfg.rows * cfg.inner;
+                assert!(x_bits <= 1024,
+                    "mode {i} (sparse): X buffer {x_bits} bits exceeds 1024");
+            } else {
+                let x_bits = cfg.bits_x * cfg.channels * cfg.rows * cfg.inner;
+                assert!(x_bits <= 512,
+                    "mode {i}: X buffer {x_bits} bits exceeds 512");
+            }
+        }
+    }
+
+    /// Verify the Y-buffer fits within the 512-bit permutation width.
+    ///
+    /// For sparse modes, Y buffer size is halved (sparsity mask selects
+    /// which elements to use).
+    #[test]
+    fn test_y_buffer_fits_perm_width() {
+        for i in 0..=25u8 {
+            let mode = MacPermuteMode::from_mode(i).unwrap();
+            let cfg = mac_permute_config(mode);
+
+            let y_bits = cfg.bits_y * cfg.channels * cfg.inner * cfg.cols;
+            if cfg.sparse {
+                assert!(y_bits / 2 <= 512,
+                    "mode {i} (sparse): Y buffer {y_bits}/2 bits exceeds 512");
+            } else {
+                assert!(y_bits <= 512,
+                    "mode {i}: Y buffer {y_bits} bits exceeds 512");
+            }
+        }
+    }
+
+    /// Verify that bits_y is always 4, 8, or 16 and bits_x is always
+    /// 8, 16, or 32 (hardware granularity constraint).
+    #[test]
+    fn test_element_width_constraints() {
+        for i in 0..=25u8 {
+            let mode = MacPermuteMode::from_mode(i).unwrap();
+            let cfg = mac_permute_config(mode);
+
+            assert!(
+                cfg.bits_x == 8 || cfg.bits_x == 16 || cfg.bits_x == 32,
+                "mode {i}: bits_x={} not in {{8, 16, 32}}",
+                cfg.bits_x
+            );
+            assert!(
+                cfg.bits_y == 4 || cfg.bits_y == 8 || cfg.bits_y == 16,
+                "mode {i}: bits_y={} not in {{4, 8, 16}}",
+                cfg.bits_y
+            );
+            assert!(cfg.bits_x >= cfg.bits_y,
+                "mode {i}: bits_x={} < bits_y={} violates hardware constraint",
+                cfg.bits_x, cfg.bits_y);
+        }
+    }
+
+    /// Verify the mult_mode index that aietools would assign to each
+    /// permute mode.
+    ///
+    /// The mult_modes table (from constants.py lines 213-222) maps
+    /// (bits_x, bits_y, acc_cmb, bfloat) to a mult_mode index.
+    #[test]
+    fn test_mult_mode_assignment() {
+        // aietools mult_modes table:
+        //   0: MultMode(8,  4, 1, false, 32)
+        //   1: MultMode(8,  8, 1, false, 32)
+        //   2: MultMode(16, 8, 1, false, 32)
+        //   3: MultMode(16, 16, 1, false, 32)
+        //   4: MultMode(16, 8, 2, false, 32)
+        //   5: MultMode(16, 16, 2, false, 32)
+        //   6: MultMode(16, 16, 1, true, 16)
+        //   7: MultMode(32, 16, 2, false, 32)
+
+        let expected_mmodes: [(u32, u32, u32, bool); 26] = [
+            // mode 0-8: matrix multiply
+            ( 8,  4, 1, false), // mmode 0
+            ( 8,  8, 1, false), // mmode 1
+            (16,  8, 1, false), // mmode 2
+            (16, 16, 1, false), // mmode 3
+            (16,  8, 2, false), // mmode 4
+            (16,  8, 2, false), // mmode 4
+            (16, 16, 2, false), // mmode 5
+            (16, 16, 2, false), // mmode 5
+            (16, 16, 1, true),  // mmode 6
+            // mode 9-12: element-wise
+            (16,  8, 1, false), // mmode 2
+            ( 8,  8, 1, false), // mmode 1
+            (16, 16, 1, false), // mmode 3
+            (16, 16, 2, false), // mmode 5
+            // mode 13-16: convolution
+            ( 8,  8, 1, false), // mmode 1
+            ( 8,  8, 1, false), // mmode 1
+            ( 8,  8, 1, false), // mmode 1
+            (16, 16, 2, false), // mmode 5
+            // mode 17: bf16 element-wise
+            (16, 16, 1, true),  // mmode 6
+            // mode 18-20: FFT
+            (32, 16, 2, false), // mmode 7
+            (32, 16, 2, false), // mmode 7
+            (16, 16, 2, false), // mmode 5
+            // mode 21-25: sparse
+            ( 8,  4, 1, false), // mmode 0
+            ( 8,  8, 1, false), // mmode 1
+            (16,  8, 2, false), // mmode 4
+            (16, 16, 2, false), // mmode 5
+            (16, 16, 1, true),  // mmode 6
+        ];
+
+        for (i, &(bx, by, ac, bf)) in expected_mmodes.iter().enumerate() {
+            let mode = MacPermuteMode::from_mode(i as u8).unwrap();
+            let cfg = mac_permute_config(mode);
+
+            assert_eq!(cfg.bits_x, bx,
+                "mode {i}: bits_x mismatch for mult_mode lookup");
+            assert_eq!(cfg.bits_y, by,
+                "mode {i}: bits_y mismatch for mult_mode lookup");
+            assert_eq!(cfg.acc_combine, ac,
+                "mode {i}: acc_combine mismatch for mult_mode lookup");
+            assert_eq!(cfg.bfloat, bf,
+                "mode {i}: bfloat mismatch for mult_mode lookup");
+        }
+    }
+
+    /// Verify the rc2i function with identity (all ones) strides produces
+    /// simple row-major and col-major linear indices.
+    #[test]
+    fn test_rc2i_identity_strides() {
+        // 4x4 matrix with 1 channel, all unit strides, row-major
+        for r in 0..4 {
+            for c in 0..4 {
+                let idx = rc2i(r, c, 0, 4, 4, 1, 1, 1, 1, Ordering::RowMajor);
+                assert_eq!(idx, r * 4 + c,
+                    "rc2i row-major ({r},{c}): expected {}, got {idx}", r * 4 + c);
+            }
+        }
+
+        // Same but col-major
+        for r in 0..4 {
+            for c in 0..4 {
+                let idx = rc2i(r, c, 0, 4, 4, 1, 1, 1, 1, Ordering::ColMajor);
+                assert_eq!(idx, c * 4 + r,
+                    "rc2i col-major ({r},{c}): expected {}, got {idx}", c * 4 + r);
+            }
+        }
+    }
+
+    /// Verify rc2i with multi-channel stride patterns.
+    #[test]
+    fn test_rc2i_multi_channel() {
+        // 2x2 matrix with 4 channels, row-major
+        // Element (row=1, col=0, ch=2): ((1*2 + 0) * 4 + 2) * 1 = 10
+        let idx = rc2i(1, 0, 2, 2, 2, 4, 1, 1, 1, Ordering::RowMajor);
+        assert_eq!(idx, 10);
+
+        // Element (row=0, col=1, ch=3): ((0*2 + 1) * 4 + 3) * 1 = 7
+        let idx = rc2i(0, 1, 3, 2, 2, 4, 1, 1, 1, Ordering::RowMajor);
+        assert_eq!(idx, 7);
+    }
+
+    // ========================================================================
+    // Additional shuffle edge case tests
+    // ========================================================================
+
+    /// Verify that all 48 shuffle modes are accessible.
+    #[test]
+    fn test_all_shuffle_modes_execute() {
+        let lo = identity_lo();
+        let hi = identity_hi();
+
+        for i in 0..=47u8 {
+            let mode = ShuffleMode::from_mode(i).unwrap();
+            let result = shuffle_vectors(&lo, &hi, mode);
+            // Just verify it produces 64 bytes without panicking
+            assert_eq!(result.len(), VEC_BYTES,
+                "mode {i}: result length mismatch");
+        }
+    }
+
+    /// Verify all deinterleave+interleave roundtrips (8, 16, 32, 64, 128
+    /// bit element sizes).
+    #[test]
+    fn test_all_deinterleave_roundtrips() {
+        let lo = identity_lo();
+        let hi = identity_hi();
+
+        // 8-bit: T8_64x2 deinterleave, T8_2x64 interleave
+        let evens = shuffle_vectors(&lo, &hi, ShuffleMode::T8_64x2Lo);
+        let odds = shuffle_vectors(&lo, &hi, ShuffleMode::T8_64x2Hi);
+        let rlo = shuffle_vectors(&evens, &odds, ShuffleMode::T8_2x64Lo);
+        let rhi = shuffle_vectors(&evens, &odds, ShuffleMode::T8_2x64Hi);
+        assert_eq!(rlo, lo, "8-bit roundtrip lo mismatch");
+        assert_eq!(rhi, hi, "8-bit roundtrip hi mismatch");
+
+        // 32-bit: T32_16x2 deinterleave, T32_2x16 interleave
+        let evens = shuffle_vectors(&lo, &hi, ShuffleMode::T32_16x2Lo);
+        let odds = shuffle_vectors(&lo, &hi, ShuffleMode::T32_16x2Hi);
+        let rlo = shuffle_vectors(&evens, &odds, ShuffleMode::T32_2x16Lo);
+        let rhi = shuffle_vectors(&evens, &odds, ShuffleMode::T32_2x16Hi);
+        assert_eq!(rlo, lo, "32-bit roundtrip lo mismatch");
+        assert_eq!(rhi, hi, "32-bit roundtrip hi mismatch");
+
+        // 64-bit: T64_8x2 deinterleave, T64_2x8 interleave
+        let evens = shuffle_vectors(&lo, &hi, ShuffleMode::T64_8x2Lo);
+        let odds = shuffle_vectors(&lo, &hi, ShuffleMode::T64_8x2Hi);
+        let rlo = shuffle_vectors(&evens, &odds, ShuffleMode::T64_2x8Lo);
+        let rhi = shuffle_vectors(&evens, &odds, ShuffleMode::T64_2x8Hi);
+        assert_eq!(rlo, lo, "64-bit roundtrip lo mismatch");
+        assert_eq!(rhi, hi, "64-bit roundtrip hi mismatch");
+
+        // 128-bit: T128_4x2 deinterleave, T128_2x4 interleave
+        let evens = shuffle_vectors(&lo, &hi, ShuffleMode::T128_4x2Lo);
+        let odds = shuffle_vectors(&lo, &hi, ShuffleMode::T128_4x2Hi);
+        let rlo = shuffle_vectors(&evens, &odds, ShuffleMode::T128_2x4Lo);
+        let rhi = shuffle_vectors(&evens, &odds, ShuffleMode::T128_2x4Hi);
+        assert_eq!(rlo, lo, "128-bit roundtrip lo mismatch");
+        assert_eq!(rhi, hi, "128-bit roundtrip hi mismatch");
+
+        // 256-bit: T256_2x2
+        let a = shuffle_vectors(&lo, &hi, ShuffleMode::T256_2x2Lo);
+        let b = shuffle_vectors(&lo, &hi, ShuffleMode::T256_2x2Hi);
+        let rlo = shuffle_vectors(&a, &b, ShuffleMode::T256_2x2Lo);
+        let rhi = shuffle_vectors(&a, &b, ShuffleMode::T256_2x2Hi);
+        assert_eq!(rlo, lo, "256-bit roundtrip lo mismatch");
+        assert_eq!(rhi, hi, "256-bit roundtrip hi mismatch");
+    }
+
+    /// Verify that zero-filled inputs produce zero-filled outputs for
+    /// all shuffle modes.
+    #[test]
+    fn test_shuffle_zero_input() {
+        let zero = [0u8; VEC_BYTES];
+
+        for i in 0..=47u8 {
+            let mode = ShuffleMode::from_mode(i).unwrap();
+            let result = shuffle_vectors(&zero, &zero, mode);
+            assert_eq!(result, zero,
+                "mode {i}: zero input should produce zero output");
+        }
     }
 }
