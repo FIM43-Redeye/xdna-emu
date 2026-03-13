@@ -1,6 +1,6 @@
 # DMA Engine -- Accuracy Sweep Match Report
 
-Audited: 2026-03-12
+Audited: 2026-03-12 (re-audited on dev branch)
 Agent: F (DMA subsystem)
 
 ## Methodology
@@ -10,7 +10,8 @@ Compared xdna-emu DMA engine (`src/device/dma/`) against aie-rt
 (`aie-rt/driver/src/global/xaiemlgbl_params.h`).
 
 All aie-rt code was read first, then our emulator code was compared
-function-by-function.
+function-by-function. This re-audit confirms several divergences from
+the initial sweep have since been resolved in-tree.
 
 ---
 
@@ -91,9 +92,13 @@ All fields match:
 - BD_7: TLAST_Suppress, Next_BD, Use_Next_BD, Valid_BD, Lock_Rel_Value,
   Lock_Rel_ID, Lock_Acq_Enable, Lock_Acq_Value, Lock_Acq_ID
 
-**Result: FULL MATCH.** Shim address reconstruction (30-bit low | 16-bit
-high << 30) matches aie-rt's split-register approach
-(`_XAieMl_ShimDmaReadBd` lines 987-994).
+**Result: FULL MATCH.** Shim address reconstruction uses
+`extract(w1) | (extract(w2) << 30)` which produces a 46-bit word address.
+The `extract()` method shifts w1 right by LSB=2 (removing the always-zero
+alignment bits), yielding bits [31:2] as a 30-bit value. The high 16 bits
+are shifted left by 30 to occupy bits [45:30]. This is algebraically
+equivalent to aie-rt's `(field << Lsb) | (high << 32)` byte address
+divided by 4: `our_word_addr * 4 == aiert_byte_addr`.
 
 Note: Shim BD correctly does NOT parse compression_enable, d2_wrap, or
 zero-padding fields (these are MemTile-only), matching aie-rt which also
@@ -178,7 +183,7 @@ aie-rt and our emulator use the value-based model.
 ### 3.3 Lock Value Sign Extension
 
 Lock values are 7-bit signed fields. Our `sign_extend_7bit()` function
-(bd.rs:537-544) correctly sign-extends from 7 bits to i8. aie-rt casts to
+(bd.rs:544-551) correctly sign-extends from 7 bits to i8. aie-rt casts to
 `(s8)` (xaie_dma_aieml.c:548, 557, 778, 787).
 
 **Result: MATCH.**
@@ -260,7 +265,7 @@ passes `d3_stepsize = 0` for non-MemTile). This is harmless -- D3 with
 aie-rt's address formula is implicit in the BD fields:
 `addr = base + d0_counter * d0_step + d1_counter * d1_step + ... + iter * iter_step`
 
-Our `compute_address()` (addressing.rs:321-333):
+Our `compute_address()` (addressing.rs:409-421):
 ```rust
 addr += (iteration_counter * iteration.stepsize_bytes())
      + sum(counters[dim] * dimensions[dim].stride)
@@ -274,7 +279,7 @@ In aie-rt, `Wrap` is the count at which the dimension resets. When
 `counter == wrap`, the counter resets to 0 and the next dimension
 increments. With `Wrap == 0`, the dimension does 1 iteration (no wrap).
 
-Our `advance()` (addressing.rs:382-408): counter increments, and when
+Our `advance()` (addressing.rs:470-496): counter increments, and when
 `counter >= effective_size()` (where effective_size() maps 0 -> 1), counter
 resets and the next dimension increments.
 
@@ -291,7 +296,7 @@ Our code converts stored 0 to actual 1, matching this invariant.
 
 ---
 
-## 7. Zero Padding (compression.rs / addressing.rs vs aie-rt)
+## 7. Zero Padding (addressing.rs vs aie-rt)
 
 ### 7.1 Padding Field Widths
 
@@ -301,7 +306,7 @@ aie-rt checks max padding per dimension
 - D1: 5 bits (max 31, `0x3F >> 1 = 0x1F`)
 - D2: 4 bits (max 15, `0x3F >> 2 = 0x0F`)
 
-Our `ZeroPadConfig` doc comment (addressing.rs:120-124) correctly states
+Our `ZeroPadConfig` doc comment (addressing.rs:121-124) correctly states
 these widths. The pad values are extracted from registers using regdb-derived
 masks that encode these widths.
 
@@ -312,10 +317,14 @@ masks that encode these widths.
 aie-rt enforces: if D{N}_wrap == 0, then D{N}_after must be 0, and all
 higher-dimension padding must be 0 (xaie_dma_aieml.c:240-262).
 
-Our emulator does not enforce this validation at BD parse time.
+Our `validate_padding()` method (addressing.rs:208-278) implements the
+identical rules: per-dimension max value checks and the wrap-zero
+propagation constraint. It is called from `to_bd_config()` (bd.rs:498-501)
+during BD setup.
 
-**Result: MINOR DIVERGENCE.** See catalog-dma.md. Not a behavioral bug
-because the compiler never generates invalid configurations.
+**Result: MATCH.** Our validation mirrors aie-rt exactly. We log warnings
+rather than returning errors, which is intentional -- the emulator is
+permissive.
 
 ### 7.3 Sparsity Compression Format
 
@@ -367,13 +376,16 @@ BD stride tests.
 ## 9. MemTile BD-Channel Validity
 
 aie-rt has `_XAieMl_MemTileDmaCheckBdChValidity()` (xaie_dma_aieml.c:1320-1331):
-- BD 0-23 are valid for even channels (0, 2, 4)
-- BD 24-47 are valid for odd channels (1, 3, 5)
+- BD 0-23 are valid for even per-direction channels (0, 2, 4)
+- BD 24-47 are valid for odd per-direction channels (1, 3, 5)
 
-Our emulator does not enforce this constraint.
+Our `check_memtile_bd_channel_validity()` (engine.rs:487-502) implements
+this exact logic. It is called from `start_channel_with_repeat()`
+(engine.rs:758). On mismatch it logs a warning but allows the operation,
+matching the emulator's permissive design philosophy.
 
-**Result: DIVERGENCE.** See catalog-dma.md. This is a validation-only issue;
-the compiler generates correct BD-channel assignments.
+**Result: MATCH.** Validation implemented; differs from aie-rt only in
+severity (warning vs error return).
 
 ---
 
@@ -395,6 +407,52 @@ The `IterationConfig` then uses the "stored-1" convention where `wrap=0` means
 
 ---
 
+## 11. Transfer Execution (engine.rs)
+
+### 11.1 FSM Phase Pipeline
+
+Our channel FSM follows:
+`BdSetup -> AcquiringLock -> MemoryLatency -> [HostPipelineLatency] -> Transferring -> ReleasingLock -> BdChaining -> [repeat/idle]`
+
+aie-rt does not define an internal FSM (it programs hardware), but the
+hardware pipeline implied by the status register bits matches:
+- `ChannelRunning` = Transferring
+- `StalledLockAcq` = AcquiringLock
+- `StalledLockRel` = ReleasingLock (not separately tracked by us)
+- `StalledStreamStarve` = S2MM stall in Transferring
+- `StalledTCT` = task completion token stall
+
+**Result: FUNCTIONALLY EQUIVALENT.** Our FSM captures the hardware pipeline
+phases. The HostPipelineLatency phase is an emulator addition for cycle-
+accuracy with DDR-backed shim transfers.
+
+### 11.2 S2MM Stream Starvation
+
+When an S2MM channel has no stream data available, real hardware stalls
+(StalledStreamStarve bit). Our `do_transfer_cycle()` returns
+`TransferCycleResult::Stalled`, which keeps the FSM in `Transferring`
+without advancing the transfer -- same behavioral effect.
+
+**Result: MATCH.**
+
+### 11.3 BD Chaining
+
+aie-rt uses `UseNxtBd` and `NxtBd` fields to chain BDs. Our emulator reads
+these from the parsed BD and transitions to `BdChaining` state after
+completion, loading the next BD with `create_transfer_from_bd()`.
+
+**Result: MATCH.**
+
+### 11.4 Repeat Count
+
+Our implementation supports `repeat_count` (run BD chain N+1 times), which
+matches the hardware Start_Queue `Repeat_Count` field. After a chain
+completes, if `repeat_count > 0`, the chain restarts from `chain_start_bd`.
+
+**Result: MATCH.**
+
+---
+
 ## Summary
 
 | Subsection | Files Compared | Result |
@@ -410,13 +468,16 @@ The `IterationConfig` then uses the "stored-1" convention where `wrap=0` means
 | Completion polling | engine.rs vs xaie_dma_aieml.c | FUNCTIONALLY EQUIVALENT |
 | Multi-dim addressing | addressing.rs vs xaie_dma_aieml.c | FULL MATCH |
 | Zero padding widths | addressing.rs vs xaie_dma_aieml.c | FULL MATCH |
-| Padding validation | N/A | MINOR DIVERGENCE |
+| Padding validation | addressing.rs vs xaie_dma_aieml.c | FULL MATCH |
 | BD spacing | bd.rs vs xaiemlgbl_params.h | FULL MATCH |
 | BD base addresses | aiert_validation.rs | FULL MATCH (cross-validated) |
-| MemTile BD-Ch validity | N/A vs xaie_dma_aieml.c | DIVERGENCE |
+| MemTile BD-Ch validity | engine.rs vs xaie_dma_aieml.c | MATCH (warn vs error) |
 | Compression format | compression.rs vs AM020 | NO DIVERGENCE POSSIBLE |
+| Transfer execution | engine.rs | FUNCTIONALLY EQUIVALENT |
+| BD chaining | engine.rs | MATCH |
+| Repeat count | engine.rs | MATCH |
 
 Overall: The DMA engine is highly accurate. No behavioral bugs were found.
-Two validation-layer gaps were identified (padding validation and MemTile
-BD-channel constraints) -- both are compile-time invariants that the
-toolchain enforces, not runtime behavioral differences.
+No critical or high-severity divergences remain. Two previously-reported
+validation gaps (DMA-D1 padding validation, DMA-D2 BD-channel checks) have
+been resolved since the initial audit.
