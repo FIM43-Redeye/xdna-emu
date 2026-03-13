@@ -486,13 +486,20 @@ impl BufferDescriptor {
             d3: DimensionConfig { size: 0, stride: d3_stride },
             iteration,
             compression_enable: self.compression_enable,
-            zero_padding: super::addressing::ZeroPadConfig {
-                d0_before: self.d0_zero_before,
-                d0_after: self.d0_zero_after,
-                d1_before: self.d1_zero_before,
-                d1_after: self.d1_zero_after,
-                d2_before: self.d2_zero_before,
-                d2_after: self.d2_zero_after,
+            zero_padding: {
+                let pad = super::addressing::ZeroPadConfig {
+                    d0_before: self.d0_zero_before,
+                    d0_after: self.d0_zero_after,
+                    d1_before: self.d1_zero_before,
+                    d1_after: self.d1_zero_after,
+                    d2_before: self.d2_zero_before,
+                    d2_after: self.d2_zero_after,
+                };
+                // Validate MemTile padding constraints per aie-rt
+                // _XAieMl_DmaMemTileCheckPaddingConfig(). Uses raw wrap values
+                // (0 = simple/1 iteration) to check propagation rules.
+                pad.validate_padding(self.d0_wrap, self.d1_wrap, self.d2_wrap);
+                pad
             },
             enable_packet: self.enable_packet,
             packet_id: self.packet_id,

@@ -188,6 +188,94 @@ impl ZeroPadConfig {
         let data_words = d0_size as u64 * d1_size as u64 * d2_size as u64;
         total_output - data_words
     }
+
+    /// Validate padding configuration against MemTile constraints.
+    ///
+    /// Checks the rules from aie-rt `_XAieMl_DmaMemTileCheckPaddingConfig()`:
+    ///
+    /// 1. **Field width limits**: D0 max 63 (6 bits), D1 max 31 (5 bits),
+    ///    D2 max 15 (4 bits). Applies to both before and after fields.
+    ///
+    /// 2. **Wrap-zero propagation**: If D{N}_wrap == 0 (register value,
+    ///    meaning effective wrap of 1), then:
+    ///    - D{N}_after must be 0
+    ///    - All higher-dimension before/after must be 0
+    ///
+    /// The `d{N}_wrap` parameters are raw register values (0 = simple/1 iteration).
+    ///
+    /// Logs warnings on violation but does not error -- the emulator is permissive.
+    /// Returns `true` if the config is valid, `false` if any warning was issued.
+    pub fn validate_padding(&self, d0_wrap: u16, d1_wrap: u16, d2_wrap: u16) -> bool {
+        if !self.is_enabled() {
+            return true;
+        }
+
+        let mut valid = true;
+
+        // Per-dimension max values: 0x3F >> dim_index
+        // D0: 6 bits (63), D1: 5 bits (31), D2: 4 bits (15)
+        const PAD_MAX_BASE: u8 = 0x3F;
+        let dim_maxes: [u8; 3] = [
+            PAD_MAX_BASE,       // D0: 63
+            PAD_MAX_BASE >> 1,  // D1: 31
+            PAD_MAX_BASE >> 2,  // D2: 15
+        ];
+
+        let befores = [self.d0_before, self.d1_before, self.d2_before];
+        let afters = [self.d0_after, self.d1_after, self.d2_after];
+        let wraps = [d0_wrap, d1_wrap, d2_wrap];
+        let dim_names = ["D0", "D1", "D2"];
+
+        // Check field width limits
+        for dim in 0..3 {
+            if befores[dim] > dim_maxes[dim] {
+                log::warn!(
+                    "MemTile zero-padding: {} before ({}) exceeds max ({})",
+                    dim_names[dim], befores[dim], dim_maxes[dim]
+                );
+                valid = false;
+            }
+            if afters[dim] > dim_maxes[dim] {
+                log::warn!(
+                    "MemTile zero-padding: {} after ({}) exceeds max ({})",
+                    dim_names[dim], afters[dim], dim_maxes[dim]
+                );
+                valid = false;
+            }
+        }
+
+        // Check wrap-zero propagation: when wrap==0, after must be 0
+        // and all higher-dimension before/after must be 0
+        for dim in 0..3 {
+            if wraps[dim] == 0 {
+                if afters[dim] != 0 {
+                    log::warn!(
+                        "MemTile zero-padding: {} after ({}) must be 0 when {} wrap is 0",
+                        dim_names[dim], afters[dim], dim_names[dim]
+                    );
+                    valid = false;
+                }
+                for higher in (dim + 1)..3 {
+                    if befores[higher] != 0 {
+                        log::warn!(
+                            "MemTile zero-padding: {} before ({}) must be 0 when {} wrap is 0",
+                            dim_names[higher], befores[higher], dim_names[dim]
+                        );
+                        valid = false;
+                    }
+                    if afters[higher] != 0 {
+                        log::warn!(
+                            "MemTile zero-padding: {} after ({}) must be 0 when {} wrap is 0",
+                            dim_names[higher], afters[higher], dim_names[dim]
+                        );
+                        valid = false;
+                    }
+                }
+            }
+        }
+
+        valid
+    }
 }
 
 /// Multi-dimensional address generator with iteration support.
@@ -794,5 +882,125 @@ mod tests {
         // data = 14 * 61 * 1 = 854
         // padding = 1024 - 854 = 170
         assert_eq!(pad.total_pad_words(14, 61, 1), 170);
+    }
+
+    #[test]
+    fn test_validate_padding_valid_config() {
+        // Normal valid padding: wraps are non-zero, values within limits
+        let pad = ZeroPadConfig {
+            d0_before: 2,
+            d0_after: 3,
+            d1_before: 2,
+            d1_after: 1,
+            ..Default::default()
+        };
+        assert!(pad.validate_padding(14, 61, 0));
+    }
+
+    #[test]
+    fn test_validate_padding_disabled_always_valid() {
+        // No padding configured -- always valid regardless of wraps
+        let pad = ZeroPadConfig::default();
+        assert!(pad.validate_padding(0, 0, 0));
+    }
+
+    #[test]
+    fn test_validate_padding_d0_wrap_zero_rejects_d0_after() {
+        // d0_wrap == 0 means d0_after must be 0
+        let pad = ZeroPadConfig {
+            d0_before: 1,
+            d0_after: 2,  // invalid when d0_wrap == 0
+            ..Default::default()
+        };
+        assert!(!pad.validate_padding(0, 4, 2));
+    }
+
+    #[test]
+    fn test_validate_padding_d0_wrap_zero_rejects_higher_dims() {
+        // d0_wrap == 0 means d1 and d2 before/after must all be 0
+        let pad = ZeroPadConfig {
+            d0_before: 1,
+            d1_before: 3,  // invalid when d0_wrap == 0
+            ..Default::default()
+        };
+        assert!(!pad.validate_padding(0, 4, 2));
+    }
+
+    #[test]
+    fn test_validate_padding_d1_wrap_zero_rejects_d2_padding() {
+        // d1_wrap == 0 means d1_after must be 0 and d2 before/after must be 0
+        let pad = ZeroPadConfig {
+            d0_before: 1,
+            d0_after: 1,
+            d2_before: 5,  // invalid when d1_wrap == 0
+            ..Default::default()
+        };
+        assert!(!pad.validate_padding(8, 0, 2));
+    }
+
+    #[test]
+    fn test_validate_padding_d1_wrap_zero_rejects_d1_after() {
+        // d1_wrap == 0 means d1_after must be 0
+        let pad = ZeroPadConfig {
+            d0_before: 1,
+            d1_after: 2,  // invalid when d1_wrap == 0
+            ..Default::default()
+        };
+        assert!(!pad.validate_padding(8, 0, 2));
+    }
+
+    #[test]
+    fn test_validate_padding_d2_wrap_zero_rejects_d2_after() {
+        // d2_wrap == 0 means d2_after must be 0
+        let pad = ZeroPadConfig {
+            d0_before: 1,
+            d2_after: 3,  // invalid when d2_wrap == 0
+            ..Default::default()
+        };
+        assert!(!pad.validate_padding(8, 4, 0));
+    }
+
+    #[test]
+    fn test_validate_padding_field_width_d0_overflow() {
+        // D0 max is 63 (6 bits)
+        let pad = ZeroPadConfig {
+            d0_before: 64,  // exceeds 63
+            ..Default::default()
+        };
+        assert!(!pad.validate_padding(8, 4, 2));
+    }
+
+    #[test]
+    fn test_validate_padding_field_width_d1_overflow() {
+        // D1 max is 31 (5 bits)
+        let pad = ZeroPadConfig {
+            d1_after: 32,  // exceeds 31
+            ..Default::default()
+        };
+        assert!(!pad.validate_padding(8, 4, 2));
+    }
+
+    #[test]
+    fn test_validate_padding_field_width_d2_overflow() {
+        // D2 max is 15 (4 bits)
+        let pad = ZeroPadConfig {
+            d2_before: 16,  // exceeds 15
+            ..Default::default()
+        };
+        assert!(!pad.validate_padding(8, 4, 2));
+    }
+
+    #[test]
+    fn test_validate_padding_at_max_values() {
+        // All fields at their respective maximums -- should be valid
+        let pad = ZeroPadConfig {
+            d0_before: 63,
+            d0_after: 63,
+            d1_before: 31,
+            d1_after: 31,
+            d2_before: 15,
+            d2_after: 15,
+        };
+        assert!(pad.validate_padding(8, 4, 2));
     }
 }
