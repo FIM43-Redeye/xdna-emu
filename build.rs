@@ -362,6 +362,8 @@ fn gen_arch(model: &xdna_archspec::types::ArchModel, out_dir: &Path) {
                 writeln!(out, "    pub const PHYSICAL_BANKS: u8 = {};", phys.num_banks).unwrap();
                 writeln!(out, "    /// Physical bank size in bytes.").unwrap();
                 writeln!(out, "    pub const PHYSICAL_BANK_SIZE: u64 = {};", phys.bank_size).unwrap();
+                writeln!(out, "    /// Physical bank width in bits (SRAM word width).").unwrap();
+                writeln!(out, "    pub const PHYSICAL_BANK_WIDTH_BITS: u16 = {};", phys.bank_width_bits).unwrap();
             }
             if let Some(pmem) = mem.program_memory_bytes {
                 writeln!(out, "    /// Program (instruction) memory size in bytes.").unwrap();

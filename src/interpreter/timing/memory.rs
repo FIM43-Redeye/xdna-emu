@@ -172,8 +172,8 @@ impl MemoryQuadrant {
 /// Size of each bank in bytes.
 pub const BANK_SIZE: usize = crate::arch::compute::PHYSICAL_BANK_SIZE as usize;
 
-/// Bank width in bytes (128 bits = 16 bytes).
-pub const BANK_WIDTH_BYTES: usize = 128 / 8; // TODO: generate from ArchModel bank_width_bits
+/// Bank width in bytes (derived from ArchModel physical bank_width_bits).
+pub const BANK_WIDTH_BYTES: usize = crate::arch::compute::PHYSICAL_BANK_WIDTH_BITS as usize / 8;
 
 /// Base memory access latency (cycles).
 pub const BASE_LATENCY: u8 = crate::arch::timing::DATA_MEMORY_LATENCY;
@@ -566,6 +566,18 @@ pub struct MemoryStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Validate that BANK_WIDTH_BYTES is derived from the ArchModel constant
+    /// and matches the aie-rt XAIEMLGBL_MEMORY_MODULE_DATAMEMORY_WIDTH (128 bits).
+    #[test]
+    fn test_bank_width_matches_aiert() {
+        // aie-rt: XAIEMLGBL_MEMORY_MODULE_DATAMEMORY_WIDTH = 128 bits = 16 bytes
+        assert_eq!(BANK_WIDTH_BYTES, 16);
+        assert_eq!(
+            BANK_WIDTH_BYTES,
+            crate::arch::compute::PHYSICAL_BANK_WIDTH_BITS as usize / 8,
+        );
+    }
 
     #[test]
     fn test_bank_calculation() {

@@ -58,6 +58,8 @@ mod tests {
     fn test_compute_banking_constants() {
         assert_eq!(crate::arch::compute::PHYSICAL_BANKS, 8);
         assert_eq!(crate::arch::compute::PHYSICAL_BANK_SIZE, 8 * 1024);
+        // Bank width: 128 bits per aie-rt XAIEMLGBL_MEMORY_MODULE_DATAMEMORY_WIDTH.
+        assert_eq!(crate::arch::compute::PHYSICAL_BANK_WIDTH_BITS, 128);
     }
 
     #[test]
@@ -68,6 +70,8 @@ mod tests {
             crate::arch::memtile::PHYSICAL_BANKS as u64 * crate::arch::memtile::PHYSICAL_BANK_SIZE,
             512 * 1024
         );
+        // Bank width: 128 bits per aie-rt XAIEMLGBL_MEM_TILE_MODULE_DATAMEMORY_WIDTH.
+        assert_eq!(crate::arch::memtile::PHYSICAL_BANK_WIDTH_BITS, 128);
     }
 
     #[test]

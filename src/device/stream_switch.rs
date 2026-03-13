@@ -1525,10 +1525,10 @@ mod tests {
         assert!(ss.dma_master(0).is_some(), "Should have DMA MM2S channel 0");
         assert!(ss.dma_master(1).is_some(), "Should have DMA MM2S channel 1");
 
-        // Verify port counts per AM025 CORE_MODULE/STREAM_SWITCH:
-        // Masters: 0=Core, 1-2=DMA, 3=Tile_Ctrl, 4=FIFO0, 5-10=South(6), 11-14=West(4),
-        //          15-18=North(4), 19-22=East(4) = 23 total
-        // Slaves:  0=Core, 1-2=DMA, 3=Tile_Ctrl, 4=FIFO0, 5-10=South(6), 11-14=West(4),
+        // Verify port counts per AM025 CORE_MODULE/STREAM_SWITCH (matches aie-rt AieMlTileStrmMstr/Slv):
+        // Masters: 0=Core, 1-2=DMA(2), 3=Tile_Ctrl, 4=FIFO0, 5-8=South(4), 9-12=West(4),
+        //          13-18=North(6), 19-22=East(4) = 23 total
+        // Slaves:  0=Core, 1-2=DMA(2), 3=Tile_Ctrl, 4=FIFO0, 5-10=South(6), 11-14=West(4),
         //          15-18=North(4), 19-22=East(4), 23-24=Trace(2) = 25 total
         assert_eq!(ss.masters.len(), 23);
         assert_eq!(ss.slaves.len(), 25);

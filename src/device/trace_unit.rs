@@ -18,13 +18,13 @@
 //!
 //! Events are compressed into variable-length byte sequences:
 //!
-//! | Type    | Pattern                        | Content                         |
-//! |---------|--------------------------------|---------------------------------|
-//! | Single0 | `0b0EEETTTT`                   | event(3), delta(4): 0-15 cycles |
-//! | Single1 | `0b100EEETTT TTTTTTTT`          | event(3), delta(10): 0-1023     |
-//! | Single2 | `0b101EEETTT TTTTTTTT TTTTTTTT` | event(3), delta(18): 0-262143   |
-//! | Start   | `0b11110000 + 7 bytes timer`    | 56-bit timer sync               |
-//! | Pad     | `0xFE`                          | Fills remainder of packet       |
+//! | Type    | Pattern                          | Content                         |
+//! |---------|----------------------------------|---------------------------------|
+//! | Single0 | `0b0EEETTTT`                     | event(3), delta(4): 0-15 cycles |
+//! | Single1 | `0b100EEETT TTTTTTTT`            | event(3), delta(10): 0-1023     |
+//! | Single2 | `0b101EEETT TTTTTTTT TTTTTTTT`   | event(3), delta(18): 0-262143   |
+//! | Start   | `0b11110000 + 7 bytes timer`     | 56-bit timer sync               |
+//! | Pad     | `0xFE`                           | Fills remainder of packet       |
 //!
 //! # Packet Format
 //!
@@ -347,6 +347,19 @@ impl TraceUnit {
     ///
     /// Chooses Single0 (1 byte), Single1 (2 bytes), or Single2 (3 bytes)
     /// based on the magnitude of the delta.
+    ///
+    /// Bit layouts (from mlir-aie utils/trace/utils.py decode logic):
+    ///
+    /// Single0: `0b0EEETTTT` (1 byte)
+    ///   - bits [6:4] = slot (event), bits [3:0] = delta (0-15)
+    ///
+    /// Single1: `0b100EEETT TTTTTTTT` (2 bytes)
+    ///   - byte0 bits [7:5] = 100, [4:2] = slot, [1:0] = delta_hi
+    ///   - byte1 = delta_lo. Total delta = 10 bits (0-1023).
+    ///
+    /// Single2: `0b101EEETT TTTTTTTT TTTTTTTT` (3 bytes)
+    ///   - byte0 bits [7:5] = 101, [4:2] = slot, [1:0] = delta_hi
+    ///   - byte1-2 = delta_mid_lo. Total delta = 18 bits (0-262143).
     fn encode_single(&mut self, slot: u8, delta: u64) {
         debug_assert!(slot < 8);
 
@@ -355,17 +368,17 @@ impl TraceUnit {
             let byte = (slot << 4) | (delta as u8 & 0x0F);
             self.byte_buffer.push(byte);
         } else if delta <= 1023 {
-            // Single1: 0b100EEETTT TTTTTTTT (2 bytes)
+            // Single1: 0b100EEETT TTTTTTTT (2 bytes)
             let d = delta as u16;
-            let byte0 = 0x80 | (slot << 4) | ((d >> 8) as u8 & 0x07);
+            let byte0 = 0x80 | (slot << 2) | ((d >> 8) as u8 & 0x03);
             let byte1 = (d & 0xFF) as u8;
             self.byte_buffer.push(byte0);
             self.byte_buffer.push(byte1);
         } else {
-            // Single2: 0b101EEETTT TTTTTTTT TTTTTTTT (3 bytes)
+            // Single2: 0b101EEETT TTTTTTTT TTTTTTTT (3 bytes)
             // Clamp to 18 bits (262143)
             let d = delta.min(0x3FFFF) as u32;
-            let byte0 = 0xA0 | (slot << 4) | ((d >> 16) as u8 & 0x03);
+            let byte0 = 0xA0 | (slot << 2) | ((d >> 16) as u8 & 0x03);
             let byte1 = ((d >> 8) & 0xFF) as u8;
             let byte2 = (d & 0xFF) as u8;
             self.byte_buffer.push(byte0);
@@ -545,10 +558,30 @@ mod tests {
         assert_eq!(tu.byte_buffer.len(), start_len + 2); // Single1 = 2 bytes
 
         // Verify encoding: slot=0, delta=500
-        // byte0 = 0x80 | (0 << 4) | (500 >> 8 = 1) = 0x81
+        // Format: 0b100EEETT TTTTTTTT
+        // byte0 = 0x80 | (0 << 2) | (500 >> 8 = 1) = 0x81
         // byte1 = 500 & 0xFF = 0xF4
         assert_eq!(tu.byte_buffer[start_len], 0x81);
         assert_eq!(tu.byte_buffer[start_len + 1], 0xF4);
+    }
+
+    #[test]
+    fn test_single1_encoding_nonzero_slot() {
+        let mut tu = TraceUnit::new(0, 2);
+        tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+        tu.write_register(0x10, 37 | (38 << 8) | (39 << 16)); // slot 0=37, slot 1=38, slot 2=39
+
+        tu.notify_event(28, 0);
+        let start_len = tu.byte_buffer.len();
+
+        // Slot 1, delta=500: format 0b100EEETT
+        // byte0 = 0x80 | (1 << 2) | (500 >> 8 = 1) = 0x80 | 0x04 | 0x01 = 0x85
+        // byte1 = 500 & 0xFF = 0xF4
+        tu.notify_event(38, 500);
+        assert_eq!(tu.byte_buffer[start_len], 0x85);
+        assert_eq!(tu.byte_buffer[start_len + 1], 0xF4);
+
+        // Verify mlir-aie decode: event = (0x85 >> 2) & 7 = 0x21 & 7 = 1, cycles = (0x85 & 3)*256 + 0xF4 = 500
     }
 
     #[test]
@@ -565,12 +598,38 @@ mod tests {
         assert_eq!(tu.byte_buffer.len(), start_len + 3); // Single2 = 3 bytes
 
         // Verify encoding: slot=0, delta=100000 = 0x186A0
-        // byte0 = 0xA0 | (0 << 4) | (0x186A0 >> 16 = 1) = 0xA1
+        // Format: 0b101EEETT TTTTTTTT TTTTTTTT
+        // byte0 = 0xA0 | (0 << 2) | (0x186A0 >> 16 = 1) = 0xA1
         // byte1 = (0x186A0 >> 8) & 0xFF = 0x86
         // byte2 = 0x186A0 & 0xFF = 0xA0
         assert_eq!(tu.byte_buffer[start_len], 0xA1);
         assert_eq!(tu.byte_buffer[start_len + 1], 0x86);
         assert_eq!(tu.byte_buffer[start_len + 2], 0xA0);
+    }
+
+    #[test]
+    fn test_single2_encoding_nonzero_slot() {
+        let mut tu = TraceUnit::new(0, 2);
+        tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+        tu.write_register(0x10, 37 | (38 << 8) | (39 << 16) | (40 << 24));
+        tu.write_register(0x14, 23 | (24 << 8) | (35 << 16) | (36 << 24));
+
+        tu.notify_event(28, 0);
+        let start_len = tu.byte_buffer.len();
+
+        // Slot 3, delta=100000 = 0x186A0
+        // Format: 0b101EEETT TTTTTTTT TTTTTTTT
+        // byte0 = 0xA0 | (3 << 2) | (0x186A0 >> 16 = 1) = 0xA0 | 0x0C | 0x01 = 0xAD
+        // byte1 = 0x86, byte2 = 0xA0
+        tu.notify_event(40, 100000);
+        assert_eq!(tu.byte_buffer[start_len], 0xAD);
+        assert_eq!(tu.byte_buffer[start_len + 1], 0x86);
+        assert_eq!(tu.byte_buffer[start_len + 2], 0xA0);
+
+        // Verify mlir-aie decode: event = (0xAD >> 2) & 7 = 0x2B & 7 = 3
+        // cycles = (0xAD & 3)*65536 + 0x86*256 + 0xA0 = 1*65536 + 34304 + 160 = 100000. WRONG.
+        // Actually: (0xAD & 3) = 1, 1*65536 = 65536, + 0x86*256 = 34304, + 0xA0 = 160
+        // = 65536 + 34304 + 160 = 100000. Correct!
     }
 
     #[test]
@@ -721,5 +780,85 @@ mod tests {
         // Slot 3, delta=1: 0b00110001 = 0x31
         tu.notify_event(40, 4);
         assert_eq!(tu.byte_buffer[start_len + 3], 0x31);
+    }
+
+    /// Verify our encoder matches mlir-aie's decoder (utils/trace/utils.py).
+    ///
+    /// This test implements the mlir-aie decode logic in Rust and verifies
+    /// round-trip correctness for all slots and representative deltas.
+    /// Each (slot, delta) pair is tested in isolation to avoid buffer drain
+    /// from packet emission.
+    #[test]
+    fn test_roundtrip_all_slots_all_formats() {
+        /// Decode one event from a byte buffer, returning (slot, delta, bytes_consumed).
+        /// Implements the same logic as mlir-aie convert_to_commands().
+        fn decode_single(buf: &[u8]) -> (u8, u64, usize) {
+            let b0 = buf[0];
+            if (b0 & 0x80) == 0 {
+                // Single0: 0b0EEETTTT
+                let event = (b0 >> 4) & 0x07;
+                let cycles = (b0 & 0x0F) as u64;
+                (event, cycles, 1)
+            } else if (b0 & 0xE0) == 0x80 {
+                // Single1: 0b100EEETT TTTTTTTT
+                let event = (b0 >> 2) & 0x07;
+                let cycles = ((b0 & 0x03) as u64) * 256 + buf[1] as u64;
+                (event, cycles, 2)
+            } else if (b0 & 0xE0) == 0xA0 {
+                // Single2: 0b101EEETT TTTTTTTT TTTTTTTT
+                let event = (b0 >> 2) & 0x07;
+                let cycles = ((b0 & 0x03) as u64) * 65536
+                    + (buf[1] as u64) * 256
+                    + buf[2] as u64;
+                (event, cycles, 3)
+            } else {
+                panic!("unexpected byte 0x{:02X}", b0);
+            }
+        }
+
+        // Test all 8 slots with representative deltas for each format.
+        // Each combination gets a fresh TraceUnit to avoid buffer drain
+        // from packet emission (try_emit_packet drains at 28 bytes).
+        let all_deltas: &[(u64, usize)] = &[
+            // Single0 (1 byte)
+            (0, 1), (1, 1), (7, 1), (15, 1),
+            // Single1 (2 bytes)
+            (16, 2), (100, 2), (500, 2), (1023, 2),
+            // Single2 (3 bytes)
+            (1024, 3), (10000, 3), (100000, 3), (262143, 3),
+        ];
+
+        for slot in 0u8..8 {
+            for &(d, expected_size) in all_deltas {
+                let mut tu = TraceUnit::new(0, 2);
+                tu.write_register(0x00, 0 | (28 << 16) | (29 << 24));
+                let evt0 = 37u32 | (38 << 8) | (39 << 16) | (40 << 24);
+                let evt1 = 41u32 | (42 << 8) | (43 << 16) | (44 << 24);
+                tu.write_register(0x10, evt0);
+                tu.write_register(0x14, evt1);
+                tu.notify_event(28, 0); // start
+                let start_len = tu.byte_buffer.len(); // 8 bytes start marker
+
+                let event_id = 37 + slot;
+                tu.notify_event(event_id, d); // delta = d (from start cycle 0)
+                let base = start_len;
+                assert!(
+                    tu.byte_buffer.len() >= base + expected_size,
+                    "buffer too short for slot={} delta={}: have {} bytes, need {}",
+                    slot, d, tu.byte_buffer.len() - base, expected_size
+                );
+                let (dec_slot, dec_delta, consumed) = decode_single(&tu.byte_buffer[base..]);
+                assert_eq!(
+                    dec_slot, slot,
+                    "slot mismatch: slot={} delta={} byte0=0x{:02X}",
+                    slot, d, tu.byte_buffer[base]
+                );
+                assert_eq!(
+                    dec_delta, d,
+                    "delta mismatch: slot={} delta={}", slot, d
+                );
+                assert_eq!(consumed, expected_size, "size mismatch: slot={} delta={}", slot, d);
+            }
+        }
     }
 }
