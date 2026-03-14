@@ -1779,6 +1779,8 @@ impl DeviceState {
         // 7. Event port selection registers (offsets from register database).
         // Configure which physical stream switch ports map to logical event
         // ports 0-7 for PORT_RUNNING/IDLE/STALLED trace events.
+        // These registers live in the stream switch address space (0x3FF00),
+        // not the event subsystem, so they can't go through EventModule.
         let port_sel_base = match tile.tile_type {
             TileType::Compute | TileType::Shim => {
                 ce.event_port_select.map(|[r0, r1]| (r0, r1))
@@ -1803,60 +1805,116 @@ impl DeviceState {
             }
         }
 
-        // 8. Event broadcast channel registers and Event_Generate.
+        // 8. Timer register routing.
         //
-        // Broadcast channels: 16 per module, each mapping a local event ID
-        // to a broadcast line. When Event_Generate fires an event matching
-        // a channel's value, BROADCAST_N (hw_id 107+N) is generated.
-        // Offsets from register database (Event_Broadcast0 per module).
-        let bcast_base = match tile.tile_type {
-            TileType::Compute => {
-                if ce.event_broadcast_base != 0
-                    && (ce.event_broadcast_base..=ce.event_broadcast_end).contains(&offset)
-                {
-                    Some(ce.event_broadcast_base)
-                } else if me.event_broadcast_base != 0
-                    && (me.event_broadcast_base..=me.event_broadcast_end).contains(&offset)
-                {
-                    Some(me.event_broadcast_base)
-                } else {
-                    None
+        // Each module has a timer block at a known base address. Offsets
+        // within the block are consistent across modules (see timer.rs).
+        // Compute tiles have core_timer + mem_timer; memtile has mem_timer;
+        // shim has core_timer (PL module timer).
+        {
+            use crate::arch::subsystem;
+            if tile.is_compute() {
+                let base = subsystem::compute::core_timer::OFFSET_START;
+                let end = subsystem::compute::core_timer::OFFSET_END;
+                if offset >= base && offset < end {
+                    tile.core_timer.write_register(offset - base, value);
                 }
-            }
-            TileType::MemTile => {
-                if mte.event_broadcast_base != 0
-                    && (mte.event_broadcast_base..=mte.event_broadcast_end).contains(&offset)
-                {
-                    Some(mte.event_broadcast_base)
-                } else {
-                    None
+                let base = subsystem::compute::memory_timer::OFFSET_START;
+                let end = subsystem::compute::memory_timer::OFFSET_END;
+                if offset >= base && offset < end {
+                    tile.mem_timer.write_register(offset - base, value);
                 }
-            }
-            TileType::Shim => {
-                if ce.event_broadcast_base != 0
-                    && (ce.event_broadcast_base..=ce.event_broadcast_end).contains(&offset)
-                {
-                    Some(ce.event_broadcast_base)
-                } else {
-                    None
+            } else if tile.is_mem_tile() {
+                let base = subsystem::memtile::timer::OFFSET_START;
+                let end = subsystem::memtile::timer::OFFSET_END;
+                if offset >= base && offset < end {
+                    tile.mem_timer.write_register(offset - base, value);
                 }
-            }
-        };
-        if let Some(base) = bcast_base {
-            let channel = ((offset - base) / 4) as usize;
-            if channel < 16 {
-                tile.broadcast_channels[channel] = (value & 0xFF) as u8;
-                log::debug!(
-                    "Tile({},{}) broadcast channel {} = event {}",
-                    col, row, channel, tile.broadcast_channels[channel]
-                );
+            } else if tile.is_shim() {
+                let base = subsystem::shim::timer::OFFSET_START;
+                let end = subsystem::shim::timer::OFFSET_END;
+                if offset >= base && offset < end {
+                    tile.core_timer.write_register(offset - base, value);
+                }
             }
         }
 
-        // Event_Generate register (offset from register database).
-        // Writing fires the specified event on the module's event bus.
-        // If the event matches a configured broadcast channel, the
-        // corresponding BROADCAST_N event is queued for column propagation.
+        // 8. Core debug register routing (compute tiles only).
+        //
+        // CoreDebugState uses absolute tile offsets internally, matching the
+        // hardware register map (Core_Control=0x32000, Core_Status=0x32004,
+        // Debug_Control0=0x32010, etc.).
+        if tile.is_compute() {
+            tile.core_debug.write_register(offset, value);
+        }
+
+        // 9. Event module register routing.
+        //
+        // Each tile module has an event subsystem with broadcast channels,
+        // combo events, group events, port events, and Event_Generate.
+        // The EventModule handles all of these via its register interface,
+        // which masks the offset with `& 0xFFFF` to get the subsystem-local
+        // offset. We pass the full tile offset so the masking works correctly.
+        //
+        // Event subsystem offsets (from archspec):
+        //   Compute core: 0x34008-0x34524 (module prefix 0x30000)
+        //   Compute mem:  0x14008-0x14520 (module prefix 0x10000)
+        //   MemTile:      0x94008-0x94524 (module prefix 0x90000)
+        //   Shim (PL):    0x34008-0x34518 (module prefix 0x30000)
+        {
+            use crate::arch::subsystem;
+            if tile.is_compute() {
+                let base = subsystem::compute::core_event::OFFSET_START;
+                let end = subsystem::compute::core_event::OFFSET_END;
+                if offset >= base && offset < end {
+                    if let Some(ref mut em) = tile.core_events {
+                        em.write_register(offset, value);
+                    }
+                }
+                let base = subsystem::compute::memory_event::OFFSET_START;
+                let end = subsystem::compute::memory_event::OFFSET_END;
+                if offset >= base && offset < end {
+                    if let Some(ref mut em) = tile.mem_events {
+                        em.write_register(offset, value);
+                    }
+                }
+            } else if tile.is_mem_tile() {
+                let base = subsystem::memtile::event::OFFSET_START;
+                let end = subsystem::memtile::event::OFFSET_END;
+                if offset >= base && offset < end {
+                    if let Some(ref mut em) = tile.mem_events {
+                        em.write_register(offset, value);
+                    }
+                }
+            } else if tile.is_shim() {
+                let base = subsystem::shim::event::OFFSET_START;
+                let end = subsystem::shim::event::OFFSET_END;
+                if offset >= base && offset < end {
+                    if let Some(ref mut em) = tile.core_events {
+                        em.write_register(offset, value);
+                    }
+                }
+            }
+        }
+
+        // 10. Interrupt controller register routing (shim tiles only).
+        //
+        // L1: per-switch interrupt controller in PL module (absolute offsets).
+        // L2: NoC interrupt controller (absolute offsets).
+        if tile.is_shim() {
+            if let Some(ref mut l1) = tile.l1_irq {
+                l1.write_register(offset, value);
+            }
+            if let Some(ref mut l2) = tile.l2_irq {
+                l2.write_register(offset, value);
+            }
+        }
+
+        // 11. Event_Generate: fire on trace units and broadcast.
+        //
+        // The EventModule above handles the event register write, but the
+        // trace units and broadcast propagation also need to be notified.
+        // Event_Generate offset is the first register in the event block.
         let is_event_generate = match tile.tile_type {
             TileType::Compute => offset == ce.event_generate || offset == me.event_generate,
             TileType::MemTile => offset == mte.event_generate,
@@ -1873,16 +1931,28 @@ impl DeviceState {
             tile.core_trace.notify_event(event_id, 0);
             tile.mem_trace.notify_event(event_id, 0);
 
-            // Check broadcast channel mapping: if the generated event matches
-            // any channel's configured value, generate BROADCAST_N.
-            for ch in 0..16u8 {
-                if tile.broadcast_channels[ch as usize] == event_id && event_id != 0 {
-                    let broadcast_hw_id = 107 + ch;
-                    log::info!(
-                        "Tile({},{}) Event_Generate: event {} -> BROADCAST_{} (hw_id={})",
-                        col, row, event_id, ch, broadcast_hw_id
-                    );
-                    tile.pending_broadcasts.push(broadcast_hw_id);
+            // Check broadcast channel mapping in the EventModule: if the
+            // generated event matches any broadcast channel's configured
+            // event, queue the BROADCAST_N event for column propagation.
+            let broadcast_base = match tile.tile_type {
+                TileType::Compute | TileType::Shim => 107u8, // Core/PL module
+                TileType::MemTile => 142u8,
+            };
+            let events_ref = match tile.tile_type {
+                TileType::Compute | TileType::Shim => tile.core_events.as_ref(),
+                TileType::MemTile => tile.mem_events.as_ref(),
+            };
+            if let Some(em) = events_ref {
+                for ch in 0..16u8 {
+                    let ch_event = em.broadcast.read_channel(ch as usize) as u8;
+                    if ch_event == event_id && event_id != 0 {
+                        let broadcast_hw_id = broadcast_base + ch;
+                        log::info!(
+                            "Tile({},{}) Event_Generate: event {} -> BROADCAST_{} (hw_id={})",
+                            col, row, event_id, ch, broadcast_hw_id
+                        );
+                        tile.pending_broadcasts.push(broadcast_hw_id);
+                    }
                 }
             }
         }

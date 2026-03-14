@@ -1067,15 +1067,6 @@ pub struct Tile {
     ///
     /// Each entry stores the local event ID that triggers that broadcast channel.
     /// When Event_Generate fires an event matching channel N's configured ID,
-    /// BROADCAST_N (hw_id 107+N) is generated and propagated to the column.
-    ///
-    /// Configured by writes to Event_Broadcast registers:
-    /// - Compute core module:  0x34010 + N*4 (N=0..15)
-    /// - Compute memory module: 0x14010 + N*4
-    /// - MemTile:              0x94010 + N*4
-    /// - Shim (PL module):     0x34010 + N*4
-    pub broadcast_channels: [u8; 16],
-
     /// Pending broadcast events to propagate to all tiles in this column.
     ///
     /// When Event_Generate fires an event that matches a broadcast channel,
@@ -1217,7 +1208,6 @@ impl Tile {
             cycle_dma_banks: 0,
             core_edge_detectors: [EdgeDetector::default(); 2],
             mem_edge_detectors: [EdgeDetector::default(); 2],
-            broadcast_channels: [0; 16],
             pending_broadcasts: Vec::new(),
             pending_ctrl_response: std::collections::VecDeque::new(),
         }
