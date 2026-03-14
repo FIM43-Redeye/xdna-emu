@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 
-use super::engine::{ChannelStats, ChannelTaskConfig, TaskQueueEntry, MAX_TASK_QUEUE_DEPTH};
+use super::engine::{ChannelStats, ChannelTaskConfig, TaskQueue, TaskQueueEntry};
 use super::transfer::Transfer;
 
 /// Information carried from a completed transfer into the lock release phase.
@@ -209,13 +209,10 @@ pub struct ChannelContext {
     pub repeat_count: u32,
 
     /// Task queue (8-deep FIFO per AM025).
-    pub task_queue: VecDeque<TaskQueueEntry>,
+    pub task_queue: TaskQueue,
 
     /// Per-task configuration (token issue, FoT mode, compression).
     pub task_config: ChannelTaskConfig,
-
-    /// Task queue overflow flag.
-    pub task_queue_overflow: bool,
 
     /// BD unavailable error flag (out-of-order mode).
     pub error_bd_unavailable: bool,
@@ -233,9 +230,8 @@ impl ChannelContext {
             chain_start_bd: None,
             queued_bd: None,
             repeat_count: 0,
-            task_queue: VecDeque::with_capacity(MAX_TASK_QUEUE_DEPTH),
+            task_queue: TaskQueue::new_default(),
             task_config: ChannelTaskConfig::default(),
-            task_queue_overflow: false,
             error_bd_unavailable: false,
             stats: ChannelStats::default(),
         }
@@ -331,9 +327,8 @@ impl ChannelContext {
         self.chain_start_bd = None;
         self.queued_bd = None;
         self.repeat_count = 0;
-        self.task_queue.clear();
+        self.task_queue.reset();
         self.task_config = ChannelTaskConfig::default();
-        self.task_queue_overflow = false;
         self.error_bd_unavailable = false;
         self.stats = ChannelStats::default();
     }
@@ -438,7 +433,7 @@ mod tests {
         assert!(ctx.queued_bd.is_none());
         assert_eq!(ctx.repeat_count, 0);
         assert!(ctx.task_queue.is_empty());
-        assert!(!ctx.task_queue_overflow);
+        assert!(!ctx.task_queue.has_overflow());
         assert!(!ctx.error_bd_unavailable);
     }
 
@@ -486,12 +481,7 @@ mod tests {
         assert!(ctx.has_pending_work());
 
         ctx.queued_bd = None;
-        ctx.task_queue.push_back(TaskQueueEntry {
-            start_bd: 0,
-            repeat_count: 0,
-            enable_token_issue: false,
-            bd_snapshot: None,
-        });
+        let _ = ctx.task_queue.push(TaskQueueEntry::new(0, 0, false));
         assert!(ctx.has_pending_work());
     }
 
@@ -503,7 +493,8 @@ mod tests {
         ctx.chain_start_bd = Some(5);
         ctx.queued_bd = Some(6);
         ctx.repeat_count = 10;
-        ctx.task_queue_overflow = true;
+        // Trigger overflow by filling the queue
+        for _ in 0..9 { let _ = ctx.task_queue.push(TaskQueueEntry::new(0, 0, false)); }
         ctx.error_bd_unavailable = true;
         ctx.stats.bytes_transferred = 1024;
 
@@ -515,7 +506,7 @@ mod tests {
         assert!(ctx.queued_bd.is_none());
         assert_eq!(ctx.repeat_count, 0);
         assert!(ctx.task_queue.is_empty());
-        assert!(!ctx.task_queue_overflow);
+        assert!(!ctx.task_queue.has_overflow());
         assert!(!ctx.error_bd_unavailable);
         assert_eq!(ctx.stats.bytes_transferred, 0);
     }

@@ -98,21 +98,6 @@ pub struct StreamData {
 
 /// Task complete token emitted when a DMA task finishes.
 ///
-/// When Enable_Token_Issue is set in Start_Queue and the task completes,
-/// the DMA engine emits a token with the channel's Controller_ID.
-/// This allows software to track task completion without polling.
-#[derive(Debug, Clone, Copy)]
-pub struct TaskCompleteToken {
-    /// Source tile column
-    pub col: u8,
-    /// Source tile row
-    pub row: u8,
-    /// Channel that completed the task
-    pub channel: u8,
-    /// Controller ID from channel control register (bits 15:8)
-    pub controller_id: u8,
-}
-
 /// Per-channel task configuration (set when Start_Queue is written).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ChannelTaskConfig {
@@ -130,26 +115,9 @@ pub struct ChannelTaskConfig {
     pub out_of_order_enable: bool,
 }
 
-/// Task queue entry (enqueued via Start_Queue register).
-///
-/// Per AM025, each channel has an 8-deep task queue. Tasks are enqueued
-/// by writing to the Start_Queue register and processed in FIFO order.
-#[derive(Debug, Clone)]
-pub struct TaskQueueEntry {
-    /// Starting BD index for this task
-    pub start_bd: u8,
-    /// Repeat count (actual - 1, so 0 = run once, 255 = run 256 times)
-    pub repeat_count: u8,
-    /// Enable token issue when this task completes
-    pub enable_token_issue: bool,
-    /// Snapshot of the BD config at enqueue time.
-    /// NPU instructions may overwrite the BD between enqueue and execution,
-    /// so we capture the config when the task enters the queue.
-    pub bd_snapshot: Option<super::BdConfig>,
-}
-
-/// Maximum task queue depth per channel (AM025: 3-bit Task_Queue_Size = 0-7)
-pub const MAX_TASK_QUEUE_DEPTH: usize = 8;
+// Task queue entry and token types are now in super::token.
+// Re-export for backward compatibility.
+pub use super::token::{TaskQueueEntry, TaskQueue, Token, TokenState, MAX_TASK_QUEUE_DEPTH};
 
 /// Transfer operation result (internal).
 #[derive(Debug, Clone, Copy)]
@@ -272,7 +240,7 @@ pub struct DmaEngine {
 
     /// Task complete token output buffer.
     /// Tokens are emitted when tasks complete with Enable_Token_Issue set.
-    task_tokens: VecDeque<TaskCompleteToken>,
+    task_tokens: TokenState,
 
     /// Lock timing state for contention tracking (optional).
     /// When enabled, tracks detailed lock acquire/release timing per lock.
@@ -341,7 +309,7 @@ impl DmaEngine {
             timing_config: DmaTimingConfig::from_arch(),
             stream_out: VecDeque::with_capacity(16),
             stream_in: (0..s2mm_channels).map(|_| VecDeque::with_capacity(16)).collect(),
-            task_tokens: VecDeque::with_capacity(4),
+            task_tokens: TokenState::new(),
             lock_timing: None,
             current_cycle: 0,
             trace_events: Vec::new(),
@@ -2245,19 +2213,12 @@ impl DmaEngine {
         let config = &self.channels[ch_idx].task_config;
 
         if config.enable_token_issue {
-            let token = TaskCompleteToken {
-                col: self.col,
-                row: self.row,
-                channel: ch_idx as u8,
-                controller_id: config.controller_id,
-            };
-
             log::debug!(
                 "DMA tile({},{}) ch{} emitting task complete token (controller_id={})",
                 self.col, self.row, ch_idx, config.controller_id
             );
 
-            self.task_tokens.push_back(token);
+            self.task_tokens.issue(ch_idx as u8, config.controller_id);
 
             // Clear enable_token_issue after issuing (it's set per-task via Start_Queue)
             self.channels[ch_idx].task_config.enable_token_issue = false;
@@ -2301,7 +2262,7 @@ impl DmaEngine {
         }
         self.stream_out.clear();
         self.stream_in.clear();
-        self.task_tokens.clear();
+        self.task_tokens.reset();
         // Don't clear BD configs - those are persistent configuration
     }
 
@@ -2433,25 +2394,15 @@ impl DmaEngine {
 
         let ch = &mut self.channels[ch_idx];
 
-        // Check for overflow
-        if ch.task_queue.len() >= MAX_TASK_QUEUE_DEPTH {
-            ch.task_queue_overflow = true;
+        // Push to task queue (handles overflow flag internally)
+        let entry = TaskQueueEntry::new(start_bd, repeat_count, enable_token_issue);
+        if ch.task_queue.push(entry).is_err() {
             log::trace!(
                 "DMA tile({},{}) ch{} task queue full (BD {} rejected, queue_len={})",
                 self.col, self.row, channel, start_bd, ch.task_queue.len()
             );
             return false;
         }
-
-        // Snapshot the BD config at enqueue time so later overwrites don't affect this task
-        let bd_snapshot = self.bd_configs.get(start_bd as usize).cloned();
-
-        ch.task_queue.push_back(TaskQueueEntry {
-            start_bd,
-            repeat_count,
-            enable_token_issue,
-            bd_snapshot,
-        });
 
         log::debug!(
             "DMA tile({},{}) ch{} enqueued task: BD={} repeat={} token={} (queue_size={})",
@@ -2474,7 +2425,7 @@ impl DmaEngine {
             return;
         }
 
-        let task = match self.channels[ch_idx].task_queue.pop_front() {
+        let task = match self.channels[ch_idx].task_queue.pop() {
             Some(t) => t,
             None => return,
         };
@@ -2496,13 +2447,9 @@ impl DmaEngine {
             self.channels[ch_idx].task_queue.len()
         );
 
-        // Restore BD snapshot
-        if let Some(snapshot) = task.bd_snapshot {
-            let bd_idx = task.start_bd as usize;
-            if bd_idx < self.bd_configs.len() {
-                self.bd_configs[bd_idx] = snapshot;
-            }
-        }
+        // BD is read from registers at execution time (not snapshotted at enqueue).
+        // Per AM025: Start_Queue only stores BD_ID; the hardware fetches the BD
+        // during the STARTING state transition.
 
         let start_bd = task.start_bd;
         if let Err(e) = self.start_channel_with_repeat(channel, start_bd, task.repeat_count) {
@@ -2528,14 +2475,14 @@ impl DmaEngine {
     pub fn task_queue_overflow(&self, channel: u8) -> bool {
         self.channels
             .get(channel as usize)
-            .map(|ch| ch.task_queue_overflow)
+            .map(|ch| ch.task_queue.has_overflow())
             .unwrap_or(false)
     }
 
     /// Clear the task queue overflow flag (write-to-clear per AM025).
     pub fn clear_task_queue_overflow(&mut self, channel: u8) {
         if let Some(ch) = self.channels.get_mut(channel as usize) {
-            ch.task_queue_overflow = false;
+            ch.task_queue.clear_overflow();
         }
     }
 
@@ -2613,18 +2560,18 @@ impl DmaEngine {
     /// Pop a task complete token from the output buffer.
     ///
     /// Returns None if no tokens are pending.
-    pub fn pop_task_token(&mut self) -> Option<TaskCompleteToken> {
-        self.task_tokens.pop_front()
+    pub fn pop_task_token(&mut self) -> Option<Token> {
+        self.task_tokens.consume()
     }
 
     /// Check if any task complete tokens are pending.
     pub fn has_task_token(&self) -> bool {
-        !self.task_tokens.is_empty()
+        self.task_tokens.has_pending()
     }
 
     /// Get the number of pending task complete tokens.
     pub fn task_token_count(&self) -> usize {
-        self.task_tokens.len()
+        self.task_tokens.pending_count()
     }
 
     /// Get the FoT mode for a channel (S2MM only).
@@ -2668,7 +2615,7 @@ impl DmaEngine {
         status = layout.task_queue_size.insert(status, queue_size);
 
         // Task_Queue_Overflow
-        if ch.task_queue_overflow {
+        if ch.task_queue.has_overflow() {
             status = layout.task_queue_overflow.set_bit(status);
         }
 
@@ -3301,7 +3248,7 @@ mod tests {
         // Second task had enable_token_issue, so should have emitted a token
         assert!(engine.has_task_token());
         let token = engine.pop_task_token().unwrap();
-        assert_eq!(token.channel, 2);
+        assert_eq!(token.channel_id, 2);
     }
 
     #[test]
