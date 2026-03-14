@@ -101,7 +101,7 @@ impl Default for CounterState {
 /// A bank of performance counters for one tile module.
 ///
 /// Provides the runtime counting logic that complements the existing
-/// register-level configuration in `tile.rs::PerfCounters`. This struct
+/// register-level configuration managed by the Tile struct. This struct
 /// owns the full state: configuration fields, counter values, and runtime
 /// active/idle/stopped state.
 ///

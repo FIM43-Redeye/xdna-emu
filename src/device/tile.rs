@@ -837,47 +837,8 @@ impl TileType {
     }
 }
 
-/// Complete state of a single AIE tile.
-///
-/// This struct is designed for cache-friendly access during emulation.
-/// Hot data (core state, locks) is at the start; cold data (memory) is at the end.
-/// Control packet state machine for TileControl port.
-///
-/// The TileControl port receives control packets from the stream switch.
-/// Each packet has a header word followed by 1-4 data words (beats).
-///
-/// Control packet header format (AM020 Table 3):
-/// - Bits 19:0 = Address (tile-local register offset)
-/// - Bits 21:20 = Length (00=1 beat, 01=2, 10=3, 11=4)
-/// - Bits 23:22 = Operation (00=write, 01=read+return, 10=write_incr, 11=block_write)
-/// - Bits 30:24 = Stream_ID (for response routing)
-/// - Bit 31 = Parity
-#[derive(Debug, Clone, Default)]
-pub enum ControlPacketState {
-    /// Waiting for stream header (when master port Drop_Header=false).
-    /// The stream switch forwards the routing header to TileCtrl; we must
-    /// consume and discard it before the actual control packet header.
-    WaitingForStreamHeader,
-    /// Waiting for control packet header (stream header already consumed
-    /// or was dropped by the switch).
-    #[default]
-    Idle,
-    /// Collecting data beats after header
-    Collecting {
-        /// Target register address (bits 19:0 of header)
-        address: u32,
-        /// Operation: 0=write, 1=read_return, 2=write_incr, 3=block_write
-        operation: u8,
-        /// Stream ID for response routing (bits 30:24)
-        response_id: u8,
-        /// Total beats expected (1-4)
-        beats_total: u8,
-        /// Number of beats collected so far
-        beats_collected: u8,
-        /// Accumulated data words (max 4 beats per control packet)
-        data: [u32; 4],
-    },
-}
+// Control packet state machine (ControlPacketState) has been moved to
+// control_packets::StreamReassembler in array.rs.
 
 /// An action produced by processing a control packet.
 ///
@@ -960,14 +921,8 @@ pub struct Tile {
     /// Stored as sparse map since most addresses won't be written.
     pub(crate) registers: std::collections::HashMap<u32, u32>,
 
-    /// Control packet state machine for TileCtrl port.
-    pub ctrl_pkt_state: ControlPacketState,
-
-    /// Whether the TileCtrl master port drops stream headers.
-    /// Set from the master port's packet config during CDO processing.
-    /// When false, the handler must consume and discard the stream header
-    /// before parsing the control packet header.
-    pub ctrl_pkt_drop_header: bool,
+    // Control packet FSM has moved to control_packets::StreamReassembler
+    // owned by TileArray (array.rs). The tile no longer tracks packet state.
 
     /// Shim Mux: which switchbox South slave port each DMA MM2S channel feeds.
     /// Parsed from Mux_Config register (0x1F000). Index 0 = MM2S ch0, etc.
@@ -1007,10 +962,12 @@ pub struct Tile {
 
     // === Event Modules (new -- subsystem will absorb broadcast/port selection) ===
 
-    /// Core module event system (compute and shim tiles).
-    pub core_events: super::events::EventModule,
-    /// Memory module event system (compute and mem tiles).
-    pub mem_events: super::events::EventModule,
+    /// Core module event system (compute and shim tiles only).
+    /// None for MemTile (which has no core module).
+    pub core_events: Option<super::events::EventModule>,
+    /// Memory module event system (compute and mem tiles only).
+    /// None for Shim (which has no memory module).
+    pub mem_events: Option<super::events::EventModule>,
 
     /// Stream switch event port selection (8 logical event ports).
     ///
@@ -1214,8 +1171,6 @@ impl Tile {
             data_memory: vec![0u8; params.data_memory_size].into_boxed_slice(),
             program_memory,
             registers: std::collections::HashMap::new(),
-            ctrl_pkt_state: ControlPacketState::Idle,
-            ctrl_pkt_drop_header: true,
             shim_mux_mm2s_slaves: vec![None; params.dma_mm2s_channels],
             shim_mux_s2mm_masters: vec![None; params.dma_s2mm_channels],
             cascade_input: std::collections::VecDeque::new(),
@@ -1240,14 +1195,14 @@ impl Tile {
             mem_timer: super::timer::TileTimer::new(),
             core_debug: super::core_debug::CoreDebugState::new(),
             core_events: match tile_type {
-                TileType::Compute => super::events::EventModule::new(super::events::EventModuleType::Core),
-                TileType::Shim => super::events::EventModule::new(super::events::EventModuleType::Pl),
-                TileType::MemTile => super::events::EventModule::new(super::events::EventModuleType::MemTile),
+                TileType::Compute => Some(super::events::EventModule::new(super::events::EventModuleType::Core)),
+                TileType::Shim => Some(super::events::EventModule::new(super::events::EventModuleType::Pl)),
+                TileType::MemTile => None, // MemTile has no core module
             },
             mem_events: match tile_type {
-                TileType::Compute => super::events::EventModule::new(super::events::EventModuleType::Memory),
-                TileType::MemTile => super::events::EventModule::new(super::events::EventModuleType::MemTile),
-                TileType::Shim => super::events::EventModule::new(super::events::EventModuleType::Pl),
+                TileType::Compute => Some(super::events::EventModule::new(super::events::EventModuleType::Memory)),
+                TileType::MemTile => Some(super::events::EventModule::new(super::events::EventModuleType::MemTile)),
+                TileType::Shim => None, // Shim has no memory module
             },
             l1_irq: if tile_type == TileType::Shim {
                 Some(super::interrupts::L1InterruptController::new())
@@ -1987,185 +1942,8 @@ impl Tile {
         }
     }
 
-    /// Process a data word arriving at the TileControl port.
-    ///
-    /// The TileControl master port delivers control packets that reprogram
-    /// tile registers at runtime. Each packet consists of:
-    /// 1. A control header word (address, operation, beat count)
-    /// 2. One or more data words (the register values to write)
-    ///
-    /// Control packet header format (AM020 Table 3):
-    /// - Bits 19:0 = Address (tile-local register offset)
-    /// - Bits 21:20 = Length (00=1 beat, 01=2, 10=3, 11=4)
-    /// - Bits 23:22 = Operation (00=write, 01=read, 10=write_incr, 11=block_write)
-    /// - Bits 30:24 = Stream_ID (for response routing)
-    /// - Bit 31 = Parity
-    pub fn process_ctrl_packet_word(&mut self, word: u32, tlast: bool) -> Vec<CtrlPacketAction> {
-        match std::mem::take(&mut self.ctrl_pkt_state) {
-            ControlPacketState::WaitingForStreamHeader => {
-                // Stream header forwarded because Drop_Header=false on master.
-                // Consume it and transition to Idle for the actual ctrl header.
-                let pkt_id = word & 0x1F;
-                let pkt_type = (word >> 12) & 0x7;
-                log::debug!("Tile ({},{}) ctrl_pkt: consuming stream header 0x{:08X} (pkt_id={}, pkt_type={})",
-                    self.col, self.row, word, pkt_id, pkt_type);
-                self.ctrl_pkt_state = ControlPacketState::Idle;
-                Vec::new()
-            }
-            ControlPacketState::Idle => {
-                // Parse control packet header (AM020 Table 3)
-                use crate::arch::ctrl_packet::*;
-                let address = word & ADDRESS_MASK;
-                let beats = ((word >> LENGTH_SHIFT) & LENGTH_MASK) as u8 + 1;
-                let operation = ((word >> OPERATION_SHIFT) & OPERATION_MASK) as u8;
-                let response_id = ((word >> RESPONSE_ID_SHIFT) & RESPONSE_ID_MASK) as u8;
-
-                log::info!("Tile ({},{}) ctrl_pkt: header 0x{:08X} addr=0x{:05X} op={} beats={} resp_id={}",
-                    self.col, self.row, word, address, operation, beats, response_id);
-
-                // OP_READ has no data payload -- execute immediately
-                if operation == OP_READ {
-                    let actions = self.execute_ctrl_packet(
-                        address, operation, response_id, beats, &[],
-                    );
-                    self.ctrl_pkt_state = if tlast && !self.ctrl_pkt_drop_header {
-                        ControlPacketState::WaitingForStreamHeader
-                    } else {
-                        ControlPacketState::Idle
-                    };
-                    return actions;
-                }
-
-                self.ctrl_pkt_state = ControlPacketState::Collecting {
-                    address,
-                    operation,
-                    response_id,
-                    beats_total: beats,
-                    beats_collected: 0,
-                    data: [0; 4],
-                };
-                Vec::new()
-            }
-            ControlPacketState::Collecting {
-                address,
-                operation,
-                response_id,
-                beats_total,
-                mut beats_collected,
-                mut data,
-            } => {
-                data[beats_collected as usize] = word;
-                beats_collected += 1;
-                log::debug!("Tile ({},{}) ctrl_pkt: data[{}] = 0x{:08X} ({}/{}){}",
-                    self.col, self.row, beats_collected - 1, word, beats_collected, beats_total,
-                    if tlast { " TLAST" } else { "" });
-
-                if beats_collected >= beats_total {
-                    // All beats received -- execute the operation
-                    let actions = self.execute_ctrl_packet(
-                        address, operation, response_id, beats_total,
-                        &data[..beats_collected as usize],
-                    );
-                    // After completion: if TLAST marks end of stream packet AND
-                    // headers aren't dropped, expect a stream header next time.
-                    // Otherwise stay Idle for the next ctrl packet within this
-                    // same stream packet.
-                    self.ctrl_pkt_state = if tlast && !self.ctrl_pkt_drop_header {
-                        ControlPacketState::WaitingForStreamHeader
-                    } else {
-                        ControlPacketState::Idle
-                    };
-                    actions
-                } else {
-                    // Still collecting
-                    self.ctrl_pkt_state = ControlPacketState::Collecting {
-                        address,
-                        operation,
-                        response_id,
-                        beats_total,
-                        beats_collected,
-                        data,
-                    };
-                    Vec::new()
-                }
-            }
-        }
-    }
-
-    /// Execute a complete control packet operation.
-    ///
-    /// Returns a list of actions for the caller to dispatch through
-    /// `DeviceState::write_tile_register()`, which provides the full module
-    /// dispatch (MemTile DMA BDs, stream switch, etc.).
-    ///
-    /// Currently supports:
-    /// - Operation 0 (write): Write data words to consecutive register addresses
-    /// - Operation 1 (read): Logged, returns ReadRegisters action
-    /// - Operation 2 (write_incr): Same as write
-    /// - Operation 3 (block_write): Same as write
-    fn execute_ctrl_packet(
-        &self,
-        base_address: u32,
-        operation: u8,
-        response_id: u8,
-        beats_total: u8,
-        data: &[u32],
-    ) -> Vec<CtrlPacketAction> {
-        use crate::arch::ctrl_packet::*;
-        let mut actions = Vec::new();
-
-        match operation {
-            OP_WRITE | OP_BLOCK_WRITE => {
-                for (i, &value) in data.iter().enumerate() {
-                    let addr = base_address + (i as u32) * 4;
-                    log::info!("Tile ({},{}) ctrl_pkt WRITE: [0x{:05X}] = 0x{:08X}",
-                        self.col, self.row, addr, value);
-                    actions.push(CtrlPacketAction::WriteRegister {
-                        col: self.col,
-                        row: self.row,
-                        offset: addr,
-                        value,
-                    });
-                }
-            }
-            OP_READ => {
-                log::info!(
-                    "Tile ({},{}) ctrl_pkt READ: addr=0x{:05X} beats={} resp_id={}",
-                    self.col, self.row, base_address, beats_total, response_id,
-                );
-                actions.push(CtrlPacketAction::ReadRegisters {
-                    col: self.col,
-                    row: self.row,
-                    offset: base_address,
-                    count: beats_total,
-                    response_id,
-                });
-            }
-            OP_WRITE_INCR => {
-                for (i, &value) in data.iter().enumerate() {
-                    let addr = base_address + (i as u32) * 4;
-                    log::info!("Tile ({},{}) ctrl_pkt WRITE_INCR: [0x{:05X}] = 0x{:08X}",
-                        self.col, self.row, addr, value);
-                    actions.push(CtrlPacketAction::WriteRegister {
-                        col: self.col,
-                        row: self.row,
-                        offset: addr,
-                        value,
-                    });
-                }
-            }
-            _ => {
-                let msg = format!(
-                    "Tile ({},{}) ctrl_pkt: unknown operation {} (addr=0x{:05X}) -- impossible on hardware",
-                    self.col, self.row, operation, base_address,
-                );
-                log::error!("{}", msg);
-                actions.push(CtrlPacketAction::Error(msg));
-            }
-        }
-
-        actions
-    }
+    // Control packet processing has been moved to control_packets::StreamReassembler
+    // in array.rs. The tile no longer owns the word-by-word FSM.
 
     // === Lock_Request Register Handling ===
 
@@ -2849,58 +2627,29 @@ mod tests {
     /// receiving the header, with no data payload. The action carries the
     /// offset, count (beats+1), and response_id from the header.
     #[test]
-    fn test_ctrl_packet_op_read_produces_read_registers_action() {
+    fn test_ctrl_packet_op_read_via_reassembler() {
         use crate::arch::ctrl_packet::*;
+        use super::super::control_packets::{StreamReassembler, ReassembleResult, CtrlOpCode};
 
-        let mut tile = Tile::compute(2, 3);
+        let mut reassembler = StreamReassembler::new(2, 3);
 
-        // Pre-populate registers at 0x440, 0x444, 0x448, 0x44C with known values.
-        // Direct register map insertion -- no side effects needed for these offsets.
-        tile.registers.insert(0x440, 0xDEAD_0001);
-        tile.registers.insert(0x444, 0xDEAD_0002);
-        tile.registers.insert(0x448, 0xDEAD_0003);
-        tile.registers.insert(0x44C, 0xDEAD_0004);
+        // Build OP_READ header: addr=0x440, beats=4 (raw=3), op=READ(1), resp_id=2
+        let header = 0x440u32
+            | (3u32 << LENGTH_SHIFT)
+            | ((OP_READ as u32) << OPERATION_SHIFT)
+            | (2u32 << RESPONSE_ID_SHIFT);
 
-        // Build OP_READ control packet header:
-        //   address   = 0x440 (bits 19:0)
-        //   beats     = 3 (bits 21:20) -> actual count = 3 + 1 = 4
-        //   operation = 1 (bits 23:22) = OP_READ
-        //   response_id = 2 (bits 30:24)
-        let address: u32 = 0x440;
-        let beats_raw: u32 = 3; // means 4 words
-        let operation: u32 = OP_READ as u32;
-        let response_id: u32 = 2;
-
-        let header = address
-            | (beats_raw << LENGTH_SHIFT)
-            | (operation << OPERATION_SHIFT)
-            | (response_id << RESPONSE_ID_SHIFT);
-
-        // Start from Idle state (skip stream header)
-        tile.ctrl_pkt_state = ControlPacketState::Idle;
-
-        // OP_READ has no data payload -- TLAST on the header itself
-        let actions = tile.process_ctrl_packet_word(header, true);
-
-        // Should produce exactly one ReadRegisters action
-        assert_eq!(actions.len(), 1, "OP_READ should produce exactly one action");
-
-        match &actions[0] {
-            CtrlPacketAction::ReadRegisters { col, row, offset, count, response_id: rid } => {
-                assert_eq!(*col, 2, "col should match tile col");
-                assert_eq!(*row, 3, "row should match tile row");
-                assert_eq!(*offset, 0x440, "offset should be the address from header");
-                assert_eq!(*count, 4, "count should be beats+1 = 4");
-                assert_eq!(*rid, 2, "response_id should match header");
+        // OP_READ completes immediately (no data payload)
+        match reassembler.feed_word(header, true) {
+            ReassembleResult::Complete(pkt) => {
+                assert_eq!(pkt.opcode, CtrlOpCode::Read);
+                assert_eq!(pkt.address, 0x440);
+                assert_eq!(pkt.beats, 4);
+                assert_eq!(pkt.response_id, 2);
+                assert!(pkt.data.is_empty());
             }
-            other => panic!("Expected ReadRegisters, got {:?}", other),
+            other => panic!("Expected Complete, got {:?}", other),
         }
-
-        // State machine should return to Idle (header was dropped)
-        assert!(
-            matches!(tile.ctrl_pkt_state, ControlPacketState::Idle),
-            "State should be Idle after OP_READ with TLAST and drop_header=true"
-        );
     }
 
     // === Lock Trace Event Pipeline Tests ===

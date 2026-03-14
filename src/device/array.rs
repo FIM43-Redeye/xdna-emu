@@ -1042,8 +1042,6 @@ impl TileArray {
                 let pkt_cfg = self.tiles[i].stream_switch.master_packet_cfg(master_idx);
                 if pkt_cfg.map_or(false, |c| c.packet_enable && !c.drop_header) {
                     self.ctrl_reassemblers[i].set_drop_header(false);
-                    // Also update tile's legacy field for backward compat
-                    self.tiles[i].ctrl_pkt_drop_header = false;
                 }
             }
 
