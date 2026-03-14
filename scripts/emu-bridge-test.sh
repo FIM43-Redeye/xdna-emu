@@ -1864,14 +1864,14 @@ main() {
           # Run VCD coverage audit.
           local coverage_log="$RESULTS_DIR/${safe}.chess.aiesim-coverage.log"
           local cov_rc=0
-          "$vcd_compare_bin" --coverage "$vcd_file" > "$coverage_log" 2>&1 || cov_rc=$?
+          "$vcd_compare_bin" --coverage "$vcd_file" --device vc2802 > "$coverage_log" 2>&1 || cov_rc=$?
 
           if [[ $cov_rc -eq 0 ]]; then
             echo "PASS" > "$sim_result_file"
-            # Extract signal count from coverage output for summary.
-            local sig_count
-            sig_count="$(grep -oP '\d+ signals?' "$coverage_log" | head -1 || true)"
-            echo "  AIESIM $name: PASS${sig_count:+ ($sig_count)}"
+            # Extract mapped percentage from coverage output for summary.
+            local mapped_pct
+            mapped_pct="$(grep -oP '\(\K[0-9.]+%' "$coverage_log" | head -1 || true)"
+            echo "  AIESIM $name: PASS${mapped_pct:+ ($mapped_pct mapped)}"
             ((aiesim_pass++)) || true
           else
             echo "FAIL" > "$sim_result_file"
