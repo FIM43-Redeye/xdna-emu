@@ -1,0 +1,378 @@
+//! Word-by-word control packet reassembly from stream switch data.
+//!
+//! The stream switch delivers control packets one 32-bit word at a time
+//! to the TileCtrl master port. This module reassembles those words into
+//! complete [`ControlPacket`] instances that the [`ControlPacketProcessor`]
+//! can execute.
+//!
+//! # Stream Protocol
+//!
+//! When a master port has `Drop_Header=false`, the stream routing header
+//! is forwarded before the actual control packet header. The reassembler
+//! handles this by starting in `WaitingForStreamHeader` state when configured.
+//!
+//! # Lifecycle
+//!
+//! ```text
+//! [WaitingForStreamHeader] --stream_header--> [Idle]
+//! [Idle]                   --ctrl_header-->   [Collecting] or [Complete(Read)]
+//! [Collecting]             --data_beats-->    [Complete]
+//! [Complete]               --take_packet-->   [Idle] or [WaitingForStreamHeader]
+//! ```
+
+use super::parser::{ControlPacket, CtrlOpCode, HeaderFields, parse_header};
+
+/// Reassembly state machine for control packet words.
+#[derive(Debug)]
+pub struct StreamReassembler {
+    state: ReassemblerState,
+    /// Whether stream headers are forwarded (Drop_Header=false on master port).
+    drop_header: bool,
+    /// Tile location for logging/error context.
+    col: u8,
+    row: u8,
+}
+
+#[derive(Debug, Default)]
+enum ReassemblerState {
+    /// Waiting for stream routing header (when drop_header=false).
+    WaitingForStreamHeader,
+    /// Ready for control packet header.
+    #[default]
+    Idle,
+    /// Collecting data beats after header.
+    Collecting {
+        header: HeaderFields,
+        beats_collected: u8,
+        data: [u32; 4],
+    },
+}
+
+/// Result of feeding a word to the reassembler.
+#[derive(Debug)]
+pub enum ReassembleResult {
+    /// Still collecting -- no complete packet yet.
+    Pending,
+    /// A complete control packet is ready.
+    Complete(ControlPacket),
+    /// An error occurred during reassembly.
+    Error(String),
+}
+
+impl StreamReassembler {
+    /// Create a new reassembler for a tile.
+    ///
+    /// Initially in `Idle` state (assumes Drop_Header=true). Call
+    /// `set_drop_header(false)` to enable stream header consumption.
+    pub fn new(col: u8, row: u8) -> Self {
+        Self {
+            state: ReassemblerState::Idle,
+            drop_header: true,
+            col,
+            row,
+        }
+    }
+
+    /// Configure whether stream headers are forwarded to this port.
+    ///
+    /// When `drop_header=false`, the reassembler expects a stream routing
+    /// header before each control packet header. Call this when the
+    /// TileCtrl master port's packet config is detected.
+    pub fn set_drop_header(&mut self, drop: bool) {
+        self.drop_header = drop;
+        if !drop {
+            // If we're now expecting headers, transition to waiting state
+            if matches!(self.state, ReassemblerState::Idle) {
+                self.state = ReassemblerState::WaitingForStreamHeader;
+            }
+        }
+    }
+
+    /// Whether stream headers are being dropped (not forwarded).
+    pub fn drop_header(&self) -> bool {
+        self.drop_header
+    }
+
+    /// Feed one word from the TileCtrl master port.
+    ///
+    /// Returns `Complete(packet)` when a full control packet has been
+    /// reassembled, `Pending` when more words are needed, or `Error`
+    /// on protocol violations.
+    pub fn feed_word(&mut self, word: u32, tlast: bool) -> ReassembleResult {
+        match std::mem::take(&mut self.state) {
+            ReassemblerState::WaitingForStreamHeader => {
+                // Consume the stream routing header, transition to Idle.
+                let pkt_id = word & 0x1F;
+                let pkt_type = (word >> 12) & 0x7;
+                log::debug!(
+                    "Tile ({},{}) ctrl_pkt: consuming stream header 0x{:08X} (pkt_id={}, pkt_type={})",
+                    self.col, self.row, word, pkt_id, pkt_type
+                );
+                self.state = ReassemblerState::Idle;
+                ReassembleResult::Pending
+            }
+            ReassemblerState::Idle => {
+                // Parse control packet header.
+                let header = match parse_header(word) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        self.state = ReassemblerState::Idle;
+                        return ReassembleResult::Error(format!(
+                            "Tile ({},{}) ctrl_pkt: header parse error: {}",
+                            self.col, self.row, e
+                        ));
+                    }
+                };
+
+                log::info!(
+                    "Tile ({},{}) ctrl_pkt: header 0x{:08X} addr=0x{:05X} op={:?} beats={} resp_id={}",
+                    self.col, self.row, word, header.address, header.opcode, header.beats, header.response_id
+                );
+
+                // OP_READ has no data payload -- complete immediately.
+                if header.opcode == CtrlOpCode::Read {
+                    let packet = ControlPacket::read(header.address, header.beats, header.response_id);
+                    self.transition_after_complete(tlast);
+                    return ReassembleResult::Complete(packet);
+                }
+
+                // For write operations, start collecting data beats.
+                if header.beats == 0 {
+                    // Shouldn't happen (beats = length+1, minimum 1), but handle gracefully.
+                    self.transition_after_complete(tlast);
+                    return ReassembleResult::Error(format!(
+                        "Tile ({},{}) ctrl_pkt: zero beats in write operation",
+                        self.col, self.row
+                    ));
+                }
+
+                self.state = ReassemblerState::Collecting {
+                    header,
+                    beats_collected: 0,
+                    data: [0; 4],
+                };
+                ReassembleResult::Pending
+            }
+            ReassemblerState::Collecting {
+                header,
+                mut beats_collected,
+                mut data,
+            } => {
+                data[beats_collected as usize] = word;
+                beats_collected += 1;
+
+                log::debug!(
+                    "Tile ({},{}) ctrl_pkt: data[{}] = 0x{:08X} ({}/{}){}",
+                    self.col, self.row,
+                    beats_collected - 1, word,
+                    beats_collected, header.beats,
+                    if tlast { " TLAST" } else { "" }
+                );
+
+                if beats_collected >= header.beats {
+                    // All beats received -- build the complete packet.
+                    let payload = &data[..beats_collected as usize];
+                    let packet = match header.opcode {
+                        CtrlOpCode::Write | CtrlOpCode::BlockWrite => {
+                            ControlPacket::block_write(header.address, payload.to_vec())
+                        }
+                        CtrlOpCode::WriteIncr => {
+                            ControlPacket::write_incr(header.address, payload.to_vec())
+                        }
+                        CtrlOpCode::Read => unreachable!("Read handled above"),
+                    };
+                    self.transition_after_complete(tlast);
+                    ReassembleResult::Complete(packet)
+                } else {
+                    // Still collecting.
+                    self.state = ReassemblerState::Collecting {
+                        header,
+                        beats_collected,
+                        data,
+                    };
+                    ReassembleResult::Pending
+                }
+            }
+        }
+    }
+
+    /// Reset the reassembler to its initial state.
+    pub fn reset(&mut self) {
+        self.state = if self.drop_header {
+            ReassemblerState::Idle
+        } else {
+            ReassemblerState::WaitingForStreamHeader
+        };
+    }
+
+    /// Transition after a complete packet, considering TLAST and drop_header.
+    fn transition_after_complete(&mut self, tlast: bool) {
+        self.state = if tlast && !self.drop_header {
+            ReassemblerState::WaitingForStreamHeader
+        } else {
+            ReassemblerState::Idle
+        };
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_reassembler_starts_idle() {
+        let r = StreamReassembler::new(0, 2);
+        assert!(r.drop_header());
+    }
+
+    #[test]
+    fn single_word_write() {
+        let mut r = StreamReassembler::new(0, 2);
+        // Build header: addr=0x100, op=Write(0), beats=1(encoded as 0), resp_id=0
+        let header = build_test_header(0x100, 0, 0, 0);
+        // Feed header -- should go to Collecting
+        assert!(matches!(r.feed_word(header, false), ReassembleResult::Pending));
+        // Feed data beat
+        match r.feed_word(0xDEADBEEF, true) {
+            ReassembleResult::Complete(pkt) => {
+                assert_eq!(pkt.address, 0x100);
+                assert_eq!(pkt.data.len(), 1);
+                assert_eq!(pkt.data[0], 0xDEADBEEF);
+            }
+            other => panic!("Expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn multi_word_write() {
+        let mut r = StreamReassembler::new(0, 2);
+        // 3 beats: length field = 2 (beats = length+1 = 3)
+        let header = build_test_header(0x200, 2, 0, 0);
+        assert!(matches!(r.feed_word(header, false), ReassembleResult::Pending));
+        assert!(matches!(r.feed_word(0x11, false), ReassembleResult::Pending));
+        assert!(matches!(r.feed_word(0x22, false), ReassembleResult::Pending));
+        match r.feed_word(0x33, true) {
+            ReassembleResult::Complete(pkt) => {
+                assert_eq!(pkt.data, vec![0x11, 0x22, 0x33]);
+            }
+            other => panic!("Expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn read_completes_immediately() {
+        let mut r = StreamReassembler::new(0, 2);
+        // OP_READ = 1
+        let header = build_test_header(0x300, 0, 1, 42);
+        match r.feed_word(header, true) {
+            ReassembleResult::Complete(pkt) => {
+                assert_eq!(pkt.address, 0x300);
+                assert!(pkt.data.is_empty());
+                assert_eq!(pkt.opcode, CtrlOpCode::Read);
+            }
+            other => panic!("Expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stream_header_consumed_when_drop_false() {
+        let mut r = StreamReassembler::new(0, 2);
+        r.set_drop_header(false);
+
+        // First word should be consumed as stream header
+        assert!(matches!(r.feed_word(0x0000_0007, false), ReassembleResult::Pending));
+
+        // Now the actual control packet header
+        let header = build_test_header(0x100, 0, 0, 0);
+        assert!(matches!(r.feed_word(header, false), ReassembleResult::Pending));
+
+        // Data beat with TLAST
+        match r.feed_word(0x42, true) {
+            ReassembleResult::Complete(pkt) => {
+                assert_eq!(pkt.data[0], 0x42);
+            }
+            other => panic!("Expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tlast_with_no_drop_transitions_to_waiting() {
+        let mut r = StreamReassembler::new(0, 2);
+        r.set_drop_header(false);
+
+        // Stream header
+        r.feed_word(0x0000_0007, false);
+
+        // OP_READ with TLAST
+        let header = build_test_header(0x100, 0, 1, 0);
+        r.feed_word(header, true);
+
+        // Next word should be treated as stream header again
+        // (Feed a ctrl header without consuming stream header first -- should go Pending)
+        assert!(matches!(r.feed_word(0x0000_000F, false), ReassembleResult::Pending));
+    }
+
+    #[test]
+    fn consecutive_packets_without_tlast() {
+        let mut r = StreamReassembler::new(0, 2);
+
+        // First packet: write 1 word, no TLAST
+        let h1 = build_test_header(0x100, 0, 0, 0);
+        r.feed_word(h1, false);
+        match r.feed_word(0xAA, false) {
+            ReassembleResult::Complete(pkt) => assert_eq!(pkt.data[0], 0xAA),
+            other => panic!("Expected Complete, got {:?}", other),
+        }
+
+        // Second packet in same stream: another write
+        let h2 = build_test_header(0x200, 0, 0, 0);
+        r.feed_word(h2, false);
+        match r.feed_word(0xBB, true) {
+            ReassembleResult::Complete(pkt) => assert_eq!(pkt.data[0], 0xBB),
+            other => panic!("Expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reset_returns_to_initial_state() {
+        let mut r = StreamReassembler::new(0, 2);
+        // Start collecting
+        let h = build_test_header(0x100, 1, 0, 0);
+        r.feed_word(h, false);
+        r.feed_word(0x11, false);
+        // Reset mid-collection
+        r.reset();
+        // Should be back to Idle, ready for a new header
+        let h2 = build_test_header(0x200, 0, 1, 0);
+        match r.feed_word(h2, true) {
+            ReassembleResult::Complete(pkt) => assert_eq!(pkt.opcode, CtrlOpCode::Read),
+            other => panic!("Expected Complete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn write_incr_opcode() {
+        let mut r = StreamReassembler::new(0, 2);
+        // OP_WRITE_INCR = 2
+        let header = build_test_header(0x400, 0, 2, 0);
+        r.feed_word(header, false);
+        match r.feed_word(0x55, true) {
+            ReassembleResult::Complete(pkt) => {
+                assert_eq!(pkt.opcode, CtrlOpCode::WriteIncr);
+                assert_eq!(pkt.data[0], 0x55);
+            }
+            other => panic!("Expected Complete, got {:?}", other),
+        }
+    }
+
+    // Helper: build a control packet header word.
+    // length_field is the raw 2-bit value (beats = length_field + 1).
+    fn build_test_header(address: u32, length_field: u32, operation: u32, response_id: u32) -> u32 {
+        use crate::arch::ctrl_packet::*;
+        (address & ADDRESS_MASK)
+            | ((length_field & LENGTH_MASK) << LENGTH_SHIFT)
+            | ((operation & OPERATION_MASK) << OPERATION_SHIFT)
+            | ((response_id & RESPONSE_ID_MASK) << RESPONSE_ID_SHIFT)
+    }
+}

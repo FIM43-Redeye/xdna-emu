@@ -56,10 +56,12 @@
 
 pub mod parser;
 pub mod processor;
+pub mod reassembler;
 pub mod response;
 
-pub use parser::{ControlPacket, CtrlOpCode, ParseError, parse_header};
+pub use parser::{ControlPacket, CtrlOpCode, HeaderFields, ParseError, parse_header};
 pub use processor::{ControlPacketProcessor, RegisterAccess, ProcessError};
+pub use reassembler::{StreamReassembler, ReassembleResult};
 pub use response::ControlPacketResponse;
 
 /// Interface for lazy BD re-parsing on word-by-word control packet writes.

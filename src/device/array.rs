@@ -130,6 +130,13 @@ pub struct TileArray {
     /// that are generated during lock arbiter resolution in `step_data_movement()`.
     current_cycle: u64,
 
+    /// Per-tile control packet reassemblers.
+    ///
+    /// Handles word-by-word reassembly of control packets arriving at
+    /// TileCtrl master ports. Moved here from Tile to keep tiles stateless
+    /// for control packet protocol handling.
+    ctrl_reassemblers: Vec<super::control_packets::StreamReassembler>,
+
     /// In-flight words traversing inter-tile links.
     ///
     /// On real AIE2 hardware, data takes ROUTE_LATENCY_PER_HOP cycles to
@@ -193,11 +200,21 @@ impl TileArray {
             }
         }
 
+        // Create per-tile control packet reassemblers.
+        let ctrl_reassemblers: Vec<_> = (0..capacity)
+            .map(|i| {
+                let col = (i / rows as usize) as u8;
+                let row = (i % rows as usize) as u8;
+                super::control_packets::StreamReassembler::new(col, row)
+            })
+            .collect();
+
         Self {
             arch, cols, rows, tiles, dma_engines,
             fatal_errors: Vec::new(),
             pending_ctrl_actions: Vec::new(),
             current_cycle: 0,
+            ctrl_reassemblers,
             inter_tile_pipeline: Vec::new(),
         }
     }
@@ -1003,7 +1020,8 @@ impl TileArray {
     /// which interprets it as register writes.
     fn route_tile_switches_to_ctrl(&mut self) -> usize {
         use super::stream_switch::PortType;
-        use super::tile::ControlPacketState;
+        use super::control_packets::ReassembleResult;
+        use super::tile::CtrlPacketAction;
         let mut words_routed = 0;
 
         for i in 0..self.tiles.len() {
@@ -1016,29 +1034,45 @@ impl TileArray {
                 None => continue,
             };
 
-            // Configure the tile's ctrl packet state from the master port config
+            // Configure the reassembler's drop_header from the master port config
             // (once only). If the master port is in packet mode with
             // Drop_Header=false, the stream header is forwarded and must be
-            // consumed by the handler before the actual control packet header.
-            if self.tiles[i].ctrl_pkt_drop_header {
+            // consumed by the reassembler before the actual control packet header.
+            if self.ctrl_reassemblers[i].drop_header() {
                 let pkt_cfg = self.tiles[i].stream_switch.master_packet_cfg(master_idx);
                 if pkt_cfg.map_or(false, |c| c.packet_enable && !c.drop_header) {
+                    self.ctrl_reassemblers[i].set_drop_header(false);
+                    // Also update tile's legacy field for backward compat
                     self.tiles[i].ctrl_pkt_drop_header = false;
-                    self.tiles[i].ctrl_pkt_state = ControlPacketState::WaitingForStreamHeader;
                 }
             }
 
             // Drain all pending words from the TileCtrl master port
             while self.tiles[i].stream_switch.masters[master_idx].has_data() {
                 if let Some((data, tlast)) = self.tiles[i].stream_switch.masters[master_idx].pop_with_tlast() {
-                    let actions = self.tiles[i].process_ctrl_packet_word(data, tlast);
-                    if !actions.is_empty() {
-                        self.pending_ctrl_actions.extend(actions);
+                    let col = self.tiles[i].col;
+                    let row = self.tiles[i].row;
+
+                    match self.ctrl_reassemblers[i].feed_word(data, tlast) {
+                        ReassembleResult::Complete(packet) => {
+                            // Convert the complete packet to CtrlPacketActions
+                            // for backward compatibility with the coordinator.
+                            let actions = Self::packet_to_actions(col, row, &packet);
+                            if !actions.is_empty() {
+                                self.pending_ctrl_actions.extend(actions);
+                            }
+                        }
+                        ReassembleResult::Pending => {}
+                        ReassembleResult::Error(msg) => {
+                            log::error!("{}", msg);
+                            self.pending_ctrl_actions.push(CtrlPacketAction::Error(msg));
+                        }
                     }
+
                     words_routed += 1;
                     log::debug!(
                         "TileSwitch->Ctrl: tile ({},{}) master[{}] -> ctrl_pkt = 0x{:08X}{}",
-                        self.tiles[i].col, self.tiles[i].row, master_idx, data,
+                        col, row, master_idx, data,
                         if tlast { " TLAST" } else { "" }
                     );
                 }
@@ -1046,6 +1080,41 @@ impl TileArray {
         }
 
         words_routed
+    }
+
+    /// Convert a reassembled ControlPacket into legacy CtrlPacketAction(s).
+    ///
+    /// This bridges the new control_packets module with the existing coordinator
+    /// dispatch path. Once the coordinator is updated to consume ControlPackets
+    /// directly, this adapter can be removed.
+    fn packet_to_actions(col: u8, row: u8, packet: &super::control_packets::ControlPacket) -> Vec<super::tile::CtrlPacketAction> {
+        use super::control_packets::CtrlOpCode;
+        use super::tile::CtrlPacketAction;
+
+        let mut actions = Vec::new();
+        match packet.opcode {
+            CtrlOpCode::Write | CtrlOpCode::BlockWrite | CtrlOpCode::WriteIncr => {
+                for (i, &value) in packet.data.iter().enumerate() {
+                    let addr = packet.address + (i as u32) * 4;
+                    log::info!("Tile ({},{}) ctrl_pkt {:?}: [0x{:05X}] = 0x{:08X}",
+                        col, row, packet.opcode, addr, value);
+                    actions.push(CtrlPacketAction::WriteRegister {
+                        col, row, offset: addr, value,
+                    });
+                }
+            }
+            CtrlOpCode::Read => {
+                log::info!("Tile ({},{}) ctrl_pkt READ: addr=0x{:05X} beats={} resp_id={}",
+                    col, row, packet.address, packet.beats, packet.response_id);
+                actions.push(CtrlPacketAction::ReadRegisters {
+                    col, row,
+                    offset: packet.address,
+                    count: packet.beats,
+                    response_id: packet.response_id,
+                });
+            }
+        }
+        actions
     }
 
     /// Route core stream output to per-tile StreamSwitch slave ports.
