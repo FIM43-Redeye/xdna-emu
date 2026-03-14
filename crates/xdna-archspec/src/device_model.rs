@@ -171,6 +171,9 @@ fn infer_architecture(name: &str) -> Result<Architecture, ExtractError> {
         Ok(Architecture::Aie2)
     } else if name.starts_with("npu2") {
         Ok(Architecture::Aie2p)
+    } else if name.starts_with("xcve2") {
+        // Versal AIE2 devices (e.g., xcve2802)
+        Ok(Architecture::Aie2)
     } else {
         Err(ExtractError::UnknownDevice {
             name: name.to_string(),

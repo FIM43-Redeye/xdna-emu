@@ -6121,6 +6121,7040 @@
           }
         }
       ]
+    },
+    "xcve2802": {
+      "device_id": 2,
+      "columns": 37,
+      "rows": 11,
+      "is_npu": false,
+      "local_memory_size": 65536,
+      "mem_tile_size": 524288,
+      "num_mem_tile_rows": 2,
+      "column_shift": 25,
+      "row_shift": 20,
+      "mem_base_addresses": {
+        "south": 262144,
+        "west": 327680,
+        "north": 393216,
+        "east": 458752
+      },
+      "tile_types": {
+        "shim_noc": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "representative": [
+            1,
+            0
+          ],
+          "switchbox_ports": {
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 6,
+              "slave": 8
+            },
+            "West": {
+              "master": 4,
+              "slave": 4
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          },
+          "shim_mux_ports": {
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "South": {
+              "master": 8,
+              "slave": 6
+            }
+          }
+        },
+        "mem_tile": {
+          "num_locks": 64,
+          "num_bds": 48,
+          "representative": [
+            1,
+            1
+          ],
+          "switchbox_ports": {
+            "DMA": {
+              "master": 6,
+              "slave": 6
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        },
+        "core": {
+          "num_locks": 16,
+          "num_bds": 16,
+          "representative": [
+            1,
+            2
+          ],
+          "program_memory_size": 16384,
+          "switchbox_ports": {
+            "Core": {
+              "master": 1,
+              "slave": 1
+            },
+            "DMA": {
+              "master": 2,
+              "slave": 2
+            },
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 4,
+              "slave": 6
+            },
+            "West": {
+              "master": 4,
+              "slave": 4
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 2
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          }
+        },
+        "shim_pl": {
+          "num_locks": 16,
+          "num_bds": 0,
+          "representative": [
+            0,
+            0
+          ],
+          "switchbox_ports": {
+            "FIFO": {
+              "master": 1,
+              "slave": 1
+            },
+            "South": {
+              "master": 6,
+              "slave": 8
+            },
+            "West": {
+              "master": 4,
+              "slave": 4
+            },
+            "North": {
+              "master": 6,
+              "slave": 4
+            },
+            "East": {
+              "master": 4,
+              "slave": 4
+            },
+            "Trace": {
+              "master": 0,
+              "slave": 1
+            },
+            "Ctrl": {
+              "master": 1,
+              "slave": 1
+            }
+          },
+          "shim_mux_ports": {
+            "DMA": {
+              "master": 0,
+              "slave": 0
+            },
+            "South": {
+              "master": 0,
+              "slave": 0
+            }
+          }
+        }
+      },
+      "tile_map": [
+        {
+          "col": 0,
+          "row": 0,
+          "type": "shim_pl",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": true
+          }
+        },
+        {
+          "col": 0,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": true
+          }
+        },
+        {
+          "col": 0,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": true
+          }
+        },
+        {
+          "col": 0,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": true
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 0,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": true
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 0,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": true
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 0,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": true
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 0,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": true
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 0,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": true
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 0,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": true
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 0,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": true
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 1,
+          "row": 0,
+          "type": "shim_pl",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 1,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 1,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 1,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 1,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 1,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 1,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 1,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 1,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 1,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 1,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 2,
+          "row": 0,
+          "type": "shim_noc",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 2,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 2,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 2,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 2,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 2,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 2,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 2,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 2,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 2,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 2,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 3,
+          "row": 0,
+          "type": "shim_noc",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 3,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 3,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 3,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 3,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 3,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 3,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 3,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 3,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 3,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 3,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 4,
+          "row": 0,
+          "type": "shim_pl",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 4,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 4,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 4,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 4,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 4,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 4,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 4,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 4,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 4,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 4,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 5,
+          "row": 0,
+          "type": "shim_pl",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 5,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 5,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 5,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 5,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 5,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 5,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 5,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 5,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 5,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 5,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 6,
+          "row": 0,
+          "type": "shim_noc",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 6,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 6,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 6,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 6,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 6,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 6,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 6,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 6,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 6,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 6,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 7,
+          "row": 0,
+          "type": "shim_noc",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 7,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 7,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 7,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 7,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 7,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 7,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 7,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 7,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 7,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 7,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 8,
+          "row": 0,
+          "type": "shim_pl",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 8,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 8,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 8,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 8,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 8,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 8,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 8,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 8,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 8,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 8,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 9,
+          "row": 0,
+          "type": "shim_pl",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 9,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 9,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 9,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 9,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 9,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 9,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 9,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 9,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 9,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 9,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 10,
+          "row": 0,
+          "type": "shim_noc",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 10,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 10,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 10,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 10,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 10,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 10,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 10,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 10,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 10,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 10,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 11,
+          "row": 0,
+          "type": "shim_noc",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 11,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 11,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 11,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 11,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 11,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 11,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 11,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 11,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 11,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 11,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 12,
+          "row": 0,
+          "type": "shim_pl",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 12,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 12,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 12,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 12,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 12,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 12,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 12,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 12,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 12,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 12,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 13,
+          "row": 0,
+          "type": "shim_pl",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 13,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 13,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 13,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 13,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 13,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 13,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 13,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 13,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 13,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 13,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 14,
+          "row": 0,
+          "type": "shim_noc",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 14,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 14,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 14,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 14,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 14,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 14,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 14,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 14,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 14,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 14,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 15,
+          "row": 0,
+          "type": "shim_noc",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 15,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 15,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 15,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 15,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 15,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 15,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 15,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 15,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 15,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 15,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 16,
+          "row": 0,
+          "type": "shim_pl",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 16,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 16,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 16,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 16,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 16,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 16,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 16,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 16,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 16,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 16,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 17,
+          "row": 0,
+          "type": "shim_pl",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 17,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 17,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 17,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 17,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 17,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 17,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 17,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 17,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 17,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 17,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 18,
+          "row": 0,
+          "type": "shim_noc",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 18,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 18,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 18,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 18,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 18,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 18,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 18,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 18,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 18,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 18,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 19,
+          "row": 0,
+          "type": "shim_noc",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 19,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 19,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 19,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 19,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 19,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 19,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 19,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 19,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 19,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 19,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 20,
+          "row": 0,
+          "type": "shim_pl",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 20,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 20,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 20,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 20,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 20,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 20,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 20,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 20,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 20,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 20,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 21,
+          "row": 0,
+          "type": "shim_pl",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 21,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 21,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 21,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 21,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 21,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 21,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 21,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 21,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 21,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 21,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 22,
+          "row": 0,
+          "type": "shim_noc",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 22,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 22,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 22,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 22,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 22,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 22,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 22,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 22,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 22,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 22,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 23,
+          "row": 0,
+          "type": "shim_noc",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 23,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 23,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 23,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 23,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 23,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 23,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 23,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 23,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 23,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 23,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 24,
+          "row": 0,
+          "type": "shim_pl",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 24,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 24,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 24,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 24,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 24,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 24,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 24,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 24,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 24,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 24,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 25,
+          "row": 0,
+          "type": "shim_pl",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 25,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 25,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 25,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 25,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 25,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 25,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 25,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 25,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 25,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 25,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 26,
+          "row": 0,
+          "type": "shim_noc",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 26,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 26,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 26,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 26,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 26,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 26,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 26,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 26,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 26,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 26,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 27,
+          "row": 0,
+          "type": "shim_noc",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 27,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 27,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 27,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 27,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 27,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 27,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 27,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 27,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 27,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 27,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 28,
+          "row": 0,
+          "type": "shim_pl",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 28,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 28,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 28,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 28,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 28,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 28,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 28,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 28,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 28,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 28,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 29,
+          "row": 0,
+          "type": "shim_pl",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 29,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 29,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 29,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 29,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 29,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 29,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 29,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 29,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 29,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 29,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 30,
+          "row": 0,
+          "type": "shim_noc",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 30,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 30,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 30,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 30,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 30,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 30,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 30,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 30,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 30,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 30,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 31,
+          "row": 0,
+          "type": "shim_noc",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 31,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 31,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 31,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 31,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 31,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 31,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 31,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 31,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 31,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 31,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 32,
+          "row": 0,
+          "type": "shim_pl",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 32,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 32,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 32,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 32,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 32,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 32,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 32,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 32,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 32,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 32,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 33,
+          "row": 0,
+          "type": "shim_pl",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 33,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 33,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 33,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 33,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 33,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 33,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 33,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 33,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 33,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 33,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 34,
+          "row": 0,
+          "type": "shim_noc",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 34,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 34,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 34,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 34,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 34,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 34,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 34,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 34,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 34,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 34,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 35,
+          "row": 0,
+          "type": "shim_noc",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 35,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 35,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 35,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 35,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 35,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 35,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 35,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 35,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 35,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 35,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 36,
+          "row": 0,
+          "type": "shim_pl",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 36,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 36,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          }
+        },
+        {
+          "col": 36,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 36,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 36,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 36,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 36,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 36,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 36,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 36,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": false,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 37,
+          "row": 0,
+          "type": "shim_pl",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": true,
+            "east": true,
+            "west": false
+          }
+        },
+        {
+          "col": 37,
+          "row": 1,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": true,
+            "west": false
+          }
+        },
+        {
+          "col": 37,
+          "row": 2,
+          "type": "mem_tile",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": true,
+            "west": false
+          }
+        },
+        {
+          "col": 37,
+          "row": 3,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": true,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 37,
+          "row": 4,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": true,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 37,
+          "row": 5,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": true,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 37,
+          "row": 6,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": true,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 37,
+          "row": 7,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": true,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 37,
+          "row": 8,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": true,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 37,
+          "row": 9,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": false,
+            "south": false,
+            "east": true,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        },
+        {
+          "col": 37,
+          "row": 10,
+          "type": "core",
+          "is_internal": false,
+          "edges": {
+            "north": true,
+            "south": false,
+            "east": true,
+            "west": false
+          },
+          "mem_affinity": {
+            "south": true,
+            "west": false,
+            "north": true,
+            "east": false
+          }
+        }
+      ]
     }
   }
 }

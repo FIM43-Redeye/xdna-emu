@@ -30,11 +30,11 @@ use super::tile::{Tile, TileParams, TileType};
 use crate::interpreter::state::EventType;
 use std::sync::Arc;
 
-/// Maximum supported columns
-pub const MAX_COLS: usize = 9;
+/// Maximum supported columns (VC2802 has 38 columns)
+pub const MAX_COLS: usize = 38;
 
-/// Maximum supported rows
-pub const MAX_ROWS: usize = 6;
+/// Maximum supported rows (VC2802 has 11 rows)
+pub const MAX_ROWS: usize = 11;
 
 /// Get mutable references to up to 3 tiles at disjoint indices for cross-tile lock access.
 ///

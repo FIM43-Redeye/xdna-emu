@@ -352,6 +352,16 @@ impl ModelConfig {
             .expect("npu2 device not found in device model JSON");
         Arc::new(Self::from_arch_model(model, "AIE2P (NPU2+ - Strix/Krackan)"))
     }
+
+    /// Create the VC2802 (Versal AIE2) configuration for aiesimulator validation.
+    ///
+    /// VC2802 is the 38-column x 11-row AIE2 array that aiesimulator uses for
+    /// all AIE2 targets. Same silicon as NPU1 tiles, just a larger array.
+    pub fn xcve2802() -> Arc<dyn ArchConfig> {
+        let model = ARCHSPEC_MODELS.get("xcve2802")
+            .expect("xcve2802 device not found in device model JSON; add to tools/aie-device-models.json");
+        Arc::new(Self::from_arch_model(model, "AIE2 (VC2802 - Versal, aiesim validation)"))
+    }
 }
 
 impl ArchConfig for ModelConfig {
@@ -671,5 +681,49 @@ mod tests {
         // NPU2 base has 8 compute columns + 1 = 9 total
         assert_eq!(arch.columns(), 9);
         assert_eq!(arch.rows(), 6);
+    }
+
+    #[test]
+    fn test_vc2802_dimensions() {
+        let arch = ModelConfig::xcve2802();
+        // VC2802: 37 + 1 = 38 columns, 11 rows
+        assert_eq!(arch.columns(), 38);
+        assert_eq!(arch.rows(), 11);
+    }
+
+    #[test]
+    fn test_vc2802_tile_classification() {
+        let arch = ModelConfig::xcve2802();
+        // Row 0: shim
+        assert!(matches!(arch.tile_type(0, 0), TileType::Shim));
+        assert!(matches!(arch.tile_type(7, 0), TileType::Shim));
+        // Rows 1-2: memtile
+        assert!(matches!(arch.tile_type(7, 1), TileType::MemTile));
+        assert!(matches!(arch.tile_type(7, 2), TileType::MemTile));
+        // Rows 3-10: compute
+        assert!(matches!(arch.tile_type(7, 3), TileType::Compute));
+        assert!(matches!(arch.tile_type(7, 10), TileType::Compute));
+    }
+
+    #[test]
+    fn test_vc2802_tile_params_match_npu1() {
+        // Same AIE2 silicon -- tile params should be identical
+        let vc = ModelConfig::xcve2802();
+        let npu = ModelConfig::npu1();
+        // Compute tile memory
+        assert_eq!(
+            vc.data_memory_size(TileType::Compute),
+            npu.data_memory_size(TileType::Compute)
+        );
+        // Lock counts
+        assert_eq!(
+            vc.lock_count(TileType::Compute),
+            npu.lock_count(TileType::Compute)
+        );
+        // DMA channels
+        assert_eq!(
+            vc.dma_s2mm_channels(TileType::Compute),
+            npu.dma_s2mm_channels(TileType::Compute)
+        );
     }
 }
