@@ -39,7 +39,7 @@
 //! - `reset` -> [`StatePath::CoreReset`]
 //! - `pc_breakpoint_halted` -> [`StatePath::CoreBreakpointHalted`]
 
-use crate::vcd::mapping::SubsystemMapping;
+use crate::vcd::mapping::{NestedScopeMapping, SubsystemMapping, TileMapping};
 use crate::vcd::state_path::{StatePath, Subsystem};
 
 /// Build the core/pipeline subsystem mapping for a compute tile.
@@ -85,6 +85,100 @@ pub fn core_mapping() -> SubsystemMapping {
         .fixed_signal("pc_breakpoint_halted", 1, |col, row, _| {
             StatePath::CoreBreakpointHalted { col, row }
         })
+}
+
+/// Build the core mapping for VC2802 aiesimulator VCD format.
+///
+/// In aiesimulator VCD output, core signals are nested deeper than in the
+/// idealized NPU1 mapping:
+///
+/// ```text
+/// tile_7_3.cm.proc.pc_E1              (PC stages under cm.proc)
+/// tile_7_3.cm.proc.iss.pm_rd_in       (ISS signals under cm.proc.iss)
+/// tile_7_3.cm.proc.iss.reset          (reset under cm.proc.iss)
+/// tile_7_3.cm.proc.iss.tm_rd_in       (tile memory under cm.proc.iss)
+/// tile_7_3.cm.proc.performance_counter.counter_event_value_0
+/// ```
+///
+/// This function returns a [`CompositeMapping`] with scope `"cm"` that
+/// handles both nesting levels.
+pub fn core_mapping_vc2802() -> CompositeMapping {
+    // PC stages are directly under cm.proc (1-indexed, E1..E7)
+    let pc_mapping = SubsystemMapping::new("proc", Subsystem::Core)
+        .fixed_signal("pc_E1", 32, |col, row, _| StatePath::CorePc { col, row, stage: 1 })
+        .fixed_signal("pc_E2", 32, |col, row, _| StatePath::CorePc { col, row, stage: 2 })
+        .fixed_signal("pc_E3", 32, |col, row, _| StatePath::CorePc { col, row, stage: 3 })
+        .fixed_signal("pc_E4", 32, |col, row, _| StatePath::CorePc { col, row, stage: 4 })
+        .fixed_signal("pc_E5", 32, |col, row, _| StatePath::CorePc { col, row, stage: 5 })
+        .fixed_signal("pc_E6", 32, |col, row, _| StatePath::CorePc { col, row, stage: 6 })
+        .fixed_signal("pc_E7", 32, |col, row, _| StatePath::CorePc { col, row, stage: 7 });
+
+    // ISS signals are under cm.proc.iss
+    let iss_mapping = SubsystemMapping::new("iss", Subsystem::Core)
+        .fixed_signal("pm_rd_in", 128, |col, row, _| StatePath::CorePmData { col, row })
+        .fixed_signal("pm_ad_out", 20, |col, row, _| StatePath::CorePmAddress { col, row })
+        .fixed_signal("tm_rd_in", 32, |col, row, _| StatePath::CoreTmReadData { col, row })
+        .fixed_signal("tm_ad_out", 20, |col, row, _| StatePath::CoreTmAddress { col, row })
+        .fixed_signal("tm_wr_out", 32, |col, row, _| StatePath::CoreTmWriteData { col, row })
+        .fixed_signal("tm_ld_out", 1, |col, row, _| StatePath::CoreTmLoad { col, row })
+        .fixed_signal("tm_st_out", 1, |col, row, _| StatePath::CoreTmStore { col, row })
+        .fixed_signal("reset", 1, |col, row, _| StatePath::CoreReset { col, row })
+        .fixed_signal("pc_breakpoint_halted", 1, |col, row, _| {
+            StatePath::CoreBreakpointHalted { col, row }
+        });
+
+    // Combine: cm contains proc (with PCs) and proc.iss (with ISS signals).
+    // The CompositeMapping tries each child in order.
+    CompositeMapping::new("cm", vec![
+        Box::new(pc_mapping),
+        Box::new(NestedScopeMapping::new("proc", Box::new(iss_mapping))),
+    ])
+}
+
+/// A composite mapping that tries multiple child mappings in order.
+///
+/// Used when a single VCD scope contains signals with different sub-scope
+/// structures. For example, `cm` in VC2802 VCDs contains both `proc.pc_E1`
+/// (handled by one SubsystemMapping) and `proc.iss.pm_rd_in` (handled by
+/// a NestedScopeMapping wrapping another SubsystemMapping).
+pub struct CompositeMapping {
+    scope: String,
+    children: Vec<Box<dyn TileMapping>>,
+}
+
+impl CompositeMapping {
+    pub fn new(scope: &str, children: Vec<Box<dyn TileMapping>>) -> Self {
+        CompositeMapping {
+            scope: scope.to_string(),
+            children,
+        }
+    }
+}
+
+impl TileMapping for CompositeMapping {
+    fn scope_name(&self) -> &str {
+        &self.scope
+    }
+
+    fn resolve(&self, segments: &[&str], col: u8, row: u8) -> Option<StatePath> {
+        for child in &self.children {
+            // Try each child's scope_name against the first segment.
+            if !segments.is_empty() && segments[0] == child.scope_name() {
+                if let Some(path) = child.resolve(&segments[1..], col, row) {
+                    return Some(path);
+                }
+            }
+        }
+        None
+    }
+
+    fn enumerate(&self, col: u8, row: u8) -> Vec<StatePath> {
+        let mut paths = Vec::new();
+        for child in &self.children {
+            paths.extend(child.enumerate(col, row));
+        }
+        paths
+    }
 }
 
 // ---------------------------------------------------------------------------

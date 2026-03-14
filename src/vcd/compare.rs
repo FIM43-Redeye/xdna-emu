@@ -1404,4 +1404,41 @@ mod tests {
             other => panic!("expected Mismatch, got {:?}", other),
         }
     }
+
+    /// End-to-end self-comparison: compare a real aiesim VCD to itself.
+    ///
+    /// Every signal must be ExactMatch (identical file = identical timelines).
+    /// This proves the full pipeline: wellen parsing -> mapping tree resolution
+    /// -> timeline extraction -> alignment -> comparison.
+    #[test]
+    #[ignore] // requires real VCD file from aiesimulator
+    fn self_comparison_all_exact_match() {
+        use crate::vcd::mapping::build_vc2802_mapping_tree;
+
+        let vcd_path = "build/unit_tests/08_tile_locks/--simulation-cycle-timeout.vcd";
+        if !std::path::Path::new(vcd_path).exists() {
+            eprintln!("Skipping: {} not found (run aiesimulator first)", vcd_path);
+            return;
+        }
+        let tree = build_vc2802_mapping_tree();
+        let tolerance = ToleranceConfig::strict();
+
+        let input = load_and_align(vcd_path, vcd_path, &tree).unwrap();
+        let result = compare_signals(&input, &tolerance);
+        let summary = result.summary();
+
+        assert_eq!(summary.mismatch, 0, "self-comparison should have 0 mismatches");
+        assert_eq!(summary.missing_emu, 0, "no signals should be missing from emu");
+        assert_eq!(summary.missing_sim, 0, "no signals should be missing from sim");
+        assert!(
+            summary.exact_match > 0 || summary.both_empty > 0,
+            "expected some matched signals, got exact={} empty={}",
+            summary.exact_match, summary.both_empty
+        );
+        eprintln!(
+            "Self-comparison: {} exact, {} empty, {} timing_offset, {} total",
+            summary.exact_match, summary.both_empty, summary.timing_offset,
+            summary.exact_match + summary.both_empty + summary.timing_offset
+        );
+    }
 }

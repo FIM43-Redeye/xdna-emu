@@ -26,7 +26,7 @@ use std::process;
 
 use xdna_emu::vcd::compare::{compare_signals, load_and_align};
 use xdna_emu::vcd::coverage::coverage_audit;
-use xdna_emu::vcd::mapping::build_aie2_mapping_tree;
+use xdna_emu::vcd::mapping::{build_aie2_mapping_tree, build_vc2802_mapping_tree, MappingTree};
 use xdna_emu::vcd::report::{json_report, text_report};
 use xdna_emu::vcd::tolerance::ToleranceConfig;
 
@@ -40,6 +40,7 @@ fn usage() -> ! {
     eprintln!("  vcd-compare --coverage <file> [options]");
     eprintln!();
     eprintln!("Options:");
+    eprintln!("  --device npu1|vc2802                 Device geometry (default: vc2802 for coverage, npu1 for compare)");
     eprintln!("  --tolerance strict|relaxed|default   Timing tolerance (default: default)");
     eprintln!("  --json                               Output JSON instead of text");
     eprintln!("  -o <file>                            Write output to file");
@@ -54,6 +55,7 @@ fn main() {
     let mut sim_path: Option<String> = None;
     let mut coverage_path: Option<String> = None;
     let mut tolerance_name = "default".to_string();
+    let mut device_name: Option<String> = None;
     let mut json_output = false;
     let mut output_path: Option<String> = None;
 
@@ -75,6 +77,10 @@ fn main() {
             "--tolerance" => {
                 i += 1;
                 tolerance_name = args.get(i).cloned().unwrap_or_else(|| usage());
+            }
+            "--device" => {
+                i += 1;
+                device_name = Some(args.get(i).cloned().unwrap_or_else(|| usage()));
             }
             "--json" => {
                 json_output = true;
@@ -99,13 +105,34 @@ fn main() {
     }
 
     if let Some(cov_path) = coverage_path {
-        run_coverage(&cov_path, json_output, output_path.as_deref());
+        // Default to vc2802 for coverage (most common: aiesim VCDs use VC2802 geometry)
+        let dev = device_name.as_deref().unwrap_or("vc2802");
+        let tree = parse_device(dev);
+        run_coverage(&cov_path, &tree, json_output, output_path.as_deref());
     } else if let (Some(emu), Some(sim)) = (emu_path, sim_path) {
+        // Default to npu1 for comparison (emulator uses NPU1 geometry)
+        let dev = device_name.as_deref().unwrap_or("npu1");
+        let tree = parse_device(dev);
         let tolerance = parse_tolerance(&tolerance_name);
-        run_compare(&emu, &sim, &tolerance, json_output, output_path.as_deref());
+        run_compare(&emu, &sim, &tree, &tolerance, json_output, output_path.as_deref());
     } else {
         eprintln!("Error: either --coverage or both --emu and --sim are required");
         usage();
+    }
+}
+
+/// Parse a device name into a [`MappingTree`], exiting on unknown names.
+fn parse_device(name: &str) -> MappingTree {
+    match name {
+        "npu1" => build_aie2_mapping_tree(),
+        "vc2802" => build_vc2802_mapping_tree(),
+        other => {
+            eprintln!(
+                "Error: unknown device '{}'. Use npu1 or vc2802.",
+                other
+            );
+            process::exit(1);
+        }
     }
 }
 
@@ -133,13 +160,12 @@ fn parse_tolerance(name: &str) -> ToleranceConfig {
 fn run_compare(
     emu_path: &str,
     sim_path: &str,
+    tree: &MappingTree,
     tolerance: &ToleranceConfig,
     json: bool,
     output: Option<&str>,
 ) {
-    let tree = build_aie2_mapping_tree();
-
-    let input = match load_and_align(emu_path, sim_path, &tree) {
+    let input = match load_and_align(emu_path, sim_path, tree) {
         Ok(input) => input,
         Err(e) => {
             eprintln!("Error loading VCD files: {}", e);
@@ -159,10 +185,8 @@ fn run_compare(
 // ---------------------------------------------------------------------------
 
 /// Run a coverage audit on a single VCD and write the report.
-fn run_coverage(vcd_path: &str, _json: bool, output: Option<&str>) {
-    let tree = build_aie2_mapping_tree();
-
-    let report = match coverage_audit(vcd_path, &tree) {
+fn run_coverage(vcd_path: &str, tree: &MappingTree, _json: bool, output: Option<&str>) {
+    let report = match coverage_audit(vcd_path, tree) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error auditing VCD: {}", e);

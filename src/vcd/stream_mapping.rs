@@ -179,52 +179,79 @@ impl StreamPortMapping {
 
     /// Attempt to resolve VCD segments to a [`StatePath`].
     ///
-    /// Expects two segments: `["from_{port}", "{signal}"]`.
+    /// Handles two formats:
+    ///
+    /// **Nested (2 segments):** `["from_{port}", "{signal}"]`
     /// - `from_sSouth3` + `data` -> [`StatePath::StreamPortData`]
     /// - `from_sSouth3` + `event_idle_sSouth3` -> [`StatePath::StreamPortIdle`]
+    ///
+    /// **Flat (1 segment):** `["event_idle_{port}"]` or `["from_{port}"]`
+    /// - In real aiesimulator VCDs, event signals are flat at the
+    ///   `stream_switch` level: `event_idle_sSouth0`, not nested
+    ///   under `from_sSouth0`. Data signals remain nested.
     pub fn resolve(&self, segments: &[&str], col: u8, row: u8) -> Option<StatePath> {
-        if segments.len() != 2 {
-            return None;
+        match segments.len() {
+            1 => self.resolve_flat(segments[0], col, row),
+            2 => self.resolve_nested(segments[0], segments[1], col, row),
+            _ => None,
         }
-        let scope = segments[0];
-        let signal = segments[1];
+    }
 
-        // Find the port entry whose scope matches.
+    /// Resolve a flat signal name like `"event_idle_sSouth3"`.
+    fn resolve_flat(&self, signal: &str, col: u8, row: u8) -> Option<StatePath> {
+        for entry in &self.ports {
+            let port_name = entry.port_id.name();
+            if signal == format!("event_idle_{}", port_name) {
+                return Some(StatePath::StreamPortIdle {
+                    col, row, port: PortId::named(port_name),
+                });
+            }
+            if signal == format!("event_running_{}", port_name) {
+                return Some(StatePath::StreamPortRunning {
+                    col, row, port: PortId::named(port_name),
+                });
+            }
+            if signal == format!("event_stalled_{}", port_name) {
+                return Some(StatePath::StreamPortStalled {
+                    col, row, port: PortId::named(port_name),
+                });
+            }
+            if signal == format!("event_tlast_{}", port_name) {
+                return Some(StatePath::StreamPortTlast {
+                    col, row, port: PortId::named(port_name),
+                });
+            }
+        }
+        None
+    }
+
+    /// Resolve a nested signal `["from_{port}", "{leaf}"]`.
+    fn resolve_nested(&self, scope: &str, signal: &str, col: u8, row: u8) -> Option<StatePath> {
         let port_id = self.ports.iter().find(|e| e.scope == scope).map(|e| &e.port_id)?;
         let port_name = port_id.name();
 
         match signal {
             "data" => Some(StatePath::StreamPortData {
-                col,
-                row,
-                port: PortId::named(port_name),
+                col, row, port: PortId::named(port_name),
             }),
             _ if signal == format!("event_idle_{}", port_name) => {
                 Some(StatePath::StreamPortIdle {
-                    col,
-                    row,
-                    port: PortId::named(port_name),
+                    col, row, port: PortId::named(port_name),
                 })
             }
             _ if signal == format!("event_running_{}", port_name) => {
                 Some(StatePath::StreamPortRunning {
-                    col,
-                    row,
-                    port: PortId::named(port_name),
+                    col, row, port: PortId::named(port_name),
                 })
             }
             _ if signal == format!("event_stalled_{}", port_name) => {
                 Some(StatePath::StreamPortStalled {
-                    col,
-                    row,
-                    port: PortId::named(port_name),
+                    col, row, port: PortId::named(port_name),
                 })
             }
             _ if signal == format!("event_tlast_{}", port_name) => {
                 Some(StatePath::StreamPortTlast {
-                    col,
-                    row,
-                    port: PortId::named(port_name),
+                    col, row, port: PortId::named(port_name),
                 })
             }
             _ => None,

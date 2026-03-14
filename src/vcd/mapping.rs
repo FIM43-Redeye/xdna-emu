@@ -763,6 +763,75 @@ pub fn build_aie2_mapping_tree() -> MappingTree {
         .build()
 }
 
+/// Build mapping tree for VC2802 geometry (aiesimulator validation mode).
+///
+/// VC2802 is a 38-column x 11-row AIE2 array used by aiesimulator for all
+/// AIE2 targets. The VCD hierarchy uses a different scope prefix and nesting
+/// structure compared to the idealized NPU1 tree:
+///
+/// Scope prefix: `SystemC.tl.aie_logical.aie_xtlm.math_engine`
+/// Tile groups:  `shim` (row 0), `mem_row` (rows 1-2), `array` (rows 3-10)
+///
+/// Key differences from `build_aie2_mapping_tree()`:
+/// - Scope prefix is `SystemC.tl.aie_logical.aie_xtlm` (not `top`)
+/// - Core PC signals are under `cm.proc` (not `cm`)
+/// - Core ISS signals are under `cm.proc.iss` (not `cm`)
+/// - Compute tile locks are under `mm.locks` (same as NPU1 tree)
+pub fn build_vc2802_mapping_tree() -> MappingTree {
+    use super::core_mapping::core_mapping_vc2802;
+    use super::dma_mapping::{dma_mapping, shim_dma_mapping};
+    use super::event_mapping::event_mapping;
+    use super::lock_mapping::lock_mapping;
+    use super::stream_mapping::{
+        compute_stream_mapping, memtile_stream_mapping, shim_stream_mapping,
+    };
+
+    // VC2802 dimensions from aiesimulator device model.
+    let cols: Vec<u8> = (0..38).collect();
+    let rows_memtile: Vec<u8> = vec![1, 2];
+    let rows_compute: Vec<u8> = (3..11).collect();
+
+    let shim_tiles: Vec<(u8, u8)> = cols.iter().map(|&c| (c, 0)).collect();
+    let mem_tiles: Vec<(u8, u8)> = cols
+        .iter()
+        .flat_map(|&c| rows_memtile.iter().map(move |&r| (c, r)))
+        .collect();
+    let compute_tiles: Vec<(u8, u8)> = cols
+        .iter()
+        .flat_map(|&c| rows_compute.iter().map(move |&r| (c, r)))
+        .collect();
+
+    MappingTree::builder()
+        .scope("SystemC")
+        .scope("tl")
+        .scope("aie_logical")
+        .scope("aie_xtlm")
+        .scope("math_engine")
+        // -- Shim tiles (row 0) --
+        .tile_group("shim", &shim_tiles)
+            .mapping(lock_mapping(16))
+            .mapping(shim_dma_mapping(2, 2))
+            .mapping(shim_stream_mapping())
+            .mapping(event_mapping())
+            .done_tile_group()
+        // -- Mem tiles (rows 1-2) --
+        .tile_group("mem_row", &mem_tiles)
+            .mapping(lock_mapping(64))
+            .mapping(dma_mapping(6, 6))
+            .mapping(memtile_stream_mapping())
+            .mapping(event_mapping())
+            .done_tile_group()
+        // -- Compute tiles (rows 3-10) --
+        .tile_group("array", &compute_tiles)
+            .mapping(NestedScopeMapping::new("mm", Box::new(lock_mapping(16))))
+            .mapping(NestedScopeMapping::new("mm", Box::new(dma_mapping(2, 2))))
+            .mapping(compute_stream_mapping())
+            .mapping(core_mapping_vc2802())
+            .mapping(event_mapping())
+            .done_tile_group()
+        .build()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1710,5 +1779,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- build_vc2802_mapping_tree() integration tests --
+
+    #[test]
+    fn vc2802_tree_resolves_compute_tile_pc() {
+        // Real VCD path: tl.aie_logical.aie_xtlm.math_engine.array.tile_7_3.cm.proc.pc_E1
+        let tree = build_vc2802_mapping_tree();
+        let segments = [
+            "SystemC", "tl", "aie_logical", "aie_xtlm", "math_engine",
+            "array", "tile_7_3", "cm", "proc", "pc_E1",
+        ];
+        assert_eq!(
+            tree.resolve(&segments),
+            Some(StatePath::CorePc { col: 7, row: 3, stage: 1 })
+        );
+    }
+
+    #[test]
+    fn vc2802_tree_resolves_core_iss_signal() {
+        // Real VCD path: ...array.tile_7_3.cm.proc.iss.pm_rd_in
+        let tree = build_vc2802_mapping_tree();
+        let segments = [
+            "SystemC", "tl", "aie_logical", "aie_xtlm", "math_engine",
+            "array", "tile_7_3", "cm", "proc", "iss", "pm_rd_in",
+        ];
+        assert_eq!(
+            tree.resolve(&segments),
+            Some(StatePath::CorePmData { col: 7, row: 3 })
+        );
+    }
+
+    #[test]
+    fn vc2802_tree_resolves_core_reset() {
+        // Real VCD path: ...array.tile_7_3.cm.proc.iss.reset
+        let tree = build_vc2802_mapping_tree();
+        let segments = [
+            "SystemC", "tl", "aie_logical", "aie_xtlm", "math_engine",
+            "array", "tile_7_3", "cm", "proc", "iss", "reset",
+        ];
+        assert_eq!(
+            tree.resolve(&segments),
+            Some(StatePath::CoreReset { col: 7, row: 3 })
+        );
+    }
+
+    #[test]
+    fn vc2802_tree_resolves_compute_lock() {
+        // Real VCD path: ...array.tile_7_3.mm.locks.value_0
+        let tree = build_vc2802_mapping_tree();
+        let segments = [
+            "SystemC", "tl", "aie_logical", "aie_xtlm", "math_engine",
+            "array", "tile_7_3", "mm", "locks", "value_0",
+        ];
+        assert_eq!(
+            tree.resolve(&segments),
+            Some(StatePath::LockValue { col: 7, row: 3, idx: 0 })
+        );
+    }
+
+    #[test]
+    fn vc2802_tree_resolves_shim_stream_data() {
+        // Real VCD path: ...shim.tile_0_0.stream_switch.from_sSouth0.data
+        let tree = build_vc2802_mapping_tree();
+        let segments = [
+            "SystemC", "tl", "aie_logical", "aie_xtlm", "math_engine",
+            "shim", "tile_0_0", "stream_switch", "from_sSouth0", "data",
+        ];
+        assert_eq!(
+            tree.resolve(&segments),
+            Some(StatePath::StreamPortData {
+                col: 0,
+                row: 0,
+                port: PortId::named("sSouth0"),
+            })
+        );
+    }
+
+    #[test]
+    fn vc2802_tree_resolves_memtile_lock() {
+        // Real VCD: ...mem_row.tile_2_1.locks.value_63
+        let tree = build_vc2802_mapping_tree();
+        let segments = [
+            "SystemC", "tl", "aie_logical", "aie_xtlm", "math_engine",
+            "mem_row", "tile_2_1", "locks", "value_63",
+        ];
+        assert_eq!(
+            tree.resolve(&segments),
+            Some(StatePath::LockValue { col: 2, row: 1, idx: 63 })
+        );
     }
 }
