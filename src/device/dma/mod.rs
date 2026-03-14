@@ -68,6 +68,8 @@ pub mod transfer;
 pub mod engine;
 pub mod timing;
 pub mod compression;
+pub mod fifo;
+pub mod token;
 
 pub use addressing::{AddressGenerator, DimensionConfig, AddressIterator, IterationConfig, ZeroPadConfig};
 pub use bd::{BufferDescriptor, bd_base_address, bd_register_count, BD_SPACING};

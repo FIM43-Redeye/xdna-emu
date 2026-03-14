@@ -1005,6 +1005,13 @@ pub struct Tile {
     /// unit via `notify_mem_trace_event()`.
     pub mem_trace_pending: Vec<(u64, crate::interpreter::state::EventType)>,
 
+    // === Event Modules (new -- subsystem will absorb broadcast/port selection) ===
+
+    /// Core module event system (compute and shim tiles).
+    pub core_events: super::events::EventModule,
+    /// Memory module event system (compute and mem tiles).
+    pub mem_events: super::events::EventModule,
+
     /// Stream switch event port selection (8 logical event ports).
     ///
     /// Each entry maps a logical event port (0-7) to a physical stream switch
@@ -1049,14 +1056,26 @@ pub struct Tile {
     /// TODO: Implement actual counting logic triggered by start/stop/reset
     /// events, and fire PERF_CNT_N events (hw_id 5-8) when counter reaches
     /// the configured event_value threshold.
-    pub core_perf_counters: PerfCounters,
+    pub core_perf_counters: super::perf_counters::PerfCounterBank,
 
     /// Memory module performance counters (compute: 2 counters, memtile: 4).
     ///
     /// Configured by PERFORMANCE_CONTROL/COUNTER/EVENT_VALUE registers:
     /// - Compute memory module: 0x11000-0x11084 (2 counters)
     /// - MemTile:               0x91000-0x9108C (4 counters)
-    pub mem_perf_counters: PerfCounters,
+    pub mem_perf_counters: super::perf_counters::PerfCounterBank,
+
+    // === Timers ===
+
+    /// Core module timer (compute and shim tiles).
+    pub core_timer: super::timer::TileTimer,
+    /// Memory module timer (compute and mem tiles).
+    pub mem_timer: super::timer::TileTimer,
+
+    // === Core Debug ===
+
+    /// Core debug state (compute tiles only -- halt, step, PC/SP/LR reads).
+    pub core_debug: super::core_debug::CoreDebugState,
 
     // === Memory Bank Conflict Detection ===
 
@@ -1077,6 +1096,13 @@ pub struct Tile {
     /// - 0x14408 (compute tile memory module)
     /// - 0x94408 (MemTile)
     pub mem_edge_detectors: [EdgeDetector; 2],
+
+    // === Interrupt Controllers (shim tiles only) ===
+
+    /// L1 interrupt controller (shim tiles only).
+    pub l1_irq: Option<super::interrupts::L1InterruptController>,
+    /// L2 interrupt controller (shim NoC tiles only).
+    pub l2_irq: Option<super::interrupts::L2InterruptController>,
 
     // === Event Broadcast ===
 
@@ -1113,154 +1139,8 @@ pub struct Tile {
     pub pending_ctrl_response: std::collections::VecDeque<(u32, bool)>,
 }
 
-// ---------------------------------------------------------------------------
-// Performance Counters -- stub state for register acceptance
-// ---------------------------------------------------------------------------
-
-/// Maximum number of performance counters per module.
-///
-/// Core module and MemTile have 4 counters; memory module (compute) and
-/// PL module (shim) have 2. We allocate the maximum and track how many
-/// are valid via `num_counters`.
-pub const MAX_PERF_COUNTERS: usize = 4;
-
-/// Performance counter configuration for one module (core, memory, or PL).
-///
-/// Stores the values programmed through PERFORMANCE_CONTROL and
-/// PERFORMANCE_COUNTER registers. Does NOT implement actual counting
-/// logic yet -- register writes are accepted and stored so they do not
-/// fall into the unhandled register path.
-///
-/// Register layout per aie-rt (xaiemlgbl_params.h):
-///   Control0: start/stop events for counters 0-1
-///   Control1: start/stop events for counters 2-3 (4-counter modules)
-///             OR reset events for counters 0-1 (2-counter modules)
-///   Control2: reset events for counters 0-3 (4-counter modules only)
-///   Counter0..N: 32-bit counter values
-///   EventValue0..N: 32-bit event values
-///
-/// See CLAUDE.md "Correctness Principle" -- offsets derived from aie-rt.
-#[derive(Debug, Clone)]
-pub struct PerfCounters {
-    /// Number of valid counters in this module (2 or 4).
-    pub num_counters: usize,
-
-    /// Start event for each counter (7- or 8-bit event ID, 0 = disabled).
-    pub start_event: [u8; MAX_PERF_COUNTERS],
-
-    /// Stop event for each counter.
-    pub stop_event: [u8; MAX_PERF_COUNTERS],
-
-    /// Reset event for each counter.
-    pub reset_event: [u8; MAX_PERF_COUNTERS],
-
-    /// Current counter values.
-    /// TODO: Implement actual counting logic. When a start event fires,
-    /// the counter begins incrementing each cycle. When a stop event fires,
-    /// it halts. When a reset event fires, it resets to 0. When the counter
-    /// reaches the event_value, a PERF_CNT_N event (hw_id 5+N) is generated.
-    pub counter_value: [u32; MAX_PERF_COUNTERS],
-
-    /// Event value (threshold) for each counter. When counter_value reaches
-    /// this threshold, the counter fires a PERF_CNT_N event.
-    pub event_value: [u32; MAX_PERF_COUNTERS],
-}
-
-impl PerfCounters {
-    /// Create a new performance counter block with the given count.
-    pub fn new(num_counters: usize) -> Self {
-        assert!(num_counters <= MAX_PERF_COUNTERS);
-        Self {
-            num_counters,
-            start_event: [0; MAX_PERF_COUNTERS],
-            stop_event: [0; MAX_PERF_COUNTERS],
-            reset_event: [0; MAX_PERF_COUNTERS],
-            counter_value: [0; MAX_PERF_COUNTERS],
-            event_value: [0; MAX_PERF_COUNTERS],
-        }
-    }
-
-    /// Write a control register (start/stop events for two counters).
-    ///
-    /// Layout (per aie-rt, 7-bit event fields for core/memory, 8-bit for memtile):
-    ///   bits [6:0] or [7:0] = counter_lo start event
-    ///   bits [14:8] or [15:8] = counter_lo stop event
-    ///   bits [22:16] or [23:16] = counter_hi start event
-    ///   bits [30:24] or [31:24] = counter_hi stop event
-    pub fn write_control_start_stop(
-        &mut self,
-        value: u32,
-        counter_lo: usize,
-        counter_hi: usize,
-        event_width: u32,
-    ) {
-        let mask = (1u32 << event_width) - 1;
-        if counter_lo < self.num_counters {
-            self.start_event[counter_lo] = (value & mask) as u8;
-            self.stop_event[counter_lo] = ((value >> 8) & mask) as u8;
-        }
-        if counter_hi < self.num_counters {
-            self.start_event[counter_hi] = ((value >> 16) & mask) as u8;
-            self.stop_event[counter_hi] = ((value >> 24) & mask) as u8;
-        }
-    }
-
-    /// Write a reset control register (reset events for two or four counters).
-    ///
-    /// For 4-counter modules (Control2), all four reset events are packed.
-    /// For 2-counter modules (Control1), only two reset events.
-    pub fn write_control_reset(
-        &mut self,
-        value: u32,
-        event_width: u32,
-    ) {
-        let mask = (1u32 << event_width) - 1;
-        if self.num_counters >= 1 {
-            self.reset_event[0] = (value & mask) as u8;
-        }
-        if self.num_counters >= 2 {
-            self.reset_event[1] = ((value >> 8) & mask) as u8;
-        }
-        if self.num_counters >= 3 {
-            self.reset_event[2] = ((value >> 16) & mask) as u8;
-        }
-        if self.num_counters >= 4 {
-            self.reset_event[3] = ((value >> 24) & mask) as u8;
-        }
-    }
-
-    /// Write a counter value register directly.
-    pub fn write_counter(&mut self, index: usize, value: u32) {
-        if index < self.num_counters {
-            self.counter_value[index] = value;
-        }
-    }
-
-    /// Write an event value (threshold) register.
-    pub fn write_event_value(&mut self, index: usize, value: u32) {
-        if index < self.num_counters {
-            self.event_value[index] = value;
-        }
-    }
-
-    /// Read a counter value.
-    pub fn read_counter(&self, index: usize) -> u32 {
-        if index < self.num_counters {
-            self.counter_value[index]
-        } else {
-            0
-        }
-    }
-
-    /// Read an event value (threshold).
-    pub fn read_event_value(&self, index: usize) -> u32 {
-        if index < self.num_counters {
-            self.event_value[index]
-        } else {
-            0
-        }
-    }
-}
+// Performance counter types are now in src/device/perf_counters/mod.rs.
+// The Tile struct uses perf_counters::PerfCounterBank directly.
 
 /// Single edge detection circuit.
 ///
@@ -1347,14 +1227,37 @@ impl Tile {
             mem_trace_pending: Vec::new(),
             event_port_selection: [None; 8],
             core_perf_counters: match tile_type {
-                TileType::Compute => PerfCounters::new(4),  // Core module: 4 counters
-                TileType::Shim => PerfCounters::new(2),     // PL module: 2 counters
-                TileType::MemTile => PerfCounters::new(0),  // MemTile has no core module
+                TileType::Compute => super::perf_counters::PerfCounterBank::new(4),
+                TileType::Shim => super::perf_counters::PerfCounterBank::new(2),
+                TileType::MemTile => super::perf_counters::PerfCounterBank::new(0),
             },
             mem_perf_counters: match tile_type {
-                TileType::Compute => PerfCounters::new(2),  // Memory module: 2 counters
-                TileType::MemTile => PerfCounters::new(4),  // MemTile module: 4 counters
-                TileType::Shim => PerfCounters::new(0),     // Shim has no memory module
+                TileType::Compute => super::perf_counters::PerfCounterBank::new(2),
+                TileType::MemTile => super::perf_counters::PerfCounterBank::new(4),
+                TileType::Shim => super::perf_counters::PerfCounterBank::new(0),
+            },
+            core_timer: super::timer::TileTimer::new(),
+            mem_timer: super::timer::TileTimer::new(),
+            core_debug: super::core_debug::CoreDebugState::new(),
+            core_events: match tile_type {
+                TileType::Compute => super::events::EventModule::new(super::events::EventModuleType::Core),
+                TileType::Shim => super::events::EventModule::new(super::events::EventModuleType::Pl),
+                TileType::MemTile => super::events::EventModule::new(super::events::EventModuleType::MemTile),
+            },
+            mem_events: match tile_type {
+                TileType::Compute => super::events::EventModule::new(super::events::EventModuleType::Memory),
+                TileType::MemTile => super::events::EventModule::new(super::events::EventModuleType::MemTile),
+                TileType::Shim => super::events::EventModule::new(super::events::EventModuleType::Pl),
+            },
+            l1_irq: if tile_type == TileType::Shim {
+                Some(super::interrupts::L1InterruptController::new())
+            } else {
+                None
+            },
+            l2_irq: if tile_type == TileType::Shim {
+                Some(super::interrupts::L2InterruptController::new())
+            } else {
+                None
             },
             cycle_dma_banks: 0,
             core_edge_detectors: [EdgeDetector::default(); 2],
@@ -1629,104 +1532,19 @@ impl Tile {
     ///   Control2 (+0x08): cnt0-3 reset events (4-counter only)
     ///   Counter0-3 (+0x20..+0x2C): counter values
     ///   EventValue0-3 (+0x80..+0x8C): event value thresholds
+    /// Handle a write to a core module performance counter register.
+    /// Delegates to the PerfCounterBank's register interface.
     pub fn write_core_perf_register(&mut self, offset_in_block: u32, value: u32) {
-        let event_width = if self.is_shim() { 7 } else { 7 }; // Core/PL: 7-bit events
-        match offset_in_block {
-            0x00 => {
-                self.core_perf_counters.write_control_start_stop(value, 0, 1, event_width);
-                log::debug!("Tile({},{}) core perf Control0: start[0]={} stop[0]={} start[1]={} stop[1]={}",
-                    self.col, self.row,
-                    self.core_perf_counters.start_event[0], self.core_perf_counters.stop_event[0],
-                    self.core_perf_counters.start_event[1], self.core_perf_counters.stop_event[1]);
-            }
-            0x04 => {
-                self.core_perf_counters.write_control_start_stop(value, 2, 3, event_width);
-                log::debug!("Tile({},{}) core perf Control1: start[2]={} stop[2]={} start[3]={} stop[3]={}",
-                    self.col, self.row,
-                    self.core_perf_counters.start_event[2], self.core_perf_counters.stop_event[2],
-                    self.core_perf_counters.start_event[3], self.core_perf_counters.stop_event[3]);
-            }
-            0x08 => {
-                self.core_perf_counters.write_control_reset(value, event_width);
-                log::debug!("Tile({},{}) core perf Control2 (reset): {:?}",
-                    self.col, self.row, &self.core_perf_counters.reset_event[..self.core_perf_counters.num_counters]);
-            }
-            off @ 0x20..=0x2C if (off - 0x20) % 4 == 0 => {
-                let idx = ((off - 0x20) / 4) as usize;
-                self.core_perf_counters.write_counter(idx, value);
-                log::debug!("Tile({},{}) core perf Counter{} = 0x{:08X}",
-                    self.col, self.row, idx, value);
-            }
-            off @ 0x80..=0x8C if (off - 0x80) % 4 == 0 => {
-                let idx = ((off - 0x80) / 4) as usize;
-                self.core_perf_counters.write_event_value(idx, value);
-                log::debug!("Tile({},{}) core perf EventValue{} = 0x{:08X}",
-                    self.col, self.row, idx, value);
-            }
-            _ => {
-                log::trace!("Tile({},{}) core perf: unhandled offset 0x{:X} in block",
-                    self.col, self.row, offset_in_block);
-            }
-        }
+        // Core/PL modules use 7-bit event fields
+        self.core_perf_counters.write_register(offset_in_block, value, 7);
     }
 
     /// Handle a write to a memory module performance counter register.
-    ///
-    /// Dispatches based on the register offset within the memory performance
-    /// counter range. Compute tiles use offsets 0x11000-0x11084 (2 counters);
-    /// MemTiles use offsets 0x91000-0x9108C (4 counters).
-    ///
-    /// Register layout per aie-rt (xaiemlgbl_params.h):
-    ///   Control0 (+0x00): cnt0/cnt1 start/stop events
-    ///   Control1 (+0x04): cnt2/cnt3 start/stop events (memtile 4-counter)
-    ///   Control2/1 (+0x08): reset events
-    ///   Counter0-3 (+0x20..+0x2C): counter values
-    ///   EventValue0-3 (+0x80..+0x8C): event value thresholds
+    /// Delegates to the PerfCounterBank's register interface.
     pub fn write_mem_perf_register(&mut self, offset_in_block: u32, value: u32) {
         // MemTile uses 8-bit event fields; compute memory module uses 7-bit
         let event_width = if self.is_mem_tile() { 8 } else { 7 };
-
-        match offset_in_block {
-            0x00 => {
-                self.mem_perf_counters.write_control_start_stop(value, 0, 1, event_width);
-                log::debug!("Tile({},{}) mem perf Control0: start[0]={} stop[0]={} start[1]={} stop[1]={}",
-                    self.col, self.row,
-                    self.mem_perf_counters.start_event[0], self.mem_perf_counters.stop_event[0],
-                    self.mem_perf_counters.start_event[1], self.mem_perf_counters.stop_event[1]);
-            }
-            0x04 => {
-                // MemTile: Control1 has cnt2/cnt3 start/stop
-                // Compute memory module: this offset is not used (Control1 is at +0x08 for reset)
-                if self.is_mem_tile() {
-                    self.mem_perf_counters.write_control_start_stop(value, 2, 3, event_width);
-                    log::debug!("Tile({},{}) mem perf Control1: start[2]={} stop[2]={} start[3]={} stop[3]={}",
-                        self.col, self.row,
-                        self.mem_perf_counters.start_event[2], self.mem_perf_counters.stop_event[2],
-                        self.mem_perf_counters.start_event[3], self.mem_perf_counters.stop_event[3]);
-                }
-            }
-            0x08 => {
-                self.mem_perf_counters.write_control_reset(value, event_width);
-                log::debug!("Tile({},{}) mem perf reset: {:?}",
-                    self.col, self.row, &self.mem_perf_counters.reset_event[..self.mem_perf_counters.num_counters]);
-            }
-            off @ 0x20..=0x2C if (off - 0x20) % 4 == 0 => {
-                let idx = ((off - 0x20) / 4) as usize;
-                self.mem_perf_counters.write_counter(idx, value);
-                log::debug!("Tile({},{}) mem perf Counter{} = 0x{:08X}",
-                    self.col, self.row, idx, value);
-            }
-            off @ 0x80..=0x8C if (off - 0x80) % 4 == 0 => {
-                let idx = ((off - 0x80) / 4) as usize;
-                self.mem_perf_counters.write_event_value(idx, value);
-                log::debug!("Tile({},{}) mem perf EventValue{} = 0x{:08X}",
-                    self.col, self.row, idx, value);
-            }
-            _ => {
-                log::trace!("Tile({},{}) mem perf: unhandled offset 0x{:X} in block",
-                    self.col, self.row, offset_in_block);
-            }
-        }
+        self.mem_perf_counters.write_register(offset_in_block, value, event_width);
     }
 
     /// Configure edge detectors from a register write.
@@ -3188,96 +3006,80 @@ mod tests {
         );
     }
 
-    // === Performance Counter Tests ===
+    // === Performance Counter Integration Tests ===
+    // Unit tests for PerfCounterBank are in src/device/perf_counters/mod.rs.
+    // These tests verify the full CDO register routing path.
 
     #[test]
     fn test_perf_counters_init_state() {
         let tile = Tile::compute(0, 2);
-        // Compute tile: 4 core counters, 2 memory counters
-        assert_eq!(tile.core_perf_counters.num_counters, 4);
-        assert_eq!(tile.mem_perf_counters.num_counters, 2);
-        // All values should be zero
+        assert_eq!(tile.core_perf_counters.num_counters(), 4);
+        assert_eq!(tile.mem_perf_counters.num_counters(), 2);
         for i in 0..4 {
-            assert_eq!(tile.core_perf_counters.start_event[i], 0);
-            assert_eq!(tile.core_perf_counters.stop_event[i], 0);
-            assert_eq!(tile.core_perf_counters.reset_event[i], 0);
-            assert_eq!(tile.core_perf_counters.counter_value[i], 0);
-            assert_eq!(tile.core_perf_counters.event_value[i], 0);
+            assert_eq!(tile.core_perf_counters.start_event(i), 0);
+            assert_eq!(tile.core_perf_counters.stop_event(i), 0);
+            assert_eq!(tile.core_perf_counters.reset_event(i), 0);
+            assert_eq!(tile.core_perf_counters.read_counter(i), 0);
+            assert_eq!(tile.core_perf_counters.read_event_value(i), 0);
         }
     }
 
     #[test]
     fn test_perf_counters_memtile_init() {
         let tile = Tile::mem_tile(0, 1);
-        // MemTile: 0 core counters (no core module), 4 memory counters
-        assert_eq!(tile.core_perf_counters.num_counters, 0);
-        assert_eq!(tile.mem_perf_counters.num_counters, 4);
+        assert_eq!(tile.core_perf_counters.num_counters(), 0);
+        assert_eq!(tile.mem_perf_counters.num_counters(), 4);
     }
 
     #[test]
     fn test_perf_counters_shim_init() {
         let tile = Tile::shim(0, 0);
-        // Shim: 2 PL module counters (core_perf), 0 memory counters
-        assert_eq!(tile.core_perf_counters.num_counters, 2);
-        assert_eq!(tile.mem_perf_counters.num_counters, 0);
+        assert_eq!(tile.core_perf_counters.num_counters(), 2);
+        assert_eq!(tile.mem_perf_counters.num_counters(), 0);
     }
 
     #[test]
     fn test_perf_counter_core_control0_write() {
         let mut device = super::super::state::DeviceState::new_npu1();
-        // Write Core PERFORMANCE_CONTROL0 at 0x31500
-        // cnt0_start=42, cnt0_stop=43, cnt1_start=44, cnt1_stop=45
         let value = (45u32 << 24) | (44 << 16) | (43 << 8) | 42;
         device.write_tile_register(0, 2, 0x31500, value);
-
         let tile = device.array.get(0, 2).unwrap();
-        assert_eq!(tile.core_perf_counters.start_event[0], 42);
-        assert_eq!(tile.core_perf_counters.stop_event[0], 43);
-        assert_eq!(tile.core_perf_counters.start_event[1], 44);
-        assert_eq!(tile.core_perf_counters.stop_event[1], 45);
+        assert_eq!(tile.core_perf_counters.start_event(0), 42);
+        assert_eq!(tile.core_perf_counters.stop_event(0), 43);
+        assert_eq!(tile.core_perf_counters.start_event(1), 44);
+        assert_eq!(tile.core_perf_counters.stop_event(1), 45);
     }
 
     #[test]
     fn test_perf_counter_core_control1_write() {
         let mut device = super::super::state::DeviceState::new_npu1();
-        // Write Core PERFORMANCE_CONTROL1 at 0x31504
-        // cnt2_start=10, cnt2_stop=11, cnt3_start=12, cnt3_stop=13
         let value = (13u32 << 24) | (12 << 16) | (11 << 8) | 10;
         device.write_tile_register(0, 2, 0x31504, value);
-
         let tile = device.array.get(0, 2).unwrap();
-        assert_eq!(tile.core_perf_counters.start_event[2], 10);
-        assert_eq!(tile.core_perf_counters.stop_event[2], 11);
-        assert_eq!(tile.core_perf_counters.start_event[3], 12);
-        assert_eq!(tile.core_perf_counters.stop_event[3], 13);
+        assert_eq!(tile.core_perf_counters.start_event(2), 10);
+        assert_eq!(tile.core_perf_counters.stop_event(2), 11);
+        assert_eq!(tile.core_perf_counters.start_event(3), 12);
+        assert_eq!(tile.core_perf_counters.stop_event(3), 13);
     }
 
     #[test]
     fn test_perf_counter_core_control2_reset() {
         let mut device = super::super::state::DeviceState::new_npu1();
-        // Write Core PERFORMANCE_CONTROL2 at 0x31508 (reset events)
-        // reset[0]=5, reset[1]=6, reset[2]=7, reset[3]=8
         let value = (8u32 << 24) | (7 << 16) | (6 << 8) | 5;
         device.write_tile_register(0, 2, 0x31508, value);
-
         let tile = device.array.get(0, 2).unwrap();
-        assert_eq!(tile.core_perf_counters.reset_event[0], 5);
-        assert_eq!(tile.core_perf_counters.reset_event[1], 6);
-        assert_eq!(tile.core_perf_counters.reset_event[2], 7);
-        assert_eq!(tile.core_perf_counters.reset_event[3], 8);
+        assert_eq!(tile.core_perf_counters.reset_event(0), 5);
+        assert_eq!(tile.core_perf_counters.reset_event(1), 6);
+        assert_eq!(tile.core_perf_counters.reset_event(2), 7);
+        assert_eq!(tile.core_perf_counters.reset_event(3), 8);
     }
 
     #[test]
     fn test_perf_counter_core_counter_value_write() {
         let mut device = super::super::state::DeviceState::new_npu1();
-        // Write Core PERFORMANCE_COUNTER0 at 0x31520
         device.write_tile_register(0, 2, 0x31520, 0xDEAD_BEEF);
-        // Write Core PERFORMANCE_COUNTER2 at 0x31528
         device.write_tile_register(0, 2, 0x31528, 0xCAFE_BABE);
-
         let tile = device.array.get(0, 2).unwrap();
-        assert_eq!(tile.core_perf_counters.counter_value[0], 0xDEAD_BEEF);
-        assert_eq!(tile.core_perf_counters.counter_value[2], 0xCAFE_BABE);
         assert_eq!(tile.core_perf_counters.read_counter(0), 0xDEAD_BEEF);
         assert_eq!(tile.core_perf_counters.read_counter(2), 0xCAFE_BABE);
     }
@@ -3285,14 +3087,9 @@ mod tests {
     #[test]
     fn test_perf_counter_core_event_value_write() {
         let mut device = super::super::state::DeviceState::new_npu1();
-        // Write Core PERFORMANCE_COUNTER0_EVENT_VALUE at 0x31580
         device.write_tile_register(0, 2, 0x31580, 1000);
-        // Write Core PERFORMANCE_COUNTER3_EVENT_VALUE at 0x3158C
         device.write_tile_register(0, 2, 0x3158C, 5000);
-
         let tile = device.array.get(0, 2).unwrap();
-        assert_eq!(tile.core_perf_counters.event_value[0], 1000);
-        assert_eq!(tile.core_perf_counters.event_value[3], 5000);
         assert_eq!(tile.core_perf_counters.read_event_value(0), 1000);
         assert_eq!(tile.core_perf_counters.read_event_value(3), 5000);
     }
@@ -3300,94 +3097,76 @@ mod tests {
     #[test]
     fn test_perf_counter_memory_module_write() {
         let mut device = super::super::state::DeviceState::new_npu1();
-        // Write Memory PERFORMANCE_CONTROL0 at 0x11000
-        // cnt0_start=20, cnt0_stop=21, cnt1_start=22, cnt1_stop=23
         let value = (23u32 << 24) | (22 << 16) | (21 << 8) | 20;
         device.write_tile_register(0, 2, 0x11000, value);
-
         let tile = device.array.get(0, 2).unwrap();
-        assert_eq!(tile.mem_perf_counters.start_event[0], 20);
-        assert_eq!(tile.mem_perf_counters.stop_event[0], 21);
-        assert_eq!(tile.mem_perf_counters.start_event[1], 22);
-        assert_eq!(tile.mem_perf_counters.stop_event[1], 23);
+        assert_eq!(tile.mem_perf_counters.start_event(0), 20);
+        assert_eq!(tile.mem_perf_counters.stop_event(0), 21);
+        assert_eq!(tile.mem_perf_counters.start_event(1), 22);
+        assert_eq!(tile.mem_perf_counters.stop_event(1), 23);
 
-        // Write Memory PERFORMANCE_COUNTER1 at 0x11024
         device.write_tile_register(0, 2, 0x11024, 42);
         let tile = device.array.get(0, 2).unwrap();
-        assert_eq!(tile.mem_perf_counters.counter_value[1], 42);
+        assert_eq!(tile.mem_perf_counters.read_counter(1), 42);
     }
 
     #[test]
     fn test_perf_counter_memtile_write() {
         let mut device = super::super::state::DeviceState::new_npu1();
-        // Write MemTile PERFORMANCE_CONTROL0 at 0x91000
-        // cnt0_start=100, cnt0_stop=101, cnt1_start=102, cnt1_stop=103
-        // MemTile uses 8-bit event fields
         let value = (103u32 << 24) | (102 << 16) | (101 << 8) | 100;
         device.write_tile_register(0, 1, 0x91000, value);
-
         let tile = device.array.get(0, 1).unwrap();
-        assert_eq!(tile.mem_perf_counters.start_event[0], 100);
-        assert_eq!(tile.mem_perf_counters.stop_event[0], 101);
-        assert_eq!(tile.mem_perf_counters.start_event[1], 102);
-        assert_eq!(tile.mem_perf_counters.stop_event[1], 103);
+        assert_eq!(tile.mem_perf_counters.start_event(0), 100);
+        assert_eq!(tile.mem_perf_counters.stop_event(0), 101);
+        assert_eq!(tile.mem_perf_counters.start_event(1), 102);
+        assert_eq!(tile.mem_perf_counters.stop_event(1), 103);
 
-        // Write MemTile PERFORMANCE_CONTROL1 at 0x91004 (cnt2/cnt3)
         let value2 = (203u32 << 24) | (202 << 16) | (201 << 8) | 200;
         device.write_tile_register(0, 1, 0x91004, value2);
-
         let tile = device.array.get(0, 1).unwrap();
-        assert_eq!(tile.mem_perf_counters.start_event[2], 200);
-        assert_eq!(tile.mem_perf_counters.stop_event[2], 201);
-        assert_eq!(tile.mem_perf_counters.start_event[3], 202);
-        assert_eq!(tile.mem_perf_counters.stop_event[3], 203);
+        assert_eq!(tile.mem_perf_counters.start_event(2), 200);
+        assert_eq!(tile.mem_perf_counters.stop_event(2), 201);
+        assert_eq!(tile.mem_perf_counters.start_event(3), 202);
+        assert_eq!(tile.mem_perf_counters.stop_event(3), 203);
 
-        // Write MemTile counter value
         device.write_tile_register(0, 1, 0x91020, 0x1234_5678);
         let tile = device.array.get(0, 1).unwrap();
-        assert_eq!(tile.mem_perf_counters.counter_value[0], 0x1234_5678);
+        assert_eq!(tile.mem_perf_counters.read_counter(0), 0x1234_5678);
     }
 
     #[test]
     fn test_perf_counter_shim_write() {
         let mut device = super::super::state::DeviceState::new_npu1();
-        // Write Shim PL PERFORMANCE_CONTROL0 at 0x31000
-        // cnt0_start=30, cnt0_stop=31, cnt1_start=32, cnt1_stop=33
         let value = (33u32 << 24) | (32 << 16) | (31 << 8) | 30;
         device.write_tile_register(0, 0, 0x31000, value);
-
         let tile = device.array.get(0, 0).unwrap();
-        assert_eq!(tile.core_perf_counters.start_event[0], 30);
-        assert_eq!(tile.core_perf_counters.stop_event[0], 31);
-        assert_eq!(tile.core_perf_counters.start_event[1], 32);
-        assert_eq!(tile.core_perf_counters.stop_event[1], 33);
+        assert_eq!(tile.core_perf_counters.start_event(0), 30);
+        assert_eq!(tile.core_perf_counters.stop_event(0), 31);
+        assert_eq!(tile.core_perf_counters.start_event(1), 32);
+        assert_eq!(tile.core_perf_counters.stop_event(1), 33);
 
-        // Shim counter value at 0x31020
         device.write_tile_register(0, 0, 0x31020, 99);
         let tile = device.array.get(0, 0).unwrap();
-        assert_eq!(tile.core_perf_counters.counter_value[0], 99);
+        assert_eq!(tile.core_perf_counters.read_counter(0), 99);
 
-        // Shim event value at 0x31080
         device.write_tile_register(0, 0, 0x31080, 500);
         let tile = device.array.get(0, 0).unwrap();
-        assert_eq!(tile.core_perf_counters.event_value[0], 500);
+        assert_eq!(tile.core_perf_counters.read_event_value(0), 500);
     }
 
     #[test]
     fn test_perf_counter_read_out_of_range() {
-        let counters = PerfCounters::new(2);
-        // Reading counter 3 from a 2-counter block returns 0
+        let counters = super::super::perf_counters::PerfCounterBank::new(2);
         assert_eq!(counters.read_counter(3), 0);
         assert_eq!(counters.read_event_value(3), 0);
     }
 
     #[test]
     fn test_perf_counter_write_out_of_range() {
-        let mut counters = PerfCounters::new(2);
-        // Writing counter 3 on a 2-counter block is a no-op
+        let mut counters = super::super::perf_counters::PerfCounterBank::new(2);
         counters.write_counter(3, 0xFFFF);
-        assert_eq!(counters.counter_value[3], 0);
+        assert_eq!(counters.read_counter(3), 0);
         counters.write_event_value(3, 0xFFFF);
-        assert_eq!(counters.event_value[3], 0);
+        assert_eq!(counters.read_event_value(3), 0);
     }
 }

@@ -61,6 +61,12 @@ pub mod dma;
 pub mod stream_switch;
 pub mod trace_unit;
 pub mod aiert_validation;
+pub mod control_packets;
+pub mod core_debug;
+pub mod events;
+pub mod interrupts;
+pub mod perf_counters;
+pub mod timer;
 
 pub use arch_config::{ArchConfig, ModelConfig, default_arch};
 pub use registers::{RegisterInfo, TileAddress};
