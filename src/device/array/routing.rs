@@ -519,28 +519,30 @@ impl TileArray {
     /// DMA slave port ranges come from gen_stream_ranges.rs (AM025-derived).
     fn route_dma_to_tile_switches(&mut self) -> usize {
         use crate::device::stream_switch::PortType;
+        use crate::device::dma::StreamData;
+        use std::collections::VecDeque;
         let mut words_routed = 0;
 
         for i in 0..self.tiles.len() {
-            // Route DMA MM2S stream_out to tile switch slave ports with backpressure.
-            // Peek first, determine target slave, check if it can accept. Only pop
-            // when the push will succeed. This prevents silent data loss when the
-            // downstream FIFO is full -- the data stays in stream_out until the
-            // next cycle, matching real hardware credit-based flow control.
-            loop {
-                let data = match self.dma_engines[i].peek_stream_out() {
-                    Some(d) => d.clone(),
-                    None => break,
-                };
+            // Route DMA MM2S stream_out to tile switch slave ports.
+            //
+            // On real hardware, each MM2S channel has independent credit-based
+            // flow control to its stream switch slave port. One channel's
+            // backpressure never blocks another. Since stream_out is a shared
+            // queue, we must scan all pending words and deliver those whose
+            // target slave has space, retaining blocked words for next cycle.
+            let tile_type = self.tiles[i].tile_type;
+            let col = self.tiles[i].col;
+            let row = self.tiles[i].row;
+            let s2mm_count = self.dma_engines[i].s2mm_channel_count() as u8;
 
-                let tile_type = self.tiles[i].tile_type;
-                let col = self.tiles[i].col;
-                let row = self.tiles[i].row;
+            // Drain stream_out, attempting delivery for each word.
+            let mut retained: VecDeque<StreamData> = VecDeque::new();
 
+            while let Some(data) = self.dma_engines[i].pop_stream_out() {
                 // Determine the target slave port for this DMA MM2S word.
                 let target_slave = if tile_type == TileType::Shim {
-                    let s2mm_count = self.dma_engines[i].s2mm_channel_count();
-                    let mm2s_ch = data.channel.saturating_sub(s2mm_count as u8) as usize;
+                    let mm2s_ch = data.channel.saturating_sub(s2mm_count) as usize;
                     let from_mux = self.tiles[i].shim_mux_mm2s_slaves
                         .get(mm2s_ch)
                         .copied()
@@ -572,13 +574,11 @@ impl TileArray {
                             );
                             log::error!("{}", msg);
                             self.fatal_errors.push(msg);
-                            // Pop to avoid infinite loop on permanently unroutable data
-                            self.dma_engines[i].pop_stream_out();
+                            // Drop permanently unroutable data
                             continue;
                         }
                     }
                 } else {
-                    let s2mm_count = self.dma_engines[i].s2mm_channel_count() as u8;
                     let slave_port = match tile_type {
                         TileType::MemTile => {
                             let ch_offset = data.channel.saturating_sub(s2mm_count);
@@ -598,33 +598,40 @@ impl TileArray {
                         } else {
                             log::debug!("DMA_MM2S->TileSwitch: tile ({},{}) slave[{}] rejected - wrong type {:?}",
                                 col, row, slave_port, port_type);
-                            // Pop to avoid infinite loop on misconfigured port
-                            self.dma_engines[i].pop_stream_out();
+                            // Drop misconfigured data
                             continue;
                         }
                     } else {
-                        // Pop to avoid infinite loop on out-of-range port
-                        self.dma_engines[i].pop_stream_out();
+                        // Drop out-of-range data
                         continue;
                     }
                 };
 
-                // Backpressure: only pop and push if the target can accept.
+                // Backpressure: deliver if target can accept, retain otherwise.
                 if let Some((slave_idx, desc)) = target_slave {
-                    if !self.tiles[i].stream_switch.slaves[slave_idx].can_accept() {
-                        // Target FIFO full -- leave data in stream_out (backpressure).
-                        break;
+                    if self.tiles[i].stream_switch.slaves[slave_idx].can_accept() {
+                        self.tiles[i].stream_switch.slaves[slave_idx]
+                            .push_with_tlast(data.data, data.tlast);
+                        words_routed += 1;
+
+                        let prefix = if tile_type == TileType::Shim { "Shim" } else { "tile" };
+                        log::info!("DMA_MM2S->TileSwitch: {} ({},{}) slave[{}] <- 0x{:08X}{} ({})",
+                            prefix, col, row, slave_idx, data.data,
+                            if data.tlast { " TLAST" } else { "" }, desc);
+                    } else {
+                        // Target FIFO full -- retain for next cycle.
+                        // Per-channel independence: other channels' words
+                        // continue to be processed (no head-of-line blocking).
+                        retained.push_back(data);
                     }
-
-                    // Safe to pop and push -- downstream has space.
-                    let data = self.dma_engines[i].pop_stream_out().unwrap();
-                    self.tiles[i].stream_switch.slaves[slave_idx].push_with_tlast(data.data, data.tlast);
-                    words_routed += 1;
-
-                    let prefix = if tile_type == TileType::Shim { "Shim" } else { "tile" };
-                    log::info!("DMA_MM2S->TileSwitch: {} ({},{}) slave[{}] <- 0x{:08X}{} ({})",
-                        prefix, col, row, slave_idx, data.data, if data.tlast { " TLAST" } else { "" }, desc);
                 }
+            }
+
+            // Put back any words that couldn't be delivered this cycle.
+            if !retained.is_empty() {
+                // Prepend retained words so they're tried first next cycle,
+                // preserving per-channel ordering.
+                self.dma_engines[i].prepend_stream_out(retained);
             }
         }
 

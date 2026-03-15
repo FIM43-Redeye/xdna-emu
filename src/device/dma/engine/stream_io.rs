@@ -15,6 +15,16 @@ impl DmaEngine {
         self.stream_out.front()
     }
 
+    /// Prepend retained words back to stream_out.
+    ///
+    /// Used by route_dma_to_tile_switches to put back words that couldn't
+    /// be delivered this cycle (target slave full). Retained words go to the
+    /// front so they're retried first next cycle, preserving per-channel order.
+    pub fn prepend_stream_out(&mut self, mut retained: std::collections::VecDeque<StreamData>) {
+        retained.append(&mut self.stream_out);
+        self.stream_out = retained;
+    }
+
     /// Push a word to the per-channel stream input buffer (for S2MM to consume).
     ///
     /// Each S2MM channel has its own FIFO with independent capacity, matching
