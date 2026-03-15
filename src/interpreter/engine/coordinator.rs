@@ -277,6 +277,55 @@ impl InterpreterEngine {
         }
     }
 
+    /// Flush in-flight control packet data through the stream switch.
+    ///
+    /// On real hardware, stream switch latency is 1-3 cycles per hop -- far
+    /// shorter than the NPU firmware's instruction-to-instruction latency.
+    /// So when firmware observes a shim DMA completion (Sync) and then writes
+    /// a START_QUEUE register, the control packet data has long since arrived
+    /// at the destination tile.
+    ///
+    /// In our emulator, the NPU executor and stream routing are interleaved
+    /// within the same cycle loop. Without explicit flushing, the executor
+    /// can fire START_QUEUE before the previous cycle's routing delivers
+    /// the control packet's final words to the tile's DMA BD registers.
+    ///
+    /// Call this between NPU executor advance and engine step to ensure
+    /// all in-flight control packet data reaches its destination before
+    /// subsequent NPU instructions take effect.
+    pub fn flush_ctrl_packets(&mut self) {
+        // Run routing passes to deliver pending stream data, then dispatch
+        // any control packet actions that were generated.  Limit to a few
+        // iterations; control packets traverse at most 4-5 hops.
+        for _ in 0..8 {
+            let (_, _, words) =
+                self.device.array.step_data_movement(&mut self.host_memory);
+
+            let ctrl_actions = self.device.array.drain_ctrl_packet_actions();
+            if ctrl_actions.is_empty() && words == 0 {
+                break;
+            }
+
+            use crate::device::tile::CtrlPacketAction;
+            for action in ctrl_actions {
+                match action {
+                    CtrlPacketAction::WriteRegister { col, row, offset, value } => {
+                        self.device.write_tile_register(col, row, offset, value);
+                    }
+                    CtrlPacketAction::ReadRegisters { col, row, offset, count, response_id } => {
+                        self.device.array.handle_read_registers(
+                            col, row, offset, count, response_id,
+                        );
+                    }
+                    CtrlPacketAction::Error(msg) => {
+                        self.device.array.fatal_errors.push(msg);
+                    }
+                }
+            }
+            self.drain_core_enables();
+        }
+    }
+
     /// Get reference to device state.
     pub fn device(&self) -> &DeviceState {
         &self.device

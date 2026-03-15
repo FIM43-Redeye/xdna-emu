@@ -587,12 +587,24 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
 
     while cycles < max {
         // Advance NPU instruction execution (interleaved with engine step)
+        let npu_progressed;
         {
             let (device, host_mem) = handle.engine.device_and_host_memory();
-            if let crate::npu::AdvanceResult::Error(msg) = handle.npu_executor.try_advance(device, host_mem) {
+            let result = handle.npu_executor.try_advance(device, host_mem);
+            if let crate::npu::AdvanceResult::Error(msg) = result {
                 log::error!("NPU executor fatal: {}", msg);
                 break;
             }
+            npu_progressed = matches!(result, crate::npu::AdvanceResult::Progressed);
+        }
+
+        // When the NPU executor progressed (executed an instruction that may
+        // configure DMA or write START_QUEUE), flush in-flight control packet
+        // data through the stream switch.  On real hardware the stream switch
+        // latency is invisible to firmware; in the emulator, routing is batched
+        // per cycle so control packet register writes can lag behind.
+        if npu_progressed {
+            handle.engine.flush_ctrl_packets();
         }
 
         handle.engine.step();
