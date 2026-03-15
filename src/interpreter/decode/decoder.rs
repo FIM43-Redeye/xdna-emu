@@ -1223,6 +1223,55 @@ mod tests {
     }
 
     #[test]
+    fn test_rel_instruction_decodes_to_lock_release() {
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found at ../llvm-aie");
+            return;
+        }
+        let decoder = InstructionDecoder::try_load_via_tblgen(llvm_aie_path)
+            .expect("Failed to load via tblgen");
+
+        // REL r0, r1 from Chess listing: bytes 0x10 0x10 0x12 0x19
+        // (memory order, decoder reads with from_le_bytes)
+        let rel_bytes: [u8; 4] = [0x19, 0x12, 0x10, 0x10];
+        let bundle = decoder.decode(&rel_bytes, 0x250).expect("Should decode 'rel'");
+
+        let has_lock_release = bundle.active_slots().any(|s|
+            matches!(s.semantic, Some(SemanticOp::LockRelease))
+        );
+        let slot_semantics: Vec<_> = bundle.active_slots()
+            .map(|s| format!("{:?}", s.semantic))
+            .collect();
+        assert!(has_lock_release,
+            "REL instruction must decode to SemanticOp::LockRelease, got: {:?}", slot_semantics);
+    }
+
+    #[test]
+    fn test_acq_instruction_decodes_to_lock_acquire() {
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found at ../llvm-aie");
+            return;
+        }
+        let decoder = InstructionDecoder::try_load_via_tblgen(llvm_aie_path)
+            .expect("Failed to load via tblgen");
+
+        // ACQ r0, r1 from Chess listing: bytes 0x10 0x12 0x12 0x19
+        let acq_bytes: [u8; 4] = [0x19, 0x12, 0x12, 0x10];
+        let bundle = decoder.decode(&acq_bytes, 0x230).expect("Should decode 'acq'");
+
+        let has_lock_acquire = bundle.active_slots().any(|s|
+            matches!(s.semantic, Some(SemanticOp::LockAcquire))
+        );
+        let slot_semantics: Vec<_> = bundle.active_slots()
+            .map(|s| format!("{:?}", s.semantic))
+            .collect();
+        assert!(has_lock_acquire,
+            "ACQ instruction must decode to SemanticOp::LockAcquire, got: {:?}", slot_semantics);
+    }
+
+    #[test]
     fn test_decoder_via_tblgen() {
         let llvm_aie_path = Path::new("../llvm-aie");
         if !llvm_aie_path.exists() {

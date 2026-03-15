@@ -142,6 +142,7 @@ impl LockArbiter {
             return &self.results;
         }
 
+
         // Group pending requests by lock_id using simple O(n^2) grouping.
         let mut processed = vec![false; self.pending.len()];
 

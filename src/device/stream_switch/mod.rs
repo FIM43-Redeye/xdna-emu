@@ -86,6 +86,13 @@ pub struct StreamSwitch {
     /// until TLAST. Prevents packet interleaving when multiple slaves route
     /// through the same arbiter simultaneously. 8 arbiters max (3-bit field).
     pub(crate) arbiter_locks: [Option<usize>; 8],
+    /// Per-arbiter round-robin priority pointer. After a packet completes
+    /// (TLAST), the pointer advances past the releasing slave so the next
+    /// contending slave gets priority. This matches the hardware's round-robin
+    /// arbitration: after TLAST, the releasing slave goes to the back of the
+    /// queue. Values are slave indices; the arbiter grants to the first
+    /// eligible slave starting from this index (wrapping).
+    arbiter_priority: [usize; 8],
 
     /// Words traversing the intra-tile switch pipeline.
     ///
@@ -143,6 +150,7 @@ impl StreamSwitch {
             master_packet_config: vec![MasterPacketConfig::default(); num_masters],
             active_packets: vec![None; num_slaves],
             arbiter_locks: [None; 8],
+            arbiter_priority: [0; 8],
             switch_pipeline: Vec::new(),
             fatal_errors: Vec::new(),
         }
@@ -178,6 +186,7 @@ impl StreamSwitch {
             master_packet_config: vec![MasterPacketConfig::default(); num_masters],
             active_packets: vec![None; num_slaves],
             arbiter_locks: [None; 8],
+            arbiter_priority: [0; 8],
             switch_pipeline: Vec::new(),
             fatal_errors: Vec::new(),
         }
@@ -211,6 +220,7 @@ impl StreamSwitch {
             master_packet_config: vec![MasterPacketConfig::default(); num_masters],
             active_packets: vec![None; num_slaves],
             arbiter_locks: [None; 8],
+            arbiter_priority: [0; 8],
             switch_pipeline: Vec::new(),
             fatal_errors: Vec::new(),
         }
@@ -596,13 +606,53 @@ impl StreamSwitch {
                 // Resolve route
                 match self.resolve_packet_route(slave_idx, pkt_id) {
                     Some((masters, all_drop_header, arbiter)) => {
-                        // Check arbiter lock: another slave may hold this arbiter
+                        // Check arbiter lock: another slave may hold this arbiter.
                         if let Some(locked_by) = self.arbiter_locks[arbiter as usize] {
                             if locked_by != slave_idx {
-                                // Arbiter busy -- backpressure (hold data in FIFO)
                                 self.slaves[slave_idx].cycle_stalled = true;
                                 log::trace!("TileSwitch({},{}): slave[{}] waiting for arbiter {} (held by slave[{}])",
                                     self.col, self.row, slave_idx, arbiter, locked_by);
+                                continue;
+                            }
+                        }
+
+                        // Round-robin priority check: if another slave also
+                        // wants this arbiter and has higher priority (closer
+                        // to the priority pointer in round-robin order), defer.
+                        // This prevents a lower-indexed slave from starving
+                        // higher-indexed ones by always winning the arbiter.
+                        if self.arbiter_locks[arbiter as usize].is_none() {
+                            let priority = self.arbiter_priority[arbiter as usize];
+                            // Check if any OTHER packet-enabled slave with data
+                            // also wants this arbiter and has higher RR priority
+                            let mut dominated = false;
+                            for other in 0..num_slaves {
+                                if other == slave_idx { continue; }
+                                if !self.slaves[other].packet_enable { continue; }
+                                if self.active_packets[other].is_some() { continue; }
+                                if !self.slaves[other].has_data() { continue; }
+                                // Check if 'other' also routes to this arbiter
+                                let other_header = match self.slaves[other].peek() {
+                                    Some(w) => w,
+                                    None => continue,
+                                };
+                                let (other_hdr, _) = PacketHeader::decode(other_header);
+                                if let Some((_, _, other_arb)) = self.resolve_packet_route(other, other_hdr.stream_id) {
+                                    if other_arb == arbiter {
+                                        // Both want the same arbiter. Compare RR distance.
+                                        let my_dist = (slave_idx + num_slaves - priority) % num_slaves;
+                                        let other_dist = (other + num_slaves - priority) % num_slaves;
+                                        if other_dist < my_dist {
+                                            dominated = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if dominated {
+                                self.slaves[slave_idx].cycle_stalled = true;
+                                log::trace!("TileSwitch({},{}): slave[{}] deferred by RR priority for arbiter {}",
+                                    self.col, self.row, slave_idx, arbiter);
                                 continue;
                             }
                         }
@@ -721,9 +771,12 @@ impl StreamSwitch {
                 }
 
                 if tlast {
-                    // Release arbiter lock
+                    // Release arbiter lock and advance round-robin pointer
+                    // past this slave so the next contender gets priority.
                     if let Some(ref active) = self.active_packets[slave_idx] {
-                        self.arbiter_locks[active.arbiter as usize] = None;
+                        let arb = active.arbiter as usize;
+                        self.arbiter_locks[arb] = None;
+                        self.arbiter_priority[arb] = (slave_idx + 1) % num_slaves;
                     }
                     log::debug!("TileSwitch({},{}): pkt data 0x{:08X} slave[{}] -> {:?} TLAST (end of pkt)",
                         self.col, self.row, data, slave_idx, targets);

@@ -447,6 +447,22 @@ impl Transfer {
         }
     }
 
+    /// Whether TLAST should be suppressed at the end of this transfer.
+    ///
+    /// In packet mode (`enable_packet = true`), TLAST is ALWAYS asserted at
+    /// BD boundaries regardless of the BD's TLAST_Suppress field. The hardware
+    /// requires TLAST to delineate packets for stream switch arbiter release.
+    /// Without TLAST, packet arbiters lock permanently, blocking other packets
+    /// that share the same arbiter.
+    ///
+    /// TLAST_Suppress only takes effect for circuit-switched (non-packet) MM2S
+    /// transfers, where it allows multiple chained BDs to appear as a single
+    /// continuous stream without TLAST gaps.
+    #[inline]
+    pub fn effective_tlast_suppress(&self) -> bool {
+        self.tlast_suppress && !self.enable_packet
+    }
+
     /// Whether zero-padding is active for this transfer.
     #[inline]
     pub fn has_zero_padding(&self) -> bool {

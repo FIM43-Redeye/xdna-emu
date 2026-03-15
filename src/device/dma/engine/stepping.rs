@@ -72,9 +72,13 @@ impl DmaEngine {
         let new_fsm = match fsm {
             ChannelFsm::BdSetup { cycles_remaining, mut transfer } => {
                 if cycles_remaining <= 1 {
-                    // BD setup done. Insert packet header if needed.
-                    self.maybe_insert_packet_header_from_transfer(&mut transfer);
-                    // Check if lock acquisition is needed
+                    // BD setup done. Check if lock acquisition is needed.
+                    // Packet header insertion is deferred until AFTER lock
+                    // acquisition -- on real hardware, the DMA only emits
+                    // the header when it starts transferring data, not before
+                    // the lock is acquired. Emitting early would lock the
+                    // stream switch arbiter while the DMA waits for locks,
+                    // blocking other packets that share the same arbiter.
                     if let Some(lock_id) = transfer.acquire_lock {
                         ChannelFsm::AcquiringLock {
                             lock_id,
@@ -83,6 +87,8 @@ impl DmaEngine {
                             transfer,
                         }
                     } else {
+                        // No lock needed -- insert header now, go to MemoryLatency.
+                        self.maybe_insert_packet_header_from_transfer(&mut transfer);
                         ChannelFsm::MemoryLatency {
                             cycles_remaining: self.timing_config.memory_latency_cycles as u16,
                             transfer,
@@ -96,10 +102,13 @@ impl DmaEngine {
                 }
             }
 
-            ChannelFsm::AcquiringLock { lock_id, cycles_remaining, acquired, transfer } => {
+            ChannelFsm::AcquiringLock { lock_id, cycles_remaining, acquired, mut transfer } => {
                 if acquired {
                     // Lock already acquired, counting down latency
                     if cycles_remaining <= 1 {
+                        // Lock acquired, latency done -- insert packet header
+                        // now that we're about to start the actual transfer.
+                        self.maybe_insert_packet_header_from_transfer(&mut transfer);
                         ChannelFsm::MemoryLatency {
                             cycles_remaining: self.timing_config.memory_latency_cycles as u16,
                             transfer,
@@ -360,7 +369,7 @@ impl DmaEngine {
             let action = transfer.next_output_action();
             let is_last_word = remaining <= 4;
             let channel = transfer.channel;
-            let tlast_suppress = transfer.tlast_suppress;
+            let tlast_suppress = transfer.effective_tlast_suppress();
 
             match action {
                 PadAction::Zero => {
@@ -411,7 +420,7 @@ impl DmaEngine {
             let dest = transfer.dest;
             let channel = transfer.channel;
             let is_last = remaining_after == 0;
-            let tlast_suppress = transfer.tlast_suppress;
+            let tlast_suppress = transfer.effective_tlast_suppress();
 
             let result = self.do_transfer(
                 source, dest, addr, bytes_to_transfer, channel,

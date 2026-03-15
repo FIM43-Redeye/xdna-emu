@@ -439,10 +439,12 @@ impl DmaEngine {
             bd_config.release_lock, bd_config.release_value,
             transfer.enable_packet, transfer.packet_id, direction);
 
-        // Insert packet header before any FSM state transitions. On real
-        // hardware the DMA prepends the header when the MM2S transfer begins,
-        // regardless of whether lock acquisition is needed first.
-        self.maybe_insert_packet_header_from_transfer(&mut transfer);
+        // Packet header insertion is deferred until after lock acquisition.
+        // On real hardware, the DMA only emits the packet header when it
+        // starts the actual data transfer, not before the lock is acquired.
+        // Emitting early would lock the stream switch packet arbiter while
+        // the DMA waits for buffer locks, potentially deadlocking other
+        // packets sharing the same arbiter.
 
         // Determine initial FSM state based on whether lock acquisition is needed
         let ch = &mut self.channels[ch_idx];

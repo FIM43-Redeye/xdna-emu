@@ -683,8 +683,9 @@ impl TileArray {
                     // Debug: check if master has data
                     let fifo_len = self.tiles[i].stream_switch.masters[master_port].fifo.len();
                     if fifo_len > 0 {
-                        log::debug!("TileSwitch->DMA check: tile ({},{}) master[{}] ch {} fifo_len={}",
-                            self.tiles[i].col, self.tiles[i].row, master_port, ch, fifo_len);
+                        let can_accept = self.dma_engines[i].can_accept_stream_in_for_channel(ch);
+                        log::debug!("TileSwitch->DMA check: tile ({},{}) master[{}] ch {} fifo_len={} can_accept={}",
+                            self.tiles[i].col, self.tiles[i].row, master_port, ch, fifo_len, can_accept);
                     }
 
                     // Per-channel backpressure: only pop from master if the
