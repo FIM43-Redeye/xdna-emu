@@ -310,12 +310,19 @@ impl InterpreterEngine {
         if let Some(core) = self.get_core_mut(col, row) {
             core.enabled = true;
         }
+        // Mirror to CoreDebugState so Core_Status register shows enabled.
+        if let Some(tile) = self.device.tile_mut(col, row) {
+            tile.core_debug.set_enabled(true);
+        }
     }
 
     /// Disable a core at (col, row).
     pub fn disable_core(&mut self, col: usize, row: usize) {
         if let Some(core) = self.get_core_mut(col, row) {
             core.enabled = false;
+        }
+        if let Some(tile) = self.device.tile_mut(col, row) {
+            tile.core_debug.set_enabled(false);
         }
     }
 
@@ -530,19 +537,36 @@ impl InterpreterEngine {
                         )
                     };
 
+                    // Update CoreDebugState with current PC and stall info.
+                    // This mirrors the interpreter state into the register
+                    // space so host reads of Core_Status/Core_PC return
+                    // correct values (matching real hardware behavior).
+                    tile.core_debug.update_pc(core.context.pc());
                     match result {
                         StepResult::Continue => {
+                            tile.core_debug.update_stalls(false, false, false, false);
                             all_halted = false;
                             any_running = true;
                             self.total_instructions += 1;
                         }
-                        StepResult::WaitLock { .. } | StepResult::WaitDma { .. } | StepResult::WaitStream { .. } => {
-                            // Stalled, but still active - not halted
+                        StepResult::WaitLock { .. } => {
+                            tile.core_debug.update_stalls(false, true, false, false);
+                            all_halted = false;
+                            any_running = true;
+                        }
+                        StepResult::WaitDma { .. } => {
+                            tile.core_debug.update_stalls(true, false, false, false);
+                            all_halted = false;
+                            any_running = true;
+                        }
+                        StepResult::WaitStream { .. } => {
+                            tile.core_debug.update_stalls(false, false, true, false);
                             all_halted = false;
                             any_running = true;
                         }
                         StepResult::Halt => {
-                            // This core halted - don't set all_halted=false
+                            tile.core_debug.set_done(true);
+                            tile.core_debug.update_stalls(false, false, false, false);
                         }
                         StepResult::DecodeError(ref e) => {
                             log::error!("Core({},{}) DecodeError at cycle {}: {:?}", col, row, self.total_cycles, e);
@@ -823,6 +847,16 @@ impl InterpreterEngine {
             for tile in &mut self.device.array.tiles {
                 tile.evaluate_edge_detectors(cycle);
             }
+        }
+
+        // Phase 3e: Tick tile timers.
+        //
+        // Each tile has two 64-bit timers (core module and memory module)
+        // that increment every cycle. The timer can generate a trigger
+        // event when it reaches a programmed threshold.
+        for tile in &mut self.device.array.tiles {
+            tile.core_timer.tick();
+            tile.mem_timer.tick();
         }
 
         // Phase 4: Update tile DMA channel state from engine state
