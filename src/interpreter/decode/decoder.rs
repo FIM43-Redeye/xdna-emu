@@ -395,22 +395,10 @@ impl InstructionDecoder {
             // Data-driven dispatch on operand_type
             let operand = match &field.operand_type {
                 OperandType::Register(kind) => {
-                    let reg = raw as u8;
-                    match kind {
-                        RegisterKind::Scalar => Operand::ScalarReg(reg),
-                        RegisterKind::Pointer => Operand::PointerReg(reg),
-                        // Each modifier sub-class maps to a different base index
-                        // in the unified modifier register file (32 entries total):
-                        //   m0-m7 at 0-7, dn0-dn7 at 8-15, dj0-dj7 at 16-23, dc0-dc7 at 24-31
-                        RegisterKind::ModifierM  => Operand::ModifierReg(reg + MOD_BASE_M),
-                        RegisterKind::ModifierDN => Operand::ModifierReg(reg + MOD_BASE_DN),
-                        RegisterKind::ModifierDJ => Operand::ModifierReg(reg + MOD_BASE_DJ),
-                        RegisterKind::ModifierDC => Operand::ModifierReg(reg + MOD_BASE_DC),
-                        RegisterKind::Vector256 | RegisterKind::Vector512 =>
-                            Operand::VectorReg(reg),
-                        RegisterKind::Accumulator => Operand::AccumReg(reg),
-                        RegisterKind::Control => Operand::ControlReg(reg),
-                    }
+                    Self::decode_register(*kind, raw as u8, 0)
+                }
+                OperandType::RegisterWithOffset(kind, base) => {
+                    Self::decode_register(*kind, raw as u8, *base)
                 }
                 OperandType::CompositeRegister(encoder) => {
                     self.composite_luts.decode(*encoder, raw)
@@ -525,6 +513,23 @@ impl InstructionDecoder {
 
     /// Decode an address generator field (ag_all, ag_nospill, agb_sa, etc.).
     ///
+    /// Decode a register operand from raw bits, applying subclass base offset.
+    fn decode_register(kind: RegisterKind, raw: u8, base_offset: u8) -> Operand {
+        let reg = raw + base_offset;
+        match kind {
+            RegisterKind::Scalar => Operand::ScalarReg(reg),
+            RegisterKind::Pointer => Operand::PointerReg(reg),
+            RegisterKind::ModifierM  => Operand::ModifierReg(reg + MOD_BASE_M),
+            RegisterKind::ModifierDN => Operand::ModifierReg(reg + MOD_BASE_DN),
+            RegisterKind::ModifierDJ => Operand::ModifierReg(reg + MOD_BASE_DJ),
+            RegisterKind::ModifierDC => Operand::ModifierReg(reg + MOD_BASE_DC),
+            RegisterKind::Vector256 | RegisterKind::Vector512 =>
+                Operand::VectorReg(reg),
+            RegisterKind::Accumulator => Operand::AccumReg(reg),
+            RegisterKind::Control => Operand::ControlReg(reg),
+        }
+    }
+
     /// AG fields encode a packed tuple of {pointer, offset/modifier, mode_bits}.
     /// The addressing mode (from the instruction name) determines the layout.
     /// This is structural packing, not a register composite encoding, so it

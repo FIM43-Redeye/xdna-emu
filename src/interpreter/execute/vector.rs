@@ -293,11 +293,27 @@ impl VectorAlu {
             }
 
             SemanticOp::VectorSelect => {
-                // Per-lane conditional select: dst[i] = sel[i] ? a[i] : b[i]
-                let sel = Self::get_vector_source(op, ctx, 0);
-                let a = Self::get_vector_source(op, ctx, 1);
-                let b = Self::get_vector_source(op, ctx, 2);
-                let result = Self::vector_select(&sel, &a, &b, et);
+                // VSEL.32 d, s1, s2, sel: per-lane conditional select.
+                // input_order is [s1, s2, sel] where sel is a scalar register
+                // whose bits select per-element: d[i] = (sel >> i) & 1 ? s1[i] : s2[i]
+                //
+                // The scalar sel mask is expanded to a per-lane vector mask based
+                // on element type: 32-bit uses bits 0-7, 16-bit uses bits 0-15, etc.
+                let s1 = Self::get_vector_source(op, ctx, 0);
+                let s2 = Self::get_vector_source(op, ctx, 1);
+                // Read the scalar select mask from the last source operand
+                let sel_scalar = op.sources.get(2).map(|s| match s {
+                    Operand::ScalarReg(r) => ctx.scalar.read(*r),
+                    Operand::Immediate(v) => *v as u32,
+                    _ => Self::get_scalar_source(op, ctx),
+                }).unwrap_or(0);
+                // Expand scalar mask to per-lane vector mask
+                let sel = Self::expand_select_mask(sel_scalar, et);
+                let result = Self::vector_select(&sel, &s1, &s2, et);
+                log::debug!(
+                    "[VSEL] sel_scalar=0x{:X} sel={:?} s1={:?} s2={:?} -> {:?} (sources={:?}, dest={:?})",
+                    sel_scalar, sel, s1, s2, result, op.sources, op.dest
+                );
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
@@ -310,6 +326,10 @@ impl VectorAlu {
             SemanticOp::VectorBroadcast => {
                 let value = Self::get_scalar_source(op, ctx);
                 let result = Self::vector_broadcast(value, et);
+                log::debug!(
+                    "[VBCST] Broadcast value={} et={:?} -> {:?} (sources={:?}, dest={:?})",
+                    value, et, result, op.sources, op.dest
+                );
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
@@ -1723,6 +1743,45 @@ impl VectorAlu {
         }
 
         result
+    }
+
+    /// Expand a scalar select mask to a per-lane vector mask.
+    ///
+    /// VSEL uses a scalar register where each bit selects the corresponding
+    /// element. For 32-bit mode, bits 0-7 select 8 elements. For 16-bit,
+    /// bits 0-15 select 16 elements (2 per u32 lane). For 8-bit, bits 0-31
+    /// select 32 elements (4 per u32 lane).
+    fn expand_select_mask(sel: u32, elem_type: ElementType) -> [u32; 8] {
+        let mut mask = [0u32; 8];
+        match elem_type {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+                // 8 elements, 1 bit each
+                for i in 0..8 {
+                    mask[i] = if (sel >> i) & 1 != 0 { 1 } else { 0 };
+                }
+            }
+            ElementType::Int16 | ElementType::UInt16 | ElementType::BFloat16 => {
+                // 16 elements (2 per u32), 1 bit each
+                for i in 0..8 {
+                    let lo = if (sel >> (i * 2)) & 1 != 0 { 0xFFFF } else { 0 };
+                    let hi = if (sel >> (i * 2 + 1)) & 1 != 0 { 0xFFFF } else { 0 };
+                    mask[i] = lo | (hi << 16);
+                }
+            }
+            ElementType::Int8 | ElementType::UInt8 => {
+                // 32 elements (4 per u32), 1 bit each
+                for i in 0..8 {
+                    let mut m = 0u32;
+                    for j in 0..4 {
+                        if (sel >> (i * 4 + j)) & 1 != 0 {
+                            m |= 0xFF << (j * 8);
+                        }
+                    }
+                    mask[i] = m;
+                }
+            }
+        }
+        mask
     }
 
     /// Broadcast a scalar value to all vector lanes.

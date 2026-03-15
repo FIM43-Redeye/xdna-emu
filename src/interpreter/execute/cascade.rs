@@ -94,8 +94,9 @@ impl CascadeOps {
                     let lanes = cascade_to_accumulator(&data);
                     ctx.accumulator.write(*r, lanes);
                     log::debug!(
-                        "[CASCADE] Read SCD -> acc{} (tile {},{})",
-                        r, tile.col, tile.row
+                        "[CASCADE] Read SCD -> acc{} (tile {},{}) data=[{:#X}, {:#X}, {:#X}, {:#X}, {:#X}, {:#X}]",
+                        r, tile.col, tile.row,
+                        data[0], data[1], data[2], data[3], data[4], data[5]
                     );
                 }
                 _ => {
@@ -144,8 +145,9 @@ impl CascadeOps {
                     let lanes = ctx.accumulator.read(*r);
                     let d = accumulator_to_cascade(&lanes);
                     log::debug!(
-                        "[CASCADE] Write acc{} -> MCD (tile {},{})",
-                        r, tile.col, tile.row
+                        "[CASCADE] Write acc{} -> MCD (tile {},{}) data=[{:#X}, {:#X}, {:#X}, {:#X}, {:#X}, {:#X}]",
+                        r, tile.col, tile.row,
+                        d[0], d[1], d[2], d[3], d[4], d[5]
                     );
                     d
                 }

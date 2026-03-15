@@ -119,8 +119,12 @@ pub fn detect_mem_width(mnemonic: &str) -> InstrMemWidth {
 /// data-driven dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperandType {
-    /// Simple register: raw value IS the register index.
+    /// Simple register: raw value + base_offset IS the register index.
+    /// base_offset is non-zero for register subclasses (e.g., eRS8 = r16-r23
+    /// uses base_offset=16, so a 3-bit field value of 3 maps to r19).
     Register(RegisterKind),
+    /// Register with a base offset for subclass encoding.
+    RegisterWithOffset(RegisterKind, u8),
     /// Composite register: multiple register classes share one field,
     /// discriminated by low bits. Requires an inverse encoder function.
     CompositeRegister(CompositeEncoder),

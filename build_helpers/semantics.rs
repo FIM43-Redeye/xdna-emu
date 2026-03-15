@@ -55,23 +55,53 @@ pub fn classify_operand_type(reg_class: &str, field_name: &str) -> String {
         "mCRm" => return "OperandType::Register(RegisterKind::Control)".to_string(),
         _ => {}
     }
-    if reg_class.starts_with("eW") || reg_class == "mWm" {
+    // Scalar register subclasses with base offsets:
+    // eRS4 = r16-r19 (4 regs, 2-bit index, base=16)
+    // eRS8 = r16-r23 (8 regs, 3-bit index, base=16)
+    // eR29 = r29 only (fixed register, base=29)
+    // eL = link register (r15, base=15)
+    match reg_class {
+        "eRS4" => return "OperandType::RegisterWithOffset(RegisterKind::Scalar, 16)".to_string(),
+        "eRS8" => return "OperandType::RegisterWithOffset(RegisterKind::Scalar, 16)".to_string(),
+        "eR29" => return "OperandType::RegisterWithOffset(RegisterKind::Scalar, 29)".to_string(),
+        "eL" => return "OperandType::RegisterWithOffset(RegisterKind::Scalar, 15)".to_string(),
+        _ => {}
+    }
+    // Generic eR* subclasses: treat as base scalar (no offset)
+    if reg_class.starts_with("eR") {
+        return "OperandType::Register(RegisterKind::Scalar)".to_string();
+    }
+    // Pointer register subclasses
+    if reg_class.starts_with("eP") {
+        return "OperandType::Register(RegisterKind::Pointer)".to_string();
+    }
+    // 256-bit vector register subclasses (mWm, mWn, eW*, etc.)
+    if reg_class.starts_with("eW") || reg_class.starts_with("mW") {
         return "OperandType::Register(RegisterKind::Vector256)".to_string();
     }
-    if reg_class.starts_with("mXm") || reg_class.starts_with("eX") {
+    // 512-bit vector register subclasses (mXm, mXn, mXv, mXw, mXa, mXs, eX*, etc.)
+    // All subsets of VEC512 = (add mXm, mXn, mXv, mXw, mXa, mXs)
+    if reg_class.starts_with("mX") || reg_class.starts_with("eX") {
         return "OperandType::Register(RegisterKind::Vector512)".to_string();
     }
+    // Accumulator register subclasses (eAM*, mAMm*, eBM*, mBMm*, eCM*, mBMS*, mQQ*, mQX*)
     if reg_class.starts_with("eAM")
-        || reg_class.starts_with("mAMm")
+        || reg_class.starts_with("mAM")
         || reg_class.starts_with("eBM")
-        || reg_class.starts_with("mBMm")
+        || reg_class.starts_with("mBM")
         || reg_class.starts_with("eCM")
-        || reg_class.starts_with("mBMS")
+        || reg_class.starts_with("mQQ")
+        || reg_class.starts_with("mQX")
     {
         return "OperandType::Register(RegisterKind::Accumulator)".to_string();
     }
-    if reg_class.starts_with("mQQ") || reg_class.starts_with("mQX") {
-        return "OperandType::Register(RegisterKind::Accumulator)".to_string();
+    // Stream/cascade register classes (mSs = stream source, mSd = stream dest)
+    if reg_class.starts_with("mS") {
+        return "OperandType::Register(RegisterKind::Vector512)".to_string();
+    }
+    // Modifier register subclasses
+    if reg_class.starts_with("eD") || reg_class.starts_with("eM") {
+        return "OperandType::Register(RegisterKind::ModifierM)".to_string();
     }
 
     // 3. Immediate operands
