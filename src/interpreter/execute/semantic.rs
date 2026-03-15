@@ -152,7 +152,13 @@ pub fn execute_semantic(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         SemanticOp::Event => {
             let event_id = match op.sources.first() {
                 Some(Operand::Immediate(v)) => *v as u8,
-                _ => 0, // Default to event 0 if operand missing
+                other => {
+                    log::warn!(
+                        "[SEMANTIC] Event: expected Immediate operand for event_id, got {:?}, defaulting to 0",
+                        other
+                    );
+                    0
+                }
             };
             let pc = ctx.pc();
             let cycle = ctx.cycles;

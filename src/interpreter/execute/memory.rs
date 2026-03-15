@@ -637,7 +637,10 @@ impl MemoryUnit {
             Operand::PointerReg(r) => ctx.pointer_read(*r),
             Operand::ScalarReg(r) => ctx.scalar_read(*r),
             Operand::Immediate(v) => *v as u32,
-            _ => 0,
+            other => {
+                log::warn!("[MEMORY] get_address: unexpected base operand {:?}, defaulting to 0", other);
+                0
+            }
         });
 
         let offset = op.sources.get(1).map_or(0, |src| match src {
@@ -645,11 +648,13 @@ impl MemoryUnit {
             Operand::ScalarReg(r) => ctx.scalar_read(*r).wrapping_mul(4),
             // Modifier registers contain byte offsets (set via mov dj0/m0, rN)
             Operand::ModifierReg(r) => ctx.modifier_read(*r),
-            _ => 0,
+            other => {
+                log::warn!("[MEMORY] get_address: unexpected offset operand {:?}, defaulting to 0", other);
+                0
+            }
         });
 
-        let result = base_addr.wrapping_add(offset);
-        result
+        base_addr.wrapping_add(offset)
     }
 
     /// Get store address.
@@ -679,7 +684,10 @@ impl MemoryUnit {
             Operand::PointerReg(r) => ctx.pointer_read(*r),
             Operand::ScalarReg(r) => ctx.scalar_read(*r),
             Operand::Immediate(v) => *v as u32,
-            _ => 0,
+            other => {
+                log::warn!("[MEMORY] get_store_address: unexpected base operand {:?}, defaulting to 0", other);
+                0
+            }
         });
 
         // sources[2] is the index offset: modifier registers contain byte
@@ -688,7 +696,10 @@ impl MemoryUnit {
             Operand::ModifierReg(r) => ctx.modifier_read(*r),
             Operand::Immediate(v) => (*v as i32 * 4) as u32,
             Operand::ScalarReg(r) => ctx.scalar_read(*r).wrapping_mul(4),
-            _ => 0,
+            other => {
+                log::warn!("[MEMORY] get_store_address: unexpected offset operand {:?}, defaulting to 0", other);
+                0
+            }
         });
 
         base_addr.wrapping_add(offset)
@@ -796,6 +807,10 @@ impl MemoryUnit {
     /// Read a value from a memory slice at the given offset.
     fn read_from_slice(mem: &[u8], addr: usize, width: MemWidth) -> u64 {
         if addr >= mem.len() {
+            log::warn!(
+                "[MEMORY] OOB read: addr=0x{:X} width={:?} mem_size=0x{:X}",
+                addr, width, mem.len()
+            );
             return 0;
         }
 
@@ -1029,6 +1044,7 @@ impl MemoryUnit {
         } else if let Some(neighbor_mem) = neighbors.and_then(|n| n.get_memory(quadrant)) {
             neighbor_mem
         } else {
+            log::trace!("[VLOAD] cross-tile read to non-existent neighbor {:?}", quadrant);
             return [0u32; 8];
         };
 

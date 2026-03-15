@@ -898,14 +898,20 @@ impl InterpreterEngine {
             }
         }
 
-        // Phase 3e: Tick tile timers.
+        // Phase 3e: Tick tile timers and performance counters.
         //
         // Each tile has two 64-bit timers (core module and memory module)
         // that increment every cycle. The timer can generate a trigger
         // event when it reaches a programmed threshold.
+        //
+        // Performance counters also tick each cycle. Active counters
+        // increment and check against their configured event_value
+        // threshold, generating PERF_CNT_N events when reached.
         for tile in &mut self.device.array.tiles {
             tile.core_timer.tick();
             tile.mem_timer.tick();
+            tile.core_perf_counters.tick();
+            tile.mem_perf_counters.tick();
         }
 
         // Phase 4: Update tile DMA channel state from engine state

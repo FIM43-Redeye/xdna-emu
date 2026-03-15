@@ -88,16 +88,18 @@ impl StreamOps {
                     value, port, blocking, tile.col, tile.row
                 );
 
-                // Push value to tile's stream output buffer
-                // The TileArray will route this data through the stream switch
+                // Hardware stream output FIFO is 4 words deep per port.
+                // If full and blocking, stall until the router drains it.
+                const STREAM_FIFO_DEPTH: usize = 4;
+                if blocking && tile.stream_output_len(port) >= STREAM_FIFO_DEPTH {
+                    log::debug!(
+                        "[STREAM] Write stall: port {} FIFO full (tile {},{}, pc=0x{:X})",
+                        port, tile.col, tile.row, ctx.pc()
+                    );
+                    return StreamResult::Stall { port };
+                }
+
                 tile.push_stream_output(port, value);
-
-                // Note: For blocking writes, we'd check if the output FIFO is full
-                // and return a stall. For now, the VecDeque is unbounded so writes
-                // always succeed. This matches hardware behavior where backpressure
-                // propagates through the fabric.
-                let _ = blocking; // Unused for now - could add FIFO depth check
-
                 StreamResult::Completed
             }
 
@@ -113,13 +115,17 @@ impl StreamOps {
                     header, port, blocking, tile.col, tile.row
                 );
 
-                // Push packet header to tile's stream output buffer
-                // Packet headers contain routing information for packet-switched mode
-                // The stream switch will interpret this as a packet header and route accordingly
+                // Hardware stream output FIFO is 4 words deep per port.
+                const STREAM_FIFO_DEPTH: usize = 4;
+                if blocking && tile.stream_output_len(port) >= STREAM_FIFO_DEPTH {
+                    log::debug!(
+                        "[STREAM] PacketHeader stall: port {} FIFO full (tile {},{}, pc=0x{:X})",
+                        port, tile.col, tile.row, ctx.pc()
+                    );
+                    return StreamResult::Stall { port };
+                }
+
                 tile.push_stream_output(port, header);
-
-                let _ = blocking; // Unused for now
-
                 StreamResult::Completed
             }
 
@@ -138,6 +144,10 @@ impl StreamOps {
                     StreamResult::Stall { port }
                 } else {
                     // No data but non-blocking - write 0 and continue
+                    log::debug!(
+                        "[STREAM] Non-blocking read: port {} empty, writing 0 (tile {},{})",
+                        port, tile.col, tile.row
+                    );
                     write_dest(op, ctx, 0);
                     StreamResult::Completed
                 }
@@ -339,6 +349,52 @@ mod tests {
             .with_blocking(true)
             .with_source(Operand::Immediate(42));
 
+        assert_eq!(
+            StreamOps::execute(&op, &mut ctx, &mut tile),
+            StreamResult::Completed
+        );
+    }
+
+    #[test]
+    fn test_stream_write_blocking_stalls_when_fifo_full() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        ctx.scalar.write(0, 0x11111111);
+
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamWrite)
+            .with_blocking(true)
+            .with_source(Operand::ScalarReg(0));
+
+        // Fill the FIFO (depth 4)
+        for _ in 0..4 {
+            tile.push_stream_output(0, 0xAAAA);
+        }
+
+        // 5th write should stall
+        assert_eq!(
+            StreamOps::execute(&op, &mut ctx, &mut tile),
+            StreamResult::Stall { port: 0 }
+        );
+    }
+
+    #[test]
+    fn test_stream_write_nonblocking_always_succeeds() {
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        ctx.scalar.write(0, 0x22222222);
+
+        let op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::StreamWrite)
+            .with_blocking(false)
+            .with_source(Operand::ScalarReg(0));
+
+        // Fill the FIFO (depth 4)
+        for _ in 0..4 {
+            tile.push_stream_output(0, 0xBBBB);
+        }
+
+        // Non-blocking write should still succeed (unbounded for non-blocking)
         assert_eq!(
             StreamOps::execute(&op, &mut ctx, &mut tile),
             StreamResult::Completed

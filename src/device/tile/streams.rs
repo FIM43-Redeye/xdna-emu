@@ -53,6 +53,15 @@ impl Tile {
         }
     }
 
+    /// Get stream output queue length for a port.
+    pub fn stream_output_len(&self, port: u8) -> usize {
+        if (port as usize) < self.stream_output.len() {
+            self.stream_output[port as usize].len()
+        } else {
+            0
+        }
+    }
+
     /// Pop a word from the stream output buffer for a port.
     ///
     /// Called by the stream router to collect data from this tile.

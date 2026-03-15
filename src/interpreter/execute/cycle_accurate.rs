@@ -26,7 +26,7 @@
 //! in the same cycle causes a stall.
 
 use crate::device::tile::Tile;
-use crate::interpreter::bundle::{SlotOp, VliwBundle};
+use crate::interpreter::bundle::{Operand, SlotOp, VliwBundle};
 use crate::tablegen::SemanticOp;
 use crate::interpreter::state::{EventType, ExecutionContext};
 use crate::interpreter::timing::{
@@ -185,12 +185,19 @@ impl CycleAccurateExecutor {
     }
 
     /// Record memory access for bank conflict tracking.
-    fn record_memory_access(&mut self, op: &SlotOp) {
+    fn record_memory_access(&mut self, op: &SlotOp, ctx: &ExecutionContext) {
         match op.semantic {
             Some(SemanticOp::Load) | Some(SemanticOp::Store) if !op.is_vector => {
-                // Placeholder: actual address resolution requires the execution
-                // context, which record_memory_access doesn't currently receive.
-                let addr = 0u32;
+                // Resolve address from the first pointer register in operands.
+                // This is approximate (doesn't account for modifiers/offsets)
+                // but sufficient for bank conflict detection.
+                let addr = op.sources.iter().find_map(|src| match src {
+                    Operand::Memory { base, offset } => {
+                        Some(ctx.pointer.read(*base).wrapping_add(*offset as i32 as u32))
+                    }
+                    Operand::PointerReg(r) => Some(ctx.pointer.read(*r)),
+                    _ => None,
+                }).unwrap_or(0);
                 let is_store = matches!(op.semantic, Some(SemanticOp::Store));
                 let access = MemoryAccess {
                     address: addr,
@@ -395,7 +402,7 @@ impl CycleAccurateExecutor {
         // Phase 3: Record writes and memory accesses for future hazard detection
         for op in bundle.active_slots() {
             self.record_writes(op);
-            self.record_memory_access(op);
+            self.record_memory_access(op, ctx);
         }
 
         // Convert Branch to Call when this was a jl instruction.

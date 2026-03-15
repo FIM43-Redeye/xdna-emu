@@ -96,7 +96,11 @@ impl ControlUnit {
                             log::debug!("JNZ/JZ: src[0]=ScalarReg({}) val={} target=0x{:X}", r, v, target);
                             v
                         } else {
-                            log::debug!("JNZ/JZ: no register operand, defaulting to 0");
+                            log::error!(
+                                "JNZ/JZ: no register operand found, defaulting to 0 -- \
+                                 likely a decoder bug (dest={:?}, sources={:?})",
+                                op.dest, op.sources
+                            );
                             0
                         };
                         match condition {
@@ -294,6 +298,11 @@ impl ControlUnit {
                 return ctx.scalar.read(*r);
             }
         }
+        log::error!(
+            "[CONTROL] get_branch_target: no target operand found, defaulting to 0x0 -- \
+             likely a decoder bug (sources: {:?})",
+            op.sources
+        );
         0
     }
 
@@ -343,7 +352,10 @@ impl ControlUnit {
             Operand::Lock(id) => *id,
             Operand::Immediate(v) => *v as u8,
             Operand::ScalarReg(r) => ctx.scalar_read(*r) as u8,
-            _ => 0,
+            other => {
+                log::warn!("[LOCK] ACQ: unexpected lock_id operand {:?}, defaulting to 0", other);
+                0
+            }
         });
 
         // Change value from second operand.
@@ -361,7 +373,10 @@ impl ControlUnit {
         let change_value = op.sources.get(1).map_or(-1_i8, |src| match src {
             Operand::Immediate(v) => *v as i8,
             Operand::ScalarReg(r) => ctx.scalar_read(*r) as i8,
-            _ => -1,
+            other => {
+                log::warn!("[LOCK] ACQ: unexpected change_value operand {:?}, defaulting to -1", other);
+                -1
+            }
         });
 
         let (expected, delta) = if change_value < 0 {
@@ -390,14 +405,20 @@ impl ControlUnit {
             Operand::Lock(id) => *id,
             Operand::Immediate(v) => *v as u8,
             Operand::ScalarReg(r) => ctx.scalar_read(*r) as u8,
-            _ => 0,
+            other => {
+                log::warn!("[LOCK] REL: unexpected lock_id operand {:?}, defaulting to 0", other);
+                0
+            }
         });
 
         // Delta from second operand (default: +1)
         let delta = op.sources.get(1).map_or(1, |src| match src {
             Operand::Immediate(v) => *v as i8,
             Operand::ScalarReg(r) => ctx.scalar_read(*r) as i8,
-            _ => 1,
+            other => {
+                log::warn!("[LOCK] REL: unexpected delta operand {:?}, defaulting to +1", other);
+                1
+            }
         });
 
         (lock_id, delta)
@@ -408,7 +429,10 @@ impl ControlUnit {
         op.sources.first().map_or(0, |src| match src {
             Operand::DmaChannel(ch) => *ch,
             Operand::Immediate(v) => *v as u8,
-            _ => 0,
+            other => {
+                log::warn!("[DMA] get_dma_channel: unexpected operand {:?}, defaulting to ch 0", other);
+                0
+            }
         })
     }
 
@@ -472,7 +496,10 @@ impl ControlUnit {
         // BD index is typically in second operand or immediate
         op.sources.get(1).map_or(0, |src| match src {
             Operand::Immediate(v) => *v as u8,
-            _ => 0,
+            other => {
+                log::warn!("[DMA] get_dma_bd: unexpected operand {:?}, defaulting to BD 0", other);
+                0
+            }
         })
     }
 

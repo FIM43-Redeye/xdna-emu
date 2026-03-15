@@ -72,6 +72,20 @@ pub(crate) enum ExecutorState {
         /// Index into pending_syncs identifying which sync we're waiting on.
         sync_index: usize,
     },
+    /// Blocked waiting for a MaskPoll condition to be satisfied.
+    ///
+    /// MaskPoll checks `(register & mask) == value` and blocks until true.
+    /// Used by firmware to wait for DMA completion or other status bits.
+    BlockedOnPoll {
+        /// Index of the NEXT instruction after the poll completes.
+        next_index: usize,
+        /// Full NPU register address (encodes col/row/offset).
+        reg_off: u32,
+        /// Expected value after masking.
+        value: u32,
+        /// Mask to apply before comparison.
+        mask: u32,
+    },
     /// Flushing stream switch after sync satisfaction.
     ///
     /// Control packet data may still be in-transit through the stream
@@ -356,6 +370,10 @@ impl NpuExecutor {
                         *ni = next_index + 1;
                         return AdvanceResult::Blocked;
                     }
+                    ExecutorState::BlockedOnPoll { next_index: ref mut ni, .. } => {
+                        *ni = next_index + 1;
+                        return AdvanceResult::Blocked;
+                    }
                     _ => {}
                 }
 
@@ -436,6 +454,27 @@ impl NpuExecutor {
                             next_index,
                             remaining: STREAM_FLUSH_CYCLES,
                         };
+                        AdvanceResult::Progressed
+                    }
+                } else {
+                    AdvanceResult::Blocked
+                }
+            }
+
+            ExecutorState::BlockedOnPoll { next_index, reg_off, value, mask } => {
+                let (col, row, offset) = decode_npu_address(reg_off);
+                let current = device.tile_mut(col as usize, row as usize)
+                    .map_or(0, |tile| tile.read_register(offset));
+                if (current & mask) == value {
+                    log::debug!(
+                        "NPU MaskPoll: reg=0x{:08X} satisfied (current=0x{:08X})",
+                        reg_off, current
+                    );
+                    if next_index >= self.instructions.len() {
+                        self.state = ExecutorState::Done;
+                        AdvanceResult::Done
+                    } else {
+                        self.state = ExecutorState::Executing { next_index };
                         AdvanceResult::Progressed
                     }
                 } else {
@@ -537,14 +576,31 @@ impl NpuExecutor {
             }
 
             NpuInstruction::MaskPoll { reg_off, value, mask } => {
-                // MaskPoll is a synchronization point - we simulate it by
-                // assuming the condition is already met (the DMA has completed).
-                // In a cycle-accurate simulation, we'd need to actually poll.
-                log::debug!(
-                    "NPU MaskPoll: reg=0x{:08X} value=0x{:08X} mask=0x{:08X} (assuming satisfied)",
-                    reg_off, value, mask
-                );
-                Ok(())
+                // MaskPoll blocks until (register & mask) == value.
+                // Check the condition now; if not met, transition to
+                // BlockedOnPoll and let try_advance() poll each cycle.
+                let (col, row, offset) = decode_npu_address(*reg_off);
+                let current = device.tile_mut(col as usize, row as usize)
+                    .map_or(0, |tile| tile.read_register(offset));
+                if (current & mask) == *value {
+                    log::debug!(
+                        "NPU MaskPoll: reg=0x{:08X} satisfied immediately (current=0x{:08X} & 0x{:08X} == 0x{:08X})",
+                        reg_off, current, mask, value
+                    );
+                    Ok(())
+                } else {
+                    log::debug!(
+                        "NPU MaskPoll: reg=0x{:08X} blocking (current=0x{:08X} & 0x{:08X} = 0x{:08X}, want 0x{:08X})",
+                        reg_off, current, mask, current & mask, value
+                    );
+                    self.state = ExecutorState::BlockedOnPoll {
+                        next_index: 0, // fixed up by try_advance
+                        reg_off: *reg_off,
+                        value: *value,
+                        mask: *mask,
+                    };
+                    Ok(())
+                }
             }
 
             NpuInstruction::DdrPatch { reg_addr, arg_idx, arg_plus } => {
@@ -580,12 +636,12 @@ impl NpuExecutor {
             }
 
             NpuInstruction::Unknown { opcode, data } => {
-                log::warn!(
-                    "NPU Unknown instruction: opcode=0x{:02X} data_len={}",
+                Err(format!(
+                    "NPU Unknown instruction: opcode=0x{:02X} data_len={} -- \
+                     unrecognized opcode, cannot continue",
                     opcode,
                     data.len()
-                );
-                Ok(())
+                ))
             }
         }
     }
