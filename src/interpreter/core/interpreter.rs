@@ -255,7 +255,9 @@ where
     pub fn is_stalled(&self) -> bool {
         matches!(
             self.status,
-            CoreStatus::WaitingLock { .. } | CoreStatus::WaitingDma { .. }
+            CoreStatus::WaitingLock { .. }
+                | CoreStatus::WaitingDma { .. }
+                | CoreStatus::WaitingStream { .. }
         )
     }
 
@@ -436,14 +438,22 @@ where
             }
 
             CoreStatus::WaitingStream { port } => {
-                if port == 255 {
-                    // Cascade stall (sentinel port 255): check cascade state.
-                    // Cascade reads stall on empty input, writes stall on full output.
-                    // Re-executing the instruction will resolve the correct condition.
-                    let can_resume = tile.has_cascade_input()
-                        || tile.cascade_output.is_empty();
-                    if can_resume {
-                        log::info!("Cascade available, resuming execution");
+                if port == 254 {
+                    // Cascade READ stall (sentinel port 254): SCD empty.
+                    // Resume only when cascade input data is available.
+                    if tile.has_cascade_input() {
+                        log::debug!("Cascade SCD data available, resuming execution");
+                        self.status = CoreStatus::Ready;
+                        None
+                    } else {
+                        ctx.record_stall(1);
+                        Some(StepResult::WaitStream { port })
+                    }
+                } else if port == 255 {
+                    // Cascade WRITE stall (sentinel port 255): MCD full.
+                    // Resume only when cascade output has been drained.
+                    if tile.cascade_output.is_empty() {
+                        log::debug!("Cascade MCD drained, resuming execution");
                         self.status = CoreStatus::Ready;
                         None
                     } else {

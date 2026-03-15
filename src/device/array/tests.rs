@@ -206,8 +206,10 @@ fn test_cascade_backpressure() {
     array.tile_mut(1, 2).cascade_input_dir = 0;
     array.tile_mut(1, 2).cascade_output_dir = 0;
 
-    // Fill destination's input FIFO
-    array.tile_mut(1, 2).push_cascade_input([0; 6]);
+    // Fill destination's input FIFO (depth 4)
+    for _ in 0..4 {
+        array.tile_mut(1, 2).push_cascade_input([0; 6]);
+    }
 
     // Push data to source
     let data: [u64; 6] = [42; 6];

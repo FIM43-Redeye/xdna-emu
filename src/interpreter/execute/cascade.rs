@@ -35,8 +35,10 @@ pub struct CascadeOps;
 pub enum CascadeResult {
     /// Operation completed successfully.
     Completed,
-    /// Core must stall (empty SCD read or full MCD write).
-    Stall,
+    /// Core must stall on SCD read (empty input).
+    StallRead,
+    /// Core must stall on MCD write (full output).
+    StallWrite,
     /// Not a cascade operation -- pass to next execution unit.
     NotCascadeOp,
     /// Fatal error in cascade operation.
@@ -69,11 +71,11 @@ impl CascadeOps {
         let data = match tile.pop_cascade_input() {
             Some(d) => d,
             None => {
-                log::info!(
+                log::debug!(
                     "[CASCADE] Read stall: SCD empty (tile {},{}, pc=0x{:X})",
                     tile.col, tile.row, ctx.pc()
                 );
-                return CascadeResult::Stall;
+                return CascadeResult::StallRead;
             }
         };
 
@@ -114,13 +116,16 @@ impl CascadeOps {
         ctx: &mut ExecutionContext,
         tile: &mut Tile,
     ) -> CascadeResult {
-        // Backpressure: if MCD FIFO is full (depth 1), stall
-        if tile.cascade_output.len() >= 1 {
-            log::info!(
+        // Backpressure: if MCD FIFO is full, stall.
+        // Depth 4: hardware has a 2-deep 512-bit FIFO (AM020), and each
+        // VMOV MCD writes one 256-bit half-register, so 4 entries covers
+        // two full accumulator transfers with room for pipeline slack.
+        if tile.cascade_output.len() >= 4 {
+            log::debug!(
                 "[CASCADE] Write stall: MCD full (tile {},{}, pc=0x{:X})",
                 tile.col, tile.row, ctx.pc()
             );
-            return CascadeResult::Stall;
+            return CascadeResult::StallWrite;
         }
 
         // Read source register (vector or accumulator)
@@ -224,7 +229,7 @@ mod tests {
         let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeRead)
             .with_dest(Operand::VectorReg(0));
 
-        assert_eq!(CascadeOps::execute(&op, &mut ctx, &mut tile), CascadeResult::Stall);
+        assert_eq!(CascadeOps::execute(&op, &mut ctx, &mut tile), CascadeResult::StallRead);
     }
 
     #[test]
@@ -301,13 +306,15 @@ mod tests {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
-        // Fill the MCD FIFO (depth 1)
-        tile.push_cascade_output([0; 6]);
+        // Fill the MCD FIFO (depth 4)
+        for _ in 0..4 {
+            tile.push_cascade_output([0; 6]);
+        }
 
         let op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::CascadeWrite)
             .with_source(Operand::VectorReg(0));
 
-        assert_eq!(CascadeOps::execute(&op, &mut ctx, &mut tile), CascadeResult::Stall);
+        assert_eq!(CascadeOps::execute(&op, &mut ctx, &mut tile), CascadeResult::StallWrite);
     }
 
     #[test]

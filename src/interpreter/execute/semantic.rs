@@ -206,9 +206,15 @@ pub(super) fn read_operand(operand: &Operand, ctx: &ExecutionContext) -> u32 {
         Operand::PointerReg(r) => ctx.pointer_read(*r),
         Operand::ModifierReg(r) => ctx.modifier_read(*r),
         Operand::Immediate(v) => *v as u32,
-        Operand::VectorReg(_) | Operand::AccumReg(_) => {
-            // Vector/accum need special handling - return 0 for scalar context
-            0
+        Operand::VectorReg(r) => {
+            // Scalar read of a vector register: extract lane 0 (low 32 bits).
+            // This occurs in VEXTRACT-like patterns where scalar context needs
+            // one element from a vector.
+            ctx.vector.read(*r)[0]
+        }
+        Operand::AccumReg(r) => {
+            // Scalar read of an accumulator: extract lane 0 (low 32 bits).
+            ctx.accumulator.read(*r)[0] as u32
         }
         _ => 0,
     }
@@ -263,11 +269,28 @@ pub(super) fn write_operand(operand: &Operand, ctx: &mut ExecutionContext, value
                 }
             }
         }
-        Operand::VectorReg(_) | Operand::AccumReg(_) => {
-            log::trace!(
-                "[SEMANTIC] Vector/accum register write not yet implemented: {:?}",
-                operand,
+        Operand::VectorReg(r) => {
+            // Scalar write to a vector register: write lane 0, zero-fill rest.
+            // This should be rare -- most vector writes go through VectorAlu.
+            log::warn!(
+                "[SEMANTIC] Scalar write to VectorReg({}): value=0x{:X} -- \
+                 if this fires frequently, check decoder classification",
+                r, value
             );
+            let mut lanes = [0u32; 8];
+            lanes[0] = value;
+            ctx.vector.write(*r, lanes);
+        }
+        Operand::AccumReg(r) => {
+            // Scalar write to an accumulator: write lane 0, zero-fill rest.
+            log::warn!(
+                "[SEMANTIC] Scalar write to AccumReg({}): value=0x{:X} -- \
+                 if this fires frequently, check decoder classification",
+                r, value
+            );
+            let mut lanes = [0u64; 8];
+            lanes[0] = value as u64;
+            ctx.accumulator.write(*r, lanes);
         }
         _ => {
             debug_assert!(

@@ -172,8 +172,8 @@ impl TileArray {
                     continue;
                 }
 
-                // Check backpressure: destination must have room
-                if self.tiles[dst_idx].cascade_input.is_empty() {
+                // Check backpressure: destination SCD FIFO must have room (depth 4).
+                if self.tiles[dst_idx].cascade_input.len() < 4 {
                     transfers.push((idx, dst_col, dst_row));
                 }
             }

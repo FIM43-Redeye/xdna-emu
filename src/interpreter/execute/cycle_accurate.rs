@@ -131,12 +131,13 @@ impl CycleAccurateExecutor {
             return None;
         }
 
-        // Cascade operations: dedicated 384-bit point-to-point link, separate
-        // from the stream switch fabric. Stall returns WaitStream with sentinel
-        // port 255 so the coordinator retries next cycle.
+        // Cascade operations: dedicated point-to-point link, separate from the
+        // stream switch fabric. Stall returns WaitStream with sentinel ports:
+        // port 254 = SCD read stall (empty input), port 255 = MCD write stall (full output).
         match CascadeOps::execute(op, ctx, tile) {
             CascadeResult::Completed => return None,
-            CascadeResult::Stall => return Some(ExecuteResult::WaitStream { port: 255 }),
+            CascadeResult::StallRead => return Some(ExecuteResult::WaitStream { port: 254 }),
+            CascadeResult::StallWrite => return Some(ExecuteResult::WaitStream { port: 255 }),
             CascadeResult::NotCascadeOp => {}
             CascadeResult::Error(msg) => return Some(ExecuteResult::Error { message: msg }),
         }

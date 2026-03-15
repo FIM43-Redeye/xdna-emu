@@ -462,17 +462,66 @@ impl VectorAlu {
     }
 
     /// Read a vector operand value.
+    ///
+    /// Handles both VectorReg (native 256-bit) and AccumReg (truncated from
+    /// 512-bit to 256-bit by taking the low 32 bits of each u64 lane).
+    /// This truncation matches hardware behavior for VMOV x, bml/bmh where
+    /// the 256-bit accumulator half maps directly to 8 x u32 lanes.
     fn read_vector_operand(operand: &Operand, ctx: &ExecutionContext) -> [u32; 8] {
         match operand {
             Operand::VectorReg(r) => ctx.vector.read(*r),
-            _ => [0; 8],
+            Operand::AccumReg(r) => {
+                // Accumulator -> vector: take low 32 bits of each lane.
+                let acc = ctx.accumulator.read(*r);
+                let mut v = [0u32; 8];
+                for i in 0..8 {
+                    v[i] = acc[i] as u32;
+                }
+                v
+            }
+            Operand::Immediate(val) => {
+                // Scalar broadcast into all lanes (for immediate vector operands).
+                [*val as u32; 8]
+            }
+            other => {
+                log::error!(
+                    "[VECTOR] read_vector_operand: unexpected operand {:?} -- \
+                     returning zeros, check decoder",
+                    other
+                );
+                [0; 8]
+            }
         }
     }
 
     /// Write result to vector destination.
+    ///
+    /// Handles both VectorReg (native 256-bit) and AccumReg (widened from
+    /// 256-bit to 512-bit by zero-extending each u32 lane to u64).
     fn write_vector_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: [u32; 8]) {
-        if let Some(Operand::VectorReg(r)) = &op.dest {
-            ctx.vector.write(*r, value);
+        match &op.dest {
+            Some(Operand::VectorReg(r)) => {
+                ctx.vector.write(*r, value);
+            }
+            Some(Operand::AccumReg(r)) => {
+                // Vector -> accumulator: zero-extend each u32 to u64.
+                let mut acc = [0u64; 8];
+                for i in 0..8 {
+                    acc[i] = value[i] as u64;
+                }
+                ctx.accumulator.write(*r, acc);
+            }
+            Some(other) => {
+                log::error!(
+                    "[VECTOR] write_vector_dest: unexpected dest {:?} -- \
+                     result discarded, check decoder",
+                    other
+                );
+            }
+            None => {
+                // Some vector operations have no explicit destination
+                // (e.g., comparison that sets status flags).
+            }
         }
     }
 
@@ -480,7 +529,13 @@ impl VectorAlu {
     fn get_acc_dest(op: &SlotOp) -> u8 {
         match &op.dest {
             Some(Operand::AccumReg(r)) => *r,
-            _ => 0,
+            other => {
+                log::error!(
+                    "[VECTOR] get_acc_dest: expected AccumReg, got {:?} -- defaulting to acc0",
+                    other
+                );
+                0
+            }
         }
     }
 
@@ -503,6 +558,10 @@ impl VectorAlu {
                 return *r;
             }
         }
+        log::error!(
+            "[VECTOR] get_acc_source: no AccumReg found in sources {:?} -- defaulting to acc0",
+            op.sources
+        );
         0
     }
 
