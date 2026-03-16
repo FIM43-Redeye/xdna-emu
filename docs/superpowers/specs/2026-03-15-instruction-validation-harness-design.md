@@ -4,7 +4,7 @@
 
 Validate the emulator's instruction decoder and execution engine against real
 NPU hardware by auto-generating single-instruction test kernels from the
-llvm-aie intrinsic definitions, compiling them with Chess, running on both
+llvm-aie intrinsic definitions, compiling them with Peano, running on both
 HW and EMU, and diffing outputs.
 
 The real NPU is the oracle. We don't compute expected values -- we verify
