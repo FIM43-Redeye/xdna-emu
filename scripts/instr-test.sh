@@ -43,6 +43,7 @@ SEED=42
 FORCE_COMPILE=false
 JOBS=$(nproc)
 GENERATE_ONLY=false
+FAIL_FAST=false
 
 # Collect pass-through args for --both mode
 PASSTHROUGH_ARGS=()
@@ -59,6 +60,7 @@ while [[ $# -gt 0 ]]; do
         --compile)     FORCE_COMPILE=true; PASSTHROUGH_ARGS+=("$1"); shift ;;
         -j)            JOBS="$2"; PASSTHROUGH_ARGS+=("$1" "$2"); shift 2 ;;
         --generate-only) GENERATE_ONLY=true; PASSTHROUGH_ARGS+=("$1"); shift ;;
+        --fail-fast)   FAIL_FAST=true; PASSTHROUGH_ARGS+=("$1"); shift ;;
         *)             echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -189,9 +191,16 @@ compile_one() {
     fi
 }
 export -f compile_one
-export OUT_DIR FORCE_COMPILE PEANO_INSTALL_DIR COMPILER
+export OUT_DIR FORCE_COMPILE PEANO_INSTALL_DIR COMPILER FAIL_FAST
 
-echo "$TESTS" | awk '{print $1}' | xargs -P "$JOBS" -I{} bash -c 'compile_one "$1"' _ {}
+if $FAIL_FAST; then
+    # Serial compilation, abort on first failure
+    while IFS=' ' read -r name _rest; do
+        compile_one "$name" || { echo "FAIL-FAST: aborting after ${name}"; exit 1; }
+    done <<< "$TESTS"
+else
+    echo "$TESTS" | awk '{print $1}' | xargs -P "$JOBS" -I{} bash -c 'compile_one "$1"' _ {}
+fi
 echo ""
 
 # ---- Phase 3: Run HW ----
