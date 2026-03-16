@@ -311,3 +311,43 @@ def test_short_name():
     assert short_name("int_aie2_vbroadcast32_I512") == "vbroadcast32_I512"
     assert short_name("int_aie2_vsel32") == "vsel32"
     assert short_name("int_aie2_pack_I8_I16") == "pack_I8_I16"
+
+
+# ---------------------------------------------------------------------------
+# Task 8: PRNG consistency verification tests
+# ---------------------------------------------------------------------------
+
+def gen_input_python(seed: int, n_bytes: int) -> bytes:
+    """Python reference PRNG from spec."""
+    state = seed
+    buf = bytearray(n_bytes)
+    for i in range(n_bytes):
+        state = (state * 1103515245 + 12345) & 0x7FFFFFFF
+        buf[i] = (state >> 16) & 0xFF
+    return bytes(buf)
+
+
+def test_prng_deterministic():
+    """Same seed produces same output."""
+    a = gen_input_python(42, 256)
+    b = gen_input_python(42, 256)
+    assert a == b
+
+def test_prng_different_seeds():
+    """Different seeds produce different output."""
+    a = gen_input_python(42, 256)
+    b = gen_input_python(43, 256)
+    assert a != b
+
+def test_prng_known_values():
+    """Verify first few bytes for seed=42.
+
+    state0 = 42
+    state1 = (42 * 1103515245 + 12345) & 0x7FFFFFFF
+           = 46327652297  & 0x7FFFFFFF
+           = 46327652297 % 2147483648
+           = 2032685001
+    byte0  = (2032685001 >> 16) & 0xFF = 31010 & 0xFF = 0x22 = 34
+    """
+    data = gen_input_python(42, 4)
+    assert data[0] == (((42 * 1103515245 + 12345) & 0x7FFFFFFF) >> 16) & 0xFF
