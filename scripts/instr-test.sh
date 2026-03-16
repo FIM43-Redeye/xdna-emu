@@ -26,9 +26,9 @@ RESULTS_DIR="/tmp/instr-test-results-$(date +%Y%m%d)"
 
 # mlir-aie paths for host compilation
 MLIR_AIE="${PROJECT_DIR}/../mlir-aie"
-INSTALL_DIR="${MLIR_AIE}/install"
+TEST_LIB_DIR="${MLIR_AIE}/build/runtime_lib/x86_64/test_lib"
 XRT_DIR="/opt/xilinx/xrt"
-PEANO_INSTALL_DIR="/home/triple/npu-work/llvm-aie/install"
+PEANO_INSTALL_DIR="${PROJECT_DIR}/../llvm-aie/install"
 
 # Defaults
 RUN_HW=true
@@ -98,12 +98,12 @@ if $FORCE_COMPILE || [[ ! -f "$HOST_BIN" ]] || [[ "${OUT_DIR}/test_host.cpp" -nt
     echo "Compiling test_host..."
     clang++ "${OUT_DIR}/test_host.cpp" -o "$HOST_BIN" \
         -std=c++17 -Wall \
-        -I "${INSTALL_DIR}/runtime_lib/test_lib" \
+        -I "${TEST_LIB_DIR}/include" \
         -I "${XRT_DIR}/include" \
+        -L "${TEST_LIB_DIR}/lib" \
         -L "${XRT_DIR}/lib" \
-        -lxrt_coreutil \
-        -lrt -lstdc++ \
-        "${INSTALL_DIR}/runtime_lib/test_lib/test_utils.cpp"
+        -ltest_utils -lxrt_coreutil \
+        -lrt -lstdc++
 fi
 
 compile_one() {
