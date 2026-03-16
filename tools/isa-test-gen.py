@@ -266,6 +266,23 @@ def immediate_values(bit_width: int, signed: bool = True) -> list[int]:
 # Task 3: Assembly Test Point Generation
 # ---------------------------------------------------------------------------
 
+def _padda_sequence(ptr_reg: str, base_ptr: str, offset: int) -> list[str]:
+    """Generate pointer arithmetic sequence to reach a large offset.
+
+    PADDA immediate range is 12-bit signed: [-4096, 4095].
+    For larger offsets, emit multiple PADDA instructions.
+    """
+    max_step = 1024  # PADDA accepts up to ~1536; use 1024 for safety
+    lines = [f"  mov {ptr_reg}, {base_ptr}"]
+    remaining = offset
+    while remaining > max_step:
+        lines.append(f"  padda [{ptr_reg}], #{max_step}")
+        remaining -= max_step
+    if remaining > 0:
+        lines.append(f"  padda [{ptr_reg}], #{remaining}")
+    return lines
+
+
 def _scalar_load(reg_name: str, ptr: str, offset: int) -> list[str]:
     """Generate scalar load with pointer arithmetic for large offsets.
 
@@ -274,10 +291,7 @@ def _scalar_load(reg_name: str, ptr: str, offset: int) -> list[str]:
     """
     if 0 <= offset <= MAX_SCALAR_OFFSET:
         return [f"  lda {reg_name}, [{ptr}, #{offset}]"]
-    # Copy base to scratch pointer p6, advance, then load.
-    return [
-        f"  mov p6, {ptr}",
-        f"  padda [p6], #{offset}",
+    return _padda_sequence("p6", ptr, offset) + [
         f"  lda {reg_name}, [p6, #0]",
     ]
 
@@ -289,9 +303,7 @@ def _vector_load(reg_name: str, ptr: str, offset: int) -> list[str]:
     """
     if 0 <= offset <= MAX_VECTOR_OFFSET:
         return [f"  vlda {reg_name}, [{ptr}, #{offset}]"]
-    return [
-        f"  mov p6, {ptr}",
-        f"  padda [p6], #{offset}",
+    return _padda_sequence("p6", ptr, offset) + [
         f"  vlda {reg_name}, [p6, #0]",
     ]
 
@@ -341,9 +353,7 @@ def _scalar_store(reg_name: str, ptr: str, offset: int) -> list[str]:
     """Generate scalar store with pointer arithmetic for large offsets."""
     if 0 <= offset <= MAX_SCALAR_OFFSET:
         return [f"  st {reg_name}, [{ptr}, #{offset}]"]
-    return [
-        f"  mov p7, {ptr}",
-        f"  padda [p7], #{offset}",
+    return _padda_sequence("p7", ptr, offset) + [
         f"  st {reg_name}, [p7, #0]",
     ]
 
@@ -352,9 +362,7 @@ def _vector_store(reg_name: str, ptr: str, offset: int) -> list[str]:
     """Generate vector store with pointer arithmetic for large offsets."""
     if 0 <= offset <= MAX_VECTOR_OFFSET:
         return [f"  vst {reg_name}, [{ptr}, #{offset}]"]
-    return [
-        f"  mov p7, {ptr}",
-        f"  padda [p7], #{offset}",
+    return _padda_sequence("p7", ptr, offset) + [
         f"  vst {reg_name}, [p7, #0]",
     ]
 
@@ -419,7 +427,11 @@ def _substitute_asm(asm_string: str, regs: dict[str, str]) -> str:
     # Sort by length descending to avoid partial substitution
     # (e.g., $mRx before $mRx0 would be wrong -- but $mRx0 before $mRx is fine).
     for name in sorted(regs.keys(), key=len, reverse=True):
-        result = result.replace(f"${name}", regs[name])
+        value = regs[name]
+        # Immediate values (numeric) need # prefix for llvm-mc syntax.
+        if value.lstrip("-").isdigit():
+            value = f"#{value}"
+        result = result.replace(f"${name}", value)
     return result
 
 
