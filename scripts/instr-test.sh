@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # scripts/instr-test.sh -- Instruction-level validation harness runner.
 #
-# Generates single-instruction test kernels from IntrinsicsAIE2.td,
-# compiles them with Peano, runs on real NPU and emulator, diffs outputs.
+# Generates single-instruction test kernels, compiles them, runs on real
+# NPU and emulator, diffs outputs.
 #
 # Usage:
 #   scripts/instr-test.sh [options]
+#
+# Compiler selection:
+#   --peano          Use Peano compiler (default)
+#   --chess          Use Chess compiler (xchesscc)
+#   --both           Run both compilers sequentially
 #
 # Options:
 #   --no-hw          Skip hardware runs (EMU-only, no comparison)
@@ -21,8 +26,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TD_FILE="${PROJECT_DIR}/../llvm-aie/llvm/include/llvm/IR/IntrinsicsAIE2.td"
-OUT_DIR="${PROJECT_DIR}/build/instr-tests"
-RESULTS_DIR="/tmp/instr-test-results-$(date +%Y%m%d)"
+AIETOOLS_DIR="${PROJECT_DIR}/../aietools"
 
 # mlir-aie paths for host compilation
 MLIR_AIE="${PROJECT_DIR}/../mlir-aie"
@@ -31,6 +35,7 @@ XRT_DIR="/opt/xilinx/xrt"
 PEANO_INSTALL_DIR="${PROJECT_DIR}/../llvm-aie/install"
 
 # Defaults
+COMPILER="peano"
 RUN_HW=true
 RUN_EMU=true
 FILTER=""
@@ -39,28 +44,55 @@ FORCE_COMPILE=false
 JOBS=$(nproc)
 GENERATE_ONLY=false
 
+# Collect pass-through args for --both mode
+PASSTHROUGH_ARGS=()
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --no-hw)       RUN_HW=false; shift ;;
-        --no-emu)      RUN_EMU=false; shift ;;
-        --filter)      FILTER="$2"; shift 2 ;;
-        --seed)        SEED="$2"; shift 2 ;;
-        --compile)     FORCE_COMPILE=true; shift ;;
-        -j)            JOBS="$2"; shift 2 ;;
-        --generate-only) GENERATE_ONLY=true; shift ;;
+        --peano)       COMPILER="peano"; shift ;;
+        --chess)       COMPILER="chess"; shift ;;
+        --both)        COMPILER="both"; shift ;;
+        --no-hw)       RUN_HW=false; PASSTHROUGH_ARGS+=("$1"); shift ;;
+        --no-emu)      RUN_EMU=false; PASSTHROUGH_ARGS+=("$1"); shift ;;
+        --filter)      FILTER="$2"; PASSTHROUGH_ARGS+=("$1" "$2"); shift 2 ;;
+        --seed)        SEED="$2"; PASSTHROUGH_ARGS+=("$1" "$2"); shift 2 ;;
+        --compile)     FORCE_COMPILE=true; PASSTHROUGH_ARGS+=("$1"); shift ;;
+        -j)            JOBS="$2"; PASSTHROUGH_ARGS+=("$1" "$2"); shift 2 ;;
+        --generate-only) GENERATE_ONLY=true; PASSTHROUGH_ARGS+=("$1"); shift ;;
         *)             echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
+# --both: re-invoke self for each compiler, then exit
+if [[ "$COMPILER" == "both" ]]; then
+    echo "=== Running Peano path ==="
+    "$0" --peano "${PASSTHROUGH_ARGS[@]}"
+    echo ""
+    echo "=== Running Chess path ==="
+    "$0" --chess "${PASSTHROUGH_ARGS[@]}"
+    exit $?
+fi
+
+# Set paths based on compiler choice
+OUT_DIR="${PROJECT_DIR}/build/instr-tests-${COMPILER}"
+RESULTS_DIR="/tmp/instr-test-results-$(date +%Y%m%d)-${COMPILER}"
+
 echo "=== Instruction-Level Validation Harness ==="
-echo "TD file:  $TD_FILE"
+echo "Compiler: $COMPILER"
 echo "Out dir:  $OUT_DIR"
 echo "Results:  $RESULTS_DIR"
 echo ""
 
 # ---- Phase 1: Generate ----
 echo "--- Phase 1: Generate ---"
-python3 "${PROJECT_DIR}/tools/instr-test-gen.py" --td "$TD_FILE" --out-dir "$OUT_DIR"
+if [[ "$COMPILER" == "chess" ]]; then
+    python3 "${PROJECT_DIR}/tools/chess-test-gen.py" \
+        --opns-header "${AIETOOLS_DIR}/data/aie_ml/lib/isg/me_chess_opns.h" \
+        --types-header "${AIETOOLS_DIR}/data/aie_ml/lib/isg/me_chess_types.h" \
+        --out-dir "$OUT_DIR"
+else
+    python3 "${PROJECT_DIR}/tools/instr-test-gen.py" --td "$TD_FILE" --out-dir "$OUT_DIR"
+fi
 echo ""
 
 if $GENERATE_ONLY; then
@@ -115,29 +147,49 @@ compile_one() {
         return 0
     fi
 
-    echo "  Compiling ${name}..."
+    echo "  Compiling ${name} [${COMPILER}]..."
 
-    # Compile kernel with Peano
-    (cd "$test_dir" && \
-        nice -n 19 "${PEANO_INSTALL_DIR}/bin/clang++" \
-            --target=aie2-none-unknown-elf -O2 \
-            -c kernel.cc -o kernel.o 2>"${test_dir}/peano.log") || {
-        echo "  FAIL compile peano: ${name}"
-        return 1
-    }
+    if [[ "$COMPILER" == "chess" ]]; then
+        # Compile kernel with Chess
+        (cd "$test_dir" && \
+            nice -n 19 xchesscc_wrapper aie2 \
+                -c kernel.cc -o kernel.o 2>"${test_dir}/chess.log") || {
+            echo "  FAIL compile chess: ${name}"
+            return 1
+        }
 
-    # Compile MLIR -> xclbin + insts.bin
-    (cd "$test_dir" && \
-        nice -n 19 aiecc.py --no-aiesim --no-xchesscc --no-xbridge \
-            --aie-generate-xclbin --xclbin-name=aie.xclbin \
-            --aie-generate-npu-insts --npu-insts-name=insts.bin \
-            aie.mlir 2>"${test_dir}/aiecc.log") || {
-        echo "  FAIL compile aiecc: ${name}"
-        return 1
-    }
+        # Compile MLIR -> xclbin + insts.bin (Chess linker)
+        (cd "$test_dir" && \
+            nice -n 19 aiecc.py --no-aiesim --xchesscc --xbridge \
+                --aie-generate-xclbin --xclbin-name=aie.xclbin \
+                --aie-generate-npu-insts --npu-insts-name=insts.bin \
+                aie.mlir 2>"${test_dir}/aiecc.log") || {
+            echo "  FAIL compile aiecc: ${name}"
+            return 1
+        }
+    else
+        # Compile kernel with Peano
+        (cd "$test_dir" && \
+            nice -n 19 "${PEANO_INSTALL_DIR}/bin/clang++" \
+                --target=aie2-none-unknown-elf -O2 \
+                -c kernel.cc -o kernel.o 2>"${test_dir}/peano.log") || {
+            echo "  FAIL compile peano: ${name}"
+            return 1
+        }
+
+        # Compile MLIR -> xclbin + insts.bin (Peano linker)
+        (cd "$test_dir" && \
+            nice -n 19 aiecc.py --no-aiesim --no-xchesscc --no-xbridge \
+                --aie-generate-xclbin --xclbin-name=aie.xclbin \
+                --aie-generate-npu-insts --npu-insts-name=insts.bin \
+                aie.mlir 2>"${test_dir}/aiecc.log") || {
+            echo "  FAIL compile aiecc: ${name}"
+            return 1
+        }
+    fi
 }
 export -f compile_one
-export OUT_DIR FORCE_COMPILE PEANO_INSTALL_DIR
+export OUT_DIR FORCE_COMPILE PEANO_INSTALL_DIR COMPILER
 
 echo "$TESTS" | awk '{print $1}' | xargs -P "$JOBS" -I{} bash -c 'compile_one "$1"' _ {}
 echo ""
