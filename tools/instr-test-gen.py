@@ -124,8 +124,9 @@ def _add(llvm: str, c: str, size: int, is_vec: bool):
 
 # Scalars
 _add("llvm_i32_ty",      "int32_t",       4,  False)
-_add("llvm_i64_ty",      "int64_t",       8,  False)
-_add("llvm_v2i32_ty",    "int64_t",       8,  False)  # alias
+# llvm_i64_ty and llvm_v2i32_ty excluded: Peano ABI uses v2int32 (vector)
+# for these at the Clang level, but LLVM IR type is i64/v2i32. The type
+# ambiguity causes compile failures. Exclude from initial scope.
 _add("llvm_bfloat_ty",   "bfloat16",      2,  False)
 _add("llvm_float_ty",    "float",         4,  False)
 
@@ -169,6 +170,13 @@ INFRA_PATTERNS = re.compile(
     r"acquire|release|lock|event|done)"
 )
 
+# Intrinsic name patterns for sub-vector extract/insert/update operations.
+# These require compile-time constant index arguments that cannot be filled
+# from a runtime input buffer.
+CONST_IDX_PATTERNS = re.compile(
+    r"int_aie2_(ext_|set_|upd_|extract_I128|set_I512)"
+)
+
 
 def classify_intrinsic(
     defn: IntrinsicDef,
@@ -197,6 +205,10 @@ def classify_intrinsic(
     # Cascade/stream/lock infrastructure
     if INFRA_PATTERNS.search(defn.name):
         return ("skipped", "cascade/stream/lock (needs hardware infrastructure)")
+
+    # Sub-vector extract/insert/update need compile-time constant index
+    if CONST_IDX_PATTERNS.search(defn.name):
+        return ("skipped", "ext/set/upd (needs compile-time constant index)")
 
     # Multi-return -> out of scope
     if len(class_def.ret_types) > 1:

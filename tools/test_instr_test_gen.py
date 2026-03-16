@@ -132,6 +132,9 @@ def test_map_bfloat_vector():
 def test_map_unknown_returns_none():
     assert map_llvm_type("llvm_i128_ty") is None
     assert map_llvm_type("llvm_token_ty") is None
+    # i64/v2i32 excluded: Peano ABI ambiguity (scalar vs v2int32)
+    assert map_llvm_type("llvm_i64_ty") is None
+    assert map_llvm_type("llvm_v2i32_ty") is None
 
 
 # ---------------------------------------------------------------------------
