@@ -295,10 +295,13 @@ impl VectorAlu {
             SemanticOp::VectorSelect => {
                 // VSEL.32 d, s1, s2, sel: per-lane conditional select.
                 // input_order is [s1, s2, sel] where sel is a scalar register
-                // whose bits select per-element: d[i] = (sel >> i) & 1 ? s1[i] : s2[i]
+                // whose bits control per-element selection.
                 //
-                // The scalar sel mask is expanded to a per-lane vector mask based
-                // on element type: 32-bit uses bits 0-7, 16-bit uses bits 0-15, etc.
+                // Hardware semantics (aietools aie_api select documentation):
+                //   d[i] = (sel >> i) & 1 == 0 ? s1[i] : s2[i]
+                //
+                // When sel bit is 0: take from s1 (first vector source).
+                // When sel bit is 1: take from s2 (second vector source).
                 let s1 = Self::get_vector_source(op, ctx, 0);
                 let s2 = Self::get_vector_source(op, ctx, 1);
                 // Read the scalar select mask from the last source operand
@@ -307,9 +310,12 @@ impl VectorAlu {
                     Operand::Immediate(v) => *v as u32,
                     _ => Self::get_scalar_source(op, ctx),
                 }).unwrap_or(0);
-                // Expand scalar mask to per-lane vector mask
+                // Expand scalar mask to per-lane vector mask.
                 let sel = Self::expand_select_mask(sel_scalar, et);
-                let result = Self::vector_select(&sel, &s1, &s2, et);
+                // vector_select does: mask != 0 ? arg1 : arg2
+                // Hardware wants: mask != 0 ? s2 : s1
+                // So pass s2 as arg1 and s1 as arg2.
+                let result = Self::vector_select(&sel, &s2, &s1, et);
                 log::debug!(
                     "[VSEL] sel_scalar=0x{:X} sel={:?} s1={:?} s2={:?} -> {:?} (sources={:?}, dest={:?})",
                     sel_scalar, sel, s1, s2, result, op.sources, op.dest

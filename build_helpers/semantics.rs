@@ -35,6 +35,7 @@ pub fn classify_operand_type(reg_class: &str, field_name: &str) -> String {
         ("OP_mMcdSrc", "CompositeEncoder::MvBMXDst"),
         ("OP_mScdDst", "CompositeEncoder::MvBMXDst"),
         ("OP_eRS4", "CompositeEncoder::ERS4"),
+        ("OP_mRS4m", "CompositeEncoder::ERS4"),
         ("OP_mShflDst", "CompositeEncoder::ShflDst"),
         ("OP_mWm_1", "CompositeEncoder::Wm1"),
         ("OP_mQXHLb", "CompositeEncoder::QXHLb"),
@@ -59,12 +60,18 @@ pub fn classify_operand_type(reg_class: &str, field_name: &str) -> String {
     // eRS4 = r16-r19 (4 regs, 2-bit index, base=16)
     // eRS8 = r16-r23 (8 regs, 3-bit index, base=16)
     // eR29 = r29 only (fixed register, base=29)
-    // eL = link register (r15, base=15)
+    // eL = GPR pairs l0-l7 (64-bit, l0=r16:r17, l1=r18:r19, ...).
+    //   Used only by VSEL_8 as 64-bit select mask. Treat as scalar with
+    //   base=16 since l_i maps to r(16+2*i):r(16+2*i+1) and the select
+    //   mask is read as a scalar value from the pair's even register.
+    // eS = shift registers s0-s3 (scalar, 2-bit index, base=0).
+    //   Used by VSRS, VUPS, VSHIFT_ALIGN as shift amount operand.
     match reg_class {
         "eRS4" => return "OperandType::RegisterWithOffset(RegisterKind::Scalar, 16)".to_string(),
         "eRS8" => return "OperandType::RegisterWithOffset(RegisterKind::Scalar, 16)".to_string(),
         "eR29" => return "OperandType::RegisterWithOffset(RegisterKind::Scalar, 29)".to_string(),
-        "eL" => return "OperandType::RegisterWithOffset(RegisterKind::Scalar, 15)".to_string(),
+        "eL" => return "OperandType::RegisterWithOffset(RegisterKind::Scalar, 16)".to_string(),
+        "eS" => return "OperandType::Register(RegisterKind::Scalar)".to_string(),
         _ => {}
     }
     // Generic eR* subclasses: treat as base scalar (no offset)
@@ -95,9 +102,12 @@ pub fn classify_operand_type(reg_class: &str, field_name: &str) -> String {
     {
         return "OperandType::Register(RegisterKind::Accumulator)".to_string();
     }
-    // Stream/cascade register classes (mSs = stream source, mSd = stream dest)
+    // Shift register classes: mSs contains shift registers s0-s3 (scalar).
+    // Used by VSRS, VUPS, VSHIFT_ALIGN for shift amount operands.
+    // NOT stream registers despite the "mS" prefix -- the "m" prefix is
+    // llvm-aie's naming convention for "machine" register classes.
     if reg_class.starts_with("mS") {
-        return "OperandType::Register(RegisterKind::Vector512)".to_string();
+        return "OperandType::Register(RegisterKind::Scalar)".to_string();
     }
     // Modifier register subclasses
     if reg_class.starts_with("eD") || reg_class.starts_with("eM") {
