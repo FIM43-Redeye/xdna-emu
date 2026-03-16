@@ -138,6 +138,7 @@ fn format_encoding(code: &mut String, enc: &BuildInstrEncoding) {
     writeln!(code, "        InstrEncoding {{").unwrap();
     writeln!(code, "            name: {:?}.to_string(),", enc.name).unwrap();
     writeln!(code, "            mnemonic: {:?}.to_string(),", enc.mnemonic).unwrap();
+    writeln!(code, "            asm_string: {:?}.to_string(),", enc.asm_string).unwrap();
     writeln!(code, "            slot: {:?}.to_string(),", enc.slot).unwrap();
     writeln!(code, "            width: {},", enc.width).unwrap();
     writeln!(code, "            fixed_mask: 0x{:X},", enc.fixed_mask).unwrap();

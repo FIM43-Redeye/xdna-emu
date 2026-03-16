@@ -447,6 +447,9 @@ pub struct InstrEncoding {
     /// Assembly mnemonic (e.g., "add", "lda")
     pub mnemonic: String,
 
+    /// Assembly format string (e.g., "$mRx, $mRx0, $mRy")
+    pub asm_string: String,
+
     /// Slot this instruction belongs to (e.g., "alu", "lda")
     pub slot: String,
 
@@ -730,6 +733,7 @@ impl<'a> Resolver<'a> {
         Ok(InstrEncoding {
             name: instr.name.clone(),
             mnemonic: instr.mnemonic.clone(),
+            asm_string: String::new(),
             slot: slot.field.clone(),
             width: slot.bits,
             fixed_mask,

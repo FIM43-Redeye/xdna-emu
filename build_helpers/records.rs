@@ -120,6 +120,7 @@ pub struct BuildInstrRecord {
 pub struct BuildInstrEncoding {
     pub name: String,
     pub mnemonic: String,
+    pub asm_string: String,
     pub slot: String,
     pub width: u8,
     pub fixed_mask: u64,

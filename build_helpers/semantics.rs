@@ -493,6 +493,7 @@ impl BuildInstrRecord {
         Some(BuildInstrEncoding {
             name: self.name.clone(),
             mnemonic: self.mnemonic.clone(),
+            asm_string: self.asm_string.clone(),
             slot: slot.to_string(),
             width: enc.width,
             fixed_mask,

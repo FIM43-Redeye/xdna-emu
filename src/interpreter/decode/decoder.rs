@@ -1568,6 +1568,7 @@ mod tests {
             InstrEncoding {
                 name: format!("TEST_LOAD_{}", slot),
                 mnemonic: if is_vector { format!("v{}", slot) } else { slot.to_string() },
+                asm_string: String::new(),
                 slot: slot.to_string(),
                 width: 20,
                 fixed_mask: 0,
@@ -1652,6 +1653,7 @@ mod tests {
         let padd_enc = InstrEncoding {
             name: "PADD_test".to_string(),
             mnemonic: "padd".to_string(),
+            asm_string: String::new(),
             slot: "alu".to_string(),
             width: 20,
             fixed_mask: 0,
@@ -1777,6 +1779,7 @@ mod tests {
         InstrEncoding {
             name: mnemonic.to_uppercase().replace('.', "_"),
             mnemonic: mnemonic.to_string(),
+            asm_string: String::new(),
             slot: "vec".to_string(),
             width: 26,
             fixed_mask: 0,
