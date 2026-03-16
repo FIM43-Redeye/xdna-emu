@@ -266,6 +266,13 @@ def classify_chess_intrinsic(i: ChessIntrinsic) -> tuple[str, str]:
         if i.name.startswith(prefix):
             return ("skipped", f"name prefix: {prefix}")
 
+    # 6. _conf functions require immediate (compile-time constant) operands
+    # that cannot be loaded from a buffer at runtime.  The non-_conf variants
+    # test the same hardware operations with default config values.
+    # Future: hardcode common config values (0, 1) to test these.
+    if "_conf" in i.name:
+        return ("skipped", "immediate operand required (_conf function)")
+
     return ("generated", "")
 
 
@@ -456,11 +463,31 @@ def generate_all(
 
     os.makedirs(out_dir, exist_ok=True)
 
+    # Types that xchesscc knows natively: chessTraitsOf types + C builtins.
+    # Functions using types outside this set (ISS-internal types like w32,
+    # mmode_t, pmode_t) cannot be compiled by xchesscc and are skipped.
+    from chess_type_stubs import BUILTIN_C_TYPES, parse_chess_traits
+    chess_native_types = set(parse_chess_traits(types_text).keys()) | BUILTIN_C_TYPES
+
     for i in intrinsics:
         status, reason = classify_chess_intrinsic(i)
         if status == "skipped":
             skipped.append(SkippedChessIntrinsic(
                 name=i.name, namespace=i.namespace, reason=reason,
+            ))
+            continue
+
+        # Skip functions using ISS-internal types that xchesscc cannot
+        # compile (w32, mmode_t, pmode_t, etc.).  These are hardware
+        # primitives not callable from user code.  Future: dedicated
+        # ISS-level test harness with proper type support.
+        all_types = [ptype for ptype, _, _ in i.params] + [i.return_type]
+        iss_only = [t for t in all_types
+                    if t not in chess_native_types and t != "void"]
+        if iss_only:
+            skipped.append(SkippedChessIntrinsic(
+                name=i.name, namespace=i.namespace,
+                reason=f"ISS-internal type(s): {', '.join(sorted(set(iss_only)))}",
             ))
             continue
 

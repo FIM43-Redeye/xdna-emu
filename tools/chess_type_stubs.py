@@ -102,6 +102,22 @@ def parse_iss_property_comments(text: str) -> dict[str, int]:
     return types
 
 
+def parse_all_types(
+    types_text: str,
+    iss_text: str | None = None,
+) -> dict[str, int]:
+    """Parse chessTraitsOf types and optionally merge ISS property types.
+
+    ISS types fill gaps only -- chessTraitsOf takes precedence.
+    """
+    traits = parse_chess_traits(types_text)
+    if iss_text is not None:
+        iss_types = parse_iss_property_comments(iss_text)
+        for name, bits in iss_types.items():
+            traits.setdefault(name, bits)
+    return traits
+
+
 def parse_chess_traits(text: str) -> dict[str, int]:
     """Parse chessTraitsOf<T> specializations, returning {type_name: bits}.
 
@@ -166,7 +182,6 @@ def generate_stub_header(traits: dict[str, int]) -> str:
     """
     lines = [
         "// Auto-generated type stubs for clang.cindex parsing of me_chess_opns.h",
-        "// Source: me_chess_types.h chessTraitsOf<T> specializations",
         "// DO NOT EDIT -- regenerate with: python3 tools/chess_type_stubs.py",
         "",
         "#pragma once",
@@ -174,8 +189,10 @@ def generate_stub_header(traits: dict[str, int]) -> str:
         "",
     ]
 
+    skip = BUILTIN_C_TYPES
+
     for type_name, bits in sorted(traits.items()):
-        if type_name in BUILTIN_C_TYPES:
+        if type_name in skip:
             continue
         # Round up to at least 1 byte; most types are byte-aligned but
         # ISS types like u1 (1 bit) and pmode_t (26 bits) are not.
@@ -209,13 +226,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    text = Path(args.types_header).read_text()
-    traits = parse_chess_traits(text)
-    if args.iss_types_header:
-        iss_text = Path(args.iss_types_header).read_text()
-        iss_types = parse_iss_property_comments(iss_text)
-        for name, bits in iss_types.items():
-            traits.setdefault(name, bits)
+    types_text = Path(args.types_header).read_text()
+    iss_text = Path(args.iss_types_header).read_text() if args.iss_types_header else None
+    traits = parse_all_types(types_text, iss_text)
     header = generate_stub_header(traits)
 
     if args.output:
