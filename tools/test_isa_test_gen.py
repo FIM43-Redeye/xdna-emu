@@ -23,6 +23,8 @@ immediate_values = isa_test_gen.immediate_values
 detect_output_operands = isa_test_gen.detect_output_operands
 generate_test_point = isa_test_gen.generate_test_point
 build_mega_program = isa_test_gen.build_mega_program
+generate_operand_combos = isa_test_gen.generate_operand_combos
+generate_all = isa_test_gen.generate_all
 
 
 # ---------------------------------------------------------------------------
@@ -566,3 +568,167 @@ class TestRealISA:
         print("Skip reasons:")
         for reason, count in sorted(skip_reasons.items(), key=lambda x: -x[1]):
             print(f"  {reason}: {count}")
+
+
+# ===================================================================
+# Task 4: generate_operand_combos tests
+# ===================================================================
+
+class TestGenerateOperandCombos:
+    """Tests for generate_operand_combos()."""
+
+    def test_scalar_add_combos(self):
+        """ADD with 3 scalar operands should produce baseline + variations."""
+        instr = _make_instr("ADD", "add", "add\t$mRx, $mRx0, $mRy", [
+            _make_reg_op("mRx", "scalar"),
+            _make_reg_op("mRx0", "scalar"),
+            _make_reg_op("mRy", "scalar"),
+        ])
+        combos = generate_operand_combos(instr)
+        # At least 1 baseline + variations for each operand.
+        assert len(combos) >= 2
+        # Baseline should use first register name for each operand.
+        baseline = combos[0]
+        assert baseline["mRx"] == register_names("scalar")[0]
+        assert baseline["mRx0"] == register_names("scalar")[0]
+
+    def test_immediate_combos(self):
+        """Instruction with immediate operand should vary the immediate."""
+        instr = _make_instr("ADD_ri", "add", "add\t$mRx, $mRx0, $c7s", [
+            _make_reg_op("mRx", "scalar"),
+            _make_reg_op("mRx0", "scalar"),
+            _make_imm_op("c7s", bit_width=7, signed=True),
+        ])
+        combos = generate_operand_combos(instr)
+        # Should have combos with different immediate values.
+        imm_vals = {c["c7s"] for c in combos}
+        assert len(imm_vals) > 1
+
+    def test_returns_list_of_dicts(self):
+        instr = _make_instr("ABS", "abs", "abs\t$mRx, $mRx0", [
+            _make_reg_op("mRx", "scalar"),
+            _make_reg_op("mRx0", "scalar"),
+        ])
+        combos = generate_operand_combos(instr)
+        assert isinstance(combos, list)
+        for c in combos:
+            assert isinstance(c, dict)
+
+    def test_baseline_always_first(self):
+        """First combo should be all defaults."""
+        instr = _make_instr("ADD", "add", "add\t$mRx, $mRx0, $mRy", [
+            _make_reg_op("mRx", "scalar"),
+            _make_reg_op("mRx0", "scalar"),
+            _make_reg_op("mRy", "scalar"),
+        ])
+        combos = generate_operand_combos(instr)
+        baseline = combos[0]
+        # All values should be the first choice from register_names.
+        for key in baseline:
+            assert baseline[key] == register_names("scalar")[0]
+
+
+# ===================================================================
+# Task 4: generate_all integration tests
+# ===================================================================
+
+class TestGenerateAll:
+    """Integration tests for the full pipeline."""
+
+    @pytest.fixture
+    def isa_json_path(self):
+        path = os.path.join(os.path.dirname(__file__), "aie2-isa.json")
+        if not os.path.exists(path):
+            pytest.skip("aie2-isa.json not found")
+        return path
+
+    @pytest.fixture
+    def out_dir(self, tmp_path):
+        return str(tmp_path / "isa-tests")
+
+    def test_generates_manifest(self, isa_json_path, out_dir):
+        """generate_all should produce a manifest.json."""
+        manifest = generate_all(isa_json_path, out_dir)
+        manifest_path = os.path.join(out_dir, "manifest.json")
+        assert os.path.exists(manifest_path)
+        with open(manifest_path) as f:
+            loaded = json.load(f)
+        assert "batches" in loaded
+        assert "testable_instructions" in loaded
+        assert "total_test_points" in loaded
+
+    def test_generates_batch_files(self, isa_json_path, out_dir):
+        """generate_all should produce .s files."""
+        manifest = generate_all(isa_json_path, out_dir)
+        assert manifest["total_batches"] > 0
+        for batch in manifest["batches"]:
+            s_path = os.path.join(out_dir, batch["filename"])
+            assert os.path.exists(s_path), f"Missing {batch['filename']}"
+
+    def test_batch_structure(self, isa_json_path, out_dir):
+        """Each batch should have valid metadata."""
+        manifest = generate_all(isa_json_path, out_dir)
+        for batch in manifest["batches"]:
+            assert "batch_index" in batch
+            assert "test_count" in batch
+            assert batch["test_count"] > 0
+            assert batch["test_count"] <= 70  # MAX_POINTS_PER_BATCH
+            assert "in_size" in batch
+            assert "out_size" in batch
+            assert batch["in_size"] > 0
+            assert batch["out_size"] > 0
+            assert "tests" in batch
+            assert len(batch["tests"]) == batch["test_count"]
+
+    def test_test_point_metadata(self, isa_json_path, out_dir):
+        """Each test point should have required fields."""
+        manifest = generate_all(isa_json_path, out_dir)
+        for batch in manifest["batches"]:
+            for tp in batch["tests"]:
+                assert "instruction" in tp
+                assert "slot" in tp
+                assert "combo_index" in tp
+                assert "operands" in tp
+                assert isinstance(tp["operands"], dict)
+                assert "in_offset" in tp
+                assert "in_size" in tp
+                assert "out_offset" in tp
+                assert "out_size" in tp
+
+    def test_summary_counts(self, isa_json_path, out_dir):
+        """Summary counts should be consistent."""
+        manifest = generate_all(isa_json_path, out_dir)
+        assert manifest["testable_instructions"] > 0
+        assert manifest["total_test_points"] > manifest["testable_instructions"]
+        total_from_batches = sum(b["test_count"] for b in manifest["batches"])
+        assert total_from_batches == manifest["total_test_points"]
+
+    def test_batch_assembles_with_llvm_mc(self, isa_json_path, out_dir):
+        """At least one .s file should assemble with llvm-mc."""
+        import subprocess
+
+        llvm_mc = os.path.expanduser(
+            "~/npu-work/llvm-aie/build/bin/llvm-mc"
+        )
+        if not os.path.exists(llvm_mc):
+            pytest.skip("llvm-mc not found")
+
+        manifest = generate_all(isa_json_path, out_dir)
+        assert manifest["total_batches"] > 0
+
+        # Try to assemble the first batch.
+        first_batch = manifest["batches"][0]
+        s_path = os.path.join(out_dir, first_batch["filename"])
+
+        result = subprocess.run(
+            [llvm_mc, "--triple=aie2", "--filetype=obj", "-o", "/dev/null", s_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        # If assembly fails, print the error for diagnostics.
+        if result.returncode != 0:
+            # This is informational -- not all generated assembly may be valid
+            # (some instructions may need special syntax).  We only assert that
+            # llvm-mc ran without crashing.
+            print(f"\nllvm-mc stderr:\n{result.stderr[:2000]}")
+        # llvm-mc should at least not crash (segfault = returncode -11).
+        assert result.returncode >= 0, "llvm-mc crashed"

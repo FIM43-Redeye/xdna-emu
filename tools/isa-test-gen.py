@@ -530,6 +530,241 @@ def build_mega_program(test_points: list[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Task 4: Operand Combination Generation
+# ---------------------------------------------------------------------------
+
+def generate_operand_combos(instr: dict) -> list[dict[str, str]]:
+    """Generate multiple operand assignments for an instruction.
+
+    For each operand, picks a default register/value, then varies one
+    operand at a time through its alternatives.  This produces a baseline
+    combo plus N combos (one per operand variation).
+
+    Returns:
+        List of dicts mapping operand name -> concrete register/value string.
+    """
+    operands = instr.get("operands", [])
+    asm_op_names = re.findall(r'\$(\w+)', instr.get("asm_string", ""))
+    op_by_name = {op["name"]: op for op in operands}
+    outputs = detect_output_operands(instr)
+    output_names = {op["name"] for op in outputs}
+
+    # Build default assignment and per-operand alternatives.
+    defaults: dict[str, str] = {}
+    alternatives: dict[str, list[str]] = {}
+
+    for op_name in asm_op_names:
+        if op_name not in op_by_name:
+            continue
+        op = op_by_name[op_name]
+        op_type = op.get("operand_type", "")
+
+        if op_type == "register":
+            kind = op.get("register_kind", "")
+            names = register_names(kind)
+            if not names:
+                defaults[op_name] = "r0"
+                alternatives[op_name] = []
+                continue
+            defaults[op_name] = names[0]
+            alternatives[op_name] = names[1:]
+
+        elif op_type == "immediate":
+            bit_width = op.get("bit_width", 8)
+            signed = op.get("signed", True)
+            vals = immediate_values(bit_width, signed)
+            if not vals:
+                defaults[op_name] = "0"
+                alternatives[op_name] = []
+                continue
+            defaults[op_name] = str(vals[0])
+            alternatives[op_name] = [str(v) for v in vals[1:]]
+
+        else:
+            defaults[op_name] = "0"
+            alternatives[op_name] = []
+
+    # Baseline combo: all defaults.
+    combos = [dict(defaults)]
+
+    # One-at-a-time variations: for each operand, try each alternative
+    # while keeping all others at default.
+    for op_name, alts in alternatives.items():
+        for alt_val in alts:
+            combo = dict(defaults)
+            combo[op_name] = alt_val
+            combos.append(combo)
+
+    return combos
+
+
+# ---------------------------------------------------------------------------
+# Task 4: Test Point Metadata
+# ---------------------------------------------------------------------------
+
+def _compute_input_size(instr: dict, regs: dict[str, str]) -> int:
+    """Compute total input buffer size for a test point."""
+    operands = instr.get("operands", [])
+    op_by_name = {op["name"]: op for op in operands}
+    outputs = detect_output_operands(instr)
+    output_names = {op["name"] for op in outputs}
+    asm_op_names = re.findall(r'\$(\w+)', instr.get("asm_string", ""))
+
+    total = 0
+    for op_name in asm_op_names:
+        if op_name in output_names:
+            continue
+        if op_name not in op_by_name:
+            continue
+        op = op_by_name[op_name]
+        if op["operand_type"] != "register":
+            continue
+        kind = op.get("register_kind", "")
+        if kind not in KNOWN_REGISTER_KINDS:
+            continue
+        total += REGISTER_SIZES.get(kind, 4)
+    return max(4, total)
+
+
+def _compute_output_size(instr: dict) -> int:
+    """Compute total output buffer size for a test point."""
+    outputs = detect_output_operands(instr)
+    total = 0
+    for op in outputs:
+        kind = op.get("register_kind", "")
+        total += REGISTER_SIZES.get(kind, 4)
+    return max(4, total)
+
+
+# ---------------------------------------------------------------------------
+# Task 4: Full Pipeline
+# ---------------------------------------------------------------------------
+
+# Maximum test points per batch.  16KB program memory / 16-byte VLIW bundle
+# gives 1024 bundles.  Each test point uses ~15 bundles (5 NOP + 1 instr +
+# 5 NOP + ~2 load + ~2 store).  Conservative limit: 70.
+MAX_POINTS_PER_BATCH = 70
+
+
+def generate_all(isa_json_path: str, out_dir: str) -> dict:
+    """Full pipeline: classify, generate combos, batch, write .s + manifest.
+
+    Args:
+        isa_json_path: Path to aie2-isa.json.
+        out_dir: Directory to write batch_NNN.s files and manifest.json.
+
+    Returns:
+        Summary dict with counts and batch info.
+    """
+    with open(isa_json_path) as f:
+        isa_data = json.load(f)
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Flatten across slots.
+    all_instrs = []
+    for slot, instrs in isa_data.items():
+        for instr in instrs:
+            all_instrs.append(instr)
+
+    # Classify and generate combos.
+    testable_count = 0
+    skipped_count = 0
+    skip_reasons: dict[str, int] = {}
+    test_points_meta: list[dict] = []  # per-test-point metadata
+    test_points_asm: list[str] = []    # generated assembly strings
+
+    # Track running offsets across all test points (reset per batch later).
+    global_in_offset = 0
+    global_out_offset = 0
+
+    for instr in all_instrs:
+        status, reason = classify_instruction(instr)
+        if status != "testable":
+            skipped_count += 1
+            skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+            continue
+
+        testable_count += 1
+        combos = generate_operand_combos(instr)
+
+        for combo_idx, regs in enumerate(combos):
+            in_size = _compute_input_size(instr, regs)
+            out_size = _compute_output_size(instr)
+
+            asm = generate_test_point(
+                instr, regs,
+                in_offset=global_in_offset,
+                out_offset=global_out_offset,
+            )
+            test_points_asm.append(asm)
+            test_points_meta.append({
+                "instruction": instr["name"],
+                "slot": instr.get("slot", ""),
+                "combo_index": combo_idx,
+                "operands": regs,
+                "in_offset": global_in_offset,
+                "in_size": in_size,
+                "out_offset": global_out_offset,
+                "out_size": out_size,
+            })
+
+            global_in_offset += in_size
+            global_out_offset += out_size
+
+    # Batch test points into mega-programs.
+    batches = []
+    batch_idx = 0
+    i = 0
+    while i < len(test_points_asm):
+        end = min(i + MAX_POINTS_PER_BATCH, len(test_points_asm))
+        batch_asm = test_points_asm[i:end]
+        batch_meta = test_points_meta[i:end]
+
+        # Compute batch-level buffer sizes from constituent test points.
+        batch_in_size = 0
+        batch_out_size = 0
+        for m in batch_meta:
+            batch_in_size = max(batch_in_size, m["in_offset"] + m["in_size"])
+            batch_out_size = max(batch_out_size, m["out_offset"] + m["out_size"])
+
+        # Write .s file.
+        filename = f"batch_{batch_idx:03d}.s"
+        filepath = os.path.join(out_dir, filename)
+        program = build_mega_program(batch_asm)
+        with open(filepath, "w") as f:
+            f.write(program)
+
+        batches.append({
+            "batch_index": batch_idx,
+            "filename": filename,
+            "test_count": len(batch_asm),
+            "in_size": batch_in_size,
+            "out_size": batch_out_size,
+            "tests": batch_meta,
+        })
+
+        batch_idx += 1
+        i = end
+
+    # Write manifest.json.
+    manifest = {
+        "testable_instructions": testable_count,
+        "skipped_instructions": skipped_count,
+        "total_test_points": len(test_points_asm),
+        "total_batches": len(batches),
+        "skip_reasons": skip_reasons,
+        "batches": batches,
+    }
+    manifest_path = os.path.join(out_dir, "manifest.json")
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+        f.write("\n")
+
+    return manifest
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -541,52 +776,67 @@ def main():
         description="Generate assembly test programs from aie2-isa.json",
     )
     parser.add_argument(
-        "--isa",
+        "--isa-json",
         default=os.path.join(os.path.dirname(__file__), "aie2-isa.json"),
         help="Path to aie2-isa.json (default: tools/aie2-isa.json)",
     )
     parser.add_argument(
+        "--out-dir",
+        default="build/isa-tests",
+        help="Output directory for .s files and manifest (default: build/isa-tests)",
+    )
+    parser.add_argument(
         "--summary",
         action="store_true",
-        help="Print classification summary and exit",
+        help="Print classification summary only (no file generation)",
     )
     args = parser.parse_args()
 
-    with open(args.isa) as f:
-        isa_data = json.load(f)
-
-    testable_count = 0
-    skipped_count = 0
-    skip_reasons: dict[str, int] = {}
-    testable_instrs: list[dict] = []
-
-    for slot, instrs in isa_data.items():
-        for instr in instrs:
-            status, reason = classify_instruction(instr)
-            if status == "testable":
-                testable_count += 1
-                testable_instrs.append(instr)
-            else:
-                skipped_count += 1
-                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
-
-    print(f"Testable: {testable_count}")
-    print(f"Skipped:  {skipped_count}")
-    print(f"Total:    {testable_count + skipped_count}")
-    print()
-    print("Skip reasons:")
-    for reason, count in sorted(skip_reasons.items(), key=lambda x: -x[1]):
-        print(f"  {reason}: {count}")
-
     if args.summary:
+        with open(args.isa_json) as f:
+            isa_data = json.load(f)
+
+        testable_count = 0
+        skipped_count = 0
+        skip_reasons: dict[str, int] = {}
+        testable_instrs: list[dict] = []
+
+        for slot, instrs in isa_data.items():
+            for instr in instrs:
+                status, reason = classify_instruction(instr)
+                if status == "testable":
+                    testable_count += 1
+                    testable_instrs.append(instr)
+                else:
+                    skipped_count += 1
+                    skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+
+        print(f"Testable: {testable_count}")
+        print(f"Skipped:  {skipped_count}")
+        print(f"Total:    {testable_count + skipped_count}")
+        print()
+        print("Skip reasons:")
+        for reason, count in sorted(skip_reasons.items(), key=lambda x: -x[1]):
+            print(f"  {reason}: {count}")
+        print()
+        print("Testable instructions:")
+        for instr in testable_instrs:
+            outputs = detect_output_operands(instr)
+            out_names = [o["name"] for o in outputs]
+            print(f"  {instr['name']:40s} [{instr['slot']:4s}] outputs={out_names}")
         return
 
+    manifest = generate_all(args.isa_json, args.out_dir)
+
+    print(f"Testable instructions: {manifest['testable_instructions']}")
+    print(f"Skipped instructions:  {manifest['skipped_instructions']}")
+    print(f"Total test points:     {manifest['total_test_points']}")
+    print(f"Batches:               {manifest['total_batches']}")
+    print(f"Output:                {args.out_dir}")
     print()
-    print("Testable instructions:")
-    for instr in testable_instrs:
-        outputs = detect_output_operands(instr)
-        out_names = [o["name"] for o in outputs]
-        print(f"  {instr['name']:40s} [{instr['slot']:4s}] outputs={out_names}")
+    print("Skip reasons:")
+    for reason, count in sorted(manifest["skip_reasons"].items(), key=lambda x: -x[1]):
+        print(f"  {reason}: {count}")
 
 
 if __name__ == "__main__":
