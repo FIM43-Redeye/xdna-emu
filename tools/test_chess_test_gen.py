@@ -69,6 +69,14 @@ template <> struct chessTraitsOf<v8acc64> {
         assert traits["v64int8"] == 512
         assert len(traits) >= 100
 
+    def test_ceiling_division_non_byte_aligned(self):
+        """Non-byte-aligned types get ceiling division."""
+        traits = {"v5u1": 5, "w9_step4": 9, "u1": 1}
+        header = generate_stub_header(traits)
+        assert "struct v5u1 { char _data[1]; };" in header
+        assert "struct w9_step4 { char _data[2]; };" in header
+        assert "struct u1 { char _data[1]; };" in header
+
 
 from chess_preprocess import preprocess_chess_header, ChessAnnotation
 
@@ -555,3 +563,72 @@ class TestChessDirectoryName:
             properties=[], storage_params=[], overload_index=0, source_line=1,
         )
         assert chess_test_gen.dir_name(i) == "get_something"
+
+
+from chess_type_stubs import parse_iss_property_comments
+
+
+class TestISSTypeStubs:
+    def test_parse_scalar_type(self):
+        text = 'class u2;               // property(  2 bit unsigned );'
+        types = parse_iss_property_comments(text)
+        assert types["u2"] == 2
+
+    def test_parse_signed_scalar(self):
+        text = 'class w32;              // property( 32 bit   signed );'
+        types = parse_iss_property_comments(text)
+        assert types["w32"] == 32
+
+    def test_parse_large_scalar(self):
+        text = 'class smode_t;          // property( 768 bit unsigned );'
+        types = parse_iss_property_comments(text)
+        assert types["smode_t"] == 768
+
+    def test_parse_vector_type(self):
+        text = '''class w64;              // property( 64 bit   signed );
+class v8w64;            // property( vector w64[8] );'''
+        types = parse_iss_property_comments(text)
+        assert types["w64"] == 64
+        assert types["v8w64"] == 512
+
+    def test_parse_nested_vector(self):
+        text = '''class w256;             // property( 256 bit   signed );
+class v16w256;          // property( vector w256[16] );'''
+        types = parse_iss_property_comments(text)
+        assert types["v16w256"] == 4096
+
+    def test_parse_vector_of_small_element(self):
+        text = '''class u1;               // property(  1 bit unsigned );
+class v5u1;             // property( vector u1[5] );'''
+        types = parse_iss_property_comments(text)
+        assert types["v5u1"] == 5
+
+    def test_skip_non_property_lines(self):
+        text = '''#ifndef ME_ISS_TYPES_H
+#define ME_ISS_TYPES_H
+class u2;               // property(  2 bit unsigned );
+// some random comment
+class w64;              // property( 64 bit   signed );'''
+        types = parse_iss_property_comments(text)
+        assert len(types) == 2
+
+    def test_parse_real_file(self):
+        from pathlib import Path
+        iss_path = Path(__file__).parent.parent.parent / "aietools/data/aie_ml/lib/isg/me_iss_types.h"
+        if not iss_path.exists():
+            pytest.skip("aietools not available")
+        types = parse_iss_property_comments(iss_path.read_text())
+        assert types["u1"] == 1
+        assert types["u2"] == 2
+        assert types["w32"] == 32
+        assert types["w64"] == 64
+        assert types["w128"] == 128
+        assert types["pmode_t"] == 26
+        assert types["smode_t"] == 768
+        assert types["mmode_t"] == 8
+        assert types["v5u1"] == 5
+        assert types["v8w64"] == 512
+        assert types["v16w32"] == 512
+        assert types["v32w32"] == 1024
+        assert types["v512w8"] == 4096
+        assert len(types) >= 100

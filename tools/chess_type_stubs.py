@@ -49,6 +49,59 @@ _BITS_SIZEOF = re.compile(
 )
 
 
+# Matches: class NAME; // property( N bit [un]signed );
+_ISS_SCALAR = re.compile(
+    r'class\s+(\w+)\s*;\s*//\s*property\(\s*(\d+)\s+bit\s+(?:un)?signed\s*\)'
+)
+
+# Matches: class NAME; // property( vector ELEM[COUNT] );
+_ISS_VECTOR = re.compile(
+    r'class\s+(\w+)\s*;\s*//\s*property\(\s*vector\s+(\w+)\[(\d+)\]\s*\)'
+)
+
+
+def parse_iss_property_comments(text: str) -> dict[str, int]:
+    """Parse ISS type property comments, returning {type_name: bits}.
+
+    Two forms:
+    - Scalar: ``class u2; // property( 2 bit unsigned );`` -> 2
+    - Vector: ``class v8w64; // property( vector w64[8] );`` -> w64.bits * 8
+
+    Vector element types are resolved from the same table (scalars parsed
+    first, then vectors in dependency order).
+    """
+    types: dict[str, int] = {}
+
+    # First pass: collect all scalar types.
+    for m in _ISS_SCALAR.finditer(text):
+        name, bits = m.group(1), int(m.group(2))
+        types[name] = bits
+
+    # Second pass: resolve vector types.
+    unresolved: list[tuple[str, str, int]] = []
+    for m in _ISS_VECTOR.finditer(text):
+        name, elem, count = m.group(1), m.group(2), int(m.group(3))
+        if elem in types:
+            types[name] = types[elem] * count
+        else:
+            unresolved.append((name, elem, count))
+
+    # Resolve remaining vectors (dependency chains).
+    max_passes = 10
+    for _ in range(max_passes):
+        if not unresolved:
+            break
+        still_unresolved = []
+        for name, elem, count in unresolved:
+            if elem in types:
+                types[name] = types[elem] * count
+            else:
+                still_unresolved.append((name, elem, count))
+        unresolved = still_unresolved
+
+    return types
+
+
 def parse_chess_traits(text: str) -> dict[str, int]:
     """Parse chessTraitsOf<T> specializations, returning {type_name: bits}.
 
@@ -124,9 +177,9 @@ def generate_stub_header(traits: dict[str, int]) -> str:
     for type_name, bits in sorted(traits.items()):
         if type_name in BUILTIN_C_TYPES:
             continue
-        # Round up to at least 1 byte; bits must be a multiple of 8 in
-        # practice, but guard against pathological entries.
-        byte_size = max(1, bits // 8)
+        # Round up to at least 1 byte; most types are byte-aligned but
+        # ISS types like u1 (1 bit) and pmode_t (26 bits) are not.
+        byte_size = max(1, (bits + 7) // 8)
         lines.append(f"struct {type_name} {{ char _data[{byte_size}]; }};  // {bits} bits")
 
     lines.append("")
@@ -145,6 +198,11 @@ def main() -> None:
         help="Path to me_chess_types.h (default: %(default)s)",
     )
     parser.add_argument(
+        "--iss-types-header",
+        default=None,
+        help="Path to me_iss_types.h for additional ISS type coverage (optional)",
+    )
+    parser.add_argument(
         "--output",
         default=None,
         help="Output path for generated header (default: print to stdout)",
@@ -153,6 +211,11 @@ def main() -> None:
 
     text = Path(args.types_header).read_text()
     traits = parse_chess_traits(text)
+    if args.iss_types_header:
+        iss_text = Path(args.iss_types_header).read_text()
+        iss_types = parse_iss_property_comments(iss_text)
+        for name, bits in iss_types.items():
+            traits.setdefault(name, bits)
     header = generate_stub_header(traits)
 
     if args.output:

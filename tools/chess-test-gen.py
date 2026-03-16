@@ -431,6 +431,7 @@ def generate_all(
     opns_path: str,
     types_path: str,
     out_dir: str,
+    iss_types_path: str | None = None,
 ) -> tuple[list[GeneratedChessTest], list[SkippedChessIntrinsic]]:
     """Full pipeline: stubs -> preprocess -> walk -> filter -> generate files.
 
@@ -442,6 +443,10 @@ def generate_all(
         Path to me_chess_types.h (chessTraitsOf specializations).
     out_dir:
         Root output directory.  One subdirectory per generated test.
+    iss_types_path:
+        Optional path to me_iss_types.h.  When provided, ISS property
+        comments are parsed and merged with chessTraitsOf types.  ISS fills
+        gaps only -- chessTraitsOf takes precedence via ``setdefault``.
 
     Returns
     -------
@@ -449,11 +454,18 @@ def generate_all(
     """
     # Import here rather than at module top to keep the dependency optional
     # when running unit tests that do not need the full pipeline.
-    from chess_type_stubs import parse_chess_traits, generate_stub_header
+    from chess_type_stubs import (
+        parse_chess_traits, parse_iss_property_comments, generate_stub_header,
+    )
     from chess_preprocess import preprocess_chess_header
 
     types_text = Path(types_path).read_text()
     traits = parse_chess_traits(types_text)
+    if iss_types_path:
+        iss_text = Path(iss_types_path).read_text()
+        iss_types = parse_iss_property_comments(iss_text)
+        for name, bits in iss_types.items():
+            traits.setdefault(name, bits)
     stubs = generate_stub_header(traits)
 
     opns_text = Path(opns_path).read_text()
@@ -539,13 +551,21 @@ def main() -> None:
         help="Path to me_chess_types.h (default: %(default)s)",
     )
     parser.add_argument(
+        "--iss-types-header",
+        default=None,
+        help="Path to me_iss_types.h for additional ISS type coverage (optional)",
+    )
+    parser.add_argument(
         "--out-dir",
         default="build/chess-instr-tests",
         help="Output directory (default: %(default)s)",
     )
     args = parser.parse_args()
 
-    generated, skipped = generate_all(args.opns_header, args.types_header, args.out_dir)
+    generated, skipped = generate_all(
+        args.opns_header, args.types_header, args.out_dir,
+        iss_types_path=args.iss_types_header,
+    )
 
     print(f"Generated: {len(generated)} tests")
     print(f"Skipped:   {len(skipped)} intrinsics")

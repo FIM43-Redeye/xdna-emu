@@ -91,6 +91,7 @@ if [[ "$COMPILER" == "chess" ]]; then
     python3 "${PROJECT_DIR}/tools/chess-test-gen.py" \
         --opns-header "${AIETOOLS_DIR}/data/aie_ml/lib/isg/me_chess_opns.h" \
         --types-header "${AIETOOLS_DIR}/data/aie_ml/lib/isg/me_chess_types.h" \
+        --iss-types-header "${AIETOOLS_DIR}/data/aie_ml/lib/isg/me_iss_types.h" \
         --out-dir "$OUT_DIR"
 else
     python3 "${PROJECT_DIR}/tools/instr-test-gen.py" --td "$TD_FILE" --out-dir "$OUT_DIR"
