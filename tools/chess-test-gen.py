@@ -203,6 +203,8 @@ _SKIP_PREFIXES = (
     "chess_return_address",
     "chess_dont_care",
     "keep_in_registers_wrapper",
+    "__promo_",     # internal compiler promotion primitives
+    "__promy_",     # internal compiler promotion primitives
 )
 
 # Property words from chess_property(...) that flag a function as untestable.
@@ -267,9 +269,15 @@ def dir_name(i: ChessIntrinsic) -> str:
     back into function and parameter parts without ambiguity.
     """
     if not i.params:
-        return i.name
+        return _sanitize_dirname(i.name)
     param_part = "_".join(ptype for ptype, _ in i.params)
-    return f"{i.name}__{param_part}"
+    return _sanitize_dirname(f"{i.name}__{param_part}")
+
+
+def _sanitize_dirname(name: str) -> str:
+    """Replace characters that are problematic in filesystem paths."""
+    # "unsigned char" -> "unsigned_char", etc.
+    return name.replace(" ", "_")
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +306,9 @@ def generate_chess_kernel_cc(
     conversions.  This check is done BEFORE building the lines list to
     keep the logic clean (not insert-in-loop).
     """
-    qualified_name = f"{namespace}::{func_name}" if namespace else func_name
+    # Call functions unqualified -- xchesscc knows Chess intrinsics natively
+    # regardless of their namespace in me_chess_opns.h.
+    qualified_name = func_name
 
     # Compute sizes and check sub-4-byte scalar flag BEFORE building lines.
     has_sub4_scalar = any(
