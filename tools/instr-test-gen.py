@@ -6,7 +6,7 @@ import json
 import os
 import re
 import sys
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from pathlib import Path
 
 
@@ -240,6 +240,11 @@ def generate_kernel_cc(
     arg_sig = ", ".join(info.c_type for info in arg_infos)
     sig_comment = f"{ret_info.c_type} = f({arg_sig})" if arg_infos else f"{ret_info.c_type} = f()"
 
+    # Check if any sub-4-byte scalar args exist (need string.h for memcpy)
+    has_sub4_scalar = any(
+        not info.is_vector and info.size_bytes < 4 for info in arg_infos
+    )
+
     lines = [
         f"// Auto-generated: tests {builtin}",
         f"// Signature: {sig_comment}",
@@ -247,13 +252,18 @@ def generate_kernel_cc(
         "#define NOCPP",
         "#define __AIEARCH__ 20",
         "#include <stdint.h>",
+    ]
+    if has_sub4_scalar:
+        lines.append("#include <string.h>")
+    lines += [
         "",
         'extern "C" {',
         "void test_kernel(const int32_t *restrict in, int32_t *restrict out) {",
     ]
 
     # Generate argument reads from input buffer
-    offset_i32 = 0  # current offset in int32_t units
+    offset_i32 = 0    # current offset in int32_t units
+    byte_offset = 0   # current offset in bytes (for sub-4-byte reads)
     arg_names = []
     for i, (arg_type, info) in enumerate(zip(arg_types, arg_infos)):
         arg_name = f"arg{i}"
@@ -263,11 +273,18 @@ def generate_kernel_cc(
             # Cast pointer for vector/large types
             lines.append(f"    {info.c_type} {arg_name} = "
                         f"*(const {info.c_type} *)(in + {offset_i32});")
+        elif info.size_bytes < 4:
+            # Sub-4-byte scalar: use memcpy to avoid implicit conversion
+            lines.append(f"    {info.c_type} {arg_name};")
+            lines.append(f"    memcpy(&{arg_name}, "
+                        f"(const char *)in + {byte_offset}, "
+                        f"sizeof({info.c_type}));")
         else:
-            # Scalar read (int32_t or smaller)
+            # 4-byte scalar read (int32_t, float)
             lines.append(f"    {info.c_type} {arg_name} = in[{offset_i32}];")
 
         offset_i32 += info.align_i32
+        byte_offset += max(4, info.size_bytes)  # always advance at least 4 bytes
 
     # Call intrinsic
     call_args = ", ".join(arg_names)

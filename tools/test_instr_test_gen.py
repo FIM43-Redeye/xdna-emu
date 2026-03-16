@@ -29,6 +29,7 @@ from instr_test_gen import (
     generate_kernel_cc,
     generate_aie_mlir,
     generate_test_host_cpp,
+    generate_all,
     short_name,
 )
 
@@ -351,3 +352,76 @@ def test_prng_known_values():
     """
     data = gen_input_python(42, 4)
     assert data[0] == (((42 * 1103515245 + 12345) & 0x7FFFFFFF) >> 16) & 0xFF
+
+
+# ---------------------------------------------------------------------------
+# Task 9: bfloat16 sub-4-byte scalar read path
+# ---------------------------------------------------------------------------
+
+def test_generate_kernel_bfloat16_scalar_uses_memcpy():
+    """Sub-4-byte scalar args use memcpy instead of implicit conversion."""
+    code = generate_kernel_cc(
+        builtin="__builtin_aiev2_some_bf16_op",
+        ret_type="llvm_v16i32_ty",
+        arg_types=["llvm_bfloat_ty", "llvm_i32_ty"],
+    )
+    # bfloat16 arg must use memcpy, not direct assignment from in[]
+    assert "bfloat16 arg0;" in code
+    assert "memcpy(&arg0," in code
+    assert "sizeof(bfloat16)" in code
+    # string.h must be included for memcpy
+    assert "#include <string.h>" in code
+    # Second arg (int32_t) should still use direct read
+    assert "int32_t arg1 = in[1];" in code
+
+
+def test_generate_kernel_no_stringh_without_sub4():
+    """string.h not included when no sub-4-byte scalars exist."""
+    code = generate_kernel_cc(
+        builtin="__builtin_aiev2_vbroadcast32_I512",
+        ret_type="llvm_v16i32_ty",
+        arg_types=["llvm_i32_ty"],
+    )
+    assert "#include <string.h>" not in code
+
+
+# ---------------------------------------------------------------------------
+# Task 10: generate_all integration test
+# ---------------------------------------------------------------------------
+
+def test_generate_all_creates_expected_structure(tmp_path):
+    """Exercise generate_all() with a synthetic TD snippet."""
+    td_content = """\
+class AIEV2VBCST32I512
+     : DefaultAttrsIntrinsic<[llvm_v16i32_ty], [llvm_i32_ty], [IntrNoMem]>;
+class AIE2EventIntrinsic
+    : DefaultAttrsIntrinsic<[],
+                [llvm_i32_ty],
+                [IntrHasSideEffects, IntrNoMem]>;
+
+def int_aie2_vbroadcast32_I512 : ClangBuiltin<"__builtin_aiev2_vbroadcast32_I512">, AIEV2VBCST32I512;
+def int_aie2_event0 : ClangBuiltin<"__builtin_aiev2_event0">, AIE2EventIntrinsic;
+"""
+    td_file = tmp_path / "test.td"
+    td_file.write_text(td_content)
+    out_dir = tmp_path / "out"
+
+    generated, skipped = generate_all(str(td_file), str(out_dir))
+
+    # One generatable intrinsic, one skipped (side effects)
+    assert len(generated) == 1
+    assert len(skipped) == 1
+    assert generated[0].name == "vbroadcast32_I512"
+
+    # Directory structure
+    assert (out_dir / "vbroadcast32_I512" / "kernel.cc").exists()
+    assert (out_dir / "vbroadcast32_I512" / "aie.mlir").exists()
+    assert (out_dir / "test_host.cpp").exists()
+    assert (out_dir / "manifest.json").exists()
+
+    # Manifest is valid JSON with correct counts
+    import json
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    assert len(manifest["generated"]) == 1
+    assert len(manifest["skipped"]) == 1
+    assert manifest["generated"][0]["name"] == "vbroadcast32_I512"
