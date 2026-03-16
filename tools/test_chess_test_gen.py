@@ -445,6 +445,85 @@ v16acc64 mul_2x8_8x8(v32int16 a, int sgn_x, v64uint8 b, int sgn_y);
         assert intrinsics[0].return_size == 0
 
 
+class TestChessReferenceParams:
+    """Tests for reference output parameters, memcpy buffer access, and pointer skipping."""
+
+    def test_detect_lvalue_ref_output(self):
+        """Non-const lvalue reference is an output parameter."""
+        source = """
+struct v5u1 { char _data[1]; };
+struct v16int32 { char _data[64]; };
+int some_func(v16int32, v5u1 &);
+"""
+        intrinsics = chess_test_gen.walk_ast(source, {})
+        assert len(intrinsics) == 1
+        i = intrinsics[0]
+        # Last param should have is_ref_output=True
+        assert len(i.params) == 2
+        assert i.params[1][2] is True  # is_ref_output
+        # Base type should be v5u1, not v5u1 &
+        assert i.params[1][0] == "v5u1"
+
+    def test_const_ref_is_input(self):
+        """const T & is an input parameter, not output."""
+        source = """
+struct v16int32 { char _data[64]; };
+v16int32 some_func(const v16int32 &);
+"""
+        intrinsics = chess_test_gen.walk_ast(source, {})
+        assert len(intrinsics) == 1
+        i = intrinsics[0]
+        # const ref should NOT be marked as ref output
+        assert i.params[0][2] is False
+        status, _ = chess_test_gen.classify_chess_intrinsic(intrinsics[0])
+        assert status == "generated"
+
+    def test_kernel_with_ref_output(self):
+        """Generated kernel writes ref output to output buffer."""
+        kernel = chess_test_gen.generate_chess_kernel_cc(
+            "some_func", "", "int",
+            [("v16int32", 64, False), ("v5u1", 1, True)],
+        )
+        # Should have a zero-initialized output local
+        assert "arg1_out" in kernel
+        assert "= {}" in kernel
+        # Should write ref output after return value
+        assert "memcpy" in kernel
+        # Should NOT read ref output from input buffer
+        lines = kernel.split("\n")
+        for line in lines:
+            if "arg1_out" in line and "memcpy" in line and "(const char *)in" in line:
+                assert False, f"ref output should not be read from input: {line}"
+
+    def test_kernel_memcpy_for_all_reads(self):
+        """All buffer reads use memcpy, not pointer casts."""
+        kernel = chess_test_gen.generate_chess_kernel_cc(
+            "broadcast_elem", "", "v16int32",
+            [("v16int32", 64, False), ("int", 4, False)],
+        )
+        # Should use memcpy for reading
+        assert "memcpy(&arg0" in kernel
+        assert "memcpy(&arg1" in kernel
+        # Should use memcpy for writing result
+        assert "memcpy(out" in kernel or "memcpy((char *)out" in kernel
+        # Should NOT have pointer cast reads
+        assert "*(const" not in kernel
+        # Should include string.h unconditionally
+        assert "#include <string.h>" in kernel
+
+    def test_pointer_param_skipped(self):
+        """Functions with pointer parameters are classified as untestable."""
+        i = chess_test_gen.ChessIntrinsic(
+            name="load_lut", namespace="", return_type="v16int32",
+            return_size=64, params=[("const void *", 8, False), ("int", 4, False)],
+            is_inline=False, properties=[], storage_params=[],
+            overload_index=0, source_line=1,
+        )
+        status, reason = chess_test_gen.classify_chess_intrinsic(i)
+        assert status == "skipped"
+        assert "pointer" in reason
+
+
 class TestChessFilter:
     """Unit tests for classify_chess_intrinsic -- verify skip criteria."""
 
@@ -458,7 +537,7 @@ class TestChessFilter:
             namespace=namespace,
             return_type=return_type,
             return_size=return_size,
-            params=params or [("int", 4)],
+            params=params or [("int", 4, False)],
             is_inline=is_inline,
             properties=properties or [],
             storage_params=storage_params or [],
@@ -540,7 +619,7 @@ class TestChessDirectoryName:
         """Single-arg function: name__param_type."""
         i = chess_test_gen.ChessIntrinsic(
             name="broadcast_to_v16int32", namespace="", return_type="v16int32",
-            return_size=64, params=[("int", 4)], is_inline=False,
+            return_size=64, params=[("int", 4, False)], is_inline=False,
             properties=[], storage_params=[], overload_index=0, source_line=1,
         )
         assert chess_test_gen.dir_name(i) == "broadcast_to_v16int32__int"
@@ -549,7 +628,7 @@ class TestChessDirectoryName:
         """Multi-arg function: name__type1_type2."""
         i = chess_test_gen.ChessIntrinsic(
             name="mul_2x8_8x8", namespace="", return_type="v16acc64",
-            return_size=128, params=[("v32int16", 64), ("v64uint8", 64)],
+            return_size=128, params=[("v32int16", 64, False), ("v64uint8", 64, False)],
             is_inline=False, properties=[], storage_params=[],
             overload_index=0, source_line=1,
         )
@@ -570,7 +649,7 @@ class TestChessNamespaceQualification:
         """me_primitive functions get me_primitive:: prefix."""
         kernel = chess_test_gen.generate_chess_kernel_cc(
             "ext_xl", "me_primitive", "v64uint4",
-            [("v128uint4", 64)],
+            [("v128uint4", 64, False)],
         )
         assert "me_primitive::ext_xl(" in kernel
 
@@ -578,7 +657,7 @@ class TestChessNamespaceQualification:
         """Global-namespace functions have no prefix."""
         kernel = chess_test_gen.generate_chess_kernel_cc(
             "broadcast_elem", "", "v16int32",
-            [("v16int32", 64), ("int", 4)],
+            [("v16int32", 64, False), ("int", 4, False)],
         )
         assert "broadcast_elem(" in kernel
         assert "me_primitive::" not in kernel

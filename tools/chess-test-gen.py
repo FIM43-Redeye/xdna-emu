@@ -61,9 +61,11 @@ class ChessIntrinsic:
         Byte size of the return type per the canonical AST type, clamped to
         ``max(0, ...)`` because clang returns -1 for unknown/incomplete types.
     params:
-        List of ``(type_name, byte_size)`` tuples, one per parameter.
-        ``type_name`` is the spelling from clang; ``byte_size`` is the
-        canonical size (max(0, ...) guard applied).
+        List of ``(type_name, byte_size, is_ref_output)`` tuples, one per
+        parameter.  ``type_name`` is the spelling from clang (with the
+        reference stripped for lvalue-ref params); ``byte_size`` is the
+        canonical size (max(0, ...) guard applied); ``is_ref_output`` is
+        True for non-const lvalue reference parameters (output params).
     is_inline:
         True when the cursor has a definition body (inline function), False for
         declaration-only.
@@ -85,7 +87,7 @@ class ChessIntrinsic:
     namespace: str
     return_type: str
     return_size: int
-    params: list[tuple[str, int]]
+    params: list[tuple[str, int, bool]]
     is_inline: bool
     properties: list[str]
     storage_params: list[str]
@@ -144,12 +146,19 @@ def walk_ast(
             is_inline = cursor.is_definition()
             line = cursor.location.line or 0
 
-            params: list[tuple[str, int]] = []
+            params: list[tuple[str, int, bool]] = []
             for child in cursor.get_children():
                 if child.kind == clang.cindex.CursorKind.PARM_DECL:
-                    ptype = child.type.spelling
-                    psize = max(0, child.type.get_canonical().get_size())
-                    params.append((ptype, psize))
+                    ptype_obj = child.type
+                    is_ref_output = False
+                    if ptype_obj.kind == clang.cindex.TypeKind.LVALUEREFERENCE:
+                        pointee = ptype_obj.get_pointee()
+                        if not pointee.is_const_qualified():
+                            is_ref_output = True
+                        ptype_obj = pointee
+                    ptype = ptype_obj.spelling
+                    psize = max(0, ptype_obj.get_canonical().get_size())
+                    params.append((ptype, psize, is_ref_output))
 
             ann = annotations.get(name)
             props = list(ann.properties) if ann else []
@@ -243,9 +252,14 @@ def classify_chess_intrinsic(i: ChessIntrinsic) -> tuple[str, str]:
         return ("skipped", f"void/unknown return type ({i.return_type}, size={i.return_size})")
 
     # 4. Any parameter whose size clang could not determine.
-    for ptype, psize in i.params:
+    for ptype, psize, _is_ref in i.params:
         if psize <= 0:
             return ("skipped", f"unsized parameter: {ptype}")
+
+    # 4b. Pointer parameters cannot be meaningfully filled from an input buffer.
+    for ptype, _psize, _is_ref in i.params:
+        if '*' in ptype:
+            return ("skipped", f"pointer parameter: {ptype}")
 
     # 5. Name prefix skip list.
     for prefix in _SKIP_PREFIXES:
@@ -270,7 +284,7 @@ def dir_name(i: ChessIntrinsic) -> str:
     """
     if not i.params:
         return _sanitize_dirname(i.name)
-    param_part = "_".join(ptype for ptype, _ in i.params)
+    param_part = "_".join(ptype for ptype, _, _ in i.params)
     return _sanitize_dirname(f"{i.name}__{param_part}")
 
 
@@ -288,7 +302,7 @@ def generate_chess_kernel_cc(
     func_name: str,
     namespace: str,
     return_type: str,
-    params: list[tuple[str, int]],
+    params: list[tuple[str, int, bool]],
 ) -> str:
     """Generate kernel.cc that calls one Chess-native intrinsic.
 
@@ -299,23 +313,23 @@ def generate_chess_kernel_cc(
     - Input buffer: ``const int32_t *restrict in``
     - Output buffer: ``int32_t *restrict out``
 
-    Arguments are read from consecutive regions of the input buffer.
-    The return value is cast-written to the output buffer.
-
-    Sub-4-byte scalar arguments use memcpy to avoid implicit narrowing
-    conversions.  This check is done BEFORE building the lines list to
-    keep the logic clean (not insert-in-loop).
+    All buffer reads and writes use ``memcpy`` to avoid type-punning issues
+    with xchesscc.  Non-const lvalue reference parameters (``is_ref_output``)
+    are zero-initialized locals passed by reference; their values are written
+    to the output buffer after the return value.
     """
-    # Qualify me_primitive functions so xchesscc can resolve them.
     qualified_name = f"{namespace}::{func_name}" if namespace else func_name
 
-    # Compute sizes and check sub-4-byte scalar flag BEFORE building lines.
-    has_sub4_scalar = any(
-        psize < 4 and not _is_vector_type(ptype)
-        for ptype, psize in params
-    )
+    # Separate input params from reference output params.
+    input_params = []   # (arg_name, type, size)
+    ref_outputs = []    # (arg_name, base_type, size)
+    for idx, (ptype, psize, is_ref) in enumerate(params):
+        if is_ref:
+            ref_outputs.append((f"arg{idx}_out", ptype, psize))
+        else:
+            input_params.append((f"arg{idx}", ptype, psize))
 
-    arg_sig = ", ".join(ptype for ptype, _ in params)
+    arg_sig = ", ".join(ptype for ptype, _, _ in params)
     sig_comment = (
         f"{return_type} = {qualified_name}({arg_sig})"
         if params
@@ -327,84 +341,51 @@ def generate_chess_kernel_cc(
         f"// Signature: {sig_comment}",
         "#define NOCPP",
         "#include <stdint.h>",
-    ]
-    if has_sub4_scalar:
-        lines.append("#include <string.h>")
-    lines += [
+        "#include <string.h>",
         "",
         'extern "C" {',
         "void test_kernel(const int32_t *restrict in, int32_t *restrict out) {",
     ]
 
-    # Generate argument reads from input buffer.
-    offset_i32 = 0    # current offset in int32_t units
-    byte_offset = 0   # current byte offset (for sub-4-byte reads)
-    arg_names: list[str] = []
+    # Read input params from buffer via memcpy.
+    in_byte_offset = 0
+    for arg_name, ptype, psize in input_params:
+        lines.append(f"    {ptype} {arg_name};")
+        lines.append(f"    memcpy(&{arg_name}, (const char *)in + {in_byte_offset}, sizeof({ptype}));")
+        in_byte_offset += psize
 
-    for idx, (ptype, psize) in enumerate(params):
-        arg_name = f"arg{idx}"
-        arg_names.append(arg_name)
+    # Declare reference output locals (zero-initialized).
+    for arg_name, base_type, psize in ref_outputs:
+        lines.append(f"    {base_type} {arg_name} = {{}};")
 
-        is_vector = _is_vector_type(ptype)
-        if is_vector or psize > 4:
-            # Cast the int32_t pointer to the vector/large type.
-            lines.append(
-                f"    {ptype} {arg_name} = "
-                f"*(const {ptype} *)(in + {offset_i32});"
-            )
-        elif psize < 4:
-            # Sub-4-byte scalar: memcpy to avoid implicit conversion/narrowing.
-            lines.append(f"    {ptype} {arg_name};")
-            lines.append(
-                f"    memcpy(&{arg_name}, "
-                f"(const char *)in + {byte_offset}, "
-                f"sizeof({ptype}));"
-            )
+    # Build call argument list in original parameter order.
+    call_args = []
+    in_idx = 0
+    ref_idx = 0
+    for _idx, (_ptype, _psize, is_ref) in enumerate(params):
+        if is_ref:
+            call_args.append(ref_outputs[ref_idx][0])
+            ref_idx += 1
         else:
-            # 4-byte scalar (int, unsigned, float, etc.).
-            lines.append(f"    {ptype} {arg_name} = in[{offset_i32}];")
+            call_args.append(input_params[in_idx][0])
+            in_idx += 1
 
-        # Advance offsets: always at least one i32 slot per argument.
-        align_i32 = max(1, psize // 4)
-        offset_i32 += align_i32
-        byte_offset += max(4, psize)
+    lines.append(f"    {return_type} result = {qualified_name}({', '.join(call_args)});")
 
-    call_args = ", ".join(arg_names)
-    lines.append(f"    {return_type} result = {qualified_name}({call_args});")
-    lines.append(f"    {return_type} *out_vec = ({return_type} *)out;")
-    lines.append("    *out_vec = result;")
+    # Write return value to output buffer.
+    lines.append(f"    memcpy(out, &result, sizeof({return_type}));")
+
+    # Write reference outputs after return value.
+    out_byte_offset_expr = f"sizeof({return_type})"
+    for arg_name, base_type, psize in ref_outputs:
+        lines.append(f"    memcpy((char *)out + {out_byte_offset_expr}, &{arg_name}, sizeof({base_type}));")
+        out_byte_offset_expr = f"{out_byte_offset_expr} + sizeof({base_type})"
+
     lines.append("}")
     lines.append('} // extern "C"')
-    lines.append("")  # trailing newline
+    lines.append("")
 
     return "\n".join(lines)
-
-
-# C scalar type names recognized as non-struct (used by _is_vector_type).
-_SCALAR_BASES: frozenset[str] = frozenset({
-    "int", "unsigned", "unsigned int", "short", "unsigned short",
-    "char", "signed char", "unsigned char", "long", "unsigned long",
-    "long long", "unsigned long long", "float", "double",
-    "bool", "int8_t", "uint8_t", "int16_t", "uint16_t",
-    "int32_t", "uint32_t", "int64_t", "uint64_t",
-    "bfloat16",  # 2-byte scalar on AIE
-})
-
-
-def _is_vector_type(type_name: str) -> bool:
-    """Heuristic: a type is vector/struct if it is not a primitive C scalar.
-
-    Chess types such as v16int32, v64uint8, pmode_t, etc. are all struct stubs
-    with sizeof > 4 typically, but pmode_t has sizeof==4 and is still a struct.
-    We use the naming convention: if the name starts with 'v' and contains a
-    digit, or is otherwise not a known C scalar, treat it as a struct.
-
-    In practice, for Chess intrinsics the only scalar types encountered are
-    ``int``, ``unsigned``, ``unsigned int``, ``short``, ``char``, ``float``,
-    and their signed/const variants.  Everything else is a struct.
-    """
-    base = type_name.replace("const ", "").replace("restrict ", "").strip()
-    return base not in _SCALAR_BASES
 
 
 # ---------------------------------------------------------------------------
@@ -487,9 +468,10 @@ def generate_all(
         test_dir = os.path.join(out_dir, dname)
         os.makedirs(test_dir, exist_ok=True)
 
-        # Compute buffer sizes from parameter and return type sizes.
-        in_size = sum(psize for _, psize in i.params)
-        out_size = i.return_size
+        # Compute buffer sizes (ref outputs excluded from input, included in output).
+        in_size = sum(psize for _, psize, is_ref in i.params if not is_ref)
+        ref_out_sizes = sum(psize for _, psize, is_ref in i.params if is_ref)
+        out_size = i.return_size + ref_out_sizes
         # Minimum 4 bytes for each buffer (at least one i32 slot).
         in_size = max(4, in_size)
         out_size = max(4, out_size)
