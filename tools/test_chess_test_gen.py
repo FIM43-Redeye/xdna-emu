@@ -339,3 +339,219 @@ v16acc64 mul_2x8_8x8(v32int16 a, int sgn_x, v64uint8 b, int sgn_y);
         )
         print(f"Parsed {func_count} functions, {len(errors)} errors, "
               f"{len(annotations)} annotations")
+
+
+import importlib  # noqa: E402 -- used by chess-test-gen tests
+
+# The module name contains a hyphen, so standard import cannot be used.
+chess_test_gen = importlib.import_module("chess-test-gen")
+
+
+class TestAnnotationJoining:
+    """End-to-end tests: chess_property -> preprocess -> walk -> filter."""
+
+    def test_annotation_reaches_filter(self):
+        """chess_property(dont_care) -> preprocess -> walk -> filter = skipped."""
+        from chess_preprocess import preprocess_chess_header
+        original = """
+struct v16int32 { char _data[64]; };
+v16int32 undef_v16int32() chess_property(dont_care);
+v16int32 broadcast_to_v16int32(int);
+"""
+        clean, annotations = preprocess_chess_header(original)
+        intrinsics = chess_test_gen.walk_ast(clean, annotations)
+        assert len(intrinsics) == 2
+        for i in intrinsics:
+            status, reason = chess_test_gen.classify_chess_intrinsic(i)
+            if i.name == "undef_v16int32":
+                assert status == "skipped"
+                assert "dont_care" in reason
+            elif i.name == "broadcast_to_v16int32":
+                assert status == "generated"
+
+    def test_volatile_annotation_reaches_filter(self):
+        """chess_property(volatile) -> preprocess -> walk -> filter = skipped."""
+        from chess_preprocess import preprocess_chess_header
+        original = "struct dummy { char _data[4]; };\ndummy acquire_guarded(unsigned, unsigned) chess_property(volatile);\n"
+        clean, annotations = preprocess_chess_header(original)
+        intrinsics = chess_test_gen.walk_ast(clean, annotations)
+        assert len(intrinsics) == 1
+        status, _ = chess_test_gen.classify_chess_intrinsic(intrinsics[0])
+        assert status == "skipped"
+
+
+class TestChessASTWalker:
+    """Unit tests for walk_ast -- verify correct extraction from clang.cindex."""
+
+    def test_walk_simple_function(self):
+        """Extract name, return_type, return_size, params, namespace for a plain function."""
+        source = """
+struct v16int32 { char _data[64]; };
+v16int32 broadcast_to_v16int32(int x);
+"""
+        intrinsics = chess_test_gen.walk_ast(source, {})
+        assert len(intrinsics) == 1
+        i = intrinsics[0]
+        assert i.name == "broadcast_to_v16int32"
+        assert i.return_type == "v16int32"
+        assert i.return_size == 64
+        assert i.namespace == ""
+        assert len(i.params) == 1
+        assert i.params[0][0] == "int"
+        assert i.params[0][1] == 4
+
+    def test_walk_namespace(self):
+        """Functions inside me_primitive namespace have namespace='me_primitive'."""
+        source = """
+struct v16int32 { char _data[64]; };
+namespace me_primitive {
+v16int32 load_vec(int);
+} // namespace me_primitive
+"""
+        intrinsics = chess_test_gen.walk_ast(source, {})
+        assert len(intrinsics) == 1
+        assert intrinsics[0].namespace == "me_primitive"
+        assert intrinsics[0].name == "load_vec"
+
+    def test_walk_overloads(self):
+        """Overloaded functions produce separate entries with different overload_index."""
+        source = """
+struct v16acc64 { char _data[128]; };
+struct v32int16 { char _data[64]; };
+struct v64uint8 { char _data[64]; };
+v16acc64 mul_2x8_8x8(v32int16 a, v64uint8 b);
+v16acc64 mul_2x8_8x8(v32int16 a, int sgn_x, v64uint8 b, int sgn_y);
+"""
+        intrinsics = chess_test_gen.walk_ast(source, {})
+        overloads = [i for i in intrinsics if i.name == "mul_2x8_8x8"]
+        assert len(overloads) == 2
+        indices = sorted(i.overload_index for i in overloads)
+        assert indices[0] != indices[1]
+
+    def test_walk_void_return(self):
+        """void functions are extracted but with return_size=0 (filtered later)."""
+        source = "void noop_func(int x);\n"
+        intrinsics = chess_test_gen.walk_ast(source, {})
+        assert len(intrinsics) == 1
+        assert intrinsics[0].return_type == "void"
+        assert intrinsics[0].return_size == 0
+
+
+class TestChessFilter:
+    """Unit tests for classify_chess_intrinsic -- verify skip criteria."""
+
+    def _make(self, name="f", namespace="", return_type="v16int32",
+              return_size=64, params=None, is_inline=False,
+              properties=None, storage_params=None, overload_index=0,
+              source_line=1):
+        """Build a minimal ChessIntrinsic for filter testing."""
+        return chess_test_gen.ChessIntrinsic(
+            name=name,
+            namespace=namespace,
+            return_type=return_type,
+            return_size=return_size,
+            params=params or [("int", 4)],
+            is_inline=is_inline,
+            properties=properties or [],
+            storage_params=storage_params or [],
+            overload_index=overload_index,
+            source_line=source_line,
+        )
+
+    def test_pass_pure_function(self):
+        """A clean function with no skip-triggers passes the filter."""
+        i = self._make()
+        status, _ = chess_test_gen.classify_chess_intrinsic(i)
+        assert status == "generated"
+
+    def test_filter_dont_care(self):
+        i = self._make(properties=["dont_care"])
+        status, reason = chess_test_gen.classify_chess_intrinsic(i)
+        assert status == "skipped"
+        assert "dont_care" in reason
+
+    def test_filter_volatile(self):
+        i = self._make(properties=["volatile"])
+        status, reason = chess_test_gen.classify_chess_intrinsic(i)
+        assert status == "skipped"
+        assert "volatile" in reason
+
+    def test_filter_void_return(self):
+        i = self._make(return_type="void", return_size=0)
+        status, reason = chess_test_gen.classify_chess_intrinsic(i)
+        assert status == "skipped"
+        assert "void" in reason.lower() or "return" in reason.lower()
+
+    def test_filter_operator(self):
+        i = self._make(name="operator+")
+        status, reason = chess_test_gen.classify_chess_intrinsic(i)
+        assert status == "skipped"
+        assert "operator" in reason
+
+    def test_filter_diagnostic(self):
+        """Functions like chess_report / chess_assert / chess_error are skipped."""
+        for prefix in ("chess_report_", "chess_assert_something",
+                       "chess_error_handler", "chess_warning_",
+                       "chess_exit", "chess_stop"):
+            i = self._make(name=prefix)
+            status, _ = chess_test_gen.classify_chess_intrinsic(i)
+            assert status == "skipped", f"Expected skip for {prefix}"
+
+    def test_filter_storage_params(self):
+        i = self._make(storage_params=["TM"])
+        status, reason = chess_test_gen.classify_chess_intrinsic(i)
+        assert status == "skipped"
+        assert "storage" in reason.lower()
+
+    def test_filter_unsized_return(self):
+        """return_size <= 0 triggers skip even if return_type is non-void."""
+        i = self._make(return_type="unknown_t", return_size=0)
+        status, reason = chess_test_gen.classify_chess_intrinsic(i)
+        assert status == "skipped"
+
+    def test_filter_non_functional(self):
+        i = self._make(properties=["non_functional"])
+        status, _ = chess_test_gen.classify_chess_intrinsic(i)
+        assert status == "skipped"
+
+    def test_filter_keep_with_operand(self):
+        i = self._make(properties=["keep_with_operand"])
+        status, _ = chess_test_gen.classify_chess_intrinsic(i)
+        assert status == "skipped"
+
+    def test_filter_arg_mem_only(self):
+        i = self._make(properties=["arg_mem_only"])
+        status, _ = chess_test_gen.classify_chess_intrinsic(i)
+        assert status == "skipped"
+
+
+class TestChessDirectoryName:
+    """Unit tests for dir_name -- verify stable directory name generation."""
+
+    def test_simple_function(self):
+        """Single-arg function: name__param_type."""
+        i = chess_test_gen.ChessIntrinsic(
+            name="broadcast_to_v16int32", namespace="", return_type="v16int32",
+            return_size=64, params=[("int", 4)], is_inline=False,
+            properties=[], storage_params=[], overload_index=0, source_line=1,
+        )
+        assert chess_test_gen.dir_name(i) == "broadcast_to_v16int32__int"
+
+    def test_multi_arg_function(self):
+        """Multi-arg function: name__type1_type2."""
+        i = chess_test_gen.ChessIntrinsic(
+            name="mul_2x8_8x8", namespace="", return_type="v16acc64",
+            return_size=128, params=[("v32int16", 64), ("v64uint8", 64)],
+            is_inline=False, properties=[], storage_params=[],
+            overload_index=0, source_line=1,
+        )
+        assert chess_test_gen.dir_name(i) == "mul_2x8_8x8__v32int16_v64uint8"
+
+    def test_no_args(self):
+        """Zero-arg function: just the name."""
+        i = chess_test_gen.ChessIntrinsic(
+            name="get_something", namespace="", return_type="int",
+            return_size=4, params=[], is_inline=False,
+            properties=[], storage_params=[], overload_index=0, source_line=1,
+        )
+        assert chess_test_gen.dir_name(i) == "get_something"
