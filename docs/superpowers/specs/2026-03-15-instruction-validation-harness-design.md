@@ -295,9 +295,9 @@ build/instr-tests/           -- generated (gitignored)
 ## Success Criteria
 
 1. Generator produces compilable kernel.cc for all in-scope intrinsics
-2. At least the 4 previously-buggy operations (VBCST, VSEL, VEXTRACT, VMOV)
-   pass HW == EMU comparison
-3. Any failures are real emulator bugs, not test harness issues
+2. All generated tests compile with Chess and run on both HW and EMU,
+   producing comparable output files (the harness works end-to-end)
+3. Any HW != EMU divergences are real emulator bugs, not test harness issues
 4. Adding a new test case requires zero manual work (re-run generator)
 5. Manifest tracks coverage: every intrinsic is either generated or has a
    documented skip reason
