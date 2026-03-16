@@ -179,6 +179,32 @@ int f(int, int) chess_property(functional);
         assert "volatile" in ann.properties
         assert "functional" in ann.properties
 
+    def test_strip_chess_output_qualifier(self):
+        text = 'void load_lut(const void *lut, chess_output v16int32 &v1);\n'
+        clean, _ = preprocess_chess_header(text)
+        assert "chess_output" not in clean
+        assert "v16int32 &v1" in clean
+
+    def test_strip_chess_error(self):
+        text = '  chess_error("idx must be in range [0,3]");\n'
+        clean, _ = preprocess_chess_header(text)
+        assert "chess_error" not in clean
+        # Statement is replaced by a no-op expression.
+        assert "((void)0)" in clean
+
+    def test_strip_chess_dont_care(self):
+        text = '  v8cint32 r = (v8cint32)chess_dont_care(v16int32);\n'
+        clean, _ = preprocess_chess_header(text)
+        assert "chess_dont_care" not in clean
+        # Replaced with value-initialization of the named type.
+        assert "v16int32{}" in clean
+
+    def test_strip_chess_dont_care_direct(self):
+        text = '  cint32_w64 w = chess_dont_care(cint32_w64);\n'
+        clean, _ = preprocess_chess_header(text)
+        assert "chess_dont_care" not in clean
+        assert "cint32_w64{}" in clean
+
     def test_integration_real_file(self):
         from pathlib import Path
         opns_path = Path(__file__).parent.parent.parent / "aietools/data/aie_ml/lib/isg/me_chess_opns.h"
@@ -191,9 +217,125 @@ int f(int, int) chess_property(functional);
         assert "chess_manifest(" not in clean
         assert "chess_memory_fence()" not in clean
         assert "VBITzCONSTEXPR" not in clean
+        assert "chess_output" not in clean
+        assert "chess_error(" not in clean
+        assert "chess_dont_care(" not in clean
         assert len(annotations) > 50
         dont_care_funcs = [
             name for name, a in annotations.items()
             if "dont_care" in a.properties
         ]
         assert len(dont_care_funcs) >= 10
+
+
+import tempfile  # noqa: E402 -- used by TestClangParsing
+
+
+class TestClangParsing:
+    def test_parse_simple_stub_and_declaration(self):
+        """clang.cindex can parse a type stub + function declaration."""
+        import clang.cindex
+        source = """
+struct v16int32 { char _data[64]; };
+struct v64int8 { char _data[64]; };
+v16int32 broadcast_to_v16int32(int);
+v64int8 some_vector_op(v16int32, v16int32, int);
+"""
+        index = clang.cindex.Index.create()
+        tu = index.parse("test.cpp", unsaved_files=[("test.cpp", source)],
+                         args=["-std=c++17", "-fsyntax-only"])
+        errors = [d for d in tu.diagnostics if d.severity >= clang.cindex.Diagnostic.Error]
+        assert len(errors) == 0, f"Parse errors: {[d.spelling for d in errors]}"
+        funcs = []
+        for cursor in tu.cursor.get_children():
+            if cursor.kind == clang.cindex.CursorKind.FUNCTION_DECL:
+                funcs.append(cursor.spelling)
+        assert "broadcast_to_v16int32" in funcs
+        assert "some_vector_op" in funcs
+
+    def test_parse_namespace_declarations(self):
+        """clang.cindex handles me_primitive namespace blocks."""
+        import clang.cindex
+        source = """
+struct v512w8 { char _data[64]; };
+struct v32w32 { char _data[128]; };
+struct pmode_t { char _data[4]; };
+struct smode_t { char _data[4]; };
+namespace me_primitive {
+v512w8 prmx_hw_prom(v32w32, pmode_t, smode_t);
+} //namespace me_primitive
+namespace me_primitive {
+int some_other_prim(int, int);
+} //namespace me_primitive
+"""
+        index = clang.cindex.Index.create()
+        tu = index.parse("test.cpp", unsaved_files=[("test.cpp", source)],
+                         args=["-std=c++17", "-fsyntax-only"])
+        errors = [d for d in tu.diagnostics if d.severity >= clang.cindex.Diagnostic.Error]
+        assert len(errors) == 0, f"Parse errors: {[d.spelling for d in errors]}"
+
+    def test_parse_overloaded_functions(self):
+        """clang.cindex distinguishes overloaded function signatures."""
+        import clang.cindex
+        source = """
+struct v16int32 { char _data[64]; };
+struct v16acc64 { char _data[128]; };
+struct v32int16 { char _data[64]; };
+struct v64uint8 { char _data[64]; };
+v16acc64 mul_2x8_8x8(v32int16 a, v64uint8 b);
+v16acc64 mul_2x8_8x8(v32int16 a, int sgn_x, v64uint8 b, int sgn_y);
+"""
+        index = clang.cindex.Index.create()
+        tu = index.parse("test.cpp", unsaved_files=[("test.cpp", source)],
+                         args=["-std=c++17", "-fsyntax-only"])
+        funcs = []
+        for cursor in tu.cursor.get_children():
+            if cursor.kind == clang.cindex.CursorKind.FUNCTION_DECL:
+                params = [c.type.spelling for c in cursor.get_children()
+                          if c.kind == clang.cindex.CursorKind.PARM_DECL]
+                funcs.append((cursor.spelling, params))
+        mul_overloads = [f for f in funcs if f[0] == "mul_2x8_8x8"]
+        assert len(mul_overloads) == 2
+        param_counts = sorted(len(f[1]) for f in mul_overloads)
+        assert param_counts == [2, 4]
+
+    def test_parse_preprocessed_real_header(self):
+        """Integration: pre-process + stub + parse the real me_chess_opns.h."""
+        from pathlib import Path
+        from chess_preprocess import preprocess_chess_header
+        from chess_type_stubs import parse_chess_traits, generate_stub_header
+        import clang.cindex
+
+        opns_path = Path(__file__).parent.parent.parent / "aietools/data/aie_ml/lib/isg/me_chess_opns.h"
+        types_path = Path(__file__).parent.parent.parent / "aietools/data/aie_ml/lib/isg/me_chess_types.h"
+        if not opns_path.exists() or not types_path.exists():
+            pytest.skip("aietools not available")
+
+        traits = parse_chess_traits(types_path.read_text())
+        stubs = generate_stub_header(traits)
+        clean, annotations = preprocess_chess_header(opns_path.read_text())
+        combined = stubs + "\n" + clean
+
+        index = clang.cindex.Index.create()
+        tu = index.parse("me_chess_opns_clean.cpp",
+                         unsaved_files=[("me_chess_opns_clean.cpp", combined)],
+                         args=["-std=c++17", "-fsyntax-only"])
+
+        errors = [d for d in tu.diagnostics if d.severity >= clang.cindex.Diagnostic.Error]
+
+        func_count = 0
+        def walk(cursor):
+            nonlocal func_count
+            if cursor.kind == clang.cindex.CursorKind.FUNCTION_DECL:
+                func_count += 1
+            for child in cursor.get_children():
+                walk(child)
+        walk(tu.cursor)
+
+        # Should find hundreds of functions even with some parse errors
+        assert func_count >= 500, (
+            f"Only found {func_count} functions, expected 500+. "
+            f"Errors: {len(errors)}"
+        )
+        print(f"Parsed {func_count} functions, {len(errors)} errors, "
+              f"{len(annotations)} annotations")

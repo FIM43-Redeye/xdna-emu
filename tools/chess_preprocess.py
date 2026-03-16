@@ -141,6 +141,20 @@ def preprocess_chess_header(text: str) -> tuple[str, dict[str, ChessAnnotation]]
     # Remove Chess keyword qualifiers that are not valid C++.
     text = re.sub(r'\bchess_protect_access\b', '', text)
 
+    # chess_output is a parameter qualifier (marks output-only parameters);
+    # it has no C++ equivalent -- strip it so the parameter list is clean.
+    text = re.sub(r'\bchess_output\b', '', text)
+
+    # chess_error("msg") is a Chess compile-time assertion that causes a
+    # compile error with the given message.  Replace with a no-op expression
+    # so the surrounding if-statement bodies still compile.
+    text = re.sub(r'\bchess_error\([^)]*\)', '((void)0)', text)
+
+    # chess_dont_care(TypeName) returns an uninitialized value of TypeName.
+    # Replace with TypeName{} (value-initialization), which is the closest
+    # valid C++ equivalent.  The argument is always a single identifier.
+    text = re.sub(r'\bchess_dont_care\((\w+)\)', r'\1{}', text)
+
     # chess_manifest(expr) is a Chess compile-time assertion; replace with
     # a no-op expression that is always true so surrounding if-statements
     # still compile.
