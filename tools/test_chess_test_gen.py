@@ -565,6 +565,25 @@ class TestChessDirectoryName:
         assert chess_test_gen.dir_name(i) == "get_something"
 
 
+class TestChessNamespaceQualification:
+    def test_me_primitive_gets_qualified(self):
+        """me_primitive functions get me_primitive:: prefix."""
+        kernel = chess_test_gen.generate_chess_kernel_cc(
+            "ext_xl", "me_primitive", "v64uint4",
+            [("v128uint4", 64)],
+        )
+        assert "me_primitive::ext_xl(" in kernel
+
+    def test_global_stays_unqualified(self):
+        """Global-namespace functions have no prefix."""
+        kernel = chess_test_gen.generate_chess_kernel_cc(
+            "broadcast_elem", "", "v16int32",
+            [("v16int32", 64), ("int", 4)],
+        )
+        assert "broadcast_elem(" in kernel
+        assert "me_primitive::" not in kernel
+
+
 from chess_type_stubs import parse_iss_property_comments
 
 

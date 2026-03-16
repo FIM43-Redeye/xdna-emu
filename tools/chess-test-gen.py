@@ -306,9 +306,8 @@ def generate_chess_kernel_cc(
     conversions.  This check is done BEFORE building the lines list to
     keep the logic clean (not insert-in-loop).
     """
-    # Call functions unqualified -- xchesscc knows Chess intrinsics natively
-    # regardless of their namespace in me_chess_opns.h.
-    qualified_name = func_name
+    # Qualify me_primitive functions so xchesscc can resolve them.
+    qualified_name = f"{namespace}::{func_name}" if namespace else func_name
 
     # Compute sizes and check sub-4-byte scalar flag BEFORE building lines.
     has_sub4_scalar = any(
@@ -381,6 +380,17 @@ def generate_chess_kernel_cc(
     return "\n".join(lines)
 
 
+# C scalar type names recognized as non-struct (used by _is_vector_type).
+_SCALAR_BASES: frozenset[str] = frozenset({
+    "int", "unsigned", "unsigned int", "short", "unsigned short",
+    "char", "signed char", "unsigned char", "long", "unsigned long",
+    "long long", "unsigned long long", "float", "double",
+    "bool", "int8_t", "uint8_t", "int16_t", "uint16_t",
+    "int32_t", "uint32_t", "int64_t", "uint64_t",
+    "bfloat16",  # 2-byte scalar on AIE
+})
+
+
 def _is_vector_type(type_name: str) -> bool:
     """Heuristic: a type is vector/struct if it is not a primitive C scalar.
 
@@ -394,14 +404,6 @@ def _is_vector_type(type_name: str) -> bool:
     and their signed/const variants.  Everything else is a struct.
     """
     base = type_name.replace("const ", "").replace("restrict ", "").strip()
-    _SCALAR_BASES = frozenset({
-        "int", "unsigned", "unsigned int", "short", "unsigned short",
-        "char", "signed char", "unsigned char", "long", "unsigned long",
-        "long long", "unsigned long long", "float", "double",
-        "bool", "int8_t", "uint8_t", "int16_t", "uint16_t",
-        "int32_t", "uint32_t", "int64_t", "uint64_t",
-        "bfloat16",  # 2-byte scalar on AIE
-    })
     return base not in _SCALAR_BASES
 
 
@@ -454,18 +456,12 @@ def generate_all(
     """
     # Import here rather than at module top to keep the dependency optional
     # when running unit tests that do not need the full pipeline.
-    from chess_type_stubs import (
-        parse_chess_traits, parse_iss_property_comments, generate_stub_header,
-    )
+    from chess_type_stubs import parse_all_types, generate_stub_header
     from chess_preprocess import preprocess_chess_header
 
     types_text = Path(types_path).read_text()
-    traits = parse_chess_traits(types_text)
-    if iss_types_path:
-        iss_text = Path(iss_types_path).read_text()
-        iss_types = parse_iss_property_comments(iss_text)
-        for name, bits in iss_types.items():
-            traits.setdefault(name, bits)
+    iss_text = Path(iss_types_path).read_text() if iss_types_path else None
+    traits = parse_all_types(types_text, iss_text)
     stubs = generate_stub_header(traits)
 
     opns_text = Path(opns_path).read_text()
