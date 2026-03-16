@@ -25,6 +25,12 @@ import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
+# Add amd-unified-software site-packages for clang.cindex if needed.
+_clang_site = Path("/home/triple/npu-work/amd-unified-software/tps/lnx64"
+                   "/python-3.13.0/lib/python3.13/site-packages")
+if _clang_site.is_dir() and str(_clang_site) not in sys.path:
+    sys.path.append(str(_clang_site))
+
 import clang.cindex
 
 # Load the Peano generator to reuse generate_aie_mlir and generate_test_host_cpp.
