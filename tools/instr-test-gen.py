@@ -248,9 +248,7 @@ def generate_kernel_cc(
     lines = [
         f"// Auto-generated: tests {builtin}",
         f"// Signature: {sig_comment}",
-        "#define __AIENGINE__ 2",
         "#define NOCPP",
-        "#define __AIEARCH__ 20",
         "#include <stdint.h>",
     ]
     if has_sub4_scalar:

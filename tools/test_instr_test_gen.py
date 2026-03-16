@@ -224,7 +224,9 @@ def test_generate_kernel_single_scalar_arg():
     assert "v16int32 result =" in code
     assert "v16int32 *out_vec = (v16int32 *)out;" in code
     assert "*out_vec = result;" in code
-    assert '#define __AIENGINE__ 2' in code
+    assert '#define NOCPP' in code
+    assert '#define __AIENGINE__' not in code
+    assert '#define __AIEARCH__' not in code
     assert 'extern "C"' in code
 
 def test_generate_kernel_multi_arg():
@@ -345,12 +347,12 @@ def test_prng_known_values():
 
     state0 = 42
     state1 = (42 * 1103515245 + 12345) & 0x7FFFFFFF
-           = 46327652297  & 0x7FFFFFFF
-           = 46327652297 % 2147483648
-           = 2032685001
-    byte0  = (2032685001 >> 16) & 0xFF = 31010 & 0xFF = 0x22 = 34
+           = 46347640290 + 12345 = 46347652635
+           & 0x7FFFFFFF = 1250496027
+    byte0  = (1250496027 >> 16) & 0xFF = 19081 & 0xFF = 0x89 = 137
     """
     data = gen_input_python(42, 4)
+    assert data[0] == 137
     assert data[0] == (((42 * 1103515245 + 12345) & 0x7FFFFFFF) >> 16) & 0xFF
 
 

@@ -2,7 +2,7 @@
 # scripts/instr-test.sh -- Instruction-level validation harness runner.
 #
 # Generates single-instruction test kernels from IntrinsicsAIE2.td,
-# compiles them with Chess, runs on real NPU and emulator, diffs outputs.
+# compiles them with Peano, runs on real NPU and emulator, diffs outputs.
 #
 # Usage:
 #   scripts/instr-test.sh [options]
@@ -28,6 +28,7 @@ RESULTS_DIR="/tmp/instr-test-results-$(date +%Y%m%d)"
 MLIR_AIE="${PROJECT_DIR}/../mlir-aie"
 INSTALL_DIR="${MLIR_AIE}/install"
 XRT_DIR="/opt/xilinx/xrt"
+PEANO_INSTALL_DIR="/home/triple/npu-work/llvm-aie/install"
 
 # Defaults
 RUN_HW=true
@@ -116,17 +117,18 @@ compile_one() {
 
     echo "  Compiling ${name}..."
 
-    # Compile kernel with Chess
+    # Compile kernel with Peano
     (cd "$test_dir" && \
-        xchesscc_wrapper aie2 -I "${XILINX_VITIS_AIETOOLS}/include" \
-            -c kernel.cc -o kernel.o 2>"${test_dir}/chess.log") || {
-        echo "  FAIL compile chess: ${name}"
+        nice -n 19 "${PEANO_INSTALL_DIR}/bin/clang++" \
+            --target=aie2-none-unknown-elf -O2 \
+            -c kernel.cc -o kernel.o 2>"${test_dir}/peano.log") || {
+        echo "  FAIL compile peano: ${name}"
         return 1
     }
 
     # Compile MLIR -> xclbin + insts.bin
     (cd "$test_dir" && \
-        nice -n 19 aiecc.py --no-aiesim --xchesscc --xbridge \
+        nice -n 19 aiecc.py --no-aiesim --no-xchesscc --no-xbridge \
             --aie-generate-xclbin --xclbin-name=aie.xclbin \
             --aie-generate-npu-insts --npu-insts-name=insts.bin \
             aie.mlir 2>"${test_dir}/aiecc.log") || {
@@ -135,7 +137,7 @@ compile_one() {
     }
 }
 export -f compile_one
-export OUT_DIR FORCE_COMPILE XILINX_VITIS_AIETOOLS
+export OUT_DIR FORCE_COMPILE PEANO_INSTALL_DIR
 
 echo "$TESTS" | awk '{print $1}' | xargs -P "$JOBS" -I{} bash -c 'compile_one "$1"' _ {}
 echo ""
@@ -194,8 +196,8 @@ if $RUN_EMU; then
     export HOST_BIN OUT_DIR RESULTS_DIR SEED
 
     echo "$TESTS" | while IFS=' ' read -r name in_size out_size; do
-        echo "$name $in_size $out_size"
-    done | xargs -P "$JOBS" -I{} bash -c 'set -- {}; run_emu_one "$1" "$2" "$3"' _
+        printf '%s\0%s\0%s\0' "$name" "$in_size" "$out_size"
+    done | xargs -0 -n3 -P "$JOBS" bash -c 'run_emu_one "$1" "$2" "$3"' _
     echo ""
 fi
 
