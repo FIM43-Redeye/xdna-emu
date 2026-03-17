@@ -396,6 +396,7 @@ impl MemoryUnit {
         neighbors: Option<&mut NeighborMemory>,
     ) {
         let addr = Self::get_address(op, ctx);
+        log::trace!("[VLDA] addr=0x{:X} dest={:?}", addr, op.dest);
         let latency = load_latency_for_address(addr);
 
         // Track bank access for conflict detection (local memory only)
@@ -583,6 +584,7 @@ impl MemoryUnit {
         // Use get_store_address which searches all sources for Memory operand.
         // For vst, sources[0] is the vector data, Memory is sources[1].
         let addr = Self::get_store_address(op, ctx);
+        log::debug!("[VST] addr=0x{:X} sources={:?} dest={:?}", addr, op.sources, op.dest);
 
         // Track bank access for conflict detection (local memory only)
         let (quadrant, local_offset) = decode_data_address(addr);
@@ -590,21 +592,24 @@ impl MemoryUnit {
             ctx.record_core_bank_access(local_offset as u32, 32, tile.num_banks());
         }
 
-        // Get vector register from source or dest
-        // For VST, the vector data comes from a source operand (second source)
-        // or sometimes the dest field is used for the value
+        // Get vector register from sources or dest.
+        // For VST, the vector data may be in any source position (the decoder
+        // may place VectorReg before or after the Memory operand).
         let vec_reg = op
             .sources
-            .get(1)
-            .or(op.dest.as_ref())
-            .and_then(|operand| match operand {
+            .iter()
+            .chain(op.dest.iter())
+            .find_map(|operand| match operand {
                 Operand::VectorReg(r) => Some(*r),
                 _ => None,
             });
 
         if let Some(r) = vec_reg {
             let vec_data = ctx.vector.read(r);
+            log::trace!("[VST] writing v{} to addr=0x{:X}", r, addr);
             Self::write_vector_to_memory(tile, addr, vec_data, neighbors);
+        } else {
+            log::warn!("[VST] no vector register found! sources={:?} dest={:?}", op.sources, op.dest);
         }
 
         // Apply post-modify (vector width = 32 bytes)
