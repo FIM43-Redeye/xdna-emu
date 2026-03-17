@@ -415,7 +415,7 @@ class TestRegisterNames:
                                operand_type="register+16",
                                instr_name="VGE_D8")
         assert ":" in names[0]
-        assert names[0] == "r17:r16"
+        assert names[0] == "r19:r18"  # r17:r16 avoided (r16 callee-saved)
     def test_result_latency_scalar_alu(self):
         """Scalar ALU instructions have 1-cycle result latency."""
         instr = {"sched_class": "II_ABS"}

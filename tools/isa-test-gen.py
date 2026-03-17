@@ -155,10 +155,12 @@ def classify_instruction(instr: dict) -> tuple[str, str]:
     if mnemonic in SIDE_EFFECT_MNEMONICS:
         return ("skipped", "no output (nop/side-effect)")
 
-    # 5b. Hardware counter reads need register pairs (eL) -- skip.
+    # 5b. Hardware counter/stream reads hang without active hardware.
     asm = instr.get("asm_string", "")
     if "cntr" in asm:
         return ("skipped", "hardware counter (register pair)")
+    if "SS" in asm and "mov" in mnemonic:
+        return ("skipped", "stream switch status read (hangs without streams)")
 
     operands = instr.get("operands", [])
 
@@ -294,11 +296,14 @@ def register_names(kind: str, bit_width: int = 0,
     if kind == "scalar":
         if operand_type == "register+16":
             if _needs_register_pair(instr_name):
-                # eL register pair class: l0 = r17:r16, l1 = r19:r18, etc.
-                return ["r17:r16", "r19:r18", "r21:r20", "r23:r22",
+                # eL register pair class: l1 = r19:r18, l2 = r21:r20, etc.
+                # Avoid l0 (r17:r16) -- r16 is callee-saved in the
+                # mlir-aie runtime and clobbering it can deadlock DMA.
+                return ["r19:r18", "r21:r20", "r23:r22",
                         "r25:r24", "r27:r26", "r29:r28", "r31:r30"]
-            # eRS8 high scalar class (r16-r23, 3-bit encoding).
-            return ["r16", "r17", "r18", "r19", "r20", "r21", "r22", "r23"]
+            # eRS8 high scalar class.  Avoid r16 (callee-saved by
+            # mlir-aie runtime, clobbering causes lock release failure).
+            return ["r17", "r18", "r19", "r20", "r21", "r22", "r23"]
         if bit_width == 2:
             # Shift registers (mSm/mSs class).
             return ["s0", "s1", "s2", "s3"]
