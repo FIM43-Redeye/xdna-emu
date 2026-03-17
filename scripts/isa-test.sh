@@ -225,9 +225,9 @@ if $RUN_HW; then
             -k MLIR_AIE \
             -i "${batch_dir}/insts.bin" \
             --in-size "$in_size" --out-size "$out_size" \
-            --seed "$SEED" --out-file "$hw_out" 2>/dev/null && \
+            --seed "$SEED" --out-file "$hw_out" 2>"${RESULTS_DIR}/batch_${idx}_hw.log" && \
             echo "  HW OK: batch_${idx}" || \
-            echo "  HW FAIL: batch_${idx}"
+            echo "  HW FAIL: batch_${idx} (see ${RESULTS_DIR}/batch_${idx}_hw.log)"
     done <<< "$BATCH_INFO"
     echo ""
 fi
@@ -252,9 +252,9 @@ if $RUN_EMU; then
             -k MLIR_AIE \
             -i "${batch_dir}/insts.bin" \
             --in-size "$in_size" --out-size "$out_size" \
-            --seed "$SEED" --out-file "$emu_out" 2>/dev/null && \
+            --seed "$SEED" --out-file "$emu_out" 2>"${RESULTS_DIR}/batch_${idx}_emu.log" && \
             echo "  EMU OK: batch_${idx}" || \
-            echo "  EMU FAIL: batch_${idx}"
+            echo "  EMU FAIL: batch_${idx} (see ${RESULTS_DIR}/batch_${idx}_emu.log)"
     }
     export -f run_emu_one
     export HOST_BIN OUT_DIR RESULTS_DIR SEED

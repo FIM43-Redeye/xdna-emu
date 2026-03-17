@@ -2128,7 +2128,8 @@ impl VectorAlu {
             ElementType::Int32 => {
                 for i in 0..8 {
                     let val = src[i] as i32;
-                    result[i] = val.abs() as u32;
+                    // Hardware saturates: abs(MIN) = MAX (not overflow).
+                    result[i] = val.saturating_abs() as u32;
                 }
             }
             ElementType::UInt32 => {
@@ -2145,8 +2146,9 @@ impl VectorAlu {
                 for i in 0..8 {
                     let lo = (src[i] & 0xFFFF) as i16;
                     let hi = ((src[i] >> 16) & 0xFFFF) as i16;
-                    let r_lo = lo.abs() as u16;
-                    let r_hi = hi.abs() as u16;
+                    // Hardware saturates: abs(-32768) = 32767.
+                    let r_lo = lo.saturating_abs() as u16;
+                    let r_hi = hi.saturating_abs() as u16;
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -2167,7 +2169,8 @@ impl VectorAlu {
                     let mut r = 0u32;
                     for j in 0..4 {
                         let byte = ((src[i] >> (j * 8)) & 0xFF) as i8;
-                        let r_byte = byte.abs() as u8;
+                        // Hardware saturates: abs(-128) = 127.
+                        let r_byte = byte.saturating_abs() as u8;
                         r |= (r_byte as u32) << (j * 8);
                     }
                     result[i] = r;
@@ -2234,13 +2237,14 @@ impl VectorAlu {
     }
 
     /// Vector negate: dst = -src (per element negation).
+    /// Hardware uses two's complement wrapping: -MIN = MIN.
     fn vector_negate(src: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
         let mut result = [0u32; 8];
 
         match elem_type {
             ElementType::Int32 => {
                 for i in 0..8 {
-                    result[i] = (-(src[i] as i32)) as u32;
+                    result[i] = (src[i] as i32).wrapping_neg() as u32;
                 }
             }
             ElementType::UInt32 => {
@@ -2258,8 +2262,8 @@ impl VectorAlu {
                 for i in 0..8 {
                     let lo = (src[i] & 0xFFFF) as i16;
                     let hi = ((src[i] >> 16) & 0xFFFF) as i16;
-                    let r_lo = (-lo) as u16;
-                    let r_hi = (-hi) as u16;
+                    let r_lo = lo.wrapping_neg() as u16;
+                    let r_hi = hi.wrapping_neg() as u16;
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -2286,7 +2290,7 @@ impl VectorAlu {
                     let mut r = 0u32;
                     for j in 0..4 {
                         let byte = ((src[i] >> (j * 8)) & 0xFF) as i8;
-                        let r_byte = (-byte) as u8;
+                        let r_byte = byte.wrapping_neg() as u8;
                         r |= (r_byte as u32) << (j * 8);
                     }
                     result[i] = r;

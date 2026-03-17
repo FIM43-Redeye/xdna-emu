@@ -217,7 +217,11 @@ pub fn srs_lane(
     //
     // Apply the internal BIAS: the hardware left-shifts the input by BIAS
     // to provide extra precision, then right-shifts by (user_shift + BIAS).
-    let total_shift = shift + BIAS;
+    //
+    // Clamp total_shift: if shift is absurdly large (e.g., random test data),
+    // the result is just the sign extension (0 or -1). Cap at 127 to avoid
+    // Rust's shift-by->=bitwidth panic on i128.
+    let total_shift = shift.saturating_add(BIAS).min(127);
 
     // Work in i128 to avoid overflow during the bias shift.
     let a: i128 = (value as i128) << BIAS;
@@ -230,10 +234,24 @@ pub fn srs_lane(
         // The value before shifting has been left-shifted by 1 relative to
         // the guard bit position. Guard bit is at position `total_shift`
         // in the doubled value (a << 1), sticky is the OR of bits below that.
-        let doubled = a << 1;
+        //
+        // When total_shift is very large (>= 126), virtually all bits are
+        // shifted out. Guard/sticky/LSB signals are derived from what remains
+        // after the massive shift, which is effectively the sign extension.
+        // Clamp individual shift amounts to avoid Rust panics on >= 128.
+        let doubled = a.wrapping_shl(1);
         let stk = truncate_nonzero(doubled, total_shift);
-        let grd = ((doubled >> total_shift) & 1) != 0;
-        let lsb = ((doubled >> (total_shift + 1)) & 1) != 0;
+        let grd = if total_shift < 128 {
+            ((doubled >> total_shift) & 1) != 0
+        } else {
+            false
+        };
+        let lsb_shift = total_shift.saturating_add(1);
+        let lsb = if lsb_shift < 128 {
+            ((doubled >> lsb_shift) & 1) != 0
+        } else {
+            false
+        };
         (grd, stk, lsb)
     } else {
         (false, false, ((a >> 1) & 1) != 0)
@@ -279,7 +297,9 @@ fn truncate_nonzero(value: i128, bits: u32) -> bool {
     if bits >= 128 {
         return value != 0;
     }
-    let mask = (1i128 << bits) - 1;
+    // Use unsigned arithmetic for the mask to avoid overflow when bits=127
+    // (1i128 << 127 = i128::MIN, subtracting 1 would overflow).
+    let mask = ((1u128 << bits) - 1) as i128;
     (value & mask) != 0
 }
 
