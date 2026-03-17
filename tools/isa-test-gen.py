@@ -355,6 +355,11 @@ def immediate_values(bit_width: int, signed: bool = True,
 # Task 3: Assembly Test Point Generation
 # ---------------------------------------------------------------------------
 
+def _align(offset: int, alignment: int) -> int:
+    """Round up offset to the next multiple of alignment."""
+    return (offset + alignment - 1) & ~(alignment - 1)
+
+
 def _padda_sequence(ptr_reg: str, base_ptr: str, offset: int) -> list[str]:
     """Generate pointer arithmetic sequence to reach a large offset.
 
@@ -630,6 +635,9 @@ def generate_test_point(
         kind = op.get("register_kind", "")
         if kind not in KNOWN_REGISTER_KINDS:
             continue
+        # Align offset for this operand's natural alignment.
+        align = 32 if kind in ("vector256", "vector512", "accumulator") else 4
+        cur_in_offset = _align(cur_in_offset, align)
         reg = regs.get(op_name, "r0")
         load_lines = _load_instruction(reg, kind, "p0", cur_in_offset)
         lines.extend(load_lines)
@@ -649,6 +657,9 @@ def generate_test_point(
     cur_out_offset = out_offset
     for op in outputs:
         kind = op.get("register_kind", "")
+        # Align offset for this operand's natural alignment.
+        align = 32 if kind in ("vector256", "vector512", "accumulator") else 4
+        cur_out_offset = _align(cur_out_offset, align)
         reg = regs.get(op["name"], "r0")
         store_lines = _store_instruction(reg, kind, "p1", cur_out_offset)
         lines.extend(store_lines)
@@ -799,6 +810,8 @@ def _compute_input_size(instr: dict, regs: dict[str, str]) -> int:
         kind = op.get("register_kind", "")
         if kind not in KNOWN_REGISTER_KINDS:
             continue
+        align = 32 if kind in ("vector256", "vector512", "accumulator") else 4
+        total = _align(total, align)
         total += _operand_size(op, instr_name)
     return max(4, total)
 
@@ -809,6 +822,9 @@ def _compute_output_size(instr: dict) -> int:
     instr_name = instr.get("name", "")
     total = 0
     for op in outputs:
+        kind = op.get("register_kind", "")
+        align = 32 if kind in ("vector256", "vector512", "accumulator") else 4
+        total = _align(total, align)
         total += _operand_size(op, instr_name)
     return max(4, total)
 
@@ -844,16 +860,13 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         for instr in instrs:
             all_instrs.append(instr)
 
-    # Classify and generate combos.
+    # Classify and generate combos.  First pass: collect test point specs
+    # (instruction + operand combos) without generating assembly yet.
+    # Assembly generation happens per-batch so offsets reset to zero.
     testable_count = 0
     skipped_count = 0
     skip_reasons: dict[str, int] = {}
-    test_points_meta: list[dict] = []  # per-test-point metadata
-    test_points_asm: list[str] = []    # generated assembly strings
-
-    # Track running offsets across all test points (reset per batch later).
-    global_in_offset = 0
-    global_out_offset = 0
+    test_point_specs: list[tuple[dict, int, dict]] = []  # (instr, combo_idx, regs)
 
     for instr in all_instrs:
         status, reason = classify_instruction(instr)
@@ -866,44 +879,50 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         combos = generate_operand_combos(instr)
 
         for combo_idx, regs in enumerate(combos):
+            test_point_specs.append((instr, combo_idx, regs))
+
+    # Batch test points into mega-programs, generating assembly per-batch
+    # with offsets that reset to zero at each batch boundary.
+    batches = []
+    batch_idx = 0
+    i = 0
+    while i < len(test_point_specs):
+        end = min(i + MAX_POINTS_PER_BATCH, len(test_point_specs))
+        batch_specs = test_point_specs[i:end]
+
+        # Generate assembly and metadata for this batch with local offsets.
+        batch_in_offset = 0
+        batch_out_offset = 0
+        batch_asm = []
+        batch_meta = []
+
+        for instr, combo_idx, regs in batch_specs:
             in_size = _compute_input_size(instr, regs)
             out_size = _compute_output_size(instr)
+            # Align offsets to avoid vlda/vst alignment assertions.
+            # Vector loads/stores require 32-byte alignment.
+            batch_in_offset = _align(batch_in_offset, 32)
+            batch_out_offset = _align(batch_out_offset, 32)
 
             asm = generate_test_point(
                 instr, regs,
-                in_offset=global_in_offset,
-                out_offset=global_out_offset,
+                in_offset=batch_in_offset,
+                out_offset=batch_out_offset,
             )
-            test_points_asm.append(asm)
-            test_points_meta.append({
+            batch_asm.append(asm)
+            batch_meta.append({
                 "instruction": instr["name"],
                 "slot": instr.get("slot", ""),
                 "combo_index": combo_idx,
                 "operands": regs,
-                "in_offset": global_in_offset,
+                "in_offset": batch_in_offset,
                 "in_size": in_size,
-                "out_offset": global_out_offset,
+                "out_offset": batch_out_offset,
                 "out_size": out_size,
             })
 
-            global_in_offset += in_size
-            global_out_offset += out_size
-
-    # Batch test points into mega-programs.
-    batches = []
-    batch_idx = 0
-    i = 0
-    while i < len(test_points_asm):
-        end = min(i + MAX_POINTS_PER_BATCH, len(test_points_asm))
-        batch_asm = test_points_asm[i:end]
-        batch_meta = test_points_meta[i:end]
-
-        # Compute batch-level buffer sizes from constituent test points.
-        batch_in_size = 0
-        batch_out_size = 0
-        for m in batch_meta:
-            batch_in_size = max(batch_in_size, m["in_offset"] + m["in_size"])
-            batch_out_size = max(batch_out_size, m["out_offset"] + m["out_size"])
+            batch_in_offset += in_size
+            batch_out_offset += out_size
 
         # Write .s file.
         filename = f"batch_{batch_idx:03d}.s"
@@ -916,8 +935,8 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
             "batch_index": batch_idx,
             "filename": filename,
             "test_count": len(batch_asm),
-            "in_size": batch_in_size,
-            "out_size": batch_out_size,
+            "in_size": batch_in_offset,
+            "out_size": batch_out_offset,
             "tests": batch_meta,
         })
 
@@ -928,7 +947,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     manifest = {
         "testable_instructions": testable_count,
         "skipped_instructions": skipped_count,
-        "total_test_points": len(test_points_asm),
+        "total_test_points": len(test_point_specs),
         "total_batches": len(batches),
         "skip_reasons": skip_reasons,
         "batches": batches,
