@@ -248,8 +248,8 @@ class TestClassifyInstruction:
         status, _ = classify_instruction(instr)
         assert status == "skipped"
 
-    def test_skip_register_plus_16(self):
-        """register+16 is not a standard register kind."""
+    def test_skip_hardware_counter(self):
+        """MOV_CNTR reads hardware counter and uses register pairs -- skip."""
         instr = _make_instr("MOV_CNTR", "mov", "mov\t$dst, cntr", [
             {
                 "name": "dst",
@@ -295,6 +295,24 @@ class TestClassifyInstruction:
         status, reason = classify_instruction(instr)
         assert status == "skipped"
         assert "sparse" in reason or "bw=2" in reason
+
+    def test_register_plus_16_testable(self):
+        """Vector compare with register+16 output (eRS8) is testable."""
+        instr = _make_instr("VGE_D16", "vge.d16", "vge.d16\t$cmp, $s1, $s2", [
+            {
+                "name": "cmp",
+                "bit_width": 3,
+                "is_output": False,
+                "operand_type": "register+16",
+                "register_kind": "scalar",
+                "signed": False,
+                "scale": None,
+            },
+            _make_reg_op("s1", "vector512"),
+            _make_reg_op("s2", "vector512"),
+        ])
+        status, _ = classify_instruction(instr)
+        assert status == "testable"
 
 
 # ===================================================================
@@ -381,6 +399,22 @@ class TestRegisterNames:
         """Scalar with 5-bit encoding -> general r0-r31."""
         names = register_names("scalar", bit_width=5)
         assert all(n.startswith("r") for n in names)
+
+    def test_register_plus_16_single(self):
+        """register+16 for 16/32-bit ops -> r16-r23 (single registers)."""
+        names = register_names("scalar", bit_width=3,
+                               operand_type="register+16",
+                               instr_name="VGE_D16")
+        assert all(n.startswith("r") for n in names)
+        assert ":" not in names[0]
+
+    def test_register_plus_16_pair(self):
+        """register+16 for 8-bit ops -> register pairs (r17:r16 etc.)."""
+        names = register_names("scalar", bit_width=3,
+                               operand_type="register+16",
+                               instr_name="VGE_D8")
+        assert ":" in names[0]
+        assert names[0] == "r17:r16"
 
 
 # ===================================================================

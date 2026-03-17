@@ -62,6 +62,10 @@ SAFE_OPERAND_TYPES = frozenset({
     "register", "immediate",
 })
 
+# Operand types that are equivalent to "register" with an encoding offset.
+# "register+16" maps to eRS8 (r16-r23) or eL (register pairs) in the ISA.
+REGISTER_LIKE_TYPES = frozenset({"register", "register+16"})
+
 # Size in bytes for each register kind (for offset calculations).
 REGISTER_SIZES = {
     "scalar": 4,
@@ -117,6 +121,11 @@ def classify_instruction(instr: dict) -> tuple[str, str]:
     if mnemonic in SIDE_EFFECT_MNEMONICS:
         return ("skipped", "no output (nop/side-effect)")
 
+    # 5b. Hardware counter reads need register pairs (eL) -- skip.
+    asm = instr.get("asm_string", "")
+    if "cntr" in asm:
+        return ("skipped", "hardware counter (register pair)")
+
     operands = instr.get("operands", [])
 
     # 6. No operands at all -> no output.
@@ -130,9 +139,7 @@ def classify_instruction(instr: dict) -> tuple[str, str]:
             return ("skipped", "composite register operand")
         if op_type == "unknown":
             return ("skipped", "unknown operand type")
-        if op_type == "register+16":
-            return ("skipped", "register+16 operand type")
-        if op_type == "register":
+        if op_type in REGISTER_LIKE_TYPES:
             kind = op.get("register_kind")
             if kind and kind not in KNOWN_REGISTER_KINDS:
                 return ("skipped", f"unknown register kind: {kind}")
@@ -196,13 +203,13 @@ def detect_output_operands(instr: dict) -> list[dict]:
     first_name = asm_op_names[0]
     if first_name in op_by_name:
         first_op = op_by_name[first_name]
-        if first_op.get("operand_type") == "register":
+        if first_op.get("operand_type") in REGISTER_LIKE_TYPES:
             outputs.append(first_op)
 
-    # Also check for any operand explicitly named "dst".
+    # Also check for any operand explicitly named "dst" or "d".
     for op in operands:
-        if op["name"] == "dst" and op not in outputs:
-            if op.get("operand_type") == "register":
+        if op["name"] in ("dst", "d") and op not in outputs:
+            if op.get("operand_type") in REGISTER_LIKE_TYPES:
                 outputs.append(op)
 
     return outputs
@@ -212,19 +219,52 @@ def detect_output_operands(instr: dict) -> list[dict]:
 # Task 2: Register Name Mapping
 # ---------------------------------------------------------------------------
 
-def register_names(kind: str, bit_width: int = 0) -> list[str]:
+def _needs_register_pair(instr_name: str) -> bool:
+    """Check if a register+16 operand needs a register pair (eL) vs single (eRS8).
+
+    8-bit element and 64-bit element variants use eL (64-bit register pairs)
+    because the comparison bitmask or data value exceeds 32 bits.
+    The vec_size=0b00 (8-bit) encoding uses eL in the TableGen definitions.
+    """
+    name = instr_name.upper()
+    # Explicit 8-bit element variants: _D8, _S8, _8, or trailing 8
+    # (e.g., VNEG_GTZ8, VEQZ_8, VABS_GTZ_D8)
+    if name.endswith(("_D8", "_S8", "_8", "8")):
+        # Exclude names ending in 16/32/BF16 etc.
+        if not name.endswith(("16", "32", "BF16")):
+            return True
+    # 64-bit element variants
+    if name.endswith("_64"):
+        return True
+    # Special cases
+    if name in ("MOV_CNTR",):
+        return True
+    return False
+
+
+def register_names(kind: str, bit_width: int = 0,
+                   operand_type: str = "register",
+                   instr_name: str = "") -> list[str]:
     """Return a list of representative register names for a register kind.
 
-    Uses bit_width to distinguish register subclasses:
+    Uses bit_width and operand_type to distinguish register subclasses:
       - accumulator, 4 bits -> cm0-cm8 (1024-bit full accumulators)
       - accumulator, 5 bits -> bml0-bml8, bmh0-bmh8 (512-bit halves)
       - accumulator, 6 bits -> amll0, amlh0, amhl0, amhh0 (256-bit quarters)
       - scalar, 2 bits -> s0-s3 (shift registers)
       - scalar, 5 bits -> r0-r31 (general purpose)
+      - register+16, scalar, 3 bits -> r16-r23 (eRS8 high scalar class)
 
     Reserves p0/p1 for buffer base pointers (input/output).
     """
     if kind == "scalar":
+        if operand_type == "register+16":
+            if _needs_register_pair(instr_name):
+                # eL register pair class: l0 = r17:r16, l1 = r19:r18, etc.
+                return ["r17:r16", "r19:r18", "r21:r20", "r23:r22",
+                        "r25:r24", "r27:r26", "r29:r28", "r31:r30"]
+            # eRS8 high scalar class (r16-r23, 3-bit encoding).
+            return ["r16", "r17", "r18", "r19", "r20", "r21", "r22", "r23"]
         if bit_width == 2:
             # Shift registers (mSm/mSs class).
             return ["s0", "s1", "s2", "s3"]
@@ -376,6 +416,13 @@ def _load_instruction(reg_name: str, kind: str, ptr: str, offset: int) -> list[s
             return _scalar_load("r14", ptr, offset) + [
                 f"  mov {reg_name}, r14",
             ]
+        # Register pairs (r17:r16, etc.) need two loads.
+        if ":" in reg_name:
+            hi, lo = reg_name.split(":")
+            return (
+                _scalar_load(lo, ptr, offset)
+                + _scalar_load(hi, ptr, offset + 4)
+            )
         return _scalar_load(reg_name, ptr, offset)
     if kind == "pointer":
         return _scalar_load(reg_name, ptr, offset)
@@ -449,6 +496,13 @@ def _store_instruction(reg_name: str, kind: str, ptr: str, offset: int) -> list[
         # mov to scratch scalar r14, then store.
         if reg_name.startswith("s"):
             return [f"  mov r14, {reg_name}"] + _scalar_store("r14", ptr, offset)
+        # Register pairs (r17:r16, etc.) need two stores.
+        if ":" in reg_name:
+            hi, lo = reg_name.split(":")
+            return (
+                _scalar_store(lo, ptr, offset)
+                + _scalar_store(hi, ptr, offset + 4)
+            )
         return _scalar_store(reg_name, ptr, offset)
     if kind == "pointer":
         # Store pointer as scalar -- mov to scalar first, then store.
@@ -571,7 +625,7 @@ def generate_test_point(
         if op_name not in op_by_name:
             continue
         op = op_by_name[op_name]
-        if op["operand_type"] != "register":
+        if op["operand_type"] not in REGISTER_LIKE_TYPES:
             continue
         kind = op.get("register_kind", "")
         if kind not in KNOWN_REGISTER_KINDS:
@@ -579,7 +633,7 @@ def generate_test_point(
         reg = regs.get(op_name, "r0")
         load_lines = _load_instruction(reg, kind, "p0", cur_in_offset)
         lines.extend(load_lines)
-        cur_in_offset += REGISTER_SIZES.get(kind, 4)
+        cur_in_offset += _operand_size(op, name)
 
     # NOP sled before instruction.
     lines.extend(_nop_sled(5))
@@ -598,7 +652,7 @@ def generate_test_point(
         reg = regs.get(op["name"], "r0")
         store_lines = _store_instruction(reg, kind, "p1", cur_out_offset)
         lines.extend(store_lines)
-        cur_out_offset += REGISTER_SIZES.get(kind, 4)
+        cur_out_offset += _operand_size(op, name)
 
     lines.append("")
     return "\n".join(lines)
@@ -667,10 +721,11 @@ def generate_operand_combos(instr: dict) -> list[dict[str, str]]:
         op = op_by_name[op_name]
         op_type = op.get("operand_type", "")
 
-        if op_type == "register":
+        if op_type in REGISTER_LIKE_TYPES:
             kind = op.get("register_kind", "")
             bw = op.get("bit_width", 0)
-            names = register_names(kind, bw)
+            names = register_names(kind, bw, operand_type=op_type,
+                                   instr_name=instr.get("name", ""))
             if not names:
                 defaults[op_name] = "r0"
                 alternatives[op_name] = []
@@ -712,6 +767,17 @@ def generate_operand_combos(instr: dict) -> list[dict[str, str]]:
 # Task 4: Test Point Metadata
 # ---------------------------------------------------------------------------
 
+def _operand_size(op: dict, instr_name: str = "") -> int:
+    """Compute the storage size in bytes for a single register operand."""
+    kind = op.get("register_kind", "")
+    base = REGISTER_SIZES.get(kind, 4)
+    # Register pairs (eL class) need double the scalar size.
+    if (op.get("operand_type") == "register+16"
+            and _needs_register_pair(instr_name)):
+        return 8
+    return base
+
+
 def _compute_input_size(instr: dict, regs: dict[str, str]) -> int:
     """Compute total input buffer size for a test point."""
     operands = instr.get("operands", [])
@@ -719,6 +785,7 @@ def _compute_input_size(instr: dict, regs: dict[str, str]) -> int:
     outputs = detect_output_operands(instr)
     output_names = {op["name"] for op in outputs}
     asm_op_names = re.findall(r'\$(\w+)', instr.get("asm_string", ""))
+    instr_name = instr.get("name", "")
 
     total = 0
     for op_name in asm_op_names:
@@ -727,22 +794,22 @@ def _compute_input_size(instr: dict, regs: dict[str, str]) -> int:
         if op_name not in op_by_name:
             continue
         op = op_by_name[op_name]
-        if op["operand_type"] != "register":
+        if op["operand_type"] not in REGISTER_LIKE_TYPES:
             continue
         kind = op.get("register_kind", "")
         if kind not in KNOWN_REGISTER_KINDS:
             continue
-        total += REGISTER_SIZES.get(kind, 4)
+        total += _operand_size(op, instr_name)
     return max(4, total)
 
 
 def _compute_output_size(instr: dict) -> int:
     """Compute total output buffer size for a test point."""
     outputs = detect_output_operands(instr)
+    instr_name = instr.get("name", "")
     total = 0
     for op in outputs:
-        kind = op.get("register_kind", "")
-        total += REGISTER_SIZES.get(kind, 4)
+        total += _operand_size(op, instr_name)
     return max(4, total)
 
 
