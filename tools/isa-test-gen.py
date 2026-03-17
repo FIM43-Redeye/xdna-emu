@@ -544,7 +544,7 @@ def _store_instruction(reg_name: str, kind: str, ptr: str, offset: int) -> list[
         return [
             f"  // store accumulator {reg_name}: srs {srs_src} to wl{idx} then vst",
             f"  vsrs.s16.s32 wl{idx}, {srs_src}, s0",
-        ] + _nop_sled(5) + _vector_store(f"wl{idx}", ptr, offset)
+        ] + _nop_sled(7) + _vector_store(f"wl{idx}", ptr, offset)
     if kind == "control":
         return _scalar_store(reg_name, ptr, offset)
     if kind in ("modifier_m", "modifier_dj"):
@@ -643,15 +643,21 @@ def generate_test_point(
         lines.extend(load_lines)
         cur_in_offset += _operand_size(op, name)
 
-    # NOP sled before instruction.
-    lines.extend(_nop_sled(5))
+    # NOP sled before instruction: must cover load pipeline latency.
+    # AIE2 lda/vlda latency is 7 cycles (from AIE2Schedule.td).
+    # The load instruction itself is cycle 0, so we need 7 NOPs after
+    # the LAST load before the loaded value is available.
+    lines.extend(_nop_sled(7))
 
     # The instruction itself.
     asm_line = "  " + _substitute_asm(instr["asm_string"], regs)
     lines.append(asm_line)
 
-    # NOP sled after instruction.
-    lines.extend(_nop_sled(5))
+    # NOP sled after instruction: must cover result latency before store.
+    # Scalar ALU = 1 cycle, vector ALU = 1-2 cycles, VMAC = 3-4 cycles.
+    # Use 7 conservatively (matches load latency) to be safe for all
+    # instruction types.  The store reads the register at cycle 1.
+    lines.extend(_nop_sled(7))
 
     # Store output registers to [p1, #offset].
     cur_out_offset = out_offset
