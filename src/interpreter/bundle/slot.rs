@@ -251,6 +251,9 @@ pub struct SlotOp {
 
     /// Whether this is a vector (SIMD) operation.
     pub is_vector: bool,
+    /// Whether this operates on 512-bit (x) registers rather than 256-bit (w).
+    /// When true, the VectorAlu processes both halves (reg and reg+1).
+    pub is_wide_vector: bool,
     /// Element type for vector operations (None for scalar).
     pub element_type: Option<ElementType>,
     /// Memory access width for load/store operations.
@@ -421,6 +424,7 @@ impl SlotOp {
             semantic: Some(SemanticOp::Nop),
             implicit_regs: SmallVec::new(),
             is_vector: false,
+            is_wide_vector: false,
             element_type: None,
             mem_width: MemWidth::Word,
             post_modify: PostModify::None,
@@ -478,6 +482,7 @@ impl SlotOp {
             semantic: Some(semantic),
             implicit_regs: SmallVec::new(),
             is_vector: false,
+            is_wide_vector: false,
             element_type: None,
             mem_width: MemWidth::Word,
             post_modify: PostModify::None,

@@ -523,8 +523,10 @@ impl InstructionDecoder {
             RegisterKind::ModifierDN => Operand::ModifierReg(reg + MOD_BASE_DN),
             RegisterKind::ModifierDJ => Operand::ModifierReg(reg + MOD_BASE_DJ),
             RegisterKind::ModifierDC => Operand::ModifierReg(reg + MOD_BASE_DC),
-            RegisterKind::Vector256 | RegisterKind::Vector512 =>
-                Operand::VectorReg(reg),
+            RegisterKind::Vector256 => Operand::VectorReg(reg),
+            // Vector512 (x-registers) span two 256-bit registers: x0={wl0,wh0}={v0,v1}.
+            // The 4-bit encoding index needs *2 to address the 256-bit register file.
+            RegisterKind::Vector512 => Operand::VectorReg(reg * 2),
             RegisterKind::Accumulator => Operand::AccumReg(reg),
             RegisterKind::Control => Operand::ControlReg(reg),
         }
@@ -819,6 +821,9 @@ impl InstructionDecoder {
 
         // ── Populate metadata from InstrEncoding ─────────────────────────
         slot_op.is_vector = enc.is_vector;
+        // Detect 512-bit (x-register) operations: any operand uses Vector512.
+        slot_op.is_wide_vector = enc.operand_fields.iter()
+            .any(|f| f.operand_type == OperandType::Register(RegisterKind::Vector512));
         slot_op.element_type = enc.element_type;
         slot_op.mem_width = match enc.mem_width {
             InstrMemWidth::Byte => MemWidth::Byte,

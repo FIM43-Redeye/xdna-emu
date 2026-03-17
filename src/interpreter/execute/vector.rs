@@ -60,6 +60,40 @@ impl VectorAlu {
         log::trace!("[VECTOR_ALU] Checking semantic={:?} element_type={:?} dest={:?}",
             semantic, op.element_type, op.dest);
 
+        // Process the low 256-bit half.
+        let handled = Self::execute_half(op, ctx, semantic, et);
+
+        // For 512-bit (x-register) operations, also process the high half.
+        // Create a temporary op with all VectorReg indices incremented by 1.
+        if handled && op.is_wide_vector {
+            let mut hi_op = op.clone();
+            Self::increment_vector_regs(&mut hi_op);
+            Self::execute_half(&hi_op, ctx, semantic, et);
+        }
+
+        handled
+    }
+
+    /// Increment all VectorReg indices by 1 (low half -> high half).
+    fn increment_vector_regs(op: &mut SlotOp) {
+        for src in &mut op.sources {
+            if let Operand::VectorReg(r) = src {
+                *r += 1;
+            }
+        }
+        if let Some(Operand::VectorReg(r)) = &mut op.dest {
+            *r += 1;
+        }
+    }
+
+    /// Execute one 256-bit half of a vector operation.
+    fn execute_half(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        semantic: SemanticOp,
+        et: ElementType,
+    ) -> bool {
+
         match semantic {
             // ========== Arithmetic ==========
 
