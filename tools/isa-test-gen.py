@@ -833,10 +833,27 @@ def _compute_output_size(instr: dict) -> int:
 # Task 4: Full Pipeline
 # ---------------------------------------------------------------------------
 
-# Maximum test points per batch.  16KB program memory / 16-byte VLIW bundle
-# gives 1024 bundles.  Each test point uses ~15 bundles (5 NOP + 1 instr +
-# 5 NOP + ~2 load + ~2 store).  Conservative limit: 70.
-MAX_POINTS_PER_BATCH = 70
+# Program memory limit: 16 KB = 16384 bytes.  Each assembly line produces
+# one VLIW bundle = 16 bytes.  The mega-program header (4 lines) and
+# return sequence (5 lines) consume 9 * 16 = 144 bytes of overhead.
+# We use a 10% safety margin: (16384 - 144) * 0.9 = ~14616 bytes = 913 bundles.
+PROG_MEM_BYTES = 16384
+BUNDLE_SIZE = 16
+PROG_OVERHEAD_BUNDLES = 9  # .text + .globl + label + blank + ret + 4 nops
+SAFETY_MARGIN = 0.90
+MAX_BUNDLES_PER_BATCH = int(
+    (PROG_MEM_BYTES / BUNDLE_SIZE - PROG_OVERHEAD_BUNDLES) * SAFETY_MARGIN
+)
+
+
+def _count_bundles(asm_text: str) -> int:
+    """Count the number of assembly bundles (non-empty, non-comment lines)."""
+    count = 0
+    for line in asm_text.split("\n"):
+        stripped = line.strip()
+        if stripped and not stripped.startswith("//"):
+            count += 1
+    return count
 
 
 def generate_all(isa_json_path: str, out_dir: str) -> dict:
@@ -881,26 +898,45 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         for combo_idx, regs in enumerate(combos):
             test_point_specs.append((instr, combo_idx, regs))
 
-    # Batch test points into mega-programs, generating assembly per-batch
-    # with offsets that reset to zero at each batch boundary.
+    # First pass: generate assembly for each test point at offset 0 to
+    # measure its code size (bundle count).  This lets us bin-pack into
+    # batches that fit within program memory.
+    measured_specs = []  # (instr, combo_idx, regs, bundle_count)
+    for instr, combo_idx, regs in test_point_specs:
+        asm = generate_test_point(instr, regs, in_offset=0, out_offset=0)
+        bundles = _count_bundles(asm)
+        measured_specs.append((instr, combo_idx, regs, bundles))
+
+    # Bin-pack into batches by measured code size.
     batches = []
     batch_idx = 0
     i = 0
-    while i < len(test_point_specs):
-        end = min(i + MAX_POINTS_PER_BATCH, len(test_point_specs))
-        batch_specs = test_point_specs[i:end]
+    while i < len(measured_specs):
+        # Greedily fill this batch until we'd exceed the program memory limit.
+        batch_bundle_total = 0
+        end = i
+        while end < len(measured_specs):
+            next_bundles = measured_specs[end][3]
+            if batch_bundle_total + next_bundles > MAX_BUNDLES_PER_BATCH:
+                break
+            batch_bundle_total += next_bundles
+            end += 1
+        # Must include at least one test point per batch.
+        if end == i:
+            end = i + 1
 
-        # Generate assembly and metadata for this batch with local offsets.
+        batch_specs = measured_specs[i:end]
+
+        # Second pass: regenerate assembly with correct per-batch offsets.
         batch_in_offset = 0
         batch_out_offset = 0
         batch_asm = []
         batch_meta = []
 
-        for instr, combo_idx, regs in batch_specs:
+        for instr, combo_idx, regs, _bundles in batch_specs:
             in_size = _compute_input_size(instr, regs)
             out_size = _compute_output_size(instr)
             # Align offsets to avoid vlda/vst alignment assertions.
-            # Vector loads/stores require 32-byte alignment.
             batch_in_offset = _align(batch_in_offset, 32)
             batch_out_offset = _align(batch_out_offset, 32)
 
