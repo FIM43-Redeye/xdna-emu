@@ -137,10 +137,28 @@ def classify_instruction(instr: dict) -> tuple[str, str]:
             if kind and kind not in KNOWN_REGISTER_KINDS:
                 return ("skipped", f"unknown register kind: {kind}")
 
-    # 8. Must have at least one register output.
+    # 8. Check for control-register outputs (side effects, not testable).
     outputs = detect_output_operands(instr)
+    for op in outputs:
+        if op.get("register_kind") == "control":
+            return ("skipped", "control register output (side effect)")
+
+    # 9. Must have at least one register output.
     if not outputs:
         return ("skipped", "no output operands detected")
+
+    # 10. Skip instructions with unusual accumulator subclasses:
+    #   - bit_width=2: composite/sparse register classes (mQQXw) misclassified
+    #     by the exporter.  Real accumulators use 4 bits (cm) or 5 bits (bm).
+    #   - bit_width=6: 256-bit accumulator quarters (amll/amlh/amhl/amhh).
+    #     These can't be loaded/stored via vsrs and only appear in VFLOOR.
+    for op in operands:
+        if op.get("register_kind") == "accumulator":
+            bw = op.get("bit_width", 0)
+            if bw == 2:
+                return ("skipped", "composite sparse register (bw=2)")
+            if bw == 6:
+                return ("skipped", "accumulator quarter register (bw=6)")
 
     return ("testable", "")
 
@@ -194,13 +212,23 @@ def detect_output_operands(instr: dict) -> list[dict]:
 # Task 2: Register Name Mapping
 # ---------------------------------------------------------------------------
 
-def register_names(kind: str) -> list[str]:
+def register_names(kind: str, bit_width: int = 0) -> list[str]:
     """Return a list of representative register names for a register kind.
+
+    Uses bit_width to distinguish register subclasses:
+      - accumulator, 4 bits -> cm0-cm8 (1024-bit full accumulators)
+      - accumulator, 5 bits -> bml0-bml8, bmh0-bmh8 (512-bit halves)
+      - accumulator, 6 bits -> amll0, amlh0, amhl0, amhh0 (256-bit quarters)
+      - scalar, 2 bits -> s0-s3 (shift registers)
+      - scalar, 5 bits -> r0-r31 (general purpose)
 
     Reserves p0/p1 for buffer base pointers (input/output).
     """
     if kind == "scalar":
-        # r0-r15 are general purpose.  Use a spread of values.
+        if bit_width == 2:
+            # Shift registers (mSm/mSs class).
+            return ["s0", "s1", "s2", "s3"]
+        # General purpose scalars (eR class).
         return ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r15"]
 
     if kind == "pointer":
@@ -216,12 +244,18 @@ def register_names(kind: str) -> list[str]:
         return ["x0", "x2", "x4"]
 
     if kind == "accumulator":
-        # cm0, cm2, cm4 ... (accumulator registers).
+        if bit_width == 5:
+            # 512-bit accumulator halves (mBMa/mBMm class).
+            return ["bml0", "bml2", "bmh0", "bmh2"]
+        if bit_width == 6:
+            # 256-bit accumulator quarters (mAMs class).
+            return ["amll0", "amlh0", "amhl0", "amhh0"]
+        # Default: 1024-bit full accumulators (eCM/mCMm class, 4-bit encoding).
         return ["cm0", "cm2", "cm4"]
 
     if kind == "control":
-        # Control registers -- limited set.
-        return ["r16", "r17"]
+        # Control registers (crSat, crRnd, etc.) -- not general r16/r17.
+        return ["crSat", "crRnd"]
 
     if kind == "modifier_m":
         return ["m0", "m1"]
@@ -237,11 +271,21 @@ def register_names(kind: str) -> list[str]:
 # Task 2: Immediate Value Generation
 # ---------------------------------------------------------------------------
 
-def immediate_values(bit_width: int, signed: bool = True) -> list[int]:
+def immediate_values(bit_width: int, signed: bool = True,
+                     scale: int = 1) -> list[int]:
     """Generate boundary test values for an immediate field.
 
-    Returns a deduplicated, sorted list of boundary values.
+    Args:
+        bit_width: Number of bits in the field (before scaling).
+        signed: Whether the field is signed.
+        scale: Scale factor -- values must be multiples of this.  For
+            example, PADDB has scale=4 (immediates must be multiples of 4).
+
+    Returns a deduplicated, sorted list of boundary values (already scaled).
     """
+    if scale is None or scale < 1:
+        scale = 1
+
     if signed:
         lo = -(1 << (bit_width - 1))
         hi = (1 << (bit_width - 1)) - 1
@@ -249,15 +293,20 @@ def immediate_values(bit_width: int, signed: bool = True) -> list[int]:
         lo = 0
         hi = (1 << bit_width) - 1
 
-    # Boundary values: min, max, zero, one, minus-one (if signed).
-    vals = {lo, hi, 0}
+    # Apply scale: raw field values are multiplied by scale to get the
+    # actual immediate value accepted by the assembler.
+    lo_scaled = lo * scale
+    hi_scaled = hi * scale
+
+    # Boundary values: min, max, zero, one step, minus-one step (if signed).
+    vals = {lo_scaled, hi_scaled, 0}
     if signed:
-        vals.add(-1)
+        vals.add(-scale)
     if hi > 0:
-        vals.add(1)
+        vals.add(scale)
 
     # Filter to valid range.
-    vals = {v for v in vals if lo <= v <= hi}
+    vals = {v for v in vals if lo_scaled <= v <= hi_scaled}
 
     return sorted(vals)
 
@@ -321,6 +370,12 @@ def _load_instruction(reg_name: str, kind: str, ptr: str, offset: int) -> list[s
         List of assembly lines.
     """
     if kind == "scalar":
+        # Shift registers (s0-s3) can't be loaded directly via lda.
+        # Load into scratch scalar r14, then mov to shift register.
+        if reg_name.startswith("s"):
+            return _scalar_load("r14", ptr, offset) + [
+                f"  mov {reg_name}, r14",
+            ]
         return _scalar_load(reg_name, ptr, offset)
     if kind == "pointer":
         return _scalar_load(reg_name, ptr, offset)
@@ -334,13 +389,23 @@ def _load_instruction(reg_name: str, kind: str, ptr: str, offset: int) -> list[s
             + _vector_load(f"wh{idx}", ptr, offset + 32)
         )
     if kind == "accumulator":
-        # Load as vector256 then upshift.  For test scaffolding, load
-        # zero into the accumulator by loading a vector and using vups.
-        # This is complex -- for now, load the low half as vector256.
-        # The actual accumulator content will be whatever vups produces.
-        idx = reg_name[2:]  # "cm0" -> "0"
+        # Load input data for accumulator registers.  Strategy depends on
+        # the register subclass:
+        #   cm0  (1024-bit) -> load wl0 as a 256-bit proxy
+        #   bml0 (512-bit)  -> load wl0 as a 256-bit proxy
+        #   bmh0 (512-bit)  -> load wl0 as a 256-bit proxy
+        #   amll0 (256-bit) -> load wl0 directly
+        if reg_name.startswith("cm"):
+            idx = reg_name[2:]
+        elif reg_name.startswith("bml") or reg_name.startswith("bmh"):
+            idx = reg_name[3:]
+        elif reg_name.startswith("am"):
+            # amll0, amlh0, amhl0, amhh0 -> index is last char
+            idx = reg_name[-1]
+        else:
+            idx = "0"
         return [
-            f"  // load accumulator {reg_name}: load wl{idx} then ups",
+            f"  // load accumulator {reg_name}: load wl{idx} as proxy",
         ] + _vector_load(f"wl{idx}", ptr, offset)
     if kind == "control":
         return _scalar_load(reg_name, ptr, offset)
@@ -380,6 +445,10 @@ def _store_instruction(reg_name: str, kind: str, ptr: str, offset: int) -> list[
         List of assembly lines.
     """
     if kind == "scalar":
+        # Shift registers (s0-s3) can't be stored directly via st.
+        # mov to scratch scalar r14, then store.
+        if reg_name.startswith("s"):
+            return [f"  mov r14, {reg_name}"] + _scalar_store("r14", ptr, offset)
         return _scalar_store(reg_name, ptr, offset)
     if kind == "pointer":
         # Store pointer as scalar -- mov to scalar first, then store.
@@ -398,11 +467,24 @@ def _store_instruction(reg_name: str, kind: str, ptr: str, offset: int) -> list[
         # Use vsrs to shift down to vector256, then store.
         # vsrs needs a 512-bit accumulator half (bml/bmh), not the 1024-bit cm.
         # The shift operand is s0 (shift register), not a general scalar.
-        # cm0 = {bml0, bmh0}.  We store the low half via bml.
-        idx = reg_name[2:]  # "cm0" -> "0"
+        if reg_name.startswith("cm"):
+            # cm0 = {bml0, bmh0}.  Store the low half via bml.
+            idx = reg_name[2:]
+            srs_src = f"bml{idx}"
+        elif reg_name.startswith("bml") or reg_name.startswith("bmh"):
+            # Already a 512-bit half -- use directly.
+            idx = reg_name[3:]
+            srs_src = reg_name
+        elif reg_name.startswith("am"):
+            # 256-bit quarter -- vsrs from the quarter register.
+            idx = reg_name[-1]
+            srs_src = reg_name
+        else:
+            idx = "0"
+            srs_src = f"bml{idx}"
         return [
-            f"  // store accumulator {reg_name}: srs bml{idx} to wl{idx} then vst",
-            f"  vsrs.s16.s32 wl{idx}, bml{idx}, s0",
+            f"  // store accumulator {reg_name}: srs {srs_src} to wl{idx} then vst",
+            f"  vsrs.s16.s32 wl{idx}, {srs_src}, s0",
         ] + _nop_sled(5) + _vector_store(f"wl{idx}", ptr, offset)
     if kind == "control":
         return _scalar_store(reg_name, ptr, offset)
@@ -414,6 +496,15 @@ def _store_instruction(reg_name: str, kind: str, ptr: str, offset: int) -> list[
 def _nop_sled(count: int = 5) -> list[str]:
     """Generate a NOP sled for pipeline safety."""
     return [f"  nop" for _ in range(count)]
+
+
+# Fixed-register operands in TableGen that aren't exported as variable
+# operands (e.g., eR29 = "always r29").  These appear as unsubstituted
+# $name tokens after normal operand substitution.
+FIXED_REGISTER_MAP = {
+    "idx": "r29",
+    "sel": "r28",
+}
 
 
 def _substitute_asm(asm_string: str, regs: dict[str, str]) -> str:
@@ -432,6 +523,11 @@ def _substitute_asm(asm_string: str, regs: dict[str, str]) -> str:
         if value.lstrip("-").isdigit():
             value = f"#{value}"
         result = result.replace(f"${name}", value)
+
+    # Replace any remaining $name tokens with known fixed registers.
+    for name, fixed_reg in FIXED_REGISTER_MAP.items():
+        result = result.replace(f"${name}", fixed_reg)
+
     return result
 
 
@@ -573,7 +669,8 @@ def generate_operand_combos(instr: dict) -> list[dict[str, str]]:
 
         if op_type == "register":
             kind = op.get("register_kind", "")
-            names = register_names(kind)
+            bw = op.get("bit_width", 0)
+            names = register_names(kind, bw)
             if not names:
                 defaults[op_name] = "r0"
                 alternatives[op_name] = []
@@ -584,7 +681,8 @@ def generate_operand_combos(instr: dict) -> list[dict[str, str]]:
         elif op_type == "immediate":
             bit_width = op.get("bit_width", 8)
             signed = op.get("signed", True)
-            vals = immediate_values(bit_width, signed)
+            scale = op.get("scale") or 1
+            vals = immediate_values(bit_width, signed, scale)
             if not vals:
                 defaults[op_name] = "0"
                 alternatives[op_name] = []

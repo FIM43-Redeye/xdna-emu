@@ -272,6 +272,30 @@ class TestClassifyInstruction:
         status, _ = classify_instruction(instr)
         assert status == "skipped"
 
+    def test_skip_control_register_output(self):
+        """MOVX writes to control registers -- skip (side effect)."""
+        instr = _make_instr("MOVX", "movx", "movx\t$mCRm, $mRx", [
+            _make_reg_op("mCRm", "control"),
+            _make_reg_op("mRx", "scalar"),
+        ])
+        status, reason = classify_instruction(instr)
+        assert status == "skipped"
+        assert "control" in reason
+
+    def test_skip_composite_sparse_register(self):
+        """Instructions with accumulator bw=2 are actually composite/sparse."""
+        instr = _make_instr("VNEGMSC_sparse", "vnegmsc",
+                            "vnegmsc\t$dst, $acc1, $xs1, $qxs2, $c", [
+            _make_reg_op("dst", "accumulator", bit_width=4),
+            _make_reg_op("acc1", "accumulator", bit_width=4),
+            _make_reg_op("xs1", "vector512"),
+            _make_reg_op("qxs2", "accumulator", bit_width=2),
+            _make_reg_op("c", "scalar"),
+        ])
+        status, reason = classify_instruction(instr)
+        assert status == "skipped"
+        assert "sparse" in reason or "bw=2" in reason
+
 
 # ===================================================================
 # Task 2: register_names tests
@@ -336,6 +360,28 @@ class TestRegisterNames:
         names = register_names("ERS4")
         assert names == []
 
+    def test_accumulator_bw4_returns_cm(self):
+        """Accumulator with 4-bit encoding -> 1024-bit cm registers."""
+        names = register_names("accumulator", bit_width=4)
+        assert all(n.startswith("cm") for n in names)
+
+    def test_accumulator_bw5_returns_bm(self):
+        """Accumulator with 5-bit encoding -> 512-bit bml/bmh halves."""
+        names = register_names("accumulator", bit_width=5)
+        assert any(n.startswith("bml") for n in names)
+        assert any(n.startswith("bmh") for n in names)
+
+    def test_scalar_bw2_returns_shift(self):
+        """Scalar with 2-bit encoding -> s0-s3 shift registers."""
+        names = register_names("scalar", bit_width=2)
+        assert all(n.startswith("s") for n in names)
+        assert len(names) == 4
+
+    def test_scalar_bw5_returns_general(self):
+        """Scalar with 5-bit encoding -> general r0-r31."""
+        names = register_names("scalar", bit_width=5)
+        assert all(n.startswith("r") for n in names)
+
 
 # ===================================================================
 # Task 2: immediate_values tests
@@ -364,6 +410,19 @@ class TestImmediateValues:
     def test_values_are_unique(self):
         vals = immediate_values(8, signed=True)
         assert len(vals) == len(set(vals))
+
+    def test_scaled_values_are_multiples(self):
+        """PADDB-style scaled immediates: all values must be multiples of scale."""
+        vals = immediate_values(9, signed=True, scale=4)
+        for v in vals:
+            assert v % 4 == 0, f"{v} is not a multiple of 4"
+
+    def test_scaled_range(self):
+        """9-bit signed field with scale=4 gives [-1024, 1020]."""
+        vals = immediate_values(9, signed=True, scale=4)
+        assert -1024 in vals  # -(2^8) * 4
+        assert 1020 in vals   # (2^8 - 1) * 4
+        assert 0 in vals
 
 
 # ===================================================================
