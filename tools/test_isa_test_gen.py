@@ -25,6 +25,7 @@ generate_test_point = isa_test_gen.generate_test_point
 build_mega_program = isa_test_gen.build_mega_program
 generate_operand_combos = isa_test_gen.generate_operand_combos
 generate_all = isa_test_gen.generate_all
+result_latency = isa_test_gen.result_latency
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +416,25 @@ class TestRegisterNames:
                                instr_name="VGE_D8")
         assert ":" in names[0]
         assert names[0] == "r17:r16"
+    def test_result_latency_scalar_alu(self):
+        """Scalar ALU instructions have 1-cycle result latency."""
+        instr = {"sched_class": "II_ABS"}
+        assert result_latency(instr) == 1
+
+    def test_result_latency_vmac(self):
+        """VMAC has 5-cycle result latency."""
+        instr = {"sched_class": "II_VMAC"}
+        assert result_latency(instr) == 5
+
+    def test_result_latency_vmacf(self):
+        """VMAC.F has 6-cycle result latency."""
+        instr = {"sched_class": "II_VMACf"}
+        assert result_latency(instr) == 6
+
+    def test_result_latency_default(self):
+        """Unknown sched_class gets conservative default."""
+        instr = {"sched_class": "II_NONEXISTENT_BOGUS"}
+        assert result_latency(instr) >= 5  # conservative default
 
 
 # ===================================================================
@@ -765,7 +785,10 @@ class TestGenerateAll:
             assert "batch_index" in batch
             assert "test_count" in batch
             assert batch["test_count"] > 0
-            assert batch["test_count"] <= 70  # MAX_POINTS_PER_BATCH
+            # Batches are sized by code footprint (program memory),
+            # not a fixed test count.  Sanity-check: no batch should have
+            # more than ~200 test points (would imply broken packing).
+            assert batch["test_count"] <= 200
             assert "in_size" in batch
             assert "out_size" in batch
             assert batch["in_size"] > 0

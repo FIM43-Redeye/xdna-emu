@@ -86,6 +86,40 @@ MAX_SCALAR_OFFSET = 124
 # Range: [-1024, 992].
 MAX_VECTOR_OFFSET = 992
 
+# Load pipeline latency: cycles from lda/vlda issue to register availability.
+# All lda/vlda variants have latency 7 in AIE2Schedule.td.
+LOAD_LATENCY = 7
+
+# Default result latency when sched_class is not in the latency map.
+DEFAULT_RESULT_LATENCY = 7
+
+# Scheduling model latencies: sched_class -> result latency in cycles.
+# Loaded from aie2-sched-latencies.json (extracted from AIE2Schedule.td).
+_SCHED_LATENCIES: dict[str, int] = {}
+
+
+def _load_sched_latencies() -> dict[str, int]:
+    """Load scheduling latencies from JSON, caching the result."""
+    global _SCHED_LATENCIES
+    if _SCHED_LATENCIES:
+        return _SCHED_LATENCIES
+    lat_path = os.path.join(os.path.dirname(__file__), "aie2-sched-latencies.json")
+    if os.path.exists(lat_path):
+        with open(lat_path) as f:
+            _SCHED_LATENCIES = json.load(f)
+    return _SCHED_LATENCIES
+
+
+def result_latency(instr: dict) -> int:
+    """Get the result latency for an instruction from the scheduling model.
+
+    Returns the number of cycles from instruction issue until its
+    destination register is available for reading.
+    """
+    sched_class = instr.get("sched_class", "")
+    lats = _load_sched_latencies()
+    return lats.get(sched_class, DEFAULT_RESULT_LATENCY)
+
 
 # ---------------------------------------------------------------------------
 # Task 2: Instruction Classification
@@ -544,7 +578,7 @@ def _store_instruction(reg_name: str, kind: str, ptr: str, offset: int) -> list[
         return [
             f"  // store accumulator {reg_name}: srs {srs_src} to wl{idx} then vst",
             f"  vsrs.s16.s32 wl{idx}, {srs_src}, s0",
-        ] + _nop_sled(7) + _vector_store(f"wl{idx}", ptr, offset)
+        ] + _nop_sled(4) + _vector_store(f"wl{idx}", ptr, offset)  # VSRS latency = 4
     if kind == "control":
         return _scalar_store(reg_name, ptr, offset)
     if kind in ("modifier_m", "modifier_dj"):
@@ -645,19 +679,15 @@ def generate_test_point(
 
     # NOP sled before instruction: must cover load pipeline latency.
     # AIE2 lda/vlda latency is 7 cycles (from AIE2Schedule.td).
-    # The load instruction itself is cycle 0, so we need 7 NOPs after
-    # the LAST load before the loaded value is available.
-    lines.extend(_nop_sled(7))
+    lines.extend(_nop_sled(LOAD_LATENCY))
 
     # The instruction itself.
     asm_line = "  " + _substitute_asm(instr["asm_string"], regs)
     lines.append(asm_line)
 
     # NOP sled after instruction: must cover result latency before store.
-    # Scalar ALU = 1 cycle, vector ALU = 1-2 cycles, VMAC = 3-4 cycles.
-    # Use 7 conservatively (matches load latency) to be safe for all
-    # instruction types.  The store reads the register at cycle 1.
-    lines.extend(_nop_sled(7))
+    # Per-instruction from the scheduling model (II_ABS=1, II_VMAC=5, etc.).
+    lines.extend(_nop_sled(result_latency(instr)))
 
     # Store output registers to [p1, #offset].
     cur_out_offset = out_offset
