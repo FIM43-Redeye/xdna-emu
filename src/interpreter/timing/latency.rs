@@ -217,8 +217,10 @@ impl LatencyTable {
 
             // ── Shifts ──────────────────────────────────────────────────
             SemanticOp::Shl | SemanticOp::Sra | SemanticOp::Srl
+            | SemanticOp::AshlBidir | SemanticOp::LshlBidir
                 if !is_vector => TIMING_SCALAR_1,
             SemanticOp::Shl | SemanticOp::Sra | SemanticOp::Srl
+            | SemanticOp::AshlBidir | SemanticOp::LshlBidir
                 => TIMING_VECTOR_SIMPLE,
             SemanticOp::Rotl | SemanticOp::Rotr if !is_vector => TIMING_SCALAR_1,
             SemanticOp::Rotl | SemanticOp::Rotr => TIMING_VECTOR_SHUFFLE,

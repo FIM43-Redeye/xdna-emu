@@ -571,6 +571,12 @@ impl VectorAlu {
                 }
                 ctx.accumulator.write(*r, acc);
             }
+            Some(Operand::ScalarReg(r)) => {
+                // Vector comparison -> scalar mask register (r16-r23).
+                // Condense per-lane all-ones/all-zeros into a packed bitmask.
+                let mask = Self::condense_comparison_mask(&value, op.element_type);
+                ctx.scalar.write(*r, mask);
+            }
             Some(other) => {
                 log::error!(
                     "[VECTOR] write_vector_dest: unexpected dest {:?} -- \
@@ -581,6 +587,64 @@ impl VectorAlu {
             None => {
                 // Some vector operations have no explicit destination
                 // (e.g., comparison that sets status flags).
+            }
+        }
+    }
+
+    /// Condense a per-lane comparison mask ([u32; 8] of all-ones/zeros)
+    /// into a packed scalar bitmask. One bit per element lane.
+    ///
+    /// - 32-bit elements: 8 lanes -> 8-bit mask (bits [7:0])
+    /// - 16-bit elements: 16 lanes -> 16-bit mask (bits [15:0])
+    /// - 8-bit elements: 32 lanes -> 32-bit mask (bits [31:0])
+    fn condense_comparison_mask(value: &[u32; 8], elem_type: Option<ElementType>) -> u32 {
+        match elem_type {
+            Some(ElementType::Int32) | Some(ElementType::UInt32)
+            | Some(ElementType::Float32) | None => {
+                // 8 x 32-bit lanes: one bit per u32 word
+                let mut mask = 0u32;
+                for i in 0..8 {
+                    if value[i] != 0 {
+                        mask |= 1 << i;
+                    }
+                }
+                mask
+            }
+            Some(ElementType::Int16) | Some(ElementType::UInt16)
+            | Some(ElementType::BFloat16) => {
+                // 16 x 16-bit lanes: two lanes packed per u32 word
+                let mut mask = 0u32;
+                for i in 0..8 {
+                    if value[i] & 0xFFFF != 0 {
+                        mask |= 1 << (i * 2);
+                    }
+                    if value[i] & 0xFFFF_0000 != 0 {
+                        mask |= 1 << (i * 2 + 1);
+                    }
+                }
+                mask
+            }
+            Some(ElementType::Int8) | Some(ElementType::UInt8) => {
+                // 32 x 8-bit lanes: four lanes packed per u32 word
+                let mut mask = 0u32;
+                for i in 0..8 {
+                    for j in 0..4 {
+                        if (value[i] >> (j * 8)) & 0xFF != 0 {
+                            mask |= 1 << (i * 4 + j);
+                        }
+                    }
+                }
+                mask
+            }
+            _ => {
+                // Unknown element type, try 32-bit default
+                let mut mask = 0u32;
+                for i in 0..8 {
+                    if value[i] != 0 {
+                        mask |= 1 << i;
+                    }
+                }
+                mask
             }
         }
     }

@@ -103,6 +103,8 @@ pub fn execute_semantic(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         SemanticOp::Shl => execute_shl(op, ctx),
         SemanticOp::Sra => execute_sra(op, ctx), // arithmetic right shift
         SemanticOp::Srl => execute_srl(op, ctx), // logical right shift
+        SemanticOp::AshlBidir => execute_ashl_bidir(op, ctx),
+        SemanticOp::LshlBidir => execute_lshl_bidir(op, ctx),
 
         // Comparison operations (produce 0 or 1)
         SemanticOp::SetLt => execute_setcc(op, ctx, CmpOp::Lt, true),
@@ -493,6 +495,40 @@ fn execute_srl(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     let shift = b & 0x1F;
     write_dest(op, ctx, a >> shift);
     // AIE2: Shifts do NOT set any flags (preserves C)
+    true
+}
+
+/// ASHL: bidirectional arithmetic shift.
+/// Positive shift = left, negative shift = arithmetic right.
+/// Per AIE2InstrPatterns.td section 4.1.11.
+fn execute_ashl_bidir(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
+    let a = read_source(op, ctx, 0);
+    let b = read_source(op, ctx, 1) as i32;
+    let result = if b >= 0 {
+        let shift = (b as u32) & 0x1F;
+        a << shift
+    } else {
+        let shift = ((-b) as u32) & 0x1F;
+        ((a as i32) >> shift) as u32
+    };
+    write_dest(op, ctx, result);
+    true
+}
+
+/// LSHL: bidirectional logical shift.
+/// Positive shift = left, negative shift = logical right.
+/// Per AIE2InstrPatterns.td section 4.1.11.
+fn execute_lshl_bidir(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
+    let a = read_source(op, ctx, 0);
+    let b = read_source(op, ctx, 1) as i32;
+    let result = if b >= 0 {
+        let shift = (b as u32) & 0x1F;
+        a << shift
+    } else {
+        let shift = ((-b) as u32) & 0x1F;
+        a >> shift
+    };
+    write_dest(op, ctx, result);
     true
 }
 

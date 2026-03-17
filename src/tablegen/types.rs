@@ -261,6 +261,12 @@ pub enum SemanticOp {
     Shl,   // Shift left
     Sra,   // Shift right arithmetic (signed)
     Srl,   // Shift right logical (unsigned)
+    // Bidirectional shifts (AIE2 ASHL/LSHL hardware instructions).
+    // Positive shift amount = left, negative = right.
+    // ASHL: right-shifts are arithmetic (sign-preserving).
+    // LSHL: right-shifts are logical (zero-filling).
+    AshlBidir,
+    LshlBidir,
     Rotl,  // Rotate left
     Rotr,  // Rotate right
 

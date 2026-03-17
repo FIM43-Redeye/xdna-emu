@@ -787,6 +787,15 @@ impl InstructionDecoder {
         let semantic_override = match enc.name.as_str() {
             "VMOV_mv_scd" | "VMOV_HI" | "VMOV_LO" => Some(SemanticOp::CascadeRead),
             "VMOV_mv_mcd" => Some(SemanticOp::CascadeWrite),
+            // Instructions without Pat<> patterns in TableGen need explicit
+            // semantic mappings. These are valid ISA instructions that Peano
+            // doesn't select but Chess does.
+            "ASHL" => Some(SemanticOp::AshlBidir),
+            "LSHL" => Some(SemanticOp::LshlBidir),
+            "SBC" => Some(SemanticOp::Sbc),
+            "DIVS" => Some(SemanticOp::SDiv),
+            "EXTENDu8" => Some(SemanticOp::ZeroExtend),
+            "EXTENDu16" => Some(SemanticOp::ZeroExtend),
             _ => None,
         };
 

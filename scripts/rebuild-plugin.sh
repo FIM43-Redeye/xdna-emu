@@ -15,9 +15,13 @@ EMU_DIR="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$EMU_DIR/xrt-plugin/build"
 
 CARGO_FLAGS=""
+PROFILE="debug"
 for arg in "$@"; do
   case "$arg" in
-    --release) CARGO_FLAGS="--release" ;;
+    --release)
+      CARGO_FLAGS="--release"
+      PROFILE="release"
+      ;;
     --reconfigure)
       echo ">>> Reconfiguring cmake..."
       rm -rf "$BUILD_DIR/CMakeCache.txt"
@@ -37,6 +41,12 @@ fi
 echo ">>> Building (cargo build handles plugin automatically)..."
 nice -n 19 cargo build $CARGO_FLAGS
 
-PROFILE="debug"
-[[ "$CARGO_FLAGS" == *"--release"* ]] && PROFILE="release"
-echo ">>> Done. Rust lib: $EMU_DIR/target/$PROFILE/libxdna_emu.so"
+RUST_LIB="$EMU_DIR/target/$PROFILE/libxdna_emu.so"
+echo ">>> Done. Rust lib: $RUST_LIB"
+
+# Verify the Rust lib exists and report which profile test scripts will use.
+if [[ -f "$RUST_LIB" ]]; then
+  echo ">>> EMU test usage: XDNA_EMU=$PROFILE ./test.exe"
+else
+  echo ">>> WARNING: $RUST_LIB not found!"
+fi
