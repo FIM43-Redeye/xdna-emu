@@ -678,14 +678,15 @@ fn execute_cmp(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     true
 }
 
-/// Count leading bits: count of sign-extension bits minus 1.
-/// Different from CLZ: CLB counts leading bits matching the sign bit.
+/// Count leading bits: count of leading bits matching the sign bit.
+/// Different from CLZ: CLB counts sign-redundant bits including the sign bit.
+/// Per AIE2 hardware: CLB(0x00xxxxxx) = 2 (two leading zeros).
 fn execute_clb(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     let src = read_source(op, ctx, 0);
     let result = if (src as i32) >= 0 {
-        src.leading_zeros().saturating_sub(1)
+        src.leading_zeros()
     } else {
-        src.leading_ones().saturating_sub(1)
+        src.leading_ones()
     };
     write_dest(op, ctx, result);
     true
