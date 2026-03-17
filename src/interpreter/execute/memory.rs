@@ -580,7 +580,9 @@ impl MemoryUnit {
         post_modify: &PostModify,
         neighbors: Option<&mut NeighborMemory>,
     ) {
-        let addr = Self::get_address(op, ctx);
+        // Use get_store_address which searches all sources for Memory operand.
+        // For vst, sources[0] is the vector data, Memory is sources[1].
+        let addr = Self::get_store_address(op, ctx);
 
         // Track bank access for conflict detection (local memory only)
         let (quadrant, local_offset) = decode_data_address(addr);
@@ -610,12 +612,17 @@ impl MemoryUnit {
     }
 
     /// Get the pointer register from a slot op's source operands.
+    /// Searches all sources, not just the first, because stores have
+    /// the data source before the address operand.
     fn get_pointer_reg(op: &SlotOp) -> Option<u8> {
-        op.sources.first().and_then(|src| match src {
-            Operand::Memory { base, .. } => Some(*base),
-            Operand::PointerReg(r) => Some(*r),
-            _ => None,
-        })
+        for src in &op.sources {
+            match src {
+                Operand::Memory { base, .. } => return Some(*base),
+                Operand::PointerReg(r) => return Some(*r),
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Get address from memory operand or pointer register.
@@ -625,14 +632,17 @@ impl MemoryUnit {
     /// 2. `[PointerReg, ModifierReg]` -- indexed register (byte offset in modifier)
     /// 3. `[PointerReg, Immediate/ScalarReg]` -- word-scaled offset
     fn get_address(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
-        // First check for Memory operand (encapsulates ptr+offset, already scaled)
-        if let Some(Operand::Memory { base, offset }) = op.sources.first() {
-            let base_addr = ctx.pointer_read(*base);
-            let result = base_addr.wrapping_add(*offset as i32 as u32);
-            return result;
+        // Search all sources for Memory operand (encapsulates ptr+offset, already scaled).
+        // For stores, the data source may precede the address operand.
+        for src in &op.sources {
+            if let Operand::Memory { base, offset } = src {
+                let base_addr = ctx.pointer_read(*base);
+                let result = base_addr.wrapping_add(*offset as i32 as u32);
+                return result;
+            }
         }
 
-        // Handle indexed addressing: sources[0]=ptr, sources[1]=offset
+        // Handle indexed addressing: find first PointerReg as base
         let base_addr = op.sources.first().map_or(0, |src| match src {
             Operand::PointerReg(r) => ctx.pointer_read(*r),
             Operand::ScalarReg(r) => ctx.scalar_read(*r),
