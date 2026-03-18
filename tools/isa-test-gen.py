@@ -71,6 +71,42 @@ SAFE_OPERAND_TYPES = frozenset({
 # "register+16" maps to eRS8 (r16-r23) or eL (register pairs) in the ISA.
 REGISTER_LIKE_TYPES = frozenset({"register", "register+16"})
 
+# Composite register kinds that map cleanly to a concrete register class.
+# These appear as operand_type="composite_register" in the ISA JSON because
+# their hardware encoding is non-trivial, but functionally they are just a
+# subset of a standard register class that the assembler can name directly.
+#
+# Derivation (from AIE2GenRegisterInfo.td and AIE2Disassembler.cpp):
+#   mShflDst = AIE2Vector512RegisterClass(add mXm, mBMSm)
+#     -- broadcast-shuffle destination: x* (vector512) or bml*/bmh* (acc-half).
+#     For test generation we use the x* subset (simplest concrete names).
+#   mWm_1 = AIE2Vector256RegisterClass(add mWm)
+#     -- vector256 with rearranged encoding (wl0/wh0/wl1/... non-monotonic).
+#     The assembler accepts the same wl*/wh* names as for plain vector256.
+#
+# Value: the effective register kind to use for load/store/naming purposes.
+TESTABLE_COMPOSITE_KINDS: dict[str, str] = {
+    "ShflDst": "vector512",
+    "Wm1": "vector256",
+}
+
+
+def _effective_kind(op: dict) -> str:
+    """Return the effective register kind for an operand.
+
+    For plain register operands, returns register_kind directly.
+    For composite_register operands whose kind is in TESTABLE_COMPOSITE_KINDS,
+    returns the mapped concrete kind (e.g., "ShflDst" -> "vector512").
+    Returns "" for all other operand types.
+    """
+    op_type = op.get("operand_type", "")
+    kind = op.get("register_kind", "") or ""
+    if op_type in REGISTER_LIKE_TYPES:
+        return kind
+    if op_type == "composite_register":
+        return TESTABLE_COMPOSITE_KINDS.get(kind, "")
+    return ""
+
 # Size in bytes for each register kind (for offset calculations).
 REGISTER_SIZES = {
     "scalar": 4,
@@ -98,6 +134,16 @@ LOAD_LATENCY = 7
 # Default result latency when sched_class is not in the latency map.
 DEFAULT_RESULT_LATENCY = 7
 
+# Minimum result latency enforced regardless of scheduling model.
+# The scheduling model's II_ values represent initiation intervals
+# (pipeline occupation), NOT actual write-back latencies.  Multi-cycle
+# operations like DIVS report II=1 but need many cycles to commit.
+# Since this is a test harness (correctness, not performance), we use
+# a generous minimum to guarantee the result is committed before we
+# store it.  The store sequence itself adds ~3 more cycles (mov + padda),
+# so the effective delay is MIN_RESULT_LATENCY + ~3.
+MIN_RESULT_LATENCY = 5
+
 # Scheduling model latencies: sched_class -> result latency in cycles.
 # Loaded from aie2-sched-latencies.json (extracted from AIE2Schedule.td).
 _SCHED_LATENCIES: dict[str, int] = {}
@@ -118,12 +164,15 @@ def _load_sched_latencies() -> dict[str, int]:
 def result_latency(instr: dict) -> int:
     """Get the result latency for an instruction from the scheduling model.
 
-    Returns the number of cycles from instruction issue until its
-    destination register is available for reading.
+    Returns the number of NOP cycles to insert between instruction issue
+    and result store, ensuring the pipeline has committed the result.
+    Uses the scheduling model where available, with a floor of
+    MIN_RESULT_LATENCY to guard against incomplete latency data.
     """
     sched_class = instr.get("sched_class", "")
     lats = _load_sched_latencies()
-    return lats.get(sched_class, DEFAULT_RESULT_LATENCY)
+    model_latency = lats.get(sched_class, DEFAULT_RESULT_LATENCY)
+    return max(model_latency, MIN_RESULT_LATENCY)
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +219,18 @@ def classify_instruction(instr: dict) -> tuple[str, str]:
     mnemonic = instr["mnemonic"]
 
     # 1. Load/store instructions need valid addresses -- skip.
-    if instr.get("may_load", False):
+    #
+    # Exception: some instructions are tagged may_load in TableGen but have no
+    # pointer operand -- they are register-to-register shuffles that use load
+    # slot resources but don't actually access memory (e.g. vldb.4x16.hi,
+    # vldb.4x32.lo, vldb.4x64.hi).  Without a pointer they cannot reach memory,
+    # so we treat them as compute instructions and fall through to the normal
+    # classify path.
+    operands = instr.get("operands", [])
+    has_pointer = any(
+        op.get("register_kind") == "pointer" for op in operands
+    )
+    if instr.get("may_load", False) and has_pointer:
         return ("skipped", "load instruction")
     if instr.get("may_store", False):
         return ("skipped", "store instruction")
@@ -208,7 +268,9 @@ def classify_instruction(instr: dict) -> tuple[str, str]:
     for op in operands:
         op_type = op.get("operand_type", "unknown")
         if op_type == "composite_register":
-            return ("skipped", "composite register operand")
+            kind = op.get("register_kind", "")
+            if kind not in TESTABLE_COMPOSITE_KINDS:
+                return ("skipped", "composite register operand")
         if op_type == "unknown":
             if not op.get("name", "").startswith("dontcare"):
                 return ("skipped", "unknown operand type")
@@ -217,11 +279,11 @@ def classify_instruction(instr: dict) -> tuple[str, str]:
             if kind and kind not in KNOWN_REGISTER_KINDS:
                 return ("skipped", f"unknown register kind: {kind}")
 
-    # 8. Check for control-register outputs (side effects, not testable).
+    # 8. Detect outputs.  Control register destinations are testable: after the
+    # instruction executes, the control register value is read back into a
+    # general-purpose scalar via 'mov r14, <ctrl_reg>' (MOV_mv_scl, mv slot),
+    # then stored to the output buffer.
     outputs = detect_output_operands(instr)
-    for op in outputs:
-        if op.get("register_kind") == "control":
-            return ("skipped", "control register output (side effect)")
 
     # 9. Must have at least one register output.
     if not outputs:
@@ -276,13 +338,25 @@ def detect_output_operands(instr: dict) -> list[dict]:
     first_name = asm_op_names[0]
     if first_name in op_by_name:
         first_op = op_by_name[first_name]
-        if first_op.get("operand_type") in REGISTER_LIKE_TYPES:
+        op_type = first_op.get("operand_type", "")
+        is_register_like = op_type in REGISTER_LIKE_TYPES
+        is_testable_composite = (
+            op_type == "composite_register"
+            and first_op.get("register_kind", "") in TESTABLE_COMPOSITE_KINDS
+        )
+        if is_register_like or is_testable_composite:
             outputs.append(first_op)
 
     # Also check for any operand explicitly named "dst" or "d".
     for op in operands:
         if op["name"] in ("dst", "d") and op not in outputs:
-            if op.get("operand_type") in REGISTER_LIKE_TYPES:
+            op_type = op.get("operand_type", "")
+            is_register_like = op_type in REGISTER_LIKE_TYPES
+            is_testable_composite = (
+                op_type == "composite_register"
+                and op.get("register_kind", "") in TESTABLE_COMPOSITE_KINDS
+            )
+            if is_register_like or is_testable_composite:
                 outputs.append(op)
 
     return outputs
@@ -381,6 +455,18 @@ def register_names(kind: str, bit_width: int = 0,
     if kind == "modifier_dj":
         return ["dj0", "dj1"]
 
+    # Testable composite kinds: mapped to concrete register names.
+    # ShflDst (mShflDst) is AIE2Vector512RegisterClass -- use x* names.
+    # The composite encoding allows either x* or bml*/bmh*, but x* is the
+    # simplest subset and is what the Peano compiler generates.
+    if kind == "ShflDst":
+        return ["x0", "x2", "x4"]
+
+    # Wm1 (mWm_1) is AIE2Vector256RegisterClass with non-monotonic encoding.
+    # The assembler accepts the same wl*/wh* names as for plain vector256.
+    if kind == "Wm1":
+        return ["wl0", "wl2", "wl4", "wl6"]
+
     # Unknown kind -- return empty.
     return []
 
@@ -436,6 +522,19 @@ def immediate_values(bit_width: int, signed: bool = True,
 def _align(offset: int, alignment: int) -> int:
     """Round up offset to the next multiple of alignment."""
     return (offset + alignment - 1) & ~(alignment - 1)
+
+
+def _is_sp_relative(instr: dict) -> bool:
+    """Return True if the instruction uses SP-relative addressing.
+
+    SP-relative loads/stores use [sp, $imm] in the asm_string.  SP is
+    pointer register 6 (p6) in AIE2.  These instructions have no explicit
+    pointer operand -- SP is implicit in the encoding.
+
+    Examples: VLDA_dmw_lda_w_ag_spill, VST_dmw_sts_w_ag_spill.
+    """
+    asm = instr.get("asm_string", "").lower()
+    return "[sp," in asm or "[sp]" in asm
 
 
 def _padda_sequence(ptr_reg: str, base_ptr: str, offset: int) -> list[str]:
@@ -692,7 +791,13 @@ def _store_instruction(reg_name: str, kind: str, ptr: str, offset: int) -> list[
                 + _vector_store(f"wl{idx}", ptr, offset)
             )
     if kind == "control":
-        return _scalar_store(reg_name, ptr, offset)
+        # Control registers (crSat, crRnd, etc.) cannot be stored directly
+        # via 'st' -- 'st' only accepts general-purpose scalar registers (eR
+        # class).  Read the control register back into r14 via 'mov r14,
+        # <ctrl_reg>', then store r14.  The 'mov' instruction uses the
+        # MOV_mv_scl variant (mv slot) which accepts mMvSclSrc as source,
+        # and mMvSclSrc includes mCRm (control regs).
+        return [f"  mov r14, {reg_name}"] + _scalar_store("r14", ptr, offset)
     if kind in ("modifier_m", "modifier_dj"):
         return _scalar_store(reg_name, ptr, offset)
     return [f"  // unsupported store for kind={kind}"]
@@ -834,9 +939,10 @@ def generate_test_point(
         if op_name not in op_by_name:
             continue
         op = op_by_name[op_name]
-        if op["operand_type"] not in REGISTER_LIKE_TYPES:
+        # Accept both plain register types and testable composite kinds.
+        kind = _effective_kind(op)
+        if not kind:
             continue
-        kind = op.get("register_kind", "")
         if kind not in KNOWN_REGISTER_KINDS:
             continue
         # Align offset for this operand's natural alignment.
@@ -863,7 +969,8 @@ def generate_test_point(
     # Store output registers to [p1, #offset].
     cur_out_offset = out_offset
     for op in outputs:
-        kind = op.get("register_kind", "")
+        # Use effective kind so testable composite kinds store correctly.
+        kind = _effective_kind(op) or op.get("register_kind", "")
         # Align offset for this operand's natural alignment.
         align = 32 if kind in ("vector256", "vector512", "accumulator") else 4
         cur_out_offset = _align(cur_out_offset, align)
@@ -951,6 +1058,17 @@ def generate_operand_combos(instr: dict) -> list[dict[str, str]]:
             defaults[op_name] = names[0]
             alternatives[op_name] = names[1:]
 
+        elif op_type == "composite_register":
+            # Testable composite kinds have a known register name mapping.
+            kind = op.get("register_kind", "")
+            names = register_names(kind)
+            if not names:
+                defaults[op_name] = "r0"
+                alternatives[op_name] = []
+                continue
+            defaults[op_name] = names[0]
+            alternatives[op_name] = names[1:]
+
         elif op_type == "immediate":
             bit_width = op.get("bit_width", 8)
             signed = op.get("signed", True)
@@ -1008,8 +1126,11 @@ class LoadStrategy(TestStrategy):
     """Tests load instructions by pointing at input buffer and capturing result.
 
     Handles Tier 1 (ptr+offset, ptr+index) and Tier 2 (ptr+modifier 2D/3D).
-    Rejects: may_store=True, no pointer operand, composite destinations,
-    compressed/sparse loads, stack-pointer loads.
+    Also handles SP-relative spill loads: [sp, $imm] addressing where SP (p6)
+    is initialized to the input buffer for the test.
+
+    Rejects: may_store=True, no pointer operand (non-SP-relative), composite
+    destinations, compressed/sparse loads.
     """
 
     _SKIP_PREFIXES = ("vldb.compr", "vldb.sparse")
@@ -1030,17 +1151,20 @@ class LoadStrategy(TestStrategy):
             return (False, "conversion load (no llvm-mc syntax)")
 
         operands = instr.get("operands", [])
+        sp_relative = _is_sp_relative(instr)
 
-        # Must have a pointer operand (rejects VLDB_4x register shuffles).
+        # Must have a pointer operand, unless SP-relative (SP is implicit).
+        # SP-relative instructions like VLDA_dmw_lda_w_ag_spill encode the
+        # base pointer as the SP register and list no pointer in operands.
         has_pointer = any(
             op.get("register_kind") == "pointer"
             for op in operands
             if op.get("operand_type") in REGISTER_LIKE_TYPES
         )
-        if not has_pointer:
+        if not has_pointer and not sp_relative:
             return (False, "load with no pointer operand (register shuffle)")
 
-        # Reject composite destinations.
+        # Reject composite destinations (LDA_dms_spill has mLdaScl composite).
         for op in operands:
             if op.get("operand_type") == "composite_register":
                 return (False, "composite register destination (deferred)")
@@ -1073,11 +1197,6 @@ class LoadStrategy(TestStrategy):
             if op_type == "unknown":
                 if not op.get("name", "").startswith("dontcare"):
                     return (False, "unknown operand type")
-
-        # Reject stack-pointer relative.
-        asm = instr.get("asm_string", "")
-        if "[sp," in asm.lower() or "[sp]" in asm.lower():
-            return (False, "stack-pointer relative load (deferred)")
 
         return (True, "")
 
@@ -1112,11 +1231,19 @@ class LoadStrategy(TestStrategy):
         align = 32 if dest_kind in ("vector256", "vector512", "accumulator") else 4
         in_offset = _align(in_offset, align)
 
-        # Setup: copy p0 to p6 and advance to the data region.
-        lines.extend(_padda_sequence("p6", "p0", in_offset))
+        op_by_name = {op["name"]: op for op in instr.get("operands", [])}
+        sp_relative = _is_sp_relative(instr)
+
+        if sp_relative:
+            # SP-relative load: SP (p6) is the implicit base pointer.
+            # Initialize SP to point at the input data region.  All
+            # address-offset immediates are zeroed so data is read from SP.
+            lines.extend(_padda_sequence("p6", "p0", in_offset))
+        else:
+            # Normal pointer load: copy p0 to p6 and advance to data region.
+            lines.extend(_padda_sequence("p6", "p0", in_offset))
 
         # For modifier operands (2D/3D loads), zero the modifier.
-        op_by_name = {op["name"]: op for op in instr.get("operands", [])}
         for op_name, op in op_by_name.items():
             kind = op.get("register_kind", "")
             if kind == "modifier_m":
@@ -1130,8 +1257,10 @@ class LoadStrategy(TestStrategy):
         lines.extend(_nop_sled(2))
 
         # Execute: the load instruction itself.
-        # Override pointer operand to use p6.
-        # Zero address-offset immediates (data is already at p6).
+        # For pointer loads: override pointer operand to use p6.
+        # For SP-relative loads: no pointer operand to override; SP is already
+        #   set to the data address above.
+        # Zero address-offset immediates (data is already at p6 / sp).
         # Preserve post-modify immediates (they update the pointer, not
         # the address -- zeroing them makes the test degenerate).
         asm_string = instr["asm_string"]
@@ -1168,8 +1297,12 @@ class LoadStrategy(TestStrategy):
 class StoreStrategy(TestStrategy):
     """Tests store instructions by loading known data then executing the store.
 
-    The store writes to the output buffer via p7. The verification is that
-    HW and EMU produce identical output bytes.
+    The store writes to the output buffer via p7 (normal) or via SP/p6
+    (SP-relative spill stores).  The verification is that HW and EMU produce
+    identical output bytes.
+
+    Also handles SP-relative spill stores: [sp, $imm] addressing where SP (p6)
+    is initialized to the output buffer for the test.
     """
 
     def can_test(self, instr: dict) -> tuple[bool, str]:
@@ -1183,17 +1316,20 @@ class StoreStrategy(TestStrategy):
             return (False, "conversion store (no llvm-mc syntax)")
 
         operands = instr.get("operands", [])
+        sp_relative = _is_sp_relative(instr)
 
-        # Must have a pointer operand.
+        # Must have a pointer operand, unless SP-relative (SP is implicit).
+        # SP-relative spill stores encode the destination address as the SP
+        # register and list no pointer in the operand table.
         has_pointer = any(
             op.get("register_kind") == "pointer"
             for op in operands
             if op.get("operand_type") in REGISTER_LIKE_TYPES
         )
-        if not has_pointer:
+        if not has_pointer and not sp_relative:
             return (False, "store with no pointer operand")
 
-        # Reject composite operands.
+        # Reject composite operands (ST_dms_spill has mSclSt composite).
         for op in operands:
             if op.get("operand_type") == "composite_register":
                 return (False, "composite register operand (deferred)")
@@ -1219,11 +1355,6 @@ class StoreStrategy(TestStrategy):
             if op_type == "unknown":
                 if not op.get("name", "").startswith("dontcare"):
                     return (False, "unknown operand type")
-
-        # Reject stack-pointer relative.
-        asm = instr.get("asm_string", "")
-        if "[sp," in asm.lower() or "[sp]" in asm.lower():
-            return (False, "stack-pointer relative store (deferred)")
 
         return (True, "")
 
@@ -1285,6 +1416,7 @@ class StoreStrategy(TestStrategy):
         src_reg = regs.get(src_name, "r0")
 
         op_by_name = {op["name"]: op for op in instr.get("operands", [])}
+        sp_relative = _is_sp_relative(instr)
 
         # Align and load known data into the source register.
         align = 32 if src_kind in ("vector256", "vector512", "accumulator") else 4
@@ -1295,9 +1427,15 @@ class StoreStrategy(TestStrategy):
         # NOP sled for load latency.
         lines.extend(_nop_sled(LOAD_LATENCY))
 
-        # Setup: copy p1 to p7 and advance to output region.
         out_offset = _align(out_offset, align)
-        lines.extend(_padda_sequence("p7", "p1", out_offset))
+        if sp_relative:
+            # SP-relative store: SP (p6) is the implicit destination pointer.
+            # Initialize SP to point at the output data region.  The immediate
+            # is zeroed so the store writes to exactly [sp, #0].
+            lines.extend(_padda_sequence("p6", "p1", out_offset))
+        else:
+            # Normal pointer store: copy p1 to p7 and advance to output region.
+            lines.extend(_padda_sequence("p7", "p1", out_offset))
 
         # For modifier operands, zero the modifier.
         for op_name, op in op_by_name.items():
@@ -1310,8 +1448,10 @@ class StoreStrategy(TestStrategy):
                 lines.append(f"  mov {dj_reg}, #0")
 
         # Execute: the store instruction.
-        # Override pointer to p7.
-        # Zero address-offset immediates (data is at p7).
+        # For pointer stores: override pointer to p7.
+        # For SP-relative stores: no pointer operand to override; SP is already
+        #   set to the output address above.
+        # Zero address-offset immediates (data is at p7 / sp).
         # Preserve post-modify immediates (pointer update amount).
         asm_string = instr["asm_string"]
         store_regs = dict(regs)
@@ -1494,6 +1634,10 @@ def classify_with_strategies(instr: dict) -> tuple[Optional[TestStrategy], str]:
 def _operand_size(op: dict, instr_name: str = "") -> int:
     """Compute the storage size in bytes for a single register operand."""
     kind = op.get("register_kind", "")
+    # For testable composite kinds, use the effective kind for sizing.
+    effective = _effective_kind(op)
+    if op.get("operand_type") == "composite_register" and effective:
+        kind = effective
     base = REGISTER_SIZES.get(kind, 4)
     # Register pairs (eL class) need double the scalar size.
     if (op.get("operand_type") == "register+16"
@@ -1518,9 +1662,10 @@ def _compute_input_size(instr: dict, regs: dict[str, str]) -> int:
         if op_name not in op_by_name:
             continue
         op = op_by_name[op_name]
-        if op["operand_type"] not in REGISTER_LIKE_TYPES:
+        # Accept both plain register types and testable composite kinds.
+        kind = _effective_kind(op)
+        if not kind:
             continue
-        kind = op.get("register_kind", "")
         if kind not in KNOWN_REGISTER_KINDS:
             continue
         align = 32 if kind in ("vector256", "vector512", "accumulator") else 4
@@ -1535,7 +1680,8 @@ def _compute_output_size(instr: dict) -> int:
     instr_name = instr.get("name", "")
     total = 0
     for op in outputs:
-        kind = op.get("register_kind", "")
+        # Use effective kind so testable composite kinds are sized correctly.
+        kind = _effective_kind(op) or op.get("register_kind", "")
         align = 32 if kind in ("vector256", "vector512", "accumulator") else 4
         total = _align(total, align)
         total += _operand_size(op, instr_name)

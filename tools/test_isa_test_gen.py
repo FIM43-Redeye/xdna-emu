@@ -181,6 +181,57 @@ class TestClassifyInstruction:
         assert status == "skipped"
         assert "composite" in reason.lower()
 
+    def test_shfl_dst_output_is_testable(self):
+        """VBCSTSHFL-style instructions with ShflDst output are testable.
+
+        ShflDst (mShflDst) is a composite register class that maps to vector512
+        in the test harness.  Previously these were skipped as 'composite
+        register operand'; they should now be classified as testable.
+        """
+        instr = _make_instr("VBCSTSHFL_16", "vbcstshfl.16",
+                            "vbcstshfl.16\t$dst, $s0, $idx", [
+            _make_composite_op("dst", "ShflDst", bit_width=5),
+            _make_reg_op("s0", "scalar", bit_width=5),
+            {
+                "name": "idx",
+                "bit_width": 5,
+                "is_output": False,
+                "operand_type": "register",
+                "register_kind": "scalar",
+                "signed": False,
+                "scale": None,
+            },
+        ], slot="mv", is_vector=True)
+        status, reason = classify_instruction(instr)
+        assert status == "testable", \
+            f"VBCSTSHFL_16 with ShflDst should be testable, got: {reason}"
+
+    def test_wm1_input_is_testable(self):
+        """VCONV_FP32_BF16 with Wm1 source operand is testable.
+
+        Wm1 (mWm_1) is a composite vector256 class with non-monotonic encoding.
+        The instruction has a standard accumulator destination and a Wm1 source;
+        it should be testable since both operand types are known.
+        """
+        instr = _make_instr("VCONV_FP32_BF16", "vconv.fp32.bf16",
+                            "vconv.fp32.bf16\t$dst, $src", [
+            _make_reg_op("dst", "accumulator", bit_width=5),
+            _make_composite_op("src", "Wm1", bit_width=5),
+        ], slot="mv", is_vector=True)
+        status, reason = classify_instruction(instr)
+        assert status == "testable", \
+            f"VCONV_FP32_BF16 with Wm1 source should be testable, got: {reason}"
+
+    def test_other_composite_kinds_still_skipped(self):
+        """Composite register kinds NOT in TESTABLE_COMPOSITE_KINDS are still skipped."""
+        instr = _make_instr("FOO_mv", "foo.mv", "foo.mv\t$dst, $src", [
+            _make_composite_op("dst", "MvSclSrc", bit_width=7),
+            _make_reg_op("src", "scalar"),
+        ], slot="mv")
+        status, reason = classify_instruction(instr)
+        assert status == "skipped"
+        assert "composite" in reason.lower()
+
     def test_skip_unknown_operand_type(self):
         instr = _make_instr("FOO", "foo", "foo\t$dst, $src", [
             _make_reg_op("dst", "scalar"),
@@ -273,15 +324,19 @@ class TestClassifyInstruction:
         status, _ = classify_instruction(instr)
         assert status == "skipped"
 
-    def test_skip_control_register_output(self):
-        """MOVX writes to control registers -- skip (side effect)."""
-        instr = _make_instr("MOVX", "movx", "movx\t$mCRm, $mRx", [
-            _make_reg_op("mCRm", "control"),
-            _make_reg_op("mRx", "scalar"),
+    def test_control_register_output_is_testable(self):
+        """MOVX_mvx_scl writes to a control register -- now testable via readback.
+
+        The output control register is captured by reading it back into a
+        general-purpose scalar ('mov r14, crSat') before storing.
+        """
+        instr = _make_instr("MOVX_mvx_scl", "movx", "movx\t$mCRm, $mRx", [
+            _make_reg_op("mCRm", "control", bit_width=4),
+            _make_reg_op("mRx", "scalar", bit_width=5),
         ])
         status, reason = classify_instruction(instr)
-        assert status == "skipped"
-        assert "control" in reason
+        assert status == "testable", \
+            f"MOVX_mvx_scl should be testable (control reg readback), got: {reason}"
 
     def test_skip_composite_sparse_register(self):
         """Instructions with accumulator bw=2 are actually composite/sparse."""
@@ -335,6 +390,32 @@ class TestClassifyInstruction:
         ])
         status, _ = classify_instruction(instr)
         assert status == "testable"
+
+    def test_vldb_4x_no_pointer_is_testable(self):
+        """VLDB_4x* instructions have may_load=True but no pointer -- they are
+        register-to-register vector shuffles and should be treated as compute."""
+        instr = _make_instr("VLDB_4x16_HI", "vldb.4x16.hi",
+                            "vldb.4x16.hi\t$dst, $src", [
+            _make_reg_op("dst", "vector256"),
+            _make_reg_op("src", "vector256"),
+        ], may_load=True, slot="ldb")
+        status, reason = classify_instruction(instr)
+        assert status == "testable", \
+            f"VLDB_4x with no pointer should be testable, got skipped: {reason}"
+
+    def test_load_with_pointer_still_skipped(self):
+        """A normal load (may_load=True, has pointer) must still be rejected
+        by classify_instruction -- the pointer-exception must not affect it."""
+        instr = _make_instr("LDA_U16", "lda.u16",
+                            "lda.u16\t$dst, [$p, #$off]", [
+            _make_reg_op("dst", "scalar"),
+            _make_reg_op("p", "pointer"),
+            _make_imm_op("off"),
+        ], may_load=True)
+        status, reason = classify_instruction(instr)
+        assert status == "skipped", \
+            f"Normal load (has pointer) should be skipped, got: {status}"
+        assert "load" in reason.lower()
 
 
 # ===================================================================
@@ -400,6 +481,33 @@ class TestRegisterNames:
         names = register_names("ERS4")
         assert names == []
 
+    def test_shfl_dst_returns_vector512_names(self):
+        """ShflDst composite kind maps to x* (vector512) register names.
+
+        mShflDst is AIE2Vector512RegisterClass in TableGen, accepting either
+        x* (mXm) or bml*/bmh* (mBMSm) registers in the assembler.  We use
+        the x* subset as the simplest concrete names for test generation.
+        """
+        names = register_names("ShflDst")
+        assert isinstance(names, list)
+        assert len(names) >= 2
+        assert all(n.startswith("x") for n in names), \
+            f"Expected x* names for ShflDst, got {names}"
+
+    def test_wm1_returns_vector256_names(self):
+        """Wm1 composite kind maps to wl* (vector256) register names.
+
+        mWm_1 is AIE2Vector256RegisterClass in TableGen with a non-monotonic
+        encoding (wl0, wl2, ..., wh0, wh2, ...).  The assembler accepts
+        the same wl*/wh* names as for plain vector256 -- the encoding
+        difference is transparent to the assembly programmer.
+        """
+        names = register_names("Wm1")
+        assert isinstance(names, list)
+        assert len(names) >= 2
+        assert all(n.startswith("wl") or n.startswith("wh") for n in names), \
+            f"Expected wl*/wh* names for Wm1, got {names}"
+
     def test_accumulator_bw4_returns_cm(self):
         """Accumulator with 4-bit encoding -> 1024-bit cm registers."""
         names = register_names("accumulator", bit_width=4)
@@ -439,14 +547,14 @@ class TestRegisterNames:
         assert ":" in names[0]
         assert names[0] == "r19:r18"  # r17:r16 avoided (r16 callee-saved)
     def test_result_latency_scalar_alu(self):
-        """Scalar ALU instructions have 1-cycle result latency."""
+        """Scalar ALU gets MIN_RESULT_LATENCY floor (model says 1)."""
         instr = {"sched_class": "II_ABS"}
-        assert result_latency(instr) == 1
+        assert result_latency(instr) == isa_test_gen.MIN_RESULT_LATENCY
 
     def test_result_latency_vmac(self):
-        """VMAC has 5-cycle result latency."""
+        """VMAC has 5-cycle model latency, clamped to min floor."""
         instr = {"sched_class": "II_VMAC"}
-        assert result_latency(instr) == 5
+        assert result_latency(instr) == max(5, isa_test_gen.MIN_RESULT_LATENCY)
 
     def test_result_latency_vmacf(self):
         """VMAC.F has 6-cycle result latency."""
@@ -607,6 +715,33 @@ class TestGenerateTestPoint:
         asm = generate_test_point(instr, regs, in_offset=0, out_offset=0)
         # The immediate should appear in the instruction
         assert "42" in asm
+
+    def test_control_register_output_uses_mov_readback(self):
+        """MOVX_mvx_scl: output is a control register; capture via mov readback.
+
+        The generated test point must:
+          1. Load the input scalar (mRx) from p0.
+          2. Emit the movx instruction writing to the control register (mCRm).
+          3. Read the control register back into r14 via 'mov r14, <ctrl_reg>'.
+          4. Store r14 to p1 (NOT a direct 'st crSat, [p1, ...]').
+        """
+        instr = _make_instr("MOVX_mvx_scl", "movx", "movx\t$mCRm, $mRx", [
+            _make_reg_op("mCRm", "control", bit_width=4),
+            _make_reg_op("mRx", "scalar", bit_width=5),
+        ])
+        regs = {"mCRm": "crSat", "mRx": "r3"}
+        asm = generate_test_point(instr, regs, in_offset=0, out_offset=0)
+        # Must include the movx instruction itself.
+        assert "movx\tcrSat, r3" in asm or "movx crSat, r3" in asm, \
+            f"Expected movx instruction in:\n{asm}"
+        # Must read the control register back via mov before storing.
+        assert "mov r14, crSat" in asm, \
+            f"Expected 'mov r14, crSat' readback in:\n{asm}"
+        # Must store r14, not crSat directly.
+        assert "st r14," in asm, \
+            f"Expected 'st r14,' (not 'st crSat,') in:\n{asm}"
+        assert "st crSat," not in asm, \
+            f"Should NOT have 'st crSat,' directly in:\n{asm}"
 
 
 # ===================================================================
@@ -1073,6 +1208,294 @@ class TestStoreStrategy:
         ], may_store=True, slot="st")
         strategy = isa_test_gen.StoreStrategy()
         assert strategy._compute_store_width(instr) == 32
+
+
+# ===================================================================
+# SP-relative instruction tests
+# ===================================================================
+
+class TestSpRelative:
+    """Tests for SP-relative load/store instructions.
+
+    SP-relative spill instructions use [sp, $imm] addressing where SP (p6)
+    is the implicit base register, not listed as an explicit operand.
+    The generator initializes SP to point at the data region for the test.
+    """
+
+    def _make_sp_load(self, name="VLDA_dmw_lda_w_ag_spill",
+                      mnemonic="vlda", kind="vector256"):
+        """Build a minimal SP-relative load instruction."""
+        return _make_instr(name, mnemonic,
+                           f"{mnemonic}\t$dst, [sp, $imm]", [
+            _make_reg_op("dst", kind),
+            _make_imm_op("imm", bit_width=12, signed=True),
+        ], may_load=True, slot="lda", sched_class="II_VLDA")
+
+    def _make_sp_store(self, name="VST_dmw_sts_w_ag_spill",
+                       mnemonic="vst", kind="vector256"):
+        """Build a minimal SP-relative store instruction."""
+        return _make_instr(name, mnemonic,
+                           f"{mnemonic}\t$src, [sp, $imm]", [
+            _make_reg_op("src", kind),
+            _make_imm_op("imm", bit_width=12, signed=True),
+        ], may_store=True, slot="st", sched_class="II_VST")
+
+    # --- _is_sp_relative helper ---
+
+    def test_is_sp_relative_true(self):
+        instr = self._make_sp_load()
+        assert isa_test_gen._is_sp_relative(instr)
+
+    def test_is_sp_relative_false_for_normal_load(self):
+        instr = _make_instr("LDA_S16", "lda.s16",
+                            "lda.s16\t$mRa, [$ptr, #$off]", [
+            _make_reg_op("mRa", "scalar"),
+            _make_reg_op("ptr", "pointer", bit_width=3),
+            _make_imm_op("off", bit_width=6, signed=True),
+        ], may_load=True, slot="lda")
+        assert not isa_test_gen._is_sp_relative(instr)
+
+    def test_is_sp_relative_case_insensitive(self):
+        """Detection should not be sensitive to asm_string case."""
+        instr = _make_instr("FAKE", "vlda",
+                            "vlda\t$dst, [SP, $imm]", [
+            _make_reg_op("dst", "vector256"),
+            _make_imm_op("imm", bit_width=12, signed=True),
+        ], may_load=True)
+        assert isa_test_gen._is_sp_relative(instr)
+
+    # --- LoadStrategy with SP-relative ---
+
+    def test_sp_load_can_test(self):
+        """SP-relative load should be accepted by LoadStrategy."""
+        instr = self._make_sp_load()
+        strategy = isa_test_gen.LoadStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"Expected can_test=True for SP load: {reason}"
+
+    def test_sp_load_with_composite_still_rejected(self):
+        """SP-relative load with composite destination stays rejected."""
+        instr = _make_instr("LDA_dms_spill", "lda",
+                            "lda\t$mLdaScl, [sp, $imm]", [
+            _make_composite_op("mLdaScl", "LdaScl", bit_width=7),
+            _make_imm_op("imm", bit_width=12, signed=True),
+        ], may_load=True, slot="lda")
+        strategy = isa_test_gen.LoadStrategy()
+        can, reason = strategy.can_test(instr)
+        assert not can
+        assert "composite" in reason.lower()
+
+    def test_sp_load_with_bw2_accumulator_rejected(self):
+        """SP-relative load with bw=2 accumulator stays rejected.
+
+        LDA_dmv_lda_q_ag_spill: accumulator dst with scalar 'lda' mnemonic.
+        The first rejection reason hit is the llvm-mc syntax blocker (scalar lda
+        with accumulator dest), not the bw=2 check -- both are correct blockers.
+        """
+        instr = _make_instr("LDA_dmv_lda_q_ag_spill", "lda",
+                            "lda\t$dst, [sp, $imm]", [
+            _make_imm_op("imm", bit_width=12, signed=True),
+            {
+                "name": "dst",
+                "bit_width": 2,
+                "is_output": False,
+                "operand_type": "register",
+                "register_kind": "accumulator",
+                "signed": False,
+                "scale": None,
+            },
+        ], may_load=True, slot="lda")
+        strategy = isa_test_gen.LoadStrategy()
+        can, reason = strategy.can_test(instr)
+        assert not can
+        # Multiple blockers; any rejection reason is acceptable.
+        assert reason != ""
+
+    def test_sp_load_generates_assembly_with_sp_init(self):
+        """SP-relative load should set up SP (p6) to point at input data."""
+        instr = self._make_sp_load()
+        strategy = isa_test_gen.LoadStrategy()
+        regs = {"dst": "wl0", "imm": "0"}
+        asm = strategy.generate_test_point(instr, regs,
+                                           in_offset=0, out_offset=0)
+        # SP is p6: the setup sequence should initialize p6 from p0.
+        assert "mov p6, p0" in asm, \
+            f"Expected SP (p6) initialization from p0:\n{asm}"
+        # The load instruction itself.
+        assert "vlda" in asm
+        # Should use [sp, ...] syntax.
+        assert "[sp," in asm
+        # Immediate should be zeroed (data is at sp).
+        assert "[sp, #0]" in asm or "[sp, 0]" in asm, \
+            f"Expected zeroed immediate in SP-relative load:\n{asm}"
+        # Should capture result to p1.
+        assert "p1" in asm
+
+    def test_sp_load_immediate_zeroed(self):
+        """The immediate in [sp, $imm] should be zeroed regardless of combo."""
+        instr = self._make_sp_load()
+        strategy = isa_test_gen.LoadStrategy()
+        regs = {"dst": "wl0", "imm": "64"}  # non-zero combo value
+        asm = strategy.generate_test_point(instr, regs,
+                                           in_offset=0, out_offset=0)
+        assert "[sp, #0]" in asm or "[sp, 0]" in asm, \
+            f"Immediate should be zeroed for SP-relative load:\n{asm}"
+
+    # --- StoreStrategy with SP-relative ---
+
+    def test_sp_store_can_test(self):
+        """SP-relative store should be accepted by StoreStrategy."""
+        instr = self._make_sp_store()
+        strategy = isa_test_gen.StoreStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"Expected can_test=True for SP store: {reason}"
+
+    def test_sp_store_with_composite_still_rejected(self):
+        """SP-relative store with composite source stays rejected."""
+        instr = _make_instr("ST_dms_spill", "st",
+                            "st\t$mSclSt, [sp, $imm]", [
+            _make_composite_op("mSclSt", "LdaScl", bit_width=7),
+            _make_imm_op("imm", bit_width=12, signed=True),
+        ], may_store=True, slot="st")
+        strategy = isa_test_gen.StoreStrategy()
+        can, reason = strategy.can_test(instr)
+        assert not can
+        assert "composite" in reason.lower()
+
+    def test_sp_store_generates_assembly_with_sp_init(self):
+        """SP-relative store should set up SP (p6) to point at output buffer."""
+        instr = self._make_sp_store()
+        strategy = isa_test_gen.StoreStrategy()
+        regs = {"src": "wl0", "imm": "0"}
+        asm = strategy.generate_test_point(instr, regs,
+                                           in_offset=0, out_offset=0)
+        # Should load source data from p0.
+        assert "p0" in asm
+        # SP is p6: the setup sequence should initialize p6 from p1 (output).
+        assert "mov p6, p1" in asm, \
+            f"Expected SP (p6) initialization from p1:\n{asm}"
+        # The store instruction itself.
+        assert "vst" in asm
+        # Should use [sp, ...] syntax.
+        assert "[sp," in asm
+        # Immediate should be zeroed (data is at sp).
+        assert "[sp, #0]" in asm or "[sp, 0]" in asm, \
+            f"Expected zeroed immediate in SP-relative store:\n{asm}"
+
+    def test_sp_store_does_not_use_p7(self):
+        """SP-relative store should NOT set up p7 (not used for SP stores)."""
+        instr = self._make_sp_store()
+        strategy = isa_test_gen.StoreStrategy()
+        regs = {"src": "wl0", "imm": "0"}
+        asm = strategy.generate_test_point(instr, regs,
+                                           in_offset=0, out_offset=0)
+        # p7 is the normal store scratch register; SP stores use p6 instead.
+        assert "p7" not in asm, \
+            f"SP-relative store should not set up p7:\n{asm}"
+
+    def test_normal_load_unchanged(self):
+        """Normal (non-SP-relative) loads should be unaffected by the change."""
+        instr = _make_instr("LDA_S16", "lda.s16",
+                            "lda.s16\t$mRa, [$ptr, #$off]", [
+            _make_reg_op("mRa", "scalar"),
+            _make_reg_op("ptr", "pointer", bit_width=3),
+            _make_imm_op("off", bit_width=6, signed=True),
+        ], may_load=True, slot="lda", sched_class="II_LDA")
+        strategy = isa_test_gen.LoadStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"Normal load should still be testable: {reason}"
+        regs = {"mRa": "r0", "ptr": "p6", "off": "0"}
+        asm = strategy.generate_test_point(instr, regs,
+                                           in_offset=0, out_offset=0)
+        assert "lda.s16" in asm
+        # Normal load uses p6 as scratch (same as before).
+        assert "p6" in asm
+
+    def test_normal_store_unchanged(self):
+        """Normal (non-SP-relative) stores should be unaffected by the change."""
+        instr = _make_instr("ST_S16", "st.s16",
+                            "st.s16\t$mRv, [$ptr, #$off]", [
+            _make_reg_op("mRv", "scalar"),
+            _make_reg_op("ptr", "pointer", bit_width=3),
+            _make_imm_op("off", bit_width=6, signed=True),
+        ], may_store=True, slot="st", sched_class="II_ST")
+        strategy = isa_test_gen.StoreStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"Normal store should still be testable: {reason}"
+        regs = {"mRv": "r0", "ptr": "p7", "off": "0"}
+        asm = strategy.generate_test_point(instr, regs,
+                                           in_offset=0, out_offset=0)
+        assert "st.s16" in asm
+        # Normal store uses p7 as scratch (same as before).
+        assert "p7" in asm
+
+    # --- Real ISA JSON integration ---
+
+    @pytest.fixture
+    def isa_data(self):
+        path = os.path.join(os.path.dirname(__file__), "aie2-isa.json")
+        if not os.path.exists(path):
+            pytest.skip("aie2-isa.json not found")
+        with open(path) as f:
+            return json.load(f)
+
+    def _find_instr(self, isa_data, name):
+        for section, items in isa_data.items():
+            if isinstance(items, list):
+                for i in items:
+                    if i.get("name") == name:
+                        return i
+        return None
+
+    def test_vlda_w_spill_testable(self, isa_data):
+        """VLDA_dmw_lda_w_ag_spill must be testable via LoadStrategy."""
+        instr = self._find_instr(isa_data, "VLDA_dmw_lda_w_ag_spill")
+        assert instr is not None
+        strategy = isa_test_gen.LoadStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"Expected testable: {reason}"
+
+    def test_vst_w_spill_testable(self, isa_data):
+        """VST_dmw_sts_w_ag_spill must be testable via StoreStrategy."""
+        instr = self._find_instr(isa_data, "VST_dmw_sts_w_ag_spill")
+        assert instr is not None
+        strategy = isa_test_gen.StoreStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"Expected testable: {reason}"
+
+    def test_vst_am_spill_testable(self, isa_data):
+        """VST_dmw_sts_am_ag_spill (accumulator) must be testable."""
+        instr = self._find_instr(isa_data, "VST_dmw_sts_am_ag_spill")
+        assert instr is not None
+        strategy = isa_test_gen.StoreStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"Expected testable: {reason}"
+
+    def test_vst_128_spill_testable(self, isa_data):
+        """VST_128_ag_spill must be testable via StoreStrategy."""
+        instr = self._find_instr(isa_data, "VST_128_ag_spill")
+        assert instr is not None
+        strategy = isa_test_gen.StoreStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"Expected testable: {reason}"
+
+    def test_lda_dms_spill_still_blocked(self, isa_data):
+        """LDA_dms_spill has composite operand -- must remain blocked."""
+        instr = self._find_instr(isa_data, "LDA_dms_spill")
+        assert instr is not None
+        strategy = isa_test_gen.LoadStrategy()
+        can, reason = strategy.can_test(instr)
+        assert not can, "LDA_dms_spill has composite register and should remain blocked"
+        assert "composite" in reason.lower()
+
+    def test_st_dms_spill_still_blocked(self, isa_data):
+        """ST_dms_spill has composite operand -- must remain blocked."""
+        instr = self._find_instr(isa_data, "ST_dms_spill")
+        assert instr is not None
+        strategy = isa_test_gen.StoreStrategy()
+        can, reason = strategy.can_test(instr)
+        assert not can, "ST_dms_spill has composite register and should remain blocked"
+        assert "composite" in reason.lower()
 
 
 # ===================================================================
