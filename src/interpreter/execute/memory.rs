@@ -308,8 +308,25 @@ impl MemoryUnit {
             }
         } else {
             // Scalar/partial loads go through write_dest_with_latency (which queues)
-            let value = Self::read_memory(tile, addr, width, neighbors.map(|n| &*n));
+            let raw_value = Self::read_memory(tile, addr, width, neighbors.map(|n| &*n));
 
+            // Apply sign/zero extension based on element type.
+            // lda.s8 sign-extends 8-bit to 32-bit, lda.u8 zero-extends, etc.
+            // read_memory returns zero-extended by default, so we only need
+            // to fix up signed narrow loads.
+            let value = if let Some(ref et) = op.element_type {
+                if et.is_signed() {
+                    match width {
+                        MemWidth::Byte => (raw_value as u8 as i8 as i32 as u32) as u64,
+                        MemWidth::HalfWord => (raw_value as u16 as i16 as i32 as u32) as u64,
+                        _ => raw_value,
+                    }
+                } else {
+                    raw_value  // already zero-extended
+                }
+            } else {
+                raw_value  // no element type info, keep as-is
+            };
 
             if log::log_enabled!(log::Level::Trace) {
                 let masked = addr & 0xFFFF;
