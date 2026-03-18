@@ -79,13 +79,13 @@ CONVERSION_INTRINSICS: dict[str, dict] = {
     },
     "vlda.ups.s32.s8": {
         "intrinsic": "acc32.v32.I256.ups",
-        "in_type": "<32 x i8>", "out_type": "<8 x i64>",
-        "in_bytes": 32, "out_bytes": 64, "sign": 1,
+        "in_type": "<32 x i8>", "out_type": "<16 x i64>",
+        "in_bytes": 32, "out_bytes": 128, "sign": 1,
     },
     "vlda.ups.s32.d8": {
         "intrinsic": "acc32.v32.I256.ups",
-        "in_type": "<32 x i8>", "out_type": "<8 x i64>",
-        "in_bytes": 32, "out_bytes": 64, "sign": 0,
+        "in_type": "<32 x i8>", "out_type": "<16 x i64>",
+        "in_bytes": 32, "out_bytes": 128, "sign": 0,
     },
     "vlda.ups.s64.s32": {
         "intrinsic": "acc64.v8.I256.ups",
@@ -99,13 +99,13 @@ CONVERSION_INTRINSICS: dict[str, dict] = {
     },
     "vlda.ups.s64.s16": {
         "intrinsic": "acc64.v16.I256.ups",
-        "in_type": "<16 x i16>", "out_type": "<8 x i64>",
-        "in_bytes": 32, "out_bytes": 64, "sign": 1,
+        "in_type": "<16 x i16>", "out_type": "<16 x i64>",
+        "in_bytes": 32, "out_bytes": 128, "sign": 1,
     },
     "vlda.ups.s64.d16": {
         "intrinsic": "acc64.v16.I256.ups",
-        "in_type": "<16 x i16>", "out_type": "<8 x i64>",
-        "in_bytes": 32, "out_bytes": 64, "sign": 0,
+        "in_type": "<16 x i16>", "out_type": "<16 x i64>",
+        "in_bytes": 32, "out_bytes": 128, "sign": 0,
     },
     # --- SRS (8): accumulator -> vector ---
     "vst.srs.s16.s32": {
@@ -120,13 +120,13 @@ CONVERSION_INTRINSICS: dict[str, dict] = {
     },
     "vst.srs.s8.s32": {
         "intrinsic": "I256.v32.acc32.srs",
-        "in_type": "<8 x i64>", "out_type": "<32 x i8>",
-        "in_bytes": 64, "out_bytes": 32, "sign": 1,
+        "in_type": "<16 x i64>", "out_type": "<32 x i8>",
+        "in_bytes": 128, "out_bytes": 32, "sign": 1,
     },
     "vst.srs.d8.s32": {
         "intrinsic": "I256.v32.acc32.srs",
-        "in_type": "<8 x i64>", "out_type": "<32 x i8>",
-        "in_bytes": 64, "out_bytes": 32, "sign": 0,
+        "in_type": "<16 x i64>", "out_type": "<32 x i8>",
+        "in_bytes": 128, "out_bytes": 32, "sign": 0,
     },
     "vst.srs.s32.s64": {
         "intrinsic": "I256.v8.acc64.srs",
@@ -140,13 +140,13 @@ CONVERSION_INTRINSICS: dict[str, dict] = {
     },
     "vst.srs.s16.s64": {
         "intrinsic": "I256.v16.acc64.srs",
-        "in_type": "<8 x i64>", "out_type": "<16 x i16>",
-        "in_bytes": 64, "out_bytes": 32, "sign": 1,
+        "in_type": "<16 x i64>", "out_type": "<16 x i16>",
+        "in_bytes": 128, "out_bytes": 32, "sign": 1,
     },
     "vst.srs.d16.s64": {
         "intrinsic": "I256.v16.acc64.srs",
-        "in_type": "<8 x i64>", "out_type": "<16 x i16>",
-        "in_bytes": 64, "out_bytes": 32, "sign": 0,
+        "in_type": "<16 x i64>", "out_type": "<16 x i16>",
+        "in_bytes": 128, "out_bytes": 32, "sign": 0,
     },
     # --- PACK (4): wider -> narrower + store ---
     "vst.pack.s4.s8": {
@@ -2073,7 +2073,7 @@ _UPS_SRS_PARTNERS = {
     "acc32.v32.I256.ups": {
         "srs_intrinsic": "I256.v32.acc32.srs",
         "vec_type": "<32 x i8>",
-        "acc_type": "<8 x i64>",
+        "acc_type": "<16 x i64>",
     },
     # acc64 UPS -> acc64 SRS
     "acc64.v8.I256.ups": {
@@ -2084,7 +2084,7 @@ _UPS_SRS_PARTNERS = {
     "acc64.v16.I256.ups": {
         "srs_intrinsic": "I256.v16.acc64.srs",
         "vec_type": "<16 x i16>",
-        "acc_type": "<8 x i64>",
+        "acc_type": "<16 x i64>",
     },
     # acc32 SRS -> acc32 UPS (reverse: need UPS to get into acc first)
     "I256.v16.acc32.srs": {
@@ -2095,7 +2095,7 @@ _UPS_SRS_PARTNERS = {
     "I256.v32.acc32.srs": {
         "ups_intrinsic": "acc32.v32.I256.ups",
         "vec_type": "<32 x i8>",
-        "acc_type": "<8 x i64>",
+        "acc_type": "<16 x i64>",
     },
     # acc64 SRS -> acc64 UPS
     "I256.v8.acc64.srs": {
@@ -2106,7 +2106,7 @@ _UPS_SRS_PARTNERS = {
     "I256.v16.acc64.srs": {
         "ups_intrinsic": "acc64.v16.I256.ups",
         "vec_type": "<16 x i16>",
-        "acc_type": "<8 x i64>",
+        "acc_type": "<16 x i64>",
     },
 }
 
