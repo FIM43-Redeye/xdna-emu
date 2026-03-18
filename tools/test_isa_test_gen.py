@@ -1364,11 +1364,23 @@ class TestLoadStrategy:
         can, reason = strategy.can_test(instr)
         assert not can
 
-    def test_rejects_composite_dest(self):
-        """Loads with composite destination are deferred."""
+    def test_accepts_testable_composite_dest(self):
+        """Loads with LdaScl composite destination are now testable."""
         instr = _make_instr("LDA_2D_LDASCL", "lda.2d",
                             "lda.2d\t$mLdaScl, [$ptr], $mod", [
             _make_composite_op("mLdaScl", "LdaScl", bit_width=7),
+            _make_reg_op("ptr", "pointer", bit_width=3),
+            _make_reg_op("mod", "modifier_m", bit_width=3),
+        ], may_load=True, slot="lda")
+        strategy = isa_test_gen.LoadStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"LdaScl composite should be testable now, got: {reason}"
+
+    def test_rejects_unknown_composite_dest(self):
+        """Loads with unknown composite destination are still rejected."""
+        instr = _make_instr("LDA_UNKNOWN", "lda",
+                            "lda\t$dst, [$ptr], $mod", [
+            _make_composite_op("dst", "UnknownCompKind", bit_width=7),
             _make_reg_op("ptr", "pointer", bit_width=3),
             _make_reg_op("mod", "modifier_m", bit_width=3),
         ], may_load=True, slot="lda")
@@ -1473,7 +1485,8 @@ class TestStoreStrategy:
         can, reason = strategy.can_test(instr)
         assert not can
 
-    def test_rejects_composite_source(self):
+    def test_accepts_testable_composite_source(self):
+        """Stores with LdaScl composite source are now testable."""
         instr = _make_instr("ST_COMP", "st.2d",
                             "st.2d\t$mLdaScl, [$ptr], $mod", [
             _make_composite_op("mLdaScl", "LdaScl", bit_width=7),
@@ -1482,7 +1495,7 @@ class TestStoreStrategy:
         ], may_store=True, slot="st")
         strategy = isa_test_gen.StoreStrategy()
         can, reason = strategy.can_test(instr)
-        assert not can
+        assert can, f"LdaScl composite should be testable, got: {reason}"
 
     def test_generates_valid_assembly(self):
         instr = _make_instr("ST_S16", "st.s16",
@@ -1632,8 +1645,8 @@ class TestSpRelative:
         can, reason = strategy.can_test(instr)
         assert can, f"Expected can_test=True for SP load: {reason}"
 
-    def test_sp_load_with_composite_still_rejected(self):
-        """SP-relative load with composite destination stays rejected."""
+    def test_sp_load_with_testable_composite_accepted(self):
+        """SP-relative load with LdaScl composite destination is now testable."""
         instr = _make_instr("LDA_dms_spill", "lda",
                             "lda\t$mLdaScl, [sp, $imm]", [
             _make_composite_op("mLdaScl", "LdaScl", bit_width=7),
@@ -1641,15 +1654,14 @@ class TestSpRelative:
         ], may_load=True, slot="lda")
         strategy = isa_test_gen.LoadStrategy()
         can, reason = strategy.can_test(instr)
-        assert not can
-        assert "composite" in reason.lower()
+        assert can, f"SP+LdaScl should be testable, got: {reason}"
 
-    def test_sp_load_with_bw2_accumulator_rejected(self):
-        """SP-relative load with bw=2 accumulator stays rejected.
+    def test_sp_load_with_bw2_accumulator_accepted(self):
+        """SP-relative load with bw=2 accumulator is now testable.
 
-        LDA_dmv_lda_q_ag_spill: accumulator dst with scalar 'lda' mnemonic.
-        The first rejection reason hit is the llvm-mc syntax blocker (scalar lda
-        with accumulator dest), not the bw=2 check -- both are correct blockers.
+        LDA_dmv_lda_q_ag_spill: accumulator bw=2 is the quad register class
+        (q0-q3, mQQa in TableGen) which uses the scalar 'lda' slot and IS
+        accepted by llvm-mc as "lda q0, [sp, #imm]".
         """
         instr = _make_instr("LDA_dmv_lda_q_ag_spill", "lda",
                             "lda\t$dst, [sp, $imm]", [
@@ -1666,9 +1678,7 @@ class TestSpRelative:
         ], may_load=True, slot="lda")
         strategy = isa_test_gen.LoadStrategy()
         can, reason = strategy.can_test(instr)
-        assert not can
-        # Multiple blockers; any rejection reason is acceptable.
-        assert reason != ""
+        assert can, f"DMV_Q quad load (bw=2 acc) should be testable, got: {reason}"
 
     def test_sp_load_generates_assembly_with_sp_init(self):
         """SP-relative load should set up SP (p6) to point at input data."""
@@ -1709,8 +1719,13 @@ class TestSpRelative:
         can, reason = strategy.can_test(instr)
         assert can, f"Expected can_test=True for SP store: {reason}"
 
-    def test_sp_store_with_composite_still_rejected(self):
-        """SP-relative store with composite source stays rejected."""
+    def test_sp_store_with_ldascl_composite_accepted(self):
+        """SP-relative store with LdaScl composite source is now testable.
+
+        ST_dms_spill uses mSclSt (kind="LdaScl") which is mapped to scalar
+        in TESTABLE_COMPOSITE_KINDS.  The test harness treats it as a plain
+        scalar register store, using r* names.
+        """
         instr = _make_instr("ST_dms_spill", "st",
                             "st\t$mSclSt, [sp, $imm]", [
             _make_composite_op("mSclSt", "LdaScl", bit_width=7),
@@ -1718,8 +1733,7 @@ class TestSpRelative:
         ], may_store=True, slot="st")
         strategy = isa_test_gen.StoreStrategy()
         can, reason = strategy.can_test(instr)
-        assert not can
-        assert "composite" in reason.lower()
+        assert can, f"ST_dms_spill with LdaScl should be testable, got: {reason}"
 
     def test_sp_store_generates_assembly_with_sp_init(self):
         """SP-relative store should set up SP (p6) to point at output buffer."""
@@ -1838,23 +1852,21 @@ class TestSpRelative:
         can, reason = strategy.can_test(instr)
         assert can, f"Expected testable: {reason}"
 
-    def test_lda_dms_spill_still_blocked(self, isa_data):
-        """LDA_dms_spill has composite operand -- must remain blocked."""
+    def test_lda_dms_spill_now_testable(self, isa_data):
+        """LDA_dms_spill: LdaScl composite is now in TESTABLE_COMPOSITE_KINDS."""
         instr = self._find_instr(isa_data, "LDA_dms_spill")
         assert instr is not None
         strategy = isa_test_gen.LoadStrategy()
         can, reason = strategy.can_test(instr)
-        assert not can, "LDA_dms_spill has composite register and should remain blocked"
-        assert "composite" in reason.lower()
+        assert can, f"LDA_dms_spill should be testable now: {reason}"
 
-    def test_st_dms_spill_still_blocked(self, isa_data):
-        """ST_dms_spill has composite operand -- must remain blocked."""
+    def test_st_dms_spill_now_testable(self, isa_data):
+        """ST_dms_spill: LdaScl composite is now in TESTABLE_COMPOSITE_KINDS."""
         instr = self._find_instr(isa_data, "ST_dms_spill")
         assert instr is not None
         strategy = isa_test_gen.StoreStrategy()
         can, reason = strategy.can_test(instr)
-        assert not can, "ST_dms_spill has composite register and should remain blocked"
-        assert "composite" in reason.lower()
+        assert can, f"ST_dms_spill should be testable now: {reason}"
 
 
 # ===================================================================

@@ -1521,6 +1521,42 @@ class LoadStrategy(TestStrategy):
 
 
 # ---------------------------------------------------------------------------
+# Load/store kind helpers
+# ---------------------------------------------------------------------------
+
+def _effective_load_store_kind(op: dict) -> str:
+    """Resolve the effective register kind for a load/store operand.
+
+    This extends _effective_kind() to also handle the accumulator-bw=2
+    (DMV_Q quad) case: the ISA exporter labels q0-q3 registers as
+    'accumulator' with bit_width=2 because of a 2-bit encoding for 4
+    entries.  In load/store context these are 128-byte quad registers.
+
+    Returns the kind string suitable for _load_instruction / _store_instruction.
+    """
+    # First try the composite_register -> TESTABLE_COMPOSITE_KINDS path.
+    eff = _effective_kind(op)
+    if eff:
+        return eff
+    kind = op.get("register_kind", "") or ""
+    if kind == "accumulator" and op.get("bit_width", 0) == 2:
+        # DMV_Q quad registers (q0-q3) misclassified by exporter as bw=2 accum.
+        return "quad"
+    return kind
+
+
+def _kind_alignment(kind: str) -> int:
+    """Return the natural memory alignment (bytes) for a register kind."""
+    if kind in ("vector256", "accumulator"):
+        return 32
+    if kind in ("vector512",):
+        return 32  # two 32-byte vlda instructions
+    if kind == "quad":
+        return 128  # 128-byte quadword register
+    return 4
+
+
+# ---------------------------------------------------------------------------
 # StoreStrategy: tests store instructions
 # ---------------------------------------------------------------------------
 
@@ -1559,25 +1595,35 @@ class StoreStrategy(TestStrategy):
         if not has_pointer and not sp_relative:
             return (False, "store with no pointer operand")
 
-        # Reject composite operands (ST_dms_spill has mSclSt composite).
+        # Reject composite operands unless they are in TESTABLE_COMPOSITE_KINDS.
+        # ST_dms_* instructions use mSclSt (kind="LdaScl") which maps to scalar.
         for op in operands:
             if op.get("operand_type") == "composite_register":
-                return (False, "composite register operand (deferred)")
+                ck = op.get("register_kind", "")
+                if ck not in TESTABLE_COMPOSITE_KINDS:
+                    return (False, "composite register operand (deferred)")
 
         # Detect the source (data to be stored).
         source = self._detect_store_source(instr)
         if source is None:
             return (False, "no detectable store source")
 
-        kind = source.get("register_kind", "")
+        kind = _effective_load_store_kind(source)
+        if not kind:
+            kind = source.get("register_kind", "")
         if kind not in KNOWN_REGISTER_KINDS:
             return (False, f"unsupported store source kind: {kind}")
 
         # Reject accumulator-source scalar stores: llvm-mc doesn't accept
         # "st cm0, [ptr]" syntax even though AIE2 hardware supports it.
+        # Exception: accumulator bw=2 is actually the quad register class (q0-q3)
+        # which uses scalar 'st' slot and IS accepted as "st q0, [ptr, #imm]".
         mnemonic = instr.get("mnemonic", "")
         if kind == "accumulator" and not mnemonic.startswith("vst"):
-            return (False, "accumulator source with scalar st (unsupported by llvm-mc)")
+            bw = source.get("bit_width", 0)
+            if bw != 2:
+                return (False, "accumulator source with scalar st (unsupported by llvm-mc)")
+            # bw=2: quad register (q0-q3) -- fall through, handled below.
 
         # Reject unknown operand types (except dontcare and cm-class resolvable).
         for op in operands:
@@ -1591,7 +1637,13 @@ class StoreStrategy(TestStrategy):
 
     def _detect_store_source(self, instr: dict) -> Optional[dict]:
         """For stores, the source is the first non-pointer, non-modifier
-        register in asm_string."""
+        register in asm_string.
+
+        Accepts both plain register operands (operand_type in REGISTER_LIKE_TYPES)
+        and testable composite operands (operand_type="composite_register" with
+        kind in TESTABLE_COMPOSITE_KINDS), so that DMS scalar stores (mSclSt)
+        are detected correctly.
+        """
         asm_string = instr.get("asm_string", "")
         asm_op_names = re.findall(r'\$(\w+)', asm_string)
         op_by_name = {op["name"]: op for op in instr.get("operands", [])}
@@ -1600,7 +1652,13 @@ class StoreStrategy(TestStrategy):
             if name not in op_by_name:
                 continue
             op = op_by_name[name]
-            if op.get("operand_type") not in REGISTER_LIKE_TYPES:
+            op_type = op.get("operand_type", "")
+            is_register_like = op_type in REGISTER_LIKE_TYPES
+            is_testable_composite = (
+                op_type == "composite_register"
+                and op.get("register_kind", "") in TESTABLE_COMPOSITE_KINDS
+            )
+            if not is_register_like and not is_testable_composite:
                 continue
             kind = op.get("register_kind", "")
             if kind not in ("pointer", "modifier_m", "modifier_dj"):
@@ -1610,7 +1668,10 @@ class StoreStrategy(TestStrategy):
     def _compute_store_width(self, instr: dict) -> int:
         """Determine how many bytes the store instruction actually writes."""
         source = self._detect_store_source(instr)
-        kind = source.get("register_kind", "scalar") if source else "scalar"
+        if source is None:
+            kind = "scalar"
+        else:
+            kind = _effective_load_store_kind(source) or source.get("register_kind", "scalar")
 
         if kind == "vector256":
             return 32
@@ -1618,6 +1679,8 @@ class StoreStrategy(TestStrategy):
             return 64
         if kind == "accumulator":
             return 64
+        if kind == "quad":
+            return 128
 
         # Scalar stores: check mnemonic for data width.
         mnemonic = instr.get("mnemonic", "")
@@ -1643,14 +1706,16 @@ class StoreStrategy(TestStrategy):
 
         source = self._detect_store_source(instr)
         src_name = source["name"]
-        src_kind = source.get("register_kind", "scalar")
+        # Use effective kind: resolves composite (LdaScl -> scalar) and
+        # accumulator bw=2 (DMV_Q quad -> "quad") for correct load dispatch.
+        src_kind = _effective_load_store_kind(source)
         src_reg = regs.get(src_name, "r0")
 
         op_by_name = {op["name"]: op for op in instr.get("operands", [])}
         sp_relative = _is_sp_relative(instr)
 
         # Align and load known data into the source register.
-        align = 32 if src_kind in ("vector256", "vector512", "accumulator") else 4
+        align = _kind_alignment(src_kind)
         in_offset = _align(in_offset, align)
         load_lines = _load_instruction(src_reg, src_kind, "p0", in_offset)
         lines.extend(load_lines)
@@ -1871,6 +1936,9 @@ def _operand_size(op: dict, instr_name: str = "") -> int:
     effective = _effective_kind(op)
     if op.get("operand_type") == "composite_register" and effective:
         kind = effective
+    # For accumulator bw=2 (DMV_Q quad registers q0-q3), use quad size.
+    if kind == "accumulator" and op.get("bit_width", 0) == 2:
+        kind = "quad"
     base = REGISTER_SIZES.get(kind, 4)
     # Register pairs (eL class) need double the scalar size.
     if (op.get("operand_type") == "register+16"
