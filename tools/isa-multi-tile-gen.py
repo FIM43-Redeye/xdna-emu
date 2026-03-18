@@ -10,8 +10,30 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
+
+# llvm-objcopy from Peano toolchain -- handles AIE2 ELF format.
+# Check both install/ (preferred) and build/ (fallback) locations.
+def _find_llvm_objcopy() -> str:
+    """Return path to llvm-objcopy, preferring PEANO_INSTALL_DIR if set."""
+    peano_install = os.environ.get(
+        "PEANO_INSTALL_DIR",
+        os.path.expanduser("~/npu-work/llvm-aie/install"),
+    )
+    candidates = [
+        os.path.join(peano_install, "bin", "llvm-objcopy"),
+        os.path.expanduser("~/npu-work/llvm-aie/build/bin/llvm-objcopy"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    # Return first candidate even if missing -- caller will get a clear error.
+    return candidates[0]
+
+LLVM_OBJCOPY = _find_llvm_objcopy()
 
 
 def assign_phases(batches: list[dict], tiles_per_phase: int = 4) -> list[list[dict]]:
@@ -82,6 +104,69 @@ def _obj_filename(batch: dict) -> str:
     if not base.endswith(".o"):
         base += ".o"
     return base
+
+
+def prepare_phase_objects(
+    batches: list[dict],
+    phase_dir: str,
+    obj_dir: str,
+) -> list[str]:
+    """Copy and rename batch .o files for multi-tile linking.
+
+    Every batch .o file exports a symbol named ``test_kernel``.  The
+    multi-tile MLIR declares per-tile functions as ``test_kernel_0``,
+    ``test_kernel_1``, etc.  This function makes the two agree:
+
+    1. Copies ``batch_NNN.o`` from *obj_dir* to *phase_dir* under the
+       name that ``link_with`` will reference (derived from the batch's
+       ``filename`` field).
+    2. Runs ``llvm-objcopy --redefine-sym test_kernel=test_kernel_{col}``
+       on the copy so the linker resolves the per-tile symbol.
+
+    The column index ``col`` is the batch's position in *batches* (0-based),
+    NOT the ``batch_index`` field.  This is intentional: the column assignment
+    is purely a property of the phase layout.
+
+    Args:
+        batches:   Batch dicts.  Each must have ``batch_index`` and
+                   ``filename`` fields.
+        phase_dir: Directory to write renamed .o files into (created if
+                   absent).
+        obj_dir:   Directory containing the original ``batch_NNN.o`` files
+                   produced by the compile step.
+
+    Returns:
+        List of renamed .o basenames in column order, matching what the
+        MLIR ``link_with`` attributes expect.
+
+    Raises:
+        subprocess.CalledProcessError: if llvm-objcopy fails on any file.
+        FileNotFoundError: if a source .o does not exist.
+    """
+    os.makedirs(phase_dir, exist_ok=True)
+    result: list[str] = []
+    for col, batch in enumerate(batches):
+        # Source: batch_NNN.o in the shared object directory.
+        src = os.path.join(
+            obj_dir, f"batch_{batch['batch_index']:03d}.o"
+        )
+        # Destination: named to match the link_with attribute in the MLIR.
+        o_name = _obj_filename(batch)
+        dst = os.path.join(phase_dir, o_name)
+        shutil.copy2(src, dst)
+        # Rename the exported symbol so the per-tile function declaration
+        # in the MLIR resolves correctly.
+        subprocess.run(
+            [
+                LLVM_OBJCOPY,
+                "--redefine-sym",
+                f"test_kernel=test_kernel_{col}",
+                dst,
+            ],
+            check=True,
+        )
+        result.append(o_name)
+    return result
 
 
 def generate_phase_mlir(batches: list[dict], phase_idx: int) -> str:
@@ -284,7 +369,16 @@ def main():
     parser.add_argument(
         "--out-dir",
         required=True,
-        help="Output directory for aie.mlir.",
+        help="Output directory for aie.mlir and renamed .o files.",
+    )
+    parser.add_argument(
+        "--obj-dir",
+        default=None,
+        help=(
+            "Directory containing compiled batch_NNN.o files.  When provided, "
+            "each .o is copied into --out-dir and its test_kernel symbol is "
+            "renamed to test_kernel_N before the MLIR is generated."
+        ),
     )
     args = parser.parse_args()
 
@@ -307,10 +401,17 @@ def main():
         )
         sys.exit(1)
 
-    mlir = generate_phase_mlir(selected, args.phase_idx)
-
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Rename batch .o symbols before generating MLIR so that link_with
+    # targets exist with the correct per-tile symbol names.
+    if args.obj_dir is not None:
+        renamed = prepare_phase_objects(selected, str(out_dir), args.obj_dir)
+        print(f"Prepared {len(renamed)} object file(s) in {out_dir}")
+
+    mlir = generate_phase_mlir(selected, args.phase_idx)
+
     out_path = out_dir / "aie.mlir"
     out_path.write_text(mlir)
     print(f"Wrote {out_path}")
