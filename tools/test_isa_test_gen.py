@@ -763,6 +763,49 @@ class TestGenerateOperandCombos:
 
 
 # ===================================================================
+# ComputeStrategy tests
+# ===================================================================
+
+class TestComputeStrategy:
+    """Tests for ComputeStrategy (refactored from existing logic)."""
+
+    def test_scalar_add_can_test(self):
+        instr = _make_instr("ADD", "add", "add\t$mRx, $mRx0, $mRy", [
+            _make_reg_op("mRx", "scalar"),
+            _make_reg_op("mRx0", "scalar"),
+            _make_reg_op("mRy", "scalar"),
+        ])
+        strategy = isa_test_gen.ComputeStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_load_not_compute(self):
+        instr = _make_instr("LDA", "lda", "lda\t$dst, [$p, #$off]", [
+            _make_reg_op("dst", "scalar"),
+            _make_reg_op("p", "pointer"),
+            _make_imm_op("off"),
+        ], may_load=True)
+        strategy = isa_test_gen.ComputeStrategy()
+        can, reason = strategy.can_test(instr)
+        assert not can
+
+    def test_generate_test_point_unchanged(self):
+        """ComputeStrategy must produce identical assembly to old code path."""
+        instr = _make_instr("ADD", "add", "add\t$mRx, $mRx0, $mRy", [
+            _make_reg_op("mRx", "scalar"),
+            _make_reg_op("mRx0", "scalar"),
+            _make_reg_op("mRy", "scalar"),
+        ])
+        regs = {"mRx": "r2", "mRx0": "r3", "mRy": "r4"}
+        # Old path
+        old_asm = generate_test_point(instr, regs, in_offset=0, out_offset=0)
+        # New path via strategy
+        strategy = isa_test_gen.ComputeStrategy()
+        new_asm = strategy.generate_test_point(instr, regs, in_offset=0, out_offset=0)
+        assert old_asm == new_asm
+
+
+# ===================================================================
 # Task 4: generate_all integration tests
 # ===================================================================
 

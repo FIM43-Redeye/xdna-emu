@@ -122,6 +122,37 @@ def result_latency(instr: dict) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Strategy Interface
+# ---------------------------------------------------------------------------
+
+class TestStrategy:
+    """Base class for instruction test strategies."""
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        """Return (True, "") if this strategy can test the instruction,
+        or (False, skip_reason) if not."""
+        raise NotImplementedError
+
+    def generate_test_point(self, instr: dict, regs: dict[str, str],
+                            in_offset: int, out_offset: int) -> str:
+        """Generate assembly for one test point."""
+        raise NotImplementedError
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        """Generate operand combos for this instruction.
+        Default delegates to the shared generate_operand_combos()."""
+        return generate_operand_combos(instr)
+
+    def compute_input_size(self, instr: dict, regs: dict[str, str]) -> int:
+        """Compute total input buffer size for a test point."""
+        return _compute_input_size(instr, regs)
+
+    def compute_output_size(self, instr: dict) -> int:
+        """Compute total output buffer size for a test point."""
+        return _compute_output_size(instr)
+
+
+# ---------------------------------------------------------------------------
 # Task 2: Instruction Classification
 # ---------------------------------------------------------------------------
 
@@ -820,6 +851,46 @@ def generate_operand_combos(instr: dict) -> list[dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# ComputeStrategy: wraps existing classify + generate logic
+# ---------------------------------------------------------------------------
+
+class ComputeStrategy(TestStrategy):
+    """Tests compute instructions (ALU, vector, moves).
+
+    This wraps the original classify_instruction() and generate_test_point()
+    with no behavioral change.
+    """
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        status, reason = classify_instruction(instr)
+        return (status == "testable", reason)
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset):
+        return generate_test_point(instr, regs, in_offset, out_offset)
+
+
+# ---------------------------------------------------------------------------
+# Strategy Dispatch
+# ---------------------------------------------------------------------------
+
+STRATEGIES: list[TestStrategy] = [
+    ComputeStrategy(),
+]
+
+
+def classify_with_strategies(instr: dict) -> tuple[Optional[TestStrategy], str]:
+    """Try each strategy in order. Return (strategy, "") or (None, reason)."""
+    last_reason = "no strategy matched"
+    for strategy in STRATEGIES:
+        can, reason = strategy.can_test(instr)
+        if can:
+            return (strategy, "")
+        if reason:
+            last_reason = reason
+    return (None, last_reason)
+
+
+# ---------------------------------------------------------------------------
 # Task 4: Test Point Metadata
 # ---------------------------------------------------------------------------
 
@@ -928,29 +999,30 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     testable_count = 0
     skipped_count = 0
     skip_reasons: dict[str, int] = {}
-    test_point_specs: list[tuple[dict, int, dict]] = []  # (instr, combo_idx, regs)
+    # (instr, combo_idx, regs, strategy)
+    test_point_specs: list[tuple[dict, int, dict, TestStrategy]] = []
 
     for instr in all_instrs:
-        status, reason = classify_instruction(instr)
-        if status != "testable":
+        strategy, reason = classify_with_strategies(instr)
+        if strategy is None:
             skipped_count += 1
             skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
             continue
 
         testable_count += 1
-        combos = generate_operand_combos(instr)
+        combos = strategy.generate_combos(instr)
 
         for combo_idx, regs in enumerate(combos):
-            test_point_specs.append((instr, combo_idx, regs))
+            test_point_specs.append((instr, combo_idx, regs, strategy))
 
     # First pass: generate assembly for each test point at offset 0 to
     # measure its code size (bundle count).  This lets us bin-pack into
     # batches that fit within program memory.
-    measured_specs = []  # (instr, combo_idx, regs, bundle_count)
-    for instr, combo_idx, regs in test_point_specs:
-        asm = generate_test_point(instr, regs, in_offset=0, out_offset=0)
+    measured_specs = []  # (instr, combo_idx, regs, bundle_count, strategy)
+    for instr, combo_idx, regs, strategy in test_point_specs:
+        asm = strategy.generate_test_point(instr, regs, in_offset=0, out_offset=0)
         bundles = _count_bundles(asm)
-        measured_specs.append((instr, combo_idx, regs, bundles))
+        measured_specs.append((instr, combo_idx, regs, bundles, strategy))
 
     # Bin-pack into batches by measured code size.
     batches = []
@@ -978,14 +1050,14 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         batch_asm = []
         batch_meta = []
 
-        for instr, combo_idx, regs, _bundles in batch_specs:
-            in_size = _compute_input_size(instr, regs)
-            out_size = _compute_output_size(instr)
+        for instr, combo_idx, regs, _bundles, strategy in batch_specs:
+            in_size = strategy.compute_input_size(instr, regs)
+            out_size = strategy.compute_output_size(instr)
             # Align offsets to avoid vlda/vst alignment assertions.
             batch_in_offset = _align(batch_in_offset, 32)
             batch_out_offset = _align(batch_out_offset, 32)
 
-            asm = generate_test_point(
+            asm = strategy.generate_test_point(
                 instr, regs,
                 in_offset=batch_in_offset,
                 out_offset=batch_out_offset,
@@ -1080,8 +1152,8 @@ def main():
 
         for slot, instrs in isa_data.items():
             for instr in instrs:
-                status, reason = classify_instruction(instr)
-                if status == "testable":
+                strategy, reason = classify_with_strategies(instr)
+                if strategy is not None:
                     testable_count += 1
                     testable_instrs.append(instr)
                 else:
