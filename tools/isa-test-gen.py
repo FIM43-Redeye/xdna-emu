@@ -48,6 +48,150 @@ SIDE_EFFECT_MNEMONICS = frozenset({
 # a single instruction with no direct assembly syntax).
 CONVERSION_SUFFIXES = (".ups.", ".srs.", ".conv.", ".pack.", ".unpack.")
 
+# Mnemonic substrings for conversion types handled via LLVM IR (not .conv.).
+# .conv. (bf16/fp32) is excluded because its intrinsics have different signatures.
+_CONVERSION_IR_SUFFIXES = (".ups.", ".srs.", ".pack.", ".unpack.")
+
+# Mapping from base mnemonic (stripped of .2d/.3d) to LLVM intrinsic info.
+# Each entry describes:
+#   intrinsic: the Peano intrinsic name (without @llvm.aie2. prefix)
+#   in_type:   LLVM IR type of the input vector/accumulator
+#   out_type:  LLVM IR type of the output vector/accumulator
+#   in_bytes:  byte size of in_type
+#   out_bytes: byte size of out_type
+#   sign:      1 for signed, 0 for unsigned (UPS/SRS only)
+#
+# UPS intrinsics: load a vector, upshift into an accumulator.
+# SRS intrinsics: shift-round-saturate an accumulator into a vector.
+# PACK intrinsics: pack wider elements into narrower.
+# UNPACK intrinsics: unpack narrower elements into wider.
+CONVERSION_INTRINSICS: dict[str, dict] = {
+    # --- UPS (8): vector -> accumulator ---
+    "vlda.ups.s32.s16": {
+        "intrinsic": "acc32.v16.I256.ups",
+        "in_type": "<16 x i16>", "out_type": "<8 x i64>",
+        "in_bytes": 32, "out_bytes": 64, "sign": 1,
+    },
+    "vlda.ups.s32.d16": {
+        "intrinsic": "acc32.v16.I256.ups",
+        "in_type": "<16 x i16>", "out_type": "<8 x i64>",
+        "in_bytes": 32, "out_bytes": 64, "sign": 0,
+    },
+    "vlda.ups.s32.s8": {
+        "intrinsic": "acc32.v32.I256.ups",
+        "in_type": "<32 x i8>", "out_type": "<8 x i64>",
+        "in_bytes": 32, "out_bytes": 64, "sign": 1,
+    },
+    "vlda.ups.s32.d8": {
+        "intrinsic": "acc32.v32.I256.ups",
+        "in_type": "<32 x i8>", "out_type": "<8 x i64>",
+        "in_bytes": 32, "out_bytes": 64, "sign": 0,
+    },
+    "vlda.ups.s64.s32": {
+        "intrinsic": "acc64.v8.I256.ups",
+        "in_type": "<8 x i32>", "out_type": "<8 x i64>",
+        "in_bytes": 32, "out_bytes": 64, "sign": 1,
+    },
+    "vlda.ups.s64.d32": {
+        "intrinsic": "acc64.v8.I256.ups",
+        "in_type": "<8 x i32>", "out_type": "<8 x i64>",
+        "in_bytes": 32, "out_bytes": 64, "sign": 0,
+    },
+    "vlda.ups.s64.s16": {
+        "intrinsic": "acc64.v16.I256.ups",
+        "in_type": "<16 x i16>", "out_type": "<8 x i64>",
+        "in_bytes": 32, "out_bytes": 64, "sign": 1,
+    },
+    "vlda.ups.s64.d16": {
+        "intrinsic": "acc64.v16.I256.ups",
+        "in_type": "<16 x i16>", "out_type": "<8 x i64>",
+        "in_bytes": 32, "out_bytes": 64, "sign": 0,
+    },
+    # --- SRS (8): accumulator -> vector ---
+    "vst.srs.s16.s32": {
+        "intrinsic": "I256.v16.acc32.srs",
+        "in_type": "<8 x i64>", "out_type": "<16 x i16>",
+        "in_bytes": 64, "out_bytes": 32, "sign": 1,
+    },
+    "vst.srs.d16.s32": {
+        "intrinsic": "I256.v16.acc32.srs",
+        "in_type": "<8 x i64>", "out_type": "<16 x i16>",
+        "in_bytes": 64, "out_bytes": 32, "sign": 0,
+    },
+    "vst.srs.s8.s32": {
+        "intrinsic": "I256.v32.acc32.srs",
+        "in_type": "<8 x i64>", "out_type": "<32 x i8>",
+        "in_bytes": 64, "out_bytes": 32, "sign": 1,
+    },
+    "vst.srs.d8.s32": {
+        "intrinsic": "I256.v32.acc32.srs",
+        "in_type": "<8 x i64>", "out_type": "<32 x i8>",
+        "in_bytes": 64, "out_bytes": 32, "sign": 0,
+    },
+    "vst.srs.s32.s64": {
+        "intrinsic": "I256.v8.acc64.srs",
+        "in_type": "<8 x i64>", "out_type": "<8 x i32>",
+        "in_bytes": 64, "out_bytes": 32, "sign": 1,
+    },
+    "vst.srs.d32.s64": {
+        "intrinsic": "I256.v8.acc64.srs",
+        "in_type": "<8 x i64>", "out_type": "<8 x i32>",
+        "in_bytes": 64, "out_bytes": 32, "sign": 0,
+    },
+    "vst.srs.s16.s64": {
+        "intrinsic": "I256.v16.acc64.srs",
+        "in_type": "<8 x i64>", "out_type": "<16 x i16>",
+        "in_bytes": 64, "out_bytes": 32, "sign": 1,
+    },
+    "vst.srs.d16.s64": {
+        "intrinsic": "I256.v16.acc64.srs",
+        "in_type": "<8 x i64>", "out_type": "<16 x i16>",
+        "in_bytes": 64, "out_bytes": 32, "sign": 0,
+    },
+    # --- PACK (4): wider -> narrower + store ---
+    "vst.pack.s4.s8": {
+        "intrinsic": "pack_I4_I8",
+        "in_type": "<32 x i8>", "out_type": "<32 x i8>",
+        "in_bytes": 32, "out_bytes": 32,
+    },
+    "vst.pack.d4.d8": {
+        "intrinsic": "pack_I4_I8",
+        "in_type": "<32 x i8>", "out_type": "<32 x i8>",
+        "in_bytes": 32, "out_bytes": 32,
+    },
+    "vst.pack.s8.s16": {
+        "intrinsic": "pack_I8_I16",
+        "in_type": "<16 x i16>", "out_type": "<16 x i16>",
+        "in_bytes": 32, "out_bytes": 32,
+    },
+    "vst.pack.d8.d16": {
+        "intrinsic": "pack_I8_I16",
+        "in_type": "<16 x i16>", "out_type": "<16 x i16>",
+        "in_bytes": 32, "out_bytes": 32,
+    },
+    # --- UNPACK (4): load + narrower -> wider ---
+    "vldb.unpack.s8.s4": {
+        "intrinsic": "unpack_I8_I4",
+        "in_type": "<32 x i8>", "out_type": "<32 x i8>",
+        "in_bytes": 32, "out_bytes": 32,
+    },
+    "vldb.unpack.d8.d4": {
+        "intrinsic": "unpack_I8_I4",
+        "in_type": "<32 x i8>", "out_type": "<32 x i8>",
+        "in_bytes": 32, "out_bytes": 32,
+    },
+    "vldb.unpack.s16.s8": {
+        "intrinsic": "unpack_I16_I8",
+        "in_type": "<32 x i8>", "out_type": "<16 x i16>",
+        "in_bytes": 32, "out_bytes": 32,
+    },
+    "vldb.unpack.d16.d8": {
+        "intrinsic": "unpack_I16_I8",
+        "in_type": "<32 x i8>", "out_type": "<16 x i16>",
+        "in_bytes": 32, "out_bytes": 32,
+    },
+}
+
 # Mnemonics that interact with the stream switch -- need live streams.
 STREAM_MNEMONICS = frozenset({
     "mov.nb", "mov.nb.tlast", "mov.tlast",
@@ -1896,6 +2040,350 @@ class BranchStrategy(TestStrategy):
 
 
 # ---------------------------------------------------------------------------
+# ConversionStrategy: LLVM IR generation for fused conversion instructions
+# ---------------------------------------------------------------------------
+
+def _conversion_base_mnemonic(mnemonic: str) -> str:
+    """Strip .2d/.3d addressing mode prefixes to get the base conversion mnemonic.
+
+    Examples:
+        "vlda.2d.ups.s32.s16" -> "vlda.ups.s32.s16"
+        "vlda.3d.ups.s32.s16" -> "vlda.ups.s32.s16"
+        "vlda.ups.s32.s16"    -> "vlda.ups.s32.s16"
+        "vst.srs.s16.s32"     -> "vst.srs.s16.s32"
+    """
+    return mnemonic.replace(".2d.", ".").replace(".3d.", ".")
+
+
+# UPS/SRS intrinsics that serve as the inverse (round-trip) partner.
+# For UPS test points: we call UPS (load+upshift), then need SRS to
+# convert back to a vector for storing.
+# For SRS test points: we call UPS first to get data into accumulator,
+# then call SRS (shift+store).
+#
+# Keys are the accumulator intrinsic suffix (acc32/acc64), values are
+# the corresponding SRS/UPS intrinsic info for round-trip.
+_UPS_SRS_PARTNERS = {
+    # acc32 UPS -> acc32 SRS (16-bit vector round-trip)
+    "acc32.v16.I256.ups": {
+        "srs_intrinsic": "I256.v16.acc32.srs",
+        "vec_type": "<16 x i16>",
+        "acc_type": "<8 x i64>",
+    },
+    "acc32.v32.I256.ups": {
+        "srs_intrinsic": "I256.v32.acc32.srs",
+        "vec_type": "<32 x i8>",
+        "acc_type": "<8 x i64>",
+    },
+    # acc64 UPS -> acc64 SRS
+    "acc64.v8.I256.ups": {
+        "srs_intrinsic": "I256.v8.acc64.srs",
+        "vec_type": "<8 x i32>",
+        "acc_type": "<8 x i64>",
+    },
+    "acc64.v16.I256.ups": {
+        "srs_intrinsic": "I256.v16.acc64.srs",
+        "vec_type": "<16 x i16>",
+        "acc_type": "<8 x i64>",
+    },
+    # acc32 SRS -> acc32 UPS (reverse: need UPS to get into acc first)
+    "I256.v16.acc32.srs": {
+        "ups_intrinsic": "acc32.v16.I256.ups",
+        "vec_type": "<16 x i16>",
+        "acc_type": "<8 x i64>",
+    },
+    "I256.v32.acc32.srs": {
+        "ups_intrinsic": "acc32.v32.I256.ups",
+        "vec_type": "<32 x i8>",
+        "acc_type": "<8 x i64>",
+    },
+    # acc64 SRS -> acc64 UPS
+    "I256.v8.acc64.srs": {
+        "ups_intrinsic": "acc64.v8.I256.ups",
+        "vec_type": "<8 x i32>",
+        "acc_type": "<8 x i64>",
+    },
+    "I256.v16.acc64.srs": {
+        "ups_intrinsic": "acc64.v16.I256.ups",
+        "vec_type": "<16 x i16>",
+        "acc_type": "<8 x i64>",
+    },
+}
+
+
+def generate_conversion_ll(test_points: list[dict]) -> str:
+    """Generate LLVM IR (.ll) for a batch of conversion test points.
+
+    Each test point is a dict with keys: mnemonic, intrinsic, in_type,
+    out_type, in_bytes, out_bytes, and optionally sign.
+
+    For UPS: load vector -> call UPS -> call SRS (to get back to vector) -> store
+    For SRS: load vector -> call UPS (to get into acc) -> call SRS -> store
+    For PACK: load vector -> call pack -> store
+    For UNPACK: load vector -> call unpack -> store
+
+    Returns a complete .ll file as a string.
+    """
+    lines = []
+    lines.append('; Auto-generated by isa-test-gen.py')
+    lines.append('; Do not edit manually.')
+    lines.append('')
+    lines.append('target triple = "aie2"')
+    lines.append('')
+    lines.append('define void @test_kernel(ptr %in, ptr %out) {')
+    lines.append('entry:')
+
+    # Track all intrinsics used so we can declare them at the end.
+    intrinsics_used: dict[str, tuple[str, str]] = {}  # name -> (ret_type, arg_types)
+    var_counter = 0
+    in_offset = 0
+    out_offset = 0
+
+    for idx, tp in enumerate(test_points):
+        mnemonic = tp["mnemonic"]
+        intrinsic = tp["intrinsic"]
+        in_type = tp["in_type"]
+        out_type = tp["out_type"]
+        in_bytes = tp["in_bytes"]
+        out_bytes = tp["out_bytes"]
+        sign = tp.get("sign", 0)
+
+        lines.append(f'  ; ---- test {idx}: {mnemonic} ----')
+
+        # Determine the category from the mnemonic.
+        is_ups = ".ups." in mnemonic
+        is_srs = ".srs." in mnemonic
+        is_pack = ".pack." in mnemonic
+        is_unpack = ".unpack." in mnemonic
+
+        if is_ups:
+            # UPS: load vector, call UPS intrinsic, call SRS to convert back, store.
+            partner = _UPS_SRS_PARTNERS[intrinsic]
+            vec_type = in_type
+            acc_type = out_type
+            srs_intrinsic = partner["srs_intrinsic"]
+
+            # GEP to input offset.
+            in_ptr = f"%in_ptr_{var_counter}"
+            lines.append(f'  {in_ptr} = getelementptr i8, ptr %in, i64 {in_offset}')
+            var_counter += 1
+
+            # Load vector.
+            vec_val = f"%vec_{var_counter}"
+            lines.append(f'  {vec_val} = load volatile {vec_type}, ptr {in_ptr}, align 32')
+            var_counter += 1
+
+            # Call UPS intrinsic: (vec, shift=0, sign) -> acc
+            acc_val = f"%acc_{var_counter}"
+            ups_name = f"@llvm.aie2.{intrinsic}"
+            lines.append(f'  {acc_val} = call {acc_type} {ups_name}({vec_type} {vec_val}, i32 0, i32 {sign})')
+            intrinsics_used[ups_name] = (acc_type, f"{vec_type}, i32, i32")
+            var_counter += 1
+
+            # Call SRS to get back to vector: (acc, shift=0, sign=1) -> vec
+            result_val = f"%result_{var_counter}"
+            srs_name = f"@llvm.aie2.{srs_intrinsic}"
+            lines.append(f'  {result_val} = call {vec_type} {srs_name}({acc_type} {acc_val}, i32 0, i32 1)')
+            intrinsics_used[srs_name] = (vec_type, f"{acc_type}, i32, i32")
+            var_counter += 1
+
+            # GEP to output offset.
+            out_ptr = f"%out_ptr_{var_counter}"
+            lines.append(f'  {out_ptr} = getelementptr i8, ptr %out, i64 {out_offset}')
+            var_counter += 1
+
+            # Store result.
+            lines.append(f'  store volatile {vec_type} {result_val}, ptr {out_ptr}, align 32')
+
+            # Advance offsets: input is vector-sized, output is vector-sized
+            # (we round-trip through acc, so output is the same vec type).
+            in_offset += in_bytes
+            out_offset += in_bytes  # output is vec, same size as input vec
+
+        elif is_srs:
+            # SRS: load vector, call UPS to get into acc, call SRS, store.
+            partner = _UPS_SRS_PARTNERS[intrinsic]
+            acc_type = in_type   # SRS input is accumulator
+            vec_type = out_type  # SRS output is vector
+            ups_intrinsic = partner["ups_intrinsic"]
+
+            # GEP to input offset.
+            in_ptr = f"%in_ptr_{var_counter}"
+            lines.append(f'  {in_ptr} = getelementptr i8, ptr %in, i64 {in_offset}')
+            var_counter += 1
+
+            # Load vector (we need to load as vec type, then UPS to get into acc).
+            vec_val = f"%vec_{var_counter}"
+            lines.append(f'  {vec_val} = load volatile {vec_type}, ptr {in_ptr}, align 32')
+            var_counter += 1
+
+            # Call UPS to get into accumulator: (vec, shift=0, sign=1) -> acc
+            acc_val = f"%acc_{var_counter}"
+            ups_name = f"@llvm.aie2.{ups_intrinsic}"
+            lines.append(f'  {acc_val} = call {acc_type} {ups_name}({vec_type} {vec_val}, i32 0, i32 1)')
+            intrinsics_used[ups_name] = (acc_type, f"{vec_type}, i32, i32")
+            var_counter += 1
+
+            # Call SRS intrinsic: (acc, shift=0, sign) -> vec
+            result_val = f"%result_{var_counter}"
+            srs_name = f"@llvm.aie2.{intrinsic}"
+            lines.append(f'  {result_val} = call {vec_type} {srs_name}({acc_type} {acc_val}, i32 0, i32 {sign})')
+            intrinsics_used[srs_name] = (vec_type, f"{acc_type}, i32, i32")
+            var_counter += 1
+
+            # GEP to output offset.
+            out_ptr = f"%out_ptr_{var_counter}"
+            lines.append(f'  {out_ptr} = getelementptr i8, ptr %out, i64 {out_offset}')
+            var_counter += 1
+
+            # Store result.
+            lines.append(f'  store volatile {vec_type} {result_val}, ptr {out_ptr}, align 32')
+
+            # Advance offsets: input and output are both vec-sized.
+            in_offset += out_bytes   # loaded as vec
+            out_offset += out_bytes  # stored as vec
+
+        elif is_pack:
+            # PACK: load vector, call pack intrinsic, store.
+            pack_name = f"@llvm.aie2.{intrinsic}"
+
+            # GEP to input offset.
+            in_ptr = f"%in_ptr_{var_counter}"
+            lines.append(f'  {in_ptr} = getelementptr i8, ptr %in, i64 {in_offset}')
+            var_counter += 1
+
+            # Load input vector.
+            vec_val = f"%vec_{var_counter}"
+            lines.append(f'  {vec_val} = load volatile {in_type}, ptr {in_ptr}, align 32')
+            var_counter += 1
+
+            # Call pack intrinsic: (vec) -> vec
+            result_val = f"%result_{var_counter}"
+            lines.append(f'  {result_val} = call {out_type} {pack_name}({in_type} {vec_val})')
+            intrinsics_used[pack_name] = (out_type, in_type)
+            var_counter += 1
+
+            # GEP to output offset.
+            out_ptr = f"%out_ptr_{var_counter}"
+            lines.append(f'  {out_ptr} = getelementptr i8, ptr %out, i64 {out_offset}')
+            var_counter += 1
+
+            # Store result.
+            lines.append(f'  store volatile {out_type} {result_val}, ptr {out_ptr}, align 32')
+
+            in_offset += in_bytes
+            out_offset += out_bytes
+
+        elif is_unpack:
+            # UNPACK: load vector, call unpack intrinsic, store.
+            unpack_name = f"@llvm.aie2.{intrinsic}"
+
+            # GEP to input offset.
+            in_ptr = f"%in_ptr_{var_counter}"
+            lines.append(f'  {in_ptr} = getelementptr i8, ptr %in, i64 {in_offset}')
+            var_counter += 1
+
+            # Load input vector.
+            vec_val = f"%vec_{var_counter}"
+            lines.append(f'  {vec_val} = load volatile {in_type}, ptr {in_ptr}, align 32')
+            var_counter += 1
+
+            # Call unpack intrinsic: (vec) -> vec
+            result_val = f"%result_{var_counter}"
+            lines.append(f'  {result_val} = call {out_type} {unpack_name}({in_type} {vec_val})')
+            intrinsics_used[unpack_name] = (out_type, in_type)
+            var_counter += 1
+
+            # GEP to output offset.
+            out_ptr = f"%out_ptr_{var_counter}"
+            lines.append(f'  {out_ptr} = getelementptr i8, ptr %out, i64 {out_offset}')
+            var_counter += 1
+
+            # Store result.
+            lines.append(f'  store volatile {out_type} {result_val}, ptr {out_ptr}, align 32')
+
+            in_offset += in_bytes
+            out_offset += out_bytes
+
+    lines.append('  ret void')
+    lines.append('}')
+    lines.append('')
+
+    # Declare all intrinsics used.
+    for name, (ret_type, arg_types) in sorted(intrinsics_used.items()):
+        lines.append(f'declare {ret_type} {name}({arg_types})')
+
+    lines.append('')
+    return '\n'.join(lines)
+
+
+class ConversionStrategy(TestStrategy):
+    """Tests conversion instructions via LLVM IR instead of assembly.
+
+    Conversion instructions (vlda.ups, vst.srs, vst.pack, vldb.unpack)
+    cannot be assembled by llvm-mc directly.  Instead, we generate LLVM IR
+    that calls Peano intrinsics; the compiler fuses load+intrinsic into
+    the fused instruction automatically.
+
+    This strategy does not generate assembly test points.  Instead, it
+    identifies conversion instructions and collects them for batch
+    processing via generate_conversion_ll().
+    """
+
+    def can_handle(self, instr: dict) -> bool:
+        """Return True if this instruction is a conversion we handle via LLVM IR."""
+        mnemonic = instr.get("mnemonic", "")
+        if not any(s in mnemonic for s in _CONVERSION_IR_SUFFIXES):
+            return False
+        base = _conversion_base_mnemonic(mnemonic)
+        return base in CONVERSION_INTRINSICS
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        """ConversionStrategy does not participate in normal strategy dispatch.
+
+        Conversion instructions are handled separately in generate_all().
+        This method is not called by classify_with_strategies().
+        """
+        return (False, "conversion handled via LLVM IR")
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        """Return a single empty combo -- intrinsics determine everything."""
+        return [{}]
+
+    def compute_input_size(self, instr: dict, regs: dict[str, str]) -> int:
+        """Return input size from the conversion intrinsic table."""
+        mnemonic = instr.get("mnemonic", "")
+        base = _conversion_base_mnemonic(mnemonic)
+        info = CONVERSION_INTRINSICS.get(base)
+        if info is None:
+            return 32
+        # For UPS, input is the vector being loaded.
+        # For SRS, we load a vector (out_bytes) and UPS it, then SRS.
+        if ".srs." in mnemonic:
+            return info["out_bytes"]
+        return info["in_bytes"]
+
+    def compute_output_size(self, instr: dict) -> int:
+        """Return output size from the conversion intrinsic table."""
+        mnemonic = instr.get("mnemonic", "")
+        base = _conversion_base_mnemonic(mnemonic)
+        info = CONVERSION_INTRINSICS.get(base)
+        if info is None:
+            return 32
+        # For UPS, output is vector-sized (round-tripped through SRS).
+        if ".ups." in mnemonic:
+            return info["in_bytes"]
+        return info["out_bytes"]
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset):
+        """Not used -- conversion batches go through generate_conversion_ll()."""
+        raise NotImplementedError(
+            "ConversionStrategy does not generate assembly test points; "
+            "use generate_conversion_ll() instead"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Strategy Dispatch
 # ---------------------------------------------------------------------------
 
@@ -2017,11 +2505,15 @@ def _count_bundles(asm_text: str) -> int:
 
 
 def generate_all(isa_json_path: str, out_dir: str) -> dict:
-    """Full pipeline: classify, generate combos, batch, write .s + manifest.
+    """Full pipeline: classify, generate combos, batch, write .s/.ll + manifest.
+
+    Handles two kinds of batches:
+      - Assembly (.s): normal instructions assembled by llvm-mc.
+      - LLVM IR (.ll): conversion instructions compiled by llc via intrinsics.
 
     Args:
         isa_json_path: Path to aie2-isa.json.
-        out_dir: Directory to write batch_NNN.s files and manifest.json.
+        out_dir: Directory to write batch files and manifest.json.
 
     Returns:
         Summary dict with counts and batch info.
@@ -2040,13 +2532,35 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     # Classify and generate combos.  First pass: collect test point specs
     # (instruction + operand combos) without generating assembly yet.
     # Assembly generation happens per-batch so offsets reset to zero.
+    #
+    # Conversion instructions are collected separately: one representative
+    # per base mnemonic goes into the conversion batch (LLVM IR), while
+    # all variants count toward testable_count.
+    conv_strategy = ConversionStrategy()
     testable_count = 0
     skipped_count = 0
     skip_reasons: dict[str, int] = {}
-    # (instr, combo_idx, regs, strategy)
+    # (instr, combo_idx, regs, strategy) -- assembly test points only.
     test_point_specs: list[tuple[dict, int, dict, TestStrategy]] = []
+    # Track which base conversion mnemonics we have seen (one repr each).
+    seen_conv_bases: set[str] = set()
+    # Conversion test points: list of dicts for generate_conversion_ll().
+    conv_test_points: list[dict] = []
+    # All conversion instruction defs (for testable count).
+    conv_instr_count = 0
 
     for instr in all_instrs:
+        # Check conversion first (before normal strategy dispatch).
+        if conv_strategy.can_handle(instr):
+            conv_instr_count += 1
+            mnemonic = instr.get("mnemonic", "")
+            base = _conversion_base_mnemonic(mnemonic)
+            if base not in seen_conv_bases:
+                seen_conv_bases.add(base)
+                info = CONVERSION_INTRINSICS[base]
+                conv_test_points.append({"mnemonic": base, **info})
+            continue
+
         strategy, reason = classify_with_strategies(instr)
         if strategy is None:
             skipped_count += 1
@@ -2059,6 +2573,9 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         for combo_idx, regs in enumerate(combos):
             test_point_specs.append((instr, combo_idx, regs, strategy))
 
+    # Count conversion instructions as testable.
+    testable_count += conv_instr_count
+
     # First pass: generate assembly for each test point at offset 0 to
     # measure its code size (bundle count).  This lets us bin-pack into
     # batches that fit within program memory.
@@ -2068,7 +2585,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         bundles = _count_bundles(asm)
         measured_specs.append((instr, combo_idx, regs, bundles, strategy))
 
-    # Bin-pack into batches by measured code size.
+    # Bin-pack assembly batches by measured code size.
     batches = []
     batch_idx = 0
     i = 0
@@ -2134,6 +2651,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         batches.append({
             "batch_index": batch_idx,
             "filename": filename,
+            "source_type": "assembly",
             "test_count": len(batch_asm),
             "in_size": batch_in_offset,
             "out_size": batch_out_offset,
@@ -2143,11 +2661,66 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         batch_idx += 1
         i = end
 
+    # Generate conversion batch (LLVM IR) if there are conversion test points.
+    total_conv_test_points = 0
+    if conv_test_points:
+        ll_content = generate_conversion_ll(conv_test_points)
+        ll_filename = f"batch_{batch_idx:03d}.ll"
+        ll_filepath = os.path.join(out_dir, ll_filename)
+        with open(ll_filepath, "w") as f:
+            f.write(ll_content)
+
+        # Build metadata for each conversion test point.
+        conv_meta = []
+        conv_in_offset = 0
+        conv_out_offset = 0
+        for tp in conv_test_points:
+            mnemonic = tp["mnemonic"]
+            in_bytes = tp["in_bytes"]
+            out_bytes = tp["out_bytes"]
+            # For UPS/SRS, the actual I/O sizes differ from the intrinsic
+            # in_bytes/out_bytes because we round-trip through acc.
+            if ".ups." in mnemonic:
+                effective_in = in_bytes
+                effective_out = in_bytes  # round-trip back to vec
+            elif ".srs." in mnemonic:
+                effective_in = out_bytes  # loaded as vec
+                effective_out = out_bytes
+            else:
+                effective_in = in_bytes
+                effective_out = out_bytes
+
+            conv_meta.append({
+                "instruction": mnemonic,
+                "slot": "conversion",
+                "combo_index": 0,
+                "operands": {},
+                "in_offset": conv_in_offset,
+                "in_size": effective_in,
+                "out_offset": conv_out_offset,
+                "out_size": effective_out,
+            })
+            conv_in_offset += effective_in
+            conv_out_offset += effective_out
+
+        total_conv_test_points = len(conv_test_points)
+        batches.append({
+            "batch_index": batch_idx,
+            "filename": ll_filename,
+            "source_type": "llvm_ir",
+            "test_count": total_conv_test_points,
+            "in_size": conv_in_offset,
+            "out_size": conv_out_offset,
+            "tests": conv_meta,
+        })
+        batch_idx += 1
+
     # Write manifest.json.
+    total_test_points = len(test_point_specs) + total_conv_test_points
     manifest = {
         "testable_instructions": testable_count,
         "skipped_instructions": skipped_count,
-        "total_test_points": len(test_point_specs),
+        "total_test_points": total_test_points,
         "total_batches": len(batches),
         "skip_reasons": skip_reasons,
         "batches": batches,
@@ -2192,6 +2765,7 @@ def main():
         with open(args.isa_json) as f:
             isa_data = json.load(f)
 
+        conv_strategy = ConversionStrategy()
         testable_count = 0
         skipped_count = 0
         skip_reasons: dict[str, int] = {}
@@ -2200,6 +2774,14 @@ def main():
 
         for slot, instrs in isa_data.items():
             for instr in instrs:
+                # Check conversion first.
+                if conv_strategy.can_handle(instr):
+                    testable_count += 1
+                    sname = "ConversionStrategy"
+                    strategy_counts[sname] = strategy_counts.get(sname, 0) + 1
+                    testable_instrs.append((instr, sname))
+                    continue
+
                 strategy, reason = classify_with_strategies(instr)
                 if strategy is not None:
                     testable_count += 1

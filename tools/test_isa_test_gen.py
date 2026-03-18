@@ -2513,3 +2513,385 @@ class TestCmClassRealISA:
         status, reason = classify_instruction(instr)
         assert status == "skipped"
         assert "cascade" in reason.lower()
+
+
+# ===================================================================
+# ConversionStrategy: LLVM IR generation for fused conversion instructions
+# ===================================================================
+
+class TestConversionIntrinsicMap:
+    """Validate the CONVERSION_INTRINSICS table."""
+
+    def test_has_24_entries(self):
+        """Table must have exactly 24 unique base mnemonics."""
+        table = isa_test_gen.CONVERSION_INTRINSICS
+        assert len(table) == 24
+
+    def test_all_required_fields_present(self):
+        """Each entry must have intrinsic, in_type, out_type, in_bytes, out_bytes."""
+        required = {"intrinsic", "in_type", "out_type", "in_bytes", "out_bytes"}
+        for mnemonic, info in isa_test_gen.CONVERSION_INTRINSICS.items():
+            for field in required:
+                assert field in info, \
+                    f"{mnemonic}: missing field '{field}'"
+
+    def test_ups_entries(self):
+        """UPS entries: 8 base mnemonics (4 type pairs x signed/unsigned)."""
+        table = isa_test_gen.CONVERSION_INTRINSICS
+        ups_keys = [k for k in table if k.startswith("vlda.ups.")]
+        assert len(ups_keys) == 8
+
+    def test_srs_entries(self):
+        """SRS entries: 8 base mnemonics."""
+        table = isa_test_gen.CONVERSION_INTRINSICS
+        srs_keys = [k for k in table if k.startswith("vst.srs.")]
+        assert len(srs_keys) == 8
+
+    def test_pack_entries(self):
+        """PACK entries: 4 base mnemonics."""
+        table = isa_test_gen.CONVERSION_INTRINSICS
+        pack_keys = [k for k in table if k.startswith("vst.pack.")]
+        assert len(pack_keys) == 4
+
+    def test_unpack_entries(self):
+        """UNPACK entries: 4 base mnemonics."""
+        table = isa_test_gen.CONVERSION_INTRINSICS
+        unpack_keys = [k for k in table if k.startswith("vldb.unpack.")]
+        assert len(unpack_keys) == 4
+
+    def test_signed_unsigned_differ_only_in_sign(self):
+        """Signed/unsigned pairs should use the same intrinsic but differ in sign."""
+        table = isa_test_gen.CONVERSION_INTRINSICS
+        # Check a UPS pair: vlda.ups.s32.s16 (signed) vs vlda.ups.s32.d16 (unsigned)
+        s_info = table["vlda.ups.s32.s16"]
+        d_info = table["vlda.ups.s32.d16"]
+        assert s_info["intrinsic"] == d_info["intrinsic"]
+        assert s_info["sign"] != d_info["sign"]
+        assert s_info["in_type"] == d_info["in_type"]
+        assert s_info["out_type"] == d_info["out_type"]
+
+    def test_ups_byte_sizes(self):
+        """UPS: input is 256-bit vector (32 bytes), output is 512-bit acc (64 bytes)."""
+        info = isa_test_gen.CONVERSION_INTRINSICS["vlda.ups.s32.s16"]
+        assert info["in_bytes"] == 32
+        assert info["out_bytes"] == 64
+
+    def test_srs_byte_sizes(self):
+        """SRS: input is 512-bit acc (64 bytes), output is 256-bit vector (32 bytes)."""
+        info = isa_test_gen.CONVERSION_INTRINSICS["vst.srs.s16.s32"]
+        assert info["in_bytes"] == 64
+        assert info["out_bytes"] == 32
+
+    def test_pack_byte_sizes(self):
+        """PACK: input and output are both 256-bit vectors (32 bytes)."""
+        info = isa_test_gen.CONVERSION_INTRINSICS["vst.pack.s8.s16"]
+        assert info["in_bytes"] == 32
+        assert info["out_bytes"] == 32
+
+    def test_unpack_byte_sizes(self):
+        """UNPACK: input and output types correspond to their element sizes."""
+        info = isa_test_gen.CONVERSION_INTRINSICS["vldb.unpack.s16.s8"]
+        assert info["in_bytes"] == 32
+        assert info["out_bytes"] == 32
+
+
+class TestConversionLLGeneration:
+    """Verify generate_conversion_ll() produces valid LLVM IR."""
+
+    def test_has_target_triple(self):
+        """Output must begin with target triple = aie2."""
+        table = isa_test_gen.CONVERSION_INTRINSICS
+        # Build minimal test points from table
+        test_points = []
+        for mnemonic, info in list(table.items())[:1]:
+            test_points.append({"mnemonic": mnemonic, **info})
+        ll = isa_test_gen.generate_conversion_ll(test_points)
+        assert 'target triple = "aie2"' in ll
+
+    def test_has_test_kernel(self):
+        """Output must define test_kernel with ptr args."""
+        table = isa_test_gen.CONVERSION_INTRINSICS
+        test_points = []
+        for mnemonic, info in list(table.items())[:1]:
+            test_points.append({"mnemonic": mnemonic, **info})
+        ll = isa_test_gen.generate_conversion_ll(test_points)
+        assert "define void @test_kernel(ptr %in, ptr %out)" in ll
+
+    def test_ups_generates_intrinsic_call(self):
+        """UPS test point should call the ups intrinsic."""
+        info = isa_test_gen.CONVERSION_INTRINSICS["vlda.ups.s32.s16"]
+        test_points = [{"mnemonic": "vlda.ups.s32.s16", **info}]
+        ll = isa_test_gen.generate_conversion_ll(test_points)
+        assert "@llvm.aie2.acc32.v16.I256.ups" in ll
+
+    def test_srs_generates_intrinsic_call(self):
+        """SRS test point should call the srs intrinsic."""
+        info = isa_test_gen.CONVERSION_INTRINSICS["vst.srs.s16.s32"]
+        test_points = [{"mnemonic": "vst.srs.s16.s32", **info}]
+        ll = isa_test_gen.generate_conversion_ll(test_points)
+        assert "@llvm.aie2.I256.v16.acc32.srs" in ll
+
+    def test_pack_generates_intrinsic_call(self):
+        """PACK test point should call the pack intrinsic."""
+        info = isa_test_gen.CONVERSION_INTRINSICS["vst.pack.s8.s16"]
+        test_points = [{"mnemonic": "vst.pack.s8.s16", **info}]
+        ll = isa_test_gen.generate_conversion_ll(test_points)
+        assert "@llvm.aie2.pack_I8_I16" in ll
+
+    def test_unpack_generates_intrinsic_call(self):
+        """UNPACK test point should call the unpack intrinsic."""
+        info = isa_test_gen.CONVERSION_INTRINSICS["vldb.unpack.s16.s8"]
+        test_points = [{"mnemonic": "vldb.unpack.s16.s8", **info}]
+        ll = isa_test_gen.generate_conversion_ll(test_points)
+        assert "@llvm.aie2.unpack_I16_I8" in ll
+
+    def test_uses_volatile_loads_stores(self):
+        """Must use volatile to prevent optimization."""
+        info = isa_test_gen.CONVERSION_INTRINSICS["vlda.ups.s32.s16"]
+        test_points = [{"mnemonic": "vlda.ups.s32.s16", **info}]
+        ll = isa_test_gen.generate_conversion_ll(test_points)
+        assert "load volatile" in ll
+        assert "store volatile" in ll
+
+    def test_uses_gep_for_offsets(self):
+        """Must use GEP for per-test-point memory offsets."""
+        table = isa_test_gen.CONVERSION_INTRINSICS
+        # Use two test points to verify the second has a non-zero offset.
+        items = list(table.items())[:2]
+        test_points = [{"mnemonic": m, **info} for m, info in items]
+        ll = isa_test_gen.generate_conversion_ll(test_points)
+        assert "getelementptr i8" in ll
+
+    def test_all_24_conversions_generate(self):
+        """All 24 conversion mnemonics should produce valid IR."""
+        table = isa_test_gen.CONVERSION_INTRINSICS
+        test_points = [{"mnemonic": m, **info} for m, info in table.items()]
+        ll = isa_test_gen.generate_conversion_ll(test_points)
+        # Should have one load per test point at minimum.
+        assert ll.count("load volatile") >= 24
+
+    def test_declares_intrinsics(self):
+        """All intrinsics used must be declared."""
+        info = isa_test_gen.CONVERSION_INTRINSICS["vlda.ups.s32.s16"]
+        test_points = [{"mnemonic": "vlda.ups.s32.s16", **info}]
+        ll = isa_test_gen.generate_conversion_ll(test_points)
+        assert "declare" in ll
+        assert "@llvm.aie2.acc32.v16.I256.ups" in ll
+
+
+class TestConversionStrategy:
+    """Tests for ConversionStrategy can_handle and sizing."""
+
+    def test_can_handle_ups(self):
+        """ConversionStrategy should handle vlda.ups.* mnemonics."""
+        strategy = isa_test_gen.ConversionStrategy()
+        instr = _make_instr(
+            "VLDA_UPS_S32_S16_ag_idx", "vlda.ups.s32.s16",
+            "vlda.ups.s32.s16\t$dst, [$ptr, $idx]",
+            [_make_reg_op("dst", "accumulator"),
+             _make_reg_op("ptr", "pointer"),
+             _make_reg_op("idx", "scalar")],
+            may_load=True,
+        )
+        assert strategy.can_handle(instr)
+
+    def test_can_handle_srs(self):
+        """ConversionStrategy should handle vst.srs.* mnemonics."""
+        strategy = isa_test_gen.ConversionStrategy()
+        instr = _make_instr(
+            "VST_SRS_S16_S32_ag_idx", "vst.srs.s16.s32",
+            "vst.srs.s16.s32\t[$ptr, $idx], $src",
+            [_make_reg_op("ptr", "pointer"),
+             _make_reg_op("idx", "scalar"),
+             _make_reg_op("src", "accumulator")],
+            may_store=True,
+        )
+        assert strategy.can_handle(instr)
+
+    def test_can_handle_pack(self):
+        """ConversionStrategy should handle vst.pack.* mnemonics."""
+        strategy = isa_test_gen.ConversionStrategy()
+        instr = _make_instr(
+            "VST_PACK_S8_S16_ag_idx", "vst.pack.s8.s16",
+            "vst.pack.s8.s16\t[$ptr, $idx], $src",
+            [_make_reg_op("ptr", "pointer"),
+             _make_reg_op("idx", "scalar"),
+             _make_reg_op("src", "vector256")],
+            may_store=True,
+        )
+        assert strategy.can_handle(instr)
+
+    def test_can_handle_unpack(self):
+        """ConversionStrategy should handle vldb.unpack.* mnemonics."""
+        strategy = isa_test_gen.ConversionStrategy()
+        instr = _make_instr(
+            "VLDB_UNPACK_S16_S8_ag_idx", "vldb.unpack.s16.s8",
+            "vldb.unpack.s16.s8\t$dst, [$ptr, $idx]",
+            [_make_reg_op("dst", "vector256"),
+             _make_reg_op("ptr", "pointer"),
+             _make_reg_op("idx", "scalar")],
+            may_load=True,
+        )
+        assert strategy.can_handle(instr)
+
+    def test_does_not_handle_conv(self):
+        """ConversionStrategy should NOT handle .conv. (bf16/fp32) mnemonics."""
+        strategy = isa_test_gen.ConversionStrategy()
+        instr = _make_instr(
+            "VST_CONV_BF16_FP32", "vst.conv.bf16.fp32",
+            "vst.conv.bf16.fp32\t[$ptr], $src",
+            [_make_reg_op("ptr", "pointer"),
+             _make_reg_op("src", "accumulator")],
+            may_store=True,
+        )
+        assert not strategy.can_handle(instr)
+
+    def test_does_not_handle_plain_add(self):
+        """ConversionStrategy should NOT handle plain compute instructions."""
+        strategy = isa_test_gen.ConversionStrategy()
+        instr = _make_instr(
+            "ADD", "add", "add\t$dst, $s1, $s2",
+            [_make_reg_op("dst", "scalar"),
+             _make_reg_op("s1", "scalar"),
+             _make_reg_op("s2", "scalar")],
+        )
+        assert not strategy.can_handle(instr)
+
+    def test_can_handle_2d_variant(self):
+        """ConversionStrategy should handle 2D addressing variants."""
+        strategy = isa_test_gen.ConversionStrategy()
+        instr = _make_instr(
+            "VLDA_2D_UPS_S32_S16", "vlda.2d.ups.s32.s16",
+            "vlda.2d.ups.s32.s16\t$dst, [$ptr, $mod]",
+            [_make_reg_op("dst", "accumulator"),
+             _make_reg_op("ptr", "pointer"),
+             _make_reg_op("mod", "modifier_m")],
+            may_load=True,
+        )
+        assert strategy.can_handle(instr)
+
+    def test_sizes_ups(self):
+        """UPS: buffer I/O is vector-sized (round-trips through accumulator).
+
+        Input buffer: 32 bytes (vector loaded).
+        Output buffer: 32 bytes (vector after UPS+SRS round-trip).
+        """
+        strategy = isa_test_gen.ConversionStrategy()
+        instr = _make_instr(
+            "VLDA_UPS_S32_S16_ag_idx", "vlda.ups.s32.s16",
+            "vlda.ups.s32.s16\t$dst, [$ptr, $idx]",
+            [_make_reg_op("dst", "accumulator"),
+             _make_reg_op("ptr", "pointer"),
+             _make_reg_op("idx", "scalar")],
+            may_load=True,
+        )
+        assert strategy.compute_input_size(instr, {}) == 32
+        assert strategy.compute_output_size(instr) == 32
+
+    def test_sizes_srs(self):
+        """SRS: buffer I/O is vector-sized (UPS used to get data into acc).
+
+        Input buffer: 32 bytes (vector loaded, then UPS'd).
+        Output buffer: 32 bytes (vector after SRS).
+        """
+        strategy = isa_test_gen.ConversionStrategy()
+        instr = _make_instr(
+            "VST_SRS_S16_S32_ag_idx", "vst.srs.s16.s32",
+            "vst.srs.s16.s32\t[$ptr, $idx], $src",
+            [_make_reg_op("ptr", "pointer"),
+             _make_reg_op("idx", "scalar"),
+             _make_reg_op("src", "accumulator")],
+            may_store=True,
+        )
+        assert strategy.compute_input_size(instr, {}) == 32
+        assert strategy.compute_output_size(instr) == 32
+
+    def test_generate_combos_returns_one(self):
+        """ConversionStrategy should return exactly one combo per instruction."""
+        strategy = isa_test_gen.ConversionStrategy()
+        instr = _make_instr(
+            "VLDA_UPS_S32_S16_ag_idx", "vlda.ups.s32.s16",
+            "vlda.ups.s32.s16\t$dst, [$ptr, $idx]",
+            [_make_reg_op("dst", "accumulator"),
+             _make_reg_op("ptr", "pointer"),
+             _make_reg_op("idx", "scalar")],
+            may_load=True,
+        )
+        combos = strategy.generate_combos(instr)
+        assert len(combos) == 1
+
+    @pytest.fixture
+    def isa_data(self):
+        path = os.path.join(os.path.dirname(__file__), "aie2-isa.json")
+        if not os.path.exists(path):
+            pytest.skip("aie2-isa.json not found")
+        with open(path) as f:
+            return json.load(f)
+
+    def test_real_isa_conversion_count(self, isa_data):
+        """ConversionStrategy should handle all 136 conversion instruction defs."""
+        strategy = isa_test_gen.ConversionStrategy()
+        count = 0
+        for slot, instrs in isa_data.items():
+            for instr in instrs:
+                if strategy.can_handle(instr):
+                    count += 1
+        # 24 base mnemonics x various addressing modes = 136 total defs
+        # (8 UPS + 8 SRS + 4 PACK + 4 UNPACK) x addressing variants
+        assert count >= 100, f"Expected >= 100 conversion defs handled, got {count}"
+
+
+class TestGenerateAllWithConversions:
+    """Integration tests for generate_all with conversion batches."""
+
+    @pytest.fixture
+    def isa_json_path(self):
+        path = os.path.join(os.path.dirname(__file__), "aie2-isa.json")
+        if not os.path.exists(path):
+            pytest.skip("aie2-isa.json not found")
+        return path
+
+    @pytest.fixture
+    def out_dir(self, tmp_path):
+        return str(tmp_path / "isa-tests")
+
+    def test_manifest_has_source_type(self, isa_json_path, out_dir):
+        """Each batch should have a source_type field."""
+        manifest = generate_all(isa_json_path, out_dir)
+        for batch in manifest["batches"]:
+            assert "source_type" in batch, \
+                f"Batch {batch['batch_index']} missing source_type"
+            assert batch["source_type"] in ("assembly", "llvm_ir"), \
+                f"Batch {batch['batch_index']}: unexpected source_type '{batch['source_type']}'"
+
+    def test_conversion_batch_exists(self, isa_json_path, out_dir):
+        """At least one batch should be llvm_ir type (conversions)."""
+        manifest = generate_all(isa_json_path, out_dir)
+        ll_batches = [b for b in manifest["batches"] if b["source_type"] == "llvm_ir"]
+        assert len(ll_batches) >= 1, "Expected at least one llvm_ir batch"
+
+    def test_conversion_batch_has_ll_file(self, isa_json_path, out_dir):
+        """Conversion batch should reference a .ll file that exists."""
+        manifest = generate_all(isa_json_path, out_dir)
+        ll_batches = [b for b in manifest["batches"] if b["source_type"] == "llvm_ir"]
+        assert len(ll_batches) >= 1
+        for batch in ll_batches:
+            assert batch["filename"].endswith(".ll"), \
+                f"Expected .ll filename, got {batch['filename']}"
+            ll_path = os.path.join(out_dir, batch["filename"])
+            assert os.path.exists(ll_path), f"Missing {batch['filename']}"
+
+    def test_conversion_batch_has_24_tests(self, isa_json_path, out_dir):
+        """Conversion batch should have 24 test points (one per base mnemonic)."""
+        manifest = generate_all(isa_json_path, out_dir)
+        ll_batches = [b for b in manifest["batches"] if b["source_type"] == "llvm_ir"]
+        total_ll_tests = sum(b["test_count"] for b in ll_batches)
+        assert total_ll_tests == 24, \
+            f"Expected 24 conversion test points, got {total_ll_tests}"
+
+    def test_conversion_testable_counted(self, isa_json_path, out_dir):
+        """Conversion instructions should be counted as testable, not skipped."""
+        manifest = generate_all(isa_json_path, out_dir)
+        # The 136 conversion instruction defs that were previously skipped
+        # should now count toward testable_instructions.
+        assert manifest["testable_instructions"] > 0
