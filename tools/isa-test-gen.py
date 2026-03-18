@@ -60,6 +60,10 @@ STREAM_MNEMONICS = frozenset({
 KNOWN_REGISTER_KINDS = frozenset({
     "scalar", "pointer", "vector256", "vector512", "accumulator",
     "control", "modifier_m", "modifier_dj",
+    # quad: 128-byte (1024-bit) quadword vector registers q0-q3.
+    # These appear in DMV_Q load/store instructions as "accumulator" bw=2
+    # in the ISA JSON (exporter misclassification); we promote them here.
+    "quad",
 })
 
 # Operand types that are safe to handle.
@@ -83,12 +87,102 @@ REGISTER_LIKE_TYPES = frozenset({"register", "register+16"})
 #   mWm_1 = AIE2Vector256RegisterClass(add mWm)
 #     -- vector256 with rearranged encoding (wl0/wh0/wl1/... non-monotonic).
 #     The assembler accepts the same wl*/wh* names as for plain vector256.
+#   mMvSclSrc / MvSclSrc (bw=7, 128 entries)
+#     -- source operand class for mv-slot scalar moves (MOV_mv_scl, ADD_NC,
+#     MOVXM, VEXTRACT).  Encodes scalars, pointers, shift regs, modifiers, and
+#     control regs.  For testing we use the plain scalar (r*) subset.
+#   LdaCg (bw=7, 128 entries)
+#     -- constant-generator destination in the lda slot (MOVA_lda_cg).
+#     Encodes the same register space as MvSclSrc.  Map to scalar for testing.
+#   AluCg (bw=6, 64 entries)
+#     -- constant-generator destination in the alu slot (MOVX_alu_cg).
+#     Subset of the scalar register space.  Map to scalar for testing.
+#   ERS4 (bw=2, 4 entries: r24-r27)
+#     -- narrow scalar subclass used as an index operand in VEXTRACT.
+#     Concrete names: r24, r25, r26, r27.
+#   MvBMXDst (bw=6)
+#     -- vector/accumulator destination for cascade-read vmov (VMOV_mv_scd,
+#     VMOV_mv_x, VMOV_mv_mcd).  Encodes x* (vector512) or bml*/bmh* (acc-half).
+#     Map to vector512 for testing.
+#   MvBMXSrc (bw=9)
+#     -- wide vector/accumulator source for vmov (VMOV_mv_x).
+#     Map to vector512 for testing.
+#   MvAMWQDst (bw=7)
+#     -- 256-bit vector destination for wmov (VMOV_mv_w).
+#     Map to vector256 for testing.
+#   MvAMWQSrc (bw=9)
+#     -- wide 256-bit vector source for wmov (VMOV_mv_w).
+#     Map to vector256 for testing.
 #
 # Value: the effective register kind to use for load/store/naming purposes.
 TESTABLE_COMPOSITE_KINDS: dict[str, str] = {
     "ShflDst": "vector512",
     "Wm1": "vector256",
+    # Scalar-family composite kinds.
+    "MvSclSrc": "scalar",
+    "LdaCg": "scalar",
+    "AluCg": "scalar",
+    # Narrow scalar subclass (r24-r27); marked as scalar so load/store work.
+    "ERS4": "scalar",
+    # Vector-family composite kinds.
+    "MvBMXDst": "vector512",
+    "MvBMXSrc": "vector512",
+    "MvAMWQDst": "vector256",
+    "MvAMWQSrc": "vector256",
+    # DMS scalar load/store class (mLdaScl / mSclSt).
+    # AIE2ScalarRegisterClass(add eP, eR, eDC, eDJ, eDN, eM, lr): spans
+    # pointers, general scalars, loop counters, DJ indices, modifiers, LR.
+    # We use the eR (r*) subset as the simplest concrete names; the
+    # assembler accepts r* names for both mLdaScl and mSclSt operands.
+    # Source: AIE2GenRegisterInfo.td mLdaScl / mSclSt definitions.
+    "LdaScl": "scalar",
 }
+
+
+# Operand names that can carry a cm-class (1024-bit full accumulator) encoding.
+# These are the names that appear in VUPS x2c, VSRS x_srs, VMOV_mv_cm, and
+# VNEG where the ISA exporter emits operand_type="unknown" + bit_width=4
+# instead of operand_type="register" + register_kind="accumulator".
+#
+# Heuristic derivation: the cm register class (eCM/mCMm in TableGen) uses a
+# 4-bit field encoding cm0..cm7 (8 entries).  Every non-dontcare operand with
+# operand_type="unknown" and bit_width=4 that appears with one of these names
+# in a vector instruction is a cm-class register.  The 4-bit width distinguishes
+# cm (4 bits) from bm-class (5 bits) and am-class (6 bits).
+#
+# This is a workaround for a known limitation of the Rust ISA exporter: it
+# cannot yet tag cm-class operands correctly.  The proper fix is to add cm
+# register class recognition to the OperandInfo export in src/tablegen/.
+_CM_CLASS_OPERAND_NAMES = frozenset({"dst", "src", "acc1", "acc2"})
+
+
+def _resolve_unknown_operand(op: dict) -> dict:
+    """Attempt to resolve an unknown-typed operand to a concrete register class.
+
+    Workaround: the ISA exporter does not yet tag cm-class (1024-bit full
+    accumulator, eCM/mCMm TableGen class) operands correctly.  They appear
+    with operand_type="unknown", register_kind=None, bit_width=4 instead of
+    operand_type="register", register_kind="accumulator", bit_width=4.
+
+    When an operand matches this signature AND its name is one of the known
+    cm-class operand names (dst, src, acc1, acc2), return a corrected copy
+    with operand_type="register" and register_kind="accumulator".
+
+    All other unknown operands are returned unchanged.
+    """
+    if op.get("operand_type") != "unknown":
+        return op
+    if op.get("register_kind"):
+        return op
+    if op.get("bit_width") != 4:
+        return op
+    if op.get("name", "") not in _CM_CLASS_OPERAND_NAMES:
+        return op
+    # Matches the cm-class heuristic: treat as accumulator register.
+    resolved = dict(op)
+    resolved["operand_type"] = "register"
+    resolved["register_kind"] = "accumulator"
+    return resolved
 
 
 def _effective_kind(op: dict) -> str:
@@ -97,8 +191,12 @@ def _effective_kind(op: dict) -> str:
     For plain register operands, returns register_kind directly.
     For composite_register operands whose kind is in TESTABLE_COMPOSITE_KINDS,
     returns the mapped concrete kind (e.g., "ShflDst" -> "vector512").
+    For unknown operands that match the cm-class heuristic (see
+    _resolve_unknown_operand), returns "accumulator".
     Returns "" for all other operand types.
     """
+    # Apply cm-class resolution before the type dispatch below.
+    op = _resolve_unknown_operand(op)
     op_type = op.get("operand_type", "")
     kind = op.get("register_kind", "") or ""
     if op_type in REGISTER_LIKE_TYPES:
@@ -117,6 +215,9 @@ REGISTER_SIZES = {
     "control": 4,
     "modifier_m": 4,
     "modifier_dj": 4,
+    # quad: 128-byte (1024-bit) quadword vector registers q0-q3.
+    # mQQa = AIE2Vector128RegisterClass(add q0, q1, q2, q3) per AIE2GenRegisterInfo.td.
+    "quad": 128,
 }
 
 # Maximum positive immediate offset for lda/st (6-bit signed, step 4).
@@ -257,12 +358,23 @@ def classify_instruction(instr: dict) -> tuple[str, str]:
         return ("skipped", "hardware counter (register pair)")
     if "SS" in asm and "mov" in mnemonic:
         return ("skipped", "stream switch status read (hangs without streams)")
+    # 5c. Cascade read/write instructions need active cascade connections.
+    # SCD = stream cascade data (read from cascade), MCD = main cascade data
+    # (write to cascade).  Without live cascade setup these stall.
+    if "SCD" in asm or "MCD" in asm:
+        return ("skipped", "cascade instruction (needs active cascade)")
 
     operands = instr.get("operands", [])
 
     # 6. No operands at all -> no output.
     if not operands:
         return ("skipped", "no operands")
+
+    # Resolve cm-class unknowns before all subsequent checks.  The ISA
+    # exporter emits operand_type="unknown" for cm-class (1024-bit full
+    # accumulator, 4-bit encoding) operands.  _resolve_unknown_operand
+    # corrects this for operands named dst/src/acc1/acc2 with bit_width=4.
+    operands = [_resolve_unknown_operand(op) for op in operands]
 
     # 7. Check each operand for unsupported types.
     for op in operands:
@@ -315,11 +427,25 @@ def detect_output_operands(instr: dict) -> list[dict]:
     For instructions with explicit 'dst' in the operand name, that is
     always an output regardless of position.
 
+    Tied-destination fallback (VADDMAC/VADDMSC/VSUBMAC/VSUBMSC family):
+    Some instructions show $dst first in the asm_string but have NO operand
+    named "dst".  In these instructions $dst is a write alias for one of the
+    accumulator inputs (the operation accumulates in-place).  The hardware
+    convention is that the first accumulator appearing after $dst in the
+    asm_string order is the tied register: it is both read as input AND
+    written as output.  When this pattern is detected we return that
+    accumulator as the output so the test harness can load it before the
+    instruction and store it afterward to capture the result.
+
     Returns a list of operand dicts that are outputs.
     """
     operands = instr.get("operands", [])
     if not operands:
         return []
+
+    # Resolve cm-class unknowns so that dst/src operands with the cm-class
+    # signature are treated as register operands below.
+    operands = [_resolve_unknown_operand(op) for op in operands]
 
     asm_string = instr.get("asm_string", "")
 
@@ -329,7 +455,7 @@ def detect_output_operands(instr: dict) -> list[dict]:
     if not asm_op_names:
         return []
 
-    # Build a lookup from operand name to operand dict.
+    # Build a lookup from operand name to resolved operand dict.
     op_by_name = {op["name"]: op for op in operands}
 
     # The first operand placeholder in asm_string is the destination,
@@ -346,6 +472,21 @@ def detect_output_operands(instr: dict) -> list[dict]:
         )
         if is_register_like or is_testable_composite:
             outputs.append(first_op)
+    elif first_name == "dst":
+        # Tied-destination pattern: $dst appears first in asm_string but no
+        # operand named "dst" exists in the operands list.  The write
+        # destination is tied to the first accumulator operand that follows
+        # $dst in asm_string order.  That register serves as both input
+        # (pre-loaded) and output (stored after execution), implementing
+        # in-place accumulation.
+        for name in asm_op_names[1:]:
+            if name not in op_by_name:
+                continue
+            candidate = op_by_name[name]
+            if (candidate.get("operand_type") in REGISTER_LIKE_TYPES
+                    and candidate.get("register_kind") == "accumulator"):
+                outputs.append(candidate)
+                break
 
     # Also check for any operand explicitly named "dst" or "d".
     for op in operands:
@@ -436,6 +577,12 @@ def register_names(kind: str, bit_width: int = 0,
         return ["x0", "x2", "x4"]
 
     if kind == "accumulator":
+        if bit_width == 2:
+            # DMV_Q quad registers: mQQa = AIE2Vector128RegisterClass(add q0,q1,q2,q3).
+            # The ISA exporter misclassifies these as "accumulator" with bw=2 because
+            # the 2-bit encoding maps to 4 entries.  The real names are q0-q3.
+            # Source: AIE2GenRegisterInfo.td eQQEs / eQQOs / mQQa definitions.
+            return ["q0", "q1", "q2", "q3"]
         if bit_width == 5:
             # 512-bit accumulator halves (mBMa/mBMm class).
             return ["bml0", "bml2", "bmh0", "bmh2"]
@@ -466,6 +613,49 @@ def register_names(kind: str, bit_width: int = 0,
     # The assembler accepts the same wl*/wh* names as for plain vector256.
     if kind == "Wm1":
         return ["wl0", "wl2", "wl4", "wl6"]
+
+    # MvSclSrc (mMvSclSrc) is the mv-slot scalar source class.
+    # Encodes scalars, pointers, shift regs, modifiers, and control regs.
+    # For testing we use plain general-purpose scalars (r0-r7).
+    if kind == "MvSclSrc":
+        return ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7"]
+
+    # LdaCg: constant-generator destination in the lda slot.
+    # Encodes the same register space as MvSclSrc; map to scalar for testing.
+    if kind == "LdaCg":
+        return ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7"]
+
+    # AluCg: constant-generator destination in the alu slot.
+    # Subset of the scalar register space; map to scalar for testing.
+    if kind == "AluCg":
+        return ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7"]
+
+    # ERS4: narrow scalar subclass r24-r27, used as index in VEXTRACT.
+    # These are the only 4 registers in this class (2-bit encoding).
+    if kind == "ERS4":
+        return ["r24", "r25", "r26", "r27"]
+
+    # MvBMXDst / MvBMXSrc: vector/accumulator registers for cascade vmov.
+    # Encoding covers x* (vector512) and bml*/bmh* (acc-half).
+    # Use x* names as the simplest concrete subset.
+    if kind in ("MvBMXDst", "MvBMXSrc"):
+        return ["x0", "x2", "x4"]
+
+    # MvAMWQDst / MvAMWQSrc: 256-bit vector registers for wmov.
+    # Use the same wl* names as plain vector256.
+    if kind in ("MvAMWQDst", "MvAMWQSrc"):
+        return ["wl0", "wl2", "wl4", "wl6"]
+
+    # LdaScl: DMS scalar load/store composite class (mLdaScl / mSclSt).
+    # Encodes eR, eP, eDC, eDJ, eDN, eM, and lr -- we use eR (r*) subset.
+    if kind == "LdaScl":
+        return ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r15"]
+
+    # quad: 128-byte (1024-bit) quadword registers q0-q3.
+    # mQQa = AIE2Vector128RegisterClass(add eQQEs, eQQOs) per AIE2GenRegisterInfo.td.
+    # eQQEs = {q0, q2}, eQQOs = {q1, q3}.
+    if kind == "quad":
+        return ["q0", "q1", "q2", "q3"]
 
     # Unknown kind -- return empty.
     return []
@@ -681,6 +871,17 @@ def _load_instruction(reg_name: str, kind: str, ptr: str, offset: int) -> list[s
         return _scalar_load(reg_name, ptr, offset)
     if kind in ("modifier_m", "modifier_dj"):
         return _scalar_load(reg_name, ptr, offset)
+    if kind == "quad":
+        # 128-byte (1024-bit) quadword register load via scalar 'lda' slot.
+        # Syntax: lda q0, [ptr, #imm]  where imm has scale=16.
+        # We use #0 (zero offset) and advance the pointer with padda if needed.
+        # LDA_dmv_lda_q_ag_idx_imm: immediate range [-512, 496] (6-bit * 16).
+        MAX_QUAD_OFFSET = 496  # 6-bit signed * scale 16
+        if 0 <= offset <= MAX_QUAD_OFFSET:
+            return [f"  lda {reg_name}, [{ptr}, #{offset}]"]
+        return _padda_sequence("p6", ptr, offset) + [
+            f"  lda {reg_name}, [p6, #0]",
+        ]
     return [f"  // unsupported load for kind={kind}"]
 
 
@@ -800,6 +1001,17 @@ def _store_instruction(reg_name: str, kind: str, ptr: str, offset: int) -> list[
         return [f"  mov r14, {reg_name}"] + _scalar_store("r14", ptr, offset)
     if kind in ("modifier_m", "modifier_dj"):
         return _scalar_store(reg_name, ptr, offset)
+    if kind == "quad":
+        # 128-byte (1024-bit) quadword register store via scalar 'st' slot.
+        # Syntax: st q0, [ptr, #imm]  where imm has scale=16.
+        # We use #0 (zero offset) and advance the pointer with padda if needed.
+        # ST_dmv_sts_q_ag_idx_imm: immediate range [-512, 496] (6-bit * 16).
+        MAX_QUAD_OFFSET = 496  # 6-bit signed * scale 16
+        if 0 <= offset <= MAX_QUAD_OFFSET:
+            return [f"  st {reg_name}, [{ptr}, #{offset}]"]
+        return _padda_sequence("p7", ptr, offset) + [
+            f"  st {reg_name}, [p7, #0]",
+        ]
     return [f"  // unsupported store for kind={kind}"]
 
 
@@ -1031,6 +1243,9 @@ def generate_operand_combos(instr: dict) -> list[dict[str, str]]:
         List of dicts mapping operand name -> concrete register/value string.
     """
     operands = instr.get("operands", [])
+    # Resolve cm-class unknowns so that combo generation assigns cm register
+    # names (cm0, cm2, ...) instead of falling through to the "else: 0" branch.
+    operands = [_resolve_unknown_operand(op) for op in operands]
     asm_op_names = re.findall(r'\$(\w+)', instr.get("asm_string", ""))
     op_by_name = {op["name"]: op for op in operands}
     outputs = detect_output_operands(instr)
@@ -1164,35 +1379,48 @@ class LoadStrategy(TestStrategy):
         if not has_pointer and not sp_relative:
             return (False, "load with no pointer operand (register shuffle)")
 
-        # Reject composite destinations (LDA_dms_spill has mLdaScl composite).
+        # Reject composite destinations unless they are in TESTABLE_COMPOSITE_KINDS.
+        # LDA_dms_* instructions use mLdaScl (kind="LdaScl") which maps to scalar.
         for op in operands:
             if op.get("operand_type") == "composite_register":
-                return (False, "composite register destination (deferred)")
+                ck = op.get("register_kind", "")
+                if ck not in TESTABLE_COMPOSITE_KINDS:
+                    return (False, "composite register destination (deferred)")
 
         # Detect the output (loaded register).
         dest = self._detect_load_dest(instr)
         if dest is None:
             return (False, "no detectable load destination")
 
-        kind = dest.get("register_kind", "")
+        kind = _effective_kind(dest)
+        if not kind:
+            kind = dest.get("register_kind", "")
         if kind not in KNOWN_REGISTER_KINDS:
             return (False, f"unsupported load destination kind: {kind}")
 
         # Reject accumulator-dest scalar loads: llvm-mc doesn't accept
         # "lda cm0, [ptr]" syntax even though AIE2 hardware supports it.
+        # Exception: accumulator bw=2 is actually the quad register class
+        # (q0-q3, mQQa in TableGen) which uses the same scalar 'lda' slot
+        # and IS accepted by llvm-mc as "lda q0, [ptr, #imm]".
         mnemonic = instr.get("mnemonic", "")
         if kind == "accumulator" and not mnemonic.startswith(("vlda", "vldb")):
-            return (False, "accumulator dest with scalar lda (unsupported by llvm-mc)")
+            bw = dest.get("bit_width", 0)
+            if bw != 2:
+                return (False, "accumulator dest with scalar lda (unsupported by llvm-mc)")
+            # bw=2: quad register (q0-q3) -- fall through, handled below.
 
         if kind == "accumulator":
             bw = dest.get("bit_width", 0)
             if bw == 2:
-                return (False, "composite sparse register (bw=2)")
-            if bw == 6:
+                # Quad registers: handled as "quad" kind in generate_test_point.
+                pass
+            elif bw == 6:
                 return (False, "accumulator quarter register (bw=6)")
 
-        # Reject unknown operand types (except dontcare).
+        # Reject unknown operand types (except dontcare and cm-class resolvable).
         for op in operands:
+            op = _resolve_unknown_operand(op)
             op_type = op.get("operand_type", "unknown")
             if op_type == "unknown":
                 if not op.get("name", "").startswith("dontcare"):
@@ -1224,11 +1452,13 @@ class LoadStrategy(TestStrategy):
 
         dest = self._detect_load_dest(instr)
         dest_name = dest["name"]
-        dest_kind = dest.get("register_kind", "scalar")
+        # Use effective kind: resolves composite (LdaScl -> scalar) and
+        # accumulator bw=2 (DMV_Q quad -> "quad") for correct load/store dispatch.
+        dest_kind = _effective_load_store_kind(dest)
         dest_reg = regs.get(dest_name, "r0")
 
         # Align input offset for this destination type.
-        align = 32 if dest_kind in ("vector256", "vector512", "accumulator") else 4
+        align = _kind_alignment(dest_kind)
         in_offset = _align(in_offset, align)
 
         op_by_name = {op["name"]: op for op in instr.get("operands", [])}
@@ -1349,8 +1579,9 @@ class StoreStrategy(TestStrategy):
         if kind == "accumulator" and not mnemonic.startswith("vst"):
             return (False, "accumulator source with scalar st (unsupported by llvm-mc)")
 
-        # Reject unknown operand types (except dontcare).
+        # Reject unknown operand types (except dontcare and cm-class resolvable).
         for op in operands:
+            op = _resolve_unknown_operand(op)
             op_type = op.get("operand_type", "unknown")
             if op_type == "unknown":
                 if not op.get("name", "").startswith("dontcare"):
@@ -1633,6 +1864,8 @@ def classify_with_strategies(instr: dict) -> tuple[Optional[TestStrategy], str]:
 
 def _operand_size(op: dict, instr_name: str = "") -> int:
     """Compute the storage size in bytes for a single register operand."""
+    # Resolve cm-class unknowns before inspecting the kind.
+    op = _resolve_unknown_operand(op)
     kind = op.get("register_kind", "")
     # For testable composite kinds, use the effective kind for sizing.
     effective = _effective_kind(op)

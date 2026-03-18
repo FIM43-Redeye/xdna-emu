@@ -172,8 +172,10 @@ class TestClassifyInstruction:
         assert status == "skipped"
 
     def test_skip_composite_register(self):
-        instr = _make_instr("ADD_NC", "add.nc", "add.nc\t$dst, $s0, $imm", [
-            _make_composite_op("dst", "MvSclSrc"),
+        """Instructions with unknown composite register kinds are still skipped."""
+        instr = _make_instr("FOO_unknown_composite", "foo",
+                            "foo\t$dst, $s0, $imm", [
+            _make_composite_op("dst", "UnknownCompositeKind"),
             _make_reg_op("s0", "scalar"),
             _make_imm_op("imm"),
         ])
@@ -225,12 +227,106 @@ class TestClassifyInstruction:
     def test_other_composite_kinds_still_skipped(self):
         """Composite register kinds NOT in TESTABLE_COMPOSITE_KINDS are still skipped."""
         instr = _make_instr("FOO_mv", "foo.mv", "foo.mv\t$dst, $src", [
-            _make_composite_op("dst", "MvSclSrc", bit_width=7),
+            _make_composite_op("dst", "SomeObscureKind", bit_width=7),
             _make_reg_op("src", "scalar"),
         ], slot="mv")
         status, reason = classify_instruction(instr)
         assert status == "skipped"
         assert "composite" in reason.lower()
+
+    def test_mvsclsrc_output_is_testable(self):
+        """MOV_mv_scl-style with MvSclSrc output/source is testable.
+
+        MvSclSrc (bw=7) is the mv-slot scalar source/destination class.
+        Both operands are MvSclSrc composites: first is the destination,
+        second is the source.
+        """
+        instr = _make_instr("MOV_mv_scl", "mov",
+                            "mov\t$mMvSclDst, $mMvSclSrc", [
+            _make_composite_op("mMvSclDst", "MvSclSrc", bit_width=7),
+            _make_composite_op("mMvSclSrc", "MvSclSrc", bit_width=7),
+        ], slot="mv")
+        status, reason = classify_instruction(instr)
+        assert status == "testable", \
+            f"MOV_mv_scl with MvSclSrc operands should be testable, got: {reason}"
+
+    def test_alucg_output_is_testable(self):
+        """MOVX_alu_cg with AluCg destination is testable.
+
+        AluCg (bw=6) is the alu-slot constant-generator destination class.
+        The instruction moves an immediate into an AluCg destination register.
+        """
+        instr = _make_instr("MOVX_alu_cg", "movx",
+                            "movx\t$dst, $i", [
+            _make_composite_op("dst", "AluCg", bit_width=6),
+            _make_imm_op("i", bit_width=11),
+        ], slot="alu")
+        status, reason = classify_instruction(instr)
+        assert status == "testable", \
+            f"MOVX_alu_cg with AluCg dst should be testable, got: {reason}"
+
+    def test_ldacg_output_is_testable(self):
+        """MOVA_lda_cg with LdaCg destination is testable.
+
+        LdaCg (bw=7) is the lda-slot constant-generator destination class.
+        """
+        instr = _make_instr("MOVA_lda_cg", "mova",
+                            "mova\t$mLdaCg, $c11s", [
+            _make_composite_op("mLdaCg", "LdaCg", bit_width=7),
+            _make_imm_op("c11s", bit_width=11),
+        ], slot="lda")
+        status, reason = classify_instruction(instr)
+        assert status == "testable", \
+            f"MOVA_lda_cg with LdaCg dst should be testable, got: {reason}"
+
+    def test_vextract_with_ers4_and_mvsclsrc_is_testable(self):
+        """VEXTRACT with both ERS4 (index) and MvSclSrc (dst) is testable.
+
+        VEXTRACT has two composite operands: ERS4 for the lane index and
+        MvSclSrc for the scalar destination.  Both must be handled for
+        the instruction to be classified as testable.
+        """
+        instr = _make_instr("VEXTRACT_D32", "vextract.d32",
+                            "vextract.d32\t$dst, $s1, $idx", [
+            _make_composite_op("dst", "MvSclSrc", bit_width=7),
+            _make_composite_op("idx", "ERS4", bit_width=2),
+            _make_reg_op("s1", "vector512", bit_width=4),
+        ], slot="mv", is_vector=True)
+        status, reason = classify_instruction(instr)
+        assert status == "testable", \
+            f"VEXTRACT_D32 with ERS4+MvSclSrc should be testable, got: {reason}"
+
+    def test_vmov_mv_x_is_testable(self):
+        """VMOV_mv_x with MvBMXDst (dst) and MvBMXSrc (src) is testable."""
+        instr = _make_instr("VMOV_mv_x", "vmov",
+                            "vmov\t$dst, $src", [
+            _make_composite_op("dst", "MvBMXDst", bit_width=6),
+            _make_composite_op("src", "MvBMXSrc", bit_width=9),
+        ], slot="mv", is_vector=True)
+        status, reason = classify_instruction(instr)
+        assert status == "testable", \
+            f"VMOV_mv_x with MvBMXDst/MvBMXSrc should be testable, got: {reason}"
+
+    def test_vmov_mv_w_is_testable(self):
+        """VMOV_mv_w with MvAMWQDst (dst) and MvAMWQSrc (src) is testable."""
+        instr = _make_instr("VMOV_mv_w", "vmov",
+                            "vmov\t$dst, $src", [
+            _make_composite_op("dst", "MvAMWQDst", bit_width=7),
+            _make_composite_op("src", "MvAMWQSrc", bit_width=9),
+        ], slot="mv", is_vector=True)
+        status, reason = classify_instruction(instr)
+        assert status == "testable", \
+            f"VMOV_mv_w with MvAMWQDst/MvAMWQSrc should be testable, got: {reason}"
+
+    def test_cascade_instruction_is_skipped(self):
+        """VMOV_mv_scd reads from SCD (cascade) -- skipped without cascade setup."""
+        instr = _make_instr("VMOV_mv_scd", "vmov",
+                            "vmov\t$dst, SCD", [
+            _make_composite_op("dst", "MvBMXDst", bit_width=6),
+        ], slot="lda", is_vector=True)
+        status, reason = classify_instruction(instr)
+        assert status == "skipped"
+        assert "cascade" in reason.lower()
 
     def test_skip_unknown_operand_type(self):
         instr = _make_instr("FOO", "foo", "foo\t$dst, $src", [
@@ -478,7 +574,7 @@ class TestRegisterNames:
         assert len(names) >= 1
 
     def test_unknown_kind_returns_empty(self):
-        names = register_names("ERS4")
+        names = register_names("TrulyUnknownKind")
         assert names == []
 
     def test_shfl_dst_returns_vector512_names(self):
@@ -507,6 +603,82 @@ class TestRegisterNames:
         assert len(names) >= 2
         assert all(n.startswith("wl") or n.startswith("wh") for n in names), \
             f"Expected wl*/wh* names for Wm1, got {names}"
+
+    def test_mvsclsrc_returns_scalar_names(self):
+        """MvSclSrc composite kind (mv-slot scalar source) maps to r* scalar names.
+
+        mMvSclSrc encodes scalars, pointers, shift regs, modifiers, and control
+        regs in 7 bits.  For testing we use the plain general-purpose scalar
+        subset (r0-r7) since they can be loaded/stored directly.
+        """
+        names = register_names("MvSclSrc")
+        assert isinstance(names, list)
+        assert len(names) >= 2
+        assert all(n.startswith("r") for n in names), \
+            f"Expected r* names for MvSclSrc, got {names}"
+
+    def test_ldacg_returns_scalar_names(self):
+        """LdaCg (lda-slot constant-generator destination) maps to r* scalar names."""
+        names = register_names("LdaCg")
+        assert isinstance(names, list)
+        assert len(names) >= 2
+        assert all(n.startswith("r") for n in names), \
+            f"Expected r* names for LdaCg, got {names}"
+
+    def test_alucg_returns_scalar_names(self):
+        """AluCg (alu-slot constant-generator destination) maps to r* scalar names."""
+        names = register_names("AluCg")
+        assert isinstance(names, list)
+        assert len(names) >= 2
+        assert all(n.startswith("r") for n in names), \
+            f"Expected r* names for AluCg, got {names}"
+
+    def test_ers4_returns_r24_to_r27(self):
+        """ERS4 is a 2-bit narrow scalar class encoding exactly r24-r27.
+
+        ERS4 is used as the index operand in VEXTRACT instructions.
+        The 2-bit field encodes 4 consecutive high scalar registers.
+        """
+        names = register_names("ERS4")
+        assert names == ["r24", "r25", "r26", "r27"], \
+            f"Expected [r24, r25, r26, r27] for ERS4, got {names}"
+
+    def test_mvbmxdst_returns_vector512_names(self):
+        """MvBMXDst composite kind maps to x* (vector512) register names.
+
+        MvBMXDst is used as the destination of cascade vmov (VMOV_mv_scd,
+        VMOV_mv_x).  It encodes x* (vector512) and bml*/bmh* (acc-half).
+        We use the x* subset as the simplest concrete names for testing.
+        """
+        names = register_names("MvBMXDst")
+        assert isinstance(names, list)
+        assert len(names) >= 2
+        assert all(n.startswith("x") for n in names), \
+            f"Expected x* names for MvBMXDst, got {names}"
+
+    def test_mvbmxsrc_returns_vector512_names(self):
+        """MvBMXSrc composite kind (wide vector/accumulator source) maps to x* names."""
+        names = register_names("MvBMXSrc")
+        assert isinstance(names, list)
+        assert len(names) >= 2
+        assert all(n.startswith("x") for n in names), \
+            f"Expected x* names for MvBMXSrc, got {names}"
+
+    def test_mvamwqdst_returns_vector256_names(self):
+        """MvAMWQDst (256-bit vector destination for wmov) maps to wl* names."""
+        names = register_names("MvAMWQDst")
+        assert isinstance(names, list)
+        assert len(names) >= 2
+        assert all(n.startswith("wl") or n.startswith("wh") for n in names), \
+            f"Expected wl*/wh* names for MvAMWQDst, got {names}"
+
+    def test_mvamwqsrc_returns_vector256_names(self):
+        """MvAMWQSrc (wide 256-bit source for wmov) maps to wl* names."""
+        names = register_names("MvAMWQSrc")
+        assert isinstance(names, list)
+        assert len(names) >= 2
+        assert all(n.startswith("wl") or n.startswith("wh") for n in names), \
+            f"Expected wl*/wh* names for MvAMWQSrc, got {names}"
 
     def test_accumulator_bw4_returns_cm(self):
         """Accumulator with 4-bit encoding -> 1024-bit cm registers."""
@@ -648,6 +820,193 @@ class TestDetectOutputOperands:
         outputs = detect_output_operands(instr)
         assert len(outputs) == 1
         assert outputs[0]["name"] == "mRx"
+
+    def test_tied_dst_vaddmac_dense(self):
+        """VADDMAC_vmac_bm_core_dense: $dst in asm but no 'dst' operand.
+
+        The first accumulator operand following $dst in asm_string order
+        (acc1) is the tied write-back destination and should be returned
+        as the sole output.
+        """
+        instr = _make_instr(
+            "VADDMAC_vmac_bm_core_dense", "vaddmac",
+            "vaddmac\t$dst, $acc1, $acc2, $s1, $s2, $c",
+            [
+                _make_reg_op("acc1", "accumulator", bit_width=4),
+                _make_reg_op("c", "scalar", bit_width=5),
+                _make_reg_op("s1", "vector512", bit_width=4),
+                _make_reg_op("acc2", "accumulator", bit_width=4),
+                _make_reg_op("s2", "vector512", bit_width=4),
+            ],
+            slot="vec", is_vector=True,
+        )
+        outputs = detect_output_operands(instr)
+        assert len(outputs) == 1, f"Expected 1 output, got {outputs}"
+        assert outputs[0]["name"] == "acc1"
+        assert outputs[0]["register_kind"] == "accumulator"
+
+    def test_tied_dst_vaddmac_f_dense_bw5(self):
+        """VADDMAC_F_vmac_bm_core_dense: $dst in asm, no 'dst' operand, bw=5.
+
+        Uses bw=5 accumulators (bm class).  The first accumulator in asm
+        order after $dst is acc1.
+        """
+        instr = _make_instr(
+            "VADDMAC_F_vmac_bm_core_dense", "vaddmac.f",
+            "vaddmac.f\t$dst, $acc1, $acc2, $s1, $s2, $c",
+            [
+                _make_reg_op("acc2", "accumulator", bit_width=5),
+                _make_reg_op("c", "scalar", bit_width=5),
+                _make_reg_op("acc1", "accumulator", bit_width=5),
+                _make_reg_op("s1", "vector512", bit_width=4),
+                _make_reg_op("s2", "vector512", bit_width=4),
+            ],
+            slot="vec", is_vector=True,
+        )
+        outputs = detect_output_operands(instr)
+        assert len(outputs) == 1, f"Expected 1 output, got {outputs}"
+        assert outputs[0]["name"] == "acc1"
+        assert outputs[0]["register_kind"] == "accumulator"
+
+    def test_tied_dst_no_accumulator_returns_empty(self):
+        """$dst in asm without any accumulator operand -> no output detected.
+
+        Guards against the tied-destination fallback producing false positives
+        for hypothetical instructions that have $dst-without-operand but no
+        accumulator in the remaining operands.
+        """
+        instr = _make_instr(
+            "HYPO_no_acc", "hypo",
+            "hypo\t$dst, $s1, $s2",
+            [
+                _make_reg_op("s1", "vector512", bit_width=4),
+                _make_reg_op("s2", "vector512", bit_width=4),
+            ],
+            slot="vec", is_vector=True,
+        )
+        outputs = detect_output_operands(instr)
+        assert outputs == [], f"Expected no outputs, got {outputs}"
+
+    def test_existing_dst_operand_unaffected_by_tied_fallback(self):
+        """Instructions with a real 'dst' operand still work through the normal path.
+
+        The tied-destination fallback only activates when 'dst' appears in
+        the asm_string but is absent from the operands list.  VADD has a real
+        'dst' operand and must continue to work correctly.
+        """
+        instr = _make_instr("VADD", "vadd", "vadd\t$dst, $acc1, $acc2, $c", [
+            _make_reg_op("acc2", "accumulator", bit_width=4),
+            _make_reg_op("c", "scalar", bit_width=5),
+            _make_reg_op("dst", "accumulator", bit_width=4),
+            _make_reg_op("acc1", "accumulator", bit_width=4),
+        ], slot="vec")
+        outputs = detect_output_operands(instr)
+        assert any(o["name"] == "dst" for o in outputs), \
+            "Normal 'dst' operand should still be detected as output"
+
+
+class TestClassifyTiedDst:
+    """Classification tests for VADDMAC/VADDMSC/VSUBMAC/VSUBMSC variants.
+
+    Dense variants (bw=4 or bw=5 accumulators, no bw=2 sparse regs, no
+    unknown operands) should now be testable because detect_output_operands()
+    handles the tied-destination pattern.
+
+    Sparse narrow variants remain blocked by bw=2 accumulator (qxs2).
+    Sparse wide variants remain blocked by the unknown 'ys1' operand.
+    """
+
+    def _make_vmac_family_dense(self, name, mnemonic, bw):
+        """Dense VMAC-family instruction with accumulator bit_width=bw."""
+        return _make_instr(
+            name, mnemonic,
+            f"{mnemonic}\t$dst, $acc1, $acc2, $s1, $s2, $c",
+            [
+                _make_reg_op("acc1", "accumulator", bit_width=bw),
+                _make_reg_op("c", "scalar", bit_width=5),
+                _make_reg_op("s1", "vector512", bit_width=4),
+                _make_reg_op("acc2", "accumulator", bit_width=bw),
+                _make_reg_op("s2", "vector512", bit_width=4),
+            ],
+            slot="vec", is_vector=True,
+        )
+
+    def test_vaddmac_bm_dense_testable(self):
+        """VADDMAC_vmac_bm_core_dense (bw=4) is testable after tied-dst fix."""
+        instr = self._make_vmac_family_dense(
+            "VADDMAC_vmac_bm_core_dense", "vaddmac", bw=4)
+        status, reason = classify_instruction(instr)
+        assert status == "testable", \
+            f"VADDMAC_vmac_bm_core_dense should be testable, got: {reason}"
+
+    def test_vaddmac_f_bm_dense_testable(self):
+        """VADDMAC_F_vmac_bm_core_dense (bw=5) is testable after tied-dst fix."""
+        instr = self._make_vmac_family_dense(
+            "VADDMAC_F_vmac_bm_core_dense", "vaddmac.f", bw=5)
+        status, reason = classify_instruction(instr)
+        assert status == "testable", \
+            f"VADDMAC_F_vmac_bm_core_dense should be testable, got: {reason}"
+
+    def test_vaddmsc_bm_dense_testable(self):
+        """VADDMSC_vmac_bm_core_dense (bw=4) is testable."""
+        instr = self._make_vmac_family_dense(
+            "VADDMSC_vmac_bm_core_dense", "vaddmsc", bw=4)
+        status, reason = classify_instruction(instr)
+        assert status == "testable", \
+            f"VADDMSC_vmac_bm_core_dense should be testable, got: {reason}"
+
+    def test_vsubmac_bm_dense_testable(self):
+        """VSUBMAC_vmac_bm_core_dense (bw=4) is testable."""
+        instr = self._make_vmac_family_dense(
+            "VSUBMAC_vmac_bm_core_dense", "vsubmac", bw=4)
+        status, reason = classify_instruction(instr)
+        assert status == "testable", \
+            f"VSUBMAC_vmac_bm_core_dense should be testable, got: {reason}"
+
+    def test_vsubmsc_bm_dense_testable(self):
+        """VSUBMSC_vmac_bm_core_dense (bw=4) is testable."""
+        instr = self._make_vmac_family_dense(
+            "VSUBMSC_vmac_bm_core_dense", "vsubmsc", bw=4)
+        status, reason = classify_instruction(instr)
+        assert status == "testable", \
+            f"VSUBMSC_vmac_bm_core_dense should be testable, got: {reason}"
+
+    def test_sparse_narrow_still_skipped_by_bw2(self):
+        """Sparse narrow variants have a bw=2 accumulator (qxs2) -- still skipped."""
+        instr = _make_instr(
+            "VADDMAC_vmac_cm_core_sparse_narrow", "vaddmac",
+            "vaddmac\t$dst, $acc1, $acc2, $xs1, $qxs2, $c",
+            [
+                _make_reg_op("xs1", "vector512", bit_width=4),
+                _make_reg_op("acc2", "accumulator", bit_width=4),
+                _make_reg_op("c", "scalar", bit_width=5),
+                _make_reg_op("acc1", "accumulator", bit_width=4),
+                _make_reg_op("qxs2", "accumulator", bit_width=2),
+            ],
+            slot="vec", is_vector=True,
+        )
+        status, reason = classify_instruction(instr)
+        assert status == "skipped", \
+            f"Sparse narrow should be skipped (bw=2 qxs2), got testable"
+        assert "sparse" in reason or "bw=2" in reason
+
+    def test_sparse_wide_still_skipped_by_unknown_ys1(self):
+        """Sparse wide variants have an unknown 'ys1' operand -- still skipped."""
+        instr = _make_instr(
+            "VADDMSC_F_vmac_bm_core_sparse_wide", "vaddmsc.f",
+            "vaddmsc.f\t$dst, $acc1, $acc2, $ys1, $qxs2, $c",
+            [
+                _make_unknown_op("ys1", bit_width=2),
+                _make_reg_op("acc1", "accumulator", bit_width=5),
+                _make_reg_op("acc2", "accumulator", bit_width=5),
+                _make_reg_op("qxs2", "accumulator", bit_width=2),
+                _make_reg_op("c", "scalar", bit_width=5),
+            ],
+            slot="vec", is_vector=True,
+        )
+        status, reason = classify_instruction(instr)
+        assert status == "skipped", \
+            f"Sparse wide should be skipped (unknown ys1 / bw=2 qxs2), got testable"
 
 
 # ===================================================================
@@ -1719,3 +2078,357 @@ class TestGenerateAll:
             print(f"\nllvm-mc stderr:\n{result.stderr[:2000]}")
         # llvm-mc should at least not crash (segfault = returncode -11).
         assert result.returncode >= 0, "llvm-mc crashed"
+
+
+# ===================================================================
+# cm-class operand resolution (_resolve_unknown_operand)
+# ===================================================================
+
+def _make_cm_unknown_op(name, bit_width=4):
+    """Build an operand dict matching the cm-class export signature.
+
+    The ISA exporter emits operand_type='unknown', register_kind=None,
+    bit_width=4 for cm-class (1024-bit full accumulator) operands.
+    """
+    return {
+        "name": name,
+        "bit_width": bit_width,
+        "is_output": False,
+        "operand_type": "unknown",
+        "register_kind": None,
+        "signed": False,
+        "scale": None,
+    }
+
+
+class TestResolveUnknownOperand:
+    """Tests for _resolve_unknown_operand() cm-class heuristic.
+
+    The heuristic identifies cm-class (1024-bit full accumulator) operands
+    that the ISA exporter incorrectly tags as operand_type='unknown'.
+    Matching operands have: operand_type='unknown', register_kind=None,
+    bit_width=4, and name in {dst, src, acc1, acc2}.
+    """
+
+    _resolve = staticmethod(isa_test_gen._resolve_unknown_operand)
+
+    def test_dst_bw4_resolved_to_accumulator(self):
+        """dst with bit_width=4 and unknown type -> register/accumulator."""
+        op = _make_cm_unknown_op("dst")
+        resolved = self._resolve(op)
+        assert resolved["operand_type"] == "register"
+        assert resolved["register_kind"] == "accumulator"
+
+    def test_src_bw4_resolved(self):
+        """src with bit_width=4 and unknown type -> register/accumulator."""
+        op = _make_cm_unknown_op("src")
+        resolved = self._resolve(op)
+        assert resolved["operand_type"] == "register"
+        assert resolved["register_kind"] == "accumulator"
+
+    def test_acc1_bw4_resolved(self):
+        """acc1 with bit_width=4 -> register/accumulator."""
+        op = _make_cm_unknown_op("acc1")
+        resolved = self._resolve(op)
+        assert resolved["operand_type"] == "register"
+        assert resolved["register_kind"] == "accumulator"
+
+    def test_acc2_bw4_resolved(self):
+        """acc2 with bit_width=4 -> register/accumulator."""
+        op = _make_cm_unknown_op("acc2")
+        resolved = self._resolve(op)
+        assert resolved["operand_type"] == "register"
+        assert resolved["register_kind"] == "accumulator"
+
+    def test_original_not_mutated(self):
+        """_resolve_unknown_operand must not mutate the input dict."""
+        op = _make_cm_unknown_op("dst")
+        original_type = op["operand_type"]
+        self._resolve(op)
+        assert op["operand_type"] == original_type
+
+    def test_non_cm_name_not_resolved(self):
+        """An unknown operand with a name not in the cm set is unchanged."""
+        op = _make_cm_unknown_op("ys1")  # not dst/src/acc1/acc2
+        resolved = self._resolve(op)
+        assert resolved["operand_type"] == "unknown"
+        assert resolved is op or resolved["operand_type"] == "unknown"
+
+    def test_dontcare_not_resolved(self):
+        """dontcare operands with bit_width=4 are NOT resolved (kept unknown)."""
+        op = _make_cm_unknown_op("dontcare4")
+        resolved = self._resolve(op)
+        assert resolved["operand_type"] == "unknown"
+
+    def test_wrong_bit_width_not_resolved(self):
+        """bit_width=2 (sparse class) must not be resolved as cm."""
+        op = _make_cm_unknown_op("dst", bit_width=2)
+        resolved = self._resolve(op)
+        assert resolved["operand_type"] == "unknown"
+
+    def test_already_typed_not_touched(self):
+        """If operand_type is already 'register', it is returned as-is."""
+        op = {
+            "name": "dst",
+            "bit_width": 4,
+            "is_output": False,
+            "operand_type": "register",
+            "register_kind": "accumulator",
+            "signed": False,
+            "scale": None,
+        }
+        resolved = self._resolve(op)
+        assert resolved is op  # unchanged
+
+
+class TestCmClassClassification:
+    """Tests for classify_instruction with cm-class operands.
+
+    Covers the instructions recovered by _resolve_unknown_operand:
+    VUPS x2c variants, VSRS x_srs variants, VMOV_mv_cm, and VNEG.
+    """
+
+    def _make_vups_x2c(self, mnemonic="vups.s32.s16"):
+        """Build a synthetic VUPS x2c-style instruction.
+
+        x2c variant: src is vector512 (bw=4), dst is cm-class (bw=4, unknown).
+        The ISA exporter tags dst as unknown; the heuristic recovers it.
+        """
+        return _make_instr(
+            "VUPS_S32_S16_mv_ups_x2c", mnemonic,
+            f"{mnemonic}\t$dst, $src, $shft",
+            [
+                _make_reg_op("shft", "scalar", bit_width=2),
+                _make_reg_op("src", "vector512", bit_width=4),
+                _make_cm_unknown_op("dst"),  # cm-class, mistagged as unknown
+            ],
+            slot="mv", is_vector=True,
+        )
+
+    def _make_vsrs_x_srs(self, mnemonic="vsrs.s16.s32"):
+        """Build a synthetic VSRS x_srs-style instruction.
+
+        x_srs variant: src is cm-class (bw=4, unknown), dst is vector512 (bw=4).
+        """
+        return _make_instr(
+            "VSRS_S16_S32_mv_x_srs", mnemonic,
+            f"{mnemonic}\t$dst, $src, $shft",
+            [
+                _make_reg_op("dst", "vector512", bit_width=4),
+                _make_cm_unknown_op("src"),  # cm-class, mistagged as unknown
+                _make_reg_op("shft", "scalar", bit_width=2),
+            ],
+            slot="st", is_vector=True,
+        )
+
+    def _make_vmov_cm(self):
+        """Build a synthetic VMOV_mv_cm instruction (both ops are cm-class)."""
+        return _make_instr(
+            "VMOV_mv_cm", "vmov",
+            "vmov\t$dst, $src",
+            [
+                _make_cm_unknown_op("dst"),
+                _make_cm_unknown_op("src"),
+            ],
+            slot="mv", is_vector=True,
+        )
+
+    def _make_vneg_cm(self):
+        """Build a synthetic VNEG instruction (dst and acc1 are cm-class)."""
+        return _make_instr(
+            "VNEG", "vneg",
+            "vneg\t$dst, $acc1, $c",
+            [
+                _make_reg_op("c", "scalar", bit_width=5),
+                _make_cm_unknown_op("dst"),
+                _make_cm_unknown_op("acc1"),
+            ],
+            slot="vec", is_vector=True,
+        )
+
+    def test_vups_x2c_is_testable(self):
+        """VUPS x2c with cm-class dst (unknown bw=4) should be testable."""
+        instr = self._make_vups_x2c()
+        status, reason = classify_instruction(instr)
+        assert status == "testable", \
+            f"VUPS x2c should be testable via cm heuristic, got: {reason}"
+
+    def test_vsrs_x_srs_is_testable(self):
+        """VSRS x_srs with cm-class src (unknown bw=4) should be testable."""
+        instr = self._make_vsrs_x_srs()
+        status, reason = classify_instruction(instr)
+        assert status == "testable", \
+            f"VSRS x_srs should be testable via cm heuristic, got: {reason}"
+
+    def test_vmov_cm_is_testable(self):
+        """VMOV_mv_cm with both ops as cm-class should be testable."""
+        instr = self._make_vmov_cm()
+        status, reason = classify_instruction(instr)
+        assert status == "testable", \
+            f"VMOV_mv_cm should be testable via cm heuristic, got: {reason}"
+
+    def test_vneg_cm_is_testable(self):
+        """VNEG with cm-class dst and acc1 should be testable."""
+        instr = self._make_vneg_cm()
+        status, reason = classify_instruction(instr)
+        assert status == "testable", \
+            f"VNEG should be testable via cm heuristic, got: {reason}"
+
+    def test_vups_x2c_dst_is_output(self):
+        """For VUPS x2c, the cm-class dst should be detected as an output."""
+        instr = self._make_vups_x2c()
+        outputs = detect_output_operands(instr)
+        assert len(outputs) >= 1
+        assert outputs[0]["name"] == "dst"
+        # After resolution, the output should look like an accumulator register.
+        assert outputs[0]["register_kind"] == "accumulator"
+
+    def test_vsrs_x_srs_dst_is_output(self):
+        """For VSRS x_srs, the vector512 dst is the output (not the cm src)."""
+        instr = self._make_vsrs_x_srs()
+        outputs = detect_output_operands(instr)
+        assert len(outputs) >= 1
+        assert outputs[0]["name"] == "dst"
+
+    def test_vups_x2c_combos_use_cm_names(self):
+        """generate_operand_combos should assign cm* names to the dst operand."""
+        instr = self._make_vups_x2c()
+        combos = generate_operand_combos(instr)
+        assert len(combos) >= 1
+        # The dst should use cm-family register names.
+        dst_val = combos[0].get("dst", "")
+        assert dst_val.startswith("cm"), \
+            f"Expected cm* register for dst, got: {dst_val!r}"
+
+    def test_vsrs_x_srs_combos_use_cm_names(self):
+        """generate_operand_combos should assign cm* names to the src operand."""
+        instr = self._make_vsrs_x_srs()
+        combos = generate_operand_combos(instr)
+        assert len(combos) >= 1
+        src_val = combos[0].get("src", "")
+        assert src_val.startswith("cm"), \
+            f"Expected cm* register for src, got: {src_val!r}"
+
+    def test_vups_x2c_generates_test_point(self):
+        """generate_test_point for VUPS x2c should include UPS sequence."""
+        instr = self._make_vups_x2c()
+        combos = generate_operand_combos(instr)
+        regs = combos[0]
+        asm = generate_test_point(instr, regs, in_offset=0, out_offset=0)
+        # Must include the instruction.
+        assert "vups.s32.s16" in asm
+        # Must include SRS to extract the cm output for storage.
+        assert "vsrs" in asm
+
+    def test_unknown_bw2_still_blocked(self):
+        """Unknown operands with bit_width=2 are NOT cm-class; must stay blocked."""
+        instr = _make_instr("FOO_sparse", "foo.sparse",
+                            "foo.sparse\t$dst, $acc1, $xs2, $c", [
+            _make_reg_op("dst", "accumulator", bit_width=4),
+            _make_reg_op("acc1", "accumulator", bit_width=4),
+            _make_reg_op("xs2", "vector512"),
+            _make_unknown_op("ys1", bit_width=2),  # NOT cm-class
+            _make_reg_op("c", "scalar"),
+        ], slot="vec", is_vector=True)
+        status, reason = classify_instruction(instr)
+        assert status == "skipped"
+        assert "unknown" in reason.lower()
+
+    def test_non_standard_name_still_blocked(self):
+        """Unknown operand with bw=4 but name not in {dst,src,acc1,acc2} stays blocked."""
+        instr = _make_instr("BAR", "bar", "bar\t$mRx, $ys1", [
+            _make_reg_op("mRx", "scalar"),
+            _make_cm_unknown_op("ys1"),  # bw=4, unknown, but name is not dst/src/...
+        ])
+        status, reason = classify_instruction(instr)
+        assert status == "skipped"
+        assert "unknown" in reason.lower()
+
+
+class TestCmClassRealISA:
+    """Integration tests against real aie2-isa.json for cm-class recovery.
+
+    Verifies that the ~17 instructions with cm-class unknown operands are
+    correctly classified as testable after applying _resolve_unknown_operand.
+    """
+
+    @pytest.fixture
+    def isa_data(self):
+        path = os.path.join(os.path.dirname(__file__), "aie2-isa.json")
+        if not os.path.exists(path):
+            pytest.skip("aie2-isa.json not found")
+        with open(path) as f:
+            return json.load(f)
+
+    def _find_instr(self, isa_data, name):
+        for section, items in isa_data.items():
+            if isinstance(items, list):
+                for i in items:
+                    if i.get("name") == name:
+                        return i
+        return None
+
+    @pytest.mark.parametrize("instr_name", [
+        # VUPS x2c variants (dst is cm-class, src is vector512)
+        "VUPS_S32_D16_mv_ups_x2c",
+        "VUPS_S32_S16_mv_ups_x2c",
+        "VUPS_S64_D32_mv_ups_x2c",
+        "VUPS_S64_S32_mv_ups_x2c",
+        # VSRS x_srs variants (src is cm-class, dst is vector512 or vector256)
+        "VSRS_D16_S32_mv_x_srs",
+        "VSRS_D32_S64_mv_x_srs",
+        "VSRS_S16_S32_mv_x_srs",
+        "VSRS_S32_S64_mv_x_srs",
+        # VMOV and VNEG with cm operands
+        "VMOV_mv_cm",
+        "VNEG",
+    ])
+    def test_cm_instruction_is_testable(self, isa_data, instr_name):
+        """Each cm-class instruction should be testable after heuristic resolution."""
+        instr = self._find_instr(isa_data, instr_name)
+        if instr is None:
+            pytest.skip(f"{instr_name} not in ISA JSON")
+        strategy = isa_test_gen.ComputeStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, \
+            f"{instr_name} should be testable via cm heuristic, got: {reason}"
+
+    @pytest.mark.parametrize("instr_name", [
+        # VUPS x2c variants have cm dst, which should combo to cm* names
+        "VUPS_S32_S16_mv_ups_x2c",
+        "VUPS_S64_S32_mv_ups_x2c",
+        # VSRS x_srs variants have cm src
+        "VSRS_S16_S32_mv_x_srs",
+        "VSRS_S32_S64_mv_x_srs",
+    ])
+    def test_cm_operand_combos_use_cm_names(self, isa_data, instr_name):
+        """cm-class operands should get cm0/cm2/cm4 register assignments."""
+        instr = self._find_instr(isa_data, instr_name)
+        if instr is None:
+            pytest.skip(f"{instr_name} not in ISA JSON")
+        combos = generate_operand_combos(instr)
+        assert len(combos) >= 1
+        # At least one combo should have a cm* value for dst or src.
+        found_cm = False
+        for combo in combos:
+            for val in combo.values():
+                if isinstance(val, str) and val.startswith("cm"):
+                    found_cm = True
+                    break
+        assert found_cm, \
+            f"{instr_name}: expected cm* register in combos, got {combos[0]}"
+
+    def test_vmov_hi_blocked_cascade(self, isa_data):
+        """VMOV_HI reads from SCD (cascade) -- must be skipped despite cm dst.
+
+        Even though VMOV_HI has a cm-class dst (bw=4, unknown), the asm_string
+        contains 'SCD' which means the instruction stalls without active cascade
+        connections.  The cascade check fires before the cm-class heuristic can
+        make it testable, so it remains skipped.
+        """
+        instr = self._find_instr(isa_data, "VMOV_HI")
+        if instr is None:
+            pytest.skip("VMOV_HI not in ISA JSON")
+        status, reason = classify_instruction(instr)
+        assert status == "skipped"
+        assert "cascade" in reason.lower()
