@@ -297,6 +297,27 @@ class TestClassifyInstruction:
         assert status == "skipped"
         assert "sparse" in reason or "bw=2" in reason
 
+    def test_dontcare_operand_accepted(self):
+        """Instructions with dontcare padding operands should be testable."""
+        instr = _make_instr("PADDA", "padda", "padda\t[$mPa], #$c12s", [
+            _make_reg_op("mPa", "pointer", bit_width=3),
+            _make_imm_op("c12s", bit_width=12, signed=True),
+            _make_unknown_op("dontcare2", bit_width=2),
+        ])
+        status, reason = classify_instruction(instr)
+        assert status == "testable", f"Expected testable, got {status}: {reason}"
+
+    def test_non_dontcare_unknown_still_skipped(self):
+        """Unknown operands that are NOT dontcare should still be skipped."""
+        instr = _make_instr("FOO", "foo", "foo\t$dst, $src, $ys1", [
+            _make_reg_op("dst", "scalar"),
+            _make_reg_op("src", "scalar"),
+            _make_unknown_op("ys1", bit_width=2),
+        ])
+        status, reason = classify_instruction(instr)
+        assert status == "skipped"
+        assert "unknown" in reason.lower()
+
     def test_register_plus_16_testable(self):
         """Vector compare with register+16 output (eRS8) is testable."""
         instr = _make_instr("VGE_D16", "vge.d16", "vge.d16\t$cmp, $s1, $s2", [

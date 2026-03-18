@@ -174,7 +174,8 @@ def classify_instruction(instr: dict) -> tuple[str, str]:
         if op_type == "composite_register":
             return ("skipped", "composite register operand")
         if op_type == "unknown":
-            return ("skipped", "unknown operand type")
+            if not op.get("name", "").startswith("dontcare"):
+                return ("skipped", "unknown operand type")
         if op_type in REGISTER_LIKE_TYPES:
             kind = op.get("register_kind")
             if kind and kind not in KNOWN_REGISTER_KINDS:
@@ -625,6 +626,9 @@ def _substitute_asm(asm_string: str, regs: dict[str, str]) -> str:
     # Replace any remaining $name tokens with known fixed registers.
     for name, fixed_reg in FIXED_REGISTER_MAP.items():
         result = result.replace(f"${name}", fixed_reg)
+
+    # Zero-fill any remaining dontcare operands.
+    result = re.sub(r'\$dontcare\w*', '#0', result)
 
     return result
 
