@@ -173,9 +173,12 @@ package_one() {
         return 0
     fi
 
-    # Skip if already packaged (unless --compile).
+    # Skip if already packaged (unless --compile or .o is newer than xclbin).
     if ! $FORCE_COMPILE && [[ -f "${batch_dir}/aie.xclbin" ]] && [[ -f "${batch_dir}/insts.bin" ]]; then
-        return 0
+        if [[ ! "$o_path" -nt "${batch_dir}/aie.xclbin" ]]; then
+            return 0
+        fi
+        echo "  STALE batch_${batch_idx}: .o newer than xclbin, repackaging"
     fi
 
     mkdir -p "$batch_dir"
