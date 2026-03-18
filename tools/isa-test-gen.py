@@ -1166,10 +1166,138 @@ class StoreStrategy(TestStrategy):
 
 
 # ---------------------------------------------------------------------------
+# BranchStrategy: tests branch instructions with marker-based verification
+# ---------------------------------------------------------------------------
+
+class BranchStrategy(TestStrategy):
+    """Tests branch instructions using marker-based verification.
+
+    Stores marker values to the output buffer to verify which path executed.
+    Conditional branches get two test points: taken and not-taken.
+    """
+
+    _TESTABLE = frozenset({"j", "jl", "jnz", "jz"})
+    _DEFERRED = frozenset({"ret", "jnzd"})
+
+    _label_counter = 0
+
+    @classmethod
+    def _next_label_id(cls) -> int:
+        cls._label_counter += 1
+        return cls._label_counter
+
+    @classmethod
+    def reset_labels(cls):
+        """Reset label counter (call at start of each batch)."""
+        cls._label_counter = 0
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        mnemonic = instr.get("mnemonic", "")
+        if mnemonic in self._DEFERRED:
+            return (False, f"deferred branch: {mnemonic}")
+        if mnemonic not in self._TESTABLE:
+            return (False, "not a branch instruction")
+
+        # Reject register-indirect branches (j $mPm, jl $mPm).
+        operands = instr.get("operands", [])
+        has_pointer = any(
+            op.get("register_kind") == "pointer"
+            for op in operands
+            if op.get("operand_type") in REGISTER_LIKE_TYPES
+        )
+        if has_pointer:
+            return (False, "register-indirect branch (deferred)")
+
+        return (True, "")
+
+    def _is_conditional(self, instr: dict) -> bool:
+        return instr.get("mnemonic", "") in ("jnz", "jz")
+
+    def compute_input_size(self, instr, regs):
+        return 4 if self._is_conditional(instr) else 0
+
+    def compute_output_size(self, instr):
+        return 8  # 4-byte "before" marker + 4-byte "path" marker
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        """Conditional branches get 2 combos, unconditional get 1."""
+        base_combo = {}
+        for op in instr.get("operands", []):
+            op_name = op["name"]
+            if op_name == "cpmaddr" or op_name.startswith("cpmaddr"):
+                base_combo[op_name] = "0"  # placeholder, overridden
+            elif op.get("operand_type") in REGISTER_LIKE_TYPES:
+                kind = op.get("register_kind", "")
+                bw = op.get("bit_width", 0)
+                names = register_names(kind, bw,
+                                       operand_type=op.get("operand_type", ""),
+                                       instr_name=instr.get("name", ""))
+                base_combo[op_name] = names[0] if names else "r0"
+            else:
+                base_combo[op_name] = "0"
+
+        if not self._is_conditional(instr):
+            return [base_combo]
+
+        # Two combos: nonzero + zero condition.
+        return [dict(base_combo), dict(base_combo)]
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset):
+        lines = []
+        name = instr["name"]
+        mnemonic = instr.get("mnemonic", "")
+        lid = self._next_label_id()
+        lines.append(f"  // ---- test (branch): {name} ----")
+
+        BRANCH_DELAY = 5
+
+        # For conditional branches, load the condition value from input.
+        if self._is_conditional(instr):
+            in_offset = _align(in_offset, 4)
+            lines.extend(_scalar_load("r0", "p0", in_offset))
+            lines.extend(_nop_sled(LOAD_LATENCY))
+
+        # Store "before" marker (0xAA = 170).
+        out_offset = _align(out_offset, 4)
+        lines.append(f"  mov r14, #170")
+        lines.extend(_scalar_store("r14", "p1", out_offset))
+
+        # The branch instruction with label target.
+        if mnemonic == "j":
+            lines.append(f"  j .Ltaken_{lid}")
+        elif mnemonic == "jl":
+            lines.append(f"  jl .Ltaken_{lid}")
+        elif mnemonic == "jnz":
+            lines.append(f"  jnz r0, .Ltaken_{lid}")
+        elif mnemonic == "jz":
+            lines.append(f"  jz r0, .Ltaken_{lid}")
+
+        # Branch delay slots.
+        lines.extend(_nop_sled(BRANCH_DELAY))
+
+        # Fall-through path (branch NOT taken).
+        lines.append(f"  mov r14, #187")  # 0xBB
+        lines.extend(_scalar_store("r14", "p1", out_offset + 4))
+        lines.append(f"  j .Ldone_{lid}")
+        lines.extend(_nop_sled(BRANCH_DELAY))
+
+        # Taken path.
+        lines.append(f".Ltaken_{lid}:")
+        lines.append(f"  mov r14, #204")  # 0xCC
+        lines.extend(_scalar_store("r14", "p1", out_offset + 4))
+
+        # Convergence point.
+        lines.append(f".Ldone_{lid}:")
+        lines.append("")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Strategy Dispatch
 # ---------------------------------------------------------------------------
 
 STRATEGIES: list[TestStrategy] = [
+    BranchStrategy(),
     LoadStrategy(),
     StoreStrategy(),
     ComputeStrategy(),
@@ -1341,6 +1469,9 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
             end = i + 1
 
         batch_specs = measured_specs[i:end]
+
+        # Reset branch labels per batch to avoid cross-file collisions.
+        BranchStrategy.reset_labels()
 
         # Second pass: regenerate assembly with correct per-batch offsets.
         batch_in_offset = 0

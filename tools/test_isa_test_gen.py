@@ -1012,6 +1012,120 @@ class TestStoreStrategy:
 
 
 # ===================================================================
+# BranchStrategy tests
+# ===================================================================
+
+class TestBranchStrategy:
+    """Tests for BranchStrategy."""
+
+    def setup_method(self):
+        """Reset label counter before each test."""
+        isa_test_gen.BranchStrategy.reset_labels()
+
+    def test_jnz_can_test(self):
+        instr = _make_instr("JNZ", "jnz", "jnz\t$mRx, $cpmaddr", [
+            _make_reg_op("mRx", "scalar"),
+            _make_imm_op("cpmaddr", bit_width=20, signed=False),
+        ], slot="lng")
+        strategy = isa_test_gen.BranchStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_jz_can_test(self):
+        instr = _make_instr("JZ", "jz", "jz\t$mRx, $cpmaddr", [
+            _make_reg_op("mRx", "scalar"),
+            _make_imm_op("cpmaddr", bit_width=20, signed=False),
+        ], slot="lng")
+        strategy = isa_test_gen.BranchStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_j_immediate_can_test(self):
+        instr = _make_instr("J", "j", "j\t$cpmaddr", [
+            _make_imm_op("cpmaddr", bit_width=20, signed=False),
+        ], slot="lng")
+        strategy = isa_test_gen.BranchStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_j_register_indirect_deferred(self):
+        """Register-indirect j $mPm should be deferred (needs pointer setup)."""
+        instr = _make_instr("J_IND", "j", "j\t$mPm", [
+            _make_reg_op("mPm", "pointer"),
+        ], slot="alu")
+        strategy = isa_test_gen.BranchStrategy()
+        can, reason = strategy.can_test(instr)
+        assert not can
+
+    def test_ret_deferred(self):
+        instr = _make_instr("RET", "ret", "ret lr", [], slot="alu")
+        strategy = isa_test_gen.BranchStrategy()
+        can, reason = strategy.can_test(instr)
+        assert not can
+
+    def test_jnzd_deferred(self):
+        instr = _make_instr("JNZD", "jnzd", "jnzd\t$mRx, $mRx0, $mPm", [
+            _make_reg_op("mRx", "scalar"),
+            _make_reg_op("mRx0", "scalar"),
+            _make_reg_op("mPm", "pointer"),
+        ], slot="alu")
+        strategy = isa_test_gen.BranchStrategy()
+        can, reason = strategy.can_test(instr)
+        assert not can
+
+    def test_jnz_generates_markers(self):
+        instr = _make_instr("JNZ", "jnz", "jnz\t$mRx, $cpmaddr", [
+            _make_reg_op("mRx", "scalar"),
+            _make_imm_op("cpmaddr", bit_width=20, signed=False),
+        ], slot="lng")
+        strategy = isa_test_gen.BranchStrategy()
+        regs = {"mRx": "r0", "cpmaddr": "0"}
+        asm = strategy.generate_test_point(instr, regs,
+                                           in_offset=0, out_offset=0)
+        assert ".Ltaken_" in asm
+        assert ".Ldone_" in asm
+        assert "jnz" in asm
+        # Should store markers
+        assert "#170" in asm  # 0xAA
+
+    def test_labels_are_unique(self):
+        instr = _make_instr("JNZ", "jnz", "jnz\t$mRx, $cpmaddr", [
+            _make_reg_op("mRx", "scalar"),
+            _make_imm_op("cpmaddr", bit_width=20, signed=False),
+        ], slot="lng")
+        strategy = isa_test_gen.BranchStrategy()
+        regs = {"mRx": "r0", "cpmaddr": "0"}
+        asm1 = strategy.generate_test_point(instr, regs,
+                                            in_offset=0, out_offset=0)
+        asm2 = strategy.generate_test_point(instr, regs,
+                                            in_offset=32, out_offset=32)
+        import re as _re
+        labels1 = set(_re.findall(r'\.L\w+_(\d+)', asm1))
+        labels2 = set(_re.findall(r'\.L\w+_(\d+)', asm2))
+        assert labels1.isdisjoint(labels2), \
+            f"Labels must be unique: {labels1} vs {labels2}"
+
+    def test_conditional_combos(self):
+        """Conditional branches should produce 2 combos (taken + not-taken)."""
+        instr = _make_instr("JNZ", "jnz", "jnz\t$mRx, $cpmaddr", [
+            _make_reg_op("mRx", "scalar"),
+            _make_imm_op("cpmaddr", bit_width=20, signed=False),
+        ], slot="lng")
+        strategy = isa_test_gen.BranchStrategy()
+        combos = strategy.generate_combos(instr)
+        assert len(combos) == 2
+
+    def test_unconditional_combos(self):
+        """Unconditional j should produce 1 combo."""
+        instr = _make_instr("J", "j", "j\t$cpmaddr", [
+            _make_imm_op("cpmaddr", bit_width=20, signed=False),
+        ], slot="lng")
+        strategy = isa_test_gen.BranchStrategy()
+        combos = strategy.generate_combos(instr)
+        assert len(combos) == 1
+
+
+# ===================================================================
 # Task 4: generate_all integration tests
 # ===================================================================
 
