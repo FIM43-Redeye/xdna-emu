@@ -730,6 +730,19 @@ def _has_modifier_operand(instr: dict) -> bool:
     )
 
 
+def _is_postmodify_immediate(asm_string: str, op_name: str) -> bool:
+    """Check if an immediate operand is a post-modify update amount.
+
+    Post-modify:  lda r0, [ptr], $imm   -- ], $imm  (update after access)
+    Basic offset: lda r0, [ptr, $imm]   -- , $imm]  (offset within brackets)
+
+    Post-modify immediates must NOT be zeroed -- they are the pointer
+    update amount, not an address offset.
+    """
+    # Pattern: closing bracket followed by the operand reference.
+    return f"], ${op_name}" in asm_string
+
+
 def _normalize_mnemonic(asm_string: str, has_modifier: bool) -> str:
     """Strip internal mnemonic suffixes that llvm-mc doesn't accept.
 
@@ -1117,15 +1130,20 @@ class LoadStrategy(TestStrategy):
         lines.extend(_nop_sled(2))
 
         # Execute: the load instruction itself.
-        # Override pointer operand to use p6, zero immediate offsets.
+        # Override pointer operand to use p6.
+        # Zero address-offset immediates (data is already at p6).
+        # Preserve post-modify immediates (they update the pointer, not
+        # the address -- zeroing them makes the test degenerate).
+        asm_string = instr["asm_string"]
         load_regs = dict(regs)
         for op_name, op in op_by_name.items():
             if op.get("register_kind") == "pointer":
                 load_regs[op_name] = "p6"
-            # NOTE: Zero all immediate offsets. Data is already at p6.
-            # Future enhancement: vary offsets and adjust p6 accordingly.
             if op.get("operand_type") == "immediate":
-                load_regs[op_name] = "0"
+                if _is_postmodify_immediate(asm_string, op_name):
+                    pass  # Keep combo-specified value.
+                else:
+                    load_regs[op_name] = "0"
 
         asm_line = "  " + _substitute_asm(instr["asm_string"], load_regs,
                                           has_modifier=_has_modifier_operand(instr))
@@ -1292,13 +1310,19 @@ class StoreStrategy(TestStrategy):
                 lines.append(f"  mov {dj_reg}, #0")
 
         # Execute: the store instruction.
-        # Override pointer to p7, zero immediate offsets.
+        # Override pointer to p7.
+        # Zero address-offset immediates (data is at p7).
+        # Preserve post-modify immediates (pointer update amount).
+        asm_string = instr["asm_string"]
         store_regs = dict(regs)
         for op_name, op in op_by_name.items():
             if op.get("register_kind") == "pointer":
                 store_regs[op_name] = "p7"
             if op.get("operand_type") == "immediate":
-                store_regs[op_name] = "0"
+                if _is_postmodify_immediate(asm_string, op_name):
+                    pass  # Keep combo-specified value.
+                else:
+                    store_regs[op_name] = "0"
 
         asm_line = "  " + _substitute_asm(instr["asm_string"], store_regs,
                                           has_modifier=_has_modifier_operand(instr))

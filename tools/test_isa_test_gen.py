@@ -773,6 +773,22 @@ class TestGenerateOperandCombos:
 # ComputeStrategy tests
 # ===================================================================
 
+class TestPostModifyDetection:
+    """Tests for _is_postmodify_immediate."""
+
+    def test_postmodify_detected(self):
+        assert isa_test_gen._is_postmodify_immediate(
+            "lda.u8\t$mRa, [$ptr], $imm", "imm")
+
+    def test_offset_not_postmodify(self):
+        assert not isa_test_gen._is_postmodify_immediate(
+            "lda.s16\t$mRa, [$ptr, $imm]", "imm")
+
+    def test_no_match_different_name(self):
+        assert not isa_test_gen._is_postmodify_immediate(
+            "lda.u8\t$mRa, [$ptr], $imm", "off")
+
+
 class TestComputeStrategy:
     """Tests for ComputeStrategy (refactored from existing logic)."""
 
@@ -902,6 +918,38 @@ class TestLoadStrategy:
         assert "vlda.128" in asm
         assert "vst" in asm
 
+    def test_postmodify_preserves_immediate(self):
+        """Post-modify load must preserve the combo-specified immediate."""
+        instr = _make_instr("LDA_U8_ag_pstm_nrm_imm", "lda.u8",
+                            "lda.u8\t$mRa, [$ptr], $imm", [
+            _make_reg_op("mRa", "scalar"),
+            _make_reg_op("ptr", "pointer", bit_width=3),
+            _make_imm_op("imm", bit_width=6, signed=True),
+        ], may_load=True, slot="lda", sched_class="II_LDA")
+        strategy = isa_test_gen.LoadStrategy()
+        regs = {"mRa": "r0", "ptr": "p2", "imm": "-8"}
+        asm = strategy.generate_test_point(instr, regs,
+                                           in_offset=0, out_offset=0)
+        # Post-modify immediate should NOT be zeroed.
+        assert "], #-8" in asm or "], -8" in asm, \
+            f"Post-modify immediate should be preserved, got:\n{asm}"
+
+    def test_offset_immediate_zeroed(self):
+        """Basic address offset immediate should be zeroed."""
+        instr = _make_instr("LDA_S16", "lda.s16",
+                            "lda.s16\t$mRa, [$ptr, $imm]", [
+            _make_reg_op("mRa", "scalar"),
+            _make_reg_op("ptr", "pointer", bit_width=3),
+            _make_imm_op("imm", bit_width=6, signed=True),
+        ], may_load=True, slot="lda", sched_class="II_LDA")
+        strategy = isa_test_gen.LoadStrategy()
+        regs = {"mRa": "r0", "ptr": "p2", "imm": "-8"}
+        asm = strategy.generate_test_point(instr, regs,
+                                           in_offset=0, out_offset=0)
+        # Address offset immediate SHOULD be zeroed.
+        assert ", #0]" in asm or ", 0]" in asm, \
+            f"Address offset immediate should be zeroed, got:\n{asm}"
+
 
 # ===================================================================
 # StoreStrategy tests
@@ -970,6 +1018,21 @@ class TestStoreStrategy:
                                            in_offset=0, out_offset=0)
         assert "vlda" in asm
         assert "vst.128" in asm
+
+    def test_postmodify_preserves_immediate(self):
+        """Post-modify store must preserve the combo-specified immediate."""
+        instr = _make_instr("ST_S16_ag_pstm_nrm_imm", "st.s16",
+                            "st.s16\t$mRv, [$ptr], $imm", [
+            _make_reg_op("mRv", "scalar"),
+            _make_reg_op("ptr", "pointer", bit_width=3),
+            _make_imm_op("imm", bit_width=6, signed=True),
+        ], may_store=True, slot="st", sched_class="II_ST")
+        strategy = isa_test_gen.StoreStrategy()
+        regs = {"mRv": "r0", "ptr": "p7", "imm": "-4"}
+        asm = strategy.generate_test_point(instr, regs,
+                                           in_offset=0, out_offset=0)
+        assert "], #-4" in asm or "], -4" in asm, \
+            f"Post-modify immediate should be preserved, got:\n{asm}"
 
     def test_store_width_s8(self):
         instr = _make_instr("ST_S8", "st.s8",
