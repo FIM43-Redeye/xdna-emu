@@ -1577,14 +1577,17 @@ def main():
         testable_count = 0
         skipped_count = 0
         skip_reasons: dict[str, int] = {}
-        testable_instrs: list[dict] = []
+        strategy_counts: dict[str, int] = {}
+        testable_instrs: list[tuple[dict, str]] = []
 
         for slot, instrs in isa_data.items():
             for instr in instrs:
                 strategy, reason = classify_with_strategies(instr)
                 if strategy is not None:
                     testable_count += 1
-                    testable_instrs.append(instr)
+                    sname = type(strategy).__name__
+                    strategy_counts[sname] = strategy_counts.get(sname, 0) + 1
+                    testable_instrs.append((instr, sname))
                 else:
                     skipped_count += 1
                     skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
@@ -1593,15 +1596,19 @@ def main():
         print(f"Skipped:  {skipped_count}")
         print(f"Total:    {testable_count + skipped_count}")
         print()
+        print("Strategy breakdown:")
+        for sname, count in sorted(strategy_counts.items()):
+            print(f"  {sname}: {count}")
+        print()
         print("Skip reasons:")
         for reason, count in sorted(skip_reasons.items(), key=lambda x: -x[1]):
             print(f"  {reason}: {count}")
         print()
         print("Testable instructions:")
-        for instr in testable_instrs:
+        for instr, sname in testable_instrs:
             outputs = detect_output_operands(instr)
             out_names = [o["name"] for o in outputs]
-            print(f"  {instr['name']:40s} [{instr['slot']:4s}] outputs={out_names}")
+            print(f"  {instr['name']:40s} [{instr['slot']:4s}] {sname:20s} outputs={out_names}")
         return
 
     manifest = generate_all(args.isa_json, args.out_dir)
