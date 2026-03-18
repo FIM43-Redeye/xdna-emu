@@ -412,10 +412,11 @@ class TestRegisterNames:
         assert any(n.startswith("bmh") for n in names)
 
     def test_scalar_bw2_returns_shift(self):
-        """Scalar with 2-bit encoding -> s0-s3 shift registers."""
+        """Scalar with 2-bit encoding -> s0-s2 shift registers (s3 reserved)."""
         names = register_names("scalar", bit_width=2)
         assert all(n.startswith("s") for n in names)
-        assert len(names) == 4
+        assert len(names) == 3
+        assert "s3" not in names
 
     def test_scalar_bw5_returns_general(self):
         """Scalar with 5-bit encoding -> general r0-r31."""

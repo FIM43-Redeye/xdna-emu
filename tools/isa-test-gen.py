@@ -343,7 +343,9 @@ def register_names(kind: str, bit_width: int = 0,
             return ["r17", "r18", "r19", "r20", "r21", "r22", "r23"]
         if bit_width == 2:
             # Shift registers (mSm/mSs class).
-            return ["s0", "s1", "s2", "s3"]
+            # s3 is reserved for UPS/SRS infrastructure (accumulator
+            # load/store uses it as the shift amount).
+            return ["s0", "s1", "s2"]
         # General purpose scalars (eR class).
         return ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r15"]
 
@@ -517,24 +519,65 @@ def _load_instruction(reg_name: str, kind: str, ptr: str, offset: int) -> list[s
             + _vector_load(f"wh{idx}", ptr, offset + 32)
         )
     if kind == "accumulator":
-        # Load input data for accumulator registers.  Strategy depends on
-        # the register subclass:
-        #   cm0  (1024-bit) -> load wl0 as a 256-bit proxy
-        #   bml0 (512-bit)  -> load wl0 as a 256-bit proxy
-        #   bmh0 (512-bit)  -> load wl0 as a 256-bit proxy
-        #   amll0 (256-bit) -> load wl0 directly
+        # Load data INTO the accumulator register file using UPS.
+        # The vector and accumulator register files are separate in AIE2.
+        # Simply loading wl{idx} does NOT populate the accumulator -- we must
+        # use vups.s32.s16 to convert 16-bit vector elements into 32-bit
+        # accumulator elements.
+        #
+        # Round-trip: vlda -> vups -> [instruction] -> vsrs -> vst
+        # UPS with s0=0 zero-extends 16->32 bit, SRS with s0=0 truncates
+        # 32->16 bit.  Lossless when values fit in 16 bits (they do, since
+        # we loaded 16-bit data from the input buffer).
+        #
+        # s0 must be initialized to 0 before vups (shift amount).
+        init_s3 = ["  mov r14, #0", "  mov s3, r14"]
         if reg_name.startswith("cm"):
+            # cm0 = {bml0, bmh0} -- load both halves via UPS.
             idx = reg_name[2:]
+            return (
+                [f"  // load accumulator {reg_name}: vlda + vups both halves"]
+                + init_s3
+                + _vector_load(f"wl{idx}", ptr, offset)
+                + _vector_load(f"wh{idx}", ptr, offset + 32)
+                + _nop_sled(LOAD_LATENCY)
+                + [f"  vups.s32.s16 bml{idx}, wl{idx}, s3",
+                   f"  vups.s32.s16 bmh{idx}, wh{idx}, s3"]
+            )
         elif reg_name.startswith("bml") or reg_name.startswith("bmh"):
             idx = reg_name[3:]
+            return (
+                [f"  // load accumulator {reg_name}: vlda + vups"]
+                + init_s3
+                + _vector_load(f"wl{idx}", ptr, offset)
+                + _nop_sled(LOAD_LATENCY)
+                + [f"  vups.s32.s16 {reg_name}, wl{idx}, s3"]
+            )
         elif reg_name.startswith("am"):
-            # amll0, amlh0, amhl0, amhh0 -> index is last char
+            # am quarters (amll, amlh, amhl, amhh) can't be UPS'd directly.
+            # Load the parent half-accumulator instead:
+            #   amll/amlh -> bml,  amhl/amhh -> bmh
             idx = reg_name[-1]
+            if reg_name.startswith("amh"):
+                parent = f"bmh{idx}"
+            else:
+                parent = f"bml{idx}"
+            return (
+                [f"  // load accumulator {reg_name}: vlda + vups via {parent}"]
+                + init_s3
+                + _vector_load(f"wl{idx}", ptr, offset)
+                + _nop_sled(LOAD_LATENCY)
+                + [f"  vups.s32.s16 {parent}, wl{idx}, s3"]
+            )
         else:
             idx = "0"
-        return [
-            f"  // load accumulator {reg_name}: load wl{idx} as proxy",
-        ] + _vector_load(f"wl{idx}", ptr, offset)
+            return (
+                [f"  // load accumulator {reg_name}: vlda + vups"]
+                + init_s3
+                + _vector_load(f"wl{idx}", ptr, offset)
+                + _nop_sled(LOAD_LATENCY)
+                + [f"  vups.s32.s16 bml{idx}, wl{idx}, s3"]
+            )
     if kind == "control":
         return _scalar_load(reg_name, ptr, offset)
     if kind in ("modifier_m", "modifier_dj"):
@@ -601,26 +644,53 @@ def _store_instruction(reg_name: str, kind: str, ptr: str, offset: int) -> list[
     if kind == "accumulator":
         # Use vsrs to shift down to vector256, then store.
         # vsrs needs a 512-bit accumulator half (bml/bmh), not the 1024-bit cm.
-        # The shift operand is s0 (shift register), not a general scalar.
+        # s0 must be initialized to 0 (shift amount) before use.
+        init_s3 = ["  mov r14, #0", "  mov s3, r14"]
         if reg_name.startswith("cm"):
-            # cm0 = {bml0, bmh0}.  Store the low half via bml.
+            # cm0 = {bml0, bmh0}.  Store BOTH halves via SRS.
             idx = reg_name[2:]
-            srs_src = f"bml{idx}"
+            return (
+                [f"  // store accumulator {reg_name}: srs both halves"]
+                + init_s3
+                + [f"  vsrs.s16.s32 wl{idx}, bml{idx}, s3"]
+                + _nop_sled(4)
+                + _vector_store(f"wl{idx}", ptr, offset)
+                + [f"  vsrs.s16.s32 wh{idx}, bmh{idx}, s3"]
+                + _nop_sled(4)
+                + _vector_store(f"wh{idx}", ptr, offset + 32)
+            )
         elif reg_name.startswith("bml") or reg_name.startswith("bmh"):
-            # Already a 512-bit half -- use directly.
             idx = reg_name[3:]
-            srs_src = reg_name
+            return (
+                [f"  // store accumulator {reg_name}: srs to wl{idx} then vst"]
+                + init_s3
+                + [f"  vsrs.s16.s32 wl{idx}, {reg_name}, s3"]
+                + _nop_sled(4)
+                + _vector_store(f"wl{idx}", ptr, offset)
+            )
         elif reg_name.startswith("am"):
-            # 256-bit quarter -- vsrs from the quarter register.
+            # am quarters can't be SRS'd directly -- use parent half.
             idx = reg_name[-1]
-            srs_src = reg_name
+            if reg_name.startswith("amh"):
+                parent = f"bmh{idx}"
+            else:
+                parent = f"bml{idx}"
+            return (
+                [f"  // store accumulator {reg_name}: srs via {parent}"]
+                + init_s3
+                + [f"  vsrs.s16.s32 wl{idx}, {parent}, s3"]
+                + _nop_sled(4)
+                + _vector_store(f"wl{idx}", ptr, offset)
+            )
         else:
             idx = "0"
-            srs_src = f"bml{idx}"
-        return [
-            f"  // store accumulator {reg_name}: srs {srs_src} to wl{idx} then vst",
-            f"  vsrs.s16.s32 wl{idx}, {srs_src}, s0",
-        ] + _nop_sled(4) + _vector_store(f"wl{idx}", ptr, offset)  # VSRS latency = 4
+            return (
+                [f"  // store accumulator {reg_name}: srs bml{idx} then vst"]
+                + init_s3
+                + [f"  vsrs.s16.s32 wl{idx}, bml{idx}, s3"]
+                + _nop_sled(4)
+                + _vector_store(f"wl{idx}", ptr, offset)
+            )
     if kind == "control":
         return _scalar_store(reg_name, ptr, offset)
     if kind in ("modifier_m", "modifier_dj"):
