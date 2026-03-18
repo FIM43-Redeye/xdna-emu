@@ -148,7 +148,7 @@ def prepare_phase_objects(
     for col, batch in enumerate(batches):
         # Source: batch_NNN.o in the shared object directory.
         src = os.path.join(
-            obj_dir, f"batch_{batch['batch_index']:03d}.o"
+            obj_dir, f"batch_{batch['batch_index']}.o"
         )
         # Destination: named to match the link_with attribute in the MLIR.
         o_name = _obj_filename(batch)

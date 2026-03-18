@@ -253,7 +253,7 @@ class TestPreparePhaseObjects:
         result, m_copy, _ = self._run(batches, "/phase/0", "/objs")
         assert m_copy.call_count == 1
         src, dst = m_copy.call_args[0]
-        assert src == "/objs/batch_000.o"
+        assert src == "/objs/batch_0.o"
         assert dst == "/phase/0/batch_000.o"
 
     def test_single_batch_redefine_sym(self):
@@ -306,8 +306,8 @@ class TestPreparePhaseObjects:
         batches = [_batch_indexed(3), _batch_indexed(9)]
         _, m_copy, _ = self._run(batches, "/p", "/objs")
         srcs = [m_copy.call_args_list[i][0][0] for i in range(2)]
-        assert srcs[0] == "/objs/batch_003.o"
-        assert srcs[1] == "/objs/batch_009.o"
+        assert srcs[0] == "/objs/batch_3.o"
+        assert srcs[1] == "/objs/batch_9.o"
 
     def test_dst_path_inside_phase_dir(self):
         """Destination files land in phase_dir, not obj_dir."""

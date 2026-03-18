@@ -18,6 +18,7 @@
 #   -j N             Parallelism for compile + EMU (default: nproc)
 #   --generate-only  Only run the generator, skip compile/run
 #   --filter PAT     Only run batches matching PAT (grep -E on batch filename)
+#   --multi-tile     Group batches into phases of 4 tiles (one per NPU column)
 
 set -euo pipefail
 
@@ -41,6 +42,7 @@ FORCE_COMPILE=false
 JOBS=$(nproc)
 GENERATE_ONLY=false
 FILTER=""
+MULTI_TILE=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -51,6 +53,7 @@ while [[ $# -gt 0 ]]; do
         -j)              JOBS="$2"; shift 2 ;;
         --generate-only) GENERATE_ONLY=true; shift ;;
         --filter)        FILTER="$2"; shift 2 ;;
+        --multi-tile)    MULTI_TILE=true; shift ;;
         *)               echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -62,6 +65,9 @@ echo "=== ISA-Level Validation Harness ==="
 echo "ISA JSON: $ISA_JSON"
 echo "Out dir:  $OUT_DIR"
 echo "Results:  $RESULTS_DIR"
+if $MULTI_TILE; then
+    echo "Mode:     multi-tile (4 tiles per phase)"
+fi
 echo ""
 
 # ---- Phase 1: Generate ----
@@ -151,7 +157,6 @@ echo "$BATCH_INFO" | awk '{print $1, $2}' | \
 echo ""
 
 # ---- Phase 3: Link + Package ----
-echo "--- Phase 3: Link + Package (aiecc.py) ---"
 
 # Generate shared test_host.cpp from instr-test-gen.py.
 HOST_CPP="${OUT_DIR}/test_host.cpp"
@@ -178,150 +183,397 @@ if $FORCE_COMPILE || [[ ! -f "$HOST_BIN" ]] || [[ "$HOST_CPP" -nt "$HOST_BIN" ]]
         -lrt -lstdc++
 fi
 
-package_one() {
-    local batch_idx="$1"
-    local filename="$2"
-    local in_size="$3"
-    local out_size="$4"
-    local batch_dir="${OUT_DIR}/batch_${batch_idx}"
-    local o_path="${OUT_DIR}/batch_${batch_idx}.o"
+if $MULTI_TILE; then
+    # ---- Multi-tile mode: group batches into phases of 4 ----
 
-    if [[ ! -f "$o_path" ]]; then
-        echo "  SKIP batch_${batch_idx}: assembly failed"
-        return 0
+    # Compute phase assignments from BATCH_INFO.
+    PHASE_INFO=""
+    phase_idx=0
+    batch_indices=""
+    count=0
+    while IFS=' ' read -r idx filename in_size out_size; do
+        # Check that the .o exists before including in a phase.
+        if [[ ! -f "${OUT_DIR}/batch_${idx}.o" ]]; then
+            echo "  SKIP batch_${idx}: assembly failed (not included in phase)"
+            continue
+        fi
+        if [[ $count -ge 4 ]]; then
+            PHASE_INFO="${PHASE_INFO}${phase_idx} ${batch_indices%,}\n"
+            phase_idx=$((phase_idx + 1))
+            batch_indices=""
+            count=0
+        fi
+        batch_indices="${batch_indices}${idx},"
+        count=$((count + 1))
+    done <<< "$BATCH_INFO"
+    # Flush remaining batches.
+    if [[ $count -gt 0 ]]; then
+        PHASE_INFO="${PHASE_INFO}${phase_idx} ${batch_indices%,}\n"
     fi
 
-    # Skip if already packaged (unless --compile or .o is newer than xclbin).
-    if ! $FORCE_COMPILE && [[ -f "${batch_dir}/aie.xclbin" ]] && [[ -f "${batch_dir}/insts.bin" ]]; then
-        if [[ ! "$o_path" -nt "${batch_dir}/aie.xclbin" ]]; then
+    TOTAL_PHASES=$(printf '%b' "$PHASE_INFO" | grep -c . || echo 0)
+    echo "--- Phase 3: Package (multi-tile, $TOTAL_PHASES phases) ---"
+
+    package_phase() {
+        local pidx="$1"
+        local batch_list="$2"
+        local phase_dir="${OUT_DIR}/phase_${pidx}"
+
+        # Skip if already packaged (unless --compile).
+        if ! $FORCE_COMPILE && [[ -f "${phase_dir}/aie.xclbin" ]] && [[ -f "${phase_dir}/insts.bin" ]]; then
+            # Check if any .o is newer than the xclbin.
+            local stale=false
+            for bi in ${batch_list//,/ }; do
+                if [[ "${OUT_DIR}/batch_${bi}.o" -nt "${phase_dir}/aie.xclbin" ]]; then
+                    stale=true
+                    break
+                fi
+            done
+            if ! $stale; then
+                return 0
+            fi
+            echo "  STALE phase_${pidx}: .o newer than xclbin, repackaging"
+        fi
+
+        mkdir -p "$phase_dir"
+
+        # Use isa-multi-tile-gen.py to copy/rename .o files and generate MLIR.
+        python3 "${PROJECT_DIR}/tools/isa-multi-tile-gen.py" \
+            --manifest "$MANIFEST" \
+            --batches "$batch_list" \
+            --phase-idx "$pidx" \
+            --out-dir "$phase_dir" \
+            --obj-dir "$OUT_DIR" 2>"${phase_dir}/gen.log" || {
+                echo "  GEN FAIL: phase_${pidx} (see ${phase_dir}/gen.log)"
+                return 0
+            }
+
+        # Run aiecc.py (Peano mode, no Chess).
+        (cd "$phase_dir" && \
+            nice -n 19 aiecc.py --no-aiesim --no-xchesscc --no-xbridge \
+                --aie-generate-xclbin --xclbin-name=aie.xclbin \
+                --aie-generate-npu-insts --npu-insts-name=insts.bin \
+                aie.mlir 2>"${phase_dir}/aiecc.log") && \
+            echo "  PKG OK: phase_${pidx}" || \
+            echo "  PKG FAIL: phase_${pidx} (see ${phase_dir}/aiecc.log)"
+    }
+    export -f package_phase
+    export OUT_DIR FORCE_COMPILE MANIFEST PROJECT_DIR
+
+    printf '%b' "$PHASE_INFO" | while IFS=' ' read -r pidx batch_list; do
+        [[ -z "$pidx" ]] && continue
+        package_phase "$pidx" "$batch_list"
+    done
+    echo ""
+
+else
+    # ---- Single-tile mode (original behavior) ----
+    echo "--- Phase 3: Link + Package (aiecc.py) ---"
+
+    package_one() {
+        local batch_idx="$1"
+        local filename="$2"
+        local in_size="$3"
+        local out_size="$4"
+        local batch_dir="${OUT_DIR}/batch_${batch_idx}"
+        local o_path="${OUT_DIR}/batch_${batch_idx}.o"
+
+        if [[ ! -f "$o_path" ]]; then
+            echo "  SKIP batch_${batch_idx}: assembly failed"
             return 0
         fi
-        echo "  STALE batch_${batch_idx}: .o newer than xclbin, repackaging"
-    fi
 
-    mkdir -p "$batch_dir"
-    cp "$o_path" "${batch_dir}/kernel.o"
+        # Skip if already packaged (unless --compile or .o is newer than xclbin).
+        if ! $FORCE_COMPILE && [[ -f "${batch_dir}/aie.xclbin" ]] && [[ -f "${batch_dir}/insts.bin" ]]; then
+            if [[ ! "$o_path" -nt "${batch_dir}/aie.xclbin" ]]; then
+                return 0
+            fi
+            echo "  STALE batch_${batch_idx}: .o newer than xclbin, repackaging"
+        fi
 
-    # Generate aie.mlir for this batch's buffer sizes.
-    python3 -c "
+        mkdir -p "$batch_dir"
+        cp "$o_path" "${batch_dir}/kernel.o"
+
+        # Generate aie.mlir for this batch's buffer sizes.
+        python3 -c "
 import sys; sys.path.insert(0, '${PROJECT_DIR}/tools')
 import importlib
 gen = importlib.import_module('instr-test-gen')
 print(gen.generate_aie_mlir(${in_size}, ${out_size}))
 " > "${batch_dir}/aie.mlir"
 
-    # Run aiecc.py (Peano mode, no Chess).
-    (cd "$batch_dir" && \
-        nice -n 19 aiecc.py --no-aiesim --no-xchesscc --no-xbridge \
-            --aie-generate-xclbin --xclbin-name=aie.xclbin \
-            --aie-generate-npu-insts --npu-insts-name=insts.bin \
-            aie.mlir 2>"${batch_dir}/aiecc.log") && \
-        echo "  PKG OK: batch_${batch_idx}" || \
-        echo "  PKG FAIL: batch_${batch_idx} (see ${batch_dir}/aiecc.log)"
-}
-export -f package_one
-export HOST_BIN PROJECT_DIR
+        # Run aiecc.py (Peano mode, no Chess).
+        (cd "$batch_dir" && \
+            nice -n 19 aiecc.py --no-aiesim --no-xchesscc --no-xbridge \
+                --aie-generate-xclbin --xclbin-name=aie.xclbin \
+                --aie-generate-npu-insts --npu-insts-name=insts.bin \
+                aie.mlir 2>"${batch_dir}/aiecc.log") && \
+            echo "  PKG OK: batch_${batch_idx}" || \
+            echo "  PKG FAIL: batch_${batch_idx} (see ${batch_dir}/aiecc.log)"
+    }
+    export -f package_one
+    export HOST_BIN PROJECT_DIR
 
-echo "$BATCH_INFO" | while IFS=' ' read -r idx filename in_size out_size; do
-    package_one "$idx" "$filename" "$in_size" "$out_size"
-done
-echo ""
+    echo "$BATCH_INFO" | while IFS=' ' read -r idx filename in_size out_size; do
+        package_one "$idx" "$filename" "$in_size" "$out_size"
+    done
+    echo ""
+fi
 
 # ---- Phase 4: Run HW ----
 mkdir -p "$RESULTS_DIR"
 
-if $RUN_HW; then
-    echo "--- Phase 4: Run HW (serial) ---"
-    while IFS=' ' read -r idx filename in_size out_size; do
-        batch_dir="${OUT_DIR}/batch_${idx}"
-        hw_out="${RESULTS_DIR}/batch_${idx}_hw.bin"
+if $MULTI_TILE; then
+    # Multi-tile HW execution: one xclbin per phase, serial.
+    if $RUN_HW; then
+        echo "--- Phase 4: Run HW (multi-tile, serial) ---"
+        printf '%b' "$PHASE_INFO" | while IFS=' ' read -r pidx batch_list; do
+            [[ -z "$pidx" ]] && continue
+            phase_dir="${OUT_DIR}/phase_${pidx}"
+            [[ ! -f "${phase_dir}/aie.xclbin" ]] && {
+                echo "  SKIP phase_${pidx}: not packaged"
+                continue
+            }
 
-        if [[ ! -f "${batch_dir}/aie.xclbin" ]]; then
-            echo "  SKIP batch_${idx}: not packaged"
-            continue
-        fi
+            # Compute combined buffer sizes from manifest.
+            sizes=$(python3 -c "
+import json
+m = json.load(open('${MANIFEST}'))
+indices = [int(x) for x in '${batch_list}'.split(',')]
+by_idx = {b['batch_index']: b for b in m['batches']}
+total_in = sum(by_idx[i]['in_size'] for i in indices)
+total_out = sum(by_idx[i]['out_size'] for i in indices)
+print(total_in, total_out)
+")
+            in_size=$(echo "$sizes" | awk '{print $1}')
+            out_size=$(echo "$sizes" | awk '{print $2}')
 
-        "$HOST_BIN" \
-            -x "${batch_dir}/aie.xclbin" \
-            -k MLIR_AIE \
-            -i "${batch_dir}/insts.bin" \
-            --in-size "$in_size" --out-size "$out_size" \
-            --seed "$SEED" --out-file "$hw_out" 2>"${RESULTS_DIR}/batch_${idx}_hw.log" && \
-            echo "  HW OK: batch_${idx}" || \
-            echo "  HW FAIL: batch_${idx} (see ${RESULTS_DIR}/batch_${idx}_hw.log)"
-    done <<< "$BATCH_INFO"
-    echo ""
+            hw_out="${RESULTS_DIR}/phase_${pidx}_hw.bin"
+            "$HOST_BIN" \
+                -x "${phase_dir}/aie.xclbin" \
+                -k MLIR_AIE \
+                -i "${phase_dir}/insts.bin" \
+                --in-size "$in_size" --out-size "$out_size" \
+                --seed "$SEED" --out-file "$hw_out" 2>"${RESULTS_DIR}/phase_${pidx}_hw.log" && \
+                echo "  HW OK: phase_${pidx}" || \
+                echo "  HW FAIL: phase_${pidx} (see ${RESULTS_DIR}/phase_${pidx}_hw.log)"
+        done
+        echo ""
+    fi
+else
+    # Single-tile HW execution (original behavior).
+    if $RUN_HW; then
+        echo "--- Phase 4: Run HW (serial) ---"
+        while IFS=' ' read -r idx filename in_size out_size; do
+            batch_dir="${OUT_DIR}/batch_${idx}"
+            hw_out="${RESULTS_DIR}/batch_${idx}_hw.bin"
+
+            if [[ ! -f "${batch_dir}/aie.xclbin" ]]; then
+                echo "  SKIP batch_${idx}: not packaged"
+                continue
+            fi
+
+            "$HOST_BIN" \
+                -x "${batch_dir}/aie.xclbin" \
+                -k MLIR_AIE \
+                -i "${batch_dir}/insts.bin" \
+                --in-size "$in_size" --out-size "$out_size" \
+                --seed "$SEED" --out-file "$hw_out" 2>"${RESULTS_DIR}/batch_${idx}_hw.log" && \
+                echo "  HW OK: batch_${idx}" || \
+                echo "  HW FAIL: batch_${idx} (see ${RESULTS_DIR}/batch_${idx}_hw.log)"
+        done <<< "$BATCH_INFO"
+        echo ""
+    fi
 fi
 
 # ---- Phase 5: Run EMU ----
-if $RUN_EMU; then
-    echo "--- Phase 5: Run EMU (j=$JOBS) ---"
+if $MULTI_TILE; then
+    if $RUN_EMU; then
+        echo "--- Phase 5: Run EMU (multi-tile, j=$JOBS) ---"
 
-    run_emu_one() {
-        local idx="$1"
-        local in_size="$2"
-        local out_size="$3"
-        local batch_dir="${OUT_DIR}/batch_${idx}"
-        local emu_out="${RESULTS_DIR}/batch_${idx}_emu.bin"
+        run_emu_phase() {
+            local pidx="$1"
+            local batch_list="$2"
+            local in_size="$3"
+            local out_size="$4"
+            local phase_dir="${OUT_DIR}/phase_${pidx}"
+            local emu_out="${RESULTS_DIR}/phase_${pidx}_emu.bin"
 
-        if [[ ! -f "${batch_dir}/aie.xclbin" ]]; then
-            return 0
-        fi
+            if [[ ! -f "${phase_dir}/aie.xclbin" ]]; then
+                return 0
+            fi
 
-        XDNA_EMU="${XDNA_EMU:-debug}" "$HOST_BIN" \
-            -x "${batch_dir}/aie.xclbin" \
-            -k MLIR_AIE \
-            -i "${batch_dir}/insts.bin" \
-            --in-size "$in_size" --out-size "$out_size" \
-            --seed "$SEED" --out-file "$emu_out" 2>"${RESULTS_DIR}/batch_${idx}_emu.log" && \
-            echo "  EMU OK: batch_${idx}" || \
-            echo "  EMU FAIL: batch_${idx} (see ${RESULTS_DIR}/batch_${idx}_emu.log)"
-    }
-    export -f run_emu_one
-    export HOST_BIN OUT_DIR RESULTS_DIR SEED
+            XDNA_EMU="${XDNA_EMU:-debug}" "$HOST_BIN" \
+                -x "${phase_dir}/aie.xclbin" \
+                -k MLIR_AIE \
+                -i "${phase_dir}/insts.bin" \
+                --in-size "$in_size" --out-size "$out_size" \
+                --seed "$SEED" --out-file "$emu_out" 2>"${RESULTS_DIR}/phase_${pidx}_emu.log" && \
+                echo "  EMU OK: phase_${pidx}" || \
+                echo "  EMU FAIL: phase_${pidx} (see ${RESULTS_DIR}/phase_${pidx}_emu.log)"
+        }
+        export -f run_emu_phase
+        export HOST_BIN OUT_DIR RESULTS_DIR SEED MANIFEST
 
-    echo "$BATCH_INFO" | while IFS=' ' read -r idx filename in_size out_size; do
-        printf '%s\0%s\0%s\0' "$idx" "$in_size" "$out_size"
-    done | xargs -0 -n3 -P "$JOBS" bash -c 'run_emu_one "$1" "$2" "$3"' _
-    echo ""
+        # Build argument list: pidx batch_list in_size out_size (null-separated).
+        printf '%b' "$PHASE_INFO" | while IFS=' ' read -r pidx batch_list; do
+            [[ -z "$pidx" ]] && continue
+            sizes=$(python3 -c "
+import json
+m = json.load(open('${MANIFEST}'))
+indices = [int(x) for x in '${batch_list}'.split(',')]
+by_idx = {b['batch_index']: b for b in m['batches']}
+total_in = sum(by_idx[i]['in_size'] for i in indices)
+total_out = sum(by_idx[i]['out_size'] for i in indices)
+print(total_in, total_out)
+")
+            in_size=$(echo "$sizes" | awk '{print $1}')
+            out_size=$(echo "$sizes" | awk '{print $2}')
+            printf '%s\0%s\0%s\0%s\0' "$pidx" "$batch_list" "$in_size" "$out_size"
+        done | xargs -0 -n4 -P "$JOBS" bash -c 'run_emu_phase "$1" "$2" "$3" "$4"' _
+        echo ""
+    fi
+else
+    if $RUN_EMU; then
+        echo "--- Phase 5: Run EMU (j=$JOBS) ---"
+
+        run_emu_one() {
+            local idx="$1"
+            local in_size="$2"
+            local out_size="$3"
+            local batch_dir="${OUT_DIR}/batch_${idx}"
+            local emu_out="${RESULTS_DIR}/batch_${idx}_emu.bin"
+
+            if [[ ! -f "${batch_dir}/aie.xclbin" ]]; then
+                return 0
+            fi
+
+            XDNA_EMU="${XDNA_EMU:-debug}" "$HOST_BIN" \
+                -x "${batch_dir}/aie.xclbin" \
+                -k MLIR_AIE \
+                -i "${batch_dir}/insts.bin" \
+                --in-size "$in_size" --out-size "$out_size" \
+                --seed "$SEED" --out-file "$emu_out" 2>"${RESULTS_DIR}/batch_${idx}_emu.log" && \
+                echo "  EMU OK: batch_${idx}" || \
+                echo "  EMU FAIL: batch_${idx} (see ${RESULTS_DIR}/batch_${idx}_emu.log)"
+        }
+        export -f run_emu_one
+        export HOST_BIN OUT_DIR RESULTS_DIR SEED
+
+        echo "$BATCH_INFO" | while IFS=' ' read -r idx filename in_size out_size; do
+            printf '%s\0%s\0%s\0' "$idx" "$in_size" "$out_size"
+        done | xargs -0 -n3 -P "$JOBS" bash -c 'run_emu_one "$1" "$2" "$3"' _
+        echo ""
+    fi
 fi
 
 # ---- Phase 6: Compare ----
-if $RUN_HW && $RUN_EMU; then
-    echo "--- Phase 6: Compare ---"
-    PASS=0
-    FAIL=0
-    SKIP=0
-    FAIL_LIST=""
+if $MULTI_TILE; then
+    # Multi-tile: split combined phase outputs into per-batch files, then compare.
+    if $RUN_HW && $RUN_EMU; then
+        echo "--- Phase 6: Split + Compare ---"
 
-    while IFS=' ' read -r idx filename in_size out_size; do
-        hw_out="${RESULTS_DIR}/batch_${idx}_hw.bin"
-        emu_out="${RESULTS_DIR}/batch_${idx}_emu.bin"
+        # Split all phase outputs into per-batch files.
+        printf '%b' "$PHASE_INFO" | while IFS=' ' read -r pidx batch_list; do
+            [[ -z "$pidx" ]] && continue
+            python3 -c "
+import json, sys
+m = json.load(open('${MANIFEST}'))
+indices = [int(x) for x in '${batch_list}'.split(',')]
+by_idx = {b['batch_index']: b for b in m['batches']}
 
-        if [[ ! -f "$hw_out" ]] || [[ ! -f "$emu_out" ]]; then
-            SKIP=$((SKIP + 1))
-            continue
-        fi
+for mode in ['hw', 'emu']:
+    combined = '${RESULTS_DIR}/phase_${pidx}_' + mode + '.bin'
+    try:
+        data = open(combined, 'rb').read()
+    except FileNotFoundError:
+        continue
+    offset = 0
+    for idx in indices:
+        size = by_idx[idx]['out_size']
+        chunk = data[offset:offset + size]
+        out_path = f'${RESULTS_DIR}/batch_{idx}_' + mode + '.bin'
+        open(out_path, 'wb').write(chunk)
+        offset += size
+"
+        done
 
-        if cmp -s "$hw_out" "$emu_out"; then
-            PASS=$((PASS + 1))
-        else
-            FAIL=$((FAIL + 1))
-            FAIL_LIST="${FAIL_LIST}  DIVERGE: batch_${idx}\n"
-            echo "  DIVERGE: batch_${idx}"
-        fi
-    done <<< "$BATCH_INFO"
+        # Compare per-batch (same logic as single-tile).
+        PASS=0
+        FAIL=0
+        SKIP=0
+        FAIL_LIST=""
 
-    echo ""
-    echo "=== Results ==="
-    echo "PASS: $PASS"
-    echo "FAIL: $FAIL"
-    echo "SKIP: $SKIP"
-    if [[ $FAIL -gt 0 ]]; then
+        while IFS=' ' read -r idx filename in_size out_size; do
+            hw_out="${RESULTS_DIR}/batch_${idx}_hw.bin"
+            emu_out="${RESULTS_DIR}/batch_${idx}_emu.bin"
+
+            if [[ ! -f "$hw_out" ]] || [[ ! -f "$emu_out" ]]; then
+                SKIP=$((SKIP + 1))
+                continue
+            fi
+
+            if cmp -s "$hw_out" "$emu_out"; then
+                PASS=$((PASS + 1))
+            else
+                FAIL=$((FAIL + 1))
+                FAIL_LIST="${FAIL_LIST}  DIVERGE: batch_${idx}\n"
+                echo "  DIVERGE: batch_${idx}"
+            fi
+        done <<< "$BATCH_INFO"
+
         echo ""
-        echo "Divergences:"
-        printf '%b' "$FAIL_LIST"
+        echo "=== Results ==="
+        echo "PASS: $PASS"
+        echo "FAIL: $FAIL"
+        echo "SKIP: $SKIP"
+        echo "Phases: $TOTAL_PHASES"
+        if [[ $FAIL -gt 0 ]]; then
+            echo ""
+            echo "Divergences:"
+            printf '%b' "$FAIL_LIST"
+        fi
+    else
+        echo "=== Comparison skipped (need both HW and EMU) ==="
     fi
 else
-    echo "=== Comparison skipped (need both HW and EMU) ==="
+    # Single-tile comparison (original behavior).
+    if $RUN_HW && $RUN_EMU; then
+        echo "--- Phase 6: Compare ---"
+        PASS=0
+        FAIL=0
+        SKIP=0
+        FAIL_LIST=""
+
+        while IFS=' ' read -r idx filename in_size out_size; do
+            hw_out="${RESULTS_DIR}/batch_${idx}_hw.bin"
+            emu_out="${RESULTS_DIR}/batch_${idx}_emu.bin"
+
+            if [[ ! -f "$hw_out" ]] || [[ ! -f "$emu_out" ]]; then
+                SKIP=$((SKIP + 1))
+                continue
+            fi
+
+            if cmp -s "$hw_out" "$emu_out"; then
+                PASS=$((PASS + 1))
+            else
+                FAIL=$((FAIL + 1))
+                FAIL_LIST="${FAIL_LIST}  DIVERGE: batch_${idx}\n"
+                echo "  DIVERGE: batch_${idx}"
+            fi
+        done <<< "$BATCH_INFO"
+
+        echo ""
+        echo "=== Results ==="
+        echo "PASS: $PASS"
+        echo "FAIL: $FAIL"
+        echo "SKIP: $SKIP"
+        if [[ $FAIL -gt 0 ]]; then
+            echo ""
+            echo "Divergences:"
+            printf '%b' "$FAIL_LIST"
+        fi
+    else
+        echo "=== Comparison skipped (need both HW and EMU) ==="
+    fi
 fi
