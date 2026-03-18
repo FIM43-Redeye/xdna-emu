@@ -2708,8 +2708,8 @@ class TestConversionStrategy:
         )
         assert strategy.can_handle(instr)
 
-    def test_can_handle_pack(self):
-        """ConversionStrategy should handle vst.pack.* mnemonics."""
+    def test_cannot_handle_pack_yet(self):
+        """pack intrinsics not lowered by llc -- deferred to Chess path."""
         strategy = isa_test_gen.ConversionStrategy()
         instr = _make_instr(
             "VST_PACK_S8_S16_ag_idx", "vst.pack.s8.s16",
@@ -2719,10 +2719,10 @@ class TestConversionStrategy:
              _make_reg_op("src", "vector256")],
             may_store=True,
         )
-        assert strategy.can_handle(instr)
+        assert not strategy.can_handle(instr)
 
-    def test_can_handle_unpack(self):
-        """ConversionStrategy should handle vldb.unpack.* mnemonics."""
+    def test_cannot_handle_unpack_yet(self):
+        """unpack intrinsics not lowered by llc -- deferred to Chess path."""
         strategy = isa_test_gen.ConversionStrategy()
         instr = _make_instr(
             "VLDB_UNPACK_S16_S8_ag_idx", "vldb.unpack.s16.s8",
@@ -2732,7 +2732,7 @@ class TestConversionStrategy:
              _make_reg_op("idx", "scalar")],
             may_load=True,
         )
-        assert strategy.can_handle(instr)
+        assert not strategy.can_handle(instr)
 
     def test_does_not_handle_conv(self):
         """ConversionStrategy should NOT handle .conv. (bf16/fp32) mnemonics."""
@@ -2829,16 +2829,16 @@ class TestConversionStrategy:
             return json.load(f)
 
     def test_real_isa_conversion_count(self, isa_data):
-        """ConversionStrategy should handle all 136 conversion instruction defs."""
+        """ConversionStrategy handles UPS+SRS instruction defs (pack/unpack deferred)."""
         strategy = isa_test_gen.ConversionStrategy()
         count = 0
         for slot, instrs in isa_data.items():
             for instr in instrs:
                 if strategy.can_handle(instr):
                     count += 1
-        # 24 base mnemonics x various addressing modes = 136 total defs
-        # (8 UPS + 8 SRS + 4 PACK + 4 UNPACK) x addressing variants
-        assert count >= 100, f"Expected >= 100 conversion defs handled, got {count}"
+        # 16 base mnemonics x various addressing modes
+        # (8 UPS + 8 SRS; PACK/UNPACK deferred -- llc doesn't lower them)
+        assert count >= 70, f"Expected >= 70 conversion defs handled, got {count}"
 
 
 class TestGenerateAllWithConversions:
@@ -2881,13 +2881,13 @@ class TestGenerateAllWithConversions:
             ll_path = os.path.join(out_dir, batch["filename"])
             assert os.path.exists(ll_path), f"Missing {batch['filename']}"
 
-    def test_conversion_batch_has_24_tests(self, isa_json_path, out_dir):
-        """Conversion batch should have 24 test points (one per base mnemonic)."""
+    def test_conversion_batch_has_16_tests(self, isa_json_path, out_dir):
+        """Conversion batch should have 16 test points (UPS+SRS only, pack/unpack deferred)."""
         manifest = generate_all(isa_json_path, out_dir)
         ll_batches = [b for b in manifest["batches"] if b["source_type"] == "llvm_ir"]
         total_ll_tests = sum(b["test_count"] for b in ll_batches)
-        assert total_ll_tests == 24, \
-            f"Expected 24 conversion test points, got {total_ll_tests}"
+        assert total_ll_tests == 16, \
+            f"Expected 16 conversion test points, got {total_ll_tests}"
 
     def test_conversion_testable_counted(self, isa_json_path, out_dir):
         """Conversion instructions should be counted as testable, not skipped."""

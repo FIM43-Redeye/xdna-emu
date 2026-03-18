@@ -149,44 +149,47 @@ CONVERSION_INTRINSICS: dict[str, dict] = {
         "in_bytes": 128, "out_bytes": 32, "sign": 0,
     },
     # --- PACK (4): wider -> narrower + store ---
+    # NOTE: pack/unpack intrinsics are NOT lowered by llc (left as function
+    # calls, causing link errors).  Marked llc_unsupported=True until we
+    # add a Chess or C-builtin path for them.
     "vst.pack.s4.s8": {
-        "intrinsic": "pack_I4_I8",
+        "intrinsic": "pack_I4_I8", "llc_unsupported": True,
         "in_type": "<32 x i8>", "out_type": "<32 x i8>",
         "in_bytes": 32, "out_bytes": 32,
     },
     "vst.pack.d4.d8": {
-        "intrinsic": "pack_I4_I8",
+        "intrinsic": "pack_I4_I8", "llc_unsupported": True,
         "in_type": "<32 x i8>", "out_type": "<32 x i8>",
         "in_bytes": 32, "out_bytes": 32,
     },
     "vst.pack.s8.s16": {
-        "intrinsic": "pack_I8_I16",
+        "intrinsic": "pack_I8_I16", "llc_unsupported": True,
         "in_type": "<16 x i16>", "out_type": "<16 x i16>",
         "in_bytes": 32, "out_bytes": 32,
     },
     "vst.pack.d8.d16": {
-        "intrinsic": "pack_I8_I16",
+        "intrinsic": "pack_I8_I16", "llc_unsupported": True,
         "in_type": "<16 x i16>", "out_type": "<16 x i16>",
         "in_bytes": 32, "out_bytes": 32,
     },
     # --- UNPACK (4): load + narrower -> wider ---
     "vldb.unpack.s8.s4": {
-        "intrinsic": "unpack_I8_I4",
+        "intrinsic": "unpack_I8_I4", "llc_unsupported": True,
         "in_type": "<32 x i8>", "out_type": "<32 x i8>",
         "in_bytes": 32, "out_bytes": 32,
     },
     "vldb.unpack.d8.d4": {
-        "intrinsic": "unpack_I8_I4",
+        "intrinsic": "unpack_I8_I4", "llc_unsupported": True,
         "in_type": "<32 x i8>", "out_type": "<32 x i8>",
         "in_bytes": 32, "out_bytes": 32,
     },
     "vldb.unpack.s16.s8": {
-        "intrinsic": "unpack_I16_I8",
+        "intrinsic": "unpack_I16_I8", "llc_unsupported": True,
         "in_type": "<32 x i8>", "out_type": "<16 x i16>",
         "in_bytes": 32, "out_bytes": 32,
     },
     "vldb.unpack.d16.d8": {
-        "intrinsic": "unpack_I16_I8",
+        "intrinsic": "unpack_I16_I8", "llc_unsupported": True,
         "in_type": "<32 x i8>", "out_type": "<16 x i16>",
         "in_bytes": 32, "out_bytes": 32,
     },
@@ -2336,7 +2339,10 @@ class ConversionStrategy(TestStrategy):
         if not any(s in mnemonic for s in _CONVERSION_IR_SUFFIXES):
             return False
         base = _conversion_base_mnemonic(mnemonic)
-        return base in CONVERSION_INTRINSICS
+        if base not in CONVERSION_INTRINSICS:
+            return False
+        info = CONVERSION_INTRINSICS[base]
+        return not info.get("llc_unsupported", False)
 
     def can_test(self, instr: dict) -> tuple[bool, str]:
         """ConversionStrategy does not participate in normal strategy dispatch.
