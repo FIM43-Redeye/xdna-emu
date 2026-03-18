@@ -1943,36 +1943,43 @@ class TestSpRelative:
 # ===================================================================
 
 class TestBranchStrategy:
-    """Tests for BranchStrategy."""
+    """Tests for BranchStrategy with absolute IW address targets."""
 
-    def setup_method(self):
-        """Reset label counter before each test."""
-        isa_test_gen.BranchStrategy.reset_labels()
+    def _make_j(self):
+        return _make_instr("J_jump_imm", "j", "j\t$cpmaddr", [
+            _make_imm_op("cpmaddr", bit_width=20, signed=False),
+        ], slot="lng")
 
-    def test_jnz_can_test(self):
-        instr = _make_instr("JNZ", "jnz", "jnz\t$mRx, $cpmaddr", [
+    def _make_jl(self):
+        return _make_instr("JL", "jl", "jl\t$cpmaddr", [
+            _make_imm_op("cpmaddr", bit_width=20, signed=False),
+        ], slot="lng")
+
+    def _make_jnz(self):
+        return _make_instr("JNZ", "jnz", "jnz\t$mRx, $cpmaddr", [
             _make_reg_op("mRx", "scalar"),
             _make_imm_op("cpmaddr", bit_width=20, signed=False),
         ], slot="lng")
+
+    def _make_jz(self):
+        return _make_instr("JZ", "jz", "jz\t$mRx, $cpmaddr", [
+            _make_reg_op("mRx", "scalar"),
+            _make_imm_op("cpmaddr", bit_width=20, signed=False),
+        ], slot="lng")
+
+    def test_jnz_can_test(self):
         strategy = isa_test_gen.BranchStrategy()
-        can, reason = strategy.can_test(instr)
+        can, reason = strategy.can_test(self._make_jnz())
         assert can, f"Expected can_test=True: {reason}"
 
     def test_jz_can_test(self):
-        instr = _make_instr("JZ", "jz", "jz\t$mRx, $cpmaddr", [
-            _make_reg_op("mRx", "scalar"),
-            _make_imm_op("cpmaddr", bit_width=20, signed=False),
-        ], slot="lng")
         strategy = isa_test_gen.BranchStrategy()
-        can, reason = strategy.can_test(instr)
+        can, reason = strategy.can_test(self._make_jz())
         assert can, f"Expected can_test=True: {reason}"
 
     def test_j_immediate_can_test(self):
-        instr = _make_instr("J", "j", "j\t$cpmaddr", [
-            _make_imm_op("cpmaddr", bit_width=20, signed=False),
-        ], slot="lng")
         strategy = isa_test_gen.BranchStrategy()
-        can, reason = strategy.can_test(instr)
+        can, reason = strategy.can_test(self._make_j())
         assert can, f"Expected can_test=True: {reason}"
 
     def test_j_register_indirect_deferred(self):
@@ -2000,56 +2007,122 @@ class TestBranchStrategy:
         can, reason = strategy.can_test(instr)
         assert not can
 
-    def test_jnz_generates_markers(self):
-        instr = _make_instr("JNZ", "jnz", "jnz\t$mRx, $cpmaddr", [
-            _make_reg_op("mRx", "scalar"),
-            _make_imm_op("cpmaddr", bit_width=20, signed=False),
-        ], slot="lng")
+    def test_j_generates_numeric_targets(self):
+        """Unconditional j should emit numeric IW addresses, not labels."""
         strategy = isa_test_gen.BranchStrategy()
-        regs = {"mRx": "r0", "cpmaddr": "0"}
-        asm = strategy.generate_test_point(instr, regs,
+        regs = {"cpmaddr": "0"}
+        asm = strategy.generate_test_point(self._make_j(), regs,
                                            in_offset=0, out_offset=0)
-        assert ".Ltaken_" in asm
-        assert ".Ldone_" in asm
-        assert "jnz" in asm
-        # Should store markers
-        assert "#170" in asm  # 0xAA
+        # No labels -- only numeric targets.
+        assert ".Ltaken" not in asm
+        assert ".Ldone" not in asm
+        # Should have j #N instruction.
+        assert "j #" in asm
+        # Should store markers.
+        assert "#170" in asm  # 0xAA before marker
+        assert "#204" in asm  # 0xCC taken marker
+        assert "#187" in asm  # 0xBB fall-through marker
 
-    def test_labels_are_unique(self):
-        instr = _make_instr("JNZ", "jnz", "jnz\t$mRx, $cpmaddr", [
-            _make_reg_op("mRx", "scalar"),
-            _make_imm_op("cpmaddr", bit_width=20, signed=False),
-        ], slot="lng")
+    def test_jnz_generates_condition_setup(self):
+        """Conditional jnz emits mov r0, #N for the condition value."""
+        strategy = isa_test_gen.BranchStrategy()
+        regs = {"mRx": "r0", "cpmaddr": "0", "_combo_idx": 0}
+        asm = strategy.generate_test_point(self._make_jnz(), regs,
+                                           in_offset=0, out_offset=0)
+        # Combo 0 = taken path for jnz -> needs nonzero condition.
+        assert "mov r0, #1" in asm
+        assert "jnz r0, #" in asm
+
+    def test_jnz_not_taken_combo(self):
+        """Combo index 1 for jnz = not-taken (condition = 0)."""
+        strategy = isa_test_gen.BranchStrategy()
+        regs = {"mRx": "r0", "cpmaddr": "0", "_combo_idx": 1}
+        asm = strategy.generate_test_point(self._make_jnz(), regs,
+                                           in_offset=0, out_offset=0)
+        assert "mov r0, #0" in asm
+
+    def test_jz_taken_combo(self):
+        """Combo 0 for jz = taken -> needs zero condition."""
+        strategy = isa_test_gen.BranchStrategy()
+        regs = {"mRx": "r0", "cpmaddr": "0", "_combo_idx": 0}
+        asm = strategy.generate_test_point(self._make_jz(), regs,
+                                           in_offset=0, out_offset=0)
+        assert "mov r0, #0" in asm
+        assert "jz r0, #" in asm
+
+    def test_code_iw_offset_shifts_targets(self):
+        """Non-zero code_iw_offset shifts all branch target addresses."""
+        strategy = isa_test_gen.BranchStrategy()
+        regs = {"cpmaddr": "0"}
+        asm0 = strategy.generate_test_point(self._make_j(), regs,
+                                            in_offset=0, out_offset=0,
+                                            code_iw_offset=0)
+        asm10 = strategy.generate_test_point(self._make_j(), regs,
+                                             in_offset=0, out_offset=0,
+                                             code_iw_offset=10)
+        import re as _re
+        targets0 = [int(m) for m in _re.findall(r'j #(\d+)', asm0)]
+        targets10 = [int(m) for m in _re.findall(r'j #(\d+)', asm10)]
+        # Both should have exactly 2 j targets (branch + skip-to-done).
+        assert len(targets0) == 2
+        assert len(targets10) == 2
+        # Offset=10 should shift every target by exactly 10.
+        for t0, t10 in zip(targets0, targets10):
+            assert t10 == t0 + 10
+
+    def test_no_input_buffer_needed(self):
+        """Branch tests use immediate condition values, no input buffer."""
         strategy = isa_test_gen.BranchStrategy()
         regs = {"mRx": "r0", "cpmaddr": "0"}
-        asm1 = strategy.generate_test_point(instr, regs,
-                                            in_offset=0, out_offset=0)
-        asm2 = strategy.generate_test_point(instr, regs,
-                                            in_offset=32, out_offset=32)
-        import re as _re
-        labels1 = set(_re.findall(r'\.L\w+_(\d+)', asm1))
-        labels2 = set(_re.findall(r'\.L\w+_(\d+)', asm2))
-        assert labels1.isdisjoint(labels2), \
-            f"Labels must be unique: {labels1} vs {labels2}"
+        assert strategy.compute_input_size(self._make_jnz(), regs) == 0
+        assert strategy.compute_input_size(self._make_j(), regs) == 0
+
+    def test_output_size_is_8(self):
+        """Two 4-byte markers: before + path."""
+        strategy = isa_test_gen.BranchStrategy()
+        assert strategy.compute_output_size(self._make_j()) == 8
 
     def test_conditional_combos(self):
         """Conditional branches should produce 2 combos (taken + not-taken)."""
-        instr = _make_instr("JNZ", "jnz", "jnz\t$mRx, $cpmaddr", [
-            _make_reg_op("mRx", "scalar"),
-            _make_imm_op("cpmaddr", bit_width=20, signed=False),
-        ], slot="lng")
         strategy = isa_test_gen.BranchStrategy()
-        combos = strategy.generate_combos(instr)
+        combos = strategy.generate_combos(self._make_jnz())
         assert len(combos) == 2
 
     def test_unconditional_combos(self):
         """Unconditional j should produce 1 combo."""
-        instr = _make_instr("J", "j", "j\t$cpmaddr", [
-            _make_imm_op("cpmaddr", bit_width=20, signed=False),
-        ], slot="lng")
         strategy = isa_test_gen.BranchStrategy()
-        combos = strategy.generate_combos(instr)
+        combos = strategy.generate_combos(self._make_j())
         assert len(combos) == 1
+
+    def test_delay_slots_present(self):
+        """Branch should be followed by 5 NOP delay slots."""
+        strategy = isa_test_gen.BranchStrategy()
+        regs = {"cpmaddr": "0"}
+        asm = strategy.generate_test_point(self._make_j(), regs,
+                                           in_offset=0, out_offset=0)
+        lines = [l.strip() for l in asm.split("\n")
+                 if l.strip() and not l.strip().startswith("//")]
+        # Find the j instruction and count following nops.
+        for i, line in enumerate(lines):
+            if line.startswith("j #"):
+                nop_count = 0
+                for k in range(i + 1, min(i + 6, len(lines))):
+                    if lines[k] == "nop":
+                        nop_count += 1
+                    else:
+                        break
+                assert nop_count == 5, f"Expected 5 delay NOPs, got {nop_count}"
+                break
+        else:
+            assert False, "No j # instruction found"
+
+    def test_jl_generates_jl_instruction(self):
+        """jl should emit jl #N, not j #N."""
+        strategy = isa_test_gen.BranchStrategy()
+        regs = {"cpmaddr": "0"}
+        asm = strategy.generate_test_point(self._make_jl(), regs,
+                                           in_offset=0, out_offset=0)
+        assert "jl #" in asm
 
 
 # ===================================================================

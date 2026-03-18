@@ -436,8 +436,15 @@ class TestStrategy:
         raise NotImplementedError
 
     def generate_test_point(self, instr: dict, regs: dict[str, str],
-                            in_offset: int, out_offset: int) -> str:
-        """Generate assembly for one test point."""
+                            in_offset: int, out_offset: int,
+                            code_iw_offset: int = 0) -> str:
+        """Generate assembly for one test point.
+
+        Args:
+            code_iw_offset: Instruction word index of the first instruction
+                in this test point (counted from the function entry).  Used
+                by BranchStrategy to compute absolute branch targets.
+        """
         raise NotImplementedError
 
     def generate_combos(self, instr: dict) -> list[dict[str, str]]:
@@ -1242,6 +1249,8 @@ def _substitute_asm(asm_string: str, regs: dict[str, str],
     # Sort by length descending to avoid partial substitution
     # (e.g., $mRx before $mRx0 would be wrong -- but $mRx0 before $mRx is fine).
     for name in sorted(regs.keys(), key=len, reverse=True):
+        if name.startswith("_"):
+            continue  # Skip internal metadata keys (_combo_idx, etc.)
         value = regs[name]
         # Immediate values (numeric) need # prefix for llvm-mc syntax.
         if value.lstrip("-").isdigit():
@@ -1476,7 +1485,7 @@ class ComputeStrategy(TestStrategy):
         status, reason = classify_instruction(instr)
         return (status == "testable", reason)
 
-    def generate_test_point(self, instr, regs, in_offset, out_offset):
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
         return generate_test_point(instr, regs, in_offset, out_offset)
 
 
@@ -1592,7 +1601,7 @@ class LoadStrategy(TestStrategy):
             return 4
         return _operand_size(dest, instr.get("name", ""))
 
-    def generate_test_point(self, instr, regs, in_offset, out_offset):
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
         lines = []
         name = instr["name"]
         lines.append(f"  // ---- test (load): {name} ----")
@@ -1846,7 +1855,7 @@ class StoreStrategy(TestStrategy):
     def compute_output_size(self, instr):
         return self._compute_store_width(instr)
 
-    def generate_test_point(self, instr, regs, in_offset, out_offset):
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
         lines = []
         name = instr["name"]
         lines.append(f"  // ---- test (store): {name} ----")
@@ -1924,22 +1933,15 @@ class BranchStrategy(TestStrategy):
 
     Stores marker values to the output buffer to verify which path executed.
     Conditional branches get two test points: taken and not-taken.
+
+    Branch targets use absolute instruction word (IW) addresses.  Each
+    assembly line (regardless of compressed byte size) occupies exactly
+    one instruction word in program memory.  The code_iw_offset parameter
+    tells us how many IWs precede this test point in the current batch.
     """
 
     _TESTABLE = frozenset({"j", "jl", "jnz", "jz"})
     _DEFERRED = frozenset({"ret", "jnzd"})
-
-    _label_counter = 0
-
-    @classmethod
-    def _next_label_id(cls) -> int:
-        cls._label_counter += 1
-        return cls._label_counter
-
-    @classmethod
-    def reset_labels(cls):
-        """Reset label counter (call at start of each batch)."""
-        cls._label_counter = 0
 
     def can_test(self, instr: dict) -> tuple[bool, str]:
         mnemonic = instr.get("mnemonic", "")
@@ -1964,13 +1966,18 @@ class BranchStrategy(TestStrategy):
         return instr.get("mnemonic", "") in ("jnz", "jz")
 
     def compute_input_size(self, instr, regs):
-        return 4 if self._is_conditional(instr) else 0
+        # Conditional branches use immediate values (mov r0, #N) for the
+        # condition, not input buffer loads.  No input buffer needed.
+        return 0
 
     def compute_output_size(self, instr):
         return 8  # 4-byte "before" marker + 4-byte "path" marker
 
     def generate_combos(self, instr: dict) -> list[dict[str, str]]:
-        """Conditional branches get 2 combos, unconditional get 1."""
+        """Conditional branches get 2 combos, unconditional get 1.
+
+        Combo index 0 = taken path, combo index 1 = not-taken path.
+        """
         base_combo = {}
         for op in instr.get("operands", []):
             op_name = op["name"]
@@ -1989,55 +1996,110 @@ class BranchStrategy(TestStrategy):
         if not self._is_conditional(instr):
             return [base_combo]
 
-        # Two combos: nonzero + zero condition.
+        # Two combos: index 0 = taken, index 1 = not-taken.
         return [dict(base_combo), dict(base_combo)]
 
-    def generate_test_point(self, instr, regs, in_offset, out_offset):
-        lines = []
+    def generate_test_point(self, instr, regs, in_offset, out_offset,
+                            code_iw_offset=0):
+        """Generate branch test with absolute IW addresses.
+
+        Layout (for unconditional j):
+            IW+0: mov r14, #170       (before marker)
+            IW+1: st r14, [p1, #OUT]  (store before marker)
+            IW+2: j #<taken_iw>       (THE BRANCH)
+            IW+3..+7: nop (x5)        (delay slots)
+            IW+8: mov r14, #187       (fall-through: 0xBB)
+            IW+9: st r14, [p1, #OUT+4]
+            IW+10: j #<done_iw>       (skip to convergence)
+            IW+11..+15: nop (x5)      (delay slots)
+            IW+16: mov r14, #204      (taken: 0xCC)
+            IW+17: st r14, [p1, #OUT+4]
+            done_iw = IW+18
+
+        For conditional (jnz/jz), an extra mov r0, #N prepends.
+        Store helpers may emit >1 IW for large offsets (padda sequence).
+        We count instructions dynamically to get correct targets.
+        """
         name = instr["name"]
         mnemonic = instr.get("mnemonic", "")
-        lid = self._next_label_id()
-        lines.append(f"  // ---- test (branch): {name} ----")
+        is_cond = self._is_conditional(instr)
 
         BRANCH_DELAY = 5
 
-        # For conditional branches, load the condition value from input.
-        if self._is_conditional(instr):
-            in_offset = _align(in_offset, 4)
-            lines.extend(_scalar_load("r0", "p0", in_offset))
-            lines.extend(_nop_sled(LOAD_LATENCY))
+        # Determine condition value from combo index.
+        # Combo 0 = taken: jnz needs nonzero, jz needs zero.
+        # Combo 1 = not-taken: jnz needs zero, jz needs nonzero.
+        combo_idx = regs.get("_combo_idx", 0)
 
-        # Store "before" marker (0xAA = 170).
+        # Phase 1: Build pre-branch instructions and count them.
+        pre_branch = []
+        pre_branch.append(f"  // ---- test (branch): {name} ----")
+
+        if is_cond:
+            if mnemonic == "jnz":
+                cond_val = 1 if combo_idx == 0 else 0
+            else:  # jz
+                cond_val = 0 if combo_idx == 0 else 1
+            pre_branch.append(f"  mov r0, #{cond_val}")
+
         out_offset = _align(out_offset, 4)
-        lines.append(f"  mov r14, #170")
-        lines.extend(_scalar_store("r14", "p1", out_offset))
+        pre_branch.append(f"  mov r14, #170")
+        pre_branch.extend(_scalar_store("r14", "p1", out_offset))
 
-        # The branch instruction with label target.
+        # Count actual instruction words (skip comments).
+        def _iw_count(lines):
+            return sum(1 for l in lines
+                       if l.strip() and not l.strip().startswith("//"))
+
+        n_pre = _iw_count(pre_branch)
+
+        # Phase 2: Build fall-through and taken paths, count them.
+        fall_through = [f"  mov r14, #187"]
+        fall_through.extend(_scalar_store("r14", "p1", out_offset + 4))
+        n_fall = _iw_count(fall_through)
+
+        taken = [f"  mov r14, #204"]
+        taken.extend(_scalar_store("r14", "p1", out_offset + 4))
+        n_taken = _iw_count(taken)
+
+        # Phase 3: Compute absolute IW addresses.
+        # branch_iw = code_iw_offset + n_pre
+        # After branch: 5 delay slots
+        # fall_through_start = branch_iw + 1 + BRANCH_DELAY
+        # After fall-through: j-to-done + 5 delay slots
+        # taken_start = fall_through_start + n_fall + 1 + BRANCH_DELAY
+        # done_iw = taken_start + n_taken
+
+        branch_iw = code_iw_offset + n_pre
+        fall_through_start = branch_iw + 1 + BRANCH_DELAY
+        taken_start = fall_through_start + n_fall + 1 + BRANCH_DELAY
+        done_iw = taken_start + n_taken
+
+        # Phase 4: Assemble the full test point.
+        lines = list(pre_branch)
+
+        # The branch instruction with absolute IW target.
         if mnemonic == "j":
-            lines.append(f"  j .Ltaken_{lid}")
+            lines.append(f"  j #{taken_start}")
         elif mnemonic == "jl":
-            lines.append(f"  jl .Ltaken_{lid}")
+            lines.append(f"  jl #{taken_start}")
         elif mnemonic == "jnz":
-            lines.append(f"  jnz r0, .Ltaken_{lid}")
+            lines.append(f"  jnz r0, #{taken_start}")
         elif mnemonic == "jz":
-            lines.append(f"  jz r0, .Ltaken_{lid}")
+            lines.append(f"  jz r0, #{taken_start}")
 
-        # Branch delay slots.
         lines.extend(_nop_sled(BRANCH_DELAY))
 
         # Fall-through path (branch NOT taken).
-        lines.append(f"  mov r14, #187")  # 0xBB
-        lines.extend(_scalar_store("r14", "p1", out_offset + 4))
-        lines.append(f"  j .Ldone_{lid}")
+        lines.extend(fall_through)
+        lines.append(f"  j #{done_iw}")
         lines.extend(_nop_sled(BRANCH_DELAY))
 
         # Taken path.
-        lines.append(f".Ltaken_{lid}:")
-        lines.append(f"  mov r14, #204")  # 0xCC
-        lines.extend(_scalar_store("r14", "p1", out_offset + 4))
+        lines.extend(taken)
 
-        # Convergence point.
-        lines.append(f".Ldone_{lid}:")
+        # No explicit convergence marker -- the next test point (or ret)
+        # follows at done_iw.
         lines.append("")
         return "\n".join(lines)
 
@@ -2381,7 +2443,7 @@ class ConversionStrategy(TestStrategy):
             return info["in_bytes"]
         return info["out_bytes"]
 
-    def generate_test_point(self, instr, regs, in_offset, out_offset):
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
         """Not used -- conversion batches go through generate_conversion_ll()."""
         raise NotImplementedError(
             "ConversionStrategy does not generate assembly test points; "
@@ -2394,11 +2456,7 @@ class ConversionStrategy(TestStrategy):
 # ---------------------------------------------------------------------------
 
 STRATEGIES: list[TestStrategy] = [
-    # BranchStrategy disabled: llvm-mc doesn't support label-based branch
-    # targets for AIE2 (uses absolute instruction word addresses, not
-    # relocatable labels). The strategy class is preserved for future use
-    # when a linker with relocation support is available.
-    # BranchStrategy(),
+    BranchStrategy(),
     LoadStrategy(),
     StoreStrategy(),
     ComputeStrategy(),
@@ -2577,6 +2635,8 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         combos = strategy.generate_combos(instr)
 
         for combo_idx, regs in enumerate(combos):
+            # Tag the combo index so BranchStrategy can select taken/not-taken.
+            regs["_combo_idx"] = combo_idx
             test_point_specs.append((instr, combo_idx, regs, strategy))
 
     # Count conversion instructions as testable.
@@ -2611,14 +2671,13 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
 
         batch_specs = measured_specs[i:end]
 
-        # Reset branch labels per batch to avoid cross-file collisions.
-        BranchStrategy.reset_labels()
-
         # Second pass: regenerate assembly with correct per-batch offsets.
         batch_in_offset = 0
         batch_out_offset = 0
         batch_asm = []
         batch_meta = []
+        # Track cumulative instruction word count for branch targets.
+        batch_iw_count = 0
 
         for instr, combo_idx, regs, _bundles, strategy in batch_specs:
             in_size = strategy.compute_input_size(instr, regs)
@@ -2631,13 +2690,16 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
                 instr, regs,
                 in_offset=batch_in_offset,
                 out_offset=batch_out_offset,
+                code_iw_offset=batch_iw_count,
             )
+            batch_iw_count += _count_bundles(asm)
             batch_asm.append(asm)
             batch_meta.append({
                 "instruction": instr["name"],
                 "slot": instr.get("slot", ""),
                 "combo_index": combo_idx,
-                "operands": regs,
+                "operands": {k: v for k, v in regs.items()
+                             if not k.startswith("_")},
                 "in_offset": batch_in_offset,
                 "in_size": in_size,
                 "out_offset": batch_out_offset,
