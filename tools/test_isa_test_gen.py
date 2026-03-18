@@ -680,6 +680,27 @@ class TestRegisterNames:
         assert all(n.startswith("wl") or n.startswith("wh") for n in names), \
             f"Expected wl*/wh* names for MvAMWQSrc, got {names}"
 
+    def test_ldascl_returns_scalar_r_names(self):
+        """LdaScl composite kind (mLdaScl/mSclSt DMS class) maps to r* scalar names."""
+        names = register_names("LdaScl")
+        assert isinstance(names, list)
+        assert len(names) >= 4, f"Expected multiple r* names, got {names}"
+        assert all(n.startswith("r") for n in names), \
+            f"Expected r* names for LdaScl, got {names}"
+
+    def test_quad_returns_q_names(self):
+        """quad kind (DMV_Q mQQa class, q0-q3) returns q0..q3."""
+        names = register_names("quad")
+        assert isinstance(names, list)
+        assert names == ["q0", "q1", "q2", "q3"], \
+            f"Expected ['q0','q1','q2','q3'] for quad kind, got {names}"
+
+    def test_accumulator_bw2_returns_quad_names(self):
+        """Accumulator bw=2 is the DMV_Q quad register class, returns q0-q3."""
+        names = register_names("accumulator", bit_width=2)
+        assert names == ["q0", "q1", "q2", "q3"], \
+            f"Expected q0-q3 for accumulator bw=2, got {names}"
+
     def test_accumulator_bw4_returns_cm(self):
         """Accumulator with 4-bit encoding -> 1024-bit cm registers."""
         names = register_names("accumulator", bit_width=4)
@@ -1867,6 +1888,54 @@ class TestSpRelative:
         strategy = isa_test_gen.StoreStrategy()
         can, reason = strategy.can_test(instr)
         assert can, f"ST_dms_spill should be testable now: {reason}"
+
+    def test_lda_dms_idx_imm_testable(self, isa_data):
+        """LDA_dms_lda_idx_imm (DMS scalar load, mLdaScl dest) must be testable."""
+        instr = self._find_instr(isa_data, "LDA_dms_lda_idx_imm")
+        assert instr is not None, "LDA_dms_lda_idx_imm not found in ISA"
+        strategy = isa_test_gen.LoadStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"LDA_dms_lda_idx_imm should be testable, got: {reason}"
+
+    def test_lda_2d_dms_testable(self, isa_data):
+        """LDA_2D_dms_lda (DMS scalar 2D load, mLdaScl dest) must be testable."""
+        instr = self._find_instr(isa_data, "LDA_2D_dms_lda")
+        assert instr is not None, "LDA_2D_dms_lda not found in ISA"
+        strategy = isa_test_gen.LoadStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"LDA_2D_dms_lda should be testable, got: {reason}"
+
+    def test_st_dms_idx_testable(self, isa_data):
+        """ST_dms_sts_idx (DMS scalar store, mSclSt source) must be testable."""
+        instr = self._find_instr(isa_data, "ST_dms_sts_idx")
+        assert instr is not None, "ST_dms_sts_idx not found in ISA"
+        strategy = isa_test_gen.StoreStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"ST_dms_sts_idx should be testable, got: {reason}"
+
+    def test_st_2d_dms_testable(self, isa_data):
+        """ST_2D_dms_sts (DMS scalar 2D store, mSclSt source) must be testable."""
+        instr = self._find_instr(isa_data, "ST_2D_dms_sts")
+        assert instr is not None, "ST_2D_dms_sts not found in ISA"
+        strategy = isa_test_gen.StoreStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"ST_2D_dms_sts should be testable, got: {reason}"
+
+    def test_lda_dmv_q_idx_testable(self, isa_data):
+        """LDA_dmv_lda_q_ag_idx (DMV_Q quad load, bw=2 accumulator) must be testable."""
+        instr = self._find_instr(isa_data, "LDA_dmv_lda_q_ag_idx")
+        assert instr is not None, "LDA_dmv_lda_q_ag_idx not found in ISA"
+        strategy = isa_test_gen.LoadStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"LDA_dmv_lda_q_ag_idx (DMV_Q) should be testable, got: {reason}"
+
+    def test_st_dmv_q_idx_testable(self, isa_data):
+        """ST_dmv_sts_q_ag_idx (DMV_Q quad store, bw=2 accumulator) must be testable."""
+        instr = self._find_instr(isa_data, "ST_dmv_sts_q_ag_idx")
+        assert instr is not None, "ST_dmv_sts_q_ag_idx not found in ISA"
+        strategy = isa_test_gen.StoreStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"ST_dmv_sts_q_ag_idx (DMV_Q) should be testable, got: {reason}"
 
 
 # ===================================================================
