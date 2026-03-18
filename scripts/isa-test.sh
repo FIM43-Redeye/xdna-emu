@@ -25,6 +25,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ISA_JSON="${PROJECT_DIR}/tools/aie2-isa.json"
 LLVM_MC="${HOME}/npu-work/llvm-aie/build/bin/llvm-mc"
+PEANO_LLC="${HOME}/npu-work/llvm-aie/install/bin/llc"
 PEANO_INSTALL_DIR="${HOME}/npu-work/llvm-aie/install"
 
 # mlir-aie paths for host compilation and aiecc.py
@@ -102,31 +103,48 @@ fi
 echo "Batches to process: $TOTAL"
 echo ""
 
-# ---- Phase 2: Assemble ----
-echo "--- Phase 2: Assemble (llvm-mc) ---"
+# ---- Phase 2: Assemble / Compile ----
+echo "--- Phase 2: Assemble / Compile ---"
 
 if [[ ! -x "$LLVM_MC" ]]; then
     echo "ERROR: llvm-mc not found at $LLVM_MC"
+    exit 1
+fi
+if [[ ! -x "$PEANO_LLC" ]]; then
+    echo "ERROR: llc not found at $PEANO_LLC"
     exit 1
 fi
 
 assemble_one() {
     local batch_idx="$1"
     local filename="$2"
-    local s_path="${OUT_DIR}/${filename}"
-    local o_path="${s_path%.s}.o"
+    local in_path="${OUT_DIR}/${filename}"
+    # Output .o is always named by batch index, regardless of input format.
+    local o_path="${OUT_DIR}/batch_${batch_idx}.o"
 
-    # Skip if already assembled (unless --compile).
-    if ! $FORCE_COMPILE && [[ -f "$o_path" ]] && [[ "$o_path" -nt "$s_path" ]]; then
+    # Skip if already assembled/compiled (unless --compile).
+    if ! $FORCE_COMPILE && [[ -f "$o_path" ]] && [[ "$o_path" -nt "$in_path" ]]; then
         return 0
     fi
 
-    nice -n 19 "$LLVM_MC" --triple=aie2 --filetype=obj -o "$o_path" "$s_path" 2>"${s_path%.s}.mc.log" && \
-        echo "  ASM OK: ${filename}" || \
-        echo "  ASM FAIL: ${filename} (see ${s_path%.s}.mc.log)"
+    if [[ "$filename" == *.ll ]]; then
+        # LLVM IR: compile with llc.
+        # --issue-limit=1 prevents VLIW packing so each instruction occupies
+        # its own cycle slot, which is required for single-instruction validation.
+        nice -n 19 "$PEANO_LLC" -mtriple=aie2 --issue-limit=1 -filetype=obj \
+            -o "$o_path" "$in_path" 2>"${in_path%.ll}.llc.log" && \
+            echo "  LLC OK: ${filename}" || \
+            echo "  LLC FAIL: ${filename} (see ${in_path%.ll}.llc.log)"
+    else
+        # Assembly (.s): assemble with llvm-mc.
+        nice -n 19 "$LLVM_MC" --triple=aie2 --filetype=obj \
+            -o "$o_path" "$in_path" 2>"${in_path%.s}.mc.log" && \
+            echo "  ASM OK: ${filename}" || \
+            echo "  ASM FAIL: ${filename} (see ${in_path%.s}.mc.log)"
+    fi
 }
 export -f assemble_one
-export OUT_DIR FORCE_COMPILE LLVM_MC
+export OUT_DIR FORCE_COMPILE LLVM_MC PEANO_LLC
 
 echo "$BATCH_INFO" | awk '{print $1, $2}' | \
     xargs -P "$JOBS" -n2 bash -c 'assemble_one "$1" "$2"' _
@@ -166,7 +184,7 @@ package_one() {
     local in_size="$3"
     local out_size="$4"
     local batch_dir="${OUT_DIR}/batch_${batch_idx}"
-    local o_path="${OUT_DIR}/${filename%.s}.o"
+    local o_path="${OUT_DIR}/batch_${batch_idx}.o"
 
     if [[ ! -f "$o_path" ]]; then
         echo "  SKIP batch_${batch_idx}: assembly failed"
