@@ -43,6 +43,11 @@ SIDE_EFFECT_MNEMONICS = frozenset({
     "done", "event",
 })
 
+# Mnemonic substrings for conversion load/store variants that llvm-mc
+# cannot assemble (they combine memory access with data conversion in
+# a single instruction with no direct assembly syntax).
+CONVERSION_SUFFIXES = (".ups.", ".srs.", ".conv.", ".pack.", ".unpack.")
+
 # Mnemonics that interact with the stream switch -- need live streams.
 STREAM_MNEMONICS = frozenset({
     "mov.nb", "mov.nb.tlast", "mov.tlast",
@@ -637,14 +642,56 @@ FIXED_REGISTER_MAP = {
 }
 
 
-def _substitute_asm(asm_string: str, regs: dict[str, str]) -> str:
+# Mnemonic suffixes that llvm-mc does not accept when a modifier_m
+# operand is present.  llvm-mc infers the addressing mode from the
+# operand types, so ".2d", ".3d", and trailing data-type suffixes
+# (e.g., ".s16", ".u8") must be stripped from the asm_string.
+#
+# Pattern: strip ".2d" or ".3d" and everything after it from the mnemonic.
+# Examples: "lda.2d.s16" -> "lda", "vlda.3d" -> "vlda", "padda.2d" -> "padda"
+_MODIFIER_SUFFIX_RE = re.compile(r'\.(2d|3d)\b[.\w]*')
+
+
+def _has_modifier_operand(instr: dict) -> bool:
+    """Check if instruction has a modifier_m operand."""
+    return any(
+        op.get("register_kind") == "modifier_m"
+        for op in instr.get("operands", [])
+    )
+
+
+def _normalize_mnemonic(asm_string: str, has_modifier: bool) -> str:
+    """Strip internal mnemonic suffixes that llvm-mc doesn't accept.
+
+    When an instruction has a modifier_m operand, llvm-mc expects the
+    base mnemonic (e.g., "lda" not "lda.2d.s16") and infers the
+    addressing mode from the operands.
+    """
+    if not has_modifier:
+        return asm_string
+    # The mnemonic is everything before the first tab or space.
+    parts = re.split(r'(\t| )', asm_string, maxsplit=1)
+    if len(parts) < 2:
+        return asm_string
+    mnemonic = parts[0]
+    rest = ''.join(parts[1:])
+    # Strip .2d/.3d and everything after in the mnemonic.
+    normalized = _MODIFIER_SUFFIX_RE.sub('', mnemonic)
+    return normalized + rest
+
+
+def _substitute_asm(asm_string: str, regs: dict[str, str],
+                    has_modifier: bool = False) -> str:
     """Substitute operand placeholders in asm_string with register names.
 
     The asm_string looks like "add\\t$mRx, $mRx0, $mRy".
     We replace each $name with the corresponding value from regs.
     We also replace \\t with a real tab.
+
+    If has_modifier is True, strip .2d/.3d suffixes that llvm-mc
+    doesn't accept when a modifier_m operand is present.
     """
-    result = asm_string
+    result = _normalize_mnemonic(asm_string, has_modifier)
     # Sort by length descending to avoid partial substitution
     # (e.g., $mRx before $mRx0 would be wrong -- but $mRx0 before $mRx is fine).
     for name in sorted(regs.keys(), key=len, reverse=True):
@@ -722,7 +769,8 @@ def generate_test_point(
     lines.extend(_nop_sled(LOAD_LATENCY))
 
     # The instruction itself.
-    asm_line = "  " + _substitute_asm(instr["asm_string"], regs)
+    asm_line = "  " + _substitute_asm(instr["asm_string"], regs,
+                                      has_modifier=_has_modifier_operand(instr))
     lines.append(asm_line)
 
     # NOP sled after instruction: must cover result latency before store.
@@ -893,6 +941,11 @@ class LoadStrategy(TestStrategy):
         if any(mnemonic.startswith(p) for p in self._SKIP_PREFIXES):
             return (False, "compressed/sparse load (needs FIFO init)")
 
+        # Reject conversion loads (ups/conv/unpack) -- llvm-mc has no
+        # single-instruction syntax for these.
+        if any(s in mnemonic for s in CONVERSION_SUFFIXES):
+            return (False, "conversion load (no llvm-mc syntax)")
+
         operands = instr.get("operands", [])
 
         # Must have a pointer operand (rejects VLDB_4x register shuffles).
@@ -1004,7 +1057,8 @@ class LoadStrategy(TestStrategy):
             if op.get("operand_type") == "immediate":
                 load_regs[op_name] = "0"
 
-        asm_line = "  " + _substitute_asm(instr["asm_string"], load_regs)
+        asm_line = "  " + _substitute_asm(instr["asm_string"], load_regs,
+                                          has_modifier=_has_modifier_operand(instr))
         lines.append(asm_line)
 
         # NOP sled for load result latency.
@@ -1033,6 +1087,12 @@ class StoreStrategy(TestStrategy):
     def can_test(self, instr: dict) -> tuple[bool, str]:
         if not instr.get("may_store", False):
             return (False, "not a store instruction")
+
+        # Reject conversion stores (srs/conv/pack) -- llvm-mc has no
+        # single-instruction syntax for these.
+        mnemonic = instr.get("mnemonic", "")
+        if any(s in mnemonic for s in CONVERSION_SUFFIXES):
+            return (False, "conversion store (no llvm-mc syntax)")
 
         operands = instr.get("operands", [])
 
@@ -1170,7 +1230,8 @@ class StoreStrategy(TestStrategy):
             if op.get("operand_type") == "immediate":
                 store_regs[op_name] = "0"
 
-        asm_line = "  " + _substitute_asm(instr["asm_string"], store_regs)
+        asm_line = "  " + _substitute_asm(instr["asm_string"], store_regs,
+                                          has_modifier=_has_modifier_operand(instr))
         lines.append(asm_line)
 
         lines.append("")
@@ -1309,7 +1370,11 @@ class BranchStrategy(TestStrategy):
 # ---------------------------------------------------------------------------
 
 STRATEGIES: list[TestStrategy] = [
-    BranchStrategy(),
+    # BranchStrategy disabled: llvm-mc doesn't support label-based branch
+    # targets for AIE2 (uses absolute instruction word addresses, not
+    # relocatable labels). The strategy class is preserved for future use
+    # when a linker with relocation support is available.
+    # BranchStrategy(),
     LoadStrategy(),
     StoreStrategy(),
     ComputeStrategy(),
