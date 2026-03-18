@@ -870,10 +870,155 @@ class ComputeStrategy(TestStrategy):
 
 
 # ---------------------------------------------------------------------------
+# LoadStrategy: tests load instructions
+# ---------------------------------------------------------------------------
+
+class LoadStrategy(TestStrategy):
+    """Tests load instructions by pointing at input buffer and capturing result.
+
+    Handles Tier 1 (ptr+offset, ptr+index) and Tier 2 (ptr+modifier 2D/3D).
+    Rejects: may_store=True, no pointer operand, composite destinations,
+    compressed/sparse loads, stack-pointer loads.
+    """
+
+    _SKIP_PREFIXES = ("vldb.compr", "vldb.sparse")
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        if not instr.get("may_load", False):
+            return (False, "not a load instruction")
+        if instr.get("may_store", False):
+            return (False, "load+store combo (actually a store)")
+
+        mnemonic = instr.get("mnemonic", "")
+        if any(mnemonic.startswith(p) for p in self._SKIP_PREFIXES):
+            return (False, "compressed/sparse load (needs FIFO init)")
+
+        operands = instr.get("operands", [])
+
+        # Must have a pointer operand (rejects VLDB_4x register shuffles).
+        has_pointer = any(
+            op.get("register_kind") == "pointer"
+            for op in operands
+            if op.get("operand_type") in REGISTER_LIKE_TYPES
+        )
+        if not has_pointer:
+            return (False, "load with no pointer operand (register shuffle)")
+
+        # Reject composite destinations.
+        for op in operands:
+            if op.get("operand_type") == "composite_register":
+                return (False, "composite register destination (deferred)")
+
+        # Detect the output (loaded register).
+        dest = self._detect_load_dest(instr)
+        if dest is None:
+            return (False, "no detectable load destination")
+
+        kind = dest.get("register_kind", "")
+        if kind not in KNOWN_REGISTER_KINDS:
+            return (False, f"unsupported load destination kind: {kind}")
+
+        if kind == "accumulator":
+            bw = dest.get("bit_width", 0)
+            if bw == 2:
+                return (False, "composite sparse register (bw=2)")
+            if bw == 6:
+                return (False, "accumulator quarter register (bw=6)")
+
+        # Reject unknown operand types (except dontcare).
+        for op in operands:
+            op_type = op.get("operand_type", "unknown")
+            if op_type == "unknown":
+                if not op.get("name", "").startswith("dontcare"):
+                    return (False, "unknown operand type")
+
+        # Reject stack-pointer relative.
+        asm = instr.get("asm_string", "")
+        if "[sp," in asm.lower() or "[sp]" in asm.lower():
+            return (False, "stack-pointer relative load (deferred)")
+
+        return (True, "")
+
+    def _detect_load_dest(self, instr: dict) -> Optional[dict]:
+        """For loads, the destination is the first register in asm_string."""
+        outputs = detect_output_operands(instr)
+        return outputs[0] if outputs else None
+
+    def compute_input_size(self, instr, regs):
+        dest = self._detect_load_dest(instr)
+        if dest is None:
+            return 4
+        return _operand_size(dest, instr.get("name", ""))
+
+    def compute_output_size(self, instr):
+        dest = self._detect_load_dest(instr)
+        if dest is None:
+            return 4
+        return _operand_size(dest, instr.get("name", ""))
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset):
+        lines = []
+        name = instr["name"]
+        lines.append(f"  // ---- test (load): {name} ----")
+
+        dest = self._detect_load_dest(instr)
+        dest_name = dest["name"]
+        dest_kind = dest.get("register_kind", "scalar")
+        dest_reg = regs.get(dest_name, "r0")
+
+        # Align input offset for this destination type.
+        align = 32 if dest_kind in ("vector256", "vector512", "accumulator") else 4
+        in_offset = _align(in_offset, align)
+
+        # Setup: copy p0 to p6 and advance to the data region.
+        lines.extend(_padda_sequence("p6", "p0", in_offset))
+
+        # For modifier operands (2D/3D loads), zero the modifier.
+        op_by_name = {op["name"]: op for op in instr.get("operands", [])}
+        for op_name, op in op_by_name.items():
+            kind = op.get("register_kind", "")
+            if kind == "modifier_m":
+                mod_reg = regs.get(op_name, "m0")
+                lines.append(f"  mov {mod_reg}, #0")
+            elif kind == "modifier_dj":
+                dj_reg = regs.get(op_name, "dj0")
+                lines.append(f"  mov {dj_reg}, #0")
+
+        # NOP sled to cover setup latency.
+        lines.extend(_nop_sled(2))
+
+        # Execute: the load instruction itself.
+        # Override pointer operand to use p6, zero immediate offsets.
+        load_regs = dict(regs)
+        for op_name, op in op_by_name.items():
+            if op.get("register_kind") == "pointer":
+                load_regs[op_name] = "p6"
+            # NOTE: Zero all immediate offsets. Data is already at p6.
+            # Future enhancement: vary offsets and adjust p6 accordingly.
+            if op.get("operand_type") == "immediate":
+                load_regs[op_name] = "0"
+
+        asm_line = "  " + _substitute_asm(instr["asm_string"], load_regs)
+        lines.append(asm_line)
+
+        # NOP sled for load result latency.
+        lines.extend(_nop_sled(result_latency(instr)))
+
+        # Capture: store loaded value to output buffer.
+        out_offset = _align(out_offset, align)
+        store_lines = _store_instruction(dest_reg, dest_kind, "p1", out_offset)
+        lines.extend(store_lines)
+
+        lines.append("")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Strategy Dispatch
 # ---------------------------------------------------------------------------
 
 STRATEGIES: list[TestStrategy] = [
+    LoadStrategy(),
     ComputeStrategy(),
 ]
 

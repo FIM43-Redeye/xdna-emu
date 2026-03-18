@@ -674,12 +674,15 @@ class TestRealISA:
                 return
         pytest.fail("ADD not found in ISA")
 
-    def test_loads_skipped(self, isa_data):
-        """All lda-slot instructions with may_load should be skipped."""
+    def test_some_loads_testable(self, isa_data):
+        """Some lda-slot instructions should now be testable via LoadStrategy."""
+        testable = 0
         for instr in isa_data.get("lda", []):
             if instr.get("may_load"):
-                status, _ = classify_instruction(instr)
-                assert status == "skipped", f"{instr['name']} should be skipped"
+                strategy, _ = isa_test_gen.classify_with_strategies(instr)
+                if strategy is not None:
+                    testable += 1
+        assert testable > 0, "Expected some loads to be testable"
 
     def test_stores_skipped(self, isa_data):
         """All st-slot instructions with may_store should be skipped."""
@@ -803,6 +806,97 @@ class TestComputeStrategy:
         strategy = isa_test_gen.ComputeStrategy()
         new_asm = strategy.generate_test_point(instr, regs, in_offset=0, out_offset=0)
         assert old_asm == new_asm
+
+
+# ===================================================================
+# LoadStrategy tests
+# ===================================================================
+
+class TestLoadStrategy:
+    """Tests for LoadStrategy."""
+
+    def test_scalar_load_can_test(self):
+        """Simple scalar load with pointer + immediate offset."""
+        instr = _make_instr("LDA_S16", "lda.s16",
+                            "lda.s16\t$mRa, [$ptr, #$off]", [
+            _make_reg_op("mRa", "scalar"),
+            _make_reg_op("ptr", "pointer", bit_width=3),
+            _make_imm_op("off", bit_width=6, signed=True),
+        ], may_load=True, slot="lda")
+        strategy = isa_test_gen.LoadStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_rejects_store_with_may_load(self):
+        """Instructions with both may_load and may_store are stores, not loads."""
+        instr = _make_instr("ST_2D_S16", "st.2d.s16",
+                            "st.2d.s16\t$mRv, [$ptr], $mod", [
+            _make_reg_op("mRv", "scalar"),
+            _make_reg_op("ptr", "pointer", bit_width=3),
+            _make_reg_op("mod", "modifier_m", bit_width=3),
+        ], may_load=True, may_store=True, slot="lda")
+        strategy = isa_test_gen.LoadStrategy()
+        can, reason = strategy.can_test(instr)
+        assert not can
+
+    def test_rejects_no_pointer(self):
+        """VLDB_4x* register-to-register shuffles have no pointer -- reject."""
+        instr = _make_instr("VLDB_4x16_HI", "vldb.4x16.hi",
+                            "vldb.4x16.hi\t$dst, $src", [
+            _make_reg_op("dst", "vector256"),
+            _make_reg_op("src", "vector256"),
+        ], may_load=True, slot="ldb")
+        strategy = isa_test_gen.LoadStrategy()
+        can, reason = strategy.can_test(instr)
+        assert not can
+
+    def test_rejects_composite_dest(self):
+        """Loads with composite destination are deferred."""
+        instr = _make_instr("LDA_2D_LDASCL", "lda.2d",
+                            "lda.2d\t$mLdaScl, [$ptr], $mod", [
+            _make_composite_op("mLdaScl", "LdaScl", bit_width=7),
+            _make_reg_op("ptr", "pointer", bit_width=3),
+            _make_reg_op("mod", "modifier_m", bit_width=3),
+        ], may_load=True, slot="lda")
+        strategy = isa_test_gen.LoadStrategy()
+        can, reason = strategy.can_test(instr)
+        assert not can
+
+    def test_generates_valid_assembly(self):
+        """LoadStrategy should produce setup + load + capture assembly."""
+        instr = _make_instr("LDA_S16", "lda.s16",
+                            "lda.s16\t$mRa, [$ptr, #$off]", [
+            _make_reg_op("mRa", "scalar"),
+            _make_reg_op("ptr", "pointer", bit_width=3),
+            _make_imm_op("off", bit_width=6, signed=True),
+        ], may_load=True, slot="lda", sched_class="II_LDA")
+        strategy = isa_test_gen.LoadStrategy()
+        regs = {"mRa": "r0", "ptr": "p6", "off": "0"}
+        asm = strategy.generate_test_point(instr, regs,
+                                           in_offset=0, out_offset=0)
+        # Should set up p6 pointing at input data
+        assert "p6" in asm
+        # Should contain the load instruction
+        assert "lda.s16" in asm
+        # Should store the loaded value
+        assert "st" in asm
+        # Should have NOP sled for load latency
+        assert "nop" in asm
+
+    def test_vector_load_uses_vst(self):
+        """Vector loads should use vst to capture the result."""
+        instr = _make_instr("VLDA_128", "vlda.128",
+                            "vlda.128\t$dst, [$ptr, #$off]", [
+            _make_reg_op("dst", "vector256"),
+            _make_reg_op("ptr", "pointer", bit_width=3),
+            _make_imm_op("off", bit_width=6, signed=True),
+        ], may_load=True, slot="ldb", sched_class="II_VLDA")
+        strategy = isa_test_gen.LoadStrategy()
+        regs = {"dst": "wl0", "ptr": "p6", "off": "0"}
+        asm = strategy.generate_test_point(instr, regs,
+                                           in_offset=0, out_offset=0)
+        assert "vlda.128" in asm
+        assert "vst" in asm
 
 
 # ===================================================================
