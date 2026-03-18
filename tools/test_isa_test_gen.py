@@ -684,12 +684,15 @@ class TestRealISA:
                     testable += 1
         assert testable > 0, "Expected some loads to be testable"
 
-    def test_stores_skipped(self, isa_data):
-        """All st-slot instructions with may_store should be skipped."""
+    def test_some_stores_testable(self, isa_data):
+        """Some st-slot instructions should now be testable via StoreStrategy."""
+        testable = 0
         for instr in isa_data.get("st", []):
             if instr.get("may_store"):
-                status, _ = classify_instruction(instr)
-                assert status == "skipped", f"{instr['name']} should be skipped"
+                strategy, _ = isa_test_gen.classify_with_strategies(instr)
+                if strategy is not None:
+                    testable += 1
+        assert testable > 0, "Expected some stores to be testable"
 
     def test_classification_summary(self, isa_data):
         """Print summary (informational, always passes)."""
@@ -897,6 +900,115 @@ class TestLoadStrategy:
                                            in_offset=0, out_offset=0)
         assert "vlda.128" in asm
         assert "vst" in asm
+
+
+# ===================================================================
+# StoreStrategy tests
+# ===================================================================
+
+class TestStoreStrategy:
+    """Tests for StoreStrategy."""
+
+    def test_scalar_store_can_test(self):
+        instr = _make_instr("ST_S16", "st.s16",
+                            "st.s16\t$mRv, [$ptr, #$off]", [
+            _make_reg_op("mRv", "scalar"),
+            _make_reg_op("ptr", "pointer", bit_width=3),
+            _make_imm_op("off", bit_width=6, signed=True),
+        ], may_store=True, slot="st")
+        strategy = isa_test_gen.StoreStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_rejects_no_pointer(self):
+        instr = _make_instr("VST_FAKE", "vst.fake",
+                            "vst.fake\t$src, $dst", [
+            _make_reg_op("src", "vector256"),
+            _make_reg_op("dst", "vector256"),
+        ], may_store=True, slot="st")
+        strategy = isa_test_gen.StoreStrategy()
+        can, reason = strategy.can_test(instr)
+        assert not can
+
+    def test_rejects_composite_source(self):
+        instr = _make_instr("ST_COMP", "st.2d",
+                            "st.2d\t$mLdaScl, [$ptr], $mod", [
+            _make_composite_op("mLdaScl", "LdaScl", bit_width=7),
+            _make_reg_op("ptr", "pointer", bit_width=3),
+            _make_reg_op("mod", "modifier_m", bit_width=3),
+        ], may_store=True, slot="st")
+        strategy = isa_test_gen.StoreStrategy()
+        can, reason = strategy.can_test(instr)
+        assert not can
+
+    def test_generates_valid_assembly(self):
+        instr = _make_instr("ST_S16", "st.s16",
+                            "st.s16\t$mRv, [$ptr, #$off]", [
+            _make_reg_op("mRv", "scalar"),
+            _make_reg_op("ptr", "pointer", bit_width=3),
+            _make_imm_op("off", bit_width=6, signed=True),
+        ], may_store=True, slot="st", sched_class="II_ST")
+        strategy = isa_test_gen.StoreStrategy()
+        regs = {"mRv": "r0", "ptr": "p7", "off": "0"}
+        asm = strategy.generate_test_point(instr, regs,
+                                           in_offset=0, out_offset=0)
+        assert "lda" in asm
+        assert "st.s16" in asm
+        assert "p7" in asm
+
+    def test_vector_store(self):
+        instr = _make_instr("VST_128", "vst.128",
+                            "vst.128\t$src, [$ptr, #$off]", [
+            _make_reg_op("src", "vector256"),
+            _make_reg_op("ptr", "pointer", bit_width=3),
+            _make_imm_op("off", bit_width=6, signed=True),
+        ], may_store=True, slot="st", sched_class="II_VST")
+        strategy = isa_test_gen.StoreStrategy()
+        regs = {"src": "wl0", "ptr": "p7", "off": "0"}
+        asm = strategy.generate_test_point(instr, regs,
+                                           in_offset=0, out_offset=0)
+        assert "vlda" in asm
+        assert "vst.128" in asm
+
+    def test_store_width_s8(self):
+        instr = _make_instr("ST_S8", "st.s8",
+                            "st.s8\t$mRv, [$ptr, #$off]", [
+            _make_reg_op("mRv", "scalar"),
+            _make_reg_op("ptr", "pointer", bit_width=3),
+            _make_imm_op("off", bit_width=6, signed=True),
+        ], may_store=True, slot="st")
+        strategy = isa_test_gen.StoreStrategy()
+        assert strategy._compute_store_width(instr) == 1
+
+    def test_store_width_s16(self):
+        instr = _make_instr("ST_S16", "st.s16",
+                            "st.s16\t$mRv, [$ptr, #$off]", [
+            _make_reg_op("mRv", "scalar"),
+            _make_reg_op("ptr", "pointer", bit_width=3),
+            _make_imm_op("off", bit_width=6, signed=True),
+        ], may_store=True, slot="st")
+        strategy = isa_test_gen.StoreStrategy()
+        assert strategy._compute_store_width(instr) == 2
+
+    def test_store_width_scalar_default(self):
+        instr = _make_instr("ST", "st",
+                            "st\t$mRv, [$ptr, #$off]", [
+            _make_reg_op("mRv", "scalar"),
+            _make_reg_op("ptr", "pointer", bit_width=3),
+            _make_imm_op("off", bit_width=6, signed=True),
+        ], may_store=True, slot="st")
+        strategy = isa_test_gen.StoreStrategy()
+        assert strategy._compute_store_width(instr) == 4
+
+    def test_store_width_vector(self):
+        instr = _make_instr("VST", "vst",
+                            "vst\t$src, [$ptr, #$off]", [
+            _make_reg_op("src", "vector256"),
+            _make_reg_op("ptr", "pointer", bit_width=3),
+            _make_imm_op("off", bit_width=6, signed=True),
+        ], may_store=True, slot="st")
+        strategy = isa_test_gen.StoreStrategy()
+        assert strategy._compute_store_width(instr) == 32
 
 
 # ===================================================================

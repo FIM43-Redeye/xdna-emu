@@ -1014,11 +1014,164 @@ class LoadStrategy(TestStrategy):
 
 
 # ---------------------------------------------------------------------------
+# StoreStrategy: tests store instructions
+# ---------------------------------------------------------------------------
+
+class StoreStrategy(TestStrategy):
+    """Tests store instructions by loading known data then executing the store.
+
+    The store writes to the output buffer via p7. The verification is that
+    HW and EMU produce identical output bytes.
+    """
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        if not instr.get("may_store", False):
+            return (False, "not a store instruction")
+
+        operands = instr.get("operands", [])
+
+        # Must have a pointer operand.
+        has_pointer = any(
+            op.get("register_kind") == "pointer"
+            for op in operands
+            if op.get("operand_type") in REGISTER_LIKE_TYPES
+        )
+        if not has_pointer:
+            return (False, "store with no pointer operand")
+
+        # Reject composite operands.
+        for op in operands:
+            if op.get("operand_type") == "composite_register":
+                return (False, "composite register operand (deferred)")
+
+        # Detect the source (data to be stored).
+        source = self._detect_store_source(instr)
+        if source is None:
+            return (False, "no detectable store source")
+
+        kind = source.get("register_kind", "")
+        if kind not in KNOWN_REGISTER_KINDS:
+            return (False, f"unsupported store source kind: {kind}")
+
+        # Reject unknown operand types (except dontcare).
+        for op in operands:
+            op_type = op.get("operand_type", "unknown")
+            if op_type == "unknown":
+                if not op.get("name", "").startswith("dontcare"):
+                    return (False, "unknown operand type")
+
+        # Reject stack-pointer relative.
+        asm = instr.get("asm_string", "")
+        if "[sp," in asm.lower() or "[sp]" in asm.lower():
+            return (False, "stack-pointer relative store (deferred)")
+
+        return (True, "")
+
+    def _detect_store_source(self, instr: dict) -> Optional[dict]:
+        """For stores, the source is the first non-pointer, non-modifier
+        register in asm_string."""
+        asm_string = instr.get("asm_string", "")
+        asm_op_names = re.findall(r'\$(\w+)', asm_string)
+        op_by_name = {op["name"]: op for op in instr.get("operands", [])}
+
+        for name in asm_op_names:
+            if name not in op_by_name:
+                continue
+            op = op_by_name[name]
+            if op.get("operand_type") not in REGISTER_LIKE_TYPES:
+                continue
+            kind = op.get("register_kind", "")
+            if kind not in ("pointer", "modifier_m", "modifier_dj"):
+                return op
+        return None
+
+    def _compute_store_width(self, instr: dict) -> int:
+        """Determine how many bytes the store instruction actually writes."""
+        source = self._detect_store_source(instr)
+        kind = source.get("register_kind", "scalar") if source else "scalar"
+
+        if kind == "vector256":
+            return 32
+        if kind == "vector512":
+            return 64
+        if kind == "accumulator":
+            return 64
+
+        # Scalar stores: check mnemonic for data width.
+        mnemonic = instr.get("mnemonic", "")
+        if ".s8" in mnemonic or ".u8" in mnemonic:
+            return 1
+        if ".s16" in mnemonic or ".u16" in mnemonic:
+            return 2
+        return 4
+
+    def compute_input_size(self, instr, regs):
+        source = self._detect_store_source(instr)
+        if source is None:
+            return 4
+        return _operand_size(source, instr.get("name", ""))
+
+    def compute_output_size(self, instr):
+        return self._compute_store_width(instr)
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset):
+        lines = []
+        name = instr["name"]
+        lines.append(f"  // ---- test (store): {name} ----")
+
+        source = self._detect_store_source(instr)
+        src_name = source["name"]
+        src_kind = source.get("register_kind", "scalar")
+        src_reg = regs.get(src_name, "r0")
+
+        op_by_name = {op["name"]: op for op in instr.get("operands", [])}
+
+        # Align and load known data into the source register.
+        align = 32 if src_kind in ("vector256", "vector512", "accumulator") else 4
+        in_offset = _align(in_offset, align)
+        load_lines = _load_instruction(src_reg, src_kind, "p0", in_offset)
+        lines.extend(load_lines)
+
+        # NOP sled for load latency.
+        lines.extend(_nop_sled(LOAD_LATENCY))
+
+        # Setup: copy p1 to p7 and advance to output region.
+        out_offset = _align(out_offset, align)
+        lines.extend(_padda_sequence("p7", "p1", out_offset))
+
+        # For modifier operands, zero the modifier.
+        for op_name, op in op_by_name.items():
+            kind = op.get("register_kind", "")
+            if kind == "modifier_m":
+                mod_reg = regs.get(op_name, "m0")
+                lines.append(f"  mov {mod_reg}, #0")
+            elif kind == "modifier_dj":
+                dj_reg = regs.get(op_name, "dj0")
+                lines.append(f"  mov {dj_reg}, #0")
+
+        # Execute: the store instruction.
+        # Override pointer to p7, zero immediate offsets.
+        store_regs = dict(regs)
+        for op_name, op in op_by_name.items():
+            if op.get("register_kind") == "pointer":
+                store_regs[op_name] = "p7"
+            if op.get("operand_type") == "immediate":
+                store_regs[op_name] = "0"
+
+        asm_line = "  " + _substitute_asm(instr["asm_string"], store_regs)
+        lines.append(asm_line)
+
+        lines.append("")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Strategy Dispatch
 # ---------------------------------------------------------------------------
 
 STRATEGIES: list[TestStrategy] = [
     LoadStrategy(),
+    StoreStrategy(),
     ComputeStrategy(),
 ]
 
