@@ -918,6 +918,12 @@ class LoadStrategy(TestStrategy):
         if kind not in KNOWN_REGISTER_KINDS:
             return (False, f"unsupported load destination kind: {kind}")
 
+        # Reject accumulator-dest scalar loads: llvm-mc doesn't accept
+        # "lda cm0, [ptr]" syntax even though AIE2 hardware supports it.
+        mnemonic = instr.get("mnemonic", "")
+        if kind == "accumulator" and not mnemonic.startswith(("vlda", "vldb")):
+            return (False, "accumulator dest with scalar lda (unsupported by llvm-mc)")
+
         if kind == "accumulator":
             bw = dest.get("bit_width", 0)
             if bw == 2:
@@ -1052,6 +1058,12 @@ class StoreStrategy(TestStrategy):
         kind = source.get("register_kind", "")
         if kind not in KNOWN_REGISTER_KINDS:
             return (False, f"unsupported store source kind: {kind}")
+
+        # Reject accumulator-source scalar stores: llvm-mc doesn't accept
+        # "st cm0, [ptr]" syntax even though AIE2 hardware supports it.
+        mnemonic = instr.get("mnemonic", "")
+        if kind == "accumulator" and not mnemonic.startswith("vst"):
+            return (False, "accumulator source with scalar st (unsupported by llvm-mc)")
 
         # Reject unknown operand types (except dontcare).
         for op in operands:
