@@ -992,6 +992,18 @@ class TestClassifyTiedDst:
         assert status == "testable", \
             f"VSUBMSC_vmac_bm_core_dense should be testable, got: {reason}"
 
+    def test_tied_dst_substituted_in_assembly(self):
+        """$dst tied-destination must be replaced with acc1's register name."""
+        instr = self._make_vmac_family_dense(
+            "VSUBMAC_vmac_bm_core_dense", "vsubmac", bw=4)
+        strategy = isa_test_gen.ComputeStrategy()
+        can, reason = strategy.can_test(instr)
+        assert can, reason
+        combos = strategy.generate_combos(instr)
+        asm = strategy.generate_test_point(instr, combos[0],
+                                           in_offset=0, out_offset=0)
+        assert "$dst" not in asm, f"$dst not substituted in: {asm[:200]}"
+
     def test_sparse_narrow_still_skipped_by_bw2(self):
         """Sparse narrow variants have a bw=2 accumulator (qxs2) -- still skipped."""
         instr = _make_instr(

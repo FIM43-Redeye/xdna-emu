@@ -1261,6 +1261,14 @@ def _substitute_asm(asm_string: str, regs: dict[str, str],
     for name, fixed_reg in FIXED_REGISTER_MAP.items():
         result = result.replace(f"${name}", fixed_reg)
 
+    # Tied-destination: $dst appears in the asm_string but has no matching
+    # operand in the operands list (it's an alias for acc1, the in-place
+    # accumulate target).  Replace with acc1's value if present.
+    if "$dst" in result and "dst" not in regs:
+        tied_val = regs.get("acc1", regs.get("acc2", ""))
+        if tied_val:
+            result = result.replace("$dst", tied_val)
+
     # Zero-fill any remaining dontcare operands.
     result = re.sub(r'\$dontcare\w*', '#0', result)
 
