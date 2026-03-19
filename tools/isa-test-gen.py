@@ -2965,6 +2965,169 @@ class ConversionStrategy(TestStrategy):
 
 
 # ---------------------------------------------------------------------------
+# DoneStrategy: tests the `done` instruction (core halt)
+# ---------------------------------------------------------------------------
+
+
+class DoneStrategy(TestStrategy):
+    """Tests the `done` instruction using a canary pattern.
+
+    `done` halts the core.  We store a before-marker, execute `done`, then
+    store an after-marker.  The after-marker should never appear in the
+    output because the core stops at `done`.  Both EMU and HW should produce
+    identical output: before=0xAA, after=0x00 (never written).
+    """
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        if instr.get("mnemonic", "") == "done":
+            return (True, "")
+        return (False, "not the done instruction")
+
+    def compute_input_size(self, instr, regs):
+        return 0
+
+    def compute_output_size(self, instr):
+        return 8  # before marker + after marker (canary)
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        return [{}]  # No operands.
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
+        lines = []
+        lines.append(f"  // ---- test (done): DONE ----")
+
+        # Store before marker.
+        out_offset = _align(out_offset, 4)
+        lines.append(f"  mov r14, #170")
+        lines.extend(_scalar_store("r14", "p1", out_offset))
+
+        # Execute done -- core halts here.
+        lines.append(f"  done")
+
+        # After marker (canary -- should never execute).
+        lines.append(f"  mov r14, #204")
+        lines.extend(_scalar_store("r14", "p1", out_offset + 4))
+
+        lines.append("")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# EventStrategy: tests the `event` instruction
+# ---------------------------------------------------------------------------
+
+
+class EventStrategy(TestStrategy):
+    """Tests the `event` instruction using marker-based verification.
+
+    `event $val` fires a hardware event (trace system).  It does not stall
+    the core or produce register output.  We verify execution by storing
+    before/after markers -- both should appear since event is non-blocking.
+    """
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        if instr.get("mnemonic", "") == "event":
+            return (True, "")
+        return (False, "not the event instruction")
+
+    def compute_input_size(self, instr, regs):
+        return 0
+
+    def compute_output_size(self, instr):
+        return 8  # before + after markers
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        return [{"val": "0"}]  # Event value 0 (2-bit field: 0-3).
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
+        lines = []
+        lines.append(f"  // ---- test (event): EVENT ----")
+
+        # Store before marker.
+        out_offset = _align(out_offset, 4)
+        lines.append(f"  mov r14, #170")
+        lines.extend(_scalar_store("r14", "p1", out_offset))
+
+        # Execute event (non-blocking, fires trace event).
+        val = regs.get("val", "0")
+        lines.append(f"  event #{val}")
+
+        # Store after marker (proves event didn't stall).
+        lines.append(f"  mov r14, #204")
+        lines.extend(_scalar_store("r14", "p1", out_offset + 4))
+
+        lines.append("")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# PaddaSpStrategy: tests `padda [sp], $imm`
+# ---------------------------------------------------------------------------
+
+
+class PaddaSpStrategy(TestStrategy):
+    """Tests `padda [sp], $imm` -- SP pointer increment.
+
+    `padda [sp], $imm` adds imm*32 to SP (p6).  Since SP has no explicit
+    output register, we:
+      1. Save p6 to a scratch register
+      2. Set p6 to a known value (0)
+      3. Execute padda [sp], #imm
+      4. Read back p6 (now = 0 + imm*32) and store to output
+      5. Restore p6
+
+    Only handles padda [sp]; paddb [sp] is blocked by llvm-mc #858.
+    """
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        name = instr.get("name", "")
+        if name == "PADDA_sp_imm":
+            return (True, "")
+        if name == "PADDB_sp_imm":
+            return (False, "paddb [sp] blocked by llvm-mc #858")
+        return (False, "not a padda [sp] instruction")
+
+    def compute_input_size(self, instr, regs):
+        return 0
+
+    def compute_output_size(self, instr):
+        return 4  # One 32-bit pointer value.
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        # Use imm=32 (one step).  llvm-mc requires SP immediates to be
+        # multiples of 32; the ISA JSON scale=32 means the HW field stores
+        # imm/32, but the assembler takes the raw byte value.
+        return [{"imm": "32", "dontcare2": "0"}]
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
+        lines = []
+        lines.append(f"  // ---- test (padda_sp): PADDA_sp_imm ----")
+
+        out_offset = _align(out_offset, 4)
+
+        # Save current p6 (SP) to r13 so we can restore it later.
+        # mov r13, p6 uses the mv slot (MOV_mv_scl).
+        lines.append(f"  mov r13, p6")
+
+        # Set p6 to 0 so the result is deterministic.
+        lines.append(f"  movxm p6, #0")
+
+        # Execute padda [sp], #imm.
+        imm = regs.get("imm", "32")
+        lines.append(f"  padda [sp], #{imm}")
+
+        # Read back p6 (now = 0 + imm*32) and store to output.
+        lines.append(f"  mov r14, p6")
+        lines.extend(_scalar_store("r14", "p1", out_offset))
+
+        # Restore p6.
+        lines.append(f"  mov p6, r13")
+
+        lines.append("")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Strategy Dispatch
 # ---------------------------------------------------------------------------
 
@@ -2973,6 +3136,9 @@ STRATEGIES: list[TestStrategy] = [
     LockStrategy(),
     FifoLoadStrategy(),
     CascadeStrategy(),
+    DoneStrategy(),
+    EventStrategy(),
+    PaddaSpStrategy(),
     LoadStrategy(),
     StoreStrategy(),
     ComputeStrategy(),

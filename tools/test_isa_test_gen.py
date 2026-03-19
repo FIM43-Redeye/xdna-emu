@@ -2735,6 +2735,235 @@ class TestCascadeStrategy:
 
 
 # ===================================================================
+# DoneStrategy tests
+# ===================================================================
+
+class TestDoneStrategy:
+    """Tests for DoneStrategy -- verifies `done` halts the core."""
+
+    def _make_done(self):
+        return _make_instr("DONE", "done", "done\t", [])
+
+    def _make_event(self):
+        """Event instruction should NOT be handled by DoneStrategy."""
+        return _make_instr("EVENT", "event", "event\t$val", [
+            _make_imm_op("val", bit_width=2, signed=False),
+        ])
+
+    def test_done_can_test(self):
+        strategy = isa_test_gen.DoneStrategy()
+        can, reason = strategy.can_test(self._make_done())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_event_rejected(self):
+        strategy = isa_test_gen.DoneStrategy()
+        can, _ = strategy.can_test(self._make_event())
+        assert not can
+
+    def test_non_done_rejected(self):
+        strategy = isa_test_gen.DoneStrategy()
+        instr = _make_instr("ADD", "add", "add\t$mRx, $mRy, $mRz", [
+            _make_reg_op("mRx", "scalar"),
+        ])
+        can, _ = strategy.can_test(instr)
+        assert not can
+
+    def test_no_input_buffer(self):
+        strategy = isa_test_gen.DoneStrategy()
+        assert strategy.compute_input_size(self._make_done(), {}) == 0
+
+    def test_output_size_is_8(self):
+        """8 bytes: before marker + after marker (canary, should stay zero)."""
+        strategy = isa_test_gen.DoneStrategy()
+        assert strategy.compute_output_size(self._make_done()) == 8
+
+    def test_one_combo(self):
+        strategy = isa_test_gen.DoneStrategy()
+        combos = strategy.generate_combos(self._make_done())
+        assert len(combos) == 1
+
+    def test_generates_before_marker(self):
+        """Should store a before marker, then execute done."""
+        strategy = isa_test_gen.DoneStrategy()
+        regs = strategy.generate_combos(self._make_done())[0]
+        asm = strategy.generate_test_point(self._make_done(), regs,
+                                           in_offset=0, out_offset=0)
+        assert "#170" in asm  # before marker 0xAA
+
+    def test_generates_done_instruction(self):
+        strategy = isa_test_gen.DoneStrategy()
+        regs = strategy.generate_combos(self._make_done())[0]
+        asm = strategy.generate_test_point(self._make_done(), regs,
+                                           in_offset=0, out_offset=0)
+        assert "done" in asm
+
+    def test_after_marker_follows_done(self):
+        """After marker should be present (but won't execute -- canary)."""
+        strategy = isa_test_gen.DoneStrategy()
+        regs = strategy.generate_combos(self._make_done())[0]
+        asm = strategy.generate_test_point(self._make_done(), regs,
+                                           in_offset=0, out_offset=0)
+        assert "#204" in asm  # after marker 0xCC
+        # The done instruction should appear BEFORE the after marker
+        lines = asm.split("\n")
+        done_line = next(i for i, l in enumerate(lines) if "done" in l and "//" not in l)
+        after_line = next(i for i, l in enumerate(lines) if "#204" in l)
+        assert done_line < after_line
+
+
+# ===================================================================
+# EventStrategy tests
+# ===================================================================
+
+class TestEventStrategy:
+    """Tests for EventStrategy -- verifies `event` fires without stalling."""
+
+    def _make_event(self):
+        return _make_instr("EVENT", "event", "event\t$val", [
+            _make_imm_op("val", bit_width=2, signed=False),
+        ])
+
+    def _make_done(self):
+        return _make_instr("DONE", "done", "done\t", [])
+
+    def test_event_can_test(self):
+        strategy = isa_test_gen.EventStrategy()
+        can, reason = strategy.can_test(self._make_event())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_done_rejected(self):
+        strategy = isa_test_gen.EventStrategy()
+        can, _ = strategy.can_test(self._make_done())
+        assert not can
+
+    def test_non_event_rejected(self):
+        strategy = isa_test_gen.EventStrategy()
+        instr = _make_instr("ADD", "add", "add\t$mRx, $mRy, $mRz", [
+            _make_reg_op("mRx", "scalar"),
+        ])
+        can, _ = strategy.can_test(instr)
+        assert not can
+
+    def test_no_input_buffer(self):
+        strategy = isa_test_gen.EventStrategy()
+        assert strategy.compute_input_size(self._make_event(), {}) == 0
+
+    def test_output_size_is_8(self):
+        strategy = isa_test_gen.EventStrategy()
+        assert strategy.compute_output_size(self._make_event()) == 8
+
+    def test_one_combo(self):
+        strategy = isa_test_gen.EventStrategy()
+        combos = strategy.generate_combos(self._make_event())
+        assert len(combos) == 1
+
+    def test_combo_has_val(self):
+        """Event immediate value should be set (0-3 range)."""
+        strategy = isa_test_gen.EventStrategy()
+        combos = strategy.generate_combos(self._make_event())
+        assert "val" in combos[0]
+
+    def test_generates_markers(self):
+        """Both before and after markers should appear (event doesn't stall)."""
+        strategy = isa_test_gen.EventStrategy()
+        regs = strategy.generate_combos(self._make_event())[0]
+        asm = strategy.generate_test_point(self._make_event(), regs,
+                                           in_offset=0, out_offset=0)
+        assert "#170" in asm  # before
+        assert "#204" in asm  # after
+
+    def test_generates_event_instruction(self):
+        strategy = isa_test_gen.EventStrategy()
+        regs = strategy.generate_combos(self._make_event())[0]
+        asm = strategy.generate_test_point(self._make_event(), regs,
+                                           in_offset=0, out_offset=0)
+        assert "event" in asm
+
+
+# ===================================================================
+# PaddaSpStrategy tests
+# ===================================================================
+
+class TestPaddaSpStrategy:
+    """Tests for PaddaSpStrategy -- verifies padda [sp], $imm."""
+
+    def _make_padda_sp(self):
+        return _make_instr("PADDA_sp_imm", "padda", "padda\t[sp], $imm", [
+            {"name": "dontcare2", "bit_width": 2, "is_output": False,
+             "operand_type": "unknown", "register_kind": None,
+             "signed": False, "scale": None},
+            {"name": "imm", "bit_width": 13, "is_output": False,
+             "operand_type": "immediate", "register_kind": None,
+             "signed": True, "scale": 32},
+        ])
+
+    def _make_paddb_sp(self):
+        return _make_instr("PADDB_sp_imm", "paddb", "paddb\t[sp], $imm", [
+            {"name": "imm", "bit_width": 12, "is_output": False,
+             "operand_type": "immediate", "register_kind": None,
+             "signed": True, "scale": 32},
+        ])
+
+    def test_padda_sp_can_test(self):
+        strategy = isa_test_gen.PaddaSpStrategy()
+        can, reason = strategy.can_test(self._make_padda_sp())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_paddb_sp_rejected(self):
+        """paddb [sp] is blocked by llvm-mc #858."""
+        strategy = isa_test_gen.PaddaSpStrategy()
+        can, _ = strategy.can_test(self._make_paddb_sp())
+        assert not can
+
+    def test_non_padda_rejected(self):
+        strategy = isa_test_gen.PaddaSpStrategy()
+        instr = _make_instr("ADD", "add", "add\t$mRx, $mRy, $mRz", [
+            _make_reg_op("mRx", "scalar"),
+        ])
+        can, _ = strategy.can_test(instr)
+        assert not can
+
+    def test_no_input_buffer(self):
+        strategy = isa_test_gen.PaddaSpStrategy()
+        assert strategy.compute_input_size(self._make_padda_sp(), {}) == 0
+
+    def test_output_size(self):
+        """Output: 4 bytes for the modified pointer value."""
+        strategy = isa_test_gen.PaddaSpStrategy()
+        assert strategy.compute_output_size(self._make_padda_sp()) == 4
+
+    def test_one_combo(self):
+        strategy = isa_test_gen.PaddaSpStrategy()
+        combos = strategy.generate_combos(self._make_padda_sp())
+        assert len(combos) == 1
+
+    def test_generates_sp_setup(self):
+        """Should set up p6 (SP) with a known value before padda."""
+        strategy = isa_test_gen.PaddaSpStrategy()
+        regs = strategy.generate_combos(self._make_padda_sp())[0]
+        asm = strategy.generate_test_point(self._make_padda_sp(), regs,
+                                           in_offset=0, out_offset=0)
+        # Should reference p6 (SP alias)
+        assert "p6" in asm
+
+    def test_reads_back_modified_sp(self):
+        """Should store the modified p6 value to the output buffer."""
+        strategy = isa_test_gen.PaddaSpStrategy()
+        regs = strategy.generate_combos(self._make_padda_sp())[0]
+        asm = strategy.generate_test_point(self._make_padda_sp(), regs,
+                                           in_offset=0, out_offset=0)
+        # Should store the result (modified p6) to output
+        assert "st" in asm.lower()
+
+    def test_generates_padda_instruction(self):
+        strategy = isa_test_gen.PaddaSpStrategy()
+        regs = strategy.generate_combos(self._make_padda_sp())[0]
+        asm = strategy.generate_test_point(self._make_padda_sp(), regs,
+                                           in_offset=0, out_offset=0)
+        assert "padda" in asm and "[sp]" in asm
+
+
+# ===================================================================
 # Task 4: generate_all integration tests
 # ===================================================================
 
