@@ -2834,6 +2834,107 @@ class StreamStrategy(TestStrategy):
     def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
         raise NotImplementedError("StreamStrategy uses generate_stream_pair()")
 
+    def _delay_count(self, instr):
+        """Extract delay count from mov.d* mnemonic."""
+        m = re.match(r"mov\.d(\d)", instr.get("mnemonic", ""))
+        return int(m.group(1)) if m else 1
+
+    def generate_stream_pair(self, instr, regs):
+        """Generate producer + consumer assembly pair for a stream instruction.
+
+        Returns dict with 'producer_asm' and 'consumer_asm' keys.
+        """
+        mode = self._detect_mode(instr)
+        if mode == "stream_write":
+            return {"producer_asm": self._gen_write_producer(instr, regs),
+                    "consumer_asm": self._gen_write_consumer()}
+        elif mode == "stream_read":
+            return {"producer_asm": self._gen_read_producer(),
+                    "consumer_asm": self._gen_read_consumer(instr, regs)}
+        else:  # ss_status
+            return {"producer_asm": self._gen_status_producer(),
+                    "consumer_asm": self._gen_status_consumer(instr, regs)}
+
+    def _gen_write_producer(self, instr, regs):
+        """Test tile: immediate value, markers, stream write instruction."""
+        asm_str = instr.get("asm_string", "")
+        name = instr["name"]
+        lines = [f"  // ---- stream write producer (test): {name} ----"]
+        lines.append("  mov r0, #0xBEEF")
+        if self._has_tlast_reg(instr):
+            lines.append("  mov r1, #1")
+        if "cph" in asm_str:
+            lines.append("  mov m0, #0")
+        lines.append("  mov r14, #170")
+        lines.extend(_scalar_store("r14", "p0", 0))
+        asm_line = _substitute_asm(asm_str, regs)
+        lines.append(f"  {asm_line}")
+        lines.append("  mov r14, #204")
+        lines.extend(_scalar_store("r14", "p0", 4))
+        lines.append("")
+        return "\n".join(lines)
+
+    def _gen_write_consumer(self):
+        """Helper: drain stream via mov.d1, store received value."""
+        lines = ["  // ---- stream write consumer (helper): drain ss0 ----"]
+        lines.append("  mov.d1 r0, ss0")
+        lines.append("  nop")
+        lines.extend(_scalar_store("r0", "p0", 0))
+        lines.append("")
+        return "\n".join(lines)
+
+    def _gen_read_producer(self):
+        """Helper: write known value to ms."""
+        lines = ["  // ---- stream read producer (helper): write ms ----"]
+        lines.append("  mov r0, #0xBEEF")
+        lines.append("  mov r14, #170")
+        lines.extend(_scalar_store("r14", "p0", 0))
+        lines.append("  mov ms, r0")
+        lines.append("  mov r14, #204")
+        lines.extend(_scalar_store("r14", "p0", 4))
+        lines.append("")
+        return "\n".join(lines)
+
+    def _gen_read_consumer(self, instr, regs):
+        """Test tile: execute mov.d* stream read, NOP sled, store result."""
+        name = instr["name"]
+        delay = self._delay_count(instr)
+        asm_str = instr.get("asm_string", "")
+        lines = [f"  // ---- stream read consumer (test): {name} ----"]
+        asm_line = _substitute_asm(asm_str, regs)
+        lines.append(f"  {asm_line}")
+        lines.extend(_nop_sled(delay))
+        lines.extend(_scalar_store("r0", "p0", 0))
+        lines.append("")
+        return "\n".join(lines)
+
+    def _gen_status_producer(self):
+        """Helper: write dummy value to establish active flow."""
+        lines = ["  // ---- SS status producer (helper): establish flow ----"]
+        lines.append("  mov r0, #0xDEAD")
+        lines.append("  mov r14, #170")
+        lines.extend(_scalar_store("r14", "p0", 0))
+        lines.append("  mov ms, r0")
+        lines.append("  mov r14, #204")
+        lines.extend(_scalar_store("r14", "p0", 4))
+        lines.append("")
+        return "\n".join(lines)
+
+    def _gen_status_consumer(self, instr, regs):
+        """Test tile: markers around SS read, plus store status value."""
+        name = instr["name"]
+        asm_str = instr.get("asm_string", "")
+        lines = [f"  // ---- SS status consumer (test): {name} ----"]
+        lines.append("  mov r14, #170")
+        lines.extend(_scalar_store("r14", "p0", 0))
+        asm_line = _substitute_asm(asm_str, regs)
+        lines.append(f"  {asm_line}")
+        lines.append("  mov r14, #204")
+        lines.extend(_scalar_store("r14", "p0", 4))
+        lines.extend(_scalar_store("r0", "p0", 8))
+        lines.append("")
+        return "\n".join(lines)
+
 
 # ---------------------------------------------------------------------------
 # ConversionStrategy: LLVM IR generation for fused conversion instructions

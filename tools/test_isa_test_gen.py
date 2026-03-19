@@ -4369,3 +4369,144 @@ class TestStreamStrategy:
     def test_consumer_output_size_ss_status(self):
         strategy = isa_test_gen.StreamStrategy()
         assert strategy.compute_consumer_output_size(self._make_ss_status_read()) == 12
+
+    # -- generate_stream_pair: stream_write mode --
+
+    def test_stream_write_producer_has_markers(self):
+        strategy = isa_test_gen.StreamStrategy()
+        regs = {"src": "r0"}
+        result = strategy.generate_stream_pair(self._make_stream_write_nb(), regs)
+        prod = result["producer_asm"]
+        assert "#170" in prod
+        assert "#204" in prod
+
+    def test_stream_write_producer_uses_p0(self):
+        strategy = isa_test_gen.StreamStrategy()
+        regs = {"src": "r0"}
+        result = strategy.generate_stream_pair(self._make_stream_write_nb(), regs)
+        prod = result["producer_asm"]
+        assert "p0" in prod
+        assert "p1" not in prod
+
+    def test_stream_write_producer_has_test_instruction(self):
+        strategy = isa_test_gen.StreamStrategy()
+        regs = {"src": "r0"}
+        result = strategy.generate_stream_pair(self._make_stream_write_nb(), regs)
+        prod = result["producer_asm"]
+        assert "mov.nb" in prod
+        assert "ms" in prod
+
+    def test_stream_write_consumer_reads_ss0(self):
+        strategy = isa_test_gen.StreamStrategy()
+        regs = {"src": "r0"}
+        result = strategy.generate_stream_pair(self._make_stream_write_nb(), regs)
+        cons = result["consumer_asm"]
+        assert "ss0" in cons
+
+    def test_stream_write_consumer_stores_to_p0(self):
+        strategy = isa_test_gen.StreamStrategy()
+        regs = {"src": "r0"}
+        result = strategy.generate_stream_pair(self._make_stream_write_nb(), regs)
+        cons = result["consumer_asm"]
+        assert "p0" in cons
+
+    def test_stream_write_consumer_has_nop_after_read(self):
+        strategy = isa_test_gen.StreamStrategy()
+        regs = {"src": "r0"}
+        result = strategy.generate_stream_pair(self._make_stream_write_nb(), regs)
+        cons = result["consumer_asm"]
+        lines = cons.strip().split("\n")
+        # Find mov.d1 line, next should be nop
+        for i, line in enumerate(lines):
+            if "mov.d1" in line and i + 1 < len(lines):
+                assert "nop" in lines[i + 1]
+                break
+        else:
+            assert False, "mov.d1 not found in consumer"
+
+    def test_stream_write_cph_zeros_modifier(self):
+        strategy = isa_test_gen.StreamStrategy()
+        regs = {"addr": "m0", "nw": "0", "op": "0", "id": "r0"}
+        result = strategy.generate_stream_pair(self._make_stream_write_cph(), regs)
+        prod = result["producer_asm"]
+        assert "m0" in prod
+        assert "#0" in prod
+
+    def test_stream_write_tlast_reg_sets_register(self):
+        strategy = isa_test_gen.StreamStrategy()
+        regs = {"src": "r0", "tlast": "r1"}
+        result = strategy.generate_stream_pair(self._make_stream_write_tlast(), regs)
+        prod = result["producer_asm"]
+        assert "r1" in prod
+
+    # -- generate_stream_pair: stream_read mode --
+
+    def test_stream_read_consumer_has_test_instruction(self):
+        strategy = isa_test_gen.StreamStrategy()
+        regs = {"dst": "r0", "src": "ss0"}
+        result = strategy.generate_stream_pair(self._make_stream_read_d1(), regs)
+        cons = result["consumer_asm"]
+        assert "mov.d1" in cons
+        assert "ss0" in cons
+
+    def test_stream_read_consumer_has_nop_sled(self):
+        strategy = isa_test_gen.StreamStrategy()
+        regs = {"dst": "r0", "src": "ss0"}
+        result = strategy.generate_stream_pair(self._make_stream_read_d1(), regs)
+        cons = result["consumer_asm"]
+        lines = cons.strip().split("\n")
+        # Find mov.d1 line, nop should follow before the store
+        for i, line in enumerate(lines):
+            if "mov.d1" in line and i + 1 < len(lines):
+                assert "nop" in lines[i + 1]
+                break
+        else:
+            assert False, "mov.d1 not found in consumer"
+
+    def test_stream_read_producer_writes_ms(self):
+        strategy = isa_test_gen.StreamStrategy()
+        regs = {"dst": "r0", "src": "ss0"}
+        result = strategy.generate_stream_pair(self._make_stream_read_d1(), regs)
+        prod = result["producer_asm"]
+        assert "ms" in prod
+
+    def test_stream_read_producer_has_markers(self):
+        strategy = isa_test_gen.StreamStrategy()
+        regs = {"dst": "r0", "src": "ss0"}
+        result = strategy.generate_stream_pair(self._make_stream_read_d1(), regs)
+        prod = result["producer_asm"]
+        assert "#170" in prod
+        assert "#204" in prod
+
+    # -- generate_stream_pair: ss_status mode --
+
+    def test_ss_status_consumer_has_ss_read(self):
+        strategy = isa_test_gen.StreamStrategy()
+        regs = {"mRa": "r0"}
+        result = strategy.generate_stream_pair(self._make_ss_status_read(), regs)
+        cons = result["consumer_asm"]
+        assert "SS" in cons
+
+    def test_ss_status_consumer_has_markers(self):
+        strategy = isa_test_gen.StreamStrategy()
+        regs = {"mRa": "r0"}
+        result = strategy.generate_stream_pair(self._make_ss_status_read(), regs)
+        cons = result["consumer_asm"]
+        assert "#170" in cons
+        assert "#204" in cons
+
+    def test_ss_status_consumer_stores_value(self):
+        strategy = isa_test_gen.StreamStrategy()
+        regs = {"mRa": "r0"}
+        result = strategy.generate_stream_pair(self._make_ss_status_read(), regs)
+        cons = result["consumer_asm"]
+        # Should have 3+ stores: marker_before, marker_after, value
+        store_count = cons.count("st ")
+        assert store_count >= 3, f"Expected 3+ stores, got {store_count}"
+
+    def test_ss_status_producer_writes_ms(self):
+        strategy = isa_test_gen.StreamStrategy()
+        regs = {"mRa": "r0"}
+        result = strategy.generate_stream_pair(self._make_ss_status_read(), regs)
+        prod = result["producer_asm"]
+        assert "ms" in prod
