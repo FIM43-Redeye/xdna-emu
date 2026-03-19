@@ -434,8 +434,12 @@ class TestClassifyInstruction:
         assert status == "testable", \
             f"MOVX_mvx_scl should be testable (control reg readback), got: {reason}"
 
-    def test_skip_composite_sparse_register(self):
-        """Instructions with accumulator bw=2 are actually composite/sparse."""
+    def test_sparse_qxs2_testable(self):
+        """Sparse multiply with qxs2 (accumulator bw=2) is now testable.
+
+        The _resolve_sparse_qx heuristic resolves qxs2 to sparse_qx kind,
+        which is a known register kind mapped to qx0-qx3.
+        """
         instr = _make_instr("VNEGMSC_sparse", "vnegmsc",
                             "vnegmsc\t$dst, $acc1, $xs1, $qxs2, $c", [
             _make_reg_op("dst", "accumulator", bit_width=4),
@@ -445,8 +449,18 @@ class TestClassifyInstruction:
             _make_reg_op("c", "scalar"),
         ])
         status, reason = classify_instruction(instr)
+        assert status == "testable", f"Expected testable, got {status}: {reason}"
+
+    def test_non_qxs2_bw2_still_skipped(self):
+        """Accumulator bw=2 operands NOT named qxs2 are still skipped."""
+        instr = _make_instr("FOO_bw2", "foo",
+                            "foo\t$dst, $src", [
+            _make_reg_op("dst", "accumulator", bit_width=4),
+            _make_reg_op("src", "accumulator", bit_width=2),
+        ])
+        status, reason = classify_instruction(instr)
         assert status == "skipped"
-        assert "sparse" in reason or "bw=2" in reason
+        assert "bw=2" in reason or "sparse" in reason
 
     def test_dontcare_operand_accepted(self):
         """Instructions with dontcare padding operands should be testable."""
@@ -458,12 +472,25 @@ class TestClassifyInstruction:
         status, reason = classify_instruction(instr)
         assert status == "testable", f"Expected testable, got {status}: {reason}"
 
-    def test_non_dontcare_unknown_still_skipped(self):
-        """Unknown operands that are NOT dontcare should still be skipped."""
-        instr = _make_instr("FOO", "foo", "foo\t$dst, $src, $ys1", [
+    def test_ys1_wide_y_testable(self):
+        """ys1 (unknown bw=2) is now resolved to wide_y (y2-y5)."""
+        instr = _make_instr("VMAC_sparse_wide", "vmac",
+                            "vmac\t$dst, $acc1, $ys1, $qxs2, $c", [
+            _make_reg_op("dst", "accumulator", bit_width=4),
+            _make_reg_op("acc1", "accumulator", bit_width=4),
+            _make_unknown_op("ys1", bit_width=2),
+            _make_reg_op("qxs2", "accumulator", bit_width=2),
+            _make_reg_op("c", "scalar"),
+        ])
+        status, reason = classify_instruction(instr)
+        assert status == "testable", f"Expected testable, got {status}: {reason}"
+
+    def test_non_ys1_unknown_bw2_still_skipped(self):
+        """Unknown bw=2 operands NOT named ys1 are still skipped."""
+        instr = _make_instr("FOO", "foo", "foo\t$dst, $src, $weird", [
             _make_reg_op("dst", "scalar"),
             _make_reg_op("src", "scalar"),
-            _make_unknown_op("ys1", bit_width=2),
+            _make_unknown_op("weird", bit_width=2),
         ])
         status, reason = classify_instruction(instr)
         assert status == "skipped"
@@ -739,6 +766,17 @@ class TestRegisterNames:
                                instr_name="VGE_D8")
         assert ":" in names[0]
         assert names[0] == "r19:r18"  # r17:r16 avoided (r16 callee-saved)
+
+    def test_wide_y_returns_y_registers(self):
+        """wide_y kind maps to y2-y5 (eYs 1024-bit wide vector class)."""
+        names = register_names("wide_y")
+        assert names == ["y2", "y3", "y4", "y5"]
+
+    def test_sparse_qx_returns_qx_registers(self):
+        """sparse_qx kind maps to qx0-qx3 (mQQXw sparse composite class)."""
+        names = register_names("sparse_qx")
+        assert names == ["qx0", "qx1", "qx2", "qx3"]
+
     def test_result_latency_scalar_alu(self):
         """Scalar ALU gets MIN_RESULT_LATENCY floor (model says 1)."""
         instr = {"sched_class": "II_ABS"}
@@ -1004,8 +1042,11 @@ class TestClassifyTiedDst:
                                            in_offset=0, out_offset=0)
         assert "$dst" not in asm, f"$dst not substituted in: {asm[:200]}"
 
-    def test_sparse_narrow_still_skipped_by_bw2(self):
-        """Sparse narrow variants have a bw=2 accumulator (qxs2) -- still skipped."""
+    def test_sparse_narrow_now_testable(self):
+        """Sparse narrow variants (qxs2 bw=2) are now testable.
+
+        _resolve_sparse_qx resolves qxs2 to sparse_qx, a known register kind.
+        """
         instr = _make_instr(
             "VADDMAC_vmac_cm_core_sparse_narrow", "vaddmac",
             "vaddmac\t$dst, $acc1, $acc2, $xs1, $qxs2, $c",
@@ -1019,12 +1060,15 @@ class TestClassifyTiedDst:
             slot="vec", is_vector=True,
         )
         status, reason = classify_instruction(instr)
-        assert status == "skipped", \
-            f"Sparse narrow should be skipped (bw=2 qxs2), got testable"
-        assert "sparse" in reason or "bw=2" in reason
+        assert status == "testable", \
+            f"Sparse narrow should be testable now, got {status}: {reason}"
 
-    def test_sparse_wide_still_skipped_by_unknown_ys1(self):
-        """Sparse wide variants have an unknown 'ys1' operand -- still skipped."""
+    def test_sparse_wide_now_testable(self):
+        """Sparse wide variants (ys1 + qxs2) are now testable.
+
+        _resolve_unknown_operand resolves ys1 to wide_y, and
+        _resolve_sparse_qx resolves qxs2 to sparse_qx.
+        """
         instr = _make_instr(
             "VADDMSC_F_vmac_bm_core_sparse_wide", "vaddmsc.f",
             "vaddmsc.f\t$dst, $acc1, $acc2, $ys1, $qxs2, $c",
@@ -1038,8 +1082,8 @@ class TestClassifyTiedDst:
             slot="vec", is_vector=True,
         )
         status, reason = classify_instruction(instr)
-        assert status == "skipped", \
-            f"Sparse wide should be skipped (unknown ys1 / bw=2 qxs2), got testable"
+        assert status == "testable", \
+            f"Sparse wide should be testable now, got {status}: {reason}"
 
 
 # ===================================================================
@@ -2347,6 +2391,56 @@ class TestResolveUnknownOperand:
         assert resolved is op  # unchanged
 
 
+class TestResolveSparseOperands:
+    """Tests for _resolve_sparse_qx() and _resolve_operand() with ys1/qxs2."""
+
+    def test_qxs2_resolved_to_sparse_qx(self):
+        """qxs2 with accumulator bw=2 -> sparse_qx kind."""
+        op = _make_reg_op("qxs2", "accumulator", bit_width=2)
+        resolved = isa_test_gen._resolve_sparse_qx(op)
+        assert resolved["register_kind"] == "sparse_qx"
+        assert resolved["operand_type"] == "register"
+
+    def test_non_qxs2_accumulator_bw2_unchanged(self):
+        """Non-qxs2 accumulator bw=2 (e.g. dst for quad load) is unchanged."""
+        op = _make_reg_op("dst", "accumulator", bit_width=2)
+        resolved = isa_test_gen._resolve_sparse_qx(op)
+        assert resolved["register_kind"] == "accumulator"
+
+    def test_ys1_resolved_to_wide_y(self):
+        """ys1 with unknown bw=2 -> wide_y kind via _resolve_unknown_operand."""
+        op = _make_unknown_op("ys1", bit_width=2)
+        resolved = isa_test_gen._resolve_unknown_operand(op)
+        assert resolved["operand_type"] == "register"
+        assert resolved["register_kind"] == "wide_y"
+
+    def test_non_ys1_unknown_bw2_unchanged(self):
+        """Non-ys1 unknown bw=2 is not resolved."""
+        op = _make_unknown_op("weird", bit_width=2)
+        resolved = isa_test_gen._resolve_unknown_operand(op)
+        assert resolved["operand_type"] == "unknown"
+
+    def test_resolve_operand_chains_all(self):
+        """_resolve_operand applies cm-class, ys1, and qxs2 resolvers."""
+        # cm-class
+        op = _make_cm_unknown_op("dst")
+        assert isa_test_gen._resolve_operand(op)["register_kind"] == "accumulator"
+        # ys1
+        op = _make_unknown_op("ys1", bit_width=2)
+        assert isa_test_gen._resolve_operand(op)["register_kind"] == "wide_y"
+        # qxs2
+        op = _make_reg_op("qxs2", "accumulator", bit_width=2)
+        assert isa_test_gen._resolve_operand(op)["register_kind"] == "sparse_qx"
+
+    def test_cdst_csrc_resolved_as_cm_class(self):
+        """cdst and csrc are cm-class operands (used by vmov.d)."""
+        for name in ("cdst", "csrc"):
+            op = _make_cm_unknown_op(name)
+            resolved = isa_test_gen._resolve_unknown_operand(op)
+            assert resolved["operand_type"] == "register"
+            assert resolved["register_kind"] == "accumulator"
+
+
 class TestCmClassClassification:
     """Tests for classify_instruction with cm-class operands.
 
@@ -2486,14 +2580,14 @@ class TestCmClassClassification:
         # Must include SRS to extract the cm output for storage.
         assert "vsrs" in asm
 
-    def test_unknown_bw2_still_blocked(self):
-        """Unknown operands with bit_width=2 are NOT cm-class; must stay blocked."""
+    def test_unknown_bw2_non_ys1_still_blocked(self):
+        """Unknown operands with bit_width=2 and names other than ys1 stay blocked."""
         instr = _make_instr("FOO_sparse", "foo.sparse",
                             "foo.sparse\t$dst, $acc1, $xs2, $c", [
             _make_reg_op("dst", "accumulator", bit_width=4),
             _make_reg_op("acc1", "accumulator", bit_width=4),
             _make_reg_op("xs2", "vector512"),
-            _make_unknown_op("ys1", bit_width=2),  # NOT cm-class
+            _make_unknown_op("weird_op", bit_width=2),  # NOT ys1
             _make_reg_op("c", "scalar"),
         ], slot="vec", is_vector=True)
         status, reason = classify_instruction(instr)
@@ -2501,10 +2595,10 @@ class TestCmClassClassification:
         assert "unknown" in reason.lower()
 
     def test_non_standard_name_still_blocked(self):
-        """Unknown operand with bw=4 but name not in {dst,src,acc1,acc2} stays blocked."""
-        instr = _make_instr("BAR", "bar", "bar\t$mRx, $ys1", [
+        """Unknown operand with bw=4 but name not in cm-class set stays blocked."""
+        instr = _make_instr("BAR", "bar", "bar\t$mRx, $zz1", [
             _make_reg_op("mRx", "scalar"),
-            _make_cm_unknown_op("ys1"),  # bw=4, unknown, but name is not dst/src/...
+            _make_cm_unknown_op("zz1"),  # bw=4, unknown, but name not in cm-class set
         ])
         status, reason = classify_instruction(instr)
         assert status == "skipped"

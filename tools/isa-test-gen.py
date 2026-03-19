@@ -225,6 +225,15 @@ KNOWN_REGISTER_KINDS = frozenset({
     # These appear in DMV_Q load/store instructions as "accumulator" bw=2
     # in the ISA JSON (exporter misclassification); we promote them here.
     "quad",
+    # wide_y: 1024-bit wide vector registers y2-y5 (eYs class).
+    # Used as the wide source operand in sparse vector multiply.
+    # Each y register is a pair of x registers: y2={x4,x5}, y3={x6,x7}, etc.
+    "wide_y",
+    # sparse_qx: 640-bit sparse vector+mask composite registers qx0-qx3.
+    # Used as the sparse data source in vmac/vmul/vneg/vsub family.
+    # Each qx register combines an x register (512-bit vector) and a q
+    # register (128-bit mask): qx0={x0,q0}, qx1={x1,q1}, etc.
+    "sparse_qx",
 })
 
 # Operand types that are safe to handle.
@@ -314,36 +323,75 @@ TESTABLE_COMPOSITE_KINDS: dict[str, str] = {
 # This is a workaround for a known limitation of the Rust ISA exporter: it
 # cannot yet tag cm-class operands correctly.  The proper fix is to add cm
 # register class recognition to the OperandInfo export in src/tablegen/.
-_CM_CLASS_OPERAND_NAMES = frozenset({"dst", "src", "acc1", "acc2"})
+_CM_CLASS_OPERAND_NAMES = frozenset({"dst", "src", "acc1", "acc2", "cdst", "csrc"})
 
 
 def _resolve_unknown_operand(op: dict) -> dict:
     """Attempt to resolve an unknown-typed operand to a concrete register class.
 
-    Workaround: the ISA exporter does not yet tag cm-class (1024-bit full
-    accumulator, eCM/mCMm TableGen class) operands correctly.  They appear
-    with operand_type="unknown", register_kind=None, bit_width=4 instead of
-    operand_type="register", register_kind="accumulator", bit_width=4.
+    Handles three exporter limitations:
 
-    When an operand matches this signature AND its name is one of the known
-    cm-class operand names (dst, src, acc1, acc2), return a corrected copy
-    with operand_type="register" and register_kind="accumulator".
+    1. cm-class (1024-bit full accumulator, eCM/mCMm TableGen class):
+       operand_type="unknown", register_kind=None, bit_width=4 with names in
+       _CM_CLASS_OPERAND_NAMES -> register_kind="accumulator".
+
+    2. eYs (1024-bit wide vector, y2-y5 for sparse multiply):
+       operand_type="unknown", bit_width=2, name="ys1" -> register_kind="wide_y".
+       Source: AIE2GenRegisterInfo.td eYs = {y2, y3, y4, y5}.
 
     All other unknown operands are returned unchanged.
     """
     if op.get("operand_type") != "unknown":
         return op
-    if op.get("register_kind"):
+
+    name = op.get("name", "")
+    bw = op.get("bit_width")
+
+    # cm-class: bw=4, no register_kind, known cm-class name.
+    if bw == 4 and not op.get("register_kind") and name in _CM_CLASS_OPERAND_NAMES:
+        resolved = dict(op)
+        resolved["operand_type"] = "register"
+        resolved["register_kind"] = "accumulator"
+        return resolved
+
+    # eYs wide vector: bw=2, name=ys1.
+    # These appear in sparse vector multiply (vmac, vmul, etc.) as the
+    # wide source operand.  The 2-bit field encodes y2-y5 (4 entries).
+    if bw == 2 and name == "ys1":
+        resolved = dict(op)
+        resolved["operand_type"] = "register"
+        resolved["register_kind"] = "wide_y"
+        return resolved
+
+    return op
+
+
+def _resolve_sparse_qx(op: dict) -> dict:
+    """Resolve accumulator bw=2 operands named qxs2 to sparse_qx kind.
+
+    The ISA exporter classifies mQQXw (640-bit sparse vector+mask composite,
+    qx0-qx3) as accumulator bw=2.  This conflicts with mQQa (128-byte quad
+    registers q0-q3) which also appears as accumulator bw=2 in load contexts.
+
+    Disambiguation: the operand name "qxs2" is unique to sparse multiply.
+    Source: AIE2GenFixupInstrInfo.td vmac_*_core_sparse_wide encodings.
+    """
+    if op.get("register_kind") != "accumulator":
         return op
-    if op.get("bit_width") != 4:
+    if op.get("bit_width") != 2:
         return op
-    if op.get("name", "") not in _CM_CLASS_OPERAND_NAMES:
+    if op.get("name") != "qxs2":
         return op
-    # Matches the cm-class heuristic: treat as accumulator register.
     resolved = dict(op)
-    resolved["operand_type"] = "register"
-    resolved["register_kind"] = "accumulator"
+    resolved["register_kind"] = "sparse_qx"
     return resolved
+
+
+def _resolve_operand(op: dict) -> dict:
+    """Apply all operand resolution heuristics in sequence."""
+    op = _resolve_unknown_operand(op)
+    op = _resolve_sparse_qx(op)
+    return op
 
 
 def _effective_kind(op: dict) -> str:
@@ -356,8 +404,8 @@ def _effective_kind(op: dict) -> str:
     _resolve_unknown_operand), returns "accumulator".
     Returns "" for all other operand types.
     """
-    # Apply cm-class resolution before the type dispatch below.
-    op = _resolve_unknown_operand(op)
+    # Apply all operand resolution heuristics before the type dispatch below.
+    op = _resolve_operand(op)
     op_type = op.get("operand_type", "")
     kind = op.get("register_kind", "") or ""
     if op_type in REGISTER_LIKE_TYPES:
@@ -379,6 +427,13 @@ REGISTER_SIZES = {
     # quad: 128-byte (1024-bit) quadword vector registers q0-q3.
     # mQQa = AIE2Vector128RegisterClass(add q0, q1, q2, q3) per AIE2GenRegisterInfo.td.
     "quad": 128,
+    # wide_y: 128-byte (1024-bit) wide vector registers y2-y5.
+    # Each y is a pair of x registers (2 x 64 bytes).
+    "wide_y": 128,
+    # sparse_qx: 80-byte (640-bit) sparse vector+mask composite qx0-qx3.
+    # We only load the 64-byte x component; the 16-byte q mask is left at
+    # its default value (testing assembly pipeline, not computational correctness).
+    "sparse_qx": 64,
 }
 
 # Maximum positive immediate offset for lda/st (6-bit signed, step 4).
@@ -538,11 +593,12 @@ def classify_instruction(instr: dict) -> tuple[str, str]:
     if not operands:
         return ("skipped", "no operands")
 
-    # Resolve cm-class unknowns before all subsequent checks.  The ISA
-    # exporter emits operand_type="unknown" for cm-class (1024-bit full
-    # accumulator, 4-bit encoding) operands.  _resolve_unknown_operand
-    # corrects this for operands named dst/src/acc1/acc2 with bit_width=4.
-    operands = [_resolve_unknown_operand(op) for op in operands]
+    # Resolve misclassified operands before all subsequent checks.
+    # _resolve_operand handles:
+    #   - cm-class unknowns (bw=4, name in dst/src/acc1/acc2/cdst/csrc)
+    #   - eYs wide vectors (bw=2, name=ys1) -> wide_y
+    #   - mQQXw sparse composites (accumulator bw=2, name=qxs2) -> sparse_qx
+    operands = [_resolve_operand(op) for op in operands]
 
     # 7. Check each operand for unsupported types.
     for op in operands:
@@ -825,6 +881,16 @@ def register_names(kind: str, bit_width: int = 0,
     if kind == "quad":
         return ["q0", "q1", "q2", "q3"]
 
+    # wide_y: 1024-bit wide vector registers y2-y5 (eYs class).
+    # Source: AIE2GenRegisterInfo.td -- y2={x4,x5}, y3={x6,x7}, y4={x8,x9}, y5={x10,x11}.
+    if kind == "wide_y":
+        return ["y2", "y3", "y4", "y5"]
+
+    # sparse_qx: 640-bit sparse vector+mask composite registers qx0-qx3 (mQQXw class).
+    # Source: AIE2GenRegisterInfo.td -- qx0={x0,q0}, qx1={x1,q1}, etc.
+    if kind == "sparse_qx":
+        return ["qx0", "qx1", "qx2", "qx3"]
+
     # Unknown kind -- return empty.
     return []
 
@@ -1050,6 +1116,32 @@ def _load_instruction(reg_name: str, kind: str, ptr: str, offset: int) -> list[s
         return _padda_sequence("p6", ptr, offset) + [
             f"  lda {reg_name}, [p6, #0]",
         ]
+    if kind == "wide_y":
+        # 1024-bit wide vector registers y2-y5 (eYs class).
+        # Each y register is a pair of x registers: y2={x4,x5}, y3={x6,x7}, etc.
+        # Load by filling all 4 vector256 halves: wl{lo}, wh{lo}, wl{hi}, wh{hi}.
+        # y2=x4:x5 -> wl4,wh4,wl5,wh5.  y3=x6:x7 -> wl6,wh6,wl7,wh7.
+        y_idx = int(reg_name[1:])  # "y2" -> 2
+        lo_x = y_idx * 2       # y2 -> x4
+        hi_x = lo_x + 1        # y2 -> x5
+        return (
+            [f"  // load wide_y {reg_name}: x{lo_x} + x{hi_x} via 4x vlda"]
+            + _vector_load(f"wl{lo_x}", ptr, offset)
+            + _vector_load(f"wh{lo_x}", ptr, offset + 32)
+            + _vector_load(f"wl{hi_x}", ptr, offset + 64)
+            + _vector_load(f"wh{hi_x}", ptr, offset + 96)
+        )
+    if kind == "sparse_qx":
+        # 640-bit sparse vector+mask composite registers qx0-qx3 (mQQXw class).
+        # Each qx register combines an x register (512-bit) and a q mask (128-bit).
+        # We load only the x component; the q mask defaults to zero (no masking).
+        # qx0={x0,q0} -> load wl0,wh0.  qx1={x1,q1} -> load wl1,wh1.
+        qx_idx = int(reg_name[2:])  # "qx0" -> 0
+        return (
+            [f"  // load sparse_qx {reg_name}: x{qx_idx} component via 2x vlda"]
+            + _vector_load(f"wl{qx_idx}", ptr, offset)
+            + _vector_load(f"wh{qx_idx}", ptr, offset + 32)
+        )
     return [f"  // unsupported load for kind={kind}"]
 
 
@@ -1336,7 +1428,8 @@ def generate_test_point(
         if kind not in KNOWN_REGISTER_KINDS:
             continue
         # Align offset for this operand's natural alignment.
-        align = 32 if kind in ("vector256", "vector512", "accumulator") else 4
+        align = 32 if kind in ("vector256", "vector512", "accumulator",
+                                "wide_y", "sparse_qx", "quad") else 4
         cur_in_offset = _align(cur_in_offset, align)
         reg = regs.get(op_name, "r0")
         load_lines = _load_instruction(reg, kind, "p0", cur_in_offset)
@@ -1362,7 +1455,8 @@ def generate_test_point(
         # Use effective kind so testable composite kinds store correctly.
         kind = _effective_kind(op) or op.get("register_kind", "")
         # Align offset for this operand's natural alignment.
-        align = 32 if kind in ("vector256", "vector512", "accumulator") else 4
+        align = 32 if kind in ("vector256", "vector512", "accumulator",
+                                "wide_y", "sparse_qx", "quad") else 4
         cur_out_offset = _align(cur_out_offset, align)
         reg = regs.get(op["name"], "r0")
         store_lines = _store_instruction(reg, kind, "p1", cur_out_offset)
@@ -1421,9 +1515,9 @@ def generate_operand_combos(instr: dict) -> list[dict[str, str]]:
         List of dicts mapping operand name -> concrete register/value string.
     """
     operands = instr.get("operands", [])
-    # Resolve cm-class unknowns so that combo generation assigns cm register
-    # names (cm0, cm2, ...) instead of falling through to the "else: 0" branch.
-    operands = [_resolve_unknown_operand(op) for op in operands]
+    # Resolve misclassified operands so that combo generation assigns correct
+    # register names instead of falling through to the "else: 0" branch.
+    operands = [_resolve_operand(op) for op in operands]
     asm_op_names = re.findall(r'\$(\w+)', instr.get("asm_string", ""))
     op_by_name = {op["name"]: op for op in operands}
     outputs = detect_output_operands(instr)
@@ -2471,8 +2565,8 @@ def classify_with_strategies(instr: dict) -> tuple[Optional[TestStrategy], str]:
 
 def _operand_size(op: dict, instr_name: str = "") -> int:
     """Compute the storage size in bytes for a single register operand."""
-    # Resolve cm-class unknowns before inspecting the kind.
-    op = _resolve_unknown_operand(op)
+    # Resolve misclassified operands before inspecting the kind.
+    op = _resolve_operand(op)
     kind = op.get("register_kind", "")
     # For testable composite kinds, use the effective kind for sizing.
     effective = _effective_kind(op)
@@ -2511,7 +2605,8 @@ def _compute_input_size(instr: dict, regs: dict[str, str]) -> int:
             continue
         if kind not in KNOWN_REGISTER_KINDS:
             continue
-        align = 32 if kind in ("vector256", "vector512", "accumulator") else 4
+        align = 32 if kind in ("vector256", "vector512", "accumulator",
+                                "wide_y", "sparse_qx", "quad") else 4
         total = _align(total, align)
         total += _operand_size(op, instr_name)
     return max(4, total)
@@ -2525,7 +2620,8 @@ def _compute_output_size(instr: dict) -> int:
     for op in outputs:
         # Use effective kind so testable composite kinds are sized correctly.
         kind = _effective_kind(op) or op.get("register_kind", "")
-        align = 32 if kind in ("vector256", "vector512", "accumulator") else 4
+        align = 32 if kind in ("vector256", "vector512", "accumulator",
+                                "wide_y", "sparse_qx", "quad") else 4
         total = _align(total, align)
         total += _operand_size(op, instr_name)
     return max(4, total)
