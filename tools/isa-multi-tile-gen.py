@@ -73,8 +73,11 @@ def compute_phase_buffer_layout(batches: list[dict]) -> dict:
     for b in batches:
         in_sz = b["in_size"]
         out_sz = b["out_size"]
-        # Element counts (i32), minimum 1
-        in_elems = max(1, in_sz // 4)
+        # Element counts (i32), minimum 1 (but 0 for stream pairs with no input)
+        if _is_stream(b):
+            in_elems = 0
+        else:
+            in_elems = max(1, in_sz // 4)
         out_elems = max(1, out_sz // 4)
 
         in_off_bytes.append(cur_in_bytes)
@@ -151,8 +154,8 @@ def prepare_phase_objects(
     os.makedirs(phase_dir, exist_ok=True)
     result: list[str] = []
     for col, batch in enumerate(batches):
-        if _is_cascade(batch):
-            # Cascade pairs have two .o files (producer + consumer).
+        if _is_multi_tile(batch):
+            # Multi-tile pairs have two .o files (producer + consumer).
             for suffix, sym_suffix in [("producer", "prod"),
                                        ("consumer", "cons")]:
                 src_name = batch.get(
@@ -197,6 +200,16 @@ def _is_cascade(batch: dict) -> bool:
     return batch.get("source_type") == "cascade_pair"
 
 
+def _is_stream(batch: dict) -> bool:
+    """Return True if batch is a stream_pair."""
+    return batch.get("source_type") == "stream_pair"
+
+
+def _is_multi_tile(batch: dict) -> bool:
+    """Return True if batch uses two tiles (cascade or stream pair)."""
+    return _is_cascade(batch) or _is_stream(batch)
+
+
 def generate_phase_mlir(batches: list[dict], phase_idx: int) -> str:
     """Generate MLIR for one phase with up to 4 tiles.
 
@@ -229,8 +242,10 @@ def generate_phase_mlir(batches: list[dict], phase_idx: int) -> str:
     total_in = layout["total_in_elems"]
     total_out = layout["total_out_elems"]
 
-    # Identify cascade columns
+    # Identify multi-tile columns (cascade and stream pairs)
+    multi_tile_cols = [col for col, b in enumerate(batches) if _is_multi_tile(b)]
     cascade_cols = [col for col, b in enumerate(batches) if _is_cascade(b)]
+    stream_cols = [col for col, b in enumerate(batches) if _is_stream(b)]
 
     lines = []
     lines.append(f"// Phase {phase_idx}: {n_tiles} tile(s)")
@@ -244,11 +259,11 @@ def generate_phase_mlir(batches: list[dict], phase_idx: int) -> str:
     # Consumer / normal compute tiles (row 2)
     for col in range(n_tiles):
         lines.append(f"    %tile_{col}_2 = aie.tile({col}, 2)")
-    # Memtiles (row 1) for cascade columns
-    for col in cascade_cols:
+    # Memtiles (row 1) for multi-tile columns
+    for col in multi_tile_cols:
         lines.append(f"    %tile_{col}_1 = aie.tile({col}, 1)")
-    # Producer tiles (row 3) for cascade columns
-    for col in cascade_cols:
+    # Producer tiles (row 3) for multi-tile columns
+    for col in multi_tile_cols:
         lines.append(f"    %tile_{col}_3 = aie.tile({col}, 3)")
     lines.append("")
 
@@ -258,10 +273,18 @@ def generate_phase_mlir(batches: list[dict], phase_idx: int) -> str:
     if cascade_cols:
         lines.append("")
 
+    # -- Stream flow declarations --
+    for col in stream_cols:
+        lines.append(f"    aie.flow(%tile_{col}_3, Core : 0, %tile_{col}_2, Core : 0)")
+    if stream_cols:
+        lines.append("")
+
     # -- Objectfifos and function declarations per tile --
     for col, batch in enumerate(batches):
         if _is_cascade(batch):
             _emit_cascade_objectfifos(lines, col, batch)
+        elif _is_stream(batch):
+            _emit_stream_objectfifos(lines, col, batch)
         else:
             _emit_normal_objectfifos(lines, col, batch)
 
@@ -269,14 +292,18 @@ def generate_phase_mlir(batches: list[dict], phase_idx: int) -> str:
     for col, batch in enumerate(batches):
         if _is_cascade(batch):
             _emit_cascade_cores(lines, col, batch)
+        elif _is_stream(batch):
+            _emit_stream_cores(lines, col, batch)
         else:
             _emit_normal_core(lines, col, batch)
 
     # -- Runtime sequence --
+    # MLIR memref size must be >= 1 even if no input is needed.
+    rt_in = max(1, total_in)
     lines.append(
         f"    aie.runtime_sequence("
-        f"%in : memref<{total_in}xi32>, "
-        f"%buf : memref<{total_in}xi32>, "
+        f"%in : memref<{rt_in}xi32>, "
+        f"%buf : memref<{rt_in}xi32>, "
         f"%out : memref<{total_out}xi32>) {{"
     )
 
@@ -316,6 +343,23 @@ def generate_phase_mlir(batches: list[dict], phase_idx: int) -> str:
             lines.append(
                 f"      %c_cons_out_len_{col} = arith.constant {cons_out_elems} : i64"
             )
+        elif _is_stream(batch):
+            prod_out_elems = max(1, batch["producer_out_size"] // 4)
+            cons_out_elems = max(1, batch["consumer_out_size"] // 4)
+            # Stream pairs have no input -- only output offsets.
+            lines.append(
+                f"      %c_prod_out_off_{col} = arith.constant {out_off} : i64"
+            )
+            lines.append(
+                f"      %c_prod_out_len_{col} = arith.constant {prod_out_elems} : i64"
+            )
+            cons_out_off = out_off + prod_out_elems
+            lines.append(
+                f"      %c_cons_out_off_{col} = arith.constant {cons_out_off} : i64"
+            )
+            lines.append(
+                f"      %c_cons_out_len_{col} = arith.constant {cons_out_elems} : i64"
+            )
         else:
             in_elems = max(1, batch["in_size"] // 4)
             out_elems = max(1, batch["out_size"] // 4)
@@ -337,10 +381,10 @@ def generate_phase_mlir(batches: list[dict], phase_idx: int) -> str:
     lines.append("      // Output DMAs first (set up receive before sending)")
 
     # Output DMAs with issue_token.
-    # Cascade pairs emit two output DMAs (producer + consumer); normal emit one.
+    # Multi-tile pairs emit two output DMAs (producer + consumer); normal emit one.
     dma_id = n_tiles  # start output IDs after input IDs
     for col, batch in enumerate(batches):
-        if _is_cascade(batch):
+        if _is_cascade(batch) or _is_stream(batch):
             prod_out_elems = max(1, batch["producer_out_size"] // 4)
             cons_out_elems = max(1, batch["consumer_out_size"] // 4)
             # Producer output DMA (via memtile, shim-side name)
@@ -381,7 +425,9 @@ def generate_phase_mlir(batches: list[dict], phase_idx: int) -> str:
     # Input DMAs without issue_token
     input_dma_id = 0
     for col, batch in enumerate(batches):
-        if _is_cascade(batch):
+        if _is_stream(batch):
+            continue  # Stream pairs have no input objectfifo
+        elif _is_cascade(batch):
             # Producer input (via memtile, shim-side name)
             lines.append(
                 f"      aiex.npu.dma_memcpy_nd("
@@ -389,7 +435,7 @@ def generate_phase_mlir(batches: list[dict], phase_idx: int) -> str:
                 f"[%c1, %c1, %c1, %c_in_len_{col}]"
                 f"[%c0, %c0, %c0, %c1]) "
                 f"{{metadata = @of_prod_in_{col}_0, id = {input_dma_id} : i64}} "
-                f": memref<{total_in}xi32>"
+                f": memref<{rt_in}xi32>"
             )
         else:
             lines.append(
@@ -398,7 +444,7 @@ def generate_phase_mlir(batches: list[dict], phase_idx: int) -> str:
                 f"[%c1, %c1, %c1, %c_in_len_{col}]"
                 f"[%c0, %c0, %c0, %c1]) "
                 f"{{metadata = @of_in_{col}, id = {input_dma_id} : i64}} "
-                f": memref<{total_in}xi32>"
+                f": memref<{rt_in}xi32>"
             )
         input_dma_id += 1
 
@@ -407,7 +453,7 @@ def generate_phase_mlir(batches: list[dict], phase_idx: int) -> str:
 
     # dma_wait per output
     for col, batch in enumerate(batches):
-        if _is_cascade(batch):
+        if _is_cascade(batch) or _is_stream(batch):
             lines.append(
                 f"      aiex.npu.dma_wait {{symbol = @of_prod_out_{col}_1}}"
             )
@@ -590,6 +636,107 @@ def _emit_cascade_cores(lines: list[str], col: int, batch: dict) -> None:
     lines.append("")
 
     # Consumer core (row 2): acquires output buffer, reads cascade implicitly
+    lines.append(f"    aie.core(%tile_{col}_2) {{")
+    lines.append(
+        f"      %sub_out = aie.objectfifo.acquire @of_cons_out_{col}(Produce, 1) "
+        f": !aie.objectfifosubview<memref<{cons_out_elems}xi32>>"
+    )
+    lines.append(
+        f"      %elem_out = aie.objectfifo.subview.access %sub_out[0] "
+        f": !aie.objectfifosubview<memref<{cons_out_elems}xi32>> -> memref<{cons_out_elems}xi32>"
+    )
+    lines.append(
+        f"      func.call @test_kernel_{col}_cons(%elem_out) "
+        f": (memref<{cons_out_elems}xi32>) -> ()"
+    )
+    lines.append(f"      aie.objectfifo.release @of_cons_out_{col}(Produce, 1)")
+    lines.append("      aie.end")
+    lines.append("    }")
+    lines.append("")
+
+
+def _emit_stream_objectfifos(lines: list[str], col: int, batch: dict) -> None:
+    """Emit objectfifos, links, and function declarations for a stream_pair.
+
+    Data flow:
+      Producer output: row3 -> memtile -> shim (two-hop with link)
+      Consumer output: row2 -> shim (direct, same as normal)
+    No producer input objectfifo -- test values are immediates.
+    """
+    prod_out_elems = max(1, batch["producer_out_size"] // 4)
+    cons_out_elems = max(1, batch["consumer_out_size"] // 4)
+    prod_obj = _obj_filename(batch, "producer_filename")
+    cons_obj = _obj_filename(batch, "consumer_filename")
+
+    # Producer output: row3 -> memtile -> shim (two-hop)
+    lines.append(
+        f"    aie.objectfifo @of_prod_out_{col}_0(%tile_{col}_3, "
+        f"{{%tile_{col}_1}}, 1 : i32) "
+        f": !aie.objectfifo<memref<{prod_out_elems}xi32>>"
+    )
+    lines.append(
+        f"    aie.objectfifo @of_prod_out_{col}_1(%tile_{col}_1, "
+        f"{{%tile_{col}_0}}, 1 : i32) "
+        f": !aie.objectfifo<memref<{prod_out_elems}xi32>>"
+    )
+    lines.append(
+        f"    aie.objectfifo.link [@of_prod_out_{col}_0] -> "
+        f"[@of_prod_out_{col}_1] ([] [])"
+    )
+    lines.append("")
+
+    # Consumer output: consumer(row2) -> shim(row0) (direct)
+    lines.append(
+        f"    aie.objectfifo @of_cons_out_{col}(%tile_{col}_2, "
+        f"{{%tile_{col}_0}}, 2 : i32) "
+        f": !aie.objectfifo<memref<{cons_out_elems}xi32>>"
+    )
+    lines.append("")
+
+    # Function declarations -- both take single memref (output only)
+    lines.append(
+        f'    func.func private @test_kernel_{col}_prod'
+        f"(memref<{prod_out_elems}xi32>) "
+        f'attributes {{link_with = "{prod_obj}"}}'
+    )
+    lines.append(
+        f'    func.func private @test_kernel_{col}_cons'
+        f"(memref<{cons_out_elems}xi32>) "
+        f'attributes {{link_with = "{cons_obj}"}}'
+    )
+    lines.append("")
+
+
+def _emit_stream_cores(lines: list[str], col: int, batch: dict) -> None:
+    """Emit core blocks for a stream_pair (producer at row 3, consumer at row 2).
+
+    Both cores have single-arg functions (output only). The producer writes to
+    the master stream via immediates; the consumer reads from the slave stream
+    and writes results to its output buffer.
+    """
+    prod_out_elems = max(1, batch["producer_out_size"] // 4)
+    cons_out_elems = max(1, batch["consumer_out_size"] // 4)
+
+    # Producer core (row 3): output only
+    lines.append(f"    aie.core(%tile_{col}_3) {{")
+    lines.append(
+        f"      %sub_out = aie.objectfifo.acquire @of_prod_out_{col}_0(Produce, 1) "
+        f": !aie.objectfifosubview<memref<{prod_out_elems}xi32>>"
+    )
+    lines.append(
+        f"      %elem_out = aie.objectfifo.subview.access %sub_out[0] "
+        f": !aie.objectfifosubview<memref<{prod_out_elems}xi32>> -> memref<{prod_out_elems}xi32>"
+    )
+    lines.append(
+        f"      func.call @test_kernel_{col}_prod(%elem_out) "
+        f": (memref<{prod_out_elems}xi32>) -> ()"
+    )
+    lines.append(f"      aie.objectfifo.release @of_prod_out_{col}_0(Produce, 1)")
+    lines.append("      aie.end")
+    lines.append("    }")
+    lines.append("")
+
+    # Consumer core (row 2): output only
     lines.append(f"    aie.core(%tile_{col}_2) {{")
     lines.append(
         f"      %sub_out = aie.objectfifo.acquire @of_cons_out_{col}(Produce, 1) "

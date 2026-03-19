@@ -4200,6 +4200,140 @@ class TestMultiTileCascade:
 
 
 # ---------------------------------------------------------------------------
+# TestMultiTileStream
+# ---------------------------------------------------------------------------
+
+class TestMultiTileStream:
+    """Tests for stream_pair MLIR generation in isa-multi-tile-gen."""
+
+    @pytest.fixture
+    def multi(self):
+        from importlib.util import spec_from_file_location, module_from_spec
+        spec = spec_from_file_location("multi", "tools/isa-multi-tile-gen.py")
+        mod = module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _make_stream_batch(self, idx=0, cons_out=4):
+        return {
+            "batch_index": idx,
+            "source_type": "stream_pair",
+            "producer_filename": f"batch_{idx:03d}_producer.s",
+            "consumer_filename": f"batch_{idx:03d}_consumer.s",
+            "producer_in_size": 0,
+            "producer_out_size": 8,
+            "consumer_in_size": 0,
+            "consumer_out_size": cons_out,
+            "instruction": "MOV_NB_mv_scl2ms",
+            "slot": "st",
+            "in_size": 0,
+            "out_size": 8 + cons_out,
+            "test_count": 1,
+            "filename": f"batch_{idx:03d}_consumer.s",
+        }
+
+    def _make_normal_batch(self, idx=1):
+        return {
+            "batch_index": idx,
+            "filename": f"batch_{idx:03d}.s",
+            "source_type": "assembly",
+            "in_size": 128,
+            "out_size": 256,
+            "test_count": 4,
+        }
+
+    def _make_cascade_batch(self, idx=2):
+        return {
+            "batch_index": idx,
+            "source_type": "cascade_pair",
+            "producer_filename": f"batch_{idx:03d}_producer.s",
+            "consumer_filename": f"batch_{idx:03d}_consumer.s",
+            "producer_in_size": 64,
+            "producer_out_size": 8,
+            "consumer_in_size": 0,
+            "consumer_out_size": 64,
+            "instruction": "VMOV_mv_scd",
+            "slot": "lda",
+            "in_size": 64,
+            "out_size": 72,
+            "test_count": 1,
+            "filename": f"batch_{idx:03d}_consumer.s",
+        }
+
+    def test_stream_mlir_has_aie_flow(self, multi):
+        mlir = multi.generate_phase_mlir([self._make_stream_batch()], 0)
+        assert "aie.flow" in mlir
+        assert "Core : 0" in mlir
+
+    def test_stream_mlir_no_cascade_flow(self, multi):
+        mlir = multi.generate_phase_mlir([self._make_stream_batch()], 0)
+        assert "cascade_flow" not in mlir
+
+    def test_stream_mlir_has_two_compute_tiles(self, multi):
+        mlir = multi.generate_phase_mlir([self._make_stream_batch()], 0)
+        assert "aie.tile(0, 2)" in mlir
+        assert "aie.tile(0, 3)" in mlir
+
+    def test_stream_mlir_has_memtile(self, multi):
+        mlir = multi.generate_phase_mlir([self._make_stream_batch()], 0)
+        assert "aie.tile(0, 1)" in mlir
+
+    def test_stream_mlir_no_producer_input_objectfifo(self, multi):
+        mlir = multi.generate_phase_mlir([self._make_stream_batch()], 0)
+        assert "of_prod_in" not in mlir
+
+    def test_stream_mlir_has_producer_output(self, multi):
+        mlir = multi.generate_phase_mlir([self._make_stream_batch()], 0)
+        assert "of_prod_out_0" in mlir
+
+    def test_stream_mlir_has_consumer_output(self, multi):
+        mlir = multi.generate_phase_mlir([self._make_stream_batch()], 0)
+        assert "of_cons_out_0" in mlir
+
+    def test_stream_producer_one_arg(self, multi):
+        mlir = multi.generate_phase_mlir([self._make_stream_batch()], 0)
+        for line in mlir.split("\n"):
+            if "test_kernel_0_prod" in line and "func.func" in line:
+                assert line.count("memref") == 1, f"Producer should have 1 arg: {line}"
+                break
+        else:
+            assert False, "Producer function declaration not found"
+
+    def test_stream_consumer_one_arg(self, multi):
+        mlir = multi.generate_phase_mlir([self._make_stream_batch()], 0)
+        for line in mlir.split("\n"):
+            if "test_kernel_0_cons" in line and "func.func" in line:
+                assert line.count("memref") == 1, f"Consumer should have 1 arg: {line}"
+                break
+        else:
+            assert False, "Consumer function declaration not found"
+
+    def test_stream_mixed_with_normal_and_cascade(self, multi):
+        batches = [
+            self._make_stream_batch(0),
+            self._make_normal_batch(1),
+            self._make_cascade_batch(2),
+        ]
+        mlir = multi.generate_phase_mlir(batches, 0)
+        assert "aie.flow" in mlir
+        assert "cascade_flow" in mlir
+        assert "of_in_1" in mlir
+
+    def test_stream_no_input_dma(self, multi):
+        mlir = multi.generate_phase_mlir([self._make_stream_batch()], 0)
+        assert "of_prod_in" not in mlir
+
+    def test_stream_ss_status_larger_consumer_output(self, multi):
+        batch = self._make_stream_batch(cons_out=12)
+        mlir = multi.generate_phase_mlir([batch], 0)
+        assert "memref<3xi32>" in mlir
+
+    def test_stream_has_objectfifo_link(self, multi):
+        mlir = multi.generate_phase_mlir([self._make_stream_batch()], 0)
+        assert "objectfifo.link" in mlir
+
+
+# ---------------------------------------------------------------------------
 # TestStreamStrategy
 # ---------------------------------------------------------------------------
 
