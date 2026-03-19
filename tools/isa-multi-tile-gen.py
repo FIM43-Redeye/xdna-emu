@@ -97,9 +97,14 @@ def compute_phase_buffer_layout(batches: list[dict]) -> dict:
     }
 
 
-def _obj_filename(batch: dict) -> str:
-    """Derive .o filename from batch filename (replace .s or .ll with .o)."""
-    name = batch.get("filename", batch.get("name", "unknown"))
+def _obj_filename(batch: dict, key: str = "filename") -> str:
+    """Derive .o filename from batch filename (replace .s or .ll with .o).
+
+    Args:
+        batch: Batch dict.
+        key: Dict key to read the source filename from (default "filename").
+    """
+    name = batch.get(key, batch.get("filename", batch.get("name", "unknown")))
     base = re.sub(r"\.(s|ll)$", "", name)
     if not base.endswith(".o"):
         base += ".o"
@@ -169,11 +174,19 @@ def prepare_phase_objects(
     return result
 
 
+def _is_cascade(batch: dict) -> bool:
+    """Return True if batch is a cascade_pair."""
+    return batch.get("source_type") == "cascade_pair"
+
+
 def generate_phase_mlir(batches: list[dict], phase_idx: int) -> str:
     """Generate MLIR for one phase with up to 4 tiles.
 
-    Each batch occupies one column (0..n-1).  The MLIR uses objectfifos for
-    data movement and link_with for linking pre-compiled .o files.
+    Each batch occupies one column (0..n-1).  Normal (assembly) batches use a
+    single compute tile at row 2.  Cascade_pair batches use two tiles in the
+    same column: producer at row 3, consumer at row 2, connected by
+    aie.cascade_flow.  Producer data routes through a memtile (row 1) via
+    two-hop objectfifos with objectfifo.link.
 
     Args:
         batches: list of batch dicts with at least in_size, out_size, filename.
@@ -198,73 +211,48 @@ def generate_phase_mlir(batches: list[dict], phase_idx: int) -> str:
     total_in = layout["total_in_elems"]
     total_out = layout["total_out_elems"]
 
+    # Identify cascade columns
+    cascade_cols = [col for col, b in enumerate(batches) if _is_cascade(b)]
+
     lines = []
     lines.append(f"// Phase {phase_idx}: {n_tiles} tile(s)")
     lines.append("module {")
     lines.append(f"  aie.device({device}) {{")
 
     # -- Tile declarations --
+    # Shim tiles (row 0)
     for col in range(n_tiles):
         lines.append(f"    %tile_{col}_0 = aie.tile({col}, 0)")
+    # Consumer / normal compute tiles (row 2)
     for col in range(n_tiles):
         lines.append(f"    %tile_{col}_2 = aie.tile({col}, 2)")
+    # Memtiles (row 1) for cascade columns
+    for col in cascade_cols:
+        lines.append(f"    %tile_{col}_1 = aie.tile({col}, 1)")
+    # Producer tiles (row 3) for cascade columns
+    for col in cascade_cols:
+        lines.append(f"    %tile_{col}_3 = aie.tile({col}, 3)")
     lines.append("")
+
+    # -- Cascade flow declarations --
+    for col in cascade_cols:
+        lines.append(f"    aie.cascade_flow(%tile_{col}_3, %tile_{col}_2)")
+    if cascade_cols:
+        lines.append("")
 
     # -- Objectfifos and function declarations per tile --
     for col, batch in enumerate(batches):
-        in_elems = max(1, batch["in_size"] // 4)
-        out_elems = max(1, batch["out_size"] // 4)
-        obj_file = _obj_filename(batch)
-
-        lines.append(
-            f"    aie.objectfifo @of_in_{col}(%tile_{col}_0, "
-            f"{{%tile_{col}_2}}, 2 : i32) "
-            f": !aie.objectfifo<memref<{in_elems}xi32>>"
-        )
-        lines.append(
-            f"    aie.objectfifo @of_out_{col}(%tile_{col}_2, "
-            f"{{%tile_{col}_0}}, 2 : i32) "
-            f": !aie.objectfifo<memref<{out_elems}xi32>>"
-        )
-        lines.append("")
-        lines.append(
-            f'    func.func private @test_kernel_{col}'
-            f"(memref<{in_elems}xi32>, memref<{out_elems}xi32>) "
-            f'attributes {{link_with = "{obj_file}"}}'
-        )
-        lines.append("")
+        if _is_cascade(batch):
+            _emit_cascade_objectfifos(lines, col, batch)
+        else:
+            _emit_normal_objectfifos(lines, col, batch)
 
     # -- Core blocks per tile --
     for col, batch in enumerate(batches):
-        in_elems = max(1, batch["in_size"] // 4)
-        out_elems = max(1, batch["out_size"] // 4)
-
-        lines.append(f"    aie.core(%tile_{col}_2) {{")
-        lines.append(
-            f"      %sub_in = aie.objectfifo.acquire @of_in_{col}(Consume, 1) "
-            f": !aie.objectfifosubview<memref<{in_elems}xi32>>"
-        )
-        lines.append(
-            f"      %elem_in = aie.objectfifo.subview.access %sub_in[0] "
-            f": !aie.objectfifosubview<memref<{in_elems}xi32>> -> memref<{in_elems}xi32>"
-        )
-        lines.append(
-            f"      %sub_out = aie.objectfifo.acquire @of_out_{col}(Produce, 1) "
-            f": !aie.objectfifosubview<memref<{out_elems}xi32>>"
-        )
-        lines.append(
-            f"      %elem_out = aie.objectfifo.subview.access %sub_out[0] "
-            f": !aie.objectfifosubview<memref<{out_elems}xi32>> -> memref<{out_elems}xi32>"
-        )
-        lines.append(
-            f"      func.call @test_kernel_{col}(%elem_in, %elem_out) "
-            f": (memref<{in_elems}xi32>, memref<{out_elems}xi32>) -> ()"
-        )
-        lines.append(f"      aie.objectfifo.release @of_in_{col}(Consume, 1)")
-        lines.append(f"      aie.objectfifo.release @of_out_{col}(Produce, 1)")
-        lines.append("      aie.end")
-        lines.append("    }")
-        lines.append("")
+        if _is_cascade(batch):
+            _emit_cascade_cores(lines, col, batch)
+        else:
+            _emit_normal_core(lines, col, batch)
 
     # -- Runtime sequence --
     lines.append(
@@ -278,65 +266,140 @@ def generate_phase_mlir(batches: list[dict], phase_idx: int) -> str:
     lines.append("      %c0 = arith.constant 0 : i64")
     lines.append("      %c1 = arith.constant 1 : i64")
 
-    # Per-tile constants for offsets and lengths
+    # Per-tile constants for offsets and lengths.
+    # Cascade pairs need sub-offsets for producer and consumer outputs.
     for col, batch in enumerate(batches):
-        in_elems = max(1, batch["in_size"] // 4)
-        out_elems = max(1, batch["out_size"] // 4)
         in_off = layout["in_offsets_elems"][col]
         out_off = layout["out_offsets_elems"][col]
 
-        lines.append(
-            f"      %c_in_off_{col} = arith.constant {in_off} : i64"
-        )
-        lines.append(
-            f"      %c_in_len_{col} = arith.constant {in_elems} : i64"
-        )
-        lines.append(
-            f"      %c_out_off_{col} = arith.constant {out_off} : i64"
-        )
-        lines.append(
-            f"      %c_out_len_{col} = arith.constant {out_elems} : i64"
-        )
+        if _is_cascade(batch):
+            prod_in_elems = max(1, batch["producer_in_size"] // 4)
+            prod_out_elems = max(1, batch["producer_out_size"] // 4)
+            cons_out_elems = max(1, batch["consumer_out_size"] // 4)
+
+            lines.append(
+                f"      %c_in_off_{col} = arith.constant {in_off} : i64"
+            )
+            lines.append(
+                f"      %c_in_len_{col} = arith.constant {prod_in_elems} : i64"
+            )
+            # Producer output sub-region
+            lines.append(
+                f"      %c_prod_out_off_{col} = arith.constant {out_off} : i64"
+            )
+            lines.append(
+                f"      %c_prod_out_len_{col} = arith.constant {prod_out_elems} : i64"
+            )
+            # Consumer output sub-region (follows producer output)
+            cons_out_off = out_off + prod_out_elems
+            lines.append(
+                f"      %c_cons_out_off_{col} = arith.constant {cons_out_off} : i64"
+            )
+            lines.append(
+                f"      %c_cons_out_len_{col} = arith.constant {cons_out_elems} : i64"
+            )
+        else:
+            in_elems = max(1, batch["in_size"] // 4)
+            out_elems = max(1, batch["out_size"] // 4)
+
+            lines.append(
+                f"      %c_in_off_{col} = arith.constant {in_off} : i64"
+            )
+            lines.append(
+                f"      %c_in_len_{col} = arith.constant {in_elems} : i64"
+            )
+            lines.append(
+                f"      %c_out_off_{col} = arith.constant {out_off} : i64"
+            )
+            lines.append(
+                f"      %c_out_len_{col} = arith.constant {out_elems} : i64"
+            )
 
     lines.append("")
     lines.append("      // Output DMAs first (set up receive before sending)")
 
-    # Output DMAs with issue_token
-    for col in range(n_tiles):
-        out_elems = max(1, batches[col]["out_size"] // 4)
-        dma_id = col + n_tiles
-        lines.append(
-            f"      aiex.npu.dma_memcpy_nd("
-            f"%out[%c0, %c0, %c0, %c_out_off_{col}]"
-            f"[%c1, %c1, %c1, %c_out_len_{col}]"
-            f"[%c0, %c0, %c0, %c1]) "
-            f"{{metadata = @of_out_{col}, id = {dma_id} : i64, "
-            f"issue_token = true}} : memref<{total_out}xi32>"
-        )
+    # Output DMAs with issue_token.
+    # Cascade pairs emit two output DMAs (producer + consumer); normal emit one.
+    dma_id = n_tiles  # start output IDs after input IDs
+    for col, batch in enumerate(batches):
+        if _is_cascade(batch):
+            prod_out_elems = max(1, batch["producer_out_size"] // 4)
+            cons_out_elems = max(1, batch["consumer_out_size"] // 4)
+            # Producer output DMA (via memtile, shim-side name)
+            lines.append(
+                f"      aiex.npu.dma_memcpy_nd("
+                f"%out[%c0, %c0, %c0, %c_prod_out_off_{col}]"
+                f"[%c1, %c1, %c1, %c_prod_out_len_{col}]"
+                f"[%c0, %c0, %c0, %c1]) "
+                f"{{metadata = @of_prod_out_{col}_1, id = {dma_id} : i64, "
+                f"issue_token = true}} : memref<{total_out}xi32>"
+            )
+            dma_id += 1
+            # Consumer output DMA (direct row2->shim)
+            lines.append(
+                f"      aiex.npu.dma_memcpy_nd("
+                f"%out[%c0, %c0, %c0, %c_cons_out_off_{col}]"
+                f"[%c1, %c1, %c1, %c_cons_out_len_{col}]"
+                f"[%c0, %c0, %c0, %c1]) "
+                f"{{metadata = @of_cons_out_{col}, id = {dma_id} : i64, "
+                f"issue_token = true}} : memref<{total_out}xi32>"
+            )
+            dma_id += 1
+        else:
+            out_elems = max(1, batch["out_size"] // 4)
+            lines.append(
+                f"      aiex.npu.dma_memcpy_nd("
+                f"%out[%c0, %c0, %c0, %c_out_off_{col}]"
+                f"[%c1, %c1, %c1, %c_out_len_{col}]"
+                f"[%c0, %c0, %c0, %c1]) "
+                f"{{metadata = @of_out_{col}, id = {dma_id} : i64, "
+                f"issue_token = true}} : memref<{total_out}xi32>"
+            )
+            dma_id += 1
 
     lines.append("")
     lines.append("      // Input DMAs")
 
     # Input DMAs without issue_token
-    for col in range(n_tiles):
-        in_elems = max(1, batches[col]["in_size"] // 4)
-        lines.append(
-            f"      aiex.npu.dma_memcpy_nd("
-            f"%in[%c0, %c0, %c0, %c_in_off_{col}]"
-            f"[%c1, %c1, %c1, %c_in_len_{col}]"
-            f"[%c0, %c0, %c0, %c1]) "
-            f"{{metadata = @of_in_{col}, id = {col} : i64}} "
-            f": memref<{total_in}xi32>"
-        )
+    input_dma_id = 0
+    for col, batch in enumerate(batches):
+        if _is_cascade(batch):
+            # Producer input (via memtile, shim-side name)
+            lines.append(
+                f"      aiex.npu.dma_memcpy_nd("
+                f"%in[%c0, %c0, %c0, %c_in_off_{col}]"
+                f"[%c1, %c1, %c1, %c_in_len_{col}]"
+                f"[%c0, %c0, %c0, %c1]) "
+                f"{{metadata = @of_prod_in_{col}_0, id = {input_dma_id} : i64}} "
+                f": memref<{total_in}xi32>"
+            )
+        else:
+            lines.append(
+                f"      aiex.npu.dma_memcpy_nd("
+                f"%in[%c0, %c0, %c0, %c_in_off_{col}]"
+                f"[%c1, %c1, %c1, %c_in_len_{col}]"
+                f"[%c0, %c0, %c0, %c1]) "
+                f"{{metadata = @of_in_{col}, id = {input_dma_id} : i64}} "
+                f": memref<{total_in}xi32>"
+            )
+        input_dma_id += 1
 
     lines.append("")
     lines.append("      // Wait for all outputs")
 
     # dma_wait per output
-    for col in range(n_tiles):
-        lines.append(
-            f"      aiex.npu.dma_wait {{symbol = @of_out_{col}}}"
-        )
+    for col, batch in enumerate(batches):
+        if _is_cascade(batch):
+            lines.append(
+                f"      aiex.npu.dma_wait {{symbol = @of_prod_out_{col}_1}}"
+            )
+            lines.append(
+                f"      aiex.npu.dma_wait {{symbol = @of_cons_out_{col}}}"
+            )
+        else:
+            lines.append(
+                f"      aiex.npu.dma_wait {{symbol = @of_out_{col}}}"
+            )
 
     lines.append("    }")
     lines.append("  }")
@@ -344,6 +407,188 @@ def generate_phase_mlir(batches: list[dict], phase_idx: int) -> str:
     lines.append("")  # trailing newline
 
     return "\n".join(lines)
+
+
+def _emit_normal_objectfifos(lines: list[str], col: int, batch: dict) -> None:
+    """Emit objectfifos and function declaration for a normal (assembly) batch."""
+    in_elems = max(1, batch["in_size"] // 4)
+    out_elems = max(1, batch["out_size"] // 4)
+    obj_file = _obj_filename(batch)
+
+    lines.append(
+        f"    aie.objectfifo @of_in_{col}(%tile_{col}_0, "
+        f"{{%tile_{col}_2}}, 2 : i32) "
+        f": !aie.objectfifo<memref<{in_elems}xi32>>"
+    )
+    lines.append(
+        f"    aie.objectfifo @of_out_{col}(%tile_{col}_2, "
+        f"{{%tile_{col}_0}}, 2 : i32) "
+        f": !aie.objectfifo<memref<{out_elems}xi32>>"
+    )
+    lines.append("")
+    lines.append(
+        f'    func.func private @test_kernel_{col}'
+        f"(memref<{in_elems}xi32>, memref<{out_elems}xi32>) "
+        f'attributes {{link_with = "{obj_file}"}}'
+    )
+    lines.append("")
+
+
+def _emit_cascade_objectfifos(lines: list[str], col: int, batch: dict) -> None:
+    """Emit objectfifos, links, and function declarations for a cascade_pair.
+
+    Data flow:
+      Producer input:  shim -> memtile -> row3 (two-hop with link)
+      Producer output: row3 -> memtile -> shim (two-hop with link)
+      Consumer output: row2 -> shim (direct, same as normal)
+    """
+    prod_in_elems = max(1, batch["producer_in_size"] // 4)
+    prod_out_elems = max(1, batch["producer_out_size"] // 4)
+    cons_out_elems = max(1, batch["consumer_out_size"] // 4)
+    prod_obj = _obj_filename(batch, "producer_filename")
+    cons_obj = _obj_filename(batch, "consumer_filename")
+
+    # Producer input: shim(row0) -> memtile(row1) -> producer(row3)
+    lines.append(
+        f"    aie.objectfifo @of_prod_in_{col}_0(%tile_{col}_0, "
+        f"{{%tile_{col}_1}}, 1 : i32) "
+        f": !aie.objectfifo<memref<{prod_in_elems}xi32>>"
+    )
+    lines.append(
+        f"    aie.objectfifo @of_prod_in_{col}_1(%tile_{col}_1, "
+        f"{{%tile_{col}_3}}, 1 : i32) "
+        f": !aie.objectfifo<memref<{prod_in_elems}xi32>>"
+    )
+    lines.append(
+        f"    aie.objectfifo.link [@of_prod_in_{col}_0] -> "
+        f"[@of_prod_in_{col}_1] ([] [])"
+    )
+    lines.append("")
+
+    # Producer output: producer(row3) -> memtile(row1) -> shim(row0)
+    lines.append(
+        f"    aie.objectfifo @of_prod_out_{col}_0(%tile_{col}_3, "
+        f"{{%tile_{col}_1}}, 1 : i32) "
+        f": !aie.objectfifo<memref<{prod_out_elems}xi32>>"
+    )
+    lines.append(
+        f"    aie.objectfifo @of_prod_out_{col}_1(%tile_{col}_1, "
+        f"{{%tile_{col}_0}}, 1 : i32) "
+        f": !aie.objectfifo<memref<{prod_out_elems}xi32>>"
+    )
+    lines.append(
+        f"    aie.objectfifo.link [@of_prod_out_{col}_0] -> "
+        f"[@of_prod_out_{col}_1] ([] [])"
+    )
+    lines.append("")
+
+    # Consumer output: consumer(row2) -> shim(row0) (direct)
+    lines.append(
+        f"    aie.objectfifo @of_cons_out_{col}(%tile_{col}_2, "
+        f"{{%tile_{col}_0}}, 2 : i32) "
+        f": !aie.objectfifo<memref<{cons_out_elems}xi32>>"
+    )
+    lines.append("")
+
+    # Function declarations -- producer takes (in, out), consumer takes (out)
+    lines.append(
+        f'    func.func private @test_kernel_{col}_prod'
+        f"(memref<{prod_in_elems}xi32>, memref<{prod_out_elems}xi32>) "
+        f'attributes {{link_with = "{prod_obj}"}}'
+    )
+    lines.append(
+        f'    func.func private @test_kernel_{col}_cons'
+        f"(memref<{cons_out_elems}xi32>) "
+        f'attributes {{link_with = "{cons_obj}"}}'
+    )
+    lines.append("")
+
+
+def _emit_normal_core(lines: list[str], col: int, batch: dict) -> None:
+    """Emit core block for a normal (assembly) batch."""
+    in_elems = max(1, batch["in_size"] // 4)
+    out_elems = max(1, batch["out_size"] // 4)
+
+    lines.append(f"    aie.core(%tile_{col}_2) {{")
+    lines.append(
+        f"      %sub_in = aie.objectfifo.acquire @of_in_{col}(Consume, 1) "
+        f": !aie.objectfifosubview<memref<{in_elems}xi32>>"
+    )
+    lines.append(
+        f"      %elem_in = aie.objectfifo.subview.access %sub_in[0] "
+        f": !aie.objectfifosubview<memref<{in_elems}xi32>> -> memref<{in_elems}xi32>"
+    )
+    lines.append(
+        f"      %sub_out = aie.objectfifo.acquire @of_out_{col}(Produce, 1) "
+        f": !aie.objectfifosubview<memref<{out_elems}xi32>>"
+    )
+    lines.append(
+        f"      %elem_out = aie.objectfifo.subview.access %sub_out[0] "
+        f": !aie.objectfifosubview<memref<{out_elems}xi32>> -> memref<{out_elems}xi32>"
+    )
+    lines.append(
+        f"      func.call @test_kernel_{col}(%elem_in, %elem_out) "
+        f": (memref<{in_elems}xi32>, memref<{out_elems}xi32>) -> ()"
+    )
+    lines.append(f"      aie.objectfifo.release @of_in_{col}(Consume, 1)")
+    lines.append(f"      aie.objectfifo.release @of_out_{col}(Produce, 1)")
+    lines.append("      aie.end")
+    lines.append("    }")
+    lines.append("")
+
+
+def _emit_cascade_cores(lines: list[str], col: int, batch: dict) -> None:
+    """Emit core blocks for a cascade_pair (producer at row 3, consumer at row 2)."""
+    prod_in_elems = max(1, batch["producer_in_size"] // 4)
+    prod_out_elems = max(1, batch["producer_out_size"] // 4)
+    cons_out_elems = max(1, batch["consumer_out_size"] // 4)
+
+    # Producer core (row 3): acquires input from memtile + output to memtile
+    lines.append(f"    aie.core(%tile_{col}_3) {{")
+    lines.append(
+        f"      %sub_in = aie.objectfifo.acquire @of_prod_in_{col}_1(Consume, 1) "
+        f": !aie.objectfifosubview<memref<{prod_in_elems}xi32>>"
+    )
+    lines.append(
+        f"      %elem_in = aie.objectfifo.subview.access %sub_in[0] "
+        f": !aie.objectfifosubview<memref<{prod_in_elems}xi32>> -> memref<{prod_in_elems}xi32>"
+    )
+    lines.append(
+        f"      %sub_out = aie.objectfifo.acquire @of_prod_out_{col}_0(Produce, 1) "
+        f": !aie.objectfifosubview<memref<{prod_out_elems}xi32>>"
+    )
+    lines.append(
+        f"      %elem_out = aie.objectfifo.subview.access %sub_out[0] "
+        f": !aie.objectfifosubview<memref<{prod_out_elems}xi32>> -> memref<{prod_out_elems}xi32>"
+    )
+    lines.append(
+        f"      func.call @test_kernel_{col}_prod(%elem_in, %elem_out) "
+        f": (memref<{prod_in_elems}xi32>, memref<{prod_out_elems}xi32>) -> ()"
+    )
+    lines.append(f"      aie.objectfifo.release @of_prod_in_{col}_1(Consume, 1)")
+    lines.append(f"      aie.objectfifo.release @of_prod_out_{col}_0(Produce, 1)")
+    lines.append("      aie.end")
+    lines.append("    }")
+    lines.append("")
+
+    # Consumer core (row 2): acquires output buffer, reads cascade implicitly
+    lines.append(f"    aie.core(%tile_{col}_2) {{")
+    lines.append(
+        f"      %sub_out = aie.objectfifo.acquire @of_cons_out_{col}(Produce, 1) "
+        f": !aie.objectfifosubview<memref<{cons_out_elems}xi32>>"
+    )
+    lines.append(
+        f"      %elem_out = aie.objectfifo.subview.access %sub_out[0] "
+        f": !aie.objectfifosubview<memref<{cons_out_elems}xi32>> -> memref<{cons_out_elems}xi32>"
+    )
+    lines.append(
+        f"      func.call @test_kernel_{col}_cons(%elem_out) "
+        f": (memref<{cons_out_elems}xi32>) -> ()"
+    )
+    lines.append(f"      aie.objectfifo.release @of_cons_out_{col}(Produce, 1)")
+    lines.append("      aie.end")
+    lines.append("    }")
+    lines.append("")
 
 
 def main():
