@@ -318,15 +318,18 @@ class TestClassifyInstruction:
         assert status == "testable", \
             f"VMOV_mv_w with MvAMWQDst/MvAMWQSrc should be testable, got: {reason}"
 
-    def test_cascade_instruction_is_skipped(self):
-        """VMOV_mv_scd reads from SCD (cascade) -- skipped without cascade setup."""
+    def test_cascade_read_is_testable(self):
+        """VMOV_mv_scd reads from SCD (cascade) -- now testable via CascadeReadStrategy."""
         instr = _make_instr("VMOV_mv_scd", "vmov",
                             "vmov\t$dst, SCD", [
             _make_composite_op("dst", "MvBMXDst", bit_width=6),
         ], slot="lda", is_vector=True)
+        # classify_instruction is the legacy path used by ComputeStrategy.
+        # SCD instructions are now handled by CascadeReadStrategy in the
+        # strategy chain, so classify_instruction sees them as testable
+        # (the SCD early-exit was removed).
         status, reason = classify_instruction(instr)
-        assert status == "skipped"
-        assert "cascade" in reason.lower()
+        assert status == "testable"
 
     def test_skip_unknown_operand_type(self):
         instr = _make_instr("FOO", "foo", "foo\t$dst, $src", [
@@ -3044,8 +3047,9 @@ class TestCascadeReadStrategy:
 
     def test_consumer_output_size_half(self):
         strategy = isa_test_gen.CascadeReadStrategy()
-        assert strategy.compute_consumer_output_size(self._make_vmov_hi_scd()) == 32
-        assert strategy.compute_consumer_output_size(self._make_vmov_lo_scd()) == 32
+        # Half variants use marker-based verification (2 x 4-byte markers = 8).
+        assert strategy.compute_consumer_output_size(self._make_vmov_hi_scd()) == 8
+        assert strategy.compute_consumer_output_size(self._make_vmov_lo_scd()) == 8
 
     def test_producer_asm_loads_data(self):
         strategy = isa_test_gen.CascadeReadStrategy()
@@ -3113,23 +3117,25 @@ class TestCascadeReadStrategy:
         cons = result["consumer_asm"]
         assert "wl0" in cons and "wh0" in cons
 
-    def test_consumer_hi_stores_high_half_only(self):
+    def test_consumer_hi_uses_markers(self):
+        """vmov.hi writes to cm (accumulator) -- uses marker-based verification."""
         strategy = isa_test_gen.CascadeReadStrategy()
-        regs = {"dst": "x0"}
+        regs = {"dst": "cm0"}
         result = strategy.generate_cascade_pair(self._make_vmov_hi_scd(), regs)
         cons = result["consumer_asm"]
-        assert "wh0" in cons
-        lines = [l for l in cons.split("\n") if "vst" in l]
-        assert len(lines) == 1
+        assert "#170" in cons  # before marker
+        assert "#204" in cons  # after marker
+        assert "vst" not in cons  # no vector store for accumulator
 
-    def test_consumer_lo_stores_low_half_only(self):
+    def test_consumer_lo_uses_markers(self):
+        """vmov.lo writes to cm (accumulator) -- uses marker-based verification."""
         strategy = isa_test_gen.CascadeReadStrategy()
-        regs = {"dst": "x0"}
+        regs = {"dst": "cm0"}
         result = strategy.generate_cascade_pair(self._make_vmov_lo_scd(), regs)
         cons = result["consumer_asm"]
-        assert "wl0" in cons
-        lines = [l for l in cons.split("\n") if "vst" in l]
-        assert len(lines) == 1
+        assert "#170" in cons  # before marker
+        assert "#204" in cons  # after marker
+        assert "vst" not in cons  # no vector store for accumulator
 
 
 # ===================================================================
@@ -3239,6 +3245,36 @@ class TestGenerateAll:
             print(f"\nllvm-mc stderr:\n{result.stderr[:2000]}")
         # llvm-mc should at least not crash (segfault = returncode -11).
         assert result.returncode >= 0, "llvm-mc crashed"
+
+    def test_cascade_pairs_in_manifest(self, isa_json_path, out_dir):
+        """Cascade read instructions should produce cascade_pair batches."""
+        manifest = generate_all(isa_json_path, out_dir)
+        cascade_batches = [
+            b for b in manifest["batches"]
+            if b.get("source_type") == "cascade_pair"
+        ]
+        assert len(cascade_batches) == 3
+
+    def test_cascade_pair_has_both_files(self, isa_json_path, out_dir):
+        """Each cascade_pair batch should have producer and consumer filenames."""
+        manifest = generate_all(isa_json_path, out_dir)
+        cascade_batches = [
+            b for b in manifest["batches"]
+            if b.get("source_type") == "cascade_pair"
+        ]
+        for batch in cascade_batches:
+            assert "producer_filename" in batch
+            assert "consumer_filename" in batch
+            prod_path = os.path.join(out_dir, batch["producer_filename"])
+            cons_path = os.path.join(out_dir, batch["consumer_filename"])
+            assert os.path.exists(prod_path), f"Missing {prod_path}"
+            assert os.path.exists(cons_path), f"Missing {cons_path}"
+
+    def test_cascade_reads_now_testable(self, isa_json_path, out_dir):
+        """Cascade reads should no longer appear in skip reasons."""
+        manifest = generate_all(isa_json_path, out_dir)
+        skip_reasons = manifest.get("skip_reasons", {})
+        assert "cascade read (stalls without neighboring tile)" not in skip_reasons
 
 
 # ===================================================================
@@ -3629,20 +3665,19 @@ class TestCmClassRealISA:
         assert found_cm, \
             f"{instr_name}: expected cm* register in combos, got {combos[0]}"
 
-    def test_vmov_hi_blocked_cascade(self, isa_data):
-        """VMOV_HI reads from SCD (cascade) -- must be skipped despite cm dst.
+    def test_vmov_hi_cascade_read_testable(self, isa_data):
+        """VMOV_HI reads from SCD (cascade) -- now testable via CascadeReadStrategy.
 
-        Even though VMOV_HI has a cm-class dst (bw=4, unknown), the asm_string
-        contains 'SCD' which means the instruction stalls without active cascade
-        connections.  The cascade check fires before the cm-class heuristic can
-        make it testable, so it remains skipped.
+        VMOV_HI has a cm-class dst (bw=4, unknown) and reads from SCD.
+        CascadeReadStrategy handles it in the strategy chain, generating a
+        cascade_pair batch.  The legacy classify_instruction() path no longer
+        skips SCD instructions.
         """
         instr = self._find_instr(isa_data, "VMOV_HI")
         if instr is None:
             pytest.skip("VMOV_HI not in ISA JSON")
         status, reason = classify_instruction(instr)
-        assert status == "skipped"
-        assert "cascade" in reason.lower()
+        assert status == "testable"
 
 
 # ===================================================================
@@ -3991,7 +4026,7 @@ class TestGenerateAllWithConversions:
         for batch in manifest["batches"]:
             assert "source_type" in batch, \
                 f"Batch {batch['batch_index']} missing source_type"
-            assert batch["source_type"] in ("assembly", "llvm_ir"), \
+            assert batch["source_type"] in ("assembly", "llvm_ir", "cascade_pair"), \
                 f"Batch {batch['batch_index']}: unexpected source_type '{batch['source_type']}'"
 
     def test_conversion_batch_exists(self, isa_json_path, out_dir):

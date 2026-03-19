@@ -582,10 +582,8 @@ def classify_instruction(instr: dict) -> tuple[str, str]:
     # cycle count.  No skip needed.
     if "SS" in asm and "mov" in mnemonic:
         return ("skipped", "stream switch status read (hangs without streams)")
-    # 5c. Cascade read instructions stall without data from a neighboring
-    # tile.  MCD (write) is handled by CascadeStrategy.
-    if "SCD" in asm:
-        return ("skipped", "cascade read (stalls without neighboring tile)")
+    # 5c. Cascade write is handled by CascadeStrategy; cascade read by
+    # CascadeReadStrategy.  Both are matched via the strategy chain.
     if "MCD" in asm:
         return ("skipped", "cascade write (handled by CascadeStrategy)")
 
@@ -2674,6 +2672,9 @@ class CascadeReadStrategy(TestStrategy):
         return mnemonic in ("vmov.hi", "vmov.lo")
 
     def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        # vmov.hi/vmov.lo write to cm (accumulator) registers, not x (vector).
+        if self._is_half(instr):
+            return [{"dst": "cm0"}]
         return [{"dst": "x0"}]
 
     def compute_producer_input_size(self) -> int:
@@ -2686,7 +2687,9 @@ class CascadeReadStrategy(TestStrategy):
         return 0
 
     def compute_consumer_output_size(self, instr: dict) -> int:
-        return 32 if self._is_half(instr) else 64
+        # Half variants use marker-based verification (2 x 4-byte markers).
+        # Full vmov stores the 512-bit (64-byte) vector result.
+        return 8 if self._is_half(instr) else 64
 
     def compute_input_size(self, instr, regs):
         return self.compute_producer_input_size()
@@ -2723,21 +2726,33 @@ class CascadeReadStrategy(TestStrategy):
         return "\n".join(lines)
 
     def _generate_consumer(self, instr: dict, regs: dict) -> str:
-        """Consumer: enable SCD, read cascade, store result to p0."""
+        """Consumer: enable SCD, read cascade, store result to p0.
+
+        For full vmov (512-bit, dst=x0): stores the vector data directly.
+        For half variants vmov.hi/vmov.lo (dst=cm0): uses marker-based
+        verification (0xAA before, 0xCC after) since accumulator registers
+        cannot be stored with plain vst.
+        """
         mnemonic = instr.get("mnemonic", "")
         asm_str = instr.get("asm_string", "")
         name = instr["name"]
         lines = []
         lines.append(f"  // ---- cascade consumer: {name} ----")
-        lines.append("  mov r14, #1")
-        lines.append("  mov crSCDEn, r14")
-        asm_line = _substitute_asm(asm_str, regs)
-        lines.append(f"  {asm_line}")
-        if mnemonic == "vmov.hi":
-            lines.append("  vst wh0, [p0, #0]")
-        elif mnemonic == "vmov.lo":
-            lines.append("  vst wl0, [p0, #0]")
+        if self._is_half(instr):
+            # Marker-based: store 0xAA, execute cascade read, store 0xCC.
+            lines.append("  mov r14, #170")
+            lines.extend(_scalar_store("r14", "p0", 0))
+            lines.append("  mov r14, #1")
+            lines.append("  mov crSCDEn, r14")
+            asm_line = _substitute_asm(asm_str, regs)
+            lines.append(f"  {asm_line}")
+            lines.append("  mov r14, #204")
+            lines.extend(_scalar_store("r14", "p0", 4))
         else:
+            lines.append("  mov r14, #1")
+            lines.append("  mov crSCDEn, r14")
+            asm_line = _substitute_asm(asm_str, regs)
+            lines.append(f"  {asm_line}")
             lines.append("  vst wl0, [p0, #0]")
             lines.append("  vst wh0, [p0, #32]")
         lines.append("")
@@ -3397,6 +3412,9 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     conv_test_points: list[dict] = []
     # All conversion instruction defs (for testable count).
     conv_instr_count = 0
+    # Cascade read specs: (instr, combo_idx, regs, strategy) for cascade_pair
+    # generation.  These are NOT bin-packed; each becomes a standalone batch.
+    cascade_specs: list[tuple[dict, int, dict, CascadeReadStrategy]] = []
 
     for instr in all_instrs:
         # Check conversion first (before normal strategy dispatch).
@@ -3417,10 +3435,14 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
             continue
 
         # Cascade read instructions are counted as testable but NOT
-        # bin-packed into mega-program batches.  They will get their own
-        # cascade_pair generation path in a later task.
+        # bin-packed into mega-program batches.  Each becomes a standalone
+        # cascade_pair batch with producer + consumer .s files.
         if isinstance(strategy, CascadeReadStrategy):
             testable_count += 1
+            combos = strategy.generate_combos(instr)
+            for combo_idx, regs in enumerate(combos):
+                regs["_combo_idx"] = combo_idx
+                cascade_specs.append((instr, combo_idx, regs, strategy))
             continue
 
         testable_count += 1
@@ -3575,8 +3597,60 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         })
         batch_idx += 1
 
+    # Generate cascade_pair batches.  Each cascade read instruction becomes
+    # a standalone batch with producer + consumer .s files.
+    for instr, combo_idx, regs, strategy in cascade_specs:
+        pair = strategy.generate_cascade_pair(instr, regs)
+
+        prod_asm = pair["producer_asm"]
+        cons_asm = pair["consumer_asm"]
+
+        # Wrap each in a standalone mega-program.
+        prod_program = build_mega_program([prod_asm])
+        cons_program = build_mega_program([cons_asm])
+
+        prod_filename = f"batch_{batch_idx:03d}_producer.s"
+        cons_filename = f"batch_{batch_idx:03d}_consumer.s"
+
+        with open(os.path.join(out_dir, prod_filename), "w") as f:
+            f.write(prod_program)
+        with open(os.path.join(out_dir, cons_filename), "w") as f:
+            f.write(cons_program)
+
+        batches.append({
+            "batch_index": batch_idx,
+            "filename": cons_filename,
+            "source_type": "cascade_pair",
+            "producer_filename": prod_filename,
+            "consumer_filename": cons_filename,
+            "producer_in_size": strategy.compute_producer_input_size(),
+            "producer_out_size": strategy.compute_producer_output_size(),
+            "consumer_in_size": 0,
+            "consumer_out_size": strategy.compute_consumer_output_size(instr),
+            "instruction": instr["name"],
+            "slot": instr.get("slot", ""),
+            "test_count": 1,
+            "in_size": strategy.compute_producer_input_size(),
+            "out_size": (strategy.compute_producer_output_size()
+                         + strategy.compute_consumer_output_size(instr)),
+            "tests": [{
+                "instruction": instr["name"],
+                "slot": instr.get("slot", ""),
+                "combo_index": combo_idx,
+                "operands": {k: v for k, v in regs.items()
+                             if not k.startswith("_")},
+                "in_offset": 0,
+                "in_size": strategy.compute_producer_input_size(),
+                "out_offset": 0,
+                "out_size": (strategy.compute_producer_output_size()
+                             + strategy.compute_consumer_output_size(instr)),
+            }],
+        })
+        batch_idx += 1
+
     # Write manifest.json.
-    total_test_points = len(test_point_specs) + total_conv_test_points
+    total_test_points = (len(test_point_specs) + total_conv_test_points
+                         + len(cascade_specs))
     manifest = {
         "testable_instructions": testable_count,
         "skipped_instructions": skipped_count,
