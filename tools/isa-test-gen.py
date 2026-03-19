@@ -50,7 +50,7 @@ CONVERSION_SUFFIXES = (".ups.", ".srs.", ".conv.", ".pack.", ".unpack.")
 
 # Mnemonic substrings for conversion types handled via LLVM IR (not .conv.).
 # .conv. (bf16/fp32) is excluded because its intrinsics have different signatures.
-_CONVERSION_IR_SUFFIXES = (".ups.", ".srs.", ".pack.", ".unpack.")
+_CONVERSION_IR_SUFFIXES = (".ups.", ".srs.", ".pack.", ".unpack.", ".conv.")
 
 # Mapping from base mnemonic (stripped of .2d/.3d) to LLVM intrinsic info.
 # Each entry describes:
@@ -148,50 +148,64 @@ CONVERSION_INTRINSICS: dict[str, dict] = {
         "in_type": "<16 x i64>", "out_type": "<16 x i16>",
         "in_bytes": 128, "out_bytes": 32, "sign": 0,
     },
-    # --- PACK (4): wider -> narrower + store ---
-    # NOTE: pack/unpack intrinsics are NOT lowered by llc (left as function
-    # calls, causing link errors).  Marked llc_unsupported=True until we
-    # add a Chess or C-builtin path for them.
+    # --- PACK (4): wider -> narrower (fuses with store) ---
+    # Pack intrinsics take <32 x i16> input + i32 sign flag, return <32 x i8>.
+    # The sign flag (0=unsigned, 1=signed) selects d/s prefix.
+    # llc fuses pack+store into vst.pack.* instructions.
     "vst.pack.s4.s8": {
-        "intrinsic": "pack_I4_I8", "llc_unsupported": True,
-        "in_type": "<32 x i8>", "out_type": "<32 x i8>",
-        "in_bytes": 32, "out_bytes": 32,
+        "intrinsic": "pack_I4_I8",
+        "in_type": "<32 x i16>", "out_type": "<32 x i8>",
+        "in_bytes": 64, "out_bytes": 32, "sign": 1,
     },
     "vst.pack.d4.d8": {
-        "intrinsic": "pack_I4_I8", "llc_unsupported": True,
-        "in_type": "<32 x i8>", "out_type": "<32 x i8>",
-        "in_bytes": 32, "out_bytes": 32,
+        "intrinsic": "pack_I4_I8",
+        "in_type": "<32 x i16>", "out_type": "<32 x i8>",
+        "in_bytes": 64, "out_bytes": 32, "sign": 0,
     },
     "vst.pack.s8.s16": {
-        "intrinsic": "pack_I8_I16", "llc_unsupported": True,
-        "in_type": "<16 x i16>", "out_type": "<16 x i16>",
-        "in_bytes": 32, "out_bytes": 32,
+        "intrinsic": "pack_I8_I16",
+        "in_type": "<32 x i16>", "out_type": "<32 x i8>",
+        "in_bytes": 64, "out_bytes": 32, "sign": 1,
     },
     "vst.pack.d8.d16": {
-        "intrinsic": "pack_I8_I16", "llc_unsupported": True,
-        "in_type": "<16 x i16>", "out_type": "<16 x i16>",
-        "in_bytes": 32, "out_bytes": 32,
+        "intrinsic": "pack_I8_I16",
+        "in_type": "<32 x i16>", "out_type": "<32 x i8>",
+        "in_bytes": 64, "out_bytes": 32, "sign": 0,
     },
-    # --- UNPACK (4): load + narrower -> wider ---
+    # --- UNPACK (4): narrower -> wider (load + expand) ---
+    # Unpack intrinsics take <32 x i8> input + i32 sign flag, return <32 x i16>.
+    # llc may or may not fuse with load.
     "vldb.unpack.s8.s4": {
-        "intrinsic": "unpack_I8_I4", "llc_unsupported": True,
-        "in_type": "<32 x i8>", "out_type": "<32 x i8>",
-        "in_bytes": 32, "out_bytes": 32,
+        "intrinsic": "unpack_I8_I4",
+        "in_type": "<32 x i8>", "out_type": "<32 x i16>",
+        "in_bytes": 32, "out_bytes": 64, "sign": 1,
     },
     "vldb.unpack.d8.d4": {
-        "intrinsic": "unpack_I8_I4", "llc_unsupported": True,
-        "in_type": "<32 x i8>", "out_type": "<32 x i8>",
-        "in_bytes": 32, "out_bytes": 32,
+        "intrinsic": "unpack_I8_I4",
+        "in_type": "<32 x i8>", "out_type": "<32 x i16>",
+        "in_bytes": 32, "out_bytes": 64, "sign": 0,
     },
     "vldb.unpack.s16.s8": {
-        "intrinsic": "unpack_I16_I8", "llc_unsupported": True,
-        "in_type": "<32 x i8>", "out_type": "<16 x i16>",
-        "in_bytes": 32, "out_bytes": 32,
+        "intrinsic": "unpack_I16_I8",
+        "in_type": "<32 x i8>", "out_type": "<32 x i16>",
+        "in_bytes": 32, "out_bytes": 64, "sign": 1,
     },
     "vldb.unpack.d16.d8": {
-        "intrinsic": "unpack_I16_I8", "llc_unsupported": True,
-        "in_type": "<32 x i8>", "out_type": "<16 x i16>",
-        "in_bytes": 32, "out_bytes": 32,
+        "intrinsic": "unpack_I16_I8",
+        "in_type": "<32 x i8>", "out_type": "<32 x i16>",
+        "in_bytes": 32, "out_bytes": 64, "sign": 0,
+    },
+    # --- BF16/FP32 conversions (2): bf16 <-> fp32 via accumulator ---
+    # These fuse with load/store into vlda.conv.fp32.bf16 / vst.conv.bf16.fp32.
+    "vlda.conv.fp32.bf16": {
+        "intrinsic": "v16bf16.to.v16accfloat",
+        "in_type": "<16 x bfloat>", "out_type": "<8 x i64>",
+        "in_bytes": 32, "out_bytes": 64,
+    },
+    "vst.conv.bf16.fp32": {
+        "intrinsic": "v16accfloat.to.v16bf16",
+        "in_type": "<8 x i64>", "out_type": "<16 x bfloat>",
+        "in_bytes": 64, "out_bytes": 32,
     },
 }
 
@@ -2317,66 +2331,120 @@ def generate_conversion_ll(test_points: list[dict]) -> str:
             out_offset += out_bytes  # stored as vec
 
         elif is_pack:
-            # PACK: load vector, call pack intrinsic, store.
+            # PACK: load vector, call pack(vec, sign) -> packed, store.
+            # llc fuses pack+store into vst.pack.* automatically.
             pack_name = f"@llvm.aie2.{intrinsic}"
 
-            # GEP to input offset.
             in_ptr = f"%in_ptr_{var_counter}"
             lines.append(f'  {in_ptr} = getelementptr i8, ptr %in, i64 {in_offset}')
             var_counter += 1
 
-            # Load input vector.
             vec_val = f"%vec_{var_counter}"
             lines.append(f'  {vec_val} = load volatile {in_type}, ptr {in_ptr}, align 32')
             var_counter += 1
 
-            # Call pack intrinsic: (vec) -> vec
             result_val = f"%result_{var_counter}"
-            lines.append(f'  {result_val} = call {out_type} {pack_name}({in_type} {vec_val})')
-            intrinsics_used[pack_name] = (out_type, in_type)
+            lines.append(f'  {result_val} = call {out_type} {pack_name}({in_type} {vec_val}, i32 {sign})')
+            intrinsics_used[pack_name] = (out_type, f"{in_type}, i32")
             var_counter += 1
 
-            # GEP to output offset.
             out_ptr = f"%out_ptr_{var_counter}"
             lines.append(f'  {out_ptr} = getelementptr i8, ptr %out, i64 {out_offset}')
             var_counter += 1
 
-            # Store result.
             lines.append(f'  store volatile {out_type} {result_val}, ptr {out_ptr}, align 32')
 
             in_offset += in_bytes
             out_offset += out_bytes
 
         elif is_unpack:
-            # UNPACK: load vector, call unpack intrinsic, store.
+            # UNPACK: load vector, call unpack(vec, sign) -> wider, store.
             unpack_name = f"@llvm.aie2.{intrinsic}"
 
-            # GEP to input offset.
             in_ptr = f"%in_ptr_{var_counter}"
             lines.append(f'  {in_ptr} = getelementptr i8, ptr %in, i64 {in_offset}')
             var_counter += 1
 
-            # Load input vector.
             vec_val = f"%vec_{var_counter}"
             lines.append(f'  {vec_val} = load volatile {in_type}, ptr {in_ptr}, align 32')
             var_counter += 1
 
-            # Call unpack intrinsic: (vec) -> vec
             result_val = f"%result_{var_counter}"
-            lines.append(f'  {result_val} = call {out_type} {unpack_name}({in_type} {vec_val})')
-            intrinsics_used[unpack_name] = (out_type, in_type)
+            lines.append(f'  {result_val} = call {out_type} {unpack_name}({in_type} {vec_val}, i32 {sign})')
+            intrinsics_used[unpack_name] = (out_type, f"{in_type}, i32")
             var_counter += 1
 
-            # GEP to output offset.
             out_ptr = f"%out_ptr_{var_counter}"
             lines.append(f'  {out_ptr} = getelementptr i8, ptr %out, i64 {out_offset}')
             var_counter += 1
 
-            # Store result.
             lines.append(f'  store volatile {out_type} {result_val}, ptr {out_ptr}, align 32')
 
             in_offset += in_bytes
             out_offset += out_bytes
+
+        elif ".conv." in mnemonic:
+            # BF16/FP32 conversion: load, convert via intrinsic, store.
+            # vlda.conv.fp32.bf16: load bf16 -> convert to fp32 acc -> convert back -> store
+            # vst.conv.bf16.fp32: load fp32 acc -> convert to bf16 -> store
+            conv_name = f"@llvm.aie2.{intrinsic}"
+
+            in_ptr = f"%in_ptr_{var_counter}"
+            lines.append(f'  {in_ptr} = getelementptr i8, ptr %in, i64 {in_offset}')
+            var_counter += 1
+
+            if "vlda.conv" in mnemonic:
+                # Load bf16, convert to accfloat, convert back to bf16, store.
+                # Round-trip so output is same type as input.
+                vec_val = f"%vec_{var_counter}"
+                lines.append(f'  {vec_val} = load volatile {in_type}, ptr {in_ptr}, align 32')
+                var_counter += 1
+
+                acc_val = f"%acc_{var_counter}"
+                lines.append(f'  {acc_val} = call {out_type} {conv_name}({in_type} {vec_val})')
+                intrinsics_used[conv_name] = (out_type, in_type)
+                var_counter += 1
+
+                # Convert back to bf16 for storage.
+                back_name = "@llvm.aie2.v16accfloat.to.v16bf16"
+                result_val = f"%result_{var_counter}"
+                lines.append(f'  {result_val} = call {in_type} {back_name}({out_type} {acc_val})')
+                intrinsics_used[back_name] = (in_type, out_type)
+                var_counter += 1
+
+                out_ptr = f"%out_ptr_{var_counter}"
+                lines.append(f'  {out_ptr} = getelementptr i8, ptr %out, i64 {out_offset}')
+                var_counter += 1
+
+                lines.append(f'  store volatile {in_type} {result_val}, ptr {out_ptr}, align 32')
+                in_offset += in_bytes
+                out_offset += in_bytes  # round-trip: output same size as input
+
+            else:
+                # vst.conv.bf16.fp32: load bf16, ups to accfloat, convert to bf16, store.
+                # We need bf16 input, convert to acc, then back to bf16.
+                ups_name = "@llvm.aie2.v16bf16.to.v16accfloat"
+                vec_val = f"%vec_{var_counter}"
+                lines.append(f'  {vec_val} = load volatile {out_type}, ptr {in_ptr}, align 32')
+                var_counter += 1
+
+                acc_val = f"%acc_{var_counter}"
+                lines.append(f'  {acc_val} = call {in_type} {ups_name}({out_type} {vec_val})')
+                intrinsics_used[ups_name] = (in_type, out_type)
+                var_counter += 1
+
+                result_val = f"%result_{var_counter}"
+                lines.append(f'  {result_val} = call {out_type} {conv_name}({in_type} {acc_val})')
+                intrinsics_used[conv_name] = (out_type, in_type)
+                var_counter += 1
+
+                out_ptr = f"%out_ptr_{var_counter}"
+                lines.append(f'  {out_ptr} = getelementptr i8, ptr %out, i64 {out_offset}')
+                var_counter += 1
+
+                lines.append(f'  store volatile {out_type} {result_val}, ptr {out_ptr}, align 32')
+                in_offset += out_bytes   # loaded as bf16
+                out_offset += out_bytes  # stored as bf16
 
     lines.append('  ret void')
     lines.append('}')
@@ -2411,8 +2479,7 @@ class ConversionStrategy(TestStrategy):
         base = _conversion_base_mnemonic(mnemonic)
         if base not in CONVERSION_INTRINSICS:
             return False
-        info = CONVERSION_INTRINSICS[base]
-        return not info.get("llc_unsupported", False)
+        return True
 
     def can_test(self, instr: dict) -> tuple[bool, str]:
         """ConversionStrategy does not participate in normal strategy dispatch.

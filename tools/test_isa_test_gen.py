@@ -2607,10 +2607,10 @@ class TestCmClassRealISA:
 class TestConversionIntrinsicMap:
     """Validate the CONVERSION_INTRINSICS table."""
 
-    def test_has_24_entries(self):
-        """Table must have exactly 24 unique base mnemonics."""
+    def test_has_26_entries(self):
+        """Table must have exactly 26 unique base mnemonics (8 ups + 8 srs + 4 pack + 4 unpack + 2 bf16/fp32)."""
         table = isa_test_gen.CONVERSION_INTRINSICS
-        assert len(table) == 24
+        assert len(table) == 26
 
     def test_all_required_fields_present(self):
         """Each entry must have intrinsic, in_type, out_type, in_bytes, out_bytes."""
@@ -2668,16 +2668,16 @@ class TestConversionIntrinsicMap:
         assert info["out_bytes"] == 32
 
     def test_pack_byte_sizes(self):
-        """PACK: input and output are both 256-bit vectors (32 bytes)."""
+        """PACK: input is <32 x i16> (64 bytes), output is <32 x i8> (32 bytes)."""
         info = isa_test_gen.CONVERSION_INTRINSICS["vst.pack.s8.s16"]
-        assert info["in_bytes"] == 32
+        assert info["in_bytes"] == 64
         assert info["out_bytes"] == 32
 
     def test_unpack_byte_sizes(self):
-        """UNPACK: input and output types correspond to their element sizes."""
+        """UNPACK: input is <32 x i8> (32 bytes), output is <32 x i16> (64 bytes)."""
         info = isa_test_gen.CONVERSION_INTRINSICS["vldb.unpack.s16.s8"]
         assert info["in_bytes"] == 32
-        assert info["out_bytes"] == 32
+        assert info["out_bytes"] == 64
 
 
 class TestConversionLLGeneration:
@@ -2793,8 +2793,8 @@ class TestConversionStrategy:
         )
         assert strategy.can_handle(instr)
 
-    def test_cannot_handle_pack_yet(self):
-        """pack intrinsics not lowered by llc -- deferred to Chess path."""
+    def test_can_handle_pack(self):
+        """Pack intrinsics are now lowered by llc (fused into vst.pack)."""
         strategy = isa_test_gen.ConversionStrategy()
         instr = _make_instr(
             "VST_PACK_S8_S16_ag_idx", "vst.pack.s8.s16",
@@ -2804,10 +2804,10 @@ class TestConversionStrategy:
              _make_reg_op("src", "vector256")],
             may_store=True,
         )
-        assert not strategy.can_handle(instr)
+        assert strategy.can_handle(instr)
 
-    def test_cannot_handle_unpack_yet(self):
-        """unpack intrinsics not lowered by llc -- deferred to Chess path."""
+    def test_can_handle_unpack(self):
+        """Unpack intrinsics are now lowered by llc."""
         strategy = isa_test_gen.ConversionStrategy()
         instr = _make_instr(
             "VLDB_UNPACK_S16_S8_ag_idx", "vldb.unpack.s16.s8",
@@ -2817,10 +2817,10 @@ class TestConversionStrategy:
              _make_reg_op("idx", "scalar")],
             may_load=True,
         )
-        assert not strategy.can_handle(instr)
+        assert strategy.can_handle(instr)
 
-    def test_does_not_handle_conv(self):
-        """ConversionStrategy should NOT handle .conv. (bf16/fp32) mnemonics."""
+    def test_can_handle_conv(self):
+        """ConversionStrategy handles .conv. (bf16/fp32) mnemonics."""
         strategy = isa_test_gen.ConversionStrategy()
         instr = _make_instr(
             "VST_CONV_BF16_FP32", "vst.conv.bf16.fp32",
@@ -2829,7 +2829,7 @@ class TestConversionStrategy:
              _make_reg_op("src", "accumulator")],
             may_store=True,
         )
-        assert not strategy.can_handle(instr)
+        assert strategy.can_handle(instr)
 
     def test_does_not_handle_plain_add(self):
         """ConversionStrategy should NOT handle plain compute instructions."""
@@ -2914,16 +2914,16 @@ class TestConversionStrategy:
             return json.load(f)
 
     def test_real_isa_conversion_count(self, isa_data):
-        """ConversionStrategy handles UPS+SRS instruction defs (pack/unpack deferred)."""
+        """ConversionStrategy handles all conversion instruction defs."""
         strategy = isa_test_gen.ConversionStrategy()
         count = 0
         for slot, instrs in isa_data.items():
             for instr in instrs:
                 if strategy.can_handle(instr):
                     count += 1
-        # 16 base mnemonics x various addressing modes
-        # (8 UPS + 8 SRS; PACK/UNPACK deferred -- llc doesn't lower them)
-        assert count >= 70, f"Expected >= 70 conversion defs handled, got {count}"
+        # 26 base mnemonics x various addressing modes
+        # (8 UPS + 8 SRS + 4 pack + 4 unpack + 2 bf16/fp32 conv)
+        assert count >= 100, f"Expected >= 100 conversion defs handled, got {count}"
 
 
 class TestGenerateAllWithConversions:
@@ -2966,13 +2966,13 @@ class TestGenerateAllWithConversions:
             ll_path = os.path.join(out_dir, batch["filename"])
             assert os.path.exists(ll_path), f"Missing {batch['filename']}"
 
-    def test_conversion_batch_has_16_tests(self, isa_json_path, out_dir):
-        """Conversion batch should have 16 test points (UPS+SRS only, pack/unpack deferred)."""
+    def test_conversion_batch_has_26_tests(self, isa_json_path, out_dir):
+        """Conversion batch should have 26 test points (ups+srs+pack+unpack+bf16)."""
         manifest = generate_all(isa_json_path, out_dir)
         ll_batches = [b for b in manifest["batches"] if b["source_type"] == "llvm_ir"]
         total_ll_tests = sum(b["test_count"] for b in ll_batches)
-        assert total_ll_tests == 16, \
-            f"Expected 16 conversion test points, got {total_ll_tests}"
+        assert total_ll_tests == 26, \
+            f"Expected 26 conversion test points, got {total_ll_tests}"
 
     def test_conversion_testable_counted(self, isa_json_path, out_dir):
         """Conversion instructions should be counted as testable, not skipped."""
