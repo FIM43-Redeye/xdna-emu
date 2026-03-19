@@ -575,10 +575,11 @@ def classify_instruction(instr: dict) -> tuple[str, str]:
     if mnemonic in SIDE_EFFECT_MNEMONICS:
         return ("skipped", "no output (nop/side-effect)")
 
-    # 5b. Hardware counter/stream reads hang without active hardware.
+    # 5b. Stream switch status reads hang without active streams.
     asm = instr.get("asm_string", "")
-    if "cntr" in asm:
-        return ("skipped", "hardware counter (register pair)")
+    # Note: "cntr" (hardware cycle counter) is always running on an active
+    # core -- mov r17:r16, cntr is safe to execute and produces a 64-bit
+    # cycle count.  No skip needed.
     if "SS" in asm and "mov" in mnemonic:
         return ("skipped", "stream switch status read (hangs without streams)")
     # 5c. Cascade read/write instructions need active cascade connections.
@@ -625,18 +626,20 @@ def classify_instruction(instr: dict) -> tuple[str, str]:
     if not outputs:
         return ("skipped", "no output operands detected")
 
-    # 10. Skip instructions with unusual accumulator subclasses:
-    #   - bit_width=2: composite/sparse register classes (mQQXw) misclassified
-    #     by the exporter.  Real accumulators use 4 bits (cm) or 5 bits (bm).
-    #   - bit_width=6: 256-bit accumulator quarters (amll/amlh/amhl/amhh).
-    #     These can't be loaded/stored via vsrs and only appear in VFLOOR.
+    # 10. Skip instructions with unresolved accumulator bw=2 operands.
+    #   After _resolve_operand, qxs2 (sparse) becomes "sparse_qx" and ys1
+    #   (wide vector) becomes "wide_y", so they won't match here.  Only
+    #   genuinely unresolved bw=2 accumulators (e.g. non-qxs2 names in load
+    #   contexts) are skipped.
+    #
+    #   Accumulator bw=6 (256-bit quarters: amll/amlh/amhl/amhh) are now
+    #   testable -- they can be loaded/stored via their parent half-accumulator
+    #   (bml/bmh) using the existing vups/vsrs infrastructure.
     for op in operands:
         if op.get("register_kind") == "accumulator":
             bw = op.get("bit_width", 0)
             if bw == 2:
                 return ("skipped", "composite sparse register (bw=2)")
-            if bw == 6:
-                return ("skipped", "accumulator quarter register (bw=6)")
 
     return ("testable", "")
 
@@ -667,9 +670,9 @@ def detect_output_operands(instr: dict) -> list[dict]:
     if not operands:
         return []
 
-    # Resolve cm-class unknowns so that dst/src operands with the cm-class
-    # signature are treated as register operands below.
-    operands = [_resolve_unknown_operand(op) for op in operands]
+    # Resolve misclassified operands so that dst/src operands with the
+    # cm-class signature (and ys1/qxs2 sparse) are treated correctly below.
+    operands = [_resolve_operand(op) for op in operands]
 
     asm_string = instr.get("asm_string", "")
 
@@ -1640,6 +1643,16 @@ class LoadStrategy(TestStrategy):
         operands = instr.get("operands", [])
         sp_relative = _is_sp_relative(instr)
 
+        # Reject SP-relative am-class spills: llvm-mc crashes (assertion
+        # failure in getSImmOpValueXStep) because the encoder expects step=32
+        # but the immediate field metadata says scale=1.  llvm-aie bug.
+        # Affects: VLDA_dmw_lda_am_ag_spill, VST_dmw_sts_am_ag_spill.
+        if sp_relative and any(
+            op.get("register_kind") == "accumulator" and op.get("bit_width") == 6
+            for op in operands
+        ):
+            return (False, "am-class SP spill (llvm-mc encoder bug)")
+
         # Must have a pointer operand, unless SP-relative (SP is implicit).
         # SP-relative instructions like VLDA_dmw_lda_w_ag_spill encode the
         # base pointer as the SP register and list no pointer in operands.
@@ -1687,12 +1700,14 @@ class LoadStrategy(TestStrategy):
             if bw == 2:
                 # Quad registers: handled as "quad" kind in generate_test_point.
                 pass
-            elif bw == 6:
-                return (False, "accumulator quarter register (bw=6)")
+            # bw=6: am-class quarter registers (amll/amlh/amhl/amhh).
+            # These are 256-bit quarters of the 512-bit bml/bmh halves.
+            # Loaded/stored via parent half-accumulator using vups/vsrs.
+            # Fall through -- handled by standard accumulator infrastructure.
 
-        # Reject unknown operand types (except dontcare and cm-class resolvable).
+        # Reject unknown operand types (except dontcare and resolvable).
         for op in operands:
-            op = _resolve_unknown_operand(op)
+            op = _resolve_operand(op)
             op_type = op.get("operand_type", "unknown")
             if op_type == "unknown":
                 if not op.get("name", "").startswith("dontcare"):
@@ -1856,6 +1871,15 @@ class StoreStrategy(TestStrategy):
         operands = instr.get("operands", [])
         sp_relative = _is_sp_relative(instr)
 
+        # Reject SP-relative am-class spills: llvm-mc crashes (assertion
+        # failure in getSImmOpValueXStep) because the encoder expects step=32
+        # but the immediate field metadata says scale=1.  llvm-aie bug.
+        if sp_relative and any(
+            op.get("register_kind") == "accumulator" and op.get("bit_width") == 6
+            for op in operands
+        ):
+            return (False, "am-class SP spill (llvm-mc encoder bug)")
+
         # Must have a pointer operand, unless SP-relative (SP is implicit).
         # SP-relative spill stores encode the destination address as the SP
         # register and list no pointer in the operand table.
@@ -1897,9 +1921,9 @@ class StoreStrategy(TestStrategy):
                 return (False, "accumulator source with scalar st (unsupported by llvm-mc)")
             # bw=2: quad register (q0-q3) -- fall through, handled below.
 
-        # Reject unknown operand types (except dontcare and cm-class resolvable).
+        # Reject unknown operand types (except dontcare and resolvable).
         for op in operands:
-            op = _resolve_unknown_operand(op)
+            op = _resolve_operand(op)
             op_type = op.get("operand_type", "unknown")
             if op_type == "unknown":
                 if not op.get("name", "").startswith("dontcare"):

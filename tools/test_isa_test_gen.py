@@ -396,8 +396,12 @@ class TestClassifyInstruction:
         status, _ = classify_instruction(instr)
         assert status == "skipped"
 
-    def test_skip_hardware_counter(self):
-        """MOV_CNTR reads hardware counter and uses register pairs -- skip."""
+    def test_hardware_counter_testable(self):
+        """MOV_CNTR reads hardware cycle counter into register pair -- testable.
+
+        The counter is always running on an active core.  Output is a 64-bit
+        cycle count in a register pair (register+16, bw=3 -> eL class).
+        """
         instr = _make_instr("MOV_CNTR", "mov", "mov\t$dst, cntr", [
             {
                 "name": "dst",
@@ -410,7 +414,7 @@ class TestClassifyInstruction:
             },
         ])
         status, reason = classify_instruction(instr)
-        assert status == "skipped"
+        assert status == "testable", f"Expected testable, got {status}: {reason}"
 
     def test_imm_only_skipped(self):
         """Instructions with only immediate operands (no register output)."""
@@ -1913,13 +1917,18 @@ class TestSpRelative:
         can, reason = strategy.can_test(instr)
         assert can, f"Expected testable: {reason}"
 
-    def test_vst_am_spill_testable(self, isa_data):
-        """VST_dmw_sts_am_ag_spill (accumulator) must be testable."""
+    def test_vst_am_spill_blocked_by_llvm_bug(self, isa_data):
+        """VST_dmw_sts_am_ag_spill is blocked by llvm-mc encoder bug.
+
+        The SP-relative am-class spill store crashes llvm-mc because the
+        encoder expects step=32 but the immediate field has scale=1.
+        """
         instr = self._find_instr(isa_data, "VST_dmw_sts_am_ag_spill")
         assert instr is not None
         strategy = isa_test_gen.StoreStrategy()
         can, reason = strategy.can_test(instr)
-        assert can, f"Expected testable: {reason}"
+        assert not can
+        assert "llvm-mc" in reason.lower() or "bug" in reason.lower()
 
     def test_vst_128_spill_testable(self, isa_data):
         """VST_128_ag_spill must be testable via StoreStrategy."""
