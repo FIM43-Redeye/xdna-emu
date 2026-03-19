@@ -2787,6 +2787,11 @@ class StreamStrategy(TestStrategy):
         return ""
 
     def can_test(self, instr: dict) -> tuple[bool, str]:
+        # doTlast_reg variants have $tlast in asm_string but llvm-mc
+        # doesn't support the extra operand.  Skip them -- the base
+        # and mnemonic-tlast variants cover the same encodings.
+        if self._has_tlast_reg(instr):
+            return (False, "doTlast_reg variant (unsupported by llvm-mc)")
         mode = self._detect_mode(instr)
         if mode:
             return (True, "")
@@ -2801,7 +2806,7 @@ class StreamStrategy(TestStrategy):
         if mode == "ss_status":
             return [{"mRa": "r0"}]
         if mode == "stream_read":
-            return [{"dst": "r0", "src": "ss0"}]
+            return [{"dst": "r0", "src": "srSS0"}]
         # stream_write
         combo: dict[str, str] = {}
         if "cph" in asm:
@@ -2876,8 +2881,8 @@ class StreamStrategy(TestStrategy):
 
     def _gen_write_consumer(self):
         """Helper: drain stream via mov.d1, store received value."""
-        lines = ["  // ---- stream write consumer (helper): drain ss0 ----"]
-        lines.append("  mov.d1 r0, ss0")
+        lines = ["  // ---- stream write consumer (helper): drain stream ----"]
+        lines.append("  mov.d1 r0, srSS0")
         lines.append("  nop")
         lines.extend(_scalar_store("r0", "p0", 0))
         lines.append("")

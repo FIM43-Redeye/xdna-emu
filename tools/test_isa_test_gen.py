@@ -4381,10 +4381,13 @@ class TestStreamStrategy:
         ])
 
     def _make_stream_read_d1(self):
-        """mov.d1 $dst, ss0 -- stream read with 1 delay slot."""
-        return _make_instr("MOV_D1_mv_ss2scl", "mov.d1",
-                           "mov.d1\t$dst, ss0", [
+        """mov.d1 $dst, $src -- stream read with 1 delay slot."""
+        return _make_instr("MOV_D1", "mov.d1",
+                           "mov.d1\t$dst, $src", [
             _make_reg_op("dst", "scalar", is_output=True),
+            {"name": "src", "bit_width": 7, "operand_type": "composite_register",
+             "register_kind": "MvSclSrc", "is_output": False,
+             "signed": False, "scale": None},
         ])
 
     def _make_ss_status_read(self):
@@ -4431,10 +4434,12 @@ class TestStreamStrategy:
         can, reason = strategy.can_test(self._make_stream_write_cph())
         assert can, f"Expected can_test=True: {reason}"
 
-    def test_can_test_stream_write_tlast(self):
+    def test_can_test_stream_write_tlast_reg_rejected(self):
+        """doTlast_reg variants are rejected (unsupported by llvm-mc)."""
         strategy = isa_test_gen.StreamStrategy()
         can, reason = strategy.can_test(self._make_stream_write_tlast())
-        assert can, f"Expected can_test=True: {reason}"
+        assert not can
+        assert "doTlast_reg" in reason
 
     def test_can_test_stream_read_d1(self):
         strategy = isa_test_gen.StreamStrategy()
@@ -4513,13 +4518,6 @@ class TestStreamStrategy:
         assert "addr" in combos[0]
         assert "id" in combos[0]
 
-    def test_combos_stream_write_tlast(self):
-        strategy = isa_test_gen.StreamStrategy()
-        combos = strategy.generate_combos(self._make_stream_write_tlast())
-        assert len(combos) == 1
-        assert "src" in combos[0]
-        assert "tlast" in combos[0]
-
     def test_combos_stream_read(self):
         strategy = isa_test_gen.StreamStrategy()
         combos = strategy.generate_combos(self._make_stream_read_d1())
@@ -4585,12 +4583,12 @@ class TestStreamStrategy:
         assert "mov.nb" in prod
         assert "ms" in prod
 
-    def test_stream_write_consumer_reads_ss0(self):
+    def test_stream_write_consumer_reads_stream(self):
         strategy = isa_test_gen.StreamStrategy()
         regs = {"src": "r0"}
         result = strategy.generate_stream_pair(self._make_stream_write_nb(), regs)
         cons = result["consumer_asm"]
-        assert "ss0" in cons
+        assert "srSS0" in cons
 
     def test_stream_write_consumer_stores_to_p0(self):
         strategy = isa_test_gen.StreamStrategy()
@@ -4621,26 +4619,19 @@ class TestStreamStrategy:
         assert "m0" in prod
         assert "#0" in prod
 
-    def test_stream_write_tlast_reg_sets_register(self):
-        strategy = isa_test_gen.StreamStrategy()
-        regs = {"src": "r0", "tlast": "r1"}
-        result = strategy.generate_stream_pair(self._make_stream_write_tlast(), regs)
-        prod = result["producer_asm"]
-        assert "r1" in prod
-
     # -- generate_stream_pair: stream_read mode --
 
     def test_stream_read_consumer_has_test_instruction(self):
         strategy = isa_test_gen.StreamStrategy()
-        regs = {"dst": "r0", "src": "ss0"}
+        regs = {"dst": "r0", "src": "srSS0"}
         result = strategy.generate_stream_pair(self._make_stream_read_d1(), regs)
         cons = result["consumer_asm"]
         assert "mov.d1" in cons
-        assert "ss0" in cons
+        assert "srSS0" in cons
 
     def test_stream_read_consumer_has_nop_sled(self):
         strategy = isa_test_gen.StreamStrategy()
-        regs = {"dst": "r0", "src": "ss0"}
+        regs = {"dst": "r0", "src": "srSS0"}
         result = strategy.generate_stream_pair(self._make_stream_read_d1(), regs)
         cons = result["consumer_asm"]
         lines = cons.strip().split("\n")
@@ -4654,14 +4645,14 @@ class TestStreamStrategy:
 
     def test_stream_read_producer_writes_ms(self):
         strategy = isa_test_gen.StreamStrategy()
-        regs = {"dst": "r0", "src": "ss0"}
+        regs = {"dst": "r0", "src": "srSS0"}
         result = strategy.generate_stream_pair(self._make_stream_read_d1(), regs)
         prod = result["producer_asm"]
         assert "ms" in prod
 
     def test_stream_read_producer_has_markers(self):
         strategy = isa_test_gen.StreamStrategy()
-        regs = {"dst": "r0", "src": "ss0"}
+        regs = {"dst": "r0", "src": "srSS0"}
         result = strategy.generate_stream_pair(self._make_stream_read_d1(), regs)
         prod = result["producer_asm"]
         assert "#170" in prod
