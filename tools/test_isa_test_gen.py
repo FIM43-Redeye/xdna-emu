@@ -2656,6 +2656,85 @@ class TestFifoLoadStrategy:
 
 
 # ===================================================================
+# CascadeStrategy tests
+# ===================================================================
+
+class TestCascadeStrategy:
+    """Tests for CascadeStrategy with marker-based verification."""
+
+    def _make_mcd_write(self):
+        return _make_instr("VMOV_mv_mcd", "vmov", "vmov\tMCD, $src", [
+            {"name": "src", "bit_width": 6, "operand_type": "composite_register",
+             "register_kind": "MvBMXDst"},
+        ], slot="st")
+
+    def _make_scd_read(self):
+        return _make_instr("VMOV_mv_scd", "vmov", "vmov\t$dst, SCD", [
+            {"name": "dst", "bit_width": 6, "operand_type": "composite_register",
+             "register_kind": "MvBMXDst"},
+        ], slot="lda")
+
+    def _make_vmov_hi(self):
+        return _make_instr("VMOV_HI", "vmov.hi", "vmov.hi\t$dst, SCD", [
+            {"name": "dst", "bit_width": 4, "operand_type": "unknown"},
+        ], slot="lda")
+
+    def test_mcd_write_can_test(self):
+        """Cascade write should be testable (MCD FIFO depth 4)."""
+        strategy = isa_test_gen.CascadeStrategy()
+        can, reason = strategy.can_test(self._make_mcd_write())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_scd_read_rejected(self):
+        """Cascade read should be rejected (stalls without neighboring tile)."""
+        strategy = isa_test_gen.CascadeStrategy()
+        can, _ = strategy.can_test(self._make_scd_read())
+        assert not can
+
+    def test_vmov_hi_rejected(self):
+        """vmov.hi SCD should be rejected (cascade read)."""
+        strategy = isa_test_gen.CascadeStrategy()
+        can, _ = strategy.can_test(self._make_vmov_hi())
+        assert not can
+
+    def test_non_cascade_rejected(self):
+        strategy = isa_test_gen.CascadeStrategy()
+        instr = _make_instr("ADD", "add", "add\t$mRx, $mRy, $mRz", [
+            _make_reg_op("mRx", "scalar"),
+        ])
+        can, _ = strategy.can_test(instr)
+        assert not can
+
+    def test_no_input_buffer(self):
+        strategy = isa_test_gen.CascadeStrategy()
+        assert strategy.compute_input_size(self._make_mcd_write(), {}) == 0
+
+    def test_output_size_is_8(self):
+        strategy = isa_test_gen.CascadeStrategy()
+        assert strategy.compute_output_size(self._make_mcd_write()) == 8
+
+    def test_mcd_write_generates_markers(self):
+        """MCD write should have before/after markers and enable crMCDEn."""
+        strategy = isa_test_gen.CascadeStrategy()
+        regs = {"src": "x0"}
+        asm = strategy.generate_test_point(self._make_mcd_write(), regs,
+                                           in_offset=0, out_offset=0)
+        assert "#170" in asm  # before
+        assert "#204" in asm  # after
+        assert "crMCDEn" in asm
+        assert "vmov" in asm and "MCD" in asm
+
+    def test_mcd_write_loads_source(self):
+        """MCD write should load data into the source register first."""
+        strategy = isa_test_gen.CascadeStrategy()
+        regs = {"src": "x0"}
+        asm = strategy.generate_test_point(self._make_mcd_write(), regs,
+                                           in_offset=0, out_offset=0)
+        # Should load data into x0 via vlda (vector load from input buffer).
+        assert "vlda" in asm
+
+
+# ===================================================================
 # Task 4: generate_all integration tests
 # ===================================================================
 

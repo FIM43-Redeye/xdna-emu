@@ -582,11 +582,12 @@ def classify_instruction(instr: dict) -> tuple[str, str]:
     # cycle count.  No skip needed.
     if "SS" in asm and "mov" in mnemonic:
         return ("skipped", "stream switch status read (hangs without streams)")
-    # 5c. Cascade read/write instructions need active cascade connections.
-    # SCD = stream cascade data (read from cascade), MCD = main cascade data
-    # (write to cascade).  Without live cascade setup these stall.
-    if "SCD" in asm or "MCD" in asm:
-        return ("skipped", "cascade instruction (needs active cascade)")
+    # 5c. Cascade read instructions stall without data from a neighboring
+    # tile.  MCD (write) is handled by CascadeStrategy.
+    if "SCD" in asm:
+        return ("skipped", "cascade read (stalls without neighboring tile)")
+    if "MCD" in asm:
+        return ("skipped", "cascade write (handled by CascadeStrategy)")
 
     operands = instr.get("operands", [])
 
@@ -2558,6 +2559,97 @@ class FifoLoadStrategy(TestStrategy):
 
 
 # ---------------------------------------------------------------------------
+# CascadeStrategy: tests cascade write instruction with markers
+# ---------------------------------------------------------------------------
+
+class CascadeStrategy(TestStrategy):
+    """Tests cascade write instruction (vmov MCD, $src).
+
+    Cascade writes push data to the MCD FIFO (depth 4).  A single write
+    completes without stalling even if no downstream tile is consuming.
+    Marker-based verification proves execution completed.
+
+    Cascade READS (vmov $dst, SCD / vmov.hi / vmov.lo) stall without
+    data from a neighboring tile and are rejected here.  Multi-tile
+    infrastructure is needed to test them.
+    """
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        asm = instr.get("asm_string", "")
+        if "MCD" in asm:
+            return (True, "")
+        if "SCD" in asm:
+            return (False, "cascade read (stalls without neighboring tile)")
+        return (False, "not a cascade instruction")
+
+    def compute_input_size(self, instr, regs):
+        return 0
+
+    def compute_output_size(self, instr):
+        return 8  # before + after markers
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        combo = {}
+        for op in instr.get("operands", []):
+            op_name = op["name"]
+            kind = op.get("register_kind", "")
+            if kind in ("MvBMXDst", "MvBMXSrc"):
+                combo[op_name] = "x0"
+            else:
+                names = register_names(kind)
+                combo[op_name] = names[0] if names else "r0"
+        return [combo]
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
+        """Generate cascade write test with markers.
+
+        Layout:
+            vlda wl0, [p0, #0]         (load data into x0 low half)
+            vlda wh0, [p0, #32]        (load data into x0 high half)
+            nop x5                     (wait for load pipeline)
+            mov crMCDEn, #1            (enable cascade output)
+            mov r14, #170              (before marker)
+            st r14, [p1, #OUT]
+            vmov MCD, x0              (THE INSTRUCTION)
+            mov r14, #204              (after marker)
+            st r14, [p1, #OUT+4]
+        """
+        name = instr["name"]
+        asm_str = instr.get("asm_string", "")
+        src_reg = regs.get("src", "x0")
+
+        LOAD_LATENCY = 5
+
+        lines = []
+        lines.append(f"  // ---- test (cascade): {name} ----")
+
+        # Load known data into the source vector register from input buffer.
+        in_offset = _align(in_offset, 32)
+        lines.append(f"  vlda wl0, [p0, #{in_offset}]")
+        lines.append(f"  vlda wh0, [p0, #{in_offset + 32}]")
+        lines.extend(_nop_sled(LOAD_LATENCY))
+
+        # Enable cascade output.
+        lines.append(f"  mov crMCDEn, #1")
+
+        # Store "before" marker.
+        out_offset = _align(out_offset, 4)
+        lines.append(f"  mov r14, #170")
+        lines.extend(_scalar_store("r14", "p1", out_offset))
+
+        # Execute the instruction under test.
+        asm_line = _substitute_asm(asm_str, regs)
+        lines.append(f"  {asm_line}")
+
+        # Store "after" marker (proves no stall).
+        lines.append(f"  mov r14, #204")
+        lines.extend(_scalar_store("r14", "p1", out_offset + 4))
+
+        lines.append("")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # ConversionStrategy: LLVM IR generation for fused conversion instructions
 # ---------------------------------------------------------------------------
 
@@ -2880,6 +2972,7 @@ STRATEGIES: list[TestStrategy] = [
     BranchStrategy(),
     LockStrategy(),
     FifoLoadStrategy(),
+    CascadeStrategy(),
     LoadStrategy(),
     StoreStrategy(),
     ComputeStrategy(),
