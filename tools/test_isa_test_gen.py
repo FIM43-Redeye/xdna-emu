@@ -3188,7 +3188,10 @@ class TestGenerateAll:
             assert batch["test_count"] <= 200
             assert "in_size" in batch
             assert "out_size" in batch
-            assert batch["in_size"] > 0
+            # Pair batches (cascade_pair, stream_pair) may have in_size == 0
+            # because the consumer receives data via cascade/stream, not host.
+            if batch.get("source_type") not in ("cascade_pair", "stream_pair"):
+                assert batch["in_size"] > 0
             assert batch["out_size"] > 0
             assert "tests" in batch
             assert len(batch["tests"]) == batch["test_count"]
@@ -3275,6 +3278,58 @@ class TestGenerateAll:
         manifest = generate_all(isa_json_path, out_dir)
         skip_reasons = manifest.get("skip_reasons", {})
         assert "cascade read (stalls without neighboring tile)" not in skip_reasons
+
+    def test_stream_pairs_in_manifest(self, isa_json_path, out_dir):
+        """Stream instructions should produce stream_pair batches."""
+        manifest = generate_all(isa_json_path, out_dir)
+        stream_batches = [
+            b for b in manifest["batches"]
+            if b.get("source_type") == "stream_pair"
+        ]
+        assert len(stream_batches) > 0, "Expected stream_pair batches"
+
+    def test_stream_pair_has_both_files(self, isa_json_path, out_dir):
+        """Each stream_pair batch should have producer and consumer filenames."""
+        manifest = generate_all(isa_json_path, out_dir)
+        stream_batches = [
+            b for b in manifest["batches"]
+            if b.get("source_type") == "stream_pair"
+        ]
+        for batch in stream_batches:
+            assert "producer_filename" in batch
+            assert "consumer_filename" in batch
+            prod_path = os.path.join(out_dir, batch["producer_filename"])
+            cons_path = os.path.join(out_dir, batch["consumer_filename"])
+            assert os.path.exists(prod_path), f"Missing {prod_path}"
+            assert os.path.exists(cons_path), f"Missing {cons_path}"
+
+    def test_stream_instructions_now_testable(self, isa_json_path, out_dir):
+        """Stream instructions should no longer appear in skip reasons."""
+        manifest = generate_all(isa_json_path, out_dir)
+        skip_reasons = manifest.get("skip_reasons", {})
+        assert "stream instruction" not in skip_reasons
+        assert "stream switch status read (hangs without streams)" not in skip_reasons
+
+    def test_mov_d_dual_testing(self, isa_json_path, out_dir):
+        """mov.d* should appear in both normal batches and stream_pair batches."""
+        manifest = generate_all(isa_json_path, out_dir)
+        stream_batches = [
+            b for b in manifest["batches"]
+            if b.get("source_type") == "stream_pair"
+        ]
+        normal_batches = [
+            b for b in manifest["batches"]
+            if b.get("source_type", "assembly") == "assembly"
+        ]
+        stream_instrs = {b["instruction"] for b in stream_batches if "instruction" in b}
+        has_d_stream = any("MOV_D" in i for i in stream_instrs)
+        assert has_d_stream, "Expected mov.d* in stream_pair batches"
+        normal_instrs = set()
+        for batch in normal_batches:
+            for test in batch.get("tests", []):
+                normal_instrs.add(test.get("instruction", ""))
+        has_d_normal = any("MOV_D" in i for i in normal_instrs)
+        assert has_d_normal, "Expected mov.d* in normal assembly batches"
 
 
 # ===================================================================
@@ -4026,7 +4081,7 @@ class TestGenerateAllWithConversions:
         for batch in manifest["batches"]:
             assert "source_type" in batch, \
                 f"Batch {batch['batch_index']} missing source_type"
-            assert batch["source_type"] in ("assembly", "llvm_ir", "cascade_pair"), \
+            assert batch["source_type"] in ("assembly", "llvm_ir", "cascade_pair", "stream_pair"), \
                 f"Batch {batch['batch_index']}: unexpected source_type '{batch['source_type']}'"
 
     def test_conversion_batch_exists(self, isa_json_path, out_dir):

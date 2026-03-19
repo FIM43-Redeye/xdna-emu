@@ -3588,6 +3588,9 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     # Cascade read specs: (instr, combo_idx, regs, strategy) for cascade_pair
     # generation.  These are NOT bin-packed; each becomes a standalone batch.
     cascade_specs: list[tuple[dict, int, dict, CascadeReadStrategy]] = []
+    # Stream specs: (instr, combo_idx, regs, strategy) for stream_pair
+    # generation.  Like cascade, NOT bin-packed; each becomes a standalone batch.
+    stream_specs: list[tuple[dict, int, dict, StreamStrategy]] = []
 
     for instr in all_instrs:
         # Check conversion first (before normal strategy dispatch).
@@ -3618,10 +3621,15 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
                 cascade_specs.append((instr, combo_idx, regs, strategy))
             continue
 
-        # Stream instructions are counted as testable but deferred to
-        # stream_pair generation (Task 3).  Skip bin-packing for now.
+        # Stream instructions are counted as testable but NOT bin-packed
+        # into mega-program batches.  Each becomes a standalone stream_pair
+        # batch with producer + consumer .s files.
         if isinstance(strategy, StreamStrategy):
             testable_count += 1
+            combos = strategy.generate_combos(instr)
+            for combo_idx, regs in enumerate(combos):
+                regs["_combo_idx"] = combo_idx
+                stream_specs.append((instr, combo_idx, regs, strategy))
             continue
 
         testable_count += 1
@@ -3634,6 +3642,21 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
 
     # Count conversion instructions as testable.
     testable_count += conv_instr_count
+
+    # Second pass: mov.d* also get non-stream combos via ComputeStrategy.
+    # StreamStrategy already claims them for stream-source combos (ss0);
+    # this pass lets ComputeStrategy handle non-stream combos (e.g., mov.d1 r0, r1).
+    compute = ComputeStrategy()
+    for instr in all_instrs:
+        mnemonic = instr.get("mnemonic", "")
+        if re.match(r"mov\.d[1-6]", mnemonic):
+            can, _ = compute.can_test(instr)
+            if can:
+                testable_count += 1
+                combos = compute.generate_combos(instr)
+                for combo_idx, regs in enumerate(combos):
+                    regs["_combo_idx"] = combo_idx
+                    test_point_specs.append((instr, combo_idx, regs, compute))
 
     # First pass: generate assembly for each test point at offset 0 to
     # measure its code size (bundle count).  This lets us bin-pack into
@@ -3827,9 +3850,60 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         })
         batch_idx += 1
 
+    # Generate stream_pair batches.  Each stream instruction becomes a
+    # standalone batch with producer + consumer .s files.
+    for instr, combo_idx, regs, strategy in stream_specs:
+        pair = strategy.generate_stream_pair(instr, regs)
+
+        prod_asm = pair["producer_asm"]
+        cons_asm = pair["consumer_asm"]
+
+        # Wrap each in a standalone mega-program.
+        prod_program = build_mega_program([prod_asm])
+        cons_program = build_mega_program([cons_asm])
+
+        prod_filename = f"batch_{batch_idx:03d}_producer.s"
+        cons_filename = f"batch_{batch_idx:03d}_consumer.s"
+
+        with open(os.path.join(out_dir, prod_filename), "w") as f:
+            f.write(prod_program)
+        with open(os.path.join(out_dir, cons_filename), "w") as f:
+            f.write(cons_program)
+
+        batches.append({
+            "batch_index": batch_idx,
+            "filename": cons_filename,
+            "source_type": "stream_pair",
+            "producer_filename": prod_filename,
+            "consumer_filename": cons_filename,
+            "producer_in_size": strategy.compute_producer_input_size(instr),
+            "producer_out_size": strategy.compute_producer_output_size(instr),
+            "consumer_in_size": 0,
+            "consumer_out_size": strategy.compute_consumer_output_size(instr),
+            "instruction": instr["name"],
+            "slot": instr.get("slot", ""),
+            "test_count": 1,
+            "in_size": 0,
+            "out_size": (strategy.compute_producer_output_size(instr)
+                         + strategy.compute_consumer_output_size(instr)),
+            "tests": [{
+                "instruction": instr["name"],
+                "slot": instr.get("slot", ""),
+                "combo_index": combo_idx,
+                "operands": {k: v for k, v in regs.items()
+                             if not k.startswith("_")},
+                "in_offset": 0,
+                "in_size": 0,
+                "out_offset": 0,
+                "out_size": (strategy.compute_producer_output_size(instr)
+                             + strategy.compute_consumer_output_size(instr)),
+            }],
+        })
+        batch_idx += 1
+
     # Write manifest.json.
     total_test_points = (len(test_point_specs) + total_conv_test_points
-                         + len(cascade_specs))
+                         + len(cascade_specs) + len(stream_specs))
     manifest = {
         "testable_instructions": testable_count,
         "skipped_instructions": skipped_count,
