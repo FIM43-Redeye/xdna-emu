@@ -3047,6 +3047,90 @@ class TestCascadeReadStrategy:
         assert strategy.compute_consumer_output_size(self._make_vmov_hi_scd()) == 32
         assert strategy.compute_consumer_output_size(self._make_vmov_lo_scd()) == 32
 
+    def test_producer_asm_loads_data(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        regs = {"dst": "x0"}
+        result = strategy.generate_cascade_pair(self._make_vmov_scd(), regs)
+        prod = result["producer_asm"]
+        assert "vlda" in prod
+        assert "wl0" in prod and "wh0" in prod
+
+    def test_producer_asm_has_nop_sled(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        regs = {"dst": "x0"}
+        result = strategy.generate_cascade_pair(self._make_vmov_scd(), regs)
+        prod = result["producer_asm"]
+        assert prod.count("nop") >= 5
+
+    def test_producer_asm_enables_mcd(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        regs = {"dst": "x0"}
+        result = strategy.generate_cascade_pair(self._make_vmov_scd(), regs)
+        prod = result["producer_asm"]
+        assert "crMCDEn" in prod
+
+    def test_producer_asm_writes_mcd(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        regs = {"dst": "x0"}
+        result = strategy.generate_cascade_pair(self._make_vmov_scd(), regs)
+        prod = result["producer_asm"]
+        assert "MCD" in prod and "vmov" in prod
+
+    def test_producer_asm_has_markers(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        regs = {"dst": "x0"}
+        result = strategy.generate_cascade_pair(self._make_vmov_scd(), regs)
+        prod = result["producer_asm"]
+        assert "#170" in prod  # before
+        assert "#204" in prod  # after
+
+    def test_consumer_asm_enables_scd(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        regs = {"dst": "x0"}
+        result = strategy.generate_cascade_pair(self._make_vmov_scd(), regs)
+        cons = result["consumer_asm"]
+        assert "crSCDEn" in cons
+
+    def test_consumer_asm_reads_scd(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        regs = {"dst": "x0"}
+        result = strategy.generate_cascade_pair(self._make_vmov_scd(), regs)
+        cons = result["consumer_asm"]
+        assert "SCD" in cons and "vmov" in cons
+
+    def test_consumer_asm_stores_to_p0(self):
+        """Consumer has one arg (output), so p0 = output buffer."""
+        strategy = isa_test_gen.CascadeReadStrategy()
+        regs = {"dst": "x0"}
+        result = strategy.generate_cascade_pair(self._make_vmov_scd(), regs)
+        cons = result["consumer_asm"]
+        assert "vst" in cons and "p0" in cons
+
+    def test_consumer_full_stores_both_halves(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        regs = {"dst": "x0"}
+        result = strategy.generate_cascade_pair(self._make_vmov_scd(), regs)
+        cons = result["consumer_asm"]
+        assert "wl0" in cons and "wh0" in cons
+
+    def test_consumer_hi_stores_high_half_only(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        regs = {"dst": "x0"}
+        result = strategy.generate_cascade_pair(self._make_vmov_hi_scd(), regs)
+        cons = result["consumer_asm"]
+        assert "wh0" in cons
+        lines = [l for l in cons.split("\n") if "vst" in l]
+        assert len(lines) == 1
+
+    def test_consumer_lo_stores_low_half_only(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        regs = {"dst": "x0"}
+        result = strategy.generate_cascade_pair(self._make_vmov_lo_scd(), regs)
+        cons = result["consumer_asm"]
+        assert "wl0" in cons
+        lines = [l for l in cons.split("\n") if "vst" in l]
+        assert len(lines) == 1
+
 
 # ===================================================================
 # Task 4: generate_all integration tests

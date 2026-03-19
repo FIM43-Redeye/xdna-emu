@@ -2694,6 +2694,55 @@ class CascadeReadStrategy(TestStrategy):
     def compute_output_size(self, instr):
         return self.compute_producer_output_size() + self.compute_consumer_output_size(instr)
 
+    def generate_cascade_pair(self, instr: dict, regs: dict) -> dict:
+        """Generate producer and consumer assembly programs.
+
+        Returns dict with 'producer_asm' and 'consumer_asm' strings.
+        """
+        return {
+            "producer_asm": self._generate_producer(),
+            "consumer_asm": self._generate_consumer(instr, regs),
+        }
+
+    def _generate_producer(self) -> str:
+        """Generic producer: load data from p0, write to MCD, markers to p1."""
+        LOAD_LATENCY = 5
+        lines = []
+        lines.append("  // ---- cascade producer: load + write MCD ----")
+        lines.append("  vlda wl0, [p0, #0]")
+        lines.append("  vlda wh0, [p0, #32]")
+        lines.extend(_nop_sled(LOAD_LATENCY))
+        lines.append("  mov r14, #170")
+        lines.extend(_scalar_store("r14", "p1", 0))
+        lines.append("  mov r14, #1")
+        lines.append("  mov crMCDEn, r14")
+        lines.append("  vmov MCD, x0")
+        lines.append("  mov r14, #204")
+        lines.extend(_scalar_store("r14", "p1", 4))
+        lines.append("")
+        return "\n".join(lines)
+
+    def _generate_consumer(self, instr: dict, regs: dict) -> str:
+        """Consumer: enable SCD, read cascade, store result to p0."""
+        mnemonic = instr.get("mnemonic", "")
+        asm_str = instr.get("asm_string", "")
+        name = instr["name"]
+        lines = []
+        lines.append(f"  // ---- cascade consumer: {name} ----")
+        lines.append("  mov r14, #1")
+        lines.append("  mov crSCDEn, r14")
+        asm_line = _substitute_asm(asm_str, regs)
+        lines.append(f"  {asm_line}")
+        if mnemonic == "vmov.hi":
+            lines.append("  vst wh0, [p0, #0]")
+        elif mnemonic == "vmov.lo":
+            lines.append("  vst wl0, [p0, #0]")
+        else:
+            lines.append("  vst wl0, [p0, #0]")
+            lines.append("  vst wh0, [p0, #32]")
+        lines.append("")
+        return "\n".join(lines)
+
     def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
         raise NotImplementedError(
             "CascadeReadStrategy uses generate_cascade_pair(), not generate_test_point()"
