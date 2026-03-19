@@ -2047,30 +2047,145 @@ class TestBranchStrategy:
         can, reason = strategy.can_test(self._make_j())
         assert can, f"Expected can_test=True: {reason}"
 
-    def test_j_register_indirect_deferred(self):
-        """Register-indirect j $mPm should be deferred (needs pointer setup)."""
-        instr = _make_instr("J_IND", "j", "j\t$mPm", [
+    def _make_j_ind(self):
+        return _make_instr("J_jump_ind", "j", "j\t$mPm", [
             _make_reg_op("mPm", "pointer"),
         ], slot="alu")
-        strategy = isa_test_gen.BranchStrategy()
-        can, reason = strategy.can_test(instr)
-        assert not can
 
-    def test_ret_deferred(self):
-        instr = _make_instr("RET", "ret", "ret lr", [], slot="alu")
-        strategy = isa_test_gen.BranchStrategy()
-        can, reason = strategy.can_test(instr)
-        assert not can
+    def _make_jl_ind(self):
+        return _make_instr("JL_IND", "jl", "jl\t$mPm", [
+            _make_reg_op("mPm", "pointer"),
+        ], slot="alu")
 
-    def test_jnzd_deferred(self):
-        instr = _make_instr("JNZD", "jnzd", "jnzd\t$mRx, $mRx0, $mPm", [
+    def _make_ret(self):
+        return _make_instr("RET", "ret", "ret lr", [], slot="alu")
+
+    def _make_jnzd(self):
+        return _make_instr("JNZD", "jnzd", "jnzd\t$mRx, $mRx0, $mPm", [
             _make_reg_op("mRx", "scalar"),
             _make_reg_op("mRx0", "scalar"),
             _make_reg_op("mPm", "pointer"),
         ], slot="alu")
+
+    def test_j_register_indirect_can_test(self):
+        """Register-indirect j $mPm should now be testable."""
         strategy = isa_test_gen.BranchStrategy()
-        can, reason = strategy.can_test(instr)
-        assert not can
+        can, reason = strategy.can_test(self._make_j_ind())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_jl_register_indirect_can_test(self):
+        """Register-indirect jl $mPm should now be testable."""
+        strategy = isa_test_gen.BranchStrategy()
+        can, reason = strategy.can_test(self._make_jl_ind())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_ret_can_test(self):
+        """ret lr should now be testable."""
+        strategy = isa_test_gen.BranchStrategy()
+        can, reason = strategy.can_test(self._make_ret())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_jnzd_can_test(self):
+        """jnzd should now be testable."""
+        strategy = isa_test_gen.BranchStrategy()
+        can, reason = strategy.can_test(self._make_jnzd())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_ret_generates_lr_setup(self):
+        """ret should set LR to the taken target IW address."""
+        strategy = isa_test_gen.BranchStrategy()
+        regs = {}
+        asm = strategy.generate_test_point(self._make_ret(), regs,
+                                           in_offset=0, out_offset=0)
+        # Should set up LR with target address.
+        assert "mov lr, #" in asm
+        # Should have ret lr instruction.
+        assert "ret lr" in asm
+        # Should store markers.
+        assert "#170" in asm  # 0xAA before marker
+        assert "#204" in asm  # 0xCC taken marker
+
+    def test_j_ind_generates_pointer_setup(self):
+        """Register-indirect j should load target IW into pointer register."""
+        strategy = isa_test_gen.BranchStrategy()
+        regs = {"mPm": "p2"}
+        asm = strategy.generate_test_point(self._make_j_ind(), regs,
+                                           in_offset=0, out_offset=0)
+        # Should set up pointer register with target address.
+        assert "mov p2, #" in asm
+        # Should have j p2 instruction (not j #N).
+        assert "j p2" in asm
+
+    def test_jl_ind_generates_pointer_setup(self):
+        """Register-indirect jl should load target IW into pointer register."""
+        strategy = isa_test_gen.BranchStrategy()
+        regs = {"mPm": "p3"}
+        asm = strategy.generate_test_point(self._make_jl_ind(), regs,
+                                           in_offset=0, out_offset=0)
+        assert "mov p3, #" in asm
+        assert "jl p3" in asm
+
+    def test_jnzd_generates_counter_setup(self):
+        """jnzd should set up counter register and pointer register."""
+        strategy = isa_test_gen.BranchStrategy()
+        regs = {"mRx": "r0", "mRx0": "r1", "mPm": "p2", "_combo_idx": 0}
+        asm = strategy.generate_test_point(self._make_jnzd(), regs,
+                                           in_offset=0, out_offset=0)
+        # Combo 0 = taken: counter should be 2 (decrement to 1, nonzero).
+        assert "mov r1, #2" in asm
+        assert "mov p2, #" in asm
+        assert "jnzd r0, r1, p2" in asm
+
+    def test_jnzd_not_taken_combo(self):
+        """jnzd combo 1 = not-taken: counter should be 1 (decrement to 0)."""
+        strategy = isa_test_gen.BranchStrategy()
+        regs = {"mRx": "r0", "mRx0": "r1", "mPm": "p2", "_combo_idx": 1}
+        asm = strategy.generate_test_point(self._make_jnzd(), regs,
+                                           in_offset=0, out_offset=0)
+        # Combo 1 = not-taken: counter should be 1 (decrement to 0, zero).
+        assert "mov r1, #1" in asm
+
+    def test_jnzd_generates_two_combos(self):
+        """jnzd is conditional, should produce 2 combos."""
+        strategy = isa_test_gen.BranchStrategy()
+        combos = strategy.generate_combos(self._make_jnzd())
+        assert len(combos) == 2
+
+    def test_ret_generates_one_combo(self):
+        """ret is unconditional, should produce 1 combo."""
+        strategy = isa_test_gen.BranchStrategy()
+        combos = strategy.generate_combos(self._make_ret())
+        assert len(combos) == 1
+
+    def test_j_ind_generates_one_combo(self):
+        """Register-indirect j is unconditional, should produce 1 combo."""
+        strategy = isa_test_gen.BranchStrategy()
+        combos = strategy.generate_combos(self._make_j_ind())
+        assert len(combos) == 1
+
+    def test_ret_no_input_buffer(self):
+        """ret needs no input buffer."""
+        strategy = isa_test_gen.BranchStrategy()
+        assert strategy.compute_input_size(self._make_ret(), {}) == 0
+
+    def test_j_ind_iw_offset_shifts_targets(self):
+        """Register-indirect j should respect code_iw_offset."""
+        strategy = isa_test_gen.BranchStrategy()
+        regs = {"mPm": "p2"}
+        import re as _re
+        asm0 = strategy.generate_test_point(self._make_j_ind(), regs,
+                                            in_offset=0, out_offset=0,
+                                            code_iw_offset=0)
+        asm10 = strategy.generate_test_point(self._make_j_ind(), regs,
+                                             in_offset=0, out_offset=0,
+                                             code_iw_offset=10)
+        # Extract the pointer setup value (mov p2, #N).
+        targets0 = _re.findall(r'mov p2, #(\d+)', asm0)
+        targets10 = _re.findall(r'mov p2, #(\d+)', asm10)
+        assert len(targets0) >= 1
+        assert len(targets10) >= 1
+        # Offset=10 should shift the target by 10.
+        assert int(targets10[0]) == int(targets0[0]) + 10
 
     def test_j_generates_numeric_targets(self):
         """Unconditional j should emit numeric IW addresses, not labels."""

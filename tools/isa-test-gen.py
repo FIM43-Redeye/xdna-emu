@@ -2080,30 +2080,27 @@ class BranchStrategy(TestStrategy):
     tells us how many IWs precede this test point in the current batch.
     """
 
-    _TESTABLE = frozenset({"j", "jl", "jnz", "jz"})
-    _DEFERRED = frozenset({"ret", "jnzd"})
+    _TESTABLE = frozenset({"j", "jl", "jnz", "jz", "ret", "jnzd"})
 
     def can_test(self, instr: dict) -> tuple[bool, str]:
         mnemonic = instr.get("mnemonic", "")
-        if mnemonic in self._DEFERRED:
-            return (False, f"deferred branch: {mnemonic}")
         if mnemonic not in self._TESTABLE:
             return (False, "not a branch instruction")
-
-        # Reject register-indirect branches (j $mPm, jl $mPm).
-        operands = instr.get("operands", [])
-        has_pointer = any(
-            op.get("register_kind") == "pointer"
-            for op in operands
-            if op.get("operand_type") in REGISTER_LIKE_TYPES
-        )
-        if has_pointer:
-            return (False, "register-indirect branch (deferred)")
-
         return (True, "")
 
     def _is_conditional(self, instr: dict) -> bool:
-        return instr.get("mnemonic", "") in ("jnz", "jz")
+        return instr.get("mnemonic", "") in ("jnz", "jz", "jnzd")
+
+    def _is_indirect(self, instr: dict) -> bool:
+        """True if the branch target comes from a pointer register."""
+        return any(
+            op.get("register_kind") == "pointer"
+            for op in instr.get("operands", [])
+            if op.get("operand_type") in REGISTER_LIKE_TYPES
+        )
+
+    def _is_ret(self, instr: dict) -> bool:
+        return instr.get("mnemonic", "") == "ret"
 
     def compute_input_size(self, instr, regs):
         # Conditional branches use immediate values (mov r0, #N) for the
@@ -2143,7 +2140,7 @@ class BranchStrategy(TestStrategy):
                             code_iw_offset=0):
         """Generate branch test with absolute IW addresses.
 
-        Layout (for unconditional j):
+        Layout (for unconditional j #imm):
             IW+0: mov r14, #170       (before marker)
             IW+1: st r14, [p1, #OUT]  (store before marker)
             IW+2: j #<taken_iw>       (THE BRANCH)
@@ -2156,6 +2153,11 @@ class BranchStrategy(TestStrategy):
             IW+17: st r14, [p1, #OUT+4]
             done_iw = IW+18
 
+        For register-indirect (j pN, jl pN, ret lr): an extra mov to load
+        the target IW address into the pointer/LR register prepends.
+        For jnzd: mov counter + mov target pointer prepend.  Combo 0 = taken
+        (counter=2, decrements to 1), combo 1 = not-taken (counter=1,
+        decrements to 0).
         For conditional (jnz/jz), an extra mov r0, #N prepends.
         Store helpers may emit >1 IW for large offsets (padda sequence).
         We count instructions dynamically to get correct targets.
@@ -2163,19 +2165,26 @@ class BranchStrategy(TestStrategy):
         name = instr["name"]
         mnemonic = instr.get("mnemonic", "")
         is_cond = self._is_conditional(instr)
+        is_ind = self._is_indirect(instr)
+        is_ret = self._is_ret(instr)
 
         BRANCH_DELAY = 5
 
         # Determine condition value from combo index.
-        # Combo 0 = taken: jnz needs nonzero, jz needs zero.
-        # Combo 1 = not-taken: jnz needs zero, jz needs nonzero.
         combo_idx = regs.get("_combo_idx", 0)
 
         # Phase 1: Build pre-branch instructions and count them.
         pre_branch = []
         pre_branch.append(f"  // ---- test (branch): {name} ----")
 
-        if is_cond:
+        if mnemonic == "jnzd":
+            # jnzd $mRx, $mRx0, $mPm: dest = source - 1; jump if nonzero.
+            # Combo 0 = taken: source=2 (dec to 1, nonzero).
+            # Combo 1 = not-taken: source=1 (dec to 0, zero).
+            src_reg = regs.get("mRx0", "r1")
+            counter_val = 2 if combo_idx == 0 else 1
+            pre_branch.append(f"  mov {src_reg}, #{counter_val}")
+        elif is_cond:
             if mnemonic == "jnz":
                 cond_val = 1 if combo_idx == 0 else 0
             else:  # jz
@@ -2185,6 +2194,15 @@ class BranchStrategy(TestStrategy):
         out_offset = _align(out_offset, 4)
         pre_branch.append(f"  mov r14, #170")
         pre_branch.extend(_scalar_store("r14", "p1", out_offset))
+
+        # For register-indirect and ret, we need a setup mov AFTER building
+        # the rest of the layout (to know the target IW), but the mov must
+        # appear BEFORE the branch in instruction order.  We insert a
+        # placeholder and patch it in phase 4.
+        setup_placeholder_idx = None
+        if is_ret or is_ind:
+            setup_placeholder_idx = len(pre_branch)
+            pre_branch.append("  nop")  # placeholder, replaced in phase 4
 
         # Count actual instruction words (skip comments).
         def _iw_count(lines):
@@ -2203,23 +2221,44 @@ class BranchStrategy(TestStrategy):
         n_taken = _iw_count(taken)
 
         # Phase 3: Compute absolute IW addresses.
-        # branch_iw = code_iw_offset + n_pre
-        # After branch: 5 delay slots
-        # fall_through_start = branch_iw + 1 + BRANCH_DELAY
-        # After fall-through: j-to-done + 5 delay slots
-        # taken_start = fall_through_start + n_fall + 1 + BRANCH_DELAY
-        # done_iw = taken_start + n_taken
-
         branch_iw = code_iw_offset + n_pre
         fall_through_start = branch_iw + 1 + BRANCH_DELAY
         taken_start = fall_through_start + n_fall + 1 + BRANCH_DELAY
         done_iw = taken_start + n_taken
 
+        # Patch the setup placeholder with the actual target address.
+        if setup_placeholder_idx is not None:
+            if is_ret:
+                pre_branch[setup_placeholder_idx] = \
+                    f"  mov lr, #{taken_start}"
+            elif is_ind:
+                ptr_reg = regs.get("mPm", "p2")
+                pre_branch[setup_placeholder_idx] = \
+                    f"  mov {ptr_reg}, #{taken_start}"
+                # jnzd also needs pointer setup (already has counter from above).
+                if mnemonic == "jnzd":
+                    # The placeholder was for the pointer; counter mov is
+                    # already in pre_branch from the jnzd block above.
+                    pass
+
         # Phase 4: Assemble the full test point.
         lines = list(pre_branch)
 
-        # The branch instruction with absolute IW target.
-        if mnemonic == "j":
+        # The branch instruction.
+        if is_ret:
+            lines.append(f"  ret lr")
+        elif mnemonic == "jnzd":
+            dst_reg = regs.get("mRx", "r0")
+            src_reg = regs.get("mRx0", "r1")
+            ptr_reg = regs.get("mPm", "p2")
+            lines.append(f"  jnzd {dst_reg}, {src_reg}, {ptr_reg}")
+        elif is_ind:
+            ptr_reg = regs.get("mPm", "p2")
+            if mnemonic == "j":
+                lines.append(f"  j {ptr_reg}")
+            elif mnemonic == "jl":
+                lines.append(f"  jl {ptr_reg}")
+        elif mnemonic == "j":
             lines.append(f"  j #{taken_start}")
         elif mnemonic == "jl":
             lines.append(f"  jl #{taken_start}")
