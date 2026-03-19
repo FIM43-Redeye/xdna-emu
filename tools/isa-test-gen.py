@@ -266,7 +266,7 @@ REGISTER_LIKE_TYPES = frozenset({"register", "register+16"})
 #   AluCg (bw=6, 64 entries)
 #     -- constant-generator destination in the alu slot (MOVX_alu_cg).
 #     Subset of the scalar register space.  Map to scalar for testing.
-#   ERS4 (bw=2, 4 entries: r24-r27)
+#   ERS4 (bw=2, 4 entries: r16-r19)
 #     -- narrow scalar subclass used as an index operand in VEXTRACT.
 #     Concrete names: r24, r25, r26, r27.
 #   MvBMXDst (bw=6)
@@ -743,8 +743,8 @@ def _needs_register_pair(instr_name: str) -> bool:
         # Exclude names ending in 16/32/BF16 etc.
         if not name.endswith(("16", "32", "BF16")):
             return True
-    # 64-bit element variants
-    if name.endswith("_64"):
+    # 64-bit element variants (VEXTRACT_D64, VEXTRACT_S64, etc.)
+    if name.endswith(("_64", "D64", "S64")):
         return True
     # Special cases
     if name in ("MOV_CNTR",):
@@ -852,10 +852,11 @@ def register_names(kind: str, bit_width: int = 0,
     if kind == "AluCg":
         return ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7"]
 
-    # ERS4: narrow scalar subclass r24-r27, used as index in VEXTRACT.
+    # ERS4: narrow scalar subclass r16-r19, used as index in VEXTRACT.
     # These are the only 4 registers in this class (2-bit encoding).
+    # Source: AIE2GenRegisterInfo.td line 456: def eRS4 = (add r16, r17, r18, r19)
     if kind == "ERS4":
-        return ["r24", "r25", "r26", "r27"]
+        return ["r16", "r17", "r18", "r19"]
 
     # MvBMXDst / MvBMXSrc: vector/accumulator registers for cascade vmov.
     # Encoding covers x* (vector512) and bml*/bmh* (acc-half).

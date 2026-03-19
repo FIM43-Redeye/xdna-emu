@@ -667,15 +667,15 @@ class TestRegisterNames:
         assert all(n.startswith("r") for n in names), \
             f"Expected r* names for AluCg, got {names}"
 
-    def test_ers4_returns_r24_to_r27(self):
-        """ERS4 is a 2-bit narrow scalar class encoding exactly r24-r27.
+    def test_ers4_returns_r16_to_r19(self):
+        """ERS4 is a 2-bit narrow scalar class encoding exactly r16-r19.
 
         ERS4 is used as the index operand in VEXTRACT instructions.
-        The 2-bit field encodes 4 consecutive high scalar registers.
+        Source: AIE2GenRegisterInfo.td: def eRS4 = (add r16, r17, r18, r19)
         """
         names = register_names("ERS4")
-        assert names == ["r24", "r25", "r26", "r27"], \
-            f"Expected [r24, r25, r26, r27] for ERS4, got {names}"
+        assert names == ["r16", "r17", "r18", "r19"], \
+            f"Expected [r16, r17, r18, r19] for ERS4, got {names}"
 
     def test_mvbmxdst_returns_vector512_names(self):
         """MvBMXDst composite kind maps to x* (vector512) register names.
