@@ -2284,6 +2284,131 @@ class BranchStrategy(TestStrategy):
 
 
 # ---------------------------------------------------------------------------
+# LockStrategy: tests lock acquire/release with marker-based verification
+# ---------------------------------------------------------------------------
+
+class LockStrategy(TestStrategy):
+    """Tests lock instructions using marker-based verification.
+
+    Lock instructions (acq, rel, acq.cond, rel.cond) are side-effect-only:
+    they modify lock hardware state but don't produce register outputs.
+    We verify execution by storing before/after markers -- if the core
+    doesn't stall, both markers appear in the output buffer.
+
+    For acq instructions, a rel is emitted first to set the lock to a
+    known value, preventing the core from stalling indefinitely.
+
+    Conditional variants (acq.cond, rel.cond) use r26 as the condition
+    register; we set r26=1 so the operation always executes.
+    """
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        mnemonic = instr.get("mnemonic", "")
+        if mnemonic not in LOCK_MNEMONICS:
+            return (False, "not a lock instruction")
+        return (True, "")
+
+    def _is_acquire(self, instr: dict) -> bool:
+        return instr.get("mnemonic", "").startswith("acq")
+
+    def _is_conditional(self, instr: dict) -> bool:
+        return ".cond" in instr.get("mnemonic", "")
+
+    def compute_input_size(self, instr, regs):
+        return 0  # No input buffer needed.
+
+    def compute_output_size(self, instr):
+        return 8  # 4-byte "before" marker + 4-byte "after" marker.
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        """Lock instructions get 1 combo with default register values.
+
+        Uses distinct registers for mRx (lock ID) and mRy (value) to
+        avoid clobbering during setup.
+        """
+        combo = {}
+        scalar_idx = 0
+        # Rotate through scalar registers to avoid using the same register
+        # for both the lock ID and the lock value operands.
+        scalar_choices = ["r0", "r1", "r2", "r3"]
+        for op in instr.get("operands", []):
+            op_name = op["name"]
+            op_type = op.get("operand_type", "")
+            if op_type == "immediate":
+                # Use lock ID 0 -- safe default, exists on all tiles.
+                combo[op_name] = "0"
+            elif op_type in REGISTER_LIKE_TYPES:
+                combo[op_name] = scalar_choices[scalar_idx % len(scalar_choices)]
+                scalar_idx += 1
+            elif op_type in ("unknown", "dontcare"):
+                combo[op_name] = "0"
+            else:
+                combo[op_name] = "0"
+        return [combo]
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
+        """Generate lock test with before/after markers.
+
+        Layout:
+            mov r14, #170           (before marker)
+            st r14, [p1, #OUT]      (store before)
+            [mov r26, #1]           (if conditional: enable operation)
+            [mov rN, #1]            (set lock value register)
+            [rel #id/rX, rN]        (if acquire: pre-set lock so it won't stall)
+            <lock instruction>      (THE INSTRUCTION UNDER TEST)
+            mov r14, #204           (after marker)
+            st r14, [p1, #OUT+4]    (store after -- proves no stall)
+        """
+        name = instr["name"]
+        mnemonic = instr.get("mnemonic", "")
+        asm_str = instr.get("asm_string", "")
+
+        lines = []
+        lines.append(f"  // ---- test (lock): {name} ----")
+
+        # Store "before" marker.
+        out_offset = _align(out_offset, 4)
+        lines.append(f"  mov r14, #170")
+        lines.extend(_scalar_store("r14", "p1", out_offset))
+
+        # For conditional variants: set r26=1 so the operation executes.
+        if self._is_conditional(instr):
+            lines.append(f"  mov r26, #1")
+
+        # Determine the lock ID and value register from the combo.
+        # Immediate form: id=lock_id, mRy=value register.
+        # Register form: mRx=lock_id register, mRy=value register.
+        val_reg = regs.get("mRy", "r1")
+
+        # Set the value register to 1.
+        lines.append(f"  mov {val_reg}, #1")
+
+        # For register-indirect lock ID, set the lock ID register.
+        lock_id_reg = regs.get("mRx", None)
+        if lock_id_reg:
+            lines.append(f"  mov {lock_id_reg}, #0")
+
+        # For acquire: emit rel first to ensure the lock is acquirable.
+        if self._is_acquire(instr):
+            if lock_id_reg:
+                lines.append(f"  rel {lock_id_reg}, {val_reg}")
+            else:
+                lock_id_imm = regs.get("id", "0")
+                lines.append(f"  rel #{lock_id_imm}, {val_reg}")
+
+        # Execute the instruction under test.
+        asm_line = _substitute_asm(asm_str, regs)
+        lines.append(f"  {asm_line}")
+
+        # Store "after" marker (proves no stall).
+        lines.append(f"  mov r14, #204")
+        lines.extend(_scalar_store("r14", "p1", out_offset + 4))
+
+        lines.append("")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # ConversionStrategy: LLVM IR generation for fused conversion instructions
 # ---------------------------------------------------------------------------
 
@@ -2604,6 +2729,7 @@ class ConversionStrategy(TestStrategy):
 
 STRATEGIES: list[TestStrategy] = [
     BranchStrategy(),
+    LockStrategy(),
     LoadStrategy(),
     StoreStrategy(),
     ComputeStrategy(),

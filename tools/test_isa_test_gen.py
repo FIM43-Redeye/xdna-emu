@@ -2306,6 +2306,165 @@ class TestBranchStrategy:
 
 
 # ===================================================================
+# LockStrategy tests
+# ===================================================================
+
+class TestLockStrategy:
+    """Tests for LockStrategy with marker-based verification."""
+
+    def _make_acq_imm(self):
+        return _make_instr("ACQ_mLockId_imm", "acq", "acq\t$id, $mRy", [
+            _make_imm_op("id", bit_width=6, signed=True),
+            _make_reg_op("mRy", "scalar"),
+        ], slot="alu")
+
+    def _make_acq_reg(self):
+        return _make_instr("ACQ_mLockId_reg", "acq", "acq\t$mRx, $mRy", [
+            _make_reg_op("mRy", "scalar"),
+            _make_reg_op("mRx", "scalar"),
+            {"name": "dontcare1", "bit_width": 1, "operand_type": "unknown"},
+        ], slot="alu")
+
+    def _make_rel_imm(self):
+        return _make_instr("REL_mLockId_imm", "rel", "rel\t$id, $mRy", [
+            _make_imm_op("id", bit_width=6, signed=True),
+            _make_reg_op("mRy", "scalar"),
+        ], slot="alu")
+
+    def _make_rel_reg(self):
+        return _make_instr("REL_mLockId_reg", "rel", "rel\t$mRx, $mRy", [
+            {"name": "dontcare1", "bit_width": 1, "operand_type": "unknown"},
+            _make_reg_op("mRy", "scalar"),
+            _make_reg_op("mRx", "scalar"),
+        ], slot="alu")
+
+    def _make_acq_cond_imm(self):
+        return _make_instr("ACQ_COND_mLockId_imm", "acq.cond",
+                           "acq.cond\t$id, $mRy, r26", [
+            _make_imm_op("id", bit_width=6, signed=True),
+            _make_reg_op("mRy", "scalar"),
+        ], slot="alu")
+
+    def _make_rel_cond_reg(self):
+        return _make_instr("REL_COND_mLockId_reg", "rel.cond",
+                           "rel.cond\t$mRx, $mRy, r26", [
+            {"name": "dontcare1", "bit_width": 1, "operand_type": "unknown"},
+            _make_reg_op("mRx", "scalar"),
+            _make_reg_op("mRy", "scalar"),
+        ], slot="alu")
+
+    def test_acq_imm_can_test(self):
+        strategy = isa_test_gen.LockStrategy()
+        can, reason = strategy.can_test(self._make_acq_imm())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_acq_reg_can_test(self):
+        strategy = isa_test_gen.LockStrategy()
+        can, reason = strategy.can_test(self._make_acq_reg())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_rel_imm_can_test(self):
+        strategy = isa_test_gen.LockStrategy()
+        can, reason = strategy.can_test(self._make_rel_imm())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_rel_reg_can_test(self):
+        strategy = isa_test_gen.LockStrategy()
+        can, reason = strategy.can_test(self._make_rel_reg())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_acq_cond_can_test(self):
+        strategy = isa_test_gen.LockStrategy()
+        can, reason = strategy.can_test(self._make_acq_cond_imm())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_rel_cond_can_test(self):
+        strategy = isa_test_gen.LockStrategy()
+        can, reason = strategy.can_test(self._make_rel_cond_reg())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_non_lock_rejected(self):
+        """Non-lock mnemonic should be rejected."""
+        instr = _make_instr("ADD", "add", "add\t$mRx, $mRy, $mRz", [
+            _make_reg_op("mRx", "scalar"),
+            _make_reg_op("mRy", "scalar"),
+            _make_reg_op("mRz", "scalar"),
+        ])
+        strategy = isa_test_gen.LockStrategy()
+        can, _ = strategy.can_test(instr)
+        assert not can
+
+    def test_no_input_buffer(self):
+        """Lock tests use immediate/register setup, no input buffer."""
+        strategy = isa_test_gen.LockStrategy()
+        assert strategy.compute_input_size(self._make_acq_imm(), {}) == 0
+
+    def test_output_size_is_8(self):
+        """Two 4-byte markers: before + after."""
+        strategy = isa_test_gen.LockStrategy()
+        assert strategy.compute_output_size(self._make_acq_imm()) == 8
+
+    def test_one_combo(self):
+        """Lock instructions produce exactly 1 combo."""
+        strategy = isa_test_gen.LockStrategy()
+        combos = strategy.generate_combos(self._make_acq_imm())
+        assert len(combos) == 1
+
+    def test_rel_imm_generates_markers(self):
+        """rel with immediate lock ID should store before/after markers."""
+        strategy = isa_test_gen.LockStrategy()
+        regs = {"id": "0", "mRy": "r1"}
+        asm = strategy.generate_test_point(self._make_rel_imm(), regs,
+                                           in_offset=0, out_offset=0)
+        assert "#170" in asm  # 0xAA before marker
+        assert "#204" in asm  # 0xCC after marker
+        # asm_string uses tabs: "rel\t#0, r1"
+        assert "rel" in asm and "#0" in asm and "r1" in asm
+
+    def test_acq_imm_has_rel_setup(self):
+        """acq should be preceded by a rel to ensure the lock won't stall."""
+        strategy = isa_test_gen.LockStrategy()
+        regs = {"id": "0", "mRy": "r1"}
+        asm = strategy.generate_test_point(self._make_acq_imm(), regs,
+                                           in_offset=0, out_offset=0)
+        # rel setup should appear before the acq.
+        lines = asm.split("\n")
+        rel_line = next((i for i, l in enumerate(lines) if "rel" in l), None)
+        acq_line = next((i for i, l in enumerate(lines) if "acq" in l), None)
+        assert rel_line is not None, "Expected rel setup before acq"
+        assert acq_line is not None, "Expected acq instruction"
+        assert rel_line < acq_line, "rel setup must come before acq"
+
+    def test_acq_reg_has_rel_setup(self):
+        """Register-form acq should also be preceded by rel setup."""
+        strategy = isa_test_gen.LockStrategy()
+        regs = {"mRx": "r2", "mRy": "r1", "dontcare1": "0"}
+        asm = strategy.generate_test_point(self._make_acq_reg(), regs,
+                                           in_offset=0, out_offset=0)
+        assert "rel" in asm
+        # asm_string uses tabs: "acq\tr2, r1"
+        assert "acq" in asm and "r2" in asm
+
+    def test_acq_cond_sets_r26(self):
+        """Conditional acquire should set r26=1 so the operation executes."""
+        strategy = isa_test_gen.LockStrategy()
+        regs = {"id": "0", "mRy": "r1"}
+        asm = strategy.generate_test_point(self._make_acq_cond_imm(), regs,
+                                           in_offset=0, out_offset=0)
+        assert "mov r26, #1" in asm
+        assert "acq.cond" in asm
+
+    def test_rel_cond_sets_r26(self):
+        """Conditional release should set r26=1 so the operation executes."""
+        strategy = isa_test_gen.LockStrategy()
+        regs = {"mRx": "r2", "mRy": "r1", "dontcare1": "0"}
+        asm = strategy.generate_test_point(self._make_rel_cond_reg(), regs,
+                                           in_offset=0, out_offset=0)
+        assert "mov r26, #1" in asm
+        assert "rel.cond" in asm
+
+
+# ===================================================================
 # Task 4: generate_all integration tests
 # ===================================================================
 
