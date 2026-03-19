@@ -214,7 +214,6 @@ STREAM_MNEMONICS = frozenset({
     "mov.nb", "mov.nb.tlast", "mov.tlast",
     "mov.ph", "mov.ph.nb", "mov.ph.nb.tlast", "mov.ph.tlast",
     "mov.cph", "mov.cph.nb", "mov.cph.nb.tlast", "mov.cph.tlast",
-    "mov.d1", "mov.d2", "mov.d3", "mov.d4", "mov.d5", "mov.d6",
 })
 
 # Register kinds we know how to load/store.
@@ -567,22 +566,14 @@ def classify_instruction(instr: dict) -> tuple[str, str]:
     if mnemonic in LOCK_MNEMONICS:
         return ("skipped", "lock instruction")
 
-    # 4. Stream switch instructions -- need live streams.
-    if mnemonic in STREAM_MNEMONICS:
-        return ("skipped", "stream instruction")
-
-    # 5. NOPs and side-effect-only -- skip.
+    # 4. NOPs and side-effect-only -- skip.
     if mnemonic in SIDE_EFFECT_MNEMONICS:
         return ("skipped", "no output (nop/side-effect)")
 
-    # 5b. Stream switch status reads hang without active streams.
+    # 4b. Stream switch status reads and stream instructions are now handled
+    # by StreamStrategy in the strategy chain.
     asm = instr.get("asm_string", "")
-    # Note: "cntr" (hardware cycle counter) is always running on an active
-    # core -- mov r17:r16, cntr is safe to execute and produces a 64-bit
-    # cycle count.  No skip needed.
-    if "SS" in asm and "mov" in mnemonic:
-        return ("skipped", "stream switch status read (hangs without streams)")
-    # 5c. Cascade write is handled by CascadeStrategy; cascade read by
+    # 4c. Cascade write is handled by CascadeStrategy; cascade read by
     # CascadeReadStrategy.  Both are matched via the strategy chain.
     if "MCD" in asm:
         return ("skipped", "cascade write (handled by CascadeStrategy)")
@@ -2765,6 +2756,86 @@ class CascadeReadStrategy(TestStrategy):
 
 
 # ---------------------------------------------------------------------------
+# StreamStrategy: stream read, write, and status instructions
+# ---------------------------------------------------------------------------
+
+class StreamStrategy(TestStrategy):
+    """Handle stream-related instructions in three internal modes:
+
+    - stream_write: instructions that write to ms (master stream port)
+    - stream_read:  mov.d1-d6 with stream source ss0
+    - ss_status:    mov $mRa, SS (stream switch status read)
+    """
+
+    def _detect_mode(self, instr: dict) -> str:
+        """Detect which stream sub-mode applies to *instr*.
+
+        Order matters: SS status check must come BEFORE the ms check
+        because mov.nb appears in both SS reads and stream writes.
+        """
+        asm = instr.get("asm_string", "")
+        mnemonic = instr.get("mnemonic", "")
+        # SS status -- check BEFORE mnemonic/ms (mov.nb collision)
+        if "SS" in asm and "mov" in mnemonic:
+            return "ss_status"
+        # Stream writes -- word-boundary check for "ms"
+        if re.search(r'\bms\b', asm):
+            return "stream_write"
+        # Stream reads -- mov.d*
+        if re.match(r"mov\.d[1-6]", mnemonic):
+            return "stream_read"
+        return ""
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        mode = self._detect_mode(instr)
+        if mode:
+            return (True, "")
+        return (False, "not a stream instruction")
+
+    def _has_tlast_reg(self, instr: dict) -> bool:
+        return "$tlast" in instr.get("asm_string", "")
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        mode = self._detect_mode(instr)
+        asm = instr.get("asm_string", "")
+        if mode == "ss_status":
+            return [{"mRa": "r0"}]
+        if mode == "stream_read":
+            return [{"dst": "r0", "src": "ss0"}]
+        # stream_write
+        combo: dict[str, str] = {}
+        if "cph" in asm:
+            combo = {"addr": "m0", "nw": "0", "op": "0", "id": "r0"}
+        elif "ph" in asm:
+            combo = {"id": "r0", "pcktType": "0"}
+        else:
+            combo = {"src": "r0"}
+        if self._has_tlast_reg(instr):
+            combo["tlast"] = "r1"
+        return [combo]
+
+    def compute_producer_input_size(self, instr: dict) -> int:
+        return 0
+
+    def compute_producer_output_size(self, instr: dict) -> int:
+        return 8
+
+    def compute_consumer_output_size(self, instr: dict) -> int:
+        if self._detect_mode(instr) == "ss_status":
+            return 12
+        return 4
+
+    def compute_input_size(self, instr: dict, regs: dict[str, str]) -> int:
+        return 0
+
+    def compute_output_size(self, instr: dict) -> int:
+        return self.compute_producer_output_size(instr) + self.compute_consumer_output_size(instr)
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
+        raise NotImplementedError("StreamStrategy uses generate_stream_pair()")
+
+
+# ---------------------------------------------------------------------------
 # ConversionStrategy: LLVM IR generation for fused conversion instructions
 # ---------------------------------------------------------------------------
 
@@ -3252,6 +3323,7 @@ STRATEGIES: list[TestStrategy] = [
     FifoLoadStrategy(),
     CascadeReadStrategy(),   # must be before CascadeStrategy
     CascadeStrategy(),
+    StreamStrategy(),       # must be before ComputeStrategy
     DoneStrategy(),
     EventStrategy(),
     PaddaSpStrategy(),
@@ -3443,6 +3515,12 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
             for combo_idx, regs in enumerate(combos):
                 regs["_combo_idx"] = combo_idx
                 cascade_specs.append((instr, combo_idx, regs, strategy))
+            continue
+
+        # Stream instructions are counted as testable but deferred to
+        # stream_pair generation (Task 3).  Skip bin-packing for now.
+        if isinstance(strategy, StreamStrategy):
+            testable_count += 1
             continue
 
         testable_count += 1

@@ -4142,3 +4142,230 @@ class TestMultiTileCascade:
                 break
         else:
             assert False, "Consumer function declaration not found"
+
+
+# ---------------------------------------------------------------------------
+# TestStreamStrategy
+# ---------------------------------------------------------------------------
+
+class TestStreamStrategy:
+    """Tests for StreamStrategy -- stream read/write/status instructions."""
+
+    # -- helpers to build mock instructions --
+
+    def _make_stream_write_nb(self):
+        """mov.nb ms, $src -- non-blocking scalar-to-master-stream write."""
+        return _make_instr("MOV_NB_mv_scl2ms", "mov.nb", "mov.nb\tms, $src", [
+            _make_reg_op("src", "scalar"),
+        ])
+
+    def _make_stream_write_blocking(self):
+        """mov ms, $src -- blocking scalar-to-master-stream write."""
+        return _make_instr("MOV_mv_scl2ms", "mov", "mov\tms, $src", [
+            _make_reg_op("src", "scalar"),
+        ])
+
+    def _make_stream_write_ph(self):
+        """mov.ph ms, $id, $pcktType -- packet header write."""
+        return _make_instr("MOV_PH_mv_scl2ms", "mov.ph",
+                           "mov.ph\tms, $id, $pcktType", [
+            _make_reg_op("id", "scalar"),
+            _make_imm_op("pcktType", bit_width=3, signed=False),
+        ])
+
+    def _make_stream_write_cph(self):
+        """mov.cph ms, $addr, $nw, $op, $id -- config packet header."""
+        return _make_instr("MOV_CPH_mv_scl2ms", "mov.cph",
+                           "mov.cph\tms, $addr, $nw, $op, $id", [
+            _make_reg_op("addr", "modifier_m"),
+            _make_imm_op("nw", bit_width=5, signed=False),
+            _make_imm_op("op", bit_width=2, signed=False),
+            _make_reg_op("id", "scalar"),
+        ])
+
+    def _make_stream_write_tlast(self):
+        """mov.nb.tlast ms, $src, $tlast -- with tlast register."""
+        return _make_instr("MOV_NB_TLAST_mv_scl2ms", "mov.nb.tlast",
+                           "mov.nb.tlast\tms, $src, $tlast", [
+            _make_reg_op("src", "scalar"),
+            _make_reg_op("tlast", "scalar"),
+        ])
+
+    def _make_stream_read_d1(self):
+        """mov.d1 $dst, ss0 -- stream read with 1 delay slot."""
+        return _make_instr("MOV_D1_mv_ss2scl", "mov.d1",
+                           "mov.d1\t$dst, ss0", [
+            _make_reg_op("dst", "scalar", is_output=True),
+        ])
+
+    def _make_ss_status_read(self):
+        """mov $mRa, SS -- stream switch status read."""
+        return _make_instr("MOV_mv_SS2scl", "mov",
+                           "mov\t$mRa, SS", [
+            _make_reg_op("mRa", "scalar", is_output=True),
+        ])
+
+    def _make_ss_status_read_nb(self):
+        """mov.nb $mRa, SS -- non-blocking SS read (mnemonic collision test)."""
+        return _make_instr("MOV_NB_mv_ss2scl", "mov.nb",
+                           "mov.nb\t$mRa, SS", [
+            _make_reg_op("mRa", "scalar", is_output=True),
+        ])
+
+    def _make_non_stream(self):
+        """add $mRx, $mRy, $mRz -- plain compute, not stream."""
+        return _make_instr("ADD", "add", "add\t$mRx, $mRy, $mRz", [
+            _make_reg_op("mRx", "scalar"),
+            _make_reg_op("mRy", "scalar"),
+            _make_reg_op("mRz", "scalar"),
+        ])
+
+    # -- can_test: accepts --
+
+    def test_can_test_stream_write_nb(self):
+        strategy = isa_test_gen.StreamStrategy()
+        can, reason = strategy.can_test(self._make_stream_write_nb())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_can_test_stream_write_blocking(self):
+        strategy = isa_test_gen.StreamStrategy()
+        can, reason = strategy.can_test(self._make_stream_write_blocking())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_can_test_stream_write_ph(self):
+        strategy = isa_test_gen.StreamStrategy()
+        can, reason = strategy.can_test(self._make_stream_write_ph())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_can_test_stream_write_cph(self):
+        strategy = isa_test_gen.StreamStrategy()
+        can, reason = strategy.can_test(self._make_stream_write_cph())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_can_test_stream_write_tlast(self):
+        strategy = isa_test_gen.StreamStrategy()
+        can, reason = strategy.can_test(self._make_stream_write_tlast())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_can_test_stream_read_d1(self):
+        strategy = isa_test_gen.StreamStrategy()
+        can, reason = strategy.can_test(self._make_stream_read_d1())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_can_test_ss_status(self):
+        strategy = isa_test_gen.StreamStrategy()
+        can, reason = strategy.can_test(self._make_ss_status_read())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_can_test_ss_status_nb(self):
+        """mov.nb $mRa, SS should route to ss_status, NOT stream_write."""
+        strategy = isa_test_gen.StreamStrategy()
+        can, reason = strategy.can_test(self._make_ss_status_read_nb())
+        assert can, f"Expected can_test=True: {reason}"
+
+    # -- can_test: rejects --
+
+    def test_rejects_non_stream(self):
+        strategy = isa_test_gen.StreamStrategy()
+        can, _ = strategy.can_test(self._make_non_stream())
+        assert not can
+
+    # -- _detect_mode --
+
+    def test_detect_mode_stream_write(self):
+        strategy = isa_test_gen.StreamStrategy()
+        assert strategy._detect_mode(self._make_stream_write_nb()) == "stream_write"
+
+    def test_detect_mode_stream_write_blocking(self):
+        strategy = isa_test_gen.StreamStrategy()
+        assert strategy._detect_mode(self._make_stream_write_blocking()) == "stream_write"
+
+    def test_detect_mode_stream_write_ph(self):
+        strategy = isa_test_gen.StreamStrategy()
+        assert strategy._detect_mode(self._make_stream_write_ph()) == "stream_write"
+
+    def test_detect_mode_stream_write_cph(self):
+        strategy = isa_test_gen.StreamStrategy()
+        assert strategy._detect_mode(self._make_stream_write_cph()) == "stream_write"
+
+    def test_detect_mode_stream_read_d1(self):
+        strategy = isa_test_gen.StreamStrategy()
+        assert strategy._detect_mode(self._make_stream_read_d1()) == "stream_read"
+
+    def test_detect_mode_ss_status(self):
+        strategy = isa_test_gen.StreamStrategy()
+        assert strategy._detect_mode(self._make_ss_status_read()) == "ss_status"
+
+    def test_detect_mode_ss_status_nb_not_stream_write(self):
+        """mov.nb $mRa, SS: SS check must come before ms check to avoid
+        routing this to stream_write (both share mnemonic 'mov.nb')."""
+        strategy = isa_test_gen.StreamStrategy()
+        assert strategy._detect_mode(self._make_ss_status_read_nb()) == "ss_status"
+
+    # -- generate_combos --
+
+    def test_combos_stream_write(self):
+        strategy = isa_test_gen.StreamStrategy()
+        combos = strategy.generate_combos(self._make_stream_write_nb())
+        assert len(combos) == 1
+        assert "src" in combos[0]
+
+    def test_combos_stream_write_ph(self):
+        strategy = isa_test_gen.StreamStrategy()
+        combos = strategy.generate_combos(self._make_stream_write_ph())
+        assert len(combos) == 1
+        assert "id" in combos[0]
+        assert "pcktType" in combos[0]
+
+    def test_combos_stream_write_cph(self):
+        strategy = isa_test_gen.StreamStrategy()
+        combos = strategy.generate_combos(self._make_stream_write_cph())
+        assert len(combos) == 1
+        assert "addr" in combos[0]
+        assert "id" in combos[0]
+
+    def test_combos_stream_write_tlast(self):
+        strategy = isa_test_gen.StreamStrategy()
+        combos = strategy.generate_combos(self._make_stream_write_tlast())
+        assert len(combos) == 1
+        assert "src" in combos[0]
+        assert "tlast" in combos[0]
+
+    def test_combos_stream_read(self):
+        strategy = isa_test_gen.StreamStrategy()
+        combos = strategy.generate_combos(self._make_stream_read_d1())
+        assert len(combos) == 1
+        assert "dst" in combos[0]
+        assert "src" in combos[0]
+
+    def test_combos_ss_status(self):
+        strategy = isa_test_gen.StreamStrategy()
+        combos = strategy.generate_combos(self._make_ss_status_read())
+        assert len(combos) == 1
+        assert "mRa" in combos[0]
+
+    # -- buffer sizes --
+
+    def test_producer_input_size_always_zero(self):
+        strategy = isa_test_gen.StreamStrategy()
+        assert strategy.compute_producer_input_size(self._make_stream_write_nb()) == 0
+        assert strategy.compute_producer_input_size(self._make_stream_read_d1()) == 0
+        assert strategy.compute_producer_input_size(self._make_ss_status_read()) == 0
+
+    def test_producer_output_size(self):
+        strategy = isa_test_gen.StreamStrategy()
+        assert strategy.compute_producer_output_size(self._make_stream_write_nb()) == 8
+        assert strategy.compute_producer_output_size(self._make_stream_read_d1()) == 8
+        assert strategy.compute_producer_output_size(self._make_ss_status_read()) == 8
+
+    def test_consumer_output_size_write(self):
+        strategy = isa_test_gen.StreamStrategy()
+        assert strategy.compute_consumer_output_size(self._make_stream_write_nb()) == 4
+
+    def test_consumer_output_size_read(self):
+        strategy = isa_test_gen.StreamStrategy()
+        assert strategy.compute_consumer_output_size(self._make_stream_read_d1()) == 4
+
+    def test_consumer_output_size_ss_status(self):
+        strategy = isa_test_gen.StreamStrategy()
+        assert strategy.compute_consumer_output_size(self._make_ss_status_read()) == 12
