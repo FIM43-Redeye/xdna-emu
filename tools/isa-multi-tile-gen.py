@@ -151,26 +151,44 @@ def prepare_phase_objects(
     os.makedirs(phase_dir, exist_ok=True)
     result: list[str] = []
     for col, batch in enumerate(batches):
-        # Source: batch_NNN.o in the shared object directory.
-        src = os.path.join(
-            obj_dir, f"batch_{batch['batch_index']}.o"
-        )
-        # Destination: named to match the link_with attribute in the MLIR.
-        o_name = _obj_filename(batch)
-        dst = os.path.join(phase_dir, o_name)
-        shutil.copy2(src, dst)
-        # Rename the exported symbol so the per-tile function declaration
-        # in the MLIR resolves correctly.
-        subprocess.run(
-            [
-                LLVM_OBJCOPY,
-                "--redefine-sym",
-                f"test_kernel=test_kernel_{col}",
-                dst,
-            ],
-            check=True,
-        )
-        result.append(o_name)
+        if _is_cascade(batch):
+            # Cascade pairs have two .o files (producer + consumer).
+            for suffix, sym_suffix in [("producer", "prod"),
+                                       ("consumer", "cons")]:
+                src_name = batch.get(
+                    f"{suffix}_filename", ""
+                ).replace(".s", ".o")
+                src = os.path.join(obj_dir, src_name)
+                dst = os.path.join(phase_dir, src_name)
+                shutil.copy2(src, dst)
+                subprocess.run(
+                    [
+                        LLVM_OBJCOPY,
+                        "--redefine-sym",
+                        f"test_kernel=test_kernel_{col}_{sym_suffix}",
+                        dst,
+                    ],
+                    check=True,
+                )
+                result.append(src_name)
+        else:
+            # Normal batch: single .o file.
+            src = os.path.join(
+                obj_dir, f"batch_{batch['batch_index']}.o"
+            )
+            o_name = _obj_filename(batch)
+            dst = os.path.join(phase_dir, o_name)
+            shutil.copy2(src, dst)
+            subprocess.run(
+                [
+                    LLVM_OBJCOPY,
+                    "--redefine-sym",
+                    f"test_kernel=test_kernel_{col}",
+                    dst,
+                ],
+                check=True,
+            )
+            result.append(o_name)
     return result
 
 
