@@ -2465,6 +2465,197 @@ class TestLockStrategy:
 
 
 # ===================================================================
+# FifoLoadStrategy tests
+# ===================================================================
+
+class TestFifoLoadStrategy:
+    """Tests for FifoLoadStrategy with marker-based verification."""
+
+    def _make_compr_fill(self):
+        return _make_instr("VLDB_COMPR_FILL", "vldb.compr.fill",
+                           "vldb.compr.fill\t[$ptr]", [
+            _make_reg_op("ptr", "pointer"),
+        ], slot="ldb")
+
+    def _make_compr_peek(self):
+        return _make_instr("VLDB_COMPR_PEEK", "vldb.compr.peek",
+                           "vldb.compr.peek\t$dst, [$ptr]", [
+            _make_reg_op("dst", "vector256"),
+            _make_reg_op("ptr", "pointer"),
+        ], slot="ldb")
+
+    def _make_compr_pop(self):
+        return _make_instr("VLDB_COMPR_POP", "vldb.compr.pop",
+                           "vldb.compr.pop\t$dst, [$ptr]", [
+            _make_reg_op("ptr", "pointer"),
+            _make_reg_op("dst", "vector256"),
+        ], slot="ldb")
+
+    def _make_compr_reset(self):
+        return _make_instr("VLDB_COMPR_RESET", "vldb.compr.reset",
+                           "vldb.compr.reset\t[$ptr]", [
+            _make_reg_op("ptr", "pointer"),
+        ], slot="ldb")
+
+    def _make_sparse_fill(self):
+        return _make_instr("VLDB_SPARSE_FILL_8", "vldb.sparse.fill.8",
+                           "vldb.sparse.fill.8\t[$ptr]", [
+            _make_reg_op("ptr", "pointer"),
+        ], slot="ldb")
+
+    def _make_sparse_peek(self):
+        return _make_instr("VLDB_SPARSE_PEEK_8", "vldb.sparse.peek.8",
+                           "vldb.sparse.peek.8\t$dst, [$ptr]", [
+            {"name": "dst", "bit_width": 3, "operand_type": "composite_register",
+             "register_kind": "QXHLb"},
+            _make_reg_op("ptr", "pointer"),
+        ], slot="ldb")
+
+    def _make_sparse_pop(self):
+        return _make_instr("VLDB_SPARSE_POP_4", "vldb.sparse.pop.4",
+                           "vldb.sparse.pop.4\t$dst, [$ptr]", [
+            _make_reg_op("ptr", "pointer"),
+            {"name": "dst", "bit_width": 3, "operand_type": "composite_register",
+             "register_kind": "QXHLb"},
+        ], slot="ldb")
+
+    def test_compr_fill_can_test(self):
+        strategy = isa_test_gen.FifoLoadStrategy()
+        can, reason = strategy.can_test(self._make_compr_fill())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_compr_peek_can_test(self):
+        strategy = isa_test_gen.FifoLoadStrategy()
+        can, reason = strategy.can_test(self._make_compr_peek())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_compr_pop_can_test(self):
+        strategy = isa_test_gen.FifoLoadStrategy()
+        can, reason = strategy.can_test(self._make_compr_pop())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_compr_reset_can_test(self):
+        strategy = isa_test_gen.FifoLoadStrategy()
+        can, reason = strategy.can_test(self._make_compr_reset())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_sparse_fill_can_test(self):
+        strategy = isa_test_gen.FifoLoadStrategy()
+        can, reason = strategy.can_test(self._make_sparse_fill())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_sparse_peek_can_test(self):
+        strategy = isa_test_gen.FifoLoadStrategy()
+        can, reason = strategy.can_test(self._make_sparse_peek())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_sparse_pop_can_test(self):
+        strategy = isa_test_gen.FifoLoadStrategy()
+        can, reason = strategy.can_test(self._make_sparse_pop())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_non_fifo_rejected(self):
+        """Normal load should not be handled by FifoLoadStrategy."""
+        instr = _make_instr("LDA", "lda", "lda\t$dst, [$ptr, #$imm]", [
+            _make_reg_op("dst", "scalar"),
+            _make_reg_op("ptr", "pointer"),
+            _make_imm_op("imm", bit_width=7, signed=True),
+        ])
+        strategy = isa_test_gen.FifoLoadStrategy()
+        can, _ = strategy.can_test(instr)
+        assert not can
+
+    def test_no_input_buffer(self):
+        """FIFO tests don't use the input buffer (markers only)."""
+        strategy = isa_test_gen.FifoLoadStrategy()
+        assert strategy.compute_input_size(self._make_compr_fill(), {}) == 0
+
+    def test_output_size_is_8(self):
+        """Two 4-byte markers: before + after."""
+        strategy = isa_test_gen.FifoLoadStrategy()
+        assert strategy.compute_output_size(self._make_compr_fill()) == 8
+
+    def test_one_combo(self):
+        strategy = isa_test_gen.FifoLoadStrategy()
+        combos = strategy.generate_combos(self._make_compr_fill())
+        assert len(combos) == 1
+
+    def test_fill_generates_markers(self):
+        """FILL should have before/after markers."""
+        strategy = isa_test_gen.FifoLoadStrategy()
+        regs = {"ptr": "p2"}
+        asm = strategy.generate_test_point(self._make_compr_fill(), regs,
+                                           in_offset=0, out_offset=0)
+        assert "#170" in asm  # before
+        assert "#204" in asm  # after
+        assert "vldb.compr.fill" in asm
+
+    def test_peek_has_reset_fill_setup(self):
+        """PEEK should be preceded by RESET + FILL to prime the FIFO."""
+        strategy = isa_test_gen.FifoLoadStrategy()
+        regs = {"dst": "wl0", "ptr": "p2"}
+        asm = strategy.generate_test_point(self._make_compr_peek(), regs,
+                                           in_offset=0, out_offset=0)
+        lines = asm.split("\n")
+        # Find reset, fill, and peek lines.
+        reset_line = next((i for i, l in enumerate(lines)
+                          if "vldb.compr.reset" in l), None)
+        fill_line = next((i for i, l in enumerate(lines)
+                         if "vldb.compr.fill" in l), None)
+        peek_line = next((i for i, l in enumerate(lines)
+                         if "vldb.compr.peek" in l), None)
+        assert reset_line is not None, "Expected reset before peek"
+        assert fill_line is not None, "Expected fill before peek"
+        assert peek_line is not None, "Expected peek instruction"
+        assert reset_line < fill_line < peek_line
+
+    def test_pop_has_reset_fill_setup(self):
+        """POP should be preceded by RESET + FILL to prime the FIFO."""
+        strategy = isa_test_gen.FifoLoadStrategy()
+        regs = {"dst": "wl0", "ptr": "p2"}
+        asm = strategy.generate_test_point(self._make_compr_pop(), regs,
+                                           in_offset=0, out_offset=0)
+        assert "vldb.compr.reset" in asm
+        assert "vldb.compr.fill" in asm
+        assert "vldb.compr.pop" in asm
+
+    def test_sparse_peek_has_setup(self):
+        """Sparse PEEK uses sparse-specific reset and fill."""
+        strategy = isa_test_gen.FifoLoadStrategy()
+        regs = {"dst": "qwl0", "ptr": "p2"}
+        asm = strategy.generate_test_point(self._make_sparse_peek(), regs,
+                                           in_offset=0, out_offset=0)
+        assert "vldb.sparse.reset.8" in asm
+        assert "vldb.sparse.fill.8" in asm
+        assert "vldb.sparse.peek.8" in asm
+
+    def test_sparse_pop_has_setup(self):
+        """Sparse POP uses sparse-specific reset and fill."""
+        strategy = isa_test_gen.FifoLoadStrategy()
+        regs = {"dst": "qwl0", "ptr": "p2"}
+        asm = strategy.generate_test_point(self._make_sparse_pop(), regs,
+                                           in_offset=0, out_offset=0)
+        assert "vldb.sparse.reset.4" in asm
+        assert "vldb.sparse.fill.4" in asm
+        assert "vldb.sparse.pop.4" in asm
+
+    def test_fill_has_nop_sled_after(self):
+        """FILL needs pipeline delay (NOPs) before the FIFO is ready."""
+        strategy = isa_test_gen.FifoLoadStrategy()
+        regs = {"dst": "wl0", "ptr": "p2"}
+        asm = strategy.generate_test_point(self._make_compr_peek(), regs,
+                                           in_offset=0, out_offset=0)
+        # Count NOPs between fill and peek.
+        lines = [l.strip() for l in asm.split("\n") if l.strip()]
+        fill_idx = next(i for i, l in enumerate(lines)
+                       if "vldb.compr.fill" in l)
+        peek_idx = next(i for i, l in enumerate(lines)
+                       if "vldb.compr.peek" in l)
+        nops = sum(1 for l in lines[fill_idx+1:peek_idx] if l == "nop")
+        assert nops >= 5, f"Expected >= 5 NOPs between fill and peek, got {nops}"
+
+
+# ===================================================================
 # Task 4: generate_all integration tests
 # ===================================================================
 

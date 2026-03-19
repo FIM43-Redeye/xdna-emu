@@ -2409,6 +2409,155 @@ class LockStrategy(TestStrategy):
 
 
 # ---------------------------------------------------------------------------
+# FifoLoadStrategy: tests compressed/sparse FIFO load instructions
+# ---------------------------------------------------------------------------
+
+# Mnemonics for FIFO load operations.
+_FIFO_PREFIXES = ("vldb.compr", "vldb.sparse")
+
+# QXHLb composite register class: 320-bit sparse registers (quad + vector half).
+# mQXHLb = {qwl0, qwl2, qwl1, qwl3, qwh0, qwh2, qwh1, qwh3}
+_QXHLB_REGISTER_NAMES = ["qwl0", "qwl1", "qwl2", "qwl3",
+                          "qwh0", "qwh1", "qwh2", "qwh3"]
+
+
+class FifoLoadStrategy(TestStrategy):
+    """Tests compressed/sparse FIFO load instructions with markers.
+
+    FIFO operations follow a protocol: RESET -> FILL -> PEEK/POP.
+    FILL reads from memory into a hardware decompression FIFO; PEEK/POP
+    read decompressed data from the FIFO.
+
+    For FILL/RESET: marker-only verification (no register output).
+    For PEEK/POP: RESET + FILL to prime the FIFO, then execute.
+    All 16 variants use before/after markers to prove execution
+    completed without stalling.
+
+    The pointer register (p2) is aimed at the input buffer so FILL
+    reads valid memory.  The FIFO decompresses whatever bytes are
+    there; since EMU and HW see identical input data, their outputs
+    (including any garbage from "decompressing" random data) match.
+    """
+
+    _PEEK_POP_OPS = frozenset({"peek", "pop"})
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        mnemonic = instr.get("mnemonic", "")
+        if not any(mnemonic.startswith(p) for p in _FIFO_PREFIXES):
+            return (False, "not a FIFO load instruction")
+        return (True, "")
+
+    def _is_peek_or_pop(self, instr: dict) -> bool:
+        """True if the instruction reads from the FIFO (needs setup)."""
+        mnemonic = instr.get("mnemonic", "")
+        return any(f".{op}" in mnemonic for op in self._PEEK_POP_OPS)
+
+    def _fifo_setup_prefix(self, instr: dict) -> tuple[str, str]:
+        """Return (reset_mnemonic, fill_mnemonic) for the instruction's FIFO.
+
+        Compressed: vldb.compr.reset, vldb.compr.fill
+        Sparse:     vldb.sparse.reset.N, vldb.sparse.fill.N
+        """
+        mnemonic = instr.get("mnemonic", "")
+        if mnemonic.startswith("vldb.compr"):
+            return ("vldb.compr.reset", "vldb.compr.fill")
+        # Sparse: mnemonic = vldb.sparse.{op}.{width}
+        parts = mnemonic.split(".")
+        width = parts[-1] if len(parts) >= 4 else "8"
+        return (f"vldb.sparse.reset.{width}", f"vldb.sparse.fill.{width}")
+
+    def compute_input_size(self, instr, regs):
+        return 0  # No input buffer needed (markers only).
+
+    def compute_output_size(self, instr):
+        return 8  # 4-byte "before" marker + 4-byte "after" marker.
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        """One combo with default register values."""
+        combo = {}
+        for op in instr.get("operands", []):
+            op_name = op["name"]
+            op_type = op.get("operand_type", "")
+            kind = op.get("register_kind", "")
+            if op_type in REGISTER_LIKE_TYPES:
+                if kind == "pointer":
+                    combo[op_name] = "p2"
+                elif kind == "vector256":
+                    combo[op_name] = "wl0"
+                elif kind == "QXHLb":
+                    combo[op_name] = _QXHLB_REGISTER_NAMES[0]
+                else:
+                    names = register_names(kind)
+                    combo[op_name] = names[0] if names else "r0"
+            elif op_type == "composite_register":
+                if kind == "QXHLb":
+                    combo[op_name] = _QXHLB_REGISTER_NAMES[0]
+                else:
+                    combo[op_name] = "wl0"
+            else:
+                combo[op_name] = "0"
+        return [combo]
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
+        """Generate FIFO load test with before/after markers.
+
+        Layout for PEEK/POP:
+            padda p2, p0, #in_offset       (point at input data)
+            mov r14, #170                  (before marker)
+            st r14, [p1, #OUT]
+            vldb.{compr|sparse.N}.reset [p2]  (clear FIFO state)
+            vldb.{compr|sparse.N}.fill [p2]   (fill from memory)
+            nop x5                         (wait for fill pipeline)
+            <instruction under test>       (peek/pop)
+            mov r14, #204                  (after marker)
+            st r14, [p1, #OUT+4]
+
+        Layout for FILL/RESET:
+            padda p2, p0, #in_offset       (valid pointer for FILL)
+            mov r14, #170                  (before marker)
+            st r14, [p1, #OUT]
+            <instruction under test>       (fill/reset)
+            mov r14, #204                  (after marker)
+            st r14, [p1, #OUT+4]
+        """
+        name = instr["name"]
+        mnemonic = instr.get("mnemonic", "")
+        asm_str = instr.get("asm_string", "")
+        reset_mnem, fill_mnem = self._fifo_setup_prefix(instr)
+
+        FIFO_LATENCY = 5
+
+        lines = []
+        lines.append(f"  // ---- test (fifo): {name} ----")
+
+        # Set up pointer to input buffer (valid memory for FILL).
+        ptr_reg = regs.get("ptr", "p2")
+        lines.extend(_padda_sequence(ptr_reg, "p0", _align(in_offset, 32)))
+
+        # Store "before" marker.
+        out_offset = _align(out_offset, 4)
+        lines.append(f"  mov r14, #170")
+        lines.extend(_scalar_store("r14", "p1", out_offset))
+
+        # For PEEK/POP: prime the FIFO with RESET + FILL + wait.
+        if self._is_peek_or_pop(instr):
+            lines.append(f"  {reset_mnem} [{ptr_reg}]")
+            lines.append(f"  {fill_mnem} [{ptr_reg}]")
+            lines.extend(_nop_sled(FIFO_LATENCY))
+
+        # Execute the instruction under test.
+        asm_line = _substitute_asm(asm_str, regs)
+        lines.append(f"  {asm_line}")
+
+        # Store "after" marker (proves no stall).
+        lines.append(f"  mov r14, #204")
+        lines.extend(_scalar_store("r14", "p1", out_offset + 4))
+
+        lines.append("")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # ConversionStrategy: LLVM IR generation for fused conversion instructions
 # ---------------------------------------------------------------------------
 
@@ -2730,6 +2879,7 @@ class ConversionStrategy(TestStrategy):
 STRATEGIES: list[TestStrategy] = [
     BranchStrategy(),
     LockStrategy(),
+    FifoLoadStrategy(),
     LoadStrategy(),
     StoreStrategy(),
     ComputeStrategy(),
