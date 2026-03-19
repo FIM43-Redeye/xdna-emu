@@ -573,6 +573,11 @@ def classify_instruction(instr: dict) -> tuple[str, str]:
     # 4b. Stream switch status reads and stream instructions are now handled
     # by StreamStrategy in the strategy chain.
     asm = instr.get("asm_string", "")
+    # 4b2. doTlast_reg variants have $tlast in asm_string that llvm-mc
+    # doesn't support.  StreamStrategy rejects them, but they can slip
+    # through to ComputeStrategy.  Catch them here as a safety net.
+    if "$tlast" in asm:
+        return ("skipped", "doTlast_reg variant (unsupported by llvm-mc)")
     # 4c. Cascade write is handled by CascadeStrategy; cascade read by
     # CascadeReadStrategy.  Both are matched via the strategy chain.
     if "MCD" in asm:
