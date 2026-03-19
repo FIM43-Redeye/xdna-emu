@@ -153,22 +153,22 @@ CONVERSION_INTRINSICS: dict[str, dict] = {
     # The sign flag (0=unsigned, 1=signed) selects d/s prefix.
     # llc fuses pack+store into vst.pack.* instructions.
     "vst.pack.s4.s8": {
-        "intrinsic": "pack_I4_I8",
+        "intrinsic": "pack.I4.I8",
         "in_type": "<32 x i16>", "out_type": "<32 x i8>",
         "in_bytes": 64, "out_bytes": 32, "sign": 1,
     },
     "vst.pack.d4.d8": {
-        "intrinsic": "pack_I4_I8",
+        "intrinsic": "pack.I4.I8",
         "in_type": "<32 x i16>", "out_type": "<32 x i8>",
         "in_bytes": 64, "out_bytes": 32, "sign": 0,
     },
     "vst.pack.s8.s16": {
-        "intrinsic": "pack_I8_I16",
+        "intrinsic": "pack.I8.I16",
         "in_type": "<32 x i16>", "out_type": "<32 x i8>",
         "in_bytes": 64, "out_bytes": 32, "sign": 1,
     },
     "vst.pack.d8.d16": {
-        "intrinsic": "pack_I8_I16",
+        "intrinsic": "pack.I8.I16",
         "in_type": "<32 x i16>", "out_type": "<32 x i8>",
         "in_bytes": 64, "out_bytes": 32, "sign": 0,
     },
@@ -176,22 +176,22 @@ CONVERSION_INTRINSICS: dict[str, dict] = {
     # Unpack intrinsics take <32 x i8> input + i32 sign flag, return <32 x i16>.
     # llc may or may not fuse with load.
     "vldb.unpack.s8.s4": {
-        "intrinsic": "unpack_I8_I4",
+        "intrinsic": "unpack.I8.I4",
         "in_type": "<32 x i8>", "out_type": "<32 x i16>",
         "in_bytes": 32, "out_bytes": 64, "sign": 1,
     },
     "vldb.unpack.d8.d4": {
-        "intrinsic": "unpack_I8_I4",
+        "intrinsic": "unpack.I8.I4",
         "in_type": "<32 x i8>", "out_type": "<32 x i16>",
         "in_bytes": 32, "out_bytes": 64, "sign": 0,
     },
     "vldb.unpack.s16.s8": {
-        "intrinsic": "unpack_I16_I8",
+        "intrinsic": "unpack.I16.I8",
         "in_type": "<32 x i8>", "out_type": "<32 x i16>",
         "in_bytes": 32, "out_bytes": 64, "sign": 1,
     },
     "vldb.unpack.d16.d8": {
-        "intrinsic": "unpack_I16_I8",
+        "intrinsic": "unpack.I16.I8",
         "in_type": "<32 x i8>", "out_type": "<32 x i16>",
         "in_bytes": 32, "out_bytes": 64, "sign": 0,
     },
@@ -2206,8 +2206,13 @@ def generate_conversion_ll(test_points: list[dict]) -> str:
 
     For UPS: load vector -> call UPS -> call SRS (to get back to vector) -> store
     For SRS: load vector -> call UPS (to get into acc) -> call SRS -> store
-    For PACK: load vector -> call pack -> store
-    For UNPACK: load vector -> call unpack -> store
+    For PACK: load vector -> call pack(vec, sign) -> store
+    For UNPACK: load vector -> call unpack(vec, sign) -> store
+    For CONV: load bf16/fp32 -> convert -> convert back -> store
+
+    Each test point gets its own internal function to avoid instruction
+    selection issues when mixing intrinsic types in a single function.
+    test_kernel dispatches to each with the appropriate buffer offsets.
 
     Returns a complete .ll file as a string.
     """
@@ -2217,14 +2222,14 @@ def generate_conversion_ll(test_points: list[dict]) -> str:
     lines.append('')
     lines.append('target triple = "aie2"')
     lines.append('')
-    lines.append('define void @test_kernel(ptr %in, ptr %out) {')
-    lines.append('entry:')
 
     # Track all intrinsics used so we can declare them at the end.
     intrinsics_used: dict[str, tuple[str, str]] = {}  # name -> (ret_type, arg_types)
-    var_counter = 0
-    in_offset = 0
-    out_offset = 0
+
+    # Each test point gets its own function to avoid instruction selection
+    # issues when mixing intrinsic types (pack/unpack fail when combined
+    # with ups/srs/conv in a single function).
+    helper_funcs = []  # (func_name, in_bytes_consumed, out_bytes_produced)
 
     for idx, tp in enumerate(test_points):
         mnemonic = tp["mnemonic"]
@@ -2235,217 +2240,127 @@ def generate_conversion_ll(test_points: list[dict]) -> str:
         out_bytes = tp["out_bytes"]
         sign = tp.get("sign", 0)
 
-        lines.append(f'  ; ---- test {idx}: {mnemonic} ----')
+        func_name = f"@_conv_test_{idx}"
+        func_lines = []
+        func_lines.append(f'define internal void {func_name}(ptr %in, ptr %out) {{')
+        func_lines.append(f'entry:')
+        func_lines.append(f'  ; ---- test {idx}: {mnemonic} ----')
+
+        var_counter = 0
 
         # Determine the category from the mnemonic.
         is_ups = ".ups." in mnemonic
         is_srs = ".srs." in mnemonic
         is_pack = ".pack." in mnemonic
         is_unpack = ".unpack." in mnemonic
+        in_consumed = 0
+        out_produced = 0
 
         if is_ups:
-            # UPS: load vector, call UPS intrinsic, call SRS to convert back, store.
             partner = _UPS_SRS_PARTNERS[intrinsic]
             vec_type = in_type
             acc_type = out_type
             srs_intrinsic = partner["srs_intrinsic"]
-
-            # GEP to input offset.
-            in_ptr = f"%in_ptr_{var_counter}"
-            lines.append(f'  {in_ptr} = getelementptr i8, ptr %in, i64 {in_offset}')
-            var_counter += 1
-
-            # Load vector.
-            vec_val = f"%vec_{var_counter}"
-            lines.append(f'  {vec_val} = load volatile {vec_type}, ptr {in_ptr}, align 32')
-            var_counter += 1
-
-            # Call UPS intrinsic: (vec, shift=0, sign) -> acc
-            acc_val = f"%acc_{var_counter}"
             ups_name = f"@llvm.aie2.{intrinsic}"
-            lines.append(f'  {acc_val} = call {acc_type} {ups_name}({vec_type} {vec_val}, i32 0, i32 {sign})')
-            intrinsics_used[ups_name] = (acc_type, f"{vec_type}, i32, i32")
-            var_counter += 1
-
-            # Call SRS to get back to vector: (acc, shift=0, sign=1) -> vec
-            result_val = f"%result_{var_counter}"
             srs_name = f"@llvm.aie2.{srs_intrinsic}"
-            lines.append(f'  {result_val} = call {vec_type} {srs_name}({acc_type} {acc_val}, i32 0, i32 1)')
+
+            func_lines.append(f'  %v = load volatile {vec_type}, ptr %in, align 32')
+            func_lines.append(f'  %a = call {acc_type} {ups_name}({vec_type} %v, i32 0, i32 {sign})')
+            func_lines.append(f'  %r = call {vec_type} {srs_name}({acc_type} %a, i32 0, i32 1)')
+            func_lines.append(f'  store volatile {vec_type} %r, ptr %out, align 32')
+
+            intrinsics_used[ups_name] = (acc_type, f"{vec_type}, i32, i32")
             intrinsics_used[srs_name] = (vec_type, f"{acc_type}, i32, i32")
-            var_counter += 1
-
-            # GEP to output offset.
-            out_ptr = f"%out_ptr_{var_counter}"
-            lines.append(f'  {out_ptr} = getelementptr i8, ptr %out, i64 {out_offset}')
-            var_counter += 1
-
-            # Store result.
-            lines.append(f'  store volatile {vec_type} {result_val}, ptr {out_ptr}, align 32')
-
-            # Advance offsets: input is vector-sized, output is vector-sized
-            # (we round-trip through acc, so output is the same vec type).
-            in_offset += in_bytes
-            out_offset += in_bytes  # output is vec, same size as input vec
+            in_consumed = in_bytes
+            out_produced = in_bytes  # round-trip: output is vec-sized
 
         elif is_srs:
-            # SRS: load vector, call UPS to get into acc, call SRS, store.
             partner = _UPS_SRS_PARTNERS[intrinsic]
-            acc_type = in_type   # SRS input is accumulator
-            vec_type = out_type  # SRS output is vector
+            acc_type = in_type
+            vec_type = out_type
             ups_intrinsic = partner["ups_intrinsic"]
-
-            # GEP to input offset.
-            in_ptr = f"%in_ptr_{var_counter}"
-            lines.append(f'  {in_ptr} = getelementptr i8, ptr %in, i64 {in_offset}')
-            var_counter += 1
-
-            # Load vector (we need to load as vec type, then UPS to get into acc).
-            vec_val = f"%vec_{var_counter}"
-            lines.append(f'  {vec_val} = load volatile {vec_type}, ptr {in_ptr}, align 32')
-            var_counter += 1
-
-            # Call UPS to get into accumulator: (vec, shift=0, sign=1) -> acc
-            acc_val = f"%acc_{var_counter}"
             ups_name = f"@llvm.aie2.{ups_intrinsic}"
-            lines.append(f'  {acc_val} = call {acc_type} {ups_name}({vec_type} {vec_val}, i32 0, i32 1)')
-            intrinsics_used[ups_name] = (acc_type, f"{vec_type}, i32, i32")
-            var_counter += 1
-
-            # Call SRS intrinsic: (acc, shift=0, sign) -> vec
-            result_val = f"%result_{var_counter}"
             srs_name = f"@llvm.aie2.{intrinsic}"
-            lines.append(f'  {result_val} = call {vec_type} {srs_name}({acc_type} {acc_val}, i32 0, i32 {sign})')
+
+            func_lines.append(f'  %v = load volatile {vec_type}, ptr %in, align 32')
+            func_lines.append(f'  %a = call {acc_type} {ups_name}({vec_type} %v, i32 0, i32 1)')
+            func_lines.append(f'  %r = call {vec_type} {srs_name}({acc_type} %a, i32 0, i32 {sign})')
+            func_lines.append(f'  store volatile {vec_type} %r, ptr %out, align 32')
+
+            intrinsics_used[ups_name] = (acc_type, f"{vec_type}, i32, i32")
             intrinsics_used[srs_name] = (vec_type, f"{acc_type}, i32, i32")
-            var_counter += 1
-
-            # GEP to output offset.
-            out_ptr = f"%out_ptr_{var_counter}"
-            lines.append(f'  {out_ptr} = getelementptr i8, ptr %out, i64 {out_offset}')
-            var_counter += 1
-
-            # Store result.
-            lines.append(f'  store volatile {vec_type} {result_val}, ptr {out_ptr}, align 32')
-
-            # Advance offsets: input and output are both vec-sized.
-            in_offset += out_bytes   # loaded as vec
-            out_offset += out_bytes  # stored as vec
+            in_consumed = out_bytes
+            out_produced = out_bytes
 
         elif is_pack:
-            # PACK: load vector, call pack(vec, sign) -> packed, store.
-            # llc fuses pack+store into vst.pack.* automatically.
             pack_name = f"@llvm.aie2.{intrinsic}"
 
-            in_ptr = f"%in_ptr_{var_counter}"
-            lines.append(f'  {in_ptr} = getelementptr i8, ptr %in, i64 {in_offset}')
-            var_counter += 1
+            func_lines.append(f'  %v = load volatile {in_type}, ptr %in, align 32')
+            func_lines.append(f'  %r = call {out_type} {pack_name}({in_type} %v, i32 {sign})')
+            func_lines.append(f'  store volatile {out_type} %r, ptr %out, align 32')
 
-            vec_val = f"%vec_{var_counter}"
-            lines.append(f'  {vec_val} = load volatile {in_type}, ptr {in_ptr}, align 32')
-            var_counter += 1
-
-            result_val = f"%result_{var_counter}"
-            lines.append(f'  {result_val} = call {out_type} {pack_name}({in_type} {vec_val}, i32 {sign})')
             intrinsics_used[pack_name] = (out_type, f"{in_type}, i32")
-            var_counter += 1
-
-            out_ptr = f"%out_ptr_{var_counter}"
-            lines.append(f'  {out_ptr} = getelementptr i8, ptr %out, i64 {out_offset}')
-            var_counter += 1
-
-            lines.append(f'  store volatile {out_type} {result_val}, ptr {out_ptr}, align 32')
-
-            in_offset += in_bytes
-            out_offset += out_bytes
+            in_consumed = in_bytes
+            out_produced = out_bytes
 
         elif is_unpack:
-            # UNPACK: load vector, call unpack(vec, sign) -> wider, store.
             unpack_name = f"@llvm.aie2.{intrinsic}"
 
-            in_ptr = f"%in_ptr_{var_counter}"
-            lines.append(f'  {in_ptr} = getelementptr i8, ptr %in, i64 {in_offset}')
-            var_counter += 1
+            func_lines.append(f'  %v = load volatile {in_type}, ptr %in, align 32')
+            func_lines.append(f'  %r = call {out_type} {unpack_name}({in_type} %v, i32 {sign})')
+            func_lines.append(f'  store volatile {out_type} %r, ptr %out, align 32')
 
-            vec_val = f"%vec_{var_counter}"
-            lines.append(f'  {vec_val} = load volatile {in_type}, ptr {in_ptr}, align 32')
-            var_counter += 1
-
-            result_val = f"%result_{var_counter}"
-            lines.append(f'  {result_val} = call {out_type} {unpack_name}({in_type} {vec_val}, i32 {sign})')
             intrinsics_used[unpack_name] = (out_type, f"{in_type}, i32")
-            var_counter += 1
-
-            out_ptr = f"%out_ptr_{var_counter}"
-            lines.append(f'  {out_ptr} = getelementptr i8, ptr %out, i64 {out_offset}')
-            var_counter += 1
-
-            lines.append(f'  store volatile {out_type} {result_val}, ptr {out_ptr}, align 32')
-
-            in_offset += in_bytes
-            out_offset += out_bytes
+            in_consumed = in_bytes
+            out_produced = out_bytes
 
         elif ".conv." in mnemonic:
-            # BF16/FP32 conversion: load, convert via intrinsic, store.
-            # vlda.conv.fp32.bf16: load bf16 -> convert to fp32 acc -> convert back -> store
-            # vst.conv.bf16.fp32: load fp32 acc -> convert to bf16 -> store
             conv_name = f"@llvm.aie2.{intrinsic}"
 
-            in_ptr = f"%in_ptr_{var_counter}"
-            lines.append(f'  {in_ptr} = getelementptr i8, ptr %in, i64 {in_offset}')
-            var_counter += 1
-
             if "vlda.conv" in mnemonic:
-                # Load bf16, convert to accfloat, convert back to bf16, store.
-                # Round-trip so output is same type as input.
-                vec_val = f"%vec_{var_counter}"
-                lines.append(f'  {vec_val} = load volatile {in_type}, ptr {in_ptr}, align 32')
-                var_counter += 1
-
-                acc_val = f"%acc_{var_counter}"
-                lines.append(f'  {acc_val} = call {out_type} {conv_name}({in_type} {vec_val})')
-                intrinsics_used[conv_name] = (out_type, in_type)
-                var_counter += 1
-
-                # Convert back to bf16 for storage.
                 back_name = "@llvm.aie2.v16accfloat.to.v16bf16"
-                result_val = f"%result_{var_counter}"
-                lines.append(f'  {result_val} = call {in_type} {back_name}({out_type} {acc_val})')
-                intrinsics_used[back_name] = (in_type, out_type)
-                var_counter += 1
-
-                out_ptr = f"%out_ptr_{var_counter}"
-                lines.append(f'  {out_ptr} = getelementptr i8, ptr %out, i64 {out_offset}')
-                var_counter += 1
-
-                lines.append(f'  store volatile {in_type} {result_val}, ptr {out_ptr}, align 32')
-                in_offset += in_bytes
-                out_offset += in_bytes  # round-trip: output same size as input
-
-            else:
-                # vst.conv.bf16.fp32: load bf16, ups to accfloat, convert to bf16, store.
-                # We need bf16 input, convert to acc, then back to bf16.
-                ups_name = "@llvm.aie2.v16bf16.to.v16accfloat"
-                vec_val = f"%vec_{var_counter}"
-                lines.append(f'  {vec_val} = load volatile {out_type}, ptr {in_ptr}, align 32')
-                var_counter += 1
-
-                acc_val = f"%acc_{var_counter}"
-                lines.append(f'  {acc_val} = call {in_type} {ups_name}({out_type} {vec_val})')
-                intrinsics_used[ups_name] = (in_type, out_type)
-                var_counter += 1
-
-                result_val = f"%result_{var_counter}"
-                lines.append(f'  {result_val} = call {out_type} {conv_name}({in_type} {acc_val})')
+                func_lines.append(f'  %v = load volatile {in_type}, ptr %in, align 32')
+                func_lines.append(f'  %a = call {out_type} {conv_name}({in_type} %v)')
+                func_lines.append(f'  %r = call {in_type} {back_name}({out_type} %a)')
+                func_lines.append(f'  store volatile {in_type} %r, ptr %out, align 32')
                 intrinsics_used[conv_name] = (out_type, in_type)
-                var_counter += 1
+                intrinsics_used[back_name] = (in_type, out_type)
+                in_consumed = in_bytes
+                out_produced = in_bytes
+            else:
+                ups_name = "@llvm.aie2.v16bf16.to.v16accfloat"
+                func_lines.append(f'  %v = load volatile {out_type}, ptr %in, align 32')
+                func_lines.append(f'  %a = call {in_type} {ups_name}({out_type} %v)')
+                func_lines.append(f'  %r = call {out_type} {conv_name}({in_type} %a)')
+                func_lines.append(f'  store volatile {out_type} %r, ptr %out, align 32')
+                intrinsics_used[ups_name] = (in_type, out_type)
+                intrinsics_used[conv_name] = (out_type, in_type)
+                in_consumed = out_bytes
+                out_produced = out_bytes
 
-                out_ptr = f"%out_ptr_{var_counter}"
-                lines.append(f'  {out_ptr} = getelementptr i8, ptr %out, i64 {out_offset}')
-                var_counter += 1
+        func_lines.append('  ret void')
+        func_lines.append('}')
+        func_lines.append('')
+        helper_funcs.append((func_name, in_consumed, out_produced,
+                             '\n'.join(func_lines)))
 
-                lines.append(f'  store volatile {out_type} {result_val}, ptr {out_ptr}, align 32')
-                in_offset += out_bytes   # loaded as bf16
-                out_offset += out_bytes  # stored as bf16
+    # Emit helper functions first.
+    for _, _, _, func_text in helper_funcs:
+        lines.append(func_text)
 
+    # Emit test_kernel that dispatches to each helper with offset pointers.
+    lines.append('define void @test_kernel(ptr %in, ptr %out) {')
+    lines.append('entry:')
+    in_offset = 0
+    out_offset = 0
+    for idx, (func_name, in_consumed, out_produced, _) in enumerate(helper_funcs):
+        in_ptr = f"%in_{idx}"
+        out_ptr = f"%out_{idx}"
+        lines.append(f'  {in_ptr} = getelementptr i8, ptr %in, i64 {in_offset}')
+        lines.append(f'  {out_ptr} = getelementptr i8, ptr %out, i64 {out_offset}')
+        lines.append(f'  call void {func_name}(ptr {in_ptr}, ptr {out_ptr})')
+        in_offset += in_consumed
+        out_offset += out_produced
     lines.append('  ret void')
     lines.append('}')
     lines.append('')

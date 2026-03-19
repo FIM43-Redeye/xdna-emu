@@ -2721,14 +2721,14 @@ class TestConversionLLGeneration:
         info = isa_test_gen.CONVERSION_INTRINSICS["vst.pack.s8.s16"]
         test_points = [{"mnemonic": "vst.pack.s8.s16", **info}]
         ll = isa_test_gen.generate_conversion_ll(test_points)
-        assert "@llvm.aie2.pack_I8_I16" in ll
+        assert "@llvm.aie2.pack.I8.I16" in ll
 
     def test_unpack_generates_intrinsic_call(self):
         """UNPACK test point should call the unpack intrinsic."""
         info = isa_test_gen.CONVERSION_INTRINSICS["vldb.unpack.s16.s8"]
         test_points = [{"mnemonic": "vldb.unpack.s16.s8", **info}]
         ll = isa_test_gen.generate_conversion_ll(test_points)
-        assert "@llvm.aie2.unpack_I16_I8" in ll
+        assert "@llvm.aie2.unpack.I16.I8" in ll
 
     def test_uses_volatile_loads_stores(self):
         """Must use volatile to prevent optimization."""
