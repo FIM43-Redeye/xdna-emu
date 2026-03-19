@@ -2963,6 +2963,91 @@ class TestPaddaSpStrategy:
         assert "padda" in asm and "[sp]" in asm
 
 
+class TestCascadeReadStrategy:
+    """Tests for CascadeReadStrategy -- multi-tile cascade read testing."""
+
+    def _make_vmov_scd(self):
+        return _make_instr("VMOV_mv_scd", "vmov", "vmov\t$dst, SCD", [
+            {"name": "dst", "bit_width": 6, "operand_type": "composite_register",
+             "register_kind": "MvBMXDst", "is_output": False,
+             "signed": False, "scale": None},
+        ], slot="lda")
+
+    def _make_vmov_hi_scd(self):
+        return _make_instr("VMOV_HI", "vmov.hi", "vmov.hi\t$dst, SCD", [
+            {"name": "dst", "bit_width": 4, "operand_type": "unknown",
+             "is_output": False, "signed": False, "scale": None},
+        ], slot="lda")
+
+    def _make_vmov_lo_scd(self):
+        return _make_instr("VMOV_LO", "vmov.lo", "vmov.lo\t$dst, SCD", [
+            {"name": "dst", "bit_width": 4, "operand_type": "unknown",
+             "is_output": False, "signed": False, "scale": None},
+        ], slot="lda")
+
+    def _make_mcd_write(self):
+        return _make_instr("VMOV_mv_mcd", "vmov", "vmov\tMCD, $src", [
+            {"name": "src", "bit_width": 6, "operand_type": "composite_register",
+             "register_kind": "MvBMXDst", "is_output": False,
+             "signed": False, "scale": None},
+        ], slot="st")
+
+    def test_vmov_scd_can_test(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        can, reason = strategy.can_test(self._make_vmov_scd())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_vmov_hi_scd_can_test(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        can, reason = strategy.can_test(self._make_vmov_hi_scd())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_vmov_lo_scd_can_test(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        can, reason = strategy.can_test(self._make_vmov_lo_scd())
+        assert can, f"Expected can_test=True: {reason}"
+
+    def test_mcd_write_rejected(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        can, _ = strategy.can_test(self._make_mcd_write())
+        assert not can
+
+    def test_non_cascade_rejected(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        instr = _make_instr("ADD", "add", "add\t$mRx, $mRy, $mRz", [
+            _make_reg_op("mRx", "scalar"),
+        ])
+        can, _ = strategy.can_test(instr)
+        assert not can
+
+    def test_combo_forces_x0(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        combos = strategy.generate_combos(self._make_vmov_scd())
+        assert len(combos) == 1
+        assert combos[0]["dst"] == "x0"
+
+    def test_producer_input_size(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        assert strategy.compute_producer_input_size() == 64
+
+    def test_producer_output_size(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        assert strategy.compute_producer_output_size() == 8
+
+    def test_consumer_input_size(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        assert strategy.compute_consumer_input_size() == 0
+
+    def test_consumer_output_size_full(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        assert strategy.compute_consumer_output_size(self._make_vmov_scd()) == 64
+
+    def test_consumer_output_size_half(self):
+        strategy = isa_test_gen.CascadeReadStrategy()
+        assert strategy.compute_consumer_output_size(self._make_vmov_hi_scd()) == 32
+        assert strategy.compute_consumer_output_size(self._make_vmov_lo_scd()) == 32
+
+
 # ===================================================================
 # Task 4: generate_all integration tests
 # ===================================================================

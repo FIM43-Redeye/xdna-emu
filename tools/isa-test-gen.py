@@ -2649,6 +2649,57 @@ class CascadeStrategy(TestStrategy):
         return "\n".join(lines)
 
 
+class CascadeReadStrategy(TestStrategy):
+    """Tests cascade read instructions via multi-tile producer-consumer pairs.
+
+    Cascade reads (vmov $dst, SCD / vmov.hi / vmov.lo) stall without data
+    from a neighboring tile.  This strategy generates TWO assembly programs:
+    a producer (loads data, writes MCD) and a consumer (reads SCD, stores
+    result).  The MLIR generator places them in the same column with
+    aie.cascade_flow linking row 3 (producer) to row 2 (consumer).
+
+    These are NOT bin-packed into mega-program batches.  Each cascade read
+    instruction becomes a standalone cascade_pair batch.
+    """
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        asm = instr.get("asm_string", "")
+        if "SCD" in asm:
+            return (True, "")
+        return (False, "not a cascade read instruction")
+
+    def _is_half(self, instr: dict) -> bool:
+        """True for vmov.hi/vmov.lo (256-bit half reads)."""
+        mnemonic = instr.get("mnemonic", "")
+        return mnemonic in ("vmov.hi", "vmov.lo")
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        return [{"dst": "x0"}]
+
+    def compute_producer_input_size(self) -> int:
+        return 64
+
+    def compute_producer_output_size(self) -> int:
+        return 8
+
+    def compute_consumer_input_size(self) -> int:
+        return 0
+
+    def compute_consumer_output_size(self, instr: dict) -> int:
+        return 32 if self._is_half(instr) else 64
+
+    def compute_input_size(self, instr, regs):
+        return self.compute_producer_input_size()
+
+    def compute_output_size(self, instr):
+        return self.compute_producer_output_size() + self.compute_consumer_output_size(instr)
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
+        raise NotImplementedError(
+            "CascadeReadStrategy uses generate_cascade_pair(), not generate_test_point()"
+        )
+
+
 # ---------------------------------------------------------------------------
 # ConversionStrategy: LLVM IR generation for fused conversion instructions
 # ---------------------------------------------------------------------------
@@ -3135,6 +3186,7 @@ STRATEGIES: list[TestStrategy] = [
     BranchStrategy(),
     LockStrategy(),
     FifoLoadStrategy(),
+    CascadeReadStrategy(),   # must be before CascadeStrategy
     CascadeStrategy(),
     DoneStrategy(),
     EventStrategy(),
@@ -3313,6 +3365,13 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         if strategy is None:
             skipped_count += 1
             skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+            continue
+
+        # Cascade read instructions are counted as testable but NOT
+        # bin-packed into mega-program batches.  They will get their own
+        # cascade_pair generation path in a later task.
+        if isinstance(strategy, CascadeReadStrategy):
+            testable_count += 1
             continue
 
         testable_count += 1
