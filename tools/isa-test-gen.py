@@ -1597,6 +1597,11 @@ class ComputeStrategy(TestStrategy):
     """
 
     def can_test(self, instr: dict) -> tuple[bool, str]:
+        # Reject SP-relative spill instructions: these need specialized
+        # LoadStrategy/StoreStrategy handling but were rejected there due
+        # to llvm-mc encoder bugs.  Don't let the fallback pick them up.
+        if _is_sp_relative(instr):
+            return (False, "SP-relative spill (llvm-mc encoder bug)")
         status, reason = classify_instruction(instr)
         return (status == "testable", reason)
 
@@ -1645,15 +1650,12 @@ class LoadStrategy(TestStrategy):
         operands = instr.get("operands", [])
         sp_relative = _is_sp_relative(instr)
 
-        # Reject SP-relative am-class spills: llvm-mc crashes (assertion
-        # failure in getSImmOpValueXStep) because the encoder expects step=32
-        # but the immediate field metadata says scale=1.  llvm-aie bug.
-        # Affects: VLDA_dmw_lda_am_ag_spill, VST_dmw_sts_am_ag_spill.
-        if sp_relative and any(
-            op.get("register_kind") == "accumulator" and op.get("bit_width") == 6
-            for op in operands
-        ):
-            return (False, "am-class SP spill (llvm-mc encoder bug)")
+        # Reject ALL SP-relative spill loads: llvm-mc crashes with assertion
+        # failure in getSImmOpValueXStep because the encoder step/range
+        # requirements don't match the immediate field metadata.  llvm-aie bug.
+        # Affects: LDA_dmv_lda_q_ag_spill, VLDA_dmw_lda_{am,w}_ag_spill.
+        if sp_relative:
+            return (False, "SP-relative spill load (llvm-mc encoder bug)")
 
         # Must have a pointer operand, unless SP-relative (SP is implicit).
         # SP-relative instructions like VLDA_dmw_lda_w_ag_spill encode the
@@ -1882,14 +1884,12 @@ class StoreStrategy(TestStrategy):
         operands = instr.get("operands", [])
         sp_relative = _is_sp_relative(instr)
 
-        # Reject SP-relative am-class spills: llvm-mc crashes (assertion
-        # failure in getSImmOpValueXStep) because the encoder expects step=32
-        # but the immediate field metadata says scale=1.  llvm-aie bug.
-        if sp_relative and any(
-            op.get("register_kind") == "accumulator" and op.get("bit_width") == 6
-            for op in operands
-        ):
-            return (False, "am-class SP spill (llvm-mc encoder bug)")
+        # Reject ALL SP-relative spill stores: llvm-mc crashes with assertion
+        # failure in getSImmOpValueXStep because the encoder step/range
+        # requirements don't match the immediate field metadata.  llvm-aie bug.
+        # Affects: ST_dmv_sts_q_ag_spill, VST_{128,dmw_sts_{am,w}}_ag_spill.
+        if sp_relative:
+            return (False, "SP-relative spill store (llvm-mc encoder bug)")
 
         # Must have a pointer operand, unless SP-relative (SP is implicit).
         # SP-relative spill stores encode the destination address as the SP
@@ -2637,9 +2637,15 @@ class CascadeStrategy(TestStrategy):
         lines.append(f"  // ---- test (cascade): {name} ----")
 
         # Load known data into the source vector register from input buffer.
+        # Use _padda_sequence for large offsets (vlda max immediate is 992).
         in_offset = _align(in_offset, 32)
-        lines.append(f"  vlda wl0, [p0, #{in_offset}]")
-        lines.append(f"  vlda wh0, [p0, #{in_offset + 32}]")
+        if in_offset <= MAX_VECTOR_OFFSET:
+            lines.append(f"  vlda wl0, [p0, #{in_offset}]")
+            lines.append(f"  vlda wh0, [p0, #{in_offset + 32}]")
+        else:
+            lines.extend(_padda_sequence("p6", "p0", in_offset))
+            lines.append(f"  vlda wl0, [p6, #0]")
+            lines.append(f"  vlda wh0, [p6, #32]")
         lines.extend(_nop_sled(LOAD_LATENCY))
 
         # Enable cascade output.
