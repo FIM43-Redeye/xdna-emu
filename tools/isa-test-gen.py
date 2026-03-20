@@ -2082,13 +2082,14 @@ class StoreStrategy(TestStrategy):
 class BranchStrategy(TestStrategy):
     """Tests branch instructions using marker-based verification.
 
-    Stores marker values to the output buffer to verify which path executed.
-    Conditional branches get two test points: taken and not-taken.
-
-    Branch targets use absolute instruction word (IW) addresses.  Each
-    assembly line (regardless of compressed byte size) occupies exactly
-    one instruction word in program memory.  The code_iw_offset parameter
-    tells us how many IWs precede this test point in the current batch.
+    DISABLED: AIE2 branch instructions (j, jl, jnz, jz, jnzd, ret) use
+    ABSOLUTE byte addresses.  Our assembly is linked at a non-zero offset
+    (typically 0xa0+) by aiecc.py, but llvm-mc doesn't support label operands
+    for branch targets and emits no relocations.  So `j #N` in our .s file
+    becomes an absolute jump to byte N in the final ELF, which lands in the
+    objectfifo wrapper code, not our kernel.  Testing branches requires
+    either LLVM IR (.ll) tests where the compiler resolves addresses, or
+    runtime address computation via register-indirect branches.
     """
 
     _TESTABLE = frozenset({"j", "jl", "jnz", "jz", "ret", "jnzd"})
@@ -2097,7 +2098,9 @@ class BranchStrategy(TestStrategy):
         mnemonic = instr.get("mnemonic", "")
         if mnemonic not in self._TESTABLE:
             return (False, "not a branch instruction")
-        return (True, "")
+        # All branch instructions disabled: absolute address targets are
+        # unrelocatable in hand-written assembly.  See class docstring.
+        return (False, "branch instruction (absolute address, unrelocatable)")
 
     def _is_conditional(self, instr: dict) -> bool:
         return instr.get("mnemonic", "") in ("jnz", "jz", "jnzd")
@@ -2184,17 +2187,9 @@ class BranchStrategy(TestStrategy):
         # Determine condition value from combo index.
         combo_idx = regs.get("_combo_idx", 0)
 
-        # Does this branch clobber LR?  jl saves return address in LR;
-        # ret reads LR (and our test sets it to the taken path address).
-        # The kernel returns via 'ret lr' at the end, so we must preserve it.
-        clobbers_lr = (mnemonic == "jl") or is_ret
-
         # Phase 1: Build pre-branch instructions and count them.
         pre_branch = []
         pre_branch.append(f"  // ---- test (branch): {name} ----")
-
-        if clobbers_lr:
-            pre_branch.append(f"  mov r15, lr")
 
         if mnemonic == "jnzd":
             # jnzd $mRx, $mRx0, $mPm: dest = source - 1; jump if nonzero.
@@ -2243,9 +2238,7 @@ class BranchStrategy(TestStrategy):
         branch_iw = code_iw_offset + n_pre
         fall_through_start = branch_iw + 1 + BRANCH_DELAY
         taken_start = fall_through_start + n_fall + 1 + BRANCH_DELAY
-        # After the taken path, we may need to restore LR (1 extra IW).
-        n_restore = 1 if clobbers_lr else 0
-        done_iw = taken_start + n_taken + n_restore
+        done_iw = taken_start + n_taken
 
         # Patch the setup placeholder with the actual target address.
         if setup_placeholder_idx is not None:
@@ -2297,10 +2290,6 @@ class BranchStrategy(TestStrategy):
 
         # Taken path.
         lines.extend(taken)
-
-        # Restore LR if this branch clobbered it.
-        if clobbers_lr:
-            lines.append(f"  mov lr, r15")
 
         # No explicit convergence marker -- the next test point (or ret)
         # follows at done_iw.
