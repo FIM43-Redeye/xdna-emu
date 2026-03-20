@@ -93,7 +93,8 @@ BATCH_INFO=$(python3 -c "
 import json, sys
 m = json.load(open('${MANIFEST}'))
 for b in m['batches']:
-    print(b['batch_index'], b['filename'], b['in_size'], b['out_size'])
+    source_type = b.get('source_type', 'assembly')
+    print(b['batch_index'], b['filename'], b['in_size'], b['out_size'], source_type)
 ")
 
 # Apply filter if specified.
@@ -121,12 +122,19 @@ if [[ ! -x "$PEANO_LLC" ]]; then
     exit 1
 fi
 
-assemble_one() {
-    local batch_idx="$1"
-    local filename="$2"
+assemble_file() {
+    # Assemble a single .s or .ll file into a .o file (name derived from input).
+    local filename="$1"
     local in_path="${OUT_DIR}/${filename}"
-    # Output .o is always named by batch index, regardless of input format.
-    local o_path="${OUT_DIR}/batch_${batch_idx}.o"
+
+    # Derive .o name from the source filename to match manifest convention.
+    local o_name
+    if [[ "$filename" == *.ll ]]; then
+        o_name="${filename%.ll}.o"
+    else
+        o_name="${filename%.s}.o"
+    fi
+    local o_path="${OUT_DIR}/${o_name}"
 
     # Skip if already assembled/compiled (unless --compile).
     if ! $FORCE_COMPILE && [[ -f "$o_path" ]] && [[ "$o_path" -nt "$in_path" ]]; then
@@ -149,11 +157,23 @@ assemble_one() {
             echo "  ASM FAIL: ${filename} (see ${in_path%.s}.mc.log)"
     fi
 }
-export -f assemble_one
+export -f assemble_file
 export OUT_DIR FORCE_COMPILE LLVM_MC PEANO_LLC
 
-echo "$BATCH_INFO" | awk '{print $1, $2}' | \
-    xargs -P "$JOBS" -n2 bash -c 'assemble_one "$1" "$2"' _
+# Build list of all files to assemble (includes producer/consumer for pairs).
+ASM_FILES=$(python3 -c "
+import json
+m = json.load(open('${MANIFEST}'))
+for b in m['batches']:
+    st = b.get('source_type', 'assembly')
+    if st in ('cascade_pair', 'stream_pair'):
+        print(b['producer_filename'])
+        print(b['consumer_filename'])
+    else:
+        print(b['filename'])
+")
+
+echo "$ASM_FILES" | xargs -P "$JOBS" -n1 bash -c 'assemble_file "$1"' _
 echo ""
 
 # ---- Phase 3: Link + Package ----
@@ -187,15 +207,33 @@ if $MULTI_TILE; then
     # ---- Multi-tile mode: group batches into phases of 4 ----
 
     # Compute phase assignments from BATCH_INFO.
+    # For pair batches (cascade_pair, stream_pair), verify both .o files exist.
+    # For normal batches, verify the single .o exists.
     PHASE_INFO=""
     phase_idx=0
     batch_indices=""
     count=0
-    while IFS=' ' read -r idx filename in_size out_size; do
-        # Check that the .o exists before including in a phase.
-        if [[ ! -f "${OUT_DIR}/batch_${idx}.o" ]]; then
-            echo "  SKIP batch_${idx}: assembly failed (not included in phase)"
-            continue
+    while IFS=' ' read -r idx filename in_size out_size source_type; do
+        # Check that the required .o file(s) exist.
+        if [[ "$source_type" == "cascade_pair" ]] || [[ "$source_type" == "stream_pair" ]]; then
+            # Pair batches need both producer and consumer .o files.
+            prod_o="${filename/_consumer.s/_producer.o}"
+            cons_o="${filename%.s}.o"
+            if [[ ! -f "${OUT_DIR}/${prod_o}" ]] || [[ ! -f "${OUT_DIR}/${cons_o}" ]]; then
+                echo "  SKIP batch_${idx}: pair assembly incomplete (not included in phase)"
+                continue
+            fi
+        else
+            # Normal batch: derive .o from filename.
+            if [[ "$filename" == *.ll ]]; then
+                o_name="${filename%.ll}.o"
+            else
+                o_name="${filename%.s}.o"
+            fi
+            if [[ ! -f "${OUT_DIR}/${o_name}" ]]; then
+                echo "  SKIP batch_${idx}: assembly failed (not included in phase)"
+                continue
+            fi
         fi
         if [[ $count -ge 4 ]]; then
             PHASE_INFO="${PHASE_INFO}${phase_idx} ${batch_indices%,}\n"
@@ -221,10 +259,11 @@ if $MULTI_TILE; then
 
         # Skip if already packaged (unless --compile).
         if ! $FORCE_COMPILE && [[ -f "${phase_dir}/aie.xclbin" ]] && [[ -f "${phase_dir}/insts.bin" ]]; then
-            # Check if any .o is newer than the xclbin.
+            # Check if any .o is newer than the xclbin by scanning phase dir.
             local stale=false
-            for bi in ${batch_list//,/ }; do
-                if [[ "${OUT_DIR}/batch_${bi}.o" -nt "${phase_dir}/aie.xclbin" ]]; then
+            for ofile in "${phase_dir}"/*.o; do
+                [[ -f "$ofile" ]] || continue
+                if [[ "$ofile" -nt "${phase_dir}/aie.xclbin" ]]; then
                     stale=true
                     break
                 fi
@@ -275,8 +314,22 @@ else
         local filename="$2"
         local in_size="$3"
         local out_size="$4"
+        local source_type="$5"
         local batch_dir="${OUT_DIR}/batch_${batch_idx}"
-        local o_path="${OUT_DIR}/batch_${batch_idx}.o"
+
+        # Pair batches need two tiles -- skip in single-tile mode.
+        if [[ "$source_type" == "cascade_pair" ]] || [[ "$source_type" == "stream_pair" ]]; then
+            return 0
+        fi
+
+        # Derive .o name from filename (matches manifest naming convention).
+        local o_name
+        if [[ "$filename" == *.ll ]]; then
+            o_name="${filename%.ll}.o"
+        else
+            o_name="${filename%.s}.o"
+        fi
+        local o_path="${OUT_DIR}/${o_name}"
 
         if [[ ! -f "$o_path" ]]; then
             echo "  SKIP batch_${batch_idx}: assembly failed"
@@ -314,8 +367,8 @@ print(gen.generate_aie_mlir(${in_size}, ${out_size}))
     export -f package_one
     export HOST_BIN PROJECT_DIR
 
-    echo "$BATCH_INFO" | while IFS=' ' read -r idx filename in_size out_size; do
-        package_one "$idx" "$filename" "$in_size" "$out_size"
+    echo "$BATCH_INFO" | while IFS=' ' read -r idx filename in_size out_size source_type; do
+        package_one "$idx" "$filename" "$in_size" "$out_size" "$source_type"
     done
     echo ""
 fi
@@ -343,6 +396,10 @@ indices = [int(x) for x in '${batch_list}'.split(',')]
 by_idx = {b['batch_index']: b for b in m['batches']}
 total_in = sum(by_idx[i]['in_size'] for i in indices)
 total_out = sum(by_idx[i]['out_size'] for i in indices)
+# Stream pairs have in_size=0; MLIR uses max(1 elem, total) for memref.
+# Match that here so test_host doesn't try to allocate 0 bytes.
+total_in = max(4, total_in)
+total_out = max(4, total_out)
 print(total_in, total_out)
 ")
             in_size=$(echo "$sizes" | awk '{print $1}')
@@ -364,7 +421,11 @@ else
     # Single-tile HW execution (original behavior).
     if $RUN_HW; then
         echo "--- Phase 4: Run HW (serial) ---"
-        while IFS=' ' read -r idx filename in_size out_size; do
+        while IFS=' ' read -r idx filename in_size out_size source_type; do
+            # Skip pair batches in single-tile mode.
+            [[ "$source_type" == "cascade_pair" ]] && continue
+            [[ "$source_type" == "stream_pair" ]] && continue
+
             batch_dir="${OUT_DIR}/batch_${idx}"
             hw_out="${RESULTS_DIR}/batch_${idx}_hw.bin"
 
@@ -425,6 +486,10 @@ indices = [int(x) for x in '${batch_list}'.split(',')]
 by_idx = {b['batch_index']: b for b in m['batches']}
 total_in = sum(by_idx[i]['in_size'] for i in indices)
 total_out = sum(by_idx[i]['out_size'] for i in indices)
+# Stream pairs have in_size=0; MLIR uses max(1 elem, total) for memref.
+# Match that here so test_host doesn't try to allocate 0 bytes.
+total_in = max(4, total_in)
+total_out = max(4, total_out)
 print(total_in, total_out)
 ")
             in_size=$(echo "$sizes" | awk '{print $1}')
@@ -460,7 +525,10 @@ else
         export -f run_emu_one
         export HOST_BIN OUT_DIR RESULTS_DIR SEED
 
-        echo "$BATCH_INFO" | while IFS=' ' read -r idx filename in_size out_size; do
+        echo "$BATCH_INFO" | while IFS=' ' read -r idx filename in_size out_size source_type; do
+            # Skip pair batches in single-tile mode.
+            [[ "$source_type" == "cascade_pair" ]] && continue
+            [[ "$source_type" == "stream_pair" ]] && continue
             printf '%s\0%s\0%s\0' "$idx" "$in_size" "$out_size"
         done | xargs -0 -n3 -P "$JOBS" bash -c 'run_emu_one "$1" "$2" "$3"' _
         echo ""
@@ -504,7 +572,7 @@ for mode in ['hw', 'emu']:
         SKIP=0
         FAIL_LIST=""
 
-        while IFS=' ' read -r idx filename in_size out_size; do
+        while IFS=' ' read -r idx filename in_size out_size source_type; do
             hw_out="${RESULTS_DIR}/batch_${idx}_hw.bin"
             emu_out="${RESULTS_DIR}/batch_${idx}_emu.bin"
 
@@ -545,7 +613,11 @@ else
         SKIP=0
         FAIL_LIST=""
 
-        while IFS=' ' read -r idx filename in_size out_size; do
+        while IFS=' ' read -r idx filename in_size out_size source_type; do
+            # Skip pair batches in single-tile mode.
+            [[ "$source_type" == "cascade_pair" ]] && continue
+            [[ "$source_type" == "stream_pair" ]] && continue
+
             hw_out="${RESULTS_DIR}/batch_${idx}_hw.bin"
             emu_out="${RESULTS_DIR}/batch_${idx}_emu.bin"
 
