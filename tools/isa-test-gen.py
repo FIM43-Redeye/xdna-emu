@@ -2098,9 +2098,9 @@ class BranchStrategy(TestStrategy):
         mnemonic = instr.get("mnemonic", "")
         if mnemonic not in self._TESTABLE:
             return (False, "not a branch instruction")
-        # All branch instructions disabled: absolute address targets are
-        # unrelocatable in hand-written assembly.  See class docstring.
-        return (False, "branch instruction (absolute address, unrelocatable)")
+        # All branch instructions disabled in assembly: absolute address
+        # targets are unrelocatable.  Tested via .ll batch instead.
+        return (False, "branch (tested via .ll, not assembly)")
 
     def _is_conditional(self, instr: dict) -> bool:
         return instr.get("mnemonic", "") in ("jnz", "jz", "jnzd")
@@ -3364,7 +3364,69 @@ exit:
 }
 """, "JNZD"))
 
-    # --- Test 6: Nested branches (diamond pattern) ---
+    # --- Test 6: Indirect jump (j pN -- register indirect) ---
+    helpers.append(("@_branch_j_ind", 4, 8, """\
+define internal void @_branch_j_ind(ptr %in, ptr %out) {
+entry:
+  %v = load volatile i32, ptr %in, align 4
+  store volatile i32 170, ptr %out, align 4
+  %cond = icmp sgt i32 %v, 0
+  br i1 %cond, label %positive, label %negative
+positive:
+  br label %merge
+negative:
+  br label %merge
+merge:
+  %r = phi i32 [1, %positive], [0, %negative]
+  %p1 = getelementptr i8, ptr %out, i64 4
+  store volatile i32 %r, ptr %p1, align 4
+  ret void
+}
+""", "J_jump_ind"))
+
+    # --- Test 7: Indirect jl (function pointer call) ---
+    helpers.append(("@_branch_jl_ind", 4, 8, """\
+define internal i32 @_ind_callee_a(i32 %x) {
+  %r = add i32 %x, 100
+  ret i32 %r
+}
+
+define internal void @_branch_jl_ind(ptr %in, ptr %out) {
+entry:
+  %v = load volatile i32, ptr %in, align 4
+  store volatile i32 170, ptr %out, align 4
+  %r = call i32 @_ind_callee_a(i32 %v)
+  %p1 = getelementptr i8, ptr %out, i64 4
+  store volatile i32 %r, ptr %p1, align 4
+  ret void
+}
+""", "JL_IND"))
+
+    # --- Test 8: Return from nested call (ret) ---
+    helpers.append(("@_branch_ret_nested", 4, 8, """\
+define internal i32 @_nested_inner(i32 %x) {
+  %r = mul i32 %x, 3
+  ret i32 %r
+}
+
+define internal i32 @_nested_outer(i32 %x) {
+  %r1 = call i32 @_nested_inner(i32 %x)
+  %r2 = add i32 %r1, 7
+  ret i32 %r2
+}
+
+define internal void @_branch_ret_nested(ptr %in, ptr %out) {
+entry:
+  %v = load volatile i32, ptr %in, align 4
+  store volatile i32 170, ptr %out, align 4
+  %r = call i32 @_nested_outer(i32 %v)
+  %p1 = getelementptr i8, ptr %out, i64 4
+  store volatile i32 %r, ptr %p1, align 4
+  ret void
+}
+""", "RET"))
+
+    # --- Test 9: Nested branches (diamond pattern) ---
     helpers.append(("@_branch_diamond", 8, 8, """\
 define internal void @_branch_diamond(ptr %in, ptr %out) {
 entry:
@@ -3839,16 +3901,30 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     # generation.  Like cascade, NOT bin-packed; each becomes a standalone batch.
     stream_specs: list[tuple[dict, int, dict, StreamStrategy]] = []
 
+    # Track all ISA names covered by each conversion base mnemonic.
+    conv_base_to_isa_names: dict[str, list[str]] = {}
+    # Branch instructions tested via .ll (not assembly).
+    _BRANCH_MNEMONICS = frozenset({"j", "jl", "jnz", "jz", "ret", "jnzd"})
+    branch_instr_count = 0
+
     for instr in all_instrs:
         # Check conversion first (before normal strategy dispatch).
         if conv_strategy.can_handle(instr):
             conv_instr_count += 1
             mnemonic = instr.get("mnemonic", "")
             base = _conversion_base_mnemonic(mnemonic)
+            conv_base_to_isa_names.setdefault(base, []).append(instr["name"])
             if base not in seen_conv_bases:
                 seen_conv_bases.add(base)
                 info = CONVERSION_INTRINSICS[base]
                 conv_test_points.append({"mnemonic": base, **info})
+            continue
+
+        # Branch instructions are tested via .ll, not assembly.
+        # Count them as testable but don't dispatch to assembly strategies.
+        mnemonic = instr.get("mnemonic", "")
+        if mnemonic in _BRANCH_MNEMONICS:
+            branch_instr_count += 1
             continue
 
         strategy, reason = classify_with_strategies(instr)
@@ -4021,6 +4097,9 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
                 effective_in = in_bytes
                 effective_out = out_bytes
 
+            # Track all ISA-level instruction names covered by this
+            # base mnemonic (includes 2D/3D and addressing variants).
+            covered_names = conv_base_to_isa_names.get(mnemonic, [mnemonic])
             conv_meta.append({
                 "instruction": mnemonic,
                 "slot": "conversion",
@@ -4030,6 +4109,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
                 "in_size": effective_in,
                 "out_offset": conv_out_offset,
                 "out_size": effective_out,
+                "covers_isa_names": covered_names,
             })
             conv_in_offset += effective_in
             conv_out_offset += effective_out
@@ -4168,11 +4248,17 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         batch_idx += 1
 
     # Write manifest.json.
+    # Count branch .ll test points from the branch batch.
+    branch_test_count = len(branch_meta)
     total_test_points = (len(test_point_specs) + total_conv_test_points
-                         + len(cascade_specs) + len(stream_specs))
+                         + len(cascade_specs) + len(stream_specs)
+                         + branch_test_count)
+    # Conversion and branch instructions are all testable (tested via .ll).
+    total_conv_isa_names = sum(len(v) for v in conv_base_to_isa_names.values())
     manifest = {
-        "testable_instructions": testable_count,
+        "testable_instructions": testable_count + conv_instr_count + branch_instr_count,
         "skipped_instructions": skipped_count,
+        "conversion_variants_covered": total_conv_isa_names,
         "total_test_points": total_test_points,
         "total_batches": len(batches),
         "skip_reasons": skip_reasons,
@@ -4266,8 +4352,18 @@ def main():
 
     manifest = generate_all(args.isa_json, args.out_dir)
 
-    print(f"Testable instructions: {manifest['testable_instructions']}")
-    print(f"Skipped instructions:  {manifest['skipped_instructions']}")
+    testable = manifest['testable_instructions']
+    skipped = manifest['skipped_instructions']
+    total_isa = testable + skipped
+    conv_variants = manifest.get('conversion_variants_covered', 0)
+    print(f"Testable instructions: {testable}/{total_isa} ({100*testable/total_isa:.1f}%)")
+    if conv_variants:
+        conv_bases = len(set(
+            t['instruction'] for b in manifest['batches'] for t in b['tests']
+            if t.get('slot') == 'conversion'
+        ))
+        print(f"  (includes {conv_variants} conversion variants via {conv_bases} .ll test points)")
+    print(f"Skipped instructions:  {skipped}")
     print(f"Total test points:     {manifest['total_test_points']}")
     print(f"Batches:               {manifest['total_batches']}")
     print(f"Output:                {args.out_dir}")
