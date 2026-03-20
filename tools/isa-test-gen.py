@@ -1491,9 +1491,9 @@ def build_mega_program(test_points: list[str]) -> str:
     for tp in test_points:
         lines.append(tp)
 
-    # Return sequence: ret lr + NOP sled.
+    # Return sequence: ret lr + NOP sled (5 delay slots on AIE2).
     lines.append("  ret lr")
-    lines.extend([f"  nop" for _ in range(4)])
+    lines.extend([f"  nop" for _ in range(5)])
     lines.append("")
 
     return "\n".join(lines)
