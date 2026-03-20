@@ -176,8 +176,9 @@ def prepare_phase_objects(
                 result.append(src_name)
         else:
             # Normal batch: single .o file.
+            # The filename field is "batch_NNN.s"; derive .o from it.
             src = os.path.join(
-                obj_dir, f"batch_{batch['batch_index']}.o"
+                obj_dir, _obj_filename(batch)
             )
             o_name = _obj_filename(batch)
             dst = os.path.join(phase_dir, o_name)
