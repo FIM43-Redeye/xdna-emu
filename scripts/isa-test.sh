@@ -406,14 +406,21 @@ print(total_in, total_out)
             out_size=$(echo "$sizes" | awk '{print $2}')
 
             hw_out="${RESULTS_DIR}/phase_${pidx}_hw.bin"
-            "$HOST_BIN" \
+            hw_log="${RESULTS_DIR}/phase_${pidx}_hw.log"
+            timeout 30 "$HOST_BIN" \
                 -x "${phase_dir}/aie.xclbin" \
                 -k MLIR_AIE \
                 -i "${phase_dir}/insts.bin" \
                 --in-size "$in_size" --out-size "$out_size" \
-                --seed "$SEED" --out-file "$hw_out" 2>"${RESULTS_DIR}/phase_${pidx}_hw.log" && \
-                echo "  HW OK: phase_${pidx}" || \
-                echo "  HW FAIL: phase_${pidx} (see ${RESULTS_DIR}/phase_${pidx}_hw.log)"
+                --seed "$SEED" --out-file "$hw_out" 2>"$hw_log"
+            rc=$?
+            if [[ $rc -eq 0 ]]; then
+                echo "  HW OK: phase_${pidx}"
+            elif [[ $rc -eq 124 ]]; then
+                echo "  HW TIMEOUT: phase_${pidx} (killed after 30s)"
+            else
+                echo "  HW FAIL: phase_${pidx} (rc=$rc, see $hw_log)"
+            fi
         done
         echo ""
     fi
@@ -434,14 +441,21 @@ else
                 continue
             fi
 
-            "$HOST_BIN" \
+            hw_log="${RESULTS_DIR}/batch_${idx}_hw.log"
+            timeout 30 "$HOST_BIN" \
                 -x "${batch_dir}/aie.xclbin" \
                 -k MLIR_AIE \
                 -i "${batch_dir}/insts.bin" \
                 --in-size "$in_size" --out-size "$out_size" \
-                --seed "$SEED" --out-file "$hw_out" 2>"${RESULTS_DIR}/batch_${idx}_hw.log" && \
-                echo "  HW OK: batch_${idx}" || \
-                echo "  HW FAIL: batch_${idx} (see ${RESULTS_DIR}/batch_${idx}_hw.log)"
+                --seed "$SEED" --out-file "$hw_out" 2>"$hw_log"
+            rc=$?
+            if [[ $rc -eq 0 ]]; then
+                echo "  HW OK: batch_${idx}"
+            elif [[ $rc -eq 124 ]]; then
+                echo "  HW TIMEOUT: batch_${idx} (killed after 30s)"
+            else
+                echo "  HW FAIL: batch_${idx} (rc=$rc, see $hw_log)"
+            fi
         done <<< "$BATCH_INFO"
         echo ""
     fi

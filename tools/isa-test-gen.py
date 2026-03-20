@@ -1631,6 +1631,12 @@ class LoadStrategy(TestStrategy):
         if any(mnemonic.startswith(p) for p in self._SKIP_PREFIXES):
             return (False, "compressed/sparse load (needs FIFO init)")
 
+        # Reject .tm (tile memory) loads -- these access a special memory
+        # region that requires hardware configuration our harness doesn't
+        # provide, causing a permanent hardware hang.
+        if ".tm" in mnemonic:
+            return (False, "tile memory load (.tm) -- needs dedicated harness")
+
         # Reject conversion loads (ups/conv/unpack) -- llvm-mc has no
         # single-instruction syntax for these.
         if any(s in mnemonic for s in CONVERSION_SUFFIXES):
@@ -1817,14 +1823,17 @@ def _effective_load_store_kind(op: dict) -> str:
 
     Returns the kind string suitable for _load_instruction / _store_instruction.
     """
-    # First try the composite_register -> TESTABLE_COMPOSITE_KINDS path.
+    # Check for quad registers FIRST: accumulator with bw=2 is actually
+    # quad (q0-q3).  Must check before _effective_kind() which would
+    # return "accumulator" and short-circuit.
+    kind = op.get("register_kind", "") or ""
+    if kind == "accumulator" and op.get("bit_width", 0) == 2:
+        return "quad"
+
+    # Then try the composite_register -> TESTABLE_COMPOSITE_KINDS path.
     eff = _effective_kind(op)
     if eff:
         return eff
-    kind = op.get("register_kind", "") or ""
-    if kind == "accumulator" and op.get("bit_width", 0) == 2:
-        # DMV_Q quad registers (q0-q3) misclassified by exporter as bw=2 accum.
-        return "quad"
     return kind
 
 
@@ -1858,9 +1867,15 @@ class StoreStrategy(TestStrategy):
         if not instr.get("may_store", False):
             return (False, "not a store instruction")
 
+        # Reject .tm (tile memory) stores -- these access a special memory
+        # region that requires hardware configuration our harness doesn't
+        # provide, causing a permanent hardware hang.
+        mnemonic = instr.get("mnemonic", "")
+        if ".tm" in mnemonic:
+            return (False, "tile memory store (.tm) -- needs dedicated harness")
+
         # Reject conversion stores (srs/conv/pack) -- llvm-mc has no
         # single-instruction syntax for these.
-        mnemonic = instr.get("mnemonic", "")
         if any(s in mnemonic for s in CONVERSION_SUFFIXES):
             return (False, "conversion store (no llvm-mc syntax)")
 
@@ -2169,9 +2184,17 @@ class BranchStrategy(TestStrategy):
         # Determine condition value from combo index.
         combo_idx = regs.get("_combo_idx", 0)
 
+        # Does this branch clobber LR?  jl saves return address in LR;
+        # ret reads LR (and our test sets it to the taken path address).
+        # The kernel returns via 'ret lr' at the end, so we must preserve it.
+        clobbers_lr = (mnemonic == "jl") or is_ret
+
         # Phase 1: Build pre-branch instructions and count them.
         pre_branch = []
         pre_branch.append(f"  // ---- test (branch): {name} ----")
+
+        if clobbers_lr:
+            pre_branch.append(f"  mov r15, lr")
 
         if mnemonic == "jnzd":
             # jnzd $mRx, $mRx0, $mPm: dest = source - 1; jump if nonzero.
@@ -2220,7 +2243,9 @@ class BranchStrategy(TestStrategy):
         branch_iw = code_iw_offset + n_pre
         fall_through_start = branch_iw + 1 + BRANCH_DELAY
         taken_start = fall_through_start + n_fall + 1 + BRANCH_DELAY
-        done_iw = taken_start + n_taken
+        # After the taken path, we may need to restore LR (1 extra IW).
+        n_restore = 1 if clobbers_lr else 0
+        done_iw = taken_start + n_taken + n_restore
 
         # Patch the setup placeholder with the actual target address.
         if setup_placeholder_idx is not None:
@@ -2272,6 +2297,10 @@ class BranchStrategy(TestStrategy):
 
         # Taken path.
         lines.extend(taken)
+
+        # Restore LR if this branch clobbered it.
+        if clobbers_lr:
+            lines.append(f"  mov lr, r15")
 
         # No explicit convergence marker -- the next test point (or ret)
         # follows at done_iw.
