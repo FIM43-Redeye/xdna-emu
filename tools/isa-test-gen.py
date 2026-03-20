@@ -3431,13 +3431,22 @@ class PaddaSpStrategy(TestStrategy):
 
 STRATEGIES: list[TestStrategy] = [
     BranchStrategy(),
-    LockStrategy(),
+    # LockStrategy disabled: lock acq/rel instructions interact with the
+    # objectfifo DMA lock protocol.  Register-indirect variants use PRNG
+    # data as lock IDs, which can steal locks from the DMA engine and
+    # deadlock the tile.  Needs a dedicated harness without objectfifos.
+    # LockStrategy(),
     FifoLoadStrategy(),
     CascadeReadStrategy(),   # must be before CascadeStrategy
     CascadeStrategy(),
     StreamStrategy(),       # must be before ComputeStrategy
-    DoneStrategy(),
-    EventStrategy(),
+    # DoneStrategy disabled: done halts the core before lock releases,
+    # so the output DMA never triggers and the runtime sequence hangs.
+    # Needs a dedicated batch with custom lock handling.
+    # DoneStrategy(),
+    # EventStrategy disabled: event instruction has no testable output
+    # and the marker-based approach adds risk for minimal value.
+    # EventStrategy(),
     PaddaSpStrategy(),
     LoadStrategy(),
     StoreStrategy(),
