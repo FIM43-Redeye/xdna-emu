@@ -445,6 +445,8 @@ fn disassemble_from_semantic(slot_op: &SlotOp) -> String {
         SemanticOp::NegMul => vec_et("vnegmul"),
         SemanticOp::Accumulate => vec_et("vacc"),
 
+        // Hardware state reads
+        SemanticOp::ReadCycleCounter => "mov.cntr".into(),
         // Side-effect
         SemanticOp::CascadeRead => "vmov.scd".into(),
         SemanticOp::CascadeWrite => "vmov.mcd".into(),

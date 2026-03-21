@@ -147,6 +147,15 @@ pub fn execute_semantic(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         SemanticOp::ZeroExtend => execute_zero_extend(op, ctx),
         SemanticOp::Truncate => execute_truncate(op, ctx),
 
+        // Hardware state reads
+        SemanticOp::ReadCycleCounter => {
+            // MOV_CNTR: read the per-core cycle counter into a scalar register.
+            // The counter is 32-bit on AIE2 (wraps at 2^32).
+            let counter = ctx.cycles as u32;
+            write_dest(op, ctx, counter);
+            true
+        }
+
         // Nop
         SemanticOp::Nop => true, // Nothing to do
 
@@ -579,25 +588,26 @@ fn execute_setcc(op: &SlotOp, ctx: &mut ExecutionContext, cmp: CmpOp, signed: bo
 /// For generic select, the test value is the 3rd source operand.
 fn execute_select(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     let src_true = read_source(op, ctx, 0);
-    let src_false = read_source(op, ctx, 1);
 
     // Get test value: first check for implicit r27, then fall back to source[2]
     let test = get_implicit_use(op, ctx, 27).unwrap_or_else(|| read_source(op, ctx, 2));
 
-    // Determine condition from select_variant
+    // Determine condition from select_variant.
+    // AIE2 sel.eqz/sel.nez follow RISC-V Zbt semantics:
+    //   sel.eqz rd, rs1, rs2, r27: rd = (r27 == 0) ? rs1 : 0
+    //   sel.nez rd, rs1, rs2, r27: rd = (r27 != 0) ? rs1 : 0
+    // The false branch is always zero, not the second source operand.
     let condition = match op.select_variant {
         Some(SelectVariant::NotEqualZero) => test != 0,
         _ => test == 0, // sel.eqz and generic select
     };
 
-    log::debug!(
-        "[SEMANTIC SELECT] semantic={:?} sources={:?} implicit_regs={:?} test={} true={} false={} cond={}",
-        op.semantic, op.sources, op.implicit_regs, test, src_true, src_false, condition
+    let result = if condition { src_true } else { 0 };
+
+    log::trace!(
+        "[SEMANTIC SELECT] semantic={:?} test={} src_true={} cond={} result={}",
+        op.semantic, test, src_true, condition, result
     );
-
-    let result = if condition { src_true } else { src_false };
-
-    log::debug!("[SEMANTIC SELECT] result={}", result);
 
     write_dest(op, ctx, result);
     true
@@ -873,14 +883,14 @@ mod tests {
         }];
 
         assert!(execute_semantic(&op, &mut ctx));
-        assert_eq!(ctx.scalar_read(3), 200); // r27!=0, so false value selected
+        assert_eq!(ctx.scalar_read(3), 0); // r27!=0, eqz condition false -> 0
     }
 
     #[test]
     fn test_execute_sel_nez_with_zero() {
         let mut ctx = make_test_context();
         ctx.scalar.write(1, 100); // true value
-        ctx.scalar.write(2, 200); // false value
+        ctx.scalar.write(2, 200); // false value (ignored -- false branch is always 0)
         ctx.scalar.write(27, 0);  // test value (r27) = 0, so sel.nez selects false
 
         let mut op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Select)
@@ -894,7 +904,7 @@ mod tests {
         }];
 
         assert!(execute_semantic(&op, &mut ctx));
-        assert_eq!(ctx.scalar_read(3), 200); // r27==0, nez condition false -> false value
+        assert_eq!(ctx.scalar_read(3), 0); // r27==0, nez condition false -> 0
     }
 
     #[test]

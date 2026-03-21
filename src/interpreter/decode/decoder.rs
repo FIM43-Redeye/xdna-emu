@@ -484,6 +484,22 @@ impl InstructionDecoder {
             }
         }
 
+        // Pointer arithmetic with register offset (padda/paddb/padds [ptr], mod).
+        // The addressing mode may be IndexedRegister or Unknown depending on the
+        // instruction name, but for pointer arithmetic the semantics are the same:
+        // ptr += mod (or ptr += dj from the AG field).
+        if decoded.encoding.is_ptr_arithmetic && direct_dest.is_none() {
+            if let Some(Operand::PointerReg(base)) = field_operands.get("ptr").cloned() {
+                direct_dest = Some(Operand::PointerReg(base));
+                // If there's a modifier register, use it as the offset source.
+                if let Some(mod_op) = field_operands.get("mod").cloned() {
+                    extra_sources.push(mod_op);
+                    field_operands.remove("mod");
+                }
+                field_operands.remove("ptr");
+            }
+        }
+
         // SP-relative load/store (spill/fill): Uses = [SP] in TableGen.
         // The immediate field is a stack offset, not a standalone value.
         // Convert to Memory { base: SP_PTR_INDEX, offset: imm }.
@@ -796,6 +812,7 @@ impl InstructionDecoder {
             "DIVS" => Some(SemanticOp::SDiv),
             "EXTENDu8" => Some(SemanticOp::ZeroExtend),
             "EXTENDu16" => Some(SemanticOp::ZeroExtend),
+            "MOV_CNTR" => Some(SemanticOp::ReadCycleCounter),
             _ => None,
         };
 

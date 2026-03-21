@@ -307,6 +307,9 @@ impl LatencyTable {
             SemanticOp::PointerAdd | SemanticOp::PointerMov
                 => TIMING_SCALAR_1,
 
+            // ── Hardware state reads ──────────────────────────────────────
+            SemanticOp::ReadCycleCounter => TIMING_SCALAR_1,
+
             // ── Intrinsics ──────────────────────────────────────────────
             SemanticOp::Intrinsic(_) if is_vector => TIMING_VECTOR_MAC, // Conservative
             SemanticOp::Intrinsic(_) => TIMING_SCALAR_MUL,

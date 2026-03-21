@@ -312,6 +312,7 @@ impl SlotOp {
                 | SemanticOp::SetNe | SemanticOp::Select
                 | SemanticOp::SDiv | SemanticOp::UDiv | SemanticOp::SRem
                 | SemanticOp::Neg | SemanticOp::Truncate | SemanticOp::Event
+                | SemanticOp::ReadCycleCounter
             ) if !self.is_vector => SlotIndex::Scalar0,
 
             // MAC/MatMul/Accumulate -> Accumulator slot

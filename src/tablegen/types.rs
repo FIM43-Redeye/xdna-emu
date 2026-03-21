@@ -363,6 +363,9 @@ pub enum SemanticOp {
     DmaWait,                // Wait for DMA completion
     Halt,                   // Core termination (halt)
 
+    // Hardware state reads
+    ReadCycleCounter,       // MOV_CNTR: read per-core cycle counter
+
     // Pointer operations
     PointerAdd,  // Pointer arithmetic: ptr + offset
     PointerMov,  // Pointer move: ptr = value

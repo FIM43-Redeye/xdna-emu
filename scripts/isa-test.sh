@@ -61,10 +61,31 @@ done
 OUT_DIR="${PROJECT_DIR}/build/isa-tests"
 RESULTS_DIR="/tmp/isa-test-results-$(date +%Y%m%d)"
 
+# Determine which EMU profile to use and check for stale builds.
+EMU_PROFILE="${XDNA_EMU:-debug}"
+EMU_LIB="${PROJECT_DIR}/target/${EMU_PROFILE}/libxdna_emu.so"
+if [[ ! -f "$EMU_LIB" ]]; then
+    echo "WARNING: EMU lib not found at $EMU_LIB"
+    echo "  Run: cargo build $([ "$EMU_PROFILE" = "release" ] && echo "--release")"
+    echo "  Or set XDNA_EMU=release to use the release profile."
+fi
+# Warn if the EMU lib is older than any Rust source file.
+if [[ -f "$EMU_LIB" ]]; then
+    newest_src=$(find "${PROJECT_DIR}/src" -name '*.rs' -newer "$EMU_LIB" 2>/dev/null | head -1)
+    if [[ -n "$newest_src" ]]; then
+        echo "WARNING: EMU lib ($EMU_PROFILE) is STALE -- Rust source is newer."
+        echo "  Stale: $EMU_LIB ($(stat -c '%y' "$EMU_LIB" | cut -d. -f1))"
+        echo "  Newer: $newest_src"
+        echo "  Run: cargo build $([ "$EMU_PROFILE" = "release" ] && echo "--release")"
+        echo ""
+    fi
+fi
+
 echo "=== ISA-Level Validation Harness ==="
 echo "ISA JSON: $ISA_JSON"
 echo "Out dir:  $OUT_DIR"
 echo "Results:  $RESULTS_DIR"
+echo "EMU:      $EMU_PROFILE ($EMU_LIB)"
 if $MULTI_TILE; then
     echo "Mode:     multi-tile (4 tiles per phase)"
 fi
@@ -407,13 +428,14 @@ print(total_in, total_out)
 
             hw_out="${RESULTS_DIR}/phase_${pidx}_hw.bin"
             hw_log="${RESULTS_DIR}/phase_${pidx}_hw.log"
+            rc=0
             timeout 30 "$HOST_BIN" \
                 -x "${phase_dir}/aie.xclbin" \
                 -k MLIR_AIE \
                 -i "${phase_dir}/insts.bin" \
                 --in-size "$in_size" --out-size "$out_size" \
-                --seed "$SEED" --out-file "$hw_out" 2>"$hw_log"
-            rc=$?
+                --seed "$SEED" --out-file "$hw_out" 2>"$hw_log" \
+                || rc=$?
             if [[ $rc -eq 0 ]]; then
                 echo "  HW OK: phase_${pidx}"
             elif [[ $rc -eq 124 ]]; then
@@ -442,13 +464,14 @@ else
             fi
 
             hw_log="${RESULTS_DIR}/batch_${idx}_hw.log"
+            rc=0
             timeout 30 "$HOST_BIN" \
                 -x "${batch_dir}/aie.xclbin" \
                 -k MLIR_AIE \
                 -i "${batch_dir}/insts.bin" \
                 --in-size "$in_size" --out-size "$out_size" \
-                --seed "$SEED" --out-file "$hw_out" 2>"$hw_log"
-            rc=$?
+                --seed "$SEED" --out-file "$hw_out" 2>"$hw_log" \
+                || rc=$?
             if [[ $rc -eq 0 ]]; then
                 echo "  HW OK: batch_${idx}"
             elif [[ $rc -eq 124 ]]; then
@@ -478,7 +501,7 @@ if $MULTI_TILE; then
                 return 0
             fi
 
-            XDNA_EMU="${XDNA_EMU:-debug}" "$HOST_BIN" \
+            XDNA_EMU="$EMU_PROFILE" "$HOST_BIN" \
                 -x "${phase_dir}/aie.xclbin" \
                 -k MLIR_AIE \
                 -i "${phase_dir}/insts.bin" \
@@ -488,7 +511,7 @@ if $MULTI_TILE; then
                 echo "  EMU FAIL: phase_${pidx} (see ${RESULTS_DIR}/phase_${pidx}_emu.log)"
         }
         export -f run_emu_phase
-        export HOST_BIN OUT_DIR RESULTS_DIR SEED MANIFEST
+        export HOST_BIN OUT_DIR RESULTS_DIR SEED EMU_PROFILE MANIFEST EMU_PROFILE
 
         # Build argument list: pidx batch_list in_size out_size (null-separated).
         printf '%b' "$PHASE_INFO" | while IFS=' ' read -r pidx batch_list; do
@@ -527,7 +550,7 @@ else
                 return 0
             fi
 
-            XDNA_EMU="${XDNA_EMU:-debug}" "$HOST_BIN" \
+            XDNA_EMU="$EMU_PROFILE" "$HOST_BIN" \
                 -x "${batch_dir}/aie.xclbin" \
                 -k MLIR_AIE \
                 -i "${batch_dir}/insts.bin" \
@@ -537,7 +560,7 @@ else
                 echo "  EMU FAIL: batch_${idx} (see ${RESULTS_DIR}/batch_${idx}_emu.log)"
         }
         export -f run_emu_one
-        export HOST_BIN OUT_DIR RESULTS_DIR SEED
+        export HOST_BIN OUT_DIR RESULTS_DIR SEED EMU_PROFILE
 
         echo "$BATCH_INFO" | while IFS=' ' read -r idx filename in_size out_size source_type; do
             # Skip pair batches in single-tile mode.
