@@ -1435,6 +1435,29 @@ def generate_test_point(
         lines.extend(load_lines)
         cur_in_offset += _operand_size(op, name)
 
+    # Mask VEXTRACT/VINSERT/VEXTBCST index registers to valid element range.
+    # Unbounded indices from random test data cause hardware hangs (TDR).
+    # Note: VEXTRACT still hangs on HW even with bounded indices (see batch
+    # 35/36 investigation). The masking is retained for correctness when/if
+    # the root cause is found.
+    if name.startswith(("VEXTRACT", "VINSERT", "VEXTBCST")):
+        # Determine max valid index from element size suffix.
+        if any(name.endswith(s) for s in ("_D64", "_S64", "64")):
+            max_idx = 3   # 4 x 64-bit elements
+        elif any(name.endswith(s) for s in ("_D32", "_S32", "32")):
+            max_idx = 7   # 8 x 32-bit elements
+        elif any(name.endswith(s) for s in ("_D16", "_S16", "16")):
+            max_idx = 15  # 16 x 16-bit elements
+        else:
+            max_idx = 31  # 32 x 8-bit elements
+        # Find the index register: operand named "idx" with ERS4 kind.
+        idx_op = op_by_name.get("idx", {})
+        if idx_op.get("register_kind") in ("ERS4",):
+            idx_reg = regs.get("idx", "r16")
+            # AIE2 AND is register-only; load mask into r14 first.
+            lines.append(f"  mov r14, #{max_idx}")
+            lines.append(f"  and {idx_reg}, {idx_reg}, r14")
+
     # NOP sled before instruction: must cover load pipeline latency.
     # AIE2 lda/vlda latency is 7 cycles (from AIE2Schedule.td).
     lines.extend(_nop_sled(LOAD_LATENCY))
