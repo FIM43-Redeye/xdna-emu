@@ -855,6 +855,7 @@ impl InstructionDecoder {
             InstrMemWidth::Byte => MemWidth::Byte,
             InstrMemWidth::HalfWord => MemWidth::HalfWord,
             InstrMemWidth::Word => MemWidth::Word,
+            InstrMemWidth::QuadWord => MemWidth::QuadWord,
             InstrMemWidth::Vector256 => MemWidth::Vector256,
         };
         slot_op.branch_condition = enc.branch_condition;

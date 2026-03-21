@@ -60,6 +60,7 @@ pub enum AddressingMode {
 /// - `lda.s8` / `lda.u8` -> Byte (8-bit)
 /// - `lda.s16` / `lda.u16` -> HalfWord (16-bit)
 /// - `lda` (no suffix) -> Word (32-bit)
+/// - `vlda.128` / `vldb.128` / `vst.128` -> QuadWord (128-bit)
 /// - `vlda` / `vldb` / `vst` -> Vector256 (256-bit)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InstrMemWidth {
@@ -67,6 +68,8 @@ pub enum InstrMemWidth {
     HalfWord,
     #[default]
     Word,
+    /// 128-bit quadword access (vlda.128, vst.128, etc.)
+    QuadWord,
     Vector256,
 }
 
@@ -96,13 +99,19 @@ pub fn detect_addressing_mode(instr_name: &str) -> AddressingMode {
 /// Detect memory access width from the instruction mnemonic.
 ///
 /// Uses the assembly mnemonic suffix convention: `.s8`, `.u16`, etc.
-/// Vector operations (`vlda`, `vldb`, `vst`) are always 256-bit.
+/// Vector operations (`vlda`, `vldb`, `vst`) are normally 256-bit,
+/// but `.128` variants load/store only 128 bits (lower half of vector reg).
 pub fn detect_mem_width(mnemonic: &str) -> InstrMemWidth {
     let lower = mnemonic.to_lowercase();
     if lower.starts_with("vlda") || lower.starts_with("vldb")
         || lower.starts_with("vst")
     {
-        InstrMemWidth::Vector256
+        // Check for 128-bit variant before defaulting to 256-bit.
+        if lower.contains(".128") || lower.contains("_128") {
+            InstrMemWidth::QuadWord
+        } else {
+            InstrMemWidth::Vector256
+        }
     } else if lower.contains(".s8") || lower.contains(".u8") {
         InstrMemWidth::Byte
     } else if lower.contains(".s16") || lower.contains(".u16") {

@@ -225,7 +225,11 @@ pub fn detect_addressing_mode(instr_name: &str) -> String {
 pub fn detect_mem_width(mnemonic: &str) -> String {
     let lower = mnemonic.to_lowercase();
     if lower.starts_with("vlda") || lower.starts_with("vldb") || lower.starts_with("vst") {
-        "InstrMemWidth::Vector256"
+        if lower.contains(".128") || lower.contains("_128") {
+            "InstrMemWidth::QuadWord"
+        } else {
+            "InstrMemWidth::Vector256"
+        }
     } else if lower.contains(".s8") || lower.contains(".u8") {
         "InstrMemWidth::Byte"
     } else if lower.contains(".s16") || lower.contains(".u16") {
