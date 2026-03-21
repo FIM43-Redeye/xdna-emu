@@ -1008,20 +1008,19 @@ impl VectorAlu {
 
     /// Shift-Round-Saturate: convert accumulator lanes to narrower vector output.
     ///
+    /// The accumulator always has 8 lanes of 64-bit each (one value per u64).
+    /// SRS reads 8 accumulator values and converts them to narrower output,
+    /// packing multiple values per u32 word for 16-bit and 8-bit outputs.
+    ///
     /// Delegates to the `vector_srs` module which implements the full 10-mode
     /// SRS pipeline (shift, round, saturate) per AIE2 hardware specification.
     /// Float types (BFloat16, Float32) are handled inline since they bypass
     /// the integer rounding pipeline.
-    ///
-    /// Accumulator packing convention:
-    ///   Acc32 (from_type=Int32): two 32-bit values packed per u64 word
-    ///     acc[i] = (lane[2i+1] << 32) | lane[2i]
-    ///   Acc64 (from_type=Int64 or Float): one value per u64 word
     fn vector_srs(
         ctx: &ExecutionContext,
         acc_reg: u8,
         shift: u32,
-        from_type: ElementType,
+        _from_type: ElementType,
         to_type: ElementType,
     ) -> [u32; 8] {
         let acc = ctx.accumulator.read(acc_reg);
@@ -1039,134 +1038,64 @@ impl VectorAlu {
             ElementType::Int8 | ElementType::Int16 | ElementType::Int32
         );
 
-        // Determine accumulator mode from from_type.
-        // Acc32: from_type is Int32/UInt32 -> 32-bit lanes packed 2 per u64.
-        // Acc64: from_type is Int64 or float -> 64-bit lanes, 1 per u64.
-        let acc32_mode = matches!(
-            from_type,
-            ElementType::Int32 | ElementType::UInt32
-                | ElementType::Int16 | ElementType::UInt16
-                | ElementType::Int8 | ElementType::UInt8
-        );
-
-        if acc32_mode {
-            // Acc32: 16 lanes of 32-bit packed 2 per u64.
-            // Unpack all 16 lanes, then SRS to output width and repack.
-            let mut lanes = [0i64; 16];
-            for i in 0..8 {
-                let lo = (acc[i] & 0xFFFF_FFFF) as u32;
-                let hi = (acc[i] >> 32) as u32;
-                // Sign-extend the 32-bit values to i64 for SRS.
-                lanes[i * 2] = lo as i32 as i64;
-                lanes[i * 2 + 1] = hi as i32 as i64;
-            }
-
-            match to_type {
-                ElementType::Int32 | ElementType::UInt32 => {
-                    // 16 x 32-bit acc -> 8 x 32-bit output (only lower 8 lanes)
-                    for i in 0..8 {
-                        let out = vector_srs::srs_lane(
-                            lanes[i], shift, signed_output, 32,
-                            saturate, sym_sat, mode,
-                        );
-                        result[i] = out as u32;
-                    }
-                }
-                ElementType::Int16 | ElementType::UInt16 => {
-                    // 16 x 32-bit acc -> 16 x 16-bit output (pack 2 per u32)
-                    for i in 0..8 {
-                        let out0 = vector_srs::srs_lane(
-                            lanes[i * 2], shift, signed_output, 16,
-                            saturate, sym_sat, mode,
-                        );
-                        let out1 = vector_srs::srs_lane(
-                            lanes[i * 2 + 1], shift, signed_output, 16,
-                            saturate, sym_sat, mode,
-                        );
-                        result[i] = (out0 as u16 as u32) | ((out1 as u16 as u32) << 16);
-                    }
-                }
-                ElementType::Int8 | ElementType::UInt8 => {
-                    // 16 x 32-bit acc -> 16 x 8-bit output (pack 4 per u32)
-                    for i in 0..4 {
-                        let mut word = 0u32;
-                        for j in 0..4 {
-                            let lane = i * 4 + j;
-                            if lane < 16 {
-                                let out = vector_srs::srs_lane(
-                                    lanes[lane], shift, signed_output, 8,
-                                    saturate, sym_sat, mode,
-                                );
-                                word |= (out as u8 as u32) << (j * 8);
-                            }
-                        }
-                        result[i] = word;
-                    }
-                }
-                _ => {
-                    // Float types don't use Acc32 mode in practice.
-                    log::warn!("[VECTOR] SRS: unexpected float output from Acc32 mode");
+        // 8 accumulator lanes, each u64 holds one value.
+        match to_type {
+            ElementType::Int32 | ElementType::UInt32 => {
+                for i in 0..8 {
+                    let val = acc[i] as i64;
+                    let out = vector_srs::srs_lane(
+                        val, shift, signed_output, 32,
+                        saturate, sym_sat, mode,
+                    );
+                    result[i] = out as u32;
                 }
             }
-        } else {
-            // Acc64: 8 lanes of 64-bit, one per u64 word.
-            match to_type {
-                ElementType::Int32 | ElementType::UInt32 => {
-                    for i in 0..8 {
-                        let val = acc[i] as i64;
-                        let out = vector_srs::srs_lane(
-                            val, shift, signed_output, 32,
-                            saturate, sym_sat, mode,
-                        );
-                        result[i] = out as u32;
-                    }
+            ElementType::Int16 | ElementType::UInt16 => {
+                // 8 acc lanes -> 8 x 16-bit, packed 2 per u32 (4 words used)
+                for i in 0..4 {
+                    let val0 = acc[i * 2] as i64;
+                    let val1 = acc[i * 2 + 1] as i64;
+                    let out0 = vector_srs::srs_lane(
+                        val0, shift, signed_output, 16,
+                        saturate, sym_sat, mode,
+                    );
+                    let out1 = vector_srs::srs_lane(
+                        val1, shift, signed_output, 16,
+                        saturate, sym_sat, mode,
+                    );
+                    result[i] = (out0 as u16 as u32) | ((out1 as u16 as u32) << 16);
                 }
-                ElementType::Int16 | ElementType::UInt16 => {
-                    for i in 0..4 {
-                        let val0 = acc[i * 2] as i64;
-                        let val1 = acc[i * 2 + 1] as i64;
-                        let out0 = vector_srs::srs_lane(
-                            val0, shift, signed_output, 16,
-                            saturate, sym_sat, mode,
-                        );
-                        let out1 = vector_srs::srs_lane(
-                            val1, shift, signed_output, 16,
-                            saturate, sym_sat, mode,
-                        );
-                        result[i] = (out0 as u16 as u32) | ((out1 as u16 as u32) << 16);
-                    }
-                }
-                ElementType::Int8 | ElementType::UInt8 => {
-                    for i in 0..2 {
-                        let mut word = 0u32;
-                        for j in 0..4 {
-                            let lane = i * 4 + j;
-                            if lane < 8 {
-                                let val = acc[lane] as i64;
-                                let out = vector_srs::srs_lane(
-                                    val, shift, signed_output, 8,
-                                    saturate, sym_sat, mode,
-                                );
-                                word |= (out as u8 as u32) << (j * 8);
-                            }
+            }
+            ElementType::Int8 | ElementType::UInt8 => {
+                for i in 0..2 {
+                    let mut word = 0u32;
+                    for j in 0..4 {
+                        let lane = i * 4 + j;
+                        if lane < 8 {
+                            let val = acc[lane] as i64;
+                            let out = vector_srs::srs_lane(
+                                val, shift, signed_output, 8,
+                                saturate, sym_sat, mode,
+                            );
+                            word |= (out as u8 as u32) << (j * 8);
                         }
-                        result[i] = word;
                     }
+                    result[i] = word;
                 }
-                ElementType::BFloat16 => {
-                    for i in 0..4 {
-                        let f0 = f64::from_bits(acc[i * 2]) as f32;
-                        let f1 = f64::from_bits(acc[i * 2 + 1]) as f32;
-                        let bf0 = Self::f32_to_bf16(f0);
-                        let bf1 = Self::f32_to_bf16(f1);
-                        result[i] = (bf0 as u32) | ((bf1 as u32) << 16);
-                    }
+            }
+            ElementType::BFloat16 => {
+                for i in 0..4 {
+                    let f0 = f64::from_bits(acc[i * 2]) as f32;
+                    let f1 = f64::from_bits(acc[i * 2 + 1]) as f32;
+                    let bf0 = Self::f32_to_bf16(f0);
+                    let bf1 = Self::f32_to_bf16(f1);
+                    result[i] = (bf0 as u32) | ((bf1 as u32) << 16);
                 }
-                ElementType::Float32 => {
-                    for i in 0..8 {
-                        let f = f64::from_bits(acc[i]) as f32;
-                        result[i] = f.to_bits();
-                    }
+            }
+            ElementType::Float32 => {
+                for i in 0..8 {
+                    let f = f64::from_bits(acc[i]) as f32;
+                    result[i] = f.to_bits();
                 }
             }
         }
@@ -3465,10 +3394,9 @@ mod tests {
     }
 
     #[test]
-    fn test_vector_srs_int32_acc64() {
+    fn test_vector_srs_int32() {
         let mut ctx = make_ctx();
-        // Set up accumulator with Acc64 values (one 64-bit value per lane).
-        // from_type = Int64 selects Acc64 mode in SRS.
+        // Accumulator: one value per u64 lane.
         ctx.accumulator.write(0, [256, 512, 768, 1024, 1280, 1536, 1792, 2048]);
 
         let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Srs)
@@ -3476,8 +3404,7 @@ mod tests {
             .with_dest(Operand::VectorReg(0))
             .with_source(Operand::AccumReg(0))
             .with_source(Operand::Immediate(4)); // Shift right by 4
-        // Acc64 mode: each u64 lane holds one value.
-        op.from_type = Some(ElementType::Float32); // Float triggers Acc64 path
+        op.from_type = Some(ElementType::Int32);
 
         VectorAlu::execute(&op, &mut ctx);
         let result = ctx.vector.read(0);
@@ -3489,24 +3416,20 @@ mod tests {
     }
 
     #[test]
-    fn test_vector_srs_int16_acc32() {
+    fn test_vector_ups_srs_roundtrip() {
         let mut ctx = make_ctx();
-        // Set up accumulator in Acc32 mode: two 32-bit values packed per u64.
-        // vups.s32.s16 then vsrs.s16.s32 round-trip test.
-        // Input: 16 x i16 values [1, 2, 3, ..., 16] packed via UPS.
-        let mut src = [0u32; 8];
-        for i in 0..8u32 {
-            let lo = (i * 2 + 1) as u16;
-            let hi = (i * 2 + 2) as u16;
-            src[i as usize] = (lo as u32) | ((hi as u32) << 16);
-        }
-        // UPS with shift=0
+        // UPS+SRS round-trip: 16 x i16 input, UPS processes lower 8 lanes,
+        // SRS converts back to i16. Only the lower 4 output words should
+        // match the lower 4 input words (8 x i16 -> 8 acc lanes -> 8 x i16).
+        let src = [0x0002_0001u32, 0x0004_0003, 0x0006_0005, 0x0008_0007,
+                    0x000A_0009, 0x000C_000B, 0x000E_000D, 0x0010_000F];
+        // UPS with shift=0: sign-extend 8 i16 values to i32 in accumulator
         let acc = super::vector_ups::ups_vector_to_acc(
             &src, 0, ElementType::Int16, ElementType::Int32,
         );
         ctx.accumulator.write(0, acc);
 
-        // SRS with shift=0, from_type=Int32 (Acc32 mode)
+        // SRS with shift=0
         let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Srs)
             .as_vector(ElementType::Int16)
             .with_dest(Operand::VectorReg(0))
@@ -3516,8 +3439,15 @@ mod tests {
 
         VectorAlu::execute(&op, &mut ctx);
         let result = ctx.vector.read(0);
-        // Should recover original values (identity round-trip).
-        assert_eq!(result, src, "UPS->SRS roundtrip should be identity");
+        // 8 acc lanes produce 8 x i16 packed into 4 u32 words.
+        // UPS processes lanes 0-7 (first 8 of 16 input lanes).
+        // Lanes 0-7 are: 1,2, 3,4, 5,6, 7,8
+        assert_eq!(result[0], 0x0002_0001, "lanes 0-1");
+        assert_eq!(result[1], 0x0004_0003, "lanes 2-3");
+        assert_eq!(result[2], 0x0006_0005, "lanes 4-5");
+        assert_eq!(result[3], 0x0008_0007, "lanes 6-7");
+        // Upper words are zero (only 8 lanes processed)
+        assert_eq!(result[4], 0, "upper should be zero");
     }
 
     #[test]
