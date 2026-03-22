@@ -19,6 +19,8 @@
 //! Hardware reference: mulmac.py (read for understanding, original implementation).
 
 use crate::interpreter::bundle::ElementType;
+use crate::interpreter::execute::vector_config::{AccWidth, MatMulConfig};
+use crate::interpreter::state::{Vec512, Acc1024};
 
 /// Tile geometry for a matrix multiply mode.
 #[derive(Debug, Clone, Copy)]
@@ -163,6 +165,206 @@ pub fn matmul_sub(
         ElementType::Int32 => matmul_i32xi16(acc, a, b, true, true, true),
         ElementType::UInt32 => matmul_i32xi16(acc, a, b, false, false, true),
         ElementType::Float32 => matmul_bf16xbf16(acc, a, b, true),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Config-driven full-width matmul (512-bit inputs, 1024-bit accumulator)
+// ---------------------------------------------------------------------------
+
+/// Extract an element from a 512-bit vector (`Vec512` = `[u32; 16]`).
+///
+/// `byte_idx` is the byte offset within the full 64-byte vector.
+fn extract_element_512(src: &Vec512, byte_idx: usize, bits: u32, signed: bool) -> i64 {
+    match bits {
+        4 => {
+            // 4-bit elements: two per byte
+            let byte_pos = byte_idx / 2;
+            let nibble = byte_idx % 2;
+            let word = byte_pos / 4;
+            let byte_in_word = byte_pos % 4;
+            let raw_byte = ((src[word] >> (byte_in_word * 8)) & 0xFF) as u8;
+            let val = if nibble == 0 { raw_byte & 0xF } else { (raw_byte >> 4) & 0xF };
+            if signed && (val & 0x8) != 0 {
+                // Sign-extend from 4 bits
+                (val as i8 | !0xFu8 as i8) as i64
+            } else {
+                val as i64
+            }
+        }
+        8 => {
+            let word = byte_idx / 4;
+            let byte_in_word = byte_idx % 4;
+            let val = ((src[word] >> (byte_in_word * 8)) & 0xFF) as u8;
+            if signed { val as i8 as i64 } else { val as i64 }
+        }
+        16 => {
+            let elem_idx = byte_idx / 2;
+            let word = elem_idx / 2;
+            let half_in_word = elem_idx % 2;
+            let val = ((src[word] >> (half_in_word * 16)) & 0xFFFF) as u16;
+            if signed { val as i16 as i64 } else { val as i64 }
+        }
+        32 => {
+            let word = byte_idx / 4;
+            let val = src[word];
+            if signed { val as i32 as i64 } else { val as i64 }
+        }
+        _ => 0,
+    }
+}
+
+/// Read from a 1024-bit accumulator (`Acc1024` = `[u64; 16]`).
+fn read_acc_wide(acc: &Acc1024, index: usize, acc_width: AccWidth) -> i64 {
+    match acc_width {
+        AccWidth::Acc32 => {
+            // 32 x 32-bit lanes packed into 16 u64 words (two per word)
+            let u64_lane = index / 2;
+            let half = index % 2;
+            let bits = ((acc[u64_lane] >> (half * 32)) & 0xFFFF_FFFF) as u32;
+            bits as i32 as i64
+        }
+        AccWidth::Acc64 => {
+            // 16 x 64-bit lanes, one per u64 word
+            acc[index] as i64
+        }
+    }
+}
+
+/// Write to a 1024-bit accumulator (`Acc1024` = `[u64; 16]`).
+fn write_acc_wide(acc: &mut Acc1024, index: usize, value: i64, acc_width: AccWidth) {
+    match acc_width {
+        AccWidth::Acc32 => {
+            let u64_lane = index / 2;
+            let half = index % 2;
+            let masked = (value as u32) as u64;
+            let shift = half * 32;
+            acc[u64_lane] = (acc[u64_lane] & !(0xFFFF_FFFF_u64 << shift)) | (masked << shift);
+        }
+        AccWidth::Acc64 => {
+            acc[index] = value as u64;
+        }
+    }
+}
+
+/// Write an fp32 value to a wide accumulator.
+fn write_acc_wide_f32(acc: &mut Acc1024, index: usize, value: f32) {
+    // bf16 mode always uses acc_cmb=1 (32-bit lanes)
+    let u64_lane = index / 2;
+    let half = index % 2;
+    let bits = value.to_bits() as u64;
+    let shift = half * 32;
+    acc[u64_lane] = (acc[u64_lane] & !(0xFFFF_FFFF_u64 << shift)) | (bits << shift);
+}
+
+/// Read an fp32 value from a wide accumulator.
+fn read_acc_wide_f32(acc: &Acc1024, index: usize) -> f32 {
+    let u64_lane = index / 2;
+    let half = index % 2;
+    let bits = ((acc[u64_lane] >> (half * 32)) & 0xFFFF_FFFF) as u32;
+    f32::from_bits(bits)
+}
+
+/// Config-driven matrix multiply on full-width (512-bit) inputs.
+///
+/// Reads element data from the 512-bit A and B vectors, performs a tiled
+/// matrix multiply according to the geometry in `config`, and writes the
+/// result to the 1024-bit accumulator.
+///
+/// The input vectors are interpreted as flat arrays of elements in
+/// row-major order:
+/// - A[r][k] at byte offset `(r * inner + k) * (bits_x / 8)`
+/// - B[k][c] at byte offset `(k * cols + c) * (bits_y / 8)`
+///
+/// Output goes to accumulator lane `r * cols + c`.
+pub fn matmul_config_driven(
+    acc: &mut Acc1024,
+    a: &Vec512,
+    b: &Vec512,
+    config: &MatMulConfig,
+) {
+    let rows = config.rows as usize;
+    let inner = config.inner as usize;
+    let cols = config.cols as usize;
+    let bits_x = config.a_type.bits() as u32;
+    let bits_y = config.b_type.bits() as u32;
+    let bytes_x = (bits_x / 8) as usize;
+    let bytes_y = if bits_y == 4 { 1 } else { (bits_y / 8) as usize }; // 4-bit: 2 elements per byte
+
+    // Zero accumulator if requested (zero_acc = !accumulate in MatMulConfig)
+    if !config.accumulate {
+        *acc = [0u64; 16];
+    }
+
+    if config.bfloat {
+        // BFloat16 path: extract bf16 as f32, accumulate in fp32
+        for r in 0..rows {
+            for c in 0..cols {
+                let out_idx = r * cols + c;
+                let mut sum: f32 = 0.0;
+
+                for k in 0..inner {
+                    let a_byte = (r * inner + k) * bytes_x;
+                    let b_byte = (k * cols + c) * bytes_y;
+
+                    // Extract bf16 elements: byte offset / 2 gives the bf16 index
+                    let a_elem_idx = a_byte / 2;
+                    let b_elem_idx = b_byte / 2;
+                    // Vec512 has 16 u32 words = 32 bf16 elements; index directly
+                    let a_word = a_elem_idx / 2;
+                    let a_half = a_elem_idx % 2;
+                    let b_word = b_elem_idx / 2;
+                    let b_half = b_elem_idx % 2;
+                    let a_bits = ((a[a_word] >> (a_half * 16)) & 0xFFFF) as u16;
+                    let b_bits = ((b[b_word] >> (b_half * 16)) & 0xFFFF) as u16;
+                    let a_val = f32::from_bits((a_bits as u32) << 16);
+                    let b_val = f32::from_bits((b_bits as u32) << 16);
+
+                    sum += a_val * b_val;
+                }
+
+                let prev = read_acc_wide_f32(acc, out_idx);
+                if config.subtract {
+                    write_acc_wide_f32(acc, out_idx, prev - sum);
+                } else {
+                    write_acc_wide_f32(acc, out_idx, prev + sum);
+                }
+            }
+        }
+        return;
+    }
+
+    // Integer path
+    for r in 0..rows {
+        for c in 0..cols {
+            let out_idx = r * cols + c;
+            let mut sum: i64 = 0;
+
+            for k in 0..inner {
+                let a_byte = if bits_x == 4 {
+                    (r * inner + k) / 2
+                } else {
+                    (r * inner + k) * bytes_x
+                };
+                let b_byte = if bits_y == 4 {
+                    (k * cols + c) / 2
+                } else {
+                    (k * cols + c) * bytes_y
+                };
+
+                let a_val = extract_element_512(a, a_byte, bits_x, config.x_signed);
+                let b_val = extract_element_512(b, b_byte, bits_y, config.y_signed);
+
+                sum += a_val * b_val;
+            }
+
+            let prev = read_acc_wide(acc, out_idx, config.acc_width);
+            if config.subtract {
+                write_acc_wide(acc, out_idx, prev - sum, config.acc_width);
+            } else {
+                write_acc_wide(acc, out_idx, prev + sum, config.acc_width);
+            }
+        }
     }
 }
 
