@@ -16,6 +16,12 @@
 
 use std::fmt;
 
+/// 512-bit vector data: two consecutive 256-bit w-registers.
+pub type Vec512 = [u32; 16];
+
+/// 1024-bit accumulator data: two consecutive 512-bit bm-registers.
+pub type Acc1024 = [u64; 16];
+
 /// Number of scalar registers including special-purpose slots.
 /// Indices 0-31 are GPRs (r0-r31); 32-47 are special registers.
 pub const NUM_SCALAR_REGS: usize = 48;
@@ -380,6 +386,40 @@ impl VectorRegisterFile {
         }
         self.write(reg, words);
     }
+
+    /// Read a 512-bit x-register (two consecutive w-registers).
+    ///
+    /// The decoder maps x0 -> vreg 0, x1 -> vreg 2, etc. (reg * 2).
+    /// `base_reg` is already the decoded index (0, 2, 4, ...) -- the caller
+    /// is responsible for the x -> w mapping before calling here.
+    pub fn read_wide(&self, base_reg: u8) -> Vec512 {
+        debug_assert!(
+            base_reg % 2 == 0,
+            "wide vector read from odd base register {}",
+            base_reg
+        );
+        let lo = self.read(base_reg);
+        let hi = self.read(base_reg + 1);
+        let mut result = [0u32; 16];
+        result[..8].copy_from_slice(&lo);
+        result[8..].copy_from_slice(&hi);
+        result
+    }
+
+    /// Write a 512-bit x-register (split across two consecutive w-registers).
+    pub fn write_wide(&mut self, base_reg: u8, data: Vec512) {
+        debug_assert!(
+            base_reg % 2 == 0,
+            "wide vector write to odd base register {}",
+            base_reg
+        );
+        let mut lo = [0u32; 8];
+        let mut hi = [0u32; 8];
+        lo.copy_from_slice(&data[..8]);
+        hi.copy_from_slice(&data[8..]);
+        self.write(base_reg, lo);
+        self.write(base_reg + 1, hi);
+    }
 }
 
 impl fmt::Debug for VectorRegisterFile {
@@ -470,6 +510,39 @@ impl AccumulatorRegisterFile {
         for (lane, val) in values.iter().enumerate() {
             self.regs[idx][lane] = self.regs[idx][lane].wrapping_add(*val);
         }
+    }
+
+    /// Read a 1024-bit cm-register (two consecutive bm-registers).
+    ///
+    /// cm0 = (acc0, acc1), cm2 = (acc2, acc3), etc.
+    /// `base_reg` must be even (hardware enforces pair alignment).
+    pub fn read_wide(&self, base_reg: u8) -> Acc1024 {
+        debug_assert!(
+            base_reg % 2 == 0,
+            "wide accum read from odd base register {}",
+            base_reg
+        );
+        let lo = self.read(base_reg);
+        let hi = self.read(base_reg + 1);
+        let mut result = [0u64; 16];
+        result[..8].copy_from_slice(&lo);
+        result[8..].copy_from_slice(&hi);
+        result
+    }
+
+    /// Write a 1024-bit cm-register (split across two consecutive bm-registers).
+    pub fn write_wide(&mut self, base_reg: u8, data: Acc1024) {
+        debug_assert!(
+            base_reg % 2 == 0,
+            "wide accum write to odd base register {}",
+            base_reg
+        );
+        let mut lo = [0u64; 8];
+        let mut hi = [0u64; 8];
+        lo.copy_from_slice(&data[..8]);
+        hi.copy_from_slice(&data[8..]);
+        self.write(base_reg, lo);
+        self.write(base_reg + 1, hi);
     }
 }
 
@@ -783,6 +856,46 @@ mod tests {
 
         regs.write_lane(2, 5, 0xCAFE_BABE_DEAD_BEEF);
         assert_eq!(regs.read_lane(2, 5), 0xCAFE_BABE_DEAD_BEEF);
+    }
+
+    // ========== Wide Register Tests ==========
+
+    #[test]
+    fn test_vector_read_wide() {
+        let mut vrf = VectorRegisterFile::new();
+        vrf.write(0, [1, 2, 3, 4, 5, 6, 7, 8]);
+        vrf.write(1, [9, 10, 11, 12, 13, 14, 15, 16]);
+        let wide = vrf.read_wide(0);
+        assert_eq!(wide, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+    }
+
+    #[test]
+    fn test_vector_write_wide() {
+        let mut vrf = VectorRegisterFile::new();
+        let data: [u32; 16] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160];
+        vrf.write_wide(0, data);
+        assert_eq!(vrf.read(0), [10, 20, 30, 40, 50, 60, 70, 80]);
+        assert_eq!(vrf.read(1), [90, 100, 110, 120, 130, 140, 150, 160]);
+    }
+
+    #[test]
+    fn test_accum_read_wide() {
+        let mut arf = AccumulatorRegisterFile::new();
+        arf.write(0, [100, 200, 300, 400, 500, 600, 700, 800]);
+        arf.write(1, [900, 1000, 1100, 1200, 1300, 1400, 1500, 1600]);
+        let wide = arf.read_wide(0);
+        assert_eq!(wide, [100, 200, 300, 400, 500, 600, 700, 800,
+                           900, 1000, 1100, 1200, 1300, 1400, 1500, 1600]);
+    }
+
+    #[test]
+    fn test_accum_write_wide() {
+        let mut arf = AccumulatorRegisterFile::new();
+        let mut data = [0u64; 16];
+        for i in 0..16 { data[i] = (i as u64 + 1) * 10; }
+        arf.write_wide(0, data);
+        assert_eq!(arf.read(0), [10, 20, 30, 40, 50, 60, 70, 80]);
+        assert_eq!(arf.read(1), [90, 100, 110, 120, 130, 140, 150, 160]);
     }
 
     // ========== TableGen Validation Tests ==========
