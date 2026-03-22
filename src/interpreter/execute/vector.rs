@@ -34,8 +34,6 @@ use crate::interpreter::state::ExecutionContext;
 use crate::interpreter::state::{Vec512, Acc1024};
 use crate::tablegen::SemanticOp;
 
-use super::vector_config::MatMulConfig;
-use super::vector_matmul;
 use super::vector_srs::{self, RoundingMode};
 use super::vector_ups;
 use super::vector_pack;
@@ -63,24 +61,22 @@ impl VectorAlu {
         log::trace!("[VECTOR_ALU] Checking semantic={:?} element_type={:?} dest={:?}",
             semantic, op.element_type, op.dest);
 
-        // TODO: MAC-family operations should use config-word-driven geometry
-        // instead of element-wise multiply. The config word parser exists in
-        // MatMulConfig::from_config_word() but the matmul kernel needs correct
-        // element permutation tables before it can be wired up here.
-        // See: vector_config.rs CONFIG_GEOMETRY_TABLE, vector_matmul.rs matmul_config_driven
+        // Determine if this needs full-width processing:
+        // 1. is_wide_vector: instruction has Vector512 operands (x-registers)
+        // 2. AccumReg-only ops (VADD, VSUB, VNEG on cm-class accumulators)
+        //    don't have Vector512 operands but always operate on 1024-bit
+        //    cm registers.
+        let has_acc_source = op.sources.iter()
+            .any(|s| matches!(s, Operand::AccumReg(_)));
+        let has_vec_source = op.sources.iter()
+            .any(|s| matches!(s, Operand::VectorReg(_)));
+        let is_accum_only = has_acc_source && !has_vec_source;
 
-        // Process the low 256-bit half.
-        let handled = Self::execute_half(op, ctx, semantic, et);
-
-        // For 512-bit (x-register) operations, also process the high half.
-        // Create a temporary op with all VectorReg indices incremented by 1.
-        if handled && op.is_wide_vector {
-            let mut hi_op = op.clone();
-            Self::increment_vector_regs(&mut hi_op);
-            Self::execute_half(&hi_op, ctx, semantic, et);
+        if op.is_wide_vector || is_accum_only {
+            Self::execute_wide(op, ctx, semantic, et)
+        } else {
+            Self::execute_half(op, ctx, semantic, et)
         }
-
-        handled
     }
 
     /// Increment all VectorReg indices by 1 (low half -> high half).
@@ -775,130 +771,7 @@ impl VectorAlu {
         }
     }
 
-    /// Check if a semantic operation is a MAC-family instruction.
-    fn is_mac_family(semantic: SemanticOp) -> bool {
-        matches!(
-            semantic,
-            SemanticOp::Mac
-                | SemanticOp::MatMul
-                | SemanticOp::MatMulSub
-                | SemanticOp::NegMatMul
-                | SemanticOp::AddMac
-                | SemanticOp::SubMac
-        )
-    }
-
-    /// Execute a MAC-family instruction with config-word-driven geometry.
-    ///
-    /// Unlike simple vector ops that can be split into independent 256-bit
-    /// halves, MAC operations read full 512-bit vectors and write 1024-bit
-    /// accumulators. The config word (from a scalar register) selects the
-    /// tile geometry and operational flags.
-    fn execute_mac_config_driven(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        semantic: SemanticOp,
-        et: ElementType,
-    ) -> bool {
-        // Extract config register value from sources.
-        let conf_val = match Self::get_config_register(op, ctx) {
-            Some(v) => v,
-            None => {
-                // No config register present (unit tests or legacy path).
-                // Fall back to the old element-wise / half-split behavior.
-                return Self::execute_mac_legacy(op, ctx, semantic, et);
-            }
-        };
-
-        // Determine if this is a bf16 instruction.
-        let is_bf16 = matches!(et, ElementType::BFloat16 | ElementType::Float32)
-            || op.encoding_name.as_ref().map_or(false, |n| n.contains(".f"));
-
-        // Parse config word into geometry and flags.
-        let mut config = match MatMulConfig::from_config_word(conf_val, is_bf16) {
-            Some(c) => c,
-            None => {
-                // Unknown geometry -- fall back to element-wise MAC.
-                // This happens when the config word encodes an invalid
-                // (amode, bmode, variant) triple.
-                log::trace!(
-                    "[VECTOR_MAC] unknown config word 0x{:08x} (amode={}, bmode={}, variant={}), \
-                     falling back to element-wise",
-                    conf_val,
-                    (conf_val >> 1) & 3,
-                    (conf_val >> 3) & 3,
-                    (conf_val >> 5) & 7,
-                );
-                return Self::execute_mac_legacy(op, ctx, semantic, et);
-            }
-        };
-
-        log::trace!(
-            "[VECTOR_MAC] config=0x{:08x} -> {}x{}x{} bits_x={} bits_y={} \
-             signed=({},{}) acc_width={:?} accum={} sub={}",
-            conf_val,
-            config.rows, config.inner, config.cols,
-            config.a_type.bits(), config.b_type.bits(),
-            config.x_signed, config.y_signed,
-            config.acc_width, config.accumulate, config.subtract,
-        );
-
-        // Override subtract flag based on instruction type.
-        match semantic {
-            SemanticOp::MatMulSub => config.subtract = true,
-            SemanticOp::NegMatMul => config.subtract = !config.subtract,
-            _ => {}
-        }
-
-        // Get accumulator register index. For cm registers, the low half
-        // is acc_reg and the high half is acc_reg + 1.
-        let acc_reg = Self::get_acc_dest(op);
-        let acc_lo_reg = acc_reg;
-        let acc_hi_reg = acc_reg + 1;
-
-        // Read current accumulator state (both halves for cm register).
-        let mut acc_lo = ctx.accumulator.read(acc_lo_reg);
-        let mut acc_hi = ctx.accumulator.read(acc_hi_reg);
-
-        // Read full 512-bit vector inputs. Each x-register is two
-        // consecutive 256-bit w-registers.
-        let (a_lo, a_hi) = Self::get_wide_vector_source(op, ctx, 0);
-        let (b_lo, b_hi) = Self::get_wide_vector_source(op, ctx, 1);
-
-        // For AddMac/SubMac, handle the second accumulator source.
-        if matches!(semantic, SemanticOp::AddMac | SemanticOp::SubMac) {
-            let acc2_reg = Self::get_acc_source(op);
-            let acc2_lo = ctx.accumulator.read(acc2_reg);
-            let acc2_hi = ctx.accumulator.read(acc2_reg + 1);
-            // Add or subtract the second accumulator.
-            let negate = matches!(semantic, SemanticOp::SubMac);
-            for i in 0..8 {
-                if negate {
-                    acc_lo[i] = acc_lo[i].wrapping_sub(acc2_lo[i]);
-                    acc_hi[i] = acc_hi[i].wrapping_sub(acc2_hi[i]);
-                } else {
-                    acc_lo[i] = acc_lo[i].wrapping_add(acc2_lo[i]);
-                    acc_hi[i] = acc_hi[i].wrapping_add(acc2_hi[i]);
-                }
-            }
-        }
-
-        // Perform the config-driven matrix multiply.
-        vector_matmul::matmul_config_driven(
-            &mut acc_lo, &mut acc_hi,
-            &a_lo, &a_hi,
-            &b_lo, &b_hi,
-            &config,
-        );
-
-        // Write back both accumulator halves.
-        ctx.accumulator.write(acc_lo_reg, acc_lo);
-        ctx.accumulator.write(acc_hi_reg, acc_hi);
-
-        true
-    }
-
-    /// Accumulator-to-accumulator add/subtract.
+/// Accumulator-to-accumulator add/subtract.
     ///
     /// Handles VADD, VSUB, VNEGADD, VNEGSUB and their .f (float) variants.
     /// These take two accumulator (cm-class, 1024-bit) sources and write
@@ -997,28 +870,7 @@ impl VectorAlu {
         }
     }
 
-    /// Legacy MAC execution path: half-split element-wise multiply.
-    ///
-    /// Used when no config register is present (unit tests) or the config
-    /// word encodes an unrecognized geometry.
-    fn execute_mac_legacy(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        semantic: SemanticOp,
-        et: ElementType,
-    ) -> bool {
-        let handled = Self::execute_half(op, ctx, semantic, et);
-
-        if handled && op.is_wide_vector {
-            let mut hi_op = op.clone();
-            Self::increment_vector_regs(&mut hi_op);
-            Self::execute_half(&hi_op, ctx, semantic, et);
-        }
-
-        handled
-    }
-
-    /// Get config register value from a scalar register in sources.
+/// Get config register value from a scalar register in sources.
     ///
     /// The config register is the last scalar register source in the VMAC
     /// instruction (r0-r15 in `vmac cm0, cm0, x0, x0, r0`).
@@ -1033,37 +885,7 @@ impl VectorAlu {
         None
     }
 
-    /// Get a 512-bit wide vector source (two consecutive 256-bit registers).
-    ///
-    /// Returns (low_half, high_half) where each is [u32; 8] = 256 bits.
-    /// For `x0`, this returns (wl0, wh0) = (vreg 0, vreg 1).
-    fn get_wide_vector_source(
-        op: &SlotOp,
-        ctx: &ExecutionContext,
-        source_index: usize,
-    ) -> ([u32; 8], [u32; 8]) {
-        // Find the nth VectorReg source.
-        let mut vec_count = 0;
-        for src in &op.sources {
-            if let Operand::VectorReg(r) = src {
-                if vec_count == source_index {
-                    let lo = ctx.vector.read(*r);
-                    // High half is the next register.
-                    let hi = if op.is_wide_vector {
-                        ctx.vector.read(r + 1)
-                    } else {
-                        [0u32; 8]
-                    };
-                    return (lo, hi);
-                }
-                vec_count += 1;
-            }
-        }
-        // Fallback: return zeros.
-        ([0u32; 8], [0u32; 8])
-    }
-
-    /// Get accumulator destination register.
+/// Get accumulator destination register.
     fn get_acc_dest(op: &SlotOp) -> u8 {
         match &op.dest {
             Some(Operand::AccumReg(r)) => *r,
@@ -3748,6 +3570,236 @@ impl VectorAlu {
     fn get_wide_acc_source(op: &SlotOp, ctx: &ExecutionContext) -> (u8, Acc1024) {
         let reg = Self::get_acc_source(op);
         (reg, ctx.accumulator.read_wide(reg))
+    }
+
+    // ========== Wide dispatch bridges ==========
+
+    /// Bridge: apply a narrow element-wise function to a wide vector.
+    ///
+    /// Splits Vec512 into two [u32; 8] halves, applies the function to
+    /// each half independently, and concatenates the results. Works for
+    /// any operation where each output element depends only on
+    /// corresponding input elements.
+    fn wide_element_wise_unary(
+        a: &Vec512,
+        et: ElementType,
+        op_fn: fn(&[u32; 8], ElementType) -> [u32; 8],
+    ) -> Vec512 {
+        let a_lo: [u32; 8] = a[..8].try_into().unwrap();
+        let a_hi: [u32; 8] = a[8..].try_into().unwrap();
+        let r_lo = op_fn(&a_lo, et);
+        let r_hi = op_fn(&a_hi, et);
+        let mut result = [0u32; 16];
+        result[..8].copy_from_slice(&r_lo);
+        result[8..].copy_from_slice(&r_hi);
+        result
+    }
+
+    /// Bridge: apply a narrow two-input element-wise function to wide vectors.
+    fn wide_element_wise_binary(
+        a: &Vec512,
+        b: &Vec512,
+        et: ElementType,
+        op_fn: fn(&[u32; 8], &[u32; 8], ElementType) -> [u32; 8],
+    ) -> Vec512 {
+        let a_lo: [u32; 8] = a[..8].try_into().unwrap();
+        let a_hi: [u32; 8] = a[8..].try_into().unwrap();
+        let b_lo: [u32; 8] = b[..8].try_into().unwrap();
+        let b_hi: [u32; 8] = b[8..].try_into().unwrap();
+        let r_lo = op_fn(&a_lo, &b_lo, et);
+        let r_hi = op_fn(&a_hi, &b_hi, et);
+        let mut result = [0u32; 16];
+        result[..8].copy_from_slice(&r_lo);
+        result[8..].copy_from_slice(&r_hi);
+        result
+    }
+
+    /// Fallback: split a wide op into two narrow halves.
+    ///
+    /// Used for SemanticOps not yet ported to execute_wide.
+    /// Preserves the old clone+increment behavior.
+    fn execute_wide_fallback(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        semantic: SemanticOp,
+        et: ElementType,
+    ) -> bool {
+        log::trace!(
+            "[VECTOR_WIDE] fallback to half-split for {:?}",
+            semantic
+        );
+        let handled = Self::execute_half(op, ctx, semantic, et);
+        if handled {
+            let mut hi_op = op.clone();
+            Self::increment_vector_regs(&mut hi_op);
+            Self::execute_half(&hi_op, ctx, semantic, et);
+        }
+        handled
+    }
+
+    /// Execute a 512-bit wide vector operation.
+    ///
+    /// Unlike execute_half which processes 256-bit chunks independently,
+    /// this reads full 512-bit inputs and writes full 512-bit outputs.
+    /// Element-wise ops use the bridge to reuse narrow math. Cross-half
+    /// ops have dedicated implementations (added in later tasks).
+    fn execute_wide(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        semantic: SemanticOp,
+        et: ElementType,
+    ) -> bool {
+        match semantic {
+            // ========== Element-wise arithmetic (bridge) ==========
+            SemanticOp::Add => {
+                // Check for VADDSUB (3 vector sources: s1, s2, sel)
+                let vec_source_count = op.sources.iter()
+                    .filter(|s| matches!(s, Operand::VectorReg(_)))
+                    .count();
+                if vec_source_count >= 3 {
+                    // VADDSUB: conditional add/subtract -- use fallback for now
+                    return Self::execute_wide_fallback(op, ctx, semantic, et);
+                }
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_add);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+            SemanticOp::Sub => {
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_sub);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+            SemanticOp::Mul => {
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_mul);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+            SemanticOp::Min => {
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_min);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+            SemanticOp::Max => {
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_max);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+            SemanticOp::Neg => {
+                // Check for accumulator negate (VNEG on cm-class)
+                let has_acc_source = op.sources.iter()
+                    .any(|s| matches!(s, Operand::AccumReg(_)));
+                if has_acc_source {
+                    // Delegate to fallback which calls execute_half's Neg handler
+                    // (it already has accumulator negate logic)
+                    return Self::execute_wide_fallback(op, ctx, semantic, et);
+                }
+                let a = Self::get_wide_vec_source(op, ctx, 0);
+                let result = Self::wide_element_wise_unary(&a, et, Self::vector_negate);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+
+            // ========== Bitwise ops (no ElementType parameter) ==========
+            SemanticOp::And => {
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let a_lo: [u32; 8] = a[..8].try_into().unwrap();
+                let a_hi: [u32; 8] = a[8..].try_into().unwrap();
+                let b_lo: [u32; 8] = b[..8].try_into().unwrap();
+                let b_hi: [u32; 8] = b[8..].try_into().unwrap();
+                let mut result = [0u32; 16];
+                result[..8].copy_from_slice(&Self::vector_bitwise_and(&a_lo, &b_lo));
+                result[8..].copy_from_slice(&Self::vector_bitwise_and(&a_hi, &b_hi));
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+            SemanticOp::Or => {
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let a_lo: [u32; 8] = a[..8].try_into().unwrap();
+                let a_hi: [u32; 8] = a[8..].try_into().unwrap();
+                let b_lo: [u32; 8] = b[..8].try_into().unwrap();
+                let b_hi: [u32; 8] = b[8..].try_into().unwrap();
+                let mut result = [0u32; 16];
+                result[..8].copy_from_slice(&Self::vector_bitwise_or(&a_lo, &b_lo));
+                result[8..].copy_from_slice(&Self::vector_bitwise_or(&a_hi, &b_hi));
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+            SemanticOp::Xor => {
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let a_lo: [u32; 8] = a[..8].try_into().unwrap();
+                let a_hi: [u32; 8] = a[8..].try_into().unwrap();
+                let b_lo: [u32; 8] = b[..8].try_into().unwrap();
+                let b_hi: [u32; 8] = b[8..].try_into().unwrap();
+                let mut result = [0u32; 16];
+                result[..8].copy_from_slice(&Self::vector_bitwise_xor(&a_lo, &b_lo));
+                result[8..].copy_from_slice(&Self::vector_bitwise_xor(&a_hi, &b_hi));
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+            SemanticOp::Not => {
+                let a = Self::get_wide_vec_source(op, ctx, 0);
+                let a_lo: [u32; 8] = a[..8].try_into().unwrap();
+                let a_hi: [u32; 8] = a[8..].try_into().unwrap();
+                let mut result = [0u32; 16];
+                result[..8].copy_from_slice(&Self::vector_bitwise_not(&a_lo));
+                result[8..].copy_from_slice(&Self::vector_bitwise_not(&a_hi));
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+
+            // ========== Comparison (bridge) ==========
+            SemanticOp::Cmp => {
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_cmp_eq);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+            SemanticOp::SetGe => {
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_compare_ge);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+            SemanticOp::SetLt => {
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_compare_lt);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+
+            // ========== Accumulator ops ==========
+            SemanticOp::Accumulate => {
+                let has_acc_source = op.sources.iter()
+                    .any(|s| matches!(s, Operand::AccumReg(_)));
+                if has_acc_source {
+                    // VADD/VSUB/VNEGADD/VNEGSUB: accumulator-to-accumulator
+                    Self::execute_acc_add_sub(op, ctx);
+                } else {
+                    // Legacy: vector-into-accumulator, use fallback
+                    return Self::execute_wide_fallback(op, ctx, semantic, et);
+                }
+                true
+            }
+
+            // ========== Copy / Clear ==========
+            SemanticOp::Copy => {
+                let a = Self::get_wide_vec_source(op, ctx, 0);
+                Self::write_wide_vec_dest(op, ctx, a);
+                true
+            }
+            SemanticOp::VectorClear => {
+                Self::write_wide_vec_dest(op, ctx, [0u32; 16]);
+                true
+            }
+
+            // ========== Fallback ==========
+            _ => Self::execute_wide_fallback(op, ctx, semantic, et),
+        }
     }
 }
 
