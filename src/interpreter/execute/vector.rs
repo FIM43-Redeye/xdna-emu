@@ -3796,9 +3796,151 @@ impl VectorAlu {
                 true
             }
 
+            // ========== Cross-half operations ==========
+
+            SemanticOp::VectorInsert => {
+                let is_push = op.encoding_name.as_ref().map_or(false, |n| {
+                    n.to_lowercase().contains("vpush")
+                });
+                if is_push {
+                    let src = Self::get_wide_vec_source(op, ctx, 0);
+                    let value = Self::get_scalar_source(op, ctx);
+                    let is_hi = op.encoding_name.as_ref().map_or(false, |n| {
+                        n.to_lowercase().contains("_hi")
+                    });
+                    let result = Self::wide_vector_push(&src, value, is_hi, et);
+                    Self::write_wide_vec_dest(op, ctx, result);
+                    true
+                } else {
+                    Self::execute_wide_fallback(op, ctx, semantic, et)
+                }
+            }
+
+            SemanticOp::VectorBroadcast => {
+                let has_vector_source = op.sources.iter()
+                    .any(|s| matches!(s, Operand::VectorReg(_)));
+                if has_vector_source {
+                    // VEXTBCST: extract element from 512-bit source, then broadcast
+                    let src = Self::get_wide_vec_source(op, ctx, 0);
+                    let index = Self::get_lane_index(op, ctx);
+                    let value = Self::extract_wide_element(&src, index, et);
+                    let narrow_result = Self::vector_broadcast(value, et);
+                    let mut result = [0u32; 16];
+                    result[..8].copy_from_slice(&narrow_result);
+                    result[8..].copy_from_slice(&narrow_result);
+                    Self::write_wide_vec_dest(op, ctx, result);
+                } else {
+                    // VBCST: scalar broadcast to all lanes
+                    let value = Self::get_scalar_source(op, ctx);
+                    let narrow_result = Self::vector_broadcast(value, et);
+                    let mut result = [0u32; 16];
+                    result[..8].copy_from_slice(&narrow_result);
+                    result[8..].copy_from_slice(&narrow_result);
+                    Self::write_wide_vec_dest(op, ctx, result);
+                }
+                true
+            }
+
+            SemanticOp::Align => {
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let shift = Self::get_lane_index(op, ctx);
+                let result = Self::wide_vector_align(&a, &b, shift);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+
             // ========== Fallback ==========
             _ => Self::execute_wide_fallback(op, ctx, semantic, et),
         }
+    }
+
+    /// Push a scalar into a 512-bit vector, shifting existing elements.
+    ///
+    /// - `vpush.lo` (`is_hi=false`): shift elements toward high indices, insert
+    ///   scalar at the lowest position (index 0).
+    /// - `vpush.hi` (`is_hi=true`): shift elements toward low indices, insert
+    ///   scalar at the highest position.
+    ///
+    /// The shift is element-size-aware: for i32, one push moves 4 bytes; for
+    /// i16, 2 bytes; for i8, 1 byte.  The operation works on the full 64-byte
+    /// (512-bit) vector, so elements cross the 256-bit lane boundary freely.
+    fn wide_vector_push(src: &Vec512, value: u32, is_hi: bool, et: ElementType) -> Vec512 {
+        // Flatten to bytes for element-size-agnostic shifting.
+        let mut bytes = [0u8; 64];
+        for (i, word) in src.iter().enumerate() {
+            let b = word.to_le_bytes();
+            bytes[i * 4..i * 4 + 4].copy_from_slice(&b);
+        }
+
+        let elem_bytes = (et.bits() as usize / 8).max(1);
+
+        if is_hi {
+            // Shift towards low indices, open a slot at the high end.
+            bytes.copy_within(elem_bytes.., 0);
+            let val_bytes = value.to_le_bytes();
+            let insert_pos = 64 - elem_bytes;
+            for i in 0..elem_bytes.min(4) {
+                bytes[insert_pos + i] = val_bytes[i];
+            }
+        } else {
+            // Shift towards high indices, open a slot at the low end.
+            bytes.copy_within(..64 - elem_bytes, elem_bytes);
+            let val_bytes = value.to_le_bytes();
+            for i in 0..elem_bytes.min(4) {
+                bytes[i] = val_bytes[i];
+            }
+        }
+
+        let mut result = [0u32; 16];
+        for (i, chunk) in bytes.chunks(4).enumerate() {
+            result[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        result
+    }
+
+    /// Extract a single element from any position in a 512-bit vector.
+    ///
+    /// The element index is masked to the valid range for the given element
+    /// type (e.g., 0–31 for i16, 0–15 for i32).  Supports sub-word types
+    /// stored in packed little-endian order within each u32 word.
+    fn extract_wide_element(src: &Vec512, index: u32, et: ElementType) -> u32 {
+        let max_elems = 512 / et.bits() as u32;
+        let idx = index % max_elems;
+        let bit_offset = idx * et.bits() as u32;
+        let word_idx = (bit_offset / 32) as usize;
+        let bit_in_word = bit_offset % 32;
+        let mask = (1u64 << et.bits()) - 1;
+        ((src[word_idx] as u64 >> bit_in_word) & mask) as u32
+    }
+
+    /// Concatenate two 512-bit vectors (128 bytes total) and extract 64 bytes
+    /// starting at `byte_shift`.
+    ///
+    /// Logically: `result = (src1 || src2)[byte_shift .. byte_shift + 64]`.
+    /// Bytes beyond the 128-byte window are zero-padded.  The shift is masked
+    /// to 7 bits (0–127).
+    fn wide_vector_align(src1: &Vec512, src2: &Vec512, byte_shift: u32) -> Vec512 {
+        let shift = (byte_shift & 0x7F) as usize; // clamp to 0–127
+
+        // Helper: read one byte from the 128-byte concatenated space.
+        let get_byte = |idx: usize| -> u8 {
+            let word_array = if idx < 64 { src1 } else { src2 };
+            let adj = idx % 64;
+            let w = adj / 4;
+            let b = adj % 4;
+            ((word_array[w] >> (b * 8)) & 0xFF) as u8
+        };
+
+        let mut result = [0u32; 16];
+        for i in 0..16 {
+            let base = i * 4 + shift;
+            let b0 = if base     < 128 { get_byte(base)     } else { 0 } as u32;
+            let b1 = if base + 1 < 128 { get_byte(base + 1) } else { 0 } as u32;
+            let b2 = if base + 2 < 128 { get_byte(base + 2) } else { 0 } as u32;
+            let b3 = if base + 3 < 128 { get_byte(base + 3) } else { 0 } as u32;
+            result[i] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        }
+        result
     }
 }
 
@@ -4367,5 +4509,87 @@ mod tests {
         let lo16_nowrap = ctx.vector.read(0)[0] as i16;
         // Without saturation, 32768 truncated to 16 bits wraps to -32768
         assert_eq!(lo16_nowrap, -32768);
+    }
+
+    // ---- wide_vector_push ------------------------------------------------
+
+    /// vpush.lo: scalar inserted at index 0, existing elements shift up.
+    /// Verifies data crossing the 256-bit (word index 8) boundary.
+    #[test]
+    fn test_wide_vector_push_lo_32() {
+        let mut src = [0u32; 16];
+        for i in 0..16 { src[i] = (i as u32 + 1) * 100; }
+        let result = VectorAlu::wide_vector_push(&src, 0xDEAD_BEEF, false, ElementType::Int32);
+        assert_eq!(result[0],  0xDEAD_BEEF, "inserted value at lo end");
+        assert_eq!(result[1],  100,         "former element 0 shifted to 1");
+        assert_eq!(result[8],  800,         "former element 7 crossed 256-bit boundary");
+        assert_eq!(result[15], 1500,        "former element 14 at high end");
+    }
+
+    /// vpush.hi: scalar inserted at the highest position, existing elements
+    /// shift down.  Verifies element that was in the high half appears in lo.
+    #[test]
+    fn test_wide_vector_push_hi_32() {
+        let mut src = [0u32; 16];
+        for i in 0..16 { src[i] = (i as u32 + 1) * 100; }
+        let result = VectorAlu::wide_vector_push(&src, 0xCAFE_BABE, true, ElementType::Int32);
+        assert_eq!(result[0],  200,         "former element 1 shifted to 0");
+        assert_eq!(result[7],  900,         "former element 8 crossed boundary to 7");
+        assert_eq!(result[14], 1600,        "former element 15 at second-to-last");
+        assert_eq!(result[15], 0xCAFE_BABE, "inserted value at hi end");
+    }
+
+    // ---- extract_wide_element --------------------------------------------
+
+    /// Element 8 of i32 lives in word index 8 (the high 256-bit half).
+    #[test]
+    fn test_extract_wide_element_high_half() {
+        let mut src = [0u32; 16];
+        src[8] = 0x4242_4242;
+        let val = VectorAlu::extract_wide_element(&src, 8, ElementType::Int32);
+        assert_eq!(val, 0x4242_4242);
+    }
+
+    /// Element 17 of i16: bit offset = 17*16 = 272.  Word index = 272/32 = 8,
+    /// bit-in-word = 272%32 = 16, so it is the high 16 bits of word 8.
+    #[test]
+    fn test_extract_wide_element_16bit() {
+        let mut src = [0u32; 16];
+        src[8] = 0xBEEF_DEAD; // lo16 = 0xDEAD, hi16 = 0xBEEF
+        let val = VectorAlu::extract_wide_element(&src, 17, ElementType::Int16);
+        assert_eq!(val, 0xBEEF);
+    }
+
+    // ---- wide_vector_align -----------------------------------------------
+
+    /// Zero shift returns src1 unchanged.
+    #[test]
+    fn test_wide_vector_align_no_shift() {
+        let src1 = [1u32; 16];
+        let src2 = [2u32; 16];
+        let result = VectorAlu::wide_vector_align(&src1, &src2, 0);
+        assert_eq!(result, [1u32; 16]);
+    }
+
+    /// Shift by exactly 64 bytes skips all of src1 and returns src2 unchanged.
+    #[test]
+    fn test_wide_vector_align_full_shift() {
+        let src1 = [1u32; 16];
+        let src2 = [2u32; 16];
+        let result = VectorAlu::wide_vector_align(&src1, &src2, 64);
+        assert_eq!(result, [2u32; 16]);
+    }
+
+    /// Shift by 60 bytes: result[0] = last word of src1, result[1] = first
+    /// word of src2.  This exercises the cross-boundary stitch path.
+    #[test]
+    fn test_wide_vector_align_cross_boundary() {
+        let mut src1 = [0u32; 16];
+        let mut src2 = [0u32; 16];
+        src1[15] = 0xAAAA_AAAA; // last word of src1
+        src2[0]  = 0xBBBB_BBBB; // first word of src2
+        let result = VectorAlu::wide_vector_align(&src1, &src2, 60);
+        assert_eq!(result[0], 0xAAAA_AAAA, "last word of src1 at result[0]");
+        assert_eq!(result[1], 0xBBBB_BBBB, "first word of src2 at result[1]");
     }
 }
