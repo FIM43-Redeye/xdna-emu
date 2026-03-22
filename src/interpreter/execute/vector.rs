@@ -31,8 +31,11 @@
 
 use crate::interpreter::bundle::{ElementType, Operand, ShufflePattern, SlotOp};
 use crate::interpreter::state::ExecutionContext;
+use crate::interpreter::state::{Vec512, Acc1024};
 use crate::tablegen::SemanticOp;
 
+use super::vector_config::MatMulConfig;
+use super::vector_matmul;
 use super::vector_srs::{self, RoundingMode};
 use super::vector_ups;
 use super::vector_pack;
@@ -59,6 +62,12 @@ impl VectorAlu {
 
         log::trace!("[VECTOR_ALU] Checking semantic={:?} element_type={:?} dest={:?}",
             semantic, op.element_type, op.dest);
+
+        // TODO: MAC-family operations should use config-word-driven geometry
+        // instead of element-wise multiply. The config word parser exists in
+        // MatMulConfig::from_config_word() but the matmul kernel needs correct
+        // element permutation tables before it can be wired up here.
+        // See: vector_config.rs CONFIG_GEOMETRY_TABLE, vector_matmul.rs matmul_config_driven
 
         // Process the low 256-bit half.
         let handled = Self::execute_half(op, ctx, semantic, et);
@@ -98,9 +107,26 @@ impl VectorAlu {
             // ========== Arithmetic ==========
 
             SemanticOp::Add => {
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_add(&a, &b, et);
-                Self::write_vector_dest(op, ctx, result);
+                // Two variants:
+                // 1. VADD_elem: simple vector add (2 sources)
+                // 2. VADDSUB: conditional add/subtract (3 sources: s1, s2, sel)
+                //    vaddsub.8 $d, $s1, $s2, $sel
+                //    d[i] = (sel[i] & 1) ? s1[i] - s2[i] : s1[i] + s2[i]
+                let vec_source_count = op.sources.iter()
+                    .filter(|s| matches!(s, Operand::VectorReg(_)))
+                    .count();
+
+                if vec_source_count >= 3 {
+                    let s1 = Self::get_vector_source(op, ctx, 0);
+                    let s2 = Self::get_vector_source(op, ctx, 1);
+                    let sel = Self::get_vector_source(op, ctx, 2);
+                    let result = Self::vector_addsub(&s1, &s2, &sel, et);
+                    Self::write_vector_dest(op, ctx, result);
+                } else {
+                    let (a, b) = Self::get_two_vector_sources(op, ctx);
+                    let result = Self::vector_add(&a, &b, et);
+                    Self::write_vector_dest(op, ctx, result);
+                }
                 true
             }
 
@@ -140,9 +166,54 @@ impl VectorAlu {
             }
 
             SemanticOp::Neg => {
-                let src = Self::get_vector_source(op, ctx, 0);
-                let result = Self::vector_negate(&src, et);
-                Self::write_vector_dest(op, ctx, result);
+                // Two variants:
+                // 1. VNEG (accumulator): vneg $dst, $acc1, $c
+                //    Negate accumulator value: dst = -acc1
+                // 2. Vector negate: vneg $d, $s1
+                //    Per-element negate: d[i] = -s1[i]
+                let has_acc_source = op.sources.iter().any(|s| matches!(s, Operand::AccumReg(_)));
+
+                if has_acc_source {
+                    // Accumulator negate: negate both halves of cm register.
+                    // Config word controls zero_acc and shift16 (same as vadd).
+                    let acc_reg = op.sources.iter().find_map(|s| match s {
+                        Operand::AccumReg(r) => Some(*r),
+                        _ => None,
+                    }).unwrap_or(0);
+                    let dst_reg = Self::get_acc_dest(op);
+                    let conf = Self::get_config_register(op, ctx).unwrap_or(0);
+                    let zero_acc1 = (conf & 1) != 0;
+                    let is_float = op.encoding_name.as_ref()
+                        .map_or(false, |n| n.contains("_F"));
+
+                    for half in 0..2u8 {
+                        let src = ctx.accumulator.read(acc_reg + half);
+                        let mut result = [0u64; 8];
+
+                        if is_float {
+                            // Float: negate each fp32 value (two per u64 lane)
+                            for i in 0..8 {
+                                let lo = f32::from_bits(src[i] as u32);
+                                let hi = f32::from_bits((src[i] >> 32) as u32);
+                                let r_lo = if zero_acc1 { 0.0f32 } else { -lo };
+                                let r_hi = if zero_acc1 { 0.0f32 } else { -hi };
+                                result[i] = (r_lo.to_bits() as u64) | ((r_hi.to_bits() as u64) << 32);
+                            }
+                        } else {
+                            // Integer: negate each i64 lane
+                            for i in 0..8 {
+                                let v = if zero_acc1 { 0i64 } else { src[i] as i64 };
+                                result[i] = v.wrapping_neg() as u64;
+                            }
+                        }
+
+                        ctx.accumulator.write(dst_reg + half, result);
+                    }
+                } else {
+                    let src = Self::get_vector_source(op, ctx, 0);
+                    let result = Self::vector_negate(&src, et);
+                    Self::write_vector_dest(op, ctx, result);
+                }
                 true
             }
 
@@ -330,7 +401,9 @@ impl VectorAlu {
             }
 
             SemanticOp::VectorInsert => {
-                // Insert scalar into vector lane
+                // TODO: VPUSH (shift+insert) operates on full 512-bit vectors
+                // and cannot be properly handled in the 256-bit half-split path.
+                // For now, fall through to legacy insert-at-index behavior.
                 let mut dst = Self::get_vector_dest_value(op, ctx);
                 let value = Self::get_scalar_source(op, ctx);
                 let index = Self::get_lane_index(op, ctx);
@@ -377,12 +450,23 @@ impl VectorAlu {
             }
 
             SemanticOp::VectorBroadcast => {
-                let value = Self::get_scalar_source(op, ctx);
+                // Two variants:
+                // 1. VBCST: broadcast scalar to all lanes: vbcst.8 $dst, $scalar
+                // 2. VEXTBCST: extract element from vector, then broadcast:
+                //    vextbcst.16 $dst, $src_vec, $idx
+                let has_vector_source = op.sources.iter().any(|s| matches!(s, Operand::VectorReg(_)));
+
+                let value = if has_vector_source {
+                    // VEXTBCST: extract element at index from vector source
+                    let src = Self::get_vector_source(op, ctx, 0);
+                    let index = Self::get_lane_index(op, ctx);
+                    Self::extract_element_by_index(&src, index, et)
+                } else {
+                    // VBCST: broadcast scalar value
+                    Self::get_scalar_source(op, ctx)
+                };
+
                 let result = Self::vector_broadcast(value, et);
-                log::debug!(
-                    "[VBCST] Broadcast value={} et={:?} -> {:?} (sources={:?}, dest={:?})",
-                    value, et, result, op.sources, op.dest
-                );
                 Self::write_vector_dest(op, ctx, result);
                 true
             }
@@ -429,13 +513,30 @@ impl VectorAlu {
             }
 
             SemanticOp::NegGtz => {
-                let src = Self::get_vector_source(op, ctx, 0);
-                let result = Self::vector_neg_gtz(&src, et);
-                Self::write_vector_dest(op, ctx, result);
+                // VNEG_GTZ: conditional negate based on another vector's sign.
+                // vneg_gtz.16 $d, $cmp, $s1:
+                //   d[i] = (cmp[i] > 0) ? -s1[i] : s1[i]
+                let vec_source_count = op.sources.iter()
+                    .filter(|s| matches!(s, Operand::VectorReg(_)))
+                    .count();
+
+                if vec_source_count >= 2 {
+                    let cmp = Self::get_vector_source(op, ctx, 0);
+                    let s1 = Self::get_vector_source(op, ctx, 1);
+                    let result = Self::vector_bneg_gtz(&cmp, &s1, et);
+                    Self::write_vector_dest(op, ctx, result);
+                } else {
+                    let src = Self::get_vector_source(op, ctx, 0);
+                    let result = Self::vector_neg_gtz(&src, et);
+                    Self::write_vector_dest(op, ctx, result);
+                }
                 true
             }
 
             SemanticOp::NegLtz => {
+                // TODO: VBNEG_LTZ has two vector sources (cmp, s1) for
+                // conditional negate. Currently using single-source abs path
+                // which is correct when cmp == src but wrong otherwise.
                 let src = Self::get_vector_source(op, ctx, 0);
                 let result = Self::vector_neg_ltz(&src, et);
                 Self::write_vector_dest(op, ctx, result);
@@ -443,9 +544,21 @@ impl VectorAlu {
             }
 
             SemanticOp::Accumulate => {
-                let src = Self::get_vector_source(op, ctx, 0);
-                let acc_reg = Self::get_acc_dest(op);
-                Self::vector_accumulate(ctx, acc_reg, &src, et);
+                // VADD/VSUB/VNEGADD/VNEGSUB: add/subtract two accumulator
+                // registers. Format: `vadd $dst, $acc1, $acc2, $config`.
+                //
+                // Check if sources contain AccumReg (acc-to-acc operation)
+                // or VectorReg (legacy vector accumulate path).
+                let has_acc_source = op.sources.iter().any(|s| matches!(s, Operand::AccumReg(_)));
+
+                if has_acc_source {
+                    Self::execute_acc_add_sub(op, ctx);
+                } else {
+                    // Legacy: accumulate a vector source into an accumulator.
+                    let src = Self::get_vector_source(op, ctx, 0);
+                    let acc_reg = Self::get_acc_dest(op);
+                    Self::vector_accumulate(ctx, acc_reg, &src, et);
+                }
                 true
             }
 
@@ -660,6 +773,294 @@ impl VectorAlu {
                 mask
             }
         }
+    }
+
+    /// Check if a semantic operation is a MAC-family instruction.
+    fn is_mac_family(semantic: SemanticOp) -> bool {
+        matches!(
+            semantic,
+            SemanticOp::Mac
+                | SemanticOp::MatMul
+                | SemanticOp::MatMulSub
+                | SemanticOp::NegMatMul
+                | SemanticOp::AddMac
+                | SemanticOp::SubMac
+        )
+    }
+
+    /// Execute a MAC-family instruction with config-word-driven geometry.
+    ///
+    /// Unlike simple vector ops that can be split into independent 256-bit
+    /// halves, MAC operations read full 512-bit vectors and write 1024-bit
+    /// accumulators. The config word (from a scalar register) selects the
+    /// tile geometry and operational flags.
+    fn execute_mac_config_driven(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        semantic: SemanticOp,
+        et: ElementType,
+    ) -> bool {
+        // Extract config register value from sources.
+        let conf_val = match Self::get_config_register(op, ctx) {
+            Some(v) => v,
+            None => {
+                // No config register present (unit tests or legacy path).
+                // Fall back to the old element-wise / half-split behavior.
+                return Self::execute_mac_legacy(op, ctx, semantic, et);
+            }
+        };
+
+        // Determine if this is a bf16 instruction.
+        let is_bf16 = matches!(et, ElementType::BFloat16 | ElementType::Float32)
+            || op.encoding_name.as_ref().map_or(false, |n| n.contains(".f"));
+
+        // Parse config word into geometry and flags.
+        let mut config = match MatMulConfig::from_config_word(conf_val, is_bf16) {
+            Some(c) => c,
+            None => {
+                // Unknown geometry -- fall back to element-wise MAC.
+                // This happens when the config word encodes an invalid
+                // (amode, bmode, variant) triple.
+                log::trace!(
+                    "[VECTOR_MAC] unknown config word 0x{:08x} (amode={}, bmode={}, variant={}), \
+                     falling back to element-wise",
+                    conf_val,
+                    (conf_val >> 1) & 3,
+                    (conf_val >> 3) & 3,
+                    (conf_val >> 5) & 7,
+                );
+                return Self::execute_mac_legacy(op, ctx, semantic, et);
+            }
+        };
+
+        log::trace!(
+            "[VECTOR_MAC] config=0x{:08x} -> {}x{}x{} bits_x={} bits_y={} \
+             signed=({},{}) acc_width={:?} accum={} sub={}",
+            conf_val,
+            config.rows, config.inner, config.cols,
+            config.a_type.bits(), config.b_type.bits(),
+            config.x_signed, config.y_signed,
+            config.acc_width, config.accumulate, config.subtract,
+        );
+
+        // Override subtract flag based on instruction type.
+        match semantic {
+            SemanticOp::MatMulSub => config.subtract = true,
+            SemanticOp::NegMatMul => config.subtract = !config.subtract,
+            _ => {}
+        }
+
+        // Get accumulator register index. For cm registers, the low half
+        // is acc_reg and the high half is acc_reg + 1.
+        let acc_reg = Self::get_acc_dest(op);
+        let acc_lo_reg = acc_reg;
+        let acc_hi_reg = acc_reg + 1;
+
+        // Read current accumulator state (both halves for cm register).
+        let mut acc_lo = ctx.accumulator.read(acc_lo_reg);
+        let mut acc_hi = ctx.accumulator.read(acc_hi_reg);
+
+        // Read full 512-bit vector inputs. Each x-register is two
+        // consecutive 256-bit w-registers.
+        let (a_lo, a_hi) = Self::get_wide_vector_source(op, ctx, 0);
+        let (b_lo, b_hi) = Self::get_wide_vector_source(op, ctx, 1);
+
+        // For AddMac/SubMac, handle the second accumulator source.
+        if matches!(semantic, SemanticOp::AddMac | SemanticOp::SubMac) {
+            let acc2_reg = Self::get_acc_source(op);
+            let acc2_lo = ctx.accumulator.read(acc2_reg);
+            let acc2_hi = ctx.accumulator.read(acc2_reg + 1);
+            // Add or subtract the second accumulator.
+            let negate = matches!(semantic, SemanticOp::SubMac);
+            for i in 0..8 {
+                if negate {
+                    acc_lo[i] = acc_lo[i].wrapping_sub(acc2_lo[i]);
+                    acc_hi[i] = acc_hi[i].wrapping_sub(acc2_hi[i]);
+                } else {
+                    acc_lo[i] = acc_lo[i].wrapping_add(acc2_lo[i]);
+                    acc_hi[i] = acc_hi[i].wrapping_add(acc2_hi[i]);
+                }
+            }
+        }
+
+        // Perform the config-driven matrix multiply.
+        vector_matmul::matmul_config_driven(
+            &mut acc_lo, &mut acc_hi,
+            &a_lo, &a_hi,
+            &b_lo, &b_hi,
+            &config,
+        );
+
+        // Write back both accumulator halves.
+        ctx.accumulator.write(acc_lo_reg, acc_lo);
+        ctx.accumulator.write(acc_hi_reg, acc_hi);
+
+        true
+    }
+
+    /// Accumulator-to-accumulator add/subtract.
+    ///
+    /// Handles VADD, VSUB, VNEGADD, VNEGSUB and their .f (float) variants.
+    /// These take two accumulator (cm-class, 1024-bit) sources and write
+    /// a 1024-bit result.
+    ///
+    /// The config register (scalar operand) controls:
+    /// - Bit  0: zero_acc1 (zero acc1 before operation)
+    /// - Bit 10: shift16 (right-shift result by 16 bits)
+    /// - Bit 11: sub_acc1 (negate acc1)
+    /// - Bit 12: sub_acc2 (negate acc2)
+    ///
+    /// Base operations (before config modifiers):
+    /// - vadd:    dst = acc1 + acc2
+    /// - vsub:    dst = acc1 - acc2
+    /// - vnegadd: dst = -acc1 + acc2
+    /// - vnegsub: dst = -acc1 - acc2
+    fn execute_acc_add_sub(op: &SlotOp, ctx: &mut ExecutionContext) {
+        // Get the two AccumReg source indices.
+        let mut acc_sources: Vec<u8> = Vec::new();
+        for src in &op.sources {
+            if let Operand::AccumReg(r) = src {
+                acc_sources.push(*r);
+            }
+        }
+
+        let acc1_reg = if !acc_sources.is_empty() { acc_sources[0] } else { 0 };
+        let acc2_reg = if acc_sources.len() >= 2 { acc_sources[1] } else { acc1_reg };
+        let dst_reg = Self::get_acc_dest(op);
+
+        // Read config register.
+        let conf = Self::get_config_register(op, ctx).unwrap_or(0);
+        let zero_acc1 = (conf & 1) != 0;
+        let shift16 = ((conf >> 10) & 1) != 0;
+        let sub_acc1 = ((conf >> 11) & 1) != 0;
+        let sub_acc2 = ((conf >> 12) & 1) != 0;
+
+        // Determine base operation from encoding name.
+        let enc_lower = op.encoding_name.as_ref().map_or(String::new(), |n| n.to_lowercase());
+        let base_sub = enc_lower.starts_with("vsub");
+        let base_neg = enc_lower.starts_with("vneg");
+        let base_negsub = enc_lower.starts_with("vnegsub");
+        let is_float = enc_lower.contains("_f");
+
+        // Compute effective signs for acc1 and acc2.
+        // Base operation sets initial signs, config modifiers can flip them.
+        let negate_acc1 = base_neg || base_negsub || sub_acc1;
+        let negate_acc2 = base_sub || base_negsub || sub_acc2;
+
+        // Process both halves of the cm register (low=reg, high=reg+1).
+        for half in 0..2u8 {
+            let r1 = acc1_reg + half;
+            let r2 = acc2_reg + half;
+            let rd = dst_reg + half;
+
+            let a1 = ctx.accumulator.read(r1);
+            let a2 = ctx.accumulator.read(r2);
+            let mut result = [0u64; 8];
+
+            if is_float {
+                for i in 0..8 {
+                    let a1_lo = if zero_acc1 { 0.0 } else { f32::from_bits(a1[i] as u32) };
+                    let a1_hi = if zero_acc1 { 0.0 } else { f32::from_bits((a1[i] >> 32) as u32) };
+                    let a2_lo = f32::from_bits(a2[i] as u32);
+                    let a2_hi = f32::from_bits((a2[i] >> 32) as u32);
+
+                    let v1_lo = if negate_acc1 { -a1_lo } else { a1_lo };
+                    let v1_hi = if negate_acc1 { -a1_hi } else { a1_hi };
+                    let v2_lo = if negate_acc2 { -a2_lo } else { a2_lo };
+                    let v2_hi = if negate_acc2 { -a2_hi } else { a2_hi };
+
+                    let res_lo = v1_lo + v2_lo;
+                    let res_hi = v1_hi + v2_hi;
+
+                    result[i] = (res_lo.to_bits() as u64) | ((res_hi.to_bits() as u64) << 32);
+                }
+            } else {
+                for i in 0..8 {
+                    let v1 = if zero_acc1 { 0i64 } else { a1[i] as i64 };
+                    let v2 = a2[i] as i64;
+
+                    let v1 = if negate_acc1 { v1.wrapping_neg() } else { v1 };
+                    let v2 = if negate_acc2 { v2.wrapping_neg() } else { v2 };
+
+                    let mut res = v1.wrapping_add(v2);
+
+                    // shift16: arithmetic right shift by 16 bits
+                    if shift16 {
+                        res >>= 16;
+                    }
+
+                    result[i] = res as u64;
+                }
+            }
+
+            ctx.accumulator.write(rd, result);
+        }
+    }
+
+    /// Legacy MAC execution path: half-split element-wise multiply.
+    ///
+    /// Used when no config register is present (unit tests) or the config
+    /// word encodes an unrecognized geometry.
+    fn execute_mac_legacy(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        semantic: SemanticOp,
+        et: ElementType,
+    ) -> bool {
+        let handled = Self::execute_half(op, ctx, semantic, et);
+
+        if handled && op.is_wide_vector {
+            let mut hi_op = op.clone();
+            Self::increment_vector_regs(&mut hi_op);
+            Self::execute_half(&hi_op, ctx, semantic, et);
+        }
+
+        handled
+    }
+
+    /// Get config register value from a scalar register in sources.
+    ///
+    /// The config register is the last scalar register source in the VMAC
+    /// instruction (r0-r15 in `vmac cm0, cm0, x0, x0, r0`).
+    /// Returns None if no scalar register is present (e.g., unit tests).
+    fn get_config_register(op: &SlotOp, ctx: &ExecutionContext) -> Option<u32> {
+        // Scan sources in reverse order -- the config register is typically last.
+        for src in op.sources.iter().rev() {
+            if let Operand::ScalarReg(r) = src {
+                return Some(ctx.scalar.read(*r));
+            }
+        }
+        None
+    }
+
+    /// Get a 512-bit wide vector source (two consecutive 256-bit registers).
+    ///
+    /// Returns (low_half, high_half) where each is [u32; 8] = 256 bits.
+    /// For `x0`, this returns (wl0, wh0) = (vreg 0, vreg 1).
+    fn get_wide_vector_source(
+        op: &SlotOp,
+        ctx: &ExecutionContext,
+        source_index: usize,
+    ) -> ([u32; 8], [u32; 8]) {
+        // Find the nth VectorReg source.
+        let mut vec_count = 0;
+        for src in &op.sources {
+            if let Operand::VectorReg(r) = src {
+                if vec_count == source_index {
+                    let lo = ctx.vector.read(*r);
+                    // High half is the next register.
+                    let hi = if op.is_wide_vector {
+                        ctx.vector.read(r + 1)
+                    } else {
+                        [0u32; 8]
+                    };
+                    return (lo, hi);
+                }
+                vec_count += 1;
+            }
+        }
+        // Fallback: return zeros.
+        ([0u32; 8], [0u32; 8])
     }
 
     /// Get accumulator destination register.
@@ -1173,6 +1574,62 @@ impl VectorAlu {
     }
 
     /// Vector addition by element type.
+    /// Conditional add/subtract: per-element add or subtract based on sel vector.
+    ///
+    /// d[i] = (sel[i] & 1) ? (s1[i] - s2[i]) : (s1[i] + s2[i])
+    fn vector_addsub(
+        s1: &[u32; 8],
+        s2: &[u32; 8],
+        sel: &[u32; 8],
+        elem_type: ElementType,
+    ) -> [u32; 8] {
+        let mut result = [0u32; 8];
+
+        match elem_type {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+                for i in 0..8 {
+                    if sel[i] & 1 != 0 {
+                        result[i] = s1[i].wrapping_sub(s2[i]);
+                    } else {
+                        result[i] = s1[i].wrapping_add(s2[i]);
+                    }
+                }
+            }
+            ElementType::Int16 | ElementType::UInt16 | ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let a_lo = (s1[i] & 0xFFFF) as u16;
+                    let a_hi = ((s1[i] >> 16) & 0xFFFF) as u16;
+                    let b_lo = (s2[i] & 0xFFFF) as u16;
+                    let b_hi = ((s2[i] >> 16) & 0xFFFF) as u16;
+                    let sel_lo = sel[i] & 1;
+                    let sel_hi = (sel[i] >> 16) & 1;
+                    let r_lo = if sel_lo != 0 { a_lo.wrapping_sub(b_lo) } else { a_lo.wrapping_add(b_lo) };
+                    let r_hi = if sel_hi != 0 { a_hi.wrapping_sub(b_hi) } else { a_hi.wrapping_add(b_hi) };
+                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                }
+            }
+            ElementType::Int8 | ElementType::UInt8 => {
+                for i in 0..8 {
+                    let mut val = 0u32;
+                    for j in 0..4u32 {
+                        let a_byte = ((s1[i] >> (j * 8)) & 0xFF) as u8;
+                        let b_byte = ((s2[i] >> (j * 8)) & 0xFF) as u8;
+                        let s_bit = (sel[i] >> (j * 8)) & 1;
+                        let r = if s_bit != 0 {
+                            a_byte.wrapping_sub(b_byte)
+                        } else {
+                            a_byte.wrapping_add(b_byte)
+                        };
+                        val |= (r as u32) << (j * 8);
+                    }
+                    result[i] = val;
+                }
+            }
+        }
+
+        result
+    }
+
     fn vector_add(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
         let mut result = [0u32; 8];
 
@@ -1785,6 +2242,54 @@ impl VectorAlu {
     }
 
     /// Insert a scalar value into a vector at the given index.
+    /// Push a scalar into a vector, shifting existing elements.
+    ///
+    /// - `is_hi`: push into high end (shift elements towards low indices,
+    ///   insert at highest position, discard lowest element)
+    /// - `!is_hi`: push into low end (shift elements towards high indices,
+    ///   insert at lowest position, discard highest element)
+    fn vector_push(src: &[u32; 8], value: u32, is_hi: bool, et: ElementType) -> [u32; 8] {
+        // Convert to byte array, shift, insert, convert back.
+        let mut bytes = [0u8; 32];
+        for (i, word) in src.iter().enumerate() {
+            bytes[i * 4] = (*word & 0xFF) as u8;
+            bytes[i * 4 + 1] = ((*word >> 8) & 0xFF) as u8;
+            bytes[i * 4 + 2] = ((*word >> 16) & 0xFF) as u8;
+            bytes[i * 4 + 3] = ((*word >> 24) & 0xFF) as u8;
+        }
+
+        let elem_bytes = et.bits() as usize / 8;
+        let elem_bytes = if elem_bytes == 0 { 1 } else { elem_bytes }; // min 1 byte for 8-bit
+
+        if is_hi {
+            // Shift elements towards low indices (remove lowest element,
+            // insert at highest position).
+            bytes.copy_within(elem_bytes.., 0);
+            // Insert value at the highest position
+            let insert_pos = 32 - elem_bytes;
+            let val_bytes = value.to_le_bytes();
+            for i in 0..elem_bytes.min(4) {
+                bytes[insert_pos + i] = val_bytes[i];
+            }
+        } else {
+            // Shift elements towards high indices (remove highest element,
+            // insert at lowest position).
+            bytes.copy_within(..32 - elem_bytes, elem_bytes);
+            // Insert value at position 0
+            let val_bytes = value.to_le_bytes();
+            for i in 0..elem_bytes.min(4) {
+                bytes[i] = val_bytes[i];
+            }
+        }
+
+        // Convert back to [u32; 8]
+        let mut result = [0u32; 8];
+        for (i, chunk) in bytes.chunks(4).enumerate() {
+            result[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        result
+    }
+
     fn vector_insert(dst: &mut [u32; 8], value: u32, index: u32, elem_type: ElementType) {
         match elem_type {
             ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
@@ -1900,6 +2405,32 @@ impl VectorAlu {
     }
 
     /// Broadcast a scalar value to all vector lanes.
+    /// Extract a single element from a 256-bit vector by element index.
+    ///
+    /// Returns the element value (zero-extended to u32).
+    fn extract_element_by_index(src: &[u32; 8], index: u32, et: ElementType) -> u32 {
+        match et {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+                let idx = (index as usize) & 7;
+                src[idx]
+            }
+            ElementType::Int16 | ElementType::UInt16 | ElementType::BFloat16 => {
+                // 16 elements of 16-bit each in 256 bits
+                let idx = (index as usize) & 15;
+                let word = idx / 2;
+                let half = idx % 2;
+                (src[word] >> (half * 16)) & 0xFFFF
+            }
+            ElementType::Int8 | ElementType::UInt8 => {
+                // 32 elements of 8-bit each in 256 bits
+                let idx = (index as usize) & 31;
+                let word = idx / 4;
+                let byte_in_word = idx % 4;
+                (src[word] >> (byte_in_word * 8)) & 0xFF
+            }
+        }
+    }
+
     fn vector_broadcast(value: u32, elem_type: ElementType) -> [u32; 8] {
         match elem_type {
             ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
@@ -2216,6 +2747,141 @@ impl VectorAlu {
 
     /// Negate if less than zero: dst[i] = (src[i] < 0) ? -src[i] : src[i]
     /// This is essentially abs() for signed types.
+    /// Conditional negate: d[i] = (cmp[i] > 0) ? -s1[i] : s1[i]
+    fn vector_bneg_gtz(cmp: &[u32; 8], s1: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
+        let mut result = [0u32; 8];
+
+        match elem_type {
+            ElementType::Int32 => {
+                for i in 0..8 {
+                    let c = cmp[i] as i32;
+                    let v = s1[i] as i32;
+                    result[i] = if c > 0 { v.wrapping_neg() as u32 } else { s1[i] };
+                }
+            }
+            ElementType::UInt32 => {
+                for i in 0..8 {
+                    let c = cmp[i];
+                    result[i] = if c > 0 { (s1[i] as i32).wrapping_neg() as u32 } else { s1[i] };
+                }
+            }
+            ElementType::Float32 => {
+                for i in 0..8 {
+                    let c = f32::from_bits(cmp[i]);
+                    let v = f32::from_bits(s1[i]);
+                    result[i] = if c > 0.0 { (-v).to_bits() } else { s1[i] };
+                }
+            }
+            ElementType::Int16 => {
+                for i in 0..8 {
+                    let c_lo = (cmp[i] & 0xFFFF) as i16;
+                    let c_hi = ((cmp[i] >> 16) & 0xFFFF) as i16;
+                    let v_lo = (s1[i] & 0xFFFF) as i16;
+                    let v_hi = ((s1[i] >> 16) & 0xFFFF) as i16;
+                    let r_lo = if c_lo > 0 { v_lo.wrapping_neg() } else { v_lo };
+                    let r_hi = if c_hi > 0 { v_hi.wrapping_neg() } else { v_hi };
+                    result[i] = (r_lo as u16 as u32) | ((r_hi as u16 as u32) << 16);
+                }
+            }
+            ElementType::UInt16 | ElementType::BFloat16 => {
+                for i in 0..8 {
+                    let c_lo = (cmp[i] & 0xFFFF) as u16;
+                    let c_hi = ((cmp[i] >> 16) & 0xFFFF) as u16;
+                    let v_lo = (s1[i] & 0xFFFF) as i16;
+                    let v_hi = ((s1[i] >> 16) & 0xFFFF) as i16;
+                    let r_lo = if c_lo > 0 { v_lo.wrapping_neg() } else { v_lo };
+                    let r_hi = if c_hi > 0 { v_hi.wrapping_neg() } else { v_hi };
+                    result[i] = (r_lo as u16 as u32) | ((r_hi as u16 as u32) << 16);
+                }
+            }
+            ElementType::Int8 => {
+                for i in 0..8 {
+                    let mut val = 0u32;
+                    for j in 0..4u32 {
+                        let c = ((cmp[i] >> (j * 8)) & 0xFF) as i8;
+                        let v = ((s1[i] >> (j * 8)) & 0xFF) as i8;
+                        let r = if c > 0 { v.wrapping_neg() } else { v };
+                        val |= (r as u8 as u32) << (j * 8);
+                    }
+                    result[i] = val;
+                }
+            }
+            ElementType::UInt8 => {
+                for i in 0..8 {
+                    let mut val = 0u32;
+                    for j in 0..4u32 {
+                        let c = ((cmp[i] >> (j * 8)) & 0xFF) as u8;
+                        let v = ((s1[i] >> (j * 8)) & 0xFF) as i8;
+                        let r = if c > 0 { v.wrapping_neg() } else { v };
+                        val |= (r as u8 as u32) << (j * 8);
+                    }
+                    result[i] = val;
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Conditional negate: d[i] = (cmp[i] < 0) ? -s1[i] : s1[i]
+    fn vector_bneg_ltz(cmp: &[u32; 8], s1: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
+        let mut result = [0u32; 8];
+
+        match elem_type {
+            ElementType::Int32 => {
+                for i in 0..8 {
+                    let c = cmp[i] as i32;
+                    let v = s1[i] as i32;
+                    result[i] = if c < 0 { v.wrapping_neg() as u32 } else { s1[i] };
+                }
+            }
+            ElementType::UInt32 | ElementType::Float32 => {
+                // Unsigned: cmp is never < 0 (treated as unsigned), pass through.
+                // Float: check sign bit.
+                if matches!(elem_type, ElementType::Float32) {
+                    for i in 0..8 {
+                        let c = f32::from_bits(cmp[i]);
+                        let v = f32::from_bits(s1[i]);
+                        result[i] = if c < 0.0 { (-v).to_bits() } else { s1[i] };
+                    }
+                } else {
+                    result = *s1;
+                }
+            }
+            ElementType::Int16 => {
+                for i in 0..8 {
+                    let c_lo = (cmp[i] & 0xFFFF) as i16;
+                    let c_hi = ((cmp[i] >> 16) & 0xFFFF) as i16;
+                    let v_lo = (s1[i] & 0xFFFF) as i16;
+                    let v_hi = ((s1[i] >> 16) & 0xFFFF) as i16;
+                    let r_lo = if c_lo < 0 { v_lo.wrapping_neg() } else { v_lo };
+                    let r_hi = if c_hi < 0 { v_hi.wrapping_neg() } else { v_hi };
+                    result[i] = (r_lo as u16 as u32) | ((r_hi as u16 as u32) << 16);
+                }
+            }
+            ElementType::UInt16 | ElementType::BFloat16 => {
+                result = *s1; // Unsigned: never negative
+            }
+            ElementType::Int8 => {
+                for i in 0..8 {
+                    let mut val = 0u32;
+                    for j in 0..4u32 {
+                        let c = ((cmp[i] >> (j * 8)) & 0xFF) as i8;
+                        let v = ((s1[i] >> (j * 8)) & 0xFF) as i8;
+                        let r = if c < 0 { v.wrapping_neg() } else { v };
+                        val |= (r as u8 as u32) << (j * 8);
+                    }
+                    result[i] = val;
+                }
+            }
+            ElementType::UInt8 => {
+                result = *s1; // Unsigned: never negative
+            }
+        }
+
+        result
+    }
+
     fn vector_neg_ltz(src: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
         let mut result = [0u32; 8];
 
@@ -3021,6 +3687,67 @@ impl VectorAlu {
         }
 
         result
+    }
+
+    // ========== Wide (512-bit / 1024-bit) Helpers ==========
+
+    /// Read the nth VectorReg source as a full 512-bit value.
+    ///
+    /// Unlike get_vector_source which reads a single 256-bit register,
+    /// this reads a pair of consecutive registers (x-register = two w-registers).
+    /// Skips non-VectorReg sources when counting, so idx=0 is the first
+    /// VectorReg in sources, idx=1 is the second, etc.
+    fn get_wide_vec_source(op: &SlotOp, ctx: &ExecutionContext, idx: usize) -> Vec512 {
+        let mut vec_count = 0;
+        for src in &op.sources {
+            if let Operand::VectorReg(r) = src {
+                if vec_count == idx {
+                    return ctx.vector.read_wide(*r);
+                }
+                vec_count += 1;
+            }
+        }
+        [0u32; 16]
+    }
+
+    /// Read two wide vector sources.
+    fn get_two_wide_vec_sources(
+        op: &SlotOp,
+        ctx: &ExecutionContext,
+    ) -> (Vec512, Vec512) {
+        let a = Self::get_wide_vec_source(op, ctx, 0);
+        let b = Self::get_wide_vec_source(op, ctx, 1);
+        (a, b)
+    }
+
+    /// Write a 512-bit result to the vector destination.
+    fn write_wide_vec_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: Vec512) {
+        if let Some(Operand::VectorReg(r)) = &op.dest {
+            ctx.vector.write_wide(*r, value);
+        } else {
+            log::error!(
+                "[VECTOR_WIDE] write_wide_vec_dest: expected VectorReg dest, got {:?}",
+                op.dest
+            );
+        }
+    }
+
+    /// Read the accumulator destination register index and its current 1024-bit value.
+    fn get_wide_acc_dest_value(op: &SlotOp, ctx: &ExecutionContext) -> (u8, Acc1024) {
+        let reg = Self::get_acc_dest(op);
+        (reg, ctx.accumulator.read_wide(reg))
+    }
+
+    /// Write a 1024-bit result to the accumulator destination.
+    fn write_wide_acc_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: Acc1024) {
+        let reg = Self::get_acc_dest(op);
+        ctx.accumulator.write_wide(reg, value);
+    }
+
+    /// Read an AccumReg source as a 1024-bit cm-register.
+    fn get_wide_acc_source(op: &SlotOp, ctx: &ExecutionContext) -> (u8, Acc1024) {
+        let reg = Self::get_acc_source(op);
+        (reg, ctx.accumulator.read_wide(reg))
     }
 }
 

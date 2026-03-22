@@ -35,6 +35,8 @@ pub use registers::{
     AccumulatorRegisterFile,
     PointerRegisterFile,
     ModifierRegisterFile,
+    // Wide register type aliases.
+    Vec512, Acc1024,
     // Register file dimensions and special register indices.
     NUM_SCALAR_REGS, NUM_SCALAR_GPRS,
     LR_REG_INDEX, LS_REG_INDEX, LE_REG_INDEX, LC_REG_INDEX,
