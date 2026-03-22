@@ -3849,6 +3849,102 @@ impl VectorAlu {
                 true
             }
 
+            // ========== Shift operations (bridge) ==========
+            SemanticOp::Shl => {
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_shift_left);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+            SemanticOp::Srl => {
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_shift_right_logical);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+            SemanticOp::Sra => {
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_shift_right_arith);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+
+            // ========== Comparison variants (bridge) ==========
+            // MaxLt and MinGe are synonyms for Max/Min -- the conditional suffix
+            // describes the input ordering contract, not a distinct operation.
+            SemanticOp::MaxLt => {
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_max);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+            SemanticOp::MinGe => {
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_min);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+
+            // ========== Conditional arithmetic (bridge) ==========
+            SemanticOp::SubLt => {
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_sub_lt);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+            SemanticOp::SubGe => {
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_sub_ge);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+            SemanticOp::MaxDiffLt => {
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_maxdiff_lt);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+            SemanticOp::NegAdd => {
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_neg_add);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+
+            // ========== Conditional unary (bridge) ==========
+            SemanticOp::NegGtz => {
+                // Two-vector-source variant (VNEG_GTZ with select operand) uses fallback.
+                let vec_source_count = op.sources.iter()
+                    .filter(|s| matches!(s, Operand::VectorReg(_)))
+                    .count();
+                if vec_source_count >= 2 {
+                    return Self::execute_wide_fallback(op, ctx, semantic, et);
+                }
+                let a = Self::get_wide_vec_source(op, ctx, 0);
+                let result = Self::wide_element_wise_unary(&a, et, Self::vector_neg_gtz);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+            SemanticOp::NegLtz => {
+                let a = Self::get_wide_vec_source(op, ctx, 0);
+                let result = Self::wide_element_wise_unary(&a, et, Self::vector_neg_ltz);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+            SemanticOp::AbsGtz => {
+                let a = Self::get_wide_vec_source(op, ctx, 0);
+                let result = Self::wide_element_wise_unary(&a, et, Self::vector_abs_gtz);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+            SemanticOp::SetEq => {
+                // VCMP_EQZ: compare each element to zero.
+                let a = Self::get_wide_vec_source(op, ctx, 0);
+                let result = Self::wide_element_wise_unary(&a, et, Self::vector_compare_eqz);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+
             // ========== Fallback ==========
             _ => Self::execute_wide_fallback(op, ctx, semantic, et),
         }
