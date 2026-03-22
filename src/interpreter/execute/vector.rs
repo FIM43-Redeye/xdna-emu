@@ -162,54 +162,12 @@ impl VectorAlu {
             }
 
             SemanticOp::Neg => {
-                // Two variants:
-                // 1. VNEG (accumulator): vneg $dst, $acc1, $c
-                //    Negate accumulator value: dst = -acc1
-                // 2. Vector negate: vneg $d, $s1
-                //    Per-element negate: d[i] = -s1[i]
-                let has_acc_source = op.sources.iter().any(|s| matches!(s, Operand::AccumReg(_)));
-
-                if has_acc_source {
-                    // Accumulator negate: negate both halves of cm register.
-                    // Config word controls zero_acc and shift16 (same as vadd).
-                    let acc_reg = op.sources.iter().find_map(|s| match s {
-                        Operand::AccumReg(r) => Some(*r),
-                        _ => None,
-                    }).unwrap_or(0);
-                    let dst_reg = Self::get_acc_dest(op);
-                    let conf = Self::get_config_register(op, ctx).unwrap_or(0);
-                    let zero_acc1 = (conf & 1) != 0;
-                    let is_float = op.encoding_name.as_ref()
-                        .map_or(false, |n| n.contains("_F"));
-
-                    for half in 0..2u8 {
-                        let src = ctx.accumulator.read(acc_reg + half);
-                        let mut result = [0u64; 8];
-
-                        if is_float {
-                            // Float: negate each fp32 value (two per u64 lane)
-                            for i in 0..8 {
-                                let lo = f32::from_bits(src[i] as u32);
-                                let hi = f32::from_bits((src[i] >> 32) as u32);
-                                let r_lo = if zero_acc1 { 0.0f32 } else { -lo };
-                                let r_hi = if zero_acc1 { 0.0f32 } else { -hi };
-                                result[i] = (r_lo.to_bits() as u64) | ((r_hi.to_bits() as u64) << 32);
-                            }
-                        } else {
-                            // Integer: negate each i64 lane
-                            for i in 0..8 {
-                                let v = if zero_acc1 { 0i64 } else { src[i] as i64 };
-                                result[i] = v.wrapping_neg() as u64;
-                            }
-                        }
-
-                        ctx.accumulator.write(dst_reg + half, result);
-                    }
-                } else {
-                    let src = Self::get_vector_source(op, ctx, 0);
-                    let result = Self::vector_negate(&src, et);
-                    Self::write_vector_dest(op, ctx, result);
-                }
+                // Vector negate: vneg $d, $s1 -- per-element negate.
+                // AccumReg-only Neg ops are routed to execute_wide which
+                // calls execute_acc_negate, so this arm only sees vector ops.
+                let src = Self::get_vector_source(op, ctx, 0);
+                let result = Self::vector_negate(&src, et);
+                Self::write_vector_dest(op, ctx, result);
                 true
             }
 
@@ -789,7 +747,7 @@ impl VectorAlu {
     /// - vnegadd: dst = -acc1 + acc2
     /// - vnegsub: dst = -acc1 - acc2
     fn execute_acc_add_sub(op: &SlotOp, ctx: &mut ExecutionContext) {
-        // Get the two AccumReg source indices.
+        // Collect the two AccumReg source indices.
         let mut acc_sources: Vec<u8> = Vec::new();
         for src in &op.sources {
             if let Operand::AccumReg(r) = src {
@@ -799,7 +757,10 @@ impl VectorAlu {
 
         let acc1_reg = if !acc_sources.is_empty() { acc_sources[0] } else { 0 };
         let acc2_reg = if acc_sources.len() >= 2 { acc_sources[1] } else { acc1_reg };
-        let dst_reg = Self::get_acc_dest(op);
+
+        // Read both cm sources as 1024-bit wide registers (16 lanes each).
+        let a1 = ctx.accumulator.read_wide(acc1_reg);
+        let a2 = ctx.accumulator.read_wide(acc2_reg);
 
         // Read config register.
         let conf = Self::get_config_register(op, ctx).unwrap_or(0);
@@ -820,54 +781,91 @@ impl VectorAlu {
         let negate_acc1 = base_neg || base_negsub || sub_acc1;
         let negate_acc2 = base_sub || base_negsub || sub_acc2;
 
-        // Process both halves of the cm register (low=reg, high=reg+1).
-        for half in 0..2u8 {
-            let r1 = acc1_reg + half;
-            let r2 = acc2_reg + half;
-            let rd = dst_reg + half;
+        // Process all 16 lanes of the cm register in a single pass.
+        let mut result = [0u64; 16];
 
-            let a1 = ctx.accumulator.read(r1);
-            let a2 = ctx.accumulator.read(r2);
-            let mut result = [0u64; 8];
+        if is_float {
+            for i in 0..16 {
+                let a1_lo = if zero_acc1 { 0.0 } else { f32::from_bits(a1[i] as u32) };
+                let a1_hi = if zero_acc1 { 0.0 } else { f32::from_bits((a1[i] >> 32) as u32) };
+                let a2_lo = f32::from_bits(a2[i] as u32);
+                let a2_hi = f32::from_bits((a2[i] >> 32) as u32);
 
-            if is_float {
-                for i in 0..8 {
-                    let a1_lo = if zero_acc1 { 0.0 } else { f32::from_bits(a1[i] as u32) };
-                    let a1_hi = if zero_acc1 { 0.0 } else { f32::from_bits((a1[i] >> 32) as u32) };
-                    let a2_lo = f32::from_bits(a2[i] as u32);
-                    let a2_hi = f32::from_bits((a2[i] >> 32) as u32);
+                let v1_lo = if negate_acc1 { -a1_lo } else { a1_lo };
+                let v1_hi = if negate_acc1 { -a1_hi } else { a1_hi };
+                let v2_lo = if negate_acc2 { -a2_lo } else { a2_lo };
+                let v2_hi = if negate_acc2 { -a2_hi } else { a2_hi };
 
-                    let v1_lo = if negate_acc1 { -a1_lo } else { a1_lo };
-                    let v1_hi = if negate_acc1 { -a1_hi } else { a1_hi };
-                    let v2_lo = if negate_acc2 { -a2_lo } else { a2_lo };
-                    let v2_hi = if negate_acc2 { -a2_hi } else { a2_hi };
+                let res_lo = v1_lo + v2_lo;
+                let res_hi = v1_hi + v2_hi;
 
-                    let res_lo = v1_lo + v2_lo;
-                    let res_hi = v1_hi + v2_hi;
-
-                    result[i] = (res_lo.to_bits() as u64) | ((res_hi.to_bits() as u64) << 32);
-                }
-            } else {
-                for i in 0..8 {
-                    let v1 = if zero_acc1 { 0i64 } else { a1[i] as i64 };
-                    let v2 = a2[i] as i64;
-
-                    let v1 = if negate_acc1 { v1.wrapping_neg() } else { v1 };
-                    let v2 = if negate_acc2 { v2.wrapping_neg() } else { v2 };
-
-                    let mut res = v1.wrapping_add(v2);
-
-                    // shift16: arithmetic right shift by 16 bits
-                    if shift16 {
-                        res >>= 16;
-                    }
-
-                    result[i] = res as u64;
-                }
+                result[i] = (res_lo.to_bits() as u64) | ((res_hi.to_bits() as u64) << 32);
             }
+        } else {
+            for i in 0..16 {
+                let v1 = if zero_acc1 { 0i64 } else { a1[i] as i64 };
+                let v2 = a2[i] as i64;
 
-            ctx.accumulator.write(rd, result);
+                let v1 = if negate_acc1 { v1.wrapping_neg() } else { v1 };
+                let v2 = if negate_acc2 { v2.wrapping_neg() } else { v2 };
+
+                let mut res = v1.wrapping_add(v2);
+
+                // shift16: arithmetic right shift by 16 bits
+                if shift16 {
+                    res >>= 16;
+                }
+
+                result[i] = res as u64;
+            }
         }
+
+        // Write all 16 lanes back via write_wide.
+        let dst_reg = Self::get_acc_dest(op);
+        ctx.accumulator.write_wide(dst_reg, result);
+    }
+
+    /// Accumulator negate: dst = -src for all 16 lanes of a cm-register.
+    ///
+    /// Handles VNEG on cm-class accumulators. The config word controls
+    /// zero_acc (zero the source before negation, producing 0). Float mode
+    /// is detected from the encoding name "_F" suffix: each u64 lane holds
+    /// two fp32 values (bits [31:0] and bits [63:32]).
+    fn execute_acc_negate(op: &SlotOp, ctx: &mut ExecutionContext) {
+        let acc_reg = op.sources.iter().find_map(|s| match s {
+            Operand::AccumReg(r) => Some(*r),
+            _ => None,
+        }).unwrap_or(0);
+        let dst_reg = Self::get_acc_dest(op);
+
+        // Read source as full 1024-bit wide register.
+        let src = ctx.accumulator.read_wide(acc_reg);
+
+        let conf = Self::get_config_register(op, ctx).unwrap_or(0);
+        let zero_acc = (conf & 1) != 0;
+        let is_float = op.encoding_name.as_ref()
+            .map_or(false, |n| n.contains("_F"));
+
+        let mut result = [0u64; 16];
+
+        if is_float {
+            // Float: each u64 lane holds two fp32 values.
+            for i in 0..16 {
+                let lo = f32::from_bits(src[i] as u32);
+                let hi = f32::from_bits((src[i] >> 32) as u32);
+                let r_lo = if zero_acc { 0.0f32 } else { -lo };
+                let r_hi = if zero_acc { 0.0f32 } else { -hi };
+                result[i] = (r_lo.to_bits() as u64) | ((r_hi.to_bits() as u64) << 32);
+            }
+        } else {
+            // Integer: each u64 lane is one i64 value.
+            for i in 0..16 {
+                let v = if zero_acc { 0i64 } else { src[i] as i64 };
+                result[i] = v.wrapping_neg() as u64;
+            }
+        }
+
+        ctx.accumulator.write_wide(dst_reg, result);
     }
 
 /// Get config register value from a scalar register in sources.
@@ -3690,17 +3688,18 @@ impl VectorAlu {
                 true
             }
             SemanticOp::Neg => {
-                // Check for accumulator negate (VNEG on cm-class)
+                // Two sub-cases:
+                // 1. AccumReg source: VNEG on cm-class accumulator (1024-bit)
+                // 2. VectorReg source: element-wise vector negate (512-bit)
                 let has_acc_source = op.sources.iter()
                     .any(|s| matches!(s, Operand::AccumReg(_)));
                 if has_acc_source {
-                    // Delegate to fallback which calls execute_half's Neg handler
-                    // (it already has accumulator negate logic)
-                    return Self::execute_wide_fallback(op, ctx, semantic, et);
+                    Self::execute_acc_negate(op, ctx);
+                } else {
+                    let a = Self::get_wide_vec_source(op, ctx, 0);
+                    let result = Self::wide_element_wise_unary(&a, et, Self::vector_negate);
+                    Self::write_wide_vec_dest(op, ctx, result);
                 }
-                let a = Self::get_wide_vec_source(op, ctx, 0);
-                let result = Self::wide_element_wise_unary(&a, et, Self::vector_negate);
-                Self::write_wide_vec_dest(op, ctx, result);
                 true
             }
 
