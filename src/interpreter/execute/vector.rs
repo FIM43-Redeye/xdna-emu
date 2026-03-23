@@ -30,7 +30,7 @@
 //! - **Shuffle**: vshuffle, vpack, vunpack
 
 use crate::interpreter::bundle::{ElementType, Operand, ShufflePattern, SlotOp};
-use crate::interpreter::state::ExecutionContext;
+use crate::interpreter::state::{ExecutionContext, SrsConfig};
 use crate::interpreter::state::{Vec512, Acc1024};
 use crate::tablegen::SemanticOp;
 
@@ -1229,41 +1229,71 @@ impl VectorAlu {
 
     /// Shift-Round-Saturate: convert accumulator lanes to narrower vector output.
     ///
+    /// Thin wrapper that reads the accumulator register and delegates to
+    /// `vector_srs_from_acc` for the actual conversion logic.
+    fn vector_srs(
+        ctx: &ExecutionContext,
+        acc_reg: u8,
+        shift: u32,
+        from_type: ElementType,
+        to_type: ElementType,
+    ) -> [u32; 8] {
+        let acc = ctx.accumulator.read(acc_reg);
+        Self::vector_srs_from_acc(&acc, shift, from_type, to_type, &ctx.srs_config)
+    }
+
+    /// Core SRS logic operating on accumulator data directly.
+    ///
     /// The accumulator always has 8 lanes of 64-bit each (one value per u64).
     /// SRS reads 8 accumulator values and converts them to narrower output,
     /// packing multiple values per u32 word for 16-bit and 8-bit outputs.
+    ///
+    /// `from_type` controls how many bits of each u64 lane are meaningful:
+    /// in S32 mode only the low 32 bits matter (upper bits may be garbage),
+    /// in S64 mode the full 64 bits are used.
     ///
     /// Delegates to the `vector_srs` module which implements the full 10-mode
     /// SRS pipeline (shift, round, saturate) per AIE2 hardware specification.
     /// Float types (BFloat16, Float32) are handled inline since they bypass
     /// the integer rounding pipeline.
-    fn vector_srs(
-        ctx: &ExecutionContext,
-        acc_reg: u8,
+    ///
+    /// Used by both the narrow `vector_srs` and the wide SRS handler.
+    fn vector_srs_from_acc(
+        acc: &[u64; 8],
         shift: u32,
-        _from_type: ElementType,
+        from_type: ElementType,
         to_type: ElementType,
+        cfg: &SrsConfig,
     ) -> [u32; 8] {
-        let acc = ctx.accumulator.read(acc_reg);
         let mut result = [0u32; 8];
 
         // Read rounding and saturation from the SRS control register state.
-        let cfg = &ctx.srs_config;
         let mode = RoundingMode::from_raw(cfg.rounding_mode)
             .unwrap_or(RoundingMode::PosInf);
         let saturate = cfg.saturate();
         let sym_sat = cfg.symmetric_saturate();
 
-        let signed_output = matches!(
-            to_type,
-            ElementType::Int8 | ElementType::Int16 | ElementType::Int32
-        );
+        let signed_output = to_type.is_signed();
+
+        // Mask accumulator values to from_type width.
+        // In S32 mode, only low 32 bits are meaningful.
+        // In S64 mode (or 64-bit types), use the full u64.
+        let from_bits = from_type.bits() as u32;
+        let mask_value = |raw: u64| -> i64 {
+            if from_bits >= 64 {
+                raw as i64
+            } else {
+                // Sign-extend from from_bits width.
+                let shift_amt = 64 - from_bits;
+                ((raw as i64) << shift_amt) >> shift_amt
+            }
+        };
 
         // 8 accumulator lanes, each u64 holds one value.
         match to_type {
             ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
                 for i in 0..8 {
-                    let val = acc[i] as i64;
+                    let val = mask_value(acc[i]);
                     let out = vector_srs::srs_lane(
                         val, shift, signed_output, 32,
                         saturate, sym_sat, mode,
@@ -1274,8 +1304,8 @@ impl VectorAlu {
             ElementType::Int16 | ElementType::UInt16 => {
                 // 8 acc lanes -> 8 x 16-bit, packed 2 per u32 (4 words used)
                 for i in 0..4 {
-                    let val0 = acc[i * 2] as i64;
-                    let val1 = acc[i * 2 + 1] as i64;
+                    let val0 = mask_value(acc[i * 2]);
+                    let val1 = mask_value(acc[i * 2 + 1]);
                     let out0 = vector_srs::srs_lane(
                         val0, shift, signed_output, 16,
                         saturate, sym_sat, mode,
@@ -1293,7 +1323,7 @@ impl VectorAlu {
                     for j in 0..4 {
                         let lane = i * 4 + j;
                         if lane < 8 {
-                            let val = acc[lane] as i64;
+                            let val = mask_value(acc[lane]);
                             let out = vector_srs::srs_lane(
                                 val, shift, signed_output, 8,
                                 saturate, sym_sat, mode,
@@ -4687,5 +4717,40 @@ mod tests {
         let result = VectorAlu::wide_vector_align(&src1, &src2, 60);
         assert_eq!(result[0], 0xAAAA_AAAA, "last word of src1 at result[0]");
         assert_eq!(result[1], 0xBBBB_BBBB, "first word of src2 at result[1]");
+    }
+
+    #[test]
+    fn test_vector_srs_from_type_masks_accumulator() {
+        // When from_type is Int32, only the low 32 bits of each u64
+        // accumulator lane should be used. Upper bits should be ignored.
+        let mut ctx = make_ctx();
+        // Set acc lane 0: upper 32 bits = garbage, lower 32 bits = 100.
+        // With saturation enabled and signed 16-bit output, value 100
+        // should survive. But without masking, the garbage upper bits
+        // (0xDEAD_BEEF) make the i64 value huge and saturation clamps
+        // to i16::MAX (32767) instead of 100.
+        ctx.accumulator.write(0, [
+            0xDEAD_BEEF_0000_0064, // upper garbage, lower = 100
+            0, 0, 0, 0, 0, 0, 0,
+        ]);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Srs)
+            .as_vector(ElementType::Int16) // 16-bit output
+            .with_dest(Operand::VectorReg(0))
+            .with_source(Operand::AccumReg(0))
+            .with_source(Operand::Immediate(0)); // shift=0
+        op.from_type = Some(ElementType::Int32); // 32-bit accumulator mode
+
+        // Floor rounding, saturation ON, signed output.
+        // Without masking: i64 value is huge -> saturates to 32767.
+        // With masking: value is 100 -> passes through as 100.
+        ctx.srs_config.rounding_mode = 0;
+        ctx.srs_config.saturation_mode = 1; // Saturate
+        ctx.srs_config.srs_sign = true;
+
+        VectorAlu::execute(&op, &mut ctx);
+        let result = ctx.vector.read(0);
+        let lo16 = result[0] as i16;
+        assert_eq!(lo16, 100, "from_type=Int32 should mask to low 32 bits");
     }
 }
