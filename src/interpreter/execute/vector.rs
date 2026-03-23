@@ -1002,7 +1002,7 @@ impl VectorAlu {
                 }
                 ctx.accumulator.write(acc_reg, new_acc);
             }
-            ElementType::Int32 | ElementType::UInt32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
                 // 8 x int32 matrix multiply-accumulate
                 let mut new_acc = current;
                 for i in 0..8 {
@@ -1081,7 +1081,7 @@ impl VectorAlu {
                 }
                 ctx.accumulator.write(acc_reg, new_acc);
             }
-            ElementType::Int32 | ElementType::UInt32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
                 let mut new_acc = current;
                 for i in 0..8 {
                     let prod = (a[i] as u64) * (b[i] as u64);
@@ -1166,7 +1166,7 @@ impl VectorAlu {
         let acc2 = ctx.accumulator.read(acc2_reg);
 
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
                 let mut new_acc = [0u64; 8];
                 for i in 0..8 {
                     let prod = (a[i] as u64) * (b[i] as u64);
@@ -1261,7 +1261,7 @@ impl VectorAlu {
 
         // 8 accumulator lanes, each u64 holds one value.
         match to_type {
-            ElementType::Int32 | ElementType::UInt32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
                 for i in 0..8 {
                     let val = acc[i] as i64;
                     let out = vector_srs::srs_lane(
@@ -1406,7 +1406,7 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
                 for i in 0..8 {
                     if sel[i] & 1 != 0 {
                         result[i] = s1[i].wrapping_sub(s2[i]);
@@ -1454,7 +1454,7 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
                 // 8 × 32-bit integer lanes
                 for i in 0..8 {
                     result[i] = a[i].wrapping_add(b[i]);
@@ -1515,7 +1515,7 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
                 for i in 0..8 {
                     result[i] = a[i].wrapping_sub(b[i]);
                 }
@@ -1571,7 +1571,7 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
                 for i in 0..8 {
                     result[i] = a[i].wrapping_mul(b[i]);
                 }
@@ -1633,7 +1633,7 @@ impl VectorAlu {
         let current = ctx.accumulator.read(acc_reg);
 
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
                 // 8 × 32-bit → 8 × 64-bit accumulator lanes
                 let mut new_acc = [0u64; 8];
                 for i in 0..8 {
@@ -1705,12 +1705,12 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 => {
+            ElementType::Int32 | ElementType::Int64 => {
                 for i in 0..8 {
                     result[i] = std::cmp::min(a[i] as i32, b[i] as i32) as u32;
                 }
             }
-            ElementType::UInt32 => {
+            ElementType::UInt32 | ElementType::UInt64 => {
                 for i in 0..8 {
                     result[i] = std::cmp::min(a[i], b[i]);
                 }
@@ -1789,12 +1789,12 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 => {
+            ElementType::Int32 | ElementType::Int64 => {
                 for i in 0..8 {
                     result[i] = std::cmp::max(a[i] as i32, b[i] as i32) as u32;
                 }
             }
-            ElementType::UInt32 => {
+            ElementType::UInt32 | ElementType::UInt64 => {
                 for i in 0..8 {
                     result[i] = std::cmp::max(a[i], b[i]);
                 }
@@ -1947,7 +1947,7 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
                 for i in 0..8 {
                     result[i] = if a[i] == b[i] { 0xFFFF_FFFF } else { 0 };
                 }
@@ -2029,7 +2029,7 @@ impl VectorAlu {
     /// Returns the element at the given lane index, converted to a u32.
     fn vector_extract(src: &[u32; 8], index: u32, elem_type: ElementType) -> u32 {
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
                 // 8 lanes of 32-bit elements
                 let lane = (index as usize) & 0x7;
                 src[lane]
@@ -2112,7 +2112,7 @@ impl VectorAlu {
 
     fn vector_insert(dst: &mut [u32; 8], value: u32, index: u32, elem_type: ElementType) {
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
                 // 8 lanes of 32-bit elements
                 let lane = (index as usize) & 0x7;
                 dst[lane] = value;
@@ -2146,7 +2146,7 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
                 // 8 lanes of 32-bit elements
                 for i in 0..8 {
                     result[i] = if mask[i] != 0 { src1[i] } else { src2[i] };
@@ -2194,7 +2194,7 @@ impl VectorAlu {
     fn expand_select_mask(sel: u32, elem_type: ElementType) -> [u32; 8] {
         let mut mask = [0u32; 8];
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
                 // 8 elements, 1 bit each
                 for i in 0..8 {
                     mask[i] = if (sel >> i) & 1 != 0 { 1 } else { 0 };
@@ -2230,7 +2230,7 @@ impl VectorAlu {
     /// Returns the element value (zero-extended to u32).
     fn extract_element_by_index(src: &[u32; 8], index: u32, et: ElementType) -> u32 {
         match et {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
                 let idx = (index as usize) & 7;
                 src[idx]
             }
@@ -2253,7 +2253,7 @@ impl VectorAlu {
 
     fn vector_broadcast(value: u32, elem_type: ElementType) -> [u32; 8] {
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
                 // Broadcast 32-bit value to all 8 lanes
                 [value; 8]
             }
@@ -2278,7 +2278,7 @@ impl VectorAlu {
     fn vector_shift_left(src: &[u32; 8], shift: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
         let mut result = [0u32; 8];
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
                 for i in 0..8 {
                     let sh = shift[i] & 0x1F;
                     result[i] = src[i].wrapping_shl(sh);
@@ -2315,7 +2315,7 @@ impl VectorAlu {
     fn vector_shift_right_logical(src: &[u32; 8], shift: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
         let mut result = [0u32; 8];
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
                 for i in 0..8 {
                     let sh = shift[i] & 0x1F;
                     result[i] = src[i].wrapping_shr(sh);
@@ -2352,7 +2352,7 @@ impl VectorAlu {
     fn vector_shift_right_arith(src: &[u32; 8], shift: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
         let mut result = [0u32; 8];
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
                 for i in 0..8 {
                     let sh = (shift[i] & 0x1F) as u32;
                     result[i] = ((src[i] as i32).wrapping_shr(sh)) as u32;
@@ -2429,7 +2429,7 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 => {
+            ElementType::Int32 | ElementType::Int64 => {
                 for i in 0..8 {
                     let val = src[i] as i32;
                     // If val > 0, abs(val) = val (since val is positive)
@@ -2437,7 +2437,7 @@ impl VectorAlu {
                     result[i] = if val > 0 { val as u32 } else { src[i] };
                 }
             }
-            ElementType::UInt32 => {
+            ElementType::UInt32 | ElementType::UInt64 => {
                 // Unsigned: all values are >= 0, so "greater than zero" means != 0
                 // abs() is identity for unsigned
                 result = *src;
@@ -2493,13 +2493,13 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 => {
+            ElementType::Int32 | ElementType::Int64 => {
                 for i in 0..8 {
                     let val = src[i] as i32;
                     result[i] = if val > 0 { (-val) as u32 } else { src[i] };
                 }
             }
-            ElementType::UInt32 => {
+            ElementType::UInt32 | ElementType::UInt64 => {
                 // For unsigned, "negate" wraps around
                 for i in 0..8 {
                     result[i] = if src[i] > 0 { 0u32.wrapping_sub(src[i]) } else { src[i] };
@@ -2572,14 +2572,14 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 => {
+            ElementType::Int32 | ElementType::Int64 => {
                 for i in 0..8 {
                     let c = cmp[i] as i32;
                     let v = s1[i] as i32;
                     result[i] = if c > 0 { v.wrapping_neg() as u32 } else { s1[i] };
                 }
             }
-            ElementType::UInt32 => {
+            ElementType::UInt32 | ElementType::UInt64 => {
                 for i in 0..8 {
                     let c = cmp[i];
                     result[i] = if c > 0 { (s1[i] as i32).wrapping_neg() as u32 } else { s1[i] };
@@ -2648,14 +2648,14 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 => {
+            ElementType::Int32 | ElementType::Int64 => {
                 for i in 0..8 {
                     let c = cmp[i] as i32;
                     let v = s1[i] as i32;
                     result[i] = if c < 0 { v.wrapping_neg() as u32 } else { s1[i] };
                 }
             }
-            ElementType::UInt32 | ElementType::Float32 => {
+            ElementType::UInt32 | ElementType::UInt64 | ElementType::Float32 => {
                 // Unsigned: cmp is never < 0 (treated as unsigned), pass through.
                 // Float: check sign bit.
                 if matches!(elem_type, ElementType::Float32) {
@@ -2706,14 +2706,14 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 => {
+            ElementType::Int32 | ElementType::Int64 => {
                 for i in 0..8 {
                     let val = src[i] as i32;
                     // Hardware saturates: abs(MIN) = MAX (not overflow).
                     result[i] = val.saturating_abs() as u32;
                 }
             }
-            ElementType::UInt32 => {
+            ElementType::UInt32 | ElementType::UInt64 => {
                 // Unsigned values are never < 0, so pass through
                 result = *src;
             }
@@ -2776,7 +2776,7 @@ impl VectorAlu {
         let mut new_acc = current;
 
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
                 for i in 0..8 {
                     new_acc[i] = current[i].wrapping_add(src[i] as u64);
                 }
@@ -2823,12 +2823,12 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 => {
+            ElementType::Int32 | ElementType::Int64 => {
                 for i in 0..8 {
                     result[i] = (src[i] as i32).wrapping_neg() as u32;
                 }
             }
-            ElementType::UInt32 => {
+            ElementType::UInt32 | ElementType::UInt64 => {
                 for i in 0..8 {
                     result[i] = 0u32.wrapping_sub(src[i]);
                 }
@@ -2898,12 +2898,12 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 => {
+            ElementType::Int32 | ElementType::Int64 => {
                 for i in 0..8 {
                     result[i] = ((-(a[i] as i32)) as i64 + (b[i] as i32) as i64) as u32;
                 }
             }
-            ElementType::UInt32 => {
+            ElementType::UInt32 | ElementType::UInt64 => {
                 for i in 0..8 {
                     result[i] = b[i].wrapping_sub(a[i]);
                 }
@@ -2996,12 +2996,12 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 => {
+            ElementType::Int32 | ElementType::Int64 => {
                 for i in 0..8 {
                     result[i] = if (a[i] as i32) >= (b[i] as i32) { !0 } else { 0 };
                 }
             }
-            ElementType::UInt32 => {
+            ElementType::UInt32 | ElementType::UInt64 => {
                 for i in 0..8 {
                     result[i] = if a[i] >= b[i] { !0 } else { 0 };
                 }
@@ -3080,12 +3080,12 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 => {
+            ElementType::Int32 | ElementType::Int64 => {
                 for i in 0..8 {
                     result[i] = if (a[i] as i32) < (b[i] as i32) { !0 } else { 0 };
                 }
             }
-            ElementType::UInt32 => {
+            ElementType::UInt32 | ElementType::UInt64 => {
                 for i in 0..8 {
                     result[i] = if a[i] < b[i] { !0 } else { 0 };
                 }
@@ -3164,7 +3164,7 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 | ElementType::UInt32 => {
+            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
                 for i in 0..8 {
                     result[i] = if a[i] == 0 { !0 } else { 0 };
                 }
@@ -3254,14 +3254,14 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 => {
+            ElementType::Int32 | ElementType::Int64 => {
                 for i in 0..8 {
                     let va = a[i] as i32;
                     let vb = b[i] as i32;
                     result[i] = if va < vb { va.wrapping_sub(vb) as u32 } else { a[i] };
                 }
             }
-            ElementType::UInt32 => {
+            ElementType::UInt32 | ElementType::UInt64 => {
                 for i in 0..8 {
                     result[i] = if a[i] < b[i] { a[i].wrapping_sub(b[i]) } else { a[i] };
                 }
@@ -3340,14 +3340,14 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 => {
+            ElementType::Int32 | ElementType::Int64 => {
                 for i in 0..8 {
                     let va = a[i] as i32;
                     let vb = b[i] as i32;
                     result[i] = if va >= vb { va.wrapping_sub(vb) as u32 } else { a[i] };
                 }
             }
-            ElementType::UInt32 => {
+            ElementType::UInt32 | ElementType::UInt64 => {
                 for i in 0..8 {
                     result[i] = if a[i] >= b[i] { a[i].wrapping_sub(b[i]) } else { a[i] };
                 }
@@ -3427,7 +3427,7 @@ impl VectorAlu {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 => {
+            ElementType::Int32 | ElementType::Int64 => {
                 for i in 0..8 {
                     let va = a[i] as i32;
                     let vb = b[i] as i32;
@@ -3435,7 +3435,7 @@ impl VectorAlu {
                     result[i] = diff.max(0) as u32;
                 }
             }
-            ElementType::UInt32 => {
+            ElementType::UInt32 | ElementType::UInt64 => {
                 for i in 0..8 {
                     result[i] = a[i].saturating_sub(b[i]);
                 }

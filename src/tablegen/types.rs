@@ -642,6 +642,10 @@ pub enum ElementType {
     Int32,
     /// 32-bit unsigned integer.
     UInt32,
+    /// 64-bit signed integer (accumulator lanes in S64 mode).
+    Int64,
+    /// 64-bit unsigned integer (accumulator lanes in D64 mode).
+    UInt64,
     /// 16-bit brain floating point.
     BFloat16,
     /// 32-bit floating point.
@@ -655,6 +659,7 @@ impl ElementType {
             ElementType::Int8 | ElementType::UInt8 => 8,
             ElementType::Int16 | ElementType::UInt16 | ElementType::BFloat16 => 16,
             ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => 32,
+            ElementType::Int64 | ElementType::UInt64 => 64,
         }
     }
 
@@ -665,7 +670,7 @@ impl ElementType {
 
     /// Whether this element type is signed (Int8, Int16, Int32).
     pub fn is_signed(self) -> bool {
-        matches!(self, ElementType::Int8 | ElementType::Int16 | ElementType::Int32)
+        matches!(self, ElementType::Int8 | ElementType::Int16 | ElementType::Int32 | ElementType::Int64)
     }
 }
 
@@ -1470,5 +1475,23 @@ mod tests {
             SemanticOp::from_intrinsic("int_aie2_I1024_I1024_ACC1024_accfloat_bf_mul_conf"),
             Some(SemanticOp::MatMul)
         );
+    }
+
+    #[test]
+    fn test_int64_bits() {
+        assert_eq!(ElementType::Int64.bits(), 64);
+        assert_eq!(ElementType::UInt64.bits(), 64);
+    }
+
+    #[test]
+    fn test_int64_lanes() {
+        assert_eq!(ElementType::Int64.lanes_256(), 4);
+        assert_eq!(ElementType::UInt64.lanes_256(), 4);
+    }
+
+    #[test]
+    fn test_int64_signed() {
+        assert!(ElementType::Int64.is_signed());
+        assert!(!ElementType::UInt64.is_signed());
     }
 }

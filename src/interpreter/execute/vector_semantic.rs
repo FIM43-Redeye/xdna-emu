@@ -196,7 +196,7 @@ pub(crate) fn vector_add(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
     let mut result = [0u32; 8];
 
     match elem_type {
-        ElementType::Int32 | ElementType::UInt32 => {
+        ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
             for i in 0..8 {
                 result[i] = a[i].wrapping_add(b[i]);
             }
@@ -252,7 +252,7 @@ pub(crate) fn vector_sub(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
     let mut result = [0u32; 8];
 
     match elem_type {
-        ElementType::Int32 | ElementType::UInt32 => {
+        ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
             for i in 0..8 {
                 result[i] = a[i].wrapping_sub(b[i]);
             }
@@ -308,7 +308,7 @@ pub(crate) fn vector_mul(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
     let mut result = [0u32; 8];
 
     match elem_type {
-        ElementType::Int32 | ElementType::UInt32 => {
+        ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
             for i in 0..8 {
                 result[i] = a[i].wrapping_mul(b[i]);
             }
@@ -367,7 +367,7 @@ pub(crate) fn vector_neg(a: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
     let mut result = [0u32; 8];
 
     match elem_type {
-        ElementType::Int32 | ElementType::UInt32 => {
+        ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
             for i in 0..8 {
                 result[i] = (a[i] as i32).wrapping_neg() as u32;
             }
@@ -416,7 +416,7 @@ pub(crate) fn vector_cmp_eq(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) 
     let mut result = [0u32; 8];
 
     match elem_type {
-        ElementType::Int32 | ElementType::UInt32 | ElementType::Float32 => {
+        ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 | ElementType::Float32 => {
             for i in 0..8 {
                 result[i] = if a[i] == b[i] { 0xFFFF_FFFF } else { 0 };
             }
@@ -454,12 +454,12 @@ pub(crate) fn vector_min(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
     let mut result = [0u32; 8];
 
     match elem_type {
-        ElementType::Int32 => {
+        ElementType::Int32 | ElementType::Int64 => {
             for i in 0..8 {
                 result[i] = std::cmp::min(a[i] as i32, b[i] as i32) as u32;
             }
         }
-        ElementType::UInt32 => {
+        ElementType::UInt32 | ElementType::UInt64 => {
             for i in 0..8 {
                 result[i] = std::cmp::min(a[i], b[i]);
             }
@@ -538,12 +538,12 @@ pub(crate) fn vector_max(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
     let mut result = [0u32; 8];
 
     match elem_type {
-        ElementType::Int32 => {
+        ElementType::Int32 | ElementType::Int64 => {
             for i in 0..8 {
                 result[i] = std::cmp::max(a[i] as i32, b[i] as i32) as u32;
             }
         }
-        ElementType::UInt32 => {
+        ElementType::UInt32 | ElementType::UInt64 => {
             for i in 0..8 {
                 result[i] = std::cmp::max(a[i], b[i]);
             }
@@ -661,7 +661,7 @@ pub(crate) fn vector_shl(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
     let mut result = [0u32; 8];
 
     match elem_type {
-        ElementType::Int32 | ElementType::UInt32 => {
+        ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
             for i in 0..8 {
                 let shift = (b[i] & 0x1F) as u32;
                 result[i] = a[i].wrapping_shl(shift);
@@ -707,7 +707,7 @@ pub(crate) fn vector_srl(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
     let mut result = [0u32; 8];
 
     match elem_type {
-        ElementType::Int32 | ElementType::UInt32 => {
+        ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
             for i in 0..8 {
                 let shift = (b[i] & 0x1F) as u32;
                 result[i] = a[i].wrapping_shr(shift);
@@ -752,13 +752,13 @@ pub(crate) fn vector_sra(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
     let mut result = [0u32; 8];
 
     match elem_type {
-        ElementType::Int32 => {
+        ElementType::Int32 | ElementType::Int64 => {
             for i in 0..8 {
                 let shift = (b[i] & 0x1F) as u32;
                 result[i] = (a[i] as i32).wrapping_shr(shift) as u32;
             }
         }
-        ElementType::UInt32 => {
+        ElementType::UInt32 | ElementType::UInt64 => {
             // Arithmetic shift on unsigned is same as logical shift
             for i in 0..8 {
                 let shift = (b[i] & 0x1F) as u32;
@@ -827,12 +827,12 @@ pub(crate) fn vector_abs(a: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
     let mut result = [0u32; 8];
 
     match elem_type {
-        ElementType::Int32 => {
+        ElementType::Int32 | ElementType::Int64 => {
             for i in 0..8 {
                 result[i] = (a[i] as i32).unsigned_abs();
             }
         }
-        ElementType::UInt32 => {
+        ElementType::UInt32 | ElementType::UInt64 => {
             result = *a; // Already unsigned
         }
         ElementType::Float32 => {

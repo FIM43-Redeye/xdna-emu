@@ -507,6 +507,8 @@ fn element_suffix(et: ElementType) -> &'static str {
         ElementType::UInt16 => "u16",
         ElementType::Int32 => "i32",
         ElementType::UInt32 => "u32",
+        ElementType::Int64 => "i64",
+        ElementType::UInt64 => "u64",
         ElementType::BFloat16 => "bf16",
         ElementType::Float32 => "f32",
     }

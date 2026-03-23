@@ -417,8 +417,8 @@ pub fn matmul_sparse(
         ElementType::BFloat16 | ElementType::Float32 => {
             sparse_matmul_bf16xbf16(acc, a, b_data, b_mask, subtract);
         }
-        ElementType::Int32 | ElementType::UInt32 => {
-            // int32 x int16 sparse: acc_cmb=2
+        ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
+            // int32/int64 x int16 sparse: acc_cmb=2
             sparse_matmul_i16xi16(acc, a, b_data, b_mask, signed_a, signed_b, subtract);
         }
     }

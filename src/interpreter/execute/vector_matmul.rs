@@ -143,6 +143,7 @@ pub fn matmul_dense(
         ElementType::BFloat16 => matmul_bf16xbf16(acc, a, b, false),
         ElementType::Int32 => matmul_i32xi16(acc, a, b, true, true, false),
         ElementType::UInt32 => matmul_i32xi16(acc, a, b, false, false, false),
+        ElementType::Int64 | ElementType::UInt64 => matmul_i32xi16(acc, a, b, signed_a, signed_b, false),
         ElementType::Float32 => matmul_bf16xbf16(acc, a, b, false),
     }
 }
@@ -164,6 +165,7 @@ pub fn matmul_sub(
         ElementType::BFloat16 => matmul_bf16xbf16(acc, a, b, true),
         ElementType::Int32 => matmul_i32xi16(acc, a, b, true, true, true),
         ElementType::UInt32 => matmul_i32xi16(acc, a, b, false, false, true),
+        ElementType::Int64 | ElementType::UInt64 => matmul_i32xi16(acc, a, b, signed_a, signed_b, true),
         ElementType::Float32 => matmul_bf16xbf16(acc, a, b, true),
     }
 }
