@@ -33,7 +33,8 @@ pub use resolver::{
     build_decoder_tables, AddressingMode, CompositeEncoder, DecoderIndex, InstrEncoding,
     InstrMemWidth, OperandField, OperandType, RegisterKind, ResolveError, Resolver, SlotIndex,
     classify_operand_type, detect_addressing_mode, detect_mem_width,
-    infer_branch_condition, infer_element_type, infer_select_variant, refine_branch_semantic,
+    infer_branch_condition, infer_dual_element_types, infer_element_type, infer_select_variant,
+    refine_branch_semantic,
 };
 pub use types::{
     BranchCondition, CompositeFormatDef, ElementType, EncodingPart, ImplicitReg,

@@ -182,6 +182,10 @@ fn format_encoding(code: &mut String, enc: &BuildInstrEncoding) {
         Some(s) => writeln!(code, "            element_type: Some({}),", s).unwrap(),
         None => writeln!(code, "            element_type: None,").unwrap(),
     }
+    match &enc.from_type {
+        Some(s) => writeln!(code, "            from_type: Some({}),", s).unwrap(),
+        None => writeln!(code, "            from_type: None,").unwrap(),
+    }
     match &enc.branch_condition {
         Some(s) => writeln!(code, "            branch_condition: Some({}),", s).unwrap(),
         None => writeln!(code, "            branch_condition: None,").unwrap(),

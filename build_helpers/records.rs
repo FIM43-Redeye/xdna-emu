@@ -140,6 +140,8 @@ pub struct BuildInstrEncoding {
     pub has_complete_decoder: bool,
     /// Rust expression string for ElementType variant, or None.
     pub element_type: Option<String>,
+    /// Rust expression string for source ElementType (SRS/UPS dual-type), or None.
+    pub from_type: Option<String>,
     /// Rust expression string for BranchCondition variant, or None.
     pub branch_condition: Option<String>,
     pub is_vector: bool,

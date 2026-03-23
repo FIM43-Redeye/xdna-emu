@@ -522,6 +522,11 @@ pub struct InstrEncoding {
     /// None for instructions that don't have an element type suffix.
     pub element_type: Option<ElementType>,
 
+    /// Source element type for dual-type instructions (SRS/UPS).
+    /// The output type goes in `element_type`; the input type goes here.
+    /// None for single-type instructions.
+    pub from_type: Option<ElementType>,
+
     /// Branch condition inferred from the mnemonic (e.g., "jnz" -> NotZero).
     /// Only set for BrCond instructions.
     pub branch_condition: Option<BranchCondition>,
@@ -735,7 +740,9 @@ impl<'a> Resolver<'a> {
         // Spill/fill instructions implicitly use SP as the base address.
         // Detected from TableGen Uses = [SP] attribute.
         let is_sp_relative = instr.attributes.uses.iter().any(|u| u == "SP");
-        let element_type = infer_element_type(&instr.mnemonic);
+        let (dual_et, dual_ft) = infer_dual_element_types(&instr.name);
+        let element_type = dual_et.or_else(|| infer_element_type(&instr.mnemonic));
+        let from_type = dual_ft;
         let branch_condition = infer_branch_condition(&instr.mnemonic, semantic);
         let select_variant = infer_select_variant(&instr.mnemonic, semantic);
 
@@ -759,6 +766,7 @@ impl<'a> Resolver<'a> {
             // Regex parser doesn't parse hasCompleteDecoder; assume true (safe default)
             has_complete_decoder: true,
             element_type,
+            from_type,
             branch_condition,
             is_vector,
             select_variant,
@@ -1188,6 +1196,58 @@ pub fn infer_element_type(mnemonic: &str) -> Option<ElementType> {
     } else {
         None
     }
+}
+
+/// Parse a type token like "S16", "D32", "S64" into an ElementType.
+fn parse_type_token(token: &str) -> Option<ElementType> {
+    match token {
+        "S8" => Some(ElementType::Int8),
+        "D8" => Some(ElementType::UInt8),
+        "S16" => Some(ElementType::Int16),
+        "D16" => Some(ElementType::UInt16),
+        "S32" => Some(ElementType::Int32),
+        "D32" => Some(ElementType::UInt32),
+        "S64" => Some(ElementType::Int64),
+        "D64" => Some(ElementType::UInt64),
+        _ => None,
+    }
+}
+
+/// Infer both element types for dual-type instructions (SRS/UPS).
+///
+/// Encoding names follow two patterns:
+/// - Standalone: `V{SRS|UPS}_{OUT}_{IN}_*`
+/// - Fused: `V{LDA|ST}_{2D|3D}_{UPS|SRS}_{OUT}_{IN}*`
+///
+/// Returns `(element_type, from_type)` where element_type is the OUTPUT
+/// type and from_type is the INPUT type. Returns `(None, None)` for
+/// non-SRS/UPS instructions.
+pub fn infer_dual_element_types(name: &str) -> (Option<ElementType>, Option<ElementType>) {
+    let parts: Vec<&str> = name.split('_').collect();
+
+    // Pattern 1: V{SRS|UPS}_{OUT}_{IN}_*
+    if parts.len() >= 3 && (parts[0] == "VSRS" || parts[0] == "VUPS") {
+        if let (Some(out_type), Some(in_type)) =
+            (parse_type_token(parts[1]), parse_type_token(parts[2]))
+        {
+            return (Some(out_type), Some(in_type));
+        }
+    }
+
+    // Pattern 2: V{LDA|ST}_{2D|3D}_{UPS|SRS}_{OUT}_{IN}*
+    if parts.len() >= 5 {
+        let is_fused = (parts[0] == "VLDA" || parts[0] == "VST")
+            && (parts[2] == "UPS" || parts[2] == "SRS");
+        if is_fused {
+            if let (Some(out_type), Some(in_type)) =
+                (parse_type_token(parts[3]), parse_type_token(parts[4]))
+            {
+                return (Some(out_type), Some(in_type));
+            }
+        }
+    }
+
+    (None, None)
 }
 
 /// Refine a Br semantic to BrCond when the mnemonic indicates a condition.
@@ -1889,5 +1949,57 @@ mod tests {
                 field.name, expected_output,
             );
         }
+    }
+
+    #[test]
+    fn test_infer_dual_element_types_srs() {
+        let (et, ft) = infer_dual_element_types("VSRS_S16_S32_mv_w_srs");
+        assert_eq!(et, Some(ElementType::Int16));
+        assert_eq!(ft, Some(ElementType::Int32));
+
+        let (et, ft) = infer_dual_element_types("VSRS_D32_S64_mv_x_srs");
+        assert_eq!(et, Some(ElementType::UInt32));
+        assert_eq!(ft, Some(ElementType::Int64));
+
+        let (et, ft) = infer_dual_element_types("VSRS_S8_S32_mv_w_srs");
+        assert_eq!(et, Some(ElementType::Int8));
+        assert_eq!(ft, Some(ElementType::Int32));
+    }
+
+    #[test]
+    fn test_infer_dual_element_types_ups() {
+        let (et, ft) = infer_dual_element_types("VUPS_S32_D16_mv_ups_w2b");
+        assert_eq!(et, Some(ElementType::Int32));
+        assert_eq!(ft, Some(ElementType::UInt16));
+
+        let (et, ft) = infer_dual_element_types("VUPS_S64_S32_mv_ups_w2b");
+        assert_eq!(et, Some(ElementType::Int64));
+        assert_eq!(ft, Some(ElementType::Int32));
+
+        let (et, ft) = infer_dual_element_types("VUPS_S32_S16_mv_ups_x2c");
+        assert_eq!(et, Some(ElementType::Int32));
+        assert_eq!(ft, Some(ElementType::Int16));
+    }
+
+    #[test]
+    fn test_infer_dual_element_types_fused() {
+        let (et, ft) = infer_dual_element_types("VLDA_2D_UPS_S32_D16");
+        assert_eq!(et, Some(ElementType::Int32));
+        assert_eq!(ft, Some(ElementType::UInt16));
+
+        let (et, ft) = infer_dual_element_types("VST_2D_SRS_D8_S32");
+        assert_eq!(et, Some(ElementType::UInt8));
+        assert_eq!(ft, Some(ElementType::Int32));
+    }
+
+    #[test]
+    fn test_infer_dual_element_types_non_srs_ups() {
+        let (et, ft) = infer_dual_element_types("VADD_32");
+        assert_eq!(et, None);
+        assert_eq!(ft, None);
+
+        let (et, ft) = infer_dual_element_types("VMAC_vmac_cm_core_dense");
+        assert_eq!(et, None);
+        assert_eq!(ft, None);
     }
 }

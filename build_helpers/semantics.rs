@@ -318,6 +318,56 @@ pub fn infer_element_type(mnemonic: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Dual-type inference (SRS/UPS)
+// ---------------------------------------------------------------------------
+
+/// Parse a type token like "S16", "D32" into an ElementType expression string.
+fn parse_type_token_str(token: &str) -> Option<String> {
+    match token {
+        "S8" => Some("ElementType::Int8".to_string()),
+        "D8" => Some("ElementType::UInt8".to_string()),
+        "S16" => Some("ElementType::Int16".to_string()),
+        "D16" => Some("ElementType::UInt16".to_string()),
+        "S32" => Some("ElementType::Int32".to_string()),
+        "D32" => Some("ElementType::UInt32".to_string()),
+        "S64" => Some("ElementType::Int64".to_string()),
+        "D64" => Some("ElementType::UInt64".to_string()),
+        _ => None,
+    }
+}
+
+/// Infer both element types for dual-type instructions (SRS/UPS).
+///
+/// Returns `(element_type, from_type)` as Rust expression strings.
+pub fn infer_dual_element_types(name: &str) -> (Option<String>, Option<String>) {
+    let parts: Vec<&str> = name.split('_').collect();
+
+    // Pattern 1: V{SRS|UPS}_{OUT}_{IN}_*
+    if parts.len() >= 3 && (parts[0] == "VSRS" || parts[0] == "VUPS") {
+        if let (Some(out_type), Some(in_type)) =
+            (parse_type_token_str(parts[1]), parse_type_token_str(parts[2]))
+        {
+            return (Some(out_type), Some(in_type));
+        }
+    }
+
+    // Pattern 2: V{LDA|ST}_{2D|3D}_{UPS|SRS}_{OUT}_{IN}*
+    if parts.len() >= 5 {
+        let is_fused = (parts[0] == "VLDA" || parts[0] == "VST")
+            && (parts[2] == "UPS" || parts[2] == "SRS");
+        if is_fused {
+            if let (Some(out_type), Some(in_type)) =
+                (parse_type_token_str(parts[3]), parse_type_token_str(parts[4]))
+            {
+                return (Some(out_type), Some(in_type));
+            }
+        }
+    }
+
+    (None, None)
+}
+
+// ---------------------------------------------------------------------------
 // Branch semantic refinement
 // ---------------------------------------------------------------------------
 
@@ -487,7 +537,9 @@ impl BuildInstrRecord {
 
         let is_vector = self.mnemonic.starts_with('v') || self.mnemonic.starts_with('V');
         let is_sp_relative = self.uses.iter().any(|u| u == "SP");
-        let element_type = infer_element_type(&self.mnemonic);
+        let (dual_et, dual_ft) = infer_dual_element_types(&self.name);
+        let element_type = dual_et.or_else(|| infer_element_type(&self.mnemonic));
+        let from_type = dual_ft;
         let branch_condition =
             infer_branch_condition(&self.mnemonic, semantic.as_deref());
         let select_variant =
@@ -513,6 +565,7 @@ impl BuildInstrRecord {
             mem_width: detect_mem_width(&self.mnemonic),
             has_complete_decoder: self.has_complete_decoder,
             element_type,
+            from_type,
             branch_condition,
             is_vector,
             select_variant,

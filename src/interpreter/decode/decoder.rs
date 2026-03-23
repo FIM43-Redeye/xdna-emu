@@ -851,6 +851,7 @@ impl InstructionDecoder {
         slot_op.is_wide_vector = enc.operand_fields.iter()
             .any(|f| f.operand_type == OperandType::Register(RegisterKind::Vector512));
         slot_op.element_type = enc.element_type;
+        slot_op.from_type = enc.from_type;
         slot_op.mem_width = match enc.mem_width {
             InstrMemWidth::Byte => MemWidth::Byte,
             InstrMemWidth::HalfWord => MemWidth::HalfWord,
@@ -1616,6 +1617,7 @@ mod tests {
                 mem_width: if is_vector { InstrMemWidth::Vector256 } else { InstrMemWidth::Word },
                 has_complete_decoder: true,
                 element_type: None,
+                from_type: None,
                 branch_condition: None,
                 is_vector,
                 select_variant: None,
@@ -1701,6 +1703,7 @@ mod tests {
             mem_width: InstrMemWidth::Word,
             has_complete_decoder: true,
             element_type: None,
+            from_type: None,
             branch_condition: None,
             is_vector: false,
             select_variant: None,
@@ -1827,6 +1830,7 @@ mod tests {
             mem_width: InstrMemWidth::Word,
             has_complete_decoder: true,
             element_type: crate::tablegen::infer_element_type(mnemonic),
+            from_type: None,
             branch_condition: None,
             is_vector: true,
             select_variant: None,
