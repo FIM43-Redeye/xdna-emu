@@ -65,12 +65,16 @@ impl VectorAlu {
         // 1. is_wide_vector: instruction has Vector512 operands (x-registers)
         // 2. AccumReg-only ops (VADD, VSUB, VNEG on cm-class accumulators)
         //    don't have Vector512 operands but always operate on 1024-bit
-        //    cm registers.
-        let has_acc_source = op.sources.iter()
-            .any(|s| matches!(s, Operand::AccumReg(_)));
-        let has_vec_source = op.sources.iter()
-            .any(|s| matches!(s, Operand::VectorReg(_)));
-        let is_accum_only = has_acc_source && !has_vec_source;
+        //    cm registers. Only Accumulate and Neg semantics qualify --
+        //    SRS/Convert read an accumulator but write a vector, so they
+        //    are NOT accum-only.
+        let is_accum_only = matches!(semantic, SemanticOp::Accumulate | SemanticOp::Neg) && {
+            let has_acc_source = op.sources.iter()
+                .any(|s| matches!(s, Operand::AccumReg(_)));
+            let has_vec_source = op.sources.iter()
+                .any(|s| matches!(s, Operand::VectorReg(_)));
+            has_acc_source && !has_vec_source
+        };
 
         if op.is_wide_vector || is_accum_only {
             Self::execute_wide(op, ctx, semantic, et)
