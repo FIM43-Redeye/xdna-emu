@@ -69,16 +69,26 @@ if [[ ! -f "$EMU_LIB" ]]; then
     echo "  Run: cargo build $([ "$EMU_PROFILE" = "release" ] && echo "--release")"
     echo "  Or set XDNA_EMU=release to use the release profile."
 fi
-# Warn if the EMU lib is older than any Rust source file.
+# Auto-rebuild if the EMU lib is older than any Rust source file.
+# This ensures the plugin always matches the current code -- manual rebuilds
+# are the #1 source of "why didn't my change take effect?" confusion.
 if [[ -f "$EMU_LIB" ]]; then
     newest_src=$(find "${PROJECT_DIR}/src" -name '*.rs' -newer "$EMU_LIB" 2>/dev/null | head -1)
     if [[ -n "$newest_src" ]]; then
-        echo "WARNING: EMU lib ($EMU_PROFILE) is STALE -- Rust source is newer."
-        echo "  Stale: $EMU_LIB ($(stat -c '%y' "$EMU_LIB" | cut -d. -f1))"
-        echo "  Newer: $newest_src"
-        echo "  Run: cargo build $([ "$EMU_PROFILE" = "release" ] && echo "--release")"
+        echo "EMU lib ($EMU_PROFILE) is stale -- rebuilding..."
+        CARGO_FLAGS=""
+        [[ "$EMU_PROFILE" = "release" ]] && CARGO_FLAGS="--release"
+        nice -n 19 cargo build $CARGO_FLAGS 2>&1
+        echo "Rebuild complete."
         echo ""
     fi
+elif [[ ! -f "$EMU_LIB" ]]; then
+    echo "EMU lib not found -- building..."
+    CARGO_FLAGS=""
+    [[ "$EMU_PROFILE" = "release" ]] && CARGO_FLAGS="--release"
+    nice -n 19 cargo build $CARGO_FLAGS 2>&1
+    echo "Build complete."
+    echo ""
 fi
 
 echo "=== ISA-Level Validation Harness ==="
