@@ -3815,6 +3815,53 @@ impl VectorAlu {
                 true
             }
 
+            // ========== SRS/UPS (element-wise, split into halves) ==========
+
+            SemanticOp::Srs => {
+                // Wide SRS: read Acc1024, SRS each half, write Vec512.
+                let acc_reg = Self::get_acc_source(op);
+                let shift = Self::get_shift_amount(op, ctx);
+                let from = op.from_type.unwrap_or(ElementType::Int64);
+                let acc_wide = ctx.accumulator.read_wide(acc_reg);
+                let acc_lo: [u64; 8] = acc_wide[..8].try_into().unwrap();
+                let acc_hi: [u64; 8] = acc_wide[8..].try_into().unwrap();
+
+                let result_lo = Self::vector_srs_from_acc(&acc_lo, shift, from, et, &ctx.srs_config);
+                let result_hi = Self::vector_srs_from_acc(&acc_hi, shift, from, et, &ctx.srs_config);
+
+                let mut result = [0u32; 16];
+                result[..8].copy_from_slice(&result_lo);
+                result[8..].copy_from_slice(&result_hi);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+
+            SemanticOp::Ups => {
+                // Wide UPS: read Vec512, UPS each half, write Acc1024.
+                let src = Self::get_wide_vec_source(op, ctx, 0);
+                let shift = Self::get_shift_amount(op, ctx);
+                let from = op.from_type.unwrap_or(ElementType::Int16);
+                let src_lo: [u32; 8] = src[..8].try_into().unwrap();
+                let src_hi: [u32; 8] = src[8..].try_into().unwrap();
+
+                let acc_lo = vector_ups::ups_vector_to_acc(&src_lo, shift, from, et);
+                let acc_hi = vector_ups::ups_vector_to_acc(&src_hi, shift, from, et);
+
+                match &op.dest {
+                    Some(Operand::AccumReg(r)) => {
+                        let mut acc_wide = [0u64; 16];
+                        acc_wide[..8].copy_from_slice(&acc_lo);
+                        acc_wide[8..].copy_from_slice(&acc_hi);
+                        ctx.accumulator.write_wide(*r, acc_wide);
+                    }
+                    _ => {
+                        log::warn!("[VECTOR_WIDE] UPS with non-AccumReg dest");
+                        return Self::execute_wide_fallback(op, ctx, semantic, et);
+                    }
+                }
+                true
+            }
+
             // ========== Copy / Clear ==========
             SemanticOp::Copy => {
                 let a = Self::get_wide_vec_source(op, ctx, 0);
@@ -4752,5 +4799,71 @@ mod tests {
         let result = ctx.vector.read(0);
         let lo16 = result[0] as i16;
         assert_eq!(lo16, 100, "from_type=Int32 should mask to low 32 bits");
+    }
+
+    #[test]
+    fn test_wide_ups_x2c() {
+        // Wide UPS: x-register (512-bit) -> cm-register (1024-bit)
+        let mut ctx = make_ctx();
+
+        // Write 512-bit input to x4 (v4+v5): simple 32-bit values
+        // Low half (v4): [1,2,3,4,5,6,7,8]
+        ctx.vector.write(4, [1, 2, 3, 4, 5, 6, 7, 8]);
+        // High half (v5): [9,10,11,12,13,14,15,16]
+        ctx.vector.write(5, [9, 10, 11, 12, 13, 14, 15, 16]);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Ups)
+            .as_vector(ElementType::Int64) // output: 64-bit accumulator
+            .with_dest(Operand::AccumReg(0))
+            .with_source(Operand::VectorReg(4))
+            .with_source(Operand::Immediate(0)); // shift=0
+        op.from_type = Some(ElementType::Int32); // input: 32-bit vector
+        op.is_wide_vector = true;
+
+        VectorAlu::execute(&op, &mut ctx);
+
+        // Check low accumulator (acc0): should have lanes 0-7 = [1,2,...,8]
+        let acc_lo = ctx.accumulator.read(0);
+        for i in 0..8 {
+            assert_eq!(acc_lo[i], (i as u64 + 1), "acc_lo lane {i}");
+        }
+        // Check high accumulator (acc1): should have lanes 8-15 = [9,10,...,16]
+        let acc_hi = ctx.accumulator.read(1);
+        for i in 0..8 {
+            assert_eq!(acc_hi[i], (i as u64 + 9), "acc_hi lane {i}");
+        }
+    }
+
+    #[test]
+    fn test_wide_srs_cm_to_x() {
+        // Wide SRS: cm-register (1024-bit) -> x-register (512-bit)
+        let mut ctx = make_ctx();
+
+        // Write 1024-bit accumulator to cm0 (acc0+acc1)
+        let acc_lo: [u64; 8] = [10, 20, 30, 40, 50, 60, 70, 80];
+        let acc_hi: [u64; 8] = [90, 100, 110, 120, 130, 140, 150, 160];
+        ctx.accumulator.write(0, acc_lo);
+        ctx.accumulator.write(1, acc_hi);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Srs)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::VectorReg(4))
+            .with_source(Operand::AccumReg(0))
+            .with_source(Operand::Immediate(0)); // shift=0
+        op.from_type = Some(ElementType::Int64);
+        op.is_wide_vector = true;
+
+        // Floor rounding, no saturation, signed
+        ctx.srs_config.rounding_mode = 0;
+        ctx.srs_config.saturation_mode = 0;
+        ctx.srs_config.srs_sign = true;
+
+        VectorAlu::execute(&op, &mut ctx);
+
+        // Check output: x4 = v4+v5
+        let v4 = ctx.vector.read(4);
+        assert_eq!(v4, [10, 20, 30, 40, 50, 60, 70, 80]);
+        let v5 = ctx.vector.read(5);
+        assert_eq!(v5, [90, 100, 110, 120, 130, 140, 150, 160]);
     }
 }
