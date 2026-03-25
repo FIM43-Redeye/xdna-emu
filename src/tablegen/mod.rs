@@ -12,6 +12,7 @@
 //! bytecode interpreter. Both are consumed by the instruction decoder.
 
 pub mod decoder_bytecode;
+pub mod decoder_ffi;
 mod resolver;
 mod types;
 
@@ -76,6 +77,23 @@ mod tests {
                 .collect();
             panic!("Expected both ACQ variants, found: {:?}", acq_names);
         }
+    }
+
+    /// Lock ID fields must be classified as LockId (unsigned), not signed immediate.
+    #[test]
+    fn test_acq_lock_id_field_type() {
+        let output = load_from_generated();
+        let alu = output.encodings_by_slot.get("alu").expect("No alu slot");
+        let enc = alu.iter().find(|e| e.name == "ACQ_mLockId_imm")
+            .expect("ACQ_mLockId_imm should exist");
+        for f in &enc.operand_fields {
+            eprintln!("ACQ field: name={} width={} type={:?} signed={}",
+                f.name, f.width, f.operand_type, f.signed);
+        }
+        let id_field = enc.operand_fields.iter().find(|f| f.name == "id")
+            .expect("ACQ_mLockId_imm should have 'id' field");
+        assert_eq!(id_field.operand_type, OperandType::LockId,
+            "Lock ID field should be LockId, not {:?}", id_field.operand_type);
     }
 
     /// Verify structural semantic inference in the generated data.

@@ -114,12 +114,19 @@ pub fn classify_operand_type(reg_class: &str, field_name: &str) -> String {
         return "OperandType::Register(RegisterKind::ModifierM)".to_string();
     }
 
-    // 3. Immediate operands
+    // 3. Lock ID fields: always unsigned, regardless of reg_class.
+    // Lock IDs are 0-63 (6-bit unsigned).  The field may have an imm6
+    // reg_class which parse_immediate_type() would classify as signed.
+    if field_name == "id" || field_name == "mLockId" {
+        return "OperandType::LockId".to_string();
+    }
+
+    // 4. Immediate operands
     if let Some(imm_type) = parse_immediate_type(reg_class) {
         return imm_type;
     }
 
-    // 4. Field-name fallback
+    // 5. Field-name fallback
     if reg_class.is_empty() || reg_class == "?" {
         return classify_from_field_name(field_name);
     }

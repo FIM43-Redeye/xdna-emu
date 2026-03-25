@@ -265,12 +265,19 @@ pub fn classify_operand_type(reg_class: &str, field_name: &str) -> OperandType {
         return OperandType::Register(RegisterKind::Accumulator);
     }
 
-    // 3. Immediate operands (parsed from reg_class name)
+    // 3. Lock ID fields: always unsigned, regardless of reg_class.
+    // Lock IDs are 0-63 (6-bit unsigned).  The field may have an imm6
+    // reg_class which parse_immediate_type() would classify as signed.
+    if field_name == "id" || field_name == "mLockId" {
+        return OperandType::LockId;
+    }
+
+    // 4. Immediate operands (parsed from reg_class name)
     if let Some(imm_type) = parse_immediate_type(reg_class) {
         return imm_type;
     }
 
-    // 4. Field-name fallback (when reg_class is empty or unrecognized)
+    // 5. Field-name fallback (when reg_class is empty or unrecognized)
     if reg_class.is_empty() || reg_class == "?" {
         return classify_from_field_name(field_name);
     }
@@ -1012,14 +1019,24 @@ impl SlotIndex {
         }
     }
 
-    /// Decode a word using the LLVM bytecode table.
+    /// Decode a word using LLVM's disassembler (via FFI) with bytecode fallback.
     ///
-    /// The bytecode identifies the instruction name, which is looked up
-    /// in `by_name` to retrieve the full `InstrEncoding` with all semantic
-    /// metadata. Returns `None` if no decoder table is available or if the
-    /// instruction is not recognized.
+    /// The FFI path uses LLVM's MCDisassembler which includes full TRY_DECODE
+    /// register class validation, giving perfect disambiguation.  Falls back
+    /// to the bytecode interpreter if the FFI decoder is unavailable.
     #[inline]
     pub fn decode(&self, word: u64) -> Option<(&InstrEncoding, HashMap<String, u64>)> {
+        // Try LLVM FFI decoder first (perfect TRY_DECODE disambiguation).
+        if let Some(ffi_slot) = super::decoder_ffi::slot_from_name(&self.slot_name) {
+            if let Some(name) = super::decoder_ffi::decode_slot_name(ffi_slot, word) {
+                if let Some(encoding) = self.by_name.get(&name) {
+                    let operands = self.extract_operands(encoding, word);
+                    return Some((encoding, operands));
+                }
+            }
+        }
+
+        // Fall back to bytecode interpreter.
         let table = self.decoder_table.as_ref()?;
         let instr_name = table.decode(word)?;
         let encoding = self.by_name.get(instr_name)?;
@@ -1088,6 +1105,14 @@ impl DecoderIndex {
     /// Check if the index is empty.
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
+    }
+
+    /// Look up an InstrEncoding by instruction name within a slot.
+    ///
+    /// Used by the LLVM FFI decode path to retrieve metadata (semantic,
+    /// element_type, etc.) after LLVM identifies the instruction name.
+    pub fn encoding_by_name(&self, slot_name: &str, instr_name: &str) -> Option<&InstrEncoding> {
+        self.slots.get(slot_name).and_then(|idx| idx.by_name.get(instr_name))
     }
 
     /// Iterate over all encodings across all slots.
@@ -1541,12 +1566,16 @@ mod tests {
         let data = make_test_data();
         let by_slot = build_decoder_tables(&data);
 
-        // Build without decoder table -- decode returns None for everything
+        // Build without bytecode decoder table.  The FFI decoder may still
+        // decode if the slot name matches a real LLVM slot and the bits
+        // happen to encode a valid instruction whose name exists in by_name.
         let alu_index = SlotIndex::build("alu", by_slot["alu"].clone(), None);
         assert_eq!(alu_index.slot_name, "alu");
 
-        let add_word = 0b00011_00101_00010_0000_1u64;
-        assert!(alu_index.decode(add_word).is_none());
+        // Use bits that are unlikely to decode to a real instruction
+        // whose name matches our synthetic test data.
+        let nonsense_word = 0xDEADBEEF_u64;
+        assert!(alu_index.decode(nonsense_word).is_none());
     }
 
     #[test]
@@ -1903,9 +1932,12 @@ mod tests {
 
     #[test]
     fn test_classify_field_name_fallback() {
-        // Lock IDs
+        // Lock IDs -- must be LockId even when reg_class is a signed imm type.
+        // Lock IDs are unsigned (0-63); the field name takes precedence.
         assert_eq!(classify_operand_type("", "id"), OperandType::LockId);
         assert_eq!(classify_operand_type("", "mLockId"), OperandType::LockId);
+        assert_eq!(classify_operand_type("imm6", "id"), OperandType::LockId);
+        assert_eq!(classify_operand_type("simm6", "mLockId"), OperandType::LockId);
 
         // Constant fields from field name
         assert_eq!(

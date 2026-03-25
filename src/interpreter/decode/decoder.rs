@@ -27,12 +27,13 @@ use crate::interpreter::bundle::{
     ExtractedBundle, MemWidth, Operand, PostModify, SlotIndex, SlotOp, VliwBundle,
     extract_slots,
 };
-use crate::interpreter::state::{MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN, MOD_BASE_M};
+use crate::interpreter::state::{MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN, MOD_BASE_M, SP_PTR_INDEX};
 use crate::interpreter::traits::{DecodeError, Decoder};
 use super::composite::CompositeLuts;
 use crate::tablegen::{
     AddressingMode, DecoderIndex, InstrEncoding, InstrMemWidth, OperandType, RegisterKind,
     SemanticOp, decoder_bytecode,
+    decoder_ffi::{self, DecodedOperand, DecodeResult, operand_from_reg_name},
 };
 
 /// A decoded instruction from TableGen data.
@@ -363,6 +364,232 @@ impl InstructionDecoder {
         }
 
         None
+    }
+
+    // -----------------------------------------------------------------------
+    // LLVM FFI decode path (Step 6)
+    // -----------------------------------------------------------------------
+
+    /// Convert SlotType to decoder_ffi::Slot for LLVM decoding.
+    fn slot_type_to_ffi(slot_type: crate::interpreter::bundle::SlotType) -> Option<decoder_ffi::Slot> {
+        use crate::interpreter::bundle::SlotType;
+        match slot_type {
+            SlotType::Alu => Some(decoder_ffi::Slot::Alu),
+            SlotType::Lda => Some(decoder_ffi::Slot::Lda),
+            SlotType::Ldb => Some(decoder_ffi::Slot::Ldb),
+            SlotType::Lng => Some(decoder_ffi::Slot::Lng),
+            SlotType::Mv  => Some(decoder_ffi::Slot::Mv),
+            SlotType::St  => Some(decoder_ffi::Slot::St),
+            SlotType::Vec => Some(decoder_ffi::Slot::Vec),
+            SlotType::Nop => None,
+        }
+    }
+
+    /// Try to decode a slot using LLVM FFI and build operands directly from
+    /// LLVM's register names and output classification.
+    ///
+    /// Returns (DecodedInstr, dest, sources, post_modify) on success.
+    /// The DecodedInstr is still needed for build_slot_op() which reads
+    /// metadata (semantic, element_type, etc.) from InstrEncoding.
+    ///
+    /// Falls back to None if:
+    /// - LLVM can't decode the slot
+    /// - The instruction name doesn't match any InstrEncoding
+    /// - An LLVM register name can't be mapped to our Operand type
+    fn try_decode_via_ffi(
+        &self,
+        bits: u64,
+        slot_type: crate::interpreter::bundle::SlotType,
+    ) -> Option<(DecodedInstr, Option<Operand>, Vec<Operand>, Option<PostModify>)> {
+        let ffi_slot = Self::slot_type_to_ffi(slot_type)?;
+        let ffi_result = decoder_ffi::decode_slot(ffi_slot, bits)?;
+
+        // Look up InstrEncoding by LLVM instruction name (still need for metadata).
+        let slot_name = match slot_type {
+            crate::interpreter::bundle::SlotType::Lda => "lda",
+            crate::interpreter::bundle::SlotType::Ldb => "ldb",
+            crate::interpreter::bundle::SlotType::Alu => "alu",
+            crate::interpreter::bundle::SlotType::Mv  => "mv",
+            crate::interpreter::bundle::SlotType::St  => "st",
+            crate::interpreter::bundle::SlotType::Vec => "vec",
+            crate::interpreter::bundle::SlotType::Lng => "lng",
+            _ => return None,
+        };
+
+        let encoding = self.index.encoding_by_name(slot_name, &ffi_result.name)?;
+
+        // Map LLVM operands to our Operand type.
+        let (dest, sources, post_modify) =
+            Self::extract_operands_from_ffi(&ffi_result, encoding);
+
+        // Build a minimal DecodedInstr with empty raw operands (we don't need
+        // them since we're using LLVM's operands, but build_slot_op reads
+        // encoding metadata from it).
+        let decoded_instr = DecodedInstr {
+            encoding: encoding.clone(),
+            operands: HashMap::new(),
+        };
+
+        Some((decoded_instr, dest, sources, post_modify))
+    }
+
+    /// Extract dest, sources, and post-modify from LLVM FFI decode result.
+    ///
+    /// Uses num_defs to split outputs from inputs, then applies addressing
+    /// mode logic from InstrEncoding to construct Memory operands and
+    /// PostModify metadata.
+    fn extract_operands_from_ffi(
+        ffi_result: &DecodeResult,
+        encoding: &InstrEncoding,
+    ) -> (Option<Operand>, Vec<Operand>, Option<PostModify>) {
+        let num_defs = ffi_result.num_defs as usize;
+
+        // Map all LLVM operands to our Operand type.
+        // Skip operands that can't be mapped (mask registers, DMA regs).
+        //
+        // LLVM's decoder tables already handle sign extension and scaling
+        // internally.  The decoded immediate values are ready to use as-is.
+        // Do NOT apply additional sign extension or scaling here -- that was
+        // needed for our raw bit-field extraction path, not for LLVM output.
+        let mapped: Vec<Option<Operand>> = ffi_result.operands.iter().map(|op| {
+            match op {
+                DecodedOperand::Reg { name, .. } => {
+                    operand_from_reg_name(name).map(|m| m.operand)
+                }
+                DecodedOperand::Imm(val) => {
+                    Some(Operand::Immediate(*val as i32))
+                }
+            }
+        }).collect();
+
+        // Split into defs (outputs) and uses (inputs).
+        let split_at = num_defs.min(mapped.len());
+        let def_ops: Vec<Operand> = mapped[..split_at].iter().filter_map(|o| o.clone()).collect();
+        let mut use_ops: Vec<Operand> = mapped[split_at..].iter().filter_map(|o| o.clone()).collect();
+
+        // Destination: first def operand (if any and writable).
+        let mut dest = def_ops.into_iter().next();
+        if let Some(ref d) = dest {
+            if !can_be_dest(d) {
+                // Non-writable in dest position (config immediate, etc.) -- move to sources.
+                use_ops.insert(0, d.clone());
+                dest = None;
+            }
+        }
+
+        let mut post_modify: Option<PostModify> = None;
+
+        // LLVM MCInst operand layout is deterministic (from AIEBaseDisassembler.h):
+        //   Loads:  defs=[loaded_value, post_mod_ptr]  uses=[base_ptr, modify]
+        //   Stores: defs=[post_mod_ptr]                uses=[data, base_ptr, modify]
+        //
+        // def[0] is always the right dest: loaded value for loads, post-mod
+        // pointer for stores (which executors ignore via dest=None for stores
+        // without register defs).  No heuristic swapping needed.
+
+        // Handle pointer arithmetic: dest is the pointer reg, sources are offset.
+        // LLVM reports the pointer as both a def (output) and a use (input) since
+        // the instruction reads and writes the same register.  Deduplicate: keep
+        // the pointer only in dest, remove the self-reference from sources so
+        // executors see [offset] not [self_ptr, offset].
+        if encoding.is_ptr_arithmetic {
+            if dest.is_none() {
+                // Find the first PointerReg in uses and promote it to dest.
+                if let Some(pos) = use_ops.iter().position(|o| matches!(o, Operand::PointerReg(_))) {
+                    dest = Some(use_ops.remove(pos));
+                }
+            }
+            // Remove any self-referencing pointer from sources.
+            if let Some(Operand::PointerReg(dest_p)) = &dest {
+                let dp = *dest_p;
+                use_ops.retain(|o| !matches!(o, Operand::PointerReg(p) if *p == dp));
+            }
+            // Sources are whatever remains (offset immediate or modifier reg).
+            return (dest, use_ops, post_modify);
+        }
+
+        // Handle memory addressing modes: combine pointer + offset into Memory
+        // or PostModify, matching what decode_ag_field() does in the legacy path.
+        match encoding.addressing_mode {
+            AddressingMode::IndexedImmediate => {
+                // Find PointerReg + Immediate pair in uses, combine into Memory.
+                if let Some(ptr_pos) = use_ops.iter().position(|o| matches!(o, Operand::PointerReg(_))) {
+                    let ptr_reg = match use_ops.remove(ptr_pos) {
+                        Operand::PointerReg(p) => p,
+                        _ => unreachable!(),
+                    };
+                    // Next Immediate after the pointer (now at ptr_pos since we removed ptr).
+                    let offset = if let Some(imm_pos) = use_ops[ptr_pos..].iter()
+                        .position(|o| matches!(o, Operand::Immediate(_)))
+                    {
+                        match use_ops.remove(ptr_pos + imm_pos) {
+                            Operand::Immediate(v) => v as i16,
+                            _ => unreachable!(),
+                        }
+                    } else {
+                        0
+                    };
+                    // SP-relative: handled naturally since SP maps to PointerReg(SP_PTR_INDEX).
+                    use_ops.push(Operand::Memory { base: ptr_reg, offset });
+                }
+            }
+            AddressingMode::PostModifyImmediate => {
+                if let Some(ptr_pos) = use_ops.iter().position(|o| matches!(o, Operand::PointerReg(_))) {
+                    let ptr_reg = use_ops.remove(ptr_pos);
+                    // Find the modify amount.
+                    let modify = if let Some(imm_pos) = use_ops[ptr_pos..].iter()
+                        .position(|o| matches!(o, Operand::Immediate(_)))
+                    {
+                        match use_ops.remove(ptr_pos + imm_pos) {
+                            Operand::Immediate(v) => v as i16,
+                            _ => 0,
+                        }
+                    } else {
+                        0
+                    };
+                    use_ops.push(ptr_reg);
+                    post_modify = Some(PostModify::Immediate(modify));
+                }
+            }
+            AddressingMode::PostModifyRegister => {
+                if let Some(ptr_pos) = use_ops.iter().position(|o| matches!(o, Operand::PointerReg(_))) {
+                    let ptr_reg = use_ops.remove(ptr_pos);
+                    // Find the modifier register.
+                    if let Some(mod_pos) = use_ops[ptr_pos..].iter()
+                        .position(|o| matches!(o, Operand::ModifierReg(_)))
+                    {
+                        let mod_reg = match use_ops.remove(ptr_pos + mod_pos) {
+                            Operand::ModifierReg(r) => r,
+                            _ => 0,
+                        };
+                        post_modify = Some(PostModify::Register(mod_reg));
+                    }
+                    use_ops.push(ptr_reg);
+                }
+            }
+            AddressingMode::IndexedRegister => {
+                // ptr + dj register: both stay as separate sources.
+                // (Current decoder does this too -- no Memory combining.)
+            }
+            AddressingMode::Unknown => {
+                // No addressing mode -- pure compute instruction, or
+                // unrecognized addressing pattern. Leave operands as-is.
+            }
+        }
+
+        // SP-relative load/store: uses = [SP] in TableGen.
+        // Convert standalone immediate to Memory { base: SP, offset: imm }.
+        if encoding.is_sp_relative && !encoding.is_ptr_arithmetic {
+            if let Some(imm_pos) = use_ops.iter().position(|o| matches!(o, Operand::Immediate(_))) {
+                let offset = match use_ops.remove(imm_pos) {
+                    Operand::Immediate(v) => v as i16,
+                    _ => 0,
+                };
+                use_ops.push(Operand::Memory { base: SP_PTR_INDEX, offset });
+            }
+        }
+
+        (dest, use_ops, post_modify)
     }
 
     /// Extract operands from decoded instruction using data-driven dispatch.
@@ -966,10 +1193,19 @@ impl Decoder for InstructionDecoder {
                 // Zero bits means no operation in this slot - treat as NOP.
                 if slot.slot_type == SlotType::Nop || slot.bits == 0 {
                     bundle.set_slot(SlotOp::nop(slot_index));
-                } else if let Some(decoded) = self.decode_slot_bits(slot.bits, slot.slot_type) {
-                    let (dest, sources, extracted_pm) = self.extract_operands(&decoded);
-
-                    // Build SlotOp directly from SemanticOp (no Operation bridge)
+                } else if let Some((decoded, dest, sources, extracted_pm)) =
+                    self.try_decode_via_ffi(slot.bits, slot.slot_type)
+                        .or_else(|| {
+                            // Legacy fallback: bytecode identification + bit-field extraction.
+                            self.decode_slot_bits(slot.bits, slot.slot_type).map(|d| {
+                                let (dest, sources, pm) = self.extract_operands(&d);
+                                (d, dest, sources, pm)
+                            })
+                        })
+                {
+                    // Primary path: LLVM FFI for both instruction identification
+                    // and operand extraction.  Legacy bytecode path is fallback
+                    // only (covers any instruction LLVM doesn't handle).
                     let mut slot_op = self.build_slot_op(
                         slot_index, &decoded, dest, sources, extracted_pm,
                     );
@@ -2040,5 +2276,365 @@ mod tests {
         // Verify .f suffix correctly infers Float32
         let enc = make_vec_encoding("vadd.f");
         assert_eq!(enc.element_type, Some(ElementType::Float32));
+    }
+
+    /// Cross-validate LLVM FFI operands against legacy bit-field extraction
+    /// for real ELF instructions.
+    ///
+    /// This test decodes every instruction in every fuzz ELF using BOTH the
+    /// LLVM FFI path and the legacy bytecode path, and compares the resulting
+    /// operands. Any divergence is flagged.
+    #[test]
+    fn test_ffi_vs_legacy_operand_crosscheck() {
+        use crate::interpreter::bundle::SlotType;
+
+        // Find ELF files from fuzz dir (recursive) or ISA test harness.
+        let mut elf_paths = Vec::new();
+        for search_dir in &["build/fuzz", "build/isa-tests"] {
+            let dir = std::path::Path::new(search_dir);
+            if dir.exists() {
+                fn collect_elfs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+                    if let Ok(entries) = std::fs::read_dir(dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                collect_elfs(&path, out);
+                            } else if path.extension().map(|e| e == "elf" || e == "o").unwrap_or(false) {
+                                out.push(path);
+                            }
+                        }
+                    }
+                }
+                collect_elfs(dir, &mut elf_paths);
+            }
+        }
+
+        if elf_paths.is_empty() {
+            eprintln!("Skipping: no ELF files found in build/fuzz or build/isa-tests");
+            return;
+        }
+        // Limit to 50 ELFs for test speed.
+        elf_paths.truncate(50);
+
+        let decoder = InstructionDecoder::load_default();
+        let mut total = 0u64;
+        let mut ffi_hits = 0u64;
+        let mut ffi_misses = 0u64;
+        let mut matches = 0u64;
+        let mut divergences = 0u64;
+        let mut divergence_details: Vec<String> = Vec::new();
+
+        for path in &elf_paths {
+
+            let data = std::fs::read(&path).unwrap();
+            let elf = match goblin::elf::Elf::parse(&data) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            for section in &elf.section_headers {
+                if section.sh_flags & 0x4 == 0 {
+                    continue; // Skip non-executable sections
+                }
+                let start = section.sh_offset as usize;
+                let end = start + section.sh_size as usize;
+                if end > data.len() { continue; }
+
+                let code = &data[start..end];
+                let mut offset = 0;
+
+                while offset + 4 <= code.len() {
+                    let format = crate::interpreter::bundle::detect_format(&code[offset..]);
+                    let size = format.size_bytes() as usize;
+                    if offset + size > code.len() { break; }
+
+                    let extracted = decoder.extract_bundle_slots(&code[offset..offset + size]);
+
+                    for slot in &extracted.slots {
+                        if slot.slot_type == SlotType::Nop || slot.bits == 0 {
+                            continue;
+                        }
+                        total += 1;
+
+                        let ffi_result = decoder.try_decode_via_ffi(slot.bits, slot.slot_type);
+                        let legacy_result = decoder.decode_slot_bits(slot.bits, slot.slot_type)
+                            .map(|d| {
+                                let (dest, sources, pm) = decoder.extract_operands(&d);
+                                (d, dest, sources, pm)
+                            });
+
+                        match (ffi_result, legacy_result) {
+                            (Some((_, ffi_dest, ffi_src, ffi_pm)), Some((_, leg_dest, leg_src, leg_pm))) => {
+                                ffi_hits += 1;
+                                if ffi_dest == leg_dest && ffi_src == leg_src && ffi_pm == leg_pm {
+                                    matches += 1;
+                                } else {
+                                    divergences += 1;
+                                    if divergence_details.len() < 20 {
+                                        divergence_details.push(format!(
+                                            "  {:?} 0x{:010X}:\n    FFI:    dest={:?} src={:?} pm={:?}\n    LEGACY: dest={:?} src={:?} pm={:?}",
+                                            slot.slot_type, slot.bits,
+                                            ffi_dest, ffi_src, ffi_pm,
+                                            leg_dest, leg_src, leg_pm,
+                                        ));
+                                    }
+                                }
+                            }
+                            (None, Some(_)) => { ffi_misses += 1; }
+                            _ => {}
+                        }
+                    }
+
+                    offset += size;
+                }
+            }
+        }
+
+        eprintln!("\n=== FFI vs Legacy Cross-Validation ===");
+        eprintln!("Total slot decodes:    {}", total);
+        eprintln!("FFI hits:              {} ({:.1}%)", ffi_hits,
+            if total > 0 { 100.0 * ffi_hits as f64 / total as f64 } else { 0.0 });
+        eprintln!("FFI misses (fallback): {}", ffi_misses);
+        eprintln!("Operand matches:       {}", matches);
+        eprintln!("Operand divergences:   {}", divergences);
+
+        // Categorize divergences.
+        let mut cat_store_dest = 0u64;  // Store: FFI dest=None, legacy has ModifierReg dest
+        let mut cat_ptr_arith = 0u64;   // Pointer arith: FFI has extra PointerReg in sources
+        let mut cat_memory_offset = 0u64; // Memory offset differs
+        let mut cat_missing_memory = 0u64; // FFI has raw operands, legacy has Memory{}
+        let mut cat_post_modify = 0u64; // PostModify differs
+        let mut cat_other = 0u64;
+
+        // Re-scan to categorize (the details vec was capped at 20)
+        for path in &elf_paths {
+            let data = match std::fs::read(path) { Ok(d) => d, Err(_) => continue };
+            let elf = match goblin::elf::Elf::parse(&data) { Ok(e) => e, Err(_) => continue };
+            for section in &elf.section_headers {
+                if section.sh_flags & 0x4 == 0 { continue; }
+                let start = section.sh_offset as usize;
+                let end = start + section.sh_size as usize;
+                if end > data.len() { continue; }
+                let code = &data[start..end];
+                let mut offset = 0;
+                while offset + 4 <= code.len() {
+                    let format = crate::interpreter::bundle::detect_format(&code[offset..]);
+                    let size = format.size_bytes() as usize;
+                    if offset + size > code.len() { break; }
+                    let extracted = decoder.extract_bundle_slots(&code[offset..offset + size]);
+                    for slot in &extracted.slots {
+                        if slot.slot_type == SlotType::Nop || slot.bits == 0 { continue; }
+                        let ffi = decoder.try_decode_via_ffi(slot.bits, slot.slot_type);
+                        let leg = decoder.decode_slot_bits(slot.bits, slot.slot_type).map(|d| {
+                            let (dest, sources, pm) = decoder.extract_operands(&d);
+                            (d, dest, sources, pm)
+                        });
+                        if let (Some((_, fd, fs, fp)), Some((_, ld, ls, lp))) = (ffi, leg) {
+                            if fd == ld && fs == ls && fp == lp { continue; }
+                            // Categorize
+                            if ld.is_some() && fd.is_none() && matches!(ld, Some(Operand::ModifierReg(_))) {
+                                cat_store_dest += 1;
+                            } else if fd == ld && fp != lp {
+                                cat_post_modify += 1;
+                            } else if fd == ld {
+                                // Same dest, different sources
+                                let ffi_has_mem = fs.iter().any(|o| matches!(o, Operand::Memory { .. }));
+                                let leg_has_mem = ls.iter().any(|o| matches!(o, Operand::Memory { .. }));
+                                if ffi_has_mem && leg_has_mem {
+                                    cat_memory_offset += 1;
+                                } else if !ffi_has_mem && leg_has_mem {
+                                    cat_missing_memory += 1;
+                                } else if fs.len() != ls.len() {
+                                    cat_ptr_arith += 1;
+                                } else {
+                                    cat_other += 1;
+                                }
+                            } else {
+                                cat_other += 1;
+                            }
+                        }
+                    }
+                    offset += size;
+                }
+            }
+        }
+
+        eprintln!("\nDivergence categories:");
+        eprintln!("  Store dest (FFI correct, legacy wrong):    {}", cat_store_dest);
+        eprintln!("  Ptr arith (extra PointerReg in sources):   {}", cat_ptr_arith);
+        eprintln!("  Memory offset differs:                     {}", cat_memory_offset);
+        eprintln!("  Missing Memory (FFI has raw, legacy has):  {}", cat_missing_memory);
+        eprintln!("  PostModify differs:                        {}", cat_post_modify);
+        eprintln!("  Other:                                     {}", cat_other);
+
+        if !divergence_details.is_empty() {
+            eprintln!("\nFirst {} divergences:", divergence_details.len());
+            for d in &divergence_details {
+                eprintln!("{}", d);
+            }
+        }
+
+        // We expect the FFI path to handle most instructions.
+        if total > 0 {
+            let hit_rate = 100.0 * ffi_hits as f64 / total as f64;
+            eprintln!("FFI hit rate: {:.1}%", hit_rate);
+            assert!(hit_rate > 90.0, "FFI should handle >90% of instructions (got {:.1}%)", hit_rate);
+        }
+    }
+
+    /// Inspect raw LLVM operand layout for post-modify loads.
+    #[test]
+    #[ignore]
+    fn test_llvm_postmodify_operand_layout() {
+        use crate::interpreter::bundle::SlotType;
+
+        // Find post-modify load instructions in ELF files.
+        let mut elf_paths = Vec::new();
+        for search_dir in &["build/isa-tests", "build/fuzz"] {
+            let dir = std::path::Path::new(search_dir);
+            if dir.exists() {
+                fn collect_elfs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+                    if let Ok(entries) = std::fs::read_dir(dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_dir() { collect_elfs(&path, out); }
+                            else if path.extension().map(|e| e == "elf" || e == "o").unwrap_or(false) {
+                                out.push(path);
+                            }
+                        }
+                    }
+                }
+                collect_elfs(dir, &mut elf_paths);
+            }
+        }
+        // Also check bridge test ELFs
+        let bridge_elf = std::path::Path::new(
+            "../mlir-aie/build/test/npu-xrt/add_one_using_dma/chess/aie_arch.mlir.prj/main_core_0_2.elf"
+        );
+        if bridge_elf.exists() {
+            elf_paths.push(bridge_elf.to_path_buf());
+        }
+
+        let decoder = InstructionDecoder::load_default();
+        let mut seen = std::collections::HashSet::new();
+
+        for path in &elf_paths {
+            let data = match std::fs::read(path) { Ok(d) => d, Err(_) => continue };
+            let elf = match goblin::elf::Elf::parse(&data) { Ok(e) => e, Err(_) => continue };
+            for section in &elf.section_headers {
+                if section.sh_flags & 0x4 == 0 { continue; }
+                let start = section.sh_offset as usize;
+                let end = start + section.sh_size as usize;
+                if end > data.len() { continue; }
+                let code = &data[start..end];
+                let mut offset = 0;
+                while offset + 4 <= code.len() {
+                    let format = crate::interpreter::bundle::detect_format(&code[offset..]);
+                    let size = format.size_bytes() as usize;
+                    if offset + size > code.len() { break; }
+                    let extracted = decoder.extract_bundle_slots(&code[offset..offset + size]);
+                    for slot in &extracted.slots {
+                        if slot.slot_type == SlotType::Nop || slot.bits == 0 { continue; }
+                        if !matches!(slot.slot_type, SlotType::Lda | SlotType::Ldb) { continue; }
+
+                        let ffi_slot = InstructionDecoder::slot_type_to_ffi(slot.slot_type);
+                        if ffi_slot.is_none() { continue; }
+                        let raw = decoder_ffi::decode_slot(ffi_slot.unwrap(), slot.bits);
+                        if raw.is_none() { continue; }
+                        let raw = raw.unwrap();
+
+                        // Only show post-modify instructions
+                        let enc_name = &raw.name;
+                        let encoding = decoder.index.encoding_by_name(
+                            match slot.slot_type {
+                                SlotType::Lda => "lda",
+                                SlotType::Ldb => "ldb",
+                                _ => continue,
+                            },
+                            enc_name,
+                        );
+                        if encoding.is_none() { continue; }
+                        let encoding = encoding.unwrap();
+                        if !matches!(encoding.addressing_mode,
+                            AddressingMode::PostModifyImmediate | AddressingMode::PostModifyRegister
+                        ) { continue; }
+
+                        let key = format!("{} nd={} ops={:?}", enc_name, raw.num_defs,
+                            raw.operands.iter().map(|o| match o {
+                                crate::tablegen::decoder_ffi::DecodedOperand::Reg { name, .. } => format!("Reg({})", name),
+                                crate::tablegen::decoder_ffi::DecodedOperand::Imm(v) => format!("Imm({})", v),
+                            }).collect::<Vec<_>>()
+                        );
+                        if seen.insert(key.clone()) {
+                            eprintln!("{}", key);
+                        }
+                    }
+                    offset += size;
+                }
+            }
+        }
+    }
+
+    /// Decode every instruction in batch_0's kernel via both FFI and legacy,
+    /// printing all results for side-by-side comparison.
+    #[test]
+    #[ignore]
+    fn test_batch0_ffi_vs_legacy_all_instructions() {
+        use crate::interpreter::bundle::SlotType;
+
+        let kernel_path = std::path::Path::new("build/isa-tests/batch_0/kernel.o");
+        if !kernel_path.exists() {
+            eprintln!("Skipping: batch_0 kernel not found");
+            return;
+        }
+
+        let data = std::fs::read(kernel_path).unwrap();
+        let elf = goblin::elf::Elf::parse(&data).unwrap();
+        let decoder = InstructionDecoder::load_default();
+
+        for section in &elf.section_headers {
+            if section.sh_flags & 0x4 == 0 { continue; }
+            let start = section.sh_offset as usize;
+            let end = start + section.sh_size as usize;
+            if end > data.len() { continue; }
+            let code = &data[start..end];
+            let mut offset = 0;
+            let mut instr_num = 0;
+
+            while offset + 4 <= code.len() {
+                let format = crate::interpreter::bundle::detect_format(&code[offset..]);
+                let size = format.size_bytes() as usize;
+                if offset + size > code.len() { break; }
+
+                let extracted = decoder.extract_bundle_slots(&code[offset..offset + size]);
+                for slot in &extracted.slots {
+                    if slot.slot_type == SlotType::Nop || slot.bits == 0 { continue; }
+                    instr_num += 1;
+
+                    let ffi = decoder.try_decode_via_ffi(slot.bits, slot.slot_type);
+                    let leg = decoder.decode_slot_bits(slot.bits, slot.slot_type).map(|d| {
+                        let name = d.encoding.name.clone();
+                        let (dest, sources, pm) = decoder.extract_operands(&d);
+                        (name, dest, sources, pm)
+                    });
+
+                    let ffi_name = ffi.as_ref().map(|(d, _, _, _)| d.encoding.name.as_str()).unwrap_or("FAIL");
+                    let leg_name = leg.as_ref().map(|(n, _, _, _)| n.as_str()).unwrap_or("FAIL");
+
+                    let ffi_ops = ffi.as_ref().map(|(_, d, s, p)| format!("dest={:?} src={:?} pm={:?}", d, s, p));
+                    let leg_ops = leg.as_ref().map(|(_, d, s, p)| format!("dest={:?} src={:?} pm={:?}", d, s, p));
+
+                    let status = if ffi_ops == leg_ops { "OK" } else { "DIFF" };
+
+                    eprintln!("[{:3}] {:?} 0x{:010X} {} name_ffi={} name_leg={}",
+                        instr_num, slot.slot_type, slot.bits, status, ffi_name, leg_name);
+                    if status == "DIFF" {
+                        eprintln!("  FFI:    {}", ffi_ops.unwrap_or_default());
+                        eprintln!("  LEGACY: {}", leg_ops.unwrap_or_default());
+                    }
+                }
+                offset += size;
+            }
+        }
     }
 }
