@@ -18,9 +18,193 @@
 //!
 //! Hardware reference: mulmac.py (read for understanding, original implementation).
 
-use crate::interpreter::bundle::ElementType;
+use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
 use crate::interpreter::execute::vector_config::{AccWidth, MatMulConfig};
-use crate::interpreter::state::{Vec512, Acc1024};
+use crate::interpreter::state::{ExecutionContext, Vec512, Acc1024};
+use crate::tablegen::SemanticOp;
+
+// ---------------------------------------------------------------------------
+// Entry point: execute_matmul
+// ---------------------------------------------------------------------------
+
+/// Execute a MAC-family instruction using config-driven matrix multiply.
+///
+/// This is the single entry point for ALL MAC-family instructions (Mac,
+/// MatMul, MatMulSub, NegMul, NegMatMul, AddMac, SubMac). It reads the
+/// config register, parses tile geometry, reads 512-bit vector inputs and
+/// 1024-bit accumulator, performs the multiply, and writes back.
+///
+/// Returns `true` if this function handled the instruction, `false` if the
+/// semantic is not a MAC-family operation (caller should use fallback).
+pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
+    // Only handle MAC-family semantics.
+    let semantic = match op.semantic {
+        Some(
+            s @ (SemanticOp::Mac
+            | SemanticOp::MatMul
+            | SemanticOp::MatMulSub
+            | SemanticOp::NegMul
+            | SemanticOp::NegMatMul
+            | SemanticOp::AddMac
+            | SemanticOp::SubMac),
+        ) => s,
+        _ => return false,
+    };
+
+    // Read config register (last ScalarReg in sources).
+    let conf_val = match get_config_reg(op, ctx) {
+        Some(v) => v,
+        None => {
+            log::error!(
+                "[MATMUL] no config register found in sources for {:?}",
+                op.encoding_name
+            );
+            return true; // Handled (as error), don't fall through.
+        }
+    };
+
+    // Detect bf16 mode from encoding name.
+    let is_bf16 = op
+        .encoding_name
+        .as_ref()
+        .map(|n| n.contains("_F_") || n.ends_with("_F"))
+        .unwrap_or(false);
+
+    // Parse config word into tile geometry and modes.
+    let mut config = match MatMulConfig::from_config_word(conf_val, is_bf16) {
+        Some(c) => c,
+        None => {
+            log::error!(
+                "[MATMUL] failed to parse config word 0x{:08x} (bf16={}) for {:?}",
+                conf_val,
+                is_bf16,
+                op.encoding_name
+            );
+            return true;
+        }
+    };
+
+    // Handle product negation for NegMul/NegMatMul/MatMulSub semantics.
+    match semantic {
+        SemanticOp::NegMul | SemanticOp::NegMatMul | SemanticOp::MatMulSub => {
+            config.subtract = !config.subtract;
+        }
+        _ => {}
+    }
+
+    // Read the two 512-bit input vectors.
+    let (a, b) = get_two_vec512(op, ctx);
+
+    // Read the accumulator destination (1024-bit wide register pair).
+    let acc_reg = get_acc_dest(op);
+    let mut acc = ctx.accumulator.read_wide(acc_reg);
+
+    // For AddMac/SubMac: merge a second accumulator source before the multiply.
+    // AddMac: acc_dest = acc_dest + acc_src + A * B
+    // SubMac: acc_dest = acc_dest - acc_src + A * B
+    match semantic {
+        SemanticOp::AddMac => {
+            let src_reg = get_acc_source(op);
+            let src_acc = ctx.accumulator.read_wide(src_reg);
+            for i in 0..16 {
+                acc[i] = acc[i].wrapping_add(src_acc[i]);
+            }
+        }
+        SemanticOp::SubMac => {
+            let src_reg = get_acc_source(op);
+            let src_acc = ctx.accumulator.read_wide(src_reg);
+            for i in 0..16 {
+                acc[i] = acc[i].wrapping_sub(src_acc[i]);
+            }
+        }
+        _ => {}
+    }
+
+    // Perform the config-driven matrix multiply.
+    matmul_config_driven(&mut acc, &a, &b, &config);
+
+    // Write result back to the accumulator.
+    ctx.accumulator.write_wide(acc_reg, acc);
+
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers for execute_matmul
+// ---------------------------------------------------------------------------
+
+/// Scan sources for the last ScalarReg operand (the config register).
+fn get_config_reg(op: &SlotOp, ctx: &ExecutionContext) -> Option<u32> {
+    for src in op.sources.iter().rev() {
+        if let Operand::ScalarReg(r) = src {
+            return Some(ctx.scalar.read(*r));
+        }
+    }
+    None
+}
+
+/// Read two 512-bit vectors from the VectorReg operands.
+///
+/// MAC instructions have two VectorReg sources that each name an x-register
+/// (already decoded as even indices: x0->0, x2->2, etc.). We read the full
+/// 512-bit value via `read_wide`.
+fn get_two_vec512(op: &SlotOp, ctx: &ExecutionContext) -> (Vec512, Vec512) {
+    let mut vregs = op
+        .sources
+        .iter()
+        .filter_map(|s| {
+            if let Operand::VectorReg(r) = s {
+                Some(*r)
+            } else {
+                None
+            }
+        });
+
+    let a_reg = vregs.next().unwrap_or_else(|| {
+        log::error!("[MATMUL] missing first VectorReg source");
+        0
+    });
+    let b_reg = vregs.next().unwrap_or_else(|| {
+        log::error!("[MATMUL] missing second VectorReg source");
+        0
+    });
+
+    // Ensure even alignment for wide read.
+    let a_base = a_reg & !1;
+    let b_base = b_reg & !1;
+
+    (ctx.vector.read_wide(a_base), ctx.vector.read_wide(b_base))
+}
+
+/// Extract the AccumReg from the destination operand.
+fn get_acc_dest(op: &SlotOp) -> u8 {
+    match &op.dest {
+        Some(Operand::AccumReg(r)) => {
+            // Ensure even alignment for wide access.
+            *r & !1
+        }
+        other => {
+            log::error!(
+                "[MATMUL] expected AccumReg dest, got {:?} -- defaulting to cm0",
+                other
+            );
+            0
+        }
+    }
+}
+
+/// Extract the first AccumReg from sources (for AddMac/SubMac).
+fn get_acc_source(op: &SlotOp) -> u8 {
+    for src in &op.sources {
+        if let Operand::AccumReg(r) = src {
+            return *r & !1;
+        }
+    }
+    log::error!(
+        "[MATMUL] no AccumReg found in sources -- defaulting to cm0"
+    );
+    0
+}
 
 /// Tile geometry for a matrix multiply mode.
 #[derive(Debug, Clone, Copy)]
@@ -1197,5 +1381,260 @@ mod tests {
                 idx, actual
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_matmul entry point tests
+    // -----------------------------------------------------------------------
+
+    use crate::interpreter::bundle::SlotIndex;
+    use crate::interpreter::state::ExecutionContext;
+
+    /// Build a minimal SlotOp for a MAC-family instruction.
+    ///
+    /// Sources: [VectorReg(a_reg), VectorReg(b_reg), ScalarReg(conf_reg)]
+    /// Dest: AccumReg(acc_reg)
+    fn make_mac_op(
+        semantic: SemanticOp,
+        a_vreg: u8,
+        b_vreg: u8,
+        conf_sreg: u8,
+        acc_dest: u8,
+        encoding_name: Option<&str>,
+    ) -> SlotOp {
+        let mut op = SlotOp::from_semantic(SlotIndex::Accumulator, semantic);
+        op.is_vector = true;
+        op.is_wide_vector = true;
+        op.sources.push(Operand::VectorReg(a_vreg));
+        op.sources.push(Operand::VectorReg(b_vreg));
+        op.sources.push(Operand::ScalarReg(conf_sreg));
+        op.dest = Some(Operand::AccumReg(acc_dest));
+        op.encoding_name = encoding_name.map(|s| s.to_string());
+        op
+    }
+
+    /// Build a MAC op with an extra AccumReg source (for AddMac/SubMac).
+    fn make_double_acc_op(
+        semantic: SemanticOp,
+        a_vreg: u8,
+        b_vreg: u8,
+        conf_sreg: u8,
+        acc_dest: u8,
+        acc_src: u8,
+        encoding_name: Option<&str>,
+    ) -> SlotOp {
+        let mut op = make_mac_op(semantic, a_vreg, b_vreg, conf_sreg, acc_dest, encoding_name);
+        // Insert AccumReg source before the ScalarReg (config is last).
+        op.sources.insert(2, Operand::AccumReg(acc_src));
+        op
+    }
+
+    /// Pack [u32; 16] (Vec512) of all-ones bytes (int8 = 1 in every byte).
+    fn vec512_all_ones_i8() -> Vec512 {
+        // 0x01010101 repeated 16 times = 64 bytes of 0x01
+        [0x01010101u32; 16]
+    }
+
+    /// Pack Vec512 of all bf16(1.0) values.
+    fn vec512_all_ones_bf16() -> Vec512 {
+        // bf16(1.0) = 0x3F80; two per u32 = 0x3F80_3F80
+        let word = 0x3F80_3F80u32;
+        [word; 16]
+    }
+
+    /// Build a config word for int8xi8 mode.
+    ///
+    /// Config word layout:
+    ///   bit 0:    zero_acc
+    ///   bits 1-2: amode (0 = acc_cmb=1, 32-bit)
+    ///   bits 3-4: bmode (1 = int8 B)
+    ///   bits 5-7: variant (0)
+    ///   bit 8:    sgn_y (1 = signed)
+    ///   bit 9:    sgn_x (1 = signed)
+    ///
+    /// i8xi8 signed accumulate: amode=0, bmode=1, sgn_x=1, sgn_y=1
+    /// = (1<<3) | (1<<8) | (1<<9) = 0x308
+    fn config_i8xi8_accumulate() -> u32 {
+        (1 << 3) | (1 << 8) | (1 << 9) // amode=0, bmode=1, signed
+    }
+
+    /// Build a config word for bf16 mode.
+    /// bf16 uses the bf16 lookup path (variant=0), sign bits irrelevant.
+    fn config_bf16_accumulate() -> u32 {
+        0x00 // zero_acc=0, variant=0
+    }
+
+    /// Build a config word for int8xi8 with zero_acc=1 (clear before multiply).
+    fn config_i8xi8_zero_acc() -> u32 {
+        (1 << 3) | (1 << 8) | (1 << 9) | 1 // same as accumulate but bit 0 set
+    }
+
+    #[test]
+    fn test_execute_matmul_i8xi8_ones() {
+        // All-ones int8 inputs through the full entry point.
+        // Config-driven: 4x8x8 (int8xi8, pmode=0) -> 32 output elements.
+        // Each output = sum(k=0..7) { 1 * 1 } = 8.
+        let mut ctx = ExecutionContext::new();
+
+        // Write all-ones to vector regs x0 (v0+v1) and x2 (v2+v3).
+        let ones = vec512_all_ones_i8();
+        ctx.vector.write_wide(0, ones);
+        ctx.vector.write_wide(2, ones);
+
+        // Write config to scalar r5.
+        ctx.scalar.write(5, config_i8xi8_accumulate());
+
+        let op = make_mac_op(
+            SemanticOp::Mac,
+            0, // x0
+            2, // x2
+            5, // config in r5
+            0, // cm0
+            None,
+        );
+
+        let handled = execute_matmul(&op, &mut ctx);
+        assert!(handled, "execute_matmul should handle Mac semantic");
+
+        // Read back accumulator cm0.
+        let acc = ctx.accumulator.read_wide(0);
+
+        // For 4x8x8 int8, there are 32 output elements (Acc32, two per u64).
+        // Each = 8.
+        for i in 0..32 {
+            let lane = i / 2;
+            let half = i % 2;
+            let val = ((acc[lane] >> (half * 32)) & 0xFFFF_FFFF) as i32;
+            assert_eq!(
+                val, 8,
+                "output[{}]: expected 8, got {}",
+                i, val
+            );
+        }
+    }
+
+    #[test]
+    fn test_execute_matmul_bf16_ones() {
+        // All bf16(1.0) inputs. Config-driven: 4x8x4 bf16 -> 16 outputs.
+        // Each output = sum(k=0..7) { 1.0 * 1.0 } = 8.0.
+        let mut ctx = ExecutionContext::new();
+
+        let ones = vec512_all_ones_bf16();
+        ctx.vector.write_wide(0, ones);
+        ctx.vector.write_wide(2, ones);
+        ctx.scalar.write(5, config_bf16_accumulate());
+
+        let op = make_mac_op(
+            SemanticOp::Mac,
+            0,
+            2,
+            5,
+            0,
+            Some("VMAC_F_vmac_bm_core_dense"),
+        );
+
+        let handled = execute_matmul(&op, &mut ctx);
+        assert!(handled);
+
+        let acc = ctx.accumulator.read_wide(0);
+        // bf16 mode: 16 fp32 outputs, two per u64 lane.
+        for i in 0..16 {
+            let lane = i / 2;
+            let half = i % 2;
+            let bits = ((acc[lane] >> (half * 32)) & 0xFFFF_FFFF) as u32;
+            let val = f32::from_bits(bits);
+            assert!(
+                (val - 8.0).abs() < 0.01,
+                "output[{}]: expected 8.0, got {}",
+                i, val
+            );
+        }
+    }
+
+    #[test]
+    fn test_execute_matmul_negate() {
+        // NegMul semantic: output = -(A * B).
+        // All-ones int8 -> each product sum = 8, negated = -8.
+        let mut ctx = ExecutionContext::new();
+
+        let ones = vec512_all_ones_i8();
+        ctx.vector.write_wide(0, ones);
+        ctx.vector.write_wide(2, ones);
+        ctx.scalar.write(5, config_i8xi8_accumulate());
+
+        let op = make_mac_op(
+            SemanticOp::NegMul,
+            0,
+            2,
+            5,
+            0,
+            None,
+        );
+
+        let handled = execute_matmul(&op, &mut ctx);
+        assert!(handled);
+
+        let acc = ctx.accumulator.read_wide(0);
+        for i in 0..32 {
+            let lane = i / 2;
+            let half = i % 2;
+            let val = ((acc[lane] >> (half * 32)) & 0xFFFF_FFFF) as u32 as i32;
+            assert_eq!(
+                val, -8,
+                "output[{}]: expected -8, got {}",
+                i, val
+            );
+        }
+    }
+
+    #[test]
+    fn test_execute_matmul_zero_acc() {
+        // Verify zero_acc=1 clears the accumulator before multiply.
+        let mut ctx = ExecutionContext::new();
+
+        // Pre-fill accumulator with garbage.
+        let mut preload = [0u64; 16];
+        for i in 0..16 {
+            preload[i] = 0xDEAD_BEEF_CAFE_BABEu64;
+        }
+        ctx.accumulator.write_wide(0, preload);
+
+        let ones = vec512_all_ones_i8();
+        ctx.vector.write_wide(0, ones);
+        ctx.vector.write_wide(2, ones);
+        ctx.scalar.write(5, config_i8xi8_zero_acc());
+
+        let op = make_mac_op(
+            SemanticOp::Mac,
+            0,
+            2,
+            5,
+            0,
+            None,
+        );
+
+        let handled = execute_matmul(&op, &mut ctx);
+        assert!(handled);
+
+        let acc = ctx.accumulator.read_wide(0);
+        // With zero_acc, accumulator is cleared first, so result = 0 + products = 8.
+        for i in 0..32 {
+            let lane = i / 2;
+            let half = i % 2;
+            let val = ((acc[lane] >> (half * 32)) & 0xFFFF_FFFF) as i32;
+            assert_eq!(
+                val, 8,
+                "output[{}]: expected 8 (zero_acc should clear), got {}",
+                i, val
+            );
+        }
+    }
+
+    #[test]
+    fn test_execute_matmul_returns_false_for_non_mac() {
+        // Verify non-MAC semantics return false.
+        let mut ctx = ExecutionContext::new();
+        let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Add);
+        assert!(!execute_matmul(&op, &mut ctx));
     }
 }
