@@ -1359,34 +1359,43 @@ impl VectorAlu {
                 }
             }
             ElementType::Int16 | ElementType::UInt16 => {
-                // 8 acc lanes -> 8 x 16-bit, packed 2 per u32 (4 words used)
-                for i in 0..4 {
-                    let val0 = mask_value(acc[i * 2]);
-                    let val1 = mask_value(acc[i * 2 + 1]);
-                    let out0 = vector_srs::srs_lane(
-                        val0, shift, signed_output, 16,
+                // Acc32 mode: 16 lanes packed 2 per u64.
+                // Extract lo32 and hi32 from each u64 to get 16 acc32 lanes,
+                // then SRS each to 16-bit and pack 2 per u32 result word.
+                for i in 0..8 {
+                    let lo_val = mask_value(acc[i] & 0xFFFF_FFFF);
+                    let hi_val = mask_value(acc[i] >> 32);
+                    let out_lo = vector_srs::srs_lane(
+                        lo_val, shift, signed_output, 16,
                         saturate, sym_sat, mode,
                     );
-                    let out1 = vector_srs::srs_lane(
-                        val1, shift, signed_output, 16,
+                    let out_hi = vector_srs::srs_lane(
+                        hi_val, shift, signed_output, 16,
                         saturate, sym_sat, mode,
                     );
-                    result[i] = (out0 as u16 as u32) | ((out1 as u16 as u32) << 16);
+                    result[i] = (out_lo as u16 as u32) | ((out_hi as u16 as u32) << 16);
                 }
             }
             ElementType::Int8 | ElementType::UInt8 => {
-                for i in 0..2 {
+                // Acc32 mode: 16 lanes packed 2 per u64 -> 16 x 8-bit output.
+                // 16 bytes = 4 u32 result words.
+                for i in 0..4 {
                     let mut word = 0u32;
                     for j in 0..4 {
-                        let lane = i * 4 + j;
-                        if lane < 8 {
-                            let val = mask_value(acc[lane]);
-                            let out = vector_srs::srs_lane(
-                                val, shift, signed_output, 8,
-                                saturate, sym_sat, mode,
-                            );
-                            word |= (out as u8 as u32) << (j * 8);
-                        }
+                        let lane_idx = i * 4 + j;
+                        let u64_idx = lane_idx / 2;
+                        let is_hi = lane_idx % 2 == 1;
+                        let raw = if is_hi {
+                            acc[u64_idx] >> 32
+                        } else {
+                            acc[u64_idx] & 0xFFFF_FFFF
+                        };
+                        let val = mask_value(raw);
+                        let out = vector_srs::srs_lane(
+                            val, shift, signed_output, 8,
+                            saturate, sym_sat, mode,
+                        );
+                        word |= (out as u8 as u32) << (j * 8);
                     }
                     result[i] = word;
                 }
@@ -4683,12 +4692,11 @@ mod tests {
     #[test]
     fn test_vector_ups_srs_roundtrip() {
         let mut ctx = make_ctx();
-        // UPS+SRS round-trip: 16 x i16 input, UPS processes lower 8 lanes,
-        // SRS converts back to i16. Only the lower 4 output words should
-        // match the lower 4 input words (8 x i16 -> 8 acc lanes -> 8 x i16).
+        // UPS+SRS round-trip: 16 x i16 input -> Acc32 (16 lanes, 2 per u64)
+        // -> SRS back to 16 x i16. All 16 lanes should survive the round-trip.
         let src = [0x0002_0001u32, 0x0004_0003, 0x0006_0005, 0x0008_0007,
                     0x000A_0009, 0x000C_000B, 0x000E_000D, 0x0010_000F];
-        // UPS with shift=0: sign-extend 8 i16 values to i32 in accumulator
+        // UPS with shift=0: sign-extend 16 i16 values to i32 in accumulator
         let acc = super::vector_ups::ups_vector_to_acc(
             &src, 0, ElementType::Int16, ElementType::Int32,
         );
@@ -4704,15 +4712,16 @@ mod tests {
 
         VectorAlu::execute(&op, &mut ctx);
         let result = ctx.vector.read(0);
-        // 8 acc lanes produce 8 x i16 packed into 4 u32 words.
-        // UPS processes lanes 0-7 (first 8 of 16 input lanes).
-        // Lanes 0-7 are: 1,2, 3,4, 5,6, 7,8
+        // Acc32 mode processes all 16 lanes. SRS produces 16 x i16
+        // packed into 8 u32 words -- a perfect round-trip.
         assert_eq!(result[0], 0x0002_0001, "lanes 0-1");
         assert_eq!(result[1], 0x0004_0003, "lanes 2-3");
         assert_eq!(result[2], 0x0006_0005, "lanes 4-5");
         assert_eq!(result[3], 0x0008_0007, "lanes 6-7");
-        // Upper words are zero (only 8 lanes processed)
-        assert_eq!(result[4], 0, "upper should be zero");
+        assert_eq!(result[4], 0x000A_0009, "lanes 8-9");
+        assert_eq!(result[5], 0x000C_000B, "lanes 10-11");
+        assert_eq!(result[6], 0x000E_000D, "lanes 12-13");
+        assert_eq!(result[7], 0x0010_000F, "lanes 14-15");
     }
 
     #[test]
@@ -5162,5 +5171,73 @@ mod tests {
         // full_mask = 0x928A
         let scalar_result = ctx.scalar.read(16);
         assert_eq!(scalar_result, 0x928A, "wide VLT scalar bitmask mismatch: got {:#06x}", scalar_result);
+    }
+
+    /// SRS from Acc32 (16 lanes packed 2 per u64) to 16-bit output.
+    /// Verifies that vector_srs_from_acc correctly unpacks lo32/hi32 from
+    /// each u64 and produces 16 x 16-bit results packed into 8 u32 words.
+    #[test]
+    fn test_srs_from_acc32_to_d16() {
+        // Build acc data: 16 lanes of acc32, values 100..115, packed 2 per u64.
+        let mut acc = [0u64; 8];
+        for i in 0..8usize {
+            let lo = (100 + i * 2) as u64;
+            let hi = (100 + i * 2 + 1) as u64;
+            acc[i] = lo | (hi << 32);
+        }
+
+        // SRS with shift=0, from S32 accumulator to Int16 output.
+        let cfg = SrsConfig {
+            rounding_mode: 0, // Floor
+            saturation_mode: 0, // No saturation
+            srs_sign: true, // Signed output
+        };
+
+        let result = VectorAlu::vector_srs_from_acc(
+            &acc, 0, ElementType::Int32, ElementType::Int16, &cfg,
+        );
+
+        // Each result word packs 2 x 16-bit values.
+        for i in 0..8 {
+            let expected_lo = (100 + i * 2) as u16;
+            let expected_hi = (100 + i * 2 + 1) as u16;
+            let expected = (expected_lo as u32) | ((expected_hi as u32) << 16);
+            assert_eq!(result[i], expected, "result[{}]: got {:#010x}, expected {:#010x}",
+                i, result[i], expected);
+        }
+    }
+
+    /// SRS from Acc32 (16 lanes packed 2 per u64) to 8-bit output.
+    #[test]
+    fn test_srs_from_acc32_to_d8() {
+        // Build acc data: 16 lanes of acc32, values 10..25, packed 2 per u64.
+        let mut acc = [0u64; 8];
+        for i in 0..8usize {
+            let lo = (10 + i * 2) as u64;
+            let hi = (10 + i * 2 + 1) as u64;
+            acc[i] = lo | (hi << 32);
+        }
+
+        let cfg = SrsConfig {
+            rounding_mode: 0,
+            saturation_mode: 0,
+            srs_sign: true,
+        };
+
+        let result = VectorAlu::vector_srs_from_acc(
+            &acc, 0, ElementType::Int32, ElementType::Int8, &cfg,
+        );
+
+        // 16 x 8-bit values packed into 4 u32 words (4 bytes each).
+        for i in 0..4 {
+            let mut expected = 0u32;
+            for j in 0..4 {
+                let lane_idx = i * 4 + j;
+                let val = (10 + lane_idx) as u8;
+                expected |= (val as u32) << (j * 8);
+            }
+            assert_eq!(result[i], expected, "result[{}]: got {:#010x}, expected {:#010x}",
+                i, result[i], expected);
+        }
     }
 }

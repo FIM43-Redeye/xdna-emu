@@ -263,13 +263,14 @@ pub fn ups_vector(
 
 /// Perform UPS and produce a 512-bit accumulator result.
 ///
-/// The accumulator has 8 lanes of 64 bits each. Both Acc32 and Acc64 modes
-/// use one value per u64 lane (zero-extended for 32-bit values). This matches
-/// hardware behavior where UPS with 16-bit input processes only the lower 8
-/// of 16 input lanes in Acc32 mode, producing 8 x 32-bit results.
+/// The accumulator has 8 lanes of 64 bits each (`[u64; 8]`).
 ///
-/// For Acc64 mode (e.g., vups.s64.s32): 8 input lanes of 32-bit become
-/// 8 lanes of 64-bit.
+/// **Acc32 mode** (`bits_out <= 32`): hardware packs TWO 32-bit accumulator
+/// values per u64 slot: `u64[i] = lane[2*i] | (lane[2*i+1] << 32)`.
+/// With 16-bit input this produces 16 acc32 lanes; with 8-bit input, also 16
+/// (the maximum that fit in 8 u64 words at 2 per word).
+///
+/// **Acc64 mode** (`bits_out > 32`): one 64-bit value per u64 slot, 8 lanes.
 pub fn ups_vector_to_acc(
     src: &[u32; 8],
     shift: u32,
@@ -282,12 +283,28 @@ pub fn ups_vector_to_acc(
 
     let mut result = [0u64; 8];
 
-    // Always 8 output lanes (one per u64 word in the accumulator).
-    // For narrow inputs (8-bit or 16-bit), only the first 8 lanes are processed.
-    for i in 0..8u32 {
-        let val = extract_lane(src, i, bits_in);
-        let out = ups_lane_signed(val, shift, bits_in, bits_out, false, signed_input);
-        result[i as usize] = out as u64;
+    if bits_out <= 32 {
+        // Acc32 mode: pack two 32-bit values per u64 word.
+        let in_lanes = (256 / bits_in).min(16);
+        for i in 0..in_lanes {
+            let val = extract_lane(src, i, bits_in);
+            let out = ups_lane_signed(val, shift, bits_in, bits_out, false, signed_input);
+            let out_u32 = (out as u64) & 0xFFFF_FFFF;
+            let word_idx = (i / 2) as usize;
+            if i % 2 == 0 {
+                result[word_idx] |= out_u32;
+            } else {
+                result[word_idx] |= out_u32 << 32;
+            }
+        }
+    } else {
+        // Acc64 mode: one 64-bit value per u64 word.
+        let in_lanes = (256 / bits_in).min(8);
+        for i in 0..in_lanes {
+            let val = extract_lane(src, i, bits_in);
+            let out = ups_lane_signed(val, shift, bits_in, bits_out, false, signed_input);
+            result[i as usize] = out as u64;
+        }
     }
 
     result
@@ -553,41 +570,60 @@ mod tests {
     // -- ups_vector_to_acc tests --
 
     #[test]
-    fn test_ups_to_acc_s32_s16_identity() {
-        // vups.s32.s16 with shift=0: processes lower 8 of 16 input lanes.
-        // Each u64 holds one sign-extended i32 value.
+    fn test_ups_acc32_packing_two_per_u64() {
+        // vups.s32.s16 with shift=0: 16 input lanes of 16-bit -> 16 acc32 values,
+        // packed 2 per u64.  u64[i] = lane[2*i] | (lane[2*i+1] << 32).
         let src = [0x0002_0001u32, 0x0004_0003, 0x0006_0005, 0x0008_0007,
                     0x000A_0009, 0x000C_000B, 0x000E_000D, 0x0010_000F];
         let acc = ups_vector_to_acc(&src, 0, ElementType::Int16, ElementType::Int32);
-        // 8 lanes: values 1, 2, 3, 4, 5, 6, 7, 8 (lower i16 of each u32)
-        assert_eq!(acc[0], 1);
-        assert_eq!(acc[1], 2);
-        assert_eq!(acc[2], 3);
-        assert_eq!(acc[3], 4);
-        assert_eq!(acc[4], 5);
-        assert_eq!(acc[5], 6);
-        assert_eq!(acc[6], 7);
-        assert_eq!(acc[7], 8);
+        // Lane 0=1, lane 1=2 -> acc[0] = 1 | (2<<32)
+        assert_eq!(acc[0], 1 | (2u64 << 32), "acc[0]");
+        assert_eq!(acc[1], 3 | (4u64 << 32), "acc[1]");
+        assert_eq!(acc[2], 5 | (6u64 << 32), "acc[2]");
+        assert_eq!(acc[3], 7 | (8u64 << 32), "acc[3]");
+        assert_eq!(acc[4], 9 | (10u64 << 32), "acc[4]");
+        assert_eq!(acc[5], 11 | (12u64 << 32), "acc[5]");
+        assert_eq!(acc[6], 13 | (14u64 << 32), "acc[6]");
+        assert_eq!(acc[7], 15 | (16u64 << 32), "acc[7]");
     }
 
     #[test]
-    fn test_ups_to_acc_s32_s16_negative() {
+    fn test_ups_acc32_negative() {
         // vups.s32.s16 with shift=0 and negative input: -1 in i16 = 0xFFFF.
-        let src = [0xFFFF_FFFF_u32; 8]; // all lanes = -1 as i16
+        // -1 as i32 = 0xFFFF_FFFF. Two per u64 = 0xFFFF_FFFF_FFFF_FFFF.
+        let src = [0xFFFF_FFFF_u32; 8]; // all 16 lanes = -1 as i16
         let acc = ups_vector_to_acc(&src, 0, ElementType::Int16, ElementType::Int32);
         for i in 0..8usize {
-            // -1 sign-extended from i16 through i32 to i64, stored as u64
-            assert_eq!(acc[i], (-1i64) as u64, "lane {}", i);
+            // Both lo and hi halves are 0xFFFF_FFFF (i.e. -1 as u32).
+            assert_eq!(acc[i], 0xFFFF_FFFF_FFFF_FFFF, "lane pair {}", i);
         }
     }
 
     #[test]
-    fn test_ups_to_acc_s64_s32() {
+    fn test_ups_acc64_one_per_u64() {
         // vups.s64.s32 with shift=0: 8 input lanes of 32-bit -> 8 x 64-bit.
+        // Acc64 mode: one value per u64 word.
         let src = [1u32, 2, 3, 4, 5, 6, 7, 8];
-        let acc = ups_vector_to_acc(&src, 0, ElementType::Int32, ElementType::Int32);
+        let acc = ups_vector_to_acc(&src, 0, ElementType::Int32, ElementType::Int64);
         for i in 0..8 {
-            assert_eq!(acc[i], (i + 1) as u64);
+            assert_eq!(acc[i], (i + 1) as u64, "lane {}", i);
+        }
+    }
+
+    #[test]
+    fn test_ups_acc32_from_d8() {
+        // vups.s32.s8 with shift=0: up to 16 lanes of 8-bit input -> 16 acc32 values.
+        // Input: 32 lanes of 8-bit in [u32; 8], only first 16 processed.
+        let mut src = [0u32; 8];
+        for i in 0..32u32 {
+            pack_lane(&mut src, i, 8, (i + 1) as i64);
+        }
+        let acc = ups_vector_to_acc(&src, 0, ElementType::Int8, ElementType::Int32);
+        // 16 acc32 lanes, packed 2 per u64.
+        for pair in 0..8usize {
+            let lo = (pair * 2 + 1) as u64;
+            let hi = (pair * 2 + 2) as u64;
+            assert_eq!(acc[pair], lo | (hi << 32), "acc[{}]", pair);
         }
     }
 }
