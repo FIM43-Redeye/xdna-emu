@@ -63,12 +63,15 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         }
     };
 
-    // Detect bf16 mode from encoding name.
+    // Detect bf16 mode from mnemonic/encoding name.
+    // The encoding_name field holds the mnemonic (e.g., "vmac.f", "vaddmac.f").
+    // BFloat16 variants use ".f" suffix or "_F_"/"_F" in the encoding name.
     let is_bf16 = op
         .encoding_name
         .as_ref()
-        .map(|n| n.contains("_F_") || n.ends_with("_F"))
-        .unwrap_or(false);
+        .map(|n| n.ends_with(".f") || n.contains(".f ") || n.contains("_F_") || n.ends_with("_F"))
+        .unwrap_or(false)
+        || matches!(op.element_type, Some(ElementType::BFloat16 | ElementType::Float32));
 
     // Parse config word into tile geometry and modes.
     let mut config = match MatMulConfig::from_config_word(conf_val, is_bf16) {
