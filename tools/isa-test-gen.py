@@ -3872,31 +3872,67 @@ def _vmac_configs_for_instr(name: str) -> list[int]:
 
     configs = []
 
+    # Valid (amode, bmode, variant) triples from CONFIG_GEOMETRY_TABLE.
+    # Only generate configs that the hardware geometry table supports.
+    VALID_DENSE = [
+        # amode=0 (acc32)
+        (0, 0, 0),  # i8xi4  4x16x8
+        (0, 1, 0),  # i8xi8  4x8x8
+        (0, 2, 0),  # i16xi8  4x4x8
+        (0, 3, 0),  # i16xi16  4x2x8
+        # amode=1 (acc64)
+        (1, 0, 0),  # i32xi16  4x2x4
+        (1, 2, 0),  # i16xi8  2x8x8
+        (1, 2, 1),  # i16xi8  4x8x4
+        (1, 3, 0),  # i16xi16  2x4x8
+        (1, 3, 1),  # i16xi16  4x4x4
+    ]
+    VALID_SPARSE = [
+        # amode=0 (acc32)
+        (0, 0, 1),  # i8xi4 sparse
+        (0, 1, 5),  # i8xi8 sparse
+        # amode=1 (acc64)
+        (1, 2, 2),  # i16xi8 sparse
+        (1, 3, 5),  # i16xi16 sparse
+    ]
+    VALID_BF16_DENSE = [(2, 3, 0)]
+    VALID_BF16_SPARSE = [(2, 3, 2)]  # bf16 sparse
+    VALID_BF16_ELEMWISE = [(2, 3, 1)]  # bf16 element-wise
+
     if is_float:
-        # bf16 mode: amode=2, bmode=3 always.
-        # Signedness bits are don't-care for bf16 (IEEE sign in the data).
-        configs.append(_make_vmac_config(
-            amode=2, bmode=3, variant=variant,
-            sgn_x=0, sgn_y=0, zero_acc=1))
+        if "SPARSE" in name_upper:
+            table = VALID_BF16_SPARSE
+        else:
+            # Include dense + element-wise for non-sparse bf16.
+            table = VALID_BF16_DENSE + VALID_BF16_ELEMWISE
+        for amode, bmode, v in table:
+            configs.append(_make_vmac_config(
+                amode=amode, bmode=bmode, variant=v,
+                sgn_x=0, sgn_y=0, zero_acc=1))
     elif is_cm:
-        # acc64 integer: amode=1.
-        # Generate configs for common element type pairs.
-        for bmode in (0, 1):  # 8x8->64, 16x16->64
-            for sgn_x, sgn_y in ((1, 1), (0, 0)):  # signed-signed, unsigned-unsigned
-                configs.append(_make_vmac_config(
-                    amode=1, bmode=bmode, variant=variant,
-                    sgn_x=sgn_x, sgn_y=sgn_y, zero_acc=1))
-    elif is_bm:
-        # acc32 integer: amode=0.
-        for bmode in (0, 1):  # 8x8->32, 16x16->32
+        # acc64: amode=1 entries.
+        table = VALID_SPARSE if "SPARSE" in name_upper else VALID_DENSE
+        for amode, bmode, v in table:
+            if amode != 1:
+                continue
             for sgn_x, sgn_y in ((1, 1), (0, 0)):
                 configs.append(_make_vmac_config(
-                    amode=0, bmode=bmode, variant=variant,
+                    amode=amode, bmode=bmode, variant=v,
+                    sgn_x=sgn_x, sgn_y=sgn_y, zero_acc=1))
+    elif is_bm:
+        # acc32: amode=0 entries.
+        table = VALID_SPARSE if "SPARSE" in name_upper else VALID_DENSE
+        for amode, bmode, v in table:
+            if amode != 0:
+                continue
+            for sgn_x, sgn_y in ((1, 1), (0, 0)):
+                configs.append(_make_vmac_config(
+                    amode=amode, bmode=bmode, variant=v,
                     sgn_x=sgn_x, sgn_y=sgn_y, zero_acc=1))
     else:
-        # Fallback: signed 16x16, acc64, dense.
+        # Fallback: one known-good config.
         configs.append(_make_vmac_config(
-            amode=1, bmode=1, variant=variant,
+            amode=1, bmode=3, variant=0,
             sgn_x=1, sgn_y=1, zero_acc=1))
 
     return configs
