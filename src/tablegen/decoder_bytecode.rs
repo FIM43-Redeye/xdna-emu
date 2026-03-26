@@ -115,6 +115,13 @@ impl DecoderTable {
                     let _decoder_idx = read_uleb128(bytes, &mut ptr);
                     let num_to_skip = read_u24_le(bytes, &mut ptr);
 
+                    // TRY_DECODE is used for hasCompleteDecoder=0 instructions.
+                    // LLVM calls a per-instruction decoder function (indexed by
+                    // decoder_idx) that validates register class membership and
+                    // can reject the match. Our bytecode interpreter cannot
+                    // replicate this validation -- it accepts the first match.
+                    //
+                    // TODO: Replace with LLVM FFI decoder (see decoder_ffi/).
                     if self.opcode_names.contains_key(&opcode_id) {
                         return self.opcode_names.get(&opcode_id).map(|s| s.as_str());
                     }
@@ -131,10 +138,9 @@ impl DecoderTable {
                 }
 
                 _ => {
-                    log::warn!(
-                        "Unknown decoder bytecode opcode {} at offset {}",
-                        opcode,
-                        ptr - 1
+                    eprintln!(
+                        "[UNKNOWN OPCODE] {} at offset {} (insn=0x{:X})",
+                        opcode, ptr - 1, insn_bits
                     );
                     return None;
                 }
@@ -306,5 +312,33 @@ mod tests {
         } else {
             panic!("MV bits 0x{:06x} failed to decode", mv_bits);
         }
+    }
+
+    /// Documents a known limitation of the bytecode interpreter:
+    /// TRY_DECODE cannot validate register class membership, so VSEL_16
+    /// wins over VPUSH_HI_32 for certain register encodings.
+    ///
+    /// The integrated decode path (SlotIndex::decode) uses the LLVM FFI
+    /// decoder which handles this correctly.  See decoder_ffi tests.
+    #[test]
+    fn test_vpush_hi_32_bytecode_known_limitation() {
+        let output = crate::tablegen::load_from_generated();
+        let mv_table = output.decoder_tables.get("mv")
+            .expect("Should have mv decoder table");
+
+        // r3 encoding works (VSEL_16 doesn't match this one)
+        let r3_bits: u64 = 0x028C3D;
+        let r3_result = mv_table.decode(r3_bits);
+        assert_eq!(r3_result, Some("VPUSH_HI_32"),
+            "r3 encoding 0x{:06X} should decode as VPUSH_HI_32, got {:?}",
+            r3_bits, r3_result);
+
+        // r4 encoding: bytecode interpreter incorrectly matches VSEL_16
+        // because it accepts the first TRY_DECODE without register class
+        // validation.  The FFI decoder handles this correctly.
+        let r4_bits: u64 = 0x02903D;
+        let r4_result = mv_table.decode(r4_bits);
+        assert_eq!(r4_result, Some("VSEL_16"),
+            "Bytecode interpreter should (incorrectly) match VSEL_16 for r4 encoding");
     }
 }
