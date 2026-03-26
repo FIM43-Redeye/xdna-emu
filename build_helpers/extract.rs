@@ -571,11 +571,17 @@ fn semantic_from_intrinsic(name: &str) -> Option<String> {
     if stem.starts_with("vsub_ge") {
         return Some("SemanticOp::SubGe".to_string());
     }
-    if stem.starts_with("vlt") || stem.starts_with("vmax_lt") {
+    if stem.starts_with("vmax_lt") {
         return Some("SemanticOp::MaxLt".to_string());
     }
-    if stem.starts_with("vge") || stem.starts_with("vmin_ge") {
+    if stem.starts_with("vmin_ge") {
         return Some("SemanticOp::MinGe".to_string());
+    }
+    if stem.starts_with("vlt") {
+        return Some("SemanticOp::SetLt".to_string());
+    }
+    if stem.starts_with("vge") {
+        return Some("SemanticOp::SetGe".to_string());
     }
     if stem.starts_with("veqz") {
         return Some("SemanticOp::SetEq".to_string());

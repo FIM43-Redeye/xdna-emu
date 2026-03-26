@@ -359,14 +359,18 @@ impl VectorAlu {
             }
 
             SemanticOp::VectorInsert => {
-                // TODO: VPUSH (shift+insert) operates on full 512-bit vectors
-                // and cannot be properly handled in the 256-bit half-split path.
-                // For now, fall through to legacy insert-at-index behavior.
-                let mut dst = Self::get_vector_dest_value(op, ctx);
-                let value = Self::get_scalar_source(op, ctx);
-                let index = Self::get_lane_index(op, ctx);
-                Self::vector_insert(&mut dst, value, index, et);
-                Self::write_vector_dest(op, ctx, dst);
+                // VINSERT.N dst, s1, idx, s0: copy s1 with s1[idx] replaced by s0.
+                // The base vector is s1 (sources[0]), NOT the current dst value.
+                // VPUSH (shift+insert) is handled in the execute_wide path.
+                //
+                // MCInst operand order: (outs dst), (ins s1, idx, s0)
+                // sources = [VectorReg(s1), ScalarReg(idx), ScalarReg(s0)]
+                // Use position-aware access: idx is 1st scalar, s0 is 2nd scalar.
+                let mut base = Self::get_vector_source(op, ctx, 0);
+                let index = Self::get_nth_scalar_source(op, ctx, 0);  // idx
+                let value = Self::get_nth_scalar_source(op, ctx, 1);  // s0
+                Self::vector_insert(&mut base, value, index, et);
+                Self::write_vector_dest(op, ctx, base);
                 true
             }
 
@@ -762,10 +766,6 @@ impl VectorAlu {
         let acc1_reg = if !acc_sources.is_empty() { acc_sources[0] } else { 0 };
         let acc2_reg = if acc_sources.len() >= 2 { acc_sources[1] } else { acc1_reg };
 
-        // Read both cm sources as 1024-bit wide registers (16 lanes each).
-        let a1 = ctx.accumulator.read_wide(acc1_reg);
-        let a2 = ctx.accumulator.read_wide(acc2_reg);
-
         // Read config register.
         let conf = Self::get_config_register(op, ctx).unwrap_or(0);
         let zero_acc1 = (conf & 1) != 0;
@@ -778,55 +778,89 @@ impl VectorAlu {
         let base_sub = enc_lower.starts_with("vsub");
         let base_neg = enc_lower.starts_with("vneg");
         let base_negsub = enc_lower.starts_with("vnegsub");
-        let is_float = enc_lower.contains("_f");
+        let is_float = enc_lower.contains("_f") || enc_lower.contains(".f");
+
+        // Wide (cm, 1024-bit) vs narrow (bm, 512-bit) accumulator.
+        // Wide cm registers always use even base indices (cm0=bm0, cm1=bm2, etc.).
+        // If any accumulator operand (source or dest) has an odd index, this is
+        // a narrow bm operation.
+        let dst_reg = Self::get_acc_dest(op);
+        let any_odd = acc_sources.iter().any(|r| r % 2 != 0) || dst_reg % 2 != 0;
+        let is_wide = !any_odd;
 
         // Compute effective signs for acc1 and acc2.
-        // Base operation sets initial signs, config modifiers can flip them.
         let negate_acc1 = base_neg || base_negsub || sub_acc1;
         let negate_acc2 = base_sub || base_negsub || sub_acc2;
 
-        // Process all 16 lanes of the cm register in a single pass.
-        let mut result = [0u64; 16];
+        if is_wide {
+            // Wide path: 1024-bit cm registers (16 x 64-bit lanes).
+            let a1 = ctx.accumulator.read_wide(acc1_reg);
+            let a2 = ctx.accumulator.read_wide(acc2_reg);
+            let mut result = [0u64; 16];
 
-        if is_float {
-            for i in 0..16 {
-                let a1_lo = if zero_acc1 { 0.0 } else { f32::from_bits(a1[i] as u32) };
-                let a1_hi = if zero_acc1 { 0.0 } else { f32::from_bits((a1[i] >> 32) as u32) };
-                let a2_lo = f32::from_bits(a2[i] as u32);
-                let a2_hi = f32::from_bits((a2[i] >> 32) as u32);
+            if is_float {
+                for i in 0..16 {
+                    let a1_lo = if zero_acc1 { 0.0 } else { f32::from_bits(a1[i] as u32) };
+                    let a1_hi = if zero_acc1 { 0.0 } else { f32::from_bits((a1[i] >> 32) as u32) };
+                    let a2_lo = f32::from_bits(a2[i] as u32);
+                    let a2_hi = f32::from_bits((a2[i] >> 32) as u32);
 
-                let v1_lo = if negate_acc1 { -a1_lo } else { a1_lo };
-                let v1_hi = if negate_acc1 { -a1_hi } else { a1_hi };
-                let v2_lo = if negate_acc2 { -a2_lo } else { a2_lo };
-                let v2_hi = if negate_acc2 { -a2_hi } else { a2_hi };
+                    let v1_lo = if negate_acc1 { -a1_lo } else { a1_lo };
+                    let v1_hi = if negate_acc1 { -a1_hi } else { a1_hi };
+                    let v2_lo = if negate_acc2 { -a2_lo } else { a2_lo };
+                    let v2_hi = if negate_acc2 { -a2_hi } else { a2_hi };
 
-                let res_lo = v1_lo + v2_lo;
-                let res_hi = v1_hi + v2_hi;
-
-                result[i] = (res_lo.to_bits() as u64) | ((res_hi.to_bits() as u64) << 32);
-            }
-        } else {
-            for i in 0..16 {
-                let v1 = if zero_acc1 { 0i64 } else { a1[i] as i64 };
-                let v2 = a2[i] as i64;
-
-                let v1 = if negate_acc1 { v1.wrapping_neg() } else { v1 };
-                let v2 = if negate_acc2 { v2.wrapping_neg() } else { v2 };
-
-                let mut res = v1.wrapping_add(v2);
-
-                // shift16: arithmetic right shift by 16 bits
-                if shift16 {
-                    res >>= 16;
+                    result[i] = ((v1_lo + v2_lo).to_bits() as u64)
+                        | (((v1_hi + v2_hi).to_bits() as u64) << 32);
                 }
-
-                result[i] = res as u64;
+            } else {
+                for i in 0..16 {
+                    let v1 = if zero_acc1 { 0i64 } else { a1[i] as i64 };
+                    let v2 = a2[i] as i64;
+                    let v1 = if negate_acc1 { v1.wrapping_neg() } else { v1 };
+                    let v2 = if negate_acc2 { v2.wrapping_neg() } else { v2 };
+                    let mut res = v1.wrapping_add(v2);
+                    if shift16 { res >>= 16; }
+                    result[i] = res as u64;
+                }
             }
-        }
 
-        // Write all 16 lanes back via write_wide.
-        let dst_reg = Self::get_acc_dest(op);
-        ctx.accumulator.write_wide(dst_reg, result);
+            ctx.accumulator.write_wide(dst_reg, result);
+        } else {
+            // Narrow path: 512-bit bm registers (8 x 64-bit lanes).
+            let a1 = ctx.accumulator.read(acc1_reg);
+            let a2 = ctx.accumulator.read(acc2_reg);
+            let mut result = [0u64; 8];
+
+            if is_float {
+                for i in 0..8 {
+                    let a1_lo = if zero_acc1 { 0.0 } else { f32::from_bits(a1[i] as u32) };
+                    let a1_hi = if zero_acc1 { 0.0 } else { f32::from_bits((a1[i] >> 32) as u32) };
+                    let a2_lo = f32::from_bits(a2[i] as u32);
+                    let a2_hi = f32::from_bits((a2[i] >> 32) as u32);
+
+                    let v1_lo = if negate_acc1 { -a1_lo } else { a1_lo };
+                    let v1_hi = if negate_acc1 { -a1_hi } else { a1_hi };
+                    let v2_lo = if negate_acc2 { -a2_lo } else { a2_lo };
+                    let v2_hi = if negate_acc2 { -a2_hi } else { a2_hi };
+
+                    result[i] = ((v1_lo + v2_lo).to_bits() as u64)
+                        | (((v1_hi + v2_hi).to_bits() as u64) << 32);
+                }
+            } else {
+                for i in 0..8 {
+                    let v1 = if zero_acc1 { 0i64 } else { a1[i] as i64 };
+                    let v2 = a2[i] as i64;
+                    let v1 = if negate_acc1 { v1.wrapping_neg() } else { v1 };
+                    let v2 = if negate_acc2 { v2.wrapping_neg() } else { v2 };
+                    let mut res = v1.wrapping_add(v2);
+                    if shift16 { res >>= 16; }
+                    result[i] = res as u64;
+                }
+            }
+
+            ctx.accumulator.write(dst_reg, result);
+        }
     }
 
     /// Accumulator negate: dst = -src for all 16 lanes of a cm-register.
@@ -842,34 +876,53 @@ impl VectorAlu {
         }).unwrap_or(0);
         let dst_reg = Self::get_acc_dest(op);
 
-        // Read source as full 1024-bit wide register.
-        let src = ctx.accumulator.read_wide(acc_reg);
-
         let conf = Self::get_config_register(op, ctx).unwrap_or(0);
         let zero_acc = (conf & 1) != 0;
         let is_float = op.encoding_name.as_ref()
-            .map_or(false, |n| n.contains("_F"));
+            .map_or(false, |n| n.contains("_F") || n.contains(".f"));
 
-        let mut result = [0u64; 16];
+        // Wide (cm) vs narrow (bm) -- same detection as execute_acc_add_sub.
+        // Wide cm registers always use even base indices.
+        let any_odd = acc_reg % 2 != 0 || dst_reg % 2 != 0;
+        let is_wide = !any_odd;
 
-        if is_float {
-            // Float: each u64 lane holds two fp32 values.
-            for i in 0..16 {
-                let lo = f32::from_bits(src[i] as u32);
-                let hi = f32::from_bits((src[i] >> 32) as u32);
-                let r_lo = if zero_acc { 0.0f32 } else { -lo };
-                let r_hi = if zero_acc { 0.0f32 } else { -hi };
-                result[i] = (r_lo.to_bits() as u64) | ((r_hi.to_bits() as u64) << 32);
+        if is_wide {
+            let src = ctx.accumulator.read_wide(acc_reg);
+            let mut result = [0u64; 16];
+            if is_float {
+                for i in 0..16 {
+                    let lo = f32::from_bits(src[i] as u32);
+                    let hi = f32::from_bits((src[i] >> 32) as u32);
+                    let r_lo = if zero_acc { 0.0f32 } else { -lo };
+                    let r_hi = if zero_acc { 0.0f32 } else { -hi };
+                    result[i] = (r_lo.to_bits() as u64) | ((r_hi.to_bits() as u64) << 32);
+                }
+            } else {
+                for i in 0..16 {
+                    let v = if zero_acc { 0i64 } else { src[i] as i64 };
+                    result[i] = v.wrapping_neg() as u64;
+                }
             }
+            ctx.accumulator.write_wide(dst_reg, result);
         } else {
-            // Integer: each u64 lane is one i64 value.
-            for i in 0..16 {
-                let v = if zero_acc { 0i64 } else { src[i] as i64 };
-                result[i] = v.wrapping_neg() as u64;
+            let src = ctx.accumulator.read(acc_reg);
+            let mut result = [0u64; 8];
+            if is_float {
+                for i in 0..8 {
+                    let lo = f32::from_bits(src[i] as u32);
+                    let hi = f32::from_bits((src[i] >> 32) as u32);
+                    let r_lo = if zero_acc { 0.0f32 } else { -lo };
+                    let r_hi = if zero_acc { 0.0f32 } else { -hi };
+                    result[i] = (r_lo.to_bits() as u64) | ((r_hi.to_bits() as u64) << 32);
+                }
+            } else {
+                for i in 0..8 {
+                    let v = if zero_acc { 0i64 } else { src[i] as i64 };
+                    result[i] = v.wrapping_neg() as u64;
+                }
             }
+            ctx.accumulator.write(dst_reg, result);
         }
-
-        ctx.accumulator.write_wide(dst_reg, result);
     }
 
 /// Get config register value from a scalar register in sources.
@@ -2036,6 +2089,44 @@ impl VectorAlu {
             match src {
                 Operand::ScalarReg(r) => return ctx.scalar.read(*r),
                 Operand::Immediate(imm) => return *imm as u32,
+                _ => {}
+            }
+        }
+        0
+    }
+
+    /// Get 64-bit scalar source from a register pair (rN, rN+1).
+    ///
+    /// For 64-bit VPUSH, the scalar value spans two adjacent registers:
+    /// rN holds the low 32 bits, rN+1 holds the high 32 bits.
+    fn get_scalar_source_64(op: &SlotOp, ctx: &ExecutionContext) -> u64 {
+        for src in &op.sources {
+            if let Operand::ScalarReg(r) = src {
+                let lo = ctx.scalar.read(*r) as u64;
+                let hi = ctx.scalar.read(r + 1) as u64;
+                return lo | (hi << 32);
+            }
+        }
+        0
+    }
+
+    /// Get the Nth scalar source operand (0-indexed among scalars/immediates).
+    ///
+    /// For instructions with multiple scalar operands (e.g., VINSERT has both
+    /// idx and s0), type-scanning heuristics pick the wrong one. This function
+    /// returns the Nth scalar in source order.
+    fn get_nth_scalar_source(op: &SlotOp, ctx: &ExecutionContext, n: usize) -> u32 {
+        let mut count = 0;
+        for src in &op.sources {
+            match src {
+                Operand::ScalarReg(r) => {
+                    if count == n { return ctx.scalar.read(*r); }
+                    count += 1;
+                }
+                Operand::Immediate(imm) => {
+                    if count == n { return *imm as u32; }
+                    count += 1;
+                }
                 _ => {}
             }
         }
@@ -3795,13 +3886,35 @@ impl VectorAlu {
             SemanticOp::SetGe => {
                 let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
                 let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_compare_ge);
-                Self::write_wide_vec_dest(op, ctx, result);
+                if matches!(op.dest, Some(Operand::ScalarReg(_))) {
+                    // VGE: condense per-lane mask into scalar bitmask
+                    let lo: [u32; 8] = result[..8].try_into().unwrap();
+                    let hi: [u32; 8] = result[8..].try_into().unwrap();
+                    let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
+                    let mask_hi = Self::condense_comparison_mask(&hi, op.element_type);
+                    let lanes_per_half = 256 / et.bits() as u32;
+                    let full_mask = mask_lo | (mask_hi << lanes_per_half);
+                    Self::write_scalar_dest(op, ctx, full_mask);
+                } else {
+                    Self::write_wide_vec_dest(op, ctx, result);
+                }
                 true
             }
             SemanticOp::SetLt => {
                 let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
                 let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_compare_lt);
-                Self::write_wide_vec_dest(op, ctx, result);
+                if matches!(op.dest, Some(Operand::ScalarReg(_))) {
+                    // VLT: condense per-lane mask into scalar bitmask
+                    let lo: [u32; 8] = result[..8].try_into().unwrap();
+                    let hi: [u32; 8] = result[8..].try_into().unwrap();
+                    let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
+                    let mask_hi = Self::condense_comparison_mask(&hi, op.element_type);
+                    let lanes_per_half = 256 / et.bits() as u32;
+                    let full_mask = mask_lo | (mask_hi << lanes_per_half);
+                    Self::write_scalar_dest(op, ctx, full_mask);
+                } else {
+                    Self::write_wide_vec_dest(op, ctx, result);
+                }
                 true
             }
 
@@ -3879,21 +3992,48 @@ impl VectorAlu {
 
             // ========== Cross-half operations ==========
 
+            SemanticOp::VectorExtract => {
+                // VEXTRACT operates on a full 512-bit source.
+                // Cannot use fallback (execute_half twice) because the second
+                // call overwrites the scalar dest with a result from the wrong half.
+                let src = Self::get_wide_vec_source(op, ctx, 0);
+                let index = Self::get_lane_index(op, ctx);
+                let value = Self::extract_wide_element(&src, index, et);
+                Self::write_scalar_dest(op, ctx, value);
+                true
+            }
+
             SemanticOp::VectorInsert => {
                 let is_push = op.encoding_name.as_ref().map_or(false, |n| {
                     n.to_lowercase().contains("vpush")
                 });
                 if is_push {
                     let src = Self::get_wide_vec_source(op, ctx, 0);
-                    let value = Self::get_scalar_source(op, ctx);
+                    // For 64-bit VPUSH, read a register pair (rN, rN+1).
+                    let value = if et.bits() >= 64 {
+                        Self::get_scalar_source_64(op, ctx)
+                    } else {
+                        Self::get_scalar_source(op, ctx) as u64
+                    };
                     let is_hi = op.encoding_name.as_ref().map_or(false, |n| {
-                        n.to_lowercase().contains("_hi")
+                        let lower = n.to_lowercase();
+                        lower.contains("_hi") || lower.contains(".hi")
                     });
                     let result = Self::wide_vector_push(&src, value, is_hi, et);
                     Self::write_wide_vec_dest(op, ctx, result);
                     true
                 } else {
-                    Self::execute_wide_fallback(op, ctx, semantic, et)
+                    // VINSERT.N dst, s1, idx, s0: copy s1 with s1[idx] = s0.
+                    // Cannot use fallback (execute_half twice) because it
+                    // inserts at the same index in BOTH halves.
+                    //
+                    // MCInst: sources = [VectorReg(s1), ScalarReg(idx), ScalarReg(s0)]
+                    let base = Self::get_wide_vec_source(op, ctx, 0);
+                    let index = Self::get_nth_scalar_source(op, ctx, 0);  // idx
+                    let value = Self::get_nth_scalar_source(op, ctx, 1);  // s0
+                    let result = Self::insert_wide_element(&base, index, value, et);
+                    Self::write_wide_vec_dest(op, ctx, result);
+                    true
                 }
             }
 
@@ -4041,7 +4181,7 @@ impl VectorAlu {
     /// The shift is element-size-aware: for i32, one push moves 4 bytes; for
     /// i16, 2 bytes; for i8, 1 byte.  The operation works on the full 64-byte
     /// (512-bit) vector, so elements cross the 256-bit lane boundary freely.
-    fn wide_vector_push(src: &Vec512, value: u32, is_hi: bool, et: ElementType) -> Vec512 {
+    fn wide_vector_push(src: &Vec512, value: u64, is_hi: bool, et: ElementType) -> Vec512 {
         // Flatten to bytes for element-size-agnostic shifting.
         let mut bytes = [0u8; 64];
         for (i, word) in src.iter().enumerate() {
@@ -4050,20 +4190,19 @@ impl VectorAlu {
         }
 
         let elem_bytes = (et.bits() as usize / 8).max(1);
+        let val_bytes = value.to_le_bytes();
 
         if is_hi {
             // Shift towards low indices, open a slot at the high end.
             bytes.copy_within(elem_bytes.., 0);
-            let val_bytes = value.to_le_bytes();
             let insert_pos = 64 - elem_bytes;
-            for i in 0..elem_bytes.min(4) {
+            for i in 0..elem_bytes {
                 bytes[insert_pos + i] = val_bytes[i];
             }
         } else {
             // Shift towards high indices, open a slot at the low end.
             bytes.copy_within(..64 - elem_bytes, elem_bytes);
-            let val_bytes = value.to_le_bytes();
-            for i in 0..elem_bytes.min(4) {
+            for i in 0..elem_bytes {
                 bytes[i] = val_bytes[i];
             }
         }
@@ -4078,7 +4217,7 @@ impl VectorAlu {
     /// Extract a single element from any position in a 512-bit vector.
     ///
     /// The element index is masked to the valid range for the given element
-    /// type (e.g., 0–31 for i16, 0–15 for i32).  Supports sub-word types
+    /// type (e.g., 0-31 for i16, 0-15 for i32).  Supports sub-word types
     /// stored in packed little-endian order within each u32 word.
     fn extract_wide_element(src: &Vec512, index: u32, et: ElementType) -> u32 {
         let max_elems = 512 / et.bits() as u32;
@@ -4088,6 +4227,35 @@ impl VectorAlu {
         let bit_in_word = bit_offset % 32;
         let mask = (1u64 << et.bits()) - 1;
         ((src[word_idx] as u64 >> bit_in_word) & mask) as u32
+    }
+
+    /// Insert a scalar value at a specific element position in a 512-bit vector.
+    ///
+    /// Returns a copy of `src` with the element at `index` replaced by `value`.
+    /// The index is masked to the valid range for the element type.
+    fn insert_wide_element(src: &Vec512, index: u32, value: u32, et: ElementType) -> Vec512 {
+        let mut result = *src;
+        let max_elems = 512 / et.bits() as u32;
+        let idx = index % max_elems;
+        let bit_offset = idx * et.bits() as u32;
+        let word_idx = (bit_offset / 32) as usize;
+        let bit_in_word = bit_offset % 32;
+        let mask = (1u64 << et.bits()) - 1;
+        // Clear the target element bits and insert the new value.
+        let word_val = result[word_idx] as u64;
+        let cleared = word_val & !(mask << bit_in_word);
+        let inserted = cleared | (((value as u64) & mask) << bit_in_word);
+        result[word_idx] = inserted as u32;
+        // Handle elements that span a word boundary (e.g., 64-bit at bit_in_word > 0).
+        if bit_in_word + et.bits() as u32 > 32 && word_idx + 1 < 16 {
+            let overflow_bits = bit_in_word + et.bits() as u32 - 32;
+            let overflow_mask = (1u64 << overflow_bits) - 1;
+            let hi_val = result[word_idx + 1] as u64;
+            let hi_cleared = hi_val & !overflow_mask;
+            let hi_inserted = hi_cleared | (((value as u64) >> (et.bits() as u32 - overflow_bits)) & overflow_mask);
+            result[word_idx + 1] = hi_inserted as u32;
+        }
+        result
     }
 
     /// Concatenate two 512-bit vectors (128 bytes total) and extract 64 bytes
@@ -4696,7 +4864,7 @@ mod tests {
     fn test_wide_vector_push_lo_32() {
         let mut src = [0u32; 16];
         for i in 0..16 { src[i] = (i as u32 + 1) * 100; }
-        let result = VectorAlu::wide_vector_push(&src, 0xDEAD_BEEF, false, ElementType::Int32);
+        let result = VectorAlu::wide_vector_push(&src, 0xDEAD_BEEF_u64, false, ElementType::Int32);
         assert_eq!(result[0],  0xDEAD_BEEF, "inserted value at lo end");
         assert_eq!(result[1],  100,         "former element 0 shifted to 1");
         assert_eq!(result[8],  800,         "former element 7 crossed 256-bit boundary");
@@ -4709,11 +4877,39 @@ mod tests {
     fn test_wide_vector_push_hi_32() {
         let mut src = [0u32; 16];
         for i in 0..16 { src[i] = (i as u32 + 1) * 100; }
-        let result = VectorAlu::wide_vector_push(&src, 0xCAFE_BABE, true, ElementType::Int32);
+        let result = VectorAlu::wide_vector_push(&src, 0xCAFE_BABE_u64, true, ElementType::Int32);
         assert_eq!(result[0],  200,         "former element 1 shifted to 0");
         assert_eq!(result[7],  900,         "former element 8 crossed boundary to 7");
         assert_eq!(result[14], 1600,        "former element 15 at second-to-last");
         assert_eq!(result[15], 0xCAFE_BABE, "inserted value at hi end");
+    }
+
+    /// vpush.lo.64: 64-bit scalar inserted at the low end, consuming 8 bytes.
+    #[test]
+    fn test_wide_vector_push_lo_64() {
+        let mut src = [0u32; 16];
+        for i in 0..16 { src[i] = (i as u32 + 1) * 100; }
+        let result = VectorAlu::wide_vector_push(&src, 0x1234_5678_ABCD_EF00_u64, false, ElementType::Int64);
+        // Low 32 bits at word 0, high 32 bits at word 1.
+        assert_eq!(result[0], 0xABCD_EF00, "64-bit value low word");
+        assert_eq!(result[1], 0x1234_5678, "64-bit value high word");
+        // Former element 0 (words 0-1) shifted to words 2-3.
+        assert_eq!(result[2], 100, "former word 0 shifted to word 2");
+        assert_eq!(result[3], 200, "former word 1 shifted to word 3");
+    }
+
+    /// vpush.hi.64: 64-bit scalar inserted at the high end, consuming 8 bytes.
+    #[test]
+    fn test_wide_vector_push_hi_64() {
+        let mut src = [0u32; 16];
+        for i in 0..16 { src[i] = (i as u32 + 1) * 100; }
+        let result = VectorAlu::wide_vector_push(&src, 0xDEAD_BEEF_CAFE_0000_u64, true, ElementType::Int64);
+        // High 8 bytes = inserted value.
+        assert_eq!(result[14], 0xCAFE_0000, "64-bit value low word at hi end");
+        assert_eq!(result[15], 0xDEAD_BEEF, "64-bit value high word at hi end");
+        // Former words shifted down by 2.
+        assert_eq!(result[0], 300, "former word 2 shifted to word 0");
+        assert_eq!(result[1], 400, "former word 3 shifted to word 1");
     }
 
     // ---- extract_wide_element --------------------------------------------
@@ -4735,6 +4931,41 @@ mod tests {
         src[8] = 0xBEEF_DEAD; // lo16 = 0xDEAD, hi16 = 0xBEEF
         let val = VectorAlu::extract_wide_element(&src, 17, ElementType::Int16);
         assert_eq!(val, 0xBEEF);
+    }
+
+    // ---- insert_wide_element ------------------------------------------------
+
+    /// Insert i32 at element 8 (high half, word index 8).
+    #[test]
+    fn test_insert_wide_element_high_half() {
+        let src = [0u32; 16];
+        let result = VectorAlu::insert_wide_element(&src, 8, 0xDEAD_BEEF, ElementType::Int32);
+        assert_eq!(result[8], 0xDEAD_BEEF);
+        // Other words remain zero.
+        assert_eq!(result[0], 0);
+        assert_eq!(result[7], 0);
+        assert_eq!(result[9], 0);
+    }
+
+    /// Insert i16 at element 17 (high 16 bits of word 8).
+    #[test]
+    fn test_insert_wide_element_16bit() {
+        let mut src = [0u32; 16];
+        src[8] = 0x0000_DEAD; // low 16 bits should be preserved
+        let result = VectorAlu::insert_wide_element(&src, 17, 0xBEEF, ElementType::Int16);
+        assert_eq!(result[8], 0xBEEF_DEAD); // hi16=BEEF, lo16=DEAD (preserved)
+    }
+
+    /// Round-trip: insert then extract should return the inserted value.
+    #[test]
+    fn test_insert_extract_roundtrip() {
+        let src = [0xFFFF_FFFFu32; 16];
+        let after = VectorAlu::insert_wide_element(&src, 5, 0x42, ElementType::Int32);
+        let val = VectorAlu::extract_wide_element(&after, 5, ElementType::Int32);
+        assert_eq!(val, 0x42);
+        // Neighbor should be untouched.
+        let neighbor = VectorAlu::extract_wide_element(&after, 4, ElementType::Int32);
+        assert_eq!(neighbor, 0xFFFF_FFFF);
     }
 
     // ---- wide_vector_align -----------------------------------------------
@@ -4869,5 +5100,67 @@ mod tests {
         assert_eq!(v4, [10, 20, 30, 40, 50, 60, 70, 80]);
         let v5 = ctx.vector.read(5);
         assert_eq!(v5, [90, 100, 110, 120, 130, 140, 150, 160]);
+    }
+
+    /// VGE with wide (x-register) sources and scalar dest produces a bitmask.
+    /// 16 lanes of i32 across two halves -> 16-bit scalar mask.
+    #[test]
+    fn test_wide_setge_scalar_dest_i32() {
+        let mut ctx = make_ctx();
+        // x0 = v0:v1 (lo:hi), x2 = v2:v3
+        // lo half (v0): [10, 5, 20, 3, 8, 8, 100, 0]
+        // hi half (v1): [1, 2, 3, 4, 5, 6, 7, 8]
+        ctx.vector.write(0, [10, 5, 20, 3, 8, 8, 100, 0]);
+        ctx.vector.write(1, [1, 2, 3, 4, 5, 6, 7, 8]);
+        // lo half (v2): [5, 10, 20, 4, 7, 8, 50, 1]
+        // hi half (v3): [1, 3, 2, 4, 6, 5, 7, 9]
+        ctx.vector.write(2, [5, 10, 20, 4, 7, 8, 50, 1]);
+        ctx.vector.write(3, [1, 3, 2, 4, 6, 5, 7, 9]);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::SetGe)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::ScalarReg(16))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(2));
+        op.is_wide_vector = true;
+
+        assert!(VectorAlu::execute(&op, &mut ctx));
+
+        // lo half comparison (a >= b):
+        //   10>=5=T, 5>=10=F, 20>=20=T, 3>=4=F, 8>=7=T, 8>=8=T, 100>=50=T, 0>=1=F
+        //   mask_lo = 0b_0111_0101 = 0x75
+        // hi half comparison:
+        //   1>=1=T, 2>=3=F, 3>=2=T, 4>=4=T, 5>=6=F, 6>=5=T, 7>=7=T, 8>=9=F
+        //   mask_hi = 0b_0110_1101 = 0x6D
+        // full_mask = mask_lo | (mask_hi << 8) = 0x6D75
+        let scalar_result = ctx.scalar.read(16);
+        assert_eq!(scalar_result, 0x6D75, "wide VGE scalar bitmask mismatch: got {:#06x}", scalar_result);
+    }
+
+    /// VLT with wide (x-register) sources and scalar dest produces a bitmask.
+    #[test]
+    fn test_wide_setlt_scalar_dest_i32() {
+        let mut ctx = make_ctx();
+        // Same data as above
+        ctx.vector.write(0, [10, 5, 20, 3, 8, 8, 100, 0]);
+        ctx.vector.write(1, [1, 2, 3, 4, 5, 6, 7, 8]);
+        ctx.vector.write(2, [5, 10, 20, 4, 7, 8, 50, 1]);
+        ctx.vector.write(3, [1, 3, 2, 4, 6, 5, 7, 9]);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::SetLt)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::ScalarReg(16))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(2));
+        op.is_wide_vector = true;
+
+        assert!(VectorAlu::execute(&op, &mut ctx));
+
+        // VLT is the complement of VGE (for signed integers, no NaN).
+        // lo: F,T,F,T,F,F,F,T -> 0b_1000_1010 = 0x8A
+        // hi: F,T,F,F,T,F,F,T -> 0b_1001_0010 = 0x92
+        // full_mask = 0x928A
+        let scalar_result = ctx.scalar.read(16);
+        assert_eq!(scalar_result, 0x928A, "wide VLT scalar bitmask mismatch: got {:#06x}", scalar_result);
     }
 }
