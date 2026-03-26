@@ -19,7 +19,9 @@
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCInstrDesc.h"
+#include "llvm/MC/MCInstrItineraries.h"
 #include "llvm/MC/MCRegisterInfo.h"
+#include "llvm/MC/MCSchedule.h"
 #include "llvm/MC/MCDisassembler/MCDisassembler.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCSubtargetInfo.h"
@@ -45,6 +47,7 @@ static MCAsmInfo *g_mai = nullptr;
 static MCContext *g_ctx = nullptr;
 static MCDisassembler *g_disasm = nullptr;
 static MCInstrInfo *g_mii = nullptr;
+static InstrItineraryData g_iid;  // Legacy itinerary data for scheduling queries.
 
 static void init_disassembler() {
     // Register the AIE2 target (the llvm-aie build provides this).
@@ -73,6 +76,13 @@ static void init_disassembler() {
 
     g_ctx = new MCContext(triple, g_mai, g_mri, g_sti);
     g_disasm = g_target->createMCDisassembler(*g_sti, *g_ctx);
+
+    // Initialize itinerary data for the AIE2 CPU.
+    //
+    // createMCSubtargetInfo() with empty CPU/features gives a default model.
+    // We need to explicitly request the "aie2" CPU's itineraries, which
+    // contain per-instruction latencies via operand_cycles[].
+    g_iid = g_sti->getInstrItineraryForCPU("aie2");
 }
 
 // Extract the slot-level MCInst from a bundle-level decode result.
@@ -272,6 +282,64 @@ const char *aie2_opcode_mnemonic(uint32_t opcode) {
 int aie2_decoder_init(void) {
     std::call_once(g_init_flag, init_disassembler);
     return g_disasm ? 1 : 0;
+}
+
+uint32_t aie2_get_num_regs(void) {
+    std::call_once(g_init_flag, init_disassembler);
+    if (!g_mri)
+        return 0;
+    return g_mri->getNumRegs();
+}
+
+const char *aie2_get_reg_name(uint32_t reg_id) {
+    std::call_once(g_init_flag, init_disassembler);
+    if (!g_mri || reg_id >= g_mri->getNumRegs())
+        return nullptr;
+    const char *name = g_mri->getName(reg_id);
+    if (!name || name[0] == '\0')
+        return nullptr;
+    return name;
+}
+
+uint32_t aie2_get_num_opcodes(void) {
+    std::call_once(g_init_flag, init_disassembler);
+    if (!g_mii)
+        return 0;
+    return g_mii->getNumOpcodes();
+}
+
+int aie2_get_instr_info(uint32_t opcode, Aie2InstrInfo *out) {
+    std::call_once(g_init_flag, init_disassembler);
+    if (!g_mii || !g_sti || opcode >= g_mii->getNumOpcodes() || !out)
+        return 0;
+
+    memset(out, 0, sizeof(*out));
+
+    const MCInstrDesc &desc = g_mii->get(opcode);
+    out->flags = desc.getFlags();
+    out->num_operands = desc.getNumOperands();
+    out->num_defs = desc.getNumDefs();
+    out->latency = -1;
+    out->stage_latency = -1;
+
+    // Query the itinerary-based scheduling model.
+    unsigned sched_class = desc.getSchedClass();
+    out->sched_class = (uint16_t)sched_class;
+
+    // Get operand-level latency from itinerary data.
+    // operand_cycles[0] = result availability cycle (the key metric for us).
+    if (!g_iid.isEmpty()) {
+        auto op0 = g_iid.getOperandCycle(sched_class, 0);
+        if (op0.has_value())
+            out->latency = (int16_t)op0.value();
+
+        // Also get pipeline stage latency as a fallback.
+        unsigned stage_lat = g_iid.getStageLatency(sched_class);
+        if (stage_lat > 0)
+            out->stage_latency = (int16_t)stage_lat;
+    }
+
+    return 1;
 }
 
 } // extern "C"

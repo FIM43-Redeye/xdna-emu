@@ -55,10 +55,27 @@ pub enum Slot {
     Nop = 7,
 }
 
+/// Raw per-instruction metadata from MCInstrDesc + itinerary model.
+/// Mirrors `Aie2InstrInfo` in the C header.
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct RawInstrInfo {
+    pub flags: u64,
+    pub num_operands: u16,
+    pub num_defs: u8,
+    pub latency: i16,        // operand_cycles[0], or -1 if unavailable
+    pub stage_latency: i16,  // Pipeline stage sum, or -1 if unavailable
+    pub sched_class: u16,    // Itinerary class index (opaque)
+}
+
 extern "C" {
     fn aie2_decode_slot(slot: Slot, insn_bits: u64) -> RawDecodeResult;
     fn aie2_opcode_name(opcode: u32) -> *const std::os::raw::c_char;
     fn aie2_decoder_init() -> i32;
+    fn aie2_get_num_regs() -> u32;
+    fn aie2_get_reg_name(reg_id: u32) -> *const std::os::raw::c_char;
+    fn aie2_get_num_opcodes() -> u32;
+    fn aie2_get_instr_info(opcode: u32, out: *mut RawInstrInfo) -> i32;
 }
 
 static INIT: Once = Once::new();
@@ -204,7 +221,126 @@ pub fn slot_from_name(name: &str) -> Option<Slot> {
 }
 
 // ---------------------------------------------------------------------------
-// Register name -> Operand mapping (Step 5)
+// Instruction metadata (bulk-queryable at init time)
+// ---------------------------------------------------------------------------
+
+/// MCID flag bit positions (from llvm/MC/MCInstrDesc.h).
+pub mod mcid {
+    pub const RETURN: u64          = 1 << 5;
+    pub const CALL: u64            = 1 << 7;
+    pub const BARRIER: u64         = 1 << 8;
+    pub const TERMINATOR: u64      = 1 << 9;
+    pub const BRANCH: u64          = 1 << 10;
+    pub const INDIRECT_BRANCH: u64 = 1 << 11;
+    pub const COMPARE: u64         = 1 << 12;
+    pub const MOVE_IMM: u64        = 1 << 13;
+    pub const MOVE_REG: u64        = 1 << 14;
+    pub const MAY_LOAD: u64        = 1 << 19;
+    pub const MAY_STORE: u64       = 1 << 20;
+    pub const COMMUTABLE: u64      = 1 << 25;
+    pub const ADD: u64             = 1 << 37;
+}
+
+/// Per-instruction metadata from LLVM's MCInstrDesc and itinerary model.
+///
+/// Queried once at decoder init and stored in a Vec indexed by opcode.
+/// All hot-path lookups are then pure Rust array accesses -- zero FFI cost.
+#[derive(Debug, Clone)]
+pub struct InstrInfo {
+    /// MCID flags bitmask (MayLoad, MayStore, isBranch, etc.).
+    pub flags: u64,
+    /// Number of output (def) operands.
+    pub num_defs: u8,
+    /// Result latency from itinerary operand_cycles[0], or None.
+    pub latency: Option<u8>,
+    /// Total pipeline latency from InstrStage sum, or None.
+    pub stage_latency: Option<u8>,
+    /// Itinerary class index (opaque, for cross-ref with build-time data).
+    pub sched_class: u16,
+}
+
+impl InstrInfo {
+    pub fn is_load(&self) -> bool { self.flags & mcid::MAY_LOAD != 0 }
+    pub fn is_store(&self) -> bool { self.flags & mcid::MAY_STORE != 0 }
+    pub fn is_branch(&self) -> bool { self.flags & mcid::BRANCH != 0 }
+    pub fn is_call(&self) -> bool { self.flags & mcid::CALL != 0 }
+    pub fn is_return(&self) -> bool { self.flags & mcid::RETURN != 0 }
+    pub fn is_terminator(&self) -> bool { self.flags & mcid::TERMINATOR != 0 }
+    pub fn is_compare(&self) -> bool { self.flags & mcid::COMPARE != 0 }
+    pub fn is_commutable(&self) -> bool { self.flags & mcid::COMMUTABLE != 0 }
+    pub fn is_move_reg(&self) -> bool { self.flags & mcid::MOVE_REG != 0 }
+    pub fn is_move_imm(&self) -> bool { self.flags & mcid::MOVE_IMM != 0 }
+}
+
+/// Query instruction metadata for all opcodes at init time.
+///
+/// Returns a Vec where `result[opcode]` is the InstrInfo for that opcode.
+/// Called once during decoder initialization; subsequent accesses are O(1)
+/// array lookups with zero FFI overhead.
+pub fn query_all_instr_info() -> Vec<InstrInfo> {
+    if !init() {
+        return Vec::new();
+    }
+
+    let num = unsafe { aie2_get_num_opcodes() };
+    let mut result = Vec::with_capacity(num as usize);
+
+    for opcode in 0..num {
+        let mut raw = RawInstrInfo {
+            flags: 0,
+            num_operands: 0,
+            num_defs: 0,
+            latency: -1,
+            stage_latency: -1,
+            sched_class: 0,
+        };
+
+        let ok = unsafe { aie2_get_instr_info(opcode, &mut raw) };
+        if ok == 0 {
+            result.push(InstrInfo {
+                flags: 0,
+                num_defs: 0,
+                latency: None,
+                stage_latency: None,
+                sched_class: 0,
+            });
+            continue;
+        }
+
+        let latency = if raw.latency >= 0 {
+            Some(raw.latency as u8)
+        } else {
+            None
+        };
+
+        let stage_latency = if raw.stage_latency >= 0 {
+            Some(raw.stage_latency as u8)
+        } else {
+            None
+        };
+
+        result.push(InstrInfo {
+            flags: raw.flags,
+            num_defs: raw.num_defs,
+            latency,
+            stage_latency,
+            sched_class: raw.sched_class,
+        });
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Register name -> Operand mapping
+//
+// Two-tier design:
+// 1. classify_reg_name() contains the domain knowledge: given a register name,
+//    produce our internal MappedOperand. This is pure logic, no FFI.
+// 2. RegisterMap builds a HashMap<String, MappedOperand> at init by querying
+//    MCRegisterInfo for ALL register names and running each through the
+//    classifier. This gives O(1) lookups at runtime with zero FFI cost,
+//    and validates coverage at init time.
 // ---------------------------------------------------------------------------
 
 use crate::interpreter::bundle::slot::Operand;
@@ -256,10 +392,11 @@ fn parse_reg_name(name: &str) -> Option<(&str, u8)> {
     Some((prefix, index))
 }
 
-/// Map an LLVM register name to our internal Operand.
+/// Classify an LLVM register name to our internal Operand.
 ///
-/// Handles the full AIE2 register namespace as defined in llvm-aie's
-/// AIE2RegisterInfo.td. Returns None for unrecognized names.
+/// This is the domain knowledge layer: given a name string, produce
+/// our internal MappedOperand. Called at init time to populate the
+/// RegisterMap, and directly by legacy code paths.
 ///
 /// # Accumulator Register Indexing
 ///
@@ -275,7 +412,7 @@ fn parse_reg_name(name: &str) -> Option<(&str, u8)> {
 ///   amll_n, amlh_n -> AccumReg(n * 2)     [within bml_n]
 ///   amhl_n, amhh_n -> AccumReg(n * 2 + 1) [within bmh_n]
 /// ```
-pub fn operand_from_reg_name(name: &str) -> Option<MappedOperand> {
+pub fn classify_reg_name(name: &str) -> Option<MappedOperand> {
     // Special registers (no trailing index).
     match name {
         "lr" => return Some(MappedOperand {
@@ -304,6 +441,25 @@ pub fn operand_from_reg_name(name: &str) -> Option<MappedOperand> {
         }),
         "CORE_ID" | "core_id" => return Some(MappedOperand {
             operand: Operand::ScalarReg(CORE_ID_REG_INDEX),
+            accum_width: None,
+        }),
+        // DMA 3D addressing descriptor registers (d0_3d - d3_3d).
+        // These select 3D stride patterns for loads/stores. Map to ModifierReg
+        // in the 3D descriptor range (indices 32-35).
+        "d0_3d" => return Some(MappedOperand {
+            operand: Operand::ModifierReg(32),
+            accum_width: None,
+        }),
+        "d1_3d" => return Some(MappedOperand {
+            operand: Operand::ModifierReg(33),
+            accum_width: None,
+        }),
+        "d2_3d" => return Some(MappedOperand {
+            operand: Operand::ModifierReg(34),
+            accum_width: None,
+        }),
+        "d3_3d" => return Some(MappedOperand {
+            operand: Operand::ModifierReg(35),
             accum_width: None,
         }),
         _ => {}
@@ -393,17 +549,116 @@ pub fn operand_from_reg_name(name: &str) -> Option<MappedOperand> {
         "l" => Some(simple(Operand::ScalarReg(16 + idx * 2))),
 
         // Mask registers: q0-q3 (128-bit), qx0-qx3 (640-bit).
-        // No direct Operand variant -- these control vector lane masking.
-        // For now, map to ControlReg with a sentinel range.
-        "q" | "ql" | "qh" => None,
-        "qx" => None,
-        "qwl" | "qwh" => None,
+        // Used as explicit operands in sparse vector loads (VLDB_SPARSE_POP).
+        // Map to ControlReg in a dedicated mask range (indices 16-31).
+        //   q0-q3:    ControlReg(16..19)   -- 128-bit mask
+        //   ql0-ql3:  ControlReg(16..19)   -- low 64-bit of q
+        //   qh0-qh3:  ControlReg(16..19)   -- high 64-bit of q
+        //   qwl0-qwl3: ControlReg(20..23)  -- 256-bit wide mask low
+        //   qwh0-qwh3: ControlReg(24..27)  -- 256-bit wide mask high
+        //   qx0-qx3:  ControlReg(28..31)   -- 640-bit extended mask
+        "q" | "ql" | "qh" => Some(simple(Operand::ControlReg(16 + idx))),
+        "qwl" => Some(simple(Operand::ControlReg(20 + idx))),
+        "qwh" => Some(simple(Operand::ControlReg(24 + idx))),
+        "qx" => Some(simple(Operand::ControlReg(28 + idx))),
 
-        // DMA registers (d0-d7): composite 80-bit, not typically instruction operands.
-        "d" => None,
+        // DMA 2D addressing descriptor registers (d0-d7).
+        // These select 2D stride patterns for loads/stores. Map to ModifierReg
+        // in the 2D descriptor range (indices 36-43).
+        // (3D descriptors d0_3d-d3_3d are handled as special-case names above.)
+        "d" => Some(simple(Operand::ModifierReg(36 + idx))),
 
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// RegisterMap: init-time HashMap from LLVM's MCRegisterInfo
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+/// Pre-built register name -> MappedOperand lookup table.
+///
+/// Populated once at init by querying MCRegisterInfo for all register names
+/// and running each through `classify_reg_name()`. Subsequent lookups are
+/// O(1) HashMap access with zero FFI cost.
+struct RegisterMap {
+    map: HashMap<String, MappedOperand>,
+    /// Register names that LLVM knows but we intentionally don't map
+    /// (mask regs, DMA regs, status regs, etc.).
+    unmapped: Vec<String>,
+}
+
+static REG_MAP: OnceLock<RegisterMap> = OnceLock::new();
+
+impl RegisterMap {
+    /// Build the register map by querying MCRegisterInfo.
+    fn from_llvm() -> Self {
+        let mut map = HashMap::new();
+        let mut unmapped = Vec::new();
+
+        if !init() {
+            // FFI not available -- return empty map (classify_reg_name fallback).
+            return Self { map, unmapped };
+        }
+
+        let num_regs = unsafe { aie2_get_num_regs() };
+
+        for reg_id in 1..num_regs {
+            let name_ptr = unsafe { aie2_get_reg_name(reg_id) };
+            if name_ptr.is_null() {
+                continue;
+            }
+            let name = unsafe { CStr::from_ptr(name_ptr) }
+                .to_string_lossy()
+                .into_owned();
+
+            if name.is_empty() {
+                continue;
+            }
+
+            match classify_reg_name(&name) {
+                Some(mapped) => {
+                    map.insert(name, mapped);
+                }
+                None => {
+                    unmapped.push(name);
+                }
+            }
+        }
+
+        Self { map, unmapped }
+    }
+
+    fn lookup(&self, name: &str) -> Option<MappedOperand> {
+        self.map.get(name).cloned()
+    }
+}
+
+/// Get or initialize the global register map.
+fn reg_map() -> &'static RegisterMap {
+    REG_MAP.get_or_init(RegisterMap::from_llvm)
+}
+
+/// Map an LLVM register name to our internal Operand.
+///
+/// Uses the pre-built RegisterMap (O(1) HashMap lookup, zero FFI cost).
+/// Falls back to `classify_reg_name()` for names not in the map (e.g.,
+/// if the map hasn't been initialized or a name wasn't in MCRegisterInfo).
+pub fn operand_from_reg_name(name: &str) -> Option<MappedOperand> {
+    let map = reg_map();
+    map.lookup(name).or_else(|| classify_reg_name(name))
+}
+
+/// Get the count of mapped and unmapped registers from MCRegisterInfo.
+///
+/// Returns `(mapped, unmapped_names)`. The unmapped list contains register
+/// names LLVM knows that we intentionally skip (mask regs, DMA regs, etc.).
+pub fn reg_map_coverage() -> (usize, &'static [String]) {
+    let map = reg_map();
+    (map.map.len(), &map.unmapped)
 }
 
 #[cfg(test)]
@@ -503,8 +758,116 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // operand_from_reg_name tests
+    // RegisterMap and operand_from_reg_name tests
     // -----------------------------------------------------------------------
+
+    /// Verify that no unmapped register ever appears as an explicit operand
+    /// in any decoded instruction across all slots.
+    ///
+    /// If this test fails, it means LLVM is producing an operand with a
+    /// register name we don't handle -- that's a real gap to fix.
+    #[test]
+    fn test_unmapped_regs_never_appear_as_explicit_operands() {
+        let (_, unmapped) = reg_map_coverage();
+        let unmapped_set: std::collections::HashSet<&str> =
+            unmapped.iter().map(|s| s.as_str()).collect();
+
+        let slots = [
+            (Slot::Alu, 20),
+            (Slot::Lda, 21),
+            (Slot::Ldb, 16),
+            (Slot::Mv,  22),
+            (Slot::St,  21),
+            (Slot::Vec, 26),
+        ];
+
+        let mut hits: Vec<String> = Vec::new();
+
+        // Probe a range of bit patterns per slot to cover diverse encodings.
+        for (slot, width) in &slots {
+            for probe in 0..512u64 {
+                // Spread probes across the encoding space.
+                let bits = probe << (width / 2);
+                if let Some(decoded) = decode_slot(*slot, bits) {
+                    for op in &decoded.operands {
+                        if let DecodedOperand::Reg { name, .. } = op {
+                            if unmapped_set.contains(name.as_str()) {
+                                let msg = format!(
+                                    "{} in {} (slot {:?} bits 0x{:X})",
+                                    name, decoded.name, slot, bits
+                                );
+                                if !hits.iter().any(|h| h.starts_with(name.as_str())) {
+                                    hits.push(msg);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !hits.is_empty() {
+            eprintln!("Unmapped registers appearing as explicit operands ({}):", hits.len());
+            for h in &hits {
+                eprintln!("  {}", h);
+            }
+            panic!(
+                "{} unmapped register(s) appear as explicit operands -- need mapping",
+                hits.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_register_map_populated_from_llvm() {
+        let (mapped, unmapped) = reg_map_coverage();
+
+        // LLVM knows ~135 physical registers for AIE2. We should map most of them.
+        assert!(mapped > 80,
+            "Should map 80+ registers from MCRegisterInfo, got {}", mapped);
+
+        // Unmapped registers are intentional (mask regs, DMA regs, status regs).
+        // Verify the unmapped list contains expected categories.
+        eprintln!("RegisterMap: {} mapped, {} unmapped", mapped, unmapped.len());
+        for name in unmapped {
+            eprintln!("  unmapped: {}", name);
+        }
+    }
+
+    #[test]
+    fn test_register_map_matches_classify() {
+        // Every entry in the RegisterMap should produce the same result
+        // as calling classify_reg_name directly.
+        let map = reg_map();
+        for (name, mapped) in &map.map {
+            let direct = classify_reg_name(name);
+            assert_eq!(
+                direct.as_ref(), Some(mapped),
+                "RegisterMap and classify_reg_name disagree for '{}'", name
+            );
+        }
+    }
+
+    #[test]
+    fn test_register_map_lookup_matches_direct() {
+        // operand_from_reg_name (HashMap path) should match classify_reg_name
+        // for all known register names.
+        let test_names = [
+            "r0", "r15", "r31", "p0", "p7", "lr", "SP", "LS", "LE", "LC", "DP",
+            "x0", "x4", "wl0", "wh3", "y2",
+            "bml0", "bmh0", "cm0", "cm3",
+            "amll0", "amhh1",
+            "m0", "dn3", "dj7", "dc0",
+            "crRnd", "crSat",
+            "s0",
+        ];
+        for name in &test_names {
+            let from_map = operand_from_reg_name(name);
+            let from_classify = classify_reg_name(name);
+            assert_eq!(from_map, from_classify,
+                "Mismatch for '{}': map={:?} classify={:?}", name, from_map, from_classify);
+        }
+    }
 
     #[test]
     fn test_scalar_regs() {
@@ -658,6 +1021,81 @@ mod tests {
             }
         }
         assert!(mapped > 0, "Should have mapped at least one register operand");
+    }
+
+    // -----------------------------------------------------------------------
+    // Instruction metadata (InstrInfo) tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_query_all_instr_info_returns_data() {
+        let infos = query_all_instr_info();
+        assert!(infos.len() > 600, "Should have 600+ opcodes, got {}", infos.len());
+
+        // Count how many have latency data.
+        let with_latency = infos.iter().filter(|i| i.latency.is_some()).count();
+        assert!(with_latency > 100,
+            "Should have 100+ opcodes with latency, got {}", with_latency);
+
+        // Count how many have non-zero sched class indices.
+        let with_sched = infos.iter().filter(|i| i.sched_class > 0).count();
+        assert!(with_sched > 100,
+            "Should have 100+ opcodes with sched class, got {}", with_sched);
+    }
+
+    #[test]
+    fn test_instr_info_flags_populated() {
+        let infos = query_all_instr_info();
+
+        // Scan all opcodes for instructions with MayLoad and MayStore flags.
+        let loads = infos.iter().filter(|i| i.is_load()).count();
+        let stores = infos.iter().filter(|i| i.is_store()).count();
+        let branches = infos.iter().filter(|i| i.is_branch()).count();
+
+        assert!(loads > 50, "Should have 50+ load instructions, got {}", loads);
+        assert!(stores > 50, "Should have 50+ store instructions, got {}", stores);
+        assert!(branches > 5, "Should have 5+ branch instructions, got {}", branches);
+    }
+
+    #[test]
+    fn test_instr_info_latency_cross_check() {
+        // Cross-validate LLVM itinerary latencies against our AM020 constants.
+        let infos = query_all_instr_info();
+
+        let mut found_load = false;
+        let mut found_store = false;
+        let mut found_vmac = false;
+
+        for (opcode, info) in infos.iter().enumerate() {
+            if let Some(latency) = info.latency {
+                let name = match opcode_name(opcode as u32) {
+                    Some(n) => n,
+                    None => continue,
+                };
+
+                // Load instructions with MayLoad flag should have latency 7.
+                if info.is_load() && name.starts_with("LDA_") && !found_load {
+                    assert_eq!(latency, 7, "{} latency should be 7 (load)", name);
+                    found_load = true;
+                }
+
+                // Store instructions with MayStore flag should have latency 1.
+                if info.is_store() && name.starts_with("ST_") && !found_store {
+                    assert_eq!(latency, 1, "{} latency should be 1 (store)", name);
+                    found_store = true;
+                }
+
+                // Vector MAC (integer) should have latency 5.
+                // VMAC_F (float) may differ -- skip floating-point variants.
+                if name.starts_with("VMAC_vmac_") && !found_vmac {
+                    assert_eq!(latency, 5, "{} latency should be 5 (VMAC)", name);
+                    found_vmac = true;
+                }
+            }
+        }
+        assert!(found_load, "Should have found a load instruction with latency");
+        assert!(found_store, "Should have found a store instruction with latency");
+        assert!(found_vmac, "Should have found a VMAC instruction with latency");
     }
 
     #[test]

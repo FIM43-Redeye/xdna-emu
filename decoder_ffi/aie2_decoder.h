@@ -71,6 +71,49 @@ const char *aie2_opcode_mnemonic(uint32_t opcode);
 // Returns 1 on success, 0 on failure.
 int aie2_decoder_init(void);
 
+// ── Instruction metadata (bulk-queryable at init time) ──────────────────
+
+// Per-instruction metadata from MCInstrDesc + itinerary scheduling model.
+struct Aie2InstrInfo {
+    uint64_t flags;          // MCID flags bitmask (MayLoad, MayStore, isBranch, etc.)
+    uint16_t num_operands;   // Total operand count
+    uint8_t num_defs;        // Number of output (def) operands
+    int16_t latency;         // Result latency from itinerary operand_cycles[0], or -1
+    int16_t stage_latency;   // Total pipeline latency from InstrStage sum, or -1
+    uint16_t sched_class;    // Itinerary class index (opaque; for cross-ref with build data)
+};
+
+// MCID flag bit positions (from llvm/MC/MCInstrDesc.h MCID::Flag enum).
+// These are bit indices -- test with (flags & (1ULL << BIT)).
+#define AIE2_MCID_RETURN          5
+#define AIE2_MCID_CALL            7
+#define AIE2_MCID_BARRIER         8
+#define AIE2_MCID_TERMINATOR      9
+#define AIE2_MCID_BRANCH         10
+#define AIE2_MCID_INDIRECT_BRANCH 11
+#define AIE2_MCID_COMPARE        12
+#define AIE2_MCID_MOVE_IMM       13
+#define AIE2_MCID_MOVE_REG       14
+#define AIE2_MCID_MAY_LOAD       19
+#define AIE2_MCID_MAY_STORE      20
+#define AIE2_MCID_COMMUTABLE     25
+#define AIE2_MCID_ADD            37
+
+// Get the total number of registers known to MCRegisterInfo.
+// Register IDs range from 1..num_regs (0 is NoRegister).
+uint32_t aie2_get_num_regs(void);
+
+// Get the name of a register by its LLVM register ID.
+// Returns NULL if the ID is out of range or the name is empty.
+const char *aie2_get_reg_name(uint32_t reg_id);
+
+// Get the total number of opcodes known to LLVM's MCInstrInfo.
+uint32_t aie2_get_num_opcodes(void);
+
+// Query instruction metadata for a single opcode.
+// Returns 1 on success, 0 if opcode is out of range or decoder not initialized.
+int aie2_get_instr_info(uint32_t opcode, struct Aie2InstrInfo *out);
+
 #ifdef __cplusplus
 }
 #endif
