@@ -3946,25 +3946,27 @@ class VmacStrategy(TestStrategy):
         The config word is stored in the combo under key '_vmac_config' (an
         internal key that generate_test_point picks up for the mov init).
         """
-        # Get base register combos (just the baseline -- all defaults).
+        # Get base register combos (varying accumulator, vector, etc.).
         base_combos = generate_operand_combos(instr)
         if not base_combos:
             return []
-
-        # Use only the baseline register assignment (combo 0 = all defaults).
-        baseline = base_combos[0]
 
         # Get valid config words for this instruction.
         configs = _vmac_configs_for_instr(instr["name"])
         if not configs:
             return base_combos  # Fallback: no special config handling.
 
-        # Generate one combo per config word, all using baseline registers.
+        # Cross-product: each config word x each register combo.
+        # Cap register combos to avoid explosion (4 configs * 19 reg combos = 76).
+        MAX_REG_COMBOS = 5
+        capped_combos = base_combos[:MAX_REG_COMBOS]
+
         combos = []
         for cfg in configs:
-            combo = dict(baseline)
-            combo["_vmac_config"] = cfg
-            combos.append(combo)
+            for base in capped_combos:
+                combo = dict(base)
+                combo["_vmac_config"] = cfg
+                combos.append(combo)
 
         return combos
 
