@@ -660,8 +660,14 @@ impl MemoryUnit {
 
         if let Some(r) = vec_reg {
             let vec_data = ctx.vector.read(r);
-            log::trace!("[VST] writing v{} to addr=0x{:X}", r, addr);
-            Self::write_vector_to_memory(tile, addr, vec_data, neighbors);
+            log::trace!("[VST] writing v{} to addr=0x{:X} mem_width={:?}", r, addr, op.mem_width);
+            // VST_128: only write lower 16 bytes (4 words) for 128-bit stores.
+            if op.mem_width == MemWidth::QuadWord {
+                let half = [vec_data[0], vec_data[1], vec_data[2], vec_data[3], 0, 0, 0, 0];
+                Self::write_vector_to_memory(tile, addr, half, neighbors);
+            } else {
+                Self::write_vector_to_memory(tile, addr, vec_data, neighbors);
+            }
         } else {
             log::warn!("[VST] no vector register found! sources={:?} dest={:?}", op.sources, op.dest);
         }
