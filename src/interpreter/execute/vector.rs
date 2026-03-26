@@ -110,17 +110,22 @@ impl VectorAlu {
             SemanticOp::Add => {
                 // Two variants:
                 // 1. VADD_elem: simple vector add (2 sources)
-                // 2. VADDSUB: conditional add/subtract (3 sources: s1, s2, sel)
+                // 2. VADDSUB: conditional add/subtract (2 vector + 1 scalar source)
                 //    vaddsub.8 $d, $s1, $s2, $sel
                 //    d[i] = (sel[i] & 1) ? s1[i] - s2[i] : s1[i] + s2[i]
-                let vec_source_count = op.sources.iter()
-                    .filter(|s| matches!(s, Operand::VectorReg(_)))
-                    .count();
+                //    sel is a SCALAR register (bitmask), not a vector.
+                let has_scalar_sel = op.sources.iter()
+                    .any(|s| matches!(s, Operand::ScalarReg(_)))
+                    && op.sources.iter()
+                        .filter(|s| matches!(s, Operand::VectorReg(_)))
+                        .count() == 2;
 
-                if vec_source_count >= 3 {
+                if has_scalar_sel {
                     let s1 = Self::get_vector_source(op, ctx, 0);
                     let s2 = Self::get_vector_source(op, ctx, 1);
-                    let sel = Self::get_vector_source(op, ctx, 2);
+                    // Read the scalar selector bitmask
+                    let sel_scalar = Self::get_nth_scalar_source(op, ctx, 0);
+                    let sel = Self::expand_select_mask(sel_scalar, et);
                     let result = Self::vector_addsub(&s1, &s2, &sel, et);
                     Self::write_vector_dest(op, ctx, result);
                 } else {
@@ -3275,13 +3280,40 @@ impl VectorAlu {
         match semantic {
             // ========== Element-wise arithmetic (bridge) ==========
             SemanticOp::Add => {
-                // Check for VADDSUB (3 vector sources: s1, s2, sel)
-                let vec_source_count = op.sources.iter()
-                    .filter(|s| matches!(s, Operand::VectorReg(_)))
-                    .count();
-                if vec_source_count >= 3 {
-                    // VADDSUB: conditional add/subtract -- use fallback for now
-                    return Self::execute_wide_fallback(op, ctx, semantic, et);
+                // Check for VADDSUB: 2 vector sources + 1 scalar selector.
+                let has_scalar_sel = op.sources.iter()
+                    .any(|s| matches!(s, Operand::ScalarReg(_)))
+                    && op.sources.iter()
+                        .filter(|s| matches!(s, Operand::VectorReg(_)))
+                        .count() == 2;
+                if has_scalar_sel {
+                    // VADDSUB: read full 512-bit sources and scalar selector.
+                    let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                    let sel_scalar = Self::get_nth_scalar_source(op, ctx, 0);
+                    // Split wide vectors into lo/hi halves for per-half processing.
+                    let a_lo: [u32; 8] = a[..8].try_into().unwrap();
+                    let a_hi: [u32; 8] = a[8..].try_into().unwrap();
+                    let b_lo: [u32; 8] = b[..8].try_into().unwrap();
+                    let b_hi: [u32; 8] = b[8..].try_into().unwrap();
+                    // Expand selector bits: lo half uses lower bits, hi uses upper.
+                    // For 8-bit elements (32 per half), the selector is a 64-bit
+                    // register pair. Read second scalar if available.
+                    let elems_per_half = 256 / et.bits() as u32;
+                    let sel_lo = Self::expand_select_mask(sel_scalar, et);
+                    let sel_hi_bits = if elems_per_half >= 32 {
+                        // 8-bit: need second register of the pair
+                        Self::get_nth_scalar_source(op, ctx, 1)
+                    } else {
+                        sel_scalar >> elems_per_half
+                    };
+                    let sel_hi = Self::expand_select_mask(sel_hi_bits, et);
+                    let lo = Self::vector_addsub(&a_lo, &b_lo, &sel_lo, et);
+                    let hi = Self::vector_addsub(&a_hi, &b_hi, &sel_hi, et);
+                    let mut result = [0u32; 16];
+                    result[..8].copy_from_slice(&lo);
+                    result[8..].copy_from_slice(&hi);
+                    Self::write_wide_vec_dest(op, ctx, result);
+                    return true;
                 }
                 let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
                 let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_add);
@@ -3788,12 +3820,19 @@ impl VectorAlu {
     /// type (e.g., 0-31 for i16, 0-15 for i32).  Supports sub-word types
     /// stored in packed little-endian order within each u32 word.
     fn extract_wide_element(src: &Vec512, index: u32, et: ElementType) -> u32 {
-        let max_elems = 512 / et.bits() as u32;
+        let bits = et.bits() as u32;
+        if bits >= 64 {
+            // 64-bit element: return the lower 32 bits of the element.
+            // For 512-bit registers, there are 8 elements of 64-bit = 4 pairs.
+            let idx = (index as usize % 4) * 2;
+            return src[idx];
+        }
+        let max_elems = 512 / bits;
         let idx = index % max_elems;
-        let bit_offset = idx * et.bits() as u32;
+        let bit_offset = idx * bits;
         let word_idx = (bit_offset / 32) as usize;
         let bit_in_word = bit_offset % 32;
-        let mask = (1u64 << et.bits()) - 1;
+        let mask = (1u64 << bits) - 1;
         ((src[word_idx] as u64 >> bit_in_word) & mask) as u32
     }
 
@@ -3803,12 +3842,19 @@ impl VectorAlu {
     /// The index is masked to the valid range for the element type.
     fn insert_wide_element(src: &Vec512, index: u32, value: u32, et: ElementType) -> Vec512 {
         let mut result = *src;
-        let max_elems = 512 / et.bits() as u32;
+        let bits = et.bits() as u32;
+        if bits >= 64 {
+            // 64-bit element: write the lower 32 bits.
+            let idx = (index as usize % 4) * 2;
+            result[idx] = value;
+            return result;
+        }
+        let max_elems = 512 / bits;
         let idx = index % max_elems;
-        let bit_offset = idx * et.bits() as u32;
+        let bit_offset = idx * bits;
         let word_idx = (bit_offset / 32) as usize;
         let bit_in_word = bit_offset % 32;
-        let mask = (1u64 << et.bits()) - 1;
+        let mask = (1u64 << bits) - 1;
         // Clear the target element bits and insert the new value.
         let word_val = result[word_idx] as u64;
         let cleared = word_val & !(mask << bit_in_word);

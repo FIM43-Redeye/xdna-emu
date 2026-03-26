@@ -1147,6 +1147,8 @@ impl InstructionDecoder {
             // via itinerary table. Override by encoding name instead.
             "VBAND" => Some(SemanticOp::And),
             "VBOR" => Some(SemanticOp::Or),
+            // VADDSUB has no intrinsic pattern -- needs explicit mapping.
+            "VADDSUB_8" | "VADDSUB_16" | "VADDSUB_32" => Some(SemanticOp::Add),
             _ => {
                 // MAC-family instructions: many encoding names lack
                 // build-time semantic assignment (no intrinsic pattern).

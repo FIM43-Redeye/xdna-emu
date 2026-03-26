@@ -328,6 +328,12 @@ pub fn infer_element_type(mnemonic: &str) -> Option<String> {
         } else {
             Some("ElementType::Int32".to_string())
         }
+    } else if mnemonic.ends_with("64") || mnemonic.contains(".i64") || mnemonic.contains(".u64") {
+        if is_unsigned {
+            Some("ElementType::UInt64".to_string())
+        } else {
+            Some("ElementType::Int64".to_string())
+        }
     } else if mnemonic.contains("bf16") || mnemonic.contains(".bf") {
         Some("ElementType::BFloat16".to_string())
     } else if mnemonic.contains("f32") || mnemonic.contains("float") || mnemonic.ends_with(".f") {
