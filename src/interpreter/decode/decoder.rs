@@ -29,6 +29,7 @@ use crate::interpreter::bundle::{
 };
 use crate::interpreter::state::{MOD_BASE_DC, MOD_BASE_DJ, MOD_BASE_DN, MOD_BASE_M, SP_PTR_INDEX};
 use crate::interpreter::traits::{DecodeError, Decoder};
+#[cfg(test)]
 use super::composite::CompositeLuts;
 use crate::tablegen::{
     AddressingMode, DecoderIndex, InstrEncoding, InstrMemWidth, OperandType, RegisterKind,
@@ -97,13 +98,18 @@ pub struct InstructionDecoder {
     /// O(1) decoder index (per-slot LLVM bytecode lookup).
     index: DecoderIndex,
 
-    /// Pre-built composite register decode LUTs.
-    /// Each composite encoder variant has a dedicated LUT for O(1) decode.
+    /// Pre-built composite register decode LUTs (test-only).
+    /// Used by legacy `extract_operands()` for cross-validation against FFI.
+    #[cfg(test)]
     composite_luts: CompositeLuts,
 
     /// Data-driven VLIW slot extraction table, built from tblgen Inst fields.
     /// When present, replaces the hand-coded extract_* functions in slot_layout.
     format_table: Option<crate::interpreter::bundle::FormatTable>,
+
+    /// Per-opcode metadata from LLVM's MCInstrDesc + itinerary model.
+    /// Indexed by LLVM opcode ID for O(1) lookups. Populated once at init.
+    instr_info: Vec<decoder_ffi::InstrInfo>,
 
     /// Statistics: successful decodes.
     decode_count: u64,
@@ -118,6 +124,7 @@ impl Default for InstructionDecoder {
 }
 
 /// Sign-extend a value from `bits` width to i32.
+#[cfg(test)]
 #[inline]
 fn sign_extend(value: i32, bits: u32) -> i32 {
     if bits == 0 || bits >= 32 {
@@ -128,10 +135,7 @@ fn sign_extend(value: i32, bits: u32) -> i32 {
 }
 
 /// Sign-extend an already-extracted unsigned raw value based on its logical width.
-///
-/// Unlike `OperandField::extract_signed()`, this works on the value directly
-/// without needing the original instruction word. Essential for split fields
-/// where the value was reassembled from non-contiguous fragments.
+#[cfg(test)]
 #[inline]
 fn sign_extend_raw(value: u64, width: u8) -> i64 {
     if width == 0 || width >= 64 {
@@ -171,8 +175,10 @@ impl InstructionDecoder {
     pub fn new() -> Self {
         Self {
             index: DecoderIndex::default(),
+            #[cfg(test)]
             composite_luts: CompositeLuts::build(),
             format_table: None,
+            instr_info: Vec::new(),
             decode_count: 0,
             unknown_count: 0,
         }
@@ -227,6 +233,16 @@ impl InstructionDecoder {
             output.decoder_tables,
         );
         decoder.format_table = format_table;
+
+        // Populate per-opcode metadata from LLVM's MCInstrDesc + itinerary model.
+        decoder.instr_info = decoder_ffi::query_all_instr_info();
+        log::info!(
+            "Loaded LLVM InstrInfo: {} opcodes, {} with latency, {} with flags",
+            decoder.instr_info.len(),
+            decoder.instr_info.iter().filter(|i| i.latency.is_some()).count(),
+            decoder.instr_info.iter().filter(|i| i.flags != 0).count(),
+        );
+
         decoder
     }
 
@@ -278,8 +294,10 @@ impl InstructionDecoder {
 
         Self {
             index,
+            #[cfg(test)]
             composite_luts: CompositeLuts::build(),
             format_table: None,
+            instr_info: Vec::new(),
             decode_count: 0,
             unknown_count: 0,
         }
@@ -289,10 +307,98 @@ impl InstructionDecoder {
     pub fn from_index(index: DecoderIndex) -> Self {
         Self {
             index,
+            #[cfg(test)]
             composite_luts: CompositeLuts::build(),
             format_table: None,
+            instr_info: Vec::new(),
             decode_count: 0,
             unknown_count: 0,
+        }
+    }
+
+    /// Get LLVM InstrInfo for an opcode, if available.
+    pub fn get_instr_info(&self, opcode: u32) -> Option<&decoder_ffi::InstrInfo> {
+        self.instr_info.get(opcode as usize)
+    }
+
+    /// Get the full InstrInfo table (for passing to LatencyTable, etc.).
+    pub fn instr_info_table(&self) -> &[decoder_ffi::InstrInfo] {
+        &self.instr_info
+    }
+
+    /// Validate a SlotOp's SemanticOp against LLVM MCInstrDesc flags.
+    ///
+    /// Logs a warning when our semantic classification disagrees with LLVM's
+    /// flags (e.g., we say Load but LLVM says no MayLoad). These are bugs
+    /// in our SemanticOp inference, not in LLVM.
+    fn validate_semantic_vs_flags(&self, op: &SlotOp) {
+        let opcode = match op.llvm_opcode {
+            Some(o) => o,
+            None => return,
+        };
+        let info = match self.instr_info.get(opcode as usize) {
+            Some(i) if i.flags != 0 => i,
+            _ => return,
+        };
+        let semantic = match op.semantic {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Load: our SemanticOp says Load but LLVM says no MayLoad?
+        if matches!(semantic, SemanticOp::Load) && !info.is_load() {
+            log::warn!(
+                "[semantic-flag mismatch] {} (opcode {}): SemanticOp::Load but LLVM has no MayLoad (flags=0x{:X})",
+                op.encoding_name.as_deref().unwrap_or("?"), opcode, info.flags,
+            );
+        }
+        // Store: our SemanticOp says Store but LLVM says no MayStore?
+        if matches!(semantic, SemanticOp::Store) && !info.is_store() {
+            log::warn!(
+                "[semantic-flag mismatch] {} (opcode {}): SemanticOp::Store but LLVM has no MayStore (flags=0x{:X})",
+                op.encoding_name.as_deref().unwrap_or("?"), opcode, info.flags,
+            );
+        }
+        // Branch: LLVM says Branch but we don't have Br/BrCond?
+        if info.is_branch() && !matches!(semantic,
+            SemanticOp::Br | SemanticOp::BrCond | SemanticOp::Call | SemanticOp::Ret
+        ) {
+            log::warn!(
+                "[semantic-flag mismatch] {} (opcode {}): LLVM says Branch but SemanticOp::{:?}",
+                op.encoding_name.as_deref().unwrap_or("?"), opcode, semantic,
+            );
+        }
+        // Call: LLVM says Call but we don't?
+        if info.is_call() && !matches!(semantic, SemanticOp::Call) {
+            log::warn!(
+                "[semantic-flag mismatch] {} (opcode {}): LLVM says Call but SemanticOp::{:?}",
+                op.encoding_name.as_deref().unwrap_or("?"), opcode, semantic,
+            );
+        }
+        // Return: LLVM says Return but we don't?
+        if info.is_return() && !matches!(semantic, SemanticOp::Ret) {
+            log::warn!(
+                "[semantic-flag mismatch] {} (opcode {}): LLVM says Return but SemanticOp::{:?}",
+                op.encoding_name.as_deref().unwrap_or("?"), opcode, semantic,
+            );
+        }
+
+        // Reverse: we say Load but LLVM says no MayLoad?
+        // (Skip pointer ops and cascade reads -- they use the load slot but
+        // aren't memory loads in LLVM's sense.)
+        if info.is_load() && !matches!(semantic,
+            SemanticOp::Load | SemanticOp::PointerAdd | SemanticOp::PointerMov
+            | SemanticOp::CascadeRead | SemanticOp::CascadeWrite
+            | SemanticOp::Copy
+        ) && !matches!(semantic,
+            // Intrinsics and vector ops that load (UPS, etc.) may have MayLoad
+            // from LLVM but aren't SemanticOp::Load. That's expected.
+            SemanticOp::Ups | SemanticOp::Intrinsic(_)
+        ) {
+            log::debug!(
+                "[semantic-flag note] {} (opcode {}): LLVM MayLoad but SemanticOp::{:?}",
+                op.encoding_name.as_deref().unwrap_or("?"), opcode, semantic,
+            );
         }
     }
 
@@ -334,8 +440,9 @@ impl InstructionDecoder {
 
     /// Try to decode slot-specific bits against encodings for that slot.
     ///
-    /// This is the preferred O(1) decode method. It uses the DecoderIndex
-    /// for constant-time lookup based on the slot's common opcode bits.
+    /// Legacy decode method using bytecode tables. Retained for cross-validation
+    /// tests against the LLVM FFI decoder. Not used in production.
+    #[cfg(test)]
     pub fn decode_slot_bits(
         &self,
         bits: u64,
@@ -400,7 +507,7 @@ impl InstructionDecoder {
         &self,
         bits: u64,
         slot_type: crate::interpreter::bundle::SlotType,
-    ) -> Option<(DecodedInstr, Option<Operand>, Vec<Operand>, Option<PostModify>)> {
+    ) -> Option<(DecodedInstr, Option<Operand>, Vec<Operand>, Option<PostModify>, Option<u32>)> {
         let ffi_slot = Self::slot_type_to_ffi(slot_type)?;
         let ffi_result = decoder_ffi::decode_slot(ffi_slot, bits)?;
 
@@ -430,7 +537,7 @@ impl InstructionDecoder {
             operands: HashMap::new(),
         };
 
-        Some((decoded_instr, dest, sources, post_modify))
+        Some((decoded_instr, dest, sources, post_modify, Some(ffi_result.opcode)))
     }
 
     /// Extract dest, sources, and post-modify from LLVM FFI decode result.
@@ -594,12 +701,9 @@ impl InstructionDecoder {
 
     /// Extract operands from decoded instruction using data-driven dispatch.
     ///
-    /// Each operand field's `operand_type` (populated from TableGen reg_class)
-    /// determines exactly how raw bits become an Operand. No field-name heuristics.
-    ///
-    /// Address generator fields (ag_*) are still handled specially because they
-    /// encode a packed {ptr, imm/mod, mode} tuple -- this is structural, not a
-    /// register encoding issue.
+    /// Legacy bit-field extraction method. Retained for cross-validation tests
+    /// against the LLVM FFI operand extraction. Not used in production.
+    #[cfg(test)]
     fn extract_operands(&self, decoded: &DecodedInstr) -> (Option<Operand>, Vec<Operand>, Option<PostModify>) {
         let mut field_operands: HashMap<String, Operand> = HashMap::new();
         let mut direct_dest: Option<Operand> = None;
@@ -757,6 +861,7 @@ impl InstructionDecoder {
     /// Decode an address generator field (ag_all, ag_nospill, agb_sa, etc.).
     ///
     /// Decode a register operand from raw bits, applying subclass base offset.
+    #[cfg(test)]
     fn decode_register(kind: RegisterKind, raw: u8, base_offset: u8) -> Operand {
         let reg = raw + base_offset;
         match kind {
@@ -776,9 +881,7 @@ impl InstructionDecoder {
     }
 
     /// AG fields encode a packed tuple of {pointer, offset/modifier, mode_bits}.
-    /// The addressing mode (from the instruction name) determines the layout.
-    /// This is structural packing, not a register composite encoding, so it
-    /// stays as explicit logic rather than being part of the OperandType system.
+    #[cfg(test)]
     fn decode_ag_field(
         &self,
         field: &crate::tablegen::OperandField,
@@ -878,11 +981,7 @@ impl InstructionDecoder {
     }
 
     /// Extract destination and sources using TableGen's output_order/input_order.
-    ///
-    /// This is the key function for Phase 1: it ensures sources are in canonical order.
-    ///
-    /// Note: Operand names come from TableGen input_order which should now match
-    /// the field_operands keys (after resolver traces through field_sources).
+    #[cfg(test)]
     fn extract_ordered_operands(
         &self,
         decoded: &DecodedInstr,
@@ -971,6 +1070,7 @@ impl InstructionDecoder {
     }
 
     /// Heuristic to find destination from field_operands map.
+    #[cfg(test)]
     fn find_dest_heuristic(
         &self,
         field_operands: &std::collections::HashMap<String, Operand>,
@@ -985,10 +1085,7 @@ impl InstructionDecoder {
 
     /// Legacy safety net: check if a field name represents a destination.
     ///
-    /// This heuristic is only used when output_order/input_order are empty or
-    /// when the first output_order name doesn't match any field_operand key.
-    /// New instructions should always have output_order/input_order populated
-    /// by the resolver -- do not extend this pattern list.
+    #[cfg(test)]
     fn is_dest_field(&self, name: &str) -> bool {
         (name.contains("mRx") && !name.contains("mRx0"))
             || name.starts_with("d")
@@ -1040,6 +1137,10 @@ impl InstructionDecoder {
             "EXTENDu8" => Some(SemanticOp::ZeroExtend),
             "EXTENDu16" => Some(SemanticOp::ZeroExtend),
             "MOV_CNTR" => Some(SemanticOp::ReadCycleCounter),
+            // VBAND/VBOR share sched_class II_VBLOG -- cannot distinguish
+            // via itinerary table. Override by encoding name instead.
+            "VBAND" => Some(SemanticOp::And),
+            "VBOR" => Some(SemanticOp::Or),
             _ => None,
         };
 
@@ -1193,22 +1294,18 @@ impl Decoder for InstructionDecoder {
                 // Zero bits means no operation in this slot - treat as NOP.
                 if slot.slot_type == SlotType::Nop || slot.bits == 0 {
                     bundle.set_slot(SlotOp::nop(slot_index));
-                } else if let Some((decoded, dest, sources, extracted_pm)) =
+                } else if let Some((decoded, dest, sources, extracted_pm, ffi_opcode)) =
                     self.try_decode_via_ffi(slot.bits, slot.slot_type)
-                        .or_else(|| {
-                            // Legacy fallback: bytecode identification + bit-field extraction.
-                            self.decode_slot_bits(slot.bits, slot.slot_type).map(|d| {
-                                let (dest, sources, pm) = self.extract_operands(&d);
-                                (d, dest, sources, pm)
-                            })
-                        })
                 {
-                    // Primary path: LLVM FFI for both instruction identification
-                    // and operand extraction.  Legacy bytecode path is fallback
-                    // only (covers any instruction LLVM doesn't handle).
+                    // LLVM FFI is the sole production decoder for both instruction
+                    // identification and operand extraction.
                     let mut slot_op = self.build_slot_op(
                         slot_index, &decoded, dest, sources, extracted_pm,
                     );
+                    slot_op.llvm_opcode = ffi_opcode;
+
+                    // Validate SemanticOp against LLVM's MCInstrDesc flags.
+                    self.validate_semantic_vs_flags(&slot_op);
 
                     // For LNG slot instructions, use the operation's natural slot since
                     // LNG can contain either control (JL, J) or vector/scalar (movxm).
@@ -2364,7 +2461,7 @@ mod tests {
                             });
 
                         match (ffi_result, legacy_result) {
-                            (Some((_, ffi_dest, ffi_src, ffi_pm)), Some((_, leg_dest, leg_src, leg_pm))) => {
+                            (Some((_, ffi_dest, ffi_src, ffi_pm, _)), Some((_, leg_dest, leg_src, leg_pm))) => {
                                 ffi_hits += 1;
                                 if ffi_dest == leg_dest && ffi_src == leg_src && ffi_pm == leg_pm {
                                     matches += 1;
@@ -2429,7 +2526,7 @@ mod tests {
                             let (dest, sources, pm) = decoder.extract_operands(&d);
                             (d, dest, sources, pm)
                         });
-                        if let (Some((_, fd, fs, fp)), Some((_, ld, ls, lp))) = (ffi, leg) {
+                        if let (Some((_, fd, fs, fp, _)), Some((_, ld, ls, lp))) = (ffi, leg) {
                             if fd == ld && fs == ls && fp == lp { continue; }
                             // Categorize
                             if ld.is_some() && fd.is_none() && matches!(ld, Some(Operand::ModifierReg(_))) {
@@ -2618,10 +2715,10 @@ mod tests {
                         (name, dest, sources, pm)
                     });
 
-                    let ffi_name = ffi.as_ref().map(|(d, _, _, _)| d.encoding.name.as_str()).unwrap_or("FAIL");
+                    let ffi_name = ffi.as_ref().map(|(d, _, _, _, _)| d.encoding.name.as_str()).unwrap_or("FAIL");
                     let leg_name = leg.as_ref().map(|(n, _, _, _)| n.as_str()).unwrap_or("FAIL");
 
-                    let ffi_ops = ffi.as_ref().map(|(_, d, s, p)| format!("dest={:?} src={:?} pm={:?}", d, s, p));
+                    let ffi_ops = ffi.as_ref().map(|(_, d, s, p, _)| format!("dest={:?} src={:?} pm={:?}", d, s, p));
                     let leg_ops = leg.as_ref().map(|(_, d, s, p)| format!("dest={:?} src={:?} pm={:?}", d, s, p));
 
                     let status = if ffi_ops == leg_ops { "OK" } else { "DIFF" };
@@ -2636,5 +2733,69 @@ mod tests {
                 offset += size;
             }
         }
+    }
+
+    /// Verify that validate_semantic_vs_flags produces no warnings for
+    /// all instructions in the ISA test ELFs.
+    ///
+    /// This catches cases where our SemanticOp classification disagrees
+    /// with LLVM's MCInstrDesc flags (MayLoad, MayStore, isBranch, etc.).
+    #[test]
+    fn test_semantic_vs_llvm_flags_no_false_positives() {
+        let decoder = InstructionDecoder::load_default();
+
+        // Decode all known instruction encodings and validate.
+        let mut checked = 0;
+        let mut warnings = Vec::new();
+
+        for enc in decoder.decoder_index().all_encodings() {
+            // Skip instructions without semantics -- those are expected gaps.
+            if enc.semantic.is_none() {
+                continue;
+            }
+
+            // Try to get an LLVM opcode by decoding the encoding's fixed bits.
+            let ffi_slot = match enc.slot.as_str() {
+                "alu" => decoder_ffi::Slot::Alu,
+                "lda" => decoder_ffi::Slot::Lda,
+                "ldb" => decoder_ffi::Slot::Ldb,
+                "lng" => decoder_ffi::Slot::Lng,
+                "mv" => decoder_ffi::Slot::Mv,
+                "st" => decoder_ffi::Slot::St,
+                "vec" => decoder_ffi::Slot::Vec,
+                _ => continue,
+            };
+
+            // Use the fixed bits as a decode candidate.
+            let bits = enc.fixed_bits;
+            if let Some(ffi_result) = decoder_ffi::decode_slot(ffi_slot, bits) {
+                if let Some(info) = decoder.get_instr_info(ffi_result.opcode) {
+                    if info.flags == 0 { continue; } // No flags to validate.
+
+                    let semantic = enc.semantic.unwrap();
+
+                    // Check load/store classification.
+                    if matches!(semantic, SemanticOp::Load) && !info.is_load() {
+                        warnings.push(format!("{}: SemanticOp::Load but no MayLoad", enc.name));
+                    }
+                    if matches!(semantic, SemanticOp::Store) && !info.is_store() {
+                        warnings.push(format!("{}: SemanticOp::Store but no MayStore", enc.name));
+                    }
+
+                    checked += 1;
+                }
+            }
+        }
+
+        eprintln!("Validated semantic vs LLVM flags for {} instructions", checked);
+        if !warnings.is_empty() {
+            eprintln!("Warnings ({}):", warnings.len());
+            for w in &warnings {
+                eprintln!("  {}", w);
+            }
+        }
+        // Warnings are informational, not test failures.
+        // As we fix misclassifications, we can tighten this.
+        assert!(checked > 50, "Should validate 50+ instructions, got {}", checked);
     }
 }

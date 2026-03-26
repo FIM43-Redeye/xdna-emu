@@ -1126,6 +1126,7 @@ const ITINERARY_SEMANTICS: &[(&str, &str)] = &[
     ("II_VPUSH_HI", "SemanticOp::VectorInsert"),
     ("II_VPUSH_LO", "SemanticOp::VectorInsert"),
     ("II_VSRSM", "SemanticOp::Srs"),
+    ("II_VBCST", "SemanticOp::VectorBroadcast"),
     ("II_VEXTBCST", "SemanticOp::VectorBroadcast"),
     ("II_ADC", "SemanticOp::Adc"),
     ("II_SBC", "SemanticOp::Sbc"),
