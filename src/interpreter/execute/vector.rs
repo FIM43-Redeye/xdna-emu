@@ -144,11 +144,10 @@ impl VectorAlu {
                 true
             }
 
-            SemanticOp::Mac => {
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let acc_reg = Self::get_acc_dest(op);
-                Self::vector_mac(ctx, acc_reg, &a, &b, et);
-                true
+            SemanticOp::Mac | SemanticOp::MatMul | SemanticOp::MatMulSub
+            | SemanticOp::NegMul | SemanticOp::NegMatMul
+            | SemanticOp::AddMac | SemanticOp::SubMac => {
+                return super::vector_matmul::execute_matmul(op, ctx);
             }
 
             SemanticOp::Min => {
@@ -241,57 +240,6 @@ impl VectorAlu {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let result = Self::vector_min(&a, &b, et);
                 Self::write_vector_dest(op, ctx, result);
-                true
-            }
-
-            // ========== Matrix Operations ==========
-
-            SemanticOp::MatMul => {
-                // Dense/sparse matrix multiply: acc += A * B
-                // BFloat16 variant uses dedicated bf16 path
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let acc_reg = Self::get_acc_dest(op);
-                match et {
-                    ElementType::BFloat16 => Self::vector_matmul_bf16(ctx, acc_reg, &a, &b, true),
-                    _ => Self::vector_matmul_dense(ctx, acc_reg, &a, &b, et),
-                }
-                true
-            }
-
-            SemanticOp::MatMulSub => {
-                // Matrix multiply-subtract: acc -= A * B
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let acc_reg = Self::get_acc_dest(op);
-                match et {
-                    ElementType::BFloat16 => Self::vector_matmul_bf16(ctx, acc_reg, &a, &b, false),
-                    _ => Self::vector_matmul_sub(ctx, acc_reg, &a, &b, et),
-                }
-                true
-            }
-
-            SemanticOp::NegMatMul => {
-                // Negated matrix multiply: acc += -(A * B)
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let acc_reg = Self::get_acc_dest(op);
-                Self::vector_neg_matmul(ctx, acc_reg, &a, &b, et);
-                true
-            }
-
-            SemanticOp::AddMac => {
-                // Double accumulator: acc1 = acc1 + acc2 + A * B
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let acc_reg = Self::get_acc_dest(op);
-                let acc2_reg = Self::get_acc_source(op);
-                Self::vector_double_acc_mac(ctx, acc_reg, acc2_reg, &a, &b, et, true);
-                true
-            }
-
-            SemanticOp::SubMac => {
-                // Double accumulator: acc1 = acc1 - acc2 + A * B
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let acc_reg = Self::get_acc_dest(op);
-                let acc2_reg = Self::get_acc_source(op);
-                Self::vector_double_acc_mac(ctx, acc_reg, acc2_reg, &a, &b, et, false);
                 true
             }
 
@@ -528,13 +476,6 @@ impl VectorAlu {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let result = Self::vector_neg_add(&a, &b, et);
                 Self::write_vector_dest(op, ctx, result);
-                true
-            }
-
-            SemanticOp::NegMul => {
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let acc_reg = Self::get_acc_dest(op);
-                Self::vector_neg_mul(ctx, acc_reg, &a, &b, et);
                 true
             }
 
@@ -1000,290 +941,6 @@ impl VectorAlu {
     /// - A: activation matrix (from vector register)
     /// - B: weight matrix (from vector register)
     /// - Result accumulates to 512-bit accumulator
-    fn vector_matmul_dense(
-        ctx: &mut ExecutionContext,
-        acc_reg: u8,
-        a: &[u32; 8],
-        b: &[u32; 8],
-        elem_type: ElementType,
-    ) {
-        let current = ctx.accumulator.read(acc_reg);
-
-        match elem_type {
-            ElementType::Int8 | ElementType::UInt8 => {
-                // 32 x int8 elements: interpret as 4x8 * 8x4 = 4x4 output
-                // Each u32 contains 4 int8 values
-                // Simplified: element-wise multiply-accumulate for compatibility
-                let mut new_acc = current;
-                for i in 0..8 {
-                    let mut acc = current[i];
-                    for byte_idx in 0..4 {
-                        let a_byte = ((a[i] >> (byte_idx * 8)) & 0xFF) as u8;
-                        let b_byte = ((b[i] >> (byte_idx * 8)) & 0xFF) as u8;
-                        let prod = if matches!(elem_type, ElementType::Int8) {
-                            (a_byte as i8 as i64) * (b_byte as i8 as i64)
-                        } else {
-                            (a_byte as i64) * (b_byte as i64)
-                        };
-                        acc = acc.wrapping_add(prod as u64);
-                    }
-                    new_acc[i] = acc;
-                }
-                ctx.accumulator.write(acc_reg, new_acc);
-            }
-            ElementType::Int16 | ElementType::UInt16 => {
-                // 16 x int16 elements: interpret as matrix multiply
-                let mut new_acc = current;
-                for i in 0..8 {
-                    let a_lo = (a[i] & 0xFFFF) as i16 as i32;
-                    let a_hi = ((a[i] >> 16) & 0xFFFF) as i16 as i32;
-                    let b_lo = (b[i] & 0xFFFF) as i16 as i32;
-                    let b_hi = ((b[i] >> 16) & 0xFFFF) as i16 as i32;
-                    // Accumulate products
-                    new_acc[i] = current[i]
-                        .wrapping_add((a_lo * b_lo) as u64)
-                        .wrapping_add((a_hi * b_hi) as u64);
-                }
-                ctx.accumulator.write(acc_reg, new_acc);
-            }
-            ElementType::BFloat16 => {
-                // 16 x bf16 matrix multiply
-                let mut new_acc = current;
-                for i in 0..8 {
-                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16) as f64;
-                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16) as f64;
-                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16) as f64;
-                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16) as f64;
-                    let current_f = f64::from_bits(current[i]);
-                    new_acc[i] = (current_f + a_lo * b_lo + a_hi * b_hi).to_bits();
-                }
-                ctx.accumulator.write(acc_reg, new_acc);
-            }
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
-                // 8 x int32 matrix multiply-accumulate
-                let mut new_acc = current;
-                for i in 0..8 {
-                    let prod = (a[i] as u64) * (b[i] as u64);
-                    new_acc[i] = current[i].wrapping_add(prod);
-                }
-                ctx.accumulator.write(acc_reg, new_acc);
-            }
-            ElementType::Float32 => {
-                // 8 x f32 matrix multiply
-                let mut new_acc = current;
-                for i in 0..8 {
-                    let fa = f32::from_bits(a[i]) as f64;
-                    let fb = f32::from_bits(b[i]) as f64;
-                    let current_f = f64::from_bits(current[i]);
-                    new_acc[i] = (current_f + fa * fb).to_bits();
-                }
-                ctx.accumulator.write(acc_reg, new_acc);
-            }
-        }
-    }
-
-    /// Matrix multiply-subtract (VMSC): acc -= A * B
-    ///
-    /// Used for convolution operations where subtraction is needed.
-    fn vector_matmul_sub(
-        ctx: &mut ExecutionContext,
-        acc_reg: u8,
-        a: &[u32; 8],
-        b: &[u32; 8],
-        elem_type: ElementType,
-    ) {
-        let current = ctx.accumulator.read(acc_reg);
-
-        match elem_type {
-            ElementType::Int8 | ElementType::UInt8 => {
-                let mut new_acc = current;
-                for i in 0..8 {
-                    let mut acc = current[i];
-                    for byte_idx in 0..4 {
-                        let a_byte = ((a[i] >> (byte_idx * 8)) & 0xFF) as u8;
-                        let b_byte = ((b[i] >> (byte_idx * 8)) & 0xFF) as u8;
-                        let prod = if matches!(elem_type, ElementType::Int8) {
-                            (a_byte as i8 as i64) * (b_byte as i8 as i64)
-                        } else {
-                            (a_byte as i64) * (b_byte as i64)
-                        };
-                        acc = acc.wrapping_sub(prod as u64);
-                    }
-                    new_acc[i] = acc;
-                }
-                ctx.accumulator.write(acc_reg, new_acc);
-            }
-            ElementType::Int16 | ElementType::UInt16 => {
-                let mut new_acc = current;
-                for i in 0..8 {
-                    let a_lo = (a[i] & 0xFFFF) as i16 as i32;
-                    let a_hi = ((a[i] >> 16) & 0xFFFF) as i16 as i32;
-                    let b_lo = (b[i] & 0xFFFF) as i16 as i32;
-                    let b_hi = ((b[i] >> 16) & 0xFFFF) as i16 as i32;
-                    new_acc[i] = current[i]
-                        .wrapping_sub((a_lo * b_lo) as u64)
-                        .wrapping_sub((a_hi * b_hi) as u64);
-                }
-                ctx.accumulator.write(acc_reg, new_acc);
-            }
-            ElementType::BFloat16 => {
-                let mut new_acc = current;
-                for i in 0..8 {
-                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16) as f64;
-                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16) as f64;
-                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16) as f64;
-                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16) as f64;
-                    let current_f = f64::from_bits(current[i]);
-                    new_acc[i] = (current_f - a_lo * b_lo - a_hi * b_hi).to_bits();
-                }
-                ctx.accumulator.write(acc_reg, new_acc);
-            }
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
-                let mut new_acc = current;
-                for i in 0..8 {
-                    let prod = (a[i] as u64) * (b[i] as u64);
-                    new_acc[i] = current[i].wrapping_sub(prod);
-                }
-                ctx.accumulator.write(acc_reg, new_acc);
-            }
-            ElementType::Float32 => {
-                let mut new_acc = current;
-                for i in 0..8 {
-                    let fa = f32::from_bits(a[i]) as f64;
-                    let fb = f32::from_bits(b[i]) as f64;
-                    let current_f = f64::from_bits(current[i]);
-                    new_acc[i] = (current_f - fa * fb).to_bits();
-                }
-                ctx.accumulator.write(acc_reg, new_acc);
-            }
-        }
-    }
-
-    /// Negated matrix multiply (VNEGMAC): acc += -(A * B)
-    ///
-    /// Adds the negated product to the accumulator.
-    fn vector_neg_matmul(
-        ctx: &mut ExecutionContext,
-        acc_reg: u8,
-        a: &[u32; 8],
-        b: &[u32; 8],
-        elem_type: ElementType,
-    ) {
-        // VNEGMAC: acc += -(A * B) is the same as acc -= A * B
-        Self::vector_matmul_sub(ctx, acc_reg, a, b, elem_type);
-    }
-
-    /// BFloat16 matrix multiply-accumulate for CNN workloads (VMAC.f/VMSC.f)
-    ///
-    /// Operands are BFloat16, accumulator is Float32 for higher precision.
-    /// This is the key instruction for neural network inference.
-    fn vector_matmul_bf16(
-        ctx: &mut ExecutionContext,
-        acc_reg: u8,
-        a: &[u32; 8],
-        b: &[u32; 8],
-        accumulate: bool, // true for VMAC.f, false for VMSC.f
-    ) {
-        let current = ctx.accumulator.read(acc_reg);
-        let mut new_acc = current;
-
-        // Each u32 contains 2 bf16 values (16 bf16 total in 256-bit vector)
-        // Accumulator holds 8 x f32 values (as f64 for precision)
-        for i in 0..8 {
-            let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16) as f64;
-            let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16) as f64;
-            let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16) as f64;
-            let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16) as f64;
-            let current_f = f64::from_bits(current[i]);
-
-            let product_sum = a_lo * b_lo + a_hi * b_hi;
-            if accumulate {
-                new_acc[i] = (current_f + product_sum).to_bits();
-            } else {
-                new_acc[i] = (current_f - product_sum).to_bits();
-            }
-        }
-
-        ctx.accumulator.write(acc_reg, new_acc);
-    }
-
-    /// Double accumulator MAC (VADDMAC/VSUBMAC): acc1 = acc1 +/- acc2 + A * B
-    ///
-    /// These fused operations combine accumulator arithmetic with matrix multiply.
-    fn vector_double_acc_mac(
-        ctx: &mut ExecutionContext,
-        acc1_reg: u8,
-        acc2_reg: u8,
-        a: &[u32; 8],
-        b: &[u32; 8],
-        elem_type: ElementType,
-        add_acc2: bool, // true for VADDMAC, false for VSUBMAC
-    ) {
-        let acc1 = ctx.accumulator.read(acc1_reg);
-        let acc2 = ctx.accumulator.read(acc2_reg);
-
-        match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
-                let mut new_acc = [0u64; 8];
-                for i in 0..8 {
-                    let prod = (a[i] as u64) * (b[i] as u64);
-                    let acc2_contrib = if add_acc2 {
-                        acc2[i]
-                    } else {
-                        0u64.wrapping_sub(acc2[i])
-                    };
-                    new_acc[i] = acc1[i].wrapping_add(acc2_contrib).wrapping_add(prod);
-                }
-                ctx.accumulator.write(acc1_reg, new_acc);
-            }
-            ElementType::BFloat16 | ElementType::Float32 => {
-                let mut new_acc = [0u64; 8];
-                for i in 0..8 {
-                    let (a_lo, a_hi, b_lo, b_hi) = if matches!(elem_type, ElementType::BFloat16) {
-                        (
-                            Self::bf16_to_f32((a[i] & 0xFFFF) as u16) as f64,
-                            Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16) as f64,
-                            Self::bf16_to_f32((b[i] & 0xFFFF) as u16) as f64,
-                            Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16) as f64,
-                        )
-                    } else {
-                        (
-                            f32::from_bits(a[i]) as f64,
-                            0.0,
-                            f32::from_bits(b[i]) as f64,
-                            0.0,
-                        )
-                    };
-
-                    let acc1_f = f64::from_bits(acc1[i]);
-                    let acc2_f = f64::from_bits(acc2[i]);
-                    let product = a_lo * b_lo + a_hi * b_hi;
-
-                    let result = if add_acc2 {
-                        acc1_f + acc2_f + product
-                    } else {
-                        acc1_f - acc2_f + product
-                    };
-                    new_acc[i] = result.to_bits();
-                }
-                ctx.accumulator.write(acc1_reg, new_acc);
-            }
-            _ => {
-                // For other types, fall back to simple accumulate
-                let mut new_acc = acc1;
-                for i in 0..8 {
-                    let acc2_contrib = if add_acc2 {
-                        acc2[i]
-                    } else {
-                        0u64.wrapping_sub(acc2[i])
-                    };
-                    new_acc[i] = acc1[i].wrapping_add(acc2_contrib);
-                }
-                ctx.accumulator.write(acc1_reg, new_acc);
-            }
-        }
-    }
-
     /// Shift-Round-Saturate: convert accumulator lanes to narrower vector output.
     ///
     /// Thin wrapper that reads the accumulator register and delegates to
@@ -1716,84 +1373,6 @@ impl VectorAlu {
         }
 
         result
-    }
-
-    /// Vector multiply-accumulate (adds to 512-bit accumulator).
-    fn vector_mac(
-        ctx: &mut ExecutionContext,
-        acc_reg: u8,
-        a: &[u32; 8],
-        b: &[u32; 8],
-        elem_type: ElementType,
-    ) {
-        let current = ctx.accumulator.read(acc_reg);
-
-        match elem_type {
-            ElementType::Int32 | ElementType::UInt32 | ElementType::Int64 | ElementType::UInt64 => {
-                // 8 × 32-bit → 8 × 64-bit accumulator lanes
-                let mut new_acc = [0u64; 8];
-                for i in 0..8 {
-                    let prod = (a[i] as u64) * (b[i] as u64);
-                    new_acc[i] = current[i].wrapping_add(prod);
-                }
-                ctx.accumulator.write(acc_reg, new_acc);
-            }
-            ElementType::Float32 => {
-                // 8 × f32 MAC: accumulator holds f64 for precision
-                let mut new_acc = current;
-                for i in 0..8 {
-                    let fa = f32::from_bits(a[i]) as f64;
-                    let fb = f32::from_bits(b[i]) as f64;
-                    let current_f = f64::from_bits(current[i]);
-                    new_acc[i] = (current_f + fa * fb).to_bits();
-                }
-                ctx.accumulator.write(acc_reg, new_acc);
-            }
-            ElementType::Int16 | ElementType::UInt16 => {
-                // 16 × 16-bit → 16 products, accumulated
-                let mut new_acc = current;
-                for i in 0..8 {
-                    let a_lo = a[i] & 0xFFFF;
-                    let a_hi = (a[i] >> 16) & 0xFFFF;
-                    let b_lo = b[i] & 0xFFFF;
-                    let b_hi = (b[i] >> 16) & 0xFFFF;
-                    let prod_lo = a_lo * b_lo;
-                    let prod_hi = a_hi * b_hi;
-                    // Accumulate both products into single 64-bit lane
-                    new_acc[i] = current[i]
-                        .wrapping_add(prod_lo as u64)
-                        .wrapping_add(prod_hi as u64);
-                }
-                ctx.accumulator.write(acc_reg, new_acc);
-            }
-            ElementType::BFloat16 => {
-                // 16 × bf16 MAC: convert to f32, accumulate to f64
-                let mut new_acc = current;
-                for i in 0..8 {
-                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16) as f64;
-                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16) as f64;
-                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16) as f64;
-                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16) as f64;
-                    let current_f = f64::from_bits(current[i]);
-                    new_acc[i] = (current_f + a_lo * b_lo + a_hi * b_hi).to_bits();
-                }
-                ctx.accumulator.write(acc_reg, new_acc);
-            }
-            ElementType::Int8 | ElementType::UInt8 => {
-                // 32 × 8-bit → 32 products, accumulated
-                let mut new_acc = current;
-                for i in 0..8 {
-                    let mut sum = 0u64;
-                    for j in 0..4 {
-                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as u64;
-                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as u64;
-                        sum += a_byte * b_byte;
-                    }
-                    new_acc[i] = current[i].wrapping_add(sum);
-                }
-                ctx.accumulator.write(acc_reg, new_acc);
-            }
-        }
     }
 
     /// Vector minimum by element type.
@@ -3111,18 +2690,6 @@ impl VectorAlu {
         result
     }
 
-    /// Vector negate multiply: acc += -(src1 * src2).
-    fn vector_neg_mul(
-        ctx: &mut ExecutionContext,
-        acc_reg: u8,
-        a: &[u32; 8],
-        b: &[u32; 8],
-        elem_type: ElementType,
-    ) {
-        // This is equivalent to vector_neg_matmul (acc -= A * B is same as acc += -(A * B))
-        Self::vector_matmul_sub(ctx, acc_reg, a, b, elem_type);
-    }
-
     // ========== Vector Comparison Operation Implementations ==========
 
     /// Vector compare greater-or-equal: dst[i] = (a[i] >= b[i]) ? ~0 : 0
@@ -3927,6 +3494,13 @@ impl VectorAlu {
                 true
             }
 
+            // ========== Matrix Multiply (config-driven) ==========
+            SemanticOp::Mac | SemanticOp::MatMul | SemanticOp::MatMulSub
+            | SemanticOp::NegMul | SemanticOp::NegMatMul
+            | SemanticOp::AddMac | SemanticOp::SubMac => {
+                return super::vector_matmul::execute_matmul(op, ctx);
+            }
+
             // ========== Accumulator ops ==========
             SemanticOp::Accumulate => {
                 let has_acc_source = op.sources.iter()
@@ -4429,28 +4003,9 @@ mod tests {
         assert_eq!(ctx.vector.read(2), [20, 30, 40, 50, 60, 70, 80, 90]);
     }
 
-    #[test]
-    fn test_vector_mac() {
-        let mut ctx = make_ctx();
-        ctx.vector.write(0, [1, 2, 3, 4, 5, 6, 7, 8]);
-        ctx.vector.write(1, [2, 2, 2, 2, 2, 2, 2, 2]);
-
-        // acc0 = v0 * v1
-        let op = SlotOp::from_semantic(SlotIndex::Accumulator, SemanticOp::Mac)
-            .as_vector(ElementType::Int32)
-            .with_dest(Operand::AccumReg(0))
-            .with_source(Operand::VectorReg(0))
-            .with_source(Operand::VectorReg(1));
-
-        VectorAlu::execute(&op, &mut ctx);
-        let acc = ctx.accumulator.read(0);
-        assert_eq!(acc, [2, 4, 6, 8, 10, 12, 14, 16]);
-
-        // Accumulate again
-        VectorAlu::execute(&op, &mut ctx);
-        let acc = ctx.accumulator.read(0);
-        assert_eq!(acc, [4, 8, 12, 16, 20, 24, 28, 32]);
-    }
+    // NOTE: test_vector_mac was removed -- it tested the old element-wise MAC
+    // path which has been replaced by config-driven matrix multiply dispatch
+    // (execute_matmul). MAC tests now belong in vector_matmul.rs.
 
     #[test]
     fn test_vector_min_max() {
@@ -4701,28 +4256,10 @@ mod tests {
         assert!((hi0 - 2.5).abs() < 0.1, "Expected ~2.5, got {}", hi0);
     }
 
-    #[test]
-    fn test_vector_matmul_dense_int32() {
-        let mut ctx = make_ctx();
-        ctx.vector.write(0, [1, 2, 3, 4, 5, 6, 7, 8]);
-        ctx.vector.write(1, [2, 2, 2, 2, 2, 2, 2, 2]);
-
-        let op = SlotOp::from_semantic(SlotIndex::Accumulator, SemanticOp::MatMul)
-            .as_vector(ElementType::Int32)
-            .with_dest(Operand::AccumReg(0))
-            .with_source(Operand::VectorReg(0))
-            .with_source(Operand::VectorReg(1));
-
-        VectorAlu::execute(&op, &mut ctx);
-        let acc = ctx.accumulator.read(0);
-        // Each lane: a[i] * b[i] accumulated
-        assert_eq!(acc, [2, 4, 6, 8, 10, 12, 14, 16]);
-
-        // Accumulate again
-        VectorAlu::execute(&op, &mut ctx);
-        let acc = ctx.accumulator.read(0);
-        assert_eq!(acc, [4, 8, 12, 16, 20, 24, 28, 32]);
-    }
+    // NOTE: test_vector_matmul_dense_int32 was removed -- it tested the old
+    // element-wise matmul path which has been replaced by config-driven matrix
+    // multiply dispatch (execute_matmul). MatMul tests now belong in
+    // vector_matmul.rs.
 
     #[test]
     fn test_vector_srs_int32() {
