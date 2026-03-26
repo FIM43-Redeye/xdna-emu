@@ -1212,6 +1212,12 @@ pub fn infer_element_type(mnemonic: &str) -> Option<ElementType> {
         } else {
             Some(ElementType::Int32)
         }
+    } else if mnemonic.ends_with("64") || mnemonic.contains(".i64") || mnemonic.contains(".u64") {
+        if mnemonic.contains(".u") {
+            Some(ElementType::UInt64)
+        } else {
+            Some(ElementType::Int64)
+        }
     } else if mnemonic.contains("bf16") || mnemonic.contains(".bf") {
         Some(ElementType::BFloat16)
     } else if mnemonic.contains("f32") || mnemonic.contains("float")
@@ -1251,7 +1257,7 @@ pub fn infer_dual_element_types(name: &str) -> (Option<ElementType>, Option<Elem
     let parts: Vec<&str> = name.split('_').collect();
 
     // Pattern 1: V{SRS|UPS}_{OUT}_{IN}_*
-    if parts.len() >= 3 && (parts[0] == "VSRS" || parts[0] == "VUPS") {
+    if parts.len() >= 3 && (parts[0] == "VSRS" || parts[0] == "VSRSM" || parts[0] == "VUPS") {
         if let (Some(out_type), Some(in_type)) =
             (parse_type_token(parts[1]), parse_type_token(parts[2]))
         {
@@ -1984,6 +1990,18 @@ mod tests {
     }
 
     #[test]
+    fn test_infer_element_type_64bit() {
+        assert_eq!(infer_element_type("vpush.hi.64"), Some(ElementType::Int64));
+        assert_eq!(infer_element_type("vpush.lo.64"), Some(ElementType::Int64));
+        assert_eq!(infer_element_type("vinsert.64"), Some(ElementType::Int64));
+        assert_eq!(infer_element_type("vextract.64"), Some(ElementType::Int64));
+        // Existing types still work.
+        assert_eq!(infer_element_type("vpush.hi.32"), Some(ElementType::Int32));
+        assert_eq!(infer_element_type("vpush.lo.16"), Some(ElementType::Int16));
+        assert_eq!(infer_element_type("vinsert.8"), Some(ElementType::Int8));
+    }
+
+    #[test]
     fn test_infer_dual_element_types_srs() {
         let (et, ft) = infer_dual_element_types("VSRS_S16_S32_mv_w_srs");
         assert_eq!(et, Some(ElementType::Int16));
@@ -1995,6 +2013,22 @@ mod tests {
 
         let (et, ft) = infer_dual_element_types("VSRS_S8_S32_mv_w_srs");
         assert_eq!(et, Some(ElementType::Int8));
+        assert_eq!(ft, Some(ElementType::Int32));
+    }
+
+    #[test]
+    fn test_infer_dual_element_types_vsrsm() {
+        // VSRSM (masked SRS) must also infer types from its name.
+        let (et, ft) = infer_dual_element_types("VSRSM_D32_S64");
+        assert_eq!(et, Some(ElementType::UInt32));
+        assert_eq!(ft, Some(ElementType::Int64));
+
+        let (et, ft) = infer_dual_element_types("VSRSM_S16_S32");
+        assert_eq!(et, Some(ElementType::Int16));
+        assert_eq!(ft, Some(ElementType::Int32));
+
+        let (et, ft) = infer_dual_element_types("VSRSM_D16_S32");
+        assert_eq!(et, Some(ElementType::UInt16));
         assert_eq!(ft, Some(ElementType::Int32));
     }
 
