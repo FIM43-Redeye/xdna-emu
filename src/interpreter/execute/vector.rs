@@ -56,6 +56,7 @@ impl VectorAlu {
             return false;
         }
 
+
         let et = op.element_type.unwrap_or(ElementType::Int32);
 
         log::trace!("[VECTOR_ALU] Checking semantic={:?} element_type={:?} dest={:?}",
