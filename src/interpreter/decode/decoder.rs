@@ -1147,8 +1147,15 @@ impl InstructionDecoder {
                 // Match by encoding name prefix to assign the correct
                 // MAC variant semantic.
                 let n = enc.name.as_str();
-                if n.starts_with("VNEGMAC_") || n.starts_with("VNEGMSC_") {
+                if n.starts_with("VNEGMAC_") {
                     Some(SemanticOp::NegMatMul)
+                } else if n.starts_with("VNEGMSC_") {
+                    // VNEGMSC: both NEG (negate product) and MSC (negate acc
+                    // via compressor). The two negations cancel in the
+                    // compressor's subtract XOR chain: sub = sub0 ^ neg ^ msc
+                    // = sub0 ^ 1 ^ 1 = sub0. Net effect is same as VMAC
+                    // (no subtract flip). Use Mac semantic.
+                    Some(SemanticOp::Mac)
                 } else if n.starts_with("VNEGMUL_") {
                     Some(SemanticOp::NegMul)
                 } else if n.starts_with("VADDMAC_") || n.starts_with("VADDMSC_") {
@@ -1159,7 +1166,11 @@ impl InstructionDecoder {
                     Some(SemanticOp::Mac)
                 } else if n.starts_with("VMSC_") {
                     Some(SemanticOp::MatMulSub)
-                } else if n.starts_with("VMUL_") {
+                } else if n.starts_with("VMUL_") && n.contains("_vmac_") {
+                    // Matrix multiply VMUL: encoding names contain _vmac_
+                    // (e.g., VMUL_vmac_cm_core_dense). Element-wise vmul
+                    // (e.g., VMUL_S8) does NOT contain _vmac_ and should
+                    // retain its original Mul semantic.
                     Some(SemanticOp::MatMul)
                 } else {
                     None
