@@ -20,6 +20,27 @@ import re
 import sys
 from typing import Optional
 
+
+def write_if_changed(filepath: str, content: str) -> bool:
+    """Write content to file only if it differs from the existing file.
+
+    Preserves the file's mtime when content is identical, which prevents
+    downstream timestamp-based staleness checks from triggering unnecessary
+    reassembly and repackaging.
+
+    Returns True if the file was written, False if unchanged.
+    """
+    if os.path.isfile(filepath):
+        try:
+            with open(filepath, "r") as f:
+                if f.read() == content:
+                    return False
+        except (OSError, UnicodeDecodeError):
+            pass  # Fall through to write.
+    with open(filepath, "w") as f:
+        f.write(content)
+    return True
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -578,10 +599,17 @@ def classify_instruction(instr: dict) -> tuple[str, str]:
     # through to ComputeStrategy.  Catch them here as a safety net.
     if "$tlast" in asm:
         return ("skipped", "doTlast_reg variant (unsupported by llvm-mc)")
-    # 4c. Cascade write is handled by CascadeStrategy; cascade read by
-    # CascadeReadStrategy.  Both are matched via the strategy chain.
+    # 4c. Cascade write stalls without a downstream consumer tile
+    # (confirmed on real NPU: batch_62 hang, 2026-03-24).  Cascade reads
+    # stall without an upstream producer.  Both need multi-tile harness.
     if "MCD" in asm:
-        return ("skipped", "cascade write (handled by CascadeStrategy)")
+        return ("skipped", "cascade write (stalls without downstream consumer)")
+    # 4d. VEXTRACT/VEXTBCST with immediate index: can't mask at runtime
+    # to avoid index-0 silicon errata (see 2026-03-24 investigation).
+    # Register-index variants are handled by post-load masking below.
+    iname = instr.get("name", "")
+    if iname.startswith(("VEXTRACT", "VEXTBCST")) and "ExtractIdxImm" in iname:
+        return ("skipped", "immediate-index extract (index-0 errata, can't mask)")
 
     operands = instr.get("operands", [])
 
@@ -1435,32 +1463,66 @@ def generate_test_point(
         lines.extend(load_lines)
         cur_in_offset += _operand_size(op, name)
 
+    # NOP sled before masking/instruction: must cover load pipeline latency.
+    # AIE2 lda/vlda latency is 7 cycles (from AIE2Schedule.td).
+    # IMPORTANT: the sled must come BEFORE the index masking below, because
+    # the index register is loaded via `lda` and AIE2 has no scoreboard --
+    # masking before the load pipeline drains reads stale register values.
+    lines.extend(_nop_sled(LOAD_LATENCY))
+
     # Mask VEXTRACT/VINSERT/VEXTBCST index registers to valid element range.
     # Unbounded indices from random test data cause hardware hangs (TDR).
-    # Note: VEXTRACT still hangs on HW even with bounded indices (see batch
-    # 35/36 investigation). The masking is retained for correctness when/if
-    # the root cause is found.
     if name.startswith(("VEXTRACT", "VINSERT", "VEXTBCST")):
-        # Determine max valid index from element size suffix.
-        if any(name.endswith(s) for s in ("_D64", "_S64", "64")):
-            max_idx = 3   # 4 x 64-bit elements
-        elif any(name.endswith(s) for s in ("_D32", "_S32", "32")):
-            max_idx = 7   # 8 x 32-bit elements
-        elif any(name.endswith(s) for s in ("_D16", "_S16", "16")):
-            max_idx = 15  # 16 x 16-bit elements
+        # Determine max valid index from element size in instruction name.
+        # Names like VEXTBCST_64_mRm, VEXTRACT_D32, etc. -- match the
+        # size component anywhere in the name, not just at the end.
+        if "_64" in name or "_D64" in name or "_S64" in name:
+            max_idx = 7   # 8 x 64-bit elements in 512-bit vector
+        elif "_32" in name or "_D32" in name or "_S32" in name:
+            max_idx = 15  # 16 x 32-bit elements
+        elif "_16" in name or "_D16" in name or "_S16" in name:
+            max_idx = 31  # 32 x 16-bit elements
         else:
-            max_idx = 31  # 32 x 8-bit elements
-        # Find the index register: operand named "idx" with ERS4 kind.
+            max_idx = 63  # 64 x 8-bit elements
+        # Find the index register: operand named "idx" with ERS4 or scalar kind.
+        # VEXTRACT uses ERS4; VEXTBCST uses scalar. Both need masking.
         idx_op = op_by_name.get("idx", {})
-        if idx_op.get("register_kind") in ("ERS4",):
+        if idx_op.get("register_kind") in ("ERS4", "scalar"):
             idx_reg = regs.get("idx", "r16")
             # AIE2 AND is register-only; load mask into r14 first.
             lines.append(f"  mov r14, #{max_idx}")
             lines.append(f"  and {idx_reg}, {idx_reg}, r14")
+            # VEXTRACT/VEXTBCST index-0 errata: element index 0 after
+            # vlda permanently stalls the AIE2 core (Phoenix NPU, confirmed
+            # 2026-03-24).  OR with 1 ensures the index is always >= 1.
+            # This sacrifices even-index coverage but avoids the hang.
+            # See docs/investigations/2026-03-24-vextract-index0-hang.md.
+            if name.startswith(("VEXTRACT", "VEXTBCST")):
+                lines.append(f"  mov r14, #1")
+                lines.append(f"  or {idx_reg}, {idx_reg}, r14")
 
-    # NOP sled before instruction: must cover load pipeline latency.
-    # AIE2 lda/vlda latency is 7 cycles (from AIE2Schedule.td).
-    lines.extend(_nop_sled(LOAD_LATENCY))
+    # Mask VSHIFT/VSHIFT_ALIGN shift amount to valid byte range (1-63).
+    # The shift operand is a scalar register loaded from random 32-bit data.
+    # Out-of-range values (>=64) produce all-zero output on real hardware.
+    # OR with 1 avoids shift=0 which triggers a stall errata on Phoenix
+    # (same class as vextract index-0, see 2026-03-24 investigation).
+    if name.startswith("VSHIFT"):
+        shift_op = op_by_name.get("shift", {})
+        if shift_op.get("register_kind") == "scalar":
+            shift_reg = regs.get("shift", "r0")
+            lines.append(f"  mov r14, #63")
+            lines.append(f"  and {shift_reg}, {shift_reg}, r14")
+            lines.append(f"  mov r14, #1")
+            lines.append(f"  or {shift_reg}, {shift_reg}, r14")
+
+    # VSHUFFLE mod=0 errata: same class of stall as vextract/vshift at 0.
+    # OR with 1 ensures the mode register is never zero.
+    if name.startswith("VSHUFFLE"):
+        mod_op = op_by_name.get("mod", {})
+        if mod_op.get("register_kind") == "scalar":
+            mod_reg = regs.get("mod", "r0")
+            lines.append(f"  mov r14, #1")
+            lines.append(f"  or {mod_reg}, {mod_reg}, r14")
 
     # The instruction itself.
     asm_line = "  " + _substitute_asm(instr["asm_string"], regs,
@@ -2601,19 +2663,20 @@ class FifoLoadStrategy(TestStrategy):
 class CascadeStrategy(TestStrategy):
     """Tests cascade write instruction (vmov MCD, $src).
 
-    Cascade writes push data to the MCD FIFO (depth 4).  A single write
-    completes without stalling even if no downstream tile is consuming.
-    Marker-based verification proves execution completed.
+    Cascade writes push data to the MCD FIFO.  However, without a
+    downstream consumer tile connected via aie.cascade_flow, even a
+    single write stalls the core indefinitely (confirmed on real NPU --
+    batch_62 hang investigation, 2026-03-24).  Cascade writes therefore
+    cannot be tested in single-tile harness batches.
 
-    Cascade READS (vmov $dst, SCD / vmov.hi / vmov.lo) stall without
-    data from a neighboring tile and are rejected here.  Multi-tile
-    infrastructure is needed to test them.
+    Both cascade WRITES and READS are rejected here.  Multi-tile
+    cascade_pair infrastructure (CascadeReadStrategy) is needed.
     """
 
     def can_test(self, instr: dict) -> tuple[bool, str]:
         asm = instr.get("asm_string", "")
         if "MCD" in asm:
-            return (True, "")
+            return (False, "cascade write (stalls without downstream consumer)")
         if "SCD" in asm:
             return (False, "cascade read (stalls without neighboring tile)")
         return (False, "not a cascade instruction")
@@ -3738,6 +3801,286 @@ class PaddaSpStrategy(TestStrategy):
 
 
 # ---------------------------------------------------------------------------
+# VmacStrategy: tests MAC/MUL instructions with valid config words
+# ---------------------------------------------------------------------------
+
+# All MAC-family mnemonics that use a config register ($c operand).
+# These all use the vmac_*_core encoding in AIE2.
+_VMAC_MNEMONICS = frozenset({
+    "vmac", "vmac.f", "vmul", "vmul.f",
+    "vaddmac", "vaddmac.f", "vsubmac",
+    "vaddmsc", "vaddmsc.f", "vsubmsc",
+    "vmsc", "vmsc.f",
+    "vnegmac", "vnegmsc", "vnegmul", "vnegmul.f",
+})
+
+
+def _make_vmac_config(amode: int, bmode: int, variant: int,
+                      sgn_x: int, sgn_y: int, zero_acc: int,
+                      sub0: int = 0) -> int:
+    """Build a MAC config word from individual fields.
+
+    Bit layout (from aietools python_model/model/mulmac.py):
+        bit 0:     zero_acc  (1 = clear accumulator before multiply)
+        bits 1-2:  amode     (0=acc32, 1=acc64, 2=bf16)
+        bits 3-4:  bmode     (element type pair: 0=8x8, 1=16x16, 2=32x32, 3=bf16)
+        bits 5-7:  variant   (0=dense, 1=sparse narrow, 2=sparse wide)
+        bit 8:     sgn_y     (1=signed Y input)
+        bit 9:     sgn_x     (1=signed X input)
+        bit 11:    sub0      (1=subtract mode)
+    """
+    return ((zero_acc << 0) | (amode << 1) | (bmode << 3) | (variant << 5)
+            | (sgn_y << 8) | (sgn_x << 9) | (sub0 << 11))
+
+
+def _vmac_configs_for_instr(name: str) -> list[int]:
+    """Return valid config words for a MAC instruction encoding name.
+
+    The encoding name (e.g., "VMAC_vmac_cm_core_dense") tells us:
+      - cm_core vs bm_core: accumulator mode (amode)
+      - _F_ prefix: floating-point (bf16) mode
+      - dense/sparse_narrow/sparse_wide: variant
+
+    We generate a small set of configs covering the main element type
+    geometries.  All use zero_acc=1 (clear accumulator, so the output is
+    purely from the multiply -- easier to verify).
+
+    Args:
+        name: ISA instruction name (e.g., "VMAC_vmac_cm_core_dense").
+
+    Returns:
+        List of valid config word integers.
+    """
+    name_upper = name.upper()
+
+    # Determine variant from encoding name.
+    if "SPARSE_WIDE" in name_upper:
+        variant = 2
+    elif "SPARSE_NARROW" in name_upper:
+        variant = 1
+    else:
+        variant = 0  # dense
+
+    # Determine if this is a floating-point (bf16) instruction.
+    # The _F_ prefix in the ISA name (e.g., VMAC_F_vmac_bm_core_dense)
+    # or .f mnemonic suffix indicates bf16 mode.
+    is_float = "_F_" in name_upper
+
+    # Determine accumulator width from encoding name.
+    is_cm = "CM_CORE" in name_upper  # 1024-bit full accumulator (acc64)
+    is_bm = "BM_CORE" in name_upper  # 512-bit half accumulator (acc32)
+
+    configs = []
+
+    if is_float:
+        # bf16 mode: amode=2, bmode=3 always.
+        # Signedness bits are don't-care for bf16 (IEEE sign in the data).
+        configs.append(_make_vmac_config(
+            amode=2, bmode=3, variant=variant,
+            sgn_x=0, sgn_y=0, zero_acc=1))
+    elif is_cm:
+        # acc64 integer: amode=1.
+        # Generate configs for common element type pairs.
+        for bmode in (0, 1):  # 8x8->64, 16x16->64
+            for sgn_x, sgn_y in ((1, 1), (0, 0)):  # signed-signed, unsigned-unsigned
+                configs.append(_make_vmac_config(
+                    amode=1, bmode=bmode, variant=variant,
+                    sgn_x=sgn_x, sgn_y=sgn_y, zero_acc=1))
+    elif is_bm:
+        # acc32 integer: amode=0.
+        for bmode in (0, 1):  # 8x8->32, 16x16->32
+            for sgn_x, sgn_y in ((1, 1), (0, 0)):
+                configs.append(_make_vmac_config(
+                    amode=0, bmode=bmode, variant=variant,
+                    sgn_x=sgn_x, sgn_y=sgn_y, zero_acc=1))
+    else:
+        # Fallback: signed 16x16, acc64, dense.
+        configs.append(_make_vmac_config(
+            amode=1, bmode=1, variant=variant,
+            sgn_x=1, sgn_y=1, zero_acc=1))
+
+    return configs
+
+
+class VmacStrategy(TestStrategy):
+    """Tests MAC/MUL instructions with valid config words.
+
+    MAC instructions (vmac, vmul, vaddmac, vsubmac, vnegmac, etc.) take a
+    scalar config register ($c) that controls tile geometry, element types,
+    signedness, and accumulate mode.  Without a valid config word, the
+    hardware produces undefined results.
+
+    This strategy:
+    1. Detects MAC instructions by mnemonic.
+    2. Generates combos with valid config words derived from the encoding name.
+    3. Injects `mov rN, #config_word` before the instruction to set the
+       config register to a known-valid value (overriding random test data).
+    """
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        mnemonic = instr.get("mnemonic", "")
+        if mnemonic not in _VMAC_MNEMONICS:
+            return (False, "not a MAC instruction")
+
+        # Delegate to ComputeStrategy for the base testability check
+        # (operand types, output detection, etc.).
+        if _is_sp_relative(instr):
+            return (False, "SP-relative MAC (unexpected)")
+        status, reason = classify_instruction(instr)
+        if status != "testable":
+            return (False, reason)
+
+        return (True, "")
+
+    def _find_config_operand(self, instr: dict) -> Optional[str]:
+        """Find the config register operand name (usually 'c')."""
+        for op in instr.get("operands", []):
+            if op["name"] == "c" and op.get("register_kind") == "scalar":
+                return "c"
+        return None
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        """Generate combos that pair register assignments with valid configs.
+
+        For each valid config word, generate one combo with default registers.
+        The config word is stored in the combo under key '_vmac_config' (an
+        internal key that generate_test_point picks up for the mov init).
+        """
+        # Get base register combos (just the baseline -- all defaults).
+        base_combos = generate_operand_combos(instr)
+        if not base_combos:
+            return []
+
+        # Use only the baseline register assignment (combo 0 = all defaults).
+        baseline = base_combos[0]
+
+        # Get valid config words for this instruction.
+        configs = _vmac_configs_for_instr(instr["name"])
+        if not configs:
+            return base_combos  # Fallback: no special config handling.
+
+        # Generate one combo per config word, all using baseline registers.
+        combos = []
+        for cfg in configs:
+            combo = dict(baseline)
+            combo["_vmac_config"] = cfg
+            combos.append(combo)
+
+        return combos
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
+        """Generate test point with config register initialization.
+
+        Injects a `mov rN, #config_word` sequence after input loads but
+        before the instruction execution, overriding whatever random data
+        was loaded into the config register.
+        """
+        lines = []
+        name = instr["name"]
+        config_val = regs.get("_vmac_config", 0)
+        lines.append(f"  // ---- test (vmac): {name} config=0x{config_val:x} ----")
+
+        # Build lookup: operand name -> operand dict.
+        op_by_name = {op["name"]: op for op in instr.get("operands", [])}
+
+        # Detect outputs.
+        outputs = detect_output_operands(instr)
+        output_names = {op["name"] for op in outputs}
+
+        # Determine inputs from asm_string order.
+        asm_op_names = re.findall(r'\$(\w+)', instr.get("asm_string", ""))
+
+        # Load input registers from [p0, #offset].
+        cur_in_offset = in_offset
+        for op_name in asm_op_names:
+            if op_name in output_names:
+                continue
+            if op_name not in op_by_name:
+                continue
+            op = op_by_name[op_name]
+            kind = _effective_kind(op)
+            if not kind:
+                continue
+            if kind not in KNOWN_REGISTER_KINDS:
+                continue
+            # Skip the config register -- we'll set it via mov.
+            if op_name == "c":
+                continue
+            align = 32 if kind in ("vector256", "vector512", "accumulator",
+                                    "wide_y", "sparse_qx", "quad") else 4
+            cur_in_offset = _align(cur_in_offset, align)
+            reg = regs.get(op_name, "r0")
+            load_lines = _load_instruction(reg, kind, "p0", cur_in_offset)
+            lines.extend(load_lines)
+            cur_in_offset += _operand_size(op, name)
+
+        # NOP sled for load pipeline latency.
+        lines.extend(_nop_sled(LOAD_LATENCY))
+
+        # Initialize the config register with a valid config word.
+        # The config register is a scalar (typically r0), so we use movxm
+        # to load the full 20-bit immediate (mov only supports 10-bit).
+        config_reg = regs.get("c", "r0")
+        if config_val <= 0x1FF:
+            # Small enough for mov immediate (10-bit signed, but config
+            # values are always positive and fit in 9 unsigned bits).
+            lines.append(f"  mov {config_reg}, #{config_val}")
+        else:
+            # Use movxm for larger values (20-bit immediate).
+            lines.append(f"  movxm {config_reg}, #{config_val}")
+
+        # The instruction itself.
+        asm_line = "  " + _substitute_asm(instr["asm_string"], regs,
+                                          has_modifier=_has_modifier_operand(instr))
+        lines.append(asm_line)
+
+        # NOP sled after instruction: must cover result latency.
+        lines.extend(_nop_sled(result_latency(instr)))
+
+        # Store output registers to [p1, #offset].
+        cur_out_offset = out_offset
+        for op in outputs:
+            kind = _effective_kind(op) or op.get("register_kind", "")
+            align = 32 if kind in ("vector256", "vector512", "accumulator",
+                                    "wide_y", "sparse_qx", "quad") else 4
+            cur_out_offset = _align(cur_out_offset, align)
+            reg = regs.get(op["name"], "r0")
+            store_lines = _store_instruction(reg, kind, "p1", cur_out_offset)
+            lines.extend(store_lines)
+            cur_out_offset += _operand_size(op, name)
+
+        lines.append("")
+        return "\n".join(lines)
+
+    def compute_input_size(self, instr, regs):
+        """Input size excludes the config register (set via mov, not loaded)."""
+        operands = instr.get("operands", [])
+        op_by_name = {op["name"]: op for op in operands}
+        outputs = detect_output_operands(instr)
+        output_names = {op["name"] for op in outputs}
+        asm_op_names = re.findall(r'\$(\w+)', instr.get("asm_string", ""))
+        instr_name = instr.get("name", "")
+
+        total = 0
+        for op_name in asm_op_names:
+            if op_name in output_names:
+                continue
+            if op_name not in op_by_name:
+                continue
+            if op_name == "c":
+                continue  # Config register not loaded from buffer.
+            op = op_by_name[op_name]
+            kind = _effective_kind(op)
+            if not kind or kind not in KNOWN_REGISTER_KINDS:
+                continue
+            align = 32 if kind in ("vector256", "vector512", "accumulator",
+                                    "wide_y", "sparse_qx", "quad") else 4
+            total = _align(total, align)
+            total += _operand_size(op, instr_name)
+        return max(4, total)
+
+
+# ---------------------------------------------------------------------------
 # Strategy Dispatch
 # ---------------------------------------------------------------------------
 
@@ -3762,6 +4105,7 @@ STRATEGIES: list[TestStrategy] = [
     PaddaSpStrategy(),
     LoadStrategy(),
     StoreStrategy(),
+    VmacStrategy(),         # must be before ComputeStrategy
     ComputeStrategy(),
 ]
 
@@ -4075,8 +4419,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         filename = f"batch_{batch_idx:03d}.s"
         filepath = os.path.join(out_dir, filename)
         program = build_mega_program(batch_asm)
-        with open(filepath, "w") as f:
-            f.write(program)
+        write_if_changed(filepath, program)
 
         batches.append({
             "batch_index": batch_idx,
@@ -4097,8 +4440,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         ll_content = generate_conversion_ll(conv_test_points)
         ll_filename = f"batch_{batch_idx:03d}.ll"
         ll_filepath = os.path.join(out_dir, ll_filename)
-        with open(ll_filepath, "w") as f:
-            f.write(ll_content)
+        write_if_changed(ll_filepath, ll_content)
 
         # Build metadata for each conversion test point.
         conv_meta = []
@@ -4154,8 +4496,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     branch_ll, branch_meta, branch_in, branch_out = generate_branch_ll()
     branch_filename = f"batch_{batch_idx:03d}.ll"
     branch_filepath = os.path.join(out_dir, branch_filename)
-    with open(branch_filepath, "w") as f:
-        f.write(branch_ll)
+    write_if_changed(branch_filepath, branch_ll)
 
     batches.append({
         "batch_index": batch_idx,
@@ -4183,10 +4524,8 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         prod_filename = f"batch_{batch_idx:03d}_producer.s"
         cons_filename = f"batch_{batch_idx:03d}_consumer.s"
 
-        with open(os.path.join(out_dir, prod_filename), "w") as f:
-            f.write(prod_program)
-        with open(os.path.join(out_dir, cons_filename), "w") as f:
-            f.write(cons_program)
+        write_if_changed(os.path.join(out_dir, prod_filename), prod_program)
+        write_if_changed(os.path.join(out_dir, cons_filename), cons_program)
 
         batches.append({
             "batch_index": batch_idx,
@@ -4234,10 +4573,8 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         prod_filename = f"batch_{batch_idx:03d}_producer.s"
         cons_filename = f"batch_{batch_idx:03d}_consumer.s"
 
-        with open(os.path.join(out_dir, prod_filename), "w") as f:
-            f.write(prod_program)
-        with open(os.path.join(out_dir, cons_filename), "w") as f:
-            f.write(cons_program)
+        write_if_changed(os.path.join(out_dir, prod_filename), prod_program)
+        write_if_changed(os.path.join(out_dir, cons_filename), cons_program)
 
         batches.append({
             "batch_index": batch_idx,
@@ -4288,9 +4625,11 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         "batches": batches,
     }
     manifest_path = os.path.join(out_dir, "manifest.json")
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2)
-        f.write("\n")
+    manifest_content = json.dumps(manifest, indent=2) + "\n"
+    if not write_if_changed(manifest_path, manifest_content):
+        # Content unchanged, but touch the mtime so the staleness check
+        # in isa-test.sh knows we verified the output is current.
+        os.utime(manifest_path)
 
     return manifest
 
