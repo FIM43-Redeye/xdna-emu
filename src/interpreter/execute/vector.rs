@@ -2139,6 +2139,9 @@ impl VectorAlu {
     /// Absolute value if greater than zero: dst[i] = (src[i] > 0) ? abs(src[i]) : src[i]
     /// For positive values, abs() is identity, so this is really just a pass-through.
     /// Used for ReLU-like activations where only positive values are preserved as-is.
+    /// Absolute value.  The GTZ suffix describes comparison flags written to
+    /// the `cmp` register, NOT a condition on the primary result.  The primary
+    /// output is always abs(s).
     fn vector_abs_gtz(src: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
         let mut result = [0u32; 8];
 
@@ -2146,28 +2149,25 @@ impl VectorAlu {
             ElementType::Int32 | ElementType::Int64 => {
                 for i in 0..8 {
                     let val = src[i] as i32;
-                    // If val > 0, abs(val) = val (since val is positive)
-                    // If val <= 0, keep val unchanged
-                    result[i] = if val > 0 { val as u32 } else { src[i] };
+                    result[i] = val.wrapping_abs() as u32;
                 }
             }
             ElementType::UInt32 | ElementType::UInt64 => {
-                // Unsigned: all values are >= 0, so "greater than zero" means != 0
-                // abs() is identity for unsigned
+                // Unsigned: abs is identity.
                 result = *src;
             }
             ElementType::Float32 => {
                 for i in 0..8 {
                     let f = f32::from_bits(src[i]);
-                    result[i] = if f > 0.0 { f.abs().to_bits() } else { src[i] };
+                    result[i] = f.abs().to_bits();
                 }
             }
             ElementType::Int16 => {
                 for i in 0..8 {
                     let lo = (src[i] & 0xFFFF) as i16;
                     let hi = ((src[i] >> 16) & 0xFFFF) as i16;
-                    let r_lo = if lo > 0 { lo as u16 } else { lo as u16 };
-                    let r_hi = if hi > 0 { hi as u16 } else { hi as u16 };
+                    let r_lo = lo.wrapping_abs() as u16;
+                    let r_hi = hi.wrapping_abs() as u16;
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -2178,8 +2178,8 @@ impl VectorAlu {
                 for i in 0..8 {
                     let lo = Self::bf16_to_f32((src[i] & 0xFFFF) as u16);
                     let hi = Self::bf16_to_f32(((src[i] >> 16) & 0xFFFF) as u16);
-                    let r_lo = if lo > 0.0 { Self::f32_to_bf16(lo.abs()) } else { (src[i] & 0xFFFF) as u16 };
-                    let r_hi = if hi > 0.0 { Self::f32_to_bf16(hi.abs()) } else { ((src[i] >> 16) & 0xFFFF) as u16 };
+                    let r_lo = Self::f32_to_bf16(lo.abs());
+                    let r_hi = Self::f32_to_bf16(hi.abs());
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -2188,7 +2188,7 @@ impl VectorAlu {
                     let mut r = 0u32;
                     for j in 0..4 {
                         let byte = ((src[i] >> (j * 8)) & 0xFF) as i8;
-                        let r_byte = if byte > 0 { byte as u8 } else { byte as u8 };
+                        let r_byte = byte.wrapping_abs() as u8;
                         r |= (r_byte as u32) << (j * 8);
                     }
                     result[i] = r;
@@ -2202,7 +2202,9 @@ impl VectorAlu {
         result
     }
 
-    /// Negate if greater than zero: dst[i] = (src[i] > 0) ? -src[i] : src[i]
+    /// Unconditional negate.  The GTZ suffix describes comparison flags written
+    /// to the `cmp` register, NOT a condition on the primary result.  The
+    /// primary output is always -s.
     fn vector_neg_gtz(src: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
         let mut result = [0u32; 8];
 
@@ -2210,27 +2212,26 @@ impl VectorAlu {
             ElementType::Int32 | ElementType::Int64 => {
                 for i in 0..8 {
                     let val = src[i] as i32;
-                    result[i] = if val > 0 { (-val) as u32 } else { src[i] };
+                    result[i] = val.wrapping_neg() as u32;
                 }
             }
             ElementType::UInt32 | ElementType::UInt64 => {
-                // For unsigned, "negate" wraps around
                 for i in 0..8 {
-                    result[i] = if src[i] > 0 { 0u32.wrapping_sub(src[i]) } else { src[i] };
+                    result[i] = 0u32.wrapping_sub(src[i]);
                 }
             }
             ElementType::Float32 => {
                 for i in 0..8 {
-                    let f = f32::from_bits(src[i]);
-                    result[i] = if f > 0.0 { (-f).to_bits() } else { src[i] };
+                    // Flip sign bit.
+                    result[i] = src[i] ^ 0x8000_0000;
                 }
             }
             ElementType::Int16 => {
                 for i in 0..8 {
                     let lo = (src[i] & 0xFFFF) as i16;
                     let hi = ((src[i] >> 16) & 0xFFFF) as i16;
-                    let r_lo = if lo > 0 { (-lo) as u16 } else { lo as u16 };
-                    let r_hi = if hi > 0 { (-hi) as u16 } else { hi as u16 };
+                    let r_lo = lo.wrapping_neg() as u16;
+                    let r_hi = hi.wrapping_neg() as u16;
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -2238,18 +2239,15 @@ impl VectorAlu {
                 for i in 0..8 {
                     let lo = (src[i] & 0xFFFF) as u16;
                     let hi = ((src[i] >> 16) & 0xFFFF) as u16;
-                    let r_lo = if lo > 0 { 0u16.wrapping_sub(lo) } else { lo };
-                    let r_hi = if hi > 0 { 0u16.wrapping_sub(hi) } else { hi };
+                    let r_lo = 0u16.wrapping_sub(lo);
+                    let r_hi = 0u16.wrapping_sub(hi);
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
             ElementType::BFloat16 => {
                 for i in 0..8 {
-                    let lo = Self::bf16_to_f32((src[i] & 0xFFFF) as u16);
-                    let hi = Self::bf16_to_f32(((src[i] >> 16) & 0xFFFF) as u16);
-                    let r_lo = if lo > 0.0 { Self::f32_to_bf16(-lo) } else { (src[i] & 0xFFFF) as u16 };
-                    let r_hi = if hi > 0.0 { Self::f32_to_bf16(-hi) } else { ((src[i] >> 16) & 0xFFFF) as u16 };
-                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
+                    // Flip sign bits for bf16 elements.
+                    result[i] = src[i] ^ 0x8000_8000;
                 }
             }
             ElementType::Int8 => {
@@ -2257,7 +2255,7 @@ impl VectorAlu {
                     let mut r = 0u32;
                     for j in 0..4 {
                         let byte = ((src[i] >> (j * 8)) & 0xFF) as i8;
-                        let r_byte = if byte > 0 { (-byte) as u8 } else { byte as u8 };
+                        let r_byte = byte.wrapping_neg() as u8;
                         r |= (r_byte as u32) << (j * 8);
                     }
                     result[i] = r;
@@ -2268,7 +2266,7 @@ impl VectorAlu {
                     let mut r = 0u32;
                     for j in 0..4 {
                         let byte = ((src[i] >> (j * 8)) & 0xFF) as u8;
-                        let r_byte = if byte > 0 { 0u8.wrapping_sub(byte) } else { byte };
+                        let r_byte = 0u8.wrapping_sub(byte);
                         r |= (r_byte as u32) << (j * 8);
                     }
                     result[i] = r;
@@ -2416,66 +2414,14 @@ impl VectorAlu {
         result
     }
 
-    fn vector_neg_ltz(src: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
+    /// Bitwise NOT (VBNEG_LTZ).  The "B" prefix means "bitwise", matching
+    /// VBAND/VBOR.  The LTZ suffix describes comparison flags written to
+    /// the `cmp` register.  The primary output is always ~s.
+    fn vector_neg_ltz(src: &[u32; 8], _elem_type: ElementType) -> [u32; 8] {
         let mut result = [0u32; 8];
-
-        match elem_type {
-            ElementType::Int32 | ElementType::Int64 => {
-                for i in 0..8 {
-                    let val = src[i] as i32;
-                    // Hardware saturates: abs(MIN) = MAX (not overflow).
-                    result[i] = val.saturating_abs() as u32;
-                }
-            }
-            ElementType::UInt32 | ElementType::UInt64 => {
-                // Unsigned values are never < 0, so pass through
-                result = *src;
-            }
-            ElementType::Float32 => {
-                for i in 0..8 {
-                    let f = f32::from_bits(src[i]);
-                    result[i] = f.abs().to_bits();
-                }
-            }
-            ElementType::Int16 => {
-                for i in 0..8 {
-                    let lo = (src[i] & 0xFFFF) as i16;
-                    let hi = ((src[i] >> 16) & 0xFFFF) as i16;
-                    // Hardware saturates: abs(-32768) = 32767.
-                    let r_lo = lo.saturating_abs() as u16;
-                    let r_hi = hi.saturating_abs() as u16;
-                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
-                }
-            }
-            ElementType::UInt16 => {
-                result = *src;
-            }
-            ElementType::BFloat16 => {
-                for i in 0..8 {
-                    let lo = Self::bf16_to_f32((src[i] & 0xFFFF) as u16);
-                    let hi = Self::bf16_to_f32(((src[i] >> 16) & 0xFFFF) as u16);
-                    let r_lo = Self::f32_to_bf16(lo.abs());
-                    let r_hi = Self::f32_to_bf16(hi.abs());
-                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
-                }
-            }
-            ElementType::Int8 => {
-                for i in 0..8 {
-                    let mut r = 0u32;
-                    for j in 0..4 {
-                        let byte = ((src[i] >> (j * 8)) & 0xFF) as i8;
-                        // Hardware saturates: abs(-128) = 127.
-                        let r_byte = byte.saturating_abs() as u8;
-                        r |= (r_byte as u32) << (j * 8);
-                    }
-                    result[i] = r;
-                }
-            }
-            ElementType::UInt8 => {
-                result = *src;
-            }
+        for i in 0..8 {
+            result[i] = !src[i];
         }
-
         result
     }
 
@@ -2952,134 +2898,46 @@ impl VectorAlu {
     // ========== Vector Conditional Arithmetic Implementations ==========
 
     /// Subtract if less-than: dst[i] = (a[i] < b[i]) ? a[i] - b[i] : a[i]
+    /// Unconditional subtraction: d = a - b.  The LT suffix describes
+    /// comparison flags written to the `cmp` register, NOT a condition on
+    /// the subtraction.
     fn vector_sub_lt(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
-        let mut result = [0u32; 8];
-
-        match elem_type {
-            ElementType::Int32 | ElementType::Int64 => {
-                for i in 0..8 {
-                    let va = a[i] as i32;
-                    let vb = b[i] as i32;
-                    result[i] = if va < vb { va.wrapping_sub(vb) as u32 } else { a[i] };
-                }
-            }
-            ElementType::UInt32 | ElementType::UInt64 => {
-                for i in 0..8 {
-                    result[i] = if a[i] < b[i] { a[i].wrapping_sub(b[i]) } else { a[i] };
-                }
-            }
-            ElementType::Float32 => {
-                for i in 0..8 {
-                    let fa = f32::from_bits(a[i]);
-                    let fb = f32::from_bits(b[i]);
-                    result[i] = if fa < fb { (fa - fb).to_bits() } else { a[i] };
-                }
-            }
-            ElementType::Int16 => {
-                for i in 0..8 {
-                    let a_lo = (a[i] & 0xFFFF) as i16;
-                    let a_hi = ((a[i] >> 16) & 0xFFFF) as i16;
-                    let b_lo = (b[i] & 0xFFFF) as i16;
-                    let b_hi = ((b[i] >> 16) & 0xFFFF) as i16;
-                    let r_lo = if a_lo < b_lo { a_lo.wrapping_sub(b_lo) as u16 } else { a_lo as u16 };
-                    let r_hi = if a_hi < b_hi { a_hi.wrapping_sub(b_hi) as u16 } else { a_hi as u16 };
-                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
-                }
-            }
-            ElementType::UInt16 => {
-                for i in 0..8 {
-                    let a_lo = (a[i] & 0xFFFF) as u16;
-                    let a_hi = ((a[i] >> 16) & 0xFFFF) as u16;
-                    let b_lo = (b[i] & 0xFFFF) as u16;
-                    let b_hi = ((b[i] >> 16) & 0xFFFF) as u16;
-                    let r_lo = if a_lo < b_lo { a_lo.wrapping_sub(b_lo) } else { a_lo };
-                    let r_hi = if a_hi < b_hi { a_hi.wrapping_sub(b_hi) } else { a_hi };
-                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
-                }
-            }
-            ElementType::BFloat16 => {
-                for i in 0..8 {
-                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
-                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
-                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
-                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
-                    let r_lo = if a_lo < b_lo { Self::f32_to_bf16(a_lo - b_lo) } else { (a[i] & 0xFFFF) as u16 };
-                    let r_hi = if a_hi < b_hi { Self::f32_to_bf16(a_hi - b_hi) } else { ((a[i] >> 16) & 0xFFFF) as u16 };
-                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
-                }
-            }
-            ElementType::Int8 => {
-                for i in 0..8 {
-                    let mut r = 0u32;
-                    for j in 0..4 {
-                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as i8;
-                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as i8;
-                        let r_byte = if a_byte < b_byte { a_byte.wrapping_sub(b_byte) as u8 } else { a_byte as u8 };
-                        r |= (r_byte as u32) << (j * 8);
-                    }
-                    result[i] = r;
-                }
-            }
-            ElementType::UInt8 => {
-                for i in 0..8 {
-                    let mut r = 0u32;
-                    for j in 0..4 {
-                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as u8;
-                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as u8;
-                        let r_byte = if a_byte < b_byte { a_byte.wrapping_sub(b_byte) } else { a_byte };
-                        r |= (r_byte as u32) << (j * 8);
-                    }
-                    result[i] = r;
-                }
-            }
-        }
-
-        result
+        Self::vector_sub_unconditional(a, b, elem_type)
     }
 
-    /// Subtract if greater-or-equal: dst[i] = (a[i] >= b[i]) ? a[i] - b[i] : a[i]
+    /// Unconditional subtraction: d = a - b.  The GE suffix describes
+    /// comparison flags written to the `cmp` register, NOT a condition on
+    /// the subtraction.
     fn vector_sub_ge(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
+        Self::vector_sub_unconditional(a, b, elem_type)
+    }
+
+    /// Shared unconditional subtraction for vsub_lt / vsub_ge.
+    fn vector_sub_unconditional(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
         let mut result = [0u32; 8];
 
         match elem_type {
-            ElementType::Int32 | ElementType::Int64 => {
+            ElementType::Int32 | ElementType::UInt32
+            | ElementType::Int64 | ElementType::UInt64 => {
                 for i in 0..8 {
-                    let va = a[i] as i32;
-                    let vb = b[i] as i32;
-                    result[i] = if va >= vb { va.wrapping_sub(vb) as u32 } else { a[i] };
-                }
-            }
-            ElementType::UInt32 | ElementType::UInt64 => {
-                for i in 0..8 {
-                    result[i] = if a[i] >= b[i] { a[i].wrapping_sub(b[i]) } else { a[i] };
+                    result[i] = a[i].wrapping_sub(b[i]);
                 }
             }
             ElementType::Float32 => {
                 for i in 0..8 {
                     let fa = f32::from_bits(a[i]);
                     let fb = f32::from_bits(b[i]);
-                    result[i] = if fa >= fb { (fa - fb).to_bits() } else { a[i] };
+                    result[i] = (fa - fb).to_bits();
                 }
             }
-            ElementType::Int16 => {
-                for i in 0..8 {
-                    let a_lo = (a[i] & 0xFFFF) as i16;
-                    let a_hi = ((a[i] >> 16) & 0xFFFF) as i16;
-                    let b_lo = (b[i] & 0xFFFF) as i16;
-                    let b_hi = ((b[i] >> 16) & 0xFFFF) as i16;
-                    let r_lo = if a_lo >= b_lo { a_lo.wrapping_sub(b_lo) as u16 } else { a_lo as u16 };
-                    let r_hi = if a_hi >= b_hi { a_hi.wrapping_sub(b_hi) as u16 } else { a_hi as u16 };
-                    result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
-                }
-            }
-            ElementType::UInt16 => {
+            ElementType::Int16 | ElementType::UInt16 => {
                 for i in 0..8 {
                     let a_lo = (a[i] & 0xFFFF) as u16;
                     let a_hi = ((a[i] >> 16) & 0xFFFF) as u16;
                     let b_lo = (b[i] & 0xFFFF) as u16;
                     let b_hi = ((b[i] >> 16) & 0xFFFF) as u16;
-                    let r_lo = if a_lo >= b_lo { a_lo.wrapping_sub(b_lo) } else { a_lo };
-                    let r_hi = if a_hi >= b_hi { a_hi.wrapping_sub(b_hi) } else { a_hi };
+                    let r_lo = a_lo.wrapping_sub(b_lo);
+                    let r_hi = a_hi.wrapping_sub(b_hi);
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -3089,30 +2947,18 @@ impl VectorAlu {
                     let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
                     let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
                     let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
-                    let r_lo = if a_lo >= b_lo { Self::f32_to_bf16(a_lo - b_lo) } else { (a[i] & 0xFFFF) as u16 };
-                    let r_hi = if a_hi >= b_hi { Self::f32_to_bf16(a_hi - b_hi) } else { ((a[i] >> 16) & 0xFFFF) as u16 };
+                    let r_lo = Self::f32_to_bf16(a_lo - b_lo);
+                    let r_hi = Self::f32_to_bf16(a_hi - b_hi);
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
-            ElementType::Int8 => {
-                for i in 0..8 {
-                    let mut r = 0u32;
-                    for j in 0..4 {
-                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as i8;
-                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as i8;
-                        let r_byte = if a_byte >= b_byte { a_byte.wrapping_sub(b_byte) as u8 } else { a_byte as u8 };
-                        r |= (r_byte as u32) << (j * 8);
-                    }
-                    result[i] = r;
-                }
-            }
-            ElementType::UInt8 => {
+            ElementType::Int8 | ElementType::UInt8 => {
                 for i in 0..8 {
                     let mut r = 0u32;
                     for j in 0..4 {
                         let a_byte = ((a[i] >> (j * 8)) & 0xFF) as u8;
                         let b_byte = ((b[i] >> (j * 8)) & 0xFF) as u8;
-                        let r_byte = if a_byte >= b_byte { a_byte.wrapping_sub(b_byte) } else { a_byte };
+                        let r_byte = a_byte.wrapping_sub(b_byte);
                         r |= (r_byte as u32) << (j * 8);
                     }
                     result[i] = r;

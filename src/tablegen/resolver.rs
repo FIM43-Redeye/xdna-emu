@@ -1194,26 +1194,40 @@ pub fn infer_semantic_from_structure(
 /// Resolved once per encoding during TableGen loading (not per decoded instruction).
 /// Returns None for instructions without an element type suffix.
 pub fn infer_element_type(mnemonic: &str) -> Option<ElementType> {
+    // AIE2 mnemonics use `.s` for signed, `.d` for unsigned (data/raw),
+    // `.u` for unsigned (less common).  Check for `.d` followed by a digit
+    // to avoid false positives on `.2d` (2D addressing) etc.
+    let has_dot_d_digit = mnemonic.contains(".d8")
+        || mnemonic.contains(".d16")
+        || mnemonic.contains(".d32")
+        || mnemonic.contains(".d64")
+        || mnemonic.contains(".d4");
+    let is_unsigned = mnemonic.contains(".u") || has_dot_d_digit;
+
     if mnemonic.ends_with("8") || mnemonic.contains(".i8") || mnemonic.contains(".u8") {
-        if mnemonic.contains(".u") {
+        if is_unsigned {
             Some(ElementType::UInt8)
         } else {
             Some(ElementType::Int8)
         }
     } else if mnemonic.ends_with("16") || mnemonic.contains(".i16") || mnemonic.contains(".u16") {
-        if mnemonic.contains(".u") {
+        // BFloat16 check before generic 16-bit: bf16 contains "16" but is float.
+        if mnemonic.contains("bf16") || mnemonic.contains(".bf") {
+            return Some(ElementType::BFloat16);
+        }
+        if is_unsigned {
             Some(ElementType::UInt16)
         } else {
             Some(ElementType::Int16)
         }
     } else if mnemonic.ends_with("32") || mnemonic.contains(".i32") || mnemonic.contains(".u32") {
-        if mnemonic.contains(".u") {
+        if is_unsigned {
             Some(ElementType::UInt32)
         } else {
             Some(ElementType::Int32)
         }
     } else if mnemonic.ends_with("64") || mnemonic.contains(".i64") || mnemonic.contains(".u64") {
-        if mnemonic.contains(".u") {
+        if is_unsigned {
             Some(ElementType::UInt64)
         } else {
             Some(ElementType::Int64)

@@ -297,20 +297,33 @@ pub fn infer_semantic_from_structure(
 
 /// Infer element type from mnemonic suffix.
 pub fn infer_element_type(mnemonic: &str) -> Option<String> {
+    // AIE2 mnemonics use `.s` for signed, `.d` for unsigned (data/raw),
+    // `.u` for unsigned (less common).  Check for `.d` followed by a digit
+    // to avoid false positives on `.2d` (2D addressing) etc.
+    let has_dot_d_digit = mnemonic.contains(".d8")
+        || mnemonic.contains(".d16")
+        || mnemonic.contains(".d32")
+        || mnemonic.contains(".d64")
+        || mnemonic.contains(".d4");
+    let is_unsigned = mnemonic.contains(".u") || has_dot_d_digit;
+
     if mnemonic.ends_with("8") || mnemonic.contains(".i8") || mnemonic.contains(".u8") {
-        if mnemonic.contains(".u") {
+        if is_unsigned {
             Some("ElementType::UInt8".to_string())
         } else {
             Some("ElementType::Int8".to_string())
         }
     } else if mnemonic.ends_with("16") || mnemonic.contains(".i16") || mnemonic.contains(".u16") {
-        if mnemonic.contains(".u") {
+        if mnemonic.contains("bf16") || mnemonic.contains(".bf") {
+            return Some("ElementType::BFloat16".to_string());
+        }
+        if is_unsigned {
             Some("ElementType::UInt16".to_string())
         } else {
             Some("ElementType::Int16".to_string())
         }
     } else if mnemonic.ends_with("32") || mnemonic.contains(".i32") || mnemonic.contains(".u32") {
-        if mnemonic.contains(".u") {
+        if is_unsigned {
             Some("ElementType::UInt32".to_string())
         } else {
             Some("ElementType::Int32".to_string())
