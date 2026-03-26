@@ -166,6 +166,85 @@ pub fn unpack_vector(
     result
 }
 
+/// Parse VPACK bit widths from encoding name.
+///
+/// VPACK_{D|S}{out}_{D|S}{in}: e.g. VPACK_D4_D8 -> (8, 4, false).
+/// Returns (bits_in, bits_out, signed).
+pub fn pack_widths_from_name(name: &str) -> (u32, u32, bool) {
+    let upper = name.to_uppercase();
+    let parts: Vec<&str> = upper.split('_').collect();
+    if parts.len() >= 3 {
+        let signed = parts[1].starts_with('S') || parts[2].starts_with('S');
+        let out_bits: u32 = parts[1][1..].parse().unwrap_or(8);
+        let in_bits: u32 = parts[2][1..].parse().unwrap_or(16);
+        (in_bits, out_bits, signed)
+    } else {
+        (16, 8, false)
+    }
+}
+
+/// Parse VUNPACK bit widths from encoding name.
+///
+/// VUNPACK_{D|S}{out}_{D|S}{in}: e.g. VUNPACK_D16_D8 -> (8, 16, false).
+/// Returns (bits_in, bits_out, signed).
+pub fn unpack_widths_from_name(name: &str) -> (u32, u32, bool) {
+    let upper = name.to_uppercase();
+    let parts: Vec<&str> = upper.split('_').collect();
+    if parts.len() >= 3 {
+        let signed = parts[1].starts_with('S') || parts[2].starts_with('S');
+        let out_bits: u32 = parts[1][1..].parse().unwrap_or(16);
+        let in_bits: u32 = parts[2][1..].parse().unwrap_or(8);
+        (in_bits, out_bits, signed)
+    } else {
+        (8, 16, false)
+    }
+}
+
+/// Pack a 256-bit half: narrow 256/bits_i lanes from bits_i to bits_o.
+///
+/// Processes one 256-bit register, treating it as 256/bits_i lanes of
+/// bits_i-width values, and packs each down to bits_o width.
+pub fn pack_half(
+    src: &[u32; 8],
+    bits_i: u32,
+    bits_o: u32,
+    signed: bool,
+    mode: PackMode,
+) -> [u32; 8] {
+    let lanes = (256 / bits_i) as usize;
+    let mut narrowed = vec![0i64; lanes];
+    for i in 0..lanes {
+        let val = extract_lane(src, i, bits_i, signed);
+        narrowed[i] = pack_lane(val, bits_i, bits_o, signed, mode);
+    }
+    let mut result = [0u32; 8];
+    insert_lanes(&mut result, &narrowed, bits_o);
+    result
+}
+
+/// Unpack lanes from a 256-bit source starting at lane_start, widening to bits_o.
+///
+/// Extracts lanes at bits_i width starting from lane_start, widens each to
+/// bits_o, and packs the results into a 256-bit output register. The number
+/// of output lanes is 256/bits_o.
+pub fn unpack_half(
+    src: &[u32; 8],
+    lane_start: usize,
+    bits_i: u32,
+    bits_o: u32,
+    signed: bool,
+) -> [u32; 8] {
+    let out_lanes = (256 / bits_o) as usize;
+    let mut widened = vec![0i64; out_lanes];
+    for i in 0..out_lanes {
+        let val = extract_lane(src, lane_start + i, bits_i, signed);
+        widened[i] = unpack_lane(val, bits_i, bits_o, signed);
+    }
+    let mut result = [0u32; 8];
+    insert_lanes(&mut result, &widened, bits_o);
+    result
+}
+
 /// Extract lane `idx` from a 256-bit (8 x u32) register at `bits` width.
 ///
 /// Handles arbitrary bit widths including those that cross u32 boundaries.
@@ -498,6 +577,83 @@ mod tests {
         for i in 0..output_lanes {
             let got = extract_lane(&result, i, 16, true);
             assert_eq!(got, vals[i], "lane {} mismatch", i);
+        }
+    }
+
+    // -- pack then unpack roundtrip --
+
+    // -- pack_widths_from_name / unpack_widths_from_name --
+
+    #[test]
+    fn test_pack_widths_from_name() {
+        // VPACK_D4_D8: input 8-bit, output 4-bit, unsigned
+        assert_eq!(pack_widths_from_name("VPACK_D4_D8"), (8, 4, false));
+        // VPACK_S8_S16: input 16-bit, output 8-bit, signed
+        assert_eq!(pack_widths_from_name("VPACK_S8_S16"), (16, 8, true));
+        // VPACK_D8_D16: input 16-bit, output 8-bit, unsigned
+        assert_eq!(pack_widths_from_name("VPACK_D8_D16"), (16, 8, false));
+        // Fallback for unrecognized format
+        assert_eq!(pack_widths_from_name("VPACK"), (16, 8, false));
+    }
+
+    #[test]
+    fn test_unpack_widths_from_name() {
+        // VUNPACK_D16_D8: input 8-bit, output 16-bit, unsigned
+        assert_eq!(unpack_widths_from_name("VUNPACK_D16_D8"), (8, 16, false));
+        // VUNPACK_S32_S16: input 16-bit, output 32-bit, signed
+        assert_eq!(unpack_widths_from_name("VUNPACK_S32_S16"), (16, 32, true));
+        // Fallback for unrecognized format
+        assert_eq!(unpack_widths_from_name("VUNPACK"), (8, 16, false));
+    }
+
+    // -- pack_half / unpack_half --
+
+    #[test]
+    fn test_pack_half_d16_to_d8() {
+        // 16 lanes of 16-bit values in a 256-bit register, pack to 8-bit.
+        // Output: 16 lanes of 8-bit = 128 bits = 4 words.
+        let mut src = [0u32; 8];
+        let vals: Vec<i64> = (0..16).map(|i| (i * 10) as i64).collect();
+        insert_lanes(&mut src, &vals, 16);
+
+        let result = pack_half(&src, 16, 8, false, PackMode::Truncate);
+
+        // Verify each output lane has the low 8 bits of the input.
+        for (i, &expected) in vals.iter().enumerate() {
+            let got = extract_lane(&result, i, 8, false);
+            assert_eq!(got, expected & 0xFF, "lane {} mismatch", i);
+        }
+    }
+
+    #[test]
+    fn test_unpack_half_d8_to_d16() {
+        // 32 lanes of 8-bit values in a 256-bit register.
+        // Unpack lanes 0..15 to 16-bit (unsigned).
+        let mut src = [0u32; 8];
+        let vals: Vec<i64> = (0..32).map(|i| (i * 7) as i64).collect();
+        insert_lanes(&mut src, &vals, 8);
+
+        let result = unpack_half(&src, 0, 8, 16, false);
+
+        // Output: 16 lanes of 16-bit, each matching the original 8-bit value.
+        for i in 0..16 {
+            let got = extract_lane(&result, i, 16, false);
+            assert_eq!(got, vals[i], "lane {} mismatch", i);
+        }
+    }
+
+    #[test]
+    fn test_unpack_half_d8_to_d16_upper() {
+        // Unpack lanes 16..31 from a 256-bit register of 8-bit values.
+        let mut src = [0u32; 8];
+        let vals: Vec<i64> = (0..32).map(|i| (i * 3) as i64).collect();
+        insert_lanes(&mut src, &vals, 8);
+
+        let result = unpack_half(&src, 16, 8, 16, false);
+
+        for i in 0..16 {
+            let got = extract_lane(&result, i, 16, false);
+            assert_eq!(got, vals[16 + i], "lane {} mismatch", i);
         }
     }
 

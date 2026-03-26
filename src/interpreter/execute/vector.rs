@@ -4175,6 +4175,63 @@ impl VectorAlu {
                 true
             }
 
+            // ========== Pack / Unpack (asymmetric widths) ==========
+
+            SemanticOp::Pack => {
+                // VPACK: 512-bit x-reg source -> 256-bit w-reg dest.
+                // Each 256-bit half is packed independently, then the two
+                // packed halves are concatenated into one 256-bit result.
+                let name = op.encoding_name.as_deref().unwrap_or("");
+                let (bits_i, bits_o, signed) = vector_pack::pack_widths_from_name(name);
+                let src = Self::get_wide_vec_source(op, ctx, 0);
+                let src_lo: [u32; 8] = src[..8].try_into().unwrap();
+                let src_hi: [u32; 8] = src[8..].try_into().unwrap();
+
+                let packed_lo = vector_pack::pack_half(
+                    &src_lo, bits_i, bits_o, signed, vector_pack::PackMode::Truncate,
+                );
+                let packed_hi = vector_pack::pack_half(
+                    &src_hi, bits_i, bits_o, signed, vector_pack::PackMode::Truncate,
+                );
+
+                // Each half produces (256/bits_i * bits_o) bits of packed data.
+                // Concatenate the two halves into a single 256-bit w-register.
+                let words_per_half = ((256 / bits_i) * bits_o / 32) as usize;
+                let mut result = [0u32; 8];
+                result[..words_per_half].copy_from_slice(&packed_lo[..words_per_half]);
+                result[words_per_half..words_per_half * 2]
+                    .copy_from_slice(&packed_hi[..words_per_half]);
+
+                // Write to 256-bit w-register dest (NOT write_wide_vec_dest).
+                Self::write_vector_dest(op, ctx, result);
+                true
+            }
+
+            SemanticOp::Unpack => {
+                // VUNPACK: 256-bit w-reg source -> 512-bit x-reg dest.
+                // The source lanes are split: lower lanes fill the low half
+                // of the output, upper lanes fill the high half.
+                let name = op.encoding_name.as_deref().unwrap_or("");
+                let (bits_i, bits_o, signed) = vector_pack::unpack_widths_from_name(name);
+
+                // Read the 256-bit source (NOT wide -- it's a w-register).
+                let src = Self::get_vector_source(op, ctx, 0);
+
+                // Each output half holds 256/bits_o lanes. The second half
+                // reads from lane_start = 256/bits_o in the source.
+                let lanes_per_half = (256 / bits_o) as usize;
+                let result_lo = vector_pack::unpack_half(&src, 0, bits_i, bits_o, signed);
+                let result_hi = vector_pack::unpack_half(
+                    &src, lanes_per_half, bits_i, bits_o, signed,
+                );
+
+                let mut result = [0u32; 16];
+                result[..8].copy_from_slice(&result_lo);
+                result[8..].copy_from_slice(&result_hi);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+
             // ========== Fallback ==========
             _ => Self::execute_wide_fallback(op, ctx, semantic, et),
         }
