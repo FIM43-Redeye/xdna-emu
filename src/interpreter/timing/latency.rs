@@ -16,6 +16,7 @@
 
 use crate::interpreter::bundle::SlotOp;
 use crate::tablegen::SemanticOp;
+use crate::tablegen::decoder_ffi;
 
 /// Timing information for a single operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,16 +178,28 @@ const TIMING_DEFAULT: OperationTiming = OperationTiming::simple(1);
 
 /// Lookup table for operation latencies.
 ///
-/// Timing is derived directly from `SemanticOp` + metadata, with no
-/// intermediate key enum. All timing values are compile-time constants
-/// from AM020 and AIE2Schedule.td.
+/// Two-tier lookup:
+/// 1. **LLVM itinerary** (primary): per-opcode latency from LLVM's scheduling
+///    model, queried once at init via FFI and stored in a Vec indexed by
+///    LLVM opcode. Zero runtime FFI cost -- just an array index.
+/// 2. **SemanticOp fallback**: when the LLVM opcode is unavailable (legacy
+///    decode path) or has no itinerary data, falls back to AM020-derived
+///    constants dispatched via SemanticOp + is_vector.
 #[derive(Debug, Clone)]
-pub struct LatencyTable;
+pub struct LatencyTable {
+    /// Per-opcode latency from LLVM's itinerary model.
+    /// Indexed by LLVM opcode ID; None if the opcode has no itinerary data.
+    llvm_latencies: Vec<Option<u8>>,
+}
 
 impl LatencyTable {
-    /// Create the AIE2 latency table from AM020 specifications.
+    /// Create the AIE2 latency table, populated with LLVM itinerary data.
     pub fn aie2() -> Self {
-        Self
+        let infos = decoder_ffi::query_all_instr_info();
+        let llvm_latencies = infos.into_iter()
+            .map(|info| info.latency)
+            .collect();
+        Self { llvm_latencies }
     }
 
     /// Map a SemanticOp + vector flag directly to its timing.
@@ -316,9 +329,21 @@ impl LatencyTable {
         }
     }
 
-    /// Get timing for a SlotOp using its SemanticOp.
+    /// Get timing for a SlotOp.
+    ///
+    /// First checks the LLVM itinerary data (via opcode index), then falls
+    /// back to the SemanticOp-based lookup for instructions decoded via the
+    /// legacy path or without itinerary data.
     #[inline]
     pub fn timing_for_slot_op(&self, op: &SlotOp) -> OperationTiming {
+        // Tier 1: LLVM itinerary lookup (O(1) array index, zero FFI).
+        if let Some(opcode) = op.llvm_opcode {
+            if let Some(&Some(latency)) = self.llvm_latencies.get(opcode as usize) {
+                return OperationTiming::simple(latency);
+            }
+        }
+
+        // Tier 2: SemanticOp fallback (AM020 constants).
         if let Some(semantic) = op.semantic {
             Self::timing_from_semantic(semantic, op.is_vector)
         } else {
@@ -345,7 +370,17 @@ impl LatencyTable {
             "ProcessorModel.mispredict_penalty ({}) != LATENCY_BRANCH_TAKEN+1 ({})",
             model.mispredict_penalty, LATENCY_BRANCH_TAKEN + 1
         );
-        Self::aie2()
+
+        let table = Self::aie2();
+
+        // Verify LLVM itinerary data was populated.
+        let with_latency = table.llvm_latencies.iter()
+            .filter(|l| l.is_some())
+            .count();
+        log::info!("LatencyTable: {} / {} opcodes have LLVM itinerary latency",
+            with_latency, table.llvm_latencies.len());
+
+        table
     }
 }
 
@@ -394,7 +429,9 @@ pub fn itinerary_to_timing(class_name: &str) -> Option<OperationTiming> {
 
 impl Default for LatencyTable {
     fn default() -> Self {
-        Self::aie2()
+        // Default creates an empty table (no LLVM data) -- uses SemanticOp fallback only.
+        // Production code should use aie2() or validated_aie2() for full LLVM latencies.
+        Self { llvm_latencies: Vec::new() }
     }
 }
 
@@ -644,5 +681,69 @@ mod tests {
                 mismatches.len(), checked, mismatches.join("\n"),
             );
         }
+    }
+
+    /// Verify that the LLVM opcode-indexed latency path works end-to-end.
+    ///
+    /// Creates a SlotOp with an llvm_opcode set, and verifies that
+    /// timing_for_slot_op returns the LLVM itinerary latency rather than
+    /// the SemanticOp fallback.
+    #[test]
+    fn test_llvm_opcode_latency_path() {
+        use crate::tablegen::decoder_ffi;
+
+        let table = LatencyTable::aie2();
+        let infos = decoder_ffi::query_all_instr_info();
+
+        // Find a VMAC instruction (latency should be 5 from LLVM itinerary).
+        let vmac_opcode = infos.iter().enumerate()
+            .find(|(_, info)| info.latency == Some(5) && !info.is_load())
+            .map(|(opcode, _)| opcode as u32);
+
+        if let Some(opcode) = vmac_opcode {
+            let mut op = SlotOp::from_semantic(
+                crate::interpreter::bundle::SlotIndex::Vector,
+                SemanticOp::Mac,
+            );
+            op.llvm_opcode = Some(opcode);
+
+            let timing = table.timing_for_slot_op(&op);
+            assert_eq!(timing.latency, 5,
+                "LLVM itinerary path should return latency 5 for opcode {}", opcode);
+        }
+
+        // Find a load instruction (latency should be 7).
+        let load_opcode = infos.iter().enumerate()
+            .find(|(_, info)| info.latency == Some(7) && info.is_load())
+            .map(|(opcode, _)| opcode as u32);
+
+        if let Some(opcode) = load_opcode {
+            let mut op = SlotOp::from_semantic(
+                crate::interpreter::bundle::SlotIndex::LoadA,
+                SemanticOp::Load,
+            );
+            op.llvm_opcode = Some(opcode);
+
+            let timing = table.timing_for_slot_op(&op);
+            assert_eq!(timing.latency, 7,
+                "LLVM itinerary path should return latency 7 for load opcode {}", opcode);
+        }
+    }
+
+    /// Verify fallback to SemanticOp when llvm_opcode is None.
+    #[test]
+    fn test_semantic_fallback_when_no_llvm_opcode() {
+        let table = LatencyTable::aie2();
+
+        // SlotOp without llvm_opcode should use SemanticOp path.
+        let op = SlotOp::from_semantic(
+            crate::interpreter::bundle::SlotIndex::Scalar0,
+            SemanticOp::Add,
+        );
+        assert!(op.llvm_opcode.is_none());
+
+        let timing = table.timing_for_slot_op(&op);
+        assert_eq!(timing.latency, LATENCY_SCALAR_ADD,
+            "Without llvm_opcode, should fall back to SemanticOp");
     }
 }

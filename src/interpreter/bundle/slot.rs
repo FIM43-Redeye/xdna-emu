@@ -285,6 +285,9 @@ pub struct SlotOp {
     pub encoding_name: Option<String>,
     /// Raw opcode bits for unrecognized instructions (diagnostics only).
     pub raw_opcode: Option<u32>,
+    /// LLVM opcode ID (index into MCInstrInfo), set when decoded via FFI.
+    /// Used for opcode-indexed latency lookups from LLVM's itinerary model.
+    pub llvm_opcode: Option<u32>,
 }
 
 // Core methods on SlotOp.
@@ -439,6 +442,7 @@ impl SlotOp {
             predicate: None,
             encoding_name: None,
             raw_opcode: None,
+            llvm_opcode: None,
         }
     }
 
@@ -497,6 +501,7 @@ impl SlotOp {
             predicate: None,
             encoding_name: None,
             raw_opcode: None,
+            llvm_opcode: None,
         }
     }
 }
