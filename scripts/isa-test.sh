@@ -59,7 +59,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 OUT_DIR="${PROJECT_DIR}/build/isa-tests"
-RESULTS_DIR="/tmp/isa-test-results-$(date +%Y%m%d)"
+# Results under build/ so they survive reboots (unlike /tmp).
+# Override with ISA_TEST_RESULTS env var if needed.
+RESULTS_DIR="${ISA_TEST_RESULTS:-${PROJECT_DIR}/build/isa-test-results/$(date +%Y%m%d)}"
 
 # Determine which EMU profile to use and check for stale builds.
 EMU_PROFILE="${XDNA_EMU:-debug}"
@@ -103,9 +105,21 @@ echo ""
 
 # ---- Phase 1: Generate ----
 echo "--- Phase 1: Generate ---"
-python3 "${PROJECT_DIR}/tools/isa-test-gen.py" \
-    --isa-json "$ISA_JSON" \
-    --out-dir "$OUT_DIR"
+
+# Skip generation if inputs (ISA JSON + generator script) are older than
+# the manifest.  This avoids re-running the full Python pipeline when
+# nothing has changed.
+GENERATOR="${PROJECT_DIR}/tools/isa-test-gen.py"
+MANIFEST_OUT="${OUT_DIR}/manifest.json"
+if ! $FORCE_COMPILE && [[ -f "$MANIFEST_OUT" ]] \
+    && [[ ! "$ISA_JSON" -nt "$MANIFEST_OUT" ]] \
+    && [[ ! "$GENERATOR" -nt "$MANIFEST_OUT" ]]; then
+    echo "  Up to date (inputs unchanged). Skipping generation."
+else
+    python3 "$GENERATOR" \
+        --isa-json "$ISA_JSON" \
+        --out-dir "$OUT_DIR"
+fi
 echo ""
 
 if $GENERATE_ONLY; then
@@ -439,7 +453,8 @@ print(total_in, total_out)
             hw_out="${RESULTS_DIR}/phase_${pidx}_hw.bin"
             hw_log="${RESULTS_DIR}/phase_${pidx}_hw.log"
             rc=0
-            timeout 30 "$HOST_BIN" \
+            # Unset XDNA_EMU for HW runs so they go through the real NPU.
+            env -u XDNA_EMU timeout 30 "$HOST_BIN" \
                 -x "${phase_dir}/aie.xclbin" \
                 -k MLIR_AIE \
                 -i "${phase_dir}/insts.bin" \
@@ -475,7 +490,9 @@ else
 
             hw_log="${RESULTS_DIR}/batch_${idx}_hw.log"
             rc=0
-            timeout 30 "$HOST_BIN" \
+            # Unset XDNA_EMU for HW runs so they go through the real NPU,
+            # not the emulator plugin.  Use env -u to fully remove it.
+            env -u XDNA_EMU timeout 30 "$HOST_BIN" \
                 -x "${batch_dir}/aie.xclbin" \
                 -k MLIR_AIE \
                 -i "${batch_dir}/insts.bin" \
@@ -695,4 +712,29 @@ else
     else
         echo "=== Comparison skipped (need both HW and EMU) ==="
     fi
+fi
+
+# ---- Phase 7: Test-Point Analysis ----
+# Runs the per-instruction analyzer for fine-grained accuracy metrics.
+ANALYZER="${PROJECT_DIR}/tools/isa-test-analyze.py"
+ANALYSIS_LOG="${RESULTS_DIR}/analysis.log"
+if [[ -f "$ANALYZER" ]] && [[ -f "$MANIFEST" ]]; then
+    echo ""
+    echo "--- Phase 7: Test-Point Analysis ---"
+    python3 "$ANALYZER" \
+        --manifest "$MANIFEST" \
+        --results-dir "$RESULTS_DIR" \
+        --summary 2>&1 | tee "$ANALYSIS_LOG"
+
+    # Also write a failing-only detailed log.
+    DETAIL_LOG="${RESULTS_DIR}/analysis-failing.log"
+    python3 "$ANALYZER" \
+        --manifest "$MANIFEST" \
+        --results-dir "$RESULTS_DIR" \
+        --failing > "$DETAIL_LOG" 2>&1
+
+    echo ""
+    echo "Analysis logs written to:"
+    echo "  Summary:  $ANALYSIS_LOG"
+    echo "  Detailed: $DETAIL_LOG"
 fi
