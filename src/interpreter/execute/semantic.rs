@@ -281,6 +281,13 @@ pub(super) fn write_operand(operand: &Operand, ctx: &mut ExecutionContext, value
                     ctx.srs_config.srs_sign = (value & 1) != 0;
                     log::trace!("crSRSSign = {} (raw 0x{:X})", value & 1, value);
                 }
+                // Mask registers q0-q3: ControlReg(16..19).
+                // Scalar write sets the low 32 bits (clears upper bits).
+                16..=19 => {
+                    let q_idx = (id - 16) as u8;
+                    ctx.mask.write_u32_low(q_idx, value);
+                    log::trace!("q{} = 0x{:08X} (scalar write)", q_idx, value);
+                }
                 _ => {
                     log::trace!("control register write: id={}, value=0x{:X}", id, value);
                 }

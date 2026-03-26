@@ -34,6 +34,7 @@ pub use registers::{
     VectorRegisterFile,
     AccumulatorRegisterFile,
     PointerRegisterFile,
+    MaskRegisterFile,
     ModifierRegisterFile,
     // Wide register type aliases.
     Vec512, Acc1024,

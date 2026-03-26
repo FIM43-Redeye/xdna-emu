@@ -18,8 +18,8 @@
 //! ```
 
 use super::registers::{
-    AccumulatorRegisterFile, ModifierRegisterFile, PointerRegisterFile, ScalarRegisterFile,
-    VectorRegisterFile,
+    AccumulatorRegisterFile, MaskRegisterFile, ModifierRegisterFile, PointerRegisterFile,
+    ScalarRegisterFile, VectorRegisterFile,
 };
 use crate::interpreter::bundle::Operand;
 use crate::interpreter::timing::{HazardDetector, LatencyTable, MemoryModel};
@@ -541,6 +541,9 @@ pub struct ExecutionContext {
     /// Accumulator registers (acc0-acc7).
     pub accumulator: AccumulatorRegisterFile,
 
+    /// Mask registers (q0-q3) for sparse vector operations.
+    pub mask: MaskRegisterFile,
+
     // === Statistics ===
     /// Total cycles executed.
     pub cycles: u64,
@@ -663,6 +666,7 @@ impl ExecutionContext {
             modifier: ModifierRegisterFile::new(),
             vector: VectorRegisterFile::new(),
             accumulator: AccumulatorRegisterFile::new(),
+            mask: MaskRegisterFile::new(),
             cycles: 0,
             instructions: 0,
             stall_cycles: 0,

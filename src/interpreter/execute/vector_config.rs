@@ -70,6 +70,13 @@ pub struct MatMulConfig {
     pub bfloat: bool,
     /// Whether to subtract (negate the product) rather than add.
     pub subtract: bool,
+    /// Whether this is a sparse mode (B operand has a sparsity mask).
+    ///
+    /// Sparse modes have doubled inner dimension compared to their dense
+    /// equivalents. The B operand comes from a composite qx register
+    /// (vector data + 64-bit mask). Elements at masked-out positions are
+    /// treated as zero during the multiply.
+    pub sparse: bool,
 }
 
 /// A single valid matmul geometry entry, combining element type pair with
@@ -195,6 +202,7 @@ impl MatMulConfig {
             acc_width: if entry.acc_cmb == 2 { AccWidth::Acc64 } else { AccWidth::Acc32 },
             bfloat: entry.bfloat,
             subtract,
+            sparse: false,
         })
     }
 
@@ -241,6 +249,7 @@ impl MatMulConfig {
             acc_width: if entry.acc_cmb == 2 { AccWidth::Acc64 } else { AccWidth::Acc32 },
             bfloat: entry.bfloat,
             subtract,
+            sparse: false,
         })
     }
 
@@ -287,6 +296,7 @@ impl MatMulConfig {
             acc_width: if entry.acc_cmb == 2 { AccWidth::Acc64 } else { AccWidth::Acc32 },
             bfloat: entry.bfloat,
             subtract,
+            sparse: false,
         })
     }
 
@@ -391,6 +401,7 @@ impl MatMulConfig {
             acc_width: if entry.acc_cmb == 2 { AccWidth::Acc64 } else { AccWidth::Acc32 },
             bfloat: entry.bfloat,
             subtract: sub0,
+            sparse: entry.sparse,
         })
     }
 }

@@ -1161,7 +1161,17 @@ def _load_instruction(reg_name: str, kind: str, ptr: str, offset: int) -> list[s
     if kind == "sparse_qx":
         # 640-bit sparse vector+mask composite registers qx0-qx3 (mQQXw class).
         # Each qx register combines an x register (512-bit) and a q mask (128-bit).
-        # We load only the x component; the q mask defaults to zero (no masking).
+        # We load only the x component; the q mask is NOT initialized here because
+        # setting it requires specialized mask load instructions (vldb.sparse.fill)
+        # that need FIFO configuration beyond what this harness supports.
+        #
+        # Consequence: on hardware, q registers contain undefined/residual values,
+        # making sparse test results non-deterministic. The emulator initializes
+        # q registers to zero (all masked out), so sparse tests will diverge from
+        # hardware. Sparse MAC correctness is validated via unit tests instead.
+        #
+        # TODO: implement FIFO-based mask loading to make sparse ISA tests
+        # deterministic and comparable between HW and EMU.
         # qx0={x0,q0} -> load wl0,wh0.  qx1={x1,q1} -> load wl1,wh1.
         qx_idx = int(reg_name[2:])  # "qx0" -> 0
         return (

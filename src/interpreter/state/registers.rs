@@ -582,6 +582,106 @@ impl fmt::Debug for AccumulatorRegisterFile {
 }
 
 // ============================================================================
+// Mask Register File (q0-q3)
+// ============================================================================
+
+/// Number of mask registers.
+///
+/// AIE2 has 4 mask registers (q0-q3), each 128 bits. These are used for
+/// sparse vector operations -- the mask indicates which elements in a
+/// sparse vector are non-zero (2:4 structured sparsity).
+pub const NUM_MASK_REGS: usize = 4;
+
+/// Mask register file: 4 x 128-bit registers for sparse vector masks.
+///
+/// Each register is stored as [u32; 4] (128 bits). The sparse matmul
+/// only uses the low 64 bits of each mask register, but the full 128-bit
+/// width is preserved for correctness with other mask operations.
+///
+/// Composite qx registers (qx0-qx3) pair a mask register with a vector
+/// register: qx_n = {x_n, q_n}. The mask portion comes from q_n, and
+/// the vector data from x_n (in the vector register file).
+#[derive(Clone)]
+pub struct MaskRegisterFile {
+    regs: [[u32; 4]; NUM_MASK_REGS],
+}
+
+impl MaskRegisterFile {
+    /// Create a new mask register file with all registers zeroed.
+    pub fn new() -> Self {
+        Self {
+            regs: [[0u32; 4]; NUM_MASK_REGS],
+        }
+    }
+
+    /// Read the low 64 bits of a mask register (used by sparse matmul).
+    pub fn read_u64_low(&self, reg: u8) -> u64 {
+        let idx = (reg as usize) % NUM_MASK_REGS;
+        (self.regs[idx][0] as u64) | ((self.regs[idx][1] as u64) << 32)
+    }
+
+    /// Read the full 128-bit mask register as [u32; 4].
+    pub fn read(&self, reg: u8) -> [u32; 4] {
+        let idx = (reg as usize) % NUM_MASK_REGS;
+        self.regs[idx]
+    }
+
+    /// Write the full 128-bit mask register.
+    pub fn write(&mut self, reg: u8, value: [u32; 4]) {
+        let idx = (reg as usize) % NUM_MASK_REGS;
+        self.regs[idx] = value;
+    }
+
+    /// Write a 32-bit value to the low word of a mask register.
+    ///
+    /// Used when a scalar write targets a mask register (e.g., setting
+    /// a mask from a scalar value).
+    pub fn write_u32_low(&mut self, reg: u8, value: u32) {
+        let idx = (reg as usize) % NUM_MASK_REGS;
+        self.regs[idx][0] = value;
+        self.regs[idx][1] = 0;
+        self.regs[idx][2] = 0;
+        self.regs[idx][3] = 0;
+    }
+
+    /// Clear all mask registers to zero.
+    pub fn clear(&mut self) {
+        self.regs = [[0u32; 4]; NUM_MASK_REGS];
+    }
+}
+
+impl Default for MaskRegisterFile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for MaskRegisterFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let non_zero: Vec<_> = self
+            .regs
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.iter().any(|x| *x != 0))
+            .collect();
+
+        if non_zero.is_empty() {
+            write!(f, "MaskRegisterFile {{ all zero }}")
+        } else {
+            writeln!(f, "MaskRegisterFile {{")?;
+            for (reg, val) in non_zero {
+                writeln!(
+                    f,
+                    "  q{}: 0x{:08X}_{:08X}_{:08X}_{:08X}",
+                    reg, val[3], val[2], val[1], val[0]
+                )?;
+            }
+            write!(f, "}}")
+        }
+    }
+}
+
+// ============================================================================
 // TableGen Validation
 // ============================================================================
 
