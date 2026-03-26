@@ -420,6 +420,8 @@ fi
 
 # ---- Phase 4: Run HW ----
 mkdir -p "$RESULTS_DIR"
+# Maintain a 'latest' symlink for easy access.
+ln -sfn "$RESULTS_DIR" "${RESULTS_DIR%/*}/latest"
 
 if $MULTI_TILE; then
     # Multi-tile HW execution: one xclbin per phase, serial.

@@ -448,7 +448,7 @@ Flags: `--chess-only`, `--peano-only`, `--no-hw`, `--compile`,
 `--serial-hw`, `--trace=sweep`, `-v <filter>`.
 
 **Build dirs**: `mlir-aie/build/test/npu-xrt/$name/chess/` and `peano/`
-**Results**: `/tmp/emu-bridge-results-YYYYMMDD/`
+**Results**: `build/bridge-test-results/YYYYMMDD/` (symlink at `build/bridge-test-results/latest`)
 **Plugin**: `pkexec cp xrt-plugin/build/libxrt_driver_emu.so.2 /opt/xilinx/xrt/lib/`
 
 ### Backup: npu-test (standalone harness)

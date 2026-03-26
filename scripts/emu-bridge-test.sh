@@ -67,9 +67,12 @@ PEANO_KERNEL_FLAGS="-O2 -std=c++20 --target=aie2-none-unknown-elf -DNDEBUG"
 PEANO_KERNEL_FLAGS+=" -Wno-parentheses -Wno-attributes -Wno-macro-redefined"
 PEANO_KERNEL_FLAGS+=" -Wno-empty-body -Wno-missing-template-arg-list-after-template-kw"
 
-# Results directory -- one per day, phases append into it
-RESULTS_DIR="/tmp/emu-bridge-results-$(date +%Y%m%d)"
+# Results directory -- under build/ so they survive reboots (unlike /tmp).
+# Override with BRIDGE_TEST_RESULTS env var if needed.
+RESULTS_DIR="${BRIDGE_TEST_RESULTS:-${EMU_ROOT}/build/bridge-test-results/$(date +%Y%m%d)}"
 mkdir -p "$RESULTS_DIR"
+# Maintain a 'latest' symlink for easy access.
+ln -sfn "$RESULTS_DIR" "${RESULTS_DIR%/*}/latest"
 
 # Default parallelism
 JOBS="$(nproc)"
