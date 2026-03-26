@@ -3469,8 +3469,10 @@ impl VectorAlu {
                     let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
                     let mask_hi = Self::condense_comparison_mask(&hi, op.element_type);
                     let lanes_per_half = 256 / et.bits() as u32;
-                    let full_mask = mask_lo | (mask_hi << lanes_per_half);
-                    Self::write_scalar_dest(op, ctx, full_mask);
+                    // Use u64 for the combined mask since lanes_per_half can
+                    // be 32 (8-bit elements), which would overflow a u32 shift.
+                    let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
+                    Self::write_scalar_dest(op, ctx, full_mask as u32);
                 } else {
                     Self::write_wide_vec_dest(op, ctx, result);
                 }
@@ -3486,8 +3488,10 @@ impl VectorAlu {
                     let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
                     let mask_hi = Self::condense_comparison_mask(&hi, op.element_type);
                     let lanes_per_half = 256 / et.bits() as u32;
-                    let full_mask = mask_lo | (mask_hi << lanes_per_half);
-                    Self::write_scalar_dest(op, ctx, full_mask);
+                    // Use u64 for the combined mask since lanes_per_half can
+                    // be 32 (8-bit elements), which would overflow a u32 shift.
+                    let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
+                    Self::write_scalar_dest(op, ctx, full_mask as u32);
                 } else {
                     Self::write_wide_vec_dest(op, ctx, result);
                 }

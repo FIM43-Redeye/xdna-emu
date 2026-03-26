@@ -336,6 +336,129 @@ impl MatMulConfig {
             .map(|e| (e.rows, e.inner, e.cols))
             .collect()
     }
+
+    /// Parse a matmul configuration from a hardware config word.
+    ///
+    /// The config word is passed in a scalar register and encodes the
+    /// geometry (amode, bmode, variant) plus operational flags (signedness,
+    /// zero_acc, subtract). Bit layout from `aiev2_compute_control()`:
+    ///
+    /// ```text
+    /// Bit  0:     zero_acc  (zero accumulator before operation)
+    /// Bits 1-2:   amode     (accumulator combining mode)
+    /// Bits 3-4:   bmode     (B element width selector)
+    /// Bits 5-7:   variant   (geometry variant)
+    /// Bit  8:     sgn_y     (Y/B signedness: 1=signed, 0=unsigned)
+    /// Bit  9:     sgn_x     (X/A signedness: 1=signed, 0=unsigned)
+    /// Bit  10:    shift16   (shift output by 16 bits)
+    /// Bit  11:    sub0      (subtract control 0)
+    /// Bit  12:    sub1      (subtract control 1)
+    /// Bit  13:    sub2      (subtract control 2)
+    /// Bits 16+:   sub_mask  (per-element subtract mask)
+    /// ```
+    ///
+    /// Returns None if the (amode, bmode, variant) triple does not
+    /// correspond to a known geometry.
+    pub fn from_config_word(conf: u32, is_bf16: bool) -> Option<Self> {
+        let zero_acc = (conf & 1) != 0;
+        let amode = (conf >> 1) & 3;
+        let bmode = (conf >> 3) & 3;
+        let variant = (conf >> 5) & 7;
+        let sgn_y = ((conf >> 8) & 1) != 0;
+        let sgn_x = ((conf >> 9) & 1) != 0;
+        let _shift16 = ((conf >> 10) & 1) != 0;
+        let sub0 = ((conf >> 11) & 1) != 0;
+        let _sub1 = ((conf >> 12) & 1) != 0;
+        let _sub2 = ((conf >> 13) & 1) != 0;
+
+        let entry = if is_bf16 {
+            lookup_bf16_geometry(variant)
+        } else {
+            lookup_integer_geometry(amode, bmode, variant)
+        }?;
+
+        let (a_type, b_type) = element_types_from_entry(entry);
+
+        Some(Self {
+            rows: entry.rows,
+            inner: entry.inner,
+            cols: entry.cols,
+            accumulate: !zero_acc,
+            x_signed: sgn_x,
+            y_signed: sgn_y,
+            a_type,
+            b_type,
+            acc_width: if entry.acc_cmb == 2 { AccWidth::Acc64 } else { AccWidth::Acc32 },
+            bfloat: entry.bfloat,
+            subtract: sub0,
+        })
+    }
+}
+
+/// Hardware config word (amode, bmode, variant) to geometry lookup table.
+///
+/// Derived from the `aiev2_compute_control()` function in aiev2_vmult.h
+/// and the geometry function names (e.g., `mac_4x8_8x8` = rows=4, inner=8, cols=8).
+///
+/// Each entry: (amode, bmode, variant) -> GeometryEntry
+const CONFIG_GEOMETRY_TABLE: &[(u32, u32, u32, GeometryEntry)] = &[
+    // amode=0: acc_cmb=1 (32-bit accumulator lanes)
+    // i8 x i4 -> acc32
+    (0, 0, 0, GeometryEntry { bits_x: 8, bits_y: 4, rows: 4, inner: 16, cols: 8, acc_cmb: 1, bfloat: false, sparse: false }),
+    // i8 x i4 sparse -> acc32
+    (0, 0, 1, GeometryEntry { bits_x: 8, bits_y: 4, rows: 4, inner: 32, cols: 8, acc_cmb: 1, bfloat: false, sparse: true }),
+    // i8 x i8 -> acc32
+    (0, 1, 0, GeometryEntry { bits_x: 8, bits_y: 8, rows: 4, inner: 8, cols: 8, acc_cmb: 1, bfloat: false, sparse: false }),
+    // i8 x i8 sparse -> acc32
+    (0, 1, 5, GeometryEntry { bits_x: 8, bits_y: 8, rows: 4, inner: 16, cols: 8, acc_cmb: 1, bfloat: false, sparse: true }),
+    // i16 x i8 -> acc32
+    (0, 2, 0, GeometryEntry { bits_x: 16, bits_y: 8, rows: 4, inner: 4, cols: 8, acc_cmb: 1, bfloat: false, sparse: false }),
+    // i16 x i16 -> acc32
+    (0, 3, 0, GeometryEntry { bits_x: 16, bits_y: 16, rows: 4, inner: 2, cols: 8, acc_cmb: 1, bfloat: false, sparse: false }),
+
+    // amode=1: acc_cmb=2 (64-bit accumulator lanes)
+    // i32 x i16 -> acc64
+    (1, 0, 0, GeometryEntry { bits_x: 32, bits_y: 16, rows: 4, inner: 2, cols: 4, acc_cmb: 2, bfloat: false, sparse: false }),
+    // i16 x i8 -> acc64 (variant 0: 2x8x8)
+    (1, 2, 0, GeometryEntry { bits_x: 16, bits_y: 8, rows: 2, inner: 8, cols: 8, acc_cmb: 2, bfloat: false, sparse: false }),
+    // i16 x i8 -> acc64 (variant 1: 4x8x4)
+    (1, 2, 1, GeometryEntry { bits_x: 16, bits_y: 8, rows: 4, inner: 8, cols: 4, acc_cmb: 2, bfloat: false, sparse: false }),
+    // i16 x i8 sparse -> acc64
+    (1, 2, 2, GeometryEntry { bits_x: 16, bits_y: 8, rows: 2, inner: 16, cols: 8, acc_cmb: 2, bfloat: false, sparse: true }),
+    // i16 x i16 -> acc64 (variant 0: 2x4x8)
+    (1, 3, 0, GeometryEntry { bits_x: 16, bits_y: 16, rows: 2, inner: 4, cols: 8, acc_cmb: 2, bfloat: false, sparse: false }),
+    // i16 x i16 -> acc64 (variant 1: 4x4x4)
+    (1, 3, 1, GeometryEntry { bits_x: 16, bits_y: 16, rows: 4, inner: 4, cols: 4, acc_cmb: 2, bfloat: false, sparse: false }),
+    // i16 x i16 sparse -> acc64
+    (1, 3, 5, GeometryEntry { bits_x: 16, bits_y: 16, rows: 2, inner: 8, cols: 8, acc_cmb: 2, bfloat: false, sparse: true }),
+];
+
+/// Look up geometry for integer MAC from config word fields.
+fn lookup_integer_geometry(amode: u32, bmode: u32, variant: u32) -> Option<&'static GeometryEntry> {
+    CONFIG_GEOMETRY_TABLE
+        .iter()
+        .find(|(a, b, v, _)| *a == amode && *b == bmode && *v == variant)
+        .map(|(_, _, _, entry)| entry)
+}
+
+/// Look up geometry for bf16 MAC from config word variant field.
+///
+/// BFloat16 MAC uses a separate instruction format (vmac.f) with only
+/// the variant field selecting geometry.
+fn lookup_bf16_geometry(variant: u32) -> Option<&'static GeometryEntry> {
+    match variant {
+        // Dense 4x8x4: 16 outputs in 32-bit accumulator lanes
+        0 => Some(&GeometryEntry {
+            bits_x: 16, bits_y: 16, rows: 4, inner: 8, cols: 4,
+            acc_cmb: 1, bfloat: true, sparse: false,
+        }),
+        // Element-wise: 16 channels, each a 1x2 dot product
+        1 => Some(&GeometryEntry {
+            bits_x: 16, bits_y: 16, rows: 16, inner: 2, cols: 1,
+            acc_cmb: 1, bfloat: true, sparse: false,
+        }),
+        _ => None,
+    }
 }
 
 /// Map a geometry entry back to ElementType pairs.

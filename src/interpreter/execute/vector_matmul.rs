@@ -372,6 +372,7 @@ fn extract_element_512(src: &Vec512, byte_idx: usize, bits: u32, signed: bool) -
             let nibble = byte_idx % 2;
             let word = byte_pos / 4;
             let byte_in_word = byte_pos % 4;
+            if word >= src.len() { return 0; }
             let raw_byte = ((src[word] >> (byte_in_word * 8)) & 0xFF) as u8;
             let val = if nibble == 0 { raw_byte & 0xF } else { (raw_byte >> 4) & 0xF };
             if signed && (val & 0x8) != 0 {
@@ -384,6 +385,7 @@ fn extract_element_512(src: &Vec512, byte_idx: usize, bits: u32, signed: bool) -
         8 => {
             let word = byte_idx / 4;
             let byte_in_word = byte_idx % 4;
+            if word >= src.len() { return 0; }
             let val = ((src[word] >> (byte_in_word * 8)) & 0xFF) as u8;
             if signed { val as i8 as i64 } else { val as i64 }
         }
@@ -391,11 +393,13 @@ fn extract_element_512(src: &Vec512, byte_idx: usize, bits: u32, signed: bool) -
             let elem_idx = byte_idx / 2;
             let word = elem_idx / 2;
             let half_in_word = elem_idx % 2;
+            if word >= src.len() { return 0; }
             let val = ((src[word] >> (half_in_word * 16)) & 0xFFFF) as u16;
             if signed { val as i16 as i64 } else { val as i64 }
         }
         32 => {
             let word = byte_idx / 4;
+            if word >= src.len() { return 0; }
             let val = src[word];
             if signed { val as i32 as i64 } else { val as i64 }
         }
