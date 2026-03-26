@@ -87,7 +87,17 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         }
     };
 
-    // Handle product negation for NegMul/NegMatMul/MatMulSub semantics.
+    // Handle subtract semantics for MAC variants.
+    // The hardware compressor stage controls the sign of the accumulator
+    // contribution via a subtract flag. VMSC (instruction_msc in aietools)
+    // passes subtract_acc=True to vmac(), which negates the accumulator's
+    // contribution in the compressor. Effect:
+    //   vmac: result = acc + A*B   (subtract=false)
+    //   vmsc: result = -acc + A*B  (subtract=true, i.e., flip the subtract flag)
+    //   vnegmac: result = acc - A*B  (negate the product via subtract)
+    // When zero_acc=1, vmsc gives -(0) + A*B = A*B... BUT the hardware
+    // subtract flag also affects the product sign in the compressor, so
+    // vmsc with zero_acc actually gives -(A*B).
     match semantic {
         SemanticOp::NegMul | SemanticOp::NegMatMul | SemanticOp::MatMulSub => {
             config.subtract = !config.subtract;
@@ -98,36 +108,70 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     // Read the two 512-bit input vectors.
     let (a, b) = get_two_vec512(op, ctx);
 
-    // Read the accumulator destination (1024-bit wide register pair).
-    let acc_reg = get_acc_dest(op);
-    let mut acc = ctx.accumulator.read_wide(acc_reg);
+    // Determine accumulator access mode from destination operand.
+    // cm (1024-bit): AccumReg is always even, read/write as wide pair.
+    // bm (512-bit):  AccumReg can be even (bml) or odd (bmh), single register.
+    //
+    // bm_core instructions produce 512-bit output (e.g., bf16 4x8x4 = 16 fp32
+    // = 64 bytes). cm_core instructions produce 1024-bit output (e.g., int8
+    // 4x8x8 = 32 int32 = 128 bytes). The geometry determines how many output
+    // elements fill the accumulator; the register index determines where they
+    // go in the physical register file.
+    let (acc_reg, is_half) = get_acc_dest(op);
+    let mut acc = if is_half {
+        // bm (512-bit): read single register, pad to 1024-bit working buffer.
+        let half = ctx.accumulator.read(acc_reg);
+        let mut buf = [0u64; 16];
+        buf[..8].copy_from_slice(&half);
+        buf
+    } else {
+        // cm (1024-bit): read wide pair.
+        ctx.accumulator.read_wide(acc_reg)
+    };
 
-    // For AddMac/SubMac: merge a second accumulator source before the multiply.
-    // AddMac: acc_dest = acc_dest + acc_src + A * B
-    // SubMac: acc_dest = acc_dest - acc_src + A * B
+    // Perform the config-driven matrix multiply.
+    // This zeros the acc buffer if zero_acc=1 (accumulate=false), then
+    // computes the product and accumulates/replaces.
+    matmul_config_driven(&mut acc, &a, &b, &config);
+
+    // For AddMac/SubMac: merge a second accumulator source AFTER the multiply.
+    // This must happen after matmul_config_driven because that function zeros
+    // the accumulator when zero_acc=1. The hardware computes:
+    //   AddMac: result = (acc_dest [or 0] + A*B) + acc2
+    //   SubMac: result = (acc_dest [or 0] + A*B) - acc2
     match semantic {
-        SemanticOp::AddMac => {
+        SemanticOp::AddMac | SemanticOp::SubMac => {
             let src_reg = get_acc_source(op);
-            let src_acc = ctx.accumulator.read_wide(src_reg);
-            for i in 0..16 {
-                acc[i] = acc[i].wrapping_add(src_acc[i]);
-            }
-        }
-        SemanticOp::SubMac => {
-            let src_reg = get_acc_source(op);
-            let src_acc = ctx.accumulator.read_wide(src_reg);
-            for i in 0..16 {
-                acc[i] = acc[i].wrapping_sub(src_acc[i]);
+            let src_acc = if is_half {
+                let half = ctx.accumulator.read(src_reg);
+                let mut buf = [0u64; 16];
+                buf[..8].copy_from_slice(&half);
+                buf
+            } else {
+                ctx.accumulator.read_wide(src_reg & !1)
+            };
+            let n = if is_half { 8 } else { 16 };
+            for i in 0..n {
+                if semantic == SemanticOp::AddMac {
+                    acc[i] = acc[i].wrapping_add(src_acc[i]);
+                } else {
+                    acc[i] = acc[i].wrapping_sub(src_acc[i]);
+                }
             }
         }
         _ => {}
     }
 
-    // Perform the config-driven matrix multiply.
-    matmul_config_driven(&mut acc, &a, &b, &config);
-
     // Write result back to the accumulator.
-    ctx.accumulator.write_wide(acc_reg, acc);
+    if is_half {
+        // bm (512-bit): write back single register only.
+        let mut half = [0u64; 8];
+        half.copy_from_slice(&acc[..8]);
+        ctx.accumulator.write(acc_reg, half);
+    } else {
+        // cm (1024-bit): write wide pair.
+        ctx.accumulator.write_wide(acc_reg, acc);
+    }
 
     true
 }
@@ -180,27 +224,62 @@ fn get_two_vec512(op: &SlotOp, ctx: &ExecutionContext) -> (Vec512, Vec512) {
 }
 
 /// Extract the AccumReg from the destination operand.
-fn get_acc_dest(op: &SlotOp) -> u8 {
+///
+/// Returns (register_index, is_half_width):
+/// - cm destinations (1024-bit): even index, is_half=false
+/// - bml destinations (512-bit low): even index, is_half=true
+/// - bmh destinations (512-bit high): odd index, is_half=true
+///
+/// Detection: bf16 MAC ops always use bm_core (512-bit output geometry).
+/// Integer MAC ops always use cm_core (1024-bit output geometry).
+/// The encoding name carries ".f" or "_F_" for bf16 mode.
+fn get_acc_dest(op: &SlotOp) -> (u8, bool) {
+    let is_bf16 = op
+        .encoding_name
+        .as_ref()
+        .map(|n| n.ends_with(".f") || n.contains(".f ") || n.contains("_F_") || n.ends_with("_F"))
+        .unwrap_or(false);
+
     match &op.dest {
         Some(Operand::AccumReg(r)) => {
-            // Ensure even alignment for wide access.
-            *r & !1
+            if is_bf16 {
+                // bm_core: use register index as-is (even=bml, odd=bmh).
+                (*r, true)
+            } else {
+                // cm_core: force even alignment for wide pair access.
+                (*r & !1, false)
+            }
         }
         other => {
             log::error!(
                 "[MATMUL] expected AccumReg dest, got {:?} -- defaulting to cm0",
                 other
             );
-            0
+            (0, false)
         }
     }
 }
 
-/// Extract the first AccumReg from sources (for AddMac/SubMac).
+/// Extract the second AccumReg from sources (acc2 for AddMac/SubMac).
+///
+/// VADDMAC/VSUBMAC have three accumulator operands: dest, acc1 (=dest),
+/// and acc2 (the merge source). In our operand list, acc1 appears first
+/// and acc2 second. We skip the first AccumReg (acc1, same as dest) and
+/// return the second one (acc2).
 fn get_acc_source(op: &SlotOp) -> u8 {
+    let mut seen_first = false;
     for src in &op.sources {
         if let Operand::AccumReg(r) = src {
-            return *r & !1;
+            if seen_first {
+                return *r;
+            }
+            seen_first = true;
+        }
+    }
+    // If only one AccumReg in sources, acc2 = acc1 (same register).
+    for src in &op.sources {
+        if let Operand::AccumReg(r) = src {
+            return *r;
         }
     }
     log::error!(

@@ -7,7 +7,7 @@
 //! - **Pointer**: 8 x 20-bit address registers (p0-p7)
 //! - **Modifier**: 8 x 20-bit post-modify registers (m0-m7)
 //! - **Vector**: 32 x 256-bit SIMD registers (v0-v31)
-//! - **Accumulator**: 8 x 512-bit MAC accumulators (acc0-acc7)
+//! - **Accumulator**: 18 x 512-bit MAC accumulators (9 cm pairs: bml0-bml8 + bmh0-bmh8)
 //!
 //! The scalar register file is extended to 48 entries to include special-
 //! purpose registers at indices 32-47. In AIE2 hardware these are separate
@@ -79,7 +79,13 @@ pub const MOD_BASE_DC: u8 = 24;
 pub const NUM_VECTOR_REGS: usize = 32;
 
 /// Number of accumulator registers.
-pub const NUM_ACCUMULATOR_REGS: usize = 8;
+///
+/// AIE2 has 9 cm-registers (cm0-cm8), each 1024 bits. Each cm is composed
+/// of two 512-bit bm-registers (bml and bmh), giving 18 physical 512-bit
+/// entries. Our Operand::AccumReg indices use the bm-level numbering:
+///   bml_n = n*2, bmh_n = n*2+1, cm_n = n*2 (wide: reads n*2 and n*2+1).
+/// So indices range from 0 to 17 (cm8 = bml8 = index 16, bmh8 = index 17).
+pub const NUM_ACCUMULATOR_REGS: usize = 18;
 
 /// Mask for pointer/modifier values (tile-local address width, from archspec).
 const PTR_MASK: u32 = crate::arch::TILE_OFFSET_MASK;
@@ -452,8 +458,9 @@ impl fmt::Debug for VectorRegisterFile {
 
 /// Accumulator register file.
 ///
-/// 8 × 512-bit registers (acc0-acc7) for multiply-accumulate operations.
-/// Each register holds 8 × 64-bit or 16 × 32-bit accumulators.
+/// 18 × 512-bit registers for multiply-accumulate operations (9 cm-register
+/// pairs: cm0-cm8, each split into bml and bmh halves).
+/// Each 512-bit register holds 8 × 64-bit or 16 × 32-bit accumulators.
 #[derive(Clone)]
 pub struct AccumulatorRegisterFile {
     /// Each register is 512 bits = 8 × u64
@@ -477,36 +484,36 @@ impl AccumulatorRegisterFile {
     /// Read an accumulator register as 8 × u64.
     #[inline]
     pub fn read(&self, reg: u8) -> [u64; 8] {
-        self.regs[(reg & 0x07) as usize]
+        self.regs[(reg as usize) % NUM_ACCUMULATOR_REGS]
     }
 
     /// Write an accumulator register from 8 × u64.
     #[inline]
     pub fn write(&mut self, reg: u8, value: [u64; 8]) {
-        self.regs[(reg & 0x07) as usize] = value;
+        self.regs[(reg as usize) % NUM_ACCUMULATOR_REGS] = value;
     }
 
     /// Read a single lane (0-7) as u64.
     #[inline]
     pub fn read_lane(&self, reg: u8, lane: u8) -> u64 {
-        self.regs[(reg & 0x07) as usize][(lane & 0x07) as usize]
+        self.regs[(reg as usize) % NUM_ACCUMULATOR_REGS][(lane & 0x07) as usize]
     }
 
     /// Write a single lane (0-7).
     #[inline]
     pub fn write_lane(&mut self, reg: u8, lane: u8, value: u64) {
-        self.regs[(reg & 0x07) as usize][(lane & 0x07) as usize] = value;
+        self.regs[(reg as usize) % NUM_ACCUMULATOR_REGS][(lane & 0x07) as usize] = value;
     }
 
     /// Clear (zero) an accumulator register.
     #[inline]
     pub fn clear(&mut self, reg: u8) {
-        self.regs[(reg & 0x07) as usize] = [0; 8];
+        self.regs[(reg as usize) % NUM_ACCUMULATOR_REGS] = [0; 8];
     }
 
     /// Accumulate: add values to existing accumulator lanes.
     pub fn accumulate(&mut self, reg: u8, values: [u64; 8]) {
-        let idx = (reg & 0x07) as usize;
+        let idx = (reg as usize) % NUM_ACCUMULATOR_REGS;
         for (lane, val) in values.iter().enumerate() {
             self.regs[idx][lane] = self.regs[idx][lane].wrapping_add(*val);
         }

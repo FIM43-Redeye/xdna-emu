@@ -1141,7 +1141,30 @@ impl InstructionDecoder {
             // via itinerary table. Override by encoding name instead.
             "VBAND" => Some(SemanticOp::And),
             "VBOR" => Some(SemanticOp::Or),
-            _ => None,
+            _ => {
+                // MAC-family instructions: many encoding names lack
+                // build-time semantic assignment (no intrinsic pattern).
+                // Match by encoding name prefix to assign the correct
+                // MAC variant semantic.
+                let n = enc.name.as_str();
+                if n.starts_with("VNEGMAC_") || n.starts_with("VNEGMSC_") {
+                    Some(SemanticOp::NegMatMul)
+                } else if n.starts_with("VNEGMUL_") {
+                    Some(SemanticOp::NegMul)
+                } else if n.starts_with("VADDMAC_") || n.starts_with("VADDMSC_") {
+                    Some(SemanticOp::AddMac)
+                } else if n.starts_with("VSUBMAC_") || n.starts_with("VSUBMSC_") {
+                    Some(SemanticOp::SubMac)
+                } else if n.starts_with("VMAC_") {
+                    Some(SemanticOp::Mac)
+                } else if n.starts_with("VMSC_") {
+                    Some(SemanticOp::MatMulSub)
+                } else if n.starts_with("VMUL_") {
+                    Some(SemanticOp::MatMul)
+                } else {
+                    None
+                }
+            }
         };
 
         // Build SlotOp directly from SemanticOp (no Operation bridge).
@@ -1291,8 +1314,13 @@ impl Decoder for InstructionDecoder {
                 };
 
                 // Try to decode the slot bits against known encodings.
-                // Zero bits means no operation in this slot - treat as NOP.
-                if slot.slot_type == SlotType::Nop || slot.bits == 0 {
+                // Only explicit NOP slot type is treated as NOP here.
+                // Zero bits in a non-NOP slot is a VALID encoding (e.g.,
+                // vmac cm0, cm0, x0, x0, r0 has all-zero operand fields
+                // after format/discriminator bits are stripped). The LLVM
+                // FFI decoder handles the full encoding including the
+                // discriminator bits that build_bundle_32 re-adds.
+                if slot.slot_type == SlotType::Nop {
                     bundle.set_slot(SlotOp::nop(slot_index));
                 } else if let Some((decoded, dest, sources, extracted_pm, ffi_opcode)) =
                     self.try_decode_via_ffi(slot.bits, slot.slot_type)
