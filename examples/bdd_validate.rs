@@ -105,17 +105,29 @@ fn main() {
                 continue;
             }
 
-            match decoder.decode_slot_bits(slot.bits, slot.slot_type) {
+            // Use the production FFI decode path.
+            let ffi_slot = match slot.slot_type {
+                SlotType::Alu => Some(xdna_emu::tablegen::decoder_ffi::Slot::Alu),
+                SlotType::Lda => Some(xdna_emu::tablegen::decoder_ffi::Slot::Lda),
+                SlotType::Ldb => Some(xdna_emu::tablegen::decoder_ffi::Slot::Ldb),
+                SlotType::Lng => Some(xdna_emu::tablegen::decoder_ffi::Slot::Lng),
+                SlotType::Mv  => Some(xdna_emu::tablegen::decoder_ffi::Slot::Mv),
+                SlotType::St  => Some(xdna_emu::tablegen::decoder_ffi::Slot::St),
+                SlotType::Vec => Some(xdna_emu::tablegen::decoder_ffi::Slot::Vec),
+                _ => None,
+            };
+            match ffi_slot.and_then(|s| xdna_emu::tablegen::decoder_ffi::decode_slot(s, slot.bits)) {
                 Some(decoded) => {
                     slots_decoded += 1;
-                    let enc_name = &decoded.encoding.name;
-                    let mnemonic = &decoded.encoding.mnemonic;
+                    let enc_name = &decoded.name;
+                    // Derive mnemonic from name (lowercase, strip suffix).
+                    let mnemonic = enc_name.split('_').next().unwrap_or(enc_name).to_lowercase();
 
                     slot_results.push(format!("{}:{}[{}]",
                         slot_type_name(slot.slot_type), mnemonic, enc_name));
 
                     *encoding_counts.entry(enc_name.clone()).or_insert(0) += 1;
-                    *mnemonic_counts.entry(mnemonic.clone()).or_insert(0) += 1;
+                    *mnemonic_counts.entry(mnemonic).or_insert(0) += 1;
                 }
                 None => {
                     slots_failed += 1;
