@@ -212,6 +212,8 @@ impl VectorAlu {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let result = Self::vector_compare_ge(&a, &b, et);
                 Self::write_vector_dest(op, ctx, result);
+                // cmp = packed bitmask of the same comparison
+                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&result, et));
                 true
             }
 
@@ -219,6 +221,8 @@ impl VectorAlu {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let result = Self::vector_compare_lt(&a, &b, et);
                 Self::write_vector_dest(op, ctx, result);
+                // cmp = packed bitmask of the same comparison
+                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&result, et));
                 true
             }
 
@@ -234,6 +238,9 @@ impl VectorAlu {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let result = Self::vector_max(&a, &b, et);
                 Self::write_vector_dest(op, ctx, result);
+                // cmp = per-element (a < b)
+                let cmp = Self::vector_compare_lt(&a, &b, et);
+                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&cmp, et));
                 true
             }
 
@@ -241,6 +248,9 @@ impl VectorAlu {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let result = Self::vector_min(&a, &b, et);
                 Self::write_vector_dest(op, ctx, result);
+                // cmp = per-element (a >= b)
+                let cmp = Self::vector_compare_ge(&a, &b, et);
+                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&cmp, et));
                 true
             }
 
@@ -420,37 +430,45 @@ impl VectorAlu {
                 let src = Self::get_vector_source(op, ctx, 0);
                 let result = Self::vector_abs_gtz(&src, et);
                 Self::write_vector_dest(op, ctx, result);
+                // cmp = per-element (s > 0)
+                let zero = [0u32; 8];
+                let cmp = Self::vector_compare_lt(&zero, &src, et); // 0 < s  =>  s > 0
+                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&cmp, et));
                 true
             }
 
             SemanticOp::NegGtz => {
-                // VNEG_GTZ: conditional negate based on another vector's sign.
-                // vneg_gtz.16 $d, $cmp, $s1:
-                //   d[i] = (cmp[i] > 0) ? -s1[i] : s1[i]
                 let vec_source_count = op.sources.iter()
                     .filter(|s| matches!(s, Operand::VectorReg(_)))
                     .count();
 
-                if vec_source_count >= 2 {
-                    let cmp = Self::get_vector_source(op, ctx, 0);
+                let src = if vec_source_count >= 2 {
+                    let cond = Self::get_vector_source(op, ctx, 0);
                     let s1 = Self::get_vector_source(op, ctx, 1);
-                    let result = Self::vector_bneg_gtz(&cmp, &s1, et);
+                    let result = Self::vector_bneg_gtz(&cond, &s1, et);
                     Self::write_vector_dest(op, ctx, result);
+                    s1
                 } else {
                     let src = Self::get_vector_source(op, ctx, 0);
                     let result = Self::vector_neg_gtz(&src, et);
                     Self::write_vector_dest(op, ctx, result);
-                }
+                    src
+                };
+                // cmp = per-element (s > 0)
+                let zero = [0u32; 8];
+                let cmp = Self::vector_compare_lt(&zero, &src, et);
+                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&cmp, et));
                 true
             }
 
             SemanticOp::NegLtz => {
-                // TODO: VBNEG_LTZ has two vector sources (cmp, s1) for
-                // conditional negate. Currently using single-source abs path
-                // which is correct when cmp == src but wrong otherwise.
                 let src = Self::get_vector_source(op, ctx, 0);
                 let result = Self::vector_neg_ltz(&src, et);
                 Self::write_vector_dest(op, ctx, result);
+                // cmp = per-element (s < 0)
+                let zero = [0u32; 8];
+                let cmp = Self::vector_compare_lt(&src, &zero, et);
+                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&cmp, et));
                 true
             }
 
@@ -516,6 +534,9 @@ impl VectorAlu {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let result = Self::vector_sub_lt(&a, &b, et);
                 Self::write_vector_dest(op, ctx, result);
+                // cmp = per-element (a < b)
+                let cmp = Self::vector_compare_lt(&a, &b, et);
+                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&cmp, et));
                 true
             }
 
@@ -523,6 +544,9 @@ impl VectorAlu {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let result = Self::vector_sub_ge(&a, &b, et);
                 Self::write_vector_dest(op, ctx, result);
+                // cmp = per-element (a >= b)
+                let cmp = Self::vector_compare_ge(&a, &b, et);
+                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&cmp, et));
                 true
             }
 
@@ -530,6 +554,9 @@ impl VectorAlu {
                 let (a, b) = Self::get_two_vector_sources(op, ctx);
                 let result = Self::vector_maxdiff_lt(&a, &b, et);
                 Self::write_vector_dest(op, ctx, result);
+                // cmp = per-element (a < b)
+                let cmp = Self::vector_compare_lt(&a, &b, et);
+                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&cmp, et));
                 true
             }
 
@@ -1727,6 +1754,56 @@ impl VectorAlu {
         if let Some(Operand::ScalarReg(r)) = &op.dest {
             ctx.scalar.write(*r, value);
         }
+    }
+
+    /// Write comparison flags to the secondary destination register (cmp) of
+    /// dual-result instructions (VSUB_LT, VABS_GTZ, VNEG_GTZ, etc.).
+    ///
+    /// The cmp register receives a per-element bitmask: bit i is set when the
+    /// comparison is true for element i.
+    fn write_cmp_dest(op: &SlotOp, ctx: &mut ExecutionContext, flags: u32) {
+        if let Some(Operand::ScalarReg(r)) = op.extra_dests.first() {
+            ctx.scalar.write(*r, flags);
+        }
+    }
+
+    /// Compute per-element comparison flags from a vector comparison result.
+    ///
+    /// Takes the expanded mask (all-ones or all-zeros per element) and packs
+    /// it into a scalar bitmask: bit i = 1 if element i was non-zero.
+    fn pack_comparison_flags(mask: &[u32; 8], elem_type: ElementType) -> u32 {
+        let mut flags: u32 = 0;
+        match elem_type {
+            ElementType::Int32 | ElementType::UInt32
+            | ElementType::Int64 | ElementType::UInt64
+            | ElementType::Float32 => {
+                // 8 elements of 32-bit
+                for i in 0..8 {
+                    if mask[i] != 0 { flags |= 1 << i; }
+                }
+            }
+            ElementType::Int16 | ElementType::UInt16 | ElementType::BFloat16 => {
+                // 16 elements of 16-bit
+                for i in 0..8 {
+                    let lo = mask[i] & 0xFFFF;
+                    let hi = (mask[i] >> 16) & 0xFFFF;
+                    let bit = i * 2;
+                    if lo != 0 { flags |= 1 << bit; }
+                    if hi != 0 { flags |= 1 << (bit + 1); }
+                }
+            }
+            ElementType::Int8 | ElementType::UInt8 => {
+                // 32 elements of 8-bit
+                for i in 0..8 {
+                    for j in 0..4 {
+                        let byte = (mask[i] >> (j * 8)) & 0xFF;
+                        let bit = i * 4 + j;
+                        if byte != 0 { flags |= 1 << bit; }
+                    }
+                }
+            }
+        }
+        flags
     }
 
     /// Get current value of vector destination (for read-modify-write ops like insert).

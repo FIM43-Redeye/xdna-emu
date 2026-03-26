@@ -278,6 +278,10 @@ pub struct SlotOp {
     pub sources: SmallVec<[Operand; 4]>,
     /// Destination operand (if any).
     pub dest: Option<Operand>,
+    /// Additional destination operands (e.g., `cmp` register for dual-result
+    /// instructions like VSUB_LT, VABS_GTZ).  The first def becomes `dest`;
+    /// remaining defs are stored here.
+    pub extra_dests: SmallVec<[Operand; 1]>,
     /// Optional predicate for conditional execution.
     pub predicate: Option<Predicate>,
     /// Encoding mnemonic from TableGen (e.g., "jl", "mova", "vadd").
@@ -439,6 +443,7 @@ impl SlotOp {
             shuffle_pattern: ShufflePattern::default(),
             sources: SmallVec::new(),
             dest: None,
+            extra_dests: SmallVec::new(),
             predicate: None,
             encoding_name: None,
             raw_opcode: None,
@@ -498,6 +503,7 @@ impl SlotOp {
             shuffle_pattern: ShufflePattern::default(),
             sources: SmallVec::new(),
             dest: None,
+            extra_dests: SmallVec::new(),
             predicate: None,
             encoding_name: None,
             raw_opcode: None,

@@ -507,7 +507,7 @@ impl InstructionDecoder {
         &self,
         bits: u64,
         slot_type: crate::interpreter::bundle::SlotType,
-    ) -> Option<(DecodedInstr, Option<Operand>, Vec<Operand>, Option<PostModify>, Option<u32>)> {
+    ) -> Option<(DecodedInstr, Option<Operand>, Vec<Operand>, Option<PostModify>, Option<u32>, Vec<Operand>)> {
         let ffi_slot = Self::slot_type_to_ffi(slot_type)?;
         let ffi_result = decoder_ffi::decode_slot(ffi_slot, bits)?;
 
@@ -526,7 +526,7 @@ impl InstructionDecoder {
         let encoding = self.index.encoding_by_name(slot_name, &ffi_result.name)?;
 
         // Map LLVM operands to our Operand type.
-        let (dest, sources, post_modify) =
+        let (dest, sources, post_modify, extra_defs) =
             Self::extract_operands_from_ffi(&ffi_result, encoding);
 
         // Build a minimal DecodedInstr with empty raw operands (we don't need
@@ -537,7 +537,7 @@ impl InstructionDecoder {
             operands: HashMap::new(),
         };
 
-        Some((decoded_instr, dest, sources, post_modify, Some(ffi_result.opcode)))
+        Some((decoded_instr, dest, sources, post_modify, Some(ffi_result.opcode), extra_defs))
     }
 
     /// Extract dest, sources, and post-modify from LLVM FFI decode result.
@@ -548,7 +548,7 @@ impl InstructionDecoder {
     fn extract_operands_from_ffi(
         ffi_result: &DecodeResult,
         encoding: &InstrEncoding,
-    ) -> (Option<Operand>, Vec<Operand>, Option<PostModify>) {
+    ) -> (Option<Operand>, Vec<Operand>, Option<PostModify>, Vec<Operand>) {
         let num_defs = ffi_result.num_defs as usize;
 
         // Map all LLVM operands to our Operand type.
@@ -575,7 +575,11 @@ impl InstructionDecoder {
         let mut use_ops: Vec<Operand> = mapped[split_at..].iter().filter_map(|o| o.clone()).collect();
 
         // Destination: first def operand (if any and writable).
-        let mut dest = def_ops.into_iter().next();
+        // Remaining defs (e.g., cmp register in dual-result instructions)
+        // are saved in extra_defs for later attachment to SlotOp.
+        let mut def_iter = def_ops.into_iter();
+        let mut dest = def_iter.next();
+        let extra_defs: Vec<Operand> = def_iter.collect();
         if let Some(ref d) = dest {
             if !can_be_dest(d) {
                 // Non-writable in dest position (config immediate, etc.) -- move to sources.
@@ -612,7 +616,7 @@ impl InstructionDecoder {
                 use_ops.retain(|o| !matches!(o, Operand::PointerReg(p) if *p == dp));
             }
             // Sources are whatever remains (offset immediate or modifier reg).
-            return (dest, use_ops, post_modify);
+            return (dest, use_ops, post_modify, extra_defs);
         }
 
         // Handle memory addressing modes: combine pointer + offset into Memory
@@ -696,7 +700,7 @@ impl InstructionDecoder {
             }
         }
 
-        (dest, use_ops, post_modify)
+        (dest, use_ops, post_modify, extra_defs)
     }
 
     /// Extract operands from decoded instruction using data-driven dispatch.
@@ -704,7 +708,7 @@ impl InstructionDecoder {
     /// Legacy bit-field extraction method. Retained for cross-validation tests
     /// against the LLVM FFI operand extraction. Not used in production.
     #[cfg(test)]
-    fn extract_operands(&self, decoded: &DecodedInstr) -> (Option<Operand>, Vec<Operand>, Option<PostModify>) {
+    fn extract_operands(&self, decoded: &DecodedInstr) -> (Option<Operand>, Vec<Operand>, Option<PostModify>, Vec<Operand>) {
         let mut field_operands: HashMap<String, Operand> = HashMap::new();
         let mut direct_dest: Option<Operand> = None;
         let mut extra_sources: Vec<Operand> = Vec::new();
@@ -855,7 +859,9 @@ impl InstructionDecoder {
             extra_sources,
         );
 
-        (dest, sources, extracted_post_modify)
+        // Legacy path doesn't extract extra defs (dual-result support is
+        // FFI-only).
+        (dest, sources, extracted_post_modify, vec![])
     }
 
     /// Decode an address generator field (ag_all, ag_nospill, agb_sa, etc.).
@@ -1333,7 +1339,7 @@ impl Decoder for InstructionDecoder {
                 // discriminator bits that build_bundle_32 re-adds.
                 if slot.slot_type == SlotType::Nop {
                     bundle.set_slot(SlotOp::nop(slot_index));
-                } else if let Some((decoded, dest, sources, extracted_pm, ffi_opcode)) =
+                } else if let Some((decoded, dest, sources, extracted_pm, ffi_opcode, extra_defs)) =
                     self.try_decode_via_ffi(slot.bits, slot.slot_type)
                 {
                     // LLVM FFI is the sole production decoder for both instruction
@@ -1342,6 +1348,11 @@ impl Decoder for InstructionDecoder {
                         slot_index, &decoded, dest, sources, extracted_pm,
                     );
                     slot_op.llvm_opcode = ffi_opcode;
+                    // Attach secondary destinations (e.g., cmp register for
+                    // dual-result instructions like VSUB_LT, VABS_GTZ).
+                    for ed in extra_defs {
+                        slot_op.extra_dests.push(ed);
+                    }
 
                     // Validate SemanticOp against LLVM's MCInstrDesc flags.
                     self.validate_semantic_vs_flags(&slot_op);
@@ -1772,7 +1783,7 @@ mod tests {
                 continue;
             }
             if let Some(decoded) = decoder.decode_slot_bits(slot.bits, slot.slot_type) {
-                let (dest, sources, _pm) = decoder.extract_operands(&decoded);
+                let (dest, sources, _pm, _) = decoder.extract_operands(&decoded);
                 results.push((decoded.encoding.mnemonic.clone(), dest, sources));
             } else {
                 results.push((format!("UNKNOWN_{:?}", slot.slot_type), None, vec![]));
@@ -1855,7 +1866,7 @@ mod tests {
         // Verify the key assertion: add_314 MV slot should decode to mov r6, #6
         let mv_314 = ext_314.slots.iter().find(|s| s.slot_type == crate::interpreter::bundle::SlotType::Mv).unwrap();
         let decoded_mv_314 = decoder.decode_slot_bits(mv_314.bits, mv_314.slot_type).unwrap();
-        let (dest, sources, _) = decoder.extract_operands(&decoded_mv_314);
+        let (dest, sources, _, _) = decoder.extract_operands(&decoded_mv_314);
         assert_eq!(dest, Some(Operand::ScalarReg(6)), "Expected dest=r6");
         assert_eq!(sources, vec![Operand::Immediate(6)], "Expected source=Immediate(6)");
     }
@@ -1897,7 +1908,7 @@ mod tests {
         let decoded = decoder.decode_slot_bits(bits, SlotType::Lng)
             .expect("Should decode movxm r3, #0x7ff");
         assert_eq!(decoded.encoding.mnemonic, "movxm");
-        let (dest, sources, _) = decoder.extract_operands(&decoded);
+        let (dest, sources, _, _) = decoder.extract_operands(&decoded);
         assert_eq!(dest, Some(Operand::ScalarReg(3)));
         assert_eq!(sources, vec![Operand::Immediate(0x7ff)]);
 
@@ -1906,7 +1917,7 @@ mod tests {
         let bits = build_movxm(0x100, 35);
         let decoded = decoder.decode_slot_bits(bits, SlotType::Lng)
             .expect("Should decode movxm p2, #0x100");
-        let (dest, sources, _) = decoder.extract_operands(&decoded);
+        let (dest, sources, _, _) = decoder.extract_operands(&decoded);
         assert_eq!(dest, Some(Operand::PointerReg(2)));
         assert_eq!(sources, vec![Operand::Immediate(0x100)]);
 
@@ -1915,7 +1926,7 @@ mod tests {
         let bits = build_movxm(0x70000, 103);
         let decoded = decoder.decode_slot_bits(bits, SlotType::Lng)
             .expect("Should decode movxm sp, #0x70000");
-        let (dest, sources, _) = decoder.extract_operands(&decoded);
+        let (dest, sources, _, _) = decoder.extract_operands(&decoded);
         assert_eq!(dest, Some(Operand::PointerReg(crate::interpreter::state::SP_PTR_INDEX)), "SP should map to dedicated SP");
         assert_eq!(sources, vec![Operand::Immediate(0x70000)]);
 
@@ -1928,7 +1939,7 @@ mod tests {
         let bits = build_movxm(0x1234, 39);
         let decoded = decoder.decode_slot_bits(bits, SlotType::Lng)
             .expect("Should decode movxm lr, #0x1234");
-        let (dest, sources, _) = decoder.extract_operands(&decoded);
+        let (dest, sources, _, _) = decoder.extract_operands(&decoded);
         assert_eq!(dest, Some(Operand::ScalarReg(LR_REG_INDEX)),
             "lr must decode as ScalarReg(LR), not PointerReg(2)");
         assert_eq!(sources, vec![Operand::Immediate(0x1234)]);
@@ -2094,7 +2105,7 @@ mod tests {
             operands,
         };
 
-        let (dest, sources, _post_modify) = decoder.extract_operands(&decoded);
+        let (dest, sources, _post_modify, _) = decoder.extract_operands(&decoded);
 
         // PADD: ptr becomes destination, imm becomes source
         assert_eq!(dest, Some(Operand::PointerReg(3)),
@@ -2112,7 +2123,7 @@ mod tests {
             operands: decoded.operands.clone(),
         };
 
-        let (dest, sources, _) = decoder.extract_operands(&load_decoded);
+        let (dest, sources, _, _) = decoder.extract_operands(&load_decoded);
 
         // Non-padd: ptr+imm combine into Memory operand as source
         assert!(dest.is_none() || !matches!(dest, Some(Operand::PointerReg(3))),
@@ -2495,12 +2506,12 @@ mod tests {
                         let ffi_result = decoder.try_decode_via_ffi(slot.bits, slot.slot_type);
                         let legacy_result = decoder.decode_slot_bits(slot.bits, slot.slot_type)
                             .map(|d| {
-                                let (dest, sources, pm) = decoder.extract_operands(&d);
+                                let (dest, sources, pm, _extra) = decoder.extract_operands(&d);
                                 (d, dest, sources, pm)
                             });
 
                         match (ffi_result, legacy_result) {
-                            (Some((_, ffi_dest, ffi_src, ffi_pm, _)), Some((_, leg_dest, leg_src, leg_pm))) => {
+                            (Some((_, ffi_dest, ffi_src, ffi_pm, _, _)), Some((_, leg_dest, leg_src, leg_pm))) => {
                                 ffi_hits += 1;
                                 if ffi_dest == leg_dest && ffi_src == leg_src && ffi_pm == leg_pm {
                                     matches += 1;
@@ -2562,10 +2573,10 @@ mod tests {
                         if slot.slot_type == SlotType::Nop || slot.bits == 0 { continue; }
                         let ffi = decoder.try_decode_via_ffi(slot.bits, slot.slot_type);
                         let leg = decoder.decode_slot_bits(slot.bits, slot.slot_type).map(|d| {
-                            let (dest, sources, pm) = decoder.extract_operands(&d);
+                            let (dest, sources, pm, _) = decoder.extract_operands(&d);
                             (d, dest, sources, pm)
                         });
-                        if let (Some((_, fd, fs, fp, _)), Some((_, ld, ls, lp))) = (ffi, leg) {
+                        if let (Some((_, fd, fs, fp, _, _)), Some((_, ld, ls, lp))) = (ffi, leg) {
                             if fd == ld && fs == ls && fp == lp { continue; }
                             // Categorize
                             if ld.is_some() && fd.is_none() && matches!(ld, Some(Operand::ModifierReg(_))) {
@@ -2750,14 +2761,14 @@ mod tests {
                     let ffi = decoder.try_decode_via_ffi(slot.bits, slot.slot_type);
                     let leg = decoder.decode_slot_bits(slot.bits, slot.slot_type).map(|d| {
                         let name = d.encoding.name.clone();
-                        let (dest, sources, pm) = decoder.extract_operands(&d);
+                        let (dest, sources, pm, _) = decoder.extract_operands(&d);
                         (name, dest, sources, pm)
                     });
 
-                    let ffi_name = ffi.as_ref().map(|(d, _, _, _, _)| d.encoding.name.as_str()).unwrap_or("FAIL");
+                    let ffi_name = ffi.as_ref().map(|(d, _, _, _, _, _)| d.encoding.name.as_str()).unwrap_or("FAIL");
                     let leg_name = leg.as_ref().map(|(n, _, _, _)| n.as_str()).unwrap_or("FAIL");
 
-                    let ffi_ops = ffi.as_ref().map(|(_, d, s, p, _)| format!("dest={:?} src={:?} pm={:?}", d, s, p));
+                    let ffi_ops = ffi.as_ref().map(|(_, d, s, p, _, _)| format!("dest={:?} src={:?} pm={:?}", d, s, p));
                     let leg_ops = leg.as_ref().map(|(_, d, s, p)| format!("dest={:?} src={:?} pm={:?}", d, s, p));
 
                     let status = if ffi_ops == leg_ops { "OK" } else { "DIFF" };
