@@ -1772,6 +1772,16 @@ impl VectorAlu {
         }
     }
 
+    /// Write a 64-bit comparison bitmask to the cmp register pair (for 8-bit
+    /// element comparisons that need 64 bits: 32 elements per half * 2 halves).
+    fn write_cmp_dest_wide(op: &SlotOp, ctx: &mut ExecutionContext, flags: u64) {
+        if let Some(Operand::ScalarReg(r)) = op.extra_dests.first() {
+            // Write low 32 bits to rN, high 32 bits to rN+1.
+            ctx.scalar.write(*r, flags as u32);
+            ctx.scalar.write(*r + 1, (flags >> 32) as u32);
+        }
+    }
+
     /// Compute per-element comparison flags from a vector comparison result.
     ///
     /// Takes the expanded mask (all-ones or all-zeros per element) and packs
@@ -3459,12 +3469,29 @@ impl VectorAlu {
                     let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
                     let mask_hi = Self::condense_comparison_mask(&hi, op.element_type);
                     let lanes_per_half = 256 / et.bits() as u32;
-                    // Use u64 for the combined mask since lanes_per_half can
-                    // be 32 (8-bit elements), which would overflow a u32 shift.
                     let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
-                    Self::write_scalar_dest(op, ctx, full_mask as u32);
+                    // For 8-bit elements, the mask needs 64 bits (register pair).
+                    if lanes_per_half >= 32 {
+                        Self::write_cmp_dest_wide(op, ctx, full_mask);
+                    } else {
+                        Self::write_scalar_dest(op, ctx, full_mask as u32);
+                    }
+                    // Also write to extra_dests (cmp register) for 16/32-bit.
+                    Self::write_cmp_dest(op, ctx, full_mask as u32);
                 } else {
                     Self::write_wide_vec_dest(op, ctx, result);
+                    // Write packed cmp flags to secondary dest.
+                    let lo: [u32; 8] = result[..8].try_into().unwrap();
+                    let hi: [u32; 8] = result[8..].try_into().unwrap();
+                    let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
+                    let mask_hi = Self::condense_comparison_mask(&hi, op.element_type);
+                    let lanes_per_half = 256 / et.bits() as u32;
+                    let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
+                    if lanes_per_half >= 32 {
+                        Self::write_cmp_dest_wide(op, ctx, full_mask);
+                    } else {
+                        Self::write_cmp_dest(op, ctx, full_mask as u32);
+                    }
                 }
                 true
             }
@@ -3478,12 +3505,26 @@ impl VectorAlu {
                     let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
                     let mask_hi = Self::condense_comparison_mask(&hi, op.element_type);
                     let lanes_per_half = 256 / et.bits() as u32;
-                    // Use u64 for the combined mask since lanes_per_half can
-                    // be 32 (8-bit elements), which would overflow a u32 shift.
                     let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
-                    Self::write_scalar_dest(op, ctx, full_mask as u32);
+                    if lanes_per_half >= 32 {
+                        Self::write_cmp_dest_wide(op, ctx, full_mask);
+                    } else {
+                        Self::write_scalar_dest(op, ctx, full_mask as u32);
+                    }
+                    Self::write_cmp_dest(op, ctx, full_mask as u32);
                 } else {
                     Self::write_wide_vec_dest(op, ctx, result);
+                    let lo: [u32; 8] = result[..8].try_into().unwrap();
+                    let hi: [u32; 8] = result[8..].try_into().unwrap();
+                    let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
+                    let mask_hi = Self::condense_comparison_mask(&hi, op.element_type);
+                    let lanes_per_half = 256 / et.bits() as u32;
+                    let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
+                    if lanes_per_half >= 32 {
+                        Self::write_cmp_dest_wide(op, ctx, full_mask);
+                    } else {
+                        Self::write_cmp_dest(op, ctx, full_mask as u32);
+                    }
                 }
                 true
             }
