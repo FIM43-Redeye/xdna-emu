@@ -3344,6 +3344,40 @@ impl VectorAlu {
                 Self::write_wide_vec_dest(op, ctx, result);
                 true
             }
+            SemanticOp::VectorSelect => {
+                // VSEL: 512-bit select with scalar bitmask.
+                // Must split the selector across lo/hi halves.
+                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                let sel_scalar = op.sources.iter().find_map(|s| match s {
+                    Operand::ScalarReg(r) => Some(ctx.scalar.read(*r)),
+                    _ => None,
+                }).unwrap_or(0);
+                let a_lo: [u32; 8] = a[..8].try_into().unwrap();
+                let a_hi: [u32; 8] = a[8..].try_into().unwrap();
+                let b_lo: [u32; 8] = b[..8].try_into().unwrap();
+                let b_hi: [u32; 8] = b[8..].try_into().unwrap();
+                let elems_per_half = 256 / et.bits() as u32;
+                let sel_lo = Self::expand_select_mask(sel_scalar, et);
+                let sel_hi_bits = if elems_per_half >= 32 {
+                    // 8-bit: second register of pair
+                    op.sources.iter().filter_map(|s| match s {
+                        Operand::ScalarReg(r) => Some(ctx.scalar.read(*r)),
+                        _ => None,
+                    }).nth(1).unwrap_or(0)
+                } else {
+                    sel_scalar >> elems_per_half
+                };
+                let sel_hi = Self::expand_select_mask(sel_hi_bits, et);
+                // Hardware: bit=0 -> s1, bit=1 -> s2
+                let lo = Self::vector_select(&sel_lo, &b_lo, &a_lo, et);
+                let hi = Self::vector_select(&sel_hi, &b_hi, &a_hi, et);
+                let mut result = [0u32; 16];
+                result[..8].copy_from_slice(&lo);
+                result[8..].copy_from_slice(&hi);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+
             SemanticOp::Neg => {
                 // Two sub-cases:
                 // 1. AccumReg source: VNEG on cm-class accumulator (1024-bit)
