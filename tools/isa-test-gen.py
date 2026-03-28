@@ -4135,6 +4135,182 @@ def _vmac_configs_for_instr(name: str) -> list[int]:
     return configs
 
 
+_ACCUM_ARITH_MNEMONICS = frozenset({
+    "vadd", "vadd.f",
+    "vsub", "vsub.f",
+    "vneg", "vneg.f",
+    "vnegadd", "vnegadd.f",
+    "vnegsub", "vnegsub.f",
+})
+
+
+def _accum_arith_configs() -> list[int]:
+    """Config words for accumulator add/sub/neg instructions.
+
+    Bit layout (from execute_acc_add_sub):
+        bit 0:     zero_acc1  (1 = clear acc1 before operation)
+        bit 10:    shift16    (1 = right-shift result by 16)
+        bit 11:    sub_acc1   (1 = negate acc1)
+        bit 12:    sub_acc2   (1 = negate acc2)
+
+    Config=0 tests the plain operation (no zeroing, no shift, no
+    negation).  Additional config values (zero_acc1, shift16, etc.) can
+    be added once the basic path is validated.
+    """
+    return [
+        0x0000,  # Plain operation (no zeroing, no shift, no negation)
+    ]
+
+
+class AccumArithStrategy(TestStrategy):
+    """Tests accumulator add/sub/neg instructions with valid config words.
+
+    These instructions (vadd, vadd.f, vsub, vneg, etc.) take a scalar
+    config register ($c) that controls zero_acc1, shift16, sub_acc1,
+    sub_acc2 flags.  Without a valid config word, random data in the
+    config register causes undefined behavior (e.g., zeroing an
+    accumulator, negating an operand, or shifting the result).
+
+    Uses the same test-point generation pattern as VmacStrategy:
+    load inputs -> set config via mov -> execute -> store outputs.
+    """
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        mnemonic = instr.get("mnemonic", "")
+        if mnemonic not in _ACCUM_ARITH_MNEMONICS:
+            return (False, "not an accumulator arithmetic instruction")
+        if _is_sp_relative(instr):
+            return (False, "SP-relative (unexpected)")
+        status, reason = classify_instruction(instr)
+        if status != "testable":
+            return (False, reason)
+        return (True, "")
+
+    def _find_config_operand(self, instr: dict) -> Optional[str]:
+        """Find the config register operand name (usually 'c')."""
+        for op in instr.get("operands", []):
+            if op["name"] == "c" and op.get("register_kind") == "scalar":
+                return "c"
+        return None
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        """Generate combos pairing register assignments with valid configs."""
+        base_combos = generate_operand_combos(instr)
+        if not base_combos:
+            return []
+
+        configs = _accum_arith_configs()
+        MAX_REG_COMBOS = 5
+        capped_combos = base_combos[:MAX_REG_COMBOS]
+
+        combos = []
+        for cfg in configs:
+            for base in capped_combos:
+                combo = dict(base)
+                combo["_vmac_config"] = cfg
+                combos.append(combo)
+        return combos
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
+        """Generate test point with config register initialization.
+
+        Identical structure to VmacStrategy.generate_test_point -- load
+        inputs, set config via mov, execute, store outputs.
+        """
+        lines = []
+        name = instr["name"]
+        config_val = regs.get("_vmac_config", 0)
+        lines.append(f"  // ---- test (accum_arith): {name} config=0x{config_val:x} ----")
+
+        op_by_name = {op["name"]: op for op in instr.get("operands", [])}
+        outputs = detect_output_operands(instr)
+        output_names = {op["name"] for op in outputs}
+        asm_op_names = re.findall(r'\$(\w+)', instr.get("asm_string", ""))
+
+        # Load input registers from [p0, #offset].
+        cur_in_offset = in_offset
+        for op_name in asm_op_names:
+            if op_name in output_names:
+                continue
+            if op_name not in op_by_name:
+                continue
+            op = op_by_name[op_name]
+            kind = _effective_kind(op)
+            if not kind:
+                continue
+            if kind not in KNOWN_REGISTER_KINDS:
+                continue
+            if op_name == "c":
+                continue  # Config set via mov, not loaded from buffer.
+            align = 32 if kind in ("vector256", "vector512", "accumulator",
+                                    "wide_y", "sparse_qx", "quad") else 4
+            cur_in_offset = _align(cur_in_offset, align)
+            reg = regs.get(op_name, "r0")
+            load_lines = _load_instruction(reg, kind, "p0", cur_in_offset)
+            lines.extend(load_lines)
+            cur_in_offset += _operand_size(op, name)
+
+        # NOP sled for load pipeline latency.
+        lines.extend(_nop_sled(LOAD_LATENCY))
+
+        # Initialize the config register with a valid config word.
+        config_reg = regs.get("c", "r0")
+        if config_val <= 0x1FF:
+            lines.append(f"  mov {config_reg}, #{config_val}")
+        else:
+            lines.append(f"  movxm {config_reg}, #{config_val}")
+
+        # The instruction itself.
+        asm_line = "  " + _substitute_asm(instr["asm_string"], regs,
+                                          has_modifier=_has_modifier_operand(instr))
+        lines.append(asm_line)
+
+        # NOP sled after instruction: must cover result latency.
+        lines.extend(_nop_sled(result_latency(instr)))
+
+        # Store output registers to [p1, #offset].
+        cur_out_offset = out_offset
+        for op in outputs:
+            kind = _effective_kind(op) or op.get("register_kind", "")
+            align = 32 if kind in ("vector256", "vector512", "accumulator",
+                                    "wide_y", "sparse_qx", "quad") else 4
+            cur_out_offset = _align(cur_out_offset, align)
+            reg = regs.get(op["name"], "r0")
+            store_lines = _store_instruction(reg, kind, "p1", cur_out_offset)
+            lines.extend(store_lines)
+            cur_out_offset += _operand_size(op, name)
+
+        lines.append("")
+        return "\n".join(lines)
+
+    def compute_input_size(self, instr, regs):
+        """Input size excludes the config register (set via mov)."""
+        operands = instr.get("operands", [])
+        op_by_name = {op["name"]: op for op in operands}
+        outputs = detect_output_operands(instr)
+        output_names = {op["name"] for op in outputs}
+        asm_op_names = re.findall(r'\$(\w+)', instr.get("asm_string", ""))
+        instr_name = instr.get("name", "")
+
+        total = 0
+        for op_name in asm_op_names:
+            if op_name in output_names:
+                continue
+            if op_name not in op_by_name:
+                continue
+            if op_name == "c":
+                continue
+            op = op_by_name[op_name]
+            kind = _effective_kind(op)
+            if not kind or kind not in KNOWN_REGISTER_KINDS:
+                continue
+            align = 32 if kind in ("vector256", "vector512", "accumulator",
+                                    "wide_y", "sparse_qx", "quad") else 4
+            total = _align(total, align)
+            total += _operand_size(op, instr_name)
+        return max(4, total)
+
+
 class VmacStrategy(TestStrategy):
     """Tests MAC/MUL instructions with valid config words.
 
@@ -4341,6 +4517,7 @@ STRATEGIES: list[TestStrategy] = [
     PaddaSpStrategy(),
     LoadStrategy(),
     StoreStrategy(),
+    AccumArithStrategy(),   # must be before ComputeStrategy
     VmacStrategy(),         # must be before ComputeStrategy
     ComputeStrategy(),
 ]
