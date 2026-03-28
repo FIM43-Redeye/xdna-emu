@@ -414,6 +414,73 @@ pub fn refine_branch_semantic(mnemonic: &str, semantic: Option<String>) -> Optio
 }
 
 // ---------------------------------------------------------------------------
+// Encoding-name semantic refinement (build-time)
+// ---------------------------------------------------------------------------
+
+/// Correct semantics for instructions where pattern/itinerary inference
+/// assigns the wrong operation.
+///
+/// Unlike earlier layers, this function OVERRIDES existing semantics when
+/// it has a definitive answer. This is necessary because:
+/// - VMSC_* gets `Mac` from itinerary (II_VMAC) but is really `MatMulSub`
+/// - VNEGMAC_* gets `NegMul` from patterns but is really `NegMatMul`
+/// - ASHL gets `Sra` from patterns but is really `AshlBidir`
+/// - EXTENDu8/u16 get `And` from patterns but are really `ZeroExtend`
+/// - MOV_CNTR gets `Copy` from patterns but is really `ReadCycleCounter`
+///
+/// This runs at build time, so the name-matching cost is zero at runtime.
+pub fn refine_encoding_semantic(encoding_name: &str) -> Option<String> {
+    // MAC-family instructions: encoding names encode the operation variant.
+    // These all target the accumulator slot. Earlier layers may assign a
+    // wrong semantic (e.g., itinerary assigns Mac to all MAC-family).
+    let n = encoding_name;
+    if n.starts_with("VNEGMAC_") {
+        return Some("SemanticOp::NegMatMul".to_string());
+    }
+    if n.starts_with("VNEGMSC_") {
+        // VNEGMSC: double negation (neg product + neg acc) cancels.
+        // Net effect = VMAC (no subtract flip).
+        return Some("SemanticOp::Mac".to_string());
+    }
+    if n.starts_with("VNEGMUL_") {
+        return Some("SemanticOp::NegMul".to_string());
+    }
+    if n.starts_with("VADDMAC_") || n.starts_with("VADDMSC_") {
+        return Some("SemanticOp::AddMac".to_string());
+    }
+    if n.starts_with("VSUBMAC_") || n.starts_with("VSUBMSC_") {
+        return Some("SemanticOp::SubMac".to_string());
+    }
+    if n.starts_with("VMAC_") {
+        return Some("SemanticOp::Mac".to_string());
+    }
+    if n.starts_with("VMSC_") {
+        return Some("SemanticOp::MatMulSub".to_string());
+    }
+    // Matrix multiply VMUL: encoding names contain _vmac_ (accumulator slot).
+    // Element-wise vmul (e.g., VMUL_S8) does NOT contain _vmac_.
+    if n.starts_with("VMUL_") && n.contains("_vmac_") {
+        return Some("SemanticOp::MatMul".to_string());
+    }
+
+    // Instructions without Pat<> patterns that need explicit mapping.
+    match n {
+        "ASHL" => Some("SemanticOp::AshlBidir".to_string()),
+        "LSHL" => Some("SemanticOp::LshlBidir".to_string()),
+        "SBC" => Some("SemanticOp::Sbc".to_string()),
+        "DIVS" => Some("SemanticOp::SDiv".to_string()),
+        "EXTENDu8" | "EXTENDu16" => Some("SemanticOp::ZeroExtend".to_string()),
+        "MOV_CNTR" => Some("SemanticOp::ReadCycleCounter".to_string()),
+        // VBAND/VBOR share sched_class II_VBLOG -- itinerary can't distinguish.
+        "VBAND" => Some("SemanticOp::And".to_string()),
+        "VBOR" => Some("SemanticOp::Or".to_string()),
+        // VADDSUB has no intrinsic pattern.
+        "VADDSUB_8" | "VADDSUB_16" | "VADDSUB_32" => Some("SemanticOp::Add".to_string()),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Branch condition inference
 // ---------------------------------------------------------------------------
 
@@ -526,6 +593,8 @@ impl BuildInstrRecord {
         };
 
         let semantic = refine_branch_semantic(&self.mnemonic, semantic);
+        // NOTE: refine_encoding_semantic runs as Layer 5 in extract.rs,
+        // AFTER all pattern/intrinsic/itinerary layers have had their say.
 
         let input_order: Vec<String> = self.inputs.iter().map(|(_, n)| n.clone()).collect();
         let output_order: Vec<String> = self.outputs.iter().map(|(_, n)| n.clone()).collect();

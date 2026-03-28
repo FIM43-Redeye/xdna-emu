@@ -7,6 +7,16 @@
 //! lines map to different physical banks, enabling parallel access from
 //! core load/store units and DMA engines.
 
+/// Bank row size in bytes (128-bit = 16 bytes per AM020).
+/// Consecutive bank rows map to different physical banks.
+const BANK_ROW_BYTES: usize = 16;
+
+/// Bit shift equivalent of BANK_ROW_BYTES (log2(16) = 4).
+const BANK_ROW_SHIFT: u32 = 4;
+
+/// Byte mask for aligning down to a bank row boundary.
+const BANK_ROW_MASK: u32 = !(BANK_ROW_BYTES as u32 - 1);
+
 /// Compute the bank index for a local memory address.
 ///
 /// AIE2 uses interleaved banking at 128-bit (16-byte) boundaries.
@@ -17,7 +27,7 @@
 /// `num_banks` is 8 for compute tiles, 16 for MemTiles.
 #[inline]
 pub fn addr_to_bank(addr: u32, num_banks: usize) -> u8 {
-    ((addr as usize >> 4) % num_banks) as u8
+    ((addr as usize >> BANK_ROW_SHIFT) % num_banks) as u8
 }
 
 /// Compute a bitmask of all banks touched by a memory access.
@@ -31,14 +41,13 @@ pub fn banks_for_access(addr: u32, bytes: usize, num_banks: usize) -> u16 {
         return 0;
     }
     let mut mask = 0u16;
-    // Align down to bank row boundary
-    let start = (addr & !0xF) as usize;
+    let start = (addr & BANK_ROW_MASK) as usize;
     let end = (addr as usize) + bytes;
     let mut a = start;
     while a < end {
-        let bank = (a >> 4) % num_banks;
+        let bank = (a >> BANK_ROW_SHIFT) % num_banks;
         mask |= 1 << bank;
-        a += 16;
+        a += BANK_ROW_BYTES;
     }
     mask
 }

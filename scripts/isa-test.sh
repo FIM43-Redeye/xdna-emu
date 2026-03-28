@@ -80,7 +80,7 @@ if [[ -f "$EMU_LIB" ]]; then
         echo "EMU lib ($EMU_PROFILE) is stale -- rebuilding..."
         CARGO_FLAGS=""
         [[ "$EMU_PROFILE" = "release" ]] && CARGO_FLAGS="--release"
-        nice -n 19 cargo build $CARGO_FLAGS 2>&1
+        TMPDIR="${TMPDIR:-/tmp}" nice -n 19 cargo build $CARGO_FLAGS 2>&1
         echo "Rebuild complete."
         echo ""
     fi
@@ -88,7 +88,7 @@ elif [[ ! -f "$EMU_LIB" ]]; then
     echo "EMU lib not found -- building..."
     CARGO_FLAGS=""
     [[ "$EMU_PROFILE" = "release" ]] && CARGO_FLAGS="--release"
-    nice -n 19 cargo build $CARGO_FLAGS 2>&1
+    TMPDIR="${TMPDIR:-/tmp}" nice -n 19 cargo build $CARGO_FLAGS 2>&1
     echo "Build complete."
     echo ""
 fi

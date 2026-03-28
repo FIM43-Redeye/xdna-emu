@@ -38,6 +38,7 @@ use xdna_archspec::regdb::RegisterDb;
 const PT_CORE: u8 = 0;
 const PT_FIFO: u8 = 1;
 const PT_TRACE: u8 = 2;
+const PT_CTRL: u8 = 3;
 const PT_NORTH_BASE: u8 = 10;
 const PT_SOUTH_BASE: u8 = 20;
 const PT_EAST_BASE: u8 = 30;
@@ -1040,8 +1041,11 @@ fn collect_port_array(
 /// Map a register name suffix to a port type value and Rust expression.
 fn suffix_to_port_type(suffix: &str) -> (u8, String) {
     // Special names first
-    if suffix == "AIE_Core0" || suffix == "Tile_Ctrl" {
+    if suffix == "AIE_Core0" {
         return (PT_CORE, "port_type::CORE".to_string());
+    }
+    if suffix == "Tile_Ctrl" {
+        return (PT_CTRL, "port_type::CTRL".to_string());
     }
     if suffix.starts_with("FIFO") {
         return (PT_FIFO, "port_type::FIFO".to_string());

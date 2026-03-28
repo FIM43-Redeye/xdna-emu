@@ -57,14 +57,17 @@ struct CoreState {
 }
 
 impl CoreState {
-    /// Create a new core state with cycle-accurate executor.
-    fn new() -> Self {
+    /// Create a new core state for a specific tile position.
+    ///
+    /// The tile's column and row are used to initialize the read-only
+    /// CORE_ID register, so the core knows its position in the array.
+    fn new(col: u8, row: u8) -> Self {
         Self {
             interpreter: CoreInterpreter::new(
                 InstructionDecoder::load_default(),
                 CycleAccurateExecutor::new(),
             ),
-            context: ExecutionContext::new(),
+            context: ExecutionContext::new_for_tile(col, row),
             enabled: false,
             trace_events_consumed: 0,
         }
@@ -123,9 +126,16 @@ impl InterpreterEngine {
         let rows = device.rows();
         let compute_row_start = 2; // Rows 0=shim, 1=memtile, 2+=compute
 
-        // Create core states for all possible positions
+        // Create core states for all possible positions, each initialized
+        // with its tile coordinates so CORE_ID is correct.
         let num_cores = cols * rows;
-        let cores = (0..num_cores).map(|_| CoreState::new()).collect();
+        let cores = (0..num_cores)
+            .map(|idx| {
+                let col = (idx / rows) as u8;
+                let row = (idx % rows) as u8;
+                CoreState::new(col, row)
+            })
+            .collect();
 
         Self {
             device,

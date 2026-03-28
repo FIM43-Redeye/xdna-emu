@@ -283,8 +283,11 @@ fn decode_mv_amwq_src(raw: u64) -> Operand {
 /// Inverse of `getmMvBMXSrcOpValue`.
 fn decode_mv_bmx_src(raw: u64) -> Operand {
     if (raw >> 4) & 0x1F == 0b11000 {
+        // x-registers span two consecutive w-registers: x0={w0,w1}, x1={w2,w3}.
+        // Multiply by 2 to get the w-register base index, matching the standard
+        // Vector512 decoder path (decoder.rs line 896).
         let x_reg = (raw & 0xF) as u8;
-        return Operand::VectorReg(x_reg);
+        return Operand::VectorReg(x_reg * 2);
     }
     let bm_reg = (raw >> 4) as u8;
     Operand::AccumReg(bm_reg)
@@ -296,8 +299,9 @@ fn decode_mv_bmx_dst(raw: u64) -> Operand {
         let bm_reg = (raw >> 1) as u8;
         return Operand::AccumReg(bm_reg);
     }
+    // x-registers: multiply by 2 for w-register base index.
     let x_reg = (raw >> 2) as u8;
-    Operand::VectorReg(x_reg)
+    Operand::VectorReg(x_reg * 2)
 }
 
 /// Inverse of `geteRS4OpValue`.

@@ -2,7 +2,8 @@
 //!
 //! All instruction encodings, scheduling models, register definitions, and
 //! decoder bytecode tables are extracted from llvm-aie at compile time by
-//! `build_helpers/` and embedded as Rust constants in `gen_tablegen.rs`.
+//! `build_helpers/` and embedded as Rust constants across per-slot files
+//! (`gen_tblgen_slot_*.rs`) assembled by `gen_tablegen.rs`.
 //!
 //! At runtime, [`load_from_generated`] constructs the full `TblgenOutput`
 //! from these constants. No llvm-aie, no filesystem access, no subprocess.
@@ -16,7 +17,7 @@ pub mod decoder_ffi;
 mod resolver;
 mod types;
 
-// Build-time generated instruction tables (from build_helpers -> gen_tablegen.rs)
+// Build-time generated instruction tables (per-slot files for parallel compilation)
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/gen_tablegen.rs"));
 }

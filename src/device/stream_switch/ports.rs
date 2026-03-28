@@ -54,6 +54,7 @@ impl PortType {
             port_type::CORE => PortType::Core,
             port_type::FIFO => PortType::Fifo,
             port_type::TRACE => PortType::Trace,
+            port_type::CTRL => PortType::TileCtrl,
             n if n >= port_type::DMA_BASE => PortType::Dma(n - port_type::DMA_BASE),
             n if n >= port_type::WEST_BASE => PortType::West,
             n if n >= port_type::EAST_BASE => PortType::East,

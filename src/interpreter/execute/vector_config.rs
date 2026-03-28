@@ -468,6 +468,11 @@ fn lookup_bf16_geometry(variant: u32) -> Option<&'static GeometryEntry> {
             bits_x: 16, bits_y: 16, rows: 16, inner: 2, cols: 1,
             acc_cmb: 1, bfloat: true, sparse: false,
         }),
+        // Sparse: doubled inner dimension (4x16x4)
+        2 => Some(&GeometryEntry {
+            bits_x: 16, bits_y: 16, rows: 4, inner: 16, cols: 4,
+            acc_cmb: 1, bfloat: true, sparse: true,
+        }),
         _ => None,
     }
 }
@@ -486,7 +491,10 @@ fn element_types_from_entry(entry: &GeometryEntry) -> (ElementType, ElementType)
             8 => ElementType::Int8,
             16 => ElementType::Int16,
             32 => ElementType::Int32,
-            _ => ElementType::Int8, // fallback, should not occur
+            other => panic!(
+                "element_types_from_entry: unexpected bits_x={} in geometry {:?}",
+                other, entry,
+            ),
         }
     };
 
@@ -497,7 +505,10 @@ fn element_types_from_entry(entry: &GeometryEntry) -> (ElementType, ElementType)
             4 => ElementType::Int8, // int4 represented as Int8 (no Int4 variant)
             8 => ElementType::Int8,
             16 => ElementType::Int16,
-            _ => ElementType::Int8, // fallback
+            other => panic!(
+                "element_types_from_entry: unexpected bits_y={} in geometry {:?}",
+                other, entry,
+            )
         }
     };
 

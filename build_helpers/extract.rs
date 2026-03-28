@@ -522,12 +522,17 @@ fn semantic_from_intrinsic(name: &str) -> Option<String> {
         }
     }
 
-    if stem.starts_with("add_acc")
-        || stem.starts_with("sub_acc")
-        || stem.starts_with("negadd_acc")
-        || stem.starts_with("negsub_acc")
-    {
+    if stem.starts_with("add_acc") {
         return Some("SemanticOp::Accumulate".to_string());
+    }
+    if stem.starts_with("sub_acc") {
+        return Some("SemanticOp::AccumSub".to_string());
+    }
+    if stem.starts_with("negadd_acc") {
+        return Some("SemanticOp::AccumNegAdd".to_string());
+    }
+    if stem.starts_with("negsub_acc") {
+        return Some("SemanticOp::AccumNegSub".to_string());
     }
     if stem.starts_with("concat_") {
         return Some("SemanticOp::Shuffle".to_string());
@@ -1121,12 +1126,14 @@ const ITINERARY_SEMANTICS: &[(&str, &str)] = &[
     ("II_VMOV_CASCADE_READ", "SemanticOp::CascadeRead"),
     ("II_VMOV_CASCADE_WRITE", "SemanticOp::CascadeWrite"),
     ("II_VMOV", "SemanticOp::Copy"),
+    ("II_VMOV_X", "SemanticOp::Copy"),
     ("II_VPACK", "SemanticOp::Pack"),
     ("II_VUNPACK", "SemanticOp::Unpack"),
-    ("II_VPUSH_HI", "SemanticOp::VectorInsert"),
-    ("II_VPUSH_LO", "SemanticOp::VectorInsert"),
+    ("II_VPUSH_HI", "SemanticOp::VectorPushHi"),
+    ("II_VPUSH_LO", "SemanticOp::VectorPush"),
     ("II_VSRSM", "SemanticOp::Srs"),
     ("II_VBCST", "SemanticOp::VectorBroadcast"),
+    ("II_VBCSTSHFL", "SemanticOp::VectorBroadcast"),
     ("II_VEXTBCST", "SemanticOp::VectorBroadcast"),
     ("II_ADC", "SemanticOp::Adc"),
     ("II_SBC", "SemanticOp::Sbc"),
@@ -1260,6 +1267,53 @@ pub fn extract_all(llvm_aie_path: &Path) -> Result<BuildTblgenOutput, String> {
         eprintln!(
             "cargo:warning=TableGen: {} itinerary semantics inferred",
             itinerary_inferred
+        );
+    }
+
+    // Layer 5a: Cascade detection via implicit control register uses.
+    // crSCDEn = slave cascade enable (data arrives from neighbor) -> CascadeRead.
+    // crMCDEn = master cascade enable (data sent to neighbor) -> CascadeWrite.
+    // These OVERRIDE any previous semantic (cascade VMOVs get Copy from patterns,
+    // which is wrong -- they're data movement between tiles, not register copies).
+    let mut cascade_overridden = 0usize;
+    for encodings in by_slot.values_mut() {
+        for enc in encodings.iter_mut() {
+            let uses_scd = enc.implicit_regs.iter().any(|r| r.reg_class == "crSCDEn" && r.is_use);
+            let uses_mcd = enc.implicit_regs.iter().any(|r| r.reg_class == "crMCDEn" && r.is_use);
+            if uses_scd {
+                enc.semantic = Some("SemanticOp::CascadeRead".to_string());
+                cascade_overridden += 1;
+            } else if uses_mcd {
+                enc.semantic = Some("SemanticOp::CascadeWrite".to_string());
+                cascade_overridden += 1;
+            }
+        }
+    }
+    if cascade_overridden > 0 {
+        eprintln!(
+            "cargo:warning=TableGen: {} cascade semantics via implicit regs",
+            cascade_overridden
+        );
+    }
+
+    // Layer 5b: Encoding-name corrections. OVERRIDES earlier layers when they
+    // assigned a wrong semantic (e.g., VMSC gets Mac from itinerary but should
+    // be MatMulSub; ASHL gets Sra from patterns but should be AshlBidir).
+    let mut encoding_corrected = 0usize;
+    for encodings in by_slot.values_mut() {
+        for enc in encodings.iter_mut() {
+            if let Some(op) = super::semantics::refine_encoding_semantic(&enc.name) {
+                if enc.semantic.as_deref() != Some(op.as_str()) {
+                    encoding_corrected += 1;
+                }
+                enc.semantic = Some(op);
+            }
+        }
+    }
+    if encoding_corrected > 0 {
+        eprintln!(
+            "cargo:warning=TableGen: {} encoding-name semantics corrected",
+            encoding_corrected
         );
     }
 

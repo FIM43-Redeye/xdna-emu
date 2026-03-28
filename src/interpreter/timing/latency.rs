@@ -288,6 +288,7 @@ impl LatencyTable {
             SemanticOp::Mac | SemanticOp::MatMul | SemanticOp::MatMulSub
             | SemanticOp::NegMatMul | SemanticOp::AddMac | SemanticOp::SubMac
             | SemanticOp::NegMul | SemanticOp::Accumulate
+            | SemanticOp::AccumSub | SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub
                 => TIMING_VECTOR_MAC,
             SemanticOp::Srs | SemanticOp::Ups | SemanticOp::Convert
             | SemanticOp::Pack | SemanticOp::Unpack
@@ -295,7 +296,8 @@ impl LatencyTable {
             SemanticOp::Shuffle | SemanticOp::Align
                 => TIMING_VECTOR_SHUFFLE,
             SemanticOp::VectorBroadcast | SemanticOp::VectorExtract
-            | SemanticOp::VectorInsert | SemanticOp::VectorSelect
+            | SemanticOp::VectorInsert | SemanticOp::VectorPush
+            | SemanticOp::VectorPushHi | SemanticOp::VectorSelect
             | SemanticOp::VectorClear
                 => TIMING_VECTOR_SIMPLE,
             SemanticOp::Min | SemanticOp::Max => TIMING_VECTOR_SIMPLE,

@@ -117,6 +117,16 @@ impl ScalarRegisterFile {
         }
     }
 
+    /// Initialize the read-only CORE_ID register.
+    ///
+    /// This bypasses write protection -- used only at context creation
+    /// to set the tile's identity. Per AM020, CORE_ID encodes the tile's
+    /// column and row position in the array.
+    pub fn set_core_id(&mut self, col: u8, row: u8) {
+        let idx = CORE_ID_REG_INDEX as usize % NUM_SCALAR_REGS;
+        self.regs[idx] = ((col as u32) << 16) | (row as u32);
+    }
+
     /// Read a register. Indices 0-31 are GPRs; 32-47 are special registers.
     #[inline]
     pub fn read(&self, reg: u8) -> u32 {
@@ -125,8 +135,15 @@ impl ScalarRegisterFile {
     }
 
     /// Write a register. Indices 0-31 are GPRs; 32-47 are special registers.
+    ///
+    /// CORE_ID (index 37) is read-only in hardware. Writes are silently
+    /// ignored to match silicon behavior.
     #[inline]
     pub fn write(&mut self, reg: u8, value: u32) {
+        if reg == CORE_ID_REG_INDEX {
+            log::trace!("[SCALAR] ignored write to read-only CORE_ID (value=0x{:08x})", value);
+            return;
+        }
         let idx = (reg as usize) % NUM_SCALAR_REGS;
         self.regs[idx] = value;
     }
@@ -425,6 +442,38 @@ impl VectorRegisterFile {
         hi.copy_from_slice(&data[8..]);
         self.write(base_reg, lo);
         self.write(base_reg + 1, hi);
+    }
+
+    /// Read a 1024-bit y-register (four consecutive w-registers).
+    ///
+    /// The decoder maps y0 -> vreg 0, y1 -> vreg 4, etc. (reg * 4).
+    /// `base_reg` is already the decoded index (0, 4, 8, ...).
+    pub fn read_quad(&self, base_reg: u8) -> [u32; 32] {
+        debug_assert!(
+            base_reg % 4 == 0,
+            "quad vector read from non-aligned base register {}",
+            base_reg
+        );
+        let mut result = [0u32; 32];
+        result[..8].copy_from_slice(&self.read(base_reg));
+        result[8..16].copy_from_slice(&self.read(base_reg + 1));
+        result[16..24].copy_from_slice(&self.read(base_reg + 2));
+        result[24..].copy_from_slice(&self.read(base_reg + 3));
+        result
+    }
+
+    /// Write a 1024-bit y-register (split across four consecutive w-registers).
+    pub fn write_quad(&mut self, base_reg: u8, data: &[u32; 32]) {
+        debug_assert!(
+            base_reg % 4 == 0,
+            "quad vector write to non-aligned base register {}",
+            base_reg
+        );
+        let mut w = [0u32; 8];
+        for i in 0..4 {
+            w.copy_from_slice(&data[i * 8..(i + 1) * 8]);
+            self.write(base_reg + i as u8, w);
+        }
     }
 }
 

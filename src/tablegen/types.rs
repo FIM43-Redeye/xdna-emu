@@ -334,6 +334,8 @@ pub enum SemanticOp {
     VectorBroadcast, // Broadcast scalar to all lanes
     VectorExtract,   // Extract single element from vector
     VectorInsert,    // Insert scalar into vector lane
+    VectorPush,      // Push scalar into vector low half (vpush.lo)
+    VectorPushHi,    // Push scalar into vector high half (vpush.hi)
     VectorSelect,    // Per-lane conditional select
     VectorClear,     // Clear vector to zero
     Convert,         // Type conversion (vconv, vfloor, vceil, etc.)
@@ -352,6 +354,9 @@ pub enum SemanticOp {
     NegAdd,       // dst = -src1 + src2
     NegMul,       // acc += -(src1 * src2)
     Accumulate,   // acc += src (no multiply)
+    AccumSub,     // acc1 - acc2 (vadd with md2=1 / vsub)
+    AccumNegAdd,  // -acc1 + acc2 (vnegadd)
+    AccumNegSub,  // -acc1 - acc2 (vnegsub)
 
     // Side-effect operations
     CascadeRead,            // Read from cascade input
@@ -497,11 +502,18 @@ impl SemanticOp {
         }
 
         // Accumulate intrinsics: add_acc, sub_acc, negadd_acc, negsub_acc
-        // These are accumulator operations without multiply (acc += src).
-        if stem.starts_with("add_acc") || stem.starts_with("sub_acc")
-            || stem.starts_with("negadd_acc") || stem.starts_with("negsub_acc")
-        {
+        // These are accumulator operations without multiply.
+        if stem.starts_with("add_acc") {
             return Some(Self::Accumulate);
+        }
+        if stem.starts_with("sub_acc") {
+            return Some(Self::AccumSub);
+        }
+        if stem.starts_with("negadd_acc") {
+            return Some(Self::AccumNegAdd);
+        }
+        if stem.starts_with("negsub_acc") {
+            return Some(Self::AccumNegSub);
         }
 
         // Concat intrinsics: concat_I512_I256, concat_bf1024_bf512, etc.

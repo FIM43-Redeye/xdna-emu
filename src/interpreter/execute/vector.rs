@@ -62,14 +62,19 @@ impl VectorAlu {
         log::trace!("[VECTOR_ALU] Checking semantic={:?} element_type={:?} dest={:?}",
             semantic, op.element_type, op.dest);
 
-        // Determine if this needs full-width processing:
+        // Determine if this needs full-width (1024-bit) processing:
         // 1. is_wide_vector: instruction has Vector512 operands (x-registers)
-        // 2. AccumReg-only ops (VADD, VSUB, VNEG on cm-class accumulators)
-        //    don't have Vector512 operands but always operate on 1024-bit
-        //    cm registers. Only Accumulate and Neg semantics qualify --
-        //    SRS/Convert read an accumulator but write a vector, so they
-        //    are NOT accum-only.
-        let is_accum_only = matches!(semantic, SemanticOp::Accumulate | SemanticOp::Neg) && {
+        // 2. AccumReg-only ops (VADD, VSUB, VNEG) that use cm-class (Full)
+        //    accumulators -- these need wide read/write.
+        // 3. Wide accumulator source: SRS/UPS/Convert with cm-class source
+        //    (AccumWidth::Full) need the wide path even though they write to
+        //    a vector register, not an accumulator.
+        let has_wide_acc_source = matches!(op.accum_width,
+            Some(crate::tablegen::decoder_ffi::AccumWidth::Full));
+        let is_accum_only = matches!(semantic,
+            SemanticOp::Accumulate | SemanticOp::AccumSub
+            | SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub
+            | SemanticOp::Neg) && {
             let has_acc_source = op.sources.iter()
                 .any(|s| matches!(s, Operand::AccumReg(_)));
             let has_vec_source = op.sources.iter()
@@ -77,7 +82,7 @@ impl VectorAlu {
             has_acc_source && !has_vec_source
         };
 
-        if op.is_wide_vector || is_accum_only {
+        if op.is_wide_vector || is_accum_only || has_wide_acc_source {
             Self::execute_wide(op, ctx, semantic, et)
         } else {
             Self::execute_half(op, ctx, semantic, et)
@@ -291,13 +296,11 @@ impl VectorAlu {
                     Some(Operand::AccumReg(r)) => {
                         ctx.accumulator.write(*r, acc_result);
                     }
-                    _ => {
-                        // Fallback: truncate to vector (shouldn't happen for real VUPS)
-                        let mut v = [0u32; 8];
-                        for i in 0..8 {
-                            v[i] = acc_result[i] as u32;
-                        }
-                        Self::write_vector_dest(op, ctx, v);
+                    other => {
+                        panic!(
+                            "VUPS destination must be AccumReg, got {:?} (encoding={:?})",
+                            other, op.encoding_name,
+                        );
                     }
                 }
                 true
@@ -327,12 +330,12 @@ impl VectorAlu {
                 // The base vector is s1 (sources[0]), NOT the current dst value.
                 // VPUSH (shift+insert) is handled in the execute_wide path.
                 //
-                // MCInst operand order: (outs dst), (ins s1, idx, s0)
-                // sources = [VectorReg(s1), ScalarReg(idx), ScalarReg(s0)]
-                // Use position-aware access: idx is 1st scalar, s0 is 2nd scalar.
+                // The index is read from r29 (fixed implicit register, not a
+                // decoded operand).  $idx in the asm_string is an implicit ref
+                // to r29 -- it does not appear in the operand list.
                 let mut base = Self::get_vector_source(op, ctx, 0);
-                let index = Self::get_nth_scalar_source(op, ctx, 0);  // idx
-                let value = Self::get_nth_scalar_source(op, ctx, 1);  // s0
+                let index = ctx.scalar.read(29);  // r29: implicit index register
+                let value = Self::get_nth_scalar_source(op, ctx, 0);  // s0
                 Self::vector_insert(&mut base, value, index, et);
                 Self::write_vector_dest(op, ctx, base);
                 true
@@ -376,24 +379,39 @@ impl VectorAlu {
             }
 
             SemanticOp::VectorBroadcast => {
-                // Two variants:
+                // Three variants:
                 // 1. VBCST: broadcast scalar to all lanes: vbcst.8 $dst, $scalar
-                // 2. VEXTBCST: extract element from vector, then broadcast:
+                // 2. VBCST_64: broadcast 64-bit scalar pair to all lanes:
+                //    vbcst.64 $dst, $s0  (s0 is decoded as a register pair)
+                // 3. VEXTBCST: extract element from vector, then broadcast:
                 //    vextbcst.16 $dst, $src_vec, $idx
                 let has_vector_source = op.sources.iter().any(|s| matches!(s, Operand::VectorReg(_)));
 
-                let value = if has_vector_source {
-                    // VEXTBCST: extract element at index from vector source
-                    let src = Self::get_vector_source(op, ctx, 0);
-                    let index = Self::get_lane_index(op, ctx);
-                    Self::extract_element_by_index(&src, index, et)
+                if matches!(et, ElementType::Int64 | ElementType::UInt64) && !has_vector_source {
+                    // 64-bit broadcast: read register pair (rN, rN+1) as lo:hi.
+                    let val64 = Self::get_scalar_source_64(op, ctx);
+                    let lo = val64 as u32;
+                    let hi = (val64 >> 32) as u32;
+                    let mut result = [0u32; 8];
+                    for i in 0..4 {
+                        result[i * 2] = lo;
+                        result[i * 2 + 1] = hi;
+                    }
+                    Self::write_vector_dest(op, ctx, result);
                 } else {
-                    // VBCST: broadcast scalar value
-                    Self::get_scalar_source(op, ctx)
-                };
+                    let value = if has_vector_source {
+                        // VEXTBCST: extract element at index from vector source
+                        let src = Self::get_vector_source(op, ctx, 0);
+                        let index = Self::get_lane_index(op, ctx);
+                        Self::extract_element_by_index(&src, index, et)
+                    } else {
+                        // VBCST: broadcast scalar value
+                        Self::get_scalar_source(op, ctx)
+                    };
 
-                let result = Self::vector_broadcast(value, et);
-                Self::write_vector_dest(op, ctx, result);
+                    let result = Self::vector_broadcast(value, et);
+                    Self::write_vector_dest(op, ctx, result);
+                }
                 true
             }
 
@@ -477,7 +495,8 @@ impl VectorAlu {
                 true
             }
 
-            SemanticOp::Accumulate => {
+            SemanticOp::Accumulate | SemanticOp::AccumSub
+            | SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub => {
                 // VADD/VSUB/VNEGADD/VNEGSUB: add/subtract two accumulator
                 // registers. Format: `vadd $dst, $acc1, $acc2, $config`.
                 //
@@ -698,15 +717,11 @@ impl VectorAlu {
                 }
                 mask
             }
-            _ => {
-                // Unknown element type, try 32-bit default
-                let mut mask = 0u32;
-                for i in 0..8 {
-                    if value[i] != 0 {
-                        mask |= 1 << i;
-                    }
-                }
-                mask
+            other => {
+                panic!(
+                    "condense_comparison_mask: unhandled element type {:?}",
+                    other,
+                );
             }
         }
     }
@@ -747,20 +762,29 @@ impl VectorAlu {
         let sub_acc1 = ((conf >> 11) & 1) != 0;
         let sub_acc2 = ((conf >> 12) & 1) != 0;
 
-        // Determine base operation from encoding name.
-        let enc_lower = op.encoding_name.as_ref().map_or(String::new(), |n| n.to_lowercase());
-        let base_sub = enc_lower.starts_with("vsub");
-        let base_neg = enc_lower.starts_with("vneg");
-        let base_negsub = enc_lower.starts_with("vnegsub");
-        let is_float = enc_lower.contains("_f") || enc_lower.contains(".f");
+        // Determine base operation from SemanticOp (set at decode time from
+        // the encoding class -- VADD, VSUB, VNEGADD, VNEGSUB).
+        let semantic = op.semantic.unwrap_or(SemanticOp::Accumulate);
+        let base_sub = matches!(semantic, SemanticOp::AccumSub);
+        let base_neg = matches!(semantic, SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub);
+        let base_negsub = matches!(semantic, SemanticOp::AccumNegSub);
+        // Float mode from element_type (set at build time from mnemonic ".f" suffix).
+        let is_float = matches!(op.element_type, Some(ElementType::Float32) | Some(ElementType::BFloat16));
 
         // Wide (cm, 1024-bit) vs narrow (bm, 512-bit) accumulator.
-        // Wide cm registers always use even base indices (cm0=bm0, cm1=bm2, etc.).
-        // If any accumulator operand (source or dest) has an odd index, this is
-        // a narrow bm operation.
+        // Use AccumWidth metadata from decoder when available (structural signal).
+        // Fallback: cm registers always use even base indices, so odd index implies bm.
         let dst_reg = Self::get_acc_dest(op);
-        let any_odd = acc_sources.iter().any(|r| r % 2 != 0) || dst_reg % 2 != 0;
-        let is_wide = !any_odd;
+        let is_wide = match op.accum_width {
+            Some(crate::tablegen::decoder_ffi::AccumWidth::Full) => true,
+            Some(crate::tablegen::decoder_ffi::AccumWidth::Half)
+            | Some(crate::tablegen::decoder_ffi::AccumWidth::Quarter) => false,
+            None => {
+                // Legacy fallback: if any index is odd, it must be a bm half.
+                let any_odd = acc_sources.iter().any(|r| r % 2 != 0) || dst_reg % 2 != 0;
+                !any_odd
+            }
+        };
 
         // Compute effective signs for acc1 and acc2.
         let negate_acc1 = base_neg || base_negsub || sub_acc1;
@@ -773,19 +797,20 @@ impl VectorAlu {
             let mut result = [0u64; 16];
 
             if is_float {
+                use super::vector_float::{fp32_flush_to_zero, aie2_fp32_add};
                 for i in 0..16 {
-                    let a1_lo = if zero_acc1 { 0.0 } else { f32::from_bits(a1[i] as u32) };
-                    let a1_hi = if zero_acc1 { 0.0 } else { f32::from_bits((a1[i] >> 32) as u32) };
-                    let a2_lo = f32::from_bits(a2[i] as u32);
-                    let a2_hi = f32::from_bits((a2[i] >> 32) as u32);
+                    let mut a1_lo = if zero_acc1 { 0u32 } else { fp32_flush_to_zero(a1[i] as u32) };
+                    let mut a1_hi = if zero_acc1 { 0u32 } else { fp32_flush_to_zero((a1[i] >> 32) as u32) };
+                    let mut a2_lo = fp32_flush_to_zero(a2[i] as u32);
+                    let mut a2_hi = fp32_flush_to_zero((a2[i] >> 32) as u32);
 
-                    let v1_lo = if negate_acc1 { -a1_lo } else { a1_lo };
-                    let v1_hi = if negate_acc1 { -a1_hi } else { a1_hi };
-                    let v2_lo = if negate_acc2 { -a2_lo } else { a2_lo };
-                    let v2_hi = if negate_acc2 { -a2_hi } else { a2_hi };
+                    // Negate by flipping sign bit (works for zero, normal, inf, NaN).
+                    if negate_acc1 { a1_lo ^= 0x8000_0000; a1_hi ^= 0x8000_0000; }
+                    if negate_acc2 { a2_lo ^= 0x8000_0000; a2_hi ^= 0x8000_0000; }
 
-                    result[i] = ((v1_lo + v2_lo).to_bits() as u64)
-                        | (((v1_hi + v2_hi).to_bits() as u64) << 32);
+                    let r_lo = aie2_fp32_add(a1_lo, a2_lo);
+                    let r_hi = aie2_fp32_add(a1_hi, a2_hi);
+                    result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
                 }
             } else {
                 for i in 0..16 {
@@ -807,19 +832,19 @@ impl VectorAlu {
             let mut result = [0u64; 8];
 
             if is_float {
+                use super::vector_float::{fp32_flush_to_zero, aie2_fp32_add};
                 for i in 0..8 {
-                    let a1_lo = if zero_acc1 { 0.0 } else { f32::from_bits(a1[i] as u32) };
-                    let a1_hi = if zero_acc1 { 0.0 } else { f32::from_bits((a1[i] >> 32) as u32) };
-                    let a2_lo = f32::from_bits(a2[i] as u32);
-                    let a2_hi = f32::from_bits((a2[i] >> 32) as u32);
+                    let mut a1_lo = if zero_acc1 { 0u32 } else { fp32_flush_to_zero(a1[i] as u32) };
+                    let mut a1_hi = if zero_acc1 { 0u32 } else { fp32_flush_to_zero((a1[i] >> 32) as u32) };
+                    let mut a2_lo = fp32_flush_to_zero(a2[i] as u32);
+                    let mut a2_hi = fp32_flush_to_zero((a2[i] >> 32) as u32);
 
-                    let v1_lo = if negate_acc1 { -a1_lo } else { a1_lo };
-                    let v1_hi = if negate_acc1 { -a1_hi } else { a1_hi };
-                    let v2_lo = if negate_acc2 { -a2_lo } else { a2_lo };
-                    let v2_hi = if negate_acc2 { -a2_hi } else { a2_hi };
+                    if negate_acc1 { a1_lo ^= 0x8000_0000; a1_hi ^= 0x8000_0000; }
+                    if negate_acc2 { a2_lo ^= 0x8000_0000; a2_hi ^= 0x8000_0000; }
 
-                    result[i] = ((v1_lo + v2_lo).to_bits() as u64)
-                        | (((v1_hi + v2_hi).to_bits() as u64) << 32);
+                    let r_lo = aie2_fp32_add(a1_lo, a2_lo);
+                    let r_hi = aie2_fp32_add(a1_hi, a2_hi);
+                    result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
                 }
             } else {
                 for i in 0..8 {
@@ -837,12 +862,12 @@ impl VectorAlu {
         }
     }
 
-    /// Accumulator negate: dst = -src for all 16 lanes of a cm-register.
+    /// Accumulator negate: dst = -src.
     ///
-    /// Handles VNEG on cm-class accumulators. The config word controls
-    /// zero_acc (zero the source before negation, producing 0). Float mode
-    /// is detected from the encoding name "_F" suffix: each u64 lane holds
-    /// two fp32 values (bits [31:0] and bits [63:32]).
+    /// Handles VNEG on both bm (512-bit) and cm (1024-bit) accumulators.
+    /// The config word controls zero_acc (zero the source before negation,
+    /// producing 0). Float mode is detected from element_type (Float32/BFloat16):
+    /// each u64 lane holds two fp32 values (bits [31:0] and bits [63:32]).
     fn execute_acc_negate(op: &SlotOp, ctx: &mut ExecutionContext) {
         let acc_reg = op.sources.iter().find_map(|s| match s {
             Operand::AccumReg(r) => Some(*r),
@@ -852,24 +877,36 @@ impl VectorAlu {
 
         let conf = Self::get_config_register(op, ctx).unwrap_or(0);
         let zero_acc = (conf & 1) != 0;
-        let is_float = op.encoding_name.as_ref()
-            .map_or(false, |n| n.contains("_F") || n.contains(".f"));
+        // Float mode from element_type (set at build time from mnemonic ".f" suffix).
+        let is_float = matches!(op.element_type, Some(ElementType::Float32) | Some(ElementType::BFloat16));
 
         // Wide (cm) vs narrow (bm) -- same detection as execute_acc_add_sub.
-        // Wide cm registers always use even base indices.
-        let any_odd = acc_reg % 2 != 0 || dst_reg % 2 != 0;
-        let is_wide = !any_odd;
+        // Use AccumWidth metadata from decoder when available (structural signal).
+        let is_wide = match op.accum_width {
+            Some(crate::tablegen::decoder_ffi::AccumWidth::Full) => true,
+            Some(crate::tablegen::decoder_ffi::AccumWidth::Half)
+            | Some(crate::tablegen::decoder_ffi::AccumWidth::Quarter) => false,
+            None => {
+                let any_odd = acc_reg % 2 != 0 || dst_reg % 2 != 0;
+                !any_odd
+            }
+        };
 
         if is_wide {
             let src = ctx.accumulator.read_wide(acc_reg);
             let mut result = [0u64; 16];
             if is_float {
+                use super::vector_float::{fp32_flush_to_zero, fp32_is_nan, fp32_make_nan};
                 for i in 0..16 {
-                    let lo = f32::from_bits(src[i] as u32);
-                    let hi = f32::from_bits((src[i] >> 32) as u32);
-                    let r_lo = if zero_acc { 0.0f32 } else { -lo };
-                    let r_hi = if zero_acc { 0.0f32 } else { -hi };
-                    result[i] = (r_lo.to_bits() as u64) | ((r_hi.to_bits() as u64) << 32);
+                    let lo = fp32_flush_to_zero(src[i] as u32);
+                    let hi = fp32_flush_to_zero((src[i] >> 32) as u32);
+                    let r_lo = if zero_acc { 0u32 }
+                        else if fp32_is_nan(lo) { fp32_make_nan(false) }
+                        else { lo ^ 0x8000_0000 };
+                    let r_hi = if zero_acc { 0u32 }
+                        else if fp32_is_nan(hi) { fp32_make_nan(false) }
+                        else { hi ^ 0x8000_0000 };
+                    result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
                 }
             } else {
                 for i in 0..16 {
@@ -882,12 +919,17 @@ impl VectorAlu {
             let src = ctx.accumulator.read(acc_reg);
             let mut result = [0u64; 8];
             if is_float {
+                use super::vector_float::{fp32_flush_to_zero, fp32_is_nan, fp32_make_nan};
                 for i in 0..8 {
-                    let lo = f32::from_bits(src[i] as u32);
-                    let hi = f32::from_bits((src[i] >> 32) as u32);
-                    let r_lo = if zero_acc { 0.0f32 } else { -lo };
-                    let r_hi = if zero_acc { 0.0f32 } else { -hi };
-                    result[i] = (r_lo.to_bits() as u64) | ((r_hi.to_bits() as u64) << 32);
+                    let lo = fp32_flush_to_zero(src[i] as u32);
+                    let hi = fp32_flush_to_zero((src[i] >> 32) as u32);
+                    let r_lo = if zero_acc { 0u32 }
+                        else if fp32_is_nan(lo) { fp32_make_nan(false) }
+                        else { lo ^ 0x8000_0000 };
+                    let r_hi = if zero_acc { 0u32 }
+                        else if fp32_is_nan(hi) { fp32_make_nan(false) }
+                        else { hi ^ 0x8000_0000 };
+                    result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
                 }
             } else {
                 for i in 0..8 {
@@ -1091,18 +1133,24 @@ impl VectorAlu {
                 }
             }
             ElementType::BFloat16 => {
-                for i in 0..4 {
-                    let f0 = f64::from_bits(acc[i * 2]) as f32;
-                    let f1 = f64::from_bits(acc[i * 2 + 1]) as f32;
-                    let bf0 = Self::f32_to_bf16(f0);
-                    let bf1 = Self::f32_to_bf16(f1);
-                    result[i] = (bf0 as u32) | ((bf1 as u32) << 16);
+                // Acc32 float mode: each u64 holds two f32 values.
+                // BFloat16 SRS: extract each f32 and truncate to bf16,
+                // packing two bf16 per u32 result word -> 16 bf16 lanes.
+                for i in 0..8 {
+                    let f_lo = f32::from_bits(acc[i] as u32);
+                    let f_hi = f32::from_bits((acc[i] >> 32) as u32);
+                    let bf_lo = Self::f32_to_bf16(f_lo);
+                    let bf_hi = Self::f32_to_bf16(f_hi);
+                    result[i] = (bf_lo as u32) | ((bf_hi as u32) << 16);
                 }
             }
             ElementType::Float32 => {
+                // Acc32 float mode: each u64 holds two f32 values
+                // (bits [31:0] = lo, bits [63:32] = hi).
+                // Float SRS is a pass-through: extract the low f32 per lane.
+                // 8 accumulator u64 words -> 8 f32 result words (low half).
                 for i in 0..8 {
-                    let f = f64::from_bits(acc[i]) as f32;
-                    result[i] = f.to_bits();
+                    result[i] = acc[i] as u32;
                 }
             }
         }
@@ -1166,13 +1214,33 @@ impl VectorAlu {
                     result[i] = i16_val as i32 as u32;
                 }
             }
+            // Int32 -> BFloat16 (VFLOOR_S32_BF16): 8 i32 -> 16 bf16 (pack into 4 words)
+            (ElementType::Int32, ElementType::BFloat16) => {
+                for i in 0..4 {
+                    let f0 = src[i * 2] as i32 as f32;
+                    let f1 = src[i * 2 + 1] as i32 as f32;
+                    let bf0 = Self::f32_to_bf16(f0);
+                    let bf1 = Self::f32_to_bf16(f1);
+                    result[i] = (bf0 as u32) | ((bf1 as u32) << 16);
+                }
+            }
+            // BFloat16 -> Int32: 16 bf16 -> 8 i32 (use lower half)
+            (ElementType::BFloat16, ElementType::Int32) => {
+                for i in 0..8 {
+                    let bf16 = (src[i / 2] >> ((i % 2) * 16)) as u16;
+                    let f = Self::bf16_to_f32(bf16);
+                    result[i] = f as i32 as u32;
+                }
+            }
             // Same type: pass through
             _ if from_type == to_type => {
                 result = *src;
             }
-            _ => {
-                // Unhandled conversion: pass through
-                result = *src;
+            (from, to) => {
+                panic!(
+                    "vector_convert: unhandled conversion {:?} -> {:?} (encoding={:?})",
+                    from, to, "vector_convert",
+                );
             }
         }
 
@@ -1758,6 +1826,15 @@ impl VectorAlu {
     fn write_scalar_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: u32) {
         if let Some(Operand::ScalarReg(r)) = &op.dest {
             ctx.scalar.write(*r, value);
+        }
+    }
+
+    /// Write a 64-bit scalar result to destination register pair (rN, rN+1).
+    /// Used for 8-bit comparisons where the bitmask exceeds 32 bits.
+    fn write_scalar_dest_wide(op: &SlotOp, ctx: &mut ExecutionContext, value: u64) {
+        if let Some(Operand::ScalarReg(r)) = &op.dest {
+            ctx.scalar.write(*r, value as u32);
+            ctx.scalar.write(*r + 1, (value >> 32) as u32);
         }
     }
 
@@ -3472,15 +3549,17 @@ impl VectorAlu {
                     let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
                     // For 8-bit elements, the mask needs 64 bits (register pair).
                     if lanes_per_half >= 32 {
+                        // Write to primary dest (VGE/VLT: cmp is the main dest).
+                        Self::write_scalar_dest_wide(op, ctx, full_mask);
+                        // Also write to extra_dests (dual-result ops like VSUB_LT).
                         Self::write_cmp_dest_wide(op, ctx, full_mask);
                     } else {
                         Self::write_scalar_dest(op, ctx, full_mask as u32);
+                        // Also write to extra_dests (cmp register) for 16/32-bit.
+                        Self::write_cmp_dest(op, ctx, full_mask as u32);
                     }
-                    // Also write to extra_dests (cmp register) for 16/32-bit.
-                    Self::write_cmp_dest(op, ctx, full_mask as u32);
                 } else {
                     Self::write_wide_vec_dest(op, ctx, result);
-                    // Write packed cmp flags to secondary dest.
                     let lo: [u32; 8] = result[..8].try_into().unwrap();
                     let hi: [u32; 8] = result[8..].try_into().unwrap();
                     let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
@@ -3499,7 +3578,6 @@ impl VectorAlu {
                 let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
                 let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_compare_lt);
                 if matches!(op.dest, Some(Operand::ScalarReg(_))) {
-                    // VLT: condense per-lane mask into scalar bitmask
                     let lo: [u32; 8] = result[..8].try_into().unwrap();
                     let hi: [u32; 8] = result[8..].try_into().unwrap();
                     let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
@@ -3507,11 +3585,12 @@ impl VectorAlu {
                     let lanes_per_half = 256 / et.bits() as u32;
                     let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
                     if lanes_per_half >= 32 {
+                        Self::write_scalar_dest_wide(op, ctx, full_mask);
                         Self::write_cmp_dest_wide(op, ctx, full_mask);
                     } else {
                         Self::write_scalar_dest(op, ctx, full_mask as u32);
+                        Self::write_cmp_dest(op, ctx, full_mask as u32);
                     }
-                    Self::write_cmp_dest(op, ctx, full_mask as u32);
                 } else {
                     Self::write_wide_vec_dest(op, ctx, result);
                     let lo: [u32; 8] = result[..8].try_into().unwrap();
@@ -3537,7 +3616,8 @@ impl VectorAlu {
             }
 
             // ========== Accumulator ops ==========
-            SemanticOp::Accumulate => {
+            SemanticOp::Accumulate | SemanticOp::AccumSub
+            | SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub => {
                 let has_acc_source = op.sources.iter()
                     .any(|s| matches!(s, Operand::AccumReg(_)));
                 if has_acc_source {
@@ -3564,9 +3644,19 @@ impl VectorAlu {
                 let result_lo = Self::vector_srs_from_acc(&acc_lo, shift, from, et, &ctx.srs_config);
                 let result_hi = Self::vector_srs_from_acc(&acc_hi, shift, from, et, &ctx.srs_config);
 
+                // Pack the two halves contiguously. For reduction SRS (e.g.,
+                // s8 from s32, s16 from s64), each half only fills a fraction
+                // of its 8-word output. Compute how many valid u32 words each
+                // half produces based on lane count and output element width.
+                let from_bits = from.bits() as usize;
+                let lanes_per_half = if from_bits <= 32 { 16 } else { 8 }; // Acc32 vs Acc64
+                let to_bits = et.bits() as usize;
+                let words_per_half = (lanes_per_half * to_bits + 31) / 32;
+
                 let mut result = [0u32; 16];
-                result[..8].copy_from_slice(&result_lo);
-                result[8..].copy_from_slice(&result_hi);
+                let n = words_per_half.min(8);
+                result[..n].copy_from_slice(&result_lo[..n]);
+                result[n..n + n].copy_from_slice(&result_hi[..n]);
                 Self::write_wide_vec_dest(op, ctx, result);
                 true
             }
@@ -3589,9 +3679,11 @@ impl VectorAlu {
                         acc_wide[8..].copy_from_slice(&acc_hi);
                         ctx.accumulator.write_wide(*r, acc_wide);
                     }
-                    _ => {
-                        log::warn!("[VECTOR_WIDE] UPS with non-AccumReg dest");
-                        return Self::execute_wide_fallback(op, ctx, semantic, et);
+                    other => {
+                        panic!(
+                            "Wide VUPS destination must be AccumReg, got {:?} (encoding={:?})",
+                            other, op.encoding_name,
+                        );
                     }
                 }
                 true
@@ -3599,12 +3691,32 @@ impl VectorAlu {
 
             // ========== Copy / Clear ==========
             SemanticOp::Copy => {
-                let a = Self::get_wide_vec_source(op, ctx, 0);
-                Self::write_wide_vec_dest(op, ctx, a);
+                // Handle both vector-to-vector and accum-to-accum moves.
+                let has_acc_source = op.sources.iter()
+                    .any(|s| matches!(s, Operand::AccumReg(_)));
+                if has_acc_source {
+                    // Accumulator move: vmov cm_dst, cm_src
+                    let src_reg = op.sources.iter().find_map(|s| match s {
+                        Operand::AccumReg(r) => Some(*r),
+                        _ => None,
+                    }).unwrap_or(0);
+                    let data = ctx.accumulator.read_wide(src_reg);
+                    Self::write_wide_acc_dest(op, ctx, data);
+                } else {
+                    // Vector move: vmov x_dst, x_src
+                    let a = Self::get_wide_vec_source(op, ctx, 0);
+                    Self::write_wide_vec_dest(op, ctx, a);
+                }
                 true
             }
             SemanticOp::VectorClear => {
-                Self::write_wide_vec_dest(op, ctx, [0u32; 16]);
+                // Handle both vector and accumulator clears.
+                let has_acc_dest = matches!(&op.dest, Some(Operand::AccumReg(_)));
+                if has_acc_dest {
+                    Self::write_wide_acc_dest(op, ctx, [0u64; 16]);
+                } else {
+                    Self::write_wide_vec_dest(op, ctx, [0u32; 16]);
+                }
                 true
             }
 
@@ -3621,38 +3733,32 @@ impl VectorAlu {
                 true
             }
 
-            SemanticOp::VectorInsert => {
-                let is_push = op.encoding_name.as_ref().map_or(false, |n| {
-                    n.to_lowercase().contains("vpush")
-                });
-                if is_push {
-                    let src = Self::get_wide_vec_source(op, ctx, 0);
-                    // For 64-bit VPUSH, read a register pair (rN, rN+1).
-                    let value = if et.bits() >= 64 {
-                        Self::get_scalar_source_64(op, ctx)
-                    } else {
-                        Self::get_scalar_source(op, ctx) as u64
-                    };
-                    let is_hi = op.encoding_name.as_ref().map_or(false, |n| {
-                        let lower = n.to_lowercase();
-                        lower.contains("_hi") || lower.contains(".hi")
-                    });
-                    let result = Self::wide_vector_push(&src, value, is_hi, et);
-                    Self::write_wide_vec_dest(op, ctx, result);
-                    true
+            SemanticOp::VectorPush | SemanticOp::VectorPushHi => {
+                let src = Self::get_wide_vec_source(op, ctx, 0);
+                // For 64-bit VPUSH, read a register pair (rN, rN+1).
+                let value = if et.bits() >= 64 {
+                    Self::get_scalar_source_64(op, ctx)
                 } else {
-                    // VINSERT.N dst, s1, idx, s0: copy s1 with s1[idx] = s0.
-                    // Cannot use fallback (execute_half twice) because it
-                    // inserts at the same index in BOTH halves.
-                    //
-                    // MCInst: sources = [VectorReg(s1), ScalarReg(idx), ScalarReg(s0)]
-                    let base = Self::get_wide_vec_source(op, ctx, 0);
-                    let index = Self::get_nth_scalar_source(op, ctx, 0);  // idx
-                    let value = Self::get_nth_scalar_source(op, ctx, 1);  // s0
-                    let result = Self::insert_wide_element(&base, index, value, et);
-                    Self::write_wide_vec_dest(op, ctx, result);
-                    true
-                }
+                    Self::get_scalar_source(op, ctx) as u64
+                };
+                let is_hi = matches!(op.semantic, Some(SemanticOp::VectorPushHi));
+                let result = Self::wide_vector_push(&src, value, is_hi, et);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+
+            SemanticOp::VectorInsert => {
+                // VINSERT.N dst, s1, idx, s0: copy s1 with s1[idx] = s0.
+                // Cannot use fallback (execute_half twice) because it
+                // inserts at the same index in BOTH halves.
+                //
+                // Index from r29 (fixed implicit register, not decoded operand).
+                let base = Self::get_wide_vec_source(op, ctx, 0);
+                let index = ctx.scalar.read(29);  // r29: implicit index register
+                let value = Self::get_nth_scalar_source(op, ctx, 0);  // s0
+                let result = Self::insert_wide_element(&base, index, value, et);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
             }
 
             SemanticOp::VectorBroadcast => {

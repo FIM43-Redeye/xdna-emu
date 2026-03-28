@@ -78,6 +78,7 @@ fn register_kind_str(ot: &OperandType) -> Option<String> {
         RegisterKind::ModifierDC => "modifier_dc",
         RegisterKind::Vector256 => "vector256",
         RegisterKind::Vector512 => "vector512",
+        RegisterKind::Vector1024 => "vector1024",
         RegisterKind::Accumulator => "accumulator",
         RegisterKind::Control => "control",
     }.to_string())

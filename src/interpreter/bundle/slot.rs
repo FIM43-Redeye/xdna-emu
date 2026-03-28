@@ -254,6 +254,9 @@ pub struct SlotOp {
     /// Whether this operates on 512-bit (x) registers rather than 256-bit (w).
     /// When true, the VectorAlu processes both halves (reg and reg+1).
     pub is_wide_vector: bool,
+    /// Whether this operates on 1024-bit (y) registers (sparse MAC wide).
+    /// When true, VectorReg operands span four consecutive 256-bit registers.
+    pub is_quad_vector: bool,
     /// Element type for vector operations (None for scalar).
     pub element_type: Option<ElementType>,
     /// Memory access width for load/store operations.
@@ -292,6 +295,11 @@ pub struct SlotOp {
     /// LLVM opcode ID (index into MCInstrInfo), set when decoded via FFI.
     /// Used for opcode-indexed latency lookups from LLVM's itinerary model.
     pub llvm_opcode: Option<u32>,
+    /// Accumulator access width from the LLVM register class of the first
+    /// AccumReg operand (dest or source). Used by execute_acc_add_sub to
+    /// choose between 512-bit (bml/bmh) and 1024-bit (cm) read/write paths
+    /// instead of the unreliable parity heuristic.
+    pub accum_width: Option<crate::tablegen::decoder_ffi::AccumWidth>,
 }
 
 // Core methods on SlotOp.
@@ -325,7 +333,8 @@ impl SlotOp {
             // MAC/MatMul/Accumulate -> Accumulator slot
             Some(SemanticOp::Mac | SemanticOp::MatMul | SemanticOp::MatMulSub
                 | SemanticOp::NegMatMul | SemanticOp::AddMac | SemanticOp::SubMac
-                | SemanticOp::Accumulate) => SlotIndex::Accumulator,
+                | SemanticOp::Accumulate | SemanticOp::AccumSub
+                | SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub) => SlotIndex::Accumulator,
 
             // Load/PointerAdd/Cascade -> LoadA
             Some(SemanticOp::Load | SemanticOp::PointerAdd | SemanticOp::PointerMov
@@ -433,6 +442,7 @@ impl SlotOp {
             implicit_regs: SmallVec::new(),
             is_vector: false,
             is_wide_vector: false,
+            is_quad_vector: false,
             element_type: None,
             mem_width: MemWidth::Word,
             post_modify: PostModify::None,
@@ -448,6 +458,7 @@ impl SlotOp {
             encoding_name: None,
             raw_opcode: None,
             llvm_opcode: None,
+            accum_width: None,
         }
     }
 
@@ -493,6 +504,7 @@ impl SlotOp {
             implicit_regs: SmallVec::new(),
             is_vector: false,
             is_wide_vector: false,
+            is_quad_vector: false,
             element_type: None,
             mem_width: MemWidth::Word,
             post_modify: PostModify::None,
@@ -508,6 +520,7 @@ impl SlotOp {
             encoding_name: None,
             raw_opcode: None,
             llvm_opcode: None,
+            accum_width: None,
         }
     }
 }

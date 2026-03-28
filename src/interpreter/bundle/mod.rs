@@ -427,6 +427,8 @@ fn disassemble_from_semantic(slot_op: &SlotOp) -> String {
         SemanticOp::VectorBroadcast => vec_et("vbcst"),
         SemanticOp::VectorExtract => vec_et("vext"),
         SemanticOp::VectorInsert => vec_et("vins"),
+        SemanticOp::VectorPush => vec_et("vpush.lo"),
+        SemanticOp::VectorPushHi => vec_et("vpush.hi"),
         SemanticOp::VectorSelect => vec_et("vsel"),
         SemanticOp::VectorClear => "vclr".into(),
         SemanticOp::Min => if is_vec { vec_et("vmin") } else { "min".into() },
@@ -443,7 +445,10 @@ fn disassemble_from_semantic(slot_op: &SlotOp) -> String {
         SemanticOp::NegLtz => vec_et("vneg_ltz"),
         SemanticOp::NegAdd => vec_et("vnegadd"),
         SemanticOp::NegMul => vec_et("vnegmul"),
-        SemanticOp::Accumulate => vec_et("vacc"),
+        SemanticOp::Accumulate => vec_et("vadd"),
+        SemanticOp::AccumSub => vec_et("vsub"),
+        SemanticOp::AccumNegAdd => vec_et("vnegadd_acc"),
+        SemanticOp::AccumNegSub => vec_et("vnegsub_acc"),
 
         // Hardware state reads
         SemanticOp::ReadCycleCounter => "mov.cntr".into(),

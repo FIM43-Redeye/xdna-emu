@@ -32,8 +32,8 @@ use crate::interpreter::traits::{DecodeError, Decoder};
 #[cfg(test)]
 use super::composite::CompositeLuts;
 use crate::tablegen::{
-    AddressingMode, DecoderIndex, InstrEncoding, InstrMemWidth, OperandType, RegisterKind,
-    SemanticOp, decoder_bytecode,
+    AddressingMode, CompositeEncoder, DecoderIndex, InstrEncoding, InstrMemWidth, OperandType,
+    RegisterKind, SemanticOp, decoder_bytecode,
     decoder_ffi::{self, DecodedOperand, DecodeResult, operand_from_reg_name},
 };
 
@@ -507,7 +507,8 @@ impl InstructionDecoder {
         &self,
         bits: u64,
         slot_type: crate::interpreter::bundle::SlotType,
-    ) -> Option<(DecodedInstr, Option<Operand>, Vec<Operand>, Option<PostModify>, Option<u32>, Vec<Operand>)> {
+    ) -> Option<(DecodedInstr, Option<Operand>, Vec<Operand>, Option<PostModify>, Option<u32>, Vec<Operand>,
+                  Option<decoder_ffi::AccumWidth>)> {
         let ffi_slot = Self::slot_type_to_ffi(slot_type)?;
         let ffi_result = decoder_ffi::decode_slot(ffi_slot, bits)?;
 
@@ -526,7 +527,7 @@ impl InstructionDecoder {
         let encoding = self.index.encoding_by_name(slot_name, &ffi_result.name)?;
 
         // Map LLVM operands to our Operand type.
-        let (dest, sources, post_modify, extra_defs) =
+        let (dest, sources, post_modify, extra_defs, accum_width) =
             Self::extract_operands_from_ffi(&ffi_result, encoding);
 
         // Build a minimal DecodedInstr with empty raw operands (we don't need
@@ -537,7 +538,8 @@ impl InstructionDecoder {
             operands: HashMap::new(),
         };
 
-        Some((decoded_instr, dest, sources, post_modify, Some(ffi_result.opcode), extra_defs))
+        Some((decoded_instr, dest, sources, post_modify, Some(ffi_result.opcode), extra_defs,
+              accum_width))
     }
 
     /// Extract dest, sources, and post-modify from LLVM FFI decode result.
@@ -548,7 +550,8 @@ impl InstructionDecoder {
     fn extract_operands_from_ffi(
         ffi_result: &DecodeResult,
         encoding: &InstrEncoding,
-    ) -> (Option<Operand>, Vec<Operand>, Option<PostModify>, Vec<Operand>) {
+    ) -> (Option<Operand>, Vec<Operand>, Option<PostModify>, Vec<Operand>,
+          Option<decoder_ffi::AccumWidth>) {
         let num_defs = ffi_result.num_defs as usize;
 
         // Map all LLVM operands to our Operand type.
@@ -558,10 +561,20 @@ impl InstructionDecoder {
         // internally.  The decoded immediate values are ready to use as-is.
         // Do NOT apply additional sign extension or scaling here -- that was
         // needed for our raw bit-field extraction path, not for LLVM output.
+        //
+        // Also capture the first AccumWidth seen from register class metadata
+        // (e.g., bml -> Half, cm -> Full). This flows to SlotOp.accum_width
+        // for use in accumulator execution paths.
+        let mut first_accum_width: Option<decoder_ffi::AccumWidth> = None;
         let mapped: Vec<Option<Operand>> = ffi_result.operands.iter().map(|op| {
             match op {
                 DecodedOperand::Reg { name, .. } => {
-                    operand_from_reg_name(name).map(|m| m.operand)
+                    operand_from_reg_name(name).map(|m| {
+                        if first_accum_width.is_none() {
+                            first_accum_width = m.accum_width;
+                        }
+                        m.operand
+                    })
                 }
                 DecodedOperand::Imm(val) => {
                     Some(Operand::Immediate(*val as i32))
@@ -616,7 +629,7 @@ impl InstructionDecoder {
                 use_ops.retain(|o| !matches!(o, Operand::PointerReg(p) if *p == dp));
             }
             // Sources are whatever remains (offset immediate or modifier reg).
-            return (dest, use_ops, post_modify, extra_defs);
+            return (dest, use_ops, post_modify, extra_defs, first_accum_width);
         }
 
         // Handle memory addressing modes: combine pointer + offset into Memory
@@ -700,7 +713,7 @@ impl InstructionDecoder {
             }
         }
 
-        (dest, use_ops, post_modify, extra_defs)
+        (dest, use_ops, post_modify, extra_defs, first_accum_width)
     }
 
     /// Extract operands from decoded instruction using data-driven dispatch.
@@ -881,6 +894,9 @@ impl InstructionDecoder {
             // Vector512 (x-registers) span two 256-bit registers: x0={wl0,wh0}={v0,v1}.
             // The 4-bit encoding index needs *2 to address the 256-bit register file.
             RegisterKind::Vector512 => Operand::VectorReg(reg * 2),
+            // Vector1024 (y-registers) span four 256-bit registers: y2={v8,v9,v10,v11}.
+            // The 2-bit encoding index needs *4 to address the 256-bit register file.
+            RegisterKind::Vector1024 => Operand::VectorReg(reg * 4),
             RegisterKind::Accumulator => Operand::AccumReg(reg),
             RegisterKind::Control => Operand::ControlReg(reg),
         }
@@ -1121,80 +1137,13 @@ impl InstructionDecoder {
     ) -> SlotOp {
         let enc = &decoded.encoding;
 
-        // Cascade instructions: detected by encoding name before SemanticOp lookup.
-        // These have hasSideEffects=true and mnemonic "vmov" (which maps to
-        // SemanticOp::Copy). Name-based detection is required because the
-        // mnemonic is shared with regular vmov instructions.
-        //
-        // Data-driven alternative: cascade instructions use crSCDEn/crMCDEn in
-        // their Uses list and OP_mScdDst/OP_mMcdSrc operand types. If new
-        // cascade variants are added, detect via those operand types instead
-        // of extending this name list.
-        let semantic_override = match enc.name.as_str() {
-            "VMOV_mv_scd" | "VMOV_HI" | "VMOV_LO" => Some(SemanticOp::CascadeRead),
-            "VMOV_mv_mcd" => Some(SemanticOp::CascadeWrite),
-            // Instructions without Pat<> patterns in TableGen need explicit
-            // semantic mappings. These are valid ISA instructions that Peano
-            // doesn't select but Chess does.
-            "ASHL" => Some(SemanticOp::AshlBidir),
-            "LSHL" => Some(SemanticOp::LshlBidir),
-            "SBC" => Some(SemanticOp::Sbc),
-            "DIVS" => Some(SemanticOp::SDiv),
-            "EXTENDu8" => Some(SemanticOp::ZeroExtend),
-            "EXTENDu16" => Some(SemanticOp::ZeroExtend),
-            "MOV_CNTR" => Some(SemanticOp::ReadCycleCounter),
-            // VBAND/VBOR share sched_class II_VBLOG -- cannot distinguish
-            // via itinerary table. Override by encoding name instead.
-            "VBAND" => Some(SemanticOp::And),
-            "VBOR" => Some(SemanticOp::Or),
-            // VADDSUB has no intrinsic pattern -- needs explicit mapping.
-            "VADDSUB_8" | "VADDSUB_16" | "VADDSUB_32" => Some(SemanticOp::Add),
-            _ => {
-                // MAC-family instructions: many encoding names lack
-                // build-time semantic assignment (no intrinsic pattern).
-                // Match by encoding name prefix to assign the correct
-                // MAC variant semantic.
-                let n = enc.name.as_str();
-                if n.starts_with("VNEGMAC_") {
-                    Some(SemanticOp::NegMatMul)
-                } else if n.starts_with("VNEGMSC_") {
-                    // VNEGMSC: both NEG (negate product) and MSC (negate acc
-                    // via compressor). The two negations cancel in the
-                    // compressor's subtract XOR chain: sub = sub0 ^ neg ^ msc
-                    // = sub0 ^ 1 ^ 1 = sub0. Net effect is same as VMAC
-                    // (no subtract flip). Use Mac semantic.
-                    Some(SemanticOp::Mac)
-                } else if n.starts_with("VNEGMUL_") {
-                    Some(SemanticOp::NegMul)
-                } else if n.starts_with("VADDMAC_") || n.starts_with("VADDMSC_") {
-                    Some(SemanticOp::AddMac)
-                } else if n.starts_with("VSUBMAC_") || n.starts_with("VSUBMSC_") {
-                    Some(SemanticOp::SubMac)
-                } else if n.starts_with("VMAC_") {
-                    Some(SemanticOp::Mac)
-                } else if n.starts_with("VMSC_") {
-                    Some(SemanticOp::MatMulSub)
-                } else if n.starts_with("VMUL_") && n.contains("_vmac_") {
-                    // Matrix multiply VMUL: encoding names contain _vmac_
-                    // (e.g., VMUL_vmac_cm_core_dense). Element-wise vmul
-                    // (e.g., VMUL_S8) does NOT contain _vmac_ and should
-                    // retain its original Mul semantic.
-                    Some(SemanticOp::MatMul)
-                } else {
-                    None
-                }
-            }
-        };
-
-        // Build SlotOp directly from SemanticOp (no Operation bridge).
-        // Force PointerAdd for all pointer arithmetic instructions.
-        // Some PADDB/PADDA variants get SemanticOp::Add from pattern
-        // matching instead of PointerAdd. The is_ptr_arithmetic flag
-        // (derived from mnemonic "padd*") is the reliable indicator.
+        // Semantic is fully resolved at build time (see extract.rs Layers 1-5).
+        // PointerAdd override: some PADDB/PADDA variants get Add from pattern
+        // matching. The is_ptr_arithmetic flag (from mnemonic "padd*") corrects it.
         let effective_semantic = if enc.is_ptr_arithmetic {
             Some(SemanticOp::PointerAdd)
         } else {
-            semantic_override.or(enc.semantic)
+            enc.semantic
         };
         let mut slot_op = if let Some(semantic) = effective_semantic {
             SlotOp::from_semantic(slot_index, semantic)
@@ -1217,9 +1166,17 @@ impl InstructionDecoder {
 
         // ── Populate metadata from InstrEncoding ─────────────────────────
         slot_op.is_vector = enc.is_vector;
-        // Detect 512-bit (x-register) operations: any operand uses Vector512.
+        // Detect 512+ bit operations: any operand uses Vector512, Vector1024,
+        // or a composite register that can encode x-registers (MvBMXSrc/Dst).
         slot_op.is_wide_vector = enc.operand_fields.iter()
-            .any(|f| f.operand_type == OperandType::Register(RegisterKind::Vector512));
+            .any(|f| matches!(f.operand_type,
+                OperandType::Register(RegisterKind::Vector512)
+                | OperandType::Register(RegisterKind::Vector1024)
+                | OperandType::CompositeRegister(CompositeEncoder::MvBMXSrc)
+                | OperandType::CompositeRegister(CompositeEncoder::MvBMXDst)));
+        // Detect 1024-bit (y-register) operations for sparse MAC wide variants.
+        slot_op.is_quad_vector = enc.operand_fields.iter()
+            .any(|f| f.operand_type == OperandType::Register(RegisterKind::Vector1024));
         slot_op.element_type = enc.element_type;
         slot_op.from_type = enc.from_type;
         slot_op.mem_width = match enc.mem_width {
@@ -1341,7 +1298,8 @@ impl Decoder for InstructionDecoder {
                 // discriminator bits that build_bundle_32 re-adds.
                 if slot.slot_type == SlotType::Nop {
                     bundle.set_slot(SlotOp::nop(slot_index));
-                } else if let Some((decoded, dest, sources, extracted_pm, ffi_opcode, extra_defs)) =
+                } else if let Some((decoded, dest, sources, extracted_pm, ffi_opcode, extra_defs,
+                                     accum_width)) =
                     self.try_decode_via_ffi(slot.bits, slot.slot_type)
                 {
                     // LLVM FFI is the sole production decoder for both instruction
@@ -1350,6 +1308,7 @@ impl Decoder for InstructionDecoder {
                         slot_index, &decoded, dest, sources, extracted_pm,
                     );
                     slot_op.llvm_opcode = ffi_opcode;
+                    slot_op.accum_width = accum_width;
                     // Attach secondary destinations (e.g., cmp register for
                     // dual-result instructions like VSUB_LT, VABS_GTZ).
                     for ed in extra_defs {
@@ -2513,7 +2472,7 @@ mod tests {
                             });
 
                         match (ffi_result, legacy_result) {
-                            (Some((_, ffi_dest, ffi_src, ffi_pm, _, _)), Some((_, leg_dest, leg_src, leg_pm))) => {
+                            (Some((_, ffi_dest, ffi_src, ffi_pm, _, _, _)), Some((_, leg_dest, leg_src, leg_pm))) => {
                                 ffi_hits += 1;
                                 if ffi_dest == leg_dest && ffi_src == leg_src && ffi_pm == leg_pm {
                                     matches += 1;
@@ -2578,7 +2537,7 @@ mod tests {
                             let (dest, sources, pm, _) = decoder.extract_operands(&d);
                             (d, dest, sources, pm)
                         });
-                        if let (Some((_, fd, fs, fp, _, _)), Some((_, ld, ls, lp))) = (ffi, leg) {
+                        if let (Some((_, fd, fs, fp, _, _, _)), Some((_, ld, ls, lp))) = (ffi, leg) {
                             if fd == ld && fs == ls && fp == lp { continue; }
                             // Categorize
                             if ld.is_some() && fd.is_none() && matches!(ld, Some(Operand::ModifierReg(_))) {
@@ -2767,10 +2726,10 @@ mod tests {
                         (name, dest, sources, pm)
                     });
 
-                    let ffi_name = ffi.as_ref().map(|(d, _, _, _, _, _)| d.encoding.name.as_str()).unwrap_or("FAIL");
+                    let ffi_name = ffi.as_ref().map(|(d, _, _, _, _, _, _)| d.encoding.name.as_str()).unwrap_or("FAIL");
                     let leg_name = leg.as_ref().map(|(n, _, _, _)| n.as_str()).unwrap_or("FAIL");
 
-                    let ffi_ops = ffi.as_ref().map(|(_, d, s, p, _, _)| format!("dest={:?} src={:?} pm={:?}", d, s, p));
+                    let ffi_ops = ffi.as_ref().map(|(_, d, s, p, _, _, _)| format!("dest={:?} src={:?} pm={:?}", d, s, p));
                     let leg_ops = leg.as_ref().map(|(_, d, s, p)| format!("dest={:?} src={:?} pm={:?}", d, s, p));
 
                     let status = if ffi_ops == leg_ops { "OK" } else { "DIFF" };

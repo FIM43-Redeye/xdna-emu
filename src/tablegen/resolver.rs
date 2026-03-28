@@ -164,6 +164,8 @@ pub enum RegisterKind {
     Vector256,
     /// mXm, eX*: 512-bit vector registers
     Vector512,
+    /// eYs: 1024-bit vector registers (y2-y5)
+    Vector1024,
     /// eAM, eBM, eCM, mAMm, mBMm: accumulator registers
     Accumulator,
     /// mCRm: control registers (crRnd, crSat, crSRSSign, crVaddSign, etc.)
@@ -253,6 +255,9 @@ pub fn classify_operand_type(reg_class: &str, field_name: &str) -> OperandType {
     }
     if reg_class.starts_with("mXm") || reg_class.starts_with("eX") {
         return OperandType::Register(RegisterKind::Vector512);
+    }
+    if reg_class.starts_with("eY") {
+        return OperandType::Register(RegisterKind::Vector1024);
     }
     if reg_class.starts_with("eAM") || reg_class.starts_with("mAMm")
         || reg_class.starts_with("eBM") || reg_class.starts_with("mBMm")
@@ -1113,6 +1118,59 @@ impl DecoderIndex {
     /// element_type, etc.) after LLVM identifies the instruction name.
     pub fn encoding_by_name(&self, slot_name: &str, instr_name: &str) -> Option<&InstrEncoding> {
         self.slots.get(slot_name).and_then(|idx| idx.by_name.get(instr_name))
+    }
+
+    /// Find the most specific encoding matching `bits` in a slot.
+    ///
+    /// LLVM's MCDisassembler sometimes picks a general encoding (e.g. VMAC)
+    /// when a more specific one (e.g. VADD_F) also matches the same bits.
+    /// This happens because `hasCompleteDecoder = 0` means multiple encodings
+    /// can match the same bit pattern.
+    ///
+    /// This method checks ALL encodings in the slot and returns the one with
+    /// the most constrained fixed_mask (highest popcount) whose fixed_bits
+    /// match. More constrained = more specific = better match.
+    ///
+    /// Returns `None` if no encoding matches, or the LLVM-selected encoding
+    /// if it's already the most specific.
+    pub fn refine_encoding<'a>(
+        &'a self,
+        slot_name: &str,
+        llvm_name: &str,
+        bits: u64,
+    ) -> Option<&'a InstrEncoding> {
+        let slot = self.slots.get(slot_name)?;
+        let llvm_enc = slot.by_name.get(llvm_name)?;
+
+        // Find the most specific encoding that matches these bits.
+        let mut best: Option<&InstrEncoding> = None;
+        let mut best_specificity: u32 = 0;
+
+        for enc in slot.by_name.values() {
+            // Skip if bits don't match this encoding's fixed pattern.
+            if (bits & enc.fixed_mask) != enc.fixed_bits {
+                continue;
+            }
+            let specificity = enc.fixed_mask.count_ones();
+            if specificity > best_specificity {
+                best_specificity = specificity;
+                best = Some(enc);
+            }
+        }
+
+        // If the best match is the same as what LLVM returned, no refinement needed.
+        // If different, return the more specific one.
+        let refined = best.unwrap_or(llvm_enc);
+        if refined.name != llvm_enc.name {
+            log::trace!(
+                "[REFINE] {} -> {} (specificity {} > {})",
+                llvm_enc.name,
+                refined.name,
+                refined.fixed_mask.count_ones(),
+                llvm_enc.fixed_mask.count_ones(),
+            );
+        }
+        Some(refined)
     }
 
     /// Iterate over all encodings across all slots.

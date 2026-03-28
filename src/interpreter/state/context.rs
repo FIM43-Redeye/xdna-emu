@@ -655,13 +655,27 @@ impl ExecutionContext {
     /// - Hazard detection (RAW, WAW, WAR)
     /// - Memory bank conflict modeling
     /// - Event tracing (can be disabled via `timing.disable_tracing()`)
+    ///
+    /// CORE_ID is initialized to 0 (col=0, row=0). For production use,
+    /// prefer `new_for_tile(col, row)` which sets the correct tile identity.
     pub fn new() -> Self {
+        Self::new_for_tile(0, 0)
+    }
+
+    /// Create a new execution context for a specific tile position.
+    ///
+    /// Initializes the read-only CORE_ID register with the tile's column
+    /// and row, matching hardware behavior where each core knows its
+    /// position in the array.
+    pub fn new_for_tile(col: u8, row: u8) -> Self {
         let mut timing = TimingContext::new();
-        timing.enable_tracing(); // Enable event tracing by default for profiling
+        timing.enable_tracing();
+        let mut scalar = ScalarRegisterFile::new();
+        scalar.set_core_id(col, row);
         Self {
             pc: 0,
             flags: Flags::default(),
-            scalar: ScalarRegisterFile::new(),
+            scalar,
             pointer: PointerRegisterFile::new(),
             modifier: ModifierRegisterFile::new(),
             vector: VectorRegisterFile::new(),
@@ -673,7 +687,7 @@ impl ExecutionContext {
             halted: false,
             sp_reg: SpRegister::default(),
             sp_value: 0,
-            lr_reg: super::registers::LR_REG_INDEX, // Dedicated special register index
+            lr_reg: super::registers::LR_REG_INDEX,
             timing,
             scalar_snapshot: None,
             pointer_snapshot: None,

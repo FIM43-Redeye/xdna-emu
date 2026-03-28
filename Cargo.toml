@@ -83,6 +83,4 @@ name = "export-isa"
 path = "src/bin/export_isa.rs"
 
 [profile.release]
-# LTO disabled: the 37k-line gen_tablegen.rs makes full LTO very slow.
-# Re-evaluate after splitting generated code into per-slot modules.
-# lto = true
+lto = true

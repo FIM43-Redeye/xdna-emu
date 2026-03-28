@@ -56,6 +56,9 @@ pub mod arch {
         pub const CORE: u8 = 0;
         pub const FIFO: u8 = 1;
         pub const TRACE: u8 = 2;
+        /// Tile control port (configuration/debug).
+        /// Per AM025: compute=port 3, memtile=port 6, shim=port 0.
+        pub const CTRL: u8 = 3;
         pub const NORTH_BASE: u8 = 10;
         pub const SOUTH_BASE: u8 = 20;
         pub const EAST_BASE: u8 = 30;

@@ -180,20 +180,23 @@ impl DmaEngine {
         }
     }
 
-    /// Create a new DMA engine for a compute tile (NPU1/AIE2 defaults).
+    /// Create a compute tile DMA engine with AIE2 defaults (2+2 channels, 16 BDs).
     ///
-    /// Uses hardcoded channel/BD counts matching Phoenix/HawkPoint.
-    /// Production code should use `new()` with ArchConfig-derived values.
+    /// Test convenience constructor. Production code uses `new()` with
+    /// ArchConfig-derived values (see `DeviceArray::new()`).
+    #[cfg(test)]
     pub fn new_compute_tile(col: u8, row: u8) -> Self {
         Self::new(col, row, TileType::Compute, 2, 2, 16, 16)
     }
 
-    /// Create a new DMA engine for a memory tile (NPU1/AIE2 defaults).
+    /// Create a memory tile DMA engine with AIE2 defaults (6+6 channels, 48 BDs).
+    #[cfg(test)]
     pub fn new_mem_tile(col: u8, row: u8) -> Self {
         Self::new(col, row, TileType::MemTile, 6, 6, 48, 64)
     }
 
-    /// Create a new DMA engine for a shim tile (NPU1/AIE2 defaults).
+    /// Create a shim tile DMA engine with AIE2 defaults (2+2 channels, 16 BDs).
+    #[cfg(test)]
     pub fn new_shim_tile(col: u8, row: u8) -> Self {
         Self::new(col, row, TileType::Shim, 2, 2, 16, 0)
     }

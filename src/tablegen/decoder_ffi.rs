@@ -740,18 +740,20 @@ mod tests {
     }
 
     #[test]
-    fn test_vadd_f_has_output() {
-        // Find a VADD_F encoding by trying a known vec slot pattern.
-        // VADD_F bml0, bml0, bml0 -- look at what LLVM returns.
-        // We'll try a few vec slot encodings and look for one with num_defs > 0.
-        //
-        // For now, just verify the infrastructure works by decoding any vec
-        // instruction and checking that num_defs is reported.
-        for bits in [0x000001u64, 0x100001, 0x200001, 0x0F0001] {
-            if let Some(decoded) = decode_slot(Slot::Vec, bits) {
-                eprintln!(
-                    "Vec 0x{:06X}: {} num_defs={} ops={:?}",
-                    bits, decoded.name, decoded.num_defs, decoded.operands
+    fn test_vadd_f_decodes_correctly() {
+        // VADD_F bml0, bml0, bml0, r0: raw bytes 89 00 00 00 (LE).
+        // In a 32-bit I32_VEC bundle, vec slot bits = word >> 6 = 0x2.
+        let decoded = decode_slot(Slot::Vec, 0x2).expect("VADD_F should decode");
+        assert_eq!(decoded.name, "VADD_F", "LLVM should identify as VADD_F");
+        assert_eq!(decoded.num_defs, 1, "one output (destination accum)");
+
+        // All operands should be accumulator or scalar -- no VectorReg artifacts.
+        for op in &decoded.operands {
+            if let DecodedOperand::Reg { name, .. } = op {
+                assert!(
+                    name.starts_with("bm") || name.starts_with("r"),
+                    "VADD_F operand should be accum or scalar, got {}",
+                    name,
                 );
             }
         }

@@ -647,8 +647,8 @@ fn execute_mov(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
 fn execute_pointer_add(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     // Resolve the destination pointer register.
     // Priority: explicit dest > inferred from first PointerReg source > SP fallback.
-    let ptr_dest = match op.dest {
-        Some(Operand::PointerReg(p)) => Some(p),
+    let ptr_dest = match &op.dest {
+        Some(Operand::PointerReg(p)) => Some(*p),
         None => {
             // Infer from first PointerReg source (tied operand pattern).
             op.sources.iter().find_map(|s| match s {
@@ -656,7 +656,10 @@ fn execute_pointer_add(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
                 _ => None,
             })
         }
-        _ => return false,
+        other => panic!(
+            "execute_pointer_add: destination must be PointerReg, got {:?} (encoding={:?})",
+            other, op.encoding_name,
+        ),
     };
 
     match ptr_dest {
@@ -682,9 +685,12 @@ fn execute_pointer_add(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
 ///
 /// Uses deferred pipeline write (latency 1) to match hardware timing.
 fn execute_pointer_mov(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
-    let ptr_idx = match op.dest {
-        Some(Operand::PointerReg(p)) => p,
-        _ => return false,
+    let ptr_idx = match &op.dest {
+        Some(Operand::PointerReg(p)) => *p,
+        other => panic!(
+            "execute_pointer_mov: destination must be PointerReg, got {:?} (encoding={:?})",
+            other, op.encoding_name,
+        ),
     };
     let value = read_source(op, ctx, 0);
     ctx.queue_pointer_write(ptr_idx, value, 1);

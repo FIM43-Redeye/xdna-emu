@@ -127,14 +127,10 @@ impl StreamSwitch {
     /// Create a new stream switch for a compute tile.
     ///
     /// Port layout is defined in arch::{COMPUTE_MASTER_PORTS, COMPUTE_SLAVE_PORTS}.
-    /// Port 3 (master and slave) is Tile_Ctrl, not Core.
+    /// Tile_Ctrl port type is data-driven from AM025 register database.
     pub fn new_compute_tile(col: u8, row: u8) -> Self {
-        let mut masters = Self::build_ports_from_spec(crate::arch::COMPUTE_MASTER_PORTS, PortDirection::Master);
-        let mut slaves = Self::build_ports_from_spec(crate::arch::COMPUTE_SLAVE_PORTS, PortDirection::Slave);
-
-        // Tag port 3 as TileCtrl (AM025: Compute port 3 = Tile_Ctrl)
-        if masters.len() > 3 { masters[3].port_type = PortType::TileCtrl; }
-        if slaves.len() > 3 { slaves[3].port_type = PortType::TileCtrl; }
+        let masters = Self::build_ports_from_spec(crate::arch::COMPUTE_MASTER_PORTS, PortDirection::Master);
+        let slaves = Self::build_ports_from_spec(crate::arch::COMPUTE_SLAVE_PORTS, PortDirection::Slave);
 
         let num_slaves = slaves.len();
         let num_masters = masters.len();
@@ -159,18 +155,14 @@ impl StreamSwitch {
     /// Create a new stream switch for a memory tile.
     ///
     /// Port layout is defined in arch::{MEMTILE_MASTER_PORTS, MEMTILE_SLAVE_PORTS}.
-    /// Port 6 (master and slave) is Tile_Ctrl, not Core.
+    /// Tile_Ctrl port type is data-driven from AM025 register database.
     ///
     /// Note the asymmetry: 6 North masters but only 4 North slaves, and
     /// 4 South masters but 6 South slaves. This matches MemTile's role as
     /// a buffer between Shim (which has 6 North outputs) and Compute tiles.
     pub fn new_mem_tile(col: u8, row: u8) -> Self {
-        let mut masters = Self::build_ports_from_spec(crate::arch::MEMTILE_MASTER_PORTS, PortDirection::Master);
-        let mut slaves = Self::build_ports_from_spec(crate::arch::MEMTILE_SLAVE_PORTS, PortDirection::Slave);
-
-        // Tag port 6 as TileCtrl (AM025: MemTile port 6 = Tile_Ctrl)
-        if masters.len() > 6 { masters[6].port_type = PortType::TileCtrl; }
-        if slaves.len() > 6 { slaves[6].port_type = PortType::TileCtrl; }
+        let masters = Self::build_ports_from_spec(crate::arch::MEMTILE_MASTER_PORTS, PortDirection::Master);
+        let slaves = Self::build_ports_from_spec(crate::arch::MEMTILE_SLAVE_PORTS, PortDirection::Slave);
 
         let num_slaves = slaves.len();
         let num_masters = masters.len();
@@ -195,16 +187,12 @@ impl StreamSwitch {
     /// Create a new stream switch for a shim tile.
     ///
     /// Port layout is defined in arch::{SHIM_MASTER_PORTS, SHIM_SLAVE_PORTS}.
-    /// Port 0 (master and slave) is Tile_Ctrl, not Core.
+    /// Tile_Ctrl port type is data-driven from AM025 register database.
     ///
     /// The 6 North masters (12-17) connect 1:1 to MemTile South slaves (7-12).
     pub fn new_shim_tile(col: u8) -> Self {
-        let mut masters = Self::build_ports_from_spec(crate::arch::SHIM_MASTER_PORTS, PortDirection::Master);
-        let mut slaves = Self::build_ports_from_spec(crate::arch::SHIM_SLAVE_PORTS, PortDirection::Slave);
-
-        // Tag port 0 as TileCtrl (AM025: Shim port 0 = Tile_Ctrl)
-        if !masters.is_empty() { masters[0].port_type = PortType::TileCtrl; }
-        if !slaves.is_empty() { slaves[0].port_type = PortType::TileCtrl; }
+        let masters = Self::build_ports_from_spec(crate::arch::SHIM_MASTER_PORTS, PortDirection::Master);
+        let slaves = Self::build_ports_from_spec(crate::arch::SHIM_SLAVE_PORTS, PortDirection::Slave);
 
         let num_slaves = slaves.len();
         let num_masters = masters.len();

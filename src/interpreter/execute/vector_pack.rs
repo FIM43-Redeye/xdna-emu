@@ -102,15 +102,12 @@ pub fn pack_lane(value: i64, _bits_i: u32, bits_o: u32, signed: bool, mode: Pack
 ///
 /// If `signed`, sign-extends from `bits_i` to `bits_o`.
 /// If unsigned, zero-extends (upper bits are already zero after truncation).
-pub fn unpack_lane(value: i64, _bits_i: u32, bits_o: u32, signed: bool) -> i64 {
-    // The input value is already in bits_i width. Truncating to bits_o with
-    // the signedness flag handles both sign-extension and zero-extension:
-    // - For signed: the bits_i-width value gets sign-extended to bits_o.
-    // - For unsigned: the bits_i-width value gets zero-extended to bits_o.
-    //
-    // Since we interpret the input as already having bits_i significant bits,
-    // and bits_o > bits_i, truncating to bits_o is effectively a widening.
-    truncate(value, signed, bits_o)
+pub fn unpack_lane(value: i64, bits_i: u32, bits_o: u32, signed: bool) -> i64 {
+    // First normalize the input to bits_i width with correct sign/zero extension.
+    // This ensures the sign bit at position (bits_i - 1) is propagated correctly.
+    // Then truncate to bits_o, which is a no-op widening since bits_o >= bits_i.
+    let normalized = truncate(value, signed, bits_i);
+    truncate(normalized, signed, bits_o)
 }
 
 /// Pack a full 512-bit vector: narrow each lane from `bits_i` to `bits_o`.

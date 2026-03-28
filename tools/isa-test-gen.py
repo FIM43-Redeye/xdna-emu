@@ -451,9 +451,8 @@ REGISTER_SIZES = {
     # Each y is a pair of x registers (2 x 64 bytes).
     "wide_y": 128,
     # sparse_qx: 80-byte (640-bit) sparse vector+mask composite qx0-qx3.
-    # We only load the 64-byte x component; the 16-byte q mask is left at
-    # its default value (testing assembly pipeline, not computational correctness).
-    "sparse_qx": 64,
+    # 64-byte x component (512-bit vector) + 16-byte q mask (128-bit).
+    "sparse_qx": 80,
 }
 
 # Maximum positive immediate offset for lda/st (6-bit signed, step 4).
@@ -1161,23 +1160,24 @@ def _load_instruction(reg_name: str, kind: str, ptr: str, offset: int) -> list[s
     if kind == "sparse_qx":
         # 640-bit sparse vector+mask composite registers qx0-qx3 (mQQXw class).
         # Each qx register combines an x register (512-bit) and a q mask (128-bit).
-        # We load only the x component; the q mask is NOT initialized here because
-        # setting it requires specialized mask load instructions (vldb.sparse.fill)
-        # that need FIFO configuration beyond what this harness supports.
-        #
-        # Consequence: on hardware, q registers contain undefined/residual values,
-        # making sparse test results non-deterministic. The emulator initializes
-        # q registers to zero (all masked out), so sparse tests will diverge from
-        # hardware. Sparse MAC correctness is validated via unit tests instead.
-        #
-        # TODO: implement FIFO-based mask loading to make sparse ISA tests
-        # deterministic and comparable between HW and EMU.
-        # qx0={x0,q0} -> load wl0,wh0.  qx1={x1,q1} -> load wl1,wh1.
+        # Load both: x component via vlda (64 bytes), q mask via lda (16 bytes).
+        # qx0={x0,q0} -> load wl0,wh0,q0.  qx1={x1,q1} -> load wl1,wh1,q1.
         qx_idx = int(reg_name[2:])  # "qx0" -> 0
+        # q mask starts at offset+64 (after the 64-byte x component).
+        # lda qN has scale=16, so immediate range is [-512, 496].
+        q_offset = offset + 64
+        MAX_QUAD_OFFSET = 496
+        if 0 <= q_offset <= MAX_QUAD_OFFSET:
+            q_load = [f"  lda q{qx_idx}, [{ptr}, #{q_offset}]"]
+        else:
+            q_load = _padda_sequence("p6", ptr, q_offset) + [
+                f"  lda q{qx_idx}, [p6, #0]",
+            ]
         return (
-            [f"  // load sparse_qx {reg_name}: x{qx_idx} component via 2x vlda"]
+            [f"  // load sparse_qx {reg_name}: x{qx_idx} + q{qx_idx} mask"]
             + _vector_load(f"wl{qx_idx}", ptr, offset)
             + _vector_load(f"wh{qx_idx}", ptr, offset + 32)
+            + q_load
         )
     return [f"  // unsupported load for kind={kind}"]
 
@@ -1473,6 +1473,15 @@ def generate_test_point(
         lines.extend(load_lines)
         cur_in_offset += _operand_size(op, name)
 
+    # VINSERT: load implicit index register r29 from input buffer.
+    # r29 is a fixed implicit register (not a decoded operand) -- the harness
+    # must load it explicitly since it won't appear in the operand list.
+    if name.startswith("VINSERT"):
+        align = 4
+        cur_in_offset = _align(cur_in_offset, align)
+        lines.extend(_scalar_load("r29", "p0", cur_in_offset))
+        cur_in_offset += 4
+
     # NOP sled before masking/instruction: must cover load pipeline latency.
     # AIE2 lda/vlda latency is 7 cycles (from AIE2Schedule.td).
     # IMPORTANT: the sled must come BEFORE the index masking below, because
@@ -1494,22 +1503,27 @@ def generate_test_point(
             max_idx = 31  # 32 x 16-bit elements
         else:
             max_idx = 63  # 64 x 8-bit elements
-        # Find the index register: operand named "idx" with ERS4 or scalar kind.
-        # VEXTRACT uses ERS4; VEXTBCST uses scalar. Both need masking.
-        idx_op = op_by_name.get("idx", {})
-        if idx_op.get("register_kind") in ("ERS4", "scalar"):
-            idx_reg = regs.get("idx", "r16")
-            # AIE2 AND is register-only; load mask into r14 first.
+        # VINSERT: index is in implicit r29, not a decoded operand.
+        if name.startswith("VINSERT"):
             lines.append(f"  mov r14, #{max_idx}")
-            lines.append(f"  and {idx_reg}, {idx_reg}, r14")
-            # VEXTRACT/VEXTBCST index-0 errata: element index 0 after
-            # vlda permanently stalls the AIE2 core (Phoenix NPU, confirmed
-            # 2026-03-24).  OR with 1 ensures the index is always >= 1.
-            # This sacrifices even-index coverage but avoids the hang.
-            # See docs/investigations/2026-03-24-vextract-index0-hang.md.
-            if name.startswith(("VEXTRACT", "VEXTBCST")):
-                lines.append(f"  mov r14, #1")
-                lines.append(f"  or {idx_reg}, {idx_reg}, r14")
+            lines.append(f"  and r29, r29, r14")
+        else:
+            # Find the index register: operand named "idx" with ERS4 or scalar kind.
+            # VEXTRACT uses ERS4; VEXTBCST uses scalar. Both need masking.
+            idx_op = op_by_name.get("idx", {})
+            if idx_op.get("register_kind") in ("ERS4", "scalar"):
+                idx_reg = regs.get("idx", "r16")
+                # AIE2 AND is register-only; load mask into r14 first.
+                lines.append(f"  mov r14, #{max_idx}")
+                lines.append(f"  and {idx_reg}, {idx_reg}, r14")
+                # VEXTRACT/VEXTBCST index-0 errata: element index 0 after
+                # vlda permanently stalls the AIE2 core (Phoenix NPU, confirmed
+                # 2026-03-24).  OR with 1 ensures the index is always >= 1.
+                # This sacrifices even-index coverage but avoids the hang.
+                # See docs/investigations/2026-03-24-vextract-index0-hang.md.
+                if name.startswith(("VEXTRACT", "VEXTBCST")):
+                    lines.append(f"  mov r14, #1")
+                    lines.append(f"  or {idx_reg}, {idx_reg}, r14")
 
     # Mask VSHIFT/VSHIFT_ALIGN shift amount to valid byte range (1-63).
     # The shift operand is a scalar register loaded from random 32-bit data.
@@ -3744,6 +3758,179 @@ class EventStrategy(TestStrategy):
 
 
 # ---------------------------------------------------------------------------
+# PointerArithStrategy: tests in-place pointer updates (padda/paddb/padds)
+# ---------------------------------------------------------------------------
+
+# All non-SP padda/paddb/padds variants.  These are in-place pointer updates
+# where the pointer register is both input and output.  ComputeStrategy
+# wrongly skips loading the pointer because detect_output_operands marks it
+# as output; this strategy loads it explicitly.
+_POINTER_ARITH_NAMES = {
+    "PADDA_2D", "PADDA_3D",
+    "PADDA_lda_ptr_inc_idx", "PADDA_lda_ptr_inc_idx_imm",
+    "PADDB_2D", "PADDB_3D",
+    "PADDB_ldb_ptr_inc_nospill_nrm", "PADDB_ldb_ptr_inc_nrm_imm",
+    "PADDS_2D", "PADDS_3D",
+    "PADDS_st_ptr_inc_idx", "PADDS_st_ptr_inc_idx_imm",
+}
+
+
+class PointerArithStrategy(TestStrategy):
+    """Tests in-place pointer arithmetic (padda/paddb/padds 2D/3D/idx).
+
+    These instructions update a pointer register in-place:
+        padda.2d [$ptr], $mod   -- ptr += step(mod) with 2D wrap
+        padda [$ptr], $mod      -- ptr += step(mod)
+        padda [$ptr], #imm      -- ptr += imm
+
+    The pointer is BOTH input and output.  We:
+      1. Load the pointer value from input buffer into a scalar register
+      2. Move it into the pointer register (p2-p5)
+      3. Load the modifier register from input (if present)
+      4. Execute the instruction
+      5. Move the pointer back to a scalar register
+      6. Store the scalar to the output buffer
+    """
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        name = instr.get("name", "")
+        if name in _POINTER_ARITH_NAMES:
+            return (True, "")
+        return (False, "not an in-place pointer arithmetic instruction")
+
+    def compute_input_size(self, instr, regs):
+        """Pointer (4 bytes) + modifier (4 bytes) if idx variant.
+
+        2D/3D variants use dimension registers (d0-d7) which are configured
+        externally -- no input data needed for those.  idx variants use
+        modifier registers (m0-m7) which CAN be loaded from input.
+        """
+        name = instr.get("name", "")
+        is_2d_3d = "2D" in name or "3D" in name
+        if is_2d_3d:
+            return 4  # Just the pointer value.
+        has_mod = any(
+            op.get("register_kind") == "modifier_m"
+            for op in instr.get("operands", [])
+        )
+        return 8 if has_mod else 4
+
+    def compute_output_size(self, instr):
+        return 4  # One 32-bit pointer value.
+
+    def generate_combos(self, instr: dict) -> list[dict[str, str]]:
+        """Generate combos for pointer x modifier (or pointer x immediate).
+
+        2D/3D variants use dimension registers (d0-d7) while idx variants
+        use modifier registers (m0-m7).  Both are 3-bit fields encoding
+        the same physical register space, but the assembler requires
+        different names.
+        """
+        name = instr.get("name", "")
+        operands = instr.get("operands", [])
+        combos = []
+
+        ptr_choices = ["p2", "p3", "p4", "p5"]
+        is_2d_3d = "2D" in name or "3D" in name
+        # 2D/3D: dimension registers d0-d7.  idx: modifier registers m0-m7.
+        mod_choices = ["d0", "d1"] if is_2d_3d else ["m0", "m1"]
+        # Small immediates that stay in valid memory range.
+        imm_choices = ["0", "4", "-4", "32", "64"]
+
+        has_mod = any(op.get("register_kind") == "modifier_m" for op in operands)
+        has_imm = any(op.get("name") == "imm" for op in operands)
+
+        if has_mod:
+            for ptr in ptr_choices:
+                for mod in mod_choices:
+                    combo = {"ptr": ptr, "mod": mod}
+                    # Fill dontcare fields with "0".
+                    for op in operands:
+                        if op["name"].startswith("dontcare"):
+                            combo[op["name"]] = "0"
+                    combos.append(combo)
+        elif has_imm:
+            for ptr in ptr_choices:
+                for imm in imm_choices:
+                    combo = {"ptr": ptr, "imm": imm}
+                    for op in operands:
+                        if op["name"].startswith("dontcare"):
+                            combo[op["name"]] = "0"
+                    combos.append(combo)
+        else:
+            # Fallback: just pointer combos.
+            for ptr in ptr_choices:
+                combo = {"ptr": ptr}
+                for op in operands:
+                    if op["name"].startswith("dontcare"):
+                        combo[op["name"]] = "0"
+                combos.append(combo)
+
+        return combos
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
+        lines = []
+        name = instr["name"]
+        mnemonic = instr["mnemonic"]
+        asm_string = instr.get("asm_string", "")
+        operands = instr.get("operands", [])
+        ptr_reg = regs.get("ptr", "p2")
+        mod_reg = regs.get("mod", "m0")
+
+        in_offset = _align(in_offset, 4)
+        out_offset = _align(out_offset, 4)
+
+        lines.append(f"  // ---- test (ptr_arith): {name} ptr={ptr_reg} ----")
+
+        # Step 1: Load the pointer value from input buffer into r14,
+        # then move to the pointer register.
+        lines.extend(_scalar_load("r14", "p0", in_offset))
+        lines.extend(_nop_sled(LOAD_LATENCY))
+        lines.append(f"  mov {ptr_reg}, r14")
+
+        # Step 2: Load modifier from input (if idx variant uses one).
+        # 2D/3D variants use dimension registers (d0-d7) configured externally
+        # -- we just select which one via the combo.  idx variants use modifier
+        # registers (m0-m7) which can be loaded from input data.
+        is_2d_3d = "2D" in name or "3D" in name
+        has_mod = (
+            not is_2d_3d
+            and any(
+                op.get("register_kind") == "modifier_m" for op in operands
+            )
+        )
+        if has_mod:
+            lines.extend(_scalar_load("r13", "p0", in_offset + 4))
+            lines.extend(_nop_sled(LOAD_LATENCY))
+            lines.append(f"  mov {mod_reg}, r13")
+
+        # Step 3: Execute the instruction.
+        # Reconstruct assembly from asm_string template by substituting
+        # operand placeholders ($ptr, $mod, $imm, $dontcareN).
+        asm_line = asm_string
+        for op_name, op_val in regs.items():
+            placeholder = f"${op_name}"
+            if op_name == "imm":
+                asm_line = asm_line.replace(placeholder, f"#{op_val}")
+            elif op_name.startswith("dontcare") or op_name.startswith("_"):
+                continue  # Handled below / internal key.
+            else:
+                asm_line = asm_line.replace(placeholder, str(op_val))
+        # Replace any remaining dontcare placeholders not in regs.
+        for op in operands:
+            if op["name"].startswith("dontcare"):
+                asm_line = asm_line.replace(f"${op['name']}", "0")
+        lines.append(f"  {asm_line}")
+
+        # Step 4: Move modified pointer to scalar and store to output.
+        lines.append(f"  mov r14, {ptr_reg}")
+        lines.extend(_scalar_store("r14", "p1", out_offset))
+
+        lines.append("")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # PaddaSpStrategy: tests `padda [sp], $imm`
 # ---------------------------------------------------------------------------
 
@@ -4150,6 +4337,7 @@ STRATEGIES: list[TestStrategy] = [
     # EventStrategy disabled: event instruction has no testable output
     # and the marker-based approach adds risk for minimal value.
     # EventStrategy(),
+    PointerArithStrategy(),
     PaddaSpStrategy(),
     LoadStrategy(),
     StoreStrategy(),
@@ -4220,6 +4408,10 @@ def _compute_input_size(instr: dict, regs: dict[str, str]) -> int:
                                 "wide_y", "sparse_qx", "quad") else 4
         total = _align(total, align)
         total += _operand_size(op, instr_name)
+    # VINSERT: implicit r29 index register loaded from input (4 bytes).
+    if instr_name.startswith("VINSERT"):
+        total = _align(total, 4)
+        total += 4
     return max(4, total)
 
 

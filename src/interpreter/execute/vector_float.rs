@@ -364,6 +364,39 @@ pub fn aie2_canonicalize_nan(value: f32) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// AIE2 fp32 arithmetic (FTZ + NaN propagation)
+// ---------------------------------------------------------------------------
+
+/// AIE2 fp32 addition with hardware-accurate FTZ and NaN handling.
+///
+/// AIE2 float operations differ from IEEE 754:
+/// 1. Inputs are flushed to signed zero if denormalized (exp=0, man!=0)
+/// 2. If either input is NaN after FTZ, result is positive canonical NaN
+/// 3. Normal IEEE 754 addition otherwise
+/// 4. Result is FTZ'd again (denormalized results flushed to signed zero)
+///
+/// Derived from aietools python_model/model/mulmac.py and constants.py.
+#[inline]
+pub fn aie2_fp32_add(a_bits: u32, b_bits: u32) -> u32 {
+    // Step 1: Flush denormalized inputs to signed zero.
+    let a_ftz = fp32_flush_to_zero(a_bits);
+    let b_ftz = fp32_flush_to_zero(b_bits);
+
+    // Step 2: Check for NaN (after FTZ, denorms become zero so won't be NaN).
+    if fp32_is_nan(a_ftz) || fp32_is_nan(b_ftz) {
+        return fp32_make_nan(false); // Positive canonical NaN
+    }
+
+    // Step 3: Normal float addition.
+    let a = f32::from_bits(a_ftz);
+    let b = f32::from_bits(b_ftz);
+    let result = a + b;
+
+    // Step 4: Flush denormalized result to signed zero.
+    fp32_flush_to_zero(result.to_bits())
+}
+
+// ---------------------------------------------------------------------------
 // AIE2 rounding for bf16 conversion (SRS bf16 lane path)
 // ---------------------------------------------------------------------------
 

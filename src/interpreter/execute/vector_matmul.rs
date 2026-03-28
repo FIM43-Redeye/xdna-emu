@@ -63,15 +63,10 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         }
     };
 
-    // Detect bf16 mode from mnemonic/encoding name.
-    // The encoding_name field holds the mnemonic (e.g., "vmac.f", "vaddmac.f").
-    // BFloat16 variants use ".f" suffix or "_F_"/"_F" in the encoding name.
-    let is_bf16 = op
-        .encoding_name
-        .as_ref()
-        .map(|n| n.ends_with(".f") || n.contains(".f ") || n.contains("_F_") || n.ends_with("_F"))
-        .unwrap_or(false)
-        || matches!(op.element_type, Some(ElementType::BFloat16 | ElementType::Float32));
+    // Detect bf16 mode from element_type (set at build time from mnemonic).
+    // BFloat16/Float32 MAC variants use a different tile geometry and
+    // accumulator format than integer variants.
+    let is_bf16 = matches!(op.element_type, Some(ElementType::BFloat16 | ElementType::Float32));
 
     // Parse config word into tile geometry and modes.
     let mut config = match MatMulConfig::from_config_word(conf_val, is_bf16) {
@@ -88,16 +83,23 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     };
 
     // Handle subtract semantics for MAC variants.
-    // The hardware compressor stage controls the sign of the accumulator
-    // contribution via a subtract flag. VMSC (instruction_msc in aietools)
-    // passes subtract_acc=True to vmac(), which negates the accumulator's
-    // contribution in the compressor. Effect:
-    //   vmac: result = acc + A*B   (subtract=false)
-    //   vmsc: result = -acc + A*B  (subtract=true, i.e., flip the subtract flag)
-    //   vnegmac: result = acc - A*B  (negate the product via subtract)
-    // When zero_acc=1, vmsc gives -(0) + A*B = A*B... BUT the hardware
-    // subtract flag also affects the product sign in the compressor, so
-    // vmsc with zero_acc actually gives -(A*B).
+    //
+    // The hardware compressor stage controls the sign of the product via a
+    // subtract flag.  Several instruction families flip this flag:
+    //
+    //   vmac:     result = acc + A*B        (subtract=false)
+    //   vmsc:     result = acc - A*B        (subtract=true, negates product)
+    //   vnegmac:  result = -(acc) + A*B     (NegMul semantic)
+    //   vnegmsc:  result = -(acc) - A*B     (NegMul + MSC)
+    //   vaddmac:  result = (acc + A*B) + acc2
+    //   vaddmsc:  result = (acc - A*B) + acc2  (MSC: product negated)
+    //   vsubmac:  result = (acc + A*B) - acc2
+    //   vsubmsc:  result = (acc - A*B) - acc2  (MSC: product negated)
+    //
+    // The NegMul/NegMatMul/MatMulSub semantics flip subtract for vnegmac.
+    // MSC (multiply-subtract) variants have the subtract flag baked into
+    // the instruction encoding (not in the config word).  Detect MSC from
+    // the encoding mnemonic and flip subtract accordingly.
     match semantic {
         SemanticOp::NegMul | SemanticOp::NegMatMul | SemanticOp::MatMulSub => {
             config.subtract = !config.subtract;
@@ -105,21 +107,29 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         _ => {}
     }
 
-    // Detect sparse mode from encoding name.
+    // MSC variants (vaddmsc, vsubmsc) with AddMac/SubMac semantics need
+    // the product negation applied.  VMSC and VNEGMSC already get the
+    // product negation via their NegMul/NegMatMul semantics above, so
+    // only apply this for AddMac/SubMac.
+    if matches!(semantic, SemanticOp::AddMac | SemanticOp::SubMac) {
+        if let Some(ref name) = op.encoding_name {
+            if name.contains("msc") {
+                config.subtract = !config.subtract;
+            }
+        }
+    }
+
+    // Detect sparse mode from operand types.
     //
-    // Sparse MAC instructions use different operand types:
+    // Sparse MAC instructions use different operand types than dense:
     //   - Dense: two VectorReg sources (x registers)
     //   - Sparse wide: VectorReg (ys1 = 1024-bit) + ControlReg (qxs2)
     //   - Sparse narrow: VectorReg (xs1 = 512-bit) + ControlReg (qxs2)
     //
     // The qxs2 operand is a composite register: qx_n = {x_n (data), q_n (mask)}.
-    // ControlReg(28+n) maps to qx_n. We extract the vector data from x_n and
-    // the 64-bit sparsity mask from q_n.
-    let is_sparse = op
-        .encoding_name
-        .as_ref()
-        .map(|n| n.contains("sparse"))
-        .unwrap_or(false);
+    // ControlReg(28+n) maps to qx_n. The presence of a ControlReg source
+    // is the structural signal that distinguishes sparse from dense.
+    let is_sparse = op.sources.iter().any(|s| matches!(s, Operand::ControlReg(_)));
 
     // Read input vectors. Sparse instructions have different operand types.
     let (a, b, sparse_mask) = if is_sparse {
@@ -169,6 +179,11 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     // the accumulator when zero_acc=1. The hardware computes:
     //   AddMac: result = (acc_dest [or 0] + A*B) + acc2
     //   SubMac: result = (acc_dest [or 0] + A*B) - acc2
+    //
+    // In Acc32 mode, the hardware performs the acc2 merge as independent
+    // 32-bit lane additions (no carry propagation from the low half to the
+    // high half within each u64 word). In Acc64 mode, it's a full 64-bit
+    // addition on each u64 lane.
     match semantic {
         SemanticOp::AddMac | SemanticOp::SubMac => {
             let src_reg = get_acc_source(op);
@@ -181,11 +196,32 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
                 ctx.accumulator.read_wide(src_reg & !1)
             };
             let n = if is_half { 8 } else { 16 };
-            for i in 0..n {
-                if semantic == SemanticOp::AddMac {
-                    acc[i] = acc[i].wrapping_add(src_acc[i]);
-                } else {
-                    acc[i] = acc[i].wrapping_sub(src_acc[i]);
+            let is_sub = semantic == SemanticOp::SubMac;
+            match config.acc_width {
+                AccWidth::Acc32 => {
+                    // Acc32: two i32 values per u64, added independently.
+                    for i in 0..n {
+                        let a_lo = (acc[i] & 0xFFFF_FFFF) as u32;
+                        let a_hi = (acc[i] >> 32) as u32;
+                        let s_lo = (src_acc[i] & 0xFFFF_FFFF) as u32;
+                        let s_hi = (src_acc[i] >> 32) as u32;
+                        let (r_lo, r_hi) = if is_sub {
+                            (a_lo.wrapping_sub(s_lo), a_hi.wrapping_sub(s_hi))
+                        } else {
+                            (a_lo.wrapping_add(s_lo), a_hi.wrapping_add(s_hi))
+                        };
+                        acc[i] = (r_lo as u64) | ((r_hi as u64) << 32);
+                    }
+                }
+                AccWidth::Acc64 => {
+                    // Acc64: full 64-bit add/sub on each u64 lane.
+                    for i in 0..n {
+                        if is_sub {
+                            acc[i] = acc[i].wrapping_sub(src_acc[i]);
+                        } else {
+                            acc[i] = acc[i].wrapping_add(src_acc[i]);
+                        }
+                    }
                 }
             }
         }
@@ -260,19 +296,27 @@ fn get_two_vec512(op: &SlotOp, ctx: &ExecutionContext) -> (Vec512, Vec512) {
 /// - bml destinations (512-bit low): even index, is_half=true
 /// - bmh destinations (512-bit high): odd index, is_half=true
 ///
-/// Detection: bf16 MAC ops always use bm_core (512-bit output geometry).
-/// Integer MAC ops always use cm_core (1024-bit output geometry).
-/// The encoding name carries ".f" or "_F_" for bf16 mode.
+/// Determine accumulator destination register and whether it's a narrow
+/// (bm, 512-bit) or wide (cm, 1024-bit) access.
+///
+/// Uses AccumWidth from the decoder's register class metadata:
+///   Half (bml/bmh) -> 512-bit bm_core (is_half = true)
+///   Full (cm)       -> 1024-bit cm_core (is_half = false)
+///   None            -> infer from element type (bf16/float -> half, integer -> wide)
 fn get_acc_dest(op: &SlotOp) -> (u8, bool) {
-    let is_bf16 = op
-        .encoding_name
-        .as_ref()
-        .map(|n| n.ends_with(".f") || n.contains(".f ") || n.contains("_F_") || n.ends_with("_F"))
-        .unwrap_or(false);
+    let is_half = match op.accum_width {
+        Some(crate::tablegen::decoder_ffi::AccumWidth::Half)
+        | Some(crate::tablegen::decoder_ffi::AccumWidth::Quarter) => true,
+        Some(crate::tablegen::decoder_ffi::AccumWidth::Full) => false,
+        None => {
+            // Legacy fallback: bf16/float -> bm_core, integer -> cm_core.
+            matches!(op.element_type, Some(ElementType::BFloat16 | ElementType::Float32))
+        }
+    };
 
     match &op.dest {
         Some(Operand::AccumReg(r)) => {
-            if is_bf16 {
+            if is_half {
                 // bm_core: use register index as-is (even=bml, odd=bmh).
                 (*r, true)
             } else {
@@ -338,12 +382,27 @@ fn get_sparse_operands(op: &SlotOp, ctx: &ExecutionContext) -> (Vec512, Vec512, 
             Operand::VectorReg(r) => {
                 if a_vec.is_none() {
                     // First VectorReg is the dense A input.
-                    // For wide (ys1): register is already aligned by decoder
-                    // (y2 = VectorReg(8), read_wide gives 512 bits from v8+v9).
-                    let base = *r & !1;
-                    a_vec = Some(ctx.vector.read_wide(base));
+                    if op.is_quad_vector {
+                        // y-register (1024-bit): read all four 256-bit registers.
+                        // y2 = VectorReg(8), spans v8..v11.
+                        // The matmul uses the lower 512 bits as the A operand;
+                        // the upper 512 bits extend the inner dimension for
+                        // sparse wide variants (handled by geometry config).
+                        let base = *r & !3;
+                        let quad = ctx.vector.read_quad(base);
+                        // Pack lower 512 bits into Vec512 for the matmul engine.
+                        let mut lo = [0u32; 16];
+                        lo.copy_from_slice(&quad[..16]);
+                        a_vec = Some(lo);
+                        // TODO: upper 512 bits (quad[16..32]) needed for true
+                        // 1024-bit sparse support. Currently the geometry config
+                        // only addresses the lower half.
+                    } else {
+                        // x-register (512-bit): read two 256-bit registers.
+                        let base = *r & !1;
+                        a_vec = Some(ctx.vector.read_wide(base));
+                    }
                 }
-                // If there's a second VectorReg, ignore -- sparse only has one.
             }
             Operand::ControlReg(id) => {
                 // ControlReg(28..31) = qx0..qx3.
@@ -468,13 +527,17 @@ pub fn matmul_sparse_config_driven(
             let mut sum: i64 = 0;
 
             for k in 0..inner {
+                // For 4-bit elements, extract_element_512 expects an ELEMENT
+                // index (it divides by 2 internally to get the byte and uses
+                // modulo 2 for the nibble selector).  For 8/16/32-bit elements
+                // it expects a BYTE offset.
                 let a_byte = if bits_x == 4 {
-                    (r * inner + k) / 2
+                    r * inner + k
                 } else {
                     (r * inner + k) * bytes_x
                 };
                 let b_byte = if bits_y == 4 {
-                    (k * cols + c) / 2
+                    k * cols + c
                 } else {
                     (k * cols + c) * bytes_y
                 };
@@ -838,13 +901,17 @@ pub fn matmul_config_driven(
             let mut sum: i64 = 0;
 
             for k in 0..inner {
+                // For 4-bit elements, extract_element_512 expects an ELEMENT
+                // index (it divides by 2 internally to get the byte and uses
+                // modulo 2 for the nibble selector).  For 8/16/32-bit elements
+                // it expects a BYTE offset.
                 let a_byte = if bits_x == 4 {
-                    (r * inner + k) / 2
+                    r * inner + k
                 } else {
                     (r * inner + k) * bytes_x
                 };
                 let b_byte = if bits_y == 4 {
-                    (k * cols + c) / 2
+                    k * cols + c
                 } else {
                     (k * cols + c) * bytes_y
                 };
@@ -1835,7 +1902,7 @@ mod tests {
         ctx.vector.write_wide(2, ones);
         ctx.scalar.write(5, config_bf16_accumulate());
 
-        let op = make_mac_op(
+        let mut op = make_mac_op(
             SemanticOp::Mac,
             0,
             2,
@@ -1843,6 +1910,7 @@ mod tests {
             0,
             Some("VMAC_F_vmac_bm_core_dense"),
         );
+        op.element_type = Some(ElementType::BFloat16);
 
         let handled = execute_matmul(&op, &mut ctx);
         assert!(handled);
