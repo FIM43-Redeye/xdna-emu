@@ -611,6 +611,18 @@ impl InstructionDecoder {
         // pointer for stores (which executors ignore via dest=None for stores
         // without register defs).  No heuristic swapping needed.
 
+        // Some LLVM instruction definitions (e.g., LDA_dmv_lda_q) have all
+        // operands in (ins) with (outs) empty, so num_defs=0 and dest=None.
+        // For load instructions, promote the first writable non-address register
+        // to dest so the executor writes the loaded data.
+        if dest.is_none() && encoding.may_load {
+            if let Some(pos) = use_ops.iter().position(|o| matches!(o,
+                Operand::ControlReg(_) | Operand::AccumReg(_) | Operand::VectorReg(_) | Operand::ScalarReg(_)
+            )) {
+                dest = Some(use_ops.remove(pos));
+            }
+        }
+
         // Handle pointer arithmetic: dest is the pointer reg, sources are offset.
         // LLVM reports the pointer as both a def (output) and a use (input) since
         // the instruction reads and writes the same register.  Deduplicate: keep

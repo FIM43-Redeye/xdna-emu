@@ -306,7 +306,8 @@ fn get_two_vec512(op: &SlotOp, ctx: &ExecutionContext) -> (Vec512, Vec512) {
 fn get_acc_dest(op: &SlotOp) -> (u8, bool) {
     let is_half = match op.accum_width {
         Some(crate::tablegen::decoder_ffi::AccumWidth::Half)
-        | Some(crate::tablegen::decoder_ffi::AccumWidth::Quarter) => true,
+        | Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterLow)
+        | Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterHigh) => true,
         Some(crate::tablegen::decoder_ffi::AccumWidth::Full) => false,
         None => {
             // Legacy fallback: bf16/float -> bm_core, integer -> cm_core.

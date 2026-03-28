@@ -102,6 +102,23 @@ pub fn detect_addressing_mode(instr_name: &str) -> AddressingMode {
 /// Vector operations (`vlda`, `vldb`, `vst`) are normally 256-bit,
 /// but `.128` variants load/store only 128 bits (lower half of vector reg).
 pub fn detect_mem_width(mnemonic: &str) -> InstrMemWidth {
+    detect_mem_width_full("", mnemonic)
+}
+
+/// Detect memory width from instruction name and mnemonic.
+///
+/// Quad-word scalar loads/stores (dmv_lda_q / dmv_sts_q) and AM loads/stores
+/// (dmw_lda_am / dmw_sts_am) use the same mnemonics as regular scalar/vector
+/// operations ("lda"/"st"/"vlda"/"vst"), so the encoding name is needed to
+/// distinguish them.
+pub fn detect_mem_width_full(instr_name: &str, mnemonic: &str) -> InstrMemWidth {
+    let lower_name = instr_name.to_lowercase();
+
+    // Quad-word scalar: 128-bit load/store to q registers.
+    if lower_name.contains("dmv_lda_q") || lower_name.contains("dmv_sts_q") {
+        return InstrMemWidth::QuadWord;
+    }
+
     let lower = mnemonic.to_lowercase();
     if lower.starts_with("vlda") || lower.starts_with("vldb")
         || lower.starts_with("vst")
@@ -774,7 +791,7 @@ impl<'a> Resolver<'a> {
             output_order,
             implicit_regs: instr.implicit_regs.clone(),
             addressing_mode: detect_addressing_mode(&instr.name),
-            mem_width: detect_mem_width(&instr.mnemonic),
+            mem_width: detect_mem_width_full(&instr.name, &instr.mnemonic),
             // Regex parser doesn't parse hasCompleteDecoder; assume true (safe default)
             has_complete_decoder: true,
             element_type,

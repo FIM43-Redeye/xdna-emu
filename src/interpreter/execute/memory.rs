@@ -307,8 +307,7 @@ impl MemoryUnit {
                 ctx.queue_vector_load(dest.clone(), vec_data, latency);
             }
         } else if width == MemWidth::QuadWord {
-            // 128-bit load: read 16 bytes, write to lower half of vector register.
-            // Upper 128 bits are zeroed (hardware behavior).
+            // 128-bit load: read 16 bytes into a q register (mask) or vector.
             let full_data = Self::read_vector_from_memory(tile, addr, neighbors.map(|n| &*n));
             let mut vec_data = [0u32; 8];
             vec_data[0] = full_data[0];
@@ -376,33 +375,18 @@ impl MemoryUnit {
             ctx.record_core_bank_access(local_offset as u32, width.bytes() as usize, tile.num_banks());
         }
 
-        // Handle vector stores specially
+        // Handle vector/wide stores
         if width == MemWidth::Vector256 || width == MemWidth::QuadWord {
-            // Get vector register from source or dest
-            let vec_reg = op
-                .sources
-                .get(1)
-                .or(op.dest.as_ref())
-                .and_then(|operand| match operand {
-                    Operand::VectorReg(r) => Some(*r),
-                    _ => None,
-                });
+            // Read data from VectorReg, AccumReg, or ControlReg source.
+            let vec_data = Self::read_store_data_wide(op, ctx);
 
-            if let Some(r) = vec_reg {
-                let vec_data = ctx.vector.read(r);
+            if let Some(data) = vec_data {
                 if width == MemWidth::QuadWord {
                     // 128-bit store: write only lower 4 words (16 bytes).
-                    // Zero-fill the upper half so write_vector_to_memory
-                    // only writes meaningful data in the lower 16 bytes.
-                    let half = [vec_data[0], vec_data[1], vec_data[2], vec_data[3],
-                                0, 0, 0, 0];
-                    // We still write 32 bytes total but upper 16 are zeros.
-                    // This is acceptable since the ISA test output area is
-                    // allocated per test point, and the test only checks the
-                    // declared out_size bytes.
+                    let half = [data[0], data[1], data[2], data[3], 0, 0, 0, 0];
                     Self::write_vector_to_memory(tile, addr, half, neighbors);
                 } else {
-                    Self::write_vector_to_memory(tile, addr, vec_data, neighbors);
+                    Self::write_vector_to_memory(tile, addr, data, neighbors);
                 }
             }
         } else {
@@ -457,9 +441,20 @@ impl MemoryUnit {
             Self::read_vector_from_memory(tile, addr, neighbors.map(|n| &*n))
         };
 
-        // Queue deferred write to destination vector register
+        // Queue deferred write to destination register.
+        // AccumReg destinations (AM loads) need width metadata for quarter writes.
         if let Some(dest) = &op.dest {
-            ctx.queue_vector_load(dest.clone(), vec_data, latency);
+            match dest {
+                Operand::AccumReg(_) => {
+                    let width = op.accum_width.unwrap_or(
+                        crate::tablegen::decoder_ffi::AccumWidth::Half,
+                    );
+                    ctx.queue_accum_load(dest.clone(), vec_data, width, latency);
+                }
+                _ => {
+                    ctx.queue_vector_load(dest.clone(), vec_data, latency);
+                }
+            }
         }
 
         // Apply post-modify immediately (pointer update is not deferred)
@@ -646,34 +641,60 @@ impl MemoryUnit {
             ctx.record_core_bank_access(local_offset as u32, 32, tile.num_banks());
         }
 
-        // Get vector register from sources or dest.
-        // For VST, the vector data may be in any source position (the decoder
-        // may place VectorReg before or after the Memory operand).
-        let vec_reg = op
-            .sources
-            .iter()
-            .chain(op.dest.iter())
-            .find_map(|operand| match operand {
-                Operand::VectorReg(r) => Some(*r),
-                _ => None,
-            });
+        // Get data from sources or dest. Check VectorReg, AccumReg, or ControlReg.
+        let vec_data = Self::read_store_data_wide(op, ctx);
 
-        if let Some(r) = vec_reg {
-            let vec_data = ctx.vector.read(r);
-            log::trace!("[VST] writing v{} to addr=0x{:X} mem_width={:?}", r, addr, op.mem_width);
-            // VST_128: only write lower 16 bytes (4 words) for 128-bit stores.
+        if let Some(data) = vec_data {
+            log::trace!("[VST] writing to addr=0x{:X} mem_width={:?}", addr, op.mem_width);
             if op.mem_width == MemWidth::QuadWord {
-                let half = [vec_data[0], vec_data[1], vec_data[2], vec_data[3], 0, 0, 0, 0];
+                let half = [data[0], data[1], data[2], data[3], 0, 0, 0, 0];
                 Self::write_vector_to_memory(tile, addr, half, neighbors);
             } else {
-                Self::write_vector_to_memory(tile, addr, vec_data, neighbors);
+                Self::write_vector_to_memory(tile, addr, data, neighbors);
             }
         } else {
-            log::warn!("[VST] no vector register found! sources={:?} dest={:?}", op.sources, op.dest);
+            log::warn!("[VST] no data register found! sources={:?} dest={:?}", op.sources, op.dest);
         }
 
         // Apply post-modify (vector width = 32 bytes)
         Self::apply_post_modify(op, ctx, post_modify);
+    }
+
+    /// Read 256-bit store data from the first VectorReg, AccumReg, or ControlReg
+    /// found in the op's sources or dest. Returns [u32; 8] or None.
+    fn read_store_data_wide(op: &SlotOp, ctx: &ExecutionContext) -> Option<[u32; 8]> {
+        use crate::tablegen::decoder_ffi::AccumWidth;
+
+        for operand in op.sources.iter().chain(op.dest.iter()) {
+            match operand {
+                Operand::VectorReg(r) => return Some(ctx.vector.read(*r)),
+                Operand::AccumReg(r) => {
+                    // Read the right quarter/half based on accum_width.
+                    let accum = ctx.accumulator.read(*r);
+                    let width = op.accum_width.unwrap_or(AccumWidth::Half);
+                    let lanes: &[u64] = match width {
+                        AccumWidth::QuarterLow => &accum[0..4],
+                        AccumWidth::QuarterHigh => &accum[4..8],
+                        AccumWidth::Half | AccumWidth::Full => &accum[0..4],
+                    };
+                    // Convert [u64] lanes to [u32; 8] for memory write.
+                    let mut result = [0u32; 8];
+                    for (i, &lane) in lanes.iter().enumerate() {
+                        result[i * 2] = lane as u32;
+                        result[i * 2 + 1] = (lane >> 32) as u32;
+                    }
+                    return Some(result);
+                }
+                Operand::ControlReg(id) if *id >= 16 && *id <= 19 => {
+                    // q0-q3 mask registers: 128-bit, stored in [u32; 4].
+                    let q_idx = (*id - 16) as u8;
+                    let mask = ctx.mask.read(q_idx);
+                    return Some([mask[0], mask[1], mask[2], mask[3], 0, 0, 0, 0]);
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Get the pointer register from a slot op's source operands.

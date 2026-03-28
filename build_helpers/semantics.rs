@@ -230,6 +230,22 @@ pub fn detect_addressing_mode(instr_name: &str) -> String {
 
 /// Detect memory access width from mnemonic. Returns a Rust expression string.
 pub fn detect_mem_width(mnemonic: &str) -> String {
+    detect_mem_width_full("", mnemonic)
+}
+
+/// Detect memory width from instruction name and mnemonic.
+///
+/// Quad-word scalar loads/stores (dmv_lda_q / dmv_sts_q) use the same "lda"/"st"
+/// mnemonics as regular 32-bit scalar ops. The encoding name is needed to
+/// distinguish 128-bit q-register operations.
+pub fn detect_mem_width_full(instr_name: &str, mnemonic: &str) -> String {
+    let lower_name = instr_name.to_lowercase();
+
+    // Quad-word scalar: 128-bit load/store to q registers.
+    if lower_name.contains("dmv_lda_q") || lower_name.contains("dmv_sts_q") {
+        return "InstrMemWidth::QuadWord".to_string();
+    }
+
     let lower = mnemonic.to_lowercase();
     if lower.starts_with("vlda") || lower.starts_with("vldb") || lower.starts_with("vst") {
         if lower.contains(".128") || lower.contains("_128") {
@@ -657,7 +673,7 @@ impl BuildInstrRecord {
             output_order,
             implicit_regs,
             addressing_mode: detect_addressing_mode(&self.name),
-            mem_width: detect_mem_width(&self.mnemonic),
+            mem_width: detect_mem_width_full(&self.name, &self.mnemonic),
             has_complete_decoder: self.has_complete_decoder,
             element_type,
             from_type,

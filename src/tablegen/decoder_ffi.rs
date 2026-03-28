@@ -357,8 +357,10 @@ use crate::interpreter::state::{
 /// between 256-bit, 512-bit, or 1024-bit access patterns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccumWidth {
-    /// 256-bit quarter-accumulator (amll, amlh, amhl, amhh).
-    Quarter,
+    /// 256-bit low quarter-accumulator (amll, amhl) -- lanes 0-3.
+    QuarterLow,
+    /// 256-bit high quarter-accumulator (amlh, amhh) -- lanes 4-7.
+    QuarterHigh,
     /// 512-bit half-accumulator (bml, bmh).
     Half,
     /// 1024-bit full accumulator (cm).
@@ -529,10 +531,14 @@ pub fn classify_reg_name(name: &str) -> Option<MappedOperand> {
         "cm" => Some(accum(Operand::AccumReg(idx * 2), AccumWidth::Full)),
 
         // Accumulator 256-bit sub-banks.
-        // amll_n, amlh_n are within bml_n -> AccumReg(n * 2).
-        "amll" | "amlh" => Some(accum(Operand::AccumReg(idx * 2), AccumWidth::Quarter)),
-        // amhl_n, amhh_n are within bmh_n -> AccumReg(n * 2 + 1).
-        "amhl" | "amhh" => Some(accum(Operand::AccumReg(idx * 2 + 1), AccumWidth::Quarter)),
+        // amll_n = low quarter of bml_n (lanes 0-3).
+        "amll" => Some(accum(Operand::AccumReg(idx * 2), AccumWidth::QuarterLow)),
+        // amlh_n = high quarter of bml_n (lanes 4-7).
+        "amlh" => Some(accum(Operand::AccumReg(idx * 2), AccumWidth::QuarterHigh)),
+        // amhl_n = low quarter of bmh_n (lanes 0-3).
+        "amhl" => Some(accum(Operand::AccumReg(idx * 2 + 1), AccumWidth::QuarterLow)),
+        // amhh_n = high quarter of bmh_n (lanes 4-7).
+        "amhh" => Some(accum(Operand::AccumReg(idx * 2 + 1), AccumWidth::QuarterHigh)),
 
         // Modifier sub-registers.
         "m"  => Some(simple(Operand::ModifierReg(MOD_BASE_M + idx))),
@@ -957,15 +963,25 @@ mod tests {
         let m = operand_from_reg_name("cm1").unwrap();
         assert_eq!(m.operand, Operand::AccumReg(2));
 
-        // amll0 -> AccumReg(0), Quarter
+        // amll0 -> AccumReg(0), QuarterLow (lanes 0-3 of bml0)
         let m = operand_from_reg_name("amll0").unwrap();
         assert_eq!(m.operand, Operand::AccumReg(0));
-        assert_eq!(m.accum_width, Some(AccumWidth::Quarter));
+        assert_eq!(m.accum_width, Some(AccumWidth::QuarterLow));
 
-        // amhh1 -> AccumReg(3), Quarter (within bmh1)
+        // amlh0 -> AccumReg(0), QuarterHigh (lanes 4-7 of bml0)
+        let m = operand_from_reg_name("amlh0").unwrap();
+        assert_eq!(m.operand, Operand::AccumReg(0));
+        assert_eq!(m.accum_width, Some(AccumWidth::QuarterHigh));
+
+        // amhl1 -> AccumReg(3), QuarterLow (lanes 0-3 of bmh1)
+        let m = operand_from_reg_name("amhl1").unwrap();
+        assert_eq!(m.operand, Operand::AccumReg(3));
+        assert_eq!(m.accum_width, Some(AccumWidth::QuarterLow));
+
+        // amhh1 -> AccumReg(3), QuarterHigh (lanes 4-7 of bmh1)
         let m = operand_from_reg_name("amhh1").unwrap();
         assert_eq!(m.operand, Operand::AccumReg(3));
-        assert_eq!(m.accum_width, Some(AccumWidth::Quarter));
+        assert_eq!(m.accum_width, Some(AccumWidth::QuarterHigh));
     }
 
     #[test]

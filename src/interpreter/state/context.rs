@@ -44,6 +44,9 @@ pub struct PendingWrite {
     pub scalar_value: u32,
     /// Vector value for vector loads (None for scalar loads).
     pub vec_value: Option<[u32; 8]>,
+    /// Accumulator access width for AccumReg destinations.
+    /// Determines which lanes to write (quarter/half/full).
+    pub accum_width: Option<crate::tablegen::decoder_ffi::AccumWidth>,
     /// Cycle at which this write becomes visible.
     pub ready_cycle: u64,
     /// Cycle at which this write was issued (for forwarding discrimination).
@@ -920,6 +923,7 @@ impl ExecutionContext {
             dest,
             scalar_value: value,
             vec_value: None,
+            accum_width: None,
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
         });
@@ -931,6 +935,25 @@ impl ExecutionContext {
             dest,
             scalar_value: 0,
             vec_value: Some(value),
+            accum_width: None,
+            ready_cycle: self.cycles + latency,
+            issued_cycle: self.cycles,
+        });
+    }
+
+    /// Queue an accumulator load with width metadata for quarter/half/full writes.
+    pub fn queue_accum_load(
+        &mut self,
+        dest: Operand,
+        value: [u32; 8],
+        width: crate::tablegen::decoder_ffi::AccumWidth,
+        latency: u64,
+    ) {
+        self.pending_writes.push(PendingWrite {
+            dest,
+            scalar_value: 0,
+            vec_value: Some(value),
+            accum_width: Some(width),
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
         });
@@ -958,6 +981,7 @@ impl ExecutionContext {
             dest: Operand::PointerReg(reg),
             scalar_value: value,
             vec_value: None,
+            accum_width: None,
             ready_cycle: self.cycles + latency,
             issued_cycle: self.cycles,
         });
@@ -1063,7 +1087,91 @@ impl ExecutionContext {
                     self.vector.write(*r, *vec);
                 }
             }
+            Operand::AccumReg(r) => {
+                if let Some(vec) = &pw.vec_value {
+                    self.apply_accum_write(*r, vec, pw.accum_width);
+                }
+            }
+            Operand::ControlReg(id) => {
+                // Mask registers q0-q3 are ControlReg(16..19).
+                if *id >= 16 && *id <= 19 {
+                    if let Some(vec) = &pw.vec_value {
+                        let q_idx = (*id - 16) as u8;
+                        self.mask.write(q_idx, [vec[0], vec[1], vec[2], vec[3]]);
+                    }
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// Write to an accumulator register with quarter/half/full width support.
+    ///
+    /// For quarter writes (AM registers), only 4 u64 lanes are updated while
+    /// preserving the other 4 lanes. For half writes (bml/bmh), the full
+    /// 512-bit register is overwritten.
+    fn apply_accum_write(
+        &mut self,
+        reg: u8,
+        vec: &[u32; 8],
+        width: Option<crate::tablegen::decoder_ffi::AccumWidth>,
+    ) {
+        use crate::tablegen::decoder_ffi::AccumWidth;
+
+        // Convert [u32; 8] (256 bits) to [u64; 4] by pairing adjacent words.
+        let to_u64_lanes = |v: &[u32; 8]| -> [u64; 4] {
+            [
+                (v[0] as u64) | ((v[1] as u64) << 32),
+                (v[2] as u64) | ((v[3] as u64) << 32),
+                (v[4] as u64) | ((v[5] as u64) << 32),
+                (v[6] as u64) | ((v[7] as u64) << 32),
+            ]
+        };
+
+        match width {
+            Some(AccumWidth::QuarterLow) => {
+                // Write to lanes 0-3 of the 512-bit register, preserve 4-7.
+                let mut current = self.accumulator.read(reg);
+                let lanes = to_u64_lanes(vec);
+                current[0] = lanes[0];
+                current[1] = lanes[1];
+                current[2] = lanes[2];
+                current[3] = lanes[3];
+                self.accumulator.write(reg, current);
+            }
+            Some(AccumWidth::QuarterHigh) => {
+                // Write to lanes 4-7 of the 512-bit register, preserve 0-3.
+                let mut current = self.accumulator.read(reg);
+                let lanes = to_u64_lanes(vec);
+                current[4] = lanes[0];
+                current[5] = lanes[1];
+                current[6] = lanes[2];
+                current[7] = lanes[3];
+                self.accumulator.write(reg, current);
+            }
+            Some(AccumWidth::Half) | None => {
+                // Write the full 512-bit register (default for bml/bmh loads).
+                let lanes = to_u64_lanes(vec);
+                let mut full = [0u64; 8];
+                full[0] = lanes[0];
+                full[1] = lanes[1];
+                full[2] = lanes[2];
+                full[3] = lanes[3];
+                // Upper 4 lanes come from the remaining vec data if available.
+                // For 256-bit loads, lanes 4-7 are zero.
+                self.accumulator.write(reg, full);
+            }
+            Some(AccumWidth::Full) => {
+                // 1024-bit write: vec only has 256 bits, write as low half.
+                // Full writes typically go through write_wide, not this path.
+                let lanes = to_u64_lanes(vec);
+                let mut full = [0u64; 8];
+                full[0] = lanes[0];
+                full[1] = lanes[1];
+                full[2] = lanes[2];
+                full[3] = lanes[3];
+                self.accumulator.write(reg, full);
+            }
         }
     }
 

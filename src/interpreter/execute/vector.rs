@@ -778,7 +778,8 @@ impl VectorAlu {
         let is_wide = match op.accum_width {
             Some(crate::tablegen::decoder_ffi::AccumWidth::Full) => true,
             Some(crate::tablegen::decoder_ffi::AccumWidth::Half)
-            | Some(crate::tablegen::decoder_ffi::AccumWidth::Quarter) => false,
+            | Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterLow)
+            | Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterHigh) => false,
             None => {
                 // Legacy fallback: if any index is odd, it must be a bm half.
                 let any_odd = acc_sources.iter().any(|r| r % 2 != 0) || dst_reg % 2 != 0;
@@ -885,7 +886,8 @@ impl VectorAlu {
         let is_wide = match op.accum_width {
             Some(crate::tablegen::decoder_ffi::AccumWidth::Full) => true,
             Some(crate::tablegen::decoder_ffi::AccumWidth::Half)
-            | Some(crate::tablegen::decoder_ffi::AccumWidth::Quarter) => false,
+            | Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterLow)
+            | Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterHigh) => false,
             None => {
                 let any_odd = acc_reg % 2 != 0 || dst_reg % 2 != 0;
                 !any_odd
