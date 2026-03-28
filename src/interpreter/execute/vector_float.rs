@@ -303,14 +303,17 @@ pub fn fp32_is_inf(bits: u32) -> bool {
 
 /// Create the AIE2 canonical NaN bit pattern (fp32).
 ///
-/// AIE2 produces a specific NaN for all NaN results: the mantissa is 0x7F
-/// (lowest 7 bits set). This differs from IEEE 754's quiet NaN convention
-/// (which sets bit 22). AIE2 does not distinguish quiet vs signaling NaN.
+/// AIE2 produces a specific NaN for all NaN results: mantissa = 1 (only bit 0
+/// set), sign = 0 (always positive).  This was verified against real NPU1
+/// hardware by observing `vadd.f` on NaN inputs through the SRS path.
 ///
-/// Matches `fp32_make_nan(sgn)` in the hardware model.
+/// The aietools Python model (`bfloat16.py:fp32_make_nan`) uses mantissa =
+/// 0x7F (2^7-1), which matches the BF16 canonical NaN extended to f32.  The
+/// real silicon produces mantissa = 1 instead.  Since hardware is ground
+/// truth, we use mantissa = 1.
 #[inline]
 pub fn fp32_make_nan(sign: bool) -> u32 {
-    ((sign as u32) << 31) | (0xFF << 23) | 0x7F
+    ((sign as u32) << 31) | (0xFF << 23) | 0x1
 }
 
 /// Create an fp32 infinity bit pattern.

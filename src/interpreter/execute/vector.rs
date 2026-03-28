@@ -5045,4 +5045,84 @@ mod tests {
                 i, result[i], expected);
         }
     }
+
+    /// VADD_F: NaN + NaN should produce canonical NaN with mantissa = 1.
+    ///
+    /// Negative s16 values sign-extended to s32 produce f32 NaN bit patterns
+    /// (exponent = 0xFF, mantissa != 0).  The hardware canonical NaN is
+    /// 0x7F800001 (mantissa = 1, sign = 0).  Verified against real NPU1 HW.
+    #[test]
+    fn test_vadd_f_nan_canonical() {
+        use crate::tablegen::decoder_ffi::AccumWidth;
+        let mut ctx = make_ctx();
+
+        // Load NaN values: s16 = -1 -> s32 = 0xFFFFFFFF -> f32: NaN (exp=0xFF).
+        // Pack two NaN values per u64 accumulator lane.
+        let nan_s32 = 0xFFFFFFFFu32;
+        let nan_u64 = (nan_s32 as u64) | ((nan_s32 as u64) << 32);
+        let acc = [nan_u64; 8];
+        ctx.accumulator.write(0, acc);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Accumulate)
+            .as_vector(ElementType::Float32)
+            .with_dest(Operand::AccumReg(0))
+            .with_source(Operand::AccumReg(0))
+            .with_source(Operand::AccumReg(0))
+            .with_source(Operand::ScalarReg(0));
+        op.accum_width = Some(AccumWidth::Half);
+        ctx.scalar.write(0, 0);
+
+        VectorAlu::execute(&op, &mut ctx);
+
+        let result = ctx.accumulator.read(0);
+        // Each u64 lane should hold two copies of canonical NaN = 0x7F800001.
+        let expected = 0x7F800001_7F800001u64;
+        for (i, &v) in result.iter().enumerate() {
+            assert_eq!(v, expected,
+                "acc lane {} should be canonical NaN pair, got {:#018x}", i, v);
+        }
+    }
+
+    /// VADD_F: float accumulator add should flush denormals to zero.
+    ///
+    /// The test harness loads s16 data via `vups.s32.s16` then runs
+    /// `vadd.f bml0, bml0, bml0, r0`.  Small positive s16 values
+    /// (1..127) sign-extend to s32 = denormalized f32 bit patterns.
+    /// FTZ should flush them to +0.0, so vadd.f(0, 0) = 0.
+    /// SRS should then produce zero.
+    #[test]
+    fn test_vadd_f_denormal_ftz() {
+        use crate::tablegen::decoder_ffi::AccumWidth;
+        let mut ctx = make_ctx();
+
+        // Simulate UPS: sign-extend 16 s16 values to s32, pack 2 per u64.
+        // Values 0..15: all small positive -> denormalized f32 patterns.
+        let src = [0x0002_0001u32, 0x0004_0003, 0x0006_0005, 0x0008_0007,
+                    0x000A_0009, 0x000C_000B, 0x000E_000D, 0x0010_000F];
+        let acc = super::vector_ups::ups_vector_to_acc(
+            &src, 0, ElementType::Int16, ElementType::Int32,
+        );
+        ctx.accumulator.write(0, acc);
+
+        // Build a vadd.f operation: bml0 = bml0 + bml0.
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Accumulate)
+            .as_vector(ElementType::Float32)
+            .with_dest(Operand::AccumReg(0))
+            .with_source(Operand::AccumReg(0))
+            .with_source(Operand::AccumReg(0))
+            .with_source(Operand::ScalarReg(0)); // config = 0
+        op.accum_width = Some(AccumWidth::Half);
+
+        // Config register r0 = 0.
+        ctx.scalar.write(0, 0);
+
+        VectorAlu::execute(&op, &mut ctx);
+
+        // Read back via SRS s16.s32 with shift=0.
+        let result_acc = ctx.accumulator.read(0);
+        // All values were denormalized f32 -> FTZ to 0 -> add(0,0) = 0.
+        for (i, &v) in result_acc.iter().enumerate() {
+            assert_eq!(v, 0, "acc lane {} should be 0 after FTZ, got {:#018x}", i, v);
+        }
+    }
 }
