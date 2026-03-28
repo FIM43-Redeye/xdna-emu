@@ -74,7 +74,7 @@ impl VectorAlu {
         let is_accum_only = matches!(semantic,
             SemanticOp::Accumulate | SemanticOp::AccumSub
             | SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub
-            | SemanticOp::Neg) && {
+            | SemanticOp::Neg | SemanticOp::NegAdd) && {
             let has_acc_source = op.sources.iter()
                 .any(|s| matches!(s, Operand::AccumReg(_)));
             let has_vec_source = op.sources.iter()
@@ -496,29 +496,28 @@ impl VectorAlu {
             }
 
             SemanticOp::Accumulate | SemanticOp::AccumSub
-            | SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub => {
+            | SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub
+            | SemanticOp::NegAdd => {
                 // VADD/VSUB/VNEGADD/VNEGSUB: add/subtract two accumulator
                 // registers. Format: `vadd $dst, $acc1, $acc2, $config`.
                 //
                 // Check if sources contain AccumReg (acc-to-acc operation)
-                // or VectorReg (legacy vector accumulate path).
+                // or VectorReg (legacy vector accumulate / regular NegAdd).
                 let has_acc_source = op.sources.iter().any(|s| matches!(s, Operand::AccumReg(_)));
 
                 if has_acc_source {
                     Self::execute_acc_add_sub(op, ctx);
+                } else if matches!(semantic, SemanticOp::NegAdd) {
+                    // Regular vector negate-add (no accumulator involvement).
+                    let (a, b) = Self::get_two_vector_sources(op, ctx);
+                    let result = Self::vector_neg_add(&a, &b, et);
+                    Self::write_vector_dest(op, ctx, result);
                 } else {
                     // Legacy: accumulate a vector source into an accumulator.
                     let src = Self::get_vector_source(op, ctx, 0);
                     let acc_reg = Self::get_acc_dest(op);
                     Self::vector_accumulate(ctx, acc_reg, &src, et);
                 }
-                true
-            }
-
-            SemanticOp::NegAdd => {
-                let (a, b) = Self::get_two_vector_sources(op, ctx);
-                let result = Self::vector_neg_add(&a, &b, et);
-                Self::write_vector_dest(op, ctx, result);
                 true
             }
 
@@ -762,12 +761,43 @@ impl VectorAlu {
         let sub_acc1 = ((conf >> 11) & 1) != 0;
         let sub_acc2 = ((conf >> 12) & 1) != 0;
 
-        // Determine base operation from SemanticOp (set at decode time from
-        // the encoding class -- VADD, VSUB, VNEGADD, VNEGSUB).
+        // Determine md1/md2 encoding bits from SemanticOp.
+        //
+        // The hardware VACC ALU has two mode bits (md1, md2) that XOR with the
+        // config register's sub_acc1/sub_acc2 bits to determine the effective
+        // sign of each accumulator operand:
+        //   negate_acc1 = md1 XOR sub_acc1
+        //   negate_acc2 = md2 XOR sub_acc2
+        //
+        // Encoding:       md1  md2   Operation
+        //   VADD           0    0    +acc1 + acc2
+        //   VSUB           0    1    +acc1 - acc2
+        //   VNEGSUB        1    0    -acc1 + acc2
+        //   VNEGADD        1    1    -acc1 - acc2 = -(acc1 + acc2)
+        //
+        // Note: VNEGADD negates BOTH operands (the "add" refers to the
+        // unsigned operation, "neg" flips both signs). VNEGSUB negates only
+        // acc1 (the "sub" flips one sign, "neg" flips another, net one flip).
         let semantic = op.semantic.unwrap_or(SemanticOp::Accumulate);
-        let base_sub = matches!(semantic, SemanticOp::AccumSub);
-        let base_neg = matches!(semantic, SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub);
-        let base_negsub = matches!(semantic, SemanticOp::AccumNegSub);
+        let enc_lower = op.encoding_name.as_deref().unwrap_or("").to_ascii_lowercase();
+        // Map semantic -> (md1, md2).  Accept both AccumXxx (build-time) and
+        // generic NegAdd (runtime mnemonic dispatch, no NegSub variant exists).
+        let (md1, md2) = match semantic {
+            SemanticOp::Accumulate => (false, false),                    // VADD
+            SemanticOp::AccumSub => (false, true),                       // VSUB
+            SemanticOp::AccumNegAdd => (true, true),                     // VNEGADD
+            SemanticOp::AccumNegSub => (true, false),                    // VNEGSUB
+            SemanticOp::NegAdd => {
+                // Runtime mnemonic dispatch -- both vnegadd and vnegsub map to
+                // NegAdd.  Distinguish via encoding name.
+                if enc_lower.contains("negsub") {
+                    (true, false)                                        // VNEGSUB
+                } else {
+                    (true, true)                                         // VNEGADD
+                }
+            }
+            _ => (false, false),
+        };
         // Float mode from element_type (set at build time from mnemonic ".f" suffix).
         let is_float = matches!(op.element_type, Some(ElementType::Float32) | Some(ElementType::BFloat16));
 
@@ -787,9 +817,9 @@ impl VectorAlu {
             }
         };
 
-        // Compute effective signs for acc1 and acc2.
-        let negate_acc1 = base_neg || base_negsub || sub_acc1;
-        let negate_acc2 = base_sub || base_negsub || sub_acc2;
+        // Compute effective signs: md bits XOR config bits (mirrors hardware).
+        let negate_acc1 = md1 ^ sub_acc1;
+        let negate_acc2 = md2 ^ sub_acc2;
 
         if is_wide {
             // Wide path: 1024-bit cm registers (16 x 64-bit lanes).
@@ -814,14 +844,22 @@ impl VectorAlu {
                     result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
                 }
             } else {
+                // Acc32 mode: each u64 holds two independent 32-bit accumulator
+                // lanes.  The hardware ALU has no carry chain between the lo and
+                // hi halves -- all arithmetic is per-lane 32-bit.
                 for i in 0..16 {
-                    let v1 = if zero_acc1 { 0i64 } else { a1[i] as i64 };
-                    let v2 = a2[i] as i64;
-                    let v1 = if negate_acc1 { v1.wrapping_neg() } else { v1 };
-                    let v2 = if negate_acc2 { v2.wrapping_neg() } else { v2 };
-                    let mut res = v1.wrapping_add(v2);
-                    if shift16 { res >>= 16; }
-                    result[i] = res as u64;
+                    let v1_lo = if zero_acc1 { 0i32 } else { a1[i] as i32 };
+                    let v1_hi = if zero_acc1 { 0i32 } else { (a1[i] >> 32) as i32 };
+                    let v2_lo = a2[i] as i32;
+                    let v2_hi = (a2[i] >> 32) as i32;
+                    let v1_lo = if negate_acc1 { v1_lo.wrapping_neg() } else { v1_lo };
+                    let v1_hi = if negate_acc1 { v1_hi.wrapping_neg() } else { v1_hi };
+                    let v2_lo = if negate_acc2 { v2_lo.wrapping_neg() } else { v2_lo };
+                    let v2_hi = if negate_acc2 { v2_hi.wrapping_neg() } else { v2_hi };
+                    let mut r_lo = v1_lo.wrapping_add(v2_lo);
+                    let mut r_hi = v1_hi.wrapping_add(v2_hi);
+                    if shift16 { r_lo >>= 16; r_hi >>= 16; }
+                    result[i] = (r_lo as u32 as u64) | ((r_hi as u32 as u64) << 32);
                 }
             }
 
@@ -848,14 +886,20 @@ impl VectorAlu {
                     result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
                 }
             } else {
+                // Acc32 mode: independent 32-bit lane operations (see wide path).
                 for i in 0..8 {
-                    let v1 = if zero_acc1 { 0i64 } else { a1[i] as i64 };
-                    let v2 = a2[i] as i64;
-                    let v1 = if negate_acc1 { v1.wrapping_neg() } else { v1 };
-                    let v2 = if negate_acc2 { v2.wrapping_neg() } else { v2 };
-                    let mut res = v1.wrapping_add(v2);
-                    if shift16 { res >>= 16; }
-                    result[i] = res as u64;
+                    let v1_lo = if zero_acc1 { 0i32 } else { a1[i] as i32 };
+                    let v1_hi = if zero_acc1 { 0i32 } else { (a1[i] >> 32) as i32 };
+                    let v2_lo = a2[i] as i32;
+                    let v2_hi = (a2[i] >> 32) as i32;
+                    let v1_lo = if negate_acc1 { v1_lo.wrapping_neg() } else { v1_lo };
+                    let v1_hi = if negate_acc1 { v1_hi.wrapping_neg() } else { v1_hi };
+                    let v2_lo = if negate_acc2 { v2_lo.wrapping_neg() } else { v2_lo };
+                    let v2_hi = if negate_acc2 { v2_hi.wrapping_neg() } else { v2_hi };
+                    let mut r_lo = v1_lo.wrapping_add(v2_lo);
+                    let mut r_hi = v1_hi.wrapping_add(v2_hi);
+                    if shift16 { r_lo >>= 16; r_hi >>= 16; }
+                    result[i] = (r_lo as u32 as u64) | ((r_hi as u32 as u64) << 32);
                 }
             }
 
@@ -911,9 +955,13 @@ impl VectorAlu {
                     result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
                 }
             } else {
+                // Acc32 mode: independent 32-bit negation per lane half.
                 for i in 0..16 {
-                    let v = if zero_acc { 0i64 } else { src[i] as i64 };
-                    result[i] = v.wrapping_neg() as u64;
+                    let lo = if zero_acc { 0i32 } else { src[i] as i32 };
+                    let hi = if zero_acc { 0i32 } else { (src[i] >> 32) as i32 };
+                    let r_lo = lo.wrapping_neg() as u32;
+                    let r_hi = hi.wrapping_neg() as u32;
+                    result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
                 }
             }
             ctx.accumulator.write_wide(dst_reg, result);
@@ -934,9 +982,13 @@ impl VectorAlu {
                     result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
                 }
             } else {
+                // Acc32 mode: independent 32-bit negation per lane half.
                 for i in 0..8 {
-                    let v = if zero_acc { 0i64 } else { src[i] as i64 };
-                    result[i] = v.wrapping_neg() as u64;
+                    let lo = if zero_acc { 0i32 } else { src[i] as i32 };
+                    let hi = if zero_acc { 0i32 } else { (src[i] >> 32) as i32 };
+                    let r_lo = lo.wrapping_neg() as u32;
+                    let r_hi = hi.wrapping_neg() as u32;
+                    result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
                 }
             }
             ctx.accumulator.write(dst_reg, result);
@@ -3619,12 +3671,18 @@ impl VectorAlu {
 
             // ========== Accumulator ops ==========
             SemanticOp::Accumulate | SemanticOp::AccumSub
-            | SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub => {
+            | SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub
+            | SemanticOp::NegAdd => {
                 let has_acc_source = op.sources.iter()
                     .any(|s| matches!(s, Operand::AccumReg(_)));
                 if has_acc_source {
                     // VADD/VSUB/VNEGADD/VNEGSUB: accumulator-to-accumulator
                     Self::execute_acc_add_sub(op, ctx);
+                } else if matches!(semantic, SemanticOp::NegAdd) {
+                    // Regular vector negate-add (no accumulator involvement).
+                    let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
+                    let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_neg_add);
+                    Self::write_wide_vec_dest(op, ctx, result);
                 } else {
                     // Legacy: vector-into-accumulator, use fallback
                     return Self::execute_wide_fallback(op, ctx, semantic, et);
@@ -3851,12 +3909,8 @@ impl VectorAlu {
                 Self::write_wide_vec_dest(op, ctx, result);
                 true
             }
-            SemanticOp::NegAdd => {
-                let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                let result = Self::wide_element_wise_binary(&a, &b, et, Self::vector_neg_add);
-                Self::write_wide_vec_dest(op, ctx, result);
-                true
-            }
+            // NegAdd and Sub are now handled in the accumulator dispatch above
+            // (with has_acc_source check to distinguish vector vs accumulator ops).
 
             // ========== Conditional unary (bridge) ==========
             SemanticOp::NegGtz => {
