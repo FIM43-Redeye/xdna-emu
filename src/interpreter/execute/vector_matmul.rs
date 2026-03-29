@@ -433,6 +433,58 @@ fn get_sparse_operands(op: &SlotOp, ctx: &ExecutionContext) -> (Vec512, Vec512, 
     (a, b, mask)
 }
 
+/// Decompress sparse B data using pair-routing.
+///
+/// The hardware treats the 512-bit x register as 32 byte-pairs. For each
+/// group of 4 mask bits, the pair `(compressed[2*g], compressed[2*g+1])` is
+/// routed to the set-bit positions within the group's 4-byte output span:
+///
+///   - `compressed[2*g]`   (hi) -> highest set-bit position in the group
+///   - `compressed[2*g+1]` (lo) -> lowest set-bit position in the group
+///   - Clear-bit positions -> 0
+///
+/// For groups with >2 set bits (violates 2:4 structured sparsity), only the
+/// lowest and highest set-bit positions receive data. Middle positions get 0.
+/// This matches the hardware's 2-data-path-per-group physical constraint.
+///
+/// The mask operates at byte granularity (1 bit per byte). For 16-bit
+/// elements, each element spans 2 consecutive mask bits. For 4-bit elements,
+/// each mask bit controls a byte containing 2 nibbles.
+///
+/// Reference: aie_doc.hpp partial decompression table (vldb.sparse.fill
+/// stage 1), vmac pair-routing (stage 2).
+fn sparse_pair_route(compressed: &[u8; 64], mask: u128) -> [u8; 128] {
+    let mut out = [0u8; 128];
+
+    for g in 0..32 {
+        let mask4 = ((mask >> (4 * g)) & 0xF) as u8;
+        if mask4 == 0 {
+            continue;
+        }
+
+        let hi = compressed[2 * g];
+        let lo = compressed[2 * g + 1];
+        let base = 4 * g;
+
+        // Find lowest and highest set-bit positions (0..3) within the group.
+        let lowest = mask4.trailing_zeros() as usize;
+        // mask4 is a 4-bit value in a u8. leading_zeros counts from bit 7.
+        // highest set bit = 7 - leading_zeros.
+        let highest = 7 - mask4.leading_zeros() as usize;
+
+        if lowest == highest {
+            // Single set bit: only hi is used.
+            out[base + lowest] = hi;
+        } else {
+            // 2+ set bits: lo -> lowest, hi -> highest.
+            out[base + lowest] = lo;
+            out[base + highest] = hi;
+        }
+    }
+
+    out
+}
+
 /// Sparse config-driven matrix multiply on full-width (512-bit) inputs.
 ///
 /// Like `matmul_config_driven` but applies a 64-bit sparsity mask to the B
@@ -2178,6 +2230,143 @@ mod tests {
             let half = i % 2;
             let v = ((acc[lane] >> (half * 32)) & 0xFFFF_FFFF) as i32;
             assert_eq!(v, 0, "output[{}] should be 0", i);
+        }
+    }
+}
+
+#[cfg(test)]
+mod sparse_decompress_tests {
+    use super::*;
+
+    /// Helper: build a compressed array with sequential byte values.
+    fn seq_compressed() -> [u8; 64] {
+        let mut c = [0u8; 64];
+        for i in 0..64 {
+            c[i] = (i + 1) as u8; // 1, 2, 3, ..., 64
+        }
+        c
+    }
+
+    #[test]
+    fn test_pair_route_mask_0000() {
+        let compressed = seq_compressed();
+        let mask: u128 = 0;
+        let out = sparse_pair_route(&compressed, mask);
+        assert!(out.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_pair_route_mask_0011() {
+        // Group 0: mask=0011 (bits 0,1 set).
+        // Pair: hi=compressed[0]=1, lo=compressed[1]=2.
+        // lo -> lowest set bit (pos 0), hi -> highest set bit (pos 1).
+        let compressed = seq_compressed();
+        let mask: u128 = 0b0011;
+        let out = sparse_pair_route(&compressed, mask);
+        assert_eq!(out[0], 2, "lo -> pos 0");
+        assert_eq!(out[1], 1, "hi -> pos 1");
+        assert_eq!(out[2], 0);
+        assert_eq!(out[3], 0);
+    }
+
+    #[test]
+    fn test_pair_route_mask_0101() {
+        // Group 0: mask=0101 (bits 0,2 set).
+        // lo -> pos 0, hi -> pos 2.
+        let compressed = seq_compressed();
+        let mask: u128 = 0b0101;
+        let out = sparse_pair_route(&compressed, mask);
+        assert_eq!(out[0], 2, "lo -> pos 0");
+        assert_eq!(out[1], 0);
+        assert_eq!(out[2], 1, "hi -> pos 2");
+        assert_eq!(out[3], 0);
+    }
+
+    #[test]
+    fn test_pair_route_mask_1001() {
+        // lo -> pos 0, hi -> pos 3.
+        let compressed = seq_compressed();
+        let mask: u128 = 0b1001;
+        let out = sparse_pair_route(&compressed, mask);
+        assert_eq!(out[0], 2, "lo -> pos 0");
+        assert_eq!(out[1], 0);
+        assert_eq!(out[2], 0);
+        assert_eq!(out[3], 1, "hi -> pos 3");
+    }
+
+    #[test]
+    fn test_pair_route_single_bit_0001() {
+        // Single bit: hi -> pos 0.
+        let compressed = seq_compressed();
+        let mask: u128 = 0b0001;
+        let out = sparse_pair_route(&compressed, mask);
+        assert_eq!(out[0], 1, "hi -> pos 0");
+        assert_eq!(out[1], 0);
+        assert_eq!(out[2], 0);
+        assert_eq!(out[3], 0);
+    }
+
+    #[test]
+    fn test_pair_route_single_bit_1000() {
+        // Single bit: hi -> pos 3.
+        let compressed = seq_compressed();
+        let mask: u128 = 0b1000;
+        let out = sparse_pair_route(&compressed, mask);
+        assert_eq!(out[0], 0);
+        assert_eq!(out[1], 0);
+        assert_eq!(out[2], 0);
+        assert_eq!(out[3], 1, "hi -> pos 3");
+    }
+
+    #[test]
+    fn test_pair_route_two_groups() {
+        // Group 0: mask=0011 -> lo=2 -> pos 0, hi=1 -> pos 1
+        // Group 1: mask=1010 -> lo=4 -> pos 5, hi=3 -> pos 7
+        let compressed = seq_compressed();
+        let mask: u128 = 0b1010_0011;
+        let out = sparse_pair_route(&compressed, mask);
+        assert_eq!(out[0], 2);
+        assert_eq!(out[1], 1);
+        assert_eq!(out[2], 0);
+        assert_eq!(out[3], 0);
+        assert_eq!(out[4], 0);
+        assert_eq!(out[5], 4, "lo -> pos 4+1=5");
+        assert_eq!(out[6], 0);
+        assert_eq!(out[7], 3, "hi -> pos 4+3=7");
+    }
+
+    #[test]
+    fn test_pair_route_invalid_3bits() {
+        // Group 0: mask=0111 (3 set bits -- invalid 2:4).
+        // lo -> lowest (pos 0), hi -> highest (pos 2). Middle gets 0.
+        let compressed = seq_compressed();
+        let mask: u128 = 0b0111;
+        let out = sparse_pair_route(&compressed, mask);
+        assert_eq!(out[0], 2, "lo -> lowest set bit (pos 0)");
+        assert_eq!(out[1], 0, "middle set bit -> 0");
+        assert_eq!(out[2], 1, "hi -> highest set bit (pos 2)");
+        assert_eq!(out[3], 0);
+    }
+
+    #[test]
+    fn test_pair_route_all_groups_1100() {
+        // Every group has mask=1100 (bits 2,3 set).
+        let compressed = seq_compressed();
+        let mask: u128 = {
+            let mut m: u128 = 0;
+            for g in 0..32u128 {
+                m |= 0b1100 << (4 * g);
+            }
+            m
+        };
+        let out = sparse_pair_route(&compressed, mask);
+        for g in 0..32 {
+            let hi = compressed[2 * g];
+            let lo = compressed[2 * g + 1];
+            assert_eq!(out[4 * g + 0], 0, "group {g} pos 0");
+            assert_eq!(out[4 * g + 1], 0, "group {g} pos 1");
+            assert_eq!(out[4 * g + 2], lo, "group {g} lo -> pos 2");
+            assert_eq!(out[4 * g + 3], hi, "group {g} hi -> pos 3");
         }
     }
 }
