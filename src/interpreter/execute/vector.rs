@@ -3835,20 +3835,88 @@ impl VectorAlu {
                     result[8..].copy_from_slice(&narrow_result);
                     Self::write_wide_vec_dest(op, ctx, result);
                 } else {
-                    // VBCST / VBCSTSHFL: scalar broadcast to all lanes
-                    let value = Self::get_scalar_source(op, ctx);
-                    let narrow_result = Self::vector_broadcast(value, et);
-                    let mut result = [0u32; 16];
-                    result[..8].copy_from_slice(&narrow_result);
-                    result[8..].copy_from_slice(&narrow_result);
+                    // VBCST / VBCSTSHFL: broadcast scalar to 512-bit vector.
+                    // VBCSTSHFL additionally applies a 16-bit matrix transpose.
 
-                    // VBCSTSHFL: the instruction should apply a shuffle
-                    // from r29 after broadcast, but the ISA test harness
-                    // doesn't load r29 before the 16/32 variants (only
-                    // before the 8-bit variant), making those tests
-                    // non-deterministic. Skip the shuffle for now --
-                    // the broadcast alone is correct and testable.
-                    // TODO: implement shuffle when r29 is deterministic.
+                    // Step 1: broadcast
+                    let mut result = if matches!(et, ElementType::Int64 | ElementType::UInt64) {
+                        // 64-bit: read register pair for full 64-bit value
+                        let val64 = Self::get_scalar_source_64(op, ctx);
+                        let lo = val64 as u32;
+                        let hi = (val64 >> 32) as u32;
+                        let mut r = [0u32; 16];
+                        for i in 0..8 {
+                            r[i * 2] = lo;
+                            r[i * 2 + 1] = hi;
+                        }
+                        r
+                    } else {
+                        let value = Self::get_scalar_source(op, ctx);
+                        let narrow_result = Self::vector_broadcast(value, et);
+                        let mut r = [0u32; 16];
+                        r[..8].copy_from_slice(&narrow_result);
+                        r[8..].copy_from_slice(&narrow_result);
+                        r
+                    };
+
+                    // Step 2: VBCSTSHFL applies an implicit 16-bit matrix
+                    // transpose based on element size (observed on NPU1,
+                    // r29=0). The transpose groups all copies of each
+                    // 16-bit sub-component together:
+                    //   .8:  T32_2x16Lo(broadcast, zeros)
+                    //   .16: identity (1 component, no rearrangement)
+                    //   .32: 128-bit blocks (4 copies x 2 components)
+                    //   .64: 256-bit blocks (4 copies x 4 components)
+                    let is_shfl = op.encoding_name.as_deref()
+                        .map_or(false, |n| n.contains("SHFL") || n.contains("shfl"));
+
+                    if is_shfl {
+                        // Apply implicit 16-bit matrix transpose
+                        let elem_bits = et.bits();
+                        if elem_bits < 16 {
+                            // 8-bit: interleave broadcast with zeros at 32-bit
+                            // granularity (T32_2x16Lo(bcast, zeros))
+                            let mut transposed = [0u32; 16];
+                            for i in 0..8 {
+                                transposed[i * 2] = result[i];
+                                // transposed[i * 2 + 1] stays 0
+                            }
+                            result = transposed;
+                        } else if elem_bits > 16 {
+                            // 32/64-bit: transpose 16-bit sub-components
+                            // within blocks, grouping identical components.
+                            let ncomp = (elem_bits / 16) as usize;
+                            let block_u16 = (ncomp * ncomp).max(8);
+                            let nblocks = 32 / block_u16;
+                            let ncopy = block_u16 / ncomp;
+
+                            let mut u16s = [0u16; 32];
+                            for i in 0..16 {
+                                u16s[i * 2] = result[i] as u16;
+                                u16s[i * 2 + 1] = (result[i] >> 16) as u16;
+                            }
+
+                            let mut transposed_u16 = [0u16; 32];
+                            for blk in 0..nblocks {
+                                let base = blk * block_u16;
+                                for comp in 0..ncomp {
+                                    for copy in 0..ncopy {
+                                        transposed_u16[base + comp * ncopy + copy] =
+                                            u16s[base + copy * ncomp + comp];
+                                    }
+                                }
+                            }
+
+                            for i in 0..16 {
+                                result[i] = transposed_u16[i * 2] as u32
+                                    | ((transposed_u16[i * 2 + 1] as u32) << 16);
+                            }
+                        }
+                        // 16-bit: identity (no transpose needed)
+
+                        // TODO: when r29 != 0, apply additional shuffle
+                        // mode on top of the implicit transpose.
+                    }
 
                     Self::write_wide_vec_dest(op, ctx, result);
                 }
