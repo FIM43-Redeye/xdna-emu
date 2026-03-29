@@ -1145,21 +1145,39 @@ impl VectorAlu {
                 }
             }
             ElementType::Int16 | ElementType::UInt16 => {
-                // Acc32 mode: 16 lanes packed 2 per u64.
-                // Extract lo32 and hi32 from each u64 to get 16 acc32 lanes,
-                // then SRS each to 16-bit and pack 2 per u32 result word.
-                for i in 0..8 {
-                    let lo_val = mask_value(acc[i] & 0xFFFF_FFFF);
-                    let hi_val = mask_value(acc[i] >> 32);
-                    let out_lo = vector_srs::srs_lane(
-                        lo_val, shift, signed_output, 16,
-                        saturate, sym_sat, mode,
-                    );
-                    let out_hi = vector_srs::srs_lane(
-                        hi_val, shift, signed_output, 16,
-                        saturate, sym_sat, mode,
-                    );
-                    result[i] = (out_lo as u16 as u32) | ((out_hi as u16 as u32) << 16);
+                if from_bits >= 64 {
+                    // Acc64 -> 16-bit (4:1 reduction): 8 u64 lanes, each
+                    // SRS'd from 64-bit to 16-bit. Pack 2 per u32 = 4 words.
+                    for i in 0..4 {
+                        let val0 = mask_value(acc[i * 2]);
+                        let val1 = mask_value(acc[i * 2 + 1]);
+                        let out0 = vector_srs::srs_lane(
+                            val0, shift, signed_output, 16,
+                            saturate, sym_sat, mode,
+                        );
+                        let out1 = vector_srs::srs_lane(
+                            val1, shift, signed_output, 16,
+                            saturate, sym_sat, mode,
+                        );
+                        result[i] = (out0 as u16 as u32) | ((out1 as u16 as u32) << 16);
+                    }
+                } else {
+                    // Acc32 -> 16-bit (2:1 reduction): 16 lanes packed 2 per u64.
+                    // Extract lo32 and hi32 from each u64 to get 16 acc32 lanes,
+                    // then SRS each to 16-bit and pack 2 per u32 result word.
+                    for i in 0..8 {
+                        let lo_val = mask_value(acc[i] & 0xFFFF_FFFF);
+                        let hi_val = mask_value(acc[i] >> 32);
+                        let out_lo = vector_srs::srs_lane(
+                            lo_val, shift, signed_output, 16,
+                            saturate, sym_sat, mode,
+                        );
+                        let out_hi = vector_srs::srs_lane(
+                            hi_val, shift, signed_output, 16,
+                            saturate, sym_sat, mode,
+                        );
+                        result[i] = (out_lo as u16 as u32) | ((out_hi as u16 as u32) << 16);
+                    }
                 }
             }
             ElementType::Int8 | ElementType::UInt8 => {
