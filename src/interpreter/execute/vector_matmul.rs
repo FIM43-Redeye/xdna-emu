@@ -131,14 +131,6 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     // is the structural signal that distinguishes sparse from dense.
     let is_sparse = op.sources.iter().any(|s| matches!(s, Operand::ControlReg(_)));
 
-    // Read input vectors. Sparse instructions have different operand types.
-    let (a, b, sparse_mask) = if is_sparse {
-        get_sparse_operands(op, ctx)
-    } else {
-        let (a, b) = get_two_vec512(op, ctx);
-        (a, b, 0u64) // mask unused for dense
-    };
-
     // Determine accumulator access mode from destination operand.
     // cm (1024-bit): AccumReg is always even, read/write as wide pair.
     // bm (512-bit):  AccumReg can be even (bml) or odd (bmh), single register.
@@ -160,17 +152,13 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         ctx.accumulator.read_wide(acc_reg)
     };
 
-    // Perform the config-driven matrix multiply.
-    // This zeros the acc buffer if zero_acc=1 (accumulate=false), then
-    // computes the product and accumulates/replaces.
-    //
-    // For sparse mode, the mask is applied to B elements during the multiply:
-    // masked-out positions are treated as zero (they don't contribute to the
-    // dot product). The geometry already has the correct doubled inner
-    // dimension from the sparse config word variant.
+    // Read input vectors and perform multiply.
     if is_sparse {
-        matmul_sparse_config_driven(&mut acc, &a, &b, sparse_mask, &config);
+        let (a_bytes, b_compressed, mask) = get_sparse_operands(op, ctx);
+        let b_decompressed = sparse_pair_route(&b_compressed, mask);
+        matmul_sparse_config_driven(&mut acc, &a_bytes, &b_decompressed, &config);
     } else {
+        let (a, b) = get_two_vec512(op, ctx);
         matmul_config_driven(&mut acc, &a, &b, &config);
     }
 
@@ -366,71 +354,56 @@ fn get_acc_source(op: &SlotOp) -> u8 {
 /// Read operands for a sparse MAC instruction.
 ///
 /// Sparse MAC instructions have different operand types from dense:
-/// - A (dense input): VectorReg -- either 512-bit (xs1) or 1024-bit (ys1)
+/// - A (dense input): VectorReg -- 512-bit (xs1) or 1024-bit (ys1)
 /// - B (sparse input): ControlReg(28+n) -- composite qx_n = {x_n, q_n}
 ///
-/// The B data comes from the vector register x_n (where n = ctrl_reg - 28),
-/// and the 64-bit sparsity mask comes from the mask register q_n.
-///
-/// Returns (a_vec512, b_vec512, mask_u64).
-fn get_sparse_operands(op: &SlotOp, ctx: &ExecutionContext) -> (Vec512, Vec512, u64) {
-    let mut a_vec: Option<Vec512> = None;
-    let mut b_vec: Option<Vec512> = None;
-    let mut mask: u64 = 0;
+/// Returns:
+/// - `a_bytes`: A operand as 128-byte buffer (zero-padded if A < 128 bytes)
+/// - `b_compressed`: Raw 64 bytes from the B x-register (before decompression)
+/// - `mask`: Full 128-bit mask from the q register
+fn get_sparse_operands(op: &SlotOp, ctx: &ExecutionContext) -> ([u8; 128], [u8; 64], u128) {
+    let mut a_bytes = [0u8; 128];
+    let mut b_compressed = [0u8; 64];
+    let mut mask: u128 = 0;
+    let mut found_a = false;
 
     for src in &op.sources {
         match src {
             Operand::VectorReg(r) => {
-                if a_vec.is_none() {
-                    // First VectorReg is the dense A input.
+                if !found_a {
+                    found_a = true;
                     if op.is_quad_vector {
-                        // y-register (1024-bit): read all four 256-bit registers.
-                        // y2 = VectorReg(8), spans v8..v11.
-                        // The matmul uses the lower 512 bits as the A operand;
-                        // the upper 512 bits extend the inner dimension for
-                        // sparse wide variants (handled by geometry config).
+                        // y-register (1024-bit): full 128 bytes for sparse wide.
                         let base = *r & !3;
                         let quad = ctx.vector.read_quad(base);
-                        // Pack lower 512 bits into Vec512 for the matmul engine.
-                        let mut lo = [0u32; 16];
-                        lo.copy_from_slice(&quad[..16]);
-                        a_vec = Some(lo);
-                        // TODO: upper 512 bits (quad[16..32]) needed for true
-                        // 1024-bit sparse support. Currently the geometry config
-                        // only addresses the lower half.
+                        a_bytes = vec1024_to_bytes(&quad);
                     } else {
-                        // x-register (512-bit): read two 256-bit registers.
+                        // x-register (512-bit): 64 bytes, zero-padded to 128.
                         let base = *r & !1;
-                        a_vec = Some(ctx.vector.read_wide(base));
+                        let wide = ctx.vector.read_wide(base);
+                        let narrow = vec512_to_bytes(&wide);
+                        a_bytes[..64].copy_from_slice(&narrow);
                     }
                 }
             }
             Operand::ControlReg(id) => {
-                // ControlReg(28..31) = qx0..qx3.
-                // Map to x register index and mask register index.
                 if *id >= 28 && *id <= 31 {
-                    let qx_idx = *id - 28; // 0..3
-                    // B data from x_n: x0=VectorReg(0), x1=VectorReg(2), etc.
+                    let qx_idx = *id - 28;
                     let x_base = (qx_idx as u8) * 2;
-                    b_vec = Some(ctx.vector.read_wide(x_base));
-                    // Mask from q_n register.
-                    mask = ctx.mask.read_u64_low(qx_idx as u8);
+                    let wide = ctx.vector.read_wide(x_base);
+                    b_compressed = vec512_to_bytes(&wide);
+                    mask = ctx.mask.read_u128(qx_idx as u8);
                 }
             }
-            _ => {} // ScalarReg (config), AccumReg handled elsewhere
+            _ => {}
         }
     }
 
-    let a = a_vec.unwrap_or_else(|| {
+    if !found_a {
         log::error!("[MATMUL-SPARSE] missing VectorReg source for A operand");
-        [0u32; 16]
-    });
-    let b = b_vec.unwrap_or_else(|| {
-        log::error!("[MATMUL-SPARSE] missing ControlReg(qx) source for B operand");
-        [0u32; 16]
-    });
+    }
 
-    (a, b, mask)
+    (a_bytes, b_compressed, mask)
 }
 
 /// Decompress sparse B data using pair-routing.
@@ -554,24 +527,16 @@ fn extract_element_bytes(src: &[u8; 128], byte_idx: usize, bits: u32, signed: bo
     }
 }
 
-/// Sparse config-driven matrix multiply on full-width (512-bit) inputs.
+/// Sparse config-driven matrix multiply using pair-routed (decompressed) B.
 ///
-/// Like `matmul_config_driven` but applies a 64-bit sparsity mask to the B
-/// operand. Elements at masked-out positions are treated as zero during the
-/// multiply (they don't contribute to the dot product).
-///
-/// The mask uses one bit per byte of B data. For 8-bit elements, each mask
-/// bit controls one element. For 16-bit elements, two consecutive mask bits
-/// control one element (either bit set = element is active).
-///
-/// The geometry (from config) already reflects the sparse inner dimension
-/// (doubled vs dense) -- this is encoded in the config word's variant field
-/// and looked up from the sparse geometry table.
+/// Both `a` and `b` are 128-byte buffers. `b` has already been decompressed
+/// by `sparse_pair_route` -- the mask was consumed during decompression.
+/// The multiply loop shape is identical to the dense version but indexes
+/// into the wider byte buffers.
 pub fn matmul_sparse_config_driven(
     acc: &mut Acc1024,
-    a: &Vec512,
-    b: &Vec512,
-    mask: u64,
+    a: &[u8; 128],
+    b: &[u8; 128],
     config: &MatMulConfig,
 ) {
     let rows = config.rows as usize;
@@ -579,16 +544,14 @@ pub fn matmul_sparse_config_driven(
     let cols = config.cols as usize;
     let bits_x = config.a_type.bits() as u32;
     let bits_y = config.b_type.bits() as u32;
-    let bytes_x = (bits_x / 8) as usize;
+    let bytes_x = if bits_x == 4 { 1 } else { (bits_x / 8) as usize };
     let bytes_y = if bits_y == 4 { 1 } else { (bits_y / 8) as usize };
 
-    // Zero accumulator if requested.
     if !config.accumulate {
         *acc = [0u64; 16];
     }
 
     if config.bfloat {
-        // BFloat16 sparse path.
         for r in 0..rows {
             for c in 0..cols {
                 let out_idx = r * cols + c;
@@ -598,33 +561,11 @@ pub fn matmul_sparse_config_driven(
                     let a_byte = (r * inner + k) * bytes_x;
                     let b_byte = (k * cols + c) * bytes_y;
 
-                    // Check mask for B element. For 16-bit elements, two
-                    // consecutive mask bits per element.
-                    let b_elem_byte = b_byte;
-                    let mask_active = if bits_y >= 16 {
-                        let bit_lo = b_elem_byte;
-                        let bit_hi = b_elem_byte + 1;
-                        (bit_lo < 64 && (mask >> bit_lo) & 1 != 0)
-                            || (bit_hi < 64 && (mask >> bit_hi) & 1 != 0)
-                    } else {
-                        b_elem_byte < 64 && (mask >> b_elem_byte) & 1 != 0
-                    };
-
-                    if !mask_active {
-                        continue; // Masked-out element contributes zero.
-                    }
-
-                    let a_elem_idx = a_byte / 2;
-                    let b_elem_idx = b_byte / 2;
-                    let a_word = a_elem_idx / 2;
-                    let a_half = a_elem_idx % 2;
-                    let b_word = b_elem_idx / 2;
-                    let b_half = b_elem_idx % 2;
-                    if a_word >= a.len() || b_word >= b.len() {
+                    if a_byte + 1 >= 128 || b_byte + 1 >= 128 {
                         continue;
                     }
-                    let a_bits = ((a[a_word] >> (a_half * 16)) & 0xFFFF) as u16;
-                    let b_bits = ((b[b_word] >> (b_half * 16)) & 0xFFFF) as u16;
+                    let a_bits = u16::from_le_bytes([a[a_byte], a[a_byte + 1]]);
+                    let b_bits = u16::from_le_bytes([b[b_byte], b[b_byte + 1]]);
                     let a_val = f32::from_bits((a_bits as u32) << 16);
                     let b_val = f32::from_bits((b_bits as u32) << 16);
 
@@ -649,10 +590,6 @@ pub fn matmul_sparse_config_driven(
             let mut sum: i64 = 0;
 
             for k in 0..inner {
-                // For 4-bit elements, extract_element_512 expects an ELEMENT
-                // index (it divides by 2 internally to get the byte and uses
-                // modulo 2 for the nibble selector).  For 8/16/32-bit elements
-                // it expects a BYTE offset.
                 let a_byte = if bits_x == 4 {
                     r * inner + k
                 } else {
@@ -664,26 +601,8 @@ pub fn matmul_sparse_config_driven(
                     (k * cols + c) * bytes_y
                 };
 
-                // Check mask for B element.
-                let mask_active = if bits_y >= 16 {
-                    let bit_lo = b_byte;
-                    let bit_hi = b_byte + 1;
-                    (bit_lo < 64 && (mask >> bit_lo) & 1 != 0)
-                        || (bit_hi < 64 && (mask >> bit_hi) & 1 != 0)
-                } else if bits_y == 4 {
-                    // 4-bit: mask bit per nibble
-                    let nibble_idx = k * cols + c;
-                    nibble_idx < 64 && (mask >> nibble_idx) & 1 != 0
-                } else {
-                    b_byte < 64 && (mask >> b_byte) & 1 != 0
-                };
-
-                if !mask_active {
-                    continue;
-                }
-
-                let a_val = extract_element_512(a, a_byte, bits_x, config.x_signed);
-                let b_val = extract_element_512(b, b_byte, bits_y, config.y_signed);
+                let a_val = extract_element_bytes(a, a_byte, bits_x, config.x_signed);
+                let b_val = extract_element_bytes(b, b_byte, bits_y, config.y_signed);
 
                 sum += a_val * b_val;
             }
@@ -2144,11 +2063,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_sparse_config_driven_zero_mask_produces_zero() {
-        // Sparse matmul with mask=0: all B elements masked out -> product = 0.
+    fn test_sparse_config_driven_all_zero_b_produces_zero() {
+        // Sparse matmul with all-zero decompressed B -> product = 0.
         // With zero_acc=1, result is pure zero.
-        let a = vec512_all_ones_i8();
-        let b = vec512_all_ones_i8();
+        let mut a = [0u8; 128];
+        for b in a.iter_mut() { *b = 1; } // all-ones A
+        let b = [0u8; 128]; // all-zero decompressed B
         let mut acc = [0u64; 16];
 
         // i8xi8 sparse config: amode=0, bmode=1, variant=5 -> 4x16x8
@@ -2159,22 +2079,23 @@ mod tests {
         assert!(config.sparse, "variant=5 should give sparse geometry");
         assert_eq!(config.inner, 16, "sparse i8xi8 inner should be 16");
 
-        matmul_sparse_config_driven(&mut acc, &a, &b, 0, &config);
+        matmul_sparse_config_driven(&mut acc, &a, &b, &config);
 
-        // All outputs should be zero (mask kills everything).
+        // All outputs should be zero (all B elements are zero).
         for i in 0..32 {
             let lane = i / 2;
             let half = i % 2;
             let val = ((acc[lane] >> (half * 32)) & 0xFFFF_FFFF) as i32;
-            assert_eq!(val, 0, "output[{}] should be 0 with zero mask", i);
+            assert_eq!(val, 0, "output[{}] should be 0 with zero B", i);
         }
     }
 
     #[test]
-    fn test_sparse_config_driven_full_mask() {
-        // Sparse matmul with all mask bits set: every B element participates.
-        let a = vec512_all_ones_i8();
-        let b = vec512_all_ones_i8();
+    fn test_sparse_config_driven_all_ones_b() {
+        // Sparse matmul with all-ones decompressed B and all-ones A.
+        // rows=4, inner=16, cols=8: each output = sum(k=0..15) { 1 * 1 } = 16.
+        let a = [1u8; 128];
+        let b = [1u8; 128]; // all-ones decompressed B (mask already applied)
         let mut acc = [0u64; 16];
 
         // i8xi8 sparse: variant=5, zero_acc, signed
@@ -2183,26 +2104,14 @@ mod tests {
             false,
         ).unwrap();
 
-        // All 64 bytes of B active (mask = all ones in low 64 bits).
-        // But B is only 64 bytes = 512 bits = 16 u32 words.
-        // With rows=4, inner=16, cols=8: B needs 16*8 = 128 int8 elements
-        // = 128 bytes, but we only have 64 bytes (512 bits). So elements
-        // beyond byte 63 are out-of-range and extract returns 0.
-        let mask: u64 = u64::MAX;
-        matmul_sparse_config_driven(&mut acc, &a, &b, mask, &config);
+        matmul_sparse_config_driven(&mut acc, &a, &b, &config);
 
-        // Each output lane = sum over k=0..15 of A[r][k] * B[k][c].
-        // A is all 1s (64 bytes = all valid), B is all 1s but only first
-        // 64 bytes are within mask range. With cols=8, B[k][c] at byte
-        // k*8+c. For k=0..7, c=0..7: bytes 0..63 are all active and = 1.
-        // For k=8..15: bytes 64..127 are outside our 64-byte B, so
-        // extract_element_512 returns 0.
-        // Result for each lane: sum(k=0..7) { 1*1 } + sum(k=8..15) { 1*0 } = 8.
+        // Each output lane = sum(k=0..15) { 1*1 } = 16.
         for i in 0..32 {
             let lane = i / 2;
             let half = i % 2;
             let val = ((acc[lane] >> (half * 32)) & 0xFFFF_FFFF) as i32;
-            assert_eq!(val, 8, "output[{}]: expected 8 with full mask, got {}", i, val);
+            assert_eq!(val, 16, "output[{}]: expected 16 with all-ones, got {}", i, val);
         }
     }
 
@@ -2509,5 +2418,50 @@ mod extract_bytes_tests {
         assert_eq!(bytes[3], 0x04);
         assert_eq!(bytes[4], 0x05);
         assert_eq!(bytes[7], 0x08);
+    }
+}
+
+#[cfg(test)]
+mod sparse_matmul_tests {
+    use super::*;
+    use crate::interpreter::execute::vector_config::MatMulConfig;
+
+    #[test]
+    fn test_sparse_i8xi8_identity() {
+        // i8xi8 sparse: 4x16x8, acc32.
+        let mut a = [0u8; 128];
+        for k in 0..16 {
+            a[0 * 16 + k] = 1;
+        }
+        let mut b = [0u8; 128];
+        for k in 0..16 {
+            b[k * 8 + 0] = (k + 1) as u8;
+        }
+        let config = MatMulConfig::from_config_word(
+            (1 << 0) | (0 << 1) | (1 << 3) | (5 << 5) | (1 << 8) | (1 << 9),
+            false,
+        ).expect("valid sparse i8xi8 config");
+        let mut acc = [0u64; 16];
+        matmul_sparse_config_driven(&mut acc, &a, &b, &config);
+        let result = (acc[0] & 0xFFFF_FFFF) as i32;
+        assert_eq!(result, 136, "dot product of [1]*16 with [1..16]");
+    }
+
+    #[test]
+    fn test_sparse_bf16_basic() {
+        // bf16 sparse: 4x16x4, acc32(fp32).
+        let mut a = [0u8; 128];
+        a[0] = 0x80; a[1] = 0x3F; // bf16 1.0
+        let mut b = [0u8; 128];
+        b[0] = 0x00; b[1] = 0x40; // bf16 2.0
+        let config = MatMulConfig::from_config_word(
+            (1 << 0) | (2 << 5),
+            true,
+        ).expect("valid sparse bf16 config");
+        let mut acc = [0u64; 16];
+        matmul_sparse_config_driven(&mut acc, &a, &b, &config);
+        let result_bits = (acc[0] & 0xFFFF_FFFF) as u32;
+        let result = f32::from_bits(result_bits);
+        assert_eq!(result, 2.0);
     }
 }
