@@ -1325,6 +1325,20 @@ FIXED_REGISTER_MAP = {
     "sel": "r28",
 }
 
+# Implicit registers that must be loaded from the input buffer before
+# execution.  These are literal register names in the asm_string (not
+# $-placeholder operands) that the instruction reads or modifies.  The
+# test harness loads each one from the PRNG input data so both HW and
+# EMU see deterministic, matching values.
+#
+#   DIVS:       r31 is the division-step state register (tied I/O).
+#   SELEQZ/NEZ: r27 is the condition test register.
+IMPLICIT_INPUT_REGS: dict[str, list[str]] = {
+    "DIVS":   ["r31"],
+    "SELEQZ": ["r27"],
+    "SELNEZ": ["r27"],
+}
+
 
 # Mnemonic suffixes that llvm-mc does not accept when a modifier_m
 # operand is present.  llvm-mc infers the addressing mode from the
@@ -1473,13 +1487,17 @@ def generate_test_point(
         lines.extend(load_lines)
         cur_in_offset += _operand_size(op, name)
 
-    # VINSERT: load implicit index register r29 from input buffer.
-    # r29 is a fixed implicit register (not a decoded operand) -- the harness
-    # must load it explicitly since it won't appear in the operand list.
+    # Load implicit registers that aren't in the operand list.
+    # VINSERT: r29 (index register).
+    # DIVS: r31 (division-step state).
+    # SELEQZ/SELNEZ: r27 (condition test).
+    implicit_regs: list[str] = []
     if name.startswith("VINSERT"):
-        align = 4
-        cur_in_offset = _align(cur_in_offset, align)
-        lines.extend(_scalar_load("r29", "p0", cur_in_offset))
+        implicit_regs.append("r29")
+    implicit_regs.extend(IMPLICIT_INPUT_REGS.get(name, []))
+    for imp_reg in implicit_regs:
+        cur_in_offset = _align(cur_in_offset, 4)
+        lines.extend(_scalar_load(imp_reg, "p0", cur_in_offset))
         cur_in_offset += 4
 
     # NOP sled before masking/instruction: must cover load pipeline latency.
@@ -4585,8 +4603,13 @@ def _compute_input_size(instr: dict, regs: dict[str, str]) -> int:
                                 "wide_y", "sparse_qx", "quad") else 4
         total = _align(total, align)
         total += _operand_size(op, instr_name)
-    # VINSERT: implicit r29 index register loaded from input (4 bytes).
+    # Implicit registers loaded from input (4 bytes each).
+    # VINSERT: r29. DIVS: r31. SELEQZ/SELNEZ: r27.
+    implicit_count = 0
     if instr_name.startswith("VINSERT"):
+        implicit_count += 1
+    implicit_count += len(IMPLICIT_INPUT_REGS.get(instr_name, []))
+    for _ in range(implicit_count):
         total = _align(total, 4)
         total += 4
     return max(4, total)
