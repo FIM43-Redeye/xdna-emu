@@ -485,6 +485,75 @@ fn sparse_pair_route(compressed: &[u8; 64], mask: u128) -> [u8; 128] {
     out
 }
 
+/// Convert a Vec512 ([u32; 16], 64 bytes) to a byte array in little-endian order.
+fn vec512_to_bytes(v: &Vec512) -> [u8; 64] {
+    let mut bytes = [0u8; 64];
+    for (i, word) in v.iter().enumerate() {
+        let base = i * 4;
+        bytes[base] = *word as u8;
+        bytes[base + 1] = (*word >> 8) as u8;
+        bytes[base + 2] = (*word >> 16) as u8;
+        bytes[base + 3] = (*word >> 24) as u8;
+    }
+    bytes
+}
+
+/// Convert a quad vector ([u32; 32], 128 bytes) to a byte array.
+fn vec1024_to_bytes(v: &[u32; 32]) -> [u8; 128] {
+    let mut bytes = [0u8; 128];
+    for (i, word) in v.iter().enumerate() {
+        let base = i * 4;
+        bytes[base] = *word as u8;
+        bytes[base + 1] = (*word >> 8) as u8;
+        bytes[base + 2] = (*word >> 16) as u8;
+        bytes[base + 3] = (*word >> 24) as u8;
+    }
+    bytes
+}
+
+/// Extract an element from a 128-byte buffer.
+///
+/// For 4-bit elements, `byte_idx` is the element index (two elements per
+/// byte: element 0 = low nibble, element 1 = high nibble). For 8/16/32-bit
+/// elements, `byte_idx` is the byte offset.
+///
+/// Returns 0 for out-of-bounds accesses.
+fn extract_element_bytes(src: &[u8; 128], byte_idx: usize, bits: u32, signed: bool) -> i64 {
+    match bits {
+        4 => {
+            let byte_pos = byte_idx / 2;
+            let nibble = byte_idx % 2;
+            if byte_pos >= 128 { return 0; }
+            let raw = src[byte_pos];
+            let val = if nibble == 0 { raw & 0xF } else { (raw >> 4) & 0xF };
+            if signed && (val & 0x8) != 0 {
+                (val as i8 | !0x0Fi8) as i64
+            } else {
+                val as i64
+            }
+        }
+        8 => {
+            if byte_idx >= 128 { return 0; }
+            let val = src[byte_idx];
+            if signed { val as i8 as i64 } else { val as i64 }
+        }
+        16 => {
+            if byte_idx + 1 >= 128 { return 0; }
+            let val = u16::from_le_bytes([src[byte_idx], src[byte_idx + 1]]);
+            if signed { val as i16 as i64 } else { val as i64 }
+        }
+        32 => {
+            if byte_idx + 3 >= 128 { return 0; }
+            let val = u32::from_le_bytes([
+                src[byte_idx], src[byte_idx + 1],
+                src[byte_idx + 2], src[byte_idx + 3],
+            ]);
+            if signed { val as i32 as i64 } else { val as i64 }
+        }
+        _ => 0,
+    }
+}
+
 /// Sparse config-driven matrix multiply on full-width (512-bit) inputs.
 ///
 /// Like `matmul_config_driven` but applies a 64-bit sparsity mask to the B
@@ -2368,5 +2437,77 @@ mod sparse_decompress_tests {
             assert_eq!(out[4 * g + 2], lo, "group {g} lo -> pos 2");
             assert_eq!(out[4 * g + 3], hi, "group {g} hi -> pos 3");
         }
+    }
+}
+
+#[cfg(test)]
+mod extract_bytes_tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_i8_signed() {
+        let mut buf = [0u8; 128];
+        buf[0] = 0xFF; // -1 as i8
+        buf[1] = 0x7F; // 127
+        buf[5] = 0x80; // -128
+        assert_eq!(extract_element_bytes(&buf, 0, 8, true), -1);
+        assert_eq!(extract_element_bytes(&buf, 1, 8, true), 127);
+        assert_eq!(extract_element_bytes(&buf, 5, 8, true), -128);
+    }
+
+    #[test]
+    fn test_extract_u8() {
+        let mut buf = [0u8; 128];
+        buf[0] = 0xFF;
+        assert_eq!(extract_element_bytes(&buf, 0, 8, false), 255);
+    }
+
+    #[test]
+    fn test_extract_i16_le() {
+        let mut buf = [0u8; 128];
+        // 0x0102 at byte 0 (LE: buf[0]=0x02, buf[1]=0x01)
+        buf[0] = 0x02;
+        buf[1] = 0x01;
+        assert_eq!(extract_element_bytes(&buf, 0, 16, false), 0x0102);
+        assert_eq!(extract_element_bytes(&buf, 0, 16, true), 0x0102);
+    }
+
+    #[test]
+    fn test_extract_i16_signed_negative() {
+        let mut buf = [0u8; 128];
+        buf[4] = 0x00;
+        buf[5] = 0x80; // 0x8000 = -32768
+        assert_eq!(extract_element_bytes(&buf, 4, 16, true), -32768);
+        assert_eq!(extract_element_bytes(&buf, 4, 16, false), 0x8000);
+    }
+
+    #[test]
+    fn test_extract_4bit() {
+        let mut buf = [0u8; 128];
+        buf[0] = 0xBA; // low nibble = 0xA, high nibble = 0xB
+        assert_eq!(extract_element_bytes(&buf, 0, 4, false), 0xA);
+        assert_eq!(extract_element_bytes(&buf, 1, 4, false), 0xB);
+        assert_eq!(extract_element_bytes(&buf, 0, 4, true), -6);
+        assert_eq!(extract_element_bytes(&buf, 1, 4, true), -5);
+    }
+
+    #[test]
+    fn test_extract_oob_returns_zero() {
+        let buf = [0u8; 128];
+        assert_eq!(extract_element_bytes(&buf, 200, 8, false), 0);
+    }
+
+    #[test]
+    fn test_vec512_to_bytes() {
+        let mut v: Vec512 = [0u32; 16];
+        v[0] = 0x04030201;
+        v[1] = 0x08070605;
+        let bytes = vec512_to_bytes(&v);
+        assert_eq!(bytes[0], 0x01);
+        assert_eq!(bytes[1], 0x02);
+        assert_eq!(bytes[2], 0x03);
+        assert_eq!(bytes[3], 0x04);
+        assert_eq!(bytes[4], 0x05);
+        assert_eq!(bytes[7], 0x08);
     }
 }
