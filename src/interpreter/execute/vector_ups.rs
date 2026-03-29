@@ -310,6 +310,54 @@ pub fn ups_vector_to_acc(
     result
 }
 
+/// Perform UPS from a 256-bit narrow source to a 1024-bit wide accumulator.
+///
+/// This is the "w2c" path: a narrow vector register (wl) contains enough
+/// elements for a 4:1 upshift to fill a full cm register (bml + bmh).
+///
+/// - **D8/S8 -> S32 (Acc32)**: 32 x 8-bit values -> 32 x 32-bit, packed as
+///   16 u64 words (two i32 per u64).
+/// - **D16/S16 -> S64 (Acc64)**: 16 x 16-bit values -> 16 x 64-bit, one per
+///   u64 word.
+pub fn ups_vector_to_acc_wide(
+    src: &[u32; 8],
+    shift: u32,
+    from_type: ElementType,
+    to_type: ElementType,
+) -> [u64; 16] {
+    let bits_in = from_type.bits() as u32;
+    let bits_out = to_type.bits() as u32;
+    let signed_input = from_type.is_signed();
+
+    let mut result = [0u64; 16];
+
+    if bits_out <= 32 {
+        // Acc32 mode: 32 narrow lanes -> 32 acc32 values in 16 u64 words.
+        let in_lanes = (256 / bits_in).min(32);
+        for i in 0..in_lanes {
+            let val = extract_lane(src, i, bits_in);
+            let out = ups_lane_signed(val, shift, bits_in, bits_out, false, signed_input);
+            let out_u32 = (out as u64) & 0xFFFF_FFFF;
+            let word_idx = (i / 2) as usize;
+            if i % 2 == 0 {
+                result[word_idx] |= out_u32;
+            } else {
+                result[word_idx] |= out_u32 << 32;
+            }
+        }
+    } else {
+        // Acc64 mode: 16 narrow lanes -> 16 acc64 values in 16 u64 words.
+        let in_lanes = (256 / bits_in).min(16);
+        for i in 0..in_lanes {
+            let val = extract_lane(src, i, bits_in);
+            let out = ups_lane_signed(val, shift, bits_in, bits_out, false, signed_input);
+            result[i as usize] = out as u64;
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,6 +672,47 @@ mod tests {
             let lo = (pair * 2 + 1) as u64;
             let hi = (pair * 2 + 2) as u64;
             assert_eq!(acc[pair], lo | (hi << 32), "acc[{}]", pair);
+        }
+    }
+
+    #[test]
+    fn test_ups_wide_d8_to_s32() {
+        // w2c path: 32 x uint8 in 256 bits -> 32 x int32 in 1024 bits (Acc32).
+        // Pack 32 consecutive byte values (1..=32) into 8 u32 words.
+        let mut src = [0u32; 8];
+        for i in 0u32..32 {
+            let byte_idx = i / 4;
+            let shift_amt = (i % 4) * 8;
+            src[byte_idx as usize] |= (i + 1) << shift_amt;
+        }
+
+        let acc = ups_vector_to_acc_wide(&src, 0, ElementType::UInt8, ElementType::Int32);
+
+        // 32 acc32 lanes packed as 16 u64 words, two i32 per u64.
+        for pair in 0..16usize {
+            let lo = (pair * 2 + 1) as u64;
+            let hi = (pair * 2 + 2) as u64;
+            assert_eq!(acc[pair], lo | (hi << 32), "acc[{}]", pair);
+        }
+    }
+
+    #[test]
+    fn test_ups_wide_s16_to_s64() {
+        // w2c path: 16 x int16 in 256 bits -> 16 x int64 in 1024 bits (Acc64).
+        let mut src = [0u32; 8];
+        for i in 0u32..16 {
+            let word_idx = (i / 2) as usize;
+            let shift_amt = (i % 2) * 16;
+            // Use small negative values to test sign extension.
+            let val = (-(i as i16) - 1) as u16;
+            src[word_idx] |= (val as u32) << shift_amt;
+        }
+
+        let acc = ups_vector_to_acc_wide(&src, 0, ElementType::Int16, ElementType::Int64);
+
+        for i in 0..16usize {
+            let expected = (-(i as i64) - 1) as u64;
+            assert_eq!(acc[i], expected, "acc[{}]", i);
         }
     }
 }

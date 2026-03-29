@@ -3740,21 +3740,30 @@ impl VectorAlu {
             }
 
             SemanticOp::Ups => {
-                // Wide UPS: read Vec512, UPS each half, write Acc1024.
-                let src = Self::get_wide_vec_source(op, ctx, 0);
                 let shift = Self::get_shift_amount(op, ctx);
                 let from = op.from_type.unwrap_or(ElementType::Int16);
-                let src_lo: [u32; 8] = src[..8].try_into().unwrap();
-                let src_hi: [u32; 8] = src[8..].try_into().unwrap();
 
-                let acc_lo = vector_ups::ups_vector_to_acc(&src_lo, shift, from, et);
-                let acc_hi = vector_ups::ups_vector_to_acc(&src_hi, shift, from, et);
+                let acc_wide = if !op.is_wide_vector {
+                    // w2c path: narrow source (256-bit wl) fills full 1024-bit
+                    // cm register via 4:1 upshift (e.g., 32xi8->32xi32 or
+                    // 16xi16->16xi64).
+                    let src = Self::get_vector_source(op, ctx, 0);
+                    vector_ups::ups_vector_to_acc_wide(&src, shift, from, et)
+                } else {
+                    // x2c path: wide source (512-bit x-reg), UPS each half.
+                    let src = Self::get_wide_vec_source(op, ctx, 0);
+                    let src_lo: [u32; 8] = src[..8].try_into().unwrap();
+                    let src_hi: [u32; 8] = src[8..].try_into().unwrap();
+                    let acc_lo = vector_ups::ups_vector_to_acc(&src_lo, shift, from, et);
+                    let acc_hi = vector_ups::ups_vector_to_acc(&src_hi, shift, from, et);
+                    let mut wide = [0u64; 16];
+                    wide[..8].copy_from_slice(&acc_lo);
+                    wide[8..].copy_from_slice(&acc_hi);
+                    wide
+                };
 
                 match &op.dest {
                     Some(Operand::AccumReg(r)) => {
-                        let mut acc_wide = [0u64; 16];
-                        acc_wide[..8].copy_from_slice(&acc_lo);
-                        acc_wide[8..].copy_from_slice(&acc_hi);
                         ctx.accumulator.write_wide(*r, acc_wide);
                     }
                     other => {
