@@ -309,6 +309,7 @@ pub enum SemanticOp {
     Nop,     // No operation
     Done,    // Core termination (halt)
     Event,   // Generate trace event (operand selects INSTR_EVENT_0/1)
+    DivStep, // Iterative signed division step (dstep via r31)
 
     // Synchronization (AIE-specific)
     LockAcquire,  // Acquire lock
@@ -610,7 +611,7 @@ impl SemanticOp {
             "done" => Some(Self::Done),
             "event" | "event0" | "event1" => Some(Self::Event),
             "clb" => Some(Self::Clb),
-            "divs" => Some(Self::SDiv),
+            "divs" => Some(Self::DivStep),
             "sched_barrier" => Some(Self::Nop),
             _ => None,
         }

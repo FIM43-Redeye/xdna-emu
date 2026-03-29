@@ -218,8 +218,10 @@ impl LatencyTable {
             SemanticOp::Mul if !is_vector => TIMING_SCALAR_MUL,
             SemanticOp::Mul => TIMING_VECTOR_MUL,
             SemanticOp::SDiv | SemanticOp::UDiv | SemanticOp::SRem | SemanticOp::URem
+            | SemanticOp::DivStep
                 if !is_vector => TIMING_SCALAR_DIV,
             SemanticOp::SDiv | SemanticOp::UDiv | SemanticOp::SRem | SemanticOp::URem
+            | SemanticOp::DivStep
                 => TIMING_VECTOR_MAC, // Vector div uses MAC pipeline
 
             // ── Bitwise ─────────────────────────────────────────────────

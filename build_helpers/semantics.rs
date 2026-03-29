@@ -484,7 +484,8 @@ pub fn refine_encoding_semantic(encoding_name: &str) -> Option<String> {
         "ASHL" => Some("SemanticOp::AshlBidir".to_string()),
         "LSHL" => Some("SemanticOp::LshlBidir".to_string()),
         "SBC" => Some("SemanticOp::Sbc".to_string()),
-        "DIVS" => Some("SemanticOp::SDiv".to_string()),
+        "DIVS" => Some("SemanticOp::DivStep".to_string()),
+        "SELEQZ" | "SELNEZ" => Some("SemanticOp::Select".to_string()),
         "EXTENDu8" | "EXTENDu16" => Some("SemanticOp::ZeroExtend".to_string()),
         "MOV_CNTR" => Some("SemanticOp::ReadCycleCounter".to_string()),
         // VBAND/VBOR share sched_class II_VBLOG -- itinerary can't distinguish.
@@ -609,8 +610,12 @@ impl BuildInstrRecord {
         };
 
         let semantic = refine_branch_semantic(&self.mnemonic, semantic);
-        // NOTE: refine_encoding_semantic runs as Layer 5 in extract.rs,
-        // AFTER all pattern/intrinsic/itinerary layers have had their say.
+        // Apply name-based overrides that are needed for downstream inference
+        // (select_variant, etc.) before those inferences run.  The full
+        // refine_encoding_semantic pipeline in extract.rs may re-set this
+        // later, but the override here ensures infer_select_variant sees the
+        // correct semantic.
+        let semantic = refine_encoding_semantic(&self.name).or(semantic);
 
         let input_order: Vec<String> = self.inputs.iter().map(|(_, n)| n.clone()).collect();
         let output_order: Vec<String> = self.outputs.iter().map(|(_, n)| n.clone()).collect();
