@@ -1639,4 +1639,42 @@ mod tests {
                 "mode {i}: zero input should produce zero output");
         }
     }
+
+    /// Verify that shuffle mode 26 (T16_4x16Lo) with (broadcast, zeros) input
+    /// matches hardware VBCSTSHFL output for the r29!=0 case.
+    ///
+    /// Per aietools ISG (me_inline_primitives.h lines 2795-2831):
+    /// VBCSTSHFL = s2v_interleave_sw(broadcast, ZEROS, mode=r29)
+    ///
+    /// For r29=0, our shuffle mode 0 doesn't match hardware (the intlv_hw
+    /// combinational circuit differs from our transpose_extract model).
+    /// We use an empirical transpose model for r29=0 instead.
+    ///
+    /// For r29!=0, shuffle_vectors(broadcast, zeros, mode) works correctly,
+    /// verified against NPU1 hardware with mode 26 (T16_4x16Lo).
+    #[test]
+    fn test_vbcstshfl_mode26_matches_hw() {
+        let zero = [0u8; VEC_BYTES];
+
+        // VBCSTSHFL_64 combo 7 from batch 30: r29=0x45bac25a, mode=26
+        // Broadcast u16 components: a1d6, ea99, c25a, 45ba
+        let comp: [u8; 8] = [0xd6, 0xa1, 0x99, 0xea, 0x5a, 0xc2, 0xba, 0x45];
+        let mut bcast = [0u8; VEC_BYTES];
+        for i in 0..8 { bcast[i*8..i*8+8].copy_from_slice(&comp); }
+
+        // HW output: [A A 0 0 B B 0 0 C C 0 0 D D 0 0] * 2
+        let mut hw = [0u8; VEC_BYTES];
+        let comps: [[u8; 2]; 4] = [[0xd6, 0xa1], [0x99, 0xea], [0x5a, 0xc2], [0xba, 0x45]];
+        for half in 0..2 {
+            let base = half * 32;
+            for (c, comp) in comps.iter().enumerate() {
+                hw[base + c*8] = comp[0]; hw[base + c*8+1] = comp[1];
+                hw[base + c*8+2] = comp[0]; hw[base + c*8+3] = comp[1];
+            }
+        }
+
+        let result = shuffle_vectors(&bcast, &zero, ShuffleMode::T16_4x16Lo);
+        assert_eq!(result, hw,
+            "shuffle(broadcast.64, zeros, T16_4x16Lo) must match NPU1 VBCSTSHFL_64 output");
+    }
 }

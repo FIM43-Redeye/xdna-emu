@@ -3871,51 +3871,78 @@ impl VectorAlu {
                         .map_or(false, |n| n.contains("SHFL") || n.contains("shfl"));
 
                     if is_shfl {
-                        // Apply implicit 16-bit matrix transpose
-                        let elem_bits = et.bits();
-                        if elem_bits < 16 {
-                            // 8-bit: interleave broadcast with zeros at 32-bit
-                            // granularity (T32_2x16Lo(bcast, zeros))
-                            let mut transposed = [0u32; 16];
-                            for i in 0..8 {
-                                transposed[i * 2] = result[i];
-                                // transposed[i * 2 + 1] stays 0
-                            }
-                            result = transposed;
-                        } else if elem_bits > 16 {
-                            // 32/64-bit: transpose 16-bit sub-components
-                            // within blocks, grouping identical components.
-                            let ncomp = (elem_bits / 16) as usize;
-                            let block_u16 = (ncomp * ncomp).max(8);
-                            let nblocks = 32 / block_u16;
-                            let ncopy = block_u16 / ncomp;
+                        // Per aietools ISG (me_inline_primitives.h):
+                        // VBCSTSHFL = s2v_interleave_sw(broadcast, ZEROS, r29)
+                        // i.e., shuffle_vectors(broadcast, zeros, mode=r29)
+                        //
+                        // For r29=0: our shuffle mode 0 implementation
+                        // doesn't match hardware (intlv_hw uses a different
+                        // combinational circuit). Use the empirically-verified
+                        // transpose model instead.
+                        //
+                        // For r29!=0: use shuffle_vectors directly (verified
+                        // for mode 26 against hardware).
+                        let r29 = ctx.scalar.read(29);
+                        let mode_idx = (r29 & 0x3F) as u8;
 
-                            let mut u16s = [0u16; 32];
-                            for i in 0..16 {
-                                u16s[i * 2] = result[i] as u16;
-                                u16s[i * 2 + 1] = (result[i] >> 16) as u16;
-                            }
+                        if mode_idx == 0 {
+                            // r29=0: apply empirical transpose model
+                            let elem_bits = et.bits();
+                            if elem_bits < 16 {
+                                // 8-bit: interleave broadcast with zeros
+                                // at 32-bit granularity
+                                let mut transposed = [0u32; 16];
+                                for i in 0..8 {
+                                    transposed[i * 2] = result[i];
+                                }
+                                result = transposed;
+                            } else if elem_bits > 16 {
+                                // 32/64-bit: 16-bit matrix transpose within
+                                // element-sized blocks
+                                let ncomp = (elem_bits / 16) as usize;
+                                let block_u16 = (ncomp * ncomp).max(8);
+                                let nblocks = 32 / block_u16;
+                                let ncopy = block_u16 / ncomp;
 
-                            let mut transposed_u16 = [0u16; 32];
-                            for blk in 0..nblocks {
-                                let base = blk * block_u16;
-                                for comp in 0..ncomp {
-                                    for copy in 0..ncopy {
-                                        transposed_u16[base + comp * ncopy + copy] =
-                                            u16s[base + copy * ncomp + comp];
+                                let mut u16s = [0u16; 32];
+                                for i in 0..16 {
+                                    u16s[i * 2] = result[i] as u16;
+                                    u16s[i * 2 + 1] = (result[i] >> 16) as u16;
+                                }
+
+                                let mut out = [0u16; 32];
+                                for blk in 0..nblocks {
+                                    let base = blk * block_u16;
+                                    for comp in 0..ncomp {
+                                        for copy in 0..ncopy {
+                                            out[base + comp * ncopy + copy] =
+                                                u16s[base + copy * ncomp + comp];
+                                        }
                                     }
                                 }
-                            }
 
+                                for i in 0..16 {
+                                    result[i] = out[i * 2] as u32
+                                        | ((out[i * 2 + 1] as u32) << 16);
+                                }
+                            }
+                            // 16-bit with r29=0: identity
+                        } else if let Some(mode) = super::vector_permute::ShuffleMode::from_mode(mode_idx) {
+                            // r29!=0: use standard shuffle with (broadcast, zeros)
+                            let mut lo_bytes = [0u8; 64];
+                            let hi_bytes = [0u8; 64];
                             for i in 0..16 {
-                                result[i] = transposed_u16[i * 2] as u32
-                                    | ((transposed_u16[i * 2 + 1] as u32) << 16);
+                                lo_bytes[i * 4..i * 4 + 4].copy_from_slice(&result[i].to_le_bytes());
+                            }
+                            let shuffled = super::vector_permute::shuffle_vectors(&lo_bytes, &hi_bytes, mode);
+                            for i in 0..16 {
+                                result[i] = u32::from_le_bytes([
+                                    shuffled[i * 4], shuffled[i * 4 + 1],
+                                    shuffled[i * 4 + 2], shuffled[i * 4 + 3],
+                                ]);
                             }
                         }
-                        // 16-bit: identity (no transpose needed)
-
-                        // TODO: when r29 != 0, apply additional shuffle
-                        // mode on top of the implicit transpose.
+                        // mode > 47: no valid shuffle, keep broadcast result
                     }
 
                     Self::write_wide_vec_dest(op, ctx, result);
