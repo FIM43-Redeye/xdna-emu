@@ -669,6 +669,15 @@ impl MaskRegisterFile {
         (self.regs[idx][0] as u64) | ((self.regs[idx][1] as u64) << 32)
     }
 
+    /// Read the full 128-bit mask register as u128 (used by sparse pair-routing).
+    pub fn read_u128(&self, reg: u8) -> u128 {
+        let idx = (reg as usize) % NUM_MASK_REGS;
+        (self.regs[idx][0] as u128)
+            | ((self.regs[idx][1] as u128) << 32)
+            | ((self.regs[idx][2] as u128) << 64)
+            | ((self.regs[idx][3] as u128) << 96)
+    }
+
     /// Read the full 128-bit mask register as [u32; 4].
     pub fn read(&self, reg: u8) -> [u32; 4] {
         let idx = (reg as usize) % NUM_MASK_REGS;
@@ -1052,6 +1061,23 @@ mod tests {
         arf.write_wide(0, data);
         assert_eq!(arf.read(0), [10, 20, 30, 40, 50, 60, 70, 80]);
         assert_eq!(arf.read(1), [90, 100, 110, 120, 130, 140, 150, 160]);
+    }
+
+    // ========== MaskRegisterFile Tests ==========
+
+    #[test]
+    fn test_mask_read_u128() {
+        let mut mrf = MaskRegisterFile::new();
+        mrf.write(0, [0xAAAAAAAA, 0xBBBBBBBB, 0xCCCCCCCC, 0xDDDDDDDD]);
+        let val = mrf.read_u128(0);
+        assert_eq!(val, 0xDDDDDDDD_CCCCCCCC_BBBBBBBB_AAAAAAAA_u128);
+    }
+
+    #[test]
+    fn test_mask_read_u128_zero() {
+        let mrf = MaskRegisterFile::new();
+        assert_eq!(mrf.read_u128(0), 0u128);
+        assert_eq!(mrf.read_u128(3), 0u128);
     }
 
     // ========== TableGen Validation Tests ==========
