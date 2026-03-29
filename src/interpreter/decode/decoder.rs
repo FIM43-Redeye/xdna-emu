@@ -1185,7 +1185,8 @@ impl InstructionDecoder {
                 OperandType::Register(RegisterKind::Vector512)
                 | OperandType::Register(RegisterKind::Vector1024)
                 | OperandType::CompositeRegister(CompositeEncoder::MvBMXSrc)
-                | OperandType::CompositeRegister(CompositeEncoder::MvBMXDst)));
+                | OperandType::CompositeRegister(CompositeEncoder::MvBMXDst)
+                | OperandType::CompositeRegister(CompositeEncoder::ShflDst)));
         // Detect 1024-bit (y-register) operations for sparse MAC wide variants.
         slot_op.is_quad_vector = enc.operand_fields.iter()
             .any(|f| f.operand_type == OperandType::Register(RegisterKind::Vector1024));
@@ -1205,6 +1206,14 @@ impl InstructionDecoder {
 
         // Store encoding mnemonic for crossref/debugging
         slot_op.encoding_name = Some(enc.mnemonic.clone());
+
+        // VBCSTSHFL: TableGen maps to Shuffle, but the instruction is a scalar
+        // broadcast to 512-bit vector (with optional shuffle). Remap to
+        // VectorBroadcast so the execution handler reads the scalar operand
+        // correctly. The shuffle step is a no-op when all lanes are identical.
+        if enc.mnemonic.starts_with("vbcstshfl") {
+            slot_op.semantic = Some(SemanticOp::VectorBroadcast);
+        }
 
         // Add implicit registers from TableGen
         if !enc.implicit_regs.is_empty() {

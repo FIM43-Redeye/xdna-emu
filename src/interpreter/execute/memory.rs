@@ -259,7 +259,14 @@ impl MemoryUnit {
             }
 
             Some(SemanticOp::Load) if op.slot == SlotIndex::LoadB => {
-                Self::execute_vector_load_b(op, ctx, tile, pm, neighbors);
+                // VLDB_4x: 4-way gather load using vector elements as addresses.
+                // Source register contains 4 x 32-bit memory addresses in its
+                // lo or hi half. Hardware reads 64 bits from each address.
+                if Self::is_load_4x(op) {
+                    Self::execute_vector_load_4x(op, ctx, tile, neighbors);
+                } else {
+                    Self::execute_vector_load_b(op, ctx, tile, pm, neighbors);
+                }
                 true
             }
 
@@ -497,6 +504,115 @@ impl MemoryUnit {
 
         // Apply post-modify immediately (pointer update is not deferred)
         Self::apply_post_modify(op, ctx, post_modify);
+    }
+
+    /// Check if this is a VLDB_4x instruction (4-way gather load).
+    fn is_load_4x(op: &SlotOp) -> bool {
+        if let Some(name) = &op.encoding_name {
+            let lower = name.to_ascii_lowercase();
+            lower.contains("vldb.4x") || lower.contains("vldb_4x")
+        } else {
+            // Structural fallback: VLDB_4x has no pointer operand.
+            // Regular VLDB has a PointerReg source; VLDB_4x has only VectorReg.
+            op.sources.iter().all(|s| matches!(s, Operand::VectorReg(_)))
+                && !op.sources.is_empty()
+        }
+    }
+
+    /// Execute 4-way gather load (VLDB_4x16/32/64 LO/HI).
+    ///
+    /// The source vector register contains 4 x 32-bit memory addresses in
+    /// either its lower (LO) or upper (HI) 128-bit half. The hardware
+    /// reads 64 bits from each address and packs the 4 results (256 bits
+    /// total) into the destination register.
+    ///
+    /// The element size (16/32/64) controls address alignment:
+    /// - 4x16: mask 0xFFFFFFFC (4-byte aligned)
+    /// - 4x32: mask 0xFFFFFFF8 (8-byte aligned)
+    /// - 4x64: mask 0xFFFFFFF0 (16-byte aligned)
+    ///
+    /// Source: aietools ISG me_inline_primitives.h `load_4x_address()`.
+    fn execute_vector_load_4x(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        tile: &Tile,
+        neighbors: Option<&mut NeighborMemory>,
+    ) {
+        // Read source vector register.
+        let src_reg = match op.sources.first() {
+            Some(Operand::VectorReg(r)) => *r,
+            _ => {
+                log::warn!("[VLDB_4x] no VectorReg source");
+                return;
+            }
+        };
+        let src_data = ctx.vector.read(src_reg);
+
+        // Parse mnemonic to determine hi/lo and element size.
+        let name = op.encoding_name.as_deref().unwrap_or("");
+        let lower = name.to_ascii_lowercase();
+        let is_hi = lower.contains("hi");
+
+        let align_mask: u32 = if lower.contains("4x64") {
+            0xFFFF_FFF0
+        } else if lower.contains("4x32") {
+            0xFFFF_FFF8
+        } else {
+            // 4x16 or unknown -> 4-byte alignment
+            0xFFFF_FFFC
+        };
+
+        // Extract 4 x 32-bit addresses from lo or hi half of source.
+        let addrs = if is_hi {
+            [src_data[4], src_data[5], src_data[6], src_data[7]]
+        } else {
+            [src_data[0], src_data[1], src_data[2], src_data[3]]
+        };
+
+        // Read 64 bits (2 x u32) from each aligned address.
+        let latency = LATENCY_MEMORY as u64;
+        let mut result = [0u32; 8];
+        for i in 0..4 {
+            let addr = addrs[i] & align_mask;
+            let (quadrant, offset) = decode_data_address(addr);
+            let mem: &[u8] = if quadrant == MemoryQuadrant::Local || neighbors.is_none() {
+                tile.data_memory()
+            } else if let Some(nbr_mem) = neighbors.as_ref().and_then(|n| n.get_memory(quadrant)) {
+                nbr_mem
+            } else {
+                // Non-existent neighbor -> zeros
+                result[i * 2] = 0;
+                result[i * 2 + 1] = 0;
+                continue;
+            };
+
+            // Read 8 bytes (64 bits) at the aligned offset.
+            if offset + 7 < mem.len() {
+                result[i * 2] = u32::from_le_bytes([
+                    mem[offset],
+                    mem[offset + 1],
+                    mem[offset + 2],
+                    mem[offset + 3],
+                ]);
+                result[i * 2 + 1] = u32::from_le_bytes([
+                    mem[offset + 4],
+                    mem[offset + 5],
+                    mem[offset + 6],
+                    mem[offset + 7],
+                ]);
+            }
+        }
+
+        log::trace!(
+            "[VLDB_4x] {} src=v{} addrs=[{:#x},{:#x},{:#x},{:#x}] -> {:?}",
+            name, src_reg, addrs[0] & align_mask, addrs[1] & align_mask,
+            addrs[2] & align_mask, addrs[3] & align_mask, result
+        );
+
+        // Queue deferred write to destination.
+        if let Some(dest) = &op.dest {
+            ctx.queue_vector_load(dest.clone(), result, latency);
+        }
     }
 
     /// Execute vector load with unpack (VLDB_UNPACK).
