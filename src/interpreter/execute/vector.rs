@@ -5206,8 +5206,8 @@ mod tests {
         VectorAlu::execute(&op, &mut ctx);
 
         let result = ctx.accumulator.read(0);
-        // Each u64 lane should hold two copies of canonical NaN = 0x7F800001.
-        let expected = 0x7F800001_7F800001u64;
+        // Each u64 lane should hold two copies of canonical NaN = 0x7F80007F.
+        let expected = 0x7F80007F_7F80007Fu64;
         for (i, &v) in result.iter().enumerate() {
             assert_eq!(v, expected,
                 "acc lane {} should be canonical NaN pair, got {:#018x}", i, v);

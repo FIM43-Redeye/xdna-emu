@@ -313,7 +313,7 @@ pub fn fp32_is_inf(bits: u32) -> bool {
 /// truth, we use mantissa = 1.
 #[inline]
 pub fn fp32_make_nan(sign: bool) -> u32 {
-    ((sign as u32) << 31) | (0xFF << 23) | 0x1
+    ((sign as u32) << 31) | (0xFF << 23) | 0x7F
 }
 
 /// Create an fp32 infinity bit pattern.
