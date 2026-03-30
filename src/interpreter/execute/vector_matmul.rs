@@ -410,28 +410,35 @@ fn get_sparse_operands(op: &SlotOp, ctx: &ExecutionContext) -> ([u8; 128], [u8; 
 ///
 /// The hardware treats the 512-bit x register as 32 byte-pairs. For each
 /// group of 4 mask bits, the pair `(compressed[2*g], compressed[2*g+1])` is
-/// routed to the set-bit positions within the group's 4-byte output span:
+/// routed to the set-bit positions within the group's 4-byte output span.
 ///
-///   - `compressed[2*g]`   (hi) -> highest set-bit position in the group
+/// The output is **column-major**: groups traverse inner-dimension positions
+/// first, then columns. For i8xi8 sparse (inner=16, cols=8):
+///   - Groups 0-3 → column 0 (inner positions 0-15, 4 bytes each)
+///   - Groups 4-7 → column 1
+///   - Groups 28-31 → column 7
+///
+/// Within each group:
 ///   - `compressed[2*g+1]` (lo) -> lowest set-bit position in the group
+///   - `compressed[2*g]`   (hi) -> highest set-bit position in the group
 ///   - Clear-bit positions -> 0
 ///
-/// For groups with >2 set bits (violates 2:4 structured sparsity), only the
-/// lowest and highest set-bit positions receive data. Middle positions get 0.
-/// This matches the hardware's 2-data-path-per-group physical constraint.
+/// If >2 bits are set in a group (violates 2:4 structured sparsity), the
+/// hardware produces 0 for that group. Verified on real AIE2 silicon.
 ///
-/// The mask operates at byte granularity (1 bit per byte). For 16-bit
-/// elements, each element spans 2 consecutive mask bits. For 4-bit elements,
-/// each mask bit controls a byte containing 2 nibbles.
-///
-/// Reference: aie_doc.hpp partial decompression table (vldb.sparse.fill
-/// stage 1), vmac pair-routing (stage 2).
+/// Reference: Hardware characterization test (tests/sparse-mask-characterize.s),
+/// aie_doc.hpp partial decompression table.
 fn sparse_pair_route(compressed: &[u8; 64], mask: u128) -> [u8; 128] {
     let mut out = [0u8; 128];
 
     for g in 0..32 {
         let mask4 = ((mask >> (4 * g)) & 0xF) as u8;
         if mask4 == 0 {
+            continue;
+        }
+
+        // Hardware zeroes groups with >2 set bits (violates 2:4 sparsity).
+        if mask4.count_ones() > 2 {
             continue;
         }
 
@@ -449,7 +456,7 @@ fn sparse_pair_route(compressed: &[u8; 64], mask: u128) -> [u8; 128] {
             // Single set bit: only hi is used.
             out[base + lowest] = hi;
         } else {
-            // 2+ set bits: lo -> lowest, hi -> highest.
+            // 2 set bits: lo -> lowest, hi -> highest.
             out[base + lowest] = lo;
             out[base + highest] = hi;
         }
@@ -531,8 +538,14 @@ fn extract_element_bytes(src: &[u8; 128], byte_idx: usize, bits: u32, signed: bo
 ///
 /// Both `a` and `b` are 128-byte buffers. `b` has already been decompressed
 /// by `sparse_pair_route` -- the mask was consumed during decompression.
-/// The multiply loop shape is identical to the dense version but indexes
-/// into the wider byte buffers.
+///
+/// The decompressed B is in **column-major** byte order: mask groups traverse
+/// inner positions first, then columns. The first `128/cols` bytes are column 0,
+/// the next `128/cols` bytes are column 1, etc. This matches the hardware's
+/// mask layout (verified on real AIE2 silicon).
+///
+/// B[k][c] byte offset = c * inner_elements + k (in element units), which
+/// maps to byte `(c * inner + k) * bytes_y` for types >= 8 bits.
 pub fn matmul_sparse_config_driven(
     acc: &mut Acc1024,
     a: &[u8; 128],
@@ -559,7 +572,8 @@ pub fn matmul_sparse_config_driven(
 
                 for k in 0..inner {
                     let a_byte = (r * inner + k) * bytes_x;
-                    let b_byte = (k * cols + c) * bytes_y;
+                    // Column-major B: B[k][c] at byte (c * inner + k) * bytes_y.
+                    let b_byte = (c * inner + k) * bytes_y;
 
                     if a_byte + 1 >= 128 || b_byte + 1 >= 128 {
                         continue;
@@ -583,7 +597,7 @@ pub fn matmul_sparse_config_driven(
         return;
     }
 
-    // Integer sparse path.
+    // Integer sparse path with column-major B indexing.
     for r in 0..rows {
         for c in 0..cols {
             let out_idx = r * cols + c;
@@ -595,10 +609,11 @@ pub fn matmul_sparse_config_driven(
                 } else {
                     (r * inner + k) * bytes_x
                 };
+                // Column-major B: element index = c * inner + k.
                 let b_byte = if bits_y == 4 {
-                    k * cols + c
+                    c * inner + k
                 } else {
-                    (k * cols + c) * bytes_y
+                    (c * inner + k) * bytes_y
                 };
 
                 let a_val = extract_element_bytes(a, a_byte, bits_x, config.x_signed);
@@ -2316,14 +2331,14 @@ mod sparse_decompress_tests {
     #[test]
     fn test_pair_route_invalid_3bits() {
         // Group 0: mask=0111 (3 set bits -- invalid 2:4).
-        // lo -> lowest (pos 0), hi -> highest (pos 2). Middle gets 0.
+        // Hardware zeroes the group. Verified on real AIE2 silicon.
         let compressed = seq_compressed();
         let mask: u128 = 0b0111;
         let out = sparse_pair_route(&compressed, mask);
-        assert_eq!(out[0], 2, "lo -> lowest set bit (pos 0)");
-        assert_eq!(out[1], 0, "middle set bit -> 0");
-        assert_eq!(out[2], 1, "hi -> highest set bit (pos 2)");
-        assert_eq!(out[3], 0);
+        assert_eq!(out[0], 0, ">2 bits: group zeroed");
+        assert_eq!(out[1], 0, ">2 bits: group zeroed");
+        assert_eq!(out[2], 0, ">2 bits: group zeroed");
+        assert_eq!(out[3], 0, ">2 bits: group zeroed");
     }
 
     #[test]
@@ -2429,13 +2444,14 @@ mod sparse_matmul_tests {
     #[test]
     fn test_sparse_i8xi8_identity() {
         // i8xi8 sparse: 4x16x8, acc32.
+        // B is column-major: B[k][c] at byte c*inner + k = c*16 + k.
         let mut a = [0u8; 128];
         for k in 0..16 {
-            a[0 * 16 + k] = 1;
+            a[0 * 16 + k] = 1; // A row 0, all inner positions = 1
         }
         let mut b = [0u8; 128];
         for k in 0..16 {
-            b[k * 8 + 0] = (k + 1) as u8;
+            b[0 * 16 + k] = (k + 1) as u8; // B column 0: [1, 2, ..., 16]
         }
         let config = MatMulConfig::from_config_word(
             (1 << 0) | (0 << 1) | (1 << 3) | (5 << 5) | (1 << 8) | (1 << 9),
@@ -2444,6 +2460,7 @@ mod sparse_matmul_tests {
         let mut acc = [0u64; 16];
         matmul_sparse_config_driven(&mut acc, &a, &b, &config);
         let result = (acc[0] & 0xFFFF_FFFF) as i32;
+        // sum(k=0..15) { 1 * (k+1) } = 1+2+...+16 = 136
         assert_eq!(result, 136, "dot product of [1]*16 with [1..16]");
     }
 
