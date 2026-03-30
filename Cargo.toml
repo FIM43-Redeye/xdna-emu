@@ -83,4 +83,5 @@ name = "export-isa"
 path = "src/bin/export_isa.rs"
 
 [profile.release]
-lto = true
+lto = "thin"
+codegen-units = 8
