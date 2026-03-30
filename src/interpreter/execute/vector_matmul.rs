@@ -539,13 +539,17 @@ fn extract_element_bytes(src: &[u8; 128], byte_idx: usize, bits: u32, signed: bo
 /// Both `a` and `b` are 128-byte buffers. `b` has already been decompressed
 /// by `sparse_pair_route` -- the mask was consumed during decompression.
 ///
-/// The decompressed B is in **column-major** byte order: mask groups traverse
-/// inner positions first, then columns. The first `128/cols` bytes are column 0,
-/// the next `128/cols` bytes are column 1, etc. This matches the hardware's
-/// mask layout (verified on real AIE2 silicon).
+/// The decompressed B layout is **interleaved by column**: mask groups cycle
+/// through columns first, then advance to the next inner block. Group g maps
+/// to column `g % cols` and inner block `g / cols`. Each group covers 4 bytes
+/// (= 4/bytes_y elements for types >= 8 bits, or 8 nibbles for 4-bit).
 ///
-/// B[k][c] byte offset = c * inner_elements + k (in element units), which
-/// maps to byte `(c * inner + k) * bytes_y` for types >= 8 bits.
+/// For B[k][c], the byte offset in the decompressed buffer is:
+///   group = (k / elems_per_group) * cols + c
+///   b_byte = group * 4 + (k % elems_per_group) * bytes_y
+///
+/// Derived from aietools constants.py `__make_perms_helper` sparse permutation
+/// generation. Verified by hardware characterization (group 0 = column 0).
 pub fn matmul_sparse_config_driven(
     acc: &mut Acc1024,
     a: &[u8; 128],
@@ -560,6 +564,9 @@ pub fn matmul_sparse_config_driven(
     let bytes_x = if bits_x == 4 { 1 } else { (bits_x / 8) as usize };
     let bytes_y = if bits_y == 4 { 1 } else { (bits_y / 8) as usize };
 
+    // Elements per group: how many B elements fit in 4 bytes.
+    let epg: usize = if bits_y == 4 { 8 } else { 4 / bytes_y };
+
     if !config.accumulate {
         *acc = [0u64; 16];
     }
@@ -572,8 +579,8 @@ pub fn matmul_sparse_config_driven(
 
                 for k in 0..inner {
                     let a_byte = (r * inner + k) * bytes_x;
-                    // Column-major B: B[k][c] at byte (c * inner + k) * bytes_y.
-                    let b_byte = (c * inner + k) * bytes_y;
+                    // Interleaved B: group = (k/epg)*cols + c, byte within group = (k%epg)*bytes_y.
+                    let b_byte = ((k / epg) * cols + c) * 4 + (k % epg) * bytes_y;
 
                     if a_byte + 1 >= 128 || b_byte + 1 >= 128 {
                         continue;
@@ -597,7 +604,7 @@ pub fn matmul_sparse_config_driven(
         return;
     }
 
-    // Integer sparse path with column-major B indexing.
+    // Integer sparse path with interleaved B indexing.
     for r in 0..rows {
         for c in 0..cols {
             let out_idx = r * cols + c;
@@ -609,11 +616,12 @@ pub fn matmul_sparse_config_driven(
                 } else {
                     (r * inner + k) * bytes_x
                 };
-                // Column-major B: element index = c * inner + k.
+                // Interleaved B: group = (k/epg)*cols+c, element within = k%epg.
                 let b_byte = if bits_y == 4 {
-                    c * inner + k
+                    // 4-bit: 8 nibbles per group. b_elem_idx is the nibble index.
+                    ((k / epg) * cols + c) * epg + (k % epg)
                 } else {
-                    (c * inner + k) * bytes_y
+                    ((k / epg) * cols + c) * 4 + (k % epg) * bytes_y
                 };
 
                 let a_val = extract_element_bytes(a, a_byte, bits_x, config.x_signed);
@@ -2444,14 +2452,17 @@ mod sparse_matmul_tests {
     #[test]
     fn test_sparse_i8xi8_identity() {
         // i8xi8 sparse: 4x16x8, acc32.
-        // B is column-major: B[k][c] at byte c*inner + k = c*16 + k.
+        // B interleaved: group g -> col g%8, inner_block g/8.
+        // B[k][c] byte = ((k/4)*8+c)*4 + k%4.
+        // For col 0: B[k][0] byte = (k/4)*32 + k%4.
         let mut a = [0u8; 128];
         for k in 0..16 {
             a[0 * 16 + k] = 1; // A row 0, all inner positions = 1
         }
         let mut b = [0u8; 128];
-        for k in 0..16 {
-            b[0 * 16 + k] = (k + 1) as u8; // B column 0: [1, 2, ..., 16]
+        for k in 0..16usize {
+            let b_byte = ((k / 4) * 8) * 4 + (k % 4); // col=0
+            b[b_byte] = (k + 1) as u8; // B column 0: [1, 2, ..., 16]
         }
         let config = MatMulConfig::from_config_word(
             (1 << 0) | (0 << 1) | (1 << 3) | (5 << 5) | (1 << 8) | (1 << 9),
