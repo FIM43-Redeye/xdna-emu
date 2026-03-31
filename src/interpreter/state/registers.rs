@@ -152,6 +152,11 @@ impl ScalarRegisterFile {
     pub fn as_slice(&self) -> &[u32] {
         &self.regs[..NUM_SCALAR_GPRS]
     }
+
+    /// Fill all registers with a sentinel pattern (tripwire for uninitialized reads).
+    pub fn fill_pattern(&mut self, pattern: u32) {
+        self.regs.fill(pattern);
+    }
 }
 
 impl fmt::Debug for ScalarRegisterFile {
@@ -221,6 +226,11 @@ impl PointerRegisterFile {
         let idx = (reg & 0x07) as usize;
         let new_value = self.regs[idx].wrapping_add(offset as u32) & PTR_MASK;
         self.regs[idx] = new_value;
+    }
+
+    /// Fill all registers with a sentinel pattern (tripwire for uninitialized reads).
+    pub fn fill_pattern(&mut self, pattern: u32) {
+        self.regs.fill(pattern);
     }
 }
 
@@ -304,6 +314,11 @@ impl ModifierRegisterFile {
     pub fn write(&mut self, reg: u8, value: u32) {
         let idx = (reg as usize) % NUM_MODIFIER_REGS;
         self.regs[idx] = value & PTR_MASK;
+    }
+
+    /// Fill all registers with a sentinel pattern (tripwire for uninitialized reads).
+    pub fn fill_pattern(&mut self, pattern: u32) {
+        self.regs.fill(pattern);
     }
 }
 
@@ -475,6 +490,13 @@ impl VectorRegisterFile {
             self.write(base_reg + i as u8, w);
         }
     }
+
+    /// Fill all registers with a sentinel pattern (tripwire for uninitialized reads).
+    pub fn fill_pattern(&mut self, pattern: u32) {
+        for reg in &mut self.regs {
+            reg.fill(pattern);
+        }
+    }
 }
 
 impl fmt::Debug for VectorRegisterFile {
@@ -600,6 +622,15 @@ impl AccumulatorRegisterFile {
         self.write(base_reg, lo);
         self.write(base_reg + 1, hi);
     }
+
+    /// Fill all registers with a sentinel pattern (tripwire for uninitialized reads).
+    /// The u32 pattern is doubled to fill u64 lanes (e.g., 0xDEADBEEF -> 0xDEADBEEF_DEADBEEF).
+    pub fn fill_pattern(&mut self, pattern: u32) {
+        let wide = (pattern as u64) << 32 | (pattern as u64);
+        for reg in &mut self.regs {
+            reg.fill(wide);
+        }
+    }
 }
 
 impl fmt::Debug for AccumulatorRegisterFile {
@@ -705,6 +736,13 @@ impl MaskRegisterFile {
     /// Clear all mask registers to zero.
     pub fn clear(&mut self) {
         self.regs = [[0u32; 4]; NUM_MASK_REGS];
+    }
+
+    /// Fill all registers with a sentinel pattern (tripwire for uninitialized reads).
+    pub fn fill_pattern(&mut self, pattern: u32) {
+        for reg in &mut self.regs {
+            reg.fill(pattern);
+        }
     }
 }
 

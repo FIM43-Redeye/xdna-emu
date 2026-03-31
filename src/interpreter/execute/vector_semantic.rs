@@ -1484,6 +1484,8 @@ mod tests {
         let mut ctx = make_ctx();
         ctx.vector.write(0, [1; 8]);
         ctx.vector.write(1, [2; 8]);
+        // Explicitly zero v2 so we can verify no write happened.
+        ctx.vector.write(2, [0; 8]);
 
         let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Add)
             .as_vector(ElementType::Int32)

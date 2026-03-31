@@ -2166,6 +2166,9 @@ mod tests {
         let mut ctx = make_ctx();
         let mut tile = make_tile();
 
+        // Explicitly zero p7 so we can verify the load hasn't committed yet.
+        ctx.pointer.write(7, 0);
+
         ctx.set_sp(0x70080);
         ctx.cycles = 100;
 

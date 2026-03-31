@@ -651,6 +651,21 @@ impl Default for ExecutionContext {
     }
 }
 
+/// Read the register initialization pattern from XDNA_EMU_REG_INIT.
+///
+/// Controls what value fills all registers before normal initialization.
+/// Any register not explicitly initialized will retain this pattern,
+/// making uninitialized reads immediately visible in output.
+///
+/// Values: "zero" -> 0, "<hex>" -> parsed, unset -> 0xDEADBEEF.
+fn reg_init_pattern() -> u32 {
+    match std::env::var("XDNA_EMU_REG_INIT").as_deref() {
+        Ok("zero") => 0x0000_0000,
+        Ok(hex) => u32::from_str_radix(hex, 16).unwrap_or(0xDEAD_BEEF),
+        Err(_) => 0xDEAD_BEEF,
+    }
+}
+
 impl ExecutionContext {
     /// Create a new execution context with all state zeroed.
     ///
@@ -667,23 +682,43 @@ impl ExecutionContext {
 
     /// Create a new execution context for a specific tile position.
     ///
-    /// Initializes the read-only CORE_ID register with the tile's column
-    /// and row, matching hardware behavior where each core knows its
-    /// position in the array.
+    /// All register files are first blasted with a sentinel pattern
+    /// (default 0xDEADBEEF, configurable via XDNA_EMU_REG_INIT env var).
+    /// Normal initialization then overwrites the fields it's responsible for.
+    /// Any register NOT explicitly initialized retains the sentinel, making
+    /// uninitialized reads immediately obvious in output.
     pub fn new_for_tile(col: u8, row: u8) -> Self {
+        let pattern = reg_init_pattern();
         let mut timing = TimingContext::new();
         timing.enable_tracing();
+
+        // Create register files and fill with sentinel pattern
         let mut scalar = ScalarRegisterFile::new();
+        let mut pointer = PointerRegisterFile::new();
+        let mut modifier = ModifierRegisterFile::new();
+        let mut vector = VectorRegisterFile::new();
+        let mut accumulator = AccumulatorRegisterFile::new();
+        let mut mask = MaskRegisterFile::new();
+
+        scalar.fill_pattern(pattern);
+        pointer.fill_pattern(pattern);
+        modifier.fill_pattern(pattern);
+        vector.fill_pattern(pattern);
+        accumulator.fill_pattern(pattern);
+        mask.fill_pattern(pattern);
+
+        // Normal initialization overwrites what it should
         scalar.set_core_id(col, row);
+
         Self {
             pc: 0,
             flags: Flags::default(),
             scalar,
-            pointer: PointerRegisterFile::new(),
-            modifier: ModifierRegisterFile::new(),
-            vector: VectorRegisterFile::new(),
-            accumulator: AccumulatorRegisterFile::new(),
-            mask: MaskRegisterFile::new(),
+            pointer,
+            modifier,
+            vector,
+            accumulator,
+            mask,
             cycles: 0,
             instructions: 0,
             stall_cycles: 0,
@@ -1560,6 +1595,9 @@ mod tests {
         use crate::interpreter::state::LR_REG_INDEX;
         let mut ctx = ExecutionContext::new();
 
+        // Explicitly zero r0 so we can verify set_lr doesn't clobber it.
+        ctx.scalar.write(0, 0);
+
         ctx.set_lr(0x2000);
         assert_eq!(ctx.lr(), 0x2000);
         // lr is stored at dedicated index 32, NOT r0
@@ -1605,6 +1643,9 @@ mod tests {
     fn test_sp_register_config() {
         let mut ctx = ExecutionContext::new();
 
+        // Explicitly zero p0 so we can verify set_sp doesn't clobber it.
+        ctx.pointer.write(0, 0);
+
         // Default: dedicated SP register (not aliased to any pointer reg)
         ctx.set_sp(0x1000);
         assert_eq!(ctx.sp(), 0x1000);
@@ -1630,7 +1671,10 @@ mod tests {
         ctx.reset();
 
         assert_eq!(ctx.pc(), 0);
-        assert_eq!(ctx.scalar.read(5), 0);
+        // After reset, r5 should NOT retain the pre-reset value (42).
+        // It will have the register init pattern (tripwire), not zero.
+        assert_ne!(ctx.scalar.read(5), 42,
+            "r5 should not retain pre-reset value");
         assert_eq!(ctx.cycles, 0);
         assert!(!ctx.halted);
     }
@@ -2252,6 +2296,12 @@ mod tests {
         // Others should remain in the queue.
         let mut ctx = ExecutionContext::new();
 
+        // Explicitly zero the registers under test so we can detect
+        // whether pending writes have committed or not.
+        ctx.scalar.write(0, 0);
+        ctx.scalar.write(1, 0);
+        ctx.scalar.write(2, 0);
+
         ctx.cycles = 10;
         ctx.queue_scalar_load(Operand::ScalarReg(0), 0xA, 2); // ready=12
         ctx.queue_scalar_load(Operand::ScalarReg(1), 0xB, 5); // ready=15
@@ -2280,6 +2330,12 @@ mod tests {
         // Regression test for the swap_remove drain pattern.
         // With many pending writes, partial commit must not corrupt indices.
         let mut ctx = ExecutionContext::new();
+
+        // Zero all registers under test so we can distinguish committed
+        // from not-yet-committed.
+        for i in 0..6u8 {
+            ctx.scalar.write(i, 0);
+        }
 
         ctx.cycles = 10;
         // Queue 6 writes with staggered ready_cycles
@@ -2629,5 +2685,51 @@ mod tests {
         ctx.cycles = 80;
         ctx.delay_pending_writes(1);
         assert_eq!(ctx.pointer.read(7), 0xDEAD, "p7 still correct");
+    }
+
+    #[test]
+    fn test_register_init_tripwire() {
+        // Default pattern is 0xDEADBEEF (unless XDNA_EMU_REG_INIT overrides).
+        // Registers NOT touched by init should retain the sentinel.
+        let pattern = reg_init_pattern();
+        let ctx = ExecutionContext::new_for_tile(1, 2);
+
+        // Scalar r0 is not initialized -- should contain sentinel
+        assert_eq!(ctx.scalar.read(0), pattern, "r0 should contain sentinel");
+        assert_eq!(ctx.scalar.read(15), pattern, "r15 should contain sentinel");
+
+        // CORE_ID IS initialized -- should NOT contain sentinel
+        assert_ne!(
+            ctx.scalar.read(crate::interpreter::state::registers::CORE_ID_REG_INDEX),
+            pattern,
+            "CORE_ID should be overwritten by init"
+        );
+        // Verify CORE_ID has the right value
+        assert_eq!(
+            ctx.scalar.read(crate::interpreter::state::registers::CORE_ID_REG_INDEX),
+            (1u32 << 16) | 2u32,
+            "CORE_ID should encode col=1, row=2"
+        );
+
+        // PC IS initialized to 0
+        assert_eq!(ctx.pc(), 0, "PC should be initialized to 0");
+
+        // Vector register should contain sentinel
+        let v0 = ctx.vector.read(0);
+        assert_eq!(v0, [pattern; 8], "v0 should contain sentinel");
+
+        // Accumulator should contain doubled sentinel
+        let wide = (pattern as u64) << 32 | (pattern as u64);
+        let acc0 = ctx.accumulator.read(0);
+        assert_eq!(acc0, [wide; 8], "acc0 should contain sentinel");
+
+        // Pointer registers should contain sentinel
+        assert_eq!(ctx.pointer.read(0), pattern, "p0 should contain sentinel");
+
+        // Modifier registers should contain sentinel
+        assert_eq!(ctx.modifier.read(0), pattern, "m0 should contain sentinel");
+
+        // Mask registers should contain sentinel
+        assert_eq!(ctx.mask.read(0), [pattern; 4], "q0 should contain sentinel");
     }
 }
