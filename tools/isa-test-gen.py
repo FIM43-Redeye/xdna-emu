@@ -1395,18 +1395,6 @@ def _has_modifier_operand(instr: dict) -> bool:
     )
 
 
-def _is_postmodify_immediate(asm_string: str, op_name: str) -> bool:
-    """Check if an immediate operand is a post-modify update amount.
-
-    Post-modify:  lda r0, [ptr], $imm   -- ], $imm  (update after access)
-    Basic offset: lda r0, [ptr, $imm]   -- , $imm]  (offset within brackets)
-
-    Post-modify immediates must NOT be zeroed -- they are the pointer
-    update amount, not an address offset.
-    """
-    # Pattern: closing bracket followed by the operand reference.
-    return f"], ${op_name}" in asm_string
-
 
 def _normalize_mnemonic(asm_string: str, has_modifier: bool) -> str:
     """Strip internal mnemonic suffixes that llvm-mc doesn't accept.

@@ -285,16 +285,13 @@ the input buffer is smaller than expected, the load reads garbage.
 
 ### Fix
 
-Add bounds check before emitting implicit register loads:
+The bounds are already guaranteed by construction: `compute_input_size()`
+accounts for implicit registers, so the batch packing loop allocates
+sufficient input buffer space. Adding a runtime guard would be dead code.
 
-```python
-if cur_in_offset + 4 > in_buffer_size:
-    # Skip this test point -- not enough input space for implicit regs.
-    return None  # Caller skips this test point.
-```
-
-This parallels the program memory overflow handling: if the test doesn't fit,
-skip it rather than generate broken code.
+Fix: add a documentation comment in the implicit register loading section
+noting this invariant, so future maintainers understand why there is no
+explicit bounds check.
 
 ## Audit: All Strategies Against Sequential Output Principle
 
