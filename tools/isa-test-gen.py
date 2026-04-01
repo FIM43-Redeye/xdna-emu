@@ -688,6 +688,12 @@ def detect_output_operands(instr: dict) -> list[dict]:
 
     Returns a list of operand dicts that are outputs.
     """
+    # Store instructions write to memory, not to a register.  They have
+    # no register output.  StoreStrategy uses _detect_store_source() to
+    # find the data register independently.
+    if instr.get("may_store") and not instr.get("may_load"):
+        return []
+
     operands = instr.get("operands", [])
     if not operands:
         return []
