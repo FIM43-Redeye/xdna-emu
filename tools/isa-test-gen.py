@@ -1644,13 +1644,21 @@ def _register_zeroing_preamble() -> list[str]:
     lines = []
     lines.append("  // ==== Register zeroing preamble ====")
 
-    # Scalar: r0 = 0, then copy to r1-r31
+    # Scalar: r0 = 0, then copy to caller-saved registers.
+    # r16-r23 are callee-saved (AIE2 ABI) -- do NOT zero them.
+    # main() uses r16 for lock release values; zeroing it triggers a
+    # pipeline hazard (mova r16,#1 → rel #0x30,r16 with only 1 cycle gap)
+    # that causes IOMMU page faults on real hardware.
     lines.append("  mov r0, #0")
-    for i in range(1, 32):
+    for i in range(1, 16):
+        lines.append(f"  mov r{i}, r0")
+    for i in range(24, 32):
         lines.append(f"  mov r{i}, r0")
 
-    # Pointer: p2-p7 (p0 = input buffer, p1 = output buffer -- do not touch)
-    for i in range(2, 8):
+    # Pointer: p2-p5 only.
+    # p0 = input buffer, p1 = output buffer -- do not touch.
+    # p6, p7 are callee-saved (AIE2 ABI) -- do not touch.
+    for i in range(2, 6):
         lines.append(f"  mov p{i}, r0")
 
     # Modifier: m0-m7, dn0-dn7, dj0-dj7, dc0-dc7 (32 registers)
@@ -1694,7 +1702,9 @@ def _register_zeroing_preamble() -> list[str]:
 
 
 # Number of bundles the zeroing preamble adds to each batch.
-PREAMBLE_BUNDLES = 116
+# (15 + 8 scalar + 4 ptr + 32 mod + 12 vec + 7 nop + 5 accum +
+#  4 st + 7 nop + 4 lda + 7 nop + 1 mov r0 = 106)
+PREAMBLE_BUNDLES = 106
 
 
 def build_mega_program(test_points: list[str]) -> str:
