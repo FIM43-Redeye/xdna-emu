@@ -1980,8 +1980,6 @@ class LoadStrategy(TestStrategy):
 
         dest = self._detect_load_dest(instr)
         dest_name = dest["name"]
-        # Use effective kind: resolves composite (LdaScl -> scalar) and
-        # accumulator bw=2 (DMV_Q quad -> "quad") for correct load/store dispatch.
         dest_kind = _effective_load_store_kind(dest)
         dest_reg = regs.get(dest_name, "r0")
 
@@ -1990,47 +1988,22 @@ class LoadStrategy(TestStrategy):
         in_offset = _align(in_offset, align)
 
         op_by_name = {op["name"]: op for op in instr.get("operands", [])}
-        sp_relative = _is_sp_relative(instr)
 
-        if sp_relative:
-            # SP-relative load: SP (p6) is the implicit base pointer.
-            # Initialize SP to point at the input data region.  All
-            # address-offset immediates are zeroed so data is read from SP.
-            lines.extend(_padda_sequence("p6", "p0", in_offset))
-        else:
-            # Normal pointer load: copy p0 to p6 and advance to data region.
-            lines.extend(_padda_sequence("p6", "p0", in_offset))
-
-        # For modifier operands (2D/3D loads), zero the modifier.
-        for op_name, op in op_by_name.items():
-            kind = op.get("register_kind", "")
-            if kind == "modifier_m":
-                mod_reg = regs.get(op_name, "m0")
-                lines.append(f"  mov {mod_reg}, #0")
-            elif kind == "modifier_dj":
-                dj_reg = regs.get(op_name, "dj0")
-                lines.append(f"  mov {dj_reg}, #0")
+        # Safe pointer setup: zero modifiers FIRST, then set pointer.
+        # Both SP-relative and normal loads use p6 pointing at input data.
+        lines.extend(_safe_ptr_setup("p6", "p0", in_offset, op_by_name, regs))
 
         # NOP sled to cover setup latency.
         lines.extend(_nop_sled(2))
 
         # Execute: the load instruction itself.
-        # For pointer loads: override pointer operand to use p6.
-        # For SP-relative loads: no pointer operand to override; SP is already
-        #   set to the data address above.
-        # Zero address-offset immediates (data is already at p6 / sp).
-        # Preserve post-modify immediates (they update the pointer, not
-        # the address -- zeroing them makes the test degenerate).
-        asm_string = instr["asm_string"]
+        # Override pointer to p6, zero ALL immediates (including post-modify).
         load_regs = dict(regs)
         for op_name, op in op_by_name.items():
             if op.get("register_kind") == "pointer":
                 load_regs[op_name] = "p6"
             if op.get("operand_type") == "immediate":
-                if _is_postmodify_immediate(asm_string, op_name):
-                    pass  # Keep combo-specified value.
-                else:
-                    load_regs[op_name] = "0"
+                load_regs[op_name] = "0"
 
         asm_line = "  " + _substitute_asm(instr["asm_string"], load_regs,
                                           has_modifier=_has_modifier_operand(instr))
@@ -2039,7 +2012,7 @@ class LoadStrategy(TestStrategy):
         # NOP sled for load result latency.
         lines.extend(_nop_sled(result_latency(instr)))
 
-        # Capture: store loaded value to output buffer.
+        # Capture: store loaded value to output buffer sequentially.
         out_offset = _align(out_offset, align)
         store_lines = _store_instruction(dest_reg, dest_kind, "p1", out_offset)
         lines.extend(store_lines)
