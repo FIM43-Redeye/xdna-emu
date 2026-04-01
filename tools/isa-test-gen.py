@@ -1528,6 +1528,8 @@ def generate_test_point(
     # VINSERT: r29 (index register).
     # DIVS: r31 (division-step state).
     # SELEQZ/SELNEZ: r27 (condition test).
+    # NOTE: compute_input_size() accounts for these implicit registers,
+    # so the batch packing loop allocates sufficient input buffer space.
     implicit_regs: list[str] = []
     if name.startswith("VINSERT"):
         implicit_regs.append("r29")
@@ -1687,6 +1689,10 @@ def _register_zeroing_preamble() -> list[str]:
     # Mask: q0-q3 (128-bit each).  No direct zero instruction; load from
     # a memory region we've zeroed.  Use the start of the output buffer
     # (p1) as scratch -- it will be overwritten by actual test outputs.
+    # NOTE: This writes to output buffer offsets 0-15.  This is safe
+    # because the preamble runs before any tests, and test output data
+    # overwrites these bytes.  The sequential output tape starts at
+    # offset 0 and advances monotonically.
     for off in range(0, 16, 4):
         lines.append(f"  st r0, [p1, #{off}]")
     lines.extend(_nop_sled(LOAD_LATENCY))
@@ -4003,6 +4009,9 @@ class PointerArithStrategy(TestStrategy):
         # Step 4: Move modified pointer to scalar and store to output.
         lines.append(f"  mov r14, {ptr_reg}")
         lines.extend(_scalar_store("r14", "p1", out_offset))
+        # Defensive: reset the pointer register to a safe value so no
+        # subsequent test can accidentally use the wild computed pointer.
+        lines.append(f"  mov {ptr_reg}, p1")
 
         lines.append("")
         return "\n".join(lines)
@@ -4706,6 +4715,11 @@ MAX_BUNDLES_PER_BATCH = int(
     (PROG_MEM_BYTES / BUNDLE_SIZE - PROG_OVERHEAD_BUNDLES) * SAFETY_MARGIN
 )
 
+# Maximum output buffer size in bytes.  The tile has 64KB of data memory
+# shared between input and output buffers.  Program memory (1024 bundles)
+# is usually the binding constraint, but this guards against size bugs.
+MAX_OUT_BUFFER_BYTES = 32768  # 32KB -- conservative half of 64KB
+
 
 def _count_bundles(asm_text: str) -> int:
     """Count the number of assembly bundles (non-empty, non-comment lines)."""
@@ -4865,11 +4879,19 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         # Greedily fill this batch until we'd exceed the program memory limit.
         batch_bundle_total = 0
         end = i
+        batch_out_estimate = 0
         while end < len(measured_specs):
             next_bundles = measured_specs[end][3]
             if batch_bundle_total + next_bundles > MAX_BUNDLES_PER_BATCH:
                 break
+            # Check output buffer won't overflow data memory.
+            next_out_size = measured_specs[end][4].compute_output_size(
+                measured_specs[end][0])
+            next_out_aligned = _align(batch_out_estimate, 32) + next_out_size
+            if next_out_aligned > MAX_OUT_BUFFER_BYTES:
+                break
             batch_bundle_total += next_bundles
+            batch_out_estimate = next_out_aligned
             end += 1
         # Must include at least one test point per batch.
         if end == i:
