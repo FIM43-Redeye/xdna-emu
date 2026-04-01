@@ -2223,15 +2223,13 @@ class StoreStrategy(TestStrategy):
 
         source = self._detect_store_source(instr)
         src_name = source["name"]
-        # Use effective kind: resolves composite (LdaScl -> scalar) and
-        # accumulator bw=2 (DMV_Q quad -> "quad") for correct load dispatch.
         src_kind = _effective_load_store_kind(source)
         src_reg = regs.get(src_name, "r0")
 
         op_by_name = {op["name"]: op for op in instr.get("operands", [])}
         sp_relative = _is_sp_relative(instr)
 
-        # Align and load known data into the source register.
+        # Align and load known data into the source register from input buffer.
         align = _kind_alignment(src_kind)
         in_offset = _align(in_offset, align)
         load_lines = _load_instruction(src_reg, src_kind, "p0", in_offset)
@@ -2240,42 +2238,21 @@ class StoreStrategy(TestStrategy):
         # NOP sled for load latency.
         lines.extend(_nop_sled(LOAD_LATENCY))
 
+        # Safe pointer setup: zero modifiers FIRST, then set output pointer.
         out_offset = _align(out_offset, align)
         if sp_relative:
-            # SP-relative store: SP (p6) is the implicit destination pointer.
-            # Initialize SP to point at the output data region.  The immediate
-            # is zeroed so the store writes to exactly [sp, #0].
-            lines.extend(_padda_sequence("p6", "p1", out_offset))
+            lines.extend(_safe_ptr_setup("p6", "p1", out_offset, op_by_name, regs))
         else:
-            # Normal pointer store: copy p1 to p7 and advance to output region.
-            lines.extend(_padda_sequence("p7", "p1", out_offset))
-
-        # For modifier operands, zero the modifier.
-        for op_name, op in op_by_name.items():
-            kind = op.get("register_kind", "")
-            if kind == "modifier_m":
-                mod_reg = regs.get(op_name, "m0")
-                lines.append(f"  mov {mod_reg}, #0")
-            elif kind == "modifier_dj":
-                dj_reg = regs.get(op_name, "dj0")
-                lines.append(f"  mov {dj_reg}, #0")
+            lines.extend(_safe_ptr_setup("p7", "p1", out_offset, op_by_name, regs))
 
         # Execute: the store instruction.
-        # For pointer stores: override pointer to p7.
-        # For SP-relative stores: no pointer operand to override; SP is already
-        #   set to the output address above.
-        # Zero address-offset immediates (data is at p7 / sp).
-        # Preserve post-modify immediates (pointer update amount).
-        asm_string = instr["asm_string"]
+        # Override pointer to p7 (or p6 for SP-relative), zero ALL immediates.
         store_regs = dict(regs)
         for op_name, op in op_by_name.items():
             if op.get("register_kind") == "pointer":
                 store_regs[op_name] = "p7"
             if op.get("operand_type") == "immediate":
-                if _is_postmodify_immediate(asm_string, op_name):
-                    pass  # Keep combo-specified value.
-                else:
-                    store_regs[op_name] = "0"
+                store_regs[op_name] = "0"
 
         asm_line = "  " + _substitute_asm(instr["asm_string"], store_regs,
                                           has_modifier=_has_modifier_operand(instr))
