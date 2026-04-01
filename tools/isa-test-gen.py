@@ -991,15 +991,16 @@ def _padda_sequence(ptr_reg: str, base_ptr: str, offset: int) -> list[str]:
     """Generate pointer arithmetic sequence to reach a large offset.
 
     PADDA immediate range is 12-bit signed: [-4096, 4095].
-    For larger offsets, emit multiple PADDA instructions.
+    For larger offsets (positive or negative), emit multiple PADDA instructions.
     """
     max_step = 1024  # PADDA accepts up to ~1536; use 1024 for safety
     lines = [f"  mov {ptr_reg}, {base_ptr}"]
     remaining = offset
-    while remaining > max_step:
-        lines.append(f"  padda [{ptr_reg}], #{max_step}")
-        remaining -= max_step
-    if remaining > 0:
+    while abs(remaining) > max_step:
+        step = max_step if remaining > 0 else -max_step
+        lines.append(f"  padda [{ptr_reg}], #{step}")
+        remaining -= step
+    if remaining != 0:
         lines.append(f"  padda [{ptr_reg}], #{remaining}")
     return lines
 
