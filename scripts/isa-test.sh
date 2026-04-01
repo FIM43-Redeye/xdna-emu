@@ -569,7 +569,8 @@ if $MULTI_TILE; then
             fi
         }
         export -f run_emu_phase
-        export HOST_BIN OUT_DIR RESULTS_DIR SEED EMU_PROFILE MANIFEST EMU_PROFILE
+        export HOST_BIN OUT_DIR RESULTS_DIR SEED EMU_PROFILE MANIFEST
+        export XDNA_EMU="$EMU_PROFILE"
 
         # Build argument list: pidx batch_list in_size out_size (null-separated).
         printf '%b' "$PHASE_INFO" | while IFS=' ' read -r pidx batch_list; do
@@ -622,6 +623,11 @@ else
         }
         export -f run_emu_one
         export HOST_BIN OUT_DIR RESULTS_DIR SEED EMU_PROFILE
+        # Export XDNA_EMU so xargs subprocesses inherit it reliably.
+        # The inline XDNA_EMU="$EMU_PROFILE" in run_emu_one is belt-and-
+        # suspenders, but xargs spawns via bash -c which can miss inline
+        # env vars if the shell fast-paths the exec.
+        export XDNA_EMU="$EMU_PROFILE"
 
         echo "$BATCH_INFO" | while IFS=' ' read -r idx filename in_size out_size source_type; do
             # Skip pair batches in single-tile mode.
