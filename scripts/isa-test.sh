@@ -415,13 +415,17 @@ print(gen.generate_aie_mlir(${in_size}, ${out_size}))
 " > "${batch_dir}/aie.mlir"
 
         # Run aiecc.py (Peano mode, no Chess).
-        (cd "$batch_dir" && \
+        if (cd "$batch_dir" && \
             nice -n 19 aiecc.py --no-aiesim --no-xchesscc --no-xbridge \
                 --aie-generate-xclbin --xclbin-name=aie.xclbin \
                 --aie-generate-npu-insts --npu-insts-name=insts.bin \
-                aie.mlir 2>"${batch_dir}/aiecc.log") && \
-            echo "  PKG OK: batch_${batch_idx}" || \
+                aie.mlir 2>"${batch_dir}/aiecc.log"); then
+            echo "  PKG OK: batch_${batch_idx}"
+        else
             echo "  PKG FAIL: batch_${batch_idx} (see ${batch_dir}/aiecc.log)"
+            echo "FATAL: Packaging failed. Aborting."
+            exit 1
+        fi
     }
     export -f package_one
     export HOST_BIN PROJECT_DIR
@@ -480,9 +484,13 @@ print(total_in, total_out)
             if [[ $rc -eq 0 ]]; then
                 echo "  HW OK: phase_${pidx}"
             elif [[ $rc -eq 124 ]]; then
-                echo "  HW TIMEOUT: phase_${pidx} (killed after 30s)"
+                echo "  HW TIMEOUT: phase_${pidx} (killed after 30s -- NPU may be wedged)"
+                echo "FATAL: Hardware timeout. Aborting."
+                exit 1
             else
                 echo "  HW FAIL: phase_${pidx} (rc=$rc, see $hw_log)"
+                echo "FATAL: Hardware run failed. Aborting."
+                exit 1
             fi
         done
         echo ""
@@ -518,9 +526,13 @@ else
             if [[ $rc -eq 0 ]]; then
                 echo "  HW OK: batch_${idx}"
             elif [[ $rc -eq 124 ]]; then
-                echo "  HW TIMEOUT: batch_${idx} (killed after 30s)"
+                echo "  HW TIMEOUT: batch_${idx} (killed after 30s -- NPU may be wedged)"
+                echo "FATAL: Hardware timeout. Aborting."
+                exit 1
             else
                 echo "  HW FAIL: batch_${idx} (rc=$rc, see $hw_log)"
+                echo "FATAL: Hardware run failed. Aborting."
+                exit 1
             fi
         done <<< "$BATCH_INFO"
         echo ""
@@ -544,14 +556,17 @@ if $MULTI_TILE; then
                 return 0
             fi
 
-            XDNA_EMU="$EMU_PROFILE" "$HOST_BIN" \
+            if XDNA_EMU="$EMU_PROFILE" "$HOST_BIN" \
                 -x "${phase_dir}/aie.xclbin" \
                 -k MLIR_AIE \
                 -i "${phase_dir}/insts.bin" \
                 --in-size "$in_size" --out-size "$out_size" \
-                --seed "$SEED" --out-file "$emu_out" 2>"${RESULTS_DIR}/phase_${pidx}_emu.log" && \
-                echo "  EMU OK: phase_${pidx}" || \
+                --seed "$SEED" --out-file "$emu_out" 2>"${RESULTS_DIR}/phase_${pidx}_emu.log"; then
+                echo "  EMU OK: phase_${pidx}"
+            else
                 echo "  EMU FAIL: phase_${pidx} (see ${RESULTS_DIR}/phase_${pidx}_emu.log)"
+                return 1
+            fi
         }
         export -f run_emu_phase
         export HOST_BIN OUT_DIR RESULTS_DIR SEED EMU_PROFILE MANIFEST EMU_PROFILE
@@ -593,14 +608,17 @@ else
                 return 0
             fi
 
-            XDNA_EMU="$EMU_PROFILE" "$HOST_BIN" \
+            if XDNA_EMU="$EMU_PROFILE" "$HOST_BIN" \
                 -x "${batch_dir}/aie.xclbin" \
                 -k MLIR_AIE \
                 -i "${batch_dir}/insts.bin" \
                 --in-size "$in_size" --out-size "$out_size" \
-                --seed "$SEED" --out-file "$emu_out" 2>"${RESULTS_DIR}/batch_${idx}_emu.log" && \
-                echo "  EMU OK: batch_${idx}" || \
+                --seed "$SEED" --out-file "$emu_out" 2>"${RESULTS_DIR}/batch_${idx}_emu.log"; then
+                echo "  EMU OK: batch_${idx}"
+            else
                 echo "  EMU FAIL: batch_${idx} (see ${RESULTS_DIR}/batch_${idx}_emu.log)"
+                return 1
+            fi
         }
         export -f run_emu_one
         export HOST_BIN OUT_DIR RESULTS_DIR SEED EMU_PROFILE
@@ -611,6 +629,10 @@ else
             [[ "$source_type" == "stream_pair" ]] && continue
             printf '%s\0%s\0%s\0' "$idx" "$in_size" "$out_size"
         done | xargs -0 -n3 -P "$JOBS" bash -c 'run_emu_one "$1" "$2" "$3"' _
+        if [[ ${PIPESTATUS[1]} -ne 0 ]]; then
+            echo "FATAL: Emulator run failed. Aborting."
+            exit 1
+        fi
         echo ""
     fi
 fi
