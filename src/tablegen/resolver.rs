@@ -187,6 +187,13 @@ pub enum RegisterKind {
     Accumulator,
     /// mCRm: control registers (crRnd, crSat, crSRSSign, crVaddSign, etc.)
     Control,
+    /// mQX*: sparse composite registers qx0-qx3 (vector data + sparsity mask)
+    SparseQx,
+    /// eL: 64-bit scalar register pairs (l0..l7 = {r16:r17}..{r30:r31}).
+    /// Encoding is pair index; decoded register = index * 2 + base_offset.
+    /// The even register is emitted as ScalarReg; the execution handler
+    /// reads reg+1 for the upper 32 bits.
+    ScalarPair,
 }
 
 /// Which Peano composite encoder function was used.
@@ -265,6 +272,9 @@ pub fn classify_operand_type(reg_class: &str, field_name: &str) -> OperandType {
         "eDJ" => return OperandType::Register(RegisterKind::ModifierDJ),
         "eDC" => return OperandType::Register(RegisterKind::ModifierDC),
         "mCRm" => return OperandType::Register(RegisterKind::Control),
+        // eL: 64-bit scalar pair (l0={r16,r17} .. l7={r30,r31}).
+        // 3-bit field encodes pair index; stride=2, base=16.
+        "eL" => return OperandType::RegisterWithOffset(RegisterKind::ScalarPair, 16),
         _ => {}
     }
     if reg_class.starts_with("eW") || reg_class == "mWm" {
@@ -283,8 +293,12 @@ pub fn classify_operand_type(reg_class: &str, field_name: &str) -> OperandType {
         return OperandType::Register(RegisterKind::Accumulator);
     }
     // mQQm (weight queue) -- treat as accumulator for emulator purposes
-    if reg_class.starts_with("mQQ") || reg_class.starts_with("mQX") {
+    if reg_class.starts_with("mQQ") {
         return OperandType::Register(RegisterKind::Accumulator);
+    }
+    // mQX*: sparse composite registers qx0-qx3 (vector data x_n + mask q_n)
+    if reg_class.starts_with("mQX") {
+        return OperandType::Register(RegisterKind::SparseQx);
     }
 
     // 3. Lock ID fields: always unsigned, regardless of reg_class.
@@ -304,8 +318,13 @@ pub fn classify_operand_type(reg_class: &str, field_name: &str) -> OperandType {
         return classify_from_field_name(field_name);
     }
 
-    // Unrecognized reg_class -- warn and fallback
-    OperandType::Unknown
+    // Unrecognized reg_class -- this should be addressed by adding the class
+    // to the match above. Panicking at build time catches the miss early.
+    panic!(
+        "Unrecognized register class '{}' for field '{}'. \
+         Add it to classify_operand_type() in resolver.rs.",
+        reg_class, field_name
+    )
 }
 
 /// Parse immediate type from reg_class name (e.g., "simm7", "imm12x4").

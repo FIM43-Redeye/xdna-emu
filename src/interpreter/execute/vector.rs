@@ -3456,12 +3456,17 @@ impl VectorAlu {
                     let b_hi: [u32; 8] = b[8..].try_into().unwrap();
                     // Expand selector bits: lo half uses lower bits, hi uses upper.
                     // For 8-bit elements (32 per half), the selector is a 64-bit
-                    // register pair. Read second scalar if available.
+                    // register pair (eL class: l_n = {r(16+2n), r(16+2n+1)}).
+                    // LLVM decodes this as a single ScalarReg for the even register;
+                    // we read reg+1 for the upper 32 bits.
                     let elems_per_half = 256 / et.bits() as u32;
                     let sel_lo = Self::expand_select_mask(sel_scalar, et);
                     let sel_hi_bits = if elems_per_half >= 32 {
-                        // 8-bit: need second register of the pair
-                        Self::get_nth_scalar_source(op, ctx, 1)
+                        // 8-bit: 64-bit selector, upper 32 bits in the next register
+                        let sel_reg = op.sources.iter().find_map(|s| {
+                            if let Operand::ScalarReg(r) = s { Some(*r) } else { None }
+                        }).unwrap_or(0);
+                        ctx.scalar.read(sel_reg + 1)
                     } else {
                         sel_scalar >> elems_per_half
                     };

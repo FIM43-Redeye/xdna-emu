@@ -81,6 +81,8 @@ fn register_kind_str(ot: &OperandType) -> Option<String> {
         RegisterKind::Vector1024 => "vector1024",
         RegisterKind::Accumulator => "accumulator",
         RegisterKind::Control => "control",
+        RegisterKind::SparseQx => "sparse_qx",
+        RegisterKind::ScalarPair => "scalar_pair",
     }.to_string())
 }
 

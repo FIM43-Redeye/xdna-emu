@@ -811,8 +811,17 @@ impl ExecutionContext {
     ///
     /// AIE2 cores have a hardware loop mechanism: the LE register holds the
     /// address of the last instruction in the loop body. After that instruction
-    /// executes, if LC > 0, the hardware decrements LC and redirects PC to LS
-    /// instead of advancing normally.
+    /// executes, if LC > 0, the hardware decrements LC. If the new LC is
+    /// still > 0, it redirects PC to LS; otherwise it falls through.
+    ///
+    /// This gives exactly LC iterations: the loop body executes, LC
+    /// decrements, and the back-edge is taken while the decremented LC
+    /// remains positive. When LC reaches 0, the current execution is
+    /// the last and control falls through.
+    ///
+    /// Note: this differs from JNZD, which tests-before-decrement and
+    /// needs trip_count - 1 loaded (see AIEBaseHardwareLoops.cpp). ZLS
+    /// hardware loops load trip_count directly into LC.
     ///
     /// `fetch_pc` is the address of the instruction that just executed (before
     /// advance_pc). The check compares this against LE, because LE marks the
@@ -827,13 +836,21 @@ impl ExecutionContext {
         if fetch_pc == le {
             let lc = self.scalar.read(super::registers::LC_REG_INDEX);
             if lc > 0 {
-                let ls = self.scalar.read(super::registers::LS_REG_INDEX);
-                self.scalar.write(super::registers::LC_REG_INDEX, lc - 1);
-                self.pc = ls;
-                log::debug!(
-                    "ZLS loop: executed instr at LE=0x{:X}, LC {} -> {}, jumping to LS=0x{:X}",
-                    le, lc, lc - 1, ls
-                );
+                let new_lc = lc - 1;
+                self.scalar.write(super::registers::LC_REG_INDEX, new_lc);
+                if new_lc > 0 {
+                    let ls = self.scalar.read(super::registers::LS_REG_INDEX);
+                    self.pc = ls;
+                    log::debug!(
+                        "ZLS loop: executed instr at LE=0x{:X}, LC {} -> {}, jumping to LS=0x{:X}",
+                        le, lc, new_lc, ls
+                    );
+                } else {
+                    log::debug!(
+                        "ZLS loop: final iteration at LE=0x{:X}, LC {} -> 0, falling through",
+                        le, lc
+                    );
+                }
             }
         }
     }
@@ -1858,32 +1875,34 @@ mod tests {
         let mut ctx = ExecutionContext::new();
 
         // Set up loop: LS=0x100, LE=0x200, LC=3
+        // ZLS hardware loops load trip_count directly into LC.
+        // LC=3 means 3 body executions: 2 back-edges + 1 fall-through.
         ctx.scalar.write(LS_REG_INDEX, 0x100);
         ctx.scalar.write(LE_REG_INDEX, 0x200);
         ctx.scalar.write(LC_REG_INDEX, 3);
         ctx.set_pc(0x204); // PC after advance_pc from LE
 
-        // Check with fetch_pc = LE address -> should loop back
+        // First check: LC 3->2, still > 0, loop back
         ctx.check_hardware_loop(0x200);
         assert_eq!(ctx.pc(), 0x100); // Redirected to LS
-        assert_eq!(ctx.scalar.read(LC_REG_INDEX), 2); // LC decremented
+        assert_eq!(ctx.scalar.read(LC_REG_INDEX), 2);
 
-        // Again
+        // Second check: LC 2->1, still > 0, loop back
         ctx.set_pc(0x204);
         ctx.check_hardware_loop(0x200);
         assert_eq!(ctx.pc(), 0x100);
         assert_eq!(ctx.scalar.read(LC_REG_INDEX), 1);
 
-        // Third iteration
+        // Third check: LC 1->0, fall through (this was the last iteration)
         ctx.set_pc(0x204);
         ctx.check_hardware_loop(0x200);
-        assert_eq!(ctx.pc(), 0x100);
+        assert_eq!(ctx.pc(), 0x204); // Falls through -- LC hit 0
         assert_eq!(ctx.scalar.read(LC_REG_INDEX), 0);
 
-        // LC=0: should NOT loop back, PC stays advanced
-        ctx.set_pc(0x204);
+        // LC already 0: no action
+        ctx.set_pc(0x208);
         ctx.check_hardware_loop(0x200);
-        assert_eq!(ctx.pc(), 0x204); // Falls through
+        assert_eq!(ctx.pc(), 0x208); // Not at LE, unchanged
         assert_eq!(ctx.scalar.read(LC_REG_INDEX), 0);
     }
 

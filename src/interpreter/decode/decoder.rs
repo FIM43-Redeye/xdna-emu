@@ -617,7 +617,7 @@ impl InstructionDecoder {
         // to dest so the executor writes the loaded data.
         if dest.is_none() && encoding.may_load {
             if let Some(pos) = use_ops.iter().position(|o| matches!(o,
-                Operand::ControlReg(_) | Operand::AccumReg(_) | Operand::VectorReg(_) | Operand::ScalarReg(_)
+                Operand::ControlReg(_) | Operand::AccumReg(_) | Operand::VectorReg(_) | Operand::ScalarReg(_) | Operand::SparseQxReg(_)
             )) {
                 dest = Some(use_ops.remove(pos));
             }
@@ -775,8 +775,11 @@ impl InstructionDecoder {
                 }
                 OperandType::LockId => Operand::Lock(raw as u8),
                 OperandType::Unknown => {
-                    // Fallback: treat as unsigned immediate
-                    Operand::Immediate(raw as i32)
+                    panic!(
+                        "Unhandled OperandType::Unknown for field '{}' (raw=0x{:X}) in encoding '{}'. \
+                         Add the register class to classify_operand_type() in resolver.rs.",
+                        field.name, raw, decoded.encoding.name
+                    );
                 }
             };
 
@@ -911,6 +914,11 @@ impl InstructionDecoder {
             RegisterKind::Vector1024 => Operand::VectorReg(reg * 4),
             RegisterKind::Accumulator => Operand::AccumReg(reg),
             RegisterKind::Control => Operand::ControlReg(reg),
+            RegisterKind::SparseQx => Operand::SparseQxReg(reg),
+            // ScalarPair: 64-bit pair, encoding is pair index.
+            // Emit the even register (index * 2 + base_offset); the execution
+            // handler reads reg+1 for the upper 32 bits.
+            RegisterKind::ScalarPair => Operand::ScalarReg(raw * 2 + base_offset),
         }
     }
 
