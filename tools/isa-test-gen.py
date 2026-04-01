@@ -1597,6 +1597,75 @@ def generate_test_point(
 # Task 3: Mega-program Assembly
 # ---------------------------------------------------------------------------
 
+def _register_zeroing_preamble() -> list[str]:
+    """Emit assembly to zero ALL hardware registers before test execution.
+
+    Eliminates nondeterminism from uninitialized register state.  Real
+    hardware retains values from prior kernel runs; without zeroing, test
+    results depend on execution history.
+
+    Zeroed register classes:
+      - Scalar r0-r31 (r0 = zero source, rest via mov)
+      - Pointer p2-p7 (p0/p1 = input/output buffer pointers, preserved)
+      - Modifier m0-m7, dn0-dn7, dj0-dj7, dc0-dc7
+      - Vector x0-x11 (v0-v23 via 512-bit broadcast)
+      - Accumulator cm0-cm8 (9 pairs via vclr)
+      - Mask q0-q3 (loaded from zeroed output buffer scratch)
+
+    Cost: ~120 bundles (~13% of program memory budget).
+    """
+    lines = []
+    lines.append("  // ==== Register zeroing preamble ====")
+
+    # Scalar: r0 = 0, then copy to r1-r31
+    lines.append("  mov r0, #0")
+    for i in range(1, 32):
+        lines.append(f"  mov r{i}, r0")
+
+    # Pointer: p2-p7 (p0 = input buffer, p1 = output buffer -- do not touch)
+    for i in range(2, 8):
+        lines.append(f"  mov p{i}, r0")
+
+    # Modifier: m0-m7, dn0-dn7, dj0-dj7, dc0-dc7 (32 registers)
+    for prefix in ("m", "dn", "dj", "dc"):
+        for i in range(8):
+            lines.append(f"  mov {prefix}{i}, r0")
+
+    # Vector: vbcst.32 broadcasts r0 (zero) to all lanes of xN (512-bit).
+    # x0-x11 covers v0-v23 (24 of 32 vector registers).  v24-v31 are not
+    # addressable as 512-bit x-registers; the ISA test generator does not
+    # assign registers above v11 (x5), so this is sufficient.
+    for i in range(12):
+        lines.append(f"  vbcst.32 x{i}, r0")
+
+    # NOP sled: vector broadcast write latency
+    lines.extend(_nop_sled(LOAD_LATENCY))
+
+    # Accumulator: vclr zeros a full 1024-bit cm pair.
+    # cm0, cm2, cm4, cm6, cm8 = 5 pairs covering all 10 bm-pair registers
+    # (bml0/bmh0 through bml8/bmh8).
+    for i in (0, 2, 4, 6, 8):
+        lines.append(f"  vclr cm{i}")
+
+    # Mask: q0-q3 (128-bit each).  No direct zero instruction; load from
+    # a memory region we've zeroed.  Use the start of the output buffer
+    # (p1) as scratch -- it will be overwritten by actual test outputs.
+    for off in range(0, 16, 4):
+        lines.append(f"  st r0, [p1, #{off}]")
+    lines.extend(_nop_sled(LOAD_LATENCY))
+    for i in range(4):
+        lines.append(f"  lda q{i}, [p1, #0]")
+    lines.extend(_nop_sled(LOAD_LATENCY))
+
+    lines.append("  // ==== End preamble ====")
+    lines.append("")
+    return lines
+
+
+# Number of bundles the zeroing preamble adds to each batch.
+PREAMBLE_BUNDLES = 116
+
+
 def build_mega_program(test_points: list[str]) -> str:
     """Build a complete .s file from a list of test point assembly strings.
 
@@ -1614,6 +1683,10 @@ def build_mega_program(test_points: list[str]) -> str:
     lines.append(".globl test_kernel")
     lines.append("test_kernel:")
     lines.append("")
+
+    # Zero all registers before any tests to eliminate nondeterminism
+    # from stale hardware state.
+    lines.extend(_register_zeroing_preamble())
 
     for tp in test_points:
         lines.append(tp)
@@ -4640,7 +4713,7 @@ def _compute_output_size(instr: dict) -> int:
 # We use a 10% safety margin: (16384 - 144) * 0.9 = ~14616 bytes = 913 bundles.
 PROG_MEM_BYTES = 16384
 BUNDLE_SIZE = 16
-PROG_OVERHEAD_BUNDLES = 9  # .text + .globl + label + blank + ret + 4 nops
+PROG_OVERHEAD_BUNDLES = 9 + PREAMBLE_BUNDLES  # header + preamble + ret + nops
 SAFETY_MARGIN = 0.90
 MAX_BUNDLES_PER_BATCH = int(
     (PROG_MEM_BYTES / BUNDLE_SIZE - PROG_OVERHEAD_BUNDLES) * SAFETY_MARGIN
