@@ -3642,13 +3642,15 @@ entry:
     helpers.append(("@_branch_loop", 4, 8, """\
 define internal void @_branch_loop(ptr %in, ptr %out) {
 entry:
-  %n = load volatile i32, ptr %in, align 4
+  %raw = load volatile i32, ptr %in, align 4
+  %n = and i32 %raw, 15
+  %n1 = add i32 %n, 1
   store volatile i32 170, ptr %out, align 4
   br label %loop
 loop:
   %i = phi i32 [0, %entry], [%i_next, %loop]
   %i_next = add i32 %i, 1
-  %done = icmp eq i32 %i_next, %n
+  %done = icmp eq i32 %i_next, %n1
   br i1 %done, label %exit, label %loop
 exit:
   %p1 = getelementptr i8, ptr %out, i64 4
