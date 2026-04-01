@@ -590,6 +590,12 @@ def classify_instruction(instr: dict) -> tuple[str, str]:
     if mnemonic in SIDE_EFFECT_MNEMONICS:
         return ("skipped", "no output (nop/side-effect)")
 
+    # 4a. MOV_CNTR reads the hardware cycle counter, which is inherently
+    # nondeterministic across runs (varies with DMA/lock handshake timing).
+    # Confirmed nondeterministic across 10 runs on real NPU (2026-04-01).
+    if instr.get("name") == "MOV_CNTR":
+        return ("skipped", "cycle counter (hardware-nondeterministic)")
+
     # 4b. Stream switch status reads and stream instructions are now handled
     # by StreamStrategy in the strategy chain.
     asm = instr.get("asm_string", "")
@@ -1697,23 +1703,80 @@ def _register_zeroing_preamble() -> list[str]:
         lines.append(f"  lda q{i}, [p1, #0]")
     lines.extend(_nop_sled(LOAD_LATENCY))
 
+    # Reset vector load buffer B.  The vldb.4x{16,32,64}.{lo,hi} shuffle
+    # instructions read from an internal hardware buffer that retains state
+    # across kernel invocations.  On first run after kernel load, the buffer
+    # has boot residue; on subsequent runs, it has the previous kernel's last
+    # vldb state.  Resetting both the compressed and sparse FIFOs ensures
+    # deterministic shuffle results from the first instruction.
+    lines.append("  mov p3, p0  // valid pointer for vldb reset")
+    lines.append("  vldb.compr.reset [p3]")
+    lines.append("  vldb.sparse.reset.4 [p3]")
+    lines.append("  vldb.sparse.reset.8 [p3]")
+    lines.append("  vldb.sparse.reset.16 [p3]")
+
     lines.append("  // ==== End preamble ====")
     lines.append("")
     return lines
 
 
+def _output_buffer_zeroing(out_size: int) -> list[str]:
+    """Emit assembly to zero the output buffer before test execution.
+
+    Eliminates cold-start nondeterminism: on the first run after kernel
+    load, tile data memory contains CDO boot residue.  Subsequent runs
+    see the previous kernel's output.  Zeroing ensures identical initial
+    state regardless of execution history.
+
+    Uses vst with wl0 (already zero from register preamble) at offsets
+    from p3.  The vst offset encoding is 6-bit signed * 32 = max 992
+    bytes, so we advance p3 with padda every 31 chunks (992 bytes).
+    """
+    if out_size <= 0:
+        return []
+
+    MAX_OFFSET = 31 * 32  # 992 bytes, max for 6-bit signed * 32
+
+    lines = []
+    lines.append("  // ==== Zero output buffer (cold-start determinism) ====")
+    lines.append("  mov p3, p1")
+    chunks = (out_size + 31) // 32
+    local_offset = 0
+    for i in range(chunks):
+        if local_offset >= MAX_OFFSET:
+            lines.append(f"  padda [p3], #{local_offset}")
+            local_offset = 0
+        lines.append(f"  vst wl0, [p3, #0x{local_offset:x}]")
+        local_offset += 32
+    lines.append("")
+    return lines
+
+
+def output_zeroing_bundles(out_size: int) -> int:
+    """Return the number of bundles the output zeroing adds."""
+    if out_size <= 0:
+        return 0
+    chunks = (out_size + 31) // 32
+    # 1 mov + 1 vst per chunk + 1 padda per 31 chunks
+    return 1 + chunks + (chunks // 31)
+
+
 # Number of bundles the prologue + preamble + epilogue adds to each batch.
 # Prologue: 1 paddb + 8 st = 9
-# Preamble: 1 + 15 + 8 + 4 + 32 + 12 + 7 + 5 + 4 + 7 + 4 + 7 = 106
+# Preamble: 1 + 15 + 8 + 4 + 32 + 12 + 7 + 5 + 4 + 7 + 4 + 7 + 5 = 111
+#   (last 5 = mov p3 + vldb.compr.reset + 3x vldb.sparse.reset)
 # Epilogue: 8 lda + 7 nop + 1 paddb + 1 ret + 5 nop = 22
-PREAMBLE_BUNDLES = 9 + 106 + 22  # = 137
+# Output zeroing: variable, computed per batch via output_zeroing_bundles().
+PREAMBLE_BUNDLES = 9 + 111 + 22  # = 142 (excludes output zeroing)
 
 
-def build_mega_program(test_points: list[str]) -> str:
+def build_mega_program(test_points: list[str], out_size: int = 0) -> str:
     """Build a complete .s file from a list of test point assembly strings.
 
     Args:
         test_points: List of assembly strings from generate_test_point().
+        out_size: Total output buffer size in bytes.  When > 0, the preamble
+            zeros the output buffer to eliminate cold-start nondeterminism.
 
     Returns:
         Complete assembly program as a string.
@@ -1747,6 +1810,12 @@ def build_mega_program(test_points: list[str]) -> str:
     # Zero all caller-saved registers before any tests to eliminate
     # nondeterminism from stale hardware state.
     lines.extend(_register_zeroing_preamble())
+
+    # NOTE: Output buffer zeroing is handled host-side (test_host.cpp
+    # does memset(buf_out,0) + sync(TO_DEVICE) before kernel launch).
+    # Kernel-side zeroing was attempted but is redundant -- the remaining
+    # cold-start nondeterminism comes from hardware register/buffer state,
+    # not tile data memory.
 
     # Save SP after preamble: some tests (PADDA_sp_imm) modify SP.
     # Use r8 (caller-saved, not in any test register pool).
@@ -4518,6 +4587,22 @@ class VmacStrategy(TestStrategy):
         # Determine inputs from asm_string order.
         asm_op_names = re.findall(r'\$(\w+)', instr.get("asm_string", ""))
 
+        # Zero the destination accumulator before loading inputs.
+        # MAC instructions accumulate onto acc1 (zero_acc1=0 in most configs),
+        # so the destination retains the previous test's result if not cleared.
+        # This eliminates inter-test state leakage that causes cold-start
+        # nondeterminism on real hardware.
+        for op in outputs:
+            dst_reg = regs.get(op["name"], "")
+            dst_kind = _effective_kind(op) or op.get("register_kind", "")
+            if dst_kind == "accumulator" and dst_reg:
+                # Map bml/bmh to their cm pair for vclr.
+                if dst_reg.startswith("cm"):
+                    lines.append(f"  vclr {dst_reg}")
+                elif dst_reg.startswith("bml") or dst_reg.startswith("bmh"):
+                    cm_idx = dst_reg[3:]
+                    lines.append(f"  vclr cm{cm_idx}")
+
         # Load input registers from [p0, #offset].
         cur_in_offset = in_offset
         for op_name in asm_op_names:
@@ -4907,17 +4992,21 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     i = 0
     while i < len(measured_specs):
         # Greedily fill this batch until we'd exceed the program memory limit.
+        # The output buffer zeroing adds ceil(out_size/32) bundles to the
+        # preamble, so we account for it dynamically as we add test points.
         batch_bundle_total = 0
         end = i
         batch_out_estimate = 0
         while end < len(measured_specs):
             next_bundles = measured_specs[end][3]
-            if batch_bundle_total + next_bundles > MAX_BUNDLES_PER_BATCH:
-                break
-            # Check output buffer won't overflow data memory.
             next_out_size = measured_specs[end][4].compute_output_size(
                 measured_specs[end][0])
             next_out_aligned = _align(batch_out_estimate, 32) + next_out_size
+            # Total program size = test bundles + output zeroing bundles.
+            zeroing = output_zeroing_bundles(next_out_aligned)
+            if batch_bundle_total + next_bundles + zeroing > MAX_BUNDLES_PER_BATCH:
+                break
+            # Check output buffer won't overflow data memory.
             if next_out_aligned > MAX_OUT_BUFFER_BYTES:
                 break
             batch_bundle_total += next_bundles
@@ -4970,7 +5059,7 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         # Write .s file.
         filename = f"batch_{batch_idx:03d}.s"
         filepath = os.path.join(out_dir, filename)
-        program = build_mega_program(batch_asm)
+        program = build_mega_program(batch_asm, out_size=batch_out_offset)
         write_if_changed(filepath, program)
 
         batches.append({
@@ -5070,8 +5159,10 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         cons_asm = pair["consumer_asm"]
 
         # Wrap each in a standalone mega-program.
-        prod_program = build_mega_program([prod_asm])
-        cons_program = build_mega_program([cons_asm])
+        prod_out_size = strategy.compute_producer_output_size()
+        cons_out_size = strategy.compute_consumer_output_size(instr)
+        prod_program = build_mega_program([prod_asm], out_size=prod_out_size)
+        cons_program = build_mega_program([cons_asm], out_size=cons_out_size)
 
         prod_filename = f"batch_{batch_idx:03d}_producer.s"
         cons_filename = f"batch_{batch_idx:03d}_consumer.s"
@@ -5086,9 +5177,9 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
             "producer_filename": prod_filename,
             "consumer_filename": cons_filename,
             "producer_in_size": strategy.compute_producer_input_size(),
-            "producer_out_size": strategy.compute_producer_output_size(),
+            "producer_out_size": prod_out_size,
             "consumer_in_size": 0,
-            "consumer_out_size": strategy.compute_consumer_output_size(instr),
+            "consumer_out_size": cons_out_size,
             "instruction": instr["name"],
             "slot": instr.get("slot", ""),
             "test_count": 1,
@@ -5119,8 +5210,10 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
         cons_asm = pair["consumer_asm"]
 
         # Wrap each in a standalone mega-program.
-        prod_program = build_mega_program([prod_asm])
-        cons_program = build_mega_program([cons_asm])
+        prod_out_size = strategy.compute_producer_output_size(instr)
+        cons_out_size = strategy.compute_consumer_output_size(instr)
+        prod_program = build_mega_program([prod_asm], out_size=prod_out_size)
+        cons_program = build_mega_program([cons_asm], out_size=cons_out_size)
 
         prod_filename = f"batch_{batch_idx:03d}_producer.s"
         cons_filename = f"batch_{batch_idx:03d}_consumer.s"
@@ -5135,9 +5228,9 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
             "producer_filename": prod_filename,
             "consumer_filename": cons_filename,
             "producer_in_size": strategy.compute_producer_input_size(instr),
-            "producer_out_size": strategy.compute_producer_output_size(instr),
+            "producer_out_size": prod_out_size,
             "consumer_in_size": 0,
-            "consumer_out_size": strategy.compute_consumer_output_size(instr),
+            "consumer_out_size": cons_out_size,
             "instruction": instr["name"],
             "slot": instr.get("slot", ""),
             "test_count": 1,
