@@ -1011,6 +1011,36 @@ def _padda_sequence(ptr_reg: str, base_ptr: str, offset: int) -> list[str]:
     return lines
 
 
+def _safe_ptr_setup(ptr_reg: str, base_ptr: str, offset: int,
+                    op_by_name: dict, regs: dict) -> list[str]:
+    """Set up a pointer for load/store with all modifiers pre-zeroed.
+
+    Order matters: zero modifiers FIRST, then set the pointer.  This
+    prevents stale modifier values from corrupting 2D/3D addressing.
+    Uses combo-assigned register names (not hardcoded m0/dj0).
+
+    Args:
+        ptr_reg: Target pointer register (e.g., "p6", "p7").
+        base_ptr: Base pointer to copy from (e.g., "p0", "p1").
+        offset: Byte offset from base_ptr.
+        op_by_name: Dict of operand name -> operand dict for this instruction.
+        regs: Combo-assigned register mapping (operand name -> register name).
+    """
+    lines = []
+    # 1. Zero ALL modifier registers this instruction references.
+    #    Must happen BEFORE the pointer is set up so that stale modifier
+    #    values cannot corrupt 2D/3D stride calculations.
+    for op_name, op in op_by_name.items():
+        kind = op.get("register_kind", "")
+        if kind == "modifier_m":
+            lines.append(f"  mov {regs.get(op_name, 'm0')}, #0")
+        elif kind == "modifier_dj":
+            lines.append(f"  mov {regs.get(op_name, 'dj0')}, #0")
+    # 2. THEN set the pointer (modifiers are now safe).
+    lines.extend(_padda_sequence(ptr_reg, base_ptr, offset))
+    return lines
+
+
 def _scalar_load(reg_name: str, ptr: str, offset: int) -> list[str]:
     """Generate scalar load with pointer arithmetic for large offsets.
 
