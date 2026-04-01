@@ -402,7 +402,8 @@ int main(int argc, const char *argv[]) {
         ("in-size",  "Input buffer size in bytes",  cxxopts::value<int>())
         ("out-size", "Output buffer size in bytes",  cxxopts::value<int>())
         ("seed",     "PRNG seed",                    cxxopts::value<uint32_t>()->default_value("42"))
-        ("out-file", "Output file path",             cxxopts::value<std::string>());
+        ("out-file", "Output file path",             cxxopts::value<std::string>())
+        ("in-file",  "Input data file (overrides PRNG seed)", cxxopts::value<std::string>()->default_value(""));
 
     cxxopts::ParseResult vm;
     test_utils::parse_options(argc, argv, options, vm);
@@ -411,6 +412,7 @@ int main(int argc, const char *argv[]) {
     int out_size = vm["out-size"].as<int>();
     uint32_t seed = vm["seed"].as<uint32_t>();
     std::string out_file = vm["out-file"].as<std::string>();
+    std::string in_file  = vm["in-file"].as<std::string>();
 
     // Round up to i32 alignment for XRT buffer objects.
     int in_elems  = (in_size  + 3) / 4;
@@ -444,15 +446,39 @@ int main(int argc, const char *argv[]) {
     auto bo_out = xrt::bo(device, out_elems * sizeof(int32_t),
                           XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(5));
 
-    // Fill input with deterministic PRNG data.
+    // Fill input buffer: from file if --in-file given, otherwise PRNG.
     uint8_t *buf_in = bo_in.map<uint8_t *>();
-    fill_prng(buf_in, in_size, seed);
+    if (!in_file.empty()) {
+        std::ifstream ifs(in_file, std::ios::binary);
+        if (!ifs) {
+            std::cerr << "Cannot open input file: " << in_file << std::endl;
+            return 1;
+        }
+        ifs.read(reinterpret_cast<char *>(buf_in), in_size);
+        auto got = ifs.gcount();
+        if (got < in_size) {
+            std::cerr << "Input file too short: " << got << " < " << in_size << std::endl;
+            return 1;
+        }
+    } else {
+        fill_prng(buf_in, in_size, seed);
+    }
+
+    // Zero output and scratch buffers for deterministic initial state.
+    // Without this, tile data memory contains stale data from CDO/boot
+    // or a previous kernel run, causing first-run nondeterminism.
+    uint8_t *buf_out = bo_out.map<uint8_t *>();
+    memset(buf_out, 0, out_elems * sizeof(int32_t));
+    uint8_t *buf_buf = bo_buf.map<uint8_t *>();
+    memset(buf_buf, 0, in_elems * sizeof(int32_t));
 
     void *bufInstr = bo_instr.map<void *>();
     memcpy(bufInstr, instr_v.data(), instr_v.size() * sizeof(int));
 
     bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bo_out.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bo_buf.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
     unsigned int opcode = 3;
     auto run = kernel(opcode, bo_instr, instr_v.size(), bo_in, bo_buf, bo_out);
@@ -463,7 +489,6 @@ int main(int argc, const char *argv[]) {
     }
 
     bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-    uint8_t *buf_out = bo_out.map<uint8_t *>();
 
     // Write raw output to file.
     std::ofstream ofs(out_file, std::ios::binary);
