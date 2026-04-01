@@ -106,14 +106,24 @@ echo ""
 # ---- Phase 1: Generate ----
 echo "--- Phase 1: Generate ---"
 
-# Skip generation if inputs (ISA JSON + generator script) are older than
-# the manifest.  This avoids re-running the full Python pipeline when
-# nothing has changed.
+# Skip generation if ALL inputs (ISA JSON + all Python tools) are older
+# than the manifest.  Any tool change triggers regeneration -- stale
+# builds from missed tool changes have been a recurring pain point.
 GENERATOR="${PROJECT_DIR}/tools/isa-test-gen.py"
+HOST_GENERATOR="${PROJECT_DIR}/tools/instr-test-gen.py"
 MANIFEST_OUT="${OUT_DIR}/manifest.json"
-if ! $FORCE_COMPILE && [[ -f "$MANIFEST_OUT" ]] \
-    && [[ ! "$ISA_JSON" -nt "$MANIFEST_OUT" ]] \
-    && [[ ! "$GENERATOR" -nt "$MANIFEST_OUT" ]]; then
+TOOLS_CHANGED=false
+if [[ -f "$MANIFEST_OUT" ]]; then
+    for tool in "$ISA_JSON" "$GENERATOR" "$HOST_GENERATOR" \
+                "${PROJECT_DIR}/tools/"*.py; do
+        if [[ "$tool" -nt "$MANIFEST_OUT" ]]; then
+            echo "  Input changed: $(basename "$tool")"
+            TOOLS_CHANGED=true
+            break
+        fi
+    done
+fi
+if ! $FORCE_COMPILE && [[ -f "$MANIFEST_OUT" ]] && ! $TOOLS_CHANGED; then
     echo "  Up to date (inputs unchanged). Skipping generation."
 else
     python3 "$GENERATOR" \
@@ -224,8 +234,10 @@ echo ""
 # ---- Phase 3: Link + Package ----
 
 # Generate shared test_host.cpp from instr-test-gen.py.
+# Regenerate if the generator script is newer than the output, or if missing.
 HOST_CPP="${OUT_DIR}/test_host.cpp"
-if [[ ! -f "$HOST_CPP" ]]; then
+if [[ ! -f "$HOST_CPP" ]] || [[ "$HOST_GENERATOR" -nt "$HOST_CPP" ]]; then
+    echo "Generating test_host.cpp..."
     python3 -c "
 import sys; sys.path.insert(0, '${PROJECT_DIR}/tools')
 import importlib
@@ -235,8 +247,10 @@ print(gen.generate_test_host_cpp())
 fi
 
 # Compile shared host binary (once).
+# Rebuild if source changed, or if the generator is newer (implies source changed).
 HOST_BIN="${OUT_DIR}/test_host"
-if $FORCE_COMPILE || [[ ! -f "$HOST_BIN" ]] || [[ "$HOST_CPP" -nt "$HOST_BIN" ]]; then
+if $FORCE_COMPILE || [[ ! -f "$HOST_BIN" ]] || [[ "$HOST_CPP" -nt "$HOST_BIN" ]] \
+    || [[ "$HOST_GENERATOR" -nt "$HOST_BIN" ]]; then
     echo "Compiling test_host..."
     clang++ "$HOST_CPP" -o "$HOST_BIN" \
         -std=c++17 -Wall \
