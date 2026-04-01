@@ -1748,11 +1748,17 @@ def build_mega_program(test_points: list[str]) -> str:
     # nondeterminism from stale hardware state.
     lines.extend(_register_zeroing_preamble())
 
+    # Save SP after preamble: some tests (PADDA_sp_imm) modify SP.
+    # Use r8 (caller-saved, not in any test register pool).
+    lines.append("  mov r8, sp  // save SP for epilogue (r8 reserved)")
+
     for tp in test_points:
         lines.append(tp)
 
-    # Epilogue: restore callee-saved registers and deallocate frame.
+    # Epilogue: restore SP (in case a test modified it), then restore
+    # callee-saved registers and deallocate frame.
     lines.append(f"  // ==== Epilogue: restore callee-saved r16-r23 ====")
+    lines.append("  mov sp, r8  // restore SP in case tests modified it")
     for i, reg in enumerate(CALLEE_SAVED):
         lines.append(f"  lda {reg}, [sp, #{-(i + 1) * 4}]")
     lines.extend([f"  nop" for _ in range(LOAD_LATENCY)])
