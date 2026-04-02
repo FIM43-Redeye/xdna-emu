@@ -54,8 +54,10 @@ done
 
 OUT_DIR="${PROJECT_DIR}/build/isa-tests"
 # Results under build/ so they survive reboots (unlike /tmp).
-# Override with ISA_TEST_RESULTS env var if needed.
-RESULTS_DIR="${ISA_TEST_RESULTS:-${PROJECT_DIR}/build/isa-test-results/$(date +%Y%m%d)}"
+# 'latest' is always the working directory. On each new run, any
+# existing 'latest' is archived to a timestamped folder first.
+RESULTS_BASE="${PROJECT_DIR}/build/isa-test-results"
+RESULTS_DIR="${ISA_TEST_RESULTS:-${RESULTS_BASE}/latest}"
 
 # Determine which EMU profile to use and check for stale builds.
 EMU_PROFILE="${XDNA_EMU:-debug}"
@@ -430,9 +432,37 @@ print(gen.generate_aie_mlir(${in_size}, ${out_size}))
 fi
 
 # ---- Phase 4: Run HW ----
+# Archive any existing 'latest' results before starting a new run.
+# Uses the modification time of the directory to name the archive,
+# with a suffix for same-day disambiguation.
+mkdir -p "$RESULTS_BASE"
+# Migrate from old symlink-based layout: if 'latest' is a symlink,
+# remove it so we can create a real directory.
+if [[ -L "$RESULTS_DIR" ]]; then
+    rm "$RESULTS_DIR"
+fi
+if [[ -d "$RESULTS_DIR" ]] && [[ -z "${ISA_TEST_RESULTS:-}" ]]; then
+    # Only archive if there are actual result files in latest.
+    if ls "${RESULTS_DIR}"/batch_*_hw.bin &>/dev/null || \
+       ls "${RESULTS_DIR}"/phase_*_hw.bin &>/dev/null; then
+        archive_date=$(date -r "$RESULTS_DIR" +%Y%m%d)
+        archive_path="${RESULTS_BASE}/${archive_date}"
+        # Add letter suffix if the date already exists.
+        if [[ -d "$archive_path" ]]; then
+            suffix="b"
+            while [[ -d "${archive_path}${suffix}" ]]; do
+                suffix=$(echo "$suffix" | tr 'a-y' 'b-z')
+            done
+            archive_path="${archive_path}${suffix}"
+        fi
+        echo "Archiving previous results -> $(basename "$archive_path")"
+        mv "$RESULTS_DIR" "$archive_path"
+    else
+        # Empty or no results -- just clear it.
+        rm -rf "$RESULTS_DIR"
+    fi
+fi
 mkdir -p "$RESULTS_DIR"
-# Maintain a 'latest' symlink for easy access.
-ln -sfn "$RESULTS_DIR" "${RESULTS_DIR%/*}/latest"
 
 if $MULTI_TILE; then
     # Multi-tile HW execution: one xclbin per phase, serial.
