@@ -153,6 +153,12 @@ def analyze(manifest_path: str, results_dir: str, category_filter: str = None,
         if not tests:
             continue
 
+        # Pair batches (cascade/stream) require --multi-tile mode.
+        # Don't count them as skipped in single-tile results.
+        source_type = batch.get("source_type", "assembly")
+        if source_type in ("cascade_pair", "stream_pair"):
+            continue
+
         hw_data, emu_data = load_batch_data(results_dir, batch_idx)
         if hw_data is None or emu_data is None:
             skipped_batches += 1
