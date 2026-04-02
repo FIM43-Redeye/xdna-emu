@@ -542,20 +542,30 @@ pub fn matmul_sparse_config_driven(
     // Sparse crossbar routing, derived from real NPU hardware observation:
     //
     //   output_column = compressed_byte_index % cols
-    //   inner_k = (group / 8) * 4 + (group / 4) % 2
+    //   inner_k = (group / 8) * 4 + bit_positions[(group / 4) % 2]
     //
-    // Each compressed byte routes to a specific output column based purely on
-    // its position in the 64-byte buffer. The mask determines which bytes are
-    // "active" (2 per group), and active bytes are the consecutive pairs at
-    // positions 2*g and 2*g+1 for each mask group g.
+    // where bit_positions are the two set bit indices from the mask nibble.
+    // Groups alternate between the two set bits in 4-group blocks.
     //
-    // The A (dense) side index depends on the group's position, NOT on the
-    // mask bit position within the group. Both compressed bytes in a group
-    // share the same inner_k.  The inner_k formula was derived from NPU
-    // hardware characterization with A = identity pattern [1..16] and
-    // B = one-hot compressed bytes (inner_k characterization v2, 2026-04-02).
+    // Column routing is mask-independent: each compressed byte routes to
+    // a column based purely on its position in the 64-byte buffer.
     //
-    // Cleanroom source: NPU hardware observation (sparse-characterize tests).
+    // Cleanroom: NPU crossbar sweep characterization (2026-04-02).
+
+    // Extract the two set bit positions from the first mask nibble.
+    let representative_nibble = (mask & 0xF) as u8;
+    let bit_positions: [usize; 2] = {
+        let mut bits = [0usize; 2];
+        let mut idx = 0;
+        for b in 0..4u8 {
+            if (representative_nibble >> b) & 1 != 0 && idx < 2 {
+                bits[idx] = b as usize;
+                idx += 1;
+            }
+        }
+        if idx == 1 { bits[1] = bits[0]; }
+        bits
+    };
 
     if config.bfloat {
         // Bf16 sparse: each compressed B element is 2 bytes (little-endian).
@@ -577,8 +587,9 @@ pub fn matmul_sparse_config_driven(
 
                 let b_byte_pos = g * 2 + comp_idx;
                 let col = b_byte_pos % cols;
-                // Hardware-verified inner_k formula (2026-04-02).
-                let inner_k = (g / 8) * 4 + (g / 4) % 2;
+                // Mask-dependent inner_k (crossbar sweep 2026-04-02).
+                let bit_select = (g / 4) % 2;
+                let inner_k = (g / 8) * 4 + bit_positions[bit_select];
 
                 // Read 2-byte bf16 from compressed B.
                 let b_off = b_byte_pos * 2;
@@ -619,9 +630,50 @@ pub fn matmul_sparse_config_driven(
     // positions are active (set bits in the mask nibble). For each active
     // position, read the corresponding compressed B byte and route it to the
     // correct output column.
+    //
+    // inner_k routing (cleanroom, NPU crossbar sweep 2026-04-02):
+    //
+    // The mask nibble's set bit positions determine the inner_k value.
+    // Groups are processed in blocks of 4, alternating between the two
+    // set bits of the mask nibble:
+    //
+    //   bit_positions = [b0, b1]  (the two set bits, sorted ascending)
+    //   bit_select = (g / 4) % 2  (alternates per 4-group block)
+    //   inner_k = (g / 8) * 4 + bit_positions[bit_select]
+    //
+    // Example: mask 0x3 (bits 0,1) → inner_k sequence: 0,1,4,5,8,9,12,13
+    //          mask 0x5 (bits 0,2) → inner_k sequence: 0,2,4,6,8,10,12,14
+    //          mask 0xC (bits 2,3) → inner_k sequence: 2,3,6,7,10,11,14,15
+    //
+    // Both compressed bytes within a group share the same inner_k.
+    // The column routing (col = b_byte_pos % cols) is mask-independent.
+
+    // Extract the two set bit positions from mask nibble 0 as representative.
+    // All nibbles in the mask should use the same pattern (the 2:4 sparsity
+    // pattern is uniform across groups in hardware-generated masks).
+    // Fall back to [0, 1] if the mask doesn't have exactly 2 bits set.
+    let representative_nibble = (mask & 0xF) as u8;
+    let bit_positions: [usize; 2] = {
+        let mut bits = [0usize; 2];
+        let mut idx = 0;
+        for b in 0..4u8 {
+            if (representative_nibble >> b) & 1 != 0 && idx < 2 {
+                bits[idx] = b as usize;
+                idx += 1;
+            }
+        }
+        // If mask nibble doesn't have exactly 2 bits, use first-seen or default.
+        if idx < 2 {
+            // Single-bit or zero-bit mask: replicate the found bit.
+            if idx == 1 { bits[1] = bits[0]; }
+            // idx == 0: both stay 0, which is fine (no active groups anyway).
+        }
+        bits
+    };
+
     for g in 0..num_groups {
         let mask4 = ((mask >> (4 * g)) & 0xF) as u8;
-        if mask4 == 0 || mask4.count_ones() > 2 {
+        if mask4 == 0 {
             continue;
         }
 
@@ -639,16 +691,11 @@ pub fn matmul_sparse_config_driven(
             // Output column: cleanroom routing from NPU observation.
             let col = b_byte_pos % cols;
 
-            // Inner dimension index for A: which position in the dense A
-            // matrix this compressed byte corresponds to.
-            //
-            // Hardware-verified formula (NPU characterization 2026-04-02):
-            //   inner_k = (g / 8) * 4 + (g / 4) % 2
-            //
-            // The mask bit position does NOT affect inner_k -- both
-            // compressed bytes within a group share the same A index.
-            // The bit position only affects column routing (via b_byte_pos).
-            let inner_k = (g / 8) * 4 + (g / 4) % 2;
+            // Inner dimension index: depends on group position AND mask
+            // bit positions. Groups alternate between the two set bits
+            // in 4-group blocks.
+            let bit_select = (g / 4) % 2;
+            let inner_k = (g / 8) * 4 + bit_positions[bit_select];
 
             // Read B element from compressed buffer.
             let b_val = extract_element_bytes(&b_pad, b_byte_pos, bits_y, config.y_signed);

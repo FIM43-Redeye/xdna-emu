@@ -935,8 +935,11 @@ def register_names(kind: str, bit_width: int = 0,
 
     # sparse_qx: 640-bit sparse vector+mask composite registers qx0-qx3 (mQQXw class).
     # Source: AIE2GenRegisterInfo.td -- qx0={x0,q0}, qx1={x1,q1}, etc.
+    # Start with qx1 to avoid aliasing x0 (the default vector512 register).
+    # qx0={x0,q0} shares the x0 data register with the default xs1 operand,
+    # causing both A and B to read the same data in the baseline combo.
     if kind == "sparse_qx":
-        return ["qx0", "qx1", "qx2", "qx3"]
+        return ["qx1", "qx2", "qx3", "qx0"]
 
     # Unknown kind -- return empty.
     return []
@@ -5271,6 +5274,24 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
 
             batch_in_offset += in_size
             batch_out_offset += out_size
+
+        # Verify second-pass code size fits program memory.
+        # The first-pass measurement used offset=0 which underestimates
+        # bundle count (stores at large offsets need padda sequences).
+        # If we overflow, trim test points from the end until it fits.
+        zeroing_bundles = output_zeroing_bundles(batch_out_offset)
+        total_bundles = batch_iw_count + zeroing_bundles + PROG_OVERHEAD_BUNDLES
+        while total_bundles * BUNDLE_SIZE > PROG_MEM_BYTES and len(batch_asm) > 1:
+            # Pop the last test point and recalculate.
+            batch_asm.pop()
+            removed = batch_meta.pop()
+            batch_out_offset = removed["out_offset"]
+            batch_in_offset = removed["in_offset"]
+            batch_iw_count = sum(_count_bundles(a) for a in batch_asm)
+            zeroing_bundles = output_zeroing_bundles(batch_out_offset)
+            total_bundles = batch_iw_count + zeroing_bundles + PROG_OVERHEAD_BUNDLES
+            # Push the removed test back for the next batch.
+            end -= 1
 
         # Write .s file.
         filename = f"batch_{batch_idx:03d}.s"
