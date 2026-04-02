@@ -56,6 +56,16 @@ impl VectorAlu {
             return false;
         }
 
+        // Skip fused ops on memory slots -- MemoryUnit handles these.
+        // Fused instructions (vlda.ups, vst.srs, vst.pack, vlda.conv, vst.conv)
+        // are encoded in load/store VLIW slots and need memory access that
+        // VectorAlu cannot provide.
+        if op.slot.is_memory() && matches!(semantic,
+            SemanticOp::Ups | SemanticOp::Srs | SemanticOp::Pack
+            | SemanticOp::Unpack | SemanticOp::Convert)
+        {
+            return false;
+        }
 
         let et = op.element_type.unwrap_or(ElementType::Int32);
 
@@ -1100,8 +1110,8 @@ impl VectorAlu {
     /// Float types (BFloat16, Float32) are handled inline since they bypass
     /// the integer rounding pipeline.
     ///
-    /// Used by both the narrow `vector_srs` and the wide SRS handler.
-    fn vector_srs_from_acc(
+    /// Used by the narrow `vector_srs`, wide SRS handler, and fused `vst.srs`.
+    pub(super) fn vector_srs_from_acc(
         acc: &[u64; 8],
         shift: u32,
         from_type: ElementType,
@@ -1231,7 +1241,9 @@ impl VectorAlu {
     }
 
     /// Vector type conversion.
-    fn vector_convert(src: &[u32; 8], from_type: ElementType, to_type: ElementType) -> [u32; 8] {
+    ///
+    /// Used by standalone `VCONV` and fused `vlda.conv` / `vst.conv`.
+    pub(super) fn vector_convert(src: &[u32; 8], from_type: ElementType, to_type: ElementType) -> [u32; 8] {
         let mut result = [0u32; 8];
 
         match (from_type, to_type) {

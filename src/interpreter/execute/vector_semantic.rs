@@ -822,62 +822,6 @@ pub(crate) fn vector_sra(a: &[u32; 8], b: &[u32; 8], elem_type: ElementType) -> 
     result
 }
 
-/// Vector absolute value by element type.
-pub(crate) fn vector_abs(a: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
-    let mut result = [0u32; 8];
-
-    match elem_type {
-        ElementType::Int32 | ElementType::Int64 => {
-            for i in 0..8 {
-                result[i] = (a[i] as i32).unsigned_abs();
-            }
-        }
-        ElementType::UInt32 | ElementType::UInt64 => {
-            result = *a; // Already unsigned
-        }
-        ElementType::Float32 => {
-            for i in 0..8 {
-                // Clear sign bit
-                result[i] = a[i] & 0x7FFF_FFFF;
-            }
-        }
-        ElementType::BFloat16 => {
-            for i in 0..8 {
-                let lo = a[i] & 0x7FFF; // Clear sign bit of low bf16
-                let hi = (a[i] >> 16) & 0x7FFF; // Clear sign bit of high bf16
-                result[i] = lo | (hi << 16);
-            }
-        }
-        ElementType::Int16 => {
-            for i in 0..8 {
-                let a_lo = (a[i] & 0xFFFF) as i16;
-                let a_hi = ((a[i] >> 16) & 0xFFFF) as i16;
-                let r_lo = a_lo.unsigned_abs();
-                let r_hi = a_hi.unsigned_abs();
-                result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
-            }
-        }
-        ElementType::UInt16 => {
-            result = *a;
-        }
-        ElementType::Int8 => {
-            for i in 0..8 {
-                let mut r = 0u32;
-                for j in 0..4 {
-                    let a_byte = ((a[i] >> (j * 8)) & 0xFF) as i8;
-                    let r_byte = a_byte.unsigned_abs();
-                    r |= (r_byte as u32) << (j * 8);
-                }
-                result[i] = r;
-            }
-        }
-        ElementType::UInt8 => {
-            result = *a;
-        }
-    }
-
-    result
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1332,43 +1276,6 @@ mod tests {
     // ======================================================================
     // Absolute value tests
     // ======================================================================
-
-    #[test]
-    fn test_vector_abs_i32() {
-        let a = [(-5i32) as u32, 10, 0, (-1i32) as u32, 0, 0, 0, 0];
-        let result = vector_abs(&a, ElementType::Int32);
-        assert_eq!(result[0], 5);
-        assert_eq!(result[1], 10);
-        assert_eq!(result[2], 0);
-        assert_eq!(result[3], 1);
-    }
-
-    #[test]
-    fn test_vector_abs_f32() {
-        let a = [(-1.5f32).to_bits(), 2.0f32.to_bits(), 0, 0, 0, 0, 0, 0];
-        let result = vector_abs(&a, ElementType::Float32);
-        assert_eq!(f32::from_bits(result[0]), 1.5);
-        assert_eq!(f32::from_bits(result[1]), 2.0);
-    }
-
-    #[test]
-    fn test_vector_abs_i16() {
-        // lo=-3, hi=5
-        let a = [(((-3i16) as u16) as u32) | ((5u32) << 16), 0, 0, 0, 0, 0, 0, 0];
-        let result = vector_abs(&a, ElementType::Int16);
-        let r_lo = (result[0] & 0xFFFF) as u16;
-        let r_hi = ((result[0] >> 16) & 0xFFFF) as u16;
-        assert_eq!(r_lo, 3);
-        assert_eq!(r_hi, 5);
-    }
-
-    #[test]
-    fn test_vector_abs_uint32_identity() {
-        let a = [42, 100, 0, 0, 0, 0, 0, 0];
-        let result = vector_abs(&a, ElementType::UInt32);
-        assert_eq!(result[0], 42);
-        assert_eq!(result[1], 100);
-    }
 
     // ======================================================================
     // Integration: dispatch through execute_vector_semantic

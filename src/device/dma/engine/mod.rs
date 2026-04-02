@@ -432,7 +432,7 @@ impl DmaEngine {
         };
 
         // Create transfer
-        let mut transfer = Transfer::new(bd_config, bd_index, channel, direction, self.col, self.row, self.tile_type)?;
+        let transfer = Transfer::new(bd_config, bd_index, channel, direction, self.col, self.row, self.tile_type)?;
 
         log::info!("DMA tile({},{}) ch{} BD{} start: total_bytes={} base_addr=0x{:X} next_bd={:?} acq_lock={:?}(val={}) rel_lock={:?}(val={}) pkt={}(id={}) dir={:?}",
             self.col, self.row, channel, bd_index,

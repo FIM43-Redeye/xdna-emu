@@ -228,11 +228,6 @@ pub fn detect_addressing_mode(instr_name: &str) -> String {
 // Memory width detection
 // ---------------------------------------------------------------------------
 
-/// Detect memory access width from mnemonic. Returns a Rust expression string.
-pub fn detect_mem_width(mnemonic: &str) -> String {
-    detect_mem_width_full("", mnemonic)
-}
-
 /// Detect memory width from instruction name and mnemonic.
 ///
 /// Quad-word scalar loads/stores (dmv_lda_q / dmv_sts_q) use the same "lda"/"st"

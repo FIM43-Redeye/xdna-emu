@@ -9,10 +9,11 @@
 //! stats) that was previously spread across 11 parallel Vec<T> arrays in
 //! DmaEngine.
 
-use std::collections::VecDeque;
 use std::fmt;
 
-use super::engine::{ChannelStats, ChannelTaskConfig, TaskQueue, TaskQueueEntry};
+use super::engine::{ChannelStats, ChannelTaskConfig, TaskQueue};
+#[cfg(test)]
+use super::engine::TaskQueueEntry;
 use super::transfer::Transfer;
 
 /// Information carried from a completed transfer into the lock release phase.

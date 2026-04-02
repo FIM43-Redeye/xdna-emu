@@ -282,6 +282,40 @@ impl MemoryUnit {
                 true
             }
 
+            // ========== Fused load+compute operations ==========
+
+            Some(SemanticOp::Ups) => {
+                // vlda.ups: load from memory, upshift to accumulator
+                Self::execute_fused_load_ups(op, ctx, tile, pm);
+                true
+            }
+
+            Some(SemanticOp::Convert) if Self::is_load_slot(op) => {
+                // vlda.conv: load from memory, convert (e.g., bf16 -> f32)
+                Self::execute_fused_load_convert(op, ctx, tile, pm);
+                true
+            }
+
+            // ========== Fused compute+store operations ==========
+
+            Some(SemanticOp::Srs) => {
+                // vst.srs: shift-round-saturate accumulator, store to memory
+                Self::execute_fused_store_srs(op, ctx, tile, pm, neighbors);
+                true
+            }
+
+            Some(SemanticOp::Pack) => {
+                // vst.pack: pack vector, store narrowed data to memory
+                Self::execute_fused_store_pack(op, ctx, tile, pm, neighbors);
+                true
+            }
+
+            Some(SemanticOp::Convert) => {
+                // vst.conv: convert (e.g., f32 -> bf16), store to memory
+                Self::execute_fused_store_convert(op, ctx, tile, pm, neighbors);
+                true
+            }
+
             _ => false, // Not a memory operation
         }
     }
@@ -734,6 +768,231 @@ impl MemoryUnit {
                 }
             }
         }
+    }
+
+    // ========== Fused instruction helpers ==========
+
+    /// Check if the op is on a load slot (LoadA or LoadB).
+    fn is_load_slot(op: &SlotOp) -> bool {
+        matches!(op.slot, SlotIndex::LoadA | SlotIndex::LoadB)
+    }
+
+    /// Load 256 bits from memory at the op's address. Shared by fused load handlers.
+    fn fused_load_vector(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        tile: &Tile,
+    ) -> [u32; 8] {
+        let addr = Self::get_address(op, ctx);
+        let (quadrant, local_offset) = decode_data_address(addr);
+        if quadrant == MemoryQuadrant::Local {
+            ctx.record_core_bank_access(local_offset as u32, 32, tile.num_banks());
+        }
+        Self::read_vector_from_memory(tile, addr, None)
+    }
+
+    /// Get shift amount from operands (immediate or scalar register).
+    fn get_shift_amount(op: &SlotOp, ctx: &ExecutionContext) -> u32 {
+        for src in &op.sources {
+            match src {
+                Operand::Immediate(imm) => return *imm as u32,
+                Operand::ScalarReg(r) => return ctx.scalar.read(*r),
+                _ => {}
+            }
+        }
+        0
+    }
+
+    /// Get accumulator register index from operands.
+    fn get_acc_source(op: &SlotOp) -> u8 {
+        for src in &op.sources {
+            if let Operand::AccumReg(r) = src {
+                return *r;
+            }
+        }
+        0
+    }
+
+    /// Get vector register data from the first VectorReg source.
+    fn get_vector_source(op: &SlotOp, ctx: &ExecutionContext) -> [u32; 8] {
+        for src in &op.sources {
+            if let Operand::VectorReg(r) = src {
+                return ctx.vector.read(*r);
+            }
+        }
+        [0u32; 8]
+    }
+
+    // ========== Fused load+compute handlers ==========
+
+    /// Execute `vlda.ups`: load from memory, upshift to accumulator.
+    ///
+    /// Loads a 256-bit vector from memory, then applies UPS (upshift) to
+    /// widen narrow lanes into accumulator format. The result is written
+    /// to the destination accumulator register.
+    fn execute_fused_load_ups(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        tile: &Tile,
+        post_modify: &PostModify,
+    ) {
+        let vec_data = Self::fused_load_vector(op, ctx, tile);
+        let shift = Self::get_shift_amount(op, ctx);
+        let from = op.from_type.unwrap_or(ElementType::Int16);
+        let to = op.element_type.unwrap_or(ElementType::Int32);
+
+        let acc_result = super::vector_ups::ups_vector_to_acc(&vec_data, shift, from, to);
+
+        match &op.dest {
+            Some(Operand::AccumReg(r)) => {
+                ctx.accumulator.write(*r, acc_result);
+            }
+            other => {
+                log::warn!(
+                    "[FUSED] vlda.ups: expected AccumReg dest, got {:?} (encoding={:?})",
+                    other, op.encoding_name,
+                );
+            }
+        }
+
+        Self::apply_post_modify(op, ctx, post_modify);
+    }
+
+    /// Execute `vlda.conv`: load from memory, convert type (e.g., bf16 -> f32).
+    ///
+    /// Loads a 256-bit vector from memory, then applies type conversion.
+    /// The result is written to the destination vector register.
+    fn execute_fused_load_convert(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        tile: &Tile,
+        post_modify: &PostModify,
+    ) {
+        let vec_data = Self::fused_load_vector(op, ctx, tile);
+        let from = op.from_type.unwrap_or(ElementType::BFloat16);
+        let to = op.element_type.unwrap_or(ElementType::Float32);
+
+        let result = super::VectorAlu::vector_convert(&vec_data, from, to);
+
+        if let Some(dest) = &op.dest {
+            let latency = load_latency_for_address(Self::get_address(op, ctx));
+            ctx.queue_vector_load(dest.clone(), result, latency);
+        }
+
+        Self::apply_post_modify(op, ctx, post_modify);
+    }
+
+    // ========== Fused compute+store handlers ==========
+
+    /// Execute `vst.srs`: shift-round-saturate accumulator, store to memory.
+    ///
+    /// Reads accumulator data, applies SRS to produce a narrower vector,
+    /// then stores the result to memory.
+    fn execute_fused_store_srs(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        tile: &mut Tile,
+        post_modify: &PostModify,
+        neighbors: Option<&mut NeighborMemory>,
+    ) {
+        let acc_reg = Self::get_acc_source(op);
+        let acc = ctx.accumulator.read(acc_reg);
+        let shift = Self::get_shift_amount(op, ctx);
+        let from = op.from_type.unwrap_or(ElementType::Int32);
+        let to = op.element_type.unwrap_or(ElementType::Int16);
+
+        let narrowed = super::VectorAlu::vector_srs_from_acc(
+            &acc, shift, from, to, &ctx.srs_config,
+        );
+
+        // Calculate store size from the SRS output width.
+        // SRS narrows: e.g., 8 acc32 lanes -> 8x16-bit = 16 bytes.
+        let to_bits = to.bits() as usize;
+        let from_bits = from.bits() as usize;
+        let lanes = if from_bits <= 32 { 16 } else { 8 }; // Acc32 vs Acc64
+        let store_bytes = lanes * to_bits / 8;
+
+        let addr = Self::get_store_address(op, ctx);
+        log::debug!(
+            "[FUSED] vst.srs: acc{} -> addr=0x{:X} ({} bytes, {:?}->{:?})",
+            acc_reg, addr, store_bytes, from, to,
+        );
+
+        let (quadrant, local_offset) = decode_data_address(addr);
+        if quadrant == MemoryQuadrant::Local {
+            ctx.record_core_bank_access(local_offset as u32, store_bytes, tile.num_banks());
+        }
+
+        Self::write_vector_to_memory(tile, addr, narrowed, neighbors);
+        Self::apply_post_modify(op, ctx, post_modify);
+    }
+
+    /// Execute `vst.pack`: pack vector, store narrowed data to memory.
+    ///
+    /// Reads a vector register, applies packing (e.g., 16-bit -> 8-bit),
+    /// then stores the packed result to memory.
+    fn execute_fused_store_pack(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        tile: &mut Tile,
+        post_modify: &PostModify,
+        neighbors: Option<&mut NeighborMemory>,
+    ) {
+        let src = Self::get_vector_source(op, ctx);
+        let enc_name = op.encoding_name.as_deref().unwrap_or("");
+        let (bits_i, bits_o, signed) = super::vector_pack::pack_widths_from_name(enc_name);
+
+        let packed = super::vector_pack::pack_vector(
+            &src, bits_i, bits_o, signed,
+            super::vector_pack::PackMode::Truncate,
+        );
+
+        let addr = Self::get_store_address(op, ctx);
+        log::debug!(
+            "[FUSED] vst.pack: addr=0x{:X} ({}-bit -> {}-bit)",
+            addr, bits_i, bits_o,
+        );
+
+        let (quadrant, local_offset) = decode_data_address(addr);
+        if quadrant == MemoryQuadrant::Local {
+            let store_bytes = 256 / bits_o as usize / 8 * bits_o as usize / 8;
+            ctx.record_core_bank_access(local_offset as u32, store_bytes.max(1), tile.num_banks());
+        }
+
+        Self::write_vector_to_memory(tile, addr, packed, neighbors);
+        Self::apply_post_modify(op, ctx, post_modify);
+    }
+
+    /// Execute `vst.conv`: convert type (e.g., f32 -> bf16), store to memory.
+    ///
+    /// Reads a vector register, applies type conversion, then stores
+    /// the converted result to memory.
+    fn execute_fused_store_convert(
+        op: &SlotOp,
+        ctx: &mut ExecutionContext,
+        tile: &mut Tile,
+        post_modify: &PostModify,
+        neighbors: Option<&mut NeighborMemory>,
+    ) {
+        let src = Self::get_vector_source(op, ctx);
+        let from = op.from_type.unwrap_or(ElementType::Float32);
+        let to = op.element_type.unwrap_or(ElementType::BFloat16);
+
+        let converted = super::VectorAlu::vector_convert(&src, from, to);
+
+        let addr = Self::get_store_address(op, ctx);
+        log::debug!(
+            "[FUSED] vst.conv: addr=0x{:X} ({:?} -> {:?})",
+            addr, from, to,
+        );
+
+        let (quadrant, local_offset) = decode_data_address(addr);
+        if quadrant == MemoryQuadrant::Local {
+            ctx.record_core_bank_access(local_offset as u32, 32, tile.num_banks());
+        }
+
+        Self::write_vector_to_memory(tile, addr, converted, neighbors);
+        Self::apply_post_modify(op, ctx, post_modify);
     }
 
     /// Execute vector store (VST).
