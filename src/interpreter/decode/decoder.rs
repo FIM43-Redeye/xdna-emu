@@ -775,6 +775,10 @@ impl InstructionDecoder {
                 }
                 OperandType::LockId => Operand::Lock(raw as u8),
                 OperandType::Unknown => {
+                    // Fields named "dontcare*" are reserved/padding -- skip silently.
+                    if field.name.starts_with("dontcare") {
+                        continue;
+                    }
                     panic!(
                         "Unhandled OperandType::Unknown for field '{}' (raw=0x{:X}) in encoding '{}'. \
                          Add the register class to classify_operand_type() in resolver.rs.",

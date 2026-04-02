@@ -562,11 +562,11 @@ pub fn classify_reg_name(name: &str) -> Option<MappedOperand> {
         //   qh0-qh3:  ControlReg(16..19)   -- high 64-bit of q
         //   qwl0-qwl3: ControlReg(20..23)  -- 256-bit wide mask low
         //   qwh0-qwh3: ControlReg(24..27)  -- 256-bit wide mask high
-        //   qx0-qx3:  ControlReg(28..31)   -- 640-bit extended mask
+        //   qx0-qx3:   SparseQxReg(0..3)   -- sparse composite (x_n + q_n)
         "q" | "ql" | "qh" => Some(simple(Operand::ControlReg(16 + idx))),
         "qwl" => Some(simple(Operand::ControlReg(20 + idx))),
         "qwh" => Some(simple(Operand::ControlReg(24 + idx))),
-        "qx" => Some(simple(Operand::ControlReg(28 + idx))),
+        "qx" => Some(simple(Operand::SparseQxReg(idx))),
 
         // DMA 2D addressing descriptor registers (d0-d7).
         // These select 2D stride patterns for loads/stores. Map to ModifierReg

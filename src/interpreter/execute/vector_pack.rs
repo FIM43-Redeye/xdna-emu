@@ -163,17 +163,35 @@ pub fn unpack_vector(
     result
 }
 
+/// Check if a token is a type token (D4, S8, D16, S32, etc.).
+fn is_type_token(token: &str) -> bool {
+    (token.starts_with('D') || token.starts_with('S'))
+        && token.len() >= 2
+        && token[1..].parse::<u32>().is_ok()
+}
+
+/// Find consecutive type token pair in parts, returning their indices.
+fn find_type_pair(parts: &[&str]) -> Option<(usize, usize)> {
+    for i in 0..parts.len().saturating_sub(1) {
+        if is_type_token(parts[i]) && is_type_token(parts[i + 1]) {
+            return Some((i, i + 1));
+        }
+    }
+    None
+}
+
 /// Parse VPACK bit widths from encoding name.
 ///
-/// VPACK_{D|S}{out}_{D|S}{in}: e.g. VPACK_D4_D8 -> (8, 4, false).
+/// Handles standalone `VPACK_{OUT}_{IN}` and fused `VST_PACK_{OUT}_{IN}_*`.
+/// Type tokens are {D|S}{bits} (e.g., D4, S8, D16, S32).
 /// Returns (bits_in, bits_out, signed).
 pub fn pack_widths_from_name(name: &str) -> (u32, u32, bool) {
     let upper = name.to_uppercase();
     let parts: Vec<&str> = upper.split('_').collect();
-    if parts.len() >= 3 {
-        let signed = parts[1].starts_with('S') || parts[2].starts_with('S');
-        let out_bits: u32 = parts[1][1..].parse().unwrap_or(8);
-        let in_bits: u32 = parts[2][1..].parse().unwrap_or(16);
+    if let Some((out_idx, in_idx)) = find_type_pair(&parts) {
+        let signed = parts[out_idx].starts_with('S') || parts[in_idx].starts_with('S');
+        let out_bits: u32 = parts[out_idx][1..].parse().unwrap_or(8);
+        let in_bits: u32 = parts[in_idx][1..].parse().unwrap_or(16);
         (in_bits, out_bits, signed)
     } else {
         (16, 8, false)
@@ -182,15 +200,16 @@ pub fn pack_widths_from_name(name: &str) -> (u32, u32, bool) {
 
 /// Parse VUNPACK bit widths from encoding name.
 ///
-/// VUNPACK_{D|S}{out}_{D|S}{in}: e.g. VUNPACK_D16_D8 -> (8, 16, false).
+/// Handles standalone `VUNPACK_{OUT}_{IN}` and fused `VLDB_UNPACK_{OUT}_{IN}_*`.
+/// Type tokens are {D|S}{bits} (e.g., D8, S16, D32).
 /// Returns (bits_in, bits_out, signed).
 pub fn unpack_widths_from_name(name: &str) -> (u32, u32, bool) {
     let upper = name.to_uppercase();
     let parts: Vec<&str> = upper.split('_').collect();
-    if parts.len() >= 3 {
-        let signed = parts[1].starts_with('S') || parts[2].starts_with('S');
-        let out_bits: u32 = parts[1][1..].parse().unwrap_or(16);
-        let in_bits: u32 = parts[2][1..].parse().unwrap_or(8);
+    if let Some((out_idx, in_idx)) = find_type_pair(&parts) {
+        let signed = parts[out_idx].starts_with('S') || parts[in_idx].starts_with('S');
+        let out_bits: u32 = parts[out_idx][1..].parse().unwrap_or(16);
+        let in_bits: u32 = parts[in_idx][1..].parse().unwrap_or(8);
         (in_bits, out_bits, signed)
     } else {
         (8, 16, false)
@@ -583,22 +602,26 @@ mod tests {
 
     #[test]
     fn test_pack_widths_from_name() {
-        // VPACK_D4_D8: input 8-bit, output 4-bit, unsigned
+        // Standalone: VPACK_{OUT}_{IN}
         assert_eq!(pack_widths_from_name("VPACK_D4_D8"), (8, 4, false));
-        // VPACK_S8_S16: input 16-bit, output 8-bit, signed
         assert_eq!(pack_widths_from_name("VPACK_S8_S16"), (16, 8, true));
-        // VPACK_D8_D16: input 16-bit, output 8-bit, unsigned
         assert_eq!(pack_widths_from_name("VPACK_D8_D16"), (16, 8, false));
+        // Fused: VST_PACK_{OUT}_{IN}_*
+        assert_eq!(pack_widths_from_name("VST_PACK_D4_D8_ag_idx"), (8, 4, false));
+        assert_eq!(pack_widths_from_name("VST_PACK_S4_S8_ag_pstm_nrm"), (8, 4, true));
+        assert_eq!(pack_widths_from_name("VST_2D_PACK_S8_S16"), (16, 8, true));
         // Fallback for unrecognized format
         assert_eq!(pack_widths_from_name("VPACK"), (16, 8, false));
     }
 
     #[test]
     fn test_unpack_widths_from_name() {
-        // VUNPACK_D16_D8: input 8-bit, output 16-bit, unsigned
+        // Standalone: VUNPACK_{OUT}_{IN}
         assert_eq!(unpack_widths_from_name("VUNPACK_D16_D8"), (8, 16, false));
-        // VUNPACK_S32_S16: input 16-bit, output 32-bit, signed
         assert_eq!(unpack_widths_from_name("VUNPACK_S32_S16"), (16, 32, true));
+        // Fused: VLDB_UNPACK_{OUT}_{IN}_*
+        assert_eq!(unpack_widths_from_name("VLDB_UNPACK_D8_D4_ag_idx"), (4, 8, false));
+        assert_eq!(unpack_widths_from_name("VLDB_UNPACK_S16_S8_ag_pstm_nrm"), (8, 16, true));
         // Fallback for unrecognized format
         assert_eq!(unpack_widths_from_name("VUNPACK"), (8, 16, false));
     }

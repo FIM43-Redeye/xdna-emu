@@ -334,9 +334,10 @@ fn decode_wm1(raw: u64) -> Operand {
 }
 
 /// Inverse of `getmQXHLbOpValue`.
+/// QXHLb encodes sparse composite registers qx0-qx3.
 fn decode_qxhlb(raw: u64) -> Operand {
     let reg = (raw >> 1) as u8;
-    Operand::AccumReg(reg)
+    Operand::SparseQxReg(reg)
 }
 
 #[cfg(test)]

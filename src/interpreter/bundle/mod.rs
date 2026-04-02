@@ -501,6 +501,7 @@ fn operand_str(op: &Operand) -> String {
         Operand::DmaChannel(ch) => format!("ch{}", ch),
         Operand::BufferDescriptor(bd) => format!("bd{}", bd),
         Operand::ControlReg(id) => format!("cr{}", id),
+        Operand::SparseQxReg(id) => format!("qx{}", id),
     }
 }
 

@@ -1337,7 +1337,7 @@ pub fn infer_element_type(mnemonic: &str) -> Option<ElementType> {
     }
 }
 
-/// Parse a type token like "S16", "D32", "S64" into an ElementType.
+/// Parse a type token like "S16", "D32", "S64", "FP32", "BF16" into an ElementType.
 fn parse_type_token(token: &str) -> Option<ElementType> {
     match token {
         "S8" => Some(ElementType::Int8),
@@ -1348,19 +1348,26 @@ fn parse_type_token(token: &str) -> Option<ElementType> {
         "D32" => Some(ElementType::UInt32),
         "S64" => Some(ElementType::Int64),
         "D64" => Some(ElementType::UInt64),
+        "FP32" => Some(ElementType::Float32),
+        "BF16" => Some(ElementType::BFloat16),
         _ => None,
     }
 }
 
-/// Infer both element types for dual-type instructions (SRS/UPS).
+/// Infer both element types for dual-type instructions (SRS/UPS/CONV/FLOOR).
 ///
-/// Encoding names follow two patterns:
-/// - Standalone: `V{SRS|UPS}_{OUT}_{IN}_*`
-/// - Fused: `V{LDA|ST}_{2D|3D}_{UPS|SRS}_{OUT}_{IN}*`
+/// Encoding names follow these patterns:
+/// - Standalone SRS/UPS: `V{SRS|UPS}_{OUT}_{IN}_*`
+/// - Fused SRS/UPS with 2D/3D: `V{LDA|ST}_{2D|3D}_{UPS|SRS}_{OUT}_{IN}*`
+/// - Fused SRS/UPS without 2D/3D: `V{LDA|ST}_{UPS|SRS}_{OUT}_{IN}_*`
+/// - Standalone CONV: `VCONV_{FROM}_{TO}` (note: FROM first, swapped vs SRS/UPS)
+/// - Standalone FLOOR: `VFLOOR_{FROM}_{TO}_*`
+/// - Fused CONV with 2D/3D: `V{LDA|ST}_{CONV}_{2D|3D}_{FROM}_{TO}*`
+/// - Fused CONV without 2D/3D: `V{LDA|ST}_{CONV}_{FROM}_{TO}_*`
 ///
 /// Returns `(element_type, from_type)` where element_type is the OUTPUT
 /// type and from_type is the INPUT type. Returns `(None, None)` for
-/// non-SRS/UPS instructions.
+/// unrecognized patterns.
 pub fn infer_dual_element_types(name: &str) -> (Option<ElementType>, Option<ElementType>) {
     let parts: Vec<&str> = name.split('_').collect();
 
@@ -1382,6 +1389,54 @@ pub fn infer_dual_element_types(name: &str) -> (Option<ElementType>, Option<Elem
                 (parse_type_token(parts[3]), parse_type_token(parts[4]))
             {
                 return (Some(out_type), Some(in_type));
+            }
+        }
+    }
+
+    // Pattern 3: V{LDA|ST}_{UPS|SRS}_{OUT}_{IN}* (no 2D/3D prefix)
+    if parts.len() >= 4 {
+        let is_fused = (parts[0] == "VLDA" || parts[0] == "VST")
+            && (parts[1] == "UPS" || parts[1] == "SRS");
+        if is_fused {
+            if let (Some(out_type), Some(in_type)) =
+                (parse_type_token(parts[2]), parse_type_token(parts[3]))
+            {
+                return (Some(out_type), Some(in_type));
+            }
+        }
+    }
+
+    // Pattern 4: VCONV_{FROM}_{TO} or VFLOOR_{FROM}_{TO}_*
+    // Note: CONV/FLOOR name format is {FROM}_{TO}, not {OUT}_{IN}.
+    // We swap to return (out=TO, from=FROM) to match the convention.
+    if parts.len() >= 3 && (parts[0] == "VCONV" || parts[0] == "VFLOOR") {
+        if let (Some(from_type), Some(to_type)) =
+            (parse_type_token(parts[1]), parse_type_token(parts[2]))
+        {
+            return (Some(to_type), Some(from_type));
+        }
+    }
+
+    // Pattern 5: Fused CONV variants
+    if parts.len() >= 4 && (parts[0] == "VLDA" || parts[0] == "VST") {
+        // Find the CONV keyword position, then types follow after it.
+        if let Some(conv_pos) = parts.iter().position(|&p| p == "CONV") {
+            if conv_pos + 2 < parts.len() {
+                // Skip optional 2D/3D after CONV
+                let type_start = if parts.get(conv_pos + 1).map_or(false,
+                    |p| *p == "2D" || *p == "3D")
+                {
+                    conv_pos + 2
+                } else {
+                    conv_pos + 1
+                };
+                if type_start + 1 < parts.len() {
+                    if let (Some(from_type), Some(to_type)) =
+                        (parse_type_token(parts[type_start]), parse_type_token(parts[type_start + 1]))
+                    {
+                        return (Some(to_type), Some(from_type));
+                    }
+                }
             }
         }
     }
@@ -2157,6 +2212,7 @@ mod tests {
 
     #[test]
     fn test_infer_dual_element_types_fused() {
+        // Pattern 2: with 2D/3D prefix
         let (et, ft) = infer_dual_element_types("VLDA_2D_UPS_S32_D16");
         assert_eq!(et, Some(ElementType::Int32));
         assert_eq!(ft, Some(ElementType::UInt16));
@@ -2164,6 +2220,56 @@ mod tests {
         let (et, ft) = infer_dual_element_types("VST_2D_SRS_D8_S32");
         assert_eq!(et, Some(ElementType::UInt8));
         assert_eq!(ft, Some(ElementType::Int32));
+
+        // Pattern 3: without 2D/3D prefix (direct fused encoding)
+        let (et, ft) = infer_dual_element_types("VLDA_UPS_S64_S32_ag_idx");
+        assert_eq!(et, Some(ElementType::Int64));
+        assert_eq!(ft, Some(ElementType::Int32));
+
+        let (et, ft) = infer_dual_element_types("VLDA_UPS_S64_D32_ag_pstm_nrm");
+        assert_eq!(et, Some(ElementType::Int64));
+        assert_eq!(ft, Some(ElementType::UInt32));
+
+        let (et, ft) = infer_dual_element_types("VST_SRS_S16_S32_ag_idx_imm");
+        assert_eq!(et, Some(ElementType::Int16));
+        assert_eq!(ft, Some(ElementType::Int32));
+    }
+
+    #[test]
+    fn test_infer_dual_element_types_conv() {
+        // Standalone VCONV: VCONV_{FROM}_{TO}
+        let (et, ft) = infer_dual_element_types("VCONV_FP32_BF16");
+        assert_eq!(et, Some(ElementType::BFloat16));  // output = TO
+        assert_eq!(ft, Some(ElementType::Float32));    // from = FROM
+
+        let (et, ft) = infer_dual_element_types("VCONV_BF16_FP32");
+        assert_eq!(et, Some(ElementType::Float32));
+        assert_eq!(ft, Some(ElementType::BFloat16));
+
+        // VFLOOR: VFLOOR_{FROM}_{TO}_*
+        let (et, ft) = infer_dual_element_types("VFLOOR_S32_BF16_mFl2FxSrc_AM");
+        assert_eq!(et, Some(ElementType::BFloat16));
+        assert_eq!(ft, Some(ElementType::Int32));
+
+        // Fused CONV: VLDA_2D_CONV_FP32_BF16
+        let (et, ft) = infer_dual_element_types("VLDA_2D_CONV_FP32_BF16");
+        assert_eq!(et, Some(ElementType::BFloat16));
+        assert_eq!(ft, Some(ElementType::Float32));
+
+        // Fused CONV without 2D: VLDA_CONV_FP32_BF16_ag_idx
+        let (et, ft) = infer_dual_element_types("VLDA_CONV_FP32_BF16_ag_idx");
+        assert_eq!(et, Some(ElementType::BFloat16));
+        assert_eq!(ft, Some(ElementType::Float32));
+
+        // Fused store CONV: VST_CONV_BF16_FP32_ag_idx
+        let (et, ft) = infer_dual_element_types("VST_CONV_BF16_FP32_ag_idx");
+        assert_eq!(et, Some(ElementType::Float32));
+        assert_eq!(ft, Some(ElementType::BFloat16));
+
+        // Fused store CONV with 2D: VST_CONV_2D_BF16_FP32
+        let (et, ft) = infer_dual_element_types("VST_CONV_2D_BF16_FP32");
+        assert_eq!(et, Some(ElementType::Float32));
+        assert_eq!(ft, Some(ElementType::BFloat16));
     }
 
     #[test]

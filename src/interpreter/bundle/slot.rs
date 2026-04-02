@@ -199,6 +199,10 @@ pub enum Operand {
     /// Control register (crRnd=6, crSat=9, crSRSSign=8, crVaddSign=0, etc.).
     /// The u8 is the 4-bit hardware register ID from the ISA encoding.
     ControlReg(u8),
+    /// Sparse composite register qx0-qx3.
+    /// Each qx_n combines vector data (x_n) with a sparsity mask (q_n).
+    /// The u8 is the qx index (0-3). Used as the B operand in sparse MAC.
+    SparseQxReg(u8),
 }
 
 /// Predicate for conditional execution.
