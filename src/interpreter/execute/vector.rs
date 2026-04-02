@@ -344,12 +344,11 @@ impl VectorAlu {
                 // The base vector is s1 (sources[0]), NOT the current dst value.
                 // VPUSH (shift+insert) is handled in the execute_wide path.
                 //
-                // The index is read from r29 (fixed implicit register, not a
-                // decoded operand).  $idx in the asm_string is an implicit ref
-                // to r29 -- it does not appear in the operand list.
+                // Decoded sources: [s1 (VectorReg), idx (ScalarReg r29), s0 (ScalarReg)].
+                // Index is always r29 (implicit), value is the second scalar source.
                 let mut base = Self::get_vector_source(op, ctx, 0);
                 let index = ctx.scalar.read(29);  // r29: implicit index register
-                let value = Self::get_nth_scalar_source(op, ctx, 0);  // s0
+                let value = Self::get_nth_scalar_source(op, ctx, 1);  // s0 (skip idx)
                 Self::vector_insert(&mut base, value, index, et);
                 Self::write_vector_dest(op, ctx, base);
                 true
@@ -3860,12 +3859,31 @@ impl VectorAlu {
                 // Cannot use fallback (execute_half twice) because it
                 // inserts at the same index in BOTH halves.
                 //
-                // Index from r29 (fixed implicit register, not decoded operand).
+                // Decoded sources: [s1 (VectorReg), idx (ScalarReg r29), s0 (ScalarReg)].
                 let base = Self::get_wide_vec_source(op, ctx, 0);
                 let index = ctx.scalar.read(29);  // r29: implicit index register
-                let value = Self::get_nth_scalar_source(op, ctx, 0);  // s0
-                let result = Self::insert_wide_element(&base, index, value, et);
-                Self::write_wide_vec_dest(op, ctx, result);
+                if matches!(et, ElementType::Int64 | ElementType::UInt64) {
+                    // 64-bit: s0 is a register pair (rN+1:rN). Read both halves.
+                    // get_nth_scalar_source returns the pair's base register value;
+                    // we need to find the actual register number to read rN+1.
+                    let mut s0_reg = None;
+                    let mut scalar_count = 0;
+                    for src in &op.sources {
+                        if let Operand::ScalarReg(r) = src {
+                            if scalar_count == 1 { s0_reg = Some(*r); break; }
+                            scalar_count += 1;
+                        }
+                    }
+                    let reg = s0_reg.unwrap_or(0);
+                    let lo = ctx.scalar.read(reg);
+                    let hi = ctx.scalar.read(reg + 1);
+                    let result = Self::insert_wide_element_64(&base, index, lo, hi);
+                    Self::write_wide_vec_dest(op, ctx, result);
+                } else {
+                    let value = Self::get_nth_scalar_source(op, ctx, 1);  // s0 (skip idx)
+                    let result = Self::insert_wide_element(&base, index, value, et);
+                    Self::write_wide_vec_dest(op, ctx, result);
+                }
                 true
             }
 
@@ -4229,12 +4247,23 @@ impl VectorAlu {
     ///
     /// Returns a copy of `src` with the element at `index` replaced by `value`.
     /// The index is masked to the valid range for the element type.
+    /// Insert a 64-bit value (lo + hi words) at a specific 64-bit element position.
+    fn insert_wide_element_64(src: &Vec512, index: u32, lo: u32, hi: u32) -> Vec512 {
+        let mut result = *src;
+        // 512 bits / 64 bits = 8 elements
+        let idx = (index as usize) % 8;
+        result[idx * 2] = lo;
+        result[idx * 2 + 1] = hi;
+        result
+    }
+
     fn insert_wide_element(src: &Vec512, index: u32, value: u32, et: ElementType) -> Vec512 {
         let mut result = *src;
         let bits = et.bits() as u32;
         if bits >= 64 {
-            // 64-bit element: write the lower 32 bits.
-            let idx = (index as usize % 4) * 2;
+            // 64-bit element: only lower 32 bits available via this path.
+            // Use insert_wide_element_64 for full 64-bit inserts.
+            let idx = (index as usize % 8) * 2;
             result[idx] = value;
             return result;
         }
