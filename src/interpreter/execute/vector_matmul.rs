@@ -542,22 +542,18 @@ pub fn matmul_sparse_config_driven(
     // Sparse crossbar routing, derived from real NPU hardware observation:
     //
     //   output_column = compressed_byte_index % cols
+    //   inner_k = (group / 8) * 4 + (group / 4) % 2
     //
     // Each compressed byte routes to a specific output column based purely on
     // its position in the 64-byte buffer. The mask determines which bytes are
     // "active" (2 per group), and active bytes are the consecutive pairs at
     // positions 2*g and 2*g+1 for each mask group g.
     //
-    // The A (dense) side index for each compressed byte depends on the mask
-    // group's position within the inner dimension. Each group g maps to an
-    // inner_group index, and each active bit within the group maps to a
-    // specific inner-dimension position.
-    //
-    // For the A index, the mapping is:
-    //   inner_k = (compressed_byte_index / cols) * 4 + bit_position_in_group
-    //
-    // where bit_position_in_group is which of the 4 slots within the mask
-    // nibble this compressed byte occupies (determined by the mask pattern).
+    // The A (dense) side index depends on the group's position, NOT on the
+    // mask bit position within the group. Both compressed bytes in a group
+    // share the same inner_k.  The inner_k formula was derived from NPU
+    // hardware characterization with A = identity pattern [1..16] and
+    // B = one-hot compressed bytes (inner_k characterization v2, 2026-04-02).
     //
     // Cleanroom source: NPU hardware observation (sparse-characterize tests).
 
@@ -581,8 +577,8 @@ pub fn matmul_sparse_config_driven(
 
                 let b_byte_pos = g * 2 + comp_idx;
                 let col = b_byte_pos % cols;
-                let inner_groups = config.inner as usize / 4;
-                let inner_k = (g % inner_groups) * 4 + bit as usize;
+                // Hardware-verified inner_k formula (2026-04-02).
+                let inner_k = (g / 8) * 4 + (g / 4) % 2;
 
                 // Read 2-byte bf16 from compressed B.
                 let b_off = b_byte_pos * 2;
@@ -645,12 +641,14 @@ pub fn matmul_sparse_config_driven(
 
             // Inner dimension index for A: which position in the dense A
             // matrix this compressed byte corresponds to.
-            // Each mask group g has 4 inner positions (a group of 4 in the
-            // inner dimension). The group's position within the inner dim
-            // cycles with period inner/4 (inner_groups). The mask bit
-            // selects which of the 4 positions within the group is active.
-            let inner_groups = config.inner as usize / 4;
-            let inner_k = (g % inner_groups) * 4 + bit as usize;
+            //
+            // Hardware-verified formula (NPU characterization 2026-04-02):
+            //   inner_k = (g / 8) * 4 + (g / 4) % 2
+            //
+            // The mask bit position does NOT affect inner_k -- both
+            // compressed bytes within a group share the same A index.
+            // The bit position only affects column routing (via b_byte_pos).
+            let inner_k = (g / 8) * 4 + (g / 4) % 2;
 
             // Read B element from compressed buffer.
             let b_val = extract_element_bytes(&b_pad, b_byte_pos, bits_y, config.y_signed);

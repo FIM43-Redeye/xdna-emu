@@ -459,6 +459,12 @@ REGISTER_SIZES = {
 
 # Maximum positive immediate offset for lda/st (6-bit signed, step 4).
 # Range: [-128, 124].  We use only positive offsets in generated code.
+# Spill scratch area: extra stack space for SP-relative spill instruction
+# testing.  Spill instructions access tile-local memory via SP, so we allocate
+# this in the stack frame.  128 bytes covers the largest spill operation
+# (accumulator at 64 bytes) with alignment headroom.
+SPILL_SCRATCH_SIZE = 128
+
 MAX_SCALAR_OFFSET = 124
 
 # Maximum positive immediate offset for vlda/vst (6-bit signed, step 32).
@@ -1002,13 +1008,210 @@ def _is_sp_relative(instr: dict) -> bool:
     return "[sp," in asm or "[sp]" in asm
 
 
+def _spill_load_sequence(instr: dict, regs: dict, dest_reg: str,
+                         dest_kind: str, in_offset: int,
+                         sp_offset: int, data_size: int) -> list[str]:
+    """Generate a spill load test using tile-local stack memory.
+
+    Spill instructions access tile-local memory via SP.  The test harness
+    can't point SP at the DDR input buffer (causes hardware hang).  Instead:
+
+    1. Copy input data from DDR (p0 + in_offset) to local stack scratch area
+       using regular loads/stores via a temporary register.
+    2. Set SP to scratch_base + |sp_offset| (so SP + sp_offset = scratch_base).
+    3. Execute the spill load instruction (reads from local stack).
+
+    The scratch area starts 32 bytes below the saved SP (past callee-saved
+    registers).  We use r8 (saved SP) to calculate the scratch address.
+    """
+    lines = []
+    # Step 1: Copy input data from DDR to stack scratch area.
+    # Use p6 as temporary pointer to DDR input, p7 won't work (callee-saved
+    # in some modes).  We copy word-by-word for simplicity.
+    lines.extend(_padda_sequence("p6", "p0", in_offset))
+    lines.extend(_nop_sled(2))
+
+    # Copy data_size bytes from [p6] to stack scratch.
+    # Scratch base = r8 (saved SP) - 32 (callee-saved) - data_size.
+    # We use padda from r8 to set up a pointer to the scratch area.
+    scratch_offset = -(32 + data_size)  # below callee-saved region
+    # Align scratch_offset to data alignment
+    scratch_offset = -((-scratch_offset + 31) // 32 * 32)
+
+    # Copy using scalar lda/st pairs for portability.
+    for off in range(0, data_size, 4):
+        lines.append(f"  lda r9, [p6, #{off}]")
+    lines.extend(_nop_sled(LOAD_LATENCY))
+    # Now store to stack scratch.  We compute scratch address using r8 (SP).
+    # mov p7, r8 isn't valid -- we need to use paddb on SP itself.
+    # Strategy: restore SP from r8, then paddb to reach scratch, store, restore.
+    lines.append(f"  mov sp, r8")
+    lines.append(f"  paddb [sp], #{scratch_offset}")
+    for off in range(0, min(data_size, 4 * 1), 4):
+        lines.append(f"  st r9, [sp, #{off}]")
+
+    # For larger data, we need multiple lda/st rounds.  For now, handle the
+    # common sizes: 4 (scalar), 16 (quad), 32 (vector256).
+    if data_size <= 4:
+        pass  # already stored r9
+    else:
+        # Re-copy with proper multi-word handling.
+        lines.clear()
+        lines.extend(_padda_sequence("p6", "p0", in_offset))
+        lines.extend(_nop_sled(2))
+
+        # Restore SP to scratch base for stores.
+        lines.append(f"  mov sp, r8")
+        lines.append(f"  paddb [sp], #{scratch_offset}")
+        lines.extend(_nop_sled(2))
+
+        if data_size <= 32 and dest_kind in ("vector256", "vector512",
+                                             "accumulator", "quad"):
+            # Vector path: vlda from DDR, vst to local stack.
+            if dest_kind == "quad":
+                lines.append(f"  lda q0, [p6, #0]")
+                lines.extend(_nop_sled(LOAD_LATENCY))
+                lines.append(f"  st q0, [sp, #0]")
+            else:
+                lines.append(f"  vlda wl0, [p6, #0]")
+                lines.extend(_nop_sled(LOAD_LATENCY))
+                lines.append(f"  vst wl0, [sp, #0]")
+        else:
+            # Scalar word-by-word copy.
+            for i, off in enumerate(range(0, data_size, 4)):
+                reg = f"r{9 + (i % 4)}"
+                lines.append(f"  lda {reg}, [p6, #{off}]")
+            lines.extend(_nop_sled(LOAD_LATENCY))
+            for i, off in enumerate(range(0, data_size, 4)):
+                reg = f"r{9 + (i % 4)}"
+                lines.append(f"  st {reg}, [sp, #{off}]")
+
+    lines.extend(_nop_sled(2))
+
+    # Step 2: Set SP so that SP + sp_offset = scratch_base.
+    # Currently SP = saved_SP + scratch_offset (= scratch_base).
+    # We need SP = scratch_base - sp_offset = scratch_base + |sp_offset|.
+    if sp_offset != 0:
+        lines.append(f"  paddb [sp], #{-sp_offset}")
+
+    lines.extend(_nop_sled(2))
+
+    # Step 3: Execute the spill load.
+    op_by_name = {op["name"]: op for op in instr.get("operands", [])}
+    load_regs = dict(regs)
+    for op_name, op in op_by_name.items():
+        if op.get("operand_type") == "immediate":
+            load_regs[op_name] = str(sp_offset)
+    asm_line = "  " + _substitute_asm(instr["asm_string"], load_regs,
+                                      has_modifier=_has_modifier_operand(instr))
+    lines.append(asm_line)
+
+    # Restore SP from r8 (tests may have moved it).
+    # The epilogue also does this, but we restore early so subsequent
+    # test points that use p6 for pointer setup work correctly.
+    lines.append(f"  mov sp, r8")
+
+    return lines
+
+
+def _spill_store_sequence(instr: dict, regs: dict, src_reg: str,
+                          src_kind: str, out_offset: int,
+                          sp_offset: int, data_size: int) -> list[str]:
+    """Generate a spill store test using tile-local stack memory.
+
+    1. Execute the spill store (writes to local stack scratch area).
+    2. Copy the result from stack scratch to DDR output buffer (p1).
+    """
+    lines = []
+    scratch_offset = -(32 + data_size)
+    scratch_offset = -((-scratch_offset + 31) // 32 * 32)
+
+    # Step 1: Set SP to scratch + |sp_offset| so the store lands in scratch.
+    lines.append(f"  mov sp, r8")
+    lines.append(f"  paddb [sp], #{scratch_offset}")
+    if sp_offset != 0:
+        lines.append(f"  paddb [sp], #{-sp_offset}")
+    lines.extend(_nop_sled(2))
+
+    # Step 2: Execute the spill store.
+    op_by_name = {op["name"]: op for op in instr.get("operands", [])}
+    store_regs = dict(regs)
+    for op_name, op in op_by_name.items():
+        if op.get("operand_type") == "immediate":
+            store_regs[op_name] = str(sp_offset)
+    asm_line = "  " + _substitute_asm(instr["asm_string"], store_regs,
+                                      has_modifier=_has_modifier_operand(instr))
+    lines.append(asm_line)
+    lines.extend(_nop_sled(2))
+
+    # Step 3: Read back from stack scratch and store to DDR output buffer.
+    # Reset SP to scratch_base for reading.
+    lines.append(f"  mov sp, r8")
+    lines.append(f"  paddb [sp], #{scratch_offset}")
+    lines.extend(_nop_sled(2))
+
+    if data_size <= 32 and src_kind in ("vector256", "vector512",
+                                        "accumulator", "quad"):
+        if src_kind == "quad":
+            lines.append(f"  lda q0, [sp, #0]")
+            lines.extend(_nop_sled(LOAD_LATENCY))
+            store_lines = _store_instruction("q0", "quad", "p1", out_offset)
+            lines.extend(store_lines)
+        else:
+            lines.append(f"  vlda wl0, [sp, #0]")
+            lines.extend(_nop_sled(LOAD_LATENCY))
+            store_lines = _store_instruction("wl0", "vector256", "p1", out_offset)
+            lines.extend(store_lines)
+    else:
+        # Scalar: read word-by-word.
+        for i, off in enumerate(range(0, data_size, 4)):
+            reg = f"r{9 + (i % 4)}"
+            lines.append(f"  lda {reg}, [sp, #{off}]")
+        lines.extend(_nop_sled(LOAD_LATENCY))
+        lines.extend(_padda_sequence("p7", "p1", out_offset))
+        for i, off in enumerate(range(0, data_size, 4)):
+            reg = f"r{9 + (i % 4)}"
+            lines.append(f"  st {reg}, [p7, #{i * 4}]")
+
+    # Restore SP.
+    lines.append(f"  mov sp, r8")
+
+    return lines
+
+
+def _sp_spill_offset(instr: dict) -> int:
+    """Return the SP-relative immediate offset for a spill instruction.
+
+    AIE2 SP-relative addressing uses an implicit sign bit -- the decoder
+    forces sign=1 before sign-extending, so the encoding can ONLY represent
+    negative values.  The offset must be negative and aligned to the
+    instruction's step size.
+
+    The step size depends on the operand class (from TableGen):
+      - imm12x32_neg (step=32): VLDA/VST vector/accumulator spills
+      - imm12x16_neg (step=16): LDA/ST quad register (q) spills
+      - imm12x4 (step=4, NOT negative): LDA/ST scalar spills
+
+    Returns the byte offset to use in assembly (e.g., -32).
+    """
+    name = instr.get("name", "")
+    # Scalar spills use imm12x4 which is NOT negative-only.
+    if "dms_spill" in name:
+        return 0
+    # Quad register spills use imm12x16_neg (step=16).
+    if "dmv_lda_q_ag_spill" in name or "dmv_sts_q_ag_spill" in name:
+        return -16
+    # All others (vector/accumulator) use imm12x32_neg (step=32).
+    return -32
+
+
 def _padda_sequence(ptr_reg: str, base_ptr: str, offset: int) -> list[str]:
     """Generate pointer arithmetic sequence to reach a large offset.
 
     PADDA immediate range is 12-bit signed: [-4096, 4095].
     For larger offsets (positive or negative), emit multiple PADDA instructions.
     """
-    max_step = 1024  # PADDA accepts up to ~1536; use 1024 for safety
+    max_step = 2044  # PADDA range: 9-bit signed * step 4 = [-2048, 2044]
     lines = [f"  mov {ptr_reg}, {base_ptr}"]
     remaining = offset
     while abs(remaining) > max_step:
@@ -1801,7 +2004,11 @@ def build_mega_program(test_points: list[str], out_size: int = 0) -> str:
     lines.append("")
 
     # Prologue: allocate stack frame and save callee-saved registers.
-    frame_size = len(CALLEE_SAVED) * 4  # 32 bytes for 8 registers
+    # Frame includes callee-saved regs (32 bytes) + spill scratch area
+    # (128 bytes) for SP-relative spill instruction testing.  The scratch
+    # area lives at SP offsets [-32..-160] after the callee-saved region.
+    callee_size = len(CALLEE_SAVED) * 4  # 32 bytes for 8 registers
+    frame_size = callee_size + SPILL_SCRATCH_SIZE
     # Round up to multiple of 32 (AIE2 stack alignment).
     frame_size = ((frame_size + 31) // 32) * 32
     lines.append(f"  // ==== Prologue: save callee-saved r16-r23 ====")
@@ -1941,11 +2148,8 @@ class ComputeStrategy(TestStrategy):
     """
 
     def can_test(self, instr: dict) -> tuple[bool, str]:
-        # Reject SP-relative spill instructions: these need specialized
-        # LoadStrategy/StoreStrategy handling but were rejected there due
-        # to llvm-mc encoder bugs.  Don't let the fallback pick them up.
         if _is_sp_relative(instr):
-            return (False, "SP-relative spill (llvm-mc encoder bug)")
+            return (False, "SP-relative spill (use LoadStrategy/StoreStrategy)")
         status, reason = classify_instruction(instr)
         return (status == "testable", reason)
 
@@ -1994,16 +2198,15 @@ class LoadStrategy(TestStrategy):
         operands = instr.get("operands", [])
         sp_relative = _is_sp_relative(instr)
 
-        # Reject ALL SP-relative spill loads: llvm-mc crashes with assertion
-        # failure in getSImmOpValueXStep because the encoder step/range
-        # requirements don't match the immediate field metadata.  llvm-aie bug.
-        # Affects: LDA_dmv_lda_q_ag_spill, VLDA_dmw_lda_{am,w}_ag_spill.
+        # SP-relative spill instructions need tile-local memory.  The stack
+        # scratch infrastructure is in place (SPILL_SCRATCH_SIZE in frame)
+        # but paddb alignment constraints (step=32 negative-only) make the
+        # SP adjustment sequences tricky.  Deferred until the llvm-mc
+        # encoder constraints are better understood.
         if sp_relative:
-            return (False, "SP-relative spill load (llvm-mc encoder bug)")
+            return (False, "SP-relative spill (paddb alignment constraints)")
 
         # Must have a pointer operand, unless SP-relative (SP is implicit).
-        # SP-relative instructions like VLDA_dmw_lda_w_ag_spill encode the
-        # base pointer as the SP register and list no pointer in operands.
         has_pointer = any(
             op.get("register_kind") == "pointer"
             for op in operands
@@ -2095,26 +2298,35 @@ class LoadStrategy(TestStrategy):
         in_offset = _align(in_offset, align)
 
         op_by_name = {op["name"]: op for op in instr.get("operands", [])}
+        sp_relative = _is_sp_relative(instr)
+        sp_offset = _sp_spill_offset(instr) if sp_relative else 0
 
-        # Safe pointer setup: zero modifiers FIRST, then set pointer.
-        # Both SP-relative and normal loads use p6 pointing at input data.
-        lines.extend(_safe_ptr_setup("p6", "p0", in_offset, op_by_name, regs))
+        if sp_relative:
+            # SP-relative spill loads: copy input data from DDR to local
+            # stack scratch area, then execute the spill load from there.
+            # The spill scratch area is at SP offsets below the callee-saved
+            # registers.  We temporarily move SP into the scratch area so
+            # the negative spill offset lands within it.
+            data_size = _operand_size(dest, name)
+            lines.extend(
+                _spill_load_sequence(instr, regs, dest_reg, dest_kind,
+                                     in_offset, sp_offset, data_size))
+        else:
+            # Normal (non-SP) load: p6 points directly at input data in DDR.
+            lines.extend(_safe_ptr_setup("p6", "p0", in_offset,
+                                         op_by_name, regs))
+            lines.extend(_nop_sled(2))
 
-        # NOP sled to cover setup latency.
-        lines.extend(_nop_sled(2))
+            load_regs = dict(regs)
+            for op_name, op in op_by_name.items():
+                if op.get("register_kind") == "pointer":
+                    load_regs[op_name] = "p6"
+                if op.get("operand_type") == "immediate":
+                    load_regs[op_name] = "0"
 
-        # Execute: the load instruction itself.
-        # Override pointer to p6, zero ALL immediates (including post-modify).
-        load_regs = dict(regs)
-        for op_name, op in op_by_name.items():
-            if op.get("register_kind") == "pointer":
-                load_regs[op_name] = "p6"
-            if op.get("operand_type") == "immediate":
-                load_regs[op_name] = "0"
-
-        asm_line = "  " + _substitute_asm(instr["asm_string"], load_regs,
-                                          has_modifier=_has_modifier_operand(instr))
-        lines.append(asm_line)
+            asm_line = "  " + _substitute_asm(instr["asm_string"], load_regs,
+                                              has_modifier=_has_modifier_operand(instr))
+            lines.append(asm_line)
 
         # NOP sled for load result latency.
         lines.extend(_nop_sled(result_latency(instr)))
@@ -2201,16 +2413,11 @@ class StoreStrategy(TestStrategy):
         operands = instr.get("operands", [])
         sp_relative = _is_sp_relative(instr)
 
-        # Reject ALL SP-relative spill stores: llvm-mc crashes with assertion
-        # failure in getSImmOpValueXStep because the encoder step/range
-        # requirements don't match the immediate field metadata.  llvm-aie bug.
-        # Affects: ST_dmv_sts_q_ag_spill, VST_{128,dmw_sts_{am,w}}_ag_spill.
+        # SP-relative spill: deferred (paddb alignment constraints).
         if sp_relative:
-            return (False, "SP-relative spill store (llvm-mc encoder bug)")
+            return (False, "SP-relative spill (paddb alignment constraints)")
 
         # Must have a pointer operand, unless SP-relative (SP is implicit).
-        # SP-relative spill stores encode the destination address as the SP
-        # register and list no pointer in the operand table.
         has_pointer = any(
             op.get("register_kind") == "pointer"
             for op in operands
@@ -2345,25 +2552,30 @@ class StoreStrategy(TestStrategy):
         # NOP sled for load latency.
         lines.extend(_nop_sled(LOAD_LATENCY))
 
-        # Safe pointer setup: zero modifiers FIRST, then set output pointer.
         out_offset = _align(out_offset, align)
+        sp_offset = _sp_spill_offset(instr) if sp_relative else 0
+
         if sp_relative:
-            lines.extend(_safe_ptr_setup("p6", "p1", out_offset, op_by_name, regs))
+            # Spill stores use tile-local stack memory.  Store to scratch,
+            # then read back and copy to DDR output buffer.
+            data_size = self._compute_store_width(instr)
+            lines.extend(
+                _spill_store_sequence(instr, regs, src_reg, src_kind,
+                                      out_offset, sp_offset, data_size))
         else:
-            lines.extend(_safe_ptr_setup("p7", "p1", out_offset, op_by_name, regs))
+            # Normal store: set up output pointer, execute store directly.
+            lines.extend(_safe_ptr_setup("p7", "p1", out_offset,
+                                         op_by_name, regs))
+            store_regs = dict(regs)
+            for op_name, op in op_by_name.items():
+                if op.get("register_kind") == "pointer":
+                    store_regs[op_name] = "p7"
+                if op.get("operand_type") == "immediate":
+                    store_regs[op_name] = "0"
 
-        # Execute: the store instruction.
-        # Override pointer to p7 (or p6 for SP-relative), zero ALL immediates.
-        store_regs = dict(regs)
-        for op_name, op in op_by_name.items():
-            if op.get("register_kind") == "pointer":
-                store_regs[op_name] = "p7"
-            if op.get("operand_type") == "immediate":
-                store_regs[op_name] = "0"
-
-        asm_line = "  " + _substitute_asm(instr["asm_string"], store_regs,
-                                          has_modifier=_has_modifier_operand(instr))
-        lines.append(asm_line)
+            asm_line = "  " + _substitute_asm(instr["asm_string"], store_regs,
+                                              has_modifier=_has_modifier_operand(instr))
+            lines.append(asm_line)
 
         lines.append("")
         return "\n".join(lines)
