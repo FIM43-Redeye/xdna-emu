@@ -1145,11 +1145,25 @@ impl ExecutionContext {
                 }
             }
             Operand::ControlReg(id) => {
-                // Mask registers q0-q3 are ControlReg(16..19).
-                if *id >= 16 && *id <= 19 {
-                    if let Some(vec) = &pw.vec_value {
+                if let Some(vec) = &pw.vec_value {
+                    if *id >= 16 && *id <= 19 {
+                        // q0-q3: full 128-bit mask write.
                         let q_idx = (*id - 16) as u8;
                         self.mask.write(q_idx, [vec[0], vec[1], vec[2], vec[3]]);
+                    } else if *id >= 28 && *id <= 31 {
+                        // ql0-ql3: write low 64 bits, preserve high 64 bits.
+                        let q_idx = (*id - 28) as u8;
+                        let mut cur = self.mask.read(q_idx);
+                        cur[0] = vec[0];
+                        cur[1] = vec[1];
+                        self.mask.write(q_idx, cur);
+                    } else if *id >= 32 && *id <= 35 {
+                        // qh0-qh3: write high 64 bits, preserve low 64 bits.
+                        let q_idx = (*id - 32) as u8;
+                        let mut cur = self.mask.read(q_idx);
+                        cur[2] = vec[0];
+                        cur[3] = vec[1];
+                        self.mask.write(q_idx, cur);
                     }
                 }
             }

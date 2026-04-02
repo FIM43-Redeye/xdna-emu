@@ -11,8 +11,6 @@
 #   scripts/isa-test.sh [options]
 #
 # Options:
-#   --no-hw          Skip hardware runs (EMU-only, no comparison)
-#   --no-emu         Skip emulator runs (HW-only baseline)
 #   --seed N         PRNG seed (default: 42)
 #   --compile        Force recompilation
 #   -j N             Parallelism for compile + EMU (default: nproc)
@@ -35,8 +33,6 @@ TEST_LIB_DIR="${MLIR_AIE}/build/runtime_lib/x86_64/test_lib"
 XRT_DIR="/opt/xilinx/xrt"
 
 # Defaults
-RUN_HW=true
-RUN_EMU=true
 SEED=42
 FORCE_COMPILE=false
 JOBS=$(nproc)
@@ -46,8 +42,6 @@ MULTI_TILE=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --no-hw)         RUN_HW=false; shift ;;
-        --no-emu)        RUN_EMU=false; shift ;;
         --seed)          SEED="$2"; shift 2 ;;
         --compile)       FORCE_COMPILE=true; shift ;;
         -j)              JOBS="$2"; shift 2 ;;
@@ -360,8 +354,8 @@ if $MULTI_TILE; then
 
     printf '%b' "$PHASE_INFO" | while IFS=' ' read -r pidx batch_list; do
         [[ -z "$pidx" ]] && continue
-        package_phase "$pidx" "$batch_list"
-    done
+        printf '%s\0%s\0' "$pidx" "$batch_list"
+    done | xargs -0 -n2 -P "$JOBS" bash -c 'package_phase "$1" "$2"' _
     echo ""
 
 else
@@ -423,16 +417,15 @@ print(gen.generate_aie_mlir(${in_size}, ${out_size}))
             echo "  PKG OK: batch_${batch_idx}"
         else
             echo "  PKG FAIL: batch_${batch_idx} (see ${batch_dir}/aiecc.log)"
-            echo "FATAL: Packaging failed. Aborting."
-            exit 1
+            return 1
         fi
     }
     export -f package_one
-    export HOST_BIN PROJECT_DIR
+    export HOST_BIN PROJECT_DIR OUT_DIR FORCE_COMPILE
 
     echo "$BATCH_INFO" | while IFS=' ' read -r idx filename in_size out_size source_type; do
-        package_one "$idx" "$filename" "$in_size" "$out_size" "$source_type"
-    done
+        printf '%s\0%s\0%s\0%s\0%s\0' "$idx" "$filename" "$in_size" "$out_size" "$source_type"
+    done | xargs -0 -n5 -P "$JOBS" bash -c 'package_one "$1" "$2" "$3" "$4" "$5"' _
     echo ""
 fi
 
@@ -443,8 +436,7 @@ ln -sfn "$RESULTS_DIR" "${RESULTS_DIR%/*}/latest"
 
 if $MULTI_TILE; then
     # Multi-tile HW execution: one xclbin per phase, serial.
-    if $RUN_HW; then
-        echo "--- Phase 4: Run HW (multi-tile, serial) ---"
+    echo "--- Phase 4: Run HW (multi-tile, serial) ---"
         printf '%b' "$PHASE_INFO" | while IFS=' ' read -r pidx batch_list; do
             [[ -z "$pidx" ]] && continue
             phase_dir="${OUT_DIR}/phase_${pidx}"
@@ -494,11 +486,9 @@ print(total_in, total_out)
             fi
         done
         echo ""
-    fi
 else
     # Single-tile HW execution (original behavior).
-    if $RUN_HW; then
-        echo "--- Phase 4: Run HW (serial) ---"
+    echo "--- Phase 4: Run HW (serial) ---"
         while IFS=' ' read -r idx filename in_size out_size source_type; do
             # Skip pair batches in single-tile mode.
             [[ "$source_type" == "cascade_pair" ]] && continue
@@ -535,14 +525,12 @@ else
                 exit 1
             fi
         done <<< "$BATCH_INFO"
-        echo ""
-    fi
+    echo ""
 fi
 
 # ---- Phase 5: Run EMU ----
 if $MULTI_TILE; then
-    if $RUN_EMU; then
-        echo "--- Phase 5: Run EMU (multi-tile, j=$JOBS) ---"
+    echo "--- Phase 5: Run EMU (multi-tile, j=$JOBS) ---"
 
         run_emu_phase() {
             local pidx="$1"
@@ -593,10 +581,8 @@ print(total_in, total_out)
             printf '%s\0%s\0%s\0%s\0' "$pidx" "$batch_list" "$in_size" "$out_size"
         done | xargs -0 -n4 -P "$JOBS" bash -c 'run_emu_phase "$1" "$2" "$3" "$4"' _
         echo ""
-    fi
 else
-    if $RUN_EMU; then
-        echo "--- Phase 5: Run EMU (j=$JOBS) ---"
+    echo "--- Phase 5: Run EMU (j=$JOBS) ---"
 
         run_emu_one() {
             local idx="$1"
@@ -640,14 +626,12 @@ else
             exit 1
         fi
         echo ""
-    fi
 fi
 
 # ---- Phase 6: Compare ----
 if $MULTI_TILE; then
     # Multi-tile: split combined phase outputs into per-batch files, then compare.
-    if $RUN_HW && $RUN_EMU; then
-        echo "--- Phase 6: Split + Compare ---"
+    echo "--- Phase 6: Split + Compare ---"
 
         # Split all phase outputs into per-batch files.
         printf '%b' "$PHASE_INFO" | while IFS=' ' read -r pidx batch_list; do
@@ -709,13 +693,9 @@ for mode in ['hw', 'emu']:
             echo "Divergences:"
             printf '%b' "$FAIL_LIST"
         fi
-    else
-        echo "=== Comparison skipped (need both HW and EMU) ==="
-    fi
 else
     # Single-tile comparison (original behavior).
-    if $RUN_HW && $RUN_EMU; then
-        echo "--- Phase 6: Compare ---"
+    echo "--- Phase 6: Compare ---"
         PASS=0
         FAIL=0
         SKIP=0
@@ -753,9 +733,6 @@ else
             echo "Divergences:"
             printf '%b' "$FAIL_LIST"
         fi
-    else
-        echo "=== Comparison skipped (need both HW and EMU) ==="
-    fi
 fi
 
 # ---- Phase 7: Test-Point Analysis ----

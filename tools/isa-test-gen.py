@@ -248,7 +248,7 @@ KNOWN_REGISTER_KINDS = frozenset({
     # wide_y: 1024-bit wide vector registers y2-y5 (eYs class).
     # Used as the wide source operand in sparse vector multiply.
     # Each y register is a pair of x registers: y2={x4,x5}, y3={x6,x7}, etc.
-    "wide_y",
+    "wide_y", "vector1024",
     # sparse_qx: 640-bit sparse vector+mask composite registers qx0-qx3.
     # Used as the sparse data source in vmac/vmul/vneg/vsub family.
     # Each qx register combines an x register (512-bit vector) and a q
@@ -447,9 +447,11 @@ REGISTER_SIZES = {
     # quad: 128-byte (1024-bit) quadword vector registers q0-q3.
     # mQQa = AIE2Vector128RegisterClass(add q0, q1, q2, q3) per AIE2GenRegisterInfo.td.
     "quad": 128,
-    # wide_y: 128-byte (1024-bit) wide vector registers y2-y5.
+    # wide_y / vector1024: 128-byte (1024-bit) wide vector registers y2-y5.
     # Each y is a pair of x registers (2 x 64 bytes).
+    # "vector1024" is the ISA JSON name; "wide_y" is the legacy alias.
     "wide_y": 128,
+    "vector1024": 128,
     # sparse_qx: 80-byte (640-bit) sparse vector+mask composite qx0-qx3.
     # 64-byte x component (512-bit vector) + 16-byte q mask (128-bit).
     "sparse_qx": 80,
@@ -922,7 +924,7 @@ def register_names(kind: str, bit_width: int = 0,
 
     # wide_y: 1024-bit wide vector registers y2-y5 (eYs class).
     # Source: AIE2GenRegisterInfo.td -- y2={x4,x5}, y3={x6,x7}, y4={x8,x9}, y5={x10,x11}.
-    if kind == "wide_y":
+    if kind in ("wide_y", "vector1024"):
         return ["y2", "y3", "y4", "y5"]
 
     # sparse_qx: 640-bit sparse vector+mask composite registers qx0-qx3 (mQQXw class).
@@ -1186,7 +1188,7 @@ def _load_instruction(reg_name: str, kind: str, ptr: str, offset: int) -> list[s
         return _padda_sequence("p6", ptr, offset) + [
             f"  lda {reg_name}, [p6, #0]",
         ]
-    if kind == "wide_y":
+    if kind in ("wide_y", "vector1024"):
         # 1024-bit wide vector registers y2-y5 (eYs class).
         # Each y register is a pair of x registers: y2={x4,x5}, y3={x6,x7}, etc.
         # Load by filling all 4 vector256 halves: wl{lo}, wh{lo}, wl{hi}, wh{hi}.
@@ -1512,7 +1514,7 @@ def generate_test_point(
             continue
         # Align offset for this operand's natural alignment.
         align = 32 if kind in ("vector256", "vector512", "accumulator",
-                                "wide_y", "sparse_qx", "quad") else 4
+                                "wide_y", "vector1024", "sparse_qx", "quad") else 4
         cur_in_offset = _align(cur_in_offset, align)
         reg = regs.get(op_name, "r0")
         load_lines = _load_instruction(reg, kind, "p0", cur_in_offset)
@@ -1616,7 +1618,7 @@ def generate_test_point(
         kind = _effective_kind(op) or op.get("register_kind", "")
         # Align offset for this operand's natural alignment.
         align = 32 if kind in ("vector256", "vector512", "accumulator",
-                                "wide_y", "sparse_qx", "quad") else 4
+                                "wide_y", "vector1024", "sparse_qx", "quad") else 4
         cur_out_offset = _align(cur_out_offset, align)
         reg = regs.get(op["name"], "r0")
         store_lines = _store_instruction(reg, kind, "p1", cur_out_offset)
@@ -4431,7 +4433,7 @@ class AccumArithStrategy(TestStrategy):
             if op_name == "c":
                 continue  # Config set via mov, not loaded from buffer.
             align = 32 if kind in ("vector256", "vector512", "accumulator",
-                                    "wide_y", "sparse_qx", "quad") else 4
+                                    "wide_y", "vector1024", "sparse_qx", "quad") else 4
             cur_in_offset = _align(cur_in_offset, align)
             reg = regs.get(op_name, "r0")
             load_lines = _load_instruction(reg, kind, "p0", cur_in_offset)
@@ -4461,7 +4463,7 @@ class AccumArithStrategy(TestStrategy):
         for op in outputs:
             kind = _effective_kind(op) or op.get("register_kind", "")
             align = 32 if kind in ("vector256", "vector512", "accumulator",
-                                    "wide_y", "sparse_qx", "quad") else 4
+                                    "wide_y", "vector1024", "sparse_qx", "quad") else 4
             cur_out_offset = _align(cur_out_offset, align)
             reg = regs.get(op["name"], "r0")
             store_lines = _store_instruction(reg, kind, "p1", cur_out_offset)
@@ -4493,7 +4495,7 @@ class AccumArithStrategy(TestStrategy):
             if not kind or kind not in KNOWN_REGISTER_KINDS:
                 continue
             align = 32 if kind in ("vector256", "vector512", "accumulator",
-                                    "wide_y", "sparse_qx", "quad") else 4
+                                    "wide_y", "vector1024", "sparse_qx", "quad") else 4
             total = _align(total, align)
             total += _operand_size(op, instr_name)
         return max(4, total)
@@ -4622,7 +4624,7 @@ class VmacStrategy(TestStrategy):
             if op_name == "c":
                 continue
             align = 32 if kind in ("vector256", "vector512", "accumulator",
-                                    "wide_y", "sparse_qx", "quad") else 4
+                                    "wide_y", "vector1024", "sparse_qx", "quad") else 4
             cur_in_offset = _align(cur_in_offset, align)
             reg = regs.get(op_name, "r0")
             load_lines = _load_instruction(reg, kind, "p0", cur_in_offset)
@@ -4657,7 +4659,7 @@ class VmacStrategy(TestStrategy):
         for op in outputs:
             kind = _effective_kind(op) or op.get("register_kind", "")
             align = 32 if kind in ("vector256", "vector512", "accumulator",
-                                    "wide_y", "sparse_qx", "quad") else 4
+                                    "wide_y", "vector1024", "sparse_qx", "quad") else 4
             cur_out_offset = _align(cur_out_offset, align)
             reg = regs.get(op["name"], "r0")
             store_lines = _store_instruction(reg, kind, "p1", cur_out_offset)
@@ -4689,7 +4691,7 @@ class VmacStrategy(TestStrategy):
             if not kind or kind not in KNOWN_REGISTER_KINDS:
                 continue
             align = 32 if kind in ("vector256", "vector512", "accumulator",
-                                    "wide_y", "sparse_qx", "quad") else 4
+                                    "wide_y", "vector1024", "sparse_qx", "quad") else 4
             total = _align(total, align)
             total += _operand_size(op, instr_name)
         return max(4, total)
@@ -4786,7 +4788,7 @@ def _compute_input_size(instr: dict, regs: dict[str, str]) -> int:
         if kind not in KNOWN_REGISTER_KINDS:
             continue
         align = 32 if kind in ("vector256", "vector512", "accumulator",
-                                "wide_y", "sparse_qx", "quad") else 4
+                                "wide_y", "vector1024", "sparse_qx", "quad") else 4
         total = _align(total, align)
         total += _operand_size(op, instr_name)
     # Implicit registers loaded from input (4 bytes each).
@@ -4810,7 +4812,7 @@ def _compute_output_size(instr: dict) -> int:
         # Use effective kind so testable composite kinds are sized correctly.
         kind = _effective_kind(op) or op.get("register_kind", "")
         align = 32 if kind in ("vector256", "vector512", "accumulator",
-                                "wide_y", "sparse_qx", "quad") else 4
+                                "wide_y", "vector1024", "sparse_qx", "quad") else 4
         total = _align(total, align)
         total += _operand_size(op, instr_name)
     return max(4, total)

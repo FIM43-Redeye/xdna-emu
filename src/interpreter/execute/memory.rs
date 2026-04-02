@@ -1072,10 +1072,22 @@ impl MemoryUnit {
                     return Some(result);
                 }
                 Operand::ControlReg(id) if *id >= 16 && *id <= 19 => {
-                    // q0-q3 mask registers: 128-bit, stored in [u32; 4].
+                    // q0-q3 mask registers: full 128-bit read.
                     let q_idx = (*id - 16) as u8;
                     let mask = ctx.mask.read(q_idx);
                     return Some([mask[0], mask[1], mask[2], mask[3], 0, 0, 0, 0]);
+                }
+                Operand::ControlReg(id) if *id >= 28 && *id <= 31 => {
+                    // ql0-ql3: low 64 bits of mask register.
+                    let q_idx = (*id - 28) as u8;
+                    let mask = ctx.mask.read(q_idx);
+                    return Some([mask[0], mask[1], 0, 0, 0, 0, 0, 0]);
+                }
+                Operand::ControlReg(id) if *id >= 32 && *id <= 35 => {
+                    // qh0-qh3: high 64 bits of mask register.
+                    let q_idx = (*id - 32) as u8;
+                    let mask = ctx.mask.read(q_idx);
+                    return Some([mask[2], mask[3], 0, 0, 0, 0, 0, 0]);
                 }
                 _ => {}
             }

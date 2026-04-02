@@ -292,13 +292,15 @@ pub fn classify_operand_type(reg_class: &str, field_name: &str) -> OperandType {
     {
         return OperandType::Register(RegisterKind::Accumulator);
     }
+    // mQQX*, mQX*: sparse composite registers qx0-qx3 (vector data + mask).
+    // Must be checked BEFORE mQQ (accumulator weight queue) since mQQXw
+    // starts with mQQ but is NOT an accumulator.
+    if reg_class.starts_with("mQQX") || reg_class.starts_with("mQX") {
+        return OperandType::Register(RegisterKind::SparseQx);
+    }
     // mQQm (weight queue) -- treat as accumulator for emulator purposes
     if reg_class.starts_with("mQQ") {
         return OperandType::Register(RegisterKind::Accumulator);
-    }
-    // mQX*: sparse composite registers qx0-qx3 (vector data x_n + mask q_n)
-    if reg_class.starts_with("mQX") {
-        return OperandType::Register(RegisterKind::SparseQx);
     }
 
     // 3. Lock ID fields: always unsigned, regardless of reg_class.
@@ -368,9 +370,22 @@ fn extract_scale_suffix(s: &str) -> i32 {
 }
 
 /// Classify operand type purely from the field name (last resort fallback).
+///
+/// Some TableGen definitions (especially FixupInstrInfo patterns) use raw
+/// `bits<N>` fields without associating a register class in the DAG. The
+/// field name itself carries enough information to classify the operand.
 fn classify_from_field_name(field_name: &str) -> OperandType {
     if field_name == "id" || field_name == "mLockId" {
         return OperandType::LockId;
+    }
+    // Sparse MAC operands: ys1 = 1024-bit y-register, qxs2 = sparse composite.
+    // These appear as raw bits<2> fields in vmac_*_sparse_wide definitions
+    // without a register class binding.
+    if field_name == "ys1" {
+        return OperandType::Register(RegisterKind::Vector1024);
+    }
+    if field_name == "qxs2" {
+        return OperandType::Register(RegisterKind::SparseQx);
     }
     // Constant fields: c5s, c11s (signed), c5u, c6u (unsigned)
     if field_name.len() >= 3 && field_name.starts_with('c') {

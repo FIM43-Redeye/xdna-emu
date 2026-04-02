@@ -289,6 +289,24 @@ pub(super) fn write_operand(operand: &Operand, ctx: &mut ExecutionContext, value
                     ctx.mask.write_u32_low(q_idx, value);
                     log::trace!("q{} = 0x{:08X} (scalar write)", q_idx, value);
                 }
+                // ql0-ql3: ControlReg(28..31). Scalar write to low word
+                // of low 64-bit half (preserves rest).
+                28..=31 => {
+                    let q_idx = (id - 28) as u8;
+                    let mut cur = ctx.mask.read(q_idx);
+                    cur[0] = value;
+                    ctx.mask.write(q_idx, cur);
+                    log::trace!("ql{} low word = 0x{:08X} (scalar write)", q_idx, value);
+                }
+                // qh0-qh3: ControlReg(32..35). Scalar write to low word
+                // of high 64-bit half (preserves rest).
+                32..=35 => {
+                    let q_idx = (id - 32) as u8;
+                    let mut cur = ctx.mask.read(q_idx);
+                    cur[2] = value;
+                    ctx.mask.write(q_idx, cur);
+                    log::trace!("qh{} low word = 0x{:08X} (scalar write)", q_idx, value);
+                }
                 _ => {
                     log::trace!("control register write: id={}, value=0x{:X}", id, value);
                 }

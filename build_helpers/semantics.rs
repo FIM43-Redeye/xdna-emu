@@ -91,14 +91,24 @@ pub fn classify_operand_type(reg_class: &str, field_name: &str) -> String {
     if reg_class.starts_with("mX") || reg_class.starts_with("eX") {
         return "OperandType::Register(RegisterKind::Vector512)".to_string();
     }
-    // Accumulator register subclasses (eAM*, mAMm*, eBM*, mBMm*, eCM*, mBMS*, mQQ*, mQX*)
+    // 1024-bit vector register subclasses (eYs = y-registers y2-y5).
+    // Used by sparse MAC wide variants for the dense A operand (ys1).
+    if reg_class.starts_with("eY") {
+        return "OperandType::Register(RegisterKind::Vector1024)".to_string();
+    }
+    // mQQX*: sparse composite registers qx0-qx3 (vector data + sparsity mask).
+    // Must be checked BEFORE mQQ (accumulator weight queue) since mQQXw
+    // starts with mQQ but is NOT an accumulator.
+    if reg_class.starts_with("mQQX") || reg_class.starts_with("mQX") {
+        return "OperandType::Register(RegisterKind::SparseQx)".to_string();
+    }
+    // Accumulator register subclasses (eAM*, mAMm*, eBM*, mBMm*, eCM*, mBMS*, mQQ*)
     if reg_class.starts_with("eAM")
         || reg_class.starts_with("mAM")
         || reg_class.starts_with("eBM")
         || reg_class.starts_with("mBM")
         || reg_class.starts_with("eCM")
         || reg_class.starts_with("mQQ")
-        || reg_class.starts_with("mQX")
     {
         return "OperandType::Register(RegisterKind::Accumulator)".to_string();
     }
@@ -180,9 +190,22 @@ fn extract_scale_suffix(s: &str) -> i32 {
 }
 
 /// Classify operand type from field name alone (last resort).
+///
+/// Some TableGen definitions (especially FixupInstrInfo patterns) use raw
+/// `bits<N>` fields without associating a register class in the DAG. The
+/// field name itself carries enough information to classify the operand.
 fn classify_from_field_name(field_name: &str) -> String {
     if field_name == "id" || field_name == "mLockId" {
         return "OperandType::LockId".to_string();
+    }
+    // Sparse MAC operands: ys1 = 1024-bit y-register, qxs2 = sparse composite.
+    // These appear as raw bits<2> fields in vmac_*_sparse_wide definitions
+    // without a register class binding.
+    if field_name == "ys1" {
+        return "OperandType::Register(RegisterKind::Vector1024)".to_string();
+    }
+    if field_name == "qxs2" {
+        return "OperandType::Register(RegisterKind::SparseQx)".to_string();
     }
     if field_name.len() >= 3 && field_name.starts_with('c') {
         let bytes = field_name.as_bytes();

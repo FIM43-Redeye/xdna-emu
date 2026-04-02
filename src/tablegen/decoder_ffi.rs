@@ -556,14 +556,16 @@ pub fn classify_reg_name(name: &str) -> Option<MappedOperand> {
 
         // Mask registers: q0-q3 (128-bit), qx0-qx3 (640-bit).
         // Used as explicit operands in sparse vector loads (VLDB_SPARSE_POP).
-        // Map to ControlReg in a dedicated mask range (indices 16-31).
-        //   q0-q3:    ControlReg(16..19)   -- 128-bit mask
-        //   ql0-ql3:  ControlReg(16..19)   -- low 64-bit of q
-        //   qh0-qh3:  ControlReg(16..19)   -- high 64-bit of q
+        // Map to ControlReg in a dedicated mask range (indices 16-35).
+        //   q0-q3:    ControlReg(16..19)   -- 128-bit mask (full)
+        //   ql0-ql3:  ControlReg(28..31)   -- low 64-bit of q
+        //   qh0-qh3:  ControlReg(32..35)   -- high 64-bit of q
         //   qwl0-qwl3: ControlReg(20..23)  -- 256-bit wide mask low
         //   qwh0-qwh3: ControlReg(24..27)  -- 256-bit wide mask high
         //   qx0-qx3:   SparseQxReg(0..3)   -- sparse composite (x_n + q_n)
-        "q" | "ql" | "qh" => Some(simple(Operand::ControlReg(16 + idx))),
+        "q" => Some(simple(Operand::ControlReg(16 + idx))),
+        "ql" => Some(simple(Operand::ControlReg(28 + idx))),
+        "qh" => Some(simple(Operand::ControlReg(32 + idx))),
         "qwl" => Some(simple(Operand::ControlReg(20 + idx))),
         "qwh" => Some(simple(Operand::ControlReg(24 + idx))),
         "qx" => Some(simple(Operand::SparseQxReg(idx))),
