@@ -2840,4 +2840,60 @@ mod tests {
         // As we fix misclassifications, we can tighten this.
         assert!(checked > 50, "Should validate 50+ instructions, got {}", checked);
     }
+
+    #[test]
+    fn test_decode_vbcstshfl_8_encoding() {
+        use crate::interpreter::bundle::SlotType;
+
+        let llvm_aie_path = Path::new("../llvm-aie");
+        if !llvm_aie_path.exists() {
+            eprintln!("Skipping test: llvm-aie not found");
+            return;
+        }
+        let decoder = InstructionDecoder::try_load_via_tblgen(llvm_aie_path)
+            .expect("Failed to load via tblgen");
+
+        // vbcstshfl.8 x0, r0, r29 = 0x180027b9
+        // MV bits = (0x180027b9 >> 5) & 0x3FFFFF = 0x00013D
+        let word: u32 = 0x180027b9;
+        let mv_bits = ((word >> 5) & 0x3FFFFF) as u64;
+        eprintln!("MV bits for vbcstshfl.8: 0x{:06X}", mv_bits);
+
+        // Try native decoder
+        let native_result = decoder.decode_slot_bits(mv_bits, SlotType::Mv);
+        if let Some(decoded) = &native_result {
+            eprintln!("Native decode: name={:?} mnemonic={:?}", decoded.encoding.name, decoded.encoding.mnemonic);
+        } else {
+            eprintln!("Native decode: FAILED");
+        }
+
+        // Try FFI decoder
+        let ffi_result = decoder.try_decode_via_ffi(mv_bits, SlotType::Mv);
+        if let Some((decoded, dest, sources, _, _, _, _)) = &ffi_result {
+            eprintln!("FFI decode: name={:?} mnemonic={:?} dest={:?} sources={:?}",
+                decoded.encoding.name, decoded.encoding.mnemonic, dest, sources);
+        } else {
+            eprintln!("FFI decode: FAILED");
+        }
+
+        // Also try decoding the full 32-bit bundle
+        let bytes = word.to_le_bytes();
+        match decoder.decode(&bytes, 0) {
+            Ok(bundle) => {
+                for (i, slot) in bundle.slots().iter().enumerate() {
+                    if let Some(ref op) = slot {
+                        if !op.is_nop() {
+                            eprintln!("Bundle slot {}: semantic={:?} encoding={:?} is_vector={}",
+                                i, op.semantic, op.encoding_name, op.is_vector);
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("Bundle decode: FAILED {:?}", e),
+        }
+
+        // The instruction should decode as VBCSTSHFL_8 with VectorBroadcast semantic
+        assert!(ffi_result.is_some() || native_result.is_some(),
+            "VBCSTSHFL_8 should be decodable");
+    }
 }

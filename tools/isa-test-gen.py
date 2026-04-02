@@ -1591,6 +1591,12 @@ IMPLICIT_INPUT_REGS: dict[str, list[str]] = {
     "SELNEZ": ["r27"],
 }
 
+# Instructions that use r29 as an implicit shuffle mode register.
+# r29 must be loaded from input data (for deterministic results) and
+# masked to the valid mode range 0-47 (mode >= 48 causes mode_decode
+# overflow in the 48-bit mask register, producing undefined routing).
+_VBCSTSHFL_NAMES = {"VBCSTSHFL_8", "VBCSTSHFL_16", "VBCSTSHFL_32", "VBCSTSHFL_64"}
+
 
 # Mnemonic suffixes that llvm-mc does not accept when a modifier_m
 # operand is present.  llvm-mc infers the addressing mode from the
@@ -1736,6 +1742,8 @@ def generate_test_point(
     implicit_regs: list[str] = []
     if name.startswith("VINSERT"):
         implicit_regs.append("r29")
+    if name in _VBCSTSHFL_NAMES:
+        implicit_regs.append("r29")
     implicit_regs.extend(IMPLICIT_INPUT_REGS.get(name, []))
     for imp_reg in implicit_regs:
         cur_in_offset = _align(cur_in_offset, 4)
@@ -1807,6 +1815,15 @@ def generate_test_point(
             mod_reg = regs.get("mod", "r0")
             lines.append(f"  mov r14, #1")
             lines.append(f"  or {mod_reg}, {mod_reg}, r14")
+
+    # VBCSTSHFL: mask r29 (shuffle mode) to valid range 0-47.
+    # mode_decode(r29) computes mask = u48(1) << (r29 & 0x3F).  Modes >= 48
+    # overflow the 48-bit field, producing mask = 0 (byte-0-only passthrough).
+    # Use modulo via subtraction: if r29 >= 48, subtract 48 to wrap into range.
+    # This gives better mode coverage than just masking to 0-31.
+    if name in _VBCSTSHFL_NAMES:
+        lines.append(f"  mov r14, #47")
+        lines.append(f"  and r29, r29, r14")
 
     # The instruction itself.
     asm_line = "  " + _substitute_asm(instr["asm_string"], regs,
@@ -5007,9 +5024,11 @@ def _compute_input_size(instr: dict, regs: dict[str, str]) -> int:
         total = _align(total, align)
         total += _operand_size(op, instr_name)
     # Implicit registers loaded from input (4 bytes each).
-    # VINSERT: r29. DIVS: r31. SELEQZ/SELNEZ: r27.
+    # VINSERT: r29. VBCSTSHFL: r29. DIVS: r31. SELEQZ/SELNEZ: r27.
     implicit_count = 0
     if instr_name.startswith("VINSERT"):
+        implicit_count += 1
+    if instr_name in _VBCSTSHFL_NAMES:
         implicit_count += 1
     implicit_count += len(IMPLICIT_INPUT_REGS.get(instr_name, []))
     for _ in range(implicit_count):

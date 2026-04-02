@@ -314,10 +314,17 @@ if $MULTI_TILE; then
 
         # Skip if already packaged (unless --compile).
         if ! $FORCE_COMPILE && [[ -f "${phase_dir}/aie.xclbin" ]] && [[ -f "${phase_dir}/insts.bin" ]]; then
-            # Check if any .o is newer than the xclbin by scanning phase dir.
+            # Check if any SOURCE .o (in OUT_DIR) is newer than the phase copy.
+            # This catches cases where the test generator changes batch composition.
             local stale=false
             for ofile in "${phase_dir}"/*.o; do
                 [[ -f "$ofile" ]] || continue
+                local basename=$(basename "$ofile")
+                local src_o="${OUT_DIR}/${basename}"
+                if [[ -f "$src_o" ]] && [[ "$src_o" -nt "$ofile" ]]; then
+                    stale=true
+                    break
+                fi
                 if [[ "$ofile" -nt "${phase_dir}/aie.xclbin" ]]; then
                     stale=true
                     break
@@ -326,7 +333,7 @@ if $MULTI_TILE; then
             if ! $stale; then
                 return 0
             fi
-            echo "  STALE phase_${pidx}: .o newer than xclbin, repackaging"
+            echo "  STALE phase_${pidx}: source .o newer than phase copy, repackaging"
         fi
 
         mkdir -p "$phase_dir"

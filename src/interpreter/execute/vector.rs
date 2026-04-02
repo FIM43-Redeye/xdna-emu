@@ -3940,6 +3940,12 @@ impl VectorAlu {
                         // Per aietools ISG (me_inline_primitives.h):
                         // VBCSTSHFL = s2v_interleave_sw(broadcast, ZEROS, r29)
                         // i.e., shuffle_vectors(broadcast, zeros, mode=r29)
+                        //
+                        // mode_decode: mask = u48(1) << (r29 & 0x3F)
+                        // When mode >= 48, the shift exceeds the 48-bit field width
+                        // and the hardware produces mask = 0 (no routing bits set).
+                        // With mask = 0, the crossbar passes byte 0 through and
+                        // zeros the remaining 63 bytes.
                         let r29 = ctx.scalar.read(29);
                         let mode_idx = (r29 & 0x3F) as u8;
 
@@ -3956,8 +3962,15 @@ impl VectorAlu {
                                     shuffled[i * 4 + 2], shuffled[i * 4 + 3],
                                 ]);
                             }
+                        } else {
+                            // mode >= 48: mode_decode overflows the 48-bit mask,
+                            // producing mask = 0. The crossbar with no routing
+                            // bits passes only byte 0 of the lo input; everything
+                            // else is zero. Convert the broadcast to [byte0, 0..].
+                            let byte0 = result[0] as u8;
+                            result = [0u32; 16];
+                            result[0] = byte0 as u32;
                         }
-                        // mode > 47: no valid shuffle, keep broadcast result
                     }
 
                     Self::write_wide_vec_dest(op, ctx, result);
