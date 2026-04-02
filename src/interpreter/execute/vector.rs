@@ -56,13 +56,17 @@ impl VectorAlu {
             return false;
         }
 
-        // Skip fused ops on memory slots -- MemoryUnit handles these.
+        // Skip fused ops that have memory operands -- MemoryUnit handles these.
         // Fused instructions (vlda.ups, vst.srs, vst.pack, vlda.conv, vst.conv)
-        // are encoded in load/store VLIW slots and need memory access that
-        // VectorAlu cannot provide.
+        // combine memory access with compute and need tile access.
+        //
+        // Standalone SRS/Pack/UPS (e.g., VSRS in the ST slot, VUPS in the LDA
+        // slot) are also on memory slots but have NO memory operand -- they
+        // operate purely on registers and must be handled here.
         if op.slot.is_memory() && matches!(semantic,
             SemanticOp::Ups | SemanticOp::Srs | SemanticOp::Pack
             | SemanticOp::Unpack | SemanticOp::Convert)
+            && op.sources.iter().any(|s| matches!(s, Operand::Memory { .. }))
         {
             return false;
         }

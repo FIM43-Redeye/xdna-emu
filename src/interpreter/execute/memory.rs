@@ -284,33 +284,38 @@ impl MemoryUnit {
 
             // ========== Fused load+compute operations ==========
 
-            Some(SemanticOp::Ups) => {
+            Some(SemanticOp::Ups) if Self::has_memory_operand(op) => {
                 // vlda.ups: load from memory, upshift to accumulator
                 Self::execute_fused_load_ups(op, ctx, tile, pm);
                 true
             }
 
-            Some(SemanticOp::Convert) if Self::is_load_slot(op) => {
+            Some(SemanticOp::Convert) if Self::is_load_slot(op) && Self::has_memory_operand(op) => {
                 // vlda.conv: load from memory, convert (e.g., bf16 -> f32)
                 Self::execute_fused_load_convert(op, ctx, tile, pm);
                 true
             }
 
             // ========== Fused compute+store operations ==========
+            //
+            // Only handle these if the instruction has a memory address operand.
+            // Standalone SRS/Pack/Convert (e.g., VSRS in the ST slot) have no
+            // memory operand -- they write to a register, not memory. VectorAlu
+            // handles those.
 
-            Some(SemanticOp::Srs) => {
+            Some(SemanticOp::Srs) if Self::has_memory_operand(op) => {
                 // vst.srs: shift-round-saturate accumulator, store to memory
                 Self::execute_fused_store_srs(op, ctx, tile, pm, neighbors);
                 true
             }
 
-            Some(SemanticOp::Pack) => {
+            Some(SemanticOp::Pack) if Self::has_memory_operand(op) => {
                 // vst.pack: pack vector, store narrowed data to memory
                 Self::execute_fused_store_pack(op, ctx, tile, pm, neighbors);
                 true
             }
 
-            Some(SemanticOp::Convert) => {
+            Some(SemanticOp::Convert) if Self::has_memory_operand(op) => {
                 // vst.conv: convert (e.g., f32 -> bf16), store to memory
                 Self::execute_fused_store_convert(op, ctx, tile, pm, neighbors);
                 true
@@ -771,6 +776,12 @@ impl MemoryUnit {
     }
 
     // ========== Fused instruction helpers ==========
+
+    /// Check if the op has a memory address operand (Memory { base, offset }).
+    /// Fused instructions have this; standalone SRS/Pack/UPS on memory slots don't.
+    fn has_memory_operand(op: &SlotOp) -> bool {
+        op.sources.iter().any(|s| matches!(s, Operand::Memory { .. }))
+    }
 
     /// Check if the op is on a load slot (LoadA or LoadB).
     fn is_load_slot(op: &SlotOp) -> bool {
