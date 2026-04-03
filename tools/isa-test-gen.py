@@ -1825,6 +1825,13 @@ def generate_test_point(
         lines.append(f"  mov r14, #47")
         lines.append(f"  and r29, r29, r14")
 
+    # SBC/ADDC: clear carry flag to a known state before the instruction.
+    # The carry flag is set by the previous test's arithmetic, which may
+    # differ between HW and EMU if any prior instruction has a carry bug.
+    # sub r14, r14, r14 sets carry=0 (no borrow: a-a=0).
+    if name in ("SBC", "ADDC"):
+        lines.append(f"  sub r14, r14, r14")
+
     # The instruction itself.
     asm_line = "  " + _substitute_asm(instr["asm_string"], regs,
                                       has_modifier=_has_modifier_operand(instr))
