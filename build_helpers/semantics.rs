@@ -406,7 +406,7 @@ pub fn infer_dual_element_types(name: &str) -> (Option<String>, Option<String>) 
 
     // Pattern 1: V{SRS|UPS|FLOOR}_{OUT}_{IN}_*
     // VFLOOR uses the same convention as SRS/UPS: {OUT}_{IN}.
-    if parts.len() >= 3 && (parts[0] == "VSRS" || parts[0] == "VUPS" || parts[0] == "VFLOOR") {
+    if parts.len() >= 3 && (parts[0] == "VSRS" || parts[0] == "VSRSM" || parts[0] == "VUPS" || parts[0] == "VFLOOR") {
         if let (Some(out_type), Some(in_type)) =
             (parse_type_token_str(parts[1]), parse_type_token_str(parts[2]))
         {

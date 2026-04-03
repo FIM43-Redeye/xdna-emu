@@ -4001,14 +4001,26 @@ impl VectorAlu {
             }
 
             SemanticOp::Align => {
-                // VSHIFT_ALIGN: concatenate s1:s2, extract 512 bits at byte offset.
-                // Sources: [s1 (Vec512), pre (Scalar), s2 (Vec512), shift (Scalar)].
-                // The `pre` value adds a 16-byte-aligned pre-shift, and `shift`
-                // gives the remaining byte offset within that window.
+                // Concatenate s1:s2, extract 512 bits at byte offset.
+                //
+                // VSHIFT:       sources = [s1 (Vec512), s2 (Vec512), shift (Scalar)]
+                // VSHIFT_ALIGN: sources = [s1 (Vec512), pre (Scalar), s2 (Vec512), shift (Scalar)]
+                //
+                // Both forms: byte shift = last scalar source (r-register).
+                // VSHIFT_ALIGN also has a "pre" s-register operand
+                // whose exact effect on the shift calculation is not
+                // yet understood -- currently ignored (1/17 passing).
                 let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                let pre = Self::get_nth_scalar_source(op, ctx, 0);
-                let shift = Self::get_nth_scalar_source(op, ctx, 1);
-                let total_shift = (pre & 0x3) * 16 + shift;
+
+                let n_scalars = op.sources.iter().filter(|s| {
+                    matches!(s, Operand::ScalarReg(_) | Operand::Immediate(_))
+                }).count();
+                let total_shift = if n_scalars >= 2 {
+                    Self::get_nth_scalar_source(op, ctx, 1)
+                } else {
+                    Self::get_nth_scalar_source(op, ctx, 0)
+                };
+
                 let result = Self::wide_vector_align(&a, &b, total_shift);
                 Self::write_wide_vec_dest(op, ctx, result);
                 true
