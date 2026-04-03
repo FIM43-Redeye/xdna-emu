@@ -3542,11 +3542,13 @@ impl VectorAlu {
                 let elems_per_half = 256 / et.bits() as u32;
                 let sel_lo = Self::expand_select_mask(sel_scalar, et);
                 let sel_hi_bits = if elems_per_half >= 32 {
-                    // 8-bit: second register of pair
-                    op.sources.iter().filter_map(|s| match s {
-                        Operand::ScalarReg(r) => Some(ctx.scalar.read(*r)),
+                    // 8-bit elements: 64-bit mask from register pair.
+                    // The operand decodes as a single ScalarReg (low reg
+                    // of the pair). Read r+1 for the high 32 bits.
+                    op.sources.iter().find_map(|s| match s {
+                        Operand::ScalarReg(r) => Some(ctx.scalar.read(r + 1)),
                         _ => None,
-                    }).nth(1).unwrap_or(0)
+                    }).unwrap_or(0)
                 } else {
                     sel_scalar >> elems_per_half
                 };
