@@ -80,11 +80,12 @@ impl VectorAlu {
         // 1. is_wide_vector: instruction has Vector512 operands (x-registers)
         // 2. AccumReg-only ops (VADD, VSUB, VNEG) that use cm-class (Full)
         //    accumulators -- these need wide read/write.
-        // 3. Wide accumulator source: SRS/UPS/Convert with cm-class source
-        //    (AccumWidth::Full) need the wide path even though they write to
-        //    a vector register, not an accumulator.
+        // 3. Accumulator source: SRS/UPS/Convert with accumulator source
+        //    need the wide path because execute_half only reads VectorReg
+        //    sources. Both Half (bml/bmh) and Full (cm) accumulators route here.
         let has_wide_acc_source = matches!(op.accum_width,
-            Some(crate::tablegen::decoder_ffi::AccumWidth::Full));
+            Some(crate::tablegen::decoder_ffi::AccumWidth::Full)
+            | Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
         let is_accum_only = matches!(semantic,
             SemanticOp::Accumulate | SemanticOp::AccumSub
             | SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub
@@ -3258,11 +3259,11 @@ impl VectorAlu {
 
         match elem_type {
             ElementType::Int32 | ElementType::Int64 => {
-                // Signed: wrapping subtraction, then clamp negative to 0 (HW-verified).
+                // Signed: widen to i64 to avoid overflow, then clamp to [0, u32::MAX].
+                // wrapping_sub at i32 width loses the true sign of large differences.
                 for i in 0..8 {
-                    let va = a[i] as i32;
-                    let vb = b[i] as i32;
-                    result[i] = va.wrapping_sub(vb).max(0) as u32;
+                    let diff = (a[i] as i32 as i64) - (b[i] as i32 as i64);
+                    result[i] = diff.max(0) as u32;
                 }
             }
             ElementType::UInt32 | ElementType::UInt64 => {
@@ -3278,14 +3279,14 @@ impl VectorAlu {
                 }
             }
             ElementType::Int16 => {
-                // Signed: wrapping subtraction, then clamp negative to 0 (HW-verified).
+                // Signed: widen to i32 to avoid overflow, then clamp to [0, u16::MAX].
                 for i in 0..8 {
-                    let a_lo = (a[i] & 0xFFFF) as i16;
-                    let a_hi = ((a[i] >> 16) & 0xFFFF) as i16;
-                    let b_lo = (b[i] & 0xFFFF) as i16;
-                    let b_hi = ((b[i] >> 16) & 0xFFFF) as i16;
-                    let r_lo = a_lo.wrapping_sub(b_lo).max(0) as u16;
-                    let r_hi = a_hi.wrapping_sub(b_hi).max(0) as u16;
+                    let a_lo = (a[i] & 0xFFFF) as i16 as i32;
+                    let a_hi = ((a[i] >> 16) & 0xFFFF) as i16 as i32;
+                    let b_lo = (b[i] & 0xFFFF) as i16 as i32;
+                    let b_hi = ((b[i] >> 16) & 0xFFFF) as i16 as i32;
+                    let r_lo = (a_lo - b_lo).max(0) as u16;
+                    let r_hi = (a_hi - b_hi).max(0) as u16;
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -3312,13 +3313,13 @@ impl VectorAlu {
                 }
             }
             ElementType::Int8 => {
-                // Signed: wrapping subtraction, then clamp negative to 0 (HW-verified).
+                // Signed: widen to i16 to avoid overflow, then clamp to [0, u8::MAX].
                 for i in 0..8 {
                     let mut r = 0u32;
                     for j in 0..4 {
-                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as i8;
-                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as i8;
-                        let r_byte = a_byte.wrapping_sub(b_byte).max(0) as u8;
+                        let a_byte = ((a[i] >> (j * 8)) & 0xFF) as i8 as i16;
+                        let b_byte = ((b[i] >> (j * 8)) & 0xFF) as i8 as i16;
+                        let r_byte = (a_byte - b_byte).max(0) as u8;
                         r |= (r_byte as u32) << (j * 8);
                     }
                     result[i] = r;
@@ -3338,6 +3339,38 @@ impl VectorAlu {
             }
         }
 
+        result
+    }
+
+    /// VFLOOR: BF16 -> S32 with shift scaling.
+    ///
+    /// Converts 8 packed BF16 values (from 4 u32 words in `src[0..4]`) to 8 i32:
+    ///   result[i] = saturate_s32(floor(bf16_value * 2^shift))
+    ///
+    /// The shift parameter comes from a scalar register operand.
+    /// Hardware uses the low 6 bits as a signed value (range -32 to +31).
+    fn vector_floor_bf16_to_s32(src: &[u32; 8], shift: i32) -> [u32; 8] {
+        use super::vector_float::fp32_flush_to_zero;
+        let mut result = [0u32; 8];
+        // Hardware interprets shift as signed 6-bit (-32 to +31).
+        let masked = (shift & 0x3F) as i8;
+        let effective_shift = if masked >= 32 { masked - 64 } else { masked } as i32;
+        let scale = (2.0f64).powi(effective_shift);
+        for i in 0..8 {
+            let bf16 = (src[i / 2] >> ((i % 2) * 16)) as u16;
+            let f = f32::from_bits(fp32_flush_to_zero(Self::bf16_to_f32(bf16).to_bits()));
+            // Hardware saturates NaN to INT_MAX (positive saturation).
+            if f.is_nan() {
+                result[i] = i32::MAX as u32;
+                continue;
+            }
+            // Scale then floor, using f64 for intermediate precision.
+            let scaled = (f as f64) * scale;
+            let floored = scaled.floor();
+            // Saturate to i32 range.
+            let clamped = floored.clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+            result[i] = clamped as u32;
+        }
         result
     }
 
@@ -4210,21 +4243,67 @@ impl VectorAlu {
                 //    extract lower 32 bits per lane as the input vector.
                 // B. Narrow vector source (VFLOOR bf16->s32): 256-bit in, 512-bit out.
                 // C. Wide vector source: 512-bit in, 512-bit out.
+                //
+                // VFLOOR has a shift operand (scalar register) that scales:
+                //   result[i] = saturate_s32(floor(bf16_value * 2^shift))
                 let from = op.from_type.unwrap_or(ElementType::Int32);
+
+                // Extract shift from scalar source (VFLOOR only).
+                let shift_val: Option<i32> = op.sources.iter().find_map(|s| {
+                    if let Operand::ScalarReg(r) = s {
+                        Some(ctx.scalar.read(*r) as i32)
+                    } else {
+                        None
+                    }
+                });
+                let is_vfloor = from == ElementType::BFloat16
+                    && et == ElementType::Int32
+                    && shift_val.is_some();
                 let has_acc_source = op.sources.iter()
                     .any(|s| matches!(s, Operand::AccumReg(_)));
 
                 if has_acc_source {
-                    // Accumulator source: read acc lanes, extract lower 32 bits each.
-                    // Detect narrow (bm, 512-bit) vs wide (cm, 1024-bit) from
-                    // AccumWidth metadata or register index parity.
+                    // Accumulator source: read acc data as raw bits, then convert.
+                    //
+                    // Accumulator access widths (from LLVM register class):
+                    //   QuarterLow  (amll/amhl): 256 bits = lanes 0-3 of a bm register
+                    //   QuarterHigh (amlh/amhh): 256 bits = lanes 4-7 of a bm register
+                    //   Half        (bml/bmh):   512 bits = 8 lanes
+                    //   Full        (cm):       1024 bits = 16 lanes (2 bm registers)
+                    //
+                    // The raw bits are reinterpreted according to `from` type -- e.g.,
+                    // VFLOOR reads a quarter as 16 packed BF16 values, not as lane values.
                     let acc_reg = Self::get_acc_source(op);
-                    let is_wide = match op.accum_width {
-                        Some(crate::tablegen::decoder_ffi::AccumWidth::Full) => true,
-                        Some(_) => false,
-                        None => acc_reg % 2 == 0,
-                    };
-                    let (src_lo, src_hi) = if is_wide {
+                    let is_quarter = matches!(op.accum_width,
+                        Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterLow) |
+                        Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterHigh));
+                    // Only Full (cm-class) is truly wide (1024-bit, 16 lanes).
+                    // Half (bml/bmh) is 512-bit = 8 lanes. When accum_width is
+                    // None, default to half -- the even-register heuristic was
+                    // wrong because bml registers ARE even-numbered.
+                    let is_wide = matches!(op.accum_width,
+                        Some(crate::tablegen::decoder_ffi::AccumWidth::Full));
+
+                    let (src_lo, src_hi) = if is_quarter {
+                        // Quarter-accumulator: 256 bits = 4 u64 lanes.
+                        // Repack as 8 u32 words (raw byte reinterpretation).
+                        let acc = ctx.accumulator.read(acc_reg);
+                        let lane_start = match op.accum_width {
+                            Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterHigh) => 4,
+                            _ => 0,
+                        };
+                        let mut words = [0u32; 8];
+                        for i in 0..4 {
+                            words[i * 2] = acc[lane_start + i] as u32;
+                            words[i * 2 + 1] = (acc[lane_start + i] >> 32) as u32;
+                        }
+                        // Split into two halves for vector_convert (4 words each).
+                        let mut lo = [0u32; 8];
+                        let mut hi = [0u32; 8];
+                        lo[..4].copy_from_slice(&words[..4]);
+                        hi[..4].copy_from_slice(&words[4..]);
+                        (lo, hi)
+                    } else if is_wide {
                         let acc = ctx.accumulator.read_wide(acc_reg);
                         let mut lo = [0u32; 8];
                         let mut hi = [0u32; 8];
@@ -4234,19 +4313,41 @@ impl VectorAlu {
                         }
                         (lo, hi)
                     } else {
-                        // Narrow (bml/bmh): 8 lanes, no high half.
+                        // Half (bml/bmh): 8 u64 lanes.
+                        // Acc32 mode packs two 32-bit values per lane (consecutive):
+                        //   lane[i] = {val[2i+1], val[2i]}
+                        // Extract all 16 values in consecutive order, split into two
+                        // halves of 8 for vector_convert processing.
                         let acc = ctx.accumulator.read(acc_reg);
-                        let mut lo = [0u32; 8];
+                        let mut all = [0u32; 16];
                         for i in 0..8 {
-                            lo[i] = acc[i] as u32;
+                            all[i * 2] = acc[i] as u32;         // val[2i]
+                            all[i * 2 + 1] = (acc[i] >> 32) as u32; // val[2i+1]
                         }
-                        (lo, [0u32; 8])
+                        let mut lo = [0u32; 8];
+                        let mut hi = [0u32; 8];
+                        lo.copy_from_slice(&all[..8]);
+                        hi.copy_from_slice(&all[8..]);
+                        (lo, hi)
                     };
-                    let res_lo = Self::vector_convert(&src_lo, from, et);
-                    let res_hi = Self::vector_convert(&src_hi, from, et);
+                    let (res_lo, res_hi) = if is_vfloor {
+                        let s = shift_val.unwrap();
+                        (Self::vector_floor_bf16_to_s32(&src_lo, s),
+                         Self::vector_floor_bf16_to_s32(&src_hi, s))
+                    } else {
+                        (Self::vector_convert(&src_lo, from, et),
+                         Self::vector_convert(&src_hi, from, et))
+                    };
                     // VCONV may produce narrow output (e.g., f32->bf16 packs 8 f32
                     // into 4 words of bf16). Write to the appropriate dest width.
-                    if et.bits() < from.bits() {
+                    if is_quarter && from.bits() < et.bits() {
+                        // Quarter expansion (e.g., VFLOOR bf16->s32): 256 bits ->
+                        // 512 bits. Both halves produce full 8-word results.
+                        let mut result = [0u32; 16];
+                        result[..8].copy_from_slice(&res_lo);
+                        result[8..].copy_from_slice(&res_hi);
+                        Self::write_wide_vec_dest(op, ctx, result);
+                    } else if et.bits() < from.bits() {
                         // Contraction: 512-bit acc -> 256-bit vector.
                         // Each half contracts; pack results into one 256-bit output.
                         let words_per_half = (8 * et.bits() as usize) / (from.bits() as usize);
@@ -4256,7 +4357,7 @@ impl VectorAlu {
                             .copy_from_slice(&res_hi[..words_per_half]);
                         Self::write_vector_dest(op, ctx, result);
                     } else {
-                        // Same-width or expansion from acc.
+                        // Same-width or expansion from half/full acc.
                         let mut result = [0u32; 16];
                         result[..8].copy_from_slice(&res_lo);
                         result[8..].copy_from_slice(&res_hi);
@@ -4271,17 +4372,25 @@ impl VectorAlu {
                         lo_in[..4].copy_from_slice(&src[..4]);
                         let mut hi_in = [0u32; 8];
                         hi_in[..4].copy_from_slice(&src[4..]);
-                        let res_lo = Self::vector_convert(&lo_in, from, et);
-                        let res_hi = Self::vector_convert(&hi_in, from, et);
+                        let (res_lo, res_hi) = if is_vfloor {
+                            let s = shift_val.unwrap();
+                            (Self::vector_floor_bf16_to_s32(&lo_in, s),
+                             Self::vector_floor_bf16_to_s32(&hi_in, s))
+                        } else {
+                            (Self::vector_convert(&lo_in, from, et),
+                             Self::vector_convert(&hi_in, from, et))
+                        };
                         if matches!(op.dest, Some(Operand::AccumReg(_))) {
-                            // Accumulator dest: pack 16 x u32 into 8 x u64 (two
-                            // fp32 lanes per u64, matching bml layout).
+                            // Accumulator dest: pack 16 x u32 into 8 x u64.
+                            // Acc32 layout: consecutive pairs per lane:
+                            //   lane[i] = {val[2i+1], val[2i]}
                             let dst_reg = Self::get_acc_dest(op);
+                            let mut all = [0u32; 16];
+                            all[..8].copy_from_slice(&res_lo);
+                            all[8..].copy_from_slice(&res_hi);
                             let mut acc = [0u64; 8];
                             for i in 0..8 {
-                                let lo_val = if i < 8 { res_lo[i] } else { 0 };
-                                let hi_val = if i < 8 { res_hi[i] } else { 0 };
-                                acc[i] = (lo_val as u64) | ((hi_val as u64) << 32);
+                                acc[i] = (all[i * 2] as u64) | ((all[i * 2 + 1] as u64) << 32);
                             }
                             ctx.accumulator.write(dst_reg, acc);
                         } else {
@@ -5076,6 +5185,134 @@ mod tests {
         assert!((f1 - 2.0).abs() < 0.01, "Expected 2.0, got {}", f1);
         assert!((f2 - 3.0).abs() < 0.01, "Expected 3.0, got {}", f2);
         assert!((f3 - 4.0).abs() < 0.01, "Expected 4.0, got {}", f3);
+    }
+
+    /// VFLOOR: basic floor computation with shift=0.
+    #[test]
+    fn test_vfloor_bf16_to_s32_shift0() {
+        let result = VectorAlu::vector_floor_bf16_to_s32(
+            &[
+                // Pack BF16 pairs: (1.5, -2.5), (0.0, 100.0), zeros...
+                ((VectorAlu::f32_to_bf16(1.5) as u32) | ((VectorAlu::f32_to_bf16(-2.5) as u32) << 16)),
+                ((VectorAlu::f32_to_bf16(0.0) as u32) | ((VectorAlu::f32_to_bf16(100.0) as u32) << 16)),
+                0, 0, 0, 0, 0, 0,
+            ],
+            0, // shift=0
+        );
+        assert_eq!(result[0] as i32, 1, "floor(1.5) = 1");
+        assert_eq!(result[1] as i32, -3, "floor(-2.5) = -3");
+        assert_eq!(result[2] as i32, 0, "floor(0.0) = 0");
+        assert_eq!(result[3] as i32, 100, "floor(100.0) = 100");
+    }
+
+    /// VFLOOR: signed 6-bit shift masking. Hardware uses (shift & 0x3F) sign-extended.
+    #[test]
+    fn test_vfloor_signed_6bit_shift() {
+        let bf16_10 = VectorAlu::f32_to_bf16(10.0);
+        let src = [bf16_10 as u32, 0, 0, 0, 0, 0, 0, 0];
+
+        // shift=3: floor(10.0 * 8) = 80
+        assert_eq!(VectorAlu::vector_floor_bf16_to_s32(&src, 3)[0] as i32, 80);
+
+        // shift=0x23 (35): low 6 bits = 0x23 = 35, signed 6-bit = 35-64 = -29
+        // floor(10.0 * 2^-29) = floor(10.0 / 536870912) = 0
+        assert_eq!(VectorAlu::vector_floor_bf16_to_s32(&src, 0x23)[0] as i32, 0);
+
+        // shift=0xFFFFFF07 (-249 as i32): low 6 bits = 7, positive
+        // floor(10.0 * 128) = 1280
+        assert_eq!(VectorAlu::vector_floor_bf16_to_s32(&src, -249)[0] as i32, 1280);
+
+        // shift with bit 5 set: 0x20 = 32, signed 6-bit = 32-64 = -32
+        // floor(10.0 * 2^-32) = 0
+        assert_eq!(VectorAlu::vector_floor_bf16_to_s32(&src, 0x20)[0] as i32, 0);
+    }
+
+    /// VFLOOR: NaN input saturates to INT_MAX.
+    #[test]
+    fn test_vfloor_nan_saturates_to_int_max() {
+        // BF16 0xFFFF = NaN (all exponent + mantissa bits set)
+        let src = [0xFFFF_FFFF, 0, 0, 0, 0, 0, 0, 0];
+        let result = VectorAlu::vector_floor_bf16_to_s32(&src, 0);
+        assert_eq!(result[0], i32::MAX as u32, "NaN -> INT_MAX");
+        assert_eq!(result[1], i32::MAX as u32, "NaN -> INT_MAX");
+    }
+
+    /// VCONV_BF16_FP32: accumulator source routes to wide path and reads all 16 lanes.
+    #[test]
+    fn test_vconv_bf16_fp32_acc_source() {
+        use crate::tablegen::decoder_ffi::AccumWidth;
+        let mut ctx = make_ctx();
+
+        // Write 16 FP32 values into accumulator bml0 as consecutive pairs per lane.
+        // Lane[i] = {fp32[2i+1], fp32[2i]}
+        let mut acc = [0u64; 8];
+        for i in 0..8 {
+            let f_lo = ((i * 2 + 1) as f32).to_bits();      // 1.0, 3.0, 5.0, ...
+            let f_hi = ((i * 2 + 2) as f32).to_bits();      // 2.0, 4.0, 6.0, ...
+            acc[i] = (f_lo as u64) | ((f_hi as u64) << 32);
+        }
+        ctx.accumulator.write(0, acc);
+
+        // VCONV_BF16_FP32: Convert FP32 (in acc) to BF16 (in vector)
+        let mut op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Convert)
+            .as_vector(ElementType::BFloat16)
+            .with_dest(Operand::VectorReg(0))
+            .with_source(Operand::AccumReg(0));
+        op.from_type = Some(ElementType::Float32);
+        op.accum_width = Some(AccumWidth::Half);
+
+        assert!(VectorAlu::execute(&op, &mut ctx));
+        let result = ctx.vector.read(0);
+
+        // Result should have 16 BF16 values packed: bf16(1.0), bf16(2.0), ..., bf16(16.0)
+        for i in 0..8 {
+            let lo_bf16 = (result[i / 2] >> ((i % 2) * 16)) as u16;
+            let expected = VectorAlu::f32_to_bf16((i + 1) as f32);
+            assert_eq!(lo_bf16, expected,
+                "element {}: expected bf16({}.0)=0x{:04X}, got 0x{:04X}",
+                i, i + 1, expected, lo_bf16);
+        }
+    }
+
+    /// VCONV_FP32_BF16: BF16->FP32 expansion writes consecutive pairs to accumulator.
+    #[test]
+    fn test_vconv_fp32_bf16_acc_dest() {
+        use crate::tablegen::decoder_ffi::AccumWidth;
+        let mut ctx = make_ctx();
+
+        // Write 16 BF16 values (1.0..16.0) into vector register
+        let mut vec_data = [0u32; 8];
+        for i in 0..8 {
+            let bf_lo = VectorAlu::f32_to_bf16((i * 2 + 1) as f32);
+            let bf_hi = VectorAlu::f32_to_bf16((i * 2 + 2) as f32);
+            vec_data[i] = (bf_lo as u32) | ((bf_hi as u32) << 16);
+        }
+        ctx.vector.write(0, vec_data);
+
+        // VCONV_FP32_BF16: Convert BF16 (in vector) to FP32 (in acc)
+        let mut op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Convert)
+            .as_vector(ElementType::Float32)
+            .with_dest(Operand::AccumReg(0))
+            .with_source(Operand::VectorReg(0));
+        op.from_type = Some(ElementType::BFloat16);
+        op.is_wide_vector = true;
+
+        assert!(VectorAlu::execute(&op, &mut ctx));
+        let acc = ctx.accumulator.read(0);
+
+        // Each lane should have consecutive FP32 pair: {fp32[2i+1], fp32[2i]}
+        for i in 0..8 {
+            let lo = acc[i] as u32;
+            let hi = (acc[i] >> 32) as u32;
+            let f_lo = f32::from_bits(lo);
+            let f_hi = f32::from_bits(hi);
+            let expected_lo = (i * 2 + 1) as f32;
+            let expected_hi = (i * 2 + 2) as f32;
+            assert!((f_lo - expected_lo).abs() < 0.1,
+                "lane {} lo: expected {}, got {}", i, expected_lo, f_lo);
+            assert!((f_hi - expected_hi).abs() < 0.1,
+                "lane {} hi: expected {}, got {}", i, expected_hi, f_hi);
+        }
     }
 
     #[test]

@@ -454,13 +454,13 @@ if [[ -d "$RESULTS_DIR" ]] && [[ -z "${ISA_TEST_RESULTS:-}" ]]; then
        ls "${RESULTS_DIR}"/phase_*_hw.bin &>/dev/null; then
         archive_date=$(date -r "$RESULTS_DIR" +%Y%m%d)
         archive_path="${RESULTS_BASE}/${archive_date}"
-        # Add letter suffix if the date already exists.
+        # Add numeric suffix if the date already exists.
         if [[ -d "$archive_path" ]]; then
-            suffix="b"
-            while [[ -d "${archive_path}${suffix}" ]]; do
-                suffix=$(echo "$suffix" | tr 'a-y' 'b-z')
+            suffix=2
+            while [[ -d "${archive_path}-${suffix}" ]]; do
+                ((suffix++))
             done
-            archive_path="${archive_path}${suffix}"
+            archive_path="${archive_path}-${suffix}"
         fi
         echo "Archiving previous results -> $(basename "$archive_path")"
         mv "$RESULTS_DIR" "$archive_path"

@@ -514,7 +514,12 @@ impl InstructionDecoder {
             _ => return None,
         };
 
-        let encoding = self.index.encoding_by_name(slot_name, &ffi_result.name)?;
+        let encoding = self.index.encoding_by_name(slot_name, &ffi_result.name);
+        if encoding.is_none() {
+            log::warn!("[FFI-LOOKUP MISS] slot={} name={} -- not in index",
+                slot_name, ffi_result.name);
+        }
+        let encoding = encoding?;
 
         // Map LLVM operands to our Operand type.
         let (dest, sources, post_modify, extra_defs, accum_width) =
@@ -2896,5 +2901,117 @@ mod tests {
         // The instruction should decode as VBCSTSHFL_8 with VectorBroadcast semantic
         assert!(ffi_result.is_some() || native_result.is_some(),
             "VBCSTSHFL_8 should be decodable");
+    }
+
+    /// Debug test: check VMAXDIFF_LT_S16 FFI operand ordering.
+    ///
+    /// Encoding from `llvm-objdump -d batch_061.o`:
+    ///   `b9c: 39 90 04 18  vmaxdiff_lt.s16 x0, r16, x2, x0`
+    /// Expected: dest=x0, extra_dest=r16, sources=[x2, x0]
+    #[test]
+    fn test_vmaxdiff_lt_s16_operand_order() {
+        use crate::interpreter::bundle::SlotType;
+
+        // Decode from the full 32-bit bundle bytes.
+        let bundle_bytes: [u8; 4] = [0x39, 0x90, 0x04, 0x18];
+        let decoder = InstructionDecoder::load_default();
+
+        let bundle = decoder.decode(&bundle_bytes, 0).expect("decode bundle");
+        let mv_slot = bundle.slots().iter().flatten().find(|s| !s.is_nop())
+            .expect("should have a non-NOP slot");
+
+        eprintln!("Encoding: {:?}", mv_slot.encoding_name);
+        eprintln!("Semantic: {:?}", mv_slot.semantic);
+        eprintln!("Dest: {:?}", mv_slot.dest);
+        eprintln!("Sources: {:?}", mv_slot.sources);
+        eprintln!("Extra dests: {:?}", mv_slot.extra_dests);
+
+        // encoding_name stores mnemonic (lowercase), not TableGen name
+        assert_eq!(mv_slot.encoding_name.as_deref(), Some("vmaxdiff_lt.s16"));
+
+        // dest should be x0 = VectorReg(0)
+        assert_eq!(mv_slot.dest, Some(Operand::VectorReg(0)),
+            "dest should be x0");
+
+        // sources[0] should be s1=x2 = VectorReg(4), sources[1] should be s2=x0 = VectorReg(0)
+        assert!(mv_slot.sources.len() >= 2, "should have 2 sources");
+        assert_eq!(mv_slot.sources[0], Operand::VectorReg(4),
+            "sources[0] should be s1=x2 (VectorReg(4))");
+        assert_eq!(mv_slot.sources[1], Operand::VectorReg(0),
+            "sources[1] should be s2=x0 (VectorReg(0))");
+    }
+
+    /// Debug test: check VFLOOR_S32_BF16 operand layout.
+    ///
+    /// Encoding: `226: 59 00 00 08  vfloor.s32.bf16 x0, wl0, s0`
+    #[test]
+    fn test_vfloor_s32_bf16_operands() {
+        let bundle_bytes: [u8; 4] = [0x59, 0x00, 0x00, 0x08];
+        let decoder = InstructionDecoder::load_default();
+
+        let bundle = decoder.decode(&bundle_bytes, 0).expect("decode bundle");
+        let slot = bundle.slots().iter().flatten().find(|s| !s.is_nop())
+            .expect("should have a non-NOP slot");
+
+        eprintln!("Encoding: {:?}", slot.encoding_name);
+        eprintln!("Semantic: {:?}", slot.semantic);
+        eprintln!("Dest: {:?}", slot.dest);
+        eprintln!("Sources: {:?}", slot.sources);
+        eprintln!("from_type: {:?}", slot.from_type);
+        eprintln!("element_type: {:?}", slot.element_type);
+        eprintln!("accum_width: {:?}", slot.accum_width);
+        eprintln!("is_wide_vector: {:?}", slot.is_wide_vector);
+        eprintln!("is_vector: {:?}", slot.is_vector);
+        eprintln!("slot: {:?}", slot.slot);
+
+        assert!(slot.encoding_name.as_deref().unwrap_or("").contains("vfloor"));
+
+        // Also check ST slot FFI decode directly
+        let st_bits: u64 = 0x000001;
+        let ffi_result = crate::tablegen::decoder_ffi::decode_slot(
+            crate::tablegen::decoder_ffi::Slot::St, st_bits);
+        if let Some(result) = &ffi_result {
+            eprintln!("ST FFI: name={} num_defs={} operands={:?}",
+                result.name, result.num_defs, result.operands);
+        } else {
+            eprintln!("ST FFI: FAILED to decode bits 0x{:06X}", st_bits);
+        }
+    }
+
+    /// Debug test: check VCONV_BF16_FP32 decode.
+    #[test]
+    fn test_vconv_bf16_fp32_decode() {
+        // vconv.bf16.fp32 wl0, bml0 = [0xD9, 0x01, 0x00, 0x08]
+        let bundle_bytes: [u8; 4] = [0xD9, 0x01, 0x00, 0x08];
+        let decoder = InstructionDecoder::load_default();
+
+        let bundle = decoder.decode(&bundle_bytes, 0).expect("decode bundle");
+        let slot = bundle.slots().iter().flatten().find(|s| !s.is_nop());
+
+        if let Some(slot) = slot {
+            eprintln!("Encoding: {:?}", slot.encoding_name);
+            eprintln!("Semantic: {:?}", slot.semantic);
+            eprintln!("Dest: {:?}", slot.dest);
+            eprintln!("Sources: {:?}", slot.sources);
+            eprintln!("is_vector: {:?}", slot.is_vector);
+            eprintln!("is_wide_vector: {:?}", slot.is_wide_vector);
+            eprintln!("from_type: {:?}", slot.from_type);
+            eprintln!("element_type: {:?}", slot.element_type);
+            eprintln!("accum_width: {:?}", slot.accum_width);
+            eprintln!("slot: {:?}", slot.slot);
+        } else {
+            eprintln!("NO non-NOP slot found -- VCONV decoded as NOP/unknown");
+        }
+
+        // Also try direct FFI decode
+        let st_bits: u64 = 0x000007;
+        let ffi_result = crate::tablegen::decoder_ffi::decode_slot(
+            crate::tablegen::decoder_ffi::Slot::St, st_bits);
+        if let Some(result) = &ffi_result {
+            eprintln!("ST FFI: name={} num_defs={} operands={:?}",
+                result.name, result.num_defs, result.operands);
+        } else {
+            eprintln!("ST FFI: FAILED to decode bits 0x{:06X}", st_bits);
+        }
     }
 }
