@@ -1421,10 +1421,20 @@ pub fn infer_dual_element_types(name: &str) -> (Option<ElementType>, Option<Elem
         }
     }
 
-    // Pattern 4: VCONV_{FROM}_{TO} or VFLOOR_{FROM}_{TO}_*
-    // Note: CONV/FLOOR name format is {FROM}_{TO}, not {OUT}_{IN}.
+    // Pattern 4a: VFLOOR_{OUT}_{IN}_* (same convention as SRS/UPS)
+    // The suffix mFl2FxSrc confirms: float IN, fixed-point OUT.
+    if parts.len() >= 3 && parts[0] == "VFLOOR" {
+        if let (Some(out_type), Some(in_type)) =
+            (parse_type_token(parts[1]), parse_type_token(parts[2]))
+        {
+            return (Some(out_type), Some(in_type));
+        }
+    }
+
+    // Pattern 4b: VCONV_{FROM}_{TO}
+    // Note: CONV name format is {FROM}_{TO}, not {OUT}_{IN}.
     // We swap to return (out=TO, from=FROM) to match the convention.
-    if parts.len() >= 3 && (parts[0] == "VCONV" || parts[0] == "VFLOOR") {
+    if parts.len() >= 3 && parts[0] == "VCONV" {
         if let (Some(from_type), Some(to_type)) =
             (parse_type_token(parts[1]), parse_type_token(parts[2]))
         {
@@ -2261,10 +2271,11 @@ mod tests {
         assert_eq!(et, Some(ElementType::Float32));
         assert_eq!(ft, Some(ElementType::BFloat16));
 
-        // VFLOOR: VFLOOR_{FROM}_{TO}_*
+        // VFLOOR: VFLOOR_{OUT}_{IN}_* (same as SRS/UPS convention)
+        // VFLOOR_S32_BF16 = floor BF16 input to S32 output
         let (et, ft) = infer_dual_element_types("VFLOOR_S32_BF16_mFl2FxSrc_AM");
-        assert_eq!(et, Some(ElementType::BFloat16));
-        assert_eq!(ft, Some(ElementType::Int32));
+        assert_eq!(et, Some(ElementType::Int32));     // output = S32
+        assert_eq!(ft, Some(ElementType::BFloat16));  // from = BF16
 
         // Fused CONV: VLDA_2D_CONV_FP32_BF16
         let (et, ft) = infer_dual_element_types("VLDA_2D_CONV_FP32_BF16");

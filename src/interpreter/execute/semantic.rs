@@ -234,6 +234,14 @@ pub(super) fn read_operand(operand: &Operand, ctx: &ExecutionContext) -> u32 {
             // Scalar read of an accumulator: extract lane 0 (low 32 bits).
             ctx.accumulator.read(*r)[0] as u32
         }
+        Operand::ControlReg(id) => {
+            match id {
+                6 => ctx.srs_config.rounding_mode as u32,   // crRnd
+                8 => ctx.srs_config.srs_sign as u32,        // crSRSSign
+                9 => ctx.srs_config.saturation_mode as u32, // crSat
+                _ => 0,
+            }
+        }
         _ => 0,
     }
 }
@@ -502,8 +510,9 @@ fn execute_div_step(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     let pa: u64 = ((pi as u64) << 32) | (ai as u64);
     let mut new_pa = pa << 1;
 
-    if borrow {
-        // co == 0 (borrow): update upper half with subtraction result, set bit 0.
+    if !borrow {
+        // co == 1 (no borrow): trial subtraction succeeded (div_shft >= b).
+        // Keep the subtracted result in upper half, set quotient bit 0.
         new_pa = (new_pa & 0x0000_0000_FFFF_FFFE) | ((div_tmp as u64) << 32) | 1;
     }
 
@@ -1337,12 +1346,11 @@ mod tests {
     #[test]
     fn test_execute_div_step_basic() {
         // One dstep iteration with pi=0, ai=0x00000008, b=3.
-        // After 32 iterations this would compute 8/3=2 r2.
-        // First step: div_shft = {0[30:0], 0[31]} = 0
-        //   div_tmp = 0 - 3 = wraps, borrow=true
+        // First step: div_shft = {0[30:0], ai[31]} = 0
+        //   div_tmp = 0 - 3 = wraps, borrow=true (0 < 3)
         //   pa = {0, 8} << 1 = {0, 16}
-        //   borrow: pa[63:32] = (0u32.wrapping_sub(3)), pa[0] = 1
-        //   ao = 16 | 1 = 17, po = 0xFFFFFFFD
+        //   borrow (trial subtraction failed): keep pa unchanged
+        //   ao = 16, po = 0
         let mut ctx = make_test_context();
         ctx.scalar.write(1, 0x00000008); // ai = s0
         ctx.scalar.write(2, 3);          // b  = s1
@@ -1353,19 +1361,21 @@ mod tests {
         op.dest = Some(Operand::ScalarReg(3));
         assert!(execute_semantic(&op, &mut ctx));
 
-        // ao = (8 << 1) | 1 = 17 = 0x11
-        assert_eq!(ctx.scalar_read(3), 0x00000011, "ao (d0)");
-        // po = 0u32.wrapping_sub(3) = 0xFFFFFFFD
-        assert_eq!(ctx.scalar_read(31), 0xFFFFFFFD, "po (r31)");
+        // Borrow occurred (0 < 3): trial subtraction fails, pa unchanged.
+        // ao = (8 << 1) = 16, po = 0
+        assert_eq!(ctx.scalar_read(3), 0x00000010, "ao (d0)");
+        assert_eq!(ctx.scalar_read(31), 0, "po (r31)");
     }
 
     #[test]
     fn test_execute_div_step_no_borrow() {
         // pi=0x40000000, ai=0, b=0.
-        // div_shft = {pi[30:0], ai[31]} = {0x40000000, 0} = 0x80000000
+        // div_shft = {pi[30:0], ai[31]} = 0x80000000
         // div_tmp = 0x80000000 - 0 = 0x80000000, no borrow.
-        // No borrow: pa = {0x40000000, 0} << 1 = {0x80000000, 0}
-        // po = 0x80000000, ao = 0
+        // No borrow (trial subtraction succeeded): keep div_tmp, set bit 0.
+        // pa = {0x40000000, 0} << 1 = {0x80000000, 0}
+        // Update: pa[63:32] = 0x80000000, pa[0] = 1
+        // po = 0x80000000, ao = 1
         let mut ctx = make_test_context();
         ctx.scalar.write(1, 0);           // ai
         ctx.scalar.write(2, 0);           // b
@@ -1376,7 +1386,8 @@ mod tests {
         op.dest = Some(Operand::ScalarReg(3));
         assert!(execute_semantic(&op, &mut ctx));
 
-        assert_eq!(ctx.scalar_read(3), 0, "ao");
+        // No borrow: div_tmp kept in upper half, quotient bit set.
+        assert_eq!(ctx.scalar_read(3), 1, "ao");
         assert_eq!(ctx.scalar_read(31), 0x80000000, "po");
     }
 

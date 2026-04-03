@@ -202,10 +202,12 @@ impl VectorAlu {
             // ========== Shuffle/Pack/Unpack ==========
 
             SemanticOp::Shuffle => {
-                let src = Self::get_vector_source(op, ctx, 0);
-                let result = Self::vector_shuffle(&src, op.shuffle_pattern);
-                Self::write_vector_dest(op, ctx, result);
-                true
+                // VSHUFFLE is a 512-bit operation handled in execute_wide.
+                // If we reach here via the narrow (256-bit) fallback path,
+                // it means execute_wide didn't handle it -- should not happen
+                // for real VSHUFFLE instructions. Return false to signal
+                // unhandled (avoids panic from calling wide helpers in narrow context).
+                false
             }
 
             SemanticOp::Pack => {
@@ -251,10 +253,11 @@ impl VectorAlu {
             }
 
             SemanticOp::SetEq => {
-                // Vector equal-to-zero (from VectorEqz)
+                // Vector equal-to-zero (VEQZ): produces a comparison bitmask
+                // written to scalar cmp register(s), not a vector result.
                 let src = Self::get_vector_source(op, ctx, 0);
                 let result = Self::vector_compare_eqz(&src, et);
-                Self::write_vector_dest(op, ctx, result);
+                Self::write_cmp_dest(op, ctx, Self::pack_comparison_flags(&result, et));
                 true
             }
 
@@ -1312,11 +1315,12 @@ impl VectorAlu {
                 }
             }
             // BFloat16 -> Int32: 16 bf16 -> 8 i32 (use lower half)
+            // VFLOOR uses floor rounding (toward negative infinity).
             (ElementType::BFloat16, ElementType::Int32) => {
                 for i in 0..8 {
                     let bf16 = (src[i / 2] >> ((i % 2) * 16)) as u16;
                     let f = Self::bf16_to_f32(bf16);
-                    result[i] = f as i32 as u32;
+                    result[i] = f.floor() as i32 as u32;
                 }
             }
             // Same type: pass through
@@ -3836,7 +3840,15 @@ impl VectorAlu {
                 let src = Self::get_wide_vec_source(op, ctx, 0);
                 let index = Self::get_lane_index(op, ctx);
                 let value = Self::extract_wide_element(&src, index, et);
-                Self::write_scalar_dest(op, ctx, value);
+                if et.bits() >= 64 {
+                    // 64-bit extract: write register pair (rN, rN+1)
+                    Self::write_scalar_dest(op, ctx, value as u32);
+                    if let Some(Operand::ScalarReg(r)) = &op.dest {
+                        ctx.scalar.write(r + 1, (value >> 32) as u32);
+                    }
+                } else {
+                    Self::write_scalar_dest(op, ctx, value as u32);
+                }
                 true
             }
 
@@ -3895,10 +3907,20 @@ impl VectorAlu {
                     let src = Self::get_wide_vec_source(op, ctx, 0);
                     let index = Self::get_lane_index(op, ctx);
                     let value = Self::extract_wide_element(&src, index, et);
-                    let narrow_result = Self::vector_broadcast(value, et);
                     let mut result = [0u32; 16];
-                    result[..8].copy_from_slice(&narrow_result);
-                    result[8..].copy_from_slice(&narrow_result);
+                    if et.bits() >= 64 {
+                        // 64-bit broadcast: replicate lo:hi pairs across 512 bits
+                        let lo = value as u32;
+                        let hi = (value >> 32) as u32;
+                        for i in 0..8 {
+                            result[i * 2] = lo;
+                            result[i * 2 + 1] = hi;
+                        }
+                    } else {
+                        let narrow_result = Self::vector_broadcast(value as u32, et);
+                        result[..8].copy_from_slice(&narrow_result);
+                        result[8..].copy_from_slice(&narrow_result);
+                    }
                     Self::write_wide_vec_dest(op, ctx, result);
                 } else {
                     // VBCST / VBCSTSHFL: broadcast scalar to 512-bit vector.
@@ -3982,6 +4004,42 @@ impl VectorAlu {
                 let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
                 let shift = Self::get_lane_index(op, ctx);
                 let result = Self::wide_vector_align(&a, &b, shift);
+                Self::write_wide_vec_dest(op, ctx, result);
+                true
+            }
+
+            SemanticOp::Shuffle => {
+                // VSHUFFLE = s2v_interleave_sw(s1, s2, mode)
+                // Two 512-bit vector inputs shuffled through the 48-mode
+                // crossbar, with mode from the scalar `mod` operand.
+                let (s1, s2) = Self::get_two_wide_vec_sources(op, ctx);
+                let mode_val = Self::get_scalar_source(op, ctx);
+                let mode_idx = (mode_val & 0x3F) as u8;
+
+                let mut lo_bytes = [0u8; 64];
+                let mut hi_bytes = [0u8; 64];
+                for i in 0..16 {
+                    lo_bytes[i * 4..i * 4 + 4].copy_from_slice(&s1[i].to_le_bytes());
+                    hi_bytes[i * 4..i * 4 + 4].copy_from_slice(&s2[i].to_le_bytes());
+                }
+
+                let out_bytes = if let Some(mode) = super::vector_permute::ShuffleMode::from_mode(mode_idx) {
+                    super::vector_permute::shuffle_vectors(&lo_bytes, &hi_bytes, mode)
+                } else {
+                    // mode >= 48: mask overflows to 0, crossbar passes
+                    // only byte 0 of lo input, rest is zero.
+                    let mut z = [0u8; 64];
+                    z[0] = lo_bytes[0];
+                    z
+                };
+
+                let mut result = [0u32; 16];
+                for i in 0..16 {
+                    result[i] = u32::from_le_bytes([
+                        out_bytes[i * 4], out_bytes[i * 4 + 1],
+                        out_bytes[i * 4 + 2], out_bytes[i * 4 + 3],
+                    ]);
+                }
                 Self::write_wide_vec_dest(op, ctx, result);
                 true
             }
@@ -4188,21 +4246,27 @@ impl VectorAlu {
     /// The element index is masked to the valid range for the given element
     /// type (e.g., 0-31 for i16, 0-15 for i32).  Supports sub-word types
     /// stored in packed little-endian order within each u32 word.
-    fn extract_wide_element(src: &Vec512, index: u32, et: ElementType) -> u32 {
+    fn extract_wide_element(src: &Vec512, index: u32, et: ElementType) -> u64 {
         let bits = et.bits() as u32;
         if bits >= 64 {
-            // 64-bit element: return the lower 32 bits of the element.
-            // For 512-bit registers, there are 8 elements of 64-bit = 4 pairs.
-            let idx = (index as usize % 4) * 2;
-            return src[idx];
+            // 64-bit element: 8 elements in 512-bit register.
+            let idx = (index as usize % 8) * 2;
+            (src[idx] as u64) | ((src[idx + 1] as u64) << 32)
+        } else {
+            let max_elems = 512 / bits;
+            let idx = index % max_elems;
+            let bit_offset = idx * bits;
+            let word_idx = (bit_offset / 32) as usize;
+            let bit_in_word = bit_offset % 32;
+            let mask = (1u64 << bits) - 1;
+            let raw = ((src[word_idx] as u64 >> bit_in_word) & mask) as u32;
+            // Sign-extend for signed types
+            match et {
+                ElementType::Int8 => (raw as u8 as i8 as i32 as u32) as u64,
+                ElementType::Int16 => (raw as u16 as i16 as i32 as u32) as u64,
+                _ => raw as u64,
+            }
         }
-        let max_elems = 512 / bits;
-        let idx = index % max_elems;
-        let bit_offset = idx * bits;
-        let word_idx = (bit_offset / 32) as usize;
-        let bit_in_word = bit_offset % 32;
-        let mask = (1u64 << bits) - 1;
-        ((src[word_idx] as u64 >> bit_in_word) & mask) as u32
     }
 
     /// Insert a scalar value at a specific element position in a 512-bit vector.
@@ -4389,33 +4453,60 @@ mod tests {
     }
 
     #[test]
-    fn test_vector_shuffle_reverse() {
+    fn test_vector_shuffle_mode0() {
+        // VSHUFFLE with mode=0: verify the crossbar is invoked and
+        // produces a non-trivial permutation of the input data.
         let mut ctx = make_ctx();
-        ctx.vector.write(0, [1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut lo = [0u32; 16];
+        let mut hi = [0u32; 16];
+        for i in 0..16 {
+            lo[i] = (i as u32) + 1;
+            hi[i] = (i as u32) + 0x100;
+        }
+        ctx.vector.write_wide(0, lo);
+        ctx.vector.write_wide(2, hi);
+        ctx.scalar.write(5, 0);
 
         let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Shuffle)
             .as_vector(ElementType::Int32)
-            .with_dest(Operand::VectorReg(1))
-            .with_source(Operand::VectorReg(0));
-        op.shuffle_pattern = ShufflePattern::Reverse;
+            .with_dest(Operand::VectorReg(4))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(2))
+            .with_source(Operand::ScalarReg(5));
+        op.is_wide_vector = true;
 
         VectorAlu::execute(&op, &mut ctx);
-        assert_eq!(ctx.vector.read(1), [8, 7, 6, 5, 4, 3, 2, 1]);
+        let result = ctx.vector.read_wide(4);
+        // The crossbar should produce a permutation that differs from
+        // both inputs -- not identity, not zeros.
+        assert_ne!(result, lo, "result should not be identity of lo");
+        assert_ne!(result, hi, "result should not be identity of hi");
+        assert_ne!(result, [0u32; 16], "result should not be all zeros");
     }
 
     #[test]
-    fn test_vector_shuffle_broadcast() {
+    fn test_vector_shuffle_overflow_mode() {
+        // mode >= 48: mask overflows, only byte 0 of lo passes through
         let mut ctx = make_ctx();
-        ctx.vector.write(0, [10, 20, 30, 40, 50, 60, 70, 80]);
+        ctx.vector.write_wide(0, [0xDEADBEEF, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        ctx.vector.write_wide(2, [0xFF; 16]);
+        ctx.scalar.write(3, 50); // mode 50 >= 48
 
         let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Shuffle)
             .as_vector(ElementType::Int32)
-            .with_dest(Operand::VectorReg(1))
-            .with_source(Operand::VectorReg(0));
-        op.shuffle_pattern = ShufflePattern::Broadcast(2);
+            .with_dest(Operand::VectorReg(4))
+            .with_source(Operand::VectorReg(0))
+            .with_source(Operand::VectorReg(2))
+            .with_source(Operand::ScalarReg(3));
+        op.is_wide_vector = true;
 
         VectorAlu::execute(&op, &mut ctx);
-        assert_eq!(ctx.vector.read(1), [30, 30, 30, 30, 30, 30, 30, 30]);
+        let result = ctx.vector.read_wide(4);
+        // Only byte 0 (0xEF) passes, everything else zero
+        assert_eq!(result[0], 0xEF);
+        for i in 1..16 {
+            assert_eq!(result[i], 0, "lane {} should be zero", i);
+        }
     }
 
     #[test]
@@ -4886,8 +4977,12 @@ mod tests {
     fn test_extract_wide_element_16bit() {
         let mut src = [0u32; 16];
         src[8] = 0xBEEF_DEAD; // lo16 = 0xDEAD, hi16 = 0xBEEF
-        let val = VectorAlu::extract_wide_element(&src, 17, ElementType::Int16);
+        // UInt16: no sign extension, raw 16-bit value
+        let val = VectorAlu::extract_wide_element(&src, 17, ElementType::UInt16);
         assert_eq!(val, 0xBEEF);
+        // Int16: sign-extended (0xBEEF is negative as i16)
+        let val_signed = VectorAlu::extract_wide_element(&src, 17, ElementType::Int16);
+        assert_eq!(val_signed, 0xBEEF_u16 as i16 as i32 as u32 as u64);
     }
 
     // ---- insert_wide_element ------------------------------------------------
