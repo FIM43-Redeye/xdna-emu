@@ -414,12 +414,13 @@ pub fn infer_dual_element_types(name: &str) -> (Option<String>, Option<String>) 
         }
     }
 
-    // Pattern 1b: VCONV_{FROM}_{TO}_* (note: opposite of VFLOOR/SRS/UPS)
+    // Pattern 1b: VCONV_{OUT}_{IN}_* (same convention as SRS/UPS)
+    // Example: VCONV_FP32_BF16 = bf16 input -> fp32 output.
     if parts.len() >= 3 && parts[0] == "VCONV" {
-        if let (Some(from_type), Some(to_type)) =
+        if let (Some(out_type), Some(in_type)) =
             (parse_type_token_str(parts[1]), parse_type_token_str(parts[2]))
         {
-            return (Some(to_type), Some(from_type));
+            return (Some(out_type), Some(in_type));
         }
     }
 

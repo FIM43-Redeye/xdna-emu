@@ -158,6 +158,7 @@ fn can_be_dest(operand: &Operand) -> bool {
             | Operand::AccumReg(_)
             | Operand::PointerReg(_)
             | Operand::ModifierReg(_)
+            | Operand::ControlReg(_)
     )
 }
 

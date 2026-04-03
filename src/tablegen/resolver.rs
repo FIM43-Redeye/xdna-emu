@@ -1431,14 +1431,14 @@ pub fn infer_dual_element_types(name: &str) -> (Option<ElementType>, Option<Elem
         }
     }
 
-    // Pattern 4b: VCONV_{FROM}_{TO}
-    // Note: CONV name format is {FROM}_{TO}, not {OUT}_{IN}.
-    // We swap to return (out=TO, from=FROM) to match the convention.
+    // Pattern 4b: VCONV_{OUT}_{IN}
+    // Same convention as SRS/UPS: first type is output, second is input.
+    // Example: VCONV_FP32_BF16 = output fp32, input bf16 (bf16->fp32 expansion).
     if parts.len() >= 3 && parts[0] == "VCONV" {
-        if let (Some(from_type), Some(to_type)) =
+        if let (Some(out_type), Some(in_type)) =
             (parse_type_token(parts[1]), parse_type_token(parts[2]))
         {
-            return (Some(to_type), Some(from_type));
+            return (Some(out_type), Some(in_type));
         }
     }
 
@@ -2262,14 +2262,15 @@ mod tests {
 
     #[test]
     fn test_infer_dual_element_types_conv() {
-        // Standalone VCONV: VCONV_{FROM}_{TO}
+        // Standalone VCONV: VCONV_{OUT}_{IN} (same convention as SRS/UPS)
+        // VCONV_FP32_BF16 = bf16 input -> fp32 output
         let (et, ft) = infer_dual_element_types("VCONV_FP32_BF16");
-        assert_eq!(et, Some(ElementType::BFloat16));  // output = TO
-        assert_eq!(ft, Some(ElementType::Float32));    // from = FROM
+        assert_eq!(et, Some(ElementType::Float32));    // output = FP32
+        assert_eq!(ft, Some(ElementType::BFloat16));   // from = BF16
 
         let (et, ft) = infer_dual_element_types("VCONV_BF16_FP32");
-        assert_eq!(et, Some(ElementType::Float32));
-        assert_eq!(ft, Some(ElementType::BFloat16));
+        assert_eq!(et, Some(ElementType::BFloat16));
+        assert_eq!(ft, Some(ElementType::Float32));
 
         // VFLOOR: VFLOOR_{OUT}_{IN}_* (same as SRS/UPS convention)
         // VFLOOR_S32_BF16 = floor BF16 input to S32 output

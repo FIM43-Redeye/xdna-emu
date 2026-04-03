@@ -313,7 +313,7 @@ pub fn fp32_is_inf(bits: u32) -> bool {
 /// truth, we use mantissa = 1.
 #[inline]
 pub fn fp32_make_nan(sign: bool) -> u32 {
-    ((sign as u32) << 31) | (0xFF << 23) | 0x7F
+    ((sign as u32) << 31) | (0xFF << 23) | 0x01
 }
 
 /// Create an fp32 infinity bit pattern.
@@ -808,13 +808,13 @@ mod tests {
 
     #[test]
     fn test_canonical_nan_bits() {
-        // AIE2 canonical NaN: exponent=255, mantissa=0x7F.
+        // AIE2 canonical NaN: exponent=255, mantissa=1 (HW-verified).
         let pos_nan = fp32_make_nan(false);
-        assert_eq!(pos_nan, 0x7F80_007F);
+        assert_eq!(pos_nan, 0x7F80_0001);
         assert!(fp32_is_nan(pos_nan));
 
         let neg_nan = fp32_make_nan(true);
-        assert_eq!(neg_nan, 0xFF80_007F);
+        assert_eq!(neg_nan, 0xFF80_0001);
         assert!(fp32_is_nan(neg_nan));
 
         // Verify the f32 representation is NaN.
