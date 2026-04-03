@@ -495,23 +495,29 @@ fn execute_rem(op: &SlotOp, ctx: &mut ExecutionContext, signed: bool) -> bool {
 ///         po = pa[63:32]  -> r31
 ///         ao = pa[31:0]   -> d0
 fn execute_div_step(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
-    let ai = read_source(op, ctx, 0); // s0: working accumulator
-    let b  = read_source(op, ctx, 1); // s1: divisor
-    let pi = ctx.scalar.read(31);     // r31: partial quotient (implicit)
+    // LLVM FFI decoder puts the tied r31 as sources[0] (from sd_in), so s0
+    // and s1 are at indices 1 and 2 when r31 is present in the source list.
+    let (ai, b) = if op.sources.len() >= 3
+        && matches!(op.sources.first(), Some(Operand::ScalarReg(31)))
+    {
+        (read_source(op, ctx, 1), read_source(op, ctx, 2))
+    } else {
+        (read_source(op, ctx, 0), read_source(op, ctx, 1))
+    };
+    let pi = ctx.scalar.read(31); // r31: partial quotient (implicit)
 
     // dstep_pre: {pi[30:0], ai[31]}
     let div_shft = ((pi & 0x7FFF_FFFF) << 1) | (ai >> 31);
 
     // Trial subtraction: div_shft - b, with carry (borrow) detection.
     let (div_tmp, borrow) = div_shft.overflowing_sub(b);
-    // In hardware: co=0 means borrow occurred (div_shft < b as unsigned).
 
     // dstep_post: pa = {pi, ai} << 1
     let pa: u64 = ((pi as u64) << 32) | (ai as u64);
     let mut new_pa = pa << 1;
 
     if !borrow {
-        // co == 1 (no borrow): trial subtraction succeeded (div_shft >= b).
+        // No borrow: trial subtraction succeeded (div_shft >= b).
         // Keep the subtracted result in upper half, set quotient bit 0.
         new_pa = (new_pa & 0x0000_0000_FFFF_FFFE) | ((div_tmp as u64) << 32) | 1;
     }

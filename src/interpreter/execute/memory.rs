@@ -1233,16 +1233,18 @@ impl MemoryUnit {
     /// Uses the same logic as `get_store_value` but returns the Operand
     /// instead of reading it, for use with deferred partial-word stores.
     fn get_store_source_operand(op: &SlotOp) -> Operand {
-        let operand = if op.encoding_name.is_some() {
-            op.sources.first().cloned()
-        } else {
-            op.sources.first().and_then(|first| {
-                match first {
-                    Operand::PointerReg(_) | Operand::Memory { .. } => op.dest.clone(),
-                    _ => Some(first.clone()),
+        // For partial-word stores, the data register is the first non-address
+        // operand. The LLVM FFI decoder puts the data register in op.dest when
+        // it appears first in the MCInst defs, so fall back to dest when the
+        // sources contain only address operands (PointerReg, Memory, ModifierReg).
+        let operand = op.sources.first().and_then(|first| {
+            match first {
+                Operand::PointerReg(_) | Operand::Memory { .. } | Operand::ModifierReg(_) => {
+                    op.dest.clone()
                 }
-            }).or_else(|| op.dest.clone())
-        };
+                _ => Some(first.clone()),
+            }
+        }).or_else(|| op.dest.clone());
         operand.unwrap_or(Operand::ScalarReg(0))
     }
 
