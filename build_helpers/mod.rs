@@ -8,6 +8,7 @@
 pub mod bytecode;
 pub mod codegen;
 pub mod cpp_switch;
+pub mod element_type_logic;
 pub mod extract;
 pub mod records;
 pub mod semantics;

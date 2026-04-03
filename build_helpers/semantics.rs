@@ -330,114 +330,38 @@ pub fn infer_semantic_from_structure(
 // ---------------------------------------------------------------------------
 
 /// Infer element type from mnemonic suffix.
-pub fn infer_element_type(mnemonic: &str) -> Option<String> {
-    // AIE2 mnemonics use `.s` for signed, `.d` for unsigned (data/raw),
-    // `.u` for unsigned (less common).  Check for `.d` followed by a digit
-    // to avoid false positives on `.2d` (2D addressing) etc.
-    let has_dot_d_digit = mnemonic.contains(".d8")
-        || mnemonic.contains(".d16")
-        || mnemonic.contains(".d32")
-        || mnemonic.contains(".d64")
-        || mnemonic.contains(".d4");
-    let is_unsigned = mnemonic.contains(".u") || has_dot_d_digit;
-
-    if mnemonic.ends_with("8") || mnemonic.contains(".i8") || mnemonic.contains(".u8") {
-        if is_unsigned {
-            Some("ElementType::UInt8".to_string())
-        } else {
-            Some("ElementType::Int8".to_string())
-        }
-    } else if mnemonic.ends_with("16") || mnemonic.contains(".i16") || mnemonic.contains(".u16") {
-        if mnemonic.contains("bf16") || mnemonic.contains(".bf") {
-            return Some("ElementType::BFloat16".to_string());
-        }
-        if is_unsigned {
-            Some("ElementType::UInt16".to_string())
-        } else {
-            Some("ElementType::Int16".to_string())
-        }
-    } else if mnemonic.ends_with("32") || mnemonic.contains(".i32") || mnemonic.contains(".u32") {
-        if is_unsigned {
-            Some("ElementType::UInt32".to_string())
-        } else {
-            Some("ElementType::Int32".to_string())
-        }
-    } else if mnemonic.ends_with("64") || mnemonic.contains(".i64") || mnemonic.contains(".u64") {
-        if is_unsigned {
-            Some("ElementType::UInt64".to_string())
-        } else {
-            Some("ElementType::Int64".to_string())
-        }
-    } else if mnemonic.contains("bf16") || mnemonic.contains(".bf") {
-        Some("ElementType::BFloat16".to_string())
-    } else if mnemonic.contains("f32") || mnemonic.contains("float") || mnemonic.ends_with(".f") {
-        Some("ElementType::Float32".to_string())
-    } else {
-        None
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Dual-type inference (SRS/UPS)
-// ---------------------------------------------------------------------------
-
-/// Parse a type token like "S16", "D32" into an ElementType expression string.
-fn parse_type_token_str(token: &str) -> Option<String> {
-    match token {
-        "S8" => Some("ElementType::Int8".to_string()),
-        "D8" => Some("ElementType::UInt8".to_string()),
-        "S16" => Some("ElementType::Int16".to_string()),
-        "D16" => Some("ElementType::UInt16".to_string()),
-        "S32" => Some("ElementType::Int32".to_string()),
-        "D32" => Some("ElementType::UInt32".to_string()),
-        "S64" => Some("ElementType::Int64".to_string()),
-        "D64" => Some("ElementType::UInt64".to_string()),
-        "BF16" => Some("ElementType::BFloat16".to_string()),
-        "FP32" => Some("ElementType::Float32".to_string()),
-        _ => None,
-    }
-}
-
-/// Infer both element types for dual-type instructions (SRS/UPS).
 ///
+/// Delegates to shared logic in `element_type_logic.rs` and formats as a
+/// Rust expression string for codegen.
+pub fn infer_element_type(mnemonic: &str) -> Option<String> {
+    super::element_type_logic::infer_type_tag_from_mnemonic(mnemonic).map(tag_to_string)
+}
+
+/// Infer both element types for dual-type instructions (SRS/UPS/CONV/FLOOR).
+///
+/// Delegates to shared logic in `element_type_logic.rs`.
 /// Returns `(element_type, from_type)` as Rust expression strings.
 pub fn infer_dual_element_types(name: &str) -> (Option<String>, Option<String>) {
-    let parts: Vec<&str> = name.split('_').collect();
+    let (et, ft) = super::element_type_logic::infer_dual_type_tags(name);
+    (et.map(tag_to_string), ft.map(tag_to_string))
+}
 
-    // Pattern 1: V{SRS|UPS|FLOOR}_{OUT}_{IN}_*
-    // VFLOOR uses the same convention as SRS/UPS: {OUT}_{IN}.
-    if parts.len() >= 3 && (parts[0] == "VSRS" || parts[0] == "VSRSM" || parts[0] == "VUPS" || parts[0] == "VFLOOR") {
-        if let (Some(out_type), Some(in_type)) =
-            (parse_type_token_str(parts[1]), parse_type_token_str(parts[2]))
-        {
-            return (Some(out_type), Some(in_type));
-        }
+/// Convert a TypeTag to a Rust expression string for codegen output.
+fn tag_to_string(tag: super::element_type_logic::TypeTag) -> String {
+    use super::element_type_logic::TypeTag;
+    match tag {
+        TypeTag::Int8 => "ElementType::Int8",
+        TypeTag::UInt8 => "ElementType::UInt8",
+        TypeTag::Int16 => "ElementType::Int16",
+        TypeTag::UInt16 => "ElementType::UInt16",
+        TypeTag::Int32 => "ElementType::Int32",
+        TypeTag::UInt32 => "ElementType::UInt32",
+        TypeTag::Int64 => "ElementType::Int64",
+        TypeTag::UInt64 => "ElementType::UInt64",
+        TypeTag::BFloat16 => "ElementType::BFloat16",
+        TypeTag::Float32 => "ElementType::Float32",
     }
-
-    // Pattern 1b: VCONV_{OUT}_{IN}_* (same convention as SRS/UPS)
-    // Example: VCONV_FP32_BF16 = bf16 input -> fp32 output.
-    if parts.len() >= 3 && parts[0] == "VCONV" {
-        if let (Some(out_type), Some(in_type)) =
-            (parse_type_token_str(parts[1]), parse_type_token_str(parts[2]))
-        {
-            return (Some(out_type), Some(in_type));
-        }
-    }
-
-    // Pattern 2: V{LDA|ST}_{2D|3D}_{UPS|SRS}_{OUT}_{IN}*
-    if parts.len() >= 5 {
-        let is_fused = (parts[0] == "VLDA" || parts[0] == "VST")
-            && (parts[2] == "UPS" || parts[2] == "SRS");
-        if is_fused {
-            if let (Some(out_type), Some(in_type)) =
-                (parse_type_token_str(parts[3]), parse_type_token_str(parts[4]))
-            {
-                return (Some(out_type), Some(in_type));
-            }
-        }
-    }
-
-    (None, None)
+    .to_string()
 }
 
 // ---------------------------------------------------------------------------

@@ -1298,175 +1298,39 @@ pub fn infer_semantic_from_structure(
 }
 
 
+/// Convert a shared TypeTag to the crate's ElementType.
+fn tag_to_element_type(tag: super::element_type_logic::TypeTag) -> ElementType {
+    use super::element_type_logic::TypeTag;
+    match tag {
+        TypeTag::Int8 => ElementType::Int8,
+        TypeTag::UInt8 => ElementType::UInt8,
+        TypeTag::Int16 => ElementType::Int16,
+        TypeTag::UInt16 => ElementType::UInt16,
+        TypeTag::Int32 => ElementType::Int32,
+        TypeTag::UInt32 => ElementType::UInt32,
+        TypeTag::Int64 => ElementType::Int64,
+        TypeTag::UInt64 => ElementType::UInt64,
+        TypeTag::BFloat16 => ElementType::BFloat16,
+        TypeTag::Float32 => ElementType::Float32,
+    }
+}
+
 /// Infer element type from a mnemonic suffix.
 ///
-/// Resolved once per encoding during TableGen loading (not per decoded instruction).
-/// Returns None for instructions without an element type suffix.
+/// Delegates to shared logic in `element_type_logic.rs`.
 pub fn infer_element_type(mnemonic: &str) -> Option<ElementType> {
-    // AIE2 mnemonics use `.s` for signed, `.d` for unsigned (data/raw),
-    // `.u` for unsigned (less common).  Check for `.d` followed by a digit
-    // to avoid false positives on `.2d` (2D addressing) etc.
-    let has_dot_d_digit = mnemonic.contains(".d8")
-        || mnemonic.contains(".d16")
-        || mnemonic.contains(".d32")
-        || mnemonic.contains(".d64")
-        || mnemonic.contains(".d4");
-    let is_unsigned = mnemonic.contains(".u") || has_dot_d_digit;
-
-    if mnemonic.ends_with("8") || mnemonic.contains(".i8") || mnemonic.contains(".u8") {
-        if is_unsigned {
-            Some(ElementType::UInt8)
-        } else {
-            Some(ElementType::Int8)
-        }
-    } else if mnemonic.ends_with("16") || mnemonic.contains(".i16") || mnemonic.contains(".u16") {
-        // BFloat16 check before generic 16-bit: bf16 contains "16" but is float.
-        if mnemonic.contains("bf16") || mnemonic.contains(".bf") {
-            return Some(ElementType::BFloat16);
-        }
-        if is_unsigned {
-            Some(ElementType::UInt16)
-        } else {
-            Some(ElementType::Int16)
-        }
-    } else if mnemonic.ends_with("32") || mnemonic.contains(".i32") || mnemonic.contains(".u32") {
-        if is_unsigned {
-            Some(ElementType::UInt32)
-        } else {
-            Some(ElementType::Int32)
-        }
-    } else if mnemonic.ends_with("64") || mnemonic.contains(".i64") || mnemonic.contains(".u64") {
-        if is_unsigned {
-            Some(ElementType::UInt64)
-        } else {
-            Some(ElementType::Int64)
-        }
-    } else if mnemonic.contains("bf16") || mnemonic.contains(".bf") {
-        Some(ElementType::BFloat16)
-    } else if mnemonic.contains("f32") || mnemonic.contains("float")
-        || mnemonic.ends_with(".f")
-    {
-        Some(ElementType::Float32)
-    } else {
-        None
-    }
+    super::element_type_logic::infer_type_tag_from_mnemonic(mnemonic).map(tag_to_element_type)
 }
 
-/// Parse a type token like "S16", "D32", "S64", "FP32", "BF16" into an ElementType.
-fn parse_type_token(token: &str) -> Option<ElementType> {
-    match token {
-        "S8" => Some(ElementType::Int8),
-        "D8" => Some(ElementType::UInt8),
-        "S16" => Some(ElementType::Int16),
-        "D16" => Some(ElementType::UInt16),
-        "S32" => Some(ElementType::Int32),
-        "D32" => Some(ElementType::UInt32),
-        "S64" => Some(ElementType::Int64),
-        "D64" => Some(ElementType::UInt64),
-        "FP32" => Some(ElementType::Float32),
-        "BF16" => Some(ElementType::BFloat16),
-        _ => None,
-    }
-}
 
 /// Infer both element types for dual-type instructions (SRS/UPS/CONV/FLOOR).
 ///
-/// Encoding names follow these patterns:
-/// - Standalone SRS/UPS: `V{SRS|UPS}_{OUT}_{IN}_*`
-/// - Fused SRS/UPS with 2D/3D: `V{LDA|ST}_{2D|3D}_{UPS|SRS}_{OUT}_{IN}*`
-/// - Fused SRS/UPS without 2D/3D: `V{LDA|ST}_{UPS|SRS}_{OUT}_{IN}_*`
-/// - Standalone CONV: `VCONV_{FROM}_{TO}` (note: FROM first, swapped vs SRS/UPS)
-/// - Standalone FLOOR: `VFLOOR_{FROM}_{TO}_*`
-/// - Fused CONV with 2D/3D: `V{LDA|ST}_{CONV}_{2D|3D}_{FROM}_{TO}*`
-/// - Fused CONV without 2D/3D: `V{LDA|ST}_{CONV}_{FROM}_{TO}_*`
-///
+/// Delegates to shared logic in `element_type_logic.rs`.
 /// Returns `(element_type, from_type)` where element_type is the OUTPUT
-/// type and from_type is the INPUT type. Returns `(None, None)` for
-/// unrecognized patterns.
+/// type and from_type is the INPUT type.
 pub fn infer_dual_element_types(name: &str) -> (Option<ElementType>, Option<ElementType>) {
-    let parts: Vec<&str> = name.split('_').collect();
-
-    // Pattern 1: V{SRS|UPS}_{OUT}_{IN}_*
-    if parts.len() >= 3 && (parts[0] == "VSRS" || parts[0] == "VSRSM" || parts[0] == "VUPS") {
-        if let (Some(out_type), Some(in_type)) =
-            (parse_type_token(parts[1]), parse_type_token(parts[2]))
-        {
-            return (Some(out_type), Some(in_type));
-        }
-    }
-
-    // Pattern 2: V{LDA|ST}_{2D|3D}_{UPS|SRS}_{OUT}_{IN}*
-    if parts.len() >= 5 {
-        let is_fused = (parts[0] == "VLDA" || parts[0] == "VST")
-            && (parts[2] == "UPS" || parts[2] == "SRS");
-        if is_fused {
-            if let (Some(out_type), Some(in_type)) =
-                (parse_type_token(parts[3]), parse_type_token(parts[4]))
-            {
-                return (Some(out_type), Some(in_type));
-            }
-        }
-    }
-
-    // Pattern 3: V{LDA|ST}_{UPS|SRS}_{OUT}_{IN}* (no 2D/3D prefix)
-    if parts.len() >= 4 {
-        let is_fused = (parts[0] == "VLDA" || parts[0] == "VST")
-            && (parts[1] == "UPS" || parts[1] == "SRS");
-        if is_fused {
-            if let (Some(out_type), Some(in_type)) =
-                (parse_type_token(parts[2]), parse_type_token(parts[3]))
-            {
-                return (Some(out_type), Some(in_type));
-            }
-        }
-    }
-
-    // Pattern 4a: VFLOOR_{OUT}_{IN}_* (same convention as SRS/UPS)
-    // The suffix mFl2FxSrc confirms: float IN, fixed-point OUT.
-    if parts.len() >= 3 && parts[0] == "VFLOOR" {
-        if let (Some(out_type), Some(in_type)) =
-            (parse_type_token(parts[1]), parse_type_token(parts[2]))
-        {
-            return (Some(out_type), Some(in_type));
-        }
-    }
-
-    // Pattern 4b: VCONV_{OUT}_{IN}
-    // Same convention as SRS/UPS: first type is output, second is input.
-    // Example: VCONV_FP32_BF16 = output fp32, input bf16 (bf16->fp32 expansion).
-    if parts.len() >= 3 && parts[0] == "VCONV" {
-        if let (Some(out_type), Some(in_type)) =
-            (parse_type_token(parts[1]), parse_type_token(parts[2]))
-        {
-            return (Some(out_type), Some(in_type));
-        }
-    }
-
-    // Pattern 5: Fused CONV variants
-    if parts.len() >= 4 && (parts[0] == "VLDA" || parts[0] == "VST") {
-        // Find the CONV keyword position, then types follow after it.
-        if let Some(conv_pos) = parts.iter().position(|&p| p == "CONV") {
-            if conv_pos + 2 < parts.len() {
-                // Skip optional 2D/3D after CONV
-                let type_start = if parts.get(conv_pos + 1).map_or(false,
-                    |p| *p == "2D" || *p == "3D")
-                {
-                    conv_pos + 2
-                } else {
-                    conv_pos + 1
-                };
-                if type_start + 1 < parts.len() {
-                    if let (Some(from_type), Some(to_type)) =
-                        (parse_type_token(parts[type_start]), parse_type_token(parts[type_start + 1]))
-                    {
-                        return (Some(to_type), Some(from_type));
-                    }
-                }
-            }
-        }
-    }
-
-    (None, None)
+    let (et, ft) = super::element_type_logic::infer_dual_type_tags(name);
+    (et.map(tag_to_element_type), ft.map(tag_to_element_type))
 }
 
 /// Refine a Br semantic to BrCond when the mnemonic indicates a condition.
@@ -2279,24 +2143,26 @@ mod tests {
         assert_eq!(ft, Some(ElementType::BFloat16));  // from = BF16
 
         // Fused CONV: VLDA_2D_CONV_FP32_BF16
+        // Same {OUT}_{IN} convention: FP32 is output, BF16 is input.
         let (et, ft) = infer_dual_element_types("VLDA_2D_CONV_FP32_BF16");
-        assert_eq!(et, Some(ElementType::BFloat16));
-        assert_eq!(ft, Some(ElementType::Float32));
+        assert_eq!(et, Some(ElementType::Float32));
+        assert_eq!(ft, Some(ElementType::BFloat16));
 
         // Fused CONV without 2D: VLDA_CONV_FP32_BF16_ag_idx
         let (et, ft) = infer_dual_element_types("VLDA_CONV_FP32_BF16_ag_idx");
+        assert_eq!(et, Some(ElementType::Float32));
+        assert_eq!(ft, Some(ElementType::BFloat16));
+
+        // Fused store CONV: VST_CONV_BF16_FP32_ag_idx
+        // {OUT}_{IN}: BF16 output, FP32 input.
+        let (et, ft) = infer_dual_element_types("VST_CONV_BF16_FP32_ag_idx");
         assert_eq!(et, Some(ElementType::BFloat16));
         assert_eq!(ft, Some(ElementType::Float32));
 
-        // Fused store CONV: VST_CONV_BF16_FP32_ag_idx
-        let (et, ft) = infer_dual_element_types("VST_CONV_BF16_FP32_ag_idx");
-        assert_eq!(et, Some(ElementType::Float32));
-        assert_eq!(ft, Some(ElementType::BFloat16));
-
         // Fused store CONV with 2D: VST_CONV_2D_BF16_FP32
         let (et, ft) = infer_dual_element_types("VST_CONV_2D_BF16_FP32");
-        assert_eq!(et, Some(ElementType::Float32));
-        assert_eq!(ft, Some(ElementType::BFloat16));
+        assert_eq!(et, Some(ElementType::BFloat16));
+        assert_eq!(ft, Some(ElementType::Float32));
     }
 
     #[test]

@@ -17,6 +17,12 @@ pub mod decoder_ffi;
 mod resolver;
 mod types;
 
+// Shared element type inference logic (canonical source: build_helpers/).
+// Included here so the runtime resolver can delegate to the same logic
+// that the build-time codegen uses. See build_helpers/element_type_logic.rs.
+#[path = "../../build_helpers/element_type_logic.rs"]
+mod element_type_logic;
+
 // Build-time generated instruction tables (per-slot files for parallel compilation)
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/gen_tablegen.rs"));
