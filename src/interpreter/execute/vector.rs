@@ -4001,27 +4001,33 @@ impl VectorAlu {
             }
 
             SemanticOp::Align => {
-                // Concatenate s1:s2, extract 512 bits at byte offset.
+                // VSHIFT / VSHIFT_ALIGN barrel shifter.
                 //
-                // VSHIFT:       sources = [s1 (Vec512), s2 (Vec512), shift (Scalar)]
-                // VSHIFT_ALIGN: sources = [s1 (Vec512), pre (Scalar), s2 (Vec512), shift (Scalar)]
+                // VSHIFT:       sources = [s1, s2, shift(Scalar)]
+                //               step = 0 (no pre-shift stage)
                 //
-                // Both forms: byte shift = last scalar source (r-register).
-                // VSHIFT_ALIGN also has a "pre" s-register operand
-                // whose exact effect on the shift calculation is not
-                // yet understood -- currently ignored (1/17 passing).
+                // VSHIFT_ALIGN: sources = [s1, step(Scalar), s2, shift(Scalar)]
+                //               step = s-register value (pre-shift selector)
+                //
+                // The hardware uses a mask-based merge + barrel shift +
+                // optional pre-shift merge. See wide_vector_shift() docs.
                 let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
 
                 let n_scalars = op.sources.iter().filter(|s| {
                     matches!(s, Operand::ScalarReg(_) | Operand::Immediate(_))
                 }).count();
-                let total_shift = if n_scalars >= 2 {
-                    Self::get_nth_scalar_source(op, ctx, 1)
+
+                let (step, shift) = if n_scalars >= 2 {
+                    // VSHIFT_ALIGN: first scalar = step, second = shift
+                    let step = Self::get_nth_scalar_source(op, ctx, 0);
+                    let shift = Self::get_nth_scalar_source(op, ctx, 1);
+                    (step, shift)
                 } else {
-                    Self::get_nth_scalar_source(op, ctx, 0)
+                    // VSHIFT: single scalar = shift, step = 0
+                    (0, Self::get_nth_scalar_source(op, ctx, 0))
                 };
 
-                let result = Self::wide_vector_align(&a, &b, total_shift);
+                let result = Self::wide_vector_shift(&a, &b, step, shift);
                 Self::write_wide_vec_dest(op, ctx, result);
                 true
             }
@@ -4430,28 +4436,131 @@ impl VectorAlu {
     /// Logically: `result = (src1 || src2)[byte_shift .. byte_shift + 64]`.
     /// Bytes beyond the 128-byte window are zero-padded.  The shift is masked
     /// to 7 bits (0–127).
-    fn wide_vector_align(src1: &Vec512, src2: &Vec512, byte_shift: u32) -> Vec512 {
-        let shift = (byte_shift & 0x7F) as usize; // clamp to 0–127
+    /// VSHIFT/VSHIFT_ALIGN barrel shifter.
+    ///
+    /// Implements the hardware barrel shift with optional pre-shift stage.
+    /// Derived from aietools ISG reference model (`vshift_hw` in
+    /// `me_inline_primitives.h`). The hardware uses a mask-based merge
+    /// of vectors a and b, followed by a progressive barrel shift, then
+    /// an optional pre-shifted copy of a merged into the high bytes.
+    ///
+    /// Parameters:
+    ///   a, b: 512-bit source vectors
+    ///   step: 3-bit pre-shift selector (from s-register & 0x7):
+    ///         0 = no pre-shift (plain VSHIFT behavior)
+    ///         1 = pre-shift a by 4 bytes (32 bits)
+    ///         2 = pre-shift a by 8 bytes (64 bits)
+    ///         3 = pre-shift a by 16 bytes (128 bits)
+    ///         4 = pre-shift a by 32 bytes (256 bits)
+    ///   shift: byte shift amount from r-register (full 32-bit value)
+    fn wide_vector_shift(a_orig: &Vec512, b: &Vec512, step: u32, shift: u32) -> Vec512 {
+        // Convert to byte arrays for manipulation.
+        let mut a_bytes = [0u8; 64];
+        let mut b_bytes = [0u8; 64];
+        for i in 0..16 {
+            let aw = a_orig[i].to_le_bytes();
+            let bw = b[i].to_le_bytes();
+            a_bytes[i*4..i*4+4].copy_from_slice(&aw);
+            b_bytes[i*4..i*4+4].copy_from_slice(&bw);
+        }
 
-        // Helper: read one byte from the 128-byte concatenated space.
-        let get_byte = |idx: usize| -> u8 {
-            let word_array = if idx < 64 { src1 } else { src2 };
-            let adj = idx % 64;
-            let w = adj / 4;
-            let b = adj % 4;
-            ((word_array[w] >> (b * 8)) & 0xFF) as u8
-        };
+        // Step 1: vshift_mask -- decompose shift register value.
+        // Extract 6-bit shift amount and hi_shft flag.
+        let shift_6 = (shift & 0x3F) as usize;
+        let hi_shft = shift >= 64;
 
+        // Build 64-bit mask: mask = (0xFFFF_FFFF_FFFF_FFFF << shift)[127:64]
+        // This gives a mask where the high bits are set based on shift amount.
+        let mask_128: u128 = 0xFFFF_FFFF_FFFF_FFFFu128 << (shift & 0x7F);
+        let mask_64: u64 = (mask_128 >> 64) as u64;
+
+        // Step 2: Compute pre-shifted version of a (for step != 0).
+        let mut pre_bytes = [0u8; 64];
+        let mut a_active = a_bytes;
+        let step_val = step & 0x7;
+        if step_val >= 1 && step_val <= 4 {
+            // Pre-shift a right by 2^(step+1) bytes = {4, 8, 16, 32} bytes.
+            let pre_shift_bits = match step_val {
+                1 => 32,   // 4 bytes
+                2 => 64,   // 8 bytes
+                3 => 128,  // 16 bytes
+                4 => 256,  // 32 bytes
+                _ => 0,
+            };
+            // Right-shift a_orig by pre_shift_bits as a 512-bit value.
+            let pre_shift_bytes = pre_shift_bits / 8;
+            for i in 0..64 {
+                let src_idx = i + pre_shift_bytes;
+                pre_bytes[i] = if src_idx < 64 { a_bytes[src_idx] } else { 0 };
+            }
+            // When step != 0, a is zeroed for the main shift stage.
+            a_active = [0u8; 64];
+        }
+
+        // Step 3: Build per-byte masks from the 64-bit mask.
+        // maska: for vector a, maskb: for vector b.
+        // If hi_shft: maska = 0 (all zero), else maska = ~mask (inverted).
+        // maskb = mask.
+        let maska_64: u64 = if hi_shft { 0 } else { !mask_64 };
+        let maskb_64: u64 = mask_64;
+
+        // Expand 1-bit-per-byte masks to full byte masks.
+        let mut c_bytes = [0u8; 64];
+        for i in 0..64 {
+            let a_sel = (maska_64 >> i) & 1;
+            let b_sel = (maskb_64 >> i) & 1;
+            c_bytes[i] = if a_sel != 0 { a_active[i] }
+                         else if b_sel != 0 { b_bytes[i] }
+                         else { 0 };
+        }
+
+        // Step 4: Progressive barrel shift using shift[5:0] bit by bit.
+        // Each bit rotates c by that power of 2 bytes.
+        // Bit 5: rotate by 32 bytes
+        // Bit 4: rotate by 16 bytes
+        // Bit 3: rotate by 8 bytes
+        // Bit 2: rotate by 4 bytes
+        // Bit 1: rotate by 2 bytes
+        // Bit 0: rotate by 1 byte
+        // Each rotation: c = [c[0..N-1], c[N..63]] (low bytes move to top).
+        for bit in (0..6).rev() {
+            if (shift_6 >> bit) & 1 != 0 {
+                let n = 1 << bit; // bytes to rotate
+                let mut rotated = [0u8; 64];
+                for i in 0..64 {
+                    rotated[i] = c_bytes[(i + n) % 64];
+                }
+                c_bytes = rotated;
+            }
+        }
+
+        // Step 5: Merge pre-shifted portion into result.
+        // maskpre = bit-reversed maska (bit i of maskpre = bit (63-i) of maska).
+        // result = c | (pre & maskpre)
+        let mut maskpre_64: u64 = 0;
+        for i in 0..64 {
+            let bit = (maska_64 >> (63 - i)) & 1;
+            maskpre_64 |= bit << i;
+        }
+        for i in 0..64 {
+            if (maskpre_64 >> i) & 1 != 0 {
+                c_bytes[i] |= pre_bytes[i];
+            }
+        }
+
+        // Convert back to Vec512.
         let mut result = [0u32; 16];
         for i in 0..16 {
-            let base = i * 4 + shift;
-            let b0 = if base     < 128 { get_byte(base)     } else { 0 } as u32;
-            let b1 = if base + 1 < 128 { get_byte(base + 1) } else { 0 } as u32;
-            let b2 = if base + 2 < 128 { get_byte(base + 2) } else { 0 } as u32;
-            let b3 = if base + 3 < 128 { get_byte(base + 3) } else { 0 } as u32;
-            result[i] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+            result[i] = u32::from_le_bytes([
+                c_bytes[i*4], c_bytes[i*4+1], c_bytes[i*4+2], c_bytes[i*4+3]
+            ]);
         }
         result
+    }
+
+    /// Simple concat-and-extract shift (used by narrow VSHIFT path).
+    fn wide_vector_align(src1: &Vec512, src2: &Vec512, byte_shift: u32) -> Vec512 {
+        Self::wide_vector_shift(src1, src2, 0, byte_shift)
     }
 }
 
