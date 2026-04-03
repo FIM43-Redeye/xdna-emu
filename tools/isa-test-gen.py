@@ -2160,6 +2160,14 @@ def generate_operand_combos(instr: dict) -> list[dict[str, str]]:
             combo[op_name] = alt_val
             combos.append(combo)
 
+    # DIVS: hardware requires d0 == s0 (the dstep state machine feeds d0
+    # back as the next s0).  AIE2PS encodes this explicitly; AIE2 enforces
+    # it silently.  Tie d0 to s0 in every combo.
+    iname = instr.get("name", "")
+    if iname == "DIVS" and "d0" in defaults and "s0" in defaults:
+        for combo in combos:
+            combo["d0"] = combo["s0"]
+
     return combos
 
 
