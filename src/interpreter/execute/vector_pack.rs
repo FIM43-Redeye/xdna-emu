@@ -187,7 +187,9 @@ fn find_type_pair(parts: &[&str]) -> Option<(usize, usize)> {
 /// Returns (bits_in, bits_out, signed).
 pub fn pack_widths_from_name(name: &str) -> (u32, u32, bool) {
     let upper = name.to_uppercase();
-    let parts: Vec<&str> = upper.split('_').collect();
+    // Split on both '_' and '.' to handle encoding names ("VPACK_D4_D8")
+    // and mnemonics ("vpack.d4.d8").
+    let parts: Vec<&str> = upper.split(|c| c == '_' || c == '.').collect();
     if let Some((out_idx, in_idx)) = find_type_pair(&parts) {
         let signed = parts[out_idx].starts_with('S') || parts[in_idx].starts_with('S');
         let out_bits: u32 = parts[out_idx][1..].parse().unwrap_or(8);
@@ -205,7 +207,9 @@ pub fn pack_widths_from_name(name: &str) -> (u32, u32, bool) {
 /// Returns (bits_in, bits_out, signed).
 pub fn unpack_widths_from_name(name: &str) -> (u32, u32, bool) {
     let upper = name.to_uppercase();
-    let parts: Vec<&str> = upper.split('_').collect();
+    // Split on both '_' and '.' to handle encoding names ("VUNPACK_S16_S8")
+    // and mnemonics ("vunpack.s16.s8").
+    let parts: Vec<&str> = upper.split(|c| c == '_' || c == '.').collect();
     if let Some((out_idx, in_idx)) = find_type_pair(&parts) {
         let signed = parts[out_idx].starts_with('S') || parts[in_idx].starts_with('S');
         let out_bits: u32 = parts[out_idx][1..].parse().unwrap_or(16);

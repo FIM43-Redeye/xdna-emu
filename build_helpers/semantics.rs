@@ -392,6 +392,8 @@ fn parse_type_token_str(token: &str) -> Option<String> {
         "D32" => Some("ElementType::UInt32".to_string()),
         "S64" => Some("ElementType::Int64".to_string()),
         "D64" => Some("ElementType::UInt64".to_string()),
+        "BF16" => Some("ElementType::BFloat16".to_string()),
+        "FP32" => Some("ElementType::Float32".to_string()),
         _ => None,
     }
 }
@@ -402,12 +404,22 @@ fn parse_type_token_str(token: &str) -> Option<String> {
 pub fn infer_dual_element_types(name: &str) -> (Option<String>, Option<String>) {
     let parts: Vec<&str> = name.split('_').collect();
 
-    // Pattern 1: V{SRS|UPS}_{OUT}_{IN}_*
-    if parts.len() >= 3 && (parts[0] == "VSRS" || parts[0] == "VUPS") {
+    // Pattern 1: V{SRS|UPS|FLOOR}_{OUT}_{IN}_*
+    // VFLOOR uses the same convention as SRS/UPS: {OUT}_{IN}.
+    if parts.len() >= 3 && (parts[0] == "VSRS" || parts[0] == "VUPS" || parts[0] == "VFLOOR") {
         if let (Some(out_type), Some(in_type)) =
             (parse_type_token_str(parts[1]), parse_type_token_str(parts[2]))
         {
             return (Some(out_type), Some(in_type));
+        }
+    }
+
+    // Pattern 1b: VCONV_{FROM}_{TO}_* (note: opposite of VFLOOR/SRS/UPS)
+    if parts.len() >= 3 && parts[0] == "VCONV" {
+        if let (Some(from_type), Some(to_type)) =
+            (parse_type_token_str(parts[1]), parse_type_token_str(parts[2]))
+        {
+            return (Some(to_type), Some(from_type));
         }
     }
 

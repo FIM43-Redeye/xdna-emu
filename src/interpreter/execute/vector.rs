@@ -4001,9 +4001,15 @@ impl VectorAlu {
             }
 
             SemanticOp::Align => {
+                // VSHIFT_ALIGN: concatenate s1:s2, extract 512 bits at byte offset.
+                // Sources: [s1 (Vec512), pre (Scalar), s2 (Vec512), shift (Scalar)].
+                // The `pre` value adds a 16-byte-aligned pre-shift, and `shift`
+                // gives the remaining byte offset within that window.
                 let (a, b) = Self::get_two_wide_vec_sources(op, ctx);
-                let shift = Self::get_lane_index(op, ctx);
-                let result = Self::wide_vector_align(&a, &b, shift);
+                let pre = Self::get_nth_scalar_source(op, ctx, 0);
+                let shift = Self::get_nth_scalar_source(op, ctx, 1);
+                let total_shift = (pre & 0x3) * 16 + shift;
+                let result = Self::wide_vector_align(&a, &b, total_shift);
                 Self::write_wide_vec_dest(op, ctx, result);
                 true
             }
@@ -4129,10 +4135,100 @@ impl VectorAlu {
                 true
             }
             SemanticOp::SetEq => {
-                // VCMP_EQZ: compare each element to zero.
+                // VEQZ: compare each element to zero, produce scalar comparison bitmask.
+                // VEQZ has the cmp register as primary dest (not extra_dests), so
+                // write to dest via write_scalar_dest. Also write to extra_dests
+                // for dual-result ops that might share this path.
                 let a = Self::get_wide_vec_source(op, ctx, 0);
                 let result = Self::wide_element_wise_unary(&a, et, Self::vector_compare_eqz);
-                Self::write_wide_vec_dest(op, ctx, result);
+                let lo: [u32; 8] = result[..8].try_into().unwrap();
+                let hi: [u32; 8] = result[8..].try_into().unwrap();
+                let mask_lo = Self::condense_comparison_mask(&lo, op.element_type);
+                let mask_hi = Self::condense_comparison_mask(&hi, op.element_type);
+                let lanes_per_half = 256 / et.bits() as u32;
+                let full_mask = (mask_lo as u64) | ((mask_hi as u64) << lanes_per_half);
+                if lanes_per_half >= 32 {
+                    Self::write_scalar_dest_wide(op, ctx, full_mask);
+                    Self::write_cmp_dest_wide(op, ctx, full_mask);
+                } else {
+                    Self::write_scalar_dest(op, ctx, full_mask as u32);
+                    Self::write_cmp_dest(op, ctx, full_mask as u32);
+                }
+                true
+            }
+
+            // ========== Convert (wide path) ==========
+
+            SemanticOp::Convert => {
+                // VCONV/VFLOOR: type conversion.
+                // Three source types:
+                // A. Accumulator source (VCONV_FP32_BF16, VCONV_BF16_FP32): read acc,
+                //    extract lower 32 bits per lane as the input vector.
+                // B. Narrow vector source (VFLOOR bf16->s32): 256-bit in, 512-bit out.
+                // C. Wide vector source: 512-bit in, 512-bit out.
+                let from = op.from_type.unwrap_or(ElementType::Int32);
+                let has_acc_source = op.sources.iter()
+                    .any(|s| matches!(s, Operand::AccumReg(_)));
+
+                if has_acc_source {
+                    // Accumulator source: read acc lanes, extract lower 32 bits each.
+                    let acc_reg = Self::get_acc_source(op);
+                    let acc = ctx.accumulator.read_wide(acc_reg);
+                    // Each acc lane is u64; extract lower 32 bits for vector_convert.
+                    let mut src_lo = [0u32; 8];
+                    let mut src_hi = [0u32; 8];
+                    for i in 0..8 {
+                        src_lo[i] = acc[i] as u32;
+                        src_hi[i] = acc[i + 8] as u32;
+                    }
+                    let res_lo = Self::vector_convert(&src_lo, from, et);
+                    let res_hi = Self::vector_convert(&src_hi, from, et);
+                    // VCONV may produce narrow output (e.g., f32->bf16 packs 8 f32
+                    // into 4 words of bf16). Write to the appropriate dest width.
+                    if et.bits() < from.bits() {
+                        // Contraction: 512-bit acc -> 256-bit vector.
+                        // Each half contracts; pack results into one 256-bit output.
+                        let words_per_half = (8 * et.bits() as usize) / (from.bits() as usize);
+                        let mut result = [0u32; 8];
+                        result[..words_per_half].copy_from_slice(&res_lo[..words_per_half]);
+                        result[words_per_half..words_per_half * 2]
+                            .copy_from_slice(&res_hi[..words_per_half]);
+                        Self::write_vector_dest(op, ctx, result);
+                    } else {
+                        // Same-width or expansion from acc.
+                        let mut result = [0u32; 16];
+                        result[..8].copy_from_slice(&res_lo);
+                        result[8..].copy_from_slice(&res_hi);
+                        Self::write_wide_vec_dest(op, ctx, result);
+                    }
+                } else {
+                    let is_expansion = from.bits() < et.bits();
+                    if is_expansion {
+                        // Narrow source (256-bit w-register) -> wide dest (512-bit x-register).
+                        let src = Self::get_vector_source(op, ctx, 0);
+                        let mut lo_in = [0u32; 8];
+                        lo_in[..4].copy_from_slice(&src[..4]);
+                        let mut hi_in = [0u32; 8];
+                        hi_in[..4].copy_from_slice(&src[4..]);
+                        let res_lo = Self::vector_convert(&lo_in, from, et);
+                        let res_hi = Self::vector_convert(&hi_in, from, et);
+                        let mut result = [0u32; 16];
+                        result[..8].copy_from_slice(&res_lo);
+                        result[8..].copy_from_slice(&res_hi);
+                        Self::write_wide_vec_dest(op, ctx, result);
+                    } else {
+                        // Same-width: 512-bit source, 512-bit dest.
+                        let src = Self::get_wide_vec_source(op, ctx, 0);
+                        let src_lo: [u32; 8] = src[..8].try_into().unwrap();
+                        let src_hi: [u32; 8] = src[8..].try_into().unwrap();
+                        let res_lo = Self::vector_convert(&src_lo, from, et);
+                        let res_hi = Self::vector_convert(&src_hi, from, et);
+                        let mut result = [0u32; 16];
+                        result[..8].copy_from_slice(&res_lo);
+                        result[8..].copy_from_slice(&res_hi);
+                        Self::write_wide_vec_dest(op, ctx, result);
+                    }
+                }
                 true
             }
 
