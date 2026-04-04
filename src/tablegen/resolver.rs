@@ -775,10 +775,12 @@ impl<'a> Resolver<'a> {
             }
         }
 
-        // Two-tier semantic inference: pattern -> structural.
+        // Three-tier semantic inference: pattern -> structural -> fused refinement.
         // Pattern-based semantics come from parsed Pat<> entries in TableGenData.
         // Structural inference uses TableGen attributes (mayLoad, Defs, etc.).
-        // No mnemonic fallback -- all semantics are data-driven.
+        // Fused refinement uses the instruction NAME to distinguish Load/Store
+        // from fused ops (UPS/SRS/Pack/Unpack/Convert) that LLVM lacks Pat<>
+        // entries for (they're selected in C++, not TableGen patterns).
         let defs_vec: Vec<String> = instr.attributes.defs.iter().cloned().collect();
         let uses_vec: Vec<String> = instr.attributes.uses.iter().cloned().collect();
         let semantic = self.data.semantic_for_instruction(&instr.name)
@@ -792,6 +794,10 @@ impl<'a> Resolver<'a> {
 
         // Refine Br -> BrCond for conditional branches
         let semantic = refine_branch_semantic(&instr.mnemonic, semantic);
+
+        // Refine Load/Store -> fused semantics (UPS/SRS/Pack/Unpack/Convert)
+        // using the TableGen instruction name, not the runtime mnemonic.
+        let semantic = refine_fused_semantic(&instr.name, semantic);
 
         // Extract operand ordering from InstrDef
         let input_order: Vec<String> = instr.inputs.iter().map(|o| o.name.clone()).collect();
@@ -1349,6 +1355,66 @@ pub fn refine_branch_semantic(mnemonic: &str, semantic: Option<SemanticOp>) -> O
         Some(SemanticOp::BrCond)
     } else {
         semantic
+    }
+}
+
+/// Refine Load/Store/None into fused compute semantics using the TableGen
+/// instruction name.
+///
+/// Fused instructions (vlda.ups, vst.srs, vst.pack, vldb.unpack, vlda.conv,
+/// vst.conv) combine memory access with a compute step.  Structural inference
+/// only sees `mayLoad`/`mayStore` and returns generic Load/Store.  The
+/// instruction NAME from TableGen encodes the fused operation (e.g.
+/// `VLDA_UPS_S64_S32_ag_idx`), so we can refine without runtime mnemonic
+/// parsing.
+///
+/// Standalone VUNPACK/VPACK have neither mayLoad nor mayStore (they operate
+/// purely on registers), so structural inference returns None.  We assign
+/// Unpack/Pack based on the name prefix.
+pub fn refine_fused_semantic(name: &str, semantic: Option<SemanticOp>) -> Option<SemanticOp> {
+    match semantic {
+        Some(SemanticOp::Load) => {
+            // VLDA_UPS_* -> load + upshift to accumulator
+            if name.contains("_UPS_") {
+                return Some(SemanticOp::Ups);
+            }
+            // VLDB_*_UNPACK_* or VLDA_*_UNPACK_* -> load + unpack (widen)
+            if name.contains("_UNPACK_") {
+                return Some(SemanticOp::Unpack);
+            }
+            // VLDA_CONV_* -> load + convert (e.g., bf16 -> f32)
+            if name.contains("_CONV_") {
+                return Some(SemanticOp::Convert);
+            }
+            semantic
+        }
+        Some(SemanticOp::Store) => {
+            // VST_SRS_* -> shift-round-saturate + store
+            if name.contains("_SRS_") {
+                return Some(SemanticOp::Srs);
+            }
+            // VST_PACK_* -> pack (narrow) + store
+            if name.contains("_PACK_") {
+                return Some(SemanticOp::Pack);
+            }
+            // VST_CONV_* -> convert + store (e.g., f32 -> bf16)
+            if name.contains("_CONV_") {
+                return Some(SemanticOp::Convert);
+            }
+            semantic
+        }
+        None => {
+            // Standalone VUNPACK (register-to-register, no memory access)
+            if name.starts_with("VUNPACK_") {
+                return Some(SemanticOp::Unpack);
+            }
+            // Standalone VPACK (register-to-register, no memory access)
+            if name.starts_with("VPACK_") {
+                return Some(SemanticOp::Pack);
+            }
+            None
+        }
+        _ => semantic,
     }
 }
 
@@ -2174,5 +2240,84 @@ mod tests {
         let (et, ft) = infer_dual_element_types("VMAC_vmac_cm_core_dense");
         assert_eq!(et, None);
         assert_eq!(ft, None);
+    }
+
+    #[test]
+    fn test_refine_fused_semantic_load_ups() {
+        assert_eq!(
+            refine_fused_semantic("VLDA_UPS_S64_S32_ag_idx", Some(SemanticOp::Load)),
+            Some(SemanticOp::Ups),
+        );
+        assert_eq!(
+            refine_fused_semantic("VLDA_UPS_S32_D16_ag_pstm_nrm_imm", Some(SemanticOp::Load)),
+            Some(SemanticOp::Ups),
+        );
+    }
+
+    #[test]
+    fn test_refine_fused_semantic_store_srs() {
+        assert_eq!(
+            refine_fused_semantic("VST_SRS_S32_S64_ag_idx_imm", Some(SemanticOp::Store)),
+            Some(SemanticOp::Srs),
+        );
+    }
+
+    #[test]
+    fn test_refine_fused_semantic_store_pack() {
+        assert_eq!(
+            refine_fused_semantic("VST_PACK_D4_D8_ag_idx", Some(SemanticOp::Store)),
+            Some(SemanticOp::Pack),
+        );
+    }
+
+    #[test]
+    fn test_refine_fused_semantic_load_unpack() {
+        assert_eq!(
+            refine_fused_semantic("VLDB_2D_UNPACK_D16_D8", Some(SemanticOp::Load)),
+            Some(SemanticOp::Unpack),
+        );
+    }
+
+    #[test]
+    fn test_refine_fused_semantic_standalone_pack_unpack() {
+        // Standalone VUNPACK/VPACK have no mayLoad/mayStore -> semantic=None
+        assert_eq!(
+            refine_fused_semantic("VUNPACK_D16_D8", None),
+            Some(SemanticOp::Unpack),
+        );
+        assert_eq!(
+            refine_fused_semantic("VPACK_S4_S8", None),
+            Some(SemanticOp::Pack),
+        );
+    }
+
+    #[test]
+    fn test_refine_fused_semantic_conv() {
+        assert_eq!(
+            refine_fused_semantic("VLDA_CONV_FP32_BF16_ag_idx", Some(SemanticOp::Load)),
+            Some(SemanticOp::Convert),
+        );
+        assert_eq!(
+            refine_fused_semantic("VST_CONV_BF16_FP32_ag_pstm_nrm", Some(SemanticOp::Store)),
+            Some(SemanticOp::Convert),
+        );
+    }
+
+    #[test]
+    fn test_refine_fused_semantic_passthrough() {
+        // Plain load/store without fused suffix -> unchanged
+        assert_eq!(
+            refine_fused_semantic("VLDA_ag_idx_imm", Some(SemanticOp::Load)),
+            Some(SemanticOp::Load),
+        );
+        assert_eq!(
+            refine_fused_semantic("VST_dmw_sts_w_ag_idx", Some(SemanticOp::Store)),
+            Some(SemanticOp::Store),
+        );
+        // Non-memory semantics -> unchanged
+        assert_eq!(
+            refine_fused_semantic("VADD_32", Some(SemanticOp::Add)),
+            Some(SemanticOp::Add),
+        );
     }
 }

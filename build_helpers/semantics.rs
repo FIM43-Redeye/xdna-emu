@@ -434,6 +434,34 @@ pub fn refine_encoding_semantic(encoding_name: &str) -> Option<String> {
         return Some("SemanticOp::MatMul".to_string());
     }
 
+    // Fused load+compute / compute+store operations.
+    // Structural inference sees only mayLoad/mayStore and returns Load/Store.
+    // The instruction NAME encodes the fused operation.
+    if n.contains("_UPS_") {
+        return Some("SemanticOp::Ups".to_string());
+    }
+    if n.contains("_SRS_") {
+        return Some("SemanticOp::Srs".to_string());
+    }
+    if n.contains("_UNPACK_") {
+        return Some("SemanticOp::Unpack".to_string());
+    }
+    // VST_PACK (fused store+pack) -- match _PACK_ with underscore to avoid
+    // matching VUNPACK which has "PACK" as a substring.
+    if n.contains("_PACK_") && !n.contains("UNPACK") {
+        return Some("SemanticOp::Pack".to_string());
+    }
+    if n.contains("_CONV_") {
+        return Some("SemanticOp::Convert".to_string());
+    }
+    // Standalone VUNPACK/VPACK (register-only, no mayLoad/mayStore).
+    if n.starts_with("VUNPACK_") {
+        return Some("SemanticOp::Unpack".to_string());
+    }
+    if n.starts_with("VPACK_") {
+        return Some("SemanticOp::Pack".to_string());
+    }
+
     // Instructions without Pat<> patterns that need explicit mapping.
     match n {
         "ASHL" => Some("SemanticOp::AshlBidir".to_string()),
