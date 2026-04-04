@@ -852,11 +852,24 @@ impl MemoryUnit {
         let from = op.from_type.unwrap_or(ElementType::Int16);
         let to = op.element_type.unwrap_or(ElementType::Int32);
 
-        let acc_result = super::vector_ups::ups_vector_to_acc(&vec_data, shift, from, to);
+        // Half (bml/bmh) -> 512-bit single register.
+        // Full/None (cm) -> 1024-bit wide pair via w2c upshift.
+        let is_half = matches!(op.accum_width,
+            Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
 
         match &op.dest {
             Some(Operand::AccumReg(r)) => {
-                ctx.accumulator.write(*r, acc_result);
+                if is_half {
+                    let acc = super::vector_ups::ups_vector_to_acc(
+                        &vec_data, shift, from, to,
+                    );
+                    ctx.accumulator.write(*r, acc);
+                } else {
+                    let acc_wide = super::vector_ups::ups_vector_to_acc_wide(
+                        &vec_data, shift, from, to,
+                    );
+                    ctx.accumulator.write_wide(*r, acc_wide);
+                }
             }
             other => {
                 log::warn!(
@@ -872,7 +885,8 @@ impl MemoryUnit {
     /// Execute `vlda.conv`: load from memory, convert type (e.g., bf16 -> f32).
     ///
     /// Loads a 256-bit vector from memory, then applies type conversion.
-    /// The result is written to the destination vector register.
+    /// For bf16->fp32, the 16 bf16 values expand to 16 fp32 values (512 bits)
+    /// and are written to an accumulator register as float accumulator data.
     fn execute_fused_load_convert(
         op: &SlotOp,
         ctx: &mut ExecutionContext,
@@ -883,11 +897,40 @@ impl MemoryUnit {
         let from = op.from_type.unwrap_or(ElementType::BFloat16);
         let to = op.element_type.unwrap_or(ElementType::Float32);
 
-        let result = super::VectorAlu::vector_convert(&vec_data, from, to);
-
-        if let Some(dest) = &op.dest {
-            let latency = load_latency_for_address(Self::get_address(op, ctx));
-            ctx.queue_vector_load(dest.clone(), result, latency);
+        match &op.dest {
+            Some(Operand::AccumReg(r)) => {
+                // bf16 -> fp32: 16 bf16 in 256 bits -> 16 fp32 in 512 bits.
+                // Each bf16 is zero-extended to fp32 (left-shift by 16).
+                // Store as 8 u64 words (2 x fp32 per u64).
+                if from == ElementType::BFloat16 && to == ElementType::Float32 {
+                    let mut acc = [0u64; 8];
+                    for i in 0..8 {
+                        let lo_bf16 = (vec_data[i] & 0xFFFF) as u64;
+                        let hi_bf16 = ((vec_data[i] >> 16) & 0xFFFF) as u64;
+                        let lo_fp32 = lo_bf16 << 16;
+                        let hi_fp32 = hi_bf16 << 16;
+                        acc[i] = lo_fp32 | (hi_fp32 << 32);
+                    }
+                    ctx.accumulator.write(*r, acc);
+                } else {
+                    // Generic path: use vector_convert (256-bit result)
+                    let result = super::VectorAlu::vector_convert(&vec_data, from, to);
+                    // Pack into accumulator as raw u64 words
+                    let mut acc = [0u64; 8];
+                    for i in 0..4 {
+                        acc[i] = result[i * 2] as u64
+                            | ((result[i * 2 + 1] as u64) << 32);
+                    }
+                    ctx.accumulator.write(*r, acc);
+                }
+            }
+            Some(dest) => {
+                // Non-accumulator dest (vector register)
+                let result = super::VectorAlu::vector_convert(&vec_data, from, to);
+                let latency = load_latency_for_address(Self::get_address(op, ctx));
+                ctx.queue_vector_load(dest.clone(), result, latency);
+            }
+            None => {}
         }
 
         Self::apply_post_modify(op, ctx, post_modify);
@@ -907,41 +950,89 @@ impl MemoryUnit {
         neighbors: Option<&mut NeighborMemory>,
     ) {
         let acc_reg = Self::get_acc_source(op);
-        let acc = ctx.accumulator.read(acc_reg);
         let shift = Self::get_shift_amount(op, ctx);
         let from = op.from_type.unwrap_or(ElementType::Int32);
         let to = op.element_type.unwrap_or(ElementType::Int16);
 
-        let narrowed = super::VectorAlu::vector_srs_from_acc(
-            &acc, shift, from, to, &ctx.srs_config,
-        );
-
-        // Calculate store size from the SRS output width.
-        // SRS narrows: e.g., 8 acc32 lanes -> 8x16-bit = 16 bytes.
-        let to_bits = to.bits() as usize;
-        let from_bits = from.bits() as usize;
-        let lanes = if from_bits <= 32 { 16 } else { 8 }; // Acc32 vs Acc64
-        let store_bytes = lanes * to_bits / 8;
+        // Half (bml/bmh) -> 512-bit single register, narrow SRS.
+        // Full/None (cm) -> 1024-bit wide pair, SRS each half and pack.
+        let is_half = matches!(op.accum_width,
+            Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
 
         let addr = Self::get_store_address(op, ctx);
-        log::debug!(
-            "[FUSED] vst.srs: acc{} -> addr=0x{:X} ({} bytes, {:?}->{:?})",
-            acc_reg, addr, store_bytes, from, to,
-        );
 
-        let (quadrant, local_offset) = decode_data_address(addr);
-        if quadrant == MemoryQuadrant::Local {
-            ctx.record_core_bank_access(local_offset as u32, store_bytes, tile.num_banks());
+        if is_half {
+            let acc = ctx.accumulator.read(acc_reg);
+            let narrowed = super::VectorAlu::vector_srs_from_acc(
+                &acc, shift, from, to, &ctx.srs_config,
+            );
+
+            let to_bits = to.bits() as usize;
+            let from_bits = from.bits() as usize;
+            let lanes = if from_bits <= 32 { 16 } else { 8 };
+            let store_bytes = lanes * to_bits / 8;
+
+            log::debug!(
+                "[FUSED] vst.srs: acc{} -> addr=0x{:X} ({} bytes, {:?}->{:?}, half)",
+                acc_reg, addr, store_bytes, from, to,
+            );
+
+            let (quadrant, local_offset) = decode_data_address(addr);
+            if quadrant == MemoryQuadrant::Local {
+                ctx.record_core_bank_access(local_offset as u32, store_bytes, tile.num_banks());
+            }
+
+            Self::write_vector_to_memory(tile, addr, narrowed, neighbors);
+        } else {
+            // Wide SRS: read Acc1024 (cm-register), SRS each half, pack results.
+            let acc_wide = ctx.accumulator.read_wide(acc_reg);
+            let acc_lo: [u64; 8] = acc_wide[..8].try_into().unwrap();
+            let acc_hi: [u64; 8] = acc_wide[8..].try_into().unwrap();
+
+            let result_lo = super::VectorAlu::vector_srs_from_acc(
+                &acc_lo, shift, from, to, &ctx.srs_config,
+            );
+            let result_hi = super::VectorAlu::vector_srs_from_acc(
+                &acc_hi, shift, from, to, &ctx.srs_config,
+            );
+
+            // Pack the two halves. For reduction SRS (e.g., Acc32->i8),
+            // each half only fills a fraction of its 8-word result.
+            let from_bits = from.bits() as usize;
+            let to_bits = to.bits() as usize;
+            let lanes_per_half = if from_bits <= 32 { 16 } else { 8 };
+            let words_per_half = (lanes_per_half * to_bits + 31) / 32;
+            let n = words_per_half.min(8);
+
+            let mut packed = [0u32; 8];
+            packed[..n].copy_from_slice(&result_lo[..n]);
+            if n + n <= 8 {
+                packed[n..n + n].copy_from_slice(&result_hi[..n]);
+            }
+
+            let store_bytes = n * 2 * 4; // Both halves, 4 bytes per u32 word
+
+            log::debug!(
+                "[FUSED] vst.srs: acc{} -> addr=0x{:X} ({} bytes, {:?}->{:?}, wide)",
+                acc_reg, addr, store_bytes, from, to,
+            );
+
+            let (quadrant, local_offset) = decode_data_address(addr);
+            if quadrant == MemoryQuadrant::Local {
+                ctx.record_core_bank_access(local_offset as u32, store_bytes, tile.num_banks());
+            }
+
+            Self::write_vector_to_memory(tile, addr, packed, neighbors);
         }
 
-        Self::write_vector_to_memory(tile, addr, narrowed, neighbors);
         Self::apply_post_modify(op, ctx, post_modify);
     }
 
     /// Execute `vst.pack`: pack vector, store narrowed data to memory.
     ///
-    /// Reads a vector register, applies packing (e.g., 16-bit -> 8-bit),
-    /// then stores the packed result to memory.
+    /// The source is a 512-bit x-register. Each 256-bit half is packed
+    /// independently, then the two packed halves are concatenated into
+    /// a single 256-bit (32-byte) store.
     fn execute_fused_store_pack(
         op: &SlotOp,
         ctx: &mut ExecutionContext,
@@ -949,14 +1040,38 @@ impl MemoryUnit {
         post_modify: &PostModify,
         neighbors: Option<&mut NeighborMemory>,
     ) {
-        let src = Self::get_vector_source(op, ctx);
         let enc_name = op.encoding_name.as_deref().unwrap_or("");
         let (bits_i, bits_o, signed) = super::vector_pack::pack_widths_from_name(enc_name);
 
-        let packed = super::vector_pack::pack_vector(
-            &src, bits_i, bits_o, signed,
+        // Read 512-bit x-register source (wl + wh).
+        let src_lo = Self::get_vector_source(op, ctx);
+        // Read the high half by incrementing the register index.
+        let src_hi = {
+            let mut hi = [0u32; 8];
+            for src in &op.sources {
+                if let Operand::VectorReg(r) = src {
+                    hi = ctx.vector.read(r + 1);
+                    break;
+                }
+            }
+            hi
+        };
+
+        let packed_lo = super::vector_pack::pack_half(
+            &src_lo, bits_i, bits_o, signed,
             super::vector_pack::PackMode::Truncate,
         );
+        let packed_hi = super::vector_pack::pack_half(
+            &src_hi, bits_i, bits_o, signed,
+            super::vector_pack::PackMode::Truncate,
+        );
+
+        // Each half produces (256/bits_i * bits_o) bits of packed data.
+        let words_per_half = ((256 / bits_i as usize) * bits_o as usize / 32).max(1);
+        let mut result = [0u32; 8];
+        let n = words_per_half.min(4); // Each half fits in at most 4 words
+        result[..n].copy_from_slice(&packed_lo[..n]);
+        result[n..n + n].copy_from_slice(&packed_hi[..n]);
 
         let addr = Self::get_store_address(op, ctx);
         log::debug!(
@@ -966,11 +1081,11 @@ impl MemoryUnit {
 
         let (quadrant, local_offset) = decode_data_address(addr);
         if quadrant == MemoryQuadrant::Local {
-            let store_bytes = 256 / bits_o as usize / 8 * bits_o as usize / 8;
-            ctx.record_core_bank_access(local_offset as u32, store_bytes.max(1), tile.num_banks());
+            let store_bytes = n * 2 * 4;
+            ctx.record_core_bank_access(local_offset as u32, store_bytes, tile.num_banks());
         }
 
-        Self::write_vector_to_memory(tile, addr, packed, neighbors);
+        Self::write_vector_to_memory(tile, addr, result, neighbors);
         Self::apply_post_modify(op, ctx, post_modify);
     }
 
