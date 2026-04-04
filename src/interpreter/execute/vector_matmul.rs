@@ -187,18 +187,21 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
 
             if config.bfloat {
                 // BFloat16 mode: accumulator holds fp32 values, two per u64.
-                // The acc2 merge must use fp32 arithmetic, not integer.
+                // Use AIE2 fp32 add (FTZ + NaN canonicalization) for the acc2
+                // merge, matching the hardware's accumulator ALU behavior.
+                use super::vector_float::aie2_fp32_add;
                 for i in 0..n {
-                    let a_lo = f32::from_bits((acc[i] & 0xFFFF_FFFF) as u32);
-                    let a_hi = f32::from_bits((acc[i] >> 32) as u32);
-                    let s_lo = f32::from_bits((src_acc[i] & 0xFFFF_FFFF) as u32);
-                    let s_hi = f32::from_bits((src_acc[i] >> 32) as u32);
-                    let (r_lo, r_hi) = if is_sub {
-                        (a_lo - s_lo, a_hi - s_hi)
-                    } else {
-                        (a_lo + s_lo, a_hi + s_hi)
-                    };
-                    acc[i] = (r_lo.to_bits() as u64) | ((r_hi.to_bits() as u64) << 32);
+                    let a_lo = (acc[i] & 0xFFFF_FFFF) as u32;
+                    let a_hi = (acc[i] >> 32) as u32;
+                    let mut s_lo = (src_acc[i] & 0xFFFF_FFFF) as u32;
+                    let mut s_hi = (src_acc[i] >> 32) as u32;
+                    if is_sub {
+                        s_lo ^= 0x8000_0000;
+                        s_hi ^= 0x8000_0000;
+                    }
+                    let r_lo = aie2_fp32_add(a_lo, s_lo);
+                    let r_hi = aie2_fp32_add(a_hi, s_hi);
+                    acc[i] = (r_lo as u64) | ((r_hi as u64) << 32);
                 }
             } else {
                 match config.acc_width {
