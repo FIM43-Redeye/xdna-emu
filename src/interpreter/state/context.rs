@@ -1059,6 +1059,16 @@ impl ExecutionContext {
     /// `commit_pending_writes()` instead.
     #[cfg(test)]
     pub fn flush_pending_writes(&mut self) {
+        self.force_commit_all_pending();
+    }
+
+    /// Force-commit ALL pending writes regardless of ready_cycle.
+    ///
+    /// Models hardware scoreboard stall: when an instruction reads a
+    /// register that has a pending load, the hardware stalls until the
+    /// load completes. We approximate this by committing all pending
+    /// writes before the dependent instruction reads.
+    pub fn force_commit_all_pending(&mut self) {
         let writes: Vec<_> = self.pending_writes.drain(..).collect();
         for pw in &writes {
             self.apply_pending_write(pw);

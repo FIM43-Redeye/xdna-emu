@@ -4499,6 +4499,13 @@ impl VectorAlu {
                 // VUNPACK: 256-bit w-reg source -> 512-bit x-reg dest.
                 // The source lanes are split: lower lanes fill the low half
                 // of the output, upper lanes fill the high half.
+                //
+                // The compiler emits vldb+vunpack without NOPs because
+                // hardware scoreboarding stalls the unpack until the load
+                // completes. Force-commit all pending vector writes so the
+                // source data from a preceding vldb is visible.
+                ctx.force_commit_all_pending();
+
                 let name = op.encoding_name.as_deref().unwrap_or("");
                 let (bits_i, bits_o, signed) = vector_pack::unpack_widths_from_name(name);
 
