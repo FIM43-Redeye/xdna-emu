@@ -892,6 +892,194 @@ pub fn matmul_sub(
 }
 
 // ---------------------------------------------------------------------------
+// Hardware-accurate bf16 dot product
+// ---------------------------------------------------------------------------
+//
+// AIE2 bf16 MAC uses a fixed-point accumulation pipeline:
+//   1. Each bf16*bf16 product is exact in fp32 (8-bit * 8-bit mantissa < 23 bits)
+//   2. All products for one output lane share a common exponent (max across them)
+//   3. Each product mantissa is right-shifted to align to the max exponent,
+//      then rounded to 23 bits using round-to-nearest-even (RNE)
+//   4. Aligned mantissas are summed in integer arithmetic (wide enough to not overflow)
+//   5. The sum is normalized back to fp32 with RNE rounding
+//
+// Derived from aietools python_model/model/bfloat16.py and mulmac.py.
+
+/// Compute a bf16 dot product using hardware-accurate fixed-point accumulation.
+///
+/// Takes a slice of exact fp32 products (each from bf16 * bf16) and an optional
+/// prior accumulator value. Returns the fp32 result matching AIE2 hardware.
+fn bf16_dot_product_hw(products: &[f32], prev_acc: f32, subtract: bool) -> f32 {
+    // Collect all non-zero fp32 values (products + prior accumulator).
+    // Each fp32 value has: sign(1) | exponent(8) | mantissa(23).
+
+    // Find the maximum biased exponent across all products AND the prior accumulator.
+    let mut max_exp: i32 = 0;
+    for &p in products {
+        if p != 0.0 && !p.is_nan() && !p.is_infinite() {
+            let exp = ((p.to_bits() >> 23) & 0xFF) as i32;
+            if exp > max_exp {
+                max_exp = exp;
+            }
+        }
+    }
+    if prev_acc != 0.0 && !prev_acc.is_nan() && !prev_acc.is_infinite() {
+        let exp = ((prev_acc.to_bits() >> 23) & 0xFF) as i32;
+        if exp > max_exp {
+            max_exp = exp;
+        }
+    }
+
+    if max_exp == 0 {
+        // All inputs are zero or denormal -- result is zero.
+        return 0.0;
+    }
+
+    // Align each value to max_exp and sum in fixed-point.
+    // After alignment, each value is a signed integer mantissa (with implicit bit)
+    // right-shifted by (max_exp - its_exp) bits and rounded to 23 bits (RNE).
+    let mut sum: i64 = 0;
+
+    for &p in products {
+        sum += align_round_rne(p, max_exp);
+    }
+
+    // Add prior accumulator value (also aligned and rounded).
+    let prev_aligned = align_round_rne(prev_acc, max_exp);
+    if subtract {
+        sum -= prev_aligned;
+    } else {
+        sum += prev_aligned;
+    }
+
+    // Normalize the integer sum back to fp32.
+    normalize_to_f32(sum, max_exp)
+}
+
+/// Align an fp32 value to a target exponent and round mantissa to 23 bits (RNE).
+///
+/// Returns a signed integer representing the aligned mantissa.
+fn align_round_rne(val: f32, target_exp: i32) -> i64 {
+    if val == 0.0 || val.is_nan() || val.is_infinite() {
+        return 0;
+    }
+
+    let bits = val.to_bits();
+    let sgn = (bits >> 31) != 0;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let man = (bits & 0x7F_FFFF) | 0x80_0000; // 24 bits with implicit bit
+
+    let shift = target_exp - exp;
+    if shift < 0 {
+        // This value has a LARGER exponent than target -- shouldn't happen
+        // if target_exp is the true max. Treat as overflow.
+        return 0;
+    }
+
+    let aligned = if shift == 0 {
+        man as i64
+    } else if shift >= 25 {
+        // Completely shifted out -- rounds to zero.
+        0i64
+    } else {
+        // Right-shift with RNE rounding.
+        let shift = shift as u32;
+        let round_bit = 1u32 << (shift - 1);
+        let sticky_mask = round_bit - 1;
+        let truncated = man >> shift;
+        let remainder = man & ((1u32 << shift) - 1);
+
+        // RNE: round up if remainder > halfway, or if exactly halfway and LSB is odd
+        let rounded = if remainder > round_bit
+            || (remainder == round_bit && (truncated & 1) != 0)
+        {
+            truncated + 1
+        } else {
+            truncated
+        };
+        rounded as i64
+    };
+
+    if sgn { -aligned } else { aligned }
+}
+
+/// Normalize a signed integer mantissa sum back to fp32 with RNE rounding.
+///
+/// `sum` is the fixed-point accumulator (signed), and `max_exp` is the
+/// shared biased exponent.
+fn normalize_to_f32(sum: i64, max_exp: i32) -> f32 {
+    if sum == 0 {
+        return 0.0;
+    }
+
+    let sgn = sum < 0;
+    let mag = sum.unsigned_abs();
+
+    // Find the leading one position (0-indexed from LSB).
+    let leading = 63 - mag.leading_zeros() as i32; // Position of highest set bit
+
+    // We need to fit into 23-bit mantissa (bits 22..0, implicit bit at 23).
+    // The value is: mag * 2^(max_exp - 23 - 127) (adjusting for fp32 bias).
+    //
+    // The leading bit is at position `leading`. We want it at position 23
+    // (the implicit bit position in fp32). So:
+    //   result_exp = max_exp + (leading - 23)
+
+    let result_exp = max_exp + (leading - 23);
+
+    if result_exp <= 0 {
+        // Underflow to zero (or denormal, which we flush to zero).
+        return 0.0;
+    }
+    if result_exp >= 255 {
+        // Overflow to infinity.
+        return if sgn { f32::NEG_INFINITY } else { f32::INFINITY };
+    }
+
+    // Extract 23-bit mantissa with RNE rounding.
+    let man_bits = if leading <= 23 {
+        // Value fits in 23 bits without shifting -- no rounding needed.
+        (mag << (23 - leading as u32)) as u32
+    } else {
+        // Need to right-shift and round.
+        let shift = (leading - 23) as u32;
+        let truncated = (mag >> shift) as u32;
+        let round_bit = 1u64 << (shift - 1);
+        let sticky_mask = round_bit - 1;
+        let remainder = mag & ((1u64 << shift) - 1);
+
+        let rounded = if remainder > round_bit
+            || (remainder == round_bit && (truncated & 1) != 0)
+        {
+            truncated + 1
+        } else {
+            truncated
+        };
+
+        // Check for mantissa overflow (carry into exponent).
+        if rounded >= (1u32 << 24) {
+            // Re-normalize: the mantissa overflowed, bump exponent.
+            let new_exp = result_exp + 1;
+            if new_exp >= 255 {
+                return if sgn { f32::NEG_INFINITY } else { f32::INFINITY };
+            }
+            let man = (rounded >> 1) & 0x7F_FFFF;
+            let bits = ((sgn as u32) << 31)
+                | ((new_exp as u32 & 0xFF) << 23)
+                | man;
+            return f32::from_bits(bits);
+        }
+
+        rounded
+    };
+
+    let man = man_bits & 0x7F_FFFF; // Strip implicit bit
+    let bits =
+        ((sgn as u32) << 31) | ((result_exp as u32 & 0xFF) << 23) | man;
+    f32::from_bits(bits)
+}
+
+// ---------------------------------------------------------------------------
 // Config-driven full-width matmul (512-bit inputs, 1024-bit accumulator)
 // ---------------------------------------------------------------------------
 
@@ -1024,7 +1212,13 @@ pub fn matmul_config_driven(
     }
 
     if config.bfloat {
-        // BFloat16 path: extract bf16 as f32, accumulate in fp32
+        // BFloat16 path: sequential fp32 accumulation.
+        //
+        // Note: element-wise mode (variant=1, rows=16 inner=2 cols=1) uses
+        // a per-lane B element permutation that doesn't match simple matmul
+        // geometry. Hardware characterization is needed to determine the
+        // exact mapping. The row-major B indexing below is correct for
+        // dense mode (variant=0, 4x8x4) but wrong for element-wise.
         for r in 0..rows {
             for c in 0..cols {
                 let out_idx = r * cols + c;
@@ -1033,11 +1227,8 @@ pub fn matmul_config_driven(
                 for k in 0..inner {
                     let a_byte = (r * inner + k) * bytes_x;
                     let b_byte = (k * cols + c) * bytes_y;
-
-                    // Extract bf16 elements: byte offset / 2 gives the bf16 index
                     let a_elem_idx = a_byte / 2;
                     let b_elem_idx = b_byte / 2;
-                    // Vec512 has 16 u32 words = 32 bf16 elements; index directly
                     let a_word = a_elem_idx / 2;
                     let a_half = a_elem_idx % 2;
                     let b_word = b_elem_idx / 2;
