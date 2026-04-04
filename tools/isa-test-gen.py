@@ -4754,6 +4754,125 @@ class AccumArithStrategy(TestStrategy):
         return max(4, total)
 
 
+class Vldb4xStrategy(TestStrategy):
+    """Tests VLDB_4x LUT load instructions with proper address construction.
+
+    VLDB_4x (vldb.4x{16,32,64}.{lo,hi}) performs 4-way memory reads using
+    addresses from the source vector register.  The hardware applies:
+      1. Alignment mask per element size
+      2. OR 0x10 on odd-indexed addresses (bank interleaving)
+
+    The default ComputeStrategy loads random PRNG data as the source,
+    producing meaningless addresses that read from uninitialized memory.
+    This strategy constructs proper addresses pointing into the input
+    buffer so the reads return deterministic, verifiable data.
+
+    Input layout (256 bytes):
+      [0:128]   = LUT data (PRNG, will be read by the gather)
+      [128:160] = scratch for address vector construction (unused PRNG)
+
+    The address vector is built at runtime:
+      words 0-3 (LO half): p0+0x00, p0+0x20, p0+0x40, p0+0x60
+      words 4-7 (HI half): p0+0x00, p0+0x20, p0+0x40, p0+0x60  (same)
+
+    This gives .lo and .hi the same addresses so both are testable.
+    The |0x10 bank interleave means effective reads at:
+      +0x00, +0x30, +0x40, +0x70  (all within the 128-byte LUT region)
+    """
+
+    # Addresses are p0+offset.  These are 32-byte spaced so that alignment
+    # masks for all element sizes (4x16/32/64) produce the same result,
+    # and the |0x10 interleave stays within the 128-byte input region.
+    _ADDR_OFFSETS = [0x00, 0x20, 0x40, 0x60]
+
+    _IN_SIZE = 256   # 128 bytes LUT data + scratch
+    _OUT_SIZE = 32    # one 256-bit vector result
+
+    def can_test(self, instr: dict) -> tuple[bool, str]:
+        name = instr.get("name", "")
+        if name.startswith("VLDB_4x"):
+            return (True, "")
+        return (False, "not a VLDB_4x instruction")
+
+    def compute_input_size(self, instr, regs):
+        return self._IN_SIZE
+
+    def compute_output_size(self, instr):
+        return self._OUT_SIZE
+
+    def generate_combos(self, instr):
+        """Generate combos: src=wl0, dst varies.
+
+        VLDB_4x has two operands named "dst" and "src", both vector256.
+        (Note: is_output is False for both in the ISA JSON -- the TableGen
+        extraction doesn't mark dst as output for these instructions.)
+        We fix the source to wl0 (address vector) and vary the destination.
+        """
+        dst_regs = ["wl0", "wl2", "wl4", "wl6"]
+        return [{"dst": dst, "src": "wl0"} for dst in dst_regs]
+
+    def generate_test_point(self, instr, regs, in_offset, out_offset, **_kw):
+        name = instr["name"]
+        lines = []
+        lines.append(f"  // ---- test (4x LUT load): {name} ----")
+
+        # Operands are named "dst" and "src" in the ISA JSON.
+        dst_reg = regs.get("dst", "wl2")
+        src_reg = regs.get("src", "wl0")
+
+        # Build address vector at runtime using scalar ops.
+        # Store 8 addresses to scratch area at [p1, out_offset..out_offset+32],
+        # then load as vector.  (Output buffer is safe as scratch since we
+        # overwrite it with the real result afterward.)
+        lines.append(f"  // Build address vector: 8 x (p0 + offset)")
+        lines.append(f"  mov r0, p0")
+        lines.append(f"  mov r14, #32")
+
+        # Use p0 base + in_offset as the LUT data base
+        # (the PRNG data at this batch's input region)
+        if in_offset > 0 and in_offset <= 127:
+            lines.append(f"  add r0, r0, #{in_offset}")
+        elif in_offset > 127:
+            # Large offset: use padda on a temp pointer
+            lines.append(f"  mov p5, p0")
+            lines += _padda_sequence("p5", "p0", in_offset)
+            lines.append(f"  mov r0, p5")
+
+        # Store 8 addresses: [base+0, base+0x20, base+0x40, base+0x60] x 2
+        lines.append(f"  mov r1, r0")
+        for i in range(8):
+            st_off = out_offset + i * 4
+            if 0 <= st_off <= 124:
+                lines.append(f"  st r1, [p1, #{st_off}]")
+            else:
+                # Large offset: use temp pointer
+                lines += _padda_sequence("p5", "p1", st_off)
+                lines.append(f"  st r1, [p5, #0]")
+            if i == 3:
+                # Reset for HI half (same offsets)
+                lines.append(f"  mov r1, r0")
+            elif i < 7:
+                lines.append(f"  add r1, r1, r14")
+
+        lines.extend(_nop_sled(LOAD_LATENCY))
+
+        # Load address vector from scratch area
+        lines.extend(_vector_load(src_reg, "p1", out_offset))
+        lines.extend(_nop_sled(LOAD_LATENCY))
+
+        # Execute the VLDB_4x instruction
+        asm_str = instr.get("asm_string", "")
+        asm_line = "  " + _substitute_asm(asm_str, regs,
+                                           has_modifier=_has_modifier_operand(instr))
+        lines.append(asm_line)
+        lines.extend(_nop_sled(LOAD_LATENCY))
+
+        # Store result
+        lines.extend(_vector_store(dst_reg, "p1", out_offset))
+
+        return "\n".join(lines)
+
+
 class VmacStrategy(TestStrategy):
     """Tests MAC/MUL instructions with valid config words.
 
@@ -4977,6 +5096,7 @@ STRATEGIES: list[TestStrategy] = [
     LoadStrategy(),
     StoreStrategy(),
     AccumArithStrategy(),   # must be before ComputeStrategy
+    Vldb4xStrategy(),       # must be before ComputeStrategy (LUT address construction)
     VmacStrategy(),         # must be before ComputeStrategy
     ComputeStrategy(),
 ]
