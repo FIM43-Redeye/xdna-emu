@@ -1215,6 +1215,8 @@ pub fn matmul_config_driven(
     }
 
     if config.bfloat {
+        use super::vector_float::{bf16_flush_to_zero, fp32_flush_to_zero};
+
         // BFloat16 element-wise mode (variant=1, 16x2x1 geometry):
         // Each lane L computes A[L]*B[L] + A[L+16]*B[L+16].
         // Both A and B use the same symmetric stride-16 mapping.
@@ -1224,7 +1226,12 @@ pub fn matmul_config_driven(
         for r in 0..rows {
             for c in 0..cols {
                 let out_idx = r * cols + c;
-                let mut sum: f32 = 0.0;
+
+                // Accumulate products in f64 to match hardware's 29-bit
+                // internal precision.  The aietools reference model
+                // (bf16_mac_reference_double) uses float64 and agrees with
+                // the hardware model within 1 ULP.
+                let mut sum: f64 = 0.0;
 
                 for k in 0..inner {
                     let elem_idx = if is_elemwise {
@@ -1247,20 +1254,36 @@ pub fn matmul_config_driven(
                     let b_word = b_elem_idx / 2;
                     let b_half = b_elem_idx % 2;
 
-                    let a_bits = ((a[a_word] >> (a_half * 16)) & 0xFFFF) as u16;
-                    let b_bits = ((b[b_word] >> (b_half * 16)) & 0xFFFF) as u16;
-                    let a_val = f32::from_bits((a_bits as u32) << 16);
-                    let b_val = f32::from_bits((b_bits as u32) << 16);
+                    // FTZ bf16 inputs: denormalized bf16 values (exp=0,
+                    // mantissa!=0) are flushed to signed zero before
+                    // multiplication.  Matches bf16_denorm_to_0 in the
+                    // aietools hardware model.
+                    let a_bits = bf16_flush_to_zero(
+                        ((a[a_word] >> (a_half * 16)) & 0xFFFF) as u16,
+                    );
+                    let b_bits = bf16_flush_to_zero(
+                        ((b[b_word] >> (b_half * 16)) & 0xFFFF) as u16,
+                    );
+                    let a_val = f32::from_bits((a_bits as u32) << 16) as f64;
+                    let b_val = f32::from_bits((b_bits as u32) << 16) as f64;
 
                     sum += a_val * b_val;
                 }
 
-                let prev = read_acc_wide_f32(acc, out_idx);
-                if config.subtract {
-                    write_acc_wide_f32(acc, out_idx, prev - sum);
+                // FTZ the previous accumulator value before adding, then
+                // combine in f64 and convert back to fp32.  Apply output FTZ
+                // to match aietools reference model (bf16_mac_reference_double
+                // line 173: fp32_denorm_to_0 on result).
+                let prev_bits = read_acc_wide_f32(acc, out_idx).to_bits();
+                let prev = f32::from_bits(fp32_flush_to_zero(prev_bits)) as f64;
+                let result = if config.subtract {
+                    prev - sum
                 } else {
-                    write_acc_wide_f32(acc, out_idx, prev + sum);
-                }
+                    prev + sum
+                };
+                let result_f32 = result as f32;
+                let result_ftz = fp32_flush_to_zero(result_f32.to_bits());
+                write_acc_wide_f32(acc, out_idx, f32::from_bits(result_ftz));
             }
         }
         return;
