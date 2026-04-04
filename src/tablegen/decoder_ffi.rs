@@ -468,19 +468,23 @@ pub fn classify_reg_name(name: &str) -> Option<MappedOperand> {
     }
 
     // Control registers (named, no index).
+    // IDs must match HWEncoding from AIE2GenRegisterInfo.td:
+    //   crVaddSign=0, crF2FMask=1, crF2IMask=2, crFPMask=3,
+    //   crMCDEn=4, crPackSign=5, crRnd=6, crSCDEn=7,
+    //   crSRSSign=8, crSat=9, crUPSSign=10, crUnpackSign=11
     let cr_id = match name {
-        "crVaddSign" => Some(0u8),
-        "crSCDEn"    => Some(1),
-        "crMCDEn"    => Some(2),
-        "crUnpackSign" => Some(3),
-        "crPackSign" => Some(4),
-        "crUPSSign"  => Some(5),
-        "crRnd"      => Some(6),
-        "crSat"      => Some(7),
-        "crSRSSign"  => Some(8),
-        "crFPMask"   => Some(9),
-        "crF2IMask"  => Some(10),
-        "crF2FMask"  => Some(11),
+        "crVaddSign"   => Some(0u8),
+        "crF2FMask"    => Some(1),
+        "crF2IMask"    => Some(2),
+        "crFPMask"     => Some(3),
+        "crMCDEn"      => Some(4),
+        "crPackSign"   => Some(5),
+        "crRnd"        => Some(6),
+        "crSCDEn"      => Some(7),
+        "crSRSSign"    => Some(8),
+        "crSat"        => Some(9),
+        "crUPSSign"    => Some(10),
+        "crUnpackSign" => Some(11),
         _ => None,
     };
     if let Some(id) = cr_id {
@@ -1003,14 +1007,21 @@ mod tests {
 
     #[test]
     fn test_control_regs() {
+        // IDs must match HWEncoding from AIE2GenRegisterInfo.td.
         let m = operand_from_reg_name("crRnd").unwrap();
         assert_eq!(m.operand, Operand::ControlReg(6));
 
         let m = operand_from_reg_name("crSat").unwrap();
-        assert_eq!(m.operand, Operand::ControlReg(7));
+        assert_eq!(m.operand, Operand::ControlReg(9));
 
         let m = operand_from_reg_name("crSRSSign").unwrap();
         assert_eq!(m.operand, Operand::ControlReg(8));
+
+        let m = operand_from_reg_name("crUPSSign").unwrap();
+        assert_eq!(m.operand, Operand::ControlReg(10));
+
+        let m = operand_from_reg_name("crVaddSign").unwrap();
+        assert_eq!(m.operand, Operand::ControlReg(0));
     }
 
     #[test]

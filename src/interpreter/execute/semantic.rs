@@ -1112,6 +1112,48 @@ mod tests {
     }
 
     #[test]
+    fn test_control_reg_roundtrip_crsat() {
+        // Simulate the ISA test flow: movx crSat, r0; mov r14, crSat
+        let mut ctx = make_test_context();
+        ctx.scalar.write(0, 2); // r0 = 2
+
+        // movx crSat, r0
+        let mut write_op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Copy);
+        write_op.sources = smallvec![Operand::ScalarReg(0)];
+        write_op.dest = Some(Operand::ControlReg(9)); // crSat
+        assert!(execute_semantic(&write_op, &mut ctx));
+
+        // mov r14, crSat
+        let mut read_op = SlotOp::from_semantic(SlotIndex::Scalar1, SemanticOp::Copy);
+        read_op.sources = smallvec![Operand::ControlReg(9)];
+        read_op.dest = Some(Operand::ScalarReg(14));
+        assert!(execute_semantic(&read_op, &mut ctx));
+
+        assert_eq!(ctx.scalar.read(14), 2);
+    }
+
+    #[test]
+    fn test_control_reg_roundtrip_crrnd() {
+        // Simulate: movx crRnd, r0; mov r14, crRnd
+        let mut ctx = make_test_context();
+        ctx.scalar.write(0, 0xD); // r0 = 13
+
+        // movx crRnd, r0
+        let mut write_op = SlotOp::from_semantic(SlotIndex::Scalar0, SemanticOp::Copy);
+        write_op.sources = smallvec![Operand::ScalarReg(0)];
+        write_op.dest = Some(Operand::ControlReg(6)); // crRnd
+        assert!(execute_semantic(&write_op, &mut ctx));
+
+        // mov r14, crRnd
+        let mut read_op = SlotOp::from_semantic(SlotIndex::Scalar1, SemanticOp::Copy);
+        read_op.sources = smallvec![Operand::ControlReg(6)];
+        read_op.dest = Some(Operand::ScalarReg(14));
+        assert!(execute_semantic(&read_op, &mut ctx));
+
+        assert_eq!(ctx.scalar.read(14), 0xD);
+    }
+
+    #[test]
     fn test_execute_mul() {
         let mut ctx = make_test_context();
         ctx.scalar.write(1, 7);

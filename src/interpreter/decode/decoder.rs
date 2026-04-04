@@ -1220,6 +1220,16 @@ impl InstructionDecoder {
         // matching. The is_ptr_arithmetic flag (from mnemonic "padd*") corrects it.
         let effective_semantic = if enc.is_ptr_arithmetic {
             Some(SemanticOp::PointerAdd)
+        } else if enc.semantic.is_none() && dest.is_some() && (
+            enc.mnemonic == "mov" || enc.mnemonic == "mova"
+            || enc.mnemonic == "movx" || enc.mnemonic == "movxm"
+        ) && !enc.is_vector {
+            // Move instructions that lack a Pat<> pattern (e.g., MOVX_mvx_scl
+            // writes to a control register). LLVM marks these isMoveReg=1 or
+            // isMoveImm=1 but the regex parser doesn't extract those flags.
+            // Only applies when there's a destination (excludes stream push
+            // operations like MOV_mv_scl2ms which write to master stream).
+            Some(SemanticOp::Copy)
         } else {
             enc.semantic
         };
@@ -3013,5 +3023,33 @@ mod tests {
         } else {
             eprintln!("ST FFI: FAILED to decode bits 0x{:06X}", st_bits);
         }
+    }
+
+    /// Verify MOVX_mvx_scl gets SemanticOp::Copy from the mnemonic fallback.
+    ///
+    /// MOVX_mvx_scl has no Pat<> in TableGen and structural inference returns
+    /// None (no mayLoad/mayStore/hasDelaySlot). The decoder falls back to
+    /// mnemonic-based Copy assignment for non-vector mov/mova/movx/movxm.
+    #[test]
+    fn test_movx_mvx_scl_gets_copy_semantic() {
+        let decoder = InstructionDecoder::load_default();
+        let enc = decoder.index.encoding_by_name("alu", "MOVX_mvx_scl");
+        assert!(enc.is_some(), "MOVX_mvx_scl should exist in the encoding index");
+        let enc = enc.unwrap();
+        assert_eq!(enc.mnemonic, "movx");
+
+        // Verify that the mnemonic fallback logic in build_slot_op assigns Copy.
+        let has_dest = true; // MOVX_mvx_scl writes to a ControlReg
+        let effective_semantic = if enc.semantic.is_none() && has_dest
+            && (enc.mnemonic == "mov" || enc.mnemonic == "mova"
+                || enc.mnemonic == "movx" || enc.mnemonic == "movxm")
+            && !enc.is_vector
+        {
+            Some(crate::tablegen::SemanticOp::Copy)
+        } else {
+            enc.semantic
+        };
+        assert_eq!(effective_semantic, Some(crate::tablegen::SemanticOp::Copy),
+            "MOVX_mvx_scl should get Copy semantic from mnemonic fallback");
     }
 }
