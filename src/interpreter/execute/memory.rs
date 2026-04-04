@@ -834,6 +834,16 @@ impl MemoryUnit {
         [0u32; 8]
     }
 
+    /// Find the first AccumReg index in the sources.
+    fn find_acc_source(op: &SlotOp) -> Option<u8> {
+        for src in &op.sources {
+            if let Operand::AccumReg(r) = src {
+                return Some(*r);
+            }
+        }
+        None
+    }
+
     // ========== Fused load+compute handlers ==========
 
     /// Execute `vlda.ups`: load from memory, upshift to accumulator.
@@ -1100,9 +1110,53 @@ impl MemoryUnit {
         post_modify: &PostModify,
         neighbors: Option<&mut NeighborMemory>,
     ) {
-        let src = Self::get_vector_source(op, ctx);
         let from = op.from_type.unwrap_or(ElementType::Float32);
         let to = op.element_type.unwrap_or(ElementType::BFloat16);
+
+        // vst.conv source can be AccumReg (bmh/bml) or VectorReg.
+        // For fp32->bf16: the accumulator holds 16 fp32 values packed as
+        // 8 u64 words (2 x f32 per u64). Extract them into [u32; 8] for
+        // the convert path.
+        let src = if let Some(acc_reg) = Self::find_acc_source(op) {
+            let acc = ctx.accumulator.read(acc_reg);
+            // Accumulator in float mode: each u64 = (hi_f32 << 32) | lo_f32.
+            // Extract the 8 low f32 words. The high words go into the upper
+            // half of the vector which we handle separately if needed.
+            //
+            // For bf16 output (16 values in 256 bits = 32 bytes), we need
+            // all 16 f32 values. Pack them as 8 pairs into the convert path.
+            if from == ElementType::Float32 && to == ElementType::BFloat16 {
+                // Direct bf16 truncation from accumulator float data.
+                let mut result = [0u32; 8];
+                for i in 0..8 {
+                    let f_lo = f32::from_bits(acc[i] as u32);
+                    let f_hi = f32::from_bits((acc[i] >> 32) as u32);
+                    let bf_lo = super::VectorAlu::f32_to_bf16(f_lo);
+                    let bf_hi = super::VectorAlu::f32_to_bf16(f_hi);
+                    result[i] = (bf_lo as u32) | ((bf_hi as u32) << 16);
+                }
+                let addr = Self::get_store_address(op, ctx);
+                log::debug!(
+                    "[FUSED] vst.conv: addr=0x{:X} ({:?} -> {:?}, from accum)",
+                    addr, from, to,
+                );
+                let (quadrant, local_offset) = decode_data_address(addr);
+                if quadrant == MemoryQuadrant::Local {
+                    ctx.record_core_bank_access(local_offset as u32, 32, tile.num_banks());
+                }
+                Self::write_vector_to_memory(tile, addr, result, neighbors);
+                Self::apply_post_modify(op, ctx, post_modify);
+                return;
+            }
+            // Non-bf16 path: extract low 32 bits of each acc word
+            let mut v = [0u32; 8];
+            for i in 0..8 {
+                v[i] = acc[i] as u32;
+            }
+            v
+        } else {
+            Self::get_vector_source(op, ctx)
+        };
 
         let converted = super::VectorAlu::vector_convert(&src, from, to);
 

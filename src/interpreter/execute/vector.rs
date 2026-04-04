@@ -1063,7 +1063,7 @@ impl VectorAlu {
 
     /// Convert f32 to BFloat16 (truncate lower 16 bits).
     #[inline]
-    fn f32_to_bf16(val: f32) -> u16 {
+    pub(super) fn f32_to_bf16(val: f32) -> u16 {
         (val.to_bits() >> 16) as u16
     }
 
