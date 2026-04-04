@@ -77,6 +77,17 @@ pub struct MatMulConfig {
     /// (vector data + 64-bit mask). Elements at masked-out positions are
     /// treated as zero during the multiply.
     pub sparse: bool,
+    /// Raw bit width of A (X) elements from the geometry table.
+    ///
+    /// Usually matches `a_type.bits()`, but for 4-bit modes the a_type
+    /// field uses Int8 (no Int4 variant exists). Use this field instead
+    /// of `a_type.bits()` in computation paths that need the true width.
+    pub bits_x: u32,
+    /// Raw bit width of B (Y) elements from the geometry table.
+    ///
+    /// See `bits_x` for rationale. Critical for i8xi4 mode where
+    /// `b_type` is Int8 but the actual element width is 4 bits.
+    pub bits_y: u32,
 }
 
 /// A single valid matmul geometry entry, combining element type pair with
@@ -203,6 +214,8 @@ impl MatMulConfig {
             bfloat: entry.bfloat,
             subtract,
             sparse: false,
+            bits_x: entry.bits_x,
+            bits_y: entry.bits_y,
         })
     }
 
@@ -250,6 +263,8 @@ impl MatMulConfig {
             bfloat: entry.bfloat,
             subtract,
             sparse: false,
+            bits_x: entry.bits_x,
+            bits_y: entry.bits_y,
         })
     }
 
@@ -297,6 +312,8 @@ impl MatMulConfig {
             bfloat: entry.bfloat,
             subtract,
             sparse: false,
+            bits_x: entry.bits_x,
+            bits_y: entry.bits_y,
         })
     }
 
@@ -400,6 +417,8 @@ impl MatMulConfig {
             b_type,
             acc_width: if entry.acc_cmb == 2 { AccWidth::Acc64 } else { AccWidth::Acc32 },
             bfloat: entry.bfloat,
+            bits_x: entry.bits_x,
+            bits_y: entry.bits_y,
             subtract: sub0,
             sparse: entry.sparse,
         })

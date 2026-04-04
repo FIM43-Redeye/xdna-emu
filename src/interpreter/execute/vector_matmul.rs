@@ -184,29 +184,47 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
             };
             let n = if is_half { 8 } else { 16 };
             let is_sub = semantic == SemanticOp::SubMac;
-            match config.acc_width {
-                AccWidth::Acc32 => {
-                    // Acc32: two i32 values per u64, added independently.
-                    for i in 0..n {
-                        let a_lo = (acc[i] & 0xFFFF_FFFF) as u32;
-                        let a_hi = (acc[i] >> 32) as u32;
-                        let s_lo = (src_acc[i] & 0xFFFF_FFFF) as u32;
-                        let s_hi = (src_acc[i] >> 32) as u32;
-                        let (r_lo, r_hi) = if is_sub {
-                            (a_lo.wrapping_sub(s_lo), a_hi.wrapping_sub(s_hi))
-                        } else {
-                            (a_lo.wrapping_add(s_lo), a_hi.wrapping_add(s_hi))
-                        };
-                        acc[i] = (r_lo as u64) | ((r_hi as u64) << 32);
-                    }
+
+            if config.bfloat {
+                // BFloat16 mode: accumulator holds fp32 values, two per u64.
+                // The acc2 merge must use fp32 arithmetic, not integer.
+                for i in 0..n {
+                    let a_lo = f32::from_bits((acc[i] & 0xFFFF_FFFF) as u32);
+                    let a_hi = f32::from_bits((acc[i] >> 32) as u32);
+                    let s_lo = f32::from_bits((src_acc[i] & 0xFFFF_FFFF) as u32);
+                    let s_hi = f32::from_bits((src_acc[i] >> 32) as u32);
+                    let (r_lo, r_hi) = if is_sub {
+                        (a_lo - s_lo, a_hi - s_hi)
+                    } else {
+                        (a_lo + s_lo, a_hi + s_hi)
+                    };
+                    acc[i] = (r_lo.to_bits() as u64) | ((r_hi.to_bits() as u64) << 32);
                 }
-                AccWidth::Acc64 => {
-                    // Acc64: full 64-bit add/sub on each u64 lane.
-                    for i in 0..n {
-                        if is_sub {
-                            acc[i] = acc[i].wrapping_sub(src_acc[i]);
-                        } else {
-                            acc[i] = acc[i].wrapping_add(src_acc[i]);
+            } else {
+                match config.acc_width {
+                    AccWidth::Acc32 => {
+                        // Acc32: two i32 values per u64, added independently.
+                        for i in 0..n {
+                            let a_lo = (acc[i] & 0xFFFF_FFFF) as u32;
+                            let a_hi = (acc[i] >> 32) as u32;
+                            let s_lo = (src_acc[i] & 0xFFFF_FFFF) as u32;
+                            let s_hi = (src_acc[i] >> 32) as u32;
+                            let (r_lo, r_hi) = if is_sub {
+                                (a_lo.wrapping_sub(s_lo), a_hi.wrapping_sub(s_hi))
+                            } else {
+                                (a_lo.wrapping_add(s_lo), a_hi.wrapping_add(s_hi))
+                            };
+                            acc[i] = (r_lo as u64) | ((r_hi as u64) << 32);
+                        }
+                    }
+                    AccWidth::Acc64 => {
+                        // Acc64: full 64-bit add/sub on each u64 lane.
+                        for i in 0..n {
+                            if is_sub {
+                                acc[i] = acc[i].wrapping_sub(src_acc[i]);
+                            } else {
+                                acc[i] = acc[i].wrapping_add(src_acc[i]);
+                            }
                         }
                     }
                 }
@@ -523,8 +541,8 @@ pub fn matmul_sparse_config_driven(
 ) {
     let rows = config.rows as usize;
     let cols = config.cols as usize;
-    let bits_x = config.a_type.bits() as u32;
-    let bits_y = config.b_type.bits() as u32;
+    let bits_x = config.bits_x;
+    let bits_y = config.bits_y;
     let bytes_x = if bits_x == 4 { 1 } else { (bits_x / 8) as usize };
 
     // Total number of mask groups. Each group covers 4 positions with 2 active
@@ -995,8 +1013,8 @@ pub fn matmul_config_driven(
     let rows = config.rows as usize;
     let inner = config.inner as usize;
     let cols = config.cols as usize;
-    let bits_x = config.a_type.bits() as u32;
-    let bits_y = config.b_type.bits() as u32;
+    let bits_x = config.bits_x;
+    let bits_y = config.bits_y;
     let bytes_x = (bits_x / 8) as usize;
     let bytes_y = if bits_y == 4 { 1 } else { (bits_y / 8) as usize }; // 4-bit: 2 elements per byte
 
