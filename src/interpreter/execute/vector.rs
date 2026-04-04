@@ -3794,66 +3794,98 @@ impl VectorAlu {
             // ========== SRS/UPS (element-wise, split into halves) ==========
 
             SemanticOp::Srs => {
-                // Wide SRS: read Acc1024, SRS each half, write Vec512.
                 let acc_reg = Self::get_acc_source(op);
                 let shift = Self::get_shift_amount(op, ctx);
                 let from = op.from_type.unwrap_or(ElementType::Int64);
-                let acc_wide = ctx.accumulator.read_wide(acc_reg);
-                let acc_lo: [u64; 8] = acc_wide[..8].try_into().unwrap();
-                let acc_hi: [u64; 8] = acc_wide[8..].try_into().unwrap();
+                // Half (bml/bmh) is 512-bit = single bm register, use narrow
+                // read. Full (cm) and None (legacy/wide default) use read_wide.
+                let is_half = matches!(op.accum_width,
+                    Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
 
-                let result_lo = Self::vector_srs_from_acc(&acc_lo, shift, from, et, &ctx.srs_config);
-                let result_hi = Self::vector_srs_from_acc(&acc_hi, shift, from, et, &ctx.srs_config);
+                if !is_half {
+                    // Wide SRS: read Acc1024 (cm-register), SRS each half,
+                    // write Vec512.
+                    let acc_wide = ctx.accumulator.read_wide(acc_reg);
+                    let acc_lo: [u64; 8] = acc_wide[..8].try_into().unwrap();
+                    let acc_hi: [u64; 8] = acc_wide[8..].try_into().unwrap();
 
-                // Pack the two halves contiguously. For reduction SRS (e.g.,
-                // s8 from s32, s16 from s64), each half only fills a fraction
-                // of its 8-word output. Compute how many valid u32 words each
-                // half produces based on lane count and output element width.
-                let from_bits = from.bits() as usize;
-                let lanes_per_half = if from_bits <= 32 { 16 } else { 8 }; // Acc32 vs Acc64
-                let to_bits = et.bits() as usize;
-                let words_per_half = (lanes_per_half * to_bits + 31) / 32;
+                    let result_lo = Self::vector_srs_from_acc(&acc_lo, shift, from, et, &ctx.srs_config);
+                    let result_hi = Self::vector_srs_from_acc(&acc_hi, shift, from, et, &ctx.srs_config);
 
-                let mut result = [0u32; 16];
-                let n = words_per_half.min(8);
-                result[..n].copy_from_slice(&result_lo[..n]);
-                result[n..n + n].copy_from_slice(&result_hi[..n]);
-                Self::write_wide_vec_dest(op, ctx, result);
+                    // Pack the two halves contiguously. For reduction SRS
+                    // (e.g., s8 from s32, s16 from s64), each half only fills
+                    // a fraction of its 8-word output.
+                    let from_bits = from.bits() as usize;
+                    let lanes_per_half = if from_bits <= 32 { 16 } else { 8 };
+                    let to_bits = et.bits() as usize;
+                    let words_per_half = (lanes_per_half * to_bits + 31) / 32;
+
+                    let mut result = [0u32; 16];
+                    let n = words_per_half.min(8);
+                    result[..n].copy_from_slice(&result_lo[..n]);
+                    result[n..n + n].copy_from_slice(&result_hi[..n]);
+                    Self::write_wide_vec_dest(op, ctx, result);
+                } else {
+                    // Half SRS (bml/bmh): read single 512-bit accum register,
+                    // SRS 8 lanes, write to 256-bit w-register.
+                    let acc = ctx.accumulator.read(acc_reg);
+                    let result = Self::vector_srs_from_acc(&acc, shift, from, et, &ctx.srs_config);
+                    Self::write_vector_dest(op, ctx, result);
+                }
                 true
             }
 
             SemanticOp::Ups => {
                 let shift = Self::get_shift_amount(op, ctx);
                 let from = op.from_type.unwrap_or(ElementType::Int16);
+                let is_half = matches!(op.accum_width,
+                    Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
 
-                let acc_wide = if !op.is_wide_vector {
-                    // w2c path: narrow source (256-bit wl) fills full 1024-bit
-                    // cm register via 4:1 upshift (e.g., 32xi8->32xi32 or
-                    // 16xi16->16xi64).
-                    let src = Self::get_vector_source(op, ctx, 0);
-                    vector_ups::ups_vector_to_acc_wide(&src, shift, from, et)
-                } else {
-                    // x2c path: wide source (512-bit x-reg), UPS each half.
-                    let src = Self::get_wide_vec_source(op, ctx, 0);
-                    let src_lo: [u32; 8] = src[..8].try_into().unwrap();
-                    let src_hi: [u32; 8] = src[8..].try_into().unwrap();
-                    let acc_lo = vector_ups::ups_vector_to_acc(&src_lo, shift, from, et);
-                    let acc_hi = vector_ups::ups_vector_to_acc(&src_hi, shift, from, et);
-                    let mut wide = [0u64; 16];
-                    wide[..8].copy_from_slice(&acc_lo);
-                    wide[8..].copy_from_slice(&acc_hi);
-                    wide
-                };
+                if !is_half {
+                    let acc_wide = if !op.is_wide_vector {
+                        // w2c path: narrow source (256-bit wl) fills full
+                        // 1024-bit cm register via 4:1 upshift.
+                        let src = Self::get_vector_source(op, ctx, 0);
+                        vector_ups::ups_vector_to_acc_wide(&src, shift, from, et)
+                    } else {
+                        // x2c path: wide source (512-bit x-reg), UPS each half.
+                        let src = Self::get_wide_vec_source(op, ctx, 0);
+                        let src_lo: [u32; 8] = src[..8].try_into().unwrap();
+                        let src_hi: [u32; 8] = src[8..].try_into().unwrap();
+                        let acc_lo = vector_ups::ups_vector_to_acc(&src_lo, shift, from, et);
+                        let acc_hi = vector_ups::ups_vector_to_acc(&src_hi, shift, from, et);
+                        let mut wide = [0u64; 16];
+                        wide[..8].copy_from_slice(&acc_lo);
+                        wide[8..].copy_from_slice(&acc_hi);
+                        wide
+                    };
 
-                match &op.dest {
-                    Some(Operand::AccumReg(r)) => {
-                        ctx.accumulator.write_wide(*r, acc_wide);
+                    match &op.dest {
+                        Some(Operand::AccumReg(r)) => {
+                            ctx.accumulator.write_wide(*r, acc_wide);
+                        }
+                        other => {
+                            panic!(
+                                "Wide VUPS destination must be AccumReg, got {:?} (encoding={:?})",
+                                other, op.encoding_name,
+                            );
+                        }
                     }
-                    other => {
-                        panic!(
-                            "Wide VUPS destination must be AccumReg, got {:?} (encoding={:?})",
-                            other, op.encoding_name,
-                        );
+                } else {
+                    // Half UPS (bml/bmh): narrow source -> single 512-bit
+                    // accum register.
+                    let src = Self::get_vector_source(op, ctx, 0);
+                    let acc_result = vector_ups::ups_vector_to_acc(&src, shift, from, et);
+                    match &op.dest {
+                        Some(Operand::AccumReg(r)) => {
+                            ctx.accumulator.write(*r, acc_result);
+                        }
+                        other => {
+                            panic!(
+                                "VUPS destination must be AccumReg, got {:?} (encoding={:?})",
+                                other, op.encoding_name,
+                            );
+                        }
                     }
                 }
                 true
@@ -3865,13 +3897,22 @@ impl VectorAlu {
                 let has_acc_source = op.sources.iter()
                     .any(|s| matches!(s, Operand::AccumReg(_)));
                 if has_acc_source {
-                    // Accumulator move: vmov cm_dst, cm_src
                     let src_reg = op.sources.iter().find_map(|s| match s {
                         Operand::AccumReg(r) => Some(*r),
                         _ => None,
                     }).unwrap_or(0);
-                    let data = ctx.accumulator.read_wide(src_reg);
-                    Self::write_wide_acc_dest(op, ctx, data);
+                    let is_half = matches!(op.accum_width,
+                        Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
+                    if !is_half {
+                        // Accumulator move: vmov cm_dst, cm_src
+                        let data = ctx.accumulator.read_wide(src_reg);
+                        Self::write_wide_acc_dest(op, ctx, data);
+                    } else {
+                        // Half-accum move: vmov bm_dst, bm_src
+                        let data = ctx.accumulator.read(src_reg);
+                        let dst = Self::get_acc_dest(op);
+                        ctx.accumulator.write(dst, data);
+                    }
                 } else {
                     // Vector move: vmov x_dst, x_src
                     let a = Self::get_wide_vec_source(op, ctx, 0);
@@ -3883,7 +3924,14 @@ impl VectorAlu {
                 // Handle both vector and accumulator clears.
                 let has_acc_dest = matches!(&op.dest, Some(Operand::AccumReg(_)));
                 if has_acc_dest {
-                    Self::write_wide_acc_dest(op, ctx, [0u64; 16]);
+                    let is_half = matches!(op.accum_width,
+                        Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
+                    if !is_half {
+                        Self::write_wide_acc_dest(op, ctx, [0u64; 16]);
+                    } else {
+                        let dst = Self::get_acc_dest(op);
+                        ctx.accumulator.clear(dst);
+                    }
                 } else {
                     Self::write_wide_vec_dest(op, ctx, [0u32; 16]);
                 }
