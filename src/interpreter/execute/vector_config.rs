@@ -483,7 +483,8 @@ fn lookup_bf16_geometry(variant: u32) -> Option<&'static GeometryEntry> {
             acc_cmb: 1, bfloat: true, sparse: false,
         }),
         // Element-wise: 16 channels, each a 1x2 dot product.
-        // Per-lane B element mapping (B[2i], B[2i+1]) is handled in
+        // Lane L computes A[L]*B[L] + A[L+16]*B[L+16] -- stride-16
+        // symmetric mapping for both A and B sides. Handled in
         // matmul_config_driven's is_elemwise path.
         1 => Some(&GeometryEntry {
             bits_x: 16, bits_y: 16, rows: 16, inner: 2, cols: 1,

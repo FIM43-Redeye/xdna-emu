@@ -1212,27 +1212,38 @@ pub fn matmul_config_driven(
     }
 
     if config.bfloat {
-        // BFloat16 path: sequential fp32 accumulation.
-        //
-        // Note: element-wise mode (variant=1, rows=16 inner=2 cols=1) uses
-        // a per-lane B element permutation that doesn't match simple matmul
-        // geometry. Hardware characterization is needed to determine the
-        // exact mapping. The row-major B indexing below is correct for
-        // dense mode (variant=0, 4x8x4) but wrong for element-wise.
+        // BFloat16 element-wise mode (variant=1, 16x2x1 geometry):
+        // Each lane L computes A[L]*B[L] + A[L+16]*B[L+16].
+        // Both A and B use the same symmetric stride-16 mapping.
+        // Verified by hardware characterization (bf16_elemwise_characterizer.s).
+        let is_elemwise = rows == 16 && inner == 2 && cols == 1;
+
         for r in 0..rows {
             for c in 0..cols {
                 let out_idx = r * cols + c;
                 let mut sum: f32 = 0.0;
 
                 for k in 0..inner {
-                    let a_byte = (r * inner + k) * bytes_x;
-                    let b_byte = (k * cols + c) * bytes_y;
-                    let a_elem_idx = a_byte / 2;
-                    let b_elem_idx = b_byte / 2;
-                    let a_word = a_elem_idx / 2;
-                    let a_half = a_elem_idx % 2;
+                    let elem_idx = if is_elemwise {
+                        // Element-wise: lane L reads element L (k=0) and L+16 (k=1)
+                        r + k * 16
+                    } else {
+                        // Dense (4x8x4): standard row-major indexing
+                        r * inner + k
+                    };
+                    let a_word = elem_idx / 2;
+                    let a_half = elem_idx % 2;
+
+                    let b_elem_idx = if is_elemwise {
+                        // Element-wise: B uses same mapping as A
+                        r + k * 16
+                    } else {
+                        // Dense: column-major B indexing
+                        k * cols + c
+                    };
                     let b_word = b_elem_idx / 2;
                     let b_half = b_elem_idx % 2;
+
                     let a_bits = ((a[a_word] >> (a_half * 16)) & 0xFFFF) as u16;
                     let b_bits = ((b[b_word] >> (b_half * 16)) & 0xFFFF) as u16;
                     let a_val = f32::from_bits((a_bits as u32) << 16);
