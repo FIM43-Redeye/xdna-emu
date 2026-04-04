@@ -558,19 +558,28 @@ impl MemoryUnit {
         }
     }
 
-    /// Execute 4-way gather load (VLDB_4x16/32/64 LO/HI).
+    /// Execute 4-way LUT load (VLDB_4x16/32/64 LO/HI).
     ///
-    /// The source vector register contains 4 x 32-bit memory addresses in
-    /// either its lower (LO) or upper (HI) 128-bit half. The hardware
-    /// reads 64 bits from each address and packs the 4 results (256 bits
-    /// total) into the destination register.
+    /// These instructions perform 4-way parallel memory reads for LUT
+    /// (look-up table) access. The source vector provides 4 pre-computed
+    /// addresses in its lo or hi half. The hardware applies alignment
+    /// masking per element size and bank-interleaves odd-indexed reads.
     ///
-    /// The element size (16/32/64) controls address alignment:
-    /// - 4x16: mask 0xFFFFFFFC (4-byte aligned)
-    /// - 4x32: mask 0xFFFFFFF8 (8-byte aligned)
-    /// - 4x64: mask 0xFFFFFFF0 (16-byte aligned)
+    /// Semantics (from aietools me_addr.h):
+    ///   1. Extract 4 addresses from the source register's lo/hi half
+    ///   2. Mask each for alignment: 4x16=0xFFFFFFFC, 4x32=0xFFFFFFF8,
+    ///      4x64=0xFFFFFFF0
+    ///   3. OR 0x10 onto odd-indexed addresses (indices 1 and 3) for
+    ///      memory bank interleaving
+    ///   4. Read 64 bits from each of the 4 effective addresses
+    ///   5. Pack results into the 256-bit destination register
     ///
-    /// Source: aietools ISG me_inline_primitives.h `load_4x_address()`.
+    /// The bank interleave (`|0x10`) ensures parallel access to different
+    /// 16-byte memory banks, enabling conflict-free 4-way reads when the
+    /// base pointers (lut1/lut2) are 256-bit aligned.
+    ///
+    /// Source: aietools me_addr.h `lut_pointer()` + `load_4x_address()`.
+    /// Confirmed by hardware characterization on Phoenix NPU (3/3 tests).
     fn execute_vector_load_4x(
         op: &SlotOp,
         ctx: &mut ExecutionContext,
@@ -585,9 +594,13 @@ impl MemoryUnit {
                 return;
             }
         };
+
+        // Commit pending writes so a preceding vlda's data is visible.
+        ctx.force_commit_all_pending();
+
         let src_data = ctx.vector.read(src_reg);
 
-        // Parse mnemonic to determine hi/lo and element size.
+        // Parse encoding name for hi/lo and element size.
         let name = op.encoding_name.as_deref().unwrap_or("");
         let lower = name.to_ascii_lowercase();
         let is_hi = lower.contains("hi");
@@ -597,58 +610,59 @@ impl MemoryUnit {
         } else if lower.contains("4x32") {
             0xFFFF_FFF8
         } else {
-            // 4x16 or unknown -> 4-byte alignment
-            0xFFFF_FFFC
+            0xFFFF_FFFC // 4x16
         };
 
-        // Extract 4 x 32-bit addresses from lo or hi half of source.
-        let addrs = if is_hi {
+        // Extract 4 addresses from lo or hi half of source register.
+        let raw_addrs = if is_hi {
             [src_data[4], src_data[5], src_data[6], src_data[7]]
         } else {
             [src_data[0], src_data[1], src_data[2], src_data[3]]
         };
 
-        // Read 64 bits (2 x u32) from each aligned address.
+        // Apply alignment mask, then bank-interleave odd indices.
+        let eff_addrs = [
+            raw_addrs[0] & align_mask,
+            (raw_addrs[1] & align_mask) | 0x10,
+            raw_addrs[2] & align_mask,
+            (raw_addrs[3] & align_mask) | 0x10,
+        ];
+
+        // Read 64 bits from each effective address.
         let latency = LATENCY_MEMORY as u64;
         let mut result = [0u32; 8];
         for i in 0..4 {
-            let addr = addrs[i] & align_mask;
+            let addr = eff_addrs[i];
             let (quadrant, offset) = decode_data_address(addr);
             let mem: &[u8] = if quadrant == MemoryQuadrant::Local || neighbors.is_none() {
                 tile.data_memory()
-            } else if let Some(nbr_mem) = neighbors.as_ref().and_then(|n| n.get_memory(quadrant)) {
+            } else if let Some(nbr_mem) = neighbors.as_ref()
+                .and_then(|n| n.get_memory(quadrant))
+            {
                 nbr_mem
             } else {
-                // Non-existent neighbor -> zeros
-                result[i * 2] = 0;
-                result[i * 2 + 1] = 0;
-                continue;
+                continue; // non-existent neighbor -> zeros
             };
 
-            // Read 8 bytes (64 bits) at the aligned offset.
             if offset + 7 < mem.len() {
                 result[i * 2] = u32::from_le_bytes([
-                    mem[offset],
-                    mem[offset + 1],
-                    mem[offset + 2],
-                    mem[offset + 3],
+                    mem[offset], mem[offset + 1],
+                    mem[offset + 2], mem[offset + 3],
                 ]);
                 result[i * 2 + 1] = u32::from_le_bytes([
-                    mem[offset + 4],
-                    mem[offset + 5],
-                    mem[offset + 6],
-                    mem[offset + 7],
+                    mem[offset + 4], mem[offset + 5],
+                    mem[offset + 6], mem[offset + 7],
                 ]);
             }
         }
 
         log::trace!(
-            "[VLDB_4x] {} src=v{} addrs=[{:#x},{:#x},{:#x},{:#x}] -> {:?}",
-            name, src_reg, addrs[0] & align_mask, addrs[1] & align_mask,
-            addrs[2] & align_mask, addrs[3] & align_mask, result
+            "[VLDB_4x] {} src=v{} addrs=[{:#x},{:#x},{:#x},{:#x}] -> [{:08x},{:08x},...]",
+            name, src_reg,
+            eff_addrs[0], eff_addrs[1], eff_addrs[2], eff_addrs[3],
+            result[0], result[1],
         );
 
-        // Queue deferred write to destination.
         if let Some(dest) = &op.dest {
             ctx.queue_vector_load(dest.clone(), result, latency);
         }
