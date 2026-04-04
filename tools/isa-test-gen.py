@@ -3585,8 +3585,13 @@ _UPS_SRS_PARTNERS = {
 }
 
 
-def generate_conversion_ll(test_points: list[dict]) -> str:
+def generate_conversion_ll(test_points: list[dict]) -> tuple[str, list[tuple[int, int]]]:
     """Generate LLVM IR (.ll) for a batch of conversion test points.
+
+    Returns (ll_content, effective_sizes) where effective_sizes is a list
+    of (in_consumed, out_produced) tuples -- one per test point.  These
+    are the ACTUAL byte counts used by the generated LLVM IR for GEP
+    offsets, and must be used by the manifest builder to stay in sync.
 
     Each test point is a dict with keys: mnemonic, intrinsic, in_type,
     out_type, in_bytes, out_bytes, and optionally sign.
@@ -3757,7 +3762,8 @@ def generate_conversion_ll(test_points: list[dict]) -> str:
         lines.append(f'declare {ret_type} {name}({arg_types})')
 
     lines.append('')
-    return '\n'.join(lines)
+    effective_sizes = [(ic, op) for _, ic, op, _ in helper_funcs]
+    return '\n'.join(lines), effective_sizes
 
 
 # ---------------------------------------------------------------------------
@@ -5349,30 +5355,22 @@ def generate_all(isa_json_path: str, out_dir: str) -> dict:
     # Generate conversion batch (LLVM IR) if there are conversion test points.
     total_conv_test_points = 0
     if conv_test_points:
-        ll_content = generate_conversion_ll(conv_test_points)
+        ll_content, effective_sizes = generate_conversion_ll(conv_test_points)
         ll_filename = f"batch_{batch_idx:03d}.ll"
         ll_filepath = os.path.join(out_dir, ll_filename)
         write_if_changed(ll_filepath, ll_content)
 
         # Build metadata for each conversion test point.
+        # Use effective_sizes from generate_conversion_ll() -- these are
+        # the ACTUAL byte counts used for GEP offsets in the LLVM IR.
+        # Duplicating the size logic here would cause offset misalignment.
         conv_meta = []
         conv_in_offset = 0
         conv_out_offset = 0
-        for tp in conv_test_points:
+        for tp, (effective_in, effective_out) in zip(
+            conv_test_points, effective_sizes
+        ):
             mnemonic = tp["mnemonic"]
-            in_bytes = tp["in_bytes"]
-            out_bytes = tp["out_bytes"]
-            # For UPS/SRS, the actual I/O sizes differ from the intrinsic
-            # in_bytes/out_bytes because we round-trip through acc.
-            if ".ups." in mnemonic:
-                effective_in = in_bytes
-                effective_out = in_bytes  # round-trip back to vec
-            elif ".srs." in mnemonic:
-                effective_in = out_bytes  # loaded as vec
-                effective_out = out_bytes
-            else:
-                effective_in = in_bytes
-                effective_out = out_bytes
 
             # Track all ISA-level instruction names covered by this
             # base mnemonic (includes 2D/3D and addressing variants).

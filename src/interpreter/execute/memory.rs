@@ -2843,4 +2843,134 @@ mod tests {
         assert_eq!(stored, Some(0x42),
             "st dj0 must store modifier register value");
     }
+
+    /// Test the fused vlda.ups + vst.srs round-trip for s8.s32 wide (cm register).
+    ///
+    /// Reproduces the exact instruction sequence from the compiler-generated
+    /// conversion test: vlda.ups.s32.s8 cm0, s0, [p0] -> vst.srs.s8.s32 cm0, s0, [p1].
+    #[test]
+    fn test_fused_ups_srs_s8_s32_wide_roundtrip() {
+        use crate::tablegen::decoder_ffi::AccumWidth;
+
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        // Write 32 bytes of i8 test data to input address (0x100)
+        let input_data: [u8; 32] = [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+            17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+        ];
+        for (i, &byte) in input_data.iter().enumerate() {
+            tile.data_memory_mut()[0x100 + i] = byte;
+        }
+
+        // Set up pointer registers: p0 = input (0x70100), p1 = output (0x70200)
+        // Address 0x70100 decodes to local memory at offset 0x100
+        ctx.pointer.write(0, 0x70100);
+        ctx.pointer.write(1, 0x70200);
+
+        // s0 = 0 (shift amount) -- matches what the compiler generates.
+        // The sentinel pattern fills s0 with 0xDEADBEEF by default,
+        // but we set it to 0 here to match hardware reset state.
+        // A separate test below verifies sentinel behavior.
+        ctx.scalar.write(0, 0);
+
+        // Step 1: vlda.ups.s32.s8 cm0, s0, [p0, #0]
+        let mut ups_op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Ups)
+            .with_dest(Operand::AccumReg(0))
+            .with_source(Operand::ScalarReg(0))    // shift register
+            .with_source(Operand::Memory { base: 0, offset: 0 });
+        ups_op.from_type = Some(ElementType::Int8);
+        ups_op.element_type = Some(ElementType::Int32);
+        ups_op.accum_width = Some(AccumWidth::Full);  // cm register
+        ups_op.mem_width = MemWidth::Vector256;
+        ups_op.is_vector = true;
+
+        MemoryUnit::execute(&ups_op, &mut ctx, &mut tile, None);
+
+        // Verify accumulator has non-zero data
+        let acc = ctx.accumulator.read_wide(0);
+        assert!(acc.iter().any(|&v| v != 0),
+            "UPS should produce non-zero accumulator data");
+
+        // Step 2: vst.srs.s8.s32 cm0, s0, [p1, #0]
+        let mut srs_op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Srs)
+            .with_source(Operand::AccumReg(0))     // accumulator source
+            .with_source(Operand::ScalarReg(0))    // shift register
+            .with_source(Operand::Memory { base: 1, offset: 0 });
+        srs_op.from_type = Some(ElementType::Int32);
+        srs_op.element_type = Some(ElementType::Int8);
+        srs_op.accum_width = Some(AccumWidth::Full);  // cm register
+        srs_op.mem_width = MemWidth::Vector256;
+        srs_op.is_vector = true;
+
+        MemoryUnit::execute(&srs_op, &mut ctx, &mut tile, None);
+
+        // Read output and compare with input (should be identity for shift=0)
+        let output: Vec<u8> = (0..32)
+            .map(|i| tile.data_memory()[0x200 + i])
+            .collect();
+        assert_eq!(&output[..], &input_data[..],
+            "fused vlda.ups + vst.srs s8.s32 round-trip should be identity");
+    }
+
+    /// Verify that s0 (SRS shift register) starts at zero, matching hardware
+    /// reset state. The fused UPS/SRS pipeline depends on this because
+    /// compilers may read s0 before writing it.
+    #[test]
+    fn test_fused_ups_srs_s0_zero_init() {
+        use crate::tablegen::decoder_ffi::AccumWidth;
+
+        let mut ctx = make_ctx();
+        let mut tile = make_tile();
+
+        // Write test data to input
+        let input_data: [u8; 32] = [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+            17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+        ];
+        for (i, &byte) in input_data.iter().enumerate() {
+            tile.data_memory_mut()[0x100 + i] = byte;
+        }
+
+        ctx.pointer.write(0, 0x70100);
+        ctx.pointer.write(1, 0x70200);
+
+        // DO NOT set s0 explicitly. SRS shift register s0 = ScalarReg(40)
+        // should already be zero from hardware-matching init.
+        assert_eq!(ctx.scalar.read(40), 0, "s0 should start at 0 (hw reset)");
+
+        // UPS with s0 = 0 (from init, like hardware)
+        let mut ups_op = SlotOp::from_semantic(SlotIndex::LoadA, SemanticOp::Ups)
+            .with_dest(Operand::AccumReg(0))
+            .with_source(Operand::ScalarReg(40))  // s0 = ScalarReg(40)
+            .with_source(Operand::Memory { base: 0, offset: 0 });
+        ups_op.from_type = Some(ElementType::Int8);
+        ups_op.element_type = Some(ElementType::Int32);
+        ups_op.accum_width = Some(AccumWidth::Full);
+        ups_op.mem_width = MemWidth::Vector256;
+        ups_op.is_vector = true;
+
+        MemoryUnit::execute(&ups_op, &mut ctx, &mut tile, None);
+
+        // SRS with s0 = 0 (unchanged)
+        let mut srs_op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Srs)
+            .with_source(Operand::AccumReg(0))
+            .with_source(Operand::ScalarReg(40))  // s0 = ScalarReg(40)
+            .with_source(Operand::Memory { base: 1, offset: 0 });
+        srs_op.from_type = Some(ElementType::Int32);
+        srs_op.element_type = Some(ElementType::Int8);
+        srs_op.accum_width = Some(AccumWidth::Full);
+        srs_op.mem_width = MemWidth::Vector256;
+        srs_op.is_vector = true;
+
+        MemoryUnit::execute(&srs_op, &mut ctx, &mut tile, None);
+
+        // s0=0 round-trip should produce identity
+        let output: Vec<u8> = (0..32)
+            .map(|i| tile.data_memory()[0x200 + i])
+            .collect();
+        assert_eq!(&output[..], &input_data[..],
+            "UPS->SRS with s0=0 (hw init) should round-trip correctly");
+    }
 }

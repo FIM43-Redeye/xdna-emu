@@ -707,8 +707,16 @@ impl ExecutionContext {
         accumulator.fill_pattern(pattern);
         mask.fill_pattern(pattern);
 
-        // Normal initialization overwrites what it should
+        // Normal initialization overwrites what it should.
         scalar.set_core_id(col, row);
+
+        // Zero-initialize SRS shift registers (s0-s3 = ScalarReg 40-43).
+        // Hardware resets these to 0. Compilers assume s0=0 at function
+        // entry and may read it before writing (e.g., vlda.ups uses s0
+        // for shift before the compiler emits `mov s0, r0`).
+        for i in 40..=43 {
+            scalar.write(i, 0);
+        }
 
         Self {
             pc: 0,
@@ -2774,5 +2782,12 @@ mod tests {
 
         // Mask registers should contain sentinel
         assert_eq!(ctx.mask.read(0), [pattern; 4], "q0 should contain sentinel");
+
+        // SRS shift registers (s0-s3 = ScalarReg 40-43) should be zero,
+        // not sentinel, because hardware resets them to 0.
+        assert_eq!(ctx.scalar.read(40), 0, "s0 should be zero (hardware reset)");
+        assert_eq!(ctx.scalar.read(41), 0, "s1 should be zero (hardware reset)");
+        assert_eq!(ctx.scalar.read(42), 0, "s2 should be zero (hardware reset)");
+        assert_eq!(ctx.scalar.read(43), 0, "s3 should be zero (hardware reset)");
     }
 }

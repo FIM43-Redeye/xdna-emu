@@ -5201,6 +5201,69 @@ mod tests {
     }
 
     #[test]
+    fn test_wide_ups_srs_s8_s32_roundtrip() {
+        // Wide UPS+SRS round-trip: 32 x i8 input -> cm0 (Acc32 wide, 32 lanes)
+        // -> SRS back to 32 x i8. Simulates vlda.ups.s32.s8 + vst.srs.s8.s32.
+        //
+        // 32 bytes of i8 data packed into 8 u32 words:
+        let src = [
+            0x04030201u32, 0x08070605, 0x0C0B0A09, 0x100F0E0D,
+            0x14131211, 0x18171615, 0x1C1B1A19, 0x201F1E1D,
+        ];
+
+        // UPS wide: 32 x i8 -> 32 x i32 in cm (1024-bit accumulator)
+        let acc_wide = super::vector_ups::ups_vector_to_acc_wide(
+            &src, 0, ElementType::Int8, ElementType::Int32,
+        );
+
+        // Verify UPS wrote non-zero data
+        assert!(acc_wide.iter().any(|&v| v != 0), "UPS produced all zeros");
+
+        // SRS each half (split at word 8 boundary, matching fused handler)
+        let acc_lo: [u64; 8] = acc_wide[..8].try_into().unwrap();
+        let acc_hi: [u64; 8] = acc_wide[8..].try_into().unwrap();
+
+        let cfg = super::SrsConfig::default();
+        let result_lo = VectorAlu::vector_srs_from_acc(
+            &acc_lo, 0, ElementType::Int32, ElementType::Int8, &cfg,
+        );
+        let result_hi = VectorAlu::vector_srs_from_acc(
+            &acc_hi, 0, ElementType::Int32, ElementType::Int8, &cfg,
+        );
+
+        // Pack like the fused handler does
+        let lanes_per_half = 16usize; // from_bits=32 <= 32
+        let to_bits = 8usize;
+        let words_per_half = (lanes_per_half * to_bits + 31) / 32;
+        let n = words_per_half.min(8);
+        assert_eq!(n, 4, "should be 4 words per half for 16 x i8");
+
+        let mut packed = [0u32; 8];
+        packed[..n].copy_from_slice(&result_lo[..n]);
+        packed[n..n + n].copy_from_slice(&result_hi[..n]);
+
+        // The round-trip should recover the original input
+        assert_eq!(packed, src, "wide s8.s32 UPS->SRS round-trip failed");
+
+        // Also test with non-zero shift (common in real code)
+        let acc_shifted = super::vector_ups::ups_vector_to_acc_wide(
+            &src, 4, ElementType::Int8, ElementType::Int32,
+        );
+        let acc_s_lo: [u64; 8] = acc_shifted[..8].try_into().unwrap();
+        let acc_s_hi: [u64; 8] = acc_shifted[8..].try_into().unwrap();
+        let res_s_lo = VectorAlu::vector_srs_from_acc(
+            &acc_s_lo, 4, ElementType::Int32, ElementType::Int8, &cfg,
+        );
+        let res_s_hi = VectorAlu::vector_srs_from_acc(
+            &acc_s_hi, 4, ElementType::Int32, ElementType::Int8, &cfg,
+        );
+        let mut packed_s = [0u32; 8];
+        packed_s[..4].copy_from_slice(&res_s_lo[..4]);
+        packed_s[4..8].copy_from_slice(&res_s_hi[..4]);
+        assert_eq!(packed_s, src, "wide s8.s32 UPS->SRS round-trip with shift=4 failed");
+    }
+
+    #[test]
     fn test_vector_convert_bf16_to_f32() {
         let mut ctx = make_ctx();
         // Create bf16 values: 1.0, 2.0, 3.0, 4.0 (packed 2 per u32)
