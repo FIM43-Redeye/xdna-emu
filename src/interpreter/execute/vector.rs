@@ -1761,6 +1761,7 @@ impl VectorAlu {
     }
 
     /// Vector shuffle with pattern.
+    #[allow(dead_code)]
     fn vector_shuffle(src: &[u32; 8], pattern: ShufflePattern) -> [u32; 8] {
         match pattern {
             ShufflePattern::Identity => *src,
@@ -2015,6 +2016,7 @@ impl VectorAlu {
     }
 
     /// Get current value of vector destination (for read-modify-write ops like insert).
+    #[allow(dead_code)]
     fn get_vector_dest_value(op: &SlotOp, ctx: &ExecutionContext) -> [u32; 8] {
         if let Some(Operand::VectorReg(r)) = &op.dest {
             ctx.vector.read(*r)
@@ -2067,6 +2069,7 @@ impl VectorAlu {
     ///   insert at highest position, discard lowest element)
     /// - `!is_hi`: push into low end (shift elements towards high indices,
     ///   insert at lowest position, discard highest element)
+    #[allow(dead_code)]
     fn vector_push(src: &[u32; 8], value: u32, is_hi: bool, et: ElementType) -> [u32; 8] {
         // Convert to byte array, shift, insert, convert back.
         let mut bytes = [0u8; 32];
@@ -2641,6 +2644,7 @@ impl VectorAlu {
     }
 
     /// Conditional negate: d[i] = (cmp[i] < 0) ? -s1[i] : s1[i]
+    #[allow(dead_code)]
     fn vector_bneg_ltz(cmp: &[u32; 8], s1: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
         let mut result = [0u32; 8];
 
@@ -3420,6 +3424,7 @@ impl VectorAlu {
     }
 
     /// Read the accumulator destination register index and its current 1024-bit value.
+    #[allow(dead_code)]
     fn get_wide_acc_dest_value(op: &SlotOp, ctx: &ExecutionContext) -> (u8, Acc1024) {
         let reg = Self::get_acc_dest(op);
         (reg, ctx.accumulator.read_wide(reg))
@@ -3432,6 +3437,7 @@ impl VectorAlu {
     }
 
     /// Read an AccumReg source as a 1024-bit cm-register.
+    #[allow(dead_code)]
     fn get_wide_acc_source(op: &SlotOp, ctx: &ExecutionContext) -> (u8, Acc1024) {
         let reg = Self::get_acc_source(op);
         (reg, ctx.accumulator.read_wide(reg))
@@ -4781,6 +4787,7 @@ impl VectorAlu {
     }
 
     /// Simple concat-and-extract shift (used by narrow VSHIFT path).
+    #[allow(dead_code)]
     fn wide_vector_align(src1: &Vec512, src2: &Vec512, byte_shift: u32) -> Vec512 {
         Self::wide_vector_shift(src1, src2, 0, byte_shift)
     }

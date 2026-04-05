@@ -78,6 +78,7 @@ pub struct BuildImplicitReg {
 
 /// A parsed instruction record from TableGen (build-time version).
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct BuildInstrRecord {
     pub name: String,
     pub parents: Vec<String>,

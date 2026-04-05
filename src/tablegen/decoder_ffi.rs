@@ -771,6 +771,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_vmac_f_untied_acc_operands() {
+        // VMAC_F with dst=bml0, acc1=bml2 (untied operands).
+        // From real binary: bytes 49 00 00 01 -> bundle 0x01000049.
+        // vec_bits = ((0x01000049 >> 4) >> 2) & 0x03FFFFFF = 0x0040001
+        let vec_bits: u64 = 0x0040001;
+        let decoded = decode_slot(Slot::Vec, vec_bits)
+            .expect("VMAC_F with untied acc should decode");
+
+        assert!(
+            decoded.name.starts_with("VMAC_F"),
+            "Expected VMAC_F, got {}",
+            decoded.name,
+        );
+        assert_eq!(decoded.num_defs, 1, "one output def");
+
+        let reg_names: Vec<&str> = decoded
+            .operands
+            .iter()
+            .filter_map(|op| {
+                if let DecodedOperand::Reg { name, .. } = op {
+                    Some(name.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert!(reg_names.len() >= 2, "Need at least dst + acc1 registers");
+        assert_eq!(reg_names[0], "bml0", "dst should be bml0");
+        assert_eq!(reg_names[1], "bml2", "acc1 should be bml2");
+    }
+
     // -----------------------------------------------------------------------
     // RegisterMap and operand_from_reg_name tests
     // -----------------------------------------------------------------------

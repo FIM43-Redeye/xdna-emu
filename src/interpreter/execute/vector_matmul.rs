@@ -140,16 +140,26 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     // 4x8x8 = 32 int32 = 128 bytes). The geometry determines how many output
     // elements fill the accumulator; the register index determines where they
     // go in the physical register file.
-    let (acc_reg, is_half) = get_acc_dest(op);
+    let (acc_dest, is_half) = get_acc_dest(op);
+
+    // The initial accumulator value is read from the FIRST AccumReg source
+    // (acc1), NOT from the destination register.  VMAC_F/VMSC_F etc. have
+    // separate $dst and $acc1 fields -- when they differ, the hardware reads
+    // from acc1 and writes to dst.  For tied instructions (dst == acc1), the
+    // first AccumReg source IS the same register as dest.
+    let acc_src = op.sources.iter().find_map(|s| {
+        if let Operand::AccumReg(r) = s { Some(*r) } else { None }
+    }).unwrap_or(acc_dest);
+
     let mut acc = if is_half {
         // bm (512-bit): read single register, pad to 1024-bit working buffer.
-        let half = ctx.accumulator.read(acc_reg);
+        let half = ctx.accumulator.read(acc_src);
         let mut buf = [0u64; 16];
         buf[..8].copy_from_slice(&half);
         buf
     } else {
         // cm (1024-bit): read wide pair.
-        ctx.accumulator.read_wide(acc_reg)
+        ctx.accumulator.read_wide(acc_src & !1)
     };
 
     // Read input vectors and perform multiply.
@@ -236,15 +246,15 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         _ => {}
     }
 
-    // Write result back to the accumulator.
+    // Write result back to the DESTINATION accumulator register.
     if is_half {
         // bm (512-bit): write back single register only.
         let mut half = [0u64; 8];
         half.copy_from_slice(&acc[..8]);
-        ctx.accumulator.write(acc_reg, half);
+        ctx.accumulator.write(acc_dest, half);
     } else {
         // cm (1024-bit): write wide pair.
-        ctx.accumulator.write_wide(acc_reg, acc);
+        ctx.accumulator.write_wide(acc_dest, acc);
     }
 
     true
@@ -1103,7 +1113,11 @@ fn bf16_mac_hw_lane(q: u32, a_elems: &[u16], b_elems: &[u16], subtract: bool) ->
 
     // Early exit for NaN/Inf (before alignment).
     if nan_flag {
-        return fp32_make(false, 255, 0x7F_FFFF); // Canonical NaN (fpcorr format)
+        // Hardware bfnorm_lane produces NaN with only bit 0 of the mantissa
+        // set (see me_inline_primitives.h:13569).  The fpcorr normalization
+        // zeroes the mantissa via out_zeros masking, then deposits the nan
+        // flag into bit 0: rr[0] |= nan.  Result = 0x7F800001.
+        return fp32_make(false, 255, 1);
     }
     if inf_flag {
         return fp32_make(inf_sgn, 255, 0); // Infinity
@@ -2326,6 +2340,7 @@ mod tests {
     }
 
     /// Build a MAC op with an extra AccumReg source (for AddMac/SubMac).
+    #[allow(dead_code)]
     fn make_double_acc_op(
         semantic: SemanticOp,
         a_vreg: u8,
