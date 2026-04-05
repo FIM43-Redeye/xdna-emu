@@ -895,20 +895,30 @@ pub fn matmul_sub(
 }
 
 // ---------------------------------------------------------------------------
-// Hardware-accurate bf16 MAC (29-bit accumulator model)
+// Hardware-accurate bf16 MAC (vmac pipeline model)
 // ---------------------------------------------------------------------------
 //
-// Exact translation of `bf16_mac_hw` from the aietools python_model
-// (bfloat16.py lines 280-399).  This matches the AIE2 hardware MAC
-// pipeline's fixed-point accumulation with 29-bit internal precision.
+// Reimplementation of the AIE2 hardware MAC pipeline for bfloat16 inputs.
+// The hardware uses a biased exponent system with global alignment, matching
+// the vmac pipeline from the architecture's multiplier-accumulator unit.
+//
+// Key hardware behavioral facts (derived from architecture reference):
+//   - Product exponents are biased: cexp = aexp + bexp + 1
+//   - Accumulator exponent is biased: qexp_biased = qexp + 128
+//   - All values (products + accumulator) align to a global maximum exponent
+//   - Products are signed, aligned at float_width=23 with RNE rounding
+//   - Accumulator is unsigned, aligned at float_width=23, then signed
+//   - Wide integer summation preserves all bits (no intermediate rounding)
+//   - Single final normalization: exps = cexpmax + fl - 23 - 128
 //
 // Pipeline stages:
-//   1. Split bf16 inputs, detect NaN/Inf, compute product exponents
+//   1. Split bf16 inputs, detect NaN/Inf, compute biased product exponents
 //   2. Integer multiply (8-bit mantissa * 8-bit mantissa = 16-bit product)
-//   3. Align products to max exponent, round to iprec=23 bits (RNE)
-//   4. Sum aligned products in integer arithmetic
-//   5. Merge product sum with previous fp32 accumulator at aprec=29 bits
-//   6. Normalize back to fp32 with RNE rounding, FTZ on underflow
+//   3. Bias accumulator exponent (+128), find global cexpmax
+//   4. Align signed products to cexpmax at float_width=23 (bfshift, RNE)
+//   5. Align unsigned accumulator to cexpmax at float_width=23 (fpshift, RNE)
+//   6. Sum all aligned values exactly (wide integer arithmetic)
+//   7. Normalize to fp32 via fpcorr (exps = cexpmax + fl - 23 - 128)
 
 /// Shift-and-round with RNE (round-to-nearest-even).
 ///
@@ -964,178 +974,234 @@ fn flo(man: i64) -> i32 {
     63 - man.leading_zeros() as i32
 }
 
-/// Find the leading bit position for a signed value.
-/// For non-negative: same as flo.  For negative: flo(bitwise complement).
-fn flb(man: i64) -> i32 {
-    if man >= 0 { flo(man) } else { flo(!man) }
-}
 
-/// Truncate to `bits` width with sign extension.
-fn trnc(a: i64, sgn: bool, bits: u32) -> i64 {
-    if bits == 0 { return 0; }
-    let mask = if bits >= 64 { !0i64 as u64 } else { (1u64 << bits) - 1 };
-    let v = (a as u64) & mask;
-    let s = (v >> (bits - 1)) & 1;
-    if s == 1 && sgn {
-        // Sign-extend: set all upper bits
-        (v | !mask) as i64
-    } else {
-        v as i64
-    }
-}
-
-/// Hardware-accurate bf16 MAC for one output lane.
+/// Hardware-accurate bf16 MAC for one output lane (vmac pipeline).
 ///
 /// Takes the previous accumulator value `q` (fp32 bits), paired bf16
 /// input elements `a_elems` and `b_elems`, and whether to subtract.
 /// Returns the new fp32 accumulator value (as bits).
 ///
-/// Direct translation of `bf16_mac_hw` from bfloat16.py.
+/// Implements the AIE2 vmac pipeline's biased exponent system with global
+/// alignment, matching the hardware multiplier-accumulator unit behavior.
 fn bf16_mac_hw_lane(q: u32, a_elems: &[u16], b_elems: &[u16], subtract: bool) -> u32 {
     use super::vector_float::{bf16_split, fp32_split, fp32_make};
 
-    let iprec: i32 = 23; // Internal precision for product alignment
-    let aprec: i32 = 29; // Accumulator precision for merge
+    const FLOAT_WIDTH: i32 = 23; // Internal alignment precision
 
     let n = a_elems.len();
     debug_assert_eq!(n, b_elems.len());
 
-    // Phase 1: Split inputs, detect NaN/Inf, compute product exponents.
+    // Phase 1: Split inputs, detect NaN/Inf, compute biased product exponents.
+    //
+    // Hardware biases product exponents by +1: cexp = aexp + bexp + 1.
+    // This accounts for the multiplier array's internal representation.
     let mut nan_flag = false;
     let mut inf_flag = false;
     let mut inf_sgn = false;
-    let mut csgnl = Vec::with_capacity(n);
-    let mut cexpl = Vec::with_capacity(n);
-    let mut amanl = Vec::with_capacity(n);
-    let mut bmanl = Vec::with_capacity(n);
+
+    struct Product {
+        signed_mantissa: i64,
+        biased_exp: i32,
+    }
+    let mut products = Vec::with_capacity(n);
 
     for i in 0..n {
-        let (asgn, aexp, aman) = bf16_split(a_elems[i]);
-        let (bsgn, bexp, bman) = bf16_split(b_elems[i]);
+        let (asgn, mut aexp, aman) = bf16_split(a_elems[i]);
+        let (bsgn, mut bexp, bman) = bf16_split(b_elems[i]);
 
         let csgn = asgn != bsgn; // Product sign = XOR
-        csgnl.push(csgn);
-        amanl.push(aman);
-        bmanl.push(bman);
 
+        // NaN/Inf detection (before denorm handling).
         let ainf = aexp == 255 && aman == 0;
         let binf = bexp == 255 && bman == 0;
         let anan = aexp == 255 && aman != 0;
         let bnan = bexp == 255 && bman != 0;
         let cinf = ainf || binf;
         let cnan = anan || bnan;
+        // Inf * zero = NaN (hardware behavior).
+        let cex0 = (aexp == 0 && aman == 0) || (bexp == 0 && bman == 0);
 
-        nan_flag = nan_flag || cnan || (inf_flag && cinf && csgn != inf_sgn);
+        nan_flag = nan_flag || cnan
+            || (inf_flag && cinf && csgn != inf_sgn)
+            || (cinf && cex0);
         inf_flag = (inf_flag || cinf) && !nan_flag;
-        if cinf && !inf_flag { inf_sgn = csgn; }
-
-        let cexp: i32 = if aexp == 0 || bexp == 0 {
-            0 // FTZ: if either input has exp=0, product is zero
-        } else {
-            (aexp as i32) + (bexp as i32)
-        };
-        cexpl.push(cexp);
-    }
-
-    // Phase 2: Accumulate products in fixed-point.
-    let cexpmax = *cexpl.iter().max().unwrap_or(&0);
-
-    let mut cmansum: i64 = 0;
-    for i in 0..n {
-        let aman = if cexpl[i] > 0 { (1i64 << 7) | (amanl[i] as i64) } else { 0 };
-        let bman = if cexpl[i] > 0 { (1i64 << 7) | (bmanl[i] as i64) } else { 0 };
-        let cman_f = aman * bman; // Q.14 (up to 16 significant bits)
-
-        let expdiff = cexpmax - cexpl[i];
-
-        // Align to max exponent, keep iprec=23 bits.
-        let (cman, _) = shift_round_rne(cman_f, expdiff + 14, iprec, false);
-
-        if csgnl[i] {
-            cmansum -= cman;
-        } else {
-            cmansum += cman;
+        if cinf && inf_sgn == false && !nan_flag {
+            inf_sgn = csgn;
         }
+
+        // Track whether original exponent was zero BEFORE denorm handling.
+        // Hardware uses this to decide implicit leading 1 bit (cex0 flag).
+        let aex0 = aexp == 0;
+        let bex0 = bexp == 0;
+
+        // Denorm handling: bump exponent so product exponent math works,
+        // but mantissa does NOT get implicit 1 (tracked via aex0/bex0).
+        if aexp == 0 && aman != 0 { aexp = 1; }
+        if bexp == 0 && bman != 0 { bexp = 1; }
+
+        // Biased product exponent: hardware adds +1.
+        let cexp: i32 = if aexp == 0 || bexp == 0 {
+            0 // Zero input -> zero product
+        } else {
+            (aexp as i32) + (bexp as i32) + 1
+        };
+
+        // Unsigned product mantissa. Implicit leading 1 bit is added only
+        // when the ORIGINAL exponent was non-zero (hardware cex0 flag).
+        let a_man: i64 = if !aex0 && aexp < 255 {
+            0x80 | aman as i64  // Normal: add implicit 1
+        } else if aex0 && aman != 0 {
+            aman as i64  // Denorm: raw mantissa, no implicit 1
+        } else {
+            0  // Zero or Inf/NaN: zero mantissa for multiply
+        };
+        let b_man: i64 = if !bex0 && bexp < 255 {
+            0x80 | bman as i64
+        } else if bex0 && bman != 0 {
+            bman as i64
+        } else {
+            0
+        };
+        let unsigned_product = a_man * b_man; // Up to 16 bits
+
+        // Sign applied to product BEFORE alignment (matches hardware sge/mpy stages).
+        let signed_product = if csgn != subtract {
+            -(unsigned_product)
+        } else {
+            unsigned_product
+        };
+
+        products.push(Product { signed_mantissa: signed_product, biased_exp: cexp });
     }
 
-    // Phase 3: Merge with previous fp32 accumulator.
+    // Phase 2: Accumulator -- extract and bias exponent.
     //
-    // For subtract mode (MSC/SubMac): result = acc - products.
-    // Negate the product sum so the merge computes acc + (-products).
-    if subtract {
-        cmansum = -cmansum;
-    }
+    // Hardware biases accumulator exponent by +128: qexp_biased = qexp + 128.
+    // Zero accumulator keeps biased exponent = 0.
+    let (qsgn, qexp_raw, qman_raw) = fp32_split(q);
+    let qzero = qexp_raw == 0 && qman_raw == 0;
+    let qinf = qexp_raw == 255 && qman_raw == 0;
+    let qnan = qexp_raw == 255 && qman_raw != 0;
 
-    let lo_pos = flb(cmansum);
+    // Denorm handling for accumulator (same pattern as products).
+    let mut qexp = qexp_raw;
+    if qexp == 0 && qman_raw != 0 { qexp = 1; }
 
-    let (qsgn, qexp, qman_raw) = fp32_split(q);
-    let qinf = qexp == 255 && qman_raw == 0;
-    let qnan = qexp == 255 && qman_raw != 0;
+    let qexp_biased: i32 = if !qzero { (qexp as i32) + 128 } else { 0 };
 
-    nan_flag = nan_flag || qnan || (inf_flag && qinf && qsgn != inf_sgn);
-    inf_flag = (inf_flag || qinf) && !nan_flag;
-
-    // Reconstruct signed accumulator mantissa (FTZ: exp=0 → man=0).
-    let qman_full: i64 = if qexp > 0 {
+    // Unsigned accumulator mantissa (implicit leading 1 for normals).
+    let qman_unsigned: i64 = if qexp_raw > 0 && qexp_raw < 255 {
         (1i64 << 23) | (qman_raw as i64)
     } else {
         0
     };
-    let qman: i64 = if qsgn { -qman_full } else { qman_full };
 
-    // Compute effective exponents for alignment.
-    let cexp_eff = cexpmax as i64 + lo_pos as i64 - iprec as i64 - 127;
-    let rexp = std::cmp::max(cexp_eff, qexp as i64) as i32;
+    // NaN/Inf from accumulator.
+    nan_flag = nan_flag || qnan || (inf_flag && qinf && qsgn != inf_sgn);
+    inf_flag = (inf_flag || qinf) && !nan_flag;
+    if qinf && !nan_flag { inf_sgn = inf_sgn || qsgn; }
 
-    let qlo_pos = rexp as i64 - qexp as i64 + 23;
-    let clo_pos = rexp as i64 - cexpmax as i64 + iprec as i64 + 127;
-
-    let qsh_dn = qlo_pos - aprec as i64;
-    let csh_dn = clo_pos - aprec as i64;
-
-    // Swap: the value with the smaller shift keeps full precision (left-shifted),
-    // the value with the larger shift gets rounded to aprec bits.
-    let (qm3, cm3, _qlo_pos2, clo_pos2, qsh_dn2) = if qsh_dn > csh_dn {
-        (cmansum, qman, clo_pos, qlo_pos, csh_dn)
-    } else {
-        (qman, cmansum, qlo_pos, clo_pos, qsh_dn)
-    };
-
-    let lsh = (-qsh_dn2) as u32;
-    let qman2 = if lsh >= 63 { 0i64 } else { qm3.wrapping_shl(lsh) };
-    let (cmansum2, _) = shift_round_rne(cm3, clo_pos2 as i32, aprec, true);
-
-    let rsum2 = qman2 + cmansum2;
-    let rsum = trnc(rsum2, true, 32);
-
-    // Phase 4: Handle NaN/Inf.
+    // Early exit for NaN/Inf (before alignment).
     if nan_flag {
-        return fp32_make(false, 255, 0x7F); // Canonical NaN
+        return fp32_make(false, 255, 0x7F_FFFF); // Canonical NaN (fpcorr format)
     }
     if inf_flag {
         return fp32_make(inf_sgn, 255, 0); // Infinity
     }
 
-    // Phase 5: Normalize back to fp32.
-    let sgn = rsum < 0;
-    let sum_abs = rsum.unsigned_abs() as i64;
+    // Phase 3: Global cexpmax across products AND accumulator.
+    let mut cexpmax: i32 = qexp_biased;
+    for p in &products {
+        if p.biased_exp > cexpmax {
+            cexpmax = p.biased_exp;
+        }
+    }
 
-    if sum_abs == 0 {
+    if cexpmax == 0 {
+        return 0; // All inputs zero
+    }
+
+    // Phase 4: Align signed products to cexpmax at float_width=23 (bfshift).
+    //
+    // Hardware bfshift formula: vk = product << (float_width - 14)
+    // then shift_round_rne(vk, 23 + shift, float_width) where shift = cexpmax - cexp.
+    // The << 9 scales the 14-bit product to the 23-bit alignment field.
+    let mut product_sum: i64 = 0;
+    for p in &products {
+        if p.biased_exp == 0 {
+            continue; // Zero product
+        }
+        let s = cexpmax - p.biased_exp;
+        let vk = p.signed_mantissa << (FLOAT_WIDTH - 14); // << 9
+        let (aligned, _) = shift_round_rne(vk, 23 + s, FLOAT_WIDTH, false);
+        product_sum += aligned;
+    }
+
+    // Phase 5: Align unsigned accumulator to cexpmax at float_width=23 (fpshift).
+    //
+    // Hardware fpshift formula: vk = man << (float_width - 23)
+    // then shift_round_rne(vk, 23 + shift, float_width) where shift = cexpmax - qexp_biased.
+    // For fp32 mantissa, the << 0 is a no-op.
+    let aligned_acc: i64 = if qman_unsigned > 0 && qexp_biased > 0 {
+        let s_acc = cexpmax - qexp_biased;
+        let vk_acc = qman_unsigned; // << 0 (float_width - 23 = 0)
+        let (aligned, _) = shift_round_rne(vk_acc, 23 + s_acc, FLOAT_WIDTH, false);
+        // Apply accumulator sign (hardware cry_hw + cpr_hw 2's complement).
+        if qsgn { -aligned } else { aligned }
+    } else {
+        0
+    };
+
+    // Phase 6: Sum (exact -- hardware uses wide integers through PSA tree).
+    let total = product_sum + aligned_acc;
+
+    // Phase 7: fpcorr normalization to fp32.
+    //
+    // Hardware fpcorr formula: exps = cexpmax + fl - 23 - 128
+    // where fl = leading bit position of the unsigned magnitude.
+    let sgn = total < 0;
+    let man = total.unsigned_abs() as i64;
+
+    if man == 0 {
         return 0;
     }
 
-    let nlo_pos = flo(sum_abs);
-    let (man, expincr) = shift_round_rne(sum_abs, nlo_pos, 23, true);
-    let exp = rexp + nlo_pos - aprec + if expincr { 1 } else { 0 };
+    let fl = flo(man);
 
-    if exp >= 255 {
+    // Shift mantissa to 23-bit fp32 field with RNE rounding.
+    let (mans, fl_adj) = if fl <= 23 {
+        // Value fits in 23 bits -- left-shift to fill.
+        (man << (23 - fl), fl)
+    } else {
+        // Value exceeds 23 bits -- right-shift with RNE.
+        let shft = fl - 23 - 1;
+        let mut shifted = man >> shft;
+        let rmask = (1i64 << shft) - 1;
+        let grd = (shifted & 1) != 0;
+        let lsb = (shifted & 2) != 0;
+        let stk = (man & rmask) != 0;
+        let rup = grd && (stk || lsb);
+        let mut fl_out = fl;
+        if rup {
+            shifted += 2;
+            if shifted >= (1i64 << 25) {
+                shifted >>= 1;
+                fl_out += 1;
+            }
+        }
+        (shifted >> 1, fl_out)
+    };
+
+    let exps = cexpmax + fl_adj - 23 - 128;
+
+    if exps <= 0 || fl == -1 {
+        return 0; // Underflow (FTZ)
+    }
+    if exps >= 255 {
         return fp32_make(sgn, 255, 0); // Overflow
     }
-    if exp <= 0 {
-        return fp32_make(sgn, 0, 0); // Underflow (FTZ)
-    }
 
-    fp32_make(sgn, exp as u8, man as u32 & 0x7F_FFFF)
+    fp32_make(sgn, exps as u8, mans as u32 & 0x7F_FFFF)
 }
 
 // ---------------------------------------------------------------------------
