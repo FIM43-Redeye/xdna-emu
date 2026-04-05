@@ -162,27 +162,47 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         ctx.accumulator.read_wide(acc_src & !1)
     };
 
+    // For AddMac/SubMac: read the second accumulator source.
+    //
+    // In bfloat mode, acc2 participates in the 68-bit PSA adder BEFORE
+    // normalization (hardware: psal_hw merges products + acc1 + acc2, then
+    // bfnorm_hw normalizes). We pass acc2 into matmul_config_driven so
+    // bf16_mac_hw_lane can include it in the pre-normalization sum.
+    //
+    // In integer mode, acc2 is a simple post-multiply add/sub.
+    let (acc2_for_bfloat, is_sub_acc2) = match semantic {
+        SemanticOp::AddMac | SemanticOp::SubMac if config.bfloat => {
+            let src_reg = get_acc_source(op);
+            let src_acc = if is_half {
+                let half = ctx.accumulator.read(src_reg);
+                let mut buf = [0u64; 16];
+                buf[..8].copy_from_slice(&half);
+                buf
+            } else {
+                ctx.accumulator.read_wide(src_reg & !1)
+            };
+            (Some(src_acc), semantic == SemanticOp::SubMac)
+        }
+        _ => (None, false),
+    };
+
     // Read input vectors and perform multiply.
     if is_sparse {
         let (a_bytes, b_register, mask) = get_sparse_operands(op, ctx);
         matmul_sparse_config_driven(&mut acc, &a_bytes, &b_register, mask, &config);
     } else {
         let (a, b) = get_two_vec512(op, ctx);
-        matmul_config_driven(&mut acc, &a, &b, &config);
+        matmul_config_driven(
+            &mut acc, &a, &b, &config,
+            acc2_for_bfloat.as_ref(),
+            is_sub_acc2,
+        );
     }
 
-    // For AddMac/SubMac: merge a second accumulator source AFTER the multiply.
-    // This must happen after matmul_config_driven because that function zeros
-    // the accumulator when zero_acc=1. The hardware computes:
-    //   AddMac: result = (acc_dest [or 0] + A*B) + acc2
-    //   SubMac: result = (acc_dest [or 0] + A*B) - acc2
-    //
-    // In Acc32 mode, the hardware performs the acc2 merge as independent
-    // 32-bit lane additions (no carry propagation from the low half to the
-    // high half within each u64 word). In Acc64 mode, it's a full 64-bit
-    // addition on each u64 lane.
+    // For integer AddMac/SubMac: merge acc2 AFTER the multiply.
+    // (Bfloat AddMac/SubMac is handled inside bf16_mac_hw_lane above.)
     match semantic {
-        SemanticOp::AddMac | SemanticOp::SubMac => {
+        SemanticOp::AddMac | SemanticOp::SubMac if !config.bfloat => {
             let src_reg = get_acc_source(op);
             let src_acc = if is_half {
                 let half = ctx.accumulator.read(src_reg);
@@ -195,50 +215,29 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
             let n = if is_half { 8 } else { 16 };
             let is_sub = semantic == SemanticOp::SubMac;
 
-            if config.bfloat {
-                // BFloat16 mode: accumulator holds fp32 values, two per u64.
-                // Use AIE2 fp32 add (FTZ + NaN handling) for the acc2 merge.
-                // The both-NaN compute-through behavior in aie2_fp32_add
-                // matches the hardware's accumulator ALU.
-                use super::vector_float::aie2_fp32_add;
-                for i in 0..n {
-                    let a_lo = (acc[i] & 0xFFFF_FFFF) as u32;
-                    let a_hi = (acc[i] >> 32) as u32;
-                    let mut s_lo = (src_acc[i] & 0xFFFF_FFFF) as u32;
-                    let mut s_hi = (src_acc[i] >> 32) as u32;
-                    if is_sub {
-                        s_lo ^= 0x8000_0000;
-                        s_hi ^= 0x8000_0000;
+            match config.acc_width {
+                AccWidth::Acc32 => {
+                    // Acc32: two i32 values per u64, added independently.
+                    for i in 0..n {
+                        let a_lo = (acc[i] & 0xFFFF_FFFF) as u32;
+                        let a_hi = (acc[i] >> 32) as u32;
+                        let s_lo = (src_acc[i] & 0xFFFF_FFFF) as u32;
+                        let s_hi = (src_acc[i] >> 32) as u32;
+                        let (r_lo, r_hi) = if is_sub {
+                            (a_lo.wrapping_sub(s_lo), a_hi.wrapping_sub(s_hi))
+                        } else {
+                            (a_lo.wrapping_add(s_lo), a_hi.wrapping_add(s_hi))
+                        };
+                        acc[i] = (r_lo as u64) | ((r_hi as u64) << 32);
                     }
-                    let r_lo = aie2_fp32_add(a_lo, s_lo);
-                    let r_hi = aie2_fp32_add(a_hi, s_hi);
-                    acc[i] = (r_lo as u64) | ((r_hi as u64) << 32);
                 }
-            } else {
-                match config.acc_width {
-                    AccWidth::Acc32 => {
-                        // Acc32: two i32 values per u64, added independently.
-                        for i in 0..n {
-                            let a_lo = (acc[i] & 0xFFFF_FFFF) as u32;
-                            let a_hi = (acc[i] >> 32) as u32;
-                            let s_lo = (src_acc[i] & 0xFFFF_FFFF) as u32;
-                            let s_hi = (src_acc[i] >> 32) as u32;
-                            let (r_lo, r_hi) = if is_sub {
-                                (a_lo.wrapping_sub(s_lo), a_hi.wrapping_sub(s_hi))
-                            } else {
-                                (a_lo.wrapping_add(s_lo), a_hi.wrapping_add(s_hi))
-                            };
-                            acc[i] = (r_lo as u64) | ((r_hi as u64) << 32);
-                        }
-                    }
-                    AccWidth::Acc64 => {
-                        // Acc64: full 64-bit add/sub on each u64 lane.
-                        for i in 0..n {
-                            if is_sub {
-                                acc[i] = acc[i].wrapping_sub(src_acc[i]);
-                            } else {
-                                acc[i] = acc[i].wrapping_add(src_acc[i]);
-                            }
+                AccWidth::Acc64 => {
+                    // Acc64: full 64-bit add/sub on each u64 lane.
+                    for i in 0..n {
+                        if is_sub {
+                            acc[i] = acc[i].wrapping_sub(src_acc[i]);
+                        } else {
+                            acc[i] = acc[i].wrapping_add(src_acc[i]);
                         }
                     }
                 }
@@ -994,7 +993,30 @@ fn flo(man: i64) -> i32 {
 ///
 /// Implements the AIE2 vmac pipeline's biased exponent system with global
 /// alignment, matching the hardware multiplier-accumulator unit behavior.
-fn bf16_mac_hw_lane(q: u32, a_elems: &[u16], b_elems: &[u16], subtract: bool) -> u32 {
+/// Execute one lane of the bf16 MAC pipeline.
+///
+/// Parameters:
+/// - `q`: primary accumulator (acc1) as fp32 bits
+/// - `a_elems`/`b_elems`: bf16 input pairs for this lane
+/// - `subtract`: negate products (MSC variants)
+/// - `acc2`: optional second accumulator for AddMac/SubMac (fp32 bits)
+/// - `sub_acc2`: if true, subtract acc2 instead of adding (SubMac)
+///
+/// Hardware pipeline (from aietools me_inline_primitives.h):
+/// 1. bfshiftcompute_hw: align products, acc1, AND acc2 to common cexpmax
+/// 2. psal_hw -> split_adder5_hw: products + acc1 + acc2 in 68-bit adder
+/// 3. bfnorm_hw: normalize the COMBINED result
+///
+/// This matches the hardware's single-pass merge, where acc2 participates
+/// in the same wide addition as products and acc1, BEFORE normalization.
+fn bf16_mac_hw_lane(
+    q: u32,
+    a_elems: &[u16],
+    b_elems: &[u16],
+    subtract: bool,
+    acc2: Option<u32>,
+    sub_acc2: bool,
+) -> u32 {
     use super::vector_float::{bf16_split, fp32_split, fp32_make};
 
     const FLOAT_WIDTH: i32 = 23; // Internal alignment precision
@@ -1059,16 +1081,20 @@ fn bf16_mac_hw_lane(q: u32, a_elems: &[u16], b_elems: &[u16], subtract: bool) ->
 
         // Unsigned product mantissa. Implicit leading 1 bit is added only
         // when the ORIGINAL exponent was non-zero (hardware cex0 flag).
-        let a_man: i64 = if !aex0 && aexp < 255 {
-            0x80 | aman as i64  // Normal: add implicit 1
-        } else if aex0 && aman != 0 {
+        // Hardware includes mantissa for NaN/Inf (exp=255) -- the NaN/Inf
+        // detection is separate from the mantissa datapath.  The multiplier
+        // array always computes products; bfnorm applies NaN/Inf flags at
+        // the output.  (See bfshiftcompute_lane oaccman = concat(!exp0, man).)
+        let a_man: i64 = if !aex0 {
+            0x80 | aman as i64  // Normal, Inf, or NaN: add implicit 1
+        } else if aman != 0 {
             aman as i64  // Denorm: raw mantissa, no implicit 1
         } else {
-            0  // Zero or Inf/NaN: zero mantissa for multiply
+            0  // Zero
         };
-        let b_man: i64 = if !bex0 && bexp < 255 {
+        let b_man: i64 = if !bex0 {
             0x80 | bman as i64
-        } else if bex0 && bman != 0 {
+        } else if bman != 0 {
             bman as i64
         } else {
             0
@@ -1085,7 +1111,7 @@ fn bf16_mac_hw_lane(q: u32, a_elems: &[u16], b_elems: &[u16], subtract: bool) ->
         products.push(Product { signed_mantissa: signed_product, biased_exp: cexp });
     }
 
-    // Phase 2: Accumulator -- extract and bias exponent.
+    // Phase 2: Accumulator (acc1) -- extract and bias exponent.
     //
     // Hardware biases accumulator exponent by +128: qexp_biased = qexp + 128.
     // Zero accumulator keeps biased exponent = 0.
@@ -1100,44 +1126,97 @@ fn bf16_mac_hw_lane(q: u32, a_elems: &[u16], b_elems: &[u16], subtract: bool) ->
 
     let qexp_biased: i32 = if !qzero { (qexp as i32) + 128 } else { 0 };
 
-    // Unsigned accumulator mantissa (implicit leading 1 for normals).
-    let qman_unsigned: i64 = if qexp_raw > 0 && qexp_raw < 255 {
-        (1i64 << 23) | (qman_raw as i64)
+    // Unsigned accumulator mantissa.  Hardware bfshiftcompute_lane uses
+    // oaccman = concat(!accexp0, accman) -- implicit leading 1 for ALL
+    // non-zero exponents (including NaN/Inf at exp=255), raw mantissa
+    // without implicit 1 for denorms, zero for true zeros.
+    let qman_unsigned: i64 = if qexp_raw > 0 {
+        (1i64 << 23) | (qman_raw as i64)  // Normal, NaN, or Inf
+    } else if qman_raw != 0 {
+        qman_raw as i64  // Denorm (no implicit 1)
     } else {
-        0
+        0  // True zero
     };
 
-    // NaN/Inf from accumulator.
+    // NaN/Inf from acc1.
     nan_flag = nan_flag || qnan || (inf_flag && qinf && qsgn != inf_sgn);
     inf_flag = (inf_flag || qinf) && !nan_flag;
     if qinf && !nan_flag { inf_sgn = inf_sgn || qsgn; }
 
-    // Early exit for NaN/Inf (before alignment).
+    // Phase 2b: Second accumulator (acc2) for AddMac/SubMac.
     //
-    // When NaN comes ONLY from the accumulator and all products are zero
-    // (all bf16 inputs are zero), the hardware passes the accumulator through
-    // unchanged -- the MAC is effectively a no-op. This preserves the
-    // accumulator's NaN bit pattern for downstream operations (e.g., the
-    // AddMac/SubMac merge step) that can compute meaningful results from
-    // two NaN operands. Verified against real NPU1 hardware.
+    // Hardware (me_inline_primitives.h addmac_bf line 14976) passes acc2
+    // as the scd_ parameter into the MAC pipeline. It participates in the
+    // same bfshiftcompute_hw -> psal_hw -> bfnorm_hw flow as acc1.
+    // The acc2 merge happens in the 68-bit PSA adder BEFORE normalization.
+    let (d_sgn, d_exp_biased, d_man_unsigned) = if let Some(d) = acc2 {
+        let (dsgn, dexp_raw, dman_raw) = fp32_split(d);
+        let dzero = dexp_raw == 0 && dman_raw == 0;
+        let dinf = dexp_raw == 255 && dman_raw == 0;
+        let dnan = dexp_raw == 255 && dman_raw != 0;
+
+        let mut dexp = dexp_raw;
+        if dexp == 0 && dman_raw != 0 { dexp = 1; }
+
+        let dexp_biased: i32 = if !dzero { (dexp as i32) + 128 } else { 0 };
+        // Same mantissa logic as acc1: include for NaN/Inf/denorm.
+        let dman: i64 = if dexp_raw > 0 {
+            (1i64 << 23) | (dman_raw as i64)
+        } else if dman_raw != 0 {
+            dman_raw as i64  // Denorm
+        } else {
+            0
+        };
+
+        // NaN/Inf from acc2.
+        nan_flag = nan_flag || dnan || (inf_flag && dinf && (dsgn != sub_acc2) != inf_sgn);
+        inf_flag = (inf_flag || dinf) && !nan_flag;
+        if dinf && !nan_flag { inf_sgn = inf_sgn || (dsgn != sub_acc2); }
+
+        // Effective sign: XOR with sub_acc2 for SubMac.
+        let effective_sgn = dsgn != sub_acc2;
+        (effective_sgn, dexp_biased, dman)
+    } else {
+        (false, 0i32, 0i64)
+    };
+
+    // NaN/Inf handling.
+    //
+    // Hardware does NOT early-exit on NaN.  NaN/Inf mantissas participate
+    // in the PSA adder normally (with implicit leading 1).  The nan/inf
+    // flags propagate through to bfnorm_lane which applies them AFTER
+    // normalization:
+    //
+    //   out_zeros = !(pinf | minf | overflow | underflow)
+    //   rr = out_zeros ? normalized_mantissa : 0
+    //   rr[0] |= nan
+    //   exp = (nan|pinf|minf|overflow) ? 0xFF : normal_exp
+    //
+    // This means: when nan_flag is set but no overflow/underflow, the
+    // normalized PSA sum is PRESERVED in the NaN mantissa bits (with bit 0
+    // OR'd).  Only when overflow also occurs is the mantissa zeroed to
+    // produce canonical NaN (0x7F800001).
+    //
+    // Special case: when NaN comes ONLY from acc1 and all products are zero
+    // and no acc2, the hardware passes the accumulator through unchanged
+    // (MAC is a no-op).  Verified against real NPU1 hardware.
     if nan_flag {
         let all_products_zero = products.iter().all(|p| p.biased_exp == 0);
-        if qnan && !qinf && all_products_zero {
-            // NaN only from accumulator, zero products: pass through.
+        if qnan && !qinf && all_products_zero && acc2.is_none() {
             return q;
         }
-        // Hardware bfnorm_lane produces NaN with only bit 0 of the mantissa
-        // set (see me_inline_primitives.h:13569).  The fpcorr normalization
-        // zeroes the mantissa via out_zeros masking, then deposits the nan
-        // flag into bit 0: rr[0] |= nan.  Result = 0x7F800001.
-        return fp32_make(false, 255, 1);
+        // Fall through: NaN mantissa participates in PSA sum, bfnorm
+        // applies NaN logic after normalization (see Phase 7 below).
     }
-    if inf_flag {
+    if inf_flag && !nan_flag {
         return fp32_make(inf_sgn, 255, 0); // Infinity
     }
 
-    // Phase 3: Global cexpmax across products AND accumulator.
+    // Phase 3: Global cexpmax across products, acc1, AND acc2.
     let mut cexpmax: i32 = qexp_biased;
+    if d_exp_biased > cexpmax {
+        cexpmax = d_exp_biased;
+    }
     for p in &products {
         if p.biased_exp > cexpmax {
             cexpmax = p.biased_exp;
@@ -1164,7 +1243,7 @@ fn bf16_mac_hw_lane(q: u32, a_elems: &[u16], b_elems: &[u16], subtract: bool) ->
         product_sum += aligned;
     }
 
-    // Phase 5: Align unsigned accumulator to cexpmax at float_width=23 (fpshift).
+    // Phase 5: Align acc1 to cexpmax at float_width=23 (fpshift).
     //
     // Hardware fpshift formula: vk = man << (float_width - 23)
     // then shift_round_rne(vk, 23 + shift, float_width) where shift = cexpmax - qexp_biased.
@@ -1179,8 +1258,21 @@ fn bf16_mac_hw_lane(q: u32, a_elems: &[u16], b_elems: &[u16], subtract: bool) ->
         0
     };
 
-    // Phase 6: Sum (exact -- hardware uses wide integers through PSA tree).
-    let total = product_sum + aligned_acc;
+    // Phase 5b: Align acc2 to cexpmax (same fpshift as acc1).
+    //
+    // Hardware psal_hw (line 12440) merges products + acc1 + acc2 via
+    // split_adder5_hw in a single 68-bit addition.
+    let aligned_acc2: i64 = if d_man_unsigned > 0 && d_exp_biased > 0 {
+        let s_d = cexpmax - d_exp_biased;
+        let vk_d = d_man_unsigned;
+        let (aligned, _) = shift_round_rne(vk_d, 23 + s_d, FLOAT_WIDTH, false);
+        if d_sgn { -aligned } else { aligned }
+    } else {
+        0
+    };
+
+    // Phase 6: Sum in 68-bit PSA adder (products + acc1 + acc2).
+    let total = product_sum + aligned_acc + aligned_acc2;
 
     // Phase 7: fpcorr normalization to fp32.
     //
@@ -1190,6 +1282,12 @@ fn bf16_mac_hw_lane(q: u32, a_elems: &[u16], b_elems: &[u16], subtract: bool) ->
     let man = total.unsigned_abs() as i64;
 
     if man == 0 {
+        // Zero sum.  bfnorm_lane: real_zero=true, exp_zeros=false.
+        // If NaN flagged: exp=0xFF, mantissa=1 (out_zeros=true for zero
+        // but mantissa is 0, then bit 0 |= nan → 1).
+        if nan_flag {
+            return fp32_make(false, 255, 1);
+        }
         return 0;
     }
 
@@ -1221,11 +1319,32 @@ fn bf16_mac_hw_lane(q: u32, a_elems: &[u16], b_elems: &[u16], subtract: bool) ->
 
     let exps = cexpmax + fl_adj - 23 - 128;
 
+    // bfnorm_lane NaN logic (me_inline_primitives.h:13557-13569):
+    //   overflow  = (exps >= 255) && !real_zero
+    //   underflow = (exps <= 0)   && !real_zero
+    //   out_zeros = !(pinf | minf | overflow | underflow)
+    //   exp_ones  = nan | pinf | minf | overflow
+    //   rr = out_zeros ? normalized_mantissa : 0
+    //   rr[0] |= nan
+    //
+    // When nan_flag is set: exp is always 0xFF (from exp_ones).
+    // Mantissa depends on whether overflow/underflow also applies.
+    if nan_flag {
+        let overflow = exps >= 255;
+        let underflow = exps <= 0;
+        if overflow || underflow {
+            // out_zeros = false → mantissa zeroed, bit 0 = nan
+            return fp32_make(sgn, 255, 1);
+        }
+        // out_zeros = true → mantissa preserved, bit 0 |= nan
+        return fp32_make(sgn, 255, (mans as u32 & 0x7F_FFFF) | 1);
+    }
+
     if exps <= 0 || fl == -1 {
         return 0; // Underflow (FTZ)
     }
     if exps >= 255 {
-        return fp32_make(sgn, 255, 0); // Overflow
+        return fp32_make(sgn, 255, 0); // Overflow → Inf
     }
 
     fp32_make(sgn, exps as u8, mans as u32 & 0x7F_FFFF)
@@ -1344,11 +1463,19 @@ fn read_acc_wide_f32(acc: &Acc1024, index: usize) -> f32 {
 /// - B[k][c] at byte offset `(k * cols + c) * (bits_y / 8)`
 ///
 /// Output goes to accumulator lane `r * cols + c`.
+/// Config-driven full-width matrix multiply.
+///
+/// `acc2_data` is an optional second accumulator for AddMac/SubMac bfloat
+/// operations. When present, each lane's acc2 value is merged into the
+/// 68-bit PSA adder BEFORE normalization (matching hardware pipeline).
+/// `sub_acc2` controls whether acc2 is subtracted (SubMac) or added (AddMac).
 pub fn matmul_config_driven(
     acc: &mut Acc1024,
     a: &Vec512,
     b: &Vec512,
     config: &MatMulConfig,
+    acc2_data: Option<&Acc1024>,
+    sub_acc2: bool,
 ) {
     let rows = config.rows as usize;
     let inner = config.inner as usize;
@@ -1406,11 +1533,16 @@ pub fn matmul_config_driven(
                 }
 
                 let prev_bits = read_acc_wide_f32(acc, out_idx).to_bits();
+                let lane_acc2 = acc2_data.map(|a2| {
+                    read_acc_wide_f32(a2, out_idx).to_bits()
+                });
                 let result = bf16_mac_hw_lane(
                     prev_bits,
                     &a_elems,
                     &b_elems,
                     config.subtract,
+                    lane_acc2,
+                    sub_acc2,
                 );
                 write_acc_wide_f32(acc, out_idx, f32::from_bits(result));
             }
@@ -2290,35 +2422,35 @@ mod tests {
         // Test 1: 8 * (1.0 * 1.0) + 0 = 8.0
         let a = [0x3F80u16; 8]; // bf16 1.0
         let b = [0x3F80u16; 8];
-        let r = bf16_mac_hw_lane(0, &a, &b, false);
+        let r = bf16_mac_hw_lane(0, &a, &b, false, None, false);
         assert_eq!(r, 0x41000000, "8*1*1+0: expected 0x41000000, got 0x{:08X}", r);
 
         // Test 2: 8 * (-2.0 * 3.0) + 0 = -48.0
         let a2 = [0xC000u16; 8]; // bf16 -2.0
         let b2 = [0x4040u16; 8]; // bf16 3.0
-        let r2 = bf16_mac_hw_lane(0, &a2, &b2, false);
+        let r2 = bf16_mac_hw_lane(0, &a2, &b2, false, None, false);
         assert_eq!(r2, 0xC2400000, "8*-2*3+0: expected 0xC2400000, got 0x{:08X}", r2);
 
         // Test 3: tiny * tiny = underflow to 0
         let a3 = [0x0080u16; 8]; // bf16 min normal
         let b3 = [0x0080u16; 8];
-        let r3 = bf16_mac_hw_lane(0, &a3, &b3, false);
+        let r3 = bf16_mac_hw_lane(0, &a3, &b3, false, None, false);
         assert_eq!(r3, 0x00000000, "tiny*tiny: expected 0, got 0x{:08X}", r3);
 
         // Test 4: zeros * ones = 0
         let a4 = [0x0000u16; 8];
         let b4 = [0x3F80u16; 8];
-        let r4 = bf16_mac_hw_lane(0, &a4, &b4, false);
+        let r4 = bf16_mac_hw_lane(0, &a4, &b4, false, None, false);
         assert_eq!(r4, 0x00000000, "zeros: expected 0, got 0x{:08X}", r4);
 
         // Test 5: subtract mode: 0 - 8*1*1 = -8.0
-        let r5 = bf16_mac_hw_lane(0, &a, &b, true);
+        let r5 = bf16_mac_hw_lane(0, &a, &b, true, None, false);
         assert_eq!(r5, 0xC1000000, "0-8*1*1: expected 0xC1000000, got 0x{:08X}", r5);
 
         // Test 6: random inputs (produces 0x7F mantissa pattern in Python model)
         let a6: [u16; 8] = [0xebd7, 0xb13b, 0x4f6c, 0x8d21, 0x6080, 0x39c6, 0x107e, 0xd6a6];
         let b6: [u16; 8] = [0x0802, 0x7b38, 0x6983, 0x2273, 0x33a8, 0x1130, 0xe493, 0x18ec];
-        let r6 = bf16_mac_hw_lane(0, &a6, &b6, false);
+        let r6 = bf16_mac_hw_lane(0, &a6, &b6, false, None, false);
         assert_eq!(r6, 0x797187FF, "random: expected 0x797187FF, got 0x{:08X}", r6);
     }
 
