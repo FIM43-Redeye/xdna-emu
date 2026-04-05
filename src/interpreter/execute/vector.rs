@@ -859,7 +859,7 @@ impl VectorAlu {
             let mut result = [0u64; 16];
 
             if is_float {
-                use super::vector_float::{fp32_flush_to_zero, aie2_fp32_add};
+                use super::vector_float::{fp32_flush_to_zero, aie2_acc_fp32_add};
                 for i in 0..16 {
                     let mut a1_lo = if zero_acc1 { 0u32 } else { fp32_flush_to_zero(a1[i] as u32) };
                     let mut a1_hi = if zero_acc1 { 0u32 } else { fp32_flush_to_zero((a1[i] >> 32) as u32) };
@@ -870,8 +870,10 @@ impl VectorAlu {
                     if negate_acc1 { a1_lo ^= 0x8000_0000; a1_hi ^= 0x8000_0000; }
                     if negate_acc2 { a2_lo ^= 0x8000_0000; a2_hi ^= 0x8000_0000; }
 
-                    let r_lo = aie2_fp32_add(a1_lo, a2_lo);
-                    let r_hi = aie2_fp32_add(a1_hi, a2_hi);
+                    // Use acc ALU add (no output FTZ): the accumulator
+                    // register file preserves denormalized fp32 values.
+                    let r_lo = aie2_acc_fp32_add(a1_lo, a2_lo);
+                    let r_hi = aie2_acc_fp32_add(a1_hi, a2_hi);
                     result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
                 }
             } else {
@@ -902,7 +904,7 @@ impl VectorAlu {
             let mut result = [0u64; 8];
 
             if is_float {
-                use super::vector_float::{fp32_flush_to_zero, aie2_fp32_add};
+                use super::vector_float::{fp32_flush_to_zero, aie2_acc_fp32_add};
                 for i in 0..8 {
                     let mut a1_lo = if zero_acc1 { 0u32 } else { fp32_flush_to_zero(a1[i] as u32) };
                     let mut a1_hi = if zero_acc1 { 0u32 } else { fp32_flush_to_zero((a1[i] >> 32) as u32) };
@@ -912,8 +914,8 @@ impl VectorAlu {
                     if negate_acc1 { a1_lo ^= 0x8000_0000; a1_hi ^= 0x8000_0000; }
                     if negate_acc2 { a2_lo ^= 0x8000_0000; a2_hi ^= 0x8000_0000; }
 
-                    let r_lo = aie2_fp32_add(a1_lo, a2_lo);
-                    let r_hi = aie2_fp32_add(a1_hi, a2_hi);
+                    let r_lo = aie2_acc_fp32_add(a1_lo, a2_lo);
+                    let r_hi = aie2_acc_fp32_add(a1_hi, a2_hi);
                     result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
                 }
             } else {

@@ -399,6 +399,30 @@ pub fn aie2_fp32_add(a_bits: u32, b_bits: u32) -> u32 {
     fp32_flush_to_zero(result.to_bits())
 }
 
+/// AIE2 fp32 accumulator ALU addition (no output FTZ).
+///
+/// Same as `aie2_fp32_add` but does NOT flush the result to zero.
+/// The accumulator preserves denormalized results; FTZ only applies
+/// at the SRS/bf16 conversion stage, not when writing back to the
+/// accumulator register file.
+///
+/// Used by VADD_F, VSUB_F, VNEGSUB_F, and VNEGADD_F (the accumulator
+/// add/subtract instructions).
+#[inline]
+pub fn aie2_acc_fp32_add(a_bits: u32, b_bits: u32) -> u32 {
+    let a_ftz = fp32_flush_to_zero(a_bits);
+    let b_ftz = fp32_flush_to_zero(b_bits);
+
+    if fp32_is_nan(a_ftz) || fp32_is_nan(b_ftz) {
+        return fp32_make_nan(false);
+    }
+
+    let a = f32::from_bits(a_ftz);
+    let b = f32::from_bits(b_ftz);
+    let result = a + b;
+    result.to_bits()
+}
+
 // ---------------------------------------------------------------------------
 // AIE2 rounding for bf16 conversion (SRS bf16 lane path)
 // ---------------------------------------------------------------------------

@@ -895,191 +895,247 @@ pub fn matmul_sub(
 }
 
 // ---------------------------------------------------------------------------
-// Hardware-accurate bf16 dot product
+// Hardware-accurate bf16 MAC (29-bit accumulator model)
 // ---------------------------------------------------------------------------
 //
-// AIE2 bf16 MAC uses a fixed-point accumulation pipeline:
-//   1. Each bf16*bf16 product is exact in fp32 (8-bit * 8-bit mantissa < 23 bits)
-//   2. All products for one output lane share a common exponent (max across them)
-//   3. Each product mantissa is right-shifted to align to the max exponent,
-//      then rounded to 23 bits using round-to-nearest-even (RNE)
-//   4. Aligned mantissas are summed in integer arithmetic (wide enough to not overflow)
-//   5. The sum is normalized back to fp32 with RNE rounding
+// Exact translation of `bf16_mac_hw` from the aietools python_model
+// (bfloat16.py lines 280-399).  This matches the AIE2 hardware MAC
+// pipeline's fixed-point accumulation with 29-bit internal precision.
 //
-// Derived from aietools python_model/model/bfloat16.py and mulmac.py.
+// Pipeline stages:
+//   1. Split bf16 inputs, detect NaN/Inf, compute product exponents
+//   2. Integer multiply (8-bit mantissa * 8-bit mantissa = 16-bit product)
+//   3. Align products to max exponent, round to iprec=23 bits (RNE)
+//   4. Sum aligned products in integer arithmetic
+//   5. Merge product sum with previous fp32 accumulator at aprec=29 bits
+//   6. Normalize back to fp32 with RNE rounding, FTZ on underflow
 
-/// Compute a bf16 dot product using hardware-accurate fixed-point accumulation.
+/// Shift-and-round with RNE (round-to-nearest-even).
 ///
-/// Takes a slice of exact fp32 products (each from bf16 * bf16) and an optional
-/// prior accumulator value. Returns the fp32 result matching AIE2 hardware.
-fn bf16_dot_product_hw(products: &[f32], prev_acc: f32, subtract: bool) -> f32 {
-    // Collect all non-zero fp32 values (products + prior accumulator).
-    // Each fp32 value has: sign(1) | exponent(8) | mantissa(23).
-
-    // Find the maximum biased exponent across all products AND the prior accumulator.
-    let mut max_exp: i32 = 0;
-    for &p in products {
-        if p != 0.0 && !p.is_nan() && !p.is_infinite() {
-            let exp = ((p.to_bits() >> 23) & 0xFF) as i32;
-            if exp > max_exp {
-                max_exp = exp;
-            }
-        }
-    }
-    if prev_acc != 0.0 && !prev_acc.is_nan() && !prev_acc.is_infinite() {
-        let exp = ((prev_acc.to_bits() >> 23) & 0xFF) as i32;
-        if exp > max_exp {
-            max_exp = exp;
-        }
-    }
-
-    if max_exp == 0 {
-        // All inputs are zero or denormal -- result is zero.
-        return 0.0;
-    }
-
-    // Align each value to max_exp and sum in fixed-point.
-    // After alignment, each value is a signed integer mantissa (with implicit bit)
-    // right-shifted by (max_exp - its_exp) bits and rounded to 23 bits (RNE).
-    let mut sum: i64 = 0;
-
-    for &p in products {
-        sum += align_round_rne(p, max_exp);
-    }
-
-    // Add prior accumulator value (also aligned and rounded).
-    let prev_aligned = align_round_rne(prev_acc, max_exp);
-    if subtract {
-        sum -= prev_aligned;
-    } else {
-        sum += prev_aligned;
-    }
-
-    // Normalize the integer sum back to fp32.
-    normalize_to_f32(sum, max_exp)
-}
-
-/// Align an fp32 value to a target exponent and round mantissa to 23 bits (RNE).
+/// Shifts `man` right so that the leading bit ends up at position `prec`.
+/// `lo_pos` is the current leading bit position.  Returns (rounded_value,
+/// exponent_increment_from_overflow).
 ///
-/// Returns a signed integer representing the aligned mantissa.
-fn align_round_rne(val: f32, target_exp: i32) -> i64 {
-    if val == 0.0 || val.is_nan() || val.is_infinite() {
-        return 0;
+/// Direct translation of `shift_round_rne` from bfloat16.py.
+fn shift_round_rne(man: i64, lo_pos: i32, prec: i32, norm_round_overflow: bool) -> (i64, bool) {
+    let sh_dn = lo_pos - prec - 1;
+
+    // Guard against shifts exceeding i64 width.
+    if sh_dn >= 63 {
+        // Shifted completely out -- rounds to zero.
+        return (0, false);
     }
 
-    let bits = val.to_bits();
-    let sgn = (bits >> 31) != 0;
-    let exp = ((bits >> 23) & 0xFF) as i32;
-    let man = (bits & 0x7F_FFFF) | 0x80_0000; // 24 bits with implicit bit
+    let rmask: i64 = if sh_dn > 0 && sh_dn < 63 { (1i64 << sh_dn) - 1 } else { 0 };
 
-    let shift = target_exp - exp;
-    if shift < 0 {
-        // This value has a LARGER exponent than target -- shouldn't happen
-        // if target_exp is the true max. Treat as overflow.
-        return 0;
-    }
-
-    let aligned = if shift == 0 {
-        man as i64
-    } else if shift >= 25 {
-        // Completely shifted out -- rounds to zero.
-        0i64
+    let r: i64 = if sh_dn < 0 {
+        let lsh = (-sh_dn) as u32;
+        if lsh >= 63 { return (0, false); } // Would overflow
+        man.wrapping_shl(lsh)
     } else {
-        // Right-shift with RNE rounding.
-        let shift = shift as u32;
-        let round_bit = 1u32 << (shift - 1);
-        let sticky_mask = round_bit - 1;
-        let truncated = man >> shift;
-        let remainder = man & ((1u32 << shift) - 1);
-
-        // RNE: round up if remainder > halfway, or if exactly halfway and LSB is odd
-        let rounded = if remainder > round_bit
-            || (remainder == round_bit && (truncated & 1) != 0)
-        {
-            truncated + 1
-        } else {
-            truncated
-        };
-        rounded as i64
+        man >> sh_dn
     };
+    let q = r.wrapping_add(2); // Pre-compute round-up value
 
-    if sgn { -aligned } else { aligned }
-}
+    let grd = (r & 1) != 0;
+    let lsb = (r & 2) != 0;
+    let stk = (man & rmask) != 0;
 
-/// Normalize a signed integer mantissa sum back to fp32 with RNE rounding.
-///
-/// `sum` is the fixed-point accumulator (signed), and `max_exp` is the
-/// shared biased exponent.
-fn normalize_to_f32(sum: i64, max_exp: i32) -> f32 {
-    if sum == 0 {
-        return 0.0;
+    // RNE: round up when guard=1 AND (sticky=1 OR lsb=1)
+    let rup = grd && (stk || lsb);
+
+    let mut expincr = false;
+
+    let overflow_threshold = if (prec + 2) < 63 { 1i64 << (prec + 2) } else { i64::MAX };
+    if norm_round_overflow && rup && (q >= overflow_threshold) {
+        let val = q >> 2;
+        expincr = true;
+        return (val, expincr);
     }
 
-    let sgn = sum < 0;
-    let mag = sum.unsigned_abs();
+    let val = if rup { q >> 1 } else { r >> 1 };
+    (val, expincr)
+}
 
-    // Find the leading one position (0-indexed from LSB).
-    let leading = 63 - mag.leading_zeros() as i32; // Position of highest set bit
+/// Find the position of the leading one bit (0-indexed from LSB).
+/// Returns -1 for input 0.
+fn flo(man: i64) -> i32 {
+    if man <= 0 { return -1; }
+    63 - man.leading_zeros() as i32
+}
 
-    // We need to fit into 23-bit mantissa (bits 22..0, implicit bit at 23).
-    // The value is: mag * 2^(max_exp - 23 - 127) (adjusting for fp32 bias).
+/// Find the leading bit position for a signed value.
+/// For non-negative: same as flo.  For negative: flo(bitwise complement).
+fn flb(man: i64) -> i32 {
+    if man >= 0 { flo(man) } else { flo(!man) }
+}
+
+/// Truncate to `bits` width with sign extension.
+fn trnc(a: i64, sgn: bool, bits: u32) -> i64 {
+    if bits == 0 { return 0; }
+    let mask = if bits >= 64 { !0i64 as u64 } else { (1u64 << bits) - 1 };
+    let v = (a as u64) & mask;
+    let s = (v >> (bits - 1)) & 1;
+    if s == 1 && sgn {
+        // Sign-extend: set all upper bits
+        (v | !mask) as i64
+    } else {
+        v as i64
+    }
+}
+
+/// Hardware-accurate bf16 MAC for one output lane.
+///
+/// Takes the previous accumulator value `q` (fp32 bits), paired bf16
+/// input elements `a_elems` and `b_elems`, and whether to subtract.
+/// Returns the new fp32 accumulator value (as bits).
+///
+/// Direct translation of `bf16_mac_hw` from bfloat16.py.
+fn bf16_mac_hw_lane(q: u32, a_elems: &[u16], b_elems: &[u16], subtract: bool) -> u32 {
+    use super::vector_float::{bf16_split, fp32_split, fp32_make};
+
+    let iprec: i32 = 23; // Internal precision for product alignment
+    let aprec: i32 = 29; // Accumulator precision for merge
+
+    let n = a_elems.len();
+    debug_assert_eq!(n, b_elems.len());
+
+    // Phase 1: Split inputs, detect NaN/Inf, compute product exponents.
+    let mut nan_flag = false;
+    let mut inf_flag = false;
+    let mut inf_sgn = false;
+    let mut csgnl = Vec::with_capacity(n);
+    let mut cexpl = Vec::with_capacity(n);
+    let mut amanl = Vec::with_capacity(n);
+    let mut bmanl = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let (asgn, aexp, aman) = bf16_split(a_elems[i]);
+        let (bsgn, bexp, bman) = bf16_split(b_elems[i]);
+
+        let csgn = asgn != bsgn; // Product sign = XOR
+        csgnl.push(csgn);
+        amanl.push(aman);
+        bmanl.push(bman);
+
+        let ainf = aexp == 255 && aman == 0;
+        let binf = bexp == 255 && bman == 0;
+        let anan = aexp == 255 && aman != 0;
+        let bnan = bexp == 255 && bman != 0;
+        let cinf = ainf || binf;
+        let cnan = anan || bnan;
+
+        nan_flag = nan_flag || cnan || (inf_flag && cinf && csgn != inf_sgn);
+        inf_flag = (inf_flag || cinf) && !nan_flag;
+        if cinf && !inf_flag { inf_sgn = csgn; }
+
+        let cexp: i32 = if aexp == 0 || bexp == 0 {
+            0 // FTZ: if either input has exp=0, product is zero
+        } else {
+            (aexp as i32) + (bexp as i32)
+        };
+        cexpl.push(cexp);
+    }
+
+    // Phase 2: Accumulate products in fixed-point.
+    let cexpmax = *cexpl.iter().max().unwrap_or(&0);
+
+    let mut cmansum: i64 = 0;
+    for i in 0..n {
+        let aman = if cexpl[i] > 0 { (1i64 << 7) | (amanl[i] as i64) } else { 0 };
+        let bman = if cexpl[i] > 0 { (1i64 << 7) | (bmanl[i] as i64) } else { 0 };
+        let cman_f = aman * bman; // Q.14 (up to 16 significant bits)
+
+        let expdiff = cexpmax - cexpl[i];
+
+        // Align to max exponent, keep iprec=23 bits.
+        let (cman, _) = shift_round_rne(cman_f, expdiff + 14, iprec, false);
+
+        if csgnl[i] {
+            cmansum -= cman;
+        } else {
+            cmansum += cman;
+        }
+    }
+
+    // Phase 3: Merge with previous fp32 accumulator.
     //
-    // The leading bit is at position `leading`. We want it at position 23
-    // (the implicit bit position in fp32). So:
-    //   result_exp = max_exp + (leading - 23)
-
-    let result_exp = max_exp + (leading - 23);
-
-    if result_exp <= 0 {
-        // Underflow to zero (or denormal, which we flush to zero).
-        return 0.0;
-    }
-    if result_exp >= 255 {
-        // Overflow to infinity.
-        return if sgn { f32::NEG_INFINITY } else { f32::INFINITY };
+    // For subtract mode (MSC/SubMac): result = acc - products.
+    // Negate the product sum so the merge computes acc + (-products).
+    if subtract {
+        cmansum = -cmansum;
     }
 
-    // Extract 23-bit mantissa with RNE rounding.
-    let man_bits = if leading <= 23 {
-        // Value fits in 23 bits without shifting -- no rounding needed.
-        (mag << (23 - leading as u32)) as u32
+    let lo_pos = flb(cmansum);
+
+    let (qsgn, qexp, qman_raw) = fp32_split(q);
+    let qinf = qexp == 255 && qman_raw == 0;
+    let qnan = qexp == 255 && qman_raw != 0;
+
+    nan_flag = nan_flag || qnan || (inf_flag && qinf && qsgn != inf_sgn);
+    inf_flag = (inf_flag || qinf) && !nan_flag;
+
+    // Reconstruct signed accumulator mantissa (FTZ: exp=0 → man=0).
+    let qman_full: i64 = if qexp > 0 {
+        (1i64 << 23) | (qman_raw as i64)
     } else {
-        // Need to right-shift and round.
-        let shift = (leading - 23) as u32;
-        let truncated = (mag >> shift) as u32;
-        let round_bit = 1u64 << (shift - 1);
-        let sticky_mask = round_bit - 1;
-        let remainder = mag & ((1u64 << shift) - 1);
+        0
+    };
+    let qman: i64 = if qsgn { -qman_full } else { qman_full };
 
-        let rounded = if remainder > round_bit
-            || (remainder == round_bit && (truncated & 1) != 0)
-        {
-            truncated + 1
-        } else {
-            truncated
-        };
+    // Compute effective exponents for alignment.
+    let cexp_eff = cexpmax as i64 + lo_pos as i64 - iprec as i64 - 127;
+    let rexp = std::cmp::max(cexp_eff, qexp as i64) as i32;
 
-        // Check for mantissa overflow (carry into exponent).
-        if rounded >= (1u32 << 24) {
-            // Re-normalize: the mantissa overflowed, bump exponent.
-            let new_exp = result_exp + 1;
-            if new_exp >= 255 {
-                return if sgn { f32::NEG_INFINITY } else { f32::INFINITY };
-            }
-            let man = (rounded >> 1) & 0x7F_FFFF;
-            let bits = ((sgn as u32) << 31)
-                | ((new_exp as u32 & 0xFF) << 23)
-                | man;
-            return f32::from_bits(bits);
-        }
+    let qlo_pos = rexp as i64 - qexp as i64 + 23;
+    let clo_pos = rexp as i64 - cexpmax as i64 + iprec as i64 + 127;
 
-        rounded
+    let qsh_dn = qlo_pos - aprec as i64;
+    let csh_dn = clo_pos - aprec as i64;
+
+    // Swap: the value with the smaller shift keeps full precision (left-shifted),
+    // the value with the larger shift gets rounded to aprec bits.
+    let (qm3, cm3, _qlo_pos2, clo_pos2, qsh_dn2) = if qsh_dn > csh_dn {
+        (cmansum, qman, clo_pos, qlo_pos, csh_dn)
+    } else {
+        (qman, cmansum, qlo_pos, clo_pos, qsh_dn)
     };
 
-    let man = man_bits & 0x7F_FFFF; // Strip implicit bit
-    let bits =
-        ((sgn as u32) << 31) | ((result_exp as u32 & 0xFF) << 23) | man;
-    f32::from_bits(bits)
+    let lsh = (-qsh_dn2) as u32;
+    let qman2 = if lsh >= 63 { 0i64 } else { qm3.wrapping_shl(lsh) };
+    let (cmansum2, _) = shift_round_rne(cm3, clo_pos2 as i32, aprec, true);
+
+    let rsum2 = qman2 + cmansum2;
+    let rsum = trnc(rsum2, true, 32);
+
+    // Phase 4: Handle NaN/Inf.
+    if nan_flag {
+        return fp32_make(false, 255, 0x7F); // Canonical NaN
+    }
+    if inf_flag {
+        return fp32_make(inf_sgn, 255, 0); // Infinity
+    }
+
+    // Phase 5: Normalize back to fp32.
+    let sgn = rsum < 0;
+    let sum_abs = rsum.unsigned_abs() as i64;
+
+    if sum_abs == 0 {
+        return 0;
+    }
+
+    let nlo_pos = flo(sum_abs);
+    let (man, expincr) = shift_round_rne(sum_abs, nlo_pos, 23, true);
+    let exp = rexp + nlo_pos - aprec + if expincr { 1 } else { 0 };
+
+    if exp >= 255 {
+        return fp32_make(sgn, 255, 0); // Overflow
+    }
+    if exp <= 0 {
+        return fp32_make(sgn, 0, 0); // Underflow (FTZ)
+    }
+
+    fp32_make(sgn, exp as u8, man as u32 & 0x7F_FFFF)
 }
 
 // ---------------------------------------------------------------------------
@@ -1215,75 +1271,55 @@ pub fn matmul_config_driven(
     }
 
     if config.bfloat {
-        use super::vector_float::{bf16_flush_to_zero, fp32_flush_to_zero};
-
-        // BFloat16 element-wise mode (variant=1, 16x2x1 geometry):
-        // Each lane L computes A[L]*B[L] + A[L+16]*B[L+16].
-        // Both A and B use the same symmetric stride-16 mapping.
-        // Verified by hardware characterization (bf16_elemwise_characterizer.s).
+        // BFloat16 MAC using exact 29-bit accumulator model.
+        //
+        // Uses bf16_mac_hw_lane which faithfully implements the aietools
+        // hardware model (bfloat16.py bf16_mac_hw): 23-bit product
+        // alignment, 29-bit accumulator merge, RNE rounding throughout,
+        // and proper FTZ on inputs/outputs.
+        //
+        // Element-wise mode (variant=1, 16x2x1 geometry): each lane L
+        // computes A[L]*B[L] + A[L+16]*B[L+16].  Verified by hardware
+        // characterization (bf16_elemwise_characterizer.s).
         let is_elemwise = rows == 16 && inner == 2 && cols == 1;
 
         for r in 0..rows {
             for c in 0..cols {
                 let out_idx = r * cols + c;
 
-                // Accumulate products in f64 to match hardware's 29-bit
-                // internal precision.  The aietools reference model
-                // (bf16_mac_reference_double) uses float64 and agrees with
-                // the hardware model within 1 ULP.
-                let mut sum: f64 = 0.0;
+                // Collect the bf16 element pairs for this output lane.
+                let mut a_elems = Vec::with_capacity(inner);
+                let mut b_elems = Vec::with_capacity(inner);
 
                 for k in 0..inner {
                     let elem_idx = if is_elemwise {
-                        // Element-wise: lane L reads element L (k=0) and L+16 (k=1)
                         r + k * 16
                     } else {
-                        // Dense (4x8x4): standard row-major indexing
                         r * inner + k
                     };
                     let a_word = elem_idx / 2;
                     let a_half = elem_idx % 2;
 
                     let b_elem_idx = if is_elemwise {
-                        // Element-wise: B uses same mapping as A
                         r + k * 16
                     } else {
-                        // Dense: column-major B indexing
                         k * cols + c
                     };
                     let b_word = b_elem_idx / 2;
                     let b_half = b_elem_idx % 2;
 
-                    // FTZ bf16 inputs: denormalized bf16 values (exp=0,
-                    // mantissa!=0) are flushed to signed zero before
-                    // multiplication.  Matches bf16_denorm_to_0 in the
-                    // aietools hardware model.
-                    let a_bits = bf16_flush_to_zero(
-                        ((a[a_word] >> (a_half * 16)) & 0xFFFF) as u16,
-                    );
-                    let b_bits = bf16_flush_to_zero(
-                        ((b[b_word] >> (b_half * 16)) & 0xFFFF) as u16,
-                    );
-                    let a_val = f32::from_bits((a_bits as u32) << 16) as f64;
-                    let b_val = f32::from_bits((b_bits as u32) << 16) as f64;
-
-                    sum += a_val * b_val;
+                    a_elems.push(((a[a_word] >> (a_half * 16)) & 0xFFFF) as u16);
+                    b_elems.push(((b[b_word] >> (b_half * 16)) & 0xFFFF) as u16);
                 }
 
-                // FTZ the previous accumulator value before adding, then
-                // combine in f64 and convert back to fp32.  Apply output FTZ
-                // to match aietools reference model (bf16_mac_reference_double
-                // line 173: fp32_denorm_to_0 on result).
                 let prev_bits = read_acc_wide_f32(acc, out_idx).to_bits();
-                let prev = f32::from_bits(fp32_flush_to_zero(prev_bits)) as f64;
-                let result = if config.subtract {
-                    prev - sum
-                } else {
-                    prev + sum
-                };
-                let result_f32 = result as f32;
-                let result_ftz = fp32_flush_to_zero(result_f32.to_bits());
-                write_acc_wide_f32(acc, out_idx, f32::from_bits(result_ftz));
+                let result = bf16_mac_hw_lane(
+                    prev_bits,
+                    &a_elems,
+                    &b_elems,
+                    config.subtract,
+                );
+                write_acc_wide_f32(acc, out_idx, f32::from_bits(result));
             }
         }
         return;
@@ -2154,6 +2190,37 @@ mod tests {
                 idx, actual
             );
         }
+    }
+
+    #[test]
+    fn test_bf16_mac_hw_lane_basic() {
+        // Test 1: 8 * (1.0 * 1.0) + 0 = 8.0
+        let a = [0x3F80u16; 8]; // bf16 1.0
+        let b = [0x3F80u16; 8];
+        let r = bf16_mac_hw_lane(0, &a, &b, false);
+        assert_eq!(r, 0x41000000, "8*1*1+0: expected 0x41000000, got 0x{:08X}", r);
+
+        // Test 2: 8 * (-2.0 * 3.0) + 0 = -48.0
+        let a2 = [0xC000u16; 8]; // bf16 -2.0
+        let b2 = [0x4040u16; 8]; // bf16 3.0
+        let r2 = bf16_mac_hw_lane(0, &a2, &b2, false);
+        assert_eq!(r2, 0xC2400000, "8*-2*3+0: expected 0xC2400000, got 0x{:08X}", r2);
+
+        // Test 3: tiny * tiny = underflow to 0
+        let a3 = [0x0080u16; 8]; // bf16 min normal
+        let b3 = [0x0080u16; 8];
+        let r3 = bf16_mac_hw_lane(0, &a3, &b3, false);
+        assert_eq!(r3, 0x00000000, "tiny*tiny: expected 0, got 0x{:08X}", r3);
+
+        // Test 4: zeros * ones = 0
+        let a4 = [0x0000u16; 8];
+        let b4 = [0x3F80u16; 8];
+        let r4 = bf16_mac_hw_lane(0, &a4, &b4, false);
+        assert_eq!(r4, 0x00000000, "zeros: expected 0, got 0x{:08X}", r4);
+
+        // Test 5: subtract mode: 0 - 8*1*1 = -8.0
+        let r5 = bf16_mac_hw_lane(0, &a, &b, true);
+        assert_eq!(r5, 0xC1000000, "0-8*1*1: expected 0xC1000000, got 0x{:08X}", r5);
     }
 
     // -----------------------------------------------------------------------
