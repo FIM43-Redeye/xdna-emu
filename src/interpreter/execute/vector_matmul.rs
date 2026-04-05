@@ -2221,6 +2221,12 @@ mod tests {
         // Test 5: subtract mode: 0 - 8*1*1 = -8.0
         let r5 = bf16_mac_hw_lane(0, &a, &b, true);
         assert_eq!(r5, 0xC1000000, "0-8*1*1: expected 0xC1000000, got 0x{:08X}", r5);
+
+        // Test 6: random inputs (produces 0x7F mantissa pattern in Python model)
+        let a6: [u16; 8] = [0xebd7, 0xb13b, 0x4f6c, 0x8d21, 0x6080, 0x39c6, 0x107e, 0xd6a6];
+        let b6: [u16; 8] = [0x0802, 0x7b38, 0x6983, 0x2273, 0x33a8, 0x1130, 0xe493, 0x18ec];
+        let r6 = bf16_mac_hw_lane(0, &a6, &b6, false);
+        assert_eq!(r6, 0x797187FF, "random: expected 0x797187FF, got 0x{:08X}", r6);
     }
 
     // -----------------------------------------------------------------------
