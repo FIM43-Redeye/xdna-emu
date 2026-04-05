@@ -370,23 +370,135 @@ pub fn aie2_canonicalize_nan(value: f32) -> f32 {
 // AIE2 fp32 arithmetic (FTZ + NaN propagation)
 // ---------------------------------------------------------------------------
 
+/// Perform fp32 addition treating NaN bit patterns (exp=0xFF, man!=0) as valid
+/// floats with exponent 255. Uses f64 intermediate precision to avoid IEEE NaN
+/// semantics in the host's f32 arithmetic.
+///
+/// The AIE2 accumulator ALU does not short-circuit on NaN when both operands
+/// are NaN. Instead, both values have the same exponent (255), so the hardware
+/// subtracts/adds their mantissas normally, producing a result with a lower
+/// exponent. If the result overflows back to exponent 255 (e.g., NaN + NaN
+/// where both have the same sign), the hardware produces canonical NaN instead.
+/// Verified against real NPU1 hardware.
+///
+/// Returns the raw fp32 result (caller should OR bit 0 if result exp < 255).
+/// Returns canonical NaN if the result overflows to exp >= 255.
+#[inline]
+pub fn fp32_add_treat_nan_as_normal(a_bits: u32, b_bits: u32) -> u32 {
+    // Decode both fp32 bit patterns into f64, treating exp=255 as valid.
+    let a_f64 = fp32_bits_to_f64_raw(a_bits);
+    let b_f64 = fp32_bits_to_f64_raw(b_bits);
+    let result = a_f64 + b_f64;
+    let result_bits = f64_to_fp32_bits_raw(result);
+
+    // If the result overflows to exp >= 255 (inf/NaN range), the hardware
+    // falls back to canonical NaN. This happens when both NaN have the same
+    // sign (addition doubles the magnitude, overflowing the exponent).
+    let result_exp = (result_bits >> 23) & 0xFF;
+    if result_exp >= 255 {
+        return fp32_make_nan(false);
+    }
+
+    result_bits
+}
+
+/// Decode an fp32 bit pattern to f64, treating ALL exponent values (including
+/// 255) as valid biased exponents. This bypasses IEEE NaN/infinity semantics.
+#[inline]
+fn fp32_bits_to_f64_raw(bits: u32) -> f64 {
+    let sign = (bits >> 31) & 1;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let man = bits & 0x7FFFFF;
+
+    if exp == 0 && man == 0 {
+        return if sign != 0 { -0.0 } else { 0.0 };
+    }
+
+    // Treat exp=0 as denorm, all others (including 255) as normal.
+    let (frac, e) = if exp == 0 {
+        // Denormalized: no implicit leading 1, exponent = 1 - bias.
+        ((man as f64) / ((1u64 << 23) as f64), -126i32)
+    } else {
+        (1.0 + (man as f64) / ((1u64 << 23) as f64), exp - 127)
+    };
+
+    let value = frac * (2.0f64).powi(e);
+    if sign != 0 { -value } else { value }
+}
+
+/// Convert an f64 value back to fp32 bit pattern, allowing the full exponent
+/// range. Values that overflow (biased exp >= 255) produce infinity (exp=255,
+/// man=0) so the caller can detect and handle overflow.
+#[inline]
+fn f64_to_fp32_bits_raw(value: f64) -> u32 {
+    if value == 0.0 {
+        return if value.is_sign_negative() { 0x80000000 } else { 0x00000000 };
+    }
+
+    let sign = value < 0.0;
+    let abs_val = value.abs();
+
+    // Compute exponent: floor(log2(abs_val)).
+    let exp_unbiased = abs_val.log2().floor() as i32;
+    let biased_exp = exp_unbiased + 127;
+
+    if biased_exp >= 255 {
+        // Overflow: return infinity so caller can detect.
+        return fp32_make_inf(sign);
+    }
+    if biased_exp <= 0 {
+        // Underflow to signed zero.
+        return if sign { 0x80000000 } else { 0x00000000 };
+    }
+
+    // Extract mantissa: abs_val / 2^exp_unbiased gives 1.fraction.
+    let significand = abs_val / (2.0f64).powi(exp_unbiased);
+    let man_f = (significand - 1.0) * ((1u64 << 23) as f64);
+    let mut man = (man_f + 0.5) as u32; // Round to nearest.
+
+    // Handle rounding overflow (man rounds up to 2^23).
+    if man >= (1u32 << 23) {
+        man = 0;
+        let biased_exp = biased_exp + 1;
+        if biased_exp >= 255 {
+            return fp32_make_inf(sign);
+        }
+        return fp32_make(sign, biased_exp as u8, man);
+    }
+
+    fp32_make(sign, biased_exp as u8, man)
+}
+
 /// AIE2 fp32 addition with hardware-accurate FTZ and NaN handling.
 ///
 /// AIE2 float operations differ from IEEE 754:
 /// 1. Inputs are flushed to signed zero if denormalized (exp=0, man!=0)
-/// 2. If either input is NaN after FTZ, result is positive canonical NaN
-/// 3. Normal IEEE 754 addition otherwise
-/// 4. Result is FTZ'd again (denormalized results flushed to signed zero)
+/// 2. If exactly one input is NaN, result is positive canonical NaN
+/// 3. If both inputs are NaN, the hardware treats exponent 0xFF as a valid
+///    exponent and computes the addition normally (no NaN short-circuit).
+///    The result's mantissa bit 0 is set as a NaN-origin sticky flag.
+///    Verified against real NPU1 hardware via ISA test harness.
+/// 4. Normal IEEE 754 addition otherwise
+/// 5. Result is FTZ'd again (denormalized results flushed to signed zero)
 ///
-/// Derived from aietools python_model/model/mulmac.py and constants.py.
+/// Derived from aietools python_model/model/mulmac.py and constants.py,
+/// with both-NaN behavior from NPU hardware observation.
 #[inline]
 pub fn aie2_fp32_add(a_bits: u32, b_bits: u32) -> u32 {
     // Step 1: Flush denormalized inputs to signed zero.
     let a_ftz = fp32_flush_to_zero(a_bits);
     let b_ftz = fp32_flush_to_zero(b_bits);
 
-    // Step 2: Check for NaN (after FTZ, denorms become zero so won't be NaN).
-    if fp32_is_nan(a_ftz) || fp32_is_nan(b_ftz) {
+    let a_nan = fp32_is_nan(a_ftz);
+    let b_nan = fp32_is_nan(b_ftz);
+
+    // Step 2: NaN handling.
+    if a_nan && b_nan {
+        // Both NaN: hardware computes as if exp=255 is valid, then sets bit 0.
+        let result = fp32_add_treat_nan_as_normal(a_ftz, b_ftz);
+        return fp32_flush_to_zero(result | 0x01);
+    }
+    if a_nan || b_nan {
         return fp32_make_nan(false); // Positive canonical NaN
     }
 
@@ -413,7 +525,15 @@ pub fn aie2_acc_fp32_add(a_bits: u32, b_bits: u32) -> u32 {
     let a_ftz = fp32_flush_to_zero(a_bits);
     let b_ftz = fp32_flush_to_zero(b_bits);
 
-    if fp32_is_nan(a_ftz) || fp32_is_nan(b_ftz) {
+    let a_nan = fp32_is_nan(a_ftz);
+    let b_nan = fp32_is_nan(b_ftz);
+
+    if a_nan && b_nan {
+        // Both NaN: hardware treats exp=255 as valid, computes normally,
+        // then sets mantissa bit 0 as NaN-origin sticky flag.
+        return fp32_add_treat_nan_as_normal(a_ftz, b_ftz) | 0x01;
+    }
+    if a_nan || b_nan {
         return fp32_make_nan(false);
     }
 

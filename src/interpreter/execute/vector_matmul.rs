@@ -197,8 +197,9 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
 
             if config.bfloat {
                 // BFloat16 mode: accumulator holds fp32 values, two per u64.
-                // Use AIE2 fp32 add (FTZ + NaN canonicalization) for the acc2
-                // merge, matching the hardware's accumulator ALU behavior.
+                // Use AIE2 fp32 add (FTZ + NaN handling) for the acc2 merge.
+                // The both-NaN compute-through behavior in aie2_fp32_add
+                // matches the hardware's accumulator ALU.
                 use super::vector_float::aie2_fp32_add;
                 for i in 0..n {
                     let a_lo = (acc[i] & 0xFFFF_FFFF) as u32;
@@ -1112,7 +1113,19 @@ fn bf16_mac_hw_lane(q: u32, a_elems: &[u16], b_elems: &[u16], subtract: bool) ->
     if qinf && !nan_flag { inf_sgn = inf_sgn || qsgn; }
 
     // Early exit for NaN/Inf (before alignment).
+    //
+    // When NaN comes ONLY from the accumulator and all products are zero
+    // (all bf16 inputs are zero), the hardware passes the accumulator through
+    // unchanged -- the MAC is effectively a no-op. This preserves the
+    // accumulator's NaN bit pattern for downstream operations (e.g., the
+    // AddMac/SubMac merge step) that can compute meaningful results from
+    // two NaN operands. Verified against real NPU1 hardware.
     if nan_flag {
+        let all_products_zero = products.iter().all(|p| p.biased_exp == 0);
+        if qnan && !qinf && all_products_zero {
+            // NaN only from accumulator, zero products: pass through.
+            return q;
+        }
         // Hardware bfnorm_lane produces NaN with only bit 0 of the mantissa
         // set (see me_inline_primitives.h:13569).  The fpcorr normalization
         // zeroes the mantissa via out_zeros masking, then deposits the nan
