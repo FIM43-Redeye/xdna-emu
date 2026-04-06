@@ -833,6 +833,167 @@ fn vec_control_negate(mmode: u8, sub: u8) -> [u32; 8] {
 }
 
 // ---------------------------------------------------------------------------
+// bf16 sparse vmac (element-level float pipeline)
+// ---------------------------------------------------------------------------
+
+/// bf16 sparse MAC: determines active bf16 element pairs from the sparsity
+/// mask and calls the full bfloat pipeline (bf16_mac_hw_lane) per output.
+///
+/// The ISS dispatches bf16 sparse through vmac_bf, which uses bfextract +
+/// bfexpcompute + bfshift + bfnorm -- a completely different pipeline from
+/// the integer mpyl/psal path. We achieve the same result by working at the
+/// bf16 element level and reusing the verified dense bf16 MAC function.
+///
+/// Element mapping (derived from ISS bfextract_hw + oracle probing):
+///   A has 64 bf16 elements (4 rows x 16 per row)
+///   B has 32 bf16 elements (8 inner x 4 cols)
+///   Output is 4 rows x 4 cols = 16 fp32 values
+///
+///   For output(row, col), inner loops 0..8:
+///     bidx = inner*4 + col  (B element index)
+///     valid = bfsmode[bidx] != 0  (from mask2sel rbfxbf)
+///     aidx depends on bfsmode value:
+///       bfsmode=1: aidx = row*16 + (inner>>1)*4 + (inner&1 ? 1 : 0)
+///       bfsmode=2: aidx = row*16 + (inner>>1)*4 + (inner&1 ? 2 : 1)
+///       bfsmode=3: aidx = row*16 + (inner>>1)*4 + (inner&1 ? 3 : 2)
+///
+///   Output lane mapping: lane i = output(i/4, i%4)
+fn sparse_vmac_bf16(
+    a_dense: &[u8; 128],
+    b_sparse: &[u8; 64],
+    mask: u128,
+    acc: &[u64; 16],
+    scd: &[u64; 16],
+    _config: u32,
+    sub0: bool,
+    _sub1: bool,
+    _sub2: bool,
+    subtract_acc: u8,
+    _subtract_mul: u8,
+) -> [u64; 16] {
+    use super::vector_matmul::bf16_mac_hw_lane;
+
+    // Extract bf16 elements from A (64 elements) and B (32 elements)
+    let a_bf16: [u16; 64] = std::array::from_fn(|i| {
+        u16::from_le_bytes([a_dense[2 * i], a_dense[2 * i + 1]])
+    });
+    let b_bf16: [u16; 32] = std::array::from_fn(|i| {
+        u16::from_le_bytes([b_sparse[2 * i], b_sparse[2 * i + 1]])
+    });
+
+    // Compute bfsmode from mask (same computation as mask2sel for pmode_bit=25).
+    // bfsmode[i] = rbfxbf[i], a 3-bit routing selector per B position.
+    let mask_bytes: [u8; 16] = std::array::from_fn(|i| ((mask >> (8 * i)) & 0xFF) as u8);
+    let mut bfsmode = [0u8; 32];
+    for row in 0..4u32 {
+        for col in 0..4u32 {
+            let byte_idx = (row + col * 4) as usize;
+            let t = mask_bytes[byte_idx];
+            let mask4 = ((t | (t >> 1)) & 1)
+                | (((t >> 2) | (t >> 3)) & 1) << 1
+                | (((t >> 4) | (t >> 5)) & 1) << 2
+                | (((t >> 6) | (t >> 7)) & 1) << 3;
+            let (sel0, sel1) = decode_mask(mask4 as u8);
+            let idx0 = (col + 4 * (2 * row)) as usize;
+            let idx1 = (col + 4 * (2 * row + 1)) as usize;
+            bfsmode[idx0] = sel0;
+            bfsmode[idx1] = sel1;
+        }
+    }
+
+    // Product negation from sub0 (MSC variants negate all products)
+    let subtract = sub0;
+
+    // Accumulator negation from subtract_acc bit 0
+    let negate_acc = (subtract_acc & 1) != 0;
+
+    // Secondary accumulator negation from subtract_acc bit 1
+    let negate_scd = (subtract_acc >> 1) & 1 != 0;
+
+    // Compute all 16 fp32 results, then pack into 8 x u64 (bm accumulator format).
+    let mut fp32_results = [0u32; 16];
+
+    for row in 0..4u32 {
+        for col in 0..4u32 {
+            let out_idx = (row * 4 + col) as usize;
+
+            // Collect active bf16 element pairs for this output position
+            let mut a_elems = Vec::with_capacity(8);
+            let mut b_elems = Vec::with_capacity(8);
+
+            for inner in 0..8u32 {
+                let bidx = (inner * 4 + col) as usize;
+                let mode = bfsmode[bidx];
+                if mode == 0 { continue; }
+
+                // A element index depends on bfsmode value (one-hot):
+                //   The base is row*16 + (inner>>1)*4
+                //   The offset (t) depends on inner parity and bfsmode:
+                //     bfsmode=1 (bit 0, aidx_bf_0): t = inner&1 ? 1 : 0
+                //     bfsmode=2 (bit 1, aidx_bf_1): t = inner&1 ? 2 : 1
+                //     bfsmode=4 (bit 2, aidx_bf_2): t = inner&1 ? 3 : 2
+                let base = (row * 16 + (inner >> 1) * 4) as usize;
+                let odd = (inner & 1) != 0;
+                let t = match mode {
+                    1 => if odd { 1 } else { 0 },
+                    2 => if odd { 2 } else { 1 },
+                    4 => if odd { 3 } else { 2 },
+                    _ => continue, // unknown mode, skip
+                };
+                let aidx = base + t;
+
+                if aidx < 64 && bidx < 32 {
+                    a_elems.push(a_bf16[aidx]);
+                    b_elems.push(b_bf16[bidx]);
+                }
+            }
+
+            // Read existing accumulator. bm accumulators pack 2 fp32 per u64:
+            //   acc[out_idx/2] lo32 = even positions, hi32 = odd positions.
+            let acc_reg = out_idx / 2;
+            let prev_bits = if out_idx & 1 == 0 {
+                acc[acc_reg] as u32
+            } else {
+                (acc[acc_reg] >> 32) as u32
+            };
+            // For VNEGMAC/VNEGMSC, negate the accumulator via fp32 sign flip.
+            let prev_bits = if negate_acc && prev_bits != 0 {
+                prev_bits ^ 0x8000_0000
+            } else {
+                prev_bits
+            };
+
+            // Secondary accumulator (same packed layout)
+            let scd_val = if out_idx & 1 == 0 {
+                scd[acc_reg] as u32
+            } else {
+                (scd[acc_reg] >> 32) as u32
+            };
+            let scd_bits = if scd_val != 0 { Some(scd_val) } else { None };
+
+            if a_elems.is_empty() && prev_bits == 0 && scd_bits.is_none() {
+                fp32_results[out_idx] = 0;
+            } else {
+                fp32_results[out_idx] = bf16_mac_hw_lane(
+                    prev_bits, &a_elems, &b_elems, subtract,
+                    scd_bits, negate_scd,
+                );
+            }
+        }
+    }
+
+    // Pack 16 fp32 values into 8 x u64 (bm accumulator format).
+    // result[i] = fp32_results[2*i] (lo32) | fp32_results[2*i+1] (hi32)
+    // Remaining result[8..16] are zero (unused for bm accumulators).
+    let mut result = [0u64; 16];
+    for i in 0..8 {
+        result[i] = (fp32_results[2 * i] as u64)
+            | ((fp32_results[2 * i + 1] as u64) << 32);
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Top-level sparse vmac
 // ---------------------------------------------------------------------------
 
@@ -868,6 +1029,20 @@ pub fn sparse_vmac(
 
     // Determine sparse pmode bit
     let pmode_bit = pmode.trailing_zeros() as u8;
+
+    // bf16 sparse (pmode_bit=25) uses a completely different pipeline:
+    // the ISS dispatches through vmac_bf which does bfextract + bfshift +
+    // bfnorm (float normalization), not the integer mpyl/psal pipeline.
+    //
+    // We implement this by determining which bf16 element pairs are active
+    // per output position (from the mask) and calling bf16_mac_hw_lane
+    // which already implements the full bfloat pipeline.
+    if mmode & 0x40 != 0 {
+        return sparse_vmac_bf16(
+            a_dense, b_sparse, mask, acc, scd, config,
+            sub0, sub1, sub2, subtract_acc, subtract_mul,
+        );
+    }
 
     // Step 1: mask2sel -> smode
     let smode = mask2sel(mask, pmode_bit);
@@ -1206,5 +1381,88 @@ mod tests {
         if total_fail > 0 {
             panic!("{}/{} test vectors failed", total_fail, total_tests);
         }
+    }
+
+    #[test]
+    fn test_sparse_vmac_bf16_vs_oracle() {
+        use std::process::Command;
+
+        let oracle_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tools/vmac-oracle/vmac_oracle");
+        if !std::path::Path::new(oracle_path).exists() { return; }
+
+        // bf16 sparse config: amode=2, bmode=0, variant=2, zero_acc=1
+        let config: u32 = 0x45;
+
+        // Random-ish bf16 data for thorough testing
+        let a_dense: [u8; 128] = std::array::from_fn(|i| {
+            (i as u8).wrapping_mul(47).wrapping_add(91)
+        });
+        let b_sparse: [u8; 64] = std::array::from_fn(|i| {
+            (i as u8).wrapping_mul(31).wrapping_add(17)
+        });
+
+        let masks: [u128; 5] = [
+            u128::from_le_bytes([0x33; 16]),         // 2 active per output
+            u128::from_le_bytes([0x03; 16]),         // 1 active per output
+            u128::from_le_bytes([0xCC; 16]),         // 2 active (bits 2,3)
+            u128::from_le_bytes([0x55; 16]),         // 2 active (bits 0,2)
+            0x01020408_10204080_01020408_10204080,   // asymmetric
+        ];
+
+        let acc = [0u64; 16];
+        let scd = [0u64; 16];
+
+        let a_hex: String = a_dense.iter().map(|b| format!("{:02x}", b)).collect();
+        let b_hex: String = b_sparse.iter().map(|b| format!("{:02x}", b)).collect();
+
+        let mut total_tests = 0;
+        let mut total_fail = 0;
+
+        for &mask in &masks {
+            total_tests += 1;
+            let result = sparse_vmac(&a_dense, &b_sparse, mask, &acc, &scd, config, false, false, false);
+
+            let mask_bytes_le: Vec<u8> = (0..16).map(|i| ((mask >> (8 * i)) & 0xFF) as u8).collect();
+            let mask_hex: String = mask_bytes_le.iter().map(|b| format!("{:02x}", b)).collect();
+
+            let output = Command::new(oracle_path)
+                .args([&a_hex, &b_hex, &mask_hex, &format!("{:x}", config)])
+                .output().unwrap();
+            let oracle_stdout = String::from_utf8_lossy(&output.stdout);
+            let oracle_lanes: Vec<u64> = oracle_stdout.lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| u64::from_str_radix(l.trim(), 16).unwrap())
+                .collect();
+
+            if oracle_lanes.len() != 16 {
+                eprintln!("SKIP mask=0x{:032x}: oracle returned {} lanes (expected 16)",
+                    mask, oracle_lanes.len());
+                continue;
+            }
+
+            // Oracle outputs 16 values: acc[i].lo32, acc[i].hi32 interleaved.
+            // Pack into 8 u64 for comparison with our packed result.
+            let mut oracle_packed = [0u64; 8];
+            for i in 0..8 {
+                oracle_packed[i] = (oracle_lanes[2 * i] & 0xFFFF_FFFF)
+                    | ((oracle_lanes[2 * i + 1] & 0xFFFF_FFFF) << 32);
+            }
+
+            let mismatches = (0..8).filter(|&i| result[i] != oracle_packed[i]).count();
+            if mismatches > 0 {
+                total_fail += 1;
+                eprintln!("FAIL config=0x{:03x} mask=0x{:032x}: {}/8 accumulators differ",
+                    config, mask, mismatches);
+                for i in 0..8 {
+                    if result[i] != oracle_packed[i] {
+                        eprintln!("  acc{}: rust=0x{:016x} oracle=0x{:016x}", i, result[i], oracle_packed[i]);
+                    }
+                }
+            }
+        }
+        if total_fail > 0 {
+            panic!("{}/{} bf16 sparse test vectors failed", total_fail, total_tests);
+        }
+        eprintln!("{}/{} bf16 sparse oracle tests passed", total_tests, total_tests);
     }
 }

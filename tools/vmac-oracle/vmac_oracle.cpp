@@ -48,12 +48,20 @@ int main(int argc, char *argv[]) {
     //   w640 mask_b = SPARSE compressed data (upper 512) + mask (lower 128) -> Y-PERM
     //   The DENSE data goes to the CROSSBAR, SPARSE goes to Y-PERM.
 
-    // Build v16w32 for DENSE data (xs1 = A_bytes, 64 bytes = 512 bits)
+    // Build v16w32 for low 64 bytes of DENSE data (integer path uses this)
     me_primitive::v16w32 al_dense;
     for (int i = 0; i < 16; i++) {
         uint32_t word = 0;
         memcpy(&word, A_bytes + i*4, 4);
         al_dense.val.elem(i) = VBit<32, true>((int64_t)(int32_t)word);
+    }
+
+    // Build v32w32 for full 128 bytes (bf16 path needs all 64 elements)
+    me_primitive::v32w32 a_full;
+    for (int i = 0; i < 32; i++) {
+        uint32_t word = 0;
+        memcpy(&word, A_bytes + i*4, 4);
+        a_full.val.elem(i) = VBit<32, true>((int64_t)(int32_t)word);
     }
 
     // Build w640 = {sparse_data[512], mask[128]} with mask in LOWER 128 bits
@@ -89,18 +97,10 @@ int main(int argc, char *argv[]) {
         mask_b.val = concat(data_part, mask_part);
     }
 
-    // Build zero accumulator
-    me_primitive::v16w64 acc1, acc2;
-    for (int i = 0; i < 16; i++) {
-        acc1.val.elem(i) = VBit<64, true>(0);
-        acc2.val.elem(i) = VBit<64, true>(0);
-    }
-
     // Config word
     me_primitive::w32 cfg;
     cfg.val = VBit<32, true>((int64_t)(int32_t)config);
 
-    // zero_acc=1 (from config bit 0), but mac wrapper also passes it
     me_primitive::u1 zero_acc_flag;
     zero_acc_flag.val = VBit<1, false>(1); // force zero acc
 
@@ -109,17 +109,48 @@ int main(int argc, char *argv[]) {
     sub1.val = VBit<1, false>(0);
     sub2.val = VBit<1, false>(0);
 
-    // Call the v16w32 mac overload (line 14820 in me_inline_primitives.h).
-    // It zero-extends al_dense to v32w32, extracts sparse data from mask_b,
-    // derives mmode/pmode from cfg, and calls vmac.
-    me_primitive::v16w64 result = me_primitive::mac(
-        al_dense, mask_b, acc1, acc2,
-        zero_acc_flag, cfg, sub0, sub1, sub2
-    );
+    // Detect bf16 mode: amode = (config >> 1) & 3; bf16 when amode == 2
+    bool is_bfloat = ((config >> 1) & 3) == 2;
 
-    for (int i = 0; i < 16; i++) {
-        uint64_t val = result.val.elem(i).to_unsigned();
-        printf("%016lx\n", val);
+    if (is_bfloat) {
+        // bf16 uses mul_bf (zero_acc=1 internally) which returns v8w64.
+        // mul_bf(v16w32 a, w640 b, w32 cfg, u1 sub0, v5u1 mask, v5u1& of)
+        me_primitive::v5u1 flag_mask;
+        for (int i = 0; i < 5; i++)
+            flag_mask.val.elem(i) = VBit<1, false>(1);
+        me_primitive::v5u1 oflags;
+
+        me_primitive::v8w64 result = me_primitive::mul_bf(
+            a_full, mask_b, cfg, sub0, flag_mask, oflags
+        );
+
+        // Output 8 x u64 (each holds 2 fp32 values: lo32 + hi32)
+        // Expand to 16 lines for consistency with integer path
+        for (int i = 0; i < 8; i++) {
+            uint64_t val = result.val.elem(i).to_unsigned();
+            uint32_t lo = (uint32_t)(val & 0xFFFFFFFF);
+            uint32_t hi = (uint32_t)(val >> 32);
+            // Lane 2*i gets lo32, lane 2*i+1 gets hi32
+            printf("%016lx\n", (uint64_t)lo);
+            printf("%016lx\n", (uint64_t)hi);
+        }
+    } else {
+        // Integer path: mac() returns v16w64
+        me_primitive::v16w64 acc1, acc2;
+        for (int i = 0; i < 16; i++) {
+            acc1.val.elem(i) = VBit<64, true>(0);
+            acc2.val.elem(i) = VBit<64, true>(0);
+        }
+
+        me_primitive::v16w64 result = me_primitive::mac(
+            al_dense, mask_b, acc1, acc2,
+            zero_acc_flag, cfg, sub0, sub1, sub2
+        );
+
+        for (int i = 0; i < 16; i++) {
+            uint64_t val = result.val.elem(i).to_unsigned();
+            printf("%016lx\n", val);
+        }
     }
 
     return 0;

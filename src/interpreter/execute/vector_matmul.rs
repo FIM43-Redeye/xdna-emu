@@ -996,7 +996,7 @@ fn flo(man: i64) -> i32 {
 ///
 /// This matches the hardware's single-pass merge, where acc2 participates
 /// in the same wide addition as products and acc1, BEFORE normalization.
-fn bf16_mac_hw_lane(
+pub(crate) fn bf16_mac_hw_lane(
     q: u32,
     a_elems: &[u16],
     b_elems: &[u16],

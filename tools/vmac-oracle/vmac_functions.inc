@@ -9930,3 +9930,147 @@
         me_primitive::v16w64 acc2 = L0_5.val;
         return mac(a, b, acc1, acc2, me_primitive::u1(0x1u), me_primitive::w32(0x0), me_primitive::u1(0x0u), me_primitive::u1(0x0u), me_primitive::u1(0x0u));
     }
+    inline me_primitive::v8w64 mac_bf(const me_primitive::v16w32& al, const me_primitive::v16w32& b, const me_primitive::v8w64& acc1, const me_primitive::v8w64& acc2, me_primitive::u1 zero_acc, me_primitive::w32 cfg, me_primitive::u1 sub0, me_primitive::u1 sub1, me_primitive::u1 sub2, const me_primitive::v5u1& mask, me_primitive::v5u1& oflags) {
+        me_primitive::u1 sgn_x{VBitZeroInitializeTag{}};
+        me_primitive::u1 sgn_y{VBitZeroInitializeTag{}};
+        me_primitive::mmode_t mmode{VBitZeroInitializeTag{}};
+        me_primitive::pmode_t pmode{VBitZeroInitializeTag{}};
+        me_primitive::w128 sparse_mask = VBit<128, true>(0x0);
+        me_primitive::u2 acc_pre_mode{VBitZeroInitializeTag{}};
+        me_primitive::u2 subtract_acc{VBitZeroInitializeTag{}};
+        me_primitive::u8 subtract_mul{VBitZeroInitializeTag{}};
+        vec_control(cfg, zero_acc, sub0, sub1, sub2, sgn_x, sgn_y, mmode, pmode, acc_pre_mode, subtract_acc, subtract_mul);
+        me_primitive::v8w64 acc = acc_pre_hw(acc1, acc_pre_mode).val;
+        me_primitive::v5u1 of{VBitZeroInitializeTag{}};
+        me_primitive::v16w32 ah = VBitVector<VBit<32, true>, 16>(VBit<512, false>(0x0u));
+        me_primitive::v8w64 r = vmac_bf(acc, acc2, subtract_acc, subtract_mul, me_primitive::v32w32(::concat(VBit<512, false>(ah.val), VBit<512, false>(al.val))), b, sparse_mask, mmode, pmode, mask, of).val;
+        oflags = of.val;
+        return r;
+    }
+
+    inline me_primitive::v8w64 mul_bf(const me_primitive::v16w32& a, const me_primitive::v16w32& b, me_primitive::w32 cfg, me_primitive::u1 sub0, const me_primitive::v5u1& mask, me_primitive::v5u1& of) {
+        me_primitive::w64 L0_0 = VBit<64, true>(0x0);
+        me_primitive::v8w64 L0{VBitZeroInitializeTag{}};
+        for (VBit<4, false> pdg_it_33 = 0; pdg_it_33 < 8; ++pdg_it_33) {
+            L0.elem((pdg_it_33).to_unsigned()) = L0_0.val;
+        }
+        me_primitive::w64 L0_2 = VBit<0x40, true>(0x0);
+        me_primitive::v8w64 L0_1{VBitZeroInitializeTag{}};
+        for (VBit<4, false> pdg_it_34 = 0; pdg_it_34 < 8; ++pdg_it_34) {
+            L0_1.elem((pdg_it_34).to_unsigned()) = L0_2.val;
+        }
+        me_primitive::v8w64 acc1 = L0.val;
+        me_primitive::v8w64 acc2 = L0_1.val;
+        return mac_bf(a, b, acc1, acc2, me_primitive::u1(0x1u), cfg, sub0, me_primitive::u1(0x0u), me_primitive::u1(0x0u), mask, of);
+    }
+
+    inline me_primitive::v8w64 mac_bf(const me_primitive::v16w32& a, const me_primitive::v16w32& b, const me_primitive::v8w64& acc1, me_primitive::w32 cfg, me_primitive::u1 sub0, const me_primitive::v5u1& mask, me_primitive::v5u1& of) {
+        me_primitive::w64 L0_0 = VBit<64, true>(0x0);
+        me_primitive::v8w64 L0{VBitZeroInitializeTag{}};
+        for (VBit<4, false> pdg_it_35 = 0; pdg_it_35 < 8; ++pdg_it_35) {
+            L0.elem((pdg_it_35).to_unsigned()) = L0_0.val;
+        }
+        me_primitive::v8w64 acc2 = L0.val;
+        return mac_bf(a, b, acc1, acc2, me_primitive::u1(0x0u), cfg, sub0, me_primitive::u1(0x0u), me_primitive::u1(0x0u), mask, of);
+    }
+
+    inline me_primitive::v8w64 addmac_bf(const me_primitive::v16w32& a, const me_primitive::v16w32& b, const me_primitive::v8w64& acc1, const me_primitive::v8w64& acc2, me_primitive::w32 cfg, me_primitive::u1 sub0, const me_primitive::v5u1& mask, me_primitive::v5u1& of) {
+        return mac_bf(a, b, acc1, acc2, me_primitive::u1(0x0u), cfg, sub0, me_primitive::u1(0x0u), me_primitive::u1(0x0u), mask, of);
+    }
+
+    inline me_primitive::v8w64 mac_bf(const me_primitive::v32w32& a, me_primitive::w640 mask_b, const me_primitive::v8w64& acc1, const me_primitive::v8w64& acc2, me_primitive::u1 zero_acc, me_primitive::w32 cfg, me_primitive::u1 sub0, me_primitive::u1 sub1, me_primitive::u1 sub2, const me_primitive::v5u1& mask, me_primitive::v5u1& oflags) {
+        me_primitive::u1 sgn_x{VBitZeroInitializeTag{}};
+        me_primitive::u1 sgn_y{VBitZeroInitializeTag{}};
+        me_primitive::mmode_t mmode{VBitZeroInitializeTag{}};
+        me_primitive::pmode_t pmode{VBitZeroInitializeTag{}};
+        me_primitive::u2 acc_pre_mode{VBitZeroInitializeTag{}};
+        me_primitive::u2 subtract_acc{VBitZeroInitializeTag{}};
+        me_primitive::u8 subtract_mul{VBitZeroInitializeTag{}};
+        vec_control(cfg, zero_acc, sub0, sub1, sub2, sgn_x, sgn_y, mmode, pmode, acc_pre_mode, subtract_acc, subtract_mul);
+        me_primitive::v8w64 acc = acc_pre_hw(acc1, acc_pre_mode).val;
+        me_primitive::v5u1 of{VBitZeroInitializeTag{}};
+        me_primitive::w128 sparse_mask = VBit<128, true>(mask_b.val.extract<0x7Fu, 0x0u>());
+        me_primitive::v16w32 b = me_primitive::v16w32(VBit<512, true>(mask_b.val.extract<0x27Fu, 0x80u>())).val;
+        me_primitive::v8w64 r = vmac_bf(acc, acc2, subtract_acc, subtract_mul, a, b, sparse_mask, mmode, pmode, mask, of).val;
+        oflags = of.val;
+        return r;
+    }
+
+    inline me_primitive::v8w64 mul_bf(const me_primitive::v32w32& a, me_primitive::w640 b, me_primitive::w32 cfg, me_primitive::u1 sub0, const me_primitive::v5u1& mask, me_primitive::v5u1& of) {
+        me_primitive::w64 L0_0 = VBit<64, true>(0x0);
+        me_primitive::v8w64 L0{VBitZeroInitializeTag{}};
+        for (VBit<4, false> pdg_it_36 = 0; pdg_it_36 < 8; ++pdg_it_36) {
+            L0.elem((pdg_it_36).to_unsigned()) = L0_0.val;
+        }
+        me_primitive::w64 L0_2 = VBit<0x40, true>(0x0);
+        me_primitive::v8w64 L0_1{VBitZeroInitializeTag{}};
+        for (VBit<4, false> pdg_it_37 = 0; pdg_it_37 < 8; ++pdg_it_37) {
+            L0_1.elem((pdg_it_37).to_unsigned()) = L0_2.val;
+        }
+        me_primitive::v8w64 acc1 = L0.val;
+        me_primitive::v8w64 acc2 = L0_1.val;
+        return mac_bf(a, b, acc1, acc2, me_primitive::u1(0x1u), cfg, sub0, me_primitive::u1(0x0u), me_primitive::u1(0x0u), mask, of);
+    }
+
+    inline me_primitive::v8w64 mac_bf(const me_primitive::v32w32& a, me_primitive::w640 b, const me_primitive::v8w64& acc1, me_primitive::w32 cfg, me_primitive::u1 sub0, const me_primitive::v5u1& mask, me_primitive::v5u1& of) {
+        me_primitive::w64 L0_0 = VBit<64, true>(0x0);
+        me_primitive::v8w64 L0{VBitZeroInitializeTag{}};
+        for (VBit<4, false> pdg_it_38 = 0; pdg_it_38 < 8; ++pdg_it_38) {
+            L0.elem((pdg_it_38).to_unsigned()) = L0_0.val;
+        }
+        me_primitive::v8w64 acc2 = L0.val;
+        return mac_bf(a, b, acc1, acc2, me_primitive::u1(0x0u), cfg, sub0, me_primitive::u1(0x0u), me_primitive::u1(0x0u), mask, of);
+    }
+
+    inline me_primitive::v8w64 addmac_bf(const me_primitive::v32w32& a, me_primitive::w640 b, const me_primitive::v8w64& acc1, const me_primitive::v8w64& acc2, me_primitive::w32 cfg, me_primitive::u1 sub0, const me_primitive::v5u1& mask, me_primitive::v5u1& of) {
+        return mac_bf(a, b, acc1, acc2, me_primitive::u1(0x0u), cfg, sub0, me_primitive::u1(0x0u), me_primitive::u1(0x0u), mask, of);
+    }
+
+    inline me_primitive::v8w64 mac_bf(const me_primitive::v16w32& al, me_primitive::w640 mask_b, const me_primitive::v8w64& acc1, const me_primitive::v8w64& acc2, me_primitive::u1 zero_acc, me_primitive::w32 cfg, me_primitive::u1 sub0, me_primitive::u1 sub1, me_primitive::u1 sub2, const me_primitive::v5u1& mask, me_primitive::v5u1& oflags) {
+        me_primitive::u1 sgn_x{VBitZeroInitializeTag{}};
+        me_primitive::u1 sgn_y{VBitZeroInitializeTag{}};
+        me_primitive::mmode_t mmode{VBitZeroInitializeTag{}};
+        me_primitive::pmode_t pmode{VBitZeroInitializeTag{}};
+        me_primitive::u2 acc_pre_mode{VBitZeroInitializeTag{}};
+        me_primitive::u2 subtract_acc{VBitZeroInitializeTag{}};
+        me_primitive::u8 subtract_mul{VBitZeroInitializeTag{}};
+        vec_control(cfg, zero_acc, sub0, sub1, sub2, sgn_x, sgn_y, mmode, pmode, acc_pre_mode, subtract_acc, subtract_mul);
+        me_primitive::v8w64 acc = acc_pre_hw(acc1, acc_pre_mode).val;
+        me_primitive::v5u1 of{VBitZeroInitializeTag{}};
+        me_primitive::v16w32 ah = VBitVector<VBit<32, true>, 16>(VBit<512, false>(0x0u));
+        me_primitive::w128 sparse_mask = VBit<128, true>(mask_b.val.extract<0x7Fu, 0x0u>());
+        me_primitive::v16w32 b = me_primitive::v16w32(VBit<512, true>(mask_b.val.extract<0x27Fu, 0x80u>())).val;
+        me_primitive::v8w64 r = vmac_bf(acc, acc2, subtract_acc, subtract_mul, me_primitive::v32w32(::concat(VBit<512, false>(ah.val), VBit<512, false>(al.val))), b, sparse_mask, mmode, pmode, mask, of).val;
+        oflags = of.val;
+        return r;
+    }
+
+    inline me_primitive::v8w64 mul_bf(const me_primitive::v16w32& a, me_primitive::w640 b, me_primitive::w32 cfg, me_primitive::u1 sub0, const me_primitive::v5u1& mask, me_primitive::v5u1& of) {
+        me_primitive::w64 L0_0 = VBit<64, true>(0x0);
+        me_primitive::v8w64 L0{VBitZeroInitializeTag{}};
+        for (VBit<4, false> pdg_it_39 = 0; pdg_it_39 < 8; ++pdg_it_39) {
+            L0.elem((pdg_it_39).to_unsigned()) = L0_0.val;
+        }
+        me_primitive::w64 L0_2 = VBit<0x40, true>(0x0);
+        me_primitive::v8w64 L0_1{VBitZeroInitializeTag{}};
+        for (VBit<4, false> pdg_it_40 = 0; pdg_it_40 < 8; ++pdg_it_40) {
+            L0_1.elem((pdg_it_40).to_unsigned()) = L0_2.val;
+        }
+        me_primitive::v8w64 acc1 = L0.val;
+        me_primitive::v8w64 acc2 = L0_1.val;
+        return mac_bf(a, b, acc1, acc2, me_primitive::u1(0x1u), cfg, sub0, me_primitive::u1(0x0u), me_primitive::u1(0x0u), mask, of);
+    }
+
+    inline me_primitive::v8w64 mac_bf(const me_primitive::v16w32& a, me_primitive::w640 b, const me_primitive::v8w64& acc1, me_primitive::w32 cfg, me_primitive::u1 sub0, const me_primitive::v5u1& mask, me_primitive::v5u1& of) {
+        me_primitive::w64 L0_0 = VBit<64, true>(0x0);
+        me_primitive::v8w64 L0{VBitZeroInitializeTag{}};
+        for (VBit<4, false> pdg_it_41 = 0; pdg_it_41 < 8; ++pdg_it_41) {
+            L0.elem((pdg_it_41).to_unsigned()) = L0_0.val;
+        }
+        me_primitive::v8w64 acc2 = L0.val;
+        return mac_bf(a, b, acc1, acc2, me_primitive::u1(0x0u), cfg, sub0, me_primitive::u1(0x0u), me_primitive::u1(0x0u), mask, of);
+    }
+
+    inline me_primitive::v8w64 addmac_bf(const me_primitive::v16w32& a, me_primitive::w640 b, const me_primitive::v8w64& acc1, const me_primitive::v8w64& acc2, me_primitive::w32 cfg, me_primitive::u1 sub0, const me_primitive::v5u1& mask, me_primitive::v5u1& of) {
+        return mac_bf(a, b, acc1, acc2, me_primitive::u1(0x0u), cfg, sub0, me_primitive::u1(0x0u), me_primitive::u1(0x0u), mask, of);
+    }
