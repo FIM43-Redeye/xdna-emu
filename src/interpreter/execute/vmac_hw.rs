@@ -152,7 +152,7 @@ pub fn mask2sel(mask: u128, pmode_bit: u8) -> [u64; 12] {
             //
             // Each byte is paired: 4 pairs of 2 bits each, ORed to form
             // a 4-bit mask4. mask4 goes through decode_mask to produce
-            // (sel0, sel1), written to r16x16 with column reversal.
+            // (sel0, sel1), written to r16x16 (no column reversal, matching ISS).
             //
             // Note: mask bytes with 3+ active pairs produce (0,0) from
             // decode_mask -- verified against oracle. This is correct
@@ -168,9 +168,8 @@ pub fn mask2sel(mask: u128, pmode_bit: u8) -> [u64; 12] {
                         | (((t >> 4) | (t >> 5)) & 1) << 2
                         | (((t >> 6) | (t >> 7)) & 1) << 3;
                     let (sel0, sel1) = decode_mask(mask4 as u8);
-                    let rc = 7 - col;
-                    let idx0 = (rc + 8 * (2 * row)) as usize;
-                    let idx1 = (rc + 8 * (2 * row + 1)) as usize;
+                    let idx0 = (col + 8 * (2 * row)) as usize;
+                    let idx1 = (col + 8 * (2 * row + 1)) as usize;
                     r16x16[idx0] = sel0;
                     r16x16[idx1] = sel1;
                 }
@@ -1006,7 +1005,8 @@ mod tests {
 
         let a_hex: String = a_dense.iter().map(|b| format!("{:02x}", b)).collect();
         let b_hex: String = b_sparse.iter().map(|b| format!("{:02x}", b)).collect();
-        let mask_hex = format!("{:032x}", mask);
+        let mask_bytes_le: Vec<u8> = (0..16).map(|i| ((mask >> (8 * i)) & 0xFF) as u8).collect();
+        let mask_hex: String = mask_bytes_le.iter().map(|b| format!("{:02x}", b)).collect();
         let output = Command::new(oracle_path)
             .args([&a_hex, &b_hex, &mask_hex, "353"])
             .output().unwrap();
@@ -1043,7 +1043,8 @@ mod tests {
 
         let a_hex: String = a_dense.iter().map(|b| format!("{:02x}", b)).collect();
         let b_hex: String = b_sparse.iter().map(|b| format!("{:02x}", b)).collect();
-        let mask_hex = format!("{:032x}", mask);
+        let mask_bytes_le: Vec<u8> = (0..16).map(|i| ((mask >> (8 * i)) & 0xFF) as u8).collect();
+        let mask_hex: String = mask_bytes_le.iter().map(|b| format!("{:02x}", b)).collect();
         let output = Command::new(oracle_path)
             .args([&a_hex, &b_hex, &mask_hex, "3bb"])
             .output().unwrap();
@@ -1095,7 +1096,8 @@ mod tests {
         // Run the oracle
         let a_hex: String = a_dense.iter().map(|b| format!("{:02x}", b)).collect();
         let b_hex: String = b_sparse.iter().map(|b| format!("{:02x}", b)).collect();
-        let mask_hex = format!("{:032x}", mask);
+        let mask_bytes_le: Vec<u8> = (0..16).map(|i| ((mask >> (8 * i)) & 0xFF) as u8).collect();
+        let mask_hex: String = mask_bytes_le.iter().map(|b| format!("{:02x}", b)).collect();
         let config_hex = format!("{:x}", config);
 
         let output = Command::new(oracle_path)
@@ -1175,7 +1177,10 @@ mod tests {
                 total_tests += 1;
                 let result = sparse_vmac(&a_dense, &b_sparse, mask, &acc, &scd, config, false, false, false);
 
-                let mask_hex = format!("{:032x}", mask);
+                // Oracle hex_to_bytes reads bytes left-to-right, so pass mask
+                // in memory order (LSB first) rather than format!() MSB order.
+                let mask_bytes_le: Vec<u8> = (0..16).map(|i| ((mask >> (8 * i)) & 0xFF) as u8).collect();
+                let mask_hex: String = mask_bytes_le.iter().map(|b| format!("{:02x}", b)).collect();
                 let output = Command::new(oracle_path)
                     .args([&a_hex, &b_hex, &mask_hex, &format!("{:x}", config)])
                     .output().unwrap();

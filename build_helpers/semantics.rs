@@ -409,9 +409,12 @@ pub fn refine_encoding_semantic(encoding_name: &str) -> Option<String> {
         return Some("SemanticOp::NegMatMul".to_string());
     }
     if n.starts_with("VNEGMSC_") {
-        // VNEGMSC: double negation (neg product + neg acc) cancels.
-        // Net effect = VMAC (no subtract flip).
-        return Some("SemanticOp::Mac".to_string());
+        // VNEGMSC = NegMul semantic. HW testing shows VNEGMSC gives raw
+        // products (no product negation), same as VMAC with acc negate.
+        // sub0 = is_msc XOR is_neg = true XOR true = false (no product negate)
+        // sub1 = is_neg = true (acc negate)
+        // With zero_acc=1: products + (-0) = products.
+        return Some("SemanticOp::NegMul".to_string());
     }
     if n.starts_with("VNEGMUL_") {
         return Some("SemanticOp::NegMul".to_string());

@@ -89,8 +89,8 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
     //
     //   vmac:     result = acc + A*B        (subtract=false)
     //   vmsc:     result = acc - A*B        (subtract=true, negates product)
-    //   vnegmac:  result = -(acc) + A*B     (NegMul semantic)
-    //   vnegmsc:  result = -(acc) - A*B     (NegMul + MSC)
+    //   vnegmac:  result = -(acc + A*B)     (NegMul semantic)
+    //   vnegmsc:  result = acc - A*B        (same sign as VMSC per HW observation)
     //   vaddmac:  result = (acc + A*B) + acc2
     //   vaddmsc:  result = (acc - A*B) + acc2  (MSC: product negated)
     //   vsubmac:  result = (acc + A*B) - acc2
@@ -107,15 +107,18 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         _ => {}
     }
 
-    // MSC variants (vaddmsc, vsubmsc) with AddMac/SubMac semantics need
-    // the product negation applied.  VMSC and VNEGMSC already get the
-    // product negation via their NegMul/NegMatMul semantics above, so
-    // only apply this for AddMac/SubMac.
-    if matches!(semantic, SemanticOp::AddMac | SemanticOp::SubMac) {
-        if let Some(ref name) = op.encoding_name {
-            if name.contains("msc") {
-                config.subtract = !config.subtract;
-            }
+    // MSC name-based correction for the dense path's config.subtract:
+    //
+    // VNEGMSC (NegMul + MSC): NegMul flipped subtract above, but the MSC
+    // and NEG product negations cancel. Un-flip for VNEGMSC.
+    //
+    // VADDMSC/VSUBMSC (AddMac/SubMac + MSC): the subtract flag wasn't
+    // flipped above (AddMac/SubMac not in the match), but MSC needs it.
+    if let Some(ref name) = op.encoding_name {
+        if name.contains("msc") && matches!(semantic,
+            SemanticOp::NegMul | SemanticOp::NegMatMul
+            | SemanticOp::AddMac | SemanticOp::SubMac) {
+            config.subtract = !config.subtract;
         }
     }
 
@@ -196,15 +199,23 @@ pub fn execute_matmul(op: &SlotOp, ctx: &mut ExecutionContext) -> bool {
         //   mdm=0, md1=0 -> VMAC  (acc + products)
         //   mdm=1, md1=0 -> VMSC  (acc - products)
         //   mdm=1, md1=1 -> VNEGMAC (-(acc + products))
-        //   mdm=0, md1=1 -> VNEGMSC (products - acc)
+        //   mdm=0, md1=1 -> VNEGMSC (-(acc) - products)
         //
         // In the C++ ISS vec_control function:
-        //   sub0 -> XOR into subtract_mul (product negation) = mdm bit
-        //   sub1 -> XOR into subtract_acc (accumulator negation) = md1 bit
+        //   sub0 -> XOR into subtract_mul (product negation)
+        //   sub1 -> XOR into subtract_acc (accumulator negation)
         //   sub2 -> XOR into subtract_acc bit 1 (scd negation)
         //
-        // mdm = is_msc XOR is_neg (VMSC and VNEGMAC both negate products;
-        //        VNEGMSC does NOT because the double-negate cancels).
+        // The sub0/sub1/sub2 flags are derived from the SemanticOp, which
+        // is resolved at build time from instruction names:
+        //   VMAC     -> Mac        -> sub0=0, sub1=0
+        //   VMSC     -> MatMulSub  -> sub0=1, sub1=0  (product negate)
+        //   VNEGMAC  -> NegMatMul  -> sub0=1, sub1=1  (product + acc negate)
+        //   VNEGMSC  -> MatMulSub  -> sub0=1, sub1=0  (product negate, same as VMSC)
+        //
+        // is_msc XOR is_neg gives the correct mdm bit for all variants.
+        // VNEGMSC gets MatMulSub (not NegMul) because HW testing shows
+        // it produces acc - products (same sign as VMSC).
         let is_msc = op.encoding_name.as_ref()
             .map(|n| n.contains("msc"))
             .unwrap_or(false);
