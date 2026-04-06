@@ -148,28 +148,27 @@ pub fn mask2sel(mask: u128, pmode_bit: u8) -> [u64; 12] {
             }
         }
         24 => {
-            // i16xi16 sparse: 2 rows x 8 cols, 8-bit mask bytes (pair bits)
+            // i16xi16 sparse: 2 rows x 8 cols, 8-bit mask bytes.
             //
-            // Mask indexing: vm.elem(r + c*2) for r=0..1, c=0..7.
-            // Output array: r16x16 has 32 x 3-bit entries.
+            // Each byte is paired: 4 pairs of 2 bits each, ORed to form
+            // a 4-bit mask4. mask4 goes through decode_mask to produce
+            // (sel0, sel1), written to r16x16 with column reversal.
             //
-            // Column reversal: the hardware crossbar routes r16x16[c]
-            // to lanes c,c+8. Mask column 0 should produce output at
-            // lanes 7,15 (the highest column in the routing), so we
-            // reverse: routing_col = 7 - col.
+            // Note: mask bytes with 3+ active pairs produce (0,0) from
+            // decode_mask -- verified against oracle. This is correct
+            // hardware behavior (no element selection when >2 groups active).
             let mask_bytes: [u8; 16] = std::array::from_fn(|i| ((mask >> (8 * i)) & 0xFF) as u8);
             let mut r16x16 = [0u8; 32];
             for row in 0..2u32 {
                 for col in 0..8u32 {
                     let byte_idx = (row + col * 2) as usize;
                     let t = mask_bytes[byte_idx];
-                    // Pair adjacent bits: bit0|bit1, bit2|bit3, bit4|bit5, bit6|bit7
-                    let mask4 = ((t >> 6) | (t >> 7)) & 1
-                        | (((t >> 4) | (t >> 5)) & 1) << 1
-                        | (((t >> 2) | (t >> 3)) & 1) << 2
-                        | ((t | (t >> 1)) & 1) << 3;
+                    let mask4 = ((t | (t >> 1)) & 1)
+                        | (((t >> 2) | (t >> 3)) & 1) << 1
+                        | (((t >> 4) | (t >> 5)) & 1) << 2
+                        | (((t >> 6) | (t >> 7)) & 1) << 3;
                     let (sel0, sel1) = decode_mask(mask4 as u8);
-                    let rc = 7 - col; // column reversal for i16xi16
+                    let rc = 7 - col;
                     let idx0 = (rc + 8 * (2 * row)) as usize;
                     let idx1 = (rc + 8 * (2 * row + 1)) as usize;
                     r16x16[idx0] = sel0;
@@ -196,10 +195,10 @@ pub fn mask2sel(mask: u128, pmode_bit: u8) -> [u64; 12] {
                 for col in 0..4u32 {
                     let byte_idx = (row + col * 4) as usize;
                     let t = mask_bytes[byte_idx];
-                    let mask4 = ((t >> 6) | (t >> 7)) & 1
-                        | (((t >> 4) | (t >> 5)) & 1) << 1
-                        | (((t >> 2) | (t >> 3)) & 1) << 2
-                        | ((t | (t >> 1)) & 1) << 3;
+                    let mask4 = ((t | (t >> 1)) & 1)
+                        | (((t >> 2) | (t >> 3)) & 1) << 1
+                        | (((t >> 4) | (t >> 5)) & 1) << 2
+                        | (((t >> 6) | (t >> 7)) & 1) << 3;
                     let (sel0, sel1) = decode_mask(mask4 as u8);
                     let idx0 = (col + 4 * (2 * row)) as usize;
                     let idx1 = (col + 4 * (2 * row + 1)) as usize;
@@ -1025,6 +1024,44 @@ mod tests {
         }
     }
 
+    /// Uniform i16xi16 sparse oracle test -- isolates compute from routing.
+    #[test]
+    fn test_sparse_vmac_i16xi16_uniform_vs_oracle() {
+        use std::process::Command;
+        let oracle_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tools/vmac-oracle/vmac_oracle");
+        if !std::path::Path::new(oracle_path).exists() { return; }
+
+        let mut a_dense = [0u8; 128];
+        for i in 0..64 { a_dense[i] = 1; }
+        let b_sparse = [1u8; 64];
+        let mask: u128 = 0x33333333_33333333_33333333_33333333;
+        let config: u32 = 0x3bb; // i16xi16 sparse, signed, zero_acc
+        let acc = [0u64; 16];
+        let scd = [0u64; 16];
+
+        let result = sparse_vmac(&a_dense, &b_sparse, mask, &acc, &scd, config, false, false, false);
+
+        let a_hex: String = a_dense.iter().map(|b| format!("{:02x}", b)).collect();
+        let b_hex: String = b_sparse.iter().map(|b| format!("{:02x}", b)).collect();
+        let mask_hex = format!("{:032x}", mask);
+        let output = Command::new(oracle_path)
+            .args([&a_hex, &b_hex, &mask_hex, "3bb"])
+            .output().unwrap();
+        let oracle_stdout = String::from_utf8_lossy(&output.stdout);
+        let oracle_lanes: Vec<u64> = oracle_stdout.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| u64::from_str_radix(l.trim(), 16).unwrap())
+            .collect();
+
+        eprintln!("i16xi16 uniform:");
+        eprintln!("Rust:   {:016x?}", &result);
+        eprintln!("Oracle: {:016x?}", &oracle_lanes);
+        let mismatches = (0..16).filter(|&i| result[i] != oracle_lanes[i]).count();
+        if mismatches > 0 {
+            panic!("{}/16 lanes differ (i16xi16 uniform test)", mismatches);
+        }
+    }
+
     /// Compare sparse_vmac output against the C++ oracle for a known test vector.
     ///
     /// Uses the same test data that was verified against real NPU hardware:
@@ -1102,9 +1139,8 @@ mod tests {
         }
     }
 
-    /// Oracle comparison for i16xi16 sparse (config 0x3bb).
+    /// Oracle comparison for i16xi16 sparse -- multiple mask patterns.
     #[test]
-    #[ignore = "i16xi16 sparse routing WIP: prmx col reversal done, prmy/multiplier still diverge"]
     fn test_sparse_vmac_i16xi16_vs_oracle() {
         use std::process::Command;
 
@@ -1114,43 +1150,56 @@ mod tests {
             return;
         }
 
+        // Test multiple mask patterns and configs
+        let masks: [u128; 4] = [
+            0x33333333_33333333_33333333_33333333, // uniform 2 bits per byte
+            0xFF00FF00_FF00FF00_FF00FF00_FF00FF00, // alternating full/empty bytes
+            0x01020408_10204080_01020408_10204080, // single bits in different positions
+            0xA5A5A5A5_A5A5A5A5_A5A5A5A5_A5A5A5A5, // mixed pattern
+        ];
+        let configs: [u32; 2] = [0x3bb, 0x0bb]; // signed, unsigned
+
         let mut a_dense = [0u8; 128];
-        for i in 0..128 { a_dense[i] = (i as u8).wrapping_mul(7).wrapping_add(3); }
+        for i in 0..64 { a_dense[i] = (i as u8).wrapping_mul(7).wrapping_add(3); }
         let b_sparse: [u8; 64] = std::array::from_fn(|i| (i as u8).wrapping_mul(13).wrapping_add(5));
-        let mask: u128 = 0x33333333_33333333_33333333_33333333;
-        let config: u32 = 0x3bb; // i16xi16 sparse, signed, zero_acc
         let acc = [0u64; 16];
         let scd = [0u64; 16];
 
-        let result = sparse_vmac(&a_dense, &b_sparse, mask, &acc, &scd, config, false, false, false);
-
         let a_hex: String = a_dense.iter().map(|b| format!("{:02x}", b)).collect();
         let b_hex: String = b_sparse.iter().map(|b| format!("{:02x}", b)).collect();
-        let mask_hex = format!("{:032x}", mask);
 
-        let output = Command::new(oracle_path)
-            .args([&a_hex, &b_hex, &mask_hex, &format!("{:x}", config)])
-            .output().unwrap();
-        let oracle_stdout = String::from_utf8_lossy(&output.stdout);
-        let oracle_lanes: Vec<u64> = oracle_stdout.lines()
-            .filter(|l| !l.is_empty())
-            .map(|l| u64::from_str_radix(l.trim(), 16).unwrap())
-            .collect();
+        let mut total_tests = 0;
+        let mut total_fail = 0;
+        for &config in &configs {
+            for &mask in &masks {
+                total_tests += 1;
+                let result = sparse_vmac(&a_dense, &b_sparse, mask, &acc, &scd, config, false, false, false);
 
-        assert_eq!(oracle_lanes.len(), 16, "Oracle should produce 16 lanes");
+                let mask_hex = format!("{:032x}", mask);
+                let output = Command::new(oracle_path)
+                    .args([&a_hex, &b_hex, &mask_hex, &format!("{:x}", config)])
+                    .output().unwrap();
+                let oracle_stdout = String::from_utf8_lossy(&output.stdout);
+                let oracle_lanes: Vec<u64> = oracle_stdout.lines()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| u64::from_str_radix(l.trim(), 16).unwrap())
+                    .collect();
 
-        let mut mismatches = 0;
-        for i in 0..16 {
-            if result[i] != oracle_lanes[i] {
-                eprintln!(
-                    "Lane {}: rust=0x{:016x} oracle=0x{:016x}",
-                    i, result[i], oracle_lanes[i]
-                );
-                mismatches += 1;
+                let mismatches = (0..16).filter(|&i| result[i] != oracle_lanes[i]).count();
+                if mismatches > 0 {
+                    total_fail += 1;
+                    eprintln!("FAIL config=0x{:03x} mask=0x{:032x}: {}/16 lanes differ",
+                        config, mask, mismatches);
+                    for i in 0..16 {
+                        if result[i] != oracle_lanes[i] {
+                            eprintln!("  L{}: rust=0x{:016x} oracle=0x{:016x}", i, result[i], oracle_lanes[i]);
+                        }
+                    }
+                }
             }
         }
-        if mismatches > 0 {
-            panic!("{} of 16 lanes differ from oracle (i16xi16 sparse)", mismatches);
+        if total_fail > 0 {
+            panic!("{}/{} test vectors failed", total_fail, total_tests);
         }
     }
 }
