@@ -2015,16 +2015,6 @@ impl VectorAlu {
         flags
     }
 
-    /// Get current value of vector destination (for read-modify-write ops like insert).
-    #[allow(dead_code)]
-    fn get_vector_dest_value(op: &SlotOp, ctx: &ExecutionContext) -> [u32; 8] {
-        if let Some(Operand::VectorReg(r)) = &op.dest {
-            ctx.vector.read(*r)
-        } else {
-            [0; 8]
-        }
-    }
-
     /// Extract a single element from a vector.
     ///
     /// Returns the element at the given lane index, converted to a u32.
@@ -2060,56 +2050,6 @@ impl VectorAlu {
                 }
             }
         }
-    }
-
-    /// Insert a scalar value into a vector at the given index.
-    /// Push a scalar into a vector, shifting existing elements.
-    ///
-    /// - `is_hi`: push into high end (shift elements towards low indices,
-    ///   insert at highest position, discard lowest element)
-    /// - `!is_hi`: push into low end (shift elements towards high indices,
-    ///   insert at lowest position, discard highest element)
-    #[allow(dead_code)]
-    fn vector_push(src: &[u32; 8], value: u32, is_hi: bool, et: ElementType) -> [u32; 8] {
-        // Convert to byte array, shift, insert, convert back.
-        let mut bytes = [0u8; 32];
-        for (i, word) in src.iter().enumerate() {
-            bytes[i * 4] = (*word & 0xFF) as u8;
-            bytes[i * 4 + 1] = ((*word >> 8) & 0xFF) as u8;
-            bytes[i * 4 + 2] = ((*word >> 16) & 0xFF) as u8;
-            bytes[i * 4 + 3] = ((*word >> 24) & 0xFF) as u8;
-        }
-
-        let elem_bytes = et.bits() as usize / 8;
-        let elem_bytes = if elem_bytes == 0 { 1 } else { elem_bytes }; // min 1 byte for 8-bit
-
-        if is_hi {
-            // Shift elements towards low indices (remove lowest element,
-            // insert at highest position).
-            bytes.copy_within(elem_bytes.., 0);
-            // Insert value at the highest position
-            let insert_pos = 32 - elem_bytes;
-            let val_bytes = value.to_le_bytes();
-            for i in 0..elem_bytes.min(4) {
-                bytes[insert_pos + i] = val_bytes[i];
-            }
-        } else {
-            // Shift elements towards high indices (remove highest element,
-            // insert at lowest position).
-            bytes.copy_within(..32 - elem_bytes, elem_bytes);
-            // Insert value at position 0
-            let val_bytes = value.to_le_bytes();
-            for i in 0..elem_bytes.min(4) {
-                bytes[i] = val_bytes[i];
-            }
-        }
-
-        // Convert back to [u32; 8]
-        let mut result = [0u32; 8];
-        for (i, chunk) in bytes.chunks(4).enumerate() {
-            result[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        }
-        result
     }
 
     fn vector_insert(dst: &mut [u32; 8], value: u32, index: u32, elem_type: ElementType) {
@@ -2637,66 +2577,6 @@ impl VectorAlu {
                     }
                     result[i] = val;
                 }
-            }
-        }
-
-        result
-    }
-
-    /// Conditional negate: d[i] = (cmp[i] < 0) ? -s1[i] : s1[i]
-    #[allow(dead_code)]
-    fn vector_bneg_ltz(cmp: &[u32; 8], s1: &[u32; 8], elem_type: ElementType) -> [u32; 8] {
-        let mut result = [0u32; 8];
-
-        match elem_type {
-            ElementType::Int32 | ElementType::Int64 => {
-                for i in 0..8 {
-                    let c = cmp[i] as i32;
-                    let v = s1[i] as i32;
-                    result[i] = if c < 0 { v.wrapping_neg() as u32 } else { s1[i] };
-                }
-            }
-            ElementType::UInt32 | ElementType::UInt64 | ElementType::Float32 => {
-                // Unsigned: cmp is never < 0 (treated as unsigned), pass through.
-                // Float: check sign bit.
-                if matches!(elem_type, ElementType::Float32) {
-                    for i in 0..8 {
-                        let c = f32::from_bits(cmp[i]);
-                        let v = f32::from_bits(s1[i]);
-                        result[i] = if c < 0.0 { (-v).to_bits() } else { s1[i] };
-                    }
-                } else {
-                    result = *s1;
-                }
-            }
-            ElementType::Int16 => {
-                for i in 0..8 {
-                    let c_lo = (cmp[i] & 0xFFFF) as i16;
-                    let c_hi = ((cmp[i] >> 16) & 0xFFFF) as i16;
-                    let v_lo = (s1[i] & 0xFFFF) as i16;
-                    let v_hi = ((s1[i] >> 16) & 0xFFFF) as i16;
-                    let r_lo = if c_lo < 0 { v_lo.wrapping_neg() } else { v_lo };
-                    let r_hi = if c_hi < 0 { v_hi.wrapping_neg() } else { v_hi };
-                    result[i] = (r_lo as u16 as u32) | ((r_hi as u16 as u32) << 16);
-                }
-            }
-            ElementType::UInt16 | ElementType::BFloat16 => {
-                result = *s1; // Unsigned: never negative
-            }
-            ElementType::Int8 => {
-                for i in 0..8 {
-                    let mut val = 0u32;
-                    for j in 0..4u32 {
-                        let c = ((cmp[i] >> (j * 8)) & 0xFF) as i8;
-                        let v = ((s1[i] >> (j * 8)) & 0xFF) as i8;
-                        let r = if c < 0 { v.wrapping_neg() } else { v };
-                        val |= (r as u8 as u32) << (j * 8);
-                    }
-                    result[i] = val;
-                }
-            }
-            ElementType::UInt8 => {
-                result = *s1; // Unsigned: never negative
             }
         }
 
@@ -3423,24 +3303,10 @@ impl VectorAlu {
         }
     }
 
-    /// Read the accumulator destination register index and its current 1024-bit value.
-    #[allow(dead_code)]
-    fn get_wide_acc_dest_value(op: &SlotOp, ctx: &ExecutionContext) -> (u8, Acc1024) {
-        let reg = Self::get_acc_dest(op);
-        (reg, ctx.accumulator.read_wide(reg))
-    }
-
     /// Write a 1024-bit result to the accumulator destination.
     fn write_wide_acc_dest(op: &SlotOp, ctx: &mut ExecutionContext, value: Acc1024) {
         let reg = Self::get_acc_dest(op);
         ctx.accumulator.write_wide(reg, value);
-    }
-
-    /// Read an AccumReg source as a 1024-bit cm-register.
-    #[allow(dead_code)]
-    fn get_wide_acc_source(op: &SlotOp, ctx: &ExecutionContext) -> (u8, Acc1024) {
-        let reg = Self::get_acc_source(op);
-        (reg, ctx.accumulator.read_wide(reg))
     }
 
     // ========== Wide dispatch bridges ==========
@@ -4786,11 +4652,6 @@ impl VectorAlu {
         result
     }
 
-    /// Simple concat-and-extract shift (used by narrow VSHIFT path).
-    #[allow(dead_code)]
-    fn wide_vector_align(src1: &Vec512, src2: &Vec512, byte_shift: u32) -> Vec512 {
-        Self::wide_vector_shift(src1, src2, 0, byte_shift)
-    }
 }
 
 #[cfg(test)]
@@ -5404,7 +5265,6 @@ mod tests {
     /// VCONV_FP32_BF16: BF16->FP32 expansion writes consecutive pairs to accumulator.
     #[test]
     fn test_vconv_fp32_bf16_acc_dest() {
-        use crate::tablegen::decoder_ffi::AccumWidth;
         let mut ctx = make_ctx();
 
         // Write 16 BF16 values (1.0..16.0) into vector register
@@ -5664,7 +5524,7 @@ mod tests {
     fn test_wide_vector_align_no_shift() {
         let src1 = [1u32; 16];
         let src2 = [2u32; 16];
-        let result = VectorAlu::wide_vector_align(&src1, &src2, 0);
+        let result = VectorAlu::wide_vector_shift(&src1, &src2, 0, 0);
         assert_eq!(result, [1u32; 16]);
     }
 
@@ -5673,7 +5533,7 @@ mod tests {
     fn test_wide_vector_align_full_shift() {
         let src1 = [1u32; 16];
         let src2 = [2u32; 16];
-        let result = VectorAlu::wide_vector_align(&src1, &src2, 64);
+        let result = VectorAlu::wide_vector_shift(&src1, &src2, 0, 64);
         assert_eq!(result, [2u32; 16]);
     }
 
@@ -5685,7 +5545,7 @@ mod tests {
         let mut src2 = [0u32; 16];
         src1[15] = 0xAAAA_AAAA; // last word of src1
         src2[0]  = 0xBBBB_BBBB; // first word of src2
-        let result = VectorAlu::wide_vector_align(&src1, &src2, 60);
+        let result = VectorAlu::wide_vector_shift(&src1, &src2, 0, 60);
         assert_eq!(result[0], 0xAAAA_AAAA, "last word of src1 at result[0]");
         assert_eq!(result[1], 0xBBBB_BBBB, "first word of src2 at result[1]");
     }

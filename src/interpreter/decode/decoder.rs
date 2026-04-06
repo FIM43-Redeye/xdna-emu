@@ -1517,7 +1517,7 @@ impl Decoder for InstructionDecoder {
 mod tests {
     use super::*;
     use crate::interpreter::bundle::ElementType;
-    use crate::tablegen::{CompositeEncoder, OperandField};
+    use crate::tablegen::OperandField;
     use std::path::Path;
 
     #[test]
@@ -2920,8 +2920,6 @@ mod tests {
     /// Expected: dest=x0, extra_dest=r16, sources=[x2, x0]
     #[test]
     fn test_vmaxdiff_lt_s16_operand_order() {
-        use crate::interpreter::bundle::SlotType;
-
         // Decode from the full 32-bit bundle bytes.
         let bundle_bytes: [u8; 4] = [0x39, 0x90, 0x04, 0x18];
         let decoder = InstructionDecoder::load_default();

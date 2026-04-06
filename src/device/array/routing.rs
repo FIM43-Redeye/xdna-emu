@@ -22,34 +22,6 @@ impl TileArray {
         total_forwarded
     }
 
-    /// Convert S2MM DMA channel index to stream switch slave port index.
-    ///
-    /// Port indices derived from AM025 gen_stream_ranges.rs constants.
-    #[allow(dead_code)] // Documented port mapping, may be used in future
-    fn s2mm_channel_to_slave_port(tile_type: TileType, channel: u8) -> u8 {
-        match tile_type {
-            TileType::Compute => compute::DMA_SLAVE_START + channel,
-            TileType::MemTile => mem_tile::DMA_SLAVE_START + channel,
-            TileType::Shim => shim::NORTH_SLAVE_START + channel,
-        }
-    }
-
-    /// Convert MM2S DMA channel index to stream switch master port index.
-    ///
-    /// The `channel` argument is the absolute DMA channel index (S2MM channels
-    /// come first, MM2S channels follow). `s2mm_count` is the number of S2MM
-    /// channels for this tile (from DmaEngine). Port indices derived from AM025
-    /// gen_stream_ranges.rs.
-    #[allow(dead_code)] // Documented port mapping, may be used in future
-    fn mm2s_channel_to_master_port(tile_type: TileType, channel: u8, s2mm_count: u8) -> u8 {
-        let ch_offset = channel.saturating_sub(s2mm_count);
-        match tile_type {
-            TileType::Compute => compute::DMA_MASTER_START + ch_offset,
-            TileType::MemTile => mem_tile::DMA_MASTER_START + ch_offset,
-            TileType::Shim => shim::NORTH_MASTER_START + ch_offset,
-        }
-    }
-
     /// Step the complete data movement system.
     ///
     /// This follows the NPU hardware architecture with 4 clean phases:

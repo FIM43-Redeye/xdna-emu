@@ -2471,23 +2471,6 @@ mod tests {
         op
     }
 
-    /// Build a MAC op with an extra AccumReg source (for AddMac/SubMac).
-    #[allow(dead_code)]
-    fn make_double_acc_op(
-        semantic: SemanticOp,
-        a_vreg: u8,
-        b_vreg: u8,
-        conf_sreg: u8,
-        acc_dest: u8,
-        acc_src: u8,
-        encoding_name: Option<&str>,
-    ) -> SlotOp {
-        let mut op = make_mac_op(semantic, a_vreg, b_vreg, conf_sreg, acc_dest, encoding_name);
-        // Insert AccumReg source before the ScalarReg (config is last).
-        op.sources.insert(2, Operand::AccumReg(acc_src));
-        op
-    }
-
     /// Pack [u32; 16] (Vec512) of all-ones bytes (int8 = 1 in every byte).
     fn vec512_all_ones_i8() -> Vec512 {
         // 0x01010101 repeated 16 times = 64 bytes of 0x01
@@ -2957,7 +2940,7 @@ mod sparse_matmul_tests {
         for k in 0..16 {
             a[0 * 16 + k] = 1; // A row 0, all sparse inner positions = 1
         }
-        let mut b = [1u8; 64]; // All compressed B bytes = 1
+        let b = [1u8; 64]; // All compressed B bytes = 1
         let mask: u128 = 0x33333333_33333333_33333333_33333333;
         let config = MatMulConfig::from_config_word(
             (1 << 0) | (0 << 1) | (1 << 3) | (5 << 5) | (1 << 8) | (1 << 9),
@@ -2977,15 +2960,10 @@ mod sparse_matmul_tests {
     }
 
     #[test]
-    #[ignore] // TODO: bf16 sparse needs word-level pair routing (byte-level swaps byte order)
     fn test_sparse_bf16_basic() {
         // bf16 sparse: 4x16x4, acc32(fp32).
         // inner_groups=4, cols=4. Group g=0 -> inner_group=0, col=0.
         // Mask bits 0,1 -> A sparse positions 0,1.
-        //
-        // This test is currently broken because the crossbar routing operates
-        // at byte granularity, which swaps the byte order within bf16
-        // elements. Bf16 sparse needs a word-level decompression function.
         let mut a = [0u8; 128];
         a[0] = 0x80; a[1] = 0x3F; // bf16 1.0 at A[row=0][sparse_k=0]
         a[2] = 0x80; a[3] = 0x3F; // bf16 1.0 at A[row=0][sparse_k=1]
