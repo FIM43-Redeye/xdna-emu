@@ -85,6 +85,7 @@ pub mod vector_config;
 pub mod vector_float;
 pub mod vector_matmul;
 pub mod vector_matmul_sparse;
+pub mod vmac_hw;
 mod memory;
 mod control;
 mod stream;
