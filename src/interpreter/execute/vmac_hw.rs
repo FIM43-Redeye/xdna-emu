@@ -149,6 +149,14 @@ pub fn mask2sel(mask: u128, pmode_bit: u8) -> [u64; 12] {
         }
         24 => {
             // i16xi16 sparse: 2 rows x 8 cols, 8-bit mask bytes (pair bits)
+            //
+            // Mask indexing: vm.elem(r + c*2) for r=0..1, c=0..7.
+            // Output array: r16x16 has 32 x 3-bit entries.
+            //
+            // Column reversal: the hardware crossbar routes r16x16[c]
+            // to lanes c,c+8. Mask column 0 should produce output at
+            // lanes 7,15 (the highest column in the routing), so we
+            // reverse: routing_col = 7 - col.
             let mask_bytes: [u8; 16] = std::array::from_fn(|i| ((mask >> (8 * i)) & 0xFF) as u8);
             let mut r16x16 = [0u8; 32];
             for row in 0..2u32 {
@@ -161,8 +169,9 @@ pub fn mask2sel(mask: u128, pmode_bit: u8) -> [u64; 12] {
                         | (((t >> 2) | (t >> 3)) & 1) << 2
                         | ((t | (t >> 1)) & 1) << 3;
                     let (sel0, sel1) = decode_mask(mask4 as u8);
-                    let idx0 = (col + 8 * (2 * row)) as usize;
-                    let idx1 = (col + 8 * (2 * row + 1)) as usize;
+                    let rc = 7 - col; // column reversal for i16xi16
+                    let idx0 = (rc + 8 * (2 * row)) as usize;
+                    let idx1 = (rc + 8 * (2 * row + 1)) as usize;
                     r16x16[idx0] = sel0;
                     r16x16[idx1] = sel1;
                 }
@@ -760,12 +769,78 @@ pub fn vec_control(
 }
 
 // ---------------------------------------------------------------------------
+// vec_control_negate: subtract_mul -> per-lane negate mask
+// ---------------------------------------------------------------------------
+
+/// Convert 8-bit subtract_mul into per-lane negate masks.
+///
+/// Returns [u32; 8] where each element is a 32-bit per-pair negate mask.
+/// Even indices (0,2,4,6) share one pattern, odd indices (1,3,5,7) share
+/// another. The hardware replicates a 64-bit value across all 8 lanes.
+///
+/// Three patterns exist based on operand width (mmode):
+///   - i8xi4/i8xi8 (mmode bits 0,1): interleaved 4-element groups
+///   - bf16 (mmode bit 6): paired elements
+///   - i16 modes (mmode bits 2,3,4,5,7): simple alternating pairs
+///
+/// Reference: C++ vec_control_negate in vmac_functions.inc line 6805.
+fn vec_control_negate(mmode: u8, sub: u8) -> [u32; 8] {
+    // Build 64-bit negate value. Each bit position maps to a specific sub bit.
+    let mut v = 0u64;
+
+    if mmode & 0x03 != 0 {
+        // Branch 1: i8xi4/i8xi8
+        // Pattern per 8-bit group: sub[base+0], sub[base+1], ..., sub[base+2], sub[base+3], ...
+        // Groups 0,1,4,5 use sub[0..3], groups 2,3,6,7 use sub[4..7].
+        for b in 0..64u32 {
+            let group = b / 8;
+            let in_group = (b % 8) as u8;
+            let half = in_group / 4;       // 0 for first 4 bits, 1 for next 4
+            let pair_bit = in_group % 2;
+            let base: u8 = if group % 4 < 2 { 0 } else { 4 };
+            let sub_idx = base + half * 2 + pair_bit;
+            if (sub >> sub_idx) & 1 != 0 {
+                v |= 1u64 << b;
+            }
+        }
+    } else if mmode & 0x40 != 0 {
+        // Branch 2: bf16
+        // Pattern per 8-bit group: sub[base+0], sub[base+0], sub[base+1], sub[base+1], ...
+        // Groups 0,1,4,5 use sub[0..3], groups 2,3,6,7 use sub[4..7].
+        for b in 0..64u32 {
+            let group = b / 8;
+            let in_group = (b % 8) as u8;
+            let base: u8 = if group % 4 < 2 { 0 } else { 4 };
+            let sub_idx = base + in_group / 2;
+            if (sub >> sub_idx) & 1 != 0 {
+                v |= 1u64 << b;
+            }
+        }
+    } else if mmode & 0xBC != 0 {
+        // Branch 3: i16 modes (bits 2,3,4,5,7)
+        // Simple: 16-bit blocks, alternating sub[2k], sub[2k+1].
+        for b in 0..64u32 {
+            let sub_idx = ((b / 16) * 2 + b % 2) as u8;
+            if (sub >> sub_idx) & 1 != 0 {
+                v |= 1u64 << b;
+            }
+        }
+    }
+    // else: v stays 0 (no negate)
+
+    // Replicate: even lanes get v[31:0], odd lanes get v[63:32].
+    let lo = (v & 0xFFFF_FFFF) as u32;
+    let hi = (v >> 32) as u32;
+    [lo, hi, lo, hi, lo, hi, lo, hi]
+}
+
+// ---------------------------------------------------------------------------
 // Top-level sparse vmac
 // ---------------------------------------------------------------------------
 
 /// Execute the full hardware vmac pipeline for sparse MAC.
 ///
-/// a_dense: 64 bytes of dense A operand (xs1, 512 bits = v16w32)
+/// a_dense: 128 bytes of dense A operand (zero-padded if narrow xs1)
 /// b_sparse: 64 bytes of compressed sparse B data (qxs2 data portion)
 /// mask: 128-bit sparsity mask (qxs2 mask portion)
 /// acc: 16 x u64 accumulator values (low 8 = lanes 0-7, high 8 = lanes 8-15)
@@ -775,7 +850,7 @@ pub fn vec_control(
 ///
 /// Returns 16 x u64 accumulator result.
 pub fn sparse_vmac(
-    a_dense: &[u8; 64],
+    a_dense: &[u8; 128],
     b_sparse: &[u8; 64],
     mask: u128,
     acc: &[u64; 16],
@@ -785,8 +860,13 @@ pub fn sparse_vmac(
     sub1: bool,
     sub2: bool,
 ) -> [u64; 16] {
-    let (mmode, pmode, sgn_x, sgn_y, subtract_acc, _subtract_mul) =
+    let zero_acc = (config & 1) != 0;
+    let (mmode, pmode, sgn_x, sgn_y, subtract_acc, subtract_mul) =
         vec_control(config, true, sub0, sub1, sub2);
+
+    // When zero_acc=1, hardware ignores the existing accumulator.
+    // Note: scd (secondary acc for AddMac/SubMac) is NOT zeroed by zero_acc.
+    let acc = if zero_acc { &[0u64; 16] } else { acc };
 
     // Determine sparse pmode bit
     let pmode_bit = pmode.trailing_zeros() as u8;
@@ -797,11 +877,7 @@ pub fn sparse_vmac(
     // Step 2: Build crossbar control word and evaluate routing
     let prmx_m = build_prmx_control(&smode, pmode);
 
-    // Zero-extend a_dense from 64 bytes (v16w32) to 128 bytes (v32w32)
-    let mut a_padded = [0u8; 128];
-    a_padded[..64].copy_from_slice(a_dense);
-
-    let bx = eval_prmx(&a_padded, &prmx_m); // 512 output bytes
+    let bx = eval_prmx(a_dense, &prmx_m); // 512 output bytes
 
     // Step 3: Evaluate Y-perm routing
     // Reinterpret b_sparse as 128 nibbles
@@ -817,8 +893,8 @@ pub fn sparse_vmac(
     // by: 512 nibbles -> 16 lanes x 32 nibbles
 
     // Split into low (lanes 0-7) and high (lanes 8-15)
-    // vec_control_negate (simplified: sub_mul is typically 0 for standard vmac)
-    let negate = 0u32; // TODO: implement vec_control_negate for subtract_mul != 0
+    // Per-lane negate mask from subtract_mul (controls product negation for MSC variants).
+    let negate_lanes = vec_control_negate(mmode, subtract_mul);
 
     let mut result = [0u64; 16];
 
@@ -829,7 +905,7 @@ pub fn sparse_vmac(
         let py: [u8; 32] = std::array::from_fn(|i| by[base + i]);
 
         let products = mpyl_hw_lane(
-            &px, &py, sgn_x, sgn_y, negate, 0xFFFF, 0xFFFF, mmode,
+            &px, &py, sgn_x, sgn_y, negate_lanes[lane], 0xFFFF, 0xFFFF, mmode,
         );
 
         let (k0, k1) = psal_lane(&products, subtract_acc, acc[lane], scd[lane], mmode);
@@ -843,7 +919,7 @@ pub fn sparse_vmac(
         let py: [u8; 32] = std::array::from_fn(|i| by[base + i]);
 
         let products = mpyh_hw_lane(
-            &px, &py, sgn_x, sgn_y, negate, mmode,
+            &px, &py, sgn_x, sgn_y, negate_lanes[lane], mmode,
         );
 
         let (k0, k1) = psah_lane(&products, subtract_acc, acc[8 + lane], scd[8 + lane], mmode);
@@ -868,6 +944,37 @@ mod tests {
     }
 
     #[test]
+    fn test_vec_control_negate_all_zero() {
+        // sub=0 -> all negate bits zero regardless of mmode
+        assert_eq!(vec_control_negate(0x10, 0x00), [0; 8]);
+        assert_eq!(vec_control_negate(0x01, 0x00), [0; 8]);
+        assert_eq!(vec_control_negate(0x40, 0x00), [0; 8]);
+    }
+
+    #[test]
+    fn test_vec_control_negate_all_ones() {
+        // sub=0xFF -> all negate bits set (MSC with sub0=true XOR 0xFF)
+        let r = vec_control_negate(0x10, 0xFF);
+        assert_eq!(r, [0xFFFF_FFFF; 8]);
+        let r = vec_control_negate(0x01, 0xFF);
+        assert_eq!(r, [0xFFFF_FFFF; 8]);
+        let r = vec_control_negate(0x40, 0xFF);
+        assert_eq!(r, [0xFFFF_FFFF; 8]);
+    }
+
+    #[test]
+    fn test_vec_control_negate_i16_partial() {
+        // mmode=0x10 (branch 3), sub=0x01 (only bit 0 set)
+        // Branch 3: bit b maps to sub[(b/16)*2 + b%2]
+        // sub bit 0 -> even bits of first 16 positions
+        let r = vec_control_negate(0x10, 0x01);
+        // bits 0,2,4,...14 = 1 (sub[0]), others 0
+        let expected_lo = 0x5555u32; // bits 0-15: alternating 1,0
+        assert_eq!(r[0], expected_lo); // even lanes
+        assert_eq!(r[1], 0);          // odd lanes (high 32 bits, sub[4..7]=0)
+    }
+
+    #[test]
     fn test_psa_create_shmode_mmode_0x10() {
         // mmode = 0x10 (bit 4, i16xi8 sparse)
         // Should select shifts[i] bits [11:6] for each lane
@@ -887,7 +994,8 @@ mod tests {
         if !std::path::Path::new(oracle_path).exists() { return; }
 
         // Uniform: all A = 0x01, all B = 0x01
-        let a_dense = [1u8; 64];
+        let mut a_dense = [0u8; 128];
+        for i in 0..64 { a_dense[i] = 1; }
         let b_sparse = [1u8; 64];
         // Uniform mask: 2 bits set per nibble
         let mask: u128 = 0x33333333_33333333_33333333_33333333;
@@ -897,11 +1005,7 @@ mod tests {
 
         let result = sparse_vmac(&a_dense, &b_sparse, mask, &acc, &scd, config, false, false, false);
 
-        let a_hex: String = {
-            let mut a128 = [0u8; 128];
-            a128[..64].copy_from_slice(&a_dense);
-            a128.iter().map(|b| format!("{:02x}", b)).collect()
-        };
+        let a_hex: String = a_dense.iter().map(|b| format!("{:02x}", b)).collect();
         let b_hex: String = b_sparse.iter().map(|b| format!("{:02x}", b)).collect();
         let mask_hex = format!("{:032x}", mask);
         let output = Command::new(oracle_path)
@@ -937,7 +1041,8 @@ mod tests {
 
         // Test vectors: sequential data for reproducibility.
         // A: 128 bytes (64 used, rest zero-padded)
-        let a_dense: [u8; 64] = std::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(3));
+        let mut a_dense = [0u8; 128];
+        for i in 0..64 { a_dense[i] = (i as u8).wrapping_mul(7).wrapping_add(3); }
         // B: 64 bytes compressed sparse data
         let b_sparse: [u8; 64] = std::array::from_fn(|i| (i as u8).wrapping_mul(13).wrapping_add(5));
         // Mask: each nibble has at most 2 bits set (valid sparse mask)
@@ -951,11 +1056,7 @@ mod tests {
         let result = sparse_vmac(&a_dense, &b_sparse, mask, &acc, &scd, config, false, false, false);
 
         // Run the oracle
-        let a_hex: String = {
-            let mut a128 = [0u8; 128];
-            a128[..64].copy_from_slice(&a_dense);
-            a128.iter().map(|b| format!("{:02x}", b)).collect()
-        };
+        let a_hex: String = a_dense.iter().map(|b| format!("{:02x}", b)).collect();
         let b_hex: String = b_sparse.iter().map(|b| format!("{:02x}", b)).collect();
         let mask_hex = format!("{:032x}", mask);
         let config_hex = format!("{:x}", config);
@@ -998,6 +1099,58 @@ mod tests {
         }
         if mismatches > 0 {
             panic!("{} of 16 lanes differ from oracle", mismatches);
+        }
+    }
+
+    /// Oracle comparison for i16xi16 sparse (config 0x3bb).
+    #[test]
+    #[ignore = "i16xi16 sparse routing WIP: prmx col reversal done, prmy/multiplier still diverge"]
+    fn test_sparse_vmac_i16xi16_vs_oracle() {
+        use std::process::Command;
+
+        let oracle_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tools/vmac-oracle/vmac_oracle");
+        if !std::path::Path::new(oracle_path).exists() {
+            eprintln!("Skipping: vmac_oracle not compiled");
+            return;
+        }
+
+        let mut a_dense = [0u8; 128];
+        for i in 0..128 { a_dense[i] = (i as u8).wrapping_mul(7).wrapping_add(3); }
+        let b_sparse: [u8; 64] = std::array::from_fn(|i| (i as u8).wrapping_mul(13).wrapping_add(5));
+        let mask: u128 = 0x33333333_33333333_33333333_33333333;
+        let config: u32 = 0x3bb; // i16xi16 sparse, signed, zero_acc
+        let acc = [0u64; 16];
+        let scd = [0u64; 16];
+
+        let result = sparse_vmac(&a_dense, &b_sparse, mask, &acc, &scd, config, false, false, false);
+
+        let a_hex: String = a_dense.iter().map(|b| format!("{:02x}", b)).collect();
+        let b_hex: String = b_sparse.iter().map(|b| format!("{:02x}", b)).collect();
+        let mask_hex = format!("{:032x}", mask);
+
+        let output = Command::new(oracle_path)
+            .args([&a_hex, &b_hex, &mask_hex, &format!("{:x}", config)])
+            .output().unwrap();
+        let oracle_stdout = String::from_utf8_lossy(&output.stdout);
+        let oracle_lanes: Vec<u64> = oracle_stdout.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| u64::from_str_radix(l.trim(), 16).unwrap())
+            .collect();
+
+        assert_eq!(oracle_lanes.len(), 16, "Oracle should produce 16 lanes");
+
+        let mut mismatches = 0;
+        for i in 0..16 {
+            if result[i] != oracle_lanes[i] {
+                eprintln!(
+                    "Lane {}: rust=0x{:016x} oracle=0x{:016x}",
+                    i, result[i], oracle_lanes[i]
+                );
+                mismatches += 1;
+            }
+        }
+        if mismatches > 0 {
+            panic!("{} of 16 lanes differ from oracle (i16xi16 sparse)", mismatches);
         }
     }
 }
