@@ -75,6 +75,7 @@
 //! let result = executor.execute(&bundle, &mut ctx, &mut tile);
 //! ```
 
+mod vector_dispatch;
 mod vector;
 mod vector_helpers;
 mod vector_arith;
@@ -97,7 +98,7 @@ mod cascade;
 mod cycle_accurate;
 mod semantic;
 
-pub use vector::VectorAlu;
+pub use vector_dispatch::VectorAlu;
 pub use memory::{MemoryUnit, NeighborMemory};
 pub use control::ControlUnit;
 pub use stream::{StreamOps, StreamResult};

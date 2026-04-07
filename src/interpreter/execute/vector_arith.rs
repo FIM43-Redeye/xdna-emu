@@ -6,7 +6,7 @@
 use crate::interpreter::bundle::ElementType;
 use crate::interpreter::state::ExecutionContext;
 
-use super::vector::VectorAlu;
+use super::vector_dispatch::VectorAlu;
 
 impl VectorAlu {
     pub(super) fn vector_addsub(

@@ -5,7 +5,7 @@
 
 use crate::interpreter::bundle::ElementType;
 
-use super::vector::VectorAlu;
+use super::vector_dispatch::VectorAlu;
 
 impl VectorAlu {
     /// Vector equality comparison (returns mask).

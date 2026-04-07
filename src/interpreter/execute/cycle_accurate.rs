@@ -39,7 +39,7 @@ use super::control::ControlUnit;
 use super::memory::{MemoryUnit, NeighborMemory};
 use super::semantic::execute_semantic;
 use super::stream::{StreamOps, StreamResult};
-use super::vector::VectorAlu;
+use super::vector_dispatch::VectorAlu;
 
 /// Cycle-accurate executor that models pipeline timing.
 ///

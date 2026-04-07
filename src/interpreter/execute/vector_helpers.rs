@@ -12,7 +12,7 @@ use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
 use crate::interpreter::state::{ExecutionContext, Vec512, Acc1024};
 use crate::tablegen::SemanticOp;
 
-use super::vector::VectorAlu;
+use super::vector_dispatch::VectorAlu;
 use super::vector_pack;
 
 impl VectorAlu {
