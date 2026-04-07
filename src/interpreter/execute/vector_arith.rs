@@ -2015,6 +2015,337 @@ mod tests {
         assert!((hi0 - 2.5).abs() < 0.1, "Expected ~2.5, got {}", hi0);
     }
 
+    // -----------------------------------------------------------------------
+    // Pure function tests (no dispatch, no ExecutionContext where possible)
+    // -----------------------------------------------------------------------
+
+    // -- vector_add: i8 --
+
+    #[test]
+    fn vector_add_i8_wrapping() {
+        let a = [0x01_FF_80_7F_u32, 0, 0, 0, 0, 0, 0, 0]; // bytes: 0x7F, 0x80, 0xFF, 0x01
+        let b = [0x01_01_01_01_u32, 0, 0, 0, 0, 0, 0, 0]; // all 1
+        let r = VectorAlu::vector_add(&a, &b, ElementType::Int8);
+        // 0x7F+1=0x80, 0x80+1=0x81, 0xFF+1=0x00(wrap), 0x01+1=0x02
+        assert_eq!(r[0], 0x02_00_81_80);
+    }
+
+    // -- vector_sub: i8, i16 --
+
+    #[test]
+    fn vector_sub_i8() {
+        let a = [0x00_80_FF_10_u32, 0, 0, 0, 0, 0, 0, 0];
+        let b = [0x01_01_01_01_u32, 0, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_sub(&a, &b, ElementType::Int8);
+        // 0x10-1=0x0F, 0xFF-1=0xFE, 0x80-1=0x7F, 0x00-1=0xFF(wrap)
+        assert_eq!(r[0], 0xFF_7F_FE_0F);
+    }
+
+    #[test]
+    fn vector_sub_i16() {
+        let a = [0x0000_8000_u32, 0, 0, 0, 0, 0, 0, 0]; // lo=0x8000(-32768), hi=0
+        let b = [0x0001_0001_u32, 0, 0, 0, 0, 0, 0, 0]; // lo=1, hi=1
+        let r = VectorAlu::vector_sub(&a, &b, ElementType::Int16);
+        // lo: 0x8000-1=0x7FFF, hi: 0-1=0xFFFF(wrap)
+        assert_eq!(r[0], 0xFFFF_7FFF);
+    }
+
+    // -- vector_mul: i16 --
+
+    #[test]
+    fn vector_mul_i16() {
+        let a = [0x0003_0002_u32, 0, 0, 0, 0, 0, 0, 0]; // lo=2, hi=3
+        let b = [0x0005_0004_u32, 0, 0, 0, 0, 0, 0, 0]; // lo=4, hi=5
+        let r = VectorAlu::vector_mul(&a, &b, ElementType::Int16);
+        // lo: 2*4=8, hi: 3*5=15
+        assert_eq!(r[0], 0x000F_0008);
+    }
+
+    // -- vector_min/max: signed i32, i16, i8 --
+
+    #[test]
+    fn vector_min_signed_i32() {
+        let a = [(-5i32) as u32, 10, 0, 0, 0, 0, 0, 0];
+        let b = [(-3i32) as u32, 5, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_min(&a, &b, ElementType::Int32);
+        assert_eq!(r[0] as i32, -5);
+        assert_eq!(r[1], 5);
+    }
+
+    #[test]
+    fn vector_max_signed_i32() {
+        let a = [(-5i32) as u32, 10, 0, 0, 0, 0, 0, 0];
+        let b = [(-3i32) as u32, 5, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_max(&a, &b, ElementType::Int32);
+        assert_eq!(r[0] as i32, -3);
+        assert_eq!(r[1], 10);
+    }
+
+    #[test]
+    fn vector_min_i8_signed() {
+        // bytes: 0x80(-128), 0x7F(127), 0xFF(-1), 0x01(1)
+        let a = [0x01_FF_7F_80_u32, 0, 0, 0, 0, 0, 0, 0];
+        let b = [0x02_FE_00_81_u32, 0, 0, 0, 0, 0, 0, 0]; // -127, 0, -2, 2
+        let r = VectorAlu::vector_min(&a, &b, ElementType::Int8);
+        // min(-128,-127)=-128, min(127,0)=0, min(-1,-2)=-2, min(1,2)=1
+        assert_eq!(r[0], 0x01_FE_00_80);
+    }
+
+    // -- vector_shift_left --
+
+    #[test]
+    fn shift_left_i32() {
+        let src = [1, 0, 0, 0, 0, 0, 0, 0];
+        let shift = [4, 0, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_shift_left(&src, &shift, ElementType::Int32);
+        assert_eq!(r[0], 16); // 1 << 4
+    }
+
+    #[test]
+    fn shift_left_i16() {
+        // lo=1, hi=1; shift lo by 2, hi by 4
+        let src = [0x0001_0001_u32, 0, 0, 0, 0, 0, 0, 0];
+        let shift = [0x0004_0002_u32, 0, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_shift_left(&src, &shift, ElementType::Int16);
+        // lo: 1<<2=4, hi: 1<<4=16
+        assert_eq!(r[0], 0x0010_0004);
+    }
+
+    #[test]
+    fn shift_left_i32_wraps_at_5_bits() {
+        // Shift amount masked to 5 bits: 32 & 0x1F = 0
+        let src = [0xFF, 0, 0, 0, 0, 0, 0, 0];
+        let shift = [32, 0, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_shift_left(&src, &shift, ElementType::Int32);
+        assert_eq!(r[0], 0xFF); // shift by 0 (32 & 0x1F)
+    }
+
+    // -- vector_shift_right_logical --
+
+    #[test]
+    fn shift_right_logical_i32() {
+        let src = [0x8000_0000, 0, 0, 0, 0, 0, 0, 0]; // MSB set
+        let shift = [1, 0, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_shift_right_logical(&src, &shift, ElementType::Int32);
+        assert_eq!(r[0], 0x4000_0000); // zero-filled from left
+    }
+
+    // -- vector_shift_right_arith --
+
+    #[test]
+    fn shift_right_arith_i32_sign_extends() {
+        let src = [0x8000_0000, 0, 0, 0, 0, 0, 0, 0]; // -2147483648
+        let shift = [1, 0, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_shift_right_arith(&src, &shift, ElementType::Int32);
+        assert_eq!(r[0], 0xC000_0000); // sign bit propagated
+    }
+
+    #[test]
+    fn shift_right_arith_i16_sign_extends() {
+        // lo=0x8000(-32768), hi=0x0001(1)
+        let src = [0x0001_8000_u32, 0, 0, 0, 0, 0, 0, 0];
+        let shift = [0x0001_0001_u32, 0, 0, 0, 0, 0, 0, 0]; // shift both by 1
+        let r = VectorAlu::vector_shift_right_arith(&src, &shift, ElementType::Int16);
+        // lo: -32768 >> 1 = -16384 = 0xC000, hi: 1 >> 1 = 0
+        assert_eq!(r[0], 0x0000_C000);
+    }
+
+    // -- vector_abs_gtz --
+
+    #[test]
+    fn abs_gtz_i32() {
+        let src = [(-5i32) as u32, 5, 0, i32::MIN as u32, 0, 0, 0, 0];
+        let r = VectorAlu::vector_abs_gtz(&src, ElementType::Int32);
+        assert_eq!(r[0], 5);
+        assert_eq!(r[1], 5);
+        assert_eq!(r[2], 0);
+        // wrapping_abs of i32::MIN = i32::MIN (wraps)
+        assert_eq!(r[3], i32::MIN as u32);
+    }
+
+    #[test]
+    fn abs_gtz_f32() {
+        let src = [(-3.0f32).to_bits(), 3.0f32.to_bits(), 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_abs_gtz(&src, ElementType::Float32);
+        assert_eq!(f32::from_bits(r[0]), 3.0);
+        assert_eq!(f32::from_bits(r[1]), 3.0);
+    }
+
+    #[test]
+    fn abs_gtz_unsigned_is_identity() {
+        let src = [42, 0, 0xFF, 0, 0, 0, 0, 0];
+        assert_eq!(VectorAlu::vector_abs_gtz(&src, ElementType::UInt32), src);
+    }
+
+    // -- vector_neg_gtz --
+
+    #[test]
+    fn neg_gtz_i32() {
+        let src = [5, (-5i32) as u32, 0, i32::MIN as u32, 0, 0, 0, 0];
+        let r = VectorAlu::vector_neg_gtz(&src, ElementType::Int32);
+        assert_eq!(r[0] as i32, -5);
+        assert_eq!(r[1] as i32, 5);
+        assert_eq!(r[2], 0);
+        // wrapping_neg of i32::MIN = i32::MIN
+        assert_eq!(r[3], i32::MIN as u32);
+    }
+
+    #[test]
+    fn neg_gtz_f32_flips_sign_bit() {
+        let src = [1.0f32.to_bits(), (-2.0f32).to_bits(), 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_neg_gtz(&src, ElementType::Float32);
+        assert_eq!(f32::from_bits(r[0]), -1.0);
+        assert_eq!(f32::from_bits(r[1]), 2.0);
+    }
+
+    // -- vector_neg_ltz (bitwise NOT) --
+
+    #[test]
+    fn neg_ltz_bitwise_not() {
+        let src = [0u32, 0xFFFF_FFFF, 0x5555_5555, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_neg_ltz(&src, ElementType::Int32);
+        assert_eq!(r[0], 0xFFFF_FFFF);
+        assert_eq!(r[1], 0);
+        assert_eq!(r[2], 0xAAAA_AAAA);
+    }
+
+    // -- vector_negate --
+
+    #[test]
+    fn negate_i16() {
+        // lo=1, hi=0xFFFF(-1)
+        let src = [0xFFFF_0001_u32, 0, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_negate(&src, ElementType::Int16);
+        // lo: -1 = 0xFFFF, hi: 1 = 0x0001
+        assert_eq!(r[0], 0x0001_FFFF);
+    }
+
+    #[test]
+    fn negate_bf16_flips_both_sign_bits() {
+        // bf16 negate = XOR with 0x8000_8000
+        let src = [0x3F80_3F80_u32, 0, 0, 0, 0, 0, 0, 0]; // two +1.0 bf16
+        let r = VectorAlu::vector_negate(&src, ElementType::BFloat16);
+        assert_eq!(r[0], 0xBF80_BF80); // both now negative
+    }
+
+    // -- vector_addsub --
+
+    #[test]
+    fn addsub_i32_mixed() {
+        let s1 = [10, 20, 0, 0, 0, 0, 0, 0];
+        let s2 = [3,  5, 0, 0, 0, 0, 0, 0];
+        // sel bit 0: lane 0 subtracts, lane 1 adds
+        let sel = [1, 0, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_addsub(&s1, &s2, &sel, ElementType::Int32);
+        assert_eq!(r[0], 7);  // 10 - 3
+        assert_eq!(r[1], 25); // 20 + 5
+    }
+
+    // -- vector_bneg_gtz (conditional negate) --
+
+    #[test]
+    fn bneg_gtz_i32_conditional() {
+        let cmp = [1, 0, (-1i32) as u32, 0, 0, 0, 0, 0]; // >0, =0, <0
+        let val = [10, 20, 30, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_bneg_gtz(&cmp, &val, ElementType::Int32);
+        assert_eq!(r[0] as i32, -10); // cmp > 0 -> negate
+        assert_eq!(r[1], 20);         // cmp == 0 -> no change
+        assert_eq!(r[2], 30);         // cmp < 0 -> no change
+    }
+
+    // -- vector_maxdiff_lt --
+
+    #[test]
+    fn maxdiff_lt_unsigned_saturates_at_zero() {
+        let a = [5, 3, 10, 0, 0, 0, 0, 0];
+        let b = [3, 5, 10, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_maxdiff_lt(&a, &b, ElementType::UInt32);
+        assert_eq!(r[0], 2);  // 5 - 3
+        assert_eq!(r[1], 0);  // 3 - 5 saturates to 0
+        assert_eq!(r[2], 0);  // 10 - 10
+    }
+
+    #[test]
+    fn maxdiff_lt_signed_clamps() {
+        let a = [(-10i32) as u32, 10, 0, 0, 0, 0, 0, 0];
+        let b = [5, (-5i32) as u32, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_maxdiff_lt(&a, &b, ElementType::Int32);
+        assert_eq!(r[0], 0);  // -10 - 5 < 0 -> clamp to 0
+        assert_eq!(r[1], 15); // 10 - (-5) = 15
+    }
+
+    // -- vector_neg_add --
+
+    #[test]
+    fn neg_add_i32() {
+        let a = [10, (-5i32) as u32, 0, 0, 0, 0, 0, 0];
+        let b = [3, 3, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_neg_add(&a, &b, ElementType::Int32);
+        assert_eq!(r[0] as i32, -7); // -10 + 3
+        assert_eq!(r[1] as i32, 8);  // 5 + 3
+    }
+
+    #[test]
+    fn neg_add_u32_is_sub_reversed() {
+        let a = [10, 3, 0, 0, 0, 0, 0, 0];
+        let b = [3, 10, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_neg_add(&a, &b, ElementType::UInt32);
+        assert_eq!(r[0], 3u32.wrapping_sub(10)); // b - a
+        assert_eq!(r[1], 7); // 10 - 3
+    }
+
+    // -- vector_sub_lt / vector_sub_ge (both alias to unconditional sub) --
+
+    #[test]
+    fn sub_lt_and_sub_ge_same_result() {
+        let a = [100, 50, 0, 0, 0, 0, 0, 0];
+        let b = [30, 60, 0, 0, 0, 0, 0, 0];
+        let r_lt = VectorAlu::vector_sub_lt(&a, &b, ElementType::Int32);
+        let r_ge = VectorAlu::vector_sub_ge(&a, &b, ElementType::Int32);
+        assert_eq!(r_lt, r_ge);
+        assert_eq!(r_lt[0], 70);
+        assert_eq!(r_lt[1] as i32, -10);
+    }
+
+    // -- vector_floor_bf16_to_s32 --
+
+    #[test]
+    fn floor_bf16_to_s32_positive() {
+        // bf16 1.5 = 0x3FC0 (f32 = 0x3FC00000)
+        // Pack into src: word 0 lo=0x3FC0, word 0 hi=0x4000 (2.0)
+        let src = [0x4000_3FC0_u32, 0, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_floor_bf16_to_s32(&src, 0);
+        // floor(1.5 * 2^0) = 1, floor(2.0 * 2^0) = 2
+        assert_eq!(r[0] as i32, 1);
+        assert_eq!(r[1] as i32, 2);
+    }
+
+    #[test]
+    fn floor_bf16_to_s32_with_shift() {
+        // bf16 1.0 = 0x3F80
+        let src = [0x0000_3F80_u32, 0, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_floor_bf16_to_s32(&src, 3);
+        // floor(1.0 * 2^3) = floor(8.0) = 8
+        assert_eq!(r[0] as i32, 8);
+    }
+
+    #[test]
+    fn floor_bf16_to_s32_negative() {
+        // bf16 -1.5 = 0xBFC0
+        let src = [0x0000_BFC0_u32, 0, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_floor_bf16_to_s32(&src, 0);
+        // floor(-1.5) = -2
+        assert_eq!(r[0] as i32, -2);
+    }
+
+    #[test]
+    fn floor_bf16_to_s32_nan_saturates_to_max() {
+        // bf16 NaN = 0x7FC0 (or any value with exp=0xFF, mantissa!=0)
+        let src = [0x0000_7FC0_u32, 0, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_floor_bf16_to_s32(&src, 0);
+        assert_eq!(r[0] as i32, i32::MAX);
+    }
+
     /// VADD_F: NaN + NaN should produce canonical NaN with mantissa = 1.
     ///
     /// Negative s16 values sign-extended to s32 produce f32 NaN bit patterns
