@@ -28,6 +28,9 @@ use crate::interpreter::state::EventType;
 /// live bridge output. Reports any mismatches, which indicate mlir-aie was
 /// updated after the last build. Returns Ok(()) if all checks pass, or an
 /// error if the bridge invocation fails (bridge unavailable is not an error).
+///
+/// Requires the `tooling` feature (needs the integration::bridge module).
+#[cfg(feature = "tooling")]
 pub fn validate_trace_events(
     bridge: &crate::integration::bridge::BridgePath,
 ) -> Result<Vec<String>, String> {
@@ -675,6 +678,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tooling")]
     fn test_validate_trace_events_passes() {
         // Validate compiled-in tables against live mlir-aie (if available).
         let bridge = crate::integration::bridge::BridgePath::discover();
