@@ -76,6 +76,7 @@
 //! ```
 
 mod vector;
+mod vector_helpers;
 mod vector_arith;
 mod vector_compare;
 mod vector_misc;
