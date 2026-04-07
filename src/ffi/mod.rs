@@ -1,18 +1,40 @@
 //! Foreign Function Interface for xdna-emu.
 //!
 //! This module provides C-callable functions for integrating xdna-emu
-//! with C/C++ applications (like the mock XRT library).
+//! with C/C++ applications (primarily the XRT emulation plugin at
+//! `xrt-plugin/`).
 //!
-//! # Safety
-//! All functions in this module use `unsafe` extern "C" ABI and must be
-//! called with valid pointers. Null pointer checks are performed where
-//! appropriate.
+//! # Safety Contract
 //!
-//! # Memory Management
-//! - Handles returned by `xdna_emu_*_create` functions must be freed
-//!   with the corresponding `xdna_emu_*_destroy` function.
+//! All functions use `unsafe extern "C"` ABI. The C caller must uphold:
+//!
+//! ## Handle Invariants
+//! - `XdnaEmuHandle` pointers returned by `xdna_emu_create` are opaque
+//!   and must not be dereferenced or modified by the caller.
+//! - A handle must be passed to exactly one `xdna_emu_destroy` call.
+//!   Using a handle after destroy is undefined behavior.
+//! - Handles are **not thread-safe**: concurrent calls on the same handle
+//!   are data races. The XRT plugin serializes via its own mutex.
+//!
+//! ## Pointer and Buffer Requirements
+//! - All `*const c_char` string parameters must be valid, NUL-terminated,
+//!   UTF-8 C strings. Invalid UTF-8 returns an error (not UB).
+//! - All `*const u8` / `*mut u8` buffer parameters must point to at
+//!   least `len` accessible bytes. Null is checked where documented.
 //! - Buffer data is copied during write/read operations; the caller
 //!   retains ownership of their pointers.
+//!
+//! ## Error Propagation
+//! - Errors are stored in a thread-local string (`LAST_ERROR`).
+//! - After any non-Success return, call `xdna_emu_get_error` on the
+//!   **same thread** to retrieve the message. The message is valid
+//!   until the next FFI call on that thread.
+//!
+//! ## Lifetime Requirements
+//! - Handles returned by `xdna_emu_create` live until `xdna_emu_destroy`.
+//! - String pointers from `xdna_emu_get_error` / `xdna_emu_get_device_name`
+//!   are borrowed from thread-local or handle state; they are invalidated
+//!   by the next FFI call on the same thread or by destroying the handle.
 
 use std::cell::RefCell;
 use std::ffi::{CStr, c_char};
@@ -78,6 +100,10 @@ static INIT_LOCK: Mutex<()> = Mutex::new(());
 /// # Safety
 /// Returns a non-null handle on success, null on failure.
 /// The returned handle must be freed with `xdna_emu_destroy`.
+///
+/// SAFETY: Box::into_raw transfers ownership to the caller. No raw
+/// pointer dereferences occur; the handle is constructed from safe Rust
+/// values and leaked via Box.
 #[no_mangle]
 pub unsafe extern "C" fn xdna_emu_create() -> *mut XdnaEmuHandle {
     let _lock = INIT_LOCK.lock().unwrap();
@@ -110,7 +136,11 @@ pub unsafe extern "C" fn xdna_emu_create() -> *mut XdnaEmuHandle {
 ///
 /// # Safety
 /// `handle` must be a valid pointer returned by `xdna_emu_create`,
-/// or null (in which case this is a no-op).
+/// or null (in which case this is a no-op). Double-free is UB.
+///
+/// SAFETY: Box::from_raw reclaims the allocation made by Box::into_raw
+/// in xdna_emu_create. The null check prevents UB from null pointers.
+/// The caller must not use the handle after this call.
 #[no_mangle]
 pub unsafe extern "C" fn xdna_emu_destroy(handle: *mut XdnaEmuHandle) {
     if !handle.is_null() {
@@ -330,6 +360,10 @@ pub unsafe extern "C" fn xdna_emu_alloc_host_region(
 /// # Safety
 /// - `handle` must be valid
 /// - `data` must point to at least `size` bytes
+///
+/// SAFETY: slice::from_raw_parts requires `data` to be valid for `size`
+/// bytes. The null+size check above prevents null dereference. The caller
+/// must ensure the buffer is accessible for the given length.
 #[no_mangle]
 pub unsafe extern "C" fn xdna_emu_write_host_memory(
     handle: *mut XdnaEmuHandle,
@@ -365,6 +399,9 @@ pub unsafe extern "C" fn xdna_emu_write_host_memory(
 /// # Safety
 /// - `handle` must be valid
 /// - `data` must point to a buffer of at least `size` bytes
+///
+/// SAFETY: slice::from_raw_parts_mut requires `data` to be valid for
+/// `size` bytes of writable memory. The null check prevents null deref.
 #[no_mangle]
 pub unsafe extern "C" fn xdna_emu_read_host_memory(
     handle: *mut XdnaEmuHandle,
@@ -829,7 +866,11 @@ pub unsafe extern "C" fn xdna_emu_write_register(
 ///
 /// # Safety
 /// - `handle` must be valid
-/// - `out` must point to at least `size` bytes
+/// - `out` must point to at least `size` writable bytes
+///
+/// SAFETY: slice::from_raw_parts_mut on `out` requires the caller to
+/// provide a valid, writable buffer of at least `size` bytes. Null is
+/// checked. Tile bounds are validated before any memory access.
 ///
 /// # Returns
 /// 0 on success, -1 if handle is invalid, -2 if tile is out of bounds,
