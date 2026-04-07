@@ -582,7 +582,11 @@ impl VectorAlu {
     /// AccumReg->VectorReg moves. Wide path also handles cm-register
     /// (1024-bit) moves.
     pub(super) fn execute_copy(op: &SlotOp, ctx: &mut ExecutionContext, _et: ElementType) -> bool {
-        if op.is_wide_vector {
+        // cm-register moves (VMOV cm_dst, cm_src) don't set is_wide_vector
+        // but have AccumReg operands and need the wide path.
+        let has_acc = op.sources.iter().any(|s| matches!(s, Operand::AccumReg(_)))
+            || matches!(&op.dest, Some(Operand::AccumReg(_)));
+        if op.is_wide_vector || has_acc {
             // Handle both vector-to-vector and accum-to-accum moves.
             let has_acc_source = op.sources.iter()
                 .any(|s| matches!(s, Operand::AccumReg(_)));
@@ -619,7 +623,9 @@ impl VectorAlu {
     ///
     /// Handles both vector and accumulator clearing (narrow and wide).
     pub(super) fn execute_vector_clear(op: &SlotOp, ctx: &mut ExecutionContext, _et: ElementType) -> bool {
-        if op.is_wide_vector {
+        // VCLR cm targets don't set is_wide_vector but need the wide path.
+        let has_acc_dest = matches!(&op.dest, Some(Operand::AccumReg(_)));
+        if op.is_wide_vector || has_acc_dest {
             // Handle both vector and accumulator clears.
             let has_acc_dest = matches!(&op.dest, Some(Operand::AccumReg(_)));
             if has_acc_dest {
