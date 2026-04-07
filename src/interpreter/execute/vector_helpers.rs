@@ -806,3 +806,578 @@ impl VectorAlu {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interpreter::bundle::{SlotIndex, SlotOp};
+    use smallvec::smallvec;
+
+    // ========== BFloat16 Conversion ==========
+
+    #[test]
+    fn test_bf16_to_f32_one() {
+        // BF16 representation of 1.0: 0x3F80 (upper 16 bits of f32 1.0)
+        assert_eq!(VectorAlu::bf16_to_f32(0x3F80), 1.0f32);
+    }
+
+    #[test]
+    fn test_bf16_to_f32_negative() {
+        // BF16 -1.0: 0xBF80
+        assert_eq!(VectorAlu::bf16_to_f32(0xBF80), -1.0f32);
+    }
+
+    #[test]
+    fn test_bf16_to_f32_zero() {
+        assert_eq!(VectorAlu::bf16_to_f32(0x0000), 0.0f32);
+    }
+
+    #[test]
+    fn test_bf16_to_f32_neg_zero() {
+        // Negative zero: sign bit set, rest zero
+        let val = VectorAlu::bf16_to_f32(0x8000);
+        assert!(val.is_sign_negative());
+        assert_eq!(val, -0.0f32);
+    }
+
+    #[test]
+    fn test_bf16_to_f32_infinity() {
+        // BF16 +inf: 0x7F80
+        assert!(VectorAlu::bf16_to_f32(0x7F80).is_infinite());
+        assert!(VectorAlu::bf16_to_f32(0x7F80).is_sign_positive());
+    }
+
+    #[test]
+    fn test_bf16_to_f32_nan() {
+        // BF16 NaN: 0x7FC0 (quiet NaN)
+        assert!(VectorAlu::bf16_to_f32(0x7FC0).is_nan());
+    }
+
+    #[test]
+    fn test_f32_to_bf16_truncation() {
+        // f32 1.0 = 0x3F80_0000 -> bf16 = 0x3F80
+        assert_eq!(VectorAlu::f32_to_bf16(1.0f32), 0x3F80);
+    }
+
+    #[test]
+    fn test_bf16_roundtrip() {
+        // Values that are exactly representable in bf16 should roundtrip
+        for bits in [0x3F80u16, 0x4000, 0xBF80, 0x0000, 0x7F80, 0x4120] {
+            let f = VectorAlu::bf16_to_f32(bits);
+            let back = VectorAlu::f32_to_bf16(f);
+            assert_eq!(back, bits, "roundtrip failed for 0x{:04X}", bits);
+        }
+    }
+
+    #[test]
+    fn test_f32_to_bf16_truncates_mantissa() {
+        // f32 with low mantissa bits that get truncated (NOT rounded)
+        // 1.0 + epsilon in low bits: 0x3F80_0001 -> still 0x3F80
+        let val = f32::from_bits(0x3F80_0001);
+        assert_eq!(VectorAlu::f32_to_bf16(val), 0x3F80);
+    }
+
+    // ========== Comparison Masks (32-bit elements) ==========
+
+    #[test]
+    fn test_condense_mask_32bit_all_set() {
+        let value = [0xFFFF_FFFF; 8];
+        assert_eq!(
+            VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int32)),
+            0xFF, // all 8 lanes set
+        );
+    }
+
+    #[test]
+    fn test_condense_mask_32bit_none_set() {
+        let value = [0u32; 8];
+        assert_eq!(
+            VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int32)),
+            0x00,
+        );
+    }
+
+    #[test]
+    fn test_condense_mask_32bit_alternating() {
+        // Lanes 0, 2, 4, 6 set
+        let mut value = [0u32; 8];
+        for i in (0..8).step_by(2) {
+            value[i] = 0xFFFF_FFFF;
+        }
+        assert_eq!(
+            VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int32)),
+            0b0101_0101,
+        );
+    }
+
+    #[test]
+    fn test_condense_mask_32bit_nonzero_means_set() {
+        // Any nonzero value in a lane should count as "set"
+        let value = [1, 0, 0x8000_0000, 0, 0, 0, 0, 42];
+        assert_eq!(
+            VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int32)),
+            0b1000_0101, // lanes 0, 2, 7
+        );
+    }
+
+    #[test]
+    fn test_condense_mask_32bit_none_element_type() {
+        // None element type should behave like 32-bit
+        let value = [0xFFFF_FFFF; 8];
+        assert_eq!(
+            VectorAlu::condense_comparison_mask(&value, None),
+            0xFF,
+        );
+    }
+
+    // ========== Comparison Masks (16-bit elements) ==========
+
+    #[test]
+    fn test_condense_mask_16bit_all_set() {
+        let value = [0xFFFF_FFFF; 8]; // all 16 lanes set
+        assert_eq!(
+            VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int16)),
+            0xFFFF,
+        );
+    }
+
+    #[test]
+    fn test_condense_mask_16bit_low_only() {
+        // Only low 16-bit halves set in each word
+        let value = [0x0000_FFFF; 8];
+        // Even-indexed lanes (0, 2, 4, ..., 14) should be set
+        assert_eq!(
+            VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int16)),
+            0b0101_0101_0101_0101,
+        );
+    }
+
+    #[test]
+    fn test_condense_mask_16bit_high_only() {
+        // Only high 16-bit halves set in each word
+        let value = [0xFFFF_0000; 8];
+        // Odd-indexed lanes (1, 3, 5, ..., 15) should be set
+        assert_eq!(
+            VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int16)),
+            0b1010_1010_1010_1010,
+        );
+    }
+
+    // ========== Comparison Masks (8-bit elements) ==========
+
+    #[test]
+    fn test_condense_mask_8bit_all_set() {
+        let value = [0xFFFF_FFFF; 8]; // all 32 lanes set
+        assert_eq!(
+            VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int8)),
+            0xFFFF_FFFF,
+        );
+    }
+
+    #[test]
+    fn test_condense_mask_8bit_first_byte_each_word() {
+        // Only byte 0 in each word is set
+        let value = [0x0000_00FF; 8];
+        // Lanes 0, 4, 8, 12, 16, 20, 24, 28
+        assert_eq!(
+            VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int8)),
+            0x1111_1111,
+        );
+    }
+
+    // ========== pack_comparison_flags ==========
+
+    #[test]
+    fn test_pack_flags_32bit_matches_condense() {
+        // pack_comparison_flags and condense_comparison_mask should agree
+        // for the same inputs when element type is specified
+        let value = [0xFFFF_FFFF, 0, 0xFFFF_FFFF, 0, 0, 0xFFFF_FFFF, 0, 0];
+        let condense = VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int32));
+        let pack = VectorAlu::pack_comparison_flags(&value, ElementType::Int32);
+        assert_eq!(condense, pack);
+    }
+
+    #[test]
+    fn test_pack_flags_16bit_matches_condense() {
+        let value = [0xFFFF_0000, 0x0000_FFFF, 0, 0xFFFF_FFFF, 0, 0, 0, 0];
+        let condense = VectorAlu::condense_comparison_mask(&value, Some(ElementType::Int16));
+        let pack = VectorAlu::pack_comparison_flags(&value, ElementType::Int16);
+        assert_eq!(condense, pack);
+    }
+
+    // ========== Wide Element Extract/Insert ==========
+
+    #[test]
+    fn test_extract_wide_element_32bit() {
+        let mut src = [0u32; 16];
+        src[0] = 0xDEAD_BEEF;
+        src[5] = 0xCAFE_BABE;
+        assert_eq!(
+            VectorAlu::extract_wide_element(&src, 0, ElementType::Int32),
+            0xDEAD_BEEF,
+        );
+        assert_eq!(
+            VectorAlu::extract_wide_element(&src, 5, ElementType::Int32),
+            0xCAFE_BABE,
+        );
+    }
+
+    #[test]
+    fn test_extract_wide_element_16bit() {
+        let mut src = [0u32; 16];
+        // Word 0 = 0x0002_0001 -> element 0 = 0x0001, element 1 = 0x0002
+        src[0] = 0x0002_0001;
+        assert_eq!(
+            VectorAlu::extract_wide_element(&src, 0, ElementType::UInt16),
+            0x0001,
+        );
+        assert_eq!(
+            VectorAlu::extract_wide_element(&src, 1, ElementType::UInt16),
+            0x0002,
+        );
+    }
+
+    #[test]
+    fn test_extract_wide_element_8bit_signed() {
+        let mut src = [0u32; 16];
+        // Word 0: bytes [0x01, 0xFF, 0x7F, 0x80]
+        src[0] = 0x807F_FF01;
+        // Element 0 = 0x01 (signed: 1)
+        assert_eq!(
+            VectorAlu::extract_wide_element(&src, 0, ElementType::Int8),
+            1,
+        );
+        // Element 1 = 0xFF (signed: -1, sign-extended to u64)
+        assert_eq!(
+            VectorAlu::extract_wide_element(&src, 1, ElementType::Int8) as u32,
+            0xFFFF_FFFF, // -1 sign extended
+        );
+    }
+
+    #[test]
+    fn test_extract_wide_element_64bit() {
+        let mut src = [0u32; 16];
+        // Element 0 at words [0, 1]: lo=0xAAAA, hi=0xBBBB
+        src[0] = 0xAAAA_AAAA;
+        src[1] = 0xBBBB_BBBB;
+        assert_eq!(
+            VectorAlu::extract_wide_element(&src, 0, ElementType::Int64),
+            0xBBBB_BBBB_AAAA_AAAA,
+        );
+    }
+
+    #[test]
+    fn test_insert_wide_element_32bit() {
+        let src = [0u32; 16];
+        let result = VectorAlu::insert_wide_element(&src, 3, 0x12345678, ElementType::Int32);
+        assert_eq!(result[3], 0x12345678);
+        // Other words untouched
+        assert_eq!(result[0], 0);
+        assert_eq!(result[4], 0);
+    }
+
+    #[test]
+    fn test_insert_wide_element_16bit() {
+        let src = [0u32; 16];
+        // Insert 0xABCD at element 1 (upper half of word 0)
+        let result = VectorAlu::insert_wide_element(&src, 1, 0xABCD, ElementType::UInt16);
+        assert_eq!(result[0], 0xABCD_0000);
+    }
+
+    #[test]
+    fn test_insert_extract_roundtrip_32bit() {
+        let src = [0u32; 16];
+        for idx in 0..16u32 {
+            let val = 0x1000_0000 + idx;
+            let inserted = VectorAlu::insert_wide_element(&src, idx, val, ElementType::Int32);
+            let extracted = VectorAlu::extract_wide_element(&inserted, idx, ElementType::Int32);
+            assert_eq!(extracted as u32, val, "roundtrip failed at index {}", idx);
+        }
+    }
+
+    #[test]
+    fn test_insert_extract_roundtrip_16bit() {
+        let src = [0u32; 16];
+        for idx in 0..32u32 {
+            let val = 0x1000 + idx;
+            let inserted = VectorAlu::insert_wide_element(&src, idx, val, ElementType::UInt16);
+            let extracted = VectorAlu::extract_wide_element(&inserted, idx, ElementType::UInt16);
+            assert_eq!(extracted as u32, val, "roundtrip failed at index {}", idx);
+        }
+    }
+
+    #[test]
+    fn test_insert_wide_element_64bit() {
+        let src = [0u32; 16];
+        let result = VectorAlu::insert_wide_element_64(&src, 2, 0xAAAA_1111, 0xBBBB_2222);
+        assert_eq!(result[4], 0xAAAA_1111);   // element 2 -> words [4, 5]
+        assert_eq!(result[5], 0xBBBB_2222);
+    }
+
+    // ========== Wide Vector Push ==========
+
+    #[test]
+    fn test_wide_push_lo_32bit() {
+        // Push value at low end, shift existing toward high
+        let mut src = [0u32; 16];
+        src[0] = 0xAAAA_AAAA; // element 0
+        let result = VectorAlu::wide_vector_push(&src, 0x42, false, ElementType::Int32);
+        // New value at word 0
+        assert_eq!(result[0], 0x42);
+        // Old element 0 shifted to word 1
+        assert_eq!(result[1], 0xAAAA_AAAA);
+    }
+
+    #[test]
+    fn test_wide_push_hi_32bit() {
+        // Push value at high end, shift existing toward low
+        let mut src = [0u32; 16];
+        src[15] = 0xBBBB_BBBB; // last word
+        let result = VectorAlu::wide_vector_push(&src, 0x99, true, ElementType::Int32);
+        // New value at last word
+        assert_eq!(result[15], 0x99);
+        // Old last word shifted to word 14
+        assert_eq!(result[14], 0xBBBB_BBBB);
+    }
+
+    #[test]
+    fn test_wide_push_lo_8bit() {
+        // 8-bit push: shifts by 1 byte, inserts 1 byte at position 0
+        let src = [0u32; 16];
+        let result = VectorAlu::wide_vector_push(&src, 0xAB, false, ElementType::Int8);
+        // Byte 0 of word 0 should be 0xAB
+        assert_eq!(result[0] & 0xFF, 0xAB);
+    }
+
+    // ========== Wide Dispatch Bridges ==========
+
+    #[test]
+    fn test_wide_element_wise_unary() {
+        // Simple identity function applied to both halves
+        fn negate(v: &[u32; 8], _et: ElementType) -> [u32; 8] {
+            let mut r = [0u32; 8];
+            for i in 0..8 { r[i] = !v[i]; }
+            r
+        }
+
+        let mut src = [0u32; 16];
+        src[0] = 0x0000_FFFF;
+        src[8] = 0xFFFF_0000;
+
+        let result = VectorAlu::wide_element_wise_unary(&src, ElementType::Int32, negate);
+        assert_eq!(result[0], 0xFFFF_0000);
+        assert_eq!(result[8], 0x0000_FFFF);
+    }
+
+    #[test]
+    fn test_wide_element_wise_binary() {
+        fn add_32(a: &[u32; 8], b: &[u32; 8], _et: ElementType) -> [u32; 8] {
+            let mut r = [0u32; 8];
+            for i in 0..8 { r[i] = a[i].wrapping_add(b[i]); }
+            r
+        }
+
+        let mut a = [0u32; 16];
+        let mut b = [0u32; 16];
+        a[0] = 10;
+        b[0] = 20;
+        a[8] = 100;
+        b[8] = 200;
+
+        let result = VectorAlu::wide_element_wise_binary(&a, &b, ElementType::Int32, add_32);
+        assert_eq!(result[0], 30);
+        assert_eq!(result[8], 300);
+    }
+
+    // ========== Wide Vector Shift (barrel shifter) ==========
+
+    #[test]
+    fn test_wide_shift_zero() {
+        // Shift by 0 with step 0 should return a (no b contribution)
+        let mut a = [0u32; 16];
+        a[0] = 0xDEAD_BEEF;
+        let b = [0u32; 16];
+        let result = VectorAlu::wide_vector_shift(&a, &b, 0, 0);
+        assert_eq!(result[0], 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn test_wide_shift_by_4_bytes() {
+        // Shift by 4 bytes = rotate c by 4 bytes (1 word)
+        let mut a = [0u32; 16];
+        for i in 0..16 { a[i] = i as u32; }
+        let b = [0u32; 16];
+        let result = VectorAlu::wide_vector_shift(&a, &b, 0, 4);
+        // After shifting a by 4 bytes: word[0] should contain what was word[1]
+        assert_eq!(result[0], 1);
+        assert_eq!(result[1], 2);
+    }
+
+    // ========== Operand Access (needs ExecutionContext) ==========
+
+    #[test]
+    fn test_read_vector_operand_vector_reg() {
+        let mut ctx = ExecutionContext::new();
+        let data = [1u32, 2, 3, 4, 5, 6, 7, 8];
+        ctx.vector.write(3, data);
+        let result = VectorAlu::read_vector_operand(&Operand::VectorReg(3), &ctx);
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_read_vector_operand_accum_truncation() {
+        let mut ctx = ExecutionContext::new();
+        // Write accumulator with values that have high bits
+        let acc = [0x1_DEAD_BEEFu64, 0x2_CAFE_BABEu64, 0, 0, 0, 0, 0, 0];
+        ctx.accumulator.write(0, acc);
+        let result = VectorAlu::read_vector_operand(&Operand::AccumReg(0), &ctx);
+        // Should truncate to low 32 bits
+        assert_eq!(result[0], 0xDEAD_BEEF);
+        assert_eq!(result[1], 0xCAFE_BABE);
+    }
+
+    #[test]
+    fn test_read_vector_operand_immediate_broadcast() {
+        let result = VectorAlu::read_vector_operand(
+            &Operand::Immediate(42),
+            &ExecutionContext::new(),
+        );
+        assert_eq!(result, [42u32; 8]);
+    }
+
+    #[test]
+    fn test_read_vector_operand_unexpected_returns_zeros() {
+        let result = VectorAlu::read_vector_operand(
+            &Operand::PointerReg(0),
+            &ExecutionContext::new(),
+        );
+        assert_eq!(result, [0u32; 8]);
+    }
+
+    // ========== Write Vector Dest ==========
+
+    #[test]
+    fn test_write_vector_dest_to_vector_reg() {
+        let mut ctx = ExecutionContext::new();
+        let data = [10u32, 20, 30, 40, 50, 60, 70, 80];
+        let mut op = SlotOp::nop(SlotIndex::Vector);
+        op.dest = Some(Operand::VectorReg(5));
+        VectorAlu::write_vector_dest(&op, &mut ctx, data);
+        assert_eq!(ctx.vector.read(5), data);
+    }
+
+    #[test]
+    fn test_write_vector_dest_to_accum_zero_extends() {
+        let mut ctx = ExecutionContext::new();
+        let data = [0xFFFF_FFFFu32, 0, 0, 0, 0, 0, 0, 0];
+        let mut op = SlotOp::nop(SlotIndex::Vector);
+        op.dest = Some(Operand::AccumReg(2));
+        VectorAlu::write_vector_dest(&op, &mut ctx, data);
+        let acc = ctx.accumulator.read(2);
+        // Zero-extended: 0xFFFF_FFFF -> 0x0000_0000_FFFF_FFFF
+        assert_eq!(acc[0], 0x0000_0000_FFFF_FFFF);
+    }
+
+    #[test]
+    fn test_write_vector_dest_to_scalar_condenses_mask() {
+        let mut ctx = ExecutionContext::new();
+        // 32-bit comparison: lanes 0 and 7 true
+        let data = [0xFFFF_FFFFu32, 0, 0, 0, 0, 0, 0, 0xFFFF_FFFF];
+        let mut op = SlotOp::nop(SlotIndex::Vector);
+        op.dest = Some(Operand::ScalarReg(16));
+        op.element_type = Some(ElementType::Int32);
+        VectorAlu::write_vector_dest(&op, &mut ctx, data);
+        assert_eq!(ctx.scalar.read(16), 0b1000_0001);
+    }
+
+    // ========== Config / Accumulator Helpers ==========
+
+    #[test]
+    fn test_get_config_register_finds_last_scalar() {
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(5, 0xCC00_FF19);
+        let mut op = SlotOp::nop(SlotIndex::Vector);
+        op.sources = smallvec![
+            Operand::VectorReg(0),
+            Operand::VectorReg(1),
+            Operand::ScalarReg(5),
+        ];
+        assert_eq!(VectorAlu::get_config_register(&op, &ctx), Some(0xCC00_FF19));
+    }
+
+    #[test]
+    fn test_get_config_register_no_scalar_returns_none() {
+        let ctx = ExecutionContext::new();
+        let mut op = SlotOp::nop(SlotIndex::Vector);
+        op.sources = smallvec![Operand::VectorReg(0)];
+        assert_eq!(VectorAlu::get_config_register(&op, &ctx), None);
+    }
+
+    #[test]
+    fn test_get_acc_dest() {
+        let mut op = SlotOp::nop(SlotIndex::Vector);
+        op.dest = Some(Operand::AccumReg(3));
+        assert_eq!(VectorAlu::get_acc_dest(&op), 3);
+    }
+
+    #[test]
+    fn test_get_acc_dest_wrong_type_defaults_to_zero() {
+        let mut op = SlotOp::nop(SlotIndex::Vector);
+        op.dest = Some(Operand::VectorReg(5));
+        assert_eq!(VectorAlu::get_acc_dest(&op), 0);
+    }
+
+    #[test]
+    fn test_get_shift_amount_immediate() {
+        let ctx = ExecutionContext::new();
+        let mut op = SlotOp::nop(SlotIndex::Vector);
+        op.sources = smallvec![Operand::Immediate(7)];
+        assert_eq!(VectorAlu::get_shift_amount(&op, &ctx), 7);
+    }
+
+    #[test]
+    fn test_get_shift_amount_register() {
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(3, 42);
+        let mut op = SlotOp::nop(SlotIndex::Vector);
+        op.sources = smallvec![Operand::ScalarReg(3)];
+        assert_eq!(VectorAlu::get_shift_amount(&op, &ctx), 42);
+    }
+
+    #[test]
+    fn test_get_shift_amount_no_source_defaults_zero() {
+        let ctx = ExecutionContext::new();
+        let mut op = SlotOp::nop(SlotIndex::Vector);
+        op.sources = smallvec![Operand::VectorReg(0)];
+        assert_eq!(VectorAlu::get_shift_amount(&op, &ctx), 0);
+    }
+
+    // ========== Scalar Source Helpers ==========
+
+    #[test]
+    fn test_get_nth_scalar_source() {
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(2, 100);
+        ctx.scalar.write(4, 200);
+        let mut op = SlotOp::nop(SlotIndex::Vector);
+        op.sources = smallvec![
+            Operand::VectorReg(0),
+            Operand::ScalarReg(2),
+            Operand::ScalarReg(4),
+        ];
+        assert_eq!(VectorAlu::get_nth_scalar_source(&op, &ctx, 0), 100);
+        assert_eq!(VectorAlu::get_nth_scalar_source(&op, &ctx, 1), 200);
+    }
+
+    #[test]
+    fn test_get_scalar_source_64_register_pair() {
+        let mut ctx = ExecutionContext::new();
+        ctx.scalar.write(6, 0xAAAA_1111);
+        ctx.scalar.write(7, 0xBBBB_2222);
+        let mut op = SlotOp::nop(SlotIndex::Vector);
+        op.sources = smallvec![Operand::ScalarReg(6)];
+        let val = VectorAlu::get_scalar_source_64(&op, &ctx);
+        assert_eq!(val as u32, 0xAAAA_1111);
+        assert_eq!((val >> 32) as u32, 0xBBBB_2222);
+    }
+}

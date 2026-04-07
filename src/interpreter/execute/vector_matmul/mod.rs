@@ -18,6 +18,17 @@
 //!
 //! Hardware reference: mulmac.py (read for understanding, original implementation).
 
+mod bf16_pipeline;
+mod helpers;
+
+// Re-export the bf16 pipeline for vmac_hw.
+pub(crate) use bf16_pipeline::bf16_mac_hw_lane;
+
+// Re-export legacy API used elsewhere.
+pub use helpers::{matmul_dense, matmul_sub};
+
+use helpers::*;
+
 use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
 use crate::interpreter::execute::vector_config::{AccWidth, MatMulConfig};
 use crate::interpreter::state::{ExecutionContext, Vec512, Acc1024};
@@ -490,92 +501,6 @@ fn get_sparse_operands(op: &SlotOp, ctx: &ExecutionContext) -> ([u8; 128], [u8; 
     (a_bytes, b_compressed, mask)
 }
 
-/// Decompress sparse B data using pair-routing.
-///
-/// The hardware treats the 512-bit x register as 32 byte-pairs. For each
-/// group of 4 mask bits, the pair `(compressed[2*g], compressed[2*g+1])` is
-/// routed to the set-bit positions within the group's 4-byte output span.
-///
-/// The output is **column-major**: groups traverse inner-dimension positions
-/// first, then columns. For i8xi8 sparse (inner=16, cols=8):
-///   - Groups 0-3 → column 0 (inner positions 0-15, 4 bytes each)
-///   - Groups 4-7 → column 1
-///   - Groups 28-31 → column 7
-///
-/// Within each group:
-///   - `compressed[2*g+1]` (lo) -> lowest set-bit position in the group
-///   - `compressed[2*g]`   (hi) -> highest set-bit position in the group
-///   - Clear-bit positions -> 0
-///
-/// Convert a Vec512 ([u32; 16], 64 bytes) to a byte array in little-endian order.
-fn vec512_to_bytes(v: &Vec512) -> [u8; 64] {
-    let mut bytes = [0u8; 64];
-    for (i, word) in v.iter().enumerate() {
-        let base = i * 4;
-        bytes[base] = *word as u8;
-        bytes[base + 1] = (*word >> 8) as u8;
-        bytes[base + 2] = (*word >> 16) as u8;
-        bytes[base + 3] = (*word >> 24) as u8;
-    }
-    bytes
-}
-
-/// Convert a quad vector ([u32; 32], 128 bytes) to a byte array.
-fn vec1024_to_bytes(v: &[u32; 32]) -> [u8; 128] {
-    let mut bytes = [0u8; 128];
-    for (i, word) in v.iter().enumerate() {
-        let base = i * 4;
-        bytes[base] = *word as u8;
-        bytes[base + 1] = (*word >> 8) as u8;
-        bytes[base + 2] = (*word >> 16) as u8;
-        bytes[base + 3] = (*word >> 24) as u8;
-    }
-    bytes
-}
-
-/// Extract an element from a 128-byte buffer.
-///
-/// For 4-bit elements, `byte_idx` is the element index (two elements per
-/// byte: element 0 = low nibble, element 1 = high nibble). For 8/16/32-bit
-/// elements, `byte_idx` is the byte offset.
-///
-/// Returns 0 for out-of-bounds accesses.
-fn extract_element_bytes(src: &[u8; 128], byte_idx: usize, bits: u32, signed: bool) -> i64 {
-    match bits {
-        4 => {
-            let byte_pos = byte_idx / 2;
-            let nibble = byte_idx % 2;
-            if byte_pos >= 128 { return 0; }
-            let raw = src[byte_pos];
-            let val = if nibble == 0 { raw & 0xF } else { (raw >> 4) & 0xF };
-            if signed && (val & 0x8) != 0 {
-                (val as i8 | !0x0Fi8) as i64
-            } else {
-                val as i64
-            }
-        }
-        8 => {
-            if byte_idx >= 128 { return 0; }
-            let val = src[byte_idx];
-            if signed { val as i8 as i64 } else { val as i64 }
-        }
-        16 => {
-            if byte_idx + 1 >= 128 { return 0; }
-            let val = u16::from_le_bytes([src[byte_idx], src[byte_idx + 1]]);
-            if signed { val as i16 as i64 } else { val as i64 }
-        }
-        32 => {
-            if byte_idx + 3 >= 128 { return 0; }
-            let val = u32::from_le_bytes([
-                src[byte_idx], src[byte_idx + 1],
-                src[byte_idx + 2], src[byte_idx + 3],
-            ]);
-            if signed { val as i32 as i64 } else { val as i64 }
-        }
-        _ => 0,
-    }
-}
-
 /// Sparse config-driven matrix multiply.
 ///
 /// `a` is a 128-byte buffer (1024 bits) containing the DENSE operand (xs1).
@@ -743,713 +668,6 @@ pub fn matmul_sparse_config_driven(
     }
 }
 
-/// Tile geometry for a matrix multiply mode.
-#[derive(Debug, Clone, Copy)]
-struct TileGeometry {
-    rows: usize,
-    inner: usize,
-    cols: usize,
-}
-
-/// Extract int8 elements from packed [u32; 8] (256 bits = 32 bytes = 32 int8 values).
-/// Elements are in little-endian byte order within each u32.
-fn extract_i8(packed: &[u32; 8], index: usize) -> i8 {
-    let word = index / 4;
-    let byte = index % 4;
-    ((packed[word] >> (byte * 8)) & 0xFF) as u8 as i8
-}
-
-/// Extract uint8 elements from packed [u32; 8].
-fn extract_u8(packed: &[u32; 8], index: usize) -> u8 {
-    let word = index / 4;
-    let byte = index % 4;
-    ((packed[word] >> (byte * 8)) & 0xFF) as u8
-}
-
-/// Extract int16 elements from packed [u32; 8] (256 bits = 16 int16 values).
-fn extract_i16(packed: &[u32; 8], index: usize) -> i16 {
-    let word = index / 2;
-    let half = index % 2;
-    ((packed[word] >> (half * 16)) & 0xFFFF) as u16 as i16
-}
-
-/// Extract uint16 elements from packed [u32; 8].
-fn extract_u16(packed: &[u32; 8], index: usize) -> u16 {
-    let word = index / 2;
-    let half = index % 2;
-    ((packed[word] >> (half * 16)) & 0xFFFF) as u16
-}
-
-/// Extract bf16 as f32 from packed [u32; 8] (256 bits = 16 bf16 values).
-fn extract_bf16_as_f32(packed: &[u32; 8], index: usize) -> f32 {
-    let word = index / 2;
-    let half = index % 2;
-    let bits = ((packed[word] >> (half * 16)) & 0xFFFF) as u16;
-    f32::from_bits((bits as u32) << 16)
-}
-
-/// Extract int32 elements from packed [u32; 8] (256 bits = 8 int32 values).
-fn extract_i32(packed: &[u32; 8], index: usize) -> i32 {
-    packed[index] as i32
-}
-
-/// Read a 32-bit accumulator lane from the [u64; 8] accumulator.
-///
-/// The 8 u64 lanes hold 16 int32 values (acc_cmb=1 mode, 32-bit accumulator).
-/// Lane layout: acc[0] holds output[0] in low 32 bits, output[1] in high 32 bits, etc.
-fn read_acc32(acc: &[u64; 8], index: usize) -> i64 {
-    let u64_lane = index / 2;
-    let half = index % 2;
-    let bits = ((acc[u64_lane] >> (half * 32)) & 0xFFFF_FFFF) as u32;
-    bits as i32 as i64
-}
-
-/// Write a 32-bit accumulator lane into the [u64; 8] accumulator.
-fn write_acc32(acc: &mut [u64; 8], index: usize, value: i64) {
-    let u64_lane = index / 2;
-    let half = index % 2;
-    let masked = (value as u32) as u64;
-    let shift = half * 32;
-    acc[u64_lane] = (acc[u64_lane] & !(0xFFFF_FFFF_u64 << shift)) | (masked << shift);
-}
-
-/// Read a 64-bit accumulator lane (acc_cmb=2 mode).
-fn read_acc64(acc: &[u64; 8], index: usize) -> i64 {
-    acc[index] as i64
-}
-
-/// Write a 64-bit accumulator lane (acc_cmb=2 mode).
-fn write_acc64(acc: &mut [u64; 8], index: usize, value: i64) {
-    acc[index] = value as u64;
-}
-
-/// Read a float32 accumulator lane from [u64; 8].
-///
-/// For bf16 matmul, the accumulator holds fp32 values. Since we have 16 output
-/// elements (4x4) and 8 u64 lanes, each u64 holds two fp32 values.
-fn read_acc_f32(acc: &[u64; 8], index: usize) -> f32 {
-    let u64_lane = index / 2;
-    let half = index % 2;
-    let bits = ((acc[u64_lane] >> (half * 32)) & 0xFFFF_FFFF) as u32;
-    f32::from_bits(bits)
-}
-
-/// Write a float32 accumulator lane.
-fn write_acc_f32(acc: &mut [u64; 8], index: usize, value: f32) {
-    let u64_lane = index / 2;
-    let half = index % 2;
-    let bits = value.to_bits() as u64;
-    let shift = half * 32;
-    acc[u64_lane] = (acc[u64_lane] & !(0xFFFF_FFFF_u64 << shift)) | (bits << shift);
-}
-
-/// Dense matrix multiply: acc += A * B (or acc = A * B if clear_acc is true).
-///
-/// Performs a tiled matrix multiply based on the element type. The input vectors
-/// are reinterpreted as 2D tiles and multiplied using the geometry appropriate
-/// for the element type combination.
-pub fn matmul_dense(
-    acc: &mut [u64; 8],
-    a: &[u32; 8],
-    b: &[u32; 8],
-    elem_type: ElementType,
-    signed_a: bool,
-    signed_b: bool,
-) {
-    match elem_type {
-        ElementType::Int8 => matmul_i8xi8(acc, a, b, true, true, false),
-        ElementType::UInt8 => matmul_i8xi8(acc, a, b, signed_a, signed_b, false),
-        ElementType::Int16 => matmul_i16xi16_32(acc, a, b, true, true, false),
-        ElementType::UInt16 => matmul_i16xi16_32(acc, a, b, signed_a, signed_b, false),
-        ElementType::BFloat16 => matmul_bf16xbf16(acc, a, b, false),
-        ElementType::Int32 => matmul_i32xi16(acc, a, b, true, true, false),
-        ElementType::UInt32 => matmul_i32xi16(acc, a, b, false, false, false),
-        ElementType::Int64 | ElementType::UInt64 => matmul_i32xi16(acc, a, b, signed_a, signed_b, false),
-        ElementType::Float32 => matmul_bf16xbf16(acc, a, b, false),
-    }
-}
-
-/// Matrix multiply-subtract: acc -= A * B.
-pub fn matmul_sub(
-    acc: &mut [u64; 8],
-    a: &[u32; 8],
-    b: &[u32; 8],
-    elem_type: ElementType,
-    signed_a: bool,
-    signed_b: bool,
-) {
-    match elem_type {
-        ElementType::Int8 => matmul_i8xi8(acc, a, b, true, true, true),
-        ElementType::UInt8 => matmul_i8xi8(acc, a, b, signed_a, signed_b, true),
-        ElementType::Int16 => matmul_i16xi16_32(acc, a, b, true, true, true),
-        ElementType::UInt16 => matmul_i16xi16_32(acc, a, b, signed_a, signed_b, true),
-        ElementType::BFloat16 => matmul_bf16xbf16(acc, a, b, true),
-        ElementType::Int32 => matmul_i32xi16(acc, a, b, true, true, true),
-        ElementType::UInt32 => matmul_i32xi16(acc, a, b, false, false, true),
-        ElementType::Int64 | ElementType::UInt64 => matmul_i32xi16(acc, a, b, signed_a, signed_b, true),
-        ElementType::Float32 => matmul_bf16xbf16(acc, a, b, true),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Hardware-accurate bf16 MAC (vmac pipeline model)
-// ---------------------------------------------------------------------------
-//
-// Reimplementation of the AIE2 hardware MAC pipeline for bfloat16 inputs.
-// The hardware uses a biased exponent system with global alignment, matching
-// the vmac pipeline from the architecture's multiplier-accumulator unit.
-//
-// Key hardware behavioral facts (derived from architecture reference):
-//   - Product exponents are biased: cexp = aexp + bexp + 1
-//   - Accumulator exponent is biased: qexp_biased = qexp + 128
-//   - All values (products + accumulator) align to a global maximum exponent
-//   - Products are signed, aligned at float_width=23 with RNE rounding
-//   - Accumulator is unsigned, aligned at float_width=23, then signed
-//   - Wide integer summation preserves all bits (no intermediate rounding)
-//   - Single final normalization: exps = cexpmax + fl - 23 - 128
-//
-// Pipeline stages:
-//   1. Split bf16 inputs, detect NaN/Inf, compute biased product exponents
-//   2. Integer multiply (8-bit mantissa * 8-bit mantissa = 16-bit product)
-//   3. Bias accumulator exponent (+128), find global cexpmax
-//   4. Align signed products to cexpmax at float_width=23 (bfshift, RNE)
-//   5. Align unsigned accumulator to cexpmax at float_width=23 (fpshift, RNE)
-//   6. Sum all aligned values exactly (wide integer arithmetic)
-//   7. Normalize to fp32 via fpcorr (exps = cexpmax + fl - 23 - 128)
-
-/// Shift-and-round with RNE (round-to-nearest-even).
-///
-/// Shifts `man` right so that the leading bit ends up at position `prec`.
-/// `lo_pos` is the current leading bit position.  Returns (rounded_value,
-/// exponent_increment_from_overflow).
-///
-/// Direct translation of `shift_round_rne` from bfloat16.py.
-fn shift_round_rne(man: i64, lo_pos: i32, prec: i32, norm_round_overflow: bool) -> (i64, bool) {
-    let sh_dn = lo_pos - prec - 1;
-
-    // Guard against shifts exceeding i64 width.
-    if sh_dn >= 63 {
-        // Shifted completely out -- rounds to zero.
-        return (0, false);
-    }
-
-    let rmask: i64 = if sh_dn > 0 && sh_dn < 63 { (1i64 << sh_dn) - 1 } else { 0 };
-
-    let r: i64 = if sh_dn < 0 {
-        let lsh = (-sh_dn) as u32;
-        if lsh >= 63 { return (0, false); } // Would overflow
-        man.wrapping_shl(lsh)
-    } else {
-        man >> sh_dn
-    };
-    let q = r.wrapping_add(2); // Pre-compute round-up value
-
-    let grd = (r & 1) != 0;
-    let lsb = (r & 2) != 0;
-    let stk = (man & rmask) != 0;
-
-    // RNE: round up when guard=1 AND (sticky=1 OR lsb=1)
-    let rup = grd && (stk || lsb);
-
-    let mut expincr = false;
-
-    let overflow_threshold = if (prec + 2) < 63 { 1i64 << (prec + 2) } else { i64::MAX };
-    if norm_round_overflow && rup && (q >= overflow_threshold) {
-        let val = q >> 2;
-        expincr = true;
-        return (val, expincr);
-    }
-
-    let val = if rup { q >> 1 } else { r >> 1 };
-    (val, expincr)
-}
-
-/// Find the position of the leading one bit (0-indexed from LSB).
-/// Returns -1 for input 0.
-fn flo(man: i64) -> i32 {
-    if man <= 0 { return -1; }
-    63 - man.leading_zeros() as i32
-}
-
-
-/// Hardware-accurate bf16 MAC for one output lane (vmac pipeline).
-///
-/// Takes the previous accumulator value `q` (fp32 bits), paired bf16
-/// input elements `a_elems` and `b_elems`, and whether to subtract.
-/// Returns the new fp32 accumulator value (as bits).
-///
-/// Implements the AIE2 vmac pipeline's biased exponent system with global
-/// alignment, matching the hardware multiplier-accumulator unit behavior.
-/// Execute one lane of the bf16 MAC pipeline.
-///
-/// Parameters:
-/// - `q`: primary accumulator (acc1) as fp32 bits
-/// - `a_elems`/`b_elems`: bf16 input pairs for this lane
-/// - `subtract`: negate products (MSC variants)
-/// - `acc2`: optional second accumulator for AddMac/SubMac (fp32 bits)
-/// - `sub_acc2`: if true, subtract acc2 instead of adding (SubMac)
-///
-/// Hardware pipeline (from aietools me_inline_primitives.h):
-/// 1. bfshiftcompute_hw: align products, acc1, AND acc2 to common cexpmax
-/// 2. psal_hw -> split_adder5_hw: products + acc1 + acc2 in 68-bit adder
-/// 3. bfnorm_hw: normalize the COMBINED result
-///
-/// This matches the hardware's single-pass merge, where acc2 participates
-/// in the same wide addition as products and acc1, BEFORE normalization.
-pub(crate) fn bf16_mac_hw_lane(
-    q: u32,
-    a_elems: &[u16],
-    b_elems: &[u16],
-    subtract: bool,
-    acc2: Option<u32>,
-    sub_acc2: bool,
-) -> u32 {
-    use super::vector_float::{bf16_split, fp32_split, fp32_make};
-
-    const FLOAT_WIDTH: i32 = 23; // Internal alignment precision
-
-    let n = a_elems.len();
-    debug_assert_eq!(n, b_elems.len());
-
-    // Phase 1: Split inputs, detect NaN/Inf, compute biased product exponents.
-    //
-    // Hardware biases product exponents by +1: cexp = aexp + bexp + 1.
-    // This accounts for the multiplier array's internal representation.
-    let mut nan_flag = false;
-    let mut inf_flag = false;
-    let mut inf_sgn = false;
-
-    struct Product {
-        signed_mantissa: i64,
-        biased_exp: i32,
-    }
-    let mut products = Vec::with_capacity(n);
-
-    for i in 0..n {
-        let (asgn, mut aexp, aman) = bf16_split(a_elems[i]);
-        let (bsgn, mut bexp, bman) = bf16_split(b_elems[i]);
-
-        let csgn = asgn != bsgn; // Product sign = XOR
-
-        // NaN/Inf detection (before denorm handling).
-        let ainf = aexp == 255 && aman == 0;
-        let binf = bexp == 255 && bman == 0;
-        let anan = aexp == 255 && aman != 0;
-        let bnan = bexp == 255 && bman != 0;
-        let cinf = ainf || binf;
-        let cnan = anan || bnan;
-        // Inf * zero = NaN (hardware behavior).
-        let cex0 = (aexp == 0 && aman == 0) || (bexp == 0 && bman == 0);
-
-        nan_flag = nan_flag || cnan
-            || (inf_flag && cinf && csgn != inf_sgn)
-            || (cinf && cex0);
-        inf_flag = (inf_flag || cinf) && !nan_flag;
-        if cinf && inf_sgn == false && !nan_flag {
-            inf_sgn = csgn;
-        }
-
-        // Track whether original exponent was zero BEFORE denorm handling.
-        // Hardware uses this to decide implicit leading 1 bit (cex0 flag).
-        let aex0 = aexp == 0;
-        let bex0 = bexp == 0;
-
-        // Denorm handling: bump exponent so product exponent math works,
-        // but mantissa does NOT get implicit 1 (tracked via aex0/bex0).
-        if aexp == 0 && aman != 0 { aexp = 1; }
-        if bexp == 0 && bman != 0 { bexp = 1; }
-
-        // Biased product exponent: hardware adds +1.
-        let cexp: i32 = if aexp == 0 || bexp == 0 {
-            0 // Zero input -> zero product
-        } else {
-            (aexp as i32) + (bexp as i32) + 1
-        };
-
-        // Unsigned product mantissa. Implicit leading 1 bit is added only
-        // when the ORIGINAL exponent was non-zero (hardware cex0 flag).
-        // Hardware includes mantissa for NaN/Inf (exp=255) -- the NaN/Inf
-        // detection is separate from the mantissa datapath.  The multiplier
-        // array always computes products; bfnorm applies NaN/Inf flags at
-        // the output.  (See bfshiftcompute_lane oaccman = concat(!exp0, man).)
-        let a_man: i64 = if !aex0 {
-            0x80 | aman as i64  // Normal, Inf, or NaN: add implicit 1
-        } else if aman != 0 {
-            aman as i64  // Denorm: raw mantissa, no implicit 1
-        } else {
-            0  // Zero
-        };
-        let b_man: i64 = if !bex0 {
-            0x80 | bman as i64
-        } else if bman != 0 {
-            bman as i64
-        } else {
-            0
-        };
-        let unsigned_product = a_man * b_man; // Up to 16 bits
-
-        // Sign applied to product BEFORE alignment (matches hardware sge/mpy stages).
-        let signed_product = if csgn != subtract {
-            -(unsigned_product)
-        } else {
-            unsigned_product
-        };
-
-        products.push(Product { signed_mantissa: signed_product, biased_exp: cexp });
-    }
-
-    // Phase 2: Accumulator (acc1) -- extract and bias exponent.
-    //
-    // Hardware biases accumulator exponent by +128: qexp_biased = qexp + 128.
-    // Zero accumulator keeps biased exponent = 0.
-    let (qsgn, qexp_raw, qman_raw) = fp32_split(q);
-    let qzero = qexp_raw == 0 && qman_raw == 0;
-    let qinf = qexp_raw == 255 && qman_raw == 0;
-    let qnan = qexp_raw == 255 && qman_raw != 0;
-
-    // Denorm handling for accumulator (same pattern as products).
-    let mut qexp = qexp_raw;
-    if qexp == 0 && qman_raw != 0 { qexp = 1; }
-
-    let qexp_biased: i32 = if !qzero { (qexp as i32) + 128 } else { 0 };
-
-    // Unsigned accumulator mantissa.  Hardware bfshiftcompute_lane uses
-    // oaccman = concat(!accexp0, accman) -- implicit leading 1 for ALL
-    // non-zero exponents (including NaN/Inf at exp=255), raw mantissa
-    // without implicit 1 for denorms, zero for true zeros.
-    let qman_unsigned: i64 = if qexp_raw > 0 {
-        (1i64 << 23) | (qman_raw as i64)  // Normal, NaN, or Inf
-    } else if qman_raw != 0 {
-        qman_raw as i64  // Denorm (no implicit 1)
-    } else {
-        0  // True zero
-    };
-
-    // NaN/Inf from acc1.
-    nan_flag = nan_flag || qnan || (inf_flag && qinf && qsgn != inf_sgn);
-    inf_flag = (inf_flag || qinf) && !nan_flag;
-    if qinf && !nan_flag { inf_sgn = inf_sgn || qsgn; }
-
-    // Phase 2b: Second accumulator (acc2) for AddMac/SubMac.
-    //
-    // Hardware (me_inline_primitives.h addmac_bf line 14976) passes acc2
-    // as the scd_ parameter into the MAC pipeline. It participates in the
-    // same bfshiftcompute_hw -> psal_hw -> bfnorm_hw flow as acc1.
-    // The acc2 merge happens in the 68-bit PSA adder BEFORE normalization.
-    let (d_sgn, d_exp_biased, d_man_unsigned) = if let Some(d) = acc2 {
-        let (dsgn, dexp_raw, dman_raw) = fp32_split(d);
-        let dzero = dexp_raw == 0 && dman_raw == 0;
-        let dinf = dexp_raw == 255 && dman_raw == 0;
-        let dnan = dexp_raw == 255 && dman_raw != 0;
-
-        let mut dexp = dexp_raw;
-        if dexp == 0 && dman_raw != 0 { dexp = 1; }
-
-        let dexp_biased: i32 = if !dzero { (dexp as i32) + 128 } else { 0 };
-        // Same mantissa logic as acc1: include for NaN/Inf/denorm.
-        let dman: i64 = if dexp_raw > 0 {
-            (1i64 << 23) | (dman_raw as i64)
-        } else if dman_raw != 0 {
-            dman_raw as i64  // Denorm
-        } else {
-            0
-        };
-
-        // NaN/Inf from acc2.
-        nan_flag = nan_flag || dnan || (inf_flag && dinf && (dsgn != sub_acc2) != inf_sgn);
-        inf_flag = (inf_flag || dinf) && !nan_flag;
-        if dinf && !nan_flag { inf_sgn = inf_sgn || (dsgn != sub_acc2); }
-
-        // Effective sign: XOR with sub_acc2 for SubMac.
-        let effective_sgn = dsgn != sub_acc2;
-        (effective_sgn, dexp_biased, dman)
-    } else {
-        (false, 0i32, 0i64)
-    };
-
-    // NaN/Inf handling.
-    //
-    // Hardware does NOT early-exit on NaN.  NaN/Inf mantissas participate
-    // in the PSA adder normally (with implicit leading 1).  The nan/inf
-    // flags propagate through to bfnorm_lane which applies them AFTER
-    // normalization:
-    //
-    //   out_zeros = !(pinf | minf | overflow | underflow)
-    //   rr = out_zeros ? normalized_mantissa : 0
-    //   rr[0] |= nan
-    //   exp = (nan|pinf|minf|overflow) ? 0xFF : normal_exp
-    //
-    // This means: when nan_flag is set but no overflow/underflow, the
-    // normalized PSA sum is PRESERVED in the NaN mantissa bits (with bit 0
-    // OR'd).  Only when overflow also occurs is the mantissa zeroed to
-    // produce canonical NaN (0x7F800001).
-    //
-    // Special case: when NaN comes ONLY from acc1 and all products are zero
-    // and no acc2, the hardware passes the accumulator through unchanged
-    // (MAC is a no-op).  Verified against real NPU1 hardware.
-    if nan_flag {
-        let all_products_zero = products.iter().all(|p| p.biased_exp == 0);
-        if qnan && !qinf && all_products_zero && acc2.is_none() {
-            return q;
-        }
-        // Fall through: NaN mantissa participates in PSA sum, bfnorm
-        // applies NaN logic after normalization (see Phase 7 below).
-    }
-    if inf_flag && !nan_flag {
-        return fp32_make(inf_sgn, 255, 0); // Infinity
-    }
-
-    // Phase 3: Global cexpmax across products, acc1, AND acc2.
-    let mut cexpmax: i32 = qexp_biased;
-    if d_exp_biased > cexpmax {
-        cexpmax = d_exp_biased;
-    }
-    for p in &products {
-        if p.biased_exp > cexpmax {
-            cexpmax = p.biased_exp;
-        }
-    }
-
-    if cexpmax == 0 {
-        return 0; // All inputs zero
-    }
-
-    // Phase 4: Align signed products to cexpmax at float_width=23 (bfshift).
-    //
-    // Hardware bfshift formula: vk = product << (float_width - 14)
-    // then shift_round_rne(vk, 23 + shift, float_width) where shift = cexpmax - cexp.
-    // The << 9 scales the 14-bit product to the 23-bit alignment field.
-    let mut product_sum: i64 = 0;
-    for p in &products {
-        if p.biased_exp == 0 {
-            continue; // Zero product
-        }
-        let s = cexpmax - p.biased_exp;
-        let vk = p.signed_mantissa << (FLOAT_WIDTH - 14); // << 9
-        let (aligned, _) = shift_round_rne(vk, 23 + s, FLOAT_WIDTH, false);
-        product_sum += aligned;
-    }
-
-    // Phase 5: Align acc1 to cexpmax at float_width=23 (fpshift).
-    //
-    // Hardware fpshift formula: vk = man << (float_width - 23)
-    // then shift_round_rne(vk, 23 + shift, float_width) where shift = cexpmax - qexp_biased.
-    // For fp32 mantissa, the << 0 is a no-op.
-    let aligned_acc: i64 = if qman_unsigned > 0 && qexp_biased > 0 {
-        let s_acc = cexpmax - qexp_biased;
-        let vk_acc = qman_unsigned; // << 0 (float_width - 23 = 0)
-        let (aligned, _) = shift_round_rne(vk_acc, 23 + s_acc, FLOAT_WIDTH, false);
-        // Apply accumulator sign (hardware cry_hw + cpr_hw 2's complement).
-        if qsgn { -aligned } else { aligned }
-    } else {
-        0
-    };
-
-    // Phase 5b: Align acc2 to cexpmax (same fpshift as acc1).
-    //
-    // Hardware psal_hw (line 12440) merges products + acc1 + acc2 via
-    // split_adder5_hw in a single 68-bit addition.
-    let aligned_acc2: i64 = if d_man_unsigned > 0 && d_exp_biased > 0 {
-        let s_d = cexpmax - d_exp_biased;
-        let vk_d = d_man_unsigned;
-        let (aligned, _) = shift_round_rne(vk_d, 23 + s_d, FLOAT_WIDTH, false);
-        if d_sgn { -aligned } else { aligned }
-    } else {
-        0
-    };
-
-    // Phase 6: Sum in 68-bit PSA adder (products + acc1 + acc2).
-    let total = product_sum + aligned_acc + aligned_acc2;
-
-    // Phase 7: fpcorr normalization to fp32.
-    //
-    // Hardware fpcorr formula: exps = cexpmax + fl - 23 - 128
-    // where fl = leading bit position of the unsigned magnitude.
-    let sgn = total < 0;
-    let man = total.unsigned_abs() as i64;
-
-    if man == 0 {
-        // Zero sum.  bfnorm_lane: real_zero=true, exp_zeros=false.
-        // If NaN flagged: exp=0xFF, mantissa=1 (out_zeros=true for zero
-        // but mantissa is 0, then bit 0 |= nan → 1).
-        if nan_flag {
-            return fp32_make(false, 255, 1);
-        }
-        return 0;
-    }
-
-    let fl = flo(man);
-
-    // Shift mantissa to 23-bit fp32 field with RNE rounding.
-    let (mans, fl_adj) = if fl <= 23 {
-        // Value fits in 23 bits -- left-shift to fill.
-        (man << (23 - fl), fl)
-    } else {
-        // Value exceeds 23 bits -- right-shift with RNE.
-        let shft = fl - 23 - 1;
-        let mut shifted = man >> shft;
-        let rmask = (1i64 << shft) - 1;
-        let grd = (shifted & 1) != 0;
-        let lsb = (shifted & 2) != 0;
-        let stk = (man & rmask) != 0;
-        let rup = grd && (stk || lsb);
-        let mut fl_out = fl;
-        if rup {
-            shifted += 2;
-            if shifted >= (1i64 << 25) {
-                shifted >>= 1;
-                fl_out += 1;
-            }
-        }
-        (shifted >> 1, fl_out)
-    };
-
-    let exps = cexpmax + fl_adj - 23 - 128;
-
-    // bfnorm_lane NaN logic (me_inline_primitives.h:13557-13569):
-    //   overflow  = (exps >= 255) && !real_zero
-    //   underflow = (exps <= 0)   && !real_zero
-    //   out_zeros = !(pinf | minf | overflow | underflow)
-    //   exp_ones  = nan | pinf | minf | overflow
-    //   rr = out_zeros ? normalized_mantissa : 0
-    //   rr[0] |= nan
-    //
-    // When nan_flag is set: exp is always 0xFF (from exp_ones).
-    // Mantissa depends on whether overflow/underflow also applies.
-    if nan_flag {
-        let overflow = exps >= 255;
-        let underflow = exps <= 0;
-        if overflow || underflow {
-            // out_zeros = false → mantissa zeroed, bit 0 = nan
-            return fp32_make(sgn, 255, 1);
-        }
-        // out_zeros = true → mantissa preserved, bit 0 |= nan
-        return fp32_make(sgn, 255, (mans as u32 & 0x7F_FFFF) | 1);
-    }
-
-    if exps <= 0 || fl == -1 {
-        return 0; // Underflow (FTZ)
-    }
-    if exps >= 255 {
-        return fp32_make(sgn, 255, 0); // Overflow → Inf
-    }
-
-    fp32_make(sgn, exps as u8, mans as u32 & 0x7F_FFFF)
-}
-
-// ---------------------------------------------------------------------------
-// Config-driven full-width matmul (512-bit inputs, 1024-bit accumulator)
-// ---------------------------------------------------------------------------
-
-/// Extract an element from a 512-bit vector (`Vec512` = `[u32; 16]`).
-///
-/// `byte_idx` is the byte offset within the full 64-byte vector.
-fn extract_element_512(src: &Vec512, byte_idx: usize, bits: u32, signed: bool) -> i64 {
-    match bits {
-        4 => {
-            // 4-bit elements: two per byte
-            let byte_pos = byte_idx / 2;
-            let nibble = byte_idx % 2;
-            let word = byte_pos / 4;
-            let byte_in_word = byte_pos % 4;
-            if word >= src.len() { return 0; }
-            let raw_byte = ((src[word] >> (byte_in_word * 8)) & 0xFF) as u8;
-            let val = if nibble == 0 { raw_byte & 0xF } else { (raw_byte >> 4) & 0xF };
-            if signed && (val & 0x8) != 0 {
-                // Sign-extend from 4 bits
-                (val as i8 | !0xFu8 as i8) as i64
-            } else {
-                val as i64
-            }
-        }
-        8 => {
-            let word = byte_idx / 4;
-            let byte_in_word = byte_idx % 4;
-            if word >= src.len() { return 0; }
-            let val = ((src[word] >> (byte_in_word * 8)) & 0xFF) as u8;
-            if signed { val as i8 as i64 } else { val as i64 }
-        }
-        16 => {
-            let elem_idx = byte_idx / 2;
-            let word = elem_idx / 2;
-            let half_in_word = elem_idx % 2;
-            if word >= src.len() { return 0; }
-            let val = ((src[word] >> (half_in_word * 16)) & 0xFFFF) as u16;
-            if signed { val as i16 as i64 } else { val as i64 }
-        }
-        32 => {
-            let word = byte_idx / 4;
-            if word >= src.len() { return 0; }
-            let val = src[word];
-            if signed { val as i32 as i64 } else { val as i64 }
-        }
-        _ => 0,
-    }
-}
-
-/// Read from a 1024-bit accumulator (`Acc1024` = `[u64; 16]`).
-fn read_acc_wide(acc: &Acc1024, index: usize, acc_width: AccWidth) -> i64 {
-    match acc_width {
-        AccWidth::Acc32 => {
-            // 32 x 32-bit lanes packed into 16 u64 words (two per word)
-            let u64_lane = index / 2;
-            let half = index % 2;
-            let bits = ((acc[u64_lane] >> (half * 32)) & 0xFFFF_FFFF) as u32;
-            bits as i32 as i64
-        }
-        AccWidth::Acc64 => {
-            // 16 x 64-bit lanes, one per u64 word
-            acc[index] as i64
-        }
-    }
-}
-
-/// Write to a 1024-bit accumulator (`Acc1024` = `[u64; 16]`).
-fn write_acc_wide(acc: &mut Acc1024, index: usize, value: i64, acc_width: AccWidth) {
-    match acc_width {
-        AccWidth::Acc32 => {
-            let u64_lane = index / 2;
-            let half = index % 2;
-            let masked = (value as u32) as u64;
-            let shift = half * 32;
-            acc[u64_lane] = (acc[u64_lane] & !(0xFFFF_FFFF_u64 << shift)) | (masked << shift);
-        }
-        AccWidth::Acc64 => {
-            acc[index] = value as u64;
-        }
-    }
-}
-
-/// Write an fp32 value to a wide accumulator.
-fn write_acc_wide_f32(acc: &mut Acc1024, index: usize, value: f32) {
-    // bf16 mode always uses acc_cmb=1 (32-bit lanes)
-    let u64_lane = index / 2;
-    let half = index % 2;
-    let bits = value.to_bits() as u64;
-    let shift = half * 32;
-    acc[u64_lane] = (acc[u64_lane] & !(0xFFFF_FFFF_u64 << shift)) | (bits << shift);
-}
-
-/// Read an fp32 value from a wide accumulator.
-fn read_acc_wide_f32(acc: &Acc1024, index: usize) -> f32 {
-    let u64_lane = index / 2;
-    let half = index % 2;
-    let bits = ((acc[u64_lane] >> (half * 32)) & 0xFFFF_FFFF) as u32;
-    f32::from_bits(bits)
-}
-
-/// Config-driven matrix multiply on full-width (512-bit) inputs.
-///
-/// Reads element data from the 512-bit A and B vectors, performs a tiled
-/// matrix multiply according to the geometry in `config`, and writes the
-/// result to the 1024-bit accumulator.
-///
-/// The input vectors are interpreted as flat arrays of elements in
-/// row-major order:
-/// - A[r][k] at byte offset `(r * inner + k) * (bits_x / 8)`
-/// - B[k][c] at byte offset `(k * cols + c) * (bits_y / 8)`
-///
-/// Output goes to accumulator lane `r * cols + c`.
 /// Config-driven full-width matrix multiply.
 ///
 /// `acc2_data` is an optional second accumulator for AddMac/SubMac bfloat
@@ -1576,40 +794,7 @@ pub fn matmul_config_driven(
 }
 
 // ---------------------------------------------------------------------------
-// int8 x int8 -> int32 accumulator
-//
-// Geometry: rows=4, inner=8, cols=8 => 32 output elements
-//
-// A is 4 rows x 8 cols of int8 = 32 bytes = 256 bits (one vector register)
-// B is 8 rows x 8 cols of int8 = 64 bytes = 512 bits (two vector registers,
-//   but the hardware only uses 256 bits from the second source, selecting
-//   via permutation. For the basic mode we use the full 256-bit B vector
-//   reshaped as 8x4.)
-//
-// Actually for the basic int8xi8 mode (mmode=1, perm_mode row 1):
-//   rows=4, inner=8, cols=8
-// But we only have 256 bits of B = 32 int8 values. With 8 rows and 8 cols
-// that would be 64 values, which exceeds our vector width.
-//
-// Looking more carefully at the hardware: the 256-bit vector holds 32 int8
-// elements. For 4x8 output, the inner dimension must be such that
-// 4 * inner * sizeof(int8) <= 256 bits AND inner * 8 * sizeof(int8) <= 256 bits.
-// So inner * 8 <= 32, meaning inner <= 4.
-//
-// The correct basic mode is actually rows=4, inner=4, cols=8 for 16xi8 input,
-// but for 8x8 input (mmode=1): rows=4, inner=8, cols=8.
-// In that case B needs 8*8 = 64 bytes which exceeds 256 bits.
-//
-// The resolution: the hardware permute unit rearranges the input data.
-// With 512-bit permute width, B can actually be drawn from the full permute
-// space. For the simpler emulation, we implement the most common sub-case:
-// rows=4, inner=8, cols=4 which fits in 256 bits for both A (4*8=32 bytes)
-// and B (8*4=32 bytes).
-//
-// For the full 4x8x8 mode, the hardware uses both X and Y permute inputs
-// which may come from different vector register halves or two registers.
-// We implement the 4x8x4 variant first as it matches one 256-bit register
-// per operand.
+// Legacy type-specific matmul functions
 // ---------------------------------------------------------------------------
 
 /// int8 x int8 matrix multiply with 32-bit accumulator.
@@ -1626,9 +811,6 @@ fn matmul_i8xi8(
     signed_b: bool,
     subtract: bool,
 ) {
-    // A is 4 rows x 8 cols of int8 = 32 elements (256 bits)
-    // B is 8 rows x 4 cols of int8 = 32 elements (256 bits)
-    // Output is 4 rows x 4 cols of int32 = 16 elements in acc
     let geom = TileGeometry { rows: 4, inner: 8, cols: 4 };
 
     for r in 0..geom.rows {
@@ -1667,14 +849,7 @@ fn matmul_i8xi8(
 
 /// int16 x int16 matrix multiply with 32-bit accumulator (acc_cmb=1).
 ///
-/// Geometry: A[4][2] * B[2][8] = C[4][8], 32 output int32 values.
-/// A: 16 int16 values from 256-bit vector. We use the first 8 (4 rows x 2 inner).
-/// B: 16 int16 values from 256-bit vector. We use all 16 (2 rows x 8 cols).
-/// Output: 32 int32 values packed into the accumulator.
-///
-/// Note: with acc_cmb=1 and 32-bit accumulator, we get 32 output lanes.
-/// With 8 u64 lanes that's 16 int32 values directly addressable, so we use
-/// the common sub-case: A[4][2] * B[2][4] = C[4][4] = 16 outputs.
+/// Geometry: A[4][2] * B[2][4] = C[4][4], 16 output int32 values.
 fn matmul_i16xi16_32(
     acc: &mut [u64; 8],
     a: &[u32; 8],
@@ -1683,9 +858,6 @@ fn matmul_i16xi16_32(
     signed_b: bool,
     subtract: bool,
 ) {
-    // A: 4 rows x 2 inner = 8 int16 elements (128 bits, first half of vector)
-    // B: 2 rows x 4 cols = 8 int16 elements (128 bits, first half of vector)
-    // Output: 4 rows x 4 cols = 16 int32 values
     let geom = TileGeometry { rows: 4, inner: 2, cols: 4 };
 
     for r in 0..geom.rows {
@@ -1724,23 +896,13 @@ fn matmul_i16xi16_32(
 
 /// bf16 x bf16 matrix multiply with fp32 accumulator.
 ///
-/// Geometry: A[4][8] * B[8][4] = C[4][4], 16 output fp32 values.
-/// A: 16 bf16 values from 256-bit vector, reinterpreted as 4 rows x 4 cols
-///    (limited by 256-bit width: 16 bf16 = 4x4).
-/// B: 16 bf16 values, reinterpreted as 4 rows x 4 cols.
-///
-/// The hardware actually uses rows=4, inner=8, cols=4 from constants.py,
-/// but with 256-bit inputs we only have 16 bf16 values per vector,
-/// so the practical single-register mode is 4x4x4.
+/// Geometry: A[4][4] * B[4][4] = C[4][4], 16 output fp32 values.
 fn matmul_bf16xbf16(
     acc: &mut [u64; 8],
     a: &[u32; 8],
     b: &[u32; 8],
     subtract: bool,
 ) {
-    // A: 4 rows x 4 inner = 16 bf16 elements (256 bits)
-    // B: 4 rows x 4 cols = 16 bf16 elements (256 bits)
-    // Output: 4 rows x 4 cols = 16 fp32 values
     let geom = TileGeometry { rows: 4, inner: 4, cols: 4 };
 
     for r in 0..geom.rows {
@@ -1769,12 +931,7 @@ fn matmul_bf16xbf16(
 
 /// int32 x int16 matrix multiply with 64-bit accumulator (acc_cmb=2).
 ///
-/// Geometry: A[4][2] * B[2][4] = C[4][4], producing 16 int64 outputs.
-/// But we only have 8 u64 lanes, so the practical mode is:
-/// A[2][2] * B[2][4] = C[2][4] = 8 int64 outputs.
-///
-/// Actually from constants.py: mmode=7 is 32x16 acc_cmb=2, perm_modes
-/// include rows=4, inner=2, cols=4.
+/// Geometry: A[4][2] * B[2][2] = C[4][2], 8 output int64 values.
 fn matmul_i32xi16(
     acc: &mut [u64; 8],
     a: &[u32; 8],
@@ -1783,12 +940,6 @@ fn matmul_i32xi16(
     signed_b: bool,
     subtract: bool,
 ) {
-    // A: 4 rows x 2 inner of int32 = 8 elements (256 bits)
-    // B: 2 rows x 4 cols of int16 = 8 elements (128 bits)
-    // Output: 4 rows x 2 cols = 8 int64 values
-    //
-    // With acc_cmb=2, each output is 64 bits, fitting in one u64 lane.
-    // 4*2 = 8 outputs = 8 u64 lanes.
     let geom = TileGeometry { rows: 4, inner: 2, cols: 2 };
 
     for r in 0..geom.rows {
@@ -1825,10 +976,10 @@ fn matmul_i32xi16(
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     /// Pack int8 values into [u32; 8] in little-endian order.
     fn pack_i8(values: &[i8]) -> [u32; 8] {
         let mut packed = [0u32; 8];
@@ -1873,22 +1024,10 @@ mod tests {
 
     #[test]
     fn test_i8xi8_identity_like() {
-        // A = 4x8 identity-like (first 4 cols are identity, rest zero)
-        // B = 8x4 with known values in first 4 rows
-        //
-        // A[r][k] = if k == r { 1 } else { 0 } for k < 4, rest 0
-        // B[k][c] = (k * 4 + c + 1) for k < 4, rest 0
-        //
-        // Result should be: C[r][c] = B[r][c] = r * 4 + c + 1
-
         let mut a_vals = [0i8; 32];
-        // Row 0: a_vals[0] = 1 (k=0)
         a_vals[0] = 1;
-        // Row 1: a_vals[8+1] = 1 (k=1)
         a_vals[8 + 1] = 1;
-        // Row 2: a_vals[16+2] = 1 (k=2)
         a_vals[16 + 2] = 1;
-        // Row 3: a_vals[24+3] = 1 (k=3)
         a_vals[24 + 3] = 1;
 
         let mut b_vals = [0i8; 32];
@@ -1904,7 +1043,6 @@ mod tests {
 
         matmul_i8xi8(&mut acc, &a, &b, true, true, false);
 
-        // Check C[r][c] = B[r][c] for the identity rows
         for r in 0..4 {
             for c in 0..4 {
                 let out_idx = r * 4 + c;
@@ -1921,10 +1059,6 @@ mod tests {
 
     #[test]
     fn test_i8xi8_all_ones() {
-        // A = 4x8, all 1s
-        // B = 8x4, all 1s
-        // C[r][c] = sum of 8 ones = 8
-
         let a_vals = [1i8; 32];
         let b_vals = [1i8; 32];
         let a = pack_i8(&a_vals);
@@ -1948,7 +1082,6 @@ mod tests {
 
     #[test]
     fn test_i8xi8_accumulate() {
-        // Verify accumulation: run matmul twice, values should double
         let a_vals = [1i8; 32];
         let b_vals = [1i8; 32];
         let a = pack_i8(&a_vals);
@@ -1973,20 +1106,17 @@ mod tests {
 
     #[test]
     fn test_i8xi8_subtract() {
-        // First accumulate, then subtract the same product
         let a_vals = [2i8; 32];
         let b_vals = [3i8; 32];
         let a = pack_i8(&a_vals);
         let b = pack_i8(&b_vals);
         let mut acc = [0u64; 8];
 
-        // acc += A * B => each output = 8 * (2 * 3) = 48
         matmul_i8xi8(&mut acc, &a, &b, true, true, false);
         for idx in 0..16 {
             assert_eq!(read_acc32(&acc, idx), 48);
         }
 
-        // acc -= A * B => each output = 48 - 48 = 0
         matmul_i8xi8(&mut acc, &a, &b, true, true, true);
         for idx in 0..16 {
             assert_eq!(read_acc32(&acc, idx), 0);
@@ -1995,18 +1125,11 @@ mod tests {
 
     #[test]
     fn test_i8xi8_signed_negative() {
-        // Test with negative values
         let mut a_vals = [0i8; 32];
         let mut b_vals = [0i8; 32];
 
-        // A[0][0] = -1, B[0][0] = -2
-        // C[0][0] = (-1) * (-2) = 2
         a_vals[0] = -1;
         b_vals[0] = -2;
-
-        // A[0][1] = 3, B[1][0] = -4
-        // C[0][0] += 3 * (-4) = -12
-        // Total C[0][0] = 2 + (-12) = -10
         a_vals[1] = 3;
         b_vals[4] = -4;
 
@@ -2020,11 +1143,9 @@ mod tests {
 
     #[test]
     fn test_i8xi8_unsigned() {
-        // Unsigned: 200 * 200 = 40000 (would be negative if signed)
         let mut a_vals = [0i8; 32];
         let mut b_vals = [0i8; 32];
 
-        // 200 as u8 = 0xC8, which as i8 = -56
         a_vals[0] = -56; // 200 as u8
         b_vals[0] = -56; // 200 as u8
 
@@ -2032,11 +1153,9 @@ mod tests {
         let b = pack_i8(&b_vals);
         let mut acc = [0u64; 8];
 
-        // Signed: (-56) * (-56) = 3136
         matmul_i8xi8(&mut acc, &a, &b, true, true, false);
         assert_eq!(read_acc32(&acc, 0), 3136);
 
-        // Unsigned: 200 * 200 = 40000
         let mut acc2 = [0u64; 8];
         matmul_i8xi8(&mut acc2, &a, &b, false, false, false);
         assert_eq!(read_acc32(&acc2, 0), 40000);
@@ -2048,24 +1167,15 @@ mod tests {
 
     #[test]
     fn test_i16xi16_identity() {
-        // A = 4x2, identity-like: A[r][k] = delta(r%2, k)
-        // B = 2x4 with sequential values
-        // For rows 0,1: result should pick from B rows 0,1
-        // For rows 2,3: same pattern wraps
-
         let mut a_vals = [0i16; 16];
-        // Row 0: A[0][0] = 1 (k=0)
         a_vals[0] = 1;
-        // Row 1: A[1][1] = 1 (k=1)
         a_vals[3] = 1;
 
         let mut b_vals = [0i16; 16];
-        // B[0][0..4] = {10, 20, 30, 40}
         b_vals[0] = 10;
         b_vals[1] = 20;
         b_vals[2] = 30;
         b_vals[3] = 40;
-        // B[1][0..4] = {50, 60, 70, 80}
         b_vals[4] = 50;
         b_vals[5] = 60;
         b_vals[6] = 70;
@@ -2077,13 +1187,10 @@ mod tests {
 
         matmul_i16xi16_32(&mut acc, &a, &b, true, true, false);
 
-        // C[0][c] = A[0][0]*B[0][c] + A[0][1]*B[1][c] = 1*B[0][c] + 0 = B[0][c]
         assert_eq!(read_acc32(&acc, 0), 10);
         assert_eq!(read_acc32(&acc, 1), 20);
         assert_eq!(read_acc32(&acc, 2), 30);
         assert_eq!(read_acc32(&acc, 3), 40);
-
-        // C[1][c] = A[1][0]*B[0][c] + A[1][1]*B[1][c] = 0 + 1*B[1][c] = B[1][c]
         assert_eq!(read_acc32(&acc, 4), 50);
         assert_eq!(read_acc32(&acc, 5), 60);
         assert_eq!(read_acc32(&acc, 6), 70);
@@ -2092,15 +1199,6 @@ mod tests {
 
     #[test]
     fn test_i16xi16_multiply() {
-        // A = [[1, 2], [3, 4], [5, 6], [7, 8]]  (4x2)
-        // B = [[1, 0, 0, 0], [0, 1, 0, 0]]       (2x4)
-        //
-        // C = A * B:
-        // C[0] = [1*1+2*0, 1*0+2*1, 1*0+2*0, 1*0+2*0] = [1, 2, 0, 0]
-        // C[1] = [3, 4, 0, 0]
-        // C[2] = [5, 6, 0, 0]
-        // C[3] = [7, 8, 0, 0]
-
         let a_vals: [i16; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0];
         let b_vals: [i16; 16] = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
@@ -2110,14 +1208,14 @@ mod tests {
 
         matmul_i16xi16_32(&mut acc, &a, &b, true, true, false);
 
-        assert_eq!(read_acc32(&acc, 0), 1);  // C[0][0]
-        assert_eq!(read_acc32(&acc, 1), 2);  // C[0][1]
-        assert_eq!(read_acc32(&acc, 4), 3);  // C[1][0]
-        assert_eq!(read_acc32(&acc, 5), 4);  // C[1][1]
-        assert_eq!(read_acc32(&acc, 8), 5);  // C[2][0]
-        assert_eq!(read_acc32(&acc, 9), 6);  // C[2][1]
-        assert_eq!(read_acc32(&acc, 12), 7); // C[3][0]
-        assert_eq!(read_acc32(&acc, 13), 8); // C[3][1]
+        assert_eq!(read_acc32(&acc, 0), 1);
+        assert_eq!(read_acc32(&acc, 1), 2);
+        assert_eq!(read_acc32(&acc, 4), 3);
+        assert_eq!(read_acc32(&acc, 5), 4);
+        assert_eq!(read_acc32(&acc, 8), 5);
+        assert_eq!(read_acc32(&acc, 9), 6);
+        assert_eq!(read_acc32(&acc, 12), 7);
+        assert_eq!(read_acc32(&acc, 13), 8);
     }
 
     #[test]
@@ -2129,11 +1227,9 @@ mod tests {
         let b = pack_i16(&b_vals);
         let mut acc = [0u64; 8];
 
-        // acc += A * B => C[0][0] = 10
         matmul_i16xi16_32(&mut acc, &a, &b, true, true, false);
         assert_eq!(read_acc32(&acc, 0), 10);
 
-        // acc -= A * B => C[0][0] = 10 - 10 = 0
         matmul_i16xi16_32(&mut acc, &a, &b, true, true, true);
         assert_eq!(read_acc32(&acc, 0), 0);
     }
@@ -2144,13 +1240,8 @@ mod tests {
 
     #[test]
     fn test_bf16_identity() {
-        // A = 4x4 identity matrix as bf16
-        // B = 4x4 with known values
-        // C = B (identity property)
-
         let mut a_bits = [0u16; 16];
         let one = f32_to_bf16_bits(1.0);
-        // Diagonal: A[0][0], A[1][1], A[2][2], A[3][3]
         a_bits[0 * 4 + 0] = one;
         a_bits[1 * 4 + 1] = one;
         a_bits[2 * 4 + 2] = one;
@@ -2183,8 +1274,6 @@ mod tests {
 
     #[test]
     fn test_bf16_all_ones() {
-        // A = 4x4 all ones, B = 4x4 all ones
-        // C[r][c] = sum of 4 ones = 4.0
         let one = f32_to_bf16_bits(1.0);
         let a_bits = [one; 16];
         let b_bits = [one; 16];
@@ -2215,9 +1304,7 @@ mod tests {
         let b = pack_bf16(&b_bits);
         let mut acc = [0u64; 8];
 
-        // First: acc = 4.0
         matmul_bf16xbf16(&mut acc, &a, &b, false);
-        // Second: acc = 8.0
         matmul_bf16xbf16(&mut acc, &a, &b, false);
 
         for idx in 0..16 {
@@ -2241,9 +1328,7 @@ mod tests {
         let b = pack_bf16(&b_bits);
         let mut acc = [0u64; 8];
 
-        // acc += 2*3*4 = 24 per lane
         matmul_bf16xbf16(&mut acc, &a, &b, false);
-        // acc -= 2*3*4 = 24 per lane => 0
         matmul_bf16xbf16(&mut acc, &a, &b, true);
 
         for idx in 0..16 {
@@ -2262,86 +1347,22 @@ mod tests {
 
     #[test]
     fn test_i32xi16_basic() {
-        // A = 4x2 of int32 = 8 values (256 bits)
-        // B = 2x2 of int16 = 4 values (64 bits)
-        // C = 4x2 of int64 = 8 values
-
         let mut a_packed = [0u32; 8];
-        // A[0][0] = 100, A[0][1] = 200
         a_packed[0] = 100;
         a_packed[1] = 200;
-        // A[1][0] = 300, A[1][1] = 400
         a_packed[2] = 300;
         a_packed[3] = 400;
 
-        // B = 2x2 identity matrix (row-major): B[0][0]=1, B[0][1]=0, B[1][0]=0, B[1][1]=1
         let b_vals: [i16; 16] = [1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let b = pack_i16(&b_vals);
 
         let mut acc = [0u64; 8];
         matmul_i32xi16(&mut acc, &a_packed, &b, true, true, false);
 
-        // C[0][0] = 100*1 + 200*0 = 100
-        // C[0][1] = 100*0 + 200*1 = 200
         assert_eq!(read_acc64(&acc, 0), 100);
         assert_eq!(read_acc64(&acc, 1), 200);
-
-        // C[1][0] = 300*1 + 400*0 = 300
-        // C[1][1] = 300*0 + 400*1 = 400
         assert_eq!(read_acc64(&acc, 2), 300);
         assert_eq!(read_acc64(&acc, 3), 400);
-    }
-
-    // -----------------------------------------------------------------------
-    // Element extraction tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_extract_i8() {
-        let packed = pack_i8(&[1, -2, 3, -4, 5, -6, 7, -8,
-                               0, 0, 0, 0, 0, 0, 0, 0,
-                               0, 0, 0, 0, 0, 0, 0, 0,
-                               0, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(extract_i8(&packed, 0), 1);
-        assert_eq!(extract_i8(&packed, 1), -2);
-        assert_eq!(extract_i8(&packed, 2), 3);
-        assert_eq!(extract_i8(&packed, 3), -4);
-        assert_eq!(extract_i8(&packed, 4), 5);
-        assert_eq!(extract_i8(&packed, 5), -6);
-    }
-
-    #[test]
-    fn test_extract_i16() {
-        let packed = pack_i16(&[100, -200, 300, -400, 0, 0, 0, 0,
-                                0, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(extract_i16(&packed, 0), 100);
-        assert_eq!(extract_i16(&packed, 1), -200);
-        assert_eq!(extract_i16(&packed, 2), 300);
-        assert_eq!(extract_i16(&packed, 3), -400);
-    }
-
-    #[test]
-    fn test_acc32_read_write_roundtrip() {
-        let mut acc = [0u64; 8];
-        write_acc32(&mut acc, 0, 42);
-        write_acc32(&mut acc, 1, -100);
-        write_acc32(&mut acc, 15, 999);
-
-        assert_eq!(read_acc32(&acc, 0), 42);
-        assert_eq!(read_acc32(&acc, 1), -100);
-        assert_eq!(read_acc32(&acc, 15), 999);
-    }
-
-    #[test]
-    fn test_acc_f32_read_write_roundtrip() {
-        let mut acc = [0u64; 8];
-        write_acc_f32(&mut acc, 0, 3.14);
-        write_acc_f32(&mut acc, 1, -2.71);
-        write_acc_f32(&mut acc, 15, 42.0);
-
-        assert!((read_acc_f32(&acc, 0) - 3.14).abs() < 0.001);
-        assert!((read_acc_f32(&acc, 1) - (-2.71)).abs() < 0.001);
-        assert!((read_acc_f32(&acc, 15) - 42.0).abs() < 0.001);
     }
 
     // -----------------------------------------------------------------------
@@ -2358,7 +1379,6 @@ mod tests {
 
         matmul_dense(&mut acc, &a, &b, ElementType::Int8, true, true);
 
-        // Each output = inner (8) dot products of 1*1 = 8
         for idx in 0..16 {
             assert_eq!(read_acc32(&acc, idx), 8);
         }
@@ -2371,13 +1391,11 @@ mod tests {
         let a = pack_i16(&a_vals);
         let b = pack_i16(&b_vals);
 
-        // Pre-load accumulator with 100 in lane 0
         let mut acc = [0u64; 8];
         write_acc32(&mut acc, 0, 100);
 
         matmul_sub(&mut acc, &a, &b, ElementType::Int16, true, true);
 
-        // C[0][0] = 100 - (1*5 + 0*0) = 95
         assert_eq!(read_acc32(&acc, 0), 95);
     }
 
@@ -2386,8 +1404,6 @@ mod tests {
         let two = f32_to_bf16_bits(2.0);
         let three = f32_to_bf16_bits(3.0);
 
-        // A = all 2.0, B = all 3.0
-        // Each output = 4 * (2.0 * 3.0) = 24.0
         let a = pack_bf16(&[two; 16]);
         let b = pack_bf16(&[three; 16]);
         let mut acc = [0u64; 8];
@@ -2404,43 +1420,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_bf16_mac_hw_lane_basic() {
-        // Test 1: 8 * (1.0 * 1.0) + 0 = 8.0
-        let a = [0x3F80u16; 8]; // bf16 1.0
-        let b = [0x3F80u16; 8];
-        let r = bf16_mac_hw_lane(0, &a, &b, false, None, false);
-        assert_eq!(r, 0x41000000, "8*1*1+0: expected 0x41000000, got 0x{:08X}", r);
-
-        // Test 2: 8 * (-2.0 * 3.0) + 0 = -48.0
-        let a2 = [0xC000u16; 8]; // bf16 -2.0
-        let b2 = [0x4040u16; 8]; // bf16 3.0
-        let r2 = bf16_mac_hw_lane(0, &a2, &b2, false, None, false);
-        assert_eq!(r2, 0xC2400000, "8*-2*3+0: expected 0xC2400000, got 0x{:08X}", r2);
-
-        // Test 3: tiny * tiny = underflow to 0
-        let a3 = [0x0080u16; 8]; // bf16 min normal
-        let b3 = [0x0080u16; 8];
-        let r3 = bf16_mac_hw_lane(0, &a3, &b3, false, None, false);
-        assert_eq!(r3, 0x00000000, "tiny*tiny: expected 0, got 0x{:08X}", r3);
-
-        // Test 4: zeros * ones = 0
-        let a4 = [0x0000u16; 8];
-        let b4 = [0x3F80u16; 8];
-        let r4 = bf16_mac_hw_lane(0, &a4, &b4, false, None, false);
-        assert_eq!(r4, 0x00000000, "zeros: expected 0, got 0x{:08X}", r4);
-
-        // Test 5: subtract mode: 0 - 8*1*1 = -8.0
-        let r5 = bf16_mac_hw_lane(0, &a, &b, true, None, false);
-        assert_eq!(r5, 0xC1000000, "0-8*1*1: expected 0xC1000000, got 0x{:08X}", r5);
-
-        // Test 6: random inputs (produces 0x7F mantissa pattern in Python model)
-        let a6: [u16; 8] = [0xebd7, 0xb13b, 0x4f6c, 0x8d21, 0x6080, 0x39c6, 0x107e, 0xd6a6];
-        let b6: [u16; 8] = [0x0802, 0x7b38, 0x6983, 0x2273, 0x33a8, 0x1130, 0xe493, 0x18ec];
-        let r6 = bf16_mac_hw_lane(0, &a6, &b6, false, None, false);
-        assert_eq!(r6, 0x797187FF, "random: expected 0x797187FF, got 0x{:08X}", r6);
-    }
-
     // -----------------------------------------------------------------------
     // execute_matmul entry point tests
     // -----------------------------------------------------------------------
@@ -2449,9 +1428,6 @@ mod tests {
     use crate::interpreter::state::ExecutionContext;
 
     /// Build a minimal SlotOp for a MAC-family instruction.
-    ///
-    /// Sources: [VectorReg(a_reg), VectorReg(b_reg), ScalarReg(conf_reg)]
-    /// Dest: AccumReg(acc_reg)
     fn make_mac_op(
         semantic: SemanticOp,
         a_vreg: u8,
@@ -2473,79 +1449,53 @@ mod tests {
 
     /// Pack [u32; 16] (Vec512) of all-ones bytes (int8 = 1 in every byte).
     fn vec512_all_ones_i8() -> Vec512 {
-        // 0x01010101 repeated 16 times = 64 bytes of 0x01
         [0x01010101u32; 16]
     }
 
     /// Pack Vec512 of all bf16(1.0) values.
     fn vec512_all_ones_bf16() -> Vec512 {
-        // bf16(1.0) = 0x3F80; two per u32 = 0x3F80_3F80
         let word = 0x3F80_3F80u32;
         [word; 16]
     }
 
     /// Build a config word for int8xi8 mode.
-    ///
-    /// Config word layout:
-    ///   bit 0:    zero_acc
-    ///   bits 1-2: amode (0 = acc_cmb=1, 32-bit)
-    ///   bits 3-4: bmode (1 = int8 B)
-    ///   bits 5-7: variant (0)
-    ///   bit 8:    sgn_y (1 = signed)
-    ///   bit 9:    sgn_x (1 = signed)
-    ///
-    /// i8xi8 signed accumulate: amode=0, bmode=1, sgn_x=1, sgn_y=1
-    /// = (1<<3) | (1<<8) | (1<<9) = 0x308
     fn config_i8xi8_accumulate() -> u32 {
-        (1 << 3) | (1 << 8) | (1 << 9) // amode=0, bmode=1, signed
+        (1 << 3) | (1 << 8) | (1 << 9)
     }
 
     /// Build a config word for bf16 mode.
-    /// bf16 uses the bf16 lookup path (variant=0), sign bits irrelevant.
     fn config_bf16_accumulate() -> u32 {
-        0x00 // zero_acc=0, variant=0
+        0x00
     }
 
-    /// Build a config word for int8xi8 with zero_acc=1 (clear before multiply).
+    /// Build a config word for int8xi8 with zero_acc=1.
     fn config_i8xi8_zero_acc() -> u32 {
-        (1 << 3) | (1 << 8) | (1 << 9) | 1 // same as accumulate but bit 0 set
+        (1 << 3) | (1 << 8) | (1 << 9) | 1
     }
 
     #[test]
     fn test_execute_matmul_i8xi8_ones() {
-        // All-ones int8 inputs through the full entry point.
-        // Config-driven: 4x8x8 (int8xi8, pmode=0) -> 32 output elements.
-        // Each output = sum(k=0..7) { 1 * 1 } = 8.
         let mut ctx = ExecutionContext::new();
 
-        // Zero accumulator cm0 before accumulate (no zero_acc in config).
         ctx.accumulator.write_wide(0, [0u64; 16]);
 
-        // Write all-ones to vector regs x0 (v0+v1) and x2 (v2+v3).
         let ones = vec512_all_ones_i8();
         ctx.vector.write_wide(0, ones);
         ctx.vector.write_wide(2, ones);
 
-        // Write config to scalar r5.
         ctx.scalar.write(5, config_i8xi8_accumulate());
 
         let op = make_mac_op(
             SemanticOp::Mac,
-            0, // x0
-            2, // x2
-            5, // config in r5
-            0, // cm0
+            0, 2, 5, 0,
             None,
         );
 
         let handled = execute_matmul(&op, &mut ctx);
         assert!(handled, "execute_matmul should handle Mac semantic");
 
-        // Read back accumulator cm0.
         let acc = ctx.accumulator.read_wide(0);
 
-        // For 4x8x8 int8, there are 32 output elements (Acc32, two per u64).
-        // Each = 8.
         for i in 0..32 {
             let lane = i / 2;
             let half = i % 2;
@@ -2560,11 +1510,8 @@ mod tests {
 
     #[test]
     fn test_execute_matmul_bf16_ones() {
-        // All bf16(1.0) inputs. Config-driven: 4x8x4 bf16 -> 16 outputs.
-        // Each output = sum(k=0..7) { 1.0 * 1.0 } = 8.0.
         let mut ctx = ExecutionContext::new();
 
-        // Zero accumulator cm0 before accumulate (no zero_acc in config).
         ctx.accumulator.write_wide(0, [0u64; 16]);
 
         let ones = vec512_all_ones_bf16();
@@ -2574,10 +1521,7 @@ mod tests {
 
         let mut op = make_mac_op(
             SemanticOp::Mac,
-            0,
-            2,
-            5,
-            0,
+            0, 2, 5, 0,
             Some("VMAC_F_vmac_bm_core_dense"),
         );
         op.element_type = Some(ElementType::BFloat16);
@@ -2586,7 +1530,6 @@ mod tests {
         assert!(handled);
 
         let acc = ctx.accumulator.read_wide(0);
-        // bf16 mode: 16 fp32 outputs, two per u64 lane.
         for i in 0..16 {
             let lane = i / 2;
             let half = i % 2;
@@ -2602,11 +1545,8 @@ mod tests {
 
     #[test]
     fn test_execute_matmul_negate() {
-        // NegMul semantic: output = -(A * B).
-        // All-ones int8 -> each product sum = 8, negated = -8.
         let mut ctx = ExecutionContext::new();
 
-        // Zero accumulator cm0 before accumulate (no zero_acc in config).
         ctx.accumulator.write_wide(0, [0u64; 16]);
 
         let ones = vec512_all_ones_i8();
@@ -2616,10 +1556,7 @@ mod tests {
 
         let op = make_mac_op(
             SemanticOp::NegMul,
-            0,
-            2,
-            5,
-            0,
+            0, 2, 5, 0,
             None,
         );
 
@@ -2641,10 +1578,8 @@ mod tests {
 
     #[test]
     fn test_execute_matmul_zero_acc() {
-        // Verify zero_acc=1 clears the accumulator before multiply.
         let mut ctx = ExecutionContext::new();
 
-        // Pre-fill accumulator with garbage.
         let mut preload = [0u64; 16];
         for i in 0..16 {
             preload[i] = 0xDEAD_BEEF_CAFE_BABEu64;
@@ -2658,10 +1593,7 @@ mod tests {
 
         let op = make_mac_op(
             SemanticOp::Mac,
-            0,
-            2,
-            5,
-            0,
+            0, 2, 5, 0,
             None,
         );
 
@@ -2669,7 +1601,6 @@ mod tests {
         assert!(handled);
 
         let acc = ctx.accumulator.read_wide(0);
-        // With zero_acc, accumulator is cleared first, so result = 0 + products = 8.
         for i in 0..32 {
             let lane = i / 2;
             let half = i % 2;
@@ -2684,7 +1615,6 @@ mod tests {
 
     #[test]
     fn test_execute_matmul_returns_false_for_non_mac() {
-        // Verify non-MAC semantics return false.
         let mut ctx = ExecutionContext::new();
         let op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Add);
         assert!(!execute_matmul(&op, &mut ctx));
@@ -2696,14 +1626,12 @@ mod tests {
 
     #[test]
     fn test_sparse_config_driven_all_zero_b_produces_zero() {
-        // Sparse matmul with all-zero B register -> product = 0.
         let mut a = [0u8; 128];
-        for b in a.iter_mut() { *b = 1; } // all-ones A
-        let b = [0u8; 64]; // all-zero B register
-        let mask: u128 = 0x33333333_33333333_33333333_33333333; // all groups: bits 0,1 set
+        for b in a.iter_mut() { *b = 1; }
+        let b = [0u8; 64];
+        let mask: u128 = 0x33333333_33333333_33333333_33333333;
         let mut acc = [0u64; 16];
 
-        // i8xi8 sparse config: amode=0, bmode=1, variant=5 -> 4x16x8
         let config = MatMulConfig::from_config_word(
             (1 << 3) | (5 << 5) | (1 << 8) | (1 << 9) | 1,
             false,
@@ -2723,13 +1651,9 @@ mod tests {
 
     #[test]
     fn test_sparse_config_driven_all_ones() {
-        // Sparse matmul with all-ones A and B, mask selects positions 0,1.
-        // rows=4, inner=16 (sparse), cols=8
-        // inner_groups=4, each with 2 active positions -> 8 dense inner
-        // Each output = sum over 8 dense k: { 1 * 1 } = 8.
         let a = [1u8; 128];
-        let b = [1u8; 64]; // all-ones B register
-        let mask: u128 = 0x33333333_33333333_33333333_33333333; // bits 0,1 in each group
+        let b = [1u8; 64];
+        let mask: u128 = 0x33333333_33333333_33333333_33333333;
         let mut acc = [0u64; 16];
 
         let config = MatMulConfig::from_config_word(
@@ -2739,7 +1663,6 @@ mod tests {
 
         matmul_sparse_config_driven(&mut acc, &a, &b, mask, &config);
 
-        // 4 inner_groups, each contributing 2 multiplies of 1*1 = 8 total per output.
         for i in 0..32 {
             let lane = i / 2;
             let half = i % 2;
@@ -2750,40 +1673,30 @@ mod tests {
 
     #[test]
     fn test_execute_matmul_sparse_via_encoding_name() {
-        // Test the full execute_matmul path with a sparse encoding name.
-        // The encoding name containing "sparse" triggers the sparse path.
         let mut ctx = ExecutionContext::new();
 
-        // Set up A in vector reg x4 (VectorReg 8,9), B in x0 (VectorReg 0,1).
         let ones = vec512_all_ones_i8();
-        ctx.vector.write_wide(8, ones); // A in y2's x4 component
-        ctx.vector.write_wide(0, ones); // B in x0
+        ctx.vector.write_wide(8, ones);
+        ctx.vector.write_wide(0, ones);
 
-        // Explicitly zero mask q0 and accumulator cm0.
-        // Zero mask means all B elements are masked out -> product = 0.
         ctx.mask.write_u32_low(0, 0);
         ctx.accumulator.write_wide(0, [0u64; 16]);
 
-        // Config: i8xi8 sparse, zero_acc=1
         let conf = (1 << 3) | (5 << 5) | (1 << 8) | (1 << 9) | 1;
         ctx.scalar.write(5, conf);
 
-        // Build a sparse MAC op:
-        // Sources: VectorReg(8) [A=y2], ControlReg(28) [B=qx0], ScalarReg(5) [config]
-        // Dest: AccumReg(0) [cm0]
         let mut op = SlotOp::from_semantic(SlotIndex::Accumulator, SemanticOp::Mac);
         op.is_vector = true;
         op.is_wide_vector = true;
-        op.sources.push(Operand::VectorReg(8));   // A from y2
-        op.sources.push(Operand::SparseQxReg(0));  // B from qx0
-        op.sources.push(Operand::ScalarReg(5));     // config
+        op.sources.push(Operand::VectorReg(8));
+        op.sources.push(Operand::SparseQxReg(0));
+        op.sources.push(Operand::ScalarReg(5));
         op.dest = Some(Operand::AccumReg(0));
         op.encoding_name = Some("VMAC_vmac_cm_core_sparse_wide".to_string());
 
         let handled = execute_matmul(&op, &mut ctx);
         assert!(handled);
 
-        // With zero mask, zero_acc: all outputs should be 0.
         let acc = ctx.accumulator.read_wide(0);
         for i in 0..32 {
             let lane = i / 2;
@@ -2800,24 +1713,18 @@ mod tests {
     #[test]
     #[ignore = "superseded by vmac_hw oracle tests; old formula model assumptions don't match hardware routing"]
     fn test_execute_matmul_sparse_with_mask() {
-        // Test sparse MAC with a non-zero mask. Set mask to activate
-        // the first byte of B, put a known value there.
         let mut ctx = ExecutionContext::new();
 
-        // A: put value 3 at position [0][0] (byte 0), rest zero.
         let mut a_data = [0u32; 16];
-        a_data[0] = 3; // A[0][0] = 3 (int8 at byte 0)
+        a_data[0] = 3;
         ctx.vector.write_wide(8, a_data);
 
-        // B: put value 7 at position [0][0] (byte 0), rest zero.
         let mut b_data = [0u32; 16];
-        b_data[0] = 7; // B[0][0] = 7 (int8 at byte 0)
+        b_data[0] = 7;
         ctx.vector.write_wide(0, b_data);
 
-        // Set mask to activate only byte 0.
-        ctx.mask.write_u32_low(0, 1); // q0 low word = 1 (bit 0 set)
+        ctx.mask.write_u32_low(0, 1);
 
-        // Config: i8xi8 sparse, zero_acc=1, signed
         let conf = (1 << 3) | (5 << 5) | (1 << 8) | (1 << 9) | 1;
         ctx.scalar.write(5, conf);
 
@@ -2833,12 +1740,10 @@ mod tests {
         let handled = execute_matmul(&op, &mut ctx);
         assert!(handled);
 
-        // C[0][0] = A[0][0] * B[0][0] = 3 * 7 = 21 (byte 0 of B is active).
         let acc = ctx.accumulator.read_wide(0);
         let val = (acc[0] & 0xFFFF_FFFF) as i32;
         assert_eq!(val, 21, "C[0][0] = 3 * 7 = 21, got {}", val);
 
-        // All other outputs should be 0 (only one element was active).
         for i in 1..32 {
             let lane = i / 2;
             let half = i % 2;
@@ -2849,98 +1754,17 @@ mod tests {
 }
 
 #[cfg(test)]
-mod extract_bytes_tests {
-    use super::*;
-
-    #[test]
-    fn test_extract_i8_signed() {
-        let mut buf = [0u8; 128];
-        buf[0] = 0xFF; // -1 as i8
-        buf[1] = 0x7F; // 127
-        buf[5] = 0x80; // -128
-        assert_eq!(extract_element_bytes(&buf, 0, 8, true), -1);
-        assert_eq!(extract_element_bytes(&buf, 1, 8, true), 127);
-        assert_eq!(extract_element_bytes(&buf, 5, 8, true), -128);
-    }
-
-    #[test]
-    fn test_extract_u8() {
-        let mut buf = [0u8; 128];
-        buf[0] = 0xFF;
-        assert_eq!(extract_element_bytes(&buf, 0, 8, false), 255);
-    }
-
-    #[test]
-    fn test_extract_i16_le() {
-        let mut buf = [0u8; 128];
-        // 0x0102 at byte 0 (LE: buf[0]=0x02, buf[1]=0x01)
-        buf[0] = 0x02;
-        buf[1] = 0x01;
-        assert_eq!(extract_element_bytes(&buf, 0, 16, false), 0x0102);
-        assert_eq!(extract_element_bytes(&buf, 0, 16, true), 0x0102);
-    }
-
-    #[test]
-    fn test_extract_i16_signed_negative() {
-        let mut buf = [0u8; 128];
-        buf[4] = 0x00;
-        buf[5] = 0x80; // 0x8000 = -32768
-        assert_eq!(extract_element_bytes(&buf, 4, 16, true), -32768);
-        assert_eq!(extract_element_bytes(&buf, 4, 16, false), 0x8000);
-    }
-
-    #[test]
-    fn test_extract_4bit() {
-        let mut buf = [0u8; 128];
-        buf[0] = 0xBA; // low nibble = 0xA, high nibble = 0xB
-        assert_eq!(extract_element_bytes(&buf, 0, 4, false), 0xA);
-        assert_eq!(extract_element_bytes(&buf, 1, 4, false), 0xB);
-        assert_eq!(extract_element_bytes(&buf, 0, 4, true), -6);
-        assert_eq!(extract_element_bytes(&buf, 1, 4, true), -5);
-    }
-
-    #[test]
-    fn test_extract_oob_returns_zero() {
-        let buf = [0u8; 128];
-        assert_eq!(extract_element_bytes(&buf, 200, 8, false), 0);
-    }
-
-    #[test]
-    fn test_vec512_to_bytes() {
-        let mut v: Vec512 = [0u32; 16];
-        v[0] = 0x04030201;
-        v[1] = 0x08070605;
-        let bytes = vec512_to_bytes(&v);
-        assert_eq!(bytes[0], 0x01);
-        assert_eq!(bytes[1], 0x02);
-        assert_eq!(bytes[2], 0x03);
-        assert_eq!(bytes[3], 0x04);
-        assert_eq!(bytes[4], 0x05);
-        assert_eq!(bytes[7], 0x08);
-    }
-}
-
-#[cfg(test)]
 mod sparse_matmul_tests {
     use super::*;
     use crate::interpreter::execute::vector_config::MatMulConfig;
 
     #[test]
     fn test_sparse_i8xi8_identity() {
-        // i8xi8 sparse: 4x16x8, acc32.
-        // Cleanroom routing: col = compressed_byte_pos % 8.
-        //
-        // With A = all 1s (row 0, 16 inner positions) and mask 0x3 (bits 0,1):
-        // Each compressed byte contributes its value to col = byte_pos % 8.
-        //
-        // To test col 0: bytes at positions 0, 8, 16, 24, 32, 40, 48, 56
-        // each route to col 0. With all B = 1 and all A = 1:
-        // col 0 sum = 8 (one contribution from each of 8 even-group first bytes)
         let mut a = [0u8; 128];
         for k in 0..16 {
-            a[0 * 16 + k] = 1; // A row 0, all sparse inner positions = 1
+            a[0 * 16 + k] = 1;
         }
-        let b = [1u8; 64]; // All compressed B bytes = 1
+        let b = [1u8; 64];
         let mask: u128 = 0x33333333_33333333_33333333_33333333;
         let config = MatMulConfig::from_config_word(
             (1 << 0) | (0 << 1) | (1 << 3) | (5 << 5) | (1 << 8) | (1 << 9),
@@ -2948,9 +1772,6 @@ mod sparse_matmul_tests {
         ).expect("valid sparse i8xi8 config");
         let mut acc = [0u64; 16];
         matmul_sparse_config_driven(&mut acc, &a, &b, mask, &config);
-        // Each column gets 8 products (64 bytes / 8 cols = 8 per col), each 1*1=1.
-        // acc_cmb=1 (Acc32): two 32-bit values per u64 lane.
-        // Element index i -> u64_lane = i/2, half = i%2.
         for c in 0..8 {
             let u64_lane = c / 2;
             let half = c % 2;
@@ -2961,14 +1782,11 @@ mod sparse_matmul_tests {
 
     #[test]
     fn test_sparse_bf16_basic() {
-        // bf16 sparse: 4x16x4, acc32(fp32).
-        // inner_groups=4, cols=4. Group g=0 -> inner_group=0, col=0.
-        // Mask bits 0,1 -> A sparse positions 0,1.
         let mut a = [0u8; 128];
-        a[0] = 0x80; a[1] = 0x3F; // bf16 1.0 at A[row=0][sparse_k=0]
-        a[2] = 0x80; a[3] = 0x3F; // bf16 1.0 at A[row=0][sparse_k=1]
+        a[0] = 0x80; a[1] = 0x3F;
+        a[2] = 0x80; a[3] = 0x3F;
         let mut b = [0u8; 64];
-        b[0] = 0x00; b[1] = 0x40; // bf16 2.0 at B[0][0]
+        b[0] = 0x00; b[1] = 0x40;
         let mask: u128 = 0x3;
         let config = MatMulConfig::from_config_word(
             (1 << 0) | (2 << 5),

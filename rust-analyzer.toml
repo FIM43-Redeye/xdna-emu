@@ -1,0 +1,22 @@
+# rust-analyzer configuration for xdna-emu
+#
+# This project has a complex build.rs that generates code from llvm-aie
+# TableGen definitions and links against LLVM FFI. The defaults need
+# adjustment to keep diagnostics accurate.
+
+# Use cargo check (not clippy) for diagnostics -- faster, less noisy
+[check]
+command = "check"
+
+# Run check on the full workspace (includes xdna-archspec crate)
+workspace = true
+
+# Increase cargo timeout -- build.rs can be slow on first run (TableGen
+# parsing, LLVM FFI compilation)
+[cargo]
+buildScripts.enable = true
+
+# Suppress the unlinked-file warning -- we sometimes have generated or
+# newly-created files that rust-analyzer hasn't indexed yet
+[diagnostics]
+disabled = ["unlinked-file"]

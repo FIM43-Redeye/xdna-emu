@@ -27,6 +27,8 @@
 //! ```
 
 mod registers;
+mod event_trace;
+mod timing_context;
 mod context;
 
 pub use registers::{

@@ -621,6 +621,222 @@ mod tests {
         ExecutionContext::new()
     }
 
+    // ========== vector_cmp_eq ==========
+
+    #[test]
+    fn test_cmp_eq_i32_equal() {
+        let a = [1, 2, 3, 4, 5, 6, 7, 8];
+        let b = [1, 2, 3, 4, 5, 6, 7, 8];
+        let r = VectorAlu::vector_cmp_eq(&a, &b, ElementType::Int32);
+        assert_eq!(r, [!0; 8]);
+    }
+
+    #[test]
+    fn test_cmp_eq_i32_none_equal() {
+        let a = [1, 2, 3, 4, 5, 6, 7, 8];
+        let b = [9, 10, 11, 12, 13, 14, 15, 16];
+        let r = VectorAlu::vector_cmp_eq(&a, &b, ElementType::Int32);
+        assert_eq!(r, [0; 8]);
+    }
+
+    #[test]
+    fn test_cmp_eq_i32_partial() {
+        let a = [1, 2, 3, 4, 5, 6, 7, 8];
+        let b = [1, 0, 3, 0, 5, 0, 7, 0];
+        let r = VectorAlu::vector_cmp_eq(&a, &b, ElementType::Int32);
+        assert_eq!(r[0], !0); // 1 == 1
+        assert_eq!(r[1], 0);  // 2 != 0
+        assert_eq!(r[2], !0); // 3 == 3
+        assert_eq!(r[3], 0);  // 4 != 0
+    }
+
+    #[test]
+    fn test_cmp_eq_i16() {
+        // Word 0: [a_lo=5, a_hi=10], [b_lo=5, b_hi=99]
+        let a = [0x000A_0005, 0, 0, 0, 0, 0, 0, 0]; // lo=5, hi=10
+        let b = [0x0063_0005, 0, 0, 0, 0, 0, 0, 0]; // lo=5, hi=99
+        let r = VectorAlu::vector_cmp_eq(&a, &b, ElementType::Int16);
+        // lo half matches (5==5) -> 0xFFFF, hi doesn't (10!=99) -> 0x0000
+        assert_eq!(r[0], 0x0000_FFFF);
+    }
+
+    #[test]
+    fn test_cmp_eq_i8() {
+        // Word 0: bytes [0x01, 0x02, 0x03, 0x04]
+        let a = [0x04030201, 0, 0, 0, 0, 0, 0, 0];
+        // Word 0: bytes [0x01, 0xFF, 0x03, 0xFF]
+        let b = [0xFF03FF01, 0, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_cmp_eq(&a, &b, ElementType::Int8);
+        // byte 0: 0x01==0x01 -> 0xFF, byte 1: 0x02!=0xFF -> 0x00
+        // byte 2: 0x03==0x03 -> 0xFF, byte 3: 0x04!=0xFF -> 0x00
+        assert_eq!(r[0], 0x00FF_00FF);
+    }
+
+    // ========== vector_compare_ge ==========
+
+    #[test]
+    fn test_ge_i32_signed() {
+        let a = [5, 0xFFFF_FFFF, 10, 0, 0, 0, 0, 0]; // [5, -1, 10, 0, ...]
+        let b = [3, 0, 10, 1, 0, 0, 0, 0];              // [3,  0, 10, 1, ...]
+        let r = VectorAlu::vector_compare_ge(&a, &b, ElementType::Int32);
+        assert_eq!(r[0], !0); // 5 >= 3
+        assert_eq!(r[1], 0);  // -1 >= 0 is false
+        assert_eq!(r[2], !0); // 10 >= 10
+        assert_eq!(r[3], 0);  // 0 >= 1 is false
+    }
+
+    #[test]
+    fn test_ge_u32_unsigned() {
+        let a = [0xFFFF_FFFF, 0, 0, 0, 0, 0, 0, 0];
+        let b = [1, 0, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_compare_ge(&a, &b, ElementType::UInt32);
+        assert_eq!(r[0], !0); // 0xFFFFFFFF >= 1 (unsigned)
+    }
+
+    #[test]
+    fn test_ge_f32() {
+        let a = [f32::to_bits(1.5), f32::to_bits(-1.0), 0, 0, 0, 0, 0, 0];
+        let b = [f32::to_bits(1.0), f32::to_bits(0.0), 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_compare_ge(&a, &b, ElementType::Float32);
+        assert_eq!(r[0], !0); // 1.5 >= 1.0
+        assert_eq!(r[1], 0);  // -1.0 >= 0.0 is false
+    }
+
+    #[test]
+    fn test_ge_i16_signed() {
+        // lo=0x8000 (-32768), hi=0x0001 (1)  vs  lo=0x7FFF (32767), hi=0x0000 (0)
+        let a = [0x0001_8000, 0, 0, 0, 0, 0, 0, 0];
+        let b = [0x0000_7FFF, 0, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_compare_ge(&a, &b, ElementType::Int16);
+        // lo: -32768 >= 32767 -> false (0x0000)
+        // hi: 1 >= 0 -> true (0xFFFF)
+        assert_eq!(r[0], 0xFFFF_0000);
+    }
+
+    #[test]
+    fn test_ge_i8_signed() {
+        // bytes: [127, -128, 0, 0] vs [0, 0, 0, 0]
+        let a = [0x0000_807F, 0, 0, 0, 0, 0, 0, 0]; // [0x7F, 0x80, 0x00, 0x00]
+        let b = [0x0000_0000, 0, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_compare_ge(&a, &b, ElementType::Int8);
+        // byte 0: 127 >= 0 -> true (0xFF)
+        // byte 1: -128 >= 0 -> false (0x00)
+        // byte 2: 0 >= 0 -> true (0xFF)
+        // byte 3: 0 >= 0 -> true (0xFF)
+        assert_eq!(r[0], 0xFFFF_00FF);
+    }
+
+    // ========== vector_compare_lt ==========
+
+    #[test]
+    fn test_lt_is_complement_of_ge_i32() {
+        let a = [5, 0xFFFF_FFFF, 10, 0, 100, 50, 0, 1];
+        let b = [3, 0, 10, 1, 99, 51, 0, 0];
+        let ge = VectorAlu::vector_compare_ge(&a, &b, ElementType::Int32);
+        let lt = VectorAlu::vector_compare_lt(&a, &b, ElementType::Int32);
+        // For every lane, exactly one of GE or LT should be all-ones
+        for i in 0..8 {
+            assert_eq!(ge[i] ^ lt[i], !0, "ge^lt should be all-ones at lane {}", i);
+        }
+    }
+
+    #[test]
+    fn test_lt_i16_complement() {
+        let a = [0x0001_8000, 0x7FFF_0000, 0, 0, 0, 0, 0, 0];
+        let b = [0x0000_7FFF, 0x8000_0001, 0, 0, 0, 0, 0, 0];
+        let ge = VectorAlu::vector_compare_ge(&a, &b, ElementType::Int16);
+        let lt = VectorAlu::vector_compare_lt(&a, &b, ElementType::Int16);
+        for i in 0..8 {
+            assert_eq!(ge[i] ^ lt[i], !0, "ge^lt should be all-ones at lane {}", i);
+        }
+    }
+
+    // ========== vector_compare_eqz ==========
+
+    #[test]
+    fn test_eqz_i32() {
+        let a = [0, 1, 0, 0xFFFF_FFFF, 0, 42, 0, 0];
+        let r = VectorAlu::vector_compare_eqz(&a, ElementType::Int32);
+        assert_eq!(r[0], !0); // 0 == 0
+        assert_eq!(r[1], 0);  // 1 != 0
+        assert_eq!(r[2], !0); // 0 == 0
+        assert_eq!(r[3], 0);  // -1 != 0
+        assert_eq!(r[4], !0); // 0 == 0
+        assert_eq!(r[5], 0);  // 42 != 0
+    }
+
+    #[test]
+    fn test_eqz_i16() {
+        // Word: lo=0x0000, hi=0x0001
+        let a = [0x0001_0000, 0, 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_compare_eqz(&a, ElementType::Int16);
+        // lo=0 -> true (0xFFFF), hi=1 -> false (0x0000)
+        assert_eq!(r[0], 0x0000_FFFF);
+    }
+
+    #[test]
+    fn test_eqz_f32_neg_zero() {
+        // -0.0 should compare equal to zero
+        let a = [f32::to_bits(-0.0), f32::to_bits(0.0), 0, 0, 0, 0, 0, 0];
+        let r = VectorAlu::vector_compare_eqz(&a, ElementType::Float32);
+        assert_eq!(r[0], !0); // -0.0 == 0.0
+        assert_eq!(r[1], !0); // 0.0 == 0.0
+    }
+
+    // ========== vector_select ==========
+
+    #[test]
+    fn test_select_i32_all_from_src1() {
+        let mask = [!0u32; 8]; // all true -> src1
+        let src1 = [10, 20, 30, 40, 50, 60, 70, 80];
+        let src2 = [1, 2, 3, 4, 5, 6, 7, 8];
+        let r = VectorAlu::vector_select(&mask, &src1, &src2, ElementType::Int32);
+        assert_eq!(r, src1);
+    }
+
+    #[test]
+    fn test_select_i32_all_from_src2() {
+        let mask = [0u32; 8]; // all false -> src2
+        let src1 = [10, 20, 30, 40, 50, 60, 70, 80];
+        let src2 = [1, 2, 3, 4, 5, 6, 7, 8];
+        let r = VectorAlu::vector_select(&mask, &src1, &src2, ElementType::Int32);
+        assert_eq!(r, src2);
+    }
+
+    #[test]
+    fn test_select_i32_alternating() {
+        let mask = [!0, 0, !0, 0, !0, 0, !0, 0];
+        let src1 = [10, 20, 30, 40, 50, 60, 70, 80];
+        let src2 = [1, 2, 3, 4, 5, 6, 7, 8];
+        let r = VectorAlu::vector_select(&mask, &src1, &src2, ElementType::Int32);
+        assert_eq!(r, [10, 2, 30, 4, 50, 6, 70, 8]);
+    }
+
+    #[test]
+    fn test_select_i16_per_lane() {
+        // mask: lo=0xFFFF (true), hi=0x0000 (false)
+        let mask = [0x0000_FFFF; 8];
+        let src1 = [0xAAAA_BBBB; 8];
+        let src2 = [0xCCCC_DDDD; 8];
+        let r = VectorAlu::vector_select(&mask, &src1, &src2, ElementType::Int16);
+        // lo from src1, hi from src2
+        assert_eq!(r[0], 0xCCCC_BBBB);
+    }
+
+    #[test]
+    fn test_select_i8_per_byte() {
+        // mask: byte0=0xFF, byte1=0x00, byte2=0xFF, byte3=0x00
+        let mask = [0x00FF_00FF; 8];
+        let src1 = [0xAA_BB_CC_DD; 8];
+        let src2 = [0x11_22_33_44; 8];
+        let r = VectorAlu::vector_select(&mask, &src1, &src2, ElementType::Int8);
+        // byte0: mask=FF -> src1=0xDD, byte1: mask=00 -> src2=0x33
+        // byte2: mask=FF -> src1=0xBB, byte3: mask=00 -> src2=0x11
+        assert_eq!(r[0], 0x11BB_33DD);
+    }
+
+    // ========== Integration tests (existing) ==========
+
     #[test]
     fn test_vector_cmp() {
         let mut ctx = make_ctx();

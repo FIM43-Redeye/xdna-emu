@@ -37,6 +37,9 @@
 //! ```
 
 mod decoder;
+mod loader;
+mod operand_extraction;
+mod slot_builder;
 pub(crate) mod composite;
 pub mod crossref;
 
