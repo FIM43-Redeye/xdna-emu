@@ -17,22 +17,35 @@
 //! - [`fuzzer`]: Differential logic fuzzer for emulator validation
 //! - [`aiesim`]: aiesimulator subprocess harness for VCD cross-validation
 
+// Core emulation engine (always available)
 pub mod config;
 pub mod parser;
 pub mod device;
 pub mod interpreter;
 pub mod tablegen;
 pub mod npu;
-pub mod trace;
-pub mod visual;
-pub mod integration;
-pub mod testing;
 pub mod ffi;
-pub mod build_progress;
-pub mod fuzzer;
 pub mod archspec;
-pub mod vcd;
+pub mod trace;
 pub mod aiesim;
+
+// GUI (requires eframe/egui)
+#[cfg(feature = "gui")]
+pub mod visual;
+
+// VCD deep extraction (requires wellen)
+#[cfg(feature = "analysis")]
+pub mod vcd;
+
+// Test harness, external tool wrappers, fuzzer (requires crossterm)
+#[cfg(feature = "tooling")]
+pub mod build_progress;
+#[cfg(feature = "tooling")]
+pub mod testing;
+#[cfg(feature = "tooling")]
+pub mod integration;
+#[cfg(feature = "tooling")]
+pub mod fuzzer;
 
 /// Compile-time architecture constants generated from the validated ArchModel.
 ///

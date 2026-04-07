@@ -9,6 +9,7 @@ use xdna_emu::parser::cdo::{find_cdo_offset, CdoCommand};
 use xdna_emu::device::{TileAddress, RegisterInfo, DeviceState};
 use xdna_emu::device::registers::{subsystem_from_offset, tile_kind_from_row};
 use xdna_emu::archspec::SubsystemKind;
+#[cfg(feature = "tooling")]
 use xdna_emu::testing::XclbinSuite;
 
 fn main() -> anyhow::Result<()> {
@@ -31,12 +32,20 @@ fn main() -> anyhow::Result<()> {
 
     // Check for test-suite command
     if args.len() >= 2 && args.iter().any(|a| a == "test-suite") {
-        let path = args.iter()
-            .skip(1)
-            .find(|a| !a.starts_with('-') && a.as_str() != "test-suite")
-            .map(|s| s.as_str())
-            .unwrap_or(".");
-        return run_test_suite(path);
+        #[cfg(feature = "tooling")]
+        {
+            let path = args.iter()
+                .skip(1)
+                .find(|a| !a.starts_with('-') && a.as_str() != "test-suite")
+                .map(|s| s.as_str())
+                .unwrap_or(".");
+            return run_test_suite(path);
+        }
+        #[cfg(not(feature = "tooling"))]
+        {
+            eprintln!("test-suite command requires --features tooling");
+            std::process::exit(1);
+        }
     }
 
     // Check for GUI mode
@@ -321,7 +330,7 @@ fn print_command(idx: usize, cmd: &CdoCommand) {
     }
 }
 
-/// Run the XCLBIN test suite.
+#[cfg(feature = "tooling")]
 fn run_test_suite(path: &str) -> anyhow::Result<()> {
     println!("=== XCLBIN Test Suite ===");
     println!("Discovering tests in: {}", path);
@@ -382,10 +391,7 @@ fn print_help() {
     println!("    xdna-emu --trace-view-hw hw/ --trace-view-emu emu/  # Compare traces");
 }
 
-/// Run the GUI application.
-///
-/// When `trace_hw` and `trace_emu` are both provided, the trace viewer
-/// opens with that pair pre-loaded (no file dialog needed).
+#[cfg(feature = "gui")]
 fn run_gui(
     _file_path: Option<&str>,
     trace_hw: Option<&str>,
@@ -398,7 +404,6 @@ fn run_gui(
         ..Default::default()
     };
 
-    // Convert to owned paths before moving into the closure.
     let hw_path = trace_hw.map(std::path::PathBuf::from);
     let emu_path = trace_emu.map(std::path::PathBuf::from);
 
@@ -414,4 +419,14 @@ fn run_gui(
         }),
     )
     .map_err(|e| anyhow::anyhow!("GUI error: {}", e))
+}
+
+#[cfg(not(feature = "gui"))]
+fn run_gui(
+    _file_path: Option<&str>,
+    _trace_hw: Option<&str>,
+    _trace_emu: Option<&str>,
+) -> anyhow::Result<()> {
+    eprintln!("GUI requires --features gui (build with: cargo build --features gui)");
+    std::process::exit(1);
 }

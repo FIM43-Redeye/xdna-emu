@@ -31,12 +31,12 @@ uuid = "1"                                              # UUID handling
 smallvec = "1.13"                                       # Stack-allocated vectors for operands
 byteorder = "1.5"                                       # Byte order utilities for binary parsing
 dirs = "6"                                              # Platform-specific config directories
-crossterm = "0.29"                                       # Terminal control for build progress grid
+crossterm = { version = "0.29", optional = true }          # Terminal control for build progress grid
 libc = "0.2"                                              # POSIX FFI: setsid, killpg for process control
 xdna-archspec = { path = "crates/xdna-archspec" }           # Architecture specification (shared with build.rs)
 
-# VCD deep extraction (comparison engine always available; emission gated by feature)
-wellen = "0.20"
+# VCD deep extraction (gated by "analysis" feature; emission gated by "vcd-recording")
+wellen = { version = "0.20", optional = true }
 vcd = { version = "0.7", optional = true }
 
 # Serialization (for test manifests and register database)
@@ -47,17 +47,20 @@ toml = "0.8"
 # ELF parsing for core binaries
 goblin = "0.10"
 
-# GUI framework
-eframe = "0.31"                                         # egui framework for native apps
-egui_extras = { version = "0.31", features = ["image"] } # Extra widgets
-rfd = "0.15"                                            # Native file dialogs
+# GUI framework (gated by "gui" feature)
+eframe = { version = "0.31", optional = true }           # egui framework for native apps
+egui_extras = { version = "0.31", features = ["image"], optional = true } # Extra widgets
+rfd = { version = "0.15", optional = true }              # Native file dialogs
 
 # Logging
 log = "0.4"
 env_logger = "0.11"
 
 [features]
-default = []
+default = ["gui", "analysis", "tooling"]
+gui = ["dep:eframe", "dep:egui_extras", "dep:rfd"]
+analysis = ["dep:wellen"]
+tooling = ["dep:crossterm"]
 vcd-recording = ["dep:vcd"]
 
 [build-dependencies]
@@ -81,6 +84,11 @@ path = "src/bin/npu_archspec.rs"
 [[bin]]
 name = "export-isa"
 path = "src/bin/export_isa.rs"
+
+[[bin]]
+name = "vcd-compare"
+path = "src/bin/vcd_compare.rs"
+required-features = ["analysis"]
 
 [profile.release]
 lto = "thin"
