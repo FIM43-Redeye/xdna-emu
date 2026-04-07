@@ -323,6 +323,97 @@ fn insert_lanes(reg: &mut [u32; 8], lanes: &[i64], bits: u32) {
     }
 }
 
+// ========== VectorAlu dispatch for Pack/Unpack ==========
+
+use crate::interpreter::bundle::{ElementType, SlotOp};
+use crate::interpreter::state::ExecutionContext;
+
+use super::vector_dispatch::VectorAlu;
+
+impl VectorAlu {
+    /// Pack: narrow vector lanes.
+    ///
+    /// Narrow path: 2-source pack (legacy vector_pack helper).
+    /// Wide path: 512->256, split source halves, pack each, combine.
+    pub(super) fn execute_pack(op: &SlotOp, ctx: &mut ExecutionContext, _et: ElementType) -> bool {
+        if op.is_wide_vector {
+            // VPACK: 512-bit x-reg source -> 256-bit w-reg dest.
+            // Each 256-bit half is packed independently, then the two
+            // packed halves are concatenated into one 256-bit result.
+            let name = op.encoding_name.as_deref().unwrap_or("");
+            let (bits_i, bits_o, signed) = pack_widths_from_name(name);
+            let src = Self::get_wide_vec_source(op, ctx, 0);
+            let src_lo: [u32; 8] = src[..8].try_into().unwrap();
+            let src_hi: [u32; 8] = src[8..].try_into().unwrap();
+
+            let packed_lo = pack_half(
+                &src_lo, bits_i, bits_o, signed, PackMode::Truncate,
+            );
+            let packed_hi = pack_half(
+                &src_hi, bits_i, bits_o, signed, PackMode::Truncate,
+            );
+
+            // Each half produces (256/bits_i * bits_o) bits of packed data.
+            // Concatenate the two halves into a single 256-bit w-register.
+            let words_per_half = ((256 / bits_i) * bits_o / 32) as usize;
+            let mut result = [0u32; 8];
+            result[..words_per_half].copy_from_slice(&packed_lo[..words_per_half]);
+            result[words_per_half..words_per_half * 2]
+                .copy_from_slice(&packed_hi[..words_per_half]);
+
+            // Write to 256-bit w-register dest (NOT write_wide_vec_dest).
+            Self::write_vector_dest(op, ctx, result);
+        } else {
+            let (a, b) = Self::get_two_vector_sources(op, ctx);
+            let result = Self::vector_pack(&a, &b);
+            Self::write_vector_dest(op, ctx, result);
+        }
+        true
+    }
+
+    /// Unpack: widen vector lanes.
+    ///
+    /// Narrow path: sign-extend to wider type.
+    /// Wide path: 256->512, read narrow source, unpack to fill 512-bit dest.
+    pub(super) fn execute_unpack(op: &SlotOp, ctx: &mut ExecutionContext, _et: ElementType) -> bool {
+        if op.is_wide_vector {
+            // VUNPACK: 256-bit w-reg source -> 512-bit x-reg dest.
+            // The source lanes are split: lower lanes fill the low half
+            // of the output, upper lanes fill the high half.
+            //
+            // The compiler emits vldb+vunpack without NOPs because
+            // hardware scoreboarding stalls the unpack until the load
+            // completes. Force-commit all pending vector writes so the
+            // source data from a preceding vldb is visible.
+            ctx.force_commit_all_pending();
+
+            let name = op.encoding_name.as_deref().unwrap_or("");
+            let (bits_i, bits_o, signed) = unpack_widths_from_name(name);
+
+            // Read the 256-bit source (NOT wide -- it's a w-register).
+            let src = Self::get_vector_source(op, ctx, 0);
+
+            // Each output half holds 256/bits_o lanes. The second half
+            // reads from lane_start = 256/bits_o in the source.
+            let lanes_per_half = (256 / bits_o) as usize;
+            let result_lo = unpack_half(&src, 0, bits_i, bits_o, signed);
+            let result_hi = unpack_half(
+                &src, lanes_per_half, bits_i, bits_o, signed,
+            );
+
+            let mut result = [0u32; 16];
+            result[..8].copy_from_slice(&result_lo);
+            result[8..].copy_from_slice(&result_hi);
+            Self::write_wide_vec_dest(op, ctx, result);
+        } else {
+            let src = Self::get_vector_source(op, ctx, 0);
+            let result = Self::vector_unpack_low(&src);
+            Self::write_vector_dest(op, ctx, result);
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -76,6 +76,27 @@ impl VectorAlu {
             SemanticOp::MaxLt => return Self::execute_maxlt(op, ctx, et),
             SemanticOp::MinGe => return Self::execute_minge(op, ctx, et),
             SemanticOp::VectorSelect => return Self::execute_select(op, ctx, et),
+
+            // Data movement
+            SemanticOp::Shuffle => return Self::execute_shuffle(op, ctx, et),
+            SemanticOp::VectorBroadcast => return Self::execute_vector_broadcast(op, ctx, et),
+            SemanticOp::VectorExtract => return Self::execute_vector_extract(op, ctx, et),
+            SemanticOp::VectorInsert => return Self::execute_vector_insert(op, ctx, et),
+            SemanticOp::VectorPush | SemanticOp::VectorPushHi => return Self::execute_vector_push(op, ctx, et),
+            SemanticOp::Align => return Self::execute_align(op, ctx, et),
+            SemanticOp::Copy => return Self::execute_copy(op, ctx, et),
+            SemanticOp::VectorClear => return Self::execute_vector_clear(op, ctx, et),
+
+            // Bitwise (typeless generic dispatchers)
+            SemanticOp::And => return Self::execute_binary_typeless(op, ctx, Self::vector_bitwise_and),
+            SemanticOp::Or => return Self::execute_binary_typeless(op, ctx, Self::vector_bitwise_or),
+            SemanticOp::Xor => return Self::execute_binary_typeless(op, ctx, Self::vector_bitwise_xor),
+            SemanticOp::Not => return Self::execute_unary_typeless(op, ctx, Self::vector_bitwise_not),
+
+            // Pack/Unpack
+            SemanticOp::Pack => return Self::execute_pack(op, ctx, et),
+            SemanticOp::Unpack => return Self::execute_unpack(op, ctx, et),
+
             _ => {}
         }
 
