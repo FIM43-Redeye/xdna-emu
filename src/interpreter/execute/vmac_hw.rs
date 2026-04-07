@@ -29,7 +29,7 @@ pub use routing::{eval_prmx, eval_prmy};
 /// bits set map to (0, 0) = no selection.
 ///
 /// Returns (sel0, sel1).
-fn decode_mask(mask4: u8) -> (u8, u8) {
+pub(crate) fn decode_mask(mask4: u8) -> (u8, u8) {
     match mask4 & 0xF {
         1  => (1, 0),
         2  => (2, 0),
