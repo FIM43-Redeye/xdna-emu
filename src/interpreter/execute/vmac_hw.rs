@@ -1157,6 +1157,362 @@ mod tests {
         assert_eq!(shmode, [1, 2, 4, 8, 1, 2, 4, 8]);
     }
 
+    // -----------------------------------------------------------------------
+    // decode_mask: exhaustive coverage of all 16 nibble patterns
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decode_mask_all_patterns() {
+        // All 16 possible 4-bit patterns -> expected (sel0, sel1)
+        let expected: [(u8, u8); 16] = [
+            (0, 0), // 0b0000 = 0: no bits
+            (1, 0), // 0b0001 = 1
+            (2, 0), // 0b0010 = 2
+            (1, 1), // 0b0011 = 3
+            (0, 2), // 0b0100 = 4
+            (1, 2), // 0b0101 = 5
+            (2, 2), // 0b0110 = 6
+            (0, 0), // 0b0111 = 7: >2 bits
+            (0, 4), // 0b1000 = 8
+            (1, 4), // 0b1001 = 9
+            (2, 4), // 0b1010 = 10
+            (0, 0), // 0b1011 = 11: >2 bits
+            (4, 4), // 0b1100 = 12
+            (0, 0), // 0b1101 = 13: >2 bits
+            (0, 0), // 0b1110 = 14: >2 bits
+            (0, 0), // 0b1111 = 15: >2 bits
+        ];
+        for (nibble, &exp) in expected.iter().enumerate() {
+            assert_eq!(
+                decode_mask(nibble as u8), exp,
+                "decode_mask({:#06b}) = {:?}, expected {:?}",
+                nibble, decode_mask(nibble as u8), exp
+            );
+        }
+    }
+
+    #[test]
+    fn decode_mask_high_bits_ignored() {
+        // Only low 4 bits matter -- high bits are masked off
+        assert_eq!(decode_mask(0xF1), decode_mask(1)); // 0xF1 & 0xF = 1
+        assert_eq!(decode_mask(0xA5), decode_mask(5)); // 0xA5 & 0xF = 5
+    }
+
+    // -----------------------------------------------------------------------
+    // sgex_mask / sgey_mask
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sgex_mask_unsigned_is_zero() {
+        // When sgn_x=false, mask is always zero regardless of mmode
+        for mmode in [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80] {
+            assert_eq!(sgex_mask(mmode, false), 0, "mmode=0x{:02x}", mmode);
+        }
+    }
+
+    #[test]
+    fn sgey_mask_unsigned_is_zero() {
+        for mmode in [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80] {
+            assert_eq!(sgey_mask(mmode, false), 0, "mmode=0x{:02x}", mmode);
+        }
+    }
+
+    #[test]
+    fn sgex_mask_signed_nonzero() {
+        // When sgn_x=true, integer modes should have sign bits set.
+        // bf16 (0x40) is excluded: it uses float sign, not integer sign extension.
+        for mmode in [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x80] {
+            assert_ne!(sgex_mask(mmode, true), 0, "mmode=0x{:02x} should have sign bits", mmode);
+        }
+    }
+
+    #[test]
+    fn sgex_mask_bf16_is_zero() {
+        // bf16 (0x40) uses float sign handling, not integer sign extension
+        assert_eq!(sgex_mask(0x40, true), 0);
+    }
+
+    #[test]
+    fn sgey_mask_has_hi16_mirror() {
+        // sgey_mask replicates lo16 to hi16 (s |= s << 16)
+        for mmode in [0x01, 0x02, 0x04, 0x08, 0x40, 0x80] {
+            let s = sgey_mask(mmode, true);
+            let lo16 = s & 0xFFFF;
+            let hi16 = (s >> 16) & 0xFFFF;
+            assert_eq!(lo16, hi16, "mmode=0x{:02x}: lo16={:#06x} != hi16={:#06x}", mmode, lo16, hi16);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // vec_control: parse config words
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vec_control_i8xi8_dense() {
+        // config for i8xi8 dense, signed: amode=0, bmode=1, variant=0, sgn_x=1, sgn_y=1
+        // Bits: [0]=zero_acc, [2:1]=amode, [4:3]=bmode, [7:5]=variant, [8]=sgn_y, [9]=sgn_x
+        let config = (1 << 9) | (1 << 8) | (1 << 3); // sgn_x, sgn_y, bmode=1
+        let (mmode, pmode, sgn_x, sgn_y, _, _) = vec_control(config, false, false, false, false);
+        assert_eq!(mmode, 0x02, "i8xi8 mmode");
+        assert_eq!(pmode, 1 << 1, "i8xi8 dense pmode bit 1");
+        assert!(sgn_x);
+        assert!(sgn_y);
+    }
+
+    #[test]
+    fn vec_control_i16xi16_sparse() {
+        // i16xi16 sparse: amode=1, bmode=3, variant=5
+        // config = sgn_x=1, sgn_y=1, variant=5, bmode=3, amode=1, zero_acc=1
+        let config = (1 << 9) | (1 << 8) | (5 << 5) | (3 << 3) | (1 << 1) | 1;
+        let (mmode, pmode, sgn_x, sgn_y, _, _) = vec_control(config, true, false, false, false);
+        assert_eq!(mmode, 0x20, "i16xi16 sparse mmode=0x20");
+        assert_eq!(pmode, 1 << 24, "pmode bit 24 for i16xi16 sparse");
+        assert!(sgn_x);
+        assert!(sgn_y);
+    }
+
+    #[test]
+    fn vec_control_bf16_dense() {
+        // bf16 dense: amode=2, bmode=0, variant=0
+        let config = (2 << 1) | (0 << 3) | (0 << 5);
+        let (mmode, pmode, _, _, _, _) = vec_control(config, false, false, false, false);
+        assert_eq!(mmode, 0x40, "bf16 mmode");
+        assert_eq!(pmode, 1 << 8, "bf16 dense pmode bit 8");
+    }
+
+    #[test]
+    fn vec_control_zero_acc_bit() {
+        // zero_acc is bit 0 of config
+        let config_with_zero = 1u32; // zero_acc=1, everything else 0
+        let config_without_zero = 0u32;
+        // Both produce same mmode/pmode (zero_acc doesn't change mmode/pmode)
+        let (m1, p1, _, _, _, _) = vec_control(config_with_zero, true, false, false, false);
+        let (m2, p2, _, _, _, _) = vec_control(config_without_zero, false, false, false, false);
+        assert_eq!(m1, m2);
+        assert_eq!(p1, p2);
+    }
+
+    // -----------------------------------------------------------------------
+    // acc_overlap: combine 68-bit PSA result to 64-bit
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn acc_overlap_split_mode_no_carry() {
+        // mmode & 0x4F != 0 -> split mode (no carry cascade)
+        // lo=0x1234_5678, hi=0xABCD_EF01
+        let k0 = 0x1_2345_6789i64; // 36-bit (low 32 = 0x2345_6789, carry nibble = 0x1)
+        let k1 = 0x7BCD_EF01i32;   // 32-bit
+        let result = acc_overlap(k0, k1, 0x01); // mmode=0x01 is in 0x4F -> split
+        // split: no carry cascade, just concatenate lo32 and hi32
+        let lo32 = (k0 as u64) & 0xFFFF_FFFF;
+        let hi32 = (k1 as u64) & 0xFFFF_FFFF;
+        assert_eq!(result, lo32 | (hi32 << 32));
+    }
+
+    #[test]
+    fn acc_overlap_non_split_carry() {
+        // mmode & 0x4F == 0 -> non-split mode (carry cascade from lo[35:32] to hi)
+        // Use mmode=0x10 (bit 4, NOT in 0x4F mask)
+        let k0 = 0x3_0000_0000i64; // carry nibble = 0x3 (positive)
+        let k1 = 0x0000_0010i32;
+        let result = acc_overlap(k0, k1, 0x10);
+        // carry_4 = 3, sign-extended from 4 bits = 3 (positive)
+        // ah = 0x10 + 3 = 0x13
+        let lo32 = 0x0000_0000u64;
+        let hi32 = 0x0000_0013u64;
+        assert_eq!(result, lo32 | (hi32 << 32));
+    }
+
+    #[test]
+    fn acc_overlap_non_split_negative_carry() {
+        // Negative carry: carry nibble with bit 3 set -> sign-extend to negative
+        let k0 = 0xF_0000_0000i64; // carry nibble = 0xF -> sign-extend to -1
+        let k1 = 0x0000_0005i32;
+        let result = acc_overlap(k0, k1, 0x10);
+        // carry_4 = 0xF, sign-extended from 4 bits = -1
+        // ah = 5 + (-1) = 4
+        let lo32 = 0x0000_0000u64;
+        let hi32 = 0x0000_0004u64;
+        assert_eq!(result, lo32 | (hi32 << 32));
+    }
+
+    // -----------------------------------------------------------------------
+    // psa_shift1: variable left shift
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn psa_shift1_no_shift() {
+        // shmode bit 0 set -> shift 0
+        let shmode = [1u8; 8];
+        let products = [42i64; 16];
+        let shifted = psa_shift1(&products, &shmode);
+        for &v in &shifted {
+            assert_eq!(v, 42);
+        }
+    }
+
+    #[test]
+    fn psa_shift1_shift_by_4() {
+        // shmode bit 1 set -> shift left by 4
+        let shmode = [2u8; 8];
+        let products = [1i64; 16];
+        let shifted = psa_shift1(&products, &shmode);
+        for &v in &shifted {
+            assert_eq!(v, 16); // 1 << 4
+        }
+    }
+
+    #[test]
+    fn psa_shift1_zero_shmode() {
+        // shmode=0 -> no bit set -> output is 0
+        let shmode = [0u8; 8];
+        let products = [0xFF_FFFFi64; 16];
+        let shifted = psa_shift1(&products, &shmode);
+        for &v in &shifted {
+            assert_eq!(v, 0);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // multi_adder8: sum two groups of 8
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn multi_adder8_simple() {
+        let mut shifted = [0i64; 16];
+        for i in 0..8 { shifted[i] = 1; }
+        for i in 8..16 { shifted[i] = 2; }
+        let (lo, hi) = multi_adder8(&shifted);
+        assert_eq!(lo, 8);  // 8 * 1
+        assert_eq!(hi, 16); // 8 * 2
+    }
+
+    #[test]
+    fn multi_adder8_negative() {
+        let mut shifted = [0i64; 16];
+        shifted[0] = 100;
+        shifted[1] = -50;
+        // rest are zero
+        let (lo, _hi) = multi_adder8(&shifted);
+        assert_eq!(lo, 50);
+    }
+
+    // -----------------------------------------------------------------------
+    // psa_shift2: second-stage shift
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn psa_shift2_split_mode() {
+        // mmode & 0x4F != 0 -> m32=true, m0=false, m16=false
+        let (r0, r1, r2) = psa_shift2(100, 200, 0x01);
+        assert_eq!(r0, 100); // r0 = lo always
+        assert_eq!(r1, 0);   // m0=false, m16=false -> 0
+        assert_eq!(r2, 200); // m32=true -> hi as i32
+    }
+
+    #[test]
+    fn psa_shift2_m0_mode() {
+        // mmode & 0x30 != 0 -> m0=true
+        // mmode & 0x4F == 0 -> m32=false (0x30 & 0x4F = 0)
+        let (r0, r1, r2) = psa_shift2(100, 200, 0x30);
+        assert_eq!(r0, 100);
+        assert_eq!(r1, 200); // m0=true -> hi
+        assert_eq!(r2, 0);   // m32=false, m16=false -> 0
+    }
+
+    // -----------------------------------------------------------------------
+    // psa_create_shmode: more mmodes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn psa_create_shmode_mmode_0x01() {
+        // mmode=0x01: bits 0 and 6 active -> selects bits [23:18] of SHIFTS
+        let shmode = psa_create_shmode(0x01);
+        // SHIFTS[0] = 0x41041 -> bits [23:18] = (0x41041 >> 18) & 0x3F = 0x10 & 0x3F = 0x10
+        // Wait, 0x41041 = 0b0100_0001_0000_0100_0001
+        // bits [23:18]: need to look at bits 18-23 of 0x41041
+        // 0x41041 >> 18 = 0x41041 / 262144 = 1 (since 0x41041 = 266305, 266305/262144 = 1)
+        // So bits [23:18] = 1 = 0b000001 -> shift by 0
+        // This matches: mmode bit 0 -> smallest shift
+        assert_eq!(shmode[0], 1); // shift 0
+    }
+
+    #[test]
+    fn psa_create_shmode_mmode_0x02() {
+        // mmode=0x02: bit 1 -> selects bits [17:12] of SHIFTS
+        let shmode = psa_create_shmode(0x02);
+        // SHIFTS[0] = 0x41041: bits [17:12] = (0x41041 >> 12) & 0x3F = 0x41 & 0x3F = 0x01
+        assert_eq!(shmode[0], 1); // shift 0
+        // SHIFTS[1] = 0x42082: bits [17:12] = (0x42082 >> 12) & 0x3F = 0x42 & 0x3F = 0x02
+        assert_eq!(shmode[1], 2); // shift 4
+    }
+
+    // -----------------------------------------------------------------------
+    // mask2sel: verify non-sparse produces all zeros
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mask2sel_non_sparse_pmode_is_zero() {
+        // pmode_bit outside 21-25 -> smode stays all zero
+        let smode = mask2sel(0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF, 0);
+        assert_eq!(smode, [0u64; 12]);
+    }
+
+    #[test]
+    fn mask2sel_i8xi8_sparse_nonzero() {
+        // pmode_bit=22 (i8xi8 sparse), uniform mask -> smode[3..6] region should be nonzero
+        let mask: u128 = 0x33333333_33333333_33333333_33333333;
+        let smode = mask2sel(mask, 22);
+        // i8xi8 writes to bits [192..384) -> words 3..5
+        let region_sum: u64 = smode[3..6].iter().sum();
+        assert_ne!(region_sum, 0, "i8xi8 sparse smode should be nonzero in region [192..384)");
+    }
+
+    #[test]
+    fn mask2sel_zero_mask_is_zero() {
+        // Zero mask -> all decode_mask returns (0,0) -> smode is all zero
+        for pmode_bit in [21, 22, 23, 24, 25] {
+            let smode = mask2sel(0, pmode_bit);
+            assert_eq!(smode, [0u64; 12], "pmode_bit={} with zero mask", pmode_bit);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // build_prmx_control: verify pmode in low bits
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_prmx_control_pmode_in_low_21_bits() {
+        let smode = [0u64; 12];
+        let pmode = 0x1F_FFFF; // all 21 bits set
+        let m = build_prmx_control(&smode, pmode);
+        assert_eq!(m[0] & 0x1F_FFFF, 0x1F_FFFF, "low 21 bits should be pmode");
+        // With zero smode, bits above 20 should be zero
+        assert_eq!(m[0] >> 21, 0);
+        for i in 1..13 {
+            assert_eq!(m[i], 0, "word {} should be zero with zero smode", i);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // vec_control_negate: bf16 branch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vec_control_negate_bf16_partial() {
+        // mmode=0x40 (bf16), sub=0x01 (only bit 0)
+        // bf16 branch: paired elements, sub_idx = base + in_group/2
+        // Groups 0,1: base=0, sub[0..3]; Groups 2,3: base=4, sub[4..7]
+        // sub=0x01 -> sub[0]=1, rest 0
+        // Within groups 0,1: in_group/2 = 0,0,1,1,2,2,3,3 -> sub_idx = 0,0,1,1,2,2,3,3
+        // Only sub[0]=1 -> bits 0,1 of each group 0,1 byte are set
+        let r = vec_control_negate(0x40, 0x01);
+        // lo32 (groups 0..3): group 0 and 1 have bits 0,1 set = 0x03
+        // group 2 and 3 use base=4, sub[4]=0 -> 0
+        let expected_lo = 0x0000_0303u32;
+        assert_eq!(r[0], expected_lo, "bf16 negate lo32");
+    }
+
     /// Compare sparse_vmac output against the C++ oracle with UNIFORM data.
     /// When all A=1 and B=1, routing errors are masked out. This isolates
     /// the multiply-accumulate path.
