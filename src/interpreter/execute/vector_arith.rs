@@ -251,20 +251,40 @@ impl VectorAlu {
                 }
             }
             ElementType::Float32 => {
+                // AIE2 NaN semantics: when either operand is NaN, always return s1.
                 for i in 0..8 {
                     let fa = f32::from_bits(a[i]);
                     let fb = f32::from_bits(b[i]);
-                    result[i] = fa.min(fb).to_bits();
+                    result[i] = if fa.is_nan() || fb.is_nan() {
+                        a[i]
+                    } else {
+                        fa.min(fb).to_bits()
+                    };
                 }
             }
             ElementType::BFloat16 => {
+                // AIE2 NaN semantics: when either operand is NaN, the compare
+                // unit returns false, and the VMIN mux selects s1 (left operand).
+                // This is NaN propagation from s1, NOT IEEE 754 minNum.
                 for i in 0..8 {
-                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
-                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
-                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
-                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
-                    let r_lo = Self::f32_to_bf16(a_lo.min(b_lo));
-                    let r_hi = Self::f32_to_bf16(a_hi.min(b_hi));
+                    let a_lo_raw = (a[i] & 0xFFFF) as u16;
+                    let a_hi_raw = ((a[i] >> 16) & 0xFFFF) as u16;
+                    let b_lo_raw = (b[i] & 0xFFFF) as u16;
+                    let b_hi_raw = ((b[i] >> 16) & 0xFFFF) as u16;
+                    let a_lo = Self::bf16_to_f32(a_lo_raw);
+                    let a_hi = Self::bf16_to_f32(a_hi_raw);
+                    let b_lo = Self::bf16_to_f32(b_lo_raw);
+                    let b_hi = Self::bf16_to_f32(b_hi_raw);
+                    let r_lo = if a_lo.is_nan() || b_lo.is_nan() {
+                        a_lo_raw
+                    } else {
+                        Self::f32_to_bf16(a_lo.min(b_lo))
+                    };
+                    let r_hi = if a_hi.is_nan() || b_hi.is_nan() {
+                        a_hi_raw
+                    } else {
+                        Self::f32_to_bf16(a_hi.min(b_hi))
+                    };
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
@@ -335,20 +355,40 @@ impl VectorAlu {
                 }
             }
             ElementType::Float32 => {
+                // AIE2 NaN semantics: when either operand is NaN, always return s1.
                 for i in 0..8 {
                     let fa = f32::from_bits(a[i]);
                     let fb = f32::from_bits(b[i]);
-                    result[i] = fa.max(fb).to_bits();
+                    result[i] = if fa.is_nan() || fb.is_nan() {
+                        a[i]
+                    } else {
+                        fa.max(fb).to_bits()
+                    };
                 }
             }
             ElementType::BFloat16 => {
+                // AIE2 NaN semantics: when either operand is NaN, the compare
+                // unit returns false, and the VMAX mux selects s1 (left operand).
+                // This is NaN propagation from s1, NOT IEEE 754 maxNum.
                 for i in 0..8 {
-                    let a_lo = Self::bf16_to_f32((a[i] & 0xFFFF) as u16);
-                    let a_hi = Self::bf16_to_f32(((a[i] >> 16) & 0xFFFF) as u16);
-                    let b_lo = Self::bf16_to_f32((b[i] & 0xFFFF) as u16);
-                    let b_hi = Self::bf16_to_f32(((b[i] >> 16) & 0xFFFF) as u16);
-                    let r_lo = Self::f32_to_bf16(a_lo.max(b_lo));
-                    let r_hi = Self::f32_to_bf16(a_hi.max(b_hi));
+                    let a_lo_raw = (a[i] & 0xFFFF) as u16;
+                    let a_hi_raw = ((a[i] >> 16) & 0xFFFF) as u16;
+                    let b_lo_raw = (b[i] & 0xFFFF) as u16;
+                    let b_hi_raw = ((b[i] >> 16) & 0xFFFF) as u16;
+                    let a_lo = Self::bf16_to_f32(a_lo_raw);
+                    let a_hi = Self::bf16_to_f32(a_hi_raw);
+                    let b_lo = Self::bf16_to_f32(b_lo_raw);
+                    let b_hi = Self::bf16_to_f32(b_hi_raw);
+                    let r_lo = if a_lo.is_nan() || b_lo.is_nan() {
+                        a_lo_raw
+                    } else {
+                        Self::f32_to_bf16(a_lo.max(b_lo))
+                    };
+                    let r_hi = if a_hi.is_nan() || b_hi.is_nan() {
+                        a_hi_raw
+                    } else {
+                        Self::f32_to_bf16(a_hi.max(b_hi))
+                    };
                     result[i] = (r_lo as u32) | ((r_hi as u32) << 16);
                 }
             }
