@@ -10,7 +10,6 @@
 
 use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
 use crate::interpreter::state::{ExecutionContext, Vec512, Acc1024};
-use crate::tablegen::SemanticOp;
 
 use super::vector_dispatch::VectorAlu;
 use super::vector_pack;
@@ -493,41 +492,6 @@ impl VectorAlu {
         result
     }
 
-    /// Fallback: split a wide op into two narrow halves.
-    ///
-    /// Used for SemanticOps not yet ported to execute_wide.
-    /// Preserves the old clone+increment behavior.
-    pub(super) fn execute_wide_fallback(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        semantic: SemanticOp,
-        et: ElementType,
-    ) -> bool {
-        log::trace!(
-            "[VECTOR_WIDE] fallback to half-split for {:?}",
-            semantic
-        );
-        let handled = Self::execute_half(op, ctx, semantic, et);
-        if handled {
-            let mut hi_op = op.clone();
-            Self::increment_vector_regs(&mut hi_op);
-            Self::execute_half(&hi_op, ctx, semantic, et);
-        }
-        handled
-    }
-
-    /// Increment all VectorReg indices by 1 (low half -> high half).
-    pub(super) fn increment_vector_regs(op: &mut SlotOp) {
-        for src in &mut op.sources {
-            if let Operand::VectorReg(r) = src {
-                *r += 1;
-            }
-        }
-        if let Some(Operand::VectorReg(r)) = &mut op.dest {
-            *r += 1;
-        }
-    }
-
     // ========== Wide Element Manipulation ==========
 
     /// Push a scalar into a 512-bit vector, shifting existing elements.
@@ -790,25 +754,6 @@ impl VectorAlu {
         } else {
             let (a, b) = Self::get_two_vector_sources(op, ctx);
             let result = compute(&a, &b, et);
-            Self::write_vector_dest(op, ctx, result);
-        }
-        true
-    }
-
-    /// Generic dispatcher for unary element-wise operations.
-    pub(super) fn execute_unary_elementwise(
-        op: &SlotOp,
-        ctx: &mut ExecutionContext,
-        et: ElementType,
-        compute: fn(&[u32; 8], ElementType) -> [u32; 8],
-    ) -> bool {
-        if op.is_wide_vector {
-            let src = Self::get_wide_vec_source(op, ctx, 0);
-            let result = Self::wide_element_wise_unary(&src, et, compute);
-            Self::write_wide_vec_dest(op, ctx, result);
-        } else {
-            let src = Self::get_vector_source(op, ctx, 0);
-            let result = compute(&src, et);
             Self::write_vector_dest(op, ctx, result);
         }
         true

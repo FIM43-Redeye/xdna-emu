@@ -1103,3 +1103,206 @@ mod tests {
         assert_eq!(srs_s32(half, 4, RoundingMode::ConvOdd), -17); // -17 is odd
     }
 }
+
+/// Integration tests that exercise SRS through the full VectorAlu dispatch path.
+#[cfg(test)]
+mod integration_tests {
+    use crate::interpreter::bundle::{ElementType, Operand, SlotIndex, SlotOp};
+    use crate::interpreter::execute::vector_dispatch::VectorAlu;
+    use crate::interpreter::state::{ExecutionContext, SrsConfig};
+    use crate::tablegen::SemanticOp;
+
+    fn make_ctx() -> ExecutionContext {
+        ExecutionContext::new()
+    }
+
+    #[test]
+    fn test_vector_srs_int32() {
+        let mut ctx = make_ctx();
+        ctx.accumulator.write(0, [256, 512, 768, 1024, 1280, 1536, 1792, 2048]);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Srs)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::VectorReg(0))
+            .with_source(Operand::AccumReg(0))
+            .with_source(Operand::Immediate(4));
+        op.from_type = Some(ElementType::Int32);
+
+        VectorAlu::execute(&op, &mut ctx);
+        let result = ctx.vector.read(0);
+        assert_eq!(result[0], 16);
+        assert_eq!(result[1], 32);
+        assert_eq!(result[2], 48);
+        assert_eq!(result[3], 64);
+    }
+
+    #[test]
+    fn test_vector_srs_reads_config() {
+        let mut ctx = make_ctx();
+        ctx.accumulator.write(0, [264, 0, 0, 0, 0, 0, 0, 0]);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Srs)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::VectorReg(0))
+            .with_source(Operand::AccumReg(0))
+            .with_source(Operand::Immediate(4));
+        op.from_type = Some(ElementType::Int32);
+
+        // PosInf (mode 9): 16.5 -> 17
+        ctx.srs_config.rounding_mode = 9;
+        ctx.srs_config.saturation_mode = 1;
+        ctx.srs_config.srs_sign = true;
+        VectorAlu::execute(&op, &mut ctx);
+        assert_eq!(ctx.vector.read(0)[0], 17);
+
+        // Floor (mode 0): 16.5 -> 16
+        ctx.srs_config.rounding_mode = 0;
+        ctx.accumulator.write(0, [264, 0, 0, 0, 0, 0, 0, 0]);
+        VectorAlu::execute(&op, &mut ctx);
+        assert_eq!(ctx.vector.read(0)[0], 16);
+
+        // NegInf (mode 8): 16.5 -> 16
+        ctx.srs_config.rounding_mode = 8;
+        ctx.accumulator.write(0, [264, 0, 0, 0, 0, 0, 0, 0]);
+        VectorAlu::execute(&op, &mut ctx);
+        assert_eq!(ctx.vector.read(0)[0], 16);
+    }
+
+    #[test]
+    fn test_vector_srs_saturation_from_config() {
+        let mut ctx = make_ctx();
+        let overflow_val = 32768i64 as u64;
+        ctx.accumulator.write(0, [overflow_val, 0, 0, 0, 0, 0, 0, 0]);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Srs)
+            .as_vector(ElementType::Int16)
+            .with_dest(Operand::VectorReg(0))
+            .with_source(Operand::AccumReg(0))
+            .with_source(Operand::Immediate(0));
+        op.from_type = Some(ElementType::Int32);
+
+        ctx.srs_config.saturation_mode = 1;
+        ctx.srs_config.srs_sign = true;
+        VectorAlu::execute(&op, &mut ctx);
+        let lo16 = ctx.vector.read(0)[0] as i16;
+        assert_eq!(lo16, 32767);
+
+        ctx.srs_config.saturation_mode = 0;
+        ctx.accumulator.write(0, [overflow_val, 0, 0, 0, 0, 0, 0, 0]);
+        VectorAlu::execute(&op, &mut ctx);
+        let lo16_nowrap = ctx.vector.read(0)[0] as i16;
+        assert_eq!(lo16_nowrap, -32768);
+    }
+
+    #[test]
+    fn test_vector_srs_from_type_masks_accumulator() {
+        let mut ctx = make_ctx();
+        ctx.accumulator.write(0, [
+            0xDEAD_BEEF_0000_0064, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Srs)
+            .as_vector(ElementType::Int16)
+            .with_dest(Operand::VectorReg(0))
+            .with_source(Operand::AccumReg(0))
+            .with_source(Operand::Immediate(0));
+        op.from_type = Some(ElementType::Int32);
+
+        ctx.srs_config.rounding_mode = 0;
+        ctx.srs_config.saturation_mode = 1;
+        ctx.srs_config.srs_sign = true;
+
+        VectorAlu::execute(&op, &mut ctx);
+        let result = ctx.vector.read(0);
+        let lo16 = result[0] as i16;
+        assert_eq!(lo16, 100, "from_type=Int32 should mask to low 32 bits");
+    }
+
+    #[test]
+    fn test_wide_srs_cm_to_x() {
+        let mut ctx = make_ctx();
+
+        let acc_lo: [u64; 8] = [10, 20, 30, 40, 50, 60, 70, 80];
+        let acc_hi: [u64; 8] = [90, 100, 110, 120, 130, 140, 150, 160];
+        ctx.accumulator.write(0, acc_lo);
+        ctx.accumulator.write(1, acc_hi);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Srs)
+            .as_vector(ElementType::Int32)
+            .with_dest(Operand::VectorReg(4))
+            .with_source(Operand::AccumReg(0))
+            .with_source(Operand::Immediate(0));
+        op.from_type = Some(ElementType::Int64);
+        op.is_wide_vector = true;
+
+        ctx.srs_config.rounding_mode = 0;
+        ctx.srs_config.saturation_mode = 0;
+        ctx.srs_config.srs_sign = true;
+
+        VectorAlu::execute(&op, &mut ctx);
+
+        let v4 = ctx.vector.read(4);
+        assert_eq!(v4, [10, 20, 30, 40, 50, 60, 70, 80]);
+        let v5 = ctx.vector.read(5);
+        assert_eq!(v5, [90, 100, 110, 120, 130, 140, 150, 160]);
+    }
+
+    #[test]
+    fn test_srs_from_acc32_to_d16() {
+        let mut acc = [0u64; 8];
+        for i in 0..8usize {
+            let lo = (100 + i * 2) as u64;
+            let hi = (100 + i * 2 + 1) as u64;
+            acc[i] = lo | (hi << 32);
+        }
+
+        let cfg = SrsConfig {
+            rounding_mode: 0,
+            saturation_mode: 0,
+            srs_sign: true,
+        };
+
+        let result = VectorAlu::vector_srs_from_acc(
+            &acc, 0, ElementType::Int32, ElementType::Int16, &cfg,
+        );
+
+        for i in 0..8 {
+            let expected_lo = (100 + i * 2) as u16;
+            let expected_hi = (100 + i * 2 + 1) as u16;
+            let expected = (expected_lo as u32) | ((expected_hi as u32) << 16);
+            assert_eq!(result[i], expected, "result[{}]: got {:#010x}, expected {:#010x}",
+                i, result[i], expected);
+        }
+    }
+
+    #[test]
+    fn test_srs_from_acc32_to_d8() {
+        let mut acc = [0u64; 8];
+        for i in 0..8usize {
+            let lo = (10 + i * 2) as u64;
+            let hi = (10 + i * 2 + 1) as u64;
+            acc[i] = lo | (hi << 32);
+        }
+
+        let cfg = SrsConfig {
+            rounding_mode: 0,
+            saturation_mode: 0,
+            srs_sign: true,
+        };
+
+        let result = VectorAlu::vector_srs_from_acc(
+            &acc, 0, ElementType::Int32, ElementType::Int8, &cfg,
+        );
+
+        for i in 0..4 {
+            let mut expected = 0u32;
+            for j in 0..4 {
+                let lane_idx = i * 4 + j;
+                let val = (10 + lane_idx) as u8;
+                expected |= (val as u32) << (j * 8);
+            }
+            assert_eq!(result[i], expected, "result[{}]: got {:#010x}, expected {:#010x}",
+                i, result[i], expected);
+        }
+    }
+}

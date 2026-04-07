@@ -817,3 +817,126 @@ mod tests {
         }
     }
 }
+
+/// Integration tests that exercise UPS through the full VectorAlu dispatch path.
+#[cfg(test)]
+mod integration_tests {
+    use crate::interpreter::bundle::{ElementType, Operand, SlotIndex, SlotOp};
+    use crate::interpreter::execute::vector_dispatch::VectorAlu;
+    use crate::interpreter::execute::vector_ups::ups_vector_to_acc;
+    use crate::interpreter::execute::vector_ups::ups_vector_to_acc_wide;
+    use crate::interpreter::state::{ExecutionContext, SrsConfig};
+    use crate::tablegen::SemanticOp;
+
+    fn make_ctx() -> ExecutionContext {
+        ExecutionContext::new()
+    }
+
+    #[test]
+    fn test_vector_ups_srs_roundtrip() {
+        let mut ctx = make_ctx();
+        let src = [0x0002_0001u32, 0x0004_0003, 0x0006_0005, 0x0008_0007,
+                    0x000A_0009, 0x000C_000B, 0x000E_000D, 0x0010_000F];
+        let acc = ups_vector_to_acc(
+            &src, 0, ElementType::Int16, ElementType::Int32,
+        );
+        ctx.accumulator.write(0, acc);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Srs)
+            .as_vector(ElementType::Int16)
+            .with_dest(Operand::VectorReg(0))
+            .with_source(Operand::AccumReg(0))
+            .with_source(Operand::Immediate(0));
+        op.from_type = Some(ElementType::Int32);
+
+        VectorAlu::execute(&op, &mut ctx);
+        let result = ctx.vector.read(0);
+        assert_eq!(result[0], 0x0002_0001, "lanes 0-1");
+        assert_eq!(result[1], 0x0004_0003, "lanes 2-3");
+        assert_eq!(result[2], 0x0006_0005, "lanes 4-5");
+        assert_eq!(result[3], 0x0008_0007, "lanes 6-7");
+        assert_eq!(result[4], 0x000A_0009, "lanes 8-9");
+        assert_eq!(result[5], 0x000C_000B, "lanes 10-11");
+        assert_eq!(result[6], 0x000E_000D, "lanes 12-13");
+        assert_eq!(result[7], 0x0010_000F, "lanes 14-15");
+    }
+
+    #[test]
+    fn test_wide_ups_srs_s8_s32_roundtrip() {
+        let src = [
+            0x04030201u32, 0x08070605, 0x0C0B0A09, 0x100F0E0D,
+            0x14131211, 0x18171615, 0x1C1B1A19, 0x201F1E1D,
+        ];
+
+        let acc_wide = ups_vector_to_acc_wide(
+            &src, 0, ElementType::Int8, ElementType::Int32,
+        );
+        assert!(acc_wide.iter().any(|&v| v != 0), "UPS produced all zeros");
+
+        let acc_lo: [u64; 8] = acc_wide[..8].try_into().unwrap();
+        let acc_hi: [u64; 8] = acc_wide[8..].try_into().unwrap();
+
+        let cfg = SrsConfig::default();
+        let result_lo = VectorAlu::vector_srs_from_acc(
+            &acc_lo, 0, ElementType::Int32, ElementType::Int8, &cfg,
+        );
+        let result_hi = VectorAlu::vector_srs_from_acc(
+            &acc_hi, 0, ElementType::Int32, ElementType::Int8, &cfg,
+        );
+
+        let lanes_per_half = 16usize;
+        let to_bits = 8usize;
+        let words_per_half = (lanes_per_half * to_bits + 31) / 32;
+        let n = words_per_half.min(8);
+        assert_eq!(n, 4, "should be 4 words per half for 16 x i8");
+
+        let mut packed = [0u32; 8];
+        packed[..n].copy_from_slice(&result_lo[..n]);
+        packed[n..n + n].copy_from_slice(&result_hi[..n]);
+        assert_eq!(packed, src, "wide s8.s32 UPS->SRS round-trip failed");
+
+        // Also test with non-zero shift
+        let acc_shifted = ups_vector_to_acc_wide(
+            &src, 4, ElementType::Int8, ElementType::Int32,
+        );
+        let acc_s_lo: [u64; 8] = acc_shifted[..8].try_into().unwrap();
+        let acc_s_hi: [u64; 8] = acc_shifted[8..].try_into().unwrap();
+        let res_s_lo = VectorAlu::vector_srs_from_acc(
+            &acc_s_lo, 4, ElementType::Int32, ElementType::Int8, &cfg,
+        );
+        let res_s_hi = VectorAlu::vector_srs_from_acc(
+            &acc_s_hi, 4, ElementType::Int32, ElementType::Int8, &cfg,
+        );
+        let mut packed_s = [0u32; 8];
+        packed_s[..4].copy_from_slice(&res_s_lo[..4]);
+        packed_s[4..8].copy_from_slice(&res_s_hi[..4]);
+        assert_eq!(packed_s, src, "wide s8.s32 UPS->SRS round-trip with shift=4 failed");
+    }
+
+    #[test]
+    fn test_wide_ups_x2c() {
+        let mut ctx = make_ctx();
+
+        ctx.vector.write(4, [1, 2, 3, 4, 5, 6, 7, 8]);
+        ctx.vector.write(5, [9, 10, 11, 12, 13, 14, 15, 16]);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Ups)
+            .as_vector(ElementType::Int64)
+            .with_dest(Operand::AccumReg(0))
+            .with_source(Operand::VectorReg(4))
+            .with_source(Operand::Immediate(0));
+        op.from_type = Some(ElementType::Int32);
+        op.is_wide_vector = true;
+
+        VectorAlu::execute(&op, &mut ctx);
+
+        let acc_lo = ctx.accumulator.read(0);
+        for i in 0..8 {
+            assert_eq!(acc_lo[i], (i as u64 + 1), "acc_lo lane {i}");
+        }
+        let acc_hi = ctx.accumulator.read(1);
+        for i in 0..8 {
+            assert_eq!(acc_hi[i], (i as u64 + 9), "acc_hi lane {i}");
+        }
+    }
+}

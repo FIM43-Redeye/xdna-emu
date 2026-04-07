@@ -335,3 +335,173 @@ impl VectorAlu {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::interpreter::bundle::{ElementType, Operand, SlotIndex, SlotOp};
+    use crate::interpreter::execute::vector_dispatch::VectorAlu;
+    use crate::interpreter::state::ExecutionContext;
+    use crate::tablegen::SemanticOp;
+    use crate::tablegen::decoder_ffi::AccumWidth;
+
+    fn make_ctx() -> ExecutionContext {
+        ExecutionContext::new()
+    }
+
+    #[test]
+    fn test_vector_convert_bf16_to_f32() {
+        let mut ctx = make_ctx();
+        let bf16_1 = VectorAlu::f32_to_bf16(1.0);
+        let bf16_2 = VectorAlu::f32_to_bf16(2.0);
+        let bf16_3 = VectorAlu::f32_to_bf16(3.0);
+        let bf16_4 = VectorAlu::f32_to_bf16(4.0);
+        ctx.vector.write(
+            0,
+            [
+                (bf16_1 as u32) | ((bf16_2 as u32) << 16),
+                (bf16_3 as u32) | ((bf16_4 as u32) << 16),
+                0, 0, 0, 0, 0, 0,
+            ],
+        );
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Convert)
+            .as_vector(ElementType::Float32)
+            .with_dest(Operand::VectorReg(1))
+            .with_source(Operand::VectorReg(0));
+        op.from_type = Some(ElementType::BFloat16);
+
+        VectorAlu::execute(&op, &mut ctx);
+        let result = ctx.vector.read(1);
+
+        let f0 = f32::from_bits(result[0]);
+        let f1 = f32::from_bits(result[1]);
+        let f2 = f32::from_bits(result[2]);
+        let f3 = f32::from_bits(result[3]);
+        assert!((f0 - 1.0).abs() < 0.01, "Expected 1.0, got {}", f0);
+        assert!((f1 - 2.0).abs() < 0.01, "Expected 2.0, got {}", f1);
+        assert!((f2 - 3.0).abs() < 0.01, "Expected 3.0, got {}", f2);
+        assert!((f3 - 4.0).abs() < 0.01, "Expected 4.0, got {}", f3);
+    }
+
+    #[test]
+    fn test_vfloor_bf16_to_s32_shift0() {
+        let result = VectorAlu::vector_floor_bf16_to_s32(
+            &[
+                ((VectorAlu::f32_to_bf16(1.5) as u32) | ((VectorAlu::f32_to_bf16(-2.5) as u32) << 16)),
+                ((VectorAlu::f32_to_bf16(0.0) as u32) | ((VectorAlu::f32_to_bf16(100.0) as u32) << 16)),
+                0, 0, 0, 0, 0, 0,
+            ],
+            0,
+        );
+        assert_eq!(result[0] as i32, 1, "floor(1.5) = 1");
+        assert_eq!(result[1] as i32, -3, "floor(-2.5) = -3");
+        assert_eq!(result[2] as i32, 0, "floor(0.0) = 0");
+        assert_eq!(result[3] as i32, 100, "floor(100.0) = 100");
+    }
+
+    #[test]
+    fn test_vfloor_signed_6bit_shift() {
+        let bf16_10 = VectorAlu::f32_to_bf16(10.0);
+        let src = [bf16_10 as u32, 0, 0, 0, 0, 0, 0, 0];
+
+        assert_eq!(VectorAlu::vector_floor_bf16_to_s32(&src, 3)[0] as i32, 80);
+        assert_eq!(VectorAlu::vector_floor_bf16_to_s32(&src, 0x23)[0] as i32, 0);
+        assert_eq!(VectorAlu::vector_floor_bf16_to_s32(&src, -249)[0] as i32, 1280);
+        assert_eq!(VectorAlu::vector_floor_bf16_to_s32(&src, 0x20)[0] as i32, 0);
+    }
+
+    #[test]
+    fn test_vfloor_nan_saturates_to_int_max() {
+        let src = [0xFFFF_FFFF, 0, 0, 0, 0, 0, 0, 0];
+        let result = VectorAlu::vector_floor_bf16_to_s32(&src, 0);
+        assert_eq!(result[0], i32::MAX as u32, "NaN -> INT_MAX");
+        assert_eq!(result[1], i32::MAX as u32, "NaN -> INT_MAX");
+    }
+
+    #[test]
+    fn test_vconv_bf16_fp32_acc_source() {
+        let mut ctx = make_ctx();
+
+        let mut acc = [0u64; 8];
+        for i in 0..8 {
+            let f_lo = ((i * 2 + 1) as f32).to_bits();
+            let f_hi = ((i * 2 + 2) as f32).to_bits();
+            acc[i] = (f_lo as u64) | ((f_hi as u64) << 32);
+        }
+        ctx.accumulator.write(0, acc);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Convert)
+            .as_vector(ElementType::BFloat16)
+            .with_dest(Operand::VectorReg(0))
+            .with_source(Operand::AccumReg(0));
+        op.from_type = Some(ElementType::Float32);
+        op.accum_width = Some(AccumWidth::Half);
+
+        assert!(VectorAlu::execute(&op, &mut ctx));
+        let result = ctx.vector.read(0);
+
+        for i in 0..8 {
+            let lo_bf16 = (result[i / 2] >> ((i % 2) * 16)) as u16;
+            let expected = VectorAlu::f32_to_bf16((i + 1) as f32);
+            assert_eq!(lo_bf16, expected,
+                "element {}: expected bf16({}.0)=0x{:04X}, got 0x{:04X}",
+                i, i + 1, expected, lo_bf16);
+        }
+    }
+
+    #[test]
+    fn test_vconv_fp32_bf16_acc_dest() {
+        let mut ctx = make_ctx();
+
+        let mut vec_data = [0u32; 8];
+        for i in 0..8 {
+            let bf_lo = VectorAlu::f32_to_bf16((i * 2 + 1) as f32);
+            let bf_hi = VectorAlu::f32_to_bf16((i * 2 + 2) as f32);
+            vec_data[i] = (bf_lo as u32) | ((bf_hi as u32) << 16);
+        }
+        ctx.vector.write(0, vec_data);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Store, SemanticOp::Convert)
+            .as_vector(ElementType::Float32)
+            .with_dest(Operand::AccumReg(0))
+            .with_source(Operand::VectorReg(0));
+        op.from_type = Some(ElementType::BFloat16);
+        op.is_wide_vector = true;
+
+        assert!(VectorAlu::execute(&op, &mut ctx));
+        let acc = ctx.accumulator.read(0);
+
+        for i in 0..8 {
+            let lo = acc[i] as u32;
+            let hi = (acc[i] >> 32) as u32;
+            let f_lo = f32::from_bits(lo);
+            let f_hi = f32::from_bits(hi);
+            let expected_lo = (i * 2 + 1) as f32;
+            let expected_hi = (i * 2 + 2) as f32;
+            assert!((f_lo - expected_lo).abs() < 0.1,
+                "lane {} lo: expected {}, got {}", i, expected_lo, f_lo);
+            assert!((f_hi - expected_hi).abs() < 0.1,
+                "lane {} hi: expected {}, got {}", i, expected_hi, f_hi);
+        }
+    }
+
+    #[test]
+    fn test_vector_convert_int32_to_f32() {
+        let mut ctx = make_ctx();
+        ctx.vector.write(0, [1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let mut op = SlotOp::from_semantic(SlotIndex::Vector, SemanticOp::Convert)
+            .as_vector(ElementType::Float32)
+            .with_dest(Operand::VectorReg(1))
+            .with_source(Operand::VectorReg(0));
+        op.from_type = Some(ElementType::Int32);
+
+        VectorAlu::execute(&op, &mut ctx);
+        let result = ctx.vector.read(1);
+
+        for i in 0..8 {
+            let f = f32::from_bits(result[i]);
+            assert_eq!(f, (i + 1) as f32);
+        }
+    }
+}

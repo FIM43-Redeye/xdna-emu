@@ -2,10 +2,6 @@
 //!
 //! Single entry point that routes SemanticOp variants to operation
 //! implementations. Each match arm is a single function call.
-//!
-//! During the dispatch inversion refactor, this file starts as a
-//! scaffold that delegates to the old execute_half/execute_wide.
-//! As operations are extracted, they replace arms in this table.
 
 use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
 use crate::interpreter::state::ExecutionContext;
@@ -24,18 +20,14 @@ impl VectorAlu {
             return false;
         };
 
-        // Only handle vector operations
+        // Only handle vector operations.
         if !op.is_vector {
             return false;
         }
 
         // Skip fused ops that have memory operands -- MemoryUnit handles these.
-        // Fused instructions (vlda.ups, vst.srs, vst.pack, vlda.conv, vst.conv)
-        // combine memory access with compute and need tile access.
-        //
-        // Standalone SRS/Pack/UPS (e.g., VSRS in the ST slot, VUPS in the LDA
-        // slot) are also on memory slots but have NO memory operand -- they
-        // operate purely on registers and must be handled here.
+        // Standalone SRS/Pack/UPS on memory slots with NO memory operand are
+        // register-only and must be handled here.
         if op.slot.is_memory() && matches!(semantic,
             SemanticOp::Ups | SemanticOp::Srs | SemanticOp::Pack
             | SemanticOp::Unpack | SemanticOp::Convert)
@@ -49,87 +41,71 @@ impl VectorAlu {
         log::trace!("[VECTOR_ALU] Checking semantic={:?} element_type={:?} dest={:?}",
             semantic, op.element_type, op.dest);
 
-        // --- Extracted operations: dispatch directly, bypass half/wide routing ---
         match semantic {
-            SemanticOp::Add => return Self::execute_add(op, ctx, et),
-            SemanticOp::Sub => return Self::execute_binary_elementwise(op, ctx, et, Self::vector_sub),
-            SemanticOp::Mul => return Self::execute_binary_elementwise(op, ctx, et, Self::vector_mul),
-            SemanticOp::Min => return Self::execute_binary_elementwise(op, ctx, et, Self::vector_min),
-            SemanticOp::Max => return Self::execute_binary_elementwise(op, ctx, et, Self::vector_max),
-            SemanticOp::Neg => return Self::execute_neg(op, ctx, et),
-            SemanticOp::Shl => return Self::execute_shl(op, ctx, et),
-            SemanticOp::Srl => return Self::execute_srl(op, ctx, et),
-            SemanticOp::Sra => return Self::execute_sra(op, ctx, et),
-            SemanticOp::AbsGtz => return Self::execute_abs_gtz(op, ctx, et),
-            SemanticOp::NegGtz => return Self::execute_neg_gtz(op, ctx, et),
-            SemanticOp::NegLtz => return Self::execute_neg_ltz(op, ctx, et),
-            SemanticOp::SubLt => return Self::execute_sub_lt(op, ctx, et),
-            SemanticOp::SubGe => return Self::execute_sub_ge(op, ctx, et),
-            SemanticOp::MaxDiffLt => return Self::execute_maxdiff_lt(op, ctx, et),
+            // ========== Arithmetic ==========
+            SemanticOp::Add => Self::execute_add(op, ctx, et),
+            SemanticOp::Sub => Self::execute_binary_elementwise(op, ctx, et, Self::vector_sub),
+            SemanticOp::Mul => Self::execute_binary_elementwise(op, ctx, et, Self::vector_mul),
+            SemanticOp::Min => Self::execute_binary_elementwise(op, ctx, et, Self::vector_min),
+            SemanticOp::Max => Self::execute_binary_elementwise(op, ctx, et, Self::vector_max),
+            SemanticOp::Neg => Self::execute_neg(op, ctx, et),
+            SemanticOp::NegAdd => Self::execute_accumulate(op, ctx, et, semantic),
+            SemanticOp::Shl => Self::execute_shl(op, ctx, et),
+            SemanticOp::Srl => Self::execute_srl(op, ctx, et),
+            SemanticOp::Sra => Self::execute_sra(op, ctx, et),
+            SemanticOp::AbsGtz => Self::execute_abs_gtz(op, ctx, et),
+            SemanticOp::NegGtz => Self::execute_neg_gtz(op, ctx, et),
+            SemanticOp::NegLtz => Self::execute_neg_ltz(op, ctx, et),
+            SemanticOp::SubLt => Self::execute_sub_lt(op, ctx, et),
+            SemanticOp::SubGe => Self::execute_sub_ge(op, ctx, et),
+            SemanticOp::MaxDiffLt => Self::execute_maxdiff_lt(op, ctx, et),
             SemanticOp::Accumulate | SemanticOp::AccumSub
-            | SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub
-            | SemanticOp::NegAdd => return Self::execute_accumulate(op, ctx, et, semantic),
-            SemanticOp::Cmp => return Self::execute_cmp(op, ctx, et),
-            SemanticOp::SetGe => return Self::execute_setge(op, ctx, et),
-            SemanticOp::SetLt => return Self::execute_setlt(op, ctx, et),
-            SemanticOp::SetEq => return Self::execute_seteq(op, ctx, et),
-            SemanticOp::MaxLt => return Self::execute_maxlt(op, ctx, et),
-            SemanticOp::MinGe => return Self::execute_minge(op, ctx, et),
-            SemanticOp::VectorSelect => return Self::execute_select(op, ctx, et),
+            | SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub => {
+                Self::execute_accumulate(op, ctx, et, semantic)
+            }
 
-            // Data movement
-            SemanticOp::Shuffle => return Self::execute_shuffle(op, ctx, et),
-            SemanticOp::VectorBroadcast => return Self::execute_vector_broadcast(op, ctx, et),
-            SemanticOp::VectorExtract => return Self::execute_vector_extract(op, ctx, et),
-            SemanticOp::VectorInsert => return Self::execute_vector_insert(op, ctx, et),
-            SemanticOp::VectorPush | SemanticOp::VectorPushHi => return Self::execute_vector_push(op, ctx, et),
-            SemanticOp::Align => return Self::execute_align(op, ctx, et),
-            SemanticOp::Copy => return Self::execute_copy(op, ctx, et),
-            SemanticOp::VectorClear => return Self::execute_vector_clear(op, ctx, et),
+            // ========== Comparison ==========
+            SemanticOp::Cmp => Self::execute_cmp(op, ctx, et),
+            SemanticOp::SetGe => Self::execute_setge(op, ctx, et),
+            SemanticOp::SetLt => Self::execute_setlt(op, ctx, et),
+            SemanticOp::SetEq => Self::execute_seteq(op, ctx, et),
+            SemanticOp::MaxLt => Self::execute_maxlt(op, ctx, et),
+            SemanticOp::MinGe => Self::execute_minge(op, ctx, et),
+            SemanticOp::VectorSelect => Self::execute_select(op, ctx, et),
 
-            // Bitwise (typeless generic dispatchers)
-            SemanticOp::And => return Self::execute_binary_typeless(op, ctx, Self::vector_bitwise_and),
-            SemanticOp::Or => return Self::execute_binary_typeless(op, ctx, Self::vector_bitwise_or),
-            SemanticOp::Xor => return Self::execute_binary_typeless(op, ctx, Self::vector_bitwise_xor),
-            SemanticOp::Not => return Self::execute_unary_typeless(op, ctx, Self::vector_bitwise_not),
+            // ========== Data movement ==========
+            SemanticOp::Shuffle => Self::execute_shuffle(op, ctx, et),
+            SemanticOp::VectorBroadcast => Self::execute_vector_broadcast(op, ctx, et),
+            SemanticOp::VectorExtract => Self::execute_vector_extract(op, ctx, et),
+            SemanticOp::VectorInsert => Self::execute_vector_insert(op, ctx, et),
+            SemanticOp::VectorPush | SemanticOp::VectorPushHi => Self::execute_vector_push(op, ctx, et),
+            SemanticOp::Align => Self::execute_align(op, ctx, et),
+            SemanticOp::Copy => Self::execute_copy(op, ctx, et),
+            SemanticOp::VectorClear => Self::execute_vector_clear(op, ctx, et),
 
-            // Pack/Unpack
-            SemanticOp::Pack => return Self::execute_pack(op, ctx, et),
-            SemanticOp::Unpack => return Self::execute_unpack(op, ctx, et),
+            // ========== Bitwise ==========
+            SemanticOp::And => Self::execute_binary_typeless(op, ctx, Self::vector_bitwise_and),
+            SemanticOp::Or => Self::execute_binary_typeless(op, ctx, Self::vector_bitwise_or),
+            SemanticOp::Xor => Self::execute_binary_typeless(op, ctx, Self::vector_bitwise_xor),
+            SemanticOp::Not => Self::execute_unary_typeless(op, ctx, Self::vector_bitwise_not),
 
-            // SRS/UPS/Convert
-            SemanticOp::Srs => return Self::execute_srs(op, ctx, et),
-            SemanticOp::Ups => return Self::execute_ups(op, ctx, et),
-            SemanticOp::Convert => return Self::execute_convert(op, ctx, et),
+            // ========== Pack/Unpack ==========
+            SemanticOp::Pack => Self::execute_pack(op, ctx, et),
+            SemanticOp::Unpack => Self::execute_unpack(op, ctx, et),
 
-            _ => {}
-        }
+            // ========== Pipelines ==========
+            SemanticOp::Srs => Self::execute_srs(op, ctx, et),
+            SemanticOp::Ups => Self::execute_ups(op, ctx, et),
+            SemanticOp::Convert => Self::execute_convert(op, ctx, et),
 
-        // Determine if this needs full-width (1024-bit) processing:
-        // 1. is_wide_vector: instruction has Vector512 operands (x-registers)
-        // 2. AccumReg-only ops (VADD, VSUB, VNEG) that use cm-class (Full)
-        //    accumulators -- these need wide read/write.
-        // 3. Accumulator source: SRS/UPS/Convert with accumulator source
-        //    need the wide path because execute_half only reads VectorReg
-        //    sources. Both Half (bml/bmh) and Full (cm) accumulators route here.
-        let has_wide_acc_source = matches!(op.accum_width,
-            Some(crate::tablegen::decoder_ffi::AccumWidth::Full)
-            | Some(crate::tablegen::decoder_ffi::AccumWidth::Half));
-        let is_accum_only = matches!(semantic,
-            SemanticOp::Accumulate | SemanticOp::AccumSub
-            | SemanticOp::AccumNegAdd | SemanticOp::AccumNegSub
-            | SemanticOp::Neg | SemanticOp::NegAdd) && {
-            let has_acc_source = op.sources.iter()
-                .any(|s| matches!(s, Operand::AccumReg(_)));
-            let has_vec_source = op.sources.iter()
-                .any(|s| matches!(s, Operand::VectorReg(_)));
-            has_acc_source && !has_vec_source
-        };
+            // ========== Matrix engine ==========
+            SemanticOp::Mac | SemanticOp::MatMul | SemanticOp::MatMulSub
+            | SemanticOp::NegMul | SemanticOp::NegMatMul
+            | SemanticOp::AddMac | SemanticOp::SubMac => {
+                super::vector_matmul::execute_matmul(op, ctx)
+            }
 
-        if op.is_wide_vector || is_accum_only || has_wide_acc_source {
-            Self::execute_wide(op, ctx, semantic, et)
-        } else {
-            Self::execute_half(op, ctx, semantic, et)
+            _ => false,
         }
     }
 }

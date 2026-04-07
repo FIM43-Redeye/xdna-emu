@@ -5,6 +5,7 @@
 
 use crate::interpreter::bundle::{ElementType, Operand, SlotOp};
 use crate::interpreter::state::ExecutionContext;
+use crate::tablegen::SemanticOp;
 
 use super::vector_dispatch::VectorAlu;
 
@@ -1312,7 +1313,8 @@ impl VectorAlu {
                 .filter(|s| matches!(s, Operand::VectorReg(_)))
                 .count();
             if vec_source_count >= 2 {
-                return Self::execute_wide_fallback(op, ctx, crate::tablegen::SemanticOp::NegGtz, et);
+                // Two-source wide VNEG_GTZ: not yet implemented.
+                return false;
             }
             let a = Self::get_wide_vec_source(op, ctx, 0);
             let result = Self::wide_element_wise_unary(&a, et, Self::vector_neg_gtz);
@@ -1454,8 +1456,8 @@ impl VectorAlu {
                 Self::write_vector_dest(op, ctx, result);
             }
         } else if op.is_wide_vector {
-            // Legacy: vector-into-accumulator, use fallback
-            return Self::execute_wide_fallback(op, ctx, semantic, et);
+            // Wide vector-into-accumulator: not yet implemented.
+            return false;
         } else {
             // Legacy: accumulate a vector source into an accumulator.
             let src = Self::get_vector_source(op, ctx, 0);
@@ -1463,6 +1465,278 @@ impl VectorAlu {
             Self::vector_accumulate(ctx, acc_reg, &src, et);
         }
         true
+    }
+
+    /// Accumulator-to-accumulator add/subtract.
+    ///
+    /// Handles VADD, VSUB, VNEGADD, VNEGSUB and their .f (float) variants.
+    /// These take two accumulator (cm-class, 1024-bit) sources and write
+    /// a 1024-bit result.
+    ///
+    /// The config register (scalar operand) controls:
+    /// - Bit  0: zero_acc1 (zero acc1 before operation)
+    /// - Bit 10: shift16 (right-shift result by 16 bits)
+    /// - Bit 11: sub_acc1 (negate acc1)
+    /// - Bit 12: sub_acc2 (negate acc2)
+    ///
+    /// Base operations (before config modifiers):
+    /// - vadd:    dst = acc1 + acc2
+    /// - vsub:    dst = acc1 - acc2
+    /// - vnegadd: dst = -acc1 + acc2
+    /// - vnegsub: dst = -acc1 - acc2
+    pub(super) fn execute_acc_add_sub(op: &SlotOp, ctx: &mut ExecutionContext) {
+        // Collect the two AccumReg source indices.
+        let mut acc_sources: Vec<u8> = Vec::new();
+        for src in &op.sources {
+            if let Operand::AccumReg(r) = src {
+                acc_sources.push(*r);
+            }
+        }
+
+        let acc1_reg = if !acc_sources.is_empty() { acc_sources[0] } else { 0 };
+        let acc2_reg = if acc_sources.len() >= 2 { acc_sources[1] } else { acc1_reg };
+
+        // Read config register.
+        let conf = Self::get_config_register(op, ctx).unwrap_or(0);
+        let zero_acc1 = (conf & 1) != 0;
+        let shift16 = ((conf >> 10) & 1) != 0;
+        let sub_acc1 = ((conf >> 11) & 1) != 0;
+        let sub_acc2 = ((conf >> 12) & 1) != 0;
+
+        // Determine md1/md2 encoding bits from SemanticOp.
+        //
+        // The hardware VACC ALU has two mode bits (md1, md2) that XOR with the
+        // config register's sub_acc1/sub_acc2 bits to determine the effective
+        // sign of each accumulator operand:
+        //   negate_acc1 = md1 XOR sub_acc1
+        //   negate_acc2 = md2 XOR sub_acc2
+        //
+        // Encoding:       md1  md2   Operation
+        //   VADD           0    0    +acc1 + acc2
+        //   VSUB           0    1    +acc1 - acc2
+        //   VNEGSUB        1    0    -acc1 + acc2
+        //   VNEGADD        1    1    -acc1 - acc2 = -(acc1 + acc2)
+        //
+        // Note: VNEGADD negates BOTH operands (the "add" refers to the
+        // unsigned operation, "neg" flips both signs). VNEGSUB negates only
+        // acc1 (the "sub" flips one sign, "neg" flips another, net one flip).
+        let semantic = op.semantic.unwrap_or(SemanticOp::Accumulate);
+        let enc_lower = op.encoding_name.as_deref().unwrap_or("").to_ascii_lowercase();
+        // Map semantic -> (md1, md2).  Accept both AccumXxx (build-time) and
+        // generic NegAdd (runtime mnemonic dispatch, no NegSub variant exists).
+        let (md1, md2) = match semantic {
+            SemanticOp::Accumulate => (false, false),                    // VADD
+            SemanticOp::AccumSub => (false, true),                       // VSUB
+            SemanticOp::AccumNegAdd => (true, true),                     // VNEGADD
+            SemanticOp::AccumNegSub => (true, false),                    // VNEGSUB
+            SemanticOp::NegAdd => {
+                // Runtime mnemonic dispatch -- both vnegadd and vnegsub map to
+                // NegAdd.  Distinguish via encoding name.
+                if enc_lower.contains("negsub") {
+                    (true, false)                                        // VNEGSUB
+                } else {
+                    (true, true)                                         // VNEGADD
+                }
+            }
+            _ => (false, false),
+        };
+        // Float mode from element_type (set at build time from mnemonic ".f" suffix).
+        let is_float = matches!(op.element_type, Some(ElementType::Float32) | Some(ElementType::BFloat16));
+
+        // Wide (cm, 1024-bit) vs narrow (bm, 512-bit) accumulator.
+        // Use AccumWidth metadata from decoder when available (structural signal).
+        // Fallback: cm registers always use even base indices, so odd index implies bm.
+        let dst_reg = Self::get_acc_dest(op);
+        let is_wide = match op.accum_width {
+            Some(crate::tablegen::decoder_ffi::AccumWidth::Full) => true,
+            Some(crate::tablegen::decoder_ffi::AccumWidth::Half)
+            | Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterLow)
+            | Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterHigh) => false,
+            None => {
+                // Legacy fallback: if any index is odd, it must be a bm half.
+                let any_odd = acc_sources.iter().any(|r| r % 2 != 0) || dst_reg % 2 != 0;
+                !any_odd
+            }
+        };
+
+        // Compute effective signs: md bits XOR config bits (mirrors hardware).
+        let negate_acc1 = md1 ^ sub_acc1;
+        let negate_acc2 = md2 ^ sub_acc2;
+
+        if is_wide {
+            // Wide path: 1024-bit cm registers (16 x 64-bit lanes).
+            let a1 = ctx.accumulator.read_wide(acc1_reg);
+            let a2 = ctx.accumulator.read_wide(acc2_reg);
+            let mut result = [0u64; 16];
+
+            if is_float {
+                use super::vector_float::{fp32_flush_to_zero, aie2_acc_fp32_add};
+                for i in 0..16 {
+                    let mut a1_lo = if zero_acc1 { 0u32 } else { fp32_flush_to_zero(a1[i] as u32) };
+                    let mut a1_hi = if zero_acc1 { 0u32 } else { fp32_flush_to_zero((a1[i] >> 32) as u32) };
+                    let mut a2_lo = fp32_flush_to_zero(a2[i] as u32);
+                    let mut a2_hi = fp32_flush_to_zero((a2[i] >> 32) as u32);
+
+                    // Negate by flipping sign bit (works for zero, normal, inf, NaN).
+                    if negate_acc1 { a1_lo ^= 0x8000_0000; a1_hi ^= 0x8000_0000; }
+                    if negate_acc2 { a2_lo ^= 0x8000_0000; a2_hi ^= 0x8000_0000; }
+
+                    // Use acc ALU add (no output FTZ): the accumulator
+                    // register file preserves denormalized fp32 values.
+                    let r_lo = aie2_acc_fp32_add(a1_lo, a2_lo);
+                    let r_hi = aie2_acc_fp32_add(a1_hi, a2_hi);
+                    result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
+                }
+            } else {
+                // Acc32 mode: each u64 holds two independent 32-bit accumulator
+                // lanes.  The hardware ALU has no carry chain between the lo and
+                // hi halves -- all arithmetic is per-lane 32-bit.
+                for i in 0..16 {
+                    let v1_lo = if zero_acc1 { 0i32 } else { a1[i] as i32 };
+                    let v1_hi = if zero_acc1 { 0i32 } else { (a1[i] >> 32) as i32 };
+                    let v2_lo = a2[i] as i32;
+                    let v2_hi = (a2[i] >> 32) as i32;
+                    let v1_lo = if negate_acc1 { v1_lo.wrapping_neg() } else { v1_lo };
+                    let v1_hi = if negate_acc1 { v1_hi.wrapping_neg() } else { v1_hi };
+                    let v2_lo = if negate_acc2 { v2_lo.wrapping_neg() } else { v2_lo };
+                    let v2_hi = if negate_acc2 { v2_hi.wrapping_neg() } else { v2_hi };
+                    let mut r_lo = v1_lo.wrapping_add(v2_lo);
+                    let mut r_hi = v1_hi.wrapping_add(v2_hi);
+                    if shift16 { r_lo >>= 16; r_hi >>= 16; }
+                    result[i] = (r_lo as u32 as u64) | ((r_hi as u32 as u64) << 32);
+                }
+            }
+
+            ctx.accumulator.write_wide(dst_reg, result);
+        } else {
+            // Narrow path: 512-bit bm registers (8 x 64-bit lanes).
+            let a1 = ctx.accumulator.read(acc1_reg);
+            let a2 = ctx.accumulator.read(acc2_reg);
+            let mut result = [0u64; 8];
+
+            if is_float {
+                use super::vector_float::{fp32_flush_to_zero, aie2_acc_fp32_add};
+                for i in 0..8 {
+                    let mut a1_lo = if zero_acc1 { 0u32 } else { fp32_flush_to_zero(a1[i] as u32) };
+                    let mut a1_hi = if zero_acc1 { 0u32 } else { fp32_flush_to_zero((a1[i] >> 32) as u32) };
+                    let mut a2_lo = fp32_flush_to_zero(a2[i] as u32);
+                    let mut a2_hi = fp32_flush_to_zero((a2[i] >> 32) as u32);
+
+                    if negate_acc1 { a1_lo ^= 0x8000_0000; a1_hi ^= 0x8000_0000; }
+                    if negate_acc2 { a2_lo ^= 0x8000_0000; a2_hi ^= 0x8000_0000; }
+
+                    let r_lo = aie2_acc_fp32_add(a1_lo, a2_lo);
+                    let r_hi = aie2_acc_fp32_add(a1_hi, a2_hi);
+                    result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
+                }
+            } else {
+                // Acc32 mode: independent 32-bit lane operations (see wide path).
+                for i in 0..8 {
+                    let v1_lo = if zero_acc1 { 0i32 } else { a1[i] as i32 };
+                    let v1_hi = if zero_acc1 { 0i32 } else { (a1[i] >> 32) as i32 };
+                    let v2_lo = a2[i] as i32;
+                    let v2_hi = (a2[i] >> 32) as i32;
+                    let v1_lo = if negate_acc1 { v1_lo.wrapping_neg() } else { v1_lo };
+                    let v1_hi = if negate_acc1 { v1_hi.wrapping_neg() } else { v1_hi };
+                    let v2_lo = if negate_acc2 { v2_lo.wrapping_neg() } else { v2_lo };
+                    let v2_hi = if negate_acc2 { v2_hi.wrapping_neg() } else { v2_hi };
+                    let mut r_lo = v1_lo.wrapping_add(v2_lo);
+                    let mut r_hi = v1_hi.wrapping_add(v2_hi);
+                    if shift16 { r_lo >>= 16; r_hi >>= 16; }
+                    result[i] = (r_lo as u32 as u64) | ((r_hi as u32 as u64) << 32);
+                }
+            }
+
+            ctx.accumulator.write(dst_reg, result);
+        }
+    }
+
+    /// Accumulator negate: dst = -src.
+    ///
+    /// Handles VNEG on both bm (512-bit) and cm (1024-bit) accumulators.
+    /// The config word controls zero_acc (zero the source before negation,
+    /// producing 0). Float mode is detected from element_type (Float32/BFloat16):
+    /// each u64 lane holds two fp32 values (bits [31:0] and bits [63:32]).
+    pub(super) fn execute_acc_negate(op: &SlotOp, ctx: &mut ExecutionContext) {
+        let acc_reg = op.sources.iter().find_map(|s| match s {
+            Operand::AccumReg(r) => Some(*r),
+            _ => None,
+        }).unwrap_or(0);
+        let dst_reg = Self::get_acc_dest(op);
+
+        let conf = Self::get_config_register(op, ctx).unwrap_or(0);
+        let zero_acc = (conf & 1) != 0;
+        // Float mode from element_type (set at build time from mnemonic ".f" suffix).
+        let is_float = matches!(op.element_type, Some(ElementType::Float32) | Some(ElementType::BFloat16));
+
+        // Wide (cm) vs narrow (bm) -- same detection as execute_acc_add_sub.
+        // Use AccumWidth metadata from decoder when available (structural signal).
+        let is_wide = match op.accum_width {
+            Some(crate::tablegen::decoder_ffi::AccumWidth::Full) => true,
+            Some(crate::tablegen::decoder_ffi::AccumWidth::Half)
+            | Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterLow)
+            | Some(crate::tablegen::decoder_ffi::AccumWidth::QuarterHigh) => false,
+            None => {
+                let any_odd = acc_reg % 2 != 0 || dst_reg % 2 != 0;
+                !any_odd
+            }
+        };
+
+        if is_wide {
+            let src = ctx.accumulator.read_wide(acc_reg);
+            let mut result = [0u64; 16];
+            if is_float {
+                use super::vector_float::{fp32_flush_to_zero, fp32_is_nan, fp32_make_nan};
+                for i in 0..16 {
+                    let lo = fp32_flush_to_zero(src[i] as u32);
+                    let hi = fp32_flush_to_zero((src[i] >> 32) as u32);
+                    let r_lo = if zero_acc { 0u32 }
+                        else if fp32_is_nan(lo) { fp32_make_nan(false) }
+                        else { lo ^ 0x8000_0000 };
+                    let r_hi = if zero_acc { 0u32 }
+                        else if fp32_is_nan(hi) { fp32_make_nan(false) }
+                        else { hi ^ 0x8000_0000 };
+                    result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
+                }
+            } else {
+                // Acc32 mode: independent 32-bit negation per lane half.
+                for i in 0..16 {
+                    let lo = if zero_acc { 0i32 } else { src[i] as i32 };
+                    let hi = if zero_acc { 0i32 } else { (src[i] >> 32) as i32 };
+                    let r_lo = lo.wrapping_neg() as u32;
+                    let r_hi = hi.wrapping_neg() as u32;
+                    result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
+                }
+            }
+            ctx.accumulator.write_wide(dst_reg, result);
+        } else {
+            let src = ctx.accumulator.read(acc_reg);
+            let mut result = [0u64; 8];
+            if is_float {
+                use super::vector_float::{fp32_flush_to_zero, fp32_is_nan, fp32_make_nan};
+                for i in 0..8 {
+                    let lo = fp32_flush_to_zero(src[i] as u32);
+                    let hi = fp32_flush_to_zero((src[i] >> 32) as u32);
+                    let r_lo = if zero_acc { 0u32 }
+                        else if fp32_is_nan(lo) { fp32_make_nan(false) }
+                        else { lo ^ 0x8000_0000 };
+                    let r_hi = if zero_acc { 0u32 }
+                        else if fp32_is_nan(hi) { fp32_make_nan(false) }
+                        else { hi ^ 0x8000_0000 };
+                    result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
+                }
+            } else {
+                // Acc32 mode: independent 32-bit negation per lane half.
+                for i in 0..8 {
+                    let lo = if zero_acc { 0i32 } else { src[i] as i32 };
+                    let hi = if zero_acc { 0i32 } else { (src[i] >> 32) as i32 };
+                    let r_lo = lo.wrapping_neg() as u32;
+                    let r_hi = hi.wrapping_neg() as u32;
+                    result[i] = (r_lo as u64) | ((r_hi as u64) << 32);
+                }
+            }
+            ctx.accumulator.write(dst_reg, result);
+        }
     }
 }
 
