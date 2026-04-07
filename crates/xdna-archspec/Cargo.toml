@@ -3,7 +3,7 @@ name = "xdna-archspec"
 version = "0.1.0"
 edition = "2021"
 description = "NPU architecture specification -- validated hardware model extracted from the open-source toolchain"
-license = "Unlicense"
+license = "MIT"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

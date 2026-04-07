@@ -1,18 +1,18 @@
 [workspace]
-members = [".", "crates/xdna-archspec"]
+members = [".", "crates/xdna-archspec", "crates/xdna-emu-ffi"]
 
 [package]
 name = "xdna-emu"
 version = "0.1.0"
 edition = "2021"
 description = "Open-source emulator and visual debugger for AMD XDNA NPUs"
-license = "Unlicense"
+license = "MIT"
 rust-version = "1.70"
 
 [lib]
 # Build both a Rust library and a C-compatible shared library
 # The cdylib (libxdna_emu.so) provides FFI for mock XRT integration
-crate-type = ["lib", "cdylib"]
+crate-type = ["lib"]
 # Doc tests are enabled but should be run via scripts/run-tests.sh for nice priority
 
 [dependencies]

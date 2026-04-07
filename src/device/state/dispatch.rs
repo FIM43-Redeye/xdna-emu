@@ -17,7 +17,7 @@ impl DeviceState {
     ///
     /// All external callers MUST use this method. Never write to tile state
     /// directly.
-    pub(crate) fn write_tile_register(&mut self, col: u8, row: u8, offset: u32, value: u32) {
+    pub fn write_tile_register(&mut self, col: u8, row: u8, offset: u32, value: u32) {
         let address = TileAddress::encode(col, row, offset);
         if let Err(e) = self.write_register(address, value) {
             log::error!("write_tile_register failed: tile({},{}) offset=0x{:05X}: {:?}",

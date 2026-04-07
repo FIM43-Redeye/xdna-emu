@@ -39,7 +39,7 @@ if [[ ! -f "$BUILD_DIR/CMakeCache.txt" ]]; then
 fi
 
 echo ">>> Building (cargo build handles plugin automatically)..."
-nice -n 19 cargo build $CARGO_FLAGS
+nice -n 19 cargo build -p xdna-emu-ffi $CARGO_FLAGS
 
 RUST_LIB="$EMU_DIR/target/$PROFILE/libxdna_emu.so"
 # The C++ plugin is the XRT driver shim that dlopen's the Rust lib.

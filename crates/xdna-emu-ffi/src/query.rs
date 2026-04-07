@@ -335,7 +335,7 @@ pub unsafe extern "C" fn xdna_emu_get_dma_channel_state(
     is_s2mm: u8,
     channel_index: u8,
 ) -> u32 {
-    use crate::device::dma::ChannelState;
+    use xdna_emu::device::dma::ChannelState;
 
     if handle.is_null() {
         return 0;

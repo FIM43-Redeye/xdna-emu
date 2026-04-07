@@ -1,8 +1,8 @@
 //! Foreign Function Interface for xdna-emu.
 //!
-//! This module provides C-callable functions for integrating xdna-emu
-//! with C/C++ applications (primarily the XRT emulation plugin at
-//! `xrt-plugin/`).
+//! This crate produces `libxdna_emu.so` (a C-compatible shared library)
+//! for integrating xdna-emu with C/C++ applications -- primarily the XRT
+//! emulation plugin at `xrt-plugin/`.
 //!
 //! # Safety Contract
 //!
@@ -50,8 +50,8 @@ use std::cell::RefCell;
 use std::ffi::c_char;
 use std::sync::Mutex;
 
-use crate::interpreter::engine::InterpreterEngine;
-use crate::npu::NpuExecutor;
+use xdna_emu::interpreter::engine::InterpreterEngine;
+use xdna_emu::npu::NpuExecutor;
 
 // Thread-local error storage for xdna_emu_get_error().
 thread_local! {
@@ -67,13 +67,13 @@ pub(crate) fn set_last_error(msg: String) {
 /// Opaque handle to emulator state.
 /// Wraps InterpreterEngine and related state.
 pub struct XdnaEmuHandle {
-    engine: InterpreterEngine,
-    xclbin_path: Option<String>,
-    npu_executor: NpuExecutor,
-    max_cycles: u64,
+    pub(crate) engine: InterpreterEngine,
+    pub(crate) xclbin_path: Option<String>,
+    pub(crate) npu_executor: NpuExecutor,
+    pub(crate) max_cycles: u64,
     /// Next address to allocate for xdna_emu_alloc_buffer.
     /// Starts at a high address to avoid conflicts with user-specified regions.
-    next_alloc_addr: u64,
+    pub(crate) next_alloc_addr: u64,
 }
 
 /// Result codes for FFI operations.
@@ -632,9 +632,9 @@ mod tests {
     //
     // This test reads `xrt-plugin/src/transport_inprocess.cpp` and extracts
     // every symbol name passed to `resolve_required` or `resolve_optional`.
-    // It then reads all Rust source files under `src/ffi/` and extracts
-    // every `#[no_mangle]` exported function name. The test asserts that
-    // every symbol the C++ side expects is present in our Rust exports.
+    // It then reads all Rust source files under this crate's `src/` and
+    // extracts every `#[no_mangle]` exported function name. The test asserts
+    // that every symbol the C++ side expects is present in our Rust exports.
     //
     // If someone adds a new FFI function to the C++ transport, this test
     // fails until the corresponding Rust function is implemented.
@@ -695,17 +695,20 @@ mod tests {
     fn test_ffi_interface_completeness() {
         use std::path::PathBuf;
 
+        // Navigate from the FFI crate back to the repo root.
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let cpp_path = manifest_dir.join("xrt-plugin/src/transport_inprocess.cpp");
-        let ffi_dir = manifest_dir.join("src/ffi");
+        let repo_root = manifest_dir.join("../..").canonicalize()
+            .expect("cannot find repo root from FFI crate");
+        let cpp_path = repo_root.join("xrt-plugin/src/transport_inprocess.cpp");
+        let ffi_src_dir = manifest_dir.join("src");
 
         let cpp_source = std::fs::read_to_string(&cpp_path)
             .unwrap_or_else(|e| panic!("cannot read {}: {}", cpp_path.display(), e));
 
-        // Scan all .rs files in the ffi directory for exported symbols.
+        // Scan all .rs files in this crate's src/ for exported symbols.
         let mut exported = Vec::new();
-        for entry in std::fs::read_dir(&ffi_dir)
-            .unwrap_or_else(|e| panic!("cannot read dir {}: {}", ffi_dir.display(), e))
+        for entry in std::fs::read_dir(&ffi_src_dir)
+            .unwrap_or_else(|e| panic!("cannot read dir {}: {}", ffi_src_dir.display(), e))
         {
             let entry = entry.unwrap();
             let path = entry.path();
@@ -757,7 +760,7 @@ mod tests {
             panic!(
                 "FFI interface incomplete!\n\n{}\n\
                  C++ transport expects {} symbols, Rust exports {} symbols.\n\
-                 Add the missing functions to src/ffi/.",
+                 Add the missing functions to crates/xdna-emu-ffi/src/.",
                 msg,
                 expected.len(),
                 exported.len()

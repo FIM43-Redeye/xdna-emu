@@ -1,0 +1,17 @@
+[package]
+name = "xdna-emu-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "C-compatible FFI for xdna-emu (XRT emulation plugin)"
+license = "MIT"
+
+[lib]
+# Keep the .so name stable: libxdna_emu.so
+# The XRT plugin dlopen's this by name via XDNA_EMU_DIR.
+name = "xdna_emu"
+crate-type = ["cdylib"]
+
+[dependencies]
+xdna-emu = { path = "../..", default-features = false }
+log = "0.4"
+env_logger = "0.11"

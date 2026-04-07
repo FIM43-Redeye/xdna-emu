@@ -4,7 +4,7 @@
 
 use std::slice;
 
-use crate::npu::NpuInstructionStream;
+use xdna_emu::npu::NpuInstructionStream;
 
 use super::{XdnaEmuHandle, XdnaEmuResult, XdnaEmuExecStatus};
 
@@ -80,7 +80,7 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
 
     let handle = &mut *handle;
 
-    use crate::interpreter::engine::EngineStatus;
+    use xdna_emu::interpreter::engine::EngineStatus;
 
     let mut cycles = 0u64;
     let max = handle.max_cycles;
@@ -111,11 +111,11 @@ pub unsafe extern "C" fn xdna_emu_run(handle: *mut XdnaEmuHandle) -> XdnaEmuExec
         {
             let (device, host_mem) = handle.engine.device_and_host_memory();
             let result = handle.npu_executor.try_advance(device, host_mem);
-            if let crate::npu::AdvanceResult::Error(msg) = result {
+            if let xdna_emu::npu::AdvanceResult::Error(msg) = result {
                 log::error!("NPU executor fatal: {}", msg);
                 break;
             }
-            npu_progressed = matches!(result, crate::npu::AdvanceResult::Progressed);
+            npu_progressed = matches!(result, xdna_emu::npu::AdvanceResult::Progressed);
         }
 
         // When the NPU executor progressed (executed an instruction that may

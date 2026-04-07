@@ -13,7 +13,7 @@
 //! - [`visual`]: Trace comparison visualizer (egui-based)
 //! - [`integration`]: External tool integration
 //! - [`testing`]: Test harness for XCLBIN binary compatibility
-//! - [`ffi`]: C-compatible Foreign Function Interface
+//! - `ffi`: C-compatible FFI (separate crate: `xdna-emu-ffi`)
 //! - [`fuzzer`]: Differential logic fuzzer for emulator validation
 //! - [`aiesim`]: aiesimulator subprocess harness for VCD cross-validation
 
@@ -24,7 +24,6 @@ pub mod device;
 pub mod interpreter;
 pub mod tablegen;
 pub mod npu;
-pub mod ffi;
 pub mod archspec;
 pub mod trace;
 pub mod aiesim;
