@@ -66,7 +66,7 @@ vcd-recording = ["dep:vcd"]
 [build-dependencies]
 serde_json = "1"                              # Used by extract_aiert for JSON Value parsing
 xdna-archspec = { path = "crates/xdna-archspec" }
-tblgen = { git = "https://github.com/FIM43-Redeye/tblgen-rs.git", branch = "feat/varbit-init", default-features = false, features = ["llvm20-0"] }
+tblgen = { git = "https://github.com/FIM43-Redeye/tblgen-rs.git", branch = "feat/varbit-init", default-features = false, features = ["llvm21-0"] }
 cc = "1"                                      # C++ compilation for LLVM decoder FFI
 
 [dev-dependencies]
