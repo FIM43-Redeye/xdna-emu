@@ -646,7 +646,7 @@ impl TileArray {
                                 break;
                             }
                         }
-                        matched_ch.or(Some(0)) // Fallback to ch0 if no Demux config
+                        matched_ch // None = port not muxed to DMA, no S2MM routing
                     }
                     _ => None,
                 };

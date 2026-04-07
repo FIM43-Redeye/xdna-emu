@@ -775,14 +775,19 @@ impl Tile {
         // Reset mapping
         self.shim_mux_s2mm_masters.fill(None);
 
-        let mut dma_ch = 0usize;
-        for df in &mux.demux_fields {
+        // Per aie-rt (xaie_plif.c), the AIE2 shim demux has a FIXED mapping
+        // from south ports to S2MM DMA channels:
+        //   South2 (master[4]) -> S2MM ch0
+        //   South3 (master[5]) -> S2MM ch1
+        // The demux_fields are ordered South2, South3, South4, South5 and
+        // the DMA channel index matches the field's position in the valid
+        // S2MM port list (first two fields = ch0 and ch1).
+        for (dma_ch, df) in mux.demux_fields.iter().enumerate() {
             let select = df.field.extract(value);
             if select == 1 && dma_ch < self.shim_mux_s2mm_masters.len() {
                 self.shim_mux_s2mm_masters[dma_ch] = Some(df.port_index);
                 log::info!("Shim Mux ({},{}): S2MM ch{} <- master[{}] ({})",
                     self.col, self.row, dma_ch, df.port_index, df.field.name);
-                dma_ch += 1;
             }
         }
     }
